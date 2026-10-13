@@ -249,6 +249,42 @@
           "markdownDescription": "允许按阶段测试连接。"
         },
         {
+          "description": "允许在已打开的会话上逐条提交表数据变更。",
+          "type": "string",
+          "const": "allow-grid-commit",
+          "markdownDescription": "允许在已打开的会话上逐条提交表数据变更。"
+        },
+        {
+          "description": "允许从已打开的会话统计匹配行。",
+          "type": "string",
+          "const": "allow-grid-count",
+          "markdownDescription": "允许从已打开的会话统计匹配行。"
+        },
+        {
+          "description": "允许从已打开的会话读取表结构。",
+          "type": "string",
+          "const": "allow-grid-describe",
+          "markdownDescription": "允许从已打开的会话读取表结构。"
+        },
+        {
+          "description": "允许把已打开会话中的表数据或查询结果流式导出为 CSV。",
+          "type": "string",
+          "const": "allow-grid-export",
+          "markdownDescription": "允许把已打开会话中的表数据或查询结果流式导出为 CSV。"
+        },
+        {
+          "description": "允许取消尚未完成的 CSV 导出并删除未完成文件。",
+          "type": "string",
+          "const": "allow-grid-export-cancel",
+          "markdownDescription": "允许取消尚未完成的 CSV 导出并删除未完成文件。"
+        },
+        {
+          "description": "允许从已打开的会话分页读取表数据。",
+          "type": "string",
+          "const": "allow-grid-page",
+          "markdownDescription": "允许从已打开的会话分页读取表数据。"
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

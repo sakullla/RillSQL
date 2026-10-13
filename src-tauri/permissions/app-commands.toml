@@ -57,3 +57,33 @@ commands.allow = ["catalog_refresh"]
 identifier = "allow-catalog-page"
 description = "允许从已打开的会话继续读取对象。"
 commands.allow = ["catalog_page"]
+
+[[permission]]
+identifier = "allow-grid-describe"
+description = "允许从已打开的会话读取表结构。"
+commands.allow = ["grid_describe"]
+
+[[permission]]
+identifier = "allow-grid-page"
+description = "允许从已打开的会话分页读取表数据。"
+commands.allow = ["grid_page"]
+
+[[permission]]
+identifier = "allow-grid-count"
+description = "允许从已打开的会话统计匹配行。"
+commands.allow = ["grid_count"]
+
+[[permission]]
+identifier = "allow-grid-commit"
+description = "允许在已打开的会话上逐条提交表数据变更。"
+commands.allow = ["grid_commit"]
+
+[[permission]]
+identifier = "allow-grid-export"
+description = "允许把已打开会话中的表数据或查询结果流式导出为 CSV。"
+commands.allow = ["grid_export"]
+
+[[permission]]
+identifier = "allow-grid-export-cancel"
+description = "允许取消尚未完成的 CSV 导出并删除未完成文件。"
+commands.allow = ["grid_export_cancel"]

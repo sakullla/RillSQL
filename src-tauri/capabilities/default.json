@@ -17,6 +17,12 @@
     "allow-connections-forget-host-key",
     "allow-catalog-sessions",
     "allow-catalog-refresh",
-    "allow-catalog-page"
+    "allow-catalog-page",
+    "allow-grid-describe",
+    "allow-grid-page",
+    "allow-grid-count",
+    "allow-grid-commit",
+    "allow-grid-export",
+    "allow-grid-export-cancel"
   ]
 }
