@@ -480,15 +480,6 @@ async fn stored_password_is_reused_without_being_copied_into_the_config() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-fn tls_message(report: &super::stages::TestReport) -> String {
-    report
-        .stages
-        .iter()
-        .find(|stage| stage.kind == StageKind::Tls)
-        .map(|stage| stage.message.clone())
-        .unwrap_or_default()
-}
-
 fn assert_not_verified(message: &str) {
     assert!(!message.contains("已验证"), "{message}");
     assert!(message.contains("未验证"), "{message}");
@@ -502,26 +493,79 @@ async fn only_verified_tls_success_says_the_certificate_was_checked() {
     let require = model::normalize(&require, "require".to_owned()).unwrap();
     let require_ok = super::service::report_canned_remote(require.clone(), super::service::CannedRemote::Connected).await;
     assert_eq!(require_ok.status, TestStatus::Ok);
-    let require_message = tls_message(&require_ok);
-    assert_eq!(require_message, "已加密，但未验证证书和主机名");
-    assert_not_verified(&require_message);
+    let require_tls_ok = require_ok.stages.iter().find(|stage| stage.kind == StageKind::Tls).unwrap();
+    assert_eq!(require_tls_ok.label, "TLS 握手");
+    assert!(!require_tls_ok.label.contains("证书验证"));
+    assert_eq!(require_tls_ok.message, "已加密，但未验证证书和主机名");
+    assert_not_verified(&require_tls_ok.message);
 
     let require_auth = super::service::report_canned_remote(require, super::service::CannedRemote::AuthenticationFailed).await;
     assert_eq!(require_auth.status, TestStatus::Err);
     assert_eq!(require_auth.fail_stage.as_deref(), Some(StageKind::DatabaseAuthentication.label_zh()));
     let require_tls = require_auth.stages.iter().find(|stage| stage.kind == StageKind::Tls).unwrap();
     assert_eq!(require_tls.status, StageStatus::Ok);
+    assert_eq!(require_tls.label, "TLS 握手");
+    assert!(!require_tls.label.contains("证书验证"));
     assert_not_verified(&require_tls.message);
 
     let verify = model::normalize(&remote_draft(Engine::Postgres), "verify".to_owned()).unwrap();
     let verify_ok = super::service::report_canned_remote(verify.clone(), super::service::CannedRemote::Connected).await;
-    assert_eq!(tls_message(&verify_ok), "证书主机名 db.example.test 已验证");
+    let verify_tls_ok = verify_ok.stages.iter().find(|stage| stage.kind == StageKind::Tls).unwrap();
+    assert_eq!(verify_tls_ok.label, "TLS 握手与证书验证");
+    assert_eq!(verify_tls_ok.message, "证书主机名 db.example.test 已验证");
     let verify_auth = super::service::report_canned_remote(verify, super::service::CannedRemote::AuthenticationFailed).await;
     let verify_tls = verify_auth.stages.iter().find(|stage| stage.kind == StageKind::Tls).unwrap();
     assert_eq!(verify_tls.status, StageStatus::Ok);
-    assert_eq!(verify_auth.stages.iter().find(|stage| stage.kind == StageKind::DatabaseAuthentication).unwrap().status, StageStatus::Err);
-    assert_not_verified(&verify_tls.message);
-    assert!(verify_tls.message.contains("认证失败"));
+    assert_eq!(verify_tls.label, "TLS 握手与证书验证");
+    assert_eq!(verify_tls.message, "证书主机名 db.example.test 已验证");
+    assert_eq!(
+        verify_auth
+            .stages
+            .iter()
+            .find(|stage| stage.kind == StageKind::DatabaseAuthentication)
+            .unwrap()
+            .status,
+        StageStatus::Err
+    );
+}
+
+#[tokio::test]
+async fn missing_password_does_not_mark_network_or_tls_successful() {
+    let dir = temp_workspace();
+    let service = Service::new(dir.join("connections.sqlite"), Arc::new(MemoryStore::default()));
+    for (engine, mode) in [(Engine::Postgres, TlsMode::Verify), (Engine::Mysql, TlsMode::Require)] {
+        let mut draft = remote_draft(engine);
+        draft.tls_mode = mode;
+        draft.save_password = false;
+        let saved = service.save(draft, SecretInput::default()).await.unwrap();
+        let report = service.test(&saved.connection.id, SecretInput::default()).await.unwrap();
+        assert_eq!(report.status, TestStatus::Err, "{mode:?}");
+        assert_eq!(report.fail_stage.as_deref(), Some(StageKind::DatabaseAuthentication.label_zh()));
+        for kind in [StageKind::Network, StageKind::Tls] {
+            let stage = report.stages.iter().find(|stage| stage.kind == kind).unwrap();
+            assert_ne!(stage.status, StageStatus::Ok, "{mode:?} {kind:?} {}", stage.message);
+            assert!(!stage.message.contains("已加密"), "{mode:?} {}", stage.message);
+            assert!(!stage.message.contains("已验证"), "{mode:?} {}", stage.message);
+        }
+        let tls = report.stages.iter().find(|stage| stage.kind == StageKind::Tls).unwrap();
+        if mode == TlsMode::Require {
+            assert!(!tls.label.contains("证书验证"), "{}", tls.label);
+        }
+        assert_eq!(
+            report
+                .stages
+                .iter()
+                .find(|stage| stage.kind == StageKind::DatabaseAuthentication)
+                .unwrap()
+                .status,
+            StageStatus::Err
+        );
+        assert_eq!(
+            report.stages.iter().find(|stage| stage.kind == StageKind::ServerVersion).unwrap().status,
+            StageStatus::Skipped
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]

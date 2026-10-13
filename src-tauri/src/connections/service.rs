@@ -451,7 +451,12 @@ enum Remote {
     Fresh,
     Probed,
     Done { version: String },
-    Failed { stage: StageKind, error: StageError },
+    Failed {
+        stage: StageKind,
+        error: StageError,
+        network_done: bool,
+        tls_done: bool,
+    },
 }
 
 struct Attempt {
@@ -574,25 +579,30 @@ impl Attempt {
             self.remote = Remote::Probed;
             return;
         }
+        let tls_mode = self.tls_mode();
         let Some(password) = self.password.as_ref() else {
+            // 密码在 TCP/TLS 之前就缺了，不能按失败阶段的先后把前面标成已完成。
             self.remote = Remote::Failed {
                 stage: StageKind::DatabaseAuthentication,
                 error: stages::fail("请填写数据库密码", "凭据库没有可用密码，本次也没有输入。没有把空密码写入配置。"),
+                network_done: false,
+                tls_done: false,
             };
             return;
         };
         let route = match self.route() {
             Ok(route) => route,
             Err(error) => {
-                self.remote = Remote::Failed { stage: StageKind::Network, error };
+                self.remote = remote_failed(StageKind::Network, error, tls_mode);
                 return;
             }
         };
         if self.config.ssh.is_some() && self.forwarder_port.is_none() {
-            self.remote = Remote::Failed {
-                stage: StageKind::Network,
-                error: stages::fail("隧道没有就绪", "尚未连接数据库。"),
-            };
+            self.remote = remote_failed(
+                StageKind::Network,
+                stages::fail("隧道没有就绪", "尚未连接数据库。"),
+                tls_mode,
+            );
             return;
         }
         let password = password.expose().to_owned();
@@ -611,17 +621,51 @@ impl Attempt {
             Ok(version) => self.remote = Remote::Done { version },
             Err(error) => {
                 let stage = classify_db(&error);
-                self.remote = Remote::Failed { stage, error };
+                self.remote = remote_failed(stage, error, tls_mode);
             }
         }
     }
 
-    fn pass_until(&self, stage: StageKind, ok: impl FnOnce() -> String) -> Result<String, StageError> {
+    fn tls_mode(&self) -> TlsMode {
+        self.config.tls.as_ref().map(|tls| tls.mode).unwrap_or(TlsMode::Off)
+    }
+
+    fn tls_server_name(&self) -> String {
+        self.config
+            .tls
+            .as_ref()
+            .map(|tls| tls.server_name.clone())
+            .filter(|name| !name.is_empty())
+            .or_else(|| self.config.host.clone())
+            .unwrap_or_default()
+    }
+
+    fn finish_stage(&self, stage: StageKind, ok: impl FnOnce() -> String) -> Result<String, StageError> {
         match &self.remote {
             Remote::Done { version } => Ok(if stage == StageKind::ServerVersion { version.clone() } else { ok() }),
-            Remote::Failed { stage: failed, error } if *failed == stage => Err(error.clone()),
-            Remote::Failed { stage: failed, .. } if rank(*failed) > rank(stage) => Ok(ok()),
-            Remote::Failed { error, .. } => Err(error.clone()),
+            Remote::Failed {
+                stage: failed,
+                error,
+                network_done,
+                tls_done,
+            } => {
+                if *failed == stage {
+                    return Err(error.clone());
+                }
+                let completed = match stage {
+                    StageKind::Network => *network_done,
+                    StageKind::Tls => *tls_done,
+                    StageKind::DatabaseAuthentication => rank(*failed) > rank(StageKind::DatabaseAuthentication),
+                    _ => false,
+                };
+                if completed {
+                    return Ok(ok());
+                }
+                if rank(*failed) > rank(stage) {
+                    return Err(StageError::NotAttempted);
+                }
+                Err(error.clone())
+            }
             Remote::Fresh | Remote::Probed => Err(stages::fail("连接没有开始", "未执行")),
         }
     }
@@ -635,7 +679,7 @@ impl Attempt {
         self.ensure_remote().await;
         let host = self.config.host.clone().unwrap_or_default();
         let port = self.config.port.unwrap_or(0);
-        self.pass_until(StageKind::Network, || format!("{host}:{port}"))
+        self.finish_stage(StageKind::Network, || format!("{host}:{port}"))
     }
 
     async fn tls(&mut self) -> Result<String, StageError> {
@@ -644,16 +688,9 @@ impl Attempt {
             return probe.check_tls(&route).await;
         }
         self.ensure_remote().await;
-        let name = self.config.host.clone().unwrap_or_default();
-        let mode = self.config.tls.as_ref().map(|tls| tls.mode).unwrap_or(TlsMode::Off);
-        let authentication_failed = matches!(
-            self.remote,
-            Remote::Failed {
-                stage: StageKind::DatabaseAuthentication,
-                ..
-            }
-        );
-        self.pass_until(StageKind::Tls, || tls_stage_message(mode, &name, authentication_failed))
+        let server_name = self.tls_server_name();
+        let mode = self.tls_mode();
+        self.finish_stage(StageKind::Tls, || tls_stage_message(mode, &server_name))
     }
 
     async fn db_auth(&mut self) -> Result<String, StageError> {
@@ -666,7 +703,7 @@ impl Attempt {
         }
         self.ensure_remote().await;
         let user = self.config.username.clone().unwrap_or_default();
-        self.pass_until(StageKind::DatabaseAuthentication, || format!("用户 {user}"))
+        self.finish_stage(StageKind::DatabaseAuthentication, || format!("用户 {user}"))
     }
 
     async fn server_version(&mut self) -> Result<String, StageError> {
@@ -675,7 +712,7 @@ impl Attempt {
             return probe.server_version(&self.config, &route).await;
         }
         self.ensure_remote().await;
-        self.pass_until(StageKind::ServerVersion, || "未知版本".to_owned())
+        self.finish_stage(StageKind::ServerVersion, || "未知版本".to_owned())
     }
 
     async fn open_file(&mut self) -> Result<String, StageError> {
@@ -712,6 +749,13 @@ impl Attempt {
 
 #[async_trait::async_trait]
 impl StageRunner for Attempt {
+    fn stage_label(&self, stage: StageKind) -> String {
+        if stage == StageKind::Tls {
+            return StageKind::tls_label(self.tls_mode()).to_owned();
+        }
+        stage.label_zh().to_owned()
+    }
+
     async fn run_stage(&mut self, stage: StageKind) -> Result<String, StageError> {
         match stage {
             StageKind::SshHostIdentity => self.ssh_identity().await,
@@ -728,13 +772,20 @@ impl StageRunner for Attempt {
     }
 }
 
-pub(crate) fn tls_stage_message(mode: TlsMode, server_name: &str, authentication_failed: bool) -> String {
-    if mode == TlsMode::Verify && !authentication_failed {
+pub(crate) fn tls_stage_message(mode: TlsMode, server_name: &str) -> String {
+    if mode == TlsMode::Verify {
         format!("证书主机名 {server_name} 已验证")
-    } else if authentication_failed && mode == TlsMode::Verify {
-        "已加密，数据库认证失败，证书和主机名未验证".to_owned()
     } else {
         "已加密，但未验证证书和主机名".to_owned()
+    }
+}
+
+fn remote_failed(stage: StageKind, error: StageError, tls_mode: TlsMode) -> Remote {
+    Remote::Failed {
+        stage,
+        error,
+        network_done: rank(stage) > rank(StageKind::Network),
+        tls_done: tls_mode != TlsMode::Off && rank(stage) > rank(StageKind::Tls),
     }
 }
 
@@ -787,12 +838,15 @@ pub(crate) enum CannedRemote {
 
 #[cfg(test)]
 pub(crate) async fn report_canned_remote(config: SavedConnection, canned: CannedRemote) -> TestReport {
+    let tls_mode = config.tls.as_ref().map(|tls| tls.mode).unwrap_or(TlsMode::Off);
     let remote = match canned {
         CannedRemote::Connected => Remote::Done { version: "8.4.3".to_owned() },
-        CannedRemote::AuthenticationFailed => Remote::Failed {
-            stage: StageKind::DatabaseAuthentication,
-            error: stages::fail("Access denied for user", "请检查数据库用户名和密码。"),
-        },
+        // 驱动只有在握手完成后才会报认证失败，所以网络和 TLS 都已完成。
+        CannedRemote::AuthenticationFailed => remote_failed(
+            StageKind::DatabaseAuthentication,
+            stages::fail("Access denied for user", "请检查数据库用户名和密码。"),
+            tls_mode,
+        ),
     };
     let mut attempt = Attempt {
         config: config.clone(),

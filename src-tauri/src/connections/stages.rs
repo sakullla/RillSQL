@@ -18,13 +18,20 @@ pub enum StageKind {
 }
 
 impl StageKind {
+    pub fn tls_label(mode: TlsMode) -> &'static str {
+        match mode {
+            TlsMode::Verify => "TLS 握手与证书验证",
+            TlsMode::Require | TlsMode::Off => "TLS 握手",
+        }
+    }
+
     pub fn label_zh(self) -> &'static str {
         match self {
             StageKind::SshHostIdentity => "SSH 主机身份",
             StageKind::SshAuthentication => "SSH 认证",
             StageKind::Tunnel => "建立隧道",
             StageKind::Network => "网络连接",
-            StageKind::Tls => "TLS 握手与证书验证",
+            StageKind::Tls => "TLS 握手",
             StageKind::DatabaseAuthentication => "数据库认证",
             StageKind::ServerVersion => "读取服务器版本",
             StageKind::OpenFile => "打开文件",
@@ -76,6 +83,8 @@ pub struct TestReport {
 pub enum StageError {
     Fail { message: String, hint: String },
     WaitHostKey { algorithm: String, fingerprint: String },
+    /// 这一阶段没有执行，流水线继续，以便失败落在后面的阶段。
+    NotAttempted,
 }
 
 pub fn planned_stages(config: &SavedConnection) -> Vec<StageKind> {
@@ -104,6 +113,10 @@ pub fn planned_stages(config: &SavedConnection) -> Vec<StageKind> {
 #[async_trait::async_trait]
 pub trait StageRunner: Send {
     async fn run_stage(&mut self, stage: StageKind) -> Result<String, StageError>;
+
+    fn stage_label(&self, stage: StageKind) -> String {
+        stage.label_zh().to_owned()
+    }
 }
 
 pub async fn execute_stages(stages: &[StageKind], runner: &mut (dyn StageRunner + Send)) -> TestReport {
@@ -119,7 +132,7 @@ pub async fn execute_stages(stages: &[StageKind], runner: &mut (dyn StageRunner 
         if failed {
             views.push(StageView {
                 kind: *stage,
-                label: stage.label_zh().to_owned(),
+                label: runner.stage_label(*stage),
                 status: StageStatus::Skipped,
                 message: "未执行".to_owned(),
             });
@@ -132,9 +145,17 @@ pub async fn execute_stages(stages: &[StageKind], runner: &mut (dyn StageRunner 
                 }
                 views.push(StageView {
                     kind: *stage,
-                    label: stage.label_zh().to_owned(),
+                    label: runner.stage_label(*stage),
                     status: StageStatus::Ok,
                     message,
+                });
+            }
+            Err(StageError::NotAttempted) => {
+                views.push(StageView {
+                    kind: *stage,
+                    label: runner.stage_label(*stage),
+                    status: StageStatus::Skipped,
+                    message: "未执行".to_owned(),
                 });
             }
             Err(StageError::WaitHostKey {
@@ -143,12 +164,12 @@ pub async fn execute_stages(stages: &[StageKind], runner: &mut (dyn StageRunner 
             }) => {
                 failed = true;
                 status = TestStatus::Wait;
-                fail_stage = Some(stage.label_zh().to_owned());
+                fail_stage = Some(runner.stage_label(*stage));
                 fingerprint = Some(fp.clone());
                 algorithm = Some(alg);
                 views.push(StageView {
                     kind: *stage,
-                    label: stage.label_zh().to_owned(),
+                    label: runner.stage_label(*stage),
                     status: StageStatus::Wait,
                     message: format!("等待确认主机指纹 {fp}"),
                 });
@@ -156,11 +177,11 @@ pub async fn execute_stages(stages: &[StageKind], runner: &mut (dyn StageRunner 
             Err(StageError::Fail { message, hint: stage_hint }) => {
                 failed = true;
                 status = TestStatus::Err;
-                fail_stage = Some(stage.label_zh().to_owned());
+                fail_stage = Some(runner.stage_label(*stage));
                 hint = Some(stage_hint);
                 views.push(StageView {
                     kind: *stage,
-                    label: stage.label_zh().to_owned(),
+                    label: runner.stage_label(*stage),
                     status: StageStatus::Err,
                     message,
                 });
