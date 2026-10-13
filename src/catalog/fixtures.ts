@@ -24,6 +24,7 @@ export function catalogFixture(): CatalogConnection[] {
       status: "connected",
       defaultDatabase: "atlas_dev",
       foreignKeys: null,
+      error: null,
       databases: [
         {
           name: "atlas_dev",
@@ -71,6 +72,7 @@ export function catalogFixture(): CatalogConnection[] {
       status: "connected",
       defaultDatabase: "shop_staging",
       foreignKeys: null,
+      error: null,
       databases: [
         {
           name: "shop_staging",
@@ -88,6 +90,7 @@ export function catalogFixture(): CatalogConnection[] {
       status: "connected",
       defaultDatabase: "ledger",
       foreignKeys: null,
+      error: null,
       databases: [
         {
           name: "ledger",
@@ -105,6 +108,7 @@ export function catalogFixture(): CatalogConnection[] {
       status: "connected",
       defaultDatabase: null,
       foreignKeys: false,
+      error: null,
       databases: [
         {
           name: "main",
@@ -122,6 +126,7 @@ export function catalogFixture(): CatalogConnection[] {
       status: "disconnected",
       defaultDatabase: "analytics",
       foreignKeys: null,
+      error: null,
       databases: [
         {
           name: "analytics",

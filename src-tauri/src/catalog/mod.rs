@@ -1,6 +1,8 @@
 //! 按引擎读取库表：PostgreSQL 有 schema，MySQL / MariaDB 只有库，SQLite 直接列对象。
 
+pub mod commands;
 mod model;
+mod read;
 mod sqlite;
 mod tree;
 
@@ -8,6 +10,7 @@ pub use model::{
     metadata_sql, schema_status, Engine, SchemaNode, SchemaStatus, DEFAULT_OBJECT_PAGE,
 };
 pub use sqlite::{read_sqlite_file, read_sqlite_pool};
+pub use commands::{catalog_page, catalog_refresh, catalog_sessions};
 pub use tree::{
     direct_objects, object_path, reconcile_objects, refresh_connection, refresh_schema,
     search_objects, take_page, visible_database_names, visible_schema_names,
@@ -29,6 +32,11 @@ pub fn module_id() -> &'static str {
         std::any::type_name_of_val(&visible_database_names),
         std::any::type_name_of_val(&visible_schema_names),
         std::any::type_name_of_val(&direct_objects),
+        std::any::type_name_of_val(&catalog_refresh),
+        std::any::type_name_of_val(&catalog_page),
+        std::any::type_name_of_val(&catalog_sessions),
+        std::any::type_name_of_val(&read::read_catalog_session),
+        std::any::type_name_of_val(&read::read_object_page),
     );
     let _ = (
         DEFAULT_OBJECT_PAGE,

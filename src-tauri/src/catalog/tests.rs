@@ -1,14 +1,17 @@
 use std::path::Path;
 
+use super::commands::{load_catalog, page_for_session};
 use super::model::{
     metadata_sql, schema_status, ConnStatus, ConnectionNode, DatabaseNode, Engine, ObjectRow,
     SchemaNode, SchemaStatus,
 };
+use super::read::{assemble_postgres, read_catalog_session, read_limit, ObjectWindow};
 use super::sqlite::{read_sqlite_file, read_sqlite_pool};
 use super::tree::{
     direct_objects, object_path, refresh_connection, refresh_schema, search_objects, take_page,
     visible_database_names, visible_schema_names,
 };
+use crate::connections::{CatalogSession, Service};
 
 fn row(name: &str) -> ObjectRow {
     ObjectRow::table(name, Some(1))
@@ -36,6 +39,7 @@ fn connection(engine: Engine, status: ConnStatus, databases: Vec<DatabaseNode>) 
             None
         },
         databases,
+        error: None,
     }
 }
 
@@ -282,4 +286,228 @@ async fn sqlite_file_pages_objects_reports_foreign_keys_and_does_not_pretend_a_m
         SchemaStatus::Failed { .. }
     ));
     assert!(failed.objects.is_empty());
+}
+
+#[test]
+fn refresh_keeps_the_loaded_window_and_a_failed_list_is_not_empty() {
+    assert_eq!(read_limit(120, 100), 120);
+    assert_eq!(read_limit(0, 100), 100);
+    assert_eq!(read_limit(0, 0), 100);
+
+    let nodes = assemble_postgres(
+        &["app".to_owned(), "other".to_owned()],
+        "app",
+        Ok(vec![schema("public", vec![row("orders")])]),
+    );
+    let other = nodes.iter().find(|item| item.name == "other").unwrap();
+    assert!(other.error.as_deref().unwrap().contains("没有另开连接"));
+    assert!(other.schemas.is_empty());
+    let current = nodes.iter().find(|item| item.name == "app").unwrap();
+    assert!(current.error.is_none());
+    assert_eq!(current.schemas[0].objects[0].name, "orders");
+
+    let failed_list = assemble_postgres(&["app".to_owned()], "app", Err("读取库表失败：permission denied".to_owned()));
+    assert!(failed_list[0].error.is_some());
+    assert!(failed_list[0].schemas.is_empty());
+
+    let previous = connection(
+        Engine::Postgres,
+        ConnStatus::Connected,
+        vec![DatabaseNode {
+            name: "app".to_owned(),
+            error: None,
+            schemas: vec![schema("public", vec![row("orders"), row("customers")])],
+        }],
+    );
+    let mut incoming = previous.clone();
+    incoming.databases.clear();
+    incoming.error = Some("读取库表失败：down".to_owned());
+    let kept = refresh_connection(&previous, &incoming);
+    assert_eq!(kept.databases[0].schemas[0].objects.len(), 2);
+    assert!(kept.error.as_deref().unwrap().contains("读取库表失败"));
+}
+
+#[test]
+fn catalog_commands_use_the_open_session_reader() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let capability: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("capabilities/default.json")).unwrap()).unwrap();
+    let permissions = capability["permissions"].as_array().unwrap();
+    let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
+    let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+    let wire = registration.split("fn wire").nth(1).unwrap_or("");
+    let wire = wire.split("pub fn run").next().unwrap_or("");
+    for command in ["catalog_sessions", "catalog_refresh", "catalog_page"] {
+        let allow = format!("allow-{}", command.replace('_', "-"));
+        assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
+        assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
+        assert!(wire.contains(&format!("catalog::commands::{command}")), "{command}");
+    }
+    assert!(wire.contains("connections::commands::connections_open"));
+    let reader = std::fs::read_to_string(root.join("src/catalog/read.rs")).unwrap();
+    assert!(reader.contains("metadata_sql"));
+    assert!(!reader.contains("PRAGMA foreign_keys"));
+    assert!(!reader.contains("read_sqlite_file"));
+    assert!(!reader.contains("read_sqlite_pool"));
+    assert!(!reader.contains("open_sqlite"));
+    assert!(!reader.contains("open_mysql"));
+    assert!(!reader.contains("open_postgres"));
+}
+
+#[tokio::test]
+async fn scripted_and_unreachable_sessions_fail_instead_of_an_empty_catalog() {
+    let scripted = read_catalog_session(Engine::Mysql, &CatalogSession::Scripted, 100, &[]).await;
+    assert!(scripted.databases.is_empty());
+    assert!(scripted.error.as_deref().unwrap().contains("没有可查询"));
+
+    let closed = page_for_session(None, "main", "", 0, 100).await;
+    assert!(closed.objects.is_empty());
+    assert!(closed.error.as_deref().unwrap().contains("连接未打开"));
+
+    let opts = mysql_async::OptsBuilder::default()
+        .ip_or_hostname("127.0.0.1")
+        .tcp_port(1)
+        .prefer_socket(Some(false))
+        .user(Some("catalog"))
+        .pass(Some("catalog"))
+        .db_name(Some("catalog"))
+        .pool_opts(mysql_async::PoolOpts::new().with_constraints(mysql_async::PoolConstraints::new(0, 1).unwrap()));
+    let pool = mysql_async::Pool::new(opts);
+    let failed = read_catalog_session(Engine::Mysql, &CatalogSession::Mysql(pool.clone()), 100, &[]).await;
+    drop(pool);
+    assert!(failed.databases.is_empty());
+    assert!(failed.error.as_deref().unwrap().contains("读取库表失败"));
+}
+
+#[tokio::test]
+async fn sqlite_catalog_reads_the_open_session_not_a_new_connection() {
+    let dir = std::env::temp_dir().join(format!("rillsql-catalog-session-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("notes.sqlite");
+    let setup = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE customers (id INTEGER PRIMARY KEY)")
+        .execute(&setup)
+        .await
+        .unwrap();
+    sqlx::query("CREATE VIEW v_notes AS SELECT 1 AS id")
+        .execute(&setup)
+        .await
+        .unwrap();
+    sqlx::query("CREATE INDEX idx_customers_id ON customers(id)")
+        .execute(&setup)
+        .await
+        .unwrap();
+    for index in 0..103 {
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TABLE audit_{index:04} (id INTEGER)")))
+            .execute(&setup)
+            .await
+            .unwrap();
+    }
+    setup.close().await;
+
+    let service = Service::new_for_test(dir.join("connections.sqlite"));
+    service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+    assert!(service.catalog_session("notes").is_some());
+    assert_eq!(service.open_session_ids(), vec!["notes".to_owned()]);
+    assert!(service.set_catalog_foreign_keys("notes", Some(true)));
+
+    let loaded = load_catalog(&service, 100, &[]).await.unwrap();
+    assert_eq!(loaded.len(), 1);
+    let connection = &loaded[0];
+    assert_eq!(connection.engine, "sqlite");
+    assert_eq!(connection.status, "connected");
+    assert_eq!(connection.foreign_keys, Some(true));
+    assert!(connection.error.is_none());
+    let schema = &connection.databases[0].schemas[0];
+    assert_eq!(schema.total, 105);
+    assert_eq!(schema.objects.len(), 100);
+    assert!(schema.objects.iter().all(|item| item.name != "idx_customers_id"));
+    assert!(schema.error.is_none());
+    let json = serde_json::to_value(connection).unwrap();
+    assert!(json.get("foreignKeys").is_some());
+    assert_eq!(json["databases"][0]["schemas"][0]["objects"][0]["estimatedRows"], serde_json::Value::Null);
+
+    let session = service.catalog_session("notes").unwrap();
+    let next = page_for_session(Some(&session), "main", "", 100, 100).await;
+    assert!(next.error.is_none());
+    assert_eq!(next.objects.len(), 5);
+    assert!(next.objects.iter().any(|item| item.name == "v_notes" && item.kind == "view"));
+    assert_eq!(next.total, 105);
+
+    let refreshed = read_catalog_session(
+        Engine::Sqlite,
+        &session,
+        100,
+        &[ObjectWindow {
+            database: "main".to_owned(),
+            schema: String::new(),
+            limit: 105,
+        }],
+    )
+    .await;
+    assert!(refreshed.error.is_none());
+    let full = &refreshed.databases[0].schemas[0];
+    assert_eq!(full.objects.len(), 105);
+    assert_eq!(full.total, 105);
+    let mut previous = connection_node_from_page(&connection.databases[0].schemas[0].objects, &next.objects);
+    previous.foreign_keys = Some(true);
+    let merged = refresh_connection(&previous, &body_as_node(&refreshed));
+    assert!(merged.databases[0].schemas[0].objects.iter().all(|item| !item.stale));
+    assert_eq!(merged.databases[0].schemas[0].objects.len(), 105);
+
+    match &session {
+        CatalogSession::Sqlite { pool, .. } => pool.close().await,
+        _ => panic!("会话应该是已经打开的 SQLite 池"),
+    }
+    let after_close = read_catalog_session(Engine::Sqlite, &session, 100, &[]).await;
+    assert!(after_close.databases.is_empty());
+    assert!(after_close.error.as_deref().unwrap().contains("读取库表失败"));
+    assert_eq!(after_close.foreign_keys, Some(true));
+    let kept = refresh_connection(&merged, &body_as_node(&after_close));
+    assert_eq!(kept.databases[0].schemas[0].objects.len(), 105);
+    assert!(kept.error.is_some());
+    drop(service);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn connection_node_from_page(first: &[super::commands::ObjectDto], second: &[super::commands::ObjectDto]) -> ConnectionNode {
+    let mut objects = Vec::new();
+    for item in first.iter().chain(second) {
+        objects.push(if item.kind == "view" {
+            ObjectRow::view(item.name.clone())
+        } else {
+            ObjectRow::table(item.name.clone(), item.estimated_rows)
+        });
+    }
+    let total = objects.len();
+    connection(
+        Engine::Sqlite,
+        ConnStatus::Connected,
+        vec![DatabaseNode {
+            name: "main".to_owned(),
+            error: None,
+            schemas: vec![SchemaNode {
+                name: String::new(),
+                objects,
+                total,
+                error: None,
+            }],
+        }],
+    )
+}
+
+fn body_as_node(body: &super::read::ConnectionBody) -> ConnectionNode {
+    ConnectionNode {
+        id: "notes".to_owned(),
+        name: "笔记".to_owned(),
+        engine: Engine::Sqlite,
+        status: ConnStatus::Connected,
+        foreign_keys: body.foreign_keys,
+        databases: body.databases.clone(),
+        error: body.error.clone(),
+    }
 }

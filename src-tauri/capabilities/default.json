@@ -14,6 +14,9 @@
     "allow-connections-open",
     "allow-connections-disconnect",
     "allow-connections-confirm-host-key",
-    "allow-connections-forget-host-key"
+    "allow-connections-forget-host-key",
+    "allow-catalog-sessions",
+    "allow-catalog-refresh",
+    "allow-catalog-page"
   ]
 }

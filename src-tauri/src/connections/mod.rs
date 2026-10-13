@@ -4,13 +4,15 @@ pub mod commands;
 mod drivers;
 mod forward;
 mod hostkey;
-mod model;
+pub(crate) mod model;
 mod route;
 mod secrets;
 mod service;
 mod stages;
 mod store;
 mod verify;
+
+pub use service::{CatalogSession, Service};
 
 pub fn module_id() -> &'static str {
     let _linked = (

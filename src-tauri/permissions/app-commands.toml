@@ -42,3 +42,18 @@ commands.allow = ["connections_confirm_host_key"]
 identifier = "allow-connections-forget-host-key"
 description = "允许忘记已保存的 SSH 主机密钥。"
 commands.allow = ["connections_forget_host_key"]
+
+[[permission]]
+identifier = "allow-catalog-sessions"
+description = "允许查看哪些连接会话已经打开。"
+commands.allow = ["catalog_sessions"]
+
+[[permission]]
+identifier = "allow-catalog-refresh"
+description = "允许从已打开的会话刷新库表。"
+commands.allow = ["catalog_refresh"]
+
+[[permission]]
+identifier = "allow-catalog-page"
+description = "允许从已打开的会话继续读取对象。"
+commands.allow = ["catalog_page"]

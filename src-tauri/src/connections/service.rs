@@ -100,19 +100,29 @@ struct PendingHostKey {
     fingerprint: String,
 }
 
-#[allow(dead_code)]
 enum SessionKind {
     Sqlite(sqlx::SqlitePool),
     Mysql(mysql_async::Pool),
-    Postgres(tokio_postgres::Client),
+    Postgres(Arc<tokio_postgres::Client>),
     Scripted,
 }
 
 struct Session {
     kind: SessionKind,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    #[allow(dead_code)]
     foreign_keys: Option<bool>,
+}
+
+/// 已打开会话的查询句柄。调用方只能拿去查元数据，不能据此再拨一条数据库连接。
+#[derive(Clone)]
+pub enum CatalogSession {
+    Sqlite {
+        pool: sqlx::SqlitePool,
+        foreign_keys: Option<bool>,
+    },
+    Mysql(mysql_async::Pool),
+    Postgres(Arc<tokio_postgres::Client>),
+    Scripted,
 }
 
 pub struct Service {
@@ -386,7 +396,7 @@ impl Service {
             } else if let Some(pool) = attempt.mysql_pool.take() {
                 SessionKind::Mysql(pool)
             } else if let Some(client) = attempt.postgres.take() {
-                SessionKind::Postgres(client)
+                SessionKind::Postgres(Arc::new(client))
             } else {
                 SessionKind::Scripted
             };
@@ -417,6 +427,66 @@ impl Service {
 
     fn log(&self, message: String) {
         self.logs.lock().expect("logs").push(message);
+    }
+
+    pub fn open_session_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.sessions.lock().expect("sessions").keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    pub fn catalog_session(&self, id: &str) -> Option<CatalogSession> {
+        let sessions = self.sessions.lock().expect("sessions");
+        let session = sessions.get(id)?;
+        Some(match &session.kind {
+            SessionKind::Sqlite(pool) => CatalogSession::Sqlite {
+                pool: pool.clone(),
+                foreign_keys: session.foreign_keys,
+            },
+            SessionKind::Mysql(pool) => CatalogSession::Mysql(pool.clone()),
+            SessionKind::Postgres(client) => CatalogSession::Postgres(Arc::clone(client)),
+            SessionKind::Scripted => CatalogSession::Scripted,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test(path: PathBuf) -> Self {
+        Self::new(path, Arc::new(super::secrets::MemoryStore::default()))
+    }
+
+    #[cfg(test)]
+    pub fn set_catalog_foreign_keys(&self, id: &str, value: Option<bool>) -> bool {
+        let mut sessions = self.sessions.lock().expect("sessions");
+        let Some(session) = sessions.get_mut(id) else {
+            return false;
+        };
+        session.foreign_keys = value;
+        true
+    }
+
+    #[cfg(test)]
+    pub async fn open_sqlite_for_test(&self, id: &str, name: &str, path: &Path) -> Result<(), String> {
+        let mut draft = ConnectionDraft::blank(Engine::Sqlite);
+        draft.id = Some(id.to_owned());
+        draft.name = name.to_owned();
+        draft.file_path = path.display().to_string();
+        self.save(draft, SecretInput::default()).await.map_err(|err| err.message())?;
+        let outcome = self.open(id, SecretInput::default()).await?;
+        if !outcome.connected {
+            let detail = outcome
+                .report
+                .stages
+                .iter()
+                .map(|stage| format!("{}:{:?}:{}", stage.label, stage.status, stage.message))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            return Err(format!(
+                "测试连接没有打开：{} {}",
+                outcome.report.summary.unwrap_or_default(),
+                detail
+            ));
+        }
+        Ok(())
     }
 }
 

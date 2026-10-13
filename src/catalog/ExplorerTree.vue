@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import SchemaBlock from "./SchemaBlock.vue";
-import { catalogConnections, refreshCatalog, schemaKey } from "./store";
+import { catalogConnections, catalogLoadError, refreshCatalog, schemaKey } from "./store";
 import { engineShape, isConnected, searchObjects, splitMatch } from "./tree";
 
 const props = defineProps<{ filter: string }>();
@@ -28,6 +28,7 @@ const STATUS_TEXT = {
 } as const;
 
 const connections = computed(() => catalogConnections());
+const loadError = computed(() => catalogLoadError());
 const matches = computed(() => searchObjects(connections.value, props.filter));
 const expanded = ref<Record<string, boolean>>({});
 
@@ -74,6 +75,14 @@ function depthStyle(depth: number) {
     <div class="tree-toolbar">
       <button class="link" type="button" data-action="tree-refresh" aria-label="刷新对象列表" @click="refreshCatalog()">刷新对象列表</button>
     </div>
+    <div v-if="loadError" class="tree-note err" data-load-error>
+      <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>
+      <div>
+        <strong>无法读取对象列表</strong>
+        <span>{{ loadError }}</span>
+        <button class="link" type="button" data-action="tree-retry" @click="refreshCatalog()">重试</button>
+      </div>
+    </div>
     <template v-if="filter.trim()">
       <div class="tree-filter-head">匹配 {{ matches.hits.length }} 个对象</div>
       <div
@@ -111,7 +120,7 @@ function depthStyle(depth: number) {
         <span>{{ matches.skipped.join("、") }} 未连接，未包含在结果中</span>
       </div>
     </template>
-    <p v-else-if="connections.length === 0" class="tree-note">还没有连接。连接后按引擎显示数据库、schema 和表。</p>
+    <p v-else-if="connections.length === 0 && !loadError" class="tree-note">还没有连接。连接后按引擎显示数据库、schema 和表。</p>
     <template v-else>
       <section v-for="connection in connections" :key="connection.id" :data-engine="connection.engine">
         <div
@@ -136,7 +145,16 @@ function depthStyle(depth: number) {
             <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="connection.status === 'lost' ? ICONS.warn : ICONS.info" /></svg>
             <span>{{ connection.status === "lost" ? "连接已断开，对象列表不再更新" : "未连接，连接后读取对象列表" }}</span>
           </div>
-          <template v-else-if="!engineShape(connection.engine).databases">
+          <template v-else>
+          <div v-if="connection.error" class="tree-note err" data-connection-error :style="depthStyle(1)">
+            <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>
+            <div>
+              <strong>无法读取对象列表</strong>
+              <span>{{ connection.error }}</span>
+              <button class="link" type="button" data-action="tree-retry" @click="refreshCatalog()">重试</button>
+            </div>
+          </div>
+          <template v-if="!engineShape(connection.engine).databases">
             <div v-if="connection.foreignKeys !== null" class="tree-note subtle" :style="depthStyle(1)" data-foreign-keys>
               <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.info" /></svg>
               <span>foreign_keys = {{ connection.foreignKeys ? "ON" : "OFF" }}</span>
@@ -210,6 +228,7 @@ function depthStyle(depth: number) {
                 </template>
               </template>
             </template>
+          </template>
           </template>
         </template>
       </section>

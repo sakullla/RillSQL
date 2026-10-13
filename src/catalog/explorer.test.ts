@@ -84,4 +84,14 @@ describe("explorer tree", () => {
     expect(wrapper.get('[data-schema=public][data-object=orders]').attributes("data-stale")).toBe("false");
     expect(wrapper.get('[data-schema=analytics][data-object=customers]').attributes("data-stale")).toBe("false");
   });
+
+  it("shows a retryable connection error instead of an empty database", () => {
+    const [postgres] = catalogFixture();
+    replaceCatalog([{ ...postgres, databases: [], error: "读取库表失败：permission denied" }]);
+    const wrapper = mount(ExplorerTree, { props: { filter: "" } });
+    expect(wrapper.get("[data-connection-error]").text()).toContain("无法读取对象列表");
+    expect(wrapper.get("[data-connection-error]").text()).toContain("permission denied");
+    expect(wrapper.text()).not.toContain("没有表");
+    expect(wrapper.text()).not.toContain("还没有连接");
+  });
 });

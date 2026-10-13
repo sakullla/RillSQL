@@ -34,6 +34,7 @@ export interface CatalogConnection {
   status: ConnStatus;
   defaultDatabase: string | null;
   foreignKeys: boolean | null;
+  error: string | null;
   databases: DatabaseNode[];
 }
 

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
-import { listPaletteTables } from "../catalog";
+import { listPaletteTables, startCatalog } from "../catalog";
 import ConnectionsPage from "../connections/ConnectionsPage.vue";
 import { listPaletteConnections } from "../connections";
 import HistoryPage from "../history/HistoryPage.vue";
@@ -164,6 +164,7 @@ onMounted(() => {
   void syncProductIdentity().then((info) => {
     dataDir.value = info?.data_dir ?? null;
   });
+  void startCatalog();
 });
 
 onBeforeUnmount(() => {

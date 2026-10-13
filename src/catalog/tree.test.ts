@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { MODULE_ID } from "./index";
 import { createRefreshFixture, catalogFixture } from "./fixtures";
 import { listPaletteTables, refreshCatalog, replaceCatalog, resetCatalog, setRefreshSource } from "./store";
-import { engineShape, objectPath, reconcileObjects, refreshSchema, schemaFailed, schemaIsEmpty, searchObjects } from "./tree";
+import { engineShape, objectPath, reconcileObjects, refreshConnection, refreshSchema, schemaFailed, schemaIsEmpty, searchObjects } from "./tree";
 import type { CatalogObject, SchemaNode } from "./types";
 
 function row(name: string, stale = false): CatalogObject {
@@ -50,6 +50,18 @@ describe("catalog tree", () => {
     const empty: SchemaNode = { name: "empty", objects: [], total: 0, error: null };
     expect(schemaIsEmpty(empty)).toBe(true);
     expect(schemaFailed(empty)).toBe(false);
+  });
+
+  it("keeps databases when the connection read fails", () => {
+    const [previous] = catalogFixture();
+    const failed = refreshConnection(previous, {
+      ...previous,
+      error: "读取库表失败：permission denied",
+      databases: [],
+    });
+    expect(failed.error).toContain("读取库表失败");
+    expect(failed.databases[0].schemas[0].objects.map((item) => item.name)).toEqual(["customers", "orders", "categories"]);
+    expect(schemaIsEmpty(failed.databases[0].schemas[0])).toBe(false);
   });
 
   it("omits disconnected and stale objects from the palette", () => {

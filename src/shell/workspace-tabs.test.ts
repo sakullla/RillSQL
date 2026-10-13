@@ -6,6 +6,7 @@ import { createSession } from "./session";
 
 vi.mock("../catalog", () => ({
   listPaletteTables: () => [{ id: "customers", label: "customers", path: "shop / public" }],
+  startCatalog: () => Promise.resolve(),
 }));
 
 import AppShell from "./AppShell.vue";

@@ -87,6 +87,21 @@ pub fn refresh_schema(previous: &SchemaNode, incoming: &SchemaNode) -> SchemaNod
 }
 
 pub fn refresh_connection(previous: &ConnectionNode, incoming: &ConnectionNode) -> ConnectionNode {
+    if incoming.error.is_some() && incoming.databases.is_empty() {
+        return ConnectionNode {
+            id: incoming.id.clone(),
+            name: incoming.name.clone(),
+            engine: incoming.engine,
+            status: incoming.status,
+            foreign_keys: if incoming.engine.shows_foreign_keys() {
+                incoming.foreign_keys.or(previous.foreign_keys)
+            } else {
+                None
+            },
+            databases: previous.databases.clone(),
+            error: incoming.error.clone(),
+        };
+    }
     let mut databases = Vec::new();
     for database in &incoming.databases {
         let Some(old_database) = previous
@@ -131,6 +146,7 @@ pub fn refresh_connection(previous: &ConnectionNode, incoming: &ConnectionNode) 
             None
         },
         databases,
+        error: incoming.error.clone(),
     }
 }
 

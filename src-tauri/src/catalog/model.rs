@@ -132,6 +132,8 @@ pub struct ConnectionNode {
     pub status: ConnStatus,
     pub foreign_keys: Option<bool>,
     pub databases: Vec<DatabaseNode>,
+    /// 库列表本身失败时填写。空的 databases 不能单独表示“没有库”。
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,5 +166,13 @@ pub fn metadata_sql(engine: Engine) -> MetadataSql {
             objects: "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT ?1 OFFSET ?2",
             foreign_keys: Some("PRAGMA foreign_keys"),
         },
+    }
+}
+
+pub fn object_count_sql(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Postgres => "SELECT COUNT(*)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm')",
+        Engine::Mysql | Engine::Mariadb => "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ?",
+        Engine::Sqlite => "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'",
     }
 }

@@ -54,6 +54,19 @@ export function refreshSchema(previous: SchemaNode, incoming: SchemaNode): Schem
 }
 
 export function refreshConnection(previous: CatalogConnection, incoming: CatalogConnection): CatalogConnection {
+  if (incoming.error && incoming.databases.length === 0) {
+    return {
+      ...incoming,
+      foreignKeys: incoming.engine === "sqlite" ? (incoming.foreignKeys ?? previous.foreignKeys) : null,
+      databases: previous.databases.map((database) => ({
+        ...database,
+        schemas: database.schemas.map((schema) => ({
+          ...schema,
+          objects: schema.objects.map((object) => ({ ...object })),
+        })),
+      })),
+    };
+  }
   const previousDatabases = new Map(previous.databases.map((database) => [database.name, database]));
   return {
     ...incoming,
