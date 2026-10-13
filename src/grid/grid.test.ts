@@ -331,6 +331,50 @@ describe("grid views", () => {
     wrapper.unmount();
   });
 
+  it("shows the database error when a commit stops on a constraint", async () => {
+    const duplicate = 'duplicate key value violates unique constraint "customers_email_key"\nDETAIL: Key (email)=(u2@example.com) already exists.';
+    invoke.mockImplementation(async (command: string, args: { request?: { changes?: { id: string }[] } }) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") {
+        return {
+          rows: [customerRow(1), customerRow(2)],
+          truncated: false,
+          sql: 'SELECT "id" FROM "public"."customers" LIMIT 10',
+        };
+      }
+      if (command === "grid_commit") {
+        const changes = args.request?.changes ?? [];
+        const id = changes[0]?.id ?? "missing";
+        return {
+          applied: [],
+          failed: { id, sql: "UPDATE customers SET email = 'u2@example.com'", label: id, message: duplicate },
+          pendingIds: changes.map((change) => change.id),
+          rolledBack: false,
+          rule: COMMIT_RULE,
+        };
+      }
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:shop:app:public:customers", draft: "", pageSize: 10, target: customersTarget } });
+    await flushPromises();
+    const email = wrapper.findAll("button.cell-btn").find((button) => button.text() === "u1@example.com");
+    await email!.trigger("dblclick");
+    await wrapper.get("input[aria-label='编辑 email']").setValue("u2@example.com");
+    await wrapper.findAll("button").find((button) => button.text() === "暂存")!.trigger("click");
+    await wrapper.findAll("button").find((button) => button.text() === "预览并提交")!.trigger("click");
+    await wrapper.findAll("button").find((button) => button.text() === "提交变更")!.trigger("click");
+    await flushPromises();
+    expect(wrapper.find("[aria-label='提交数据变更']").exists()).toBe(false);
+    const bar = wrapper.get(".pending-bar");
+    expect(bar.text()).toContain("1 行提交失败，仍留在暂存区");
+    expect(bar.text()).toContain('duplicate key value violates unique constraint "customers_email_key"');
+    expect(bar.text()).toContain("DETAIL: Key (email)=(u2@example.com) already exists.");
+    const failed = wrapper.get("tr.row-failed");
+    expect(failed.attributes("data-row-id")).toBe("1");
+    expect(failed.attributes("title")).toBe(duplicate);
+    wrapper.unmount();
+  });
+
   it("shows a read failure instead of no matches", async () => {
     invoke.mockRejectedValue(new Error("连接已断开，读取失败"));
     const wrapper = mount(DataGrid, { props: { tabId: "table:shop:app:public:broken", draft: "", target: { ...customersTarget, table: "broken" } } });

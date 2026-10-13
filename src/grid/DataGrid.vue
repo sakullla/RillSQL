@@ -35,6 +35,12 @@ const viewport = ref(0);
 const rowHeight = 28;
 
 const columns = computed(() => session?.store.schema.columns ?? []);
+function failureText(id: string, kind: "insert" | "data"): string {
+  if (!session) return "";
+  if (kind === "insert") return session.failures.get(id) ?? "";
+  return [session.failures.get(`u:${id}`), session.failures.get(`d:${id}`)].filter((message): message is string => !!message).join("\n");
+}
+
 const displayRows = computed(() => {
   if (!session) return [];
   const inserts = session.inserts.map((insert) => ({
@@ -43,6 +49,7 @@ const displayRows = computed(() => {
     located: false,
     deleted: false,
     failed: session.failures.has(insert.id),
+    failure: failureText(insert.id, "insert"),
   }));
   const data = session.loaded
     .filter((row) => !session.inserts.some((insert) => insert.id === row.id))
@@ -52,9 +59,11 @@ const displayRows = computed(() => {
       located: row.located,
       deleted: session.deletes.includes(row.id),
       failed: session.failures.has(`u:${row.id}`) || session.failures.has(`d:${row.id}`),
+      failure: failureText(row.id, "data"),
     }));
   return [...inserts, ...data];
 });
+const commitFailures = computed(() => (session ? Array.from(session.failures, ([id, message]) => ({ id, message })) : []));
 const windowStart = computed(() => (viewport.value === 0 ? 0 : Math.max(0, Math.floor(scrollTop.value / rowHeight) - 8)));
 const windowEnd = computed(() => (viewport.value === 0 ? displayRows.value.length : Math.min(displayRows.value.length, Math.ceil((scrollTop.value + viewport.value) / rowHeight) + 8)));
 const visibleRows = computed(() => displayRows.value.slice(windowStart.value, windowEnd.value));
@@ -201,7 +210,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
           </tr>
         </thead>
         <tbody>
-          <tr v-for="row in visibleRows" :key="row.id" :class="{ 'row-insert': row.kind === 'insert', 'row-delete': row.deleted, 'row-failed': row.failed }" :data-row-id="row.id" :data-located="row.located">
+          <tr v-for="row in visibleRows" :key="row.id" :class="{ 'row-insert': row.kind === 'insert', 'row-delete': row.deleted, 'row-failed': row.failed }" :data-row-id="row.id" :data-located="row.located" :title="row.failure || undefined">
             <td v-for="column in columns" :key="column.name">
               <div v-if="editing && editing.id === row.id && editing.column === column.name" class="editor">
                 <input v-model="editing.draft" :aria-label="`编辑 ${column.name}`" :disabled="editing.isNull" @keydown.enter.prevent="saveEdit" />
@@ -241,10 +250,11 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
     <div v-if="session.pendingCount || session.failures.size" class="pending-bar" role="region" aria-label="未提交的变更">
       <strong>{{ session.pendingCount }} 项变更未提交</strong>
       <span>修改 {{ session.edits.size }} 行 · 新增 {{ session.inserts.length }} 行 · 删除 {{ session.deletes.length }} 行</span>
-      <span v-if="session.failures.size">{{ session.failures.size }} 行提交失败，仍留在暂存区</span>
+      <span v-if="session.failures.size" class="err-text">{{ session.failures.size }} 行提交失败，仍留在暂存区</span>
       <span class="grow"></span>
       <button class="btn" type="button" @click="session.discard()">全部放弃</button>
       <button class="btn primary" type="button" :disabled="!session.pendingCount" @click="commitOpen = true">预览并提交</button>
+      <p v-for="failure in commitFailures" :key="failure.id" class="commit-failure" role="alert">{{ failure.message }}</p>
     </div>
     <section v-if="session.selectedId" class="inspector" aria-label="值查看器">
       <div class="inspector-meta">

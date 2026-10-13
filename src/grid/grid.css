@@ -104,6 +104,14 @@
 }
 .pending-bar { background: var(--warn-soft); color: var(--warn); }
 .pending-bar strong { color: var(--text); }
+.err-text { color: var(--err); font-weight: 600; }
+.commit-failure {
+  flex: 1 0 100%;
+  margin: 0;
+  color: var(--err);
+  font-weight: 600;
+  white-space: pre-wrap;
+}
 .editor {
   display: flex;
   gap: 4px;
