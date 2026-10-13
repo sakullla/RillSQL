@@ -1,10 +1,14 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { clearFinishedTasks, exportTasks } from "./tasks";
+import { cancelRemoteExport, clearFinishedTasks, exportTasks } from "./tasks";
 
 const open = ref(false);
 const running = computed(() => exportTasks.find((task) => task.status === "running"));
 const label = computed(() => (running.value ? `导出 ${running.value.doneRows}/${running.value.totalRows}` : "任务"));
+
+function cancel(id: string) {
+  void cancelRemoteExport(id);
+}
 
 function statusText(status: string, partial: boolean, done: number, total: number, message: string): string {
   if (status === "running") return `${done} / ${total} 行`;
@@ -29,6 +33,7 @@ function statusText(status: string, partial: boolean, done: number, total: numbe
       <article v-for="task in exportTasks" :key="task.id" class="task-row" :data-status="task.status">
         <div class="task-top">
           <span class="task-name" :title="task.path">{{ task.fileName }}</span>
+          <button v-if="task.status === 'running'" class="btn" type="button" @click="cancel(task.id)">取消</button>
         </div>
         <div class="progress" aria-hidden="true"><i :style="{ width: `${Math.floor((task.doneRows / Math.max(1, task.totalRows)) * 100)}%` }"></i></div>
         <small>{{ statusText(task.status, task.partial, task.doneRows, task.totalRows, task.message) }}</small>

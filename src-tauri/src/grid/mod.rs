@@ -1,6 +1,8 @@
-//! 表数据浏览、逐条提交和 CSV 导出。没有真实连接时由夹具执行。
+//! 表数据浏览、逐条提交和 CSV 导出。正式路径使用已经打开的连接会话。
 
+pub mod commands;
 mod export;
+mod live;
 mod sql;
 mod store;
 
@@ -14,6 +16,8 @@ pub fn module_id() -> &'static str {
         std::any::type_name_of_val(&export::plan_export),
         std::any::type_name_of_val(&export::touch_api),
         std::any::type_name_of_val(&export::start_export),
+        std::any::type_name_of_val(&commands::grid_page),
+        std::any::type_name_of_val(&live::describe),
         std::any::type_name_of_val(&store::customers_fixture),
         std::any::type_name_of_val(&store::nokey_fixture),
         std::any::type_name_of_val(&store::touch_api),

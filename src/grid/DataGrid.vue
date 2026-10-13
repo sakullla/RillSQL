@@ -1,19 +1,27 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from "vue";
+import { computed, reactive, ref, watch } from "vue";
 import ExportDialog from "../export/ExportDialog.vue";
 import { planExport, type ExportScope } from "../export/plan";
-import { runExportTask } from "../export/tasks";
+import { runRemoteExport } from "../export/tasks";
 import type { CsvOptions } from "../export/csv";
-import { queryPage } from "./data";
+import { loadSettings } from "../shell/settings";
 import { copyPlain, copySqlValue, previewText, showCell, type NullCopy } from "./display";
-import { fixtureForTab } from "./fixture";
 import "./grid.css";
-import { TableSession } from "./session";
+import { LiveTable } from "./live";
+import type { TableTarget } from "./target";
 import { FILTER_OPS, opLabel, opNeedsValue, type Cell, type FilterOp } from "./types";
 
-const props = defineProps<{ tabId: string; draft: string; pageSize?: number; nullCopy?: NullCopy }>();
-const session = reactive(new TableSession(fixtureForTab(props.tabId), props.pageSize ?? 100));
-const filterColumn = ref(session.store.schema.columns[0]?.name ?? "");
+const props = defineProps<{ tabId: string; draft: string; pageSize?: number; nullCopy?: NullCopy; target?: TableTarget | null }>();
+const session = props.target ? reactive(new LiveTable(props.target, props.pageSize ?? loadSettings().pageSize)) : null;
+if (session) void session.open();
+const filterColumn = ref("");
+watch(
+  () => session?.store.schema.columns[0]?.name ?? "",
+  (name) => {
+    if (name && !filterColumn.value) filterColumn.value = name;
+  },
+  { immediate: true },
+);
 const filterOp = ref<FilterOp>("eq");
 const filterValue = ref("");
 const filterError = ref("");
@@ -26,8 +34,9 @@ const scrollTop = ref(0);
 const viewport = ref(0);
 const rowHeight = 28;
 
-const columns = computed(() => session.store.schema.columns);
+const columns = computed(() => session?.store.schema.columns ?? []);
 const displayRows = computed(() => {
+  if (!session) return [];
   const inserts = session.inserts.map((insert) => ({
     id: insert.id,
     kind: "insert" as const,
@@ -58,16 +67,17 @@ function onScroll(event: Event) {
   viewport.value = element.clientHeight;
 }
 
-const selectedColumn = computed(() => columns.value.find((column) => column.name === session.selectedColumn) ?? null);
-const selectedRaw = computed(() => (session.selectedId && session.selectedColumn ? session.cellValue(session.selectedId, session.selectedColumn) : undefined));
+const selectedColumn = computed(() => columns.value.find((column) => column.name === session?.selectedColumn) ?? null);
+const selectedRaw = computed(() => (session?.selectedId && session.selectedColumn ? session.cellValue(session.selectedId, session.selectedColumn) : undefined));
 const selectedShown = computed(() => showCell(selectedRaw.value));
-const previewRows = computed(() => session.loaded.slice(0, 4).map((row) => ({ ...row.cells })));
+const previewRows = computed(() => session?.loaded.slice(0, 4).map((row) => ({ ...row.cells })) ?? []);
 
-function applyFilter() {
+async function applyFilter() {
+  if (!session) return;
   filterError.value = "";
-  const error = session.addFilter({ column: filterColumn.value, op: filterOp.value, value: filterValue.value });
+  const error = await session.addFilter({ column: filterColumn.value, op: filterOp.value, value: filterValue.value });
   if (error && !session.error) filterError.value = error;
-  else filterValue.value = "";
+  else if (!error) filterValue.value = "";
 }
 
 function beginEdit(id: string, column: string) {
@@ -119,35 +129,39 @@ function editDisabled(): boolean {
   return !session.canDeleteRow(session.selectedId);
 }
 
-function readAll() {
-  const page = queryPage(session.store, { filters: session.filters, sort: session.sort, offset: 0, limit: 1_000_000 });
-  if (!page.ok) return [];
-  return page.rows.map((row) => ({ ...row.cells }));
-}
-
 function startExport(payload: { scope: ExportScope; acknowledged: boolean; path: string; csv: CsvOptions }) {
+  if (!session?.target) return;
   const plan = planExport({
     origin: "table",
     scope: payload.scope,
     truncated: session.truncated,
     fileName: payload.path,
   });
-  const loaded = session.loaded.map((row) => ({ ...row.cells }));
-  runExportTask({
+  void runRemoteExport({
     plan,
     acknowledged: payload.acknowledged,
     path: plan.fileName,
-    columns: columns.value.map((column) => column.name),
-    rows: loaded,
     csv: payload.csv,
-    readRows: readAll,
+    mode: payload.scope === "full" ? "table-full" : "table-loaded",
+    connectionId: session.target.connectionId,
+    database: session.target.database,
+    schema: session.target.schema,
+    table: session.target.table,
+    engine: session.target.engine,
+    filters: session.filters,
+    sort: session.sort,
+    limit: payload.scope === "loaded" ? session.loaded.length : 0,
+    truncated: session.truncated,
+    statement: "",
   });
   exportOpen.value = false;
 }
 </script>
 
 <template>
-  <div class="data-grid" aria-label="数据表格" :data-tab-id="tabId" :data-draft="draft" :data-loaded="session.loaded.length" :data-truncated="session.truncated">
+  <div class="data-grid" aria-label="数据表格" :data-tab-id="tabId" :data-draft="draft" :data-loaded="session ? session.loaded.length : 0" :data-truncated="session ? session.truncated : false">
+    <p v-if="!session" class="grid-alert" role="alert">没有绑定已打开的表，不能用示例数据代替。</p>
+    <template v-else>
     <div class="grid-toolbar">
       <form class="filter-form" @submit.prevent="applyFilter">
         <select v-model="filterColumn" aria-label="筛选列">
@@ -166,7 +180,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
       <span v-if="session.sort" class="chip">{{ session.sort.column }} {{ session.sort.direction === "asc" ? "升序" : "降序" }}
         <button class="chip-x" type="button" aria-label="清除排序" @click="session.clearSort()">×</button>
       </span>
-      <span class="scope-tag server">服务器端 · 整张表</span>
+      <span class="scope-tag server">{{ session.scopeLabel }}</span>
       <span class="grow"></span>
       <span class="key-chip" :class="session.store.schema.key.length ? 'ok' : 'warn'">{{ session.keyLabel }}</span>
       <button class="btn" type="button" :disabled="!session.canInsert" @click="session.addRow()">新增行</button>
@@ -281,5 +295,6 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
       @close="exportOpen = false"
       @start="startExport"
     />
+    </template>
   </div>
 </template>

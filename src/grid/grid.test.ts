@@ -1,5 +1,10 @@
-import { mount } from "@vue/test-utils";
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { flushPromises, mount } from "@vue/test-utils";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as csvWrite from "../export/write";
+import { exportTasks, resetExportTasks } from "../export/tasks";
 import DataGrid from "./DataGrid.vue";
 import { commitChanges, queryPage, viewLoadedRows } from "./data";
 import { copyPlain, copySqlValue, showCell } from "./display";
@@ -7,7 +12,14 @@ import { customersFixture, nokeyFixture, viewFixture } from "./fixture";
 import QueryResultGrid from "./QueryResultGrid.vue";
 import { TableSession } from "./session";
 import { selectExportGate } from "./sql";
-import { COMMIT_RULE } from "./types";
+import type { TableTarget } from "./target";
+import { COMMIT_RULE, type Column } from "./types";
+
+const invoke = vi.hoisted(() => vi.fn());
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke,
+}));
 
 describe("grid batches, nulls and server filters", () => {
   it("loads one batch and keeps the truncated rows for a later read", () => {
@@ -170,10 +182,88 @@ describe("query results stay on the loaded rows", () => {
   });
 });
 
+const customersTarget: TableTarget = {
+  connectionId: "shop",
+  database: "app",
+  schema: "public",
+  table: "customers",
+  engine: "postgres",
+};
+
+const notesTarget: TableTarget = {
+  connectionId: "local",
+  database: "main",
+  schema: "",
+  table: "notes",
+  engine: "sqlite",
+};
+
+function column(name: string, flags: Partial<Column> = {}): Column {
+  return {
+    name,
+    typeName: "text",
+    nullable: flags.nullable ?? true,
+    primary: flags.primary ?? false,
+    unique: flags.unique ?? false,
+    auto: flags.auto ?? false,
+  };
+}
+
+function customerSchema() {
+  return {
+    engine: "postgres",
+    database: "app",
+    schema: "public",
+    name: "customers",
+    kind: "table",
+    key: ["id"],
+    columns: [
+      column("id", { primary: true, unique: true, auto: true, nullable: false }),
+      column("name", { nullable: false }),
+      column("email", { nullable: false, unique: true }),
+      column("note"),
+    ],
+  };
+}
+
+function customerRow(id: number) {
+  const note = id === 1 ? null : id === 2 ? "" : id === 3 ? "长".repeat(2000) : `备注${id}`;
+  return {
+    id: String(id),
+    cells: { id: String(id), name: `客户${id}`, email: `u${id}@example.com`, note },
+    located: true,
+    locatorColumns: ["id"],
+    locatorValues: [String(id)],
+  };
+}
+
 describe("grid views", () => {
-  it("shows a truncated batch, nulls and the server scope for a table tab", async () => {
-    const wrapper = mount(DataGrid, { props: { tabId: "table:customers", draft: "" } });
-    expect(wrapper.attributes("data-tab-id")).toBe("table:customers");
+  beforeEach(() => {
+    invoke.mockReset();
+    resetExportTasks();
+  });
+
+  it("reads an opened table through grid commands instead of the fixture", async () => {
+    expect(readFileSync(join(process.cwd(), "src/grid/DataGrid.vue"), "utf8")).not.toContain("fixtureForTab");
+    expect(readFileSync(join(process.cwd(), "src/grid/QueryResultGrid.vue"), "utf8")).not.toContain("readRows");
+    invoke.mockImplementation(async (command: string, args: { request?: { offset?: number; limit?: number; table?: string } }) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") {
+        const offset = args.request?.offset ?? 0;
+        const limit = args.request?.limit ?? 100;
+        const rows = Array.from({ length: 130 }, (_, index) => customerRow(index + 1)).slice(offset, offset + limit);
+        return { rows, truncated: offset + limit < 130, sql: `SELECT "id" FROM "public"."customers" LIMIT ${limit}` };
+      }
+      if (command === "grid_count") return { matched: 130 };
+      if (command === "grid_export") {
+        return { status: "done", success: true, writtenRows: 100, path: args.request && "path" in args.request ? String((args.request as { path?: string }).path) : "", residualPath: null, message: "已导出", partial: true };
+      }
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:shop:app:public:customers", draft: "", pageSize: 100, target: customersTarget } });
+    await flushPromises();
+    expect(invoke.mock.calls.map((call) => call[0])).toEqual(expect.arrayContaining(["grid_describe", "grid_page"]));
+    expect(wrapper.attributes("data-tab-id")).toBe("table:shop:app:public:customers");
     expect(wrapper.attributes("data-draft")).toBe("");
     expect(wrapper.text()).toContain("已读取");
     expect(wrapper.text()).toContain("100");
@@ -182,27 +272,83 @@ describe("grid views", () => {
     expect(wrapper.find(".v-null").text()).toBe("NULL");
     expect(wrapper.text()).toContain("空字符串");
     expect(wrapper.text()).not.toContain("长".repeat(200));
+    const pageCall = invoke.mock.calls.find((call) => call[0] === "grid_page");
+    expect(pageCall?.[1]).toMatchObject({ request: { connectionId: "shop", table: "customers", limit: 100, offset: 0 } });
+    const writeSpy = vi.spyOn(csvWrite, "writeCsvFile");
+    const exportButton = wrapper.findAll("button").find((button) => button.text() === "导出");
+    await exportButton!.trigger("click");
+    const dir = mkdtempSync(join(tmpdir(), "rillsql-grid-view-"));
+    await wrapper.get("input[aria-label='导出路径']").setValue(join(dir, "customers.csv"));
+    const start = wrapper.findAll("button").filter((button) => button.text() === "导出").at(-1)!;
+    await start.trigger("click");
+    await flushPromises();
+    const exported = invoke.mock.calls.find((call) => call[0] === "grid_export");
+    expect(exported?.[1]).toMatchObject({ request: { mode: "table-loaded", connectionId: "shop", table: "customers", truncated: true, limit: 100 } });
+    expect(JSON.stringify(exported?.[1])).toContain("（部分）");
+    expect(writeSpy).not.toHaveBeenCalled();
+    writeSpy.mockRestore();
+    rmSync(dir, { recursive: true, force: true });
     await wrapper.get("button[aria-label='继续读取']").trigger("click");
+    await flushPromises();
     expect(wrapper.attributes("data-loaded")).toBe("130");
     expect(wrapper.attributes("data-truncated")).toBe("false");
     wrapper.unmount();
   });
 
-  it("disables changes for rows that cannot be located", () => {
-    const wrapper = mount(DataGrid, { props: { tabId: "table:nokey", draft: "x" } });
+  it("disables changes for rows that cannot be located", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") {
+        return {
+          engine: "sqlite",
+          database: "main",
+          schema: "",
+          name: "notes",
+          kind: "table",
+          key: [],
+          columns: [column("label")],
+        };
+      }
+      if (command === "grid_page") {
+        return {
+          rows: [
+            { id: "o:0:0", cells: { label: "重复" }, located: false, locatorColumns: [], locatorValues: [] },
+            { id: "o:0:1", cells: { label: "重复" }, located: false, locatorColumns: [], locatorValues: [] },
+          ],
+          truncated: false,
+          sql: 'SELECT "label" FROM "notes" LIMIT 10',
+        };
+      }
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:local:main::notes", draft: "x", pageSize: 10, target: notesTarget } });
+    await flushPromises();
     const add = wrapper.findAll("button").find((button) => button.text() === "新增行");
     const remove = wrapper.findAll("button").find((button) => button.text() === "删除行");
     expect(add!.attributes("disabled")).toBeUndefined();
     expect(remove!.attributes("disabled")).toBeDefined();
     expect(wrapper.text()).toContain("无主键 · 只能新增");
+    expect(invoke.mock.calls.some((call) => call[0] === "grid_describe")).toBe(true);
     wrapper.unmount();
   });
 
-  it("shows a read failure instead of no matches", () => {
-    const wrapper = mount(DataGrid, { props: { tabId: "table:broken", draft: "" } });
+  it("shows a read failure instead of no matches", async () => {
+    invoke.mockRejectedValue(new Error("连接已断开，读取失败"));
+    const wrapper = mount(DataGrid, { props: { tabId: "table:shop:app:public:broken", draft: "", target: { ...customersTarget, table: "broken" } } });
+    await flushPromises();
     expect(wrapper.text()).toContain("读取失败");
     expect(wrapper.text()).toContain("这不是无匹配结果");
     expect(wrapper.text()).not.toContain("没有匹配行");
+    wrapper.unmount();
+  });
+
+  it("keeps an unbound table tab empty instead of showing fixture rows", async () => {
+    const wrapper = mount(DataGrid, { props: { tabId: "table:customers", draft: "" } });
+    await flushPromises();
+    expect(wrapper.attributes("data-tab-id")).toBe("table:customers");
+    expect(wrapper.attributes("data-draft")).toBe("");
+    expect(wrapper.text()).toContain("没有绑定已打开的表，不能用示例数据代替。");
+    expect(invoke).not.toHaveBeenCalled();
+    expect(wrapper.text()).not.toContain("客户1");
     wrapper.unmount();
   });
 
@@ -225,6 +371,52 @@ describe("grid views", () => {
     await exportButton!.trigger("click");
     await wrapper.get("input[value='full']").setValue("full");
     expect(wrapper.text()).toContain("只有 SELECT 可以重新执行并全量导出");
+    wrapper.unmount();
+  });
+
+  it("re-executes a select on the open connection and does not write loaded rows as the full file", async () => {
+    const store = customersFixture(4);
+    const secret = "仅已加载的秘密";
+    const rows = store.rows.slice(0, 2).map((row) => ({ ...row, cells: { ...row.cells, note: secret } }));
+    invoke.mockResolvedValue({
+      status: "done",
+      success: true,
+      writtenRows: 4,
+      path: "q.csv",
+      residualPath: null,
+      message: "已导出 4 行。",
+      partial: false,
+    });
+    const wrapper = mount(QueryResultGrid, {
+      props: {
+        tabId: "query-1",
+        statement: "SELECT id, note FROM customers",
+        columns: store.schema.columns,
+        rows,
+        truncated: true,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+        schema: "public",
+      },
+    });
+    await wrapper.get("button").trigger("click");
+    const open = wrapper.findAll("button").find((button) => button.text() === "导出");
+    await open!.trigger("click");
+    await wrapper.get("input[value='full']").setValue(true);
+    await wrapper.get("input[type='checkbox']").setValue(true);
+    const dir = mkdtempSync(join(tmpdir(), "rillsql-query-full-"));
+    await wrapper.get("input[aria-label='导出路径']").setValue(join(dir, "query.csv"));
+    const start = wrapper.findAll("button").filter((button) => button.text() === "导出").at(-1)!;
+    await start.trigger("click");
+    await flushPromises();
+    const call = invoke.mock.calls.find((item) => item[0] === "grid_export");
+    expect(call?.[1]).toMatchObject({
+      request: { mode: "query", connectionId: "shop", statement: "SELECT id, note FROM customers", acknowledged: true },
+    });
+    expect(JSON.stringify(call?.[1])).not.toContain(secret);
+    expect(exportTasks[0]?.status).toBe("done");
+    rmSync(dir, { recursive: true, force: true });
     wrapper.unmount();
   });
 });

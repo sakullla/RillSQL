@@ -3,11 +3,11 @@ import { computed, ref } from "vue";
 import ExportDialog from "../export/ExportDialog.vue";
 import type { CsvOptions } from "../export/csv";
 import { planExport, type ExportScope } from "../export/plan";
-import { runExportTask } from "../export/tasks";
+import { runExportTask, runRemoteExport } from "../export/tasks";
 import { viewLoadedRows } from "./data";
 import { showCell } from "./display";
 import "./grid.css";
-import type { Cell, Column, Row, SortSpec } from "./types";
+import type { Cell, Column, Engine, Row, SortSpec } from "./types";
 
 const props = defineProps<{
   tabId: string;
@@ -15,6 +15,10 @@ const props = defineProps<{
   columns: Column[];
   rows: Row[];
   truncated: boolean;
+  connectionId?: string;
+  engine?: Engine;
+  database?: string;
+  schema?: string;
 }>();
 
 const find = ref("");
@@ -40,6 +44,47 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
     truncated: props.truncated,
     fileName: payload.path,
   });
+  if (payload.scope === "full") {
+    if (!plan.allowed || !props.connectionId) {
+      const blocked = plan.allowed
+        ? {
+            ...plan,
+            allowed: false,
+            serverRead: false,
+            reexecutes: false,
+            rejectReason: "查询结果没有绑定已打开的连接，不能把已加载行当成全量导出。",
+          }
+        : plan;
+      runExportTask({
+        plan: blocked,
+        acknowledged: payload.acknowledged,
+        path: plan.fileName,
+        columns: props.columns.map((column) => column.name),
+        rows: [],
+        csv: payload.csv,
+      });
+    } else {
+      void runRemoteExport({
+        plan,
+        acknowledged: payload.acknowledged,
+        path: plan.fileName,
+        csv: payload.csv,
+        mode: "query",
+        connectionId: props.connectionId,
+        database: props.database ?? "",
+        schema: props.schema ?? "",
+        table: "",
+        engine: props.engine ?? "postgres",
+        filters: [],
+        sort: null,
+        limit: 0,
+        truncated: props.truncated,
+        statement: props.statement,
+      });
+    }
+    exportOpen.value = false;
+    return;
+  }
   runExportTask({
     plan,
     acknowledged: payload.acknowledged,
@@ -47,7 +92,6 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
     columns: props.columns.map((column) => column.name),
     rows: props.rows.map(cells),
     csv: payload.csv,
-    readRows: () => props.rows.map(cells),
   });
   exportOpen.value = false;
 }

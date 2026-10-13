@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import { catalogConnections } from "../catalog/store";
 import DataGrid from "../grid/DataGrid.vue";
+import { resolveTableTarget } from "../grid/target";
 import QueryTab from "../query/QueryTab.vue";
 import StructurePane from "../structure/StructurePane.vue";
 import Icon from "./Icon.vue";
 import type { ShellTab } from "./session";
+import { loadSettings } from "./settings";
 import WelcomeView from "./WelcomeView.vue";
 
 const props = defineProps<{ tabs: ShellTab[]; activeId: string | null }>();
@@ -20,6 +23,11 @@ const emit = defineEmits<{
 }>();
 
 const active = computed(() => props.tabs.find((tab) => tab.id === props.activeId) ?? null);
+const pageSize = computed(() => loadSettings().pageSize);
+
+function tableTarget(tabId: string) {
+  return resolveTableTarget(tabId, catalogConnections());
+}
 
 function onDraft(tabId: string, draft: string) {
   emit("draft", tabId, draft);
@@ -62,6 +70,8 @@ function onDraft(tabId: string, draft: string) {
       :key="active.id"
       :tab-id="active.id"
       :draft="active.draft"
+      :page-size="pageSize"
+      :target="tableTarget(active.id)"
     />
     <StructurePane
       v-else-if="active && active.kind === 'structure'"

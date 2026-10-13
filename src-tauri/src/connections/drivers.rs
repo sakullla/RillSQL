@@ -25,10 +25,12 @@ pub async fn open_sqlite(path: &Path) -> Result<SqliteOpen, StageError> {
     if path.as_os_str().is_empty() {
         return Err(stages::fail("请选择数据库文件", "SQLite 只打开已有文件。"));
     }
+    // 表编辑和目录元数据共用这一条已打开的会话，不再为写入另开只读连接。
     let options = sqlx::sqlite::SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false)
-        .read_only(true);
+        .busy_timeout(Duration::from_secs(5))
+        .read_only(false);
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(options)
@@ -78,6 +80,10 @@ pub async fn open_mysql(config: &SavedConnection, route: &Route, password: &str)
     if let Some(database) = &config.database {
         builder = builder.db_name(Some(database.clone()));
     }
+    // 目录和表浏览共用池里的这一条连接，查询时不再额外拨号。
+    builder = builder.pool_opts(
+        mysql_async::PoolOpts::new().with_constraints(mysql_async::PoolConstraints::new(0, 1).expect("mysql pool")),
+    );
     if plan.ssl_opts_present {
         builder = builder.ssl_opts(Some(mysql_ssl(&plan, config.tls.as_ref())?));
     }

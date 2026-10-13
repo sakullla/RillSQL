@@ -44,6 +44,15 @@ fn wire<R: tauri::Runtime>(builder: tauri::Builder<R>, state: connections::comma
         connections::commands::connections_disconnect,
         connections::commands::connections_confirm_host_key,
         connections::commands::connections_forget_host_key,
+        catalog::commands::catalog_sessions,
+        catalog::commands::catalog_refresh,
+        catalog::commands::catalog_page,
+        grid::commands::grid_describe,
+        grid::commands::grid_page,
+        grid::commands::grid_count,
+        grid::commands::grid_commit,
+        grid::commands::grid_export,
+        grid::commands::grid_export_cancel,
     ])
 }
 
