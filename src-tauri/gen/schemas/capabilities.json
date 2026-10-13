@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"澄库主窗口：默认核心权限与文件对话框。","local":true,"windows":["main"],"permissions":["core:default","dialog:default"]}}

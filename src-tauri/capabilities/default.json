@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "澄库主窗口：默认核心权限与文件对话框。",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:default"]
+}

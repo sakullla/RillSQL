@@ -1,0 +1,123 @@
+/* 色彩令牌与原型 styles/app.css 一致。浅色、深色由 data-theme 切换。 */
+:root {
+  --font: "Segoe UI Variable Text", "Segoe UI", -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+  --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", "SF Mono", Consolas, "Microsoft YaHei", monospace;
+  --r-sm: 4px;
+  --r: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --row-h: 28px;
+  --tree-h: 28px;
+  --editor-font: 13px;
+  --titlebar-h: 40px;
+  --status-h: 26px;
+  --rail-w: 60px;
+}
+
+:root[data-density="comfortable"] {
+  --row-h: 34px;
+  --tree-h: 32px;
+}
+
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f3f5f4;
+  --chrome: #eef1f0;
+  --panel: #ffffff;
+  --panel-2: #f8faf9;
+  --sunken: #f0f3f2;
+  --hover: #e9eeec;
+  --active: #e0e7e4;
+  --text: #1b2623;
+  --text-2: #52615c;
+  --text-3: #7f8c87;
+  --line: #e1e6e4;
+  --line-2: #cfd7d4;
+  --accent: #0f7f68;
+  --accent-hover: #0b6c58;
+  --accent-soft: #e0f1eb;
+  --accent-text: #0b6956;
+  --on-accent: #ffffff;
+  --ok: #157a4b;
+  --ok-soft: #e3f3e8;
+  --warn: #8f5507;
+  --warn-soft: #fdf1da;
+  --warn-line: #efd6a3;
+  --err: #bb3529;
+  --err-soft: #fcebe8;
+  --err-line: #f1c5bf;
+  --info: #2563a8;
+  --info-soft: #e7effa;
+  --sel: rgba(15, 127, 104, 0.08);
+  --sel-strong: rgba(15, 127, 104, 0.16);
+  --shadow-sm: 0 1px 2px rgba(18, 32, 28, 0.06);
+  --shadow: 0 10px 28px rgba(18, 32, 28, 0.12), 0 1px 3px rgba(18, 32, 28, 0.06);
+  --shadow-lg: 0 28px 70px rgba(18, 32, 28, 0.24), 0 2px 6px rgba(18, 32, 28, 0.08);
+  --tk-kw: #7c45c9;
+  --tk-str: #a2530c;
+  --tk-num: #0b65c2;
+  --tk-com: #869490;
+  --tk-fn: #0f7f68;
+  --tk-id: #1b2623;
+  --env-dev: #0f7f68;
+  --env-test: #2563a8;
+  --env-prod: #c4321f;
+  --env-local: #7354e0;
+  --env-none: #7f8c87;
+  --eng-postgres: #336791;
+  --eng-mysql: #00718a;
+  --eng-mariadb: #a65632;
+  --eng-sqlite: #1f78b8;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0e1312;
+  --chrome: #111716;
+  --panel: #151b1a;
+  --panel-2: #192120;
+  --sunken: #121817;
+  --hover: #1e2826;
+  --active: #26312e;
+  --text: #dfe7e4;
+  --text-2: #a3b1ac;
+  --text-3: #73827d;
+  --line: #222b29;
+  --line-2: #2f3b38;
+  --accent: #4fc7a2;
+  --accent-hover: #6cd4b3;
+  --accent-soft: #173a30;
+  --accent-text: #6cd4b3;
+  --on-accent: #052219;
+  --ok: #5fce90;
+  --ok-soft: #15301f;
+  --warn: #e8b660;
+  --warn-soft: #30261a;
+  --warn-line: #574421;
+  --err: #f2897d;
+  --err-soft: #391e1b;
+  --err-line: #5c2d28;
+  --info: #82b4ec;
+  --info-soft: #172638;
+  --sel: rgba(79, 199, 162, 0.08);
+  --sel-strong: rgba(79, 199, 162, 0.18);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow: 0 12px 30px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 30px 80px rgba(0, 0, 0, 0.6), 0 2px 6px rgba(0, 0, 0, 0.35);
+  --tk-kw: #c5a3ff;
+  --tk-str: #e8b37d;
+  --tk-num: #7ab7fb;
+  --tk-com: #6b7a75;
+  --tk-fn: #6cd4b3;
+  --tk-id: #dfe7e4;
+  --env-dev: #4fc7a2;
+  --env-test: #82b4ec;
+  --env-prod: #f2897d;
+  --env-local: #b3a1ff;
+  --env-none: #73827d;
+  --eng-postgres: #8bb3dc;
+  --eng-mysql: #5fbfd3;
+  --eng-mariadb: #e2a07f;
+  --eng-sqlite: #77b9ea;
+}
