@@ -15,9 +15,15 @@ const emit = defineEmits<{
   connections: [];
   sqlite: [];
   palette: [];
+  structure: [];
+  draft: [id: string, draft: string];
 }>();
 
 const active = computed(() => props.tabs.find((tab) => tab.id === props.activeId) ?? null);
+
+function onDraft(tabId: string, draft: string) {
+  emit("draft", tabId, draft);
+}
 </script>
 
 <template>
@@ -34,7 +40,7 @@ const active = computed(() => props.tabs.find((tab) => tab.id === props.activeId
     >
       <Icon :name="tab.kind === 'query' ? 'code' : 'table'" />
       <span class="tab-title">{{ tab.title }}</span>
-      <span class="tab-conn none">{{ tab.targetText ?? "未绑定" }}</span>
+      <span class="tab-conn none">{{ tab.targetText || tab.path || "未绑定" }}</span>
       <button class="tab-x" type="button" :aria-label="`关闭 ${tab.title}`" title="关闭" @click.stop="emit('close', tab.id)">
         <Icon name="x" />
       </button>
@@ -44,15 +50,32 @@ const active = computed(() => props.tabs.find((tab) => tab.id === props.activeId
     </button>
   </div>
   <div class="tab-body" id="tab-body">
-    <QueryTab v-if="active?.kind === 'query'" />
-    <DataGrid v-else-if="active?.kind === 'table'" />
-    <StructurePane v-else-if="active?.kind === 'structure'" />
+    <QueryTab
+      v-if="active && active.kind === 'query'"
+      :key="active.id"
+      :tab-id="active.id"
+      :draft="active.draft"
+      @update:draft="onDraft"
+    />
+    <DataGrid
+      v-else-if="active && active.kind === 'table'"
+      :key="active.id"
+      :tab-id="active.id"
+      :draft="active.draft"
+    />
+    <StructurePane
+      v-else-if="active && active.kind === 'structure'"
+      :key="active.id"
+      :tab-id="active.id"
+      :draft="active.draft"
+    />
     <WelcomeView
       v-else
       @new-query="emit('new-query')"
       @connections="emit('connections')"
       @sqlite="emit('sqlite')"
       @palette="emit('palette')"
+      @structure="emit('structure')"
     />
   </div>
 </template>

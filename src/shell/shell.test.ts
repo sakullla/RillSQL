@@ -26,7 +26,9 @@ describe("shell layout", () => {
     expect(title.text()).toContain("澄库");
     expect(title.find(".cmd-trigger").attributes("aria-label")).toBe("打开命令面板");
 
-    const status = mount(StatusBar, { props: { tab: { id: "q", kind: "query", title: "查询 1", targetText: null }, onWorkspace: true } });
+    const status = mount(StatusBar, {
+      props: { tab: { id: "q", kind: "query", title: "查询 1", targetText: null, path: null, draft: "" }, onWorkspace: true },
+    });
     expect(status.text()).toContain("未绑定连接 · 请选择执行目标");
     expect(status.text()).toContain("仅存本机");
 
@@ -46,6 +48,7 @@ describe("shell layout", () => {
   it("filters the command palette down to commands when the query starts with >", () => {
     const items = shellCommands({
       openQuery: () => undefined,
+      openStructure: () => undefined,
       showPage: () => undefined,
       toggleSidebar: () => undefined,
       setTheme: () => undefined,

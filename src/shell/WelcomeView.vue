@@ -8,6 +8,7 @@ const emit = defineEmits<{
   connections: [];
   sqlite: [];
   palette: [];
+  structure: [];
 }>();
 </script>
 
@@ -26,6 +27,9 @@ const emit = defineEmits<{
           <h3>开始</h3>
           <button class="wl-item" type="button" @click="emit('new-query')">
             <Icon name="code" /><span>新建查询</span><ChordKeys chord="Mod+T" />
+          </button>
+          <button class="wl-item" type="button" @click="emit('structure')">
+            <Icon name="table" /><span>打开结构占位</span>
           </button>
           <button class="wl-item" type="button" @click="emit('connections')">
             <Icon name="plus" /><span>新建连接</span>

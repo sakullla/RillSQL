@@ -11,7 +11,7 @@ import { shellCommands, type PaletteItem } from "./commands";
 import { syncProductIdentity } from "./identity";
 import SettingsView from "./SettingsView.vue";
 import { loadSettings, saveSettings, type ShellSettings } from "./settings";
-import { createSession } from "./session";
+import { createSession, STRUCTURE_PLACEHOLDER } from "./session";
 import ShortcutHelp from "./ShortcutHelp.vue";
 import Sidebar from "./Sidebar.vue";
 import StatusBar from "./StatusBar.vue";
@@ -32,7 +32,7 @@ const commands = computed<PaletteItem[]>(() => [
     label: table.label,
     icon: "table" as const,
     path: table.path,
-    run: () => session.showPage("workspace"),
+    run: () => session.openTable({ id: table.id, label: table.label, path: table.path }),
   })),
   ...listPaletteConnections().map((connection) => ({
     id: connection.id,
@@ -44,6 +44,7 @@ const commands = computed<PaletteItem[]>(() => [
   })),
   ...shellCommands({
     openQuery: session.openQuery,
+    openStructure: () => session.openStructure(STRUCTURE_PLACEHOLDER),
     showPage: session.showPage,
     toggleSidebar: session.toggleSidebar,
     setTheme,
@@ -194,6 +195,8 @@ onBeforeUnmount(() => {
           @connections="session.showPage('connections')"
           @sqlite="requestSqlite()"
           @palette="session.openPalette('all')"
+          @structure="session.openStructure(STRUCTURE_PLACEHOLDER)"
+          @draft="session.setDraft"
         />
         <ConnectionsPage v-else-if="session.page.value === 'connections'" :sqlite-prompt="sqlitePrompt" />
         <HistoryPage v-else-if="session.page.value === 'history'" />

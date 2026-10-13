@@ -4,11 +4,26 @@ import { parseHash, toHash } from "../router";
 
 export type TabKind = "query" | "table" | "structure";
 
+export const NEW_QUERY_DRAFT = "-- 查询模块占位。执行、取消、补全和结果尚未接入。\n";
+
+export interface PlaceholderTarget {
+  id: string;
+  label: string;
+  path?: string;
+}
+
+export const STRUCTURE_PLACEHOLDER: PlaceholderTarget = {
+  id: "placeholder",
+  label: "结构占位",
+};
+
 export interface ShellTab {
   id: string;
   kind: TabKind;
   title: string;
   targetText: string | null;
+  path: string | null;
+  draft: string;
 }
 
 export interface ShellSession {
@@ -23,6 +38,9 @@ export interface ShellSession {
   activeTab: Ref<ShellTab | null>;
   showPage: (page: AppPage) => void;
   openQuery: () => void;
+  openTable: (target: PlaceholderTarget) => void;
+  openStructure: (target: PlaceholderTarget) => void;
+  setDraft: (id: string, draft: string) => void;
   activateTab: (id: string) => void;
   closeTab: (id: string) => void;
   toggleSidebar: () => void;
@@ -59,11 +77,48 @@ export function createSession(initialHash = ""): ShellSession {
       kind: "query",
       title: `查询 ${count}`,
       targetText: null,
+      path: null,
+      draft: NEW_QUERY_DRAFT,
     };
     sequence += 1;
     tabs.value = [...tabs.value, tab];
     activeId.value = tab.id;
     showPage("workspace");
+  }
+
+  function openPlaceholder(kind: "table" | "structure", target: PlaceholderTarget) {
+    const id = `${kind}:${target.id}`;
+    const existing = tabs.value.find((tab) => tab.id === id);
+    if (existing) {
+      activeId.value = existing.id;
+      showPage("workspace");
+      return;
+    }
+    const tab: ShellTab = {
+      id,
+      kind,
+      title: target.label,
+      targetText: null,
+      path: target.path ?? null,
+      draft: "",
+    };
+    tabs.value = [...tabs.value, tab];
+    activeId.value = tab.id;
+    showPage("workspace");
+  }
+
+  function openTable(target: PlaceholderTarget) {
+    openPlaceholder("table", target);
+  }
+
+  function openStructure(target: PlaceholderTarget) {
+    openPlaceholder("structure", target);
+  }
+
+  function setDraft(id: string, draft: string) {
+    const tab = tabs.value.find((item) => item.id === id);
+    if (!tab || tab.draft === draft) return;
+    tab.draft = draft;
   }
 
   function activateTab(id: string) {
@@ -122,6 +177,9 @@ export function createSession(initialHash = ""): ShellSession {
     activeTab,
     showPage,
     openQuery,
+    openTable,
+    openStructure,
+    setDraft,
     activateTab,
     closeTab,
     toggleSidebar,
