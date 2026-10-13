@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,21 +94,13 @@ pub async fn open_mysql(config: &SavedConnection, route: &Route, password: &str)
     })
 }
 
-fn mysql_ssl(plan: &MysqlTlsPlan, tls: Option<&TlsSettings>) -> Result<SslOpts, StageError> {
+pub(crate) fn mysql_ssl(plan: &MysqlTlsPlan, tls: Option<&TlsSettings>) -> Result<SslOpts, StageError> {
     let mut ssl = SslOpts::default()
         .with_danger_skip_domain_validation(plan.skip_domain_validation)
         .with_danger_accept_invalid_certs(plan.accept_invalid_certs)
         .with_danger_tls_hostname_override(plan.hostname_override.clone());
     if let Some(tls) = tls {
-        if tls.mode == TlsMode::Verify && tls.ca_mode == CaMode::File {
-            let path = tls.ca_file.clone().ok_or_else(|| stages::fail("请填写 CA 证书文件", "没有改用不验证的连接。"))?;
-            if !Path::new(&path).is_file() {
-                return Err(stages::fail(format!("读不到 CA 证书 {path}"), "没有改用不验证的连接。"));
-            }
-            ssl = ssl
-                .with_root_certs(vec![Path::new(&path).to_path_buf().into()])
-                .with_disable_built_in_roots(true);
-        }
+        ssl = install_mysql_trust(ssl, tls)?;
         if let (Some(cert), Some(key)) = (&tls.client_cert, &tls.client_key) {
             if !Path::new(cert).is_file() || !Path::new(key).is_file() {
                 return Err(stages::fail("读不到客户端证书或私钥", "没有改用不验证的连接。"));
@@ -120,6 +112,40 @@ fn mysql_ssl(plan: &MysqlTlsPlan, tls: Option<&TlsSettings>) -> Result<SslOpts, 
         }
     }
     Ok(ssl)
+}
+
+fn install_mysql_trust(ssl: SslOpts, tls: &TlsSettings) -> Result<SslOpts, StageError> {
+    match tls.ca_mode {
+        CaMode::File => {
+            let path = tls.ca_file.clone().ok_or_else(|| stages::fail("请填写 CA 证书文件", "没有改用不验证的连接。"))?;
+            if !Path::new(&path).is_file() {
+                return Err(stages::fail(format!("读不到 CA 证书 {path}"), "没有改用不验证的连接。"));
+            }
+            // 只有指定 CA 文件时才不装操作系统信任库。
+            Ok(ssl.with_root_certs(vec![PathBuf::from(path).into()]).with_disable_built_in_roots(true))
+        }
+        CaMode::System => {
+            let mut roots = Vec::new();
+            for anchor in os_trust_anchors()? {
+                roots.push(anchor.into());
+            }
+            // mysql_async 的 built-in roots 是 webpki Mozilla 清单，不是操作系统信任库。
+            Ok(ssl.with_root_certs(roots).with_disable_built_in_roots(true))
+        }
+    }
+}
+
+fn os_trust_anchors() -> Result<Vec<Vec<u8>>, StageError> {
+    let loaded = rustls_native_certs::load_native_certs();
+    if loaded.certs.is_empty() {
+        let detail = if loaded.errors.is_empty() {
+            "系统信任库里没有可用的根证书".to_owned()
+        } else {
+            loaded.errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
+        };
+        return Err(stages::fail(detail, "没有改用不验证的连接，也没有改用 Mozilla 内置根。"));
+    }
+    Ok(loaded.certs.into_iter().map(|cert| cert.as_ref().to_vec()).collect())
 }
 
 pub struct PostgresOpen {

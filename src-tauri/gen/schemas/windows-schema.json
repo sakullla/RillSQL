@@ -177,6 +177,60 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "允许读取关于信息。应用一旦声明自己的权限，未列出的命令会被拒绝，因此保留原有 app_info。",
+          "type": "string",
+          "const": "allow-app-info",
+          "markdownDescription": "允许读取关于信息。应用一旦声明自己的权限，未列出的命令会被拒绝，因此保留原有 app_info。"
+        },
+        {
+          "description": "允许确认 SSH 主机密钥。",
+          "type": "string",
+          "const": "allow-connections-confirm-host-key",
+          "markdownDescription": "允许确认 SSH 主机密钥。"
+        },
+        {
+          "description": "允许删除连接配置。",
+          "type": "string",
+          "const": "allow-connections-delete",
+          "markdownDescription": "允许删除连接配置。"
+        },
+        {
+          "description": "允许断开已打开的连接。",
+          "type": "string",
+          "const": "allow-connections-disconnect",
+          "markdownDescription": "允许断开已打开的连接。"
+        },
+        {
+          "description": "允许忘记已保存的 SSH 主机密钥。",
+          "type": "string",
+          "const": "allow-connections-forget-host-key",
+          "markdownDescription": "允许忘记已保存的 SSH 主机密钥。"
+        },
+        {
+          "description": "允许列出已保存的连接。",
+          "type": "string",
+          "const": "allow-connections-list",
+          "markdownDescription": "允许列出已保存的连接。"
+        },
+        {
+          "description": "允许打开已保存的连接。",
+          "type": "string",
+          "const": "allow-connections-open",
+          "markdownDescription": "允许打开已保存的连接。"
+        },
+        {
+          "description": "允许保存连接配置。",
+          "type": "string",
+          "const": "allow-connections-save",
+          "markdownDescription": "允许保存连接配置。"
+        },
+        {
+          "description": "允许按阶段测试连接。",
+          "type": "string",
+          "const": "allow-connections-test",
+          "markdownDescription": "允许按阶段测试连接。"
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

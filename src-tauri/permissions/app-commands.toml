@@ -1,0 +1,44 @@
+[[permission]]
+identifier = "allow-app-info"
+description = "允许读取关于信息。应用一旦声明自己的权限，未列出的命令会被拒绝，因此保留原有 app_info。"
+commands.allow = ["app_info"]
+
+[[permission]]
+identifier = "allow-connections-list"
+description = "允许列出已保存的连接。"
+commands.allow = ["connections_list"]
+
+[[permission]]
+identifier = "allow-connections-save"
+description = "允许保存连接配置。"
+commands.allow = ["connections_save"]
+
+[[permission]]
+identifier = "allow-connections-delete"
+description = "允许删除连接配置。"
+commands.allow = ["connections_delete"]
+
+[[permission]]
+identifier = "allow-connections-test"
+description = "允许按阶段测试连接。"
+commands.allow = ["connections_test"]
+
+[[permission]]
+identifier = "allow-connections-open"
+description = "允许打开已保存的连接。"
+commands.allow = ["connections_open"]
+
+[[permission]]
+identifier = "allow-connections-disconnect"
+description = "允许断开已打开的连接。"
+commands.allow = ["connections_disconnect"]
+
+[[permission]]
+identifier = "allow-connections-confirm-host-key"
+description = "允许确认 SSH 主机密钥。"
+commands.allow = ["connections_confirm_host_key"]
+
+[[permission]]
+identifier = "allow-connections-forget-host-key"
+description = "允许忘记已保存的 SSH 主机密钥。"
+commands.allow = ["connections_forget_host_key"]

@@ -8,7 +8,7 @@ use crate::connections::drivers::{self, TunnelFault};
 use crate::connections::hostkey::{self, HostKeyDecision, PresentedKey};
 use crate::connections::model::{
     password_account, ssh_password_account, ConnectionDraft, Engine, FieldError, SavedConnection, Secret, SecretInput, SshAuthKind,
-    SshSettings,
+    SshSettings, TlsMode,
 };
 use crate::connections::route::{self, Route};
 use crate::connections::secrets::SecretStore;
@@ -645,7 +645,15 @@ impl Attempt {
         }
         self.ensure_remote().await;
         let name = self.config.host.clone().unwrap_or_default();
-        self.pass_until(StageKind::Tls, || format!("证书主机名 {name} 已验证"))
+        let mode = self.config.tls.as_ref().map(|tls| tls.mode).unwrap_or(TlsMode::Off);
+        let authentication_failed = matches!(
+            self.remote,
+            Remote::Failed {
+                stage: StageKind::DatabaseAuthentication,
+                ..
+            }
+        );
+        self.pass_until(StageKind::Tls, || tls_stage_message(mode, &name, authentication_failed))
     }
 
     async fn db_auth(&mut self) -> Result<String, StageError> {
@@ -720,6 +728,16 @@ impl StageRunner for Attempt {
     }
 }
 
+pub(crate) fn tls_stage_message(mode: TlsMode, server_name: &str, authentication_failed: bool) -> String {
+    if mode == TlsMode::Verify && !authentication_failed {
+        format!("证书主机名 {server_name} 已验证")
+    } else if authentication_failed && mode == TlsMode::Verify {
+        "已加密，数据库认证失败，证书和主机名未验证".to_owned()
+    } else {
+        "已加密，但未验证证书和主机名".to_owned()
+    }
+}
+
 fn rank(stage: StageKind) -> u8 {
     match stage {
         StageKind::Network => 0,
@@ -759,4 +777,41 @@ fn classify_db(error: &StageError) -> StageKind {
         return StageKind::Tls;
     }
     StageKind::Network
+}
+
+#[cfg(test)]
+pub(crate) enum CannedRemote {
+    Connected,
+    AuthenticationFailed,
+}
+
+#[cfg(test)]
+pub(crate) async fn report_canned_remote(config: SavedConnection, canned: CannedRemote) -> TestReport {
+    let remote = match canned {
+        CannedRemote::Connected => Remote::Done { version: "8.4.3".to_owned() },
+        CannedRemote::AuthenticationFailed => Remote::Failed {
+            stage: StageKind::DatabaseAuthentication,
+            error: stages::fail("Access denied for user", "请检查数据库用户名和密码。"),
+        },
+    };
+    let mut attempt = Attempt {
+        config: config.clone(),
+        probes: Probes::default(),
+        password: None,
+        ssh_password: None,
+        passphrase: None,
+        saved_fingerprint: None,
+        ssh_fault: None,
+        ssh_started: false,
+        ssh_authed: false,
+        forwarder_port: None,
+        shutdown: None,
+        remote,
+        sqlite_pool: None,
+        mysql_pool: None,
+        postgres: None,
+        schema_note: None,
+        foreign_keys: None,
+    };
+    stages::execute_stages(&stages::planned_stages(&config), &mut attempt).await
 }

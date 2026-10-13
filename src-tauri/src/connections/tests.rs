@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use super::forward::{Forwarder, RecordingOpener};
 use super::hostkey::{self, Authenticator, HostKeyDecision};
-use super::model::{self, leaked_secret, ConnectionDraft, Engine, EnvLabel, Secret, SecretInput, SshAuthKind, TlsMode};
+use super::model::{self, leaked_secret, CaMode, ConnectionDraft, Engine, EnvLabel, Secret, SecretInput, SshAuthKind, TlsMode};
 use super::route::{self, Retry};
 use super::secrets::{MemoryStore, UnavailableStore};
 use super::service::{DatabaseProbe, Probes, Service, SshProbe};
@@ -478,4 +478,87 @@ async fn stored_password_is_reused_without_being_copied_into_the_config() {
     service.disconnect(&saved.connection.id);
     assert!(!service.is_connected(&saved.connection.id));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+fn tls_message(report: &super::stages::TestReport) -> String {
+    report
+        .stages
+        .iter()
+        .find(|stage| stage.kind == StageKind::Tls)
+        .map(|stage| stage.message.clone())
+        .unwrap_or_default()
+}
+
+fn assert_not_verified(message: &str) {
+    assert!(!message.contains("已验证"), "{message}");
+    assert!(message.contains("未验证"), "{message}");
+    assert!(message.contains("已加密"), "{message}");
+}
+
+#[tokio::test]
+async fn only_verified_tls_success_says_the_certificate_was_checked() {
+    let mut require = remote_draft(Engine::Mysql);
+    require.tls_mode = TlsMode::Require;
+    let require = model::normalize(&require, "require".to_owned()).unwrap();
+    let require_ok = super::service::report_canned_remote(require.clone(), super::service::CannedRemote::Connected).await;
+    assert_eq!(require_ok.status, TestStatus::Ok);
+    let require_message = tls_message(&require_ok);
+    assert_eq!(require_message, "已加密，但未验证证书和主机名");
+    assert_not_verified(&require_message);
+
+    let require_auth = super::service::report_canned_remote(require, super::service::CannedRemote::AuthenticationFailed).await;
+    assert_eq!(require_auth.status, TestStatus::Err);
+    assert_eq!(require_auth.fail_stage.as_deref(), Some(StageKind::DatabaseAuthentication.label_zh()));
+    let require_tls = require_auth.stages.iter().find(|stage| stage.kind == StageKind::Tls).unwrap();
+    assert_eq!(require_tls.status, StageStatus::Ok);
+    assert_not_verified(&require_tls.message);
+
+    let verify = model::normalize(&remote_draft(Engine::Postgres), "verify".to_owned()).unwrap();
+    let verify_ok = super::service::report_canned_remote(verify.clone(), super::service::CannedRemote::Connected).await;
+    assert_eq!(tls_message(&verify_ok), "证书主机名 db.example.test 已验证");
+    let verify_auth = super::service::report_canned_remote(verify, super::service::CannedRemote::AuthenticationFailed).await;
+    let verify_tls = verify_auth.stages.iter().find(|stage| stage.kind == StageKind::Tls).unwrap();
+    assert_eq!(verify_tls.status, StageStatus::Ok);
+    assert_eq!(verify_auth.stages.iter().find(|stage| stage.kind == StageKind::DatabaseAuthentication).unwrap().status, StageStatus::Err);
+    assert_not_verified(&verify_tls.message);
+    assert!(verify_tls.message.contains("认证失败"));
+}
+
+#[tokio::test]
+async fn mysql_system_roots_come_from_the_os_store_and_ca_files_drop_them() {
+    let native = rustls_native_certs::load_native_certs();
+    assert!(!native.certs.is_empty(), "{:?}", native.errors);
+    let expected: Vec<Vec<u8>> = native.certs.iter().map(|cert| cert.as_ref().to_vec()).collect();
+    assert!(!mysql_async::SslOpts::default().disable_built_in_roots());
+
+    for engine in [Engine::Mysql, Engine::Mariadb] {
+        for mode in [TlsMode::Verify, TlsMode::Require] {
+            let mut draft = remote_draft(engine);
+            draft.tls_mode = mode;
+            draft.ca_mode = CaMode::System;
+            let saved = model::normalize(&draft, "system".to_owned()).unwrap();
+            let route = route::resolve_route(&saved, None).unwrap();
+            let ssl = super::drivers::mysql_ssl(&route::mysql_tls_plan(&route), saved.tls.as_ref()).unwrap();
+            assert!(ssl.disable_built_in_roots(), "{engine:?} {mode:?} 仍会装入 webpki Mozilla 根");
+            let mut actual = Vec::new();
+            for cert in ssl.root_certs() {
+                actual.push(cert.read().await.unwrap().into_owned());
+            }
+            assert_eq!(actual, expected, "{engine:?} {mode:?}");
+        }
+    }
+
+    let ca = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/connections/fixtures/ca.pem");
+    let mut file_draft = remote_draft(Engine::Mysql);
+    file_draft.ca_mode = CaMode::File;
+    file_draft.ca_file = ca.display().to_string();
+    let saved = model::normalize(&file_draft, "file".to_owned()).unwrap();
+    let route = route::resolve_route(&saved, None).unwrap();
+    let ssl = super::drivers::mysql_ssl(&route::mysql_tls_plan(&route), saved.tls.as_ref()).unwrap();
+    assert!(ssl.disable_built_in_roots());
+    let roots = ssl.root_certs();
+    assert_eq!(roots.len(), 1);
+    let bytes = roots[0].read().await.unwrap().into_owned();
+    assert_eq!(bytes, std::fs::read(&ca).unwrap());
+    assert_ne!(bytes, expected.concat());
 }

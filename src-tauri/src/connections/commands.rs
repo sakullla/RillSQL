@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -37,8 +38,12 @@ pub struct ConnectionsState {
 
 impl ConnectionsState {
     pub fn new() -> Self {
+        Self::with_path(service::default_config_path())
+    }
+
+    pub fn with_path(path: PathBuf) -> Self {
         Self {
-            service: Arc::new(Service::new(service::default_config_path(), Arc::new(KeyringStore::new()))),
+            service: Arc::new(Service::new(path, Arc::new(KeyringStore::new()))),
         }
     }
 }

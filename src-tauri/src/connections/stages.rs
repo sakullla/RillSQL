@@ -102,11 +102,11 @@ pub fn planned_stages(config: &SavedConnection) -> Vec<StageKind> {
 }
 
 #[async_trait::async_trait]
-pub trait StageRunner {
+pub trait StageRunner: Send {
     async fn run_stage(&mut self, stage: StageKind) -> Result<String, StageError>;
 }
 
-pub async fn execute_stages(stages: &[StageKind], runner: &mut dyn StageRunner) -> TestReport {
+pub async fn execute_stages(stages: &[StageKind], runner: &mut (dyn StageRunner + Send)) -> TestReport {
     let mut views = Vec::with_capacity(stages.len());
     let mut failed = false;
     let mut fail_stage = None;

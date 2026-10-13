@@ -1,6 +1,6 @@
 //! 连接：保存、测试、打开和删除，TLS 校验名与 SSH 通道分开。
 
-mod commands;
+pub mod commands;
 mod drivers;
 mod forward;
 mod hostkey;
