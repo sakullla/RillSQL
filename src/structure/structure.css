@@ -2,6 +2,7 @@
    视觉一律引用 tokens.css 令牌与 base.css 基样式，不硬编码色值与间距。 */
 
 /* ---------- 工作区容器与「数据/结构」切换条（shell 的 WorkspaceView 也使用这两个类） ---------- */
+.structure-pane,
 .table-workspace {
   flex: 1;
   min-height: 0;
