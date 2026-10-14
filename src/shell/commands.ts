@@ -26,7 +26,7 @@ export interface ShellActions {
 export function shellCommands(actions: ShellActions): PaletteItem[] {
   return [
     { id: "new-query", group: "命令", label: "新建查询", icon: "code", chord: "Mod+T", run: actions.openQuery },
-    { id: "open-structure", group: "命令", label: "打开结构占位", icon: "table", run: actions.openStructure },
+    { id: "open-structure", group: "命令", label: "新建表结构", icon: "table", run: actions.openStructure },
     { id: "new-connection", group: "命令", label: "新建连接", icon: "plus", run: () => actions.showPage("connections") },
     { id: "open-sqlite", group: "命令", label: "打开 SQLite 文件", icon: "file", run: actions.requestSqlite },
     { id: "history", group: "命令", label: "查询历史", icon: "history", run: () => actions.showPage("history") },

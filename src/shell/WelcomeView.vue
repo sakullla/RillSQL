@@ -23,28 +23,28 @@ const emit = defineEmits<{
         </div>
       </div>
       <div class="welcome-grid">
-        <section>
-          <h3>开始</h3>
-          <button class="wl-item" type="button" @click="emit('new-query')">
-            <Icon name="code" /><span>新建查询</span><ChordKeys chord="Mod+T" />
-          </button>
-          <button class="wl-item" type="button" @click="emit('structure')">
-            <Icon name="table" /><span>打开结构占位</span>
-          </button>
-          <button class="wl-item" type="button" @click="emit('connections')">
-            <Icon name="plus" /><span>新建连接</span>
-          </button>
-          <button class="wl-item" type="button" @click="emit('sqlite')">
-            <Icon name="file" /><span>打开 SQLite 文件</span>
-          </button>
-          <button class="wl-item" type="button" @click="emit('palette')">
-            <Icon name="command" /><span>命令面板</span><ChordKeys chord="Mod+K" />
-          </button>
-        </section>
-        <section>
-          <h3>最近打开</h3>
-          <p class="muted sm">还没有最近打开的表。连接数据库后，从资源管理器打开的表会出现在这里。</p>
-        </section>
+        <button class="welcome-path" type="button" @click="emit('connections')">
+          <Icon name="plus" />
+          <span class="wp-title">新建连接</span>
+          <span class="wp-desc">连接 MySQL、PostgreSQL 或 MariaDB，填几项就能开始。</span>
+        </button>
+        <button class="welcome-path" type="button" @click="emit('sqlite')">
+          <Icon name="file" />
+          <span class="wp-title">打开 SQLite 文件</span>
+          <span class="wp-desc">直接打开本机上的一个数据库文件，不用配置服务器。</span>
+        </button>
+      </div>
+      <div class="welcome-more">
+        <span class="muted sm">已经连好了？</span>
+        <button class="btn ghost sm" type="button" @click="emit('new-query')">
+          <Icon name="code" />新建查询<ChordKeys chord="Mod+T" />
+        </button>
+        <button class="btn ghost sm" type="button" @click="emit('structure')">
+          <Icon name="table" />新建表结构
+        </button>
+        <button class="btn ghost sm" type="button" @click="emit('palette')">
+          <Icon name="command" />命令面板<ChordKeys chord="Mod+K" />
+        </button>
       </div>
     </div>
   </div>

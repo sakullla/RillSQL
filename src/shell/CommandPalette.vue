@@ -69,7 +69,7 @@ function onKey(event: KeyboardEvent) {
       </label>
       <div id="pal-list" class="pal-list" role="listbox">
         <p v-if="!visible.length" class="pal-none">
-          {{ mode === "tables" ? "目录模块接入前，没有可打开的表。" : "没有匹配项" }}
+          {{ mode === "tables" ? "没有匹配的表。" : "没有匹配项" }}
         </p>
         <template v-else>
           <template v-for="(item, index) in visible" :key="item.id">

@@ -146,7 +146,11 @@ onBeforeUnmount(() => {
     >
       <Icon :name="tab.kind === 'query' ? 'code' : 'table'" />
       <span class="tab-title">{{ tab.title }}</span>
-      <span class="tab-conn none">{{ tab.targetText || tab.path || "未绑定" }}</span>
+      <span
+        v-if="tab.targetText || tab.path || tab.kind === 'query'"
+        class="tab-target"
+        :class="{ none: !tab.targetText && !tab.path }"
+      >{{ tab.targetText || tab.path || "未选择连接" }}</span>
       <button class="tab-x" type="button" :aria-label="`关闭 ${tab.title}`" title="关闭" @click.stop="emit('close', tab.id)">
         <Icon name="x" />
       </button>
@@ -222,7 +226,7 @@ onBeforeUnmount(() => {
     >
       <template v-if="menuTab.kind === 'query'">
         <div class="menu-head">选择执行目标</div>
-        <p v-if="!menuTargets.length" class="target-empty">还没有可选的数据库。</p>
+        <p v-if="!menuTargets.length" class="target-empty">还没有可用的连接——先在「连接」页新建一个。</p>
         <button
           v-for="option in menuTargets"
           :key="option.key"

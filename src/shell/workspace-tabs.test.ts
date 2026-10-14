@@ -68,10 +68,16 @@ function paletteItem(wrapper: VueWrapper, label: string) {
   return item!;
 }
 
+function welcomeAction(wrapper: VueWrapper, label: string) {
+  const item = wrapper.findAll(".welcome-more .btn").find((node) => node.text().includes(label));
+  expect(item, label).toBeTruthy();
+  return item!;
+}
+
 describe("workspace tab identity", () => {
   it("keeps query drafts on the tab that owns them", async () => {
     const wrapper = mount(AppShell);
-    await wrapper.get(".wl-item").trigger("click");
+    await welcomeAction(wrapper, "新建查询").trigger("click");
     expect(wrapper.get("[aria-label='查询']").attributes("data-tab-id")).toBe("query-1");
     await replaceDraft(wrapper, "SELECT alpha");
     await wrapper.get(".tab-new").trigger("click");
@@ -96,19 +102,17 @@ describe("workspace tab identity", () => {
     wrapper.unmount();
   });
 
-  it("opens table and structure placeholders from welcome and the command palette", async () => {
+  it("opens table and structure tabs from the welcome page and the command palette", async () => {
     const welcome = mount(AppShell);
-    const structure = welcome.findAll(".wl-item").find((item) => item.text().includes("打开结构占位"));
-    expect(structure).toBeTruthy();
-    await structure!.trigger("click");
+    await welcomeAction(welcome, "新建表结构").trigger("click");
     expect(welcome.get("[aria-label='表结构']").attributes("data-tab-id")).toBe("structure:placeholder");
     expect(welcome.get("[aria-label='表结构']").attributes("data-draft")).toBe("");
-    expect(welcome.get(".tab-title").text()).toBe("结构占位");
+    expect(welcome.get(".tab-title").text()).toBe("新建表结构");
     welcome.unmount();
 
     const wrapper = mount(AppShell);
     await wrapper.get(".cmd-trigger").trigger("click");
-    await paletteItem(wrapper, "打开结构占位").trigger("click");
+    await paletteItem(wrapper, "新建表结构").trigger("click");
     expect(wrapper.get("[aria-label='表结构']").attributes("data-tab-id")).toBe("structure:placeholder");
 
     await wrapper.get(".cmd-trigger").trigger("click");
@@ -118,8 +122,9 @@ describe("workspace tab identity", () => {
     expect(grid.attributes("data-tab-id")).toBe("table:customers");
     expect(grid.attributes("data-draft")).toBe("");
     expect(wrapper.get(".tab.active .tab-title").text()).toBe("customers");
-    expect(wrapper.get(".tab.active .tab-conn").text()).toBe("shop / public");
-    expect(wrapper.get(".statusbar").text()).toContain("未绑定连接");
+    // 标签与状态栏用文字说明数据来自哪里（R4）
+    expect(wrapper.get(".tab.active .tab-target").text()).toBe("shop / public");
+    expect(wrapper.get(".statusbar").text()).toContain("shop / public");
 
     await wrapper.get(".cmd-trigger").trigger("click");
     await paletteItem(wrapper, "customers").trigger("click");
@@ -140,7 +145,7 @@ describe("workspace tab identity", () => {
     expect(session.tabs.value.map((tab) => tab.id)).toEqual(["table:customers", "query-1"]);
     expect(session.activeId.value).toBe("table:customers");
     expect(session.tabs.value[0]).toMatchObject({ kind: "table", title: "customers", path: "shop / public", draft: "" });
-    session.openStructure({ id: "placeholder", label: "结构占位" });
+    session.openStructure({ id: "placeholder", label: "新建表结构" });
     expect(session.activeTab.value).toMatchObject({ id: "structure:placeholder", kind: "structure" });
   });
 
@@ -158,7 +163,7 @@ describe("workspace tab identity", () => {
   it("binds a query from the tab menu and closes the other tabs", async () => {
     replaceCatalog([postgresCatalog()]);
     const wrapper = mount(AppShell);
-    await wrapper.get(".wl-item").trigger("click");
+    await welcomeAction(wrapper, "新建查询").trigger("click");
     await wrapper.get(".tab-new").trigger("click");
     expect(wrapper.findAll(".tab")).toHaveLength(2);
 
@@ -168,7 +173,8 @@ describe("workspace tab identity", () => {
     expect(document.body.querySelector("[data-menu=tab]")).toBeNull();
 
     const first = wrapper.findAll(".tab")[0]!;
-    expect(first.get(".tab-conn").text()).toBe("未绑定");
+    expect(first.get(".tab-target").text()).toBe("未选择连接");
+    expect(wrapper.get(".statusbar").text()).toContain("还未选择执行目标");
     const opened = contextMenu(first.element);
     await nextTick();
     expect(opened.defaultPrevented).toBe(true);
@@ -182,9 +188,9 @@ describe("workspace tab identity", () => {
     menu.querySelector<HTMLButtonElement>("[data-action=bind-target]")?.click();
     await nextTick();
     expect(document.body.querySelector("[data-menu=tab]")).toBeNull();
-    expect(wrapper.findAll(".tab")[0]!.get(".tab-conn").text()).toBe("127.0.0.1 / rillsql");
-    expect(wrapper.get(".target-btn .tg-name").text()).toBe("127.0.0.1");
-    expect(wrapper.get(".target-btn .tg-db").text()).toContain("rillsql");
+    expect(wrapper.findAll(".tab")[0]!.get(".tab-target").text()).toBe("127.0.0.1 / rillsql");
+    expect(wrapper.get(".statusbar").text()).toContain("127.0.0.1 / rillsql");
+    expect(wrapper.get(".statusbar").text()).toContain("已连接");
 
     contextMenu(wrapper.findAll(".tab")[0]!.element);
     await nextTick();
@@ -195,7 +201,7 @@ describe("workspace tab identity", () => {
     await nextTick();
     expect(wrapper.findAll(".tab")).toHaveLength(1);
     expect(wrapper.get(".tab-title").text()).toBe("查询 1");
-    expect(wrapper.get(".tab-conn").text()).toBe("127.0.0.1 / rillsql");
+    expect(wrapper.get(".tab-target").text()).toBe("127.0.0.1 / rillsql");
 
     contextMenu(wrapper.get(".tab").element);
     await nextTick();

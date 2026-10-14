@@ -3,19 +3,40 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import ActivityRail from "./ActivityRail.vue";
 import { filterPalette, shellCommands } from "./commands";
 import EnvPill from "./EnvPill.vue";
-import ActivityRail from "./ActivityRail.vue";
 import { PRODUCT_TITLE } from "./product";
+import type { ShellTab } from "./session";
 import StatusBar from "./StatusBar.vue";
-import { CONNECTION_STATUS_TEXT, ENVIRONMENT_LABELS } from "./status-text";
+import { CONNECTION_STATUS_TEXT, ENVIRONMENT_LABELS, OPERATION_STATE_TEXT, type OperationState } from "./status-text";
 import TitleBar from "./TitleBar.vue";
 import { desktopShell } from "./window-chrome";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
+function makeTab(overrides: Partial<ShellTab> = {}): ShellTab {
+  return {
+    id: "q",
+    kind: "query",
+    title: "查询 1",
+    targetText: null,
+    path: null,
+    draft: "",
+    connectionId: null,
+    connectionName: null,
+    database: null,
+    engine: null,
+    connectionStatus: null,
+    targetNotice: null,
+    tablePane: "data",
+    structureSection: "columns",
+    ...overrides,
+  };
+}
+
 describe("shell layout", () => {
-  it("keeps navigation labels, title, and status text", () => {
+  it("keeps navigation labels, brand, and the command entry visible", () => {
     const rail = mount(ActivityRail, { props: { page: "workspace" } });
     expect(rail.text()).toContain("工作台");
     expect(rail.text()).toContain("连接");
@@ -28,31 +49,68 @@ describe("shell layout", () => {
     expect(title.find(".cmd-trigger").attributes("aria-label")).toBe("打开命令面板");
     expect(desktopShell()).toBe(false);
     expect(title.find(".caption").exists()).toBe(false);
+  });
 
+  it("renders platform window controls only for custom chrome", () => {
     const caption = mount(TitleBar, { props: { theme: "system", caption: true } });
     expect(caption.get(".titlebar").attributes("data-tauri-drag-region")).toBe("deep");
     expect(caption.get(".tb-actions").attributes("data-tauri-drag-region")).toBe("false");
     expect(caption.get("[aria-label='最小化']").exists()).toBe(true);
     expect(caption.get("[aria-label='最大化']").exists()).toBe(true);
     expect(caption.get("[aria-label='关闭']").exists()).toBe(true);
+  });
 
-    const bare = { id: "q", kind: "query" as const, title: "查询 1", targetText: null, path: null, draft: "", connectionId: null, connectionName: null, database: null, engine: null, connectionStatus: null, targetNotice: null };
-    const status = mount(StatusBar, {
-      props: { tab: bare, onWorkspace: true },
-    });
-    expect(status.text()).toContain("未绑定连接 · 请选择执行目标");
-    expect(status.text()).toContain("仅存本机");
+  it("switches theme from the title bar menu", async () => {
+    const title = mount(TitleBar, { props: { theme: "system" } });
+    const dark = title.findAll(".theme-menu .menu-item").find((item) => item.text().includes("深色"));
+    expect(dark).toBeTruthy();
+    await dark!.trigger("click");
+    expect(title.emitted("set-theme")).toEqual([["dark"]]);
+  });
+
+  it("status bar keeps only the current target in plain words", () => {
+    const unbound = mount(StatusBar, { props: { tab: makeTab(), onWorkspace: true } });
+    expect(unbound.text()).toContain("此查询还未选择执行目标——在查询里选一个连接和库");
+    // 次要入口不再常驻状态栏（ADR-4.4）
+    expect(unbound.text()).not.toContain("仅存本机");
+    expect(unbound.text()).not.toContain("快捷键");
+
     const lost = mount(StatusBar, {
       props: {
-        tab: { ...bare, targetText: "Atlas / atlas_dev", connectionId: "atlas", connectionName: "Atlas", database: "atlas_dev", engine: "postgres", connectionStatus: "lost" as const },
+        tab: makeTab({ targetText: "Atlas / atlas_dev", connectionId: "atlas", connectionName: "Atlas", database: "atlas_dev", engine: "postgres", connectionStatus: "lost" }),
         onWorkspace: true,
       },
     });
     expect(lost.text()).toContain("Atlas / atlas_dev");
     expect(lost.text()).toContain("连接已断开");
 
+    const table = mount(StatusBar, {
+      props: { tab: makeTab({ id: "table:customers", kind: "table", title: "customers", path: "shop / public" }), onWorkspace: true },
+    });
+    expect(table.text()).toContain("customers");
+    expect(table.text()).toContain("shop / public");
+
     const idle = mount(StatusBar, { props: { tab: null, onWorkspace: false } });
     expect(idle.text()).toContain(PRODUCT_TITLE);
+  });
+
+  it("distinguishes the four operation states by text, not color alone", () => {
+    const states: OperationState[] = ["running", "ok", "error", "unknown"];
+    const labels = states.map((state) => {
+      const bar = mount(StatusBar, {
+        props: { tab: null, onWorkspace: false, activity: { state, text: "导出 customers.csv" } },
+      });
+      const activity = bar.get(".sb-activity");
+      expect(activity.attributes("data-state")).toBe(state);
+      expect(activity.text()).toContain(OPERATION_STATE_TEXT[state]);
+      expect(activity.text()).toContain("导出 customers.csv");
+      return OPERATION_STATE_TEXT[state];
+    });
+    expect(new Set(labels).size).toBe(4);
+    expect(labels).toEqual(["进行中", "成功", "失败", "结果未知"]);
+
+    const quiet = mount(StatusBar, { props: { tab: null, onWorkspace: false } });
+    expect(quiet.find(".sb-activity").exists()).toBe(false);
   });
 
   it("does not distinguish environment or status by color alone", () => {
@@ -77,17 +135,25 @@ describe("shell layout", () => {
     const commands = filterPalette(items, ">主题", "all");
     expect(commands.map((item) => item.label)).toEqual(["切换到浅色主题", "切换到深色主题", "主题跟随系统"]);
     expect(filterPalette(items, "customers", "tables")).toEqual([]);
+    // 两条主路径同样能从命令面板直达
+    expect(items.some((item) => item.label === "新建连接")).toBe(true);
+    expect(items.some((item) => item.label === "打开 SQLite 文件")).toBe(true);
   });
 
-  it("hides navigation labels at the prototype narrow breakpoint", () => {
+  it("builds the shell styles on tokens instead of hard-coded sizes", () => {
     const css = readFileSync(resolve(root, "src/styles/shell.css"), "utf8");
-    const narrow = css.slice(css.indexOf("@media (max-width: 720px)"));
-    expect(narrow).toContain(".rail-btn span { display: none; }");
     expect(css).toContain(".titlebar");
     expect(css).toContain(".caption-close");
     expect(css).toContain(".titlebar.custom-chrome");
     expect(css).toContain(".statusbar");
+    expect(css).toContain(".welcome-grid");
+    expect(css).toContain(".tab-target");
     expect(css).toContain("#palette");
+    // 字号与动效时长一律引用令牌（ADR-3）
+    expect(css).not.toMatch(/font-size:\s*[\d.]+px/);
+    expect(css).not.toMatch(/[\d.]+ms/);
+    const narrow = css.slice(css.indexOf("@media (max-width: 720px)"));
+    expect(narrow).toContain(".rail-btn span { display: none; }");
   });
 
   it("puts the product title on the window and the html document", () => {

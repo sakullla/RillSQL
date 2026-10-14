@@ -1,36 +1,50 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { PRODUCT_TITLE } from "./product";
-import ChordKeys from "./ChordKeys.vue";
 import Icon from "./Icon.vue";
 import type { ShellTab } from "./session";
-import { CONNECTION_STATUS_TEXT } from "./status-text";
+import { CONNECTION_STATUS_TEXT, OPERATION_STATE_TEXT, type OperationActivity, type OperationState } from "./status-text";
 
-const props = defineProps<{ tab: ShellTab | null; onWorkspace: boolean }>();
-const emit = defineEmits<{ help: [] }>();
+const props = defineProps<{ tab: ShellTab | null; onWorkspace: boolean; activity?: OperationActivity | null }>();
+
 const statusLabel = computed(() => {
   const status = props.tab?.connectionStatus;
-  return status ? CONNECTION_STATUS_TEXT[status] : "状态未知";
+  return status ? CONNECTION_STATUS_TEXT[status] : null;
 });
+
+const ACTIVITY_TONE: Record<OperationState, "info" | "ok" | "err" | "warn"> = {
+  running: "info",
+  ok: "ok",
+  error: "err",
+  unknown: "warn",
+};
 </script>
 
 <template>
   <footer class="statusbar">
     <div class="sb-left">
-      <span v-if="onWorkspace && tab && !tab.targetText" class="sb-item warn">未绑定连接 · 请选择执行目标</span>
-      <span v-else-if="onWorkspace && tab?.targetText" class="sb-item sb-conn">
-        <strong>{{ tab.targetText }}</strong>
-        <span class="conn-state" :class="tab.connectionStatus ? `st-${tab.connectionStatus}` : ''"><i></i>{{ statusLabel }}</span>
-      </span>
+      <template v-if="onWorkspace && tab">
+        <span v-if="tab.kind === 'query' && !tab.targetText" class="sb-item sb-warn">
+          <Icon name="database" />此查询还未选择执行目标——在查询里选一个连接和库
+        </span>
+        <span v-else-if="tab.targetText" class="sb-item sb-target">
+          <Icon name="database" />
+          <strong>{{ tab.targetText }}</strong>
+          <span v-if="statusLabel" class="conn-state" :class="`st-${tab.connectionStatus}`"><i></i>{{ statusLabel }}</span>
+        </span>
+        <span v-else class="sb-item sb-target">
+          <Icon name="table" />
+          <strong>{{ tab.title }}</strong>
+          <span v-if="tab.path" class="muted">{{ tab.path }}</span>
+        </span>
+      </template>
       <span v-else class="sb-item muted">{{ PRODUCT_TITLE }}</span>
     </div>
     <div class="sb-right">
-      <span class="sb-item" title="无需账号、不联网同步；配置与历史只保存在本机">
-        <Icon name="lock" />仅存本机
+      <span v-if="activity" class="sb-activity" :data-state="activity.state">
+        <span class="badge" :class="ACTIVITY_TONE[activity.state]">{{ OPERATION_STATE_TEXT[activity.state] }}</span>
+        <span class="sb-activity-text">{{ activity.text }}</span>
       </span>
-      <button class="sb-item" type="button" @click="emit('help')">
-        <ChordKeys chord="?" />快捷键
-      </button>
     </div>
   </footer>
 </template>

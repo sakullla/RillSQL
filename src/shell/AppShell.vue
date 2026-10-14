@@ -46,7 +46,7 @@ function onHistoryOpen(plan: OpenPlan) {
       engine: null,
       status: null,
       needsTarget: true,
-      notice: "原连接已删除，请重新选择执行目标。暂不选择。",
+      notice: "原来的连接已删除——在查询里重新选择一个连接和库后再执行。",
     });
     return;
   }
@@ -288,7 +288,7 @@ onBeforeUnmount(() => {
         <SettingsView v-else :settings="settings" :data-dir="dataDir" @change="onSettings" @help="session.openHelp()" />
       </main>
     </div>
-    <StatusBar :tab="session.activeTab.value" :on-workspace="session.page.value === 'workspace'" @help="session.openHelp()" />
+    <StatusBar :tab="session.activeTab.value" :on-workspace="session.page.value === 'workspace'" />
     <CommandPalette :open="session.paletteOpen.value" :mode="session.paletteMode.value" :items="commands" @close="session.closePalette()" @run="runCommand" />
     <ShortcutHelp :open="session.helpOpen.value" @close="session.closeHelp()" />
   </div>

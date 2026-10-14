@@ -17,7 +17,7 @@ export interface PlaceholderTarget {
 
 export const STRUCTURE_PLACEHOLDER: PlaceholderTarget = {
   id: "placeholder",
-  label: "结构占位",
+  label: "新建表结构",
 };
 
 export interface QueryTarget {
