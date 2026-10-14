@@ -59,6 +59,21 @@ description = "允许从已打开的会话继续读取对象。"
 commands.allow = ["catalog_page"]
 
 [[permission]]
+identifier = "allow-ddl-describe"
+description = "允许从已打开的会话读取表结构编辑信息。"
+commands.allow = ["ddl_describe"]
+
+[[permission]]
+identifier = "allow-ddl-preview"
+description = "允许为已打开的会话生成结构变更预览，不执行。"
+commands.allow = ["ddl_preview"]
+
+[[permission]]
+identifier = "allow-ddl-execute"
+description = "允许在已打开的会话上逐条执行已确认的结构变更。"
+commands.allow = ["ddl_execute"]
+
+[[permission]]
 identifier = "allow-grid-describe"
 description = "允许从已打开的会话读取表结构。"
 commands.allow = ["grid_describe"]

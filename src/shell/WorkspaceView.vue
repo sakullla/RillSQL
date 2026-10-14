@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { catalogConnections } from "../catalog/store";
 import DataGrid from "../grid/DataGrid.vue";
 import { resolveTableTarget } from "../grid/target";
 import QueryTab from "../query/QueryTab.vue";
 import StructurePane from "../structure/StructurePane.vue";
+import "../structure/structure.css";
 import Icon from "./Icon.vue";
 import type { QueryTarget, ShellTab } from "./session";
 import { loadSettings } from "./settings";
@@ -25,6 +26,15 @@ const emit = defineEmits<{
 
 const active = computed(() => props.tabs.find((tab) => tab.id === props.activeId) ?? null);
 const pageSize = computed(() => loadSettings().pageSize);
+const tablePane = ref<Record<string, "data" | "structure">>({});
+
+function paneOf(tabId: string): "data" | "structure" {
+  return tablePane.value[tabId] ?? "data";
+}
+
+function showPane(tabId: string, pane: "data" | "structure") {
+  tablePane.value = { ...tablePane.value, [tabId]: pane };
+}
 
 function tableTarget(tabId: string) {
   return resolveTableTarget(tabId, catalogConnections());
@@ -78,19 +88,34 @@ function onTarget(target: QueryTarget) {
       @update:draft="onDraft"
       @target="onTarget"
     />
-    <DataGrid
-      v-else-if="active && active.kind === 'table'"
-      :key="active.id"
-      :tab-id="active.id"
-      :draft="active.draft"
-      :page-size="pageSize"
-      :target="tableTarget(active.id)"
-    />
+    <div v-else-if="active && active.kind === 'table'" class="table-workspace">
+      <div class="pane-switch" role="tablist" aria-label="表内容">
+        <button type="button" role="tab" :aria-selected="paneOf(active.id) === 'data'" @click="showPane(active.id, 'data')">数据</button>
+        <button type="button" role="tab" :aria-selected="paneOf(active.id) === 'structure'" @click="showPane(active.id, 'structure')">结构</button>
+      </div>
+      <DataGrid
+        v-if="paneOf(active.id) === 'data'"
+        :key="active.id"
+        :tab-id="active.id"
+        :draft="active.draft"
+        :page-size="pageSize"
+        :target="tableTarget(active.id)"
+      />
+      <StructurePane
+        v-else
+        :key="`${active.id}:structure`"
+        :tab-id="active.id"
+        :draft="active.draft"
+        purpose="edit"
+        :target="tableTarget(active.id)"
+      />
+    </div>
     <StructurePane
       v-else-if="active && active.kind === 'structure'"
       :key="active.id"
       :tab-id="active.id"
       :draft="active.draft"
+      purpose="create"
     />
     <WelcomeView
       v-else

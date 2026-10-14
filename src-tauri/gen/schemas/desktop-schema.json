@@ -249,6 +249,24 @@
           "markdownDescription": "允许按阶段测试连接。"
         },
         {
+          "description": "允许从已打开的会话读取表结构编辑信息。",
+          "type": "string",
+          "const": "allow-ddl-describe",
+          "markdownDescription": "允许从已打开的会话读取表结构编辑信息。"
+        },
+        {
+          "description": "允许在已打开的会话上逐条执行已确认的结构变更。",
+          "type": "string",
+          "const": "allow-ddl-execute",
+          "markdownDescription": "允许在已打开的会话上逐条执行已确认的结构变更。"
+        },
+        {
+          "description": "允许为已打开的会话生成结构变更预览，不执行。",
+          "type": "string",
+          "const": "allow-ddl-preview",
+          "markdownDescription": "允许为已打开的会话生成结构变更预览，不执行。"
+        },
+        {
           "description": "允许在已打开的会话上逐条提交表数据变更。",
           "type": "string",
           "const": "allow-grid-commit",
