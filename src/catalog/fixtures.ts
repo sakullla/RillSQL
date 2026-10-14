@@ -45,7 +45,7 @@ export function catalogFixture(): CatalogConnection[] {
             },
             {
               name: "restricted",
-              error: "permission denied for schema restricted",
+              error: "没有权限读取 restricted 里的对象（permission denied）",
               total: 0,
               objects: [],
             },

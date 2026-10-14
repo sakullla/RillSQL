@@ -1,37 +1,22 @@
-.tree-toolbar { display: flex; justify-content: flex-end; padding: 0 8px 4px; }
-.tree .link {
-  color: var(--accent-text);
-  font-weight: 500;
-  font-size: 12px;
-  text-decoration: underline;
-  text-underline-offset: 2px;
-  text-decoration-color: color-mix(in srgb, currentColor 35%, transparent);
-}
-.tree .link:hover { text-decoration-color: currentColor; }
-.tree .link:disabled { opacity: 0.6; }
-.tree-connect { display: flex; align-items: center; gap: 6px; }
-.tree-connect input {
-  width: 128px;
-  height: 24px;
-  padding: 0 6px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: var(--panel);
-  color: var(--text);
-  font-size: 12px;
-}
+/* 资源管理器树呈现：色值、字号、间距、动效一律引用 tokens.css 令牌，控件复用 base.css 基样式。
+   布局骨架（.tree 的滚动与 .tree-note 的基础排版）由 shell.css 提供。 */
+
+.tree-toolbar { display: flex; justify-content: flex-end; padding: 0 var(--sp-1) var(--sp-1); }
+
+/* ---------- 树行 ---------- */
 .tree-row {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sp-2);
   height: var(--tree-h);
-  padding: 0 6px 0 calc(4px + var(--d, 0) * 14px);
-  border-radius: 5px;
+  padding: 0 var(--sp-2) 0 calc(var(--sp-1) + var(--d, 0) * var(--sp-4));
+  border-radius: var(--r);
   cursor: pointer;
-  font-size: 12.5px;
+  font-size: var(--fs-sm);
   white-space: nowrap;
   user-select: none;
+  transition: background var(--dur-fast) var(--ease);
 }
 .tree-row:hover { background: var(--hover); }
 .tree-row.active { background: var(--accent-soft); color: var(--accent-text); font-weight: 500; }
@@ -40,30 +25,49 @@
 .tree .tw .i { width: 12px; height: 12px; }
 .tree-row > .i { width: 15px; height: 15px; color: var(--text-3); }
 .tree .tr-name { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-.tree .tr-meta { margin-left: auto; padding-left: 6px; font-size: 11px; color: var(--text-3); font-variant-numeric: tabular-nums; }
-.tree .tr-conn { height: 32px; font-weight: 600; margin-top: 6px; }
-.tree .conn-acts { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; }
-.tree .conn-acts .link { font-size: 12px; }
+.tree .tr-meta { margin-left: auto; padding-left: var(--sp-2); font-size: var(--fs-xs); color: var(--text-3); font-variant-numeric: tabular-nums; }
+.tree-row > .badge { margin-left: auto; }
+
+/* 连接行 */
+.tree .tr-conn { height: calc(var(--tree-h) + 2px); font-weight: 600; margin-top: var(--sp-2); }
+.tree .conn-acts { margin-left: auto; display: inline-flex; align-items: center; gap: var(--sp-2); flex-shrink: 0; }
+
+/* 失效对象：删除线之外另有「已失效」文字徽标，颜色不作唯一信息来源 */
 .tree-row.dropped .tr-name { text-decoration: line-through; color: var(--text-3); }
-.tree .tree-note { padding: 6px 8px 6px calc(24px + var(--d, 0) * 14px); }
-.tree .tree-note > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+
+/* ---------- 树内说明条 ---------- */
+.tree .tree-note { padding-left: calc(var(--sp-6) + var(--d, 0) * var(--sp-4)); }
+.tree .tree-note > div { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 0; }
+.tree .tree-note strong { font-size: var(--fs-sm); }
+.tree .tree-note .reason { color: var(--text-2); word-break: break-word; }
+.tree .tree-note .tree-note-acts { display: flex; align-items: center; gap: var(--sp-2); margin-top: var(--sp-1); }
 .tree .tree-note.err { color: var(--err); }
-.tree .tree-note.err span { color: var(--text-2); word-break: break-word; }
 .tree .tree-note.warn { color: var(--warn); }
-.tree .tree-note.more { color: var(--text-3); }
-.tree .tree-more-acts { display: flex; gap: 10px; }
-.tree .tree-filter-head { font-size: 11.5px; color: var(--text-3); padding: 2px 8px 6px; }
-.tree .tr-hit { height: auto; min-height: var(--tree-h); padding: 5px 8px; align-items: flex-start; }
+.tree .tree-note.more { align-items: center; color: var(--text-2); }
+.tree .tree-note.more > span { color: var(--text-3); font-size: var(--fs-xs); }
+.tree .tree-inline-err { color: var(--err); font-size: var(--fs-xs); word-break: break-word; }
+
+/* 连接密码输入（其余输入样式来自 base.css 全局规则） */
+.tree-connect { display: flex; align-items: center; gap: var(--sp-2); }
+.tree-connect input { width: 140px; height: var(--control-h-sm); }
+
+/* ---------- 筛选结果 ---------- */
+.tree .tree-filter-head { font-size: var(--fs-xs); color: var(--text-3); padding: var(--sp-1) var(--sp-2) var(--sp-2); }
+.tree .tr-hit { height: auto; min-height: var(--tree-h); padding: var(--sp-1) var(--sp-2); align-items: flex-start; }
+.tree .tr-hit > .i { margin-top: 2px; }
 .tree .hit-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.tree .hit-path { display: flex; gap: 5px; align-items: center; font-size: 11.5px; color: var(--text-3); font-weight: 400; }
+.tree .hit-path { display: flex; gap: var(--sp-1); align-items: center; font-size: var(--fs-xs); color: var(--text-3); font-weight: 400; }
+.tree mark { background: var(--accent-soft); color: var(--accent-text); font-weight: 600; border-radius: var(--r-sm); padding: 0 1px; }
+
+/* ---------- 引擎缩写块 ---------- */
 .tree .eng {
   --engc: var(--text-2);
   display: inline-grid;
   place-items: center;
-  width: 22px;
-  height: 22px;
-  border-radius: 5px;
-  font: 700 10.5px/1 var(--font);
+  width: 20px;
+  height: 20px;
+  border-radius: var(--r-sm);
+  font: 700 var(--fs-xs)/1 var(--font);
   letter-spacing: -0.2px;
   color: var(--engc);
   background: color-mix(in srgb, var(--engc) 14%, transparent);
@@ -73,22 +77,7 @@
 .tree .eng-mysql { --engc: var(--eng-mysql); }
 .tree .eng-mariadb { --engc: var(--eng-mariadb); }
 .tree .eng-sqlite { --engc: var(--eng-sqlite); }
-.tree .pill {
-  display: inline-flex;
-  align-items: center;
-  height: 18px;
-  padding: 0 6px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 500;
-  background: var(--sunken);
-  color: var(--text-2);
-  white-space: nowrap;
-}
-.tree .pill-err { background: var(--err-soft); color: var(--err); }
-.object-menu { min-width: 196px; }
-.object-menu .menu-sep { height: 1px; margin: 4px 6px; background: var(--line); }
-.object-menu .menu-item.danger { color: var(--err); }
-.object-menu .menu-item.danger:hover:not(:disabled) { background: var(--err-soft); }
-.object-menu .menu-item:disabled { opacity: 0.45; }
-.tree mark { background: transparent; color: inherit; font-weight: 650; }
+
+/* ---------- 对象右键菜单（其余菜单样式来自 base.css 的 .menu） ---------- */
+.object-menu { min-width: 200px; }
+.object-menu .menu-sep { height: 1px; margin: var(--sp-1) var(--sp-2); background: var(--line); }

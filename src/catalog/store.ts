@@ -182,7 +182,7 @@ function applySnapshot(incoming: CatalogConnection[]): void {
 function failureText(error: unknown): string {
   if (error instanceof Error && error.message) return error.message;
   if (typeof error === "string" && error) return error;
-  return "无法读取对象列表";
+  return "对象列表没读出来，原因未知。";
 }
 
 export async function refreshFromBackend(): Promise<void> {
@@ -216,7 +216,7 @@ export async function startCatalog(): Promise<void> {
   if (refreshSource) return;
   const ids = await fetchSessions();
   if (ids === null) {
-    if (connections.value.length === 0) loadError.value = "无法读取已打开的连接";
+    if (connections.value.length === 0) loadError.value = "读不到已打开的连接。到「连接」页确认连接还能打开。";
     return;
   }
   await refreshFromBackend();

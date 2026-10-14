@@ -15,6 +15,7 @@ const emit = defineEmits<{
   "focused-database": [connectionId: string, database: string];
 }>();
 const menu = ref<{ object: CatalogObjectRef; x: number; y: number; notice: string } | null>(null);
+const refreshing = ref(false);
 const focusing = ref<string | null>(null);
 const focusTarget = ref<string | null>(null);
 const focusError = ref("");
@@ -116,6 +117,16 @@ function openFailure(report: OpenOutcome["report"]): string {
   if (report.status === "wait") return report.hint || "需要先在连接页确认主机身份。";
   const stage = report.stages.find((item) => item.status === "err" && item.message);
   return stage?.message || report.hint || report.failStage || "没有连上。";
+}
+
+async function onRefresh() {
+  if (refreshing.value) return;
+  refreshing.value = true;
+  try {
+    await refreshCatalog();
+  } finally {
+    refreshing.value = false;
+  }
 }
 
 async function connectSession(connection: CatalogConnection, password = "") {
@@ -271,18 +282,22 @@ onBeforeUnmount(() => {
 <template>
   <div class="tree" role="tree" aria-label="数据库对象" @click="onTreeClick" @contextmenu="onContextMenu" @scroll="closeMenu">
     <div class="tree-toolbar">
-      <button class="link" type="button" data-action="tree-refresh" aria-label="刷新对象列表" @click="refreshCatalog()">刷新对象列表</button>
+      <button class="btn ghost sm" type="button" data-action="tree-refresh" aria-label="刷新对象列表" :disabled="refreshing" @click="onRefresh">
+        {{ refreshing ? "正在刷新…" : "刷新" }}
+      </button>
     </div>
     <div v-if="loadError" class="tree-note err" data-load-error>
       <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>
       <div>
-        <strong>无法读取对象列表</strong>
-        <span>{{ loadError }}</span>
-        <button class="link" type="button" data-action="tree-retry" @click="refreshCatalog()">重试</button>
+        <strong>对象列表没读出来</strong>
+        <span class="reason">{{ loadError }}</span>
+        <span class="tree-note-acts">
+          <button class="btn sm" type="button" data-action="tree-retry" @click="onRefresh">重试</button>
+        </span>
       </div>
     </div>
     <template v-if="filter.trim()">
-      <div class="tree-filter-head">匹配 {{ matches.hits.length }} 个对象</div>
+      <div class="tree-filter-head">找到 {{ matches.hits.length }} 个名称包含“{{ filter.trim() }}”的对象</div>
       <div
         v-for="hit in matches.hits"
         :key="hit.id"
@@ -309,20 +324,20 @@ onBeforeUnmount(() => {
           <span class="hit-path">
             <span v-if="hit.env !== 'none' && hit.envTone !== 'none'" class="env xs" :class="`env-${hit.envTone}`">{{ hit.envLabel }}</span>
             {{ hit.path }}
-            <span v-if="hit.stale" class="pill pill-err">已失效</span>
+            <span v-if="hit.stale" class="badge err" title="这个对象已在外部被删除，下次刷新后不再显示">已失效</span>
           </span>
         </span>
       </div>
       <div v-if="matches.hits.length === 0" class="tree-note" style="--d: 0">
         <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.info" /></svg>
-        <span>已连接的数据库中没有名称包含“{{ filter.trim() }}”的表</span>
+        <span>已连接的数据库里没有名称包含“{{ filter.trim() }}”的表或视图</span>
       </div>
       <div v-if="matches.skipped.length" class="tree-note subtle" style="--d: 0" data-skipped>
         <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.info" /></svg>
-        <span>{{ matches.skipped.join("、") }} 未连接，未包含在结果中</span>
+        <span>{{ matches.skipped.join("、") }} 未连接，没有参与筛选</span>
       </div>
     </template>
-    <p v-else-if="connections.length === 0 && !loadError" class="tree-note">还没有连接。连接后按引擎显示数据库、schema 和表。</p>
+    <p v-else-if="connections.length === 0 && !loadError" class="tree-note">还没有打开的连接。到「连接」页新建连接后，这里会列出数据库、schema 和表。</p>
     <template v-else>
       <section v-for="connection in connections" :key="connection.id" :data-engine="connection.engine" :data-connection="connection.id">
         <div
@@ -343,7 +358,7 @@ onBeforeUnmount(() => {
           <span class="conn-acts">
             <button
               v-if="!isConnected(connection.status) && passwordFor !== connection.id"
-              class="link"
+              class="btn sm"
               type="button"
               data-action="tree-connect"
               :data-connection="connection.id"
@@ -352,34 +367,38 @@ onBeforeUnmount(() => {
             >
               {{ connecting === connection.id ? "正在连接…" : connection.status === "lost" ? "重新连接" : "连接" }}
             </button>
-            <span class="conn-state" :class="`st-${connection.status}`"><i></i><span class="sr">{{ STATUS_TEXT[connection.status] }}</span></span>
+            <span class="conn-state" :class="`st-${connection.status}`">
+              <i></i><span v-if="connection.status !== 'connected'">{{ STATUS_TEXT[connection.status] }}</span>
+            </span>
           </span>
         </div>
         <template v-if="open(`c:${connection.id}`)">
           <div v-if="!isConnected(connection.status)" class="tree-note" :class="{ warn: connection.status === 'lost' }" :style="depthStyle(1)" data-disconnected>
             <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="connection.status === 'lost' ? ICONS.warn : ICONS.info" /></svg>
             <div>
-              <span>{{ connection.status === "lost" ? "连接已断开，对象列表不再更新" : "未连接，连接后读取对象列表" }}</span>
+              <span>{{ connection.status === "lost" ? "连接已断开，这里显示的是断开前读到的内容，可能不是最新。" : "未连接——连接后才会读取这里的表。" }}</span>
               <form v-if="passwordFor === connection.id" class="tree-connect" @submit.prevent="connectSession(connection, typedPassword)">
                 <input v-model="typedPassword" type="password" autocomplete="current-password" aria-label="数据库密码" />
-                <button class="link" type="submit" data-action="tree-connect" :data-connection="connection.id" :disabled="connecting === connection.id">连接</button>
+                <button class="btn sm primary" type="submit" data-action="tree-connect" :data-connection="connection.id" :disabled="connecting === connection.id">连接</button>
               </form>
-              <span v-if="connectError && connectTarget === connection.id" data-connect-error>{{ connectError }}</span>
+              <span v-if="connectError && connectTarget === connection.id" class="tree-inline-err" data-connect-error>{{ connectError }}</span>
             </div>
           </div>
           <template v-else>
           <div v-if="connection.error" class="tree-note err" data-connection-error :style="depthStyle(1)">
             <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>
             <div>
-              <strong>无法读取对象列表</strong>
-              <span>{{ connection.error }}</span>
-              <button class="link" type="button" data-action="tree-retry" @click="refreshCatalog()">重试</button>
+              <strong>对象列表没读出来</strong>
+              <span class="reason">{{ connection.error }}</span>
+              <span class="tree-note-acts">
+                <button class="btn sm" type="button" data-action="tree-retry" @click="onRefresh">重试</button>
+              </span>
             </div>
           </div>
           <template v-if="!engineShape(connection.engine).databases">
             <div v-if="connection.foreignKeys !== null" class="tree-note subtle" :style="depthStyle(1)" data-foreign-keys>
               <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.info" /></svg>
-              <span>foreign_keys = {{ connection.foreignKeys ? "ON" : "OFF" }}</span>
+              <span>SQLite 的外键约束：{{ connection.foreignKeys ? "已开启" : "已关闭" }}（foreign_keys = {{ connection.foreignKeys ? "ON" : "OFF" }}）</span>
             </div>
             <template v-for="database in connection.databases" :key="database.name">
               <SchemaBlock
@@ -408,34 +427,38 @@ onBeforeUnmount(() => {
                 </span>
                 <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.database" /></svg>
                 <span class="tr-name">{{ database.name }}</span>
-                <span v-if="database.name === connection.defaultDatabase" class="tr-meta">默认</span>
+                <span v-if="database.name === connection.defaultDatabase" class="badge">当前会话连在这个库</span>
               </div>
               <template v-if="open(`d:${connection.id}:${database.name}`)">
                 <div v-if="sessionGap(database)" class="tree-note" :style="depthStyle(2)" data-other-database>
                   <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.info" /></svg>
                   <div>
-                    <span>这条会话连在 {{ sessionGap(database)?.current }}。PostgreSQL 一次只能读取一个库。</span>
-                    <button
-                      class="link"
-                      type="button"
-                      data-action="focus-database"
-                      :data-database="database.name"
-                      :data-connection="connection.id"
-                      :disabled="focusing === focusKey(connection.id, database.name)"
-                      title="把当前会话改连到这个库。正在执行的语句会断开。已保存的连接配置不变。"
-                      @click.stop="focusSession(connection, database.name)"
-                    >
-                      {{ focusing === focusKey(connection.id, database.name) ? "正在连接…" : `连接到 ${database.name}` }}
-                    </button>
-                    <span v-if="focusError && focusTarget === focusKey(connection.id, database.name)" data-focus-error>{{ focusError }}</span>
+                    <span>这条会话现在连在 {{ sessionGap(database)?.current }}，PostgreSQL 一次只能读取一个库。要浏览 {{ database.name }} 的表，先把会话连过去。</span>
+                    <span class="tree-note-acts">
+                      <button
+                        class="btn sm"
+                        type="button"
+                        data-action="focus-database"
+                        :data-database="database.name"
+                        :data-connection="connection.id"
+                        :disabled="focusing === focusKey(connection.id, database.name)"
+                        :title="`把当前会话改连到 ${database.name}。正在执行的语句会断开，已保存的连接配置不变。`"
+                        @click.stop="focusSession(connection, database.name)"
+                      >
+                        {{ focusing === focusKey(connection.id, database.name) ? "正在连接…" : `连接到 ${database.name}` }}
+                      </button>
+                    </span>
+                    <span v-if="focusError && focusTarget === focusKey(connection.id, database.name)" class="tree-inline-err" data-focus-error>{{ focusError }}</span>
                   </div>
                 </div>
                 <div v-else-if="database.error" class="tree-note err" :style="depthStyle(2)">
                   <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>
                   <div>
-                    <strong>无法读取对象列表</strong>
-                    <span>{{ database.error }}</span>
-                    <button class="link" type="button" data-action="tree-retry" @click="refreshCatalog()">重试</button>
+                    <strong>对象列表没读出来</strong>
+                    <span class="reason">{{ database.error }}</span>
+                    <span class="tree-note-acts">
+                      <button class="btn sm" type="button" data-action="tree-retry" @click="onRefresh">重试</button>
+                    </span>
                   </div>
                 </div>
                 <template v-for="schema in database.schemas" :key="`${database.name}:${schema.name}`">
@@ -486,7 +509,7 @@ onBeforeUnmount(() => {
       @click.stop
       @contextmenu.prevent
     >
-      <div v-if="menu.object.stale" class="menu-head">这个对象已失效</div>
+      <div v-if="menu.object.stale" class="menu-head">这个对象已失效——它在外部被删除，不能再打开</div>
       <button class="menu-item" type="button" data-action="open-data" :disabled="menu.object.stale" @click="openObject(menu.object, 'data')">打开数据</button>
       <button class="menu-item" type="button" data-action="open-structure" :disabled="menu.object.stale" @click="openObject(menu.object, 'structure', 'columns')">查看结构</button>
       <button class="menu-item" type="button" data-action="new-query" :disabled="menu.object.stale" :title="browseSql(menu.object.engine, menu.object.schema, menu.object.name)" @click="onQuery">新建查询</button>
