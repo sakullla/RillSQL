@@ -380,7 +380,7 @@ fn sqlite_rebuild_with(snapshot: &Snapshot, drafts: &[ColumnDraft], foreign_keys
         }
     };
     let mut steps = vec![
-        Step { sql: "PRAGMA foreign_keys = OFF;".to_owned(), label: "在事务外关闭外键强制".to_owned() },
+        Step { sql: "PRAGMA foreign_keys = OFF;".to_owned(), label: "在事务外关闭外键检查".to_owned() },
         Step { sql: "BEGIN;".to_owned(), label: "开始重建事务".to_owned() },
         Step { sql: create, label: "按新定义创建新表".to_owned() },
         Step {
@@ -414,7 +414,7 @@ fn sqlite_rebuild_with(snapshot: &Snapshot, drafts: &[ColumnDraft], foreign_keys
     if snapshot.live_foreign_keys == Some(false) {
         risks.push(Risk {
             level: "info".to_owned(),
-            text: "当前连接 foreign_keys = OFF。重建结束后仍恢复为 OFF，外键定义不会因此变成已强制。".to_owned(),
+            text: "当前连接 foreign_keys = OFF。重建结束后仍恢复为 OFF，外键定义不会因此变成强制检查。".to_owned(),
         });
     }
     finish(snapshot.engine, true, target, Vec::new(), risks, steps)

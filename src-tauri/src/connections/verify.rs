@@ -105,7 +105,7 @@ pub fn handshake(server_name: &str, fixture: CertFixture) -> Result<(), String> 
             break;
         }
     }
-    Err("TLS 握手没有完成".to_owned())
+    Err("加密连接没能建立".to_owned())
 }
 
 #[cfg(test)]

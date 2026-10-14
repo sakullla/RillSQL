@@ -12,7 +12,7 @@ pub async fn load(session: &CatalogSession, request: &Request, table: &str) -> R
         _ => None,
     };
     match session {
-        CatalogSession::Scripted => Err("这条已打开的会话没有可查询的数据库通道。".to_owned()),
+        CatalogSession::Scripted => Err("这个连接没有连着可查询的数据库。".to_owned()),
         CatalogSession::Sqlite { pool, .. } => load_sqlite(pool, &request.database, table, recorded).await,
         CatalogSession::Mysql(pool) => load_mysql(pool, request.engine, &request.database, table).await,
         CatalogSession::Postgres(client) => load_postgres(client, &request.database, &request.schema, table).await,
@@ -90,7 +90,7 @@ fn ensure_session(session: &CatalogSession, engine: Engine) -> Result<(), String
         (CatalogSession::Sqlite { .. }, Engine::Sqlite) => true,
         (CatalogSession::Mysql(_), Engine::Mysql | Engine::Mariadb) => true,
         (CatalogSession::Postgres(_), Engine::Postgres) => true,
-        (CatalogSession::Scripted, _) => return Err("这条已打开的会话没有可查询的数据库通道。".to_owned()),
+        (CatalogSession::Scripted, _) => return Err("这个连接没有连着可查询的数据库。".to_owned()),
         _ => false,
     };
     if ok {
@@ -102,7 +102,7 @@ fn ensure_session(session: &CatalogSession, engine: Engine) -> Result<(), String
 
 async fn load_sqlite(pool: &sqlx::SqlitePool, database: &str, table: &str, recorded: Option<bool>) -> Result<Snapshot, String> {
     if !database.is_empty() && database != "main" {
-        return Err(format!("当前会话连在 main，没有另开连接修改 {database}"));
+        return Err(format!("当前连接打开的是 main，没有另开连接修改 {database}"));
     }
     if !super::sql::valid_name(table) {
         return Err("表名无效。".to_owned());
@@ -388,7 +388,7 @@ async fn count_nulls(session: &CatalogSession, snapshot: &Snapshot, column: &str
             let row = row.ok_or_else(|| "没有读到 NULL 计数".to_owned())?;
             Ok(mysql_i64(&row, 0))
         }
-        CatalogSession::Scripted => Err("这条已打开的会话没有可查询的数据库通道。".to_owned()),
+        CatalogSession::Scripted => Err("这个连接没有连着可查询的数据库。".to_owned()),
     }
 }
 
@@ -536,12 +536,12 @@ async fn count_nulls_mysql_count(conn: &mut mysql_async::Conn, database: &str, t
 
 async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: &str, table: &str) -> Result<Snapshot, String> {
     if schema.is_empty() {
-        return Err("PostgreSQL 需要 schema，没有另开连接。".to_owned());
+        return Err("PostgreSQL 需要指定 schema（表所在的分组名），没有另开连接。".to_owned());
     }
     let current = client.query_one("SELECT current_database()", &[]).await.map_err(|err| err.to_string())?;
     let current: Option<String> = current.try_get(0).map_err(|err| err.to_string())?;
     if current.as_deref().unwrap_or("") != database {
-        return Err(format!("当前会话连在 {}，没有另开连接修改 {database}", current.unwrap_or_default()));
+        return Err(format!("当前连接打开的是 {}，没有另开连接修改 {database}", current.unwrap_or_default()));
     }
     let kind_rows = client
         .query(

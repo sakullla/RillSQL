@@ -250,11 +250,11 @@ pub fn fk_actions(engine: Engine) -> &'static [&'static str] {
 
 pub fn rule_text(engine: Engine, rebuild: bool) -> String {
     if rebuild {
-        return "SQLite 按官方步骤重建：先在事务外关闭外键强制，再在一个事务里建新表、复制数据、删除旧表并改回原名，然后做 foreign_key_check。这只属于这次重建，不是所有数据库都能回滚。事务内失败会回滚这次重建；事务外改过的 foreign_keys 会恢复为会话原来的值。".to_owned();
+        return "SQLite 按官方步骤重建：先在事务外关闭外键检查，再在一个事务里建新表、复制数据、删除旧表并改回原名，然后做 foreign_key_check（外键完整性检查）。这只属于这次重建，不是所有数据库都能回滚。事务内失败会回滚这次重建；事务外改过的 foreign_keys 会恢复为会话原来的值。".to_owned();
     }
     match engine {
-        Engine::Mysql | Engine::Mariadb => "这些语句逐条自动提交，失败即停。MySQL 与 MariaDB 的 DDL 会隐式提交，中途失败不会撤销已经成功的语句，不能声称已经全部回滚。".to_owned(),
-        Engine::Postgres => "这些语句逐条自动提交，失败即停。已经成功的语句不撤销。PostgreSQL 虽然可以把 DDL 放进事务，这里也不包成一个大事务，不能据此认为所有数据库都会回滚。".to_owned(),
-        Engine::Sqlite => "这些语句逐条自动提交，失败即停。已经成功的语句不撤销，后面的语句不执行。".to_owned(),
+        Engine::Mysql | Engine::Mariadb => "这些语句逐条执行，失败即停。MySQL 与 MariaDB 会立即提交每条结构变更语句，中途失败不会撤销已经成功的语句，不能声称已经全部回滚。".to_owned(),
+        Engine::Postgres => "这些语句逐条执行，失败即停。已经成功的语句不撤销。PostgreSQL 虽然可以把结构变更放进事务，这里也不包成一个大事务，不能据此认为所有数据库都会回滚。".to_owned(),
+        Engine::Sqlite => "这些语句逐条执行，失败即停。已经成功的语句不撤销，后面的语句不执行。".to_owned(),
     }
 }

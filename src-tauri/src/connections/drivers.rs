@@ -69,7 +69,7 @@ pub async fn open_mysql(config: &SavedConnection, route: &Route, password: &str)
     if plan.skip_domain_validation || plan.accept_invalid_certs {
         if route.tls_mode != TlsMode::Require {
             return Err(stages::fail(
-                "TLS 计划不一致",
+                "加密连接设置前后不一致",
                 "只有用户选择“加密但不验证”时才跳过证书校验。",
             ));
         }
@@ -178,7 +178,7 @@ pub async fn open_postgres(config: &SavedConnection, route: &Route, password: &s
     let plan = route::postgres_tls_plan(route).map_err(|err| stages::fail(err, "没有改用转发器地址做证书校验。"))?;
     if plan.verify_hostname && plan.host == "127.0.0.1" && route.tls_server_name.as_deref() != Some("127.0.0.1") {
         return Err(stages::fail(
-            "TLS 计划把校验名改成了转发器地址",
+            "加密设置错把转发器地址当成了证书校验名",
             "证书仍应按数据库主机名校验。",
         ));
     }
@@ -205,7 +205,7 @@ pub async fn open_postgres(config: &SavedConnection, route: &Route, password: &s
         });
         client
     } else {
-        let (client, connection) = pg.connect(NoTls).await.map_err(|err| stages::fail(err.to_string(), "网络连接失败，没有改用 TLS。"))?;
+        let (client, connection) = pg.connect(NoTls).await.map_err(|err| stages::fail(err.to_string(), "网络连接失败，没有改走加密连接重试。"))?;
         tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -413,7 +413,7 @@ pub async fn start_tunnel(
             if let Some(decision) = decision {
                 return Err(decision_error(decision));
             }
-            return Err(TunnelFault::Identity(stages::fail(err.0, "尚未尝试 SSH 认证或数据库认证。")));
+            return Err(TunnelFault::Identity(stages::fail(err.0, "还没有尝试登录 SSH 跳板机或数据库。")));
         }
     };
     let decision = outcome.lock().ok().and_then(|slot| slot.clone());
@@ -429,7 +429,7 @@ pub async fn start_tunnel(
                 None => {
                     return Err(TunnelFault::Authentication(stages::fail(
                         "请填写 SSH 密码",
-                        "这是跳板机认证失败，尚未尝试连接数据库。",
+                        "这是登录跳板机失败，还没有尝试连接数据库。",
                     )))
                 }
             };
@@ -441,7 +441,7 @@ pub async fn start_tunnel(
                 None => {
                     return Err(TunnelFault::Authentication(stages::fail(
                         "请填写私钥文件",
-                        "这是跳板机认证失败，尚未尝试连接数据库。",
+                        "这是登录跳板机失败，还没有尝试连接数据库。",
                     )))
                 }
             };
@@ -467,13 +467,13 @@ pub async fn start_tunnel(
                     if ssh.auth == SshAuthKind::Key { "publickey" } else { "password" },
                     ssh.username
                 ),
-                "这是跳板机认证失败，尚未尝试连接数据库。请检查 SSH 用户、私钥或口令。",
+                "这是登录跳板机失败，还没有尝试连接数据库。请检查 SSH 用户、私钥或口令。",
             )));
         }
         Err(err) => {
             return Err(TunnelFault::Authentication(stages::fail(
                 err.to_string(),
-                "这是跳板机认证失败，尚未尝试连接数据库。",
+                "这是登录跳板机失败，还没有尝试连接数据库。",
             )));
         }
     }
@@ -482,7 +482,7 @@ pub async fn start_tunnel(
         Err(err) => {
             return Err(TunnelFault::Tunnel(stages::fail(
                 err.to_string(),
-                "SSH 已认证，但隧道没有建立。尚未连接数据库。",
+                "已登录 SSH 跳板机，但到数据库的通道没有打通，还没有连接数据库。",
             )))
         }
     };
@@ -491,7 +491,7 @@ pub async fn start_tunnel(
         Err(err) => {
             return Err(TunnelFault::Tunnel(stages::fail(
                 err.to_string(),
-                "SSH 已认证，但隧道没有建立。尚未连接数据库。",
+                "已登录 SSH 跳板机，但到数据库的通道没有打通，还没有连接数据库。",
             )))
         }
     };

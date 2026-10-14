@@ -121,13 +121,13 @@ impl Drop for Reservation {
 pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: StartRequest) -> Result<RunDto, String> {
     let parts = split_sql(&request.sql);
     if parts.is_empty() {
-        return Err("没有可执行的 SQL".to_owned());
+        return Err("没有可执行的 SQL 语句".to_owned());
     }
     let session = service
         .catalog_session(&request.connection_id)
-        .ok_or_else(|| "连接未打开，没有另开数据库连接。".to_owned())?;
+        .ok_or_else(|| "这条连接还没有打开，没有另开新的连接。".to_owned())?;
     if matches!(session, CatalogSession::Scripted) {
-        return Err("这条已打开的会话没有可查询的数据库通道".to_owned());
+        return Err("这个连接没有连着可查询的数据库".to_owned());
     }
     let transport = service.cancel_transport(&request.connection_id).unwrap_or(CancelTransport::None);
     let via_ssh = transport.via_ssh();
@@ -259,7 +259,7 @@ fn summary_of(batch: &exec::BatchReport) -> String {
             .map(|item| item.message.clone())
             .unwrap_or_else(|| "执行失败".to_owned()),
         "unknown" => "连接中断，结果未知".to_owned(),
-        "cancelled" => "数据库已确认取消".to_owned(),
+        "cancelled" => "数据库已确认取消，查询已停止".to_owned(),
         _ => "执行结束".to_owned(),
     }
 }

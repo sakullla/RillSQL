@@ -20,23 +20,23 @@ pub enum StageKind {
 impl StageKind {
     pub fn tls_label(mode: TlsMode) -> &'static str {
         match mode {
-            TlsMode::Verify => "TLS 握手与证书验证",
-            TlsMode::Require | TlsMode::Off => "TLS 握手",
+            TlsMode::Verify => "加密连接并核对证书",
+            TlsMode::Require | TlsMode::Off => "加密连接",
         }
     }
 
     pub fn label_zh(self) -> &'static str {
         match self {
-            StageKind::SshHostIdentity => "SSH 主机身份",
-            StageKind::SshAuthentication => "SSH 认证",
-            StageKind::Tunnel => "建立隧道",
-            StageKind::Network => "网络连接",
-            StageKind::Tls => "TLS 握手",
-            StageKind::DatabaseAuthentication => "数据库认证",
-            StageKind::ServerVersion => "读取服务器版本",
+            StageKind::SshHostIdentity => "确认 SSH 跳板机身份",
+            StageKind::SshAuthentication => "登录 SSH 跳板机",
+            StageKind::Tunnel => "通过 SSH 跳板机打通到数据库的通道",
+            StageKind::Network => "连接数据库服务器",
+            StageKind::Tls => "加密连接",
+            StageKind::DatabaseAuthentication => "登录数据库",
+            StageKind::ServerVersion => "读取数据库版本",
             StageKind::OpenFile => "打开文件",
-            StageKind::ReadSchema => "读取 schema",
-            StageKind::ForeignKeys => "检查 foreign_keys",
+            StageKind::ReadSchema => "读取表结构清单",
+            StageKind::ForeignKeys => "检查外键设置",
         }
     }
 }
@@ -171,7 +171,7 @@ pub async fn execute_stages(stages: &[StageKind], runner: &mut (dyn StageRunner 
                     kind: *stage,
                     label: runner.stage_label(*stage),
                     status: StageStatus::Wait,
-                    message: format!("等待确认主机指纹 {fp}"),
+                    message: format!("等待确认 SSH 服务器指纹 {fp}"),
                 });
             }
             Err(StageError::Fail { message, hint: stage_hint }) => {

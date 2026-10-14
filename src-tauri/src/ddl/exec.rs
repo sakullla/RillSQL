@@ -81,7 +81,7 @@ async fn prepare_snapshot(session: &CatalogSession, request: &Request) -> Result
 
 pub async fn run_steps(session: &CatalogSession, steps: &[Step], restore_foreign_keys: Option<bool>) -> Result<Vec<StepReceipt>, String> {
     match session {
-        CatalogSession::Scripted => Err("这条已打开的会话没有可查询的数据库通道。".to_owned()),
+        CatalogSession::Scripted => Err("这个连接没有连着可查询的数据库。".to_owned()),
         CatalogSession::Sqlite { pool, .. } => run_sqlite(pool, steps, restore_foreign_keys).await,
         CatalogSession::Mysql(pool) => run_mysql(pool, steps).await,
         CatalogSession::Postgres(client) => run_postgres(client, steps).await,

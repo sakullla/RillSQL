@@ -20,7 +20,7 @@ pub fn on_request(via_ssh: bool) -> CancelView {
         phase: "requested",
         fresh_channel: false,
         message: if via_ssh {
-            "已请求取消，将另开一条 SSH 通道，等待数据库确认。".to_owned()
+            "已请求取消，将另开一条经 SSH 的连接通知数据库，等待确认。".to_owned()
         } else {
             "已请求取消，等待数据库确认。".to_owned()
         },
@@ -32,10 +32,10 @@ pub fn on_delivery(view: &mut CancelView, result: Result<bool, String>, via_ssh:
         Ok(fresh) => {
             view.fresh_channel = fresh;
             if via_ssh && fresh {
-                view.message = "已通过另一条 SSH 通道发出取消，等待数据库确认。请求发出不等于查询已停止。".to_owned();
+                view.message = "已通过另一条经 SSH 的连接发出取消，等待数据库确认。请求发出不等于查询已停止。".to_owned();
             } else if via_ssh && !fresh {
                 view.phase = "failed";
-                view.message = "经 SSH 的取消没有另开通道，已视为失败。查询仍在执行。".to_owned();
+                view.message = "经 SSH 的取消没能另开连接，已视为失败。查询仍在执行。".to_owned();
                 view.fresh_channel = false;
             }
         }
@@ -68,9 +68,9 @@ pub fn fresh_cancel_channel(opens: &[OpenRecord], busy_id: u64) -> Result<&OpenR
         .iter()
         .rev()
         .find(|item| item.id != busy.id)
-        .ok_or_else(|| "取消没有另开通道，不能复用正在执行的那条 direct-tcpip".to_owned())?;
+        .ok_or_else(|| "取消没有另开连接，不能复用正在执行的那一条".to_owned())?;
     if fresh.host != busy.host || fresh.port != busy.port {
-        return Err("取消通道没有指向原来的数据库地址".to_owned());
+        return Err("取消用的连接没有指向原来的数据库地址".to_owned());
     }
     if fresh.host == "127.0.0.1" || fresh.host.eq_ignore_ascii_case("localhost") {
         return Err("取消不能把转发器地址当成数据库主机".to_owned());
@@ -98,7 +98,7 @@ pub async fn deliver_cancel(transport: &CancelTransport) -> Result<bool, String>
                 Ok(true)
             }
         }
-        CancelTransport::None => Err("这条已打开的会话没有可取消的数据库通道。查询仍在执行。".to_owned()),
+        CancelTransport::None => Err("这条连接没有可用来取消的数据库通道。查询仍在执行。".to_owned()),
     }
 }
 
@@ -111,7 +111,7 @@ async fn kill_mysql(connection_id: &AtomicU64, opts: &mysql_async::Opts, via_ssh
     let pool = mysql_async::Pool::new(opts.clone());
     let mut conn = pool.get_conn().await.map_err(|err| {
         if via_ssh {
-            format!("经 SSH 另开取消通道失败：{err}。查询仍在执行。")
+            format!("经 SSH 另开取消连接失败：{err}。查询仍在执行。")
         } else {
             format!("取消失败：{err}。查询仍在执行。")
         }

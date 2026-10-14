@@ -764,8 +764,8 @@ impl Attempt {
             }
         }
         Ok(match self.config.ssh.as_ref().map(|ssh| ssh.auth) {
-            Some(SshAuthKind::Key) => "私钥认证成功".to_owned(),
-            _ => "密码认证成功".to_owned(),
+            Some(SshAuthKind::Key) => "使用私钥登录成功".to_owned(),
+            _ => "使用密码登录成功".to_owned(),
         })
     }
 
@@ -783,7 +783,7 @@ impl Attempt {
             return Ok(message);
         }
         let local = self.forwarder_port.ok_or_else(|| stages::fail("隧道没有建立", "尚未连接数据库。"))?;
-        Ok(format!("127.0.0.1:{local} → {host}:{port}（每条本地连接单独一条 direct-tcpip）"))
+        Ok(format!("本机 127.0.0.1:{local} 经 SSH 跳板机打通到数据库 {host}:{port} 的通道"))
     }
 
     async fn ensure_remote(&mut self) {
@@ -1002,9 +1002,9 @@ impl StageRunner for Attempt {
 
 pub(crate) fn tls_stage_message(mode: TlsMode, server_name: &str) -> String {
     if mode == TlsMode::Verify {
-        format!("证书主机名 {server_name} 已验证")
+        format!("已核对证书，主机名 {server_name} 与证书一致")
     } else {
-        "已加密，但未验证证书和主机名".to_owned()
+        "已加密，但没有核对证书和主机名".to_owned()
     }
 }
 
@@ -1042,7 +1042,7 @@ fn classify_db(error: &StageError) -> StageKind {
     let StageError::Fail { message, hint } = error else {
         return StageKind::Network;
     };
-    if hint.contains("网络连接失败") || hint.contains("隧道没有") {
+    if hint.contains("网络连接失败") || hint.contains("隧道没有") || hint.contains("通道没有打通") {
         return StageKind::Network;
     }
     if hint.contains("用户名和密码") || hint.contains("数据库认证") {

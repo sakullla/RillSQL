@@ -261,7 +261,7 @@ fn schema_dto(schema: &super::store::TableSchema, database: &str) -> SchemaDto {
 }
 
 fn require_session(state: &ConnectionsState, id: &str) -> Result<crate::connections::CatalogSession, String> {
-    state.service.catalog_session(id).ok_or_else(|| "连接未打开，没有另开数据库连接。".to_owned())
+    state.service.catalog_session(id).ok_or_else(|| "这条连接还没有打开，没有另开新的连接。".to_owned())
 }
 
 #[tauri::command]

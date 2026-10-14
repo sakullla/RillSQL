@@ -12,7 +12,7 @@ pub fn qualified_table(engine: Engine, database: &str, schema: &str, table: &str
     match engine {
         Engine::Sqlite => {
             if !database.is_empty() && database != "main" {
-                return Err(format!("当前会话连在 main，没有另开连接修改 {database}"));
+                return Err(format!("当前连接打开的是 main，没有另开连接修改 {database}"));
             }
             Ok(quote_ident(engine, table))
         }
@@ -24,7 +24,7 @@ pub fn qualified_table(engine: Engine, database: &str, schema: &str, table: &str
         }
         Engine::Postgres => {
             if schema.is_empty() {
-                return Err("PostgreSQL 需要 schema，没有另开连接。".to_owned());
+                return Err("PostgreSQL 需要指定 schema（表所在的分组名），没有另开连接。".to_owned());
             }
             Ok(format!("{}.{}", quote_ident(engine, schema), quote_ident(engine, table)))
         }

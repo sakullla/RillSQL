@@ -84,7 +84,7 @@ fn cancel_phases_stay_distinct() {
     let mut reused = cancel::on_request(true);
     cancel::on_delivery(&mut reused, Ok(false), true);
     assert_eq!(reused.phase, "failed");
-    assert!(reused.message.contains("没有另开通道"));
+    assert!(reused.message.contains("没能另开连接"));
 }
 
 #[test]

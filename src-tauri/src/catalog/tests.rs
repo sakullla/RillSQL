@@ -358,11 +358,11 @@ fn catalog_commands_use_the_open_session_reader() {
 async fn scripted_and_unreachable_sessions_fail_instead_of_an_empty_catalog() {
     let scripted = read_catalog_session(Engine::Mysql, &CatalogSession::Scripted, 100, &[]).await;
     assert!(scripted.databases.is_empty());
-    assert!(scripted.error.as_deref().unwrap().contains("没有可查询"));
+    assert!(scripted.error.as_deref().unwrap().contains("没有连着可查询"));
 
     let closed = page_for_session(None, "main", "", 0, 100).await;
     assert!(closed.objects.is_empty());
-    assert!(closed.error.as_deref().unwrap().contains("连接未打开"));
+    assert!(closed.error.as_deref().unwrap().contains("还没有打开"));
 
     let opts = mysql_async::OptsBuilder::default()
         .ip_or_hostname("127.0.0.1")

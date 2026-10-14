@@ -158,7 +158,7 @@ fn request_from(database: String, schema: String, engine: &str, action: Action) 
 }
 
 fn require_session(state: &ConnectionsState, id: &str) -> Result<crate::connections::CatalogSession, String> {
-    state.service.catalog_session(id).ok_or_else(|| "连接未打开，没有另开数据库连接。".to_owned())
+    state.service.catalog_session(id).ok_or_else(|| "这条连接还没有打开，没有另开新的连接。".to_owned())
 }
 
 fn describe_dto(snapshot: &Snapshot) -> DescribeDto {
@@ -275,7 +275,7 @@ pub(crate) async fn execute_saved(
     request: &Request,
     confirmed_sql: &[String],
 ) -> Result<Receipt, String> {
-    let session = service.catalog_session(connection_id).ok_or_else(|| "连接未打开，没有另开数据库连接。".to_owned())?;
+    let session = service.catalog_session(connection_id).ok_or_else(|| "这条连接还没有打开，没有另开新的连接。".to_owned())?;
     let receipt = exec::execute(&session, request, confirmed_sql).await?;
     if let Some(enabled) = exec::committed_foreign_keys(&request.action, &receipt) {
         service.set_catalog_foreign_keys(connection_id, Some(enabled));

@@ -547,8 +547,8 @@ async fn stored_password_is_reused_without_being_copied_into_the_config() {
 }
 
 fn assert_not_verified(message: &str) {
-    assert!(!message.contains("已验证"), "{message}");
-    assert!(message.contains("未验证"), "{message}");
+    assert!(!message.contains("已核对"), "{message}");
+    assert!(message.contains("没有核对"), "{message}");
     assert!(message.contains("已加密"), "{message}");
 }
 
@@ -560,9 +560,9 @@ async fn only_verified_tls_success_says_the_certificate_was_checked() {
     let require_ok = super::service::report_canned_remote(require.clone(), super::service::CannedRemote::Connected).await;
     assert_eq!(require_ok.status, TestStatus::Ok);
     let require_tls_ok = require_ok.stages.iter().find(|stage| stage.kind == StageKind::Tls).unwrap();
-    assert_eq!(require_tls_ok.label, "TLS 握手");
-    assert!(!require_tls_ok.label.contains("证书验证"));
-    assert_eq!(require_tls_ok.message, "已加密，但未验证证书和主机名");
+    assert_eq!(require_tls_ok.label, "加密连接");
+    assert!(!require_tls_ok.label.contains("核对证书"));
+    assert_eq!(require_tls_ok.message, "已加密，但没有核对证书和主机名");
     assert_not_verified(&require_tls_ok.message);
 
     let require_auth = super::service::report_canned_remote(require, super::service::CannedRemote::AuthenticationFailed).await;
@@ -570,20 +570,20 @@ async fn only_verified_tls_success_says_the_certificate_was_checked() {
     assert_eq!(require_auth.fail_stage.as_deref(), Some(StageKind::DatabaseAuthentication.label_zh()));
     let require_tls = require_auth.stages.iter().find(|stage| stage.kind == StageKind::Tls).unwrap();
     assert_eq!(require_tls.status, StageStatus::Ok);
-    assert_eq!(require_tls.label, "TLS 握手");
-    assert!(!require_tls.label.contains("证书验证"));
+    assert_eq!(require_tls.label, "加密连接");
+    assert!(!require_tls.label.contains("核对证书"));
     assert_not_verified(&require_tls.message);
 
     let verify = model::normalize(&remote_draft(Engine::Postgres), "verify".to_owned()).unwrap();
     let verify_ok = super::service::report_canned_remote(verify.clone(), super::service::CannedRemote::Connected).await;
     let verify_tls_ok = verify_ok.stages.iter().find(|stage| stage.kind == StageKind::Tls).unwrap();
-    assert_eq!(verify_tls_ok.label, "TLS 握手与证书验证");
-    assert_eq!(verify_tls_ok.message, "证书主机名 db.example.test 已验证");
+    assert_eq!(verify_tls_ok.label, "加密连接并核对证书");
+    assert_eq!(verify_tls_ok.message, "已核对证书，主机名 db.example.test 与证书一致");
     let verify_auth = super::service::report_canned_remote(verify, super::service::CannedRemote::AuthenticationFailed).await;
     let verify_tls = verify_auth.stages.iter().find(|stage| stage.kind == StageKind::Tls).unwrap();
     assert_eq!(verify_tls.status, StageStatus::Ok);
-    assert_eq!(verify_tls.label, "TLS 握手与证书验证");
-    assert_eq!(verify_tls.message, "证书主机名 db.example.test 已验证");
+    assert_eq!(verify_tls.label, "加密连接并核对证书");
+    assert_eq!(verify_tls.message, "已核对证书，主机名 db.example.test 与证书一致");
     assert_eq!(
         verify_auth
             .stages
@@ -611,11 +611,11 @@ async fn missing_password_does_not_mark_network_or_tls_successful() {
             let stage = report.stages.iter().find(|stage| stage.kind == kind).unwrap();
             assert_ne!(stage.status, StageStatus::Ok, "{mode:?} {kind:?} {}", stage.message);
             assert!(!stage.message.contains("已加密"), "{mode:?} {}", stage.message);
-            assert!(!stage.message.contains("已验证"), "{mode:?} {}", stage.message);
+            assert!(!stage.message.contains("已核对"), "{mode:?} {}", stage.message);
         }
         let tls = report.stages.iter().find(|stage| stage.kind == StageKind::Tls).unwrap();
         if mode == TlsMode::Require {
-            assert!(!tls.label.contains("证书验证"), "{}", tls.label);
+            assert!(!tls.label.contains("核对证书"), "{}", tls.label);
         }
         assert_eq!(
             report

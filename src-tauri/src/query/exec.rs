@@ -76,7 +76,7 @@ pub fn database_gate(engine: &str, current: &str, requested: &str) -> DatabaseGa
 }
 
 pub fn refuse_message(current: &str, requested: &str) -> String {
-    format!("当前会话连在 {current}，没有另开连接执行 {requested}")
+    format!("当前连接打开的是 {current}，没有另开连接执行 {requested}")
 }
 
 pub fn classify_failure(sql: &str, message: String, cancel_requested: bool) -> StatementStop {
@@ -280,7 +280,7 @@ impl StatementDriver for LiveDriver {
     async fn run(&self, sql: &str, limit: usize, cancel: &Arc<AtomicBool>) -> Result<StatementValue, StatementStop> {
         let mut attached = self.session.lock().await;
         let result = match &mut *attached {
-            Attached::Scripted => Err("这条已打开的会话没有可查询的数据库通道".to_owned()),
+            Attached::Scripted => Err("这个连接没有连着可查询的数据库".to_owned()),
             Attached::Sqlite(pool) => sqlite_run(pool, sql, limit, cancel).await,
             Attached::Mysql(conn) => mysql_run(conn, &self.transport, sql, limit).await,
             Attached::Postgres(client) => postgres_run(client, sql, limit).await,

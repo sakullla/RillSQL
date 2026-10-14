@@ -254,7 +254,7 @@ async fn open_session_reads_writes_and_exports_without_a_second_connection() {
     let refused = live::describe(&session, "other", "", "customers", "sqlite").await.unwrap_err();
     assert!(refused.contains("没有另开连接"));
     let scripted = live::describe(&CatalogSession::Scripted, "main", "", "customers", "sqlite").await.unwrap_err();
-    assert!(scripted.contains("没有可查询"));
+    assert!(scripted.contains("没有连着可查询"));
 
     let page = live::query_page(&session, "main", "", "customers", "sqlite", &[], None, 0, 100).await.unwrap();
     assert_eq!(page.rows.len(), 100);
@@ -366,7 +366,7 @@ async fn open_session_reads_writes_and_exports_without_a_second_connection() {
     .await
     .unwrap();
     assert!(blocked_delete.applied.is_empty());
-    assert!(blocked_delete.failed.unwrap().message.contains("无法唯一定位"));
+    assert!(blocked_delete.failed.unwrap().message.contains("无法唯一确定"));
     assert_eq!(live::count_rows(&session, "main", "", "notes", "sqlite", &[]).await.unwrap(), 3);
 
     let view = live::describe(&session, "main", "", "v_customers", "sqlite").await.unwrap();
@@ -381,7 +381,7 @@ async fn open_session_reads_writes_and_exports_without_a_second_connection() {
     )
     .await
     .unwrap();
-    assert!(view_write.failed.unwrap().message.contains("只有基础表"));
+    assert!(view_write.failed.unwrap().message.contains("只有数据表"));
 
     let spec = |id: &str, mode: ExportMode, path: &str, limit: u64, truncated: bool, statement: &str, acknowledged: bool| ExportSpec {
         id: id.to_owned(),

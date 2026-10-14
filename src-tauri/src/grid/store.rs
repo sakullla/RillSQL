@@ -381,15 +381,15 @@ pub fn commit_changes(store: &mut TableStore, changes: &[Change]) -> CommitRepor
             Change::Update { id, .. } | Change::Insert { id, .. } | Change::Delete { id, .. } => id.clone(),
         }).collect::<Vec<_>>();
         if store.schema.kind != "table" {
-            return fail(applied, pending[0].clone(), String::new(), "只有基础表可以新增、修改或删除".to_owned(), pending);
+            return fail(applied, pending[0].clone(), String::new(), "只有数据表可以新增、修改或删除，视图不行".to_owned(), pending);
         }
         match change {
             Change::Update { id, row_id, sets } => {
                 let Some(position) = store.rows.iter().position(|row| row.id == *row_id) else {
-                    return fail(applied, id.clone(), String::new(), "无法唯一定位，不能修改".to_owned(), pending);
+                    return fail(applied, id.clone(), String::new(), "无法唯一确定这一行，不能修改".to_owned(), pending);
                 };
                 if !store.rows[position].located || store.rows[position].locator.is_none() {
-                    return fail(applied, id.clone(), String::new(), "无法唯一定位，不能修改".to_owned(), pending);
+                    return fail(applied, id.clone(), String::new(), "无法唯一确定这一行，不能修改".to_owned(), pending);
                 }
                 let locator = store.rows[position].locator.clone().unwrap();
                 let hits = store.rows.iter().filter(|row| row.locator.as_ref().is_some_and(|item| same_locator(item, &locator))).count();
@@ -413,10 +413,10 @@ pub fn commit_changes(store: &mut TableStore, changes: &[Change]) -> CommitRepor
             }
             Change::Delete { id, row_id } => {
                 let Some(position) = store.rows.iter().position(|row| row.id == *row_id) else {
-                    return fail(applied, id.clone(), String::new(), "无法唯一定位，不能删除".to_owned(), pending);
+                    return fail(applied, id.clone(), String::new(), "无法唯一确定这一行，不能删除".to_owned(), pending);
                 };
                 if !store.rows[position].located || store.rows[position].locator.is_none() {
-                    return fail(applied, id.clone(), String::new(), "无法唯一定位，不能删除".to_owned(), pending);
+                    return fail(applied, id.clone(), String::new(), "无法唯一确定这一行，不能删除".to_owned(), pending);
                 }
                 let locator = store.rows[position].locator.clone().unwrap();
                 let hits = store.rows.iter().filter(|row| row.locator.as_ref().is_some_and(|item| same_locator(item, &locator))).count();

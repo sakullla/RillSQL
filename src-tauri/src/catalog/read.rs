@@ -50,7 +50,7 @@ fn read_failure(err: impl std::fmt::Display) -> String {
 }
 
 fn scripted_message() -> String {
-    read_failure("这条已打开的会话没有可查询的数据库通道")
+    read_failure("这个连接没有连着可查询的数据库")
 }
 
 pub(crate) fn other_database_message(current: &str, name: &str) -> String {
@@ -90,7 +90,7 @@ pub async fn read_catalog_session(engine: Engine, session: &CatalogSession, page
             databases: Vec::new(),
         },
         _ => ConnectionBody {
-            error: Some(read_failure("会话类型和连接引擎不一致")),
+            error: Some(read_failure("连接类型和引擎不一致")),
             foreign_keys: None,
             databases: Vec::new(),
         },

@@ -30,11 +30,11 @@ fn audited(statement: &str) -> sqlx::AssertSqlSafe<String> {
 }
 
 fn no_channel() -> String {
-    "这条已打开的会话没有可查询的数据库通道".to_owned()
+    "这个连接没有连着可查询的数据库".to_owned()
 }
 
 fn other_database(current: &str, name: &str) -> String {
-    format!("当前会话连在 {current}，没有另开连接读取 {name}")
+    format!("当前连接打开的是 {current}，没有另开连接读取 {name}")
 }
 
 pub struct LiveRow {
@@ -125,7 +125,7 @@ pub async fn describe(session: &CatalogSession, database: &str, schema: &str, ta
         CatalogSession::Postgres(client) => {
             ensure_postgres_database(client, database).await?;
             if schema.is_empty() {
-                return Err("PostgreSQL 需要 schema，没有另开连接。".to_owned());
+                return Err("PostgreSQL 需要指定 schema（表所在的分组名），没有另开连接。".to_owned());
             }
             describe_postgres(client, schema, table).await
         }
@@ -195,7 +195,7 @@ pub async fn commit(
     for (index, change) in changes.iter().enumerate() {
         let pending: Vec<String> = changes.iter().skip(index).map(|item| item.id.clone()).collect();
         if schema.kind != "table" {
-            return Ok(fail(applied, &change.id, String::new(), "只有基础表可以新增、修改或删除", pending));
+            return Ok(fail(applied, &change.id, String::new(), "只有数据表可以新增、修改或删除，视图不行", pending));
         }
         match change.kind {
             MutationKind::Update => {
@@ -259,13 +259,13 @@ fn fail(applied: Vec<Applied>, id: &str, sql: String, message: impl Into<String>
 fn located_sql<'a>(schema: &'a TableSchema, locator: &'a [(String, Cell)], update: bool) -> Result<&'a [(String, Cell)], String> {
     let verb = if update { "修改" } else { "删除" };
     if schema.key.is_empty() {
-        return Err(format!("无法唯一定位，不能{verb}"));
+        return Err(format!("这张表没有主键，无法唯一确定这一行，不能{verb}"));
     }
     if locator.len() != schema.key.len() || locator.iter().zip(&schema.key).any(|(item, key)| item.0 != *key) {
-        return Err(format!("无法唯一定位，不能{verb}"));
+        return Err(format!("主键值不完整，无法唯一确定这一行，不能{verb}"));
     }
     if locator.iter().any(|(_, value)| matches!(value, Cell::Null)) {
-        return Err(format!("无法唯一定位，不能{verb}"));
+        return Err(format!("主键值里有空值，无法唯一确定这一行，不能{verb}"));
     }
     Ok(locator)
 }
@@ -284,7 +284,7 @@ async fn expect_one(session: &CatalogSession, schema: &TableSchema, locator: &[(
     if count == 1 {
         Ok(())
     } else if count == 0 {
-        Err("无法唯一定位，不能修改或删除".to_owned())
+        Err("数据库里已找不到这一行，不能修改或删除".to_owned())
     } else {
         Err(format!("影响 {count} 行，已停止。已成功的语句不撤销。"))
     }

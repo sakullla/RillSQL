@@ -94,7 +94,7 @@ pub fn compile_where(schema: &TableSchema, filters: &[Filter]) -> Result<String,
     let mut parts = Vec::new();
     for filter in filters {
         let Some(column) = schema.columns.iter().find(|column| column.name == filter.column) else {
-            return Err(format!("未知列 {}，不能拼接手写条件", filter.column));
+            return Err(format!("找不到列 {}，不能拼进筛选条件", filter.column));
         };
         if filter.op.needs_value() && filter.value.as_deref().unwrap_or("").is_empty() {
             return Err("筛选值不能为空".to_owned());
@@ -120,12 +120,12 @@ pub fn select_export_gate(sql: &str) -> Result<String, String> {
         return Err("没有可导出的语句".to_owned());
     }
     if statements.len() > 1 {
-        return Err("全量导出只接受单条 SELECT".to_owned());
+        return Err("完整导出只接受单条 SELECT 语句".to_owned());
     }
     let statement = statements[0].clone();
     let keyword = statement.chars().take_while(|ch| ch.is_ascii_alphabetic()).collect::<String>().to_ascii_uppercase();
     if keyword != "SELECT" {
-        return Err("只有 SELECT 可以重新执行并全量导出".to_owned());
+        return Err("只有 SELECT 可以重新执行并完整导出".to_owned());
     }
     Ok(statement)
 }

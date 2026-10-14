@@ -118,7 +118,7 @@ pub(crate) async fn page_for_session(session: Option<&CatalogSession>, database:
         return PageDto {
             objects: Vec::new(),
             total: 0,
-            error: Some("连接未打开，无法继续读取对象".to_owned()),
+            error: Some("这条连接还没有打开，无法继续读取对象".to_owned()),
         };
     };
     let body = read::read_object_page(session, database, schema, offset, limit).await;
