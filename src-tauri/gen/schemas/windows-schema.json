@@ -285,6 +285,36 @@
           "markdownDescription": "允许从已打开的会话分页读取表数据。"
         },
         {
+          "description": "允许请求取消正在执行的 SQL。",
+          "type": "string",
+          "const": "allow-query-cancel",
+          "markdownDescription": "允许请求取消正在执行的 SQL。"
+        },
+        {
+          "description": "允许读取本机查询历史。",
+          "type": "string",
+          "const": "allow-query-history",
+          "markdownDescription": "允许读取本机查询历史。"
+        },
+        {
+          "description": "允许清空本机查询历史。",
+          "type": "string",
+          "const": "allow-query-history-clear",
+          "markdownDescription": "允许清空本机查询历史。"
+        },
+        {
+          "description": "允许读取一次 SQL 执行的状态和已完成结果。",
+          "type": "string",
+          "const": "allow-query-poll",
+          "markdownDescription": "允许读取一次 SQL 执行的状态和已完成结果。"
+        },
+        {
+          "description": "允许在已打开的会话上执行 SQL。",
+          "type": "string",
+          "const": "allow-query-start",
+          "markdownDescription": "允许在已打开的会话上执行 SQL。"
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

@@ -34,7 +34,8 @@ fn local_data_dir() -> String {
 }
 
 fn wire<R: tauri::Runtime>(builder: tauri::Builder<R>, state: connections::commands::ConnectionsState) -> tauri::Builder<R> {
-    builder.manage(state).invoke_handler(tauri::generate_handler![
+    let query_state = query::QueryState::from_config_path(state.service.config_path());
+    builder.manage(state).manage(query_state).invoke_handler(tauri::generate_handler![
         app_info,
         connections::commands::connections_list,
         connections::commands::connections_save,
@@ -53,6 +54,11 @@ fn wire<R: tauri::Runtime>(builder: tauri::Builder<R>, state: connections::comma
         grid::commands::grid_commit,
         grid::commands::grid_export,
         grid::commands::grid_export_cancel,
+        query::commands::query_start,
+        query::commands::query_poll,
+        query::commands::query_cancel,
+        query::commands::query_history,
+        query::commands::query_history_clear,
     ])
 }
 

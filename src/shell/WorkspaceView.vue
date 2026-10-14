@@ -6,7 +6,7 @@ import { resolveTableTarget } from "../grid/target";
 import QueryTab from "../query/QueryTab.vue";
 import StructurePane from "../structure/StructurePane.vue";
 import Icon from "./Icon.vue";
-import type { ShellTab } from "./session";
+import type { QueryTarget, ShellTab } from "./session";
 import { loadSettings } from "./settings";
 import WelcomeView from "./WelcomeView.vue";
 
@@ -20,6 +20,7 @@ const emit = defineEmits<{
   palette: [];
   structure: [];
   draft: [id: string, draft: string];
+  target: [id: string, target: QueryTarget];
 }>();
 
 const active = computed(() => props.tabs.find((tab) => tab.id === props.activeId) ?? null);
@@ -31,6 +32,11 @@ function tableTarget(tabId: string) {
 
 function onDraft(tabId: string, draft: string) {
   emit("draft", tabId, draft);
+}
+
+function onTarget(target: QueryTarget) {
+  if (!active.value) return;
+  emit("target", active.value.id, target);
 }
 </script>
 
@@ -63,7 +69,14 @@ function onDraft(tabId: string, draft: string) {
       :key="active.id"
       :tab-id="active.id"
       :draft="active.draft"
+      :connection-id="active.connectionId"
+      :connection-name="active.connectionName"
+      :database="active.database"
+      :engine="active.engine"
+      :connection-status="active.connectionStatus"
+      :notice="active.targetNotice"
       @update:draft="onDraft"
+      @target="onTarget"
     />
     <DataGrid
       v-else-if="active && active.kind === 'table'"

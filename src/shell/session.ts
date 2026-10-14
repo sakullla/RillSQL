@@ -1,10 +1,11 @@
 import { computed, ref, type Ref } from "vue";
 import type { AppPage } from "../router";
 import { parseHash, toHash } from "../router";
+import type { ConnectionStatus } from "./status-text";
 
 export type TabKind = "query" | "table" | "structure";
 
-export const NEW_QUERY_DRAFT = "-- 查询模块占位。执行、取消、补全和结果尚未接入。\n";
+export const NEW_QUERY_DRAFT = "";
 
 export interface PlaceholderTarget {
   id: string;
@@ -17,6 +18,25 @@ export const STRUCTURE_PLACEHOLDER: PlaceholderTarget = {
   label: "结构占位",
 };
 
+export interface QueryTarget {
+  connectionId: string;
+  connectionName: string;
+  database: string;
+  engine: string;
+  status: ConnectionStatus;
+}
+
+export interface QueryDraftInput {
+  sql: string;
+  connectionId: string | null;
+  connectionName: string | null;
+  database: string | null;
+  engine: string | null;
+  status: ConnectionStatus | null;
+  needsTarget: boolean;
+  notice: string | null;
+}
+
 export interface ShellTab {
   id: string;
   kind: TabKind;
@@ -24,6 +44,12 @@ export interface ShellTab {
   targetText: string | null;
   path: string | null;
   draft: string;
+  connectionId: string | null;
+  connectionName: string | null;
+  database: string | null;
+  engine: string | null;
+  connectionStatus: ConnectionStatus | null;
+  targetNotice: string | null;
 }
 
 export interface ShellSession {
@@ -38,9 +64,12 @@ export interface ShellSession {
   activeTab: Ref<ShellTab | null>;
   showPage: (page: AppPage) => void;
   openQuery: () => void;
+  openQueryDraft: (input: QueryDraftInput) => string;
   openTable: (target: PlaceholderTarget) => void;
   openStructure: (target: PlaceholderTarget) => void;
   setDraft: (id: string, draft: string) => void;
+  setQueryTarget: (id: string, target: QueryTarget | null) => void;
+  setCloseGuard: (guard: ((id: string) => boolean) | null) => void;
   activateTab: (id: string) => void;
   closeTab: (id: string) => void;
   toggleSidebar: () => void;
@@ -48,6 +77,42 @@ export interface ShellSession {
   closePalette: () => void;
   openHelp: () => void;
   closeHelp: () => void;
+}
+
+function blankTab(kind: TabKind, id: string, title: string, path: string | null, draft: string): ShellTab {
+  return {
+    id,
+    kind,
+    title,
+    targetText: null,
+    path,
+    draft,
+    connectionId: null,
+    connectionName: null,
+    database: null,
+    engine: null,
+    connectionStatus: null,
+    targetNotice: null,
+  };
+}
+
+function applyTarget(tab: ShellTab, target: QueryTarget | null) {
+  if (!target) {
+    tab.connectionId = null;
+    tab.connectionName = null;
+    tab.database = null;
+    tab.engine = null;
+    tab.connectionStatus = null;
+    tab.targetText = null;
+    return;
+  }
+  tab.connectionId = target.connectionId;
+  tab.connectionName = target.connectionName;
+  tab.database = target.database;
+  tab.engine = target.engine;
+  tab.connectionStatus = target.status;
+  tab.targetText = `${target.connectionName} / ${target.database || "main"}`;
+  tab.targetNotice = null;
 }
 
 export function createSession(initialHash = ""): ShellSession {
@@ -60,6 +125,7 @@ export function createSession(initialHash = ""): ShellSession {
   const paletteMode = ref<"all" | "tables">("all");
   const helpOpen = ref(false);
   let sequence = 1;
+  let closeGuard: ((id: string) => boolean) | null = null;
 
   const activeTab = computed(() => tabs.value.find((tab) => tab.id === activeId.value) ?? null);
 
@@ -72,18 +138,31 @@ export function createSession(initialHash = ""): ShellSession {
 
   function openQuery() {
     const count = tabs.value.filter((tab) => tab.kind === "query").length + 1;
-    const tab: ShellTab = {
-      id: `query-${sequence}`,
-      kind: "query",
-      title: `查询 ${count}`,
-      targetText: null,
-      path: null,
-      draft: NEW_QUERY_DRAFT,
-    };
+    const tab = blankTab("query", `query-${sequence}`, `查询 ${count}`, null, NEW_QUERY_DRAFT);
     sequence += 1;
     tabs.value = [...tabs.value, tab];
     activeId.value = tab.id;
     showPage("workspace");
+  }
+
+  function openQueryDraft(input: QueryDraftInput): string {
+    const count = tabs.value.filter((tab) => tab.kind === "query").length + 1;
+    const tab = blankTab("query", `query-${sequence}`, `查询 ${count}`, null, input.sql);
+    sequence += 1;
+    tab.targetNotice = input.notice;
+    if (!input.needsTarget && input.connectionId && input.connectionName && input.database != null && input.engine && input.status) {
+      applyTarget(tab, {
+        connectionId: input.connectionId,
+        connectionName: input.connectionName,
+        database: input.database,
+        engine: input.engine,
+        status: input.status,
+      });
+    }
+    tabs.value = [...tabs.value, tab];
+    activeId.value = tab.id;
+    showPage("workspace");
+    return tab.id;
   }
 
   function openPlaceholder(kind: "table" | "structure", target: PlaceholderTarget) {
@@ -94,14 +173,7 @@ export function createSession(initialHash = ""): ShellSession {
       showPage("workspace");
       return;
     }
-    const tab: ShellTab = {
-      id,
-      kind,
-      title: target.label,
-      targetText: null,
-      path: target.path ?? null,
-      draft: "",
-    };
+    const tab = blankTab(kind, id, target.label, target.path ?? null, "");
     tabs.value = [...tabs.value, tab];
     activeId.value = tab.id;
     showPage("workspace");
@@ -121,6 +193,16 @@ export function createSession(initialHash = ""): ShellSession {
     tab.draft = draft;
   }
 
+  function setQueryTarget(id: string, target: QueryTarget | null) {
+    const tab = tabs.value.find((item) => item.id === id);
+    if (!tab || tab.kind !== "query") return;
+    applyTarget(tab, target);
+  }
+
+  function setCloseGuard(guard: ((id: string) => boolean) | null) {
+    closeGuard = guard;
+  }
+
   function activateTab(id: string) {
     if (!tabs.value.some((tab) => tab.id === id)) return;
     activeId.value = id;
@@ -128,6 +210,7 @@ export function createSession(initialHash = ""): ShellSession {
   }
 
   function closeTab(id: string) {
+    if (closeGuard && closeGuard(id) === false) return;
     const index = tabs.value.findIndex((tab) => tab.id === id);
     if (index < 0) return;
     const next = tabs.value.filter((tab) => tab.id !== id);
@@ -177,9 +260,12 @@ export function createSession(initialHash = ""): ShellSession {
     activeTab,
     showPage,
     openQuery,
+    openQueryDraft,
     openTable,
     openStructure,
     setDraft,
+    setQueryTarget,
+    setCloseGuard,
     activateTab,
     closeTab,
     toggleSidebar,

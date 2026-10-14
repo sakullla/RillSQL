@@ -1,9 +1,12 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { listPaletteTables, startCatalog } from "../catalog";
+import { catalogConnections } from "../catalog/store";
 import ConnectionsPage from "../connections/ConnectionsPage.vue";
 import { listPaletteConnections } from "../connections";
 import HistoryPage from "../history/HistoryPage.vue";
+import type { OpenPlan } from "../history/plan";
+import { attachCloser, guardClose } from "../query/runtime";
 import { parseHash } from "../router";
 import ActivityRail from "./ActivityRail.vue";
 import CommandPalette from "./CommandPalette.vue";
@@ -12,6 +15,7 @@ import { syncProductIdentity } from "./identity";
 import SettingsView from "./SettingsView.vue";
 import { loadSettings, saveSettings, type ShellSettings } from "./settings";
 import { createSession, STRUCTURE_PLACEHOLDER } from "./session";
+import type { ConnectionStatus } from "./status-text";
 import ShortcutHelp from "./ShortcutHelp.vue";
 import Sidebar from "./Sidebar.vue";
 import StatusBar from "./StatusBar.vue";
@@ -21,6 +25,40 @@ import WorkspaceView from "./WorkspaceView.vue";
 import type { AppPage } from "../router";
 
 const session = createSession(typeof location === "undefined" ? "" : location.hash);
+attachCloser((id) => session.closeTab(id));
+session.setCloseGuard((id) => guardClose(id));
+
+function asStatus(status: string): ConnectionStatus {
+  if (status === "connected" || status === "connecting" || status === "disconnected" || status === "error" || status === "lost") return status;
+  return "disconnected";
+}
+
+function onHistoryOpen(plan: OpenPlan) {
+  const known = plan.connectionId ? catalogConnections().find((item) => item.id === plan.connectionId) ?? null : null;
+  if (plan.needsTarget || !known || !plan.connectionId || plan.database == null) {
+    session.openQueryDraft({
+      sql: plan.sql,
+      connectionId: null,
+      connectionName: null,
+      database: null,
+      engine: null,
+      status: null,
+      needsTarget: true,
+      notice: "原连接已删除，请重新选择执行目标。暂不选择。",
+    });
+    return;
+  }
+  session.openQueryDraft({
+    sql: plan.sql,
+    connectionId: plan.connectionId,
+    connectionName: known.name,
+    database: plan.database,
+    engine: known.engine,
+    status: asStatus(known.status),
+    needsTarget: false,
+    notice: null,
+  });
+}
 const settings = reactive<ShellSettings>(loadSettings());
 const dataDir = ref<string | null>(null);
 const sqlitePrompt = ref(0);
@@ -171,6 +209,8 @@ onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKey);
   window.removeEventListener("hashchange", onHashChange);
   media?.removeEventListener("change", onSchemeChange);
+  attachCloser(() => undefined);
+  session.setCloseGuard(null);
 });
 </script>
 
@@ -198,9 +238,10 @@ onBeforeUnmount(() => {
           @palette="session.openPalette('all')"
           @structure="session.openStructure(STRUCTURE_PLACEHOLDER)"
           @draft="session.setDraft"
+          @target="session.setQueryTarget"
         />
         <ConnectionsPage v-else-if="session.page.value === 'connections'" :sqlite-prompt="sqlitePrompt" />
-        <HistoryPage v-else-if="session.page.value === 'history'" />
+        <HistoryPage v-else-if="session.page.value === 'history'" @open="onHistoryOpen" />
         <SettingsView v-else :settings="settings" :data-dir="dataDir" @change="onSettings" @help="session.openHelp()" />
       </main>
     </div>

@@ -26,11 +26,20 @@ describe("shell layout", () => {
     expect(title.text()).toContain("澄库");
     expect(title.find(".cmd-trigger").attributes("aria-label")).toBe("打开命令面板");
 
+    const bare = { id: "q", kind: "query" as const, title: "查询 1", targetText: null, path: null, draft: "", connectionId: null, connectionName: null, database: null, engine: null, connectionStatus: null, targetNotice: null };
     const status = mount(StatusBar, {
-      props: { tab: { id: "q", kind: "query", title: "查询 1", targetText: null, path: null, draft: "" }, onWorkspace: true },
+      props: { tab: bare, onWorkspace: true },
     });
     expect(status.text()).toContain("未绑定连接 · 请选择执行目标");
     expect(status.text()).toContain("仅存本机");
+    const lost = mount(StatusBar, {
+      props: {
+        tab: { ...bare, targetText: "Atlas / atlas_dev", connectionId: "atlas", connectionName: "Atlas", database: "atlas_dev", engine: "postgres", connectionStatus: "lost" as const },
+        onWorkspace: true,
+      },
+    });
+    expect(lost.text()).toContain("Atlas / atlas_dev");
+    expect(lost.text()).toContain("连接已断开");
 
     const idle = mount(StatusBar, { props: { tab: null, onWorkspace: false } });
     expect(idle.text()).toContain(PRODUCT_TITLE);

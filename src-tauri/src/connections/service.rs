@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -111,6 +112,46 @@ struct Session {
     kind: SessionKind,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     foreign_keys: Option<bool>,
+    cancel: CancelTransport,
+}
+
+/// 取消正在执行的语句。查询本身仍走已打开的会话，不从这里再拨一条执行连接。
+#[derive(Clone)]
+pub enum CancelTransport {
+    Sqlite(Arc<AtomicBool>),
+    Mysql {
+        connection_id: Arc<AtomicU64>,
+        opts: mysql_async::Opts,
+        via_ssh: bool,
+    },
+    Postgres {
+        token: tokio_postgres::CancelToken,
+        tls: Option<tokio_postgres_rustls::MakeRustlsConnect>,
+        via_ssh: bool,
+    },
+    None,
+}
+
+impl CancelTransport {
+    pub fn via_ssh(&self) -> bool {
+        match self {
+            Self::Mysql { via_ssh, .. } | Self::Postgres { via_ssh, .. } => *via_ssh,
+            _ => false,
+        }
+    }
+
+    pub fn sqlite_flag(&self) -> Option<Arc<AtomicBool>> {
+        match self {
+            Self::Sqlite(flag) => Some(Arc::clone(flag)),
+            _ => None,
+        }
+    }
+
+    pub fn set_mysql_connection_id(&self, id: u64) {
+        if let Self::Mysql { connection_id, .. } = self {
+            connection_id.store(id, Ordering::SeqCst);
+        }
+    }
 }
 
 /// 已打开会话的查询句柄。调用方只能拿去查元数据，不能据此再拨一条数据库连接。
@@ -372,6 +413,7 @@ impl Service {
             postgres: None,
             schema_note: None,
             foreign_keys: None,
+            cancel: CancelTransport::None,
         };
         let report = stages::execute_stages(&stages, &mut attempt).await;
         if report.status == TestStatus::Wait {
@@ -406,6 +448,7 @@ impl Service {
                     kind,
                     shutdown: attempt.shutdown.take(),
                     foreign_keys,
+                    cancel: attempt.cancel.clone(),
                 },
             );
         }
@@ -433,6 +476,10 @@ impl Service {
         let mut ids: Vec<String> = self.sessions.lock().expect("sessions").keys().cloned().collect();
         ids.sort();
         ids
+    }
+
+    pub fn cancel_transport(&self, id: &str) -> Option<CancelTransport> {
+        self.sessions.lock().expect("sessions").get(id).map(|session| session.cancel.clone())
     }
 
     pub fn catalog_session(&self, id: &str) -> Option<CatalogSession> {
@@ -547,6 +594,7 @@ struct Attempt {
     postgres: Option<tokio_postgres::Client>,
     schema_note: Option<String>,
     foreign_keys: Option<bool>,
+    cancel: CancelTransport,
 }
 
 impl Attempt {
@@ -678,10 +726,22 @@ impl Attempt {
         let password = password.expose().to_owned();
         let opened = match self.config.engine {
             Engine::Mysql | Engine::Mariadb => drivers::open_mysql(&self.config, &route, &password).await.map(|opened| {
+                let via_ssh = self.config.ssh.is_some();
+                self.cancel = CancelTransport::Mysql {
+                    connection_id: Arc::new(AtomicU64::new(opened.connection_id)),
+                    opts: opened.kill_opts,
+                    via_ssh,
+                };
                 self.mysql_pool = Some(opened.pool);
                 opened.version
             }),
             Engine::Postgres => drivers::open_postgres(&self.config, &route, &password).await.map(|opened| {
+                let via_ssh = self.config.ssh.is_some();
+                self.cancel = CancelTransport::Postgres {
+                    token: opened.cancel,
+                    tls: opened.tls,
+                    via_ssh,
+                };
                 self.postgres = Some(opened.client);
                 opened.version
             }),
@@ -794,6 +854,7 @@ impl Attempt {
         self.schema_note = Some(format!("SQLite {} · 读取到 {} 个表或视图", opened.version, opened.schema_objects));
         self.foreign_keys = Some(opened.foreign_keys);
         self.sqlite_pool = Some(opened.pool);
+        self.cancel = CancelTransport::Sqlite(Arc::new(AtomicBool::new(false)));
         Ok(path)
     }
 
@@ -936,6 +997,7 @@ pub(crate) async fn report_canned_remote(config: SavedConnection, canned: Canned
         postgres: None,
         schema_note: None,
         foreign_keys: None,
+        cancel: CancelTransport::None,
     };
     stages::execute_stages(&stages::planned_stages(&config), &mut attempt).await
 }

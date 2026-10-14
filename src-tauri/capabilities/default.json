@@ -23,6 +23,11 @@
     "allow-grid-count",
     "allow-grid-commit",
     "allow-grid-export",
-    "allow-grid-export-cancel"
+    "allow-grid-export-cancel",
+    "allow-query-start",
+    "allow-query-poll",
+    "allow-query-cancel",
+    "allow-query-history",
+    "allow-query-history-clear"
   ]
 }

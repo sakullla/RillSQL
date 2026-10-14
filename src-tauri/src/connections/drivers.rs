@@ -59,6 +59,9 @@ pub async fn open_sqlite(path: &Path) -> Result<SqliteOpen, StageError> {
 pub struct MysqlOpen {
     pub pool: Pool,
     pub version: String,
+    /// 只在取消时另开一条连接。执行仍使用上面的池。
+    pub kill_opts: mysql_async::Opts,
+    pub connection_id: u64,
 }
 
 pub async fn open_mysql(config: &SavedConnection, route: &Route, password: &str) -> Result<MysqlOpen, StageError> {
@@ -87,16 +90,23 @@ pub async fn open_mysql(config: &SavedConnection, route: &Route, password: &str)
     if plan.ssl_opts_present {
         builder = builder.ssl_opts(Some(mysql_ssl(&plan, config.tls.as_ref())?));
     }
-    let pool = Pool::new(builder);
+    let opts = mysql_async::Opts::from(builder);
+    let pool = Pool::new(opts.clone());
     let mut conn = pool.get_conn().await.map_err(|err| db_stage(route.tls_mode, err.to_string()))?;
     let version: Option<(String,)> = conn
         .query_first("SELECT VERSION()")
+        .await
+        .map_err(|err| db_stage(route.tls_mode, err.to_string()))?;
+    let connection_id: Option<u64> = conn
+        .query_first("SELECT CONNECTION_ID()")
         .await
         .map_err(|err| db_stage(route.tls_mode, err.to_string()))?;
     let version = version.map(|row| row.0).unwrap_or_else(|| "未知版本".to_owned());
     Ok(MysqlOpen {
         pool,
         version: version_note(config.engine, &version),
+        kill_opts: opts,
+        connection_id: connection_id.unwrap_or(0),
     })
 }
 
@@ -157,6 +167,8 @@ fn os_trust_anchors() -> Result<Vec<Vec<u8>>, StageError> {
 pub struct PostgresOpen {
     pub client: tokio_postgres::Client,
     pub version: String,
+    pub cancel: tokio_postgres::CancelToken,
+    pub tls: Option<MakeRustlsConnect>,
 }
 
 pub async fn open_postgres(config: &SavedConnection, route: &Route, password: &str) -> Result<PostgresOpen, StageError> {
@@ -182,8 +194,8 @@ pub async fn open_postgres(config: &SavedConnection, route: &Route, password: &s
     }
     pg.port(plan.port);
     pg.connect_timeout(Duration::from_secs(15));
-    let client = if plan.use_tls {
-        let tls = postgres_tls(config, &plan)?;
+    let tls_for_cancel = if plan.use_tls { Some(postgres_tls(config, &plan)?) } else { None };
+    let client = if let Some(tls) = tls_for_cancel.clone() {
         let (client, connection) = pg.connect(tls).await.map_err(|err| db_stage(route.tls_mode, err.to_string()))?;
         tokio::spawn(async move {
             let _ = connection.await;
@@ -196,6 +208,7 @@ pub async fn open_postgres(config: &SavedConnection, route: &Route, password: &s
         });
         client
     };
+    let cancel = client.cancel_token();
     let messages = client
         .simple_query("SELECT version()")
         .await
@@ -207,7 +220,12 @@ pub async fn open_postgres(config: &SavedConnection, route: &Route, password: &s
             _ => None,
         })
         .unwrap_or_else(|| "未知版本".to_owned());
-    Ok(PostgresOpen { client, version })
+    Ok(PostgresOpen {
+        client,
+        version,
+        cancel,
+        tls: tls_for_cancel,
+    })
 }
 
 fn postgres_tls(config: &SavedConnection, plan: &PostgresTlsPlan) -> Result<MakeRustlsConnect, StageError> {

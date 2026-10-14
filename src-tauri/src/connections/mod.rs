@@ -2,7 +2,7 @@
 
 pub mod commands;
 mod drivers;
-mod forward;
+pub(crate) mod forward;
 mod hostkey;
 pub(crate) mod model;
 mod route;
@@ -12,7 +12,7 @@ mod stages;
 mod store;
 mod verify;
 
-pub use service::{CatalogSession, Service};
+pub use service::{CancelTransport, CatalogSession, Service};
 
 pub fn module_id() -> &'static str {
     let _linked = (

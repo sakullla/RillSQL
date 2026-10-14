@@ -87,3 +87,28 @@ commands.allow = ["grid_export"]
 identifier = "allow-grid-export-cancel"
 description = "允许取消尚未完成的 CSV 导出并删除未完成文件。"
 commands.allow = ["grid_export_cancel"]
+
+[[permission]]
+identifier = "allow-query-start"
+description = "允许在已打开的会话上执行 SQL。"
+commands.allow = ["query_start"]
+
+[[permission]]
+identifier = "allow-query-poll"
+description = "允许读取一次 SQL 执行的状态和已完成结果。"
+commands.allow = ["query_poll"]
+
+[[permission]]
+identifier = "allow-query-cancel"
+description = "允许请求取消正在执行的 SQL。"
+commands.allow = ["query_cancel"]
+
+[[permission]]
+identifier = "allow-query-history"
+description = "允许读取本机查询历史。"
+commands.allow = ["query_history"]
+
+[[permission]]
+identifier = "allow-query-history-clear"
+description = "允许清空本机查询历史。"
+commands.allow = ["query_history_clear"]
