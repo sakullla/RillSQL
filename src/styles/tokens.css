@@ -1,123 +1,230 @@
-/* 色彩令牌与原型 styles/app.css 一致。浅色、深色由 data-theme 切换。 */
+/* 设计令牌：面向"偶尔碰数据库的开发者"的新视觉语言。
+   原则：简洁、一致、耐看；留白与可读性优先。
+   明暗双主题由 data-theme 同名变量覆盖（机制见 src/shell/theme.ts，DOM 契约不变）。
+   密度由 :root[data-density="comfortable"] 覆盖；默认密度较旧版宽松。
+   颜色不作状态唯一信息来源：组件层另配图标/文字，令牌层保证前景/soft 背景组合对比充足。 */
+
+/* ---------- 与主题无关的令牌：字体、间距、字号、圆角、动效、布局 ---------- */
 :root {
+  /* 字体 */
   --font: "Segoe UI Variable Text", "Segoe UI", -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
   --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", "SF Mono", Consolas, "Microsoft YaHei", monospace;
+
+  /* 字号刻度 */
+  --fs-xs: 11.5px;
+  --fs-sm: 12.5px;
+  --fs-md: 13.5px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+  --fs-xxl: 24px;
+  /* 行高 */
+  --lh-tight: 1.3;
+  --lh: 1.55;
+
+  /* 间距刻度（4px 基线） */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-7: 32px;
+  --sp-8: 48px;
+
+  /* 圆角 */
   --r-sm: 4px;
   --r: 6px;
   --r-md: 8px;
   --r-lg: 12px;
-  --row-h: 28px;
-  --tree-h: 28px;
-  --editor-font: 13px;
+  --r-xl: 16px;
+  --r-full: 999px;
+
+  /* 动效时长与缓动；prefers-reduced-motion 时在文件末尾归零 */
+  --dur-fast: 120ms;
+  --dur: 180ms;
+  --dur-slow: 280ms;
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* 布局尺寸（现状外壳使用的尺寸类令牌） */
   --titlebar-h: 40px;
-  --status-h: 26px;
+  --status-h: 28px;
   --rail-w: 60px;
+  --editor-font: 13px;
+
+  /* 密度相关：默认密度较旧版（行高 28px）宽松 */
+  --row-h: 32px;
+  --tree-h: 30px;
+  --control-h: 34px;
+  --control-h-sm: 28px;
 }
 
 :root[data-density="comfortable"] {
-  --row-h: 34px;
-  --tree-h: 32px;
+  --row-h: 38px;
+  --tree-h: 36px;
+  --control-h: 38px;
+  --control-h-sm: 32px;
 }
 
+/* ---------- 浅色主题（默认） ---------- */
 :root,
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg: #f3f5f4;
-  --chrome: #eef1f0;
+
+  /* 背景层级 */
+  --bg: #f6f7f9;
+  --chrome: #eef0f3;
   --panel: #ffffff;
-  --panel-2: #f8faf9;
-  --sunken: #f0f3f2;
-  --hover: #e9eeec;
-  --active: #e0e7e4;
-  --text: #1b2623;
-  --text-2: #52615c;
-  --text-3: #7f8c87;
-  --line: #e1e6e4;
-  --line-2: #cfd7d4;
-  --accent: #0f7f68;
-  --accent-hover: #0b6c58;
-  --accent-soft: #e0f1eb;
-  --accent-text: #0b6956;
+  --panel-2: #fafbfc;
+  --sunken: #f0f2f5;
+  --hover: #eceef2;
+  --active: #e1e4ea;
+
+  /* 文本三级 */
+  --text: #1f2430;
+  --text-2: #555d6b;
+  --text-3: #8a919e;
+
+  /* 分隔线 */
+  --line: #e5e7ec;
+  --line-2: #d3d7de;
+
+  /* 强调（靛蓝） */
+  --accent: #3d5bd9;
+  --accent-hover: #2f4ac0;
+  --accent-soft: #e8edfb;
+  --accent-text: #2f4ac0;
   --on-accent: #ffffff;
-  --ok: #157a4b;
-  --ok-soft: #e3f3e8;
-  --warn: #8f5507;
-  --warn-soft: #fdf1da;
-  --warn-line: #efd6a3;
-  --err: #bb3529;
-  --err-soft: #fcebe8;
-  --err-line: #f1c5bf;
-  --info: #2563a8;
-  --info-soft: #e7effa;
-  --sel: rgba(15, 127, 104, 0.08);
-  --sel-strong: rgba(15, 127, 104, 0.16);
-  --shadow-sm: 0 1px 2px rgba(18, 32, 28, 0.06);
-  --shadow: 0 10px 28px rgba(18, 32, 28, 0.12), 0 1px 3px rgba(18, 32, 28, 0.06);
-  --shadow-lg: 0 28px 70px rgba(18, 32, 28, 0.24), 0 2px 6px rgba(18, 32, 28, 0.08);
-  --tk-kw: #7c45c9;
-  --tk-str: #a2530c;
-  --tk-num: #0b65c2;
-  --tk-com: #869490;
-  --tk-fn: #0f7f68;
-  --tk-id: #1b2623;
-  --env-dev: #0f7f68;
-  --env-test: #2563a8;
-  --env-prod: #c4321f;
-  --env-local: #7354e0;
-  --env-none: #7f8c87;
+
+  /* 状态：ok / warn / err / info，各带 soft 背景与（需要时的）描边 */
+  --ok: #18794e;
+  --ok-soft: #e3f4ea;
+  --warn: #945f0d;
+  --warn-soft: #fdf3dd;
+  --warn-line: #eed9a8;
+  --err: #c2332b;
+  --err-soft: #fdecea;
+  --err-line: #f3c6c1;
+  --info: #2f6cb5;
+  --info-soft: #e8f0fa;
+
+  /* 选中 */
+  --sel: rgba(61, 91, 217, 0.08);
+  --sel-strong: rgba(61, 91, 217, 0.16);
+
+  /* 焦点环与禁用态 */
+  --ring: rgba(61, 91, 217, 0.28);
+  --disabled-fg: #9aa1ad;
+  --disabled-bg: #f0f2f5;
+
+  /* 阴影 */
+  --shadow-sm: 0 1px 2px rgba(24, 32, 48, 0.06);
+  --shadow: 0 10px 28px rgba(24, 32, 48, 0.10), 0 1px 3px rgba(24, 32, 48, 0.06);
+  --shadow-lg: 0 28px 70px rgba(24, 32, 48, 0.20), 0 2px 6px rgba(24, 32, 48, 0.08);
+
+  /* 语法高亮 */
+  --tk-kw: #7c3aed;
+  --tk-str: #b45309;
+  --tk-num: #0369a1;
+  --tk-com: #8a919e;
+  --tk-fn: #3d5bd9;
+  --tk-id: #1f2430;
+
+  /* 环境标签色 */
+  --env-dev: #18794e;
+  --env-test: #2f6cb5;
+  --env-prod: #c2332b;
+  --env-local: #6d4fd0;
+  --env-none: #8a919e;
+
+  /* 引擎色 */
   --eng-postgres: #336791;
-  --eng-mysql: #00718a;
-  --eng-mariadb: #a65632;
-  --eng-sqlite: #1f78b8;
+  --eng-mysql: #00758f;
+  --eng-mariadb: #a85f35;
+  --eng-sqlite: #0f80cc;
 }
 
+/* ---------- 深色主题 ---------- */
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #0e1312;
-  --chrome: #111716;
-  --panel: #151b1a;
-  --panel-2: #192120;
-  --sunken: #121817;
-  --hover: #1e2826;
-  --active: #26312e;
-  --text: #dfe7e4;
-  --text-2: #a3b1ac;
-  --text-3: #73827d;
-  --line: #222b29;
-  --line-2: #2f3b38;
-  --accent: #4fc7a2;
-  --accent-hover: #6cd4b3;
-  --accent-soft: #173a30;
-  --accent-text: #6cd4b3;
-  --on-accent: #052219;
-  --ok: #5fce90;
-  --ok-soft: #15301f;
-  --warn: #e8b660;
-  --warn-soft: #30261a;
-  --warn-line: #574421;
-  --err: #f2897d;
-  --err-soft: #391e1b;
-  --err-line: #5c2d28;
-  --info: #82b4ec;
-  --info-soft: #172638;
-  --sel: rgba(79, 199, 162, 0.08);
-  --sel-strong: rgba(79, 199, 162, 0.18);
+
+  /* 背景层级 */
+  --bg: #16181d;
+  --chrome: #121419;
+  --panel: #1c1f26;
+  --panel-2: #21242c;
+  --sunken: #191c22;
+  --hover: #262a33;
+  --active: #2e333d;
+
+  /* 文本三级 */
+  --text: #e3e6ec;
+  --text-2: #a6adba;
+  --text-3: #767e8c;
+
+  /* 分隔线 */
+  --line: #292d36;
+  --line-2: #363b46;
+
+  /* 强调（亮靛蓝） */
+  --accent: #7c97f0;
+  --accent-hover: #93abf4;
+  --accent-soft: #232c47;
+  --accent-text: #93abf4;
+  --on-accent: #12141c;
+
+  /* 状态 */
+  --ok: #66c896;
+  --ok-soft: #18291f;
+  --warn: #e5b568;
+  --warn-soft: #2c2416;
+  --warn-line: #4d3f22;
+  --err: #f08a80;
+  --err-soft: #331d1b;
+  --err-line: #542e2a;
+  --info: #8ab6ee;
+  --info-soft: #1b2634;
+
+  /* 选中 */
+  --sel: rgba(124, 151, 240, 0.10);
+  --sel-strong: rgba(124, 151, 240, 0.20);
+
+  /* 焦点环与禁用态 */
+  --ring: rgba(124, 151, 240, 0.38);
+  --disabled-fg: #5c6470;
+  --disabled-bg: #21242c;
+
+  /* 阴影 */
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
-  --shadow: 0 12px 30px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.3);
-  --shadow-lg: 0 30px 80px rgba(0, 0, 0, 0.6), 0 2px 6px rgba(0, 0, 0, 0.35);
-  --tk-kw: #c5a3ff;
+  --shadow: 0 12px 30px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.30);
+  --shadow-lg: 0 30px 80px rgba(0, 0, 0, 0.60), 0 2px 6px rgba(0, 0, 0, 0.35);
+
+  /* 语法高亮 */
+  --tk-kw: #c4a5ff;
   --tk-str: #e8b37d;
-  --tk-num: #7ab7fb;
-  --tk-com: #6b7a75;
-  --tk-fn: #6cd4b3;
-  --tk-id: #dfe7e4;
-  --env-dev: #4fc7a2;
-  --env-test: #82b4ec;
-  --env-prod: #f2897d;
+  --tk-num: #8ec6fb;
+  --tk-com: #6b7482;
+  --tk-fn: #93abf4;
+  --tk-id: #e3e6ec;
+
+  /* 环境标签色 */
+  --env-dev: #66c896;
+  --env-test: #8ab6ee;
+  --env-prod: #f08a80;
   --env-local: #b3a1ff;
-  --env-none: #73827d;
+  --env-none: #767e8c;
+
+  /* 引擎色 */
   --eng-postgres: #8bb3dc;
   --eng-mysql: #5fbfd3;
   --eng-mariadb: #e2a07f;
   --eng-sqlite: #77b9ea;
+}
+
+/* 动效降级：用户要求减少动效时，所有时长令牌归零 */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 0ms;
+    --dur: 0ms;
+    --dur-slow: 0ms;
+  }
 }
