@@ -10,6 +10,14 @@ export function isConnected(status: ConnStatus): boolean {
   return status === "connected";
 }
 
+/** PostgreSQL 把其他库标成这条说明时，并不是对象列表读失败。 */
+export function postgresSessionGap(error: string | null | undefined): { current: string; database: string } | null {
+  if (typeof error !== "string") return null;
+  const match = error.match(/当前会话连在\s*(.+?)\s*[,，]\s*没有另开连接读取\s*(\S+)/);
+  if (!match?.[1] || !match[2]) return null;
+  return { current: match[1], database: match[2] };
+}
+
 /** 空的 schema 名不占路径一段。MySQL / MariaDB / SQLite 没有独立 schema 层。 */
 export function objectPath(connection: string, database: string, schema: string): string {
   return [connection, database, schema].filter((part) => part.length > 0).join(" / ");
@@ -95,9 +103,11 @@ export function refreshConnection(previous: CatalogConnection, incoming: Catalog
 export interface SearchHit {
   id: string;
   name: string;
+  kind: CatalogObject["kind"];
   path: string;
   env: CatalogConnection["env"];
   envLabel: string;
+  envTone: CatalogConnection["envTone"];
   stale: boolean;
   connectionId: string;
   database: string;
@@ -123,9 +133,11 @@ export function searchObjects(connections: CatalogConnection[], query: string): 
           hits.push({
             id: `${connection.id}:${database.name}:${schema.name}:${object.name}`,
             name: object.name,
+            kind: object.kind,
             path: objectPath(connection.name, database.name, schema.name),
             env: connection.env,
             envLabel: connection.envLabel,
+            envTone: connection.envTone,
             stale: object.stale,
             connectionId: connection.id,
             database: database.name,

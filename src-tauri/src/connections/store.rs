@@ -1,10 +1,12 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 use crate::connections::model::{
-    CaMode, Engine, EnvLabel, SavedConnection, SshAuthKind, SshSettings, TlsMode, TlsSettings,
+    CaMode, Engine, EnvTag, SavedConnection, SshAuthKind, SshSettings, TlsMode, TlsSettings,
 };
 
 #[derive(Clone)]
@@ -65,6 +67,60 @@ impl Store {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS env_tags (
+                id TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                tone TEXT NOT NULL,
+                position INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        self.seed_env_tags().await?;
+        Ok(())
+    }
+
+    /// 只在第一次打开配置库时放入原来的四个标签。用户删光之后不再补回去。
+    async fn seed_env_tags(&self) -> Result<(), sqlx::Error> {
+        let row = sqlx::query("SELECT value FROM app_meta WHERE key = 'env_tags_seeded'")
+            .fetch_optional(&self.pool)
+            .await?;
+        let seeded: Option<String> = row.as_ref().map(|item| item.try_get(0)).transpose()?;
+        if seeded.as_deref() == Some("1") {
+            return Ok(());
+        }
+        for (position, (id, label, tone)) in [
+            ("dev", "开发", "dev"),
+            ("test", "测试", "test"),
+            ("prod", "生产", "prod"),
+            ("local", "本地", "local"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sqlx::query("INSERT OR IGNORE INTO env_tags (id, label, tone, position) VALUES (?1, ?2, ?3, ?4)")
+                .bind(id)
+                .bind(label)
+                .bind(tone)
+                .bind(i64::try_from(position).unwrap_or(0))
+                .execute(&self.pool)
+                .await?;
+        }
+        sqlx::query(
+            "INSERT INTO app_meta (key, value) VALUES ('env_tags_seeded', '1')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -104,7 +160,7 @@ impl Store {
         .bind(&connection.id)
         .bind(&connection.name)
         .bind(connection.engine.as_str())
-        .bind(connection.env.as_str())
+        .bind(&connection.env)
         .bind(&connection.host)
         .bind(connection.port.map(i64::from))
         .bind(&connection.database)
@@ -214,15 +270,103 @@ impl Store {
         Ok(count > 0)
     }
 
+    pub async fn list_tags(&self) -> Result<Vec<EnvTag>, sqlx::Error> {
+        let rows = sqlx::query("SELECT id, label, tone, position FROM env_tags ORDER BY position, label")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(row_to_tag).collect()
+    }
+
+    pub async fn tag(&self, id: &str) -> Result<Option<EnvTag>, sqlx::Error> {
+        let row = sqlx::query("SELECT id, label, tone, position FROM env_tags WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(row_to_tag).transpose()
+    }
+
+    pub async fn label_taken(&self, label: &str, except_id: &str) -> Result<bool, sqlx::Error> {
+        let row = sqlx::query("SELECT COUNT(*) FROM env_tags WHERE label = ?1 AND id <> ?2")
+            .bind(label)
+            .bind(except_id)
+            .fetch_one(&self.pool)
+            .await?;
+        let count: i64 = row.try_get(0)?;
+        Ok(count > 0)
+    }
+
+    pub async fn next_tag_position(&self) -> Result<i64, sqlx::Error> {
+        let row = sqlx::query("SELECT COALESCE(MAX(position), -1) + 1 FROM env_tags")
+            .fetch_one(&self.pool)
+            .await?;
+        row.try_get(0)
+    }
+
+    pub async fn upsert_tag(&self, tag: &EnvTag) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO env_tags (id, label, tone, position) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET label = excluded.label, tone = excluded.tone, position = excluded.position",
+        )
+        .bind(&tag.id)
+        .bind(&tag.label)
+        .bind(&tag.tone)
+        .bind(tag.position)
+        .execute(&self.pool)
+        .await?;
+        self.checkpoint().await?;
+        Ok(())
+    }
+
+    pub async fn delete_tag(&self, id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE connections SET env = 'none' WHERE env = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM env_tags WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        self.checkpoint().await?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn testing_set_env(&self, id: &str, env: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE connections SET env = ?1 WHERE id = ?2")
+            .bind(env)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        self.checkpoint().await?;
+        Ok(())
+    }
+
     async fn checkpoint(&self) -> Result<(), sqlx::Error> {
         sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&self.pool).await?;
         Ok(())
     }
 }
 
+fn row_to_tag(row: &sqlx::sqlite::SqliteRow) -> Result<EnvTag, sqlx::Error> {
+    Ok(EnvTag {
+        id: row.try_get(0)?,
+        label: row.try_get(1)?,
+        tone: row.try_get(2)?,
+        position: row.try_get(3)?,
+    })
+}
+
 fn row_to_connection(row: &sqlx::sqlite::SqliteRow) -> Result<SavedConnection, sqlx::Error> {
     let engine = Engine::parse(row.try_get::<String, _>(2)?.as_str()).ok_or_else(|| sqlx::Error::Protocol("未知引擎".into()))?;
-    let env = EnvLabel::parse(row.try_get::<String, _>(3)?.as_str()).ok_or_else(|| sqlx::Error::Protocol("未知环境".into()))?;
+    let env = {
+        let value: String = row.try_get(3)?;
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            "none".to_owned()
+        } else {
+            trimmed.to_owned()
+        }
+    };
     let tls_mode: Option<String> = row.try_get(9)?;
     let tls = match tls_mode.as_deref().and_then(TlsMode::parse) {
         Some(mode) => Some(TlsSettings {
@@ -271,6 +415,7 @@ fn row_to_connection(row: &sqlx::sqlite::SqliteRow) -> Result<SavedConnection, s
     })
 }
 
+#[cfg(test)]
 pub fn persisted_bytes(path: &Path) -> Vec<u8> {
     let mut bytes = std::fs::read(path).unwrap_or_default();
     for suffix in ["-wal", "-shm"] {

@@ -2,6 +2,8 @@ import { EditorView } from "@codemirror/view";
 import { mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { nextTick } from "vue";
+import { resetCatalog, replaceCatalog } from "../catalog/store";
+import type { CatalogConnection } from "../catalog/types";
 import { createSession } from "./session";
 
 vi.mock("../catalog", () => ({
@@ -13,7 +15,39 @@ import AppShell from "./AppShell.vue";
 
 afterEach(() => {
   location.hash = "";
+  resetCatalog();
 });
+
+function contextMenu(target: Element, x = 40, y = 28): MouseEvent {
+  const event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: x, clientY: y });
+  target.dispatchEvent(event);
+  return event;
+}
+
+function tabMenu(): HTMLElement {
+  const menu = document.body.querySelector("[data-menu=tab]");
+  expect(menu).toBeTruthy();
+  return menu as HTMLElement;
+}
+
+function postgresCatalog(): CatalogConnection {
+  return {
+    id: "pg",
+    name: "127.0.0.1",
+    engine: "postgres",
+    env: "dev",
+    envLabel: "开发",
+    envTone: "dev",
+    status: "connected",
+    defaultDatabase: "rillsql",
+    foreignKeys: null,
+    error: null,
+    databases: [
+      { name: "rillsql", schemas: [], error: null },
+      { name: "postgres", schemas: [], error: null },
+    ],
+  };
+}
 
 function editorText(wrapper: VueWrapper): string {
   const view = EditorView.findFromDOM(wrapper.get(".cm-content").element);
@@ -108,5 +142,92 @@ describe("workspace tab identity", () => {
     expect(session.tabs.value[0]).toMatchObject({ kind: "table", title: "customers", path: "shop / public", draft: "" });
     session.openStructure({ id: "placeholder", label: "结构占位" });
     expect(session.activeTab.value).toMatchObject({ id: "structure:placeholder", kind: "structure" });
+  });
+
+  it("reuses a table tab and can open it on the drop section", () => {
+    const session = createSession("#/");
+    session.openTable({ id: "atlas:rillsql:public:customers", label: "customers", path: "rillsql / public", pane: "data" });
+    session.openTable({ id: "atlas:rillsql:public:customers", label: "customers", path: "rillsql / public", pane: "structure", section: "drop" });
+    expect(session.tabs.value).toHaveLength(1);
+    expect(session.tabs.value[0]).toMatchObject({ tablePane: "structure", structureSection: "drop" });
+    session.setTableView("table:atlas:rillsql:public:customers", "data");
+    expect(session.tabs.value[0]?.tablePane).toBe("data");
+    expect(session.tabs.value[0]?.structureSection).toBe("drop");
+  });
+
+  it("binds a query from the tab menu and closes the other tabs", async () => {
+    replaceCatalog([postgresCatalog()]);
+    const wrapper = mount(AppShell);
+    await wrapper.get(".wl-item").trigger("click");
+    await wrapper.get(".tab-new").trigger("click");
+    expect(wrapper.findAll(".tab")).toHaveLength(2);
+
+    const plus = contextMenu(wrapper.get(".tab-new").element);
+    await nextTick();
+    expect(plus.defaultPrevented).toBe(true);
+    expect(document.body.querySelector("[data-menu=tab]")).toBeNull();
+
+    const first = wrapper.findAll(".tab")[0]!;
+    expect(first.get(".tab-conn").text()).toBe("未绑定");
+    const opened = contextMenu(first.element);
+    await nextTick();
+    expect(opened.defaultPrevented).toBe(true);
+    const menu = tabMenu();
+    expect(menu.textContent).toContain("选择执行目标");
+    expect(menu.textContent).toContain("127.0.0.1 / rillsql");
+    expect(menu.textContent).toContain("127.0.0.1 / postgres");
+    expect(menu.textContent).toContain("关闭其他");
+    expect(menu.querySelector<HTMLButtonElement>("[data-action=close-right]")?.disabled).toBe(false);
+
+    menu.querySelector<HTMLButtonElement>("[data-action=bind-target]")?.click();
+    await nextTick();
+    expect(document.body.querySelector("[data-menu=tab]")).toBeNull();
+    expect(wrapper.findAll(".tab")[0]!.get(".tab-conn").text()).toBe("127.0.0.1 / rillsql");
+    expect(wrapper.get(".target-btn .tg-name").text()).toBe("127.0.0.1");
+    expect(wrapper.get(".target-btn .tg-db").text()).toContain("rillsql");
+
+    contextMenu(wrapper.findAll(".tab")[0]!.element);
+    await nextTick();
+    const rebound = tabMenu();
+    const picked = rebound.querySelector("[data-key]") as HTMLElement | null;
+    expect(picked?.querySelector(".check")).toBeTruthy();
+    rebound.querySelector<HTMLButtonElement>("[data-action=close-others]")?.click();
+    await nextTick();
+    expect(wrapper.findAll(".tab")).toHaveLength(1);
+    expect(wrapper.get(".tab-title").text()).toBe("查询 1");
+    expect(wrapper.get(".tab-conn").text()).toBe("127.0.0.1 / rillsql");
+
+    contextMenu(wrapper.get(".tab").element);
+    await nextTick();
+    expect(tabMenu().querySelector<HTMLButtonElement>("[data-action=close-others]")?.disabled).toBe(true);
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await nextTick();
+    expect(document.body.querySelector("[data-menu=tab]")).toBeNull();
+    wrapper.unmount();
+  });
+
+  it("switches a table tab between data and structure from the tab menu", async () => {
+    const wrapper = mount(AppShell);
+    await wrapper.get(".cmd-trigger").trigger("click");
+    await paletteItem(wrapper, "customers").trigger("click");
+    const opened = contextMenu(wrapper.get(".tab").element);
+    await nextTick();
+    expect(opened.defaultPrevented).toBe(true);
+    const menu = tabMenu();
+    expect(menu.textContent).toContain("数据");
+    expect(menu.textContent).toContain("结构");
+    expect(menu.textContent).not.toContain("选择执行目标");
+    menu.querySelector<HTMLButtonElement>("[data-action=show-structure]")?.click();
+    await nextTick();
+    expect(document.body.querySelector("[data-menu=tab]")).toBeNull();
+    expect(wrapper.get("[aria-label='表结构']").attributes("data-tab-id")).toBe("table:customers");
+    expect(wrapper.find("[aria-label='数据表格']").exists()).toBe(false);
+
+    contextMenu(wrapper.get(".tab").element);
+    await nextTick();
+    tabMenu().querySelector<HTMLButtonElement>("[data-action=show-data]")?.click();
+    await nextTick();
+    expect(wrapper.get("[aria-label='数据表格']").attributes("data-tab-id")).toBe("table:customers");
+    wrapper.unmount();
   });
 });

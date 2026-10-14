@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use mysql_async::prelude::Queryable;
 
+#[cfg(test)]
 use crate::connections::forward::OpenRecord;
 use crate::connections::CancelTransport;
 
@@ -57,6 +58,7 @@ pub fn on_statement_end(view: &mut CancelView, outcome: &str) {
 }
 
 /// 执行通道已经占用 `busy_id`。取消必须是另一次打开，不能复用那条记录。
+#[cfg(test)]
 pub fn fresh_cancel_channel(opens: &[OpenRecord], busy_id: u64) -> Result<&OpenRecord, String> {
     let busy = opens
         .iter()

@@ -1,21 +1,22 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
-import { tauriConnectionApi, type ConnectionApi, type TestReport } from "./api";
+import { refreshCatalog } from "../catalog/store";
+import { tauriConnectionApi, type ConnectionApi, type EnvTagInput, type TestReport } from "./api";
 import ConnIcon from "./ConnIcon.vue";
+import EnvTagField from "./EnvTagField.vue";
 import { pickSqliteFile, replacePaletteConnections } from "./index";
 import {
   ENGINES,
-  ENVS,
   blankDraft,
   draftFromSaved,
   engineMeta,
-  envLabel,
+  presentEnv,
   plannedStageLabels,
   tlsVerificationCopy,
   validate,
   type ConnectionDraft,
   type Engine,
-  type EnvLabel,
+  type EnvTag,
   type SavedConnection,
   type SecretInput,
   type TlsMode,
@@ -47,6 +48,14 @@ const promptPassword = ref("");
 const promptSave = ref(false);
 const editDialog = ref<HTMLDialogElement | null>(null);
 const otherDialog = ref<HTMLDialogElement | null>(null);
+const tags = ref<EnvTag[]>([
+  { id: "dev", label: "开发", tone: "dev", position: 0 },
+  { id: "test", label: "测试", tone: "test", position: 1 },
+  { id: "prod", label: "生产", tone: "prod", position: 2 },
+  { id: "local", label: "本地", tone: "local", position: 3 },
+]);
+const tagsLoaded = ref(false);
+const tagError = ref("");
 
 const filtered = computed(() => {
   const q = query.value.trim().toLowerCase();
@@ -101,6 +110,38 @@ function resetSecrets() {
   secrets.passphrase = "";
 }
 
+function envView(id: string) {
+  return presentEnv(id, tags.value);
+}
+
+function errorText(error: unknown, fallback: string): string {
+  if (typeof error === "string" && error.trim()) return error;
+  if (error instanceof Error && error.message.trim()) return error.message;
+  if (error && typeof error === "object" && "message" in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message;
+  }
+  return fallback;
+}
+
+function ensureDraftEnv() {
+  if (!tagsLoaded.value) return;
+  if (draft.value.env !== "none" && !tags.value.some((tag) => tag.id === draft.value.env)) {
+    draft.value.env = "none";
+  }
+}
+
+async function reloadTags() {
+  try {
+    tags.value = await api.value.listTags();
+    tagsLoaded.value = true;
+    tagError.value = "";
+    ensureDraftEnv();
+  } catch (error) {
+    tagError.value = errorText(error, "环境标签没有读出来。");
+  }
+}
+
 function openEditor(existing?: SavedConnection, engine?: Engine) {
   report.value = null;
   fieldErrors.value = {};
@@ -113,6 +154,7 @@ function openEditor(existing?: SavedConnection, engine?: Engine) {
     draft.value = blankDraft(engine ?? "postgres");
     knownHostKey.value = null;
   }
+  ensureDraftEnv();
   section.value = "general";
   dialog.value = "edit";
   menuId.value = null;
@@ -125,6 +167,7 @@ function switchEngine(engine: Engine) {
   const next = blankDraft(engine);
   next.name = name;
   draft.value = next;
+  ensureDraftEnv();
   report.value = null;
 }
 
@@ -132,8 +175,31 @@ function chooseSection(next: "general" | "tls" | "ssh") {
   section.value = next;
 }
 
-function setEnv(value: string) {
-  draft.value.env = value as EnvLabel;
+async function saveTag(payload: EnvTagInput) {
+  try {
+    const saved = await api.value.saveTag(payload);
+    tags.value = await api.value.listTags();
+    tagsLoaded.value = true;
+    if (!payload.id) draft.value.env = saved.id;
+    tagError.value = "";
+    refreshCatalog();
+  } catch (error) {
+    tagError.value = errorText(error, "没有保存标签。");
+  }
+}
+
+async function removeTag(id: string) {
+  try {
+    await api.value.deleteTag(id);
+    if (draft.value.env === id) draft.value.env = "none";
+    tags.value = await api.value.listTags();
+    tagsLoaded.value = true;
+    tagError.value = "";
+    await reload();
+    refreshCatalog();
+  } catch (error) {
+    tagError.value = errorText(error, "没有删除标签。");
+  }
 }
 
 async function browseSqlite() {
@@ -301,6 +367,7 @@ const detailTarget = computed(() => (dialog.value === "details" ? deleteTarget.v
 
 onMounted(() => {
   void reload();
+  void reloadTags();
 });
 
 watch(
@@ -346,7 +413,7 @@ watch(
               <h3>{{ item.name }}</h3>
               <p>{{ versions[item.id] || engineMeta(item.engine).label }}</p>
             </div>
-            <span class="env" :class="`env-${item.env}`">{{ envLabel(item.env) }}</span>
+            <span class="env" :class="`env-${envView(item.env).tone}`">{{ envView(item.env).label }}</span>
           </header>
           <dl v-if="item.engine === 'sqlite'" class="cc-dl">
             <dt>文件</dt>
@@ -429,15 +496,7 @@ watch(
                   <small v-else>只打开已有文件。删除这个连接不会删除文件。</small>
                 </label>
               </div>
-              <fieldset class="field env-field">
-                <legend>环境标签</legend>
-                <div class="env-pick">
-                  <label v-for="item in ENVS" :key="item.id" :class="{ on: draft.env === item.id }">
-                    <input type="radio" name="cf-env" :value="item.id" :checked="draft.env === item.id" @change="setEnv(item.id)" />
-                    <span class="env" :class="`env-${item.id}`">{{ item.label }}</span>
-                  </label>
-                </div>
-              </fieldset>
+              <EnvTagField v-model="draft.env" :tags="tags" :error="tagError" @save="saveTag" @remove="removeTag" />
               <div class="callout callout-info"><ConnIcon name="info" /><div>SQLite 是本地文件，不需要 TLS 或 SSH。连接后会显示 <code>PRAGMA foreign_keys</code> 的实际状态。SQLite 默认不强制外键。</div></div>
             </template>
             <template v-else-if="section === 'general'">
@@ -450,15 +509,7 @@ watch(
                 <label class="field full"><span>密码</span><input v-model="secrets.password" type="password" autocomplete="new-password" /><small>留空则继续使用系统凭据库里已保存的密码。密码不会写入普通配置。</small></label>
                 <label class="check full"><input v-model="draft.savePassword" type="checkbox" /><span>把密码保存到系统凭据库<small>不勾选时，每次连接都会询问密码。</small></span></label>
               </div>
-              <fieldset class="field">
-                <legend>环境标签</legend>
-                <div class="env-pick">
-                  <label v-for="item in ENVS" :key="item.id" :class="{ on: draft.env === item.id }">
-                    <input type="radio" name="cf-env" :value="item.id" :checked="draft.env === item.id" @change="setEnv(item.id)" />
-                    <span class="env" :class="`env-${item.id}`">{{ item.label }}</span>
-                  </label>
-                </div>
-              </fieldset>
+              <EnvTagField v-model="draft.env" :tags="tags" :error="tagError" @save="saveTag" @remove="removeTag" />
               <div class="route-box"><span class="muted sm">连接路径</span><div class="route"><ConnIcon name="monitor" /><span>本机</span><template v-if="draft.sshOn"><i class="route-line"></i><span class="route-hop"><ConnIcon name="tunnel" />{{ draft.sshHost || "跳板机" }}:{{ draft.sshPort }}</span></template><i class="route-line"></i><span class="route-hop"><ConnIcon name="database" />{{ draft.host || "数据库主机" }}:{{ draft.port || "?" }}</span></div></div>
             </template>
             <template v-else-if="section === 'tls'">

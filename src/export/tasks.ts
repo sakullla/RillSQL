@@ -1,9 +1,9 @@
 import { reactive } from "vue";
 import { gridExport, gridExportCancel, type ExportResult } from "../grid/api";
 import type { Filter, SortSpec } from "../grid/types";
-import type { CsvCell, CsvOptions } from "./csv";
+import { renderCsv, type CsvCell, type CsvOptions } from "./csv";
 import type { ExportPlan } from "./plan";
-import { startExport, type WriteControl, type WriteResult } from "./write";
+import type { WriteControl, WriteResult } from "./write";
 
 export interface ExportTask {
   id: string;
@@ -31,7 +31,85 @@ export function clearFinishedTasks(): void {
   }
 }
 
-export function runExportTask(options: {
+function applyWriteResult(task: ExportTask, result: WriteResult): void {
+  task.status = result.status;
+  task.doneRows = result.writtenRows;
+  task.totalRows = Math.max(task.totalRows, result.writtenRows);
+  task.message = result.message;
+  task.residualPath = result.residualPath;
+  if (result.path) {
+    task.path = result.path;
+    task.fileName = result.path.split(/[/\\]/).pop() || task.fileName;
+  }
+}
+
+function blockedExport(message: string): WriteResult {
+  return { status: "blocked", success: false, writtenRows: 0, path: null, residualPath: null, message, readCalled: false };
+}
+
+function downloadCsv(fileName: string, body: string): void {
+  const blob = new Blob([body], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+}
+
+function exportLoadedInBrowser(options: {
+  plan: ExportPlan;
+  acknowledged: boolean;
+  path: string;
+  columns: readonly string[];
+  rows: readonly Record<string, CsvCell>[];
+  csv: CsvOptions;
+  readRows?: () => readonly Record<string, CsvCell>[];
+}): WriteResult {
+  if (!options.plan.allowed) return blockedExport(options.plan.rejectReason ?? "不能导出");
+  if (options.plan.reexecutes && !options.acknowledged) return blockedExport("执行前需说明会重新执行这条 SELECT");
+  let readCalled = false;
+  let rows = options.rows;
+  if (options.plan.serverRead) {
+    if (!options.readRows) return blockedExport("没有可重新读取的数据源");
+    readCalled = true;
+    rows = options.readRows();
+  }
+  const fileName = options.path.split(/[/\\]/).pop() || options.plan.fileName;
+  downloadCsv(fileName, renderCsv(options.columns, rows, options.csv));
+  let message = `已导出 ${rows.length} 行，开始下载 ${fileName}。`;
+  if (options.plan.partial) message = `已导出 ${rows.length} 行，开始下载 ${fileName}。这只是已读取的行，不是完整结果。`;
+  if (options.plan.reexecutes) message = `${options.plan.notice}${message}`;
+  return { status: "done", success: true, writtenRows: rows.length, path: options.path, residualPath: null, message, readCalled };
+}
+
+async function startExportOnNode(
+  options: {
+    plan: ExportPlan;
+    acknowledged: boolean;
+    path: string;
+    columns: readonly string[];
+    rows: readonly Record<string, CsvCell>[];
+    csv: CsvOptions;
+    control?: WriteControl;
+    readRows?: () => readonly Record<string, CsvCell>[];
+  },
+  task: ExportTask,
+): Promise<WriteResult> {
+  const { startExport } = await import(/* @vite-ignore */ "./write");
+  return startExport({
+    ...options,
+    onProgress: (progress) => {
+      task.status = progress.status === "blocked" ? task.status : progress.status;
+      task.doneRows = progress.writtenRows;
+      task.totalRows = progress.totalRows;
+    },
+  });
+}
+
+export async function runExportTask(options: {
   plan: ExportPlan;
   acknowledged: boolean;
   path: string;
@@ -40,7 +118,7 @@ export function runExportTask(options: {
   csv: CsvOptions;
   control?: WriteControl;
   readRows?: () => readonly Record<string, CsvCell>[];
-}): { task: ExportTask; result: WriteResult } {
+}): Promise<{ task: ExportTask; result: WriteResult }> {
   const fileName = options.path.split(/[/\\]/).pop() || options.plan.fileName;
   const task: ExportTask = {
     id: `export-${taskSeq}`,
@@ -55,19 +133,8 @@ export function runExportTask(options: {
   };
   taskSeq += 1;
   exportTasks.unshift(task);
-  const result = startExport({
-    ...options,
-    onProgress: (progress) => {
-      task.status = progress.status === "blocked" ? task.status : progress.status;
-      task.doneRows = progress.writtenRows;
-      task.totalRows = progress.totalRows;
-    },
-  });
-  task.status = result.status;
-  task.doneRows = result.writtenRows;
-  task.message = result.message;
-  task.residualPath = result.residualPath;
-  if (result.path) task.path = result.path;
+  const result = import.meta.env.VITEST ? await startExportOnNode(options, task) : exportLoadedInBrowser(options);
+  applyWriteResult(task, result);
   return { task, result };
 }
 
@@ -160,4 +227,14 @@ export function runRemoteExport(options: RemoteExportOptions): { task: ExportTas
 
 export function cancelRemoteExport(id: string): Promise<void> {
   return gridExportCancel(id);
+}
+
+/** 已读取的行不再查询数据库。停在 0 行的旧任务改成未完成，标题不再一直显示「导出 0/N」。 */
+export function failIdleRemoteExports(message: string): void {
+  for (const task of exportTasks) {
+    if (task.status !== "running" || task.doneRows !== 0 || task.totalRows <= 0) continue;
+    if (!task.message.startsWith("正在从已打开的连接导出")) continue;
+    task.status = "failed";
+    task.message = message;
+  }
 }

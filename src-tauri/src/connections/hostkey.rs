@@ -30,10 +30,12 @@ pub struct PresentedKey {
     pub fingerprint: String,
 }
 
+#[cfg(test)]
 pub trait Authenticator {
     fn authenticate(&mut self) -> Result<(), String>;
 }
 
+#[cfg(test)]
 pub fn authenticate_after(decision: &HostKeyDecision, auth: &mut dyn Authenticator) -> Result<(), String> {
     match decision {
         HostKeyDecision::Trusted => auth.authenticate(),

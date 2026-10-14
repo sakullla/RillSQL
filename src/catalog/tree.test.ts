@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { MODULE_ID } from "./index";
 import { createRefreshFixture, catalogFixture } from "./fixtures";
 import { listPaletteTables, refreshCatalog, replaceCatalog, resetCatalog, setRefreshSource } from "./store";
-import { engineShape, objectPath, reconcileObjects, refreshConnection, refreshSchema, schemaFailed, schemaIsEmpty, searchObjects } from "./tree";
+import { browseSql, qualifiedObjectName } from "./object-ref";
+import { engineShape, objectPath, postgresSessionGap, reconcileObjects, refreshConnection, refreshSchema, schemaFailed, schemaIsEmpty, searchObjects } from "./tree";
 import type { CatalogObject, SchemaNode } from "./types";
 
 function row(name: string, stale = false): CatalogObject {
@@ -28,7 +29,17 @@ describe("catalog tree", () => {
     expect(found.skipped).toEqual(["Analytics"]);
     expect(found.hits.some((hit) => hit.name === "events")).toBe(false);
     expect(objectPath("本地笔记", "main", "")).toBe("本地笔记 / main");
+    expect(qualifiedObjectName("postgres", "public", "customers")).toBe('"public"."customers"');
+    expect(qualifiedObjectName("mysql", "", "orders")).toBe("`orders`");
+    expect(browseSql("sqlite", "", "notes")).toBe('SELECT *\nFROM "notes"\nLIMIT 100;');
     expect(objectPath("Shop", "shop_staging", "")).toBe("Shop / shop_staging");
+  });
+
+  it("recognizes a postgres session that has not attached to another database", () => {
+    expect(postgresSessionGap("当前会话连在 postgres，没有另开连接读取 rillsql")).toEqual({ current: "postgres", database: "rillsql" });
+    expect(postgresSessionGap("当前会话连在 postgres,没有另开连接读取 rillsql")).toEqual({ current: "postgres", database: "rillsql" });
+    expect(postgresSessionGap("读取库表失败：permission denied")).toBeNull();
+    expect(postgresSessionGap(null)).toBeNull();
   });
 
   it("marks a missing object stale and drops it on the next refresh", () => {

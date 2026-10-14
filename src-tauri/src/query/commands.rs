@@ -92,6 +92,7 @@ impl QueryState {
         Ok(guard.as_ref().expect("历史刚刚打开").clone())
     }
 
+    #[cfg(test)]
     pub fn is_connection_busy(&self, connection_id: &str) -> bool {
         connection_busy(self, connection_id)
     }
@@ -273,6 +274,7 @@ fn history_status(status: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn connection_busy(state: &QueryState, connection_id: &str) -> bool {
     state.runs.lock().expect("runs").values().any(|slot| slot_busy(slot, connection_id))
 }

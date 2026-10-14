@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ConnectionDraft, SavedConnection, SecretInput } from "./model";
+import type { ConnectionDraft, EnvTag, EnvTone, SavedConnection, SecretInput } from "./model";
 
 export interface StageView {
   kind: string;
@@ -34,8 +34,17 @@ export interface OpenOutcome {
   foreignKeys?: boolean | null;
 }
 
+export interface EnvTagInput {
+  id?: string;
+  label: string;
+  tone: EnvTone;
+}
+
 export interface ConnectionApi {
   list(): Promise<SavedConnection[]>;
+  listTags(): Promise<EnvTag[]>;
+  saveTag(input: EnvTagInput): Promise<EnvTag>;
+  deleteTag(id: string): Promise<void>;
   save(draft: ConnectionDraft, secrets: SecretInput): Promise<SaveOutcome>;
   remove(id: string): Promise<DeleteOutcome>;
   test(id: string, secrets: SecretInput): Promise<TestReport>;
@@ -52,6 +61,9 @@ function emptyToNull(value: string): string | null {
 
 export const tauriConnectionApi: ConnectionApi = {
   list: () => invoke<SavedConnection[]>("connections_list"),
+  listTags: () => invoke<EnvTag[]>("env_tags_list"),
+  saveTag: (input) => invoke<EnvTag>("env_tags_save", { id: input.id ?? null, label: input.label, tone: input.tone }),
+  deleteTag: (id) => invoke<void>("env_tags_delete", { id }),
   save: (draft, secrets) =>
     invoke<SaveOutcome>("connections_save", {
       draft,

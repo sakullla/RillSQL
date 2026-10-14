@@ -29,6 +29,11 @@ description = "允许打开已保存的连接。"
 commands.allow = ["connections_open"]
 
 [[permission]]
+identifier = "allow-connections-focus-database"
+description = "允许把已打开的 PostgreSQL 会话改连到同一个服务器上的另一个库，不修改已保存的配置。"
+commands.allow = ["connections_focus_database"]
+
+[[permission]]
 identifier = "allow-connections-disconnect"
 description = "允许断开已打开的连接。"
 commands.allow = ["connections_disconnect"]
@@ -42,6 +47,21 @@ commands.allow = ["connections_confirm_host_key"]
 identifier = "allow-connections-forget-host-key"
 description = "允许忘记已保存的 SSH 主机密钥。"
 commands.allow = ["connections_forget_host_key"]
+
+[[permission]]
+identifier = "allow-env-tags-list"
+description = "允许读取用户维护的环境标签。"
+commands.allow = ["env_tags_list"]
+
+[[permission]]
+identifier = "allow-env-tags-save"
+description = "允许添加或修改环境标签。"
+commands.allow = ["env_tags_save"]
+
+[[permission]]
+identifier = "allow-env-tags-delete"
+description = "允许删除环境标签，并把仍使用它的连接改为无标签。"
+commands.allow = ["env_tags_delete"]
 
 [[permission]]
 identifier = "allow-catalog-sessions"

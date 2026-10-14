@@ -183,6 +183,7 @@ fn ddl_commands_stay_registered_beside_existing_commands() {
         ("connections_delete", "connections::commands::connections_delete"),
         ("connections_test", "connections::commands::connections_test"),
         ("connections_open", "connections::commands::connections_open"),
+        ("connections_focus_database", "connections::commands::connections_focus_database"),
         ("connections_disconnect", "connections::commands::connections_disconnect"),
         ("connections_confirm_host_key", "connections::commands::connections_confirm_host_key"),
         ("connections_forget_host_key", "connections::commands::connections_forget_host_key"),

@@ -1,11 +1,45 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import { describe, expect, it } from "vitest";
-import type { ConnectionApi, TestReport } from "./api";
+import type { ConnectionApi, EnvTagInput, TestReport } from "./api";
 import ConnectionsPage from "./ConnectionsPage.vue";
 import { listPaletteConnections, MODULE_ID, replacePaletteConnections, setSqlitePicker } from "./index";
-import { blankDraft, storedConfigHidesSecrets, toStoredConfig, validate, type SavedConnection, type SecretInput } from "./model";
+import { blankDraft, storedConfigHidesSecrets, toStoredConfig, validate, type EnvTag, type SavedConnection, type SecretInput } from "./model";
 
 const secret: SecretInput = { password: "db-secret-alpha", sshPassword: "ssh-secret-beta", passphrase: "key-pass-gamma" };
+
+function seedTags(): EnvTag[] {
+  return [
+    { id: "dev", label: "开发", tone: "dev", position: 0 },
+    { id: "test", label: "测试", tone: "test", position: 1 },
+    { id: "prod", label: "生产", tone: "prod", position: 2 },
+    { id: "local", label: "本地", tone: "local", position: 3 },
+  ];
+}
+
+function tagApi(tags: EnvTag[], extra: Partial<ConnectionApi> = {}): Pick<ConnectionApi, "listTags" | "saveTag" | "deleteTag"> {
+  return {
+    listTags: async () => tags.map((item) => ({ ...item })),
+    saveTag: async (input: EnvTagInput) => {
+      const label = input.label.trim();
+      if (tags.some((item) => item.label === label && item.id !== input.id)) throw new Error("已经有同名环境标签");
+      if (input.id) {
+        const found = tags.find((item) => item.id === input.id);
+        if (!found) throw new Error("找不到这个环境标签");
+        found.label = label;
+        found.tone = input.tone;
+        return { ...found };
+      }
+      const created = { id: `tag-${tags.length + 1}`, label, tone: input.tone, position: tags.length };
+      tags.push(created);
+      return { ...created };
+    },
+    deleteTag: async (id: string) => {
+      const index = tags.findIndex((item) => item.id === id);
+      if (index >= 0) tags.splice(index, 1);
+    },
+    ...extra,
+  };
+}
 
 function savedMysql(): SavedConnection {
   return {
@@ -62,6 +96,7 @@ describe("connections page", () => {
     ];
     const api: ConnectionApi = {
       list: async () => [savedMysql()],
+      ...tagApi(seedTags()),
       save: async (draft) => ({ connection: { ...toStoredConfig(draft, draft.id ?? "created"), passwordSaved: draft.savePassword }, note: null }),
       remove: async (id) => ({ connection: { ...savedMysql(), id }, databaseFileRemoved: false }),
       test: async () => reports[0],
@@ -107,5 +142,59 @@ describe("connections page", () => {
     expect(page.text()).toContain("数据库或其中的任何数据");
     page.unmount();
     replacePaletteConnections([]);
+  });
+
+  it("lets the user add, rename, and delete environment tags", async () => {
+    const tags = seedTags();
+    const api: ConnectionApi = {
+      list: async () => [savedMysql()],
+      ...tagApi(tags),
+      save: async (draft) => ({ connection: { ...toStoredConfig(draft, draft.id ?? "created"), passwordSaved: draft.savePassword }, note: null }),
+      remove: async (id) => ({ connection: { ...savedMysql(), id }, databaseFileRemoved: false }),
+      test: async () => ({ status: "ok", stages: [] }),
+      open: async () => ({ report: { status: "ok", stages: [] }, connected: true, foreignKeys: null }),
+      disconnect: async () => undefined,
+      confirmHostKey: async () => undefined,
+      forgetHostKey: async () => undefined,
+    };
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api } });
+    await flushPromises();
+    expect(wrapper.text()).toContain("开发");
+
+    await wrapper.get("[data-action=conn-new]").trigger("click");
+    await wrapper.get("[data-action=env-manage]").trigger("click");
+    expect((wrapper.get("[data-field=env-label]").element as HTMLInputElement).value).toBe("开发");
+    await wrapper.get("[data-field=env-label]").setValue("开发环境");
+    await wrapper.get("[data-action=env-save]").trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("开发环境");
+    expect(tags.find((item) => item.id === "dev")?.label).toBe("开发环境");
+
+    await wrapper.get("[data-action=env-add]").trigger("click");
+    await wrapper.get("[data-field=env-label]").setValue("预发");
+    await wrapper.get("[data-action=env-save]").trigger("click");
+    await flushPromises();
+    const created = wrapper.findAll(".env-pick label").find((item) => item.text().includes("预发"));
+    expect(created?.classes()).toContain("on");
+
+    await wrapper.get("[data-field=env-label]").setValue("灰度");
+    await wrapper.get("[data-action=env-save]").trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("灰度");
+    expect(wrapper.text()).not.toContain("预发");
+
+    await wrapper.get("[data-field=env-label]").setValue("开发环境");
+    await wrapper.get("[data-action=env-save]").trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("已经有同名环境标签");
+
+    await wrapper.get("[data-field=env-label]").setValue("灰度");
+    await wrapper.get("[data-action=env-delete]").trigger("click");
+    expect(wrapper.get("[data-action=env-delete]").text()).toBe("确认删除");
+    await wrapper.get("[data-action=env-delete]").trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).not.toContain("灰度");
+    expect(wrapper.get(".env-pick label.on").text()).toContain("无标签");
+    wrapper.unmount();
   });
 });

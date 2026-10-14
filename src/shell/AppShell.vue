@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { listPaletteTables, startCatalog } from "../catalog";
+import { objectIdentity, type CatalogObjectRef } from "../catalog/object-ref";
 import { catalogConnections } from "../catalog/store";
 import ConnectionsPage from "../connections/ConnectionsPage.vue";
 import { listPaletteConnections } from "../connections";
@@ -25,6 +26,7 @@ import WorkspaceView from "./WorkspaceView.vue";
 import type { AppPage } from "../router";
 
 const session = createSession(typeof location === "undefined" ? "" : location.hash);
+const windowChrome = ref({ custom: false, maximized: false });
 attachCloser((id) => session.closeTab(id));
 session.setCloseGuard((id) => guardClose(id));
 
@@ -103,6 +105,43 @@ function setTheme(theme: ThemePreference) {
 function persist() {
   saveSettings(settings);
   applyTheme();
+}
+
+function onOpenObject(object: CatalogObjectRef, pane: "data" | "structure", section?: "columns" | "drop") {
+  session.openTable({
+    id: objectIdentity(object),
+    label: object.name,
+    path: object.path,
+    pane,
+    section,
+  });
+}
+
+function onQueryObject(object: CatalogObjectRef, sql: string) {
+  session.openQueryDraft({
+    sql,
+    connectionId: object.connectionId,
+    connectionName: object.connectionName,
+    database: object.database,
+    engine: object.engine,
+    status: "connected",
+    needsTarget: false,
+    notice: null,
+  });
+}
+
+function onFocusedDatabase(connectionId: string, database: string) {
+  const known = catalogConnections().find((item) => item.id === connectionId);
+  for (const tab of session.tabs.value) {
+    if (tab.kind !== "query" || tab.connectionId !== connectionId || !tab.connectionName || !tab.engine) continue;
+    session.setQueryTarget(tab.id, {
+      connectionId,
+      connectionName: known?.name ?? tab.connectionName,
+      database,
+      engine: known?.engine ?? tab.engine,
+      status: "connected",
+    });
+  }
 }
 
 function onSettings(patch: Partial<ShellSettings>) {
@@ -215,15 +254,18 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="app-root" :class="{ 'sidebar-hidden': session.sidebarHidden.value || session.page.value !== 'workspace' }">
+  <div class="app-root" :class="{ 'sidebar-hidden': session.sidebarHidden.value || session.page.value !== 'workspace', 'custom-chrome': windowChrome.custom, 'is-maximized': windowChrome.maximized }">
     <a class="skip" href="#main">跳到主区域</a>
-    <TitleBar :theme="settings.theme" @palette="session.openPalette('all')" @help="session.openHelp()" @set-theme="setTheme" />
+    <TitleBar :theme="settings.theme" @palette="session.openPalette('all')" @help="session.openHelp()" @set-theme="setTheme" @window-state="windowChrome = $event" />
     <div class="body">
       <ActivityRail :page="session.page.value" @navigate="onNavigate" />
       <Sidebar
         v-if="session.page.value === 'workspace' && !session.sidebarHidden.value"
         :width="session.sidebarWidth.value"
         @resize="session.sidebarWidth.value = $event"
+        @open-object="onOpenObject"
+        @query-object="onQueryObject"
+        @focused-database="onFocusedDatabase"
       />
       <main id="main" tabindex="-1">
         <WorkspaceView
@@ -239,6 +281,7 @@ onBeforeUnmount(() => {
           @structure="session.openStructure(STRUCTURE_PLACEHOLDER)"
           @draft="session.setDraft"
           @target="session.setQueryTarget"
+          @table-view="session.setTableView"
         />
         <ConnectionsPage v-else-if="session.page.value === 'connections'" :sqlite-prompt="sqlitePrompt" />
         <HistoryPage v-else-if="session.page.value === 'history'" @open="onHistoryOpen" />

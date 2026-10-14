@@ -3,7 +3,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import * as csvWrite from "../export/write";
 import { exportTasks, resetExportTasks } from "../export/tasks";
 import DataGrid from "./DataGrid.vue";
 import { commitChanges, queryPage, viewLoadedRows } from "./data";
@@ -274,19 +273,47 @@ describe("grid views", () => {
     expect(wrapper.text()).not.toContain("长".repeat(200));
     const pageCall = invoke.mock.calls.find((call) => call[0] === "grid_page");
     expect(pageCall?.[1]).toMatchObject({ request: { connectionId: "shop", table: "customers", limit: 100, offset: 0 } });
-    const writeSpy = vi.spyOn(csvWrite, "writeCsvFile");
+    exportTasks.unshift({
+      id: "stuck",
+      fileName: "orders.csv",
+      path: "orders.csv",
+      status: "running",
+      doneRows: 0,
+      totalRows: 3,
+      partial: false,
+      message: "正在从已打开的连接导出",
+      residualPath: null,
+    });
     const exportButton = wrapper.findAll("button").find((button) => button.text() === "导出");
     await exportButton!.trigger("click");
     const dir = mkdtempSync(join(tmpdir(), "rillsql-grid-view-"));
-    await wrapper.get("input[aria-label='导出路径']").setValue(join(dir, "customers.csv"));
+    const requested = join(dir, "customers.csv");
+    await wrapper.get("input[aria-label='导出路径']").setValue(requested);
     const start = wrapper.findAll("button").filter((button) => button.text() === "导出").at(-1)!;
     await start.trigger("click");
+    await vi.waitFor(() => {
+      expect(exportTasks.find((task) => task.id !== "stuck")?.status).toBe("done");
+    });
+    expect(invoke.mock.calls.some((call) => call[0] === "grid_export")).toBe(false);
+    const written = join(dir, "customers（部分）.csv");
+    const body = readFileSync(written, "utf8");
+    expect(body.startsWith("\uFEFF")).toBe(true);
+    expect(body).toContain("客户1");
+    expect(body).toContain("长".repeat(2000));
+    expect(exportTasks.find((task) => task.id === "stuck")?.status).toBe("failed");
+    expect(exportTasks.find((task) => task.id !== "stuck")?.status).toBe("done");
+    expect(wrapper.get("[role='status']").text()).toContain("已导出 100 行");
+    expect(wrapper.get("[role='status']").text()).toContain("customers（部分）.csv");
+    const again = wrapper.findAll("button").find((button) => button.text() === "导出");
+    await again!.trigger("click");
+    await wrapper.get("input[value='full']").setValue(true);
+    await wrapper.get("input[aria-label='导出路径']").setValue(join(dir, "all.csv"));
+    const exportAll = wrapper.findAll("button").filter((button) => button.text() === "导出").at(-1)!;
+    await exportAll.trigger("click");
     await flushPromises();
     const exported = invoke.mock.calls.find((call) => call[0] === "grid_export");
-    expect(exported?.[1]).toMatchObject({ request: { mode: "table-loaded", connectionId: "shop", table: "customers", truncated: true, limit: 100 } });
-    expect(JSON.stringify(exported?.[1])).toContain("（部分）");
-    expect(writeSpy).not.toHaveBeenCalled();
-    writeSpy.mockRestore();
+    expect(exported?.[1]).toMatchObject({ request: { mode: "table-full", connectionId: "shop", table: "customers", limit: 0 } });
+    expect(JSON.stringify(exported?.[1])).not.toContain("客户1");
     rmSync(dir, { recursive: true, force: true });
     await wrapper.get("button[aria-label='继续读取']").trigger("click");
     await flushPromises();

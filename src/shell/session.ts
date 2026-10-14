@@ -11,6 +11,8 @@ export interface PlaceholderTarget {
   id: string;
   label: string;
   path?: string;
+  pane?: "data" | "structure";
+  section?: "columns" | "drop";
 }
 
 export const STRUCTURE_PLACEHOLDER: PlaceholderTarget = {
@@ -50,6 +52,8 @@ export interface ShellTab {
   engine: string | null;
   connectionStatus: ConnectionStatus | null;
   targetNotice: string | null;
+  tablePane: "data" | "structure";
+  structureSection: "columns" | "indexes" | "foreign" | "drop";
 }
 
 export interface ShellSession {
@@ -67,6 +71,7 @@ export interface ShellSession {
   openQueryDraft: (input: QueryDraftInput) => string;
   openTable: (target: PlaceholderTarget) => void;
   openStructure: (target: PlaceholderTarget) => void;
+  setTableView: (id: string, pane: "data" | "structure", section?: "columns" | "drop") => void;
   setDraft: (id: string, draft: string) => void;
   setQueryTarget: (id: string, target: QueryTarget | null) => void;
   setCloseGuard: (guard: ((id: string) => boolean) | null) => void;
@@ -93,6 +98,8 @@ function blankTab(kind: TabKind, id: string, title: string, path: string | null,
     engine: null,
     connectionStatus: null,
     targetNotice: null,
+    tablePane: "data",
+    structureSection: "columns",
   };
 }
 
@@ -169,14 +176,25 @@ export function createSession(initialHash = ""): ShellSession {
     const id = `${kind}:${target.id}`;
     const existing = tabs.value.find((tab) => tab.id === id);
     if (existing) {
+      if (target.pane) existing.tablePane = target.pane;
+      if (target.section) existing.structureSection = target.section;
       activeId.value = existing.id;
       showPage("workspace");
       return;
     }
     const tab = blankTab(kind, id, target.label, target.path ?? null, "");
+    if (target.pane) tab.tablePane = target.pane;
+    if (target.section) tab.structureSection = target.section;
     tabs.value = [...tabs.value, tab];
     activeId.value = tab.id;
     showPage("workspace");
+  }
+
+  function setTableView(id: string, pane: "data" | "structure", section?: "columns" | "drop") {
+    const tab = tabs.value.find((item) => item.id === id);
+    if (!tab || tab.kind !== "table") return;
+    tab.tablePane = pane;
+    if (section) tab.structureSection = section;
   }
 
   function openTable(target: PlaceholderTarget) {
@@ -263,6 +281,7 @@ export function createSession(initialHash = ""): ShellSession {
     openQueryDraft,
     openTable,
     openStructure,
+    setTableView,
     setDraft,
     setQueryTarget,
     setCloseGuard,

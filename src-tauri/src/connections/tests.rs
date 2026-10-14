@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use super::forward::{Forwarder, RecordingOpener};
 use super::hostkey::{self, Authenticator, HostKeyDecision};
-use super::model::{self, leaked_secret, CaMode, ConnectionDraft, Engine, EnvLabel, Secret, SecretInput, SshAuthKind, TlsMode};
+use super::model::{self, leaked_secret, CaMode, ConnectionDraft, Engine, Secret, SecretInput, SshAuthKind, TlsMode};
 use super::route::{self, Retry};
 use super::secrets::{MemoryStore, UnavailableStore};
 use super::service::{DatabaseProbe, Probes, Service, SshProbe};
@@ -211,7 +211,7 @@ fn sqlite_has_no_tls_and_mysql_stays_distinct_from_mariadb() {
     let saved = model::normalize(&sqlite, "file".to_owned()).unwrap();
     assert!(saved.tls.is_none());
     assert!(saved.ssh.is_none());
-    assert_eq!(saved.env.label_zh(), "本地");
+    assert_eq!(saved.env, "local");
     assert!(route::resolve_route(&saved, None).unwrap().tls_server_name.is_none());
     let mysql = model::normalize(&remote_draft(Engine::Mysql), "my".to_owned()).unwrap();
     let maria = model::normalize(&remote_draft(Engine::Mariadb), "ma".to_owned()).unwrap();
@@ -449,6 +449,72 @@ async fn deleting_one_connection_keeps_a_shared_host_key_and_does_not_create_a_m
 }
 
 #[tokio::test]
+async fn focusing_another_postgres_database_does_not_rewrite_the_saved_config() {
+    let dir = temp_workspace();
+    let config_path = dir.join("connections.sqlite");
+    let probe = Arc::new(RememberDatabase::default());
+    let service = Service::with_probes(
+        config_path,
+        Arc::new(MemoryStore::default()),
+        Probes {
+            ssh: None,
+            database: Some(probe.clone()),
+            sqlite: None,
+        },
+    );
+    let saved = service.save(remote_draft(Engine::Postgres), secrets("db-secret-alpha", "", "")).await.unwrap();
+    let id = saved.connection.id.clone();
+    assert!(service.open(&id, SecretInput::default()).await.unwrap().connected);
+
+    let missing = service.focus_database(&id, "missing").await.unwrap_err();
+    assert!(missing.contains("数据库不存在"), "{missing}");
+    assert!(missing.contains("原来的会话还在"), "{missing}");
+    assert!(service.is_connected(&id));
+
+    service.focus_database(&id, "rillsql").await.unwrap();
+    assert!(service.is_connected(&id));
+    let listed = service.list().await.unwrap();
+    assert_eq!(listed[0].saved.database.as_deref(), Some("app"));
+    assert_eq!(probe.seen.lock().expect("seen").as_slice(), ["app", "missing", "rillsql"]);
+    service.disconnect(&id);
+    let closed = service.focus_database(&id, "rillsql").await.unwrap_err();
+    assert!(closed.contains("还没有打开"), "{closed}");
+
+    let mysql = service.save(remote_draft(Engine::Mysql), secrets("db-secret-alpha", "", "")).await.unwrap();
+    let rejected = service.focus_database(&mysql.connection.id, "other").await.unwrap_err();
+    assert!(rejected.contains("只有 PostgreSQL"), "{rejected}");
+    assert_eq!(service.focus_database(&id, "  ").await.unwrap_err(), "需要数据库名。");
+    let idle = service.focus_database("missing-id", "rillsql").await.unwrap_err();
+    assert!(idle.contains("找不到这条连接配置") || idle.contains("还没有打开"), "{idle}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[derive(Default)]
+struct RememberDatabase {
+    seen: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl DatabaseProbe for RememberDatabase {
+    async fn check_tls(&self, route: &route::Route) -> Result<String, StageError> {
+        Ok(format!("证书主机名 {} 已验证", route.tls_server_name.clone().unwrap_or_default()))
+    }
+
+    async fn authenticate(&self, config: &model::SavedConnection, _route: &route::Route, _password: &str) -> Result<String, StageError> {
+        let database = config.database.clone().unwrap_or_default();
+        self.seen.lock().expect("seen").push(database.clone());
+        if database == "missing" {
+            return Err(stages::fail("数据库不存在", "没有改连。"));
+        }
+        Ok("用户 app_user".to_owned())
+    }
+
+    async fn server_version(&self, config: &model::SavedConnection, _route: &route::Route) -> Result<String, StageError> {
+        Ok(format!("{} 16", config.engine.label_zh()))
+    }
+}
+
+#[tokio::test]
 async fn stored_password_is_reused_without_being_copied_into_the_config() {
     let dir = temp_workspace();
     let config_path = dir.join("connections.sqlite");
@@ -466,7 +532,7 @@ async fn stored_password_is_reused_without_being_copied_into_the_config() {
     let input = secrets("db-secret-alpha", "", "");
     let saved = service.save(remote_draft(Engine::Mariadb), input.clone()).await.unwrap();
     assert_eq!(saved.connection.engine, Engine::Mariadb);
-    assert_eq!(saved.connection.env, EnvLabel::Dev);
+    assert_eq!(saved.connection.env, "dev");
     let report = service.test(&saved.connection.id, SecretInput::default()).await.unwrap();
     assert_eq!(report.status, TestStatus::Ok);
     assert_eq!(report.summary.as_deref(), Some("MariaDB 8.4.3"));
@@ -565,6 +631,91 @@ async fn missing_password_does_not_mark_network_or_tls_successful() {
             StageStatus::Skipped
         );
     }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn users_keep_their_own_environment_tags() {
+    let dir = temp_workspace();
+    let path = dir.join("connections.sqlite");
+    let service = Service::new(path.clone(), Arc::new(MemoryStore::default()));
+    let tags = service.list_tags().await.unwrap();
+    assert_eq!(
+        tags.iter().map(|tag| (tag.id.as_str(), tag.label.as_str(), tag.tone.as_str())).collect::<Vec<_>>(),
+        vec![("dev", "开发", "dev"), ("test", "测试", "test"), ("prod", "生产", "prod"), ("local", "本地", "local")]
+    );
+
+    let renamed = service.save_tag(Some("dev".into()), " 开发环境 ".into(), "prod".into()).await.unwrap();
+    assert_eq!(renamed.id, "dev");
+    assert_eq!(renamed.label, "开发环境");
+    assert_eq!(renamed.tone, "prod");
+    assert!(service.save_tag(None, "开发环境".into(), "dev".into()).await.unwrap_err().message().contains("同名"));
+    assert!(service.save_tag(None, "  ".into(), "dev".into()).await.unwrap_err().message().contains("请填写"));
+    assert!(service.save_tag(None, "预发".into(), "purple".into()).await.unwrap_err().message().contains("颜色"));
+    assert!(service.save_tag(None, "无标签".into(), "dev".into()).await.unwrap_err().message().contains("无标签"));
+    assert!(service
+        .save_tag(None, "标".repeat(25), "dev".into())
+        .await
+        .unwrap_err()
+        .message()
+        .contains("24"));
+
+    let created = service.save_tag(None, " 预发 ".into(), "test".into()).await.unwrap();
+    assert_eq!(created.label, "预发");
+    assert_eq!(created.tone, "test");
+    assert_ne!(created.id, "none");
+
+    let mut draft = remote_draft(Engine::Postgres);
+    draft.save_password = false;
+    draft.env = created.id.clone();
+    let saved = service.save(draft, SecretInput::default()).await.unwrap();
+    assert_eq!(saved.connection.env, created.id);
+    let mut missing = remote_draft(Engine::Mysql);
+    missing.save_password = false;
+    missing.env = "missing-tag".into();
+    let coerced = service.save(missing, SecretInput::default()).await.unwrap();
+    assert_eq!(coerced.connection.env, "none");
+
+    let catalogs = crate::catalog::commands::load_catalog(&service, 0, &[]).await.unwrap();
+    let preview = catalogs.iter().find(|item| item.id == saved.connection.id).unwrap();
+    assert_eq!(preview.env_label, "预发");
+    assert_eq!(preview.env_tone, "test");
+    let cleared = catalogs.iter().find(|item| item.id == coerced.connection.id).unwrap();
+    assert_eq!(cleared.env_label, "无标签");
+    assert_eq!(cleared.env_tone, "none");
+
+    service.delete_tag(&created.id).await.unwrap();
+    let listed = service.list().await.unwrap();
+    assert_eq!(listed.iter().find(|item| item.saved.id == saved.connection.id).unwrap().saved.env, "none");
+    let after = crate::catalog::commands::load_catalog(&service, 0, &[]).await.unwrap();
+    let detached = after.iter().find(|item| item.id == saved.connection.id).unwrap();
+    assert_eq!(detached.env, "none");
+    assert_eq!(detached.env_label, "无标签");
+    assert_eq!(detached.env_tone, "none");
+
+    drop(service);
+    {
+        let store = super::store::Store::open(&path).await.unwrap();
+        store.testing_set_env(&saved.connection.id, "ghost").await.unwrap();
+    }
+    let service = Service::new(path.clone(), Arc::new(MemoryStore::default()));
+    let ghost = service.list().await.unwrap();
+    assert_eq!(ghost.iter().find(|item| item.saved.id == saved.connection.id).unwrap().saved.env, "ghost");
+    let shown = crate::catalog::commands::load_catalog(&service, 0, &[]).await.unwrap();
+    let ghost_row = shown.iter().find(|item| item.id == saved.connection.id).unwrap();
+    assert_eq!(ghost_row.env_label, "无标签");
+    assert_eq!(ghost_row.env_tone, "none");
+
+    let renamed_local = service.save_tag(Some("local".into()), "本机".into(), "local".into()).await.unwrap();
+    assert_eq!(renamed_local.id, "local");
+    for id in ["dev", "test", "prod", "local"] {
+        service.delete_tag(id).await.unwrap();
+    }
+    assert!(service.list_tags().await.unwrap().is_empty());
+    drop(service);
+    let reopened = Service::new(path, Arc::new(MemoryStore::default()));
+    let kept = reopened.list_tags().await.unwrap();
+    assert!(kept.is_empty(), "删光的标签不应在下次打开时被种回去");
     let _ = std::fs::remove_dir_all(dir);
 }
 

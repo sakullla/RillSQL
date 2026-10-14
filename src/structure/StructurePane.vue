@@ -11,7 +11,13 @@ import StructureEditor from "./StructureEditor.vue";
 import "./structure.css";
 import type { ColumnDraft, StructureAction, StructureDescription, StructureForeignKey, StructurePlan, StructureReceipt } from "./types";
 
-const props = defineProps<{ tabId: string; draft: string; target?: TableTarget | null; purpose?: "create" | "edit" }>();
+const props = defineProps<{
+  tabId: string;
+  draft: string;
+  target?: TableTarget | null;
+  purpose?: "create" | "edit";
+  focusSection?: "columns" | "indexes" | "foreign" | "drop";
+}>();
 
 const purpose = computed(() => props.purpose ?? "create");
 const section = ref<"columns" | "indexes" | "foreign" | "drop">("columns");
@@ -29,6 +35,14 @@ const createDatabase = ref("");
 const createSchema = ref("");
 
 const connections = computed(() => catalogConnections().filter((item) => item.status === "connected"));
+
+watch(
+  () => props.focusSection,
+  (value) => {
+    if (value) section.value = value;
+  },
+  { immediate: true },
+);
 const activeColumns = computed(() => rows.value.filter((row) => !row.dropped).map((row) => row.name).filter(Boolean));
 
 function requestOf(): StructureRequest | null {

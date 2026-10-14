@@ -224,12 +224,12 @@ export async function startCatalog(): Promise<void> {
   armPoll();
 }
 
-export function refreshCatalog(): void {
+export function refreshCatalog(): Promise<void> {
   if (refreshSource) {
     applySnapshot(refreshSource());
-    return;
+    return Promise.resolve();
   }
-  void refreshFromBackend();
+  return refreshFromBackend();
 }
 
 export function listPaletteTables(): PaletteTable[] {

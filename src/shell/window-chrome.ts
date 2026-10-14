@@ -1,0 +1,98 @@
+import { onBeforeUnmount, onMounted, ref } from "vue";
+
+/** True when this page is the Tauri webview, where the native title bar can be replaced. */
+export function desktopShell(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+type AppWindow = {
+  minimize: () => Promise<void>;
+  toggleMaximize: () => Promise<void>;
+  close: () => Promise<void>;
+  isMaximized: () => Promise<boolean>;
+  isFocused: () => Promise<boolean>;
+  onResized: (handler: () => void) => Promise<() => void>;
+  onFocusChanged: (handler: (event: { payload: boolean }) => void) => Promise<() => void>;
+};
+
+async function currentWindow(): Promise<AppWindow> {
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  return getCurrentWindow();
+}
+
+/** Caption state for a borderless window. Browser previews keep the host window's own controls. */
+export function useWindowChrome() {
+  const customChrome = ref(desktopShell());
+  const maximized = ref(false);
+  const focused = ref(true);
+  let stop: (() => void) | undefined;
+  let cancelled = false;
+
+  onMounted(() => {
+    if (!customChrome.value) return;
+    void (async () => {
+      try {
+        const app = await currentWindow();
+        const [isMax, isFocused] = await Promise.all([app.isMaximized(), app.isFocused()]);
+        if (cancelled) return;
+        maximized.value = isMax;
+        focused.value = isFocused;
+        const stopResize = await app.onResized(() => {
+          void app.isMaximized().then((value) => {
+            if (!cancelled) maximized.value = value;
+          });
+        });
+        const stopFocus = await app.onFocusChanged((event) => {
+          if (!cancelled) focused.value = event.payload;
+        });
+        if (cancelled) {
+          stopResize();
+          stopFocus();
+          return;
+        }
+        stop = () => {
+          stopResize();
+          stopFocus();
+        };
+      } catch {
+        if (!cancelled) customChrome.value = false;
+      }
+    })();
+  });
+
+  onBeforeUnmount(() => {
+    cancelled = true;
+    stop?.();
+  });
+
+  async function minimize() {
+    if (!desktopShell()) return;
+    try {
+      await (await currentWindow()).minimize();
+    } catch {
+      /* leave the button in place when the window command is refused */
+    }
+  }
+
+  async function toggleMaximize() {
+    if (!desktopShell()) return;
+    try {
+      const app = await currentWindow();
+      await app.toggleMaximize();
+      maximized.value = await app.isMaximized();
+    } catch {
+      /* leave the button in place when the window command is refused */
+    }
+  }
+
+  async function close() {
+    if (!desktopShell()) return;
+    try {
+      await (await currentWindow()).close();
+    } catch {
+      /* leave the button in place when the window command is refused */
+    }
+  }
+
+  return { customChrome, maximized, focused, minimize, toggleMaximize, close };
+}

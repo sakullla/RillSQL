@@ -1,4 +1,5 @@
 import type { CatalogConnection } from "../catalog/types";
+import { engineMeta } from "../connections/model";
 import { CONNECTION_STATUS_TEXT } from "../shell/status-text";
 
 export const SQL_KEYWORDS = [
@@ -108,8 +109,18 @@ export interface TargetOption {
   name: string;
   database: string;
   engine: CatalogConnection["engine"];
+  envLabel: string;
+  envTone: CatalogConnection["envTone"];
   status: CatalogConnection["status"];
   label: string;
+}
+
+/** Engine name, environment, and connection state. Same host and database stay distinguishable. */
+export function targetDetail(option: TargetOption): string {
+  const parts = [engineMeta(option.engine).label];
+  if (option.envTone !== "none" && option.envLabel) parts.push(option.envLabel);
+  if (option.status !== "connected") parts.push(CONNECTION_STATUS_TEXT[option.status]);
+  return parts.join(" · ");
 }
 
 export function targetKey(connectionId: string, database: string): string {
@@ -129,6 +140,8 @@ export function targetOptions(connections: CatalogConnection[]): TargetOption[] 
         name: connection.name,
         database: database.name,
         engine: connection.engine,
+        envLabel: connection.envLabel,
+        envTone: connection.envTone,
         status: connection.status,
         label: `${connection.name} / ${database.name || "main"}`,
       });

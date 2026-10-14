@@ -1,10 +1,28 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import ExplorerTree from "../catalog/ExplorerTree.vue";
+import type { CatalogObjectRef } from "../catalog/object-ref";
 import Icon from "./Icon.vue";
 
 defineProps<{ width: number }>();
-const emit = defineEmits<{ resize: [width: number] }>();
+const emit = defineEmits<{
+  resize: [width: number];
+  "open-object": [object: CatalogObjectRef, pane: "data" | "structure", section?: "columns" | "drop"];
+  "query-object": [object: CatalogObjectRef, sql: string];
+  "focused-database": [connectionId: string, database: string];
+}>();
+
+function forwardOpen(object: CatalogObjectRef, pane: "data" | "structure", section?: "columns" | "drop") {
+  emit("open-object", object, pane, section);
+}
+
+function forwardQuery(object: CatalogObjectRef, sql: string) {
+  emit("query-object", object, sql);
+}
+
+function forwardFocus(connectionId: string, database: string) {
+  emit("focused-database", connectionId, database);
+}
 const filter = ref("");
 
 function onPointerDown(event: PointerEvent) {
@@ -31,7 +49,7 @@ function onPointerDown(event: PointerEvent) {
       <Icon name="search" />
       <input v-model="filter" type="search" placeholder="筛选表" aria-label="筛选表" />
     </label>
-    <ExplorerTree :filter="filter" />
+    <ExplorerTree :filter="filter" @open-object="forwardOpen" @query-object="forwardQuery" @focused-database="forwardFocus" />
   </aside>
   <div
     class="sb-resizer"

@@ -1,4 +1,6 @@
+#[cfg(test)]
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::Mutex;
 
 #[derive(Debug, thiserror::Error)]
@@ -57,17 +59,20 @@ impl SecretStore for KeyringStore {
     }
 }
 
+#[cfg(test)]
 #[derive(Default)]
 pub struct MemoryStore {
     values: Mutex<HashMap<String, String>>,
 }
 
+#[cfg(test)]
 impl MemoryStore {
     pub fn dump(&self) -> Vec<(String, String)> {
         self.values.lock().expect("secret map").iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
 }
 
+#[cfg(test)]
 impl SecretStore for MemoryStore {
     fn put(&self, account: &str, secret: &str) -> Result<(), SecretError> {
         self.values
@@ -87,9 +92,11 @@ impl SecretStore for MemoryStore {
     }
 }
 
+#[cfg(test)]
 #[derive(Default)]
 pub struct UnavailableStore;
 
+#[cfg(test)]
 impl SecretStore for UnavailableStore {
     fn put(&self, _account: &str, _secret: &str) -> Result<(), SecretError> {
         Err(SecretError::Unavailable("Secret Service 未运行".to_owned()))

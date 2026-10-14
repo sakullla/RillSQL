@@ -30,13 +30,13 @@ requirement_ids:
   - R25
 requirement_revision: 1
 revision_fence: null
-status: active
+status: closed
 stages:
   exploration: completed
   solution: completed
   plan: completed
   execution: completed
-  delivery: active
+  delivery: completed
 gates:
   solution: confirmed
 schedule_pending: false
@@ -310,6 +310,6 @@ tasks:
     history_count: 2
 blocker: null
 delivery:
-  status: pending
+  status: completed
 plan_input_digest: sha256:69ee7131170ccb725ac344bc528b1fd74a0bc612f0051c225a4a16c0889e13d5
-result_inbox_ref: evidence/results/sha256-5575ffa66a9ed47eadd30c45c229cda1b510cf1e1b5b43c0204aa687740e9cba.json
+result_inbox_ref: evidence/results/sha256-5d63bd9fe3166102cb189eea6171307600ad06f009110b722337cb9e6fc12a5c.json

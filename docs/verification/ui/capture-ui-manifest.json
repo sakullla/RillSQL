@@ -1,0 +1,685 @@
+{
+  "capturedAt": "2026-10-14T12:14:32.647Z",
+  "synthetic": true,
+  "invocation": "node scripts/capture-ui.mjs",
+  "previewUrl": "http://localhost:1420",
+  "matrix": {
+    "themes": [
+      "light",
+      "dark"
+    ],
+    "widths": [
+      1360,
+      900,
+      640
+    ]
+  },
+  "selectedScenarios": [
+    "welcome",
+    "connections",
+    "connection-editor",
+    "connection-ssh",
+    "query",
+    "data-grid",
+    "structure",
+    "export",
+    "history",
+    "settings",
+    "command-palette",
+    "shortcuts"
+  ],
+  "missing": [],
+  "success": true,
+  "imageCount": 72,
+  "captures": [
+    {
+      "name": "welcome",
+      "title": "欢迎页与资源管理器",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "welcome-light-1360.png",
+      "state": "已连接的 PostgreSQL 树和欢迎页"
+    },
+    {
+      "name": "connections",
+      "title": "连接管理",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "connections-light-1360.png",
+      "state": "已连接、未保存密码、SQLite 文件三种卡片"
+    },
+    {
+      "name": "connection-editor",
+      "title": "编辑连接",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "connection-editor-light-1360.png",
+      "state": "PostgreSQL、TLS 验证和 SSH 路径"
+    },
+    {
+      "name": "connection-ssh",
+      "title": "SSH 隧道",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "connection-ssh-light-1360.png",
+      "state": "单跳隧道和已信任的主机密钥"
+    },
+    {
+      "name": "query",
+      "title": "查询结果",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "query-light-1360.png",
+      "state": "选择执行目标后的查询结果"
+    },
+    {
+      "name": "data-grid",
+      "title": "数据表格",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "data-grid-light-1360.png",
+      "state": "orders 已读取的三行，含 NULL"
+    },
+    {
+      "name": "structure",
+      "title": "表结构",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "structure-light-1360.png",
+      "state": "orders 的字段、类型和默认值"
+    },
+    {
+      "name": "export",
+      "title": "导出 CSV",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "export-light-1360.png",
+      "state": "已读取行和全表两种导出范围"
+    },
+    {
+      "name": "command-palette",
+      "title": "命令面板",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "command-palette-light-1360.png",
+      "state": "表、连接和命令"
+    },
+    {
+      "name": "shortcuts",
+      "title": "键盘快捷键",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "shortcuts-light-1360.png",
+      "state": "全局、编辑器和表格快捷键"
+    },
+    {
+      "name": "history",
+      "title": "查询历史",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "history-light-1360.png",
+      "state": "成功、失败，以及原连接已删除"
+    },
+    {
+      "name": "settings",
+      "title": "设置",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "settings-light-1360.png",
+      "state": "外观、读取批量和关于"
+    },
+    {
+      "name": "welcome",
+      "title": "欢迎页与资源管理器",
+      "theme": "dark",
+      "width": 1360,
+      "height": 1000,
+      "file": "welcome-dark-1360.png",
+      "state": "已连接的 PostgreSQL 树和欢迎页"
+    },
+    {
+      "name": "connections",
+      "title": "连接管理",
+      "theme": "dark",
+      "width": 1360,
+      "height": 1000,
+      "file": "connections-dark-1360.png",
+      "state": "已连接、未保存密码、SQLite 文件三种卡片"
+    },
+    {
+      "name": "connection-editor",
+      "title": "编辑连接",
+      "theme": "dark",
+      "width": 1360,
+      "height": 1000,
+      "file": "connection-editor-dark-1360.png",
+      "state": "PostgreSQL、TLS 验证和 SSH 路径"
+    },
+    {
+      "name": "connection-ssh",
+      "title": "SSH 隧道",
+      "theme": "dark",
+      "width": 1360,
+      "height": 1000,
+      "file": "connection-ssh-dark-1360.png",
+      "state": "单跳隧道和已信任的主机密钥"
+    },
+    {
+      "name": "query",
+      "title": "查询结果",
+      "theme": "dark",
+      "width": 1360,
+      "height": 1000,
+      "file": "query-dark-1360.png",
+      "state": "选择执行目标后的查询结果"
+    },
+    {
+      "name": "data-grid",
+      "title": "数据表格",
+      "theme": "dark",
+      "width": 1360,
+      "height": 1000,
+      "file": "data-grid-dark-1360.png",
+      "state": "orders 已读取的三行，含 NULL"
+    },
+    {
+      "name": "structure",
+      "title": "表结构",
+      "theme": "dark",
+      "width": 1360,
+      "height": 1000,
+      "file": "structure-dark-1360.png",
+      "state": "orders 的字段、类型和默认值"
+    },
+    {
+      "name": "export",
+      "title": "导出 CSV",
+      "theme": "dark",
+      "width": 1360,
+      "height": 1000,
+      "file": "export-dark-1360.png",
+      "state": "已读取行和全表两种导出范围"
+    },
+    {
+      "name": "command-palette",
+      "title": "命令面板",
+      "theme": "dark",
+      "width": 1360,
+      "height": 1000,
+      "file": "command-palette-dark-1360.png",
+      "state": "表、连接和命令"
+    },
+    {
+      "name": "shortcuts",
+      "title": "键盘快捷键",
+      "theme": "dark",
+      "width": 1360,
+      "height": 1000,
+      "file": "shortcuts-dark-1360.png",
+      "state": "全局、编辑器和表格快捷键"
+    },
+    {
+      "name": "history",
+      "title": "查询历史",
+      "theme": "dark",
+      "width": 1360,
+      "height": 1000,
+      "file": "history-dark-1360.png",
+      "state": "成功、失败，以及原连接已删除"
+    },
+    {
+      "name": "settings",
+      "title": "设置",
+      "theme": "dark",
+      "width": 1360,
+      "height": 1000,
+      "file": "settings-dark-1360.png",
+      "state": "外观、读取批量和关于"
+    },
+    {
+      "name": "welcome",
+      "title": "欢迎页与资源管理器",
+      "theme": "light",
+      "width": 900,
+      "height": 1000,
+      "file": "welcome-light-900.png",
+      "state": "已连接的 PostgreSQL 树和欢迎页"
+    },
+    {
+      "name": "connections",
+      "title": "连接管理",
+      "theme": "light",
+      "width": 900,
+      "height": 1000,
+      "file": "connections-light-900.png",
+      "state": "已连接、未保存密码、SQLite 文件三种卡片"
+    },
+    {
+      "name": "connection-editor",
+      "title": "编辑连接",
+      "theme": "light",
+      "width": 900,
+      "height": 1000,
+      "file": "connection-editor-light-900.png",
+      "state": "PostgreSQL、TLS 验证和 SSH 路径"
+    },
+    {
+      "name": "connection-ssh",
+      "title": "SSH 隧道",
+      "theme": "light",
+      "width": 900,
+      "height": 1000,
+      "file": "connection-ssh-light-900.png",
+      "state": "单跳隧道和已信任的主机密钥"
+    },
+    {
+      "name": "query",
+      "title": "查询结果",
+      "theme": "light",
+      "width": 900,
+      "height": 1000,
+      "file": "query-light-900.png",
+      "state": "选择执行目标后的查询结果"
+    },
+    {
+      "name": "data-grid",
+      "title": "数据表格",
+      "theme": "light",
+      "width": 900,
+      "height": 1000,
+      "file": "data-grid-light-900.png",
+      "state": "orders 已读取的三行，含 NULL"
+    },
+    {
+      "name": "structure",
+      "title": "表结构",
+      "theme": "light",
+      "width": 900,
+      "height": 1000,
+      "file": "structure-light-900.png",
+      "state": "orders 的字段、类型和默认值"
+    },
+    {
+      "name": "export",
+      "title": "导出 CSV",
+      "theme": "light",
+      "width": 900,
+      "height": 1000,
+      "file": "export-light-900.png",
+      "state": "已读取行和全表两种导出范围"
+    },
+    {
+      "name": "command-palette",
+      "title": "命令面板",
+      "theme": "light",
+      "width": 900,
+      "height": 1000,
+      "file": "command-palette-light-900.png",
+      "state": "表、连接和命令"
+    },
+    {
+      "name": "shortcuts",
+      "title": "键盘快捷键",
+      "theme": "light",
+      "width": 900,
+      "height": 1000,
+      "file": "shortcuts-light-900.png",
+      "state": "全局、编辑器和表格快捷键"
+    },
+    {
+      "name": "history",
+      "title": "查询历史",
+      "theme": "light",
+      "width": 900,
+      "height": 1000,
+      "file": "history-light-900.png",
+      "state": "成功、失败，以及原连接已删除"
+    },
+    {
+      "name": "settings",
+      "title": "设置",
+      "theme": "light",
+      "width": 900,
+      "height": 1000,
+      "file": "settings-light-900.png",
+      "state": "外观、读取批量和关于"
+    },
+    {
+      "name": "welcome",
+      "title": "欢迎页与资源管理器",
+      "theme": "dark",
+      "width": 900,
+      "height": 1000,
+      "file": "welcome-dark-900.png",
+      "state": "已连接的 PostgreSQL 树和欢迎页"
+    },
+    {
+      "name": "connections",
+      "title": "连接管理",
+      "theme": "dark",
+      "width": 900,
+      "height": 1000,
+      "file": "connections-dark-900.png",
+      "state": "已连接、未保存密码、SQLite 文件三种卡片"
+    },
+    {
+      "name": "connection-editor",
+      "title": "编辑连接",
+      "theme": "dark",
+      "width": 900,
+      "height": 1000,
+      "file": "connection-editor-dark-900.png",
+      "state": "PostgreSQL、TLS 验证和 SSH 路径"
+    },
+    {
+      "name": "connection-ssh",
+      "title": "SSH 隧道",
+      "theme": "dark",
+      "width": 900,
+      "height": 1000,
+      "file": "connection-ssh-dark-900.png",
+      "state": "单跳隧道和已信任的主机密钥"
+    },
+    {
+      "name": "query",
+      "title": "查询结果",
+      "theme": "dark",
+      "width": 900,
+      "height": 1000,
+      "file": "query-dark-900.png",
+      "state": "选择执行目标后的查询结果"
+    },
+    {
+      "name": "data-grid",
+      "title": "数据表格",
+      "theme": "dark",
+      "width": 900,
+      "height": 1000,
+      "file": "data-grid-dark-900.png",
+      "state": "orders 已读取的三行，含 NULL"
+    },
+    {
+      "name": "structure",
+      "title": "表结构",
+      "theme": "dark",
+      "width": 900,
+      "height": 1000,
+      "file": "structure-dark-900.png",
+      "state": "orders 的字段、类型和默认值"
+    },
+    {
+      "name": "export",
+      "title": "导出 CSV",
+      "theme": "dark",
+      "width": 900,
+      "height": 1000,
+      "file": "export-dark-900.png",
+      "state": "已读取行和全表两种导出范围"
+    },
+    {
+      "name": "command-palette",
+      "title": "命令面板",
+      "theme": "dark",
+      "width": 900,
+      "height": 1000,
+      "file": "command-palette-dark-900.png",
+      "state": "表、连接和命令"
+    },
+    {
+      "name": "shortcuts",
+      "title": "键盘快捷键",
+      "theme": "dark",
+      "width": 900,
+      "height": 1000,
+      "file": "shortcuts-dark-900.png",
+      "state": "全局、编辑器和表格快捷键"
+    },
+    {
+      "name": "history",
+      "title": "查询历史",
+      "theme": "dark",
+      "width": 900,
+      "height": 1000,
+      "file": "history-dark-900.png",
+      "state": "成功、失败，以及原连接已删除"
+    },
+    {
+      "name": "settings",
+      "title": "设置",
+      "theme": "dark",
+      "width": 900,
+      "height": 1000,
+      "file": "settings-dark-900.png",
+      "state": "外观、读取批量和关于"
+    },
+    {
+      "name": "welcome",
+      "title": "欢迎页与资源管理器",
+      "theme": "light",
+      "width": 640,
+      "height": 1000,
+      "file": "welcome-light-640.png",
+      "state": "已连接的 PostgreSQL 树和欢迎页"
+    },
+    {
+      "name": "connections",
+      "title": "连接管理",
+      "theme": "light",
+      "width": 640,
+      "height": 1000,
+      "file": "connections-light-640.png",
+      "state": "已连接、未保存密码、SQLite 文件三种卡片"
+    },
+    {
+      "name": "connection-editor",
+      "title": "编辑连接",
+      "theme": "light",
+      "width": 640,
+      "height": 1000,
+      "file": "connection-editor-light-640.png",
+      "state": "PostgreSQL、TLS 验证和 SSH 路径"
+    },
+    {
+      "name": "connection-ssh",
+      "title": "SSH 隧道",
+      "theme": "light",
+      "width": 640,
+      "height": 1000,
+      "file": "connection-ssh-light-640.png",
+      "state": "单跳隧道和已信任的主机密钥"
+    },
+    {
+      "name": "query",
+      "title": "查询结果",
+      "theme": "light",
+      "width": 640,
+      "height": 1000,
+      "file": "query-light-640.png",
+      "state": "选择执行目标后的查询结果"
+    },
+    {
+      "name": "data-grid",
+      "title": "数据表格",
+      "theme": "light",
+      "width": 640,
+      "height": 1000,
+      "file": "data-grid-light-640.png",
+      "state": "orders 已读取的三行，含 NULL"
+    },
+    {
+      "name": "structure",
+      "title": "表结构",
+      "theme": "light",
+      "width": 640,
+      "height": 1000,
+      "file": "structure-light-640.png",
+      "state": "orders 的字段、类型和默认值"
+    },
+    {
+      "name": "export",
+      "title": "导出 CSV",
+      "theme": "light",
+      "width": 640,
+      "height": 1000,
+      "file": "export-light-640.png",
+      "state": "已读取行和全表两种导出范围"
+    },
+    {
+      "name": "command-palette",
+      "title": "命令面板",
+      "theme": "light",
+      "width": 640,
+      "height": 1000,
+      "file": "command-palette-light-640.png",
+      "state": "表、连接和命令"
+    },
+    {
+      "name": "shortcuts",
+      "title": "键盘快捷键",
+      "theme": "light",
+      "width": 640,
+      "height": 1000,
+      "file": "shortcuts-light-640.png",
+      "state": "全局、编辑器和表格快捷键"
+    },
+    {
+      "name": "history",
+      "title": "查询历史",
+      "theme": "light",
+      "width": 640,
+      "height": 1000,
+      "file": "history-light-640.png",
+      "state": "成功、失败，以及原连接已删除"
+    },
+    {
+      "name": "settings",
+      "title": "设置",
+      "theme": "light",
+      "width": 640,
+      "height": 1000,
+      "file": "settings-light-640.png",
+      "state": "外观、读取批量和关于"
+    },
+    {
+      "name": "welcome",
+      "title": "欢迎页与资源管理器",
+      "theme": "dark",
+      "width": 640,
+      "height": 1000,
+      "file": "welcome-dark-640.png",
+      "state": "已连接的 PostgreSQL 树和欢迎页"
+    },
+    {
+      "name": "connections",
+      "title": "连接管理",
+      "theme": "dark",
+      "width": 640,
+      "height": 1000,
+      "file": "connections-dark-640.png",
+      "state": "已连接、未保存密码、SQLite 文件三种卡片"
+    },
+    {
+      "name": "connection-editor",
+      "title": "编辑连接",
+      "theme": "dark",
+      "width": 640,
+      "height": 1000,
+      "file": "connection-editor-dark-640.png",
+      "state": "PostgreSQL、TLS 验证和 SSH 路径"
+    },
+    {
+      "name": "connection-ssh",
+      "title": "SSH 隧道",
+      "theme": "dark",
+      "width": 640,
+      "height": 1000,
+      "file": "connection-ssh-dark-640.png",
+      "state": "单跳隧道和已信任的主机密钥"
+    },
+    {
+      "name": "query",
+      "title": "查询结果",
+      "theme": "dark",
+      "width": 640,
+      "height": 1000,
+      "file": "query-dark-640.png",
+      "state": "选择执行目标后的查询结果"
+    },
+    {
+      "name": "data-grid",
+      "title": "数据表格",
+      "theme": "dark",
+      "width": 640,
+      "height": 1000,
+      "file": "data-grid-dark-640.png",
+      "state": "orders 已读取的三行，含 NULL"
+    },
+    {
+      "name": "structure",
+      "title": "表结构",
+      "theme": "dark",
+      "width": 640,
+      "height": 1000,
+      "file": "structure-dark-640.png",
+      "state": "orders 的字段、类型和默认值"
+    },
+    {
+      "name": "export",
+      "title": "导出 CSV",
+      "theme": "dark",
+      "width": 640,
+      "height": 1000,
+      "file": "export-dark-640.png",
+      "state": "已读取行和全表两种导出范围"
+    },
+    {
+      "name": "command-palette",
+      "title": "命令面板",
+      "theme": "dark",
+      "width": 640,
+      "height": 1000,
+      "file": "command-palette-dark-640.png",
+      "state": "表、连接和命令"
+    },
+    {
+      "name": "shortcuts",
+      "title": "键盘快捷键",
+      "theme": "dark",
+      "width": 640,
+      "height": 1000,
+      "file": "shortcuts-dark-640.png",
+      "state": "全局、编辑器和表格快捷键"
+    },
+    {
+      "name": "history",
+      "title": "查询历史",
+      "theme": "dark",
+      "width": 640,
+      "height": 1000,
+      "file": "history-dark-640.png",
+      "state": "成功、失败，以及原连接已删除"
+    },
+    {
+      "name": "settings",
+      "title": "设置",
+      "theme": "dark",
+      "width": 640,
+      "height": 1000,
+      "file": "settings-dark-640.png",
+      "state": "外观、读取批量和关于"
+    }
+  ],
+  "failures": []
+}

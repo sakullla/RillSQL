@@ -1,5 +1,5 @@
 export type Engine = "mysql" | "mariadb" | "postgres" | "sqlite";
-export type EnvLabel = "dev" | "test" | "prod" | "local" | "none";
+export type EnvTone = "dev" | "test" | "prod" | "local";
 export type TlsMode = "off" | "require" | "verify";
 export type CaMode = "system" | "file";
 export type SshAuth = "password" | "key";
@@ -8,7 +8,7 @@ export interface ConnectionDraft {
   id?: string;
   name: string;
   engine: Engine;
-  env: EnvLabel;
+  env: string;
   host: string;
   port: string;
   database: string;
@@ -55,7 +55,7 @@ export interface SavedConnection {
   id: string;
   name: string;
   engine: Engine;
-  env: EnvLabel;
+  env: string;
   host?: string | null;
   port?: number | null;
   database?: string | null;
@@ -75,20 +75,31 @@ export const ENGINES: { id: Engine; label: string; short: string; port: string }
   { id: "sqlite", label: "SQLite", short: "SQL", port: "" },
 ];
 
-export const ENVS: { id: EnvLabel; label: string }[] = [
-  { id: "dev", label: "开发" },
-  { id: "test", label: "测试" },
-  { id: "prod", label: "生产" },
-  { id: "local", label: "本地" },
-  { id: "none", label: "无标签" },
+export const ENV_NONE = "none";
+
+export interface EnvTag {
+  id: string;
+  label: string;
+  tone: EnvTone;
+  position: number;
+}
+
+export const TONES: { id: EnvTone; label: string }[] = [
+  { id: "dev", label: "青绿" },
+  { id: "test", label: "蓝色" },
+  { id: "prod", label: "红色" },
+  { id: "local", label: "紫色" },
 ];
 
 export function engineMeta(engine: Engine) {
   return ENGINES.find((item) => item.id === engine) ?? ENGINES[0];
 }
 
-export function envLabel(env: EnvLabel): string {
-  return ENVS.find((item) => item.id === env)?.label ?? "无标签";
+export function presentEnv(env: string, tags: readonly EnvTag[]): { label: string; tone: EnvTone | "none" } {
+  if (!env || env === ENV_NONE) return { label: "无标签", tone: "none" };
+  const tag = tags.find((item) => item.id === env);
+  if (!tag) return { label: "无标签", tone: "none" };
+  return { label: tag.label, tone: tag.tone };
 }
 
 export function blankDraft(engine: Engine): ConnectionDraft {

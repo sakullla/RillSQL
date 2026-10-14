@@ -10,6 +10,7 @@ import { PRODUCT_TITLE } from "./product";
 import StatusBar from "./StatusBar.vue";
 import { CONNECTION_STATUS_TEXT, ENVIRONMENT_LABELS } from "./status-text";
 import TitleBar from "./TitleBar.vue";
+import { desktopShell } from "./window-chrome";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -25,6 +26,15 @@ describe("shell layout", () => {
     expect(title.text()).toContain("RillSQL");
     expect(title.text()).toContain("澄库");
     expect(title.find(".cmd-trigger").attributes("aria-label")).toBe("打开命令面板");
+    expect(desktopShell()).toBe(false);
+    expect(title.find(".caption").exists()).toBe(false);
+
+    const caption = mount(TitleBar, { props: { theme: "system", caption: true } });
+    expect(caption.get(".titlebar").attributes("data-tauri-drag-region")).toBe("deep");
+    expect(caption.get(".tb-actions").attributes("data-tauri-drag-region")).toBe("false");
+    expect(caption.get("[aria-label='最小化']").exists()).toBe(true);
+    expect(caption.get("[aria-label='最大化']").exists()).toBe(true);
+    expect(caption.get("[aria-label='关闭']").exists()).toBe(true);
 
     const bare = { id: "q", kind: "query" as const, title: "查询 1", targetText: null, path: null, draft: "", connectionId: null, connectionName: null, database: null, engine: null, connectionStatus: null, targetNotice: null };
     const status = mount(StatusBar, {
@@ -74,6 +84,8 @@ describe("shell layout", () => {
     const narrow = css.slice(css.indexOf("@media (max-width: 720px)"));
     expect(narrow).toContain(".rail-btn span { display: none; }");
     expect(css).toContain(".titlebar");
+    expect(css).toContain(".caption-close");
+    expect(css).toContain(".titlebar.custom-chrome");
     expect(css).toContain(".statusbar");
     expect(css).toContain("#palette");
   });

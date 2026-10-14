@@ -1,24 +1,33 @@
 use std::sync::Arc;
 
 use rustls::client::danger::ServerCertVerifier;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject};
-use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::RootCertStore;
+#[cfg(test)]
+use rustls::pki_types::{pem::PemObject, PrivateKeyDer};
+#[cfg(test)]
+use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
 
+#[cfg(test)]
 use crate::connections::model::TlsMode;
+#[cfg(test)]
 use crate::connections::route::{self, Retry};
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub enum CertFixture {
     DatabaseHost,
     LocalhostOnly,
 }
 
+#[cfg(test)]
 struct Material {
     ca: CertificateDer<'static>,
     chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 }
 
+#[cfg(test)]
 fn load(cert_pem: &str, key_pem: &str) -> Material {
     let ca = CertificateDer::from_pem_slice(include_str!("fixtures/ca.pem").as_bytes())
         .expect("测试 CA");
@@ -29,6 +38,7 @@ fn load(cert_pem: &str, key_pem: &str) -> Material {
     Material { ca, chain, key }
 }
 
+#[cfg(test)]
 fn material(fixture: CertFixture) -> Material {
     match fixture {
         CertFixture::DatabaseHost => load(include_str!("fixtures/db.pem"), include_str!("fixtures/db.key")),
@@ -38,10 +48,12 @@ fn material(fixture: CertFixture) -> Material {
     }
 }
 
+#[cfg(test)]
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+#[cfg(test)]
 fn server_config(fixture: CertFixture) -> Result<Arc<ServerConfig>, String> {
     let material = material(fixture);
     let config = ServerConfig::builder_with_provider(provider())
@@ -53,6 +65,7 @@ fn server_config(fixture: CertFixture) -> Result<Arc<ServerConfig>, String> {
     Ok(Arc::new(config))
 }
 
+#[cfg(test)]
 fn verifying_client() -> Result<Arc<ClientConfig>, String> {
     let material = material(CertFixture::DatabaseHost);
     let mut roots = RootCertStore::empty();
@@ -65,6 +78,7 @@ fn verifying_client() -> Result<Arc<ClientConfig>, String> {
     Ok(Arc::new(config))
 }
 
+#[cfg(test)]
 pub fn handshake(server_name: &str, fixture: CertFixture) -> Result<(), String> {
     let server_name = ServerName::try_from(server_name.to_owned()).map_err(|err| err.to_string())?;
     let mut client = ClientConnection::new(verifying_client()?, server_name).map_err(|err| err.to_string())?;
@@ -94,6 +108,7 @@ pub fn handshake(server_name: &str, fixture: CertFixture) -> Result<(), String> 
     Err("TLS 握手没有完成".to_owned())
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsAttempt {
     pub server_name: String,
@@ -101,11 +116,13 @@ pub struct TlsAttempt {
     pub transport_host: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct TlsSession {
     pub attempts: Vec<TlsAttempt>,
 }
 
+#[cfg(test)]
 impl TlsSession {
     /// 只按证书校验名握手一次。失败后不改名、不降级。
     pub fn perform(

@@ -59,6 +59,7 @@ pub trait DirectTcpOpener: Send + Sync {
     async fn open_direct_tcpip(&self, host: &str, port: u16) -> Result<Pipe, ForwardError>;
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenRecord {
     pub id: u64,
@@ -87,6 +88,7 @@ impl Forwarder {
 
     /// 每接受一条本地连接，就向数据库地址新开一条 direct-tcpip。
     /// `tls_server_name` 与 `bastion_host` 只用于约束调用方不要把它们当成通道目标。
+    #[cfg(test)]
     pub async fn serve_n<O: DirectTcpOpener + 'static>(
         self,
         opener: Arc<O>,
@@ -146,12 +148,14 @@ async fn copy_both(mut local: TcpStream, mut remote: Pipe) -> Result<(), Forward
     Ok(())
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 pub struct RecordingOpener {
     pub opens: Arc<std::sync::Mutex<Vec<OpenRecord>>>,
     next: Arc<std::sync::atomic::AtomicU64>,
 }
 
+#[cfg(test)]
 impl RecordingOpener {
     pub fn new() -> Self {
         Self {
@@ -161,6 +165,7 @@ impl RecordingOpener {
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl DirectTcpOpener for RecordingOpener {
     async fn open_direct_tcpip(&self, host: &str, port: u16) -> Result<Pipe, ForwardError> {

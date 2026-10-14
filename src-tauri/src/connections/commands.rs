@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::connections::model::{ConnectionDraft, FieldError, Secret, SecretInput};
+use crate::connections::model::{ConnectionDraft, EnvTag, FieldError, Secret, SecretInput};
 use crate::connections::secrets::KeyringStore;
 use crate::connections::service::{self, ConnectionRecord, DeleteOutcome, OpenOutcome, SaveOutcome, Service, ServiceError};
 use crate::connections::stages::TestReport;
@@ -61,6 +61,26 @@ fn secrets_from(password: Option<String>, ssh_password: Option<String>, ssh_pass
         ssh_passphrase: ssh_passphrase.map(Secret::new),
         save_password,
     }
+}
+
+#[tauri::command]
+pub async fn env_tags_list(state: tauri::State<'_, ConnectionsState>) -> Result<Vec<EnvTag>, CommandError> {
+    state.service.list_tags().await.map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn env_tags_save(
+    state: tauri::State<'_, ConnectionsState>,
+    id: Option<String>,
+    label: String,
+    tone: String,
+) -> Result<EnvTag, CommandError> {
+    state.service.save_tag(id, label, tone).await.map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn env_tags_delete(state: tauri::State<'_, ConnectionsState>, id: String) -> Result<(), CommandError> {
+    state.service.delete_tag(&id).await.map_err(CommandError::from)
 }
 
 #[tauri::command]
@@ -123,6 +143,11 @@ pub async fn connections_open(
 pub async fn connections_disconnect(state: tauri::State<'_, ConnectionsState>, id: String) -> Result<(), CommandError> {
     state.service.disconnect(&id);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn connections_focus_database(state: tauri::State<'_, ConnectionsState>, id: String, database: String) -> Result<(), CommandError> {
+    state.service.focus_database(&id, &database).await.map_err(CommandError::from)
 }
 
 #[tauri::command]

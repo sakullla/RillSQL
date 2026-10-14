@@ -61,7 +61,13 @@ pub struct ObjectRow {
     pub stale: bool,
 }
 
+/// 负数表示估算未知。PostgreSQL 的 `reltuples` 在从未 ANALYZE 时是 -1，不是行数。
+pub(crate) fn known_row_estimate(value: Option<i64>) -> Option<i64> {
+    value.filter(|rows| *rows >= 0)
+}
+
 impl ObjectRow {
+    #[cfg(test)]
     pub fn table(name: impl Into<String>, estimated_rows: Option<i64>) -> Self {
         Self {
             name: name.into(),
@@ -71,6 +77,7 @@ impl ObjectRow {
         }
     }
 
+    #[cfg(test)]
     pub fn view(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),

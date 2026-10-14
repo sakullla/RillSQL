@@ -42,8 +42,13 @@ function shownLabel(): string {
 function objectMeta(object: CatalogObject): string {
   if (object.stale) return "";
   if (object.kind === "view") return "视图";
-  if (object.estimatedRows === null) return "";
-  return object.estimatedRows >= 1000 ? `${(object.estimatedRows / 1000).toFixed(object.estimatedRows >= 10000 ? 0 : 1)}k` : String(object.estimatedRows);
+  return knownEstimate(object.estimatedRows);
+}
+
+/** 负数是未知估算。PostgreSQL 的 reltuples 在从未分析时为 -1，不是行数。 */
+function knownEstimate(value: number | null): string {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return "";
+  return value >= 1000 ? `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)}k` : String(value);
 }
 
 function emptyLabel(): string {
@@ -71,6 +76,7 @@ function emptyLabel(): string {
       role="treeitem"
       data-level="object"
       :data-object="object.name"
+      :data-kind="object.kind"
       :data-schema="schema.name"
       :data-database="database"
       :data-stale="object.stale ? 'true' : 'false'"

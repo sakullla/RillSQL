@@ -155,6 +155,7 @@ pub fn on_tls_failure(_plan_mode: TlsMode) -> Retry {
     }
 }
 
+#[cfg(test)]
 pub fn channel_target(route: &Route) -> Option<(String, u16)> {
     Some((
         route.channel_target_host.clone()?,

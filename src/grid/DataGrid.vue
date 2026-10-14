@@ -2,7 +2,7 @@
 import { computed, reactive, ref, watch } from "vue";
 import ExportDialog from "../export/ExportDialog.vue";
 import { planExport, type ExportScope } from "../export/plan";
-import { runRemoteExport } from "../export/tasks";
+import { failIdleRemoteExports, runExportTask, runRemoteExport } from "../export/tasks";
 import type { CsvOptions } from "../export/csv";
 import { loadSettings } from "../shell/settings";
 import { copyPlain, copySqlValue, previewText, showCell, type NullCopy } from "./display";
@@ -26,6 +26,7 @@ const filterOp = ref<FilterOp>("eq");
 const filterValue = ref("");
 const filterError = ref("");
 const exportOpen = ref(false);
+const exportMessage = ref("");
 const commitOpen = ref(false);
 const editing = ref<{ id: string; column: string; draft: string; isNull: boolean } | null>(null);
 const copyMessage = ref("");
@@ -146,12 +147,29 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
     truncated: session.truncated,
     fileName: payload.path,
   });
-  void runRemoteExport({
+  exportOpen.value = false;
+  if (payload.scope === "loaded") {
+    failIdleRemoteExports("没有等到数据库返回。已读取的行改为直接下载。");
+    const columns = session.store.schema.columns.map((column) => column.name);
+    void runExportTask({
+      plan,
+      acknowledged: payload.acknowledged,
+      path: plan.fileName,
+      columns,
+      rows: session.loaded.map((row) => ({ ...row.cells })),
+      csv: payload.csv,
+    }).then(({ result }) => {
+      exportMessage.value = result.message;
+    });
+    return;
+  }
+  exportMessage.value = "正在从已打开的连接导出全部匹配行。";
+  const { done } = runRemoteExport({
     plan,
     acknowledged: payload.acknowledged,
     path: plan.fileName,
     csv: payload.csv,
-    mode: payload.scope === "full" ? "table-full" : "table-loaded",
+    mode: "table-full",
     connectionId: session.target.connectionId,
     database: session.target.database,
     schema: session.target.schema,
@@ -159,11 +177,13 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
     engine: session.target.engine,
     filters: session.filters,
     sort: session.sort,
-    limit: payload.scope === "loaded" ? session.loaded.length : 0,
+    limit: 0,
     truncated: session.truncated,
     statement: "",
   });
-  exportOpen.value = false;
+  void done.then((task) => {
+    exportMessage.value = task.message;
+  });
 }
 </script>
 
@@ -198,6 +218,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
     </div>
     <p v-if="session.filters.length || session.sort" class="sql-strip"><code>{{ session.sql }}</code></p>
     <p v-if="filterError" class="grid-alert" role="alert">{{ filterError }}</p>
+    <p v-if="exportMessage" class="hint" role="status">{{ exportMessage }}</p>
     <p v-if="session.error" class="grid-alert" role="alert">读取失败：{{ session.error }}。这不是无匹配结果。筛选条件仍保留。</p>
     <div class="grid-scroll" @scroll="onScroll">
       <div :style="{ height: `${padTop}px` }"></div>

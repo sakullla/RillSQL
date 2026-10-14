@@ -113,6 +113,7 @@ pub fn is_write(sql: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 pub fn statement_at(sql: &str, cursor: usize) -> Option<Piece> {
     let pieces = split_sql(sql);
     if let Some(found) = pieces.iter().find(|piece| cursor >= piece.start && cursor <= piece.end) {

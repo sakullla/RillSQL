@@ -55,7 +55,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
             rejectReason: "查询结果没有绑定已打开的连接，不能把已加载行当成全量导出。",
           }
         : plan;
-      runExportTask({
+      void runExportTask({
         plan: blocked,
         acknowledged: payload.acknowledged,
         path: plan.fileName,
@@ -85,7 +85,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
     exportOpen.value = false;
     return;
   }
-  runExportTask({
+  void runExportTask({
     plan,
     acknowledged: payload.acknowledged,
     path: plan.fileName,

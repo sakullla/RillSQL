@@ -1,7 +1,7 @@
 export const DEFAULT_OBJECT_PAGE = 100;
 
 export type Engine = "postgres" | "mysql" | "mariadb" | "sqlite";
-export type EnvLabel = "dev" | "test" | "prod" | "local" | "none";
+export type EnvTone = "dev" | "test" | "prod" | "local" | "none";
 export type ConnStatus = "connected" | "disconnected" | "connecting" | "error" | "lost";
 export type ObjectKind = "table" | "view";
 
@@ -29,8 +29,9 @@ export interface CatalogConnection {
   id: string;
   name: string;
   engine: Engine;
-  env: EnvLabel;
+  env: string;
   envLabel: string;
+  envTone: EnvTone;
   status: ConnStatus;
   defaultDatabase: string | null;
   foreignKeys: boolean | null;

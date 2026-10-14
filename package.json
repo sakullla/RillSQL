@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",
-    "typecheck": "vue-tsc --noEmit"
+    "typecheck": "vue-tsc --noEmit",
+    "capture:ui": "node scripts/capture-ui.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "6.20.3",
@@ -27,6 +28,7 @@
     "vue": "3.5.44"
   },
   "devDependencies": {
+    "@playwright/test": "1.63.0",
     "@tauri-apps/cli": "2.12.2",
     "@types/node": "26.6.5",
     "@vitejs/plugin-vue": "6.0.10",

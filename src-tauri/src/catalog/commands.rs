@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::model::{ConnStatus, Engine, ObjectKind, ObjectRow};
+use crate::catalog::model::{known_row_estimate, ConnStatus, Engine, ObjectKind, ObjectRow};
 use crate::catalog::read::{self, ObjectWindow};
 use crate::connections::commands::ConnectionsState;
+use crate::connections::model::{EnvTag, ENV_NONE};
 use crate::connections::{CatalogSession, Service};
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +49,7 @@ pub struct CatalogDto {
     pub engine: String,
     pub env: String,
     pub env_label: String,
+    pub env_tone: String,
     pub status: &'static str,
     pub default_database: Option<String>,
     pub foreign_keys: Option<bool>,
@@ -65,6 +67,7 @@ pub struct PageDto {
 
 pub(crate) async fn load_catalog(service: &Service, page: usize, limits: &[ObjectLimit]) -> Result<Vec<CatalogDto>, String> {
     let saved = service.list().await?;
+    let tags = service.list_tags().await?;
     let mut catalogs = Vec::with_capacity(saved.len());
     for record in saved {
         let engine = map_engine(record.saved.engine);
@@ -87,12 +90,14 @@ pub(crate) async fn load_catalog(service: &Service, page: usize, limits: &[Objec
                 databases: Vec::new(),
             },
         };
+        let (env_label, env_tone) = describe_env(&tags, &record.saved.env);
         catalogs.push(CatalogDto {
             id: record.saved.id,
             name: record.saved.name,
             engine: engine.as_str().to_owned(),
-            env: record.saved.env.as_str().to_owned(),
-            env_label: record.saved.env.label_zh().to_owned(),
+            env: record.saved.env,
+            env_label,
+            env_tone,
             status: if connected {
                 ConnStatus::Connected
             } else {
@@ -147,6 +152,16 @@ pub async fn catalog_page(
     Ok(page_for_session(session.as_ref(), &database, &schema, offset, limit).await)
 }
 
+fn describe_env(tags: &[EnvTag], id: &str) -> (String, String) {
+    if id.is_empty() || id == ENV_NONE {
+        return ("无标签".to_owned(), ENV_NONE.to_owned());
+    }
+    match tags.iter().find(|tag| tag.id == id) {
+        Some(tag) => (tag.label.clone(), tag.tone.clone()),
+        None => ("无标签".to_owned(), ENV_NONE.to_owned()),
+    }
+}
+
 fn map_engine(engine: crate::connections::model::Engine) -> Engine {
     match engine {
         crate::connections::model::Engine::Postgres => Engine::Postgres,
@@ -196,7 +211,32 @@ fn object_dto(object: &ObjectRow) -> ObjectDto {
             ObjectKind::Table => "table",
             ObjectKind::View => "view",
         },
-        estimated_rows: object.estimated_rows,
+        estimated_rows: known_row_estimate(object.estimated_rows),
         stale: object.stale,
+    }
+}
+
+#[cfg(test)]
+mod estimate_tests {
+    use super::object_dto;
+    use crate::catalog::model::{ObjectKind, ObjectRow};
+
+    #[test]
+    fn negative_estimate_is_omitted_from_the_catalog_payload() {
+        let unknown = ObjectRow {
+            name: "customers".to_owned(),
+            kind: ObjectKind::Table,
+            estimated_rows: Some(-1),
+            stale: false,
+        };
+        let dto = object_dto(&unknown);
+        assert_eq!(dto.estimated_rows, None);
+        assert!(serde_json::to_value(&dto).unwrap()["estimatedRows"].is_null());
+
+        let empty = ObjectRow {
+            estimated_rows: Some(0),
+            ..unknown
+        };
+        assert_eq!(object_dto(&empty).estimated_rows, Some(0));
     }
 }

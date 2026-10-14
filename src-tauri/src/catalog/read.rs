@@ -3,7 +3,8 @@
 use mysql_async::prelude::Queryable;
 
 use crate::catalog::model::{
-    object_count_sql, metadata_sql, DatabaseNode, Engine, ObjectKind, ObjectRow, SchemaNode, DEFAULT_OBJECT_PAGE,
+    known_row_estimate, metadata_sql, object_count_sql, DatabaseNode, Engine, ObjectKind, ObjectRow, SchemaNode,
+    DEFAULT_OBJECT_PAGE,
 };
 use crate::connections::CatalogSession;
 
@@ -399,7 +400,7 @@ fn postgres_object(row: &tokio_postgres::Row) -> Result<ObjectRow, String> {
     Ok(ObjectRow {
         name,
         kind: object_kind(&kind),
-        estimated_rows: Some(estimated),
+        estimated_rows: known_row_estimate(Some(estimated)),
         stale: false,
     })
 }
@@ -423,7 +424,7 @@ fn mysql_object(row: &mysql_async::Row) -> Result<ObjectRow, String> {
     Ok(ObjectRow {
         name: mysql_string(row, 0)?,
         kind: object_kind(&mysql_string(row, 1)?),
-        estimated_rows: mysql_i64(row, 2),
+        estimated_rows: known_row_estimate(mysql_i64(row, 2)),
         stale: false,
     })
 }

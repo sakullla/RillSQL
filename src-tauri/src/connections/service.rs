@@ -8,12 +8,12 @@ use serde::{Deserialize, Serialize};
 use crate::connections::drivers::{self, TunnelFault};
 use crate::connections::hostkey::{self, HostKeyDecision, PresentedKey};
 use crate::connections::model::{
-    password_account, ssh_password_account, ConnectionDraft, Engine, FieldError, SavedConnection, Secret, SecretInput, SshAuthKind,
-    SshSettings, TlsMode,
+    password_account, ssh_password_account, validate_tag_label, ConnectionDraft, Engine, EnvTag, FieldError, SavedConnection, Secret, SecretInput,
+    SshAuthKind, SshSettings, TlsMode, ENV_NONE,
 };
 use crate::connections::route::{self, Route};
 use crate::connections::secrets::SecretStore;
-use crate::connections::stages::{self, StageError, StageKind, StageRunner, TestReport, TestStatus};
+use crate::connections::stages::{self, StageError, StageKind, StageRunner, StageStatus, TestReport, TestStatus};
 use crate::connections::store::{self, Store};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +169,7 @@ pub enum CatalogSession {
 pub struct Service {
     path: PathBuf,
     secrets: Arc<dyn SecretStore>,
+    #[cfg(test)]
     logs: Mutex<Vec<String>>,
     cell: tokio::sync::OnceCell<Store>,
     sessions: Mutex<HashMap<String, Session>>,
@@ -185,6 +186,7 @@ impl Service {
         Self {
             path,
             secrets,
+            #[cfg(test)]
             logs: Mutex::new(Vec::new()),
             cell: tokio::sync::OnceCell::new(),
             sessions: Mutex::new(HashMap::new()),
@@ -197,10 +199,12 @@ impl Service {
         &self.path
     }
 
+    #[cfg(test)]
     pub fn logs(&self) -> Vec<String> {
         self.logs.lock().expect("logs").clone()
     }
 
+    #[cfg(test)]
     pub fn is_connected(&self, id: &str) -> bool {
         self.sessions.lock().expect("sessions").contains_key(id)
     }
@@ -219,6 +223,57 @@ impl Service {
         Ok(records)
     }
 
+    pub async fn list_tags(&self) -> Result<Vec<EnvTag>, String> {
+        self.store().await?.list_tags().await.map_err(db_err)
+    }
+
+    pub async fn save_tag(&self, id: Option<String>, label: String, tone: String) -> Result<EnvTag, ServiceError> {
+        let label = validate_tag_label(&label).map_err(ServiceError::Message)?;
+        let tone = crate::connections::model::parse_tone(&tone)
+            .ok_or_else(|| ServiceError::Message("请选择标签颜色".to_owned()))?
+            .to_owned();
+        let store = self.store().await.map_err(ServiceError::Message)?;
+        let requested = id.unwrap_or_default();
+        let requested = requested.trim();
+        if requested == ENV_NONE {
+            return Err(ServiceError::Message("不能把无标签保存成环境标签".to_owned()));
+        }
+        let (id, position) = if requested.is_empty() {
+            let position = store.next_tag_position().await.map_err(|err| ServiceError::Message(db_err(err)))?;
+            (uuid::Uuid::new_v4().to_string(), position)
+        } else {
+            let existing = store
+                .tag(requested)
+                .await
+                .map_err(|err| ServiceError::Message(db_err(err)))?
+                .ok_or_else(|| ServiceError::Message("找不到这个环境标签".to_owned()))?;
+            (existing.id, existing.position)
+        };
+        if store
+            .label_taken(&label, &id)
+            .await
+            .map_err(|err| ServiceError::Message(db_err(err)))?
+        {
+            return Err(ServiceError::Message("已经有同名环境标签".to_owned()));
+        }
+        let tag = EnvTag { id, label, tone, position };
+        store.upsert_tag(&tag).await.map_err(|err| ServiceError::Message(db_err(err)))?;
+        Ok(tag)
+    }
+
+    pub async fn delete_tag(&self, id: &str) -> Result<(), String> {
+        let id = id.trim();
+        if id.is_empty() || id == ENV_NONE {
+            return Err("无标签不能删除".to_owned());
+        }
+        let store = self.store().await?;
+        if store.tag(id).await.map_err(db_err)?.is_none() {
+            return Err("找不到这个环境标签".to_owned());
+        }
+        store.delete_tag(id).await.map_err(db_err)?;
+        Ok(())
+    }
+
     pub async fn save(&self, draft: ConnectionDraft, input: SecretInput) -> Result<SaveOutcome, ServiceError> {
         let id = draft
             .id
@@ -228,6 +283,9 @@ impl Service {
         let mut saved = crate::connections::model::normalize(&draft, id).map_err(ServiceError::Fields)?;
         let store = self.store().await.map_err(ServiceError::Message)?;
         let existing = store.get(&saved.id).await.map_err(|err| ServiceError::Message(db_err(err)))?;
+        if saved.env != ENV_NONE && store.tag(&saved.env).await.map_err(|err| ServiceError::Message(db_err(err)))?.is_none() {
+            saved.env = ENV_NONE.to_owned();
+        }
         let mut notes = Vec::new();
         if saved.engine == Engine::Sqlite {
             saved.password_saved = false;
@@ -297,6 +355,30 @@ impl Service {
 
     pub async fn open(&self, id: &str, input: SecretInput) -> Result<OpenOutcome, String> {
         self.exercise(id, input, true).await
+    }
+
+    /// 把已经打开的 PostgreSQL 会话改连到同一个服务器上的另一个库。
+    /// 不改已保存的配置。连不上时保留原来的会话。
+    pub async fn focus_database(&self, id: &str, database: &str) -> Result<(), String> {
+        let database = database.trim();
+        if database.is_empty() {
+            return Err("需要数据库名。".to_owned());
+        }
+        let store = self.store().await?;
+        let config = store.get(id).await.map_err(db_err)?.ok_or_else(|| "找不到这条连接配置".to_owned())?;
+        if config.engine != Engine::Postgres {
+            return Err("只有 PostgreSQL 需要改连到另一个库。".to_owned());
+        }
+        if !self.sessions.lock().expect("sessions").contains_key(id) {
+            return Err("这条连接还没有打开。".to_owned());
+        }
+        let outcome = self
+            .exercise_overriding(id, SecretInput::default(), true, Some(database.to_owned()))
+            .await?;
+        if outcome.connected {
+            return Ok(());
+        }
+        Err(focus_failure(&outcome.report))
     }
 
     pub fn disconnect(&self, id: &str) {
@@ -381,8 +463,21 @@ impl Service {
     }
 
     async fn exercise(&self, id: &str, input: SecretInput, open: bool) -> Result<OpenOutcome, String> {
+        self.exercise_overriding(id, input, open, None).await
+    }
+
+    async fn exercise_overriding(
+        &self,
+        id: &str,
+        input: SecretInput,
+        open: bool,
+        database: Option<String>,
+    ) -> Result<OpenOutcome, String> {
         let store = self.store().await?;
-        let config = store.get(id).await.map_err(db_err)?.ok_or_else(|| "找不到这条连接配置".to_owned())?;
+        let mut config = store.get(id).await.map_err(db_err)?.ok_or_else(|| "找不到这条连接配置".to_owned())?;
+        if let Some(database) = database {
+            config.database = Some(database);
+        }
         let saved_fingerprint = match &config.ssh {
             Some(ssh) => store.host_key(&ssh.host, ssh.port).await.map_err(db_err)?,
             None => None,
@@ -469,7 +564,10 @@ impl Service {
     }
 
     fn log(&self, message: String) {
+        #[cfg(test)]
         self.logs.lock().expect("logs").push(message);
+        #[cfg(not(test))]
+        let _ = message;
     }
 
     pub fn open_session_ids(&self) -> Vec<String> {
@@ -927,6 +1025,17 @@ fn rank(stage: StageKind) -> u8 {
         StageKind::ServerVersion => 3,
         _ => 9,
     }
+}
+
+fn focus_failure(report: &TestReport) -> String {
+    let message = report
+        .stages
+        .iter()
+        .find(|stage| stage.status == StageStatus::Err)
+        .map(|stage| stage.message.as_str())
+        .filter(|message| !message.is_empty())
+        .unwrap_or("没有连上这个库");
+    format!("{message}。原来的会话还在。")
 }
 
 fn classify_db(error: &StageError) -> StageKind {

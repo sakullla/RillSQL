@@ -1,3 +1,4 @@
+import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -7,6 +8,7 @@ import { replaceCatalog, resetCatalog } from "../catalog/store";
 import { createSession } from "../shell/session";
 import type { RunDto } from "./api";
 import { completionPlan } from "./complete";
+import { resolveEditor } from "./editor";
 import QueryTab from "./QueryTab.vue";
 import { adoptRun, attachCloser, connectionBusy, guardClose, requestCancel, resetQueryRuntime, startTabRun, tabRun } from "./runtime";
 import { QUERY_EDITOR_KEYS, sqlToRun } from "./scope";
@@ -119,8 +121,9 @@ describe("query editing", () => {
     });
     await nextTick();
     expect(wrapper.get("[aria-label='查询']").attributes("data-tab-id")).toBe("query-1");
-    expect(wrapper.text()).toContain("执行目标");
-    expect(wrapper.text()).toContain("Shop / shop_staging");
+    expect(wrapper.get("[data-action='target']").attributes("aria-label")).toContain("执行目标");
+    expect(wrapper.get("[data-action='target']").text()).toContain("Shop / shop_staging");
+    expect(wrapper.get("[data-action='target']").text()).toContain("MY");
     expect(wrapper.text()).toContain("已连接");
     const view = EditorView.findFromDOM(wrapper.get(".cm-content").element);
     expect(view).toBeTruthy();
@@ -138,6 +141,166 @@ describe("query editing", () => {
     await wrapper.get("[data-action='run-current']").trigger("click");
     await flushPromises();
     expect(started().at(-1)).toMatchObject({ command: "query_start", sql: "SELECT 1;" });
+    wrapper.unmount();
+  });
+
+  it("marks each execution target with its engine when names match", async () => {
+    const rows = catalogFixture();
+    rows[0].name = "127.0.0.1";
+    rows[0].databases = [
+      { ...rows[0].databases[0], name: "postgres" },
+      { ...rows[0].databases[1], name: "rillsql" },
+    ];
+    rows[1].name = "127.0.0.1";
+    rows[1].databases[0].name = "rillsql";
+    replaceCatalog(rows);
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-target",
+        draft: "",
+        connectionId: "shop",
+        connectionName: "127.0.0.1",
+        database: "rillsql",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    await wrapper.get("[data-action='target']").trigger("click");
+    const choices = wrapper.findAll("[role='option']");
+    const rillsql = choices.filter((item) => item.text().includes("127.0.0.1 / rillsql"));
+    expect(rillsql.map((item) => item.attributes("data-engine"))).toEqual(["postgres", "mysql"]);
+    expect(rillsql[0].text()).toContain("PostgreSQL");
+    expect(rillsql[1].text()).toContain("MySQL");
+    expect(rillsql[1].attributes("aria-selected")).toBe("true");
+    expect(wrapper.find("select").exists()).toBe(false);
+    await rillsql[0].trigger("click");
+    expect(wrapper.emitted("target")?.[0]?.[0]).toMatchObject({ connectionId: "atlas", database: "rillsql", engine: "postgres" });
+    wrapper.unmount();
+  });
+
+  it("adopts an editor that is still on the page when the closure lost it", () => {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const live = new EditorView({ parent: host, state: EditorState.create({ doc: "select 1" }) });
+    const resolved = resolveEditor(undefined, host, () => {
+      throw new Error("不应新建");
+    });
+    expect(resolved).toBe(live);
+    expect(resolved?.state.doc.toString()).toBe("select 1");
+    live.destroy();
+    host.remove();
+  });
+
+  it("rebuilds an editor that is no longer in the page", () => {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const gone = new EditorView({ parent: host, state: EditorState.create({ doc: "old" }) });
+    gone.destroy();
+    const created = resolveEditor(gone, host, (parent) => new EditorView({
+      parent,
+      state: EditorState.create({ doc: "select * from customers" }),
+    }));
+    expect(created?.dom.isConnected).toBe(true);
+    expect(created?.state.doc.toString()).toBe("select * from customers");
+    expect(resolveEditor(undefined, null, () => {
+      throw new Error("没有容器");
+    })).toBeUndefined();
+    created?.destroy();
+    host.remove();
+  });
+
+  it("shows that a run has started before the database answers", async () => {
+    replaceCatalog(catalogFixture());
+    let finish: () => void = () => undefined;
+    invoke.mockImplementation((command: string, args?: { request?: { sql: string } }) => new Promise((resolve) => {
+      if (command !== "query_start") {
+        resolve({});
+        return;
+      }
+      finish = () => resolve(runDto({
+        status: "done",
+        statements: [{ sql: args?.request?.sql ?? "", status: "ok", message: "", columns: ["id"], rows: [["1"]], truncated: false, affected: null }],
+      }));
+    }));
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-pending",
+        draft: "select * from customers",
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    const pending = wrapper.get("[data-action='run']").trigger("click");
+    await nextTick();
+    await flushPromises();
+    expect(wrapper.get("[data-action='run']").text()).toBe("正在执行…");
+    expect(wrapper.get("[data-action='run']").attributes("disabled")).toBeDefined();
+    finish();
+    await pending;
+    await flushPromises();
+    expect(wrapper.get("[data-action='run']").text()).toBe("执行");
+    wrapper.unmount();
+  });
+
+  it("still runs the draft after the editor view has been destroyed", async () => {
+    replaceCatalog(catalogFixture());
+    const calls: { command: string; sql?: string }[] = [];
+    invoke.mockImplementation(async (command: string, args?: { request?: { sql: string } }) => {
+      calls.push({ command, sql: args?.request?.sql });
+      return runDto({
+        status: "done",
+        statements: [{ sql: args?.request?.sql ?? "", status: "ok", message: "", columns: ["id"], rows: [["1"]], truncated: false, affected: null }],
+      });
+    });
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-rebuild",
+        draft: "select * from customers",
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    EditorView.findFromDOM(wrapper.get(".cm-content").element)?.destroy();
+    await wrapper.get("[data-action='run']").trigger("click");
+    await flushPromises();
+    expect(calls.filter((call) => call.command === "query_start").at(-1)?.sql).toBe("select * from customers");
+    expect(wrapper.text()).toContain("1");
+    expect(wrapper.text()).not.toContain("执行 SQL 后，结果显示在这里");
+    wrapper.unmount();
+  });
+
+  it("shows the database error instead of staying idle", async () => {
+    replaceCatalog(catalogFixture());
+    invoke.mockRejectedValue("连接未打开，没有另开数据库连接。");
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-error",
+        draft: "select * from customers",
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    await wrapper.get("[data-action='run']").trigger("click");
+    await flushPromises();
+    expect(wrapper.get("[role='alert']").text()).toContain("连接未打开，没有另开数据库连接。");
+    expect(wrapper.get("[data-action='run']").text()).toBe("执行");
     wrapper.unmount();
   });
 

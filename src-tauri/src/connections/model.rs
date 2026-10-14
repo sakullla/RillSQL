@@ -33,6 +33,7 @@ impl Engine {
         }
     }
 
+    #[cfg(test)]
     pub fn default_port(self) -> Option<u16> {
         match self {
             Engine::Mysql | Engine::Mariadb => Some(3306),
@@ -41,6 +42,7 @@ impl Engine {
         }
     }
 
+    #[cfg(test)]
     pub fn is_remote(self) -> bool {
         !matches!(self, Engine::Sqlite)
     }
@@ -55,47 +57,50 @@ impl Engine {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EnvLabel {
-    Dev,
-    Test,
-    Prod,
-    Local,
-    None,
+pub const ENV_NONE: &str = "none";
+
+/// 用户自己维护的环境标签。连接上保存的是 id；`none` 不进这张表。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvTag {
+    pub id: String,
+    pub label: String,
+    pub tone: String,
+    pub position: i64,
 }
 
-impl EnvLabel {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            EnvLabel::Dev => "dev",
-            EnvLabel::Test => "test",
-            EnvLabel::Prod => "prod",
-            EnvLabel::Local => "local",
-            EnvLabel::None => "none",
-        }
+pub fn normalize_env_id(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        ENV_NONE.to_owned()
+    } else {
+        trimmed.to_owned()
     }
+}
 
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "dev" => Some(EnvLabel::Dev),
-            "test" => Some(EnvLabel::Test),
-            "prod" => Some(EnvLabel::Prod),
-            "local" => Some(EnvLabel::Local),
-            "none" => Some(EnvLabel::None),
-            _ => None,
-        }
+pub fn parse_tone(value: &str) -> Option<&'static str> {
+    match value.trim() {
+        "dev" => Some("dev"),
+        "test" => Some("test"),
+        "prod" => Some("prod"),
+        "local" => Some("local"),
+        _ => None,
     }
+}
 
-    pub fn label_zh(self) -> &'static str {
-        match self {
-            EnvLabel::Dev => "开发",
-            EnvLabel::Test => "测试",
-            EnvLabel::Prod => "生产",
-            EnvLabel::Local => "本地",
-            EnvLabel::None => "无标签",
-        }
+pub fn validate_tag_label(label: &str) -> Result<String, String> {
+    let trimmed = label.trim();
+    let count = trimmed.chars().count();
+    if count == 0 {
+        return Err("请填写标签名称".to_owned());
     }
+    if count > 24 {
+        return Err("标签名称最多 24 个字".to_owned());
+    }
+    if trimmed == "无标签" {
+        return Err("无标签表示不使用环境标签".to_owned());
+    }
+    Ok(trimmed.to_owned())
 }
 
 /// `Off` 表示用户关闭 TLS，不是握手失败后的退路。
@@ -204,7 +209,7 @@ pub struct SavedConnection {
     pub id: String,
     pub name: String,
     pub engine: Engine,
-    pub env: EnvLabel,
+    pub env: String,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub database: Option<String>,
@@ -276,7 +281,7 @@ pub struct ConnectionDraft {
     pub id: Option<String>,
     pub name: String,
     pub engine: Engine,
-    pub env: EnvLabel,
+    pub env: String,
     pub host: String,
     pub port: String,
     pub database: String,
@@ -297,11 +302,12 @@ pub struct ConnectionDraft {
 }
 
 impl ConnectionDraft {
+    #[cfg(test)]
     pub fn blank(engine: Engine) -> Self {
         let env = if engine == Engine::Sqlite {
-            EnvLabel::Local
+            "local".to_owned()
         } else {
-            EnvLabel::Dev
+            "dev".to_owned()
         };
         Self {
             id: None,
@@ -363,7 +369,7 @@ fn normalize_sqlite(draft: &ConnectionDraft, id: String) -> Result<SavedConnecti
         id,
         name,
         engine: Engine::Sqlite,
-        env: draft.env,
+        env: normalize_env_id(&draft.env),
         host: None,
         port: None,
         database: None,
@@ -462,7 +468,7 @@ fn normalize_remote(draft: &ConnectionDraft, id: String) -> Result<SavedConnecti
         id,
         name: chosen_name(&draft.name, &host),
         engine: draft.engine,
-        env: draft.env,
+        env: normalize_env_id(&draft.env),
         host: Some(host),
         port,
         database: nonempty(&draft.database),
@@ -507,6 +513,7 @@ pub fn ssh_password_account(id: &str) -> String {
 }
 
 /// 序列化后的普通配置不得包含这些机密。私钥口令永远不入库。
+#[cfg(test)]
 pub fn leaked_secret(blob: &str, secrets: &SecretInput) -> Option<&'static str> {
     for (label, secret) in [
         ("password", secrets.password.as_ref()),

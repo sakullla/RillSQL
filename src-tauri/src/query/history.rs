@@ -126,6 +126,7 @@ impl HistoryStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn column_names(&self) -> Result<Vec<String>, String> {
         let rows = sqlx::query("PRAGMA table_info(query_history)")
             .fetch_all(&self.pool)
@@ -156,6 +157,7 @@ fn entry_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<HistoryEntry, String>
 }
 
 /// 从历史恢复时只产生草稿。调用方不能据此执行。
+#[cfg(test)]
 pub fn restored_draft(entry: &HistoryEntry, connection_exists: bool) -> RestoredDraft {
     RestoredDraft {
         sql: entry.sql.clone(),
@@ -166,6 +168,7 @@ pub fn restored_draft(entry: &HistoryEntry, connection_exists: bool) -> Restored
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoredDraft {
     pub sql: String,

@@ -23,9 +23,13 @@ pub fn module_id() -> &'static str {
         std::any::type_name_of_val(&commands::connections_delete),
         std::any::type_name_of_val(&commands::connections_test),
         std::any::type_name_of_val(&commands::connections_open),
+        std::any::type_name_of_val(&commands::connections_focus_database),
         std::any::type_name_of_val(&commands::connections_disconnect),
         std::any::type_name_of_val(&commands::connections_confirm_host_key),
         std::any::type_name_of_val(&commands::connections_forget_host_key),
+        std::any::type_name_of_val(&commands::env_tags_list),
+        std::any::type_name_of_val(&commands::env_tags_save),
+        std::any::type_name_of_val(&commands::env_tags_delete),
     );
     "connections"
 }

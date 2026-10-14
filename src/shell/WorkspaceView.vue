@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { catalogConnections } from "../catalog/store";
 import DataGrid from "../grid/DataGrid.vue";
 import { resolveTableTarget } from "../grid/target";
+import { targetDetail, targetKey, targetOptions, type TargetOption } from "../query/complete";
 import QueryTab from "../query/QueryTab.vue";
 import StructurePane from "../structure/StructurePane.vue";
 import "../structure/structure.css";
@@ -22,18 +23,18 @@ const emit = defineEmits<{
   structure: [];
   draft: [id: string, draft: string];
   target: [id: string, target: QueryTarget];
+  "table-view": [id: string, pane: "data" | "structure"];
 }>();
 
 const active = computed(() => props.tabs.find((tab) => tab.id === props.activeId) ?? null);
 const pageSize = computed(() => loadSettings().pageSize);
-const tablePane = ref<Record<string, "data" | "structure">>({});
 
-function paneOf(tabId: string): "data" | "structure" {
-  return tablePane.value[tabId] ?? "data";
+function paneOf(tab: { tablePane?: "data" | "structure" }): "data" | "structure" {
+  return tab.tablePane ?? "data";
 }
 
 function showPane(tabId: string, pane: "data" | "structure") {
-  tablePane.value = { ...tablePane.value, [tabId]: pane };
+  emit("table-view", tabId, pane);
 }
 
 function tableTarget(tabId: string) {
@@ -48,16 +49,97 @@ function onTarget(target: QueryTarget) {
   if (!active.value) return;
   emit("target", active.value.id, target);
 }
+
+const menu = ref<{ tabId: string; x: number; y: number } | null>(null);
+const menuTab = computed(() => props.tabs.find((tab) => tab.id === menu.value?.tabId) ?? null);
+const menuTargets = computed(() => (menuTab.value?.kind === "query" ? targetOptions(catalogConnections()) : []));
+
+function currentTargetKey(tab: ShellTab): string {
+  if (!tab.connectionId || tab.database == null) return "";
+  return targetKey(tab.connectionId, tab.database);
+}
+
+function onTabBarContext(event: MouseEvent) {
+  event.preventDefault();
+  const node = event.target;
+  if (!(node instanceof Element)) return;
+  const tabEl = node.closest(".tab");
+  if (!(tabEl instanceof HTMLElement)) {
+    menu.value = null;
+    return;
+  }
+  const tab = props.tabs.find((item) => item.id === tabEl.dataset.tabId);
+  if (!tab) return;
+  emit("activate", tab.id);
+  menu.value = {
+    tabId: tab.id,
+    x: Math.max(8, Math.min(event.clientX, window.innerWidth - 240)),
+    y: Math.max(8, Math.min(event.clientY, window.innerHeight - 48)),
+  };
+}
+
+function closeIds(ids: string[]) {
+  menu.value = null;
+  for (const id of ids) emit("close", id);
+}
+
+function closeOthers(id: string) {
+  closeIds(props.tabs.filter((tab) => tab.id !== id).map((tab) => tab.id));
+}
+
+function closeToTheRight(id: string) {
+  const index = props.tabs.findIndex((tab) => tab.id === id);
+  closeIds(props.tabs.slice(index + 1).map((tab) => tab.id));
+}
+
+function bindTarget(tabId: string, option: TargetOption) {
+  emit("target", tabId, {
+    connectionId: option.connectionId,
+    connectionName: option.name,
+    database: option.database,
+    engine: option.engine,
+    status: option.status,
+  });
+  menu.value = null;
+}
+
+function showTablePane(pane: "data" | "structure") {
+  const tab = menuTab.value;
+  if (!tab) return;
+  emit("table-view", tab.id, pane);
+  menu.value = null;
+}
+
+function onWindowPointer(event: MouseEvent) {
+  const node = event.target;
+  if (node instanceof Element && node.closest("[data-menu=tab]")) return;
+  menu.value = null;
+}
+
+function onWindowKey(event: KeyboardEvent) {
+  if (event.key === "Escape") menu.value = null;
+}
+
+onMounted(() => {
+  window.addEventListener("mousedown", onWindowPointer);
+  window.addEventListener("keydown", onWindowKey);
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("mousedown", onWindowPointer);
+  window.removeEventListener("keydown", onWindowKey);
+});
 </script>
 
 <template>
-  <div v-if="tabs.length" class="tabbar" role="tablist" aria-label="打开的标签">
+  <div v-if="tabs.length" class="tabbar" role="tablist" aria-label="打开的标签" @contextmenu="onTabBarContext">
     <div
       v-for="tab in tabs"
       :key="tab.id"
       class="tab"
       :class="{ active: tab.id === activeId }"
       role="tab"
+      :data-tab-id="tab.id"
       :aria-selected="tab.id === activeId"
       :tabindex="tab.id === activeId ? 0 : -1"
       @click="emit('activate', tab.id)"
@@ -90,11 +172,11 @@ function onTarget(target: QueryTarget) {
     />
     <div v-else-if="active && active.kind === 'table'" class="table-workspace">
       <div class="pane-switch" role="tablist" aria-label="表内容">
-        <button type="button" role="tab" :aria-selected="paneOf(active.id) === 'data'" @click="showPane(active.id, 'data')">数据</button>
-        <button type="button" role="tab" :aria-selected="paneOf(active.id) === 'structure'" @click="showPane(active.id, 'structure')">结构</button>
+        <button type="button" role="tab" :aria-selected="paneOf(active) === 'data'" @click="showPane(active.id, 'data')">数据</button>
+        <button type="button" role="tab" :aria-selected="paneOf(active) === 'structure'" @click="showPane(active.id, 'structure')">结构</button>
       </div>
       <DataGrid
-        v-if="paneOf(active.id) === 'data'"
+        v-if="paneOf(active) === 'data'"
         :key="active.id"
         :tab-id="active.id"
         :draft="active.draft"
@@ -108,6 +190,7 @@ function onTarget(target: QueryTarget) {
         :draft="active.draft"
         purpose="edit"
         :target="tableTarget(active.id)"
+        :focus-section="active.structureSection"
       />
     </div>
     <StructurePane
@@ -126,4 +209,44 @@ function onTarget(target: QueryTarget) {
       @structure="emit('structure')"
     />
   </div>
+  <Teleport to="body">
+    <div
+      v-if="menu && menuTab"
+      class="menu tab-menu"
+      data-menu="tab"
+      role="menu"
+      :aria-label="`${menuTab.title} 的操作`"
+      :style="{ left: `${menu.x}px`, top: `${menu.y}px` }"
+      @mousedown.stop
+      @contextmenu.prevent
+    >
+      <template v-if="menuTab.kind === 'query'">
+        <div class="menu-head">选择执行目标</div>
+        <p v-if="!menuTargets.length" class="target-empty">还没有可选的数据库。</p>
+        <button
+          v-for="option in menuTargets"
+          :key="option.key"
+          class="menu-item"
+          type="button"
+          data-action="bind-target"
+          :data-key="option.key"
+          :title="targetDetail(option)"
+          @click="bindTarget(menuTab.id, option)"
+        >
+          <span>{{ option.label }}</span>
+          <Icon v-if="option.key === currentTargetKey(menuTab)" class="check" name="check" />
+        </button>
+        <div class="menu-sep" role="separator"></div>
+      </template>
+      <template v-else-if="menuTab.kind === 'table'">
+        <button class="menu-item" type="button" data-action="show-data" @click="showTablePane('data')">数据</button>
+        <button class="menu-item" type="button" data-action="show-structure" @click="showTablePane('structure')">结构</button>
+        <div class="menu-sep" role="separator"></div>
+      </template>
+      <button class="menu-item" type="button" data-action="close-tab" @click="closeIds([menuTab.id])">关闭</button>
+      <button class="menu-item" type="button" data-action="close-others" :disabled="tabs.length < 2" @click="closeOthers(menuTab.id)">关闭其他</button>
+      <button class="menu-item" type="button" data-action="close-right" :disabled="tabs.findIndex((tab) => tab.id === menuTab.id) >= tabs.length - 1" @click="closeToTheRight(menuTab.id)">关闭右侧</button>
+      <button class="menu-item" type="button" data-action="close-all" @click="closeIds(tabs.map((tab) => tab.id))">关闭全部</button>
+    </div>
+  </Teleport>
 </template>

@@ -1,0 +1,60 @@
+name: rillsql-dev
+
+services:
+  postgres:
+    image: postgres:16
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: rillsql
+    volumes:
+      - pg:/var/lib/postgresql/data
+      - ./init/postgres.sql:/docker-entrypoint-initdb.d/01.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rillsql"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  mysql:
+    image: mysql:8.4
+    ports:
+      - "127.0.0.1:3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: rillsql
+      MYSQL_USER: rillsql
+      MYSQL_PASSWORD: rillsql
+    volumes:
+      - mysql:/var/lib/mysql
+      - ./init/mysql.sql:/docker-entrypoint-initdb.d/01.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  mariadb:
+    image: mariadb:11.4
+    ports:
+      - "127.0.0.1:3307:3306"
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: rillsql
+      MARIADB_USER: rillsql
+      MARIADB_PASSWORD: rillsql
+    volumes:
+      - mariadb:/var/lib/mysql
+      - ./init/mysql.sql:/docker-entrypoint-initdb.d/01.sql:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+volumes:
+  pg:
+  mysql:
+  mariadb:
