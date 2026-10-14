@@ -9,7 +9,7 @@ import { selectExportGate } from "../grid/sql";
 import { parseCsvDistinct, renderCsv, type CsvOptions } from "./csv";
 import { planExport } from "./plan";
 import TaskCenter from "./TaskCenter.vue";
-import { resetExportTasks } from "./tasks";
+import { exportTasks, resetExportTasks } from "./tasks";
 import { startExport } from "./write";
 
 const csv: CsvOptions = { delimiter: ",", nullToken: "", bom: false, header: true };
@@ -176,10 +176,41 @@ describe("csv export", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("shows export tasks in the titlebar control", () => {
+  it("shows running progress and plain statuses, and clears finished tasks", async () => {
+    exportTasks.push(
+      { id: "t-run", fileName: "orders.csv", path: "/tmp/orders.csv", status: "running", doneRows: 40, totalRows: 100, partial: false, message: "正在导出", residualPath: null },
+      { id: "t-done", fileName: "customers（部分）.csv", path: "/tmp/customers（部分）.csv", status: "done", doneRows: 100, totalRows: 100, partial: true, message: "已导出 100 行。", residualPath: null },
+      { id: "t-fail", fileName: "ledger.csv", path: "/tmp/ledger.csv", status: "failed", doneRows: 12, totalRows: 100, partial: false, message: "磁盘空间不足。已写入 12 行，不完整的文件保留为 ledger.csv.partial。", residualPath: "/tmp/ledger.csv.partial" },
+      { id: "t-cancel", fileName: "notes.csv", path: "/tmp/notes.csv", status: "cancelled", doneRows: 5, totalRows: 100, partial: false, message: "已取消导出：写入 5 行后停止，未完成的文件已删除。", residualPath: null },
+    );
     const wrapper = mount(TaskCenter);
     expect(wrapper.attributes("data-module")).toBe("export");
-    expect(wrapper.get("[aria-label='后台任务']").text()).toContain("任务");
+    const trigger = wrapper.get("[aria-label='后台任务']");
+    expect(trigger.text()).toContain("导出中 40/100");
+    await trigger.trigger("click");
+    const text = wrapper.text();
+    expect(text).toContain("后台任务");
+    expect(text).toContain("进行中");
+    expect(text).toContain("正在导出：已写入 40 / 100 行");
+    expect(text).toContain("已完成：写入 100 行");
+    expect(text).toContain("不是完整结果");
+    expect(text).toContain("导出失败：磁盘空间不足");
+    expect(text).toContain("已取消：未完成的文件已删除");
+    const runningRow = wrapper.get("[data-status='running']");
+    expect(runningRow.get("[role='progressbar']").attributes("aria-valuenow")).toBe("40");
+    expect(runningRow.get("button").text()).toBe("取消");
+    expect(wrapper.find("[data-status='done'] button").exists()).toBe(false);
+    await wrapper.get("[data-action='clear-finished']").trigger("click");
+    expect(exportTasks.map((task) => task.id)).toEqual(["t-run"]);
+    wrapper.unmount();
+  });
+
+  it("shows an idle trigger and an empty list when nothing is running", async () => {
+    const wrapper = mount(TaskCenter);
+    const trigger = wrapper.get("[aria-label='后台任务']");
+    expect(trigger.text()).toContain("任务");
+    await trigger.trigger("click");
+    expect(wrapper.text()).toContain("没有后台任务");
     wrapper.unmount();
   });
 });

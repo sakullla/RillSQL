@@ -229,6 +229,25 @@ export function cancelRemoteExport(id: string): Promise<void> {
   return gridExportCancel(id);
 }
 
+/** 后台任务状态的直白文字：颜色不作唯一信息来源，状态词始终在。 */
+export function taskStatusLabel(status: ExportTask["status"]): string {
+  if (status === "running") return "进行中";
+  if (status === "done") return "已完成";
+  if (status === "cancelled") return "已取消";
+  if (status === "blocked") return "未开始";
+  return "失败";
+}
+
+export function taskStatusText(task: ExportTask): string {
+  if (task.status === "running") {
+    return task.totalRows > 0 ? `正在导出：已写入 ${task.doneRows} / ${task.totalRows} 行` : `正在导出：已写入 ${task.doneRows} 行`;
+  }
+  if (task.status === "done") return `已完成：写入 ${task.totalRows} 行${task.partial ? "，只是已读取的行，不是完整结果" : ""}`;
+  if (task.status === "cancelled") return "已取消：未完成的文件已删除";
+  if (task.status === "blocked") return `没有开始：${task.message}`;
+  return `导出失败：${task.message || "原因未知"}`;
+}
+
 /** 已读取的行不再查询数据库。停在 0 行的旧任务改成未完成，标题不再一直显示「导出 0/N」。 */
 export function failIdleRemoteExports(message: string): void {
   for (const task of exportTasks) {
