@@ -45,6 +45,20 @@ watch(
 );
 const activeColumns = computed(() => rows.value.filter((row) => !row.dropped).map((row) => row.name).filter(Boolean));
 
+/* R4：结构视图里随时能读出当前连接与库。 */
+const contextText = computed(() => {
+  if (purpose.value !== "edit" || !props.target) return "";
+  const name = connections.value.find((item) => item.id === props.target!.connectionId)?.name ?? props.target.connectionId;
+  const place = props.target.schema ? `${props.target.database} / ${props.target.schema}` : props.target.database;
+  return `来自连接「${name}」的「${place}」`;
+});
+
+const activeEngine = computed(() => {
+  if (purpose.value === "edit") return props.target?.engine ?? description.value?.engine ?? "";
+  const connection = connections.value.find((item) => item.id === createConnection.value);
+  return connection?.engine ?? "";
+});
+
 function requestOf(): StructureRequest | null {
   if (purpose.value === "edit") {
     if (!props.target) return null;
@@ -119,7 +133,7 @@ watch(connections, (list) => {
 function openPreview(action: StructureAction) {
   const request = requestOf();
   if (!request) {
-    errorText.value = "没有已打开的连接，不会使用示例数据。";
+    errorText.value = purpose.value === "create" ? "需要至少一个已打开的连接。" : "这张表还没有绑定已打开的连接。";
     return;
   }
   busy.value = true;
@@ -143,12 +157,12 @@ function openPreview(action: StructureAction) {
 function previewColumns() {
   const request = requestOf();
   if (!request) {
-    errorText.value = purpose.value === "create" ? "没有已打开的连接，不会使用示例数据。" : "没有绑定已打开的表，不能用示例数据代替。";
+    errorText.value = purpose.value === "create" ? "需要至少一个已打开的连接。" : "这张表还没有绑定已打开的连接。";
     return;
   }
   if (purpose.value === "create") {
     if (!createName.value.trim()) {
-      errorText.value = "需要表名。";
+      errorText.value = "先给新表起个名字。";
       return;
     }
     openPreview({ kind: "createTable", name: createName.value.trim(), columns: rows.value.map((row) => ({ ...row })) });
@@ -211,17 +225,18 @@ function createForeignKey(foreignKey: StructureForeignKey) {
 
 <template>
   <div class="structure-pane" aria-label="表结构" :data-tab-id="tabId" :data-draft="draft" tabindex="-1">
-    <p v-if="purpose === 'edit' && !target" class="empty" role="alert">没有绑定已打开的表，不能用示例数据代替。</p>
+    <p v-if="purpose === 'edit' && !target" class="empty" role="alert">这张表还没有绑定已打开的连接。</p>
     <template v-else>
       <nav class="struct-nav" aria-label="结构分区">
         <button type="button" :class="{ on: section === 'columns' }" @click="section = 'columns'">字段</button>
         <button v-if="purpose === 'edit'" type="button" :class="{ on: section === 'indexes' }" @click="section = 'indexes'">索引</button>
         <button v-if="purpose === 'edit'" type="button" :class="{ on: section === 'foreign' }" @click="section = 'foreign'">外键</button>
         <span class="grow"></span>
-        <button v-if="purpose === 'edit'" type="button" :class="{ on: section === 'drop' }" @click="section = 'drop'">删除表</button>
+        <button v-if="purpose === 'edit'" type="button" class="danger" :class="{ on: section === 'drop' }" @click="section = 'drop'">删除表</button>
       </nav>
+      <p v-if="purpose === 'edit' && target" class="struct-context">正在修改表 <strong>{{ target.table }}</strong> · {{ contextText }}</p>
       <p v-if="errorText" class="struct-alert" role="alert">{{ errorText }}</p>
-      <p v-if="loading" class="muted">正在读取已打开会话里的表结构。</p>
+      <p v-if="loading" class="struct-loading muted">正在读取这张表的结构……</p>
       <div v-else class="struct-body">
         <form v-if="purpose === 'create'" class="struct-form" @submit.prevent="previewColumns">
           <label>连接
@@ -231,8 +246,8 @@ function createForeignKey(foreignKey: StructureForeignKey) {
           </label>
           <label>数据库<input v-model="createDatabase" type="text" aria-label="目标数据库" /></label>
           <label>Schema<input v-model="createSchema" type="text" aria-label="目标 schema" /></label>
-          <label>表名<input v-model="createName" type="text" aria-label="新表名" /></label>
-          <p v-if="!connections.length" class="muted">没有已打开的连接，不会使用示例数据。</p>
+          <label>新表名<input v-model="createName" type="text" aria-label="新表名" /></label>
+          <p v-if="!connections.length" class="muted">需要至少一个已打开的连接。</p>
         </form>
         <StructureEditor v-if="section === 'columns'" :rows="rows" :baseline="description?.columns ?? []" :mode="purpose === 'create' ? 'create' : 'edit'" @preview="previewColumns" />
         <IndexEditor
@@ -254,11 +269,29 @@ function createForeignKey(foreignKey: StructureForeignKey) {
           @create="createForeignKey"
           @enable="openPreview({ kind: 'setForeignKeys', enabled: true })"
         />
-        <section v-else-if="section === 'drop' && target">
-          <h3>删除 {{ target.table }}</h3>
-          <p>只删除预览中的这一张表，不隐式级联删除其他业务对象。约 {{ description?.rowCount ?? "未知" }} 行。这不是备份。</p>
-          <p v-if="description?.incoming.length">被引用：{{ description.incoming.map((item) => `${item.table}.${item.name}`).join("、") }}。不会添加 CASCADE。</p>
-          <button class="btn primary" type="button" @click="openPreview({ kind: 'dropTable', table: target.table })">预览 SQL</button>
+        <section v-else-if="section === 'drop' && target" class="struct-drop">
+          <h3>删除表 {{ target.table }}</h3>
+          <p class="impact danger">
+            将永久删除这张表<template v-if="description?.rowCount != null">和里面约 {{ description.rowCount }} 行数据</template>
+            <template v-else>和里面所有数据（暂时不知道有多少行）</template>，无法恢复。
+          </p>
+          <p class="muted">只删除这一张表，不会连带删除其他表或对象。</p>
+          <template v-if="description?.incoming.length">
+            <p class="impact warn">有 {{ description.incoming.length }} 个外键引用这张表：删除可能被数据库拒绝，也可能留下无效的引用。</p>
+            <details class="disclosure">
+              <summary>查看引用它的外键</summary>
+              <div class="disclosure-body">
+                <ul class="plain-list">
+                  <li v-for="item in description.incoming" :key="`${item.table}.${item.name}`">
+                    <code>{{ item.table }}.{{ item.name }}</code>（{{ item.columns.join(", ") }} → {{ item.refColumns.join(", ") }}）
+                  </li>
+                </ul>
+              </div>
+            </details>
+          </template>
+          <div>
+            <button class="btn danger" type="button" @click="openPreview({ kind: 'dropTable', table: target.table })">查看将要发生什么</button>
+          </div>
         </section>
       </div>
     </template>
@@ -267,6 +300,7 @@ function createForeignKey(foreignKey: StructureForeignKey) {
       :plan="plan"
       :receipt="receipt"
       :busy="busy"
+      :engine="activeEngine"
       :expect-name="pending?.kind === 'dropTable' ? pending.table : undefined"
       @cancel="closePreview"
       @confirm="confirm"

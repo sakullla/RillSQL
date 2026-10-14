@@ -1,12 +1,30 @@
 <script setup lang="ts">
-import { columnImpact, columnMark } from "./logic";
+import { computed } from "vue";
+import { columnImpact, columnMark, impactLevel, pendingCount } from "./logic";
 import type { ColumnDraft, StructureColumn } from "./types";
 
 const props = defineProps<{ rows: ColumnDraft[]; baseline: StructureColumn[]; mode: "create" | "edit" }>();
 const emit = defineEmits<{ preview: [] }>();
 
+const changed = computed(() => pendingCount(props.rows, props.baseline));
+const colspan = computed(() => (props.mode === "create" ? 7 : 5));
+
 function baselineOf(draft: ColumnDraft): StructureColumn | undefined {
   return props.baseline.find((column) => column.name === draft.original);
+}
+
+function markText(draft: ColumnDraft): "" | "新增" | "已修改" | "将删除" {
+  const mark = columnMark(draft, baselineOf(draft));
+  return mark === "新" ? "新增" : mark === "改" ? "已修改" : mark === "删" ? "将删除" : "";
+}
+
+function markBadge(draft: ColumnDraft): "accent" | "warn" | "err" | "" {
+  const mark = columnMark(draft, baselineOf(draft));
+  return mark === "新" ? "accent" : mark === "改" ? "warn" : mark === "删" ? "err" : "";
+}
+
+function impactOf(draft: ColumnDraft): string {
+  return columnImpact(draft, baselineOf(draft));
 }
 
 function addColumn() {
@@ -34,40 +52,55 @@ function toggleDrop(draft: ColumnDraft) {
 
 <template>
   <div class="struct-editor">
-    <div class="struct-nav">
-      <strong>字段</strong>
+    <div class="struct-toolbar">
+      <span v-if="mode === 'edit' && changed" class="badge warn">{{ changed }} 处更改未执行</span>
+      <span v-else-if="mode === 'edit'" class="muted">直接改下面的字段；改动先记下来，不会立即写入数据库。</span>
+      <span v-else class="muted">这张新表将包含下面这些字段。</span>
       <span class="grow"></span>
       <button class="btn" type="button" @click="addColumn">新增字段</button>
-      <button class="btn primary" type="button" @click="emit('preview')">预览 SQL</button>
+      <button class="btn primary" type="button" :disabled="!changed" @click="emit('preview')">查看将要发生什么</button>
     </div>
     <table class="struct-table">
       <thead>
         <tr>
-          <th>标记</th>
-          <th>名称</th>
+          <th>字段</th>
           <th>类型</th>
           <th>可空</th>
           <th>默认值</th>
-          <th>主键</th>
+          <th v-if="mode === 'create'">主键</th>
           <th v-if="mode === 'create'">自增</th>
-          <th>影响</th>
           <th></th>
         </tr>
       </thead>
       <tbody>
-        <tr v-for="(draft, index) in rows" :key="draft.original ?? `new-${index}`" :class="{ 'row-drop': draft.dropped }">
-          <td><span class="mark" :class="columnMark(draft, baselineOf(draft)) === '新' ? 'new' : columnMark(draft, baselineOf(draft)) === '删' ? 'drop' : columnMark(draft, baselineOf(draft)) === '改' ? 'edit' : ''">{{ columnMark(draft, baselineOf(draft)) }}</span></td>
-          <td><input v-model="draft.name" type="text" :aria-label="`字段名 ${index + 1}`" :disabled="draft.dropped" /></td>
-          <td><input v-model="draft.typeName" type="text" :aria-label="`类型 ${index + 1}`" :disabled="draft.dropped" /></td>
-          <td><input v-model="draft.nullable" type="checkbox" :aria-label="`可空 ${index + 1}`" :disabled="draft.dropped" /></td>
-          <td><input v-model="draft.defaultSql" type="text" :aria-label="`默认值 ${index + 1}`" :disabled="draft.dropped" /></td>
-          <td><input v-model="draft.primary" type="checkbox" :aria-label="`主键 ${index + 1}`" :disabled="draft.dropped || mode === 'edit'" /></td>
-          <td v-if="mode === 'create'"><input v-model="draft.auto" type="checkbox" :aria-label="`自增 ${index + 1}`" :disabled="draft.dropped || !draft.primary || !/int/i.test(draft.typeName)" /></td>
-          <td>{{ columnImpact(draft, baselineOf(draft)) }}</td>
-          <td>
-            <button class="btn" type="button" :aria-label="draft.dropped ? '撤销删除' : '删除字段'" @click="toggleDrop(draft)">{{ draft.dropped ? "撤销" : "删除" }}</button>
-          </td>
-        </tr>
+        <template v-for="(draft, index) in rows" :key="draft.original ?? `new-${index}`">
+          <tr :class="{ 'row-drop': draft.dropped }">
+            <td>
+              <div class="cell-name">
+                <span v-if="markText(draft)" class="badge sm" :class="markBadge(draft)">{{ markText(draft) }}</span>
+                <input v-model="draft.name" type="text" :aria-label="`字段名 ${index + 1}`" :disabled="draft.dropped" />
+                <span v-if="mode === 'edit' && draft.primary" class="badge sm">主键</span>
+              </div>
+            </td>
+            <td><input v-model="draft.typeName" type="text" :aria-label="`类型 ${index + 1}`" :disabled="draft.dropped" /></td>
+            <td class="cell-check"><input v-model="draft.nullable" type="checkbox" :aria-label="`可空 ${index + 1}`" :disabled="draft.dropped" /></td>
+            <td><input v-model="draft.defaultSql" type="text" :aria-label="`默认值 ${index + 1}`" :disabled="draft.dropped" /></td>
+            <td v-if="mode === 'create'" class="cell-check"><input v-model="draft.primary" type="checkbox" :aria-label="`主键 ${index + 1}`" :disabled="draft.dropped" /></td>
+            <td v-if="mode === 'create'" class="cell-check">
+              <input v-model="draft.auto" type="checkbox" :aria-label="`自增 ${index + 1}`" :disabled="draft.dropped || !draft.primary || !/int/i.test(draft.typeName)" />
+            </td>
+            <td class="cell-act">
+              <button class="btn sm" :class="{ danger: !draft.dropped }" type="button" @click="toggleDrop(draft)">
+                {{ draft.dropped ? "撤销删除" : "删除" }}
+              </button>
+            </td>
+          </tr>
+          <tr v-if="impactOf(draft)" class="row-impact">
+            <td :colspan="colspan">
+              <p class="impact" :class="impactLevel(draft, baselineOf(draft))">{{ impactOf(draft) }}</p>
+            </td>
+          </tr>
+        </template>
       </tbody>
     </table>
   </div>

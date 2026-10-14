@@ -47,42 +47,50 @@ function previewCreate() {
 </script>
 
 <template>
-  <div>
+  <div class="struct-foreign">
     <p v-if="engine === 'sqlite'" class="callout" :class="{ warn: enforced !== true }">
-      当前连接 foreign_keys = {{ foreignKeyLabel(enforced) }}。不会为了让创建看起来成功而静默关闭检查。
-      <button v-if="enforced === false" class="btn" type="button" @click="emit('enable')">为本次连接开启</button>
+      SQLite 靠 foreign_keys 开关决定外键是否检查数据，当前这个连接是 {{ foreignKeyLabel(enforced) }}。
+      <template v-if="enforced === false">新建的外键不会真正检查数据，可以先为这次连接开启。</template>
+      <template v-else-if="enforced === true">新外键会正常检查数据。</template>
+      <template v-else>没读到这个开关的状态，新外键可能不会检查数据。</template>
+      <button v-if="enforced === false" class="btn sm" type="button" @click="emit('enable')">为这次连接开启</button>
     </p>
-    <p v-if="myisam" class="callout warn">这张表使用 MyISAM，不支持外键。不会通过关闭检查来假装创建成功。</p>
+    <p v-if="myisam" class="callout warn">这张表使用 MyISAM，不支持外键；不会通过关闭检查来假装创建成功。</p>
+
+    <h3>这张表的外键</h3>
+    <p v-if="!foreignKeys.length" class="muted">这张表还没有外键。</p>
     <div v-for="key in foreignKeys" :key="key.name" class="obj-row">
       <code>{{ key.name }}</code>
       <span>{{ key.columns.join(", ") }} → {{ key.refTable }}({{ key.refColumns.join(", ") }})</span>
-      <span class="pill">{{ key.onDelete }} / {{ key.onUpdate }}</span>
+      <span class="badge sm">删除引用行时 {{ key.onDelete }} · 更新引用列时 {{ key.onUpdate }}</span>
       <span class="grow"></span>
-      <button class="btn" type="button" @click="emit('drop', key.name)">删除</button>
+      <button class="btn sm danger" type="button" @click="emit('drop', key.name)">删除</button>
     </div>
-    <h3>引用此表的外键</h3>
+
+    <h3>引用这张表的外键</h3>
     <p v-if="!incoming.length" class="muted">没有其他表引用这张表。</p>
     <div v-for="item in incoming" :key="`${item.table}.${item.name}`" class="obj-row">
       <code>{{ item.table }}.{{ item.name }}</code>
-      <span>{{ item.columns.join(", ") }} → {{ item.refColumns.join(", ") }}</span>
+      <span class="muted">{{ item.columns.join(", ") }} → {{ item.refColumns.join(", ") }}</span>
     </div>
+
     <form v-if="!myisam" class="struct-form" @submit.prevent="previewCreate">
       <label>名称<input v-model="name" type="text" aria-label="外键名称" /></label>
-      <label>本表列<input v-model="column" type="text" aria-label="外键列" placeholder="一列，或多列用逗号分隔" /></label>
+      <label>本表字段<input v-model="column" type="text" aria-label="外键列" placeholder="一列，或多列用逗号分隔" /></label>
       <label v-if="engine === 'postgres'">目标 schema<input v-model="refSchema" type="text" aria-label="目标 schema" /></label>
       <label>目标表<input v-model="refTable" type="text" aria-label="目标表" /></label>
-      <label>目标列<input v-model="refColumn" type="text" aria-label="目标列" /></label>
-      <label>ON DELETE
-        <select v-model="onDelete" aria-label="ON DELETE">
+      <label>目标字段<input v-model="refColumn" type="text" aria-label="目标列" placeholder="一列，或多列用逗号分隔" /></label>
+      <label>删除引用行时
+        <select v-model="onDelete" aria-label="删除引用行时">
           <option v-for="action in fkActions(engine)" :key="action">{{ action }}</option>
         </select>
       </label>
-      <label>ON UPDATE
-        <select v-model="onUpdate" aria-label="ON UPDATE">
+      <label>更新引用列时
+        <select v-model="onUpdate" aria-label="更新引用列时">
           <option v-for="action in fkActions(engine)" :key="action">{{ action }}</option>
         </select>
       </label>
-      <button class="btn primary" type="submit">预览 SQL</button>
+      <button class="btn primary" type="submit">查看将要发生什么</button>
     </form>
   </div>
 </template>
