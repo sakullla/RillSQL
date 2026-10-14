@@ -83,9 +83,12 @@ pub async fn open_mysql(config: &SavedConnection, route: &Route, password: &str)
     if let Some(database) = &config.database {
         builder = builder.db_name(Some(database.clone()));
     }
-    // 目录和表浏览共用池里的这一条连接，查询时不再额外拨号。
+    // 目录、表浏览和查询共用池里这一条连接。空闲时留着它，归还时不发 COM_RESET_CONNECTION。
     builder = builder.pool_opts(
-        mysql_async::PoolOpts::new().with_constraints(mysql_async::PoolConstraints::new(0, 1).expect("mysql pool")),
+        mysql_async::PoolOpts::new()
+            .with_constraints(mysql_async::PoolConstraints::new(0, 1).expect("mysql pool"))
+            .with_reset_connection(false)
+            .with_inactive_connection_ttl(Duration::from_secs(28_800)),
     );
     if plan.ssl_opts_present {
         builder = builder.ssl_opts(Some(mysql_ssl(&plan, config.tls.as_ref())?));

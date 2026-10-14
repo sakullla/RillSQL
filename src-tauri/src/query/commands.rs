@@ -12,7 +12,7 @@ use crate::connections::commands::ConnectionsState;
 use crate::connections::{CancelTransport, CatalogSession, Service};
 
 use super::cancel::{self, CancelView};
-use super::exec::{self, LiveDriver, StatementReport};
+use super::exec::{self, StatementReport};
 use super::history::{HistoryDraft, HistoryEntry, HistoryStore};
 use super::split::split_sql;
 
@@ -91,6 +91,30 @@ impl QueryState {
         }
         Ok(guard.as_ref().expect("历史刚刚打开").clone())
     }
+
+    pub fn is_connection_busy(&self, connection_id: &str) -> bool {
+        connection_busy(self, connection_id)
+    }
+
+    #[cfg(test)]
+    pub async fn lock_history_for_test(&self) -> tokio::sync::MutexGuard<'_, Option<HistoryStore>> {
+        self.history.lock().await
+    }
+}
+
+struct Reservation {
+    state: QueryState,
+    id: String,
+    slot: Arc<RunSlot>,
+    active: bool,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.active {
+            self.state.runs.lock().expect("runs").remove(&self.id);
+        }
+    }
 }
 
 pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: StartRequest) -> Result<RunDto, String> {
@@ -104,11 +128,8 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
     if matches!(session, CatalogSession::Scripted) {
         return Err("这条已打开的会话没有可查询的数据库通道".to_owned());
     }
-    if connection_busy(state, &request.connection_id) {
-        return Err("这个连接已有正在执行的查询。可以切换到其他标签继续编辑。".to_owned());
-    }
     let transport = service.cancel_transport(&request.connection_id).unwrap_or(CancelTransport::None);
-    exec::align_database(&session, &request.engine, &request.database).await?;
+    let via_ssh = transport.via_ssh();
     let id = uuid::Uuid::new_v4().to_string();
     let started_at = chrono::Utc::now().to_rfc3339();
     let cancel_flag = transport.sqlite_flag().unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
@@ -134,20 +155,23 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
         status: "running".to_owned(),
         cancel: "none".to_owned(),
         cancel_message: String::new(),
-        via_ssh: transport.via_ssh(),
+        via_ssh,
         fresh_channel: false,
         statements,
         started_at: started_at.clone(),
         elapsed_ms: 0,
     };
-    let slot = Arc::new(RunSlot {
-        snapshot: Mutex::new(snapshot.clone()),
-        cancel_flag: Arc::clone(&cancel_flag),
-        started: Instant::now(),
-    });
-    state.runs.lock().expect("runs").insert(id.clone(), Arc::clone(&slot));
-    let history = state.history().await?;
-    history
+    // 任何 await 之前占住这条连接，失败时由 Reservation 撤掉占位。
+    let mut reservation = reserve_run(state, snapshot.clone(), Arc::clone(&cancel_flag))?;
+    let driver = match exec::LiveDriver::attach(session, &request.engine, &request.database, transport).await {
+        Ok(driver) => driver,
+        Err(err) => return Err(err),
+    };
+    let history = match state.history().await {
+        Ok(history) => history,
+        Err(err) => return Err(err),
+    };
+    if let Err(err) = history
         .insert(&HistoryDraft {
             id: id.clone(),
             sql: request.sql.clone(),
@@ -158,13 +182,15 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
             started_at: started_at.clone(),
             summary: "执行中".to_owned(),
         })
-        .await?;
+        .await
+    {
+        return Err(err);
+    }
     let limit = exec::clamp_limit(request.limit);
-    let via_ssh = transport.via_ssh();
-    let state_runs = Arc::clone(&state.runs);
+    let slot = Arc::clone(&reservation.slot);
+    reservation.active = false;
     let history_state = state.clone();
     tokio::spawn(async move {
-        let driver = LiveDriver { session, transport };
         let batch = exec::run_batch(&parts, limit, &cancel_flag, via_ssh, &driver).await;
         finish_run(&slot, &batch);
         let summary = summary_of(&batch);
@@ -174,9 +200,28 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
                 .finish(&id, &chrono::Utc::now().to_rfc3339(), status, slot.started.elapsed().as_millis() as i64, &summary)
                 .await;
         }
-        let _ = state_runs;
     });
     Ok(snapshot)
+}
+
+fn reserve_run(state: &QueryState, snapshot: RunDto, cancel_flag: Arc<AtomicBool>) -> Result<Reservation, String> {
+    let mut runs = state.runs.lock().expect("runs");
+    if runs.values().any(|slot| slot_busy(slot, &snapshot.connection_id)) {
+        return Err("这个连接已有正在执行的查询。可以切换到其他标签继续编辑。".to_owned());
+    }
+    let id = snapshot.id.clone();
+    let slot = Arc::new(RunSlot {
+        snapshot: Mutex::new(snapshot),
+        cancel_flag,
+        started: Instant::now(),
+    });
+    runs.insert(id.clone(), Arc::clone(&slot));
+    Ok(Reservation {
+        state: state.clone(),
+        id,
+        slot,
+        active: true,
+    })
 }
 
 fn finish_run(slot: &RunSlot, batch: &exec::BatchReport) {
@@ -229,10 +274,12 @@ fn history_status(status: &str) -> &'static str {
 }
 
 fn connection_busy(state: &QueryState, connection_id: &str) -> bool {
-    state.runs.lock().expect("runs").values().any(|slot| {
-        let snap = slot.snapshot.lock().expect("snapshot");
-        snap.connection_id == connection_id && matches!(snap.status.as_str(), "running" | "cancel-requested")
-    })
+    state.runs.lock().expect("runs").values().any(|slot| slot_busy(slot, connection_id))
+}
+
+fn slot_busy(slot: &RunSlot, connection_id: &str) -> bool {
+    let snap = slot.snapshot.lock().expect("snapshot");
+    snap.connection_id == connection_id && matches!(snap.status.as_str(), "running" | "cancel-requested")
 }
 
 pub async fn request_cancel(service: &Arc<Service>, state: &QueryState, run_id: &str) -> Result<RunDto, String> {
