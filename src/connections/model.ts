@@ -231,11 +231,12 @@ export function toStoredConfig(draft: ConnectionDraft, id: string): SavedConnect
   };
 }
 
+/** 与后端 src-tauri/src/connections/stages.rs 的阶段标签保持一致。 */
 export function plannedStageLabels(draft: ConnectionDraft): string[] {
-  if (draft.engine === "sqlite") return ["打开文件", "读取 schema", "检查 foreign_keys"];
-  const stages = draft.sshOn ? ["SSH 主机身份", "SSH 认证", "建立隧道"] : ["网络连接"];
-  if (draft.tlsMode !== "off") stages.push(draft.tlsMode === "verify" ? "TLS 握手与证书验证" : "TLS 握手");
-  stages.push("数据库认证", "读取服务器版本");
+  if (draft.engine === "sqlite") return ["打开文件", "读取表结构清单", "检查外键设置"];
+  const stages = draft.sshOn ? ["确认 SSH 跳板机身份", "登录 SSH 跳板机", "通过 SSH 跳板机打通到数据库的通道"] : ["连接数据库服务器"];
+  if (draft.tlsMode !== "off") stages.push(draft.tlsMode === "verify" ? "加密连接并核对证书" : "加密连接");
+  stages.push("登录数据库", "读取数据库版本");
   return stages;
 }
 

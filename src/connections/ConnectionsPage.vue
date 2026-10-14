@@ -33,7 +33,7 @@ const note = ref("");
 const busy = ref(false);
 const menuId = ref<string | null>(null);
 const dialog = ref<"edit" | "delete" | "password" | "details" | null>(null);
-const section = ref<"general" | "tls" | "ssh">("general");
+const advancedOpen = ref(false);
 const draft = ref<ConnectionDraft>(blankDraft("postgres"));
 const fieldErrors = ref<Record<string, string>>({});
 const report = ref<TestReport | null>(null);
@@ -64,6 +64,12 @@ const filtered = computed(() => {
     [item.name, item.host, item.filePath, item.database, engineMeta(item.engine).label].some((value) => value && value.toLowerCase().includes(q)),
   );
 });
+
+const failedStage = computed(() => report.value?.stages.find((stage) => stage.status === "err") ?? null);
+
+const advancedHint = computed(() =>
+  draft.value.engine === "sqlite" ? "环境标签——本地文件不需要 TLS 或 SSH" : "TLS 加密、SSH 跳板机、环境标签——直连时通常保持默认即可",
+);
 
 function show(target: HTMLDialogElement | null) {
   if (!target) return;
@@ -142,6 +148,10 @@ async function reloadTags() {
   }
 }
 
+function usesAdvancedSettings(source: ConnectionDraft): boolean {
+  return source.sshOn || source.tlsMode === "require" || source.tlsMode === "off" || source.caMode === "file" || Boolean(source.clientCert || source.clientKey);
+}
+
 function openEditor(existing?: SavedConnection, engine?: Engine) {
   report.value = null;
   fieldErrors.value = {};
@@ -155,7 +165,7 @@ function openEditor(existing?: SavedConnection, engine?: Engine) {
     knownHostKey.value = null;
   }
   ensureDraftEnv();
-  section.value = "general";
+  advancedOpen.value = Boolean(existing) && usesAdvancedSettings(draft.value);
   dialog.value = "edit";
   menuId.value = null;
   requestAnimationFrame(() => show(editDialog.value));
@@ -171,8 +181,12 @@ function switchEngine(engine: Engine) {
   report.value = null;
 }
 
-function chooseSection(next: "general" | "tls" | "ssh") {
-  section.value = next;
+function syncAdvanced(event: Event) {
+  advancedOpen.value = (event.target as HTMLDetailsElement).open;
+}
+
+function revealErrors(errors: Record<string, string>) {
+  if (errors.sshHost || errors.sshUser || errors.sshPort || errors.caFile) advancedOpen.value = true;
 }
 
 async function saveTag(payload: EnvTagInput) {
@@ -217,8 +231,7 @@ async function saveDraft(connectAfter: boolean) {
   const errors = validate(draft.value);
   fieldErrors.value = errors;
   if (Object.keys(errors).length) {
-    if (errors.host || errors.port || errors.username) section.value = "general";
-    else if (errors.sshHost || errors.sshUser || errors.sshPort) section.value = "ssh";
+    revealErrors(errors);
     return;
   }
   busy.value = true;
@@ -244,7 +257,10 @@ function closeEditor() {
 async function runTest() {
   const errors = validate(draft.value);
   fieldErrors.value = errors;
-  if (Object.keys(errors).length) return;
+  if (Object.keys(errors).length) {
+    revealErrors(errors);
+    return;
+  }
   busy.value = true;
   try {
     const outcome = await api.value.save(draft.value, currentSecrets());
@@ -350,7 +366,7 @@ async function confirmDelete() {
   const target = deleteTarget.value;
   if (!target) return;
   const outcome = await api.value.remove(target.id);
-  note.value = outcome.databaseFileRemoved ? "配置已删除。" : `已删除连接配置“${target.name}”。数据库未受影响。`;
+  note.value = outcome.databaseFileRemoved ? "连接配置已删除。" : `已删除连接配置“${target.name}”。数据库和其中的数据不受影响。`;
   closeDialog(otherDialog.value);
   dialog.value = null;
   await reload();
@@ -396,7 +412,7 @@ watch(
         <div class="ph-actions">
           <label class="mini-search">
             <ConnIcon name="search" />
-            <input v-model="query" placeholder="搜索名称、主机或文件" aria-label="搜索连接" />
+            <input v-model="query" placeholder="搜索名称、地址或文件" aria-label="搜索连接" />
           </label>
           <button class="btn primary" type="button" data-action="conn-new" @click.stop="openEditor()">
             <ConnIcon name="plus" />新建连接
@@ -415,29 +431,19 @@ watch(
             </div>
             <span class="env" :class="`env-${envView(item.env).tone}`">{{ envView(item.env).label }}</span>
           </header>
-          <dl v-if="item.engine === 'sqlite'" class="cc-dl">
-            <dt>文件</dt>
-            <dd class="mono" :title="item.filePath ?? ''">{{ item.filePath }}</dd>
-          </dl>
-          <dl v-else class="cc-dl">
-            <dt>地址</dt>
-            <dd class="mono">{{ item.host }}:{{ item.port }}</dd>
-            <dt>数据库</dt>
-            <dd class="mono">{{ item.database || "—" }}</dd>
-            <dt>用户</dt>
-            <dd class="mono">{{ item.username }}</dd>
-          </dl>
-          <div class="cc-chips">
+          <p v-if="item.engine === 'sqlite'" class="cc-addr mono" :title="item.filePath ?? ''">{{ item.filePath }}</p>
+          <p v-else class="cc-addr mono">{{ item.host }}:{{ item.port }}<span v-if="item.database" class="muted"> / {{ item.database }}</span></p>
+          <div class="cc-badges">
             <template v-if="item.engine === 'sqlite'">
-              <span class="sec-chip"><ConnIcon name="file" />本地文件</span>
-              <span class="sec-chip" :class="foreignKeys[item.id] ? '' : 'warn'">foreign_keys {{ foreignKeys[item.id] ? "ON" : "OFF" }}</span>
+              <span class="badge"><ConnIcon name="file" />本地文件</span>
+              <span class="badge" :class="foreignKeys[item.id] ? 'ok' : 'warn'">外键约束{{ foreignKeys[item.id] ? "已开启" : "未开启" }}</span>
             </template>
             <template v-else>
-              <span v-if="item.tls?.mode === 'verify'" class="sec-chip ok"><ConnIcon name="shield" />TLS · 验证证书</span>
-              <span v-else-if="item.tls?.mode === 'require'" class="sec-chip warn"><ConnIcon name="lock" />TLS · 不验证证书</span>
-              <span v-else class="sec-chip warn"><ConnIcon name="unlock" />未加密</span>
-              <span v-if="item.ssh" class="sec-chip"><ConnIcon name="tunnel" />SSH · {{ item.ssh.host }}</span>
-              <span class="sec-chip"><ConnIcon name="key" />{{ item.passwordSaved ? "密码在系统凭据库" : "每次询问密码" }}</span>
+              <span v-if="item.tls?.mode === 'verify'" class="badge ok"><ConnIcon name="shield" />加密连接 · 核对证书</span>
+              <span v-else-if="item.tls?.mode === 'require'" class="badge warn"><ConnIcon name="lock" />加密连接 · 不核对证书</span>
+              <span v-else class="badge warn"><ConnIcon name="unlock" />不加密</span>
+              <span v-if="item.ssh" class="badge"><ConnIcon name="tunnel" />经 SSH 跳板机</span>
+              <span class="badge"><ConnIcon name="key" />{{ item.passwordSaved ? "密码已保存" : "每次询问密码" }}</span>
             </template>
           </div>
           <footer>
@@ -460,11 +466,11 @@ watch(
       <p v-if="query && !filtered.length" class="muted">没有匹配“{{ query }}”的连接。</p>
     </div>
 
-    <dialog ref="editDialog" class="modal modal-xl" @cancel.prevent="closeEditor">
+    <dialog ref="editDialog" class="modal modal-lg" @cancel.prevent="closeEditor">
       <div class="modal-head">
-        <div>
+        <div class="modal-titles">
           <h2>{{ draft.id ? `编辑连接 · ${draft.name || draft.host || draft.filePath}` : "新建连接" }}</h2>
-          <p class="modal-sub">配置只保存在本机</p>
+          <p class="modal-sub">配置只保存在本机；密码只写入系统凭据库</p>
         </div>
         <button class="icon-btn" type="button" aria-label="关闭" @click="closeEditor"><ConnIcon name="x" /></button>
       </div>
@@ -476,114 +482,138 @@ watch(
             <span><b>{{ engine.label }}</b><small>{{ engine.id === "sqlite" ? "本地文件" : `默认端口 ${engine.port}` }}</small></span>
           </label>
         </div>
-        <div class="ce-body" :class="{ single: draft.engine === 'sqlite' }">
-          <nav v-if="draft.engine !== 'sqlite'" class="ce-nav" aria-label="配置分区">
-            <button type="button" :class="{ on: section === 'general' }" @click="chooseSection('general')"><b>常规</b><small>{{ draft.host || "主机与认证" }}</small></button>
-            <button type="button" :class="{ on: section === 'tls' }" data-section="tls" @click="chooseSection('tls')"><b>TLS / SSL</b><small>{{ draft.tlsMode === "verify" ? "验证证书" : draft.tlsMode === "require" ? "加密不验证" : "不加密" }}</small></button>
-            <button type="button" :class="{ on: section === 'ssh' }" data-section="ssh" @click="chooseSection('ssh')"><b>SSH 隧道</b><small>{{ draft.sshOn ? draft.sshHost || "已启用" : "未启用" }}</small></button>
-          </nav>
-          <div class="ce-form">
-            <template v-if="draft.engine === 'sqlite'">
-              <div class="form-grid">
-                <label class="field full"><span>连接名称</span><input v-model="draft.name" placeholder="例如 本地笔记" /></label>
-                <label class="field full">
-                  <span>数据库文件<em class="req">*</em></span>
-                  <div class="input-row">
-                    <input v-model="draft.filePath" class="mono" data-field="filePath" placeholder="选择已有的 .db / .sqlite 文件" :aria-invalid="Boolean(fieldErrors.filePath)" />
-                    <button class="btn" type="button" data-action="cf-browse" @click="browseSqlite"><ConnIcon name="file" />选择…</button>
-                  </div>
-                  <small v-if="fieldErrors.filePath" class="field-err">{{ fieldErrors.filePath }}</small>
-                  <small v-else>只打开已有文件。删除这个连接不会删除文件。</small>
-                </label>
-              </div>
-              <EnvTagField v-model="draft.env" :tags="tags" :error="tagError" @save="saveTag" @remove="removeTag" />
-              <div class="callout callout-info"><ConnIcon name="info" /><div>SQLite 是本地文件，不需要 TLS 或 SSH。连接后会显示 <code>PRAGMA foreign_keys</code> 的实际状态。SQLite 默认不强制外键。</div></div>
-            </template>
-            <template v-else-if="section === 'general'">
-              <div class="form-grid">
-                <label class="field full"><span>连接名称</span><input v-model="draft.name" placeholder="例如 Atlas" /></label>
-                <label class="field"><span>主机<em class="req">*</em></span><input v-model="draft.host" class="mono" data-field="host" placeholder="db.example.internal" :aria-invalid="Boolean(fieldErrors.host)" /><small v-if="fieldErrors.host" class="field-err">{{ fieldErrors.host }}</small></label>
-                <label class="field"><span>端口<em class="req">*</em></span><input v-model="draft.port" class="mono" data-field="port" :aria-invalid="Boolean(fieldErrors.port)" /><small v-if="fieldErrors.port" class="field-err">{{ fieldErrors.port }}</small></label>
-                <label class="field"><span>数据库</span><input v-model="draft.database" class="mono" :placeholder="draft.engine === 'postgres' ? 'postgres' : '可选'" /></label>
-                <label class="field"><span>用户名<em class="req">*</em></span><input v-model="draft.username" class="mono" data-field="username" :aria-invalid="Boolean(fieldErrors.username)" /><small v-if="fieldErrors.username" class="field-err">{{ fieldErrors.username }}</small></label>
-                <label class="field full"><span>密码</span><input v-model="secrets.password" type="password" autocomplete="new-password" /><small>留空则继续使用系统凭据库里已保存的密码。密码不会写入普通配置。</small></label>
-                <label class="check full"><input v-model="draft.savePassword" type="checkbox" /><span>把密码保存到系统凭据库<small>不勾选时，每次连接都会询问密码。</small></span></label>
-              </div>
-              <EnvTagField v-model="draft.env" :tags="tags" :error="tagError" @save="saveTag" @remove="removeTag" />
-              <div class="route-box"><span class="muted sm">连接路径</span><div class="route"><ConnIcon name="monitor" /><span>本机</span><template v-if="draft.sshOn"><i class="route-line"></i><span class="route-hop"><ConnIcon name="tunnel" />{{ draft.sshHost || "跳板机" }}:{{ draft.sshPort }}</span></template><i class="route-line"></i><span class="route-hop"><ConnIcon name="database" />{{ draft.host || "数据库主机" }}:{{ draft.port || "?" }}</span></div></div>
-            </template>
-            <template v-else-if="section === 'tls'">
-              <div class="radio-stack">
-                <label v-for="item in ([['verify', '要求加密，并验证证书和主机名', '推荐。主机名不符时直接失败。'], ['require', '要求加密，但不验证证书', '握手失败时不会退回明文。'], ['off', '不加密', '只适合本机或完全可信的网络。']] as [TlsMode, string, string][])" :key="item[0]" class="radio-card" :class="{ on: draft.tlsMode === item[0] }">
-                  <input type="radio" name="cf-tls" :value="item[0]" :checked="draft.tlsMode === item[0]" @change="draft.tlsMode = item[0]" />
-                  <span><b>{{ item[1] }}</b><small>{{ item[2] }}</small></span>
-                </label>
-              </div>
-              <div v-if="draft.tlsMode !== 'off'" class="form-grid">
-                <label class="field"><span>受信任的 CA</span><select v-model="draft.caMode"><option value="system">系统信任根</option><option value="file">指定 CA 文件</option></select></label>
-                <label v-if="draft.caMode === 'file'" class="field"><span>CA 证书文件</span><input v-model="draft.caFile" class="mono" /><small v-if="fieldErrors.caFile" class="field-err">{{ fieldErrors.caFile }}</small></label>
-                <label class="field"><span>客户端证书（可选）</span><input v-model="draft.clientCert" class="mono" /></label>
-                <label class="field"><span>客户端私钥（可选）</span><input v-model="draft.clientKey" class="mono" /></label>
-              </div>
-              <div v-if="draft.tlsMode === 'verify'" class="tls-name">
-                <ConnIcon name="shield" />
-                <div>
-                  <b>证书校验使用的主机名：<code>{{ draft.host || "（填写主机后显示）" }}</code></b>
-                  <small data-tls-copy>{{ tlsVerificationCopy(draft) }}</small>
-                </div>
-              </div>
-              <div v-if="draft.tlsMode !== 'off'" class="callout callout-warn"><ConnIcon name="info" /><div>验证失败时连接直接终止：不会自动降低验证级别，也不会退回不加密连接重试。</div></div>
-              <div v-else class="callout callout-warn"><ConnIcon name="unlock" /><div>连接不加密：数据库密码和查询数据会以明文在网络上传输。</div></div>
-            </template>
-            <template v-else>
-              <label class="check"><input v-model="draft.sshOn" type="checkbox" data-field="sshOn" /><span><b>通过 SSH 跳板机连接</b><small>首版支持单跳。每条本地连接单独打开一条到数据库的通道。</small></span></label>
-              <div v-if="draft.sshOn" class="form-grid">
-                <label class="field"><span>跳板机主机<em class="req">*</em></span><input v-model="draft.sshHost" class="mono" data-field="sshHost" /><small v-if="fieldErrors.sshHost" class="field-err">{{ fieldErrors.sshHost }}</small></label>
-                <label class="field"><span>SSH 端口</span><input v-model="draft.sshPort" class="mono" /><small v-if="fieldErrors.sshPort" class="field-err">{{ fieldErrors.sshPort }}</small></label>
-                <label class="field"><span>SSH 用户<em class="req">*</em></span><input v-model="draft.sshUser" class="mono" data-field="sshUser" /><small v-if="fieldErrors.sshUser" class="field-err">{{ fieldErrors.sshUser }}</small></label>
-                <label class="field"><span>认证方式</span><span class="seg-radio"><label :class="{ on: draft.sshAuth === 'key' }"><input type="radio" name="cf-sshauth" value="key" :checked="draft.sshAuth === 'key'" @change="draft.sshAuth = 'key'" />私钥</label><label :class="{ on: draft.sshAuth === 'password' }"><input type="radio" name="cf-sshauth" value="password" :checked="draft.sshAuth === 'password'" @change="draft.sshAuth = 'password'" />密码</label></span></label>
-                <template v-if="draft.sshAuth === 'key'">
-                  <label class="field"><span>私钥文件</span><input v-model="draft.sshKey" class="mono" /></label>
-                  <label class="field"><span>私钥口令（如有）</span><input v-model="secrets.passphrase" type="password" autocomplete="new-password" /><small>只用于解锁私钥，不写入配置或日志。</small></label>
-                </template>
-                <label v-else class="field full"><span>SSH 密码</span><input v-model="secrets.sshPassword" type="password" autocomplete="new-password" /></label>
-              </div>
-              <div v-if="draft.sshOn" class="host-key">
-                <ConnIcon name="key" />
-                <div>
-                  <b>主机密钥</b>
-                  <small v-if="knownHostKey">已信任 <code>{{ knownHostKey }}</code>。如果服务器出示的密钥与此不同，连接会被阻止。</small>
-                  <small v-else>尚未记录。首次连接时会显示指纹，需要你核对后确认。</small>
-                </div>
-                <button v-if="knownHostKey" class="btn sm ghost" type="button" @click="forgetHostKey">忘记已保存的密钥</button>
-              </div>
-              <div class="route-box"><span class="muted sm">连接路径</span><div class="route"><span>本机</span><template v-if="draft.sshOn"><i class="route-line"></i><span class="route-hop">{{ draft.sshHost || "跳板机" }}:{{ draft.sshPort }}</span></template><i class="route-line"></i><span class="route-hop">{{ draft.host || "数据库主机" }}:{{ draft.port || "?" }}</span></div></div>
-            </template>
-          </div>
-        </div>
-        <div v-if="report" class="test-panel" :class="report.status" role="status">
-          <div class="test-head">
-            <b>{{ report.status === "ok" ? "连接测试通过" : report.status === "wait" ? "等待你确认主机身份" : `连接测试失败：${report.failStage || ""}` }}</b>
-            <span v-if="report.summary" class="muted sm">{{ report.summary }}</span>
-          </div>
-          <ol class="test-steps">
-            <li v-for="stage in report.stages" :key="stage.label" class="ts" :class="`ts-${stage.status === 'skipped' ? 'skip' : stage.status}`">
-              <span class="ts-i"><ConnIcon :name="stage.status === 'ok' ? 'check' : stage.status === 'err' ? 'x' : stage.status === 'wait' ? 'key' : 'minus'" /></span>
-              <span class="ts-name">{{ stage.label }}</span>
-              <span class="ts-msg">{{ stage.message }}</span>
-            </li>
-          </ol>
-          <div v-if="report.status === 'wait'" class="fp-card">
-            <p>首次连接 <code>{{ draft.sshHost }}:{{ draft.sshPort }}</code>。请通过可信渠道核对指纹，确认一致后再继续。</p>
-            <pre>{{ report.algorithm }}  {{ report.fingerprint }}</pre>
-            <div class="fp-actions">
-              <button class="btn sm" type="button" @click="rejectHostKey">不信任，停止</button>
-              <button class="btn sm primary" type="button" @click="trustHostKey">指纹一致，信任并继续</button>
+
+        <div v-if="draft.engine === 'sqlite'" class="form-grid">
+          <label class="field full"><span>连接名称</span><input v-model="draft.name" placeholder="例如 本地笔记" /></label>
+          <label class="field full">
+            <span>数据库文件<em class="req">*</em></span>
+            <div class="input-row">
+              <input v-model="draft.filePath" class="mono" data-field="filePath" placeholder="选择已有的 .db / .sqlite 文件" :aria-invalid="Boolean(fieldErrors.filePath)" />
+              <button class="btn" type="button" data-action="cf-browse" @click="browseSqlite"><ConnIcon name="file" />选择…</button>
             </div>
-          </div>
-          <p v-if="report.hint" class="test-hint">{{ report.hint }}</p>
+            <small v-if="fieldErrors.filePath" class="field-err">{{ fieldErrors.filePath }}</small>
+            <small v-else>只打开已有文件。删除这个连接不会删除文件。</small>
+          </label>
         </div>
-        <p v-else class="muted sm">测试阶段：{{ plannedStageLabels(draft).join(" → ") }}</p>
+        <div v-else class="form-grid">
+          <label class="field full"><span>连接名称</span><input v-model="draft.name" placeholder="例如 Atlas" /></label>
+          <label class="field"><span>主机<em class="req">*</em></span><input v-model="draft.host" class="mono" data-field="host" placeholder="db.example.internal" :aria-invalid="Boolean(fieldErrors.host)" /><small v-if="fieldErrors.host" class="field-err">{{ fieldErrors.host }}</small></label>
+          <label class="field"><span>端口<em class="req">*</em></span><input v-model="draft.port" class="mono" data-field="port" :aria-invalid="Boolean(fieldErrors.port)" /><small v-if="fieldErrors.port" class="field-err">{{ fieldErrors.port }}</small></label>
+          <label class="field"><span>数据库</span><input v-model="draft.database" class="mono" :placeholder="draft.engine === 'postgres' ? 'postgres' : '可选'" /></label>
+          <label class="field"><span>用户名<em class="req">*</em></span><input v-model="draft.username" class="mono" data-field="username" :aria-invalid="Boolean(fieldErrors.username)" /><small v-if="fieldErrors.username" class="field-err">{{ fieldErrors.username }}</small></label>
+          <label class="field full"><span>密码</span><input v-model="secrets.password" type="password" autocomplete="new-password" /><small>留空则继续使用系统凭据库里已保存的密码。密码不会写入普通配置。</small></label>
+          <label class="check full"><input v-model="draft.savePassword" type="checkbox" /><span>把密码保存到系统凭据库<small>不勾选时，每次连接都会询问密码。</small></span></label>
+        </div>
+        <div v-if="draft.engine === 'sqlite'" class="callout callout-info"><ConnIcon name="info" /><div>SQLite 是本地文件，不需要 TLS 或 SSH。连接后会显示外键约束（foreign_keys）的实际状态——SQLite 默认不强制外键。</div></div>
+
+        <details class="disclosure ce-advanced" data-section="advanced" :open="advancedOpen" @toggle="syncAdvanced">
+          <summary>高级选项 <span class="muted">{{ advancedHint }}</span></summary>
+          <div class="disclosure-body">
+            <EnvTagField v-model="draft.env" :tags="tags" :error="tagError" @save="saveTag" @remove="removeTag" />
+            <template v-if="draft.engine !== 'sqlite'">
+              <section class="adv-sec">
+                <h3>TLS 加密</h3>
+                <p class="adv-note">保护密码和查询数据在传输中不被窃听。直连可信网络时通常保持默认即可。</p>
+                <div class="radio-stack">
+                  <label v-for="item in ([['verify', '要求加密，并核对证书和主机名', '推荐。主机名不符时直接失败。'], ['require', '要求加密，但不核对证书', '无法加密时不会退回明文连接。'], ['off', '不加密', '只适合本机或完全可信的网络。']] as [TlsMode, string, string][])" :key="item[0]" class="radio-card" :class="{ on: draft.tlsMode === item[0] }">
+                    <input type="radio" name="cf-tls" :value="item[0]" :checked="draft.tlsMode === item[0]" @change="draft.tlsMode = item[0]" />
+                    <span><b>{{ item[1] }}</b><small>{{ item[2] }}</small></span>
+                  </label>
+                </div>
+                <div v-if="draft.tlsMode !== 'off'" class="form-grid">
+                  <label class="field"><span>受信任的 CA</span><select v-model="draft.caMode"><option value="system">系统信任根</option><option value="file">指定 CA 文件</option></select></label>
+                  <label v-if="draft.caMode === 'file'" class="field"><span>CA 证书文件</span><input v-model="draft.caFile" class="mono" data-field="caFile" /><small v-if="fieldErrors.caFile" class="field-err">{{ fieldErrors.caFile }}</small></label>
+                  <label class="field"><span>客户端证书（可选）</span><input v-model="draft.clientCert" class="mono" /></label>
+                  <label class="field"><span>客户端私钥（可选）</span><input v-model="draft.clientKey" class="mono" /></label>
+                </div>
+                <div v-if="draft.tlsMode === 'verify'" class="tls-name">
+                  <ConnIcon name="shield" />
+                  <div>
+                    <b>证书按主机名 <code>{{ draft.host || "（填写主机后显示）" }}</code> 核对</b>
+                    <small data-tls-copy>{{ tlsVerificationCopy(draft) }}</small>
+                  </div>
+                </div>
+                <div v-if="draft.tlsMode !== 'off'" class="callout callout-warn"><ConnIcon name="info" /><div>核对失败时连接直接终止：不会自动降低验证级别，也不会退回不加密连接重试。</div></div>
+                <div v-else class="callout callout-warn"><ConnIcon name="unlock" /><div>连接不加密：数据库密码和查询数据会以明文在网络上传输。</div></div>
+              </section>
+              <section class="adv-sec">
+                <h3>SSH 跳板机</h3>
+                <p class="adv-note">数据库无法从本机直接访问时，可以经过一台 SSH 服务器中转。</p>
+                <label class="check"><input v-model="draft.sshOn" type="checkbox" data-field="sshOn" /><span><b>通过 SSH 跳板机连接</b><small>支持单跳。每条连接单独打开一条到数据库的通道。</small></span></label>
+                <div v-if="draft.sshOn" class="form-grid">
+                  <label class="field"><span>跳板机主机<em class="req">*</em></span><input v-model="draft.sshHost" class="mono" data-field="sshHost" /><small v-if="fieldErrors.sshHost" class="field-err">{{ fieldErrors.sshHost }}</small></label>
+                  <label class="field"><span>SSH 端口</span><input v-model="draft.sshPort" class="mono" data-field="sshPort" /><small v-if="fieldErrors.sshPort" class="field-err">{{ fieldErrors.sshPort }}</small></label>
+                  <label class="field"><span>SSH 用户<em class="req">*</em></span><input v-model="draft.sshUser" class="mono" data-field="sshUser" /><small v-if="fieldErrors.sshUser" class="field-err">{{ fieldErrors.sshUser }}</small></label>
+                  <label class="field"><span>登录方式</span><span class="seg-radio"><label :class="{ on: draft.sshAuth === 'key' }"><input type="radio" name="cf-sshauth" value="key" :checked="draft.sshAuth === 'key'" @change="draft.sshAuth = 'key'" />私钥</label><label :class="{ on: draft.sshAuth === 'password' }"><input type="radio" name="cf-sshauth" value="password" :checked="draft.sshAuth === 'password'" @change="draft.sshAuth = 'password'" />密码</label></span></label>
+                  <template v-if="draft.sshAuth === 'key'">
+                    <label class="field"><span>私钥文件</span><input v-model="draft.sshKey" class="mono" /></label>
+                    <label class="field"><span>私钥口令（如有）</span><input v-model="secrets.passphrase" type="password" autocomplete="new-password" /><small>只用于解锁私钥，不写入配置或日志。</small></label>
+                  </template>
+                  <label v-else class="field full"><span>SSH 密码</span><input v-model="secrets.sshPassword" type="password" autocomplete="new-password" /></label>
+                </div>
+                <div v-if="draft.sshOn" class="host-key">
+                  <ConnIcon name="key" />
+                  <div>
+                    <b>跳板机身份</b>
+                    <small v-if="knownHostKey">已信任指纹 <code>{{ knownHostKey }}</code>。服务器出示的指纹与此不同时，连接会被阻止。</small>
+                    <small v-else>尚未记录。首次连接时会显示指纹，核对一致后再继续。</small>
+                  </div>
+                  <button v-if="knownHostKey" class="btn sm ghost" type="button" @click="forgetHostKey">忘记已保存的指纹</button>
+                </div>
+                <div v-if="draft.sshOn" class="route-box">
+                  <span class="muted sm">连接路径</span>
+                  <div class="route">
+                    <span class="route-hop"><ConnIcon name="monitor" />本机</span>
+                    <i class="route-line"></i>
+                    <span class="route-hop"><ConnIcon name="tunnel" />{{ draft.sshHost || "跳板机" }}:{{ draft.sshPort }}</span>
+                    <i class="route-line"></i>
+                    <span class="route-hop"><ConnIcon name="database" />{{ draft.host || "数据库主机" }}:{{ draft.port || "?" }}</span>
+                  </div>
+                </div>
+              </section>
+            </template>
+          </div>
+        </details>
+
+        <div v-if="report" class="test-panel" :class="report.status" role="status">
+          <p v-if="report.status === 'ok'" class="test-line ok"><ConnIcon name="check" />连接成功{{ report.summary ? ` · ${report.summary}` : "" }}</p>
+          <template v-else-if="report.status === 'wait'">
+            <p class="test-line wait"><ConnIcon name="key" />第一次连接这台 SSH 跳板机，需要先确认它的身份</p>
+            <div class="fp-card">
+              <p>请通过可信渠道核对 <code>{{ draft.sshHost }}:{{ draft.sshPort }}</code> 的指纹，确认一致后再继续。不一致说明可能连到了别的机器。</p>
+              <pre>{{ report.algorithm }}  {{ report.fingerprint }}</pre>
+              <div class="fp-actions">
+                <button class="btn sm" type="button" @click="rejectHostKey">不一致，停止</button>
+                <button class="btn sm primary" type="button" @click="trustHostKey">指纹一致，信任并继续</button>
+              </div>
+            </div>
+          </template>
+          <template v-else>
+            <p class="test-line err"><ConnIcon name="x" />连接失败：{{ report.failStage || "未知原因" }}</p>
+            <p v-if="failedStage?.message" class="test-detail" data-test-fail>{{ failedStage.message }}</p>
+            <p v-if="report.hint" class="test-detail">{{ report.hint }}</p>
+            <details class="disclosure test-all">
+              <summary>查看各阶段 <span class="muted">{{ report.stages.length }} 个步骤的完整结果</span></summary>
+              <div class="disclosure-body">
+                <ol class="test-steps">
+                  <li v-for="stage in report.stages" :key="stage.label" class="ts" :class="`ts-${stage.status === 'skipped' ? 'skip' : stage.status}`">
+                    <span class="ts-i"><ConnIcon :name="stage.status === 'ok' ? 'check' : stage.status === 'err' ? 'x' : stage.status === 'wait' ? 'key' : 'minus'" /></span>
+                    <span class="ts-name">{{ stage.label }}</span>
+                    <span class="ts-msg">{{ stage.message }}</span>
+                  </li>
+                </ol>
+              </div>
+            </details>
+          </template>
+        </div>
+        <details v-else class="disclosure test-plan">
+          <summary>「测试连接」会检查什么 <span class="muted">依次执行 {{ plannedStageLabels(draft).length }} 个步骤</span></summary>
+          <div class="disclosure-body">
+            <ol class="plan-steps">
+              <li v-for="label in plannedStageLabels(draft)" :key="label">{{ label }}</li>
+            </ol>
+          </div>
+        </details>
       </div>
       <div class="modal-foot">
         <button class="btn" type="button" data-action="cf-test" :disabled="busy" @click="runTest"><ConnIcon name="play" />测试连接</button>
@@ -596,29 +626,40 @@ watch(
 
     <dialog ref="otherDialog" class="modal" :class="dialog === 'delete' ? 'modal-md' : 'modal-sm'" @cancel.prevent="dialog = null">
       <template v-if="dialog === 'delete' && deleteTarget">
-        <div class="modal-head"><div><h2>删除连接配置？</h2><p class="modal-sub">{{ deleteTarget.name }}</p></div></div>
+        <div class="modal-head"><div class="modal-titles"><h2>删除连接「{{ deleteTarget.name }}」？</h2><p class="modal-sub">删除前请确认下面两条</p></div></div>
         <div class="modal-body">
           <ul class="facts">
-            <li>删除澄库中保存的这条配置，以及系统凭据库中对应的密码。</li>
-            <li><b>不会</b>删除{{ deleteTarget.engine === "sqlite" ? ` SQLite 文件 ${deleteTarget.filePath}` : "数据库或其中的任何数据" }}。</li>
+            <li><ConnIcon name="check" />会删除：本机保存的这条连接配置{{ deleteTarget.passwordSaved ? "，以及系统凭据库里保存的对应密码" : "" }}。</li>
+            <li><ConnIcon name="x" />不会删除：{{ deleteTarget.engine === "sqlite" ? `SQLite 文件 ${deleteTarget.filePath}` : "数据库本身和其中的任何数据" }}。</li>
           </ul>
         </div>
-        <div class="modal-foot"><span class="grow"></span><button class="btn" type="button" @click="closeDialog(otherDialog)">取消</button><button class="btn primary" type="button" data-action="confirm-delete" @click="confirmDelete">删除配置</button></div>
+        <div class="modal-foot"><span class="grow"></span><button class="btn" type="button" @click="closeDialog(otherDialog)">取消</button><button class="btn danger" type="button" data-action="confirm-delete" @click="confirmDelete">删除配置</button></div>
       </template>
       <template v-else-if="dialog === 'password' && passwordTarget">
-        <div class="modal-head"><div><h2>连接 {{ passwordTarget.name }}</h2><p class="modal-sub">此连接没有保存密码，因此每次都会询问。</p></div></div>
+        <div class="modal-head"><div class="modal-titles"><h2>连接 {{ passwordTarget.name }}</h2><p class="modal-sub">这条连接没有保存密码，所以每次都会询问。</p></div></div>
         <div class="modal-body">
           <label class="field"><span>数据库密码</span><input v-model="promptPassword" type="password" autocomplete="current-password" /></label>
-          <label class="check"><input v-model="promptSave" type="checkbox" /><span>保存到系统凭据库</span></label>
+          <label class="check"><input v-model="promptSave" type="checkbox" /><span>保存到系统凭据库，以后不再询问</span></label>
         </div>
         <div class="modal-foot"><span class="grow"></span><button class="btn" type="button" @click="closeDialog(otherDialog)">取消</button><button class="btn primary" type="button" @click="submitPrompt">连接</button></div>
       </template>
       <template v-else-if="detailTarget">
-        <div class="modal-head"><div><h2>{{ detailTarget.name }}</h2><p class="modal-sub">{{ engineMeta(detailTarget.engine).label }}</p></div></div>
+        <div class="modal-head"><div class="modal-titles"><h2>{{ detailTarget.name }}</h2><p class="modal-sub">{{ engineMeta(detailTarget.engine).label }}</p></div></div>
         <div class="modal-body">
           <dl class="kv">
-            <dt>密码</dt><dd>{{ detailTarget.passwordSaved ? "保存在系统凭据库" : "每次询问" }}</dd>
-            <dt>传输</dt><dd>{{ detailTarget.engine === "sqlite" ? "本地文件，没有 TLS" : detailTarget.tls?.mode === "verify" ? `按主机名 ${detailTarget.tls.serverName} 校验` : detailTarget.tls?.mode === "require" ? "已加密 · 未验证证书" : "未加密" }}</dd>
+            <template v-if="detailTarget.engine === 'sqlite'">
+              <dt>文件</dt><dd class="mono">{{ detailTarget.filePath }}</dd>
+            </template>
+            <template v-else>
+              <dt>地址</dt><dd class="mono">{{ detailTarget.host }}:{{ detailTarget.port }}</dd>
+              <dt>数据库</dt><dd>{{ detailTarget.database || "—" }}</dd>
+              <dt>用户</dt><dd class="mono">{{ detailTarget.username }}</dd>
+            </template>
+            <dt>密码</dt><dd>{{ detailTarget.passwordSaved ? "保存在系统凭据库" : "每次连接时询问" }}</dd>
+            <dt>传输</dt><dd>{{ detailTarget.engine === "sqlite" ? "本地文件，不经过网络" : detailTarget.tls?.mode === "verify" ? `加密连接，按主机名 ${detailTarget.tls.serverName} 核对证书` : detailTarget.tls?.mode === "require" ? "加密连接，不核对证书" : "不加密" }}</dd>
+            <template v-if="detailTarget.ssh">
+              <dt>中转</dt><dd class="mono">经 SSH 跳板机 {{ detailTarget.ssh.host }}:{{ detailTarget.ssh.port }}</dd>
+            </template>
           </dl>
         </div>
         <div class="modal-foot"><button class="btn" type="button" @click="openEditor(detailTarget)">编辑配置</button><span class="grow"></span><button class="btn" type="button" @click="closeDialog(otherDialog)">关闭</button></div>
