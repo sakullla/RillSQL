@@ -127,14 +127,14 @@ export interface SelectGate {
   statement: string | null;
 }
 
-/** 去掉注释后只接受单条 SELECT。WITH、多语句和非 SELECT 都不能全量导出。 */
+/** 去掉注释后只接受单条 SELECT。WITH、多语句和非 SELECT 都不能完整导出。 */
 export function selectExportGate(sql: string): SelectGate {
   const statements = splitSql(sql).map((item) => item.trim()).filter(Boolean);
   if (!statements.length) return { ok: false, reason: "没有可导出的语句", statement: null };
-  if (statements.length > 1) return { ok: false, reason: "全量导出只接受单条 SELECT", statement: null };
+  if (statements.length > 1) return { ok: false, reason: "完整导出只接受单条 SELECT 语句", statement: null };
   const statement = statements[0]!;
   const keyword = /^[A-Za-z]+/.exec(statement)?.[0]?.toUpperCase() ?? "";
-  if (keyword !== "SELECT") return { ok: false, reason: "只有 SELECT 可以重新执行并全量导出", statement };
+  if (keyword !== "SELECT") return { ok: false, reason: "只有 SELECT 可以重新执行并完整导出", statement };
   return { ok: true, reason: null, statement };
 }
 

@@ -101,10 +101,10 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
   <div class="data-grid" aria-label="查询结果" :data-tab-id="tabId" data-scope="loaded">
     <div class="result-toolbar">
       <input v-model="find" aria-label="在已读取行中查找" placeholder="在已读取行中查找" />
-      <span class="scope-tag local">{{ view.note }}</span>
-      <span class="hint">结果只读，不能新增、修改或删除</span>
+      <p class="toolbar-hint">查找和排序{{ view.note }}，不会查询数据库。</p>
       <span class="grow"></span>
-      <button class="btn" type="button" @click="exportOpen = true">导出</button>
+      <span class="hint">结果只读，不能新增、修改或删除</span>
+      <button class="btn sm" type="button" @click="exportOpen = true">导出</button>
     </div>
     <div class="grid-scroll">
       <table class="grid-table">
@@ -123,13 +123,16 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
               <span v-else>{{ showCell(row.cells[column.name] ?? null).label }}</span>
             </td>
           </tr>
+          <tr v-if="!view.rows.length">
+            <td class="grid-empty" :colspan="columns.length">已读取的行里没有匹配「{{ find }}」的行。</td>
+          </tr>
         </tbody>
       </table>
     </div>
     <footer class="grid-foot">
-      <span>已读取 <b>{{ rows.length }}</b> 行</span>
-      <span v-if="truncated">还有未加载数据</span>
-      <span>查找和排序{{ view.note }}</span>
+      <span v-if="truncated">已读取前 <b>{{ rows.length }}</b> 行，结果没有读完。</span>
+      <span v-else>已读取全部结果行（{{ rows.length }} 行）。</span>
+      <span v-if="truncated" class="muted">需要完整结果时，可导出「完整结果」，会重新执行这条查询。</span>
     </footer>
     <ExportDialog
       :open="exportOpen"

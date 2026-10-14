@@ -57,13 +57,13 @@ export class LiveTable {
   }
 
   get scopeLabel(): string {
-    return this.ready ? "服务器端 · 整张表" : "等待已打开的连接";
+    return "筛选和排序作用于整张表";
   }
 
   get keyLabel(): string {
     if (!this.ready) return "正在读取表结构";
     if (this.store.schema.kind === "view") return "只读视图";
-    if (!this.store.schema.key.length) return "无主键 · 只能新增";
+    if (!this.store.schema.key.length) return "这张表没有主键，只能新增";
     return `按 ${this.store.schema.key.join(" + ")} 定位行`;
   }
 
@@ -171,7 +171,7 @@ export class LiveTable {
   stageUpdate(rowId: string, column: string, value: Cell): string | null {
     const row = this.rowById(rowId);
     if (!row) return "找不到行";
-    if (!this.canUpdate(row)) return "无法唯一定位，不能修改";
+    if (!this.canUpdate(row)) return "无法唯一确定这一行，不能修改";
     const sets = { ...(this.edits.get(rowId) ?? {}), [column]: value };
     this.edits.set(rowId, sets);
     this.failures.delete(`u:${rowId}`);
@@ -179,7 +179,7 @@ export class LiveTable {
   }
 
   addRow(): string | null {
-    if (!this.canInsert) return "只有基础表可以新增";
+    if (!this.canInsert) return "只有数据表可以新增，视图不行";
     const id = `new-${draftSeq}`;
     draftSeq += 1;
     const cells: Record<string, Cell | undefined> = {};
@@ -210,7 +210,7 @@ export class LiveTable {
       if (this.selectedId === id) this.selectedId = null;
       return null;
     }
-    if (!this.canDeleteRow(id)) return "无法唯一定位，不能删除";
+    if (!this.canDeleteRow(id)) return "无法唯一确定这一行，不能删除";
     if (!this.deletes.includes(id)) this.deletes.push(id);
     this.edits.delete(id);
     return null;

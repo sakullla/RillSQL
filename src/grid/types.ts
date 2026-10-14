@@ -94,7 +94,7 @@ export interface CommitReport {
   rule: string;
 }
 
-export const COMMIT_RULE = "按顺序逐条提交，遇到错误即停止；已成功的语句不会自动撤销。";
+export const COMMIT_RULE = "按顺序逐条提交，遇到错误即停止；已成功的语句不撤销。";
 
 export interface FilterOpMeta {
   id: FilterOp;

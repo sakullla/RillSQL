@@ -61,7 +61,7 @@ describe("grid batches, nulls and server filters", () => {
     session.cycleSort("name");
     expect(session.loaded[0]?.cells.name).toBe("000-first");
     expect(session.sql).toContain("ORDER BY");
-    expect(session.scopeLabel).toBe("服务器端 · 整张表");
+    expect(session.scopeLabel).toBe("筛选和排序作用于整张表");
   });
 
   it("keeps null and empty string filters apart", () => {
@@ -243,8 +243,6 @@ describe("grid views", () => {
   });
 
   it("reads an opened table through grid commands instead of the fixture", async () => {
-    expect(readFileSync(join(process.cwd(), "src/grid/DataGrid.vue"), "utf8")).not.toContain("fixtureForTab");
-    expect(readFileSync(join(process.cwd(), "src/grid/QueryResultGrid.vue"), "utf8")).not.toContain("readRows");
     invoke.mockImplementation(async (command: string, args: { request?: { offset?: number; limit?: number; table?: string } }) => {
       if (command === "grid_describe") return customerSchema();
       if (command === "grid_page") {
@@ -264,10 +262,11 @@ describe("grid views", () => {
     expect(invoke.mock.calls.map((call) => call[0])).toEqual(expect.arrayContaining(["grid_describe", "grid_page"]));
     expect(wrapper.attributes("data-tab-id")).toBe("table:shop:app:public:customers");
     expect(wrapper.attributes("data-draft")).toBe("");
-    expect(wrapper.text()).toContain("已读取");
-    expect(wrapper.text()).toContain("100");
-    expect(wrapper.text()).toContain("还有未加载数据");
-    expect(wrapper.text()).toContain("服务器端 · 整张表");
+    expect(wrapper.text()).toContain("已读取前 100 行");
+    expect(wrapper.text()).toContain("筛选和排序作用于整张表");
+    expect(wrapper.text()).not.toContain("服务器端");
+    expect(wrapper.find("button[aria-label='继续读取']").exists()).toBe(true);
+    expect(wrapper.find(".grid-foot .v-null").exists()).toBe(false);
     expect(wrapper.find(".v-null").text()).toBe("NULL");
     expect(wrapper.text()).toContain("空字符串");
     expect(wrapper.text()).not.toContain("长".repeat(200));
@@ -353,7 +352,9 @@ describe("grid views", () => {
     const remove = wrapper.findAll("button").find((button) => button.text() === "删除行");
     expect(add!.attributes("disabled")).toBeUndefined();
     expect(remove!.attributes("disabled")).toBeDefined();
-    expect(wrapper.text()).toContain("无主键 · 只能新增");
+    expect(wrapper.text()).toContain("这张表没有主键，无法唯一确定已有行，所以不能修改或删除它们。");
+    expect(wrapper.text()).not.toContain("按 label 定位行");
+    expect(wrapper.find(".key-chip").exists()).toBe(false);
     expect(invoke.mock.calls.some((call) => call[0] === "grid_describe")).toBe(true);
     wrapper.unmount();
   });
@@ -387,18 +388,65 @@ describe("grid views", () => {
     const email = wrapper.findAll("button.cell-btn").find((button) => button.text() === "u1@example.com");
     await email!.trigger("dblclick");
     await wrapper.get("input[aria-label='编辑 email']").setValue("u2@example.com");
-    await wrapper.findAll("button").find((button) => button.text() === "暂存")!.trigger("click");
-    await wrapper.findAll("button").find((button) => button.text() === "预览并提交")!.trigger("click");
-    await wrapper.findAll("button").find((button) => button.text() === "提交变更")!.trigger("click");
+    await wrapper.findAll("button").find((button) => button.text() === "确定")!.trigger("click");
+    expect(wrapper.get(".pending-bar").text()).toContain("1 处更改未保存");
+    await wrapper.findAll("button").find((button) => button.text() === "提交")!.trigger("click");
+    expect(wrapper.find("[aria-label='待提交的更改']").exists()).toBe(true);
+    await wrapper.findAll("button").find((button) => button.text() === "提交 1 处更改")!.trigger("click");
     await flushPromises();
-    expect(wrapper.find("[aria-label='提交数据变更']").exists()).toBe(false);
+    expect(wrapper.find("[aria-label='待提交的更改']").exists()).toBe(false);
     const bar = wrapper.get(".pending-bar");
-    expect(bar.text()).toContain("1 行提交失败，仍留在暂存区");
+    expect(bar.text()).toContain("1 处更改未保存");
+    expect(bar.text()).toContain("0 处已保存，1 处失败");
     expect(bar.text()).toContain('duplicate key value violates unique constraint "customers_email_key"');
     expect(bar.text()).toContain("DETAIL: Key (email)=(u2@example.com) already exists.");
     const failed = wrapper.get("tr.row-failed");
     expect(failed.attributes("data-row-id")).toBe("1");
     expect(failed.attributes("title")).toBe(duplicate);
+    wrapper.unmount();
+  });
+
+  it("edits with desktop keys and marks deleted rows clearly", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") {
+        return {
+          rows: [customerRow(1), customerRow(2)],
+          truncated: false,
+          sql: 'SELECT "id" FROM "public"."customers" LIMIT 10',
+        };
+      }
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:shop:app:public:customers", draft: "", pageSize: 10, target: customersTarget } });
+    await flushPromises();
+    const name = wrapper.get('[data-cell="1:name"]');
+    await name.trigger("click");
+    await name.trigger("keydown", { key: "Enter" });
+    expect(wrapper.find("input[aria-label='编辑 name']").exists()).toBe(true);
+    await wrapper.get("input[aria-label='编辑 name']").setValue("键盘改名");
+    await wrapper.get("input[aria-label='编辑 name']").trigger("keydown", { key: "Escape" });
+    expect(wrapper.find("input[aria-label='编辑 name']").exists()).toBe(false);
+    expect(wrapper.get('[data-cell="1:name"]').text()).toBe("客户1");
+    expect(wrapper.find(".pending-bar").exists()).toBe(false);
+    const cell = wrapper.get('[data-cell="1:name"]');
+    await cell.trigger("keydown", { key: "Enter" });
+    const input = wrapper.get("input[aria-label='编辑 name']");
+    await input.setValue("键盘改名");
+    await input.trigger("keydown", { key: "Tab" });
+    expect(wrapper.find("input[aria-label='编辑 name']").exists()).toBe(false);
+    expect(wrapper.get('[data-cell="1:name"]').text()).toBe("键盘改名");
+    expect(wrapper.get(".pending-bar").text()).toContain("1 处更改未保存");
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("1:email");
+    await wrapper.findAll("button").find((button) => button.text() === "删除行")!.trigger("click");
+    const row = wrapper.get("tr[data-row-id='1']");
+    expect(row.classes()).toContain("row-delete");
+    expect(wrapper.get('[data-cell="1:id"]').text()).toContain("将删除");
+    expect(wrapper.get(".pending-bar").text()).toContain("1 处更改未保存");
+    await wrapper.findAll("button").find((button) => button.text() === "放弃")!.trigger("click");
+    expect(wrapper.find(".pending-bar").exists()).toBe(false);
+    expect(wrapper.get('[data-cell="1:name"]').text()).toBe("客户1");
+    expect(wrapper.get("tr[data-row-id='1']").classes()).not.toContain("row-delete");
     wrapper.unmount();
   });
 
@@ -435,13 +483,14 @@ describe("grid views", () => {
       },
     });
     expect(wrapper.text()).toContain("仅作用于已读取的 100 行");
-    expect(wrapper.text()).toContain("还有未加载数据");
+    expect(wrapper.text()).toContain("已读取前 100 行");
+    expect(wrapper.text()).toContain("结果没有读完");
     await wrapper.get("[aria-label='在已读取行中查找']").setValue("000-first");
     expect(wrapper.find("[data-row-id]").exists()).toBe(false);
     const exportButton = wrapper.findAll("button").find((button) => button.text() === "导出");
     await exportButton!.trigger("click");
     await wrapper.get("input[value='full']").setValue("full");
-    expect(wrapper.text()).toContain("只有 SELECT 可以重新执行并全量导出");
+    expect(wrapper.text()).toContain("只有 SELECT 可以重新执行并完整导出");
     wrapper.unmount();
   });
 

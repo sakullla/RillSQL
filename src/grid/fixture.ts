@@ -74,14 +74,3 @@ export function viewFixture(): TableStore {
   return { schema, rows: materialize(schema, [{ id: "1", cells: { id: "1", name: "只读" } }]), readError: null };
 }
 
-export function fixtureForTab(tabId: string): TableStore {
-  const name = tabId.startsWith("table:") ? tabId.slice("table:".length) : tabId;
-  if (name === "nokey" || name === "notes") return nokeyFixture();
-  if (name === "view") return viewFixture();
-  if (name === "broken") {
-    const store = customersFixture(4);
-    store.readError = "连接已断开，读取失败";
-    return store;
-  }
-  return customersFixture(130);
-}

@@ -173,11 +173,11 @@ export function commitChanges(store: TableStore, changes: readonly Change[]): Co
     const change = changes[index]!;
     const pendingIds = changes.slice(index).map((item) => item.id);
     if (store.schema.kind !== "table") {
-      return fail(applied, change.id, "", "只有基础表可以新增、修改或删除", pendingIds);
+      return fail(applied, change.id, "", "只有数据表可以新增、修改或删除，视图不行", pendingIds);
     }
     if (change.kind === "update") {
       const row = store.rows.find((item) => item.id === change.rowId);
-      if (!row?.located || !row.locator) return fail(applied, change.id, "", "无法唯一定位，不能修改", pendingIds);
+      if (!row?.located || !row.locator) return fail(applied, change.id, "", "无法唯一确定这一行，不能修改", pendingIds);
       const hits = store.rows.filter((item) => sameLocator(item.locator, row.locator));
       const sql = updateSql(store.schema, change.sets, row.locator.columns, row.locator.values);
       if (hits.length !== 1) return fail(applied, change.id, sql, `影响 ${hits.length} 行，已停止。已成功的语句不撤销。`, pendingIds);
@@ -191,7 +191,7 @@ export function commitChanges(store: TableStore, changes: readonly Change[]): Co
     }
     if (change.kind === "delete") {
       const row = store.rows.find((item) => item.id === change.rowId);
-      if (!row?.located || !row.locator) return fail(applied, change.id, "", "无法唯一定位，不能删除", pendingIds);
+      if (!row?.located || !row.locator) return fail(applied, change.id, "", "无法唯一确定这一行，不能删除", pendingIds);
       const hits = store.rows.filter((item) => sameLocator(item.locator, row.locator));
       const sql = deleteSql(store.schema, row.locator.columns, row.locator.values);
       if (hits.length !== 1) return fail(applied, change.id, sql, `影响 ${hits.length} 行，已停止。已成功的语句不撤销。`, pendingIds);
