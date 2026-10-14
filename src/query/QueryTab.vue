@@ -38,12 +38,15 @@ const emit = defineEmits<{
 
 const host = ref<HTMLElement | null>(null);
 const targetRoot = ref<HTMLElement | null>(null);
+const runRoot = ref<HTMLElement | null>(null);
 const menuOpen = ref(false);
+const runMenuOpen = ref(false);
 const activeIndex = ref(0);
 const hasSelection = ref(false);
 const submitting = ref(false);
 const actionError = ref("");
 const resultIndex = ref(0);
+const detailsOpen = ref(false);
 let view: EditorView | undefined;
 let alive = true;
 
@@ -61,7 +64,7 @@ const buttonLabel = computed(() => {
 const hint = computed(() => {
   const connection = connectionById(catalogConnections(), props.connectionId);
   if (props.connectionId && !connection) {
-    return { keywordsOnly: true, note: "原连接已不在目录中：只提供关键字。请重新选择执行目标。", objects: [] };
+    return { keywordsOnly: true, note: "原连接已不在目录中：补全只提供关键字。请重新选择执行目标。", objects: [] };
   }
   return metadataNote(connection, props.connectionId ? props.database : null);
 });
@@ -69,12 +72,81 @@ const activeStatement = computed(() => run.value?.statements[resultIndex.value] 
 const grid = computed(() => (activeStatement.value && activeStatement.value.columns.length ? gridModel(activeStatement.value) : null));
 const gridEngine = computed(() => asEngine(run.value?.engine));
 
+/* 一句话摘要（R4）：默认结果区只读这一句话，细节收进「详情」。 */
+const summary = computed(() => {
+  const current = run.value;
+  if (!current) return "";
+  const elapsed = `${current.elapsedMs} ms`;
+  if (current.status === "running") return "执行中…";
+  if (current.status === "cancel-requested") return "取消中…";
+  if (current.status === "cancelled") return `已取消。已读到的结果保留 · ${elapsed}`;
+  if (current.status === "unknown") return `连接中断，结果未知 · ${elapsed}`;
+  const statements = current.statements;
+  if (current.status === "error") {
+    const failedIndex = statements.findIndex((statement) => statement.status === "error");
+    const doneCount = statements.filter((statement) => statement.status === "ok").length;
+    const skippedCount = statements.filter((statement) => statement.status === "skipped").length;
+    const where = statements.length > 1 && failedIndex >= 0 ? `第 ${failedIndex + 1} 条语句失败` : "执行失败";
+    const kept = doneCount ? `已完成 ${doneCount} 条的结果保留` : "";
+    const skipped = skippedCount ? `其余 ${skippedCount} 条未执行` : "";
+    const tail = [kept, skipped].filter(Boolean).join("，");
+    return `${where}${tail ? `。${tail}` : ""} · ${elapsed}`;
+  }
+  if (statements.length === 1 && statements[0]) {
+    const statement = statements[0];
+    if (statement.status === "ok" && statement.columns.length) {
+      return `${statement.rows.length} 行${statement.truncated ? "（已达上限，只显示部分）" : ""} · ${elapsed}`;
+    }
+    if (statement.status === "ok") return `${statement.affected ?? 0} 行受影响 · ${elapsed}`;
+  }
+  const rowStatements = statements.filter((statement) => statement.status === "ok" && statement.columns.length).length;
+  return `${statements.length} 条语句完成${rowStatements ? `，${rowStatements} 条返回了行` : ""} · ${elapsed}`;
+});
+
+/* 工具栏状态行：取消只呈现直白三态，机制名词不出现在这里。 */
+const runStatusLine = computed(() => {
+  const current = run.value;
+  if (!current) return "";
+  if (current.cancel === "requested") return "取消中…";
+  if (current.cancel === "confirmed" || current.status === "cancelled") return "已取消";
+  if (current.cancel === "failed") return "取消失败，仍在执行";
+  const labels: Record<string, string> = { running: "执行中…", done: "完成", error: "执行失败", unknown: "结果未知" };
+  return labels[current.status] ?? statusLabel(current.status);
+});
+const cancelButtonLabel = computed(() => {
+  if (run.value?.cancel === "requested") return "取消中…";
+  if (run.value?.cancel === "failed") return "再次取消";
+  return "取消";
+});
+const detailsCaption = computed(() => {
+  const current = run.value;
+  return current ? `共 ${current.statements.length} 条语句` : "";
+});
+
 watch(
   () => run.value?.id,
   () => {
-    resultIndex.value = 0;
+    resultIndex.value = preferredIndex(run.value?.statements ?? []);
   },
 );
+
+/* 失败时自动展开详情，让错误与「在编辑器中定位」入口直接可见（R3）。 */
+watch(
+  () => [run.value?.id, run.value?.status, run.value?.cancel] as const,
+  ([, status, cancel]) => {
+    if (status === "error" || cancel === "failed") detailsOpen.value = true;
+  },
+  { immediate: true },
+);
+
+/** 默认结果区展示的语句：优先最后一条有结果集的，否则最后一条。 */
+function preferredIndex(statements: { columns: string[] }[]): number {
+  if (!statements.length) return 0;
+  for (let index = statements.length - 1; index >= 0; index -= 1) {
+    if (statements[index]!.columns.length) return index;
+  }
+  return statements.length - 1;
+}
 
 const shellTheme = EditorView.theme({
   "&": { backgroundColor: "var(--panel)", color: "var(--text)", height: "100%" },
@@ -158,11 +230,12 @@ async function execute(scope: "auto" | "current") {
   const range = editor.state.selection.main;
   const picked = sqlToRun(editor.state.doc.toString(), { from: range.from, to: range.to, head: range.head }, scope);
   if (!picked.sql.trim()) {
-    actionError.value = "没有可执行的 SQL。";
+    actionError.value = "没有可执行的 SQL 语句。";
     return;
   }
   submitting.value = true;
   menuOpen.value = false;
+  runMenuOpen.value = false;
   try {
     await nextTick();
     await startTabRun({
@@ -186,12 +259,31 @@ function cancel() {
   void requestCancel(props.tabId);
 }
 
+/** 在编辑器中定位失败语句：选中对应文本并滚动到可见位置。 */
+function locateInEditor(sqlText: string) {
+  mountEditor();
+  const editor = view;
+  if (!editor) return;
+  const needle = sqlText.trim();
+  if (!needle) return;
+  const doc = editor.state.doc.toString();
+  const from = doc.indexOf(needle);
+  if (from < 0) return;
+  editor.dispatch({ selection: { anchor: from, head: from + needle.length }, scrollIntoView: true });
+  editor.focus();
+}
+
 function toggleMenu() {
   if (running.value || submitting.value) return;
   menuOpen.value = !menuOpen.value;
   if (!menuOpen.value) return;
   const index = options.value.findIndex((item) => item.key === selectedKey.value);
   activeIndex.value = index >= 0 ? index : 0;
+}
+
+function toggleRunMenu() {
+  if (running.value || submitting.value) return;
+  runMenuOpen.value = !runMenuOpen.value;
 }
 
 function choose(option: TargetOption) {
@@ -234,15 +326,27 @@ function onTargetKey(event: KeyboardEvent) {
   }
 }
 
+function onRunMenuKey(event: KeyboardEvent) {
+  if (event.key !== "Escape") return;
+  event.preventDefault();
+  runMenuOpen.value = false;
+}
+
 function onPointerDown(event: PointerEvent) {
-  if (!menuOpen.value) return;
-  const root = targetRoot.value;
-  if (root && event.target instanceof Node && root.contains(event.target)) return;
-  menuOpen.value = false;
+  if (menuOpen.value) {
+    const root = targetRoot.value;
+    if (!root || !(event.target instanceof Node) || !root.contains(event.target)) menuOpen.value = false;
+  }
+  if (runMenuOpen.value) {
+    const root = runRoot.value;
+    if (!root || !(event.target instanceof Node) || !root.contains(event.target)) runMenuOpen.value = false;
+  }
 }
 
 watch(running, (value) => {
-  if (value) menuOpen.value = false;
+  if (!value) return;
+  menuOpen.value = false;
+  runMenuOpen.value = false;
 });
 
 function statusLabel(status: string): string {
@@ -327,46 +431,44 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <span v-if="connectionStatus" class="conn-state" :class="`st-${connectionStatus}`"><i></i>{{ CONNECTION_STATUS_TEXT[connectionStatus] }}</span>
-      <button v-if="!running" class="btn primary" type="button" data-action="run" :disabled="submitting" @click="execute('auto')">{{ submitting ? "正在执行…" : hasSelection ? "执行选中" : "执行" }}</button>
-      <button v-if="!running" class="btn" type="button" data-action="run-current" :disabled="submitting" @click="execute('current')">当前语句</button>
-      <button v-else class="btn" type="button" data-action="cancel" :disabled="run?.cancel === 'requested'" @click="cancel">
-        {{ run?.cancel === "failed" ? "再次请求取消" : run?.cancel === "requested" ? "等待确认" : "请求取消" }}
-      </button>
-      <span v-if="hasSelection && !running" class="q-note">只执行选中的内容</span>
-      <span v-if="run" class="q-note" role="status">{{ statusLabel(run.status) }} · {{ run.elapsedMs }} ms</span>
+      <div v-if="!running" ref="runRoot" class="run-group">
+        <button class="btn primary run-main" type="button" data-action="run" :disabled="submitting" @click="execute('auto')">{{ submitting ? "正在执行…" : hasSelection ? "执行选中" : "执行" }}</button>
+        <button
+          class="btn primary run-more"
+          type="button"
+          data-action="run-menu"
+          aria-label="更多执行方式"
+          aria-haspopup="menu"
+          :aria-expanded="runMenuOpen"
+          :disabled="submitting"
+          @click="toggleRunMenu"
+        >
+          <svg class="tg-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+        </button>
+        <div v-if="runMenuOpen" class="run-menu" role="menu" aria-label="执行方式" @keydown="onRunMenuKey">
+          <button class="run-item" type="button" role="menuitem" data-action="run-current" @click="execute('current')">
+            <span>执行当前语句</span>
+            <small>只执行光标所在的语句</small>
+          </button>
+        </div>
+      </div>
+      <button v-else class="btn danger" type="button" data-action="cancel" :disabled="run?.cancel === 'requested'" @click="cancel">{{ cancelButtonLabel }}</button>
+      <span v-if="run" class="q-note" role="status">{{ runStatusLine }} · {{ run.elapsedMs }} ms</span>
     </div>
     <p v-if="notice" class="q-banner">{{ notice }}</p>
     <p v-if="actionError" class="q-banner" role="alert">{{ actionError }}</p>
     <p class="q-hint" :data-keywords-only="hint.keywordsOnly">{{ hint.note }}</p>
     <div ref="host" class="cm-host"></div>
     <section class="q-results" aria-label="执行结果">
-      <p v-if="!run" class="q-idle">执行 SQL 后，结果显示在这里。有选区时只执行选区；当前语句只执行光标所在语句。</p>
+      <p v-if="!run" class="q-idle">执行 SQL 后，结果显示在这里。默认执行全部内容；选中一段后只执行选中部分，也可以只执行光标所在的当前语句。</p>
       <template v-else>
-        <div class="q-statements" role="tablist" aria-label="语句结果">
-          <button
-            v-for="(statement, index) in run.statements"
-            :key="`${run.id}-${index}`"
-            class="btn"
-            :class="{ primary: index === resultIndex }"
-            type="button"
-            role="tab"
-            :aria-selected="index === resultIndex"
-            @click="resultIndex = index"
-          >
-            {{ index + 1 }} {{ statusLabel(statement.status) }}
-          </button>
-        </div>
-        <p v-if="run.cancel === 'requested'" role="status">已请求取消，等待数据库确认。{{ run.viaSsh ? "经 SSH 时取消另开一条通道。" : "" }}{{ run.cancelMessage }}</p>
-        <p v-else-if="run.cancel === 'confirmed' || run.status === 'cancelled'" role="status">数据库已确认取消。{{ run.cancelMessage }}</p>
-        <p v-else-if="run.cancel === 'failed'" role="alert">取消失败，查询仍在执行。{{ run.cancelMessage }}</p>
-        <p v-if="run.status === 'error'">已完成的结果保留，后续语句未执行。</p>
+        <p class="q-summary" :data-status="run.status">{{ summary }}</p>
+        <p v-if="run.cancel === 'requested'" class="q-note" role="status">取消中…数据库确认后立即停止。</p>
+        <p v-else-if="run.cancel === 'confirmed' || run.status === 'cancelled'" class="q-note" role="status">已取消。已读到的结果保留。</p>
+        <p v-else-if="run.cancel === 'failed'" class="q-note" role="alert">取消失败，查询仍在执行。可以再次取消。</p>
         <template v-if="activeStatement">
-          <pre class="q-sql">{{ activeStatement.sql }}</pre>
-          <p v-if="activeStatement.status === 'unknown'">写入结果未知。不会自动重放。</p>
-          <p v-else-if="activeStatement.status === 'skipped'">这条语句没有发送到数据库。</p>
-          <p v-else-if="activeStatement.status === 'cancelled'">数据库已确认取消这条语句。</p>
-          <p v-else-if="activeStatement.status === 'error'">{{ activeStatement.message }}</p>
-          <p v-else-if="activeStatement.status === 'ok' && !grid">影响 {{ activeStatement.affected ?? 0 }} 行</p>
+          <p v-if="activeStatement.status === 'unknown'" class="q-note">写入结果未知。不会自动重放，草稿保留。</p>
+          <p v-else-if="activeStatement.status === 'skipped'" class="q-note">这条语句没有执行。</p>
           <QueryResultGrid
             v-if="grid"
             :tab-id="tabId"
@@ -379,6 +481,32 @@ onBeforeUnmount(() => {
             :database="run.database"
           />
         </template>
+        <details class="disclosure q-details" :open="detailsOpen">
+          <summary @click.prevent="detailsOpen = !detailsOpen">详情 <span class="muted">{{ detailsCaption }}</span></summary>
+          <div v-if="detailsOpen" class="disclosure-body">
+            <ol class="q-timeline">
+              <li v-for="(statement, index) in run.statements" :key="`${run.id}-${index}`" class="q-step" :class="`st-${statement.status}`">
+                <div class="q-step-head">
+                  <button class="q-step-pick" type="button" :data-statement-index="index" :aria-current="index === resultIndex" @click="resultIndex = index">
+                    第 {{ index + 1 }} 条 · {{ statusLabel(statement.status) }}
+                  </button>
+                  <button v-if="statement.status === 'error'" class="btn sm" type="button" data-action="locate" @click="locateInEditor(statement.sql)">在编辑器中定位</button>
+                </div>
+                <pre class="q-sql">{{ statement.sql }}</pre>
+                <p v-if="statement.status === 'error'" class="q-step-msg" role="alert">{{ statement.message }}</p>
+                <p v-else-if="statement.status === 'unknown'" class="q-step-msg">{{ statement.message ? `${statement.message}。` : "" }}写入结果未知，不会自动重放。</p>
+                <p v-else-if="statement.status === 'skipped'" class="q-step-msg">前面的语句失败后，这条语句没有发送到数据库。</p>
+                <p v-else-if="statement.status === 'cancelled'" class="q-step-msg">数据库已确认取消这条语句。</p>
+                <p v-else-if="statement.message" class="q-step-msg">{{ statement.message }}</p>
+              </li>
+            </ol>
+            <div v-if="run.cancelMessage" class="q-cancel-detail">
+              <p>{{ run.cancelMessage }}</p>
+              <p v-if="run.viaSsh && run.freshChannel" class="muted">这个连接经 SSH 转发，取消是另开一条通道送达数据库的。</p>
+            </div>
+            <p v-if="run.pollError" class="q-step-msg" role="alert">状态刷新失败：{{ run.pollError }}</p>
+          </div>
+        </details>
       </template>
     </section>
   </section>
@@ -386,39 +514,61 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .query-pane { display: flex; flex-direction: column; flex: 1; min-height: 0; }
-.q-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+.q-toolbar { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--line); }
 .q-target { position: relative; min-width: 0; }
-.target-btn { display: flex; align-items: center; gap: 6px; height: 30px; max-width: 420px; min-width: 0; padding: 0 8px 0 6px; border: 1px solid var(--line-2); border-radius: 7px; background: var(--panel); font-size: 12.5px; }
+.target-btn { display: flex; align-items: center; gap: var(--sp-2); height: var(--control-h); max-width: 420px; min-width: 0; padding: 0 var(--sp-2); border: 1px solid var(--line-2); border-radius: var(--r-md); background: var(--panel); font-size: var(--fs-sm); transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease); }
 .target-btn:hover:not(:disabled) { border-color: var(--text-3); }
 .target-btn.on { border-color: var(--accent); box-shadow: 0 0 0 3px var(--sel-strong); }
 .target-btn.none { border-style: dashed; color: var(--text-2); }
 .target-btn:disabled { opacity: 0.7; cursor: not-allowed; }
 .tg-name { font-weight: 600; white-space: nowrap; }
-.tg-db { display: inline-flex; align-items: center; gap: 4px; min-width: 0; color: var(--text-2); }
+.tg-db { display: inline-flex; align-items: center; gap: var(--sp-1); min-width: 0; color: var(--text-2); }
 .tg-db span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tg-sep { color: var(--text-3); }
 .tg-caret { width: 14px; height: 14px; margin-left: auto; color: var(--text-3); fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
 .target-btn :deep(.i) { width: 14px; height: 14px; color: var(--text-3); }
-.eng { --engc: var(--text-2); display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: 5px; font: 700 9.5px/1 var(--font); color: var(--engc); background: color-mix(in srgb, var(--engc) 14%, transparent); flex-shrink: 0; }
+.eng { --engc: var(--text-2); display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: var(--r-sm); font: 700 var(--fs-xs)/1 var(--font); color: var(--engc); background: color-mix(in srgb, var(--engc) 14%, transparent); flex-shrink: 0; }
 .eng-postgres { --engc: var(--eng-postgres); }
 .eng-mysql { --engc: var(--eng-mysql); }
 .eng-mariadb { --engc: var(--eng-mariadb); }
 .eng-sqlite { --engc: var(--eng-sqlite); }
-.target-menu { position: absolute; z-index: 30; top: calc(100% + 4px); left: 0; min-width: 280px; max-width: 420px; max-height: 320px; overflow: auto; padding: 4px; background: var(--panel); border: 1px solid var(--line-2); border-radius: 10px; box-shadow: var(--shadow); }
-.target-empty { margin: 0; padding: 8px; font-size: 12.5px; color: var(--text-3); }
-.target-option { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 44px; padding: 6px 8px; border-radius: 6px; text-align: left; }
+.target-menu, .run-menu { position: absolute; z-index: 30; top: calc(100% + var(--sp-1)); left: 0; min-width: 280px; max-width: 420px; max-height: 320px; overflow: auto; padding: var(--sp-1); background: var(--panel); border: 1px solid var(--line-2); border-radius: var(--r-lg); box-shadow: var(--shadow); }
+.target-empty { margin: 0; padding: var(--sp-2); font-size: var(--fs-sm); color: var(--text-3); }
+.target-option { display: flex; align-items: center; gap: var(--sp-2); width: 100%; min-height: 44px; padding: var(--sp-2); border-radius: var(--r); text-align: left; }
 .target-option.on { background: var(--hover); }
 .target-option.picked { background: var(--accent-soft); }
 .mi-copy { display: flex; flex-direction: column; min-width: 0; flex: 1; }
-.mi-title { display: flex; align-items: center; gap: 4px; min-width: 0; font-size: 12.5px; }
+.mi-title { display: flex; align-items: center; gap: var(--sp-1); min-width: 0; font-size: var(--fs-sm); }
 .mi-title b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mi-title :deep(.i) { width: 13px; height: 13px; color: var(--text-3); flex-shrink: 0; }
-.target-option small { font-size: 11.5px; color: var(--text-3); }
+.target-option small { font-size: var(--fs-xs); color: var(--text-3); }
 .target-option .check { width: 14px; height: 14px; margin-left: auto; color: var(--accent); flex-shrink: 0; }
-.q-note, .q-hint, .q-banner, .q-idle, .q-results p { margin: 0; font-size: 12.5px; color: var(--text-2); }
-.q-hint, .q-banner { padding: 4px 8px; }
+.run-group { position: relative; display: flex; }
+.run-group .run-main { border-radius: var(--r) 0 0 var(--r); }
+.run-group .run-more { border-radius: 0 var(--r) var(--r) 0; border-left: 1px solid var(--accent-hover); padding: 0 var(--sp-2); }
+.run-group .run-more .tg-caret { margin-left: 0; color: var(--on-accent); }
+.run-menu { min-width: 220px; }
+.run-item { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; padding: var(--sp-2); border-radius: var(--r); text-align: left; font-size: var(--fs-sm); }
+.run-item:hover { background: var(--hover); }
+.run-item small { font-size: var(--fs-xs); color: var(--text-3); }
+.q-note, .q-hint, .q-banner, .q-idle { margin: 0; font-size: var(--fs-sm); color: var(--text-2); }
+.q-hint, .q-banner { padding: var(--sp-1) var(--sp-3); }
 .q-banner { color: var(--text); background: var(--sunken); }
-.q-results { min-height: 120px; overflow: auto; border-top: 1px solid var(--line); padding: 8px; display: flex; flex-direction: column; gap: 8px; }
-.q-statements { display: flex; gap: 6px; flex-wrap: wrap; }
-.q-sql { margin: 0; white-space: pre-wrap; font-family: var(--mono); font-size: 12px; }
+.q-results { min-height: 120px; overflow: auto; border-top: 1px solid var(--line); padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); }
+.q-summary { margin: 0; font-size: var(--fs-md); font-weight: 600; color: var(--text); }
+.q-summary[data-status="error"] { color: var(--err); }
+.q-summary[data-status="unknown"] { color: var(--warn); }
+.q-details { font-size: var(--fs-sm); }
+.q-timeline { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
+.q-step { display: flex; flex-direction: column; gap: var(--sp-1); }
+.q-step-head { display: flex; align-items: center; gap: var(--sp-2); }
+.q-step-pick { font-size: var(--fs-sm); font-weight: 600; color: var(--text-2); border-radius: var(--r-sm); padding: 0; }
+.q-step-pick:hover { color: var(--accent-text); }
+.q-step-pick[aria-current="true"] { color: var(--accent-text); }
+.q-step.st-error .q-step-pick { color: var(--err); }
+.q-step-msg { margin: 0; font-size: var(--fs-sm); color: var(--text-2); }
+.q-step.st-error .q-step-msg { color: var(--err); }
+.q-sql { margin: 0; white-space: pre-wrap; font-family: var(--mono); font-size: var(--fs-xs); color: var(--text-2); }
+.q-cancel-detail { margin-top: var(--sp-3); padding-top: var(--sp-2); border-top: 1px solid var(--line); font-size: var(--fs-sm); color: var(--text-2); }
+.q-cancel-detail p { margin: 0 0 var(--sp-1); }
 </style>

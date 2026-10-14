@@ -31,26 +31,26 @@ export interface CompletionItem {
 
 export function metadataNote(connection: CatalogConnection | null, database: string | null): MetadataNote {
   if (!connection || database == null) {
-    return { keywordsOnly: true, note: "未选择执行目标：只提供关键字。", objects: [] };
+    return { keywordsOnly: true, note: "未选择执行目标：补全只提供关键字。", objects: [] };
   }
   if (connection.status !== "connected") {
-    return { keywordsOnly: true, note: `${connection.name} 当前是${CONNECTION_STATUS_TEXT[connection.status]}：只提供关键字。`, objects: [] };
+    return { keywordsOnly: true, note: `${connection.name} 当前${CONNECTION_STATUS_TEXT[connection.status]}：补全只提供关键字。`, objects: [] };
   }
   if (connection.error) {
-    return { keywordsOnly: true, note: `元数据读取失败（${connection.error}）：只提供关键字。`, objects: [] };
+    return { keywordsOnly: true, note: `读取 ${connection.name} 的表和视图失败（${connection.error}）：补全只提供关键字。`, objects: [] };
   }
   const db = connection.databases.find((item) => item.name === database);
   if (!db) {
-    return { keywordsOnly: true, note: `还没有读到数据库 ${database || "main"} 的元数据：只提供关键字。`, objects: [] };
+    return { keywordsOnly: true, note: `还没有读到数据库 ${database || "main"} 的表和视图：补全只提供关键字。`, objects: [] };
   }
   if (db.error) {
-    return { keywordsOnly: true, note: `元数据读取失败（${db.error}）：只提供关键字。`, objects: [] };
+    return { keywordsOnly: true, note: `读取数据库的表和视图失败（${db.error}）：补全只提供关键字。`, objects: [] };
   }
   const failed = db.schemas.filter((schema) => schema.error);
   const ready = db.schemas.filter((schema) => !schema.error);
   if (db.schemas.length > 0 && ready.length === 0) {
     const reason = failed.map((schema) => `${schema.name || "默认"}：${schema.error}`).join("；");
-    return { keywordsOnly: true, note: `元数据读取失败（${reason}）：只提供关键字。`, objects: [] };
+    return { keywordsOnly: true, note: `读取表和视图失败（${reason}）：补全只提供关键字。`, objects: [] };
   }
   const objects: CompletionObject[] = [];
   for (const schema of ready) {
@@ -66,10 +66,10 @@ export function metadataNote(connection: CatalogConnection | null, database: str
   }
   if (failed.length) {
     const reason = failed.map((schema) => `${schema.name || "默认"}（${schema.error}）`).join("、");
-    return { keywordsOnly: false, note: `部分 schema 读取失败，补全不包含这些对象：${reason}。`, objects };
+    return { keywordsOnly: false, note: `部分对象读取失败，补全可能不全：${reason}。`, objects };
   }
   if (!objects.length) {
-    return { keywordsOnly: true, note: "当前目标还没有已读取的表或视图：只提供关键字。", objects: [] };
+    return { keywordsOnly: true, note: "当前目标还没有读到表或视图：补全只提供关键字。", objects: [] };
   }
   return {
     keywordsOnly: false,

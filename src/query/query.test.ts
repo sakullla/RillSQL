@@ -138,6 +138,7 @@ describe("query editing", () => {
 
     view!.dispatch({ selection: { anchor: 0, head: 0 } });
     await nextTick();
+    await wrapper.get("[data-action='run-menu']").trigger("click");
     await wrapper.get("[data-action='run-current']").trigger("click");
     await flushPromises();
     expect(started().at(-1)).toMatchObject({ command: "query_start", sql: "SELECT 1;" });
@@ -327,8 +328,11 @@ describe("query editing", () => {
     });
     await nextTick();
     expect(failed.text()).toContain("7");
-    expect(failed.text()).toContain("已完成的结果保留");
-    expect(failed.text()).toContain("未执行");
+    expect(failed.text()).toContain("第 2 条语句失败");
+    expect(failed.text()).toContain("已完成 1 条的结果保留");
+    expect(failed.text()).toContain("其余 1 条未执行");
+    expect(failed.text()).toContain("syntax error");
+    expect(failed.text()).toContain("在编辑器中定位");
     expect(failed.get("[aria-label='查询结果']").text()).toContain("7");
     failed.unmount();
 
@@ -372,9 +376,12 @@ describe("query editing", () => {
     });
     await wrapper.get("[data-action='cancel']").trigger("click");
     await flushPromises();
-    expect(wrapper.text()).toContain("已请求取消");
-    expect(wrapper.text()).toContain("另开一条通道");
+    expect(wrapper.text()).toContain("取消中");
     expect(wrapper.text()).not.toContain("数据库已确认取消");
+    expect(wrapper.text()).not.toContain("另开一条通道");
+    expect(wrapper.get("[data-action='cancel']").text()).toBe("取消中…");
+    await wrapper.get(".q-details summary").trigger("click");
+    expect(wrapper.text()).toContain("另开一条通道");
     wrapper.unmount();
 
     const closed: string[] = [];
