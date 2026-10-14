@@ -34,14 +34,282 @@ status: active
 stages:
   exploration: completed
   solution: completed
-  plan: pending
-  execution: locked
-  delivery: locked
+  plan: completed
+  execution: completed
+  delivery: active
 gates:
   solution: confirmed
 schedule_pending: false
-implementation_base_ref: ""
-tasks: []
+implementation_base_ref: 0a85437d53d35d1b4b42cad5395c98f1abc409f3
+tasks:
+  - id: shell
+    status: completed
+    task_run_ref: task-runs/shell-run.md
+    recipe_digest: sha256:ceb4c8f80173478c1e09e9525015741d33105d4ebfacc38e3811f3fd08b18953
+    recipe_snapshot:
+      id: shell
+      goal: 桌面窗口以澄库 · RillSQL 启动，并呈现原型中的外壳、主题、快捷键帮助和关于信息。
+      depends_on: []
+      covers: [R1, R18]
+      outcomes:
+        - 启动后窗口标题和关于页能识别澄库与 RillSQL，且无需云登录即可进入欢迎页。
+        - 浅色、深色和跟随系统主题使用原型中的色彩令牌；状态和环境不靠颜色单独区分。
+        - 导航、标题栏、状态栏、命令面板和快捷键帮助与原型的布局一致，窄窗口时导航可只留图标。
+        - 关于页写明首版没有 AI、云同步、NoSQL、关系图、备份恢复和运维监控入口。
+        - 后续模块的界面和 Rust 入口以可编译占位接在外壳上，依赖和锁文件由本任务固定。
+      test: new
+      scope:
+        - .gitignore
+        - package.json
+        - package-lock.json
+        - vite.config.ts
+        - tsconfig.json
+        - tsconfig.app.json
+        - tsconfig.node.json
+        - index.html
+        - src/main.ts
+        - src/env.d.ts
+        - src/router.ts
+        - src/shell
+        - src/styles
+        - src/connections
+        - src/catalog
+        - src/query
+        - src/history
+        - src/grid
+        - src/export
+        - src/structure
+        - src-tauri/Cargo.toml
+        - src-tauri/Cargo.lock
+        - src-tauri/build.rs
+        - src-tauri/tauri.conf.json
+        - src-tauri/capabilities
+        - src-tauri/icons
+        - src-tauri/gen
+        - src-tauri/src
+    requirement_revision: 1
+    review_base_ref: 0a85437d53d35d1b4b42cad5395c98f1abc409f3
+    attempts:
+      - attempt_id: shell-A2-7c4c8bdc3cbe932f
+        message_id: shell-A2-7c4c8bdc3cbe932f-M1
+        recipe_digest: sha256:ceb4c8f80173478c1e09e9525015741d33105d4ebfacc38e3811f3fd08b18953
+        owner_mode: worker
+        baseline_ref: 155b5e5ba42c1c9b7d75e158956078f6b303d0b9
+        checkpoint_ref: 0fb8dbc715ce3cd0e0337795379943db248ca181
+        execution_status: completed
+        review_decision: passed
+        finding_count: 1
+        path_count: 10
+        review_evidence_refs:
+          - evidence/reviews/sha256-68373cd23c87904a7c811b4b43abba270d9d27dc14a06c8b1e11b6bb84d3f9ba.json
+        scope_ref: evidence/history/sha256-215c30d1535d6b93f56398b376a0215c9f918494d6c56f51b508291d3bd2a9aa.json#Attempt-History/shell-A2-7c4c8bdc3cbe932f/scope_delta
+        scope_digest: sha256:74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b
+        execution_ref: evidence/history/sha256-215c30d1535d6b93f56398b376a0215c9f918494d6c56f51b508291d3bd2a9aa.json#Attempt-History/shell-A2-7c4c8bdc3cbe932f/execution
+        execution_digest: sha256:9eff1fa47e499bc7880b7789ef275746676f8d3ea269763deed988684cb08330
+        review_ref: evidence/history/sha256-215c30d1535d6b93f56398b376a0215c9f918494d6c56f51b508291d3bd2a9aa.json#Attempt-History/shell-A2-7c4c8bdc3cbe932f/review
+        review_digest: sha256:948ffaf94f6749b6467e79405a4610cbe88f1867ba1a93d63652ad43465f4dc1
+    history_head_ref: evidence/history/sha256-215c30d1535d6b93f56398b376a0215c9f918494d6c56f51b508291d3bd2a9aa.json
+    history_count: 2
+  - id: connections
+    status: completed
+    task_run_ref: task-runs/connections-run.md
+    recipe_digest: sha256:aedee225483f5a8b6a2363abb8640e163de483f14efc4937b0bee6bf56e7a5fd
+    recipe_snapshot:
+      id: connections
+      goal: 用户能保存、测试、打开和删除 MySQL、MariaDB、PostgreSQL 与 SQLite 连接，TLS 校验名与 SSH 传输地址分离。
+      depends_on: [shell]
+      covers: [R2, R3, R4, R5]
+      outcomes:
+        - 保存的远程连接和 SQLite 文件在重启后仍可打开；删除配置不删除数据库或 SQLite 文件。
+        - 选择保存的密码进入系统凭据库，普通配置和日志中没有明文密码；凭据库不可用时仍可用本次输入的密码。
+        - 开启证书验证时按数据库主机名校验；经 SSH 时 TCP 进入转发器，只签给 localhost 的证书会失败，且不会改成不验证后重试。
+        - 一次 SSH 会话可接受多条本地连接，每条连接单独一条到数据库的通道；主机密钥首次需确认，变化时阻止连接。
+        - 测试按阶段失败并停止后续阶段。MySQL 与 MariaDB 是两种连接，SQLite 不出现 TLS 设置。
+      test: new
+      scope: [src/connections, src-tauri/src/connections]
+    requirement_revision: 1
+    review_base_ref: 0fb8dbc715ce3cd0e0337795379943db248ca181
+    attempts:
+      - attempt_id: connections-A3-10e0ec7d8caa2d0f
+        message_id: connections-A3-10e0ec7d8caa2d0f-M1
+        recipe_digest: sha256:aedee225483f5a8b6a2363abb8640e163de483f14efc4937b0bee6bf56e7a5fd
+        owner_mode: worker
+        baseline_ref: d2304bf7059ad5828a3f388a2f0af02ae960fa02
+        checkpoint_ref: 1181b1cdecf1b21d09d3d52fc59ac4998bfcccf5
+        execution_status: completed_with_concerns
+        review_decision: passed
+        finding_count: 1
+        path_count: 3
+        review_evidence_refs:
+          - evidence/reviews/sha256-9902d75a13f2eada75424a4db0bbdd8b709279768c46065a17885df4e50bccac.json
+        scope_ref: evidence/history/sha256-89f7f03e294af0728c90cadd94dd304b2b121e4a638bd5e68f42dd2e0e5a9499.json#Attempt-History/connections-A3-10e0ec7d8caa2d0f/scope_delta
+        scope_digest: sha256:74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b
+        execution_ref: evidence/history/sha256-89f7f03e294af0728c90cadd94dd304b2b121e4a638bd5e68f42dd2e0e5a9499.json#Attempt-History/connections-A3-10e0ec7d8caa2d0f/execution
+        execution_digest: sha256:eb2f322776a9c36bd33305ad7c1ed5e00f5744c34774d19de7516204d7693055
+        review_ref: evidence/history/sha256-89f7f03e294af0728c90cadd94dd304b2b121e4a638bd5e68f42dd2e0e5a9499.json#Attempt-History/connections-A3-10e0ec7d8caa2d0f/review
+        review_digest: sha256:d5651d9d6d104ecb37b194124627c24db8a36079e8088a8423c11ae4eb50c5e7
+    history_head_ref: evidence/history/sha256-89f7f03e294af0728c90cadd94dd304b2b121e4a638bd5e68f42dd2e0e5a9499.json
+    history_count: 3
+  - id: catalog
+    status: completed
+    task_run_ref: task-runs/catalog-run.md
+    recipe_digest: sha256:a3d8e156ce2864c729a71824961205b7a7fa8ee234513af454a227b069bd8592
+    recipe_snapshot:
+      id: catalog
+      goal: 用户能按引擎查看、搜索和刷新库表结构，大量对象分批出现，读取失败不显示成空库。
+      depends_on: [connections]
+      covers: [R6]
+      outcomes:
+        - PostgreSQL 显示数据库和 schema，MySQL 与 MariaDB 显示数据库，SQLite 直接列出对象并显示外键开关状态。
+        - 筛选结果带连接、库和 schema 路径，同名表可以区分；未连接的连接不混入结果。
+        - 对象超过默认批量时先显示一批并可以继续读取；读取失败显示错误和重试，不显示成没有表。
+        - 外部删除的对象标为失效，再次刷新后从树中消失。
+      test: new
+      scope: [src/catalog, src-tauri/src/catalog]
+    requirement_revision: 1
+    review_base_ref: 1181b1cdecf1b21d09d3d52fc59ac4998bfcccf5
+    attempts:
+      - attempt_id: catalog-A3-7d481ca1d7c18e76
+        message_id: catalog-A3-7d481ca1d7c18e76-M1
+        recipe_digest: sha256:a3d8e156ce2864c729a71824961205b7a7fa8ee234513af454a227b069bd8592
+        owner_mode: worker
+        baseline_ref: 6770f33335b3de84dc74651b35dcf1193e10aed6
+        checkpoint_ref: 7c10eac8c0309ceeaef7527a22805fdd6c4740ff
+        execution_status: completed_with_concerns
+        review_decision: passed
+        finding_count: 0
+        path_count: 6
+        review_evidence_refs:
+          - evidence/reviews/sha256-26464cf8af65075a052e9d51438b4928ced67761005c5c1efca1ccd00899c169.json
+        scope_ref: evidence/history/sha256-5a2ca0737b13ecbca64b78c5c8d2d0f4b1c5dc931b7d97e890108a0782fc604b.json#Attempt-History/catalog-A3-7d481ca1d7c18e76/scope_delta
+        scope_digest: sha256:f008e2241f282e444190ad860606c9ee1a9316abf86a5958d25d876e7a69e6a5
+        execution_ref: evidence/history/sha256-5a2ca0737b13ecbca64b78c5c8d2d0f4b1c5dc931b7d97e890108a0782fc604b.json#Attempt-History/catalog-A3-7d481ca1d7c18e76/execution
+        execution_digest: sha256:73f793b70dd5ba796565d24c91288d36b93b52b394b7fa892d81a532de8f9b63
+        review_ref: evidence/history/sha256-5a2ca0737b13ecbca64b78c5c8d2d0f4b1c5dc931b7d97e890108a0782fc604b.json#Attempt-History/catalog-A3-7d481ca1d7c18e76/review
+        review_digest: sha256:cdf36c79439f8e2f7b5b22a357a9b514cdda3802f0f18a607e571c366004c11f
+    history_head_ref: evidence/history/sha256-5a2ca0737b13ecbca64b78c5c8d2d0f4b1c5dc931b7d97e890108a0782fc604b.json
+    history_count: 3
+  - id: query
+    status: completed
+    task_run_ref: task-runs/query-run.md
+    recipe_digest: sha256:91155069b6a459bdb6aa35e55bf3cc8c82cc043fa7ec37943cdef19acd5e4e81
+    recipe_snapshot:
+      id: query
+      goal: 用户能在多个连接上编辑、执行、取消 SQL，并在本机历史中找回语句而不自动执行。
+      depends_on: [catalog]
+      covers: [R7, R8, R9, R19]
+      outcomes:
+        - 执行目标始终显示连接和数据库；有选区时只执行选区，当前语句只执行光标所在语句。
+        - 补全使用当前目标已读到的元数据；元数据失败时只提供关键字并说明原因。
+        - 取消区分已请求、已确认和失败；经 SSH 时取消另开一条通道。多语句在失败处停止并保留已完成结果。
+        - 断连后写入结果不明时标记未知且不重放。执行期间可以编辑其他标签，关闭正在执行的标签前先请求取消。
+        - 历史只在用户再次执行时才提交；原连接已删除时必须重新选择目标。重启不恢复未执行草稿。
+      test: new
+      scope: [src/query, src/history, src-tauri/src/query]
+    requirement_revision: 1
+    review_base_ref: bde4169c71920fc965aad905e1336a5b999b2cb4
+    attempts:
+      - attempt_id: query-A2-bfeec172be1a4df7
+        message_id: query-A2-bfeec172be1a4df7-M1
+        recipe_digest: sha256:91155069b6a459bdb6aa35e55bf3cc8c82cc043fa7ec37943cdef19acd5e4e81
+        owner_mode: worker
+        baseline_ref: 15ad2ba73c324477ca8b36fc3303ea62da8a82b7
+        checkpoint_ref: d73bb8d48452a1d385c15bc0d78c324c47c78548
+        execution_status: completed
+        review_decision: passed
+        finding_count: 0
+        path_count: 4
+        review_evidence_refs:
+          - evidence/reviews/sha256-ba34986bf8b53786a1144bd073bee27441eccf2f771bca5d5dc3c5830fd3f665.json
+        scope_ref: evidence/history/sha256-a9ddfef254475edbd26ba631e01d066f742b6d1c1ca738ec8f0a02eaac0756ff.json#Attempt-History/query-A2-bfeec172be1a4df7/scope_delta
+        scope_digest: sha256:386476ca286507aa2f41d0201456ff9d82fe2389261aae13fa79806cf9f58373
+        execution_ref: evidence/history/sha256-a9ddfef254475edbd26ba631e01d066f742b6d1c1ca738ec8f0a02eaac0756ff.json#Attempt-History/query-A2-bfeec172be1a4df7/execution
+        execution_digest: sha256:145db55cf675acb91cb57773a025de6a9ffcce15c2d66b024d8395d7cc541b77
+        review_ref: evidence/history/sha256-a9ddfef254475edbd26ba631e01d066f742b6d1c1ca738ec8f0a02eaac0756ff.json#Attempt-History/query-A2-bfeec172be1a4df7/review
+        review_digest: sha256:408db49338e6f5abcb52d2ef9377ab5dc56aff5c64816230d32bd9e4db2bc2fa
+    history_head_ref: evidence/history/sha256-a9ddfef254475edbd26ba631e01d066f742b6d1c1ca738ec8f0a02eaac0756ff.json
+    history_count: 2
+  - id: grid
+    status: completed
+    task_run_ref: task-runs/grid-run.md
+    recipe_digest: sha256:4fd42709b317f8c2396880c38da27f790d9b84bd22ac4f410e0cd9adf034cc96
+    recipe_snapshot:
+      id: grid
+      goal: 用户能分批浏览和编辑表数据，无主键的表仍可新增，并按声明的范围导出 CSV。
+      depends_on: [connections]
+      covers: [R10, R11, R17]
+      outcomes:
+        - 表数据和查询结果默认只加载一批，界面标明已加载数量和截断；NULL 与空字符串在显示、复制和导出中可区分。
+        - 表浏览的筛选和排序在服务器端按结构化条件执行；查询结果里的查找和排序只作用于已读取行。
+        - 基础表始终可以新增。没有可靠唯一标识时不能修改或删除，插入后仍不能定位的新行保持不可改、不可删。
+        - 提交逐条执行，失败即停，已成功的语句不撤销，失败行留在暂存区。
+        - 部分导出标明不是完整结果；查询结果的全量导出只接受 SELECT 并在执行前说明会重新执行。失败保留已写部分，取消删除未完成文件。
+      test: new
+      scope: [src/grid, src/export, src-tauri/src/grid]
+    requirement_revision: 1
+    review_base_ref: 9664db73c35c2639753cf1f77e7598fd32ae97dd
+    attempts:
+      - attempt_id: grid-A3-13d78d95b3e4f60a
+        message_id: grid-A3-13d78d95b3e4f60a-M1
+        recipe_digest: sha256:4fd42709b317f8c2396880c38da27f790d9b84bd22ac4f410e0cd9adf034cc96
+        owner_mode: worker
+        baseline_ref: 7c10eac8c0309ceeaef7527a22805fdd6c4740ff
+        checkpoint_ref: d73bb8d48452a1d385c15bc0d78c324c47c78548
+        execution_status: completed
+        review_decision: passed
+        finding_count: 0
+        path_count: 3
+        review_evidence_refs:
+          - evidence/reviews/sha256-c3947c3fd3f02e68048d9c12201236174fb986ce6e55ac0cc1373838e862f042.json
+        scope_ref: evidence/history/sha256-03ba433c53f724fcd0fab7a17020f662d64c9f719de7f1072976c5bb2e114def.json#Attempt-History/grid-A3-13d78d95b3e4f60a/scope_delta
+        scope_digest: sha256:74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b
+        execution_ref: evidence/history/sha256-03ba433c53f724fcd0fab7a17020f662d64c9f719de7f1072976c5bb2e114def.json#Attempt-History/grid-A3-13d78d95b3e4f60a/execution
+        execution_digest: sha256:1cf3a2faba2db7cad5bc0e91b4fb9b70042b6e01211b9002dcc770a62fd1b803
+        review_ref: evidence/history/sha256-03ba433c53f724fcd0fab7a17020f662d64c9f719de7f1072976c5bb2e114def.json#Attempt-History/grid-A3-13d78d95b3e4f60a/review
+        review_digest: sha256:5a4b74d5666b29853a14b3e170308308e236d1ed1de9947bbe556de740eaf667
+    history_head_ref: evidence/history/sha256-03ba433c53f724fcd0fab7a17020f662d64c9f719de7f1072976c5bb2e114def.json
+    history_count: 3
+  - id: structure
+    status: completed
+    task_run_ref: task-runs/structure-run.md
+    recipe_digest: sha256:530f23c90b8a034ecb53af3053305c90dbd6486b4a6e8c2c1924e41c94906207
+    recipe_snapshot:
+      id: structure
+      goal: 用户能在预览 SQL 和影响之后创建或修改表、字段、索引和外键，取消时数据库不变。
+      depends_on: [catalog]
+      covers: [R12, R13, R14, R15, R16]
+      outcomes:
+        - 建表、改字段、索引、外键和删表在执行前展示目标、风险和逐条 SQL；取消不向数据库提交。
+        - 执行后逐条给出成功、失败、未执行或结果未知。MySQL 中途失败不声称已全部回滚。
+        - SQLite 在不能可靠保留数据或约束时阻止执行；需要重建时展示官方重建步骤。能直接修改的 NOT NULL 不套重建。
+        - 删除表只删除预览中的对象。受约束保护的索引不能当作普通索引单独删除。
+      test: new
+      scope: [src/structure, src-tauri/src/ddl]
+    requirement_revision: 1
+    review_base_ref: d73bb8d48452a1d385c15bc0d78c324c47c78548
+    attempts:
+      - attempt_id: structure-A2-6b465e8d5b4d63d2
+        message_id: structure-A2-6b465e8d5b4d63d2-M1
+        recipe_digest: sha256:530f23c90b8a034ecb53af3053305c90dbd6486b4a6e8c2c1924e41c94906207
+        owner_mode: worker
+        baseline_ref: c7fcebddcc31aac86f6e0bffc16a2abdcfcb9d18
+        checkpoint_ref: 43b201222583539b29be8d9d66508b4866459d80
+        execution_status: completed
+        review_decision: passed
+        finding_count: 0
+        path_count: 5
+        review_evidence_refs:
+          - evidence/reviews/sha256-44c8e83b77819c1eb9944463f85b28cef3a252ac4ebc2f09a495a9d8377f6566.json
+        scope_ref: evidence/history/sha256-42d8061cc6acb7ac6f554c7f4a1a5634c5d5c623ca59f0089bf21df2bfb553aa.json#Attempt-History/structure-A2-6b465e8d5b4d63d2/scope_delta
+        scope_digest: sha256:53ffdf103b21526df6f1666ff3600576fcb2fd0e5a6cb6738ca8e9a732ea105d
+        execution_ref: evidence/history/sha256-42d8061cc6acb7ac6f554c7f4a1a5634c5d5c623ca59f0089bf21df2bfb553aa.json#Attempt-History/structure-A2-6b465e8d5b4d63d2/execution
+        execution_digest: sha256:ccc353a29c8ec886fcaedbdb6dbfabe0e9fafb6bc66a7e978158ac6ba0b944ea
+        review_ref: evidence/history/sha256-42d8061cc6acb7ac6f554c7f4a1a5634c5d5c623ca59f0089bf21df2bfb553aa.json#Attempt-History/structure-A2-6b465e8d5b4d63d2/review
+        review_digest: sha256:0b647005613f7c2a72fb0d359d9e939aae1f9b0c37053b36735ef75449e6e680
+    history_head_ref: evidence/history/sha256-42d8061cc6acb7ac6f554c7f4a1a5634c5d5c623ca59f0089bf21df2bfb553aa.json
+    history_count: 2
 blocker: null
 delivery:
-  status: locked
+  status: pending
+plan_input_digest: sha256:69ee7131170ccb725ac344bc528b1fd74a0bc612f0051c225a4a16c0889e13d5
+result_inbox_ref: evidence/results/sha256-5575ffa66a9ed47eadd30c45c229cda1b510cf1e1b5b43c0204aa687740e9cba.json
