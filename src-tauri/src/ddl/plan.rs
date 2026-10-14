@@ -365,7 +365,7 @@ fn sqlite_rebuild_with(snapshot: &Snapshot, drafts: &[ColumnDraft], foreign_keys
         Some(count) => format!("复制 {count} 行"),
         None => "复制保留列的数据".to_owned(),
     };
-    let restore = match snapshot.recorded_foreign_keys.or(snapshot.live_foreign_keys) {
+    let restore = match snapshot.live_foreign_keys {
         Some(true) => "ON",
         Some(false) => "OFF",
         None => {
@@ -974,14 +974,8 @@ fn create_index_sql(snapshot: &Snapshot, name: &str, unique: bool, columns: &[su
         .join(", ");
     let unique = if unique { "UNIQUE " } else { "" };
     let index = quote_ident(snapshot.engine, name);
-    let sql = match snapshot.engine {
-        Engine::Postgres => {
-            let schema = quote_ident(snapshot.engine, &snapshot.schema);
-            format!("CREATE {unique}INDEX {schema}.{index} ON {qualified} ({cols});")
-        }
-        Engine::Sqlite | Engine::Mysql | Engine::Mariadb => format!("CREATE {unique}INDEX {index} ON {qualified} ({cols});"),
-    };
-    Ok(sql)
+    // PostgreSQL 的索引名不能带 schema，索引建在表所在 schema。
+    Ok(format!("CREATE {unique}INDEX {index} ON {qualified} ({cols});"))
 }
 
 fn drop_index_sql(snapshot: &Snapshot, name: &str) -> Result<String, String> {

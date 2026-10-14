@@ -269,9 +269,22 @@ pub async fn ddl_preview(state: tauri::State<'_, ConnectionsState>, request: Pre
     Ok(plan_dto(exec::preview(&session, &loaded).await?))
 }
 
+pub(crate) async fn execute_saved(
+    service: &crate::connections::Service,
+    connection_id: &str,
+    request: &Request,
+    confirmed_sql: &[String],
+) -> Result<Receipt, String> {
+    let session = service.catalog_session(connection_id).ok_or_else(|| "连接未打开，没有另开数据库连接。".to_owned())?;
+    let receipt = exec::execute(&session, request, confirmed_sql).await?;
+    if let Some(enabled) = exec::committed_foreign_keys(&request.action, &receipt) {
+        service.set_catalog_foreign_keys(connection_id, Some(enabled));
+    }
+    Ok(receipt)
+}
+
 #[tauri::command]
 pub async fn ddl_execute(state: tauri::State<'_, ConnectionsState>, request: ExecuteBody) -> Result<ReceiptDto, String> {
-    let session = require_session(&state, &request.connection_id)?;
     let loaded = request_from(request.database, request.schema, &request.engine, request.action)?;
-    Ok(receipt_dto(exec::execute(&session, &loaded, &request.confirmed_sql).await?))
+    Ok(receipt_dto(execute_saved(&state.service, &request.connection_id, &loaded, &request.confirmed_sql).await?))
 }

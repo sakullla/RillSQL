@@ -1,8 +1,11 @@
 use std::fs;
 use std::path::PathBuf;
 
+use super::commands;
 use super::exec::{self, run_steps};
-use super::model::{Action, Column, ColumnDraft, DependentSql, Engine, Index, IndexColumn, Request, Snapshot, Step, StepStatus};
+use super::model::{
+    Action, Column, ColumnDraft, DependentSql, Engine, ForeignKey, Index, IndexColumn, IndexColumnDraft, Request, Snapshot, Step, StepStatus,
+};
 use super::plan::plan;
 use crate::connections::{CatalogSession, Service};
 
@@ -493,6 +496,127 @@ async fn bundled_sqlite_not_null_rebuilds_without_renaming_the_old_table_first()
     let value: String = sqlx::query_scalar("SELECT note FROM notes WHERE id = 1").fetch_one(pool).await.unwrap();
     assert_eq!(value, "甲");
     let fk: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(pool).await.unwrap();
-    assert_eq!(fk, 0);
+    // 标记被写成 false，但这条已打开连接的 live foreign_keys 仍是 ON，重建后恢复 live。
+    assert_eq!(fk, 1);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn postgres_create_index_name_is_not_schema_qualified() {
+    let mut snapshot = Snapshot::bare(Engine::Postgres, "app", "public", "notes");
+    snapshot.columns = vec![column("id", "integer", false, true), column("note", "text", true, false)];
+    let columns = vec![IndexColumnDraft { name: "note".to_owned(), descending: false }];
+    let plain = plan(
+        &snapshot,
+        &Action::CreateIndex { table: "notes".to_owned(), name: "idx".to_owned(), unique: false, columns: columns.clone() },
+    );
+    assert!(plain.blocked.is_empty(), "{:?}", plain.blocked);
+    assert_eq!(plain.steps.len(), 1);
+    assert_eq!(plain.steps[0].sql, "CREATE INDEX \"idx\" ON \"public\".\"notes\" (\"note\" ASC);");
+    assert!(!plain.steps[0].sql.contains("\"public\".\"idx\""));
+    let unique = plan(
+        &snapshot,
+        &Action::CreateIndex { table: "notes".to_owned(), name: "idx".to_owned(), unique: true, columns },
+    );
+    assert!(unique.blocked.is_empty(), "{:?}", unique.blocked);
+    assert_eq!(unique.steps[0].sql, "CREATE UNIQUE INDEX \"idx\" ON \"public\".\"notes\" (\"note\" ASC);");
+    assert!(!unique.steps[0].sql.contains("\"public\".\"idx\""));
+}
+
+#[test]
+fn sqlite_rebuild_preview_restores_live_foreign_keys_not_the_recorded_flag() {
+    let mut snapshot = notes("3.51.3");
+    snapshot.recorded_foreign_keys = Some(false);
+    snapshot.live_foreign_keys = Some(true);
+    snapshot.foreign_keys.push(ForeignKey {
+        name: "fk_note".to_owned(),
+        columns: vec!["note".to_owned()],
+        ref_schema: String::new(),
+        ref_table: "parent".to_owned(),
+        ref_columns: vec!["id".to_owned()],
+        on_delete: "NO ACTION".to_owned(),
+        on_update: "NO ACTION".to_owned(),
+    });
+    let planned = plan(&snapshot, &Action::DropForeignKey { table: "notes".to_owned(), name: "fk_note".to_owned() });
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert!(planned.rebuild);
+    assert_eq!(planned.steps.last().map(|step| step.sql.as_str()), Some("PRAGMA foreign_keys = ON;"));
+    assert!(planned.steps.iter().any(|step| step.sql == "PRAGMA foreign_keys = OFF;"));
+    assert!(planned.risks.iter().any(|risk| risk.text.contains("当前连接 foreign_keys = ON")));
+    assert!(planned.risks.iter().all(|risk| !risk.text.contains("恢复为 OFF")));
+}
+
+fn kept_column(name: &str, type_name: &str, primary: bool) -> ColumnDraft {
+    ColumnDraft {
+        original: Some(name.to_owned()),
+        name: name.to_owned(),
+        type_name: type_name.to_owned(),
+        nullable: !primary,
+        default_sql: String::new(),
+        primary,
+        auto: false,
+        dropped: false,
+    }
+}
+
+fn recorded_foreign_keys(session: &CatalogSession) -> Option<bool> {
+    match session {
+        CatalogSession::Sqlite { foreign_keys, .. } => *foreign_keys,
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn rebuild_restores_live_foreign_keys_and_enable_updates_the_session() {
+    let (dir, service, session) = open_notes(&[
+        "PRAGMA foreign_keys = OFF",
+        "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, note TEXT, parent_id INTEGER REFERENCES parent(id))",
+        "INSERT INTO notes (id, note, parent_id) VALUES (1, '甲', 99)",
+    ])
+    .await;
+    let CatalogSession::Sqlite { pool, .. } = &session else { panic!("sqlite") };
+    sqlx::query("PRAGMA foreign_keys = OFF").execute(pool).await.unwrap();
+    assert!(service.set_catalog_foreign_keys("notes", Some(false)));
+    let session = service.catalog_session("notes").expect("会话仍在");
+    assert_eq!(recorded_foreign_keys(&session), Some(false));
+    let CatalogSession::Sqlite { pool, .. } = &session else { panic!("sqlite") };
+    let live_off: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(pool).await.unwrap();
+    assert_eq!(live_off, 0);
+    let enable = Action::SetForeignKeys { enabled: true };
+    let preview = exec::preview(&session, &request(enable.clone())).await.unwrap();
+    assert_eq!(preview.steps.len(), 1);
+    assert_eq!(preview.steps[0].sql, "PRAGMA foreign_keys = ON;");
+    let confirmed: Vec<String> = preview.steps.iter().map(|step| step.sql.clone()).collect();
+    let turned_on = commands::execute_saved(&service, "notes", &request(enable), &confirmed).await.unwrap();
+    assert!(turned_on.steps.iter().all(|step| step.status == StepStatus::Ok), "{:?}", turned_on.steps);
+    let enabled = service.catalog_session("notes").expect("会话仍在");
+    assert_eq!(recorded_foreign_keys(&enabled), Some(true));
+
+    assert!(service.set_catalog_foreign_keys("notes", Some(false)));
+    let stale = service.catalog_session("notes").expect("会话仍在");
+    assert_eq!(recorded_foreign_keys(&stale), Some(false));
+    let CatalogSession::Sqlite { pool, .. } = &stale else { panic!("sqlite") };
+    let live_before: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(pool).await.unwrap();
+    assert_eq!(live_before, 1);
+
+    let action = Action::AlterColumns {
+        table: "notes".to_owned(),
+        columns: vec![kept_column("id", "INTEGER", true), kept_column("note", "INTEGER", false), kept_column("parent_id", "INTEGER", false)],
+    };
+    let planned = exec::preview(&stale, &request(action.clone())).await.unwrap();
+    assert!(planned.rebuild, "{:?}", planned.blocked);
+    assert_eq!(planned.steps.last().map(|step| step.sql.as_str()), Some("PRAGMA foreign_keys = ON;"));
+    assert!(planned.steps.iter().any(|step| step.sql == "PRAGMA foreign_keys = OFF;"));
+    let confirmed: Vec<String> = planned.steps.iter().map(|step| step.sql.clone()).collect();
+    let receipt = exec::execute(&stale, &request(action), &confirmed).await.unwrap();
+    assert!(receipt.steps.iter().any(|step| step.status == StepStatus::Failed), "{:?}", receipt.steps);
+    let restored = receipt.steps.iter().rev().find(|step| step.sql == "PRAGMA foreign_keys = ON;").expect("恢复 live");
+    assert_eq!(restored.status, StepStatus::Ok);
+    let live_after: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(pool).await.unwrap();
+    assert_eq!(live_after, 1);
+    let sql = master_sql(&stale, "notes").await.unwrap_or_default();
+    assert!(sql.to_ascii_lowercase().contains("note text"), "{sql}");
+    assert_eq!(recorded_foreign_keys(&service.catalog_session("notes").expect("会话仍在")), Some(false));
     let _ = fs::remove_dir_all(dir);
 }

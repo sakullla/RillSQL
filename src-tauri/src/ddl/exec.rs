@@ -33,7 +33,12 @@ pub async fn execute(session: &CatalogSession, request: &Request, confirmed_sql:
     if planned != confirmed_sql {
         return Err("预览已过期：数据库里的结构或生成的 SQL 和确认时看到的不一致，没有执行。".to_owned());
     }
-    let steps = run_steps(session, &plan.steps, snapshot.recorded_foreign_keys).await?;
+    // 重建的失败补偿恢复操作开始时读到的 live。SetForeignKeys 的语句本身就是目标值，不能再改回去。
+    let restore = match &request.action {
+        Action::SetForeignKeys { enabled } => Some(*enabled),
+        _ => snapshot.live_foreign_keys,
+    };
+    let steps = run_steps(session, &plan.steps, restore).await?;
     Ok(Receipt { blocked: Vec::new(), rule: plan.rule, steps, target: plan.target, rebuild: plan.rebuild })
 }
 
@@ -74,16 +79,27 @@ async fn prepare_snapshot(session: &CatalogSession, request: &Request) -> Result
     Ok(snapshot)
 }
 
-pub async fn run_steps(session: &CatalogSession, steps: &[Step], recorded_foreign_keys: Option<bool>) -> Result<Vec<StepReceipt>, String> {
+pub async fn run_steps(session: &CatalogSession, steps: &[Step], restore_foreign_keys: Option<bool>) -> Result<Vec<StepReceipt>, String> {
     match session {
         CatalogSession::Scripted => Err("这条已打开的会话没有可查询的数据库通道。".to_owned()),
-        CatalogSession::Sqlite { pool, .. } => run_sqlite(pool, steps, recorded_foreign_keys).await,
+        CatalogSession::Sqlite { pool, .. } => run_sqlite(pool, steps, restore_foreign_keys).await,
         CatalogSession::Mysql(pool) => run_mysql(pool, steps).await,
         CatalogSession::Postgres(client) => run_postgres(client, steps).await,
     }
 }
 
-async fn run_sqlite(pool: &sqlx::SqlitePool, steps: &[Step], recorded_foreign_keys: Option<bool>) -> Result<Vec<StepReceipt>, String> {
+pub(crate) fn committed_foreign_keys(action: &Action, receipt: &Receipt) -> Option<bool> {
+    let Action::SetForeignKeys { enabled } = action else {
+        return None;
+    };
+    if !receipt.blocked.is_empty() {
+        return None;
+    }
+    let applied = receipt.steps.iter().any(|step| step.status == StepStatus::Ok && pragma_foreign_keys_is(&step.sql, *enabled));
+    applied.then_some(*enabled)
+}
+
+async fn run_sqlite(pool: &sqlx::SqlitePool, steps: &[Step], restore: Option<bool>) -> Result<Vec<StepReceipt>, String> {
     let mut conn = pool.acquire().await.map_err(|err| err.to_string())?;
     let mut results = Vec::new();
     let mut stop = false;
@@ -159,17 +175,17 @@ async fn run_sqlite(pool: &sqlx::SqlitePool, steps: &[Step], recorded_foreign_ke
         }
     }
     if !unknown {
-        restore_foreign_keys(&mut *conn, &mut results, recorded_foreign_keys).await;
+        restore_foreign_keys(&mut *conn, &mut results, restore).await;
     }
     Ok(results)
 }
 
-async fn restore_foreign_keys(conn: &mut sqlx::SqliteConnection, results: &mut Vec<StepReceipt>, recorded: Option<bool>) {
+async fn restore_foreign_keys(conn: &mut sqlx::SqliteConnection, results: &mut Vec<StepReceipt>, restore: Option<bool>) {
     let turned_off = results.iter().any(|step| step.status == StepStatus::Ok && is_fk_off(&step.sql));
     if !turned_off {
         return;
     }
-    let value = if recorded.unwrap_or(false) { "ON" } else { "OFF" };
+    let value = if restore.unwrap_or(false) { "ON" } else { "OFF" };
     let sql = format!("PRAGMA foreign_keys = {value};");
     if results.iter().any(|step| step.status == StepStatus::Ok && step.sql.trim().eq_ignore_ascii_case(sql.trim())) {
         return;
@@ -272,8 +288,13 @@ fn statement_kind(sql: &str) -> StmtKind {
 }
 
 fn is_fk_off(sql: &str) -> bool {
+    pragma_foreign_keys_is(sql, false)
+}
+
+fn pragma_foreign_keys_is(sql: &str, enabled: bool) -> bool {
     let text = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase().replace(' ', "");
-    text.starts_with("pragmaforeign_keys=") && text.ends_with("off")
+    let want = if enabled { "pragmaforeign_keys=on" } else { "pragmaforeign_keys=off" };
+    text == want
 }
 
 fn sqlite_unknown(message: &str) -> bool {

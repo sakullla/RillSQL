@@ -496,12 +496,6 @@ impl Service {
         })
     }
 
-    #[cfg(test)]
-    pub fn new_for_test(path: PathBuf) -> Self {
-        Self::new(path, Arc::new(super::secrets::MemoryStore::default()))
-    }
-
-    #[cfg(test)]
     pub fn set_catalog_foreign_keys(&self, id: &str, value: Option<bool>) -> bool {
         let mut sessions = self.sessions.lock().expect("sessions");
         let Some(session) = sessions.get_mut(id) else {
@@ -509,6 +503,11 @@ impl Service {
         };
         session.foreign_keys = value;
         true
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test(path: PathBuf) -> Self {
+        Self::new(path, Arc::new(super::secrets::MemoryStore::default()))
     }
 
     #[cfg(test)]
