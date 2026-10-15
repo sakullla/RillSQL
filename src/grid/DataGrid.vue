@@ -1,9 +1,13 @@
 <script setup lang="ts">
 import { computed, nextTick, reactive, ref, watch } from "vue";
 import ExportDialog from "../export/ExportDialog.vue";
+import ImportDialog from "../export/ImportDialog.vue";
 import { planExport, type ExportScope } from "../export/plan";
 import { runExportTask, runRemoteExport } from "../export/tasks";
 import type { CsvOptions } from "../export/csv";
+import type { ExportFormat } from "../export/write";
+import type { InsertTarget } from "../export/insert";
+import { catalogConnections } from "../catalog/store";
 import { loadSettings } from "../shell/settings";
 import { copyPlain, copySqlValue, previewText, showCell, type NullCopy } from "./display";
 import "./grid.css";
@@ -28,7 +32,9 @@ const filterOp = ref<FilterOp>("eq");
 const filterValue = ref("");
 const filterError = ref("");
 const exportOpen = ref(false);
+const importOpen = ref(false);
 const exportMessage = ref("");
+const importMessage = ref("");
 const commitOpen = ref(false);
 const editing = ref<{ id: string; column: string; draft: string; isNull: boolean } | null>(null);
 const copyMessage = ref("");
@@ -252,7 +258,34 @@ function editDisabled(): boolean {
   return !session.canDeleteRow(session.selectedId);
 }
 
-function startExport(payload: { scope: ExportScope; acknowledged: boolean; path: string; csv: CsvOptions }) {
+const importTables = computed(() => {
+  if (!session?.target) return [];
+  const target = session.target;
+  const found: { schema: string; table: string }[] = [];
+  const connection = catalogConnections().find((item) => item.id === target.connectionId);
+  for (const database of connection?.databases ?? []) {
+    if (target.database && database.name !== target.database) continue;
+    for (const schema of database.schemas) {
+      for (const object of schema.objects) {
+        if (object.stale || object.kind !== "table") continue;
+        found.push({ schema: schema.name, table: object.name });
+      }
+    }
+  }
+  return found;
+});
+
+const insertTarget = computed<InsertTarget | null>(() => {
+  if (!session) return null;
+  return {
+    engine: session.store.schema.engine,
+    schema: session.store.schema.schema,
+    name: session.store.schema.name,
+    columns: session.store.schema.columns,
+  };
+});
+
+function startExport(payload: { scope: ExportScope; acknowledged: boolean; path: string; csv: CsvOptions; format: ExportFormat }) {
   if (!session?.target) return;
   const plan = planExport({
     origin: "table",
@@ -262,7 +295,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
   });
   exportOpen.value = false;
   if (payload.scope === "loaded") {
-    exportMessage.value = "正在保存 CSV…";
+    exportMessage.value = payload.format === "csv" ? "正在保存 CSV…" : "正在保存已读取的行…";
     const columns = session.store.schema.columns.map((column) => column.name);
     void runExportTask({
       plan,
@@ -271,6 +304,8 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
       columns,
       rows: session.loaded.map((row) => ({ ...row.cells })),
       csv: payload.csv,
+      format: payload.format,
+      insert: insertTarget.value ?? undefined,
     }).then(({ result }) => {
       exportMessage.value = result.message;
     });
@@ -293,6 +328,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
     limit: 0,
     truncated: session.truncated,
     statement: "",
+    format: payload.format,
   });
   void done.then((task) => {
     exportMessage.value = task.message;
@@ -333,6 +369,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
         :title="session.store.schema.key.length ? '删除选中的行' : '这张表没有主键，无法唯一确定已有行，不能删除'"
         @click="session.deleteSelected()"
       >删除行</button>
+      <button class="btn sm" type="button" :disabled="session.store.schema.kind !== 'table'" @click="importOpen = true">导入</button>
       <button class="btn sm" type="button" @click="exportOpen = true">导出</button>
     </div>
     <details v-if="(session.filters.length || session.sort) && session.sql" class="disclosure grid-sql">
@@ -340,6 +377,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
       <div class="disclosure-body"><pre class="sql-code">{{ session.sql }}</pre></div>
     </details>
     <p v-if="filterError" class="grid-alert" role="alert">{{ filterError }}</p>
+    <p v-if="importMessage" class="hint export-message" role="status">{{ importMessage }}</p>
     <p v-if="exportMessage" class="hint export-message" role="status">{{ exportMessage }}</p>
     <p v-if="session.error" class="grid-alert" role="alert">读取失败：{{ session.error }}。这不是无匹配结果。筛选条件仍保留。</p>
     <div ref="viewport" class="grid-scroll" @scroll.passive="onScroll" @keydown="onGridKeydown">
@@ -450,8 +488,17 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
       :pending="session.pendingCount"
       :columns="columns.map((column) => column.name)"
       :preview-rows="previewRows"
+      :insert-target="insertTarget"
       @close="exportOpen = false"
       @start="startExport"
+    />
+    <ImportDialog
+      :open="importOpen"
+      :target="session.target"
+      :schema="session.store.schema"
+      :tables="importTables"
+      @close="importOpen = false"
+      @done="(message) => { importMessage.value = message; importOpen = false; void session.readWindow(0, Math.max(session.pageSize, session.loaded.length || session.pageSize), true); }"
     />
     </template>
   </div>

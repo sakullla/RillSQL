@@ -18,7 +18,7 @@ pub async fn export_write_loaded(path: String, contents: String) -> Result<(), S
     }.await;
     if let Err(error) = result {
         let _ = tokio::fs::remove_file(&staging).await;
-        return Err(format!("无法保存 CSV：{error}。目标文件未被替换。"));
+        return Err(format!("无法保存文件：{error}。目标文件未被替换。"));
     }
     Ok(())
 }

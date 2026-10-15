@@ -94,6 +94,8 @@ pub struct ExportRequest {
     pub null_token: String,
     pub bom: bool,
     pub header: bool,
+    #[serde(default)]
+    pub format: String,
 }
 
 #[derive(Serialize)]
@@ -391,6 +393,7 @@ pub async fn grid_export(state: tauri::State<'_, ConnectionsState>, request: Exp
         null_token: request.null_token,
         bom: request.bom,
         header: request.header,
+        format: request.format,
         fail_after_rows: None,
         cancel_after_rows: None,
     };

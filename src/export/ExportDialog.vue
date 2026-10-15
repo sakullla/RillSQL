@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { renderCsv, type CsvCell, type CsvDelimiter, type CsvOptions, type NullToken } from "./csv";
+import { renderInsert, type InsertTarget } from "./insert";
+import { renderJson } from "./json";
 import { planExport, type ExportOrigin, type ExportScope } from "./plan";
 import { chooseExportPath } from "./native";
+import type { ExportFormat } from "./write";
 
 const props = defineProps<{
   open: boolean;
@@ -14,14 +17,16 @@ const props = defineProps<{
   pending: number;
   columns: string[];
   previewRows: Record<string, CsvCell>[];
+  insertTarget?: InsertTarget | null;
 }>();
 
 const emit = defineEmits<{
   close: [];
-  start: [payload: { planNotice: string; scope: ExportScope; acknowledged: boolean; path: string; csv: CsvOptions }];
+  start: [payload: { planNotice: string; scope: ExportScope; acknowledged: boolean; path: string; csv: CsvOptions; format: ExportFormat }];
 }>();
 
 const scope = ref<ExportScope>("loaded");
+const format = ref<ExportFormat>("csv");
 const delimiter = ref<CsvDelimiter>(",");
 const nullToken = ref<NullToken>("");
 const bom = ref(true);
@@ -36,6 +41,7 @@ watch(
   (open) => {
     if (!open) return;
     scope.value = "loaded";
+    format.value = "csv";
     acknowledged.value = false;
     error.value = "";
     const stamp = new Date().toISOString().slice(0, 10);
@@ -43,6 +49,13 @@ watch(
   },
   { immediate: true },
 );
+
+watch(format, (next, previous) => {
+  if (!props.open || next === previous) return;
+  const extension = next === "json" ? "json" : next === "insert" ? "sql" : "csv";
+  path.value = path.value.replace(/\.(csv|json|sql)$/i, `.${extension}`);
+  if (!/\.(csv|json|sql)$/i.test(path.value)) path.value = `${path.value}.${extension}`;
+});
 
 const csv = computed<CsvOptions>(() => ({ delimiter: delimiter.value, nullToken: nullToken.value, bom: bom.value, header: header.value }));
 const plan = computed(() =>
@@ -54,8 +67,15 @@ const plan = computed(() =>
     fileName: path.value.trim() || `${props.fileStem}.csv`,
   }),
 );
-const preview = computed(() => renderCsv(props.columns, props.previewRows.slice(0, 4), { ...csv.value, bom: false }));
-const canStart = computed(() => plan.value.allowed && (!plan.value.reexecutes || acknowledged.value) && path.value.trim().length > 0);
+const insertBlocked = computed(() => format.value === "insert" && !props.insertTarget?.name);
+const preview = computed(() => {
+  const rows = props.previewRows.slice(0, 4);
+  if (format.value === "json") return renderJson(props.columns, rows);
+  if (format.value === "insert" && props.insertTarget?.name) return renderInsert(props.insertTarget, props.columns, rows);
+  if (format.value === "insert") return "";
+  return renderCsv(props.columns, rows, { ...csv.value, bom: false });
+});
+const canStart = computed(() => plan.value.allowed && !insertBlocked.value && (!plan.value.reexecutes || acknowledged.value) && path.value.trim().length > 0);
 
 async function start() {
   if (!canStart.value || choosing.value) return;
@@ -67,9 +87,10 @@ async function start() {
     acknowledged: acknowledged.value,
     path: plan.value.fileName,
     csv: { ...csv.value },
+    format: format.value,
   };
   try {
-    const selected = await chooseExportPath(payload.path);
+    const selected = await chooseExportPath(payload.path, format.value);
     if (!selected || !props.open) return;
     path.value = selected;
     emit("start", { ...payload, path: selected });
@@ -83,11 +104,11 @@ async function start() {
 
 <template>
   <div v-if="open" class="ex-overlay" role="presentation">
-    <div class="ex-sheet" role="dialog" aria-modal="true" aria-label="导出为 CSV">
+    <div class="ex-sheet" role="dialog" aria-modal="true" :aria-label="format === 'json' ? '导出为 JSON' : format === 'insert' ? '导出为 INSERT' : '导出为 CSV'">
       <header class="ex-head">
         <div class="ex-titles">
-          <h2>导出为 CSV</h2>
-          <p>CSV 只是数据导出，不是数据库备份；要备份请用数据库自带的备份工具。</p>
+          <h2>{{ format === "json" ? "导出为 JSON" : format === "insert" ? "导出为 INSERT" : "导出为 CSV" }}</h2>
+          <p>这只是数据导出，不是数据库备份；要备份请用数据库自带的备份工具。</p>
         </div>
         <button class="icon-btn" type="button" aria-label="关闭" @click="emit('close')">
           <svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
@@ -98,6 +119,23 @@ async function start() {
         <p v-if="error" class="ex-alert" role="alert">{{ error }}</p>
         <fieldset class="ex-options" :disabled="choosing">
         <p v-if="pending" class="ex-note warn">表格里还有 {{ pending }} 处更改没有提交。导出的是数据库里已提交的数据，不包含这些未提交的更改。</p>
+
+        <fieldset class="ex-scope">
+          <legend>导出成哪种文件</legend>
+          <label class="ex-choice" :class="{ on: format === 'csv' }">
+            <input v-model="format" type="radio" name="ex-format" value="csv" />
+            <span><b>CSV</b><small>表格文本。空值按下面的 NULL 写法写出。</small></span>
+          </label>
+          <label class="ex-choice" :class="{ on: format === 'json' }">
+            <input v-model="format" type="radio" name="ex-format" value="json" />
+            <span><b>JSON 数组</b><small>每个对象是一行。空值仍是 null，空字符串仍是空字符串。</small></span>
+          </label>
+          <label class="ex-choice" :class="{ on: format === 'insert' }">
+            <input v-model="format" type="radio" name="ex-format" value="insert" />
+            <span><b>INSERT 语句</b><small>只包含这些行，不含建表或整库脚本。空值写成 NULL。</small></span>
+          </label>
+        </fieldset>
+        <p v-if="insertBlocked" class="ex-alert" role="alert">还不能确定 INSERT 要写入的表，不能开始。</p>
 
         <fieldset class="ex-scope">
           <legend>导出哪些行</legend>
@@ -130,11 +168,12 @@ async function start() {
         </label>
 
         <div class="ex-preview-wrap">
-          <p class="ex-note">预览（前 4 行）：非 NULL 的值都会加引号，所以 "" 是空字符串，{{ nullToken === "" ? "空字段" : nullToken }} 是 NULL。</p>
+          <p v-if="format === 'csv'" class="ex-note">预览（前 4 行）：非 NULL 的值都会加引号，所以 "" 是空字符串，{{ nullToken === "" ? "空字段" : nullToken }} 是 NULL。</p>
+          <p v-else class="ex-note">预览（前 4 行）。空值保持为空值。未提交的修改不会进入文件。</p>
           <pre class="ex-preview">{{ preview }}</pre>
         </div>
 
-        <details class="disclosure">
+        <details v-if="format === 'csv'" class="disclosure">
           <summary>高级选项 <span class="muted">分隔符、NULL 写法、编码、列名行</span></summary>
           <div class="disclosure-body ex-advanced">
             <label>分隔符

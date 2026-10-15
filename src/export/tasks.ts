@@ -2,8 +2,10 @@ import { reactive } from "vue";
 import { gridExport, gridExportCancel, type ExportResult } from "../grid/api";
 import type { Filter, SortSpec } from "../grid/types";
 import { renderCsv, type CsvCell, type CsvOptions } from "./csv";
+import { renderInsert, type InsertTarget } from "./insert";
+import { renderJson } from "./json";
 import type { ExportPlan } from "./plan";
-import type { WriteControl, WriteResult } from "./write";
+import type { ExportFormat, WriteControl, WriteResult } from "./write";
 import { isNativeExport, writeNativeCsv } from "./native";
 
 export interface ExportTask {
@@ -61,6 +63,21 @@ function downloadCsv(fileName: string, body: string): void {
   window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
 
+export function renderExportText(options: {
+  format?: ExportFormat;
+  columns: readonly string[];
+  rows: readonly Record<string, CsvCell>[];
+  csv: CsvOptions;
+  insert?: InsertTarget;
+}): string {
+  if (options.format === "json") return renderJson(options.columns, options.rows);
+  if (options.format === "insert") {
+    if (!options.insert?.name) throw new Error("还不能确定 INSERT 要写入的表");
+    return renderInsert(options.insert, options.columns, options.rows);
+  }
+  return renderCsv(options.columns, options.rows, options.csv);
+}
+
 function exportLoadedInBrowser(options: {
   plan: ExportPlan;
   acknowledged: boolean;
@@ -68,10 +85,13 @@ function exportLoadedInBrowser(options: {
   columns: readonly string[];
   rows: readonly Record<string, CsvCell>[];
   csv: CsvOptions;
+  format?: ExportFormat;
+  insert?: InsertTarget;
   readRows?: () => readonly Record<string, CsvCell>[];
 }): WriteResult {
   if (!options.plan.allowed) return blockedExport(options.plan.rejectReason ?? "不能导出");
   if (options.plan.reexecutes && !options.acknowledged) return blockedExport("执行前需说明会重新执行这条 SELECT");
+  if ((options.format ?? "csv") === "insert" && !options.insert?.name) return blockedExport("还不能确定 INSERT 要写入的表");
   let readCalled = false;
   let rows = options.rows;
   if (options.plan.serverRead) {
@@ -80,7 +100,7 @@ function exportLoadedInBrowser(options: {
     rows = options.readRows();
   }
   const fileName = options.path.split(/[/\\]/).pop() || options.plan.fileName;
-  downloadCsv(fileName, renderCsv(options.columns, rows, options.csv));
+  downloadCsv(fileName, renderExportText({ ...options, rows }));
   let message = `已导出 ${rows.length} 行，开始下载 ${fileName}。`;
   if (options.plan.partial) message = `已导出 ${rows.length} 行，开始下载 ${fileName}。这只是已读取的行，不是完整结果。`;
   if (options.plan.reexecutes) message = `${options.plan.notice}${message}`;
@@ -95,6 +115,8 @@ async function startExportOnNode(
     columns: readonly string[];
     rows: readonly Record<string, CsvCell>[];
     csv: CsvOptions;
+    format?: ExportFormat;
+    insert?: InsertTarget;
     control?: WriteControl;
     readRows?: () => readonly Record<string, CsvCell>[];
   },
@@ -118,6 +140,8 @@ export async function runExportTask(options: {
   columns: readonly string[];
   rows: readonly Record<string, CsvCell>[];
   csv: CsvOptions;
+  format?: ExportFormat;
+  insert?: InsertTarget;
   control?: WriteControl;
   readRows?: () => readonly Record<string, CsvCell>[];
 }): Promise<{ task: ExportTask; result: WriteResult }> {
@@ -142,7 +166,7 @@ export async function runExportTask(options: {
     else if (isNativeExport()) {
       if (options.plan.serverRead) result = blockedExport("全量导出需要使用已打开的数据库连接。");
       else {
-        await writeNativeCsv(options.path, renderCsv(options.columns, options.rows, options.csv));
+        await writeNativeCsv(options.path, renderExportText(options));
         result = {
           status: "done", success: true, writtenRows: options.rows.length, path: options.path,
           residualPath: null, readCalled: false,
@@ -174,6 +198,8 @@ export interface RemoteExportOptions {
   limit: number;
   truncated: boolean;
   statement: string;
+  format?: ExportFormat;
+  insert?: InsertTarget;
 }
 
 function asStatus(status: string): ExportTask["status"] {
@@ -232,6 +258,7 @@ export function runRemoteExport(options: RemoteExportOptions): { task: ExportTas
     nullToken: options.csv.nullToken,
     bom: options.csv.bom,
     header: options.csv.header,
+    format: options.format ?? "csv",
   })
     .then((result) => {
       applyExportResult(task, result);

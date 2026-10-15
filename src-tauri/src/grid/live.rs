@@ -89,6 +89,7 @@ pub struct ExportSpec {
     pub null_token: String,
     pub bom: bool,
     pub header: bool,
+    pub format: String,
     pub fail_after_rows: Option<u64>,
     pub cancel_after_rows: Option<u64>,
 }
@@ -332,7 +333,34 @@ fn finish_job(id: &str) {
     jobs().lock().expect("exports").remove(id);
 }
 
+fn engine_from(hint: &str) -> Engine {
+    match hint {
+        "mysql" => Engine::Mysql,
+        "mariadb" => Engine::Mariadb,
+        "sqlite" => Engine::Sqlite,
+        _ => Engine::Postgres,
+    }
+}
+
+fn export_format(spec: &ExportSpec) -> Result<&'static str, ExportOutcome> {
+    match spec.format.as_str() {
+        "" | "csv" => Ok("csv"),
+        "json" => Ok("json"),
+        "insert" => {
+            if spec.table.trim().is_empty() {
+                Err(blocked("INSERT 导出需要一张表的名字"))
+            } else {
+                Ok("insert")
+            }
+        }
+        other => Err(blocked(format!("未知导出格式 {other}"))),
+    }
+}
+
 async fn export_body(session: &CatalogSession, spec: &ExportSpec, flag: &AtomicBool) -> ExportOutcome {
+    if let Err(outcome) = export_format(spec) {
+        return outcome;
+    }
     if matches!(session, CatalogSession::Scripted) {
         return failed_message(no_channel());
     }
@@ -345,7 +373,7 @@ async fn export_body(session: &CatalogSession, spec: &ExportSpec, flag: &AtomicB
             if !spec.acknowledged {
                 return blocked("执行前需说明会重新执行这条 SELECT".to_owned());
             }
-            stream_statement(session, &statement, spec, flag, false, None).await
+            stream_statement(session, &statement, spec, flag, false, None, engine_from(&spec.engine_hint), &[]).await
         }
         ExportMode::TableLoaded | ExportMode::TableFull => {
             let schema = match describe(session, &spec.database, &spec.schema, &spec.table, &spec.engine_hint).await {
@@ -362,9 +390,26 @@ async fn export_body(session: &CatalogSession, spec: &ExportSpec, flag: &AtomicB
                 Err(message) => return failed_message(message),
             };
             let columns: Vec<String> = schema.columns.iter().map(|column| column.name.clone()).collect();
-            stream_statement(session, &sql, spec, flag, partial, Some(columns)).await
+            stream_statement(session, &sql, spec, flag, partial, Some(columns), schema.engine, &schema.columns).await
         }
     }
+}
+
+fn plain_columns(names: &[String], known: &[Column]) -> Vec<Column> {
+    if !known.is_empty() {
+        return known.to_vec();
+    }
+    names
+        .iter()
+        .map(|name| Column {
+            name: name.clone(),
+            type_name: String::new(),
+            nullable: true,
+            primary: false,
+            unique: false,
+            auto: false,
+        })
+        .collect()
 }
 
 async fn stream_statement(
@@ -374,6 +419,8 @@ async fn stream_statement(
     flag: &AtomicBool,
     partial: bool,
     known_names: Option<Vec<String>>,
+    engine: Engine,
+    columns: &[Column],
 ) -> ExportOutcome {
     match session {
         CatalogSession::Scripted => failed_message(no_channel()),
@@ -392,10 +439,12 @@ async fn stream_statement(
                     statement.columns().iter().map(|column| column.name().to_owned()).collect()
                 }
             };
-            let mut csv = match CsvFile::create(&spec.path, partial, spec) {
+            let typed = plain_columns(&names, columns);
+            let mut csv = match CsvFile::create(&spec.path, partial, spec, &typed, engine) {
                 Ok(csv) => csv,
                 Err(outcome) => return outcome,
             };
+            csv.set_names(&names);
             if let Some(outcome) = csv.control(flag, spec) {
                 return outcome;
             }
@@ -434,10 +483,12 @@ async fn stream_statement(
                 Err(err) => return failed_message(err.to_string()),
             };
             let names = known_names.unwrap_or_else(|| result.columns_ref().iter().map(|column| column.name_str().into_owned()).collect());
-            let mut csv = match CsvFile::create(&spec.path, partial, spec) {
+            let typed = plain_columns(&names, columns);
+            let mut csv = match CsvFile::create(&spec.path, partial, spec, &typed, engine) {
                 Ok(csv) => csv,
                 Err(outcome) => return outcome,
             };
+            csv.set_names(&names);
             if let Some(outcome) = csv.control(flag, spec) {
                 return outcome;
             }
@@ -477,10 +528,12 @@ async fn stream_statement(
                 Ok(statement) => statement,
                 Err(err) => return failed_message(err.to_string()),
             };
-            let mut csv = match CsvFile::create(&spec.path, partial, spec) {
+            let typed = plain_columns(&names, columns);
+            let mut csv = match CsvFile::create(&spec.path, partial, spec, &typed, engine) {
                 Ok(csv) => csv,
                 Err(outcome) => return outcome,
             };
+            csv.set_names(&names);
             if let Some(outcome) = csv.control(flag, spec) {
                 return outcome;
             }
@@ -528,13 +581,19 @@ struct CsvFile {
     delimiter: String,
     null_token: String,
     bom: bool,
+    format: String,
+    names: Vec<String>,
+    columns: Vec<Column>,
+    engine: Engine,
+    schema_name: String,
+    table_name: String,
     marked_partial: bool,
     started: bool,
     written: u64,
 }
 
 impl CsvFile {
-    fn create(path: &str, partial: bool, spec: &ExportSpec) -> Result<Self, ExportOutcome> {
+    fn create(path: &str, partial: bool, spec: &ExportSpec, columns: &[Column], engine: Engine) -> Result<Self, ExportOutcome> {
         let final_path = output_path(path, partial);
         if let Some(parent) = final_path.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
@@ -553,18 +612,38 @@ impl CsvFile {
             delimiter: if spec.delimiter.is_empty() { ",".to_owned() } else { spec.delimiter.clone() },
             null_token: spec.null_token.clone(),
             bom: spec.bom,
+            format: if spec.format.is_empty() { "csv".to_owned() } else { spec.format.clone() },
+            names: Vec::new(),
+            columns: columns.to_vec(),
+            engine,
+            schema_name: spec.schema.clone(),
+            table_name: spec.table.clone(),
             marked_partial: partial,
             started: false,
             written: 0,
         })
     }
 
+    fn set_names(&mut self, names: &[String]) {
+        self.names = names.to_vec();
+    }
+
     fn write_header(&mut self, names: &[String]) -> Option<ExportOutcome> {
+        self.names = names.to_vec();
+        if self.format != "csv" {
+            return None;
+        }
         let fields = names.iter().map(|name| encode_field(Some(name), &self.null_token)).collect::<Vec<_>>();
         self.write_line(&fields.join(&self.delimiter)).err().map(|err| self.fail(&err.to_string()))
     }
 
     fn write_cells(&mut self, cells: &[Cell]) -> Option<ExportOutcome> {
+        if self.format == "json" {
+            return self.write_json(cells);
+        }
+        if self.format == "insert" {
+            return self.write_insert(cells);
+        }
         let fields = cells
             .iter()
             .map(|cell| match cell {
@@ -573,6 +652,26 @@ impl CsvFile {
             })
             .collect::<Vec<_>>();
         if let Err(err) = self.write_line(&fields.join(&self.delimiter)) {
+            return Some(self.fail(&err.to_string()));
+        }
+        self.written += 1;
+        None
+    }
+
+    fn write_json(&mut self, cells: &[Cell]) -> Option<ExportOutcome> {
+        let object = json_object(&self.names, cells);
+        let text = if self.written == 0 { format!("[{object}") } else { format!(",{object}") };
+        if let Err(err) = self.write_chunk(&text) {
+            return Some(self.fail(&err.to_string()));
+        }
+        self.written += 1;
+        None
+    }
+
+    fn write_insert(&mut self, cells: &[Cell]) -> Option<ExportOutcome> {
+        let line = insert_line(self.engine, &self.schema_name, &self.table_name, &self.columns, &self.names, cells);
+        let text = if self.written == 0 { line } else { format!("\r\n{line}") };
+        if let Err(err) = self.write_chunk(&text) {
             return Some(self.fail(&err.to_string()));
         }
         self.written += 1;
@@ -589,22 +688,32 @@ impl CsvFile {
         None
     }
 
-    fn write_line(&mut self, line: &str) -> io::Result<()> {
+    fn write_chunk(&mut self, text: &str) -> io::Result<()> {
         let file = self.file.as_mut().ok_or_else(|| io::Error::other("文件已关闭"))?;
         if !self.started {
-            if self.bom {
+            if self.format == "csv" && self.bom {
                 file.write_all("\u{feff}".as_bytes())?;
             }
             self.started = true;
-            file.write_all(line.as_bytes())?;
-        } else {
-            file.write_all(b"\r\n")?;
-            file.write_all(line.as_bytes())?;
         }
+        file.write_all(text.as_bytes())?;
         Ok(())
     }
 
+    fn write_line(&mut self, line: &str) -> io::Result<()> {
+        if self.started {
+            self.write_chunk("\r\n")?;
+        }
+        self.write_chunk(line)
+    }
+
     fn finish(mut self) -> ExportOutcome {
+        if self.format == "json" {
+            let tail = if self.written == 0 { "[]" } else { "]" };
+            if let Err(err) = self.write_chunk(tail) {
+                return residual(self.written, &self.partial_path, &err.to_string());
+            }
+        }
         let flush = self.file.as_mut().map(|file| file.flush()).transpose();
         self.file.take();
         if let Err(err) = flush {
@@ -659,11 +768,65 @@ fn output_path(path: &str, partial: bool) -> PathBuf {
     if !partial || path.contains("（部分）") {
         return PathBuf::from(path);
     }
-    if let Some(stripped) = path.strip_suffix(".csv").or_else(|| path.strip_suffix(".CSV")) {
-        PathBuf::from(format!("{stripped}（部分）.csv"))
-    } else {
-        PathBuf::from(format!("{path}（部分）"))
+    for suffix in [".csv", ".CSV", ".json", ".JSON", ".sql", ".SQL"] {
+        if let Some(stripped) = path.strip_suffix(suffix) {
+            return PathBuf::from(format!("{stripped}（部分）{}", suffix.to_ascii_lowercase()));
+        }
     }
+    PathBuf::from(format!("{path}（部分）"))
+}
+
+fn json_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_object(names: &[String], cells: &[Cell]) -> String {
+    let fields = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let value = match cells.get(index) {
+                Some(Cell::Text(text)) => json_string(text),
+                _ => "null".to_owned(),
+            };
+            format!("{}:{value}", json_string(name))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{fields}}}")
+}
+
+fn insert_line(engine: Engine, schema_name: &str, table: &str, columns: &[Column], names: &[String], cells: &[Cell]) -> String {
+    let values = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let cell = cells.get(index).cloned().unwrap_or(Cell::Null);
+            (name.clone(), cell)
+        })
+        .collect::<Vec<_>>();
+    let schema = TableSchema {
+        engine,
+        schema: schema_name.to_owned(),
+        name: table.to_owned(),
+        kind: "table",
+        columns: columns.to_vec(),
+        key: Vec::new(),
+    };
+    format!("{};", sql::insert_sql(&schema, &values))
 }
 
 fn cancelled(written: u64) -> ExportOutcome {

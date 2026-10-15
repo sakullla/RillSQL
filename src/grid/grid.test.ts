@@ -6,6 +6,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { exportTasks, resetExportTasks } from "../export/tasks";
 import DataGrid from "./DataGrid.vue";
 import { commitChanges, queryPage, viewLoadedRows } from "./data";
+import { locateResultRows, readSingleTable, resolveEditableTable, ResultEditSession } from "./result-edit";
+import { gridModel } from "../query/rows";
 import { copyPlain, copySqlValue, showCell } from "./display";
 import { customersFixture, nokeyFixture, viewFixture } from "./fixture";
 import QueryResultGrid from "./QueryResultGrid.vue";
@@ -539,5 +541,166 @@ describe("grid views", () => {
     expect(exportTasks[0]?.status).toBe("done");
     rmSync(dir, { recursive: true, force: true });
     wrapper.unmount();
+  });
+});
+
+describe("query result edits", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    resetExportTasks();
+  });
+
+  function proof(sql: string) {
+    const parsed = readSingleTable(sql);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error(parsed.reason);
+    return parsed.table;
+  }
+
+  it("only locates a proved single-table select that contains its primary key", () => {
+    expect(readSingleTable("SELECT * FROM orders JOIN items ON items.id = orders.id").ok).toBe(false);
+    expect(readSingleTable("SELECT status, COUNT(*) FROM orders GROUP BY status").reason).toContain("聚合");
+    expect(readSingleTable("SELECT DISTINCT status FROM orders").reason).toContain("DISTINCT");
+    expect(readSingleTable("SELECT id FROM orders UNION SELECT id FROM archive").reason).toContain("UNION");
+    expect(readSingleTable("SELECT id FROM (SELECT id FROM orders) q").reason).toContain("子查询");
+    expect(readSingleTable("DELETE FROM orders").reason).toContain("SELECT");
+    const ambiguous = resolveEditableTable(proof("SELECT status FROM orders"), [
+      { schema: "public", name: "orders", kind: "table" },
+      { schema: "sales", name: "orders", kind: "table" },
+    ], "app");
+    expect(ambiguous.ok).toBe(false);
+    if (!ambiguous.ok) expect(ambiguous.reason).toContain("多个模式");
+    const named = resolveEditableTable(proof("SELECT status FROM public.orders"), [], "app");
+    expect(named).toEqual({ ok: true, schema: "public", table: "orders" });
+    const model = gridModel({ columns: ["id", "name"], rows: [["1", "甲"], ["1", "乙"]] });
+    const missingKey = locateResultRows({ ...customersFixture(1).schema, key: [] }, model.columns, model.rows);
+    expect(missingKey.ok).toBe(false);
+    if (!missingKey.ok) expect(missingKey.reason).toContain("没有主键");
+    const view = locateResultRows(viewFixture().schema, model.columns, model.rows);
+    expect(view.ok).toBe(false);
+    if (!view.ok) expect(view.reason).toContain("视图");
+    const duplicated = locateResultRows(customersFixture(1).schema, model.columns, model.rows);
+    expect(duplicated.ok).toBe(false);
+    if (!duplicated.ok) expect(duplicated.reason).toContain("无法唯一确定");
+    const unique = gridModel({ columns: ["id", "status"], rows: [["7", "open"]] });
+    const located = locateResultRows(customersFixture(1).schema, unique.columns, unique.rows);
+    expect(located.ok).toBe(true);
+    if (located.ok) expect(located.rows[0]?.located).toBe(true);
+    expect(model.rows.every((row) => !row.located)).toBe(true);
+  });
+
+  it("previews a cell change and writes it through the existing commit", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_commit") {
+        return { applied: [{ id: "u:r0", sql: "UPDATE", label: "修改 r0" }], failed: null, pendingIds: [], rolledBack: false, rule: COMMIT_RULE };
+      }
+      throw new Error(command);
+    });
+    const model = gridModel({ columns: ["id", "name", "email", "note"], rows: [["1", "客户1", "a@example.com", null]] });
+    const wrapper = mount(QueryResultGrid, {
+      props: {
+        tabId: "query-edit",
+        statement: "SELECT id, name, email, note FROM public.customers",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+        schema: "public",
+      },
+    });
+    await flushPromises();
+    expect(wrapper.attributes("data-editable")).toBe("true");
+    expect(wrapper.text()).toContain("查询结果不能新增行");
+    expect(wrapper.findAll("button").some((button) => button.text() === "新增行")).toBe(false);
+    await wrapper.get("[data-cell='r0:name']").trigger("dblclick");
+    await wrapper.get("input[aria-label='编辑 name']").setValue("新名字");
+    await wrapper.findAll("button").find((button) => button.text() === "确定")!.trigger("click");
+    expect(wrapper.get(".pending-bar").text()).toContain("1 处更改未保存");
+    await wrapper.findAll("button").find((button) => button.text() === "提交")!.trigger("click");
+    expect(wrapper.get("[aria-label='待提交的更改']").text()).toContain("UPDATE");
+    await wrapper.findAll("button").find((button) => button.text() === "提交 1 处更改")!.trigger("click");
+    await flushPromises();
+    const commit = invoke.mock.calls.find((call) => call[0] === "grid_commit");
+    expect(commit?.[1]).toMatchObject({ request: { table: "customers", schema: "public", changes: [{ kind: "update", id: "u:r0" }] } });
+    expect(wrapper.get("[data-cell='r0:name']").text()).toContain("新名字");
+    wrapper.unmount();
+  });
+
+  it("keeps a rejected row and later staged changes unsuccessful", async () => {
+    const model = gridModel({
+      columns: ["id", "name"],
+      rows: [["1", "甲"], ["2", "乙"], ["3", "丙"]],
+    });
+    const located = locateResultRows(customersFixture(1).schema, model.columns, model.rows);
+    expect(located.ok).toBe(true);
+    if (!located.ok) return;
+    const session = new ResultEditSession(customersFixture(1).schema, customersTarget, located.rows);
+    session.stageUpdate("r0", "name", "甲改");
+    session.stageUpdate("r1", "name", "乙改");
+    session.stageUpdate("r2", "name", "丙改");
+    invoke.mockResolvedValue({
+      applied: [{ id: "u:r0", sql: "UPDATE", label: "修改 r0" }],
+      failed: { id: "u:r1", sql: "UPDATE", label: "修改 r1", message: "check constraint failed" },
+      pendingIds: ["u:r1", "u:r2"],
+      rolledBack: false,
+      rule: COMMIT_RULE,
+    });
+    const report = await session.commit();
+    expect(report?.applied).toHaveLength(1);
+    expect(report?.failed?.message).toContain("check constraint");
+    expect(session.cellValue("r0", "name")).toBe("甲改");
+    expect(session.failures.get("u:r1")).toContain("check constraint");
+    expect(session.cellValue("r1", "name")).toBe("乙改");
+    expect(session.cellValue("r2", "name")).toBe("丙改");
+    expect(session.pendingCount).toBe(2);
+    expect(session.committedCells().map((row) => row.name)).toEqual(["甲改", "乙", "丙"]);
+  });
+
+  it("stays read-only for a join, a view, and a table without a key", async () => {
+    const join = mount(QueryResultGrid, {
+      props: { tabId: "join", statement: "SELECT * FROM orders JOIN items ON items.id = orders.id", columns: [], rows: [], truncated: false, connectionId: "shop", engine: "postgres", database: "app" },
+    });
+    expect(join.text()).toContain("JOIN");
+    expect(join.attributes("data-editable")).toBe("false");
+    expect(invoke).not.toHaveBeenCalled();
+    join.unmount();
+
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return { ...customerSchema(), name: "customer_view", kind: "view" };
+      throw new Error(command);
+    });
+    const view = mount(QueryResultGrid, {
+      props: {
+        tabId: "view",
+        statement: "SELECT id, name FROM public.customer_view",
+        columns: gridModel({ columns: ["id", "name"], rows: [["1", "只读"]] }).columns,
+        rows: gridModel({ columns: ["id", "name"], rows: [["1", "只读"]] }).rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+      },
+    });
+    await flushPromises();
+    expect(view.text()).toContain("视图是只读的");
+    expect(view.attributes("data-editable")).toBe("false");
+    view.unmount();
+
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return { ...customerSchema(), key: [], columns: customerSchema().columns.map((column) => ({ ...column, primary: false })) };
+      throw new Error(command);
+    });
+    const bare = gridModel({ columns: ["id", "name"], rows: [["1", "甲"]] });
+    const nokey = mount(QueryResultGrid, {
+      props: { tabId: "nokey", statement: "SELECT id, name FROM public.notes", columns: bare.columns, rows: bare.rows, truncated: false, connectionId: "shop", engine: "postgres", database: "app" },
+    });
+    await flushPromises();
+    expect(nokey.text()).toContain("没有主键");
+    await nokey.get("[data-cell='r0:name']").trigger("dblclick");
+    expect(nokey.find("input[aria-label='编辑 name']").exists()).toBe(false);
+    nokey.unmount();
   });
 });

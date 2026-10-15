@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mount } from "@vue/test-utils";
@@ -7,6 +7,8 @@ import { customersFixture } from "../grid/fixture";
 import { queryPage } from "../grid/data";
 import { selectExportGate } from "../grid/sql";
 import { parseCsvDistinct, renderCsv, type CsvOptions } from "./csv";
+import { renderInsert } from "./insert";
+import { renderJson } from "./json";
 import { planExport } from "./plan";
 import TaskCenter from "./TaskCenter.vue";
 import { exportTasks, resetExportTasks } from "./tasks";
@@ -212,5 +214,65 @@ describe("csv export", () => {
     await trigger.trigger("click");
     expect(wrapper.text()).toContain("没有后台任务");
     wrapper.unmount();
+  });
+});
+
+describe("json and insert export", () => {
+  const columns = ["id", "note"];
+  const rows = [{ id: "1", note: null }, { id: "2", note: "" }];
+  const insert = { engine: "postgres" as const, schema: "public", name: "customers", columns: [{ name: "id", typeName: "integer" }, { name: "note", typeName: "text" }] };
+
+  it("keeps nulls empty and does not replace an existing file when writing fails", () => {
+    expect(JSON.parse(renderJson(columns, rows))).toEqual([{ id: "1", note: null }, { id: "2", note: "" }]);
+    const sql = renderInsert(insert, columns, rows);
+    expect(sql).toContain('INSERT INTO "public"."customers"');
+    expect(sql).toContain("NULL");
+    expect(sql).toContain("''");
+    expect(sql).not.toContain("CREATE");
+    expect(planExport({ origin: "query", scope: "full", statement: "DELETE FROM customers", truncated: false, fileName: "rows.json" }).allowed).toBe(false);
+    const partial = planExport({ origin: "table", scope: "loaded", truncated: true, fileName: "rows.json" });
+    expect(partial.fileName).toBe("rows（部分）.json");
+    const dir = tempDir();
+    const kept = join(dir, "kept.json");
+    writeFileSync(kept, "[{\"id\":\"old\"}]");
+    const failed = startExport({
+      plan: planExport({ origin: "table", scope: "loaded", truncated: false, fileName: kept }),
+      acknowledged: false,
+      path: kept,
+      columns,
+      rows,
+      csv,
+      format: "json",
+      control: { failAfterRows: 1, failMessage: "磁盘空间不足" },
+    });
+    expect(failed.success).toBe(false);
+    expect(readFileSync(kept, "utf8")).toBe("[{\"id\":\"old\"}]");
+    const written = join(dir, "out.json");
+    const done = startExport({
+      plan: planExport({ origin: "table", scope: "loaded", truncated: false, fileName: written }),
+      acknowledged: false,
+      path: written,
+      columns,
+      rows,
+      csv,
+      format: "json",
+    });
+    expect(done.success).toBe(true);
+    expect(JSON.parse(readFileSync(written, "utf8"))).toEqual([{ id: "1", note: null }, { id: "2", note: "" }]);
+    const insertPath = join(dir, "out.sql");
+    const inserted = startExport({
+      plan: planExport({ origin: "table", scope: "loaded", truncated: false, fileName: insertPath }),
+      acknowledged: false,
+      path: insertPath,
+      columns,
+      rows,
+      csv,
+      format: "insert",
+      insert,
+    });
+    expect(inserted.success).toBe(true);
+    expect(readFileSync(insertPath, "utf8")).toContain("NULL");
+    expect(readFileSync(insertPath, "utf8")).not.toContain("old");
+    rmSync(dir, { recursive: true, force: true });
   });
 });

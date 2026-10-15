@@ -35,6 +35,7 @@ export interface ExportPayload {
   nullToken: string;
   bom: boolean;
   header: boolean;
+  format?: string;
 }
 
 export interface ExportResult {
@@ -161,6 +162,7 @@ export function gridExport(payload: ExportPayload): Promise<ExportResult> {
       nullToken: payload.nullToken,
       bom: payload.bom,
       header: payload.header,
+      format: payload.format ?? "csv",
     },
   });
 }

@@ -401,6 +401,7 @@ async fn open_session_reads_writes_and_exports_without_a_second_connection() {
         null_token: String::new(),
         bom: false,
         header: true,
+        format: "csv".to_owned(),
         fail_after_rows: None,
         cancel_after_rows: None,
     };
@@ -474,6 +475,40 @@ async fn open_session_reads_writes_and_exports_without_a_second_connection() {
     assert!(!mid.success);
     assert!(!dir.join("mid（部分）.csv").exists());
     assert!(!PathBuf::from(format!("{}.partial", dir.join("mid（部分）.csv").display())).exists());
+
+    let mut json_spec = spec("json", ExportMode::TableLoaded, &dir.join("rows.json").display().to_string(), 2, false, "", true);
+    json_spec.format = "json".to_owned();
+    let json = live::run_export(&session, &json_spec).await;
+    assert!(json.success);
+    assert_eq!(json.written_rows, 2);
+    let json_body = fs::read_to_string(json.path.unwrap()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json_body).unwrap();
+    assert!(parsed.as_array().unwrap().len() == 2);
+    assert!(json_body.contains("\"note\":null"));
+    assert!(json_body.contains("\"note\":\"\""));
+    let mut insert_spec = spec("insert", ExportMode::TableLoaded, &dir.join("rows.sql").display().to_string(), 2, false, "", true);
+    insert_spec.format = "insert".to_owned();
+    let inserted_file = live::run_export(&session, &insert_spec).await;
+    assert!(inserted_file.success);
+    let insert_body = fs::read_to_string(inserted_file.path.unwrap()).unwrap();
+    assert!(insert_body.contains("INSERT INTO \"customers\""));
+    assert!(insert_body.contains("NULL"));
+    assert!(!insert_body.contains("CREATE TABLE"));
+    let kept = dir.join("kept.json");
+    fs::write(&kept, "[{\"id\":\"old\"}]").unwrap();
+    let mut failed_json = spec("json-fail", ExportMode::TableLoaded, &kept.display().to_string(), 2, false, "", true);
+    failed_json.format = "json".to_owned();
+    failed_json.fail_after_rows = Some(0);
+    let failed_keep = live::run_export(&session, &failed_json).await;
+    assert!(!failed_keep.success);
+    assert_eq!(fs::read_to_string(&kept).unwrap(), "[{\"id\":\"old\"}]");
+    let unnamed = spec("unnamed", ExportMode::Query, &dir.join("no-table.sql").display().to_string(), 0, false, "SELECT 1", true);
+    let mut unnamed = unnamed;
+    unnamed.format = "insert".to_owned();
+    unnamed.table = String::new();
+    let blocked_insert = live::run_export(&session, &unnamed).await;
+    assert_eq!(blocked_insert.status, "blocked");
+    assert!(!dir.join("no-table.sql").exists());
 
     let missing = live::run_export(&session, &spec("missing", ExportMode::TableFull, &dir.join("missing").join("out.csv").display().to_string(), 0, false, "", true)).await;
     assert!(!missing.success);
