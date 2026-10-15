@@ -71,7 +71,12 @@ impl HistoryStore {
         .execute(&pool)
         .await
         .map_err(|err| format!("建不了查询历史：{err}"))?;
+        super::saved::ensure_schema(&pool).await?;
         Ok(Self { pool })
+    }
+
+    pub(super) fn pool(&self) -> &sqlx::SqlitePool {
+        &self.pool
     }
 
     pub async fn insert(&self, draft: &HistoryDraft) -> Result<(), String> {
