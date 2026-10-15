@@ -51,7 +51,7 @@ function quotedEnd(sql: string, start: number): number {
   return sql.length;
 }
 
-/** 去掉字符串、标识符和注释后，语句里仍有关键字 ANALYZE。 */
+/** 去掉字符串、引号标识符、注释和 dollar-quote 后，语句里仍有 ANALYZE 或 ANALYSE。 */
 function statementHasAnalyze(sql: string): boolean {
   let i = 0;
   while (i < sql.length) {
@@ -83,7 +83,8 @@ function statementHasAnalyze(sql: string): boolean {
     }
     const word = sqlWordAt(sql, i);
     if (word) {
-      if (word.text.toUpperCase() === "ANALYZE") return true;
+      const upper = word.text.toUpperCase();
+      if (upper === "ANALYZE" || upper === "ANALYSE") return true;
       i = word.end;
       continue;
     }

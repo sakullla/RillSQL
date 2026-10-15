@@ -70,7 +70,7 @@ function isIdentStart(ch: string): boolean {
 }
 
 function isIdentCont(ch: string): boolean {
-  return ch === "_" || /^[\p{L}\p{Nd}\p{M}]$/u.test(ch);
+  return ch === "_" || ch === "$" || /^[\p{L}\p{Nd}\p{M}]$/u.test(ch);
 }
 
 /** 从 start 读取一个 SQL 标识符；引号、注释和数值不在这里处理。 */
@@ -100,31 +100,54 @@ function skipQuoted(sql: string, start: number): number {
   return sql.length;
 }
 
+function eatDigits(sql: string, index: number): number {
+  let j = index;
+  while (j < sql.length) {
+    if (/\d/.test(sql[j] ?? "")) {
+      j += 1;
+      continue;
+    }
+    if (sql[j] === "_" && /\d/.test(sql[j + 1] ?? "")) {
+      j += 2;
+      continue;
+    }
+    break;
+  }
+  return j;
+}
+
+function scanExponent(sql: string, index: number): number | null {
+  if (sql[index] !== "e" && sql[index] !== "E") return null;
+  let k = index + 1;
+  if (sql[k] === "+" || sql[k] === "-") k += 1;
+  if (!/\d/.test(sql[k] ?? "")) return null;
+  while (k < sql.length && /\d/.test(sql[k] ?? "")) k += 1;
+  return k;
+}
+
 function scanNumber(sql: string, start: number): number | null {
   const head = sql[start] ?? "";
   if (!/\d/.test(head)) return null;
-  const hex = head === "0" && (sql[start + 1] === "x" || sql[start + 1] === "X") && /[0-9A-Fa-f]/.test(sql[start + 2] ?? "");
+  const mark = sql[start + 1] ?? "";
+  const hex = head === "0" && (mark === "x" || mark === "X") && /[0-9A-Fa-f]/.test(sql[start + 2] ?? "");
   if (hex) {
     let j = start + 3;
     while (j < sql.length && /[0-9A-Fa-f]/.test(sql[j] ?? "")) j += 1;
     return j;
   }
-  let j = start + 1;
-  while (j < sql.length && /\d/.test(sql[j] ?? "")) j += 1;
-  if (sql[j] === "." && /\d/.test(sql[j + 1] ?? "")) {
-    j += 2;
-    while (j < sql.length && /\d/.test(sql[j] ?? "")) j += 1;
+  const bin = head === "0" && (mark === "b" || mark === "B") && /[01]/.test(sql[start + 2] ?? "");
+  if (bin) {
+    let j = start + 3;
+    while (j < sql.length && /[01]/.test(sql[j] ?? "")) j += 1;
+    return j;
   }
-  if (sql[j] === "e" || sql[j] === "E") {
-    let k = j + 1;
-    if (sql[k] === "+" || sql[k] === "-") k += 1;
-    if (/\d/.test(sql[k] ?? "")) {
-      k += 1;
-      while (k < sql.length && /\d/.test(sql[k] ?? "")) k += 1;
-      j = k;
-    }
+  let j = eatDigits(sql, start);
+  if (sql[j] === ".") {
+    const dotted = scanExponent(sql, j + 1);
+    if (dotted !== null && !/\d/.test(sql[j + 1] ?? "")) return dotted;
+    if (/\d/.test(sql[j + 1] ?? "")) j = eatDigits(sql, j + 1);
   }
-  return j;
+  return scanExponent(sql, j) ?? j;
 }
 
 function tokenize(sql: string): Tok[] {
@@ -177,8 +200,15 @@ function tokenize(sql: string): Tok[] {
         i = j;
         continue;
       }
+      if (/\d/.test(sql[i + 1] ?? "")) {
+        let j = i + 2;
+        while (j < sql.length && /\d/.test(sql[j] ?? "")) j += 1;
+        tokens.push({ kind: "word", text: sql.slice(i, j) });
+        i = j;
+        continue;
+      }
     }
-    if ((ch === "x" || ch === "X") && sql[i + 1] === "'") {
+    if ((ch === "x" || ch === "X" || ch === "b" || ch === "B") && sql[i + 1] === "'") {
       const j = skipQuoted(sql, i + 1);
       tokens.push({ kind: "number", text: sql.slice(i, j) });
       i = j;
@@ -207,6 +237,14 @@ function tokenize(sql: string): Tok[] {
       tokens.push({ kind: "punct", text: two });
       i += 2;
       continue;
+    }
+    if ((ch === ":" || ch === "@") && two !== "::") {
+      const named = sqlWordAt(sql, i + 1);
+      if (named) {
+        tokens.push({ kind: "word", text: sql.slice(i, named.end) });
+        i = named.end;
+        continue;
+      }
     }
     const point = codePointAt(sql, i);
     tokens.push({ kind: "punct", text: point.ch });

@@ -72,6 +72,31 @@ describe("sql formatting", () => {
     expect(open).toMatchObject({ ok: false, sql: "select 状态 'abc" });
   });
 
+  it("keeps parameters, numeric separators and bit strings as single tokens", () => {
+    const sql = "select $1, :name, @name, col$1, 1.e+10, 1.e-10, 1_000, 0b101, B'1010', 状态, 1e10, 0xFFa, X'Ab', id::text, doc->'k', doc->>'v' from t";
+    const result = formatSql(sql);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    for (const literal of ["$1", ":name", "@name", "col$1", "1.e+10", "1.e-10", "1_000", "0b101", "B'1010'", "状态", "1e10", "0xFFa", "X'Ab'", "::", "->", "->>"]) {
+      expect(result.sql).toContain(literal);
+    }
+    expect(result.sql).not.toContain("$ 1");
+    expect(result.sql).not.toContain(": name");
+    expect(result.sql).not.toContain("@ name");
+    expect(result.sql).not.toContain("col $");
+    expect(result.sql).not.toContain("1 .");
+    expect(result.sql).not.toContain(". e");
+    expect(result.sql).not.toContain("e +");
+    expect(result.sql).not.toContain("e -");
+    expect(result.sql).not.toContain("1 _");
+    expect(result.sql).not.toContain("0 b");
+    expect(result.sql).not.toContain("B '");
+    expect(result.sql).not.toMatch(/:\s+:/);
+    expect(result.sql).not.toMatch(/-\s+>/);
+    const open = formatSql("select $1, :name, B'1010', 'abc");
+    expect(open).toMatchObject({ ok: false, sql: "select $1, :name, B'1010', 'abc" });
+  });
+
   it("formats only the selection and keeps the surrounding text", () => {
     const sql = "select  1;\nselect   2;";
     const from = sql.indexOf("select   2;");

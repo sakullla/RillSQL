@@ -54,4 +54,21 @@ describe("execution plan selection", () => {
       expect(explainSql("postgres", sql)).toEqual({ ok: true, sql: `EXPLAIN ${sql}` });
     }
   });
+
+  it("refuses ANALYSE after strings, identifiers, comments and dollar quotes are removed", () => {
+    const reason = "计划不使用 ANALYZE，没有发送这条语句。";
+    for (const sql of [
+      "EXPLAIN ANALYSE SELECT 1",
+      "EXPLAIN(ANALYSE) SELECT 1",
+      "EXPLAIN (VERBOSE, ANALYSE) SELECT 1",
+      "EXPLAIN /*c*/ ANALYSE SELECT 1",
+    ]) {
+      expect(explainSql("postgres", sql)).toEqual({ ok: false, reason });
+      expect(explainSql("sqlite", sql)).toEqual({ ok: false, reason });
+    }
+    expect(explainSql("postgres", "EXPLAIN ANALYZE SELECT 1")).toEqual({ ok: false, reason });
+    for (const sql of ["SELECT 'ANALYSE'", 'SELECT "ANALYSE"', "SELECT $$ANALYSE$$", "SELECT 1 /* ANALYSE */"]) {
+      expect(explainSql("postgres", sql)).toEqual({ ok: true, sql: `EXPLAIN ${sql}` });
+    }
+  });
 });
