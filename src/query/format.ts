@@ -26,6 +26,8 @@ const OPEN_REASON: Record<OpenDelimiter, string> = {
   dollar: "无法格式化：dollar-quote 未闭合。",
 };
 const ADJACENT_REASON = "无法格式化：会把原本相连的字符拆开。";
+const COMMENT_BREAK_REASON = "无法格式化：会把行注释断开，后面的文本会变成 SQL。";
+const EDGE_GLUE_REASON = "无法格式化：会去掉选区边缘的空白，使两边的字符粘在一起。";
 
 export type FormatResult = { ok: true; sql: string } | { ok: false; reason: string; sql: string };
 
@@ -53,7 +55,148 @@ export function formatDocument(sql: string, range?: { from: number; to: number }
   const to = selected ? Math.min(sql.length, Math.max(range!.from, range!.to)) : sql.length;
   const formatted = formatSql(sql.slice(from, to));
   if (!formatted.ok) return { ok: false, reason: formatted.reason, sql };
-  return { ok: true, sql: sql.slice(0, from) + formatted.sql + sql.slice(to) };
+  const next = sql.slice(0, from) + formatted.sql + sql.slice(to);
+  if (lineCommentBrokenByNewline(sql, next)) return { ok: false, reason: COMMENT_BREAK_REASON, sql };
+  if (edgeWhitespaceRemoved(sql, from, to, formatted.sql)) return { ok: false, reason: EDGE_GLUE_REASON, sql };
+  return { ok: true, sql: next };
+}
+
+function isBlank(ch: string): boolean {
+  return /\s/.test(ch);
+}
+
+function skipBlank(text: string, index: number): { next: number; newline: boolean } {
+  let next = index;
+  let newline = false;
+  while (next < text.length && isBlank(text[next] ?? "")) {
+    const ch = text[next] ?? "";
+    if (ch === "\n" || ch === "\r") newline = true;
+    next += 1;
+  }
+  return { next, newline };
+}
+
+/** 下一个非空白字符仍落在已经开始的行注释里，说明这个换行把注释拆开了。 */
+function commentContinues(inComment: boolean[], index: number): boolean {
+  return index > 0 && index < inComment.length && inComment[index] === true && inComment[index - 1] === true;
+}
+
+function lineCommentIndexes(sql: string): boolean[] {
+  const marked = Array.from({ length: sql.length }, () => false);
+  let i = 0;
+  let quote: string | null = null;
+  let dollar: string | null = null;
+  let block = false;
+  while (i < sql.length) {
+    if (dollar !== null) {
+      const marker = `$${dollar}$`;
+      if (sql.startsWith(marker, i)) {
+        i += marker.length;
+        dollar = null;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    if (quote !== null) {
+      if (sql[i] === quote && sql[i + 1] === quote) {
+        i += 2;
+        continue;
+      }
+      if (sql[i] === quote) quote = null;
+      i += 1;
+      continue;
+    }
+    if (block) {
+      if (sql[i] === "*" && sql[i + 1] === "/") {
+        block = false;
+        i += 2;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    if (sql[i] === "#" || sql.startsWith("--", i)) {
+      const start = i;
+      i += sql[i] === "#" ? 1 : 2;
+      while (i < sql.length && sql[i] !== "\n" && sql[i] !== "\r") i += 1;
+      for (let k = start; k < i; k += 1) marked[k] = true;
+      continue;
+    }
+    if (sql.startsWith("/*", i)) {
+      block = true;
+      i += 2;
+      continue;
+    }
+    if (sql[i] === "'" || sql[i] === '"' || sql[i] === "`") {
+      quote = sql[i] ?? null;
+      i += 1;
+      continue;
+    }
+    if (sql[i] === "$") {
+      const tag = dollarTag(sql, i);
+      if (tag !== null) {
+        dollar = tag;
+        i += tag.length + 2;
+        continue;
+      }
+    }
+    i += 1;
+  }
+  return marked;
+}
+
+function lineCommentBrokenByNewline(source: string, formatted: string): boolean {
+  const inComment = lineCommentIndexes(source);
+  let i = 0;
+  let j = 0;
+  while (i < source.length && j < formatted.length) {
+    const sourceBlank = isBlank(source[i] ?? "");
+    const formattedBlank = isBlank(formatted[j] ?? "");
+    if (sourceBlank && formattedBlank) {
+      const sourceGap = skipBlank(source, i);
+      const formattedGap = skipBlank(formatted, j);
+      if (formattedGap.newline && commentContinues(inComment, sourceGap.next)) return true;
+      i = sourceGap.next;
+      j = formattedGap.next;
+      continue;
+    }
+    if (sourceBlank) {
+      i = skipBlank(source, i).next;
+      continue;
+    }
+    if (formattedBlank) {
+      const formattedGap = skipBlank(formatted, j);
+      if (formattedGap.newline && commentContinues(inComment, i)) return true;
+      j = formattedGap.next;
+      continue;
+    }
+    i += 1;
+    j += 1;
+  }
+  return false;
+}
+
+function outsideTouches(outside: string, inside: string, outsideIsBefore: boolean): boolean {
+  if (!outside || !inside) return false;
+  const outsideChar = outsideIsBefore ? outside[outside.length - 1] ?? "" : outside[0] ?? "";
+  const insideChar = outsideIsBefore ? inside[0] ?? "" : inside[inside.length - 1] ?? "";
+  return !isBlank(outsideChar) && !isBlank(insideChar);
+}
+
+function edgeWhitespaceRemoved(sql: string, from: number, to: number, formatted: string): boolean {
+  const prefix = sql.slice(0, from);
+  const selected = sql.slice(from, to);
+  const suffix = sql.slice(to);
+  if (!selected || (!prefix && !suffix)) return false;
+  if (/^\s/.test(selected) && !/^\s/.test(formatted) && outsideTouches(prefix, formatted, true)) return true;
+  if (/\s$/.test(selected) && !/\s$/.test(formatted) && outsideTouches(suffix, formatted, false)) return true;
+  if (/^\s+$/.test(selected) && formatted.length === 0) {
+    const left = prefix[prefix.length - 1] ?? "";
+    const right = suffix[0] ?? "";
+    return Boolean(left && right && !isBlank(left) && !isBlank(right));
+  }
+  return false;
 }
 
 function dollarTag(sql: string, start: number): string | null {

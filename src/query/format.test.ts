@@ -176,4 +176,60 @@ describe("sql formatting", () => {
     expect(refused.ok).toBe(false);
     if (!refused.ok) expect(refused.reason).toContain("引号");
   });
+
+  it("refuses a comment selection that a newline would turn into SQL", () => {
+    const commented = "select 1 -- select 2 from t";
+    const from = commented.indexOf("-- ") + "-- ".length;
+    const broken = formatDocument(commented, { from, to: commented.length });
+    expect(broken).toMatchObject({ ok: false, sql: commented });
+    expect(broken.ok).toBe(false);
+    if (!broken.ok) expect(broken.reason).toContain("行注释");
+
+    const hashed = "delete from t where id=1#select 2 from t";
+    const hashFrom = hashed.indexOf("#") + 1;
+    const hashBroken = formatDocument(hashed, { from: hashFrom, to: hashed.length });
+    expect(hashBroken).toMatchObject({ ok: false, sql: hashed });
+    expect(hashBroken.ok).toBe(false);
+    if (!hashBroken.ok) expect(hashBroken.reason).toContain("行注释");
+
+    const kept = formatDocument(commented, { from: commented.indexOf("--"), to: commented.length });
+    expect(kept.ok).toBe(true);
+    if (!kept.ok) return;
+    expect(kept.sql.endsWith("-- select 2 from t")).toBe(true);
+    expect(kept.sql).not.toMatch(/-- select 2\n/);
+  });
+
+  it("refuses a selection that drops edge whitespace and produces 1from t", () => {
+    const sql = "select 1 from t";
+    const from = sql.indexOf("1 ");
+    const glued = formatDocument(sql, { from, to: from + "1 ".length });
+    expect(glued).toMatchObject({ ok: false, sql });
+    expect(glued.ok).toBe(false);
+    if (!glued.ok) expect(glued.reason).toContain("空白");
+
+    const leading = sql.indexOf(" 1");
+    const left = formatDocument(sql, { from: leading, to: leading + " 1".length });
+    expect(left).toMatchObject({ ok: false, sql });
+    expect(left.ok).toBe(false);
+    if (!left.ok) expect(left.reason).toContain("空白");
+
+    const gap = sql.indexOf("1") + 1;
+    const onlySpace = formatDocument(sql, { from: gap, to: gap + 1 });
+    expect(onlySpace).toMatchObject({ ok: false, sql });
+  });
+
+  it("still formats a whole document when that does not split adjacent characters", () => {
+    const sql = "select 1 from t -- keep\n-- next";
+    const result = formatDocument(sql);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.sql).toContain("-- keep");
+    expect(result.sql).toContain("-- next");
+    expect(result.sql).toContain("\nFROM\n");
+    expect(result.sql).not.toContain("1from");
+    expect(result.sql).not.toMatch(/-- keep\n\s*FROM/);
+    expect(formatDocument(sample)).toEqual({ ok: true, sql: formatted });
+    expect(formatDocument("select '# or 1=1' from t").ok).toBe(true);
+    expect(formatDocument("delete from t where id=1#or 1=1").ok).toBe(true);
+  });
 });

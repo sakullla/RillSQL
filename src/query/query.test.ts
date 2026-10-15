@@ -594,6 +594,52 @@ describe("query editing", () => {
     broken.unmount();
   });
 
+  it("keeps the editor text when formatting would break a comment or glue 1from t", async () => {
+    const commented = "select 1 -- select 2 from t";
+    const commentTab = mount(QueryTab, {
+      props: {
+        tabId: "query-format-comment",
+        draft: commented,
+        connectionId: null,
+        connectionName: null,
+        database: null,
+        engine: null,
+        connectionStatus: null,
+        notice: null,
+      },
+    });
+    await nextTick();
+    const commentView = EditorView.findFromDOM(commentTab.get(".cm-content").element)!;
+    const commentFrom = commented.indexOf("select 2");
+    commentView.dispatch({ selection: { anchor: commentFrom, head: commented.length } });
+    await commentTab.get("[data-action='format']").trigger("click");
+    expect(commentView.state.doc.toString()).toBe(commented);
+    expect(commentTab.get("[role='alert']").text()).toContain("行注释");
+    commentTab.unmount();
+
+    const glued = "select 1 from t";
+    const glueTab = mount(QueryTab, {
+      props: {
+        tabId: "query-format-glue",
+        draft: glued,
+        connectionId: null,
+        connectionName: null,
+        database: null,
+        engine: null,
+        connectionStatus: null,
+        notice: null,
+      },
+    });
+    await nextTick();
+    const glueView = EditorView.findFromDOM(glueTab.get(".cm-content").element)!;
+    const glueFrom = glued.indexOf("1 ");
+    glueView.dispatch({ selection: { anchor: glueFrom, head: glueFrom + "1 ".length } });
+    await glueTab.get("[data-action='format']").trigger("click");
+    expect(glueView.state.doc.toString()).toBe(glued);
+    expect(glueTab.get("[role='alert']").text()).toContain("空白");
+    glueTab.unmount();
+  });
+
   it("requests one EXPLAIN plan and does not run empty or multiple statements", async () => {
     replaceCatalog(catalogFixture());
     const calls: { command: string; sql?: string }[] = [];

@@ -22,7 +22,7 @@ import type { QueryTarget } from "../shell/session";
 import { ambiguousFieldNote, cachedColumns, fieldFailureNote, loadFields, qualifierFor, unknownFieldNote } from "./columns";
 import { completionPlan, connectionById, metadataNote, targetDetail, targetKey, targetOptions, type TargetOption } from "./complete";
 import { resolveEditor } from "./editor";
-import { formatSql } from "./format";
+import { formatDocument } from "./format";
 import { explainSql, planStatement } from "./plan";
 import { gridModel } from "./rows";
 import { requestCancel, startTabRun, tabRun } from "./runtime";
@@ -313,18 +313,19 @@ function formatEditor() {
   const from = Math.min(range.from, range.to);
   const to = Math.max(range.from, range.to);
   const selected = from !== to;
-  const formatted = formatSql(selected ? doc.slice(from, to) : doc);
+  const formatted = formatDocument(doc, selected ? { from, to } : undefined);
   if (!formatted.ok) {
     actionError.value = formatted.reason;
     return;
   }
-  if (formatted.sql === (selected ? doc.slice(from, to) : doc)) return;
+  if (formatted.sql === doc) return;
   const insertFrom = selected ? from : 0;
   const insertTo = selected ? to : doc.length;
-  const formattedEnd = insertFrom + formatted.sql.length;
+  const suffixLength = doc.length - insertTo;
+  const inserted = formatted.sql.slice(insertFrom, formatted.sql.length - suffixLength);
   editor.dispatch({
-    changes: { from: insertFrom, to: insertTo, insert: formatted.sql },
-    selection: selected ? { anchor: insertFrom, head: formattedEnd } : { anchor: formattedEnd },
+    changes: { from: insertFrom, to: insertTo, insert: inserted },
+    selection: selected ? { anchor: insertFrom, head: insertFrom + inserted.length } : { anchor: formatted.sql.length },
   });
 }
 
