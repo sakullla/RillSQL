@@ -25,19 +25,26 @@ const OPEN_REASON: Record<OpenDelimiter, string> = {
   comment: "无法格式化：注释未闭合。",
   dollar: "无法格式化：dollar-quote 未闭合。",
 };
+const ADJACENT_REASON = "无法格式化：会把原本相连的字符拆开。";
 
 export type FormatResult = { ok: true; sql: string } | { ok: false; reason: string; sql: string };
 
 interface Tok {
   kind: "word" | "string" | "number" | "comment" | "punct" | "dollar";
   text: string;
+  /** 这个词法单元前面原本的空白；空字符串表示它和前一个非空白字符相连。 */
+  gap: string;
   upper?: string;
 }
 
 export function formatSql(sql: string): FormatResult {
   const open = openDelimiter(sql);
   if (open) return { ok: false, reason: OPEN_REASON[open], sql };
-  return { ok: true, sql: layout(tokenize(sql)) };
+  const laid = layout(tokenize(sql));
+  if (!laid.ok || !keepsAdjacentNonWhitespace(sql, laid.sql)) {
+    return { ok: false, reason: ADJACENT_REASON, sql };
+  }
+  return { ok: true, sql: laid.sql };
 }
 
 export function formatDocument(sql: string, range?: { from: number; to: number }): FormatResult {
@@ -154,23 +161,27 @@ function tokenize(sql: string): Tok[] {
   const tokens: Tok[] = [];
   let i = 0;
   while (i < sql.length) {
+    const gapStart = i;
+    while (i < sql.length && /\s/.test(sql[i] ?? "")) i += 1;
+    if (i >= sql.length) break;
+    const gap = sql.slice(gapStart, i);
     const ch = sql[i] ?? "";
-    if (/\s/.test(ch)) {
-      i += 1;
-      continue;
-    }
-    if (sql.startsWith("--", i)) {
-      let j = i + 2;
+    const push = (kind: Tok["kind"], text: string, next: number, upper?: string) => {
+      const tok: Tok = { kind, text, gap };
+      if (upper) tok.upper = upper;
+      tokens.push(tok);
+      i = next;
+    };
+    if (sql.startsWith("--", i) || ch === "#") {
+      let j = ch === "#" ? i + 1 : i + 2;
       while (j < sql.length && sql[j] !== "\n" && sql[j] !== "\r") j += 1;
-      tokens.push({ kind: "comment", text: sql.slice(i, j) });
-      i = j;
+      push("comment", sql.slice(i, j), j);
       continue;
     }
     if (sql.startsWith("/*", i)) {
       const end = sql.indexOf("*/", i + 2);
       const j = end < 0 ? sql.length : end + 2;
-      tokens.push({ kind: "comment", text: sql.slice(i, j) });
-      i = j;
+      push("comment", sql.slice(i, j), j);
       continue;
     }
     if (ch === "'" || ch === '"' || ch === "`") {
@@ -186,8 +197,7 @@ function tokenize(sql: string): Tok[] {
         }
         j += 1;
       }
-      tokens.push({ kind: "string", text: sql.slice(i, j) });
-      i = j;
+      push("string", sql.slice(i, j), j);
       continue;
     }
     if (ch === "$") {
@@ -196,59 +206,50 @@ function tokenize(sql: string): Tok[] {
         const marker = `$${tag}$`;
         const end = sql.indexOf(marker, i + marker.length);
         const j = end < 0 ? sql.length : end + marker.length;
-        tokens.push({ kind: "dollar", text: sql.slice(i, j) });
-        i = j;
+        push("dollar", sql.slice(i, j), j);
         continue;
       }
       if (/\d/.test(sql[i + 1] ?? "")) {
         let j = i + 2;
         while (j < sql.length && /\d/.test(sql[j] ?? "")) j += 1;
-        tokens.push({ kind: "word", text: sql.slice(i, j) });
-        i = j;
+        push("word", sql.slice(i, j), j);
         continue;
       }
     }
     if ((ch === "x" || ch === "X" || ch === "b" || ch === "B") && sql[i + 1] === "'") {
       const j = skipQuoted(sql, i + 1);
-      tokens.push({ kind: "number", text: sql.slice(i, j) });
-      i = j;
+      push("number", sql.slice(i, j), j);
       continue;
     }
     const numberEnd = scanNumber(sql, i);
     if (numberEnd !== null) {
-      tokens.push({ kind: "number", text: sql.slice(i, numberEnd) });
-      i = numberEnd;
+      push("number", sql.slice(i, numberEnd), numberEnd);
       continue;
     }
     const word = sqlWordAt(sql, i);
     if (word) {
-      tokens.push({ kind: "word", text: word.text, upper: word.text.toUpperCase() });
-      i = word.end;
+      push("word", word.text, word.end, word.text.toUpperCase());
       continue;
     }
     const three = sql.slice(i, i + 3);
     if (three === "->>") {
-      tokens.push({ kind: "punct", text: three });
-      i += 3;
+      push("punct", three, i + 3);
       continue;
     }
     const two = sql.slice(i, i + 2);
     if (two === "::" || two === "->" || two === "<>" || two === "<=" || two === ">=" || two === "!=" || two === "||") {
-      tokens.push({ kind: "punct", text: two });
-      i += 2;
+      push("punct", two, i + 2);
       continue;
     }
     if ((ch === ":" || ch === "@") && two !== "::") {
       const named = sqlWordAt(sql, i + 1);
       if (named) {
-        tokens.push({ kind: "word", text: sql.slice(i, named.end) });
-        i = named.end;
+        push("word", sql.slice(i, named.end), named.end);
         continue;
       }
     }
     const point = codePointAt(sql, i);
-    tokens.push({ kind: "punct", text: point.ch });
-    i = point.next;
+    push("punct", point.ch, point.next);
   }
   return tokens;
 }
@@ -270,7 +271,7 @@ function render(tok: Tok): string {
   return tok.text;
 }
 
-function layout(tokens: Tok[]): string {
+function layout(tokens: Tok[]): { ok: true; sql: string } | { ok: false } {
   let out = "";
   let depth = 0;
   let breakBody = false;
@@ -293,27 +294,75 @@ function layout(tokens: Tok[]): string {
 
   for (const tok of tokens) {
     const kind = breakKind(tok, prev);
-    const lineComment = prev?.kind === "comment" && prev.text.startsWith("--");
+    const lineComment = prev?.kind === "comment" && (prev.text.startsWith("--") || prev.text.startsWith("#"));
+    let placed: "none" | "space" | "newline" = "none";
+    let level = 0;
+    let nextBreakBody = breakBody;
     if (depth === 0 && kind === "clause") {
-      if (out.trim().length) newline(0);
-      breakBody = true;
+      if (out.trim().length) {
+        placed = "newline";
+        level = 0;
+      }
+      nextBreakBody = true;
     } else if (depth === 0 && kind === "sub") {
-      if (out.trim().length) newline(1);
+      if (out.trim().length) {
+        placed = "newline";
+        level = 1;
+      }
     } else if (lineComment && out.trim().length) {
-      newline(1 + depth);
-      breakBody = false;
+      placed = "newline";
+      level = 1 + depth;
+      nextBreakBody = false;
     } else if (breakBody && depth === 0 && !holds(prev, tok)) {
-      newline(1);
-      breakBody = false;
+      placed = "newline";
+      level = 1;
+      nextBreakBody = false;
     } else if (prev?.kind === "punct" && prev.text === "," && depth === 0 && tok.kind !== "comment") {
-      newline(1);
+      placed = "newline";
+      level = 1;
     } else if (!tight(tok)) {
+      placed = "space";
+    }
+    if (placed === "newline") {
+      if (tok.gap.length === 0) return { ok: false };
+      newline(level);
+    } else if (placed === "space" && tok.gap.length > 0) {
       space();
     }
     out += render(tok);
     if (tok.kind === "punct" && tok.text === "(") depth += 1;
     if (tok.kind === "punct" && tok.text === ")") depth = Math.max(0, depth - 1);
+    breakBody = nextBreakBody;
     prev = tok;
   }
-  return out.replace(/[ \t]+$/, "");
+  return { ok: true, sql: out.replace(/[ \t]+$/, "") };
+}
+
+/** 成功的格式化只改关键字大小写，并重排原本就有的空白。 */
+function keepsAdjacentNonWhitespace(source: string, formatted: string): boolean {
+  const left = Array.from(source);
+  const right = Array.from(formatted);
+  const blank = (ch: string) => /\s/u.test(ch);
+  let i = 0;
+  let j = 0;
+  while (i < left.length && j < right.length) {
+    const sourceChar = left[i] ?? "";
+    const formattedChar = right[j] ?? "";
+    if (blank(sourceChar) && blank(formattedChar)) {
+      while (i < left.length && blank(left[i] ?? "")) i += 1;
+      while (j < right.length && blank(right[j] ?? "")) j += 1;
+      continue;
+    }
+    if (blank(sourceChar)) {
+      while (i < left.length && blank(left[i] ?? "")) i += 1;
+      continue;
+    }
+    if (blank(formattedChar)) return false;
+    if (sourceChar.toUpperCase() !== formattedChar.toUpperCase()) return false;
+    i += 1;
+    j += 1;
+  }
+  while (i < left.length && blank(left[i] ?? "")) i += 1;
+  while (j < right.length && blank(right[j] ?? "")) j += 1;
+  return i === left.length && j === right.length;
 }

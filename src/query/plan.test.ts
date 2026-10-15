@@ -71,4 +71,35 @@ describe("execution plan selection", () => {
       expect(explainSql("postgres", sql)).toEqual({ ok: true, sql: `EXPLAIN ${sql}` });
     }
   });
+
+  it("refuses ANALYZE and ANALYSE inside MySQL executable comments and still ignores ordinary comments", () => {
+    const reason = "计划不使用 ANALYZE，没有发送这条语句。";
+    for (const sql of [
+      "SELECT 1 /*! ANALYZE */",
+      "SELECT 1 /*!50000 ANALYZE */",
+      "SELECT 1 /*! ANALYSE */",
+      "SELECT 1 /*!50000 ANALYSE */",
+      "SELECT 1 /*!50500 analyze */",
+      "/*!50000 ANALYZE */ SELECT 1",
+      "EXPLAIN /*! ANALYZE */ SELECT 1",
+      "SELECT 1 /*!50000ANALYZE*/",
+      "SELECT 1 /*!50000ANALYSE*/",
+    ]) {
+      expect(explainSql("mysql", sql)).toEqual({ ok: false, reason });
+      expect(explainSql("postgres", sql)).toEqual({ ok: false, reason });
+      expect(explainSql("sqlite", sql)).toEqual({ ok: false, reason });
+    }
+    for (const sql of [
+      "SELECT 1 /* ANALYZE */",
+      "SELECT 1 /* ANALYSE */",
+      "SELECT 1 /*50000 ANALYZE */",
+      "SELECT 1 /*! keep */",
+      "SELECT 1 /*!50000 keep */",
+      "SELECT 1 /*! 'ANALYZE' */",
+      "SELECT 1 /*! analyzed */",
+      "SELECT 1 /*! ANALYSED */",
+    ]) {
+      expect(explainSql("mysql", sql)).toEqual({ ok: true, sql: `EXPLAIN ${sql}` });
+    }
+  });
 });

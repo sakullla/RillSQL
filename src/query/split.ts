@@ -190,6 +190,11 @@ export function openDelimiter(sql: string): OpenDelimiter | null {
       i += 1;
       continue;
     }
+    if (sql[i] === "#") {
+      i += 1;
+      while (i < sql.length && sql[i] !== "\n" && sql[i] !== "\r") i += 1;
+      continue;
+    }
     if (sql.startsWith("--", i)) {
       i += 2;
       while (i < sql.length && sql[i] !== "\n") i += 1;

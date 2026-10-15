@@ -715,14 +715,16 @@ describe("query editing", () => {
       calls.push(command);
       throw new Error("should not run");
     });
-    for (const draft of [
+    for (const [index, draft] of [
       "EXPLAIN(ANALYZE) SELECT 1",
       "EXPLAIN (VERBOSE, ANALYZE) SELECT 1",
       "EXPLAIN /*c*/ ANALYZE SELECT 1",
-    ]) {
+      "SELECT 1 /*! ANALYZE */",
+      "SELECT 1 /*!50000 ANALYSE */",
+    ].entries()) {
       const wrapper = mount(QueryTab, {
         props: {
-          tabId: `query-plan-${draft.length}`,
+          tabId: `query-plan-analyze-${index}`,
           draft,
           connectionId: "atlas",
           connectionName: "Atlas",

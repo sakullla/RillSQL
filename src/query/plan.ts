@@ -51,7 +51,7 @@ function quotedEnd(sql: string, start: number): number {
   return sql.length;
 }
 
-/** 去掉字符串、引号标识符、注释和 dollar-quote 后，语句里仍有 ANALYZE 或 ANALYSE。 */
+/** 去掉字符串、引号标识符、普通注释和 dollar-quote 后，语句里仍有 ANALYZE 或 ANALYSE。MySQL 可执行注释里的词仍要检查。 */
 function statementHasAnalyze(sql: string): boolean {
   let i = 0;
   while (i < sql.length) {
@@ -66,6 +66,15 @@ function statementHasAnalyze(sql: string): boolean {
       continue;
     }
     if (sql.startsWith("/*", i)) {
+      if (sql.startsWith("/*!", i)) {
+        let j = i + 3;
+        while (j < sql.length && /\d/.test(sql[j] ?? "")) j += 1;
+        const close = sql.indexOf("*/", j);
+        const bodyEnd = close < 0 ? sql.length : close;
+        if (statementHasAnalyze(sql.slice(j, bodyEnd))) return true;
+        i = close < 0 ? sql.length : close + 2;
+        continue;
+      }
       const end = sql.indexOf("*/", i + 2);
       i = end < 0 ? sql.length : end + 2;
       continue;

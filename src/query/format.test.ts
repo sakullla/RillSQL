@@ -9,7 +9,7 @@ const formatted = [
   "FROM",
   "  orders",
   "WHERE",
-  "  status = 'open'",
+  "  status='open'",
   "  AND note = 'it''s'",
 ].join("\n");
 
@@ -95,6 +95,71 @@ describe("sql formatting", () => {
     expect(result.sql).not.toMatch(/-\s+>/);
     const open = formatSql("select $1, :name, B'1010', 'abc");
     expect(open).toMatchObject({ ok: false, sql: "select $1, :name, B'1010', 'abc" });
+  });
+
+  it("keeps a hash comment through the end of the line and does not split glued tokens", () => {
+    const commented = "delete from t where id = 1 # or 1=1";
+    const result = formatSql(commented);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.sql).toContain("# or 1=1");
+    expect(result.sql).not.toMatch(/\n\s*OR\b/);
+    expect(result.sql).toContain("\nWHERE\n");
+    const glued = formatSql("delete from t where id=1#or 1=1");
+    expect(glued.ok).toBe(true);
+    if (!glued.ok) return;
+    expect(glued.sql).toContain("id=1#or 1=1");
+    expect(glued.sql).not.toMatch(/\n\s*OR\b/);
+    const quoted = formatSql("select '# or 1=1' from t");
+    expect(quoted.ok).toBe(true);
+    if (!quoted.ok) return;
+    expect(quoted.sql).toContain("'# or 1=1'");
+    expect(quoted.sql).toContain("\nFROM\n");
+    const apostrophe = formatSql("select 1 # it's or 1=1\nfrom t");
+    expect(apostrophe.ok).toBe(true);
+    if (!apostrophe.ok) return;
+    expect(apostrophe.sql).toContain("# it's or 1=1");
+    expect(apostrophe.sql).not.toMatch(/\n\s*OR\b/);
+  });
+
+  it("keeps glued literals intact without inserting whitespace inside them", () => {
+    const sql = "select $1, E'O pen', a@>b, a&&b, 0o17, :name, @name, col$1, 1.e+10, 1_000, 0b101, B'1010', 0xFFa, X'Ab', id::text, doc->'k', doc->>'v', 1e10, N'ab', a<@b, 状态 from t";
+    const result = formatSql(sql);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    for (const literal of ["$1", "E'O pen'", "a@>b", "a&&b", "0o17", ":name", "@name", "col$1", "1.e+10", "1_000", "0b101", "B'1010'", "0xFFa", "X'Ab'", "::", "->", "->>", "1e10", "N'ab'", "a<@b", "状态"]) {
+      expect(result.sql).toContain(literal);
+    }
+    expect(result.sql).not.toContain("E '");
+    expect(result.sql).not.toContain("@ >");
+    expect(result.sql).not.toContain("& &");
+    expect(result.sql).not.toContain("0 o");
+    expect(result.sql).not.toContain("$ 1");
+    expect(result.sql).not.toContain("< @");
+    expect(result.sql).not.toContain("N '");
+    expect(result.sql).not.toMatch(/:\s+:/);
+    expect(result.sql).not.toMatch(/-\s+>/);
+  });
+
+  it("refuses a rewrite that would separate adjacent non-whitespace and leaves the original text", () => {
+    for (const sql of ["select*from t", "select a,b from t", "delete from t where id=1or id=2"]) {
+      const result = formatSql(sql);
+      expect(result).toMatchObject({ ok: false, sql });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toContain("无法格式化");
+    }
+    const kept = formatSql("select f(a,b), 0o17 from t");
+    expect(kept.ok).toBe(true);
+    if (!kept.ok) return;
+    expect(kept.sql).toContain("f(a,b)");
+    expect(kept.sql).toContain("0o17");
+    expect(kept.sql).not.toContain("0 o");
+    const document = "select 1; select*from t";
+    const from = document.indexOf("select*from");
+    const refused = formatDocument(document, { from, to: document.length });
+    expect(refused).toMatchObject({ ok: false, sql: document });
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.reason).toContain("无法格式化");
   });
 
   it("formats only the selection and keeps the surrounding text", () => {
