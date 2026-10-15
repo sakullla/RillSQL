@@ -1,6 +1,6 @@
 import { gridCommit, type ChangePayload } from "./api";
 import { copyRow, refreshLocated } from "./data";
-import { deleteSql, splitSql, updateSql } from "./sql";
+import { deleteSql, updateSql } from "./sql";
 import type { TableTarget } from "./target";
 import type { Cell, Column, CommitReport, CommitStep, Engine, Row, TableSchema } from "./types";
 
@@ -56,9 +56,15 @@ function isIdentChar(char: string): boolean {
 
 function tokenize(sql: string): Token[] {
   const tokens: Token[] = [];
-  for (let index = 0; index < sql.length; index += 1) {
+  let index = 0;
+  while (index < sql.length) {
+    const skipped = skipQualifierGap(sql, index);
+    if (skipped >= sql.length) break;
+    if (skipped !== index) {
+      index = skipped;
+      continue;
+    }
     const char = sql[index]!;
-    if (/\s/.test(char)) continue;
     if (char === "'" || char === '"') {
       const quote = char;
       const at = index;
@@ -76,6 +82,7 @@ function tokenize(sql: string): Token[] {
         index += 1;
       }
       tokens.push(quote === "'" ? { kind: "string", text, at } : { kind: "ident", text, at });
+      if (index < sql.length) index += 1;
       continue;
     }
     if (char === "`") {
@@ -94,19 +101,22 @@ function tokenize(sql: string): Token[] {
         index += 1;
       }
       tokens.push({ kind: "ident", text, at });
+      if (index < sql.length) index += 1;
       continue;
     }
     if (isIdentChar(char)) {
       const at = index;
       let text = char;
-      while (index + 1 < sql.length && isIdentChar(sql[index + 1]!)) {
-        index += 1;
+      index += 1;
+      while (index < sql.length && isIdentChar(sql[index]!)) {
         text += sql[index]!;
+        index += 1;
       }
       tokens.push({ kind: "word", text: text.toLowerCase(), source: text, at });
       continue;
     }
     tokens.push({ kind: "punct", text: char, at: index });
+    index += 1;
   }
   return tokens;
 }
@@ -124,28 +134,37 @@ function readName(token: Token | undefined): string | null {
 
 type QualifierPart = { name: string; source: string; quoted: boolean };
 
-/** 限定名两侧的空白、块注释和行注释都不结束名字。行注释连同它结束用的换行一起跳过。 */
-function skipQualifierGap(sql: string, index: number): number {
+/** 空白、块注释和行注释（含结束它的换行）都是空隙，读下一个标识符之前不删掉这段空隙。空隙里只有注释、没有注释外的空白时，两侧仍是两个标识符。 */
+function scanQualifierGap(sql: string, index: number): { index: number; commentOnly: boolean } {
+  let sawComment = false;
+  let sawWhitespace = false;
   while (index < sql.length) {
     const char = sql[index]!;
     if (/\s/.test(char)) {
+      sawWhitespace = true;
       index += 1;
       continue;
     }
     if (sql.startsWith("--", index)) {
+      sawComment = true;
       index += 2;
       while (index < sql.length && sql[index] !== "\n") index += 1;
       if (sql[index] === "\n") index += 1;
       continue;
     }
     if (sql.startsWith("/*", index)) {
+      sawComment = true;
       const end = sql.indexOf("*/", index + 2);
       index = end < 0 ? sql.length : end + 2;
       continue;
     }
     break;
   }
-  return index;
+  return { index, commentOnly: sawComment && !sawWhitespace };
+}
+
+function skipQualifierGap(sql: string, index: number): number {
+  return scanQualifierGap(sql, index).index;
 }
 
 function readQualifierPart(sql: string, index: number): { part: QualifierPart; end: number } | null {
@@ -173,7 +192,7 @@ function readQualifierPart(sql: string, index: number): { part: QualifierPart; e
   return { part: { name: source.toLowerCase(), source, quoted: false }, end: cursor };
 }
 
-/** 点号之间的注释仍属于同一个限定名，下一段标识符不能丢掉。超过两段则无法证明单表。 */
+/** 点号之间的注释仍属于同一个限定名，下一段标识符不能丢掉。超过两段则无法证明单表。只被注释隔开的两个标识符不能拼成一张表。 */
 function walkQualifier(sql: string, start: number): { ok: true; parts: QualifierPart[]; end: number } | { ok: false; reason: string } {
   const unproved = "不能确定这条 SELECT 只读取一张基表。";
   const first = readQualifierPart(sql, skipQualifierGap(sql, start));
@@ -182,13 +201,22 @@ function walkQualifier(sql: string, start: number): { ok: true; parts: Qualifier
   const parts = [first.part];
   let index = first.end;
   while (true) {
-    const gap = skipQualifierGap(sql, index);
-    if (sql[gap] !== ".") break;
-    const next = readQualifierPart(sql, skipQualifierGap(sql, gap + 1));
-    if (!next) return { ok: false, reason: unproved };
-    parts.push(next.part);
-    index = next.end;
-    if (parts.length > 2) return { ok: false, reason: "限定名超过两部分，不能证明只是一张基表。" };
+    const gap = scanQualifierGap(sql, index);
+    if (sql[gap.index] === ".") {
+      const next = readQualifierPart(sql, skipQualifierGap(sql, gap.index + 1));
+      if (!next) return { ok: false, reason: unproved };
+      parts.push(next.part);
+      index = next.end;
+      if (parts.length > 2) return { ok: false, reason: "限定名超过两部分，不能证明只是一张基表。" };
+      continue;
+    }
+    if (gap.commentOnly) {
+      const next = readQualifierPart(sql, gap.index);
+      if (next && (next.part.quoted || !CLAUSES.has(next.part.name.toUpperCase()))) {
+        return { ok: false, reason: unproved };
+      }
+    }
+    break;
   }
   return { ok: true, parts, end: index };
 }
@@ -300,9 +328,78 @@ function columnProof(items: readonly SelectItem[], table: string, alias: string 
   };
 }
 
+/** 按分号切开原文。注释和字符串里的分号不算，注释留在语句里，读表名之前不删掉。 */
+function preservedStatements(sql: string): string[] {
+  const statements: string[] = [];
+  let start = 0;
+  let mode: "normal" | "line" | "block" | "single" | "double" | "tick" = "normal";
+  const take = (end: number) => {
+    const text = sql.slice(start, end).trim();
+    if (text && skipQualifierGap(text, 0) < text.length) statements.push(text);
+  };
+  for (let index = 0; index < sql.length; index += 1) {
+    const char = sql[index]!;
+    const next = sql[index + 1] ?? "";
+    if (mode === "line") {
+      if (char === "\n") mode = "normal";
+      continue;
+    }
+    if (mode === "block") {
+      if (char === "*" && next === "/") {
+        mode = "normal";
+        index += 1;
+      }
+      continue;
+    }
+    if (mode === "single") {
+      if (char === "'" && next === "'") index += 1;
+      else if (char === "'") mode = "normal";
+      continue;
+    }
+    if (mode === "double") {
+      if (char === '"' && next === '"') index += 1;
+      else if (char === '"') mode = "normal";
+      continue;
+    }
+    if (mode === "tick") {
+      if (char === "`" && next === "`") index += 1;
+      else if (char === "`") mode = "normal";
+      continue;
+    }
+    if (char === "-" && next === "-") {
+      mode = "line";
+      index += 1;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      mode = "block";
+      index += 1;
+      continue;
+    }
+    if (char === "'") {
+      mode = "single";
+      continue;
+    }
+    if (char === '"') {
+      mode = "double";
+      continue;
+    }
+    if (char === "`") {
+      mode = "tick";
+      continue;
+    }
+    if (char === ";") {
+      take(index);
+      start = index + 1;
+    }
+  }
+  take(sql.length);
+  return statements;
+}
+
 /** 只接受一条没有联接、聚合或子查询的 SELECT，并读出唯一的基表名。 */
 export function readSingleTable(sql: string): EditProof {
-  const statements = splitSql(sql).map((item) => item.trim()).filter(Boolean);
+  const statements = preservedStatements(sql);
   if (!statements.length) return { ok: false, reason: "没有可修改的语句。" };
   if (statements.length > 1) return { ok: false, reason: "不是单条 SELECT，不能修改查询结果。" };
   const statement = statements[0]!;

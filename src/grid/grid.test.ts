@@ -1336,4 +1336,58 @@ describe("query result edits", () => {
       current.unmount();
     }
   });
+
+  it("does not join identifiers that a comment alone separates, and clears the insert target", async () => {
+    const line = readSingleTable("SELECT id, name FROM public.cu--\nstomers");
+    expect(line.ok).toBe(false);
+    if (!line.ok) expect(line.reason).toContain("不能确定");
+    const block = readSingleTable("SELECT id, name FROM cu/*x*/stomers");
+    expect(block.ok).toBe(false);
+    if (!block.ok) expect(block.reason).toContain("不能确定");
+    expect(proof("SELECT id, name FROM public.customers--\nWHERE id = 1")).toEqual({
+      schema: "public",
+      table: "customers",
+      qualifierSource: "public",
+    });
+    expect(proof("SELECT id, name FROM shop.customers")).toEqual({
+      schema: "shop",
+      table: "customers",
+      qualifierSource: "shop",
+    });
+
+    replaceCatalog([shopCatalog("postgres", "app", [{ name: "public", tables: ["customers"] }])]);
+    const model = gridModel({ columns: ["id", "name"], rows: [["1", "甲"]] });
+    for (const [index, statement] of [
+      "SELECT id, name FROM public.cu--\nstomers",
+      "SELECT id, name FROM cu/*x*/stomers",
+    ].entries()) {
+      invoke.mockReset();
+      invoke.mockImplementation(async (command: string) => {
+        if (command === "grid_describe") return customerSchema();
+        throw new Error(command);
+      });
+      const wrapper = mount(QueryResultGrid, {
+        props: {
+          tabId: `comment-join-${index}`,
+          statement,
+          columns: model.columns,
+          rows: model.rows,
+          truncated: false,
+          connectionId: "shop",
+          engine: "postgres",
+          database: "app",
+          schema: "public",
+        },
+      });
+      await flushPromises();
+      expect(invoke).not.toHaveBeenCalled();
+      expect(wrapper.attributes("data-editable")).toBe("false");
+      expect(wrapper.text()).toContain("不能确定");
+      await wrapper.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
+      await wrapper.get("input[value='insert']").setValue(true);
+      expect(wrapper.get("pre.ex-preview").text()).not.toContain("INSERT");
+      expect(wrapper.text()).not.toContain('"public"."customers"');
+      wrapper.unmount();
+    }
+  });
 });
