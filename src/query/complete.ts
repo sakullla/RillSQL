@@ -25,32 +25,37 @@ export interface MetadataNote {
 
 export interface CompletionItem {
   label: string;
-  kind: "keyword" | "table" | "view";
+  kind: "keyword" | "table" | "view" | "column";
+  detail: string;
+}
+
+export interface CachedColumn {
+  label: string;
   detail: string;
 }
 
 export function metadataNote(connection: CatalogConnection | null, database: string | null): MetadataNote {
   if (!connection || database == null) {
-    return { keywordsOnly: true, note: "未选择执行目标：补全只提供关键字。", objects: [] };
+    return { keywordsOnly: true, note: "未选择执行目标：补全只提供关键字。字段不可用。", objects: [] };
   }
   if (connection.status !== "connected") {
-    return { keywordsOnly: true, note: `${connection.name} 当前${CONNECTION_STATUS_TEXT[connection.status]}：补全只提供关键字。`, objects: [] };
+    return { keywordsOnly: true, note: `${connection.name} 当前${CONNECTION_STATUS_TEXT[connection.status]}：补全只提供关键字。字段不可用。`, objects: [] };
   }
   if (connection.error) {
-    return { keywordsOnly: true, note: `读取 ${connection.name} 的表和视图失败（${connection.error}）：补全只提供关键字。`, objects: [] };
+    return { keywordsOnly: true, note: `读取 ${connection.name} 的表和视图失败（${connection.error}）：补全只提供关键字。字段不可用。`, objects: [] };
   }
   const db = connection.databases.find((item) => item.name === database);
   if (!db) {
-    return { keywordsOnly: true, note: `还没有读到数据库 ${database || "main"} 的表和视图：补全只提供关键字。`, objects: [] };
+    return { keywordsOnly: true, note: `还没有读到数据库 ${database || "main"} 的表和视图：补全只提供关键字。字段不可用。`, objects: [] };
   }
   if (db.error) {
-    return { keywordsOnly: true, note: `读取数据库的表和视图失败（${db.error}）：补全只提供关键字。`, objects: [] };
+    return { keywordsOnly: true, note: `读取数据库的表和视图失败（${db.error}）：补全只提供关键字。字段不可用。`, objects: [] };
   }
   const failed = db.schemas.filter((schema) => schema.error);
   const ready = db.schemas.filter((schema) => !schema.error);
   if (db.schemas.length > 0 && ready.length === 0) {
     const reason = failed.map((schema) => `${schema.name || "默认"}：${schema.error}`).join("；");
-    return { keywordsOnly: true, note: `读取表和视图失败（${reason}）：补全只提供关键字。`, objects: [] };
+    return { keywordsOnly: true, note: `读取表和视图失败（${reason}）：补全只提供关键字。字段不可用。`, objects: [] };
   }
   const objects: CompletionObject[] = [];
   for (const schema of ready) {
@@ -69,16 +74,21 @@ export function metadataNote(connection: CatalogConnection | null, database: str
     return { keywordsOnly: false, note: `部分对象读取失败，补全可能不全：${reason}。`, objects };
   }
   if (!objects.length) {
-    return { keywordsOnly: true, note: "当前目标还没有读到表或视图：补全只提供关键字。", objects: [] };
+    return { keywordsOnly: true, note: "当前目标还没有读到表或视图：补全只提供关键字。字段不可用。", objects: [] };
   }
   return {
     keywordsOnly: false,
-    note: `补全来自 ${connection.name} / ${database || "main"} 已读取的表和视图，不含未读取的字段。`,
+    note: `补全来自 ${connection.name} / ${database || "main"} 已读取的表和视图。已读取的字段会列出，未读取的字段不可用。`,
     objects,
   };
 }
 
-export function completionPlan(input: { prefix: string; connection: CatalogConnection | null; database: string | null }): {
+export function completionPlan(input: {
+  prefix: string;
+  connection: CatalogConnection | null;
+  database: string | null;
+  columns?: readonly CachedColumn[];
+}): {
   items: CompletionItem[];
   note: string;
   keywordsOnly: boolean;
@@ -92,6 +102,11 @@ export function completionPlan(input: { prefix: string; connection: CatalogConne
       if (!matched) continue;
       items.push({ label: object.label, kind: object.kind, detail: object.schema || "对象" });
       if (items.length >= 20) break;
+    }
+    for (const column of input.columns ?? []) {
+      if (items.length >= 40) break;
+      if (prefix && !column.label.toLowerCase().startsWith(prefix)) continue;
+      items.push({ label: column.label, kind: "column", detail: column.detail });
     }
   }
   for (const keyword of SQL_KEYWORDS) {

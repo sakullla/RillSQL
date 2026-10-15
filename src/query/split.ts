@@ -152,3 +152,71 @@ function dollarTag(sql: string, start: number): string | null {
   if (/^[A-Za-z0-9_]*$/.test(tag)) return tag;
   return null;
 }
+
+export type OpenDelimiter = "quote" | "comment" | "dollar";
+
+/** 引号、块注释或 dollar-quote 走到末尾仍未闭合。行注释在文末视为已结束。 */
+export function openDelimiter(sql: string): OpenDelimiter | null {
+  let i = 0;
+  let quote: string | null = null;
+  let dollar: string | null = null;
+  let comment = false;
+  while (i < sql.length) {
+    if (dollar !== null) {
+      const marker = `$${dollar}$`;
+      if (sql.startsWith(marker, i)) {
+        i += marker.length;
+        dollar = null;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    if (quote !== null) {
+      if (sql[i] === quote && sql[i + 1] === quote) {
+        i += 2;
+        continue;
+      }
+      if (sql[i] === quote) quote = null;
+      i += 1;
+      continue;
+    }
+    if (comment) {
+      if (sql[i] === "*" && sql[i + 1] === "/") {
+        comment = false;
+        i += 2;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    if (sql.startsWith("--", i)) {
+      i += 2;
+      while (i < sql.length && sql[i] !== "\n") i += 1;
+      continue;
+    }
+    if (sql.startsWith("/*", i)) {
+      comment = true;
+      i += 2;
+      continue;
+    }
+    if (sql[i] === "'" || sql[i] === '"' || sql[i] === "`") {
+      quote = sql[i] ?? null;
+      i += 1;
+      continue;
+    }
+    if (sql[i] === "$") {
+      const tag = dollarTag(sql, i);
+      if (tag !== null) {
+        dollar = tag;
+        i += tag.length + 2;
+        continue;
+      }
+    }
+    i += 1;
+  }
+  if (quote) return "quote";
+  if (comment) return "comment";
+  if (dollar !== null) return "dollar";
+  return null;
+}

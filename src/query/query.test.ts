@@ -1,3 +1,4 @@
+import { currentCompletions, startCompletion } from "@codemirror/autocomplete";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { flushPromises, mount } from "@vue/test-utils";
@@ -7,7 +8,8 @@ import { catalogFixture } from "../catalog/fixtures";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
 import { createSession } from "../shell/session";
 import type { RunDto } from "./api";
-import { completionPlan } from "./complete";
+import { clearColumnCache, qualifierFor } from "./columns";
+import { completionPlan, metadataNote } from "./complete";
 import { resolveEditor } from "./editor";
 import QueryTab from "./QueryTab.vue";
 import { adoptRun, attachCloser, connectionBusy, guardClose, requestCancel, resetQueryRuntime, startTabRun, tabRun } from "./runtime";
@@ -42,6 +44,7 @@ function runDto(patch: Partial<RunDto> = {}): RunDto {
 afterEach(() => {
   resetQueryRuntime();
   resetCatalog();
+  clearColumnCache();
   invoke.mockReset();
 });
 
@@ -94,6 +97,27 @@ describe("query editing", () => {
     expect(offline.keywordsOnly).toBe(true);
     expect(offline.note).toContain("只提供关键字");
     expect(offline.items.some((item) => item.label === "events")).toBe(false);
+    expect(offline.note).toContain("字段不可用");
+    const withColumns = completionPlan({
+      prefix: "sta",
+      connection: shop!,
+      database: "shop_staging",
+      columns: [{ label: "status", detail: "orders" }],
+    });
+    expect(withColumns.items.some((item) => item.label === "status" && item.kind === "column")).toBe(true);
+    const hiddenColumns = completionPlan({
+      prefix: "sta",
+      connection: analytics!,
+      database: "analytics",
+      columns: [{ label: "status", detail: "events" }],
+    });
+    expect(hiddenColumns.items.some((item) => item.kind === "column")).toBe(false);
+
+    const objects = metadataNote(atlas!, "atlas_dev").objects;
+    expect(qualifierFor("public.ord", objects).kind).toBe("plain");
+    expect(qualifierFor("orders.", objects)).toMatchObject({ kind: "object", columnPrefix: "" });
+    expect(qualifierFor("customers.", objects).kind).toBe("ambiguous");
+    expect(qualifierFor("o.status", objects).kind).toBe("unknown");
   });
 
   it("shows the connection and database, and sends only the chosen sql", async () => {
@@ -425,5 +449,262 @@ describe("query editing", () => {
     expect(Object.keys(localStorage)).toEqual(before);
     const restarted = createSession();
     expect(restarted.tabs.value).toEqual([]);
+  });
+
+  it("completes a described column after orders and shows why fields are unavailable", async () => {
+    replaceCatalog(catalogFixture());
+    const described: { table?: string; schema?: string }[] = [];
+    invoke.mockImplementation(async (command: string, args?: { request?: { table?: string; schema?: string } }) => {
+      if (command !== "grid_describe") throw new Error(command);
+      described.push({ table: args?.request?.table, schema: args?.request?.schema });
+      return {
+        engine: "mysql",
+        schema: "",
+        name: "orders",
+        kind: "table",
+        key: ["id"],
+        columns: [{ name: "status", typeName: "varchar", nullable: false, primary: false, unique: false, auto: false }],
+      };
+    });
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-complete",
+        draft: "SELECT orders.",
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element);
+    expect(view).toBeTruthy();
+    view!.dispatch({ selection: { anchor: view!.state.doc.length } });
+    startCompletion(view!);
+    await vi.waitFor(() => {
+      expect(currentCompletions(view!.state).some((item) => item.label === "status")).toBe(true);
+    });
+    expect(described).toEqual([{ table: "orders", schema: "" }]);
+    expect(currentCompletions(view!.state).some((item) => item.label === "secret_status")).toBe(false);
+
+    view!.dispatch({ changes: { from: 0, to: view!.state.doc.length, insert: "sta" }, selection: { anchor: 3 } });
+    startCompletion(view!);
+    await vi.waitFor(() => {
+      expect(currentCompletions(view!.state).some((item) => item.label === "status")).toBe(true);
+    });
+    expect(described).toHaveLength(1);
+    wrapper.unmount();
+    clearColumnCache();
+
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") throw "permission denied";
+      throw new Error(command);
+    });
+    const failed = mount(QueryTab, {
+      props: {
+        tabId: "query-complete-failed",
+        draft: "SELECT orders.",
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    const failedView = EditorView.findFromDOM(failed.get(".cm-content").element)!;
+    failedView.dispatch({ selection: { anchor: failedView.state.doc.length } });
+    startCompletion(failedView);
+    await vi.waitFor(() => {
+      expect(failed.get(".q-hint").text()).toContain("permission denied");
+    });
+    expect(failed.get(".q-hint").text()).toContain("不会猜测字段名");
+    expect(currentCompletions(failedView.state).some((item) => item.label === "status")).toBe(false);
+    failed.unmount();
+
+    const missing = mount(QueryTab, {
+      props: {
+        tabId: "query-complete-none",
+        draft: "SELECT orders.",
+        connectionId: null,
+        connectionName: null,
+        database: null,
+        engine: null,
+        connectionStatus: null,
+        notice: null,
+      },
+    });
+    await nextTick();
+    expect(missing.get(".q-hint").text()).toContain("字段不可用");
+    invoke.mockClear();
+    const missingView = EditorView.findFromDOM(missing.get(".cm-content").element)!;
+    missingView.dispatch({ selection: { anchor: missingView.state.doc.length } });
+    startCompletion(missingView);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    await flushPromises();
+    expect(invoke.mock.calls.some((call) => call[0] === "grid_describe")).toBe(false);
+    expect(currentCompletions(missingView.state).some((item) => item.label === "status")).toBe(false);
+    missing.unmount();
+  });
+
+  it("formats the selection in the editor and refuses an unclosed quote", async () => {
+    const sql = "select  1;\nselect   2;";
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-format",
+        draft: sql,
+        connectionId: null,
+        connectionName: null,
+        database: null,
+        engine: null,
+        connectionStatus: null,
+        notice: null,
+      },
+    });
+    await nextTick();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element)!;
+    const from = sql.indexOf("select   2;");
+    view.dispatch({ selection: { anchor: from, head: sql.length } });
+    await wrapper.get("[data-action='format']").trigger("click");
+    const next = view.state.doc.toString();
+    expect(next.slice(0, from)).toBe(sql.slice(0, from));
+    expect(next.slice(from)).toBe("SELECT\n  2;");
+    wrapper.unmount();
+
+    const broken = mount(QueryTab, {
+      props: {
+        tabId: "query-format-broken",
+        draft: "select 'abc",
+        connectionId: null,
+        connectionName: null,
+        database: null,
+        engine: null,
+        connectionStatus: null,
+        notice: null,
+      },
+    });
+    await nextTick();
+    await broken.get("[data-action='format']").trigger("click");
+    const brokenView = EditorView.findFromDOM(broken.get(".cm-content").element)!;
+    expect(brokenView.state.doc.toString()).toBe("select 'abc");
+    expect(broken.get("[role='alert']").text()).toContain("引号");
+    broken.unmount();
+  });
+
+  it("requests one EXPLAIN plan and does not run empty or multiple statements", async () => {
+    replaceCatalog(catalogFixture());
+    const calls: { command: string; sql?: string }[] = [];
+    invoke.mockImplementation(async (command: string, args?: { request?: { sql: string } }) => {
+      calls.push({ command, sql: args?.request?.sql });
+      return runDto({
+        status: "done",
+        statements: [{
+          sql: args?.request?.sql ?? "",
+          status: "ok",
+          message: "",
+          columns: ["QUERY PLAN"],
+          rows: [["Seq Scan on orders"]],
+          truncated: false,
+          affected: null,
+        }],
+      });
+    });
+    const sql = "SELECT * FROM orders;\nSELECT 2;";
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-plan",
+        draft: sql,
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    await wrapper.get("[data-action='plan']").trigger("click");
+    await flushPromises();
+    expect(calls.map((call) => call.command)).toEqual(["query_start"]);
+    expect(calls[0]?.sql).toBe("EXPLAIN SELECT * FROM orders");
+    expect(calls[0]?.sql?.toLowerCase()).not.toContain("analyze");
+    expect(wrapper.get("[data-result='plan']").text()).toContain("Seq Scan on orders");
+    expect(wrapper.get("[data-result='plan']").text()).toContain("未使用 ANALYZE");
+    expect(wrapper.find("[aria-label='查询结果']").exists()).toBe(false);
+
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element)!;
+    view.dispatch({ selection: { anchor: 0, head: sql.length } });
+    await wrapper.get("[data-action='plan']").trigger("click");
+    await flushPromises();
+    expect(calls).toHaveLength(1);
+    expect(wrapper.get("[role='alert']").text()).toContain("一条");
+    wrapper.unmount();
+
+    const sqliteCalls: string[] = [];
+    invoke.mockImplementation(async (command: string, args?: { request?: { sql: string } }) => {
+      sqliteCalls.push(args?.request?.sql ?? command);
+      return runDto({
+        engine: "sqlite",
+        database: "main",
+        statements: [{ sql: args?.request?.sql ?? "", status: "ok", message: "", columns: ["detail"], rows: [["SCAN notes"]], truncated: false, affected: null }],
+      });
+    });
+    const sqlite = mount(QueryTab, {
+      props: {
+        tabId: "query-plan-sqlite",
+        draft: "SELECT * FROM notes",
+        connectionId: "notes",
+        connectionName: "本地笔记",
+        database: "main",
+        engine: "sqlite",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    await sqlite.get("[data-action='plan']").trigger("click");
+    await flushPromises();
+    expect(sqliteCalls).toEqual(["EXPLAIN QUERY PLAN SELECT * FROM notes"]);
+    sqlite.unmount();
+
+    invoke.mockClear();
+    const offline = mount(QueryTab, {
+      props: {
+        tabId: "query-plan-offline",
+        draft: "SELECT * FROM events",
+        connectionId: "analytics",
+        connectionName: "Analytics",
+        database: "analytics",
+        engine: "mariadb",
+        connectionStatus: "disconnected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    await offline.get("[data-action='plan']").trigger("click");
+    await flushPromises();
+    expect(invoke.mock.calls).toHaveLength(0);
+    expect(offline.get("[role='alert']").text()).toContain("未连接");
+    offline.unmount();
+
+    const none = mount(QueryTab, {
+      props: {
+        tabId: "query-plan-none",
+        draft: "",
+        connectionId: null,
+        connectionName: null,
+        database: null,
+        engine: null,
+        connectionStatus: null,
+        notice: null,
+      },
+    });
+    await nextTick();
+    await none.get("[data-action='plan']").trigger("click");
+    expect(none.get("[role='alert']").text()).toContain("请选择执行目标");
+    none.unmount();
   });
 });

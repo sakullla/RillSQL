@@ -19,11 +19,15 @@ import Icon from "../shell/Icon.vue";
 import { loadSettings } from "../shell/settings";
 import { CONNECTION_STATUS_TEXT, type ConnectionStatus } from "../shell/status-text";
 import type { QueryTarget } from "../shell/session";
+import { ambiguousFieldNote, cachedColumns, fieldFailureNote, loadFields, qualifierFor, unknownFieldNote } from "./columns";
 import { completionPlan, connectionById, metadataNote, targetDetail, targetKey, targetOptions, type TargetOption } from "./complete";
 import { resolveEditor } from "./editor";
+import { formatSql } from "./format";
+import { explainSql, planStatement } from "./plan";
 import { gridModel } from "./rows";
 import { requestCancel, startTabRun, tabRun } from "./runtime";
 import { QUERY_EDITOR_KEYS, rowLimit, sqlToRun } from "./scope";
+import { openDelimiter } from "./split";
 
 const props = defineProps<{
   tabId: string;
@@ -65,6 +69,8 @@ const activeIndex = ref(0);
 const hasSelection = ref(false);
 const submitting = ref(false);
 const actionError = ref("");
+const fieldNote = ref("");
+const planMode = ref(false);
 const resultIndex = ref(0);
 const detailsOpen = ref(false);
 let view: EditorView | undefined;
@@ -83,10 +89,11 @@ const buttonLabel = computed(() => {
 });
 const hint = computed(() => {
   const connection = connectionById(catalogConnections(), props.connectionId);
-  if (props.connectionId && !connection) {
-    return { keywordsOnly: true, note: "原连接已不在目录中：补全只提供关键字。请重新选择执行目标。", objects: [] };
-  }
-  return metadataNote(connection, props.connectionId ? props.database : null);
+  const base = props.connectionId && !connection
+    ? { keywordsOnly: true, note: "原连接已不在目录中：补全只提供关键字。字段不可用。请重新选择执行目标。", objects: [] }
+    : metadataNote(connection, props.connectionId ? props.database : null);
+  if (!fieldNote.value) return base;
+  return { ...base, note: fieldNote.value };
 });
 const activeStatement = computed(() => run.value?.statements[resultIndex.value] ?? null);
 const grid = computed(() => (activeStatement.value && activeStatement.value.columns.length ? gridModel(activeStatement.value) : null));
@@ -180,22 +187,69 @@ function asEngine(value: string | undefined): Engine | undefined {
   return undefined;
 }
 
-function sqlCompletion(context: CompletionContext) {
+async function sqlCompletion(context: CompletionContext) {
   const before = context.state.sliceDoc(0, context.pos);
-  if (/--[^\n]*$/.test(before)) return null;
+  if (/--[^\n]*$/.test(before) || openDelimiter(before)) return null;
   const word = context.matchBefore(/[A-Za-z0-9_.]*$/);
   if (!word || (word.from === word.to && !context.explicit)) return null;
   const connection = connectionById(catalogConnections(), props.connectionId);
-  const plan = completionPlan({
-    prefix: word.text,
-    connection: props.connectionId && connection ? connection : null,
-    database: props.connectionId && connection ? props.database : null,
+  const ready = Boolean(props.connectionId && connection);
+  const database = ready ? props.database : null;
+  const meta = metadataNote(ready ? connection : null, database);
+  const qualified = qualifierFor(word.text, meta.objects);
+  if (qualified.kind === "plain") {
+    fieldNote.value = "";
+    const columns = ready && connection && database != null && connection.status === "connected" && !meta.keywordsOnly
+      ? cachedColumns(connection.id, database)
+      : [];
+    const plan = completionPlan({
+      prefix: word.text,
+      connection: ready ? connection : null,
+      database,
+      columns,
+    });
+    return {
+      from: word.from,
+      filter: false,
+      options: plan.items.map((item) => ({ label: item.label, type: item.kind, detail: item.detail })),
+    };
+  }
+  const columnFrom = word.to - (qualified.kind === "object" ? qualified.columnPrefix.length : 0);
+  if (!connection || database == null || connection.status !== "connected") {
+    fieldNote.value = meta.note;
+    return { from: columnFrom, filter: false, options: [] };
+  }
+  if (qualified.kind === "unknown") {
+    fieldNote.value = unknownFieldNote(qualified.name);
+    return { from: columnFrom, filter: false, options: [] };
+  }
+  if (qualified.kind === "ambiguous") {
+    fieldNote.value = ambiguousFieldNote(qualified.name);
+    return { from: columnFrom, filter: false, options: [] };
+  }
+  const engine = asEngine(props.engine ?? connection.engine);
+  if (!engine) {
+    fieldNote.value = "当前目标的引擎未知：字段不可用，不会猜测字段名。";
+    return { from: columnFrom, filter: false, options: [] };
+  }
+  const loaded = await loadFields({
+    connectionId: connection.id,
+    database,
+    engine,
+    object: qualified.object,
+    refresh: context.explicit,
   });
-  return {
-    from: word.from,
-    filter: false,
-    options: plan.items.map((item) => ({ label: item.label, type: item.kind, detail: item.detail })),
-  };
+  if (loaded.error) {
+    fieldNote.value = fieldFailureNote(qualified.object.label, loaded.error);
+    return { from: columnFrom, filter: false, options: [] };
+  }
+  fieldNote.value = "";
+  const columnPrefix = qualified.columnPrefix.toLowerCase();
+  const options = loaded.columns
+    .filter((name) => !columnPrefix || name.toLowerCase().startsWith(columnPrefix))
+    .slice(0, 40)
+    .map((name) => ({ label: name, type: "property", detail: qualified.object.label }));
+  return { from: columnFrom, filter: false, options };
 }
 
 function editorExtensions() {
@@ -219,6 +273,8 @@ function editorExtensions() {
         { key: QUERY_EDITOR_KEYS[2], run: () => { cancel(); return true; } },
         { key: QUERY_EDITOR_KEYS[3], run: startCompletion },
         { key: QUERY_EDITOR_KEYS[4], run: toggleComment },
+        { key: "Mod-Shift-f", run: () => { formatEditor(); return true; } },
+        { key: "Mod-Shift-e", run: () => { void requestPlan(); return true; } },
       ]),
     ),
     autocompletion({ override: [sqlCompletion] }),
@@ -244,6 +300,86 @@ function mountEditor() {
   }));
 }
 
+function formatEditor() {
+  actionError.value = "";
+  mountEditor();
+  const editor = view;
+  if (!editor) {
+    actionError.value = "编辑器还没有准备好，请再试一次。";
+    return;
+  }
+  const doc = editor.state.doc.toString();
+  const range = editor.state.selection.main;
+  const from = Math.min(range.from, range.to);
+  const to = Math.max(range.from, range.to);
+  const selected = from !== to;
+  const formatted = formatSql(selected ? doc.slice(from, to) : doc);
+  if (!formatted.ok) {
+    actionError.value = formatted.reason;
+    return;
+  }
+  if (formatted.sql === (selected ? doc.slice(from, to) : doc)) return;
+  const insertFrom = selected ? from : 0;
+  const insertTo = selected ? to : doc.length;
+  const formattedEnd = insertFrom + formatted.sql.length;
+  editor.dispatch({
+    changes: { from: insertFrom, to: insertTo, insert: formatted.sql },
+    selection: selected ? { anchor: insertFrom, head: formattedEnd } : { anchor: formattedEnd },
+  });
+}
+
+async function requestPlan() {
+  actionError.value = "";
+  if (running.value || submitting.value) return;
+  mountEditor();
+  const editor = view;
+  if (!editor) {
+    actionError.value = "编辑器还没有准备好，请再试一次。";
+    return;
+  }
+  const connection = connectionById(catalogConnections(), props.connectionId);
+  if (!props.connectionId || props.database == null || !props.connectionName || !props.engine || !connection) {
+    actionError.value = props.connectionId && !connection ? "原连接已删除，请重新选择执行目标。" : "请选择执行目标（连接和数据库）。";
+    return;
+  }
+  if (connection.status !== "connected") {
+    actionError.value = `${props.connectionName} 当前${CONNECTION_STATUS_TEXT[connection.status]}，无法查看执行计划。`;
+    return;
+  }
+  const range = editor.state.selection.main;
+  const picked = planStatement(editor.state.doc.toString(), { from: range.from, to: range.to, head: range.head });
+  if (!picked.ok) {
+    actionError.value = picked.reason;
+    return;
+  }
+  const explained = explainSql(props.engine, picked.statement);
+  if (!explained.ok) {
+    actionError.value = explained.reason;
+    return;
+  }
+  submitting.value = true;
+  menuOpen.value = false;
+  runMenuOpen.value = false;
+  try {
+    planMode.value = true;
+    await nextTick();
+    await startTabRun({
+      tabId: props.tabId,
+      connectionId: props.connectionId,
+      connectionName: props.connectionName,
+      database: props.database,
+      engine: props.engine,
+      sql: explained.sql,
+      limit: rowLimit(loadSettings().pageSize),
+    });
+  } catch (err) {
+    planMode.value = false;
+    actionError.value = typeof err === "string" ? err : err instanceof Error ? err.message : "执行计划失败";
+  } finally {
+    submitting.value = false;
+  }
+}
+
 async function execute(scope: "auto" | "current") {
   actionError.value = "";
   if (running.value || submitting.value) return;
@@ -267,6 +403,7 @@ async function execute(scope: "auto" | "current") {
   submitting.value = true;
   menuOpen.value = false;
   runMenuOpen.value = false;
+  planMode.value = false;
   try {
     await nextTick();
     await startTabRun({
@@ -397,6 +534,13 @@ watch(host, (element) => {
   if (element) mountEditor();
 });
 
+watch(
+  () => [props.connectionId, props.database, props.connectionStatus] as const,
+  () => {
+    fieldNote.value = "";
+  },
+);
+
 onMounted(() => {
   document.addEventListener("pointerdown", onPointerDown);
   mountEditor();
@@ -464,6 +608,8 @@ onBeforeUnmount(() => {
       </div>
       <span v-if="connectionStatus" class="conn-state" :class="`st-${connectionStatus}`"><i></i>{{ CONNECTION_STATUS_TEXT[connectionStatus] }}</span>
       <span class="grow"></span>
+      <button class="btn" type="button" data-action="format" title="格式化选中的 SQL；没有选中时格式化全部" @click="formatEditor">格式化</button>
+      <button class="btn" type="button" data-action="plan" title="查看一条语句的执行计划，不使用 ANALYZE" :disabled="running || submitting" @click="requestPlan">执行计划</button>
       <div v-if="!running" ref="runRoot" class="run-group">
         <button class="btn primary run-main" type="button" data-action="run" :disabled="submitting" @click="execute('auto')"><span aria-hidden="true">▶</span>{{ submitting ? "正在执行…" : hasSelection ? "执行选中" : "执行" }} <ChordKeys chord="Mod+Enter" /></button>
         <button
@@ -505,8 +651,19 @@ onBeforeUnmount(() => {
         <template v-if="activeStatement">
           <p v-if="activeStatement.status === 'unknown'" class="q-note">写入结果未知。不会自动重放，草稿保留。</p>
           <p v-else-if="activeStatement.status === 'skipped'" class="q-note">这条语句没有执行。</p>
+          <div v-if="planMode && grid" class="plan-view" data-result="plan">
+            <p class="plan-caption">执行计划 · 只读 · 未使用 ANALYZE</p>
+            <table>
+              <thead><tr><th v-for="(column, columnIndex) in activeStatement.columns" :key="`${column}-${columnIndex}`">{{ column }}</th></tr></thead>
+              <tbody>
+                <tr v-for="(row, rowIndex) in activeStatement.rows" :key="rowIndex">
+                  <td v-for="(cell, cellIndex) in row" :key="cellIndex">{{ cell === null ? "NULL" : cell }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
           <QueryResultGrid
-            v-if="grid"
+            v-else-if="grid"
             :tab-id="tabId"
             :statement="activeStatement.sql"
             :columns="grid.columns"
@@ -624,6 +781,10 @@ onBeforeUnmount(() => {
 .query-splitter:hover, .query-splitter:focus-visible { background: var(--accent-soft); }
 .query-pane .q-results { flex: 1; min-height: 130px; padding: 0; gap: 0; border: 0; }
 .results-heading { display: flex; align-items: center; gap: 20px; padding: 10px 16px; border-bottom: 1px solid var(--line); font-size: 11px; flex-shrink: 0; }
+.plan-view { padding: 12px 16px; overflow: auto; }
+.plan-caption { margin: 0 0 8px; font-size: var(--fs-sm); color: var(--text-2); }
+.plan-view table { border-collapse: collapse; font-family: var(--mono); font-size: var(--fs-xs); }
+.plan-view th, .plan-view td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; vertical-align: top; }
 .results-heading > span:first-child { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; }
 .results-heading .q-summary { font-size: 11px; font-weight: 400; }
 .query-pane .q-idle { display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 12px; flex: 1; padding: 24px; color: var(--text-3); background: var(--panel-2); }

@@ -20,6 +20,8 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
   { group: "SQL 编辑器", chord: "Mod+.", label: "请求取消执行" },
   { group: "SQL 编辑器", chord: "Ctrl+Space", label: "补全" },
   { group: "SQL 编辑器", chord: "Mod+/", label: "注释 / 取消注释" },
+  { group: "SQL 编辑器", chord: "Mod+Shift+F", label: "格式化选中的 SQL；无选中时格式化全部" },
+  { group: "SQL 编辑器", chord: "Mod+Shift+E", label: "查看当前语句的执行计划" },
   { group: "SQL 编辑器", chord: "Esc 然后 Tab", label: "离开编辑器（Tab 在编辑器中用于缩进）" },
   { group: "表格", chord: "↑ ↓ ← →", label: "移动单元格" },
   { group: "表格", chord: "Enter / F2", label: "编辑单元格" },
