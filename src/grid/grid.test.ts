@@ -1204,4 +1204,136 @@ describe("query result edits", () => {
     expect(failed.get("pre.ex-preview").text()).not.toContain("INSERT");
     failed.unmount();
   });
+
+  it("keeps identifiers around a comment in a qualifier and clears an unproved insert target", async () => {
+    const block = readSingleTable("SELECT id, name FROM app.public/*c*/.customers");
+    expect(block.ok).toBe(false);
+    if (!block.ok) expect(block.reason).toContain("两部分");
+    const line = readSingleTable("SELECT id, name FROM app.public--c\n.customers");
+    expect(line.ok).toBe(false);
+    if (!line.ok) expect(line.reason).toContain("两部分");
+    expect(proof("SELECT id, name FROM public/*c*/.customers")).toEqual({
+      schema: "public",
+      table: "customers",
+      qualifierSource: "public",
+    });
+    expect(proof("SELECT id, name FROM public--c\n.customers")).toEqual({
+      schema: "public",
+      table: "customers",
+      qualifierSource: "public",
+    });
+    const aliased = readSingleTable("SELECT c.id FROM public/*c*/.customers c");
+    expect(aliased.ok && aliased.columns.baseColumns).toEqual(["id"]);
+
+    replaceCatalog([shopCatalog("postgres", "app", [
+      { name: "app", tables: ["public"] },
+      { name: "public", tables: ["customers"] },
+    ])]);
+    const model = gridModel({ columns: ["id", "name"], rows: [["1", "甲"]] });
+    for (const [index, statement] of [
+      "SELECT id, name FROM app.public/*c*/.customers",
+      "SELECT id, name FROM app.public--c\n.customers",
+    ].entries()) {
+      invoke.mockReset();
+      invoke.mockImplementation(async (command: string) => {
+        if (command === "grid_describe") return { ...customerSchema(), schema: "app", name: "public" };
+        throw new Error(command);
+      });
+      const wrapper = mount(QueryResultGrid, {
+        props: {
+          tabId: `comment-three-${index}`,
+          statement,
+          columns: model.columns,
+          rows: model.rows,
+          truncated: false,
+          connectionId: "shop",
+          engine: "postgres",
+          database: "app",
+          schema: "public",
+        },
+      });
+      await flushPromises();
+      expect(invoke).not.toHaveBeenCalled();
+      expect(wrapper.attributes("data-editable")).toBe("false");
+      expect(wrapper.text()).toContain("两部分");
+      await wrapper.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
+      await wrapper.get("input[value='insert']").setValue(true);
+      expect(wrapper.get("pre.ex-preview").text()).not.toContain("INSERT");
+      expect(wrapper.text()).not.toContain('"app"."public"');
+      wrapper.unmount();
+    }
+
+    for (const engine of ["mysql", "mariadb"] as const) {
+      const commentedShop = proof("SELECT id, name FROM Shop/*c*/.customers");
+      expect(commentedShop).toEqual({ schema: "shop", table: "customers", qualifierSource: "Shop" });
+      const mismatched = resolveEditableTable(commentedShop, [
+        { schema: "", name: "customers", kind: "table" },
+      ], "shop", engine);
+      expect(mismatched.ok).toBe(false);
+      if (!mismatched.ok) expect(mismatched.reason).toContain("限定名");
+      const exactShop = resolveEditableTable(proof("SELECT id, name FROM shop.customers"), [
+        { schema: "", name: "customers", kind: "table" },
+      ], "shop", engine);
+      expect(exactShop).toEqual({ ok: true, schema: "", table: "customers" });
+      const commentedExact = resolveEditableTable(proof("SELECT id, name FROM shop/*c*/.customers"), [
+        { schema: "", name: "customers", kind: "table" },
+      ], "shop", engine);
+      expect(commentedExact).toEqual({ ok: true, schema: "", table: "customers" });
+
+      invoke.mockReset();
+      resetCatalog();
+      replaceCatalog([shopCatalog(engine, "shop", [{ name: "", tables: ["customers"] }])]);
+      invoke.mockImplementation(async (command: string) => {
+        if (command === "grid_describe") return { ...customerSchema(), engine, schema: "", database: "shop", name: "customers" };
+        throw new Error(command);
+      });
+      const foreign = mount(QueryResultGrid, {
+        props: {
+          tabId: `comment-shop-${engine}`,
+          statement: "SELECT id, name FROM Shop/*c*/.customers",
+          columns: model.columns,
+          rows: model.rows,
+          truncated: false,
+          connectionId: "shop",
+          engine,
+          database: "shop",
+        },
+      });
+      await flushPromises();
+      expect(invoke).not.toHaveBeenCalled();
+      expect(foreign.attributes("data-editable")).toBe("false");
+      expect(foreign.text()).toContain("限定名");
+      await foreign.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
+      await foreign.get("input[value='insert']").setValue(true);
+      expect(foreign.get("pre.ex-preview").text()).not.toContain("INSERT");
+      foreign.unmount();
+
+      invoke.mockReset();
+      invoke.mockImplementation(async (command: string) => {
+        if (command === "grid_describe") return { ...customerSchema(), engine, schema: "", database: "shop", name: "customers" };
+        throw new Error(command);
+      });
+      const current = mount(QueryResultGrid, {
+        props: {
+          tabId: `comment-shop-exact-${engine}`,
+          statement: "SELECT id, name FROM shop/*c*/.customers",
+          columns: model.columns,
+          rows: model.rows,
+          truncated: false,
+          connectionId: "shop",
+          engine,
+          database: "shop",
+        },
+      });
+      await flushPromises();
+      expect(invoke.mock.calls.find((call) => call[0] === "grid_describe")?.[1]).toMatchObject({
+        request: { database: "shop", schema: "", table: "customers", engine },
+      });
+      expect(current.attributes("data-editable")).toBe("true");
+      await current.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
+      await current.get("input[value='insert']").setValue(true);
+      expect(current.get("pre.ex-preview").text()).toContain("INSERT INTO `customers`");
+      current.unmount();
+    }
+  });
 });

@@ -34,7 +34,7 @@ type SelectItem =
 
 const EMPTY_COLUMNS: ColumnProof = { star: false, baseColumns: [], aliasColumns: [] };
 
-type Token = { kind: "word" | "ident" | "punct" | "string"; text: string; source?: string };
+type Token = { kind: "word" | "ident" | "punct" | "string"; text: string; source?: string; at: number };
 
 const CLAUSES = new Set(["WHERE", "ORDER", "LIMIT", "OFFSET", "FETCH", "FOR", "BY", "AND", "OR", "AS", "ASC", "DESC", "NULLS", "FIRST", "LAST", "ONLY", "ROWS", "ROW", "NEXT", "TIES", "SHARE", "NOWAIT", "SKIP", "LOCKED", "OF", "INTO"]);
 const FORBIDDEN: Record<string, string> = {
@@ -61,6 +61,7 @@ function tokenize(sql: string): Token[] {
     if (/\s/.test(char)) continue;
     if (char === "'" || char === '"') {
       const quote = char;
+      const at = index;
       let text = "";
       index += 1;
       while (index < sql.length) {
@@ -74,10 +75,11 @@ function tokenize(sql: string): Token[] {
         text += next;
         index += 1;
       }
-      tokens.push(quote === "'" ? { kind: "string", text } : { kind: "ident", text });
+      tokens.push(quote === "'" ? { kind: "string", text, at } : { kind: "ident", text, at });
       continue;
     }
     if (char === "`") {
+      const at = index;
       let text = "";
       index += 1;
       while (index < sql.length) {
@@ -91,19 +93,20 @@ function tokenize(sql: string): Token[] {
         text += next;
         index += 1;
       }
-      tokens.push({ kind: "ident", text });
+      tokens.push({ kind: "ident", text, at });
       continue;
     }
     if (isIdentChar(char)) {
+      const at = index;
       let text = char;
       while (index + 1 < sql.length && isIdentChar(sql[index + 1]!)) {
         index += 1;
         text += sql[index]!;
       }
-      tokens.push({ kind: "word", text: text.toLowerCase(), source: text });
+      tokens.push({ kind: "word", text: text.toLowerCase(), source: text, at });
       continue;
     }
-    tokens.push({ kind: "punct", text: char });
+    tokens.push({ kind: "punct", text: char, at: index });
   }
   return tokens;
 }
@@ -119,12 +122,82 @@ function readName(token: Token | undefined): string | null {
   return null;
 }
 
-/** 未加引号的标识符仍按小写参与关键字和表名折叠，库名比较要留下原文。 */
-function sourceName(token: Token | undefined): string | null {
-  if (!token) return null;
-  if (token.kind === "ident") return token.text;
-  if (token.kind === "word") return token.source ?? token.text;
-  return null;
+type QualifierPart = { name: string; source: string; quoted: boolean };
+
+/** 限定名两侧的空白、块注释和行注释都不结束名字。行注释连同它结束用的换行一起跳过。 */
+function skipQualifierGap(sql: string, index: number): number {
+  while (index < sql.length) {
+    const char = sql[index]!;
+    if (/\s/.test(char)) {
+      index += 1;
+      continue;
+    }
+    if (sql.startsWith("--", index)) {
+      index += 2;
+      while (index < sql.length && sql[index] !== "\n") index += 1;
+      if (sql[index] === "\n") index += 1;
+      continue;
+    }
+    if (sql.startsWith("/*", index)) {
+      const end = sql.indexOf("*/", index + 2);
+      index = end < 0 ? sql.length : end + 2;
+      continue;
+    }
+    break;
+  }
+  return index;
+}
+
+function readQualifierPart(sql: string, index: number): { part: QualifierPart; end: number } | null {
+  const char = sql[index];
+  if (char === '"' || char === "`") {
+    let text = "";
+    let cursor = index + 1;
+    while (cursor < sql.length) {
+      const next = sql[cursor]!;
+      if (next === char && sql[cursor + 1] === char) {
+        text += char;
+        cursor += 2;
+        continue;
+      }
+      if (next === char) return { part: { name: text, source: text, quoted: true }, end: cursor + 1 };
+      text += next;
+      cursor += 1;
+    }
+    return null;
+  }
+  if (!char || !isIdentChar(char)) return null;
+  let cursor = index + 1;
+  while (cursor < sql.length && isIdentChar(sql[cursor]!)) cursor += 1;
+  const source = sql.slice(index, cursor);
+  return { part: { name: source.toLowerCase(), source, quoted: false }, end: cursor };
+}
+
+/** 点号之间的注释仍属于同一个限定名，下一段标识符不能丢掉。超过两段则无法证明单表。 */
+function walkQualifier(sql: string, start: number): { ok: true; parts: QualifierPart[]; end: number } | { ok: false; reason: string } {
+  const unproved = "不能确定这条 SELECT 只读取一张基表。";
+  const first = readQualifierPart(sql, skipQualifierGap(sql, start));
+  if (!first) return { ok: false, reason: unproved };
+  if (!first.part.quoted && first.part.name === "only") return { ok: false, reason: unproved };
+  const parts = [first.part];
+  let index = first.end;
+  while (true) {
+    const gap = skipQualifierGap(sql, index);
+    if (sql[gap] !== ".") break;
+    const next = readQualifierPart(sql, skipQualifierGap(sql, gap + 1));
+    if (!next) return { ok: false, reason: unproved };
+    parts.push(next.part);
+    index = next.end;
+    if (parts.length > 2) return { ok: false, reason: "限定名超过两部分，不能证明只是一张基表。" };
+  }
+  return { ok: true, parts, end: index };
+}
+
+function tokenFrom(tokens: Token[], start: number, position: number): number {
+  for (let index = start; index < tokens.length; index += 1) {
+    if (tokens[index]!.at >= position) return index;
+  }
+  return tokens.length;
 }
 
 function sameIdent(left: string, right: string): boolean {
@@ -232,7 +305,8 @@ export function readSingleTable(sql: string): EditProof {
   const statements = splitSql(sql).map((item) => item.trim()).filter(Boolean);
   if (!statements.length) return { ok: false, reason: "没有可修改的语句。" };
   if (statements.length > 1) return { ok: false, reason: "不是单条 SELECT，不能修改查询结果。" };
-  const tokens = tokenize(statements[0]!);
+  const statement = statements[0]!;
+  const tokens = tokenize(statement);
   if (word(tokens[0]) !== "SELECT") return { ok: false, reason: "只有单条 SELECT 可以修改查询结果。" };
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index]!;
@@ -245,18 +319,17 @@ export function readSingleTable(sql: string): EditProof {
   if (fromAt < 0 || tokens.findIndex((token, index) => index > fromAt && word(token) === "FROM") >= 0) {
     return { ok: false, reason: "不能确定这条 SELECT 只读取一张基表。" };
   }
-  if (word(tokens[fromAt + 1]) === "ONLY") return { ok: false, reason: "不能确定这条 SELECT 只读取一张基表。" };
-  const left = readName(tokens[fromAt + 1]);
+  const fromToken = tokens[fromAt];
+  if (!fromToken) return { ok: false, reason: "不能确定这条 SELECT 只读取一张基表。" };
+  const walked = walkQualifier(statement, fromToken.at + fromToken.text.length);
+  if (!walked.ok) return walked;
+  const left = walked.parts[0];
+  const right = walked.parts[1];
   if (!left) return { ok: false, reason: "不能确定这条 SELECT 只读取一张基表。" };
-  let cursor = fromAt + 2;
-  let table: TableRef = { schema: null, table: left, qualifierSource: null };
-  if (tokens[cursor]?.text === ".") {
-    const right = readName(tokens[cursor + 1]);
-    if (!right) return { ok: false, reason: "不能确定这条 SELECT 只读取一张基表。" };
-    cursor += 2;
-    if (tokens[cursor]?.text === ".") return { ok: false, reason: "限定名超过两部分，不能证明只是一张基表。" };
-    table = { schema: left, table: right, qualifierSource: sourceName(tokens[fromAt + 1]) };
-  }
+  let cursor = tokenFrom(tokens, fromAt + 1, walked.end);
+  const table: TableRef = right
+    ? { schema: left.name, table: right.name, qualifierSource: left.source }
+    : { schema: null, table: left.name, qualifierSource: null };
   let alias: string | null = null;
   if (word(tokens[cursor]) === "AS") {
     const name = readName(tokens[cursor + 1]);
