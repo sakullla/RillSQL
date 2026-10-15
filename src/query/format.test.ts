@@ -52,6 +52,26 @@ describe("sql formatting", () => {
     if (!dollar.ok) expect(dollar.reason).toContain("dollar-quote");
   });
 
+  it("keeps unicode identifiers, numeric literals and multi-character operators intact", () => {
+    const sql = "select 状态, 1e10, 1.5E-3, 1E+10, 0xFFa, X'Ab', id::text, doc->'k', doc->>'v' -- 状态 1e10 ::\nfrom t";
+    const result = formatSql(sql);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.sql).toContain("状态");
+    expect(result.sql).not.toMatch(/状\s+态/);
+    for (const literal of ["1e10", "1.5E-3", "1E+10", "0xFFa", "X'Ab'", "::", "->>", "'k'", "'v'", "-- 状态 1e10 ::"]) {
+      expect(result.sql).toContain(literal);
+    }
+    expect(result.sql).not.toMatch(/1\s+e/);
+    expect(result.sql).not.toMatch(/0\s+x/i);
+    expect(result.sql).not.toMatch(/:\s+:/);
+    expect(result.sql).not.toMatch(/-\s+>/);
+    expect(result.sql.startsWith("SELECT\n")).toBe(true);
+    expect(result.sql).toContain("\nFROM\n");
+    const open = formatSql("select 状态 'abc");
+    expect(open).toMatchObject({ ok: false, sql: "select 状态 'abc" });
+  });
+
   it("formats only the selection and keeps the surrounding text", () => {
     const sql = "select  1;\nselect   2;";
     const from = sql.indexOf("select   2;");

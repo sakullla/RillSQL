@@ -58,6 +58,75 @@ function dollarTag(sql: string, start: number): string | null {
   return null;
 }
 
+function codePointAt(sql: string, index: number): { ch: string; next: number } {
+  const cp = sql.codePointAt(index);
+  if (cp === undefined) return { ch: "", next: index + 1 };
+  const ch = String.fromCodePoint(cp);
+  return { ch, next: index + ch.length };
+}
+
+function isIdentStart(ch: string): boolean {
+  return ch === "_" || /^\p{L}$/u.test(ch);
+}
+
+function isIdentCont(ch: string): boolean {
+  return ch === "_" || /^[\p{L}\p{Nd}\p{M}]$/u.test(ch);
+}
+
+/** 从 start 读取一个 SQL 标识符；引号、注释和数值不在这里处理。 */
+export function sqlWordAt(sql: string, start: number): { text: string; end: number } | null {
+  const first = codePointAt(sql, start);
+  if (!isIdentStart(first.ch)) return null;
+  let end = first.next;
+  while (end < sql.length) {
+    const cont = codePointAt(sql, end);
+    if (!isIdentCont(cont.ch)) break;
+    end = cont.next;
+  }
+  return { text: sql.slice(start, end), end };
+}
+
+function skipQuoted(sql: string, start: number): number {
+  const quote = sql[start] ?? "";
+  let j = start + 1;
+  while (j < sql.length) {
+    if (sql[j] === quote && sql[j + 1] === quote) {
+      j += 2;
+      continue;
+    }
+    if (sql[j] === quote) return j + 1;
+    j += 1;
+  }
+  return sql.length;
+}
+
+function scanNumber(sql: string, start: number): number | null {
+  const head = sql[start] ?? "";
+  if (!/\d/.test(head)) return null;
+  const hex = head === "0" && (sql[start + 1] === "x" || sql[start + 1] === "X") && /[0-9A-Fa-f]/.test(sql[start + 2] ?? "");
+  if (hex) {
+    let j = start + 3;
+    while (j < sql.length && /[0-9A-Fa-f]/.test(sql[j] ?? "")) j += 1;
+    return j;
+  }
+  let j = start + 1;
+  while (j < sql.length && /\d/.test(sql[j] ?? "")) j += 1;
+  if (sql[j] === "." && /\d/.test(sql[j + 1] ?? "")) {
+    j += 2;
+    while (j < sql.length && /\d/.test(sql[j] ?? "")) j += 1;
+  }
+  if (sql[j] === "e" || sql[j] === "E") {
+    let k = j + 1;
+    if (sql[k] === "+" || sql[k] === "-") k += 1;
+    if (/\d/.test(sql[k] ?? "")) {
+      k += 1;
+      while (k < sql.length && /\d/.test(sql[k] ?? "")) k += 1;
+      j = k;
+    }
+  }
+  return j;
+}
+
 function tokenize(sql: string): Tok[] {
   const tokens: Tok[] = [];
   let i = 0;
@@ -109,33 +178,39 @@ function tokenize(sql: string): Tok[] {
         continue;
       }
     }
-    if (/\d/.test(ch)) {
-      let j = i + 1;
-      while (j < sql.length && /\d/.test(sql[j] ?? "")) j += 1;
-      if (sql[j] === "." && /\d/.test(sql[j + 1] ?? "")) {
-        j += 2;
-        while (j < sql.length && /\d/.test(sql[j] ?? "")) j += 1;
-      }
+    if ((ch === "x" || ch === "X") && sql[i + 1] === "'") {
+      const j = skipQuoted(sql, i + 1);
       tokens.push({ kind: "number", text: sql.slice(i, j) });
       i = j;
       continue;
     }
-    if (/[A-Za-z_]/.test(ch)) {
-      let j = i + 1;
-      while (j < sql.length && /[A-Za-z0-9_]/.test(sql[j] ?? "")) j += 1;
-      const text = sql.slice(i, j);
-      tokens.push({ kind: "word", text, upper: text.toUpperCase() });
-      i = j;
+    const numberEnd = scanNumber(sql, i);
+    if (numberEnd !== null) {
+      tokens.push({ kind: "number", text: sql.slice(i, numberEnd) });
+      i = numberEnd;
+      continue;
+    }
+    const word = sqlWordAt(sql, i);
+    if (word) {
+      tokens.push({ kind: "word", text: word.text, upper: word.text.toUpperCase() });
+      i = word.end;
+      continue;
+    }
+    const three = sql.slice(i, i + 3);
+    if (three === "->>") {
+      tokens.push({ kind: "punct", text: three });
+      i += 3;
       continue;
     }
     const two = sql.slice(i, i + 2);
-    if (two === "<>" || two === "<=" || two === ">=" || two === "!=" || two === "||") {
+    if (two === "::" || two === "->" || two === "<>" || two === "<=" || two === ">=" || two === "!=" || two === "||") {
       tokens.push({ kind: "punct", text: two });
       i += 2;
       continue;
     }
-    tokens.push({ kind: "punct", text: ch });
-    i += 1;
+    const point = codePointAt(sql, i);
+    tokens.push({ kind: "punct", text: point.ch });
+    i = point.next;
   }
   return tokens;
 }

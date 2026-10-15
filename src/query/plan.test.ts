@@ -28,4 +28,30 @@ describe("execution plan selection", () => {
     expect(explainSql("postgres", "EXPLAIN ANALYZE SELECT 1")).toEqual({ ok: false, reason: "计划不使用 ANALYZE，没有发送这条语句。" });
     expect(explainSql("postgres", "EXPLAIN (ANALYZE) SELECT 1").ok).toBe(false);
   });
+
+  it("refuses ANALYZE anywhere after strings, identifiers and comments are removed", () => {
+    const reason = "计划不使用 ANALYZE，没有发送这条语句。";
+    for (const sql of [
+      "EXPLAIN(ANALYZE) SELECT 1",
+      "EXPLAIN (VERBOSE, ANALYZE) SELECT 1",
+      "EXPLAIN /*c*/ ANALYZE SELECT 1",
+    ]) {
+      expect(explainSql("postgres", sql)).toEqual({ ok: false, reason });
+      expect(explainSql("sqlite", sql)).toEqual({ ok: false, reason });
+    }
+    expect(explainSql("postgres", "EXPLAIN (VERBOSE) SELECT 1")).toEqual({ ok: true, sql: "EXPLAIN (VERBOSE) SELECT 1" });
+    expect(explainSql("sqlite", "SELECT status FROM orders")).toEqual({ ok: true, sql: "EXPLAIN QUERY PLAN SELECT status FROM orders" });
+    for (const sql of [
+      "SELECT 'ANALYZE' AS label",
+      'SELECT "ANALYZE"',
+      "SELECT `ANALYZE`",
+      "SELECT analyzed_at FROM t",
+      "SELECT 状态 FROM t",
+      "SELECT 1 /* ANALYZE */",
+      "SELECT 1 -- ANALYZE",
+      "SELECT $$ANALYZE$$",
+    ]) {
+      expect(explainSql("postgres", sql)).toEqual({ ok: true, sql: `EXPLAIN ${sql}` });
+    }
+  });
 });

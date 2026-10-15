@@ -707,4 +707,37 @@ describe("query editing", () => {
     expect(none.get("[role='alert']").text()).toContain("请选择执行目标");
     none.unmount();
   });
+
+  it("does not start a run when ANALYZE remains after strings, identifiers and comments", async () => {
+    replaceCatalog(catalogFixture());
+    const calls: string[] = [];
+    invoke.mockImplementation(async (command: string) => {
+      calls.push(command);
+      throw new Error("should not run");
+    });
+    for (const draft of [
+      "EXPLAIN(ANALYZE) SELECT 1",
+      "EXPLAIN (VERBOSE, ANALYZE) SELECT 1",
+      "EXPLAIN /*c*/ ANALYZE SELECT 1",
+    ]) {
+      const wrapper = mount(QueryTab, {
+        props: {
+          tabId: `query-plan-${draft.length}`,
+          draft,
+          connectionId: "atlas",
+          connectionName: "Atlas",
+          database: "atlas_dev",
+          engine: "postgres",
+          connectionStatus: "connected",
+          notice: null,
+        },
+      });
+      await nextTick();
+      await wrapper.get("[data-action='plan']").trigger("click");
+      await flushPromises();
+      expect(calls).toEqual([]);
+      expect(wrapper.get("[role='alert']").text()).toBe("计划不使用 ANALYZE，没有发送这条语句。");
+      wrapper.unmount();
+    }
+  });
 });

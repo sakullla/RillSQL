@@ -1,3 +1,4 @@
+import { sqlWordAt } from "./format";
 import { splitSql, statementAt } from "./split";
 
 export interface PlanSelection {
@@ -25,10 +26,76 @@ export function planStatement(sql: string, selection: PlanSelection): PlanPick {
   return { ok: true, statement: pieces[0]!.text };
 }
 
+function dollarEnd(sql: string, start: number): number | null {
+  const rest = sql.slice(start + 1);
+  const end = rest.indexOf("$");
+  if (end < 0) return null;
+  const tag = rest.slice(0, end);
+  if (!/^[A-Za-z0-9_]*$/.test(tag)) return null;
+  const marker = `$${tag}$`;
+  const close = sql.indexOf(marker, start + marker.length);
+  return close < 0 ? sql.length : close + marker.length;
+}
+
+function quotedEnd(sql: string, start: number): number {
+  const quote = sql[start] ?? "";
+  let j = start + 1;
+  while (j < sql.length) {
+    if (sql[j] === quote && sql[j + 1] === quote) {
+      j += 2;
+      continue;
+    }
+    if (sql[j] === quote) return j + 1;
+    j += 1;
+  }
+  return sql.length;
+}
+
+/** 去掉字符串、标识符和注释后，语句里仍有关键字 ANALYZE。 */
+function statementHasAnalyze(sql: string): boolean {
+  let i = 0;
+  while (i < sql.length) {
+    const ch = sql[i] ?? "";
+    if (/\s/.test(ch)) {
+      i += 1;
+      continue;
+    }
+    if (sql.startsWith("--", i)) {
+      i += 2;
+      while (i < sql.length && sql[i] !== "\n" && sql[i] !== "\r") i += 1;
+      continue;
+    }
+    if (sql.startsWith("/*", i)) {
+      const end = sql.indexOf("*/", i + 2);
+      i = end < 0 ? sql.length : end + 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      i = quotedEnd(sql, i);
+      continue;
+    }
+    if (ch === "$") {
+      const end = dollarEnd(sql, i);
+      if (end !== null) {
+        i = end;
+        continue;
+      }
+    }
+    const word = sqlWordAt(sql, i);
+    if (word) {
+      if (word.text.toUpperCase() === "ANALYZE") return true;
+      i = word.end;
+      continue;
+    }
+    i += 1;
+  }
+  return false;
+}
+
 /** PostgreSQL、MySQL、MariaDB 用 EXPLAIN；SQLite 用 EXPLAIN QUERY PLAN。不加 ANALYZE。 */
 export function explainSql(engine: string, statement: string): ExplainSql {
   const body = statement.trim().replace(/;\s*$/, "");
-  if (/^\s*explain\s+(analyze\b|\(\s*analyze\b)/i.test(body)) return { ok: false, reason: ANALYZE };
+  if (statementHasAnalyze(body)) return { ok: false, reason: ANALYZE };
   if (/^\s*explain\b/i.test(body)) {
     if (engine === "sqlite" && !/^\s*explain\s+query\s+plan\b/i.test(body)) {
       return { ok: true, sql: body.replace(/^\s*explain\b/i, "EXPLAIN QUERY PLAN") };
