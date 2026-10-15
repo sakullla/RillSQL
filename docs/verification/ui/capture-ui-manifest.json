@@ -1,5 +1,5 @@
 {
-  "capturedAt": "2026-10-14T12:14:32.647Z",
+  "capturedAt": "2026-10-15T00:01:08.141Z",
   "synthetic": true,
   "invocation": "node scripts/capture-ui.mjs",
   "previewUrl": "http://localhost:1420",
@@ -39,7 +39,7 @@
       "width": 1360,
       "height": 1000,
       "file": "welcome-light-1360.png",
-      "state": "已连接的 PostgreSQL 树和欢迎页"
+      "state": "欢迎页双主路径和已连接的资源管理器"
     },
     {
       "name": "connections",
@@ -48,7 +48,7 @@
       "width": 1360,
       "height": 1000,
       "file": "connections-light-1360.png",
-      "state": "已连接、未保存密码、SQLite 文件三种卡片"
+      "state": "已连接、每次询问密码、SQLite 文件三种卡片"
     },
     {
       "name": "connection-editor",
@@ -57,7 +57,7 @@
       "width": 1360,
       "height": 1000,
       "file": "connection-editor-light-1360.png",
-      "state": "PostgreSQL、TLS 验证和 SSH 路径"
+      "state": "直连必需项，高级选项按此连接展开"
     },
     {
       "name": "connection-ssh",
@@ -97,12 +97,12 @@
     },
     {
       "name": "export",
-      "title": "导出 CSV",
+      "title": "导出为 CSV",
       "theme": "light",
       "width": 1360,
       "height": 1000,
       "file": "export-light-1360.png",
-      "state": "已读取行和全表两种导出范围"
+      "state": "只导出已读取的行和全表两种范围"
     },
     {
       "name": "command-palette",
@@ -120,7 +120,7 @@
       "width": 1360,
       "height": 1000,
       "file": "shortcuts-light-1360.png",
-      "state": "全局、编辑器和表格快捷键"
+      "state": "全局、SQL 编辑器和表格快捷键"
     },
     {
       "name": "history",
@@ -138,7 +138,7 @@
       "width": 1360,
       "height": 1000,
       "file": "settings-light-1360.png",
-      "state": "外观、读取批量和关于"
+      "state": "外观、数据读取、本地数据和关于"
     },
     {
       "name": "welcome",
@@ -147,7 +147,7 @@
       "width": 1360,
       "height": 1000,
       "file": "welcome-dark-1360.png",
-      "state": "已连接的 PostgreSQL 树和欢迎页"
+      "state": "欢迎页双主路径和已连接的资源管理器"
     },
     {
       "name": "connections",
@@ -156,7 +156,7 @@
       "width": 1360,
       "height": 1000,
       "file": "connections-dark-1360.png",
-      "state": "已连接、未保存密码、SQLite 文件三种卡片"
+      "state": "已连接、每次询问密码、SQLite 文件三种卡片"
     },
     {
       "name": "connection-editor",
@@ -165,7 +165,7 @@
       "width": 1360,
       "height": 1000,
       "file": "connection-editor-dark-1360.png",
-      "state": "PostgreSQL、TLS 验证和 SSH 路径"
+      "state": "直连必需项，高级选项按此连接展开"
     },
     {
       "name": "connection-ssh",
@@ -205,12 +205,12 @@
     },
     {
       "name": "export",
-      "title": "导出 CSV",
+      "title": "导出为 CSV",
       "theme": "dark",
       "width": 1360,
       "height": 1000,
       "file": "export-dark-1360.png",
-      "state": "已读取行和全表两种导出范围"
+      "state": "只导出已读取的行和全表两种范围"
     },
     {
       "name": "command-palette",
@@ -228,7 +228,7 @@
       "width": 1360,
       "height": 1000,
       "file": "shortcuts-dark-1360.png",
-      "state": "全局、编辑器和表格快捷键"
+      "state": "全局、SQL 编辑器和表格快捷键"
     },
     {
       "name": "history",
@@ -246,7 +246,7 @@
       "width": 1360,
       "height": 1000,
       "file": "settings-dark-1360.png",
-      "state": "外观、读取批量和关于"
+      "state": "外观、数据读取、本地数据和关于"
     },
     {
       "name": "welcome",
@@ -255,7 +255,7 @@
       "width": 900,
       "height": 1000,
       "file": "welcome-light-900.png",
-      "state": "已连接的 PostgreSQL 树和欢迎页"
+      "state": "欢迎页双主路径和已连接的资源管理器"
     },
     {
       "name": "connections",
@@ -264,7 +264,7 @@
       "width": 900,
       "height": 1000,
       "file": "connections-light-900.png",
-      "state": "已连接、未保存密码、SQLite 文件三种卡片"
+      "state": "已连接、每次询问密码、SQLite 文件三种卡片"
     },
     {
       "name": "connection-editor",
@@ -273,7 +273,7 @@
       "width": 900,
       "height": 1000,
       "file": "connection-editor-light-900.png",
-      "state": "PostgreSQL、TLS 验证和 SSH 路径"
+      "state": "直连必需项，高级选项按此连接展开"
     },
     {
       "name": "connection-ssh",
@@ -313,12 +313,12 @@
     },
     {
       "name": "export",
-      "title": "导出 CSV",
+      "title": "导出为 CSV",
       "theme": "light",
       "width": 900,
       "height": 1000,
       "file": "export-light-900.png",
-      "state": "已读取行和全表两种导出范围"
+      "state": "只导出已读取的行和全表两种范围"
     },
     {
       "name": "command-palette",
@@ -336,7 +336,7 @@
       "width": 900,
       "height": 1000,
       "file": "shortcuts-light-900.png",
-      "state": "全局、编辑器和表格快捷键"
+      "state": "全局、SQL 编辑器和表格快捷键"
     },
     {
       "name": "history",
@@ -354,7 +354,7 @@
       "width": 900,
       "height": 1000,
       "file": "settings-light-900.png",
-      "state": "外观、读取批量和关于"
+      "state": "外观、数据读取、本地数据和关于"
     },
     {
       "name": "welcome",
@@ -363,7 +363,7 @@
       "width": 900,
       "height": 1000,
       "file": "welcome-dark-900.png",
-      "state": "已连接的 PostgreSQL 树和欢迎页"
+      "state": "欢迎页双主路径和已连接的资源管理器"
     },
     {
       "name": "connections",
@@ -372,7 +372,7 @@
       "width": 900,
       "height": 1000,
       "file": "connections-dark-900.png",
-      "state": "已连接、未保存密码、SQLite 文件三种卡片"
+      "state": "已连接、每次询问密码、SQLite 文件三种卡片"
     },
     {
       "name": "connection-editor",
@@ -381,7 +381,7 @@
       "width": 900,
       "height": 1000,
       "file": "connection-editor-dark-900.png",
-      "state": "PostgreSQL、TLS 验证和 SSH 路径"
+      "state": "直连必需项，高级选项按此连接展开"
     },
     {
       "name": "connection-ssh",
@@ -421,12 +421,12 @@
     },
     {
       "name": "export",
-      "title": "导出 CSV",
+      "title": "导出为 CSV",
       "theme": "dark",
       "width": 900,
       "height": 1000,
       "file": "export-dark-900.png",
-      "state": "已读取行和全表两种导出范围"
+      "state": "只导出已读取的行和全表两种范围"
     },
     {
       "name": "command-palette",
@@ -444,7 +444,7 @@
       "width": 900,
       "height": 1000,
       "file": "shortcuts-dark-900.png",
-      "state": "全局、编辑器和表格快捷键"
+      "state": "全局、SQL 编辑器和表格快捷键"
     },
     {
       "name": "history",
@@ -462,7 +462,7 @@
       "width": 900,
       "height": 1000,
       "file": "settings-dark-900.png",
-      "state": "外观、读取批量和关于"
+      "state": "外观、数据读取、本地数据和关于"
     },
     {
       "name": "welcome",
@@ -471,7 +471,7 @@
       "width": 640,
       "height": 1000,
       "file": "welcome-light-640.png",
-      "state": "已连接的 PostgreSQL 树和欢迎页"
+      "state": "欢迎页双主路径和已连接的资源管理器"
     },
     {
       "name": "connections",
@@ -480,7 +480,7 @@
       "width": 640,
       "height": 1000,
       "file": "connections-light-640.png",
-      "state": "已连接、未保存密码、SQLite 文件三种卡片"
+      "state": "已连接、每次询问密码、SQLite 文件三种卡片"
     },
     {
       "name": "connection-editor",
@@ -489,7 +489,7 @@
       "width": 640,
       "height": 1000,
       "file": "connection-editor-light-640.png",
-      "state": "PostgreSQL、TLS 验证和 SSH 路径"
+      "state": "直连必需项，高级选项按此连接展开"
     },
     {
       "name": "connection-ssh",
@@ -529,12 +529,12 @@
     },
     {
       "name": "export",
-      "title": "导出 CSV",
+      "title": "导出为 CSV",
       "theme": "light",
       "width": 640,
       "height": 1000,
       "file": "export-light-640.png",
-      "state": "已读取行和全表两种导出范围"
+      "state": "只导出已读取的行和全表两种范围"
     },
     {
       "name": "command-palette",
@@ -552,7 +552,7 @@
       "width": 640,
       "height": 1000,
       "file": "shortcuts-light-640.png",
-      "state": "全局、编辑器和表格快捷键"
+      "state": "全局、SQL 编辑器和表格快捷键"
     },
     {
       "name": "history",
@@ -570,7 +570,7 @@
       "width": 640,
       "height": 1000,
       "file": "settings-light-640.png",
-      "state": "外观、读取批量和关于"
+      "state": "外观、数据读取、本地数据和关于"
     },
     {
       "name": "welcome",
@@ -579,7 +579,7 @@
       "width": 640,
       "height": 1000,
       "file": "welcome-dark-640.png",
-      "state": "已连接的 PostgreSQL 树和欢迎页"
+      "state": "欢迎页双主路径和已连接的资源管理器"
     },
     {
       "name": "connections",
@@ -588,7 +588,7 @@
       "width": 640,
       "height": 1000,
       "file": "connections-dark-640.png",
-      "state": "已连接、未保存密码、SQLite 文件三种卡片"
+      "state": "已连接、每次询问密码、SQLite 文件三种卡片"
     },
     {
       "name": "connection-editor",
@@ -597,7 +597,7 @@
       "width": 640,
       "height": 1000,
       "file": "connection-editor-dark-640.png",
-      "state": "PostgreSQL、TLS 验证和 SSH 路径"
+      "state": "直连必需项，高级选项按此连接展开"
     },
     {
       "name": "connection-ssh",
@@ -637,12 +637,12 @@
     },
     {
       "name": "export",
-      "title": "导出 CSV",
+      "title": "导出为 CSV",
       "theme": "dark",
       "width": 640,
       "height": 1000,
       "file": "export-dark-640.png",
-      "state": "已读取行和全表两种导出范围"
+      "state": "只导出已读取的行和全表两种范围"
     },
     {
       "name": "command-palette",
@@ -660,7 +660,7 @@
       "width": 640,
       "height": 1000,
       "file": "shortcuts-dark-640.png",
-      "state": "全局、编辑器和表格快捷键"
+      "state": "全局、SQL 编辑器和表格快捷键"
     },
     {
       "name": "history",
@@ -678,7 +678,7 @@
       "width": 640,
       "height": 1000,
       "file": "settings-dark-640.png",
-      "state": "外观、读取批量和关于"
+      "state": "外观、数据读取、本地数据和关于"
     }
   ],
   "failures": []

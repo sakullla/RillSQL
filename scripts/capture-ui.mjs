@@ -11,7 +11,7 @@ const scenarioTitles = {
   query: "查询结果",
   "data-grid": "数据表格",
   structure: "表结构",
-  export: "导出 CSV",
+  export: "导出为 CSV",
   history: "查询历史",
   settings: "设置",
   "command-palette": "命令面板",
@@ -268,9 +268,9 @@ function installSyntheticIpc(initialTheme) {
         fingerprint: null,
         algorithm: null,
         stages: [
-          { kind: "file", label: "打开文件", status: "ok", message: connection.filePath },
-          { kind: "schema", label: "读取 schema", status: "ok", message: "1 张表" },
-          { kind: "fk", label: "检查 foreign_keys", status: "ok", message: "ON" },
+          { kind: "open_file", label: "打开文件", status: "ok", message: connection.filePath },
+          { kind: "read_schema", label: "读取表结构清单", status: "ok", message: "1 张表" },
+          { kind: "foreign_keys", label: "检查外键设置", status: "ok", message: "ON" },
         ],
       };
     }
@@ -282,12 +282,12 @@ function installSyntheticIpc(initialTheme) {
       fingerprint: null,
       algorithm: null,
       stages: [
-        { kind: "ssh-host", label: "SSH 主机身份", status: "ok", message: "主机密钥与已保存指纹一致" },
-        { kind: "ssh-auth", label: "SSH 认证", status: "ok", message: "私钥认证通过" },
-        { kind: "tunnel", label: "建立隧道", status: "ok", message: "已另开一条到数据库的通道" },
-        { kind: "tls", label: "TLS 握手与证书验证", status: "ok", message: "证书主机名仍是 db.internal" },
-        { kind: "auth", label: "数据库认证", status: "ok", message: "已登录 reader" },
-        { kind: "version", label: "读取服务器版本", status: "ok", message: "PostgreSQL 16.4" },
+        { kind: "ssh_host_identity", label: "确认 SSH 跳板机身份", status: "ok", message: "主机密钥与已保存指纹一致" },
+        { kind: "ssh_authentication", label: "登录 SSH 跳板机", status: "ok", message: "私钥认证通过" },
+        { kind: "tunnel", label: "通过 SSH 跳板机打通到数据库的通道", status: "ok", message: "已另开一条到数据库的通道" },
+        { kind: "tls", label: "加密连接并核对证书", status: "ok", message: "证书主机名仍是 db.internal" },
+        { kind: "database_authentication", label: "登录数据库", status: "ok", message: "已登录 reader" },
+        { kind: "server_version", label: "读取数据库版本", status: "ok", message: "PostgreSQL 16.4" },
       ],
     };
   }
@@ -481,6 +481,13 @@ async function collapseOverlay(page, width) {
   await expect(root).toHaveClass(/sidebar-hidden/);
 }
 
+/** 连接编辑对话框的高级选项默认折叠；取 SSH 字段前先展开。 */
+async function expandEditorAdvanced(page) {
+  const advanced = page.locator("details.ce-advanced");
+  if (!(await advanced.evaluate((element) => element.open))) await advanced.locator("summary").click();
+  await expect(advanced).toHaveAttribute("open", "");
+}
+
 const browser = await chromium.launch();
 try {
   for (const width of widths) {
@@ -492,7 +499,7 @@ try {
       try {
         await page.goto(previewUrl);
         await page.locator("[data-object='orders']").waitFor();
-        await captureImage(page, "welcome", theme, width, "已连接的 PostgreSQL 树和欢迎页");
+        await captureImage(page, "welcome", theme, width, "欢迎页双主路径和已连接的资源管理器");
 
         await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "连接" }).click();
         await page.getByRole("heading", { name: "连接管理" }).waitFor();
@@ -503,14 +510,15 @@ try {
         await expect(postgres).toContainText("已连接");
         await expect(sqlite).toContainText("已连接");
         await expect(page.locator("article.conn-card", { hasText: "库存 · 本地" })).toContainText("未连接");
-        await captureImage(page, "connections", theme, width, "已连接、未保存密码、SQLite 文件三种卡片");
+        await captureImage(page, "connections", theme, width, "已连接、每次询问密码、SQLite 文件三种卡片");
 
         await postgres.getByRole("button", { name: "书店 · 开发 的更多操作" }).click();
         await postgres.getByRole("button", { name: "编辑配置…" }).click();
         await page.getByRole("heading", { name: /编辑连接/ }).waitFor();
         await expect(page.locator("[data-field='host']")).toHaveValue("db.internal");
-        await captureImage(page, "connection-editor", theme, width, "PostgreSQL、TLS 验证和 SSH 路径");
-        await page.getByRole("button", { name: /SSH 隧道/ }).click();
+        await captureImage(page, "connection-editor", theme, width, "直连必需项，高级选项按此连接展开");
+        await expandEditorAdvanced(page);
+        await page.locator("[data-field='sshHost']").scrollIntoViewIfNeeded();
         await expect(page.locator("[data-field='sshHost']")).toHaveValue("bastion.internal");
         await captureImage(page, "connection-ssh", theme, width, "单跳隧道和已信任的主机密钥");
         await page.getByRole("button", { name: "关闭", exact: true }).click();
@@ -518,20 +526,20 @@ try {
 
         await openWorkspace(page);
         await collapseOverlay(page, width);
-        await page.locator(".wl-item", { hasText: "新建查询" }).click();
+        await page.getByRole("button", { name: "新建查询" }).click();
         await collapseOverlay(page, width);
-        await page.getByLabel("执行目标").selectOption({ label: "书店 · 开发 / bookstore" });
+        await page.locator("[data-action='target']").click();
+        await page.getByRole("listbox", { name: "执行目标" }).getByRole("option", { name: /书店 · 开发.*bookstore/ }).click();
         await page.locator(".cm-content").click();
         await page.keyboard.insertText("select id, customer, status, total\nfrom orders\nwhere status <> 'cancelled';");
         await page.locator("[data-action='run']").click();
-        await page.getByLabel("查询结果").waitFor();
-        await expect(page.getByLabel("查询结果")).toContainText("林夏");
+        await expect(page.getByLabel("执行结果")).toContainText("林夏");
         await captureImage(page, "query", theme, width, "选择执行目标后的查询结果");
 
         await page.getByRole("button", { name: "打开命令面板" }).click();
         const palette = page.getByRole("dialog", { name: "命令面板" });
         await palette.getByRole("combobox").fill("orders");
-        await palette.getByRole("option", { name: /orders/ }).click();
+        await palette.getByRole("option", { name: /^orders/ }).click();
         await collapseOverlay(page, width);
         await expect(page.getByLabel("数据表格")).toContainText("林夏");
         await captureImage(page, "data-grid", theme, width, "orders 已读取的三行，含 NULL");
@@ -543,10 +551,10 @@ try {
 
         await page.getByRole("tab", { name: "数据", exact: true }).click();
         await page.getByLabel("数据表格").getByRole("button", { name: "导出", exact: true }).click();
-        await page.getByRole("dialog", { name: "导出 CSV" }).waitFor();
-        await expect(page.getByRole("dialog", { name: "导出 CSV" })).toContainText("CSV 是数据导出，不是数据库备份。");
-        await captureImage(page, "export", theme, width, "已读取行和全表两种导出范围");
-        await page.getByRole("dialog", { name: "导出 CSV" }).getByRole("button", { name: "关闭", exact: true }).click();
+        await page.getByRole("dialog", { name: "导出为 CSV" }).waitFor();
+        await expect(page.getByRole("dialog", { name: "导出为 CSV" })).toContainText("CSV 只是数据导出，不是数据库备份");
+        await captureImage(page, "export", theme, width, "只导出已读取的行和全表两种范围");
+        await page.getByRole("dialog", { name: "导出为 CSV" }).getByRole("button", { name: "关闭", exact: true }).click();
 
         await page.getByRole("button", { name: "打开命令面板" }).click();
         await page.getByRole("dialog", { name: "命令面板" }).waitFor();
@@ -554,17 +562,17 @@ try {
         await page.keyboard.press("Escape");
         await page.getByRole("button", { name: "快捷键与帮助" }).click();
         await page.getByRole("heading", { name: "键盘快捷键" }).waitFor();
-        await captureImage(page, "shortcuts", theme, width, "全局、编辑器和表格快捷键");
+        await captureImage(page, "shortcuts", theme, width, "全局、SQL 编辑器和表格快捷键");
         await page.getByRole("button", { name: "知道了", exact: true }).click();
 
         await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "查询历史" }).click();
         await expect(page.getByRole("heading", { name: "查询历史" })).toBeVisible();
-        await expect(page.locator(".hist-list")).toContainText("原连接已删除");
+        await expect(page.locator(".hist-card", { hasText: "旧报表库" })).toContainText("原连接已删除");
         await captureImage(page, "history", theme, width, "成功、失败，以及原连接已删除");
 
         await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "设置" }).click();
         await page.getByLabel("编辑器字号").waitFor();
-        await captureImage(page, "settings", theme, width, "外观、读取批量和关于");
+        await captureImage(page, "settings", theme, width, "外观、数据读取、本地数据和关于");
       } catch (error) {
         const calls = await page.evaluate(() => (window.__uiCalls ?? []).slice(-8).map((call) => call.command)).catch(() => []);
         failures.push({ type: "scenario", theme, width, message: error instanceof Error ? error.message : String(error), calls });
