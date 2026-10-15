@@ -22,6 +22,11 @@ export interface OpenPlan {
   execute: false;
 }
 
+/** 原连接已不在目录中时，编辑器要写出这句话，并且这次打开不执行。 */
+export function deletedConnectionNotice(): string {
+  return "需要重新选择执行目标。原来的连接已删除，这次只载入 SQL，不会执行。";
+}
+
 export function openPlan(entry: HistoryEntry, knownIds: ReadonlySet<string>): OpenPlan {
   const exists = knownIds.has(entry.connectionId);
   return {

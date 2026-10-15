@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, shallowRef, watch } from "vue";
+import { computed, nextTick, onMounted, ref, shallowRef, watch } from "vue";
 import { catalogConnections } from "../catalog/store";
-import { queryHistory, queryHistoryClear } from "./api";
+import { queryHistory, queryHistoryClear, querySavedDelete, querySavedList, querySavedRename, querySavedSave } from "./api";
 import {
   elapsedLabel,
   filterHistory,
@@ -13,8 +13,17 @@ import {
   type HistoryEntry,
   type OpenPlan,
 } from "./plan";
+import { filterSaved, openSaved, savedName, savedNameError, savedNeedsTarget, type SavedDraft, type SavedQuery } from "./saved";
 
-const emit = defineEmits<{ open: [plan: OpenPlan] }>();
+const props = withDefaults(
+  defineProps<{
+    section?: "runs" | "saved";
+    currentDraft?: SavedDraft | null;
+    saveRequest?: number;
+  }>(),
+  { section: "runs", currentDraft: null, saveRequest: 0 },
+);
+const emit = defineEmits<{ open: [plan: OpenPlan]; "update:section": [section: "runs" | "saved"] }>();
 const entries = shallowRef<HistoryEntry[]>([]);
 const loading = ref(true);
 const loadError = ref("");
@@ -27,11 +36,38 @@ const visible = computed(() => filterHistory(entries.value, { text: text.value, 
 const page = ref(1);
 const selectedId = ref<string | null>(null);
 const confirmingClear = ref(false);
+const section = ref<"runs" | "saved">(props.section);
+const savedEntries = shallowRef<SavedQuery[]>([]);
+const savedLoading = ref(false);
+const savedError = ref("");
+const savedText = ref("");
+const saveName = ref("");
+const saveError = ref("");
+const saveMessage = ref("");
+const actionError = ref("");
+const renamingId = ref<string | null>(null);
+const renameValue = ref("");
+const renameError = ref("");
+const pendingDeleteId = ref<string | null>(null);
+const nameInput = ref<HTMLInputElement | null>(null);
 const pageSize = 30;
 const pageCount = computed(() => Math.max(1, Math.ceil(visible.value.length / pageSize)));
 const groups = computed(() => groupHistoryByDay(visible.value.slice((page.value - 1) * pageSize, page.value * pageSize)));
 const selected = computed(() => visible.value.find(item => item.id === selectedId.value) ?? visible.value[0] ?? null);
+const savedVisible = computed(() => filterSaved(savedEntries.value, savedText.value));
+const nameWillUpdate = computed(() => {
+  const name = savedName(saveName.value);
+  return name !== "" && savedEntries.value.some((item) => item.name === name);
+});
 watch([text, connectionId, status], () => { page.value = 1; selectedId.value = null; });
+watch(() => props.section, (value) => {
+  if (section.value !== value) showSection(value);
+});
+watch(() => props.saveRequest, (value, previous) => {
+  if (!value || value === previous) return;
+  showSection("saved");
+  void nextTick(() => nameInput.value?.focus());
+});
 const connectionChoices = computed(() => {
   const seen = new Map<string, string>();
   for (const entry of entries.value) seen.set(entry.connectionId, entry.connectionName);
@@ -69,8 +105,106 @@ function open(entry: HistoryEntry) {
   emit("open", openPlan(entry, knownIds.value));
 }
 
+function messageOf(err: unknown, fallback: string): string {
+  if (typeof err === "string" && err) return err;
+  if (err instanceof Error && err.message) return err.message;
+  return fallback;
+}
+
+function showSection(next: "runs" | "saved") {
+  section.value = next;
+  emit("update:section", next);
+  if (next === "saved") void loadSaved();
+}
+
+async function loadSaved() {
+  savedLoading.value = true;
+  try {
+    savedEntries.value = await querySavedList();
+    savedError.value = "";
+    if (pendingDeleteId.value && !savedEntries.value.some((item) => item.id === pendingDeleteId.value)) pendingDeleteId.value = null;
+  } catch (err) {
+    savedError.value = messageOf(err, "读不了保存的查询");
+  } finally {
+    savedLoading.value = false;
+  }
+}
+
+async function saveCurrent() {
+  saveError.value = "";
+  saveMessage.value = "";
+  const draft = props.currentDraft;
+  if (!draft) {
+    saveError.value = "先打开一个查询标签，再保存其中的 SQL。";
+    return;
+  }
+  const nameError = savedNameError(saveName.value);
+  if (nameError) {
+    saveError.value = nameError;
+    return;
+  }
+  const name = savedName(saveName.value);
+  try {
+    const written = await querySavedSave({
+      name,
+      sql: draft.sql,
+      connectionId: draft.connectionId,
+      connectionName: draft.connectionName,
+      databaseName: draft.databaseName,
+      engine: draft.engine,
+    });
+    saveMessage.value = written.created
+      ? `已保存「${written.query.name}」。没有执行，也没有写入执行历史。`
+      : `已更新「${written.query.name}」。没有执行，也没有写入执行历史。`;
+    saveName.value = "";
+    await loadSaved();
+  } catch (err) {
+    saveError.value = messageOf(err, "存不了这条查询");
+  }
+}
+
+function startRename(entry: SavedQuery) {
+  renamingId.value = entry.id;
+  renameValue.value = entry.name;
+  renameError.value = "";
+  pendingDeleteId.value = null;
+}
+
+async function confirmRename(entry: SavedQuery) {
+  const nameError = savedNameError(renameValue.value);
+  if (nameError) {
+    renameError.value = nameError;
+    return;
+  }
+  renameError.value = "";
+  try {
+    await querySavedRename(entry.id, savedName(renameValue.value));
+    renamingId.value = null;
+    await loadSaved();
+  } catch (err) {
+    renameError.value = messageOf(err, "改不了这个名称");
+  }
+}
+
+async function confirmDelete(entry: SavedQuery) {
+  actionError.value = "";
+  try {
+    await querySavedDelete(entry.id);
+    pendingDeleteId.value = null;
+    renamingId.value = null;
+    await loadSaved();
+  } catch (err) {
+    actionError.value = messageOf(err, "删不了保存的查询");
+  }
+}
+
+function openSavedItem(entry: SavedQuery) {
+  emit("open", openSaved(entry, knownIds.value));
+}
+
 onMounted(() => {
   void load();
+  if (section.value === "saved") void loadSaved();
 });
 </script>
 
@@ -79,12 +213,19 @@ onMounted(() => {
     <div class="page-inner">
       <div class="page-head">
         <div>
-          <div class="eyebrow">QUERY HISTORY</div><h1>查询历史</h1>
-          <p>找回执行过的 SQL，检查结果，再回到编辑器继续工作。</p>
+          <div class="eyebrow">{{ section === "saved" ? "SAVED QUERIES" : "QUERY HISTORY" }}</div>
+          <h1>{{ section === "saved" ? "保存的查询" : "查询历史" }}</h1>
+          <p v-if="section === 'saved'">按名称保存当前 SQL。打开只载入 SQL 和还在的执行目标，不会执行，也不会写入执行历史。</p>
+          <p v-else>找回执行过的 SQL，检查结果，再回到编辑器继续工作。</p>
+          <div class="hist-switch" role="tablist" aria-label="历史与保存的查询">
+            <button class="btn sm" :class="{ primary: section === 'runs' }" type="button" role="tab" :aria-selected="section === 'runs'" data-action="show-history" @click="showSection('runs')">执行历史</button>
+            <button class="btn sm" :class="{ primary: section === 'saved' }" type="button" role="tab" :aria-selected="section === 'saved'" data-action="show-saved" @click="showSection('saved')">保存的查询</button>
+          </div>
         </div>
-        <button class="btn danger" type="button" data-action="clear-history" :disabled="!entries.length" @click="confirmingClear = true">清空历史</button>
+        <button v-if="section === 'runs'" class="btn danger" type="button" data-action="clear-history" :disabled="!entries.length" @click="confirmingClear = true">清空历史</button>
       </div>
 
+      <template v-if="section === 'runs'">
       <div v-if="confirmingClear" class="hist-clear" role="alert"><span>清空本机的全部查询历史？此操作无法撤销。</span><button class="btn sm" @click="confirmingClear = false">取消</button><button class="btn sm danger" data-action="confirm-clear-history" @click="clearHistory">确认清空</button></div>
       <div class="hist-filters">
         <input v-model="text" type="search" aria-label="搜索历史" placeholder="搜索 SQL 或连接名" />
@@ -141,6 +282,63 @@ onMounted(() => {
       </div>
       <aside v-if="selected" class="history-inspector"><div class="inspector-head"><span>SQL 预览</span><span class="badge" :class="statusBadge(selected.status)">{{ statusLabel(selected.status) }}</span></div><dl><dt>连接</dt><dd>{{ selected.connectionName }}</dd><dt>数据库</dt><dd>{{ selected.databaseName || 'main' }}</dd><dt>执行耗时</dt><dd>{{ elapsedLabel(selected.elapsedMs) || '—' }}</dd></dl><pre>{{ selected.sql }}</pre><p>{{ selected.summary }}</p><button class="btn primary" @click="open(selected)">载入编辑器</button><small>只载入 SQL，不会执行。</small></aside>
       </div>
+      </template>
+
+      <section v-else class="saved-panel" aria-label="保存的查询">
+        <form class="saved-form" @submit.prevent="saveCurrent">
+          <label>名称<input ref="nameInput" v-model="saveName" type="text" aria-label="保存查询的名称" data-action="saved-name" :disabled="!currentDraft" /></label>
+          <p v-if="!currentDraft">先打开一个查询标签，再保存其中的 SQL。</p>
+          <template v-else>
+            <p>保存当前编辑器中的 SQL<span v-if="currentDraft.connectionName">，并记住 {{ currentDraft.connectionName }} / {{ currentDraft.databaseName || "main" }}</span><span v-else>。还没有执行目标，打开时需要重新选择</span>。保存不会执行。</p>
+            <pre class="saved-sql">{{ currentDraft.sql }}</pre>
+          </template>
+          <p v-if="nameWillUpdate">这个名称已存在，保存会更新它的 SQL，不会执行。</p>
+          <p v-if="saveMessage" role="status">{{ saveMessage }}</p>
+          <p v-if="saveError" class="saved-alert" role="alert">{{ saveError }}</p>
+          <button class="btn primary" type="submit" data-action="save-named-query" :disabled="!currentDraft">保存</button>
+        </form>
+
+        <div class="hist-filters">
+          <input v-model="savedText" type="search" aria-label="按名称查找" placeholder="按名称查找" />
+        </div>
+        <p v-if="actionError" class="saved-alert" role="alert">{{ actionError }}</p>
+        <div v-if="savedError" class="hist-error" role="alert">
+          <p>保存的查询没有读出来：{{ savedError }}</p>
+          <button class="btn sm" type="button" data-action="retry-saved" @click="loadSaved">重试</button>
+        </div>
+        <div v-else-if="savedLoading" class="empty"><p>正在读取保存的查询…</p></div>
+        <div v-else-if="!savedVisible.length" class="empty">
+          <h3>{{ savedEntries.length ? "没有匹配的名称" : "还没有保存的查询" }}</h3>
+          <p>{{ savedEntries.length ? "换个名称试试。" : "为当前 SQL 起一个名称后，它会出现在这里。" }}</p>
+        </div>
+        <ul v-else class="hist-list saved-list">
+          <li v-for="item in savedVisible" :key="item.id" class="hist-card">
+            <div class="hist-top">
+              <strong>{{ item.name }}</strong>
+              <span class="muted sm">{{ item.connectionName ? `${item.connectionName} / ${item.databaseName || "main"}` : "未记录执行目标" }}</span>
+              <span v-if="savedNeedsTarget(item, knownIds)" class="badge warn">需要重新选择执行目标</span>
+            </div>
+            <pre class="saved-sql">{{ item.sql }}</pre>
+            <div class="hist-foot">
+              <button class="btn sm" type="button" data-action="open-saved" @click="openSavedItem(item)">打开</button>
+              <button v-if="renamingId !== item.id" class="btn sm" type="button" data-action="rename-saved" @click="startRename(item)">重命名</button>
+              <button v-if="pendingDeleteId !== item.id" class="btn sm" type="button" data-action="delete-saved" @click="pendingDeleteId = item.id">删除</button>
+              <span class="muted sm">打开只载入 SQL，不会执行。</span>
+            </div>
+            <form v-if="renamingId === item.id" class="saved-rename" @submit.prevent="confirmRename(item)">
+              <input v-model="renameValue" type="text" :aria-label="`重命名 ${item.name}`" />
+              <button class="btn sm" type="button" data-action="cancel-rename-saved" @click="renamingId = null">取消</button>
+              <button class="btn sm primary" type="submit" data-action="confirm-rename-saved">确认重命名</button>
+              <p v-if="renameError" class="saved-alert" role="alert">{{ renameError }}</p>
+            </form>
+            <div v-if="pendingDeleteId === item.id" class="hist-clear" role="alert">
+              <span>删除「{{ item.name }}」？取消后它仍留在列表里。</span>
+              <button class="btn sm" type="button" data-action="cancel-delete-saved" @click="pendingDeleteId = null">取消</button>
+              <button class="btn sm danger" type="button" data-action="confirm-delete-saved" @click="confirmDelete(item)">确认删除</button>
+            </div>
+          </li>
+        </ul>
+      </section>
     </div>
   </div>
 </template>
@@ -182,5 +380,12 @@ onMounted(() => {
 .history-inspector p { font-size: 12px; color: var(--text-2); }
 .history-inspector small { display: block; margin-top: 12px; font-size: 11px; color: var(--text-3); }
 .history-pagination { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--text-2); }
+.hist-switch { display: flex; gap: var(--sp-2); margin-top: var(--sp-3); }
+.saved-form { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-3); margin: var(--sp-4) 0; }
+.saved-form label { display: flex; flex-direction: column; gap: var(--sp-2); font-size: var(--fs-sm); }
+.saved-sql { white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: var(--fs-sm); line-height: var(--lh); background: var(--sunken); border-radius: var(--r); padding: var(--sp-2) var(--sp-3); margin: var(--sp-2) 0; max-width: 100%; }
+.saved-alert { margin: 0; color: var(--err); }
+.saved-rename { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; margin-top: var(--sp-2); }
+.saved-list { margin-top: var(--sp-3); }
 @media (max-width: 900px) { .history-layout { grid-template-columns: 1fr; } .history-inspector { position: static; grid-row: 1; } .history-inspector pre { max-height: 160px; } }
 </style>

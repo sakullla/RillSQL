@@ -21,6 +21,8 @@ export interface ShellActions {
   setTheme: (theme: ThemePreference) => void;
   openHelp: () => void;
   requestSqlite: () => void;
+  saveQuery: () => void;
+  showSavedQueries: () => void;
 }
 
 export function shellCommands(actions: ShellActions): PaletteItem[] {
@@ -30,6 +32,8 @@ export function shellCommands(actions: ShellActions): PaletteItem[] {
     { id: "new-connection", group: "命令", label: "新建连接", icon: "plus", run: () => actions.showPage("connections") },
     { id: "open-sqlite", group: "命令", label: "打开 SQLite 文件", icon: "file", run: actions.requestSqlite },
     { id: "history", group: "命令", label: "查询历史", icon: "history", run: () => actions.showPage("history") },
+    { id: "save-query", group: "命令", label: "保存当前查询", icon: "file", run: actions.saveQuery },
+    { id: "saved-queries", group: "命令", label: "保存的查询", icon: "code", run: actions.showSavedQueries },
     { id: "connections", group: "命令", label: "连接管理", icon: "database", run: () => actions.showPage("connections") },
     { id: "settings", group: "命令", label: "设置", icon: "sliders", chord: "Mod+,", run: () => actions.showPage("settings") },
     { id: "sidebar", group: "命令", label: "显示 / 隐藏资源管理器", icon: "sidebar", chord: "Mod+B", run: actions.toggleSidebar },

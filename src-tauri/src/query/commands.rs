@@ -14,6 +14,7 @@ use crate::connections::{CancelTransport, CatalogSession, Service};
 use super::cancel::{self, CancelView};
 use super::exec::{self, StatementReport};
 use super::history::{HistoryDraft, HistoryEntry, HistoryStore};
+use super::saved::{RenameRequest, SaveRequest, SavedQuery, SavedWrite};
 use super::split::split_sql;
 
 #[derive(Clone)]
@@ -362,4 +363,24 @@ pub async fn query_history(query: tauri::State<'_, QueryState>) -> Result<Vec<Hi
 #[tauri::command]
 pub async fn query_history_clear(query: tauri::State<'_, QueryState>) -> Result<(), String> {
     query.history().await?.clear().await
+}
+
+#[tauri::command]
+pub async fn query_saved_list(query: tauri::State<'_, QueryState>) -> Result<Vec<SavedQuery>, String> {
+    query.history().await?.list_saved().await
+}
+
+#[tauri::command]
+pub async fn query_saved_save(query: tauri::State<'_, QueryState>, request: SaveRequest) -> Result<SavedWrite, String> {
+    query.history().await?.save_named(&request).await
+}
+
+#[tauri::command]
+pub async fn query_saved_rename(query: tauri::State<'_, QueryState>, request: RenameRequest) -> Result<SavedQuery, String> {
+    query.history().await?.rename_saved(&request).await
+}
+
+#[tauri::command]
+pub async fn query_saved_delete(query: tauri::State<'_, QueryState>, id: String) -> Result<(), String> {
+    query.history().await?.delete_saved(&id).await
 }

@@ -4,7 +4,8 @@ import { listPaletteTables, startCatalog } from "../catalog";
 import { objectIdentity, type CatalogObjectRef } from "../catalog/object-ref";
 import { catalogConnections } from "../catalog/store";
 import { listPaletteConnections } from "../connections";
-import type { OpenPlan } from "../history/plan";
+import type { SavedDraft } from "../history/saved";
+import { deletedConnectionNotice, type OpenPlan } from "../history/plan";
 import { attachCloser, guardClose } from "../query/runtime";
 import { parseHash } from "../router";
 import ActivityRail from "./ActivityRail.vue";
@@ -47,7 +48,7 @@ function onHistoryOpen(plan: OpenPlan) {
       engine: null,
       status: null,
       needsTarget: true,
-      notice: "原来的连接已删除——在查询里重新选择一个连接和库后再执行。",
+      notice: deletedConnectionNotice(),
     });
     return;
   }
@@ -65,6 +66,20 @@ function onHistoryOpen(plan: OpenPlan) {
 const settings = reactive<ShellSettings>(loadSettings());
 const dataDir = ref<string | null>(null);
 const sqlitePrompt = ref(0);
+
+const historySection = ref<"runs" | "saved">("runs");
+const saveRequest = ref(0);
+const currentSavedDraft = computed<SavedDraft | null>(() => {
+  const tab = session.activeTab.value;
+  if (!tab || tab.kind !== "query") return null;
+  return {
+    sql: tab.draft,
+    connectionId: tab.connectionId ?? "",
+    connectionName: tab.connectionName ?? "",
+    databaseName: tab.database ?? "",
+    engine: tab.engine ?? "",
+  };
+});
 
 const commands = computed<PaletteItem[]>(() => [
   ...listPaletteTables().map((table) => ({
@@ -86,11 +101,23 @@ const commands = computed<PaletteItem[]>(() => [
   ...shellCommands({
     openQuery: session.openQuery,
     openStructure: () => session.openStructure(STRUCTURE_PLACEHOLDER),
-    showPage: session.showPage,
+    showPage: (page) => {
+      if (page === "history") historySection.value = "runs";
+      session.showPage(page);
+    },
     toggleSidebar: session.toggleSidebar,
     setTheme,
     openHelp: session.openHelp,
     requestSqlite,
+    saveQuery: () => {
+      historySection.value = "saved";
+      saveRequest.value += 1;
+      session.showPage("history");
+    },
+    showSavedQueries: () => {
+      historySection.value = "saved";
+      session.showPage("history");
+    },
   }),
 ]);
 
@@ -156,6 +183,7 @@ function onNavigate(page: AppPage) {
     session.toggleSidebar();
     return;
   }
+  if (page === "history") historySection.value = "runs";
   session.showPage(page);
 }
 
@@ -289,7 +317,14 @@ onBeforeUnmount(() => {
           @query-target="target => session.openQueryDraft({ ...target, sql: '', needsTarget: false, notice: null })"
         />
         <ConnectionsPage v-if="session.page.value === 'connections'" :sqlite-prompt="sqlitePrompt" @sqlite-consumed="sqlitePrompt = 0" @workspace="session.showPage('workspace')" @query-target="target => session.openQueryDraft({ ...target, sql: '', needsTarget: false, notice: null })" />
-        <HistoryPage v-else-if="session.page.value === 'history'" @open="onHistoryOpen" />
+        <HistoryPage
+          v-else-if="session.page.value === 'history'"
+          :section="historySection"
+          :current-draft="currentSavedDraft"
+          :save-request="saveRequest"
+          @open="onHistoryOpen"
+          @update:section="historySection = $event"
+        />
         <SettingsView v-else-if="session.page.value === 'settings'" :settings="settings" :data-dir="dataDir" @change="onSettings" @help="session.openHelp()" />
       </main>
     </div>

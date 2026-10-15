@@ -357,6 +357,30 @@
           "markdownDescription": "允许读取一次 SQL 执行的状态和已完成结果。"
         },
         {
+          "description": "允许删除一条本机保存的查询。",
+          "type": "string",
+          "const": "allow-query-saved-delete",
+          "markdownDescription": "允许删除一条本机保存的查询。"
+        },
+        {
+          "description": "允许读取本机按名称保存的查询。",
+          "type": "string",
+          "const": "allow-query-saved-list",
+          "markdownDescription": "允许读取本机按名称保存的查询。"
+        },
+        {
+          "description": "允许重命名一条本机保存的查询。",
+          "type": "string",
+          "const": "allow-query-saved-rename",
+          "markdownDescription": "允许重命名一条本机保存的查询。"
+        },
+        {
+          "description": "允许把当前 SQL 按名称保存到本机，不执行。",
+          "type": "string",
+          "const": "allow-query-saved-save",
+          "markdownDescription": "允许把当前 SQL 按名称保存到本机，不执行。"
+        },
+        {
           "description": "允许在已打开的会话上执行 SQL。",
           "type": "string",
           "const": "allow-query-start",

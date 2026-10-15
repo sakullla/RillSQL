@@ -193,7 +193,17 @@ fn query_commands_are_appended_without_dropping_catalog_or_grid() {
     let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
     let wire = registration.split("fn wire").nth(1).unwrap_or("");
     let wire = wire.split("pub fn run").next().unwrap_or("");
-    for command in ["query_start", "query_poll", "query_cancel", "query_history", "query_history_clear"] {
+    for command in [
+        "query_start",
+        "query_poll",
+        "query_cancel",
+        "query_history",
+        "query_history_clear",
+        "query_saved_list",
+        "query_saved_save",
+        "query_saved_rename",
+        "query_saved_delete",
+    ] {
         let allow = format!("allow-{}", command.replace('_', "-"));
         assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
         assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
@@ -253,6 +263,131 @@ async fn history_records_execution_without_a_password_column_and_restore_does_no
         summary: String::new(),
     };
     let _ = _typed;
+}
+
+#[tokio::test]
+async fn saved_queries_roundtrip_without_writing_execution_history() {
+    use super::saved::{RenameRequest, SaveRequest};
+
+    let dir = std::env::temp_dir().join(format!("rillsql-saved-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = history::HistoryStore::open(&dir.join("query-history.sqlite")).await.unwrap();
+    let columns = store.saved_column_names().await.unwrap();
+    assert!(!columns.iter().any(|name| name.to_ascii_lowercase().contains("password")));
+    assert!(columns.iter().any(|name| name == "name"));
+    assert!(columns.iter().any(|name| name == "sql"));
+
+    let blank = store
+        .save_named(&SaveRequest {
+            name: "   ".to_owned(),
+            sql: "SELECT 1".to_owned(),
+            connection_id: String::new(),
+            connection_name: String::new(),
+            database_name: String::new(),
+            engine: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(blank, "请填写名称");
+    assert!(store.list_saved().await.unwrap().is_empty());
+
+    let created = store
+        .save_named(&SaveRequest {
+            name: " 日报 ".to_owned(),
+            sql: "SELECT id FROM orders".to_owned(),
+            connection_id: "shop".to_owned(),
+            connection_name: "Shop".to_owned(),
+            database_name: "shop_staging".to_owned(),
+            engine: "mysql".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert!(created.created);
+    assert_eq!(created.query.name, "日报");
+    assert_eq!(created.query.sql, "SELECT id FROM orders");
+    store
+        .insert(&HistoryDraft {
+            id: "h1".to_owned(),
+            sql: "SELECT 1".to_owned(),
+            connection_id: "shop".to_owned(),
+            connection_name: "Shop".to_owned(),
+            database_name: "shop_staging".to_owned(),
+            engine: "mysql".to_owned(),
+            started_at: "2026-10-15T00:00:00Z".to_owned(),
+            summary: "执行中".to_owned(),
+        })
+        .await
+        .unwrap();
+    store.finish("h1", "2026-10-15T00:00:01Z", "ok", 4, "1 条语句完成").await.unwrap();
+
+    let updated = store
+        .save_named(&SaveRequest {
+            name: "日报".to_owned(),
+            sql: "SELECT id, amount FROM orders".to_owned(),
+            connection_id: "gone".to_owned(),
+            connection_name: "旧连接".to_owned(),
+            database_name: "app".to_owned(),
+            engine: "postgres".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert!(!updated.created);
+    assert_eq!(updated.query.id, created.query.id);
+    assert_eq!(updated.query.sql, "SELECT id, amount FROM orders");
+    let listed = store.list_saved().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(store.list().await.unwrap().len(), 1);
+
+    store
+        .save_named(&SaveRequest {
+            name: "周报".to_owned(),
+            sql: "SELECT 2".to_owned(),
+            connection_id: String::new(),
+            connection_name: String::new(),
+            database_name: String::new(),
+            engine: String::new(),
+        })
+        .await
+        .unwrap();
+    let names = store.list_saved().await.unwrap().into_iter().map(|item| item.name).collect::<Vec<_>>();
+    assert_eq!(names, vec!["周报".to_owned(), "日报".to_owned()]);
+
+    let clash = store
+        .rename_saved(&RenameRequest {
+            id: updated.query.id.clone(),
+            name: "周报".to_owned(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(clash, "已经有同名的保存查询");
+    let renamed = store
+        .rename_saved(&RenameRequest {
+            id: updated.query.id.clone(),
+            name: "晨报".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(renamed.name, "晨报");
+    assert_eq!(renamed.sql, "SELECT id, amount FROM orders");
+    assert!(store
+        .rename_saved(&RenameRequest {
+            id: "missing".to_owned(),
+            name: "别的".to_owned(),
+        })
+        .await
+        .unwrap_err()
+        .contains("找不到"));
+
+    store.clear().await.unwrap();
+    assert!(store.list().await.unwrap().is_empty());
+    assert_eq!(store.list_saved().await.unwrap().len(), 2);
+    store.delete_saved(&renamed.id).await.unwrap();
+    let left = store.list_saved().await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].name, "周报");
+    assert!(store.delete_saved(&renamed.id).await.unwrap_err().contains("找不到"));
+    assert!(store.list().await.unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

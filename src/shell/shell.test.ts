@@ -131,7 +131,12 @@ describe("shell layout", () => {
       setTheme: () => undefined,
       openHelp: () => undefined,
       requestSqlite: () => undefined,
+      saveQuery: () => undefined,
+      showSavedQueries: () => undefined,
     });
+    expect(items.some((item) => item.label === "查询历史")).toBe(true);
+    expect(items.some((item) => item.label === "保存当前查询")).toBe(true);
+    expect(items.some((item) => item.label === "保存的查询")).toBe(true);
     const commands = filterPalette(items, ">主题", "all");
     expect(commands.map((item) => item.label)).toEqual(["切换到浅色主题", "切换到深色主题", "主题跟随系统"]);
     expect(filterPalette(items, "customers", "tables")).toEqual([]);

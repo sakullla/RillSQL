@@ -147,6 +147,27 @@ commands.allow = ["query_history"]
 identifier = "allow-query-history-clear"
 description = "允许清空本机查询历史。"
 commands.allow = ["query_history_clear"]
+
+[[permission]]
+identifier = "allow-query-saved-list"
+description = "允许读取本机按名称保存的查询。"
+commands.allow = ["query_saved_list"]
+
+[[permission]]
+identifier = "allow-query-saved-save"
+description = "允许把当前 SQL 按名称保存到本机，不执行。"
+commands.allow = ["query_saved_save"]
+
+[[permission]]
+identifier = "allow-query-saved-rename"
+description = "允许重命名一条本机保存的查询。"
+commands.allow = ["query_saved_rename"]
+
+[[permission]]
+identifier = "allow-query-saved-delete"
+description = "允许删除一条本机保存的查询。"
+commands.allow = ["query_saved_delete"]
+
 [[permission]]
 identifier = "allow-export-write-loaded"
 description = "允许把已经读取的 CSV 数据保存到用户选择的本地文件。"
