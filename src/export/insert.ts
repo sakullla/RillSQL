@@ -1,4 +1,4 @@
-import { insertSql } from "../grid/sql";
+import { qualifiedName, quoteIdent, sqlCell } from "../grid/sql";
 import type { Cell, Column, Engine, TableSchema } from "../grid/types";
 
 export interface InsertTarget {
@@ -26,13 +26,18 @@ function schemaOf(target: InsertTarget): TableSchema {
   };
 }
 
-/** 只生成这些行的 INSERT，不带建表或整库脚本。 */
+/** 按已读取的结果列和值生成 INSERT，不丢别名，也不改成基表列的交集。 */
 export function insertStatements(target: InsertTarget, columns: readonly string[], rows: readonly Record<string, Cell>[]): string[] {
   const schema = schemaOf(target);
+  const into = qualifiedName(schema);
+  if (!columns.length) {
+    if (schema.engine === "mysql" || schema.engine === "mariadb") return rows.map(() => `INSERT INTO ${into} () VALUES ();`);
+    return rows.map(() => `INSERT INTO ${into} DEFAULT VALUES;`);
+  }
+  const list = columns.map((name) => quoteIdent(schema.engine, name)).join(", ");
   return rows.map((row) => {
-    const values: Record<string, Cell> = {};
-    for (const name of columns) values[name] = row[name] ?? null;
-    return `${insertSql(schema, values)};`;
+    const literals = columns.map((name) => sqlCell(schema.columns.find((column) => column.name === name), row[name] ?? null)).join(", ");
+    return `INSERT INTO ${into} (${list}) VALUES (${literals});`;
   });
 }
 

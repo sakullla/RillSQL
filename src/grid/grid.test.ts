@@ -2,7 +2,9 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { flushPromises, mount } from "@vue/test-utils";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { replaceCatalog, resetCatalog } from "../catalog/store";
+import type { CatalogConnection } from "../catalog/types";
 import { exportTasks, resetExportTasks } from "../export/tasks";
 import DataGrid from "./DataGrid.vue";
 import { commitChanges, queryPage, viewLoadedRows } from "./data";
@@ -544,10 +546,40 @@ describe("grid views", () => {
   });
 });
 
+function shopCatalog(engine: CatalogConnection["engine"], database: string, schemas: { name: string; tables: string[] }[]): CatalogConnection {
+  return {
+    id: "shop",
+    name: "Shop",
+    engine,
+    env: "dev",
+    envLabel: "开发",
+    envTone: "dev",
+    status: "connected",
+    defaultDatabase: database,
+    foreignKeys: null,
+    error: null,
+    databases: [{
+      name: database,
+      error: null,
+      schemas: schemas.map((schema) => ({
+        name: schema.name,
+        error: null,
+        total: schema.tables.length,
+        objects: schema.tables.map((name) => ({ name, kind: "table" as const, estimatedRows: 1, stale: false })),
+      })),
+    }],
+  };
+}
+
 describe("query result edits", () => {
   beforeEach(() => {
     invoke.mockReset();
     resetExportTasks();
+    resetCatalog();
+  });
+
+  afterEach(() => {
+    resetCatalog();
   });
 
   function proof(sql: string) {
@@ -564,14 +596,86 @@ describe("query result edits", () => {
     expect(readSingleTable("SELECT id FROM orders UNION SELECT id FROM archive").reason).toContain("UNION");
     expect(readSingleTable("SELECT id FROM (SELECT id FROM orders) q").reason).toContain("子查询");
     expect(readSingleTable("DELETE FROM orders").reason).toContain("SELECT");
+    expect(readSingleTable("SELECT id, name FROM ONLY orders").ok).toBe(false);
+    const explicitAlias = readSingleTable("SELECT id, email AS name FROM customers");
+    expect(explicitAlias.ok).toBe(true);
+    if (explicitAlias.ok) {
+      expect(explicitAlias.columns.baseColumns).toEqual(["id"]);
+      expect(explicitAlias.columns.aliasColumns).toEqual(["name"]);
+    }
+    const implicitAlias = readSingleTable("SELECT email name FROM customers");
+    expect(implicitAlias.ok).toBe(true);
+    if (implicitAlias.ok) {
+      expect(implicitAlias.columns.baseColumns).toEqual([]);
+      expect(implicitAlias.columns.aliasColumns).toEqual(["name"]);
+    }
+    const star = readSingleTable("SELECT * FROM customers c");
+    expect(star.ok).toBe(true);
+    if (star.ok) expect(star.columns.star).toBe(true);
     const ambiguous = resolveEditableTable(proof("SELECT status FROM orders"), [
       { schema: "public", name: "orders", kind: "table" },
       { schema: "sales", name: "orders", kind: "table" },
     ], "app");
     expect(ambiguous.ok).toBe(false);
     if (!ambiguous.ok) expect(ambiguous.reason).toContain("多个模式");
-    const named = resolveEditableTable(proof("SELECT status FROM public.orders"), [], "app");
+    const named = resolveEditableTable(proof("SELECT status FROM public.orders"), [], "app", "postgres");
     expect(named).toEqual({ ok: true, schema: "public", table: "orders" });
+    const folded = resolveEditableTable(proof("SELECT id, name FROM orders"), [
+      { schema: "public", name: "Orders", kind: "table" },
+      { schema: "public", name: "orders", kind: "table" },
+    ], "app", "postgres");
+    expect(folded.ok).toBe(false);
+    if (!folded.ok) expect(folded.reason).toContain("大小写");
+    const namedFolded = resolveEditableTable(proof("SELECT id FROM public.orders"), [
+      { schema: "public", name: "orders", kind: "table" },
+      { schema: "public", name: "Orders", kind: "table" },
+    ], "app", "postgres");
+    expect(namedFolded.ok).toBe(false);
+    for (const engine of ["mysql", "mariadb"] as const) {
+      const foreign = resolveEditableTable(proof("SELECT id, name FROM otherdb.customers"), [
+        { schema: "", name: "customers", kind: "table" },
+      ], "app", engine);
+      expect(foreign.ok).toBe(false);
+      if (!foreign.ok) expect(foreign.reason).toContain("限定名");
+      const current = resolveEditableTable(proof("SELECT id, name FROM app.customers"), [
+        { schema: "", name: "customers", kind: "table" },
+      ], "app", engine);
+      expect(current).toEqual({ ok: true, schema: "", table: "customers" });
+      const unlisted = resolveEditableTable(proof("SELECT id FROM app.customers"), [], "app", engine);
+      expect(unlisted.ok).toBe(false);
+    }
+    const attached = resolveEditableTable(proof("SELECT id FROM archive.customers"), [
+      { schema: "", name: "customers", kind: "table" },
+    ], "main", "sqlite");
+    expect(attached.ok).toBe(false);
+    if (!attached.ok) expect(attached.reason).toContain("限定名");
+    const mainTable = resolveEditableTable(proof("SELECT id FROM main.customers"), [
+      { schema: "", name: "customers", kind: "table" },
+    ], "main", "sqlite");
+    expect(mainTable).toEqual({ ok: true, schema: "", table: "customers" });
+    const aliasProof = readSingleTable("SELECT id, email AS name FROM customers");
+    const aliasRows = gridModel({ columns: ["id", "name"], rows: [["1", "a@example.com"]] });
+    const aliasLocated = locateResultRows(customersFixture(1).schema, aliasRows.columns, aliasRows.rows, aliasProof.ok ? aliasProof.columns : null);
+    expect(aliasLocated.ok).toBe(true);
+    if (aliasLocated.ok && aliasProof.ok) {
+      expect(aliasLocated.editable).toEqual(["id"]);
+      const session = new ResultEditSession(customersFixture(1).schema, customersTarget, aliasLocated.rows, aliasLocated.editable);
+      expect(session.stageUpdate("r0", "name", "写进名字")).toContain("不是基表列");
+      expect(session.preview()).toEqual([]);
+    }
+    const hiddenKey = readSingleTable("SELECT email AS id FROM customers");
+    const hiddenRows = gridModel({ columns: ["id"], rows: [["a@example.com"]] });
+    const hiddenLocated = locateResultRows(customersFixture(1).schema, hiddenRows.columns, hiddenRows.rows, hiddenKey.ok ? hiddenKey.columns : null);
+    expect(hiddenLocated.ok).toBe(false);
+    const qualifiedColumn = readSingleTable("SELECT id, customers.name FROM customers c");
+    expect(qualifiedColumn.ok && qualifiedColumn.columns.baseColumns).toEqual(["id", "name"]);
+    const otherColumn = readSingleTable("SELECT id, other.name FROM customers");
+    expect(otherColumn.ok && otherColumn.columns.baseColumns).toEqual(["id"]);
+    const starProof = readSingleTable("SELECT * FROM customers");
+    const starRows = gridModel({ columns: ["id", "name"], rows: [["1", "甲"]] });
+    const starLocated = locateResultRows(customersFixture(1).schema, starRows.columns, starRows.rows, starProof.ok ? starProof.columns : null);
+    expect(starLocated.ok).toBe(true);
+    if (starLocated.ok) expect(starLocated.editable).toEqual(["id", "name"]);
     const model = gridModel({ columns: ["id", "name"], rows: [["1", "甲"], ["1", "乙"]] });
     const missingKey = locateResultRows({ ...customersFixture(1).schema, key: [] }, model.columns, model.rows);
     expect(missingKey.ok).toBe(false);
@@ -702,5 +806,273 @@ describe("query result edits", () => {
     await nokey.get("[data-cell='r0:name']").trigger("dblclick");
     expect(nokey.find("input[aria-label='编辑 name']").exists()).toBe(false);
     nokey.unmount();
+  });
+
+  it("does not edit a select-list alias as the base column", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      throw new Error(command);
+    });
+    const model = gridModel({ columns: ["id", "name"], rows: [["1", "a@example.com"]] });
+    const wrapper = mount(QueryResultGrid, {
+      props: {
+        tabId: "alias",
+        statement: "SELECT id, email AS name FROM public.customers",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+      },
+    });
+    await flushPromises();
+    expect(wrapper.attributes("data-editable")).toBe("true");
+    await wrapper.get("[data-cell='r0:name']").trigger("dblclick");
+    expect(wrapper.find("input[aria-label='编辑 name']").exists()).toBe(false);
+    await wrapper.get("[data-cell='r0:id']").trigger("dblclick");
+    expect(wrapper.find("input[aria-label='编辑 id']").exists()).toBe(true);
+    wrapper.unmount();
+
+    const implicit = mount(QueryResultGrid, {
+      props: {
+        tabId: "implicit-alias",
+        statement: "SELECT id, email name FROM public.customers",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+      },
+    });
+    await flushPromises();
+    expect(implicit.attributes("data-editable")).toBe("true");
+    await implicit.get("[data-cell='r0:name']").trigger("dblclick");
+    expect(implicit.find("input[aria-label='编辑 name']").exists()).toBe(false);
+    implicit.unmount();
+  });
+
+  it("exports loaded alias columns as JSON and INSERT", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      throw new Error(command);
+    });
+    const model = gridModel({ columns: ["customer_name"], rows: [["甲"]] });
+    const wrapper = mount(QueryResultGrid, {
+      props: {
+        tabId: "alias-export",
+        statement: "SELECT name AS customer_name FROM public.customers",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+        schema: "sales",
+      },
+    });
+    await flushPromises();
+    expect(wrapper.attributes("data-editable")).toBe("false");
+    await wrapper.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
+    await wrapper.get("input[value='json']").setValue(true);
+    expect(wrapper.get("pre.ex-preview").text()).toContain("customer_name");
+    expect(wrapper.get("pre.ex-preview").text()).toContain("甲");
+    await wrapper.get("input[value='insert']").setValue(true);
+    const preview = wrapper.get("pre.ex-preview").text();
+    expect(preview).toContain('INSERT INTO "public"."customers"');
+    expect(preview).toContain('"customer_name"');
+    expect(preview).toContain("'甲'");
+    expect(preview).not.toContain("DEFAULT VALUES");
+    expect(preview).not.toContain('"sales"');
+    wrapper.unmount();
+  });
+
+  it("clears the insert target when one table can no longer be proved", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      throw new Error(command);
+    });
+    const model = gridModel({ columns: ["id", "name"], rows: [["1", "甲"]] });
+    const wrapper = mount(QueryResultGrid, {
+      props: {
+        tabId: "switch",
+        statement: "SELECT id, name FROM public.customers",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+        schema: "public",
+      },
+    });
+    await flushPromises();
+    await wrapper.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
+    await wrapper.get("input[value='insert']").setValue(true);
+    expect(wrapper.get("pre.ex-preview").text()).toContain('INSERT INTO "public"."customers"');
+    await wrapper.setProps({ statement: "SELECT id, name FROM orders JOIN items ON items.id = orders.id" });
+    await flushPromises();
+    expect(wrapper.attributes("data-editable")).toBe("false");
+    expect(wrapper.text()).toContain("JOIN");
+    expect(wrapper.get("pre.ex-preview").text()).not.toContain("INSERT INTO");
+    expect(wrapper.findAll("button").filter((button) => button.text() === "导出").at(-1)!.attributes("disabled")).toBeDefined();
+    wrapper.unmount();
+
+    invoke.mockClear();
+    replaceCatalog([shopCatalog("postgres", "app", [
+      { name: "public", tables: ["customers"] },
+      { name: "sales", tables: ["customers"] },
+    ])]);
+    const ambiguous = mount(QueryResultGrid, {
+      props: {
+        tabId: "ambiguous",
+        statement: "SELECT id, name FROM customers",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+        schema: "sales",
+      },
+    });
+    await flushPromises();
+    expect(invoke.mock.calls.some((call) => call[0] === "grid_describe")).toBe(false);
+    expect(ambiguous.attributes("data-editable")).toBe("false");
+    expect(ambiguous.text()).toContain("多个模式");
+    await ambiguous.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
+    await ambiguous.get("input[value='insert']").setValue(true);
+    expect(ambiguous.get("pre.ex-preview").text()).not.toContain("INSERT");
+    expect(ambiguous.text()).not.toContain('"sales"');
+    ambiguous.unmount();
+  });
+
+  it("stays read-only for case-variant tables and ONLY", async () => {
+    replaceCatalog([shopCatalog("postgres", "app", [{ name: "public", tables: ["Orders", "orders", "only"] }])]);
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return { ...customerSchema(), name: "Orders" };
+      throw new Error(command);
+    });
+    const model = gridModel({ columns: ["id", "name"], rows: [["1", "甲"]] });
+    const folded = mount(QueryResultGrid, {
+      props: {
+        tabId: "case",
+        statement: "SELECT id, name FROM orders",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+        schema: "public",
+      },
+    });
+    await flushPromises();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(folded.attributes("data-editable")).toBe("false");
+    expect(folded.text()).toContain("大小写");
+    folded.unmount();
+
+    const only = mount(QueryResultGrid, {
+      props: {
+        tabId: "only",
+        statement: "SELECT id, name FROM ONLY orders",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+      },
+    });
+    await flushPromises();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(only.attributes("data-editable")).toBe("false");
+    expect(only.text()).toContain("不能确定");
+    only.unmount();
+  });
+
+  it("does not describe or insert the current table for another database qualifier", async () => {
+    const model = gridModel({ columns: ["id", "name"], rows: [["1", "甲"]] });
+    for (const engine of ["mysql", "mariadb"] as const) {
+      invoke.mockReset();
+      resetCatalog();
+      replaceCatalog([shopCatalog(engine, "app", [{ name: "", tables: ["customers"] }])]);
+      invoke.mockImplementation(async (command: string) => {
+        if (command === "grid_describe") return { ...customerSchema(), engine, schema: "" };
+        throw new Error(command);
+      });
+      const wrapper = mount(QueryResultGrid, {
+        props: {
+          tabId: `foreign-${engine}`,
+          statement: "SELECT id, name FROM otherdb.customers",
+          columns: model.columns,
+          rows: model.rows,
+          truncated: false,
+          connectionId: "shop",
+          engine,
+          database: "app",
+        },
+      });
+      await flushPromises();
+      expect(invoke).not.toHaveBeenCalled();
+      expect(wrapper.attributes("data-editable")).toBe("false");
+      expect(wrapper.text()).toContain("限定名");
+      await wrapper.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
+      await wrapper.get("input[value='insert']").setValue(true);
+      expect(wrapper.get("pre.ex-preview").text()).not.toContain("INSERT");
+      wrapper.unmount();
+    }
+
+    invoke.mockReset();
+    resetCatalog();
+    replaceCatalog([shopCatalog("sqlite", "main", [{ name: "", tables: ["customers"] }])]);
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return { ...customerSchema(), engine: "sqlite", schema: "" };
+      throw new Error(command);
+    });
+    const attached = mount(QueryResultGrid, {
+      props: {
+        tabId: "archive",
+        statement: "SELECT id, name FROM archive.customers",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "sqlite",
+        database: "main",
+      },
+    });
+    await flushPromises();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(attached.attributes("data-editable")).toBe("false");
+    expect(attached.text()).toContain("限定名");
+    attached.unmount();
+
+    invoke.mockReset();
+    replaceCatalog([shopCatalog("mysql", "app", [{ name: "", tables: ["customers"] }])]);
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return { ...customerSchema(), engine: "mysql", schema: "", name: "customers" };
+      throw new Error(command);
+    });
+    const current = mount(QueryResultGrid, {
+      props: {
+        tabId: "current-db",
+        statement: "SELECT id, name FROM app.customers",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "mysql",
+        database: "app",
+      },
+    });
+    await flushPromises();
+    expect(invoke.mock.calls.find((call) => call[0] === "grid_describe")?.[1]).toMatchObject({
+      request: { database: "app", schema: "", table: "customers", engine: "mysql" },
+    });
+    expect(current.attributes("data-editable")).toBe("true");
+    current.unmount();
   });
 });

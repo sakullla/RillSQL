@@ -229,6 +229,21 @@ describe("json and insert export", () => {
     expect(sql).toContain("NULL");
     expect(sql).toContain("''");
     expect(sql).not.toContain("CREATE");
+    expect(JSON.parse(renderJson(["customer_name"], [{ customer_name: "甲" }]))).toEqual([{ customer_name: "甲" }]);
+    const aliased = renderInsert(
+      { engine: "postgres", schema: "public", name: "customers", columns: [{ name: "id", typeName: "integer" }, { name: "name", typeName: "text" }, { name: "email", typeName: "text" }] },
+      ["customer_name"],
+      [{ customer_name: "甲" }],
+    );
+    expect(aliased).toContain('"customer_name"');
+    expect(aliased).toContain("'甲'");
+    expect(aliased).not.toContain("DEFAULT VALUES");
+    expect(aliased).not.toContain('"name"');
+    const mixed = renderInsert(insert, ["id", "customer_name"], [{ id: "1", customer_name: "甲" }]);
+    expect(mixed).toContain('"id"');
+    expect(mixed).toContain("1");
+    expect(mixed).toContain('"customer_name"');
+    expect(mixed).toContain("'甲'");
     expect(planExport({ origin: "query", scope: "full", statement: "DELETE FROM customers", truncated: false, fileName: "rows.json" }).allowed).toBe(false);
     const partial = planExport({ origin: "table", scope: "loaded", truncated: true, fileName: "rows.json" });
     expect(partial.fileName).toBe("rows（部分）.json");

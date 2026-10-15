@@ -13,7 +13,7 @@ import { useRowWindow } from "./virtual";
 import { copyPlain, showCell } from "./display";
 import "./grid.css";
 import { loadSettings } from "../shell/settings";
-import { locateResultRows, readSingleTable, resolveEditableTable, ResultEditSession, type TableHit } from "./result-edit";
+import { locateResultRows, provedEditableColumns, readSingleTable, resolveEditableTable, ResultEditSession, type TableHit } from "./result-edit";
 import type { Cell, Column, Engine, Row, SortSpec } from "./types";
 
 const props = defineProps<{
@@ -69,31 +69,27 @@ async function resolveEdit() {
   editing.value = null;
   commitOpen.value = false;
   editSession.value = null;
+  insertTarget.value = null;
   const structural = readSingleTable(props.statement);
   const engine = props.engine ?? "postgres";
   if (!structural.ok) {
-    editSession.value = null;
-    insertTarget.value = null;
     reason.value = structural.reason;
     return;
   }
-  const qualifier = structural.table.schema;
-  const schemaName = qualifier && qualifier !== props.database ? qualifier : (props.schema ?? "");
-  insertTarget.value = {
-    engine,
-    schema: schemaName,
-    name: structural.table.table,
-    columns: props.columns.map((column) => ({ name: column.name, typeName: column.typeName })),
-  };
-  if (!props.connectionId) {
-    editSession.value = null;
-    reason.value = "没有绑定已打开的连接，不能修改查询结果。";
+  const resolved = resolveEditableTable(structural.table, tableHits(), props.database ?? "", engine);
+  if (!resolved.ok) {
+    reason.value = resolved.reason;
     return;
   }
-  const resolved = resolveEditableTable(structural.table, tableHits(), props.database ?? "");
-  if (!resolved.ok) {
-    editSession.value = null;
-    reason.value = resolved.reason;
+  const loadedColumns = () => props.columns.map((column) => ({ name: column.name, typeName: column.typeName }));
+  insertTarget.value = {
+    engine,
+    schema: resolved.schema,
+    name: resolved.table,
+    columns: loadedColumns(),
+  };
+  if (!props.connectionId) {
+    reason.value = "没有绑定已打开的连接，不能修改查询结果。";
     return;
   }
   reason.value = "正在确认这张表能否修改…";
@@ -106,13 +102,17 @@ async function resolveEdit() {
       engine,
     });
     if (current !== generation) return;
+    const editable = provedEditableColumns(described, props.columns, structural.columns);
     insertTarget.value = {
       engine: described.engine,
-      schema: described.schema,
-      name: described.name,
-      columns: described.columns,
+      schema: resolved.schema,
+      name: resolved.table,
+      columns: props.columns.map((column) => {
+        const base = editable.includes(column.name) ? described.columns.find((item) => item.name === column.name) : undefined;
+        return { name: column.name, typeName: base?.typeName || column.typeName };
+      }),
     };
-    const located = locateResultRows(described, props.columns, props.rows);
+    const located = locateResultRows(described, props.columns, props.rows, structural.columns);
     if (!located.ok) {
       editSession.value = null;
       reason.value = located.reason;
@@ -124,7 +124,7 @@ async function resolveEdit() {
       schema: resolved.schema,
       table: resolved.table,
       engine: described.engine,
-    }, located.rows));
+    }, located.rows, located.editable));
     reason.value = `按 ${described.key.join(" + ")} 定位行。查询结果不能新增行。`;
   } catch (error) {
     if (current !== generation) return;
@@ -171,8 +171,7 @@ function inspect(rowId: string, index: number) {
 function beginEdit(id: string, column: string) {
   const session = editSession.value;
   const row = session?.rowById(id);
-  if (!session || !row?.located || session.deletes.includes(id)) return;
-  if (!session.schema.columns.some((item) => item.name === column)) return;
+  if (!session || !row?.located || session.deletes.includes(id) || !session.canEditColumn(column)) return;
   const current = session.cellValue(id, column);
   editing.value = { id, column, draft: current ?? "", isNull: current === null };
   session.select(id, column);
@@ -243,7 +242,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
     fileName: payload.path,
   });
   if (payload.format === "insert" && !insertTarget.value?.name) {
-    exportMessage.value = "还不能确定 INSERT 要写入的表，导出没有开始。";
+    exportMessage.value = `${reason.value} INSERT 没有开始。`;
     exportOpen.value = false;
     return;
   }
@@ -368,7 +367,7 @@ watch(() => props.rows, () => { selected.value = null; });
       <button class="btn sm primary" type="button" :disabled="!editSession.pendingCount" @click="commitOpen = true">提交</button>
       <p v-for="failure in commitFailures" :key="failure.id" class="commit-failure" role="alert">{{ failure.message }}</p>
     </div>
-    <section v-if="selected" class="inspector" aria-label="查询值查看器"><div class="inspector-meta"><strong>{{ selected.column }}</strong><span>{{ selected.value === null ? 'NULL' : selected.value === '' ? '空字符串（长度 0）' : '完整值' }}</span><span class="grow"></span><button class="btn sm" @click="selected = null">关闭</button></div><textarea readonly :value="selected.value ?? ''" :aria-label="`${selected.column} 的值`"></textarea><div class="inspector-actions"><button v-if="editSession" class="btn sm" type="button" :disabled="!editSession.canUpdate(editSession.rowById(selected.row))" @click="beginEdit(selected.row, selected.column)">编辑</button><button class="btn sm" @click="copyValue">复制值</button><span role="status">{{ copyMessage }}</span></div></section>
+    <section v-if="selected" class="inspector" aria-label="查询值查看器"><div class="inspector-meta"><strong>{{ selected.column }}</strong><span>{{ selected.value === null ? 'NULL' : selected.value === '' ? '空字符串（长度 0）' : '完整值' }}</span><span class="grow"></span><button class="btn sm" @click="selected = null">关闭</button></div><textarea readonly :value="selected.value ?? ''" :aria-label="`${selected.column} 的值`"></textarea><div class="inspector-actions"><button v-if="editSession" class="btn sm" type="button" :disabled="!editSession.canUpdate(editSession.rowById(selected.row)) || !editSession.canEditColumn(selected.column)" @click="beginEdit(selected.row, selected.column)">编辑</button><button class="btn sm" @click="copyValue">复制值</button><span role="status">{{ copyMessage }}</span></div></section>
     <div v-if="commitOpen && editSession" class="overlay" role="presentation">
       <div class="sheet" role="dialog" aria-modal="true" aria-label="待提交的更改">
         <header><div><h2>提交这些更改？</h2><p class="hint">将按顺序逐条写入数据库，遇到错误即停止；已写入的不会自动撤销。查询结果不能新增行。</p></div></header>
@@ -391,6 +390,7 @@ watch(() => props.rows, () => { selected.value = null; });
       :columns="columns.map((column) => column.name)"
       :preview-rows="exportRows().slice(0, 4)"
       :insert-target="insertTarget"
+      :insert-reason="insertTarget ? '' : reason"
       @close="exportOpen = false"
       @start="startExport"
     />

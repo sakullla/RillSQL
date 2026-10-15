@@ -18,6 +18,7 @@ const props = defineProps<{
   columns: string[];
   previewRows: Record<string, CsvCell>[];
   insertTarget?: InsertTarget | null;
+  insertReason?: string;
 }>();
 
 const emit = defineEmits<{
@@ -135,7 +136,7 @@ async function start() {
             <span><b>INSERT 语句</b><small>只包含这些行，不含建表或整库脚本。空值写成 NULL。</small></span>
           </label>
         </fieldset>
-        <p v-if="insertBlocked" class="ex-alert" role="alert">还不能确定 INSERT 要写入的表，不能开始。</p>
+        <p v-if="insertBlocked" class="ex-alert" role="alert">{{ insertReason || "还不能确定 INSERT 要写入的表，不能开始。" }}</p>
 
         <fieldset class="ex-scope">
           <legend>导出哪些行</legend>
