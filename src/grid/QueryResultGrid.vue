@@ -81,13 +81,6 @@ async function resolveEdit() {
     reason.value = resolved.reason;
     return;
   }
-  const loadedColumns = () => props.columns.map((column) => ({ name: column.name, typeName: column.typeName }));
-  insertTarget.value = {
-    engine,
-    schema: resolved.schema,
-    name: resolved.table,
-    columns: loadedColumns(),
-  };
   if (!props.connectionId) {
     reason.value = "没有绑定已打开的连接，不能修改查询结果。";
     return;
@@ -103,15 +96,17 @@ async function resolveEdit() {
     });
     if (current !== generation) return;
     const editable = provedEditableColumns(described, props.columns, structural.columns);
-    insertTarget.value = {
-      engine: described.engine,
-      schema: resolved.schema,
-      name: resolved.table,
-      columns: props.columns.map((column) => {
-        const base = editable.includes(column.name) ? described.columns.find((item) => item.name === column.name) : undefined;
-        return { name: column.name, typeName: base?.typeName || column.typeName };
-      }),
-    };
+    insertTarget.value = described.kind === "table"
+      ? {
+          engine: described.engine,
+          schema: resolved.schema,
+          name: resolved.table,
+          columns: props.columns.map((column) => {
+            const base = editable.includes(column.name) ? described.columns.find((item) => item.name === column.name) : undefined;
+            return { name: column.name, typeName: base?.typeName || column.typeName };
+          }),
+        }
+      : null;
     const located = locateResultRows(described, props.columns, props.rows, structural.columns);
     if (!located.ok) {
       editSession.value = null;
@@ -129,6 +124,7 @@ async function resolveEdit() {
   } catch (error) {
     if (current !== generation) return;
     editSession.value = null;
+    insertTarget.value = null;
     reason.value = error instanceof Error ? error.message : String(error);
   }
 }

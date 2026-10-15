@@ -13,6 +13,8 @@ export interface TableHit {
 export interface TableRef {
   schema: string | null;
   table: string;
+  /** 点号左侧限定名的原文。没有限定名时为 null。库名比较只用这份拼写。 */
+  qualifierSource: string | null;
 }
 
 /** 选择列表里能证明是基表列的结果列。别名列不在其中。 */
@@ -32,7 +34,7 @@ type SelectItem =
 
 const EMPTY_COLUMNS: ColumnProof = { star: false, baseColumns: [], aliasColumns: [] };
 
-type Token = { kind: "word" | "ident" | "punct" | "string"; text: string };
+type Token = { kind: "word" | "ident" | "punct" | "string"; text: string; source?: string };
 
 const CLAUSES = new Set(["WHERE", "ORDER", "LIMIT", "OFFSET", "FETCH", "FOR", "BY", "AND", "OR", "AS", "ASC", "DESC", "NULLS", "FIRST", "LAST", "ONLY", "ROWS", "ROW", "NEXT", "TIES", "SHARE", "NOWAIT", "SKIP", "LOCKED", "OF", "INTO"]);
 const FORBIDDEN: Record<string, string> = {
@@ -98,7 +100,7 @@ function tokenize(sql: string): Token[] {
         index += 1;
         text += sql[index]!;
       }
-      tokens.push({ kind: "word", text: text.toLowerCase() });
+      tokens.push({ kind: "word", text: text.toLowerCase(), source: text });
       continue;
     }
     tokens.push({ kind: "punct", text: char });
@@ -117,6 +119,14 @@ function readName(token: Token | undefined): string | null {
   return null;
 }
 
+/** 未加引号的标识符仍按小写参与关键字和表名折叠，库名比较要留下原文。 */
+function sourceName(token: Token | undefined): string | null {
+  if (!token) return null;
+  if (token.kind === "ident") return token.text;
+  if (token.kind === "word") return token.source ?? token.text;
+  return null;
+}
+
 function sameIdent(left: string, right: string): boolean {
   return left === right || left.toLowerCase() === right.toLowerCase();
 }
@@ -125,9 +135,9 @@ function qualifierMatches(qualifier: string, table: string, alias: string | null
   return sameIdent(qualifier, table) || (alias !== null && sameIdent(qualifier, alias));
 }
 
-/** MySQL、MariaDB 的限定名是库，SQLite 的限定名是附加库。对不上当前库就不能当成这张表。 */
+/** MySQL、MariaDB 的限定名是库，必须与连接库名原文相同。SQLite 的 main 不区分大小写，其它附加库同样按原文比较。 */
 function qualifierIsCurrentDatabase(engine: Engine, qualifier: string, database: string): boolean {
-  if (engine === "sqlite" && qualifier === "main" && (database === "" || database === "main")) return true;
+  if (engine === "sqlite" && qualifier.toLowerCase() === "main" && (database === "" || database === "main")) return true;
   return database !== "" && qualifier === database;
 }
 
@@ -239,12 +249,13 @@ export function readSingleTable(sql: string): EditProof {
   const left = readName(tokens[fromAt + 1]);
   if (!left) return { ok: false, reason: "不能确定这条 SELECT 只读取一张基表。" };
   let cursor = fromAt + 2;
-  let table: TableRef = { schema: null, table: left };
+  let table: TableRef = { schema: null, table: left, qualifierSource: null };
   if (tokens[cursor]?.text === ".") {
     const right = readName(tokens[cursor + 1]);
     if (!right) return { ok: false, reason: "不能确定这条 SELECT 只读取一张基表。" };
-    table = { schema: left, table: right };
     cursor += 2;
+    if (tokens[cursor]?.text === ".") return { ok: false, reason: "限定名超过两部分，不能证明只是一张基表。" };
+    table = { schema: left, table: right, qualifierSource: sourceName(tokens[fromAt + 1]) };
   }
   let alias: string | null = null;
   if (word(tokens[cursor]) === "AS") {
@@ -290,7 +301,8 @@ function uniqueTable(matches: readonly TableHit[], unqualified: boolean): Resolv
 /** 限定名对不上当前库、同名表跨模式，或同一模式里只靠大小写区分时，保持只读。 */
 export function resolveEditableTable(table: TableRef, hits: readonly TableHit[], database: string, engine: Engine = "postgres"): ResolvedTable {
   if (table.schema && usesDatabaseQualifier(engine)) {
-    if (!qualifierIsCurrentDatabase(engine, table.schema, database)) {
+    const qualifier = table.qualifierSource ?? table.schema;
+    if (!qualifierIsCurrentDatabase(engine, qualifier, database)) {
       return { ok: false, reason: "限定名不能证明是当前数据库中的对象，结果保持只读。" };
     }
     const matches = nameMatches(table.table, hits, null);

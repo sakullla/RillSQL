@@ -643,7 +643,27 @@ describe("query result edits", () => {
       expect(current).toEqual({ ok: true, schema: "", table: "customers" });
       const unlisted = resolveEditableTable(proof("SELECT id FROM app.customers"), [], "app", engine);
       expect(unlisted.ok).toBe(false);
+      const shopVersusShop = resolveEditableTable(proof("SELECT id, name FROM Shop.customers"), [
+        { schema: "", name: "customers", kind: "table" },
+      ], "shop", engine);
+      expect(shopVersusShop.ok).toBe(false);
+      if (!shopVersusShop.ok) expect(shopVersusShop.reason).toContain("限定名");
+      const upperVersusShop = resolveEditableTable(proof("SELECT id, name FROM SHOP.customers"), [
+        { schema: "", name: "customers", kind: "table" },
+      ], "shop", engine);
+      expect(upperVersusShop.ok).toBe(false);
+      const exactShop = resolveEditableTable(proof("SELECT id, name FROM shop.customers"), [
+        { schema: "", name: "customers", kind: "table" },
+      ], "shop", engine);
+      expect(exactShop).toEqual({ ok: true, schema: "", table: "customers" });
+      const exactSpelling = resolveEditableTable(proof("SELECT id, name FROM Shop.customers"), [
+        { schema: "", name: "customers", kind: "table" },
+      ], "Shop", engine);
+      expect(exactSpelling).toEqual({ ok: true, schema: "", table: "customers" });
     }
+    const threePart = readSingleTable("SELECT id, name FROM app.public.customers");
+    expect(threePart.ok).toBe(false);
+    if (!threePart.ok) expect(threePart.reason).toContain("两部分");
     const attached = resolveEditableTable(proof("SELECT id FROM archive.customers"), [
       { schema: "", name: "customers", kind: "table" },
     ], "main", "sqlite");
@@ -1074,5 +1094,114 @@ describe("query result edits", () => {
     });
     expect(current.attributes("data-editable")).toBe("true");
     current.unmount();
+  });
+
+  it("keeps a database qualifier read-only unless its original spelling matches", async () => {
+    const model = gridModel({ columns: ["id", "name"], rows: [["1", "甲"]] });
+    const cases = [
+      { database: "shop", qualifier: "Shop", editable: false },
+      { database: "shop", qualifier: "SHOP", editable: false },
+      { database: "shop", qualifier: "shop", editable: true },
+      { database: "Shop", qualifier: "Shop", editable: true },
+    ] as const;
+    for (const engine of ["mysql", "mariadb"] as const) {
+      for (const item of cases) {
+        invoke.mockReset();
+        resetCatalog();
+        replaceCatalog([shopCatalog(engine, item.database, [{ name: "", tables: ["customers"] }])]);
+        invoke.mockImplementation(async (command: string) => {
+          if (command === "grid_describe") return { ...customerSchema(), engine, schema: "", database: item.database, name: "customers" };
+          throw new Error(command);
+        });
+        const wrapper = mount(QueryResultGrid, {
+          props: {
+            tabId: `${engine}-${item.database}-${item.qualifier}`,
+            statement: `SELECT id, name FROM ${item.qualifier}.customers`,
+            columns: model.columns,
+            rows: model.rows,
+            truncated: false,
+            connectionId: "shop",
+            engine,
+            database: item.database,
+          },
+        });
+        await flushPromises();
+        const described = invoke.mock.calls.find((call) => call[0] === "grid_describe");
+        if (!item.editable) {
+          expect(described).toBeUndefined();
+          expect(wrapper.attributes("data-editable")).toBe("false");
+          expect(wrapper.text()).toContain("限定名");
+          await wrapper.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
+          await wrapper.get("input[value='insert']").setValue(true);
+          expect(wrapper.get("pre.ex-preview").text()).not.toContain("INSERT");
+        } else {
+          expect(described?.[1]).toMatchObject({
+            request: { database: item.database, schema: "", table: "customers", engine },
+          });
+          expect(wrapper.attributes("data-editable")).toBe("true");
+          await wrapper.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
+          await wrapper.get("input[value='insert']").setValue(true);
+          expect(wrapper.get("pre.ex-preview").text()).toContain("INSERT INTO `customers`");
+        }
+        wrapper.unmount();
+      }
+    }
+  });
+
+  it("stays read-only for a three-part PostgreSQL name and drops an unproved insert target", async () => {
+    replaceCatalog([shopCatalog("postgres", "app", [
+      { name: "app", tables: ["public"] },
+      { name: "public", tables: ["customers"] },
+    ])]);
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return { ...customerSchema(), schema: "app", name: "public" };
+      throw new Error(command);
+    });
+    const model = gridModel({ columns: ["id", "name"], rows: [["1", "甲"]] });
+    const triple = mount(QueryResultGrid, {
+      props: {
+        tabId: "three-part",
+        statement: "SELECT id, name FROM app.public.customers",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+        schema: "public",
+      },
+    });
+    await flushPromises();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(triple.attributes("data-editable")).toBe("false");
+    expect(triple.text()).toContain("两部分");
+    await triple.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
+    await triple.get("input[value='insert']").setValue(true);
+    expect(triple.get("pre.ex-preview").text()).not.toContain("INSERT");
+    expect(triple.text()).not.toContain('"app"."public"');
+    triple.unmount();
+
+    invoke.mockReset();
+    invoke.mockRejectedValue(new Error("找不到表"));
+    const failed = mount(QueryResultGrid, {
+      props: {
+        tabId: "describe-failed",
+        statement: "SELECT id, name FROM public.customers",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+        schema: "public",
+      },
+    });
+    await flushPromises();
+    expect(failed.attributes("data-editable")).toBe("false");
+    expect(failed.text()).toContain("找不到表");
+    await failed.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
+    await failed.get("input[value='insert']").setValue(true);
+    expect(failed.get("pre.ex-preview").text()).not.toContain("INSERT");
+    failed.unmount();
   });
 });
