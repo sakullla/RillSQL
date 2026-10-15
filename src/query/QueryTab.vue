@@ -2,10 +2,14 @@
 import { autocompletion, startCompletion, type CompletionContext } from "@codemirror/autocomplete";
 import { toggleComment } from "@codemirror/commands";
 import { sql } from "@codemirror/lang-sql";
+import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
+import { tags } from "@lezer/highlight";
 import { Prec } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { EditorState } from "@codemirror/state";
 import { basicSetup } from "codemirror";
+import { placeholder } from "@codemirror/view";
+import ChordKeys from "../shell/ChordKeys.vue";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { catalogConnections } from "../catalog/store";
 import { engineMeta } from "../connections/model";
@@ -36,6 +40,22 @@ const emit = defineEmits<{
   target: [target: QueryTarget];
 }>();
 
+const editorPercent = ref(42);
+const cursor = ref({ line: 1, column: 1 });
+let stopResize: (() => void) | null = null;
+function resizeEditor(event: PointerEvent) {
+  event.preventDefault();
+  stopResize?.();
+  const pane = (event.currentTarget as HTMLElement).closest(".query-pane")!;
+  const height = pane.getBoundingClientRect().height;
+  const startY = event.clientY;
+  const start = editorPercent.value;
+  const move = (next: PointerEvent) => { editorPercent.value = Math.max(20, Math.min(70, start + (next.clientY - startY) / height * 100)); };
+  stopResize = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", stopResize!); window.removeEventListener("pointercancel", stopResize!); stopResize = null; };
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", stopResize);
+  window.addEventListener("pointercancel", stopResize);
+}
 const host = ref<HTMLElement | null>(null);
 const targetRoot = ref<HTMLElement | null>(null);
 const runRoot = ref<HTMLElement | null>(null);
@@ -181,7 +201,16 @@ function sqlCompletion(context: CompletionContext) {
 function editorExtensions() {
   return [
     basicSetup,
+    placeholder("-- 在这里编写 SQL\n-- Ctrl+Enter 执行全部或选中的语句"),
     sql(),
+    syntaxHighlighting(HighlightStyle.define([
+      { tag: tags.keyword, color: "var(--tk-kw)" },
+      { tag: tags.string, color: "var(--tk-str)" },
+      { tag: tags.number, color: "var(--tk-num)" },
+      { tag: tags.comment, color: "var(--tk-com)", fontStyle: "italic" },
+      { tag: tags.operator, color: "var(--text-2)" },
+      { tag: tags.name, color: "var(--tk-id)" },
+    ])),
     shellTheme,
     Prec.high(
       keymap.of([
@@ -198,6 +227,8 @@ function editorExtensions() {
       if (update.selectionSet || update.docChanged) {
         const range = update.state.selection.main;
         hasSelection.value = range.from !== range.to;
+        const line = update.state.doc.lineAt(range.head);
+        cursor.value = { line: line.number, column: range.head - line.from + 1 };
       }
       if (!update.docChanged) return;
       const draft = update.state.doc.toString();
@@ -373,13 +404,14 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   alive = false;
+  stopResize?.();
   document.removeEventListener("pointerdown", onPointerDown);
   view?.destroy();
 });
 </script>
 
 <template>
-  <section class="query-pane" aria-label="查询" :data-tab-id="tabId">
+  <section class="query-pane" aria-label="查询" :data-tab-id="tabId" :style="{ '--editor-share': `${editorPercent}%` }">
     <div class="q-toolbar">
       <div ref="targetRoot" class="q-target">
         <button
@@ -431,8 +463,9 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <span v-if="connectionStatus" class="conn-state" :class="`st-${connectionStatus}`"><i></i>{{ CONNECTION_STATUS_TEXT[connectionStatus] }}</span>
+      <span class="grow"></span>
       <div v-if="!running" ref="runRoot" class="run-group">
-        <button class="btn primary run-main" type="button" data-action="run" :disabled="submitting" @click="execute('auto')">{{ submitting ? "正在执行…" : hasSelection ? "执行选中" : "执行" }}</button>
+        <button class="btn primary run-main" type="button" data-action="run" :disabled="submitting" @click="execute('auto')"><span aria-hidden="true">▶</span>{{ submitting ? "正在执行…" : hasSelection ? "执行选中" : "执行" }} <ChordKeys chord="Mod+Enter" /></button>
         <button
           class="btn primary run-more"
           type="button"
@@ -457,12 +490,15 @@ onBeforeUnmount(() => {
     </div>
     <p v-if="notice" class="q-banner">{{ notice }}</p>
     <p v-if="actionError" class="q-banner" role="alert">{{ actionError }}</p>
-    <p class="q-hint" :data-keywords-only="hint.keywordsOnly">{{ hint.note }}</p>
+    <div class="editor-caption"><span><Icon name="code" /> SQL 编辑器</span><span class="q-hint" :data-keywords-only="hint.keywordsOnly" :title="hint.note">{{ hint.note }}</span><span class="mono">{{ buttonEngine ? engineMeta(buttonEngine).label : 'SQL' }}</span></div>
     <div ref="host" class="cm-host"></div>
+    <div class="editor-position"><span>{{ hasSelection ? '已选中 SQL · 执行将仅运行选中部分' : 'Ctrl+Enter 执行 · Ctrl+Shift+Enter 执行当前语句' }}</span><span class="mono">Ln {{ cursor.line }}, Col {{ cursor.column }}</span></div>
+    <div class="query-splitter" role="separator" tabindex="0" aria-label="调整编辑器与结果区域高度" aria-orientation="horizontal" :aria-valuenow="editorPercent" :aria-valuemin="20" :aria-valuemax="70" @pointerdown="resizeEditor" @keydown.up.prevent="editorPercent = Math.max(20, editorPercent - 5)" @keydown.down.prevent="editorPercent = Math.min(70, editorPercent + 5)"><span></span></div>
     <section class="q-results" aria-label="执行结果">
-      <p v-if="!run" class="q-idle">执行 SQL 后，结果显示在这里。默认执行全部内容；选中一段后只执行选中部分，也可以只执行光标所在的当前语句。</p>
+      <div class="results-heading"><span><Icon name="table" />结果</span><span v-if="run" class="q-summary" :data-status="run.status">{{ summary }}</span><span v-else class="muted">等待执行</span><span class="grow"></span><span class="muted">只读结果</span></div>
+      <div v-if="!run" class="q-idle"><Icon name="terminal" /><strong>查询的答案，会出现在这里。</strong><p>选择执行目标，编写 SQL，然后点击执行。</p><ChordKeys chord="Mod+Enter" /></div>
       <template v-else>
-        <p class="q-summary" :data-status="run.status">{{ summary }}</p>
+        <div v-if="run.statements.length > 1" class="result-tabs" role="tablist" aria-label="语句结果"><button v-for="(statement, index) in run.statements" :key="index" role="tab" :aria-selected="resultIndex === index" @click="resultIndex = index">结果 {{ index + 1 }} <span>{{ statement.columns.length ? `${statement.rows.length} 行` : statusLabel(statement.status) }}</span></button></div>
         <p v-if="run.cancel === 'requested'" class="q-note" role="status">取消中…数据库确认后立即停止。</p>
         <p v-else-if="run.cancel === 'confirmed' || run.status === 'cancelled'" class="q-note" role="status">已取消。已读到的结果保留。</p>
         <p v-else-if="run.cancel === 'failed'" class="q-note" role="alert">取消失败，查询仍在执行。可以再次取消。</p>
@@ -571,4 +607,35 @@ onBeforeUnmount(() => {
 .q-sql { margin: 0; white-space: pre-wrap; font-family: var(--mono); font-size: var(--fs-xs); color: var(--text-2); }
 .q-cancel-detail { margin-top: var(--sp-3); padding-top: var(--sp-2); border-top: 1px solid var(--line); font-size: var(--fs-sm); color: var(--text-2); }
 .q-cancel-detail p { margin: 0 0 var(--sp-1); }
+.query-pane .q-toolbar { background: var(--panel); min-height: 54px; }
+.editor-caption { display: flex; align-items: center; gap: 20px; padding: 9px 16px; background: var(--panel-2); border-bottom: 1px solid var(--line); font-size: 10px; color: var(--text-2); }
+.editor-caption > span:first-child { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+.editor-caption .q-hint { flex: 1; font-size: 10px; padding: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.editor-caption > .mono { margin-left: auto; }
+.query-pane .cm-host { flex: 0 1 var(--editor-share); min-height: 90px; }
+.query-pane :deep(.cm-content) { padding-top: 14px; line-height: 1.8; }
+.query-pane :deep(.cm-line) { padding-left: 16px; }
+.query-pane :deep(.cm-gutters) { background: var(--panel-2); border-right: 0; min-width: 44px; }
+.query-pane :deep(.cm-activeLine), .query-pane :deep(.cm-activeLineGutter) { background: var(--sel); }
+.query-pane :deep(.cm-placeholder) { color: var(--text-3); }
+.editor-position { display: flex; justify-content: space-between; gap: 10px; padding: 5px 16px; color: var(--text-3); font-size: 10px; }
+.query-splitter { height: 7px; flex-shrink: 0; display: grid; place-items: center; background: var(--panel-2); border-block: 1px solid var(--line); cursor: row-resize; touch-action: none; }
+.query-splitter span { height: 2px; width: 30px; background: var(--line-2); border-radius: 2px; }
+.query-splitter:hover, .query-splitter:focus-visible { background: var(--accent-soft); }
+.query-pane .q-results { flex: 1; min-height: 130px; padding: 0; gap: 0; border: 0; }
+.results-heading { display: flex; align-items: center; gap: 20px; padding: 10px 16px; border-bottom: 1px solid var(--line); font-size: 11px; flex-shrink: 0; }
+.results-heading > span:first-child { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; }
+.results-heading .q-summary { font-size: 11px; font-weight: 400; }
+.query-pane .q-idle { display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 12px; flex: 1; padding: 24px; color: var(--text-3); background: var(--panel-2); }
+.q-idle > .i { width: 28px; height: 28px; color: var(--accent-text); }
+.q-idle strong { color: var(--text-2); font-size: 13px; font-weight: 500; }
+.q-idle p { margin: 0; font-size: 11px; }
+.result-tabs { display: flex; flex-shrink: 0; gap: 4px; padding: 0 12px; border-bottom: 1px solid var(--line); overflow: auto; }
+.result-tabs button { padding: 8px 12px; font-size: 11px; white-space: nowrap; border-bottom: 2px solid transparent; }
+.result-tabs button[aria-selected="true"] { border-color: var(--accent); color: var(--accent-text); }
+.result-tabs span { font-size: 10px; color: var(--text-3); margin-left: 6px; }
+.q-details { flex-shrink: 0; border: 0; border-top: 1px solid var(--line); border-radius: 0; }
+.q-details .disclosure-body { max-height: 180px; overflow: auto; }
+.run-main :deep(kbd) { background: transparent; color: inherit; opacity: .75; border-color: currentColor; }
+@media (max-width: 800px) { .run-main :deep(.kbd) { display: none; } .target-btn { max-width: 290px; } .q-toolbar .conn-state { display: none; } .editor-caption .q-hint { display: none; } .editor-position > span:first-child { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; } }
 </style>

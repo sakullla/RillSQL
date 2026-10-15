@@ -1,0 +1,20 @@
+{
+  "unitTests": {
+    "passed": 124,
+    "failed": 0,
+    "files": 26
+  },
+  "screenshots": {
+    "count": 72,
+    "failures": []
+  },
+  "browserReport": "workbench-runtime.json",
+  "bundleReport": "workbench-bundle.json",
+  "frontendBuild": "npm run build: passed",
+  "nativeBuild": "workbench-native-build.json",
+  "nativeExportTests": {
+    "command": "cargo test --lib native_export::tests",
+    "failed": 0,
+    "passed": 2
+  }
+}

@@ -4,8 +4,10 @@ import type { Cell, Column } from "./types";
 export const PREVIEW_BYTES = 1024;
 export type NullCopy = "NULL" | "empty" | "N";
 
+const encoder = new TextEncoder();
+
 export function byteLength(text: string): number {
-  return new TextEncoder().encode(text).length;
+  return encoder.encode(text).length;
 }
 
 export interface ShownCell {
@@ -18,8 +20,9 @@ export function showCell(value: Cell | undefined, previewBytes = PREVIEW_BYTES):
   if (value === undefined) return { kind: "unset", label: "未填", title: "尚未填写" };
   if (value === null) return { kind: "null", label: "NULL", title: "NULL" };
   if (value === "") return { kind: "empty", label: "空字符串", title: "空字符串（长度 0）" };
-  if (byteLength(value) > previewBytes) {
-    return { kind: "large", label: `大字段 · ${byteLength(value)} 字节`, title: "只预览了前 1 KB，不是完整值" };
+  const bytes = byteLength(value);
+  if (bytes > previewBytes) {
+    return { kind: "large", label: `大字段 · ${bytes} 字节`, title: "大字段，打开单元格查看完整内容" };
   }
   return { kind: "text", label: value, title: value };
 }

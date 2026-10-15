@@ -2,11 +2,12 @@
 import { computed, nextTick, reactive, ref, watch } from "vue";
 import ExportDialog from "../export/ExportDialog.vue";
 import { planExport, type ExportScope } from "../export/plan";
-import { failIdleRemoteExports, runExportTask, runRemoteExport } from "../export/tasks";
+import { runExportTask, runRemoteExport } from "../export/tasks";
 import type { CsvOptions } from "../export/csv";
 import { loadSettings } from "../shell/settings";
 import { copyPlain, copySqlValue, previewText, showCell, type NullCopy } from "./display";
 import "./grid.css";
+import { useRowWindow } from "./virtual";
 import { LiveTable } from "./live";
 import type { TableTarget } from "./target";
 import { FILTER_OPS, opLabel, opNeedsValue, type Cell, type FilterOp } from "./types";
@@ -33,9 +34,7 @@ const editing = ref<{ id: string; column: string; draft: string; isNull: boolean
 const copyMessage = ref("");
 const receipt = ref<string | null>(null);
 const revealed = reactive(new Set<string>());
-const scrollTop = ref(0);
-const viewport = ref(0);
-const rowHeight = 28;
+watch(() => props.pageSize, size => { if (session && size) session.pageSize = size; });
 
 const columns = computed(() => session?.store.schema.columns ?? []);
 function failureText(id: string, kind: "insert" | "data"): string {
@@ -68,11 +67,10 @@ const displayRows = computed(() => {
 });
 const commitFailures = computed(() => (session ? Array.from(session.failures, ([id, message]) => ({ id, message })) : []));
 const pendingVisible = computed(() => (session ? session.pendingCount > 0 || session.failures.size > 0 : false));
-const windowStart = computed(() => (viewport.value === 0 ? 0 : Math.max(0, Math.floor(scrollTop.value / rowHeight) - 8)));
-const windowEnd = computed(() => (viewport.value === 0 ? displayRows.value.length : Math.min(displayRows.value.length, Math.ceil((scrollTop.value + viewport.value) / rowHeight) + 8)));
-const visibleRows = computed(() => displayRows.value.slice(windowStart.value, windowEnd.value));
-const padTop = computed(() => windowStart.value * rowHeight);
-const padBottom = computed(() => Math.max(0, displayRows.value.length - windowEnd.value) * rowHeight);
+const { viewport, range, onScroll, reveal } = useRowWindow(computed(() => displayRows.value.length), false);
+const visibleRows = computed(() => displayRows.value.slice(range.value.start, range.value.end).map(row => ({ ...row, cells: columns.value.map(column => shown(row.id, column.name)) })));
+const padTop = computed(() => range.value.top);
+const padBottom = computed(() => range.value.bottom);
 const loading = computed(() => !!session && !session.ready && !session.error);
 
 watch(
@@ -81,12 +79,6 @@ watch(
     if (count > 0) receipt.value = null;
   },
 );
-
-function onScroll(event: Event) {
-  const element = event.target as HTMLElement;
-  scrollTop.value = element.scrollTop;
-  viewport.value = element.clientHeight;
-}
 
 const selectedColumn = computed(() => columns.value.find((column) => column.name === session?.selectedColumn) ?? null);
 const selectedRaw = computed(() => (session?.selectedId && session.selectedColumn ? session.cellValue(session.selectedId, session.selectedColumn) : undefined));
@@ -112,6 +104,8 @@ function cellSelector(id: string, column: string): string {
 }
 
 function focusCell(id: string, column: string) {
+  const index = displayRows.value.findIndex(row => row.id === id);
+  if (index >= 0) reveal(index);
   void nextTick(() => {
     (rootEl.value?.querySelector(cellSelector(id, column)) as HTMLElement | null)?.focus();
   });
@@ -119,7 +113,7 @@ function focusCell(id: string, column: string) {
 
 function currentCellIndex(): number {
   if (!session?.selectedId || !session.selectedColumn) return -1;
-  const rowIndex = visibleRows.value.findIndex((row) => row.id === session!.selectedId);
+  const rowIndex = displayRows.value.findIndex((row) => row.id === session!.selectedId);
   const columnIndex = columns.value.findIndex((column) => column.name === session!.selectedColumn);
   if (rowIndex < 0 || columnIndex < 0) return -1;
   return rowIndex * columns.value.length + columnIndex;
@@ -128,7 +122,7 @@ function currentCellIndex(): number {
 /** Tab / Shift+Tab：按桌面习惯在单元格间移动选中，越过边界时循环。 */
 function moveSelection(delta: number) {
   if (!session) return;
-  const rows = visibleRows.value;
+  const rows = displayRows.value;
   const cols = columns.value;
   if (!rows.length || !cols.length) return;
   const total = rows.length * cols.length;
@@ -198,7 +192,10 @@ function onEditorKeydown(event: KeyboardEvent) {
 /** 未编辑时：Enter 开始编辑选中单元格，Tab 移动选中。 */
 function onGridKeydown(event: KeyboardEvent) {
   if (editing.value) return;
-  if (event.key === "Enter") {
+  if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) {
+    event.preventDefault();
+    moveSelection(event.key === "ArrowUp" ? -columns.value.length : event.key === "ArrowDown" ? columns.value.length : event.key === "ArrowLeft" ? -1 : 1);
+  } else if (event.key === "Enter" || event.key === "F2") {
     if (session?.selectedId && session.selectedColumn) {
       event.preventDefault();
       beginEdit(session.selectedId, session.selectedColumn);
@@ -265,7 +262,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
   });
   exportOpen.value = false;
   if (payload.scope === "loaded") {
-    failIdleRemoteExports("没有等到数据库返回。已读取的行改为直接下载。");
+    exportMessage.value = "正在保存 CSV…";
     const columns = session.store.schema.columns.map((column) => column.name);
     void runExportTask({
       plan,
@@ -345,8 +342,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
     <p v-if="filterError" class="grid-alert" role="alert">{{ filterError }}</p>
     <p v-if="exportMessage" class="hint export-message" role="status">{{ exportMessage }}</p>
     <p v-if="session.error" class="grid-alert" role="alert">读取失败：{{ session.error }}。这不是无匹配结果。筛选条件仍保留。</p>
-    <div class="grid-scroll" @scroll="onScroll" @keydown="onGridKeydown">
-      <div :style="{ height: `${padTop}px` }"></div>
+    <div ref="viewport" class="grid-scroll" @scroll.passive="onScroll" @keydown="onGridKeydown">
       <table class="grid-table">
         <thead>
           <tr>
@@ -356,6 +352,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
           </tr>
         </thead>
         <tbody>
+          <tr v-if="padTop" class="virtual-spacer" aria-hidden="true"><td :colspan="columns.length" :style="{ height: `${padTop}px` }"></td></tr>
           <tr v-if="loading">
             <td class="grid-empty" :colspan="columns.length">正在读取表数据…</td>
           </tr>
@@ -371,19 +368,16 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
               <button v-else class="cell-btn" :class="{ on: session.selectedId === row.id && session.selectedColumn === column.name }" :data-cell="`${row.id}:${column.name}`" type="button" @click="session.select(row.id, column.name)" @dblclick="beginEdit(row.id, column.name)">
                 <span v-if="columnIndex === 0 && row.kind === 'insert'" class="row-flag">新增</span>
                 <span v-if="columnIndex === 0 && row.deleted" class="row-flag del">将删除</span>
-                <span v-if="shown(row.id, column.name).kind === 'null'" class="v-null">NULL</span>
-                <span v-else-if="shown(row.id, column.name).kind === 'empty'" class="v-empty">空字符串</span>
-                <span v-else-if="shown(row.id, column.name).kind === 'large'" class="v-large">{{ shown(row.id, column.name).label }}</span>
-                <span v-else>{{ shown(row.id, column.name).label }}</span>
+                <span :class="{ 'v-null': row.cells[columnIndex]?.kind === 'null', 'v-empty': row.cells[columnIndex]?.kind === 'empty', 'v-large': row.cells[columnIndex]?.kind === 'large' }">{{ row.cells[columnIndex]?.label }}</span>
               </button>
             </td>
           </tr>
+          <tr v-if="padBottom" class="virtual-spacer" aria-hidden="true"><td :colspan="columns.length" :style="{ height: `${padBottom}px` }"></td></tr>
           <tr v-if="!loading && !displayRows.length && !session.error">
             <td class="grid-empty" :colspan="columns.length">没有匹配的行。调整或移除筛选条件后再试。</td>
           </tr>
         </tbody>
       </table>
-      <div :style="{ height: `${padBottom}px` }"></div>
     </div>
     <footer class="grid-foot">
       <template v-if="session.truncated">

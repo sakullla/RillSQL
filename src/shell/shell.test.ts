@@ -146,7 +146,7 @@ describe("shell layout", () => {
     expect(css).toContain(".caption-close");
     expect(css).toContain(".titlebar.custom-chrome");
     expect(css).toContain(".statusbar");
-    expect(css).toContain(".welcome-grid");
+    expect(readFileSync(resolve(root, "src/styles/workbench.css"), "utf8")).toContain(".desk-columns");
     expect(css).toContain(".tab-target");
     expect(css).toContain("#palette");
     // 字号与动效时长一律引用令牌（ADR-3）

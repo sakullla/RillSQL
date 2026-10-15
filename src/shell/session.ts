@@ -126,7 +126,7 @@ export function createSession(initialHash = ""): ShellSession {
   const page = ref<AppPage>(parseHash(initialHash));
   const tabs = ref<ShellTab[]>([]);
   const activeId = ref<string | null>(null);
-  const sidebarHidden = ref(false);
+  const sidebarHidden = ref(typeof window !== "undefined" && window.innerWidth <= 960);
   const sidebarWidth = ref(268);
   const paletteOpen = ref(false);
   const paletteMode = ref<"all" | "tables">("all");

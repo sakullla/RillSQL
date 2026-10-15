@@ -11,6 +11,8 @@ const props = defineProps<{ theme: ThemePreference; caption?: boolean }>();
 const emit = defineEmits<{
   palette: [];
   help: [];
+  "new-query": [];
+  "toggle-sidebar": [];
   "set-theme": [theme: ThemePreference];
   "window-state": [state: { custom: boolean; maximized: boolean }];
 }>();
@@ -40,6 +42,7 @@ const choices: { id: ThemePreference; label: string }[] = [
       <BrandMark />
       <strong>RillSQL</strong>
       <span class="brand-cn">澄库</span>
+      <button class="icon-btn sidebar-toggle" data-tauri-drag-region="false" type="button" aria-label="显示或隐藏资源管理器" title="资源管理器 (Ctrl+B)" @click="emit('toggle-sidebar')"><Icon name="sidebar" /></button>
     </div>
     <button class="cmd-trigger" type="button" aria-label="打开命令面板" @click="emit('palette')">
       <Icon name="search" />
@@ -47,6 +50,7 @@ const choices: { id: ThemePreference; label: string }[] = [
       <ChordKeys chord="Mod+K" />
     </button>
     <div class="tb-actions" :data-tauri-drag-region="showCaption ? 'false' : undefined">
+      <button class="btn sm title-query" type="button" @click="emit('new-query')"><Icon name="plus" /> SQL 查询</button>
       <TaskCenter />
       <details class="theme-menu">
         <summary class="icon-btn" :aria-label="`外观主题：${choices.find((item) => item.id === theme)?.label}`" title="外观主题">

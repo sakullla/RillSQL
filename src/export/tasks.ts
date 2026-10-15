@@ -4,6 +4,7 @@ import type { Filter, SortSpec } from "../grid/types";
 import { renderCsv, type CsvCell, type CsvOptions } from "./csv";
 import type { ExportPlan } from "./plan";
 import type { WriteControl, WriteResult } from "./write";
+import { isNativeExport, writeNativeCsv } from "./native";
 
 export interface ExportTask {
   id: string;
@@ -15,6 +16,7 @@ export interface ExportTask {
   partial: boolean;
   message: string;
   residualPath: string | null;
+  cancellable?: boolean;
 }
 
 export const exportTasks = reactive<ExportTask[]>([]);
@@ -120,7 +122,7 @@ export async function runExportTask(options: {
   readRows?: () => readonly Record<string, CsvCell>[];
 }): Promise<{ task: ExportTask; result: WriteResult }> {
   const fileName = options.path.split(/[/\\]/).pop() || options.plan.fileName;
-  const task: ExportTask = {
+  const task = reactive<ExportTask>({
     id: `export-${taskSeq}`,
     fileName,
     path: options.path,
@@ -129,11 +131,29 @@ export async function runExportTask(options: {
     totalRows: options.rows.length,
     partial: options.plan.partial,
     message: "正在导出",
+    cancellable: false,
     residualPath: null,
-  };
+  });
   taskSeq += 1;
   exportTasks.unshift(task);
-  const result = import.meta.env.VITEST ? await startExportOnNode(options, task) : exportLoadedInBrowser(options);
+  let result: WriteResult;
+  try {
+    if (!options.plan.allowed) result = blockedExport(options.plan.rejectReason ?? "不能导出");
+    else if (isNativeExport()) {
+      if (options.plan.serverRead) result = blockedExport("全量导出需要使用已打开的数据库连接。");
+      else {
+        await writeNativeCsv(options.path, renderCsv(options.columns, options.rows, options.csv));
+        result = {
+          status: "done", success: true, writtenRows: options.rows.length, path: options.path,
+          residualPath: null, readCalled: false,
+          message: `已导出 ${options.rows.length} 行到 ${options.path}。${options.plan.partial ? "仅包含已读取的行，不是完整结果。" : ""}`,
+        };
+      }
+    } else result = import.meta.env.VITEST ? await startExportOnNode(options, task) : exportLoadedInBrowser(options);
+  } catch (error) {
+    result = { status: "failed", success: false, writtenRows: 0, path: null, residualPath: null, readCalled: false,
+      message: `导出失败：${error instanceof Error ? error.message : String(error)}` };
+  }
   applyWriteResult(task, result);
   return { task, result };
 }
@@ -180,7 +200,7 @@ function applyExportResult(task: ExportTask, result: ExportResult): void {
 
 export function runRemoteExport(options: RemoteExportOptions): { task: ExportTask; done: Promise<ExportTask> } {
   const fileName = options.path.split(/[/\\]/).pop() || options.plan.fileName;
-  const task: ExportTask = {
+  const task = reactive<ExportTask>({
     id: `export-${taskSeq}`,
     fileName,
     path: options.path,
@@ -190,7 +210,7 @@ export function runRemoteExport(options: RemoteExportOptions): { task: ExportTas
     partial: options.plan.partial,
     message: "正在从已打开的连接导出",
     residualPath: null,
-  };
+  });
   taskSeq += 1;
   exportTasks.unshift(task);
   const done = gridExport({

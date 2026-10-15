@@ -1,11 +1,9 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { listPaletteTables, startCatalog } from "../catalog";
 import { objectIdentity, type CatalogObjectRef } from "../catalog/object-ref";
 import { catalogConnections } from "../catalog/store";
-import ConnectionsPage from "../connections/ConnectionsPage.vue";
 import { listPaletteConnections } from "../connections";
-import HistoryPage from "../history/HistoryPage.vue";
 import type { OpenPlan } from "../history/plan";
 import { attachCloser, guardClose } from "../query/runtime";
 import { parseHash } from "../router";
@@ -13,7 +11,6 @@ import ActivityRail from "./ActivityRail.vue";
 import CommandPalette from "./CommandPalette.vue";
 import { shellCommands, type PaletteItem } from "./commands";
 import { syncProductIdentity } from "./identity";
-import SettingsView from "./SettingsView.vue";
 import { loadSettings, saveSettings, type ShellSettings } from "./settings";
 import { createSession, STRUCTURE_PLACEHOLDER } from "./session";
 import type { ConnectionStatus } from "./status-text";
@@ -24,6 +21,10 @@ import { applyDocumentTheme, prefersDarkScheme, type ThemePreference } from "./t
 import TitleBar from "./TitleBar.vue";
 import WorkspaceView from "./WorkspaceView.vue";
 import type { AppPage } from "../router";
+
+const ConnectionsPage = defineAsyncComponent(() => import("../connections/ConnectionsPage.vue"));
+const HistoryPage = defineAsyncComponent(() => import("../history/HistoryPage.vue"));
+const SettingsView = defineAsyncComponent(() => import("./SettingsView.vue"));
 
 const session = createSession(typeof location === "undefined" ? "" : location.hash);
 const windowChrome = ref({ custom: false, maximized: false });
@@ -108,6 +109,7 @@ function persist() {
 }
 
 function onOpenObject(object: CatalogObjectRef, pane: "data" | "structure", section?: "columns" | "drop") {
+  if (window.innerWidth <= 960) session.sidebarHidden.value = true;
   session.openTable({
     id: objectIdentity(object),
     label: object.name,
@@ -256,9 +258,10 @@ onBeforeUnmount(() => {
 <template>
   <div class="app-root" :class="{ 'sidebar-hidden': session.sidebarHidden.value || session.page.value !== 'workspace', 'custom-chrome': windowChrome.custom, 'is-maximized': windowChrome.maximized }">
     <a class="skip" href="#main">跳到主区域</a>
-    <TitleBar :theme="settings.theme" @palette="session.openPalette('all')" @help="session.openHelp()" @set-theme="setTheme" @window-state="windowChrome = $event" />
+    <TitleBar :theme="settings.theme" @palette="session.openPalette('all')" @help="session.openHelp()" @set-theme="setTheme" @window-state="windowChrome = $event" @new-query="session.openQuery()" @toggle-sidebar="session.toggleSidebar()" />
     <div class="body">
       <ActivityRail :page="session.page.value" @navigate="onNavigate" />
+      <button v-if="session.page.value === 'workspace' && !session.sidebarHidden.value" class="sidebar-dismiss" aria-label="关闭资源管理器" @click="session.toggleSidebar()"></button>
       <Sidebar
         v-if="session.page.value === 'workspace' && !session.sidebarHidden.value"
         :width="session.sidebarWidth.value"
@@ -269,9 +272,10 @@ onBeforeUnmount(() => {
       />
       <main id="main" tabindex="-1">
         <WorkspaceView
-          v-if="session.page.value === 'workspace'"
+          v-show="session.page.value === 'workspace'"
           :tabs="session.tabs.value"
           :active-id="session.activeId.value"
+          :page-size="settings.pageSize"
           @activate="session.activateTab"
           @close="session.closeTab"
           @new-query="session.openQuery()"
@@ -282,10 +286,11 @@ onBeforeUnmount(() => {
           @draft="session.setDraft"
           @target="session.setQueryTarget"
           @table-view="session.setTableView"
+          @query-target="target => session.openQueryDraft({ ...target, sql: '', needsTarget: false, notice: null })"
         />
-        <ConnectionsPage v-else-if="session.page.value === 'connections'" :sqlite-prompt="sqlitePrompt" />
+        <ConnectionsPage v-if="session.page.value === 'connections'" :sqlite-prompt="sqlitePrompt" @sqlite-consumed="sqlitePrompt = 0" @workspace="session.showPage('workspace')" @query-target="target => session.openQueryDraft({ ...target, sql: '', needsTarget: false, notice: null })" />
         <HistoryPage v-else-if="session.page.value === 'history'" @open="onHistoryOpen" />
-        <SettingsView v-else :settings="settings" :data-dir="dataDir" @change="onSettings" @help="session.openHelp()" />
+        <SettingsView v-else-if="session.page.value === 'settings'" :settings="settings" :data-dir="dataDir" @change="onSettings" @help="session.openHelp()" />
       </main>
     </div>
     <StatusBar :tab="session.activeTab.value" :on-workspace="session.page.value === 'workspace'" />

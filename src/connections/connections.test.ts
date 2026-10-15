@@ -103,9 +103,10 @@ describe("connections page", () => {
     const card = wrapper.get("article.conn-card");
     expect(card.text()).toContain("Atlas");
     expect(card.text()).toContain("MySQL");
-    expect(card.text()).toContain("db.example.test:3306 / app");
+    expect(card.find(".cc-addr").text()).toBe("db.example.test:3306");
+    expect(card.find(".cc-endpoint small").text()).toBe("app");
     expect(card.text()).toContain("未连接");
-    expect(card.text()).toContain("加密连接 · 核对证书");
+    expect(card.text()).toContain("TLS · 核对证书");
     expect(card.text()).toContain("密码已保存");
 
     await wrapper.get("[data-action=conn-new]").trigger("click");

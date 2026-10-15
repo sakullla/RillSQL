@@ -20,6 +20,8 @@ const themes: { id: ThemePreference; label: string; icon: "sun" | "moon" | "moni
   { id: "system", label: "跟随系统", icon: "monitor" },
 ];
 
+function scrollSection(id: string) { document.getElementById(id)?.scrollIntoView({ block: "start" }); }
+
 function setTheme(theme: ThemePreference) {
   emit("change", { theme });
 }
@@ -40,12 +42,13 @@ function onNullCopy(event: Event) {
     <div class="page-inner narrow">
       <div class="page-head">
         <div>
-          <div class="eyebrow"><Icon name="sliders" />设置</div>
+          <div class="eyebrow">PREFERENCES</div>
           <h1>设置</h1>
           <p>修改立即生效，只保存在本机。</p>
         </div>
       </div>
-      <section class="set-sec">
+      <nav class="settings-nav" aria-label="设置分区"><button class="btn sm" @click="scrollSection('appearance')">外观与编辑器</button><button class="btn sm" @click="scrollSection('reading')">数据读取</button><button class="btn sm" @click="scrollSection('local')">本地数据</button></nav>
+      <section id="appearance" class="set-sec">
         <h2>外观</h2>
         <div class="set-row">
           <div class="set-text">
@@ -90,7 +93,7 @@ function onNullCopy(event: Event) {
           </div>
         </div>
       </section>
-      <section class="set-sec">
+      <section id="reading" class="set-sec">
         <h2>数据读取</h2>
         <div class="set-row">
           <div class="set-text">
@@ -139,7 +142,7 @@ function onNullCopy(event: Event) {
           </div>
         </div>
       </section>
-      <section class="set-sec">
+      <section id="local" class="set-sec">
         <h2>本地数据</h2>
         <div class="set-row">
           <div class="set-text">

@@ -45,7 +45,7 @@ function percent(task: ExportTask): number {
           <span class="badge" :class="badgeVariant(task.status)">{{ taskStatusLabel(task.status) }}</span>
           <span class="tc-name" :title="task.path">{{ task.fileName }}</span>
           <span class="grow"></span>
-          <button v-if="task.status === 'running'" class="btn sm" type="button" @click="cancel(task.id)">取消</button>
+          <button v-if="task.status === 'running' && task.cancellable !== false" class="btn sm" type="button" @click="cancel(task.id)">取消</button>
         </div>
         <div
           v-if="task.status === 'running'"
@@ -66,7 +66,7 @@ function percent(task: ExportTask): number {
 
 <style scoped>
 .task-center { position: relative; }
-.tc-trigger { display: inline-flex; align-items: center; gap: var(--sp-1); height: 26px; padding: 0 var(--sp-3); border-radius: var(--r-full); background: var(--sunken); color: var(--text-2); font-size: var(--fs-xs); transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease); }
+.tc-trigger { white-space: nowrap; display: inline-flex; align-items: center; gap: var(--sp-1); height: 26px; padding: 0 var(--sp-3); border-radius: var(--r-full); background: var(--sunken); color: var(--text-2); font-size: var(--fs-xs); transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease); }
 .tc-trigger:hover { background: var(--hover); color: var(--text); }
 .tc-trigger .i { width: 13px; height: 13px; }
 .tc-trigger.busy { background: var(--accent-soft); color: var(--accent-text); }

@@ -1,5 +1,5 @@
 import { EditorView } from "@codemirror/view";
-import { mount, type VueWrapper } from "@vue/test-utils";
+import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { nextTick } from "vue";
 import { resetCatalog, replaceCatalog } from "../catalog/store";
@@ -60,6 +60,8 @@ async function replaceDraft(wrapper: VueWrapper, text: string) {
   expect(view).toBeTruthy();
   view!.dispatch({ changes: { from: 0, to: view!.state.doc.length, insert: text } });
   await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
 }
 
 function paletteItem(wrapper: VueWrapper, label: string) {
@@ -69,7 +71,7 @@ function paletteItem(wrapper: VueWrapper, label: string) {
 }
 
 function welcomeAction(wrapper: VueWrapper, label: string) {
-  const item = wrapper.findAll(".welcome-more .btn").find((node) => node.text().includes(label));
+  const item = wrapper.findAll(".welcome button").find((node) => node.text().includes(label));
   expect(item, label).toBeTruthy();
   return item!;
 }
@@ -78,23 +80,39 @@ describe("workspace tab identity", () => {
   it("keeps query drafts on the tab that owns them", async () => {
     const wrapper = mount(AppShell);
     await welcomeAction(wrapper, "新建查询").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(wrapper.get("[aria-label='查询']").attributes("data-tab-id")).toBe("query-1");
     await replaceDraft(wrapper, "SELECT alpha");
     await wrapper.get(".tab-new").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(wrapper.get("[aria-label='查询']").attributes("data-tab-id")).toBe("query-2");
     await replaceDraft(wrapper, "SELECT beta");
 
     await wrapper.findAll(".tab")[0]!.trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
     await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(wrapper.get("[aria-label='查询']").attributes("data-tab-id")).toBe("query-1");
     expect(editorText(wrapper)).toBe("SELECT alpha");
 
     await wrapper.findAll(".tab")[1]!.trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
     await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(editorText(wrapper)).toBe("SELECT beta");
 
     await wrapper.get(".tab.active .tab-x").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
     await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(wrapper.findAll(".tab")).toHaveLength(1);
     expect(wrapper.get(".tab-title").text()).toBe("查询 1");
     expect(wrapper.get("[aria-label='查询']").attributes("data-tab-id")).toBe("query-1");
@@ -104,7 +122,9 @@ describe("workspace tab identity", () => {
 
   it("opens table and structure tabs from the welcome page and the command palette", async () => {
     const welcome = mount(AppShell);
-    await welcomeAction(welcome, "新建表结构").trigger("click");
+    await welcomeAction(welcome, "设计新表结构").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(welcome.get("[aria-label='表结构']").attributes("data-tab-id")).toBe("structure:placeholder");
     expect(welcome.get("[aria-label='表结构']").attributes("data-draft")).toBe("");
     expect(welcome.get(".tab-title").text()).toBe("新建表结构");
@@ -112,11 +132,19 @@ describe("workspace tab identity", () => {
 
     const wrapper = mount(AppShell);
     await wrapper.get(".cmd-trigger").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
     await paletteItem(wrapper, "新建表结构").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(wrapper.get("[aria-label='表结构']").attributes("data-tab-id")).toBe("structure:placeholder");
 
     await wrapper.get(".cmd-trigger").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
     await paletteItem(wrapper, "customers").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(wrapper.findAll(".tab")).toHaveLength(2);
     const grid = wrapper.get("[aria-label='数据表格']");
     expect(grid.attributes("data-tab-id")).toBe("table:customers");
@@ -127,11 +155,19 @@ describe("workspace tab identity", () => {
     expect(wrapper.get(".statusbar").text()).toContain("shop / public");
 
     await wrapper.get(".cmd-trigger").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
     await paletteItem(wrapper, "customers").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(wrapper.findAll(".tab")).toHaveLength(2);
 
     await wrapper.findAll(".tab")[0]!.trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
     await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(wrapper.get("[aria-label='表结构']").attributes("data-tab-id")).toBe("structure:placeholder");
     expect(wrapper.find("[aria-label='数据表格']").exists()).toBe(false);
     wrapper.unmount();
@@ -164,11 +200,17 @@ describe("workspace tab identity", () => {
     replaceCatalog([postgresCatalog()]);
     const wrapper = mount(AppShell);
     await welcomeAction(wrapper, "新建查询").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
     await wrapper.get(".tab-new").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(wrapper.findAll(".tab")).toHaveLength(2);
 
     const plus = contextMenu(wrapper.get(".tab-new").element);
     await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(plus.defaultPrevented).toBe(true);
     expect(document.body.querySelector("[data-menu=tab]")).toBeNull();
 
@@ -177,6 +219,8 @@ describe("workspace tab identity", () => {
     expect(wrapper.get(".statusbar").text()).toContain("还未选择执行目标");
     const opened = contextMenu(first.element);
     await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(opened.defaultPrevented).toBe(true);
     const menu = tabMenu();
     expect(menu.textContent).toContain("选择执行目标");
@@ -187,6 +231,8 @@ describe("workspace tab identity", () => {
 
     menu.querySelector<HTMLButtonElement>("[data-action=bind-target]")?.click();
     await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(document.body.querySelector("[data-menu=tab]")).toBeNull();
     expect(wrapper.findAll(".tab")[0]!.get(".tab-target").text()).toBe("127.0.0.1 / rillsql");
     expect(wrapper.get(".statusbar").text()).toContain("127.0.0.1 / rillsql");
@@ -194,20 +240,28 @@ describe("workspace tab identity", () => {
 
     contextMenu(wrapper.findAll(".tab")[0]!.element);
     await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
     const rebound = tabMenu();
     const picked = rebound.querySelector("[data-key]") as HTMLElement | null;
     expect(picked?.querySelector(".check")).toBeTruthy();
     rebound.querySelector<HTMLButtonElement>("[data-action=close-others]")?.click();
     await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(wrapper.findAll(".tab")).toHaveLength(1);
     expect(wrapper.get(".tab-title").text()).toBe("查询 1");
     expect(wrapper.get(".tab-target").text()).toBe("127.0.0.1 / rillsql");
 
     contextMenu(wrapper.get(".tab").element);
     await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(tabMenu().querySelector<HTMLButtonElement>("[data-action=close-others]")?.disabled).toBe(true);
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
     await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(document.body.querySelector("[data-menu=tab]")).toBeNull();
     wrapper.unmount();
   });
@@ -215,9 +269,15 @@ describe("workspace tab identity", () => {
   it("switches a table tab between data and structure from the tab menu", async () => {
     const wrapper = mount(AppShell);
     await wrapper.get(".cmd-trigger").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
     await paletteItem(wrapper, "customers").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
     const opened = contextMenu(wrapper.get(".tab").element);
     await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(opened.defaultPrevented).toBe(true);
     const menu = tabMenu();
     expect(menu.textContent).toContain("数据");
@@ -225,14 +285,20 @@ describe("workspace tab identity", () => {
     expect(menu.textContent).not.toContain("选择执行目标");
     menu.querySelector<HTMLButtonElement>("[data-action=show-structure]")?.click();
     await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(document.body.querySelector("[data-menu=tab]")).toBeNull();
     expect(wrapper.get("[aria-label='表结构']").attributes("data-tab-id")).toBe("table:customers");
     expect(wrapper.find("[aria-label='数据表格']").exists()).toBe(false);
 
     contextMenu(wrapper.get(".tab").element);
     await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
     tabMenu().querySelector<HTMLButtonElement>("[data-action=show-data]")?.click();
     await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
     expect(wrapper.get("[aria-label='数据表格']").attributes("data-tab-id")).toBe("table:customers");
     wrapper.unmount();
   });

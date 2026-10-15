@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
-import { refreshCatalog } from "../catalog/store";
+import { catalogConnections, refreshCatalog } from "../catalog/store";
 import { tauriConnectionApi, type ConnectionApi, type EnvTagInput, type TestReport } from "./api";
 import ConnIcon from "./ConnIcon.vue";
 import EnvTagField from "./EnvTagField.vue";
@@ -24,6 +24,9 @@ import {
 import "./connections.css";
 
 const props = defineProps<{ sqlitePrompt: number; api?: ConnectionApi }>();
+const emit = defineEmits<{ workspace: []; "sqlite-consumed": []; "query-target": [target: import("../shell/session").QueryTarget] }>();
+const engineFilter = ref("all");
+const envFilter = ref("all");
 const api = computed(() => props.api ?? tauriConnectionApi);
 
 const connections = ref<SavedConnection[]>([]);
@@ -59,12 +62,24 @@ const tagError = ref("");
 
 const filtered = computed(() => {
   const q = query.value.trim().toLowerCase();
-  if (!q) return connections.value;
   return connections.value.filter((item) =>
+    (engineFilter.value === "all" || item.engine === engineFilter.value) &&
+    (envFilter.value === "all" || item.env === envFilter.value) &&
     [item.name, item.host, item.filePath, item.database, engineMeta(item.engine).label].some((value) => value && value.toLowerCase().includes(q)),
   );
 });
 
+function openWorkspace(connection: SavedConnection) {
+  const catalog = catalogConnections().find(item => item.id === connection.id);
+  const database = catalog?.defaultDatabase ?? catalog?.databases[0]?.name ?? connection.database ?? (connection.engine === "sqlite" ? "main" : null);
+  if (database == null) { emit("workspace"); return; }
+  emit("query-target", { connectionId: connection.id, connectionName: connection.name, database, engine: connection.engine, status: "connected" });
+}
+function connectionState(id: string) {
+  return statuses.value[id] ?? catalogConnections().find(item => item.id === id)?.status ?? "disconnected";
+}
+const connectedCount = computed(() => connections.value.filter(item => connectionState(item.id) === "connected").length);
+const stateLabels: Record<string, string> = { connected: "已连接", connecting: "正在连接…", disconnected: "未连接", error: "连接失败", lost: "连接中断" };
 const failedStage = computed(() => report.value?.stages.find((stage) => stage.status === "err") ?? null);
 
 const advancedHint = computed(() =>
@@ -311,10 +326,12 @@ async function connectSaved(connection: SavedConnection, typed: SecretInput) {
       if (outcome.report.summary) versions.value = { ...versions.value, [connection.id]: outcome.report.summary };
       if (outcome.foreignKeys != null) foreignKeys.value = { ...foreignKeys.value, [connection.id]: outcome.foreignKeys };
       closeEditor();
+      await refreshCatalog();
+      if (catalogConnections().some(item => item.id === connection.id)) delete statuses.value[connection.id];
     } else {
       statuses.value = { ...statuses.value, [connection.id]: "error" };
-      dialog.value = "edit";
-      show(editDialog.value);
+      openEditor(connection);
+      report.value = outcome.report;
     }
   } catch (error) {
     statuses.value = { ...statuses.value, [connection.id]: "error" };
@@ -353,6 +370,8 @@ async function disconnect(connection: SavedConnection) {
   menuId.value = null;
   await api.value.disconnect(connection.id);
   statuses.value = { ...statuses.value, [connection.id]: "disconnected" };
+  await refreshCatalog();
+  delete statuses.value[connection.id];
 }
 
 function askDelete(connection: SavedConnection) {
@@ -391,12 +410,14 @@ watch(
   async (value) => {
     if (value <= 0) return;
     const file = await pickSqliteFile();
+    emit("sqlite-consumed");
     openEditor(undefined, "sqlite");
     if (file) {
       draft.value.filePath = file;
       draft.value.name = draft.value.name || file.split(/[/\\]/).pop() || file;
     }
   },
+  { immediate: true },
 );
 </script>
 
@@ -404,66 +425,36 @@ watch(
   <div class="page conn-page" @click="menuId = null">
     <div class="page-inner">
       <div class="page-head">
-        <div>
-          <div class="eyebrow"><ConnIcon name="database" />连接</div>
-          <h1>连接管理</h1>
-          <p>连接配置只保存在本机。选择保存密码时写入操作系统凭据库，不会出现在配置文件或日志中。删除配置不会删除数据库或 SQLite 文件。</p>
-        </div>
-        <div class="ph-actions">
-          <label class="mini-search">
-            <ConnIcon name="search" />
-            <input v-model="query" placeholder="搜索名称、地址或文件" aria-label="搜索连接" />
-          </label>
-          <button class="btn primary" type="button" data-action="conn-new" @click.stop="openEditor()">
-            <ConnIcon name="plus" />新建连接
-          </button>
-        </div>
+        <div><div class="eyebrow">DATABASE CONNECTIONS</div><h1>连接管理</h1><p>一个入口，管理你的本地与远程数据库。</p></div>
+        <div class="ph-actions"><button class="btn" type="button" @click="openEditor(undefined, 'sqlite')"><ConnIcon name="file" />打开 SQLite</button><button class="btn primary" type="button" data-action="conn-new" @click.stop="openEditor()"><ConnIcon name="plus" />新建连接</button></div>
       </div>
-      <p v-if="loadError" class="page-note">{{ loadError }}</p>
-      <p v-else-if="note" class="page-note">{{ note }}</p>
+      <div class="connection-overview"><span><b>{{ connections.length }}</b> 个连接</span><span class="online-total"><i></i><b>{{ connectedCount }}</b> 个已连接</span><span class="grow"></span><span><ConnIcon name="lock" />凭据保存在本机</span></div>
+      <div class="connection-filters">
+        <label class="mini-search"><ConnIcon name="search" /><input v-model="query" type="search" placeholder="搜索名称、地址或文件…" aria-label="搜索连接" /></label>
+        <select v-model="engineFilter" aria-label="按数据库类型筛选"><option value="all">全部数据库类型</option><option v-for="engine in ENGINES" :key="engine.id" :value="engine.id">{{ engine.label }}</option></select>
+        <select v-model="envFilter" aria-label="按环境筛选"><option value="all">全部环境</option><option v-for="tag in tags" :key="tag.id" :value="tag.id">{{ tag.label }}</option><option value="none">无标签</option></select>
+        <span class="grow"></span><span class="muted sm">{{ filtered.length }} 个连接</span>
+      </div>
+      <p v-if="loadError" class="page-note" role="alert">{{ loadError }}</p><p v-else-if="note" class="page-note" role="status">{{ note }}</p>
       <div class="conn-grid">
-        <article v-for="item in filtered" :key="item.id" class="conn-card" :class="`st-${statuses[item.id] ?? 'disconnected'}`">
+        <div class="connection-columns" aria-hidden="true"><span>连接 / 数据库</span><span>地址</span><span>传输与认证</span><span>状态 / 操作</span></div>
+        <article v-for="item in filtered" :key="item.id" class="conn-card" :class="`st-${connectionState(item.id)}`">
           <header>
             <span class="eng lg" :class="`eng-${item.engine}`">{{ engineMeta(item.engine).short }}</span>
-            <div class="cc-title">
-              <h3>{{ item.name }}</h3>
-              <p>{{ versions[item.id] || engineMeta(item.engine).label }}</p>
-            </div>
-            <span class="env" :class="`env-${envView(item.env).tone}`">{{ envView(item.env).label }}</span>
+            <div class="cc-title"><h3>{{ item.name }}</h3><p>{{ engineMeta(item.engine).label }} <span class="env" :class="`env-${envView(item.env).tone}`">{{ envView(item.env).label }}</span></p></div>
           </header>
-          <p v-if="item.engine === 'sqlite'" class="cc-addr mono" :title="item.filePath ?? ''">{{ item.filePath }}</p>
-          <p v-else class="cc-addr mono">{{ item.host }}:{{ item.port }}<span v-if="item.database" class="muted"> / {{ item.database }}</span></p>
+          <div class="cc-endpoint"><p v-if="item.engine === 'sqlite'" class="cc-addr mono" :title="item.filePath ?? ''">{{ item.filePath }}</p><p v-else class="cc-addr mono" :title="`${item.host}:${item.port}`">{{ item.host }}:{{ item.port }}</p><small>{{ item.engine === 'sqlite' ? '本地文件' : item.database || '未指定默认数据库' }}</small></div>
           <div class="cc-badges">
-            <template v-if="item.engine === 'sqlite'">
-              <span class="badge"><ConnIcon name="file" />本地文件</span>
-              <span class="badge" :class="foreignKeys[item.id] ? 'ok' : 'warn'">外键约束{{ foreignKeys[item.id] ? "已开启" : "未开启" }}</span>
-            </template>
-            <template v-else>
-              <span v-if="item.tls?.mode === 'verify'" class="badge ok"><ConnIcon name="shield" />加密连接 · 核对证书</span>
-              <span v-else-if="item.tls?.mode === 'require'" class="badge warn"><ConnIcon name="lock" />加密连接 · 不核对证书</span>
-              <span v-else class="badge warn"><ConnIcon name="unlock" />不加密</span>
-              <span v-if="item.ssh" class="badge"><ConnIcon name="tunnel" />经 SSH 跳板机</span>
-              <span class="badge"><ConnIcon name="key" />{{ item.passwordSaved ? "密码已保存" : "每次询问密码" }}</span>
-            </template>
+            <template v-if="item.engine === 'sqlite'"><span class="badge"><ConnIcon name="file" />本地文件</span><span v-if="foreignKeys[item.id] != null" class="badge" :class="foreignKeys[item.id] ? 'ok' : 'warn'">外键约束{{ foreignKeys[item.id] ? '已开启' : '未开启' }}</span></template>
+            <template v-else><span v-if="item.tls?.mode === 'verify'" class="badge ok"><ConnIcon name="shield" />TLS · 核对证书</span><span v-else-if="item.tls?.mode === 'require'" class="badge warn"><ConnIcon name="lock" />TLS · 不核对证书</span><span v-else class="badge warn"><ConnIcon name="unlock" />不加密</span><span v-if="item.ssh" class="badge"><ConnIcon name="tunnel" />SSH</span><small>{{ item.passwordSaved ? '密码已保存' : '每次询问密码' }}</small></template>
           </div>
-          <footer>
-            <span class="conn-state" :class="`st-${statuses[item.id] ?? 'disconnected'}`"><i></i>{{ statuses[item.id] === "connected" ? "已连接" : statuses[item.id] === "connecting" ? "正在连接…" : statuses[item.id] === "error" ? "连接失败" : "未连接" }}</span>
-            <span class="grow"></span>
-            <button v-if="statuses[item.id] === 'connected'" class="btn sm" type="button" @click.stop="disconnect(item)"><ConnIcon name="unplug" />断开</button>
-            <button v-else class="btn sm primary" type="button" data-action="conn-connect" @click.stop="requestConnect(item)"><ConnIcon name="plug" />连接</button>
-            <button class="icon-btn" type="button" :aria-label="`${item.name} 的更多操作`" data-action="conn-menu" @click.stop="menuId = menuId === item.id ? null : item.id"><ConnIcon name="more" /></button>
-          </footer>
-          <div v-if="menuId === item.id" class="conn-menu" @click.stop>
-            <button type="button" @click="showDetails(item)"><ConnIcon name="info" />连接详情</button>
-            <button type="button" data-action="conn-edit" @click="openEditor(item)"><ConnIcon name="pencil" />编辑配置…</button>
-            <button type="button" class="danger" data-action="conn-delete" @click="askDelete(item)"><ConnIcon name="trash" />删除配置…</button>
-          </div>
+          <footer><span class="conn-state" :class="`st-${connectionState(item.id)}`"><i></i>{{ stateLabels[connectionState(item.id)] }}</span><span class="grow"></span><button v-if="connectionState(item.id) === 'connected'" class="btn sm" type="button" @click.stop="openWorkspace(item)">打开</button><button v-else class="btn sm" type="button" data-action="conn-connect" :disabled="connectionState(item.id) === 'connecting'" @click.stop="requestConnect(item)"><ConnIcon name="plug" />连接</button><button class="icon-btn" type="button" :aria-label="`${item.name} 的更多操作`" data-action="conn-menu" @click.stop="menuId = menuId === item.id ? null : item.id"><ConnIcon name="more" /></button></footer>
+          <div v-if="menuId === item.id" class="conn-menu" @click.stop><button type="button" @click="showDetails(item)"><ConnIcon name="info" />连接详情</button><button type="button" data-action="conn-edit" @click="openEditor(item)"><ConnIcon name="pencil" />编辑配置…</button><button v-if="connectionState(item.id) === 'connected'" type="button" @click="disconnect(item)"><ConnIcon name="unplug" />断开连接</button><button type="button" class="danger" data-action="conn-delete" @click="askDelete(item)"><ConnIcon name="trash" />删除配置…</button></div>
         </article>
-        <button class="conn-card add" type="button" data-action="conn-new" @click="openEditor()">
-          <ConnIcon name="plus" /><span>新建连接</span><small>PostgreSQL · MySQL · MariaDB · SQLite</small>
-        </button>
+        <div v-if="!filtered.length" class="empty"><ConnIcon name="database" /><h3>{{ connections.length ? '没有匹配的连接' : '连接你的第一个数据库' }}</h3><p>{{ connections.length ? '试试其他名称、数据库类型或环境。' : '支持 PostgreSQL、MySQL、MariaDB 和 SQLite。' }}</p></div>
+        <button class="conn-card add" type="button" data-action="conn-new" @click="openEditor()"><ConnIcon name="plus" /><span>新建连接</span><small>PostgreSQL · MySQL · MariaDB · SQLite</small></button>
       </div>
-      <p v-if="query && !filtered.length" class="muted">没有匹配“{{ query }}”的连接。</p>
+      <div class="connection-note"><ConnIcon name="shield" /><span>连接配置只保存在本机。密码保存在操作系统凭据库；删除连接不会删除数据库或 SQLite 文件。</span></div>
     </div>
 
     <dialog ref="editDialog" class="modal modal-lg" @cancel.prevent="closeEditor">

@@ -2,6 +2,7 @@
 import { computed, ref, watch } from "vue";
 import { renderCsv, type CsvCell, type CsvDelimiter, type CsvOptions, type NullToken } from "./csv";
 import { planExport, type ExportOrigin, type ExportScope } from "./plan";
+import { chooseExportPath } from "./native";
 
 const props = defineProps<{
   open: boolean;
@@ -27,6 +28,8 @@ const bom = ref(true);
 const header = ref(true);
 const path = ref("");
 const acknowledged = ref(false);
+const choosing = ref(false);
+const error = ref("");
 
 watch(
   () => props.open,
@@ -34,9 +37,11 @@ watch(
     if (!open) return;
     scope.value = "loaded";
     acknowledged.value = false;
+    error.value = "";
     const stamp = new Date().toISOString().slice(0, 10);
     path.value = `${props.fileStem}-${stamp}.csv`;
   },
+  { immediate: true },
 );
 
 const csv = computed<CsvOptions>(() => ({ delimiter: delimiter.value, nullToken: nullToken.value, bom: bom.value, header: header.value }));
@@ -52,16 +57,27 @@ const plan = computed(() =>
 const preview = computed(() => renderCsv(props.columns, props.previewRows.slice(0, 4), { ...csv.value, bom: false }));
 const canStart = computed(() => plan.value.allowed && (!plan.value.reexecutes || acknowledged.value) && path.value.trim().length > 0);
 
-function start() {
-  if (!canStart.value) return;
-  path.value = plan.value.fileName;
-  emit("start", {
+async function start() {
+  if (!canStart.value || choosing.value) return;
+  choosing.value = true;
+  error.value = "";
+  const payload = {
     planNotice: plan.value.notice,
     scope: scope.value,
     acknowledged: acknowledged.value,
     path: plan.value.fileName,
     csv: { ...csv.value },
-  });
+  };
+  try {
+    const selected = await chooseExportPath(payload.path);
+    if (!selected || !props.open) return;
+    path.value = selected;
+    emit("start", { ...payload, path: selected });
+  } catch (cause) {
+    error.value = `无法打开保存对话框：${cause instanceof Error ? cause.message : String(cause)}`;
+  } finally {
+    choosing.value = false;
+  }
 }
 </script>
 
@@ -79,6 +95,8 @@ function start() {
       </header>
 
       <div class="ex-body">
+        <p v-if="error" class="ex-alert" role="alert">{{ error }}</p>
+        <fieldset class="ex-options" :disabled="choosing">
         <p v-if="pending" class="ex-note warn">表格里还有 {{ pending }} 处更改没有提交。导出的是数据库里已提交的数据，不包含这些未提交的更改。</p>
 
         <fieldset class="ex-scope">
@@ -142,13 +160,14 @@ function start() {
             <label class="ex-header-row"><input v-model="header" type="checkbox" /> 第一行写入列名</label>
           </div>
         </details>
+        </fieldset>
       </div>
 
       <footer class="ex-foot">
         <span class="muted sm">{{ plan.label }}{{ plan.partial ? " · 不是完整结果" : "" }}</span>
         <span class="grow"></span>
         <button class="btn" type="button" @click="emit('close')">取消</button>
-        <button class="btn primary" type="button" :disabled="!canStart" @click="start">导出</button>
+        <button class="btn primary" type="button" :disabled="!canStart || choosing" @click="start">{{ choosing ? "选择保存位置…" : "导出" }}</button>
       </footer>
     </div>
   </div>
@@ -162,6 +181,7 @@ function start() {
 .ex-titles h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; }
 .ex-titles p { margin: var(--sp-1) 0 0; font-size: var(--fs-sm); color: var(--text-2); }
 .ex-body { padding: var(--sp-4) var(--sp-5); overflow: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
+.ex-options { margin: 0; padding: 0; border: 0; min-width: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
 .ex-foot { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-5); border-top: 1px solid var(--line); background: var(--panel-2); border-radius: 0 0 var(--r-xl) var(--r-xl); }
 .ex-note { margin: 0; font-size: var(--fs-sm); color: var(--text-2); line-height: var(--lh); }
 .ex-note.warn { padding: var(--sp-2) var(--sp-3); border: 1px solid var(--warn-line); border-radius: var(--r); background: var(--warn-soft); color: var(--warn); }

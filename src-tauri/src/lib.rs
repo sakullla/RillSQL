@@ -2,6 +2,7 @@ mod catalog;
 mod connections;
 mod ddl;
 mod grid;
+mod native_export;
 mod product;
 mod query;
 
@@ -37,6 +38,7 @@ fn wire<R: tauri::Runtime>(builder: tauri::Builder<R>, state: connections::comma
     let query_state = query::QueryState::from_config_path(state.service.config_path());
     builder.manage(state).manage(query_state).invoke_handler(tauri::generate_handler![
         app_info,
+        native_export::export_write_loaded,
         connections::commands::connections_list,
         connections::commands::connections_save,
         connections::commands::connections_delete,

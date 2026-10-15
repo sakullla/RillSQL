@@ -1,18 +1,19 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref } from "vue";
 import { catalogConnections } from "../catalog/store";
-import DataGrid from "../grid/DataGrid.vue";
 import { resolveTableTarget } from "../grid/target";
 import { targetDetail, targetKey, targetOptions, type TargetOption } from "../query/complete";
-import QueryTab from "../query/QueryTab.vue";
-import StructurePane from "../structure/StructurePane.vue";
 import "../structure/structure.css";
 import Icon from "./Icon.vue";
 import type { QueryTarget, ShellTab } from "./session";
 import { loadSettings } from "./settings";
 import WelcomeView from "./WelcomeView.vue";
 
-const props = defineProps<{ tabs: ShellTab[]; activeId: string | null }>();
+const DataGrid = defineAsyncComponent(() => import("../grid/DataGrid.vue"));
+const QueryTab = defineAsyncComponent(() => import("../query/QueryTab.vue"));
+const StructurePane = defineAsyncComponent(() => import("../structure/StructurePane.vue"));
+
+const props = defineProps<{ tabs: ShellTab[]; activeId: string | null; pageSize?: number }>();
 const emit = defineEmits<{
   activate: [id: string];
   close: [id: string];
@@ -21,13 +22,14 @@ const emit = defineEmits<{
   sqlite: [];
   palette: [];
   structure: [];
+  "query-target": [target: QueryTarget];
   draft: [id: string, draft: string];
   target: [id: string, target: QueryTarget];
   "table-view": [id: string, pane: "data" | "structure"];
 }>();
 
 const active = computed(() => props.tabs.find((tab) => tab.id === props.activeId) ?? null);
-const pageSize = computed(() => loadSettings().pageSize);
+const pageSize = computed(() => props.pageSize ?? loadSettings().pageSize);
 
 function paneOf(tab: { tablePane?: "data" | "structure" }): "data" | "structure" {
   return tab.tablePane ?? "data";
@@ -57,6 +59,15 @@ const menuTargets = computed(() => (menuTab.value?.kind === "query" ? targetOpti
 function currentTargetKey(tab: ShellTab): string {
   if (!tab.connectionId || tab.database == null) return "";
   return targetKey(tab.connectionId, tab.database);
+}
+
+function onTabKey(event: KeyboardEvent, id: string) {
+  const index = props.tabs.findIndex(tab => tab.id === id);
+  const next = event.key === "ArrowRight" ? (index + 1) % props.tabs.length : event.key === "ArrowLeft" ? (index - 1 + props.tabs.length) % props.tabs.length : event.key === "Home" ? 0 : event.key === "End" ? props.tabs.length - 1 : -1;
+  if (next < 0) return;
+  event.preventDefault();
+  emit("activate", props.tabs[next]!.id);
+  (event.currentTarget as HTMLElement).parentElement?.querySelectorAll<HTMLElement>('[role="tab"]')[next]?.focus();
 }
 
 function onTabBarContext(event: MouseEvent) {
@@ -132,6 +143,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
+  <div class="workspace-view">
   <div v-if="tabs.length" class="tabbar" role="tablist" aria-label="打开的标签" @contextmenu="onTabBarContext">
     <div
       v-for="tab in tabs"
@@ -143,6 +155,9 @@ onBeforeUnmount(() => {
       :aria-selected="tab.id === activeId"
       :tabindex="tab.id === activeId ? 0 : -1"
       @click="emit('activate', tab.id)"
+      @keydown.enter.prevent="emit('activate', tab.id)"
+      @keydown.space.prevent="emit('activate', tab.id)"
+      @keydown="onTabKey($event, tab.id)"
     >
       <Icon :name="tab.kind === 'query' ? 'code' : 'table'" />
       <span class="tab-title">{{ tab.title }}</span>
@@ -211,6 +226,7 @@ onBeforeUnmount(() => {
       @sqlite="emit('sqlite')"
       @palette="emit('palette')"
       @structure="emit('structure')"
+      @query-target="emit('query-target', $event)"
     />
   </div>
   <Teleport to="body">
@@ -253,4 +269,5 @@ onBeforeUnmount(() => {
       <button class="menu-item" type="button" data-action="close-all" @click="closeIds(tabs.map((tab) => tab.id))">关闭全部</button>
     </div>
   </Teleport>
+  </div>
 </template>

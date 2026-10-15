@@ -264,34 +264,6 @@
 .sb-activity { display: inline-flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-xs); color: var(--text-2); white-space: nowrap; min-width: 0; }
 .sb-activity-text { overflow: hidden; text-overflow: ellipsis; }
 
-/* ---------- 欢迎页：两条主路径 ---------- */
-.welcome { flex: 1; display: grid; place-items: center; overflow: auto; padding: var(--sp-7); }
-.welcome-inner { width: min(720px, 100%); }
-.welcome-brand { display: flex; align-items: center; gap: var(--sp-4); margin-bottom: var(--sp-7); }
-.welcome-brand h1 { margin: 0; font-size: var(--fs-xxl); font-weight: 650; letter-spacing: -0.01em; }
-.welcome-brand h1 span { color: var(--text-3); font-weight: 500; margin-left: var(--sp-2); }
-.welcome-brand p { margin: var(--sp-1) 0 0; color: var(--text-2); }
-/* 窄屏时由 base.css 的媒体查询折叠为单列 */
-.welcome-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-4); }
-.welcome-path {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: var(--sp-2);
-  padding: var(--sp-5);
-  border: 1px solid var(--line-2);
-  border-radius: var(--r-lg);
-  background: var(--panel);
-  text-align: left;
-  box-shadow: var(--shadow-sm);
-  transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
-}
-.welcome-path .i { width: 22px; height: 22px; color: var(--accent-text); }
-.welcome-path:hover { border-color: var(--accent); box-shadow: var(--shadow); }
-.welcome-path .wp-title { font-size: var(--fs-lg); font-weight: 600; color: var(--text); }
-.welcome-path .wp-desc { font-size: var(--fs-sm); color: var(--text-2); line-height: var(--lh); }
-.welcome-more { display: flex; align-items: center; gap: var(--sp-2); margin-top: var(--sp-5); flex-wrap: wrap; }
-
 /* ---------- 命令面板（增强入口，不占默认视觉主位） ---------- */
 #palette {
   position: fixed;

@@ -427,7 +427,7 @@ onBeforeUnmount(() => {
                 </span>
                 <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.database" /></svg>
                 <span class="tr-name">{{ database.name }}</span>
-                <span v-if="database.name === connection.defaultDatabase" class="badge">当前会话连在这个库</span>
+                <span v-if="database.name === connection.defaultDatabase" class="badge current-db" title="当前会话连接的数据库">当前</span>
               </div>
               <template v-if="open(`d:${connection.id}:${database.name}`)">
                 <div v-if="sessionGap(database)" class="tree-note" :style="depthStyle(2)" data-other-database>

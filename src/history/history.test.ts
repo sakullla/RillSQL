@@ -104,6 +104,8 @@ describe("query history", () => {
     expect(wrapper.findAll("[data-action='open-history']")).toHaveLength(1);
 
     await wrapper.get("[data-action='clear-history']").trigger("click");
+    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("query_history_clear");
+    await wrapper.get("[data-action='confirm-clear-history']").trigger("click");
     await flushPromises();
     expect(invoke.mock.calls.map((call) => call[0])).toContain("query_history_clear");
     expect(wrapper.text()).toContain("历史为空");

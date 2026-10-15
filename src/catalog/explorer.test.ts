@@ -57,7 +57,7 @@ describe("explorer tree", () => {
       "archive",
       "public",
     ]);
-    expect(postgres.text()).toContain("当前会话连在这个库");
+    expect(postgres.find(".current-db").attributes("title")).toBe("当前会话连接的数据库");
     const failed = postgres.get("[data-schema-error]");
     expect(failed.text()).toContain("这部分对象列表没读出来");
     expect(failed.text()).toContain("没有权限读取 restricted 里的对象");

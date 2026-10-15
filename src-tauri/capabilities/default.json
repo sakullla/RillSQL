@@ -30,6 +30,7 @@
     "allow-grid-count",
     "allow-grid-commit",
     "allow-grid-export",
+    "allow-export-write-loaded",
     "allow-grid-export-cancel",
     "allow-query-start",
     "allow-query-poll",

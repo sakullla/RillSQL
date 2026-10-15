@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { onBeforeUnmount, ref } from "vue";
 import ExplorerTree from "../catalog/ExplorerTree.vue";
 import type { CatalogObjectRef } from "../catalog/object-ref";
 import Icon from "./Icon.vue";
 
-defineProps<{ width: number }>();
+const props = defineProps<{ width: number }>();
 const emit = defineEmits<{
   resize: [width: number];
   "open-object": [object: CatalogObjectRef, pane: "data" | "structure", section?: "columns" | "drop"];
@@ -25,7 +25,11 @@ function forwardFocus(connectionId: string, database: string) {
 }
 const filter = ref("");
 
+let stopResize: (() => void) | null = null;
+onBeforeUnmount(() => stopResize?.());
 function onPointerDown(event: PointerEvent) {
+  event.preventDefault();
+  stopResize?.();
   const startX = event.clientX;
   const startWidth = (event.currentTarget as HTMLElement).previousElementSibling?.getBoundingClientRect().width ?? 268;
   const move = (ev: PointerEvent) => {
@@ -34,7 +38,11 @@ function onPointerDown(event: PointerEvent) {
   const stop = () => {
     window.removeEventListener("pointermove", move);
     window.removeEventListener("pointerup", stop);
+    window.removeEventListener("pointercancel", stop);
+    stopResize = null;
   };
+  stopResize = stop;
+  window.addEventListener("pointercancel", stop);
   window.addEventListener("pointermove", move);
   window.addEventListener("pointerup", stop);
 }
@@ -57,6 +65,9 @@ function onPointerDown(event: PointerEvent) {
     aria-orientation="vertical"
     aria-label="调整资源管理器宽度"
     tabindex="0"
+    :aria-valuenow="width" :aria-valuemin="200" :aria-valuemax="460"
+    @keydown.left.prevent="emit('resize', Math.max(200, props.width - 20))"
+    @keydown.right.prevent="emit('resize', Math.min(460, props.width + 20))"
     @pointerdown="onPointerDown"
   ></div>
 </template>

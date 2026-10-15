@@ -1,4 +1,4 @@
-import { reactive } from "vue";
+import { shallowReactive } from "vue";
 import { queryCancel, queryPoll, queryStart, type RunDto, type StartRequest } from "./api";
 
 export interface RunSnapshot extends RunDto {
@@ -6,9 +6,10 @@ export interface RunSnapshot extends RunDto {
   pollError: string;
 }
 
-const runs = reactive<Record<string, RunSnapshot>>({});
+const runs = shallowReactive<Record<string, RunSnapshot>>({});
 const timers = new Map<string, ReturnType<typeof setInterval>>();
 const closeAfter = new Set<string>();
+const pendingPolls = new Map<string, string>();
 let closer: ((id: string) => void) | null = null;
 let epoch = 0;
 
@@ -33,7 +34,8 @@ export async function startTabRun(input: StartRequest & { tabId: string }): Prom
   const dto = await queryStart(request);
   if (token !== epoch) return;
   adoptRun(tabId, dto);
-  watchRun(tabId);
+  if (isLive(dto)) watchRun(tabId);
+  else stopTimer(tabId);
 }
 
 export async function requestCancel(tabId: string): Promise<void> {
@@ -64,20 +66,21 @@ export async function requestCancel(tabId: string): Promise<void> {
 
 export function guardClose(tabId: string): boolean {
   const run = runs[tabId];
-  if (!run || !isLive(run)) return true;
+  if (!run || !isLive(run)) { delete runs[tabId]; return true; }
   closeAfter.add(tabId);
   void requestCancel(tabId);
   return false;
 }
 
 export function adoptRun(tabId: string, dto: RunDto) {
-  runs[tabId] = { ...dto, tabId, pollError: "" };
+  runs[tabId] = shallowReactive({ ...dto, tabId, pollError: "" });
 }
 
 export function resetQueryRuntime() {
   epoch += 1;
   for (const timer of timers.values()) clearInterval(timer);
   timers.clear();
+  pendingPolls.clear();
   closeAfter.clear();
   closer = null;
   for (const id of Object.keys(runs)) delete runs[id];
@@ -92,6 +95,7 @@ function watchRun(tabId: string) {
 }
 
 async function refresh(tabId: string) {
+  if (pendingPolls.has(tabId)) return;
   const current = runs[tabId];
   if (!current) {
     stopTimer(tabId);
@@ -100,13 +104,16 @@ async function refresh(tabId: string) {
   const token = epoch;
   const runId = current.id;
   try {
+    pendingPolls.set(tabId, runId);
     const next = await queryPoll(runId);
-    if (token !== epoch) return;
+    if (token !== epoch || runs[tabId]?.id !== runId) return;
     apply(tabId, next);
   } catch (err) {
     if (token !== epoch) return;
     const run = runs[tabId];
-    if (run) run.pollError = errorText(err);
+    if (run?.id === runId) run.pollError = errorText(err);
+  } finally {
+    if (pendingPolls.get(tabId) === runId) pendingPolls.delete(tabId);
   }
   settle(tabId);
 }
@@ -114,17 +121,17 @@ async function refresh(tabId: string) {
 function apply(tabId: string, next: RunDto) {
   const current = runs[tabId];
   if (current && current.id === next.id && cancelRank(next.cancel) < cancelRank(current.cancel) && isLive(next)) {
-    runs[tabId] = {
+    runs[tabId] = shallowReactive({
       ...next,
       tabId,
       pollError: "",
       cancel: current.cancel,
       cancelMessage: current.cancelMessage,
       status: current.status,
-    };
+    });
     return;
   }
-  runs[tabId] = { ...next, tabId, pollError: "" };
+  runs[tabId] = shallowReactive({ ...next, tabId, pollError: "" });
 }
 
 function settle(tabId: string) {

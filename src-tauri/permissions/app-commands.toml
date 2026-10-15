@@ -147,3 +147,7 @@ commands.allow = ["query_history"]
 identifier = "allow-query-history-clear"
 description = "允许清空本机查询历史。"
 commands.allow = ["query_history_clear"]
+[[permission]]
+identifier = "allow-export-write-loaded"
+description = "允许把已经读取的 CSV 数据保存到用户选择的本地文件。"
+commands.allow = ["export_write_loaded"]

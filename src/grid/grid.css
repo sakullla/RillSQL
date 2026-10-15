@@ -237,3 +237,7 @@
   padding: var(--sp-2) var(--sp-3);
   border-radius: var(--r);
 }
+
+.grid-table .virtual-spacer td { padding: 0; border: 0; }
+.grid-table .row-number { width: 48px; min-width: 48px; text-align: right; color: var(--text-3); background: var(--panel-2); font-size: 10px; user-select: none; }
+.grid-table .sort-arrow { margin-left: auto; color: var(--accent-text); }

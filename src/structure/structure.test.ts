@@ -118,7 +118,7 @@ describe("structure pane", () => {
     const wrapper = mount(StructurePane, { props: { tabId: "table:c1", draft: "kept", purpose: "edit", target } });
     await flushPromises();
     expect(wrapper.attributes("data-draft")).toBe("kept");
-    expect(wrapper.text()).toContain("正在修改表 notes");
+    expect(wrapper.get(".structure-heading h2").text()).toBe("notes");
     expect(wrapper.text()).toContain("来自连接「c1」的「main」");
     expect(wrapper.text()).toContain("直接改下面的字段");
     await buttonNamed(wrapper, "新增字段").trigger("click");

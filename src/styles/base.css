@@ -258,11 +258,11 @@ details.disclosure > summary .muted { font-weight: 400; }
 .tc-light { background: #fff; }
 .tc-light i:nth-child(1) { background: #eef0f3; }
 .tc-light i:nth-child(2) { background: #f6f7f9; }
-.tc-light i:nth-child(3) { margin: 8px; border-radius: 3px; background: linear-gradient(#3d5bd9 0 3px, #e5e7ec 3px 7px, transparent 7px 10px, #e5e7ec 10px 14px, transparent 14px); }
+.tc-light i:nth-child(3) { margin: 8px; border-radius: 3px; background: linear-gradient(#087f79 0 3px, #e5e7ec 3px 7px, transparent 7px 10px, #e5e7ec 10px 14px, transparent 14px); }
 .tc-dark { background: #1c1f26; }
 .tc-dark i:nth-child(1) { background: #121419; }
 .tc-dark i:nth-child(2) { background: #21242c; }
-.tc-dark i:nth-child(3) { margin: 8px; border-radius: 3px; background: linear-gradient(#7c97f0 0 3px, #363b46 3px 7px, transparent 7px 10px, #363b46 10px 14px, transparent 14px); }
+.tc-dark i:nth-child(3) { margin: 8px; border-radius: 3px; background: linear-gradient(#53c9b9 0 3px, #363b46 3px 7px, transparent 7px 10px, #363b46 10px 14px, transparent 14px); }
 .tc-system { background: linear-gradient(135deg, #fff 50%, #1c1f26 50%); }
 .tc-system i:nth-child(1) { background: linear-gradient(135deg, #eef0f3 50%, #121419 50%); }
 .tc-system i:nth-child(2) { background: linear-gradient(135deg, #f6f7f9 50%, #21242c 50%); }

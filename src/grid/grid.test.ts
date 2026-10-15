@@ -299,7 +299,8 @@ describe("grid views", () => {
     expect(body.startsWith("\uFEFF")).toBe(true);
     expect(body).toContain("客户1");
     expect(body).toContain("长".repeat(2000));
-    expect(exportTasks.find((task) => task.id === "stuck")?.status).toBe("failed");
+    // Saving this snapshot must not rewrite another export's status.
+    expect(exportTasks.find((task) => task.id === "stuck")?.status).toBe("running");
     expect(exportTasks.find((task) => task.id !== "stuck")?.status).toBe("done");
     expect(wrapper.get("[role='status']").text()).toContain("已导出 100 行");
     expect(wrapper.get("[role='status']").text()).toContain("customers（部分）.csv");
@@ -482,7 +483,7 @@ describe("grid views", () => {
         truncated: true,
       },
     });
-    expect(wrapper.text()).toContain("仅作用于已读取的 100 行");
+    expect(wrapper.text()).toContain("在已读取的 100 行中查找和排序");
     expect(wrapper.text()).toContain("已读取前 100 行");
     expect(wrapper.text()).toContain("结果没有读完");
     await wrapper.get("[aria-label='在已读取行中查找']").setValue("000-first");

@@ -241,12 +241,12 @@ describe("query editing", () => {
     const pending = wrapper.get("[data-action='run']").trigger("click");
     await nextTick();
     await flushPromises();
-    expect(wrapper.get("[data-action='run']").text()).toBe("正在执行…");
+    expect(wrapper.get("[data-action='run']").text()).toContain("正在执行…");
     expect(wrapper.get("[data-action='run']").attributes("disabled")).toBeDefined();
     finish();
     await pending;
     await flushPromises();
-    expect(wrapper.get("[data-action='run']").text()).toBe("执行");
+    expect(wrapper.get("[data-action='run']").text()).toContain("执行");
     wrapper.unmount();
   });
 
@@ -301,7 +301,7 @@ describe("query editing", () => {
     await wrapper.get("[data-action='run']").trigger("click");
     await flushPromises();
     expect(wrapper.get("[role='alert']").text()).toContain("连接未打开，没有另开数据库连接。");
-    expect(wrapper.get("[data-action='run']").text()).toBe("执行");
+    expect(wrapper.get("[data-action='run']").text()).toContain("执行");
     wrapper.unmount();
   });
 

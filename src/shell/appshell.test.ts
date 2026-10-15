@@ -18,7 +18,7 @@ describe("AppShell", () => {
     expect(wrapper.find(".statusbar").exists()).toBe(true);
 
     // R2：首次启动直接呈现两条主路径，无需文档或快捷键
-    const paths = wrapper.findAll(".welcome-path");
+    const paths = wrapper.findAll(".desk-action");
     expect(paths).toHaveLength(2);
     expect(paths[0]!.text()).toContain("新建连接");
     expect(paths[1]!.text()).toContain("打开 SQLite 文件");
@@ -36,9 +36,9 @@ describe("AppShell", () => {
 
   it("navigates to the connections page from the new-connection path", async () => {
     const wrapper = mount(AppShell);
-    await wrapper.findAll(".welcome-path")[0]!.trigger("click");
+    await wrapper.findAll(".desk-action")[0]!.trigger("click");
     expect(location.hash).toBe("#/connections");
-    expect(wrapper.find(".welcome").exists()).toBe(false);
+    expect(wrapper.find(".workspace-view").attributes("style")).toContain("display: none");
     wrapper.unmount();
   });
 });

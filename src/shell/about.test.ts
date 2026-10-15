@@ -19,7 +19,7 @@ describe("product identity", () => {
 
   it("emits the two primary paths as distinct actions", async () => {
     const wrapper = mount(WelcomeView);
-    const paths = wrapper.findAll(".welcome-path");
+    const paths = wrapper.findAll(".desk-action");
     await paths[0]!.trigger("click");
     await paths[1]!.trigger("click");
     expect(wrapper.emitted("connections")).toHaveLength(1);

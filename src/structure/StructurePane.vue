@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import Icon from "../shell/Icon.vue";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { catalogConnections, refreshCatalog } from "../catalog/store";
 import type { TableTarget } from "../grid/target";
@@ -227,6 +228,7 @@ function createForeignKey(foreignKey: StructureForeignKey) {
   <div class="structure-pane" aria-label="表结构" :data-tab-id="tabId" :data-draft="draft" tabindex="-1">
     <p v-if="purpose === 'edit' && !target" class="empty" role="alert">这张表还没有绑定已打开的连接。</p>
     <template v-else>
+      <header class="structure-heading"><span class="action-icon"><Icon name="table" /></span><div><div class="eyebrow">TABLE DESIGNER</div><h2>{{ purpose === 'create' ? '设计新表' : target?.table }}</h2><p>{{ purpose === 'create' ? '定义字段、类型与约束，预览 SQL 后再创建。' : contextText }}</p></div><span class="grow"></span><div v-if="description" class="structure-stats"><span><b>{{ description.columns.length }}</b> 字段</span><span><b>{{ description.indexes.length }}</b> 索引</span></div></header>
       <nav class="struct-nav" aria-label="结构分区">
         <button type="button" :class="{ on: section === 'columns' }" @click="section = 'columns'">字段</button>
         <button v-if="purpose === 'edit'" type="button" :class="{ on: section === 'indexes' }" @click="section = 'indexes'">索引</button>
@@ -234,7 +236,6 @@ function createForeignKey(foreignKey: StructureForeignKey) {
         <span class="grow"></span>
         <button v-if="purpose === 'edit'" type="button" class="danger" :class="{ on: section === 'drop' }" @click="section = 'drop'">删除表</button>
       </nav>
-      <p v-if="purpose === 'edit' && target" class="struct-context">正在修改表 <strong>{{ target.table }}</strong> · {{ contextText }}</p>
       <p v-if="errorText" class="struct-alert" role="alert">{{ errorText }}</p>
       <p v-if="loading" class="struct-loading muted">正在读取这张表的结构……</p>
       <div v-else class="struct-body">

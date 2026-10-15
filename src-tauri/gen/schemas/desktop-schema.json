@@ -291,6 +291,12 @@
           "markdownDescription": "允许添加或修改环境标签。"
         },
         {
+          "description": "允许把已经读取的 CSV 数据保存到用户选择的本地文件。",
+          "type": "string",
+          "const": "allow-export-write-loaded",
+          "markdownDescription": "允许把已经读取的 CSV 数据保存到用户选择的本地文件。"
+        },
+        {
           "description": "允许在已打开的会话上逐条提交表数据变更。",
           "type": "string",
           "const": "allow-grid-commit",

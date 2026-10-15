@@ -1,0 +1,23 @@
+{
+  "source": "Synthetic IPC; frontend behavior and rendering only",
+  "rows": 10000,
+  "columns": 12,
+  "checks": [
+    "Home opens a query with the chosen connection and database",
+    "10,000 rows remain scrollable; filtering sees offscreen rows; full values and sort direction are visible",
+    "Editor/result split supports keyboard resizing",
+    "Navigation preserves the editor instance and draft; undo and redo still work after returning",
+    "1,000 editable rows stay bounded; keyboard crosses the viewport; density and page size update without losing the table",
+    "95 history entries paginate and filter globally; cancelling clear does not erase data",
+    "Connection engine and environment filters compose correctly",
+    "SQLite file picker opens exactly once on request and does not reopen when returning to connections",
+    "No browser page errors"
+  ],
+  "metrics": {
+    "largeResultReadyMs": 451,
+    "renderedRows": 19,
+    "comfortableDataRowPx": 38
+  },
+  "passed": true,
+  "errors": []
+}

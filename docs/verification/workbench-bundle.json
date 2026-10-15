@@ -1,0 +1,14 @@
+{
+  "baseline": {
+    "entryKB": 702.68,
+    "gzipKB": 233.36,
+    "source": "Vite production build before redesign"
+  },
+  "current": {
+    "entry": "/assets/index-DvRc8VrW.js",
+    "entryBytes": 161154,
+    "gzipBytes": 57332
+  },
+  "entryReductionPercent": 77.1,
+  "scope": "Entry bundle only; SQL editor and feature panes now load on demand. Native window API is a separate shared chunk."
+}
