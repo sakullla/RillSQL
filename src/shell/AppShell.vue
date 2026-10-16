@@ -1,13 +1,14 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { listPaletteTables, startCatalog } from "../catalog";
 import { objectIdentity, type CatalogObjectRef } from "../catalog/object-ref";
 import { catalogConnections } from "../catalog/store";
 import { listPaletteConnections } from "../connections";
 import type { SavedDraft } from "../history/saved";
 import { deletedConnectionNotice, type OpenPlan } from "../history/plan";
-import { attachCloser, guardClose } from "../query/runtime";
+import { attachCloser } from "../query/runtime";
 import { parseHash } from "../router";
+import { chooseLeave, chooseStay, closePrompt, installCloseCoordinator, uninstallCloseCoordinator } from "./close-guard";
 import ActivityRail from "./ActivityRail.vue";
 import CommandPalette from "./CommandPalette.vue";
 import { shellCommands, type PaletteItem } from "./commands";
@@ -29,8 +30,24 @@ const SettingsView = defineAsyncComponent(() => import("./SettingsView.vue"));
 
 const session = createSession(typeof location === "undefined" ? "" : location.hash);
 const windowChrome = ref({ custom: false, maximized: false });
+const closeDialog = ref<HTMLDialogElement | null>(null);
 attachCloser((id) => session.closeTab(id));
-session.setCloseGuard((id) => guardClose(id));
+installCloseCoordinator(session);
+
+watch(
+  () => closePrompt.open,
+  async (open) => {
+    if (!open) return;
+    await nextTick();
+    const dialog = closeDialog.value;
+    if (!dialog || dialog.open) return;
+    try {
+      dialog.showModal();
+    } catch {
+      dialog.setAttribute("open", "");
+    }
+  },
+);
 
 function asStatus(status: string): ConnectionStatus {
   if (status === "connected" || status === "connecting" || status === "disconnected" || status === "error" || status === "lost") return status;
@@ -279,7 +296,7 @@ onBeforeUnmount(() => {
   window.removeEventListener("hashchange", onHashChange);
   media?.removeEventListener("change", onSchemeChange);
   attachCloser(() => undefined);
-  session.setCloseGuard(null);
+  uninstallCloseCoordinator(session);
 });
 </script>
 
@@ -331,5 +348,22 @@ onBeforeUnmount(() => {
     <StatusBar :tab="session.activeTab.value" :on-workspace="session.page.value === 'workspace'" />
     <CommandPalette :open="session.paletteOpen.value" :mode="session.paletteMode.value" :items="commands" @close="session.closePalette()" @run="runCommand" />
     <ShortcutHelp :open="session.helpOpen.value" @close="session.closeHelp()" />
+    <dialog v-if="closePrompt.open" ref="closeDialog" class="modal" aria-labelledby="close-guard-title" @cancel.prevent="chooseStay">
+      <div class="modal-head">
+        <div class="modal-titles">
+          <h2 id="close-guard-title">{{ closePrompt.scope === "window" ? "关闭窗口？" : "关闭这个标签？" }}</h2>
+          <p class="modal-sub">
+            {{ closePrompt.scope === "window"
+              ? "有标签含未提交的单元格修改。留下则窗口和修改都还在；离开会丢掉这些修改，不会写入数据库。"
+              : "这个标签有未提交的单元格修改。留下则标签和修改都还在；离开会丢掉这些修改，不会写入数据库。" }}
+          </p>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <span class="grow"></span>
+        <button class="btn" type="button" data-action="close-stay" @click="chooseStay">留下</button>
+        <button class="btn danger" type="button" data-action="close-leave" @click="chooseLeave">离开</button>
+      </div>
+    </dialog>
   </div>
 </template>

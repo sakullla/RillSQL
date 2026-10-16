@@ -1,4 +1,5 @@
 import { onBeforeUnmount, onMounted, ref } from "vue";
+import { closeFromTitleBar, handleCloseRequested } from "./close-guard";
 
 /** True when this page is the Tauri webview, where the native title bar can be replaced. */
 export function desktopShell(): boolean {
@@ -13,6 +14,7 @@ type AppWindow = {
   isFocused: () => Promise<boolean>;
   onResized: (handler: () => void) => Promise<() => void>;
   onFocusChanged: (handler: (event: { payload: boolean }) => void) => Promise<() => void>;
+  onCloseRequested: (handler: (event: { preventDefault: () => void }) => void | Promise<void>) => Promise<() => void>;
 };
 
 async function currentWindow(): Promise<AppWindow> {
@@ -45,14 +47,22 @@ export function useWindowChrome() {
         const stopFocus = await app.onFocusChanged((event) => {
           if (!cancelled) focused.value = event.payload;
         });
+        let stopClose: (() => void) | undefined;
+        try {
+          stopClose = await app.onCloseRequested((event) => handleCloseRequested(event));
+        } catch {
+          stopClose = undefined;
+        }
         if (cancelled) {
           stopResize();
           stopFocus();
+          stopClose?.();
           return;
         }
         stop = () => {
           stopResize();
           stopFocus();
+          stopClose?.();
         };
       } catch {
         if (!cancelled) customChrome.value = false;
@@ -86,12 +96,14 @@ export function useWindowChrome() {
   }
 
   async function close() {
-    if (!desktopShell()) return;
-    try {
-      await (await currentWindow()).close();
-    } catch {
-      /* leave the button in place when the window command is refused */
-    }
+    await closeFromTitleBar(async () => {
+      if (!desktopShell()) return;
+      try {
+        await (await currentWindow()).close();
+      } catch {
+        /* leave the button in place when the window command is refused */
+      }
+    });
   }
 
   return { customChrome, maximized, focused, minimize, toggleMaximize, close };
