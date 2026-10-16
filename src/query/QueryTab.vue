@@ -255,7 +255,7 @@ async function sqlCompletion(context: CompletionContext) {
 function editorExtensions() {
   return [
     basicSetup,
-    placeholder("-- 在这里编写 SQL\n-- Ctrl+Enter 执行全部或选中的语句"),
+    placeholder("-- 在这里编写 SQL\n-- Ctrl+Enter 执行选中内容；无选中时执行光标所在语句"),
     sql(),
     syntaxHighlighting(HighlightStyle.define([
       { tag: tags.keyword, color: "var(--tk-kw)" },
@@ -639,11 +639,11 @@ onBeforeUnmount(() => {
     <p v-if="actionError" class="q-banner" role="alert">{{ actionError }}</p>
     <div class="editor-caption"><span><Icon name="code" /> SQL 编辑器</span><span class="q-hint" :data-keywords-only="hint.keywordsOnly" :title="hint.note">{{ hint.note }}</span><span class="mono">{{ buttonEngine ? engineMeta(buttonEngine).label : 'SQL' }}</span></div>
     <div ref="host" class="cm-host"></div>
-    <div class="editor-position"><span>{{ hasSelection ? '已选中 SQL · 执行将仅运行选中部分' : 'Ctrl+Enter 执行 · Ctrl+Shift+Enter 执行当前语句' }}</span><span class="mono">Ln {{ cursor.line }}, Col {{ cursor.column }}</span></div>
+    <div class="editor-position"><span>{{ hasSelection ? '已选中 SQL · 执行将仅运行选中部分' : 'Ctrl+Enter 执行光标所在语句 · Ctrl+Shift+Enter 执行当前语句' }}</span><span class="mono">Ln {{ cursor.line }}, Col {{ cursor.column }}</span></div>
     <div class="query-splitter" role="separator" tabindex="0" aria-label="调整编辑器与结果区域高度" aria-orientation="horizontal" :aria-valuenow="editorPercent" :aria-valuemin="20" :aria-valuemax="70" @pointerdown="resizeEditor" @keydown.up.prevent="editorPercent = Math.max(20, editorPercent - 5)" @keydown.down.prevent="editorPercent = Math.min(70, editorPercent + 5)"><span></span></div>
     <section class="q-results" aria-label="执行结果">
       <div class="results-heading"><span><Icon name="table" />结果</span><span v-if="run" class="q-summary" :data-status="run.status">{{ summary }}</span><span v-else class="muted">等待执行</span><span class="grow"></span><span class="muted">只读结果</span></div>
-      <div v-if="!run" class="q-idle"><Icon name="terminal" /><strong>查询的答案，会出现在这里。</strong><p>选择执行目标，编写 SQL，然后点击执行。</p><ChordKeys chord="Mod+Enter" /></div>
+      <div v-if="!run" class="q-idle"><Icon name="terminal" /><p>选择执行目标，编写 SQL，然后点击执行。</p><ChordKeys chord="Mod+Enter" /></div>
       <template v-else>
         <div v-if="run.statements.length > 1" class="result-tabs" role="tablist" aria-label="语句结果"><button v-for="(statement, index) in run.statements" :key="index" role="tab" :aria-selected="resultIndex === index" @click="resultIndex = index">结果 {{ index + 1 }} <span>{{ statement.columns.length ? `${statement.rows.length} 行` : statusLabel(statement.status) }}</span></button></div>
         <p v-if="run.cancel === 'requested'" class="q-note" role="status">取消中…数据库确认后立即停止。</p>
@@ -790,7 +790,6 @@ onBeforeUnmount(() => {
 .results-heading .q-summary { font-size: 11px; font-weight: 400; }
 .query-pane .q-idle { display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 12px; flex: 1; padding: 24px; color: var(--text-3); background: var(--panel-2); }
 .q-idle > .i { width: 28px; height: 28px; color: var(--accent-text); }
-.q-idle strong { color: var(--text-2); font-size: 13px; font-weight: 500; }
 .q-idle p { margin: 0; font-size: 11px; }
 .result-tabs { display: flex; flex-shrink: 0; gap: 4px; padding: 0 12px; border-bottom: 1px solid var(--line); overflow: auto; }
 .result-tabs button { padding: 8px 12px; font-size: 11px; white-space: nowrap; border-bottom: 2px solid transparent; }

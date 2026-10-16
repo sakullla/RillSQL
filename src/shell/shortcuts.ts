@@ -15,7 +15,7 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
   { group: "全局", chord: "Alt+1…9", label: "切换到第 N 个标签" },
   { group: "全局", chord: "Mod+,", label: "设置" },
   { group: "全局", chord: "?", label: "快捷键帮助" },
-  { group: "SQL 编辑器", chord: "Mod+Enter", label: "执行选中内容；无选中时执行全部" },
+  { group: "SQL 编辑器", chord: "Mod+Enter", label: "执行选中内容；无选中时执行光标所在语句" },
   { group: "SQL 编辑器", chord: "Mod+Shift+Enter", label: "只执行光标所在语句" },
   { group: "SQL 编辑器", chord: "Mod+.", label: "请求取消执行" },
   { group: "SQL 编辑器", chord: "Ctrl+Space", label: "补全" },

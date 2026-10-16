@@ -6,17 +6,14 @@ export interface SelectionRange {
   head?: number;
 }
 
-export function sqlToRun(sql: string, selection: SelectionRange, scope: "auto" | "current"): { sql: string; mode: "selection" | "current" | "all" } {
-  if (scope === "current") {
+export function sqlToRun(sql: string, selection: SelectionRange, scope: "auto" | "current"): { sql: string; mode: "selection" | "current" } {
+  if (scope === "current" || selection.from === selection.to) {
     const cursor = selection.head ?? selection.to;
     return { sql: statementAt(sql, cursor)?.text ?? "", mode: "current" };
   }
-  if (selection.from !== selection.to) {
-    const from = Math.min(selection.from, selection.to);
-    const to = Math.max(selection.from, selection.to);
-    return { sql: sql.slice(from, to), mode: "selection" };
-  }
-  return { sql, mode: "all" };
+  const from = Math.min(selection.from, selection.to);
+  const to = Math.max(selection.from, selection.to);
+  return { sql: sql.slice(from, to), mode: "selection" };
 }
 
 export function rowLimit(pageSize: number): number {

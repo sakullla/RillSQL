@@ -7,6 +7,7 @@ import { nextTick } from "vue";
 import { catalogFixture } from "../catalog/fixtures";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
 import { createSession } from "../shell/session";
+import { SHORTCUTS } from "../shell/shortcuts";
 import type { RunDto } from "./api";
 import { clearColumnCache, qualifierFor } from "./columns";
 import { completionPlan, metadataNote } from "./complete";
@@ -56,13 +57,16 @@ describe("query editing", () => {
     expect(statementAt(sql, parts[1]!.start + 2)?.text).toBe("UPDATE t SET n = 1;");
     expect(sqlToRun(sql, { from: parts[1]!.start, to: parts[1]!.end }, "auto")).toEqual({ sql: "UPDATE t SET n = 1;", mode: "selection" });
     expect(sqlToRun(sql, { from: parts[1]!.start + 2, to: parts[1]!.start + 2 }, "current").sql).toBe("UPDATE t SET n = 1;");
-    expect(sqlToRun(sql, { from: 0, to: 0 }, "auto").sql).toBe(sql);
+    expect(sqlToRun(sql, { from: 0, to: 0 }, "auto")).toEqual({ sql: "SELECT 'a;b';", mode: "current" });
+    expect(sqlToRun(sql, { from: parts[1]!.start + 2, to: parts[1]!.start + 2 }, "auto")).toEqual({ sql: "UPDATE t SET n = 1;", mode: "current" });
   });
 
   it("keeps desktop editor shortcuts on Ctrl or Command", () => {
     expect(QUERY_EDITOR_KEYS).toEqual(["Mod-Enter", "Mod-Shift-Enter", "Mod-.", "Ctrl-Space", "Mod-/"]);
     expect(QUERY_EDITOR_KEYS).not.toContain("Alt-W");
     expect(QUERY_EDITOR_KEYS).not.toContain("Ctrl-Alt-N");
+    expect(SHORTCUTS.find((item) => item.chord === "Mod+Enter")?.label).toBe("执行选中内容；无选中时执行光标所在语句");
+    expect(SHORTCUTS.find((item) => item.chord === "Mod+Shift+Enter")?.label).toBe("只执行光标所在语句");
   });
 
   it("completes from the selected target and withholds failed metadata", () => {
@@ -144,6 +148,9 @@ describe("query editing", () => {
       },
     });
     await nextTick();
+    expect(wrapper.text()).not.toContain("查询的答案，会出现在这里。");
+    expect(wrapper.text()).not.toContain("执行全部");
+    expect(wrapper.get(".editor-position").text()).toContain("Ctrl+Enter 执行光标所在语句");
     expect(wrapper.get("[aria-label='查询']").attributes("data-tab-id")).toBe("query-1");
     expect(wrapper.get("[data-action='target']").attributes("aria-label")).toContain("执行目标");
     expect(wrapper.get("[data-action='target']").text()).toContain("Shop / shop_staging");
@@ -166,6 +173,13 @@ describe("query editing", () => {
     await wrapper.get("[data-action='run-current']").trigger("click");
     await flushPromises();
     expect(started().at(-1)).toMatchObject({ command: "query_start", sql: "SELECT 1;" });
+
+    view!.dispatch({ selection: { anchor: from + 2, head: from + 2 } });
+    await nextTick();
+    expect(wrapper.get(".editor-position").text()).toContain("光标所在语句");
+    await wrapper.get("[data-action='run']").trigger("click");
+    await flushPromises();
+    expect(started().at(-1)).toMatchObject({ command: "query_start", sql: "SELECT 2;" });
     wrapper.unmount();
   });
 
@@ -192,6 +206,9 @@ describe("query editing", () => {
       },
     });
     await nextTick();
+    expect(wrapper.get(".cm-placeholder").text()).toContain("无选中时执行光标所在语句");
+    expect(wrapper.get(".cm-placeholder").text()).not.toContain("执行全部");
+    expect(wrapper.text()).not.toContain("查询的答案，会出现在这里。");
     await wrapper.get("[data-action='target']").trigger("click");
     const choices = wrapper.findAll("[role='option']");
     const rillsql = choices.filter((item) => item.text().includes("127.0.0.1 / rillsql"));
