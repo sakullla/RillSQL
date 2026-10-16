@@ -1,0 +1,214 @@
+format_version: 2
+workflow_id: 2026-10-15-日常工作台可用性
+requirement_ref: C:\Users\12976\project\RillSQL\docs\requirements\2026-10-15-日常工作台可用性.md
+requirement_version: sha256:3e738bf69374a037af19150026badfe613664198a5a4774845d9ecb931867780
+requirement_ids: [R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12]
+requirement_revision: 2
+revision_fence:
+  from_revision: 1
+  to_revision: 2
+  status: reconciled
+  preserved_active_task_ids: [saved-queries]
+  preserved_result_task_ids: [saved-queries]
+  preserved_review_task_ids: [saved-queries]
+  preserved_drafts: []
+  reused_task_ids: [editor-assist, grid-exchange, saved-queries]
+  stale_task_ids: []
+  revision_attempt_task_ids: []
+  rebuilt_task_ids: []
+status: closed
+stages:
+  exploration: completed
+  solution: completed
+  plan: completed
+  execution: completed
+  delivery: completed
+gates:
+  solution: confirmed
+schedule_pending: false
+implementation_base_ref: f448c15e8dc7d317cc8caff0a35430f080a5a7d3
+tasks:
+  - id: editor-assist
+    status: completed
+    task_run_ref: task-runs/editor-assist-run.md
+    recipe_digest: sha256:3365f56612e93bcd11f9dc3621b54104122035b1f3d65020b27bc8ac8a6af556
+    recipe_snapshot:
+      id: editor-assist
+      goal: 查询编辑器按当前目标补全已读字段，能安全格式化 SQL，并能对一条语句显示不改数据的执行计划。
+      depends_on: []
+      covers: [R1, R2, R3]
+      outcomes:
+        - 当前目标已读到表 orders 的字段 status 时，在 orders. 后补全出现 status。
+        - 未选择目标、未连接或字段读取失败时，补全不出现猜测字段名，并可见原因。
+        - 格式化整理关键字、缩进和换行，字符串与注释文本不变；引号或注释未闭合时原文不变并可见原因；只格式化选区时选区外不变。
+        - 无选区时对光标所在语句请求计划，有选区时对选区请求计划；空语句或多条语句不发起执行。
+        - 计划使用不带 ANALYZE 的 EXPLAIN 或 SQLite 的 EXPLAIN QUERY PLAN，结果可读，请求前后所读表的数据不变。
+      test: extend
+      scope:
+        - src/query/complete.ts
+        - src/query/columns.ts
+        - src/query/format.ts
+        - src/query/plan.ts
+        - src/query/split.ts
+        - src/query/QueryTab.vue
+        - src/query/query.test.ts
+        - src/query/format.test.ts
+        - src/query/plan.test.ts
+        - src/shell/shortcuts.ts
+    requirement_revision: 1
+    review_base_ref: f448c15e8dc7d317cc8caff0a35430f080a5a7d3
+    attempts:
+      - attempt_id: editor-assist-A5-16f83a7aca41f94c
+        message_id: editor-assist-A5-16f83a7aca41f94c-M1
+        recipe_digest: sha256:3365f56612e93bcd11f9dc3621b54104122035b1f3d65020b27bc8ac8a6af556
+        owner_mode: worker
+        baseline_ref: ca6ef0d7736f65d039413d9cc2caa2157c4161bb
+        checkpoint_ref: 4507d95803159aedaf0d39f5fbf4f72ce35f9fb2
+        execution_status: completed
+        review_decision: passed
+        finding_count: 0
+        path_count: 4
+        review_evidence_refs:
+          - evidence/reviews/sha256-0ccc63ba2addb3a713083c1094821c30fd8b85b0d9e6c3bc9af1af465fe8c5e7.json
+        scope_ref: evidence/history/sha256-d15b4b9e970bf1b188ebe79189554979ddc57d6972c582f6314a32022ff11314.json#Attempt-History/editor-assist-A5-16f83a7aca41f94c/scope_delta
+        scope_digest: sha256:74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b
+        execution_ref: evidence/history/sha256-d15b4b9e970bf1b188ebe79189554979ddc57d6972c582f6314a32022ff11314.json#Attempt-History/editor-assist-A5-16f83a7aca41f94c/execution
+        execution_digest: sha256:3951c0edbcbfc27e3d21500625a16d5d1c4565e750f59d66afc527d4c853d867
+        review_ref: evidence/history/sha256-d15b4b9e970bf1b188ebe79189554979ddc57d6972c582f6314a32022ff11314.json#Attempt-History/editor-assist-A5-16f83a7aca41f94c/review
+        review_digest: sha256:2565836adf34227d737430e1be1675e5f56b12185bc907af3a5428f38534e2cb
+    history_head_ref: evidence/history/sha256-d15b4b9e970bf1b188ebe79189554979ddc57d6972c582f6314a32022ff11314.json
+    history_count: 5
+  - id: grid-exchange
+    status: completed
+    task_run_ref: task-runs/grid-exchange-run.md
+    recipe_digest: sha256:709c04f52a09e136cbe6db186fce4c18a8769aa5ed2f9b2de7999981dc4eb3a9
+    recipe_snapshot:
+      id: grid-exchange
+      goal: 可定位的单表查询结果能暂存修改，CSV 或 JSON 能导入已有表，当前行范围能导出 JSON 或 INSERT。
+      depends_on: []
+      covers: [R4, R5, R6]
+      outcomes:
+        - 单表 SELECT 且结果含主键时，修改单元格、预览并确认后，重新查询能看到新值；查询结果不能新增行。
+        - 联接、聚合、视图、缺少主键或无法证明单表时，结果保持只读并可见原因，数据库原值不变。
+        - 提交中某一行被拒绝时，该行可见失败原因，尚未成功的暂存不显示为已成功。
+        - 向已有表确认导入对应好的 CSV 或对象数组后可见写入行数；取消、文件不合法或缺必填列时不写入。
+        - 导入中某一行失败时可见该行原因，结果不显示为全部成功。
+        - 已读行可导出 JSON 数组或这些行的 INSERT；空值仍为空值，未提交修改不进入文件，说明中可见这不是数据库备份。
+        - 非 SELECT 不能全量导出；取消保存不产生任务；写入失败不替换已有目标文件。
+      test: extend
+      scope:
+        - src/grid/DataGrid.vue
+        - src/grid/QueryResultGrid.vue
+        - src/grid/data.ts
+        - src/grid/api.ts
+        - src/grid/result-edit.ts
+        - src/grid/grid.test.ts
+        - src/query/rows.ts
+        - src/export/ExportDialog.vue
+        - src/export/ImportDialog.vue
+        - src/export/plan.ts
+        - src/export/tasks.ts
+        - src/export/native.ts
+        - src/export/write.ts
+        - src/export/csv.ts
+        - src/export/json.ts
+        - src/export/insert.ts
+        - src/export/import.ts
+        - src/export/export.test.ts
+        - src/export/import.test.ts
+        - src/export/native.test.ts
+        - src-tauri/src/grid/sql.rs
+        - src-tauri/src/grid/live.rs
+        - src-tauri/src/grid/commands.rs
+        - src-tauri/src/grid/tests.rs
+        - src-tauri/src/native_export.rs
+    requirement_revision: 1
+    review_base_ref: 62f8c05222e4eee91ce5cad1a48c1fb7a9b33de9
+    attempts:
+      - attempt_id: grid-exchange-A5-95b0175f69ff0e27
+        message_id: grid-exchange-A5-95b0175f69ff0e27-M1
+        recipe_digest: sha256:709c04f52a09e136cbe6db186fce4c18a8769aa5ed2f9b2de7999981dc4eb3a9
+        owner_mode: worker
+        baseline_ref: a70aed49d33ff26f01b8d74c8cb4c1dec774c206
+        checkpoint_ref: d41d35dc7b38c77deda78ac776a5556aa49f242f
+        execution_status: completed
+        review_decision: passed
+        finding_count: 0
+        path_count: 2
+        review_evidence_refs:
+          - evidence/reviews/sha256-8abb185ddc2ab267726c2028de466a0689aec563d74b78a36fea4108d07bcc53.json
+        scope_ref: evidence/history/sha256-8084f4b6685dd06a25287592f759747592afdd9382cd9f8ab7d5c5c337bce6f6.json#Attempt-History/grid-exchange-A5-95b0175f69ff0e27/scope_delta
+        scope_digest: sha256:74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b
+        execution_ref: evidence/history/sha256-8084f4b6685dd06a25287592f759747592afdd9382cd9f8ab7d5c5c337bce6f6.json#Attempt-History/grid-exchange-A5-95b0175f69ff0e27/execution
+        execution_digest: sha256:bc75f56b18a30cdc066fbee9e2d27a61d7ed9c364f7b9cd65dd02817d64ee8be
+        review_ref: evidence/history/sha256-8084f4b6685dd06a25287592f759747592afdd9382cd9f8ab7d5c5c337bce6f6.json#Attempt-History/grid-exchange-A5-95b0175f69ff0e27/review
+        review_digest: sha256:06e782d2969c42d42bbd4f262d6635fc96eda9a018caf2f03b386e7320d69066
+    history_head_ref: evidence/history/sha256-8084f4b6685dd06a25287592f759747592afdd9382cd9f8ab7d5c5c337bce6f6.json
+    history_count: 5
+  - id: saved-queries
+    status: completed
+    task_run_ref: task-runs/saved-queries-run.md
+    recipe_digest: sha256:a9bef3aaf30655ab26a369e5c397f3a66a3429478228eb8773b078d15934dfa6
+    recipe_snapshot:
+      id: saved-queries
+      goal: 使用者能按名称保存查询，打开时不执行；连接消失时只载入 SQL 并要求重选目标。
+      depends_on: []
+      covers: [R7]
+      outcomes:
+        - 保存为日报后再次打开，编辑器中是同一 SQL，且这次打开没有新增成功的执行历史。
+        - 原连接已删除时打开，SQL 仍在，并可见需要重选目标；此时不执行。
+        - 删除前取消则查询仍在；确认删除后列表中不再有该查询。
+        - 执行历史的载入仍不执行，也不被保存查询替换。
+      test: new
+      scope:
+        - src/history/api.ts
+        - src/history/plan.ts
+        - src/history/HistoryPage.vue
+        - src/history/saved.ts
+        - src/history/saved.test.ts
+        - src/history/history.test.ts
+        - src/shell/commands.ts
+        - src/shell/AppShell.vue
+        - src/shell/session.ts
+        - src/shell/shell.test.ts
+        - src/shell/appshell.test.ts
+        - src-tauri/src/query/mod.rs
+        - src-tauri/src/query/commands.rs
+        - src-tauri/src/query/saved.rs
+        - src-tauri/src/query/history.rs
+        - src-tauri/src/query/tests.rs
+        - src-tauri/src/lib.rs
+        - src-tauri/permissions/app-commands.toml
+        - src-tauri/capabilities/default.json
+        - src-tauri/gen/schemas/acl-manifests.json
+        - src-tauri/gen/schemas/capabilities.json
+        - src-tauri/gen/schemas/desktop-schema.json
+        - src-tauri/gen/schemas/windows-schema.json
+    requirement_revision: 1
+    review_base_ref: 067b8401e1646ce81ce01f2637ba2a300475171c
+    attempts:
+      - attempt_id: saved-queries-A3-780eeed695edb08e
+        message_id: saved-queries-A3-780eeed695edb08e-M1
+        recipe_digest: sha256:a9bef3aaf30655ab26a369e5c397f3a66a3429478228eb8773b078d15934dfa6
+        owner_mode: worker
+        baseline_ref: d41d35dc7b38c77deda78ac776a5556aa49f242f
+        checkpoint_ref: 03f49b584956da09745997c771c9cb077b75c43f
+        execution_status: completed
+        review_decision: passed
+        finding_count: 0
+        path_count: 1
+        review_evidence_refs:
+          - evidence/reviews/sha256-7a9a7c50fc74ca44ef520e0f62345a24e3399837f69e36005d80b59c9e9198eb.json
+        scope_ref: evidence/history/sha256-d7b83d231098101597895fbf13a4e9ed5f0044fa92b535fd491807b868bc07d5.json#Attempt-History/saved-queries-A3-780eeed695edb08e/scope_delta
+        scope_digest: sha256:74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b
+        execution_ref: evidence/history/sha256-d7b83d231098101597895fbf13a4e9ed5f0044fa92b535fd491807b868bc07d5.json#Attempt-History/saved-queries-A3-780eeed695edb08e/execution
+        execution_digest: sha256:fcbd9a81a62d30b14544c46b3401a1111a489d5d3bc1eb7a575c87ebb899a903
+        review_ref: evidence/history/sha256-d7b83d231098101597895fbf13a4e9ed5f0044fa92b535fd491807b868bc07d5.json#Attempt-History/saved-queries-A3-780eeed695edb08e/review
+        review_digest: sha256:cee1118148b157f9114b6c764ba3f2c942c6aebe162d2e87fef1eda8af5e3b17
+    history_head_ref: evidence/history/sha256-d7b83d231098101597895fbf13a4e9ed5f0044fa92b535fd491807b868bc07d5.json
+    history_count: 3
+blocker: null
+delivery:
+  status: completed
+plan_input_digest: sha256:68dedb71d7e2775849c2801ef56aa9945467d299adc18115f39ca890cc303b37
+result_inbox_ref: evidence/results/sha256-b8f5982d78b43d0ba2fdd4a2dbdd250b34855fcb7a78b9f0167f2c6669757852.json

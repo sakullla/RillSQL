@@ -1,0 +1,1 @@
+{"candidate_ref":"03f49b584956da09745997c771c9cb077b75c43f","command_id":"typecheck","format":"verification_evidence","ordinal":1,"phase":"check","stderr":"","stdout":"\n> rillsql@0.1.0 typecheck\n> vue-tsc --noEmit\n\n"}
