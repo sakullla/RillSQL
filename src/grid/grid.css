@@ -2,8 +2,10 @@
 
 .data-grid {
   position: relative;
-  flex: 1;
+  flex: 1 1 0%;
+  min-width: 0;
   min-height: 0;
+  max-width: 100%;
   display: flex;
   flex-direction: column;
   background: var(--panel);
@@ -17,13 +19,16 @@
   align-items: center;
   gap: var(--sp-2);
   min-height: var(--control-h);
+  min-width: 0;
+  max-width: 100%;
   padding: var(--sp-2) var(--sp-3);
   border-bottom: 1px solid var(--line);
   flex-wrap: wrap;
 }
-.filter-form { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.filter-form { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; min-width: 0; max-width: 100%; }
 .filter-form select,
-.filter-form input { height: var(--control-h-sm); }
+.filter-form input,
+.result-toolbar input { height: var(--control-h-sm); min-width: 0; max-width: min(240px, 100%); }
 .toolbar-hint { margin: 0; font-size: var(--fs-xs); color: var(--text-3); max-width: 340px; }
 .key-hint { color: var(--warn); }
 
@@ -68,8 +73,8 @@
 }
 
 /* ---------- 表格 ---------- */
-.grid-scroll { flex: 1; min-height: 120px; overflow: auto; }
-.grid-table { border-collapse: collapse; width: max-content; min-width: 100%; font-size: var(--fs-sm); }
+.grid-scroll { flex: 1 1 0%; min-width: 0; min-height: 0; max-width: 100%; overflow: auto; }
+.grid-table { border-collapse: collapse; width: max-content; min-width: 100%; max-width: none; font-size: var(--fs-sm); }
 .grid-table th,
 .grid-table td {
   height: var(--row-h);
@@ -82,7 +87,8 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.grid-table th { position: sticky; top: 0; background: var(--panel-2); z-index: 1; font-weight: 600; }
+.grid-table th { position: sticky; top: 0; background: var(--panel-2); z-index: 2; font-weight: 600; }
+.grid-table td:has(.editor) { max-width: none; overflow: visible; }
 .th-btn { display: inline-flex; align-items: center; gap: var(--sp-1); width: 100%; text-align: left; font-weight: 600; }
 .th-btn:hover { color: var(--accent-text); }
 .grid-empty { text-align: center; color: var(--text-3); height: var(--row-h); }

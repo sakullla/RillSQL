@@ -1,7 +1,7 @@
 /* Database workbench surfaces and layout. */
 .workspace-view { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; }
 .app-root .titlebar { background: var(--panel); }
-.app-root .tb-brand { min-width: 240px; }
+.app-root .tb-brand { min-width: 0; }
 .app-root .cmd-trigger { background: var(--panel-2); border-radius: var(--r); max-width: 440px; }
 .app-root .rail { background: var(--nav-bg); border: 0; padding-top: 16px; gap: 8px; }
 .app-root .rail-btn { color: var(--nav-fg); padding: 12px 0; border-radius: 6px; gap: 7px; font-size: 10px; }
@@ -17,7 +17,7 @@
 .app-root .tab.active::before { top: auto; bottom: 0; }
 .app-root .tab.active > .i { color: var(--accent); }
 .app-root .statusbar { background: var(--panel-2); }
-.welcome { flex: 1; overflow: auto; background: var(--bg); padding: clamp(24px, 3.5vw, 52px); }
+.welcome { flex: 1; min-width: 0; min-height: 0; max-width: 100%; overflow: auto; background: var(--bg); padding: clamp(24px, 3.5vw, 52px); }
 .welcome-inner { max-width: 1160px; margin: 0 auto; }
 .desk-heading { display: flex; justify-content: space-between; align-items: center; gap: 20px; margin: 8px 0 30px; flex-wrap: wrap; }
 .desk-heading .eyebrow { font: 600 10px var(--mono); letter-spacing: .12em; }
@@ -81,21 +81,20 @@
 .app-root .grid-table tbody tr:nth-child(even) { background: color-mix(in srgb, var(--panel-2) 55%, var(--panel)); }
 .app-root .grid-table tbody tr:hover { background: var(--sel); }
 .app-root .grid-foot { background: var(--panel-2); }
-.table-workspace { min-height: 0; }
+.table-workspace { flex: 1 1 auto; min-width: 0; min-height: 0; max-width: 100%; overflow: hidden; }
 @media (max-width: 1180px) {
   .desk-columns { grid-template-columns: 1fr; }
   .desk-tools { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
   .desk-tools .section-heading { grid-column: 1 / -1; margin: 0; }
   .desk-tools > button { align-items: flex-start; flex-direction: column; gap: 8px; }
   .desk-tip { grid-column: 1 / -1; margin-top: 0; }
-  .app-root .tb-brand { min-width: auto; }
+  .app-root .tb-brand { min-width: 0; }
 }
 @media (max-width: 960px) {
   .welcome { padding: 24px; }
   .desk-actions { grid-template-columns: 1fr; gap: 10px; }
   .desk-action { padding: 16px; }
   .desk-db { flex-wrap: wrap; }
-  .desk-db .env { display: none; }
   .page .page-inner { padding: 24px; }
   .title-query { display: none; }
 }
@@ -123,9 +122,68 @@
 .app-root .tr-conn .conn-state { font-size: 10px; }
 .app-root .grid-table .editor input, .app-root .grid-table .editor .btn { height: calc(var(--row-h) - 4px); }
 
-.app-root .titlebar.custom-chrome .cmd-trigger { width: min(440px, max(120px, calc(100vw - 620px))); }
+.app-root .titlebar.custom-chrome .cmd-trigger { width: 100%; min-width: 0; max-width: 100%; }
 @media (max-width: 720px) { .titlebar.custom-chrome .tb-actions > .icon-btn { display: none; } }
 
 .app-root .cmd-trigger > span:not(.kbd) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .sidebar-dismiss { display: none; }
 @media (max-width: 960px) { .sidebar-dismiss { display: block; position: absolute; inset: 0 0 0 var(--rail-w); background: #091c2433; z-index: 29; } }
+
+/* 查询和表格占满内容区；宽列只在表格内部滚动，不把页面撑出横向滚动。 */
+.app-root .workspace-view { min-width: 0; max-width: 100%; overflow: hidden; }
+.app-root.sidebar-hidden #main { flex: 1 1 auto; min-width: 0; max-width: 100%; }
+.app-root .workspace-view .query-pane {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0%;
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+.app-root .workspace-view .query-pane .q-toolbar,
+.app-root .workspace-view .query-pane .editor-caption,
+.app-root .workspace-view .query-pane .editor-position,
+.app-root .workspace-view .query-pane .results-heading {
+  min-width: 0;
+  max-width: 100%;
+}
+.app-root .workspace-view .query-pane .editor-position > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.app-root .workspace-view .query-pane .cm-host {
+  flex: 0 1 var(--editor-share, 42%);
+  min-width: 0;
+  min-height: calc(var(--editor-font) * 1.8 * 3 + 36px);
+  max-width: 100%;
+}
+.app-root .workspace-view .query-pane .q-results {
+  flex: 1 1 0%;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  max-width: 100%;
+  min-height: calc(var(--row-h) * 4 + var(--control-h) + 140px);
+  overflow: hidden;
+}
+.app-root .workspace-view .query-pane .q-results > .data-grid,
+.app-root .table-workspace > .data-grid,
+.app-root .data-grid {
+  flex: 1 1 0%;
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+}
+.app-root .grid-scroll {
+  flex: 1 1 0%;
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  overflow: auto;
+}
+.app-root .grid-table { width: max-content; min-width: 100%; max-width: none; }
+.app-root .grid-table th { position: sticky; top: 0; z-index: 2; }
+.app-root .query-pane .plan-view { flex: 1 1 0%; min-width: 0; min-height: 0; max-width: 100%; overflow: auto; }
