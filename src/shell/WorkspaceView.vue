@@ -224,9 +224,6 @@ onBeforeUnmount(() => {
       @new-query="emit('new-query')"
       @connections="emit('connections')"
       @sqlite="emit('sqlite')"
-      @palette="emit('palette')"
-      @structure="emit('structure')"
-      @query-target="emit('query-target', $event)"
     />
   </div>
   <Teleport to="body">

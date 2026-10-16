@@ -23,8 +23,14 @@ try {
     };
   });
   await page.goto(base);
-  await expect(page.locator(".desk-db")).toHaveCount(3);
-  await page.locator(".desk-db").first().click();
+  const tree = page.getByRole("tree", { name: "数据库对象" });
+  await expect(tree).toContainText("书店 · 开发");
+  await expect(tree).toContainText("库存 · 本地");
+  await expect(tree).toContainText("笔记");
+  await expect(page.locator(".desk-db")).toHaveCount(0);
+  await page.getByRole("button", { name: "新建查询", exact: true }).click();
+  await page.locator("[data-action=target]").click();
+  await page.getByRole("listbox", { name: "执行目标" }).getByRole("option", { name: /书店 · 开发/ }).click();
   await expect(page.locator("[data-action=target]")).toContainText("bookstore");
   report.checks.push("Home opens a query with the chosen connection and database");
   await page.locator(".cm-content").click();
@@ -107,7 +113,10 @@ try {
   const fresh = await browser.newPage({ viewport: { width: 640, height: 800 } });
   await fresh.addInitScript(installSyntheticIpc, "light");
   await fresh.goto(base);
-  await fresh.getByRole("button", { name: "打开 SQLite 文件", exact: false }).click();
+  await fresh.getByRole("button", { name: "打开命令面板" }).click();
+  const palette = fresh.getByRole("dialog", { name: "命令面板" });
+  await palette.getByRole("combobox").fill("SQLite");
+  await palette.getByRole("option", { name: "打开 SQLite 文件", exact: true }).click();
   await expect(fresh.locator("dialog[open]")).toBeVisible();
   expect(await fresh.evaluate(() => window.__uiCalls.filter(call => call.command === "plugin:dialog|open").length)).toBe(1);
   await fresh.locator("dialog[open]").getByRole("button", { name: "关闭", exact: true }).click();

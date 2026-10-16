@@ -70,16 +70,19 @@ function paletteItem(wrapper: VueWrapper, label: string) {
   return item!;
 }
 
-function welcomeAction(wrapper: VueWrapper, label: string) {
-  const item = wrapper.findAll(".welcome button").find((node) => node.text().includes(label));
-  expect(item, label).toBeTruthy();
-  return item!;
+async function openCommand(wrapper: VueWrapper, label: string) {
+  await wrapper.get(".cmd-trigger").trigger("click");
+  await vi.dynamicImportSettled();
+  await flushPromises();
+  await paletteItem(wrapper, label).trigger("click");
+  await vi.dynamicImportSettled();
+  await flushPromises();
 }
 
 describe("workspace tab identity", () => {
   it("keeps query drafts on the tab that owns them", async () => {
     const wrapper = mount(AppShell);
-    await welcomeAction(wrapper, "新建查询").trigger("click");
+    await openCommand(wrapper, "新建查询");
     await vi.dynamicImportSettled();
     await flushPromises();
     expect(wrapper.get("[aria-label='查询']").attributes("data-tab-id")).toBe("query-1");
@@ -120,9 +123,9 @@ describe("workspace tab identity", () => {
     wrapper.unmount();
   });
 
-  it("opens table and structure tabs from the welcome page and the command palette", async () => {
+  it("opens table and structure tabs from the command palette", async () => {
     const welcome = mount(AppShell);
-    await welcomeAction(welcome, "设计新表结构").trigger("click");
+    await openCommand(welcome, "新建表结构");
     await vi.dynamicImportSettled();
     await flushPromises();
     expect(welcome.get("[aria-label='表结构']").attributes("data-tab-id")).toBe("structure:placeholder");
@@ -199,7 +202,10 @@ describe("workspace tab identity", () => {
   it("binds a query from the tab menu and closes the other tabs", async () => {
     replaceCatalog([postgresCatalog()]);
     const wrapper = mount(AppShell);
-    await welcomeAction(wrapper, "新建查询").trigger("click");
+    expect(wrapper.find(".desk-db").exists()).toBe(false);
+    expect(wrapper.get("[aria-label='数据库对象']").text()).toContain("127.0.0.1");
+    expect(wrapper.get("[aria-label='数据库对象']").text()).toContain("开发");
+    await openCommand(wrapper, "新建查询");
     await vi.dynamicImportSettled();
     await flushPromises();
     await wrapper.get(".tab-new").trigger("click");

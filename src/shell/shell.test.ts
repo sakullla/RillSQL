@@ -2,7 +2,15 @@ import { mount } from "@vue/test-utils";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn(async () => []),
+}));
+import { replaceCatalog, resetCatalog } from "../catalog/store";
+import type { CatalogConnection } from "../catalog/types";
+import ConnectionsPage from "../connections/ConnectionsPage.vue";
+import HistoryPage from "../history/HistoryPage.vue";
 import ActivityRail from "./ActivityRail.vue";
 import { filterPalette, shellCommands } from "./commands";
 import EnvPill from "./EnvPill.vue";
@@ -90,8 +98,59 @@ describe("shell layout", () => {
     expect(table.text()).toContain("customers");
     expect(table.text()).toContain("shop / public");
 
+    const catalog: CatalogConnection = {
+      id: "shop",
+      name: "书店",
+      engine: "postgres",
+      env: "prod",
+      envLabel: "生产",
+      envTone: "prod",
+      status: "connected",
+      defaultDatabase: "main",
+      foreignKeys: null,
+      error: null,
+      databases: [
+        {
+          name: "main",
+          error: null,
+          schemas: [{ name: "public", objects: [{ name: "customers", kind: "table", estimatedRows: 1, stale: false }], total: 1, error: null }],
+        },
+      ],
+    };
+    replaceCatalog([catalog]);
+    const labeled = mount(StatusBar, {
+      props: { tab: makeTab({ id: "table:shop:main:public:customers", kind: "table", title: "customers", path: "main / public" }), onWorkspace: true },
+    });
+    expect(labeled.text()).toContain("customers");
+    expect(labeled.text()).toContain("main / public");
+    expect(labeled.text()).toContain("生产");
+    resetCatalog();
+    const unlabeled = mount(StatusBar, {
+      props: { tab: makeTab({ id: "table:shop:main:public:customers", kind: "table", title: "customers", path: "main / public" }), onWorkspace: true },
+    });
+    expect(unlabeled.text()).not.toContain("生产");
+
     const idle = mount(StatusBar, { props: { tab: null, onWorkspace: false } });
     expect(idle.text()).toContain(PRODUCT_TITLE);
+  });
+
+  it("drops the english eyebrows from connections, history, and settings", () => {
+    const connections = mount(ConnectionsPage, { props: { sqlitePrompt: 0 } });
+    expect(connections.text()).toContain("连接管理");
+    expect(connections.text()).not.toContain("DATABASE CONNECTIONS");
+    connections.unmount();
+
+    const history = mount(HistoryPage);
+    expect(history.text()).toContain("查询历史");
+    expect(history.text()).not.toContain("QUERY HISTORY");
+    expect(history.text()).not.toContain("SAVED QUERIES");
+    history.unmount();
+
+    const saved = mount(HistoryPage, { props: { section: "saved" } });
+    expect(saved.text()).toContain("保存的查询");
+    expect(saved.text()).not.toContain("SAVED QUERIES");
+    expect(saved.text()).not.toContain("QUERY HISTORY");
+    saved.unmount();
   });
 
   it("distinguishes the four operation states by text, not color alone", () => {

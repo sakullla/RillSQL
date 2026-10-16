@@ -213,7 +213,6 @@ onMounted(() => {
     <div class="page-inner">
       <div class="page-head">
         <div>
-          <div class="eyebrow">{{ section === "saved" ? "SAVED QUERIES" : "QUERY HISTORY" }}</div>
           <h1>{{ section === "saved" ? "保存的查询" : "查询历史" }}</h1>
           <p v-if="section === 'saved'">按名称保存当前 SQL。打开只载入 SQL 和还在的执行目标，不会执行，也不会写入执行历史。</p>
           <p v-else>找回执行过的 SQL，检查结果，再回到编辑器继续工作。</p>

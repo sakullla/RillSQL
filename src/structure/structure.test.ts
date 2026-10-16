@@ -1,5 +1,7 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { replaceCatalog, resetCatalog } from "../catalog/store";
+import type { CatalogConnection } from "../catalog/types";
 import type { TableTarget } from "../grid/target";
 import {
   canDropIndex,
@@ -105,8 +107,25 @@ describe("structure presentation logic", () => {
   });
 });
 
+function catalogConnection(): CatalogConnection {
+  return {
+    id: "c1",
+    name: "笔记库",
+    engine: "sqlite",
+    env: "prod",
+    envLabel: "生产",
+    envTone: "prod",
+    status: "connected",
+    defaultDatabase: "main",
+    foreignKeys: true,
+    error: null,
+    databases: [],
+  };
+}
+
 describe("structure pane", () => {
   beforeEach(() => {
+    resetCatalog();
     invoke.mockReset();
     invoke.mockImplementation(async (command: string) => {
       if (command === "ddl_describe") return described;
@@ -120,6 +139,7 @@ describe("structure pane", () => {
     expect(wrapper.attributes("data-draft")).toBe("kept");
     expect(wrapper.get(".structure-heading h2").text()).toBe("notes");
     expect(wrapper.text()).toContain("来自连接「c1」的「main」");
+    expect(wrapper.text()).not.toContain("TABLE DESIGNER");
     expect(wrapper.text()).toContain("直接改下面的字段");
     await buttonNamed(wrapper, "新增字段").trigger("click");
     await wrapper.get("[aria-label='字段名 3']").setValue("email");
@@ -129,6 +149,33 @@ describe("structure pane", () => {
     expect(wrapper.text()).toContain("类型由 TEXT 改为 INTEGER");
     expect(wrapper.text()).toContain("已修改");
     wrapper.unmount();
+  });
+
+  it("shows the catalog environment label on the structure page and the confirmation", async () => {
+    replaceCatalog([catalogConnection()]);
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "ddl_describe") return described;
+      if (command === "ddl_preview") return planOf({ steps: [{ sql: 'DROP TABLE "notes";', label: "删除 notes" }] });
+      throw new Error(`unexpected ${command}`);
+    });
+    const wrapper = mount(StructurePane, { props: { tabId: "table:c1", draft: "", purpose: "edit", target } });
+    await flushPromises();
+    expect(wrapper.text()).toContain("来自连接「笔记库」的「main」");
+    expect(wrapper.text()).toContain("生产");
+    expect(wrapper.text()).not.toContain("TABLE DESIGNER");
+    await buttonNamed(wrapper, "删除表").trigger("click");
+    await buttonNamed(wrapper, "查看将要发生什么").trigger("click");
+    await flushPromises();
+    const dialog = wrapper.get("[aria-label='变更预览']");
+    expect(dialog.text()).toContain("生产");
+    expect(dialog.text()).toContain("目标：sqlite / notes");
+    wrapper.unmount();
+
+    const create = mount(StructurePane, { props: { tabId: "structure:placeholder", draft: "", purpose: "create" } });
+    await flushPromises();
+    expect(create.text()).toContain("生产");
+    expect(create.text()).not.toContain("TABLE DESIGNER");
+    create.unmount();
   });
 
   it("keeps a protected index from being deleted as a plain index", async () => {

@@ -1,11 +1,24 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import { catalogConnections } from "../catalog/store";
+import { resolveTableTarget } from "../grid/target";
 import { PRODUCT_TITLE } from "./product";
 import Icon from "./Icon.vue";
 import type { ShellTab } from "./session";
 import { CONNECTION_STATUS_TEXT, OPERATION_STATE_TEXT, type OperationActivity, type OperationState } from "./status-text";
 
 const props = defineProps<{ tab: ShellTab | null; onWorkspace: boolean; activity?: OperationActivity | null }>();
+
+const tableEnvironment = computed(() => {
+  const tab = props.tab;
+  if (!props.onWorkspace || tab?.kind !== "table") return null;
+  const resolved = resolveTableTarget(tab.id, catalogConnections());
+  if (!resolved) return null;
+  const connection = catalogConnections().find((item) => item.id === resolved.connectionId);
+  const label = connection?.envLabel.trim() ?? "";
+  if (!connection || !label) return null;
+  return { label, tone: connection.envTone };
+});
 
 const statusLabel = computed(() => {
   const status = props.tab?.connectionStatus;
@@ -36,6 +49,7 @@ const ACTIVITY_TONE: Record<OperationState, "info" | "ok" | "err" | "warn"> = {
           <Icon name="table" />
           <strong>{{ tab.title }}</strong>
           <span v-if="tab.path" class="muted">{{ tab.path }}</span>
+          <span v-if="tableEnvironment" class="env xs" :class="tableEnvironment.tone !== 'none' ? `env-${tableEnvironment.tone}` : undefined">{{ tableEnvironment.label }}</span>
         </span>
       </template>
       <span v-else class="sb-item muted">{{ PRODUCT_TITLE }}</span>

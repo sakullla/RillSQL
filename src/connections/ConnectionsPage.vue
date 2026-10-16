@@ -425,7 +425,7 @@ watch(
   <div class="page conn-page" @click="menuId = null">
     <div class="page-inner">
       <div class="page-head">
-        <div><div class="eyebrow">DATABASE CONNECTIONS</div><h1>连接管理</h1><p>一个入口，管理你的本地与远程数据库。</p></div>
+        <div><h1>连接管理</h1><p>一个入口，管理你的本地与远程数据库。</p></div>
         <div class="ph-actions"><button class="btn" type="button" @click="openEditor(undefined, 'sqlite')"><ConnIcon name="file" />打开 SQLite</button><button class="btn primary" type="button" data-action="conn-new" @click.stop="openEditor()"><ConnIcon name="plus" />新建连接</button></div>
       </div>
       <div class="connection-overview"><span><b>{{ connections.length }}</b> 个连接</span><span class="online-total"><i></i><b>{{ connectedCount }}</b> 个已连接</span><span class="grow"></span><span><ConnIcon name="lock" />凭据保存在本机</span></div>

@@ -128,8 +128,9 @@ try {
       await page.addInitScript(installSyntheticIpc, theme);
       try {
         await page.goto(previewUrl);
-        await page.locator(".desk-db").first().waitFor();
-        await captureImage(page, "welcome", theme, width, "欢迎页双主路径和已连接的资源管理器");
+        await page.getByRole("button", { name: "新建查询", exact: true }).waitFor();
+        await expect(page.locator(".desk-db")).toHaveCount(0);
+        await captureImage(page, "welcome", theme, width, "已有连接时内容区不列连接卡片，对象树仍是连接名单");
 
         await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "连接" }).click();
         await page.getByRole("heading", { name: "连接管理" }).waitFor();

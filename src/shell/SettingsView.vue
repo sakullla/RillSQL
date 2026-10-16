@@ -42,7 +42,6 @@ function onNullCopy(event: Event) {
     <div class="page-inner narrow">
       <div class="page-head">
         <div>
-          <div class="eyebrow">PREFERENCES</div>
           <h1>设置</h1>
           <p>修改立即生效，只保存在本机。</p>
         </div>

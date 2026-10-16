@@ -46,10 +46,19 @@ watch(
 );
 const activeColumns = computed(() => rows.value.filter((row) => !row.dropped).map((row) => row.name).filter(Boolean));
 
-/* R4：结构视图里随时能读出当前连接与库。 */
+const boundConnection = computed(() => {
+  const id = purpose.value === "edit" ? props.target?.connectionId : createConnection.value;
+  if (!id) return null;
+  return catalogConnections().find((item) => item.id === id) ?? null;
+});
+
+const environmentLabel = computed(() => boundConnection.value?.envLabel.trim() ?? "");
+const environmentTone = computed(() => boundConnection.value?.envTone ?? "none");
+
+/* R4：结构视图里随时能读出当前连接与库。环境文字只读目录里的同一条连接。 */
 const contextText = computed(() => {
   if (purpose.value !== "edit" || !props.target) return "";
-  const name = connections.value.find((item) => item.id === props.target!.connectionId)?.name ?? props.target.connectionId;
+  const name = boundConnection.value?.name ?? props.target.connectionId;
   const place = props.target.schema ? `${props.target.database} / ${props.target.schema}` : props.target.database;
   return `来自连接「${name}」的「${place}」`;
 });
@@ -228,7 +237,7 @@ function createForeignKey(foreignKey: StructureForeignKey) {
   <div class="structure-pane" aria-label="表结构" :data-tab-id="tabId" :data-draft="draft" tabindex="-1">
     <p v-if="purpose === 'edit' && !target" class="empty" role="alert">这张表还没有绑定已打开的连接。</p>
     <template v-else>
-      <header class="structure-heading"><span class="action-icon"><Icon name="table" /></span><div><div class="eyebrow">TABLE DESIGNER</div><h2>{{ purpose === 'create' ? '设计新表' : target?.table }}</h2><p>{{ purpose === 'create' ? '定义字段、类型与约束，预览 SQL 后再创建。' : contextText }}</p></div><span class="grow"></span><div v-if="description" class="structure-stats"><span><b>{{ description.columns.length }}</b> 字段</span><span><b>{{ description.indexes.length }}</b> 索引</span></div></header>
+      <header class="structure-heading"><span class="action-icon"><Icon name="table" /></span><div><h2>{{ purpose === 'create' ? '设计新表' : target?.table }}</h2><p><span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span> {{ purpose === 'create' ? '定义字段、类型与约束，预览 SQL 后再创建。' : contextText }}</p></div><span class="grow"></span><div v-if="description" class="structure-stats"><span><b>{{ description.columns.length }}</b> 字段</span><span><b>{{ description.indexes.length }}</b> 索引</span></div></header>
       <nav class="struct-nav" aria-label="结构分区">
         <button type="button" :class="{ on: section === 'columns' }" @click="section = 'columns'">字段</button>
         <button v-if="purpose === 'edit'" type="button" :class="{ on: section === 'indexes' }" @click="section = 'indexes'">索引</button>
@@ -302,6 +311,8 @@ function createForeignKey(foreignKey: StructureForeignKey) {
       :receipt="receipt"
       :busy="busy"
       :engine="activeEngine"
+      :env-label="environmentLabel"
+      :env-tone="environmentTone"
       :expect-name="pending?.kind === 'dropTable' ? pending.table : undefined"
       @cancel="closePreview"
       @confirm="confirm"

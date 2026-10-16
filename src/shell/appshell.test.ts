@@ -22,6 +22,12 @@ describe("AppShell", () => {
     expect(paths).toHaveLength(2);
     expect(paths[0]!.text()).toContain("新建连接");
     expect(paths[1]!.text()).toContain("打开 SQLite 文件");
+    expect(text).toContain("配置留在本机");
+    expect(text).toContain("密码进入系统凭据库");
+    expect(text).not.toContain("从数据，到答案。");
+    expect(text).not.toContain("SQL FIRST");
+    expect(text).not.toContain("WORKSPACE");
+    expect(wrapper.find(".desk-db").exists()).toBe(false);
     expect(text).not.toMatch(/云登录|请登录/);
     wrapper.unmount();
   });
