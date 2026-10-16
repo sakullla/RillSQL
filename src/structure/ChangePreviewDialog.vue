@@ -3,7 +3,7 @@ import { computed, ref, watch } from "vue";
 import { riskLevelLabel, statusLabel, transactionSummary } from "./logic";
 import type { StructurePlan, StructureReceipt } from "./types";
 
-const props = defineProps<{ plan: StructurePlan; receipt: StructureReceipt | null; busy: boolean; expectName?: string; engine?: string; envLabel?: string; envTone?: string }>();
+const props = defineProps<{ plan: StructurePlan; receipt: StructureReceipt | null; busy: boolean; expectName?: string; engine?: string; connectionName?: string; envLabel?: string; envTone?: string }>();
 const emit = defineEmits<{ cancel: []; confirm: [] }>();
 const typed = ref("");
 const copyNote = ref("");
@@ -43,7 +43,7 @@ async function copySql() {
         <span class="grow"></span>
       </header>
       <div class="body">
-        <p class="pv-target">目标：{{ plan.target }} <span v-if="envLabel" class="env xs" :class="envTone && envTone !== 'none' ? `env-${envTone}` : undefined">{{ envLabel }}</span></p>
+        <p class="pv-target">目标：<template v-if="connectionName">{{ connectionName }} / </template>{{ plan.target }} <span v-if="envLabel" class="env xs" :class="envTone && envTone !== 'none' ? `env-${envTone}` : undefined">{{ envLabel }}</span></p>
 
         <section v-if="!receipt" class="pv-sec">
           <h3 class="pv-h">将要发生什么</h3>

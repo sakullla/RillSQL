@@ -167,8 +167,11 @@ describe("structure pane", () => {
     await buttonNamed(wrapper, "查看将要发生什么").trigger("click");
     await flushPromises();
     const dialog = wrapper.get("[aria-label='变更预览']");
-    expect(dialog.text()).toContain("生产");
-    expect(dialog.text()).toContain("目标：sqlite / notes");
+    const targetLine = dialog.get(".pv-target").text();
+    expect(targetLine).toContain("笔记库");
+    expect(targetLine).toContain("notes");
+    expect(targetLine).toContain("生产");
+    expect(targetLine.startsWith("目标：sqlite")).toBe(false);
     wrapper.unmount();
 
     const create = mount(StructurePane, { props: { tabId: "structure:placeholder", draft: "", purpose: "create" } });

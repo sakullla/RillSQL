@@ -54,6 +54,7 @@ const boundConnection = computed(() => {
 
 const environmentLabel = computed(() => boundConnection.value?.envLabel.trim() ?? "");
 const environmentTone = computed(() => boundConnection.value?.envTone ?? "none");
+const connectionName = computed(() => boundConnection.value?.name.trim() ?? "");
 
 /* R4：结构视图里随时能读出当前连接与库。环境文字只读目录里的同一条连接。 */
 const contextText = computed(() => {
@@ -311,6 +312,7 @@ function createForeignKey(foreignKey: StructureForeignKey) {
       :receipt="receipt"
       :busy="busy"
       :engine="activeEngine"
+      :connection-name="connectionName"
       :env-label="environmentLabel"
       :env-tone="environmentTone"
       :expect-name="pending?.kind === 'dropTable' ? pending.table : undefined"
