@@ -1,5 +1,6 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { replaceCatalog, resetCatalog } from "../catalog/store";
 import ImportDialog from "./ImportDialog.vue";
 import type { TableTarget } from "../grid/target";
 import type { TableSchema } from "../grid/types";
@@ -35,7 +36,10 @@ async function chooseFile(wrapper: ReturnType<typeof dialog>, name: string, cont
 }
 
 describe("import into an existing table", () => {
-  beforeEach(() => invoke.mockReset());
+  beforeEach(() => {
+    invoke.mockReset();
+    resetCatalog();
+  });
 
   it("writes two mapped csv rows and reports the count", async () => {
     invoke.mockResolvedValue({
@@ -106,6 +110,35 @@ describe("import into an existing table", () => {
     expect(text).toContain("invalid input syntax for type integer");
     expect(text).toContain("不是全部成功");
     expect(text).not.toContain("已写入 2 行");
+    wrapper.unmount();
+  });
+
+  it("shows the catalog connection, table and environment before writing, and cancel writes nothing", async () => {
+    replaceCatalog([{
+      id: "shop",
+      name: "Shop",
+      engine: "postgres",
+      env: "prod",
+      envLabel: "生产",
+      envTone: "prod",
+      status: "connected",
+      defaultDatabase: "app",
+      foreignKeys: null,
+      error: null,
+      databases: [],
+    }]);
+    const wrapper = dialog();
+    const targetText = wrapper.get("[data-import-target]").text();
+    expect(targetText).toContain("Shop");
+    expect(targetText).toContain("customers");
+    expect(targetText).toContain("生产");
+    await chooseFile(wrapper, "rows.csv", "name,email,note\r\n甲,a@example.com,\r\n乙,b@example.com,备注");
+    expect(wrapper.text()).toContain("将写入 2 行");
+    expect(wrapper.get("[data-import-target]").text()).toContain("生产");
+    expect(invoke).not.toHaveBeenCalled();
+    await wrapper.findAll("button").find((button) => button.text() === "取消")!.trigger("click");
+    expect(wrapper.emitted("close")).toHaveLength(1);
+    expect(invoke).not.toHaveBeenCalled();
     wrapper.unmount();
   });
 });

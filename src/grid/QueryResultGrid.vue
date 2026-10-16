@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from "vue";
+import { computed, onBeforeUnmount, reactive, ref, watch } from "vue";
 import { catalogConnections } from "../catalog/store";
+import { registerPending } from "../shell/close-guard";
 import ExportDialog from "../export/ExportDialog.vue";
 import type { CsvOptions } from "../export/csv";
 import type { InsertTarget } from "../export/insert";
@@ -154,6 +155,34 @@ watch([find, sort, () => props.rows], reset);
 
 const commitFailures = computed(() => (editSession.value ? Array.from(editSession.value.failures, ([id, message]) => ({ id, message })) : []));
 const pendingVisible = computed(() => !!editSession.value && (editSession.value.pendingCount > 0 || editSession.value.failures.size > 0));
+const boundConnection = computed(() => {
+  if (!props.connectionId) return null;
+  return catalogConnections().find((item) => item.id === props.connectionId) ?? null;
+});
+const connectionName = computed(() => boundConnection.value?.name.trim() || props.connectionId || "");
+const environmentLabel = computed(() => boundConnection.value?.envLabel.trim() ?? "");
+const environmentTone = computed(() => boundConnection.value?.envTone ?? "none");
+const objectName = computed(() => {
+  const target = editSession.value?.target;
+  if (!target) return "";
+  return target.schema ? `${target.schema}.${target.table}` : target.table;
+});
+let releasePending: (() => void) | null = null;
+function releaseCellPending(): void {
+  releasePending?.();
+  releasePending = null;
+}
+/** 只登记未提交的单元格修改；未执行 SQL 不进入关闭确认。 */
+watch(
+  () => [props.tabId, (editSession.value?.pendingCount ?? 0) > 0] as const,
+  ([tabId, pending]) => {
+    releaseCellPending();
+    if (!pending) return;
+    releasePending = registerPending(tabId, () => props.tabId === tabId && (editSession.value?.pendingCount ?? 0) > 0);
+  },
+  { immediate: true },
+);
+onBeforeUnmount(releaseCellPending);
 
 function inspect(rowId: string, index: number) {
   const row = view.value.rows.find((item) => item.id === rowId);
@@ -366,7 +395,7 @@ watch(() => props.rows, () => { selected.value = null; });
     <section v-if="selected" class="inspector" aria-label="查询值查看器"><div class="inspector-meta"><strong>{{ selected.column }}</strong><span>{{ selected.value === null ? 'NULL' : selected.value === '' ? '空字符串（长度 0）' : '完整值' }}</span><span class="grow"></span><button class="btn sm" @click="selected = null">关闭</button></div><textarea readonly :value="selected.value ?? ''" :aria-label="`${selected.column} 的值`"></textarea><div class="inspector-actions"><button v-if="editSession" class="btn sm" type="button" :disabled="!editSession.canUpdate(editSession.rowById(selected.row)) || !editSession.canEditColumn(selected.column)" @click="beginEdit(selected.row, selected.column)">编辑</button><button class="btn sm" @click="copyValue">复制值</button><span role="status">{{ copyMessage }}</span></div></section>
     <div v-if="commitOpen && editSession" class="overlay" role="presentation">
       <div class="sheet" role="dialog" aria-modal="true" aria-label="待提交的更改">
-        <header><div><h2>提交这些更改？</h2><p class="hint">将按顺序逐条写入数据库，遇到错误即停止；已写入的不会自动撤销。查询结果不能新增行。</p></div></header>
+        <header><div><h2>提交这些更改？</h2><p class="hint" data-confirm-target>目标：{{ connectionName }} / {{ objectName }} <span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span></p><p class="hint">将按顺序逐条写入数据库，遇到错误即停止；已写入的不会自动撤销。查询结果不能新增行。</p></div></header>
         <div class="body"><ol class="sql-list"><li v-for="step in editSession.preview()" :key="step.id"><strong>{{ step.label }}</strong><pre>{{ step.sql }}</pre></li></ol></div>
         <footer>
           <button class="btn" type="button" @click="commitOpen = false">取消</button>

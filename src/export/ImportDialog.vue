@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
+import { catalogConnections } from "../catalog/store";
 import { gridCommit, gridDescribe } from "../grid/api";
 import type { TableTarget } from "../grid/target";
 import type { TableSchema } from "../grid/types";
@@ -69,6 +70,14 @@ watch(
 );
 
 const activeSchema = computed(() => localSchema.value ?? props.schema);
+const boundConnection = computed(() => catalogConnections().find((item) => item.id === props.target.connectionId) ?? null);
+const connectionName = computed(() => boundConnection.value?.name.trim() || props.target.connectionId);
+const environmentLabel = computed(() => boundConnection.value?.envLabel.trim() ?? "");
+const environmentTone = computed(() => boundConnection.value?.envTone ?? "none");
+const objectName = computed(() => {
+  const current = localTarget.value ?? props.target;
+  return current.schema ? `${current.schema}.${current.table}` : current.table;
+});
 const gaps = computed(() => requiredGaps(activeSchema.value.columns, mapping.value));
 const previewRows = computed(() => (parsed.value ? mappedPreview(parsed.value.rows, mapping.value, activeSchema.value.columns) : []));
 const { viewport, range, onScroll } = useRowWindow(computed(() => previewRows.value.length));
@@ -147,6 +156,7 @@ async function confirm() {
         </button>
       </header>
       <div class="ex-body">
+        <p class="ex-note" data-import-target>目标：{{ connectionName }} / {{ objectName }} <span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span></p>
         <p v-if="parseError" class="ex-alert" role="alert">{{ parseError }}</p>
         <p v-if="resultText" class="ex-note" role="status" data-import-result>{{ resultText }}</p>
         <label class="ex-path">导入到

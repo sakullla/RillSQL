@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
+import { anyPending, resetCloseGuard, tabHasPending } from "../shell/close-guard";
 import type { CatalogConnection } from "../catalog/types";
 import { exportTasks, resetExportTasks } from "../export/tasks";
 import DataGrid from "./DataGrid.vue";
@@ -244,6 +245,8 @@ describe("grid views", () => {
   beforeEach(() => {
     invoke.mockReset();
     resetExportTasks();
+    resetCloseGuard();
+    resetCatalog();
   });
 
   it("reads an opened table through grid commands instead of the fixture", async () => {
@@ -357,6 +360,8 @@ describe("grid views", () => {
     const remove = wrapper.findAll("button").find((button) => button.text() === "删除行");
     expect(add!.attributes("disabled")).toBeUndefined();
     expect(remove!.attributes("disabled")).toBeDefined();
+    await wrapper.get("[data-cell='o:0:0:label']").trigger("dblclick");
+    expect(wrapper.find("input[aria-label='编辑 label']").exists()).toBe(false);
     expect(wrapper.text()).toContain("这张表没有主键，无法唯一确定已有行，所以不能修改或删除它们。");
     expect(wrapper.text()).not.toContain("按 label 定位行");
     expect(wrapper.find(".key-chip").exists()).toBe(false);
@@ -476,6 +481,139 @@ describe("grid views", () => {
     wrapper.unmount();
   });
 
+  it("separates an empty table from a filter miss and can clear the filter", async () => {
+    invoke.mockImplementation(async (command: string, args: { request?: { filters?: unknown[] } }) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") {
+        const filters = args.request?.filters ?? [];
+        if (filters.length > 0) return { rows: [], truncated: false, sql: "SELECT WHERE none" };
+        return { rows: [customerRow(1), customerRow(2)], truncated: false, sql: "SELECT customers" };
+      }
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:shop:app:public:customers", draft: "select unfinished", pageSize: 10, target: customersTarget } });
+    await flushPromises();
+    expect(wrapper.find("[data-empty]").exists()).toBe(false);
+    expect(wrapper.text()).toContain("客户1");
+    expect(tabHasPending("table:shop:app:public:customers")).toBe(false);
+    expect(anyPending()).toBe(false);
+    await wrapper.get("select[aria-label='筛选列']").setValue("name");
+    await wrapper.get("input[aria-label='筛选值']").setValue("不存在");
+    await wrapper.get("form.filter-form").trigger("submit");
+    await flushPromises();
+    expect(wrapper.get("[data-empty='filter']").text()).toContain("没有匹配行");
+    expect(wrapper.find("[data-empty='table']").exists()).toBe(false);
+    expect(wrapper.text()).not.toContain("这张表没有行");
+    expect(wrapper.text()).toContain("name");
+    await wrapper.get("[data-empty='filter'] button").trigger("click");
+    await flushPromises();
+    expect(wrapper.find("[data-empty]").exists()).toBe(false);
+    expect(wrapper.text()).toContain("客户1");
+    expect(wrapper.text()).toContain("客户2");
+    wrapper.unmount();
+  });
+
+  it("shows an empty base table as having no rows and still allows insert", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") return { rows: [], truncated: false, sql: "SELECT empty" };
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:empty", draft: "", pageSize: 10, target: customersTarget } });
+    await flushPromises();
+    expect(wrapper.get("[data-empty='table']").text()).toContain("这张表没有行");
+    expect(wrapper.text()).not.toContain("没有匹配行");
+    expect(wrapper.text()).not.toContain("读取失败");
+    const add = wrapper.findAll("button").find((button) => button.text() === "新增行");
+    expect(add!.attributes("disabled")).toBeUndefined();
+    await wrapper.get("[data-empty='table'] button").trigger("click");
+    expect(wrapper.find("[data-empty]").exists()).toBe(false);
+    expect(wrapper.text()).toContain("新增");
+    expect(tabHasPending("table:empty")).toBe(true);
+    wrapper.unmount();
+    expect(tabHasPending("table:empty")).toBe(false);
+    expect(anyPending()).toBe(false);
+  });
+
+  it("keeps a view read-only when it has no rows", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return { ...customerSchema(), kind: "view" as const, name: "customer_view", key: [] };
+      if (command === "grid_page") return { rows: [], truncated: false, sql: "SELECT view" };
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:view", draft: "select 1", pageSize: 10, target: { ...customersTarget, table: "customer_view" } } });
+    await flushPromises();
+    expect(wrapper.text()).toContain("视图是只读的");
+    expect(wrapper.get("[data-empty='table']").text()).toContain("这个视图没有行");
+    expect(wrapper.get("[data-empty='table']").find("button").exists()).toBe(false);
+    const add = wrapper.findAll("button").find((button) => button.text() === "新增行");
+    expect(add!.attributes("disabled")).toBeDefined();
+    expect(tabHasPending("table:view")).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("retries a failed read without presenting it as an empty table", async () => {
+    let failed = true;
+    invoke.mockImplementation(async (command: string) => {
+      if (failed) throw new Error("连接已断开，读取失败");
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") return { rows: [customerRow(1)], truncated: false, sql: "SELECT recovered" };
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:retry", draft: "", target: customersTarget } });
+    await flushPromises();
+    expect(wrapper.text()).toContain("读取失败");
+    expect(wrapper.text()).toContain("这不是无匹配结果");
+    expect(wrapper.text()).not.toContain("没有匹配行");
+    expect(wrapper.text()).not.toContain("这张表没有行");
+    expect(wrapper.find("[data-empty]").exists()).toBe(false);
+    failed = false;
+    await wrapper.findAll("button").find((button) => button.text() === "重试")!.trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("客户1");
+    expect(wrapper.text()).not.toContain("读取失败");
+    expect(wrapper.find("[data-empty]").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("shows the catalog environment on the table and its commit preview", async () => {
+    replaceCatalog([{
+      ...shopCatalog("postgres", "app", [{ name: "public", tables: ["customers"] }]),
+      env: "prod",
+      envLabel: "生产",
+      envTone: "prod" as const,
+    }]);
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") return { rows: [customerRow(1), customerRow(2)], truncated: false, sql: "SELECT" };
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:prod", draft: "select 1", pageSize: 10, target: customersTarget } });
+    await flushPromises();
+    expect(wrapper.get("[data-env]").text()).toBe("生产");
+    expect(wrapper.find(".v-null").text()).toBe("NULL");
+    expect(wrapper.find(".v-empty").text()).toBe("空字符串");
+    expect(tabHasPending("table:prod")).toBe(false);
+    await wrapper.get("[data-cell='1:name']").trigger("dblclick");
+    await wrapper.get("input[aria-label='编辑 name']").setValue("改名");
+    await wrapper.findAll("button").find((button) => button.text() === "确定")!.trigger("click");
+    expect(tabHasPending("table:prod")).toBe(true);
+    expect(anyPending()).toBe(true);
+    await wrapper.findAll("button").find((button) => button.text() === "提交")!.trigger("click");
+    const confirm = wrapper.get("[data-confirm-target]");
+    expect(confirm.text()).toContain("Shop");
+    expect(confirm.text()).toContain("customers");
+    expect(confirm.text()).toContain("生产");
+    expect(invoke.mock.calls.some((call) => call[0] === "grid_commit")).toBe(false);
+    await wrapper.findAll("button").find((button) => button.text() === "取消")!.trigger("click");
+    expect(invoke.mock.calls.some((call) => call[0] === "grid_commit")).toBe(false);
+    expect(tabHasPending("table:prod")).toBe(true);
+    await wrapper.findAll("button").find((button) => button.text() === "放弃")!.trigger("click");
+    expect(tabHasPending("table:prod")).toBe(false);
+    expect(anyPending()).toBe(false);
+    wrapper.unmount();
+  });
+
   it("limits query find and sort to loaded rows and blocks a non-select full export", async () => {
     const store = customersFixture(130);
     const wrapper = mount(QueryResultGrid, {
@@ -576,6 +714,7 @@ describe("query result edits", () => {
     invoke.mockReset();
     resetExportTasks();
     resetCatalog();
+    resetCloseGuard();
   });
 
   afterEach(() => {
@@ -751,6 +890,58 @@ describe("query result edits", () => {
     expect(commit?.[1]).toMatchObject({ request: { table: "customers", schema: "public", changes: [{ kind: "update", id: "u:r0" }] } });
     expect(wrapper.get("[data-cell='r0:name']").text()).toContain("新名字");
     wrapper.unmount();
+  });
+
+  it("shows the catalog environment on a result commit and ignores unsaved SQL", async () => {
+    replaceCatalog([{
+      ...shopCatalog("postgres", "app", [{ name: "public", tables: ["customers"] }]),
+      env: "prod",
+      envLabel: "生产",
+      envTone: "prod" as const,
+    }]);
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      throw new Error(command);
+    });
+    const model = gridModel({ columns: ["id", "name", "email", "note"], rows: [["1", "客户1", "a@example.com", null], ["2", "客户2", "b@example.com", ""]] });
+    const wrapper = mount(QueryResultGrid, {
+      props: {
+        tabId: "query-prod",
+        statement: "SELECT id, name, email, note FROM public.customers",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+        schema: "public",
+      },
+    });
+    await flushPromises();
+    expect(wrapper.attributes("data-editable")).toBe("true");
+    expect(tabHasPending("query-prod")).toBe(false);
+    expect(anyPending()).toBe(false);
+    expect(wrapper.find(".v-null").text()).toBe("NULL");
+    expect(wrapper.find(".v-empty").text()).toBe("空字符串");
+    await wrapper.get("[aria-label='在已读取行中查找']").setValue("不会写入");
+    expect(tabHasPending("query-prod")).toBe(false);
+    await wrapper.get("[aria-label='在已读取行中查找']").setValue("");
+    await wrapper.get("[data-cell='r0:name']").trigger("dblclick");
+    await wrapper.get("input[aria-label='编辑 name']").setValue("新名字");
+    await wrapper.findAll("button").find((button) => button.text() === "确定")!.trigger("click");
+    expect(tabHasPending("query-prod")).toBe(true);
+    await wrapper.findAll("button").find((button) => button.text() === "提交")!.trigger("click");
+    const confirm = wrapper.get("[data-confirm-target]");
+    expect(confirm.text()).toContain("Shop");
+    expect(confirm.text()).toContain("customers");
+    expect(confirm.text()).toContain("生产");
+    expect(invoke.mock.calls.some((call) => call[0] === "grid_commit")).toBe(false);
+    await wrapper.findAll("button").find((button) => button.text() === "取消")!.trigger("click");
+    expect(invoke.mock.calls.some((call) => call[0] === "grid_commit")).toBe(false);
+    expect(tabHasPending("query-prod")).toBe(true);
+    wrapper.unmount();
+    expect(tabHasPending("query-prod")).toBe(false);
+    expect(anyPending()).toBe(false);
   });
 
   it("keeps a rejected row and later staged changes unsuccessful", async () => {

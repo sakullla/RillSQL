@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, reactive, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from "vue";
 import ExportDialog from "../export/ExportDialog.vue";
 import ImportDialog from "../export/ImportDialog.vue";
 import { planExport, type ExportScope } from "../export/plan";
@@ -8,6 +8,7 @@ import type { CsvOptions } from "../export/csv";
 import type { ExportFormat } from "../export/write";
 import type { InsertTarget } from "../export/insert";
 import { catalogConnections } from "../catalog/store";
+import { registerPending } from "../shell/close-guard";
 import { loadSettings } from "../shell/settings";
 import { copyPlain, copySqlValue, previewText, showCell, type NullCopy } from "./display";
 import "./grid.css";
@@ -19,6 +20,22 @@ import { FILTER_OPS, opLabel, opNeedsValue, type Cell, type FilterOp } from "./t
 const props = defineProps<{ tabId: string; draft: string; pageSize?: number; nullCopy?: NullCopy; target?: TableTarget | null }>();
 const session = props.target ? reactive(new LiveTable(props.target, props.pageSize ?? loadSettings().pageSize)) : null;
 if (session) void session.open();
+let releasePending: (() => void) | null = null;
+function releaseCellPending(): void {
+  releasePending?.();
+  releasePending = null;
+}
+/** 只登记未提交的单元格修改；未保存 SQL 不进入关闭确认。 */
+watch(
+  () => [props.tabId, (session?.pendingCount ?? 0) > 0] as const,
+  ([tabId, pending]) => {
+    releaseCellPending();
+    if (!pending) return;
+    releasePending = registerPending(tabId, () => props.tabId === tabId && (session?.pendingCount ?? 0) > 0);
+  },
+  { immediate: true },
+);
+onBeforeUnmount(releaseCellPending);
 const rootEl = ref<HTMLElement | null>(null);
 const filterColumn = ref("");
 watch(
@@ -78,6 +95,23 @@ const visibleRows = computed(() => displayRows.value.slice(range.value.start, ra
 const padTop = computed(() => range.value.top);
 const padBottom = computed(() => range.value.bottom);
 const loading = computed(() => !!session && !session.ready && !session.error);
+const showEmptyTable = computed(() => !!session && session.ready && !session.error && session.filters.length === 0 && displayRows.value.length === 0);
+const showNoMatch = computed(() => !!session && session.ready && !session.error && session.filters.length > 0 && displayRows.value.length === 0);
+const boundConnection = computed(() => {
+  const id = session?.target.connectionId;
+  if (!id) return null;
+  return catalogConnections().find((item) => item.id === id) ?? null;
+});
+const connectionName = computed(() => boundConnection.value?.name.trim() || session?.target.connectionId || "");
+const environmentLabel = computed(() => boundConnection.value?.envLabel.trim() ?? "");
+const environmentTone = computed(() => boundConnection.value?.envTone ?? "none");
+const objectName = computed(() => {
+  if (!session) return "";
+  const schemaName = session.store.schema.schema || session.target.schema;
+  const name = session.store.schema.name || session.target.table;
+  return schemaName ? `${schemaName}.${name}` : name;
+});
+const retrying = ref(false);
 
 watch(
   () => session?.pendingCount ?? 0,
@@ -103,6 +137,22 @@ async function applyFilter() {
   const error = await session.addFilter({ column: filterColumn.value, op: filterOp.value, value: filterValue.value });
   if (error && !session.error) filterError.value = error;
   else if (!error) filterValue.value = "";
+}
+
+async function clearFilters() {
+  if (!session) return;
+  filterError.value = "";
+  await session.replaceFilters([]);
+}
+
+async function retryRead() {
+  if (!session || retrying.value) return;
+  retrying.value = true;
+  try {
+    await session.open();
+  } finally {
+    retrying.value = false;
+  }
 }
 
 function cellSelector(id: string, column: string): string {
@@ -341,6 +391,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
     <p v-if="!session" class="grid-alert" role="alert">没有绑定已打开的表，不能用示例数据代替。</p>
     <template v-else>
     <div class="grid-toolbar">
+      <span v-if="environmentLabel" class="env xs" data-env :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span>
       <form class="filter-form" @submit.prevent="applyFilter">
         <select v-model="filterColumn" aria-label="筛选列">
           <option v-for="column in columns" :key="column.name" :value="column.name">{{ column.name }}</option>
@@ -379,7 +430,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
     <p v-if="filterError" class="grid-alert" role="alert">{{ filterError }}</p>
     <p v-if="importMessage" class="hint export-message" role="status">{{ importMessage }}</p>
     <p v-if="exportMessage" class="hint export-message" role="status">{{ exportMessage }}</p>
-    <p v-if="session.error" class="grid-alert" role="alert">读取失败：{{ session.error }}。这不是无匹配结果。筛选条件仍保留。</p>
+    <p v-if="session.error" class="grid-alert" role="alert">读取失败：{{ session.error }}。这不是无匹配结果。筛选条件仍保留。 <button class="btn sm" type="button" :disabled="retrying" @click="retryRead">重试</button></p>
     <div ref="viewport" class="grid-scroll" @scroll.passive="onScroll" @keydown="onGridKeydown">
       <table class="grid-table">
         <thead>
@@ -411,8 +462,11 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
             </td>
           </tr>
           <tr v-if="padBottom" class="virtual-spacer" aria-hidden="true"><td :colspan="columns.length" :style="{ height: `${padBottom}px` }"></td></tr>
-          <tr v-if="!loading && !displayRows.length && !session.error">
-            <td class="grid-empty" :colspan="columns.length">没有匹配的行。调整或移除筛选条件后再试。</td>
+          <tr v-if="showEmptyTable" data-empty="table">
+            <td class="grid-empty" :colspan="Math.max(columns.length, 1)">{{ session.store.schema.kind === "view" ? "这个视图没有行。" : "这张表没有行。" }}<button v-if="session.canInsert" class="btn sm" type="button" @click="session.addRow()">新增行</button></td>
+          </tr>
+          <tr v-else-if="showNoMatch" data-empty="filter">
+            <td class="grid-empty" :colspan="Math.max(columns.length, 1)">没有匹配行。 <button class="btn sm" type="button" @click="clearFilters">清除筛选</button></td>
           </tr>
         </tbody>
       </table>
@@ -461,6 +515,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
         <header>
           <div>
             <h2>提交这些更改？</h2>
+            <p class="hint" data-confirm-target>目标：{{ connectionName }} / {{ objectName }} <span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span></p>
             <p class="hint">将按顺序逐条写入数据库，遇到错误即停止；已写入的不会自动撤销。</p>
           </div>
         </header>
