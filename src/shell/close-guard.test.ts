@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RunDto } from "../query/api";
@@ -19,23 +21,65 @@ import { createSession } from "./session";
 import TitleBar from "./TitleBar.vue";
 
 const invoke = vi.hoisted(() => vi.fn());
+
+type CloseEvent = { preventDefault: () => void; readonly defaultPrevented: boolean };
+
+/**
+ * Window.close resolves before tauri://close-requested. The hook is two
+ * microtasks later so it runs after the title-bar await on close(), matching
+ * Tauri 2.12 rather than invoking the handler inside close().
+ */
 const windowApi = vi.hoisted(() => {
   const api = {
     prevented: 0,
-    handler: null as null | ((event: { preventDefault: () => void }) => void | Promise<void>),
-    close: vi.fn(async () => {
-      const handler = api.handler;
-      if (!handler) return;
-      await handler({
-        preventDefault() {
-          api.prevented += 1;
-        },
+    destroyed: 0,
+    closed: false,
+    trace: [] as string[],
+    handler: null as null | ((event: CloseEvent) => void | Promise<void>),
+    close: vi.fn(() => {
+      api.trace.push("close-return");
+      let resolveClose: () => void = () => undefined;
+      const promise = new Promise<void>((resolve) => {
+        resolveClose = resolve;
       });
+      queueMicrotask(() => {
+        resolveClose();
+        queueMicrotask(() => {
+          queueMicrotask(() => {
+            api.trace.push("hook");
+            const handler = api.handler;
+            if (!handler) {
+              api.closed = true;
+              return;
+            }
+            let prevented = false;
+            const event: CloseEvent = {
+              preventDefault() {
+                prevented = true;
+                api.prevented += 1;
+              },
+              get defaultPrevented() {
+                return prevented;
+              },
+            };
+            void handler(event);
+          });
+        });
+      });
+      return promise;
     }),
-    onCloseRequested: vi.fn(async (handler: (event: { preventDefault: () => void }) => void | Promise<void>) => {
-      api.handler = handler;
+    onCloseRequested: vi.fn(async (handler: (event: CloseEvent) => void | Promise<void>) => {
+      const wrapped = async (event: CloseEvent) => {
+        await handler(event);
+        if (!event.defaultPrevented) {
+          api.trace.push("destroy");
+          api.destroyed += 1;
+          api.closed = true;
+        }
+      };
+      api.handler = wrapped;
       return () => {
-        if (api.handler === handler) api.handler = null;
+        if (api.handler === wrapped) api.handler = null;
       };
     }),
   };
@@ -89,6 +133,9 @@ beforeEach(() => {
   invoke.mockReset();
   invoke.mockRejectedValue(new Error("offline"));
   windowApi.prevented = 0;
+  windowApi.destroyed = 0;
+  windowApi.closed = false;
+  windowApi.trace.length = 0;
   windowApi.handler = null;
   windowApi.close.mockClear();
   windowApi.onCloseRequested.mockClear();
@@ -248,10 +295,12 @@ describe("close guard", () => {
   });
 
   it("does not close from the title bar when query cancel fails", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
     const { session, id } = shellWithDraft("select running");
     adoptRun(id, running("run-title"));
     invoke.mockRejectedValue("取消失败：权限不足");
     const title = mount(TitleBar, { props: { theme: "system", caption: true } });
+    await flushPromises();
 
     await title.get("[aria-label='关闭']").trigger("click");
     await flushPromises();
@@ -260,6 +309,8 @@ describe("close guard", () => {
     expect(session.tabs.value.map((tab) => tab.id)).toEqual([id]);
     expect(tabRun(id)?.cancel).toBe("failed");
     expect(windowApi.close).not.toHaveBeenCalled();
+    expect(windowApi.destroyed).toBe(0);
+    expect(windowApi.closed).toBe(false);
     title.unmount();
   });
 
@@ -289,7 +340,10 @@ describe("close guard", () => {
     await flushPromises();
 
     expect(windowApi.close).toHaveBeenCalledTimes(1);
+    expect(windowApi.trace).toEqual(["close-return", "hook", "destroy"]);
     expect(windowApi.prevented).toBe(0);
+    expect(windowApi.destroyed).toBe(1);
+    expect(windowApi.closed).toBe(true);
     expect(wrapper.find("#close-guard-title").exists()).toBe(false);
     wrapper.unmount();
   });
@@ -319,5 +373,96 @@ describe("close guard", () => {
     expect(wrapper.find(`[data-tab-id='${id}']`).exists()).toBe(false);
     expect(invoke.mock.calls.map((call) => call[0])).toEqual(["app_info", "catalog_sessions"]);
     wrapper.unmount();
+  });
+
+  it("grants destroy and no other extra window permission", () => {
+    const permissions = (
+      JSON.parse(readFileSync(resolve("src-tauri/capabilities/default.json"), "utf8")) as {
+        permissions: string[];
+      }
+    ).permissions;
+    expect(permissions.filter((item) => item.startsWith("core:window:"))).toEqual([
+      "core:window:allow-minimize",
+      "core:window:allow-toggle-maximize",
+      "core:window:allow-close",
+      "core:window:allow-destroy",
+      "core:window:allow-start-dragging",
+    ]);
+  });
+
+  function closeResolvesBeforeHook(runHook: () => void): Promise<void> {
+    let resolveClose: () => void = () => undefined;
+    const promise = new Promise<void>((resolve) => {
+      resolveClose = resolve;
+    });
+    queueMicrotask(() => {
+      resolveClose();
+      queueMicrotask(() => {
+        queueMicrotask(runHook);
+      });
+    });
+    return promise;
+  }
+
+  it("does not ask again when the system hook runs after close() resolves", async () => {
+    registerPending("table:late", () => true);
+    const event = { preventDefault: vi.fn() };
+    const native = vi.fn(() => closeResolvesBeforeHook(() => void handleCloseRequested(event)));
+
+    const title = closeFromTitleBar(native);
+    await flushPromises();
+    expect(closePrompt.open).toBe(true);
+    expect(closePrompt.scope).toBe("window");
+    expect(native).not.toHaveBeenCalled();
+
+    chooseLeave();
+    await title;
+    await flushPromises();
+
+    expect(native).toHaveBeenCalledTimes(1);
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(closePrompt.open).toBe(false);
+    expect(tabHasPending("table:late")).toBe(true);
+  });
+
+  it("finishes the window close after close() returns when nothing is pending", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    const title = mount(TitleBar, { props: { theme: "system", caption: true } });
+    await flushPromises();
+
+    await title.get("[aria-label='关闭']").trigger("click");
+    await flushPromises();
+
+    expect(closePrompt.open).toBe(false);
+    expect(windowApi.trace[0]).toBe("close-return");
+    expect(windowApi.trace.indexOf("hook")).toBeGreaterThan(windowApi.trace.indexOf("close-return"));
+    expect(windowApi.trace).toEqual(["close-return", "hook", "destroy"]);
+    expect(windowApi.prevented).toBe(0);
+    expect(windowApi.closed).toBe(true);
+    title.unmount();
+  });
+
+  it("does not destroy the window when a system close cannot cancel a query", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    const { session, id } = shellWithDraft("select running");
+    adoptRun(id, running("run-os-close"));
+    invoke.mockRejectedValue("取消失败：权限不足");
+    const title = mount(TitleBar, { props: { theme: "system", caption: true } });
+    await flushPromises();
+
+    const closing = windowApi.close();
+    expect(windowApi.trace).toEqual(["close-return"]);
+    expect(windowApi.closed).toBe(false);
+    await closing;
+    await flushPromises();
+
+    expect(windowApi.trace).toEqual(["close-return", "hook"]);
+    expect(windowApi.prevented).toBe(1);
+    expect(windowApi.destroyed).toBe(0);
+    expect(windowApi.closed).toBe(false);
+    expect(closePrompt.open).toBe(false);
+    expect(session.tabs.value.map((tab) => tab.id)).toEqual([id]);
+    expect(tabRun(id)?.cancel).toBe("failed");
+    title.unmount();
   });
 });

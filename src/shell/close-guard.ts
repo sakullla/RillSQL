@@ -15,8 +15,12 @@ let tabCloser: (id: string) => void = () => undefined;
 let openTabs: () => readonly string[] = () => [];
 let windowDecision: Promise<boolean> | null = null;
 let resolveWindow: ((leave: boolean) => void) | null = null;
-/** Lets a title-bar close call the native window close without the system hook asking again. */
+/**
+ * Title bar already chose to leave. Window.close only posts Close and returns;
+ * tauri://close-requested runs later, so this stays set until that hook consumes it.
+ */
 let releaseSystemClose = false;
+let releaseHook: (() => void) | null = null;
 let titleBarFlight: Promise<void> | null = null;
 
 export function registerPending(tabId: string, isPending: () => boolean): () => void {
@@ -158,8 +162,25 @@ function finishWindow(leave: boolean): void {
   resolve?.(leave);
 }
 
+function consumeRelease(): void {
+  releaseSystemClose = false;
+  const done = releaseHook;
+  releaseHook = null;
+  done?.();
+}
+
+/** Window.close will not deliver tauri://close-requested (refused, or not the desktop shell). */
+export function releaseCloseWithoutHook(): void {
+  consumeRelease();
+}
+
 export function handleCloseRequested(event: { preventDefault(): void }): Promise<void> {
-  if (releaseSystemClose) return Promise.resolve();
+  if (releaseSystemClose) {
+    // Do not preventDefault: the listener already made Tauri prevent_close, and
+    // @tauri-apps/api finishes that close with destroy() only when this is unset.
+    consumeRelease();
+    return Promise.resolve();
+  }
   return evaluateWindowClose().then(
     (leave) => {
       if (!leave) event.preventDefault();
@@ -175,11 +196,16 @@ export function closeFromTitleBar(nativeClose: () => Promise<void>): Promise<voi
   titleBarFlight = (async () => {
     const leave = await evaluateWindowClose();
     if (!leave) return;
+    const hookDone = new Promise<void>((resolve) => {
+      releaseHook = resolve;
+    });
     releaseSystemClose = true;
     try {
       await nativeClose();
+      if (releaseSystemClose) await hookDone;
     } finally {
       releaseSystemClose = false;
+      releaseHook = null;
     }
   })().finally(() => {
     titleBarFlight = null;
@@ -191,6 +217,9 @@ export function resetCloseGuard(): void {
   checks.clear();
   discardOnce.clear();
   releaseSystemClose = false;
+  const done = releaseHook;
+  releaseHook = null;
+  done?.();
   titleBarFlight = null;
   tabCloser = () => undefined;
   openTabs = () => [];

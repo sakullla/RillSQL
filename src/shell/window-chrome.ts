@@ -1,5 +1,5 @@
 import { onBeforeUnmount, onMounted, ref } from "vue";
-import { closeFromTitleBar, handleCloseRequested } from "./close-guard";
+import { closeFromTitleBar, handleCloseRequested, releaseCloseWithoutHook } from "./close-guard";
 
 /** True when this page is the Tauri webview, where the native title bar can be replaced. */
 export function desktopShell(): boolean {
@@ -29,6 +29,7 @@ export function useWindowChrome() {
   const focused = ref(true);
   let stop: (() => void) | undefined;
   let cancelled = false;
+  let closeHookInstalled = false;
 
   onMounted(() => {
     if (!customChrome.value) return;
@@ -49,20 +50,26 @@ export function useWindowChrome() {
         });
         let stopClose: (() => void) | undefined;
         try {
+          // While this listener exists, Tauri 2.12 prevent_close's synchronously.
+          // Leaving preventDefault unset makes the API call destroy().
           stopClose = await app.onCloseRequested((event) => handleCloseRequested(event));
+          closeHookInstalled = true;
         } catch {
           stopClose = undefined;
+          closeHookInstalled = false;
         }
         if (cancelled) {
           stopResize();
           stopFocus();
           stopClose?.();
+          closeHookInstalled = false;
           return;
         }
         stop = () => {
           stopResize();
           stopFocus();
           stopClose?.();
+          closeHookInstalled = false;
         };
       } catch {
         if (!cancelled) customChrome.value = false;
@@ -97,11 +104,15 @@ export function useWindowChrome() {
 
   async function close() {
     await closeFromTitleBar(async () => {
-      if (!desktopShell()) return;
+      if (!desktopShell()) {
+        releaseCloseWithoutHook();
+        return;
+      }
       try {
         await (await currentWindow()).close();
+        if (!closeHookInstalled) releaseCloseWithoutHook();
       } catch {
-        /* leave the button in place when the window command is refused */
+        releaseCloseWithoutHook();
       }
     });
   }
