@@ -277,6 +277,10 @@
 .sb-target strong { color: var(--text); font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
 .sb-activity { display: inline-flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-xs); color: var(--text-2); white-space: nowrap; min-width: 0; }
 .sb-activity-text { overflow: hidden; text-overflow: ellipsis; }
+.sb-seg { border-radius: var(--r); cursor: default; transition: background var(--dur-fast) var(--ease); }
+.sb-seg:hover { background: var(--hover); }
+.sb-seg:active { background: var(--active); }
+.sb-seg:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
 /* ---------- 命令面板（增强入口，不占默认视觉主位） ---------- */
 #palette {
