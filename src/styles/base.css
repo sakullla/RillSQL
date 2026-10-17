@@ -9,7 +9,7 @@
 html,
 body { height: 100%; margin: 0; max-width: 100%; }
 body {
-  font: var(--fs-md)/1 var(--font);
+  font: var(--fs-sm)/1 var(--font);
   line-height: var(--lh);
   color: var(--text);
   background: var(--bg);
@@ -36,7 +36,7 @@ textarea:focus-visible { outline: none; }
 .sm { font-size: var(--fs-xs); }
 .mono { font-family: var(--mono); }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
-.skip { position: fixed; left: -999px; top: var(--sp-2); z-index: 100; background: var(--panel); padding: var(--sp-2) var(--sp-3); border-radius: var(--r); box-shadow: var(--shadow); }
+.skip { position: fixed; left: -999px; top: var(--sp-2); z-index: var(--z-toast); background: var(--panel); padding: var(--sp-2) var(--sp-3); border-radius: var(--r); box-shadow: var(--shadow); }
 .skip:focus { left: var(--sp-2); }
 
 /* ---------- 输入框 ---------- */
@@ -56,7 +56,7 @@ select {
 }
 input:not([type="checkbox"]):not([type="radio"]):focus,
 select:focus,
-textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--ring); }
+textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--ring); }
 input:disabled,
 select:disabled,
 textarea:disabled { background: var(--disabled-bg); color: var(--disabled-fg); cursor: not-allowed; }
@@ -93,31 +93,36 @@ kbd {
   font-size: var(--fs-sm);
   font-weight: 500;
   white-space: nowrap;
-  transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+  transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
 }
-.btn:hover:not(:disabled) { background: var(--hover); }
-.btn:disabled { background: var(--disabled-bg); color: var(--disabled-fg); border-color: var(--line); }
+.btn:hover:not(:disabled) { background: var(--hover); border-color: var(--line-2); }
+.btn:active:not(:disabled) { background: var(--active); box-shadow: inset 0 1px 2px var(--press); transform: translateY(.5px); }
+.btn:disabled { background: var(--disabled-bg); color: var(--disabled-fg); border-color: var(--line); box-shadow: none; }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .btn.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+.btn.primary:active:not(:disabled) { background: var(--accent-active); border-color: var(--accent-active); box-shadow: inset 0 1px 2px var(--press-accent); }
 .btn.ghost { background: transparent; border-color: transparent; color: var(--text-2); }
 .btn.ghost:hover:not(:disabled) { background: var(--hover); color: var(--text); }
-.btn.danger { color: var(--err); }
+.btn.ghost:active:not(:disabled) { background: var(--active); }
+.btn.danger { color: var(--err); border-color: var(--line-2); }
 .btn.danger:hover:not(:disabled) { background: var(--err-soft); border-color: var(--err-line); }
+.btn.danger:active:not(:disabled) { background: var(--err-soft); box-shadow: inset 0 1px 2px var(--press-danger); }
 .btn.sm { height: var(--control-h-sm); padding: 0 var(--sp-3); font-size: var(--fs-xs); gap: var(--sp-1); }
 
 .icon-btn {
-  width: var(--control-h-sm);
-  height: var(--control-h-sm);
+  width: var(--control-h);
+  height: var(--control-h);
   display: inline-grid;
   place-items: center;
   border-radius: var(--r);
   color: var(--text-2);
   flex-shrink: 0;
-  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
 }
 .icon-btn:hover:not(:disabled) { background: var(--hover); color: var(--text); }
-.icon-btn:disabled { color: var(--disabled-fg); }
-.icon-btn.sm { width: 26px; height: 26px; }
+.icon-btn:active:not(:disabled) { background: var(--active); box-shadow: inset 0 1px 2px var(--press); transform: translateY(.5px); }
+.icon-btn:disabled { color: var(--disabled-fg); background: none; }
+.icon-btn.sm { width: var(--control-h-sm); height: var(--control-h-sm); }
 
 /* ---------- 徽标 / badge ---------- */
 .badge {
@@ -126,7 +131,7 @@ kbd {
   gap: var(--sp-1);
   min-height: 20px;
   padding: 0 var(--sp-2);
-  border-radius: var(--r-full);
+  border-radius: var(--r-sm);
   background: var(--sunken);
   color: var(--text-2);
   font-size: var(--fs-xs);
@@ -178,7 +183,7 @@ details.disclosure > summary .muted { font-weight: 400; }
 /* ---------- tooltip 基础 ---------- */
 .tooltip {
   position: absolute;
-  z-index: 80;
+  z-index: var(--z-float);
   max-width: 280px;
   padding: var(--sp-1) var(--sp-2);
   border-radius: var(--r);
@@ -224,9 +229,9 @@ details.disclosure > summary .muted { font-weight: 400; }
 .conn-state.st-disconnected > i { background: transparent; box-shadow: inset 0 0 0 1.5px var(--text-3); }
 
 /* ---------- 空状态 ---------- */
-.empty { display: flex; flex-direction: column; align-items: center; text-align: center; padding: var(--sp-8) var(--sp-5); color: var(--text-2); gap: var(--sp-2); margin: auto; }
+.empty { display: flex; flex-direction: column; align-items: center; text-align: center; padding: var(--sp-6) var(--sp-5); color: var(--text-2); gap: var(--sp-1); margin: auto; }
 .empty h3 { margin: 0; font-size: var(--fs-lg); color: var(--text); font-weight: 600; }
-.empty p { margin: 0; max-width: 460px; font-size: var(--fs-sm); line-height: 1.9; }
+.empty p { margin: 0; max-width: 520px; font-size: var(--fs-sm); line-height: 1.6; }
 .empty-actions { margin-top: var(--sp-2); display: flex; gap: var(--sp-2); }
 
 /* ---------- 页面骨架 ---------- */
@@ -234,7 +239,7 @@ details.disclosure > summary .muted { font-weight: 400; }
 .page-inner { max-width: min(1180px, 100%); margin: 0 auto; padding: var(--sp-6) var(--sp-7) var(--sp-8); min-width: 0; }
 .page-inner.narrow { max-width: 920px; }
 .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: var(--sp-4); margin-bottom: var(--sp-6); flex-wrap: wrap; }
-.page-head h1 { font-size: var(--fs-xxl); margin: var(--sp-1) 0 var(--sp-2); letter-spacing: -0.01em; font-weight: 650; }
+.page-head h1 { font-size: var(--fs-xxl); margin: var(--sp-1) 0 var(--sp-2); font-weight: 600; }
 .page-head p { margin: 0; color: var(--text-2); max-width: 640px; line-height: var(--lh); }
 .eyebrow { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); font-weight: 600; color: var(--accent-text); }
 .eyebrow .i { width: 14px; height: 14px; }
@@ -310,22 +315,24 @@ dialog::backdrop { background: rgba(12, 16, 24, 0.45); }
 /* ---------- 菜单 ---------- */
 .menu {
   position: fixed;
-  z-index: 70;
+  z-index: var(--z-menu);
   min-width: 180px;
   background: var(--panel);
   border: 1px solid var(--line-2);
-  border-radius: var(--r-lg);
+  border-radius: var(--r-md);
   box-shadow: var(--shadow);
   padding: var(--sp-1);
 }
 .menu-head { font-size: var(--fs-xs); color: var(--text-3); padding: var(--sp-2) var(--sp-2) var(--sp-1); font-weight: 600; }
-.menu-item { display: flex; align-items: center; gap: var(--sp-2); width: 100%; height: 30px; padding: 0 var(--sp-2); border-radius: var(--r); font-size: var(--fs-sm); text-align: left; transition: background var(--dur-fast) var(--ease); }
+.menu-item { display: flex; align-items: center; gap: var(--sp-2); width: 100%; height: 24px; padding: 0 var(--sp-2); border-radius: var(--r); font-size: var(--fs-sm); text-align: left; transition: background var(--dur-fast) var(--ease); }
 .menu-item:hover,
 .menu-item:focus { background: var(--hover); }
 .menu-item:disabled { color: var(--disabled-fg); }
 .menu-item.danger { color: var(--err); }
 .menu-item.danger:hover:not(:disabled) { background: var(--err-soft); }
 .menu-item .check { width: 14px; color: var(--accent); }
+.menu-sep { height: 1px; margin: var(--sp-1) var(--sp-2); background: var(--line); }
+.menu-key { margin-left: auto; font-size: var(--fs-xs); color: var(--text-3); font-family: var(--mono); }
 
 /* ---------- CodeMirror 宿主 ---------- */
 .cm-host { flex: 1; min-width: 0; min-height: 0; max-width: 100%; overflow: hidden; }
