@@ -98,4 +98,23 @@ describe("Listbox", () => {
     expect(wrapper.find(".listbox-pop").classes()).not.toContain("up");
     wrapper.unmount();
   });
+
+  it("exposes the active option to assistive tech via aria-activedescendant", async () => {
+    const wrapper = open();
+    await wrapper.get('[role="combobox"]').trigger("click");
+    const options = () => wrapper.findAll('[role="option"]');
+    expect(wrapper.get('[role="listbox"]').attributes("aria-activedescendant")).toBe(options()[0].attributes("id"));
+    await wrapper.get('[role="listbox"]').trigger("keydown", { key: "ArrowDown" });
+    expect(wrapper.get('[role="listbox"]').attributes("aria-activedescendant")).toBe(options()[1].attributes("id"));
+    // 筛选模式下焦点在筛选框上，同样要能读到当前项
+    const filtered = mount(Listbox, {
+      props: { modelValue: null, options: OPTIONS, filterable: true, ariaLabel: "数据库类型" },
+      attachTo: document.body,
+    });
+    await filtered.get('[role="combobox"]').trigger("click");
+    const input = filtered.get(".listbox-filter");
+    expect(input.attributes("aria-activedescendant")).toBe(filtered.findAll('[role="option"]')[0].attributes("id"));
+    filtered.unmount();
+    wrapper.unmount();
+  });
 });

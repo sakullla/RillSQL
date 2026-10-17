@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from "vue";
 import type { ListboxOption } from "./types";
 
 const props = withDefaults(
@@ -36,6 +36,14 @@ const visible = computed(() => {
 });
 
 const listId = computed(() => (props.id ? `${props.id}-list` : undefined));
+
+const uid = useId();
+
+function optionId(index: number): string {
+  return `lb-${uid}-opt-${index}`;
+}
+
+const activeDescendant = computed(() => (open.value && visible.value.length ? optionId(active.value) : undefined));
 
 function onOutside(event: PointerEvent) {
   const target = event.target;
@@ -181,12 +189,23 @@ onBeforeUnmount(() => {
         type="search"
         placeholder="筛选"
         aria-label="筛选选项"
+        :aria-activedescendant="activeDescendant"
         @keydown="onPopupKey"
       />
-      <ul :id="listId" ref="list" class="listbox-list" role="listbox" tabindex="-1" :aria-label="ariaLabel" @keydown="onPopupKey">
+      <ul
+        :id="listId"
+        ref="list"
+        class="listbox-list"
+        role="listbox"
+        tabindex="-1"
+        :aria-label="ariaLabel"
+        :aria-activedescendant="activeDescendant"
+        @keydown="onPopupKey"
+      >
         <li
           v-for="(option, index) in visible"
           :key="option.value"
+          :id="optionId(index)"
           class="listbox-option"
           :class="{ on: index === active, picked: option.value === modelValue, disabled: option.disabled }"
           role="option"
