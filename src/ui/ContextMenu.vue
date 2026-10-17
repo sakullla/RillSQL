@@ -9,7 +9,7 @@ const props = withDefaults(
 
 const emit = defineEmits<{ close: []; select: [id: string] }>();
 
-/** 菜单宽度与单项高度是常量，位置在渲染前算好：jsdom 下取不到 offsetWidth，测试也要能断言钳制结果。 */
+/** 菜单宽度与行高常量：jsdom 量不到布局，退回这些值；真机行高读 --control-h-sm。 */
 const MENU_W = 208;
 const ITEM_H = 24;
 const HEAD_H = 26;
@@ -21,17 +21,24 @@ const menu = ref<HTMLElement | null>(null);
 /** 关闭时把焦点还给打开菜单的元素，六个调用方不必各写一遍。 */
 let restoreTo: HTMLElement | null = null;
 
-const estimatedHeight = computed(() =>
-  props.items.reduce((total, item) => {
-    if (item.kind === "item") return total + ITEM_H;
+/** 行高取自令牌，jsdom 里 getComputedStyle 读不到自定义属性时退回常量。 */
+function rowHeight(): number {
+  const raw = getComputedStyle(document.documentElement).getPropertyValue("--control-h-sm");
+  const px = Number.parseFloat(raw);
+  return Number.isFinite(px) && px > 0 ? px : ITEM_H;
+}
+
+function estimatedHeight(): number {
+  return props.items.reduce((total, item) => {
+    if (item.kind === "item") return total + rowHeight();
     if (item.kind === "head") return total + HEAD_H;
     return total + SEP_H;
-  }, 12),
-);
+  }, 12);
+}
 
 const position = computed(() => ({
   left: `${Math.max(EDGE, Math.min(props.x, window.innerWidth - MENU_W - EDGE))}px`,
-  top: `${Math.max(EDGE, Math.min(props.y, window.innerHeight - estimatedHeight.value - EDGE))}px`,
+  top: `${Math.max(EDGE, Math.min(props.y, window.innerHeight - estimatedHeight() - EDGE))}px`,
 }));
 
 function focusables(): HTMLElement[] {

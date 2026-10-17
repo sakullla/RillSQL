@@ -132,6 +132,39 @@ describe("ContextMenu", () => {
     wrapper.unmount();
   });
 
+  it("accounts for the standard-density row height when clamping", async () => {
+    // 模拟 standard 密度：--control-h-sm 变成 26px
+    document.documentElement.style.setProperty("--control-h-sm", "26px");
+    try {
+      const items: MenuItem[] = [
+        { kind: "item", id: "a", label: "A" },
+        { kind: "item", id: "b", label: "B" },
+        { kind: "item", id: "c", label: "C" },
+      ];
+      const y = 200;
+      const wrapper = mount(ContextMenu, {
+        props: { open: true, x: 40, y, items, label: "对象操作" },
+        global: { stubs: { teleport: true } },
+        attachTo: document.body,
+      });
+      await nextTick();
+      const style = wrapper.get('[role="menu"]').attributes("style") ?? "";
+      const top = Number(/top: (-?\d+)px/.exec(style)?.[1]);
+      // 26px 行高 × 3 项 + 12 = 90；y=200 不会触底，所以 top 应等于 y 本身
+      expect(top).toBe(y);
+      // 把 y 压到触底，验证估算确实变大了（26 行高比 24 把菜单“推”得更高）
+      await wrapper.setProps({ y: window.innerHeight - 40 });
+      await nextTick();
+      const clampedTop = Number(/top: (-?\d+)px/.exec(wrapper.get('[role="menu"]').attributes("style") ?? "")?.[1]);
+      // 估算高度 3×26+12 = 90 → 可用 top 上限 = innerHeight - 90 - 8
+      expect(clampedTop).toBeLessThanOrEqual(window.innerHeight - 90 - 8);
+      expect(clampedTop).toBeGreaterThanOrEqual(8);
+      wrapper.unmount();
+    } finally {
+      document.documentElement.style.removeProperty("--control-h-sm");
+    }
+  });
+
   it("closes on Tab without swallowing the keystroke", async () => {
     const wrapper = open();
     await nextTick();
