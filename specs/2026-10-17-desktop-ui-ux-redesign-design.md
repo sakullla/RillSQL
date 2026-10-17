@@ -80,7 +80,8 @@
 | 发丝线 / 强线 | `--line` `--line-2` | `#dfe3e8` `#c4ccd4` |
 | 强调 | `--accent` | `#0f766e` |
 | 强调悬停 / 按下 | `--accent-hover` `--accent-active` | `#0b5f59` `#094f4a` |
-| 强调浅底 | `--sel` `--sel-strong` | `#e6f2f0` `#cbe7e3` |
+| 强调浅底（实底） | `--accent-soft` `--accent-text` | `#e6f2f0` `#0b5f59` |
+| 选中底（半透明，叠在任意行底色/悬停色上仍正确） | `--sel` `--sel-strong` | `rgba(15,118,110,.10)` `rgba(15,118,110,.20)` |
 | 焦点环 | `--ring` | `rgba(15,118,110,.35)` |
 
 状态色、环境色、引擎色沿用 `tokens.css` 现值（ok/warn/err/info、dev/test/prod/local、postgres/mysql/mariadb/sqlite），只补 `--warn-line` 等缺失项的深色对应值。
