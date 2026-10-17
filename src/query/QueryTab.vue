@@ -18,7 +18,7 @@ import type { Engine } from "../grid/types";
 import Icon from "../shell/Icon.vue";
 import { loadSettings } from "../shell/settings";
 import { CONNECTION_STATUS_TEXT, type ConnectionStatus } from "../shell/status-text";
-import type { QueryTarget } from "../shell/session";
+import type { QueryAction, QueryTarget } from "../shell/session";
 import { ambiguousFieldNote, cachedColumns, fieldFailureNote, loadFields, qualifierFor, unknownFieldNote } from "./columns";
 import { completionPlan, connectionById, metadataNote, targetDetail, targetKey, targetOptions, type TargetOption } from "./complete";
 import { resolveEditor } from "./editor";
@@ -38,6 +38,7 @@ const props = defineProps<{
   engine: string | null;
   connectionStatus: ConnectionStatus | null;
   notice: string | null;
+  queryAction?: { action: QueryAction; nonce: number } | null;
 }>();
 const emit = defineEmits<{
   "update:draft": [tabId: string, draft: string];
@@ -426,6 +427,29 @@ async function execute(scope: "auto" | "current") {
 function cancel() {
   if (!running.value) return;
   void requestCancel(props.tabId);
+}
+
+watch(
+  () => props.queryAction,
+  (value) => {
+    if (!value) return;
+    runQueryAction(value.action);
+  },
+);
+
+function runQueryAction(action: QueryAction) {
+  switch (action) {
+    case "run":
+      return void execute("auto");
+    case "run-statement":
+      return void execute("current");
+    case "cancel":
+      return cancel();
+    case "format":
+      return formatEditor();
+    case "plan":
+      return void requestPlan();
+  }
 }
 
 /** 在编辑器中定位失败语句：选中对应文本并滚动到可见位置。 */

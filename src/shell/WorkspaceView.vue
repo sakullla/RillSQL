@@ -5,7 +5,7 @@ import { resolveTableTarget } from "../grid/target";
 import { targetDetail, targetKey, targetOptions, type TargetOption } from "../query/complete";
 import "../structure/structure.css";
 import Icon from "./Icon.vue";
-import type { QueryTarget, ShellTab } from "./session";
+import type { QueryAction, QueryTarget, ShellTab } from "./session";
 import { loadSettings } from "./settings";
 import WelcomeView from "./WelcomeView.vue";
 
@@ -13,7 +13,7 @@ const DataGrid = defineAsyncComponent(() => import("../grid/DataGrid.vue"));
 const QueryTab = defineAsyncComponent(() => import("../query/QueryTab.vue"));
 const StructurePane = defineAsyncComponent(() => import("../structure/StructurePane.vue"));
 
-const props = defineProps<{ tabs: ShellTab[]; activeId: string | null; pageSize?: number }>();
+const props = defineProps<{ tabs: ShellTab[]; activeId: string | null; pageSize?: number; queryAction?: { action: QueryAction; nonce: number } | null }>();
 const emit = defineEmits<{
   activate: [id: string];
   close: [id: string];
@@ -186,6 +186,7 @@ onBeforeUnmount(() => {
       :engine="active.engine"
       :connection-status="active.connectionStatus"
       :notice="active.targetNotice"
+      :query-action="queryAction"
       @update:draft="onDraft"
       @target="onTarget"
     />

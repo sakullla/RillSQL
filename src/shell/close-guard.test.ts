@@ -276,7 +276,7 @@ describe("close guard", () => {
 
   it("routes the title-bar close button through the same prompt", async () => {
     const { id } = shellWithDraft("select draft only");
-    const title = mount(TitleBar, { props: { theme: "system", caption: true } });
+    const title = mount(TitleBar, { props: { theme: "system", caption: true, menus: [], hasQueryTab: false } });
 
     await title.get("[aria-label='关闭']").trigger("click");
     await flushPromises();
@@ -299,7 +299,7 @@ describe("close guard", () => {
     const { session, id } = shellWithDraft("select running");
     adoptRun(id, running("run-title"));
     invoke.mockRejectedValue("取消失败：权限不足");
-    const title = mount(TitleBar, { props: { theme: "system", caption: true } });
+    const title = mount(TitleBar, { props: { theme: "system", caption: true, menus: [], hasQueryTab: false } });
     await flushPromises();
 
     await title.get("[aria-label='关闭']").trigger("click");
@@ -427,7 +427,7 @@ describe("close guard", () => {
 
   it("finishes the window close after close() returns when nothing is pending", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
-    const title = mount(TitleBar, { props: { theme: "system", caption: true } });
+    const title = mount(TitleBar, { props: { theme: "system", caption: true, menus: [], hasQueryTab: false } });
     await flushPromises();
 
     await title.get("[aria-label='关闭']").trigger("click");
@@ -447,7 +447,7 @@ describe("close guard", () => {
     const { session, id } = shellWithDraft("select running");
     adoptRun(id, running("run-os-close"));
     invoke.mockRejectedValue("取消失败：权限不足");
-    const title = mount(TitleBar, { props: { theme: "system", caption: true } });
+    const title = mount(TitleBar, { props: { theme: "system", caption: true, menus: [], hasQueryTab: false } });
     await flushPromises();
 
     const closing = windowApi.close();

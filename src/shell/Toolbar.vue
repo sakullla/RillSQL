@@ -38,8 +38,9 @@ const themeLabel = computed(() => (props.theme === "system" ? "跟随系统" : p
       </Tooltip>
     </div>
     <span class="tb-sep" role="separator"></span>
+    <div class="tb-center"><slot /></div>
     <div class="tb-group">
-      <Tooltip text="外观主题">
+      <Tooltip :text="`外观主题：${themeLabel}`">
         <button class="icon-btn" type="button" :aria-label="`外观主题：${themeLabel}`" data-action="toggle-theme" @click="emit('action', 'toggle-theme')"><Icon :name="themeIcon" /></button>
       </Tooltip>
       <Tooltip text="任务中心">
@@ -59,6 +60,7 @@ const themeLabel = computed(() => (props.theme === "system" ? "跟随系统" : p
 .toolbar { display: flex; align-items: center; gap: var(--sp-1); }
 .tb-group { display: flex; align-items: center; gap: 2px; }
 .tb-sep { width: 1px; height: 18px; background: var(--line); margin: 0 var(--sp-2); }
+.tb-center { flex: 1; display: flex; justify-content: center; min-width: 0; padding: 0 var(--sp-3); }
 .toolbar-run { margin-left: var(--sp-2); }
 .toolbar-run kbd { font: 500 var(--fs-xs)/1 var(--font); opacity: .85; border-color: color-mix(in srgb, var(--on-accent) 45%, transparent); }
 </style>

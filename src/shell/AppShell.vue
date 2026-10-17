@@ -15,12 +15,15 @@ import { shellCommands, type PaletteItem } from "./commands";
 import { syncProductIdentity } from "./identity";
 import { loadSettings, saveSettings, type ShellSettings } from "./settings";
 import { createSession, STRUCTURE_PLACEHOLDER } from "./session";
+import { shellMenus } from "./menus";
+import type { MenuDefinition } from "./menu-model";
 import type { ConnectionStatus } from "./status-text";
 import ShortcutHelp from "./ShortcutHelp.vue";
 import Sidebar from "./Sidebar.vue";
 import StatusBar from "./StatusBar.vue";
 import { applyDocumentTheme, prefersDarkScheme, type ThemePreference } from "./theme";
 import TitleBar from "./TitleBar.vue";
+import type { ToolbarAction } from "./toolbar-model";
 import WorkspaceView from "./WorkspaceView.vue";
 import type { AppPage } from "../router";
 
@@ -138,6 +141,9 @@ const commands = computed<PaletteItem[]>(() => [
   }),
 ]);
 
+const hasQueryTab = computed(() => session.activeTab.value?.kind === "query");
+const menus = computed<MenuDefinition[]>(() => shellMenus({ hasQueryTab: hasQueryTab.value }, settings.theme));
+
 function applyTheme() {
   applyDocumentTheme(settings.theme, settings.density, prefersDarkScheme(), settings.editorFont);
 }
@@ -212,6 +218,88 @@ function requestSqlite() {
 function runCommand(item: PaletteItem) {
   session.closePalette();
   item.run();
+}
+
+function onMenuSelect(menuId: string, itemId: string) {
+  const key = `${menuId}:${itemId}`;
+  switch (key) {
+    case "file:new-query":
+      return session.openQuery();
+    case "file:open-sqlite":
+      return requestSqlite();
+    case "file:save-draft":
+    case "file:settings":
+    case "tools:settings":
+    case "help:about":
+      return session.showPage("settings");
+    case "edit:palette":
+      return session.openPalette("all");
+    case "edit:quick-open":
+      return session.openPalette("tables");
+    case "view:toggle-sidebar":
+      return session.toggleSidebar();
+    case "view:theme-light":
+      return setTheme("light");
+    case "view:theme-dark":
+      return setTheme("dark");
+    case "view:theme-system":
+      return setTheme("system");
+    case "view:shortcuts":
+    case "help:shortcuts":
+      return session.openHelp();
+    case "window:close-tab":
+      if (session.activeId.value) session.closeTab(session.activeId.value);
+      return;
+    case "window:close-others": {
+      const active = session.activeId.value;
+      for (const tab of [...session.tabs.value]) if (tab.id !== active) session.closeTab(tab.id);
+      return;
+    }
+    case "window:close-right": {
+      const index = session.tabs.value.findIndex((tab) => tab.id === session.activeId.value);
+      if (index < 0) return;
+      for (const tab of session.tabs.value.slice(index + 1)) session.closeTab(tab.id);
+      return;
+    }
+    case "query:run":
+      return session.requestQueryAction("run");
+    case "query:run-statement":
+      return session.requestQueryAction("run-statement");
+    case "query:cancel":
+      return session.requestQueryAction("cancel");
+    case "query:format":
+      return session.requestQueryAction("format");
+    case "query:plan":
+      return session.requestQueryAction("plan");
+    case "tools:tasks":
+      return; // TaskCenter 自管开关
+    default:
+      return;
+  }
+}
+
+function onToolbarAction(action: ToolbarAction) {
+  switch (action) {
+    case "new-query":
+      return session.openQuery();
+    case "open-connections":
+      return session.showPage("connections");
+    case "save-draft":
+    case "history":
+      return session.showPage("history");
+    case "palette":
+      return session.openPalette("all");
+    case "tasks":
+      return; // TaskCenter 自管开关
+    case "toggle-theme":
+      return setTheme(settings.theme === "light" ? "dark" : settings.theme === "dark" ? "system" : "light");
+    case "format":
+      return session.requestQueryAction("format");
+    case "plan":
+      return session.requestQueryAction("plan");
+    case "run":
+      return session.requestQueryAction("run");
+  }
 }
 
 function typingTarget(event: KeyboardEvent): boolean {
@@ -303,7 +391,19 @@ onBeforeUnmount(() => {
 <template>
   <div class="app-root" :class="{ 'sidebar-hidden': session.sidebarHidden.value || session.page.value !== 'workspace', 'custom-chrome': windowChrome.custom, 'is-maximized': windowChrome.maximized }">
     <a class="skip" href="#main">跳到主区域</a>
-    <TitleBar :theme="settings.theme" @palette="session.openPalette('all')" @help="session.openHelp()" @set-theme="setTheme" @window-state="windowChrome = $event" @new-query="session.openQuery()" @toggle-sidebar="session.toggleSidebar()" />
+    <TitleBar
+      :theme="settings.theme"
+      :menus="menus"
+      :has-query-tab="hasQueryTab"
+      @palette="session.openPalette('all')"
+      @help="session.openHelp()"
+      @set-theme="setTheme"
+      @window-state="windowChrome = $event"
+      @new-query="session.openQuery()"
+      @toggle-sidebar="session.toggleSidebar()"
+      @menu-select="onMenuSelect"
+      @action="onToolbarAction"
+    />
     <div class="body">
       <ActivityRail :page="session.page.value" @navigate="onNavigate" />
       <button v-if="session.page.value === 'workspace' && !session.sidebarHidden.value" class="sidebar-dismiss" aria-label="关闭资源管理器" @click="session.toggleSidebar()"></button>
@@ -321,6 +421,7 @@ onBeforeUnmount(() => {
           :tabs="session.tabs.value"
           :active-id="session.activeId.value"
           :page-size="settings.pageSize"
+          :query-action="session.pendingQueryAction.value"
           @activate="session.activateTab"
           @close="session.closeTab"
           @new-query="session.openQuery()"
@@ -345,7 +446,7 @@ onBeforeUnmount(() => {
         <SettingsView v-else-if="session.page.value === 'settings'" :settings="settings" :data-dir="dataDir" @change="onSettings" @help="session.openHelp()" />
       </main>
     </div>
-    <StatusBar :tab="session.activeTab.value" :on-workspace="session.page.value === 'workspace'" />
+    <StatusBar :tab="session.activeTab.value" :on-workspace="session.page.value === 'workspace'" @navigate="(target) => session.showPage(target)" />
     <CommandPalette :open="session.paletteOpen.value" :mode="session.paletteMode.value" :items="commands" @close="session.closePalette()" @run="runCommand" />
     <ShortcutHelp :open="session.helpOpen.value" @close="session.closeHelp()" />
     <dialog v-if="closePrompt.open" ref="closeDialog" class="modal" aria-labelledby="close-guard-title" @cancel.prevent="chooseStay">

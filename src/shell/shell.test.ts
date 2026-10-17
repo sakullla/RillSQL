@@ -15,6 +15,7 @@ import ActivityRail from "./ActivityRail.vue";
 import { filterPalette, shellCommands } from "./commands";
 import EnvPill from "./EnvPill.vue";
 import { PRODUCT_TITLE } from "./product";
+import { shellMenus } from "./menus";
 import type { ShellTab } from "./session";
 import StatusBar from "./StatusBar.vue";
 import { CONNECTION_STATUS_TEXT, ENVIRONMENT_LABELS, OPERATION_STATE_TEXT, type OperationState } from "./status-text";
@@ -51,7 +52,7 @@ describe("shell layout", () => {
     expect(rail.text()).toContain("查询历史");
     expect(rail.text()).toContain("设置");
 
-    const title = mount(TitleBar, { props: { theme: "system" } });
+    const title = mount(TitleBar, { props: { theme: "system", menus: [], hasQueryTab: false } });
     expect(title.text()).toContain("RillSQL");
     expect(title.text()).toContain("澄库");
     expect(title.find(".cmd-trigger").attributes("aria-label")).toBe("打开命令面板");
@@ -60,20 +61,29 @@ describe("shell layout", () => {
   });
 
   it("renders platform window controls only for custom chrome", () => {
-    const caption = mount(TitleBar, { props: { theme: "system", caption: true } });
-    expect(caption.get(".titlebar").attributes("data-tauri-drag-region")).toBe("deep");
-    expect(caption.get(".tb-actions").attributes("data-tauri-drag-region")).toBe("false");
+    const caption = mount(TitleBar, { props: { theme: "system", caption: true, menus: [], hasQueryTab: false } });
+    // 拖动区在菜单行；工具行整体不可拖，保证按钮可点
+    expect(caption.get(".tb-menu-row").attributes("data-tauri-drag-region")).toBe("deep");
+    expect(caption.get(".tb-tool-row").attributes("data-tauri-drag-region")).toBe("false");
     expect(caption.get("[aria-label='最小化']").exists()).toBe(true);
     expect(caption.get("[aria-label='最大化']").exists()).toBe(true);
     expect(caption.get("[aria-label='关闭']").exists()).toBe(true);
   });
 
-  it("switches theme from the title bar menu", async () => {
-    const title = mount(TitleBar, { props: { theme: "system" } });
-    const dark = title.findAll(".theme-menu .menu-item").find((item) => item.text().includes("深色"));
-    expect(dark).toBeTruthy();
-    await dark!.trigger("click");
-    expect(title.emitted("set-theme")).toEqual([["dark"]]);
+  it("switches theme from the title bar view menu", async () => {
+    const menus = shellMenus({ hasQueryTab: false }, "system");
+    const title = mount(TitleBar, {
+      props: { theme: "system", menus, hasQueryTab: false },
+      global: { stubs: { teleport: true } },
+      attachTo: document.body,
+    });
+    // 视图菜单是第三组（文件 / 编辑 / 视图）
+    await title.findAll('[role="menubar"] button')[2]!.trigger("click");
+    await title.vm.$nextTick();
+    await title.vm.$nextTick();
+    await title.get('[data-id="theme-dark"]').trigger("click");
+    expect(title.emitted("menu-select")?.[0]).toEqual(["view", "theme-dark"]);
+    title.unmount();
   });
 
   it("status bar keeps only the current target in plain words", () => {

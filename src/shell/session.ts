@@ -5,6 +5,8 @@ import type { ConnectionStatus } from "./status-text";
 
 export type TabKind = "query" | "table" | "structure";
 
+export type QueryAction = "run" | "run-statement" | "cancel" | "format" | "plan";
+
 export const NEW_QUERY_DRAFT = "";
 
 export interface PlaceholderTarget {
@@ -82,6 +84,8 @@ export interface ShellSession {
   closePalette: () => void;
   openHelp: () => void;
   closeHelp: () => void;
+  pendingQueryAction: Ref<{ action: QueryAction; nonce: number } | null>;
+  requestQueryAction: (action: QueryAction) => void;
 }
 
 function blankTab(kind: TabKind, id: string, title: string, path: string | null, draft: string): ShellTab {
@@ -131,6 +135,7 @@ export function createSession(initialHash = ""): ShellSession {
   const paletteOpen = ref(false);
   const paletteMode = ref<"all" | "tables">("all");
   const helpOpen = ref(false);
+  const pendingQueryAction = ref<{ action: QueryAction; nonce: number } | null>(null);
   let sequence = 1;
   let closeGuard: ((id: string) => boolean) | null = null;
 
@@ -266,6 +271,10 @@ export function createSession(initialHash = ""): ShellSession {
     helpOpen.value = false;
   }
 
+  function requestQueryAction(action: QueryAction) {
+    pendingQueryAction.value = { action, nonce: (pendingQueryAction.value?.nonce ?? 0) + 1 };
+  }
+
   return {
     page,
     tabs,
@@ -292,5 +301,7 @@ export function createSession(initialHash = ""): ShellSession {
     closePalette,
     openHelp,
     closeHelp,
+    pendingQueryAction,
+    requestQueryAction,
   };
 }

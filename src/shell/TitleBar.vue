@@ -4,10 +4,19 @@ import type { ThemePreference } from "./theme";
 import BrandMark from "./BrandMark.vue";
 import ChordKeys from "./ChordKeys.vue";
 import Icon from "./Icon.vue";
+import MenuBar from "./MenuBar.vue";
+import Toolbar from "./Toolbar.vue";
+import type { ToolbarAction } from "./toolbar-model";
 import TaskCenter from "../export/TaskCenter.vue";
 import { useWindowChrome } from "./window-chrome";
+import type { MenuDefinition } from "./menu-model";
 
-const props = defineProps<{ theme: ThemePreference; caption?: boolean }>();
+const props = defineProps<{
+  theme: ThemePreference;
+  caption?: boolean;
+  menus: MenuDefinition[];
+  hasQueryTab: boolean;
+}>();
 const emit = defineEmits<{
   palette: [];
   help: [];
@@ -15,6 +24,8 @@ const emit = defineEmits<{
   "toggle-sidebar": [];
   "set-theme": [theme: ThemePreference];
   "window-state": [state: { custom: boolean; maximized: boolean }];
+  "menu-select": [menuId: string, itemId: string];
+  action: [action: ToolbarAction];
 }>();
 const chrome = useWindowChrome();
 const showCaption = computed(() => props.caption === true || chrome.customChrome.value);
@@ -23,59 +34,18 @@ watch(
   () => emit("window-state", { custom: showCaption.value, maximized: chrome.maximized.value }),
   { immediate: true },
 );
-
-const themeIcon = (theme: ThemePreference) => (theme === "system" ? "monitor" : theme === "dark" ? "moon" : "sun");
-const choices: { id: ThemePreference; label: string }[] = [
-  { id: "light", label: "浅色" },
-  { id: "dark", label: "深色" },
-  { id: "system", label: "跟随系统" },
-];
 </script>
 
 <template>
-  <header
-    class="titlebar"
-    :class="{ 'custom-chrome': showCaption, 'is-inactive': showCaption && !chrome.focused.value }"
-    :data-tauri-drag-region="showCaption ? 'deep' : undefined"
-  >
-    <div class="tb-brand">
-      <BrandMark />
-      <strong>RillSQL</strong>
-      <span class="brand-cn">澄库</span>
-      <button class="icon-btn sidebar-toggle" data-tauri-drag-region="false" type="button" aria-label="显示或隐藏资源管理器" title="资源管理器 (Ctrl+B)" @click="emit('toggle-sidebar')"><Icon name="sidebar" /></button>
-    </div>
-    <button class="cmd-trigger" type="button" aria-label="打开命令面板" @click="emit('palette')">
-      <Icon name="search" />
-      <span>搜索表、连接或命令</span>
-      <ChordKeys chord="Mod+K" />
-    </button>
-    <div class="tb-actions" :data-tauri-drag-region="showCaption ? 'false' : undefined">
-      <button class="btn sm title-query" type="button" @click="emit('new-query')"><Icon name="plus" /> SQL 查询</button>
-      <TaskCenter />
-      <details class="theme-menu">
-        <summary class="icon-btn" :aria-label="`外观主题：${choices.find((item) => item.id === theme)?.label}`" title="外观主题">
-          <Icon :name="themeIcon(theme)" />
-        </summary>
-        <div class="menu theme-menu-pop" role="menu" aria-label="外观">
-          <div class="menu-head">外观</div>
-          <button
-            v-for="choice in choices"
-            :key="choice.id"
-            class="menu-item"
-            type="button"
-            role="menuitemradio"
-            :aria-checked="theme === choice.id"
-            @click="emit('set-theme', choice.id)"
-          >
-            <Icon :name="themeIcon(choice.id)" />
-            <span>{{ choice.label }}</span>
-            <Icon v-if="theme === choice.id" class="check" name="check" />
-          </button>
-        </div>
-      </details>
-      <button class="icon-btn" type="button" title="快捷键 (?)" aria-label="快捷键与帮助" @click="emit('help')">
-        <Icon name="keyboard" />
-      </button>
+  <header class="titlebar" :class="{ 'custom-chrome': showCaption, 'is-inactive': showCaption && !chrome.focused.value }">
+    <div class="tb-row tb-menu-row" :data-tauri-drag-region="showCaption ? 'deep' : undefined">
+      <div class="tb-brand" data-tauri-drag-region="false">
+        <BrandMark />
+        <strong>RillSQL</strong>
+        <span class="brand-cn">澄库</span>
+      </div>
+      <MenuBar :menus="menus" @select="(menuId, itemId) => emit('menu-select', menuId, itemId)" />
+      <span class="grow" :data-tauri-drag-region="showCaption ? 'deep' : undefined"></span>
       <div v-if="showCaption" class="caption" role="group" aria-label="窗口">
         <button type="button" aria-label="最小化" title="最小化" @click="chrome.minimize()">
           <svg viewBox="0 0 10 10" aria-hidden="true"><path fill="currentColor" d="M0 5h10v1H0z" /></svg>
@@ -89,13 +59,34 @@ const choices: { id: ThemePreference; label: string }[] = [
         </button>
       </div>
     </div>
+    <div class="tb-row tb-tool-row" data-tauri-drag-region="false">
+      <Toolbar :has-query-tab="hasQueryTab" :theme="theme" @action="(action) => emit('action', action)">
+        <button class="cmd-trigger" type="button" aria-label="打开命令面板" @click="emit('palette')">
+          <Icon name="search" />
+          <span>搜索表、连接或命令</span>
+          <ChordKeys chord="Mod+K" />
+        </button>
+      </Toolbar>
+      <TaskCenter />
+      <button class="icon-btn" type="button" title="快捷键 (?)" aria-label="快捷键与帮助" @click="emit('help')">
+        <Icon name="keyboard" />
+      </button>
+      <button class="icon-btn" type="button" title="显示或隐藏资源管理器" aria-label="显示或隐藏资源管理器" @click="emit('toggle-sidebar')">
+        <Icon name="sidebar" />
+      </button>
+    </div>
   </header>
 </template>
 
 <style scoped>
-.theme-menu { position: relative; }
-.theme-menu summary { list-style: none; }
-.theme-menu summary::-webkit-details-marker { display: none; }
-.theme-menu-pop { position: absolute; right: 0; top: 32px; }
-.menu-item .check { margin-left: auto; }
+.tb-row { display: flex; align-items: center; gap: var(--sp-2); padding: 0 var(--sp-2); min-width: 0; }
+.tb-menu-row { height: var(--titlebar-h); }
+.tb-tool-row { height: var(--toolbar-h); border-top: 1px solid var(--line); }
+.cmd-trigger {
+  display: flex; align-items: center; gap: var(--sp-2); width: 300px; height: var(--control-h-sm);
+  padding: 0 var(--sp-2); border-radius: var(--r); background: var(--panel-2);
+  border: 1px solid var(--line); color: var(--text-3); font-size: var(--fs-sm);
+}
+.cmd-trigger:hover { border-color: var(--line-2); color: var(--text-2); }
+.cmd-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 </style>

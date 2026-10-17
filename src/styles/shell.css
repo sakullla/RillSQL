@@ -5,7 +5,7 @@
 .app-root {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: var(--titlebar-h) minmax(0, 1fr) var(--status-h);
+  grid-template-rows: calc(var(--titlebar-h) + var(--toolbar-h)) minmax(0, 1fr) var(--status-h);
   width: 100%;
   max-width: 100%;
   height: 100vh;
@@ -14,22 +14,18 @@
   overflow: hidden;
 }
 
-/* ---------- 标题栏 ---------- */
+/* ---------- 标题栏（第 1 行菜单 + 第 2 行工具栏） ---------- */
 .titlebar {
   display: flex;
-  align-items: center;
-  gap: var(--sp-3);
+  flex-direction: column;
+  height: calc(var(--titlebar-h) + var(--toolbar-h));
   min-width: 0;
   max-width: 100%;
-  padding: 0 var(--sp-2) 0 var(--sp-3);
-  background: var(--chrome);
   border-bottom: 1px solid var(--line);
+  background: var(--chrome);
+  flex-shrink: 0;
 }
 .titlebar.custom-chrome {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(120px, 440px) minmax(0, 1fr);
-  gap: var(--sp-3);
-  padding: 0;
   user-select: none;
   -webkit-app-region: drag;
   app-region: drag;
@@ -44,26 +40,14 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.titlebar.custom-chrome .cmd-trigger,
-.titlebar.custom-chrome .tb-actions {
+.titlebar.custom-chrome .tb-tool-row,
+.titlebar.custom-chrome .caption,
+.titlebar.custom-chrome .menubar {
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }
-.titlebar.custom-chrome .cmd-trigger {
-  width: 100%;
-  min-width: 0;
-  max-width: 100%;
-  margin: 0;
-}
-.titlebar.custom-chrome .tb-actions {
-  min-width: 0;
-  justify-self: end;
-  align-self: stretch;
-  padding-right: 0;
-}
 .titlebar.is-inactive .tb-brand,
 .titlebar.is-inactive .cmd-trigger,
-.titlebar.is-inactive .tb-task,
 .titlebar.is-inactive .icon-btn,
 .titlebar.is-inactive .caption button {
   color: var(--text-3);
@@ -108,8 +92,6 @@
 .brand-mark path { fill: none; stroke: var(--on-accent); stroke-width: 2.1; stroke-linecap: round; }
 .brand-mark.lg svg { width: 52px; height: 52px; }
 .cmd-trigger {
-  flex: 0 1 480px;
-  margin: 0 auto;
   height: var(--control-h-sm);
   display: flex;
   align-items: center;
@@ -124,7 +106,6 @@
 }
 .cmd-trigger span:not(.kbd) { flex: 1; text-align: left; }
 .cmd-trigger:hover { border-color: var(--line-2); color: var(--text-2); }
-.tb-actions { display: flex; align-items: center; gap: var(--sp-1); min-width: 0; justify-content: flex-end; }
 
 /* ---------- 主导航（ActivityRail） ---------- */
 .body { display: flex; min-height: 0; min-width: 0; max-width: 100%; position: relative; overflow: hidden; }
@@ -310,8 +291,7 @@
 
 /* ---------- 响应式 ---------- */
 @media (max-width: 1180px) {
-  .tb-brand,
-  .tb-actions { min-width: 0; }
+  .tb-brand { min-width: 0; }
 }
 @media (max-width: 960px) {
   .brand-cn,

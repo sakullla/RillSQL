@@ -14,6 +14,17 @@ describe("Toolbar", () => {
     wrapper.unmount();
   });
 
+  it("centers default-slot content between the format and theme groups", () => {
+    const wrapper = mount(Toolbar, {
+      props: { hasQueryTab: true, theme: "light" },
+      slots: { default: '<button class="cmd-trigger" type="button">搜索</button>' },
+      attachTo: document.body,
+    });
+    expect(wrapper.find(".tb-center .cmd-trigger").text()).toBe("搜索");
+    expect(wrapper.findAll(".tb-group")).toHaveLength(3);
+    wrapper.unmount();
+  });
+
   it("emits the matching action id for each enabled button", async () => {
     const wrapper = open();
     const fire = async (action: string) => {
