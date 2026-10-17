@@ -49,8 +49,7 @@ function onOutside(event: PointerEvent) {
   const target = event.target;
   if (!(target instanceof Node)) return;
   if (trigger.value?.contains(target)) return;
-  if (list.value?.contains(target)) return;
-  if (filter.value?.contains(target)) return;
+  if (pop.value?.contains(target)) return;
   close();
 }
 
@@ -101,6 +100,17 @@ function move(step: number) {
   active.value = index;
 }
 
+function nearestEnabled(from: number, step: 1 | -1): number {
+  const items = visible.value;
+  if (!items.length) return 0;
+  let index = from;
+  for (let count = 0; count < items.length; count += 1) {
+    if (!items[index]?.disabled) return index;
+    index = (index + step + items.length) % items.length;
+  }
+  return from;
+}
+
 function choose(option: ListboxOption) {
   if (option.disabled) return;
   emit("update:modelValue", option.value);
@@ -135,12 +145,12 @@ function onPopupKey(event: KeyboardEvent) {
   }
   if (event.key === "Home") {
     event.preventDefault();
-    active.value = 0;
+    active.value = nearestEnabled(0, 1);
     return;
   }
   if (event.key === "End") {
     event.preventDefault();
-    active.value = Math.max(0, visible.value.length - 1);
+    active.value = nearestEnabled(visible.value.length - 1, -1);
     return;
   }
   if (event.key === "Enter") {
@@ -154,6 +164,8 @@ function onPopupKey(event: KeyboardEvent) {
 
 watch(visible, (items) => {
   if (active.value >= items.length) active.value = Math.max(0, items.length - 1);
+  if (items.length && items[active.value]?.disabled) active.value = nearestEnabled(active.value, 1);
+  if (open.value) place();
 });
 
 onBeforeUnmount(() => {
@@ -211,7 +223,7 @@ onBeforeUnmount(() => {
           role="option"
           :aria-selected="option.value === modelValue"
           :aria-disabled="option.disabled"
-          @mouseenter="active = index"
+          @mouseenter="!option.disabled && (active = index)"
           @click="choose(option)"
         >
           <span>{{ option.label }}</span>

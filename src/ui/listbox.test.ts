@@ -117,4 +117,53 @@ describe("Listbox", () => {
     filtered.unmount();
     wrapper.unmount();
   });
+
+  it("does not close when the pointer lands on the popup chrome", async () => {
+    const wrapper = mount(Listbox, {
+      props: { modelValue: null, options: OPTIONS, filterable: true, ariaLabel: "数据库类型" },
+      attachTo: document.body,
+    });
+    await wrapper.get('[role="combobox"]').trigger("click");
+    // 弹层根节点上的 pointerdown 不应关闭（点在 padding / 筛选框下方空白处）
+    wrapper.get(".listbox-pop").element.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    await nextTick();
+    expect(wrapper.find('[role="listbox"]').exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("Home and End land on enabled options only", async () => {
+    const firstDisabled = mount(Listbox, {
+      props: {
+        modelValue: null,
+        options: [
+          { value: "a", label: "A", disabled: true },
+          { value: "b", label: "B" },
+          { value: "c", label: "C" },
+        ],
+        ariaLabel: "选项",
+      },
+      attachTo: document.body,
+    });
+    await firstDisabled.get('[role="combobox"]').trigger("click");
+    await firstDisabled.get('[role="listbox"]').trigger("keydown", { key: "Home" });
+    expect(firstDisabled.findAll(".listbox-option.on").at(0)?.text()).toBe("B");
+    firstDisabled.unmount();
+
+    const lastDisabled = mount(Listbox, {
+      props: {
+        modelValue: null,
+        options: [
+          { value: "a", label: "A" },
+          { value: "b", label: "B" },
+          { value: "c", label: "C", disabled: true },
+        ],
+        ariaLabel: "选项",
+      },
+      attachTo: document.body,
+    });
+    await lastDisabled.get('[role="combobox"]').trigger("click");
+    await lastDisabled.get('[role="listbox"]').trigger("keydown", { key: "End" });
+    expect(lastDisabled.findAll(".listbox-option.on").at(0)?.text()).toBe("B");
+    lastDisabled.unmount();
+  });
 });
