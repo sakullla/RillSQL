@@ -29,7 +29,19 @@ describe("shellMenus", () => {
     }
   });
 
-  it("only surfaces shortcuts that exist in the shortcut table", () => {
+  it("shows the editor chords on the query menu", () => {
+    const query = shellMenus({ hasQueryTab: true }, "system").find((menu) => menu.id === "query")!;
+    const byId = Object.fromEntries(
+      query.items.filter((item): item is Extract<(typeof query.items)[number], { kind: "item" }> => item.kind === "item").map((item) => [item.id, item.shortcut]),
+    );
+    expect(byId.run).toBe("Mod+Enter");
+    expect(byId["run-statement"]).toBe("Mod+Shift+Enter");
+    expect(byId.cancel).toBe("Mod+.");
+    expect(byId.format).toBe("Mod+Shift+F");
+    expect(byId.plan).toBe("Mod+Shift+E");
+  });
+
+  it("never invents a chord that is absent from the shortcut table", () => {
     const known = new Set(SHORTCUTS.map((item) => item.chord));
     for (const menu of shellMenus({ hasQueryTab: true }, "system")) {
       for (const item of menu.items) {

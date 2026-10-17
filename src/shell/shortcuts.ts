@@ -60,3 +60,8 @@ export function shortcutPlatformNote(mac: boolean): string {
 export function globalChord(label: string): string | undefined {
   return SHORTCUTS.find((item) => item.group === "全局" && item.label === label)?.chord;
 }
+
+/** 按 label 在全部分组里查 chord；菜单栏用它，保证「菜单里看到的 = 快捷键表里有的」。 */
+export function chordByLabel(label: string): string | undefined {
+  return SHORTCUTS.find((item) => item.label === label)?.chord;
+}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { chordParts, formatChord, globalChord, isMacPlatform, SHORTCUTS, shortcutPlatformNote } from "./shortcuts";
+import { chordByLabel, chordParts, formatChord, globalChord, isMacPlatform, SHORTCUTS, shortcutPlatformNote } from "./shortcuts";
 
 describe("desktop shortcuts", () => {
   it("uses platform tab shortcuts instead of the prototype browser keys", () => {
@@ -19,5 +19,12 @@ describe("desktop shortcuts", () => {
     expect(isMacPlatform("MacIntel", "")).toBe(true);
     expect(isMacPlatform("Win32", "Windows NT 10")).toBe(false);
     expect(chordParts("Alt+1…9", false)).toEqual(["Alt", "1…9"]);
+  });
+
+  it("chordByLabel finds chords in every group", () => {
+    expect(chordByLabel("新建查询")).toBe("Mod+T");
+    expect(chordByLabel("执行选中内容；无选中时执行光标所在语句")).toBe("Mod+Enter");
+    expect(chordByLabel("编辑单元格")).toBe("Enter / F2");
+    expect(chordByLabel("不存在的动作")).toBeUndefined();
   });
 });
