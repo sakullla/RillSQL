@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, ref, toRef, watch } from "vue";
 import type { MenuItem } from "./types";
+import { useOutsideDismiss } from "./useOutsideDismiss";
 
 const props = withDefaults(
   defineProps<{ open: boolean; x: number; y: number; items: MenuItem[]; label?: string }>(),
@@ -53,12 +54,6 @@ function focusItem(index: number) {
   items[wrapped]?.focus();
 }
 
-function onOutside(event: PointerEvent) {
-  const target = event.target;
-  if (target instanceof Node && menu.value?.contains(target)) return;
-  emit("close");
-}
-
 function onKey(event: KeyboardEvent) {
   const items = focusables();
   const at = items.indexOf(document.activeElement as HTMLElement);
@@ -104,24 +99,27 @@ function itemKey(item: MenuItem, index: number): string {
   return `sep-${index}`;
 }
 
+const openRef = toRef(props, "open");
+useOutsideDismiss(
+  openRef,
+  (target) => Boolean(menu.value?.contains(target)),
+  () => emit("close"),
+);
+
 watch(
-  () => props.open,
+  openRef,
   (isOpen) => {
     if (isOpen) {
       const active = document.activeElement;
       restoreTo = active instanceof HTMLElement ? active : null;
-      document.addEventListener("pointerdown", onOutside, true);
       void nextTick(() => focusItem(0));
     } else {
-      document.removeEventListener("pointerdown", onOutside, true);
       restoreTo?.focus();
       restoreTo = null;
     }
   },
   { immediate: true },
 );
-
-onBeforeUnmount(() => document.removeEventListener("pointerdown", onOutside, true));
 </script>
 
 <template>

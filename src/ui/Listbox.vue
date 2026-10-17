@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from "vue";
 import type { ListboxOption } from "./types";
+import { useOutsideDismiss } from "./useOutsideDismiss";
 
 const props = withDefaults(
   defineProps<{
@@ -25,6 +26,12 @@ const filter = ref<HTMLInputElement | null>(null);
 const pop = ref<HTMLElement | null>(null);
 const dropUp = ref(false);
 
+useOutsideDismiss(
+  open,
+  (target) => Boolean(trigger.value?.contains(target) || pop.value?.contains(target)),
+  close,
+);
+
 const selected = computed(() => props.options.find((option) => option.value === props.modelValue) ?? null);
 
 const visible = computed(() => {
@@ -45,14 +52,6 @@ function optionId(index: number): string {
 
 const activeDescendant = computed(() => (open.value && visible.value.length ? optionId(active.value) : undefined));
 
-function onOutside(event: PointerEvent) {
-  const target = event.target;
-  if (!(target instanceof Node)) return;
-  if (trigger.value?.contains(target)) return;
-  if (pop.value?.contains(target)) return;
-  close();
-}
-
 function place() {
   const anchor = trigger.value;
   const panel = pop.value;
@@ -69,7 +68,6 @@ function openList() {
   query.value = "";
   const picked = props.options.findIndex((option) => option.value === props.modelValue);
   active.value = picked >= 0 ? picked : 0;
-  document.addEventListener("pointerdown", onOutside, true);
   window.addEventListener("resize", place);
   void nextTick(() => {
     place();
@@ -80,7 +78,6 @@ function openList() {
 function close() {
   if (!open.value) return;
   open.value = false;
-  document.removeEventListener("pointerdown", onOutside, true);
   window.removeEventListener("resize", place);
 }
 
@@ -169,7 +166,6 @@ watch(visible, (items) => {
 });
 
 onBeforeUnmount(() => {
-  document.removeEventListener("pointerdown", onOutside, true);
   window.removeEventListener("resize", place);
 });
 </script>
