@@ -107,7 +107,7 @@
 | `Button` | 主 / 次 / 幽灵 / 危险 四种 `variant`，`sm`（24px）与 `md`（26px）两档，可带左侧图标与右侧 `kbd` 提示 |
 | `IconButton` | 26×26，必须带 `title` 与 `aria-label`，hover 出底色 |
 | `TextInput` / `SearchInput` | 26px 高，`focus-within` 出强调边框与 2px 光环 |
-| `Listbox`（**替换全部原生 `<select>`**） | 触发器 + 浮层；支持分组、可选筛选、方向键/Home/End/Enter/Esc、`aria-activedescendant`、外点关闭、窗口边缘翻转 |
+| `Listbox`（**替换全部原生 `<select>`**） | 触发器 + 浮层；可选筛选、方向键/Home/End/Enter/Esc（焦点随选项移动，或用 `aria-activedescendant` 表达当前项）、外点关闭、贴近窗口下沿时向上翻转。分组不在 P1 范围，P4 需要时再扩展 `ListboxOption` |
 | `Checkbox` / `Switch` | 设置页与筛选器使用 |
 | `Segmented` | 密度（紧凑/标准）、主题等二到三项切换 |
 | `Tag` | 环境（开发/测试/生产/本地）、状态（已连接/未连接/失败）、引擎徽标；3px 圆角 |
@@ -261,7 +261,7 @@
 
 - `npm run typecheck` 通过。
 - `npm test` 通过；**新增**组件测试至少覆盖：
-  - `Listbox`：打开/关闭、方向键、Enter 选中、Esc、外点关闭、`aria-activedescendant`。
+  - `Listbox`：打开/关闭、方向键、Enter 选中、Esc、外点关闭、当前项可被辅助技术读到（焦点随选项移动，或 `aria-activedescendant`）。
   - `ContextMenu`：打开、方向键、危险项、Esc、外点关闭。
   - 网格选择：单选、Shift 连选、Ctrl 加选、Ctrl+A、Ctrl+C 生成 TSV、Enter 进入编辑、Esc 取消。
   - 列宽：拖动更新、双击自适应、最小宽度。
