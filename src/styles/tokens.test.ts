@@ -33,6 +33,7 @@ const THEME_TOKENS = [
   "--line-2",
   "--accent",
   "--accent-hover",
+  "--accent-active",
   "--accent-soft",
   "--accent-text",
   "--on-accent",
@@ -54,6 +55,9 @@ const THEME_TOKENS = [
   "--shadow-sm",
   "--shadow",
   "--shadow-lg",
+  "--press",
+  "--press-accent",
+  "--press-danger",
   "--tk-kw",
   "--tk-str",
   "--tk-num",
@@ -94,6 +98,29 @@ describe("design tokens", () => {
     expect(block(":root[data-theme=\"dark\"]")).toContain("color-scheme: dark");
   });
 
+  it("uses the desktop control shape scale: 4px controls, 6px panels, 3px tags", () => {
+    const root = block(":root {");
+    expect(tokenValue(root, "--r")).toBe("4px");
+    expect(tokenValue(root, "--r-sm")).toBe("3px");
+    expect(tokenValue(root, "--r-md")).toBe("6px");
+    expect(tokenValue(root, "--r-lg")).toBe("6px");
+    expect(tokenValue(root, "--r-xl")).toBe("6px");
+  });
+
+  it("defines the five-step type scale and the float layer scale", () => {
+    const root = block(":root {");
+    expect(tokenValue(root, "--fs-xs")).toBe("11px");
+    expect(tokenValue(root, "--fs-sm")).toBe("12px");
+    expect(tokenValue(root, "--fs-md")).toBe("13px");
+    expect(tokenValue(root, "--fs-lg")).toBe("15px");
+    expect(tokenValue(root, "--fs-xl")).toBe("18px");
+    // 六档浮层层级必须严格递增，否则菜单/对话框/Toast 的叠放会互相压住
+    const zLayers = ["--z-base", "--z-sticky", "--z-float", "--z-menu", "--z-dialog", "--z-toast"]
+      .map((name) => Number.parseInt(tokenValue(root, name), 10));
+    expect(zLayers).toEqual([0, 10, 100, 200, 300, 400]);
+    expect([...zLayers].sort((a, b) => a - b)).toEqual(zLayers);
+  });
+
   it("provides spacing, font-size, radius and layout scales", () => {
     const root = block(":root {");
     for (const name of ["--sp-1", "--sp-2", "--sp-3", "--sp-4", "--sp-5", "--sp-6", "--sp-7", "--sp-8"]) {
@@ -122,16 +149,17 @@ describe("design tokens", () => {
     expect(reduced).toContain("--dur-slow: 0ms");
   });
 
-  it("defaults to a roomier density and widens further in comfortable mode", () => {
+  it("defaults to compact density and widens in standard mode", () => {
     const root = block(":root {");
-    const defaultRow = Number.parseInt(tokenValue(root, "--row-h"), 10);
-    expect(defaultRow).toBeGreaterThan(28);
-    const comfortable = block(":root[data-density=\"comfortable\"]");
-    const comfortableRow = Number.parseInt(tokenValue(comfortable, "--row-h"), 10);
-    expect(comfortableRow).toBeGreaterThan(defaultRow);
-    expect(Number.parseInt(tokenValue(comfortable, "--tree-h"), 10)).toBeGreaterThan(
-      Number.parseInt(tokenValue(root, "--tree-h"), 10),
-    );
+    expect(Number.parseInt(tokenValue(root, "--row-h"), 10)).toBe(26);
+    expect(Number.parseInt(tokenValue(root, "--tree-h"), 10)).toBe(23);
+    expect(Number.parseInt(tokenValue(root, "--control-h"), 10)).toBe(26);
+    expect(Number.parseInt(tokenValue(root, "--control-h-sm"), 10)).toBe(24);
+    const standard = block(":root[data-density=\"standard\"]");
+    expect(Number.parseInt(tokenValue(standard, "--row-h"), 10)).toBe(32);
+    expect(Number.parseInt(tokenValue(standard, "--tree-h"), 10)).toBe(30);
+    expect(Number.parseInt(tokenValue(standard, "--control-h"), 10)).toBe(30);
+    expect(Number.parseInt(tokenValue(standard, "--control-h-sm"), 10)).toBe(26);
   });
 
   it("keeps legacy token names resolvable for transitional module css", () => {

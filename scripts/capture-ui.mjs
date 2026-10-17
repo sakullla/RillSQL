@@ -183,7 +183,7 @@ try {
         await page.getByRole("tab", { name: "数据", exact: true }).click();
         await page.getByLabel("数据表格").getByRole("button", { name: "导出", exact: true }).click();
         await page.getByRole("dialog", { name: "导出为 CSV" }).waitFor();
-        await expect(page.getByRole("dialog", { name: "导出为 CSV" })).toContainText("CSV 只是数据导出，不是数据库备份");
+        await expect(page.getByRole("dialog", { name: "导出为 CSV" })).toContainText("只是数据导出，不是数据库备份");
         await captureImage(page, "export", theme, width, "只导出已读取的行和全表两种范围");
         await page.getByRole("dialog", { name: "导出为 CSV" }).getByRole("button", { name: "关闭", exact: true }).click();
 

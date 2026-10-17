@@ -1,8 +1,8 @@
 {
-  "capturedAt": "2026-10-15T01:10:56.555Z",
+  "capturedAt": "2026-10-17T10:44:29.138Z",
   "synthetic": true,
   "invocation": "node scripts/capture-ui.mjs",
-  "previewUrl": "http://localhost:1421",
+  "previewUrl": "http://localhost:1420",
   "matrix": {
     "themes": [
       "light",
@@ -39,7 +39,7 @@
       "width": 1360,
       "height": 1000,
       "file": "welcome-light-1360.png",
-      "state": "欢迎页双主路径和已连接的资源管理器"
+      "state": "已有连接时内容区不列连接卡片，对象树仍是连接名单"
     },
     {
       "name": "connections",
@@ -147,7 +147,7 @@
       "width": 1360,
       "height": 1000,
       "file": "welcome-dark-1360.png",
-      "state": "欢迎页双主路径和已连接的资源管理器"
+      "state": "已有连接时内容区不列连接卡片，对象树仍是连接名单"
     },
     {
       "name": "connections",
@@ -255,7 +255,7 @@
       "width": 900,
       "height": 1000,
       "file": "welcome-light-900.png",
-      "state": "欢迎页双主路径和已连接的资源管理器"
+      "state": "已有连接时内容区不列连接卡片，对象树仍是连接名单"
     },
     {
       "name": "connections",
@@ -363,7 +363,7 @@
       "width": 900,
       "height": 1000,
       "file": "welcome-dark-900.png",
-      "state": "欢迎页双主路径和已连接的资源管理器"
+      "state": "已有连接时内容区不列连接卡片，对象树仍是连接名单"
     },
     {
       "name": "connections",
@@ -471,7 +471,7 @@
       "width": 640,
       "height": 1000,
       "file": "welcome-light-640.png",
-      "state": "欢迎页双主路径和已连接的资源管理器"
+      "state": "已有连接时内容区不列连接卡片，对象树仍是连接名单"
     },
     {
       "name": "connections",
@@ -579,7 +579,7 @@
       "width": 640,
       "height": 1000,
       "file": "welcome-dark-640.png",
-      "state": "欢迎页双主路径和已连接的资源管理器"
+      "state": "已有连接时内容区不列连接卡片，对象树仍是连接名单"
     },
     {
       "name": "connections",
