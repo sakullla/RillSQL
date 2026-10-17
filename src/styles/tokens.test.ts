@@ -114,9 +114,11 @@ describe("design tokens", () => {
     expect(tokenValue(root, "--fs-md")).toBe("13px");
     expect(tokenValue(root, "--fs-lg")).toBe("15px");
     expect(tokenValue(root, "--fs-xl")).toBe("18px");
-    for (const name of ["--z-base", "--z-sticky", "--z-float", "--z-menu", "--z-dialog", "--z-toast"]) {
-      expect(tokenValue(root, name), name).toMatch(/^\d+$/);
-    }
+    // 六档浮层层级必须严格递增，否则菜单/对话框/Toast 的叠放会互相压住
+    const zLayers = ["--z-base", "--z-sticky", "--z-float", "--z-menu", "--z-dialog", "--z-toast"]
+      .map((name) => Number.parseInt(tokenValue(root, name), 10));
+    expect(zLayers).toEqual([0, 10, 100, 200, 300, 400]);
+    expect([...zLayers].sort((a, b) => a - b)).toEqual(zLayers);
   });
 
   it("provides spacing, font-size, radius and layout scales", () => {
