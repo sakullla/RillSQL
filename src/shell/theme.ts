@@ -1,5 +1,5 @@
 export type ThemePreference = "light" | "dark" | "system";
-export type Density = "compact" | "comfortable";
+export type Density = "compact" | "standard";
 export type ResolvedTheme = "light" | "dark";
 
 export function resolvedTheme(preference: ThemePreference, prefersDark: boolean): ResolvedTheme {

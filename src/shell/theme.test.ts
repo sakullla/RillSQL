@@ -11,9 +11,9 @@ describe("theme", () => {
 
   it("writes the resolved theme and density onto the document", () => {
     const root = document.createElement("html");
-    applyDocumentTheme("system", "comfortable", true, 15, root);
+    applyDocumentTheme("system", "standard", true, 15, root);
     expect(root.dataset.theme).toBe("dark");
-    expect(root.dataset.density).toBe("comfortable");
+    expect(root.dataset.density).toBe("standard");
     expect(root.style.getPropertyValue("--editor-font")).toBe("15px");
   });
 });

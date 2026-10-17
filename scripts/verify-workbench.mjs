@@ -80,14 +80,14 @@ try {
   await expect(page.locator('[data-cell="61:id"]')).toBeFocused();
   await expect(page.locator('[data-cell="61:id"]')).toBeVisible();
   await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "设置", exact: true }).click();
-  await page.locator('input[name="set-density"][value="comfortable"]').check();
+  await page.locator('input[name="set-density"][value="standard"]').check();
   await page.getByRole("combobox", { name: "每次读取的行数" }).selectOption("500");
   await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "工作台", exact: true }).click();
   await page.locator(".grid-scroll").evaluate(el => { el.scrollTop = el.scrollHeight; });
   await expect(page.locator('[data-row-id="1000"]')).toBeVisible();
   const measuredHeight = await page.locator('[data-row-id="1000"]').evaluate(el => el.getBoundingClientRect().height);
-  expect(measuredHeight).toBe(38);
-  report.metrics.comfortableDataRowPx = measuredHeight;
+  expect(measuredHeight).toBe(32);
+  report.metrics.standardDataRowPx = measuredHeight;
   await page.getByRole("button", { name: "按 id 排序", exact: true }).click();
   expect(await page.evaluate(() => window.__uiCalls.filter(call => call.command === "grid_page").at(-1).args.request.limit)).toBe(500);
   report.checks.push("1,000 editable rows stay bounded; keyboard crosses the viewport; density and page size update without losing the table");

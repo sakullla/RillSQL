@@ -74,8 +74,8 @@ function onNullCopy(event: Event) {
               <label :class="{ on: settings.density === 'compact' }">
                 <input type="radio" name="set-density" value="compact" :checked="settings.density === 'compact'" @change="setDensity('compact')" />紧凑
               </label>
-              <label :class="{ on: settings.density === 'comfortable' }">
-                <input type="radio" name="set-density" value="comfortable" :checked="settings.density === 'comfortable'" @change="setDensity('comfortable')" />标准
+              <label :class="{ on: settings.density === 'standard' }">
+                <input type="radio" name="set-density" value="standard" :checked="settings.density === 'standard'" @change="setDensity('standard')" />标准
               </label>
             </div>
           </div>
