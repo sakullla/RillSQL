@@ -18,6 +18,9 @@ const EDGE = 8;
 
 const menu = ref<HTMLElement | null>(null);
 
+/** 关闭时把焦点还给打开菜单的元素，六个调用方不必各写一遍。 */
+let restoreTo: HTMLElement | null = null;
+
 const estimatedHeight = computed(() =>
   props.items.reduce((total, item) => {
     if (item.kind === "item") return total + ITEM_H;
@@ -57,6 +60,10 @@ function onKey(event: KeyboardEvent) {
     emit("close");
     return;
   }
+  if (event.key === "Tab") {
+    emit("close");
+    return;
+  }
   if (event.key === "ArrowDown") {
     event.preventDefault();
     focusItem(at + 1);
@@ -84,14 +91,24 @@ function pick(item: MenuItem) {
   emit("close");
 }
 
+function itemKey(item: MenuItem, index: number): string {
+  if (item.kind === "item") return item.id;
+  if (item.kind === "head") return `head-${index}`;
+  return `sep-${index}`;
+}
+
 watch(
   () => props.open,
   (isOpen) => {
     if (isOpen) {
+      const active = document.activeElement;
+      restoreTo = active instanceof HTMLElement ? active : null;
       document.addEventListener("pointerdown", onOutside, true);
       void nextTick(() => focusItem(0));
     } else {
       document.removeEventListener("pointerdown", onOutside, true);
+      restoreTo?.focus();
+      restoreTo = null;
     }
   },
   { immediate: true },
@@ -113,7 +130,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", onOutside, tru
       @contextmenu.prevent
       @keydown="onKey"
     >
-      <template v-for="(item, index) in items" :key="index">
+      <template v-for="(item, index) in items" :key="itemKey(item, index)">
         <div v-if="item.kind === 'head'" class="menu-head" role="presentation">{{ item.text }}</div>
         <div v-else-if="item.kind === 'sep'" class="menu-sep" role="separator"></div>
         <button

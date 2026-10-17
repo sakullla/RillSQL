@@ -317,6 +317,8 @@ dialog::backdrop { background: rgba(12, 16, 24, 0.45); }
   position: fixed;
   z-index: var(--z-menu);
   min-width: 180px;
+  max-height: calc(100vh - 16px);
+  overflow: auto;
   background: var(--panel);
   border: 1px solid var(--line-2);
   border-radius: var(--r-md);

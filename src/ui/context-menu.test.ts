@@ -110,4 +110,36 @@ describe("ContextMenu", () => {
     expect(document.activeElement?.textContent).toContain("打开表数据");
     wrapper.unmount();
   });
+
+  it("restores focus to the element that opened it", async () => {
+    const source = document.createElement("button");
+    source.textContent = "右键来源";
+    document.body.append(source);
+    source.focus();
+    const wrapper = mount(ContextMenu, {
+      props: { open: false, x: 40, y: 40, items: ITEMS, label: "对象操作" },
+      global: { stubs: { teleport: true } },
+      attachTo: document.body,
+    });
+    await wrapper.setProps({ open: true });
+    await nextTick();
+    await nextTick();
+    expect(document.activeElement?.textContent).toContain("打开表数据");
+    await wrapper.setProps({ open: false });
+    await nextTick();
+    expect(document.activeElement).toBe(source);
+    source.remove();
+    wrapper.unmount();
+  });
+
+  it("closes on Tab without swallowing the keystroke", async () => {
+    const wrapper = open();
+    await nextTick();
+    const event = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+    wrapper.get('[role="menu"]').element.dispatchEvent(event);
+    await nextTick();
+    expect(wrapper.emitted("close")).toHaveLength(1);
+    expect(event.defaultPrevented).toBe(false);
+    wrapper.unmount();
+  });
 });
