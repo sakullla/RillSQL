@@ -78,4 +78,24 @@ describe("Listbox", () => {
     expect(wrapper.findAll('[role="option"]').map((n) => n.text())).toEqual(["SQLite"]);
     wrapper.unmount();
   });
+
+  it("flips the popup above the trigger when it would overflow the viewport", async () => {
+    const wrapper = open();
+    const el = wrapper.get('[role="combobox"]').element as HTMLElement;
+    el.getBoundingClientRect = () =>
+      ({ top: window.innerHeight - 40, bottom: window.innerHeight - 10, left: 20, right: 220, width: 200, height: 30, x: 20, y: window.innerHeight - 40, toJSON: () => ({}) }) as DOMRect;
+    await wrapper.get('[role="combobox"]').trigger("click");
+    expect(wrapper.find(".listbox-pop").classes()).toContain("up");
+    wrapper.unmount();
+  });
+
+  it("keeps the popup below the trigger when there is room", async () => {
+    const wrapper = open();
+    const el = wrapper.get('[role="combobox"]').element as HTMLElement;
+    el.getBoundingClientRect = () =>
+      ({ top: 40, bottom: 70, left: 20, right: 220, width: 200, height: 30, x: 20, y: 40, toJSON: () => ({}) }) as DOMRect;
+    await wrapper.get('[role="combobox"]').trigger("click");
+    expect(wrapper.find(".listbox-pop").classes()).not.toContain("up");
+    wrapper.unmount();
+  });
 });

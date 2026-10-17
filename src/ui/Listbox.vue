@@ -22,6 +22,8 @@ const active = ref(0);
 const trigger = ref<HTMLButtonElement | null>(null);
 const list = ref<HTMLUListElement | null>(null);
 const filter = ref<HTMLInputElement | null>(null);
+const pop = ref<HTMLElement | null>(null);
+const dropUp = ref(false);
 
 const selected = computed(() => props.options.find((option) => option.value === props.modelValue) ?? null);
 
@@ -44,6 +46,16 @@ function onOutside(event: PointerEvent) {
   close();
 }
 
+function place() {
+  const anchor = trigger.value;
+  const panel = pop.value;
+  if (!anchor || !panel) return;
+  const rect = anchor.getBoundingClientRect();
+  // jsdom 下 offsetHeight 为 0，退回估算高度，保证单测也能触发翻转。
+  const height = panel.offsetHeight || visible.value.length * 24 + 12;
+  dropUp.value = rect.bottom + 4 + height > window.innerHeight && rect.top > height + 4;
+}
+
 function openList() {
   if (open.value) return;
   open.value = true;
@@ -51,13 +63,18 @@ function openList() {
   const picked = props.options.findIndex((option) => option.value === props.modelValue);
   active.value = picked >= 0 ? picked : 0;
   document.addEventListener("pointerdown", onOutside, true);
-  void nextTick(() => (props.filterable ? filter.value : list.value)?.focus());
+  window.addEventListener("resize", place);
+  void nextTick(() => {
+    place();
+    (props.filterable ? filter.value : list.value)?.focus();
+  });
 }
 
 function close() {
   if (!open.value) return;
   open.value = false;
   document.removeEventListener("pointerdown", onOutside, true);
+  window.removeEventListener("resize", place);
 }
 
 function toggle() {
@@ -131,7 +148,10 @@ watch(visible, (items) => {
   if (active.value >= items.length) active.value = Math.max(0, items.length - 1);
 });
 
-onBeforeUnmount(() => document.removeEventListener("pointerdown", onOutside, true));
+onBeforeUnmount(() => {
+  document.removeEventListener("pointerdown", onOutside, true);
+  window.removeEventListener("resize", place);
+});
 </script>
 
 <template>
@@ -152,7 +172,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", onOutside, tru
       <span class="listbox-value" :class="{ placeholder: !selected }">{{ selected ? selected.label : placeholder }}</span>
       <svg class="i listbox-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" /></svg>
     </button>
-    <div v-if="open" class="listbox-pop">
+    <div v-if="open" ref="pop" class="listbox-pop" :class="{ up: dropUp }">
       <input
         v-if="filterable"
         ref="filter"
@@ -221,6 +241,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", onOutside, tru
   background: var(--panel);
   box-shadow: var(--shadow);
 }
+.listbox-pop.up { top: auto; bottom: calc(100% + 4px); }
 .listbox-filter {
   width: 100%;
   height: var(--control-h-sm);
