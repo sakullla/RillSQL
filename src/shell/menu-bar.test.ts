@@ -59,6 +59,32 @@ describe("MenuBar", () => {
     await nextTick();
     await wrapper.get('[data-id="new-query"]').trigger("click");
     expect(wrapper.emitted("select")?.[0]).toEqual(["file", "new-query"]);
+    expect(wrapper.find('[role="menu"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("closes when the same button is clicked again (pointerdown then click)", async () => {
+    const wrapper = mount(MenuBar, {
+      props: { menus: MENUS },
+      global: { stubs: { teleport: true } },
+      attachTo: document.body,
+    });
+    const button = wrapper.findAll('[role="menubar"] button')[0];
+    await button.trigger("click");
+    await nextTick();
+    await nextTick();
+    expect(button.attributes("aria-expanded")).toBe("true");
+    // 真实浏览器序列：先 pointerdown 再 click
+    button.element.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true }));
+    await nextTick();
+    // 触发器在排除列表里，pointerdown 不应关掉菜单
+    expect(button.attributes("aria-expanded")).toBe("true");
+    button.element.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await nextTick();
+    await nextTick();
+    // 这一次 click 应当把它关掉，而不是重开
+    expect(button.attributes("aria-expanded")).toBe("false");
+    expect(wrapper.find('[role="menu"]').exists()).toBe(false);
     wrapper.unmount();
   });
 

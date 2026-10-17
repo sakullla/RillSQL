@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import ContextMenu from "../ui/ContextMenu.vue";
 import type { MenuDefinition } from "./menu-model";
 
@@ -11,6 +11,12 @@ const openId = ref<string | null>(null);
 const anchor = ref<{ x: number; y: number }>({ x: 0, y: 0 });
 
 const active = computed(() => props.menus.find((menu) => menu.id === openId.value) ?? null);
+const openIndex = computed(() => props.menus.findIndex((menu) => menu.id === openId.value));
+
+// menus 变化导致当前打开项消失时，ContextMenu 会因 v-if 卸载而不发 close，这里兜底清 openId
+watch(active, (value) => {
+  if (!value) openId.value = null;
+});
 
 function toggle(menu: MenuDefinition, index: number) {
   const button = buttons.value[index];
@@ -47,8 +53,9 @@ function onItemClick(itemId: string) {
   emit("select", menuId, itemId);
 }
 
-function setButtonRef(el: unknown, index: number) {
+function setButtonRef(el: Element | ComponentPublicInstance | null, index: number) {
   if (el instanceof HTMLElement) buttons.value[index] = el;
+  else delete buttons.value[index];
 }
 </script>
 
@@ -75,6 +82,7 @@ function setButtonRef(el: unknown, index: number) {
     :y="anchor.y"
     :items="active.items"
     :label="`${active.label} 菜单`"
+    :trigger="openIndex >= 0 ? buttons[openIndex] ?? null : null"
     @close="openId = null"
     @select="(itemId) => onItemClick(itemId)"
   />

@@ -100,6 +100,25 @@ describe("ContextMenu", () => {
     wrapper.unmount();
   });
 
+  it("does not close when the pointer is on the excluded trigger", async () => {
+    const trigger = document.createElement("button");
+    document.body.append(trigger);
+    const wrapper = mount(ContextMenu, {
+      props: { open: true, x: 40, y: 40, items: ITEMS, label: "对象操作", trigger },
+      global: { stubs: { teleport: true } },
+      attachTo: document.body,
+    });
+    await nextTick();
+    trigger.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    await nextTick();
+    expect(wrapper.emitted("close")).toBeUndefined();
+    document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    await nextTick();
+    expect(wrapper.emitted("close")).toHaveLength(1);
+    trigger.remove();
+    wrapper.unmount();
+  });
+
   it("Home and End jump to the first and last enabled items", async () => {
     const wrapper = open();
     await nextTick();

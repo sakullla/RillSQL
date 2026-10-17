@@ -4,8 +4,8 @@ import type { MenuItem } from "./types";
 import { useOutsideDismiss } from "./useOutsideDismiss";
 
 const props = withDefaults(
-  defineProps<{ open: boolean; x: number; y: number; items: MenuItem[]; label?: string }>(),
-  { label: "操作" },
+  defineProps<{ open: boolean; x: number; y: number; items: MenuItem[]; label?: string; trigger?: HTMLElement | null }>(),
+  { label: "操作", trigger: null },
 );
 
 const emit = defineEmits<{ close: []; select: [id: string] }>();
@@ -102,7 +102,7 @@ function itemKey(item: MenuItem, index: number): string {
 const openRef = toRef(props, "open");
 useOutsideDismiss(
   openRef,
-  (target) => Boolean(menu.value?.contains(target)),
+  (target) => Boolean(menu.value?.contains(target) || props.trigger?.contains(target)),
   () => emit("close"),
 );
 
