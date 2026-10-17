@@ -78,14 +78,36 @@ describe("ContextMenu", () => {
     wrapper.unmount();
   });
 
-  it("closes on Escape and on an outside pointer", async () => {
+  it("closes on Escape", async () => {
     const wrapper = open();
     await nextTick();
     await wrapper.get('[role="menu"]').trigger("keydown", { key: "Escape" });
     expect(wrapper.emitted("close")).toHaveLength(1);
+    wrapper.unmount();
+  });
+
+  it("closes on an outside pointer, but not on a pointer inside the menu", async () => {
+    const wrapper = open();
+    await nextTick();
+    // 菜单内部的 pointerdown 不应关闭
+    wrapper.get('[role="menu"]').element.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    await nextTick();
+    expect(wrapper.emitted("close")).toBeUndefined();
+    // 菜单外部的 pointerdown 必须关闭
     document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
     await nextTick();
-    expect(wrapper.emitted("close").length).toBeGreaterThanOrEqual(1);
+    expect(wrapper.emitted("close")).toHaveLength(1);
+    wrapper.unmount();
+  });
+
+  it("Home and End jump to the first and last enabled items", async () => {
+    const wrapper = open();
+    await nextTick();
+    await nextTick();
+    await wrapper.get('[role="menu"]').trigger("keydown", { key: "End" });
+    expect(document.activeElement?.textContent).toContain("删除表…");
+    await wrapper.get('[role="menu"]').trigger("keydown", { key: "Home" });
+    expect(document.activeElement?.textContent).toContain("打开表数据");
     wrapper.unmount();
   });
 });
