@@ -17,6 +17,8 @@ export function useOutsideDismiss(
     onDismiss();
   }
 
+  // 默认 pre-flush：真实指针事件是宏任务，Vue 的微任务刷新总在其之前，
+  // 所以 open 之后的下一次点击必然已被监听；不加 flush: "sync"。
   watch(
     open,
     (isOpen) => {
