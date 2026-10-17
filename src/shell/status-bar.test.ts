@@ -23,7 +23,8 @@ describe("StatusBar", () => {
   it("renders the target as a clickable segment that navigates to connections", async () => {
     const wrapper = mount(StatusBar, { props: { tab: queryTab(), onWorkspace: true } });
     const segment = wrapper.get('[data-segment="connection"]');
-    expect(segment.attributes("role")).toBe("button");
+    expect(segment.element.tagName).toBe("BUTTON");
+    expect(segment.attributes("type")).toBe("button");
     await segment.trigger("click");
     expect(wrapper.emitted("navigate")?.[0]).toEqual(["connections"]);
   });
@@ -38,5 +39,22 @@ describe("StatusBar", () => {
     const wrapper = mount(StatusBar, { props: { tab: null, onWorkspace: true } });
     await wrapper.get('[data-segment="history"]').trigger("click");
     expect(wrapper.emitted("navigate")?.[0]).toEqual(["history"]);
+  });
+
+  it("makes the table-data segment navigate to connections too", async () => {
+    const tableTab = {
+      id: "t2",
+      kind: "table",
+      title: "orders",
+      path: "书店 · 开发 / bookstore / orders",
+      connectionId: "c1",
+      engine: "postgres",
+    } as unknown as ShellTab;
+    const wrapper = mount(StatusBar, { props: { tab: tableTab, onWorkspace: true } });
+    const segment = wrapper.get('[data-segment="connection"]');
+    expect(segment.element.tagName).toBe("BUTTON");
+    await segment.trigger("click");
+    expect(wrapper.emitted("navigate")?.[0]).toEqual(["connections"]);
+    wrapper.unmount();
   });
 });

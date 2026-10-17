@@ -46,7 +46,6 @@ const ACTIVITY_TONE: Record<OperationState, "info" | "ok" | "err" | "warn"> = {
           v-else-if="tab.targetText"
           class="sb-item sb-target sb-seg"
           type="button"
-          role="button"
           data-segment="connection"
           title="打开连接管理"
           @click="emit('navigate', 'connections')"
@@ -59,7 +58,6 @@ const ACTIVITY_TONE: Record<OperationState, "info" | "ok" | "err" | "warn"> = {
           v-else
           class="sb-item sb-target sb-seg"
           type="button"
-          role="button"
           data-segment="connection"
           title="打开连接管理"
           @click="emit('navigate', 'connections')"
@@ -73,7 +71,7 @@ const ACTIVITY_TONE: Record<OperationState, "info" | "ok" | "err" | "warn"> = {
       <span v-else class="sb-item muted">{{ PRODUCT_TITLE }}</span>
     </div>
     <div class="sb-right">
-      <button class="sb-item sb-seg" type="button" role="button" data-segment="history" title="查询历史" @click="emit('navigate', 'history')">
+      <button class="sb-item sb-seg" type="button" data-segment="history" title="查询历史" @click="emit('navigate', 'history')">
         <Icon name="history" /> 历史
       </button>
       <span v-if="activity" class="sb-activity" :data-state="activity.state">
