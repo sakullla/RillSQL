@@ -147,6 +147,7 @@ watch(
           :data-id="item.id"
           :disabled="item.disabled"
           :title="item.title"
+          :aria-checked="item.checked === undefined ? undefined : item.checked"
           @click="pick(item)"
         >
           <span>{{ item.label }}</span>

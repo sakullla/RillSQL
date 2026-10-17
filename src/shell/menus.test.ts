@@ -51,6 +51,32 @@ describe("shellMenus", () => {
     }
   });
 
+  it("keeps every menu shortcut non-empty and sourced from the table", () => {
+    const expected: Record<string, Record<string, string>> = {
+      file: { "new-query": "Mod+T", settings: "Mod+," },
+      edit: { palette: "Mod+K", "quick-open": "Mod+P" },
+      view: { "toggle-sidebar": "Mod+B", shortcuts: "?" },
+      query: {
+        run: "Mod+Enter",
+        "run-statement": "Mod+Shift+Enter",
+        cancel: "Mod+.",
+        format: "Mod+Shift+F",
+        plan: "Mod+Shift+E",
+      },
+      window: { "close-tab": "Mod+W", "goto-tab": "Alt+1…9" },
+      help: { shortcuts: "?" },
+    };
+    for (const menu of shellMenus({ hasQueryTab: true }, "system")) {
+      const want = expected[menu.id];
+      if (!want) continue;
+      for (const [id, chord] of Object.entries(want)) {
+        const item = menu.items.find((entry) => entry.kind === "item" && entry.id === id);
+        expect(item, `${menu.id}/${id}`).toBeTruthy();
+        if (item?.kind === "item") expect(item.shortcut, `${menu.id}/${id}`).toBe(chord);
+      }
+    }
+  });
+
   it("uses separators only between groups, never at the edges", () => {
     for (const menu of shellMenus({ hasQueryTab: true }, "system")) {
       const first = menu.items[0];

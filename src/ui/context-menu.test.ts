@@ -213,6 +213,8 @@ describe("ContextMenu", () => {
     await nextTick();
     expect(wrapper.find('[data-id="light"] .check').exists()).toBe(true);
     expect(wrapper.find('[data-id="dark"] .check').exists()).toBe(false);
+    expect(wrapper.find('[data-id="light"]').attributes("aria-checked")).toBe("true");
+    expect(wrapper.find('[data-id="dark"]').attributes("aria-checked")).toBeUndefined();
     wrapper.unmount();
   });
 });
