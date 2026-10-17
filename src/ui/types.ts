@@ -6,6 +6,6 @@ export interface ListboxOption {
 }
 
 export type MenuItem =
-  | { kind: "item"; id: string; label: string; shortcut?: string; title?: string; danger?: boolean; disabled?: boolean }
+  | { kind: "item"; id: string; label: string; shortcut?: string; title?: string; danger?: boolean; disabled?: boolean; checked?: boolean }
   | { kind: "head"; text: string }
   | { kind: "sep" };

@@ -194,4 +194,25 @@ describe("ContextMenu", () => {
     expect(event.defaultPrevented).toBe(false);
     wrapper.unmount();
   });
+
+  it("renders a check mark on checked items", async () => {
+    const wrapper = mount(ContextMenu, {
+      props: {
+        open: true,
+        x: 40,
+        y: 40,
+        label: "外观",
+        items: [
+          { kind: "item", id: "light", label: "浅色", checked: true },
+          { kind: "item", id: "dark", label: "深色" },
+        ],
+      },
+      global: { stubs: { teleport: true } },
+      attachTo: document.body,
+    });
+    await nextTick();
+    expect(wrapper.find('[data-id="light"] .check').exists()).toBe(true);
+    expect(wrapper.find('[data-id="dark"] .check').exists()).toBe(false);
+    wrapper.unmount();
+  });
 });
