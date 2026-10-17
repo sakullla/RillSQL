@@ -53,4 +53,36 @@ describe("Tooltip", () => {
     expect(wrapper.find('[role="tooltip"]').exists()).toBe(false);
     wrapper.unmount();
   });
+
+  it("defaults to a 400ms delay", async () => {
+    const wrapper = mount(Tooltip, {
+      props: { text: "导出" },
+      slots: { default: '<button class="icon-btn" aria-label="导出">e</button>' },
+      attachTo: document.body,
+    });
+    await wrapper.find(".tip-host").trigger("mouseenter");
+    vi.advanceTimersByTime(399);
+    await nextTick();
+    expect(wrapper.find('[role="tooltip"]').exists()).toBe(false);
+    vi.advanceTimersByTime(2);
+    await nextTick();
+    expect(wrapper.find('[role="tooltip"]').exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("cancels the pending timer when the pointer leaves before the delay", async () => {
+    const wrapper = mount(Tooltip, {
+      props: { text: "取消", delay: 400 },
+      slots: { default: '<button class="icon-btn" aria-label="取消">x</button>' },
+      attachTo: document.body,
+    });
+    await wrapper.find(".tip-host").trigger("mouseenter");
+    vi.advanceTimersByTime(200);
+    await wrapper.find(".tip-host").trigger("mouseleave");
+    // 若 hide() 里没有 clearTimeout，这里会迟到出现
+    vi.advanceTimersByTime(500);
+    await nextTick();
+    expect(wrapper.find('[role="tooltip"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
 });
