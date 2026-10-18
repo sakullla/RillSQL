@@ -1,5 +1,5 @@
 {
-  "capturedAt": "2026-10-18T11:42:58.280Z",
+  "capturedAt": "2026-10-18T13:42:30.501Z",
   "synthetic": true,
   "invocation": "node scripts/capture-ui.mjs",
   "previewUrl": "http://localhost:1430",

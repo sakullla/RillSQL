@@ -15,7 +15,7 @@
 .connection-filters { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-2); margin-bottom: var(--sp-3); }
 .connection-filters .mini-search { flex: 1; max-width: 360px; }
 .connection-filters input { width: 100%; }
-.conn-list { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel); overflow: hidden; }
+.conn-list { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel); }
 .connection-columns, .conn-row { display: grid; grid-template-columns: minmax(180px, 1.3fr) minmax(140px, 1fr) minmax(160px, 1fr) minmax(180px, .9fr); gap: var(--sp-3); padding: 0 var(--sp-3); align-items: center; min-height: 44px; }
 .connection-columns { min-height: 28px; font-size: var(--fs-xs); color: var(--text-3); background: var(--panel-2); }
 .conn-row { position: relative; border-top: 1px solid var(--line); text-align: left; cursor: default; }
@@ -52,8 +52,8 @@
   .conn-add small { display: none; }
 }
 
-/* 行内操作菜单 */
-.conn-menu { position: absolute; right: var(--sp-3); bottom: calc(100% - 4px); z-index: 5; min-width: 180px; padding: var(--sp-1); border: 1px solid var(--line-2); border-radius: var(--r-md); background: var(--panel); box-shadow: var(--shadow); display: flex; flex-direction: column; }
+/* 行内操作菜单：向下弹出，避免被页头统计条挡住点击 */
+.conn-menu { position: absolute; right: var(--sp-3); top: calc(100% - 4px); z-index: 5; min-width: 180px; padding: var(--sp-1); border: 1px solid var(--line-2); border-radius: var(--r-md); background: var(--panel); box-shadow: var(--shadow); display: flex; flex-direction: column; }
 .conn-menu button { text-align: left; padding: var(--sp-2); border-radius: var(--r); display: flex; gap: var(--sp-2); align-items: center; font-size: var(--fs-sm); transition: background var(--dur-fast) var(--ease); }
 .conn-menu button:hover { background: var(--hover); }
 .conn-menu button.danger { color: var(--err); }

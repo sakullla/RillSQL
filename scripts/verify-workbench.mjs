@@ -112,7 +112,7 @@ try {
   await expect(page.locator('[data-cell="61:id"]')).toBeFocused();
   await expect(page.locator('[data-cell="61:id"]')).toBeVisible();
   await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "设置", exact: true }).click();
-  await page.locator('input[name="set-density"][value="standard"]').check();
+  await page.getByRole("radiogroup", { name: "界面密度" }).getByRole("radio", { name: "标准" }).click();
   await pickListboxOption(page, "每次读取的行数", "500 行");
   await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "工作台", exact: true }).click();
   await page.locator(".grid-scroll").evaluate(el => { el.scrollTop = el.scrollHeight; });
