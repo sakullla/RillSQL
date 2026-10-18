@@ -9,6 +9,7 @@ import { anyPending, resetCloseGuard, tabHasPending } from "../shell/close-guard
 import type { CatalogConnection } from "../catalog/types";
 import { exportTasks, resetExportTasks } from "../export/tasks";
 import DataGrid from "./DataGrid.vue";
+import { autofitWidth } from "./column-width";
 import { commitChanges, queryPage, viewLoadedRows } from "./data";
 import { locateResultRows, readSingleTable, resolveEditableTable, ResultEditSession } from "./result-edit";
 import { gridModel } from "../query/rows";
@@ -2045,6 +2046,161 @@ describe("QueryResultGrid desktop selection", () => {
     expect(wrapper.get('[data-cell="r1:name"]').text()).toBe("客户2");
     expect(focusDataCell(wrapper)).toBe("r1:name");
     expect(wrapper.find(".pending-bar").exists()).toBe(false);
+    wrapper.unmount();
+  });
+});
+
+describe("grid column width", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    resetExportTasks();
+    resetCloseGuard();
+    resetCatalog();
+    localStorage.removeItem("rillsql.shell");
+  });
+
+  /** jsdom 没有窗口监听链，挂到 document.body 才能收到 window 上的 pointermove/up。 */
+  function fire(target: Element | Window, type: string, clientX = 0): void {
+    target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, clientX }));
+  }
+
+  async function mountWidthDataGrid() {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") return { rows: [customerRow(1), customerRow(2), customerRow(3)], truncated: false, sql: "SELECT customers" };
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, {
+      props: { tabId: "table:column-width", draft: "", pageSize: 10, target: customersTarget },
+      attachTo: document.body,
+    });
+    await flushPromises();
+    return wrapper;
+  }
+
+  function mountWidthResultGrid() {
+    const model = gridModel({
+      columns: ["id", "name", "email", "note"],
+      rows: [
+        ["1", "客户1", "a@example.com", null],
+        ["2", "客户2", "b@example.com", ""],
+        ["3", "客户3", "c@example.com", "备注3"],
+      ],
+    });
+    return mount(QueryResultGrid, {
+      props: {
+        tabId: "query-column-width",
+        statement: "SELECT id, name, email, note FROM customers JOIN orders ON orders.id = customers.id",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+      },
+      attachTo: document.body,
+    });
+  }
+
+  type WidthWrapper = Awaited<ReturnType<typeof mountWidthDataGrid>> | Awaited<ReturnType<typeof mountWidthResultGrid>>;
+
+  function gripTh(wrapper: WidthWrapper) {
+    const grip = wrapper.get('.col-grip[data-col="name"]');
+    return { grip, th: grip.element.closest("th") as HTMLTableCellElement };
+  }
+
+  async function dragBelowMin(wrapper: WidthWrapper) {
+    const { grip, th } = gripTh(wrapper);
+    fire(grip.element, "pointerdown", 100);
+    await nextTick();
+    fire(grip.element, "pointermove", 10);
+    await nextTick();
+    expect(th.style.width).toBe("48px");
+    fire(grip.element, "pointermove", 160);
+    await nextTick();
+    expect(th.style.width).toBe("108px");
+    return { grip, th };
+  }
+
+  it("keeps a dragged DataGrid column at least 48px wide and keeps it after release", async () => {
+    const wrapper = await mountWidthDataGrid();
+    const { grip, th } = await dragBelowMin(wrapper);
+    fire(grip.element, "pointerup");
+    await nextTick();
+    expect(th.style.width).toBe("108px");
+    const td = wrapper.get('[data-cell="1:name"]').element.closest("td") as HTMLTableCellElement;
+    expect(td.style.width).toBe("108px");
+    wrapper.unmount();
+  });
+
+  it("autofits a DataGrid column when its grip is double clicked", async () => {
+    const wrapper = await mountWidthDataGrid();
+    const { grip, th } = gripTh(wrapper);
+    expect(th.style.width).toBe("");
+    await grip.trigger("dblclick");
+    const expected = autofitWidth(["name", "客户1", "客户2", "客户3"]);
+    expect(expected).toBeGreaterThanOrEqual(48);
+    expect(expected).toBeLessThanOrEqual(360);
+    expect(th.style.width).toBe(`${expected}px`);
+    wrapper.unmount();
+  });
+
+  it("shows the DataGrid width tip only while the column is dragged", async () => {
+    const wrapper = await mountWidthDataGrid();
+    const { grip } = gripTh(wrapper);
+    expect(wrapper.find(".col-width-tip").exists()).toBe(false);
+    fire(grip.element, "pointerdown", 50);
+    await nextTick();
+    fire(grip.element, "pointermove", 75);
+    await nextTick();
+    const tip = wrapper.find(".col-width-tip");
+    expect(tip.exists()).toBe(true);
+    expect(tip.text()).toContain("px");
+    expect(tip.text()).toBe("73px");
+    fire(grip.element, "pointerup");
+    await nextTick();
+    expect(wrapper.find(".col-width-tip").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("keeps a dragged query result column at least 48px wide and keeps it after release", async () => {
+    const wrapper = mountWidthResultGrid();
+    await flushPromises();
+    const { grip, th } = await dragBelowMin(wrapper);
+    fire(grip.element, "pointerup");
+    await nextTick();
+    expect(th.style.width).toBe("108px");
+    const td = wrapper.get('[data-cell="r0:name"]').element.closest("td") as HTMLTableCellElement;
+    expect(td.style.width).toBe("108px");
+    wrapper.unmount();
+  });
+
+  it("autofits a query result column when its grip is double clicked", async () => {
+    const wrapper = mountWidthResultGrid();
+    await flushPromises();
+    const { grip, th } = gripTh(wrapper);
+    expect(th.style.width).toBe("");
+    await grip.trigger("dblclick");
+    const expected = autofitWidth(["name", "客户1", "客户2", "客户3"]);
+    expect(expected).toBeGreaterThanOrEqual(48);
+    expect(expected).toBeLessThanOrEqual(360);
+    expect(th.style.width).toBe(`${expected}px`);
+    wrapper.unmount();
+  });
+
+  it("shows the query result width tip only while the column is dragged", async () => {
+    const wrapper = mountWidthResultGrid();
+    await flushPromises();
+    const { grip } = gripTh(wrapper);
+    expect(wrapper.find(".col-width-tip").exists()).toBe(false);
+    fire(grip.element, "pointerdown", 50);
+    await nextTick();
+    fire(grip.element, "pointermove", 75);
+    await nextTick();
+    const tip = wrapper.find(".col-width-tip");
+    expect(tip.exists()).toBe(true);
+    expect(tip.text()).toContain("px");
+    expect(tip.text()).toBe("73px");
+    fire(grip.element, "pointerup");
+    await nextTick();
+    expect(wrapper.find(".col-width-tip").exists()).toBe(false);
     wrapper.unmount();
   });
 });

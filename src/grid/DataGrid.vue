@@ -11,6 +11,7 @@ import { catalogConnections } from "../catalog/store";
 import { registerPending } from "../shell/close-guard";
 import { loadSettings } from "../shell/settings";
 import { copyPlain, copySqlValue, previewText, showCell, type NullCopy } from "./display";
+import { autofitWidth, clampColWidth, MIN_COL_WIDTH } from "./column-width";
 import "./grid.css";
 import { useRowWindow } from "./virtual";
 import { LiveTable } from "./live";
@@ -354,6 +355,51 @@ function onHeaderPointer(event: PointerEvent, colName: string) {
   }
 }
 
+/** 列宽：th/td 都按 colWidths 写显式宽度，避免依赖 table-layout 猜测。 */
+const colWidths = ref<Record<string, number>>({});
+const resizing = ref<{ column: string; width: number; startX: number; startWidth: number } | null>(null);
+
+function colStyle(name: string | undefined): { width: string } | undefined {
+  const width = name ? colWidths.value[name] : undefined;
+  return width ? { width: `${width}px` } : undefined;
+}
+
+function startColResize(event: PointerEvent, column: string) {
+  const th = (event.currentTarget as HTMLElement | null)?.closest("th") as HTMLElement | null;
+  const fromTh = Number.parseFloat(th?.style.width ?? "");
+  const stored = colWidths.value[column];
+  const startWidth = stored ?? (Number.isFinite(fromTh) ? fromTh : MIN_COL_WIDTH);
+  resizing.value = { column, width: startWidth, startX: event.clientX, startWidth };
+  window.addEventListener("pointermove", moveColResize);
+  window.addEventListener("pointerup", stopColResize);
+  window.addEventListener("pointercancel", stopColResize);
+}
+
+function moveColResize(event: PointerEvent) {
+  const state = resizing.value;
+  if (!state) return;
+  const width = clampColWidth(state.startWidth + (event.clientX - state.startX));
+  state.width = width;
+  colWidths.value[state.column] = width;
+}
+
+function stopColResize() {
+  resizing.value = null;
+  window.removeEventListener("pointermove", moveColResize);
+  window.removeEventListener("pointerup", stopColResize);
+  window.removeEventListener("pointercancel", stopColResize);
+}
+onBeforeUnmount(stopColResize);
+
+function autofitCol(column: string) {
+  const samples: string[] = [column];
+  for (const row of displayRows.value.slice(0, 200)) {
+    const value = session?.cellValue(row.id, column);
+    samples.push(value ?? "");
+  }
+  colWidths.value[column] = autofitWidth(samples);
+}
+
 async function copySelectionTsv() {
   if (!session || !displayRows.value.length || !columns.value.length) return;
   const settings = loadSettings();
@@ -661,8 +707,18 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
         <thead>
           <tr>
             <th class="row-number" scope="col" aria-label="行号">#</th>
-            <th v-for="column in columns" :key="column.name" scope="col" :aria-sort="session.sort?.column === column.name ? (session.sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'" @pointerdown.prevent="onHeaderPointer($event, column.name)">
+            <th v-for="column in columns" :key="column.name" scope="col" :style="colStyle(column.name)" :aria-sort="session.sort?.column === column.name ? (session.sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'" @pointerdown.prevent="onHeaderPointer($event, column.name)">
               <button class="th-btn" type="button" :aria-label="`按 ${column.name} 排序`" @click="session.cycleSort(column.name)">{{ column.name }}</button>
+              <span
+                class="col-grip"
+                role="separator"
+                aria-orientation="vertical"
+                :aria-label="`调整 ${column.name} 列宽`"
+                :data-col="column.name"
+                @pointerdown.stop.prevent="startColResize($event, column.name)"
+                @dblclick.prevent="autofitCol(column.name)"
+              ></span>
+              <span v-if="resizing && resizing.column === column.name" class="col-width-tip">{{ resizing.width }}px</span>
             </th>
           </tr>
         </thead>
@@ -673,7 +729,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
           </tr>
           <tr v-for="(row, visibleIndex) in visibleRows" :key="row.id" :class="{ 'row-insert': row.kind === 'insert', 'row-delete': row.deleted, 'row-failed': row.failed }" :data-row-id="row.id" :data-located="row.located" :title="row.failure || undefined">
             <td class="row-number" @pointerdown.prevent="onRowNumberPointer($event, row.id)">{{ range.start + visibleIndex + 1 }}</td>
-            <td v-for="(column, columnIndex) in columns" :key="column.name">
+            <td v-for="(column, columnIndex) in columns" :key="column.name" :style="colStyle(column.name)">
               <div v-if="editing && editing.id === row.id && editing.column === column.name" class="editor">
                 <input :ref="focusEditor" v-model="editing.draft" :aria-label="`编辑 ${column.name}`" :disabled="editing.isNull" @keydown="onEditorKeydown" />
                 <button class="btn sm" type="button" :disabled="!column.nullable" @click="editing.isNull = true">设为 NULL</button>

@@ -249,3 +249,37 @@
 .grid-table th.row-number { z-index: 3; }
 .cell-btn.selected { background: var(--sel); }
 .grid-table .sort-arrow { margin-left: auto; color: var(--accent-text); }
+
+/* ---------- 列宽拖拽 ---------- */
+/* th 已是 position: sticky（本身就是定位上下文），不再覆写 position: relative 以免破坏吸顶。 */
+.col-grip {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  width: 7px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 2;
+  touch-action: none;
+}
+.col-grip:hover::after,
+.col-grip:focus-visible::after {
+  content: "";
+  position: absolute;
+  inset: 0 2px;
+  background: var(--accent);
+}
+/* th 有 overflow: hidden（省略号），浮层不能伸出 th 之外，否则会被裁掉不可见。 */
+.col-width-tip {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  z-index: var(--z-float);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
