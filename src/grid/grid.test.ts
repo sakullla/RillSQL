@@ -1809,3 +1809,242 @@ describe("DataGrid desktop selection", () => {
     wrapper.unmount();
   });
 });
+
+describe("QueryResultGrid desktop selection", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    resetExportTasks();
+    resetCloseGuard();
+    resetCatalog();
+    localStorage.removeItem("rillsql.shell");
+  });
+
+  function selectionModel() {
+    return gridModel({
+      columns: ["id", "name", "email", "note"],
+      rows: [
+        ["1", "客户1", "a@example.com", null],
+        ["2", "客户2", "b@example.com", ""],
+        ["3", "客户3", "c@example.com", "备注3"],
+      ],
+    });
+  }
+
+  async function mountQueryGrid(options: { attach?: boolean } = {}) {
+    const model = selectionModel();
+    const wrapper = mount(QueryResultGrid, {
+      props: {
+        tabId: "query-selection",
+        statement: "SELECT id, name, email, note FROM customers JOIN orders ON orders.id = customers.id",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+      },
+      ...(options.attach ? { attachTo: document.body } : {}),
+    });
+    await flushPromises();
+    expect(wrapper.attributes("data-editable")).toBe("false");
+    return wrapper;
+  }
+
+  function pointer(target: Element, init: { shift?: boolean; ctrl?: boolean } = {}) {
+    target.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true, shiftKey: !!init.shift, ctrlKey: !!init.ctrl }));
+  }
+
+  type QuerySelectionWrapper = Awaited<ReturnType<typeof mountQueryGrid>>;
+
+  function gridKey(wrapper: QuerySelectionWrapper, key: string, init: { shiftKey?: boolean; ctrlKey?: boolean } = {}) {
+    wrapper.get(".grid-scroll").element.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, ...init }));
+  }
+
+  function selectedCells(wrapper: QuerySelectionWrapper): (string | undefined)[] {
+    return wrapper.findAll("button.cell-btn.selected").map((cell) => cell.attributes("data-cell"));
+  }
+
+  function focusDataCell(wrapper: QuerySelectionWrapper): string | undefined | null {
+    const on = wrapper.find("button.cell-btn.on");
+    return on.exists() ? on.attributes("data-cell") : null;
+  }
+
+  it("selects every cell of the row when its row number is clicked", async () => {
+    const wrapper = await mountQueryGrid();
+    pointer(wrapper.get('tr[data-row-id="r0"] td.row-number').element);
+    await nextTick();
+    const cells = wrapper.findAll('tr[data-row-id="r0"] button.cell-btn');
+    expect(cells).toHaveLength(4);
+    expect(cells.filter((cell) => cell.classes().includes("selected"))).toHaveLength(3);
+    expect(focusDataCell(wrapper)).toBe("r0:note");
+    expect(selectedCells(wrapper)).not.toContain("r0:note");
+    expect(wrapper.findAll('tr[data-row-id="r1"] button.cell-btn.selected')).toHaveLength(0);
+    expect(wrapper.find(".inspector").exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("selects every cell of the column when its header is clicked", async () => {
+    const wrapper = await mountQueryGrid();
+    pointer(wrapper.get("thead th:nth-child(2)").element);
+    await nextTick();
+    expect(selectedCells(wrapper).sort()).toEqual(["r0:id", "r1:id"]);
+    expect(focusDataCell(wrapper)).toBe("r2:id");
+    wrapper.unmount();
+  });
+
+  it("selects a rectangle from the anchor with shift click", async () => {
+    const wrapper = await mountQueryGrid();
+    pointer(wrapper.get('[data-cell="r0:id"]').element);
+    await nextTick();
+    pointer(wrapper.get('[data-cell="r1:name"]').element, { shift: true });
+    await nextTick();
+    expect(selectedCells(wrapper).sort()).toEqual(["r0:id", "r0:name", "r1:id"]);
+    expect(focusDataCell(wrapper)).toBe("r1:name");
+    wrapper.unmount();
+  });
+
+  it("adds and removes cells with ctrl click", async () => {
+    const wrapper = await mountQueryGrid();
+    pointer(wrapper.get('[data-cell="r0:id"]').element);
+    await nextTick();
+    pointer(wrapper.get('[data-cell="r0:name"]').element, { ctrl: true });
+    await nextTick();
+    pointer(wrapper.get('[data-cell="r1:id"]').element, { ctrl: true });
+    await nextTick();
+    expect(selectedCells(wrapper).sort()).toEqual(["r0:name", "r1:id"]);
+    expect(focusDataCell(wrapper)).toBe("r0:id");
+    pointer(wrapper.get('[data-cell="r0:name"]').element, { ctrl: true });
+    await nextTick();
+    expect(selectedCells(wrapper)).toEqual(["r1:id"]);
+    expect(focusDataCell(wrapper)).toBe("r0:id");
+    wrapper.unmount();
+  });
+
+  it("selects all loaded rows with Ctrl+A and copies them as TSV with headers", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const wrapper = await mountQueryGrid();
+    gridKey(wrapper, "a", { ctrlKey: true });
+    await nextTick();
+    expect(wrapper.findAll("button.cell-btn")).toHaveLength(12);
+    expect(selectedCells(wrapper)).toHaveLength(11);
+    expect(focusDataCell(wrapper)).toBe("r2:note");
+    gridKey(wrapper, "c", { ctrlKey: true });
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledTimes(1);
+    const tsv = String(writeText.mock.calls[0]?.[0]);
+    const lines = tsv.split("\n");
+    expect(lines[0]).toBe("id\tname\temail\tnote");
+    expect(lines).toHaveLength(4);
+    expect(tsv).toContain("客户1");
+    expect(tsv).toContain("客户3");
+    expect(tsv).toContain("NULL");
+    wrapper.unmount();
+  });
+
+  it("copies a single selected cell as its plain value without headers", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const wrapper = await mountQueryGrid();
+    pointer(wrapper.get('[data-cell="r1:name"]').element);
+    await nextTick();
+    gridKey(wrapper, "c", { ctrlKey: true });
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText.mock.calls[0]?.[0]).toBe("客户2");
+    wrapper.unmount();
+  });
+
+  it("moves the focus with arrow keys and extends the anchor with shift", async () => {
+    const wrapper = await mountQueryGrid();
+    pointer(wrapper.get('[data-cell="r0:id"]').element);
+    await nextTick();
+    gridKey(wrapper, "ArrowDown");
+    await nextTick();
+    expect(focusDataCell(wrapper)).toBe("r1:id");
+    expect(selectedCells(wrapper)).toHaveLength(0);
+    gridKey(wrapper, "ArrowDown", { shiftKey: true });
+    await nextTick();
+    expect(focusDataCell(wrapper)).toBe("r2:id");
+    expect(selectedCells(wrapper)).toEqual(["r1:id"]);
+    wrapper.unmount();
+  });
+
+  it("clears the selection and closes the inspector with Escape when not editing", async () => {
+    const wrapper = await mountQueryGrid();
+    pointer(wrapper.get('[data-cell="r0:id"]').element);
+    await nextTick();
+    pointer(wrapper.get('[data-cell="r1:name"]').element, { shift: true });
+    await nextTick();
+    expect(selectedCells(wrapper).length).toBeGreaterThan(0);
+    expect(focusDataCell(wrapper)).toBe("r1:name");
+    expect(wrapper.find(".inspector").exists()).toBe(true);
+    gridKey(wrapper, "Escape");
+    await nextTick();
+    expect(selectedCells(wrapper)).toHaveLength(0);
+    expect(focusDataCell(wrapper)).toBeNull();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("focuses the find input with Ctrl+F", async () => {
+    const wrapper = await mountQueryGrid({ attach: true });
+    const input = wrapper.get("[aria-label='在已读取行中查找']").element as HTMLInputElement;
+    expect(document.activeElement).not.toBe(input);
+    gridKey(wrapper, "f", { ctrlKey: true });
+    expect(document.activeElement).toBe(input);
+    expect(input.selectionStart).toBe(0);
+    expect(input.selectionEnd).toBe(input.value.length);
+    wrapper.unmount();
+  });
+
+  it("copies cells of a read-only result without an edit session", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const wrapper = await mountQueryGrid();
+    pointer(wrapper.get('tr[data-row-id="r0"] td.row-number').element);
+    await nextTick();
+    expect(selectedCells(wrapper)).toHaveLength(3);
+    expect(focusDataCell(wrapper)).toBe("r0:note");
+    gridKey(wrapper, "c", { ctrlKey: true });
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledTimes(1);
+    const tsv = String(writeText.mock.calls[0]?.[0]);
+    expect(tsv.split("\n")[0]).toBe("id\tname\temail\tnote");
+    expect(tsv).toContain("客户1");
+    wrapper.unmount();
+  });
+
+  it("edits the focus cell with Enter and cancels with Escape back on the cell", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      throw new Error(command);
+    });
+    const model = selectionModel();
+    const wrapper = mount(QueryResultGrid, {
+      props: {
+        tabId: "query-selection-edit",
+        statement: "SELECT id, name, email, note FROM public.customers",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+        schema: "public",
+      },
+    });
+    await flushPromises();
+    expect(wrapper.attributes("data-editable")).toBe("true");
+    pointer(wrapper.get('[data-cell="r1:name"]').element);
+    await nextTick();
+    gridKey(wrapper, "Enter");
+    await nextTick();
+    const input = wrapper.get("input[aria-label='编辑 name']");
+    expect(input.element.closest("tr")?.getAttribute("data-row-id")).toBe("r1");
+    await input.setValue("改到一半");
+    await input.trigger("keydown", { key: "Escape" });
+    expect(wrapper.find("input[aria-label='编辑 name']").exists()).toBe(false);
+    expect(wrapper.get('[data-cell="r1:name"]').text()).toBe("客户2");
+    expect(focusDataCell(wrapper)).toBe("r1:name");
+    expect(wrapper.find(".pending-bar").exists()).toBe(false);
+    wrapper.unmount();
+  });
+});

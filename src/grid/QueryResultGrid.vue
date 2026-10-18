@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, reactive, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from "vue";
 import { catalogConnections } from "../catalog/store";
 import { registerPending } from "../shell/close-guard";
 import ExportDialog from "../export/ExportDialog.vue";
@@ -16,6 +16,18 @@ import "./grid.css";
 import { loadSettings } from "../shell/settings";
 import { locateResultRows, provedEditableColumns, readSingleTable, resolveEditableTable, ResultEditSession, type TableHit } from "./result-edit";
 import type { Cell, Column, Engine, Row, SortSpec } from "./types";
+import {
+  applyMove,
+  applyPointer,
+  cellKey,
+  emptySelection,
+  isCellSelected,
+  selectAllRows,
+  selectionToTsv,
+  type CellAddr,
+  type GridSelection,
+  type MoveKey,
+} from "./selection";
 
 const props = defineProps<{
   tabId: string;
@@ -34,6 +46,8 @@ const sort = ref<SortSpec | null>(null);
 const exportOpen = ref(false);
 const exportMessage = ref("");
 const selected = ref<{ row: string; column: string; value: Cell } | null>(null);
+const selection = ref<GridSelection>({ ...emptySelection });
+const rootEl = ref<HTMLElement | null>(null);
 const copyMessage = ref("");
 const reason = ref("只读");
 const insertTarget = ref<InsertTarget | null>(null);
@@ -141,7 +155,7 @@ const sourceRows = computed(() => {
   });
 });
 const view = computed(() => viewLoadedRows(sourceRows.value, props.columns, find.value, sort.value));
-const { viewport, range, onScroll, reset } = useRowWindow(computed(() => view.value.rows.length));
+const { viewport, range, onScroll, reset, reveal } = useRowWindow(computed(() => view.value.rows.length));
 const visibleRows = computed(() => view.value.rows.slice(range.value.start, range.value.end).map((row, index) => ({
   id: row.id,
   number: range.value.start + index + 1,
@@ -151,7 +165,12 @@ const visibleRows = computed(() => view.value.rows.slice(range.value.start, rang
   failure: [editSession.value?.failures.get(`u:${row.id}`), editSession.value?.failures.get(`d:${row.id}`)].filter(Boolean).join("\n"),
   cells: props.columns.map((column) => showCell(row.cells[column.name] ?? null)),
 })));
-watch([find, sort, () => props.rows], reset);
+watch([find, sort, () => props.rows, () => props.columns], () => {
+  reset();
+  // 行列或过滤变化后行下标失锚，清空选区防止幽灵选中。
+  selection.value = { ...emptySelection };
+  selected.value = null;
+});
 
 const commitFailures = computed(() => (editSession.value ? Array.from(editSession.value.failures, ([id, message]) => ({ id, message })) : []));
 const pendingVisible = computed(() => !!editSession.value && (editSession.value.pendingCount > 0 || editSession.value.failures.size > 0));
@@ -184,13 +203,279 @@ watch(
 );
 onBeforeUnmount(releaseCellPending);
 
-function inspect(rowId: string, index: number) {
+function addrOf(rowId: string, colName: string): CellAddr | null {
+  const rowIndex = view.value.rows.findIndex((row) => row.id === rowId);
+  const colIndex = props.columns.findIndex((column) => column.name === colName);
+  if (rowIndex < 0 || colIndex < 0) return null;
+  return { rowIndex, colIndex };
+}
+
+function rowIdAt(rowIndex: number): string | null {
+  return view.value.rows[rowIndex]?.id ?? null;
+}
+
+function columnNameAt(colIndex: number): string | null {
+  return props.columns[colIndex]?.name ?? null;
+}
+
+function rawCellValue(rowId: string, colName: string): Cell {
   const row = view.value.rows.find((item) => item.id === rowId);
-  const column = props.columns[index];
-  if (!row || !column) return;
-  selected.value = { row: rowId, column: column.name, value: editSession.value?.cellValue(rowId, column.name) ?? row.cells[column.name] ?? null };
-  editSession.value?.select(rowId, column.name);
+  return row?.cells[colName] ?? null;
+}
+
+function cellSelector(rowId: string, colName: string): string {
+  return `[data-cell="${CSS.escape(rowId)}:${CSS.escape(colName)}"]`;
+}
+
+function focusCell(rowId: string, colName: string) {
+  const index = view.value.rows.findIndex((row) => row.id === rowId);
+  if (index >= 0) reveal(index);
+  void nextTick(() => {
+    (viewport.value?.querySelector(cellSelector(rowId, colName)) as HTMLElement | null)?.focus();
+  });
+}
+
+/** 选区焦点 → 值查看器观察的选中格；没有焦点时收起查看器。 */
+function syncSelectionToState() {
+  const focus = selection.value.focus;
+  const rowId = focus ? rowIdAt(focus.rowIndex) : null;
+  const colName = focus ? columnNameAt(focus.colIndex) : null;
+  if (!rowId || !colName) {
+    selected.value = null;
+    return;
+  }
+  selected.value = { row: rowId, column: colName, value: rawCellValue(rowId, colName) };
+  editSession.value?.select(rowId, colName);
   copyMessage.value = "";
+}
+
+function syncFocusFromSelection() {
+  syncSelectionToState();
+  const focus = selection.value.focus;
+  const rowId = focus ? rowIdAt(focus.rowIndex) : null;
+  const colName = focus ? columnNameAt(focus.colIndex) : null;
+  if (rowId && colName) focusCell(rowId, colName);
+}
+
+function cellClasses(rowId: string, colName: string): { on?: boolean; selected?: boolean } {
+  const addr = addrOf(rowId, colName);
+  if (!addr) return {};
+  const focus = selection.value.focus;
+  if (focus && focus.rowIndex === addr.rowIndex && focus.colIndex === addr.colIndex) return { on: true };
+  return { selected: isCellSelected(selection.value, addr, view.value.rows.length, props.columns.length) };
+}
+
+function currentCellIndex(): number {
+  const focus = selection.value.focus;
+  const colCount = props.columns.length;
+  if (!focus || !colCount) return -1;
+  return focus.rowIndex * colCount + focus.colIndex;
+}
+
+/** Tab / Shift+Tab：按桌面习惯在单元格间移动选中，越过边界时循环。 */
+function moveSelection(delta: number) {
+  const rows = view.value.rows;
+  const cols = props.columns;
+  if (!rows.length || !cols.length) return;
+  const total = rows.length * cols.length;
+  let index = currentCellIndex();
+  if (index < 0) index = delta > 0 ? -1 : 0;
+  index = (index + delta + total) % total;
+  const rowIndex = Math.floor(index / cols.length);
+  const colIndex = index % cols.length;
+  selection.value = { anchor: { rowIndex, colIndex }, focus: { rowIndex, colIndex }, extras: "", allRows: false };
+  syncFocusFromSelection();
+}
+
+function pointerModifiers(event: PointerEvent): { shift: boolean; ctrl: boolean } {
+  return { shift: event.shiftKey, ctrl: event.ctrlKey || event.metaKey };
+}
+
+/** 当前选区展开后的格集合（矩形/allRows/extras 都算）。 */
+function selectionKeySet(): Set<string> {
+  const rowCount = view.value.rows.length;
+  const colCount = props.columns.length;
+  const keys = new Set<string>();
+  for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+    for (let colIndex = 0; colIndex < colCount; colIndex += 1) {
+      if (isCellSelected(selection.value, { rowIndex, colIndex }, rowCount, colCount)) {
+        keys.add(cellKey({ rowIndex, colIndex }));
+      }
+    }
+  }
+  return keys;
+}
+
+/** 把选区塌缩为 extras 集合（去掉矩形/allRows），行列 Ctrl 减选依赖它。 */
+function applyExtrasSet(keys: Set<string>) {
+  const extras = [...keys]
+    .sort((a, b) => {
+      const [aRow, aCol] = a.split(":").map(Number);
+      const [bRow, bCol] = b.split(":").map(Number);
+      return aRow - bRow || aCol - bCol;
+    })
+    .join(",");
+  const focusKey = selection.value.focus ? cellKey(selection.value.focus) : null;
+  let focus: CellAddr | null = null;
+  if (focusKey && keys.has(focusKey)) {
+    focus = { ...selection.value.focus! };
+  } else if (extras) {
+    const [rowIndex, colIndex] = extras.split(",")[0]!.split(":").map(Number);
+    focus = { rowIndex, colIndex };
+  }
+  selection.value = { anchor: null, focus, extras, allRows: false };
+  syncFocusFromSelection();
+}
+
+function toggleKey(keys: Set<string>, cell: CellAddr): void {
+  const key = cellKey(cell);
+  if (keys.has(key)) keys.delete(key);
+  else keys.add(key);
+}
+
+function onCellPointer(event: PointerEvent, rowId: string, colName: string) {
+  const addr = addrOf(rowId, colName);
+  if (!addr) return;
+  selection.value = applyPointer(selection.value, addr, pointerModifiers(event));
+  syncFocusFromSelection();
+}
+
+/** pointerdown 被 prevent 后部分环境只剩 click；无修饰的纯单击按单选补齐，有修饰时以选区焦点为准。 */
+function onCellClick(rowId: string, colName: string) {
+  if (!selection.value.focus) {
+    const addr = addrOf(rowId, colName);
+    if (addr) selection.value = applyPointer({ ...emptySelection }, addr, { shift: false, ctrl: false });
+  }
+  syncFocusFromSelection();
+}
+
+/** 行号：无修饰选中整行；Shift 从锚点连到行尾；Ctrl 把整行从当前选区加/减掉。 */
+function onRowNumberPointer(event: PointerEvent, rowId: string) {
+  const rowIndex = view.value.rows.findIndex((row) => row.id === rowId);
+  const lastCol = props.columns.length - 1;
+  if (rowIndex < 0 || lastCol < 0) return;
+  const mods = pointerModifiers(event);
+  if (mods.ctrl) {
+    const keys = selectionKeySet();
+    for (let colIndex = 0; colIndex <= lastCol; colIndex += 1) {
+      toggleKey(keys, { rowIndex, colIndex });
+    }
+    applyExtrasSet(keys);
+  } else if (mods.shift) {
+    selection.value = applyPointer(selection.value, { rowIndex, colIndex: lastCol }, { shift: true, ctrl: false });
+    syncFocusFromSelection();
+  } else {
+    selection.value = applyPointer(selection.value, { rowIndex, colIndex: 0 }, { shift: false, ctrl: false });
+    selection.value = applyPointer(selection.value, { rowIndex, colIndex: lastCol }, { shift: true, ctrl: false });
+    syncFocusFromSelection();
+  }
+}
+
+/** 表头：无修饰选中整列；Shift 从锚点连到列尾；Ctrl 把整列从当前选区加/减掉。 */
+function onHeaderPointer(event: PointerEvent, colName: string) {
+  const colIndex = props.columns.findIndex((column) => column.name === colName);
+  const lastRow = view.value.rows.length - 1;
+  if (colIndex < 0 || lastRow < 0) return;
+  const mods = pointerModifiers(event);
+  if (mods.ctrl) {
+    const keys = selectionKeySet();
+    for (let rowIndex = 0; rowIndex <= lastRow; rowIndex += 1) {
+      toggleKey(keys, { rowIndex, colIndex });
+    }
+    applyExtrasSet(keys);
+  } else if (mods.shift) {
+    selection.value = applyPointer(selection.value, { rowIndex: lastRow, colIndex }, { shift: true, ctrl: false });
+    syncFocusFromSelection();
+  } else {
+    selection.value = applyPointer(selection.value, { rowIndex: 0, colIndex }, { shift: false, ctrl: false });
+    selection.value = applyPointer(selection.value, { rowIndex: lastRow, colIndex }, { shift: true, ctrl: false });
+    syncFocusFromSelection();
+  }
+}
+
+async function copySelectionTsv() {
+  if (!view.value.rows.length || !props.columns.length) return;
+  const settings = loadSettings();
+  const selectedKeys = selectionKeySet();
+  // 单格复制纯值（不带表头/TSV），多格才按 TSV 导出。
+  if (selectedKeys.size === 1) {
+    const [key] = selectedKeys;
+    const [rowIndex, colIndex] = key!.split(":").map(Number);
+    const row = view.value.rows[rowIndex];
+    const column = props.columns[colIndex];
+    if (!row || !column) return;
+    try {
+      await navigator.clipboard.writeText(copyPlain(rawCellValue(row.id, column.name), settings.nullCopy));
+      copyMessage.value = "已复制";
+    } catch {
+      copyMessage.value = "复制失败，请在值查看器中选中文本复制。";
+    }
+    return;
+  }
+  if (!selectedKeys.size) return;
+  const tsv = selectionToTsv(selection.value, {
+    headers: settings.tsvHeaders,
+    columnNames: props.columns.map((column) => column.name),
+    cellAt: (rowIndex, colIndex) => {
+      const row = view.value.rows[rowIndex];
+      const column = props.columns[colIndex];
+      if (!row || !column) return null;
+      return rawCellValue(row.id, column.name);
+    },
+    nullText: settings.nullCopy === "empty" ? "" : settings.nullCopy === "N" ? "\\N" : "NULL",
+  });
+  if (!tsv) return;
+  try {
+    await navigator.clipboard.writeText(tsv);
+    copyMessage.value = "已复制为 TSV";
+  } catch {
+    copyMessage.value = "复制失败，请在值查看器中选中文本复制。";
+  }
+}
+
+/** 未编辑时：方向键移动/Shift 扩展，Enter/F2 编辑焦点格，Tab 移动，Ctrl+A 全选，Ctrl+C 复制，Ctrl+F 查找，Esc 清除选择。 */
+function onGridKeydown(event: KeyboardEvent) {
+  if (editing.value) return;
+  const rows = view.value.rows;
+  const cols = props.columns;
+  const moveKeys: MoveKey[] = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"];
+  if (moveKeys.includes(event.key as MoveKey)) {
+    event.preventDefault();
+    selection.value = applyMove(selection.value, event.key as MoveKey, event.shiftKey, rows.length, cols.length);
+    syncFocusFromSelection();
+  } else if (event.key === "Enter" || event.key === "F2") {
+    const focus = selection.value.focus;
+    const rowId = focus ? rowIdAt(focus.rowIndex) : null;
+    const colName = focus ? columnNameAt(focus.colIndex) : null;
+    if (editSession.value && rowId && colName) {
+      event.preventDefault();
+      beginEdit(rowId, colName);
+    }
+  } else if (event.key === "Tab") {
+    event.preventDefault();
+    moveSelection(event.shiftKey ? -1 : 1);
+  } else if ((event.ctrlKey || event.metaKey) && (event.key === "a" || event.key === "A")) {
+    event.preventDefault();
+    selection.value = selectAllRows(rows.length, cols.length);
+    syncFocusFromSelection();
+  } else if ((event.ctrlKey || event.metaKey) && (event.key === "c" || event.key === "C")) {
+    event.preventDefault();
+    void copySelectionTsv();
+  } else if ((event.ctrlKey || event.metaKey) && (event.key === "f" || event.key === "F")) {
+    event.preventDefault();
+    const input = rootEl.value?.querySelector('input[aria-label="在已读取行中查找"]') as HTMLInputElement | null;
+    input?.focus();
+    input?.select();
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    selection.value = { ...emptySelection };
+    selected.value = null;
+    copyMessage.value = "";
+    if (editSession.value) {
+      editSession.value.selectedId = null;
+      editSession.value.selectedColumn = null;
+    }
+  }
 }
 
 function beginEdit(id: string, column: string) {
@@ -199,7 +484,13 @@ function beginEdit(id: string, column: string) {
   if (!session || !row?.located || session.deletes.includes(id) || !session.canEditColumn(column)) return;
   const current = session.cellValue(id, column);
   editing.value = { id, column, draft: current ?? "", isNull: current === null };
-  session.select(id, column);
+  const addr = addrOf(id, column);
+  if (addr) {
+    selection.value = { anchor: { ...addr }, focus: { ...addr }, extras: "", allRows: false };
+    syncSelectionToState();
+  } else {
+    session.select(id, column);
+  }
 }
 
 function saveEdit() {
@@ -209,6 +500,31 @@ function saveEdit() {
   session.stageUpdate(edit.id, edit.column, edit.isNull ? null : edit.draft);
   editing.value = null;
   receipt.value = null;
+  focusCell(edit.id, edit.column);
+}
+
+function cancelEdit() {
+  const edit = editing.value;
+  editing.value = null;
+  if (edit) focusCell(edit.id, edit.column);
+}
+
+/** 编辑中：Enter 保存，Esc 取消，Tab 保存并移到下一个单元格。 */
+function onEditorKeydown(event: KeyboardEvent) {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    event.stopPropagation();
+    saveEdit();
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    cancelEdit();
+  } else if (event.key === "Tab") {
+    event.preventDefault();
+    event.stopPropagation();
+    saveEdit();
+    moveSelection(event.shiftKey ? -1 : 1);
+  }
 }
 
 function cycle(column: string) {
@@ -331,12 +647,10 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
   }).then(({ result }) => { exportMessage.value = result.message; });
   exportOpen.value = false;
 }
-
-watch(() => props.rows, () => { selected.value = null; });
 </script>
 
 <template>
-  <div class="data-grid" aria-label="查询结果" :data-tab-id="tabId" data-scope="loaded" :data-editable="editSession ? 'true' : 'false'">
+  <div ref="rootEl" class="data-grid" aria-label="查询结果" :data-tab-id="tabId" data-scope="loaded" :data-editable="editSession ? 'true' : 'false'">
     <div class="result-toolbar">
       <input v-model="find" aria-label="在已读取行中查找" placeholder="在已读取行中查找" />
       <span class="toolbar-hint" :title="`查找和排序${view.note}，不会查询数据库。`">在已读取的 {{ rows.length }} 行中查找和排序</span>
@@ -347,12 +661,12 @@ watch(() => props.rows, () => { selected.value = null; });
     </div>
     <p v-if="exportMessage" class="grid-hint" role="status">{{ exportMessage }}</p>
     <p v-if="receipt" class="grid-hint" role="status">{{ receipt }}</p>
-    <div ref="viewport" class="grid-scroll" @scroll.passive="onScroll">
+    <div ref="viewport" class="grid-scroll" @scroll.passive="onScroll" @keydown="onGridKeydown">
       <table class="grid-table" :aria-rowcount="view.rows.length + 1">
         <thead>
           <tr>
             <th class="row-number" aria-label="行号">#</th>
-            <th v-for="column in columns" :key="column.name" :aria-sort="sort?.column === column.name ? (sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'">
+            <th v-for="column in columns" :key="column.name" :aria-sort="sort?.column === column.name ? (sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'" @pointerdown.prevent="onHeaderPointer($event, column.name)">
               <button class="th-btn" type="button" :aria-label="`仅对已读取行按 ${column.name} 排序`" @click="cycle(column.name)">{{ column.name }}<span v-if="sort?.column === column.name" class="sort-arrow">{{ sort.direction === 'asc' ? '↑' : '↓' }}</span></button>
             </th>
           </tr>
@@ -360,16 +674,16 @@ watch(() => props.rows, () => { selected.value = null; });
         <tbody>
           <tr v-if="range.top" class="virtual-spacer" aria-hidden="true"><td :colspan="columns.length + 1" :style="{ height: `${range.top}px` }"></td></tr>
           <tr v-for="row in visibleRows" :key="row.id" :data-row-id="row.id" :aria-rowindex="row.number + 1" :class="{ 'row-delete': row.deleted, 'row-failed': row.failed }" :title="row.failure || undefined">
-            <td class="row-number">{{ row.number }}<span v-if="row.deleted" class="row-flag del">将删除</span></td>
+            <td class="row-number" @pointerdown.prevent="onRowNumberPointer($event, row.id)">{{ row.number }}<span v-if="row.deleted" class="row-flag del">将删除</span></td>
             <td v-for="(cell, index) in row.cells" :key="index">
               <div v-if="editing && editing.id === row.id && editing.column === columns[index]?.name" class="editor">
-                <input v-model="editing.draft" :aria-label="`编辑 ${columns[index]?.name}`" :disabled="editing.isNull" @keydown.enter.prevent="saveEdit" />
+                <input v-model="editing.draft" :aria-label="`编辑 ${columns[index]?.name}`" :disabled="editing.isNull" @keydown="onEditorKeydown" />
                 <button class="btn sm" type="button" :disabled="columns[index] ? !((editSession?.schema.columns.find(item => item.name === columns[index]?.name)?.nullable) ?? true) : false" @click="editing.isNull = true">设为 NULL</button>
                 <button class="btn sm" type="button" @click="editing.isNull = false">空字符串</button>
                 <button class="btn sm primary" type="button" @click="saveEdit">确定</button>
-                <button class="btn sm ghost" type="button" @click="editing = null">取消</button>
+                <button class="btn sm ghost" type="button" @click="cancelEdit">取消</button>
               </div>
-              <button v-else class="cell-btn" :class="{ on: selected?.row === row.id && selected?.column === columns[index]?.name }" :data-cell="`${row.id}:${columns[index]?.name}`" @click="inspect(row.id, index)" @dblclick="beginEdit(row.id, columns[index]?.name ?? '')"><span :class="{ 'v-null': cell.kind === 'null', 'v-empty': cell.kind === 'empty', 'v-large': cell.kind === 'large' }">{{ cell.label }}</span></button>
+              <button v-else class="cell-btn" :class="cellClasses(row.id, columns[index]?.name ?? '')" :data-cell="`${row.id}:${columns[index]?.name}`" type="button" @pointerdown.prevent="onCellPointer($event, row.id, columns[index]?.name ?? '')" @click="onCellClick(row.id, columns[index]?.name ?? '')" @dblclick="beginEdit(row.id, columns[index]?.name ?? '')"><span :class="{ 'v-null': cell.kind === 'null', 'v-empty': cell.kind === 'empty', 'v-large': cell.kind === 'large' }">{{ cell.label }}</span></button>
             </td>
           </tr>
           <tr v-if="range.bottom" class="virtual-spacer" aria-hidden="true"><td :colspan="columns.length + 1" :style="{ height: `${range.bottom}px` }"></td></tr>
