@@ -324,6 +324,16 @@ describe("import and export choices", () => {
     expect(importDialog).not.toContain(".ex-body:has(.listbox.open)");
   });
 
+  it("follows the theme overlay token instead of a fixed mask color", () => {
+    const exportDialog = readFileSync(resolve("src/export/ExportDialog.vue"), "utf8");
+    const importDialog = readFileSync(resolve("src/export/ImportDialog.vue"), "utf8");
+    for (const source of [exportDialog, importDialog]) {
+      const overlay = source.match(/\.ex-overlay \{[^}]*\}/)?.[0] ?? "";
+      expect(overlay).toContain("background: var(--overlay)");
+      expect(overlay).not.toMatch(/rgba\(/);
+    }
+  });
+
   const target: TableTarget = { connectionId: "shop", database: "app", schema: "public", table: "customers", engine: "postgres" };
   const schema: TableSchema = {
     engine: "postgres",
