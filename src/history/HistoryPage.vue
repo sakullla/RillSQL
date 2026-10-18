@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, ref, shallowRef, watch } from "vue";
 import { catalogConnections } from "../catalog/store";
 import { queryHistory, queryHistoryClear, querySavedDelete, querySavedList, querySavedRename, querySavedSave } from "./api";
+import { ContextMenu, type MenuItem } from "../ui";
 import {
   elapsedLabel,
   filterHistory,
@@ -103,6 +104,50 @@ async function clearHistory() {
 
 function open(entry: HistoryEntry) {
   emit("open", openPlan(entry, knownIds.value));
+}
+
+const rowMenu = ref<{ x: number; y: number; entry: HistoryEntry } | null>(null);
+const rowMenuEl = ref<HTMLElement | null>(null);
+
+const rowMenuItems = computed<MenuItem[]>(() => {
+  const entry = rowMenu.value?.entry;
+  if (!entry) return [];
+  return [
+    { kind: "item", id: "load", label: "载入编辑器" },
+    { kind: "item", id: "copy-sql", label: "复制 SQL" },
+    { kind: "item", id: "details", label: "查看执行详情" },
+    { kind: "item", id: "filter-conn", label: `只看「${entry.connectionName}」` },
+  ];
+});
+
+function onCardContextMenu(event: MouseEvent, entry: HistoryEntry) {
+  const node = event.target;
+  if (!(node instanceof Element)) return;
+  const card = node.closest<HTMLElement>(".hist-card");
+  if (!card) return;
+  // 先聚焦触发行：菜单关闭时 ContextMenu 会把焦点还回来，键盘用户不掉焦点。
+  card.setAttribute("tabindex", "-1");
+  card.focus();
+  rowMenuEl.value = card;
+  rowMenu.value = { x: Math.max(8, event.clientX), y: Math.max(8, event.clientY), entry };
+}
+
+function onRowMenuSelect(id: string) {
+  const entry = rowMenu.value?.entry;
+  if (!entry) return;
+  if (id === "load") return open(entry);
+  if (id === "copy-sql") {
+    void navigator.clipboard.writeText(entry.sql).catch(() => undefined);
+    return;
+  }
+  if (id === "details") {
+    selectedId.value = entry.id;
+    return;
+  }
+  if (id === "filter-conn") {
+    // 下拉选项由历史里出现过的连接生成，当前条目的 connectionId 一定合法。
+    connectionId.value = entry.connectionId;
+  }
 }
 
 function messageOf(err: unknown, fallback: string): string {
@@ -258,7 +303,7 @@ onMounted(() => {
       <section v-for="group in groups" :key="group.key" class="hist-day">
         <h2>{{ group.label }}</h2>
         <ul class="hist-list">
-          <li v-for="entry in group.entries" :key="entry.id" class="hist-card" :class="{ selected: selected?.id === entry.id }">
+          <li v-for="entry in group.entries" :key="entry.id" class="hist-card" :class="{ selected: selected?.id === entry.id }" @contextmenu.prevent="onCardContextMenu($event, entry)">
             <div class="hist-top">
               <span class="badge" :class="statusBadge(entry.status)">{{ statusLabel(entry.status) }}</span>
               <strong class="hist-target">{{ entry.connectionName }} / {{ entry.databaseName || "main" }}</strong>
@@ -339,6 +384,16 @@ onMounted(() => {
         </ul>
       </section>
     </div>
+    <ContextMenu
+      :open="Boolean(rowMenu)"
+      :x="rowMenu?.x ?? 0"
+      :y="rowMenu?.y ?? 0"
+      :items="rowMenuItems"
+      :label="rowMenu ? `${rowMenu.entry.connectionName} 历史记录的操作` : '操作'"
+      :trigger="rowMenuEl"
+      @close="rowMenu = null"
+      @select="onRowMenuSelect"
+    />
   </div>
 </template>
 

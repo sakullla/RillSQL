@@ -1,5 +1,6 @@
 import { flushPromises, mount } from "@vue/test-utils";
-import { describe, expect, it } from "vitest";
+import { nextTick } from "vue";
+import { describe, expect, it, vi } from "vitest";
 import type { ConnectionApi, EnvTagInput, TestReport } from "./api";
 import ConnectionsPage from "./ConnectionsPage.vue";
 import { listPaletteConnections, MODULE_ID, replacePaletteConnections, setSqlitePicker } from "./index";
@@ -221,6 +222,46 @@ describe("connections page", () => {
     await wrapper.get("[data-action=confirm-delete]").trigger("click");
     await flushPromises();
     expect(wrapper.text()).toContain("数据库和其中的数据不受影响");
+    wrapper.unmount();
+  });
+
+  it("右键连接行出场景菜单：连接走行内同一路径，复制配置不含密码，删除标红", async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const api = pageApi(() => ({ status: "ok", stages: [] }));
+    const openSpy = vi.fn(api.open);
+    api.open = openSpy;
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api } });
+    await flushPromises();
+
+    const card = wrapper.get("article.conn-card");
+    card.element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 40, clientY: 60 }));
+    await nextTick();
+    const menu = document.body.querySelector('[role="menu"]');
+    expect(menu).toBeTruthy();
+    const ids = [...menu!.querySelectorAll('[role="menuitem"]')].map((item) => item.getAttribute("data-id"));
+    expect(ids).toEqual(expect.arrayContaining(["connect-or-open", "edit", "test", "copy", "workspace", "delete"]));
+    expect(menu!.querySelector('[data-id="delete"]')!.classList).toContain("danger");
+    // 未连接时「在工作区打开」不可用
+    expect(menu!.querySelector<HTMLButtonElement>('[data-id="workspace"]')!.disabled).toBe(true);
+
+    // 选「连接」与行内连接按钮同路径：api.open(id, secrets)
+    menu!.querySelector<HTMLButtonElement>('[data-id="connect-or-open"]')!.click();
+    await flushPromises();
+    expect(openSpy).toHaveBeenCalledTimes(1);
+    expect(openSpy.mock.calls[0]![0]).toBe("atlas");
+    expect(document.body.querySelector('[role="menu"]')).toBeNull();
+
+    // 复制配置：JSON 非空且不含任何密码字段
+    card.element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 40, clientY: 60 }));
+    await nextTick();
+    document.body.querySelector('[role="menu"] [data-id="copy"]')!.click();
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledTimes(1);
+    const payload = writeText.mock.calls[0]![0] as string;
+    expect(payload.length).toBeGreaterThan(0);
+    expect(payload).not.toMatch(/password|passphrase/i);
+    expect(JSON.parse(payload)).toMatchObject({ id: "atlas", host: "db.example.test" });
     wrapper.unmount();
   });
 

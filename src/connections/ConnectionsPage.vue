@@ -5,6 +5,7 @@ import { tauriConnectionApi, type ConnectionApi, type EnvTagInput, type TestRepo
 import ConnIcon from "./ConnIcon.vue";
 import EnvTagField from "./EnvTagField.vue";
 import { pickSqliteFile, replacePaletteConnections } from "./index";
+import { ContextMenu, type MenuItem } from "../ui";
 import {
   ENGINES,
   blankDraft,
@@ -81,6 +82,62 @@ function connectionState(id: string) {
 const connectedCount = computed(() => connections.value.filter(item => connectionState(item.id) === "connected").length);
 const stateLabels: Record<string, string> = { connected: "已连接", connecting: "正在连接…", disconnected: "未连接", error: "连接失败", lost: "连接中断" };
 const failedStage = computed(() => report.value?.stages.find((stage) => stage.status === "err") ?? null);
+
+const rowMenu = ref<{ x: number; y: number; item: SavedConnection } | null>(null);
+const rowMenuEl = ref<HTMLElement | null>(null);
+
+function onCardContextMenu(event: MouseEvent, item: SavedConnection) {
+  const node = event.target;
+  if (!(node instanceof Element)) return;
+  const card = node.closest<HTMLElement>(".conn-card");
+  if (!card) return;
+  // 先聚焦触发行：菜单关闭时 ContextMenu 会把焦点还回来，键盘用户不掉焦点。
+  card.setAttribute("tabindex", "-1");
+  card.focus();
+  rowMenuEl.value = card;
+  rowMenu.value = { x: Math.max(8, event.clientX), y: Math.max(8, event.clientY), item };
+}
+
+const rowMenuItems = computed<MenuItem[]>(() => {
+  const item = rowMenu.value?.item;
+  if (!item) return [];
+  const state = connectionState(item.id);
+  return [
+    { kind: "item", id: "connect-or-open", label: state === "connected" ? "打开" : "连接", disabled: state === "connecting" },
+    { kind: "item", id: "edit", label: "编辑配置…" },
+    { kind: "item", id: "test", label: "测试连接" },
+    { kind: "item", id: "copy", label: "复制配置", title: "不含密码" },
+    { kind: "item", id: "workspace", label: "在工作区打开", disabled: state !== "connected" },
+    { kind: "sep" },
+    { kind: "item", id: "delete", label: "删除…", danger: true },
+  ];
+});
+
+async function testFromRow(item: SavedConnection) {
+  // 复用编辑弹窗里的 runTest：预填配置、打开弹窗、立即跑一次，结果在弹窗里看。
+  openEditor(item);
+  await runTest();
+}
+
+function copyConfig(item: SavedConnection) {
+  const clean = Object.fromEntries(Object.entries(item).filter(([key]) => !/password|passphrase/i.test(key)));
+  void navigator.clipboard.writeText(JSON.stringify(clean, null, 2)).catch(() => undefined);
+}
+
+function onRowMenuSelect(id: string) {
+  const item = rowMenu.value?.item;
+  if (!item) return;
+  if (id === "connect-or-open") {
+    if (connectionState(item.id) === "connected") openWorkspace(item);
+    else requestConnect(item);
+    return;
+  }
+  if (id === "edit") return openEditor(item);
+  if (id === "test") return void testFromRow(item);
+  if (id === "copy") return copyConfig(item);
+  if (id === "workspace") return openWorkspace(item);
+  if (id === "delete") return askDelete(item);
+}
 
 const advancedHint = computed(() =>
   draft.value.engine === "sqlite" ? "环境标签——本地文件不需要 TLS 或 SSH" : "TLS 加密、SSH 跳板机、环境标签——直连时通常保持默认即可",
@@ -438,7 +495,7 @@ watch(
       <p v-if="loadError" class="page-note" role="alert">{{ loadError }}</p><p v-else-if="note" class="page-note" role="status">{{ note }}</p>
       <div class="conn-grid">
         <div class="connection-columns" aria-hidden="true"><span>连接 / 数据库</span><span>地址</span><span>传输与认证</span><span>状态 / 操作</span></div>
-        <article v-for="item in filtered" :key="item.id" class="conn-card" :class="`st-${connectionState(item.id)}`">
+        <article v-for="item in filtered" :key="item.id" class="conn-card" :class="`st-${connectionState(item.id)}`" @contextmenu.prevent="onCardContextMenu($event, item)">
           <header>
             <span class="eng lg" :class="`eng-${item.engine}`">{{ engineMeta(item.engine).short }}</span>
             <div class="cc-title"><h3>{{ item.name }}</h3><p>{{ engineMeta(item.engine).label }} <span class="env" :class="`env-${envView(item.env).tone}`">{{ envView(item.env).label }}</span></p></div>
@@ -656,5 +713,16 @@ watch(
         <div class="modal-foot"><button class="btn" type="button" @click="openEditor(detailTarget)">编辑配置</button><span class="grow"></span><button class="btn" type="button" @click="closeDialog(otherDialog)">关闭</button></div>
       </template>
     </dialog>
+
+    <ContextMenu
+      :open="Boolean(rowMenu)"
+      :x="rowMenu?.x ?? 0"
+      :y="rowMenu?.y ?? 0"
+      :items="rowMenuItems"
+      :label="rowMenu ? `${rowMenu.item.name} 的操作` : '操作'"
+      :trigger="rowMenuEl"
+      @close="rowMenu = null"
+      @select="onRowMenuSelect"
+    />
   </div>
 </template>

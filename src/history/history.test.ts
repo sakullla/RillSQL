@@ -1,4 +1,5 @@
 import { flushPromises, mount } from "@vue/test-utils";
+import { nextTick } from "vue";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { catalogFixture } from "../catalog/fixtures";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
@@ -127,6 +128,65 @@ describe("query history", () => {
     await flushPromises();
     expect(wrapper.find("[role='alert']").exists()).toBe(false);
     expect(wrapper.findAll("[data-action='open-history']")).toHaveLength(1);
+    wrapper.unmount();
+  });
+
+  it("右键历史条目：载入不执行、复制 SQL、查看详情、按连接筛选", async () => {
+    replaceCatalog(catalogFixture());
+    const rows = [
+      entry({}),
+      entry({ id: "h2", sql: "SELECT 1", connectionId: "shop", connectionName: "Shop", databaseName: "shop_staging", engine: "mysql", startedAt: "2026-10-13T09:00:00", status: "error", summary: "1 条语句失败" }),
+    ];
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "query_history") return rows;
+      throw new Error(command);
+    });
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const wrapper = mount(HistoryPage);
+    await flushPromises();
+
+    // 第二条挂在已知连接 shop 上，四条菜单项齐全
+    const card = wrapper.findAll(".hist-card")[1]!;
+    card.element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 40, clientY: 60 }));
+    await nextTick();
+    const menu = document.body.querySelector('[role="menu"]');
+    expect(menu).toBeTruthy();
+    const ids = [...menu!.querySelectorAll('[role="menuitem"]')].map((item) => item.getAttribute("data-id"));
+    expect(ids).toEqual(expect.arrayContaining(["load", "copy-sql", "details", "filter-conn"]));
+
+    // 载入编辑器：与「载入编辑器 ↗」一致，只载入不执行
+    menu!.querySelector<HTMLButtonElement>('[data-id="load"]')!.click();
+    await flushPromises();
+    const opened = wrapper.emitted("open")?.[0]?.[0] as { execute: boolean; needsTarget: boolean; sql: string };
+    expect(opened.execute).toBe(false);
+    expect(opened.needsTarget).toBe(false);
+    expect(opened.sql).toBe("SELECT 1");
+    expect(invoke.mock.calls.map((call) => call[0])).toEqual(["query_history"]);
+
+    // 复制 SQL
+    card.element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 40, clientY: 60 }));
+    await nextTick();
+    document.body.querySelector('[role="menu"] [data-id="copy-sql"]')!.click();
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledWith("SELECT 1");
+
+    // 查看执行详情：inspector 切到该条
+    card.element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 40, clientY: 60 }));
+    await nextTick();
+    document.body.querySelector('[role="menu"] [data-id="details"]')!.click();
+    await nextTick();
+    const inspector = wrapper.get(".history-inspector");
+    expect(inspector.text()).toContain("Shop");
+    expect(inspector.text()).toContain("SELECT 1");
+
+    // 按连接筛选：下拉值变为该条连接，列表只剩它的记录
+    card.element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 40, clientY: 60 }));
+    await nextTick();
+    document.body.querySelector('[role="menu"] [data-id="filter-conn"]')!.click();
+    await nextTick();
+    expect((wrapper.get("select[aria-label='按连接筛选']").element as HTMLSelectElement).value).toBe("shop");
+    expect(wrapper.findAll(".hist-card")).toHaveLength(1);
     wrapper.unmount();
   });
 });
