@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { currentCompletions, startCompletion } from "@codemirror/autocomplete";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
@@ -67,6 +69,13 @@ describe("query editing", () => {
     expect(QUERY_EDITOR_KEYS).not.toContain("Ctrl-Alt-N");
     expect(SHORTCUTS.find((item) => item.chord === "Mod+Enter")?.label).toBe("执行选中内容；无选中时执行光标所在语句");
     expect(SHORTCUTS.find((item) => item.chord === "Mod+Shift+Enter")?.label).toBe("只执行光标所在语句");
+  });
+
+  it("derives the editor-position chord hint from the shortcut table instead of hardcoding it", () => {
+    // 渲染层在 Windows 上同样是 Ctrl+Enter，DOM 断言分不出硬编码与查表；从源头断言
+    const source = readFileSync(resolve("src/query/QueryTab.vue"), "utf8");
+    expect(source).not.toContain("Ctrl+Enter 执行光标所在语句");
+    expect(source).not.toContain("Ctrl+Shift+Enter 执行当前语句");
   });
 
   it("completes from the selected target and withholds failed metadata", () => {

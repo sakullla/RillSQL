@@ -195,6 +195,23 @@ describe("ContextMenu", () => {
     wrapper.unmount();
   });
 
+  it("formats Mod chords for the current platform in the shortcut column", async () => {
+    // jsdom 在 Windows 上，detectMac() 为 false，Mod 应显示为 Ctrl
+    const wrapper = mount(ContextMenu, {
+      props: {
+        open: true,
+        x: 40,
+        y: 40,
+        items: [{ kind: "item", id: "new", label: "新建查询", shortcut: "Mod+T" }],
+      },
+      global: { stubs: { teleport: true } },
+      attachTo: document.body,
+    });
+    await nextTick();
+    expect(wrapper.get(".menu-key").text()).toBe("Ctrl+T");
+    wrapper.unmount();
+  });
+
   it("renders a check mark on checked items", async () => {
     const wrapper = mount(ContextMenu, {
       props: {

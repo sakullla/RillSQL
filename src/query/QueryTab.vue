@@ -17,6 +17,7 @@ import QueryResultGrid from "../grid/QueryResultGrid.vue";
 import type { Engine } from "../grid/types";
 import Icon from "../shell/Icon.vue";
 import { loadSettings } from "../shell/settings";
+import { chordByLabel, detectMac, formatChord } from "../shell/shortcuts";
 import { CONNECTION_STATUS_TEXT, type ConnectionStatus } from "../shell/status-text";
 import type { QueryAction, QueryTarget } from "../shell/session";
 import { ambiguousFieldNote, cachedColumns, fieldFailureNote, loadFields, qualifierFor, unknownFieldNote } from "./columns";
@@ -44,6 +45,11 @@ const emit = defineEmits<{
   "update:draft": [tabId: string, draft: string];
   target: [target: QueryTarget];
 }>();
+
+/** 提示里的按键文案从快捷键表推导，macOS 显示 ⌘ 而不是硬编码的 Ctrl。 */
+const mac = detectMac();
+const runChordText = formatChord(chordByLabel("执行选中内容；无选中时执行光标所在语句") ?? "Mod+Enter", mac);
+const runStatementChordText = formatChord(chordByLabel("只执行光标所在语句") ?? "Mod+Shift+Enter", mac);
 
 const editorPercent = ref(42);
 const cursor = ref({ line: 1, column: 1 });
@@ -256,7 +262,7 @@ async function sqlCompletion(context: CompletionContext) {
 function editorExtensions() {
   return [
     basicSetup,
-    placeholder("-- 在这里编写 SQL\n-- Ctrl+Enter 执行选中内容；无选中时执行光标所在语句"),
+    placeholder(`-- 在这里编写 SQL\n-- ${runChordText} 执行选中内容；无选中时执行光标所在语句`),
     sql(),
     syntaxHighlighting(HighlightStyle.define([
       { tag: tags.keyword, color: "var(--tk-kw)" },
@@ -663,7 +669,7 @@ onBeforeUnmount(() => {
     <p v-if="actionError" class="q-banner" role="alert">{{ actionError }}</p>
     <div class="editor-caption"><span><Icon name="code" /> SQL 编辑器</span><span class="q-hint" :data-keywords-only="hint.keywordsOnly" :title="hint.note">{{ hint.note }}</span><span class="mono">{{ buttonEngine ? engineMeta(buttonEngine).label : 'SQL' }}</span></div>
     <div ref="host" class="cm-host"></div>
-    <div class="editor-position"><span>{{ hasSelection ? '已选中 SQL · 执行将仅运行选中部分' : 'Ctrl+Enter 执行光标所在语句 · Ctrl+Shift+Enter 执行当前语句' }}</span><span class="mono">Ln {{ cursor.line }}, Col {{ cursor.column }}</span></div>
+    <div class="editor-position"><span>{{ hasSelection ? '已选中 SQL · 执行将仅运行选中部分' : `${runChordText} 执行光标所在语句 · ${runStatementChordText} 执行当前语句` }}</span><span class="mono">Ln {{ cursor.line }}, Col {{ cursor.column }}</span></div>
     <div class="query-splitter" role="separator" tabindex="0" aria-label="调整编辑器与结果区域高度" aria-orientation="horizontal" :aria-valuenow="editorPercent" :aria-valuemin="20" :aria-valuemax="70" @pointerdown="resizeEditor" @keydown.up.prevent="editorPercent = Math.max(20, editorPercent - 5)" @keydown.down.prevent="editorPercent = Math.min(70, editorPercent + 5)"><span></span></div>
     <section class="q-results" aria-label="执行结果">
       <div class="results-heading"><span><Icon name="table" />结果</span><span v-if="run" class="q-summary" :data-status="run.status">{{ summary }}</span><span v-else class="muted">等待执行</span><span class="grow"></span><span class="muted">只读结果</span></div>

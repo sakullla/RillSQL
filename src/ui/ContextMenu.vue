@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, toRef, watch } from "vue";
+import { detectMac, formatChord } from "../shell/shortcuts";
 import type { MenuItem } from "./types";
 import { useOutsideDismiss } from "./useOutsideDismiss";
 
@@ -18,6 +19,13 @@ const SEP_H = 9;
 const EDGE = 8;
 
 const menu = ref<HTMLElement | null>(null);
+
+const mac = detectMac();
+
+/** 菜单里展示的快捷键统一走 formatChord：调用方继续传 shortcuts.ts 的原始 chord（如 Mod+T）。 */
+function displayShortcut(chord: string): string {
+  return formatChord(chord, mac);
+}
 
 /** 关闭时把焦点还给打开菜单的元素，六个调用方不必各写一遍。 */
 let restoreTo: HTMLElement | null = null;
@@ -152,7 +160,7 @@ watch(
         >
           <span>{{ item.label }}</span>
           <svg v-if="item.checked" class="i check" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7" /></svg>
-          <span v-if="item.shortcut" class="menu-key">{{ item.shortcut }}</span>
+          <span v-if="item.shortcut" class="menu-key">{{ displayShortcut(item.shortcut) }}</span>
         </button>
       </template>
     </div>
