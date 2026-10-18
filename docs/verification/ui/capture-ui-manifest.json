@@ -1,8 +1,8 @@
 {
-  "capturedAt": "2026-10-17T10:44:29.138Z",
+  "capturedAt": "2026-10-18T05:37:04.695Z",
   "synthetic": true,
   "invocation": "node scripts/capture-ui.mjs",
-  "previewUrl": "http://localhost:1420",
+  "previewUrl": "http://localhost:1430",
   "matrix": {
     "themes": [
       "light",
