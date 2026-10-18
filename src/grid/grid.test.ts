@@ -2330,6 +2330,29 @@ describe("grid column width", () => {
     wrapper.unmount();
   });
 
+  /** jsdom 量不到布局，把首拖基线所需的实测宽度打桩到 th 上。 */
+  function stubThWidth(th: HTMLTableCellElement, width: number): void {
+    Object.defineProperty(th, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({ width, height: 0, x: 0, y: 0, top: 0, left: 0, right: width, bottom: 0, toJSON: () => ({}) }),
+    });
+  }
+
+  it("starts a first DataGrid drag from the measured column width, not the 48px floor", async () => {
+    const wrapper = await mountWidthDataGrid();
+    const { grip, th } = gripTh(wrapper);
+    expect(th.style.width).toBe("");
+    stubThWidth(th, 180);
+    fire(grip.element, "pointerdown", 100);
+    await nextTick();
+    fire(grip.element, "pointermove", 100);
+    await nextTick();
+    expect(th.style.width).toBe("180px");
+    fire(grip.element, "pointerup");
+    await nextTick();
+    wrapper.unmount();
+  });
+
   it("keeps a dragged query result column at least 48px wide and keeps it after release", async () => {
     const wrapper = mountWidthResultGrid();
     await flushPromises();
@@ -2371,6 +2394,22 @@ describe("grid column width", () => {
     fire(grip.element, "pointerup");
     await nextTick();
     expect(wrapper.find(".col-width-tip").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("starts a first query result drag from the measured column width, not the 48px floor", async () => {
+    const wrapper = mountWidthResultGrid();
+    await flushPromises();
+    const { grip, th } = gripTh(wrapper);
+    expect(th.style.width).toBe("");
+    stubThWidth(th, 180);
+    fire(grip.element, "pointerdown", 100);
+    await nextTick();
+    fire(grip.element, "pointermove", 100);
+    await nextTick();
+    expect(th.style.width).toBe("180px");
+    fire(grip.element, "pointerup");
+    await nextTick();
     wrapper.unmount();
   });
 });

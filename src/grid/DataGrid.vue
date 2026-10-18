@@ -377,9 +377,10 @@ function colStyle(name: string | undefined): { width: string } | undefined {
 
 function startColResize(event: PointerEvent, column: string) {
   const th = (event.currentTarget as HTMLElement | null)?.closest("th") as HTMLElement | null;
-  const fromTh = Number.parseFloat(th?.style.width ?? "");
   const stored = colWidths.value[column];
-  const startWidth = stored ?? (Number.isFinite(fromTh) ? fromTh : MIN_COL_WIDTH);
+  const inline = Number.parseFloat(th?.style.width ?? "");
+  const measured = th?.getBoundingClientRect().width || th?.offsetWidth || 0;
+  const startWidth = stored ?? (Number.isFinite(inline) && inline > 0 ? inline : (measured > 0 ? measured : MIN_COL_WIDTH));
   resizing.value = { column, width: startWidth, startX: event.clientX, startWidth };
   window.addEventListener("pointermove", moveColResize);
   window.addEventListener("pointerup", stopColResize);

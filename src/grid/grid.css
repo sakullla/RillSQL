@@ -277,7 +277,7 @@
   z-index: var(--z-float);
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: var(--r);
   padding: 2px 6px;
   font-size: 11px;
   font-variant-numeric: tabular-nums;
