@@ -64,7 +64,7 @@
 .page { background: var(--bg); }
 .page .page-inner { max-width: 1400px; padding: 36px 40px; }
 .page .page-head { align-items: center; margin-bottom: 28px; }
-.page .page-head h1 { margin-top: 8px; font-size: 26px; letter-spacing: -.03em; }
+.page .page-head h1 { margin-top: 8px; }
 .page .page-head p { font-size: 12px; color: var(--text-2); }
 .page .eyebrow { font: 10px var(--mono); letter-spacing: .09em; }
 .page .page-inner.narrow { max-width: 1100px; }
