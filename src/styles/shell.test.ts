@@ -26,7 +26,7 @@ describe("shell geometry", () => {
   });
 
   it("routes the rail through nav tokens instead of raw hex", () => {
-    expect(workbench).toContain("background: var(--nav-active)");
+    expect(workbench).toMatch(/\.app-root \.rail-btn\.active::before \{[^}]*background: var\(--nav-active\)/);
     expect(workbench).not.toMatch(/#61d3bc/);
   });
 
@@ -39,5 +39,6 @@ describe("shell geometry", () => {
     expect(query).toMatch(/\.query-pane \.q-toolbar \{[^}]*height: var\(--target-h\)/);
     expect(query).toMatch(/height: var\(--result-head-h\)/);
     expect(query).toMatch(/height: var\(--hint-h\)/);
+    expect(query).toMatch(/flex-wrap: nowrap/);
   });
 });

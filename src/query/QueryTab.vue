@@ -732,7 +732,7 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .query-pane { display: flex; flex-direction: column; flex: 1; min-height: 0; }
-.q-toolbar { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--line); }
+.q-toolbar { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: nowrap; padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--line); }
 .q-target { position: relative; min-width: 0; }
 .target-btn { display: flex; align-items: center; gap: var(--sp-2); height: var(--control-h); max-width: 420px; min-width: 0; padding: 0 var(--sp-2); border: 1px solid var(--line-2); border-radius: var(--r-md); background: var(--panel); font-size: var(--fs-sm); transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease); }
 .target-btn:hover:not(:disabled) { border-color: var(--text-3); }
@@ -789,7 +789,9 @@ onBeforeUnmount(() => {
 .q-sql { margin: 0; white-space: pre-wrap; font-family: var(--mono); font-size: var(--fs-xs); color: var(--text-2); }
 .q-cancel-detail { margin-top: var(--sp-3); padding-top: var(--sp-2); border-top: 1px solid var(--line); font-size: var(--fs-sm); color: var(--text-2); }
 .q-cancel-detail p { margin: 0 0 var(--sp-1); }
-.query-pane .q-toolbar { background: var(--panel); height: var(--target-h); min-height: var(--target-h); padding: 0 var(--sp-3); flex-wrap: nowrap; overflow: hidden; }
+.query-pane .q-toolbar { background: var(--panel); height: var(--target-h); min-height: var(--target-h); padding: 0 var(--sp-3); gap: var(--sp-2); flex-wrap: nowrap; overflow: hidden; }
+.query-pane .q-toolbar .btn,
+.query-pane .q-toolbar .run-group { flex-shrink: 0; }
 .editor-caption { display: flex; align-items: center; gap: 20px; padding: 9px 16px; background: var(--panel-2); border-bottom: 1px solid var(--line); font-size: 10px; color: var(--text-2); }
 .editor-caption > span:first-child { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
 .editor-caption .q-hint { flex: 1; font-size: 10px; padding: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
