@@ -10,7 +10,7 @@ import type { InsertTarget } from "../export/insert";
 import { catalogConnections } from "../catalog/store";
 import { registerPending } from "../shell/close-guard";
 import { loadSettings } from "../shell/settings";
-import { ContextMenu, type MenuItem } from "../ui";
+import { ContextMenu, Listbox, type ListboxOption, type MenuItem } from "../ui";
 import { copyPlain, copySqlValue, previewText, showCell, type NullCopy } from "./display";
 import { autofitWidth, clampColWidth, MIN_COL_WIDTH } from "./column-width";
 import { qualifiedName, updateSql, whereLocator } from "./sql";
@@ -62,6 +62,8 @@ watch(
 );
 const filterOp = ref<FilterOp>("eq");
 const filterValue = ref("");
+const filterColumnOptions = computed<ListboxOption[]>(() => columns.value.map((column) => ({ value: column.name, label: column.name })));
+const filterOpOptions: ListboxOption[] = FILTER_OPS.map((op) => ({ value: op.id, label: op.label }));
 const filterError = ref("");
 const exportOpen = ref(false);
 const importOpen = ref(false);
@@ -937,12 +939,8 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
     <div class="grid-toolbar">
       <span v-if="environmentLabel" class="env xs" data-env :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span>
       <form class="filter-form" @submit.prevent="applyFilter">
-        <select v-model="filterColumn" aria-label="筛选列">
-          <option v-for="column in columns" :key="column.name" :value="column.name">{{ column.name }}</option>
-        </select>
-        <select v-model="filterOp" aria-label="筛选条件">
-          <option v-for="op in FILTER_OPS" :key="op.id" :value="op.id">{{ op.label }}</option>
-        </select>
+        <Listbox v-model="filterColumn" :options="filterColumnOptions" aria-label="筛选列" />
+        <Listbox v-model="filterOp" :options="filterOpOptions" aria-label="筛选条件" />
         <input v-if="opNeedsValue(filterOp)" v-model="filterValue" aria-label="筛选值" />
         <button class="btn sm" type="submit">筛选</button>
       </form>

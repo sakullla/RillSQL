@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { flushPromises, mount } from "@vue/test-utils";
+import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { nextTick } from "vue";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
@@ -26,6 +26,15 @@ const invoke = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({
   invoke,
 }));
+
+/** 打开某个 Listbox 并点中目标选项；筛选不再走原生 select。 */
+async function chooseOption(wrapper: VueWrapper, ariaLabel: string, label: string): Promise<void> {
+  await wrapper.get(`[role="combobox"][aria-label="${ariaLabel}"]`).trigger("click");
+  const option = wrapper.findAll('[role="listbox"] [role="option"]').find((node) => node.text().trim() === label);
+  if (!option) throw new Error(`Listbox「${ariaLabel}」里没有选项「${label}」`);
+  await option.trigger("click");
+  await nextTick();
+}
 
 describe("grid batches, nulls and server filters", () => {
   it("loads one batch and keeps the truncated rows for a later read", () => {
@@ -499,7 +508,7 @@ describe("grid views", () => {
     expect(wrapper.text()).toContain("客户1");
     expect(tabHasPending("table:shop:app:public:customers")).toBe(false);
     expect(anyPending()).toBe(false);
-    await wrapper.get("select[aria-label='筛选列']").setValue("name");
+    await chooseOption(wrapper, "筛选列", "name");
     await wrapper.get("input[aria-label='筛选值']").setValue("不存在");
     await wrapper.get("form.filter-form").trigger("submit");
     await flushPromises();
@@ -1854,8 +1863,8 @@ describe("DataGrid desktop selection", () => {
     await nextTick();
     expect(selectedCells(wrapper)).toHaveLength(3);
     expect(focusDataCell(wrapper)).toBe("2:note");
-    await wrapper.get("select[aria-label='筛选列']").setValue("id");
-    await wrapper.get("select[aria-label='筛选条件']").setValue("eq");
+    await chooseOption(wrapper, "筛选列", "id");
+    await chooseOption(wrapper, "筛选条件", "=");
     await wrapper.get("input[aria-label='筛选值']").setValue("2");
     await wrapper.get("form.filter-form").trigger("submit");
     await flushPromises();
