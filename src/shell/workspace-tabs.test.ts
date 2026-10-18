@@ -13,6 +13,12 @@ vi.mock("../catalog", () => ({
 
 import AppShell from "./AppShell.vue";
 
+// 这个文件在整套并行下会被 CodeMirror / QueryTab 动态导入拖慢：安静时整文件 ~4.6s、
+// 最慢单例 1841ms（隔离 644ms），双套件并发时整文件 ~9.5s，已多次撞上 vitest 默认的 5s 单例超时。
+// 调查确认不是 await 竞态（慢单例在更慢的那次运行里仍然通过），所以只抬高本文件的超时，
+// 不加全局超时、不加重试、不改断言。
+vi.setConfig({ testTimeout: 10000, hookTimeout: 10000 });
+
 afterEach(() => {
   location.hash = "";
   resetCatalog();
