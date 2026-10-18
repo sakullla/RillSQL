@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, shallowRef, watch } from "vue";
 import { catalogConnections } from "../catalog/store";
+import Listbox from "../ui/Listbox.vue";
+import type { ListboxOption } from "../ui/types";
 import { queryHistory, queryHistoryClear, querySavedDelete, querySavedList, querySavedRename, querySavedSave } from "./api";
 import {
   elapsedLabel,
@@ -73,6 +75,19 @@ const connectionChoices = computed(() => {
   for (const entry of entries.value) seen.set(entry.connectionId, entry.connectionName);
   return [...seen.entries()];
 });
+const connectionOptions = computed<ListboxOption[]>(() => [
+  { value: "all", label: "全部连接" },
+  { value: "deleted", label: "原连接已删除" },
+  ...connectionChoices.value.map(([id, name]) => ({ value: id, label: name })),
+]);
+const statusOptions: ListboxOption[] = [
+  { value: "all", label: "全部结果" },
+  { value: "ok", label: "成功" },
+  { value: "error", label: "失败" },
+  { value: "cancelled", label: "已取消" },
+  { value: "unknown", label: "结果未知" },
+  { value: "running", label: "执行中" },
+];
 
 function isDeleted(entry: HistoryEntry): boolean {
   return !knownIds.value.has(entry.connectionId);
@@ -228,19 +243,8 @@ onMounted(() => {
       <div v-if="confirmingClear" class="hist-clear" role="alert"><span>清空本机的全部查询历史？此操作无法撤销。</span><button class="btn sm" @click="confirmingClear = false">取消</button><button class="btn sm danger" data-action="confirm-clear-history" @click="clearHistory">确认清空</button></div>
       <div class="hist-filters">
         <input v-model="text" type="search" aria-label="搜索历史" placeholder="搜索 SQL 或连接名" />
-        <select v-model="connectionId" aria-label="按连接筛选">
-          <option value="all">全部连接</option>
-          <option value="deleted">原连接已删除</option>
-          <option v-for="[id, name] in connectionChoices" :key="id" :value="id">{{ name }}</option>
-        </select>
-        <select v-model="status" aria-label="按结果筛选">
-          <option value="all">全部结果</option>
-          <option value="ok">成功</option>
-          <option value="error">失败</option>
-          <option value="cancelled">已取消</option>
-          <option value="unknown">结果未知</option>
-          <option value="running">执行中</option>
-        </select>
+        <Listbox v-model="connectionId" :options="connectionOptions" aria-label="按连接筛选" />
+        <Listbox v-model="status" :options="statusOptions" aria-label="按结果筛选" />
       </div>
 
       <div v-if="loadError" class="hist-error" role="alert">

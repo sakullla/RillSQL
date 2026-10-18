@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import type { ListboxOption } from "../ui/types";
+import Listbox from "../ui/Listbox.vue";
 import { ABOUT_ABSENT, ABOUT_FACTS, ABOUT_TAGLINE, PRODUCT_LICENSE, PRODUCT_TITLE, PRODUCT_VERSION } from "./product";
 import { localDataPathLabel, type ShellSettings } from "./settings";
 import { detectMac } from "./shortcuts";
@@ -28,11 +30,22 @@ function setTheme(theme: ThemePreference) {
 function setDensity(density: Density) {
   emit("change", { density });
 }
-function onNumber(key: "editorFont" | "pageSize" | "previewKB" | "objectPage", event: Event) {
-  emit("change", { [key]: Number((event.target as HTMLSelectElement).value) });
+const fontOptions: ListboxOption[] = [12, 13, 14, 15, 16].map((size) => ({ value: String(size), label: `${size} px` }));
+const pageOptions: ListboxOption[] = [50, 100, 200, 500].map((size) => ({ value: String(size), label: `${size} 行` }));
+const previewOptions: ListboxOption[] = [1, 4, 16].map((size) => ({ value: String(size), label: `${size} KB` }));
+const objectOptions: ListboxOption[] = [100, 200, 500].map((size) => ({ value: String(size), label: `${size} 个` }));
+const nullOptions: ListboxOption[] = [
+  { value: "NULL", label: "NULL" },
+  { value: "empty", label: "空文本" },
+  { value: "N", label: "\\N" },
+];
+
+function onNumber(key: "editorFont" | "pageSize" | "previewKB" | "objectPage", value: string) {
+  const next = Number(value);
+  if (!Number.isFinite(next)) return;
+  emit("change", { [key]: next });
 }
-function onNullCopy(event: Event) {
-  const value = (event.target as HTMLSelectElement).value;
+function onNullCopy(value: string) {
   if (value === "NULL" || value === "empty" || value === "N") emit("change", { nullCopy: value });
 }
 </script>
@@ -86,9 +99,7 @@ function onNullCopy(event: Event) {
             <p>同时影响 SQL 编辑器的行高。</p>
           </div>
           <div class="set-ctl">
-            <select :value="settings.editorFont" aria-label="编辑器字号" @change="onNumber('editorFont', $event)">
-              <option v-for="size in [12, 13, 14, 15, 16]" :key="size" :value="size">{{ size }} px</option>
-            </select>
+            <Listbox :model-value="String(settings.editorFont)" :options="fontOptions" aria-label="编辑器字号" @update:model-value="onNumber('editorFont', $event)" />
           </div>
         </div>
       </section>
@@ -100,9 +111,7 @@ function onNullCopy(event: Event) {
             <p>表格和查询结果首次读取的上限；更多行需要主动继续读取。</p>
           </div>
           <div class="set-ctl">
-            <select :value="settings.pageSize" aria-label="每次读取的行数" @change="onNumber('pageSize', $event)">
-              <option v-for="size in [50, 100, 200, 500]" :key="size" :value="size">{{ size }} 行</option>
-            </select>
+            <Listbox :model-value="String(settings.pageSize)" :options="pageOptions" aria-label="每次读取的行数" @update:model-value="onNumber('pageSize', $event)" />
           </div>
         </div>
         <div class="set-row">
@@ -111,9 +120,7 @@ function onNullCopy(event: Event) {
             <p>超过上限的值只显示预览，完整内容按需读取。</p>
           </div>
           <div class="set-ctl">
-            <select :value="settings.previewKB" aria-label="大字段预览上限" @change="onNumber('previewKB', $event)">
-              <option v-for="size in [1, 4, 16]" :key="size" :value="size">{{ size }} KB</option>
-            </select>
+            <Listbox :model-value="String(settings.previewKB)" :options="previewOptions" aria-label="大字段预览上限" @update:model-value="onNumber('previewKB', $event)" />
           </div>
         </div>
         <div class="set-row">
@@ -122,9 +129,7 @@ function onNullCopy(event: Event) {
             <p>对象很多时分批显示，避免一次加载全部。</p>
           </div>
           <div class="set-ctl">
-            <select :value="settings.objectPage" aria-label="对象列表每次显示" @change="onNumber('objectPage', $event)">
-              <option v-for="size in [100, 200, 500]" :key="size" :value="size">{{ size }} 个</option>
-            </select>
+            <Listbox :model-value="String(settings.objectPage)" :options="objectOptions" aria-label="对象列表每次显示" @update:model-value="onNumber('objectPage', $event)" />
           </div>
         </div>
         <div class="set-row">
@@ -133,11 +138,7 @@ function onNullCopy(event: Event) {
             <p>“复制值”时 NULL 写成什么文本。“复制为 SQL 值”始终区分 NULL 与空字符串。</p>
           </div>
           <div class="set-ctl">
-            <select :value="settings.nullCopy" aria-label="复制 NULL 时写入" @change="onNullCopy">
-              <option value="NULL">NULL</option>
-              <option value="empty">空文本</option>
-              <option value="N">\N</option>
-            </select>
+            <Listbox :model-value="settings.nullCopy" :options="nullOptions" aria-label="复制 NULL 时写入" @update:model-value="onNullCopy" />
           </div>
         </div>
       </section>

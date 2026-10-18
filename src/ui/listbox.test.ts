@@ -1,8 +1,13 @@
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { mount } from "@vue/test-utils";
 import { describe, expect, it } from "vitest";
 import { nextTick } from "vue";
 import Listbox from "./Listbox.vue";
 import type { ListboxOption } from "./types";
+
+const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "Listbox.vue"), "utf8");
 
 const OPTIONS: ListboxOption[] = [
   { value: "postgres", label: "PostgreSQL" },
@@ -165,5 +170,45 @@ describe("Listbox", () => {
     await lastDisabled.get('[role="listbox"]').trigger("keydown", { key: "End" });
     expect(lastDisabled.findAll(".listbox-option.on").at(0)?.text()).toBe("B");
     lastDisabled.unmount();
+  });
+
+  it("does not open or change its value while disabled", async () => {
+    const wrapper = mount(Listbox, {
+      props: { modelValue: "mysql", options: OPTIONS, ariaLabel: "数据库类型", disabled: true },
+      attachTo: document.body,
+    });
+    const trigger = wrapper.get('[role="combobox"]');
+    expect(trigger.attributes("disabled")).toBe("");
+    expect(wrapper.classes()).toContain("disabled");
+    await trigger.trigger("click");
+    await trigger.trigger("keydown", { key: "ArrowDown" });
+    await trigger.trigger("keydown", { key: "Enter" });
+    await trigger.trigger("keydown", { key: " " });
+    expect(wrapper.find('[role="listbox"]').exists()).toBe(false);
+    expect(wrapper.emitted("update:modelValue")).toBeUndefined();
+    expect(trigger.text()).toBe("MySQL");
+    wrapper.unmount();
+  });
+
+  it("closes an open list when it becomes disabled", async () => {
+    const wrapper = open();
+    await wrapper.get('[role="combobox"]').trigger("click");
+    expect(wrapper.find('[role="listbox"]').exists()).toBe(true);
+    await wrapper.setProps({ disabled: true });
+    expect(wrapper.find('[role="listbox"]').exists()).toBe(false);
+    await wrapper.get('[role="combobox"]').trigger("click");
+    const option = wrapper.findAll('[role="option"]').find((node) => node.text() === "PostgreSQL");
+    if (option) await option.trigger("click");
+    expect(wrapper.emitted("update:modelValue")).toBeUndefined();
+    wrapper.unmount();
+  });
+
+  it("keeps hover, press, focus and disabled visible on the trigger", () => {
+    expect(source).toContain(".listbox-trigger:hover:not(:disabled) { background: var(--hover); }");
+    expect(source).toContain(".listbox-trigger:active:not(:disabled) { background: var(--active); box-shadow: inset 0 1px 2px var(--press); transform: translateY(.5px); }");
+    expect(source).toContain(".listbox-trigger:focus-visible:not(:disabled) { outline: 2px solid var(--accent); outline-offset: 1px; }");
+    expect(source).toContain(".listbox-trigger:disabled {");
+    expect(source).toContain("background: var(--disabled-bg);");
+    expect(source).toContain("color: var(--disabled-fg);");
   });
 });

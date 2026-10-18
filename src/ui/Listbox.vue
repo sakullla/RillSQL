@@ -9,9 +9,10 @@ const props = withDefaults(
     placeholder?: string;
     ariaLabel?: string;
     filterable?: boolean;
+    disabled?: boolean;
     id?: string;
   }>(),
-  { placeholder: "请选择", ariaLabel: undefined, filterable: false, id: undefined },
+  { placeholder: "请选择", ariaLabel: undefined, filterable: false, disabled: false, id: undefined },
 );
 
 const emit = defineEmits<{ "update:modelValue": [value: string] }>();
@@ -64,7 +65,7 @@ function place() {
 }
 
 function openList() {
-  if (open.value) return;
+  if (props.disabled || open.value) return;
   open.value = true;
   query.value = "";
   const picked = props.options.findIndex((option) => option.value === props.modelValue);
@@ -112,14 +113,14 @@ function nearestEnabled(from: number, step: 1 | -1): number {
 }
 
 function choose(option: ListboxOption) {
-  if (option.disabled) return;
+  if (props.disabled || option.disabled) return;
   emit("update:modelValue", option.value);
   close();
   trigger.value?.focus();
 }
 
 function onTriggerKey(event: KeyboardEvent) {
-  if (open.value) return;
+  if (props.disabled || open.value) return;
   if (event.key === "ArrowDown" || event.key === "ArrowUp" || event.key === "Enter" || event.key === " ") {
     event.preventDefault();
     openList();
@@ -168,6 +169,10 @@ watch(visible, (items) => {
   if (open.value) place();
 });
 
+watch(() => props.disabled, (isDisabled) => {
+  if (isDisabled) close();
+});
+
 onBeforeUnmount(() => {
   document.removeEventListener("pointerdown", onOutside, true);
   window.removeEventListener("resize", place);
@@ -175,13 +180,14 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="listbox" :class="{ open }">
+  <div class="listbox" :class="{ open, disabled }">
     <button
       ref="trigger"
       :id="id"
       type="button"
       class="listbox-trigger"
       role="combobox"
+      :disabled="disabled"
       :aria-expanded="open"
       aria-haspopup="listbox"
       :aria-controls="listId"
@@ -251,9 +257,17 @@ onBeforeUnmount(() => {
   font-size: var(--fs-sm);
   transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
 }
-.listbox-trigger:hover { background: var(--hover); }
-.listbox-trigger:active { background: var(--active); box-shadow: inset 0 1px 2px var(--press); transform: translateY(.5px); }
-.listbox-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.listbox-trigger:hover:not(:disabled) { background: var(--hover); }
+.listbox-trigger:active:not(:disabled) { background: var(--active); box-shadow: inset 0 1px 2px var(--press); transform: translateY(.5px); }
+.listbox-trigger:focus-visible:not(:disabled) { outline: 2px solid var(--accent); outline-offset: 1px; }
+.listbox-trigger:disabled {
+  background: var(--disabled-bg);
+  color: var(--disabled-fg);
+  border-color: var(--line);
+  box-shadow: none;
+  cursor: not-allowed;
+}
+.listbox-trigger:disabled .listbox-caret { color: var(--disabled-fg); }
 .listbox.open .listbox-trigger { border-color: var(--accent); box-shadow: 0 0 0 2px var(--ring); }
 .listbox-value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .listbox-value.placeholder { color: var(--text-3); }

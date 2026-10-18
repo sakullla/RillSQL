@@ -33,6 +33,13 @@ afterEach(() => {
   invoke.mockReset();
 });
 
+async function pick(wrapper: ReturnType<typeof mount>, label: string, option: string) {
+  await wrapper.get(`[role="combobox"][aria-label="${label}"]`).trigger("click");
+  const match = wrapper.findAll('[role="option"]').find((node) => node.text() === option);
+  expect(match, option).toBeTruthy();
+  await match!.trigger("click");
+}
+
 describe("query history", () => {
   it("plans a re-open that never executes and asks for a new target when the connection is gone", () => {
     const rows = [entry({}), entry({ id: "h2", sql: "SELECT 1", connectionId: "shop", connectionName: "Shop", databaseName: "shop_staging", engine: "mysql" })];
@@ -86,6 +93,11 @@ describe("query history", () => {
     expect(wrapper.text()).toContain("原连接已删除");
     expect(wrapper.text()).toContain("载入后重新选择连接和库");
 
+    expect(wrapper.find("select").exists()).toBe(false);
+    expect(wrapper.get(".history-inspector .btn.primary").text()).toContain("载入编辑器");
+    expect(wrapper.findAll("[data-action='open-history']").every((button) => !button.classes().includes("primary"))).toBe(true);
+    expect(wrapper.get("[data-action='clear-history']").classes()).toContain("danger");
+
     const buttons = wrapper.findAll("[data-action='open-history']");
     expect(buttons).toHaveLength(2);
     expect(buttons[0]!.text()).toContain("载入编辑器");
@@ -96,10 +108,14 @@ describe("query history", () => {
     expect(opened.sql).toContain("DELETE");
     expect(invoke.mock.calls.map((call) => call[0])).toEqual(["query_history"]);
 
-    await wrapper.get("select[aria-label='按结果筛选']").setValue("error");
+    await pick(wrapper, "按结果筛选", "失败");
     expect(wrapper.findAll("[data-action='open-history']")).toHaveLength(1);
     expect(wrapper.text()).not.toContain("旧连接 / app");
-    await wrapper.get("select[aria-label='按结果筛选']").setValue("all");
+    await pick(wrapper, "按结果筛选", "全部结果");
+    await pick(wrapper, "按连接筛选", "Shop");
+    expect(wrapper.findAll("[data-action='open-history']")).toHaveLength(1);
+    expect(wrapper.text()).toContain("Shop / shop_staging");
+    await pick(wrapper, "按连接筛选", "全部连接");
     await wrapper.get("input[aria-label='搜索历史']").setValue("select");
     expect(wrapper.findAll("[data-action='open-history']")).toHaveLength(1);
 
