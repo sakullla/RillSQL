@@ -33,8 +33,11 @@ export function loadSettings(storage: Storage | null = safeStorage()): ShellSett
   try {
     const raw = storage.getItem(STORAGE_KEY);
     if (!raw) return { ...DEFAULT_SETTINGS };
-    const parsed = JSON.parse(raw) as Partial<ShellSettings>;
-    return { ...DEFAULT_SETTINGS, ...parsed };
+    const parsed = JSON.parse(raw) as Partial<ShellSettings> & { density?: Density | "comfortable" };
+    const merged: ShellSettings = { ...DEFAULT_SETTINGS, ...parsed };
+    // 历史版本把「标准」存成 comfortable，归一到 standard，避免样式选择器失配。
+    if (parsed.density === "comfortable") merged.density = "standard";
+    return merged;
   } catch {
     return { ...DEFAULT_SETTINGS };
   }

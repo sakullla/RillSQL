@@ -7,7 +7,7 @@
 执行：
 
 ```sh
-RILLSQL_PREVIEW_URL=http://localhost:1421 node scripts/capture-ui.mjs
+RILLSQL_PREVIEW_URL=http://localhost:1420 node scripts/capture-ui.mjs
 ```
 
 `--theme light|dark|all`、`--size 1360,900,640`、`--only 'connection-*'` 可缩小范围，`--list` 列出场景。RILLSQL_CAPTURE_OUT 可指定输出目录。预览地址默认 http://localhost:1420。
