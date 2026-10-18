@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, shallowRef, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import { catalogConnections } from "../catalog/store";
 import { queryHistory, queryHistoryClear, querySavedDelete, querySavedList, querySavedRename, querySavedSave } from "./api";
-import { ContextMenu, type MenuItem } from "../ui";
+import { ContextMenu, EmptyState, Listbox, type ListboxOption, type MenuItem } from "../ui";
 import {
   elapsedLabel,
   filterHistory,
@@ -15,6 +15,7 @@ import {
   type OpenPlan,
 } from "./plan";
 import { filterSaved, openSaved, savedName, savedNameError, savedNeedsTarget, type SavedDraft, type SavedQuery } from "./saved";
+import "./history.css";
 
 const props = withDefaults(
   defineProps<{
@@ -74,6 +75,63 @@ const connectionChoices = computed(() => {
   for (const entry of entries.value) seen.set(entry.connectionId, entry.connectionName);
   return [...seen.entries()];
 });
+
+/** 筛选从原生 select 换成 Listbox，固定首项 value 为 "all"。 */
+const connectionOptions = computed<ListboxOption[]>(() => [
+  { value: "all", label: "全部连接" },
+  { value: "deleted", label: "原连接已删除" },
+  ...connectionChoices.value.map(([id, name]) => ({ value: id, label: name })),
+]);
+
+const statusOptions: ListboxOption[] = [
+  { value: "all", label: "全部结果" },
+  { value: "ok", label: "成功" },
+  { value: "error", label: "失败" },
+  { value: "cancelled", label: "已取消" },
+  { value: "unknown", label: "结果未知" },
+  { value: "running", label: "执行中" },
+];
+
+/** 密集行只放 SQL 首行；完整 SQL 留在预览面板。 */
+function firstLine(sql: string): string {
+  return sql.split("\n")[0]?.trim() ?? "";
+}
+
+const sqlLines = computed(() => (selected.value?.sql ?? "").split("\n"));
+
+const INSPECTOR_MIN = 280;
+const INSPECTOR_MAX = 520;
+const inspectorWidth = ref(360);
+let resizeOrigin = { x: 0, width: 360 };
+
+function pointerX(event: Event): number {
+  const x = (event as PointerEvent).clientX;
+  return typeof x === "number" && Number.isFinite(x) ? x : 0;
+}
+
+function onGripMove(event: Event) {
+  inspectorWidth.value = clampInspector(resizeOrigin.width + (pointerX(event) - resizeOrigin.x));
+}
+
+function clampInspector(width: number): number {
+  return Math.min(INSPECTOR_MAX, Math.max(INSPECTOR_MIN, Math.round(width)));
+}
+
+function stopGripResize() {
+  window.removeEventListener("pointermove", onGripMove);
+  window.removeEventListener("pointerup", stopGripResize);
+  window.removeEventListener("pointercancel", stopGripResize);
+}
+
+function onGripPointerDown(event: PointerEvent) {
+  event.preventDefault();
+  resizeOrigin = { x: pointerX(event), width: inspectorWidth.value };
+  window.addEventListener("pointermove", onGripMove);
+  window.addEventListener("pointerup", stopGripResize);
+  window.addEventListener("pointercancel", stopGripResize);
+}
+
+onBeforeUnmount(stopGripResize);
 
 function isDeleted(entry: HistoryEntry): boolean {
   return !knownIds.value.has(entry.connectionId);
@@ -273,19 +331,8 @@ onMounted(() => {
       <div v-if="confirmingClear" class="hist-clear" role="alert"><span>清空本机的全部查询历史？此操作无法撤销。</span><button class="btn sm" @click="confirmingClear = false">取消</button><button class="btn sm danger" data-action="confirm-clear-history" @click="clearHistory">确认清空</button></div>
       <div class="hist-filters">
         <input v-model="text" type="search" aria-label="搜索历史" placeholder="搜索 SQL 或连接名" />
-        <select v-model="connectionId" aria-label="按连接筛选">
-          <option value="all">全部连接</option>
-          <option value="deleted">原连接已删除</option>
-          <option v-for="[id, name] in connectionChoices" :key="id" :value="id">{{ name }}</option>
-        </select>
-        <select v-model="status" aria-label="按结果筛选">
-          <option value="all">全部结果</option>
-          <option value="ok">成功</option>
-          <option value="error">失败</option>
-          <option value="cancelled">已取消</option>
-          <option value="unknown">结果未知</option>
-          <option value="running">执行中</option>
-        </select>
+        <Listbox v-model="connectionId" :options="connectionOptions" aria-label="按连接筛选" />
+        <Listbox v-model="status" :options="statusOptions" aria-label="按结果筛选" />
       </div>
 
       <div v-if="loadError" class="hist-error" role="alert">
@@ -293,10 +340,11 @@ onMounted(() => {
         <button class="btn sm" type="button" data-action="retry-history" @click="load">重试</button>
       </div>
       <div v-else-if="loading" class="empty"><p>正在读取历史…</p></div>
-      <div v-else-if="!visible.length" class="empty">
-        <h3>{{ entries.length ? "没有匹配的历史记录" : "历史为空" }}</h3>
-        <p>{{ entries.length ? "换个关键词或筛选条件试试。" : "执行过的 SQL 会出现在这里。" }}</p>
-      </div>
+      <EmptyState
+        v-else-if="!visible.length"
+        :title="entries.length ? '没有匹配的历史记录' : '历史为空'"
+        :detail="entries.length ? '换个关键词或筛选条件试试。' : '执行过的 SQL 会出现在这里。'"
+      />
 
       <div v-if="visible.length" class="history-layout"><div class="history-records">
       <div class="history-count">{{ visible.length }} 条记录 <span>仅保存在本机</span></div>
@@ -304,27 +352,43 @@ onMounted(() => {
         <h2>{{ group.label }}</h2>
         <ul class="hist-list">
           <li v-for="entry in group.entries" :key="entry.id" class="hist-card" :class="{ selected: selected?.id === entry.id }" @contextmenu.prevent="onCardContextMenu($event, entry)">
-            <div class="hist-top">
-              <span class="badge" :class="statusBadge(entry.status)">{{ statusLabel(entry.status) }}</span>
-              <strong class="hist-target">{{ entry.connectionName }} / {{ entry.databaseName || "main" }}</strong>
-              <span v-if="isDeleted(entry)" class="badge warn">原连接已删除</span>
-              <span class="grow"></span>
-              <time v-if="timeOfDay(entry.startedAt)" class="muted sm">{{ timeOfDay(entry.startedAt) }}</time>
-              <span v-if="elapsedLabel(entry.elapsedMs)" class="muted sm">耗时 {{ elapsedLabel(entry.elapsedMs) }}</span>
-            </div>
-            <button class="hist-preview" :aria-label="`预览 SQL：${entry.sql.slice(0, 80)}`" @click="selectedId = entry.id"><code>{{ entry.sql }}</code></button>
-            <div class="hist-foot">
-              <span class="muted sm">{{ entry.summary }}</span>
-              <span class="grow"></span>
-              <span v-if="isDeleted(entry)" class="muted sm">载入后重新选择连接和库</span>
-              <button class="btn sm" type="button" data-action="open-history" @click="open(entry)">载入编辑器 ↗</button>
-            </div>
+            <span class="badge" :class="statusBadge(entry.status)">{{ statusLabel(entry.status) }}</span>
+            <strong class="hist-target">{{ entry.connectionName }} / {{ entry.databaseName || "main" }}</strong>
+            <span v-if="isDeleted(entry)" class="badge warn">原连接已删除</span>
+            <button class="hist-sql-line" type="button" :aria-label="`预览 SQL：${entry.sql.slice(0, 80)}`" @click="selectedId = entry.id"><code>{{ firstLine(entry.sql) }}</code></button>
+            <span v-if="isDeleted(entry)" class="hist-note muted sm">载入后重新选择连接和库</span>
+            <span class="grow"></span>
+            <span v-if="elapsedLabel(entry.elapsedMs)" class="hist-elapsed muted sm">耗时 {{ elapsedLabel(entry.elapsedMs) }}</span>
+            <time v-if="timeOfDay(entry.startedAt)" class="hist-time muted sm">{{ timeOfDay(entry.startedAt) }}</time>
+            <button class="btn sm" type="button" data-action="open-history" @click="open(entry)">载入编辑器</button>
           </li>
         </ul>
       </section>
       <footer class="history-pagination"><button class="btn sm" :disabled="page <= 1" @click="page--">上一页</button><span>{{ page }} / {{ pageCount }}</span><button class="btn sm" :disabled="page >= pageCount" @click="page++">下一页</button></footer>
       </div>
-      <aside v-if="selected" class="history-inspector"><div class="inspector-head"><span>SQL 预览</span><span class="badge" :class="statusBadge(selected.status)">{{ statusLabel(selected.status) }}</span></div><dl><dt>连接</dt><dd>{{ selected.connectionName }}</dd><dt>数据库</dt><dd>{{ selected.databaseName || 'main' }}</dd><dt>执行耗时</dt><dd>{{ elapsedLabel(selected.elapsedMs) || '—' }}</dd></dl><pre>{{ selected.sql }}</pre><p>{{ selected.summary }}</p><button class="btn primary" @click="open(selected)">载入编辑器</button><small>只载入 SQL，不会执行。</small></aside>
+      <aside v-if="selected" class="history-inspector" :style="{ width: `${inspectorWidth}px` }">
+        <div
+          class="inspector-grip"
+          data-inspector-grip
+          role="separator"
+          aria-label="拖动调整预览宽度"
+          aria-orientation="vertical"
+          tabindex="0"
+          @pointerdown="onGripPointerDown"
+          @keydown.left.prevent="inspectorWidth = clampInspector(inspectorWidth - 16)"
+          @keydown.right.prevent="inspectorWidth = clampInspector(inspectorWidth + 16)"
+        ></div>
+        <div class="inspector-head"><span>SQL 预览</span><span class="badge" :class="statusBadge(selected.status)">{{ statusLabel(selected.status) }}</span></div>
+        <dl>
+          <dt>连接</dt><dd>{{ selected.connectionName }}</dd>
+          <dt>数据库</dt><dd>{{ selected.databaseName || "main" }}</dd>
+          <dt>执行耗时</dt><dd>{{ elapsedLabel(selected.elapsedMs) || "—" }}</dd>
+        </dl>
+        <pre class="inspector-code"><code><span v-for="(line, index) in sqlLines" :key="index" class="sql-line"><span class="sql-gutter" aria-hidden="true">{{ index + 1 }}</span><span class="sql-text">{{ line }}</span></span></code></pre>
+        <p>{{ selected.summary }}</p>
+        <button class="btn primary" data-action="open-inspector" @click="open(selected)">载入编辑器</button>
+        <small>只载入 SQL，不会执行。</small>
+      </aside>
       </div>
       </template>
 
@@ -351,18 +415,18 @@ onMounted(() => {
           <button class="btn sm" type="button" data-action="retry-saved" @click="loadSaved">重试</button>
         </div>
         <div v-else-if="savedLoading" class="empty"><p>正在读取保存的查询…</p></div>
-        <div v-else-if="!savedVisible.length" class="empty">
-          <h3>{{ savedEntries.length ? "没有匹配的名称" : "还没有保存的查询" }}</h3>
-          <p>{{ savedEntries.length ? "换个名称试试。" : "为当前 SQL 起一个名称后，它会出现在这里。" }}</p>
-        </div>
+        <EmptyState
+          v-else-if="!savedVisible.length"
+          :title="savedEntries.length ? '没有匹配的名称' : '还没有保存的查询'"
+          :detail="savedEntries.length ? '换个名称试试。' : '为当前 SQL 起一个名称后，它会出现在这里。'"
+        />
         <ul v-else class="hist-list saved-list">
-          <li v-for="item in savedVisible" :key="item.id" class="hist-card">
-            <div class="hist-top">
-              <strong>{{ item.name }}</strong>
-              <span class="muted sm">{{ item.connectionName ? `${item.connectionName} / ${item.databaseName || "main"}` : "未记录执行目标" }}</span>
-              <span v-if="savedNeedsTarget(item, knownIds)" class="badge warn">需要重新选择执行目标</span>
-            </div>
-            <pre class="saved-sql">{{ item.sql }}</pre>
+          <li v-for="item in savedVisible" :key="item.id" class="hist-card saved-card">
+            <strong class="saved-name">{{ item.name }}</strong>
+            <span class="muted sm">{{ item.connectionName ? `${item.connectionName} / ${item.databaseName || "main"}` : "未记录执行目标" }}</span>
+            <span v-if="savedNeedsTarget(item, knownIds)" class="badge warn">需要重新选择执行目标</span>
+            <code class="saved-sql-line">{{ firstLine(item.sql) }}</code>
+            <span class="grow"></span>
             <div class="hist-foot">
               <button class="btn sm" type="button" data-action="open-saved" @click="openSavedItem(item)">打开</button>
               <button v-if="renamingId !== item.id" class="btn sm" type="button" data-action="rename-saved" @click="startRename(item)">重命名</button>
@@ -396,50 +460,3 @@ onMounted(() => {
     />
   </div>
 </template>
-
-<style scoped>
-.hist-filters { display: flex; gap: var(--sp-2); flex-wrap: wrap; margin-bottom: var(--sp-5); }
-.hist-filters input { flex: 1; min-width: 220px; }
-.hist-error { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4); border: 1px solid var(--err-line); border-radius: var(--r-md); background: var(--err-soft); color: var(--err); }
-.hist-error p { margin: 0; flex: 1; }
-.hist-day { margin-bottom: var(--sp-6); }
-.hist-day h2 { font-size: var(--fs-sm); color: var(--text-3); font-weight: 600; margin: 0 0 var(--sp-2); }
-.hist-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
-.hist-card { border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--panel); padding: var(--sp-3) var(--sp-4); }
-.hist-top { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
-.hist-target { font-size: var(--fs-sm); font-weight: 600; }
-.hist-sql { white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: var(--fs-sm); line-height: var(--lh); background: var(--sunken); border-radius: var(--r); padding: var(--sp-2) var(--sp-3); margin: var(--sp-2) 0; }
-.hist-foot { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
-.hist-clear { display: flex; gap: 10px; align-items: center; padding: 12px; margin-bottom: 16px; background: var(--warn-soft); border: 1px solid var(--warn-line); border-radius: var(--r); }
-.hist-clear > span { flex: 1; }
-.history-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, .7fr); gap: 24px; align-items: start; }
-.history-count { display: flex; justify-content: space-between; color: var(--text-2); font-size: 11px; padding-bottom: 20px; }
-.history-count span { color: var(--text-3); }
-.hist-list { gap: 0; }
-.hist-card { border-radius: 0; border-bottom: 0; padding: 14px 16px; }
-.hist-card:first-child { border-radius: var(--r-lg) var(--r-lg) 0 0; }
-.hist-card:last-child { border-bottom: 1px solid var(--line); border-radius: 0 0 var(--r-lg) var(--r-lg); }
-.hist-card:only-child { border-radius: var(--r-lg); }
-.hist-card.selected { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
-.hist-preview { display: block; text-align: left; width: 100%; margin: 12px 0; color: var(--text); }
-.hist-preview code { display: block; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.hist-foot { gap: 8px; }
-.hist-foot .btn { background: transparent; border: 0; color: var(--accent-text); padding: 0; }
-.history-inspector { position: sticky; top: 0; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 20px; }
-.inspector-head { display: flex; justify-content: space-between; font-size: 12px; font-weight: 600; }
-.history-inspector dl { display: grid; grid-template-columns: 75px 1fr; gap: 10px; margin: 20px 0; font-size: 11px; }
-.history-inspector dt { color: var(--text-3); }
-.history-inspector dd { margin: 0; overflow-wrap: anywhere; }
-.history-inspector pre { padding: 16px; margin: 0 -20px; background: var(--sunken); color: var(--text); font: 12px/1.9 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 350px; overflow: auto; }
-.history-inspector p { font-size: 12px; color: var(--text-2); }
-.history-inspector small { display: block; margin-top: 12px; font-size: 11px; color: var(--text-3); }
-.history-pagination { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--text-2); }
-.hist-switch { display: flex; gap: var(--sp-2); margin-top: var(--sp-3); }
-.saved-form { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-3); margin: var(--sp-4) 0; }
-.saved-form label { display: flex; flex-direction: column; gap: var(--sp-2); font-size: var(--fs-sm); }
-.saved-sql { white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: var(--fs-sm); line-height: var(--lh); background: var(--sunken); border-radius: var(--r); padding: var(--sp-2) var(--sp-3); margin: var(--sp-2) 0; max-width: 100%; }
-.saved-alert { margin: 0; color: var(--err); }
-.saved-rename { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; margin-top: var(--sp-2); }
-.saved-list { margin-top: var(--sp-3); }
-@media (max-width: 900px) { .history-layout { grid-template-columns: 1fr; } .history-inspector { position: static; grid-row: 1; } .history-inspector pre { max-height: 160px; } }
-</style>

@@ -1,4 +1,4 @@
-import { flushPromises, mount } from "@vue/test-utils";
+import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { nextTick } from "vue";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { catalogFixture } from "../catalog/fixtures";
@@ -33,6 +33,14 @@ afterEach(() => {
   resetCatalog();
   invoke.mockReset();
 });
+
+/** 打开某个 Listbox 并点中目标选项；筛选不再走原生 select。 */
+async function chooseOption(wrapper: VueWrapper, ariaLabel: string, label: string): Promise<void> {
+  await wrapper.get(`[role="combobox"][aria-label="${ariaLabel}"]`).trigger("click");
+  const option = wrapper.findAll('[role="listbox"] [role="option"]').find((node) => node.text().trim() === label);
+  if (!option) throw new Error(`Listbox「${ariaLabel}」里没有选项「${label}」`);
+  await option.trigger("click");
+}
 
 describe("query history", () => {
   it("plans a re-open that never executes and asks for a new target when the connection is gone", () => {
@@ -97,10 +105,10 @@ describe("query history", () => {
     expect(opened.sql).toContain("DELETE");
     expect(invoke.mock.calls.map((call) => call[0])).toEqual(["query_history"]);
 
-    await wrapper.get("select[aria-label='按结果筛选']").setValue("error");
+    await chooseOption(wrapper, "按结果筛选", "失败");
     expect(wrapper.findAll("[data-action='open-history']")).toHaveLength(1);
     expect(wrapper.text()).not.toContain("旧连接 / app");
-    await wrapper.get("select[aria-label='按结果筛选']").setValue("all");
+    await chooseOption(wrapper, "按结果筛选", "全部结果");
     await wrapper.get("input[aria-label='搜索历史']").setValue("select");
     expect(wrapper.findAll("[data-action='open-history']")).toHaveLength(1);
 
@@ -180,13 +188,90 @@ describe("query history", () => {
     expect(inspector.text()).toContain("Shop");
     expect(inspector.text()).toContain("SELECT 1");
 
-    // 按连接筛选：下拉值变为该条连接，列表只剩它的记录
+    // 按连接筛选：Listbox 值变为该条连接，列表只剩它的记录
     card.element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 40, clientY: 60 }));
     await nextTick();
     document.body.querySelector('[role="menu"] [data-id="filter-conn"]')!.click();
     await nextTick();
-    expect((wrapper.get("select[aria-label='按连接筛选']").element as HTMLSelectElement).value).toBe("shop");
+    expect(wrapper.get('[role="combobox"][aria-label="按连接筛选"]').text().trim()).toBe("Shop");
     expect(wrapper.findAll(".hist-card")).toHaveLength(1);
+    wrapper.unmount();
+  });
+
+  it("筛选走 Listbox 而非原生下拉，预览面板带拖宽把手，日期分组仍保留", async () => {
+    replaceCatalog(catalogFixture());
+    const rows = [
+      entry({}),
+      entry({ id: "h2", sql: "SELECT 1", connectionId: "shop", connectionName: "Shop", databaseName: "shop_staging", engine: "mysql", startedAt: "2026-10-13T09:00:00", status: "error", summary: "1 条语句失败" }),
+    ];
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "query_history") return rows;
+      throw new Error(command);
+    });
+    const wrapper = mount(HistoryPage);
+    await flushPromises();
+
+    // 1) 没有原生 select；两个筛选都是带 aria-label 的 Listbox，选项里含 value "all"
+    expect(wrapper.findAll("select")).toHaveLength(0);
+    expect(wrapper.findAll('[role="combobox"][aria-label="按连接筛选"]')).toHaveLength(1);
+    expect(wrapper.findAll('[role="combobox"][aria-label="按结果筛选"]')).toHaveLength(1);
+    await wrapper.get('[role="combobox"][aria-label="按连接筛选"]').trigger("click");
+    expect(wrapper.findAll('[role="listbox"] [role="option"]').map((node) => node.text().trim())).toEqual([
+      "全部连接",
+      "原连接已删除",
+      "旧连接",
+      "Shop",
+    ]);
+    await wrapper.get('[role="listbox"] [role="option"]').trigger("click");
+
+    // 5) 按日分组的标题仍在
+    expect(wrapper.findAll(".hist-day h2").map((node) => node.text())).toEqual(groupHistoryByDay(rows).map((group) => group.label));
+
+    // 用 Listbox 按结果筛选，列表随之收窄
+    await chooseOption(wrapper, "按结果筛选", "失败");
+    expect(wrapper.findAll(".hist-card")).toHaveLength(1);
+    await chooseOption(wrapper, "按结果筛选", "全部结果");
+    expect(wrapper.findAll(".hist-card")).toHaveLength(2);
+
+    // 2) 「载入编辑器」仍是主入口，只载入不执行
+    await wrapper.get("[data-action='open-history']").trigger("click");
+    const opened = wrapper.emitted("open")?.at(-1)?.[0] as { execute: boolean; sql: string };
+    expect(opened.execute).toBe(false);
+    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("query_start");
+    const inspector = wrapper.get(".history-inspector");
+    expect(inspector.get("button.btn.primary").text()).toContain("载入编辑器");
+    expect(inspector.text()).toContain("只载入 SQL，不会执行");
+
+    // 4) 预览面板带拖宽把手；pointer 拖动不抛错，宽度夹在 280–520px
+    const grip = wrapper.get("[data-inspector-grip]");
+    expect(grip.attributes("aria-label")).toBeTruthy();
+    const widthOf = (): number => {
+      const matched = /width:\s*(\d+)px/.exec(wrapper.get(".history-inspector").attributes("style") ?? "");
+      return Number(matched?.[1] ?? 0);
+    };
+    expect(widthOf()).toBeGreaterThanOrEqual(280);
+    expect(widthOf()).toBeLessThanOrEqual(520);
+    grip.element.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true, clientX: 400 }));
+    window.dispatchEvent(new MouseEvent("pointermove", { clientX: 460 }));
+    window.dispatchEvent(new MouseEvent("pointerup", { clientX: 460 }));
+    await nextTick();
+    expect(widthOf()).toBeGreaterThanOrEqual(280);
+    expect(widthOf()).toBeLessThanOrEqual(520);
+    grip.element.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true, clientX: 400 }));
+    window.dispatchEvent(new MouseEvent("pointermove", { clientX: 4000 }));
+    window.dispatchEvent(new MouseEvent("pointerup", { clientX: 4000 }));
+    await nextTick();
+    expect(widthOf()).toBe(520);
+    grip.element.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true, clientX: 400 }));
+    window.dispatchEvent(new MouseEvent("pointermove", { clientX: 0 }));
+    window.dispatchEvent(new MouseEvent("pointerup", { clientX: 0 }));
+    await nextTick();
+    expect(widthOf()).toBe(280);
+
+    // 3) 右键条目仍然弹出 [role="menu"]
+    wrapper.findAll(".hist-card")[0]!.element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 30, clientY: 40 }));
+    await nextTick();
+    expect(document.body.querySelector('[role="menu"]')).toBeTruthy();
     wrapper.unmount();
   });
 });

@@ -1,0 +1,149 @@
+/* 历史页与保存的查询：左列表右预览，列表按桌面密度排成密集行。 */
+.history-page .page-head h1 { font-size: 16px; }
+.history-page .page-head p { font-size: var(--fs-sm); }
+
+.hist-filters { display: flex; gap: var(--sp-2); flex-wrap: wrap; align-items: center; margin-bottom: var(--sp-5); }
+.hist-filters input { flex: 1; min-width: 220px; }
+.hist-error { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4); border: 1px solid var(--err-line); border-radius: var(--r-md); background: var(--err-soft); color: var(--err); }
+.hist-error p { margin: 0; flex: 1; }
+
+.hist-day { margin-bottom: var(--sp-6); }
+.hist-day h2 { font-size: var(--fs-sm); color: var(--text-3); font-weight: 600; margin: 0 0 var(--sp-2); }
+.hist-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0; }
+.hist-clear { display: flex; gap: 10px; align-items: center; padding: 12px; margin-bottom: 16px; background: var(--warn-soft); border: 1px solid var(--warn-line); border-radius: var(--r); }
+.hist-clear > span { flex: 1; }
+
+/* 密集行：状态 · 连接/库 · SQL 首行 · 耗时 · 时间 · 载入编辑器 */
+.hist-card {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  min-height: 34px;
+  padding: 5px 12px;
+  border: 1px solid var(--line);
+  border-bottom: 0;
+  background: var(--panel);
+  font-size: 12px;
+  border-radius: 0;
+}
+.hist-card:first-child { border-radius: var(--r-md) var(--r-md) 0 0; }
+.hist-card:last-child { border-bottom: 1px solid var(--line); border-radius: 0 0 var(--r-md) var(--r-md); }
+.hist-card:only-child { border-radius: var(--r-md); }
+.hist-card.selected { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
+.hist-target { font-size: 12px; font-weight: 600; white-space: nowrap; }
+.hist-note { color: var(--warn); font-size: 11px; }
+.hist-sql-line {
+  flex: 1 1 200px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text-2);
+  text-align: left;
+  cursor: default;
+}
+.hist-sql-line code {
+  display: block;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hist-sql-line:hover code { color: var(--text); }
+.hist-sql-line:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--r); }
+.hist-elapsed, .hist-time { font-family: var(--mono); font-size: 11px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+/* 右列宽度由行内 style 控制（280–520px），左列始终可收缩，页面不出横向滚动条。 */
+.history-layout { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 24px; align-items: start; }
+.history-records { min-width: 0; }
+.history-count { display: flex; justify-content: space-between; color: var(--text-2); font-size: 11px; padding-bottom: 20px; }
+.history-count span { color: var(--text-3); }
+.history-pagination { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--text-2); }
+
+/* 预览面板：宽度由 grip 拖出，夹在 280–520px 之间（宽度写在行内 style 上）。 */
+.history-inspector {
+  position: sticky;
+  top: 0;
+  width: 360px;
+  min-width: 0;
+  max-width: 100%;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  padding: 20px;
+  box-sizing: border-box;
+}
+.inspector-grip {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -5px;
+  width: 11px;
+  cursor: col-resize;
+  background: transparent;
+  touch-action: none;
+}
+.inspector-grip:hover, .inspector-grip:focus-visible { background: var(--accent-soft); outline: none; }
+.inspector-head { display: flex; justify-content: space-between; font-size: 12px; font-weight: 600; }
+.history-inspector dl { display: grid; grid-template-columns: 75px 1fr; gap: 10px; margin: 20px 0; font-size: 11px; }
+.history-inspector dt { color: var(--text-3); }
+.history-inspector dd { margin: 0; overflow-wrap: anywhere; }
+.history-inspector .inspector-code {
+  display: block;
+  padding: 16px;
+  margin: 0 -20px;
+  background: var(--sunken);
+  color: var(--text);
+  font: 12px/1.9 var(--mono);
+  white-space: pre;
+  max-height: 350px;
+  overflow: auto;
+}
+.inspector-code .sql-line { display: block; }
+.inspector-code .sql-gutter {
+  display: inline-block;
+  width: 24px;
+  margin-right: 16px;
+  color: var(--text-3);
+  text-align: right;
+  user-select: none;
+}
+.inspector-code .sql-text { white-space: pre; }
+.history-inspector p { font-size: 12px; color: var(--text-2); }
+.history-inspector small { display: block; margin-top: 12px; font-size: 11px; color: var(--text-3); }
+
+.hist-switch { display: flex; gap: var(--sp-2); margin-top: var(--sp-3); }
+.hist-foot { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
+.hist-foot { gap: 8px; }
+.hist-foot .btn { background: transparent; border: 0; color: var(--accent-text); padding: 0; }
+
+/* 保存的查询：同样是一行一条，改名与删除表单整行铺开。 */
+.saved-form { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-3); margin: var(--sp-4) 0; }
+.saved-form label { display: flex; flex-direction: column; gap: var(--sp-2); font-size: var(--fs-sm); }
+.saved-sql { white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: var(--fs-sm); line-height: var(--lh); background: var(--sunken); border-radius: var(--r); padding: var(--sp-2) var(--sp-3); margin: var(--sp-2) 0; max-width: 100%; }
+.saved-alert { margin: 0; color: var(--err); }
+.saved-rename { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; margin-top: var(--sp-2); width: 100%; }
+.saved-list { margin-top: var(--sp-3); }
+.saved-card .saved-name { font-size: 12px; font-weight: 600; white-space: nowrap; }
+.saved-card .saved-sql-line {
+  flex: 1 1 160px;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.saved-card .hist-foot { margin-left: auto; }
+.saved-card .hist-foot .muted { font-size: 11px; }
+
+@media (max-width: 900px) {
+  .history-layout { grid-template-columns: 1fr; }
+  .history-inspector { position: static; grid-row: 1; width: auto !important; }
+  .history-inspector .inspector-code { max-height: 160px; }
+  .inspector-grip { display: none; }
+}
