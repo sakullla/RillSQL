@@ -141,4 +141,55 @@ describe("import into an existing table", () => {
     expect(invoke).not.toHaveBeenCalled();
     wrapper.unmount();
   });
+
+  it("uses Listbox for the table and mapping selects and keeps the commit payload", async () => {
+    invoke.mockResolvedValue({
+      applied: [
+        { id: "import-1", sql: "INSERT", label: "新增 1 行" },
+        { id: "import-2", sql: "INSERT", label: "新增 1 行" },
+      ],
+      failed: null,
+      pendingIds: [],
+      rolledBack: false,
+      rule: "按顺序逐条提交，遇到错误即停止；已成功的语句不撤销。",
+    });
+    const wrapper = dialog();
+    expect(wrapper.find("select").exists()).toBe(false);
+    expect(wrapper.get("button[role='combobox'][aria-label='导入的表']").exists()).toBe(true);
+    await chooseFile(wrapper, "rows.csv", "name,email,note\r\n甲,a@example.com,\r\n乙,b@example.com,备注");
+    expect(wrapper.find("select").exists()).toBe(false);
+    const mappingLabels = wrapper
+      .findAll("button[role='combobox']")
+      .map((item) => item.attributes("aria-label") ?? "")
+      .filter((label) => label.endsWith(" 对应的列"));
+    expect(mappingLabels).toHaveLength(4);
+    expect(mappingLabels).toEqual(expect.arrayContaining(["id 对应的列", "name 对应的列", "email 对应的列", "note 对应的列"]));
+
+    await wrapper.get("button[aria-label='note 对应的列']").trigger("click");
+    const option = wrapper.findAll("[role='option']").find((item) => item.text().trim() === "不导入");
+    expect(option).toBeDefined();
+    await option!.trigger("click");
+    expect(wrapper.get("button[aria-label='note 对应的列']").text()).toContain("不导入");
+
+    await wrapper.get(".btn.primary").trigger("click");
+    await flushPromises();
+    const call = invoke.mock.calls.find((item) => item[0] === "grid_commit");
+    expect(call).toBeDefined();
+    const changes = call![1].request.changes as { id: string; kind: string; values: { column: string; value: string | null }[] }[];
+    expect(changes).toHaveLength(2);
+    expect(changes[0]).toMatchObject({
+      id: "import-1",
+      kind: "insert",
+      values: [
+        { column: "name", value: "甲" },
+        { column: "email", value: "a@example.com" },
+      ],
+    });
+    expect(changes[1]?.values).toEqual([
+      { column: "name", value: "乙" },
+      { column: "email", value: "b@example.com" },
+    ]);
+    expect(JSON.stringify(changes)).not.toContain("note");
+    wrapper.unmount();
+  });
 });

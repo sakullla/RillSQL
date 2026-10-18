@@ -1,12 +1,13 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mount } from "@vue/test-utils";
+import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, describe, expect, it } from "vitest";
 import { customersFixture } from "../grid/fixture";
 import { queryPage } from "../grid/data";
 import { selectExportGate } from "../grid/sql";
 import { parseCsvDistinct, renderCsv, type CsvOptions } from "./csv";
+import ExportDialog from "./ExportDialog.vue";
 import { renderInsert } from "./insert";
 import { renderJson } from "./json";
 import { planExport } from "./plan";
@@ -289,5 +290,59 @@ describe("json and insert export", () => {
     expect(readFileSync(insertPath, "utf8")).toContain("NULL");
     expect(readFileSync(insertPath, "utf8")).not.toContain("old");
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("export dialog advanced options", () => {
+  function dialog() {
+    return mount(ExportDialog, {
+      props: {
+        open: true,
+        origin: "table",
+        truncated: false,
+        fileStem: "customers",
+        loadedCount: 2,
+        pending: 0,
+        columns: ["id", "name"],
+        previewRows: [],
+      },
+    });
+  }
+
+  async function pick(wrapper: ReturnType<typeof dialog>, ariaLabel: string, optionText: string) {
+    await wrapper.get(`button[role='combobox'][aria-label='${ariaLabel}']`).trigger("click");
+    const option = wrapper.findAll("[role='option']").find((item) => item.text().trim() === optionText);
+    expect(option, `未找到选项 ${optionText}`).toBeDefined();
+    await option!.trigger("click");
+  }
+
+  it("replaces native selects with Listbox while keeping the aria labels", () => {
+    const wrapper = dialog();
+    expect(wrapper.find("select").exists()).toBe(false);
+    const labels = wrapper
+      .findAll("button[role='combobox']")
+      .map((item) => item.attributes("aria-label") ?? "");
+    expect(labels).toHaveLength(3);
+    expect([...labels].sort()).toEqual(["NULL 写法", "编码", "分隔符"].sort());
+    wrapper.unmount();
+  });
+
+  it("keeps the export payload fields after choosing options in Listbox", async () => {
+    const wrapper = dialog();
+    await pick(wrapper, "分隔符", "分号 ;");
+    await pick(wrapper, "NULL 写法", "\\N");
+    await pick(wrapper, "编码", "UTF-8");
+    await wrapper.get(".btn.primary").trigger("click");
+    await flushPromises();
+    const started = wrapper.emitted("start");
+    expect(started).toHaveLength(1);
+    expect(started![0]![0]).toMatchObject({
+      scope: "loaded",
+      format: "csv",
+      acknowledged: false,
+      csv: { delimiter: ";", nullToken: "\\N", bom: false, header: true },
+      path: expect.stringMatching(/^customers-\d{4}-\d{2}-\d{2}\.csv$/),
+    });
+    wrapper.unmount();
   });
 });

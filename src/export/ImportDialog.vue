@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
+import Listbox from "../ui/Listbox.vue";
+import type { ListboxOption } from "../ui/types";
 import { catalogConnections } from "../catalog/store";
 import { gridCommit, gridDescribe } from "../grid/api";
 import type { TableTarget } from "../grid/target";
@@ -51,6 +53,17 @@ const choices = computed(() => {
 function keyOf(schema: string, table: string): string {
   return `${schema}\u0000${table}`;
 }
+
+const tableOptions = computed<ListboxOption[]>(() =>
+  choices.value.map((item) => ({
+    value: keyOf(item.schema, item.table),
+    label: item.schema ? `${item.schema}.${item.table}` : item.table,
+  })),
+);
+const mappingOptions = computed<ListboxOption[]>(() => [
+  { value: "", label: "不导入" },
+  ...(parsed.value?.columns ?? []).map((name) => ({ value: name, label: name })),
+]);
 
 watch(
   () => props.open,
@@ -109,6 +122,12 @@ async function chooseTable() {
   }
 }
 
+function onTablePick(value: string) {
+  if (writing.value) return;
+  tableKey.value = value;
+  void chooseTable();
+}
+
 async function onFile(event: Event) {
   const file = (event.target as HTMLInputElement).files?.[0];
   resultText.value = "";
@@ -159,11 +178,16 @@ async function confirm() {
         <p class="ex-note" data-import-target>目标：{{ connectionName }} / {{ objectName }} <span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span></p>
         <p v-if="parseError" class="ex-alert" role="alert">{{ parseError }}</p>
         <p v-if="resultText" class="ex-note" role="status" data-import-result>{{ resultText }}</p>
-        <label class="ex-path">导入到
-          <select v-model="tableKey" aria-label="导入的表" :disabled="writing" @change="chooseTable">
-            <option v-for="item in choices" :key="keyOf(item.schema, item.table)" :value="keyOf(item.schema, item.table)">{{ item.schema ? `${item.schema}.${item.table}` : item.table }}</option>
-          </select>
-        </label>
+        <div class="ex-path">导入到
+          <span class="im-lock" :class="{ locked: writing }" :aria-disabled="writing ? 'true' : undefined">
+            <Listbox
+              :model-value="tableKey"
+              :options="tableOptions"
+              aria-label="导入的表"
+              @update:model-value="onTablePick"
+            />
+          </span>
+        </div>
         <fieldset class="ex-scope">
           <legend>文件格式</legend>
           <label class="ex-choice" :class="{ on: format === 'csv' }"><input v-model="format" type="radio" name="im-format" value="csv" :disabled="writing" /><span><b>CSV</b><small>第一行是列名。没有引号的空字段是空值。</small></span></label>
@@ -179,10 +203,13 @@ async function confirm() {
             <tr v-for="column in activeSchema.columns" :key="column.name">
               <td>{{ column.name }}<small v-if="!column.nullable && !column.auto"> 必填</small></td>
               <td>
-                <select v-model="mapping[column.name]" :aria-label="`${column.name} 对应的列`" :disabled="writing">
-                  <option value="">不导入</option>
-                  <option v-for="name in parsed.columns" :key="name" :value="name">{{ name }}</option>
-                </select>
+                <span class="im-lock" :class="{ locked: writing }" :aria-disabled="writing ? 'true' : undefined">
+                  <Listbox
+                    v-model="mapping[column.name]"
+                    :options="mappingOptions"
+                    :aria-label="`${column.name} 对应的列`"
+                  />
+                </span>
               </td>
             </tr>
           </tbody>
@@ -229,6 +256,8 @@ async function confirm() {
 .ex-choice b { font-size: var(--fs-sm); }
 .ex-choice small { display: block; color: var(--text-2); font-size: var(--fs-xs); }
 .ex-path { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-sm); color: var(--text-2); }
+.im-lock { display: inline-flex; max-width: 100%; min-width: 0; }
+.im-lock.locked { pointer-events: none; opacity: 0.6; }
 .map-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
 .map-table th, .map-table td { text-align: left; padding: var(--sp-1) var(--sp-2); border-bottom: 1px solid var(--line); }
 .preview-scroll { max-height: 180px; overflow: auto; }
