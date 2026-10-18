@@ -1638,6 +1638,20 @@ describe("DataGrid desktop selection", () => {
     wrapper.unmount();
   });
 
+  it("turns shift+wheel into horizontal scroll without touching plain wheel (S6.4)", async () => {
+    const wrapper = await mountSelectionGrid();
+    const viewport = wrapper.get(".grid-scroll").element as HTMLElement;
+    const shift = new WheelEvent("wheel", { bubbles: true, cancelable: true, shiftKey: true, deltaY: 120 });
+    viewport.dispatchEvent(shift);
+    expect(shift.defaultPrevented).toBe(true);
+    expect(viewport.scrollLeft).toBe(120);
+    const plain = new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: 80 });
+    viewport.dispatchEvent(plain);
+    expect(plain.defaultPrevented).toBe(false);
+    expect(viewport.scrollLeft).toBe(120);
+    wrapper.unmount();
+  });
+
   it("selects a rectangle from the anchor with shift click", async () => {
     const wrapper = await mountSelectionGrid();
     pointer(wrapper.get('[data-cell="1:id"]').element);
@@ -1928,6 +1942,20 @@ describe("QueryResultGrid desktop selection", () => {
     await nextTick();
     expect(selectedCells(wrapper).sort()).toEqual(["r0:id", "r1:id"]);
     expect(focusDataCell(wrapper)).toBe("r2:id");
+    wrapper.unmount();
+  });
+
+  it("turns shift+wheel into horizontal scroll without touching plain wheel (S6.4)", async () => {
+    const wrapper = await mountQueryGrid();
+    const viewport = wrapper.get(".grid-scroll").element as HTMLElement;
+    const shift = new WheelEvent("wheel", { bubbles: true, cancelable: true, shiftKey: true, deltaY: 90 });
+    viewport.dispatchEvent(shift);
+    expect(shift.defaultPrevented).toBe(true);
+    expect(viewport.scrollLeft).toBe(90);
+    const plain = new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: 60 });
+    viewport.dispatchEvent(plain);
+    expect(plain.defaultPrevented).toBe(false);
+    expect(viewport.scrollLeft).toBe(90);
     wrapper.unmount();
   });
 

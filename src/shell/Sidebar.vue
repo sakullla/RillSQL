@@ -32,13 +32,16 @@ const filter = ref("");
 
 let stopResize: (() => void) | null = null;
 onBeforeUnmount(() => stopResize?.());
+const MIN_WIDTH = 200;
+const MAX_WIDTH = 480;
+const DEFAULT_WIDTH = 234;
 function onPointerDown(event: PointerEvent) {
   event.preventDefault();
   stopResize?.();
   const startX = event.clientX;
-  const startWidth = (event.currentTarget as HTMLElement).previousElementSibling?.getBoundingClientRect().width ?? 268;
+  const startWidth = (event.currentTarget as HTMLElement).previousElementSibling?.getBoundingClientRect().width ?? DEFAULT_WIDTH;
   const move = (ev: PointerEvent) => {
-    emit("resize", Math.min(460, Math.max(200, startWidth + ev.clientX - startX)));
+    emit("resize", Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, startWidth + ev.clientX - startX)));
   };
   const stop = () => {
     window.removeEventListener("pointermove", move);
@@ -76,9 +79,10 @@ function onPointerDown(event: PointerEvent) {
     aria-orientation="vertical"
     aria-label="调整资源管理器宽度"
     tabindex="0"
-    :aria-valuenow="width" :aria-valuemin="200" :aria-valuemax="460"
-    @keydown.left.prevent="emit('resize', Math.max(200, props.width - 20))"
-    @keydown.right.prevent="emit('resize', Math.min(460, props.width + 20))"
+    :aria-valuenow="width" :aria-valuemin="MIN_WIDTH" :aria-valuemax="MAX_WIDTH"
+    @keydown.left.prevent="emit('resize', Math.max(MIN_WIDTH, props.width - 20))"
+    @keydown.right.prevent="emit('resize', Math.min(MAX_WIDTH, props.width + 20))"
+    @dblclick="emit('resize', DEFAULT_WIDTH)"
     @pointerdown="onPointerDown"
   ></div>
 </template>

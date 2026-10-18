@@ -30,6 +30,26 @@ describe("desktop shortcuts", () => {
     expect(chordByLabel("编辑单元格")).toBe("Enter / F2");
     expect(chordByLabel("不存在的动作")).toBeUndefined();
   });
+
+  it("documents the grid clipboard, find, structure, and tree shortcuts (S6.5)", () => {
+    const labels = SHORTCUTS.map((item) => item.label);
+    // 「复制值」被更精确的 TSV 描述替换，旧 label 不再留在表里
+    expect(labels).toContain("复制选中单元格为 TSV");
+    expect(labels).not.toContain("复制值");
+    expect(labels).toContain("全选已读取行");
+    expect(labels).toContain("在结果网格中查找");
+    expect(labels).toContain("打开表结构");
+    expect(labels).toContain("在对象树中移动焦点");
+    // 带 menus 标注的条目必须能被 chordByLabel（菜单/上下文用它查表）找到
+    expect(chordByLabel("复制选中单元格为 TSV")).toBe("Mod+C");
+    expect(chordByLabel("全选已读取行")).toBe("Mod+A");
+    expect(chordByLabel("在结果网格中查找")).toBe("Ctrl+F");
+    expect(chordByLabel("打开表结构")).toBe("F4");
+    expect(chordByLabel("在对象树中移动焦点")).toBe("Alt+↑ / Alt+↓");
+    for (const item of SHORTCUTS) {
+      expect(["全局", "SQL 编辑器", "表格"], `${item.label} 的分组非法`).toContain(item.group);
+    }
+  });
 });
 
 describe("shortcut ↔ menu alignment", () => {

@@ -16,7 +16,8 @@ import { filterPalette, shellCommands } from "./commands";
 import EnvPill from "./EnvPill.vue";
 import { PRODUCT_TITLE } from "./product";
 import { shellMenus } from "./menus";
-import type { ShellTab } from "./session";
+import { createSession, type ShellTab } from "./session";
+import Sidebar from "./Sidebar.vue";
 import StatusBar from "./StatusBar.vue";
 import { CONNECTION_STATUS_TEXT, ENVIRONMENT_LABELS, OPERATION_STATE_TEXT, type OperationState } from "./status-text";
 import TitleBar from "./TitleBar.vue";
@@ -236,5 +237,41 @@ describe("shell layout", () => {
     expect(html).toContain(`<title>${PRODUCT_TITLE}</title>`);
     expect(tauri).toContain(`"title": "${PRODUCT_TITLE}"`);
     expect(tauri).toContain(`"productName": "${PRODUCT_TITLE}"`);
+  });
+});
+
+describe("sidebar width (S6.2 / S7.2)", () => {
+  it("starts the explorer at 234px", () => {
+    const session = createSession();
+    expect(session.sidebarWidth.value).toBe(234);
+  });
+
+  it("clamps resize to 200–480 and resets to 234 on resizer double-click", async () => {
+    const wrapper = mount(Sidebar, { props: { width: 300 } });
+    const resizer = wrapper.get(".sb-resizer");
+    expect(resizer.attributes("role")).toBe("separator");
+    expect(resizer.attributes("aria-valuemin")).toBe("200");
+    expect(resizer.attributes("aria-valuemax")).toBe("480");
+
+    await resizer.trigger("keydown", { key: "ArrowRight" });
+    expect(wrapper.emitted("resize")?.at(-1)).toEqual([320]);
+    await wrapper.setProps({ width: 470 });
+    await resizer.trigger("keydown", { key: "ArrowRight" });
+    expect(wrapper.emitted("resize")?.at(-1)).toEqual([480]);
+    await wrapper.setProps({ width: 210 });
+    await resizer.trigger("keydown", { key: "ArrowLeft" });
+    expect(wrapper.emitted("resize")?.at(-1)).toEqual([200]);
+
+    // 拖拽越界同样钳制；jsdom 里前一个兄弟的宽度读数是 0，所以增量即 clientX 差
+    resizer.element.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true, clientX: 300 }));
+    window.dispatchEvent(new MouseEvent("pointermove", { clientX: 3000 }));
+    expect(wrapper.emitted("resize")?.at(-1)).toEqual([480]);
+    window.dispatchEvent(new MouseEvent("pointermove", { clientX: -3000 }));
+    expect(wrapper.emitted("resize")?.at(-1)).toEqual([200]);
+    window.dispatchEvent(new MouseEvent("pointerup"));
+
+    await resizer.trigger("dblclick");
+    expect(wrapper.emitted("resize")?.at(-1)).toEqual([234]);
+    wrapper.unmount();
   });
 });

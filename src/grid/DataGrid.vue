@@ -759,6 +759,15 @@ function onEditorKeydown(event: KeyboardEvent) {
   }
 }
 
+/** Shift+滚轮转为横向滚动；普通滚轮保持原生纵向滚动，不拦截。 */
+function onScrollWheel(event: WheelEvent) {
+  if (!event.shiftKey) return;
+  event.preventDefault();
+  const el = viewport.value;
+  if (!el) return;
+  el.scrollLeft += event.deltaY || event.deltaX;
+}
+
 /** 未编辑时：方向键移动/Shift 扩展，Enter/F2 编辑焦点格，Tab 移动，Ctrl+A 全选，Ctrl+C 复制 TSV，Esc 清除选择。 */
 function onGridKeydown(event: KeyboardEvent) {
   if (editing.value) return;
@@ -966,7 +975,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
     <p v-if="importMessage" class="hint export-message" role="status">{{ importMessage }}</p>
     <p v-if="exportMessage" class="hint export-message" role="status">{{ exportMessage }}</p>
     <p v-if="session.error" class="grid-alert" role="alert">读取失败：{{ session.error }}。这不是无匹配结果。筛选条件仍保留。 <button class="btn sm" type="button" :disabled="retrying" @click="retryRead">重试</button></p>
-    <div ref="viewport" class="grid-scroll" @scroll.passive="onScroll" @keydown="onGridKeydown" @contextmenu="onGridContextMenu">
+    <div ref="viewport" class="grid-scroll" @scroll.passive="onScroll" @wheel="onScrollWheel" @keydown="onGridKeydown" @contextmenu="onGridContextMenu">
       <table class="grid-table">
         <thead>
           <tr>

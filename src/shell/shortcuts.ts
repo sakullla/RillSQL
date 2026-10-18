@@ -15,6 +15,8 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
   { group: "全局", chord: "Mod+T", label: "新建查询", menus: ["文件"] },
   { group: "全局", chord: "Mod+W", label: "关闭当前标签", menus: ["窗口"] },
   { group: "全局", chord: "Mod+B", label: "显示 / 隐藏资源管理器", menus: ["视图"] },
+  { group: "全局", chord: "F4", label: "打开表结构", menus: ["视图"] },
+  { group: "全局", chord: "Alt+↑ / Alt+↓", label: "在对象树中移动焦点", menus: ["视图"] },
   { group: "全局", chord: "Alt+1…9", label: "切换到第 N 个标签", menus: ["窗口"] },
   { group: "全局", chord: "Mod+,", label: "设置", menus: ["文件", "工具"] },
   { group: "全局", chord: "?", label: "快捷键帮助", menus: ["视图", "帮助"] },
@@ -32,7 +34,9 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
   { group: "表格", chord: "Delete", label: "标记删除行（暂存）" },
   { group: "表格", chord: "Mod+Z", label: "撤销最近一项暂存变更" },
   { group: "表格", chord: "Mod+S", label: "预览并提交变更" },
-  { group: "表格", chord: "Mod+C", label: "复制值" },
+  { group: "表格", chord: "Mod+C", label: "复制选中单元格为 TSV", menus: ["编辑"] },
+  { group: "表格", chord: "Mod+A", label: "全选已读取行", menus: ["编辑"] },
+  { group: "表格", chord: "Ctrl+F", label: "在结果网格中查找", menus: ["编辑"] },
   { group: "表格", chord: "Mod+Shift+C", label: "复制为 SQL 值（区分 NULL）" },
 ];
 

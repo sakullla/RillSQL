@@ -51,4 +51,31 @@ describe("shell geometry", () => {
     expect(shell).not.toMatch(/\.tabbar\s*\{[^}]*border-(bottom|top):\s*1px/);
     expect(shell).toMatch(/\.tabbar\s*\{[^}]*box-shadow:\s*inset 0 -1px 0 var\(--line\)/);
   });
+
+  it("fixed-height chrome strips stay off physical borders (statusbar, results heading, editor position)", () => {
+    const query = readFileSync(resolve(here, "../query/QueryTab.vue"), "utf8");
+    const shell = readFileSync(resolve(here, "shell.css"), "utf8");
+    // 结果标题条：固定 --result-head-h，分隔线用 inset 阴影而非 border-bottom
+    expect(query).toMatch(/\.results-heading\s*\{[^}]*height:\s*var\(--result-head-h\)/);
+    expect(query).not.toMatch(/\.results-heading\s*\{[^}]*border-bottom:\s*1px/);
+    expect(query).toMatch(/\.results-heading\s*\{[^}]*box-shadow:\s*inset 0 -1px 0 var\(--line\)/);
+    // 编辑器位置提示条：固定 --hint-h，不带实体边框
+    expect(query).toMatch(/\.editor-position\s*\{[^}]*height:\s*var\(--hint-h\)/);
+    expect(query).not.toMatch(/\.editor-position\s*\{[^}]*border-(top|bottom|block)/);
+    // 状态栏：固定在 --status-h 网格行里，顶部分隔线用 inset 阴影
+    expect(shell).not.toMatch(/\.statusbar\s*\{[^}]*border-top:\s*1px/);
+    expect(shell).toMatch(/\.statusbar\s*\{[^}]*box-shadow:\s*inset 0 1px 0 var\(--line\)/);
+  });
+
+  it("styles the editor/result splitter and sidebar resizer per S6.2", () => {
+    const query = readFileSync(resolve(here, "../query/QueryTab.vue"), "utf8");
+    const shell = readFileSync(resolve(here, "shell.css"), "utf8");
+    // 分隔条 6px、hover/focus 强调底色、中央 30×2 握槽；不用实体 border（border-box 会吃高度）
+    expect(query).toMatch(/\.query-splitter\s*\{[^}]*height:\s*6px/);
+    expect(query).not.toMatch(/\.query-splitter\s*\{[^}]*border-(top|bottom|block)/);
+    expect(query).toMatch(/\.query-splitter:hover, \.query-splitter:focus-visible\s*\{[^}]*background:\s*var\(--accent-soft\)/);
+    expect(query).toMatch(/\.query-splitter span\s*\{[^}]*height:\s*2px[^}]*width:\s*30px/);
+    // 侧栏把手：hover/focus 显示 2px 强调指示线
+    expect(shell).toMatch(/\.sb-resizer:hover::after[^}]*width:\s*2px/);
+  });
 });

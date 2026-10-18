@@ -867,11 +867,11 @@ onBeforeUnmount(() => {
 .query-pane :deep(.cm-activeLine), .query-pane :deep(.cm-activeLineGutter) { background: var(--sel); }
 .query-pane :deep(.cm-placeholder) { color: var(--text-3); }
 .editor-position { display: flex; align-items: center; justify-content: space-between; gap: 10px; height: var(--hint-h); padding: 0 var(--sp-4); color: var(--text-3); font-size: 10px; }
-.query-splitter { height: 7px; flex-shrink: 0; display: grid; place-items: center; background: var(--panel-2); border-block: 1px solid var(--line); cursor: row-resize; touch-action: none; }
+.query-splitter { height: 6px; flex-shrink: 0; display: grid; place-items: center; background: var(--panel-2); /* border-box 下实体 border 会吃掉固定高度，分隔线用 inset 阴影 */ box-shadow: inset 0 1px 0 var(--line), inset 0 -1px 0 var(--line); cursor: row-resize; touch-action: none; }
 .query-splitter span { height: 2px; width: 30px; background: var(--line-2); border-radius: 2px; }
 .query-splitter:hover, .query-splitter:focus-visible { background: var(--accent-soft); }
 .query-pane .q-results { flex: 1; min-height: 130px; padding: 0; gap: 0; border: 0; }
-.results-heading { display: flex; align-items: center; gap: 20px; height: var(--result-head-h); padding: 0 var(--sp-4); border-bottom: 1px solid var(--line); font-size: 11px; flex-shrink: 0; }
+.results-heading { display: flex; align-items: center; gap: 20px; height: var(--result-head-h); padding: 0 var(--sp-4); box-shadow: inset 0 -1px 0 var(--line); font-size: 11px; flex-shrink: 0; }
 .plan-view { padding: 12px 16px; overflow: auto; }
 .plan-caption { margin: 0 0 8px; font-size: var(--fs-sm); color: var(--text-2); }
 .plan-view table { border-collapse: collapse; font-family: var(--mono); font-size: var(--fs-xs); }

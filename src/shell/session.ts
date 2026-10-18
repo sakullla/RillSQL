@@ -133,7 +133,7 @@ export function createSession(initialHash = ""): ShellSession {
   const tabs = ref<ShellTab[]>([]);
   const activeId = ref<string | null>(null);
   const sidebarHidden = ref(typeof window !== "undefined" && window.innerWidth <= 960);
-  const sidebarWidth = ref(268);
+  const sidebarWidth = ref(234);
   const paletteOpen = ref(false);
   const paletteMode = ref<"all" | "tables">("all");
   const helpOpen = ref(false);
