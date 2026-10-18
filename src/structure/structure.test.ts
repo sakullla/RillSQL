@@ -1,4 +1,6 @@
 import { flushPromises, mount } from "@vue/test-utils";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
 import type { CatalogConnection } from "../catalog/types";
@@ -7,12 +9,15 @@ import {
   canDropIndex,
   columnImpact,
   draftsFromColumns,
+  fkActions,
   impactLevel,
   pendingCount,
   riskLevelLabel,
   statusLabel,
   transactionSummary,
 } from "./logic";
+import ForeignKeyEditor from "./ForeignKeyEditor.vue";
+import IndexEditor from "./IndexEditor.vue";
 
 const invoke = vi.hoisted(() => vi.fn());
 
@@ -253,6 +258,111 @@ describe("structure pane", () => {
     expect(dialog.get("[role='alert']").text()).toContain("表含 CHECK 约束，重建不能可靠保留该约束，因此阻止执行。");
     expect(buttonNamed(wrapper, "确认执行").attributes("disabled")).toBeDefined();
     wrapper.unmount();
+  });
+
+  it("replaces the create-form connection select with a Listbox while keeping the pane landmarks", async () => {
+    replaceCatalog([catalogConnection(), { ...catalogConnection(), id: "c2", name: "沙箱", env: "dev", envLabel: "开发", envTone: "dev" }]);
+    const wrapper = mount(StructurePane, { props: { tabId: "structure:placeholder", draft: "", purpose: "create" } });
+    await flushPromises();
+    expect(wrapper.attributes("aria-label")).toBe("表结构");
+    expect(wrapper.attributes("data-tab-id")).toBe("structure:placeholder");
+    /* 连接选择从原生 select 换成 Listbox combobox。 */
+    expect(wrapper.find('select[aria-label="目标连接"]').exists()).toBe(false);
+    const combobox = wrapper.get('[role="combobox"][aria-label="目标连接"]');
+    expect(combobox.attributes("aria-haspopup")).toBe("listbox");
+    expect(combobox.text()).toContain("笔记库");
+    /* create 模式只有字段分区；删除表等危险操作在 edit 模式。 */
+    const createNav = wrapper.findAll(".struct-nav button").map((node) => node.text());
+    expect(createNav).toContain("字段");
+    expect(createNav).not.toContain("删除表");
+    wrapper.unmount();
+
+    const edit = mount(StructurePane, { props: { tabId: "table:c1", draft: "", purpose: "edit", target } });
+    await flushPromises();
+    const editNav = edit.findAll(".struct-nav button").map((node) => node.text());
+    expect(editNav).toContain("字段");
+    expect(editNav).toContain("索引");
+    expect(editNav).toContain("外键");
+    expect(editNav).toContain("删除表");
+    edit.unmount();
+  });
+
+  it("shows field and index counts in the structure stats row on edit", async () => {
+    const wrapper = mount(StructurePane, { props: { tabId: "table:c1", draft: "", purpose: "edit", target } });
+    await flushPromises();
+    const stats = wrapper.get(".structure-stats");
+    expect(stats.text()).toContain("字段");
+    expect(stats.text()).toContain("2");
+    expect(stats.text()).toContain("索引");
+    expect(stats.text()).toContain("2");
+    wrapper.unmount();
+  });
+
+  it("keeps the environment tag visible in the edit summary context", async () => {
+    replaceCatalog([catalogConnection()]);
+    const wrapper = mount(StructurePane, { props: { tabId: "table:c1", draft: "", purpose: "edit", target } });
+    await flushPromises();
+    const tag = wrapper.get(".structure-heading .env");
+    expect(tag.text()).toBe("生产");
+    expect(wrapper.get(".structure-heading").text()).toContain("来自连接「笔记库」的「main」");
+    wrapper.unmount();
+  });
+
+  it("uses Listbox controls instead of native selects in the foreign-key and index editors", async () => {
+    replaceCatalog([catalogConnection()]);
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "ddl_describe") {
+        return {
+          ...described,
+          foreignKeys: true,
+          foreignKeyList: [{ name: "notes_note_fkey", columns: ["note"], refSchema: "", refTable: "logs", refColumns: ["note"], onDelete: "NO ACTION", onUpdate: "NO ACTION" }],
+        };
+      }
+      return {};
+    });
+    const wrapper = mount(StructurePane, { props: { tabId: "table:c1", draft: "", purpose: "edit", target } });
+    await flushPromises();
+    await buttonNamed(wrapper, "外键").trigger("click");
+    const fk = wrapper.getComponent(ForeignKeyEditor);
+    expect(fk.find('select[aria-label="删除引用行时"]').exists()).toBe(false);
+    expect(fk.find('select[aria-label="更新引用列时"]').exists()).toBe(false);
+    expect(fk.findAll('[role="combobox"][aria-label="删除引用行时"]')).toHaveLength(1);
+    expect(fk.findAll('[role="combobox"][aria-label="更新引用列时"]')).toHaveLength(1);
+
+    await buttonNamed(wrapper, "索引").trigger("click");
+    const indexEditor = wrapper.getComponent(IndexEditor);
+    expect(indexEditor.find('select[aria-label="索引列 1"]').exists()).toBe(false);
+    expect(indexEditor.findAll('[role="combobox"][aria-label="索引列 1"]')).toHaveLength(1);
+    wrapper.unmount();
+  });
+
+  it("mounts the editors without any native select element", async () => {
+    const fk = mount(ForeignKeyEditor, {
+      props: {
+        foreignKeys: [],
+        incoming: [],
+        columns: ["id", "note"],
+        engine: "sqlite",
+        storage: null,
+        enforced: true,
+      },
+    });
+    expect(fk.findAll("select")).toHaveLength(0);
+    const actions = fkActions("sqlite");
+    await fk.get('[role="combobox"][aria-label="删除引用行时"]').trigger("click");
+    expect(fk.findAll('[role="option"]').map((node) => node.text())).toEqual(actions);
+    fk.unmount();
+
+    const indexEditor = mount(IndexEditor, { props: { indexes: [], columns: ["id", "note"] } });
+    expect(indexEditor.findAll("select")).toHaveLength(0);
+    indexEditor.unmount();
+  });
+
+  it("contains no leftover native select markup in the editor sources", () => {
+    for (const name of ["ForeignKeyEditor.vue", "IndexEditor.vue", "StructurePane.vue"]) {
+      const source = readFileSync(join(process.cwd(), "src", "structure", name), "utf8");
+      expect(source.includes("<select"), `${name} should not render native selects`).toBe(false);
+    }
   });
 
   it("reports each step in plain words and expands the details when a step fails", async () => {

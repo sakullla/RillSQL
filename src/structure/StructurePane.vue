@@ -3,6 +3,8 @@ import Icon from "../shell/Icon.vue";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { catalogConnections, refreshCatalog } from "../catalog/store";
 import type { TableTarget } from "../grid/target";
+import { Listbox } from "../ui";
+import type { ListboxOption } from "../ui";
 import { describeStructure, executeStructure, previewStructure, type StructureRequest } from "./api";
 import ChangePreviewDialog from "./ChangePreviewDialog.vue";
 import ForeignKeyEditor from "./ForeignKeyEditor.vue";
@@ -36,6 +38,7 @@ const createDatabase = ref("");
 const createSchema = ref("");
 
 const connections = computed(() => catalogConnections().filter((item) => item.status === "connected"));
+const connectionOptions = computed<ListboxOption[]>(() => connections.value.map((item) => ({ value: item.id, label: item.name })));
 
 watch(
   () => props.focusSection,
@@ -251,9 +254,7 @@ function createForeignKey(foreignKey: StructureForeignKey) {
       <div v-else class="struct-body">
         <form v-if="purpose === 'create'" class="struct-form" @submit.prevent="previewColumns">
           <label>连接
-            <select v-model="createConnection" aria-label="目标连接">
-              <option v-for="item in connections" :key="item.id" :value="item.id">{{ item.name }}</option>
-            </select>
+            <Listbox v-model="createConnection" :options="connectionOptions" aria-label="目标连接" placeholder="选择连接" />
           </label>
           <label>数据库<input v-model="createDatabase" type="text" aria-label="目标数据库" /></label>
           <label>Schema<input v-model="createSchema" type="text" aria-label="目标 schema" /></label>

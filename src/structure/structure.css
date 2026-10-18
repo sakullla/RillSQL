@@ -72,8 +72,15 @@
 .struct-toolbar .muted { font-size: var(--fs-sm); }
 .struct-table { border-collapse: collapse; width: max-content; min-width: 100%; max-width: none; font-size: var(--fs-sm); }
 .struct-table th,
-.struct-table td { border-bottom: 1px solid var(--line); padding: var(--sp-1) var(--sp-2); text-align: left; vertical-align: middle; }
-.struct-table th { color: var(--text-3); font-weight: 500; font-size: var(--fs-xs); }
+.struct-table td {
+  height: var(--row-h);
+  border-bottom: 1px solid var(--line);
+  padding: 0 var(--sp-2);
+  text-align: left;
+  vertical-align: middle;
+  font-variant-numeric: tabular-nums;
+}
+.struct-table th { position: sticky; top: 0; z-index: 2; background: var(--panel-2); color: var(--text-3); font-weight: 500; font-size: var(--fs-xs); }
 .struct-table input[type="text"],
 .struct-table select { width: 100%; min-width: 72px; }
 .struct-table .cell-check { width: 44px; text-align: center; }
@@ -179,7 +186,7 @@
 .structure-heading h2 { margin: 6px 0; font: 600 22px var(--mono); }
 .structure-heading p { margin: 0; color: var(--text-2); font-size: 11px; }
 .structure-stats { display: flex; gap: 24px; color: var(--text-3); font-size: 11px; }
-.structure-stats b { display: block; color: var(--text); font: 20px var(--mono); text-align: center; margin-bottom: 4px; }
+.structure-stats b { display: block; color: var(--text); font: 600 15px var(--mono); text-align: center; margin-bottom: 4px; font-variant-numeric: tabular-nums; }
 .structure-pane .struct-nav { gap: 16px; padding: 0 24px; min-height: 44px; background: var(--panel-2); }
 .structure-pane .struct-nav button { height: 44px; padding: 0 6px; border-radius: 0; border-bottom: 2px solid transparent; }
 .structure-pane .struct-nav button.on { border-bottom-color: var(--accent); color: var(--accent-text); background: transparent; }
@@ -188,8 +195,6 @@
 .struct-editor .struct-toolbar { padding: 16px; }
 .struct-editor .struct-toolbar .muted { font-size: 11px; }
 .struct-editor .struct-table thead { background: var(--panel-2); }
-.struct-editor .struct-table th { padding-top: 10px; padding-bottom: 10px; }
-.struct-editor .struct-table td { padding-top: 7px; padding-bottom: 7px; }
 .struct-editor .struct-table input[type="text"] { border-color: transparent; background: transparent; font: 12px var(--mono); }
 .struct-editor .struct-table input[type="text"]:hover { border-color: var(--line-2); }
 .struct-editor .struct-table input[type="text"]:focus { border-color: var(--accent); background: var(--panel); }

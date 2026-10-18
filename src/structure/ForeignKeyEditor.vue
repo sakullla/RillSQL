@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, ref } from "vue";
+import { Listbox } from "../ui";
+import type { ListboxOption } from "../ui";
 import { fkActions, foreignKeyLabel } from "./logic";
 import type { StructureForeignKey, StructureIncoming } from "./types";
 
@@ -25,6 +27,8 @@ const refColumn = ref("");
 const onDelete = ref("NO ACTION");
 const onUpdate = ref("NO ACTION");
 const myisam = props.storage?.toLowerCase() === "myisam";
+
+const actionOptions = computed<ListboxOption[]>(() => fkActions(props.engine).map((action) => ({ value: action, label: action })));
 
 function splitColumns(value: string): string[] {
   return value.split(",").map((item) => item.trim()).filter(Boolean);
@@ -81,14 +85,10 @@ function previewCreate() {
       <label>目标表<input v-model="refTable" type="text" aria-label="目标表" /></label>
       <label>目标字段<input v-model="refColumn" type="text" aria-label="目标列" placeholder="一列，或多列用逗号分隔" /></label>
       <label>删除引用行时
-        <select v-model="onDelete" aria-label="删除引用行时">
-          <option v-for="action in fkActions(engine)" :key="action">{{ action }}</option>
-        </select>
+        <Listbox v-model="onDelete" :options="actionOptions" aria-label="删除引用行时" />
       </label>
       <label>更新引用列时
-        <select v-model="onUpdate" aria-label="更新引用列时">
-          <option v-for="action in fkActions(engine)" :key="action">{{ action }}</option>
-        </select>
+        <Listbox v-model="onUpdate" :options="actionOptions" aria-label="更新引用列时" />
       </label>
       <button class="btn primary" type="submit">查看将要发生什么</button>
     </form>
