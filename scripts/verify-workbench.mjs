@@ -28,7 +28,7 @@ try {
   await expect(tree).toContainText("库存 · 本地");
   await expect(tree).toContainText("笔记");
   await expect(page.locator(".desk-db")).toHaveCount(0);
-  await page.getByRole("button", { name: "新建查询", exact: true }).click();
+  await page.getByRole("toolbar", { name: "主工具栏" }).getByRole("button", { name: "新建查询", exact: true }).click();
   await page.locator("[data-action=target]").click();
   await page.getByRole("listbox", { name: "执行目标" }).getByRole("option", { name: /书店 · 开发/ }).click();
   await expect(page.locator("[data-action=target]")).toContainText("bookstore");
@@ -36,7 +36,7 @@ try {
   await page.locator(".cm-content").click();
   await page.keyboard.insertText("SELECT * FROM orders;");
   const started = performance.now();
-  await page.locator("[data-action=run]").click();
+  await page.locator(".query-pane [data-action=run]").click();
   await expect(page.locator(".q-summary")).toContainText("10000 行");
   report.metrics.largeResultReadyMs = Math.round(performance.now() - started);
   const rendered = await page.locator("[data-row-id]").count();
