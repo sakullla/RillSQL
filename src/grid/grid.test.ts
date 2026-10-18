@@ -1809,6 +1809,47 @@ describe("DataGrid desktop selection", () => {
     expect(focusDataCell(wrapper)).toBeNull();
     wrapper.unmount();
   });
+
+  it("drops the selection when addRow prepends a draft row", async () => {
+    const wrapper = await mountSelectionGrid();
+    pointer(wrapper.get('tr[data-row-id="2"] td.row-number').element);
+    await nextTick();
+    expect(selectedCells(wrapper)).toHaveLength(3);
+    expect(focusDataCell(wrapper)).toBe("2:note");
+    await wrapper.findAll("button").find((button) => button.text() === "新增行")!.trigger("click");
+    await flushPromises();
+    expect(selectedCells(wrapper)).toHaveLength(0);
+    expect(focusDataCell(wrapper)).toBeNull();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("clears the selection when a filter replaces the rows", async () => {
+    invoke.mockImplementation(async (command: string, args: { request?: { filters?: unknown[] } }) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") {
+        const filters = args.request?.filters ?? [];
+        const rows = filters.length ? [customerRow(2), customerRow(3)] : [customerRow(1), customerRow(2), customerRow(3)];
+        return { rows, truncated: false, sql: "SELECT customers" };
+      }
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:selection-filter", draft: "", pageSize: 10, target: customersTarget } });
+    await flushPromises();
+    pointer(wrapper.get('tr[data-row-id="2"] td.row-number').element);
+    await nextTick();
+    expect(selectedCells(wrapper)).toHaveLength(3);
+    expect(focusDataCell(wrapper)).toBe("2:note");
+    await wrapper.get("select[aria-label='筛选列']").setValue("id");
+    await wrapper.get("select[aria-label='筛选条件']").setValue("eq");
+    await wrapper.get("input[aria-label='筛选值']").setValue("2");
+    await wrapper.get("form.filter-form").trigger("submit");
+    await flushPromises();
+    expect(selectedCells(wrapper)).toHaveLength(0);
+    expect(focusDataCell(wrapper)).toBeNull();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    wrapper.unmount();
+  });
 });
 
 describe("QueryResultGrid desktop selection", () => {
@@ -2046,6 +2087,135 @@ describe("QueryResultGrid desktop selection", () => {
     expect(wrapper.get('[data-cell="r1:name"]').text()).toBe("客户2");
     expect(focusDataCell(wrapper)).toBe("r1:name");
     expect(wrapper.find(".pending-bar").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  async function mountEditableQueryGrid(tabId: string) {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      throw new Error(command);
+    });
+    const model = selectionModel();
+    const wrapper = mount(QueryResultGrid, {
+      props: {
+        tabId,
+        statement: "SELECT id, name, email, note FROM public.customers",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+        schema: "public",
+      },
+    });
+    await flushPromises();
+    expect(wrapper.attributes("data-editable")).toBe("true");
+    return wrapper;
+  }
+
+  it("refreshes the inspector with the staged value after Enter saves the edit", async () => {
+    const wrapper = await mountEditableQueryGrid("query-save-inspector");
+    pointer(wrapper.get('[data-cell="r1:name"]').element);
+    await nextTick();
+    gridKey(wrapper, "Enter");
+    await nextTick();
+    const input = wrapper.get("input[aria-label='编辑 name']");
+    await input.setValue("保存后的名字");
+    await input.trigger("keydown", { key: "Enter" });
+    await nextTick();
+    expect(wrapper.find("input[aria-label='编辑 name']").exists()).toBe(false);
+    expect(wrapper.get('[data-cell="r1:name"]').text()).toBe("保存后的名字");
+    expect(wrapper.find(".inspector").exists()).toBe(true);
+    expect((wrapper.get(".inspector textarea").element as HTMLTextAreaElement).value).toBe("保存后的名字");
+    wrapper.unmount();
+  });
+
+  it("clears the selection and closes the inspector when the rows are replaced", async () => {
+    const wrapper = await mountQueryGrid();
+    pointer(wrapper.get('tr[data-row-id="r0"] td.row-number').element);
+    await nextTick();
+    expect(selectedCells(wrapper)).toHaveLength(3);
+    expect(focusDataCell(wrapper)).toBe("r0:note");
+    expect(wrapper.find(".inspector").exists()).toBe(true);
+    const next = gridModel({
+      columns: ["id", "name", "email", "note"],
+      rows: [
+        ["7", "客户7", "g@example.com", "备注7"],
+        ["8", "客户8", "h@example.com", "备注8"],
+      ],
+    });
+    await wrapper.setProps({ rows: next.rows });
+    await nextTick();
+    expect(selectedCells(wrapper)).toHaveLength(0);
+    expect(focusDataCell(wrapper)).toBeNull();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("clears the selection and closes the inspector when the find text changes", async () => {
+    const wrapper = await mountQueryGrid();
+    pointer(wrapper.get('[data-cell="r0:id"]').element);
+    await nextTick();
+    pointer(wrapper.get('[data-cell="r1:name"]').element, { shift: true });
+    await nextTick();
+    expect(selectedCells(wrapper).length).toBeGreaterThan(0);
+    expect(wrapper.find(".inspector").exists()).toBe(true);
+    await wrapper.get("input[aria-label='在已读取行中查找']").setValue("客户2");
+    await nextTick();
+    expect(selectedCells(wrapper)).toHaveLength(0);
+    expect(focusDataCell(wrapper)).toBeNull();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("removes a whole row or column from the selection with ctrl click", async () => {
+    const wrapper = await mountQueryGrid();
+    pointer(wrapper.get('tr[data-row-id="r0"] td.row-number').element);
+    await nextTick();
+    expect(selectedCells(wrapper)).toHaveLength(3);
+    pointer(wrapper.get('tr[data-row-id="r0"] td.row-number').element, { ctrl: true });
+    await nextTick();
+    expect(selectedCells(wrapper)).toHaveLength(0);
+    expect(focusDataCell(wrapper)).toBeNull();
+
+    pointer(wrapper.get("thead th:nth-child(2)").element);
+    await nextTick();
+    const idColumnSelected = wrapper.findAll("button.cell-btn.selected").map((cell) => cell.attributes("data-cell"));
+    expect(idColumnSelected.sort()).toEqual(["r0:id", "r1:id"]);
+    expect(focusDataCell(wrapper)).toBe("r2:id");
+    pointer(wrapper.get("thead th:nth-child(2)").element, { ctrl: true });
+    await nextTick();
+    expect(selectedCells(wrapper)).toHaveLength(0);
+    expect(focusDataCell(wrapper)).toBeNull();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("opens the editor on the focused cell with F2", async () => {
+    const wrapper = await mountEditableQueryGrid("query-f2-edit");
+    pointer(wrapper.get('[data-cell="r1:name"]').element);
+    await nextTick();
+    gridKey(wrapper, "F2");
+    await nextTick();
+    const input = wrapper.get("input[aria-label='编辑 name']");
+    expect(input.element.closest("tr")?.getAttribute("data-row-id")).toBe("r1");
+    await input.trigger("keydown", { key: "Escape" });
+    expect(wrapper.find("input[aria-label='编辑 name']").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("moves the focus to the next cell with Tab and back with Shift+Tab", async () => {
+    const wrapper = await mountQueryGrid();
+    pointer(wrapper.get('[data-cell="r0:id"]').element);
+    await nextTick();
+    expect(focusDataCell(wrapper)).toBe("r0:id");
+    gridKey(wrapper, "Tab");
+    await nextTick();
+    expect(focusDataCell(wrapper)).toBe("r0:name");
+    gridKey(wrapper, "Tab", { shiftKey: true });
+    await nextTick();
+    expect(focusDataCell(wrapper)).toBe("r0:id");
     wrapper.unmount();
   });
 });

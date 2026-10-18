@@ -545,6 +545,8 @@ function saveEdit() {
   session.stageUpdate(edit.id, edit.column, edit.isNull ? null : edit.draft);
   editing.value = null;
   receipt.value = null;
+  // stage 后刷新查看器快照，避免 inspector 停留在编辑前的值。
+  syncSelectionToState();
   focusCell(edit.id, edit.column);
 }
 

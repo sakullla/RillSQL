@@ -102,6 +102,17 @@ const displayRows = computed(() => {
     }));
   return [...inserts, ...data];
 });
+/** 行集签名变化（插入行/筛选/排序/重载）后索引选区已失锚：清空选区与焦点，避免高亮和复制漂到未选中的行。 */
+watch(
+  () => displayRows.value.map((row) => row.id).join("\u0000"),
+  () => {
+    selection.value = { ...emptySelection };
+    if (session) {
+      session.selectedId = null;
+      session.selectedColumn = null;
+    }
+  },
+);
 const commitFailures = computed(() => (session ? Array.from(session.failures, ([id, message]) => ({ id, message })) : []));
 const pendingVisible = computed(() => (session ? session.pendingCount > 0 || session.failures.size > 0 : false));
 const { viewport, range, onScroll, reveal } = useRowWindow(computed(() => displayRows.value.length), false);
