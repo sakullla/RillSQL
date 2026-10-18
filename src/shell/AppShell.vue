@@ -86,6 +86,7 @@ const sqlitePrompt = ref(0);
 
 const historySection = ref<"runs" | "saved">("runs");
 const saveRequest = ref(0);
+const executeRequest = ref(0);
 const currentSavedDraft = computed<SavedDraft | null>(() => {
   const tab = session.activeTab.value;
   if (!tab || tab.kind !== "query") return null;
@@ -134,6 +135,9 @@ const commands = computed<PaletteItem[]>(() => [
     showSavedQueries: () => {
       historySection.value = "saved";
       session.showPage("history");
+    },
+    executeQuery: () => {
+      executeRequest.value += 1;
     },
   }),
 ]);
@@ -321,6 +325,7 @@ onBeforeUnmount(() => {
           :tabs="session.tabs.value"
           :active-id="session.activeId.value"
           :page-size="settings.pageSize"
+          :execute-request="executeRequest"
           @activate="session.activateTab"
           @close="session.closeTab"
           @new-query="session.openQuery()"

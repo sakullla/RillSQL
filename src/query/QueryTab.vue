@@ -8,7 +8,6 @@ import { Prec } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { EditorState } from "@codemirror/state";
 import { basicSetup } from "codemirror";
-import { placeholder } from "@codemirror/view";
 import ChordKeys from "../shell/ChordKeys.vue";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { catalogConnections } from "../catalog/store";
@@ -38,6 +37,7 @@ const props = defineProps<{
   engine: string | null;
   connectionStatus: ConnectionStatus | null;
   notice: string | null;
+  executeRequest?: number;
 }>();
 const emit = defineEmits<{
   "update:draft": [tabId: string, draft: string];
@@ -149,6 +149,8 @@ const detailsCaption = computed(() => {
   const current = run.value;
   return current ? `共 ${current.statements.length} 条语句` : "";
 });
+const operationGuide = "选择执行目标，编写 SQL，然后执行。有选中时只运行选中部分，无选中时执行光标所在语句。";
+const hintVisible = computed(() => Boolean(fieldNote.value) || hint.value.keywordsOnly || hint.value.note.includes("失败"));
 
 watch(
   () => run.value?.id,
@@ -255,7 +257,6 @@ async function sqlCompletion(context: CompletionContext) {
 function editorExtensions() {
   return [
     basicSetup,
-    placeholder("-- 在这里编写 SQL\n-- Ctrl+Enter 执行选中内容；无选中时执行光标所在语句"),
     sql(),
     syntaxHighlighting(HighlightStyle.define([
       { tag: tags.keyword, color: "var(--tk-kw)" },
@@ -422,6 +423,14 @@ async function execute(scope: "auto" | "current") {
     submitting.value = false;
   }
 }
+
+watch(
+  () => props.executeRequest,
+  (value, previous) => {
+    if (value == null || value === previous) return;
+    void execute("auto");
+  },
+);
 
 function cancel() {
   if (!running.value) return;
@@ -614,7 +623,7 @@ onBeforeUnmount(() => {
       <div v-if="!running" ref="runRoot" class="run-group">
         <button class="btn primary run-main" type="button" data-action="run" :disabled="submitting" @click="execute('auto')"><span aria-hidden="true">▶</span>{{ submitting ? "正在执行…" : hasSelection ? "执行选中" : "执行" }} <ChordKeys chord="Mod+Enter" /></button>
         <button
-          class="btn primary run-more"
+          class="btn run-more"
           type="button"
           data-action="run-menu"
           aria-label="更多执行方式"
@@ -637,14 +646,13 @@ onBeforeUnmount(() => {
     </div>
     <p v-if="notice" class="q-banner">{{ notice }}</p>
     <p v-if="actionError" class="q-banner" role="alert">{{ actionError }}</p>
-    <div class="editor-caption"><span><Icon name="code" /> SQL 编辑器</span><span class="q-hint" :data-keywords-only="hint.keywordsOnly" :title="hint.note">{{ hint.note }}</span><span class="mono">{{ buttonEngine ? engineMeta(buttonEngine).label : 'SQL' }}</span></div>
+    <p v-if="hintVisible" class="q-hint" :data-keywords-only="hint.keywordsOnly" :title="hint.note">{{ hint.note }}</p>
     <div ref="host" class="cm-host"></div>
-    <div class="editor-position"><span>{{ hasSelection ? '已选中 SQL · 执行将仅运行选中部分' : 'Ctrl+Enter 执行光标所在语句 · Ctrl+Shift+Enter 执行当前语句' }}</span><span class="mono">Ln {{ cursor.line }}, Col {{ cursor.column }}</span></div>
+    <div class="editor-position"><span class="q-guide">{{ operationGuide }}</span><span class="mono">Ln {{ cursor.line }}, Col {{ cursor.column }}</span></div>
     <div class="query-splitter" role="separator" tabindex="0" aria-label="调整编辑器与结果区域高度" aria-orientation="horizontal" :aria-valuenow="editorPercent" :aria-valuemin="20" :aria-valuemax="70" @pointerdown="resizeEditor" @keydown.up.prevent="editorPercent = Math.max(20, editorPercent - 5)" @keydown.down.prevent="editorPercent = Math.min(70, editorPercent + 5)"><span></span></div>
     <section class="q-results" aria-label="执行结果">
       <div class="results-heading"><span><Icon name="table" />结果</span><span v-if="run" class="q-summary" :data-status="run.status">{{ summary }}</span><span v-else class="muted">等待执行</span><span class="grow"></span><span class="muted">只读结果</span></div>
-      <div v-if="!run" class="q-idle"><Icon name="terminal" /><p>选择执行目标，编写 SQL，然后点击执行。</p><ChordKeys chord="Mod+Enter" /></div>
-      <template v-else>
+      <template v-if="run">
         <div v-if="run.statements.length > 1" class="result-tabs" role="tablist" aria-label="语句结果"><button v-for="(statement, index) in run.statements" :key="index" role="tab" :aria-selected="resultIndex === index" @click="resultIndex = index">结果 {{ index + 1 }} <span>{{ statement.columns.length ? `${statement.rows.length} 行` : statusLabel(statement.status) }}</span></button></div>
         <p v-if="run.cancel === 'requested'" class="q-note" role="status">取消中…数据库确认后立即停止。</p>
         <p v-else-if="run.cancel === 'confirmed' || run.status === 'cancelled'" class="q-note" role="status">已取消。已读到的结果保留。</p>
@@ -739,13 +747,13 @@ onBeforeUnmount(() => {
 .target-option .check { width: 14px; height: 14px; margin-left: auto; color: var(--accent); flex-shrink: 0; }
 .run-group { position: relative; display: flex; }
 .run-group .run-main { border-radius: var(--r) 0 0 var(--r); }
-.run-group .run-more { border-radius: 0 var(--r) var(--r) 0; border-left: 1px solid var(--accent-hover); padding: 0 var(--sp-2); }
-.run-group .run-more .tg-caret { margin-left: 0; color: var(--on-accent); }
+.run-group .run-more { border-radius: 0 var(--r) var(--r) 0; margin-left: -1px; padding: 0 var(--sp-2); }
+.run-group .run-more .tg-caret { margin-left: 0; color: var(--text-2); }
 .run-menu { min-width: 220px; }
 .run-item { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; padding: var(--sp-2); border-radius: var(--r); text-align: left; font-size: var(--fs-sm); }
 .run-item:hover { background: var(--hover); }
 .run-item small { font-size: var(--fs-xs); color: var(--text-3); }
-.q-note, .q-hint, .q-banner, .q-idle { margin: 0; font-size: var(--fs-sm); color: var(--text-2); }
+.q-note, .q-hint, .q-banner { margin: 0; font-size: var(--fs-sm); color: var(--text-2); }
 .q-hint, .q-banner { padding: var(--sp-1) var(--sp-3); }
 .q-banner { color: var(--text); background: var(--sunken); }
 .q-results { min-height: 120px; overflow: auto; border-top: 1px solid var(--line); padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); }
@@ -766,17 +774,13 @@ onBeforeUnmount(() => {
 .q-cancel-detail { margin-top: var(--sp-3); padding-top: var(--sp-2); border-top: 1px solid var(--line); font-size: var(--fs-sm); color: var(--text-2); }
 .q-cancel-detail p { margin: 0 0 var(--sp-1); }
 .query-pane .q-toolbar { background: var(--panel); min-height: 54px; }
-.editor-caption { display: flex; align-items: center; gap: 20px; padding: 9px 16px; background: var(--panel-2); border-bottom: 1px solid var(--line); font-size: 10px; color: var(--text-2); }
-.editor-caption > span:first-child { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
-.editor-caption .q-hint { flex: 1; font-size: 10px; padding: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.editor-caption > .mono { margin-left: auto; }
 .query-pane .cm-host { flex: 0 1 var(--editor-share); min-height: 90px; }
 .query-pane :deep(.cm-content) { padding-top: 14px; line-height: 1.8; }
 .query-pane :deep(.cm-line) { padding-left: 16px; }
 .query-pane :deep(.cm-gutters) { background: var(--panel-2); border-right: 0; min-width: 44px; }
 .query-pane :deep(.cm-activeLine), .query-pane :deep(.cm-activeLineGutter) { background: var(--sel); }
-.query-pane :deep(.cm-placeholder) { color: var(--text-3); }
-.editor-position { display: flex; justify-content: space-between; gap: 10px; padding: 5px 16px; color: var(--text-3); font-size: 10px; }
+.editor-position { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 5px 16px; color: var(--text-3); font-size: 10px; }
+.q-guide { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .query-splitter { height: 7px; flex-shrink: 0; display: grid; place-items: center; background: var(--panel-2); border-block: 1px solid var(--line); cursor: row-resize; touch-action: none; }
 .query-splitter span { height: 2px; width: 30px; background: var(--line-2); border-radius: 2px; }
 .query-splitter:hover, .query-splitter:focus-visible { background: var(--accent-soft); }
@@ -788,9 +792,6 @@ onBeforeUnmount(() => {
 .plan-view th, .plan-view td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; vertical-align: top; }
 .results-heading > span:first-child { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; }
 .results-heading .q-summary { font-size: 11px; font-weight: 400; }
-.query-pane .q-idle { display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 12px; flex: 1; padding: 24px; color: var(--text-3); background: var(--panel-2); }
-.q-idle > .i { width: 28px; height: 28px; color: var(--accent-text); }
-.q-idle p { margin: 0; font-size: 11px; }
 .result-tabs { display: flex; flex-shrink: 0; gap: 4px; padding: 0 12px; border-bottom: 1px solid var(--line); overflow: auto; }
 .result-tabs button { padding: 8px 12px; font-size: 11px; white-space: nowrap; border-bottom: 2px solid transparent; }
 .result-tabs button[aria-selected="true"] { border-color: var(--accent); color: var(--accent-text); }
@@ -798,5 +799,5 @@ onBeforeUnmount(() => {
 .q-details { flex-shrink: 0; border: 0; border-top: 1px solid var(--line); border-radius: 0; }
 .q-details .disclosure-body { max-height: 180px; overflow: auto; }
 .run-main :deep(kbd) { background: transparent; color: inherit; opacity: .75; border-color: currentColor; }
-@media (max-width: 800px) { .run-main :deep(.kbd) { display: none; } .target-btn { max-width: 290px; } .q-toolbar .conn-state { display: none; } .editor-caption .q-hint { display: none; } .editor-position > span:first-child { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; } }
+@media (max-width: 800px) { .run-main :deep(.kbd) { display: none; } .target-btn { max-width: 290px; } .q-toolbar .conn-state { display: none; } .editor-position > span:first-child { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; } }
 </style>

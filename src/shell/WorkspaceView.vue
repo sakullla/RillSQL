@@ -13,7 +13,7 @@ const DataGrid = defineAsyncComponent(() => import("../grid/DataGrid.vue"));
 const QueryTab = defineAsyncComponent(() => import("../query/QueryTab.vue"));
 const StructurePane = defineAsyncComponent(() => import("../structure/StructurePane.vue"));
 
-const props = defineProps<{ tabs: ShellTab[]; activeId: string | null; pageSize?: number }>();
+const props = defineProps<{ tabs: ShellTab[]; activeId: string | null; pageSize?: number; executeRequest?: number }>();
 const emit = defineEmits<{
   activate: [id: string];
   close: [id: string];
@@ -186,6 +186,7 @@ onBeforeUnmount(() => {
       :engine="active.engine"
       :connection-status="active.connectionStatus"
       :notice="active.targetNotice"
+      :execute-request="executeRequest"
       @update:draft="onDraft"
       @target="onTarget"
     />

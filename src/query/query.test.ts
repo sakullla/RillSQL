@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { nextTick } from "vue";
 import { catalogFixture } from "../catalog/fixtures";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
+import { shellCommands } from "../shell/commands";
 import { createSession } from "../shell/session";
 import { SHORTCUTS } from "../shell/shortcuts";
 import type { RunDto } from "./api";
@@ -67,6 +68,26 @@ describe("query editing", () => {
     expect(QUERY_EDITOR_KEYS).not.toContain("Ctrl-Alt-N");
     expect(SHORTCUTS.find((item) => item.chord === "Mod+Enter")?.label).toBe("执行选中内容；无选中时执行光标所在语句");
     expect(SHORTCUTS.find((item) => item.chord === "Mod+Shift+Enter")?.label).toBe("只执行光标所在语句");
+  });
+
+  it("lists 执行 in the command palette with Mod+Enter", () => {
+    let ran = 0;
+    const item = shellCommands({
+      openQuery: () => undefined,
+      openStructure: () => undefined,
+      showPage: () => undefined,
+      toggleSidebar: () => undefined,
+      setTheme: () => undefined,
+      openHelp: () => undefined,
+      requestSqlite: () => undefined,
+      saveQuery: () => undefined,
+      showSavedQueries: () => undefined,
+      executeQuery: () => { ran += 1; },
+    }).find((entry) => entry.label === "执行");
+    expect(item?.group).toBe("命令");
+    expect(item?.chord).toBe("Mod+Enter");
+    item?.run();
+    expect(ran).toBe(1);
   });
 
   it("completes from the selected target and withholds failed metadata", () => {
@@ -150,7 +171,16 @@ describe("query editing", () => {
     await nextTick();
     expect(wrapper.text()).not.toContain("查询的答案，会出现在这里。");
     expect(wrapper.text()).not.toContain("执行全部");
-    expect(wrapper.get(".editor-position").text()).toContain("Ctrl+Enter 执行光标所在语句");
+    expect(wrapper.findAll(".q-guide")).toHaveLength(1);
+    expect(wrapper.get(".q-guide").text()).toBe("选择执行目标，编写 SQL，然后执行。有选中时只运行选中部分，无选中时执行光标所在语句。");
+    expect(wrapper.get(".editor-position").text()).toContain("Ln ");
+    expect(wrapper.text()).not.toContain("SQL 编辑器");
+    expect(wrapper.text()).not.toContain("选择执行目标，编写 SQL，然后点击执行");
+    expect(wrapper.text()).not.toContain("Ctrl+Enter 执行光标所在语句");
+    expect(wrapper.find(".cm-placeholder").exists()).toBe(false);
+    expect(wrapper.findAll("button.primary").map((button) => button.attributes("data-action"))).toEqual(["run"]);
+    expect(wrapper.get("[data-action='run-menu']").classes()).not.toContain("primary");
+    expect(wrapper.find("[data-action='cancel']").exists()).toBe(false);
     expect(wrapper.get("[aria-label='查询']").attributes("data-tab-id")).toBe("query-1");
     expect(wrapper.get("[data-action='target']").attributes("aria-label")).toContain("执行目标");
     expect(wrapper.get("[data-action='target']").text()).toContain("Shop / shop_staging");
@@ -165,7 +195,7 @@ describe("query editing", () => {
     await flushPromises();
     const started = () => calls.filter((call) => call.command === "query_start");
     expect(started().at(-1)).toMatchObject({ command: "query_start", sql: "SELECT 2;" });
-    expect(wrapper.text()).toContain("已读取的表和视图");
+    expect(wrapper.find(".q-hint").exists()).toBe(false);
 
     view!.dispatch({ selection: { anchor: 0, head: 0 } });
     await nextTick();
@@ -206,8 +236,9 @@ describe("query editing", () => {
       },
     });
     await nextTick();
-    expect(wrapper.get(".cm-placeholder").text()).toContain("无选中时执行光标所在语句");
-    expect(wrapper.get(".cm-placeholder").text()).not.toContain("执行全部");
+    expect(wrapper.find(".cm-placeholder").exists()).toBe(false);
+    expect(wrapper.get(".q-guide").text()).toContain("无选中时执行光标所在语句");
+    expect(wrapper.text()).not.toContain("执行全部");
     expect(wrapper.text()).not.toContain("查询的答案，会出现在这里。");
     await wrapper.get("[data-action='target']").trigger("click");
     const choices = wrapper.findAll("[role='option']");
@@ -346,6 +377,41 @@ describe("query editing", () => {
     wrapper.unmount();
   });
 
+  it("uses the existing execute path when the command palette asks to run", async () => {
+    replaceCatalog(catalogFixture());
+    const calls: string[] = [];
+    invoke.mockImplementation(async (command: string, args?: { request?: { sql: string } }) => {
+      if (command === "query_start") calls.push(args?.request?.sql ?? "");
+      return runDto({
+        status: "done",
+        statements: [{ sql: args?.request?.sql ?? "", status: "ok", message: "", columns: [], rows: [], truncated: false, affected: 0 }],
+      });
+    });
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-command",
+        draft: "SELECT 1;\nSELECT 2;",
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+        executeRequest: 0,
+      },
+    });
+    await nextTick();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element)!;
+    const from = "SELECT 1;\n".length;
+    view.dispatch({ selection: { anchor: from, head: from + "SELECT 2;".length } });
+    await nextTick();
+    await wrapper.setProps({ executeRequest: 1 });
+    await flushPromises();
+    expect(calls).toEqual(["SELECT 2;"]);
+    expect(wrapper.find("[data-action='run']").exists()).toBe(true);
+    wrapper.unmount();
+  });
+
   it("keeps finished rows when a later statement fails, and marks an unknown write", async () => {
     adoptRun("query-9", runDto({
       status: "error",
@@ -415,6 +481,10 @@ describe("query editing", () => {
         notice: null,
       },
     });
+    expect(wrapper.find("[data-action='run']").exists()).toBe(false);
+    expect(wrapper.find("[data-action='run-menu']").exists()).toBe(false);
+    expect(wrapper.get("[data-action='cancel']").text()).toBe("取消");
+    expect(wrapper.findAll("button.primary")).toHaveLength(0);
     await wrapper.get("[data-action='cancel']").trigger("click");
     await flushPromises();
     expect(wrapper.text()).toContain("取消中");
