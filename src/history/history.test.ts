@@ -128,6 +128,19 @@ describe("query history", () => {
     wrapper.unmount();
   });
 
+  it("keeps one sentence under the saved query title", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "query_history" || command === "query_saved_list") return [];
+      throw new Error(command);
+    });
+    const wrapper = mount(HistoryPage, { props: { section: "saved" } });
+    await flushPromises();
+    const lead = wrapper.get(".page-head p").text();
+    expect(lead.split("。").filter((part) => part.trim())).toEqual(["按名称保存当前 SQL"]);
+    expect(wrapper.get(".page-head h1").text()).toBe("保存的查询");
+    wrapper.unmount();
+  });
+
   it("offers a retry when history cannot be read", async () => {
     invoke.mockRejectedValueOnce(new Error("磁盘读不了"));
     const wrapper = mount(HistoryPage);
