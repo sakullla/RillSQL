@@ -228,6 +228,9 @@ function onMenuSelect(menuId: string, itemId: string) {
     case "file:open-sqlite":
       return requestSqlite();
     case "file:save-draft":
+      historySection.value = "saved";
+      saveRequest.value += 1;
+      return session.showPage("history");
     case "file:settings":
     case "tools:settings":
     case "help:about":
@@ -285,6 +288,9 @@ function onToolbarAction(action: ToolbarAction) {
     case "open-connections":
       return session.showPage("connections");
     case "save-draft":
+      historySection.value = "saved";
+      saveRequest.value += 1;
+      return session.showPage("history");
     case "history":
       return session.showPage("history");
     case "palette":
@@ -397,9 +403,7 @@ onBeforeUnmount(() => {
       :has-query-tab="hasQueryTab"
       @palette="session.openPalette('all')"
       @help="session.openHelp()"
-      @set-theme="setTheme"
       @window-state="windowChrome = $event"
-      @new-query="session.openQuery()"
       @toggle-sidebar="session.toggleSidebar()"
       @menu-select="onMenuSelect"
       @action="onToolbarAction"

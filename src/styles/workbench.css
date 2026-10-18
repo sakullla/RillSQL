@@ -2,7 +2,6 @@
 .workspace-view { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; }
 .app-root .titlebar { background: var(--panel); }
 .app-root .tb-brand { min-width: 0; }
-.app-root .cmd-trigger { background: var(--panel-2); border-radius: var(--r); max-width: 440px; }
 .app-root .rail { background: var(--nav-bg); border: 0; padding-top: 16px; gap: 8px; }
 .app-root .rail-btn { color: var(--nav-fg); padding: 12px 0; border-radius: 6px; gap: 7px; font-size: 10px; }
 .app-root .rail-btn:hover { color: var(--nav-active); background: #ffffff0d; }
@@ -121,9 +120,6 @@
 .app-root .tr-conn .btn { height: 22px; padding: 0 6px; font-size: 10px; }
 .app-root .tr-conn .conn-state { font-size: 10px; }
 .app-root .grid-table .editor input, .app-root .grid-table .editor .btn { height: calc(var(--row-h) - 4px); }
-
-.app-root .titlebar.custom-chrome .cmd-trigger { width: 100%; min-width: 0; max-width: 100%; }
-@media (max-width: 720px) { .titlebar.custom-chrome .tb-actions > .icon-btn { display: none; } }
 
 .app-root .cmd-trigger > span:not(.kbd) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .sidebar-dismiss { display: none; }

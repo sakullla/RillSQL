@@ -20,9 +20,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   palette: [];
   help: [];
-  "new-query": [];
   "toggle-sidebar": [];
-  "set-theme": [theme: ThemePreference];
   "window-state": [state: { custom: boolean; maximized: boolean }];
   "menu-select": [menuId: string, itemId: string];
   action: [action: ToolbarAction];
@@ -44,9 +42,12 @@ watch(
         <strong>RillSQL</strong>
         <span class="brand-cn">澄库</span>
       </div>
-      <MenuBar :menus="menus" @select="(menuId, itemId) => emit('menu-select', menuId, itemId)" />
+      <!-- MenuBar 是多根组件，属性不会自动落到 .menubar 上，包一层显式标记不可拖 -->
+      <div data-tauri-drag-region="false">
+        <MenuBar :menus="menus" @select="(menuId, itemId) => emit('menu-select', menuId, itemId)" />
+      </div>
       <span class="grow" :data-tauri-drag-region="showCaption ? 'deep' : undefined"></span>
-      <div v-if="showCaption" class="caption" role="group" aria-label="窗口">
+      <div v-if="showCaption" class="caption" role="group" aria-label="窗口" data-tauri-drag-region="false">
         <button type="button" aria-label="最小化" title="最小化" @click="chrome.minimize()">
           <svg viewBox="0 0 10 10" aria-hidden="true"><path fill="currentColor" d="M0 5h10v1H0z" /></svg>
         </button>
