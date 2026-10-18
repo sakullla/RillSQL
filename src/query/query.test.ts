@@ -213,6 +213,102 @@ describe("query editing", () => {
     wrapper.unmount();
   });
 
+  it("shows one operation line until a field note or a failure reason", async () => {
+    const idle = mount(QueryTab, {
+      props: {
+        tabId: "query-idle",
+        draft: "SELECT 1",
+        connectionId: null,
+        connectionName: null,
+        database: null,
+        engine: null,
+        connectionStatus: null,
+        notice: null,
+      },
+    });
+    await nextTick();
+    expect(idle.findAll(".q-guide")).toHaveLength(1);
+    expect(idle.find(".q-hint").exists()).toBe(false);
+    expect(idle.text()).toContain("等待执行");
+    expect(idle.text()).toContain("Ln ");
+    expect(idle.text()).not.toContain("补全只提供关键字");
+    expect(idle.findAll("button.primary").map((button) => button.attributes("data-action"))).toEqual(["run"]);
+    idle.unmount();
+
+    replaceCatalog(catalogFixture());
+    const steady = [
+      { tabId: "query-offline", connectionId: "analytics", connectionName: "Analytics", database: "analytics", engine: "mariadb", connectionStatus: "disconnected" as const },
+      { tabId: "query-unread", connectionId: "shop", connectionName: "Shop", database: "missing_db", engine: "mysql", connectionStatus: "connected" as const },
+      { tabId: "query-gone", connectionId: "missing", connectionName: "Old", database: "db", engine: "mysql", connectionStatus: "connected" as const },
+    ];
+    for (const props of steady) {
+      const wrapper = mount(QueryTab, { props: { ...props, draft: "SELECT 1", notice: null } });
+      await nextTick();
+      expect(wrapper.find(".q-hint").exists()).toBe(false);
+      expect(wrapper.findAll(".q-guide")).toHaveLength(1);
+      expect(wrapper.text()).not.toContain("补全只提供关键字");
+      wrapper.unmount();
+    }
+
+    const bareCatalog = catalogFixture();
+    bareCatalog[1]!.databases[0]!.schemas[0]!.objects = [];
+    bareCatalog[1]!.databases[0]!.schemas[0]!.total = 0;
+    replaceCatalog(bareCatalog);
+    const bare = mount(QueryTab, {
+      props: {
+        tabId: "query-bare",
+        draft: "SELECT 1",
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    expect(bare.find(".q-hint").exists()).toBe(false);
+    bare.unmount();
+
+    const failedCatalog = catalogFixture();
+    failedCatalog[1]!.databases[0]!.error = "permission denied";
+    replaceCatalog(failedCatalog);
+    const failed = mount(QueryTab, {
+      props: {
+        tabId: "query-meta-failed",
+        draft: "SELECT 1",
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    expect(failed.get(".q-hint").text()).toContain("失败");
+    expect(failed.get(".q-hint").text()).toContain("permission denied");
+    expect(failed.findAll(".q-guide")).toHaveLength(1);
+    failed.unmount();
+
+    replaceCatalog(catalogFixture());
+    const partial = mount(QueryTab, {
+      props: {
+        tabId: "query-partial",
+        draft: "SELECT 1",
+        connectionId: "atlas",
+        connectionName: "Atlas",
+        database: "atlas_dev",
+        engine: "postgres",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    expect(partial.get(".q-hint").text()).toContain("部分对象读取失败");
+    partial.unmount();
+  });
+
   it("marks each execution target with its engine when names match", async () => {
     const rows = catalogFixture();
     rows[0].name = "127.0.0.1";
@@ -625,12 +721,15 @@ describe("query editing", () => {
       },
     });
     await nextTick();
-    expect(missing.get(".q-hint").text()).toContain("字段不可用");
+    expect(missing.find(".q-hint").exists()).toBe(false);
+    expect(missing.findAll(".q-guide")).toHaveLength(1);
     invoke.mockClear();
     const missingView = EditorView.findFromDOM(missing.get(".cm-content").element)!;
     missingView.dispatch({ selection: { anchor: missingView.state.doc.length } });
     startCompletion(missingView);
-    await new Promise((resolve) => setTimeout(resolve, 120));
+    await vi.waitFor(() => {
+      expect(missing.get(".q-hint").text()).toContain("字段不可用");
+    });
     await flushPromises();
     expect(invoke.mock.calls.some((call) => call[0] === "grid_describe")).toBe(false);
     expect(currentCompletions(missingView.state).some((item) => item.label === "status")).toBe(false);

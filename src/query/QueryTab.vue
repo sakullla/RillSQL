@@ -150,7 +150,8 @@ const detailsCaption = computed(() => {
   return current ? `共 ${current.statements.length} 条语句` : "";
 });
 const operationGuide = "选择执行目标，编写 SQL，然后执行。有选中时只运行选中部分，无选中时执行光标所在语句。";
-const hintVisible = computed(() => Boolean(fieldNote.value) || hint.value.keywordsOnly || hint.value.note.includes("失败"));
+/* 没有目标、未连接、尚未读到对象时不另起说明；字段说明和含「失败」的原因仍显示。 */
+const hintVisible = computed(() => Boolean(fieldNote.value) || hint.value.note.includes("失败"));
 
 watch(
   () => run.value?.id,
