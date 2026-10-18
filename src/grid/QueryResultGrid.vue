@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from "vue";
 import { catalogConnections } from "../catalog/store";
 import { registerPending } from "../shell/close-guard";
+import { ContextMenu, type MenuItem } from "../ui";
 import ExportDialog from "../export/ExportDialog.vue";
 import type { CsvOptions } from "../export/csv";
 import type { InsertTarget } from "../export/insert";
@@ -13,6 +14,7 @@ import { viewLoadedRows } from "./data";
 import { useRowWindow } from "./virtual";
 import { copyPlain, showCell } from "./display";
 import { autofitWidth, clampColWidth, MIN_COL_WIDTH } from "./column-width";
+import { qualifiedName, updateSql, whereLocator } from "./sql";
 import "./grid.css";
 import { loadSettings } from "../shell/settings";
 import { locateResultRows, provedEditableColumns, readSingleTable, resolveEditableTable, ResultEditSession, type TableHit } from "./result-edit";
@@ -524,6 +526,244 @@ function onGridKeydown(event: KeyboardEvent) {
   }
 }
 
+type ContextMenuKind = "cell" | "row" | "col";
+
+const menu = ref<{ x: number; y: number; kind: ContextMenuKind; rowId?: string; column?: string } | null>(null);
+const menuEl = ref<HTMLElement | null>(null);
+
+function closeMenu() {
+  menu.value = null;
+}
+
+function cellFromKey(key: string | null): { rowId: string; column: string } | null {
+  if (!key) return null;
+  const sep = key.indexOf(":");
+  if (sep <= 0 || sep === key.length - 1) return null;
+  return { rowId: key.slice(0, sep), column: key.slice(sep + 1) };
+}
+
+/** 网格内右键：单元格/行号/表头分发三套菜单；非焦点格先设为焦点格。 */
+function onGridContextMenu(event: MouseEvent) {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const cellBtn = target.closest<HTMLElement>("button.cell-btn");
+  if (cellBtn) {
+    event.preventDefault();
+    const addr = cellFromKey(cellBtn.getAttribute("data-cell"));
+    if (!addr) return;
+    const focus = selection.value.focus;
+    const focused = focus && rowIdAt(focus.rowIndex) === addr.rowId && columnNameAt(focus.colIndex) === addr.column;
+    if (!focused) {
+      const cell = addrOf(addr.rowId, addr.column);
+      if (cell) {
+        selection.value = applyPointer(selection.value, cell, { shift: false, ctrl: false });
+        syncFocusFromSelection();
+      }
+    } else {
+      focusCell(addr.rowId, addr.column);
+    }
+    menuEl.value = cellBtn;
+    menu.value = { x: Math.max(8, event.clientX), y: Math.max(8, event.clientY), kind: "cell", ...addr };
+    return;
+  }
+  const rowNumber = target.closest<HTMLElement>("td.row-number");
+  if (rowNumber) {
+    event.preventDefault();
+    const rowId = rowNumber.closest("tr[data-row-id]")?.getAttribute("data-row-id") || "";
+    if (!rowId) return;
+    menuEl.value = rowNumber;
+    menu.value = { x: Math.max(8, event.clientX), y: Math.max(8, event.clientY), kind: "row", rowId };
+    return;
+  }
+  const header = target.closest<HTMLElement>("thead th[data-col]");
+  if (header) {
+    event.preventDefault();
+    const column = header.getAttribute("data-col") || "";
+    if (!column) return;
+    menuEl.value = header;
+    menu.value = { x: Math.max(8, event.clientX), y: Math.max(8, event.clientY), kind: "col", column };
+  }
+}
+
+const menuLabel = computed(() => {
+  const current = menu.value;
+  if (!current) return "单元格操作";
+  if (current.kind === "row") return "行操作";
+  if (current.kind === "col") return `${current.column ?? ""} 列的操作`;
+  return `${current.column ?? ""} 单元格的操作`;
+});
+
+function tsvNullText(): string {
+  const nullCopy = loadSettings().nullCopy;
+  return nullCopy === "empty" ? "" : nullCopy === "N" ? "\\N" : "NULL";
+}
+
+function rowTsv(rowId: string): string {
+  const rows = view.value.rows;
+  const names = props.columns.map((column) => column.name);
+  const rowIndex = rows.findIndex((row) => row.id === rowId);
+  if (rowIndex < 0 || !names.length) return "";
+  return selectionToTsv(
+    { anchor: { rowIndex, colIndex: 0 }, focus: { rowIndex, colIndex: names.length - 1 }, extras: "", allRows: false },
+    {
+      headers: false,
+      columnNames: names,
+      cellAt: (row, col) => rows[row]?.cells[names[col]!] ?? null,
+      nullText: tsvNullText(),
+    },
+  );
+}
+
+function colTsv(column: string): string {
+  const rows = view.value.rows;
+  const colIndex = props.columns.findIndex((item) => item.name === column);
+  const lastRow = rows.length - 1;
+  if (colIndex < 0 || lastRow < 0) return "";
+  return selectionToTsv(
+    { anchor: { rowIndex: 0, colIndex }, focus: { rowIndex: lastRow, colIndex }, extras: "", allRows: false },
+    {
+      headers: false,
+      columnNames: props.columns.map((item) => item.name),
+      cellAt: (row) => rows[row]?.cells[column] ?? null,
+      nullText: tsvNullText(),
+    },
+  );
+}
+
+/** 有主键且能定位到基表行时才生成 SELECT，否则给出具体原因。 */
+function selectSqlText(rowId: string): string | null {
+  const session = editSession.value;
+  const row = session?.rowById(rowId);
+  if (!session || !session.schema.key.length || !row?.located || !row.locator) return null;
+  return `SELECT * FROM ${qualifiedName(session.schema)} WHERE ${whereLocator(session.schema, row.locator.columns, row.locator.values)}`;
+}
+
+function updateSqlText(rowId: string, column: string): string | null {
+  const session = editSession.value;
+  const row = session?.rowById(rowId);
+  if (!session || !session.schema.key.length || !row?.located || !row.locator) return null;
+  if (!session.canEditColumn(column)) return null;
+  const value = session.cellValue(rowId, column);
+  return updateSql(session.schema, { [column]: value ?? null }, row.locator.columns, row.locator.values);
+}
+
+function cellBlockTitle(rowId: string, column: string): string {
+  const session = editSession.value;
+  if (!session) return reason.value || "查询结果是只读的。";
+  if (!session.canUpdate(session.rowById(rowId))) return "无法唯一确定这一行，不能修改或删除。";
+  if (!session.canEditColumn(column)) return "这一列不是基表列，不能修改";
+  return "";
+}
+
+function rowBlockTitle(rowId: string): string {
+  const session = editSession.value;
+  if (!session) return reason.value || "查询结果是只读的。";
+  if (!session.canDeleteRow(rowId)) return "无法唯一确定这一行，不能删除。";
+  return "";
+}
+
+const menuItems = computed<MenuItem[]>(() => {
+  const current = menu.value;
+  if (!current) return [];
+  if (current.kind === "row") {
+    const rowId = current.rowId!;
+    const block = rowBlockTitle(rowId);
+    return [
+      { kind: "item", id: "copy-row", label: "复制行（TSV）" },
+      { kind: "sep" },
+      { kind: "item", id: "delete-item", label: "标记删除行", danger: true, disabled: !!block, title: block || undefined },
+    ];
+  }
+  if (current.kind === "col") {
+    return [
+      { kind: "item", id: "copy-col", label: "复制列（TSV）" },
+      { kind: "item", id: "filter-eq", label: "按此值筛选", disabled: true, title: "表头没有单元格值；右键单元格可按该值查找" },
+    ];
+  }
+  const rowId = current.rowId!;
+  const column = current.column!;
+  const cellBlock = cellBlockTitle(rowId, column);
+  const rowBlock = rowBlockTitle(rowId);
+  const selectSql = selectSqlText(rowId);
+  const updateText = updateSqlText(rowId, column);
+  const noLocator = !editSession.value || !editSession.value.schema.key.length;
+  return [
+    { kind: "item", id: "copy-value", label: "复制值" },
+    { kind: "item", id: "copy-row", label: "复制行（TSV）" },
+    { kind: "item", id: "copy-col", label: "复制列（TSV）" },
+    { kind: "item", id: "filter-eq", label: "按此值筛选" },
+    { kind: "sep" },
+    {
+      kind: "item",
+      id: "select-sql",
+      label: "生成 SELECT",
+      disabled: !selectSql,
+      title: selectSql ? "复制 SELECT 到剪贴板" : reason.value || "无法唯一确定这一行，不能生成 SELECT",
+    },
+    {
+      kind: "item",
+      id: "update-sql",
+      label: "生成 UPDATE",
+      disabled: !updateText,
+      title: updateText ? "已复制到剪贴板，不会执行" : cellBlock || (noLocator ? "查询结果没有可定位的主键，不能生成 UPDATE" : "无法唯一确定这一行，不能生成 UPDATE"),
+    },
+    { kind: "item", id: "edit-cell", label: "编辑单元格", disabled: !!cellBlock, title: cellBlock || undefined },
+    { kind: "item", id: "delete-item", label: "标记删除行", danger: true, disabled: !!rowBlock, title: rowBlock || "标记后进入待提交，提交前会再次确认" },
+  ];
+});
+
+async function writeClipboard(text: string, message: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    copyMessage.value = message;
+  } catch {
+    copyMessage.value = "复制失败，请在值查看器中选中文本复制。";
+  }
+}
+
+async function onMenuSelect(id: string) {
+  const current = menu.value;
+  if (!current) return;
+  const settings = loadSettings();
+  if (id === "copy-value" && current.kind === "cell") {
+    await writeClipboard(copyPlain(rawCellValue(current.rowId!, current.column!), settings.nullCopy), "已复制");
+    return;
+  }
+  if (id === "copy-row" && current.rowId) {
+    const tsv = rowTsv(current.rowId);
+    if (tsv) await writeClipboard(tsv, "已复制为 TSV");
+    return;
+  }
+  if (id === "copy-col" && current.column) {
+    const tsv = colTsv(current.column);
+    if (tsv) await writeClipboard(tsv, "已复制为 TSV");
+    return;
+  }
+  if (id === "filter-eq" && current.kind === "cell" && current.column) {
+    find.value = String(rawCellValue(current.rowId!, current.column) ?? "");
+    return;
+  }
+  if (id === "select-sql" && current.rowId) {
+    const sql = selectSqlText(current.rowId);
+    if (sql) await writeClipboard(sql, "已复制");
+    return;
+  }
+  if (id === "update-sql" && current.kind === "cell" && current.rowId && current.column) {
+    const sql = updateSqlText(current.rowId, current.column);
+    if (sql) await writeClipboard(sql, "已复制，未执行");
+    return;
+  }
+  if (id === "edit-cell" && current.kind === "cell" && current.rowId && current.column) {
+    beginEdit(current.rowId, current.column);
+    return;
+  }
+  if (id === "delete-item" && current.rowId) {
+    // 只标记删除进入待提交，不直接写库；提交对话框是二次确认入口。
+    editSession.value?.deleteRow(current.rowId);
+    receipt.value = null;
+  }
+}
+
 function beginEdit(id: string, column: string) {
   const session = editSession.value;
   const row = session?.rowById(id);
@@ -709,12 +949,12 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
     </div>
     <p v-if="exportMessage" class="grid-hint" role="status">{{ exportMessage }}</p>
     <p v-if="receipt" class="grid-hint" role="status">{{ receipt }}</p>
-    <div ref="viewport" class="grid-scroll" @scroll.passive="onScroll" @keydown="onGridKeydown">
+    <div ref="viewport" class="grid-scroll" @scroll.passive="onScroll" @keydown="onGridKeydown" @contextmenu="onGridContextMenu">
       <table class="grid-table" :aria-rowcount="view.rows.length + 1">
         <thead>
           <tr>
             <th class="row-number" aria-label="行号">#</th>
-            <th v-for="column in columns" :key="column.name" :style="colStyle(column.name)" :aria-sort="sort?.column === column.name ? (sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'" @pointerdown.prevent="onHeaderPointer($event, column.name)">
+            <th v-for="column in columns" :key="column.name" :data-col="column.name" :style="colStyle(column.name)" :aria-sort="sort?.column === column.name ? (sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'" @pointerdown.prevent="onHeaderPointer($event, column.name)">
               <button class="th-btn" type="button" :aria-label="`仅对已读取行按 ${column.name} 排序`" @click="cycle(column.name)">{{ column.name }}<span v-if="sort?.column === column.name" class="sort-arrow">{{ sort.direction === 'asc' ? '↑' : '↓' }}</span></button>
               <span
                 class="col-grip"
@@ -790,6 +1030,16 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
       :insert-reason="insertTarget ? '' : reason"
       @close="exportOpen = false"
       @start="startExport"
+    />
+    <ContextMenu
+      :open="Boolean(menu)"
+      :x="menu?.x ?? 0"
+      :y="menu?.y ?? 0"
+      :items="menuItems"
+      :label="menuLabel"
+      :trigger="menuEl"
+      @close="closeMenu"
+      @select="onMenuSelect"
     />
   </div>
 </template>

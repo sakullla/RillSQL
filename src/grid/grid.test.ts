@@ -2413,3 +2413,289 @@ describe("grid column width", () => {
     wrapper.unmount();
   });
 });
+
+describe("grid context menus", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    resetExportTasks();
+    resetCloseGuard();
+    resetCatalog();
+    localStorage.removeItem("rillsql.shell");
+  });
+
+  function rightClick(el: Element) {
+    el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 40, clientY: 60 }));
+  }
+
+  function menuItemIds(): (string | null)[] {
+    return [...document.body.querySelectorAll('[role="menu"] [role="menuitem"]')].map((item) => item.getAttribute("data-id"));
+  }
+
+  function menuItem(id: string): HTMLButtonElement | null {
+    return document.body.querySelector(`[role="menu"] [data-id="${id}"]`);
+  }
+
+  function closeMenu() {
+    document.body.querySelector('[role="menu"]')?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  }
+
+  async function mountDataGrid(tabId = "table:ctx") {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") return { rows: [customerRow(1), customerRow(2)], truncated: false, sql: "SELECT customers" };
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, {
+      props: { tabId, draft: "", pageSize: 10, target: customersTarget },
+      attachTo: document.body,
+    });
+    await flushPromises();
+    return wrapper;
+  }
+
+  it("opens cell, row and header menus on DataGrid with a danger delete item", async () => {
+    const wrapper = await mountDataGrid();
+    rightClick(wrapper.get('[data-cell="1:name"]').element);
+    await nextTick();
+    expect(menuItemIds()).toEqual(expect.arrayContaining([
+      "copy-value", "copy-row", "copy-col", "filter-eq", "select-sql", "update-sql", "edit-cell", "delete-item",
+    ]));
+    expect(menuItem("delete-item")?.classList.contains("danger")).toBe(true);
+    expect(menuItem("delete-item")?.disabled).toBe(false);
+    closeMenu();
+    await nextTick();
+    expect(document.body.querySelector('[role="menu"]')).toBeNull();
+
+    rightClick(wrapper.get('tr[data-row-id="2"] td.row-number').element);
+    await nextTick();
+    const rowIds = menuItemIds();
+    expect(rowIds).toContain("copy-row");
+    expect(rowIds).toContain("delete-item");
+    expect(rowIds).not.toContain("copy-col");
+    expect(rowIds).not.toContain("edit-cell");
+    closeMenu();
+    await nextTick();
+
+    rightClick(wrapper.get('thead th[data-col="email"]').element);
+    await nextTick();
+    const colIds = menuItemIds();
+    expect(colIds).toContain("copy-col");
+    expect(colIds).toContain("filter-eq");
+    expect(colIds).not.toContain("delete-item");
+    closeMenu();
+    await nextTick();
+    wrapper.unmount();
+  });
+
+  it("copies a single plain value and a whole row as TSV from the menu", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const wrapper = await mountDataGrid();
+    rightClick(wrapper.get('[data-cell="1:name"]').element);
+    await nextTick();
+    menuItem("copy-value")!.click();
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText.mock.calls[0]?.[0]).toBe("客户1");
+
+    rightClick(wrapper.get('[data-cell="1:name"]').element);
+    await nextTick();
+    menuItem("copy-row")!.click();
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledTimes(2);
+    const tsv = String(writeText.mock.calls[1]?.[0]);
+    expect(tsv).toContain("\t");
+    expect(tsv).not.toContain("name\t"); // 单行 TSV 不带表头
+    expect(tsv).toContain("客户1");
+    expect(tsv).toContain("u1@example.com");
+    expect(tsv).toContain("NULL");
+    wrapper.unmount();
+  });
+
+  it("filters by the right-clicked value on DataGrid and sets the find box on results", async () => {
+    invoke.mockImplementation(async (command: string, args: { request?: { filters?: { column: string; op: string; value?: string }[] } }) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") {
+        const filters = args.request?.filters ?? [];
+        return { rows: filters.length ? [] : [customerRow(1), customerRow(2)], truncated: false, sql: filters.length ? "SELECT filtered" : "SELECT customers" };
+      }
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, {
+      props: { tabId: "table:ctx-filter", draft: "", pageSize: 10, target: customersTarget },
+      attachTo: document.body,
+    });
+    await flushPromises();
+    rightClick(wrapper.get('[data-cell="1:name"]').element);
+    await nextTick();
+    menuItem("filter-eq")!.click();
+    await flushPromises();
+    const page = invoke.mock.calls.find((call) => call[0] === "grid_page" && Array.isArray((call[1] as { request?: { filters?: unknown[] } })?.request?.filters)
+      && ((call[1] as { request: { filters: unknown[] } }).request.filters.length > 0));
+    expect(page?.[1]).toMatchObject({ request: { filters: [{ column: "name", op: "eq", value: "客户1" }] } });
+    expect(wrapper.get(".grid-sql").text()).toContain("SELECT filtered");
+    wrapper.unmount();
+
+    const model = gridModel({ columns: ["id", "name"], rows: [["1", "客户1"]] });
+    const result = mount(QueryResultGrid, {
+      props: {
+        tabId: "query-ctx-find",
+        statement: "SELECT id, name FROM orders JOIN items ON items.id = orders.id",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+      },
+      attachTo: document.body,
+    });
+    await flushPromises();
+    rightClick(result.get('[data-cell="r0:name"]').element);
+    await nextTick();
+    menuItem("filter-eq")!.click();
+    await nextTick();
+    expect((result.get("[aria-label='在已读取行中查找']").element as HTMLInputElement).value).toBe("客户1");
+    result.unmount();
+  });
+
+  it("disables write menu items on a read-only join result and keeps copy available", async () => {
+    const model = gridModel({ columns: ["id", "name"], rows: [["1", "客户1"]] });
+    const wrapper = mount(QueryResultGrid, {
+      props: {
+        tabId: "query-ctx-ro",
+        statement: "SELECT * FROM orders JOIN items ON items.id = orders.id",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+      },
+      attachTo: document.body,
+    });
+    await flushPromises();
+    expect(wrapper.attributes("data-editable")).toBe("false");
+    rightClick(wrapper.get('[data-cell="r0:name"]').element);
+    await nextTick();
+    for (const id of ["update-sql", "edit-cell", "delete-item", "select-sql"]) {
+      const item = menuItem(id);
+      expect(item, id).not.toBeNull();
+      expect(item!.disabled, id).toBe(true);
+      expect((item!.getAttribute("title") ?? "").length, id).toBeGreaterThan(0);
+    }
+    for (const id of ["copy-value", "copy-row", "copy-col", "filter-eq"]) {
+      expect(menuItem(id)?.disabled, id).toBe(false);
+    }
+    wrapper.unmount();
+  });
+
+  it("stages a delete from the menu without committing anything", async () => {
+    const wrapper = await mountDataGrid();
+    rightClick(wrapper.get('tr[data-row-id="1"] td.row-number').element);
+    await nextTick();
+    menuItem("delete-item")!.click();
+    await nextTick();
+    expect(document.body.querySelector('[role="menu"]')).toBeNull();
+    expect(wrapper.get(".pending-bar").text()).toContain("1 处更改未保存");
+    expect(wrapper.get('tr[data-row-id="1"]').classes()).toContain("row-delete");
+    expect(wrapper.get('[data-cell="1:id"]').text()).toContain("将删除");
+    expect(invoke.mock.calls.some((call) => call[0] === "grid_commit")).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("generates SELECT and copies an unexecuted UPDATE from the DataGrid cell menu", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const wrapper = await mountDataGrid();
+    rightClick(wrapper.get('[data-cell="1:name"]').element);
+    await nextTick();
+    menuItem("select-sql")!.click();
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText.mock.calls[0]?.[0]).toBe('SELECT * FROM "public"."customers" WHERE "id" = \'1\'');
+
+    rightClick(wrapper.get('[data-cell="1:name"]').element);
+    await nextTick();
+    menuItem("update-sql")!.click();
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledTimes(2);
+    expect(writeText.mock.calls[1]?.[0]).toBe('UPDATE "public"."customers" SET "name" = \'客户1\' WHERE "id" = \'1\'');
+    expect(wrapper.get("[data-copy]").text()).toContain("已复制，未执行");
+    expect(invoke.mock.calls.some((call) => call[0] === "grid_commit")).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("generates SELECT and UPDATE from an editable query result through its primary key", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      throw new Error(command);
+    });
+    const model = gridModel({ columns: ["id", "name", "email", "note"], rows: [["1", "客户1", "a@example.com", null]] });
+    const wrapper = mount(QueryResultGrid, {
+      props: {
+        tabId: "query-ctx-sql",
+        statement: "SELECT id, name, email, note FROM public.customers",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+        schema: "public",
+      },
+      attachTo: document.body,
+    });
+    await flushPromises();
+    expect(wrapper.attributes("data-editable")).toBe("true");
+    rightClick(wrapper.get('[data-cell="r0:name"]').element);
+    await nextTick();
+    expect(menuItem("update-sql")?.disabled).toBe(false);
+    expect(menuItem("edit-cell")?.disabled).toBe(false);
+    expect(menuItem("delete-item")?.disabled).toBe(false);
+    menuItem("select-sql")!.click();
+    await flushPromises();
+    expect(writeText.mock.calls.at(-1)?.[0]).toBe('SELECT * FROM "public"."customers" WHERE "id" = \'1\'');
+    rightClick(wrapper.get('[data-cell="r0:name"]').element);
+    await nextTick();
+    menuItem("update-sql")!.click();
+    await flushPromises();
+    expect(writeText.mock.calls.at(-1)?.[0]).toBe('UPDATE "public"."customers" SET "name" = \'客户1\' WHERE "id" = \'1\'');
+    expect(invoke.mock.calls.some((call) => call[0] === "grid_commit")).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("opens the editor from the menu and stages a row delete on an editable result", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      throw new Error(command);
+    });
+    const model = gridModel({ columns: ["id", "name", "email", "note"], rows: [["1", "客户1", "a@example.com", null], ["2", "客户2", "b@example.com", ""]] });
+    const wrapper = mount(QueryResultGrid, {
+      props: {
+        tabId: "query-ctx-edit",
+        statement: "SELECT id, name, email, note FROM public.customers",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+        schema: "public",
+      },
+      attachTo: document.body,
+    });
+    await flushPromises();
+    rightClick(wrapper.get('[data-cell="r0:name"]').element);
+    await nextTick();
+    menuItem("edit-cell")!.click();
+    await nextTick();
+    expect(wrapper.find("input[aria-label='编辑 name']").exists()).toBe(true);
+    await wrapper.get("input[aria-label='编辑 name']").trigger("keydown", { key: "Escape" });
+
+    rightClick(wrapper.get('tr[data-row-id="r1"] td.row-number').element);
+    await nextTick();
+    menuItem("delete-item")!.click();
+    await nextTick();
+    expect(wrapper.get(".pending-bar").text()).toContain("1 处更改未保存");
+    expect(wrapper.get('tr[data-row-id="r1"]').classes()).toContain("row-delete");
+    expect(invoke.mock.calls.some((call) => call[0] === "grid_commit")).toBe(false);
+    wrapper.unmount();
+  });
+});
