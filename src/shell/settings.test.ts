@@ -31,6 +31,13 @@ describe("shell settings", () => {
     expect(DEFAULT_SETTINGS.density).toBe("compact");
   });
 
+  it("includes TSV headers by default and merges old stored JSON", () => {
+    expect(DEFAULT_SETTINGS.tsvHeaders).toBe(true);
+    expect(loadSettings().tsvHeaders).toBe(true);
+    localStorage.setItem("rillsql.shell", JSON.stringify({ theme: "dark", pageSize: 20 }));
+    expect(loadSettings()).toMatchObject({ theme: "dark", pageSize: 20, tsvHeaders: true });
+  });
+
   it("round-trips through saveSettings", () => {
     const storage = fakeStorage();
     const settings = { ...DEFAULT_SETTINGS, density: "standard" as const };

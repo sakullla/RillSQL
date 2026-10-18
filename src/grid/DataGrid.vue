@@ -14,6 +14,17 @@ import { copyPlain, copySqlValue, previewText, showCell, type NullCopy } from ".
 import "./grid.css";
 import { useRowWindow } from "./virtual";
 import { LiveTable } from "./live";
+import {
+  applyMove,
+  applyPointer,
+  emptySelection,
+  isCellSelected,
+  selectAllRows,
+  selectionToTsv,
+  type CellAddr,
+  type GridSelection,
+  type MoveKey,
+} from "./selection";
 import type { TableTarget } from "./target";
 import { FILTER_OPS, opLabel, opNeedsValue, type Cell, type FilterOp } from "./types";
 
@@ -55,6 +66,7 @@ const importMessage = ref("");
 const commitOpen = ref(false);
 const editing = ref<{ id: string; column: string; draft: string; isNull: boolean } | null>(null);
 const copyMessage = ref("");
+const selection = ref<GridSelection>({ ...emptySelection });
 const receipt = ref<string | null>(null);
 const revealed = reactive(new Set<string>());
 watch(() => props.pageSize, size => { if (session && size) session.pageSize = size; });
@@ -167,6 +179,41 @@ function focusCell(id: string, column: string) {
   });
 }
 
+function addrOf(rowId: string, colName: string): CellAddr | null {
+  const rowIndex = displayRows.value.findIndex((row) => row.id === rowId);
+  const colIndex = columns.value.findIndex((column) => column.name === colName);
+  if (rowIndex < 0 || colIndex < 0) return null;
+  return { rowIndex, colIndex };
+}
+
+function rowIdAt(rowIndex: number): string | null {
+  return displayRows.value[rowIndex]?.id ?? null;
+}
+
+function columnNameAt(colIndex: number): string | null {
+  return columns.value[colIndex]?.name ?? null;
+}
+
+/** 选区焦点 → 编辑器观察的选中格（LiveTable.selectedId 语义收窄为焦点格）。 */
+function syncFocusFromSelection() {
+  if (!session) return;
+  const focus = selection.value.focus;
+  if (!focus) return;
+  const rowId = rowIdAt(focus.rowIndex);
+  const colName = columnNameAt(focus.colIndex);
+  if (!rowId || !colName) return;
+  session.select(rowId, colName);
+  focusCell(rowId, colName);
+}
+
+function cellClasses(rowId: string, colName: string): { on?: boolean; selected?: boolean } {
+  const focused = !!session && session.selectedId === rowId && session.selectedColumn === colName;
+  if (focused) return { on: true };
+  const addr = addrOf(rowId, colName);
+  if (!addr) return {};
+  return { selected: isCellSelected(selection.value, addr, displayRows.value.length, columns.value.length) };
+}
+
 function currentCellIndex(): number {
   if (!session?.selectedId || !session.selectedColumn) return -1;
   const rowIndex = displayRows.value.findIndex((row) => row.id === session!.selectedId);
@@ -188,7 +235,91 @@ function moveSelection(delta: number) {
   const row = rows[Math.floor(index / cols.length)]!;
   const column = cols[index % cols.length]!;
   session.select(row.id, column.name);
+  const addr = addrOf(row.id, column.name);
+  if (addr) selection.value = { anchor: { ...addr }, focus: { ...addr }, extras: "", allRows: false };
   focusCell(row.id, column.name);
+}
+
+function pointerModifiers(event: PointerEvent): { shift: boolean; ctrl: boolean } {
+  return { shift: event.shiftKey, ctrl: event.ctrlKey || event.metaKey };
+}
+
+function onCellPointer(event: PointerEvent, rowId: string, colName: string) {
+  const addr = addrOf(rowId, colName);
+  if (!addr) return;
+  selection.value = applyPointer(selection.value, addr, pointerModifiers(event));
+  syncFocusFromSelection();
+}
+
+/** pointerdown 被 prevent 后部分环境只剩 click；无修饰的纯单击按单选补齐，有修饰时以选区焦点为准。 */
+function onCellClick(rowId: string, colName: string) {
+  if (!session) return;
+  if (!selection.value.focus) {
+    const addr = addrOf(rowId, colName);
+    if (addr) selection.value = applyPointer({ ...emptySelection }, addr, { shift: false, ctrl: false });
+  }
+  syncFocusFromSelection();
+}
+
+/** 行号：无修饰选中整行；Shift 从锚点连到行尾；Ctrl 逐格加减选整行。 */
+function onRowNumberPointer(event: PointerEvent, rowId: string) {
+  const rowIndex = displayRows.value.findIndex((row) => row.id === rowId);
+  const lastCol = columns.value.length - 1;
+  if (rowIndex < 0 || lastCol < 0) return;
+  const mods = pointerModifiers(event);
+  if (mods.ctrl) {
+    for (let colIndex = 0; colIndex <= lastCol; colIndex += 1) {
+      selection.value = applyPointer(selection.value, { rowIndex, colIndex }, { shift: false, ctrl: true });
+    }
+  } else if (mods.shift) {
+    selection.value = applyPointer(selection.value, { rowIndex, colIndex: lastCol }, { shift: true, ctrl: false });
+  } else {
+    selection.value = applyPointer(selection.value, { rowIndex, colIndex: 0 }, { shift: false, ctrl: false });
+    selection.value = applyPointer(selection.value, { rowIndex, colIndex: lastCol }, { shift: true, ctrl: false });
+  }
+  syncFocusFromSelection();
+}
+
+/** 表头：无修饰选中整列；Shift 从锚点连到列尾；Ctrl 逐格加减选整列。 */
+function onHeaderPointer(event: PointerEvent, colName: string) {
+  const colIndex = columns.value.findIndex((column) => column.name === colName);
+  const lastRow = displayRows.value.length - 1;
+  if (colIndex < 0 || lastRow < 0) return;
+  const mods = pointerModifiers(event);
+  if (mods.ctrl) {
+    for (let rowIndex = 0; rowIndex <= lastRow; rowIndex += 1) {
+      selection.value = applyPointer(selection.value, { rowIndex, colIndex }, { shift: false, ctrl: true });
+    }
+  } else if (mods.shift) {
+    selection.value = applyPointer(selection.value, { rowIndex: lastRow, colIndex }, { shift: true, ctrl: false });
+  } else {
+    selection.value = applyPointer(selection.value, { rowIndex: 0, colIndex }, { shift: false, ctrl: false });
+    selection.value = applyPointer(selection.value, { rowIndex: lastRow, colIndex }, { shift: true, ctrl: false });
+  }
+  syncFocusFromSelection();
+}
+
+async function copySelectionTsv() {
+  if (!session || !displayRows.value.length || !columns.value.length) return;
+  const settings = loadSettings();
+  const tsv = selectionToTsv(selection.value, {
+    headers: settings.tsvHeaders,
+    columnNames: columns.value.map((column) => column.name),
+    cellAt: (rowIndex, colIndex) => {
+      const row = displayRows.value[rowIndex];
+      const column = columns.value[colIndex];
+      if (!row || !column) return null;
+      return session.cellValue(row.id, column.name);
+    },
+    nullText: settings.nullCopy === "empty" ? "" : settings.nullCopy === "N" ? "\\N" : "NULL",
+  });
+  if (!tsv) return;
+  try {
+    await navigator.clipboard.writeText(tsv);
+    copyMessage.value = "已复制为 TSV";
+  } catch {
+    copyMessage.value = "复制失败";
+  }
 }
 
 function beginEdit(id: string, column: string) {
@@ -245,20 +376,41 @@ function onEditorKeydown(event: KeyboardEvent) {
   }
 }
 
-/** 未编辑时：Enter 开始编辑选中单元格，Tab 移动选中。 */
+/** 未编辑时：方向键移动/Shift 扩展，Enter/F2 编辑焦点格，Tab 移动，Ctrl+A 全选，Ctrl+C 复制 TSV，Esc 清除选择。 */
 function onGridKeydown(event: KeyboardEvent) {
   if (editing.value) return;
-  if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) {
+  const rows = displayRows.value;
+  const cols = columns.value;
+  const moveKeys: MoveKey[] = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"];
+  if (moveKeys.includes(event.key as MoveKey)) {
     event.preventDefault();
-    moveSelection(event.key === "ArrowUp" ? -columns.value.length : event.key === "ArrowDown" ? columns.value.length : event.key === "ArrowLeft" ? -1 : 1);
+    selection.value = applyMove(selection.value, event.key as MoveKey, event.shiftKey, rows.length, cols.length);
+    syncFocusFromSelection();
   } else if (event.key === "Enter" || event.key === "F2") {
-    if (session?.selectedId && session.selectedColumn) {
+    const focus = selection.value.focus;
+    const rowId = focus ? rowIdAt(focus.rowIndex) : session?.selectedId;
+    const colName = focus ? columnNameAt(focus.colIndex) : session?.selectedColumn;
+    if (session && rowId && colName) {
       event.preventDefault();
-      beginEdit(session.selectedId, session.selectedColumn);
+      beginEdit(rowId, colName);
     }
   } else if (event.key === "Tab") {
     event.preventDefault();
     moveSelection(event.shiftKey ? -1 : 1);
+  } else if ((event.ctrlKey || event.metaKey) && (event.key === "a" || event.key === "A")) {
+    event.preventDefault();
+    selection.value = selectAllRows(rows.length, cols.length);
+    syncFocusFromSelection();
+  } else if ((event.ctrlKey || event.metaKey) && (event.key === "c" || event.key === "C")) {
+    event.preventDefault();
+    void copySelectionTsv();
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    selection.value = { ...emptySelection };
+    if (session) {
+      session.selectedId = null;
+      session.selectedColumn = null;
+    }
   }
 }
 
@@ -435,17 +587,19 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
       <table class="grid-table">
         <thead>
           <tr>
-            <th v-for="column in columns" :key="column.name" scope="col" :aria-sort="session.sort?.column === column.name ? (session.sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'">
+            <th class="row-number" scope="col" aria-label="行号">#</th>
+            <th v-for="column in columns" :key="column.name" scope="col" :aria-sort="session.sort?.column === column.name ? (session.sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'" @pointerdown.prevent="onHeaderPointer($event, column.name)">
               <button class="th-btn" type="button" :aria-label="`按 ${column.name} 排序`" @click="session.cycleSort(column.name)">{{ column.name }}</button>
             </th>
           </tr>
         </thead>
         <tbody>
-          <tr v-if="padTop" class="virtual-spacer" aria-hidden="true"><td :colspan="columns.length" :style="{ height: `${padTop}px` }"></td></tr>
+          <tr v-if="padTop" class="virtual-spacer" aria-hidden="true"><td :colspan="columns.length + 1" :style="{ height: `${padTop}px` }"></td></tr>
           <tr v-if="loading">
-            <td class="grid-empty" :colspan="columns.length">正在读取表数据…</td>
+            <td class="grid-empty" :colspan="columns.length + 1">正在读取表数据…</td>
           </tr>
-          <tr v-for="row in visibleRows" :key="row.id" :class="{ 'row-insert': row.kind === 'insert', 'row-delete': row.deleted, 'row-failed': row.failed }" :data-row-id="row.id" :data-located="row.located" :title="row.failure || undefined">
+          <tr v-for="(row, visibleIndex) in visibleRows" :key="row.id" :class="{ 'row-insert': row.kind === 'insert', 'row-delete': row.deleted, 'row-failed': row.failed }" :data-row-id="row.id" :data-located="row.located" :title="row.failure || undefined">
+            <td class="row-number" @pointerdown.prevent="onRowNumberPointer($event, row.id)">{{ range.start + visibleIndex + 1 }}</td>
             <td v-for="(column, columnIndex) in columns" :key="column.name">
               <div v-if="editing && editing.id === row.id && editing.column === column.name" class="editor">
                 <input :ref="focusEditor" v-model="editing.draft" :aria-label="`编辑 ${column.name}`" :disabled="editing.isNull" @keydown="onEditorKeydown" />
@@ -454,19 +608,19 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
                 <button class="btn sm primary" type="button" @click="saveEdit">确定</button>
                 <button class="btn sm ghost" type="button" @click="cancelEdit">取消</button>
               </div>
-              <button v-else class="cell-btn" :class="{ on: session.selectedId === row.id && session.selectedColumn === column.name }" :data-cell="`${row.id}:${column.name}`" type="button" @click="session.select(row.id, column.name)" @dblclick="beginEdit(row.id, column.name)">
+              <button v-else class="cell-btn" :class="cellClasses(row.id, column.name)" :data-cell="`${row.id}:${column.name}`" type="button" @pointerdown.prevent="onCellPointer($event, row.id, column.name)" @click="onCellClick(row.id, column.name)" @dblclick="beginEdit(row.id, column.name)">
                 <span v-if="columnIndex === 0 && row.kind === 'insert'" class="row-flag">新增</span>
                 <span v-if="columnIndex === 0 && row.deleted" class="row-flag del">将删除</span>
                 <span :class="{ 'v-null': row.cells[columnIndex]?.kind === 'null', 'v-empty': row.cells[columnIndex]?.kind === 'empty', 'v-large': row.cells[columnIndex]?.kind === 'large' }">{{ row.cells[columnIndex]?.label }}</span>
               </button>
             </td>
           </tr>
-          <tr v-if="padBottom" class="virtual-spacer" aria-hidden="true"><td :colspan="columns.length" :style="{ height: `${padBottom}px` }"></td></tr>
+          <tr v-if="padBottom" class="virtual-spacer" aria-hidden="true"><td :colspan="columns.length + 1" :style="{ height: `${padBottom}px` }"></td></tr>
           <tr v-if="showEmptyTable" data-empty="table">
-            <td class="grid-empty" :colspan="Math.max(columns.length, 1)">{{ session.store.schema.kind === "view" ? "这个视图没有行。" : "这张表没有行。" }}<button v-if="session.canInsert" class="btn sm" type="button" @click="session.addRow()">新增行</button></td>
+            <td class="grid-empty" :colspan="Math.max(columns.length, 1) + 1">{{ session.store.schema.kind === "view" ? "这个视图没有行。" : "这张表没有行。" }}<button v-if="session.canInsert" class="btn sm" type="button" @click="session.addRow()">新增行</button></td>
           </tr>
           <tr v-else-if="showNoMatch" data-empty="filter">
-            <td class="grid-empty" :colspan="Math.max(columns.length, 1)">没有匹配行。 <button class="btn sm" type="button" @click="clearFilters">清除筛选</button></td>
+            <td class="grid-empty" :colspan="Math.max(columns.length, 1) + 1">没有匹配行。 <button class="btn sm" type="button" @click="clearFilters">清除筛选</button></td>
           </tr>
         </tbody>
       </table>

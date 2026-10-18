@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { nextTick } from "vue";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
 import { anyPending, resetCloseGuard, tabHasPending } from "../shell/close-guard";
 import type { CatalogConnection } from "../catalog/types";
@@ -1580,5 +1581,157 @@ describe("query result edits", () => {
       expect(wrapper.text()).not.toContain('"public"."customers"');
       wrapper.unmount();
     }
+  });
+});
+
+describe("DataGrid desktop selection", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    resetExportTasks();
+    resetCloseGuard();
+    resetCatalog();
+    localStorage.removeItem("rillsql.shell");
+  });
+
+  async function mountSelectionGrid(rows = [customerRow(1), customerRow(2), customerRow(3)]) {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") return { rows, truncated: false, sql: "SELECT customers" };
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:selection", draft: "", pageSize: 10, target: customersTarget } });
+    await flushPromises();
+    return wrapper;
+  }
+
+  function pointer(target: Element, init: { shift?: boolean; ctrl?: boolean } = {}) {
+    target.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true, shiftKey: !!init.shift, ctrlKey: !!init.ctrl }));
+  }
+
+  type SelectionWrapper = Awaited<ReturnType<typeof mountSelectionGrid>>;
+
+  function gridKey(wrapper: SelectionWrapper, key: string, init: { shiftKey?: boolean; ctrlKey?: boolean } = {}) {
+    wrapper.get(".grid-scroll").element.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, ...init }));
+  }
+
+  function selectedCells(wrapper: SelectionWrapper): (string | undefined)[] {
+    return wrapper.findAll("button.cell-btn.selected").map((cell) => cell.attributes("data-cell"));
+  }
+
+  function focusDataCell(wrapper: SelectionWrapper): string | undefined | null {
+    const on = wrapper.find("button.cell-btn.on");
+    return on.exists() ? on.attributes("data-cell") : null;
+  }
+
+  it("selects every cell of the row when its row number is clicked", async () => {
+    const wrapper = await mountSelectionGrid();
+    pointer(wrapper.get('tr[data-row-id="1"] td.row-number').element);
+    await nextTick();
+    const cells = wrapper.findAll('tr[data-row-id="1"] button.cell-btn');
+    expect(cells).toHaveLength(4);
+    const selected = cells.filter((cell) => cell.classes().includes("selected"));
+    expect(selected).toHaveLength(3);
+    expect(focusDataCell(wrapper)).toBe("1:note");
+    expect(selectedCells(wrapper)).not.toContain("1:note");
+    expect(wrapper.findAll('tr[data-row-id="2"] button.cell-btn.selected')).toHaveLength(0);
+    wrapper.unmount();
+  });
+
+  it("selects a rectangle from the anchor with shift click", async () => {
+    const wrapper = await mountSelectionGrid();
+    pointer(wrapper.get('[data-cell="1:id"]').element);
+    await nextTick();
+    pointer(wrapper.get('[data-cell="2:name"]').element, { shift: true });
+    await nextTick();
+    expect(selectedCells(wrapper).sort()).toEqual(["1:id", "1:name", "2:id"]);
+    expect(focusDataCell(wrapper)).toBe("2:name");
+    wrapper.unmount();
+  });
+
+  it("adds and removes cells with ctrl click", async () => {
+    const wrapper = await mountSelectionGrid();
+    pointer(wrapper.get('[data-cell="1:id"]').element);
+    await nextTick();
+    pointer(wrapper.get('[data-cell="1:name"]').element, { ctrl: true });
+    await nextTick();
+    pointer(wrapper.get('[data-cell="2:id"]').element, { ctrl: true });
+    await nextTick();
+    expect(selectedCells(wrapper).sort()).toEqual(["1:name", "2:id"]);
+    expect(focusDataCell(wrapper)).toBe("1:id");
+    pointer(wrapper.get('[data-cell="1:name"]').element, { ctrl: true });
+    await nextTick();
+    expect(selectedCells(wrapper)).toEqual(["2:id"]);
+    expect(focusDataCell(wrapper)).toBe("1:id");
+    wrapper.unmount();
+  });
+
+  it("selects all loaded rows with Ctrl+A and copies them as TSV with headers", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const wrapper = await mountSelectionGrid();
+    gridKey(wrapper, "a", { ctrlKey: true });
+    await nextTick();
+    expect(wrapper.findAll("button.cell-btn")).toHaveLength(12);
+    expect(selectedCells(wrapper)).toHaveLength(11);
+    expect(focusDataCell(wrapper)).toBe("3:note");
+    gridKey(wrapper, "c", { ctrlKey: true });
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledTimes(1);
+    const tsv = String(writeText.mock.calls[0]?.[0]);
+    const lines = tsv.split("\n");
+    expect(lines[0]).toBe("id\tname\temail\tnote");
+    expect(lines).toHaveLength(4);
+    expect(tsv).toContain("客户1");
+    expect(tsv).toContain("客户3");
+    wrapper.unmount();
+  });
+
+  it("moves the focus with arrow keys and extends the anchor with shift", async () => {
+    const wrapper = await mountSelectionGrid();
+    pointer(wrapper.get('[data-cell="1:id"]').element);
+    await nextTick();
+    gridKey(wrapper, "ArrowDown");
+    await nextTick();
+    expect(focusDataCell(wrapper)).toBe("2:id");
+    expect(selectedCells(wrapper)).toHaveLength(0);
+    gridKey(wrapper, "ArrowDown", { shiftKey: true });
+    await nextTick();
+    expect(focusDataCell(wrapper)).toBe("3:id");
+    expect(selectedCells(wrapper)).toEqual(["2:id"]);
+    wrapper.unmount();
+  });
+
+  it("edits only the focus cell with Enter while several cells are selected", async () => {
+    const wrapper = await mountSelectionGrid();
+    pointer(wrapper.get('[data-cell="1:id"]').element);
+    await nextTick();
+    pointer(wrapper.get('[data-cell="2:name"]').element, { shift: true });
+    await nextTick();
+    gridKey(wrapper, "Enter");
+    await nextTick();
+    const inputs = wrapper.findAll("input[aria-label^='编辑']");
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0]!.attributes("aria-label")).toBe("编辑 name");
+    expect(inputs[0]!.element.closest("tr")?.getAttribute("data-row-id")).toBe("2");
+    wrapper.unmount();
+  });
+
+  it("renders a row-number header column and spans empty states across it", async () => {
+    const wrapper = await mountSelectionGrid();
+    expect(wrapper.find("th.row-number").exists()).toBe(true);
+    expect(wrapper.find('tr[data-row-id="1"] td.row-number').exists()).toBe(true);
+    expect(wrapper.find('tr[data-row-id="1"] td.row-number').text()).toBe("1");
+    expect(wrapper.find('tr[data-row-id="3"] td.row-number').text()).toBe("3");
+    wrapper.unmount();
+
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") return { rows: [], truncated: false, sql: "SELECT empty" };
+      throw new Error(command);
+    });
+    const empty = mount(DataGrid, { props: { tabId: "table:selection-empty", draft: "", pageSize: 10, target: customersTarget } });
+    await flushPromises();
+    expect(empty.get("[data-empty='table'] td").attributes("colspan")).toBe("5");
+    empty.unmount();
   });
 });

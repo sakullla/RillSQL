@@ -12,6 +12,7 @@ export interface ShellSettings {
   nullCopy: NullCopy;
   typeToConfirm: boolean;
   confirmClose: boolean;
+  tsvHeaders: boolean;
 }
 
 export const DEFAULT_SETTINGS: ShellSettings = {
@@ -24,6 +25,7 @@ export const DEFAULT_SETTINGS: ShellSettings = {
   nullCopy: "NULL",
   typeToConfirm: true,
   confirmClose: true,
+  tsvHeaders: true,
 };
 
 const STORAGE_KEY = "rillsql.shell";

@@ -245,5 +245,7 @@
 }
 
 .grid-table .virtual-spacer td { padding: 0; border: 0; }
-.grid-table .row-number { width: 48px; min-width: 48px; text-align: right; color: var(--text-3); background: var(--panel-2); font-size: 10px; user-select: none; }
+.grid-table .row-number { position: sticky; left: 0; z-index: 1; width: 40px; min-width: 40px; background: var(--sunken); color: var(--text-3); font-variant-numeric: tabular-nums; text-align: right; padding: 0 8px 0 4px; user-select: none; }
+.grid-table th.row-number { z-index: 3; }
+.cell-btn.selected { background: var(--sel); }
 .grid-table .sort-arrow { margin-left: auto; color: var(--accent-text); }
