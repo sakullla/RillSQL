@@ -25,10 +25,29 @@ const saved = computed(() => catalogConnections().length > 0);
           </div>
         </header>
         <div class="desk-actions">
-          <button class="desk-action" type="button" @click="emit('connections')"><span class="action-icon"><Icon name="database" /></span><span><b>新建连接</b><small>PostgreSQL / MySQL / MariaDB</small></span></button>
-          <button class="desk-action" type="button" @click="emit('sqlite')"><span class="action-icon"><Icon name="file" /></span><span><b>打开 SQLite 文件</b><small>选择本机上的数据库文件</small></span></button>
+          <button class="btn primary desk-action" type="button" @click="emit('connections')"><span class="action-icon"><Icon name="database" /></span><span><b>新建连接</b><small>PostgreSQL / MySQL / MariaDB</small></span></button>
+          <button class="btn desk-action" type="button" @click="emit('sqlite')"><span class="action-icon"><Icon name="file" /></span><span><b>打开 SQLite 文件</b><small>选择本机上的数据库文件</small></span></button>
         </div>
       </template>
     </div>
   </div>
 </template>
+
+<style scoped>
+/* .btn 的固定高度会裁切带说明的入口；实心仍只来自 .primary。 */
+.desk-action.btn {
+  height: auto;
+  width: 100%;
+  min-width: 0;
+  justify-content: flex-start;
+  white-space: normal;
+  transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
+}
+.desk-action.primary .action-icon {
+  background: color-mix(in srgb, var(--on-accent) 18%, transparent);
+  color: var(--on-accent);
+}
+.desk-action.primary small {
+  color: color-mix(in srgb, var(--on-accent) 78%, transparent);
+}
+</style>
