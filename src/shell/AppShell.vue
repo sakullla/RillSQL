@@ -196,6 +196,11 @@ function onFocusedDatabase(connectionId: string, database: string) {
   }
 }
 
+/** 对象树连接节点的编辑/测试/复制/删除：本任务统一落到连接页，具体弹窗后续再接。 */
+function onConnectionAction(_connectionId: string, _action: "edit" | "test" | "copy" | "delete") {
+  session.showPage("connections");
+}
+
 function onSettings(patch: Partial<ShellSettings>) {
   Object.assign(settings, patch);
   persist();
@@ -418,6 +423,7 @@ onBeforeUnmount(() => {
         @open-object="onOpenObject"
         @query-object="onQueryObject"
         @focused-database="onFocusedDatabase"
+        @connection-action="onConnectionAction"
       />
       <main id="main" tabindex="-1">
         <WorkspaceView

@@ -10,6 +10,7 @@ const emit = defineEmits<{
   "open-object": [object: CatalogObjectRef, pane: "data" | "structure", section?: "columns" | "drop"];
   "query-object": [object: CatalogObjectRef, sql: string];
   "focused-database": [connectionId: string, database: string];
+  "connection-action": [connectionId: string, action: "edit" | "test" | "copy" | "delete"];
 }>();
 
 function forwardOpen(object: CatalogObjectRef, pane: "data" | "structure", section?: "columns" | "drop") {
@@ -22,6 +23,10 @@ function forwardQuery(object: CatalogObjectRef, sql: string) {
 
 function forwardFocus(connectionId: string, database: string) {
   emit("focused-database", connectionId, database);
+}
+
+function forwardConnectionAction(connectionId: string, action: "edit" | "test" | "copy" | "delete") {
+  emit("connection-action", connectionId, action);
 }
 const filter = ref("");
 
@@ -57,7 +62,13 @@ function onPointerDown(event: PointerEvent) {
       <Icon name="search" />
       <input v-model="filter" type="search" placeholder="筛选表" aria-label="筛选表" />
     </label>
-    <ExplorerTree :filter="filter" @open-object="forwardOpen" @query-object="forwardQuery" @focused-database="forwardFocus" />
+    <ExplorerTree
+      :filter="filter"
+      @open-object="forwardOpen"
+      @query-object="forwardQuery"
+      @focused-database="forwardFocus"
+      @connection-action="forwardConnectionAction"
+    />
   </aside>
   <div
     class="sb-resizer"

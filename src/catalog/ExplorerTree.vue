@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import type { OpenOutcome } from "../connections/api";
+import { computed, nextTick, onMounted, onUpdated, ref, watch } from "vue";
+import { tauriConnectionApi, type OpenOutcome } from "../connections/api";
+import { ContextMenu, type MenuItem } from "../ui";
 import { focusDatabase, listConnections, openConnection } from "./backend";
 import { browseSql, qualifiedObjectName, type CatalogObjectRef } from "./object-ref";
 import SchemaBlock from "./SchemaBlock.vue";
@@ -8,13 +9,19 @@ import { catalogConnections, catalogLoadError, refreshCatalog, schemaKey } from 
 import { engineShape, isConnected, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
 import type { CatalogConnection, DatabaseNode } from "./types";
 
+type ConnectionMenuAction = "edit" | "test" | "copy" | "delete";
+
 const props = defineProps<{ filter: string }>();
 const emit = defineEmits<{
   "open-object": [object: CatalogObjectRef, pane: "data" | "structure", section?: "columns" | "drop"];
   "query-object": [object: CatalogObjectRef, sql: string];
   "focused-database": [connectionId: string, database: string];
+  "connection-action": [connectionId: string, action: ConnectionMenuAction];
 }>();
-const menu = ref<{ object: CatalogObjectRef; x: number; y: number; notice: string } | null>(null);
+const menu = ref<{ object?: CatalogObjectRef; connection?: CatalogConnection; x: number; y: number } | null>(null);
+const menuEl = ref<HTMLElement | null>(null);
+const treeEl = ref<HTMLElement | null>(null);
+const activeKey = ref<string | null>(null);
 const refreshing = ref(false);
 const focusing = ref<string | null>(null);
 const focusTarget = ref<string | null>(null);
@@ -223,64 +230,218 @@ function onTreeClick(event: MouseEvent) {
 
 function onContextMenu(event: MouseEvent) {
   event.preventDefault();
-  const row = rowOf(event.target);
-  const object = row ? readRef(row) : null;
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    closeMenu();
+    return;
+  }
+  const row = target.closest<HTMLElement>(".tr-conn, [data-level=object], [data-hit]");
+  if (!row) {
+    closeMenu();
+    return;
+  }
+  // 先把焦点放到触发行：菜单关闭时 ContextMenu 会把焦点还回来，键盘用户不掉焦点。
+  row.focus();
+  menuEl.value = row;
+  if (row.classList.contains("tr-conn")) {
+    const connectionId = row.closest("[data-connection]")?.getAttribute("data-connection") || "";
+    const connection = connections.value.find((item) => item.id === connectionId);
+    if (!connection) {
+      closeMenu();
+      return;
+    }
+    menu.value = { connection, x: Math.max(8, event.clientX), y: Math.max(8, event.clientY) };
+    return;
+  }
+  const object = readRef(row);
   if (!object) {
     closeMenu();
     return;
   }
-  const height = object.kind === "table" ? 210 : 160;
-  menu.value = {
-    object,
-    x: Math.max(8, Math.min(event.clientX, window.innerWidth - 228)),
-    y: Math.max(8, Math.min(event.clientY, window.innerHeight - height)),
-    notice: "",
-  };
+  menu.value = { object, x: Math.max(8, event.clientX), y: Math.max(8, event.clientY) };
 }
 
-function onQuery() {
-  const object = menu.value?.object;
-  if (!object || object.stale) return;
-  const sql = browseSql(object.engine, object.schema, object.name);
-  closeMenu();
-  emit("query-object", object, sql);
+const menuLabel = computed(() => {
+  const current = menu.value;
+  if (!current) return "操作";
+  if (current.connection) return `${current.connection.name} 的操作`;
+  return `${current.object?.name ?? ""} 的操作`;
+});
+
+const menuItems = computed<MenuItem[]>(() => {
+  const current = menu.value;
+  if (!current) return [];
+  if (current.connection) {
+    return [
+      { kind: "item", id: "conn-toggle", label: isConnected(current.connection.status) ? "断开连接" : "连接" },
+      { kind: "item", id: "conn-edit", label: "编辑…" },
+      { kind: "item", id: "conn-test", label: "测试连接" },
+      { kind: "item", id: "conn-copy", label: "复制配置" },
+      { kind: "sep" },
+      { kind: "item", id: "conn-delete", label: "删除…", danger: true },
+    ];
+  }
+  const object = current.object;
+  if (!object) return [];
+  const items: MenuItem[] = [];
+  if (object.stale) items.push({ kind: "head", text: "这个对象已失效——它在外部被删除，不能再打开" });
+  items.push(
+    { kind: "item", id: "open-data", label: "打开数据", disabled: object.stale },
+    { kind: "item", id: "open-structure", label: "查看结构", disabled: object.stale },
+    { kind: "item", id: "new-query", label: "新建查询到此对象", title: browseSql(object.engine, object.schema, object.name), disabled: object.stale },
+    { kind: "item", id: "copy-name", label: "复制限定名" },
+    { kind: "item", id: "gen-select", label: "生成 SELECT" },
+  );
+  if (object.kind === "table") {
+    items.push({ kind: "sep" }, { kind: "item", id: "delete-item", label: "删除表…", danger: true, disabled: object.stale, title: "打开结构页的删除确认区" });
+  }
+  return items;
+});
+
+function onMenuSelect(id: string) {
+  const current = menu.value;
+  if (!current) return;
+  if (current.object) {
+    onObjectMenu(id, current.object);
+    return;
+  }
+  if (current.connection) void onConnectionMenu(id, current.connection);
 }
 
-async function onCopy() {
-  const object = menu.value?.object;
-  if (!object) return;
-  try {
-    await navigator.clipboard.writeText(qualifiedObjectName(object.engine, object.schema, object.name));
-    closeMenu();
-  } catch {
-    if (menu.value) menu.value = { ...menu.value, notice: "无法写入剪贴板" };
+function onObjectMenu(id: string, object: CatalogObjectRef) {
+  if (id === "open-data") return openObject(object, "data");
+  if (id === "open-structure") return openObject(object, "structure", "columns");
+  if (id === "new-query") {
+    if (object.stale) return;
+    emit("query-object", object, browseSql(object.engine, object.schema, object.name));
+    return;
+  }
+  if (id === "copy-name") {
+    void navigator.clipboard.writeText(qualifiedObjectName(object.engine, object.schema, object.name)).catch(() => undefined);
+    return;
+  }
+  if (id === "gen-select") {
+    void navigator.clipboard.writeText(browseSql(object.engine, object.schema, object.name)).catch(() => undefined);
+    return;
+  }
+  if (id === "delete-item") return openObject(object, "structure", "drop");
+}
+
+async function onConnectionMenu(id: string, connection: CatalogConnection) {
+  if (id === "conn-toggle") {
+    if (isConnected(connection.status)) await disconnectSession(connection);
+    else await connectSession(connection);
+    return;
+  }
+  if (id === "conn-copy") {
+    await copyConnectionConfig(connection);
+    return;
+  }
+  if (id === "conn-edit" || id === "conn-test" || id === "conn-delete") {
+    emit("connection-action", connection.id, id.slice("conn-".length) as ConnectionMenuAction);
   }
 }
 
-function onWindowPointer(event: MouseEvent) {
-  if (event.button === 2) return;
-  const target = event.target;
-  if (target instanceof Element && target.closest("[data-menu=object]")) return;
-  closeMenu();
+async function disconnectSession(connection: CatalogConnection) {
+  try {
+    await tauriConnectionApi.disconnect(connection.id);
+  } catch (error) {
+    connectTarget.value = connection.id;
+    connectError.value = failureText(error);
+    return;
+  }
+  await refreshCatalog();
 }
 
-function onWindowKey(event: KeyboardEvent) {
-  if (event.key === "Escape") closeMenu();
+/** 复制不含密码、SSH 密码、私钥口令和主机密钥的配置 JSON。 */
+async function copyConnectionConfig(connection: CatalogConnection) {
+  const saved = (await listConnections().catch(() => [] as const)).find((item) => item.id === connection.id);
+  const payload = saved
+    ? {
+        id: saved.id,
+        name: saved.name,
+        engine: saved.engine,
+        env: saved.env,
+        host: saved.host,
+        port: saved.port,
+        database: saved.database,
+        username: saved.username,
+        filePath: saved.filePath,
+        tls: saved.tls,
+        ssh: saved.ssh,
+      }
+    : { id: connection.id, name: connection.name, engine: connection.engine };
+  await navigator.clipboard.writeText(JSON.stringify(payload, null, 2)).catch(() => undefined);
 }
 
-onMounted(() => {
-  window.addEventListener("mousedown", onWindowPointer);
-  window.addEventListener("keydown", onWindowKey);
-});
+/** 键盘导航：行不带 tabindex 时 focus() 无效，SchemaBlock 的行也要补上（roving tabindex）。 */
+function rowKeyOf(row: HTMLElement): string {
+  const connectionId = row.dataset.connection || row.closest("[data-connection]")?.getAttribute("data-connection") || "";
+  if (row.classList.contains("tr-conn")) return `c:${connectionId}`;
+  if (row.hasAttribute("data-hit")) {
+    return `h:${connectionId}:${row.dataset.database ?? ""}:${row.dataset.schema ?? ""}:${row.dataset.object ?? ""}`;
+  }
+  if (row.dataset.level === "database") return `d:${connectionId}:${row.dataset.database ?? ""}`;
+  if (row.dataset.level === "schema") return schemaKey(connectionId, row.dataset.database ?? "", row.dataset.schema ?? "");
+  return `o:${connectionId}:${row.dataset.database ?? ""}:${row.dataset.schema ?? ""}:${row.dataset.object ?? ""}`;
+}
 
-onBeforeUnmount(() => {
-  window.removeEventListener("mousedown", onWindowPointer);
-  window.removeEventListener("keydown", onWindowKey);
+function treeRows(): HTMLElement[] {
+  if (!treeEl.value) return [];
+  return [...treeEl.value.querySelectorAll<HTMLElement>('.tree-row[role="treeitem"]')];
+}
+
+function stampRows() {
+  const rows = treeRows();
+  if (!rows.length) return;
+  if (!rows.some((row) => rowKeyOf(row) === activeKey.value)) {
+    activeKey.value = rowKeyOf(rows[0]!);
+  }
+  for (const row of rows) {
+    row.tabIndex = rowKeyOf(row) === activeKey.value ? 0 : -1;
+  }
+}
+
+function focusRow(row: HTMLElement) {
+  activeKey.value = rowKeyOf(row);
+  row.focus();
+  stampRows();
+}
+
+function onTreeKey(event: KeyboardEvent) {
+  const rows = treeRows();
+  if (!rows.length) return;
+  const active = document.activeElement instanceof HTMLElement && rows.includes(document.activeElement) ? document.activeElement : null;
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const at = active ? rows.indexOf(active) : -1;
+    const next = event.key === "ArrowDown" ? (at < 0 ? 0 : Math.min(at + 1, rows.length - 1)) : at < 0 ? rows.length - 1 : Math.max(at - 1, 0);
+    focusRow(rows[next]!);
+    return;
+  }
+  if (event.key === "Enter") {
+    if (!active) return;
+    event.preventDefault();
+    active.click();
+    return;
+  }
+  if (event.key === "F4") {
+    if (!active || !active.matches("[data-level=object], [data-hit]")) return;
+    event.preventDefault();
+    const object = readRef(active);
+    if (object) emit("open-object", object, "structure", "columns");
+  }
+}
+
+onMounted(() => stampRows());
+onUpdated(() => stampRows());
+watch([expanded, connections, () => props.filter], () => {
+  void nextTick(() => stampRows());
 });
 </script>
 
 <template>
-  <div class="tree" role="tree" aria-label="数据库对象" @click="onTreeClick" @contextmenu="onContextMenu" @scroll="closeMenu">
+  <div ref="treeEl" class="tree" role="tree" aria-label="数据库对象" @click="onTreeClick" @contextmenu="onContextMenu" @keydown="onTreeKey" @scroll="closeMenu">
     <div class="tree-toolbar">
       <button class="btn ghost sm" type="button" data-action="tree-refresh" aria-label="刷新对象列表" :disabled="refreshing" @click="onRefresh">
         {{ refreshing ? "正在刷新…" : "刷新" }}
@@ -498,29 +659,16 @@ onBeforeUnmount(() => {
       </section>
     </template>
   </div>
-  <Teleport to="body">
-    <div
-      v-if="menu"
-      class="menu object-menu"
-      data-menu="object"
-      role="menu"
-      :aria-label="`${menu.object.name} 的操作`"
-      :style="{ left: `${menu.x}px`, top: `${menu.y}px` }"
-      @click.stop
-      @contextmenu.prevent
-    >
-      <div v-if="menu.object.stale" class="menu-head">这个对象已失效——它在外部被删除，不能再打开</div>
-      <button class="menu-item" type="button" data-action="open-data" :disabled="menu.object.stale" @click="openObject(menu.object, 'data')">打开数据</button>
-      <button class="menu-item" type="button" data-action="open-structure" :disabled="menu.object.stale" @click="openObject(menu.object, 'structure', 'columns')">查看结构</button>
-      <button class="menu-item" type="button" data-action="new-query" :disabled="menu.object.stale" :title="browseSql(menu.object.engine, menu.object.schema, menu.object.name)" @click="onQuery">新建查询</button>
-      <button class="menu-item" type="button" data-action="copy-name" @click="onCopy">复制完整名称</button>
-      <div v-if="menu.notice" class="menu-head">{{ menu.notice }}</div>
-      <template v-if="menu.object.kind === 'table'">
-        <div class="menu-sep" role="separator"></div>
-        <button class="menu-item danger" type="button" data-action="drop-table" :disabled="menu.object.stale" @click="openObject(menu.object, 'structure', 'drop')">删除表…</button>
-      </template>
-    </div>
-  </Teleport>
+  <ContextMenu
+    :open="Boolean(menu)"
+    :x="menu?.x ?? 0"
+    :y="menu?.y ?? 0"
+    :items="menuItems"
+    :label="menuLabel"
+    :trigger="menuEl"
+    @close="closeMenu"
+    @select="onMenuSelect"
+  />
 </template>
 
 <style src="./catalog.css"></style>

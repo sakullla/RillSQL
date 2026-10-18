@@ -219,12 +219,13 @@ describe("explorer tree", () => {
     row.element.dispatchEvent(event);
     await nextTick();
     expect(event.defaultPrevented).toBe(true);
-    const menu = document.body.querySelector("[data-menu=object]");
+    const menu = document.body.querySelector('[role="menu"]');
+    expect(menu).not.toBeNull();
     expect(menu?.textContent).toContain("打开数据");
     expect(menu?.textContent).toContain("查看结构");
     expect(menu?.textContent).toContain("新建查询");
     expect(menu?.textContent).toContain("删除表");
-    (menu?.querySelector("[data-action=open-structure]") as HTMLButtonElement | null)?.click();
+    (menu?.querySelector('[data-id="open-structure"]') as HTMLButtonElement | null)?.click();
     await nextTick();
     expect(wrapper.emitted("open-object")?.[1]?.[1]).toBe("structure");
     expect(wrapper.emitted("open-object")?.[1]?.[2]).toBe("columns");
@@ -232,8 +233,8 @@ describe("explorer tree", () => {
     const view = wrapper.get("[data-object=v_note_summary]");
     view.element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 12, clientY: 18 }));
     await nextTick();
-    expect(document.body.querySelector("[data-action=drop-table]")).toBeNull();
-    expect(document.body.querySelector("[data-action=open-data]")?.textContent).toContain("打开数据");
+    expect(document.body.querySelector('[data-id="delete-item"]')).toBeNull();
+    expect(document.body.querySelector('[data-id="open-data"]')?.textContent).toContain("打开数据");
     wrapper.unmount();
   });
 
@@ -272,6 +273,82 @@ describe("explorer tree", () => {
     expect(note.get('[data-action="tree-retry"]').text()).toBe("重试");
     expect(wrapper.text()).not.toContain("里没有表或视图");
     expect(wrapper.text()).not.toContain("还没有打开的连接");
+    wrapper.unmount();
+  });
+});
+
+describe("ExplorerTree desktop menus and keys", () => {
+  it("opens the unified object menu on right click with a danger delete only for tables", async () => {
+    replaceCatalog(catalogFixture());
+    const wrapper = mount(ExplorerTree, { props: { filter: "" }, attachTo: document.body });
+    const row = wrapper.get("[data-database=atlas_dev][data-schema=public][data-object=customers]");
+    row.element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 40, clientY: 60 }));
+    await nextTick();
+    const menu = document.body.querySelector('[role="menu"]');
+    expect(menu).not.toBeNull();
+    const ids = [...document.body.querySelectorAll('[role="menu"] [role="menuitem"]')].map((item) => item.getAttribute("data-id"));
+    expect(ids).toEqual(["open-data", "open-structure", "new-query", "copy-name", "gen-select", "delete-item"]);
+    expect(document.body.querySelector('[data-id="delete-item"]')?.classList.contains("danger")).toBe(true);
+
+    const view = wrapper.get("[data-object=v_note_summary]");
+    view.element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 8, clientY: 8 }));
+    await nextTick();
+    const viewIds = [...document.body.querySelectorAll('[role="menu"] [role="menuitem"]')].map((item) => item.getAttribute("data-id"));
+    expect(viewIds).not.toContain("delete-item");
+    wrapper.unmount();
+  });
+
+  it("offers connection actions on the connection row", async () => {
+    replaceCatalog(catalogFixture());
+    const wrapper = mount(ExplorerTree, { props: { filter: "" }, attachTo: document.body });
+    wrapper.get(".tr-conn").element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 30, clientY: 40 }));
+    await nextTick();
+    const ids = [...document.body.querySelectorAll('[role="menu"] [role="menuitem"]')].map((item) => item.getAttribute("data-id"));
+    expect(ids).toEqual(["conn-toggle", "conn-edit", "conn-test", "conn-copy", "conn-delete"]);
+    expect(document.body.querySelector('[data-id="conn-delete"]')?.classList.contains("danger")).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("copies a generated SELECT to the clipboard from the menu", async () => {
+    replaceCatalog(catalogFixture());
+    const written: string[] = [];
+    Object.defineProperty(navigator, "clipboard", {
+      value: {
+        writeText: async (text: string) => {
+          written.push(text);
+        },
+      },
+      configurable: true,
+    });
+    const wrapper = mount(ExplorerTree, { props: { filter: "" }, attachTo: document.body });
+    wrapper
+      .get("[data-level=object][data-object=customers][data-schema=public]")
+      .element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 20, clientY: 20 }));
+    await nextTick();
+    (document.body.querySelector('[data-id="gen-select"]') as HTMLElement | null)?.click();
+    await nextTick();
+    expect(written).toHaveLength(1);
+    expect(written[0]).toContain("SELECT");
+    expect(written[0]).toContain('"public"."customers"');
+    wrapper.unmount();
+  });
+
+  it("moves tree focus with Alt+arrow keys and opens structure with F4", async () => {
+    replaceCatalog(catalogFixture());
+    const wrapper = mount(ExplorerTree, { props: { filter: "" }, attachTo: document.body });
+    const rows = wrapper.findAll('.tree-row[role="treeitem"]');
+    expect(rows.length).toBeGreaterThan(2);
+    rows[0]!.element.focus();
+    expect(document.activeElement).toBe(rows[0]!.element);
+    await wrapper.get(".tree").trigger("keydown", { key: "ArrowDown", altKey: true });
+    expect(document.activeElement).toBe(rows[1]!.element);
+    await wrapper.get(".tree").trigger("keydown", { key: "ArrowUp", altKey: true });
+    expect(document.activeElement).toBe(rows[0]!.element);
+
+    const objectRow = wrapper.get("[data-level=object][data-object=customers][data-schema=public]");
+    objectRow.element.focus();
+    await wrapper.get(".tree").trigger("keydown", { key: "F4" });
+    expect(wrapper.emitted("open-object")?.[0]?.[1]).toBe("structure");
     wrapper.unmount();
   });
 });
