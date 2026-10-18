@@ -1,27 +1,30 @@
 export type ShortcutGroup = "全局" | "SQL 编辑器" | "表格";
 
+export type MenuName = "文件" | "编辑" | "视图" | "查询" | "工具" | "窗口" | "帮助";
+
 export interface ShortcutDef {
   group: ShortcutGroup;
   chord: string;
   label: string;
+  menus?: MenuName[];
 }
 
 export const SHORTCUTS: readonly ShortcutDef[] = [
-  { group: "全局", chord: "Mod+K", label: "命令面板（表、连接、命令）" },
-  { group: "全局", chord: "Mod+P", label: "快速打开表" },
-  { group: "全局", chord: "Mod+T", label: "新建查询" },
-  { group: "全局", chord: "Mod+W", label: "关闭当前标签" },
-  { group: "全局", chord: "Mod+B", label: "显示 / 隐藏资源管理器" },
-  { group: "全局", chord: "Alt+1…9", label: "切换到第 N 个标签" },
-  { group: "全局", chord: "Mod+,", label: "设置" },
-  { group: "全局", chord: "?", label: "快捷键帮助" },
-  { group: "SQL 编辑器", chord: "Mod+Enter", label: "执行选中内容；无选中时执行光标所在语句" },
-  { group: "SQL 编辑器", chord: "Mod+Shift+Enter", label: "只执行光标所在语句" },
-  { group: "SQL 编辑器", chord: "Mod+.", label: "请求取消执行" },
+  { group: "全局", chord: "Mod+K", label: "命令面板（表、连接、命令）", menus: ["编辑"] },
+  { group: "全局", chord: "Mod+P", label: "快速打开表", menus: ["编辑"] },
+  { group: "全局", chord: "Mod+T", label: "新建查询", menus: ["文件"] },
+  { group: "全局", chord: "Mod+W", label: "关闭当前标签", menus: ["窗口"] },
+  { group: "全局", chord: "Mod+B", label: "显示 / 隐藏资源管理器", menus: ["视图"] },
+  { group: "全局", chord: "Alt+1…9", label: "切换到第 N 个标签", menus: ["窗口"] },
+  { group: "全局", chord: "Mod+,", label: "设置", menus: ["文件", "工具"] },
+  { group: "全局", chord: "?", label: "快捷键帮助", menus: ["视图", "帮助"] },
+  { group: "SQL 编辑器", chord: "Mod+Enter", label: "执行选中内容；无选中时执行光标所在语句", menus: ["查询"] },
+  { group: "SQL 编辑器", chord: "Mod+Shift+Enter", label: "只执行光标所在语句", menus: ["查询"] },
+  { group: "SQL 编辑器", chord: "Mod+.", label: "请求取消执行", menus: ["查询"] },
   { group: "SQL 编辑器", chord: "Ctrl+Space", label: "补全" },
   { group: "SQL 编辑器", chord: "Mod+/", label: "注释 / 取消注释" },
-  { group: "SQL 编辑器", chord: "Mod+Shift+F", label: "格式化选中的 SQL；无选中时格式化全部" },
-  { group: "SQL 编辑器", chord: "Mod+Shift+E", label: "查看当前语句的执行计划" },
+  { group: "SQL 编辑器", chord: "Mod+Shift+F", label: "格式化选中的 SQL；无选中时格式化全部", menus: ["查询"] },
+  { group: "SQL 编辑器", chord: "Mod+Shift+E", label: "查看当前语句的执行计划", menus: ["查询"] },
   { group: "SQL 编辑器", chord: "Esc 然后 Tab", label: "离开编辑器（Tab 在编辑器中用于缩进）" },
   { group: "表格", chord: "↑ ↓ ← →", label: "移动单元格" },
   { group: "表格", chord: "Enter / F2", label: "编辑单元格" },
