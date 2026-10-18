@@ -1734,4 +1734,78 @@ describe("DataGrid desktop selection", () => {
     expect(empty.get("[data-empty='table'] td").attributes("colspan")).toBe("5");
     empty.unmount();
   });
+
+  it("keeps a plain click as a single focus cell with the inspector", async () => {
+    const wrapper = await mountSelectionGrid();
+    pointer(wrapper.get('[data-cell="2:email"]').element);
+    await nextTick();
+    expect(focusDataCell(wrapper)).toBe("2:email");
+    expect(wrapper.find(".inspector").exists()).toBe(true);
+    expect(wrapper.get(".inspector-meta").text()).toContain("email");
+    expect(selectedCells(wrapper)).toHaveLength(0);
+    wrapper.unmount();
+  });
+
+  it("copies a single selected cell as its plain value without headers", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const wrapper = await mountSelectionGrid();
+    pointer(wrapper.get('[data-cell="2:name"]').element);
+    await nextTick();
+    gridKey(wrapper, "c", { ctrlKey: true });
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText.mock.calls[0]?.[0]).toBe("客户2");
+    wrapper.unmount();
+  });
+
+  it("closes the editor with Escape and keeps the focus on that cell", async () => {
+    const wrapper = await mountSelectionGrid();
+    await wrapper.get('[data-cell="1:name"]').trigger("dblclick");
+    expect(wrapper.find("input[aria-label='编辑 name']").exists()).toBe(true);
+    await wrapper.get("input[aria-label='编辑 name']").setValue("改到一半");
+    await wrapper.get("input[aria-label='编辑 name']").trigger("keydown", { key: "Escape" });
+    expect(wrapper.find("input[aria-label='编辑 name']").exists()).toBe(false);
+    expect(wrapper.get('[data-cell="1:name"]').text()).toBe("客户1");
+    expect(focusDataCell(wrapper)).toBe("1:name");
+    wrapper.unmount();
+  });
+
+  it("clears both the rectangle and the focus with Escape when not editing", async () => {
+    const wrapper = await mountSelectionGrid();
+    pointer(wrapper.get('[data-cell="1:id"]').element);
+    await nextTick();
+    pointer(wrapper.get('[data-cell="2:name"]').element, { shift: true });
+    await nextTick();
+    expect(selectedCells(wrapper).length).toBeGreaterThan(0);
+    expect(focusDataCell(wrapper)).toBe("2:name");
+    gridKey(wrapper, "Escape");
+    await nextTick();
+    expect(selectedCells(wrapper)).toHaveLength(0);
+    expect(focusDataCell(wrapper)).toBeNull();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("removes a whole row or column from the selection with ctrl click", async () => {
+    const wrapper = await mountSelectionGrid();
+    pointer(wrapper.get('tr[data-row-id="1"] td.row-number').element);
+    await nextTick();
+    expect(selectedCells(wrapper)).toHaveLength(3);
+    pointer(wrapper.get('tr[data-row-id="1"] td.row-number').element, { ctrl: true });
+    await nextTick();
+    expect(selectedCells(wrapper)).toHaveLength(0);
+    expect(focusDataCell(wrapper)).toBeNull();
+
+    pointer(wrapper.get("thead th:nth-child(2)").element);
+    await nextTick();
+    const idColumnSelected = wrapper.findAll("button.cell-btn.selected").map((cell) => cell.attributes("data-cell"));
+    expect(idColumnSelected.sort()).toEqual(["1:id", "2:id"]);
+    expect(focusDataCell(wrapper)).toBe("3:id");
+    pointer(wrapper.get("thead th:nth-child(2)").element, { ctrl: true });
+    await nextTick();
+    expect(selectedCells(wrapper)).toHaveLength(0);
+    expect(focusDataCell(wrapper)).toBeNull();
+    wrapper.unmount();
+  });
 });

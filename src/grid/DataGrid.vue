@@ -17,6 +17,7 @@ import { LiveTable } from "./live";
 import {
   applyMove,
   applyPointer,
+  cellKey,
   emptySelection,
   isCellSelected,
   selectAllRows,
@@ -244,6 +245,54 @@ function pointerModifiers(event: PointerEvent): { shift: boolean; ctrl: boolean 
   return { shift: event.shiftKey, ctrl: event.ctrlKey || event.metaKey };
 }
 
+/** 当前选中格集合（矩形/allRows/extras 展开后的真实格）。 */
+function selectionKeySet(): Set<string> {
+  const rowCount = displayRows.value.length;
+  const colCount = columns.value.length;
+  const keys = new Set<string>();
+  for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+    for (let colIndex = 0; colIndex < colCount; colIndex += 1) {
+      if (isCellSelected(selection.value, { rowIndex, colIndex }, rowCount, colCount)) {
+        keys.add(cellKey({ rowIndex, colIndex }));
+      }
+    }
+  }
+  return keys;
+}
+
+/** 把选区塌缩为 extras 集合（去掉矩形/allRows），行列 Ctrl 减选依赖它。 */
+function applyExtrasSet(keys: Set<string>) {
+  const extras = [...keys]
+    .sort((a, b) => {
+      const [aRow, aCol] = a.split(":").map(Number);
+      const [bRow, bCol] = b.split(":").map(Number);
+      return aRow - bRow || aCol - bCol;
+    })
+    .join(",");
+  const focusKey = selection.value.focus ? cellKey(selection.value.focus) : null;
+  let focus: CellAddr | null = null;
+  if (focusKey && keys.has(focusKey)) {
+    focus = { ...selection.value.focus! };
+  } else if (extras) {
+    const [rowIndex, colIndex] = extras.split(",")[0]!.split(":").map(Number);
+    focus = { rowIndex, colIndex };
+  }
+  selection.value = { anchor: null, focus, extras, allRows: false };
+  if (session) {
+    if (focus) syncFocusFromSelection();
+    else {
+      session.selectedId = null;
+      session.selectedColumn = null;
+    }
+  }
+}
+
+function toggleKey(keys: Set<string>, cell: CellAddr): void {
+  const key = cellKey(cell);
+  if (keys.has(key)) keys.delete(key);
+  else keys.add(key);
+}
+
 function onCellPointer(event: PointerEvent, rowId: string, colName: string) {
   const addr = addrOf(rowId, colName);
   if (!addr) return;
@@ -261,47 +310,71 @@ function onCellClick(rowId: string, colName: string) {
   syncFocusFromSelection();
 }
 
-/** 行号：无修饰选中整行；Shift 从锚点连到行尾；Ctrl 逐格加减选整行。 */
+/** 行号：无修饰选中整行；Shift 从锚点连到行尾；Ctrl 把整行从当前选区加/减掉。 */
 function onRowNumberPointer(event: PointerEvent, rowId: string) {
   const rowIndex = displayRows.value.findIndex((row) => row.id === rowId);
   const lastCol = columns.value.length - 1;
   if (rowIndex < 0 || lastCol < 0) return;
   const mods = pointerModifiers(event);
   if (mods.ctrl) {
+    const keys = selectionKeySet();
     for (let colIndex = 0; colIndex <= lastCol; colIndex += 1) {
-      selection.value = applyPointer(selection.value, { rowIndex, colIndex }, { shift: false, ctrl: true });
+      toggleKey(keys, { rowIndex, colIndex });
     }
+    applyExtrasSet(keys);
   } else if (mods.shift) {
     selection.value = applyPointer(selection.value, { rowIndex, colIndex: lastCol }, { shift: true, ctrl: false });
+    syncFocusFromSelection();
   } else {
     selection.value = applyPointer(selection.value, { rowIndex, colIndex: 0 }, { shift: false, ctrl: false });
     selection.value = applyPointer(selection.value, { rowIndex, colIndex: lastCol }, { shift: true, ctrl: false });
+    syncFocusFromSelection();
   }
-  syncFocusFromSelection();
 }
 
-/** 表头：无修饰选中整列；Shift 从锚点连到列尾；Ctrl 逐格加减选整列。 */
+/** 表头：无修饰选中整列；Shift 从锚点连到列尾；Ctrl 把整列从当前选区加/减掉。 */
 function onHeaderPointer(event: PointerEvent, colName: string) {
   const colIndex = columns.value.findIndex((column) => column.name === colName);
   const lastRow = displayRows.value.length - 1;
   if (colIndex < 0 || lastRow < 0) return;
   const mods = pointerModifiers(event);
   if (mods.ctrl) {
+    const keys = selectionKeySet();
     for (let rowIndex = 0; rowIndex <= lastRow; rowIndex += 1) {
-      selection.value = applyPointer(selection.value, { rowIndex, colIndex }, { shift: false, ctrl: true });
+      toggleKey(keys, { rowIndex, colIndex });
     }
+    applyExtrasSet(keys);
   } else if (mods.shift) {
     selection.value = applyPointer(selection.value, { rowIndex: lastRow, colIndex }, { shift: true, ctrl: false });
+    syncFocusFromSelection();
   } else {
     selection.value = applyPointer(selection.value, { rowIndex: 0, colIndex }, { shift: false, ctrl: false });
     selection.value = applyPointer(selection.value, { rowIndex: lastRow, colIndex }, { shift: true, ctrl: false });
+    syncFocusFromSelection();
   }
-  syncFocusFromSelection();
 }
 
 async function copySelectionTsv() {
   if (!session || !displayRows.value.length || !columns.value.length) return;
   const settings = loadSettings();
+  const selected = selectionKeySet();
+  // 单格复制纯值（不带表头/TSV），多格才按 TSV 导出。
+  if (selected.size === 1) {
+    const [key] = selected;
+    const [rowIndex, colIndex] = key!.split(":").map(Number);
+    const row = displayRows.value[rowIndex];
+    const column = columns.value[colIndex];
+    if (!row || !column) return;
+    const text = copyPlain(session.cellValue(row.id, column.name), settings.nullCopy);
+    try {
+      await navigator.clipboard.writeText(text);
+      copyMessage.value = "已复制";
+    } catch {
+      copyMessage.value = "复制失败";
+    }
+    return;
+  }
+  if (!selected.size) return;
   const tsv = selectionToTsv(selection.value, {
     headers: settings.tsvHeaders,
     columnNames: columns.value.map((column) => column.name),
