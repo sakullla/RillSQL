@@ -1,5 +1,8 @@
 import { installSyntheticIpc } from "./synthetic-ipc.mjs";
 /** Synthetic, populated native-IPC fixtures for visual inspection; never platform acceptance evidence. */
+// 注意：shell 工具栏与查询面板共用 data-action 值（run/format/plan）与部分可访问名称（新建查询）。
+// 页面级定位器必须先用 [role="toolbar"][aria-label="主工具栏"] 或 .query-pane 限定作用域，
+// 否则 Playwright strict mode 会报重名。新增控件请沿用同样的限定手法。
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { chromium, expect } from "@playwright/test";
