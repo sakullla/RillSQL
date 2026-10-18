@@ -1,5 +1,5 @@
 {
-  "capturedAt": "2026-10-18T06:19:25.167Z",
+  "capturedAt": "2026-10-18T11:42:58.280Z",
   "synthetic": true,
   "invocation": "node scripts/capture-ui.mjs",
   "previewUrl": "http://localhost:1430",
@@ -20,6 +20,8 @@
     "connection-editor",
     "connection-ssh",
     "query",
+    "grid-selection",
+    "grid-context",
     "data-grid",
     "structure",
     "export",
@@ -30,7 +32,7 @@
   ],
   "missing": [],
   "success": true,
-  "imageCount": 72,
+  "imageCount": 84,
   "captures": [
     {
       "name": "welcome",
@@ -76,6 +78,24 @@
       "height": 1000,
       "file": "query-light-1360.png",
       "state": "选择执行目标后的查询结果"
+    },
+    {
+      "name": "grid-context",
+      "title": "网格单元格右键菜单",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "grid-context-light-1360.png",
+      "state": "单元格右键菜单展开"
+    },
+    {
+      "name": "grid-selection",
+      "title": "网格多选高亮",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "grid-selection-light-1360.png",
+      "state": "单元格 Shift 扩展多选高亮"
     },
     {
       "name": "data-grid",
@@ -186,6 +206,24 @@
       "state": "选择执行目标后的查询结果"
     },
     {
+      "name": "grid-context",
+      "title": "网格单元格右键菜单",
+      "theme": "dark",
+      "width": 1360,
+      "height": 1000,
+      "file": "grid-context-dark-1360.png",
+      "state": "单元格右键菜单展开"
+    },
+    {
+      "name": "grid-selection",
+      "title": "网格多选高亮",
+      "theme": "dark",
+      "width": 1360,
+      "height": 1000,
+      "file": "grid-selection-dark-1360.png",
+      "state": "单元格 Shift 扩展多选高亮"
+    },
+    {
       "name": "data-grid",
       "title": "数据表格",
       "theme": "dark",
@@ -292,6 +330,24 @@
       "height": 1000,
       "file": "query-light-900.png",
       "state": "选择执行目标后的查询结果"
+    },
+    {
+      "name": "grid-context",
+      "title": "网格单元格右键菜单",
+      "theme": "light",
+      "width": 900,
+      "height": 1000,
+      "file": "grid-context-light-900.png",
+      "state": "单元格右键菜单展开"
+    },
+    {
+      "name": "grid-selection",
+      "title": "网格多选高亮",
+      "theme": "light",
+      "width": 900,
+      "height": 1000,
+      "file": "grid-selection-light-900.png",
+      "state": "单元格 Shift 扩展多选高亮"
     },
     {
       "name": "data-grid",
@@ -402,6 +458,24 @@
       "state": "选择执行目标后的查询结果"
     },
     {
+      "name": "grid-context",
+      "title": "网格单元格右键菜单",
+      "theme": "dark",
+      "width": 900,
+      "height": 1000,
+      "file": "grid-context-dark-900.png",
+      "state": "单元格右键菜单展开"
+    },
+    {
+      "name": "grid-selection",
+      "title": "网格多选高亮",
+      "theme": "dark",
+      "width": 900,
+      "height": 1000,
+      "file": "grid-selection-dark-900.png",
+      "state": "单元格 Shift 扩展多选高亮"
+    },
+    {
       "name": "data-grid",
       "title": "数据表格",
       "theme": "dark",
@@ -510,6 +584,24 @@
       "state": "选择执行目标后的查询结果"
     },
     {
+      "name": "grid-context",
+      "title": "网格单元格右键菜单",
+      "theme": "light",
+      "width": 640,
+      "height": 1000,
+      "file": "grid-context-light-640.png",
+      "state": "单元格右键菜单展开"
+    },
+    {
+      "name": "grid-selection",
+      "title": "网格多选高亮",
+      "theme": "light",
+      "width": 640,
+      "height": 1000,
+      "file": "grid-selection-light-640.png",
+      "state": "单元格 Shift 扩展多选高亮"
+    },
+    {
       "name": "data-grid",
       "title": "数据表格",
       "theme": "light",
@@ -616,6 +708,24 @@
       "height": 1000,
       "file": "query-dark-640.png",
       "state": "选择执行目标后的查询结果"
+    },
+    {
+      "name": "grid-context",
+      "title": "网格单元格右键菜单",
+      "theme": "dark",
+      "width": 640,
+      "height": 1000,
+      "file": "grid-context-dark-640.png",
+      "state": "单元格右键菜单展开"
+    },
+    {
+      "name": "grid-selection",
+      "title": "网格多选高亮",
+      "theme": "dark",
+      "width": 640,
+      "height": 1000,
+      "file": "grid-selection-dark-640.png",
+      "state": "单元格 Shift 扩展多选高亮"
     },
     {
       "name": "data-grid",

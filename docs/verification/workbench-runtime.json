@@ -5,18 +5,42 @@
   "checks": [
     "Home opens a query with the chosen connection and database",
     "10,000 rows remain scrollable; filtering sees offscreen rows; full values and sort direction are visible",
+    "Result grid cell context menu opens with copy-value and closes on Escape",
+    "Shift+arrow extends a multi-cell selection on the result grid",
+    "Sidebar resizer double-click resets width to about 234px",
     "Editor/result split supports keyboard resizing",
     "Navigation preserves the editor instance and draft; undo and redo still work after returning",
     "1,000 editable rows stay bounded; keyboard crosses the viewport; density and page size update without losing the table",
     "95 history entries paginate and filter globally; cancelling clear does not erase data",
     "Connection engine and environment filters compose correctly",
+    "No page-level horizontal scrollbar at 1360/900/640 widths",
     "SQLite file picker opens exactly once on request and does not reopen when returning to connections",
     "No browser page errors"
   ],
   "metrics": {
-    "largeResultReadyMs": 2837,
+    "largeResultReadyMs": 3553,
     "renderedRows": 22,
-    "standardDataRowPx": 32
+    "standardDataRowPx": 32,
+    "pageScrollWidths": [
+      {
+        "width": 1360,
+        "height": 900,
+        "scrollWidth": 1360,
+        "clientWidth": 1360
+      },
+      {
+        "width": 900,
+        "height": 900,
+        "scrollWidth": 900,
+        "clientWidth": 900
+      },
+      {
+        "width": 640,
+        "height": 900,
+        "scrollWidth": 640,
+        "clientWidth": 640
+      }
+    ]
   },
   "passed": true,
   "errors": []

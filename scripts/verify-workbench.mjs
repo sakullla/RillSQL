@@ -57,6 +57,29 @@ try {
   await page.getByRole("button", { name: "仅对已读取行按 id 排序", exact: true }).click();
   await expect(page.locator('th[aria-sort="ascending"]')).toHaveCount(1);
   report.checks.push("10,000 rows remain scrollable; filtering sees offscreen rows; full values and sort direction are visible");
+  // S10.4 / R6：结果网格右键菜单、Shift 扩展多选、侧栏双击复位
+  const firstCell = page.locator("[data-row-id] .cell-btn").first();
+  await firstCell.click({ button: "right" });
+  const cellMenu = page.getByRole("menu");
+  await expect(cellMenu).toBeVisible();
+  await expect(cellMenu.locator('[data-id="copy-value"]')).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(cellMenu).toBeHidden();
+  report.checks.push("Result grid cell context menu opens with copy-value and closes on Escape");
+  await firstCell.click();
+  await page.keyboard.press("Shift+ArrowRight");
+  await expect(page.locator(".cell-btn.selected").first()).toBeVisible();
+  await page.keyboard.press("Escape");
+  report.checks.push("Shift+arrow extends a multi-cell selection on the result grid");
+  const sbResizer = page.locator(".sb-resizer");
+  await sbResizer.focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(sbResizer).toHaveAttribute("aria-valuenow", "254");
+  await sbResizer.dblclick();
+  const sidebarBox = await page.locator("aside.sidebar").boundingBox();
+  expect(sidebarBox).not.toBeNull();
+  expect(Math.abs(sidebarBox.width - 234)).toBeLessThanOrEqual(2);
+  report.checks.push("Sidebar resizer double-click resets width to about 234px");
   const splitter = page.getByRole("separator", { name: "调整编辑器与结果区域高度" });
   await splitter.focus();
   await page.keyboard.press("ArrowDown");
@@ -113,6 +136,20 @@ try {
   await page.getByRole("combobox", { name: "按环境筛选" }).selectOption("all");
   await page.getByRole("combobox", { name: "按数据库类型筛选" }).selectOption("all");
   report.checks.push("Connection engine and environment filters compose correctly");
+  // R6：三档宽度下页面级无横向滚动
+  const widthResults = [];
+  for (const size of [{ width: 1360, height: 900 }, { width: 900, height: 900 }, { width: 640, height: 900 }]) {
+    await page.setViewportSize(size);
+    const metrics = await page.evaluate(() => ({
+      scrollWidth: document.documentElement.scrollWidth,
+      clientWidth: document.documentElement.clientWidth,
+    }));
+    expect(metrics.scrollWidth).toBeLessThanOrEqual(metrics.clientWidth + 1);
+    widthResults.push({ ...size, ...metrics });
+  }
+  report.metrics.pageScrollWidths = widthResults;
+  report.checks.push("No page-level horizontal scrollbar at 1360/900/640 widths");
+  await page.setViewportSize({ width: 1360, height: 900 });
   const fresh = await browser.newPage({ viewport: { width: 640, height: 800 } });
   await fresh.addInitScript(installSyntheticIpc, "light");
   await fresh.goto(base);

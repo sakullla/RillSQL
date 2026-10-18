@@ -13,6 +13,8 @@ const scenarioTitles = {
   "connection-editor": "编辑连接",
   "connection-ssh": "SSH 隧道",
   query: "查询结果",
+  "grid-selection": "网格多选高亮",
+  "grid-context": "网格单元格右键菜单",
   "data-grid": "数据表格",
   structure: "表结构",
   export: "导出为 CSV",
@@ -172,6 +174,20 @@ try {
         await page.locator(".query-pane [data-action='run']").click();
         await expect(page.getByLabel("执行结果")).toContainText("林夏");
         await captureImage(page, "query", theme, width, "选择执行目标后的查询结果");
+
+        // S10.4：结果网格右键菜单与 Shift 扩展多选的视觉证据
+        await page.locator("[data-row-id] .cell-btn").first().click({ button: "right" });
+        await expect(page.getByRole("menu")).toBeVisible();
+        await expect(page.locator('[role="menu"] [data-id="copy-value"]')).toBeVisible();
+        await captureImage(page, "grid-context", theme, width, "单元格右键菜单展开");
+        await page.keyboard.press("Escape");
+        await expect(page.getByRole("menu")).toBeHidden();
+        await page.locator("[data-row-id] .cell-btn").first().click();
+        await page.keyboard.press("Shift+ArrowRight");
+        await page.keyboard.press("Shift+ArrowDown");
+        await expect(page.locator(".cell-btn.selected").first()).toBeVisible();
+        await captureImage(page, "grid-selection", theme, width, "单元格 Shift 扩展多选高亮");
+        await page.keyboard.press("Escape");
 
         await page.getByRole("button", { name: "打开命令面板" }).click();
         const palette = page.getByRole("dialog", { name: "命令面板" });

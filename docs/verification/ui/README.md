@@ -12,7 +12,7 @@ RILLSQL_PREVIEW_URL=http://localhost:1430 node scripts/capture-ui.mjs
 
 `--theme light|dark|all`、`--size 1360,900,640`、`--only 'connection-*'` 可缩小范围，`--list` 列出场景。RILLSQL_CAPTURE_OUT 可指定输出目录。预览地址默认 http://localhost:1420。
 
-本次生成 72 张图片，0 项检查失败。合成 IPC 数据仅用于界面检查，不构成真实数据库、SSH 或平台验收。
+本次生成 84 张图片，0 项检查失败。合成 IPC 数据仅用于界面检查，不构成真实数据库、SSH 或平台验收。
 
 | 场景 | 图片 |
 | --- | --- |
@@ -21,6 +21,8 @@ RILLSQL_PREVIEW_URL=http://localhost:1430 node scripts/capture-ui.mjs
 | 编辑连接 | [light 1360](connection-editor-light-1360.png) · [dark 1360](connection-editor-dark-1360.png) · [light 900](connection-editor-light-900.png) · [dark 900](connection-editor-dark-900.png) · [light 640](connection-editor-light-640.png) · [dark 640](connection-editor-dark-640.png) |
 | SSH 隧道 | [light 1360](connection-ssh-light-1360.png) · [dark 1360](connection-ssh-dark-1360.png) · [light 900](connection-ssh-light-900.png) · [dark 900](connection-ssh-dark-900.png) · [light 640](connection-ssh-light-640.png) · [dark 640](connection-ssh-dark-640.png) |
 | 查询结果 | [light 1360](query-light-1360.png) · [dark 1360](query-dark-1360.png) · [light 900](query-light-900.png) · [dark 900](query-dark-900.png) · [light 640](query-light-640.png) · [dark 640](query-dark-640.png) |
+| 网格单元格右键菜单 | [light 1360](grid-context-light-1360.png) · [dark 1360](grid-context-dark-1360.png) · [light 900](grid-context-light-900.png) · [dark 900](grid-context-dark-900.png) · [light 640](grid-context-light-640.png) · [dark 640](grid-context-dark-640.png) |
+| 网格多选高亮 | [light 1360](grid-selection-light-1360.png) · [dark 1360](grid-selection-dark-1360.png) · [light 900](grid-selection-light-900.png) · [dark 900](grid-selection-dark-900.png) · [light 640](grid-selection-light-640.png) · [dark 640](grid-selection-dark-640.png) |
 | 数据表格 | [light 1360](data-grid-light-1360.png) · [dark 1360](data-grid-dark-1360.png) · [light 900](data-grid-light-900.png) · [dark 900](data-grid-dark-900.png) · [light 640](data-grid-light-640.png) · [dark 640](data-grid-dark-640.png) |
 | 表结构 | [light 1360](structure-light-1360.png) · [dark 1360](structure-dark-1360.png) · [light 900](structure-light-900.png) · [dark 900](structure-dark-900.png) · [light 640](structure-light-640.png) · [dark 640](structure-dark-640.png) |
 | 导出为 CSV | [light 1360](export-light-1360.png) · [dark 1360](export-dark-1360.png) · [light 900](export-light-900.png) · [dark 900](export-dark-900.png) · [light 640](export-light-640.png) · [dark 640](export-dark-640.png) |
