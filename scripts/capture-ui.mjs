@@ -140,13 +140,13 @@ try {
 
         await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "连接" }).click();
         await page.getByRole("heading", { name: "连接管理" }).waitFor();
-        const postgres = page.locator("article.conn-card", { hasText: "书店 · 开发" });
-        const sqlite = page.locator("article.conn-card", { hasText: "笔记" });
+        const postgres = page.locator("article.conn-row", { hasText: "书店 · 开发" });
+        const sqlite = page.locator("article.conn-row", { hasText: "笔记" });
         if (await postgres.getByRole("button", { name: "连接", exact: true }).count()) await postgres.getByRole("button", { name: "连接", exact: true }).click();
         if (await sqlite.getByRole("button", { name: "连接", exact: true }).count()) await sqlite.getByRole("button", { name: "连接", exact: true }).click();
         await expect(postgres).toContainText("已连接");
         await expect(sqlite).toContainText("已连接");
-        await expect(page.locator("article.conn-card", { hasText: "库存 · 本地" })).toContainText("未连接");
+        await expect(page.locator("article.conn-row", { hasText: "库存 · 本地" })).toContainText("未连接");
         await captureImage(page, "connections", theme, width, "已连接、每次询问密码、SQLite 文件三种卡片");
 
         await postgres.getByRole("button", { name: "书店 · 开发 的更多操作" }).click();

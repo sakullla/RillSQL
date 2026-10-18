@@ -101,7 +101,7 @@ describe("connections page", () => {
 
     // 卡片：名称、引擎、地址、状态清楚可读，徽章克制
     expect(listPaletteConnections().map((item) => item.label)).toEqual(["Atlas"]);
-    const card = wrapper.get("article.conn-card");
+    const card = wrapper.get("article.conn-row");
     expect(card.text()).toContain("Atlas");
     expect(card.text()).toContain("MySQL");
     expect(card.find(".cc-addr").text()).toBe("db.example.test:3306");
@@ -234,7 +234,7 @@ describe("connections page", () => {
     const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api } });
     await flushPromises();
 
-    const card = wrapper.get("article.conn-card");
+    const card = wrapper.get("article.conn-row");
     card.element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 40, clientY: 60 }));
     await nextTick();
     const menu = document.body.querySelector('[role="menu"]');
@@ -316,6 +316,43 @@ describe("connections page", () => {
     await flushPromises();
     expect(wrapper.text()).not.toContain("灰度");
     expect(wrapper.get(".env-pick label.on").text()).toContain("无标签");
+    wrapper.unmount();
+  });
+
+  it("filters with Listbox, opens on double-click, and keeps row context menu", async () => {
+    const api = pageApi(() => ({ status: "ok", stages: [] }));
+    const openSpy = vi.fn(api.open);
+    api.open = openSpy;
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api } });
+    await flushPromises();
+
+    expect(wrapper.find("select").exists()).toBe(false);
+    const engineTrigger = wrapper.findAll("button[role='combobox']").find((node) => node.attributes("aria-label") === "按数据库类型筛选");
+    expect(engineTrigger).toBeTruthy();
+    await engineTrigger!.trigger("click");
+    const options = wrapper.findAll('[role="option"]');
+    expect(options.map((node) => node.text())).toContain("PostgreSQL");
+    const postgres = options.find((node) => node.text().includes("PostgreSQL"));
+    await postgres!.trigger("click");
+    await nextTick();
+    expect(wrapper.findAll("article.conn-row")).toHaveLength(0);
+    expect(wrapper.get("[data-empty-state]").text()).toContain("没有匹配的连接");
+
+    const engineTrigger2 = wrapper.findAll("button[role='combobox']").find((node) => node.attributes("aria-label") === "按数据库类型筛选");
+    await engineTrigger2!.trigger("click");
+    await wrapper.findAll('[role="option"]')[0]!.trigger("click");
+    await nextTick();
+    expect(wrapper.findAll("article.conn-row")).toHaveLength(1);
+    await wrapper.get("article.conn-row").trigger("dblclick");
+    await flushPromises();
+    expect(openSpy).toHaveBeenCalledTimes(1);
+    expect(openSpy.mock.calls[0]![0]).toBe("atlas");
+
+    wrapper.get("article.conn-row").element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 10, clientY: 10 }));
+    await nextTick();
+    const menu = document.body.querySelector('[role="menu"]');
+    expect(menu).toBeTruthy();
+    expect(menu!.querySelector('[data-id="delete"]')).toBeTruthy();
     wrapper.unmount();
   });
 });

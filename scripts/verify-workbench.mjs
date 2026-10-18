@@ -7,6 +7,12 @@ import { installSyntheticIpc } from "./synthetic-ipc.mjs";
 const base = process.env.RILLSQL_PREVIEW_URL ?? "http://localhost:1420";
 const browser = await chromium.launch();
 const report = { source: "Synthetic IPC; frontend behavior and rendering only", rows: 10000, columns: 12, checks: [], metrics: {} };
+
+/** P4 起筛选与设置用 Listbox（button[role=combobox]），没有原生 selectOption。 */
+async function pickListboxOption(page, label, optionName) {
+  await page.getByRole("combobox", { name: label }).click();
+  await page.getByRole("listbox", { name: label }).getByRole("option", { name: optionName, exact: true }).click();
+}
 const page = await browser.newPage({ viewport: { width: 1360, height: 900 } });
 const errors = [];
 page.on("pageerror", error => errors.push(error.message));
@@ -107,7 +113,7 @@ try {
   await expect(page.locator('[data-cell="61:id"]')).toBeVisible();
   await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "设置", exact: true }).click();
   await page.locator('input[name="set-density"][value="standard"]').check();
-  await page.getByRole("combobox", { name: "每次读取的行数" }).selectOption("500");
+  await pickListboxOption(page, "每次读取的行数", "500 行");
   await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "工作台", exact: true }).click();
   await page.locator(".grid-scroll").evaluate(el => { el.scrollTop = el.scrollHeight; });
   await expect(page.locator('[data-row-id="1000"]')).toBeVisible();
@@ -129,12 +135,12 @@ try {
   expect(await page.evaluate(() => window.__uiCalls.filter(call => call.command === "query_history_clear").length)).toBe(0);
   report.checks.push("95 history entries paginate and filter globally; cancelling clear does not erase data");
   await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "连接", exact: true }).click();
-  await page.getByRole("combobox", { name: "按数据库类型筛选" }).selectOption("postgres");
-  await expect(page.locator("article.conn-card")).toHaveCount(1);
-  await page.getByRole("combobox", { name: "按环境筛选" }).selectOption("local");
-  await expect(page.locator("article.conn-card")).toHaveCount(0);
-  await page.getByRole("combobox", { name: "按环境筛选" }).selectOption("all");
-  await page.getByRole("combobox", { name: "按数据库类型筛选" }).selectOption("all");
+  await pickListboxOption(page, "按数据库类型筛选", "PostgreSQL");
+  await expect(page.locator("article.conn-row")).toHaveCount(1);
+  await pickListboxOption(page, "按环境筛选", "本地");
+  await expect(page.locator("article.conn-row")).toHaveCount(0);
+  await pickListboxOption(page, "按环境筛选", "全部环境");
+  await pickListboxOption(page, "按数据库类型筛选", "全部数据库类型");
   report.checks.push("Connection engine and environment filters compose correctly");
   // R6：三档宽度下页面级无横向滚动
   const widthResults = [];

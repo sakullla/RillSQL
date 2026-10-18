@@ -5,7 +5,7 @@ import { tauriConnectionApi, type ConnectionApi, type EnvTagInput, type TestRepo
 import ConnIcon from "./ConnIcon.vue";
 import EnvTagField from "./EnvTagField.vue";
 import { pickSqliteFile, replacePaletteConnections } from "./index";
-import { ContextMenu, type MenuItem } from "../ui";
+import { ContextMenu, EmptyState, Listbox, type ListboxOption, type MenuItem } from "../ui";
 import {
   ENGINES,
   blankDraft,
@@ -65,10 +65,20 @@ const filtered = computed(() => {
   const q = query.value.trim().toLowerCase();
   return connections.value.filter((item) =>
     (engineFilter.value === "all" || item.engine === engineFilter.value) &&
-    (envFilter.value === "all" || item.env === envFilter.value) &&
+    (envFilter.value === "all" || (envFilter.value === "none" ? !item.env || item.env === "none" : item.env === envFilter.value)) &&
     [item.name, item.host, item.filePath, item.database, engineMeta(item.engine).label].some((value) => value && value.toLowerCase().includes(q)),
   );
 });
+
+const engineOptions = computed<ListboxOption[]>(() => [
+  { value: "all", label: "全部数据库类型" },
+  ...ENGINES.map((engine) => ({ value: engine.id, label: engine.label })),
+]);
+const envOptions = computed<ListboxOption[]>(() => [
+  { value: "all", label: "全部环境" },
+  ...tags.value.map((tag) => ({ value: tag.id, label: tag.label })),
+  { value: "none", label: "无标签" },
+]);
 
 function openWorkspace(connection: SavedConnection) {
   const catalog = catalogConnections().find(item => item.id === connection.id);
@@ -89,7 +99,7 @@ const rowMenuEl = ref<HTMLElement | null>(null);
 function onCardContextMenu(event: MouseEvent, item: SavedConnection) {
   const node = event.target;
   if (!(node instanceof Element)) return;
-  const card = node.closest<HTMLElement>(".conn-card");
+  const card = node.closest<HTMLElement>(".conn-row");
   if (!card) return;
   // 先聚焦触发行：菜单关闭时 ContextMenu 会把焦点还回来，键盘用户不掉焦点。
   card.setAttribute("tabindex", "-1");
@@ -482,22 +492,22 @@ watch(
   <div class="page conn-page" @click="menuId = null">
     <div class="page-inner">
       <div class="page-head">
-        <div><h1>连接管理</h1><p>一个入口，管理你的本地与远程数据库。</p></div>
+        <div><h1>连接管理</h1></div>
         <div class="ph-actions"><button class="btn" type="button" @click="openEditor(undefined, 'sqlite')"><ConnIcon name="file" />打开 SQLite</button><button class="btn primary" type="button" data-action="conn-new" @click.stop="openEditor()"><ConnIcon name="plus" />新建连接</button></div>
       </div>
       <div class="connection-overview"><span><b>{{ connections.length }}</b> 个连接</span><span class="online-total"><i></i><b>{{ connectedCount }}</b> 个已连接</span><span class="grow"></span><span><ConnIcon name="lock" />凭据保存在本机</span></div>
       <div class="connection-filters">
         <label class="mini-search"><ConnIcon name="search" /><input v-model="query" type="search" placeholder="搜索名称、地址或文件…" aria-label="搜索连接" /></label>
-        <select v-model="engineFilter" aria-label="按数据库类型筛选"><option value="all">全部数据库类型</option><option v-for="engine in ENGINES" :key="engine.id" :value="engine.id">{{ engine.label }}</option></select>
-        <select v-model="envFilter" aria-label="按环境筛选"><option value="all">全部环境</option><option v-for="tag in tags" :key="tag.id" :value="tag.id">{{ tag.label }}</option><option value="none">无标签</option></select>
+        <Listbox v-model="engineFilter" :options="engineOptions" aria-label="按数据库类型筛选" />
+        <Listbox v-model="envFilter" :options="envOptions" aria-label="按环境筛选" />
         <span class="grow"></span><span class="muted sm">{{ filtered.length }} 个连接</span>
       </div>
       <p v-if="loadError" class="page-note" role="alert">{{ loadError }}</p><p v-else-if="note" class="page-note" role="status">{{ note }}</p>
-      <div class="conn-grid">
+      <div class="conn-list">
         <div class="connection-columns" aria-hidden="true"><span>连接 / 数据库</span><span>地址</span><span>传输与认证</span><span>状态 / 操作</span></div>
-        <article v-for="item in filtered" :key="item.id" class="conn-card" :class="`st-${connectionState(item.id)}`" @contextmenu.prevent="onCardContextMenu($event, item)">
+        <article v-for="item in filtered" :key="item.id" class="conn-row" :class="`st-${connectionState(item.id)}`" @dblclick="connectionState(item.id) === 'connected' ? openWorkspace(item) : requestConnect(item)" @contextmenu.prevent="onCardContextMenu($event, item)">
           <header>
-            <span class="eng lg" :class="`eng-${item.engine}`">{{ engineMeta(item.engine).short }}</span>
+            <span class="eng" :class="`eng-${item.engine}`">{{ engineMeta(item.engine).short }}</span>
             <div class="cc-title"><h3>{{ item.name }}</h3><p>{{ engineMeta(item.engine).label }} <span class="env" :class="`env-${envView(item.env).tone}`">{{ envView(item.env).label }}</span></p></div>
           </header>
           <div class="cc-endpoint"><p v-if="item.engine === 'sqlite'" class="cc-addr mono" :title="item.filePath ?? ''">{{ item.filePath }}</p><p v-else class="cc-addr mono" :title="`${item.host}:${item.port}`">{{ item.host }}:{{ item.port }}</p><small>{{ item.engine === 'sqlite' ? '本地文件' : item.database || '未指定默认数据库' }}</small></div>
@@ -508,8 +518,15 @@ watch(
           <footer><span class="conn-state" :class="`st-${connectionState(item.id)}`"><i></i>{{ stateLabels[connectionState(item.id)] }}</span><span class="grow"></span><button v-if="connectionState(item.id) === 'connected'" class="btn sm" type="button" @click.stop="openWorkspace(item)">打开</button><button v-else class="btn sm" type="button" data-action="conn-connect" :disabled="connectionState(item.id) === 'connecting'" @click.stop="requestConnect(item)"><ConnIcon name="plug" />连接</button><button class="icon-btn" type="button" :aria-label="`${item.name} 的更多操作`" data-action="conn-menu" @click.stop="menuId = menuId === item.id ? null : item.id"><ConnIcon name="more" /></button></footer>
           <div v-if="menuId === item.id" class="conn-menu" @click.stop><button type="button" @click="showDetails(item)"><ConnIcon name="info" />连接详情</button><button type="button" data-action="conn-edit" @click="openEditor(item)"><ConnIcon name="pencil" />编辑配置…</button><button v-if="connectionState(item.id) === 'connected'" type="button" @click="disconnect(item)"><ConnIcon name="unplug" />断开连接</button><button type="button" class="danger" data-action="conn-delete" @click="askDelete(item)"><ConnIcon name="trash" />删除配置…</button></div>
         </article>
-        <div v-if="!filtered.length" class="empty"><ConnIcon name="database" /><h3>{{ connections.length ? '没有匹配的连接' : '连接你的第一个数据库' }}</h3><p>{{ connections.length ? '试试其他名称、数据库类型或环境。' : '支持 PostgreSQL、MySQL、MariaDB 和 SQLite。' }}</p></div>
-        <button class="conn-card add" type="button" data-action="conn-new" @click="openEditor()"><ConnIcon name="plus" /><span>新建连接</span><small>PostgreSQL · MySQL · MariaDB · SQLite</small></button>
+        <EmptyState
+          v-if="!filtered.length"
+          :title="connections.length ? '没有匹配的连接' : '连接你的第一个数据库'"
+          :detail="connections.length ? '换个关键词、数据库类型或环境再试。' : '支持 PostgreSQL、MySQL、MariaDB 和 SQLite。'"
+          action-label="新建连接"
+          action-id="conn-new-empty"
+          @action="openEditor()"
+        />
+        <button class="conn-add" type="button" data-action="conn-new" @click="openEditor()"><ConnIcon name="plus" /><span>新建连接</span><small>PostgreSQL · MySQL · MariaDB · SQLite</small></button>
       </div>
       <div class="connection-note"><ConnIcon name="shield" /><span>连接配置只保存在本机。密码保存在操作系统凭据库；删除连接不会删除数据库或 SQLite 文件。</span></div>
     </div>
@@ -569,7 +586,7 @@ watch(
                   </label>
                 </div>
                 <div v-if="draft.tlsMode !== 'off'" class="form-grid">
-                  <label class="field"><span>受信任的 CA</span><select v-model="draft.caMode"><option value="system">系统信任根</option><option value="file">指定 CA 文件</option></select></label>
+                  <label class="field"><span>受信任的 CA</span><Listbox v-model="draft.caMode" :options="[{ value: 'system', label: '系统信任根' }, { value: 'file', label: '指定 CA 文件' }]" aria-label="受信任的 CA" /></label>
                   <label v-if="draft.caMode === 'file'" class="field"><span>CA 证书文件</span><input v-model="draft.caFile" class="mono" data-field="caFile" /><small v-if="fieldErrors.caFile" class="field-err">{{ fieldErrors.caFile }}</small></label>
                   <label class="field"><span>客户端证书（可选）</span><input v-model="draft.clientCert" class="mono" /></label>
                   <label class="field"><span>客户端私钥（可选）</span><input v-model="draft.clientKey" class="mono" /></label>
