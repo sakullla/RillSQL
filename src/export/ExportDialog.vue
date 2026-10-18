@@ -206,15 +206,18 @@ async function start() {
         <details v-if="format === 'csv'" class="disclosure">
           <summary>高级选项 <span class="muted">分隔符、NULL 写法、编码、列名行</span></summary>
           <div class="disclosure-body ex-advanced">
-            <label>分隔符
-              <Listbox :model-value="delimiter" :options="delimiterOptions" aria-label="分隔符" :disabled="choosing" @update:model-value="onDelimiter" />
-            </label>
-            <label>NULL 写为
-              <Listbox :model-value="nullToken" :options="nullOptions" aria-label="NULL 写法" :disabled="choosing" @update:model-value="onNullToken" />
-            </label>
-            <label>编码
-              <Listbox :model-value="bom ? 'bom' : 'utf8'" :options="encodingOptions" aria-label="编码" :disabled="choosing" @update:model-value="onEncoding" />
-            </label>
+            <div class="ex-field">
+              <label for="export-delimiter">分隔符</label>
+              <Listbox id="export-delimiter" :model-value="delimiter" :options="delimiterOptions" aria-label="分隔符" :disabled="choosing" @update:model-value="onDelimiter" />
+            </div>
+            <div class="ex-field">
+              <label for="export-null">NULL 写为</label>
+              <Listbox id="export-null" :model-value="nullToken" :options="nullOptions" aria-label="NULL 写法" :disabled="choosing" @update:model-value="onNullToken" />
+            </div>
+            <div class="ex-field">
+              <label for="export-encoding">编码</label>
+              <Listbox id="export-encoding" :model-value="bom ? 'bom' : 'utf8'" :options="encodingOptions" aria-label="编码" :disabled="choosing" @update:model-value="onEncoding" />
+            </div>
             <label class="ex-header-row"><input v-model="header" type="checkbox" /> 第一行写入列名</label>
           </div>
         </details>
@@ -239,8 +242,6 @@ async function start() {
 .ex-titles h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; }
 .ex-titles p { margin: var(--sp-1) 0 0; font-size: var(--fs-sm); color: var(--text-2); }
 .ex-body { padding: var(--sp-4) var(--sp-5); overflow: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
-.ex-body:has(.listbox.open) { overflow: visible; }
-.ex-body :deep(.listbox.open) { z-index: 2; }
 .ex-advanced :deep(.listbox) { width: 100%; }
 .ex-advanced :deep(.listbox-trigger) { width: 100%; justify-content: space-between; }
 .ex-options { margin: 0; padding: 0; border: 0; min-width: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
@@ -261,6 +262,6 @@ async function start() {
 .ex-path input { width: 100%; }
 .ex-preview { margin: var(--sp-1) 0 0; max-height: 140px; overflow: auto; background: var(--sunken); padding: var(--sp-2) var(--sp-3); border-radius: var(--r); font-family: var(--mono); font-size: var(--fs-xs); line-height: var(--lh); white-space: pre-wrap; word-break: break-all; }
 .ex-advanced { display: flex; gap: var(--sp-3); flex-wrap: wrap; align-items: flex-end; }
-.ex-advanced label { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-xs); color: var(--text-2); }
+.ex-field { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-xs); color: var(--text-2); }
 .ex-advanced label.ex-header-row { flex-direction: row; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); color: var(--text); }
 </style>

@@ -25,6 +25,7 @@ const list = ref<HTMLUListElement | null>(null);
 const filter = ref<HTMLInputElement | null>(null);
 const pop = ref<HTMLElement | null>(null);
 const dropUp = ref(false);
+const popStyle = ref<Record<string, string>>({});
 
 const selected = computed(() => props.options.find((option) => option.value === props.modelValue) ?? null);
 
@@ -56,12 +57,32 @@ function onOutside(event: PointerEvent) {
 
 function place() {
   const anchor = trigger.value;
+  if (!anchor) return;
+  // 按触发器的视口坐标固定弹层，避免被 overflow:auto 裁剪，也不改动滚动位置。
   const panel = pop.value;
-  if (!anchor || !panel) return;
   const rect = anchor.getBoundingClientRect();
   // jsdom 下 offsetHeight 为 0，退回估算高度，保证单测也能触发翻转。
-  const height = panel.offsetHeight || visible.value.length * 24 + 12;
+  const height = panel?.offsetHeight || visible.value.length * 24 + 12;
   dropUp.value = rect.bottom + 4 + height > window.innerHeight && rect.top > height + 4;
+  const top = dropUp.value ? rect.top - 4 - height : rect.bottom + 4;
+  const width = panel?.offsetWidth || rect.width;
+  let left = rect.left;
+  if (width > 0 && left + width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - 8 - width);
+  const next: Record<string, string> = {
+    position: "fixed",
+    top: `${top}px`,
+    left: `${left}px`,
+  };
+  if (rect.width > 0) next.minWidth = `${rect.width}px`;
+  const prev = popStyle.value;
+  if (prev.position === next.position && prev.top === next.top && prev.left === next.left && prev.minWidth === next.minWidth) return;
+  popStyle.value = next;
+}
+
+function onScroll(event: Event) {
+  const target = event.target;
+  if (target instanceof Node && pop.value?.contains(target)) return;
+  place();
 }
 
 function openList() {
@@ -70,8 +91,10 @@ function openList() {
   query.value = "";
   const picked = props.options.findIndex((option) => option.value === props.modelValue);
   active.value = picked >= 0 ? picked : 0;
+  place();
   document.addEventListener("pointerdown", onOutside, true);
   window.addEventListener("resize", place);
+  document.addEventListener("scroll", onScroll, true);
   void nextTick(() => {
     place();
     (props.filterable ? filter.value : list.value)?.focus();
@@ -81,8 +104,10 @@ function openList() {
 function close() {
   if (!open.value) return;
   open.value = false;
+  popStyle.value = {};
   document.removeEventListener("pointerdown", onOutside, true);
   window.removeEventListener("resize", place);
+  document.removeEventListener("scroll", onScroll, true);
 }
 
 function toggle() {
@@ -176,6 +201,7 @@ watch(() => props.disabled, (isDisabled) => {
 onBeforeUnmount(() => {
   document.removeEventListener("pointerdown", onOutside, true);
   window.removeEventListener("resize", place);
+  document.removeEventListener("scroll", onScroll, true);
 });
 </script>
 
@@ -198,7 +224,7 @@ onBeforeUnmount(() => {
       <span class="listbox-value" :class="{ placeholder: !selected }">{{ selected ? selected.label : placeholder }}</span>
       <svg class="i listbox-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" /></svg>
     </button>
-    <div v-if="open" ref="pop" class="listbox-pop" :class="{ up: dropUp }">
+    <div v-if="open" ref="pop" class="listbox-pop" :class="{ up: dropUp }" :style="popStyle">
       <input
         v-if="filterable"
         ref="filter"
@@ -274,19 +300,15 @@ onBeforeUnmount(() => {
 .listbox-caret { width: 14px; height: 14px; color: var(--text-3); transition: transform var(--dur-fast) var(--ease); }
 .listbox.open .listbox-caret { transform: rotate(180deg); }
 .listbox-pop {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 0;
+  position: fixed;
   z-index: var(--z-menu);
-  min-width: 100%;
-  max-width: 320px;
+  max-width: min(320px, calc(100vw - 16px));
   padding: var(--sp-1);
   border: 1px solid var(--line-2);
   border-radius: var(--r-md);
   background: var(--panel);
   box-shadow: var(--shadow);
 }
-.listbox-pop.up { top: auto; bottom: calc(100% + 4px); }
 .listbox-filter {
   width: 100%;
   height: var(--control-h-sm);

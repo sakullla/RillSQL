@@ -182,9 +182,10 @@ async function confirm() {
         <p class="ex-note" data-import-target>目标：{{ connectionName }} / {{ objectName }} <span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span></p>
         <p v-if="parseError" class="ex-alert" role="alert">{{ parseError }}</p>
         <p v-if="resultText" class="ex-note" role="status" data-import-result>{{ resultText }}</p>
-        <label class="ex-path">导入到
-          <Listbox :model-value="tableKey" :options="tableOptions" aria-label="导入的表" :disabled="writing" @update:model-value="onTable" />
-        </label>
+        <div class="ex-path">
+          <label for="import-table">导入到</label>
+          <Listbox id="import-table" :model-value="tableKey" :options="tableOptions" aria-label="导入的表" :disabled="writing" @update:model-value="onTable" />
+        </div>
         <fieldset class="ex-scope">
           <legend>文件格式</legend>
           <label class="ex-choice" :class="{ on: format === 'csv' }"><input v-model="format" type="radio" name="im-format" value="csv" :disabled="writing" /><span><b>CSV</b><small>第一行是列名。没有引号的空字段是空值。</small></span></label>
@@ -237,8 +238,6 @@ async function confirm() {
 .ex-titles h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; }
 .ex-titles p { margin: var(--sp-1) 0 0; font-size: var(--fs-sm); color: var(--text-2); }
 .ex-body { padding: var(--sp-4) var(--sp-5); overflow: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
-.ex-body:has(.listbox.open) { overflow: visible; }
-.ex-body :deep(.listbox.open) { z-index: 2; }
 .ex-path :deep(.listbox),
 .map-table :deep(.listbox) { width: 100%; }
 .ex-path :deep(.listbox-trigger),

@@ -1,8 +1,9 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { nextTick } from "vue";
 import { customersFixture } from "../grid/fixture";
 import { queryPage } from "../grid/data";
 import { selectExportGate } from "../grid/sql";
@@ -300,14 +301,29 @@ describe("json and insert export", () => {
 });
 
 async function pick(wrapper: ReturnType<typeof mount>, label: string, option: string) {
-  await wrapper.get(`[role="combobox"][aria-label="${label}"]`).trigger("click");
+  const trigger = wrapper.get(`[role="combobox"][aria-label="${label}"]`);
+  expect(trigger.element.closest("label")).toBeNull();
+  trigger.element.click();
+  await nextTick();
   expect(wrapper.find("select").exists()).toBe(false);
+  const pop = wrapper.get(".listbox-pop");
+  expect(pop.attributes("style") ?? "").toContain("position: fixed");
   const match = wrapper.findAll('[role="option"]').find((node) => node.text() === option);
   expect(match, option).toBeTruthy();
-  await match!.trigger("click");
+  expect(match!.element.closest("label")).toBeNull();
+  match!.element.click();
+  await nextTick();
+  expect(wrapper.find('[role="listbox"]').exists()).toBe(false);
 }
 
 describe("import and export choices", () => {
+  it("does not cancel dialog scrolling to reveal an open listbox", () => {
+    const exportDialog = readFileSync(resolve("src/export/ExportDialog.vue"), "utf8");
+    const importDialog = readFileSync(resolve("src/export/ImportDialog.vue"), "utf8");
+    expect(exportDialog).not.toContain(".ex-body:has(.listbox.open)");
+    expect(importDialog).not.toContain(".ex-body:has(.listbox.open)");
+  });
+
   const target: TableTarget = { connectionId: "shop", database: "app", schema: "public", table: "customers", engine: "postgres" };
   const schema: TableSchema = {
     engine: "postgres",
