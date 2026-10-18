@@ -34,6 +34,13 @@ describe("desktop control base styles", () => {
     const disabled = block(".btn:disabled {");
     expect(disabled).toContain("box-shadow: none");
     expect(disabled).toContain("color: var(--disabled-fg)");
+    // .btn.primary 与 .btn:disabled 优先级相同且写在后面，禁用实心按钮必须单独改回禁用色
+    const primaryDisabled = block(".btn.primary:disabled {");
+    expect(css.indexOf(".btn.primary:disabled")).toBeGreaterThan(css.indexOf(".btn.primary {"));
+    expect(primaryDisabled).toContain("background: var(--disabled-bg)");
+    expect(primaryDisabled).toContain("color: var(--disabled-fg)");
+    expect(primaryDisabled).toContain("border-color: var(--line)");
+    expect(primaryDisabled).not.toContain("var(--accent)");
   });
 
   it("sizes icon buttons from the control scale", () => {
