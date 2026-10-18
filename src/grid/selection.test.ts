@@ -42,6 +42,16 @@ describe("grid selection model", () => {
     expect(isCellSelected(selection, { rowIndex: 5, colIndex: 2 }, 10, 4)).toBe(false);
   });
 
+  it("ctrl-clicking the same cell twice on an empty selection deselects it", () => {
+    let selection = applyPointer(emptySelection, { rowIndex: 4, colIndex: 3 }, { shift: false, ctrl: true });
+    expect(selection.anchor).toBeNull();
+    expect(selection.focus).toBeNull();
+    expect(isCellSelected(selection, { rowIndex: 4, colIndex: 3 }, 10, 4)).toBe(true);
+    selection = applyPointer(selection, { rowIndex: 4, colIndex: 3 }, { shift: false, ctrl: true });
+    expect(selection).toEqual({ anchor: null, focus: null, extras: "", allRows: false });
+    expect(isCellSelected(selection, { rowIndex: 4, colIndex: 3 }, 10, 4)).toBe(false);
+  });
+
   it("selectAllRows marks every loaded cell and serializes full TSV with headers", () => {
     const selection = selectAllRows(3, 2);
     expect(selection.allRows).toBe(true);
@@ -106,6 +116,16 @@ describe("grid selection model", () => {
     expect(isCellSelected(all, { rowIndex: 2, colIndex: 1 }, 3, 2)).toBe(true);
     expect(isCellSelected(all, { rowIndex: 3, colIndex: 0 }, 3, 2)).toBe(false);
     expect(isCellSelected(all, { rowIndex: 0, colIndex: 2 }, 3, 2)).toBe(false);
+  });
+
+  it("selectAllRows on an empty result produces no phantom rows in TSV", () => {
+    const all = selectAllRows(0, 2);
+    expect(all).toEqual({ anchor: null, focus: null, extras: "", allRows: true });
+    expect(selectionToTsv(all, {
+      headers: true,
+      columnNames: ["a", "b"],
+      cellAt: () => "x",
+    })).toBe("");
   });
 
   it("sanitizes header names too", () => {

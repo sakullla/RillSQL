@@ -82,6 +82,7 @@ export function applyPointer(selection: GridSelection, cell: CellAddr, modifiers
     return {
       anchor: selection.anchor ?? { ...cell },
       focus: { ...cell },
+      // shift/方向键重置散格加选，与 Excel 一致（有意行为）
       extras: "",
       allRows: false,
     };
@@ -94,9 +95,10 @@ export function applyPointer(selection: GridSelection, cell: CellAddr, modifiers
     } else {
       keys.add(key);
     }
+    // 空选中上不回填 anchor/focus，否则矩形 A→A 会让减选永远失效
     return {
-      anchor: selection.anchor ?? { ...cell },
-      focus: selection.focus ?? { ...cell },
+      anchor: selection.anchor,
+      focus: selection.focus,
       extras: extrasFromSet(keys),
       allRows: false,
     };
@@ -113,15 +115,19 @@ export function applyMove(selection: GridSelection, key: MoveKey, extend: boolea
     colIndex: Math.min(Math.max(current.colIndex + (key === "ArrowRight" ? 1 : key === "ArrowLeft" ? -1 : 0), 0), maxCol),
   };
   if (extend) {
+    // shift/方向键重置散格加选，与 Excel 一致（有意行为）
     return { anchor: selection.anchor ?? { ...current }, focus: next, extras: "", allRows: false };
   }
   return { anchor: next, focus: next, extras: "", allRows: false };
 }
 
 export function selectAllRows(rowCount: number, colCount: number): GridSelection {
+  if (rowCount <= 0) {
+    return { anchor: null, focus: null, extras: "", allRows: true };
+  }
   return {
     anchor: { rowIndex: 0, colIndex: 0 },
-    focus: { rowIndex: Math.max(rowCount - 1, 0), colIndex: Math.max(colCount - 1, 0) },
+    focus: { rowIndex: rowCount - 1, colIndex: Math.max(colCount - 1, 0) },
     extras: "",
     allRows: true,
   };
@@ -149,7 +155,10 @@ export function selectionToTsv(selection: GridSelection, options: TsvOptions): s
   const sanitize = options.sanitize ?? defaultSanitize;
 
   if (selection.allRows) {
-    const focus = selection.focus ?? { rowIndex: 0, colIndex: 0 };
+    if (!selection.focus) {
+      return "";
+    }
+    const focus = selection.focus;
     return renderRegion(0, focus.rowIndex, 0, focus.colIndex, () => true, options, nullText, sanitize);
   }
 
