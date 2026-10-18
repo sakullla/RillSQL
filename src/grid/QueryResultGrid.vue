@@ -174,6 +174,14 @@ watch([find, sort, () => props.rows, () => props.columns], () => {
   selection.value = { ...emptySelection };
   selected.value = null;
 });
+// 暂存编辑在 find/sort 下会改变可见行成员或顺序，而上面的 watch 只盯 props——按过滤结果签名补清。
+watch(
+  () => view.value.rows.map((row) => row.id).join("\u0000"),
+  () => {
+    selection.value = { ...emptySelection };
+    selected.value = null;
+  },
+);
 
 const commitFailures = computed(() => (editSession.value ? Array.from(editSession.value.failures, ([id, message]) => ({ id, message })) : []));
 const pendingVisible = computed(() => !!editSession.value && (editSession.value.pendingCount > 0 || editSession.value.failures.size > 0));

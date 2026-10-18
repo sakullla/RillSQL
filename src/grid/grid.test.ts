@@ -2131,6 +2131,28 @@ describe("QueryResultGrid desktop selection", () => {
     wrapper.unmount();
   });
 
+  it("drops the drifted selection when a staged edit changes the find match set", async () => {
+    const wrapper = await mountEditableQueryGrid("query-find-stage-drift");
+    await wrapper.get("input[aria-label='在已读取行中查找']").setValue("客户");
+    await nextTick();
+    pointer(wrapper.get('[data-cell="r1:name"]').element);
+    await nextTick();
+    expect(focusDataCell(wrapper)).toBe("r1:name");
+    expect(wrapper.find(".inspector").exists()).toBe(true);
+    gridKey(wrapper, "Enter");
+    await nextTick();
+    const input = wrapper.get("input[aria-label='编辑 name']");
+    await input.setValue("离开匹配");
+    await input.trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(wrapper.find("input[aria-label='编辑 name']").exists()).toBe(false);
+    // 暂存后 r1 不再匹配「客户」，可见行从 r0/r1/r2 变为 r0/r2：旧索引选区指向了 r2。
+    expect(selectedCells(wrapper)).toHaveLength(0);
+    expect(focusDataCell(wrapper)).toBeNull();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
   it("clears the selection and closes the inspector when the rows are replaced", async () => {
     const wrapper = await mountQueryGrid();
     pointer(wrapper.get('tr[data-row-id="r0"] td.row-number').element);
