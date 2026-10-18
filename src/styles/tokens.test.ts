@@ -73,6 +73,12 @@ const THEME_TOKENS = [
   "--eng-mysql",
   "--eng-mariadb",
   "--eng-sqlite",
+  "--nav-bg",
+  "--nav-fg",
+  "--nav-active",
+  "--nav-hover",
+  "--nav-active-bg",
+  "--overlay",
 ];
 
 describe("design tokens", () => {
@@ -88,9 +94,19 @@ describe("design tokens", () => {
   it("uses different values for key tokens across themes", () => {
     const light = block(":root[data-theme=\"light\"]");
     const dark = block(":root[data-theme=\"dark\"]");
-    for (const name of ["--bg", "--chrome", "--panel", "--text", "--text-2", "--accent", "--accent-soft", "--on-accent", "--ok", "--warn", "--err", "--info", "--ring"]) {
+    for (const name of ["--bg", "--chrome", "--panel", "--text", "--text-2", "--accent", "--accent-soft", "--on-accent", "--ok", "--warn", "--err", "--info", "--ring", "--nav-bg", "--nav-fg", "--nav-active", "--nav-hover", "--nav-active-bg", "--overlay"]) {
       expect(tokenValue(light, name), name).not.toBe(tokenValue(dark, name));
     }
+  });
+
+  it("keeps activity rail colors out of the theme-invariant root", () => {
+    const root = block(":root {");
+    expect(root).not.toContain("--nav-bg");
+    expect(root).not.toContain("--nav-fg");
+    expect(root).not.toContain("--nav-active");
+    expect(root).not.toContain("--nav-hover");
+    expect(root).not.toContain("--overlay");
+    expect(tokenValue(root, "--fs-xxl")).toBe("15px");
   });
 
   it("declares light as the default color scheme", () => {

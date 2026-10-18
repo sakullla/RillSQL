@@ -235,7 +235,7 @@ details.disclosure > summary .muted { font-weight: 400; }
 .empty-actions { margin-top: var(--sp-2); display: flex; gap: var(--sp-2); }
 
 /* ---------- 页面骨架 ---------- */
-.page { flex: 1; min-width: 0; min-height: 0; max-width: 100%; overflow: auto; }
+.page { flex: 1; min-width: 0; min-height: 0; max-width: 100%; overflow-x: hidden; overflow-y: auto; }
 .page-inner { max-width: min(1180px, 100%); margin: 0 auto; padding: var(--sp-6) var(--sp-7) var(--sp-8); min-width: 0; }
 .page-inner.narrow { max-width: 920px; }
 .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: var(--sp-4); margin-bottom: var(--sp-6); flex-wrap: wrap; }
@@ -300,7 +300,7 @@ dialog.modal {
 }
 dialog.modal[open] { display: flex; flex-direction: column; }
 .modal-lg { width: 780px; }
-dialog::backdrop { background: rgba(12, 16, 24, 0.45); }
+dialog::backdrop { background: var(--overlay); }
 .modal-head { display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line); }
 .modal-titles { flex: 1; min-width: 0; }
 .modal-head h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; }

@@ -207,7 +207,7 @@
 .overlay {
   position: absolute;
   inset: 0;
-  background: rgba(12, 16, 24, 0.45);
+  background: var(--overlay);
   display: grid;
   place-items: center;
   z-index: 5;

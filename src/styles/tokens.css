@@ -53,9 +53,6 @@
   --status-h: 24px;
   --rail-w: 44px;
   --editor-font: 12px;
-  --nav-bg: #122026;
-  --nav-fg: #7f96a1;
-  --nav-active: #5eead4;
 
   /* 密度：默认紧凑 */
   --row-h: 26px;
@@ -153,6 +150,14 @@
   --eng-mysql: #00758f;
   --eng-mariadb: #a85f35;
   --eng-sqlite: #0f80cc;
+
+  /* 活动栏与页面遮罩：两套主题各自改写，组件里不再写死。 */
+  --nav-bg: #e4e9ee;
+  --nav-fg: #5a6672;
+  --nav-active: #0b5f59;
+  --nav-hover: rgba(15, 118, 110, 0.10);
+  --nav-active-bg: rgba(15, 118, 110, 0.16);
+  --overlay: rgba(16, 24, 40, 0.32);
 }
 
 /* ---------- 深色主题（独立配色，不是机械反色） ---------- */
@@ -236,6 +241,14 @@
   --eng-mysql: #5fbfd3;
   --eng-mariadb: #e2a07f;
   --eng-sqlite: #77b9ea;
+
+  /* 活动栏与页面遮罩 */
+  --nav-bg: #122026;
+  --nav-fg: #7f96a1;
+  --nav-active: #5eead4;
+  --nav-hover: #ffffff0d;
+  --nav-active-bg: #ffffff14;
+  --overlay: rgba(0, 0, 0, 0.56);
 }
 
 /* 动效降级：用户要求减少动效时，所有时长令牌归零 */

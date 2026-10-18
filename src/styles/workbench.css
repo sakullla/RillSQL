@@ -5,9 +5,9 @@
 .app-root .cmd-trigger { background: var(--panel-2); border-radius: var(--r); max-width: 440px; }
 .app-root .rail { background: var(--nav-bg); border: 0; padding-top: 16px; gap: 8px; }
 .app-root .rail-btn { color: var(--nav-fg); padding: 12px 0; border-radius: 6px; gap: 7px; font-size: 10px; }
-.app-root .rail-btn:hover { color: var(--nav-active); background: #ffffff0d; }
-.app-root .rail-btn.active { background: #ffffff14; color: var(--nav-active); }
-.app-root .rail-btn.active::before { background: #61d3bc; left: -5px; top: 16px; bottom: 16px; }
+.app-root .rail-btn:hover { color: var(--nav-active); background: var(--nav-hover); }
+.app-root .rail-btn.active { background: var(--nav-active-bg); color: var(--nav-active); }
+.app-root .rail-btn.active::before { background: var(--accent); left: -5px; top: 16px; bottom: 16px; }
 .app-root .sidebar { background: var(--panel-2); }
 .app-root .sb-head { height: 48px; }
 .app-root .sb-title { font-size: 12px; letter-spacing: .04em; }
@@ -17,12 +17,12 @@
 .app-root .tab.active::before { top: auto; bottom: 0; }
 .app-root .tab.active > .i { color: var(--accent); }
 .app-root .statusbar { background: var(--panel-2); }
-.welcome { flex: 1; min-width: 0; min-height: 0; max-width: 100%; overflow: auto; background: var(--bg); padding: clamp(24px, 3.5vw, 52px); }
-.welcome-inner { max-width: 1160px; margin: 0 auto; }
+.welcome { flex: 1; min-width: 0; min-height: 0; max-width: 100%; overflow-x: hidden; overflow-y: auto; background: var(--bg); padding: clamp(24px, 3.5vw, 52px); }
+.welcome-inner { max-width: min(1160px, 100%); margin: 0 auto; min-width: 0; }
 .desk-heading { display: flex; justify-content: space-between; align-items: center; gap: 20px; margin: 8px 0 30px; flex-wrap: wrap; }
 .desk-heading .eyebrow { font: 600 10px var(--mono); letter-spacing: .12em; }
 .desk-heading .eyebrow span { color: var(--line-2); margin: 0 4px; }
-.desk-heading h1 { font-size: clamp(24px, 2.8vw, 36px); letter-spacing: -.04em; margin: 14px 0 10px; font-weight: 650; }
+.desk-heading h1 { font-size: var(--fs-xxl); letter-spacing: -.04em; margin: 14px 0 10px; font-weight: 650; }
 .desk-heading p { color: var(--text-2); font-size: 13px; margin: 0; }
 .desk-heading .btn { height: 38px; }
 .desk-heading .btn kbd { background: transparent; color: inherit; border-color: currentColor; opacity: .75; }
@@ -65,7 +65,7 @@
 .page { background: var(--bg); }
 .page .page-inner { max-width: 1400px; padding: 36px 40px; }
 .page .page-head { align-items: center; margin-bottom: 28px; }
-.page .page-head h1 { margin-top: 8px; font-size: 26px; letter-spacing: -.03em; }
+.page .page-head h1 { margin-top: 8px; letter-spacing: -.03em; }
 .page .page-head p { font-size: 12px; color: var(--text-2); }
 .page .eyebrow { font: 10px var(--mono); letter-spacing: .09em; }
 .page .page-inner.narrow { max-width: 1100px; }
@@ -127,7 +127,7 @@
 
 .app-root .cmd-trigger > span:not(.kbd) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .sidebar-dismiss { display: none; }
-@media (max-width: 960px) { .sidebar-dismiss { display: block; position: absolute; inset: 0 0 0 var(--rail-w); background: #091c2433; z-index: 29; } }
+@media (max-width: 960px) { .sidebar-dismiss { display: block; position: absolute; inset: 0 0 0 var(--rail-w); background: var(--overlay); z-index: 29; } }
 
 /* 查询和表格占满内容区；宽列只在表格内部滚动，不把页面撑出横向滚动。 */
 .app-root .workspace-view { min-width: 0; max-width: 100%; overflow: hidden; }

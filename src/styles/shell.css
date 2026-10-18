@@ -283,7 +283,7 @@
   position: fixed;
   inset: 0;
   z-index: 80;
-  background: rgba(12, 16, 24, 0.45);
+  background: var(--overlay);
   display: flex;
   justify-content: center;
   align-items: flex-start;
