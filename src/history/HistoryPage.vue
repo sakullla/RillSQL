@@ -232,8 +232,8 @@ onMounted(() => {
           <p v-if="section === 'saved'">按名称保存当前 SQL。</p>
           <p v-else>找回执行过的 SQL，检查结果，再回到编辑器继续工作。</p>
           <div class="hist-switch" role="tablist" aria-label="历史与保存的查询">
-            <button class="btn sm" :class="{ primary: section === 'runs' }" type="button" role="tab" :aria-selected="section === 'runs'" data-action="show-history" @click="showSection('runs')">执行历史</button>
-            <button class="btn sm" :class="{ primary: section === 'saved' }" type="button" role="tab" :aria-selected="section === 'saved'" data-action="show-saved" @click="showSection('saved')">保存的查询</button>
+            <button class="btn sm" type="button" role="tab" :aria-selected="section === 'runs'" data-action="show-history" @click="showSection('runs')">执行历史</button>
+            <button class="btn sm" type="button" role="tab" :aria-selected="section === 'saved'" data-action="show-saved" @click="showSection('saved')">保存的查询</button>
           </div>
         </div>
         <button v-if="section === 'runs'" class="btn danger" type="button" data-action="clear-history" :disabled="!entries.length" @click="confirmingClear = true">清空历史</button>
@@ -331,7 +331,7 @@ onMounted(() => {
             <form v-if="renamingId === item.id" class="saved-rename" @submit.prevent="confirmRename(item)">
               <input v-model="renameValue" type="text" :aria-label="`重命名 ${item.name}`" />
               <button class="btn sm" type="button" data-action="cancel-rename-saved" @click="renamingId = null">取消</button>
-              <button class="btn sm primary" type="submit" data-action="confirm-rename-saved">确认重命名</button>
+              <button class="btn sm" type="submit" data-action="confirm-rename-saved">确认重命名</button>
               <p v-if="renameError" class="saved-alert" role="alert">{{ renameError }}</p>
             </form>
             <div v-if="pendingDeleteId === item.id" class="hist-clear" role="alert">
@@ -384,6 +384,7 @@ onMounted(() => {
 .history-inspector small { display: block; margin-top: 12px; font-size: 11px; color: var(--text-3); }
 .history-pagination { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--text-2); }
 .hist-switch { display: flex; gap: var(--sp-2); margin-top: var(--sp-3); }
+.hist-switch button.btn[aria-selected="true"] { background: var(--sel-strong); color: var(--text); font-weight: 600; }
 .saved-form { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-3); margin: var(--sp-4) 0; }
 .saved-form label { display: flex; flex-direction: column; gap: var(--sp-2); font-size: var(--fs-sm); }
 .saved-sql { white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: var(--fs-sm); line-height: var(--lh); background: var(--sunken); border-radius: var(--r); padding: var(--sp-2) var(--sp-3); margin: var(--sp-2) 0; max-width: 100%; }

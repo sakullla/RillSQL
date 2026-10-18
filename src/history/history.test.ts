@@ -1,9 +1,14 @@
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { catalogFixture } from "../catalog/fixtures";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
 import HistoryPage from "./HistoryPage.vue";
 import { filterHistory, groupHistoryByDay, openPlan, statusLabel, type HistoryEntry } from "./plan";
+
+const pageSource = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "HistoryPage.vue"), "utf8");
 
 const invoke = vi.hoisted(() => vi.fn());
 
@@ -94,6 +99,12 @@ describe("query history", () => {
     expect(wrapper.text()).toContain("载入后重新选择连接和库");
 
     expect(wrapper.find("select").exists()).toBe(false);
+    expect(wrapper.get("[data-action='show-history']").attributes("aria-selected")).toBe("true");
+    expect(wrapper.get("[data-action='show-saved']").attributes("aria-selected")).toBe("false");
+    expect(wrapper.findAll(".hist-switch button").every((button) => !button.classes().includes("primary"))).toBe(true);
+    expect(pageSource).toContain('.hist-switch button.btn[aria-selected="true"] { background: var(--sel-strong); color: var(--text); font-weight: 600; }');
+    expect(pageSource).not.toMatch(/class="[^"]*\bprimary\b[^"]*"[^>]*data-action="confirm-rename-saved"/);
+    expect(wrapper.findAll("button.primary").map((button) => button.text())).toEqual(["载入编辑器"]);
     expect(wrapper.get(".history-inspector .btn.primary").text()).toContain("载入编辑器");
     expect(wrapper.findAll("[data-action='open-history']").every((button) => !button.classes().includes("primary"))).toBe(true);
     expect(wrapper.get("[data-action='clear-history']").classes()).toContain("danger");
@@ -138,6 +149,9 @@ describe("query history", () => {
     const lead = wrapper.get(".page-head p").text();
     expect(lead.split("。").filter((part) => part.trim())).toEqual(["按名称保存当前 SQL"]);
     expect(wrapper.get(".page-head h1").text()).toBe("保存的查询");
+    expect(wrapper.get("[data-action='show-saved']").attributes("aria-selected")).toBe("true");
+    expect(wrapper.findAll(".hist-switch button").every((button) => !button.classes().includes("primary"))).toBe(true);
+    expect(wrapper.findAll("button.primary").map((button) => button.attributes("data-action"))).toEqual(["save-named-query"]);
     wrapper.unmount();
   });
 
