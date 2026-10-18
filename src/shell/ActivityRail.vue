@@ -28,7 +28,6 @@ const items: { id: AppPage; icon: IconName; label: string }[] = [
       @click="emit('navigate', item.id)"
     >
       <Icon :name="item.icon" />
-      <span>{{ item.label }}</span>
     </button>
     <span class="grow"></span>
     <button
@@ -41,7 +40,6 @@ const items: { id: AppPage; icon: IconName; label: string }[] = [
       @click="emit('navigate', 'settings')"
     >
       <Icon name="sliders" />
-      <span>设置</span>
       <ChordKeys class="sr" chord="Mod+," />
     </button>
   </nav>

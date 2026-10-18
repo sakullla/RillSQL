@@ -44,19 +44,41 @@ function makeTab(overrides: Partial<ShellTab> = {}): ShellTab {
 }
 
 describe("shell layout", () => {
-  it("keeps navigation labels, brand, and the command entry visible", () => {
-    const rail = mount(ActivityRail, { props: { page: "workspace" } });
-    expect(rail.text()).toContain("工作台");
-    expect(rail.text()).toContain("连接");
-    expect(rail.text()).toContain("查询历史");
-    expect(rail.text()).toContain("设置");
-
+  it("keeps the brand and the command entry visible", () => {
     const title = mount(TitleBar, { props: { theme: "system" } });
     expect(title.text()).toContain("RillSQL");
     expect(title.text()).toContain("澄库");
     expect(title.find(".cmd-trigger").attributes("aria-label")).toBe("打开命令面板");
     expect(desktopShell()).toBe(false);
     expect(title.find(".caption").exists()).toBe(false);
+  });
+
+  it("shows activity rail icons without visible page names", async () => {
+    const labels = ["工作台", "连接", "查询历史", "设置"] as const;
+    const rail = mount(ActivityRail, { props: { page: "workspace" } });
+    const buttons = rail.findAll(".rail-btn");
+    expect(buttons).toHaveLength(labels.length);
+    for (const label of labels) expect(rail.text()).not.toContain(label);
+    expect(buttons.map((button) => button.attributes("aria-label"))).toEqual([...labels]);
+    expect(buttons.map((button) => button.attributes("title"))).toEqual([
+      "工作台（再次点击切换资源管理器）",
+      "连接",
+      "查询历史",
+      "设置",
+    ]);
+    expect(buttons.every((button) => button.find(".i").exists())).toBe(true);
+    expect(buttons[0].classes()).toContain("active");
+    expect(buttons[0].attributes("aria-current")).toBe("page");
+    expect(buttons.slice(1).every((button) => !button.classes().includes("active"))).toBe(true);
+    expect(buttons.slice(1).every((button) => button.attributes("aria-current") === "false")).toBe(true);
+    await buttons[0].trigger("click");
+    expect(rail.emitted("navigate")).toEqual([["workspace"]]);
+
+    const settings = mount(ActivityRail, { props: { page: "settings" } });
+    const settingsButton = settings.findAll(".rail-btn")[3];
+    expect(settingsButton.classes()).toContain("active");
+    expect(settingsButton.attributes("aria-current")).toBe("page");
+    expect(settings.findAll(".rail-btn").slice(0, 3).every((button) => !button.classes().includes("active"))).toBe(true);
   });
 
   it("renders platform window controls only for custom chrome", () => {
