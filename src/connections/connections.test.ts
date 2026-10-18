@@ -1,5 +1,7 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import { describe, expect, it } from "vitest";
+import { replaceCatalog, resetCatalog } from "../catalog/store";
+import type { CatalogConnection } from "../catalog/types";
 import type { ConnectionApi, EnvTagInput, TestReport } from "./api";
 import ConnectionsPage from "./ConnectionsPage.vue";
 import { listPaletteConnections, MODULE_ID, replacePaletteConnections, setSqlitePicker } from "./index";
@@ -60,6 +62,25 @@ function savedMysql(): SavedConnection {
   };
 }
 
+function savedSqlite(): SavedConnection {
+  return {
+    id: "notes",
+    name: "本地笔记",
+    engine: "sqlite",
+    env: "local",
+    host: null,
+    port: null,
+    database: null,
+    username: null,
+    filePath: "C:/data/notes.sqlite",
+    tls: null,
+    ssh: null,
+    passwordSaved: false,
+    sshPasswordSaved: false,
+    sshHostKey: null,
+  };
+}
+
 describe("connection model", () => {
   it("keeps mysql distinct from mariadb and leaves secrets out of sqlite config", () => {
     expect(MODULE_ID).toBe("connections");
@@ -78,9 +99,9 @@ describe("connection model", () => {
 });
 
 describe("connections page", () => {
-  function pageApi(nextReport: () => TestReport): ConnectionApi {
+  function pageApi(nextReport: () => TestReport, list: SavedConnection[] = [savedMysql()]): ConnectionApi {
     return {
-      list: async () => [savedMysql()],
+      list: async () => list,
       ...tagApi(seedTags()),
       save: async (draft) => ({ connection: { ...toStoredConfig(draft, draft.id ?? "created"), passwordSaved: draft.savePassword }, note: null }),
       remove: async (id) => ({ connection: { ...savedMysql(), id }, databaseFileRemoved: false }),
@@ -276,5 +297,102 @@ describe("connections page", () => {
     expect(wrapper.text()).not.toContain("灰度");
     expect(wrapper.get(".env-pick label.on").text()).toContain("无标签");
     wrapper.unmount();
+  });
+
+  it("只保留一枚新建连接，并用应用内下拉筛选仍按行显示连接", async () => {
+    resetCatalog();
+    const wrapper = mount(ConnectionsPage, {
+      props: { sqlitePrompt: 0, api: pageApi(() => ({ status: "ok", stages: [] }), [savedMysql(), savedSqlite()]) },
+    });
+    await flushPromises();
+
+    const createButtons = wrapper.findAll("button").filter((button) => button.text().includes("新建连接"));
+    expect(createButtons).toHaveLength(1);
+    expect(createButtons[0].classes()).toContain("primary");
+    const sqliteButton = wrapper.findAll("button").find((button) => button.text().includes("打开 SQLite"));
+    expect(sqliteButton?.classes()).not.toContain("primary");
+    expect(wrapper.find(".conn-card.add").exists()).toBe(false);
+    expect(wrapper.find(".connection-filters select").exists()).toBe(false);
+    expect(wrapper.findAll('.connection-filters [role="combobox"]').map((item) => item.attributes("aria-label"))).toEqual([
+      "按数据库类型筛选",
+      "按环境筛选",
+    ]);
+
+    const mysql = wrapper.findAll("article.conn-card").find((card) => card.text().includes("Atlas"));
+    expect(mysql?.text()).toContain("MySQL");
+    expect(mysql?.text()).toContain("db.example.test:3306");
+    expect(mysql?.text()).toContain("开发");
+    expect(mysql?.text()).toContain("未连接");
+    expect(mysql?.get("[data-action=conn-connect]").text()).toContain("连接");
+
+    const file = wrapper.findAll("article.conn-card").find((card) => card.text().includes("本地笔记"));
+    expect(file?.text()).toContain("SQLite");
+    expect(file?.find(".cc-addr").text()).toBe("C:/data/notes.sqlite");
+    expect(file?.text()).toContain("本地");
+    expect(file?.text()).toContain("未连接");
+    expect(file?.get("[data-action=conn-connect]").text()).toContain("连接");
+
+    await wrapper.get('[aria-label="搜索连接"]').setValue("不存在的名称");
+    expect(wrapper.text()).toContain("没有匹配的连接");
+    expect(wrapper.text()).toContain("试试其他名称、数据库类型或环境。");
+    expect(wrapper.text()).not.toContain("连接你的第一个数据库");
+
+    await wrapper.get('[aria-label="搜索连接"]').setValue("");
+    await wrapper.get('[aria-label="按环境筛选"]').trigger("click");
+    await wrapper.findAll(".listbox-option").find((option) => option.text() === "生产")!.trigger("click");
+    expect(wrapper.find("article.conn-card").exists()).toBe(false);
+    expect(wrapper.text()).toContain("没有匹配的连接");
+
+    await wrapper.get('[aria-label="按环境筛选"]').trigger("click");
+    await wrapper.findAll(".listbox-option").find((option) => option.text() === "全部环境")!.trigger("click");
+    await wrapper.get('[aria-label="按数据库类型筛选"]').trigger("click");
+    await wrapper.findAll(".listbox-option").find((option) => option.text() === "PostgreSQL")!.trigger("click");
+    expect(wrapper.find("article.conn-card").exists()).toBe(false);
+    expect(wrapper.find(".connection-filters select").exists()).toBe(false);
+    wrapper.unmount();
+    resetCatalog();
+  });
+
+  it("没有连接时使用和筛选无命中不同的文案", async () => {
+    const wrapper = mount(ConnectionsPage, {
+      props: { sqlitePrompt: 0, api: pageApi(() => ({ status: "ok", stages: [] }), []) },
+    });
+    await flushPromises();
+    expect(wrapper.text()).toContain("连接你的第一个数据库");
+    expect(wrapper.text()).toContain("支持 PostgreSQL、MySQL、MariaDB 和 SQLite。");
+    expect(wrapper.text()).not.toContain("没有匹配的连接");
+    expect(wrapper.findAll("button").filter((button) => button.text().includes("新建连接"))).toHaveLength(1);
+    wrapper.unmount();
+  });
+
+  it("已连接的行显示打开和已连接", async () => {
+    const connected: CatalogConnection = {
+      id: "atlas",
+      name: "Atlas",
+      engine: "mysql",
+      env: "dev",
+      envLabel: "开发",
+      envTone: "dev",
+      status: "connected",
+      defaultDatabase: "app",
+      foreignKeys: null,
+      error: null,
+      databases: [],
+    };
+    replaceCatalog([connected]);
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api: pageApi(() => ({ status: "ok", stages: [] })) } });
+    await flushPromises();
+    const card = wrapper.get("article.conn-card");
+    expect(card.text()).toContain("已连接");
+    expect(card.text()).toContain("MySQL");
+    expect(card.text()).toContain("Atlas");
+    expect(card.find(".cc-addr").text()).toBe("db.example.test:3306");
+    expect(card.text()).toContain("开发");
+    const open = card.findAll("footer button").find((button) => button.text().includes("打开"));
+    expect(open).toBeTruthy();
+    expect(open?.classes()).not.toContain("primary");
+    expect(card.find("[data-action=conn-connect]").exists()).toBe(false);
+    wrapper.unmount();
+    resetCatalog();
   });
 });

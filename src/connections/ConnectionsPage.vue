@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { catalogConnections, refreshCatalog } from "../catalog/store";
+import Listbox from "../ui/Listbox.vue";
 import { tauriConnectionApi, type ConnectionApi, type EnvTagInput, type TestReport } from "./api";
 import ConnIcon from "./ConnIcon.vue";
 import EnvTagField from "./EnvTagField.vue";
@@ -68,6 +69,15 @@ const filtered = computed(() => {
     [item.name, item.host, item.filePath, item.database, engineMeta(item.engine).label].some((value) => value && value.toLowerCase().includes(q)),
   );
 });
+const engineOptions = computed(() => [
+  { value: "all", label: "全部数据库类型" },
+  ...ENGINES.map((engine) => ({ value: engine.id, label: engine.label })),
+]);
+const envOptions = computed(() => [
+  { value: "all", label: "全部环境" },
+  ...tags.value.map((tag) => ({ value: tag.id, label: tag.label })),
+  { value: "none", label: "无标签" },
+]);
 
 function openWorkspace(connection: SavedConnection) {
   const catalog = catalogConnections().find(item => item.id === connection.id);
@@ -431,8 +441,8 @@ watch(
       <div class="connection-overview"><span><b>{{ connections.length }}</b> 个连接</span><span class="online-total"><i></i><b>{{ connectedCount }}</b> 个已连接</span><span class="grow"></span><span><ConnIcon name="lock" />凭据保存在本机</span></div>
       <div class="connection-filters">
         <label class="mini-search"><ConnIcon name="search" /><input v-model="query" type="search" placeholder="搜索名称、地址或文件…" aria-label="搜索连接" /></label>
-        <select v-model="engineFilter" aria-label="按数据库类型筛选"><option value="all">全部数据库类型</option><option v-for="engine in ENGINES" :key="engine.id" :value="engine.id">{{ engine.label }}</option></select>
-        <select v-model="envFilter" aria-label="按环境筛选"><option value="all">全部环境</option><option v-for="tag in tags" :key="tag.id" :value="tag.id">{{ tag.label }}</option><option value="none">无标签</option></select>
+        <Listbox v-model="engineFilter" :options="engineOptions" aria-label="按数据库类型筛选" />
+        <Listbox v-model="envFilter" :options="envOptions" aria-label="按环境筛选" />
         <span class="grow"></span><span class="muted sm">{{ filtered.length }} 个连接</span>
       </div>
       <p v-if="loadError" class="page-note" role="alert">{{ loadError }}</p><p v-else-if="note" class="page-note" role="status">{{ note }}</p>
@@ -452,7 +462,6 @@ watch(
           <div v-if="menuId === item.id" class="conn-menu" @click.stop><button type="button" @click="showDetails(item)"><ConnIcon name="info" />连接详情</button><button type="button" data-action="conn-edit" @click="openEditor(item)"><ConnIcon name="pencil" />编辑配置…</button><button v-if="connectionState(item.id) === 'connected'" type="button" @click="disconnect(item)"><ConnIcon name="unplug" />断开连接</button><button type="button" class="danger" data-action="conn-delete" @click="askDelete(item)"><ConnIcon name="trash" />删除配置…</button></div>
         </article>
         <div v-if="!filtered.length" class="empty"><ConnIcon name="database" /><h3>{{ connections.length ? '没有匹配的连接' : '连接你的第一个数据库' }}</h3><p>{{ connections.length ? '试试其他名称、数据库类型或环境。' : '支持 PostgreSQL、MySQL、MariaDB 和 SQLite。' }}</p></div>
-        <button class="conn-card add" type="button" data-action="conn-new" @click="openEditor()"><ConnIcon name="plus" /><span>新建连接</span><small>PostgreSQL · MySQL · MariaDB · SQLite</small></button>
       </div>
       <div class="connection-note"><ConnIcon name="shield" /><span>连接配置只保存在本机。密码保存在操作系统凭据库；删除连接不会删除数据库或 SQLite 文件。</span></div>
     </div>
