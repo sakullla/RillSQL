@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
+import type { ListboxOption } from "../ui/types";
+import Listbox from "../ui/Listbox.vue";
 import { catalogConnections } from "../catalog/store";
 import { gridCommit, gridDescribe } from "../grid/api";
 import type { TableTarget } from "../grid/target";
@@ -47,6 +49,16 @@ const choices = computed(() => {
   }
   return list;
 });
+const tableOptions = computed<ListboxOption[]>(() =>
+  choices.value.map((item) => ({
+    value: keyOf(item.schema, item.table),
+    label: item.schema ? `${item.schema}.${item.table}` : item.table,
+  })),
+);
+const columnOptions = computed<ListboxOption[]>(() => [
+  { value: "", label: "不导入" },
+  ...(parsed.value?.columns ?? []).map((name) => ({ value: name, label: name })),
+]);
 
 function keyOf(schema: string, table: string): string {
   return `${schema}\u0000${table}`;
@@ -83,6 +95,17 @@ const previewRows = computed(() => (parsed.value ? mappedPreview(parsed.value.ro
 const { viewport, range, onScroll } = useRowWindow(computed(() => previewRows.value.length));
 const visibleRows = computed(() => previewRows.value.slice(range.value.start, range.value.end));
 const canWrite = computed(() => !!parsed.value && parsed.value.rows.length > 0 && gaps.value.length === 0 && !writing.value && !describing.value && !parseError.value && activeSchema.value.kind === "table");
+
+function onTable(value: string) {
+  if (writing.value || value === tableKey.value) return;
+  tableKey.value = value;
+  void chooseTable();
+}
+
+function onColumn(name: string, value: string) {
+  if (writing.value) return;
+  mapping.value[name] = value;
+}
 
 async function chooseTable() {
   const [schemaName, table] = tableKey.value.split("\u0000");
@@ -160,9 +183,7 @@ async function confirm() {
         <p v-if="parseError" class="ex-alert" role="alert">{{ parseError }}</p>
         <p v-if="resultText" class="ex-note" role="status" data-import-result>{{ resultText }}</p>
         <label class="ex-path">导入到
-          <select v-model="tableKey" aria-label="导入的表" :disabled="writing" @change="chooseTable">
-            <option v-for="item in choices" :key="keyOf(item.schema, item.table)" :value="keyOf(item.schema, item.table)">{{ item.schema ? `${item.schema}.${item.table}` : item.table }}</option>
-          </select>
+          <Listbox :model-value="tableKey" :options="tableOptions" aria-label="导入的表" :disabled="writing" @update:model-value="onTable" />
         </label>
         <fieldset class="ex-scope">
           <legend>文件格式</legend>
@@ -179,10 +200,7 @@ async function confirm() {
             <tr v-for="column in activeSchema.columns" :key="column.name">
               <td>{{ column.name }}<small v-if="!column.nullable && !column.auto"> 必填</small></td>
               <td>
-                <select v-model="mapping[column.name]" :aria-label="`${column.name} 对应的列`" :disabled="writing">
-                  <option value="">不导入</option>
-                  <option v-for="name in parsed.columns" :key="name" :value="name">{{ name }}</option>
-                </select>
+                <Listbox :model-value="mapping[column.name] ?? ''" :options="columnOptions" :aria-label="`${column.name} 对应的列`" :disabled="writing" @update:model-value="onColumn(column.name, $event)" />
               </td>
             </tr>
           </tbody>
@@ -219,6 +237,12 @@ async function confirm() {
 .ex-titles h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; }
 .ex-titles p { margin: var(--sp-1) 0 0; font-size: var(--fs-sm); color: var(--text-2); }
 .ex-body { padding: var(--sp-4) var(--sp-5); overflow: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
+.ex-body:has(.listbox.open) { overflow: visible; }
+.ex-body :deep(.listbox.open) { z-index: 2; }
+.ex-path :deep(.listbox),
+.map-table :deep(.listbox) { width: 100%; }
+.ex-path :deep(.listbox-trigger),
+.map-table :deep(.listbox-trigger) { width: 100%; justify-content: space-between; }
 .ex-foot { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-5); border-top: 1px solid var(--line); background: var(--panel-2); border-radius: 0 0 var(--r-xl) var(--r-xl); }
 .ex-note { margin: 0; font-size: var(--fs-sm); color: var(--text-2); line-height: var(--lh); }
 .ex-alert { margin: 0; padding: var(--sp-2) var(--sp-3); background: var(--err-soft); color: var(--err); border: 1px solid var(--err-line); border-radius: var(--r); font-size: var(--fs-sm); }

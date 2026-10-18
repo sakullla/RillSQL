@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
+import type { ListboxOption } from "../ui/types";
+import Listbox from "../ui/Listbox.vue";
 import { renderCsv, type CsvCell, type CsvDelimiter, type CsvOptions, type NullToken } from "./csv";
 import { renderInsert, type InsertTarget } from "./insert";
 import { renderJson } from "./json";
@@ -25,6 +27,21 @@ const emit = defineEmits<{
   close: [];
   start: [payload: { planNotice: string; scope: ExportScope; acknowledged: boolean; path: string; csv: CsvOptions; format: ExportFormat }];
 }>();
+
+const delimiterOptions: ListboxOption[] = [
+  { value: ",", label: "逗号 ," },
+  { value: ";", label: "分号 ;" },
+  { value: "\t", label: "制表符" },
+];
+const nullOptions: ListboxOption[] = [
+  { value: "", label: "空字段（无引号）" },
+  { value: "\\N", label: "\\N" },
+  { value: "NULL", label: "NULL（无引号）" },
+];
+const encodingOptions: ListboxOption[] = [
+  { value: "utf8", label: "UTF-8" },
+  { value: "bom", label: "UTF-8 + BOM（Excel 打开不乱码）" },
+];
 
 const scope = ref<ExportScope>("loaded");
 const format = ref<ExportFormat>("csv");
@@ -77,6 +94,18 @@ const preview = computed(() => {
   return renderCsv(props.columns, rows, { ...csv.value, bom: false });
 });
 const canStart = computed(() => plan.value.allowed && !insertBlocked.value && (!plan.value.reexecutes || acknowledged.value) && path.value.trim().length > 0);
+
+function onDelimiter(value: string) {
+  if (value === "," || value === ";" || value === "\t") delimiter.value = value;
+}
+
+function onNullToken(value: string) {
+  if (value === "" || value === "\\N" || value === "NULL") nullToken.value = value;
+}
+
+function onEncoding(value: string) {
+  if (value === "utf8" || value === "bom") bom.value = value === "bom";
+}
 
 async function start() {
   if (!canStart.value || choosing.value) return;
@@ -178,24 +207,13 @@ async function start() {
           <summary>高级选项 <span class="muted">分隔符、NULL 写法、编码、列名行</span></summary>
           <div class="disclosure-body ex-advanced">
             <label>分隔符
-              <select v-model="delimiter" aria-label="分隔符">
-                <option value=",">逗号 ,</option>
-                <option value=";">分号 ;</option>
-                <option value="\t">制表符</option>
-              </select>
+              <Listbox :model-value="delimiter" :options="delimiterOptions" aria-label="分隔符" :disabled="choosing" @update:model-value="onDelimiter" />
             </label>
             <label>NULL 写为
-              <select v-model="nullToken" aria-label="NULL 写法">
-                <option value="">空字段（无引号）</option>
-                <option value="\N">\N</option>
-                <option value="NULL">NULL（无引号）</option>
-              </select>
+              <Listbox :model-value="nullToken" :options="nullOptions" aria-label="NULL 写法" :disabled="choosing" @update:model-value="onNullToken" />
             </label>
             <label>编码
-              <select v-model="bom" aria-label="编码">
-                <option :value="false">UTF-8</option>
-                <option :value="true">UTF-8 + BOM（Excel 打开不乱码）</option>
-              </select>
+              <Listbox :model-value="bom ? 'bom' : 'utf8'" :options="encodingOptions" aria-label="编码" :disabled="choosing" @update:model-value="onEncoding" />
             </label>
             <label class="ex-header-row"><input v-model="header" type="checkbox" /> 第一行写入列名</label>
           </div>
@@ -221,6 +239,10 @@ async function start() {
 .ex-titles h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; }
 .ex-titles p { margin: var(--sp-1) 0 0; font-size: var(--fs-sm); color: var(--text-2); }
 .ex-body { padding: var(--sp-4) var(--sp-5); overflow: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
+.ex-body:has(.listbox.open) { overflow: visible; }
+.ex-body :deep(.listbox.open) { z-index: 2; }
+.ex-advanced :deep(.listbox) { width: 100%; }
+.ex-advanced :deep(.listbox-trigger) { width: 100%; justify-content: space-between; }
 .ex-options { margin: 0; padding: 0; border: 0; min-width: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
 .ex-foot { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-5); border-top: 1px solid var(--line); background: var(--panel-2); border-radius: 0 0 var(--r-xl) var(--r-xl); }
 .ex-note { margin: 0; font-size: var(--fs-sm); color: var(--text-2); line-height: var(--lh); }

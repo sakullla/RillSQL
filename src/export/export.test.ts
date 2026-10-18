@@ -1,18 +1,25 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mount } from "@vue/test-utils";
-import { afterEach, describe, expect, it } from "vitest";
+import { flushPromises, mount } from "@vue/test-utils";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { customersFixture } from "../grid/fixture";
 import { queryPage } from "../grid/data";
 import { selectExportGate } from "../grid/sql";
+import type { TableTarget } from "../grid/target";
+import type { TableSchema } from "../grid/types";
 import { parseCsvDistinct, renderCsv, type CsvOptions } from "./csv";
+import ExportDialog from "./ExportDialog.vue";
+import ImportDialog from "./ImportDialog.vue";
 import { renderInsert } from "./insert";
 import { renderJson } from "./json";
 import { planExport } from "./plan";
 import TaskCenter from "./TaskCenter.vue";
 import { exportTasks, resetExportTasks } from "./tasks";
 import { startExport } from "./write";
+
+const invoke = vi.hoisted(() => vi.fn());
+vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 
 const csv: CsvOptions = { delimiter: ",", nullToken: "", bom: false, header: true };
 
@@ -289,5 +296,141 @@ describe("json and insert export", () => {
     expect(readFileSync(insertPath, "utf8")).toContain("NULL");
     expect(readFileSync(insertPath, "utf8")).not.toContain("old");
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+async function pick(wrapper: ReturnType<typeof mount>, label: string, option: string) {
+  await wrapper.get(`[role="combobox"][aria-label="${label}"]`).trigger("click");
+  expect(wrapper.find("select").exists()).toBe(false);
+  const match = wrapper.findAll('[role="option"]').find((node) => node.text() === option);
+  expect(match, option).toBeTruthy();
+  await match!.trigger("click");
+}
+
+describe("import and export choices", () => {
+  const target: TableTarget = { connectionId: "shop", database: "app", schema: "public", table: "customers", engine: "postgres" };
+  const schema: TableSchema = {
+    engine: "postgres",
+    schema: "public",
+    name: "customers",
+    kind: "table",
+    key: ["id"],
+    columns: [
+      { name: "id", typeName: "integer", nullable: false, primary: true, unique: true, auto: true },
+      { name: "name", typeName: "text", nullable: false, primary: false, unique: false, auto: false },
+      { name: "email", typeName: "text", nullable: false, primary: false, unique: true, auto: false },
+      { name: "note", typeName: "text", nullable: true, primary: false, unique: false, auto: false },
+    ],
+  };
+
+  it("changes delimiter, null token and encoding through in-app listboxes", async () => {
+    const wrapper = mount(ExportDialog, {
+      props: {
+        open: true,
+        origin: "table",
+        truncated: false,
+        fileStem: "customers",
+        loadedCount: 2,
+        pending: 0,
+        columns: ["id", "note"],
+        previewRows: [{ id: "1", note: null }, { id: "2", note: "" }],
+      },
+    });
+    expect(wrapper.find("select").exists()).toBe(false);
+    expect(wrapper.get('[role="combobox"][aria-label="分隔符"]').text()).toBe("逗号 ,");
+    expect(wrapper.get('[role="combobox"][aria-label="NULL 写法"]').text()).toBe("空字段（无引号）");
+    expect(wrapper.get('[role="combobox"][aria-label="编码"]').text()).toBe("UTF-8 + BOM（Excel 打开不乱码）");
+    expect(wrapper.get(".ex-preview").text()).toContain('"1",');
+
+    await pick(wrapper, "分隔符", "分号 ;");
+    expect(wrapper.get(".ex-preview").text()).toContain('"id";"note"');
+    await pick(wrapper, "NULL 写法", "NULL（无引号）");
+    expect(wrapper.get(".ex-preview").text()).toContain('"1";NULL');
+    await pick(wrapper, "分隔符", "制表符");
+    expect(wrapper.get(".ex-preview").text()).toContain("\"1\"\tNULL");
+    await pick(wrapper, "编码", "UTF-8");
+    expect(wrapper.get('[role="combobox"][aria-label="编码"]').text()).toBe("UTF-8");
+    expect(wrapper.find("select").exists()).toBe(false);
+
+    await wrapper.get(".btn.primary").trigger("click");
+    await flushPromises();
+    expect(wrapper.emitted("start")?.[0]?.[0]).toMatchObject({
+      format: "csv",
+      csv: { delimiter: "\t", nullToken: "NULL", bom: false, header: true },
+    });
+    wrapper.unmount();
+  });
+
+  it("uses in-app listboxes for the import table and column mapping and freezes them while writing", async () => {
+    let release: (value: unknown) => void = () => {};
+    invoke.mockImplementation((command: string) => {
+      if (command === "grid_describe") {
+        return {
+          engine: "postgres",
+          schema: "public",
+          name: "orders",
+          kind: "table",
+          columns: schema.columns,
+          key: ["id"],
+        };
+      }
+      if (command === "grid_commit") return new Promise((resolve) => { release = resolve; });
+      throw new Error(`unexpected ${command}`);
+    });
+    const wrapper = mount(ImportDialog, {
+      props: {
+        open: true,
+        target,
+        schema,
+        tables: [{ schema: "public", table: "customers" }, { schema: "public", table: "orders" }],
+      },
+    });
+    expect(wrapper.find("select").exists()).toBe(false);
+    expect(wrapper.get('[role="combobox"][aria-label="导入的表"]').text()).toBe("public.customers");
+    expect(wrapper.get('[role="combobox"][aria-label="导入的表"]').attributes("disabled")).toBeUndefined();
+
+    await wrapper.get('[role="combobox"][aria-label="导入的表"]').trigger("click");
+    expect(wrapper.findAll('[role="option"]').map((node) => node.text())).toEqual(["public.customers", "public.orders"]);
+    await wrapper.get('[role="listbox"]').trigger("keydown", { key: "Escape" });
+    await pick(wrapper, "导入的表", "public.orders");
+    await flushPromises();
+    expect(wrapper.get('[role="combobox"][aria-label="导入的表"]').text()).toBe("public.orders");
+    expect(invoke).toHaveBeenCalledWith("grid_describe", expect.objectContaining({ request: expect.objectContaining({ table: "orders" }) }));
+
+    const input = wrapper.get("input[type='file']");
+    const file = new File(["name,email,note\r\n甲,a@example.com,\r\n乙,b@example.com,备注"], "rows.csv", { type: "text/plain" });
+    Object.defineProperty(input.element, "files", { value: { 0: file, length: 1, item: () => file } });
+    await input.trigger("change");
+    await flushPromises();
+
+    expect(wrapper.find("select").exists()).toBe(false);
+    expect(wrapper.get('[role="combobox"][aria-label="note 对应的列"]').text()).toBe("note");
+    await pick(wrapper, "note 对应的列", "不导入");
+    expect(wrapper.get('[role="combobox"][aria-label="note 对应的列"]').text()).toBe("不导入");
+
+    await wrapper.get('[role="combobox"][aria-label="导入的表"]').trigger("click");
+    expect(wrapper.find('[role="listbox"]').exists()).toBe(true);
+    await wrapper.get(".btn.primary").trigger("click");
+    await flushPromises();
+    expect(wrapper.find('[role="listbox"]').exists()).toBe(false);
+    const boxes = wrapper.findAll('[role="combobox"]');
+    expect(boxes.map((box) => box.attributes("aria-label"))).toEqual([
+      "导入的表",
+      "id 对应的列",
+      "name 对应的列",
+      "email 对应的列",
+      "note 对应的列",
+    ]);
+    expect(boxes.every((box) => box.attributes("disabled") !== undefined)).toBe(true);
+    await boxes[0]!.trigger("click");
+    await boxes[4]!.trigger("click");
+    expect(wrapper.find('[role="listbox"]').exists()).toBe(false);
+    expect(wrapper.find("select").exists()).toBe(false);
+    expect(wrapper.get('[role="combobox"][aria-label="note 对应的列"]').text()).toBe("不导入");
+    expect(wrapper.get('[role="combobox"][aria-label="导入的表"]').text()).toBe("public.orders");
+
+    release({ applied: [], failed: null, pendingIds: [], rolledBack: false, rule: "按顺序逐条提交，遇到错误即停止；已成功的语句不撤销。" });
+    await flushPromises();
+    wrapper.unmount();
   });
 });
