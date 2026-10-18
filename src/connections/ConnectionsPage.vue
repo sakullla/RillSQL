@@ -24,7 +24,8 @@ import {
 } from "./model";
 import "./connections.css";
 
-const props = defineProps<{ sqlitePrompt: number; api?: ConnectionApi }>();
+type ConnectionActionRequest = { id: number; connectionId: string; action: "edit" | "test" | "copy" | "delete" };
+const props = defineProps<{ sqlitePrompt: number; api?: ConnectionApi; actionRequest?: ConnectionActionRequest | null }>();
 const emit = defineEmits<{ workspace: []; "sqlite-consumed": []; "query-target": [target: import("../shell/session").QueryTarget] }>();
 const engineFilter = ref("all");
 const envFilter = ref("all");
@@ -471,6 +472,28 @@ onMounted(() => {
   void reload();
   void reloadTags();
 });
+
+const lastHandledActionId = ref(0);
+watch(
+  () => props.actionRequest,
+  async (request) => {
+    if (!request || request.id <= lastHandledActionId.value) return;
+    lastHandledActionId.value = request.id;
+    if (!connections.value.length && !loadError.value) await reload();
+    const item = connections.value.find((entry) => entry.id === request.connectionId);
+    if (!item) {
+      note.value = "找不到这条连接，可能已被删除。";
+      return;
+    }
+    if (request.action === "edit") openEditor(item);
+    else if (request.action === "test") void testFromRow(item);
+    else if (request.action === "copy") {
+      copyConfig(item);
+      note.value = "配置已复制（不含密码）。";
+    } else if (request.action === "delete") askDelete(item);
+  },
+  { immediate: true },
+);
 
 watch(
   () => props.sqlitePrompt,

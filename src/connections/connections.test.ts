@@ -355,4 +355,34 @@ describe("connections page", () => {
     expect(menu!.querySelector('[data-id="delete"]')).toBeTruthy();
     wrapper.unmount();
   });
+
+  it("对象树 actionRequest 打开对应连接的编辑弹窗，重复请求幂等", async () => {
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api: pageApi(() => ({ status: "ok", stages: [] })) } });
+    await flushPromises();
+    await wrapper.setProps({ actionRequest: { id: 1, connectionId: "atlas", action: "edit" } });
+    await flushPromises();
+    expect(wrapper.text()).toContain("编辑连接 · Atlas");
+    const checked = wrapper.findAll('input[name="cf-engine"]').find((node) => (node.element as HTMLInputElement).checked);
+    expect((checked!.element as HTMLInputElement).value).toBe("mysql");
+    // 同一 id 重复下发不再处理，也不会关掉弹窗
+    await wrapper.setProps({ actionRequest: { id: 1, connectionId: "atlas", action: "edit" } });
+    await flushPromises();
+    expect(wrapper.text()).toContain("编辑连接 · Atlas");
+    wrapper.unmount();
+  });
+
+  it("对象树 copy 动作给出提示，已删除连接给出找不到提示", async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api: pageApi(() => ({ status: "ok", stages: [] })) } });
+    await flushPromises();
+    await wrapper.setProps({ actionRequest: { id: 2, connectionId: "atlas", action: "copy" } });
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(wrapper.text()).toContain("配置已复制（不含密码）。");
+    await wrapper.setProps({ actionRequest: { id: 3, connectionId: "ghost", action: "edit" } });
+    await flushPromises();
+    expect(wrapper.text()).toContain("找不到这条连接，可能已被删除。");
+    wrapper.unmount();
+  });
 });

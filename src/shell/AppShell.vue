@@ -196,10 +196,22 @@ function onFocusedDatabase(connectionId: string, database: string) {
   }
 }
 
-/** 对象树连接节点的编辑/测试/复制/删除：本任务统一落到连接页，具体弹窗后续再接。 */
-function onConnectionAction(_connectionId: string, _action: "edit" | "test" | "copy" | "delete") {
+/** 对象树连接节点的编辑/测试/复制/删除：透传到连接页，由连接页打开对应弹窗。 */
+const connActionSeq = ref(0);
+const connectionActionRequest = ref<{ id: number; connectionId: string; action: "edit" | "test" | "copy" | "delete" } | null>(null);
+function onConnectionAction(connectionId: string, action: "edit" | "test" | "copy" | "delete") {
+  connActionSeq.value += 1;
+  connectionActionRequest.value = { id: connActionSeq.value, connectionId, action };
   session.showPage("connections");
 }
+
+// 离开连接页后清掉请求，避免下次进入连接页时弹窗重开。
+watch(
+  () => session.page.value,
+  (page) => {
+    if (page !== "connections") connectionActionRequest.value = null;
+  },
+);
 
 function onSettings(patch: Partial<ShellSettings>) {
   Object.assign(settings, patch);
@@ -445,7 +457,7 @@ onBeforeUnmount(() => {
           @table-view="session.setTableView"
           @query-target="target => session.openQueryDraft({ ...target, sql: '', needsTarget: false, notice: null })"
         />
-        <ConnectionsPage v-if="session.page.value === 'connections'" :sqlite-prompt="sqlitePrompt" @sqlite-consumed="sqlitePrompt = 0" @workspace="session.showPage('workspace')" @query-target="target => session.openQueryDraft({ ...target, sql: '', needsTarget: false, notice: null })" />
+        <ConnectionsPage v-if="session.page.value === 'connections'" :sqlite-prompt="sqlitePrompt" :action-request="connectionActionRequest" @sqlite-consumed="sqlitePrompt = 0" @workspace="session.showPage('workspace')" @query-target="target => session.openQueryDraft({ ...target, sql: '', needsTarget: false, notice: null })" />
         <HistoryPage
           v-else-if="session.page.value === 'history'"
           :section="historySection"

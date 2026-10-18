@@ -1,6 +1,9 @@
-import { mount } from "@vue/test-utils";
+import { flushPromises, mount } from "@vue/test-utils";
+import { nextTick } from "vue";
 import { afterEach, describe, expect, it } from "vitest";
+import ConnectionsPage from "../connections/ConnectionsPage.vue";
 import AppShell from "./AppShell.vue";
+import Sidebar from "./Sidebar.vue";
 
 afterEach(() => {
   location.hash = "";
@@ -18,7 +21,7 @@ describe("AppShell", () => {
     expect(wrapper.find(".statusbar").exists()).toBe(true);
 
     // R2：首次启动直接呈现两条主路径，无需文档或快捷键
-    const paths = wrapper.findAll(".desk-action");
+    const paths = wrapper.findAll(".desk-entry");
     expect(paths).toHaveLength(2);
     expect(paths[0]!.text()).toContain("新建连接");
     expect(paths[1]!.text()).toContain("打开 SQLite 文件");
@@ -42,9 +45,21 @@ describe("AppShell", () => {
 
   it("navigates to the connections page from the new-connection path", async () => {
     const wrapper = mount(AppShell);
-    await wrapper.findAll(".desk-action")[0]!.trigger("click");
+    await wrapper.findAll(".desk-entry")[0]!.trigger("click");
     expect(location.hash).toBe("#/connections");
     expect(wrapper.find(".workspace-view").attributes("style")).toContain("display: none");
+    wrapper.unmount();
+  });
+
+  it("透传对象树连接动作到连接页的 actionRequest", async () => {
+    const wrapper = mount(AppShell);
+    wrapper.getComponent(Sidebar).vm.$emit("connection-action", "atlas", "edit");
+    await nextTick();
+    expect(location.hash).toBe("#/connections");
+    await flushPromises();
+    const page = wrapper.findComponent(ConnectionsPage);
+    expect(page.exists()).toBe(true);
+    expect(page.props("actionRequest")).toEqual({ id: 1, connectionId: "atlas", action: "edit" });
     wrapper.unmount();
   });
 });

@@ -25,11 +25,17 @@
 .desk-heading p { color: var(--text-2); font-size: 13px; margin: 0; }
 .desk-heading .btn { height: 38px; }
 .desk-heading .btn kbd { background: transparent; color: inherit; border-color: currentColor; opacity: .75; }
-.desk-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 32px; }
-.desk-action { display: flex; align-items: center; text-align: left; gap: 14px; padding: 22px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--panel); transition: border-color var(--dur-fast); }
-.desk-action:hover { border-color: var(--accent); }
-.desk-action b { font-size: 14px; display: block; margin-bottom: 5px; }
-.desk-action small { color: var(--text-2); font-size: 11px; }
+.desk-heading.compact { margin: 8px 0 16px; }
+.desk-heading.compact h1 { font-size: 16px; letter-spacing: -.02em; margin: 0 0 6px; font-weight: 650; }
+.desk-entries { list-style: none; margin: 0 0 20px; padding: 0; max-width: 520px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--panel); overflow: hidden; }
+.desk-entry { display: flex; align-items: center; gap: 12px; width: 100%; padding: 12px 16px; text-align: left; transition: background var(--dur-fast); }
+.desk-entries li + li .desk-entry { border-top: 1px solid var(--line); }
+.desk-entry:hover { background: var(--hover); }
+.desk-entry:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.desk-entry b { font-size: 13px; display: block; font-weight: 600; }
+.desk-entry small { color: var(--text-2); font-size: 11px; }
+.desk-entry .action-icon { width: 30px; height: 30px; border-radius: 6px; }
+.desk-entry .action-icon .i { width: 15px; height: 15px; }
 .action-icon { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 10px; background: var(--accent-soft); color: var(--accent-text); flex-shrink: 0; }
 .action-icon .i { width: 22px; height: 22px; }
 .action-arrow { margin-left: auto; color: var(--text-3); font-size: 18px; }
@@ -113,8 +119,6 @@
 }
 @media (max-width: 960px) {
   .welcome { padding: 24px; }
-  .desk-actions { grid-template-columns: 1fr; gap: 10px; }
-  .desk-action { padding: 16px; }
   .desk-db { flex-wrap: wrap; }
   .page .page-inner { padding: 24px; }
   .title-query { display: none; }

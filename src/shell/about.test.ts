@@ -49,7 +49,7 @@ describe("product identity", () => {
     replaceCatalog([savedConnection()]);
     const wrapper = mount(WelcomeView);
     expect(wrapper.find(".desk-db").exists()).toBe(false);
-    expect(wrapper.findAll(".desk-action")).toHaveLength(0);
+    expect(wrapper.findAll(".desk-entry")).toHaveLength(0);
     expect(wrapper.text()).toContain("新建查询");
     expect(wrapper.text()).not.toContain("书店");
     expect(wrapper.text()).not.toContain("从数据，到答案。");
@@ -59,7 +59,7 @@ describe("product identity", () => {
 
   it("emits the two primary paths as distinct actions", async () => {
     const wrapper = mount(WelcomeView);
-    const paths = wrapper.findAll(".desk-action");
+    const paths = wrapper.findAll(".desk-entry");
     await paths[0]!.trigger("click");
     await paths[1]!.trigger("click");
     expect(wrapper.emitted("connections")).toHaveLength(1);
