@@ -789,7 +789,7 @@ onBeforeUnmount(() => {
 .q-sql { margin: 0; white-space: pre-wrap; font-family: var(--mono); font-size: var(--fs-xs); color: var(--text-2); }
 .q-cancel-detail { margin-top: var(--sp-3); padding-top: var(--sp-2); border-top: 1px solid var(--line); font-size: var(--fs-sm); color: var(--text-2); }
 .q-cancel-detail p { margin: 0 0 var(--sp-1); }
-.query-pane .q-toolbar { background: var(--panel); min-height: var(--target-h); }
+.query-pane .q-toolbar { background: var(--panel); height: var(--target-h); min-height: var(--target-h); padding: 0 var(--sp-3); flex-wrap: nowrap; overflow: hidden; }
 .editor-caption { display: flex; align-items: center; gap: 20px; padding: 9px 16px; background: var(--panel-2); border-bottom: 1px solid var(--line); font-size: 10px; color: var(--text-2); }
 .editor-caption > span:first-child { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
 .editor-caption .q-hint { flex: 1; font-size: 10px; padding: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
@@ -800,12 +800,12 @@ onBeforeUnmount(() => {
 .query-pane :deep(.cm-gutters) { background: var(--panel-2); border-right: 0; min-width: 44px; }
 .query-pane :deep(.cm-activeLine), .query-pane :deep(.cm-activeLineGutter) { background: var(--sel); }
 .query-pane :deep(.cm-placeholder) { color: var(--text-3); }
-.editor-position { display: flex; justify-content: space-between; gap: 10px; padding: 5px 16px; color: var(--text-3); font-size: 10px; }
+.editor-position { display: flex; align-items: center; justify-content: space-between; gap: 10px; height: var(--hint-h); padding: 0 var(--sp-4); color: var(--text-3); font-size: 10px; }
 .query-splitter { height: 7px; flex-shrink: 0; display: grid; place-items: center; background: var(--panel-2); border-block: 1px solid var(--line); cursor: row-resize; touch-action: none; }
 .query-splitter span { height: 2px; width: 30px; background: var(--line-2); border-radius: 2px; }
 .query-splitter:hover, .query-splitter:focus-visible { background: var(--accent-soft); }
 .query-pane .q-results { flex: 1; min-height: 130px; padding: 0; gap: 0; border: 0; }
-.results-heading { display: flex; align-items: center; gap: 20px; padding: 10px 16px; border-bottom: 1px solid var(--line); font-size: 11px; flex-shrink: 0; }
+.results-heading { display: flex; align-items: center; gap: 20px; height: var(--result-head-h); padding: 0 var(--sp-4); border-bottom: 1px solid var(--line); font-size: 11px; flex-shrink: 0; }
 .plan-view { padding: 12px 16px; overflow: auto; }
 .plan-caption { margin: 0 0 8px; font-size: var(--fs-sm); color: var(--text-2); }
 .plan-view table { border-collapse: collapse; font-family: var(--mono); font-size: var(--fs-xs); }

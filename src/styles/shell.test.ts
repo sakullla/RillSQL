@@ -33,4 +33,11 @@ describe("shell geometry", () => {
   it("uses the tab height token on the tab strip", () => {
     expect(workbench).toMatch(/\.app-root \.tabbar \{[^}]*height: var\(--tab-h\)/);
   });
+
+  it("consumes the three workbench bar heights", () => {
+    const query = readFileSync(resolve(here, "../query/QueryTab.vue"), "utf8");
+    expect(query).toMatch(/\.query-pane \.q-toolbar \{[^}]*height: var\(--target-h\)/);
+    expect(query).toMatch(/height: var\(--result-head-h\)/);
+    expect(query).toMatch(/height: var\(--hint-h\)/);
+  });
 });
