@@ -4,14 +4,14 @@
 .app-root .tb-brand { min-width: 0; }
 .app-root .rail { background: var(--nav-bg); border: 0; padding-top: 16px; gap: 8px; }
 .app-root .rail-btn { color: var(--nav-fg); padding: 12px 0; border-radius: 6px; gap: 7px; font-size: 10px; }
-.app-root .rail-btn:hover { color: var(--nav-active); background: #ffffff0d; }
-.app-root .rail-btn.active { background: #ffffff14; color: var(--nav-active); }
-.app-root .rail-btn.active::before { background: #61d3bc; left: -5px; top: 16px; bottom: 16px; }
+.app-root .rail-btn:hover { color: var(--nav-active); background: rgba(255, 255, 255, 0.05); /* 深色导航上的白色蒙版，不随主题变化 */ }
+.app-root .rail-btn.active { background: rgba(255, 255, 255, 0.08); /* 深色导航上的白色蒙版，不随主题变化 */ color: var(--nav-active); }
+.app-root .rail-btn.active::before { background: var(--nav-active); left: -5px; top: 16px; bottom: 16px; }
 .app-root .sidebar { background: var(--panel-2); }
-.app-root .sb-head { height: 48px; }
+.app-root .sb-head { height: calc(var(--tree-h) + var(--sp-2)); }
 .app-root .sb-title { font-size: 12px; letter-spacing: .04em; }
-.app-root .sb-search { margin-bottom: 14px; height: 30px; }
-.app-root .tabbar { height: 40px; background: var(--panel-2); }
+.app-root .sb-search { margin-bottom: 14px; height: var(--control-h-sm); }
+.app-root .tabbar { height: var(--tab-h); background: var(--panel-2); }
 .app-root .tab { min-width: 160px; }
 .app-root .tab.active::before { top: auto; bottom: 0; }
 .app-root .tab.active > .i { color: var(--accent); }

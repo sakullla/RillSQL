@@ -789,7 +789,7 @@ onBeforeUnmount(() => {
 .q-sql { margin: 0; white-space: pre-wrap; font-family: var(--mono); font-size: var(--fs-xs); color: var(--text-2); }
 .q-cancel-detail { margin-top: var(--sp-3); padding-top: var(--sp-2); border-top: 1px solid var(--line); font-size: var(--fs-sm); color: var(--text-2); }
 .q-cancel-detail p { margin: 0 0 var(--sp-1); }
-.query-pane .q-toolbar { background: var(--panel); min-height: 54px; }
+.query-pane .q-toolbar { background: var(--panel); min-height: var(--target-h); }
 .editor-caption { display: flex; align-items: center; gap: 20px; padding: 9px 16px; background: var(--panel-2); border-bottom: 1px solid var(--line); font-size: 10px; color: var(--text-2); }
 .editor-caption > span:first-child { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
 .editor-caption .q-hint { flex: 1; font-size: 10px; padding: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }

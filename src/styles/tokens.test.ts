@@ -132,7 +132,7 @@ describe("design tokens", () => {
     for (const name of ["--r-sm", "--r", "--r-md", "--r-lg", "--r-xl", "--r-full"]) {
       expect(tokenValue(root, name), name).toMatch(/^\d+px$/);
     }
-    for (const name of ["--titlebar-h", "--status-h", "--rail-w", "--editor-font", "--row-h", "--tree-h", "--control-h", "--control-h-sm"]) {
+    for (const name of ["--titlebar-h", "--toolbar-h", "--tab-h", "--target-h", "--result-head-h", "--hint-h", "--status-h", "--rail-w", "--editor-font", "--row-h", "--tree-h", "--control-h", "--control-h-sm"]) {
       expect(tokenValue(root, name), name).toBeTruthy();
     }
   });

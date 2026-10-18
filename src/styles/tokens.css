@@ -50,6 +50,10 @@
   /* 布局尺寸 */
   --titlebar-h: 26px;
   --toolbar-h: 36px;
+  --tab-h: 30px;
+  --target-h: 32px;
+  --result-head-h: 30px;
+  --hint-h: 24px;
   --status-h: 24px;
   --rail-w: 44px;
   --editor-font: 12px;

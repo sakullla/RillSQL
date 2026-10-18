@@ -165,7 +165,7 @@
 .app-root.sidebar-hidden .sidebar,
 .app-root.sidebar-hidden .sb-resizer { display: none; }
 #main { flex: 1 1 auto; min-width: 0; max-width: 100%; min-height: 0; overflow: hidden; display: flex; flex-direction: column; background: var(--panel); }
-.sb-head { display: flex; align-items: center; height: 38px; padding: 0 var(--sp-2) 0 var(--sp-4); flex-shrink: 0; }
+.sb-head { display: flex; align-items: center; height: calc(var(--tree-h) + var(--sp-2)); padding: 0 var(--sp-2) 0 var(--sp-4); flex-shrink: 0; }
 .sb-title { font-size: var(--fs-sm); font-weight: 600; color: var(--text-2); }
 .sb-search {
   display: flex;
@@ -192,7 +192,7 @@
 .tabbar {
   display: flex;
   align-items: stretch;
-  height: 38px;
+  height: var(--tab-h);
   min-width: 0;
   max-width: 100%;
   background: var(--chrome);
@@ -312,4 +312,5 @@
   .rail-btn span { display: none; }
   .tb-brand strong { display: none; }
   .tab { min-width: 110px; }
+  .cmd-trigger { display: none; }
 }
