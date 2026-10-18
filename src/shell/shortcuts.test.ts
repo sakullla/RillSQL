@@ -52,7 +52,8 @@ describe("shortcut ↔ menu alignment", () => {
       expect(entry, `chord ${chord} 不在快捷键表里`).toBeTruthy();
       if (entry) {
         expect(entry.menus, `${chord} 缺 menus 标注`).toBeTruthy();
-        expect(entry.menus?.some((m) => menuSet.has(m)), `${chord} 的 menus 与菜单归属不一致`).toBe(true);
+        // 双向集合相等：少标（Mod+, 只写 文件）或多标（多写 查询）都算错
+        expect(new Set(entry.menus), `${chord} 的 menus 标注与菜单实际归属不一致`).toEqual(menuSet);
       }
     }
   });
@@ -69,10 +70,27 @@ describe("ShortcutHelp grouping", () => {
     wrapper.unmount();
   });
 
-  it("lists editor shortcuts that are not in a menu under SQL 编辑器", () => {
+  it("files 补全 under the SQL 编辑器 section, not elsewhere", () => {
     const wrapper = mount(ShortcutHelp, { props: { open: true } });
-    expect(wrapper.text()).toContain("补全"); // Ctrl+Space，不在任何菜单里
-    expect(wrapper.text()).toContain("SQL 编辑器");
+    const sections = wrapper.findAll("section");
+    // DOMWrapper 不保证同一节点引用相等，用 element 做身份判断
+    const section = sections.find((s) => s.find("h4")?.text() === "SQL 编辑器");
+    expect(section, "缺少 SQL 编辑器 节").toBeTruthy();
+    expect(section!.text()).toContain("补全"); // Ctrl+Space，不在任何菜单里
+    for (const other of sections) {
+      if (other.element === section!.element) continue;
+      expect(other.text(), "补全 不应出现在别的节里").not.toContain("补全");
+    }
+    wrapper.unmount();
+  });
+
+  it("matches the menu bar order", () => {
+    const labels = shellMenus({ hasQueryTab: true }, "system").map((m) => m.label);
+    const wrapper = mount(ShortcutHelp, { props: { open: true } });
+    const titles = wrapper.findAll("h4").map((n) => n.text());
+    // 只比较同时出现在两者里的标题（编辑器/表格节不在菜单里）
+    const menuTitles = titles.filter((t) => labels.includes(t));
+    expect(menuTitles).toEqual(labels.filter((l) => menuTitles.includes(l)));
     wrapper.unmount();
   });
 });
