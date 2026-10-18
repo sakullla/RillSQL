@@ -1,12 +1,14 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, defineAsyncComponent, ref } from "vue";
 import { catalogConnections } from "../catalog/store";
 import { resolveTableTarget } from "../grid/target";
 import { targetDetail, targetKey, targetOptions, type TargetOption } from "../query/complete";
 import "../structure/structure.css";
+import { ContextMenu, type MenuItem } from "../ui";
 import Icon from "./Icon.vue";
 import type { QueryAction, QueryTarget, ShellTab } from "./session";
 import { loadSettings } from "./settings";
+import { chordByLabel } from "./shortcuts";
 import WelcomeView from "./WelcomeView.vue";
 
 const DataGrid = defineAsyncComponent(() => import("../grid/DataGrid.vue"));
@@ -17,6 +19,7 @@ const props = defineProps<{ tabs: ShellTab[]; activeId: string | null; pageSize?
 const emit = defineEmits<{
   activate: [id: string];
   close: [id: string];
+  "toggle-pin": [id: string];
   "new-query": [];
   connections: [];
   sqlite: [];
@@ -53,6 +56,7 @@ function onTarget(target: QueryTarget) {
 }
 
 const menu = ref<{ tabId: string; x: number; y: number } | null>(null);
+const menuEl = ref<HTMLElement | null>(null);
 const menuTab = computed(() => props.tabs.find((tab) => tab.id === menu.value?.tabId) ?? null);
 const menuTargets = computed(() => (menuTab.value?.kind === "query" ? targetOptions(catalogConnections()) : []));
 
@@ -70,37 +74,80 @@ function onTabKey(event: KeyboardEvent, id: string) {
   (event.currentTarget as HTMLElement).parentElement?.querySelectorAll<HTMLElement>('[role="tab"]')[next]?.focus();
 }
 
+const menuLabel = computed(() => (menuTab.value ? `${menuTab.value.title} 的操作` : "操作"));
+
+const menuItems = computed<MenuItem[]>(() => {
+  const tab = menuTab.value;
+  if (!tab) return [];
+  const items: MenuItem[] = [];
+  if (tab.kind === "query") {
+    items.push({ kind: "head", text: "选择执行目标" });
+    if (!menuTargets.value.length) items.push({ kind: "head", text: "还没有可用的连接——先在「连接」页新建一个。" });
+    menuTargets.value.forEach((option, index) => {
+      items.push({
+        kind: "item",
+        id: `bind-target:${index}`,
+        label: option.label,
+        title: targetDetail(option),
+        checked: option.key === currentTargetKey(tab),
+      });
+    });
+    items.push({ kind: "sep" });
+  } else if (tab.kind === "table") {
+    items.push(
+      { kind: "item", id: "show-data", label: "数据" },
+      { kind: "item", id: "show-structure", label: "结构" },
+      { kind: "sep" },
+    );
+  }
+  const index = props.tabs.findIndex((item) => item.id === tab.id);
+  items.push(
+    { kind: "item", id: "close", label: "关闭", danger: true, shortcut: chordByLabel("关闭当前标签") },
+    { kind: "item", id: "close-others", label: "关闭其他", danger: true, disabled: props.tabs.length < 2 },
+    { kind: "item", id: "close-right", label: "关闭右侧", danger: true, disabled: index < 0 || index >= props.tabs.length - 1 },
+    { kind: "item", id: "close-all", label: "全部关闭", danger: true },
+    { kind: "sep" },
+    { kind: "item", id: "copy-sql", label: "复制 SQL", disabled: tab.kind !== "query" || !tab.draft },
+    { kind: "item", id: "pin-toggle", label: tab.pinned ? "取消固定" : "固定", checked: tab.pinned },
+  );
+  return items;
+});
+
 function onTabBarContext(event: MouseEvent) {
   event.preventDefault();
   const node = event.target;
   if (!(node instanceof Element)) return;
-  const tabEl = node.closest(".tab");
-  if (!(tabEl instanceof HTMLElement)) {
-    menu.value = null;
+  const tabEl = node.closest<HTMLElement>(".tab");
+  if (!tabEl) {
+    closeMenu();
     return;
   }
   const tab = props.tabs.find((item) => item.id === tabEl.dataset.tabId);
   if (!tab) return;
+  // 先激活并聚焦触发标签：菜单关闭时 ContextMenu 会把焦点还回来，键盘用户不掉焦点。
   emit("activate", tab.id);
-  menu.value = {
-    tabId: tab.id,
-    x: Math.max(8, Math.min(event.clientX, window.innerWidth - 240)),
-    y: Math.max(8, Math.min(event.clientY, window.innerHeight - 48)),
-  };
+  tabEl.focus();
+  menuEl.value = tabEl;
+  menu.value = { tabId: tab.id, x: Math.max(8, event.clientX), y: Math.max(8, event.clientY) };
+}
+
+function closeMenu() {
+  menu.value = null;
 }
 
 function closeIds(ids: string[]) {
-  menu.value = null;
   for (const id of ids) emit("close", id);
 }
 
+/** 关闭其他：保留当前标签，跳过其余已固定标签。 */
 function closeOthers(id: string) {
-  closeIds(props.tabs.filter((tab) => tab.id !== id).map((tab) => tab.id));
+  closeIds(props.tabs.filter((tab) => tab.id !== id && !tab.pinned).map((tab) => tab.id));
 }
 
+/** 关闭右侧：已固定标签不在关闭范围内。 */
 function closeToTheRight(id: string) {
   const index = props.tabs.findIndex((tab) => tab.id === id);
-  closeIds(props.tabs.slice(index + 1).map((tab) => tab.id));
+  closeIds(props.tabs.slice(index + 1).filter((tab) => !tab.pinned).map((tab) => tab.id));
 }
 
 function bindTarget(tabId: string, option: TargetOption) {
@@ -111,35 +158,34 @@ function bindTarget(tabId: string, option: TargetOption) {
     engine: option.engine,
     status: option.status,
   });
-  menu.value = null;
 }
 
 function showTablePane(pane: "data" | "structure") {
   const tab = menuTab.value;
   if (!tab) return;
   emit("table-view", tab.id, pane);
-  menu.value = null;
 }
 
-function onWindowPointer(event: MouseEvent) {
-  const node = event.target;
-  if (node instanceof Element && node.closest("[data-menu=tab]")) return;
-  menu.value = null;
+function onMenuSelect(id: string) {
+  const tab = menuTab.value;
+  if (!tab) return;
+  if (id.startsWith("bind-target:")) {
+    const option = menuTargets.value[Number(id.slice("bind-target:".length))];
+    if (option) bindTarget(tab.id, option);
+    return;
+  }
+  if (id === "show-data") return showTablePane("data");
+  if (id === "show-structure") return showTablePane("structure");
+  if (id === "close") return closeIds([tab.id]);
+  if (id === "close-others") return closeOthers(tab.id);
+  if (id === "close-right") return closeToTheRight(tab.id);
+  if (id === "close-all") return closeIds(props.tabs.map((item) => item.id));
+  if (id === "copy-sql") {
+    void navigator.clipboard.writeText(tab.draft).catch(() => undefined);
+    return;
+  }
+  if (id === "pin-toggle") emit("toggle-pin", tab.id);
 }
-
-function onWindowKey(event: KeyboardEvent) {
-  if (event.key === "Escape") menu.value = null;
-}
-
-onMounted(() => {
-  window.addEventListener("mousedown", onWindowPointer);
-  window.addEventListener("keydown", onWindowKey);
-});
-
-onBeforeUnmount(() => {
-  window.removeEventListener("mousedown", onWindowPointer);
-  window.removeEventListener("keydown", onWindowKey);
-});
 </script>
 
 <template>
@@ -149,7 +195,7 @@ onBeforeUnmount(() => {
       v-for="tab in tabs"
       :key="tab.id"
       class="tab"
-      :class="{ active: tab.id === activeId }"
+      :class="{ active: tab.id === activeId, pinned: tab.pinned }"
       role="tab"
       :data-tab-id="tab.id"
       :aria-selected="tab.id === activeId"
@@ -159,6 +205,7 @@ onBeforeUnmount(() => {
       @keydown.space.prevent="emit('activate', tab.id)"
       @keydown="onTabKey($event, tab.id)"
     >
+      <Icon v-if="tab.pinned" name="pin" label="已固定" />
       <Icon :name="tab.kind === 'query' ? 'code' : 'table'" />
       <span class="tab-title">{{ tab.title }}</span>
       <span
@@ -189,6 +236,7 @@ onBeforeUnmount(() => {
       :query-action="queryAction"
       @update:draft="onDraft"
       @target="onTarget"
+      @palette="emit('palette')"
     />
     <div v-else-if="active && active.kind === 'table'" class="table-workspace">
       <div class="pane-switch" role="tablist" aria-label="表内容">
@@ -227,45 +275,15 @@ onBeforeUnmount(() => {
       @sqlite="emit('sqlite')"
     />
   </div>
-  <Teleport to="body">
-    <div
-      v-if="menu && menuTab"
-      class="menu tab-menu"
-      data-menu="tab"
-      role="menu"
-      :aria-label="`${menuTab.title} 的操作`"
-      :style="{ left: `${menu.x}px`, top: `${menu.y}px` }"
-      @mousedown.stop
-      @contextmenu.prevent
-    >
-      <template v-if="menuTab.kind === 'query'">
-        <div class="menu-head">选择执行目标</div>
-        <p v-if="!menuTargets.length" class="target-empty">还没有可用的连接——先在「连接」页新建一个。</p>
-        <button
-          v-for="option in menuTargets"
-          :key="option.key"
-          class="menu-item"
-          type="button"
-          data-action="bind-target"
-          :data-key="option.key"
-          :title="targetDetail(option)"
-          @click="bindTarget(menuTab.id, option)"
-        >
-          <span>{{ option.label }}</span>
-          <Icon v-if="option.key === currentTargetKey(menuTab)" class="check" name="check" />
-        </button>
-        <div class="menu-sep" role="separator"></div>
-      </template>
-      <template v-else-if="menuTab.kind === 'table'">
-        <button class="menu-item" type="button" data-action="show-data" @click="showTablePane('data')">数据</button>
-        <button class="menu-item" type="button" data-action="show-structure" @click="showTablePane('structure')">结构</button>
-        <div class="menu-sep" role="separator"></div>
-      </template>
-      <button class="menu-item" type="button" data-action="close-tab" @click="closeIds([menuTab.id])">关闭</button>
-      <button class="menu-item" type="button" data-action="close-others" :disabled="tabs.length < 2" @click="closeOthers(menuTab.id)">关闭其他</button>
-      <button class="menu-item" type="button" data-action="close-right" :disabled="tabs.findIndex((tab) => tab.id === menuTab.id) >= tabs.length - 1" @click="closeToTheRight(menuTab.id)">关闭右侧</button>
-      <button class="menu-item" type="button" data-action="close-all" @click="closeIds(tabs.map((tab) => tab.id))">关闭全部</button>
-    </div>
-  </Teleport>
+  <ContextMenu
+    :open="Boolean(menu)"
+    :x="menu?.x ?? 0"
+    :y="menu?.y ?? 0"
+    :items="menuItems"
+    :label="menuLabel"
+    :trigger="menuEl"
+    @close="closeMenu"
+    @select="onMenuSelect"
+  />
   </div>
 </template>

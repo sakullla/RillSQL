@@ -78,6 +78,55 @@ describe("query editing", () => {
     expect(source).not.toContain("Ctrl+Shift+Enter 执行当前语句");
   });
 
+  it("offers run, format, plan, copy, palette and clear from the editor context menu", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-ctx",
+        draft: "SELECT 1;\nSELECT 2;",
+        connectionId: null,
+        connectionName: null,
+        database: null,
+        engine: null,
+        connectionStatus: null,
+        notice: null,
+      },
+    });
+    await nextTick();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element);
+    expect(view).toBeTruthy();
+    const from = view!.state.doc.toString().indexOf("SELECT 2;");
+    view!.dispatch({ selection: { anchor: from, head: from + "SELECT 2;".length } });
+    await nextTick();
+
+    await wrapper.get(".cm-host").trigger("contextmenu", { clientX: 40, clientY: 60 });
+    await nextTick();
+    const menu = document.body.querySelector('[role="menu"]');
+    expect(menu).toBeTruthy();
+    const ids = [...menu!.querySelectorAll('[role="menuitem"]')].map((item) => item.getAttribute("data-id"));
+    expect(ids).toEqual(expect.arrayContaining(["run", "run-statement", "format", "plan", "copy", "palette", "clear"]));
+
+    menu!.querySelector<HTMLButtonElement>('[data-id="palette"]')!.click();
+    await nextTick();
+    expect(wrapper.emitted("palette")).toHaveLength(1);
+    expect(document.body.querySelector('[role="menu"]')).toBeNull();
+
+    await wrapper.get(".cm-host").trigger("contextmenu", { clientX: 40, clientY: 60 });
+    await nextTick();
+    document.body.querySelector('[role="menu"] [data-id="copy"]')!.click();
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledWith("SELECT 2;");
+
+    await wrapper.get(".cm-host").trigger("contextmenu", { clientX: 40, clientY: 60 });
+    await nextTick();
+    document.body.querySelector('[role="menu"] [data-id="clear"]')!.click();
+    await nextTick();
+    const cleared = EditorView.findFromDOM(wrapper.get(".cm-content").element);
+    expect(cleared!.state.doc.toString()).toBe("SELECT 1;\n");
+    wrapper.unmount();
+  });
+
   it("completes from the selected target and withholds failed metadata", () => {
     const [atlas, shop, , notes, analytics] = catalogFixture();
     expect(atlas && shop && notes && analytics).toBeTruthy();

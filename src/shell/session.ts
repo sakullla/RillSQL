@@ -56,6 +56,7 @@ export interface ShellTab {
   targetNotice: string | null;
   tablePane: "data" | "structure";
   structureSection: "columns" | "indexes" | "foreign" | "drop";
+  pinned?: boolean;
 }
 
 export interface ShellSession {
@@ -79,6 +80,7 @@ export interface ShellSession {
   setCloseGuard: (guard: ((id: string) => boolean) | null) => void;
   activateTab: (id: string) => void;
   closeTab: (id: string) => void;
+  toggleTabPin: (id: string) => void;
   toggleSidebar: () => void;
   openPalette: (mode?: "all" | "tables") => void;
   closePalette: () => void;
@@ -243,6 +245,12 @@ export function createSession(initialHash = ""): ShellSession {
     }
   }
 
+  function toggleTabPin(id: string) {
+    const tab = tabs.value.find((item) => item.id === id);
+    if (!tab) return;
+    tab.pinned = !tab.pinned;
+  }
+
   function toggleSidebar() {
     if (page.value !== "workspace") {
       showPage("workspace");
@@ -296,6 +304,7 @@ export function createSession(initialHash = ""): ShellSession {
     setCloseGuard,
     activateTab,
     closeTab,
+    toggleTabPin,
     toggleSidebar,
     openPalette,
     closePalette,

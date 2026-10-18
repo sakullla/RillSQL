@@ -20,6 +20,7 @@ import { loadSettings } from "../shell/settings";
 import { chordByLabel, detectMac, formatChord } from "../shell/shortcuts";
 import { CONNECTION_STATUS_TEXT, type ConnectionStatus } from "../shell/status-text";
 import type { QueryAction, QueryTarget } from "../shell/session";
+import { ContextMenu, type MenuItem } from "../ui";
 import { ambiguousFieldNote, cachedColumns, fieldFailureNote, loadFields, qualifierFor, unknownFieldNote } from "./columns";
 import { completionPlan, connectionById, metadataNote, targetDetail, targetKey, targetOptions, type TargetOption } from "./complete";
 import { resolveEditor } from "./editor";
@@ -44,6 +45,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   "update:draft": [tabId: string, draft: string];
   target: [target: QueryTarget];
+  palette: [];
 }>();
 
 /** 提示里的按键文案从快捷键表推导，macOS 显示 ⌘ 而不是硬编码的 Ctrl。 */
@@ -472,6 +474,52 @@ function locateInEditor(sqlText: string) {
   editor.focus();
 }
 
+const editorMenu = ref<{ x: number; y: number } | null>(null);
+
+function onEditorContextMenu(event: MouseEvent) {
+  mountEditor();
+  editorMenu.value = { x: Math.max(8, event.clientX), y: Math.max(8, event.clientY) };
+}
+
+const editorMenuItems = computed<MenuItem[]>(() => [
+  { kind: "item", id: "run", label: "执行选中内容；无选中时执行光标所在语句", shortcut: chordByLabel("执行选中内容；无选中时执行光标所在语句") },
+  { kind: "item", id: "run-statement", label: "只执行光标所在语句", shortcut: chordByLabel("只执行光标所在语句") },
+  { kind: "sep" },
+  { kind: "item", id: "format", label: "格式化 SQL", shortcut: chordByLabel("格式化选中的 SQL；无选中时格式化全部") },
+  { kind: "item", id: "plan", label: "执行计划", shortcut: chordByLabel("查看当前语句的执行计划") },
+  { kind: "item", id: "copy", label: hasSelection.value ? "复制选中内容" : "复制" },
+  { kind: "sep" },
+  { kind: "item", id: "palette", label: "命令面板", shortcut: chordByLabel("命令面板（表、连接、命令）") },
+  { kind: "item", id: "clear", label: "清除编辑器" },
+]);
+
+function onEditorMenuSelect(id: string) {
+  if (id === "run") return void execute("auto");
+  if (id === "run-statement") return void execute("current");
+  if (id === "format") return formatEditor();
+  if (id === "plan") return void requestPlan();
+  if (id === "copy") {
+    mountEditor();
+    const editor = view;
+    if (!editor) return;
+    const range = editor.state.selection.main;
+    const text = range.from === range.to ? editor.state.doc.toString() : editor.state.sliceDoc(range.from, range.to);
+    void navigator.clipboard.writeText(text).catch(() => undefined);
+    return;
+  }
+  if (id === "palette") return emit("palette");
+  if (id === "clear") {
+    mountEditor();
+    const editor = view;
+    if (!editor) return;
+    const range = editor.state.selection.main;
+    const from = Math.min(range.from, range.to);
+    const to = Math.max(range.from, range.to);
+    if (from === to) editor.dispatch({ changes: { from: 0, to: editor.state.doc.length, insert: "" } });
+    else editor.dispatch({ changes: { from, to, insert: "" } });
+  }
+}
+
 function toggleMenu() {
   if (running.value || submitting.value) return;
   menuOpen.value = !menuOpen.value;
@@ -668,7 +716,7 @@ onBeforeUnmount(() => {
     <p v-if="notice" class="q-banner">{{ notice }}</p>
     <p v-if="actionError" class="q-banner" role="alert">{{ actionError }}</p>
     <div class="editor-caption"><span><Icon name="code" /> SQL 编辑器</span><span class="q-hint" :data-keywords-only="hint.keywordsOnly" :title="hint.note">{{ hint.note }}</span><span class="mono">{{ buttonEngine ? engineMeta(buttonEngine).label : 'SQL' }}</span></div>
-    <div ref="host" class="cm-host"></div>
+    <div ref="host" class="cm-host" @contextmenu.prevent="onEditorContextMenu"></div>
     <div class="editor-position"><span>{{ hasSelection ? '已选中 SQL · 执行将仅运行选中部分' : `${runChordText} 执行光标所在语句 · ${runStatementChordText} 执行当前语句` }}</span><span class="mono">Ln {{ cursor.line }}, Col {{ cursor.column }}</span></div>
     <div class="query-splitter" role="separator" tabindex="0" aria-label="调整编辑器与结果区域高度" aria-orientation="horizontal" :aria-valuenow="editorPercent" :aria-valuemin="20" :aria-valuemax="70" @pointerdown="resizeEditor" @keydown.up.prevent="editorPercent = Math.max(20, editorPercent - 5)" @keydown.down.prevent="editorPercent = Math.min(70, editorPercent + 5)"><span></span></div>
     <section class="q-results" aria-label="执行结果">
@@ -733,6 +781,16 @@ onBeforeUnmount(() => {
         </details>
       </template>
     </section>
+    <ContextMenu
+      :open="Boolean(editorMenu)"
+      :x="editorMenu?.x ?? 0"
+      :y="editorMenu?.y ?? 0"
+      :items="editorMenuItems"
+      label="编辑器操作"
+      :trigger="host"
+      @close="editorMenu = null"
+      @select="onEditorMenuSelect"
+    />
   </section>
 </template>
 

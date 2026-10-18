@@ -31,9 +31,21 @@ function contextMenu(target: Element, x = 40, y = 28): MouseEvent {
 }
 
 function tabMenu(): HTMLElement {
-  const menu = document.body.querySelector("[data-menu=tab]");
+  const menu = document.body.querySelector(".menu[role=menu]");
   expect(menu).toBeTruthy();
   return menu as HTMLElement;
+}
+
+function menuItem(id: string): HTMLButtonElement | null {
+  return document.body.querySelector(`[role="menu"] [data-id="${id}"]`);
+}
+
+function menuItemIds(): (string | null)[] {
+  return [...document.body.querySelectorAll('[role="menu"] [role="menuitem"]')].map((item) => item.getAttribute("data-id"));
+}
+
+function closeTabMenu() {
+  document.body.querySelector('[role="menu"]')?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
 }
 
 function postgresCatalog(): CatalogConnection {
@@ -224,7 +236,7 @@ describe("workspace tab identity", () => {
     await vi.dynamicImportSettled();
     await flushPromises();
     expect(plus.defaultPrevented).toBe(true);
-    expect(document.body.querySelector("[data-menu=tab]")).toBeNull();
+    expect(document.body.querySelector(".menu[role=menu]")).toBeNull();
 
     const first = wrapper.findAll(".tab")[0]!;
     expect(first.get(".tab-target").text()).toBe("未选择连接");
@@ -239,13 +251,15 @@ describe("workspace tab identity", () => {
     expect(menu.textContent).toContain("127.0.0.1 / rillsql");
     expect(menu.textContent).toContain("127.0.0.1 / postgres");
     expect(menu.textContent).toContain("关闭其他");
-    expect(menu.querySelector<HTMLButtonElement>("[data-action=close-right]")?.disabled).toBe(false);
+    expect(menu.querySelector<HTMLButtonElement>("[data-id=close-right]")?.disabled).toBe(false);
 
-    menu.querySelector<HTMLButtonElement>("[data-action=bind-target]")?.click();
+    const bind = [...menu.querySelectorAll<HTMLButtonElement>("button.menu-item")].find((item) => item.textContent?.includes("127.0.0.1 / rillsql"));
+    expect(bind).toBeTruthy();
+    bind!.click();
     await nextTick();
     await vi.dynamicImportSettled();
     await flushPromises();
-    expect(document.body.querySelector("[data-menu=tab]")).toBeNull();
+    expect(document.body.querySelector(".menu[role=menu]")).toBeNull();
     expect(wrapper.findAll(".tab")[0]!.get(".tab-target").text()).toBe("127.0.0.1 / rillsql");
     expect(wrapper.get(".statusbar").text()).toContain("127.0.0.1 / rillsql");
     expect(wrapper.get(".statusbar").text()).toContain("已连接");
@@ -255,9 +269,9 @@ describe("workspace tab identity", () => {
     await vi.dynamicImportSettled();
     await flushPromises();
     const rebound = tabMenu();
-    const picked = rebound.querySelector("[data-key]") as HTMLElement | null;
+    const picked = rebound.querySelector('[data-id^="bind-target"]');
     expect(picked?.querySelector(".check")).toBeTruthy();
-    rebound.querySelector<HTMLButtonElement>("[data-action=close-others]")?.click();
+    menuItem("close-others")!.click();
     await nextTick();
     await vi.dynamicImportSettled();
     await flushPromises();
@@ -269,12 +283,12 @@ describe("workspace tab identity", () => {
     await nextTick();
     await vi.dynamicImportSettled();
     await flushPromises();
-    expect(tabMenu().querySelector<HTMLButtonElement>("[data-action=close-others]")?.disabled).toBe(true);
-    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    expect(menuItem("close-others")?.disabled).toBe(true);
+    closeTabMenu();
     await nextTick();
     await vi.dynamicImportSettled();
     await flushPromises();
-    expect(document.body.querySelector("[data-menu=tab]")).toBeNull();
+    expect(document.body.querySelector(".menu[role=menu]")).toBeNull();
     wrapper.unmount();
   });
 
@@ -295,11 +309,11 @@ describe("workspace tab identity", () => {
     expect(menu.textContent).toContain("数据");
     expect(menu.textContent).toContain("结构");
     expect(menu.textContent).not.toContain("选择执行目标");
-    menu.querySelector<HTMLButtonElement>("[data-action=show-structure]")?.click();
+    menuItem("show-structure")!.click();
     await nextTick();
     await vi.dynamicImportSettled();
     await flushPromises();
-    expect(document.body.querySelector("[data-menu=tab]")).toBeNull();
+    expect(document.body.querySelector(".menu[role=menu]")).toBeNull();
     expect(wrapper.get("[aria-label='表结构']").attributes("data-tab-id")).toBe("table:customers");
     expect(wrapper.find("[aria-label='数据表格']").exists()).toBe(false);
 
@@ -307,11 +321,139 @@ describe("workspace tab identity", () => {
     await nextTick();
     await vi.dynamicImportSettled();
     await flushPromises();
-    tabMenu().querySelector<HTMLButtonElement>("[data-action=show-data]")?.click();
+    menuItem("show-data")!.click();
     await nextTick();
     await vi.dynamicImportSettled();
     await flushPromises();
     expect(wrapper.get("[aria-label='数据表格']").attributes("data-tab-id")).toBe("table:customers");
+    wrapper.unmount();
+  });
+});
+
+describe("workspace tab context menu", () => {
+  it("offers close, pin and copy actions on the tab menu", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const wrapper = mount(AppShell);
+    await openCommand(wrapper, "新建查询");
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    await replaceDraft(wrapper, "SELECT copy-me");
+
+    contextMenu(wrapper.get(".tab.active").element);
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    expect(menuItemIds()).toEqual(expect.arrayContaining(["close", "close-others", "close-right", "close-all", "copy-sql", "pin-toggle"]));
+    expect(menuItem("copy-sql")?.disabled).toBe(false);
+    menuItem("copy-sql")!.click();
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledWith("SELECT copy-me");
+    expect(document.body.querySelector(".menu[role=menu]")).toBeNull();
+
+    contextMenu(wrapper.get(".tab.active").element);
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    expect(menuItem("pin-toggle")?.textContent).toBe("固定");
+    expect(menuItem("pin-toggle")?.getAttribute("aria-checked")).not.toBe("true");
+    menuItem("pin-toggle")!.click();
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    const pinned = wrapper.get(".tab.active");
+    expect(pinned.classes()).toContain("pinned");
+    expect(pinned.find('svg[aria-label="已固定"]').exists()).toBe(true);
+
+    contextMenu(pinned.element);
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    expect(menuItem("pin-toggle")?.textContent).toBe("取消固定");
+    expect(menuItem("pin-toggle")?.getAttribute("aria-checked")).toBe("true");
+    menuItem("pin-toggle")!.click();
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    expect(wrapper.get(".tab.active").classes()).not.toContain("pinned");
+    expect(wrapper.get(".tab.active").find('svg[aria-label="已固定"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("keeps pinned tabs when closing others or to the right", async () => {
+    const wrapper = mount(AppShell);
+    await openCommand(wrapper, "新建查询");
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    await wrapper.get(".tab-new").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    await wrapper.get(".tab-new").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    expect(wrapper.findAll(".tab")).toHaveLength(3);
+    const titles = () => wrapper.findAll(".tab .tab-title").map((item) => item.text());
+
+    // 固定第 1、3 个标签
+    contextMenu(wrapper.findAll(".tab")[0]!.element);
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    menuItem("pin-toggle")!.click();
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    contextMenu(wrapper.findAll(".tab")[2]!.element);
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    menuItem("pin-toggle")!.click();
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    expect(wrapper.findAll(".tab.pinned")).toHaveLength(2);
+
+    // 对固定的第 1 个执行关闭其他：另一个固定的保留，未固定的第 2 个关闭
+    contextMenu(wrapper.findAll(".tab")[0]!.element);
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    menuItem("close-others")!.click();
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    expect(titles()).toEqual(["查询 1", "查询 3"]);
+
+    // 对第 1 个执行关闭右侧：第 3 个已固定，跳过不关
+    contextMenu(wrapper.findAll(".tab")[0]!.element);
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    expect(menuItem("close-right")?.disabled).toBe(false);
+    menuItem("close-right")!.click();
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    expect(titles()).toEqual(["查询 1", "查询 3"]);
+
+    // 取消固定第 3 个后再关闭右侧：这次关掉
+    contextMenu(wrapper.findAll(".tab")[1]!.element);
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    menuItem("pin-toggle")!.click();
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    contextMenu(wrapper.findAll(".tab")[0]!.element);
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    menuItem("close-right")!.click();
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    expect(titles()).toEqual(["查询 1"]);
     wrapper.unmount();
   });
 });

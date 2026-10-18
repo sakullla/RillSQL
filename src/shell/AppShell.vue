@@ -434,6 +434,7 @@ onBeforeUnmount(() => {
           :query-action="session.pendingQueryAction.value"
           @activate="session.activateTab"
           @close="session.closeTab"
+          @toggle-pin="session.toggleTabPin"
           @new-query="session.openQuery()"
           @connections="session.showPage('connections')"
           @sqlite="requestSqlite()"
