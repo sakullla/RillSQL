@@ -128,7 +128,8 @@ try {
       await page.addInitScript(installSyntheticIpc, theme);
       try {
         await page.goto(previewUrl);
-        await page.getByRole("button", { name: "新建查询", exact: true }).waitFor();
+        // P2 起主工具栏与欢迎页主路径都有「新建查询」，限定到工具栏避免 strict mode 重名。
+        await page.getByRole("toolbar", { name: "主工具栏" }).getByRole("button", { name: "新建查询", exact: true }).waitFor();
         await expect(page.locator(".desk-db")).toHaveCount(0);
         await captureImage(page, "welcome", theme, width, "已有连接时内容区不列连接卡片，对象树仍是连接名单");
 
@@ -157,13 +158,15 @@ try {
 
         await openWorkspace(page);
         await collapseOverlay(page, width);
-        await page.getByRole("button", { name: "新建查询" }).click();
+        // 同上：作用域到主工具栏，避免与查询面板/欢迎页同名控件冲突。
+        await page.getByRole("toolbar", { name: "主工具栏" }).getByRole("button", { name: "新建查询", exact: true }).click();
         await collapseOverlay(page, width);
         await page.locator("[data-action='target']").click();
         await page.getByRole("listbox", { name: "执行目标" }).getByRole("option", { name: /书店 · 开发.*bookstore/ }).click();
         await page.locator(".cm-content").click();
         await page.keyboard.insertText("select id, customer, status, total\nfrom orders\nwhere status <> 'cancelled';");
-        await page.locator("[data-action='run']").click();
+        // P2 后工具栏也有 data-action=run，限定到查询面板与 Task 7 的 verify 脚本一致。
+        await page.locator(".query-pane [data-action='run']").click();
         await expect(page.getByLabel("执行结果")).toContainText("林夏");
         await captureImage(page, "query", theme, width, "选择执行目标后的查询结果");
 
