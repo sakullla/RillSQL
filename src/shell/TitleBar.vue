@@ -82,7 +82,8 @@ watch(
 <style scoped>
 .tb-row { display: flex; align-items: center; gap: var(--sp-2); padding: 0 var(--sp-2); min-width: 0; }
 .tb-menu-row { height: var(--titlebar-h); }
-.tb-tool-row { height: var(--toolbar-h); border-top: 1px solid var(--line); }
+/* border-box 下固定高度 + 实体 border 会把内容盒压掉 1px，子行被压缩；分隔线用 inset 阴影表达 */
+.tb-tool-row { height: var(--toolbar-h); box-shadow: inset 0 1px 0 var(--line); }
 .cmd-trigger {
   display: flex; align-items: center; gap: var(--sp-2); width: 300px; height: var(--control-h-sm);
   padding: 0 var(--sp-2); border-radius: var(--r); background: var(--panel-2);

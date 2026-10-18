@@ -41,4 +41,14 @@ describe("shell geometry", () => {
     expect(query).toMatch(/height: var\(--hint-h\)/);
     expect(query).toMatch(/flex-wrap: nowrap/);
   });
+
+  it("chrome strips do not pair a fixed token height with a physical border", () => {
+    const titleBar = readFileSync(resolve(here, "../shell/TitleBar.vue"), "utf8");
+    const shell = readFileSync(resolve(here, "shell.css"), "utf8");
+    // 固定高度 + 实体边框在 border-box 下会吃掉内容 1px；分隔线必须用 inset 阴影
+    expect(titleBar).not.toMatch(/height:\s*var\(--toolbar-h\)[^}]*border-(top|bottom):\s*1px/);
+    expect(titleBar).toMatch(/box-shadow:\s*inset 0 1px 0 var\(--line\)/);
+    expect(shell).not.toMatch(/\.tabbar\s*\{[^}]*border-(bottom|top):\s*1px/);
+    expect(shell).toMatch(/\.tabbar\s*\{[^}]*box-shadow:\s*inset 0 -1px 0 var\(--line\)/);
+  });
 });
