@@ -1,12 +1,14 @@
 //! 在已经打开的 catalog session 上执行 SQL。不新开执行用的数据库连接。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use futures::TryStreamExt;
 use mysql_async::prelude::Queryable;
 use sqlx::Column;
 use sqlx::Row;
+use sqlx::TypeInfo;
+use sqlx::ValueRef;
 
 use crate::connections::CancelTransport;
 use crate::connections::CatalogSession;
@@ -17,6 +19,7 @@ use super::split::{self, is_write, Piece};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatementValue {
     pub columns: Vec<String>,
+    pub column_types: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
     pub truncated: bool,
     pub affected: Option<u64>,
@@ -35,6 +38,7 @@ pub struct StatementReport {
     pub status: &'static str,
     pub message: String,
     pub columns: Vec<String>,
+    pub column_types: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
     pub truncated: bool,
     pub affected: Option<u64>,
@@ -154,6 +158,7 @@ pub async fn run_batch(parts: &[Piece], limit: usize, cancel_flag: &Arc<AtomicBo
                     status: "ok",
                     message: String::new(),
                     columns: value.columns,
+                    column_types: value.column_types,
                     rows: value.rows,
                     truncated: value.truncated,
                     affected: value.affected,
@@ -191,6 +196,7 @@ pub async fn run_batch(parts: &[Piece], limit: usize, cancel_flag: &Arc<AtomicBo
                     status: statement_status,
                     message,
                     columns: Vec::new(),
+                    column_types: Vec::new(),
                     rows: Vec::new(),
                     truncated: false,
                     affected: None,
@@ -224,9 +230,152 @@ fn skipped(sql: String, message: &str) -> StatementReport {
         status: "skipped",
         message: message.to_owned(),
         columns: Vec::new(),
+        column_types: Vec::new(),
         rows: Vec::new(),
         truncated: false,
         affected: None,
+    }
+}
+
+/// 把同一次结果流按块交给调用方。不负责再执行语句。
+#[async_trait::async_trait]
+pub trait RowSink: Send + Sync {
+    async fn publish(&self, index: usize, value: &StatementValue);
+    async fn pause(&self, cancel: &AtomicBool) -> Result<(), String>;
+}
+
+pub struct NopSink;
+
+#[async_trait::async_trait]
+impl RowSink for NopSink {
+    async fn publish(&self, _index: usize, _value: &StatementValue) {}
+
+    async fn pause(&self, _cancel: &AtomicBool) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// 继续读取用的唤醒。先登记等待再看标志，避免通知发生在等待之前。
+pub struct Pace {
+    notify: tokio::sync::Notify,
+    want: AtomicBool,
+    generation: AtomicU64,
+    done: AtomicBool,
+}
+
+impl Pace {
+    pub fn new() -> Self {
+        Self {
+            notify: tokio::sync::Notify::new(),
+            want: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            done: AtomicBool::new(false),
+        }
+    }
+
+    pub fn request(&self) {
+        self.want.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    pub fn kick(&self) {
+        self.notify.notify_waiters();
+    }
+
+    pub fn finish(&self) {
+        self.done.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    pub fn bump(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    pub async fn wait_changed(&self, before: u64) {
+        loop {
+            if self.generation() != before || self.done.load(Ordering::SeqCst) {
+                return;
+            }
+            let notified = self.notify.notified();
+            if self.generation() != before || self.done.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn wait_continue(&self, cancel: &AtomicBool) -> Result<(), String> {
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return Err("已取消".to_owned());
+            }
+            let notified = self.notify.notified();
+            if cancel.load(Ordering::SeqCst) {
+                return Err("已取消".to_owned());
+            }
+            if self.want.swap(false, Ordering::SeqCst) {
+                return Ok(());
+            }
+            if self.done.load(Ordering::SeqCst) {
+                return Err("已取消".to_owned());
+            }
+            notified.await;
+        }
+    }
+}
+
+fn chunk_rows(limit: usize) -> usize {
+    if limit <= 8 { limit.max(1) } else { (limit / 2).max(1) }
+}
+
+async fn reveal_rows(
+    sink: &dyn RowSink,
+    index: usize,
+    columns: Vec<String>,
+    column_types: Vec<String>,
+    rows: Vec<Vec<Option<String>>>,
+    truncated: bool,
+    affected: Option<u64>,
+    limit: usize,
+    cancel: &AtomicBool,
+) -> Result<StatementValue, String> {
+    let step = chunk_rows(limit);
+    if rows.is_empty() {
+        let value = StatementValue {
+            columns,
+            column_types,
+            rows,
+            truncated: false,
+            affected,
+        };
+        sink.publish(index, &value).await;
+        return Ok(value);
+    }
+    let mut shown = 0usize;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("已取消".to_owned());
+        }
+        let next = (shown + step).min(rows.len());
+        let done = next == rows.len();
+        let value = StatementValue {
+            columns: columns.clone(),
+            column_types: column_types.clone(),
+            rows: rows[..next].to_vec(),
+            truncated: truncated && done,
+            affected: if done { affected } else { None },
+        };
+        sink.publish(index, &value).await;
+        shown = next;
+        if done {
+            return Ok(value);
+        }
+        sink.pause(cancel).await?;
     }
 }
 
@@ -240,6 +389,9 @@ enum Attached {
 pub struct LiveDriver {
     session: tokio::sync::Mutex<Attached>,
     transport: CancelTransport,
+    engine: String,
+    sink: Arc<dyn RowSink>,
+    statement_index: AtomicUsize,
 }
 
 impl LiveDriver {
@@ -271,19 +423,27 @@ impl LiveDriver {
         Ok(Self {
             session: tokio::sync::Mutex::new(attached),
             transport,
+            engine: engine.to_owned(),
+            sink: Arc::new(NopSink),
+            statement_index: AtomicUsize::new(0),
         })
+    }
+
+    pub fn set_sink(&mut self, sink: Arc<dyn RowSink>) {
+        self.sink = sink;
     }
 }
 
 #[async_trait::async_trait]
 impl StatementDriver for LiveDriver {
     async fn run(&self, sql: &str, limit: usize, cancel: &Arc<AtomicBool>) -> Result<StatementValue, StatementStop> {
+        let index = self.statement_index.fetch_add(1, Ordering::SeqCst);
         let mut attached = self.session.lock().await;
         let result = match &mut *attached {
             Attached::Scripted => Err("这个连接没有连着可查询的数据库".to_owned()),
-            Attached::Sqlite(pool) => sqlite_run(pool, sql, limit, cancel).await,
-            Attached::Mysql(conn) => mysql_run(conn, &self.transport, sql, limit).await,
-            Attached::Postgres(client) => postgres_run(client, sql, limit).await,
+            Attached::Sqlite(pool) => sqlite_run(pool, &self.engine, sql, limit, cancel, self.sink.as_ref(), index).await,
+            Attached::Mysql(conn) => mysql_run(conn, &self.transport, &self.engine, sql, limit, cancel, self.sink.as_ref(), index).await,
+            Attached::Postgres(client) => postgres_run(client, &self.engine, sql, limit, cancel, self.sink.as_ref(), index).await,
         };
         result.map_err(|message| classify_failure(sql, message, cancel.load(Ordering::SeqCst)))
     }
@@ -312,53 +472,112 @@ fn quote_mysql(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
-async fn sqlite_run(pool: &sqlx::SqlitePool, sql: &str, limit: usize, cancel: &Arc<AtomicBool>) -> Result<StatementValue, String> {
+async fn sqlite_run(
+    pool: &sqlx::SqlitePool,
+    engine: &str,
+    sql: &str,
+    limit: usize,
+    cancel: &Arc<AtomicBool>,
+    sink: &dyn RowSink,
+    index: usize,
+) -> Result<StatementValue, String> {
     let mut conn = pool.acquire().await.map_err(|err| err.to_string())?;
     let watched = Arc::clone(cancel);
     conn.lock_handle()
         .await
         .map_err(|err| err.to_string())?
         .set_progress_handler(64, move || !watched.load(Ordering::SeqCst));
-    let outcome = sqlite_dispatch(&mut conn, sql, limit).await;
+    let outcome = sqlite_dispatch(&mut conn, engine, sql, limit, cancel, sink, index).await;
     if let Ok(mut handle) = conn.lock_handle().await {
         handle.remove_progress_handler();
     }
     outcome
 }
 
-async fn sqlite_dispatch(conn: &mut sqlx::SqliteConnection, sql: &str, limit: usize) -> Result<StatementValue, String> {
-    let safe = sqlx::AssertSqlSafe(sql.to_owned());
+async fn sqlite_dispatch(
+    conn: &mut sqlx::SqliteConnection,
+    engine: &str,
+    sql: &str,
+    limit: usize,
+    cancel: &Arc<AtomicBool>,
+    sink: &dyn RowSink,
+    index: usize,
+) -> Result<StatementValue, String> {
+    let safe = sqlx::AssertSqlSafe(cap_result_sql(engine, sql, limit));
     if looks_like_rows(sql) {
         let mut stream = sqlx::query(safe).fetch(&mut *conn);
         let mut columns = Vec::new();
+        let mut column_types = Vec::new();
         let mut rows = Vec::new();
         let mut truncated = false;
-        while let Some(row) = stream.try_next().await.map_err(|err| err.to_string())? {
+        let mut pending: Option<sqlx::sqlite::SqliteRow> = None;
+        let step = chunk_rows(limit);
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                drop(stream);
+                return Err("已取消".to_owned());
+            }
+            let row = if let Some(row) = pending.take() {
+                row
+            } else {
+                match stream.try_next().await.map_err(|err| err.to_string())? {
+                    Some(row) => row,
+                    None => break,
+                }
+            };
             if columns.is_empty() {
                 columns = row.columns().iter().map(|column| column.name().to_owned()).collect();
+                column_types = sqlite_type_names(&row);
             }
             if rows.len() >= limit {
                 truncated = true;
                 break;
             }
-            let cells = (0..columns.len()).map(|index| sqlite_text(&row, index)).collect();
-            rows.push(cells);
+            let width = columns.len();
+            rows.push((0..width).map(|cell| sqlite_text(&row, cell)).collect());
+            if rows.len() < limit && rows.len() % step == 0 {
+                let peek = stream.try_next().await.map_err(|err| err.to_string())?;
+                let partial = StatementValue {
+                    columns: columns.clone(),
+                    column_types: column_types.clone(),
+                    rows: rows.clone(),
+                    truncated: false,
+                    affected: None,
+                };
+                sink.publish(index, &partial).await;
+                match peek {
+                    None => {
+                        drop(stream);
+                        return Ok(partial);
+                    }
+                    Some(next) => {
+                        sink.pause(cancel).await?;
+                        pending = Some(next);
+                    }
+                }
+            }
         }
         drop(stream);
-        return Ok(StatementValue {
+        let value = StatementValue {
             columns,
+            column_types,
             rows,
             truncated,
             affected: None,
-        });
+        };
+        sink.publish(index, &value).await;
+        return Ok(value);
     }
     let done = sqlx::query(safe).execute(&mut *conn).await.map_err(|err| err.to_string())?;
-    Ok(StatementValue {
+    let value = StatementValue {
         columns: Vec::new(),
+        column_types: Vec::new(),
         rows: Vec::new(),
         truncated: false,
         affected: Some(done.rows_affected()),
-    })
+    };
+    sink.publish(index, &value).await;
+    Ok(value)
 }
 
 fn looks_like_rows(sql: &str) -> bool {
@@ -368,185 +587,306 @@ fn looks_like_rows(sql: &str) -> bool {
     )
 }
 
-fn sqlite_text(row: &sqlx::sqlite::SqliteRow, index: usize) -> Option<String> {
-    if let Ok(value) = row.try_get::<Option<String>, _>(index) {
-        return value;
-    }
-    if let Ok(value) = row.try_get::<Option<i64>, _>(index) {
-        return value.map(|number| number.to_string());
-    }
-    if let Ok(value) = row.try_get::<Option<f64>, _>(index) {
-        return value.map(|number| number.to_string());
-    }
-    if let Ok(value) = row.try_get::<Option<Vec<u8>>, _>(index) {
-        return value.map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-    }
-    None
+fn sqlite_type_names(row: &sqlx::sqlite::SqliteRow) -> Vec<String> {
+    row.columns()
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let declared = column.type_info().name();
+            if declared.is_empty() || declared == "NULL" {
+                sqlite_storage_name(row, index).unwrap_or_else(|| "类型未知".to_owned())
+            } else {
+                declared.to_owned()
+            }
+        })
+        .collect()
 }
 
-async fn mysql_run(conn: &mut mysql_async::Conn, transport: &CancelTransport, sql: &str, limit: usize) -> Result<StatementValue, String> {
+fn sqlite_storage_name(row: &sqlx::sqlite::SqliteRow, index: usize) -> Option<String> {
+    let raw = row.try_get_raw(index).ok()?;
+    let name = raw.type_info().name().to_owned();
+    drop(raw);
+    if name.is_empty() || name == "NULL" { None } else { Some(name) }
+}
+
+fn sqlite_text(row: &sqlx::sqlite::SqliteRow, index: usize) -> Option<String> {
+    let storage = {
+        let raw = row.try_get_raw(index).ok()?;
+        let name = raw.type_info().name().to_owned();
+        drop(raw);
+        name
+    };
+    match storage.as_str() {
+        "NULL" => None,
+        "INTEGER" | "INT4" | "BOOLEAN" => {
+            if let Ok(value) = row.try_get::<Option<i64>, _>(index) {
+                return value.map(|number| number.to_string());
+            }
+            row.try_get::<Option<String>, _>(index).ok().flatten()
+        }
+        "BLOB" => row.try_get::<Option<Vec<u8>>, _>(index).ok().flatten().map(to_hex),
+        _ => row.try_get::<Option<String>, _>(index).ok().flatten(),
+    }
+}
+
+fn to_hex(bytes: Vec<u8>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+async fn mysql_run(
+    conn: &mut mysql_async::Conn,
+    transport: &CancelTransport,
+    engine: &str,
+    sql: &str,
+    limit: usize,
+    cancel: &Arc<AtomicBool>,
+    sink: &dyn RowSink,
+    index: usize,
+) -> Result<StatementValue, String> {
     if let Ok(Some(id)) = conn.query_first::<u64, _>("SELECT CONNECTION_ID()").await {
         transport.set_mysql_connection_id(id);
     }
-    let bounded = cap_result_sql(sql, limit);
+    let bounded = cap_result_sql(engine, sql, limit);
     let mut result = conn.query_iter(bounded).await.map_err(|err| err.to_string())?;
-    let columns: Vec<String> = result.columns_ref().iter().map(|column| column.name_str().into_owned()).collect();
+    let column_meta: Vec<(String, mysql_async::consts::ColumnType)> = result
+        .columns_ref()
+        .iter()
+        .map(|column| (column.name_str().into_owned(), column.column_type()))
+        .collect();
+    let columns: Vec<String> = column_meta.iter().map(|column| column.0.clone()).collect();
+    let column_types: Vec<String> = column_meta.iter().map(|column| mysql_type_name(column.1).to_owned()).collect();
     if columns.is_empty() {
         let affected = result.affected_rows();
         // OK 包没有行。收掉这个结果集，同一条连接才能执行下一条。
         result.drop_result().await.map_err(|err| err.to_string())?;
-        return Ok(StatementValue {
+        let value = StatementValue {
             columns,
+            column_types,
             rows: Vec::new(),
             truncated: false,
             affected: Some(affected),
-        });
+        };
+        sink.publish(index, &value).await;
+        return Ok(value);
     }
     let mut rows = Vec::new();
     let mut truncated = false;
-    while let Some(row) = result.next().await.map_err(|err| err.to_string())? {
+    let mut pending: Option<mysql_async::Row> = None;
+    let step = chunk_rows(limit);
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            let _ = result.drop_result().await;
+            return Err("已取消".to_owned());
+        }
+        let row = if let Some(row) = pending.take() {
+            row
+        } else {
+            match result.next().await.map_err(|err| err.to_string())? {
+                Some(row) => row,
+                None => break,
+            }
+        };
         if rows.len() >= limit {
             truncated = true;
             break;
         }
         let cells = (0..columns.len())
-            .map(|index| mysql_cell(row.as_ref(index).unwrap_or(&mysql_async::Value::NULL)))
+            .map(|cell| mysql_cell(row.as_ref(cell).unwrap_or(&mysql_async::Value::NULL), column_meta[cell].1))
             .collect();
         rows.push(cells);
+        if rows.len() < limit && rows.len() % step == 0 {
+            let peek = result.next().await.map_err(|err| err.to_string())?;
+            let partial = StatementValue {
+                columns: columns.clone(),
+                column_types: column_types.clone(),
+                rows: rows.clone(),
+                truncated: false,
+                affected: None,
+            };
+            sink.publish(index, &partial).await;
+            match peek {
+                None => return Ok(partial),
+                Some(next) => {
+                    sink.pause(cancel).await?;
+                    pending = Some(next);
+                }
+            }
+        }
     }
     if truncated {
         // LIMIT 已让服务器停住；再读一次只是收结束包，不是把剩余行读完。
         let _ = result.next().await.map_err(|err| err.to_string())?;
     }
-    Ok(StatementValue {
+    let value = StatementValue {
         columns,
+        column_types,
         rows,
         truncated,
         affected: None,
-    })
+    };
+    sink.publish(index, &value).await;
+    Ok(value)
 }
 
-fn mysql_cell(value: &mysql_async::Value) -> Option<String> {
+fn mysql_type_name(kind: mysql_async::consts::ColumnType) -> &'static str {
+    use mysql_async::consts::ColumnType::*;
+    match kind {
+        MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL => "DECIMAL",
+        MYSQL_TYPE_TINY => "TINYINT",
+        MYSQL_TYPE_SHORT => "SMALLINT",
+        MYSQL_TYPE_LONG => "INT",
+        MYSQL_TYPE_FLOAT => "FLOAT",
+        MYSQL_TYPE_DOUBLE => "DOUBLE",
+        MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_TIMESTAMP2 => "TIMESTAMP",
+        MYSQL_TYPE_LONGLONG => "BIGINT",
+        MYSQL_TYPE_INT24 => "MEDIUMINT",
+        MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE => "DATE",
+        MYSQL_TYPE_TIME | MYSQL_TYPE_TIME2 => "TIME",
+        MYSQL_TYPE_DATETIME | MYSQL_TYPE_DATETIME2 => "DATETIME",
+        MYSQL_TYPE_YEAR => "YEAR",
+        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING => "VARCHAR",
+        MYSQL_TYPE_BIT => "BIT",
+        MYSQL_TYPE_JSON => "JSON",
+        MYSQL_TYPE_ENUM => "ENUM",
+        MYSQL_TYPE_SET => "SET",
+        MYSQL_TYPE_TINY_BLOB => "TINYBLOB",
+        MYSQL_TYPE_BLOB => "BLOB",
+        MYSQL_TYPE_MEDIUM_BLOB => "MEDIUMBLOB",
+        MYSQL_TYPE_LONG_BLOB => "LONGBLOB",
+        MYSQL_TYPE_STRING => "CHAR",
+        MYSQL_TYPE_GEOMETRY => "GEOMETRY",
+        MYSQL_TYPE_NULL => "NULL",
+        MYSQL_TYPE_VECTOR => "VECTOR",
+        MYSQL_TYPE_UNKNOWN | MYSQL_TYPE_TYPED_ARRAY => "类型未知",
+    }
+}
+
+fn mysql_cell(value: &mysql_async::Value, kind: mysql_async::consts::ColumnType) -> Option<String> {
+    use mysql_async::consts::ColumnType::*;
+    if matches!(kind, MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL) {
+        return match value {
+            mysql_async::Value::NULL => None,
+            mysql_async::Value::Bytes(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+            mysql_async::Value::Int(number) => Some(number.to_string()),
+            mysql_async::Value::UInt(number) => Some(number.to_string()),
+            mysql_async::Value::Float(_) | mysql_async::Value::Double(_) => None,
+            mysql_async::Value::Date(_, _, _, _, _, _, _) | mysql_async::Value::Time(_, _, _, _, _, _) => None,
+        };
+    }
     match value {
         mysql_async::Value::NULL => None,
-        mysql_async::Value::Bytes(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        mysql_async::Value::Bytes(bytes) => {
+            if matches!(kind, MYSQL_TYPE_TINY_BLOB | MYSQL_TYPE_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB) {
+                Some(to_hex(bytes.clone()))
+            } else {
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            }
+        }
         mysql_async::Value::Int(number) => Some(number.to_string()),
         mysql_async::Value::UInt(number) => Some(number.to_string()),
         mysql_async::Value::Float(number) => Some(number.to_string()),
         mysql_async::Value::Double(number) => Some(number.to_string()),
-        mysql_async::Value::Date(year, month, day, hour, minute, second, micros) => {
-            Some(format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{micros:06}"))
-        }
+        mysql_async::Value::Date(year, month, day, hour, minute, second, micros) => Some(mysql_date_text(kind, *year, *month, *day, *hour, *minute, *second, *micros)),
         mysql_async::Value::Time(negative, days, hour, minute, second, micros) => {
             Some(format!("{}{days} {hour:02}:{minute:02}:{second:02}.{micros:06}", if *negative { "-" } else { "" }))
         }
     }
 }
 
-async fn postgres_run(client: &tokio_postgres::Client, sql: &str, limit: usize) -> Result<StatementValue, String> {
-    let bounded = cap_result_sql(sql, limit);
-    match client.prepare(&bounded).await {
+fn mysql_date_text(kind: mysql_async::consts::ColumnType, year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8, micros: u32) -> String {
+    use mysql_async::consts::ColumnType::*;
+    let date = format!("{year:04}-{month:02}-{day:02}");
+    let time = if micros == 0 {
+        format!("{hour:02}:{minute:02}:{second:02}")
+    } else {
+        format!("{hour:02}:{minute:02}:{second:02}.{micros:06}")
+    };
+    match kind {
+        MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE => date,
+        MYSQL_TYPE_TIME | MYSQL_TYPE_TIME2 => time,
+        MYSQL_TYPE_DATETIME | MYSQL_TYPE_DATETIME2 | MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_TIMESTAMP2 => format!("{date} {time}"),
+        _ if hour == 0 && minute == 0 && second == 0 && micros == 0 => date,
+        _ => format!("{date} {time}"),
+    }
+}
+
+async fn postgres_run(
+    client: &tokio_postgres::Client,
+    engine: &str,
+    sql: &str,
+    limit: usize,
+    cancel: &Arc<AtomicBool>,
+    sink: &dyn RowSink,
+    index: usize,
+) -> Result<StatementValue, String> {
+    let bounded = cap_result_sql(engine, sql, limit);
+    let prepared = match client.prepare(&bounded).await {
         Ok(statement) => {
-            let columns: Vec<String> = statement.columns().iter().map(|column| column.name().to_owned()).collect();
-            if columns.is_empty() {
-                let affected = client.execute(&statement, &[]).await.map_err(|err| err.to_string())?;
-                return Ok(StatementValue {
-                    columns,
-                    rows: Vec::new(),
-                    truncated: false,
-                    affected: Some(affected),
-                });
+            let columns = statement.columns().iter().map(|column| column.name().to_owned()).collect::<Vec<_>>();
+            let types = statement.columns().iter().map(|column| column.type_().name().to_owned()).collect::<Vec<_>>();
+            drop(statement);
+            Some((columns, types))
+        }
+        Err(_) => None,
+    };
+    let messages = client.simple_query(&bounded).await.map_err(|err| err.to_string())?;
+    let mut columns = prepared.as_ref().map(|item| item.0.clone()).unwrap_or_default();
+    let mut types = prepared.as_ref().map(|item| item.1.clone()).unwrap_or_default();
+    let mut rows = Vec::new();
+    let mut affected = None;
+    let mut truncated = false;
+    for message in messages {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("已取消".to_owned());
+        }
+        match message {
+            tokio_postgres::SimpleQueryMessage::RowDescription(description) => {
+                if columns.is_empty() {
+                    columns = description.iter().map(|column| column.name().to_owned()).collect();
+                }
             }
-            let params: [&(dyn tokio_postgres::types::ToSql + Sync); 0] = [];
-            let stream = client.query_raw(&statement, params).await.map_err(|err| err.to_string())?;
-            let mut stream = std::pin::pin!(stream);
-            let mut rows = Vec::new();
-            let mut truncated = false;
-            while let Some(row) = stream.try_next().await.map_err(|err| err.to_string())? {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
                 if rows.len() >= limit {
                     truncated = true;
                     break;
                 }
-                let cells = (0..columns.len()).map(|index| pg_text(&row, index)).collect();
+                let width = row.len();
+                if columns.is_empty() {
+                    columns = (0..width).map(|column| format!("col{}", column + 1)).collect();
+                }
+                if types.is_empty() {
+                    types = vec!["类型未知".to_owned(); columns.len().max(width)];
+                } else if types.len() < width {
+                    types.resize(width, "类型未知".to_owned());
+                }
+                let cells = (0..width).map(|cell| row.get(cell).map(str::to_owned)).collect();
                 rows.push(cells);
             }
-            if truncated {
-                // 语句上的 LIMIT 已经让服务器停住，这里只把这个有限结果的协议尾读完。
-                while stream.try_next().await.map_err(|err| err.to_string())?.is_some() {}
-            }
-            Ok(StatementValue {
-                columns,
-                rows,
-                truncated,
-                affected: None,
-            })
-        }
-        Err(_) => {
-            let messages = client.simple_query(&bounded).await.map_err(|err| err.to_string())?;
-            let mut columns = Vec::new();
-            let mut rows = Vec::new();
-            let mut affected = None;
-            let mut truncated = false;
-            for message in messages {
-                match message {
-                    tokio_postgres::SimpleQueryMessage::RowDescription(description) => {
-                        columns = description.iter().map(|column| column.name().to_owned()).collect();
-                    }
-                    tokio_postgres::SimpleQueryMessage::Row(row) => {
-                        if rows.len() >= limit {
-                            truncated = true;
-                            break;
-                        }
-                        let width = if columns.is_empty() { row.len() } else { columns.len() };
-                        if columns.is_empty() {
-                            columns = (0..width).map(|index| format!("col{}", index + 1)).collect();
-                        }
-                        let cells = (0..width).map(|index| row.get(index).map(str::to_owned)).collect();
-                        rows.push(cells);
-                    }
-                    tokio_postgres::SimpleQueryMessage::CommandComplete(count) => affected = Some(count),
-                    _ => {}
-                }
-            }
-            if columns.is_empty() {
-                Ok(StatementValue {
-                    columns,
-                    rows,
-                    truncated: false,
-                    affected,
-                })
-            } else {
-                Ok(StatementValue {
-                    columns,
-                    rows,
-                    truncated,
-                    affected: None,
-                })
-            }
+            tokio_postgres::SimpleQueryMessage::CommandComplete(count) => affected = Some(count),
+            _ => {}
         }
     }
-}
-
-fn pg_text(row: &tokio_postgres::Row, index: usize) -> Option<String> {
-    if let Ok(value) = row.try_get::<_, Option<String>>(index) {
-        return value;
+    if columns.is_empty() {
+        let value = StatementValue {
+            columns,
+            column_types: Vec::new(),
+            rows,
+            truncated: false,
+            affected,
+        };
+        sink.publish(index, &value).await;
+        return Ok(value);
     }
-    if let Ok(value) = row.try_get::<_, Option<i64>>(index) {
-        return value.map(|number| number.to_string());
+    if types.is_empty() {
+        types = vec!["类型未知".to_owned(); columns.len()];
     }
-    if let Ok(value) = row.try_get::<_, Option<i32>>(index) {
-        return value.map(|number| number.to_string());
-    }
-    if let Ok(value) = row.try_get::<_, Option<f64>>(index) {
-        return value.map(|number| number.to_string());
-    }
-    if let Ok(value) = row.try_get::<_, Option<bool>>(index) {
-        return value.map(|number| number.to_string());
-    }
-    if let Ok(value) = row.try_get::<_, Option<Vec<u8>>>(index) {
-        return value.map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-    }
-    None
+    reveal_rows(sink, index, columns, types, rows, truncated, None, limit, cancel).await
 }
 
 pub fn clamp_limit(limit: u64) -> usize {
@@ -554,13 +894,13 @@ pub fn clamp_limit(limit: u64) -> usize {
 }
 
 /// 给会返回行的语句加上不超过 `cap + 1` 的 LIMIT。多出来的一行只用来判断截断。
-pub fn cap_result_sql(sql: &str, cap: usize) -> String {
+pub fn cap_result_sql(engine: &str, sql: &str, cap: usize) -> String {
     let probe = cap.saturating_add(1);
     let (body, suffix) = peel_trailing_semi(sql);
     if !limit_target(body) {
         return sql.to_owned();
     }
-    let scan = scan_top(body);
+    let scan = scan_top(engine, body);
     if scan.unsafe_limit || scan.has_into {
         return sql.to_owned();
     }
@@ -714,108 +1054,8 @@ fn peel_trailing_semi(sql: &str) -> (&str, &str) {
     }
 }
 
-fn scan_top(sql: &str) -> TopScan {
-    let bytes = sql.as_bytes();
-    let mut i = 0usize;
-    let mut depth = 0i32;
-    let mut quote: Option<u8> = None;
-    let mut dollar: Option<String> = None;
-    let mut words: Vec<(String, usize, usize)> = Vec::new();
-    let mut end_of_code = 0usize;
-    while i < bytes.len() {
-        if let Some(tag) = dollar.clone() {
-            let marker = format!("${tag}$");
-            if sql[i..].starts_with(&marker) {
-                end_of_code = i + marker.len();
-                i += marker.len();
-                dollar = None;
-                continue;
-            }
-            let len = utf8_len(bytes[i]);
-            i += len;
-            end_of_code = i;
-            continue;
-        }
-        if let Some(q) = quote {
-            if bytes[i] == q {
-                if q == b'\'' && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2;
-                    end_of_code = i;
-                    continue;
-                }
-                quote = None;
-                i += 1;
-                end_of_code = i;
-                continue;
-            }
-            if q == b'\'' && bytes[i] == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                end_of_code = i;
-                continue;
-            }
-            i += utf8_len(bytes[i]);
-            end_of_code = i;
-            continue;
-        }
-        if bytes[i].is_ascii_whitespace() {
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-            i += 2;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
-            }
-            i = (i + 2).min(bytes.len());
-            continue;
-        }
-        if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
-            quote = Some(bytes[i]);
-            i += 1;
-            end_of_code = i;
-            continue;
-        }
-        if bytes[i] == b'$' {
-            if let Some(tag) = dollar_tag(sql, i) {
-                dollar = Some(tag.clone());
-                i += tag.len() + 2;
-                end_of_code = i;
-                continue;
-            }
-        }
-        if bytes[i] == b'(' {
-            depth += 1;
-            i += 1;
-            end_of_code = i;
-            continue;
-        }
-        if bytes[i] == b')' {
-            depth -= 1;
-            i += 1;
-            end_of_code = i;
-            continue;
-        }
-        if depth == 0 && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
-            let start = i;
-            i += 1;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
-            }
-            words.push((sql[start..i].to_ascii_uppercase(), start, i));
-            end_of_code = i;
-            continue;
-        }
-        let len = utf8_len(bytes[i]);
-        i += len;
-        end_of_code = i;
-    }
+fn scan_top(engine: &str, sql: &str) -> TopScan {
+    let (words, end_of_code) = split::top_level_words(engine, sql);
     interpret_words(sql, words, end_of_code)
 }
 

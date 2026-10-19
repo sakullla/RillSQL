@@ -5,6 +5,7 @@ export interface StatementDto {
   status: string;
   message: string;
   columns: string[];
+  columnTypes?: string[];
   rows: (string | null)[][];
   truncated: boolean;
   affected: number | null;
@@ -39,8 +40,9 @@ export function queryStart(request: StartRequest): Promise<RunDto> {
   return invoke<RunDto>("query_start", { request });
 }
 
-export function queryPoll(runId: string): Promise<RunDto> {
-  return invoke<RunDto>("query_poll", { runId });
+export function queryPoll(runId: string, continueRead = false): Promise<RunDto> {
+  const args = continueRead ? { runId, continueRead: true } : { runId };
+  return invoke<RunDto>("query_poll", args);
 }
 
 export function queryCancel(runId: string): Promise<RunDto> {

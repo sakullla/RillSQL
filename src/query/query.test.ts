@@ -56,10 +56,10 @@ describe("query editing", () => {
     const parts = splitSql(sql);
     expect(parts.map((part) => part.text)).toEqual(["SELECT 'a;b';", "UPDATE t SET n = 1;", "SELECT $$do;$$;"]);
     expect(statementAt(sql, parts[1]!.start + 2)?.text).toBe("UPDATE t SET n = 1;");
-    expect(sqlToRun(sql, { from: parts[1]!.start, to: parts[1]!.end }, "auto")).toEqual({ sql: "UPDATE t SET n = 1;", mode: "selection" });
+    expect(sqlToRun(sql, { from: parts[1]!.start, to: parts[1]!.end }, "auto")).toEqual({ sql: "UPDATE t SET n = 1;", mode: "selection", from: parts[1]!.start, to: parts[1]!.end });
     expect(sqlToRun(sql, { from: parts[1]!.start + 2, to: parts[1]!.start + 2 }, "current").sql).toBe("UPDATE t SET n = 1;");
-    expect(sqlToRun(sql, { from: 0, to: 0 }, "auto")).toEqual({ sql: "SELECT 'a;b';", mode: "current" });
-    expect(sqlToRun(sql, { from: parts[1]!.start + 2, to: parts[1]!.start + 2 }, "auto")).toEqual({ sql: "UPDATE t SET n = 1;", mode: "current" });
+    expect(sqlToRun(sql, { from: 0, to: 0 }, "auto")).toEqual({ sql: "SELECT 'a;b';", mode: "current", from: parts[0]!.start, to: parts[0]!.end });
+    expect(sqlToRun(sql, { from: parts[1]!.start + 2, to: parts[1]!.start + 2 }, "auto")).toEqual({ sql: "UPDATE t SET n = 1;", mode: "current", from: parts[1]!.start, to: parts[1]!.end });
   });
 
   it("keeps desktop editor shortcuts on Ctrl or Command", () => {
@@ -861,7 +861,7 @@ describe("query editing", () => {
     await wrapper.get("[data-action='plan']").trigger("click");
     await flushPromises();
     expect(calls.map((call) => call.command)).toEqual(["query_start"]);
-    expect(calls[0]?.sql).toBe("EXPLAIN SELECT * FROM orders");
+    expect(calls[0]?.sql).toBe("EXPLAIN FORMAT=TREE SELECT * FROM orders");
     expect(calls[0]?.sql?.toLowerCase()).not.toContain("analyze");
     expect(wrapper.get("[data-result='plan']").text()).toContain("Seq Scan on orders");
     expect(wrapper.get("[data-result='plan']").text()).toContain("未使用 ANALYZE");
@@ -973,5 +973,155 @@ describe("query editing", () => {
       expect(wrapper.get("[role='alert']").text()).toBe("计划不使用 ANALYZE，没有发送这条语句。");
       wrapper.unmount();
     }
+  });
+
+  it("sends the whole script only from 执行脚本 and keeps the main button on the selection", async () => {
+    replaceCatalog(catalogFixture());
+    const calls: string[] = [];
+    invoke.mockImplementation(async (_command: string, args?: { request?: { sql: string } }) => {
+      calls.push(args?.request?.sql ?? "");
+      return runDto({ status: "done", statements: [{ sql: args?.request?.sql ?? "", status: "ok", message: "", columns: [], rows: [], truncated: false, affected: 1 }] });
+    });
+    const sql = "SELECT 1;\nSELECT 2;";
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-script",
+        draft: sql,
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    const editor = EditorView.findFromDOM(wrapper.get(".cm-content").element)!;
+    editor.dispatch({ selection: { anchor: 0, head: "SELECT 1;".length } });
+    await nextTick();
+    expect(wrapper.get("[data-action='run']").text()).toContain("执行选中");
+    expect(wrapper.text()).not.toContain("执行全部");
+    await wrapper.get("[data-action='run']").trigger("click");
+    await flushPromises();
+    expect(calls).toEqual(["SELECT 1;"]);
+    expect(wrapper.html()).toContain("cm-send-range");
+    await wrapper.get("[data-action='run-menu']").trigger("click");
+    await wrapper.get("[data-action='run-script']").trigger("click");
+    await flushPromises();
+    expect(calls[1]).toBe(sql);
+    wrapper.unmount();
+  });
+
+  it("changes the selection while dragging and does not execute", async () => {
+    replaceCatalog(catalogFixture());
+    invoke.mockResolvedValue(runDto({ status: "done" }));
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-drag",
+        draft: "SELECT 1;\nSELECT 2;",
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    const editor = EditorView.findFromDOM(wrapper.get(".cm-content").element)!;
+    editor.dispatch({ selection: { anchor: 0, head: 8 } });
+    await wrapper.get(".cm-content").trigger("pointerdown");
+    await wrapper.get(".cm-content").trigger("pointermove");
+    await flushPromises();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(wrapper.get("[data-action='run']").text()).toContain("执行选中");
+    wrapper.unmount();
+  });
+
+  it("asks before analyze, sends nothing on cancel, and refuses SQLite after confirm", async () => {
+    replaceCatalog(catalogFixture());
+    const calls: string[] = [];
+    invoke.mockImplementation(async (_command: string, args?: { request?: { sql: string } }) => {
+      calls.push(args?.request?.sql ?? "");
+      return runDto({
+        status: "done",
+        engine: "postgres",
+        statements: [{ sql: args?.request?.sql ?? "", status: "ok", message: "", columns: ["QUERY PLAN"], rows: [["Seq Scan"]], truncated: false, affected: null }],
+      });
+    });
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-analyze",
+        draft: "SELECT 1",
+        connectionId: "atlas",
+        connectionName: "Atlas",
+        database: "atlas_dev",
+        engine: "postgres",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    await wrapper.get("[data-action='analyze']").trigger("click");
+    expect(wrapper.text()).toContain("这条语句会在服务器上执行。");
+    expect(invoke).not.toHaveBeenCalled();
+    await wrapper.get("[data-action='analyze-cancel']").trigger("click");
+    await flushPromises();
+    expect(invoke).not.toHaveBeenCalled();
+    await wrapper.get("[data-action='analyze']").trigger("click");
+    await wrapper.get("[data-action='analyze-confirm']").trigger("click");
+    await flushPromises();
+    expect(calls).toEqual(["EXPLAIN ANALYZE SELECT 1"]);
+    expect(wrapper.get("[data-result='plan']").text()).toContain("该语句已在服务器上执行");
+    expect(wrapper.get("[data-result='plan']").text()).not.toContain("未使用 ANALYZE");
+    wrapper.unmount();
+
+    invoke.mockClear();
+    const sqlite = mount(QueryTab, {
+      props: {
+        tabId: "query-analyze-sqlite",
+        draft: "SELECT 1",
+        connectionId: "notes",
+        connectionName: "本地笔记",
+        database: "main",
+        engine: "sqlite",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    await sqlite.get("[data-action='analyze']").trigger("click");
+    await sqlite.get("[data-action='analyze-confirm']").trigger("click");
+    await flushPromises();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(sqlite.get("[role='alert']").text()).toContain("不支持");
+    sqlite.unmount();
+  });
+
+  it("keeps a procedure body together and refuses an unclosed quote", async () => {
+    const sql = "DELIMITER $$\nCREATE PROCEDURE p()\nBEGIN\n  UPDATE t SET n = 1;\nEND$$\nDELIMITER ;\nSELECT 1;";
+    const parts = splitSql(sql, "mysql");
+    expect(parts.map((part) => part.text)).toEqual(["CREATE PROCEDURE p()\nBEGIN\n  UPDATE t SET n = 1;\nEND", "SELECT 1;"]);
+    expect(parts.some((part) => part.text.includes("DELIMITER"))).toBe(false);
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-delimiter",
+        draft: "SELECT 'open",
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    replaceCatalog(catalogFixture());
+    invoke.mockResolvedValue(runDto());
+    await nextTick();
+    await wrapper.get("[data-action='run']").trigger("click");
+    await flushPromises();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(wrapper.get("[role='alert']").text()).toContain("引号没有闭合");
+    wrapper.unmount();
   });
 });

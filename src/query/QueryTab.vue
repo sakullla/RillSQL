@@ -4,9 +4,8 @@ import { toggleComment } from "@codemirror/commands";
 import { sql } from "@codemirror/lang-sql";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { tags } from "@lezer/highlight";
-import { Prec } from "@codemirror/state";
-import { EditorView, keymap } from "@codemirror/view";
-import { EditorState } from "@codemirror/state";
+import { EditorState, Prec, StateEffect, StateField } from "@codemirror/state";
+import { Decoration, EditorView, keymap } from "@codemirror/view";
 import { basicSetup } from "codemirror";
 import ChordKeys from "../shell/ChordKeys.vue";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
@@ -22,11 +21,11 @@ import { ambiguousFieldNote, cachedColumns, fieldFailureNote, loadFields, qualif
 import { completionPlan, connectionById, metadataNote, targetDetail, targetKey, targetOptions, type TargetOption } from "./complete";
 import { resolveEditor } from "./editor";
 import { formatDocument } from "./format";
-import { explainSql, planStatement } from "./plan";
+import { analyzeSql, explainSql, hierarchicalSql, planStatement, presentPlan } from "./plan";
 import { gridModel } from "./rows";
-import { requestCancel, startTabRun, tabRun } from "./runtime";
+import { continueTabRun, requestCancel, startTabRun, tabRun, whenSettled } from "./runtime";
 import { QUERY_EDITOR_KEYS, rowLimit, sqlToRun } from "./scope";
-import { openDelimiter } from "./split";
+import { inspectSql, openDelimiter } from "./split";
 
 const props = defineProps<{
   tabId: string;
@@ -71,6 +70,9 @@ const submitting = ref(false);
 const actionError = ref("");
 const fieldNote = ref("");
 const planMode = ref(false);
+const planKind = ref<"none" | "estimate" | "analyze">("none");
+const analyzePrompt = ref(false);
+const analyzeStatement = ref("");
 const resultIndex = ref(0);
 const detailsOpen = ref(false);
 let view: EditorView | undefined;
@@ -122,7 +124,7 @@ const summary = computed(() => {
   if (statements.length === 1 && statements[0]) {
     const statement = statements[0];
     if (statement.status === "ok" && statement.columns.length) {
-      return `${statement.rows.length} 行${statement.truncated ? "（已达上限，只显示部分）" : ""} · ${elapsed}`;
+      return `${statement.rows.length} 行${statement.truncated ? "（还有未读行）" : ""} · ${elapsed}`;
     }
     if (statement.status === "ok") return `${statement.affected ?? 0} 行受影响 · ${elapsed}`;
   }
@@ -150,6 +152,13 @@ const detailsCaption = computed(() => {
   return current ? `共 ${current.statements.length} 条语句` : "";
 });
 const operationGuide = "选择执行目标，编写 SQL，然后执行。有选中时只运行选中部分，无选中时执行光标所在语句。";
+const planCaption = computed(() => (planKind.value === "analyze" ? "该语句已在服务器上执行" : "执行计划 · 只读 · 未使用 ANALYZE"));
+const planView = computed(() => {
+  const statement = activeStatement.value;
+  if (!planMode.value || !statement?.columns.length) return null;
+  return presentPlan(statement.columns, statement.rows);
+});
+const canContinue = computed(() => Boolean(running.value && activeStatement.value && activeStatement.value.rows.length > 0 && !activeStatement.value.truncated));
 /* 没有目标、未连接、尚未读到对象时不另起说明；字段说明和含「失败」的原因仍显示。 */
 const hintVisible = computed(() => Boolean(fieldNote.value) || hint.value.note.includes("失败"));
 
@@ -178,6 +187,25 @@ function preferredIndex(statements: { columns: string[] }[]): number {
   return statements.length - 1;
 }
 
+const setSendRange = StateEffect.define<{ from: number; to: number } | null>();
+const sendRangeMark = Decoration.mark({ class: "cm-send-range" });
+const sendRangeField = StateField.define<Decoration.DecorationSet>({
+  create() {
+    return Decoration.none;
+  },
+  update(marks, transaction) {
+    if (transaction.docChanged) return Decoration.none;
+    for (const effect of transaction.effects) {
+      if (!effect.is(setSendRange)) continue;
+      const range = effect.value;
+      if (!range || range.from >= range.to || range.to > transaction.state.doc.length) return Decoration.none;
+      return Decoration.set([sendRangeMark.range(range.from, range.to)]);
+    }
+    return marks;
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
+
 const shellTheme = EditorView.theme({
   "&": { backgroundColor: "var(--panel)", color: "var(--text)", height: "100%" },
   ".cm-content": { fontFamily: "var(--mono)", fontSize: "var(--editor-font)", caretColor: "var(--text)" },
@@ -192,7 +220,7 @@ function asEngine(value: string | undefined): Engine | undefined {
 
 async function sqlCompletion(context: CompletionContext) {
   const before = context.state.sliceDoc(0, context.pos);
-  if (/--[^\n]*$/.test(before) || openDelimiter(before)) return null;
+  if (/--[^\n]*$/.test(before) || openDelimiter(before, props.engine ?? undefined)) return null;
   const word = context.matchBefore(/[A-Za-z0-9_.]*$/);
   if (!word || (word.from === word.to && !context.explicit)) return null;
   const connection = connectionById(catalogConnections(), props.connectionId);
@@ -258,6 +286,7 @@ async function sqlCompletion(context: CompletionContext) {
 function editorExtensions() {
   return [
     basicSetup,
+    sendRangeField,
     sql(),
     syntaxHighlighting(HighlightStyle.define([
       { tag: tags.keyword, color: "var(--tk-kw)" },
@@ -331,8 +360,24 @@ function formatEditor() {
   });
 }
 
+function targetProblem(purpose: "执行" | "查看执行计划"): string | null {
+  const connection = connectionById(catalogConnections(), props.connectionId);
+  if (!props.connectionId || props.database == null || !props.connectionName || !props.engine || !connection) {
+    return props.connectionId && !connection ? "原连接已删除，请重新选择执行目标。" : "请选择执行目标（连接和数据库）。";
+  }
+  if (connection.status !== "connected") {
+    return `${props.connectionName} 当前${CONNECTION_STATUS_TEXT[connection.status]}，无法${purpose}。`;
+  }
+  return null;
+}
+
+function markSendRange(editor: EditorView, from: number, to: number) {
+  editor.dispatch({ effects: setSendRange.of(from < to ? { from, to } : null) });
+}
+
 async function requestPlan() {
   actionError.value = "";
+  analyzePrompt.value = false;
   if (running.value || submitting.value) return;
   mountEditor();
   const editor = view;
@@ -340,50 +385,70 @@ async function requestPlan() {
     actionError.value = "编辑器还没有准备好，请再试一次。";
     return;
   }
-  const connection = connectionById(catalogConnections(), props.connectionId);
-  if (!props.connectionId || props.database == null || !props.connectionName || !props.engine || !connection) {
-    actionError.value = props.connectionId && !connection ? "原连接已删除，请重新选择执行目标。" : "请选择执行目标（连接和数据库）。";
+  const blocked = targetProblem("查看执行计划");
+  if (blocked) {
+    actionError.value = blocked;
     return;
   }
-  if (connection.status !== "connected") {
-    actionError.value = `${props.connectionName} 当前${CONNECTION_STATUS_TEXT[connection.status]}，无法查看执行计划。`;
-    return;
-  }
+  const engine = props.engine ?? "postgres";
   const range = editor.state.selection.main;
-  const picked = planStatement(editor.state.doc.toString(), { from: range.from, to: range.to, head: range.head });
+  const doc = editor.state.doc.toString();
+  const picked = planStatement(doc, { from: range.from, to: range.to, head: range.head }, engine);
   if (!picked.ok) {
     actionError.value = picked.reason;
     return;
   }
-  const explained = explainSql(props.engine, picked.statement);
+  const explained = hierarchicalSql(engine, picked.statement);
   if (!explained.ok) {
     actionError.value = explained.reason;
     return;
   }
+  const from = range.from === range.to ? doc.indexOf(picked.statement) : Math.min(range.from, range.to);
+  const to = from < 0 ? range.to : from + (range.from === range.to ? picked.statement.length : Math.abs(range.to - range.from));
+  markSendRange(editor, Math.max(0, from), to);
   submitting.value = true;
   menuOpen.value = false;
   runMenuOpen.value = false;
   try {
     planMode.value = true;
+    planKind.value = "estimate";
     await nextTick();
     await startTabRun({
       tabId: props.tabId,
-      connectionId: props.connectionId,
-      connectionName: props.connectionName,
-      database: props.database,
-      engine: props.engine,
+      connectionId: props.connectionId!,
+      connectionName: props.connectionName!,
+      database: props.database!,
+      engine,
       sql: explained.sql,
       limit: rowLimit(loadSettings().pageSize),
     });
+    if (engine === "mysql" || engine === "mariadb") {
+      await whenSettled(props.tabId);
+      const current = tabRun(props.tabId);
+      const failed = current?.status === "error" || current?.statements.some((statement) => statement.status === "error");
+      const plain = explainSql(engine, picked.statement);
+      if (failed && plain.ok && plain.sql !== explained.sql && planKind.value === "estimate") {
+        await startTabRun({
+          tabId: props.tabId,
+          connectionId: props.connectionId!,
+          connectionName: props.connectionName!,
+          database: props.database!,
+          engine,
+          sql: plain.sql,
+          limit: rowLimit(loadSettings().pageSize),
+        });
+      }
+    }
   } catch (err) {
     planMode.value = false;
+    planKind.value = "none";
     actionError.value = typeof err === "string" ? err : err instanceof Error ? err.message : "执行计划失败";
   } finally {
     submitting.value = false;
   }
 }
 
-async function execute(scope: "auto" | "current") {
+function requestAnalyze() {
   actionError.value = "";
   if (running.value || submitting.value) return;
   mountEditor();
@@ -392,29 +457,119 @@ async function execute(scope: "auto" | "current") {
     actionError.value = "编辑器还没有准备好，请再试一次。";
     return;
   }
-  const connection = connectionById(catalogConnections(), props.connectionId);
-  if (!props.connectionId || props.database == null || !props.connectionName || !props.engine || !connection) {
-    actionError.value = props.connectionId && !connection ? "原连接已删除，请重新选择执行目标。" : "请选择执行目标（连接和数据库）。";
+  const blocked = targetProblem("查看执行计划");
+  if (blocked) {
+    actionError.value = blocked;
     return;
   }
+  const engine = props.engine ?? "postgres";
   const range = editor.state.selection.main;
-  const picked = sqlToRun(editor.state.doc.toString(), { from: range.from, to: range.to, head: range.head }, scope);
-  if (!picked.sql.trim()) {
-    actionError.value = "没有可执行的 SQL 语句。";
+  const picked = planStatement(editor.state.doc.toString(), { from: range.from, to: range.to, head: range.head }, engine);
+  if (!picked.ok) {
+    actionError.value = picked.reason;
     return;
+  }
+  analyzeStatement.value = picked.statement;
+  analyzePrompt.value = true;
+}
+
+function cancelAnalyze() {
+  analyzePrompt.value = false;
+  analyzeStatement.value = "";
+}
+
+async function confirmAnalyze() {
+  const statement = analyzeStatement.value;
+  analyzePrompt.value = false;
+  analyzeStatement.value = "";
+  const engine = props.engine ?? "postgres";
+  const explained = analyzeSql(engine, statement);
+  if (!explained.ok) {
+    actionError.value = explained.reason;
+    return;
+  }
+  const editor = view;
+  if (editor) {
+    const doc = editor.state.doc.toString();
+    const at = doc.indexOf(statement);
+    if (at >= 0) markSendRange(editor, at, at + statement.length);
   }
   submitting.value = true;
   menuOpen.value = false;
   runMenuOpen.value = false;
+  try {
+    planMode.value = true;
+    planKind.value = "analyze";
+    await nextTick();
+    await startTabRun({
+      tabId: props.tabId,
+      connectionId: props.connectionId!,
+      connectionName: props.connectionName!,
+      database: props.database!,
+      engine,
+      sql: explained.sql,
+      limit: rowLimit(loadSettings().pageSize),
+    });
+    await whenSettled(props.tabId);
+    const failed = tabRun(props.tabId)?.statements.find((item) => item.status === "error");
+    if (failed && planKind.value === "analyze") {
+      actionError.value = `服务器不支持实际执行并分析，没有再发送会修改数据的语句。${failed.message}`;
+    }
+  } catch (err) {
+    planMode.value = false;
+    planKind.value = "none";
+    actionError.value = typeof err === "string" ? err : err instanceof Error ? err.message : "执行计划失败";
+  } finally {
+    submitting.value = false;
+  }
+}
+
+async function execute(scope: "auto" | "current" | "script") {
+  actionError.value = "";
+  analyzePrompt.value = false;
+  if (running.value || submitting.value) return;
+  mountEditor();
+  const editor = view;
+  if (!editor) {
+    actionError.value = "编辑器还没有准备好，请再试一次。";
+    return;
+  }
+  const blocked = targetProblem("执行");
+  if (blocked) {
+    actionError.value = blocked;
+    return;
+  }
+  const engine = props.engine ?? "postgres";
+  const doc = editor.state.doc.toString();
+  const range = editor.state.selection.main;
+  const picked = sqlToRun(doc, { from: range.from, to: range.to, head: range.head }, scope, engine);
+  const inspected = inspectSql(scope === "selection" ? picked.sql : doc, engine);
+  if (scope === "current") {
+    if (!picked.sql.trim()) {
+      actionError.value = inspected.refusal ?? "只有空白或注释，没有发送。";
+      return;
+    }
+  } else if (inspected.refusal) {
+    actionError.value = inspected.refusal;
+    return;
+  } else if (inspected.pieces.length === 0) {
+    actionError.value = "只有空白或注释，没有发送。";
+    return;
+  }
+  markSendRange(editor, picked.from, picked.to);
+  submitting.value = true;
+  menuOpen.value = false;
+  runMenuOpen.value = false;
   planMode.value = false;
+  planKind.value = "none";
   try {
     await nextTick();
     await startTabRun({
       tabId: props.tabId,
-      connectionId: props.connectionId,
-      connectionName: props.connectionName,
-      database: props.database,
-      engine: props.engine,
+      connectionId: props.connectionId!,
+      connectionName: props.connectionName!,
+      database: props.database!,
+      engine,
       sql: picked.sql,
       limit: rowLimit(loadSettings().pageSize),
     });
@@ -423,6 +578,10 @@ async function execute(scope: "auto" | "current") {
   } finally {
     submitting.value = false;
   }
+}
+
+function continueRead() {
+  void continueTabRun(props.tabId);
 }
 
 watch(
@@ -621,6 +780,7 @@ onBeforeUnmount(() => {
       <span class="grow"></span>
       <button class="btn" type="button" data-action="format" title="格式化选中的 SQL；没有选中时格式化全部" @click="formatEditor">格式化</button>
       <button class="btn" type="button" data-action="plan" title="查看一条语句的执行计划，不使用 ANALYZE" :disabled="running || submitting" @click="requestPlan">执行计划</button>
+      <button class="btn" type="button" data-action="analyze" title="在服务器上实际执行并分析这一条语句" :disabled="running || submitting" @click="requestAnalyze">实际执行并分析</button>
       <div v-if="!running" ref="runRoot" class="run-group">
         <button class="btn primary run-main" type="button" data-action="run" :disabled="submitting" @click="execute('auto')"><span aria-hidden="true">▶</span>{{ submitting ? "正在执行…" : hasSelection ? "执行选中" : "执行" }} <ChordKeys chord="Mod+Enter" /></button>
         <button
@@ -640,10 +800,21 @@ onBeforeUnmount(() => {
             <span>执行当前语句</span>
             <small>只执行光标所在的语句</small>
           </button>
+          <button class="run-item" type="button" role="menuitem" data-action="run-script" @click="execute('script')">
+            <span>执行脚本</span>
+            <small>按顺序执行编辑器里的全部语句</small>
+          </button>
         </div>
       </div>
       <button v-else class="btn danger" type="button" data-action="cancel" :disabled="run?.cancel === 'requested'" @click="cancel">{{ cancelButtonLabel }}</button>
       <span v-if="run" class="q-note" role="status">{{ runStatusLine }} · {{ run.elapsedMs }} ms</span>
+    </div>
+    <div v-if="analyzePrompt" class="analyze-dialog" role="dialog" aria-modal="true" aria-label="实际执行并分析">
+      <p>这条语句会在服务器上执行。</p>
+      <div class="analyze-actions">
+        <button class="btn" type="button" data-action="analyze-cancel" @click="cancelAnalyze">取消</button>
+        <button class="btn" type="button" data-action="analyze-confirm" @click="confirmAnalyze">继续</button>
+      </div>
     </div>
     <p v-if="notice" class="q-banner">{{ notice }}</p>
     <p v-if="actionError" class="q-banner" role="alert">{{ actionError }}</p>
@@ -661,16 +832,28 @@ onBeforeUnmount(() => {
         <template v-if="activeStatement">
           <p v-if="activeStatement.status === 'unknown'" class="q-note">写入结果未知。不会自动重放，草稿保留。</p>
           <p v-else-if="activeStatement.status === 'skipped'" class="q-note">这条语句没有执行。</p>
-          <div v-if="planMode && grid" class="plan-view" data-result="plan">
-            <p class="plan-caption">执行计划 · 只读 · 未使用 ANALYZE</p>
-            <table>
-              <thead><tr><th v-for="(column, columnIndex) in activeStatement.columns" :key="`${column}-${columnIndex}`">{{ column }}</th></tr></thead>
-              <tbody>
-                <tr v-for="(row, rowIndex) in activeStatement.rows" :key="rowIndex">
-                  <td v-for="(cell, cellIndex) in row" :key="cellIndex">{{ cell === null ? "NULL" : cell }}</td>
-                </tr>
-              </tbody>
-            </table>
+          <p v-else-if="activeStatement.status === 'ok' && activeStatement.message" class="q-note">{{ activeStatement.message }}</p>
+          <p v-if="canContinue" class="q-note"><button class="btn sm" type="button" data-action="continue-read" @click="continueRead">继续读取</button></p>
+          <div v-if="planMode && planView" class="plan-view" data-result="plan">
+            <p class="plan-caption">{{ planCaption }}</p>
+            <ol v-if="planView.kind === 'tree'" class="plan-tree">
+              <li v-for="(node, nodeIndex) in planView.nodes" :key="nodeIndex" :style="{ paddingLeft: `${node.depth * 16}px` }">
+                <span>{{ node.operation }}</span>
+                <span v-if="node.rows">估计 {{ node.rows }} 行</span>
+                <span v-if="node.extra">{{ node.extra }}</span>
+              </li>
+            </ol>
+            <template v-else>
+              <table>
+                <thead><tr><th v-for="(column, columnIndex) in activeStatement.columns" :key="`${column}-${columnIndex}`">{{ column }}</th></tr></thead>
+                <tbody>
+                  <tr v-for="(row, rowIndex) in activeStatement.rows" :key="rowIndex">
+                    <td v-for="(cell, cellIndex) in row" :key="cellIndex">{{ cell === null ? "NULL" : cell }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <p>没有层次结果</p>
+            </template>
           </div>
           <QueryResultGrid
             v-else-if="grid"
@@ -793,6 +976,12 @@ onBeforeUnmount(() => {
 .results-heading { display: flex; align-items: center; gap: 20px; padding: 8px 16px; border-bottom: 1px solid var(--line); font-size: 11px; flex-shrink: 0; background: var(--panel-2); }
 .plan-view { padding: 12px 16px; overflow: auto; }
 .plan-caption { margin: 0 0 8px; font-size: var(--fs-sm); color: var(--text-2); }
+.plan-tree { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: var(--fs-xs); }
+.plan-tree li { display: flex; gap: 8px; padding-block: 2px; }
+.analyze-dialog { margin: var(--sp-2) var(--sp-3); padding: var(--sp-3); border: 1px solid var(--line-2); border-radius: var(--r-md); background: var(--panel); }
+.analyze-dialog p { margin: 0 0 var(--sp-2); }
+.analyze-actions { display: flex; gap: var(--sp-2); }
+.query-pane :deep(.cm-send-range) { background: color-mix(in srgb, var(--accent) 22%, transparent); border-radius: 2px; }
 .plan-view table { border-collapse: collapse; font-family: var(--mono); font-size: var(--fs-xs); }
 .plan-view th, .plan-view td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; vertical-align: top; }
 .results-heading > span:first-child { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; }

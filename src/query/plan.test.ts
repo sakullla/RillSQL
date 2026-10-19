@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { explainSql, planStatement } from "./plan";
+import { analyzeSql, explainSql, hierarchicalSql, planStatement, presentPlan } from "./plan";
 
 describe("execution plan selection", () => {
   it("uses the statement at the cursor, or the selection, and refuses empty or multiple statements", () => {
@@ -101,5 +101,36 @@ describe("execution plan selection", () => {
     ]) {
       expect(explainSql("mysql", sql)).toEqual({ ok: true, sql: `EXPLAIN ${sql}` });
     }
+  });
+
+  it("treats hash as a comment only on MySQL and MariaDB", () => {
+    expect(explainSql("mysql", "SELECT 1 # ANALYZE")).toEqual({ ok: true, sql: "EXPLAIN SELECT 1 # ANALYZE" });
+    expect(explainSql("mariadb", "SELECT 1 # ANALYSE")).toEqual({ ok: true, sql: "EXPLAIN SELECT 1 # ANALYSE" });
+    expect(explainSql("postgres", "SELECT 1 # ANALYZE").ok).toBe(false);
+    expect(explainSql("sqlite", "SELECT '#>' ").ok).toBe(true);
+  });
+
+  it("asks MySQL and MariaDB for a hierarchical plan before plain EXPLAIN", () => {
+    expect(hierarchicalSql("mysql", "SELECT * FROM orders")).toEqual({ ok: true, sql: "EXPLAIN FORMAT=TREE SELECT * FROM orders" });
+    expect(hierarchicalSql("mariadb", "SELECT * FROM orders")).toEqual({ ok: true, sql: "EXPLAIN FORMAT=JSON SELECT * FROM orders" });
+    expect(hierarchicalSql("postgres", "SELECT 1")).toEqual({ ok: true, sql: "EXPLAIN SELECT 1" });
+    expect(hierarchicalSql("sqlite", "SELECT 1")).toEqual({ ok: true, sql: "EXPLAIN QUERY PLAN SELECT 1" });
+    expect(hierarchicalSql("mysql", "EXPLAIN FORMAT=TREE SELECT 1")).toEqual({ ok: true, sql: "EXPLAIN FORMAT=TREE SELECT 1" });
+    expect(hierarchicalSql("mysql", "EXPLAIN ANALYZE SELECT 1").ok).toBe(false);
+  });
+
+  it("builds an executing analyze statement only after the caller confirms", () => {
+    expect(analyzeSql("postgres", "SELECT 1")).toEqual({ ok: true, sql: "EXPLAIN ANALYZE SELECT 1" });
+    expect(analyzeSql("mysql", "EXPLAIN SELECT 1")).toEqual({ ok: true, sql: "EXPLAIN ANALYZE SELECT 1" });
+    expect(analyzeSql("mariadb", "SELECT 1")).toEqual({ ok: true, sql: "ANALYZE SELECT 1" });
+    expect(analyzeSql("sqlite", "SELECT 1")).toEqual({ ok: false, reason: "SQLite 不支持实际执行并分析，没有发送会修改数据的语句。" });
+  });
+
+  it("shows indented plan text as a tree and tables as tables", () => {
+    expect(presentPlan(["QUERY PLAN"], [["-> Seq Scan (rows=10)"]])).toEqual({
+      kind: "tree",
+      nodes: [{ depth: 0, operation: "Seq Scan", rows: "10", extra: "rows=10" }],
+    });
+    expect(presentPlan(["id", "plan"], [["1", "scan"]])).toEqual({ kind: "table" });
   });
 });

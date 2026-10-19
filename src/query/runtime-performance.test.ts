@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isReactive } from "vue";
 import type { RunDto } from "./api";
-import { adoptRun, guardClose, resetQueryRuntime, startTabRun, tabRun } from "./runtime";
+import { adoptRun, continueTabRun, guardClose, resetQueryRuntime, startTabRun, tabRun } from "./runtime";
 const api = vi.hoisted(() => ({ queryStart: vi.fn(), queryPoll: vi.fn(), queryCancel: vi.fn() }));
 vi.mock("./api", () => api);
 const dto = (status = "running"): RunDto => ({ id: "run", connectionId: "db", connectionName: "DB", database: "main", engine: "sqlite", status, cancel: "none", cancelMessage: "", viaSsh: false, freshChannel: false, statements: [], elapsedMs: 0, startedAt: "" });
@@ -34,5 +34,15 @@ describe("slow query status requests", () => {
     resolvePoll(dto("done"));
     await Promise.resolve();
     expect(tabRun("q")?.id).toBe("replacement");
+  });
+  it("continues the same run through query_poll and does not start another", async () => {
+    api.queryStart.mockResolvedValue(dto());
+    api.queryPoll.mockResolvedValue(dto());
+    await startTabRun({ tabId: "q", connectionId: "db", connectionName: "DB", database: "main", engine: "sqlite", sql: "SELECT 1", limit: 100 });
+    await continueTabRun("q");
+    expect(api.queryStart).toHaveBeenCalledTimes(1);
+    expect(api.queryPoll).toHaveBeenCalledWith("run", true);
+    await continueTabRun("missing");
+    expect(api.queryStart).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,10 +1,11 @@
 import type { Column, Row } from "../grid/types";
 import type { StatementDto } from "./api";
 
-export function gridModel(statement: Pick<StatementDto, "columns" | "rows">): { columns: Column[]; rows: Row[] } {
-  const columns: Column[] = statement.columns.map((name) => ({
+export function gridModel(statement: Pick<StatementDto, "columns" | "rows"> & { columnTypes?: string[] }): { columns: Column[]; rows: Row[] } {
+  const types = statement.columnTypes ?? [];
+  const columns: Column[] = statement.columns.map((name, index) => ({
     name,
-    typeName: "",
+    typeName: types[index] ?? "",
     nullable: true,
     primary: false,
     unique: false,

@@ -12,7 +12,7 @@ use crate::connections::commands::ConnectionsState;
 use crate::connections::{CancelTransport, CatalogSession, Service};
 
 use super::cancel::{self, CancelView};
-use super::exec::{self, StatementReport};
+use super::exec::{self, RowSink, StatementReport, StatementValue};
 use super::history::{HistoryDraft, HistoryEntry, HistoryStore};
 use super::saved::{RenameRequest, SaveRequest, SavedQuery, SavedWrite};
 use super::split::split_sql;
@@ -28,6 +28,7 @@ struct RunSlot {
     snapshot: Mutex<RunDto>,
     cancel_flag: Arc<AtomicBool>,
     started: Instant,
+    pace: Arc<exec::Pace>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,6 +56,7 @@ pub struct StatementDto {
     pub status: String,
     pub message: String,
     pub columns: Vec<String>,
+    pub column_types: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
     pub truncated: bool,
     pub affected: Option<u64>,
@@ -120,10 +122,15 @@ impl Drop for Reservation {
 }
 
 pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: StartRequest) -> Result<RunDto, String> {
-    let parts = split_sql(&request.sql);
-    if parts.is_empty() {
-        return Err("没有可执行的 SQL 语句".to_owned());
+    let report = split_sql(&request.engine, &request.sql);
+    if let Some(reason) = report.refusal {
+        return Err(reason);
     }
+    let parts = report.pieces;
+    if parts.is_empty() {
+        return Err("只有空白或注释，没有发送。".to_owned());
+    }
+    let notices = report.notices;
     let session = service
         .catalog_session(&request.connection_id)
         .ok_or_else(|| "这条连接还没有打开，没有另开新的连接。".to_owned())?;
@@ -143,6 +150,7 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
             status: "pending".to_owned(),
             message: String::new(),
             columns: Vec::new(),
+            column_types: Vec::new(),
             rows: Vec::new(),
             truncated: false,
             affected: None,
@@ -165,10 +173,11 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
     };
     // 任何 await 之前占住这条连接，失败时由 Reservation 撤掉占位。
     let mut reservation = reserve_run(state, snapshot.clone(), Arc::clone(&cancel_flag))?;
-    let driver = match exec::LiveDriver::attach(session, &request.engine, &request.database, transport).await {
+    let mut driver = match exec::LiveDriver::attach(session, &request.engine, &request.database, transport).await {
         Ok(driver) => driver,
         Err(err) => return Err(err),
     };
+    driver.set_sink(Arc::new(SlotSink { slot: Arc::clone(&reservation.slot) }));
     let history = match state.history().await {
         Ok(history) => history,
         Err(err) => return Err(err),
@@ -192,9 +201,11 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
     let slot = Arc::clone(&reservation.slot);
     reservation.active = false;
     let history_state = state.clone();
+    let pace = Arc::clone(&slot.pace);
     tokio::spawn(async move {
+        let _finish_pace = FinishPace(Arc::clone(&pace));
         let batch = exec::run_batch(&parts, limit, &cancel_flag, via_ssh, &driver).await;
-        finish_run(&slot, &batch);
+        finish_run(&slot, &batch, &notices);
         let summary = summary_of(&batch);
         let status = history_status(&batch.status);
         if let Ok(store) = history_state.history().await {
@@ -216,6 +227,7 @@ fn reserve_run(state: &QueryState, snapshot: RunDto, cancel_flag: Arc<AtomicBool
         snapshot: Mutex::new(snapshot),
         cancel_flag,
         started: Instant::now(),
+        pace: Arc::new(exec::Pace::new()),
     });
     runs.insert(id.clone(), Arc::clone(&slot));
     Ok(Reservation {
@@ -226,7 +238,7 @@ fn reserve_run(state: &QueryState, snapshot: RunDto, cancel_flag: Arc<AtomicBool
     })
 }
 
-fn finish_run(slot: &RunSlot, batch: &exec::BatchReport) {
+fn finish_run(slot: &RunSlot, batch: &exec::BatchReport, notices: &[String]) {
     let mut snap = slot.snapshot.lock().expect("snapshot");
     if batch.cancel.phase != "none" {
         snap.cancel = batch.cancel.phase.to_owned();
@@ -235,7 +247,25 @@ fn finish_run(slot: &RunSlot, batch: &exec::BatchReport) {
     }
     snap.status = batch.status.to_owned();
     snap.elapsed_ms = u64::try_from(slot.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    snap.statements = batch.statements.iter().map(statement_dto).collect();
+    let mut statements = batch.statements.iter().map(statement_dto).collect::<Vec<_>>();
+    if let Some(first) = statements.first_mut() {
+        if !notices.is_empty() {
+            let note = notices.join("");
+            first.message = if first.message.is_empty() { note } else { format!("{note}{}", first.message) };
+        }
+    }
+    for (next, previous) in statements.iter_mut().zip(snap.statements.iter()) {
+        let keep = next.rows.is_empty()
+            && !previous.rows.is_empty()
+            && matches!(next.status.as_str(), "cancelled" | "error" | "unknown");
+        if keep {
+            next.columns = previous.columns.clone();
+            next.column_types = previous.column_types.clone();
+            next.rows = previous.rows.clone();
+            next.truncated = previous.truncated;
+        }
+    }
+    snap.statements = statements;
 }
 
 fn statement_dto(statement: &StatementReport) -> StatementDto {
@@ -244,9 +274,45 @@ fn statement_dto(statement: &StatementReport) -> StatementDto {
         status: statement.status.to_owned(),
         message: statement.message.clone(),
         columns: statement.columns.clone(),
+        column_types: statement.column_types.clone(),
         rows: statement.rows.clone(),
         truncated: statement.truncated,
         affected: statement.affected,
+    }
+}
+
+struct SlotSink {
+    slot: Arc<RunSlot>,
+}
+
+#[async_trait::async_trait]
+impl RowSink for SlotSink {
+    async fn publish(&self, index: usize, value: &StatementValue) {
+        {
+            let mut snap = self.slot.snapshot.lock().expect("snapshot");
+            if let Some(statement) = snap.statements.get_mut(index) {
+                statement.status = "running".to_owned();
+                statement.columns = value.columns.clone();
+                statement.column_types = value.column_types.clone();
+                statement.rows = value.rows.clone();
+                statement.truncated = value.truncated;
+                statement.affected = value.affected;
+            }
+            snap.elapsed_ms = u64::try_from(self.slot.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        }
+        self.slot.pace.bump();
+    }
+
+    async fn pause(&self, cancel: &AtomicBool) -> Result<(), String> {
+        self.slot.pace.wait_continue(cancel).await
+    }
+}
+
+struct FinishPace(Arc<exec::Pace>);
+
+impl Drop for FinishPace {
+    fn drop(&mut self) {
+        self.0.finish();
     }
 }
 
@@ -314,6 +380,7 @@ pub async fn request_cancel(service: &Arc<Service>, state: &QueryState, run_id: 
     if view.phase == "requested" {
         slot.cancel_flag.store(true, Ordering::SeqCst);
     }
+    slot.pace.kick();
     let mut snap = slot.snapshot.lock().expect("snapshot");
     if matches!(snap.status.as_str(), "running" | "cancel-requested") {
         snap.cancel = view.phase.to_owned();
@@ -325,7 +392,7 @@ pub async fn request_cancel(service: &Arc<Service>, state: &QueryState, run_id: 
     Ok(snap.clone())
 }
 
-pub fn poll_run(state: &QueryState, run_id: &str) -> Result<RunDto, String> {
+pub async fn poll_run(state: &QueryState, run_id: &str, continue_read: bool) -> Result<RunDto, String> {
     let slot = state
         .runs
         .lock()
@@ -333,6 +400,11 @@ pub fn poll_run(state: &QueryState, run_id: &str) -> Result<RunDto, String> {
         .get(run_id)
         .cloned()
         .ok_or_else(|| "找不到这次执行".to_owned())?;
+    if continue_read && matches!(slot.snapshot.lock().expect("snapshot").status.as_str(), "running" | "cancel-requested") {
+        let before = slot.pace.generation();
+        slot.pace.request();
+        slot.pace.wait_changed(before).await;
+    }
     let mut snap = slot.snapshot.lock().expect("snapshot").clone();
     if matches!(snap.status.as_str(), "running" | "cancel-requested") {
         snap.elapsed_ms = u64::try_from(slot.started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -346,8 +418,8 @@ pub async fn query_start(connections: tauri::State<'_, ConnectionsState>, query:
 }
 
 #[tauri::command]
-pub async fn query_poll(query: tauri::State<'_, QueryState>, run_id: String) -> Result<RunDto, String> {
-    poll_run(&query, &run_id)
+pub async fn query_poll(query: tauri::State<'_, QueryState>, run_id: String, continue_read: Option<bool>) -> Result<RunDto, String> {
+    poll_run(&query, &run_id, continue_read.unwrap_or(false)).await
 }
 
 #[tauri::command]

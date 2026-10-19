@@ -34,6 +34,7 @@ fn piece(sql: &str) -> Piece {
 fn ok_count() -> StatementValue {
     StatementValue {
         columns: Vec::new(),
+        column_types: Vec::new(),
         rows: Vec::new(),
         truncated: false,
         affected: Some(1),
@@ -43,15 +44,47 @@ fn ok_count() -> StatementValue {
 #[test]
 fn split_keeps_quotes_comments_and_current_statement() {
     let sql = "SELECT 'a;b';\n-- c;\nUPDATE t SET n = 1;\nSELECT $$do;$$;";
-    let parts = split::split_sql(sql);
+    let parts = split::split_sql("postgres", sql).pieces;
     assert_eq!(parts.len(), 3);
     assert_eq!(parts[0].text, "SELECT 'a;b';");
     assert_eq!(parts[1].text, "UPDATE t SET n = 1;");
     assert!(parts[2].text.contains("$$do;$$"));
-    let current = split::statement_at(sql, parts[1].start + 2).expect("光标所在语句");
+    let current = split::statement_at("postgres", sql, parts[1].start + 2).expect("光标所在语句");
     assert_eq!(current.text, "UPDATE t SET n = 1;");
     assert!(split::is_write(&current.text));
     assert!(!split::is_write("SELECT 1"));
+}
+
+#[test]
+fn engine_boundaries_keep_routine_bodies_and_hash_rules() {
+    let mysql = "DELIMITER $$\nCREATE PROCEDURE p()\nBEGIN\n  UPDATE t SET n = 1;\nEND$$\nDELIMITER ;\nSELECT 1;";
+    let report = split::split_sql("mysql", mysql);
+    assert!(report.refusal.is_none(), "{:?}", report.refusal);
+    assert!(report.notices.is_empty());
+    assert_eq!(report.pieces.len(), 2);
+    assert!(report.pieces[0].text.contains("UPDATE t SET n = 1;"));
+    assert!(report.pieces[0].text.contains("END"));
+    assert!(!report.pieces.iter().any(|piece| piece.text.contains("DELIMITER")));
+    assert_eq!(report.pieces[1].text, "SELECT 1;");
+
+    let hash = "SELECT 1 # keep; this\n + 2;";
+    assert_eq!(split::split_sql("mysql", hash).pieces.len(), 1);
+    assert_eq!(split::split_sql("postgres", "SELECT 1;\nSELECT 2 #>;").pieces.len(), 2);
+    assert!(split::split_sql("postgres", "SELECT 1 #> '{a}';").pieces[0].text.contains("#>"));
+
+    let routine = split::split_sql("mysql", "CREATE PROCEDURE p()\nBEGIN\n  SELECT 1;\n");
+    assert_eq!(routine.refusal.as_deref(), Some("例程体未闭合，没有发送。"));
+    let transaction = split::split_sql("postgres", "BEGIN;\nUPDATE t SET n = 1;\n");
+    assert!(transaction.refusal.is_none());
+    assert_eq!(transaction.pieces.len(), 2);
+
+    let unclosed = split::split_sql("postgres", "SELECT 'a;");
+    assert_eq!(unclosed.refusal.as_deref(), Some("引号没有闭合，没有发送。"));
+    let postgres_delimiter = split::split_sql("sqlite", "DELIMITER $$\nSELECT 1;");
+    assert!(postgres_delimiter.refusal.is_none());
+    assert_eq!(postgres_delimiter.pieces.len(), 1);
+    assert_eq!(postgres_delimiter.pieces[0].text, "SELECT 1;");
+    assert!(postgres_delimiter.notices[0].contains("不使用 DELIMITER"));
 }
 
 #[test]
@@ -472,28 +505,28 @@ async fn open_session_runs_sql_stops_and_can_cancel_without_a_second_execution_c
 
 #[test]
 fn result_cap_limits_the_server_read_without_raising_a_smaller_limit() {
-    let capped = exec::cap_result_sql("SELECT * FROM t", 10);
+    let capped = exec::cap_result_sql("postgres", "SELECT * FROM t", 10);
     assert_eq!(capped, "SELECT * FROM t LIMIT 11");
-    assert_eq!(exec::cap_result_sql("SELECT * FROM t;", 10), "SELECT * FROM t LIMIT 11;");
-    assert_eq!(exec::cap_result_sql("SELECT * FROM t -- tail", 10), "SELECT * FROM t LIMIT 11 -- tail");
-    assert_eq!(exec::cap_result_sql("SELECT * FROM t FOR UPDATE", 10), "SELECT * FROM t LIMIT 11 FOR UPDATE");
-    assert_eq!(exec::cap_result_sql("SELECT * FROM t OFFSET 4", 10), "SELECT * FROM t LIMIT 11 OFFSET 4");
-    assert_eq!(exec::cap_result_sql("SELECT * FROM t LIMIT 2", 10), "SELECT * FROM t LIMIT 2");
-    assert_eq!(exec::cap_result_sql("SELECT * FROM t LIMIT 2 FOR UPDATE", 10), "SELECT * FROM t LIMIT 2 FOR UPDATE");
-    assert_eq!(exec::cap_result_sql("SELECT * FROM t LIMIT 1000", 10), "SELECT * FROM t LIMIT 11");
-    assert_eq!(exec::cap_result_sql("SELECT * FROM t LIMIT 3, 1000", 10), "SELECT * FROM t LIMIT 3, 11");
+    assert_eq!(exec::cap_result_sql("postgres", "SELECT * FROM t;", 10), "SELECT * FROM t LIMIT 11;");
+    assert_eq!(exec::cap_result_sql("postgres", "SELECT * FROM t -- tail", 10), "SELECT * FROM t LIMIT 11 -- tail");
+    assert_eq!(exec::cap_result_sql("postgres", "SELECT * FROM t FOR UPDATE", 10), "SELECT * FROM t LIMIT 11 FOR UPDATE");
+    assert_eq!(exec::cap_result_sql("postgres", "SELECT * FROM t OFFSET 4", 10), "SELECT * FROM t LIMIT 11 OFFSET 4");
+    assert_eq!(exec::cap_result_sql("postgres", "SELECT * FROM t LIMIT 2", 10), "SELECT * FROM t LIMIT 2");
+    assert_eq!(exec::cap_result_sql("postgres", "SELECT * FROM t LIMIT 2 FOR UPDATE", 10), "SELECT * FROM t LIMIT 2 FOR UPDATE");
+    assert_eq!(exec::cap_result_sql("postgres", "SELECT * FROM t LIMIT 1000", 10), "SELECT * FROM t LIMIT 11");
+    assert_eq!(exec::cap_result_sql("postgres", "SELECT * FROM t LIMIT 3, 1000", 10), "SELECT * FROM t LIMIT 3, 11");
     assert_eq!(
-        exec::cap_result_sql("SELECT * FROM t FETCH FIRST 1000 ROWS ONLY", 10),
+        exec::cap_result_sql("postgres", "SELECT * FROM t FETCH FIRST 1000 ROWS ONLY", 10),
         "SELECT * FROM t FETCH FIRST 11 ROWS ONLY"
     );
-    assert_eq!(exec::cap_result_sql("SELECT 'LIMIT 1000' FROM t", 10), "SELECT 'LIMIT 1000' FROM t LIMIT 11");
+    assert_eq!(exec::cap_result_sql("postgres", "SELECT 'LIMIT 1000' FROM t", 10), "SELECT 'LIMIT 1000' FROM t LIMIT 11");
     assert_eq!(
-        exec::cap_result_sql("WITH c AS (SELECT * FROM t LIMIT 1000) SELECT * FROM c", 10),
+        exec::cap_result_sql("postgres", "WITH c AS (SELECT * FROM t LIMIT 1000) SELECT * FROM c", 10),
         "WITH c AS (SELECT * FROM t LIMIT 1000) SELECT * FROM c LIMIT 11"
     );
-    assert_eq!(exec::cap_result_sql("SELECT * FROM t LIMIT @n", 10), "SELECT * FROM t LIMIT @n");
-    assert_eq!(exec::cap_result_sql("UPDATE t SET n = 1", 10), "UPDATE t SET n = 1");
-    assert_eq!(exec::cap_result_sql("SELECT * INTO OUTFILE 'x' FROM t", 10), "SELECT * INTO OUTFILE 'x' FROM t");
+    assert_eq!(exec::cap_result_sql("postgres", "SELECT * FROM t LIMIT @n", 10), "SELECT * FROM t LIMIT @n");
+    assert_eq!(exec::cap_result_sql("postgres", "UPDATE t SET n = 1", 10), "UPDATE t SET n = 1");
+    assert_eq!(exec::cap_result_sql("postgres", "SELECT * INTO OUTFILE 'x' FROM t", 10), "SELECT * INTO OUTFILE 'x' FROM t");
 }
 
 #[test]
@@ -511,14 +544,14 @@ fn mysql_batch_checks_out_once_and_does_not_reset_on_return() {
     let truncated = mysql_run.split("if truncated").nth(1).expect("mysql truncated");
     assert!(!truncated.contains("while"), "截断之后不能把剩余行读完");
     let postgres = exec.split("async fn postgres_run").nth(1).unwrap();
-    let postgres = postgres.split("fn pg_text").next().unwrap();
+    let postgres = postgres.split("pub fn clamp_limit").next().unwrap();
     assert!(postgres.contains("let bounded = cap_result_sql"));
     assert!(postgres.contains("prepare(&bounded)"));
-    assert!(postgres.contains("query_raw(&statement"));
     assert!(postgres.contains("simple_query(&bounded)"));
+    assert!(postgres.contains("类型未知"));
     assert!(postgres.contains("if rows.len() >= limit"));
-    let tail = postgres.split("if truncated").nth(1).expect("postgres truncated");
-    assert!(tail.contains("LIMIT"), "协议尾只能出现在服务器 LIMIT 之后");
+    assert!(!postgres.contains("query_raw"));
+    assert!(!postgres.contains("pg_text"));
 }
 
 #[tokio::test]
@@ -891,7 +924,7 @@ fn run_request(sql: &str, database: &str) -> super::commands::StartRequest {
 
 async fn wait_done(state: &super::commands::QueryState, id: &str) -> super::commands::RunDto {
     for _ in 0..200 {
-        let snap = super::commands::poll_run(state, id).unwrap();
+        let snap = super::commands::poll_run(state, id, false).await.unwrap();
         if !matches!(snap.status.as_str(), "running" | "cancel-requested") {
             return snap;
         }

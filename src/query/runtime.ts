@@ -38,6 +38,40 @@ export async function startTabRun(input: StartRequest & { tabId: string }): Prom
   else stopTimer(tabId);
 }
 
+/** 从同一次结果流再读下一块。运行已经结束时什么都不做。 */
+export async function continueTabRun(tabId: string): Promise<void> {
+  const current = runs[tabId];
+  if (!current || !isLive(current)) return;
+  const token = epoch;
+  const runId = current.id;
+  try {
+    const next = await queryPoll(runId, true);
+    if (token !== epoch || runs[tabId]?.id !== runId) return;
+    apply(tabId, next);
+  } catch (err) {
+    if (token !== epoch) return;
+    const run = runs[tabId];
+    if (run?.id === runId) run.pollError = errorText(err);
+  }
+  settle(tabId);
+}
+
+/** 等到这次运行不再占用连接。已经结束时立刻返回。 */
+export function whenSettled(tabId: string): Promise<void> {
+  const current = runs[tabId];
+  if (!current || !isLive(current)) return Promise.resolve();
+  const runId = current.id;
+  return new Promise((resolve) => {
+    const timer = setInterval(() => {
+      const run = runs[tabId];
+      if (!run || run.id !== runId || !isLive(run)) {
+        clearInterval(timer);
+        resolve();
+      }
+    }, 40);
+  });
+}
+
 export async function requestCancel(tabId: string): Promise<void> {
   const current = runs[tabId];
   if (!current || !isLive(current)) return;
