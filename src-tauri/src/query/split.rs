@@ -12,6 +12,8 @@ pub struct SplitReport {
     pub pieces: Vec<Piece>,
     pub notices: Vec<String>,
     pub refusal: Option<String>,
+    /// 拒绝片段的起点。光标落在这里或之后时，不能退回前面已经闭合的语句。
+    pub refusal_from: Option<usize>,
 }
 
 pub fn split_sql(engine: &str, sql: &str) -> SplitReport {
@@ -45,6 +47,7 @@ pub fn split_sql(engine: &str, sql: &str) -> SplitReport {
                     pieces,
                     notices,
                     refusal: Some("自定义结束符没有写明，没有发送。".to_owned()),
+                    refusal_from: Some(begin),
                 };
             };
             delimiter = arg;
@@ -60,6 +63,7 @@ pub fn split_sql(engine: &str, sql: &str) -> SplitReport {
                 pieces,
                 notices,
                 refusal: Some(refusal),
+                refusal_from: Some(begin),
             };
         }
         if scanned.next <= begin {
@@ -71,6 +75,7 @@ pub fn split_sql(engine: &str, sql: &str) -> SplitReport {
         pieces,
         notices,
         refusal: None,
+        refusal_from: None,
     }
 }
 
@@ -228,11 +233,19 @@ pub fn top_level_words(engine: &str, sql: &str) -> (Vec<(String, usize, usize)>,
 
 #[cfg(test)]
 pub fn statement_at(engine: &str, sql: &str, cursor: usize) -> Option<Piece> {
-    let pieces = split_sql(engine, sql).pieces;
-    if let Some(found) = pieces.iter().find(|piece| cursor >= piece.start && cursor <= piece.end) {
+    let report = split_sql(engine, sql);
+    if let Some(found) = report.pieces.iter().find(|piece| cursor >= piece.start && cursor <= piece.end) {
         return Some(found.clone());
     }
-    pieces.into_iter().filter(|piece| piece.end <= cursor).next_back()
+    if report.refusal.is_some() {
+        if report.refusal_from.is_some_and(|from| cursor >= from) {
+            return None;
+        }
+    }
+    if let Some(previous) = report.pieces.iter().rev().find(|piece| piece.end <= cursor) {
+        return Some(previous.clone());
+    }
+    None
 }
 
 struct Scanned {
@@ -430,7 +443,13 @@ fn routine_look(words: &[String]) -> Look {
     }
     if words.get(index).map(String::as_str) == Some("DEFINER") {
         index += 1;
-        if words.get(index).map(String::as_str) == Some("CURRENT_USER") {
+        while let Some(word) = words.get(index).map(String::as_str) {
+            if matches!(word, "PROCEDURE" | "FUNCTION" | "TRIGGER") {
+                break;
+            }
+            if is_not_routine(word) {
+                return Look::No;
+            }
             index += 1;
         }
     }
@@ -439,6 +458,43 @@ fn routine_look(words: &[String]) -> Look {
         Some("PROCEDURE" | "FUNCTION" | "TRIGGER") => Look::Yes,
         Some(_) => Look::No,
     }
+}
+
+fn is_not_routine(word: &str) -> bool {
+    matches!(
+        word,
+        "TABLE"
+            | "VIEW"
+            | "INDEX"
+            | "UNIQUE"
+            | "FULLTEXT"
+            | "SPATIAL"
+            | "DATABASE"
+            | "SCHEMA"
+            | "USER"
+            | "ROLE"
+            | "EVENT"
+            | "SERVER"
+            | "TABLESPACE"
+            | "LOGFILE"
+            | "SEQUENCE"
+            | "TYPE"
+            | "EXTENSION"
+            | "TEMPORARY"
+            | "TEMP"
+            | "UNLOGGED"
+            | "MATERIALIZED"
+            | "RECURSIVE"
+            | "POLICY"
+            | "RULE"
+            | "DOMAIN"
+            | "CAST"
+            | "OPERATOR"
+            | "AGGREGATE"
+            | "COLLATION"
+            | "CONVERSION"
+            | "LANGUAGE"
+    )
 }
 
 fn is_routine_tail(word: &str) -> bool {

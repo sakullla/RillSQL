@@ -1,4 +1,4 @@
-import { codeHasAnalyze, splitSql, statementAt } from "./split";
+import { codeHasAnalyze, inspectSql, locateStatement, splitSql } from "./split";
 
 export interface PlanSelection {
   from: number;
@@ -6,7 +6,7 @@ export interface PlanSelection {
   head?: number;
 }
 
-export type PlanPick = { ok: true; statement: string } | { ok: false; reason: string };
+export type PlanPick = { ok: true; statement: string; from: number; to: number } | { ok: false; reason: string };
 export type ExplainSql = { ok: true; sql: string } | { ok: false; reason: string };
 
 const EMPTY = "没有可查看计划的语句。";
@@ -14,16 +14,33 @@ const MULTIPLE = "一次只能查看一条语句的执行计划。";
 const ANALYZE = "计划不使用 ANALYZE，没有发送这条语句。";
 const SQLITE_ANALYZE = "SQLite 不支持实际执行并分析，没有发送会修改数据的语句。";
 
-/** 无选区时用光标所在语句，有选区时用选区。空语句或多条语句不执行。 */
+/** 无选区时用光标所在语句，有选区时用选区。空语句、多条或未闭合时不执行。 */
 export function planStatement(sql: string, selection: PlanSelection, engine = "postgres"): PlanPick {
-  const selected = selection.from !== selection.to;
-  const text = selected
-    ? sql.slice(Math.min(selection.from, selection.to), Math.max(selection.from, selection.to))
-    : statementAt(sql, selection.head ?? selection.to, engine)?.text ?? "";
-  const pieces = splitSql(text, engine);
-  if (!text.trim() || pieces.length === 0) return { ok: false, reason: EMPTY };
-  if (pieces.length > 1) return { ok: false, reason: MULTIPLE };
-  return { ok: true, statement: pieces[0]!.text };
+  const from = Math.min(selection.from, selection.to);
+  const to = Math.max(selection.from, selection.to);
+  if (from === to) {
+    const located = locateStatement(sql, selection.head ?? to, engine);
+    if (located.refusal) return { ok: false, reason: located.refusal };
+    if (!located.piece) {
+      const document = inspectSql(sql, engine);
+      if (document.refusal) return { ok: false, reason: document.refusal };
+      if (document.notices.length > 0 && document.pieces.length === 0) return { ok: false, reason: document.notices.join("") };
+    }
+    const piece = located.piece;
+    return onePlan(piece?.text ?? "", engine, piece?.start ?? from, piece?.end ?? to);
+  }
+  return onePlan(sql.slice(from, to), engine, from, to);
+}
+
+function onePlan(text: string, engine: string, from: number, to: number): PlanPick {
+  const report = inspectSql(text, engine);
+  if (report.refusal) return { ok: false, reason: report.refusal };
+  if (report.pieces.length === 0) {
+    if (report.notices.length) return { ok: false, reason: report.notices.join("") };
+    return { ok: false, reason: EMPTY };
+  }
+  if (report.pieces.length > 1) return { ok: false, reason: MULTIPLE };
+  return { ok: true, statement: report.pieces[0]!.text, from, to };
 }
 
 /** 语句扫描只走 splitSql。注释里的 ANALYZE / ANALYSE 不算。 */
@@ -79,16 +96,126 @@ export type PlanPresentation =
   | { kind: "tree"; nodes: PlanNode[] }
   | { kind: "table" };
 
-/** 单列缩进文本按层次展开；多列只当表格。 */
+/** 单列缩进文本或 MariaDB 的 JSON 计划按层次展开；认不出时只当表格。 */
 export function presentPlan(columns: string[], rows: (string | null)[][]): PlanPresentation {
   if (columns.length !== 1) return { kind: "table" };
-  const lines = rows.flatMap((row) => (row[0] ?? "").split(/\r?\n/));
+  const text = rows.map((row) => row[0] ?? "").join("\n").trim();
+  const json = parseJsonPlan(text);
+  if (json) return { kind: "tree", nodes: json };
+  if (!isIndentedPlan(text)) return { kind: "table" };
   const nodes: PlanNode[] = [];
-  for (const line of lines) {
+  for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) continue;
     nodes.push(parsePlanLine(line));
   }
-  return { kind: "tree", nodes };
+  return nodes.length ? { kind: "tree", nodes } : { kind: "table" };
+}
+
+function isIndentedPlan(text: string): boolean {
+  return text.split(/\r?\n/).some((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return false;
+    return /^\s*->/.test(line)
+      || /\brows\s*[=:]/i.test(line)
+      || /\bcost\s*=/i.test(line)
+      || /^(?:Seq Scan|Index(?: Only)? Scan|Bitmap|Nested Loop|Hash|Sort|Limit|Aggregate|Gather|Materialize|Result|Group|WindowAgg|CTE|Subquery|SCAN\b|SEARCH\b)/.test(trimmed);
+  });
+}
+
+function parseJsonPlan(text: string): PlanNode[] | null {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(text.slice(start));
+  } catch {
+    return null;
+  }
+  if (!containsQueryBlock(value)) return null;
+  const nodes: PlanNode[] = [];
+  walkPlan(value, 0, nodes);
+  return nodes.length ? nodes : null;
+}
+
+function containsQueryBlock(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some((item) => containsQueryBlock(item));
+  if (!isRecord(value)) return false;
+  if ("query_block" in value) return true;
+  return Object.values(value).some((item) => containsQueryBlock(item));
+}
+
+const PLAN_SKIP = new Set(["select_id", "cost_info", "possible_keys", "ref", "used_columns", "used_key_parts", "attached_condition"]);
+const ROW_KEYS = ["rows", "r_rows", "rows_examined", "rows_produced_per_join"];
+
+function walkPlan(value: unknown, depth: number, nodes: PlanNode[]): void {
+  if (Array.isArray(value)) {
+    for (const item of value) walkPlan(item, depth, nodes);
+    return;
+  }
+  if (!isRecord(value)) return;
+  const table = value.table;
+  if (isRecord(table)) {
+    nodes.push(tableNode(table, depth));
+    for (const child of Object.values(table)) {
+      if (child && typeof child === "object") walkPlan(child, depth + 1, nodes);
+    }
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "query_block") {
+      walkPlan(child, depth, nodes);
+      continue;
+    }
+    if (key === "table" || PLAN_SKIP.has(key)) continue;
+    if (!Array.isArray(child) && !isRecord(child)) continue;
+    nodes.push({
+      depth,
+      operation: key.replaceAll("_", " "),
+      rows: isRecord(child) ? firstScalar(child, ROW_KEYS) : null,
+      extra: scalarExtra(child),
+    });
+    walkPlan(child, depth + 1, nodes);
+  }
+}
+
+function tableNode(table: Record<string, unknown>, depth: number): PlanNode {
+  const access = scalar(table.access_type);
+  const name = scalar(table.table_name);
+  const skip = new Set(["access_type", "table_name", ...ROW_KEYS]);
+  const extra = Object.entries(table)
+    .filter(([key, value]) => !skip.has(key) && value != null && typeof value !== "object")
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join(" ");
+  return {
+    depth,
+    operation: [access, name].filter(Boolean).join(" ") || "table",
+    rows: firstScalar(table, ROW_KEYS),
+    extra,
+  };
+}
+
+function scalarExtra(value: unknown): string {
+  if (!isRecord(value)) return "";
+  const skip = new Set(ROW_KEYS);
+  return Object.entries(value)
+    .filter(([key, item]) => !skip.has(key) && item != null && typeof item !== "object")
+    .map(([key, item]) => `${key}=${String(item)}`)
+    .join(" ");
+}
+
+function firstScalar(record: Record<string, unknown>, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" || (typeof value === "string" && value.length > 0)) return String(value);
+  }
+  return null;
+}
+
+function scalar(value: unknown): string {
+  return typeof value === "string" || typeof value === "number" ? String(value) : "";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === "object" && !Array.isArray(value);
 }
 
 function parsePlanLine(line: string): PlanNode {

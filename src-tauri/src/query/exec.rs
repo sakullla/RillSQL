@@ -654,13 +654,13 @@ async fn mysql_run(
     }
     let bounded = cap_result_sql(engine, sql, limit);
     let mut result = conn.query_iter(bounded).await.map_err(|err| err.to_string())?;
-    let column_meta: Vec<(String, mysql_async::consts::ColumnType)> = result
+    let column_meta: Vec<(String, mysql_async::consts::ColumnType, u16)> = result
         .columns_ref()
         .iter()
-        .map(|column| (column.name_str().into_owned(), column.column_type()))
+        .map(|column| (column.name_str().into_owned(), column.column_type(), column.character_set()))
         .collect();
     let columns: Vec<String> = column_meta.iter().map(|column| column.0.clone()).collect();
-    let column_types: Vec<String> = column_meta.iter().map(|column| mysql_type_name(column.1).to_owned()).collect();
+    let column_types: Vec<String> = column_meta.iter().map(|column| mysql_type_name(column.1, column.2).to_owned()).collect();
     if columns.is_empty() {
         let affected = result.affected_rows();
         // OK 包没有行。收掉这个结果集，同一条连接才能执行下一条。
@@ -697,7 +697,7 @@ async fn mysql_run(
             break;
         }
         let cells = (0..columns.len())
-            .map(|cell| mysql_cell(row.as_ref(cell).unwrap_or(&mysql_async::Value::NULL), column_meta[cell].1))
+            .map(|cell| mysql_cell(row.as_ref(cell).unwrap_or(&mysql_async::Value::NULL), column_meta[cell].1, column_meta[cell].2))
             .collect();
         rows.push(cells);
         if rows.len() < limit && rows.len() % step == 0 {
@@ -734,8 +734,11 @@ async fn mysql_run(
     Ok(value)
 }
 
-fn mysql_type_name(kind: mysql_async::consts::ColumnType) -> &'static str {
+const MYSQL_BINARY_CHARSET: u16 = 63;
+
+fn mysql_type_name(kind: mysql_async::consts::ColumnType, charset: u16) -> &'static str {
     use mysql_async::consts::ColumnType::*;
+    let binary = charset == MYSQL_BINARY_CHARSET;
     match kind {
         MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL => "DECIMAL",
         MYSQL_TYPE_TINY => "TINYINT",
@@ -750,16 +753,52 @@ fn mysql_type_name(kind: mysql_async::consts::ColumnType) -> &'static str {
         MYSQL_TYPE_TIME | MYSQL_TYPE_TIME2 => "TIME",
         MYSQL_TYPE_DATETIME | MYSQL_TYPE_DATETIME2 => "DATETIME",
         MYSQL_TYPE_YEAR => "YEAR",
-        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING => "VARCHAR",
+        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING => {
+            if binary {
+                "VARBINARY"
+            } else {
+                "VARCHAR"
+            }
+        }
         MYSQL_TYPE_BIT => "BIT",
         MYSQL_TYPE_JSON => "JSON",
         MYSQL_TYPE_ENUM => "ENUM",
         MYSQL_TYPE_SET => "SET",
-        MYSQL_TYPE_TINY_BLOB => "TINYBLOB",
-        MYSQL_TYPE_BLOB => "BLOB",
-        MYSQL_TYPE_MEDIUM_BLOB => "MEDIUMBLOB",
-        MYSQL_TYPE_LONG_BLOB => "LONGBLOB",
-        MYSQL_TYPE_STRING => "CHAR",
+        MYSQL_TYPE_TINY_BLOB => {
+            if binary {
+                "TINYBLOB"
+            } else {
+                "TINYTEXT"
+            }
+        }
+        MYSQL_TYPE_BLOB => {
+            if binary {
+                "BLOB"
+            } else {
+                "TEXT"
+            }
+        }
+        MYSQL_TYPE_MEDIUM_BLOB => {
+            if binary {
+                "MEDIUMBLOB"
+            } else {
+                "MEDIUMTEXT"
+            }
+        }
+        MYSQL_TYPE_LONG_BLOB => {
+            if binary {
+                "LONGBLOB"
+            } else {
+                "LONGTEXT"
+            }
+        }
+        MYSQL_TYPE_STRING => {
+            if binary {
+                "BINARY"
+            } else {
+                "CHAR"
+            }
+        }
         MYSQL_TYPE_GEOMETRY => "GEOMETRY",
         MYSQL_TYPE_NULL => "NULL",
         MYSQL_TYPE_VECTOR => "VECTOR",
@@ -767,7 +806,7 @@ fn mysql_type_name(kind: mysql_async::consts::ColumnType) -> &'static str {
     }
 }
 
-fn mysql_cell(value: &mysql_async::Value, kind: mysql_async::consts::ColumnType) -> Option<String> {
+fn mysql_cell(value: &mysql_async::Value, kind: mysql_async::consts::ColumnType, charset: u16) -> Option<String> {
     use mysql_async::consts::ColumnType::*;
     if matches!(kind, MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL) {
         return match value {
@@ -779,10 +818,21 @@ fn mysql_cell(value: &mysql_async::Value, kind: mysql_async::consts::ColumnType)
             mysql_async::Value::Date(_, _, _, _, _, _, _) | mysql_async::Value::Time(_, _, _, _, _, _) => None,
         };
     }
+    let binary = charset == MYSQL_BINARY_CHARSET
+        && matches!(
+            kind,
+            MYSQL_TYPE_TINY_BLOB
+                | MYSQL_TYPE_BLOB
+                | MYSQL_TYPE_MEDIUM_BLOB
+                | MYSQL_TYPE_LONG_BLOB
+                | MYSQL_TYPE_STRING
+                | MYSQL_TYPE_VARCHAR
+                | MYSQL_TYPE_VAR_STRING
+        );
     match value {
         mysql_async::Value::NULL => None,
         mysql_async::Value::Bytes(bytes) => {
-            if matches!(kind, MYSQL_TYPE_TINY_BLOB | MYSQL_TYPE_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB) {
+            if binary {
                 Some(to_hex(bytes.clone()))
             } else {
                 Some(String::from_utf8_lossy(bytes).into_owned())
@@ -1224,5 +1274,37 @@ fn utf8_len(first: u8) -> usize {
         3
     } else {
         4
+    }
+}
+
+#[cfg(test)]
+mod mysql_value_tests {
+    use super::{mysql_cell, mysql_type_name};
+    use mysql_async::consts::ColumnType::*;
+
+    #[test]
+    fn charset_splits_text_from_binary() {
+        let text = mysql_async::Value::Bytes("你好".as_bytes().to_vec());
+        let binary = mysql_async::Value::Bytes(vec![0xff, 0x00, 0x41]);
+        assert_eq!(mysql_type_name(MYSQL_TYPE_BLOB, 45), "TEXT");
+        assert_eq!(mysql_cell(&text, MYSQL_TYPE_BLOB, 45).as_deref(), Some("你好"));
+        assert_eq!(mysql_type_name(MYSQL_TYPE_TINY_BLOB, 33), "TINYTEXT");
+        assert_eq!(mysql_type_name(MYSQL_TYPE_MEDIUM_BLOB, 45), "MEDIUMTEXT");
+        assert_eq!(mysql_type_name(MYSQL_TYPE_LONG_BLOB, 45), "LONGTEXT");
+        assert_eq!(mysql_type_name(MYSQL_TYPE_BLOB, 63), "BLOB");
+        assert_eq!(mysql_type_name(MYSQL_TYPE_TINY_BLOB, 63), "TINYBLOB");
+        assert_eq!(mysql_type_name(MYSQL_TYPE_MEDIUM_BLOB, 63), "MEDIUMBLOB");
+        assert_eq!(mysql_type_name(MYSQL_TYPE_LONG_BLOB, 63), "LONGBLOB");
+        assert_eq!(mysql_cell(&binary, MYSQL_TYPE_BLOB, 63).as_deref(), Some("ff0041"));
+        assert_eq!(mysql_type_name(MYSQL_TYPE_VAR_STRING, 63), "VARBINARY");
+        assert_eq!(mysql_type_name(MYSQL_TYPE_VARCHAR, 63), "VARBINARY");
+        assert_eq!(mysql_type_name(MYSQL_TYPE_STRING, 63), "BINARY");
+        assert_eq!(mysql_cell(&binary, MYSQL_TYPE_VAR_STRING, 63).as_deref(), Some("ff0041"));
+        assert_eq!(mysql_cell(&binary, MYSQL_TYPE_STRING, 63).as_deref(), Some("ff0041"));
+        assert_eq!(mysql_type_name(MYSQL_TYPE_VAR_STRING, 45), "VARCHAR");
+        assert_eq!(mysql_type_name(MYSQL_TYPE_STRING, 45), "CHAR");
+        assert_eq!(mysql_cell(&mysql_async::Value::Bytes(b"abc".to_vec()), MYSQL_TYPE_VAR_STRING, 45).as_deref(), Some("abc"));
+        assert_eq!(mysql_cell(&mysql_async::Value::Bytes(b"12.50".to_vec()), MYSQL_TYPE_NEWDECIMAL, 63).as_deref(), Some("12.50"));
+        assert_eq!(mysql_cell(&mysql_async::Value::Date(2024, 1, 2, 0, 0, 0, 0), MYSQL_TYPE_DATE, 63).as_deref(), Some("2024-01-02"));
     }
 }

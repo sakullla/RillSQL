@@ -8,6 +8,8 @@ export interface SplitReport {
   pieces: Piece[];
   notices: string[];
   refusal: string | null;
+  /** 拒绝片段的起点。光标落在这里或之后时，不能退回前面已经闭合的语句。 */
+  refusalFrom: number | null;
 }
 
 const ROUTINE_TAIL = new Set(["IF", "LOOP", "WHILE", "REPEAT", "CASE"]);
@@ -38,29 +40,38 @@ export function inspectSql(sql: string, engine = "postgres"): SplitReport {
         i = skipBreak(sql, lineEnd);
         continue;
       }
-      if (arg == null) return { pieces, notices, refusal: "自定义结束符没有写明，没有发送。" };
+      if (arg == null) return { pieces, notices, refusal: "自定义结束符没有写明，没有发送。", refusalFrom: begin };
       delimiter = arg;
       i = skipBreak(sql, lineEnd);
       continue;
     }
     const scanned = scanStatement(sql, begin, delimiter, hash);
     if (scanned.piece) pieces.push(scanned.piece);
-    if (scanned.refusal) return { pieces, notices, refusal: scanned.refusal };
+    if (scanned.refusal) return { pieces, notices, refusal: scanned.refusal, refusalFrom: begin };
     if (scanned.next <= begin) break;
     i = scanned.next;
   }
-  return { pieces, notices, refusal: null };
+  return { pieces, notices, refusal: null, refusalFrom: null };
 }
 
 export function statementAt(sql: string, cursor: number, engine = "postgres"): Piece | null {
-  const pieces = splitSql(sql, engine);
-  const found = pieces.find((piece) => cursor >= piece.start && cursor <= piece.end);
-  if (found) return found;
-  for (let index = pieces.length - 1; index >= 0; index -= 1) {
-    const piece = pieces[index];
-    if (piece && piece.end <= cursor) return piece;
+  return locateStatement(sql, cursor, engine).piece;
+}
+
+/** 光标落在未闭合片段上时 piece 为空，并把 refusal 交回调用方。 */
+export function locateStatement(sql: string, cursor: number, engine = "postgres"): { piece: Piece | null; refusal: string | null } {
+  const report = inspectSql(sql, engine);
+  const found = report.pieces.find((piece) => cursor >= piece.start && cursor <= piece.end);
+  if (found) return { piece: found, refusal: null };
+  if (report.refusal && report.refusalFrom != null && cursor >= report.refusalFrom) {
+    return { piece: null, refusal: report.refusal };
   }
-  return null;
+  for (let index = report.pieces.length - 1; index >= 0; index -= 1) {
+    const piece = report.pieces[index];
+    if (piece && piece.end <= cursor) return { piece, refusal: null };
+  }
+  if (report.refusal) return { piece: null, refusal: report.refusal };
+  return { piece: null, refusal: null };
 }
 
 /** 去掉注释、字符串和 dollar-quote 后，代码里还有 ANALYZE 或 ANALYSE。MySQL 可执行注释仍要检查。 */
@@ -319,6 +330,14 @@ function makePiece(sql: string, start: number, end: number, delimiter: string, c
   return { text: body, start: textStart, end: textStart + body.length };
 }
 
+const ROUTINE_KIND = new Set(["PROCEDURE", "FUNCTION", "TRIGGER"]);
+const NOT_ROUTINE = new Set([
+  "TABLE", "VIEW", "INDEX", "UNIQUE", "FULLTEXT", "SPATIAL", "DATABASE", "SCHEMA", "USER", "ROLE",
+  "EVENT", "SERVER", "TABLESPACE", "LOGFILE", "SEQUENCE", "TYPE", "EXTENSION", "TEMPORARY", "TEMP",
+  "UNLOGGED", "MATERIALIZED", "RECURSIVE", "POLICY", "RULE", "DOMAIN", "CAST", "OPERATOR", "AGGREGATE",
+  "COLLATION", "CONVERSION", "LANGUAGE",
+]);
+
 function routineLook(words: string[]): "yes" | "no" | "maybe" {
   if (words[0] !== "CREATE") return "no";
   let index = 1;
@@ -329,11 +348,14 @@ function routineLook(words: string[]): "yes" | "no" | "maybe" {
   }
   if (words[index] === "DEFINER") {
     index += 1;
-    if (words[index] === "CURRENT_USER") index += 1;
+    while (words[index] && !ROUTINE_KIND.has(words[index]!)) {
+      if (NOT_ROUTINE.has(words[index]!)) return "no";
+      index += 1;
+    }
   }
   const kind = words[index];
   if (kind == null) return "maybe";
-  if (kind === "PROCEDURE" || kind === "FUNCTION" || kind === "TRIGGER") return "yes";
+  if (ROUTINE_KIND.has(kind)) return "yes";
   return "no";
 }
 

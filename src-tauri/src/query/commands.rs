@@ -126,11 +126,14 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
     if let Some(reason) = report.refusal {
         return Err(reason);
     }
-    let parts = report.pieces;
-    if parts.is_empty() {
+    if report.pieces.is_empty() {
+        if !report.notices.is_empty() {
+            return Err(report.notices.join(""));
+        }
         return Err("只有空白或注释，没有发送。".to_owned());
     }
     let notices = report.notices;
+    let parts = report.pieces;
     let session = service
         .catalog_session(&request.connection_id)
         .ok_or_else(|| "这条连接还没有打开，没有另开新的连接。".to_owned())?;

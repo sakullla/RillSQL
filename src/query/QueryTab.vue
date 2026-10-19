@@ -25,7 +25,7 @@ import { analyzeSql, explainSql, hierarchicalSql, planStatement, presentPlan } f
 import { gridModel } from "./rows";
 import { continueTabRun, requestCancel, startTabRun, tabRun, whenSettled } from "./runtime";
 import { QUERY_EDITOR_KEYS, rowLimit, sqlToRun } from "./scope";
-import { inspectSql, openDelimiter } from "./split";
+import { inspectSql, locateStatement, openDelimiter } from "./split";
 
 const props = defineProps<{
   tabId: string;
@@ -73,6 +73,7 @@ const planMode = ref(false);
 const planKind = ref<"none" | "estimate" | "analyze">("none");
 const analyzePrompt = ref(false);
 const analyzeStatement = ref("");
+const analyzeAt = ref<{ from: number; to: number } | null>(null);
 const resultIndex = ref(0);
 const detailsOpen = ref(false);
 let view: EditorView | undefined;
@@ -403,9 +404,7 @@ async function requestPlan() {
     actionError.value = explained.reason;
     return;
   }
-  const from = range.from === range.to ? doc.indexOf(picked.statement) : Math.min(range.from, range.to);
-  const to = from < 0 ? range.to : from + (range.from === range.to ? picked.statement.length : Math.abs(range.to - range.from));
-  markSendRange(editor, Math.max(0, from), to);
+  markSendRange(editor, picked.from, picked.to);
   submitting.value = true;
   menuOpen.value = false;
   runMenuOpen.value = false;
@@ -470,18 +469,22 @@ function requestAnalyze() {
     return;
   }
   analyzeStatement.value = picked.statement;
+  analyzeAt.value = { from: picked.from, to: picked.to };
   analyzePrompt.value = true;
 }
 
 function cancelAnalyze() {
   analyzePrompt.value = false;
   analyzeStatement.value = "";
+  analyzeAt.value = null;
 }
 
 async function confirmAnalyze() {
   const statement = analyzeStatement.value;
+  const at = analyzeAt.value;
   analyzePrompt.value = false;
   analyzeStatement.value = "";
+  analyzeAt.value = null;
   const engine = props.engine ?? "postgres";
   const explained = analyzeSql(engine, statement);
   if (!explained.ok) {
@@ -489,11 +492,7 @@ async function confirmAnalyze() {
     return;
   }
   const editor = view;
-  if (editor) {
-    const doc = editor.state.doc.toString();
-    const at = doc.indexOf(statement);
-    if (at >= 0) markSendRange(editor, at, at + statement.length);
-  }
+  if (editor && at) markSendRange(editor, at.from, at.to);
   submitting.value = true;
   menuOpen.value = false;
   runMenuOpen.value = false;
@@ -543,17 +542,25 @@ async function execute(scope: "auto" | "current" | "script") {
   const doc = editor.state.doc.toString();
   const range = editor.state.selection.main;
   const picked = sqlToRun(doc, { from: range.from, to: range.to, head: range.head }, scope, engine);
-  const inspected = inspectSql(scope === "selection" ? picked.sql : doc, engine);
-  if (scope === "current") {
-    if (!picked.sql.trim()) {
-      actionError.value = inspected.refusal ?? "只有空白或注释，没有发送。";
+  if (picked.mode === "current") {
+    const located = locateStatement(doc, range.head, engine);
+    if (located.refusal) {
+      actionError.value = located.refusal;
       return;
     }
-  } else if (inspected.refusal) {
+    if (!located.piece) {
+      const document = inspectSql(doc, engine);
+      actionError.value = document.refusal ?? (document.notices.join("") || "只有空白或注释，没有发送。");
+      return;
+    }
+  }
+  const inspected = inspectSql(picked.mode === "script" ? doc : picked.sql, engine);
+  if (inspected.refusal) {
     actionError.value = inspected.refusal;
     return;
-  } else if (inspected.pieces.length === 0) {
-    actionError.value = "只有空白或注释，没有发送。";
+  }
+  if (inspected.pieces.length === 0) {
+    actionError.value = inspected.notices.join("") || "只有空白或注释，没有发送。";
     return;
   }
   markSendRange(editor, picked.from, picked.to);

@@ -85,6 +85,64 @@ fn engine_boundaries_keep_routine_bodies_and_hash_rules() {
     assert_eq!(postgres_delimiter.pieces.len(), 1);
     assert_eq!(postgres_delimiter.pieces[0].text, "SELECT 1;");
     assert!(postgres_delimiter.notices[0].contains("不使用 DELIMITER"));
+
+    let only_delimiter = split::split_sql("postgres", "DELIMITER $$");
+    assert!(only_delimiter.pieces.is_empty());
+    assert!(only_delimiter.notices[0].contains("不使用 DELIMITER"));
+    let definer = "CREATE DEFINER=root PROCEDURE p()\nBEGIN\n  UPDATE t SET n = 1;\n  UPDATE t SET n = 2;\nEND";
+    let kept = split::split_sql("mysql", definer);
+    assert!(kept.refusal.is_none(), "{:?}", kept.refusal);
+    assert_eq!(kept.pieces.len(), 1, "{:?}", kept.pieces.iter().map(|piece| &piece.text).collect::<Vec<_>>());
+    assert!(kept.pieces[0].text.contains("UPDATE t SET n = 2;"));
+    let host = "CREATE DEFINER=root@localhost FUNCTION f() BEGIN SELECT 1; SELECT 2; END";
+    assert_eq!(split::split_sql("mariadb", host).pieces.len(), 1);
+    let quoted = "CREATE DEFINER=`root`@`localhost` TRIGGER tr BEFORE INSERT ON t FOR EACH ROW BEGIN SET NEW.n = 1; END";
+    assert_eq!(split::split_sql("mysql", quoted).pieces.len(), 1);
+    let open_tail = "DELETE FROM t;\nSELECT 'open";
+    assert!(split::statement_at("postgres", open_tail, open_tail.len()).is_none());
+    assert_eq!(split::statement_at("postgres", open_tail, 0).expect("closed statement").text, "DELETE FROM t;");
+}
+
+#[tokio::test]
+async fn sqlite_delimiter_without_statements_keeps_the_client_notice() {
+    use super::commands::{start_run, QueryState, StartRequest};
+
+    let dir = std::env::temp_dir().join(format!("rillsql-delim-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let service = Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")));
+    let state = QueryState::new(dir.join("history.sqlite"));
+    let err = start_run(
+        &service,
+        &state,
+        StartRequest {
+            connection_id: "notes".to_owned(),
+            connection_name: "本地笔记".to_owned(),
+            database: "main".to_owned(),
+            engine: "sqlite".to_owned(),
+            sql: "DELIMITER $$".to_owned(),
+            limit: 100,
+        },
+    )
+    .await
+    .expect_err("只有客户端指令");
+    assert!(err.contains("不使用 DELIMITER"), "{err}");
+    assert!(!err.contains("只有空白或注释"), "{err}");
+    let blank = start_run(
+        &service,
+        &state,
+        StartRequest {
+            connection_id: "notes".to_owned(),
+            connection_name: "本地笔记".to_owned(),
+            database: "main".to_owned(),
+            engine: "sqlite".to_owned(),
+            sql: "  -- note\n".to_owned(),
+            limit: 100,
+        },
+    )
+    .await
+    .expect_err("空白");
+    assert!(blank.contains("只有空白或注释"), "{blank}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

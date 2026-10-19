@@ -4,10 +4,20 @@ import { analyzeSql, explainSql, hierarchicalSql, planStatement, presentPlan } f
 describe("execution plan selection", () => {
   it("uses the statement at the cursor, or the selection, and refuses empty or multiple statements", () => {
     const sql = "SELECT 1;\nSELECT 2;";
-    expect(planStatement(sql, { from: 0, to: 0, head: 0 })).toEqual({ ok: true, statement: "SELECT 1;" });
+    expect(planStatement(sql, { from: 0, to: 0, head: 0 })).toEqual({ ok: true, statement: "SELECT 1;", from: 0, to: "SELECT 1;".length });
     const second = sql.indexOf("SELECT 2;");
-    expect(planStatement(sql, { from: second, to: second, head: second + 2 })).toEqual({ ok: true, statement: "SELECT 2;" });
-    expect(planStatement(sql, { from: second, to: sql.length, head: sql.length })).toEqual({ ok: true, statement: "SELECT 2;" });
+    expect(planStatement(sql, { from: second, to: second, head: second + 2 })).toEqual({
+      ok: true,
+      statement: "SELECT 2;",
+      from: second,
+      to: second + "SELECT 2;".length,
+    });
+    expect(planStatement(sql, { from: second, to: sql.length, head: sql.length })).toEqual({
+      ok: true,
+      statement: "SELECT 2;",
+      from: second,
+      to: sql.length,
+    });
     expect(planStatement(sql, { from: 0, to: sql.length })).toEqual({ ok: false, reason: "一次只能查看一条语句的执行计划。" });
     expect(planStatement("   ", { from: 0, to: 0 })).toEqual({ ok: false, reason: "没有可查看计划的语句。" });
     expect(planStatement("/* only */", { from: 0, to: 0 })).toEqual({ ok: false, reason: "没有可查看计划的语句。" });
@@ -132,5 +142,49 @@ describe("execution plan selection", () => {
       nodes: [{ depth: 0, operation: "Seq Scan", rows: "10", extra: "rows=10" }],
     });
     expect(presentPlan(["id", "plan"], [["1", "scan"]])).toEqual({ kind: "table" });
+    expect(presentPlan(["EXPLAIN"], [["not a plan"]])).toEqual({ kind: "table" });
+  });
+
+  it("refuses an unclosed tail instead of the previous statement and keeps the cursor range", () => {
+    const sql = "DELETE FROM t;\nSELECT 'open";
+    expect(planStatement(sql, { from: sql.length, to: sql.length, head: sql.length })).toEqual({
+      ok: false,
+      reason: "引号没有闭合，没有发送。",
+    });
+    expect(planStatement(sql, { from: 0, to: 0, head: 0 })).toEqual({
+      ok: true,
+      statement: "DELETE FROM t;",
+      from: 0,
+      to: "DELETE FROM t;".length,
+    });
+    const repeated = "SELECT 1;\nSELECT 1;";
+    const second = repeated.lastIndexOf("SELECT 1;");
+    expect(planStatement(repeated, { from: second, to: second, head: second + 2 })).toEqual({
+      ok: true,
+      statement: "SELECT 1;",
+      from: second,
+      to: second + "SELECT 1;".length,
+    });
+  });
+
+  it("reads a MariaDB JSON plan into operations and estimated rows", () => {
+    const json = JSON.stringify({
+      query_block: {
+        select_id: 1,
+        nested_loop: [
+          { table: { table_name: "orders", access_type: "ALL", rows: 10, filtered: "100.00" } },
+          { table: { table_name: "items", access_type: "ref", rows: 2, extra: "Using where" } },
+        ],
+      },
+    });
+    const plan = presentPlan(["EXPLAIN"], [[json]]);
+    expect(plan.kind).toBe("tree");
+    if (plan.kind !== "tree") return;
+    const orders = plan.nodes.find((node) => node.operation.includes("orders"));
+    const items = plan.nodes.find((node) => node.operation.includes("items"));
+    expect(orders).toMatchObject({ rows: "10" });
+    expect(orders?.extra).toContain("filtered=100.00");
+    expect(items).toMatchObject({ rows: "2" });
+    expect(items?.extra).toContain("Using where");
   });
 });

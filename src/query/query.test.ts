@@ -16,7 +16,7 @@ import { resolveEditor } from "./editor";
 import QueryTab from "./QueryTab.vue";
 import { adoptRun, attachCloser, connectionBusy, guardClose, requestCancel, resetQueryRuntime, startTabRun, tabRun } from "./runtime";
 import { QUERY_EDITOR_KEYS, sqlToRun } from "./scope";
-import { splitSql, statementAt } from "./split";
+import { inspectSql, splitSql, statementAt } from "./split";
 
 const invoke = vi.hoisted(() => vi.fn());
 
@@ -1122,6 +1122,125 @@ describe("query editing", () => {
     await flushPromises();
     expect(invoke).not.toHaveBeenCalled();
     expect(wrapper.get("[role='alert']").text()).toContain("引号没有闭合");
+    wrapper.unmount();
+  });
+
+  it("keeps an unquoted DEFINER routine in one statement", () => {
+    const sql = "CREATE DEFINER=root PROCEDURE p()\nBEGIN\n  UPDATE t SET n = 1;\n  UPDATE t SET n = 2;\nEND";
+    const parts = splitSql(sql, "mysql");
+    expect(parts).toHaveLength(1);
+    expect(parts[0]?.text).toContain("UPDATE t SET n = 2;");
+    expect(parts[0]?.text.startsWith("CREATE DEFINER=root PROCEDURE")).toBe(true);
+    const host = "CREATE DEFINER=root@localhost FUNCTION f() BEGIN SELECT 1; SELECT 2; END";
+    expect(splitSql(host, "mariadb")).toHaveLength(1);
+    const open = inspectSql("CREATE DEFINER=root PROCEDURE p() BEGIN UPDATE t SET n = 1;", "mysql");
+    expect(open.refusal).toContain("例程体未闭合");
+    expect(open.pieces).toHaveLength(0);
+    const quoted = "CREATE DEFINER=`root`@`localhost` PROCEDURE p() BEGIN SELECT 1; END";
+    expect(splitSql(quoted, "mysql")).toHaveLength(1);
+  });
+
+  it("does not replace an unclosed tail with the previous statement", async () => {
+    replaceCatalog(catalogFixture());
+    const calls: string[] = [];
+    invoke.mockImplementation(async (_command: string, args?: { request?: { sql: string } }) => {
+      calls.push(args?.request?.sql ?? "");
+      return runDto();
+    });
+    const draft = "DELETE FROM t;\nSELECT 'open";
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-unclosed-tail",
+        draft,
+        connectionId: "atlas",
+        connectionName: "Atlas",
+        database: "atlas_dev",
+        engine: "postgres",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    const editor = EditorView.findFromDOM(wrapper.get(".cm-content").element)!;
+    editor.dispatch({ selection: { anchor: 0, head: "DELETE FROM t;".length } });
+    await nextTick();
+    await wrapper.get("[data-action='run']").trigger("click");
+    await flushPromises();
+    expect(calls).toEqual(["DELETE FROM t;"]);
+    editor.dispatch({ selection: { anchor: draft.length } });
+    await nextTick();
+    await wrapper.get("[data-action='run-menu']").trigger("click");
+    await wrapper.get("[data-action='run-current']").trigger("click");
+    await flushPromises();
+    expect(calls).toEqual(["DELETE FROM t;"]);
+    expect(wrapper.get("[role='alert']").text()).toContain("引号没有闭合");
+    await wrapper.get("[data-action='plan']").trigger("click");
+    await flushPromises();
+    expect(calls).toEqual(["DELETE FROM t;"]);
+    expect(wrapper.get("[role='alert']").text()).toContain("引号没有闭合");
+    wrapper.unmount();
+  });
+
+  it("marks the cursor statement when the same text appears twice", async () => {
+    replaceCatalog(catalogFixture());
+    invoke.mockImplementation(async (_command: string, args?: { request?: { sql: string } }) => runDto({
+      status: "done",
+      statements: [{
+        sql: args?.request?.sql ?? "",
+        status: "ok",
+        message: "",
+        columns: ["QUERY PLAN"],
+        rows: [["Seq Scan"]],
+        truncated: false,
+        affected: null,
+      }],
+    }));
+    const draft = "SELECT 1;\nSELECT 1;";
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-plan-range",
+        draft,
+        connectionId: "atlas",
+        connectionName: "Atlas",
+        database: "atlas_dev",
+        engine: "postgres",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    const second = draft.lastIndexOf("SELECT 1;");
+    const editor = EditorView.findFromDOM(wrapper.get(".cm-content").element)!;
+    editor.dispatch({ selection: { anchor: second + 2 } });
+    await wrapper.get("[data-action='plan']").trigger("click");
+    await flushPromises();
+    const lines = wrapper.findAll(".cm-line");
+    expect(lines[0]?.html()).not.toContain("cm-send-range");
+    expect(lines[1]?.html()).toContain("cm-send-range");
+    wrapper.unmount();
+  });
+
+  it("explains that PostgreSQL does not use DELIMITER when that is the only text", async () => {
+    replaceCatalog(catalogFixture());
+    invoke.mockResolvedValue(runDto());
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-delimiter-only",
+        draft: "DELIMITER $$",
+        connectionId: "notes",
+        connectionName: "本地笔记",
+        database: "main",
+        engine: "sqlite",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    await wrapper.get("[data-action='run']").trigger("click");
+    await flushPromises();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(wrapper.get("[role='alert']").text()).toContain("不使用 DELIMITER");
+    expect(wrapper.get("[role='alert']").text()).not.toContain("只有空白或注释");
     wrapper.unmount();
   });
 });
