@@ -1,4 +1,4 @@
-/* RillSQL 桌面工具：紧凑密度、五档字号、三档圆角。所有视觉值只从这里取。 */
+/* RillSQL 设计令牌：紧凑桌面密度、五档字号、柔和圆角。所有视觉值只从这里取。 */
 :root {
   /* 字体 */
   --font: "Segoe UI Variable Text", "Segoe UI", -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
@@ -25,12 +25,12 @@
   --sp-7: 32px;
   --sp-8: 48px;
 
-  /* 圆角：控件 4 / 面板 6 / 标签 3 */
-  --r-sm: 3px;
-  --r: 4px;
-  --r-md: 6px;
-  --r-lg: 6px;
-  --r-xl: 6px;
+  /* 圆角刻度：标签 4 / 控件 6 / 菜单 8 / 面板 10 / 对话框 12 */
+  --r-sm: 4px;
+  --r: 6px;
+  --r-md: 8px;
+  --r-lg: 10px;
+  --r-xl: 12px;
   --r-full: 999px;
 
   /* 动效时长与缓动；prefers-reduced-motion 时在文件末尾归零 */
@@ -38,6 +38,7 @@
   --dur: 180ms;
   --dur-slow: 280ms;
   --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
 
   /* 浮层层级：只有这六档，禁止自造 z-index */
   --z-base: 0;
@@ -48,10 +49,10 @@
   --z-toast: 400;
 
   /* 布局尺寸 */
-  --titlebar-h: 26px;
-  --toolbar-h: 36px;
-  --status-h: 24px;
-  --rail-w: 44px;
+  --titlebar-h: 32px;
+  --toolbar-h: 38px;
+  --status-h: 26px;
+  --rail-w: 50px;
   --editor-font: 12px;
 
   /* 密度：默认紧凑 */
@@ -68,82 +69,82 @@
   --control-h-sm: 26px;
 }
 
-/* ---------- 浅色主题（默认） ---------- */
+/* ---------- 浅色主题（默认）：冷灰底 + 靛紫强调 ---------- */
 :root,
 :root[data-theme="light"] {
   color-scheme: light;
 
   /* 背景层级 */
-  --bg: #eef0f2;
+  --bg: #eceef2;
   --chrome: #f4f5f7;
   --panel: #ffffff;
-  --panel-2: #f7f8fa;
-  --sunken: #f7f8fa;
-  --hover: #eceff3;
-  --active: #e3e8ee;
+  --panel-2: #f6f7f9;
+  --sunken: #eef0f4;
+  --hover: #e9ecf1;
+  --active: #dfe3ea;
 
   /* 文本三级 */
-  --text: #1b2229;
-  --text-2: #5a6672;
-  --text-3: #8794a1;
+  --text: #191d24;
+  --text-2: #545d6a;
+  --text-3: #8a93a2;
 
   /* 分隔线 */
-  --line: #dfe3e8;
-  --line-2: #c4ccd4;
+  --line: #e2e5eb;
+  --line-2: #ccd2dc;
 
-  /* 强调（品牌青，加深） */
-  --accent: #0f766e;
-  --accent-hover: #0b5f59;
-  --accent-active: #094f4a;
-  --accent-soft: #e6f2f0;
-  --accent-text: #0b5f59;
+  /* 强调（靛紫） */
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --accent-active: #3730a3;
+  --accent-soft: #ecebfc;
+  --accent-text: #4338ca;
   --on-accent: #ffffff;
 
   /* 状态：ok / warn / err / info */
-  --ok: #18794e;
-  --ok-soft: #e3f4ea;
-  --warn: #945f0d;
-  --warn-soft: #fdf3dd;
-  --warn-line: #eed9a8;
-  --err: #c2332b;
-  --err-soft: #fdecea;
-  --err-line: #f3c6c1;
-  --info: #2f6cb5;
-  --info-soft: #e8f0fa;
+  --ok: #17804b;
+  --ok-soft: #e2f4ea;
+  --warn: #925f08;
+  --warn-soft: #fdf1da;
+  --warn-line: #edd8a0;
+  --err: #cb2d23;
+  --err-soft: #fdeceb;
+  --err-line: #f3c5c2;
+  --info: #2a68c4;
+  --info-soft: #e7eefb;
 
   /* 选中 */
-  --sel: rgba(15, 118, 110, 0.10);
-  --sel-strong: rgba(15, 118, 110, 0.20);
+  --sel: rgba(79, 70, 229, 0.08);
+  --sel-strong: rgba(79, 70, 229, 0.16);
 
   /* 焦点环与禁用态 */
-  --ring: rgba(15, 118, 110, 0.35);
-  --disabled-fg: #9aa1ad;
+  --ring: rgba(79, 70, 229, 0.28);
+  --disabled-fg: #9aa3ae;
   --disabled-bg: #f0f2f5;
 
   /* 阴影：只给浮层，面板不投影 */
-  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06);
-  --shadow: 0 14px 34px rgba(16, 24, 40, 0.16), 0 2px 6px rgba(16, 24, 40, 0.08);
-  --shadow-lg: 0 24px 60px rgba(16, 24, 40, 0.24), 0 4px 10px rgba(16, 24, 40, 0.10);
+  --shadow-sm: 0 1px 2px rgba(18, 24, 34, 0.06), 0 1px 3px rgba(18, 24, 34, 0.04);
+  --shadow: 0 12px 32px rgba(18, 24, 34, 0.14), 0 2px 8px rgba(18, 24, 34, 0.07);
+  --shadow-lg: 0 24px 64px rgba(18, 24, 34, 0.22), 0 6px 16px rgba(18, 24, 34, 0.09);
 
   /* 按压态内阴影：中性 / 强调 / 危险。组件里不许硬编码颜色。 */
-  --press: rgba(16, 24, 40, 0.14);
+  --press: rgba(18, 24, 34, 0.14);
   --press-accent: rgba(0, 0, 0, 0.30);
-  --press-danger: rgba(194, 51, 43, 0.18);
+  --press-danger: rgba(203, 45, 35, 0.18);
 
   /* 语法高亮 */
-  --tk-kw: #7c3aed;
-  --tk-str: #b45309;
-  --tk-num: #0369a1;
-  --tk-com: #8794a1;
-  --tk-fn: #0f766e;
-  --tk-id: #1b2229;
+  --tk-kw: #6d28d9;
+  --tk-str: #b04403;
+  --tk-num: #0270a8;
+  --tk-com: #8a93a2;
+  --tk-fn: #0e7490;
+  --tk-id: #191d24;
 
   /* 环境标签色 */
-  --env-dev: #18794e;
-  --env-test: #2f6cb5;
-  --env-prod: #c2332b;
-  --env-local: #6d4fd0;
-  --env-none: #8794a1;
+  --env-dev: #12805c;
+  --env-test: #2563c9;
+  --env-prod: #cb2d23;
+  --env-local: #6d3fd4;
+  --env-none: #8a93a2;
 
   /* 引擎色 */
   --eng-postgres: #336791;
@@ -152,103 +153,103 @@
   --eng-sqlite: #0f80cc;
 
   /* 活动栏与页面遮罩：两套主题各自改写，组件里不再写死。 */
-  --nav-bg: #e4e9ee;
-  --nav-fg: #5a6672;
-  --nav-active: #0b5f59;
-  --nav-hover: rgba(15, 118, 110, 0.10);
-  --nav-active-bg: rgba(15, 118, 110, 0.16);
-  --overlay: rgba(16, 24, 40, 0.32);
+  --nav-bg: #e9ecf1;
+  --nav-fg: #5d6675;
+  --nav-active: #4338ca;
+  --nav-hover: rgba(79, 70, 229, 0.08);
+  --nav-active-bg: rgba(79, 70, 229, 0.13);
+  --overlay: rgba(19, 23, 32, 0.36);
 }
 
 /* ---------- 深色主题（独立配色，不是机械反色） ---------- */
 :root[data-theme="dark"] {
   color-scheme: dark;
 
-  /* 背景层级 */
-  --bg: #0f1519;
-  --chrome: #121b20;
-  --panel: #161f25;
-  --panel-2: #1a242b;
-  --sunken: #121a1f;
-  --hover: #202b33;
-  --active: #27343d;
+  /* 背景层级：中性蓝灰，由深到浅 */
+  --bg: #0c0e13;
+  --chrome: #11141b;
+  --panel: #161a22;
+  --panel-2: #1b202a;
+  --sunken: #10141b;
+  --hover: #232936;
+  --active: #2b3140;
 
   /* 文本三级 */
-  --text: #dfe7ec;
-  --text-2: #9fb0bb;
-  --text-3: #7b8b96;
+  --text: #e6e9ef;
+  --text-2: #a0a9b6;
+  --text-3: #737d8c;
 
   /* 分隔线 */
-  --line: #26313a;
-  --line-2: #33414c;
+  --line: #262c38;
+  --line-2: #384051;
 
-  /* 强调 */
-  --accent: #2dd4bf;
-  --accent-hover: #5eead4;
-  --accent-active: #99f6e4;
-  --accent-soft: #14322f;
-  --accent-text: #5eead4;
-  --on-accent: #06201d;
+  /* 强调（柔光靛紫） */
+  --accent: #8b7ff7;
+  --accent-hover: #a196f9;
+  --accent-active: #b7adf9;
+  --accent-soft: #22203c;
+  --accent-text: #aca3fa;
+  --on-accent: #131224;
 
   /* 状态 */
-  --ok: #66c896;
-  --ok-soft: #18291f;
-  --warn: #e5b568;
-  --warn-soft: #2c2416;
-  --warn-line: #4d3f22;
-  --err: #f08a80;
-  --err-soft: #331d1b;
-  --err-line: #542e2a;
-  --info: #8ab6ee;
-  --info-soft: #1b2634;
+  --ok: #5dc591;
+  --ok-soft: #17281f;
+  --warn: #e0b25e;
+  --warn-soft: #281f12;
+  --warn-line: #473a1e;
+  --err: #ef837a;
+  --err-soft: #2c1b19;
+  --err-line: #4e2b27;
+  --info: #7faeee;
+  --info-soft: #182334;
 
   /* 选中 */
-  --sel: rgba(45, 212, 191, 0.14);
-  --sel-strong: rgba(45, 212, 191, 0.26);
+  --sel: rgba(139, 127, 247, 0.12);
+  --sel-strong: rgba(139, 127, 247, 0.22);
 
   /* 焦点环与禁用态 */
-  --ring: rgba(45, 212, 191, 0.40);
-  --disabled-fg: #5f6d77;
-  --disabled-bg: #1a242b;
+  --ring: rgba(139, 127, 247, 0.45);
+  --disabled-fg: #5b6472;
+  --disabled-bg: #1b202a;
 
   /* 阴影 */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.40);
-  --shadow: 0 14px 34px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.35);
-  --shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.65), 0 4px 10px rgba(0, 0, 0, 0.40);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45);
+  --shadow: 0 14px 36px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.35);
+  --shadow-lg: 0 28px 72px rgba(0, 0, 0, 0.65), 0 6px 16px rgba(0, 0, 0, 0.42);
 
   /* 按压态内阴影 */
   --press: rgba(0, 0, 0, 0.45);
   --press-accent: rgba(0, 0, 0, 0.40);
-  --press-danger: rgba(240, 138, 128, 0.18);
+  --press-danger: rgba(239, 131, 122, 0.18);
 
   /* 语法高亮 */
-  --tk-kw: #c4a5ff;
-  --tk-str: #e8b37d;
-  --tk-num: #8ec6fb;
-  --tk-com: #7b8b96;
-  --tk-fn: #5eead4;
-  --tk-id: #dfe7ec;
+  --tk-kw: #b7a5ff;
+  --tk-str: #e8b07d;
+  --tk-num: #85bbf5;
+  --tk-com: #737d8c;
+  --tk-fn: #63d5cc;
+  --tk-id: #e6e9ef;
 
   /* 环境标签色 */
-  --env-dev: #66c896;
-  --env-test: #8ab6ee;
-  --env-prod: #f08a80;
-  --env-local: #b3a1ff;
-  --env-none: #7b8b96;
+  --env-dev: #5dc591;
+  --env-test: #7faeee;
+  --env-prod: #ef837a;
+  --env-local: #ab90f5;
+  --env-none: #737d8c;
 
   /* 引擎色 */
   --eng-postgres: #8bb3dc;
-  --eng-mysql: #5fbfd3;
-  --eng-mariadb: #e2a07f;
-  --eng-sqlite: #77b9ea;
+  --eng-mysql: #61c2d8;
+  --eng-mariadb: #e09d7c;
+  --eng-sqlite: #74b8ea;
 
   /* 活动栏与页面遮罩 */
-  --nav-bg: #122026;
-  --nav-fg: #7f96a1;
-  --nav-active: #5eead4;
-  --nav-hover: #ffffff0d;
-  --nav-active-bg: #ffffff14;
-  --overlay: rgba(0, 0, 0, 0.56);
+  --nav-bg: #0d1017;
+  --nav-fg: #7d8796;
+  --nav-active: #aca3fa;
+  --nav-hover: rgba(139, 127, 247, 0.10);
+  --nav-active-bg: rgba(139, 127, 247, 0.18);
+  --overlay: rgba(4, 6, 10, 0.58);
 }
 
 /* 动效降级：用户要求减少动效时，所有时长令牌归零 */

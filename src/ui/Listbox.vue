@@ -308,6 +308,7 @@ onBeforeUnmount(() => {
   border-radius: var(--r-md);
   background: var(--panel);
   box-shadow: var(--shadow);
+  animation: pop-in var(--dur-fast) var(--ease-out);
 }
 .listbox-filter {
   width: 100%;

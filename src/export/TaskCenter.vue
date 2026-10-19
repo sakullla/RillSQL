@@ -70,7 +70,7 @@ function percent(task: ExportTask): number {
 .tc-trigger:hover { background: var(--hover); color: var(--text); }
 .tc-trigger .i { width: 13px; height: 13px; }
 .tc-trigger.busy { background: var(--accent-soft); color: var(--accent-text); }
-.tc-pop { position: absolute; right: 0; top: 32px; width: 340px; max-height: 420px; overflow: auto; background: var(--panel); border: 1px solid var(--line-2); border-radius: var(--r-lg); box-shadow: var(--shadow); padding: var(--sp-3); z-index: 30; }
+.tc-pop { position: absolute; right: 0; top: 32px; width: 340px; max-height: 420px; overflow: auto; background: var(--panel); border: 1px solid var(--line-2); border-radius: var(--r-lg); box-shadow: var(--shadow); padding: var(--sp-3); z-index: 30; animation: pop-in var(--dur-fast) var(--ease-out); }
 .tc-head { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-2); }
 .tc-head strong { font-size: var(--fs-sm); }
 .tc-empty { margin: var(--sp-2) 0; color: var(--text-3); font-size: var(--fs-sm); }

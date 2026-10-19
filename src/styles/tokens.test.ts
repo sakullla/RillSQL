@@ -114,13 +114,13 @@ describe("design tokens", () => {
     expect(block(":root[data-theme=\"dark\"]")).toContain("color-scheme: dark");
   });
 
-  it("uses the desktop control shape scale: 4px controls, 6px panels, 3px tags", () => {
+  it("uses the softened desktop shape scale: 6px controls, 10px panels, 4px tags", () => {
     const root = block(":root {");
-    expect(tokenValue(root, "--r")).toBe("4px");
-    expect(tokenValue(root, "--r-sm")).toBe("3px");
-    expect(tokenValue(root, "--r-md")).toBe("6px");
-    expect(tokenValue(root, "--r-lg")).toBe("6px");
-    expect(tokenValue(root, "--r-xl")).toBe("6px");
+    expect(tokenValue(root, "--r")).toBe("6px");
+    expect(tokenValue(root, "--r-sm")).toBe("4px");
+    expect(tokenValue(root, "--r-md")).toBe("8px");
+    expect(tokenValue(root, "--r-lg")).toBe("10px");
+    expect(tokenValue(root, "--r-xl")).toBe("12px");
   });
 
   it("defines the five-step type scale and the float layer scale", () => {

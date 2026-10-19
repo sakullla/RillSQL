@@ -16,12 +16,13 @@
   font-size: var(--fs-sm);
   white-space: nowrap;
   user-select: none;
-  transition: background var(--dur-fast) var(--ease);
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
 .tree-row:hover { background: var(--hover); }
-.tree-row.active { background: var(--accent-soft); color: var(--accent-text); font-weight: 500; }
+.tree-row.active { background: var(--sel-strong); color: var(--accent-text); font-weight: 600; }
+.tree-row.active > .i { color: var(--accent-text); }
 .tree-row:focus-visible { outline-offset: -2px; }
-.tree .tw { width: 14px; display: grid; place-items: center; color: var(--text-3); flex-shrink: 0; }
+.tree .tw { width: 14px; display: grid; place-items: center; color: var(--text-3); flex-shrink: 0; transition: transform var(--dur-fast) var(--ease); }
 .tree .tw .i { width: 12px; height: 12px; }
 .tree-row > .i { width: 15px; height: 15px; color: var(--text-3); }
 .tree .tr-name { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
@@ -57,7 +58,7 @@
 .tree .tr-hit > .i { margin-top: 2px; }
 .tree .hit-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .tree .hit-path { display: flex; gap: var(--sp-1); align-items: center; font-size: var(--fs-xs); color: var(--text-3); font-weight: 400; }
-.tree mark { background: var(--accent-soft); color: var(--accent-text); font-weight: 600; border-radius: var(--r-sm); padding: 0 1px; }
+.tree mark { background: var(--accent-soft); color: var(--accent-text); font-weight: 600; border-radius: var(--r-sm); padding: 0 2px; }
 
 /* ---------- 引擎缩写块 ---------- */
 .tree .eng {
@@ -70,7 +71,8 @@
   font: 700 var(--fs-xs)/1 var(--font);
   letter-spacing: -0.2px;
   color: var(--engc);
-  background: color-mix(in srgb, var(--engc) 14%, transparent);
+  background: color-mix(in srgb, var(--engc) 12%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--engc) 20%, transparent);
   flex-shrink: 0;
 }
 .tree .eng-postgres { --engc: var(--eng-postgres); }

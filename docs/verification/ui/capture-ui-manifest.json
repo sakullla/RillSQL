@@ -1,0 +1,82 @@
+{
+  "capturedAt": "2026-10-19T15:03:09.868Z",
+  "synthetic": true,
+  "invocation": "node scripts/capture-ui.mjs --theme light --size 1360 --only welcome,connections,query,data-grid,command-palette,settings",
+  "previewUrl": "http://localhost:1420",
+  "matrix": {
+    "themes": [
+      "light"
+    ],
+    "widths": [
+      1360
+    ]
+  },
+  "selectedScenarios": [
+    "welcome",
+    "connections",
+    "query",
+    "data-grid",
+    "settings",
+    "command-palette"
+  ],
+  "missing": [],
+  "success": true,
+  "imageCount": 6,
+  "captures": [
+    {
+      "name": "welcome",
+      "title": "欢迎页与资源管理器",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "welcome-light-1360.png",
+      "state": "已有连接时内容区不列连接卡片，对象树仍是连接名单"
+    },
+    {
+      "name": "connections",
+      "title": "连接管理",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "connections-light-1360.png",
+      "state": "已连接、每次询问密码、SQLite 文件三种卡片"
+    },
+    {
+      "name": "query",
+      "title": "查询结果",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "query-light-1360.png",
+      "state": "选择执行目标后的查询结果"
+    },
+    {
+      "name": "data-grid",
+      "title": "数据表格",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "data-grid-light-1360.png",
+      "state": "orders 已读取的三行，含 NULL"
+    },
+    {
+      "name": "command-palette",
+      "title": "命令面板",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "command-palette-light-1360.png",
+      "state": "表、连接和命令"
+    },
+    {
+      "name": "settings",
+      "title": "设置",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "settings-light-1360.png",
+      "state": "外观、数据读取、本地数据和关于"
+    }
+  ],
+  "failures": []
+}

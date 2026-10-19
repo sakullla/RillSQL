@@ -354,7 +354,8 @@ onMounted(() => {
 .hist-day { margin-bottom: var(--sp-6); }
 .hist-day h2 { font-size: var(--fs-sm); color: var(--text-3); font-weight: 600; margin: 0 0 var(--sp-2); }
 .hist-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
-.hist-card { border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--panel); padding: var(--sp-3) var(--sp-4); }
+.hist-card { border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--panel); padding: var(--sp-3) var(--sp-4); transition: background var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease); }
+.hist-card:hover { box-shadow: var(--shadow-sm); }
 .hist-top { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
 .hist-target { font-size: var(--fs-sm); font-weight: 600; }
 .hist-sql { white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: var(--fs-sm); line-height: var(--lh); background: var(--sunken); border-radius: var(--r); padding: var(--sp-2) var(--sp-3); margin: var(--sp-2) 0; }
@@ -370,6 +371,7 @@ onMounted(() => {
 .hist-card:last-child { border-bottom: 1px solid var(--line); border-radius: 0 0 var(--r-lg) var(--r-lg); }
 .hist-card:only-child { border-radius: var(--r-lg); }
 .hist-card.selected { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
+.hist-card.selected:hover { box-shadow: inset 3px 0 var(--accent); }
 .hist-preview { display: block; text-align: left; width: 100%; margin: 12px 0; color: var(--text); }
 .hist-preview code { display: block; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hist-foot { gap: 8px; }
