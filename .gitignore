@@ -5,7 +5,6 @@ dist/
 src-tauri/target/
 *.log
 .DS_Store
-docs/requirements/
-docs/sakullla-workflow/2026-10-16-使用体验重做/
+docs/*
 .compose/
 plans/
