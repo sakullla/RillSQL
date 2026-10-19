@@ -64,6 +64,12 @@ export class LiveTable {
     return this.store.schema.kind !== "table" || this.store.schema.key.length === 0;
   }
 
+  /** 定位列为空时，页查询的 null 守卫已经返回全文，不再当成未展开的预览。 */
+  private rowHasFullValues(row: Row): boolean {
+    if (this.fullValuePage()) return true;
+    return this.store.schema.key.some((name) => row.cells[name] === null);
+  }
+
   get scopeLabel(): string {
     return "筛选和排序作用于整张表";
   }
@@ -98,7 +104,7 @@ export class LiveTable {
       if (generation !== this.readGeneration) return null;
       this.sql = page.sql;
       this.error = null;
-      const rows = this.fullValuePage() ? page.rows.map((row) => ({ ...row, resolved: true })) : page.rows;
+      const rows = page.rows.map((row) => (this.rowHasFullValues(row) ? { ...row, resolved: true } : row));
       this.loaded = replace ? rows : [...this.loaded, ...rows];
       this.truncated = page.truncated;
       if (replace) this.counted = null;
@@ -150,6 +156,7 @@ export class LiveTable {
   /** 导出前把可定位行的预览换成完整文本或十六进制。读不到就不要把预览协议写进文件。 */
   async expandPreviews(): Promise<string | null> {
     for (const row of [...this.loaded]) {
+      if (row.resolved) continue;
       const needs = this.store.schema.columns.some((column) => needsFullRead(row.cells[column.name], column));
       if (!needs) continue;
       if (!row.located) return "不能按主键读取完整值，预览不能导出";

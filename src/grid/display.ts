@@ -88,13 +88,12 @@ export function copyPlain(value: Cell | undefined, nullCopy: NullCopy): string {
   return value;
 }
 
-/** 矩形和单格共用 NULL 记号。二进制复制十六进制，不复制替换字符。 */
+/** 矩形和单格共用 NULL 记号。二进制复制十六进制，不复制替换字符。二进制信封只属于二进制列。 */
 export function copyCellText(value: Cell | undefined, nullCopy: NullCopy, column?: Column, resolved = false): string {
   if (value === null || value === undefined) return copyPlain(value, nullCopy);
   if (column && valueFamily(column.typeName) === "binary") return parseHex(value) ?? "";
   if (resolved) return value;
   const envelope = parseEnvelope(value);
-  if (envelope?.kind === "binary") return "";
   if (envelope?.kind === "text") return envelope.preview;
   return value;
 }

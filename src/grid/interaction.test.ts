@@ -78,6 +78,9 @@ describe("grid display, copy and typed literals", () => {
     expect(showCell("abcd", { column: column("blob", "bytea"), opened: true }).body).toBe("abcd");
     expect(showCell("\u0001b:4", { column: column("blob", "bytea") }).label).toBe("二进制 · 4 字节");
     expect(copyCellText("abcd", "NULL", column("blob", "bytea"))).toBe("abcd");
+    expect(copyCellText("\u0001b:4", "NULL", column("blob", "bytea"))).toBe("");
+    expect(copyCellText("\u0001b:4", "NULL", column("note", "text"))).toBe("\u0001b:4");
+    expect(selectionTsv([{ row: "1", column: "note" }, { row: "1", column: "blob" }], (point) => copyCellText("\u0001b:4", "empty", column(point.column, point.column === "blob" ? "bytea" : "text")))).toBe("\u0001b:4\t");
     expect(rejectWrite(column("blob", "bytea"), "zz")).toBe("这不是十六进制");
     expect(rejectWrite(column("note", "text"), "\u0001t:11:hello")).toBeNull();
     expect(copyCellText("\u0001t:11:hello", "NULL", column("note", "text"))).toBe("\u0001t:11:hello");
@@ -294,6 +297,61 @@ describe("grid column width, clipboard and paging", () => {
     const commit = invoke.mock.calls.filter((call) => call[0] === "grid_commit").at(-1)?.[1] as { request: { changes: { sets: { value: string; resolved?: boolean }[] }[] } };
     expect(commit.request.changes[0]?.sets[0]).toMatchObject({ value: synthetic, resolved: true });
     same.unmount();
+  });
+
+  it("copies binary-envelope-shaped text as the original string", async () => {
+    const shaped = "\u0001b:4";
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return schema();
+      if (command === "grid_page") {
+        return { rows: [{ ...row(), cells: { id: "1", note: shaped, blob: "abcd", shape: "POINT(1 2)" } }], truncated: false, sql: "SELECT page" };
+      }
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:docs-binary-shape", draft: "", pageSize: 10, target } });
+    await flushPromises();
+    expect(wrapper.get("[data-cell='1:note']").text()).toContain(shaped);
+    await wrapper.get("[data-cell='1:note']").trigger("click");
+    await wrapper.findAll("button").find((button) => button.text() === "复制值")!.trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledWith(shaped);
+    await wrapper.get("[data-cell='1:note']").trigger("pointerdown");
+    await wrapper.get("[data-cell='1:blob']").trigger("pointerenter");
+    await wrapper.get("[data-cell='1:note']").trigger("contextmenu", { clientX: 4, clientY: 4 });
+    await wrapper.get(".cell-menu").findAll("button").find((button) => button.text() === "复制")!.trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenLastCalledWith(`${shaped}\tabcd`);
+    wrapper.unmount();
+  });
+
+  it("shows and copies the full text when a null key already returned it", async () => {
+    const synthetic = `\u0001t:3000:${"a".repeat(1024)}`;
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return schema();
+      if (command === "grid_page") {
+        return {
+          rows: [{ id: "o:0:0", cells: { id: null, note: synthetic, blob: "abcd", shape: "POINT(1 2)" }, located: false, locatorColumns: [], locatorValues: [] }],
+          truncated: false,
+          sql: "SELECT page",
+        };
+      }
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:docs-null-key", draft: "", pageSize: 10, target } });
+    await flushPromises();
+    expect(wrapper.get("[data-cell='o:0:0:note']").text()).toContain("t:3000");
+    await wrapper.get("[data-cell='o:0:0:note']").trigger("click");
+    await wrapper.findAll("button").find((button) => button.text() === "读取完整值")!.trigger("click");
+    await flushPromises();
+    expect((wrapper.get("textarea").element as HTMLTextAreaElement).value).toBe(synthetic);
+    await wrapper.findAll("button").find((button) => button.text() === "复制值")!.trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledWith(synthetic);
+    await wrapper.get("[data-cell='o:0:0:note']").trigger("contextmenu", { clientX: 4, clientY: 4 });
+    await wrapper.get(".cell-menu").findAll("button").find((button) => button.text() === "复制")!.trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenLastCalledWith(synthetic);
+    wrapper.unmount();
   });
 
   it("shows and copies a protocol-shaped original once the value is complete", async () => {
