@@ -60,11 +60,29 @@ pub fn reject_literal(column: &Column, value: &Cell) -> Option<String> {
         ValueFamily::Raw => Some("不能判断写回方式，不能编辑".to_owned()),
         _ => match value {
             Cell::Null => None,
+            Cell::Text(text) if is_preview_envelope(text) => Some("预览内容不能写回".to_owned()),
             Cell::Text(text) if family == ValueFamily::Binary && parse_hex(text).is_none() => Some("这不是十六进制".to_owned()),
             Cell::Text(text) if family == ValueFamily::Bool && bool_literal(text).is_none() => Some("不能写成布尔字面量".to_owned()),
             Cell::Text(_) => None,
         },
     }
+}
+
+/// 与前端预览协议一致：U+0001 开头的 t:字节数:预览 或 b:字节数。
+fn is_preview_envelope(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix('\u{1}') else {
+        return false;
+    };
+    if let Some(body) = rest.strip_prefix("b:") {
+        return !body.is_empty() && body.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    if let Some(body) = rest.strip_prefix("t:") {
+        let Some((count, _)) = body.split_once(':') else {
+            return false;
+        };
+        return !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    false
 }
 
 fn like_literal(value: &str, contains: bool) -> String {

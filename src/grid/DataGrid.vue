@@ -11,7 +11,7 @@ import { catalogConnections } from "../catalog/store";
 import { registerPending } from "../shell/close-guard";
 import { loadSettings } from "../shell/settings";
 import { rectangleSelection, selectionTsv, type CellPoint } from "./clipboard";
-import { copyCellText, copySqlValue, needsFullRead, showCell, type NullCopy } from "./display";
+import { copyCellText, copySqlValue, needsFullRead, parseEnvelope, showCell, type NullCopy } from "./display";
 import { rejectWrite, typeCaption } from "./typeset";
 import "./grid.css";
 import { useRowWindow } from "./virtual";
@@ -70,6 +70,7 @@ const focusCellPoint = ref<CellPoint | null>(null);
 const dragging = ref(false);
 const menu = ref<{ x: number; y: number; row: string; column: string } | null>(null);
 const menuError = ref("");
+let editToken = 0;
 let resizeMove: ((event: PointerEvent) => void) | null = null;
 let resizeUp: (() => void) | null = null;
 watch(() => props.pageSize, size => { if (session && size) session.pageSize = size; });
@@ -214,13 +215,30 @@ function moveSelection(delta: number) {
   focusCell(row.id, column.name);
 }
 
-function beginEdit(id: string, column: string) {
+async function beginEdit(id: string, column: string) {
+  const token = ++editToken;
   const row = displayRows.value.find((item) => item.id === id);
   if (!row || !session) return;
   const meta = columns.value.find((item) => item.name === column);
   if (rejectWrite(meta, null)) return;
   if (row.kind === "data" && !session.canUpdate(session.rowById(id))) return;
+  if (needsFullRead(session.cellValue(id, column), meta)) {
+    const error = await ensureFull(id, column);
+    if (token !== editToken) return;
+    if (error) {
+      editError.value = error;
+      if (menu.value?.row === id && menu.value.column === column) menuError.value = error;
+      return;
+    }
+  }
+  if (token !== editToken) return;
   const current = session.cellValue(id, column);
+  if (typeof current === "string" && parseEnvelope(current)) {
+    const message = "预览内容不能写回";
+    editError.value = message;
+    if (menu.value?.row === id && menu.value.column === column) menuError.value = message;
+    return;
+  }
   editError.value = "";
   editing.value = { id, column, draft: current ?? "", isNull: current === null };
   session.select(id, column);
@@ -519,17 +537,23 @@ const insertTarget = computed<InsertTarget | null>(() => {
   };
 });
 
-function startExport(payload: { scope: ExportScope; acknowledged: boolean; path: string; csv: CsvOptions; format: ExportFormat }) {
+async function startExport(payload: { scope: ExportScope; acknowledged: boolean; path: string; csv: CsvOptions; format: ExportFormat }) {
   if (!session?.target) return;
   const plan = planExport({
     origin: "table",
     scope: payload.scope,
     truncated: session.truncated,
     fileName: payload.path,
+    engine: session.target.engine,
   });
   exportOpen.value = false;
   if (payload.scope === "loaded") {
     exportMessage.value = payload.format === "csv" ? "正在保存 CSV…" : "正在保存已读取的行…";
+    const blocked = await session.expandPreviews();
+    if (blocked) {
+      exportMessage.value = blocked;
+      return;
+    }
     const columns = session.store.schema.columns.map((column) => column.name);
     void runExportTask({
       plan,
@@ -612,6 +636,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
       <div class="disclosure-body"><pre class="sql-code">{{ session.sql }}</pre></div>
     </details>
     <p v-if="filterError" class="grid-alert" role="alert">{{ filterError }}</p>
+    <p v-if="editError && !editing" class="grid-alert" role="alert">{{ editError }}</p>
     <p v-if="importMessage" class="hint export-message" role="status">{{ importMessage }}</p>
     <p v-if="exportMessage" class="hint export-message" role="status">{{ exportMessage }}</p>
     <p v-if="session.error" class="grid-alert" role="alert">读取失败：{{ session.error }}。这不是无匹配结果。筛选条件仍保留。 <button class="btn sm" type="button" :disabled="retrying" @click="retryRead">重试</button></p>

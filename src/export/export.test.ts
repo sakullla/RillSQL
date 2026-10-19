@@ -64,6 +64,10 @@ describe("csv export", () => {
     expect(selectExportGate("WITH c AS (SELECT 1) SELECT * FROM c").ok).toBe(false);
     expect(selectExportGate("SELECT 1; DELETE FROM t").ok).toBe(false);
     expect(selectExportGate("DELETE FROM t").reason).toContain("SELECT");
+    const mysql = planExport({ origin: "query", scope: "full", statement: "SELECT 1 # keep;\nFROM t", truncated: false, fileName: "q.csv", engine: "mysql" });
+    expect(mysql.allowed).toBe(true);
+    const splitByDefault = planExport({ origin: "query", scope: "full", statement: "SELECT 1 # keep;\nFROM t", truncated: false, fileName: "q.csv" });
+    expect(splitByDefault.allowed).toBe(false);
     const blocked = planExport({ origin: "query", scope: "full", statement: "UPDATE t SET a = 1", truncated: true, fileName: "q.csv" });
     expect(blocked.allowed).toBe(false);
     const allowed = planExport({ origin: "query", scope: "full", statement: "SELECT id, note FROM customers", truncated: true, fileName: "q.csv" });

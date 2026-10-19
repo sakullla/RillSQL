@@ -252,6 +252,7 @@ fn preview_sql_literals_and_split_follow_the_query_scanner() {
     assert_eq!(sql::sql_cell(Engine::Postgres, Some(&blob), &Cell::Text("0A0B".to_owned())), "'\\x0a0b'");
     assert_eq!(sql::sql_cell(Engine::Mysql, Some(&blob), &Cell::Text("aa".to_owned())), "X'aa'");
     assert_eq!(sql::reject_literal(&blob, &Cell::Text("zz".to_owned())).as_deref(), Some("这不是十六进制"));
+    assert_eq!(sql::reject_literal(&col("note", "text"), &Cell::Text("\u{1}t:11:hello".to_owned())).as_deref(), Some("预览内容不能写回"));
     assert_eq!(sql::reject_literal(&col("shape", "geometry"), &Cell::Null).as_deref(), Some("几何类型不能从格子保存"));
     assert!(sql::reject_literal(&col("mystery", ""), &Cell::Text("a".to_owned())).unwrap().contains("类型未知"));
     assert!(sql::reject_literal(&col("weird", "interval"), &Cell::Null).unwrap().contains("不能判断写回方式"));
@@ -606,7 +607,7 @@ async fn open_session_reads_writes_and_exports_without_a_second_connection() {
 
 #[tokio::test]
 async fn located_rows_preview_until_a_key_reread_and_bad_literals_are_not_sent() {
-    use super::live::{self, Mutation, MutationKind};
+    use super::live::{self, ExportMode, ExportSpec, Mutation, MutationKind};
     use crate::connections::Service;
 
     let dir = std::env::temp_dir().join(format!("rillsql-grid-preview-{}", uuid::Uuid::new_v4()));
@@ -720,6 +721,59 @@ async fn located_rows_preview_until_a_key_reread_and_bad_literals_are_not_sent()
     assert!(saved.failed.is_none());
     assert!(saved.applied[0].sql.contains("TRUE"));
     assert!(!saved.applied[0].sql.contains("'yes'"));
+
+    let preview_rejected = live::commit(
+        &session,
+        "main",
+        "",
+        "docs",
+        "sqlite",
+        &[Mutation {
+            id: "preview".to_owned(),
+            kind: MutationKind::Update,
+            sets: vec![("note".to_owned(), Cell::Text(format!("\u{1}t:3000:{}", "a".repeat(1024))))],
+            locator: short.locator.clone(),
+            values: Vec::new(),
+        }],
+    )
+    .await
+    .unwrap();
+    let preview_failed = preview_rejected.failed.expect("预览不能写回");
+    assert!(preview_failed.sql.is_empty());
+    assert!(preview_failed.message.contains("预览"));
+
+    let export_path = dir.join("docs-full.csv");
+    let exported = live::run_export(
+        &session,
+        &ExportSpec {
+            id: "docs-full".to_owned(),
+            mode: ExportMode::TableFull,
+            database: "main".to_owned(),
+            schema: String::new(),
+            table: "docs".to_owned(),
+            engine_hint: "sqlite".to_owned(),
+            filters: Vec::new(),
+            sort: None,
+            limit: 0,
+            truncated: false,
+            statement: String::new(),
+            acknowledged: true,
+            path: export_path.display().to_string(),
+            delimiter: ",".to_owned(),
+            null_token: String::new(),
+            bom: false,
+            header: true,
+            format: "csv".to_owned(),
+            fail_after_rows: None,
+            cancel_after_rows: None,
+        },
+    )
+    .await;
+    assert!(exported.success, "{}", exported.message);
+    let body = fs::read_to_string(exported.path.unwrap()).unwrap();
+    assert!(body.contains(&long), "{body}");
+    assert!(body.contains("abcd"), "{body}");
+    assert!(!body.contains('\u{1}'), "{body}");
 
     let view = live::query_page(&session, "main", "", "v_docs", "sqlite", &[], None, 0, 10).await.unwrap();
     assert!(!view.sql.contains("char(1)"), "{}", view.sql);

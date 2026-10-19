@@ -438,6 +438,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
     statement: props.statement,
     truncated: props.truncated,
     fileName: payload.path,
+    engine: props.engine,
   });
   if (payload.format === "insert" && !insertTarget.value?.name) {
     exportMessage.value = `${reason.value} INSERT 没有开始。`;
@@ -594,6 +595,7 @@ watch(() => props.rows, (rows) => {
       :open="exportOpen"
       origin="query"
       :statement="statement"
+      :engine="engine"
       :truncated="truncated"
       file-stem="query"
       :loaded-count="rows.length"

@@ -9,6 +9,8 @@ export interface ExportPlanInput {
   statement?: string;
   truncated: boolean;
   fileName: string;
+  /** 查询全量导出按这个引擎切语句。缺省仍按 PostgreSQL。 */
+  engine?: string;
 }
 
 export interface ExportPlan {
@@ -34,7 +36,7 @@ export function planExport(input: ExportPlanInput): ExportPlan {
   const partial = input.scope === "loaded" && input.truncated;
   const fileName = partial ? partialFileName(input.fileName) : input.fileName;
   if (input.scope === "full" && input.origin === "query") {
-    const gate = selectExportGate(input.statement ?? "");
+    const gate = selectExportGate(input.statement ?? "", input.engine);
     if (!gate.ok) {
       return {
         allowed: false,

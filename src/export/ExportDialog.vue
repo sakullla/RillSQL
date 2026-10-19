@@ -13,6 +13,7 @@ const props = defineProps<{
   open: boolean;
   origin: ExportOrigin;
   statement?: string;
+  engine?: string;
   truncated: boolean;
   fileStem: string;
   loadedCount: number;
@@ -83,6 +84,7 @@ const plan = computed(() =>
     statement: props.statement,
     truncated: props.truncated,
     fileName: path.value.trim() || `${props.fileStem}.csv`,
+    engine: props.engine,
   }),
 );
 const insertBlocked = computed(() => format.value === "insert" && !props.insertTarget?.name);

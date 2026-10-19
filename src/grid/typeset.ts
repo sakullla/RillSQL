@@ -19,6 +19,15 @@ export function isUnknownType(typeName: string | undefined): boolean {
   return name.length === 0 || name === "类型未知";
 }
 
+/** 页查询留给可定位行的预览协议，不是格子里的原值。 */
+export function isPreviewEnvelope(value: string): boolean {
+  if (!value.startsWith("\u0001t:") && !value.startsWith("\u0001b:")) return false;
+  const body = value.slice(3);
+  if (value[1] === "b") return /^\d+$/.test(body);
+  const cut = body.indexOf(":");
+  return cut > 0 && /^\d+$/.test(body.slice(0, cut));
+}
+
 export function valueFamily(typeName: string | undefined): ValueFamily {
   if (isUnknownType(typeName)) return "unknown";
   const name = baseType(typeName ?? "");
@@ -55,6 +64,7 @@ export function rejectWrite(column: Column | undefined, value: Cell | undefined)
   if (family === "geometry") return "几何类型不能从格子保存";
   if (family === "raw") return "不能判断写回方式，不能编辑";
   if (value === null) return null;
+  if (isPreviewEnvelope(value)) return "预览内容不能写回";
   if (family === "binary" && parseHex(value) == null) return "这不是十六进制";
   if (family === "bool" && !boolLiteral(value)) return "不能写成布尔字面量";
   return null;

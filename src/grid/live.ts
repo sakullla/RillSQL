@@ -3,6 +3,7 @@ import { deleteSql, insertSql, updateSql } from "./sql";
 import type { TableTarget } from "./target";
 import type { Cell, Change, CommitReport, CommitStep, Filter, Row, SortSpec, TableStore } from "./types";
 import { opNeedsValue } from "./types";
+import { needsFullRead, parseEnvelope } from "./display";
 import { rejectWrite } from "./typeset";
 
 export interface InsertDraft {
@@ -138,6 +139,24 @@ export class LiveTable {
     return this.readWindow(this.loaded.length, this.pageSize, false).finally(() => {
       this.paging = false;
     });
+  }
+
+  /** 导出前把可定位行的预览换成完整文本或十六进制。读不到就不要把预览协议写进文件。 */
+  async expandPreviews(): Promise<string | null> {
+    for (const row of [...this.loaded]) {
+      const needs = this.store.schema.columns.some((column) => needsFullRead(row.cells[column.name], column));
+      if (!needs) continue;
+      if (!row.located) return "不能按主键读取完整值，预览不能导出";
+      const error = await this.readLocated(row.id);
+      if (error) return error;
+      const fresh = this.rowById(row.id);
+      const still = this.store.schema.columns.some((column) => {
+        const value = fresh?.cells[column.name];
+        return typeof value === "string" && parseEnvelope(value) != null;
+      });
+      if (still) return "还没有读到完整值，不能导出";
+    }
+    return null;
   }
 
   /** 能定位的行按主键另读完整文本或十六进制。用现有 grid_page 的筛选参数，不新增命令。 */

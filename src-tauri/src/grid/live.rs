@@ -397,7 +397,7 @@ async fn export_body(session: &CatalogSession, spec: &ExportSpec, flag: &AtomicB
             let sql = match if spec.mode == ExportMode::TableFull {
                 page_sql_unlimited(&schema, &spec.filters, spec.sort.as_ref())
             } else {
-                page_sql(&schema, &spec.filters, spec.sort.as_ref(), spec.limit, 0)
+                page_sql_full(&schema, &spec.filters, spec.sort.as_ref(), spec.limit)
             } {
                 Ok(sql) => sql,
                 Err(message) => return failed_message(message),
@@ -885,17 +885,22 @@ fn residual(written: u64, path: &Path, message: &str) -> ExportOutcome {
 }
 
 fn page_sql(schema: &TableSchema, filters: &[Filter], sort: Option<&Sort>, limit: u64, offset: u64) -> Result<String, String> {
-    let body = page_body(schema, filters, sort)?;
+    let body = page_body(schema, filters, sort, false)?;
     let tail = if offset == 0 { format!(" LIMIT {limit}") } else { format!(" LIMIT {limit} OFFSET {offset}") };
     Ok(format!("{body}{tail}"))
 }
 
-fn page_sql_unlimited(schema: &TableSchema, filters: &[Filter], sort: Option<&Sort>) -> Result<String, String> {
-    page_body(schema, filters, sort)
+fn page_sql_full(schema: &TableSchema, filters: &[Filter], sort: Option<&Sort>, limit: u64) -> Result<String, String> {
+    let body = page_body(schema, filters, sort, true)?;
+    Ok(format!("{body} LIMIT {limit}"))
 }
 
-fn page_body(schema: &TableSchema, filters: &[Filter], sort: Option<&Sort>) -> Result<String, String> {
-    let list = sql::select_list(schema, sql::reads_full_values(schema, filters));
+fn page_sql_unlimited(schema: &TableSchema, filters: &[Filter], sort: Option<&Sort>) -> Result<String, String> {
+    page_body(schema, filters, sort, true)
+}
+
+fn page_body(schema: &TableSchema, filters: &[Filter], sort: Option<&Sort>, full: bool) -> Result<String, String> {
+    let list = sql::select_list(schema, full || sql::reads_full_values(schema, filters));
     let where_sql = sql::compile_where(schema, filters)?;
     let clause = if where_sql.is_empty() { String::new() } else { format!(" WHERE {where_sql}") };
     Ok(format!("SELECT {list} FROM {}{clause}{}", sql::qualified_name(schema), order_clause(schema, sort)))

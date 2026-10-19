@@ -1,6 +1,10 @@
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { flushPromises, mount } from "@vue/test-utils";
 import { nextTick } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { resetExportTasks } from "../export/tasks";
 import { resetCatalog } from "../catalog/store";
 import { resetCloseGuard } from "../shell/close-guard";
 import { rectangleSelection, selectionTsv, toTsv } from "./clipboard";
@@ -75,6 +79,7 @@ describe("grid display, copy and typed literals", () => {
     expect(showCell("\u0001b:4", { column: column("blob", "bytea") }).label).toBe("二进制 · 4 字节");
     expect(copyCellText("abcd", "NULL", column("blob", "bytea"))).toBe("abcd");
     expect(rejectWrite(column("blob", "bytea"), "zz")).toBe("这不是十六进制");
+    expect(rejectWrite(column("note", "text"), "\u0001t:11:hello")).toBe("预览内容不能写回");
     expect(sqlCell(column("flag", "boolean"), "yes", "mysql")).toBe("TRUE");
     expect(sqlCell(column("blob", "bytea"), "0A0B", "postgres")).toBe("'\\x0a0b'");
     expect(sqlCell(column("blob", "blob"), "0A0B", "mysql")).toBe("X'0a0b'");
@@ -92,6 +97,7 @@ describe("grid display, copy and typed literals", () => {
     const session = new TableSession(store, 10);
     expect(session.stageUpdate("1", "shape", null)).toContain("几何");
     expect(session.stageUpdate("1", "blob", "zz")).toContain("十六进制");
+    expect(session.stageUpdate("1", "note", "\u0001t:11:hello")).toBe("预览内容不能写回");
     expect(session.pendingCount).toBe(0);
     const view = new TableSession(viewFixture(), 10);
     expect(view.stageUpdate("1", "name", "改")).toContain("不能修改");
@@ -150,6 +156,7 @@ describe("grid column width, clipboard and paging", () => {
     continueTabRun.mockClear();
     tabRun.mockReset();
     writeText.mockClear();
+    resetExportTasks();
     Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
     resetCloseGuard();
     resetCatalog();
@@ -213,6 +220,62 @@ describe("grid column width, clipboard and paging", () => {
     wrapper.unmount();
   });
 
+  it("reads the full value before editing a located preview", async () => {
+    invoke.mockImplementation(async (command: string, args: { request?: { filters?: { column: string }[] } }) => {
+      if (command === "grid_describe") return schema();
+      if (command === "grid_page") {
+        const filters = args.request?.filters ?? [];
+        if (filters.some((filter) => filter.column === "id")) {
+          return { rows: [{ ...row(), cells: { id: "1", note: "hello\tthere", blob: "abcd", shape: "POINT(1 2)" } }], truncated: false, sql: "SELECT full" };
+        }
+        return { rows: [row()], truncated: false, sql: "SELECT preview" };
+      }
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:docs-edit", draft: "", pageSize: 10, target } });
+    await flushPromises();
+    await wrapper.get("[data-cell='1:note']").trigger("dblclick");
+    await flushPromises();
+    const input = wrapper.get("input[aria-label='编辑 note']");
+    expect((input.element as HTMLInputElement).value).toBe("hello\tthere");
+    expect((input.element as HTMLInputElement).value).not.toContain("\u0001");
+    const reread = invoke.mock.calls.filter((call) => call[0] === "grid_page").at(-1)?.[1] as { request: { limit: number; filters: { op: string; value: string }[] } };
+    expect(reread.request.limit).toBe(1);
+    expect(reread.request.filters[0]).toMatchObject({ op: "eq", value: "1" });
+    wrapper.unmount();
+  });
+
+  it("exports located previews as the full text instead of the envelope", async () => {
+    invoke.mockImplementation(async (command: string, args: { request?: { filters?: { column: string }[] } }) => {
+      if (command === "grid_describe") return schema();
+      if (command === "grid_page") {
+        const filters = args.request?.filters ?? [];
+        if (filters.some((filter) => filter.column === "id")) {
+          return { rows: [{ ...row(), cells: { id: "1", note: "hello\tthere", blob: "abcd", shape: "POINT(1 2)" } }], truncated: false, sql: "SELECT full" };
+        }
+        return { rows: [row()], truncated: false, sql: "SELECT preview" };
+      }
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:docs-export", draft: "", pageSize: 10, target } });
+    await flushPromises();
+    const dir = mkdtempSync(join(tmpdir(), "rillsql-grid-preview-"));
+    await wrapper.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
+    await wrapper.get("input[aria-label='导出路径']").setValue(join(dir, "docs.csv"));
+    await wrapper.findAll("button").filter((button) => button.text() === "导出").at(-1)!.trigger("click");
+    const written = join(dir, "docs.csv");
+    await vi.waitFor(() => {
+      expect(readFileSync(written, "utf8")).toContain("abcd");
+    });
+    const body = readFileSync(written, "utf8");
+    expect(body).toContain("hello");
+    expect(body).toContain("there");
+    expect(body).toContain("abcd");
+    expect(body).not.toContain("\u0001");
+    rmSync(dir, { recursive: true, force: true });
+    wrapper.unmount();
+  });
+
   it("keeps loaded rows when the next page fails", async () => {
     invoke.mockImplementation(async (command: string, args: { request?: { offset?: number } }) => {
       if (command === "grid_describe") return schema();
@@ -267,6 +330,25 @@ describe("grid column width, clipboard and paging", () => {
     await flushPromises();
     expect(continueTabRun).toHaveBeenCalledWith("query-1");
     expect(wrapper.text()).toContain("2");
+    wrapper.unmount();
+  });
+
+  it("uses the query engine when a hash comment would otherwise split the export", async () => {
+    const wrapper = mount(QueryResultGrid, {
+      props: {
+        tabId: "query-mysql",
+        statement: "SELECT 1 # keep;\nFROM t",
+        columns: [column("n", "integer")],
+        rows: [{ id: "r0", cells: { n: "1" }, located: false, locator: null }],
+        truncated: false,
+        engine: "mysql",
+      },
+    });
+    await flushPromises();
+    await wrapper.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
+    await wrapper.get("input[value='full']").setValue(true);
+    expect(wrapper.get("[data-export-notice]").text()).toContain("会重新执行这条 SELECT");
+    expect(wrapper.find(".ex-alert").exists()).toBe(false);
     wrapper.unmount();
   });
 });
