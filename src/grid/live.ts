@@ -3,6 +3,7 @@ import { deleteSql, insertSql, updateSql } from "./sql";
 import type { TableTarget } from "./target";
 import type { Cell, Change, CommitReport, CommitStep, Filter, Row, SortSpec, TableStore } from "./types";
 import { opNeedsValue } from "./types";
+import { rejectWrite } from "./typeset";
 
 export interface InsertDraft {
   id: string;
@@ -31,6 +32,7 @@ export class LiveTable {
   selectedId: string | null = null;
   selectedColumn: string | null = null;
   ready = false;
+  paging = false;
   store: TableStore;
   private readGeneration = 0;
 
@@ -131,8 +133,33 @@ export class LiveTable {
   }
 
   loadMore(): Promise<string | null> {
-    if (!this.truncated) return Promise.resolve(null);
-    return this.readWindow(this.loaded.length, this.pageSize, false);
+    if (!this.truncated || this.paging) return Promise.resolve(null);
+    this.paging = true;
+    return this.readWindow(this.loaded.length, this.pageSize, false).finally(() => {
+      this.paging = false;
+    });
+  }
+
+  /** 能定位的行按主键另读完整文本或十六进制。用现有 grid_page 的筛选参数，不新增命令。 */
+  async readLocated(rowId: string): Promise<string | null> {
+    const row = this.rowById(rowId);
+    if (!row?.locator || !row.located) return null;
+    const filters: Filter[] = row.locator.columns.map((column, index) => ({
+      column,
+      op: "eq",
+      value: row.locator?.values[index] ?? "",
+    }));
+    if (filters.some((filter) => !filter.value)) return "主键值不完整，不能另读这一格";
+    try {
+      const page = await gridPage(this.target, filters, null, 0, 1);
+      const fresh = page.rows[0];
+      const current = this.rowById(rowId);
+      if (!fresh || !current) return "没有读到这一格";
+      current.cells = { ...current.cells, ...fresh.cells };
+      return null;
+    } catch (error) {
+      return errorText(error);
+    }
   }
 
   async count(): Promise<string | null> {
@@ -171,6 +198,9 @@ export class LiveTable {
   stageUpdate(rowId: string, column: string, value: Cell): string | null {
     const row = this.rowById(rowId);
     if (!row) return "找不到行";
+    const found = this.store.schema.columns.find((item) => item.name === column);
+    const rejected = rejectWrite(found, value);
+    if (rejected) return rejected;
     if (!this.canUpdate(row)) return "无法唯一确定这一行，不能修改";
     const sets = { ...(this.edits.get(rowId) ?? {}), [column]: value };
     this.edits.set(rowId, sets);
@@ -193,6 +223,9 @@ export class LiveTable {
   stageInsert(id: string, column: string, value: Cell | undefined): string | null {
     const insert = this.inserts.find((item) => item.id === id);
     if (!insert) return "找不到新增行";
+    const found = this.store.schema.columns.find((item) => item.name === column);
+    const rejected = rejectWrite(found, value);
+    if (rejected) return rejected;
     insert.cells[column] = value;
     this.failures.delete(id);
     return null;

@@ -1,8 +1,10 @@
+import { inspectSql } from "../query/split";
 import { gridCommit, type ChangePayload } from "./api";
 import { copyRow, refreshLocated } from "./data";
 import { deleteSql, updateSql } from "./sql";
 import type { TableTarget } from "./target";
 import type { Cell, Column, CommitReport, CommitStep, Engine, Row, TableSchema } from "./types";
+import { rejectWrite } from "./typeset";
 
 export interface TableHit {
   schema: string;
@@ -328,78 +330,20 @@ function columnProof(items: readonly SelectItem[], table: string, alias: string 
   };
 }
 
-/** 按分号切开原文。注释和字符串里的分号不算，注释留在语句里，读表名之前不删掉。 */
-function preservedStatements(sql: string): string[] {
-  const statements: string[] = [];
-  let start = 0;
-  let mode: "normal" | "line" | "block" | "single" | "double" | "tick" = "normal";
-  const take = (end: number) => {
-    const text = sql.slice(start, end).trim();
-    if (text && skipQualifierGap(text, 0) < text.length) statements.push(text);
-  };
-  for (let index = 0; index < sql.length; index += 1) {
-    const char = sql[index]!;
-    const next = sql[index + 1] ?? "";
-    if (mode === "line") {
-      if (char === "\n") mode = "normal";
-      continue;
-    }
-    if (mode === "block") {
-      if (char === "*" && next === "/") {
-        mode = "normal";
-        index += 1;
-      }
-      continue;
-    }
-    if (mode === "single") {
-      if (char === "'" && next === "'") index += 1;
-      else if (char === "'") mode = "normal";
-      continue;
-    }
-    if (mode === "double") {
-      if (char === '"' && next === '"') index += 1;
-      else if (char === '"') mode = "normal";
-      continue;
-    }
-    if (mode === "tick") {
-      if (char === "`" && next === "`") index += 1;
-      else if (char === "`") mode = "normal";
-      continue;
-    }
-    if (char === "-" && next === "-") {
-      mode = "line";
-      index += 1;
-      continue;
-    }
-    if (char === "/" && next === "*") {
-      mode = "block";
-      index += 1;
-      continue;
-    }
-    if (char === "'") {
-      mode = "single";
-      continue;
-    }
-    if (char === '"') {
-      mode = "double";
-      continue;
-    }
-    if (char === "`") {
-      mode = "tick";
-      continue;
-    }
-    if (char === ";") {
-      take(index);
-      start = index + 1;
-    }
-  }
-  take(sql.length);
-  return statements;
+/** 按引擎切开原文。注释和字符串里的分号不算，注释留在语句里。扫描交给 query splitSql。 */
+function preservedStatements(sql: string, engine: Engine): { texts: string[]; refusal: string | null } {
+  const report = inspectSql(sql, engine);
+  const texts = report.pieces
+    .map((piece) => piece.text.trim())
+    .filter((text) => text.length > 0 && skipQualifierGap(text, 0) < text.length);
+  return { texts, refusal: report.refusal };
 }
 
 /** 只接受一条没有联接、聚合或子查询的 SELECT，并读出唯一的基表名。 */
-export function readSingleTable(sql: string): EditProof {
-  const statements = preservedStatements(sql);
+export function readSingleTable(sql: string, engine: Engine = "postgres"): EditProof {
+  const scanned = preservedStatements(sql, engine);
+  if (scanned.refusal) return { ok: false, reason: scanned.refusal };
+  const statements = scanned.texts;
   if (!statements.length) return { ok: false, reason: "没有可修改的语句。" };
   if (statements.length > 1) return { ok: false, reason: "不是单条 SELECT，不能修改查询结果。" };
   const statement = statements[0]!;
@@ -586,7 +530,10 @@ export class ResultEditSession {
     const row = this.rowById(rowId);
     if (!row) return "找不到行";
     if (!this.canEditColumn(column)) return "这一列不是基表列，不能修改";
-    if (!this.schema.columns.some((item) => item.name === column)) return "这一列不属于基表，不能修改";
+    const found = this.schema.columns.find((item) => item.name === column);
+    if (!found) return "这一列不属于基表，不能修改";
+    const rejected = rejectWrite(found, value);
+    if (rejected) return rejected;
     if (!this.canUpdate(row)) return "无法唯一确定这一行，不能修改";
     this.edits.set(rowId, { ...(this.edits.get(rowId) ?? {}), [column]: value });
     this.failures.delete(`u:${rowId}`);

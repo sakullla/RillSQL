@@ -200,6 +200,78 @@ fn grid_commands_are_registered_beside_catalog() {
     assert!(!live.contains("danger_accept_invalid"));
 }
 
+#[test]
+fn preview_sql_literals_and_split_follow_the_query_scanner() {
+    use super::sql::{self, select_export_gate_for};
+    use super::store::{Cell, Column, Engine, TableSchema};
+
+    fn col(name: &str, type_name: &str) -> Column {
+        Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable: true, primary: false, unique: false, auto: false }
+    }
+    fn schema(engine: Engine, kind: &'static str, key: &[&str], columns: Vec<Column>) -> TableSchema {
+        TableSchema {
+            engine,
+            schema: "public".to_owned(),
+            name: "customers".to_owned(),
+            kind,
+            columns,
+            key: key.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
+    let columns = vec![col("id", "integer"), col("note", "text"), col("flag", "boolean"), col("blob", "bytea"), col("shape", "geometry")];
+    let keyed = schema(Engine::Postgres, "table", &["id"], columns.clone());
+    let browse = sql::select_list(&keyed, false);
+    assert!(browse.contains("::text"), "{browse}");
+    assert!(browse.contains("chr(1)"), "{browse}");
+    assert!(browse.contains("encode("), "{browse}");
+    let opened = sql::select_list(&keyed, true);
+    assert!(opened.contains("::text"), "{opened}");
+    assert!(opened.contains("encode("), "{opened}");
+    assert!(!opened.contains("chr(1)"), "{opened}");
+    assert!(!sql::reads_full_values(&keyed, &[]));
+    assert!(sql::reads_full_values(&keyed, &[filt("id", FilterOp::Eq, Some("1"))]));
+    let view = sql::select_list(&schema(Engine::Postgres, "view", &["id"], columns.clone()), true);
+    assert!(!view.contains("chr(1)"), "{view}");
+    let nokey = sql::select_list(&schema(Engine::Postgres, "table", &[], columns), true);
+    assert!(!nokey.contains("chr(1)"), "{nokey}");
+    assert!(nokey.contains("encode("), "{nokey}");
+
+    let mysql = schema(Engine::Mysql, "table", &["id"], vec![col("id", "int"), col("note", "varchar"), col("blob", "blob")]);
+    let mysql_sql = sql::select_list(&mysql, false);
+    assert!(mysql_sql.contains("CAST(") && mysql_sql.contains("AS CHAR"), "{mysql_sql}");
+    assert!(mysql_sql.contains("CHAR(1)"), "{mysql_sql}");
+    let sqlite = schema(Engine::Sqlite, "table", &["id"], vec![col("id", "integer"), col("note", "text")]);
+    let sqlite_sql = sql::select_list(&sqlite, false);
+    assert!(sqlite_sql.contains("CAST(") && sqlite_sql.contains("AS TEXT"), "{sqlite_sql}");
+
+    let flag = col("flag", "bool");
+    assert_eq!(sql::sql_cell(Engine::Postgres, Some(&flag), &Cell::Text("t".to_owned())), "TRUE");
+    assert_eq!(sql::sql_cell(Engine::Mysql, Some(&flag), &Cell::Text("0".to_owned())), "FALSE");
+    let blob = col("blob", "bytea");
+    assert_eq!(sql::sql_cell(Engine::Postgres, Some(&blob), &Cell::Text("0A0B".to_owned())), "'\\x0a0b'");
+    assert_eq!(sql::sql_cell(Engine::Mysql, Some(&blob), &Cell::Text("aa".to_owned())), "X'aa'");
+    assert_eq!(sql::reject_literal(&blob, &Cell::Text("zz".to_owned())).as_deref(), Some("这不是十六进制"));
+    assert_eq!(sql::reject_literal(&col("shape", "geometry"), &Cell::Null).as_deref(), Some("几何类型不能从格子保存"));
+    assert!(sql::reject_literal(&col("mystery", ""), &Cell::Text("a".to_owned())).unwrap().contains("类型未知"));
+    assert!(sql::reject_literal(&col("weird", "interval"), &Cell::Null).unwrap().contains("不能判断写回方式"));
+    assert!(sql::reject_literal(&flag, &Cell::Text("maybe".to_owned())).unwrap().contains("布尔"));
+
+    let dollar = "SELECT $$a;b$$";
+    assert_eq!(sql::split_sql("postgres", dollar).len(), 1);
+    assert!(select_export_gate_for("postgres", dollar).is_ok());
+    assert_eq!(sql::split_sql("mysql", "SELECT 1 # c;\n").len(), 1);
+    assert_eq!(sql::split_sql("mysql", "SELECT 1; # comment\nSELECT 2").len(), 2);
+    assert!(select_export_gate_for("mysql", "SELECT 1; # comment\nSELECT 2").is_err());
+    assert_eq!(sql::split_sql("mysql", "SELECT 1 # c;\nSELECT 2").len(), 1);
+    assert_eq!(sql::split_sql("postgres", "SELECT 1 # c;\nSELECT 2").len(), 2);
+    let forwarded = crate::query::split_sql("postgres", "SELECT 1; SELECT 2");
+    assert_eq!(
+        sql::split_sql("postgres", "SELECT 1; SELECT 2"),
+        forwarded.pieces.into_iter().map(|piece| piece.text).filter(|text| !text.trim().is_empty()).collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test]
 async fn open_session_reads_writes_and_exports_without_a_second_connection() {
     use super::live::{self, ExportMode, ExportSpec, Mutation, MutationKind};
@@ -260,6 +332,8 @@ async fn open_session_reads_writes_and_exports_without_a_second_connection() {
     assert_eq!(page.rows.len(), 100);
     assert!(page.truncated);
     assert!(page.sql.contains("LIMIT 100"));
+    assert!(page.sql.contains("CAST(") && page.sql.contains("AS TEXT"), "{}", page.sql);
+    assert!(page.sql.contains("char(1)"), "{}", page.sql);
     assert!(page.rows[0].located);
     assert_eq!(page.rows[0].cells.get("note"), Some(&Cell::Null));
     assert_eq!(page.rows[1].cells.get("note"), Some(&Cell::Text(String::new())));
@@ -525,6 +599,137 @@ async fn open_session_reads_writes_and_exports_without_a_second_connection() {
         }
         _ => panic!("会话应该仍是原来的 SQLite 池"),
     }
+    drop(session);
+    drop(service);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn located_rows_preview_until_a_key_reread_and_bad_literals_are_not_sent() {
+    use super::live::{self, Mutation, MutationKind};
+    use crate::connections::Service;
+
+    let dir = std::env::temp_dir().join(format!("rillsql-grid-preview-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("typed.sqlite");
+    let setup = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE docs (id INTEGER PRIMARY KEY, note TEXT, flag BOOLEAN, blob BLOB, g GEOMETRY, mystery)")
+        .execute(&setup)
+        .await
+        .unwrap();
+    let long = "a".repeat(3000);
+    sqlx::query("INSERT INTO docs (id, note, flag, blob, g, mystery) VALUES (1, 'short', 't', x'abcd', 'POINT(0 0)', '2020-01-01 00:00:00')")
+        .execute(&setup)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO docs (id, note, flag, blob, g, mystery) VALUES (2, ?1, 'f', NULL, NULL, '')")
+        .bind(&long)
+        .execute(&setup)
+        .await
+        .unwrap();
+    sqlx::query("CREATE VIEW v_docs AS SELECT id, note FROM docs").execute(&setup).await.unwrap();
+    sqlx::query("CREATE TABLE loose_notes (label TEXT)").execute(&setup).await.unwrap();
+    sqlx::query("INSERT INTO loose_notes (label) VALUES (?1)").bind(&long).execute(&setup).await.unwrap();
+    setup.close().await;
+
+    let service = Service::new_for_test(dir.join("connections.sqlite"));
+    service.open_sqlite_for_test("typed", "类型", &database).await.unwrap();
+    let session = service.catalog_session("typed").expect("已打开会话");
+    let page = live::query_page(&session, "main", "", "docs", "sqlite", &[], None, 0, 10).await.unwrap();
+    assert!(page.sql.contains("CAST(") && page.sql.contains("AS TEXT"), "{}", page.sql);
+    assert!(page.sql.contains("char(1)"), "{}", page.sql);
+    let short = page.rows.iter().find(|row| row.cells.get("id") == Some(&Cell::Text("1".to_owned()))).unwrap();
+    let wide = page.rows.iter().find(|row| row.cells.get("id") == Some(&Cell::Text("2".to_owned()))).unwrap();
+    assert_eq!(short.cells.get("note"), Some(&Cell::Text("short".to_owned())));
+    match wide.cells.get("note") {
+        Some(Cell::Text(text)) => {
+            assert!(text.starts_with("\u{1}t:3000:"), "{text}");
+            assert_eq!(text.trim_start_matches("\u{1}t:3000:").len(), 1024);
+            assert!(!text.contains('\u{fffd}'));
+        }
+        other => panic!("长文本应该是预览信封 {other:?}"),
+    }
+    match short.cells.get("blob") {
+        Some(Cell::Text(text)) => assert_eq!(text, "\u{1}b:2"),
+        other => panic!("二进制应该只带字节数 {other:?}"),
+    }
+    assert_eq!(short.cells.get("g"), Some(&Cell::Text("POINT(0 0)".to_owned())));
+    assert_eq!(short.cells.get("mystery"), Some(&Cell::Text("2020-01-01 00:00:00".to_owned())));
+
+    let opened = live::query_page(&session, "main", "", "docs", "sqlite", &[filt("id", FilterOp::Eq, Some("2"))], None, 0, 1).await.unwrap();
+    assert!(!opened.sql.contains("char(1)"), "{}", opened.sql);
+    assert!(opened.sql.contains("lower(hex("), "{}", opened.sql);
+    assert_eq!(opened.rows[0].cells.get("note"), Some(&Cell::Text(long.clone())));
+    assert_eq!(opened.rows[0].cells.get("blob"), Some(&Cell::Null));
+
+    let locator = short.locator.clone();
+    let blob_rejected = live::commit(
+        &session,
+        "main",
+        "",
+        "docs",
+        "sqlite",
+        &[Mutation { id: "bad-blob".to_owned(), kind: MutationKind::Update, sets: vec![("blob".to_owned(), Cell::Text("zz".to_owned()))], locator: locator.clone(), values: Vec::new() }],
+    )
+    .await
+    .unwrap();
+    let blob_failed = blob_rejected.failed.expect("zz 不能发送");
+    assert!(blob_failed.sql.is_empty());
+    assert!(blob_failed.message.contains("这不是十六进制"));
+    let geometry_rejected = live::commit(
+        &session,
+        "main",
+        "",
+        "docs",
+        "sqlite",
+        &[Mutation { id: "bad-geo".to_owned(), kind: MutationKind::Update, sets: vec![("g".to_owned(), Cell::Null)], locator: locator.clone(), values: Vec::new() }],
+    )
+    .await
+    .unwrap();
+    let geometry_failed = geometry_rejected.failed.expect("几何不能保存");
+    assert!(geometry_failed.sql.is_empty());
+    assert!(geometry_failed.message.contains("几何"));
+    let unknown_rejected = live::commit(
+        &session,
+        "main",
+        "",
+        "docs",
+        "sqlite",
+        &[Mutation { id: "bad-type".to_owned(), kind: MutationKind::Update, sets: vec![("mystery".to_owned(), Cell::Text("x".to_owned()))], locator: locator.clone(), values: Vec::new() }],
+    )
+    .await
+    .unwrap();
+    let unknown_failed = unknown_rejected.failed.expect("类型未知不能编辑");
+    assert!(unknown_failed.sql.is_empty());
+    assert!(unknown_failed.message.contains("类型未知"));
+
+    let saved = live::commit(
+        &session,
+        "main",
+        "",
+        "docs",
+        "sqlite",
+        &[Mutation { id: "flag".to_owned(), kind: MutationKind::Update, sets: vec![("flag".to_owned(), Cell::Text("yes".to_owned()))], locator, values: Vec::new() }],
+    )
+    .await
+    .unwrap();
+    assert!(saved.failed.is_none());
+    assert!(saved.applied[0].sql.contains("TRUE"));
+    assert!(!saved.applied[0].sql.contains("'yes'"));
+
+    let view = live::query_page(&session, "main", "", "v_docs", "sqlite", &[], None, 0, 10).await.unwrap();
+    assert!(!view.sql.contains("char(1)"), "{}", view.sql);
+    let view_long = view.rows.iter().find(|row| row.cells.get("id") == Some(&Cell::Text("2".to_owned()))).unwrap();
+    assert_eq!(view_long.cells.get("note"), Some(&Cell::Text(long.clone())));
+    let loose = live::query_page(&session, "main", "", "loose_notes", "sqlite", &[], None, 0, 10).await.unwrap();
+    assert!(!loose.sql.contains("char(1)"), "{}", loose.sql);
+    assert_eq!(loose.rows[0].cells.get("label"), Some(&Cell::Text(long)));
+    assert!(loose.rows.iter().all(|row| !row.located));
+
     drop(session);
     drop(service);
     let _ = fs::remove_dir_all(&dir);

@@ -15,7 +15,7 @@ use sqlx::Statement as _;
 
 use crate::connections::CatalogSession;
 
-use super::sql::{self, select_export_gate};
+use super::sql;
 use super::store::{Applied, Cell, Column, CommitReport, Engine, Failed, Filter, Sort, TableSchema, COMMIT_RULE};
 
 const MAX_PAGE: u64 = 10_000;
@@ -200,6 +200,9 @@ pub async fn commit(
         }
         match change.kind {
             MutationKind::Update => {
+                if let Some(message) = reject_sets(&schema, &change.sets) {
+                    return Ok(fail(applied, &change.id, String::new(), message, pending));
+                }
                 let sql = match located_sql(&schema, &change.locator, true) {
                     Ok(locator) => sql::update_sql(&schema, &change.sets, &locator),
                     Err(message) => return Ok(fail(applied, &change.id, String::new(), message, pending)),
@@ -235,6 +238,9 @@ pub async fn commit(
                 }
             }
             MutationKind::Insert => {
+                if let Some(message) = reject_sets(&schema, &change.values) {
+                    return Ok(fail(applied, &change.id, String::new(), message, pending));
+                }
                 let sql = sql::insert_sql(&schema, &change.values);
                 match execute_sql(session, &sql).await {
                     Ok(0) => return Ok(fail(applied, &change.id, sql, "新增没有写入行，已停止。已成功的语句不撤销。", pending)),
@@ -257,6 +263,13 @@ fn fail(applied: Vec<Applied>, id: &str, sql: String, message: impl Into<String>
     }
 }
 
+fn reject_sets(schema: &TableSchema, sets: &[(String, Cell)]) -> Option<String> {
+    sets.iter().find_map(|(name, value)| {
+        let column = schema.columns.iter().find(|column| column.name == *name)?;
+        sql::reject_literal(column, value)
+    })
+}
+
 fn located_sql<'a>(schema: &'a TableSchema, locator: &'a [(String, Cell)], update: bool) -> Result<&'a [(String, Cell)], String> {
     let verb = if update { "修改" } else { "删除" };
     if schema.key.is_empty() {
@@ -276,7 +289,7 @@ async fn expect_one(session: &CatalogSession, schema: &TableSchema, locator: &[(
         .iter()
         .map(|(name, value)| {
             let column = schema.columns.iter().find(|column| column.name == *name);
-            format!("{} = {}", sql::quote_ident(schema.engine, name), sql::sql_cell(column, value))
+            format!("{} = {}", sql::quote_ident(schema.engine, name), sql::sql_cell(schema.engine, column, value))
         })
         .collect::<Vec<_>>()
         .join(" AND ");
@@ -366,7 +379,7 @@ async fn export_body(session: &CatalogSession, spec: &ExportSpec, flag: &AtomicB
     }
     match spec.mode {
         ExportMode::Query => {
-            let statement = match select_export_gate(&spec.statement) {
+            let statement = match sql::select_export_gate_for(&spec.engine_hint, &spec.statement) {
                 Ok(statement) => statement,
                 Err(reason) => return blocked(reason),
             };
@@ -882,7 +895,7 @@ fn page_sql_unlimited(schema: &TableSchema, filters: &[Filter], sort: Option<&So
 }
 
 fn page_body(schema: &TableSchema, filters: &[Filter], sort: Option<&Sort>) -> Result<String, String> {
-    let list = select_list(schema);
+    let list = sql::select_list(schema, sql::reads_full_values(schema, filters));
     let where_sql = sql::compile_where(schema, filters)?;
     let clause = if where_sql.is_empty() { String::new() } else { format!(" WHERE {where_sql}") };
     Ok(format!("SELECT {list} FROM {}{clause}{}", sql::qualified_name(schema), order_clause(schema, sort)))
@@ -896,22 +909,6 @@ fn count_sql(schema: &TableSchema, filters: &[Filter]) -> Result<String, String>
         Engine::Sqlite | Engine::Mysql | Engine::Mariadb => "COUNT(*)",
     };
     Ok(format!("SELECT {count} FROM {}{clause}", sql::qualified_name(schema)))
-}
-
-fn select_list(schema: &TableSchema) -> String {
-    schema
-        .columns
-        .iter()
-        .map(|column| {
-            let ident = sql::quote_ident(schema.engine, &column.name);
-            match schema.engine {
-                Engine::Postgres => format!("{ident}::text"),
-                Engine::Mysql | Engine::Mariadb => format!("CAST({ident} AS CHAR)"),
-                Engine::Sqlite => format!("CAST({ident} AS TEXT)"),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn order_clause(schema: &TableSchema, sort: Option<&Sort>) -> String {

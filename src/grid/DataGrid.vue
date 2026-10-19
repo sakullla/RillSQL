@@ -10,7 +10,9 @@ import type { InsertTarget } from "../export/insert";
 import { catalogConnections } from "../catalog/store";
 import { registerPending } from "../shell/close-guard";
 import { loadSettings } from "../shell/settings";
-import { copyPlain, copySqlValue, previewText, showCell, type NullCopy } from "./display";
+import { rectangleSelection, selectionTsv, type CellPoint } from "./clipboard";
+import { copyCellText, copySqlValue, needsFullRead, showCell, type NullCopy } from "./display";
+import { rejectWrite, typeCaption } from "./typeset";
 import "./grid.css";
 import { useRowWindow } from "./virtual";
 import { LiveTable } from "./live";
@@ -35,7 +37,11 @@ watch(
   },
   { immediate: true },
 );
-onBeforeUnmount(releaseCellPending);
+onBeforeUnmount(() => {
+  releaseCellPending();
+  stopDrag();
+  resizeUp?.();
+});
 const rootEl = ref<HTMLElement | null>(null);
 const filterColumn = ref("");
 watch(
@@ -54,9 +60,18 @@ const exportMessage = ref("");
 const importMessage = ref("");
 const commitOpen = ref(false);
 const editing = ref<{ id: string; column: string; draft: string; isNull: boolean } | null>(null);
+const editError = ref("");
 const copyMessage = ref("");
 const receipt = ref<string | null>(null);
 const revealed = reactive(new Set<string>());
+const widths = reactive<Record<string, number>>({});
+const anchor = ref<CellPoint | null>(null);
+const focusCellPoint = ref<CellPoint | null>(null);
+const dragging = ref(false);
+const menu = ref<{ x: number; y: number; row: string; column: string } | null>(null);
+const menuError = ref("");
+let resizeMove: ((event: PointerEvent) => void) | null = null;
+let resizeUp: (() => void) | null = null;
 watch(() => props.pageSize, size => { if (session && size) session.pageSize = size; });
 
 const columns = computed(() => session?.store.schema.columns ?? []);
@@ -91,6 +106,13 @@ const displayRows = computed(() => {
 const commitFailures = computed(() => (session ? Array.from(session.failures, ([id, message]) => ({ id, message })) : []));
 const pendingVisible = computed(() => (session ? session.pendingCount > 0 || session.failures.size > 0 : false));
 const { viewport, range, onScroll, reveal } = useRowWindow(computed(() => displayRows.value.length), false);
+watch(
+  () => range.value.end,
+  (end) => {
+    if (!session || !session.truncated || session.error || session.paging) return;
+    if (displayRows.value.length > 0 && end >= displayRows.value.length) void session.loadMore();
+  },
+);
 const visibleRows = computed(() => displayRows.value.slice(range.value.start, range.value.end).map(row => ({ ...row, cells: columns.value.map(column => shown(row.id, column.name)) })));
 const padTop = computed(() => range.value.top);
 const padBottom = computed(() => range.value.bottom);
@@ -122,7 +144,8 @@ watch(
 
 const selectedColumn = computed(() => columns.value.find((column) => column.name === session?.selectedColumn) ?? null);
 const selectedRaw = computed(() => (session?.selectedId && session.selectedColumn ? session.cellValue(session.selectedId, session.selectedColumn) : undefined));
-const selectedShown = computed(() => showCell(selectedRaw.value));
+const selectedShown = computed(() => showCell(selectedRaw.value, { column: selectedColumn.value ?? undefined, opened: isRevealed() }));
+const selectedPoints = computed(() => (anchor.value && focusCellPoint.value ? rectangleSelection(displayRows.value, columns.value, anchor.value, focusCellPoint.value) : []));
 const previewRows = computed(() => session?.loaded.slice(0, 4).map((row) => ({ ...row.cells })) ?? []);
 const noKeyHint = computed(() => {
   if (!session) return "";
@@ -193,9 +216,12 @@ function moveSelection(delta: number) {
 
 function beginEdit(id: string, column: string) {
   const row = displayRows.value.find((item) => item.id === id);
-  if (!row) return;
-  if (row.kind === "data" && !row.located) return;
+  if (!row || !session) return;
+  const meta = columns.value.find((item) => item.name === column);
+  if (rejectWrite(meta, null)) return;
+  if (row.kind === "data" && !session.canUpdate(session.rowById(id))) return;
   const current = session.cellValue(id, column);
+  editError.value = "";
   editing.value = { id, column, draft: current ?? "", isNull: current === null };
   session.select(id, column);
 }
@@ -207,10 +233,16 @@ function editSelected() {
 
 function saveEdit() {
   const edit = editing.value;
-  if (!edit) return;
+  if (!edit || !session) return;
   const value: Cell | undefined = edit.isNull ? null : edit.draft;
-  if (session.inserts.some((insert) => insert.id === edit.id)) session.stageInsert(edit.id, edit.column, value);
-  else session.stageUpdate(edit.id, edit.column, value);
+  const error = session.inserts.some((insert) => insert.id === edit.id)
+    ? session.stageInsert(edit.id, edit.column, value)
+    : session.stageUpdate(edit.id, edit.column, value);
+  if (error) {
+    editError.value = error;
+    return;
+  }
+  editError.value = "";
   const { id, column } = edit;
   editing.value = null;
   focusCell(id, column);
@@ -248,6 +280,11 @@ function onEditorKeydown(event: KeyboardEvent) {
 /** 未编辑时：Enter 开始编辑选中单元格，Tab 移动选中。 */
 function onGridKeydown(event: KeyboardEvent) {
   if (editing.value) return;
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {
+    event.preventDefault();
+    void copySelection();
+    return;
+  }
   if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) {
     event.preventDefault();
     moveSelection(event.key === "ArrowUp" ? -columns.value.length : event.key === "ArrowDown" ? columns.value.length : event.key === "ArrowLeft" ? -1 : 1);
@@ -279,15 +316,157 @@ async function commitChangesNow() {
 
 function shown(id: string, column: string) {
   const value = session.cellValue(id, column);
-  const key = `${id}:${column}`;
-  if (value && revealed.has(key)) return { kind: "text" as const, label: value, title: value };
-  return showCell(value);
+  const meta = columns.value.find((item) => item.name === column);
+  return showCell(value, { column: meta, opened: revealed.has(`${id}:${column}`) });
 }
 
-function copySelected(asSql: boolean) {
-  if (!session.selectedColumn) return;
+function isPicked(row: string, column: string): boolean {
+  return selectedPoints.value.some((point) => point.row === row && point.column === column);
+}
+
+function columnStyle(name: string): Record<string, string> | undefined {
+  const width = widths[name];
+  if (!width) return undefined;
+  return { width: `${width}px`, minWidth: `${width}px`, maxWidth: `${width}px` };
+}
+
+function startResize(name: string, event: PointerEvent) {
+  const th = ((event.currentTarget as HTMLElement | null) ?? (event.target as HTMLElement | null))?.closest("th");
+  const startX = event.clientX;
+  const startWidth = widths[name] ?? th?.getBoundingClientRect().width ?? 120;
+  resizeMove = (ev) => {
+    widths[name] = Math.max(48, Math.round(startWidth + ev.clientX - startX));
+  };
+  resizeUp = () => {
+    if (resizeMove) window.removeEventListener("pointermove", resizeMove);
+    if (resizeUp) window.removeEventListener("pointerup", resizeUp);
+    resizeMove = null;
+    resizeUp = null;
+  };
+  window.addEventListener("pointermove", resizeMove);
+  window.addEventListener("pointerup", resizeUp);
+}
+
+function stopDrag() {
+  dragging.value = false;
+  window.removeEventListener("pointerup", stopDrag);
+}
+
+function onCellDown(row: string, column: string, event: PointerEvent) {
+  if (event.button !== 0 || !session) return;
+  anchor.value = { row, column };
+  focusCellPoint.value = { row, column };
+  dragging.value = true;
+  menu.value = null;
+  session.select(row, column);
+  window.addEventListener("pointerup", stopDrag);
+}
+
+function onCellEnter(row: string, column: string) {
+  if (!dragging.value) return;
+  focusCellPoint.value = { row, column };
+  session?.select(row, column);
+}
+
+function onCellMenu(row: string, column: string, event: MouseEvent) {
+  event.preventDefault();
+  if (!isPicked(row, column)) {
+    anchor.value = { row, column };
+    focusCellPoint.value = { row, column };
+  }
+  session?.select(row, column);
+  menuError.value = "";
+  menu.value = { x: event.clientX, y: event.clientY, row, column };
+}
+
+async function ensureFull(rowId: string, column: string): Promise<string | null> {
+  if (!session) return null;
+  const meta = columns.value.find((item) => item.name === column);
+  if (!needsFullRead(session.cellValue(rowId, column), meta)) return null;
+  if (!session.rowById(rowId)?.located) return null;
+  return session.readLocated(rowId);
+}
+
+async function copySelection() {
+  if (!session) return;
+  const points = selectedPoints.value.length
+    ? selectedPoints.value
+    : session.selectedId && session.selectedColumn
+      ? [{ row: session.selectedId, column: session.selectedColumn }]
+      : [];
+  if (!points.length) return;
+  for (const point of points) {
+    const error = await ensureFull(point.row, point.column);
+    if (error) {
+      copyMessage.value = error;
+      return;
+    }
+  }
+  const text = selectionTsv(points, (point) => copyCellText(session.cellValue(point.row, point.column), props.nullCopy ?? loadSettings().nullCopy, columns.value.find((item) => item.name === point.column)));
+  try {
+    await navigator.clipboard.writeText(text);
+    copyMessage.value = "已复制";
+  } catch {
+    copyMessage.value = text;
+  }
+}
+
+function editFromMenu() {
+  const target = menu.value;
+  if (!target || !session) return;
+  const meta = columns.value.find((item) => item.name === target.column);
+  const rejected = rejectWrite(meta, null);
+  if (rejected) {
+    menuError.value = rejected;
+    return;
+  }
+  const row = displayRows.value.find((item) => item.id === target.row);
+  if (row?.kind === "data" && !session.canUpdate(session.rowById(target.row))) {
+    menuError.value = "只读，不能修改";
+    return;
+  }
+  menu.value = null;
+  beginEdit(target.row, target.column);
+}
+
+function setNullFromMenu() {
+  const target = menu.value;
+  if (!target || !session) return;
+  const meta = columns.value.find((item) => item.name === target.column);
+  const rejected = rejectWrite(meta, null);
+  if (rejected) {
+    menuError.value = rejected;
+    return;
+  }
+  if (meta && !meta.nullable && !session.inserts.some((insert) => insert.id === target.row)) {
+    menuError.value = "这一列不能是 NULL";
+    return;
+  }
+  const error = session.inserts.some((insert) => insert.id === target.row)
+    ? session.stageInsert(target.row, target.column, null)
+    : session.stageUpdate(target.row, target.column, null);
+  if (error) menuError.value = error;
+  else {
+    menu.value = null;
+    receipt.value = null;
+  }
+}
+
+async function copySelected(asSql: boolean) {
+  if (!session?.selectedColumn || !session.selectedId) return;
+  const error = await ensureFull(session.selectedId, session.selectedColumn);
+  if (error) {
+    copyMessage.value = error;
+    return;
+  }
   const column = selectedColumn.value ?? undefined;
-  copyMessage.value = asSql ? copySqlValue(selectedRaw.value, column) : copyPlain(selectedRaw.value, props.nullCopy ?? "NULL");
+  const text = asSql ? copySqlValue(selectedRaw.value, column, session.store.schema.engine) : copyCellText(selectedRaw.value, props.nullCopy ?? loadSettings().nullCopy, column);
+  try {
+    await navigator.clipboard.writeText(text);
+    copyMessage.value = "已复制";
+  } catch {
+    copyMessage.value = text || "复制失败，请在值查看器中选中文本复制。";
+  }
 }
 
 function revealKey(): string {
@@ -298,8 +477,13 @@ function isRevealed(): boolean {
   return revealed.has(revealKey());
 }
 
-function fullValue() {
-  if (!session.selectedId || !session.selectedColumn || typeof selectedRaw.value !== "string") return;
+async function fullValue() {
+  if (!session.selectedId || !session.selectedColumn) return;
+  const error = await ensureFull(session.selectedId, session.selectedColumn);
+  if (error) {
+    copyMessage.value = error;
+    return;
+  }
   revealed.add(revealKey());
 }
 
@@ -435,8 +619,9 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
       <table class="grid-table">
         <thead>
           <tr>
-            <th v-for="column in columns" :key="column.name" scope="col" :aria-sort="session.sort?.column === column.name ? (session.sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'">
-              <button class="th-btn" type="button" :aria-label="`按 ${column.name} 排序`" @click="session.cycleSort(column.name)">{{ column.name }}</button>
+            <th v-for="column in columns" :key="column.name" scope="col" :style="columnStyle(column.name)" :data-type="typeCaption(column)" :aria-sort="session.sort?.column === column.name ? (session.sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'">
+              <button class="th-btn" type="button" :aria-label="`按 ${column.name} 排序`" @click="session.cycleSort(column.name)"><span>{{ column.name }}</span><span class="col-type">{{ typeCaption(column) }}</span></button>
+              <span class="col-resize" role="separator" :aria-label="`调整 ${column.name} 列宽`" @pointerdown.stop.prevent="startResize(column.name, $event)"></span>
             </th>
           </tr>
         </thead>
@@ -446,15 +631,16 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
             <td class="grid-empty" :colspan="columns.length">正在读取表数据…</td>
           </tr>
           <tr v-for="row in visibleRows" :key="row.id" :class="{ 'row-insert': row.kind === 'insert', 'row-delete': row.deleted, 'row-failed': row.failed }" :data-row-id="row.id" :data-located="row.located" :title="row.failure || undefined">
-            <td v-for="(column, columnIndex) in columns" :key="column.name">
+            <td v-for="(column, columnIndex) in columns" :key="column.name" :style="columnStyle(column.name)">
               <div v-if="editing && editing.id === row.id && editing.column === column.name" class="editor">
                 <input :ref="focusEditor" v-model="editing.draft" :aria-label="`编辑 ${column.name}`" :disabled="editing.isNull" @keydown="onEditorKeydown" />
                 <button class="btn sm" type="button" :disabled="!column.nullable" @click="editing.isNull = true">设为 NULL</button>
                 <button class="btn sm" type="button" @click="editing.isNull = false">空字符串</button>
                 <button class="btn sm primary" type="button" @click="saveEdit">确定</button>
                 <button class="btn sm ghost" type="button" @click="cancelEdit">取消</button>
+                <p v-if="editError" class="menu-error" role="alert">{{ editError }}</p>
               </div>
-              <button v-else class="cell-btn" :class="{ on: session.selectedId === row.id && session.selectedColumn === column.name }" :data-cell="`${row.id}:${column.name}`" type="button" @click="session.select(row.id, column.name)" @dblclick="beginEdit(row.id, column.name)">
+              <button v-else class="cell-btn" :class="{ on: session.selectedId === row.id && session.selectedColumn === column.name, range: isPicked(row.id, column.name) }" :data-cell="`${row.id}:${column.name}`" type="button" @pointerdown="onCellDown(row.id, column.name, $event)" @pointerenter="onCellEnter(row.id, column.name)" @click="session.select(row.id, column.name)" @contextmenu="onCellMenu(row.id, column.name, $event)" @dblclick="beginEdit(row.id, column.name)">
                 <span v-if="columnIndex === 0 && row.kind === 'insert'" class="row-flag">新增</span>
                 <span v-if="columnIndex === 0 && row.deleted" class="row-flag del">将删除</span>
                 <span :class="{ 'v-null': row.cells[columnIndex]?.kind === 'null', 'v-empty': row.cells[columnIndex]?.kind === 'empty', 'v-large': row.cells[columnIndex]?.kind === 'large' }">{{ row.cells[columnIndex]?.label }}</span>
@@ -496,7 +682,7 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
         <span>列 <strong>{{ session.selectedColumn }}</strong></span>
         <span>值 <em :class="selectedShown.kind === 'null' ? 'v-null' : selectedShown.kind === 'empty' ? 'v-empty' : ''">{{ selectedShown.kind === "null" ? "NULL" : selectedShown.kind === "empty" ? "空字符串（长度 0）" : selectedShown.kind === "large" ? "大字段，当前不是完整值" : selectedShown.title }}</em></span>
       </div>
-      <textarea readonly :value="typeof selectedRaw === 'string' && selectedShown.kind === 'large' && !isRevealed() ? previewText(selectedRaw) : (selectedRaw ?? '')" :aria-label="`${session.selectedColumn} 的值`"></textarea>
+      <textarea readonly :value="selectedShown.body" :aria-label="`${session.selectedColumn} 的值`"></textarea>
       <div class="inspector-actions">
         <button v-if="selectedShown.kind === 'large'" class="btn sm" type="button" @click="fullValue">读取完整值</button>
         <button class="btn sm" type="button" :disabled="editDisabled()" @click="editSelected">编辑</button>
@@ -555,6 +741,12 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
       @close="importOpen = false"
       @done="(message) => { importMessage.value = message; importOpen = false; void session.readWindow(0, Math.max(session.pageSize, session.loaded.length || session.pageSize), true); }"
     />
+    <div v-if="menu" class="cell-menu" role="menu" :style="{ left: `${menu.x}px`, top: `${menu.y}px` }" @contextmenu.prevent>
+      <button type="button" role="menuitem" @click="copySelection(); menu = null">复制</button>
+      <button type="button" role="menuitem" @click="editFromMenu">编辑</button>
+      <button type="button" role="menuitem" @click="setNullFromMenu">设为 NULL</button>
+      <p v-if="menuError" class="menu-error" role="alert">{{ menuError }}</p>
+    </div>
     </template>
   </div>
 </template>

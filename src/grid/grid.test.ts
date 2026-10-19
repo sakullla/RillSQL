@@ -42,8 +42,11 @@ describe("grid batches, nulls and server filters", () => {
     const note = customersFixture(4).schema.columns[3];
     expect(showCell(null).kind).toBe("null");
     expect(showCell("").label).toBe("空字符串");
-    expect(showCell("长".repeat(2000)).kind).toBe("large");
-    expect(showCell("长".repeat(2000)).label).not.toContain("长".repeat(200));
+    const large = showCell("长".repeat(2000));
+    expect(large.kind).toBe("large");
+    expect(large.label).toContain("字节");
+    expect(large.label).not.toContain("长".repeat(2000));
+    expect(large.body.length).toBeLessThan(2000);
     expect(copyPlain(null, "NULL")).toBe("NULL");
     expect(copyPlain(null, "empty")).toBe("");
     expect(copyPlain(null, "N")).toBe("\\N");
@@ -276,7 +279,8 @@ describe("grid views", () => {
     expect(wrapper.find(".grid-foot .v-null").exists()).toBe(false);
     expect(wrapper.find(".v-null").text()).toBe("NULL");
     expect(wrapper.text()).toContain("空字符串");
-    expect(wrapper.text()).not.toContain("长".repeat(200));
+    expect(wrapper.text()).toContain("字节");
+    expect(wrapper.text()).not.toContain("长".repeat(2000));
     const pageCall = invoke.mock.calls.find((call) => call[0] === "grid_page");
     expect(pageCall?.[1]).toMatchObject({ request: { connectionId: "shop", table: "customers", limit: 100, offset: 0 } });
     exportTasks.unshift({
@@ -860,7 +864,7 @@ describe("query result edits", () => {
       }
       throw new Error(command);
     });
-    const model = gridModel({ columns: ["id", "name", "email", "note"], rows: [["1", "客户1", "a@example.com", null]] });
+    const model = gridModel({ columns: ["id", "name", "email", "note"], columnTypes: ["integer", "text", "text", "text"], rows: [["1", "客户1", "a@example.com", null]] });
     const wrapper = mount(QueryResultGrid, {
       props: {
         tabId: "query-edit",
@@ -903,7 +907,7 @@ describe("query result edits", () => {
       if (command === "grid_describe") return customerSchema();
       throw new Error(command);
     });
-    const model = gridModel({ columns: ["id", "name", "email", "note"], rows: [["1", "客户1", "a@example.com", null], ["2", "客户2", "b@example.com", ""]] });
+    const model = gridModel({ columns: ["id", "name", "email", "note"], columnTypes: ["integer", "text", "text", "text"], rows: [["1", "客户1", "a@example.com", null], ["2", "客户2", "b@example.com", ""]] });
     const wrapper = mount(QueryResultGrid, {
       props: {
         tabId: "query-prod",
@@ -1024,7 +1028,7 @@ describe("query result edits", () => {
       if (command === "grid_describe") return customerSchema();
       throw new Error(command);
     });
-    const model = gridModel({ columns: ["id", "name"], rows: [["1", "a@example.com"]] });
+    const model = gridModel({ columns: ["id", "name"], columnTypes: ["integer", "text"], rows: [["1", "a@example.com"]] });
     const wrapper = mount(QueryResultGrid, {
       props: {
         tabId: "alias",

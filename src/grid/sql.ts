@@ -1,5 +1,7 @@
+import { inspectSql } from "../query/split";
 import type { Column, Engine, Filter, SortSpec, TableSchema } from "./types";
 import { opNeedsValue } from "./types";
+import { binaryLiteral, boolLiteral, numericLiteral, parseHex, valueFamily } from "./typeset";
 
 export function isNumericType(typeName: string): boolean {
   return /int|numeric|decimal|real|double|float|serial|number/i.test(typeName);
@@ -25,9 +27,16 @@ export function sqlValue(column: Column, value: string): string {
   return quoteLiteral(value);
 }
 
-export function sqlCell(column: Column | undefined, value: string | null): string {
+export function sqlCell(column: Column | undefined, value: string | null, engine: Engine = "postgres"): string {
   if (value === null) return "NULL";
-  if (column && isNumericType(column.typeName) && /^-?\d+(\.\d+)?$/.test(value)) return value;
+  if (!column) return quoteLiteral(value);
+  const family = valueFamily(column.typeName);
+  if (family === "bool") return boolLiteral(value) ?? quoteLiteral(value);
+  if (family === "binary") {
+    const hex = parseHex(value);
+    return hex == null ? quoteLiteral(value) : binaryLiteral(engine, hex);
+  }
+  if (isNumericType(column.typeName) && numericLiteral(value)) return value;
   return quoteLiteral(value);
 }
 
@@ -93,7 +102,7 @@ export function whereLocator(schema: TableSchema, columns: readonly string[], va
   return columns
     .map((name, index) => {
       const column = schema.columns.find((item) => item.name === name);
-      return `${quoteIdent(schema.engine, name)} = ${sqlCell(column, values[index] ?? null)}`;
+      return `${quoteIdent(schema.engine, name)} = ${sqlCell(column, values[index] ?? null, schema.engine)}`;
     })
     .join(" AND ");
 }
@@ -101,7 +110,7 @@ export function whereLocator(schema: TableSchema, columns: readonly string[], va
 export function updateSql(schema: TableSchema, sets: Record<string, string | null>, locatorColumns: readonly string[], locatorValues: readonly (string | null)[]): string {
   const assignments = Object.entries(sets).map(([name, value]) => {
     const column = schema.columns.find((item) => item.name === name);
-    return `${quoteIdent(schema.engine, name)} = ${sqlCell(column, value)}`;
+    return `${quoteIdent(schema.engine, name)} = ${sqlCell(column, value, schema.engine)}`;
   });
   return `UPDATE ${qualifiedName(schema)} SET ${assignments.join(", ")} WHERE ${whereLocator(schema, locatorColumns, locatorValues)}`;
 }
@@ -117,7 +126,7 @@ export function insertSql(schema: TableSchema, values: Record<string, string | n
     return `INSERT INTO ${qualifiedName(schema)} DEFAULT VALUES`;
   }
   const list = names.map((name) => quoteIdent(schema.engine, name)).join(", ");
-  const literals = names.map((name) => sqlCell(schema.columns.find((column) => column.name === name), values[name] ?? null)).join(", ");
+  const literals = names.map((name) => sqlCell(schema.columns.find((column) => column.name === name), values[name] ?? null, schema.engine)).join(", ");
   return `INSERT INTO ${qualifiedName(schema)} (${list}) VALUES (${literals})`;
 }
 
@@ -127,9 +136,11 @@ export interface SelectGate {
   statement: string | null;
 }
 
-/** 去掉注释后只接受单条 SELECT。WITH、多语句和非 SELECT 都不能完整导出。 */
-export function selectExportGate(sql: string): SelectGate {
-  const statements = splitSql(sql).map((item) => item.trim()).filter(Boolean);
+/** 去掉注释后只接受单条 SELECT。WITH、多语句和非 SELECT 都不能完整导出。扫描交给 query splitSql。 */
+export function selectExportGate(sql: string, engine = "postgres"): SelectGate {
+  const report = inspectSql(sql, engine);
+  if (report.refusal) return { ok: false, reason: report.refusal, statement: null };
+  const statements = report.pieces.map((piece) => piece.text.trim()).filter(Boolean);
   if (!statements.length) return { ok: false, reason: "没有可导出的语句", statement: null };
   if (statements.length > 1) return { ok: false, reason: "完整导出只接受单条 SELECT 语句", statement: null };
   const statement = statements[0]!;
@@ -138,80 +149,7 @@ export function selectExportGate(sql: string): SelectGate {
   return { ok: true, reason: null, statement };
 }
 
-export function splitSql(sql: string): string[] {
-  const statements: string[] = [];
-  let current = "";
-  let mode: "normal" | "line" | "block" | "single" | "double" | "tick" = "normal";
-  for (let index = 0; index < sql.length; index += 1) {
-    const char = sql[index]!;
-    const next = sql[index + 1] ?? "";
-    if (mode === "line") {
-      if (char === "\n") mode = "normal";
-      continue;
-    }
-    if (mode === "block") {
-      if (char === "*" && next === "/") {
-        mode = "normal";
-        index += 1;
-      }
-      continue;
-    }
-    if (mode === "single") {
-      current += char;
-      if (char === "'" && next === "'") {
-        current += next;
-        index += 1;
-      } else if (char === "'") mode = "normal";
-      continue;
-    }
-    if (mode === "double") {
-      current += char;
-      if (char === '"' && next === '"') {
-        current += next;
-        index += 1;
-      } else if (char === '"') mode = "normal";
-      continue;
-    }
-    if (mode === "tick") {
-      current += char;
-      if (char === "`" && next === "`") {
-        current += next;
-        index += 1;
-      } else if (char === "`") mode = "normal";
-      continue;
-    }
-    if (char === "-" && next === "-") {
-      mode = "line";
-      index += 1;
-      continue;
-    }
-    if (char === "/" && next === "*") {
-      mode = "block";
-      index += 1;
-      continue;
-    }
-    if (char === "'") {
-      mode = "single";
-      current += char;
-      continue;
-    }
-    if (char === '"') {
-      mode = "double";
-      current += char;
-      continue;
-    }
-    if (char === "`") {
-      mode = "tick";
-      current += char;
-      continue;
-    }
-    if (char === ";") {
-      statements.push(current);
-      current = "";
-      continue;
-    }
-    current += char;
-  }
-  if (current.trim()) statements.push(current);
-  return statements;
+/** 语句文本来自 query-window 的扫描，不再在网格里保留一份词法。 */
+export function splitSql(sql: string, engine = "postgres"): string[] {
+  return inspectSql(sql, engine).pieces.map((piece) => piece.text).filter((text) => text.trim().length > 0);
 }

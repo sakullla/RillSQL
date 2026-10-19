@@ -8,13 +8,16 @@ import type { InsertTarget } from "../export/insert";
 import { planExport, type ExportScope } from "../export/plan";
 import { runExportTask, runRemoteExport } from "../export/tasks";
 import type { ExportFormat } from "../export/write";
+import { continueTabRun, tabRun } from "../query/runtime";
 import { gridDescribe } from "./api";
+import { rectangleSelection, selectionTsv, type CellPoint } from "./clipboard";
 import { viewLoadedRows } from "./data";
 import { useRowWindow } from "./virtual";
-import { copyPlain, showCell } from "./display";
+import { copyCellText, showCell } from "./display";
 import "./grid.css";
 import { loadSettings } from "../shell/settings";
 import { locateResultRows, provedEditableColumns, readSingleTable, resolveEditableTable, ResultEditSession, type TableHit } from "./result-edit";
+import { rejectWrite, typeCaption } from "./typeset";
 import type { Cell, Column, Engine, Row, SortSpec } from "./types";
 
 const props = defineProps<{
@@ -39,9 +42,20 @@ const reason = ref("只读");
 const insertTarget = ref<InsertTarget | null>(null);
 const editSession = ref<ResultEditSession | null>(null);
 const editing = ref<{ id: string; column: string; draft: string; isNull: boolean } | null>(null);
+const editError = ref("");
 const commitOpen = ref(false);
 const receipt = ref<string | null>(null);
+const revealed = reactive(new Set<string>());
+const widths = reactive<Record<string, number>>({});
+const anchor = ref<CellPoint | null>(null);
+const focusPoint = ref<CellPoint | null>(null);
+const dragging = ref(false);
+const menu = ref<{ x: number; y: number; row: string; column: string } | null>(null);
+const menuError = ref("");
 let generation = 0;
+let continuing = false;
+let resizeMove: ((event: PointerEvent) => void) | null = null;
+let resizeUp: (() => void) | null = null;
 
 function tableHits(): TableHit[] {
   if (!props.connectionId) return [];
@@ -71,7 +85,7 @@ async function resolveEdit() {
   commitOpen.value = false;
   editSession.value = null;
   insertTarget.value = null;
-  const structural = readSingleTable(props.statement);
+  const structural = readSingleTable(props.statement, props.engine ?? "postgres");
   const engine = props.engine ?? "postgres";
   if (!structural.ok) {
     reason.value = structural.reason;
@@ -141,7 +155,7 @@ const sourceRows = computed(() => {
   });
 });
 const view = computed(() => viewLoadedRows(sourceRows.value, props.columns, find.value, sort.value));
-const { viewport, range, onScroll, reset } = useRowWindow(computed(() => view.value.rows.length));
+const { viewport, range, onScroll, reset } = useRowWindow(computed(() => view.value.rows.length), false);
 const visibleRows = computed(() => view.value.rows.slice(range.value.start, range.value.end).map((row, index) => ({
   id: row.id,
   number: range.value.start + index + 1,
@@ -149,9 +163,26 @@ const visibleRows = computed(() => view.value.rows.slice(range.value.start, rang
   deleted: editSession.value?.deletes.includes(row.id) ?? false,
   failed: !!(editSession.value?.failures.get(`u:${row.id}`) || editSession.value?.failures.get(`d:${row.id}`)),
   failure: [editSession.value?.failures.get(`u:${row.id}`), editSession.value?.failures.get(`d:${row.id}`)].filter(Boolean).join("\n"),
-  cells: props.columns.map((column) => showCell(row.cells[column.name] ?? null)),
+  cells: props.columns.map((column) => showCell(row.cells[column.name] ?? null, { column, opened: revealed.has(`${row.id}:${column.name}`) })),
 })));
-watch([find, sort, () => props.rows], reset);
+const selectedPoints = computed(() => (anchor.value && focusPoint.value ? rectangleSelection(view.value.rows, props.columns, anchor.value, focusPoint.value) : []));
+watch([find, sort], reset);
+watch(() => tabRun(props.tabId)?.id, () => reset());
+watch(
+  () => range.value.end,
+  (end) => {
+    if (continuing || find.value) return;
+    if (!view.value.rows.length || end < view.value.rows.length) return;
+    const run = tabRun(props.tabId);
+    if (!run || (run.status !== "running" && run.status !== "cancel-requested")) return;
+    const statement = run.statements.find((item) => item.sql === props.statement);
+    if (!statement || statement.truncated || statement.rows.length === 0) return;
+    continuing = true;
+    void continueTabRun(props.tabId).finally(() => {
+      continuing = false;
+    });
+  },
+);
 
 const commitFailures = computed(() => (editSession.value ? Array.from(editSession.value.failures, ([id, message]) => ({ id, message })) : []));
 const pendingVisible = computed(() => !!editSession.value && (editSession.value.pendingCount > 0 || editSession.value.failures.size > 0));
@@ -182,7 +213,11 @@ watch(
   },
   { immediate: true },
 );
-onBeforeUnmount(releaseCellPending);
+onBeforeUnmount(() => {
+  releaseCellPending();
+  stopDrag();
+  resizeUp?.();
+});
 
 function inspect(rowId: string, index: number) {
   const row = view.value.rows.find((item) => item.id === rowId);
@@ -195,9 +230,12 @@ function inspect(rowId: string, index: number) {
 
 function beginEdit(id: string, column: string) {
   const session = editSession.value;
+  const meta = props.columns.find((item) => item.name === column);
+  if (rejectWrite(meta, null)) return;
   const row = session?.rowById(id);
   if (!session || !row?.located || session.deletes.includes(id) || !session.canEditColumn(column)) return;
   const current = session.cellValue(id, column);
+  editError.value = "";
   editing.value = { id, column, draft: current ?? "", isNull: current === null };
   session.select(id, column);
 }
@@ -206,7 +244,12 @@ function saveEdit() {
   const edit = editing.value;
   const session = editSession.value;
   if (!edit || !session) return;
-  session.stageUpdate(edit.id, edit.column, edit.isNull ? null : edit.draft);
+  const error = session.stageUpdate(edit.id, edit.column, edit.isNull ? null : edit.draft);
+  if (error) {
+    editError.value = error;
+    return;
+  }
+  editError.value = "";
   editing.value = null;
   receipt.value = null;
 }
@@ -228,8 +271,138 @@ function exportRows(): Record<string, Cell>[] {
 
 async function copyValue() {
   if (!selected.value) return;
-  try { await navigator.clipboard.writeText(copyPlain(selected.value.value, loadSettings().nullCopy)); copyMessage.value = "已复制"; }
+  const column = props.columns.find((item) => item.name === selected.value?.column);
+  const text = copyCellText(selected.value.value, loadSettings().nullCopy, column);
+  try { await navigator.clipboard.writeText(text); copyMessage.value = "已复制"; }
   catch { copyMessage.value = "复制失败，请在值查看器中选中文本复制。"; }
+}
+
+function isPicked(row: string, column: string): boolean {
+  return selectedPoints.value.some((point) => point.row === row && point.column === column);
+}
+
+function columnStyle(name: string): Record<string, string> | undefined {
+  const width = widths[name];
+  if (!width) return undefined;
+  return { width: `${width}px`, minWidth: `${width}px`, maxWidth: `${width}px` };
+}
+
+function startResize(name: string, event: PointerEvent) {
+  const th = ((event.currentTarget as HTMLElement | null) ?? (event.target as HTMLElement | null))?.closest("th");
+  const startX = event.clientX;
+  const startWidth = widths[name] ?? th?.getBoundingClientRect().width ?? 120;
+  resizeMove = (ev) => {
+    widths[name] = Math.max(48, Math.round(startWidth + ev.clientX - startX));
+  };
+  resizeUp = () => {
+    if (resizeMove) window.removeEventListener("pointermove", resizeMove);
+    if (resizeUp) window.removeEventListener("pointerup", resizeUp);
+    resizeMove = null;
+    resizeUp = null;
+  };
+  window.addEventListener("pointermove", resizeMove);
+  window.addEventListener("pointerup", resizeUp);
+}
+
+function stopDrag() {
+  dragging.value = false;
+  window.removeEventListener("pointerup", stopDrag);
+}
+
+function onCellDown(row: string, column: string, event: PointerEvent) {
+  if (event.button !== 0) return;
+  anchor.value = { row, column };
+  focusPoint.value = { row, column };
+  dragging.value = true;
+  menu.value = null;
+  inspect(row, props.columns.findIndex((item) => item.name === column));
+  window.addEventListener("pointerup", stopDrag);
+}
+
+function onCellEnter(row: string, column: string) {
+  if (!dragging.value) return;
+  focusPoint.value = { row, column };
+}
+
+function onCellMenu(row: string, column: string, event: MouseEvent) {
+  event.preventDefault();
+  if (!isPicked(row, column)) {
+    anchor.value = { row, column };
+    focusPoint.value = { row, column };
+  }
+  menuError.value = "";
+  menu.value = { x: event.clientX, y: event.clientY, row, column };
+}
+
+async function copySelection() {
+  const points = selectedPoints.value.length
+    ? selectedPoints.value
+    : selected.value
+      ? [{ row: selected.value.row, column: selected.value.column }]
+      : [];
+  if (!points.length) return;
+  const text = selectionTsv(points, (point) => {
+    const column = props.columns.find((item) => item.name === point.column);
+    const row = sourceRows.value.find((item) => item.id === point.row);
+    const value = editSession.value?.cellValue(point.row, point.column) ?? row?.cells[point.column] ?? null;
+    return copyCellText(value, loadSettings().nullCopy, column);
+  });
+  try {
+    await navigator.clipboard.writeText(text);
+    copyMessage.value = "已复制";
+  } catch {
+    copyMessage.value = "复制失败，请在值查看器中选中文本复制。";
+  }
+}
+
+function editFromMenu() {
+  const target = menu.value;
+  if (!target) return;
+  const meta = props.columns.find((item) => item.name === target.column);
+  const rejected = rejectWrite(meta, null);
+  if (rejected) {
+    menuError.value = rejected;
+    return;
+  }
+  const session = editSession.value;
+  const row = session?.rowById(target.row);
+  if (!session || !row?.located || session.deletes.includes(target.row) || !session.canEditColumn(target.column)) {
+    menuError.value = "只读，不能修改";
+    return;
+  }
+  menu.value = null;
+  beginEdit(target.row, target.column);
+}
+
+function setNullFromMenu() {
+  const target = menu.value;
+  const session = editSession.value;
+  if (!target) return;
+  const meta = props.columns.find((item) => item.name === target.column);
+  const rejected = rejectWrite(meta, null);
+  if (rejected || !session) {
+    menuError.value = rejected ?? "只读，不能修改";
+    return;
+  }
+  const error = session.stageUpdate(target.row, target.column, null);
+  if (error) menuError.value = error;
+  else {
+    menu.value = null;
+    receipt.value = null;
+  }
+}
+
+function revealSelected() {
+  if (!selected.value) return;
+  revealed.add(`${selected.value.row}:${selected.value.column}`);
+}
+
+function onGridKeydown(event: KeyboardEvent) {
+  if (editing.value) return;
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {
+    event.preventDefault();
+    void copySelection();
+  }
 }
 
 function deleteSelected() {
@@ -332,7 +505,9 @@ function startExport(payload: { scope: ExportScope; acknowledged: boolean; path:
   exportOpen.value = false;
 }
 
-watch(() => props.rows, () => { selected.value = null; });
+watch(() => props.rows, (rows) => {
+  if (selected.value && !rows.some((row) => row.id === selected.value?.row)) selected.value = null;
+});
 </script>
 
 <template>
@@ -347,13 +522,14 @@ watch(() => props.rows, () => { selected.value = null; });
     </div>
     <p v-if="exportMessage" class="grid-hint" role="status">{{ exportMessage }}</p>
     <p v-if="receipt" class="grid-hint" role="status">{{ receipt }}</p>
-    <div ref="viewport" class="grid-scroll" @scroll.passive="onScroll">
+    <div ref="viewport" class="grid-scroll" @scroll.passive="onScroll" @keydown="onGridKeydown">
       <table class="grid-table" :aria-rowcount="view.rows.length + 1">
         <thead>
           <tr>
             <th class="row-number" aria-label="行号">#</th>
-            <th v-for="column in columns" :key="column.name" :aria-sort="sort?.column === column.name ? (sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'">
-              <button class="th-btn" type="button" :aria-label="`仅对已读取行按 ${column.name} 排序`" @click="cycle(column.name)">{{ column.name }}<span v-if="sort?.column === column.name" class="sort-arrow">{{ sort.direction === 'asc' ? '↑' : '↓' }}</span></button>
+            <th v-for="column in columns" :key="column.name" :style="columnStyle(column.name)" :data-type="typeCaption(column)" :aria-sort="sort?.column === column.name ? (sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'">
+              <button class="th-btn" type="button" :aria-label="`仅对已读取行按 ${column.name} 排序`" @click="cycle(column.name)"><span>{{ column.name }}</span><span class="col-type">{{ typeCaption(column) }}</span><span v-if="sort?.column === column.name" class="sort-arrow">{{ sort.direction === 'asc' ? '↑' : '↓' }}</span></button>
+              <span class="col-resize" role="separator" :aria-label="`调整 ${column.name} 列宽`" @pointerdown.stop.prevent="startResize(column.name, $event)"></span>
             </th>
           </tr>
         </thead>
@@ -361,19 +537,23 @@ watch(() => props.rows, () => { selected.value = null; });
           <tr v-if="range.top" class="virtual-spacer" aria-hidden="true"><td :colspan="columns.length + 1" :style="{ height: `${range.top}px` }"></td></tr>
           <tr v-for="row in visibleRows" :key="row.id" :data-row-id="row.id" :aria-rowindex="row.number + 1" :class="{ 'row-delete': row.deleted, 'row-failed': row.failed }" :title="row.failure || undefined">
             <td class="row-number">{{ row.number }}<span v-if="row.deleted" class="row-flag del">将删除</span></td>
-            <td v-for="(cell, index) in row.cells" :key="index">
+            <td v-for="(cell, index) in row.cells" :key="index" :style="columnStyle(columns[index]?.name ?? '')">
               <div v-if="editing && editing.id === row.id && editing.column === columns[index]?.name" class="editor">
                 <input v-model="editing.draft" :aria-label="`编辑 ${columns[index]?.name}`" :disabled="editing.isNull" @keydown.enter.prevent="saveEdit" />
                 <button class="btn sm" type="button" :disabled="columns[index] ? !((editSession?.schema.columns.find(item => item.name === columns[index]?.name)?.nullable) ?? true) : false" @click="editing.isNull = true">设为 NULL</button>
                 <button class="btn sm" type="button" @click="editing.isNull = false">空字符串</button>
                 <button class="btn sm primary" type="button" @click="saveEdit">确定</button>
                 <button class="btn sm ghost" type="button" @click="editing = null">取消</button>
+                <p v-if="editError" class="menu-error" role="alert">{{ editError }}</p>
               </div>
-              <button v-else class="cell-btn" :class="{ on: selected?.row === row.id && selected?.column === columns[index]?.name }" :data-cell="`${row.id}:${columns[index]?.name}`" @click="inspect(row.id, index)" @dblclick="beginEdit(row.id, columns[index]?.name ?? '')"><span :class="{ 'v-null': cell.kind === 'null', 'v-empty': cell.kind === 'empty', 'v-large': cell.kind === 'large' }">{{ cell.label }}</span></button>
+              <button v-else class="cell-btn" :class="{ on: selected?.row === row.id && selected?.column === columns[index]?.name, range: isPicked(row.id, columns[index]?.name ?? '') }" :data-cell="`${row.id}:${columns[index]?.name}`" type="button" @pointerdown="onCellDown(row.id, columns[index]?.name ?? '', $event)" @pointerenter="onCellEnter(row.id, columns[index]?.name ?? '')" @contextmenu="onCellMenu(row.id, columns[index]?.name ?? '', $event)" @dblclick="beginEdit(row.id, columns[index]?.name ?? '')"><span :class="{ 'v-null': cell.kind === 'null', 'v-empty': cell.kind === 'empty', 'v-large': cell.kind === 'large' }">{{ cell.label }}</span></button>
             </td>
           </tr>
           <tr v-if="range.bottom" class="virtual-spacer" aria-hidden="true"><td :colspan="columns.length + 1" :style="{ height: `${range.bottom}px` }"></td></tr>
-          <tr v-if="!view.rows.length">
+          <tr v-if="!rows.length">
+            <td class="grid-empty" :colspan="columns.length + 1">没有行。</td>
+          </tr>
+          <tr v-else-if="!view.rows.length">
             <td class="grid-empty" :colspan="columns.length + 1">已读取的行里没有匹配「{{ find }}」的行。</td>
           </tr>
         </tbody>
@@ -392,7 +572,13 @@ watch(() => props.rows, () => { selected.value = null; });
       <button class="btn sm primary" type="button" :disabled="!editSession.pendingCount" @click="commitOpen = true">提交</button>
       <p v-for="failure in commitFailures" :key="failure.id" class="commit-failure" role="alert">{{ failure.message }}</p>
     </div>
-    <section v-if="selected" class="inspector" aria-label="查询值查看器"><div class="inspector-meta"><strong>{{ selected.column }}</strong><span>{{ selected.value === null ? 'NULL' : selected.value === '' ? '空字符串（长度 0）' : '完整值' }}</span><span class="grow"></span><button class="btn sm" @click="selected = null">关闭</button></div><textarea readonly :value="selected.value ?? ''" :aria-label="`${selected.column} 的值`"></textarea><div class="inspector-actions"><button v-if="editSession" class="btn sm" type="button" :disabled="!editSession.canUpdate(editSession.rowById(selected.row)) || !editSession.canEditColumn(selected.column)" @click="beginEdit(selected.row, selected.column)">编辑</button><button class="btn sm" @click="copyValue">复制值</button><span role="status">{{ copyMessage }}</span></div></section>
+    <section v-if="selected" class="inspector" aria-label="查询值查看器"><div class="inspector-meta"><strong>{{ selected.column }}</strong><span class="col-type">{{ typeCaption(columns.find((item) => item.name === selected.column)) }}</span><span>{{ selected.value === null ? 'NULL' : selected.value === '' ? '空字符串（长度 0）' : '值' }}</span><span class="grow"></span><button class="btn sm" @click="selected = null">关闭</button></div><textarea readonly :value="showCell(selected.value, { column: columns.find((item) => item.name === selected.column), opened: revealed.has(`${selected.row}:${selected.column}`) }).body" :aria-label="`${selected.column} 的值`"></textarea><div class="inspector-actions"><button v-if="showCell(selected.value, { column: columns.find((item) => item.name === selected.column) }).kind === 'large'" class="btn sm" type="button" @click="revealSelected">读取完整值</button><button v-if="editSession" class="btn sm" type="button" :disabled="!editSession.canUpdate(editSession.rowById(selected.row)) || !editSession.canEditColumn(selected.column)" @click="beginEdit(selected.row, selected.column)">编辑</button><button class="btn sm" @click="copyValue">复制值</button><span role="status">{{ copyMessage }}</span></div></section>
+    <div v-if="menu" class="cell-menu" role="menu" :style="{ left: `${menu.x}px`, top: `${menu.y}px` }" @contextmenu.prevent>
+      <button type="button" role="menuitem" @click="copySelection(); menu = null">复制</button>
+      <button type="button" role="menuitem" @click="editFromMenu">编辑</button>
+      <button type="button" role="menuitem" @click="setNullFromMenu">设为 NULL</button>
+      <p v-if="menuError" class="menu-error" role="alert">{{ menuError }}</p>
+    </div>
     <div v-if="commitOpen && editSession" class="overlay" role="presentation">
       <div class="sheet" role="dialog" aria-modal="true" aria-label="待提交的更改">
         <header><div><h2>提交这些更改？</h2><p class="hint" data-confirm-target>目标：{{ connectionName }} / {{ objectName }} <span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span></p><p class="hint">将按顺序逐条写入数据库，遇到错误即停止；已写入的不会自动撤销。查询结果不能新增行。</p></div></header>

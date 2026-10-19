@@ -1,5 +1,6 @@
 import { commitChanges, countMatches, queryPage } from "./data";
 import { deleteSql, insertSql, updateSql } from "./sql";
+import { rejectWrite } from "./typeset";
 import type { Cell, Change, CommitReport, CommitStep, Filter, Row, SortSpec, TableStore } from "./types";
 import { opNeedsValue } from "./types";
 
@@ -140,6 +141,9 @@ export class TableSession {
   stageUpdate(rowId: string, column: string, value: Cell): string | null {
     const row = this.rowById(rowId);
     if (!row) return "找不到行";
+    const found = this.store.schema.columns.find((item) => item.name === column);
+    const rejected = rejectWrite(found, value);
+    if (rejected) return rejected;
     if (!this.canUpdate(row)) return "无法唯一确定这一行，不能修改";
     const sets = { ...(this.edits.get(rowId) ?? {}), [column]: value };
     this.edits.set(rowId, sets);
@@ -162,6 +166,9 @@ export class TableSession {
   stageInsert(id: string, column: string, value: Cell | undefined): string | null {
     const insert = this.inserts.find((item) => item.id === id);
     if (!insert) return "找不到新增行";
+    const found = this.store.schema.columns.find((item) => item.name === column);
+    const rejected = rejectWrite(found, value);
+    if (rejected) return rejected;
     insert.cells[column] = value;
     this.failures.delete(id);
     return null;
