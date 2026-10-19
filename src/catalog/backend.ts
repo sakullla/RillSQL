@@ -13,7 +13,9 @@ export interface ObjectLimit {
 
 export async function fetchSessions(): Promise<string[] | null> {
   try {
-    return await invoke<string[]>("catalog_sessions");
+    const ids = await invoke<string[]>("catalog_sessions");
+    // 调用方会把结果交给 Set。非数组不能变成未处理拒绝。
+    return Array.isArray(ids) ? ids : null;
   } catch {
     return null;
   }
