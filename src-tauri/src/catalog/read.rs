@@ -476,17 +476,19 @@ fn quote_mysql(name: &str) -> String {
 }
 
 fn mysql_create_sql(row: &mysql_async::Row) -> Result<String, String> {
-    for index in 0..12 {
-        if row.as_ref(index).is_none() {
-            break;
-        }
-        if let Ok(text) = mysql_string(row, index) {
-            if text.to_ascii_uppercase().contains("CREATE") && !text.trim().is_empty() {
-                return Ok(text);
-            }
-        }
+    let statement = mysql_string(row, 2).ok();
+    mysql_show_create_statement(&[None, None, statement.as_deref()])
+}
+
+/// SHOW CREATE FUNCTION、PROCEDURE、TRIGGER 的语句都在索引 2。
+/// 索引 0 是对象名，名称里的 CREATE 不是定义。
+fn mysql_show_create_statement(columns: &[Option<&str>]) -> Result<String, String> {
+    let text = columns.get(2).and_then(|item| *item).unwrap_or("");
+    if text.trim().is_empty() {
+        Err(definition_failure("没有读到定义"))
+    } else {
+        Ok(text.to_owned())
     }
-    Err(definition_failure("没有读到定义"))
 }
 
 async fn read_postgres(client: &tokio_postgres::Client, page: usize, windows: &[ObjectWindow]) -> Result<Vec<DatabaseNode>, String> {
@@ -706,6 +708,32 @@ fn mysql_string(row: &mysql_async::Row, index: usize) -> Result<String, String> 
 
 fn mysql_text(row: &mysql_async::Row, index: usize) -> String {
     mysql_string(row, index).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod definition_column_tests {
+    use super::mysql_show_create_statement;
+
+    #[test]
+    fn show_create_uses_the_statement_column_when_the_name_contains_create() {
+        let function = [
+            Some("create_order"),
+            Some("ONLY_FULL_GROUP_BY"),
+            Some("CREATE FUNCTION `create_order`() RETURNS int\nBEGIN\n  RETURN 1;\nEND"),
+        ];
+        let sql = mysql_show_create_statement(&function).expect("statement column");
+        assert!(sql.starts_with("CREATE FUNCTION"));
+        assert_ne!(sql, "create_order");
+
+        let trigger = [
+            Some("created_at"),
+            Some(""),
+            Some("CREATE TRIGGER created_at BEFORE INSERT ON t FOR EACH ROW SET NEW.a = 1"),
+        ];
+        assert!(mysql_show_create_statement(&trigger).unwrap().starts_with("CREATE TRIGGER"));
+        assert!(mysql_show_create_statement(&[Some("create_order"), Some("mode")]).is_err());
+        assert!(mysql_show_create_statement(&[Some("create_order"), Some("mode"), Some("   ")]).is_err());
+    }
 }
 
 fn mysql_i64(row: &mysql_async::Row, index: usize) -> Option<i64> {

@@ -183,6 +183,12 @@
           "markdownDescription": "允许读取关于信息。应用一旦声明自己的权限，未列出的命令会被拒绝，因此保留原有 app_info。"
         },
         {
+          "description": "允许从已打开的会话读取函数、存储过程或触发器的只读定义。",
+          "type": "string",
+          "const": "allow-catalog-definition",
+          "markdownDescription": "允许从已打开的会话读取函数、存储过程或触发器的只读定义。"
+        },
+        {
           "description": "允许从已打开的会话继续读取对象。",
           "type": "string",
           "const": "allow-catalog-page",

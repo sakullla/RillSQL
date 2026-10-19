@@ -2,7 +2,7 @@ import { shallowRef, reactive } from "vue";
 import { presentEnv, type EnvTag, type SavedConnection } from "../connections/model";
 import { loadSettings } from "../shell/settings";
 import { fetchCatalog, fetchPage, fetchSessions, listConnections, listEnvTags, type ObjectLimit } from "./backend";
-import { objectPath, refreshConnection, refreshSchema } from "./tree";
+import { objectPath, refreshConnection, refreshSchema, serverSliceCount, successfulTotal } from "./tree";
 import { DEFAULT_OBJECT_PAGE, type CatalogConnection, type PageRequest, type PageResult, type PaletteTable, type SchemaNode } from "./types";
 
 const connections = shallowRef<CatalogConnection[]>([]);
@@ -124,12 +124,12 @@ export function revealMore(connectionId: string, database: string, schemaName: s
               shown[key] = Math.min(schema.objects.length, current + page);
               return schema;
             }
-            if (schema.objects.length >= schema.total) return schema;
+            if (serverSliceCount(schema) >= successfulTotal(schema)) return schema;
             const request: PageRequest = {
               connectionId,
               database,
               schema: schemaName,
-              offset: schema.objects.length,
+              offset: serverSliceCount(schema),
               limit: page,
             };
             if (pageSource) {

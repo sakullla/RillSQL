@@ -104,6 +104,53 @@ describe("catalog session reads", () => {
     );
   });
 
+  it("pages past retained rows from a failed kind without skipping successful names", async () => {
+    const base = catalogFixture();
+    const schema = base[0]!.databases[0]!.schemas.find((item) => item.name === "archive")!;
+    const functions = Array.from({ length: 15 }, (_, index) => ({
+      name: `fn_${index}`,
+      kind: "function" as const,
+      estimatedRows: null,
+      stale: false,
+    }));
+    schema.objects = [
+      ...auditTables(0, 90),
+      { name: "audit_old", kind: "table", estimatedRows: 1, stale: true },
+      ...functions,
+    ];
+    schema.total = 100;
+    schema.kindReports = [
+      { kind: "table", total: 100, error: null },
+      { kind: "function", total: 0, error: "permission denied" },
+    ];
+    replaceCatalog(base);
+    invoke.mockResolvedValue({
+      objects: auditTables(90, 10),
+      total: 100,
+      error: null,
+      kindReports: schema.kindReports,
+    });
+
+    revealMore("atlas", "atlas_dev", "archive");
+    expect(invoke).not.toHaveBeenCalled();
+    revealMore("atlas", "atlas_dev", "archive");
+    await vi.waitFor(() => {
+      const loaded = catalogConnections()[0]!.databases[0]!.schemas.find((item) => item.name === "archive");
+      expect(loaded?.objects.filter((item) => item.kind === "table" && !item.stale)).toHaveLength(100);
+    });
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith(
+      "catalog_page",
+      expect.objectContaining({ connectionId: "atlas", database: "atlas_dev", schema: "archive", offset: 90, limit: 100 }),
+    );
+    const loaded = catalogConnections()[0]!.databases[0]!.schemas.find((item) => item.name === "archive")!;
+    const names = loaded.objects.filter((item) => item.kind === "table" && !item.stale).map((item) => item.name);
+    expect(names).toContain("audit_0089");
+    expect(names).toContain("audit_0090");
+    expect(new Set(names).size).toBe(100);
+    expect(loaded.objects.filter((item) => item.kind === "function")).toHaveLength(15);
+  });
+
   it("keeps objects when a read fails and does not present that as an empty schema", async () => {
     replaceCatalog(catalogFixture());
     invoke.mockRejectedValue(new Error("读取库表失败：down"));

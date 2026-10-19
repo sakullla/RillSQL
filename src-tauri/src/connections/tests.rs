@@ -676,7 +676,7 @@ async fn users_keep_their_own_environment_tags() {
     let coerced = service.save(missing, SecretInput::default()).await.unwrap();
     assert_eq!(coerced.connection.env, "none");
 
-    let catalogs = crate::catalog::commands::load_catalog(&service, 0, &[]).await.unwrap();
+    let catalogs = crate::catalog::commands::load_catalog(&service, 0, &[], None, false).await.unwrap();
     let preview = catalogs.iter().find(|item| item.id == saved.connection.id).unwrap();
     assert_eq!(preview.env_label, "预发");
     assert_eq!(preview.env_tone, "test");
@@ -687,7 +687,7 @@ async fn users_keep_their_own_environment_tags() {
     service.delete_tag(&created.id).await.unwrap();
     let listed = service.list().await.unwrap();
     assert_eq!(listed.iter().find(|item| item.saved.id == saved.connection.id).unwrap().saved.env, "none");
-    let after = crate::catalog::commands::load_catalog(&service, 0, &[]).await.unwrap();
+    let after = crate::catalog::commands::load_catalog(&service, 0, &[], None, false).await.unwrap();
     let detached = after.iter().find(|item| item.id == saved.connection.id).unwrap();
     assert_eq!(detached.env, "none");
     assert_eq!(detached.env_label, "无标签");
@@ -701,7 +701,7 @@ async fn users_keep_their_own_environment_tags() {
     let service = Service::new(path.clone(), Arc::new(MemoryStore::default()));
     let ghost = service.list().await.unwrap();
     assert_eq!(ghost.iter().find(|item| item.saved.id == saved.connection.id).unwrap().saved.env, "ghost");
-    let shown = crate::catalog::commands::load_catalog(&service, 0, &[]).await.unwrap();
+    let shown = crate::catalog::commands::load_catalog(&service, 0, &[], None, false).await.unwrap();
     let ghost_row = shown.iter().find(|item| item.id == saved.connection.id).unwrap();
     assert_eq!(ghost_row.env_label, "无标签");
     assert_eq!(ghost_row.env_tone, "none");

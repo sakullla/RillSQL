@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import { objectPageSize, refreshCatalog, revealMore, schemaKey, shownCount } from "./store";
-import { KIND_LABEL, objectGroups, objectKey, objectLabel } from "./tree";
+import { KIND_LABEL, objectGroups, objectKey, objectLabel, serverSliceCount, successfulTotal, visibleTotal } from "./tree";
 import type { CatalogConnection, CatalogObject, ObjectKind, SchemaNode } from "./types";
 
 const props = defineProps<{
@@ -36,7 +36,7 @@ function visible(): CatalogObject[] {
 
 function needsMore(): boolean {
   const count = shownCount(schemaKey(props.connection.id, props.database, props.schema.name), props.schema.objects.length);
-  return count < props.schema.objects.length || props.schema.objects.length < props.schema.total;
+  return count < props.schema.objects.length || serverSliceCount(props.schema) < successfulTotal(props.schema);
 }
 
 function shownLabel(): string {
@@ -44,7 +44,7 @@ function shownLabel(): string {
     shownCount(schemaKey(props.connection.id, props.database, props.schema.name), props.schema.objects.length),
     props.schema.objects.length,
   );
-  return `已显示 ${count} / ${Math.max(props.schema.total, props.schema.objects.length)} 个`;
+  return `已显示 ${count} / ${Math.max(visibleTotal(props.schema), props.schema.objects.length)} 个`;
 }
 
 function objectMeta(object: CatalogObject): string {

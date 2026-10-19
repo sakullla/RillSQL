@@ -201,6 +201,26 @@ export function splitMatch(text: string, query: string): { text: string; hit: bo
   ].filter((part) => part.text.length > 0);
 }
 
+function kindFailed(schema: Pick<SchemaNode, "kindReports">, kind: ObjectKind): boolean {
+  return schema.kindReports?.some((item) => item.kind === kind && item.error !== null) ?? false;
+}
+
+/** 仍在服务端按名称切片里的行。失败类的保留行和 stale 行不占 offset。 */
+export function serverSliceCount(schema: Pick<SchemaNode, "objects" | "kindReports">): number {
+  return schema.objects.filter((object) => !object.stale && !kindFailed(schema, object.kind)).length;
+}
+
+/** 成功类的总数。没有分类报告时，schema.total 就是这个数。 */
+export function successfulTotal(schema: Pick<SchemaNode, "total" | "kindReports">): number {
+  const reports = schema.kindReports;
+  if (!reports || reports.length === 0) return schema.total;
+  return reports.reduce((sum, item) => (item.error ? sum : sum + item.total), 0);
+}
+
+export function visibleTotal(schema: Pick<SchemaNode, "objects" | "total" | "kindReports">): number {
+  return successfulTotal(schema) + schema.objects.length - serverSliceCount(schema);
+}
+
 export function schemaFailed(schema: SchemaNode): boolean {
   return schema.error !== null;
 }

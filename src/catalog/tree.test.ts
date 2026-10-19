@@ -3,7 +3,7 @@ import { MODULE_ID } from "./index";
 import { createRefreshFixture, catalogFixture } from "./fixtures";
 import { listPaletteTables, refreshCatalog, replaceCatalog, resetCatalog, setRefreshSource } from "./store";
 import { browseSql, qualifiedObjectName } from "./object-ref";
-import { engineShape, objectPath, postgresSessionGap, reconcileObjects, refreshConnection, refreshSchema, schemaFailed, schemaIsEmpty, searchObjects } from "./tree";
+import { engineShape, objectPath, postgresSessionGap, reconcileObjects, refreshConnection, refreshSchema, schemaFailed, schemaIsEmpty, searchObjects, serverSliceCount, successfulTotal, visibleTotal } from "./tree";
 import type { CatalogObject, SchemaNode } from "./types";
 
 function row(name: string, stale = false): CatalogObject {
@@ -50,6 +50,35 @@ describe("catalog tree", () => {
     ]);
     const second = reconcileObjects(first, [row("orders")]);
     expect(second.map((item) => item.name)).toEqual(["orders"]);
+  });
+
+  it("excludes failed kinds and stale rows from the server slice", () => {
+    const functions = Array.from({ length: 10 }, (_, index) => ({
+      name: `fn_${index}`,
+      kind: "function" as const,
+      estimatedRows: null,
+      stale: false,
+    }));
+    const schema: SchemaNode = {
+      name: "public",
+      objects: [
+        ...Array.from({ length: 90 }, (_, index) => row(`audit_${index}`)),
+        { name: "audit_old", kind: "table", estimatedRows: 1, stale: true },
+        ...functions,
+      ],
+      total: 100,
+      error: null,
+      kindReports: [
+        { kind: "table", total: 100, error: null },
+        { kind: "function", total: 0, error: "permission denied" },
+      ],
+    };
+    expect(serverSliceCount(schema)).toBe(90);
+    expect(successfulTotal(schema)).toBe(100);
+    expect(visibleTotal(schema)).toBe(111);
+    const plain: SchemaNode = { name: "archive", objects: [row("a"), row("b")], total: 5, error: null };
+    expect(serverSliceCount(plain)).toBe(2);
+    expect(successfulTotal(plain)).toBe(5);
   });
 
   it("keeps the previous objects when a schema read fails", () => {
