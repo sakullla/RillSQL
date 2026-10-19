@@ -11,7 +11,7 @@ export interface LivePage {
 export interface ChangePayload {
   id: string;
   kind: "update" | "insert" | "delete";
-  sets: { column: string; value: Cell }[];
+  sets: { column: string; value: Cell; resolved?: boolean }[];
   locator: { column: string; value: Cell }[];
   values: { column: string; value: Cell }[];
 }

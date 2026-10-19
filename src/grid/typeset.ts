@@ -19,13 +19,29 @@ export function isUnknownType(typeName: string | undefined): boolean {
   return name.length === 0 || name === "类型未知";
 }
 
-/** 页查询留给可定位行的预览协议，不是格子里的原值。 */
-export function isPreviewEnvelope(value: string): boolean {
-  if (!value.startsWith("\u0001t:") && !value.startsWith("\u0001b:")) return false;
+const PREVIEW_MARK = "\u0001";
+
+export function isBinaryEnvelope(value: string): boolean {
+  return value.startsWith(`${PREVIEW_MARK}b:`) && /^\d+$/.test(value.slice(3));
+}
+
+/** 页查询只在文本超过 1024 字节时包信封，预览最多 1024 个字符，整段也长于 1024 字节。 */
+export function isSyntheticTextPreview(value: string): boolean {
+  if (!value.startsWith(`${PREVIEW_MARK}t:`)) return false;
   const body = value.slice(3);
-  if (value[1] === "b") return /^\d+$/.test(body);
   const cut = body.indexOf(":");
-  return cut > 0 && /^\d+$/.test(body.slice(0, cut));
+  if (cut <= 0 || !/^\d+$/.test(body.slice(0, cut))) return false;
+  const declared = Number(body.slice(0, cut));
+  if (!Number.isFinite(declared) || declared <= 1024) return false;
+  const preview = body.slice(cut + 1);
+  if ([...preview].length > 1024) return false;
+  return new TextEncoder().encode(value).length > 1024;
+}
+
+/** 未展开的页查询预览。短文本碰巧写成协议形状时不是预览；二进制信封只约束二进制列。 */
+export function isPreviewEnvelope(value: string, typeName?: string): boolean {
+  if (isBinaryEnvelope(value)) return typeName === undefined || valueFamily(typeName) === "binary";
+  return isSyntheticTextPreview(value);
 }
 
 export function valueFamily(typeName: string | undefined): ValueFamily {
@@ -56,15 +72,15 @@ export function typeCaption(column: Pick<Column, "typeName"> | undefined): strin
   return column.typeName;
 }
 
-/** 类型本身不能写回时给出原因。NULL 不能绕过几何、原文和类型未知。 */
-export function rejectWrite(column: Column | undefined, value: Cell | undefined): string | null {
+/** 类型本身不能写回时给出原因。NULL 不能绕过几何、原文和类型未知。resolved 表示主键另读已经返回这段原文。 */
+export function rejectWrite(column: Column | undefined, value: Cell | undefined, resolved = false): string | null {
   if (value === undefined) return null;
   const family = valueFamily(column?.typeName);
   if (family === "unknown") return "类型未知，不能编辑";
   if (family === "geometry") return "几何类型不能从格子保存";
   if (family === "raw") return "不能判断写回方式，不能编辑";
   if (value === null) return null;
-  if (isPreviewEnvelope(value)) return "预览内容不能写回";
+  if (!resolved && isPreviewEnvelope(value, column?.typeName)) return "预览内容不能写回";
   if (family === "binary" && parseHex(value) == null) return "这不是十六进制";
   if (family === "bool" && !boolLiteral(value)) return "不能写成布尔字面量";
   return null;

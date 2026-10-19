@@ -65,6 +65,7 @@ export function copyRow(row: Row): Row {
     cells: { ...row.cells },
     locator: row.locator ? { columns: [...row.locator.columns], values: [...row.locator.values] } : null,
     located: row.located,
+    ...(row.resolved ? { resolved: true } : {}),
   };
 }
 

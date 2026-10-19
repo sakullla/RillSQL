@@ -11,8 +11,8 @@ import { catalogConnections } from "../catalog/store";
 import { registerPending } from "../shell/close-guard";
 import { loadSettings } from "../shell/settings";
 import { rectangleSelection, selectionTsv, type CellPoint } from "./clipboard";
-import { copyCellText, copySqlValue, needsFullRead, parseEnvelope, showCell, type NullCopy } from "./display";
-import { rejectWrite, typeCaption } from "./typeset";
+import { copyCellText, copySqlValue, needsFullRead, showCell, type NullCopy } from "./display";
+import { isPreviewEnvelope, rejectWrite, typeCaption } from "./typeset";
 import "./grid.css";
 import { useRowWindow } from "./virtual";
 import { LiveTable } from "./live";
@@ -233,7 +233,8 @@ async function beginEdit(id: string, column: string) {
   }
   if (token !== editToken) return;
   const current = session.cellValue(id, column);
-  if (typeof current === "string" && parseEnvelope(current)) {
+  const resolved = session.rowById(id)?.resolved === true;
+  if (typeof current === "string" && isPreviewEnvelope(current, meta?.typeName) && !resolved) {
     const message = "预览内容不能写回";
     editError.value = message;
     if (menu.value?.row === id && menu.value.column === column) menuError.value = message;
@@ -420,7 +421,7 @@ async function copySelection() {
       return;
     }
   }
-  const text = selectionTsv(points, (point) => copyCellText(session.cellValue(point.row, point.column), props.nullCopy ?? loadSettings().nullCopy, columns.value.find((item) => item.name === point.column)));
+  const text = selectionTsv(points, (point) => copyCellText(session.cellValue(point.row, point.column), props.nullCopy ?? loadSettings().nullCopy, columns.value.find((item) => item.name === point.column), session.rowById(point.row)?.resolved === true));
   try {
     await navigator.clipboard.writeText(text);
     copyMessage.value = "已复制";

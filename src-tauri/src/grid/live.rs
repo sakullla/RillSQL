@@ -62,6 +62,8 @@ pub struct Mutation {
     pub sets: Vec<(String, Cell)>,
     pub locator: Vec<(String, Cell)>,
     pub values: Vec<(String, Cell)>,
+    /// 与 sets 对齐。真表示该值来自已经完成的主键另读。
+    pub resolved: Vec<bool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -200,7 +202,7 @@ pub async fn commit(
         }
         match change.kind {
             MutationKind::Update => {
-                if let Some(message) = reject_sets(&schema, &change.sets) {
+                if let Some(message) = reject_sets(&schema, &change.sets, &change.resolved) {
                     return Ok(fail(applied, &change.id, String::new(), message, pending));
                 }
                 let sql = match located_sql(&schema, &change.locator, true) {
@@ -238,7 +240,7 @@ pub async fn commit(
                 }
             }
             MutationKind::Insert => {
-                if let Some(message) = reject_sets(&schema, &change.values) {
+                if let Some(message) = reject_sets(&schema, &change.values, &[]) {
                     return Ok(fail(applied, &change.id, String::new(), message, pending));
                 }
                 let sql = sql::insert_sql(&schema, &change.values);
@@ -263,10 +265,10 @@ fn fail(applied: Vec<Applied>, id: &str, sql: String, message: impl Into<String>
     }
 }
 
-fn reject_sets(schema: &TableSchema, sets: &[(String, Cell)]) -> Option<String> {
-    sets.iter().find_map(|(name, value)| {
+fn reject_sets(schema: &TableSchema, sets: &[(String, Cell)], resolved: &[bool]) -> Option<String> {
+    sets.iter().enumerate().find_map(|(index, (name, value))| {
         let column = schema.columns.iter().find(|column| column.name == *name)?;
-        sql::reject_literal(column, value)
+        sql::reject_literal_with(column, value, resolved.get(index).copied().unwrap_or(false))
     })
 }
 

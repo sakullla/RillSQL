@@ -245,6 +245,25 @@ fn preview_sql_literals_and_split_follow_the_query_scanner() {
     let sqlite_sql = sql::select_list(&sqlite, false);
     assert!(sqlite_sql.contains("CAST(") && sqlite_sql.contains("AS TEXT"), "{sqlite_sql}");
 
+    let keyed_text = schema(Engine::Postgres, "table", &["token"], vec![col("token", "text"), col("note", "text"), col("payload", "bytea")]);
+    let text_sql = sql::select_list(&keyed_text, false);
+    assert!(text_sql.starts_with("\"token\"::text,"), "{text_sql}");
+    assert!(!text_sql.contains("left(\"token\"::text"), "{text_sql}");
+    assert!(text_sql.contains("chr(1)"), "{text_sql}");
+    let keyed_blob = schema(Engine::Postgres, "table", &["payload"], vec![col("payload", "bytea"), col("blob", "bytea")]);
+    let blob_sql = sql::select_list(&keyed_blob, false);
+    assert!(blob_sql.starts_with("CASE WHEN \"payload\" IS NULL THEN NULL ELSE encode(\"payload\", 'hex') END"), "{blob_sql}");
+    assert!(!blob_sql.contains("octet_length(\"payload\")"), "{blob_sql}");
+    assert!(blob_sql.contains("chr(1)"), "{blob_sql}");
+    let mysql_key = schema(Engine::Mysql, "table", &["token"], vec![col("token", "varchar"), col("note", "text")]);
+    let mysql_key_sql = sql::select_list(&mysql_key, false);
+    assert!(mysql_key_sql.starts_with("CAST(`token` AS CHAR),"), "{mysql_key_sql}");
+    assert!(!mysql_key_sql.contains("LEFT(CAST(`token` AS CHAR)"), "{mysql_key_sql}");
+    let sqlite_key = schema(Engine::Sqlite, "table", &["token"], vec![col("token", "text"), col("note", "text")]);
+    let sqlite_key_sql = sql::select_list(&sqlite_key, false);
+    assert!(sqlite_key_sql.starts_with("CAST(\"token\" AS TEXT),"), "{sqlite_key_sql}");
+    assert!(!sqlite_key_sql.contains("substr(CAST(\"token\" AS TEXT)"), "{sqlite_key_sql}");
+
     let flag = col("flag", "bool");
     assert_eq!(sql::sql_cell(Engine::Postgres, Some(&flag), &Cell::Text("t".to_owned())), "TRUE");
     assert_eq!(sql::sql_cell(Engine::Mysql, Some(&flag), &Cell::Text("0".to_owned())), "FALSE");
@@ -252,7 +271,10 @@ fn preview_sql_literals_and_split_follow_the_query_scanner() {
     assert_eq!(sql::sql_cell(Engine::Postgres, Some(&blob), &Cell::Text("0A0B".to_owned())), "'\\x0a0b'");
     assert_eq!(sql::sql_cell(Engine::Mysql, Some(&blob), &Cell::Text("aa".to_owned())), "X'aa'");
     assert_eq!(sql::reject_literal(&blob, &Cell::Text("zz".to_owned())).as_deref(), Some("这不是十六进制"));
-    assert_eq!(sql::reject_literal(&col("note", "text"), &Cell::Text("\u{1}t:11:hello".to_owned())).as_deref(), Some("预览内容不能写回"));
+    assert!(sql::reject_literal(&col("note", "text"), &Cell::Text("\u{1}t:11:hello".to_owned())).is_none());
+    let synthetic = format!("\u{1}t:3000:{}", "a".repeat(1024));
+    assert_eq!(sql::reject_literal(&col("note", "text"), &Cell::Text(synthetic.clone())).as_deref(), Some("预览内容不能写回"));
+    assert!(sql::reject_literal_with(&col("note", "text"), &Cell::Text(synthetic), true).is_none());
     assert_eq!(sql::reject_literal(&col("shape", "geometry"), &Cell::Null).as_deref(), Some("几何类型不能从格子保存"));
     assert!(sql::reject_literal(&col("mystery", ""), &Cell::Text("a".to_owned())).unwrap().contains("类型未知"));
     assert!(sql::reject_literal(&col("weird", "interval"), &Cell::Null).unwrap().contains("不能判断写回方式"));
@@ -374,9 +396,9 @@ async fn open_session_reads_writes_and_exports_without_a_second_connection() {
         "customers",
         "sqlite",
         &[
-            Mutation { id: "u:1".to_owned(), kind: MutationKind::Update, sets: vec![("name".to_owned(), Cell::Text("已改".to_owned()))], locator: first, values: Vec::new() },
-            Mutation { id: "u:2".to_owned(), kind: MutationKind::Update, sets: vec![("email".to_owned(), Cell::Text("u1@example.com".to_owned()))], locator: second, values: Vec::new() },
-            Mutation { id: "d:3".to_owned(), kind: MutationKind::Delete, sets: Vec::new(), locator: third, values: Vec::new() },
+            Mutation { id: "u:1".to_owned(), kind: MutationKind::Update, sets: vec![("name".to_owned(), Cell::Text("已改".to_owned()))], locator: first, values: Vec::new(), resolved: Vec::new() },
+            Mutation { id: "u:2".to_owned(), kind: MutationKind::Update, sets: vec![("email".to_owned(), Cell::Text("u1@example.com".to_owned()))], locator: second, values: Vec::new(), resolved: Vec::new() },
+            Mutation { id: "d:3".to_owned(), kind: MutationKind::Delete, sets: Vec::new(), locator: third, values: Vec::new(), resolved: Vec::new() },
         ],
     )
     .await
@@ -403,6 +425,7 @@ async fn open_session_reads_writes_and_exports_without_a_second_connection() {
             sets: Vec::new(),
             locator: Vec::new(),
             values: vec![("name".to_owned(), Cell::Text("新客户".to_owned())), ("email".to_owned(), Cell::Text("fresh@example.com".to_owned()))],
+            resolved: Vec::new(),
         }],
     )
     .await
@@ -422,7 +445,7 @@ async fn open_session_reads_writes_and_exports_without_a_second_connection() {
         "",
         "notes",
         "sqlite",
-        &[Mutation { id: "new-note".to_owned(), kind: MutationKind::Insert, sets: Vec::new(), locator: Vec::new(), values: vec![("label".to_owned(), Cell::Text("新".to_owned()))] }],
+        &[Mutation { id: "new-note".to_owned(), kind: MutationKind::Insert, sets: Vec::new(), locator: Vec::new(), values: vec![("label".to_owned(), Cell::Text("新".to_owned()))], resolved: Vec::new() }],
     )
     .await
     .unwrap();
@@ -436,7 +459,7 @@ async fn open_session_reads_writes_and_exports_without_a_second_connection() {
         "",
         "notes",
         "sqlite",
-        &[Mutation { id: "d:o".to_owned(), kind: MutationKind::Delete, sets: Vec::new(), locator: vec![("label".to_owned(), Cell::Text("same".to_owned()))], values: Vec::new() }],
+        &[Mutation { id: "d:o".to_owned(), kind: MutationKind::Delete, sets: Vec::new(), locator: vec![("label".to_owned(), Cell::Text("same".to_owned()))], values: Vec::new(), resolved: Vec::new() }],
     )
     .await
     .unwrap();
@@ -452,7 +475,7 @@ async fn open_session_reads_writes_and_exports_without_a_second_connection() {
         "",
         "v_customers",
         "sqlite",
-        &[Mutation { id: "new-view".to_owned(), kind: MutationKind::Insert, sets: Vec::new(), locator: Vec::new(), values: vec![("name".to_owned(), Cell::Text("x".to_owned()))] }],
+        &[Mutation { id: "new-view".to_owned(), kind: MutationKind::Insert, sets: Vec::new(), locator: Vec::new(), values: vec![("name".to_owned(), Cell::Text("x".to_owned()))], resolved: Vec::new() }],
     )
     .await
     .unwrap();
@@ -674,7 +697,7 @@ async fn located_rows_preview_until_a_key_reread_and_bad_literals_are_not_sent()
         "",
         "docs",
         "sqlite",
-        &[Mutation { id: "bad-blob".to_owned(), kind: MutationKind::Update, sets: vec![("blob".to_owned(), Cell::Text("zz".to_owned()))], locator: locator.clone(), values: Vec::new() }],
+        &[Mutation { id: "bad-blob".to_owned(), kind: MutationKind::Update, sets: vec![("blob".to_owned(), Cell::Text("zz".to_owned()))], locator: locator.clone(), values: Vec::new(), resolved: Vec::new() }],
     )
     .await
     .unwrap();
@@ -687,7 +710,7 @@ async fn located_rows_preview_until_a_key_reread_and_bad_literals_are_not_sent()
         "",
         "docs",
         "sqlite",
-        &[Mutation { id: "bad-geo".to_owned(), kind: MutationKind::Update, sets: vec![("g".to_owned(), Cell::Null)], locator: locator.clone(), values: Vec::new() }],
+        &[Mutation { id: "bad-geo".to_owned(), kind: MutationKind::Update, sets: vec![("g".to_owned(), Cell::Null)], locator: locator.clone(), values: Vec::new(), resolved: Vec::new() }],
     )
     .await
     .unwrap();
@@ -700,7 +723,7 @@ async fn located_rows_preview_until_a_key_reread_and_bad_literals_are_not_sent()
         "",
         "docs",
         "sqlite",
-        &[Mutation { id: "bad-type".to_owned(), kind: MutationKind::Update, sets: vec![("mystery".to_owned(), Cell::Text("x".to_owned()))], locator: locator.clone(), values: Vec::new() }],
+        &[Mutation { id: "bad-type".to_owned(), kind: MutationKind::Update, sets: vec![("mystery".to_owned(), Cell::Text("x".to_owned()))], locator: locator.clone(), values: Vec::new(), resolved: Vec::new() }],
     )
     .await
     .unwrap();
@@ -714,7 +737,7 @@ async fn located_rows_preview_until_a_key_reread_and_bad_literals_are_not_sent()
         "",
         "docs",
         "sqlite",
-        &[Mutation { id: "flag".to_owned(), kind: MutationKind::Update, sets: vec![("flag".to_owned(), Cell::Text("yes".to_owned()))], locator, values: Vec::new() }],
+        &[Mutation { id: "flag".to_owned(), kind: MutationKind::Update, sets: vec![("flag".to_owned(), Cell::Text("yes".to_owned()))], locator, values: Vec::new(), resolved: Vec::new() }],
     )
     .await
     .unwrap();
@@ -734,6 +757,7 @@ async fn located_rows_preview_until_a_key_reread_and_bad_literals_are_not_sent()
             sets: vec![("note".to_owned(), Cell::Text(format!("\u{1}t:3000:{}", "a".repeat(1024))))],
             locator: short.locator.clone(),
             values: Vec::new(),
+            resolved: Vec::new(),
         }],
     )
     .await
@@ -783,6 +807,128 @@ async fn located_rows_preview_until_a_key_reread_and_bad_literals_are_not_sent()
     assert!(!loose.sql.contains("char(1)"), "{}", loose.sql);
     assert_eq!(loose.rows[0].cells.get("label"), Some(&Cell::Text(long)));
     assert!(loose.rows.iter().all(|row| !row.located));
+
+    drop(session);
+    drop(service);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn key_columns_keep_full_text_and_hex_for_locator_reads() {
+    use super::live::{self, Mutation, MutationKind};
+    use crate::connections::Service;
+
+    let dir = std::env::temp_dir().join(format!("rillsql-grid-key-preview-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("keys.sqlite");
+    let setup = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE blob_keys (id BLOB PRIMARY KEY, note TEXT, extra BLOB)").execute(&setup).await.unwrap();
+    let long = "a".repeat(3000);
+    sqlx::query("INSERT INTO blob_keys (id, note, extra) VALUES (x'abcd', ?1, x'ffff')").bind(&long).execute(&setup).await.unwrap();
+    sqlx::query("INSERT INTO blob_keys (id, note, extra) VALUES (x'abce', 'short', x'ffff')").execute(&setup).await.unwrap();
+    sqlx::query("CREATE TABLE text_keys (id TEXT PRIMARY KEY, note TEXT)").execute(&setup).await.unwrap();
+    sqlx::query("INSERT INTO text_keys (id, note) VALUES (?1, 'x')").bind(&long).execute(&setup).await.unwrap();
+    let literal = "\u{1}t:11:hello";
+    sqlx::query("INSERT INTO text_keys (id, note) VALUES (?1, 'y')").bind(literal).execute(&setup).await.unwrap();
+    setup.close().await;
+
+    let service = Service::new_for_test(dir.join("connections.sqlite"));
+    service.open_sqlite_for_test("keys", "主键", &database).await.unwrap();
+    let session = service.catalog_session("keys").expect("已打开会话");
+
+    let blobs = live::query_page(&session, "main", "", "blob_keys", "sqlite", &[], None, 0, 10).await.unwrap();
+    assert!(blobs.sql.contains("lower(hex(\"id\"))"), "{}", blobs.sql);
+    assert!(!blobs.sql.contains("length(\"id\")"), "{}", blobs.sql);
+    assert!(blobs.sql.contains("char(1)"), "{}", blobs.sql);
+    assert_eq!(blobs.rows.len(), 2);
+    assert_ne!(blobs.rows[0].id, blobs.rows[1].id);
+    let first = blobs.rows.iter().find(|row| row.cells.get("id") == Some(&Cell::Text("abcd".to_owned()))).unwrap();
+    let second = blobs.rows.iter().find(|row| row.cells.get("id") == Some(&Cell::Text("abce".to_owned()))).unwrap();
+    assert!(first.located && second.located);
+    assert_eq!(first.locator, vec![("id".to_owned(), Cell::Text("abcd".to_owned()))]);
+    assert_eq!(first.cells.get("extra"), Some(&Cell::Text("\u{1}b:2".to_owned())));
+    match first.cells.get("note") {
+        Some(Cell::Text(text)) => assert!(text.starts_with("\u{1}t:3000:"), "{text}"),
+        other => panic!("非主键长文本仍应是预览 {other:?}"),
+    }
+
+    let opened = live::query_page(&session, "main", "", "blob_keys", "sqlite", &[filt("id", FilterOp::Eq, Some("abcd"))], None, 0, 1).await.unwrap();
+    assert_eq!(opened.rows.len(), 1);
+    assert_eq!(opened.rows[0].cells.get("note"), Some(&Cell::Text(long.clone())));
+    assert_eq!(opened.rows[0].cells.get("extra"), Some(&Cell::Text("ffff".to_owned())));
+
+    let texts = live::query_page(&session, "main", "", "text_keys", "sqlite", &[], None, 0, 10).await.unwrap();
+    assert!(texts.sql.starts_with("SELECT CAST(\"id\" AS TEXT),"), "{}", texts.sql);
+    assert!(!texts.sql.contains("substr(CAST(\"id\" AS TEXT)"), "{}", texts.sql);
+    let wide = texts.rows.iter().find(|row| row.cells.get("note") == Some(&Cell::Text("x".to_owned()))).unwrap();
+    let shaped = texts.rows.iter().find(|row| row.cells.get("note") == Some(&Cell::Text("y".to_owned()))).unwrap();
+    assert_eq!(wide.cells.get("id"), Some(&Cell::Text(long.clone())));
+    assert!(wide.located);
+    assert!(!wide.id.contains('\u{1}'));
+    assert_eq!(shaped.cells.get("id"), Some(&Cell::Text(literal.to_owned())));
+    assert_eq!(shaped.locator, vec![("id".to_owned(), Cell::Text(literal.to_owned()))]);
+
+    let written = live::commit(
+        &session,
+        "main",
+        "",
+        "text_keys",
+        "sqlite",
+        &[Mutation {
+            id: "literal".to_owned(),
+            kind: MutationKind::Update,
+            sets: vec![("note".to_owned(), Cell::Text(literal.to_owned()))],
+            locator: shaped.locator.clone(),
+            values: Vec::new(),
+            resolved: Vec::new(),
+        }],
+    )
+    .await
+    .unwrap();
+    assert!(written.failed.is_none(), "{:?}", written.failed);
+    let synthetic = format!("\u{1}t:3000:{}", "a".repeat(1024));
+    let blocked = live::commit(
+        &session,
+        "main",
+        "",
+        "text_keys",
+        "sqlite",
+        &[Mutation {
+            id: "preview".to_owned(),
+            kind: MutationKind::Update,
+            sets: vec![("note".to_owned(), Cell::Text(synthetic.clone()))],
+            locator: shaped.locator.clone(),
+            values: Vec::new(),
+            resolved: Vec::new(),
+        }],
+    )
+    .await
+    .unwrap();
+    assert!(blocked.failed.expect("未展开的预览不能写回").message.contains("预览"));
+    let allowed = live::commit(
+        &session,
+        "main",
+        "",
+        "text_keys",
+        "sqlite",
+        &[Mutation {
+            id: "same-text".to_owned(),
+            kind: MutationKind::Update,
+            sets: vec![("note".to_owned(), Cell::Text(synthetic.clone()))],
+            locator: wide.locator.clone(),
+            values: Vec::new(),
+            resolved: vec![true],
+        }],
+    )
+    .await
+    .unwrap();
+    assert!(allowed.failed.is_none(), "{:?}", allowed.failed);
+    let checked = live::query_page(&session, "main", "", "text_keys", "sqlite", &[filt("id", FilterOp::Eq, Some(long.as_str()))], None, 0, 1).await.unwrap();
+    assert_eq!(checked.rows[0].cells.get("note"), Some(&Cell::Text(synthetic)));
 
     drop(session);
     drop(service);

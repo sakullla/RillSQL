@@ -56,6 +56,8 @@ pub struct CountRequest {
 pub struct ValueArg {
     pub column: String,
     pub value: Option<String>,
+    #[serde(default)]
+    pub resolved: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,6 +336,7 @@ pub async fn grid_commit(state: tauri::State<'_, ConnectionsState>, request: Com
                 sets: change.sets.iter().map(|item| (item.column.clone(), cell_of(item.value.clone()))).collect(),
                 locator: change.locator.iter().map(|item| (item.column.clone(), cell_of(item.value.clone()))).collect(),
                 values: change.values.iter().map(|item| (item.column.clone(), cell_of(item.value.clone()))).collect(),
+                resolved: change.sets.iter().map(|item| item.resolved).collect(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

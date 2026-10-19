@@ -53,6 +53,11 @@ pub fn sql_cell(engine: Engine, column: Option<&Column>, value: &Cell) -> String
 }
 
 pub fn reject_literal(column: &Column, value: &Cell) -> Option<String> {
+    reject_literal_with(column, value, false)
+}
+
+/// resolved 为真表示这段文本来自已经完成的主键另读，即使形状像预览也是原值。
+pub fn reject_literal_with(column: &Column, value: &Cell, resolved: bool) -> Option<String> {
     let family = value_family(&column.type_name);
     match family {
         ValueFamily::Unknown => Some("类型未知，不能编辑".to_owned()),
@@ -60,12 +65,37 @@ pub fn reject_literal(column: &Column, value: &Cell) -> Option<String> {
         ValueFamily::Raw => Some("不能判断写回方式，不能编辑".to_owned()),
         _ => match value {
             Cell::Null => None,
-            Cell::Text(text) if is_preview_envelope(text) => Some("预览内容不能写回".to_owned()),
+            Cell::Text(text) if !resolved && blocks_preview(family, text) => Some("预览内容不能写回".to_owned()),
             Cell::Text(text) if family == ValueFamily::Binary && parse_hex(text).is_none() => Some("这不是十六进制".to_owned()),
             Cell::Text(text) if family == ValueFamily::Bool && bool_literal(text).is_none() => Some("不能写成布尔字面量".to_owned()),
             Cell::Text(_) => None,
         },
     }
+}
+
+/// 二进制预览，或页查询才会发出的长文本预览。短文本碰巧写成协议形状时不是预览。
+fn blocks_preview(family: ValueFamily, value: &str) -> bool {
+    if family == ValueFamily::Binary {
+        return is_preview_envelope(value);
+    }
+    is_synthetic_text_preview(value)
+}
+
+/// 页查询只在文本超过 1024 字节时包信封，预览最多 1024 个字符，因此整段一定长于 1024 字节。
+fn is_synthetic_text_preview(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix('\u{1}') else {
+        return false;
+    };
+    let Some(body) = rest.strip_prefix("t:") else {
+        return false;
+    };
+    let Some((count, preview)) = body.split_once(':') else {
+        return false;
+    };
+    let Ok(bytes) = count.parse::<u64>() else {
+        return false;
+    };
+    bytes > 1024 && preview.chars().count() <= 1024 && value.len() > 1024
 }
 
 /// 与前端预览协议一致：U+0001 开头的 t:字节数:预览 或 b:字节数。
@@ -228,7 +258,7 @@ pub fn reads_full_values(schema: &TableSchema, filters: &[Filter]) -> bool {
     })
 }
 
-/// 能定位的表行只投影预览和字节数。整数等短列仍用原来的 ::text / CAST。
+/// 能定位的表行只对非主键的长文本和二进制投影预览。主键始终是完整文本或完整十六进制。
 pub fn select_list(schema: &TableSchema, full: bool) -> String {
     schema.columns.iter().map(|column| project_column(schema, column, full)).collect::<Vec<_>>().join(", ")
 }
@@ -236,13 +266,14 @@ pub fn select_list(schema: &TableSchema, full: bool) -> String {
 fn project_column(schema: &TableSchema, column: &Column, full: bool) -> String {
     let ident = quote_ident(schema.engine, &column.name);
     let plain = plain_cast(schema.engine, &ident);
+    let key_column = schema.key.iter().any(|name| name == &column.name);
     match value_family(&column.type_name) {
-        ValueFamily::Binary if full || schema.key.is_empty() => binary_hex(schema.engine, &ident),
+        ValueFamily::Binary if full || schema.key.is_empty() || key_column => binary_hex(schema.engine, &ident),
         ValueFamily::Binary => {
             let guard = null_key_guard(schema);
             format!("CASE WHEN {guard} THEN {} ELSE {} END", binary_hex(schema.engine, &ident), binary_length(schema.engine, &ident))
         }
-        ValueFamily::Text if !full && !schema.key.is_empty() => {
+        ValueFamily::Text if !full && !schema.key.is_empty() && !key_column => {
             let guard = null_key_guard(schema);
             format!("CASE WHEN {guard} THEN {plain} ELSE {} END", text_preview(schema.engine, &plain))
         }

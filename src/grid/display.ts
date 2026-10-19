@@ -1,6 +1,6 @@
 import { isNumericType, sqlCell } from "./sql";
 import type { Cell, Column, Engine } from "./types";
-import { boolLiteral, parseHex, temporalKind, typeCaption, valueFamily } from "./typeset";
+import { boolLiteral, isPreviewEnvelope, isSyntheticTextPreview, parseHex, temporalKind, typeCaption, valueFamily } from "./typeset";
 
 export const PREVIEW_BYTES = 1024;
 export type NullCopy = "NULL" | "empty" | "N";
@@ -33,18 +33,17 @@ export interface FieldEnvelope {
 }
 
 export function parseEnvelope(value: string): FieldEnvelope | null {
-  if (!value.startsWith(`${MARK}t:`) && !value.startsWith(`${MARK}b:`)) return null;
-  const kind = value[1] === "b" ? "binary" : "text";
+  if (value.startsWith(`${MARK}b:`)) {
+    const body = value.slice(3);
+    if (!/^\d+$/.test(body)) return null;
+    const bytes = Number(body);
+    return Number.isFinite(bytes) ? { kind: "binary", bytes, preview: "" } : null;
+  }
+  if (!isSyntheticTextPreview(value)) return null;
   const body = value.slice(3);
   const cut = body.indexOf(":");
-  if (kind === "binary") {
-    const bytes = Number(body);
-    return Number.isFinite(bytes) ? { kind, bytes, preview: "" } : null;
-  }
-  if (cut < 0) return null;
   const bytes = Number(body.slice(0, cut));
-  if (!Number.isFinite(bytes)) return null;
-  return { kind, bytes, preview: body.slice(cut + 1) };
+  return { kind: "text", bytes, preview: body.slice(cut + 1) };
 }
 
 export function showCell(value: Cell | undefined, previewBytesOrOptions: number | ShowOptions = PREVIEW_BYTES): ShownCell {
@@ -86,9 +85,10 @@ export function copyPlain(value: Cell | undefined, nullCopy: NullCopy): string {
 }
 
 /** 矩形和单格共用 NULL 记号。二进制复制十六进制，不复制替换字符。 */
-export function copyCellText(value: Cell | undefined, nullCopy: NullCopy, column?: Column): string {
+export function copyCellText(value: Cell | undefined, nullCopy: NullCopy, column?: Column, resolved = false): string {
   if (value === null || value === undefined) return copyPlain(value, nullCopy);
   if (column && valueFamily(column.typeName) === "binary") return parseHex(value) ?? "";
+  if (resolved) return value;
   const envelope = parseEnvelope(value);
   if (envelope?.kind === "binary") return "";
   if (envelope?.kind === "text") return envelope.preview;
@@ -97,9 +97,7 @@ export function copyCellText(value: Cell | undefined, nullCopy: NullCopy, column
 
 export function needsFullRead(value: Cell | undefined, column?: Column): boolean {
   if (typeof value !== "string") return false;
-  const envelope = parseEnvelope(value);
-  if (envelope?.kind === "binary") return true;
-  if (envelope?.kind === "text") return true;
+  if (isPreviewEnvelope(value, column?.typeName)) return true;
   return !!column && valueFamily(column.typeName) === "binary" && parseHex(value) == null;
 }
 

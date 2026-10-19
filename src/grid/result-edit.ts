@@ -489,7 +489,7 @@ export class ResultEditSession {
     rows: readonly Row[],
     editableColumns?: readonly string[],
   ) {
-    this.rows = rows.map(copyRow);
+    this.rows = rows.map((row) => ({ ...copyRow(row), resolved: true }));
     this.editableColumns = new Set(editableColumns ?? schema.columns.map((column) => column.name));
   }
 
@@ -532,7 +532,7 @@ export class ResultEditSession {
     if (!this.canEditColumn(column)) return "这一列不是基表列，不能修改";
     const found = this.schema.columns.find((item) => item.name === column);
     if (!found) return "这一列不属于基表，不能修改";
-    const rejected = rejectWrite(found, value);
+    const rejected = rejectWrite(found, value, row.resolved === true);
     if (rejected) return rejected;
     if (!this.canUpdate(row)) return "无法唯一确定这一行，不能修改";
     this.edits.set(rowId, { ...(this.edits.get(rowId) ?? {}), [column]: value });
@@ -622,7 +622,7 @@ export class ResultEditSession {
       return {
         id: change.id,
         kind: "update",
-        sets: Object.entries(change.sets).map(([column, value]) => ({ column, value })),
+        sets: Object.entries(change.sets).map(([column, value]) => ({ column, value, resolved: row?.resolved === true })),
         locator,
         values: [],
       };

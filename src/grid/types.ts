@@ -22,6 +22,8 @@ export interface Row {
   cells: Record<string, Cell>;
   locator: Locator | null;
   located: boolean;
+  /** 这一行的格子已经是完整原文，不再把协议形状当成未展开的预览。 */
+  resolved?: boolean;
 }
 
 export interface TableSchema {

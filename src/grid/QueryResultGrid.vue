@@ -272,7 +272,7 @@ function exportRows(): Record<string, Cell>[] {
 async function copyValue() {
   if (!selected.value) return;
   const column = props.columns.find((item) => item.name === selected.value?.column);
-  const text = copyCellText(selected.value.value, loadSettings().nullCopy, column);
+  const text = copyCellText(selected.value.value, loadSettings().nullCopy, column, true);
   try { await navigator.clipboard.writeText(text); copyMessage.value = "已复制"; }
   catch { copyMessage.value = "复制失败，请在值查看器中选中文本复制。"; }
 }
@@ -345,7 +345,7 @@ async function copySelection() {
     const column = props.columns.find((item) => item.name === point.column);
     const row = sourceRows.value.find((item) => item.id === point.row);
     const value = editSession.value?.cellValue(point.row, point.column) ?? row?.cells[point.column] ?? null;
-    return copyCellText(value, loadSettings().nullCopy, column);
+    return copyCellText(value, loadSettings().nullCopy, column, true);
   });
   try {
     await navigator.clipboard.writeText(text);

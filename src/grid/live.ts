@@ -3,8 +3,8 @@ import { deleteSql, insertSql, updateSql } from "./sql";
 import type { TableTarget } from "./target";
 import type { Cell, Change, CommitReport, CommitStep, Filter, Row, SortSpec, TableStore } from "./types";
 import { opNeedsValue } from "./types";
-import { needsFullRead, parseEnvelope } from "./display";
-import { rejectWrite } from "./typeset";
+import { needsFullRead } from "./display";
+import { isPreviewEnvelope, rejectWrite } from "./typeset";
 
 export interface InsertDraft {
   id: string;
@@ -59,6 +59,11 @@ export class LiveTable {
     return this.ready && this.store.schema.kind === "table";
   }
 
+  /** 视图和没有主键的表在页查询里已经是完整值。 */
+  private fullValuePage(): boolean {
+    return this.store.schema.kind !== "table" || this.store.schema.key.length === 0;
+  }
+
   get scopeLabel(): string {
     return "筛选和排序作用于整张表";
   }
@@ -93,7 +98,8 @@ export class LiveTable {
       if (generation !== this.readGeneration) return null;
       this.sql = page.sql;
       this.error = null;
-      this.loaded = replace ? page.rows : [...this.loaded, ...page.rows];
+      const rows = this.fullValuePage() ? page.rows.map((row) => ({ ...row, resolved: true })) : page.rows;
+      this.loaded = replace ? rows : [...this.loaded, ...rows];
       this.truncated = page.truncated;
       if (replace) this.counted = null;
       return null;
@@ -152,7 +158,7 @@ export class LiveTable {
       const fresh = this.rowById(row.id);
       const still = this.store.schema.columns.some((column) => {
         const value = fresh?.cells[column.name];
-        return typeof value === "string" && parseEnvelope(value) != null;
+        return typeof value === "string" && isPreviewEnvelope(value, column.typeName) && fresh?.resolved !== true;
       });
       if (still) return "还没有读到完整值，不能导出";
     }
@@ -175,6 +181,7 @@ export class LiveTable {
       const current = this.rowById(rowId);
       if (!fresh || !current) return "没有读到这一格";
       current.cells = { ...current.cells, ...fresh.cells };
+      current.resolved = true;
       return null;
     } catch (error) {
       return errorText(error);
@@ -218,7 +225,7 @@ export class LiveTable {
     const row = this.rowById(rowId);
     if (!row) return "找不到行";
     const found = this.store.schema.columns.find((item) => item.name === column);
-    const rejected = rejectWrite(found, value);
+    const rejected = rejectWrite(found, value, row.resolved === true);
     if (rejected) return rejected;
     if (!this.canUpdate(row)) return "无法唯一确定这一行，不能修改";
     const sets = { ...(this.edits.get(rowId) ?? {}), [column]: value };
@@ -342,7 +349,7 @@ export class LiveTable {
       return {
         id: change.id,
         kind: "update",
-        sets: Object.entries(change.sets).map(([column, value]) => ({ column, value })),
+        sets: Object.entries(change.sets).map(([column, value]) => ({ column, value, resolved: row?.resolved === true })),
         locator,
         values: [],
       };

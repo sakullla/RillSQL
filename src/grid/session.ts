@@ -142,7 +142,7 @@ export class TableSession {
     const row = this.rowById(rowId);
     if (!row) return "找不到行";
     const found = this.store.schema.columns.find((item) => item.name === column);
-    const rejected = rejectWrite(found, value);
+    const rejected = rejectWrite(found, value, row.resolved === true);
     if (rejected) return rejected;
     if (!this.canUpdate(row)) return "无法唯一确定这一行，不能修改";
     const sets = { ...(this.edits.get(rowId) ?? {}), [column]: value };

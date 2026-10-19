@@ -79,7 +79,12 @@ describe("grid display, copy and typed literals", () => {
     expect(showCell("\u0001b:4", { column: column("blob", "bytea") }).label).toBe("二进制 · 4 字节");
     expect(copyCellText("abcd", "NULL", column("blob", "bytea"))).toBe("abcd");
     expect(rejectWrite(column("blob", "bytea"), "zz")).toBe("这不是十六进制");
-    expect(rejectWrite(column("note", "text"), "\u0001t:11:hello")).toBe("预览内容不能写回");
+    expect(rejectWrite(column("note", "text"), "\u0001t:11:hello")).toBeNull();
+    expect(copyCellText("\u0001t:11:hello", "NULL", column("note", "text"))).toBe("\u0001t:11:hello");
+    expect(showCell("\u0001t:11:hello", { column: column("note", "text") }).label).toBe("\u0001t:11:hello");
+    const synthetic = `\u0001t:3000:${"a".repeat(1024)}`;
+    expect(rejectWrite(column("note", "text"), synthetic)).toBe("预览内容不能写回");
+    expect(rejectWrite(column("note", "text"), synthetic, true)).toBeNull();
     expect(sqlCell(column("flag", "boolean"), "yes", "mysql")).toBe("TRUE");
     expect(sqlCell(column("blob", "bytea"), "0A0B", "postgres")).toBe("'\\x0a0b'");
     expect(sqlCell(column("blob", "blob"), "0A0B", "mysql")).toBe("X'0a0b'");
@@ -97,8 +102,14 @@ describe("grid display, copy and typed literals", () => {
     const session = new TableSession(store, 10);
     expect(session.stageUpdate("1", "shape", null)).toContain("几何");
     expect(session.stageUpdate("1", "blob", "zz")).toContain("十六进制");
-    expect(session.stageUpdate("1", "note", "\u0001t:11:hello")).toBe("预览内容不能写回");
+    expect(session.stageUpdate("1", "note", "\u0001t:11:hello")).toBeNull();
+    session.discard();
+    expect(session.stageUpdate("1", "note", `\u0001t:3000:${"a".repeat(1024)}`)).toBe("预览内容不能写回");
     expect(session.pendingCount).toBe(0);
+    const located = session.rowById("1");
+    if (located) located.resolved = true;
+    expect(session.stageUpdate("1", "note", `\u0001t:3000:${"a".repeat(1024)}`)).toBeNull();
+    session.discard();
     const view = new TableSession(viewFixture(), 10);
     expect(view.stageUpdate("1", "name", "改")).toContain("不能修改");
     expect(view.pendingCount).toBe(0);
@@ -143,7 +154,7 @@ function schema() {
 function row(): { id: string; cells: Record<string, string | null>; located: boolean; locatorColumns: string[]; locatorValues: string[] } {
   return {
     id: "1",
-    cells: { id: "1", note: "\u0001t:11:hello", blob: "\u0001b:2", shape: "POINT(1 2)" },
+    cells: { id: "1", note: `\u0001t:3000:${"n".repeat(1024)}`, blob: "\u0001b:2", shape: "POINT(1 2)" },
     located: true,
     locatorColumns: ["id"],
     locatorValues: ["1"],
@@ -243,6 +254,41 @@ describe("grid column width, clipboard and paging", () => {
     expect(reread.request.limit).toBe(1);
     expect(reread.request.filters[0]).toMatchObject({ op: "eq", value: "1" });
     wrapper.unmount();
+  });
+
+  it("edits protocol-shaped text when the located read returns that same text", async () => {
+    const literal = "\u0001t:11:hello";
+    const synthetic = `\u0001t:3000:${"a".repeat(1024)}`;
+    let note = literal;
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return schema();
+      if (command === "grid_page") return { rows: [{ ...row(), cells: { id: "1", note, blob: "abcd", shape: "POINT(1 2)" } }], truncated: false, sql: "SELECT page" };
+      if (command === "grid_commit") return { applied: [{ id: "u:1", sql: "update", label: "修改" }], failed: null, pendingIds: [], rolledBack: false, rule: "按顺序" };
+      throw new Error(command);
+    });
+    const literalGrid = mount(DataGrid, { props: { tabId: "table:docs-literal", draft: "", pageSize: 10, target } });
+    await flushPromises();
+    expect(literalGrid.get("[data-cell='1:note']").text()).toContain(literal);
+    await literalGrid.get("[data-cell='1:note']").trigger("dblclick");
+    await flushPromises();
+    expect((literalGrid.get("input[aria-label='编辑 note']").element as HTMLInputElement).value).toBe(literal);
+    await literalGrid.get(".editor").findAll("button").find((button) => button.text() === "确定")!.trigger("click");
+    expect(literalGrid.text()).toContain("1 处更改未保存");
+    literalGrid.unmount();
+
+    note = synthetic;
+    const same = mount(DataGrid, { props: { tabId: "table:docs-same", draft: "", pageSize: 10, target } });
+    await flushPromises();
+    await same.get("[data-cell='1:note']").trigger("dblclick");
+    await flushPromises();
+    expect((same.get("input[aria-label='编辑 note']").element as HTMLInputElement).value).toBe(synthetic);
+    await same.get(".editor").findAll("button").find((button) => button.text() === "确定")!.trigger("click");
+    await same.get(".pending-bar").findAll("button").find((button) => button.text() === "提交")!.trigger("click");
+    await same.get(".sheet").findAll("button").find((button) => button.text().startsWith("提交"))!.trigger("click");
+    await flushPromises();
+    const commit = invoke.mock.calls.filter((call) => call[0] === "grid_commit").at(-1)?.[1] as { request: { changes: { sets: { value: string; resolved?: boolean }[] }[] } };
+    expect(commit.request.changes[0]?.sets[0]).toMatchObject({ value: synthetic, resolved: true });
+    same.unmount();
   });
 
   it("exports located previews as the full text instead of the envelope", async () => {
