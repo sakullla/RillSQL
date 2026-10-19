@@ -1,4 +1,5 @@
-import type { CatalogConnection } from "../catalog/types";
+import { KIND_LABEL, objectLabel } from "../catalog/tree";
+import type { CatalogConnection, ObjectKind } from "../catalog/types";
 import { engineMeta } from "../connections/model";
 import { CONNECTION_STATUS_TEXT } from "../shell/status-text";
 
@@ -14,7 +15,7 @@ export interface CompletionObject {
   label: string;
   name: string;
   schema: string;
-  kind: "table" | "view";
+  kind: ObjectKind;
 }
 
 export interface MetadataNote {
@@ -25,7 +26,7 @@ export interface MetadataNote {
 
 export interface CompletionItem {
   label: string;
-  kind: "keyword" | "table" | "view" | "column";
+  kind: "keyword" | ObjectKind | "column";
   detail: string;
 }
 
@@ -61,11 +62,12 @@ export function metadataNote(connection: CatalogConnection | null, database: str
   for (const schema of ready) {
     for (const object of schema.objects) {
       if (object.stale) continue;
+      const shown = objectLabel(connection.engine, object);
       objects.push({
-        label: schema.name ? `${schema.name}.${object.name}` : object.name,
+        label: schema.name ? `${schema.name}.${shown}` : shown,
         name: object.name,
         schema: schema.name,
-        kind: object.kind === "view" ? "view" : "table",
+        kind: object.kind,
       });
     }
   }
@@ -100,7 +102,7 @@ export function completionPlan(input: {
     for (const object of meta.objects) {
       const matched = !prefix || object.label.toLowerCase().startsWith(prefix) || object.name.toLowerCase().startsWith(prefix);
       if (!matched) continue;
-      items.push({ label: object.label, kind: object.kind, detail: object.schema || "对象" });
+      items.push({ label: object.label, kind: object.kind, detail: KIND_LABEL[object.kind] });
       if (items.length >= 20) break;
     }
     for (const column of input.columns ?? []) {

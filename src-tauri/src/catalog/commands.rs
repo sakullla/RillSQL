@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::model::{known_row_estimate, ConnStatus, Engine, ObjectKind, ObjectRow};
+use crate::catalog::model::{kind_name, known_row_estimate, ConnStatus, Engine, KindReport, ObjectRow};
 use crate::catalog::read::{self, ObjectWindow};
 use crate::connections::commands::ConnectionsState;
 use crate::connections::model::{EnvTag, ENV_NONE};
@@ -22,6 +22,16 @@ pub struct ObjectDto {
     pub kind: &'static str,
     pub estimated_rows: Option<i64>,
     pub stale: bool,
+    pub signature: String,
+    pub relation: String,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KindReportDto {
+    pub kind: &'static str,
+    pub total: usize,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -31,6 +41,7 @@ pub struct SchemaDto {
     pub objects: Vec<ObjectDto>,
     pub total: usize,
     pub error: Option<String>,
+    pub kind_reports: Vec<KindReportDto>,
 }
 
 #[derive(Debug, Serialize)]
@@ -63,13 +74,23 @@ pub struct PageDto {
     pub objects: Vec<ObjectDto>,
     pub total: usize,
     pub error: Option<String>,
+    pub kind_reports: Vec<KindReportDto>,
 }
 
-pub(crate) async fn load_catalog(service: &Service, page: usize, limits: &[ObjectLimit]) -> Result<Vec<CatalogDto>, String> {
+pub(crate) async fn load_catalog(
+    service: &Service,
+    page: usize,
+    limits: &[ObjectLimit],
+    connection_id: Option<&str>,
+    outline: bool,
+) -> Result<Vec<CatalogDto>, String> {
     let saved = service.list().await?;
     let tags = service.list_tags().await?;
     let mut catalogs = Vec::with_capacity(saved.len());
     for record in saved {
+        if connection_id.is_some_and(|id| id != record.saved.id) {
+            continue;
+        }
         let engine = map_engine(record.saved.engine);
         let session = service.catalog_session(&record.saved.id);
         let connected = session.is_some();
@@ -83,6 +104,7 @@ pub(crate) async fn load_catalog(service: &Service, page: usize, limits: &[Objec
             })
             .collect();
         let body = match &session {
+            Some(session) if outline => read::read_catalog_outline(engine, session).await,
             Some(session) => read::read_catalog_session(engine, session, page, &windows).await,
             None => read::ConnectionBody {
                 error: None,
@@ -119,6 +141,7 @@ pub(crate) async fn page_for_session(session: Option<&CatalogSession>, database:
             objects: Vec::new(),
             total: 0,
             error: Some("这条连接还没有打开，无法继续读取对象".to_owned()),
+            kind_reports: Vec::new(),
         };
     };
     let body = read::read_object_page(session, database, schema, offset, limit).await;
@@ -126,6 +149,7 @@ pub(crate) async fn page_for_session(session: Option<&CatalogSession>, database:
         objects: body.objects.iter().map(object_dto).collect(),
         total: body.total,
         error: body.error,
+        kind_reports: body.kind_reports.iter().map(kind_report_dto).collect(),
     }
 }
 
@@ -135,8 +159,41 @@ pub async fn catalog_sessions(state: tauri::State<'_, ConnectionsState>) -> Resu
 }
 
 #[tauri::command]
-pub async fn catalog_refresh(state: tauri::State<'_, ConnectionsState>, limits: Vec<ObjectLimit>, page: Option<usize>) -> Result<Vec<CatalogDto>, String> {
-    load_catalog(&state.service, page.unwrap_or(0), &limits).await
+pub async fn catalog_refresh(
+    state: tauri::State<'_, ConnectionsState>,
+    limits: Vec<ObjectLimit>,
+    page: Option<usize>,
+    connection_id: Option<String>,
+    outline: Option<bool>,
+) -> Result<Vec<CatalogDto>, String> {
+    load_catalog(&state.service, page.unwrap_or(0), &limits, connection_id.as_deref(), outline.unwrap_or(false)).await
+}
+
+#[tauri::command]
+pub async fn catalog_definition(
+    state: tauri::State<'_, ConnectionsState>,
+    connection_id: String,
+    database: String,
+    schema: String,
+    name: String,
+    kind: String,
+    signature: Option<String>,
+    relation: Option<String>,
+) -> Result<String, String> {
+    let session = state
+        .service
+        .catalog_session(&connection_id)
+        .ok_or_else(|| "这条连接还没有打开，无法读取定义".to_owned())?;
+    read::read_definition(
+        &session,
+        &database,
+        &schema,
+        &name,
+        &kind,
+        signature.as_deref().unwrap_or(""),
+        relation.as_deref().unwrap_or(""),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -201,33 +258,43 @@ fn schema_dto(schema: crate::catalog::model::SchemaNode) -> SchemaDto {
         total: schema.total,
         error: schema.error,
         objects: schema.objects.iter().map(object_dto).collect(),
+        kind_reports: schema.kind_reports.iter().map(kind_report_dto).collect(),
     }
 }
 
 fn object_dto(object: &ObjectRow) -> ObjectDto {
     ObjectDto {
         name: object.name.clone(),
-        kind: match object.kind {
-            ObjectKind::Table => "table",
-            ObjectKind::View => "view",
-        },
+        kind: kind_name(object.kind),
         estimated_rows: known_row_estimate(object.estimated_rows),
         stale: object.stale,
+        signature: object.signature.clone(),
+        relation: object.relation.clone(),
+    }
+}
+
+fn kind_report_dto(report: &KindReport) -> KindReportDto {
+    KindReportDto {
+        kind: kind_name(report.kind),
+        total: report.total,
+        error: report.error.clone(),
     }
 }
 
 #[cfg(test)]
 mod estimate_tests {
     use super::object_dto;
-    use crate::catalog::model::{ObjectKind, ObjectRow};
+    use crate::catalog::model::ObjectRow;
 
     #[test]
     fn negative_estimate_is_omitted_from_the_catalog_payload() {
         let unknown = ObjectRow {
             name: "customers".to_owned(),
-            kind: ObjectKind::Table,
+            kind: crate::catalog::model::ObjectKind::Table,
             estimated_rows: Some(-1),
             stale: false,
+            signature: String::new(),
+            relation: String::new(),
         };
         let dto = object_dto(&unknown);
         assert_eq!(dto.estimated_rows, None);

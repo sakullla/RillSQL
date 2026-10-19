@@ -15,7 +15,7 @@ import ActivityRail from "./ActivityRail.vue";
 import { filterPalette, shellCommands } from "./commands";
 import EnvPill from "./EnvPill.vue";
 import { PRODUCT_TITLE } from "./product";
-import type { ShellTab } from "./session";
+import { createSession, type ShellTab } from "./session";
 import StatusBar from "./StatusBar.vue";
 import { CONNECTION_STATUS_TEXT, ENVIRONMENT_LABELS, OPERATION_STATE_TEXT, type OperationState } from "./status-text";
 import TitleBar from "./TitleBar.vue";
@@ -44,6 +44,38 @@ function makeTab(overrides: Partial<ShellTab> = {}): ShellTab {
 }
 
 describe("shell layout", () => {
+  it("opens a read-only definition tab and copies its sql into a new query", () => {
+    const session = createSession();
+    session.openDefinition({
+      id: "shop:shop::add_customer:function::",
+      label: "add_customer",
+      path: "Shop / shop",
+      connectionId: "shop",
+      connectionName: "Shop",
+      database: "shop",
+      engine: "mysql",
+      status: "connected",
+      schema: "",
+      name: "add_customer",
+      kind: "function",
+      signature: "",
+      relation: "",
+    });
+    expect(session.activeTab.value).toMatchObject({ kind: "definition", title: "add_customer" });
+    expect(session.tabs.value.some((tab) => tab.kind === "structure")).toBe(false);
+    session.openQueryDraft({
+      sql: "CREATE FUNCTION add_customer() RETURNS INT BEGIN RETURN 1; END",
+      connectionId: "shop",
+      connectionName: "Shop",
+      database: "shop",
+      engine: "mysql",
+      status: "connected",
+      needsTarget: false,
+      notice: null,
+    });
+    expect(session.tabs.value.find((tab) => tab.kind === "query")?.draft).toContain("CREATE FUNCTION add_customer");
+  });
+
   it("keeps the brand and the command entry visible", () => {
     const title = mount(TitleBar, { props: { theme: "system" } });
     expect(title.text()).toContain("RillSQL");

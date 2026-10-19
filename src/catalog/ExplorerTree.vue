@@ -1,20 +1,22 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { OpenOutcome } from "../connections/api";
-import { focusDatabase, listConnections, openConnection } from "./backend";
+import { fetchDefinition, focusDatabase, listConnections, openConnection } from "./backend";
 import { browseSql, qualifiedObjectName, type CatalogObjectRef } from "./object-ref";
 import SchemaBlock from "./SchemaBlock.vue";
 import { catalogConnections, catalogLoadError, refreshCatalog, schemaKey } from "./store";
-import { engineShape, isConnected, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
+import { engineShape, isConnected, objectKey, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
 import type { CatalogConnection, DatabaseNode } from "./types";
 
 const props = defineProps<{ filter: string }>();
 const emit = defineEmits<{
   "open-object": [object: CatalogObjectRef, pane: "data" | "structure", section?: "columns" | "drop"];
+  "open-definition": [object: CatalogObjectRef];
   "query-object": [object: CatalogObjectRef, sql: string];
   "focused-database": [connectionId: string, database: string];
 }>();
 const menu = ref<{ object: CatalogObjectRef; x: number; y: number; notice: string } | null>(null);
+const selectedKey = ref<string | null>(null);
 const refreshing = ref(false);
 const focusing = ref<string | null>(null);
 const focusTarget = ref<string | null>(null);
@@ -188,9 +190,11 @@ function readRef(row: HTMLElement): CatalogObjectRef | null {
   const database = row.dataset.database ?? "";
   const schema = row.dataset.schema ?? "";
   const name = row.dataset.object ?? "";
+  const key = row.dataset.key ?? "";
   if (!connectionId || !name) return null;
   const connection = catalogConnections().find((item) => item.id === connectionId);
-  const object = connection?.databases.find((item) => item.name === database)?.schemas.find((item) => item.name === schema)?.objects.find((item) => item.name === name);
+  const objects = connection?.databases.find((item) => item.name === database)?.schemas.find((item) => item.name === schema)?.objects;
+  const object = objects?.find((item) => (key ? objectKey(item) === key : item.name === name));
   if (!connection || !object) return null;
   return {
     connectionId,
@@ -200,9 +204,15 @@ function readRef(row: HTMLElement): CatalogObjectRef | null {
     schema,
     name: object.name,
     kind: object.kind,
+    signature: object.signature,
+    relation: object.relation,
     stale: object.stale,
     path: objectPath(connection.name, database, schema),
   };
+}
+
+function isRoutine(object: CatalogObjectRef): boolean {
+  return object.kind === "function" || object.kind === "procedure" || object.kind === "trigger";
 }
 
 function closeMenu() {
@@ -218,7 +228,22 @@ function openObject(object: CatalogObjectRef | null, pane: "data" | "structure",
 function onTreeClick(event: MouseEvent) {
   const row = rowOf(event.target);
   if (!row) return;
-  openObject(readRef(row), "data");
+  const object = readRef(row);
+  if (!object) return;
+  selectedKey.value = objectKey(object);
+}
+
+function onTreeDblClick(event: MouseEvent) {
+  const row = rowOf(event.target);
+  if (!row) return;
+  const object = readRef(row);
+  if (!object || object.stale) return;
+  selectedKey.value = objectKey(object);
+  if (isRoutine(object)) {
+    emit("open-definition", object);
+    return;
+  }
+  openObject(object, "data");
 }
 
 function onContextMenu(event: MouseEvent) {
@@ -229,7 +254,7 @@ function onContextMenu(event: MouseEvent) {
     closeMenu();
     return;
   }
-  const height = object.kind === "table" ? 210 : 160;
+  const height = object.kind === "table" ? 210 : isRoutine(object) ? 150 : 160;
   menu.value = {
     object,
     x: Math.max(8, Math.min(event.clientX, window.innerWidth - 228)),
@@ -244,6 +269,25 @@ function onQuery() {
   const sql = browseSql(object.engine, object.schema, object.name);
   closeMenu();
   emit("query-object", object, sql);
+}
+
+function onDefine() {
+  const object = menu.value?.object;
+  if (!object || object.stale || !isRoutine(object)) return;
+  closeMenu();
+  emit("open-definition", object);
+}
+
+async function onCopyDefinition() {
+  const object = menu.value?.object;
+  if (!object || object.stale || !isRoutine(object)) return;
+  try {
+    const sql = await fetchDefinition(object);
+    closeMenu();
+    emit("query-object", object, sql);
+  } catch (error) {
+    if (menu.value) menu.value = { ...menu.value, notice: failureText(error) };
+  }
 }
 
 async function onCopy() {
@@ -280,7 +324,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="tree" role="tree" aria-label="数据库对象" @click="onTreeClick" @contextmenu="onContextMenu" @scroll="closeMenu">
+  <div class="tree" role="tree" aria-label="数据库对象" @click="onTreeClick" @dblclick="onTreeDblClick" @contextmenu="onContextMenu" @scroll="closeMenu">
     <div class="tree-toolbar">
       <button class="btn ghost sm" type="button" data-action="tree-refresh" aria-label="刷新对象列表" :disabled="refreshing" @click="onRefresh">
         {{ refreshing ? "正在刷新…" : "刷新" }}
@@ -302,7 +346,6 @@ onBeforeUnmount(() => {
         v-for="hit in matches.hits"
         :key="hit.id"
         class="tree-row tr-hit"
-        :class="{ dropped: hit.stale }"
         role="treeitem"
         data-hit
         :data-connection="hit.connectionId"
@@ -310,7 +353,9 @@ onBeforeUnmount(() => {
         :data-schema="hit.schema"
         :data-path="hit.path"
         :data-object="hit.name"
+        :data-key="hit.key"
         :data-kind="hit.kind"
+        :class="{ dropped: hit.stale, active: selectedKey === hit.key }"
         :data-stale="hit.stale ? 'true' : 'false'"
       >
         <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.table" /></svg>
@@ -408,6 +453,7 @@ onBeforeUnmount(() => {
                 :database="database.name"
                 :schema="schema"
                 :depth="1"
+                :selected-key="selectedKey ?? undefined"
               />
             </template>
           </template>
@@ -488,6 +534,7 @@ onBeforeUnmount(() => {
                     :database="database.name"
                     :schema="schema"
                     :depth="engineShape(connection.engine).schemas ? 3 : 2"
+                    :selected-key="selectedKey ?? undefined"
                   />
                 </template>
               </template>
@@ -510,9 +557,15 @@ onBeforeUnmount(() => {
       @contextmenu.prevent
     >
       <div v-if="menu.object.stale" class="menu-head">这个对象已失效——它在外部被删除，不能再打开</div>
-      <button class="menu-item" type="button" data-action="open-data" :disabled="menu.object.stale" @click="openObject(menu.object, 'data')">打开数据</button>
-      <button class="menu-item" type="button" data-action="open-structure" :disabled="menu.object.stale" @click="openObject(menu.object, 'structure', 'columns')">查看结构</button>
-      <button class="menu-item" type="button" data-action="new-query" :disabled="menu.object.stale" :title="browseSql(menu.object.engine, menu.object.schema, menu.object.name)" @click="onQuery">新建查询</button>
+      <template v-if="menu.object.kind === 'table' || menu.object.kind === 'view'">
+        <button class="menu-item" type="button" data-action="open-data" :disabled="menu.object.stale" @click="openObject(menu.object, 'data')">打开数据</button>
+        <button class="menu-item" type="button" data-action="open-structure" :disabled="menu.object.stale" @click="openObject(menu.object, 'structure', 'columns')">查看结构</button>
+        <button class="menu-item" type="button" data-action="new-query" :disabled="menu.object.stale" :title="browseSql(menu.object.engine, menu.object.schema, menu.object.name)" @click="onQuery">新建查询</button>
+      </template>
+      <template v-else>
+        <button class="menu-item" type="button" data-action="open-definition" :disabled="menu.object.stale" @click="onDefine">查看定义</button>
+        <button class="menu-item" type="button" data-action="copy-definition" :disabled="menu.object.stale" @click="onCopyDefinition">复制到新查询</button>
+      </template>
       <button class="menu-item" type="button" data-action="copy-name" @click="onCopy">复制完整名称</button>
       <div v-if="menu.notice" class="menu-head">{{ menu.notice }}</div>
       <template v-if="menu.object.kind === 'table'">

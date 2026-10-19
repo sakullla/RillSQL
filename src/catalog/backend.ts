@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { tauriConnectionApi, type OpenOutcome } from "../connections/api";
-import type { SavedConnection } from "../connections/model";
+import type { EnvTag, SavedConnection } from "../connections/model";
+import type { CatalogObjectRef } from "./object-ref";
 import type { CatalogConnection, PageRequest, PageResult } from "./types";
 
 export interface ObjectLimit {
@@ -18,8 +19,31 @@ export async function fetchSessions(): Promise<string[] | null> {
   }
 }
 
-export async function fetchCatalog(limits: ObjectLimit[], page: number): Promise<CatalogConnection[]> {
-  return invoke<CatalogConnection[]>("catalog_refresh", { limits, page });
+export async function fetchCatalog(limits: ObjectLimit[], page: number, connectionId?: string | null, outline = false): Promise<CatalogConnection[]> {
+  return invoke<CatalogConnection[]>("catalog_refresh", {
+    limits,
+    page,
+    connectionId: connectionId ?? null,
+    outline,
+  });
+}
+
+export async function listEnvTags(): Promise<EnvTag[]> {
+  return tauriConnectionApi.listTags();
+}
+
+export async function fetchDefinition(object: Pick<CatalogObjectRef, "connectionId" | "database" | "schema" | "name" | "kind" | "signature" | "relation">): Promise<string> {
+  const sql = await invoke<string>("catalog_definition", {
+    connectionId: object.connectionId,
+    database: object.database,
+    schema: object.schema,
+    name: object.name,
+    kind: object.kind,
+    signature: object.signature ?? "",
+    relation: object.relation ?? "",
+  });
+  if (!sql.trim()) throw new Error("没有读到定义");
+  return sql;
 }
 
 export async function fetchPage(request: PageRequest): Promise<PageResult> {

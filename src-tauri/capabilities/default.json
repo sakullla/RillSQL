@@ -22,6 +22,7 @@
     "allow-catalog-sessions",
     "allow-catalog-refresh",
     "allow-catalog-page",
+    "allow-catalog-definition",
     "allow-ddl-describe",
     "allow-ddl-preview",
     "allow-ddl-execute",

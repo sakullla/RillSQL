@@ -2,6 +2,7 @@
 import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { listPaletteTables, startCatalog } from "../catalog";
 import { objectIdentity, type CatalogObjectRef } from "../catalog/object-ref";
+import { objectLabel } from "../catalog/tree";
 import { catalogConnections } from "../catalog/store";
 import { listPaletteConnections } from "../connections";
 import type { SavedDraft } from "../history/saved";
@@ -157,6 +158,7 @@ function persist() {
 }
 
 function onOpenObject(object: CatalogObjectRef, pane: "data" | "structure", section?: "columns" | "drop") {
+  if (object.kind !== "table" && object.kind !== "view") return;
   if (window.innerWidth <= 960) session.sidebarHidden.value = true;
   session.openTable({
     id: objectIdentity(object),
@@ -164,6 +166,41 @@ function onOpenObject(object: CatalogObjectRef, pane: "data" | "structure", sect
     path: object.path,
     pane,
     section,
+  });
+}
+
+function onOpenDefinition(object: CatalogObjectRef) {
+  if (object.kind !== "function" && object.kind !== "procedure" && object.kind !== "trigger") return;
+  if (window.innerWidth <= 960) session.sidebarHidden.value = true;
+  session.openDefinition({
+    id: objectIdentity(object),
+    label: objectLabel(object.engine, object),
+    path: object.path,
+    connectionId: object.connectionId,
+    connectionName: object.connectionName,
+    database: object.database,
+    engine: object.engine,
+    status: "connected",
+    schema: object.schema,
+    name: object.name,
+    kind: object.kind,
+    signature: object.signature ?? "",
+    relation: object.relation ?? "",
+  });
+}
+
+function onCopyDefinition(sql: string) {
+  const tab = session.activeTab.value;
+  const ready = tab?.connectionId && tab.connectionName && tab.database != null && tab.engine && tab.connectionStatus;
+  session.openQueryDraft({
+    sql,
+    connectionId: ready ? tab.connectionId : null,
+    connectionName: ready ? tab.connectionName : null,
+    database: ready ? tab.database : null,
+    engine: ready ? tab.engine : null,
+    status: ready ? tab.connectionStatus : null,
+    needsTarget: !ready,
+    notice: null,
   });
 }
 
@@ -316,6 +353,7 @@ onBeforeUnmount(() => {
         :width="session.sidebarWidth.value"
         @resize="session.sidebarWidth.value = $event"
         @open-object="onOpenObject"
+        @open-definition="onOpenDefinition"
         @query-object="onQueryObject"
         @focused-database="onFocusedDatabase"
       />
@@ -336,6 +374,7 @@ onBeforeUnmount(() => {
           @draft="session.setDraft"
           @target="session.setQueryTarget"
           @table-view="session.setTableView"
+          @copy-definition="onCopyDefinition"
           @query-target="target => session.openQueryDraft({ ...target, sql: '', needsTarget: false, notice: null })"
         />
         <ConnectionsPage v-if="session.page.value === 'connections'" :sqlite-prompt="sqlitePrompt" @sqlite-consumed="sqlitePrompt = 0" @workspace="session.showPage('workspace')" @query-target="target => session.openQueryDraft({ ...target, sql: '', needsTarget: false, notice: null })" />

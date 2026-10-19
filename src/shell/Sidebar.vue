@@ -8,12 +8,17 @@ const props = defineProps<{ width: number }>();
 const emit = defineEmits<{
   resize: [width: number];
   "open-object": [object: CatalogObjectRef, pane: "data" | "structure", section?: "columns" | "drop"];
+  "open-definition": [object: CatalogObjectRef];
   "query-object": [object: CatalogObjectRef, sql: string];
   "focused-database": [connectionId: string, database: string];
 }>();
 
 function forwardOpen(object: CatalogObjectRef, pane: "data" | "structure", section?: "columns" | "drop") {
   emit("open-object", object, pane, section);
+}
+
+function forwardDefinition(object: CatalogObjectRef) {
+  emit("open-definition", object);
 }
 
 function forwardQuery(object: CatalogObjectRef, sql: string) {
@@ -57,7 +62,7 @@ function onPointerDown(event: PointerEvent) {
       <Icon name="search" />
       <input v-model="filter" type="search" placeholder="筛选表" aria-label="筛选表" />
     </label>
-    <ExplorerTree :filter="filter" @open-object="forwardOpen" @query-object="forwardQuery" @focused-database="forwardFocus" />
+    <ExplorerTree :filter="filter" @open-object="forwardOpen" @open-definition="forwardDefinition" @query-object="forwardQuery" @focused-database="forwardFocus" />
   </aside>
   <div
     class="sb-resizer"

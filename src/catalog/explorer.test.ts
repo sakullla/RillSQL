@@ -82,6 +82,13 @@ describe("explorer tree", () => {
     expect(sqlite.get("[data-foreign-keys]").text()).toContain("已关闭");
     expect(sqlite.get("[data-foreign-keys]").text()).toContain("foreign_keys = OFF");
     expect(names(sqlite, "[data-level=object]")).toEqual(["notes", "v_note_summary"]);
+    expect(sqlite.find("[data-kind-group=function]").exists()).toBe(false);
+    expect(sqlite.find("[data-kind-group=procedure]").exists()).toBe(false);
+    expect(sqlite.find("[data-kind-group=view]").exists()).toBe(true);
+    expect(sqlite.find("[data-kind-group=trigger]").exists()).toBe(true);
+    expect(wrapper.get("[data-engine=mysql]").find("[data-kind-group=function]").exists()).toBe(true);
+    expect(wrapper.get("[data-engine=mysql]").find("[data-kind-group=procedure]").exists()).toBe(true);
+    expect(wrapper.get("[data-engine=postgres]").find("[data-kind-group=trigger]").exists()).toBe(true);
 
     expect(names(wrapper, "[data-schema=archive][data-level=object]")).toHaveLength(100);
     const more = wrapper.get("[data-more]");
@@ -206,6 +213,9 @@ describe("explorer tree", () => {
     expect(row.text()).not.toContain("-1");
     expect(wrapper.get("[data-database=atlas_dev][data-schema=public][data-object=orders]").text()).toContain("0");
     await row.trigger("click");
+    expect(wrapper.emitted("open-object")).toBeUndefined();
+    expect(row.attributes("data-selected")).toBe("true");
+    await row.trigger("dblclick");
     expect(wrapper.emitted("open-object")?.[0]?.[0]).toMatchObject({
       name: "customers",
       database: "atlas_dev",
@@ -234,6 +244,12 @@ describe("explorer tree", () => {
     await nextTick();
     expect(document.body.querySelector("[data-action=drop-table]")).toBeNull();
     expect(document.body.querySelector("[data-action=open-data]")?.textContent).toContain("打开数据");
+    const group = wrapper.get("[data-database=atlas_dev][data-schema=public][data-kind-group=table]");
+    const opened = wrapper.emitted("open-object")?.length ?? 0;
+    await group.trigger("click");
+    expect(group.attributes("aria-expanded")).toBe("false");
+    expect(wrapper.emitted("open-object")?.length ?? 0).toBe(opened);
+    expect(wrapper.emitted("open-definition")).toBeUndefined();
     wrapper.unmount();
   });
 
@@ -252,7 +268,9 @@ describe("explorer tree", () => {
     expect(stale.attributes("title")).toContain("已在外部被删除");
     expect(wrapper.get('[data-schema=public][data-object=orders]').attributes("data-stale")).toBe("false");
     await stale.trigger("click");
+    await stale.trigger("dblclick");
     expect(wrapper.emitted("open-object")).toBeUndefined();
+    expect(wrapper.emitted("open-definition")).toBeUndefined();
 
     refreshCatalog();
     await wrapper.vm.$nextTick();
@@ -272,6 +290,40 @@ describe("explorer tree", () => {
     expect(note.get('[data-action="tree-retry"]').text()).toBe("重试");
     expect(wrapper.text()).not.toContain("里没有表或视图");
     expect(wrapper.text()).not.toContain("还没有打开的连接");
+    wrapper.unmount();
+  });
+
+  it("selects a routine without opening data or the structure editor", async () => {
+    const [postgres] = catalogFixture();
+    postgres.databases[0]?.schemas[0]?.objects.push(
+      { name: "add_customer", kind: "function", estimatedRows: null, stale: false, signature: "integer" },
+      { name: "purge_old", kind: "procedure", estimatedRows: null, stale: false, signature: "integer" },
+      { name: "customers_touch", kind: "trigger", estimatedRows: null, stale: false, relation: "customers" },
+    );
+    replaceCatalog([postgres]);
+    const wrapper = mount(ExplorerTree, { props: { filter: "" }, attachTo: document.body });
+    const fn = wrapper.get("[data-object=add_customer]");
+    expect(fn.text()).toContain("add_customer(integer)");
+    expect(wrapper.get("[data-database=atlas_dev][data-schema=public][data-level=group][data-kind-group=function]").text()).toContain("函数");
+    const emptyViews = wrapper.findAll("[data-kind-empty][data-kind-group=view]");
+    expect(emptyViews.length).toBeGreaterThan(0);
+    expect(emptyViews.every((node) => node.text().includes("没有视图") && !node.text().includes("没读出来"))).toBe(true);
+    await fn.trigger("click");
+    expect(wrapper.emitted("open-object")).toBeUndefined();
+    expect(wrapper.emitted("open-definition")).toBeUndefined();
+    expect(fn.attributes("data-selected")).toBe("true");
+    await fn.trigger("dblclick");
+    expect(wrapper.emitted("open-definition")?.[0]?.[0]).toMatchObject({ name: "add_customer", kind: "function", signature: "integer" });
+    expect(wrapper.emitted("open-object")).toBeUndefined();
+
+    fn.element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 20, clientY: 24 }));
+    await nextTick();
+    const menu = document.body.querySelector("[data-menu=object]");
+    expect(menu?.textContent).toContain("查看定义");
+    expect(menu?.textContent).toContain("复制到新查询");
+    expect(menu?.querySelector("[data-action=open-data]")).toBeNull();
+    expect(menu?.querySelector("[data-action=open-structure]")).toBeNull();
+    expect(menu?.querySelector("[data-action=drop-table]")).toBeNull();
     wrapper.unmount();
   });
 });

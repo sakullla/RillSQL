@@ -79,6 +79,11 @@ description = "允许从已打开的会话继续读取对象。"
 commands.allow = ["catalog_page"]
 
 [[permission]]
+identifier = "allow-catalog-definition"
+description = "允许从已打开的会话读取函数、存储过程或触发器的只读定义。"
+commands.allow = ["catalog_definition"]
+
+[[permission]]
 identifier = "allow-ddl-describe"
 description = "允许从已打开的会话读取表结构编辑信息。"
 commands.allow = ["ddl_describe"]

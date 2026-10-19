@@ -1,5 +1,7 @@
+use std::collections::HashSet;
+
 use crate::catalog::model::{
-    ConnectionNode, DatabaseNode, ObjectRow, SchemaNode, DEFAULT_OBJECT_PAGE,
+    kind_name, ConnectionNode, DatabaseNode, ObjectKind, ObjectRow, SchemaNode, DEFAULT_OBJECT_PAGE,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,16 +34,28 @@ pub fn object_path(connection: &str, database: &str, schema: &str) -> String {
         .join(" / ")
 }
 
+pub fn object_key(object: &ObjectRow) -> String {
+    format!(
+        "{}\u{1}{}\u{1}{}\u{1}{}",
+        kind_name(object.kind),
+        object.name,
+        object.signature,
+        object.relation
+    )
+}
+
 /// 第一次找不到的对象标为失效；已经失效的对象在下一次刷新时移除。
 pub fn reconcile_objects(previous: &[ObjectRow], incoming: &[ObjectRow]) -> Vec<ObjectRow> {
     let mut objects = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
+    let incoming_keys: HashSet<String> = incoming.iter().map(object_key).collect();
     for old in previous {
-        seen.insert(old.name.clone());
+        let key = object_key(old);
+        seen.insert(key.clone());
         if old.stale {
             continue;
         }
-        match incoming.iter().find(|item| item.name == old.name) {
+        match incoming.iter().find(|item| object_key(item) == key) {
             Some(fresh) => {
                 let mut row = fresh.clone();
                 row.stale = false;
@@ -55,13 +69,22 @@ pub fn reconcile_objects(previous: &[ObjectRow], incoming: &[ObjectRow]) -> Vec<
         }
     }
     for item in incoming {
-        if !seen.contains(&item.name) {
+        if !seen.contains(&object_key(item)) && incoming_keys.contains(&object_key(item)) {
             let mut row = item.clone();
             row.stale = false;
             objects.push(row);
         }
     }
     objects
+}
+
+fn failed_kinds(schema: &SchemaNode) -> HashSet<ObjectKind> {
+    schema
+        .kind_reports
+        .iter()
+        .filter(|report| report.error.is_some())
+        .map(|report| report.kind)
+        .collect()
 }
 
 pub fn refresh_schema(previous: &SchemaNode, incoming: &SchemaNode) -> SchemaNode {
@@ -75,14 +98,37 @@ pub fn refresh_schema(previous: &SchemaNode, incoming: &SchemaNode) -> SchemaNod
             objects: previous.objects.clone(),
             total: previous.objects.len(),
             error: Some(message.clone()),
+            kind_reports: incoming.kind_reports.clone(),
         };
     }
-    let objects = reconcile_objects(&previous.objects, &incoming.objects);
+    let failed = failed_kinds(incoming);
+    let kept: Vec<ObjectRow> = previous
+        .objects
+        .iter()
+        .filter(|item| failed.contains(&item.kind))
+        .cloned()
+        .collect();
+    let previous_open: Vec<ObjectRow> = previous
+        .objects
+        .iter()
+        .filter(|item| !failed.contains(&item.kind))
+        .cloned()
+        .collect();
+    let incoming_open: Vec<ObjectRow> = incoming
+        .objects
+        .iter()
+        .filter(|item| !failed.contains(&item.kind))
+        .cloned()
+        .collect();
+    let mut objects = reconcile_objects(&previous_open, &incoming_open);
+    let kept_len = kept.len();
+    objects.extend(kept);
     SchemaNode {
         name: incoming.name.clone(),
-        total: incoming.total.max(objects.len()),
+        total: incoming.total.saturating_add(kept_len).max(objects.len()),
         objects,
         error: None,
+        kind_reports: incoming.kind_reports.clone(),
     }
 }
 

@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref } from "vue";
+import DefinitionView from "../catalog/DefinitionView.vue";
 import { catalogConnections } from "../catalog/store";
+import type { CatalogObjectRef } from "../catalog/object-ref";
 import { resolveTableTarget } from "../grid/target";
 import { targetDetail, targetKey, targetOptions, type TargetOption } from "../query/complete";
 import "../structure/structure.css";
@@ -26,6 +28,7 @@ const emit = defineEmits<{
   draft: [id: string, draft: string];
   target: [id: string, target: QueryTarget];
   "table-view": [id: string, pane: "data" | "structure"];
+  "copy-definition": [sql: string];
 }>();
 
 const active = computed(() => props.tabs.find((tab) => tab.id === props.activeId) ?? null);
@@ -41,6 +44,19 @@ function showPane(tabId: string, pane: "data" | "structure") {
 
 function tableTarget(tabId: string) {
   return resolveTableTarget(tabId, catalogConnections());
+}
+
+function definitionObject(tab: ShellTab): Pick<CatalogObjectRef, "connectionId" | "database" | "schema" | "name" | "kind" | "signature" | "relation"> | null {
+  if (!tab.definition || !tab.connectionId || tab.database == null) return null;
+  return {
+    connectionId: tab.connectionId,
+    database: tab.database,
+    schema: tab.definition.schema,
+    name: tab.definition.name,
+    kind: tab.definition.kind as CatalogObjectRef["kind"],
+    signature: tab.definition.signature,
+    relation: tab.definition.relation,
+  };
 }
 
 function onDraft(tabId: string, draft: string) {
@@ -219,6 +235,13 @@ onBeforeUnmount(() => {
       :tab-id="active.id"
       :draft="active.draft"
       purpose="create"
+    />
+    <DefinitionView
+      v-else-if="active && active.kind === 'definition' && definitionObject(active)"
+      :key="active.id"
+      :label="active.title"
+      :object="definitionObject(active)!"
+      @copy-sql="emit('copy-definition', $event)"
     />
     <WelcomeView
       v-else

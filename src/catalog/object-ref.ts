@@ -9,12 +9,16 @@ export interface CatalogObjectRef {
   schema: string;
   name: string;
   kind: ObjectKind;
+  signature?: string;
+  relation?: string;
   stale: boolean;
   path: string;
 }
 
-export function objectIdentity(ref: Pick<CatalogObjectRef, "connectionId" | "database" | "schema" | "name">): string {
-  return `${ref.connectionId}:${ref.database}:${ref.schema}:${ref.name}`;
+export function objectIdentity(ref: Pick<CatalogObjectRef, "connectionId" | "database" | "schema" | "name"> & Partial<Pick<CatalogObjectRef, "kind" | "signature" | "relation">>): string {
+  const base = `${ref.connectionId}:${ref.database}:${ref.schema}:${ref.name}`;
+  if (!ref.kind || ref.kind === "table" || ref.kind === "view") return base;
+  return `${base}:${ref.kind}:${ref.signature ?? ""}:${ref.relation ?? ""}`;
 }
 
 export function quoteIdent(engine: Engine, name: string): string {

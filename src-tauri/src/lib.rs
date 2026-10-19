@@ -54,6 +54,7 @@ fn wire<R: tauri::Runtime>(builder: tauri::Builder<R>, state: connections::comma
         catalog::commands::catalog_sessions,
         catalog::commands::catalog_refresh,
         catalog::commands::catalog_page,
+        catalog::commands::catalog_definition,
         grid::commands::grid_describe,
         grid::commands::grid_page,
         grid::commands::grid_count,

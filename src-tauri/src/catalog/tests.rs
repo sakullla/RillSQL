@@ -5,7 +5,7 @@ use super::model::{
     metadata_sql, schema_status, ConnStatus, ConnectionNode, DatabaseNode, Engine, ObjectRow,
     SchemaNode, SchemaStatus,
 };
-use super::read::{assemble_postgres, read_catalog_session, read_limit, ObjectWindow};
+use super::read::{assemble_postgres, read_catalog_session, read_definition, read_limit, ObjectWindow};
 use super::sqlite::{read_sqlite_file, read_sqlite_pool};
 use super::tree::{
     direct_objects, object_path, refresh_connection, refresh_schema, search_objects, take_page,
@@ -24,6 +24,7 @@ fn schema(name: &str, objects: Vec<ObjectRow>) -> SchemaNode {
         objects,
         total,
         error: None,
+        kind_reports: Vec::new(),
     }
 }
 
@@ -58,12 +59,24 @@ fn engines_keep_their_own_levels() {
     let maria_sql = metadata_sql(Engine::Mariadb);
     let sqlite_sql = metadata_sql(Engine::Sqlite);
     assert!(postgres_sql.objects.contains("pg_namespace"));
+    assert!(postgres_sql.objects.contains("'m'"));
+    let function_sql = super::kind_sql(Engine::Postgres, super::model::ObjectKind::Function);
+    assert!(function_sql.list.contains("pg_get_function_identity_arguments"));
+    assert!(function_sql.list.contains("pg_namespace"));
+    let procedure_sql = super::kind_sql(Engine::Postgres, super::model::ObjectKind::Procedure);
+    assert!(procedure_sql.list.contains("prokind = 'p'"));
+    let trigger_sql = super::kind_sql(Engine::Mysql, super::model::ObjectKind::Trigger);
+    assert!(trigger_sql.list.contains("information_schema.triggers"));
+    assert!(super::kind_sql(Engine::Mariadb, super::model::ObjectKind::Function).list.contains("information_schema.routines"));
+    assert!(!super::model::listed_kinds(Engine::Sqlite).contains(&super::model::ObjectKind::Function));
+    assert!(super::model::listed_kinds(Engine::Sqlite).contains(&super::model::ObjectKind::Trigger));
     assert!(postgres_sql.schemas.is_some());
     assert!(mysql_sql.objects.contains("information_schema.tables"));
     assert!(maria_sql.objects.contains("information_schema.tables"));
     assert!(mysql_sql.schemas.is_none() && maria_sql.schemas.is_none());
     assert_eq!(mysql_sql.objects, maria_sql.objects);
     assert!(sqlite_sql.objects.contains("sqlite_master"));
+    assert!(sqlite_sql.objects.contains("trigger"));
     assert_eq!(sqlite_sql.foreign_keys, Some("PRAGMA foreign_keys"));
     assert!(sqlite_sql.databases.is_empty());
 }
@@ -337,7 +350,7 @@ fn catalog_commands_use_the_open_session_reader() {
     let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
     let wire = registration.split("fn wire").nth(1).unwrap_or("");
     let wire = wire.split("pub fn run").next().unwrap_or("");
-    for command in ["catalog_sessions", "catalog_refresh", "catalog_page"] {
+    for command in ["catalog_sessions", "catalog_refresh", "catalog_page", "catalog_definition"] {
         let allow = format!("allow-{}", command.replace('_', "-"));
         assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
         assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
@@ -415,7 +428,7 @@ async fn sqlite_catalog_reads_the_open_session_not_a_new_connection() {
     assert_eq!(service.open_session_ids(), vec!["notes".to_owned()]);
     assert!(service.set_catalog_foreign_keys("notes", Some(true)));
 
-    let loaded = load_catalog(&service, 100, &[]).await.unwrap();
+    let loaded = load_catalog(&service, 100, &[], None, false).await.unwrap();
     assert_eq!(loaded.len(), 1);
     let connection = &loaded[0];
     assert_eq!(connection.engine, "sqlite");
@@ -474,6 +487,69 @@ async fn sqlite_catalog_reads_the_open_session_not_a_new_connection() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn a_failed_kind_keeps_objects_from_the_other_kinds() {
+    use super::model::{KindReport, ObjectKind, ObjectRow};
+    let previous = schema(
+        "public",
+        vec![row("orders"), ObjectRow::fresh("touch", ObjectKind::Function)],
+    );
+    let mut incoming = schema("public", vec![row("orders")]);
+    incoming.kind_reports = vec![
+        KindReport {
+            kind: ObjectKind::Table,
+            total: 1,
+            error: None,
+        },
+        KindReport {
+            kind: ObjectKind::Function,
+            total: 0,
+            error: Some("permission denied for function touch".to_owned()),
+        },
+    ];
+    let merged = refresh_schema(&previous, &incoming);
+    assert!(merged.error.is_none());
+    let orders = merged.objects.iter().find(|item| item.name == "orders").unwrap();
+    let touch = merged.objects.iter().find(|item| item.name == "touch").unwrap();
+    assert!(!orders.stale);
+    assert!(!touch.stale);
+    assert!(merged.kind_reports.iter().any(|item| item.kind == ObjectKind::Function && item.error.is_some()));
+}
+
+#[tokio::test]
+async fn sqlite_lists_a_trigger_and_reads_its_sql_without_inventing_routines() {
+    let path = std::env::temp_dir().join(format!("rillsql-catalog-trigger-{}.sqlite", uuid::Uuid::new_v4()));
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE notes (id INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER notes_touch AFTER UPDATE ON notes BEGIN SELECT 1; END")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let page = read_sqlite_pool(&pool, 0, 100).await.unwrap();
+    assert!(page.objects.iter().any(|item| item.name == "notes_touch" && item.kind == super::model::ObjectKind::Trigger));
+    assert!(page.objects.iter().all(|item| item.kind != super::model::ObjectKind::Function));
+    let session = CatalogSession::Sqlite {
+        pool: pool.clone(),
+        foreign_keys: Some(false),
+    };
+    let sql = read_definition(&session, "main", "", "notes_touch", "trigger", "", "").await.unwrap();
+    assert!(sql.to_ascii_uppercase().contains("CREATE TRIGGER"));
+    let missing = read_definition(&session, "main", "", "missing", "trigger", "", "").await.unwrap_err();
+    assert!(missing.contains("没有读到定义"));
+    assert!(!missing.trim().is_empty());
+    let routine = read_definition(&session, "main", "", "notes", "function", "", "").await.unwrap_err();
+    assert!(routine.contains("没有函数"));
+    pool.close().await;
+    let _ = std::fs::remove_file(path);
+}
+
 fn connection_node_from_page(first: &[super::commands::ObjectDto], second: &[super::commands::ObjectDto]) -> ConnectionNode {
     let mut objects = Vec::new();
     for item in first.iter().chain(second) {
@@ -495,6 +571,7 @@ fn connection_node_from_page(first: &[super::commands::ObjectDto], second: &[sup
                 objects,
                 total,
                 error: None,
+                kind_reports: Vec::new(),
             }],
         }],
     )

@@ -3,13 +3,21 @@ export const DEFAULT_OBJECT_PAGE = 100;
 export type Engine = "postgres" | "mysql" | "mariadb" | "sqlite";
 export type EnvTone = "dev" | "test" | "prod" | "local" | "none";
 export type ConnStatus = "connected" | "disconnected" | "connecting" | "error" | "lost";
-export type ObjectKind = "table" | "view";
+export type ObjectKind = "table" | "view" | "function" | "procedure" | "trigger";
 
 export interface CatalogObject {
   name: string;
   kind: ObjectKind;
   estimatedRows: number | null;
   stale: boolean;
+  signature?: string;
+  relation?: string;
+}
+
+export interface KindReport {
+  kind: ObjectKind;
+  total: number;
+  error: string | null;
 }
 
 export interface SchemaNode {
@@ -17,6 +25,8 @@ export interface SchemaNode {
   objects: CatalogObject[];
   total: number;
   error: string | null;
+  kindReports?: KindReport[];
+  pending?: boolean;
 }
 
 export interface DatabaseNode {
@@ -57,6 +67,7 @@ export interface PageResult {
   objects: CatalogObject[];
   total: number;
   error: string | null;
+  kindReports?: KindReport[];
 }
 
 export interface EngineShape {

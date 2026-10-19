@@ -1,4 +1,28 @@
-import type { CatalogConnection, CatalogObject, ConnStatus, Engine, EngineShape, SchemaNode } from "./types";
+import type { CatalogConnection, CatalogObject, ConnStatus, Engine, EngineShape, ObjectKind, SchemaNode } from "./types";
+
+export const KIND_LABEL: Record<ObjectKind, string> = {
+  table: "表",
+  view: "视图",
+  function: "函数",
+  procedure: "存储过程",
+  trigger: "触发器",
+};
+
+export function objectGroups(engine: Engine): ObjectKind[] {
+  if (engine === "sqlite") return ["table", "view", "trigger"];
+  return ["table", "view", "function", "procedure", "trigger"];
+}
+
+export function objectKey(object: Pick<CatalogObject, "kind" | "name" | "signature" | "relation">): string {
+  return [object.kind, object.name, object.signature ?? "", object.relation ?? ""].join("\u0001");
+}
+
+export function objectLabel(engine: Engine, object: Pick<CatalogObject, "name" | "kind" | "signature">): string {
+  if (engine === "postgres" && (object.kind === "function" || object.kind === "procedure")) {
+    return `${object.name}(${object.signature ?? ""})`;
+  }
+  return object.name;
+}
 
 export function engineShape(engine: Engine): EngineShape {
   if (engine === "postgres") return { databases: true, schemas: true, foreignKeys: false };
@@ -24,13 +48,14 @@ export function objectPath(connection: string, database: string, schema: string)
 }
 
 export function reconcileObjects(previous: CatalogObject[], incoming: CatalogObject[]): CatalogObject[] {
-  const nextByName = new Map(incoming.map((item) => [item.name, item]));
+  const nextByKey = new Map(incoming.map((item) => [objectKey(item), item]));
   const seen = new Set<string>();
   const objects: CatalogObject[] = [];
   for (const old of previous) {
-    seen.add(old.name);
+    const key = objectKey(old);
+    seen.add(key);
     if (old.stale) continue;
-    const fresh = nextByName.get(old.name);
+    const fresh = nextByKey.get(key);
     if (!fresh) {
       objects.push({ ...old, stale: true });
       continue;
@@ -38,7 +63,7 @@ export function reconcileObjects(previous: CatalogObject[], incoming: CatalogObj
     objects.push({ ...fresh, stale: false });
   }
   for (const item of incoming) {
-    if (!seen.has(item.name)) objects.push({ ...item, stale: false });
+    if (!seen.has(objectKey(item))) objects.push({ ...item, stale: false });
   }
   return objects;
 }
@@ -48,16 +73,28 @@ export function refreshSchema(previous: SchemaNode, incoming: SchemaNode): Schem
     return {
       name: incoming.name || previous.name,
       objects: previous.objects.map((item) => ({ ...item })),
-      total: previous.objects.length,
+      total: Math.max(previous.total, previous.objects.length),
       error: incoming.error,
+      kindReports: incoming.kindReports ?? previous.kindReports,
+      pending: false,
     };
   }
-  const objects = reconcileObjects(previous.objects, incoming.objects);
+  const failed = new Set((incoming.kindReports ?? []).filter((item) => item.error).map((item) => item.kind));
+  const kept = previous.objects.filter((item) => failed.has(item.kind)).map((item) => ({ ...item }));
+  const objects = [
+    ...reconcileObjects(
+      previous.objects.filter((item) => !failed.has(item.kind)),
+      incoming.objects.filter((item) => !failed.has(item.kind)),
+    ),
+    ...kept,
+  ];
   return {
     name: incoming.name,
     objects,
-    total: Math.max(incoming.total, objects.length),
+    total: Math.max(incoming.total + kept.length, objects.length),
     error: null,
+    kindReports: incoming.kindReports ?? previous.kindReports,
+    pending: false,
   };
 }
 
@@ -102,6 +139,7 @@ export function refreshConnection(previous: CatalogConnection, incoming: Catalog
 
 export interface SearchHit {
   id: string;
+  key: string;
   name: string;
   kind: CatalogObject["kind"];
   path: string;
@@ -131,7 +169,8 @@ export function searchObjects(connections: CatalogConnection[], query: string): 
         for (const object of schema.objects) {
           if (!object.name.toLowerCase().includes(needle)) continue;
           hits.push({
-            id: `${connection.id}:${database.name}:${schema.name}:${object.name}`,
+            id: `${connection.id}:${database.name}:${schema.name}:${objectKey(object)}`,
+            key: objectKey(object),
             name: object.name,
             kind: object.kind,
             path: objectPath(connection.name, database.name, schema.name),

@@ -3,7 +3,31 @@ import type { AppPage } from "../router";
 import { parseHash, toHash } from "../router";
 import type { ConnectionStatus } from "./status-text";
 
-export type TabKind = "query" | "table" | "structure";
+export type TabKind = "query" | "table" | "structure" | "definition";
+
+export interface DefinitionRequest {
+  schema: string;
+  name: string;
+  kind: string;
+  signature: string;
+  relation: string;
+}
+
+export interface DefinitionTarget {
+  id: string;
+  label: string;
+  path?: string;
+  connectionId: string;
+  connectionName: string;
+  database: string;
+  engine: string;
+  status: ConnectionStatus;
+  schema: string;
+  name: string;
+  kind: string;
+  signature: string;
+  relation: string;
+}
 
 export const NEW_QUERY_DRAFT = "";
 
@@ -54,6 +78,7 @@ export interface ShellTab {
   targetNotice: string | null;
   tablePane: "data" | "structure";
   structureSection: "columns" | "indexes" | "foreign" | "drop";
+  definition?: DefinitionRequest | null;
 }
 
 export interface ShellSession {
@@ -71,6 +96,7 @@ export interface ShellSession {
   openQueryDraft: (input: QueryDraftInput) => string;
   openTable: (target: PlaceholderTarget) => void;
   openStructure: (target: PlaceholderTarget) => void;
+  openDefinition: (target: DefinitionTarget) => void;
   setTableView: (id: string, pane: "data" | "structure", section?: "columns" | "drop") => void;
   setDraft: (id: string, draft: string) => void;
   setQueryTarget: (id: string, target: QueryTarget | null) => void;
@@ -100,6 +126,7 @@ function blankTab(kind: TabKind, id: string, title: string, path: string | null,
     targetNotice: null,
     tablePane: "data",
     structureSection: "columns",
+    definition: null,
   };
 }
 
@@ -205,6 +232,34 @@ export function createSession(initialHash = ""): ShellSession {
     openPlaceholder("structure", target);
   }
 
+  function openDefinition(target: DefinitionTarget) {
+    const id = `definition:${target.id}`;
+    const existing = tabs.value.find((tab) => tab.id === id);
+    if (existing) {
+      activeId.value = existing.id;
+      showPage("workspace");
+      return;
+    }
+    const tab = blankTab("definition", id, target.label, target.path ?? null, "");
+    applyTarget(tab, {
+      connectionId: target.connectionId,
+      connectionName: target.connectionName,
+      database: target.database,
+      engine: target.engine,
+      status: target.status,
+    });
+    tab.definition = {
+      schema: target.schema,
+      name: target.name,
+      kind: target.kind,
+      signature: target.signature,
+      relation: target.relation,
+    };
+    tabs.value = [...tabs.value, tab];
+    activeId.value = tab.id;
+    showPage("workspace");
+  }
+
   function setDraft(id: string, draft: string) {
     const tab = tabs.value.find((item) => item.id === id);
     if (!tab || tab.draft === draft) return;
@@ -281,6 +336,7 @@ export function createSession(initialHash = ""): ShellSession {
     openQueryDraft,
     openTable,
     openStructure,
+    openDefinition,
     setTableView,
     setDraft,
     setQueryTarget,
