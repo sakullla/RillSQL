@@ -188,6 +188,14 @@ function preferredIndex(statements: { columns: string[] }[]): number {
   return statements.length - 1;
 }
 
+/** jsdom 的 Range 没有 getClientRects，选区测量不能变成未处理异常。 */
+function ensureRangeClientRects(): void {
+  if (typeof Range === "undefined") return;
+  const proto = Range.prototype as Range & { getClientRects?: () => DOMRectList };
+  if (typeof proto.getClientRects === "function") return;
+  proto.getClientRects = () => [] as unknown as DOMRectList;
+}
+
 const setSendRange = StateEffect.define<{ from: number; to: number } | null>();
 const sendRangeMark = Decoration.mark({ class: "cm-send-range" });
 const sendRangeField = StateField.define<Decoration.DecorationSet>({
@@ -326,6 +334,7 @@ function editorExtensions() {
 }
 
 function mountEditor() {
+  ensureRangeClientRects();
   view = resolveEditor(view, host.value, (parent) => new EditorView({
     parent,
     state: EditorState.create({ doc: props.draft, extensions: editorExtensions() }),
