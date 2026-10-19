@@ -85,6 +85,11 @@ describe("grid display, copy and typed literals", () => {
     const synthetic = `\u0001t:3000:${"a".repeat(1024)}`;
     expect(rejectWrite(column("note", "text"), synthetic)).toBe("预览内容不能写回");
     expect(rejectWrite(column("note", "text"), synthetic, true)).toBeNull();
+    const openedOriginal = showCell(synthetic, { column: column("note", "text"), opened: true, resolved: true });
+    expect(openedOriginal.body).toBe(synthetic);
+    expect(openedOriginal.label).toBe(synthetic);
+    expect(copyCellText(synthetic, "NULL", column("note", "text"), true)).toBe(synthetic);
+    expect(showCell(synthetic, { column: column("note", "text"), opened: true }).body).toBe("a".repeat(1024));
     expect(sqlCell(column("flag", "boolean"), "yes", "mysql")).toBe("TRUE");
     expect(sqlCell(column("blob", "bytea"), "0A0B", "postgres")).toBe("'\\x0a0b'");
     expect(sqlCell(column("blob", "blob"), "0A0B", "mysql")).toBe("X'0a0b'");
@@ -291,6 +296,50 @@ describe("grid column width, clipboard and paging", () => {
     same.unmount();
   });
 
+  it("shows and copies a protocol-shaped original once the value is complete", async () => {
+    const synthetic = `\u0001t:3000:${"a".repeat(1024)}`;
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return { ...schema(), kind: "view", key: [] };
+      if (command === "grid_page") {
+        return { rows: [{ ...row(), located: false, locatorColumns: [], locatorValues: [], cells: { id: "1", note: synthetic, blob: "abcd", shape: "POINT(1 2)" } }], truncated: false, sql: "SELECT view" };
+      }
+      throw new Error(command);
+    });
+    const view = mount(DataGrid, { props: { tabId: "table:docs-protocol-view", draft: "", pageSize: 10, target } });
+    await flushPromises();
+    expect(view.get("[data-cell='1:note']").text()).toContain("t:3000");
+    await view.get("[data-cell='1:note']").trigger("click");
+    await view.findAll("button").find((button) => button.text() === "读取完整值")!.trigger("click");
+    await flushPromises();
+    expect((view.get("textarea").element as HTMLTextAreaElement).value).toBe(synthetic);
+    await view.findAll("button").find((button) => button.text() === "复制值")!.trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledWith(synthetic);
+    view.unmount();
+
+    writeText.mockClear();
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return schema();
+      if (command === "grid_page") return { rows: [{ ...row(), cells: { id: "1", note: synthetic, blob: "abcd", shape: "POINT(1 2)" } }], truncated: false, sql: "SELECT page" };
+      throw new Error(command);
+    });
+    const located = mount(DataGrid, { props: { tabId: "table:docs-protocol-located", draft: "", pageSize: 10, target } });
+    await flushPromises();
+    expect(located.get("[data-cell='1:note']").text()).not.toContain("t:3000");
+    await located.get("[data-cell='1:note']").trigger("click");
+    await located.findAll("button").find((button) => button.text() === "读取完整值")!.trigger("click");
+    await flushPromises();
+    expect((located.get("textarea").element as HTMLTextAreaElement).value).toBe(synthetic);
+    await located.findAll("button").find((button) => button.text() === "复制值")!.trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledWith(synthetic);
+    await located.get("[data-cell='1:note']").trigger("contextmenu", { clientX: 4, clientY: 4 });
+    await located.get(".cell-menu").findAll("button").find((button) => button.text() === "复制")!.trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenLastCalledWith(synthetic);
+    located.unmount();
+  });
+
   it("exports located previews as the full text instead of the envelope", async () => {
     invoke.mockImplementation(async (command: string, args: { request?: { filters?: { column: string }[] } }) => {
       if (command === "grid_describe") return schema();
@@ -376,6 +425,29 @@ describe("grid column width, clipboard and paging", () => {
     await flushPromises();
     expect(continueTabRun).toHaveBeenCalledWith("query-1");
     expect(wrapper.text()).toContain("2");
+    wrapper.unmount();
+  });
+
+  it("opens a protocol-shaped query value as the retrieved text", async () => {
+    const synthetic = `\u0001t:3000:${"b".repeat(1024)}`;
+    const wrapper = mount(QueryResultGrid, {
+      props: {
+        tabId: "query-protocol",
+        statement: "SELECT note FROM docs",
+        columns: [column("note", "text")],
+        rows: [{ id: "r0", cells: { note: synthetic }, located: false, locator: null }],
+        truncated: false,
+        engine: "postgres",
+      },
+    });
+    await flushPromises();
+    expect(wrapper.get("[data-cell='r0:note']").text()).toContain("t:3000");
+    await wrapper.get("[data-cell='r0:note']").trigger("pointerdown");
+    await wrapper.findAll("button").find((button) => button.text() === "读取完整值")!.trigger("click");
+    expect((wrapper.get("textarea").element as HTMLTextAreaElement).value).toBe(synthetic);
+    await wrapper.findAll("button").find((button) => button.text() === "复制值")!.trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledWith(synthetic);
     wrapper.unmount();
   });
 

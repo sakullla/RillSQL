@@ -145,7 +145,7 @@ watch(
 
 const selectedColumn = computed(() => columns.value.find((column) => column.name === session?.selectedColumn) ?? null);
 const selectedRaw = computed(() => (session?.selectedId && session.selectedColumn ? session.cellValue(session.selectedId, session.selectedColumn) : undefined));
-const selectedShown = computed(() => showCell(selectedRaw.value, { column: selectedColumn.value ?? undefined, opened: isRevealed() }));
+const selectedShown = computed(() => showCell(selectedRaw.value, { column: selectedColumn.value ?? undefined, opened: isRevealed(), resolved: session?.selectedId ? session.rowById(session.selectedId)?.resolved === true : false }));
 const selectedPoints = computed(() => (anchor.value && focusCellPoint.value ? rectangleSelection(displayRows.value, columns.value, anchor.value, focusCellPoint.value) : []));
 const previewRows = computed(() => session?.loaded.slice(0, 4).map((row) => ({ ...row.cells })) ?? []);
 const noKeyHint = computed(() => {
@@ -334,9 +334,9 @@ async function commitChangesNow() {
 }
 
 function shown(id: string, column: string) {
-  const value = session.cellValue(id, column);
+  const value = session?.cellValue(id, column);
   const meta = columns.value.find((item) => item.name === column);
-  return showCell(value, { column: meta, opened: revealed.has(`${id}:${column}`) });
+  return showCell(value, { column: meta, opened: revealed.has(`${id}:${column}`), resolved: session?.rowById(id)?.resolved === true });
 }
 
 function isPicked(row: string, column: string): boolean {
@@ -479,7 +479,8 @@ async function copySelected(asSql: boolean) {
     return;
   }
   const column = selectedColumn.value ?? undefined;
-  const text = asSql ? copySqlValue(selectedRaw.value, column, session.store.schema.engine) : copyCellText(selectedRaw.value, props.nullCopy ?? loadSettings().nullCopy, column);
+  const resolved = session.rowById(session.selectedId)?.resolved === true;
+  const text = asSql ? copySqlValue(selectedRaw.value, column, session.store.schema.engine) : copyCellText(selectedRaw.value, props.nullCopy ?? loadSettings().nullCopy, column, resolved);
   try {
     await navigator.clipboard.writeText(text);
     copyMessage.value = "已复制";

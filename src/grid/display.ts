@@ -24,6 +24,8 @@ export interface ShowOptions {
   column?: Column;
   previewBytes?: number;
   opened?: boolean;
+  /** 这段文本已经是完整原文。形状像预览信封时也不拆开。 */
+  resolved?: boolean;
 }
 
 export interface FieldEnvelope {
@@ -54,11 +56,13 @@ export function showCell(value: Cell | undefined, previewBytesOrOptions: number 
   if (value === "") return { kind: "empty", label: "空字符串", title: "空字符串（长度 0）", body: "" };
   const family = options.column ? valueFamily(options.column.typeName) : "text";
   if (family === "binary") return showBinary(value, options.opened === true);
-  const envelope = parseEnvelope(value);
-  if (envelope?.kind === "text") {
-    const preview = previewText(envelope.preview, previewBytes);
-    if (!options.opened) return largeText(envelope.bytes, preview);
-    return { kind: "text", label: preview, title: preview, body: preview };
+  if (!options.resolved) {
+    const envelope = parseEnvelope(value);
+    if (envelope?.kind === "text") {
+      const preview = previewText(envelope.preview, previewBytes);
+      if (!options.opened) return largeText(envelope.bytes, preview);
+      return { kind: "text", label: preview, title: preview, body: preview };
+    }
   }
   const formatted = formatText(value, family);
   const bytes = byteLength(value);
