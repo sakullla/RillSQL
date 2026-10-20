@@ -732,13 +732,18 @@ describe("query result edits", () => {
     return parsed.table;
   }
 
+  function rejectReason(sql: string): string {
+    const parsed = readSingleTable(sql);
+    return parsed.ok ? "" : parsed.reason;
+  }
+
   it("only locates a proved single-table select that contains its primary key", () => {
     expect(readSingleTable("SELECT * FROM orders JOIN items ON items.id = orders.id").ok).toBe(false);
-    expect(readSingleTable("SELECT status, COUNT(*) FROM orders GROUP BY status").reason).toContain("聚合");
-    expect(readSingleTable("SELECT DISTINCT status FROM orders").reason).toContain("DISTINCT");
-    expect(readSingleTable("SELECT id FROM orders UNION SELECT id FROM archive").reason).toContain("UNION");
-    expect(readSingleTable("SELECT id FROM (SELECT id FROM orders) q").reason).toContain("子查询");
-    expect(readSingleTable("DELETE FROM orders").reason).toContain("SELECT");
+    expect(rejectReason("SELECT status, COUNT(*) FROM orders GROUP BY status")).toContain("聚合");
+    expect(rejectReason("SELECT DISTINCT status FROM orders")).toContain("DISTINCT");
+    expect(rejectReason("SELECT id FROM orders UNION SELECT id FROM archive")).toContain("UNION");
+    expect(rejectReason("SELECT id FROM (SELECT id FROM orders) q")).toContain("子查询");
+    expect(rejectReason("DELETE FROM orders")).toContain("SELECT");
     expect(readSingleTable("SELECT id, name FROM ONLY orders").ok).toBe(false);
     const explicitAlias = readSingleTable("SELECT id, email AS name FROM customers");
     expect(explicitAlias.ok).toBe(true);
@@ -1584,5 +1589,75 @@ describe("query result edits", () => {
       expect(wrapper.text()).not.toContain('"public"."customers"');
       wrapper.unmount();
     }
+  });
+});
+
+describe("query result keyboard navigation", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    resetExportTasks();
+    resetCatalog();
+    resetCloseGuard();
+  });
+
+  function mountReadOnly(keys: string) {
+    const model = gridModel({ columns: ["id", "name"], rows: [["1", "甲"], ["2", "乙"]] });
+    const wrapper = mount(QueryResultGrid, {
+      props: {
+        tabId: keys,
+        statement: "SELECT * FROM orders JOIN items ON items.id = orders.id",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+      },
+    });
+    return wrapper;
+  }
+
+  it("moves the selected cell with arrows and Tab, wrapping at the edges", async () => {
+    const wrapper = mountReadOnly("keys-move");
+    await flushPromises();
+    expect(wrapper.attributes("data-editable")).toBe("false");
+    await wrapper.get("[data-cell='r0:id']").trigger("pointerdown");
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("r0:id");
+    const scroll = wrapper.get(".grid-scroll");
+    await scroll.trigger("keydown", { key: "ArrowRight" });
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("r0:name");
+    await scroll.trigger("keydown", { key: "ArrowDown" });
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("r1:name");
+    await scroll.trigger("keydown", { key: "Tab" });
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("r0:id");
+    await scroll.trigger("keydown", { key: "ArrowLeft" });
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("r1:name");
+    await scroll.trigger("keydown", { key: "ArrowUp" });
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("r0:name");
+    wrapper.unmount();
+  });
+
+  it("does not start editing a read-only session with Enter or F2", async () => {
+    const wrapper = mountReadOnly("keys-enter");
+    await flushPromises();
+    await wrapper.get("[data-cell='r0:id']").trigger("pointerdown");
+    await wrapper.get(".grid-scroll").trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(wrapper.find("input[aria-label='编辑 id']").exists()).toBe(false);
+    await wrapper.get(".grid-scroll").trigger("keydown", { key: "F2" });
+    await flushPromises();
+    expect(wrapper.find("input[aria-label='编辑 id']").exists()).toBe(false);
+    expect(wrapper.attributes("data-editable")).toBe("false");
+    wrapper.unmount();
+  });
+
+  it("still copies the selected cell with Ctrl+C", async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    const wrapper = mountReadOnly("keys-copy");
+    await flushPromises();
+    await wrapper.get("[data-cell='r1:name']").trigger("pointerdown");
+    await wrapper.get(".grid-scroll").trigger("keydown", { ctrlKey: true, key: "c" });
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledWith("乙");
+    expect(wrapper.text()).toContain("已复制");
+    wrapper.unmount();
   });
 });
