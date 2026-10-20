@@ -186,7 +186,7 @@ describe("query editing", () => {
     expect(wrapper.get("[data-action='target']").text()).toContain("Shop / shop_staging");
     expect(wrapper.get("[data-action='target']").text()).toContain("MY");
     expect(wrapper.text()).toContain("已连接");
-    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element);
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement);
     expect(view).toBeTruthy();
     const from = sql.indexOf("SELECT 2;");
     view!.dispatch({ selection: { anchor: from, head: from + "SELECT 2;".length } });
@@ -441,7 +441,7 @@ describe("query editing", () => {
       },
     });
     await nextTick();
-    EditorView.findFromDOM(wrapper.get(".cm-content").element)?.destroy();
+    EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)?.destroy();
     await wrapper.get("[data-action='run']").trigger("click");
     await flushPromises();
     expect(calls.filter((call) => call.command === "query_start").at(-1)?.sql).toBe("select * from customers");
@@ -497,7 +497,7 @@ describe("query editing", () => {
       },
     });
     await nextTick();
-    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element)!;
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
     const from = "SELECT 1;\n".length;
     view.dispatch({ selection: { anchor: from, head: from + "SELECT 2;".length } });
     await nextTick();
@@ -662,7 +662,7 @@ describe("query editing", () => {
       },
     });
     await nextTick();
-    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element);
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement);
     expect(view).toBeTruthy();
     view!.dispatch({ selection: { anchor: view!.state.doc.length } });
     startCompletion(view!);
@@ -698,7 +698,7 @@ describe("query editing", () => {
       },
     });
     await nextTick();
-    const failedView = EditorView.findFromDOM(failed.get(".cm-content").element)!;
+    const failedView = EditorView.findFromDOM(failed.get(".cm-content").element as HTMLElement)!;
     failedView.dispatch({ selection: { anchor: failedView.state.doc.length } });
     startCompletion(failedView);
     await vi.waitFor(() => {
@@ -724,7 +724,7 @@ describe("query editing", () => {
     expect(missing.find(".q-hint").exists()).toBe(false);
     expect(missing.findAll(".q-guide")).toHaveLength(1);
     invoke.mockClear();
-    const missingView = EditorView.findFromDOM(missing.get(".cm-content").element)!;
+    const missingView = EditorView.findFromDOM(missing.get(".cm-content").element as HTMLElement)!;
     missingView.dispatch({ selection: { anchor: missingView.state.doc.length } });
     startCompletion(missingView);
     await vi.waitFor(() => {
@@ -751,7 +751,7 @@ describe("query editing", () => {
       },
     });
     await nextTick();
-    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element)!;
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
     const from = sql.indexOf("select   2;");
     view.dispatch({ selection: { anchor: from, head: sql.length } });
     await wrapper.get("[data-action='format']").trigger("click");
@@ -774,7 +774,7 @@ describe("query editing", () => {
     });
     await nextTick();
     await broken.get("[data-action='format']").trigger("click");
-    const brokenView = EditorView.findFromDOM(broken.get(".cm-content").element)!;
+    const brokenView = EditorView.findFromDOM(broken.get(".cm-content").element as HTMLElement)!;
     expect(brokenView.state.doc.toString()).toBe("select 'abc");
     expect(broken.get("[role='alert']").text()).toContain("引号");
     broken.unmount();
@@ -795,7 +795,7 @@ describe("query editing", () => {
       },
     });
     await nextTick();
-    const commentView = EditorView.findFromDOM(commentTab.get(".cm-content").element)!;
+    const commentView = EditorView.findFromDOM(commentTab.get(".cm-content").element as HTMLElement)!;
     const commentFrom = commented.indexOf("select 2");
     commentView.dispatch({ selection: { anchor: commentFrom, head: commented.length } });
     await commentTab.get("[data-action='format']").trigger("click");
@@ -817,7 +817,7 @@ describe("query editing", () => {
       },
     });
     await nextTick();
-    const glueView = EditorView.findFromDOM(glueTab.get(".cm-content").element)!;
+    const glueView = EditorView.findFromDOM(glueTab.get(".cm-content").element as HTMLElement)!;
     const glueFrom = glued.indexOf("1 ");
     glueView.dispatch({ selection: { anchor: glueFrom, head: glueFrom + "1 ".length } });
     await glueTab.get("[data-action='format']").trigger("click");
@@ -867,7 +867,7 @@ describe("query editing", () => {
     expect(wrapper.get("[data-result='plan']").text()).toContain("未使用 ANALYZE");
     expect(wrapper.find("[aria-label='查询结果']").exists()).toBe(false);
 
-    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element)!;
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
     view.dispatch({ selection: { anchor: 0, head: sql.length } });
     await wrapper.get("[data-action='plan']").trigger("click");
     await flushPromises();
@@ -996,7 +996,7 @@ describe("query editing", () => {
       },
     });
     await nextTick();
-    const editor = EditorView.findFromDOM(wrapper.get(".cm-content").element)!;
+    const editor = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
     editor.dispatch({ selection: { anchor: 0, head: "SELECT 1;".length } });
     await nextTick();
     expect(wrapper.get("[data-action='run']").text()).toContain("执行选中");
@@ -1028,7 +1028,7 @@ describe("query editing", () => {
       },
     });
     await nextTick();
-    const editor = EditorView.findFromDOM(wrapper.get(".cm-content").element)!;
+    const editor = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
     editor.dispatch({ selection: { anchor: 0, head: 8 } });
     await wrapper.get(".cm-content").trigger("pointerdown");
     await wrapper.get(".cm-content").trigger("pointermove");
@@ -1161,7 +1161,7 @@ describe("query editing", () => {
       },
     });
     await nextTick();
-    const editor = EditorView.findFromDOM(wrapper.get(".cm-content").element)!;
+    const editor = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
     editor.dispatch({ selection: { anchor: 0, head: "DELETE FROM t;".length } });
     await nextTick();
     await wrapper.get("[data-action='run']").trigger("click");
@@ -1210,7 +1210,7 @@ describe("query editing", () => {
     });
     await nextTick();
     const second = draft.lastIndexOf("SELECT 1;");
-    const editor = EditorView.findFromDOM(wrapper.get(".cm-content").element)!;
+    const editor = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
     editor.dispatch({ selection: { anchor: second + 2 } });
     await wrapper.get("[data-action='plan']").trigger("click");
     await flushPromises();
@@ -1241,6 +1241,166 @@ describe("query editing", () => {
     expect(invoke).not.toHaveBeenCalled();
     expect(wrapper.get("[role='alert']").text()).toContain("不使用 DELIMITER");
     expect(wrapper.get("[role='alert']").text()).not.toContain("只有空白或注释");
+    wrapper.unmount();
+  });
+
+  it("loads a history entry into the editor as a draft without running it", async () => {
+    replaceCatalog(catalogFixture());
+    const rows = [{
+      id: "h1",
+      sql: "SELECT count(*) FROM orders;",
+      connectionId: "shop",
+      connectionName: "Shop",
+      databaseName: "shop_staging",
+      engine: "mysql",
+      startedAt: "2026-10-20T09:30:00Z",
+      finishedAt: "2026-10-20T09:30:01Z",
+      status: "ok",
+      elapsedMs: 34,
+      summary: "1 行",
+    }];
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "query_history") return rows;
+      throw new Error(command);
+    });
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-history",
+        draft: "SELECT 1",
+        connectionId: "atlas",
+        connectionName: "Atlas",
+        database: "atlas_dev",
+        engine: "postgres",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("query_history");
+    await wrapper.get("[data-action='history']").trigger("click");
+    await flushPromises();
+    expect(invoke.mock.calls.map((call) => call[0])).toContain("query_history");
+    const item = wrapper.get("[data-action='open-history']");
+    expect(item.text()).toContain("成功");
+    expect(item.text()).toContain("Shop / shop_staging");
+    expect(item.text()).toContain("耗时 34 毫秒");
+    expect(item.text()).toContain("SELECT count(*) FROM orders;");
+    await item.trigger("click");
+    await flushPromises();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
+    expect(view.state.doc.toString()).toBe("SELECT count(*) FROM orders;");
+    expect(wrapper.emitted("update:draft")?.at(-1)).toEqual(["query-history", "SELECT count(*) FROM orders;"]);
+    expect(wrapper.emitted("target")?.[0]?.[0]).toMatchObject({ connectionId: "shop", connectionName: "Shop", database: "shop_staging", engine: "mysql", status: "connected" });
+    expect(wrapper.find("[data-action='open-history']").exists()).toBe(false);
+    expect(invoke.mock.calls.some((call) => call[0] === "query_start")).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("loads only the sql and explains when the history connection is gone", async () => {
+    replaceCatalog(catalogFixture());
+    const rows = [{
+      id: "h2",
+      sql: "DELETE FROM audit_log;",
+      connectionId: "ghost",
+      connectionName: "旧连接",
+      databaseName: "gone_db",
+      engine: "postgres",
+      startedAt: "2026-10-19T08:00:00Z",
+      finishedAt: "2026-10-19T08:00:02Z",
+      status: "error",
+      elapsedMs: 1200,
+      summary: "",
+    }];
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "query_history") return rows;
+      throw new Error(command);
+    });
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-history-gone",
+        draft: "SELECT 1",
+        connectionId: "atlas",
+        connectionName: "Atlas",
+        database: "atlas_dev",
+        engine: "postgres",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    await wrapper.get("[data-action='history']").trigger("click");
+    await flushPromises();
+    expect(wrapper.get("[data-action='open-history']").text()).toContain("原连接已删除");
+    await wrapper.get("[data-action='open-history']").trigger("click");
+    await flushPromises();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
+    expect(view.state.doc.toString()).toBe("DELETE FROM audit_log;");
+    expect(wrapper.emitted("update:draft")?.at(-1)).toEqual(["query-history-gone", "DELETE FROM audit_log;"]);
+    expect(wrapper.get("[role='alert']").text()).toContain("需要重新选择执行目标。原来的连接已删除，这次只载入 SQL，不会执行。");
+    expect(wrapper.emitted("target")).toBeUndefined();
+    expect(invoke.mock.calls.some((call) => call[0] === "query_start")).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("saves the editor sql by name and reopens a saved query as a draft", async () => {
+    replaceCatalog(catalogFixture());
+    const saved = [{
+      id: "s1",
+      name: "周报",
+      sql: "SELECT * FROM orders WHERE week = 42;",
+      connectionId: "atlas",
+      connectionName: "Atlas",
+      databaseName: "atlas_dev",
+      engine: "postgres",
+      updatedAt: "2026-10-18T12:00:00Z",
+    }];
+    const savedRequests: unknown[] = [];
+    invoke.mockImplementation(async (command: string, args?: { request?: unknown }) => {
+      if (command === "query_saved_list") return saved;
+      if (command === "query_saved_save") {
+        savedRequests.push(args?.request);
+        return { query: { ...saved[0]!, ...(args?.request as object), id: "s1", updatedAt: "2026-10-20T10:00:00Z" }, created: savedRequests.length === 1 };
+      }
+      throw new Error(command);
+    });
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-save",
+        draft: "SELECT 99",
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("query_saved_list");
+    await wrapper.get("[data-action='saved']").trigger("click");
+    await flushPromises();
+    expect(wrapper.get("[data-action='open-saved']").text()).toContain("周报");
+    await wrapper.get("form.pop-form").trigger("submit");
+    await flushPromises();
+    expect(savedRequests).toEqual([]);
+    expect(wrapper.text()).toContain("请填写名称");
+    await wrapper.get("[data-action='saved-name']").setValue("每日统计");
+    await wrapper.get("form.pop-form").trigger("submit");
+    await flushPromises();
+    expect(savedRequests).toEqual([{ sql: "SELECT 99", connectionId: "shop", connectionName: "Shop", databaseName: "shop_staging", engine: "mysql", name: "每日统计" }]);
+    expect(wrapper.text()).toContain("已保存「每日统计」");
+    await wrapper.get("[data-action='saved-name']").setValue("每日统计");
+    await wrapper.get("form.pop-form").trigger("submit");
+    await flushPromises();
+    expect(savedRequests).toHaveLength(2);
+    expect(wrapper.text()).toContain("已覆盖更新「每日统计」");
+    await wrapper.get("[data-action='open-saved']").trigger("click");
+    await flushPromises();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
+    expect(view.state.doc.toString()).toBe("SELECT * FROM orders WHERE week = 42;");
+    expect(wrapper.emitted("update:draft")?.at(-1)).toEqual(["query-save", "SELECT * FROM orders WHERE week = 42;"]);
+    expect(wrapper.emitted("target")?.[0]?.[0]).toMatchObject({ connectionId: "atlas", database: "atlas_dev", status: "connected" });
+    expect(invoke.mock.calls.some((call) => call[0] === "query_start")).toBe(false);
     wrapper.unmount();
   });
 });

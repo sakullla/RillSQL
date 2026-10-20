@@ -5,12 +5,15 @@ import { sql } from "@codemirror/lang-sql";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { tags } from "@lezer/highlight";
 import { EditorState, Prec, StateEffect, StateField } from "@codemirror/state";
-import { Decoration, EditorView, keymap } from "@codemirror/view";
+import { Decoration, type DecorationSet, EditorView, keymap } from "@codemirror/view";
 import { basicSetup } from "codemirror";
 import ChordKeys from "../shell/ChordKeys.vue";
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import { catalogConnections } from "../catalog/store";
 import { engineMeta } from "../connections/model";
+import { queryHistory, querySavedList, querySavedSave } from "../history/api";
+import { deletedConnectionNotice, elapsedLabel, openPlan, statusBadge, statusLabel as historyStatusLabel, type HistoryEntry, type OpenPlan } from "../history/plan";
+import { openSaved, savedName, savedNameError, savedNeedsTarget, type SavedQuery } from "../history/saved";
 import QueryResultGrid from "../grid/QueryResultGrid.vue";
 import type { Engine } from "../grid/types";
 import Icon from "../shell/Icon.vue";
@@ -76,12 +79,27 @@ const analyzeStatement = ref("");
 const analyzeAt = ref<{ from: number; to: number } | null>(null);
 const resultIndex = ref(0);
 const detailsOpen = ref(false);
+const historyRoot = ref<HTMLElement | null>(null);
+const savedRoot = ref<HTMLElement | null>(null);
+const historyOpen = ref(false);
+const savedOpen = ref(false);
+const historyEntries = shallowRef<HistoryEntry[]>([]);
+const historyLoading = ref(false);
+const historyError = ref("");
+const savedEntries = shallowRef<SavedQuery[]>([]);
+const savedLoading = ref(false);
+const savedError = ref("");
+const savedNameValue = ref("");
+const savedWriteError = ref("");
+const savedWriteMessage = ref("");
+const savedBusy = ref(false);
 let view: EditorView | undefined;
 let alive = true;
 
 const run = computed(() => tabRun(props.tabId));
 const running = computed(() => run.value?.status === "running" || run.value?.status === "cancel-requested");
 const options = computed(() => targetOptions(catalogConnections()));
+const knownIds = computed(() => new Set(catalogConnections().map((item) => item.id)));
 const selectedKey = computed(() => (props.connectionId && props.database != null ? targetKey(props.connectionId, props.database) : ""));
 const currentOption = computed(() => options.value.find((item) => item.key === selectedKey.value) ?? null);
 const buttonEngine = computed(() => currentOption.value?.engine ?? asEngine(props.engine ?? undefined));
@@ -198,7 +216,7 @@ function ensureRangeClientRects(): void {
 
 const setSendRange = StateEffect.define<{ from: number; to: number } | null>();
 const sendRangeMark = Decoration.mark({ class: "cm-send-range" });
-const sendRangeField = StateField.define<Decoration.DecorationSet>({
+const sendRangeField = StateField.define<DecorationSet>({
   create() {
     return Decoration.none;
   },
@@ -635,6 +653,132 @@ function toggleMenu() {
   activeIndex.value = index >= 0 ? index : 0;
 }
 
+function failureMessage(err: unknown, fallback: string): string {
+  if (typeof err === "string" && err) return err;
+  if (err instanceof Error && err.message) return err.message;
+  return fallback;
+}
+
+function toggleHistoryPanel() {
+  if (running.value || submitting.value) return;
+  historyOpen.value = !historyOpen.value;
+  if (!historyOpen.value) return;
+  savedOpen.value = false;
+  void loadHistory();
+}
+
+async function loadHistory() {
+  historyLoading.value = true;
+  try {
+    historyEntries.value = await queryHistory();
+    historyError.value = "";
+  } catch (err) {
+    historyError.value = failureMessage(err, "读不了查询历史");
+  } finally {
+    historyLoading.value = false;
+  }
+}
+
+function toggleSavedPanel() {
+  if (running.value || submitting.value) return;
+  savedOpen.value = !savedOpen.value;
+  if (!savedOpen.value) return;
+  historyOpen.value = false;
+  void loadSaved();
+}
+
+async function loadSaved() {
+  savedLoading.value = true;
+  try {
+    savedEntries.value = await querySavedList();
+    savedError.value = "";
+  } catch (err) {
+    savedError.value = failureMessage(err, "读不了保存的查询");
+  } finally {
+    savedLoading.value = false;
+  }
+}
+
+/** 历史或保存查询的载入计划：全量替换编辑器文本成为草稿（updateListener 会发出 update:draft），绝不执行。 */
+function applyOpenPlan(plan: OpenPlan) {
+  actionError.value = "";
+  mountEditor();
+  const editor = view;
+  if (!editor) {
+    actionError.value = "编辑器还没有准备好，请再试一次。";
+    return;
+  }
+  if (editor.state.doc.toString() !== plan.sql) {
+    editor.dispatch({ changes: { from: 0, to: editor.state.doc.length, insert: plan.sql } });
+  }
+  if (plan.needsTarget) {
+    actionError.value = deletedConnectionNotice();
+    return;
+  }
+  if (plan.connectionId == null || plan.connectionId === props.connectionId) return;
+  const connection = connectionById(catalogConnections(), plan.connectionId);
+  if (!connection) return;
+  emit("target", {
+    connectionId: connection.id,
+    connectionName: plan.connectionName,
+    database: plan.database ?? connection.defaultDatabase ?? "",
+    engine: plan.engine,
+    status: connection.status,
+  });
+}
+
+function chooseHistory(entry: HistoryEntry) {
+  historyOpen.value = false;
+  applyOpenPlan(openPlan(entry, knownIds.value));
+}
+
+function chooseSaved(entry: SavedQuery) {
+  savedOpen.value = false;
+  applyOpenPlan(openSaved(entry, knownIds.value));
+}
+
+async function saveNamedQuery() {
+  savedWriteError.value = "";
+  savedWriteMessage.value = "";
+  const nameError = savedNameError(savedNameValue.value);
+  if (nameError) {
+    savedWriteError.value = nameError;
+    return;
+  }
+  mountEditor();
+  const editor = view;
+  if (!editor) {
+    savedWriteError.value = "编辑器还没有准备好，请再试一次。";
+    return;
+  }
+  savedBusy.value = true;
+  try {
+    const written = await querySavedSave({
+      sql: editor.state.doc.toString(),
+      connectionId: props.connectionId ?? "",
+      connectionName: props.connectionName ?? "",
+      databaseName: props.database ?? "",
+      engine: props.engine ?? "postgres",
+      name: savedName(savedNameValue.value),
+    });
+    savedWriteMessage.value = written.created
+      ? `已保存「${written.query.name}」。只保存草稿，不会执行。`
+      : `已覆盖更新「${written.query.name}」。只保存草稿，不会执行。`;
+    savedNameValue.value = "";
+    await loadSaved();
+  } catch (err) {
+    savedWriteError.value = failureMessage(err, "存不了这条查询");
+  } finally {
+    savedBusy.value = false;
+  }
+}
+
+/** 弹出列表里的一行 SQL 摘要：压平空白后截断，完整内容放在 title。 */
+function sqlSummary(sql: string): string {
+  const flat = sql.replace(/\s+/g, " ").trim();
+  return flat.length > 100 ? `${flat.slice(0, 100)}…` : flat;
+}
+
 function toggleRunMenu() {
   if (running.value || submitting.value) return;
   runMenuOpen.value = !runMenuOpen.value;
@@ -686,6 +830,18 @@ function onRunMenuKey(event: KeyboardEvent) {
   runMenuOpen.value = false;
 }
 
+function onHistoryKey(event: KeyboardEvent) {
+  if (event.key !== "Escape") return;
+  event.preventDefault();
+  historyOpen.value = false;
+}
+
+function onSavedKey(event: KeyboardEvent) {
+  if (event.key !== "Escape") return;
+  event.preventDefault();
+  savedOpen.value = false;
+}
+
 function onPointerDown(event: PointerEvent) {
   if (menuOpen.value) {
     const root = targetRoot.value;
@@ -695,12 +851,22 @@ function onPointerDown(event: PointerEvent) {
     const root = runRoot.value;
     if (!root || !(event.target instanceof Node) || !root.contains(event.target)) runMenuOpen.value = false;
   }
+  if (historyOpen.value) {
+    const root = historyRoot.value;
+    if (!root || !(event.target instanceof Node) || !root.contains(event.target)) historyOpen.value = false;
+  }
+  if (savedOpen.value) {
+    const root = savedRoot.value;
+    if (!root || !(event.target instanceof Node) || !root.contains(event.target)) savedOpen.value = false;
+  }
 }
 
 watch(running, (value) => {
   if (!value) return;
   menuOpen.value = false;
   runMenuOpen.value = false;
+  historyOpen.value = false;
+  savedOpen.value = false;
 });
 
 function statusLabel(status: string): string {
@@ -795,6 +961,49 @@ onBeforeUnmount(() => {
       <span v-if="connectionStatus" class="conn-state" :class="`st-${connectionStatus}`"><i></i>{{ CONNECTION_STATUS_TEXT[connectionStatus] }}</span>
       <span class="grow"></span>
       <button class="btn" type="button" data-action="format" title="格式化选中的 SQL；没有选中时格式化全部" @click="formatEditor">格式化</button>
+      <div ref="historyRoot" class="q-pop">
+        <button class="btn" type="button" data-action="history" title="从查询历史载入 SQL；只写进草稿，不会执行" :disabled="running || submitting" @click="toggleHistoryPanel">历史</button>
+        <div v-if="historyOpen" class="pop-menu history-menu" role="menu" aria-label="查询历史" @keydown="onHistoryKey">
+          <div class="menu-head">查询历史 · 载入只写进草稿，不会执行</div>
+          <p v-if="historyError" class="pop-error" role="alert">历史没有读出来：{{ historyError }}<button class="btn sm" type="button" data-action="retry-history" @click="loadHistory">重试</button></p>
+          <p v-else-if="historyLoading" class="pop-empty">正在读取历史…</p>
+          <p v-else-if="!historyEntries.length" class="pop-empty">还没有执行过查询。</p>
+          <template v-else>
+            <button v-for="entry in historyEntries" :key="entry.id" class="pop-item" type="button" role="menuitem" data-action="open-history" :title="entry.sql" @click="chooseHistory(entry)">
+              <span class="badge" :class="statusBadge(entry.status)">{{ historyStatusLabel(entry.status) }}</span>
+              <span class="pop-copy">
+                <span class="pop-title"><b>{{ entry.connectionName }} / {{ entry.databaseName || "main" }}</b><span v-if="!knownIds.has(entry.connectionId)" class="pop-warn">原连接已删除</span></span>
+                <code>{{ sqlSummary(entry.sql) }}</code>
+                <small>耗时 {{ elapsedLabel(entry.elapsedMs) || "未知" }}</small>
+              </span>
+            </button>
+          </template>
+        </div>
+      </div>
+      <div ref="savedRoot" class="q-pop">
+        <button class="btn" type="button" data-action="saved" title="按名称保存当前 SQL，或打开已保存的查询" :disabled="running || submitting" @click="toggleSavedPanel">保存</button>
+        <div v-if="savedOpen" class="pop-menu saved-menu" role="menu" aria-label="保存的查询" @keydown="onSavedKey">
+          <form class="pop-form" @submit.prevent="saveNamedQuery">
+            <label>保存当前 SQL 为<input v-model="savedNameValue" type="text" aria-label="保存查询的名称" data-action="saved-name" placeholder="名称" /></label>
+            <p v-if="savedWriteMessage" role="status">{{ savedWriteMessage }}</p>
+            <p v-if="savedWriteError" class="pop-error" role="alert">{{ savedWriteError }}</p>
+            <button class="btn sm primary" type="submit" data-action="save-named-query" :disabled="savedBusy">保存</button>
+          </form>
+          <div class="menu-head">已保存的查询 · 打开只写进草稿，不会执行</div>
+          <p v-if="savedError" class="pop-error" role="alert">保存的查询没有读出来：{{ savedError }}<button class="btn sm" type="button" data-action="retry-saved" @click="loadSaved">重试</button></p>
+          <p v-else-if="savedLoading" class="pop-empty">正在读取保存的查询…</p>
+          <p v-else-if="!savedEntries.length" class="pop-empty">还没有保存的查询。</p>
+          <template v-else>
+            <button v-for="item in savedEntries" :key="item.id" class="pop-item" type="button" role="menuitem" data-action="open-saved" :title="item.sql" @click="chooseSaved(item)">
+              <span class="pop-copy">
+                <span class="pop-title"><b>{{ item.name }}</b><span v-if="savedNeedsTarget(item, knownIds)" class="pop-warn">需要重新选择执行目标</span></span>
+                <small>{{ item.connectionName ? `${item.connectionName} / ${item.databaseName || "main"}` : "未记录执行目标" }}</small>
+                <code>{{ sqlSummary(item.sql) }}</code>
+              </span>
+            </button>
+          </template>
+        </div>
+      </div>
       <button class="btn" type="button" data-action="plan" title="查看一条语句的执行计划，不使用 ANALYZE" :disabled="running || submitting" @click="requestPlan">执行计划</button>
       <button class="btn" type="button" data-action="analyze" title="在服务器上实际执行并分析这一条语句" :disabled="running || submitting" @click="requestAnalyze">实际执行并分析</button>
       <div v-if="!running" ref="runRoot" class="run-group">
@@ -953,6 +1162,24 @@ onBeforeUnmount(() => {
 .run-item { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; padding: var(--sp-2); border-radius: var(--r); text-align: left; font-size: var(--fs-sm); }
 .run-item:hover { background: var(--hover); }
 .run-item small { font-size: var(--fs-xs); color: var(--text-3); }
+.q-pop { position: relative; display: inline-flex; }
+.pop-menu { position: absolute; z-index: 30; top: calc(100% + var(--sp-1)); right: 0; min-width: 300px; max-width: 440px; max-height: 360px; overflow: auto; padding: var(--sp-1); background: var(--panel); border: 1px solid var(--line-2); border-radius: var(--r-md); box-shadow: var(--shadow); animation: pop-in var(--dur-fast) var(--ease-out); }
+.pop-item { display: flex; align-items: flex-start; gap: var(--sp-2); width: 100%; padding: var(--sp-2); border-radius: var(--r); text-align: left; }
+.pop-item:hover { background: var(--hover); }
+.pop-item .badge { flex-shrink: 0; }
+.pop-copy { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.pop-title { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; font-size: var(--fs-sm); }
+.pop-title b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pop-copy code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: var(--fs-xs); color: var(--text-2); }
+.pop-copy small { font-size: var(--fs-xs); color: var(--text-3); }
+.pop-warn { font-size: var(--fs-xs); color: var(--warn); flex-shrink: 0; }
+.pop-empty { margin: 0; padding: var(--sp-2); font-size: var(--fs-sm); color: var(--text-3); }
+.pop-error { display: flex; align-items: center; gap: var(--sp-2); margin: 0; padding: var(--sp-2); font-size: var(--fs-sm); color: var(--err); }
+.pop-error .btn { margin-left: auto; flex-shrink: 0; }
+.pop-form { display: flex; flex-direction: column; align-items: stretch; gap: var(--sp-2); padding: var(--sp-2); margin: 0 0 var(--sp-1); border-bottom: 1px solid var(--line); }
+.pop-form label { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-xs); color: var(--text-2); }
+.pop-form p { margin: 0; font-size: var(--fs-xs); }
+.pop-form .btn { align-self: flex-start; }
 .q-note, .q-hint, .q-banner { margin: 0; font-size: var(--fs-sm); color: var(--text-2); }
 .q-hint, .q-banner { padding: var(--sp-1) var(--sp-3); }
 .q-banner { color: var(--text); background: var(--sunken); }
