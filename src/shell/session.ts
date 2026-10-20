@@ -1,7 +1,7 @@
 import { computed, ref, type Ref } from "vue";
 import type { AppPage } from "../router";
 import { parseHash, toHash } from "../router";
-import type { ConnectionStatus } from "./status-text";
+import { CONNECTION_STATUS_TEXT, type ConnectionStatus } from "./status-text";
 
 export type TabKind = "query" | "table" | "structure" | "definition";
 
@@ -30,6 +30,30 @@ export interface DefinitionTarget {
 }
 
 export const NEW_QUERY_DRAFT = "";
+
+export const SESSION_KEY = "rillsql.session";
+
+/**
+ * Persisted query tab. Table/structure/definition tabs depend on catalog state
+ * that is not restored on startup, so only query tabs are snapshotted.
+ */
+export interface SessionSnapshotTab {
+  id: string;
+  title: string;
+  draft: string;
+  connectionId: string | null;
+  connectionName: string | null;
+  database: string | null;
+  engine: string | null;
+  connectionStatus: ConnectionStatus | null;
+  targetText: string | null;
+  targetNotice: string | null;
+}
+
+export interface SessionSnapshot {
+  tabs: SessionSnapshotTab[];
+  activeId: string | null;
+}
 
 export interface PlaceholderTarget {
   id: string;
@@ -149,7 +173,89 @@ function applyTarget(tab: ShellTab, target: QueryTarget | null) {
   tab.targetNotice = null;
 }
 
-export function createSession(initialHash = ""): ShellSession {
+export function snapshotSession(tabs: readonly ShellTab[], activeId: string | null): SessionSnapshot {
+  const kept = tabs.filter((tab) => tab.kind === "query");
+  return {
+    tabs: kept.map((tab) => ({
+      id: tab.id,
+      title: tab.title,
+      draft: tab.draft,
+      connectionId: tab.connectionId,
+      connectionName: tab.connectionName,
+      database: tab.database,
+      engine: tab.engine,
+      connectionStatus: tab.connectionStatus,
+      targetText: tab.targetText,
+      targetNotice: tab.targetNotice,
+    })),
+    // 活动标签若不是查询标签（快照里被剔除），回落到最后一个查询标签。
+    activeId: kept.some((tab) => tab.id === activeId) ? activeId : kept[kept.length - 1]?.id ?? null,
+  };
+}
+
+function optionalText(value: unknown): boolean {
+  return value === null || typeof value === "string";
+}
+
+/** Parse persisted session JSON. Any malformed shape or field returns null so the app starts fresh. */
+export function restoreSession(raw: string | null): SessionSnapshot | null {
+  if (!raw) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const source = parsed as { tabs?: unknown; activeId?: unknown };
+  if (!Array.isArray(source.tabs)) return null;
+  const activeId = source.activeId ?? null;
+  if (activeId !== null && typeof activeId !== "string") return null;
+  const tabs: SessionSnapshotTab[] = [];
+  for (const item of source.tabs) {
+    if (typeof item !== "object" || item === null) return null;
+    const tab = item as Record<string, unknown>;
+    if (typeof tab.id !== "string" || tab.id === "") return null;
+    if (typeof tab.title !== "string") return null;
+    if (typeof tab.draft !== "string") return null;
+    const status = tab.connectionStatus ?? null;
+    if (status !== null && !(typeof status === "string" && status in CONNECTION_STATUS_TEXT)) return null;
+    if (!optionalText(tab.connectionId)) return null;
+    if (!optionalText(tab.connectionName)) return null;
+    if (!optionalText(tab.database)) return null;
+    if (!optionalText(tab.engine)) return null;
+    if (!optionalText(tab.targetText)) return null;
+    if (!optionalText(tab.targetNotice)) return null;
+    tabs.push({
+      id: tab.id,
+      title: tab.title,
+      draft: tab.draft,
+      connectionId: tab.connectionId as string | null,
+      connectionName: tab.connectionName as string | null,
+      database: tab.database as string | null,
+      engine: tab.engine as string | null,
+      connectionStatus: status as ConnectionStatus | null,
+      targetText: tab.targetText as string | null,
+      targetNotice: tab.targetNotice as string | null,
+    });
+  }
+  const resolved = tabs.some((tab) => tab.id === activeId) ? activeId : tabs[tabs.length - 1]?.id ?? null;
+  return { tabs, activeId: resolved };
+}
+
+function fromSnapshot(item: SessionSnapshotTab): ShellTab {
+  const tab = blankTab("query", item.id, item.title, null, item.draft);
+  tab.connectionId = item.connectionId;
+  tab.connectionName = item.connectionName;
+  tab.database = item.database;
+  tab.engine = item.engine;
+  tab.connectionStatus = item.connectionStatus;
+  tab.targetText = item.targetText;
+  tab.targetNotice = item.targetNotice;
+  return tab;
+}
+
+export function createSession(initialHash = "", restored: SessionSnapshot | null = null): ShellSession {
   const page = ref<AppPage>(parseHash(initialHash));
   const tabs = ref<ShellTab[]>([]);
   const activeId = ref<string | null>(null);
@@ -160,6 +266,19 @@ export function createSession(initialHash = ""): ShellSession {
   const helpOpen = ref(false);
   let sequence = 1;
   let closeGuard: ((id: string) => boolean) | null = null;
+
+  if (restored && restored.tabs.length > 0) {
+    tabs.value = restored.tabs.map(fromSnapshot);
+    activeId.value = restored.tabs.some((tab) => tab.id === restored.activeId)
+      ? restored.activeId
+      : restored.tabs[restored.tabs.length - 1]!.id;
+    // 续号到恢复的 query-N 最大 N 之后，避免新标签与恢复标签撞 id。
+    sequence =
+      restored.tabs.reduce((max, tab) => {
+        const match = /^query-(\d+)$/.exec(tab.id);
+        return match ? Math.max(max, Number(match[1])) : max;
+      }, 0) + 1;
+  }
 
   const activeTab = computed(() => tabs.value.find((tab) => tab.id === activeId.value) ?? null);
 

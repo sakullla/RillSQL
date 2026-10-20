@@ -15,6 +15,7 @@ import AppShell from "./AppShell.vue";
 
 afterEach(() => {
   location.hash = "";
+  localStorage.clear();
   resetCatalog();
 });
 
@@ -113,6 +114,8 @@ describe("workspace tab identity", () => {
     await wrapper.get(".tab.active .tab-x").trigger("click");
     await vi.dynamicImportSettled();
     await flushPromises();
+    // query-2 的草稿非空，现在会弹挽留框；选择离开丢弃草稿并关闭标签
+    await wrapper.get("[data-action='close-leave']").trigger("click");
     await nextTick();
     await vi.dynamicImportSettled();
     await flushPromises();

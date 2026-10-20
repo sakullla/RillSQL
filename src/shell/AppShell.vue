@@ -5,9 +5,12 @@ import { objectIdentity, type CatalogObjectRef } from "../catalog/object-ref";
 import { objectLabel } from "../catalog/tree";
 import { catalogConnections } from "../catalog/store";
 import { listPaletteConnections } from "../connections";
+import { exportTasks, taskStatusText } from "../export/tasks";
+import type { TableTarget } from "../grid/target";
 import type { SavedDraft } from "../history/saved";
 import { deletedConnectionNotice, type OpenPlan } from "../history/plan";
-import { attachCloser } from "../query/runtime";
+import { attachCloser, startTabRun, tabRun } from "../query/runtime";
+import { rowLimit } from "../query/scope";
 import { parseHash } from "../router";
 import { chooseLeave, chooseStay, closePrompt, installCloseCoordinator, uninstallCloseCoordinator } from "./close-guard";
 import ActivityRail from "./ActivityRail.vue";
@@ -15,8 +18,8 @@ import CommandPalette from "./CommandPalette.vue";
 import { shellCommands, type PaletteItem } from "./commands";
 import { syncProductIdentity } from "./identity";
 import { loadSettings, saveSettings, type ShellSettings } from "./settings";
-import { createSession, STRUCTURE_PLACEHOLDER } from "./session";
-import type { ConnectionStatus } from "./status-text";
+import { createSession, restoreSession, SESSION_KEY, snapshotSession, STRUCTURE_PLACEHOLDER } from "./session";
+import type { ConnectionStatus, OperationActivity } from "./status-text";
 import ShortcutHelp from "./ShortcutHelp.vue";
 import Sidebar from "./Sidebar.vue";
 import StatusBar from "./StatusBar.vue";
@@ -29,11 +32,48 @@ const ConnectionsPage = defineAsyncComponent(() => import("../connections/Connec
 const HistoryPage = defineAsyncComponent(() => import("../history/HistoryPage.vue"));
 const SettingsView = defineAsyncComponent(() => import("./SettingsView.vue"));
 
-const session = createSession(typeof location === "undefined" ? "" : location.hash);
+function readStoredSession(): string | null {
+  try {
+    return localStorage.getItem(SESSION_KEY);
+  } catch {
+    return null;
+  }
+}
+
+const session = createSession(
+  typeof location === "undefined" ? "" : location.hash,
+  restoreSession(readStoredSession()),
+);
 const windowChrome = ref({ custom: false, maximized: false });
 const closeDialog = ref<HTMLDialogElement | null>(null);
 attachCloser((id) => session.closeTab(id));
 installCloseCoordinator(session);
+
+watch(
+  () => [session.tabs.value, session.activeId.value],
+  () => {
+    try {
+      localStorage.setItem(SESSION_KEY, JSON.stringify(snapshotSession(session.tabs.value, session.activeId.value)));
+    } catch {
+      // 配额满或隐私模式下持久化失败：静默放弃，不影响当前会话。
+    }
+  },
+  { deep: true },
+);
+
+const CLOSE_PROMPT_TEXT = {
+  window: {
+    cells: "有标签含未提交的单元格修改。留下则窗口和修改都还在；离开会丢掉这些修改，不会写入数据库。",
+    draft: "有标签的 SQL 草稿尚未执行。留下则窗口和草稿都还在；离开会丢掉这些草稿。",
+    both: "有标签含未提交的单元格修改和未执行的 SQL 草稿。留下则窗口和内容都还在；离开会丢掉这些修改与草稿，不会写入数据库。",
+  },
+  tab: {
+    cells: "这个标签有未提交的单元格修改。留下则标签和修改都还在；离开会丢掉这些修改，不会写入数据库。",
+    draft: "这个标签的 SQL 草稿尚未执行。留下则标签和草稿都还在；离开会丢掉这份草稿。",
+    both: "这个标签有未提交的单元格修改和未执行的 SQL 草稿。留下则标签和内容都还在；离开会丢掉这些修改与草稿，不会写入数据库。",
+  },
+} as const;
+const closePromptText = computed(() => CLOSE_PROMPT_TEXT[closePrompt.scope][closePrompt.reason]);
 
 watch(
   () => closePrompt.open,
@@ -98,6 +138,20 @@ const currentSavedDraft = computed<SavedDraft | null>(() => {
     databaseName: tab.database ?? "",
     engine: tab.engine ?? "",
   };
+});
+
+/** 状态栏右侧的进行中操作：导出任务优先，其次正在执行的查询；都没有则留空。 */
+const activity = computed<OperationActivity | null>(() => {
+  const exporting = exportTasks.find((task) => task.status === "running");
+  if (exporting) return { state: "running", text: taskStatusText(exporting) };
+  for (const tab of session.tabs.value) {
+    if (tab.kind !== "query") continue;
+    const run = tabRun(tab.id);
+    if (run && (run.status === "running" || run.status === "cancel-requested")) {
+      return { state: "running", text: `正在执行查询：${tab.connectionName ?? ""} / ${tab.database || "main"}` };
+    }
+  }
+  return null;
 });
 
 const commands = computed<PaletteItem[]>(() => [
@@ -215,6 +269,50 @@ function onQueryObject(object: CatalogObjectRef, sql: string) {
     needsTarget: false,
     notice: null,
   });
+}
+
+/** 外键值跳转：新开查询标签并立即执行这条只读 SELECT；连接忙时保留草稿并提示。 */
+async function onJumpReference(sql: string, ref: string, target: TableTarget | null): Promise<void> {
+  const known = target ? catalogConnections().find((item) => item.id === target.connectionId) ?? null : null;
+  if (!target || !known) {
+    session.openQueryDraft({
+      sql,
+      connectionId: null,
+      connectionName: null,
+      database: null,
+      engine: null,
+      status: null,
+      needsTarget: true,
+      notice: `跳转 ${ref} 需要先选择执行目标。`,
+    });
+    return;
+  }
+  const tabId = session.openQueryDraft({
+    sql,
+    connectionId: known.id,
+    connectionName: known.name,
+    database: target.database,
+    engine: known.engine,
+    status: asStatus(known.status),
+    needsTarget: false,
+    notice: null,
+  });
+  try {
+    await startTabRun({
+      tabId,
+      connectionId: known.id,
+      connectionName: known.name,
+      database: target.database,
+      engine: known.engine,
+      sql,
+      limit: rowLimit(loadSettings().pageSize),
+    });
+  } catch (err) {
+    const tab = session.tabs.value.find((item) => item.id === tabId);
+    if (tab) {
+      tab.targetNotice = `${typeof err === "string" ? err : err instanceof Error ? err.message : "自动执行失败"} SQL 草稿仍保留，可稍后再执行。`;
+    }
+  }
 }
 
 function onFocusedDatabase(connectionId: string, database: string) {
@@ -375,6 +473,7 @@ onBeforeUnmount(() => {
           @target="session.setQueryTarget"
           @table-view="session.setTableView"
           @copy-definition="onCopyDefinition"
+          @jump-reference="onJumpReference"
           @query-target="target => session.openQueryDraft({ ...target, sql: '', needsTarget: false, notice: null })"
         />
         <ConnectionsPage v-if="session.page.value === 'connections'" :sqlite-prompt="sqlitePrompt" @sqlite-consumed="sqlitePrompt = 0" @workspace="session.showPage('workspace')" @query-target="target => session.openQueryDraft({ ...target, sql: '', needsTarget: false, notice: null })" />
@@ -389,18 +488,14 @@ onBeforeUnmount(() => {
         <SettingsView v-else-if="session.page.value === 'settings'" :settings="settings" :data-dir="dataDir" @change="onSettings" @help="session.openHelp()" />
       </main>
     </div>
-    <StatusBar :tab="session.activeTab.value" :on-workspace="session.page.value === 'workspace'" />
+    <StatusBar :tab="session.activeTab.value" :on-workspace="session.page.value === 'workspace'" :activity="activity" />
     <CommandPalette :open="session.paletteOpen.value" :mode="session.paletteMode.value" :items="commands" @close="session.closePalette()" @run="runCommand" />
     <ShortcutHelp :open="session.helpOpen.value" @close="session.closeHelp()" />
     <dialog v-if="closePrompt.open" ref="closeDialog" class="modal" aria-labelledby="close-guard-title" @cancel.prevent="chooseStay">
       <div class="modal-head">
         <div class="modal-titles">
           <h2 id="close-guard-title">{{ closePrompt.scope === "window" ? "关闭窗口？" : "关闭这个标签？" }}</h2>
-          <p class="modal-sub">
-            {{ closePrompt.scope === "window"
-              ? "有标签含未提交的单元格修改。留下则窗口和修改都还在；离开会丢掉这些修改，不会写入数据库。"
-              : "这个标签有未提交的单元格修改。留下则标签和修改都还在；离开会丢掉这些修改，不会写入数据库。" }}
-          </p>
+          <p class="modal-sub">{{ closePromptText }}</p>
         </div>
       </div>
       <div class="modal-foot">

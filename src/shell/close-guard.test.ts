@@ -158,7 +158,6 @@ describe("close guard", () => {
     const { session, id } = shellWithDraft("select 1");
     let dirty = true;
     registerPending(id, () => dirty);
-    localStorage.setItem("rillsql.shell", JSON.stringify({ confirmClose: false }));
 
     session.closeTab(id);
     expect(closePrompt.open).toBe(true);
@@ -182,19 +181,50 @@ describe("close guard", () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
-  it("does not ask when the only change is an unexecuted SQL draft", () => {
+  it("asks before closing a tab with an unexecuted SQL draft and can keep it", () => {
     const { session, id } = shellWithDraft("select unfinished");
     registerPending(id, () => false);
     expect(tabHasPending(id)).toBe(false);
-    expect(anyPending()).toBe(false);
+    expect(anyPending()).toBe(true);
 
     session.closeTab(id);
+    expect(closePrompt.open).toBe(true);
+    expect(closePrompt.scope).toBe("tab");
+    expect(closePrompt.tabId).toBe(id);
+    expect(closePrompt.reason).toBe("draft");
+
+    chooseStay();
+    expect(closePrompt.open).toBe(false);
+    expect(session.tabs.value.map((tab) => tab.id)).toEqual([id]);
+    expect(session.tabs.value[0]?.draft).toBe("select unfinished");
+
+    session.closeTab(id);
+    expect(closePrompt.open).toBe(true);
+    chooseLeave();
     expect(closePrompt.open).toBe(false);
     expect(session.tabs.value).toHaveLength(0);
+    expect(anyPending()).toBe(false);
+  });
+
+  it("counts a non-empty SQL draft as pending for the window close", async () => {
+    const { session, id } = shellWithDraft("select keep me");
+    const event = { preventDefault: vi.fn() };
+
+    const system = handleCloseRequested(event);
+    await flushPromises();
+    expect(closePrompt.open).toBe(true);
+    expect(closePrompt.scope).toBe("window");
+    expect(closePrompt.reason).toBe("draft");
+
+    chooseStay();
+    await system;
+    expect(event.preventDefault).toHaveBeenCalledTimes(1);
+    expect(session.tabs.value.map((tab) => tab.id)).toEqual([id]);
+    expect(session.tabs.value[0]?.draft).toBe("select keep me");
   });
 
   it("drops the registration when the grid unregisters", () => {
-    const { session, id } = shellWithDraft("select 1");
+    const { session, id } = shellWithDraft("");
     const stop = registerPending(id, () => true);
     expect(tabHasPending(id)).toBe(true);
     stop();
@@ -275,7 +305,7 @@ describe("close guard", () => {
   });
 
   it("routes the title-bar close button through the same prompt", async () => {
-    const { id } = shellWithDraft("select draft only");
+    const { id } = shellWithDraft("");
     const title = mount(TitleBar, { props: { theme: "system", caption: true } });
 
     await title.get("[aria-label='关闭']").trigger("click");
@@ -316,7 +346,6 @@ describe("close guard", () => {
 
   it("installs the system close hook and does not ask twice after the title bar confirms", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
-    localStorage.setItem("rillsql.shell", JSON.stringify({ confirmClose: false }));
     registerPending("table:9", () => true);
     const wrapper = mount(AppShell);
     await flushPromises();
@@ -348,8 +377,7 @@ describe("close guard", () => {
     wrapper.unmount();
   });
 
-  it("keeps a tab in the shell dialog when cell edits are pending and confirmClose is off", async () => {
-    localStorage.setItem("rillsql.shell", JSON.stringify({ confirmClose: false }));
+  it("keeps a tab in the shell dialog when cell edits are pending", async () => {
     const wrapper = mount(AppShell);
     await flushPromises();
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "t", ctrlKey: true }));

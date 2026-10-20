@@ -3,7 +3,7 @@ import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref } from 
 import DefinitionView from "../catalog/DefinitionView.vue";
 import { catalogConnections } from "../catalog/store";
 import type { CatalogObjectRef } from "../catalog/object-ref";
-import { resolveTableTarget } from "../grid/target";
+import { resolveTableTarget, type TableTarget } from "../grid/target";
 import { targetDetail, targetKey, targetOptions, type TargetOption } from "../query/complete";
 import "../structure/structure.css";
 import Icon from "./Icon.vue";
@@ -29,6 +29,7 @@ const emit = defineEmits<{
   target: [id: string, target: QueryTarget];
   "table-view": [id: string, pane: "data" | "structure"];
   "copy-definition": [sql: string];
+  "jump-reference": [sql: string, ref: string, target: TableTarget | null];
 }>();
 
 const active = computed(() => props.tabs.find((tab) => tab.id === props.activeId) ?? null);
@@ -66,6 +67,12 @@ function onDraft(tabId: string, draft: string) {
 function onTarget(target: QueryTarget) {
   if (!active.value) return;
   emit("target", active.value.id, target);
+}
+
+/** 数据格子请求跳转引用行时，补上当前表的目标一起交给外壳执行。 */
+function onJumpReference(sql: string, ref: string) {
+  if (!active.value) return;
+  emit("jump-reference", sql, ref, tableTarget(active.value.id));
 }
 
 const menu = ref<{ tabId: string; x: number; y: number } | null>(null);
@@ -222,6 +229,7 @@ onBeforeUnmount(() => {
         :draft="active.draft"
         :page-size="pageSize"
         :target="tableTarget(active.id)"
+        @jump-reference="onJumpReference"
       />
       <StructurePane
         v-else
