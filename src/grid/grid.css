@@ -169,6 +169,7 @@
   color: var(--text-2);
 }
 .grid-foot b { color: var(--text); font-variant-numeric: tabular-nums; }
+.grid-foot .calc-stat { font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 /* ---------- 未保存更改 ---------- */
 .pending-bar {

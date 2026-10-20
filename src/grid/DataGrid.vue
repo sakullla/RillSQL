@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, reactive, ref, watch, type ComponentPublicInstance } from "vue";
 import ExportDialog from "../export/ExportDialog.vue";
 import ImportDialog from "../export/ImportDialog.vue";
 import { planExport, type ExportScope } from "../export/plan";
@@ -107,6 +107,9 @@ const displayRows = computed(() => {
 const commitFailures = computed(() => (session ? Array.from(session.failures, ([id, message]) => ({ id, message })) : []));
 const pendingVisible = computed(() => (session ? session.pendingCount > 0 || session.failures.size > 0 : false));
 const { viewport, range, onScroll, reveal } = useRowWindow(computed(() => displayRows.value.length), false);
+function setViewport(el: Element | ComponentPublicInstance | null): void {
+  viewport.value = el instanceof HTMLElement ? el : null;
+}
 watch(
   () => range.value.end,
   (end) => {
@@ -147,6 +150,30 @@ const selectedColumn = computed(() => columns.value.find((column) => column.name
 const selectedRaw = computed(() => (session?.selectedId && session.selectedColumn ? session.cellValue(session.selectedId, session.selectedColumn) : undefined));
 const selectedShown = computed(() => showCell(selectedRaw.value, { column: selectedColumn.value ?? undefined, opened: isRevealed(), resolved: session?.selectedId ? session.rowById(session.selectedId)?.resolved === true : false }));
 const selectedPoints = computed(() => (anchor.value && focusCellPoint.value ? rectangleSelection(displayRows.value, columns.value, anchor.value, focusCellPoint.value) : []));
+/** 选中区即时统计（对标 DBeaver 的 Calc 面板）：NULL、空字符串、预览信封和 Number() 解析不了的格子不进数值统计。 */
+const calcStats = computed(() => {
+  if (!session) return null;
+  const points = selectedPoints.value;
+  if (!points.length) return null;
+  let numeric = 0;
+  let sum = 0;
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (const point of points) {
+    const value = session.cellValue(point.row, point.column);
+    if (value === null || value === undefined || value === "") continue;
+    const meta = columns.value.find((item) => item.name === point.column);
+    if (isPreviewEnvelope(value, meta?.typeName)) continue;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) continue;
+    numeric += 1;
+    sum += parsed;
+    min = Math.min(min, parsed);
+    max = Math.max(max, parsed);
+  }
+  if (numeric === 0) return { cells: points.length, numeric, sum: null, avg: null, min: null, max: null };
+  return { cells: points.length, numeric, sum: statText(sum), avg: statText(sum / numeric), min: statText(min), max: statText(max) };
+});
 const previewRows = computed(() => session?.loaded.slice(0, 4).map((row) => ({ ...row.cells })) ?? []);
 const noKeyHint = computed(() => {
   if (!session) return "";
@@ -273,9 +300,10 @@ function cancelEdit() {
   if (edit) focusCell(edit.id, edit.column);
 }
 
-function focusEditor(el: HTMLInputElement | null) {
-  el?.focus();
-  el?.select();
+function focusEditor(el: Element | ComponentPublicInstance | null) {
+  if (!(el instanceof HTMLInputElement)) return;
+  el.focus();
+  el.select();
 }
 
 /** 编辑中：Enter 保存，Esc 取消，Tab 保存并移到下一个单元格。 */
@@ -341,6 +369,11 @@ function shown(id: string, column: string) {
 
 function isPicked(row: string, column: string): boolean {
   return selectedPoints.value.some((point) => point.row === row && point.column === column);
+}
+
+/** 统计数值最多留 4 位小数并去掉尾零，避免浮点噪音。 */
+function statText(value: number): string {
+  return String(Number(value.toFixed(4)));
 }
 
 function columnStyle(name: string): Record<string, string> | undefined {
@@ -490,6 +523,7 @@ async function copySelected(asSql: boolean) {
 }
 
 function revealKey(): string {
+  if (!session) return "";
   return `${session.selectedId}:${session.selectedColumn}`;
 }
 
@@ -498,7 +532,7 @@ function isRevealed(): boolean {
 }
 
 async function fullValue() {
-  if (!session.selectedId || !session.selectedColumn) return;
+  if (!session || !session.selectedId || !session.selectedColumn) return;
   const error = await ensureFull(session.selectedId, session.selectedColumn);
   if (error) {
     copyMessage.value = error;
@@ -508,7 +542,7 @@ async function fullValue() {
 }
 
 function editDisabled(): boolean {
-  if (!session.selectedId || !session.selectedColumn) return true;
+  if (!session || !session.selectedId || !session.selectedColumn) return true;
   return !session.canDeleteRow(session.selectedId);
 }
 
@@ -538,6 +572,13 @@ const insertTarget = computed<InsertTarget | null>(() => {
     columns: session.store.schema.columns,
   };
 });
+
+function onImportDone(message: string): void {
+  importMessage.value = message;
+  importOpen.value = false;
+  if (!session) return;
+  void session.readWindow(0, Math.max(session.pageSize, session.loaded.length || session.pageSize), true);
+}
 
 async function startExport(payload: { scope: ExportScope; acknowledged: boolean; path: string; csv: CsvOptions; format: ExportFormat }) {
   if (!session?.target) return;
@@ -642,7 +683,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
     <p v-if="importMessage" class="hint export-message" role="status">{{ importMessage }}</p>
     <p v-if="exportMessage" class="hint export-message" role="status">{{ exportMessage }}</p>
     <p v-if="session.error" class="grid-alert" role="alert">读取失败：{{ session.error }}。这不是无匹配结果。筛选条件仍保留。 <button class="btn sm" type="button" :disabled="retrying" @click="retryRead">重试</button></p>
-    <div ref="viewport" class="grid-scroll" @scroll.passive="onScroll" @keydown="onGridKeydown">
+    <div :ref="setViewport" class="grid-scroll" @scroll.passive="onScroll" @keydown="onGridKeydown">
       <table class="grid-table">
         <thead>
           <tr>
@@ -694,6 +735,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
       <button class="btn sm" type="button" @click="session.count()">统计匹配行数</button>
       <span v-if="session.counted !== null" role="status">共 {{ session.counted }} 行匹配</span>
       <span v-else class="muted">匹配行数未统计</span>
+      <span v-if="calcStats" class="calc-stat" role="status">已选 {{ calcStats.cells }} 格 · 数值 {{ calcStats.numeric }} 个<template v-if="calcStats.numeric > 0"> · 总和 {{ calcStats.sum }} · 平均 {{ calcStats.avg }} · 最小 {{ calcStats.min }} · 最大 {{ calcStats.max }}</template></span>
     </footer>
     <div v-if="pendingVisible" class="pending-bar" role="region" aria-label="未保存的更改">
       <span class="badge warn">{{ session.pendingCount }} 处更改未保存</span>
@@ -766,7 +808,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
       :schema="session.store.schema"
       :tables="importTables"
       @close="importOpen = false"
-      @done="(message) => { importMessage.value = message; importOpen = false; void session.readWindow(0, Math.max(session.pageSize, session.loaded.length || session.pageSize), true); }"
+      @done="onImportDone"
     />
     <div v-if="menu" class="cell-menu" role="menu" :style="{ left: `${menu.x}px`, top: `${menu.y}px` }" @contextmenu.prevent>
       <button type="button" role="menuitem" @click="copySelection(); menu = null">复制</button>

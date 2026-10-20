@@ -239,6 +239,42 @@ describe("grid column width, clipboard and paging", () => {
     wrapper.unmount();
   });
 
+  it("shows live sum, count, avg, min and max for the selected range", async () => {
+    const store = customersFixture(4);
+    invoke.mockImplementation(async (command: string, args: { request?: { offset?: number; limit?: number } }) => {
+      if (command === "grid_describe") return store.schema;
+      if (command === "grid_page") {
+        const offset = args.request?.offset ?? 0;
+        const limit = args.request?.limit ?? 100;
+        const rows = store.rows.slice(offset, offset + limit).map((row) => ({
+          id: row.id,
+          cells: { ...row.cells },
+          located: row.located,
+          locatorColumns: row.locator?.columns ?? [],
+          locatorValues: row.locator?.values ?? [],
+        }));
+        return { rows, truncated: offset + limit < store.rows.length, sql: "SELECT customers" };
+      }
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:customers-calc", draft: "", pageSize: 10, target } });
+    await flushPromises();
+    expect(wrapper.find(".calc-stat").exists()).toBe(false);
+    await wrapper.get("[data-cell='1:id']").trigger("pointerdown");
+    await wrapper.get("[data-cell='2:note']").trigger("pointerenter");
+    window.dispatchEvent(new PointerEvent("pointerup"));
+    await nextTick();
+    // 两行 × 四列共 8 格；数值只有 id 1、2，其余是文本、u1@example.com、NULL 和空字符串。
+    expect(wrapper.get(".calc-stat").attributes("role")).toBe("status");
+    expect(wrapper.get(".calc-stat").text()).toBe("已选 8 格 · 数值 2 个 · 总和 3 · 平均 1.5 · 最小 1 · 最大 2");
+    await wrapper.get("[data-cell='1:name']").trigger("pointerdown");
+    await wrapper.get("[data-cell='2:name']").trigger("pointerenter");
+    window.dispatchEvent(new PointerEvent("pointerup"));
+    await nextTick();
+    expect(wrapper.get(".calc-stat").text()).toBe("已选 2 格 · 数值 0 个");
+    wrapper.unmount();
+  });
+
   it("reads the full value before editing a located preview", async () => {
     invoke.mockImplementation(async (command: string, args: { request?: { filters?: { column: string }[] } }) => {
       if (command === "grid_describe") return schema();
