@@ -85,11 +85,196 @@ export function metadataNote(connection: CatalogConnection | null, database: str
   };
 }
 
+export type StatementClause = "select" | "from" | "join" | "where" | "group" | "order" | "having" | "set" | "values";
+
+export interface StatementContext {
+  clause: StatementClause | null;
+  aliases: Map<string, CompletionObject>;
+}
+
+/** 光标前当前语句的子句与 FROM/JOIN 表别名；解析不到子句时 clause 为 null，调用方回退原有行为。 */
+export function statementContext(statementBefore: string, objects: readonly CompletionObject[]): StatementContext {
+  const tokens = statementTokens(statementBefore);
+  return { clause: clauseFromTokens(tokens), aliases: aliasesFromTokens(tokens, objects) };
+}
+
+interface StatementToken {
+  text: string;
+  upper: string;
+  word: boolean;
+}
+
+const CLAUSE_BY_WORD: Record<string, StatementClause> = {
+  SELECT: "select",
+  FROM: "from",
+  JOIN: "join",
+  WHERE: "where",
+  GROUP: "group",
+  ORDER: "order",
+  HAVING: "having",
+  SET: "set",
+  VALUES: "values",
+};
+
+const BARE_ALIAS_BLOCKERS = new Set<string>(SQL_KEYWORDS);
+
+const FIELD_FIRST_CLAUSES = new Set<StatementClause | null>(["select", "where", "group", "order", "having"]);
+
+/** 只留单词与点号、逗号；跳过注释、字符串和引号标识符，避免字面量里的关键字干扰判断。 */
+function statementTokens(sql: string): StatementToken[] {
+  const tokens: StatementToken[] = [];
+  let i = 0;
+  while (i < sql.length) {
+    const ch = sql[i] ?? "";
+    if (/\s/.test(ch)) {
+      i += 1;
+      continue;
+    }
+    if (sql.startsWith("--", i)) {
+      i = eolAt(sql, i);
+      continue;
+    }
+    if (sql.startsWith("/*", i)) {
+      const close = sql.indexOf("*/", i + 2);
+      i = close < 0 ? sql.length : close + 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      i = quotedEndAt(sql, i);
+      continue;
+    }
+    if (/[A-Za-z_]/.test(ch)) {
+      let end = i + 1;
+      while (end < sql.length && /[A-Za-z0-9_]/.test(sql[end] ?? "")) end += 1;
+      const text = sql.slice(i, end);
+      tokens.push({ text, upper: text.toUpperCase(), word: true });
+      i = end;
+      continue;
+    }
+    if (ch === "." || ch === ",") tokens.push({ text: ch, upper: ch, word: false });
+    i += 1;
+  }
+  return tokens;
+}
+
+/** 从尾部向前找最近的子句关键字，就是光标所在的子句。 */
+function clauseFromTokens(tokens: readonly StatementToken[]): StatementClause | null {
+  for (let index = tokens.length - 1; index >= 0; index -= 1) {
+    const token = tokens[index]!;
+    if (!token.word) continue;
+    const clause = CLAUSE_BY_WORD[token.upper];
+    if (clause) return clause;
+  }
+  return null;
+}
+
+function aliasesFromTokens(tokens: readonly StatementToken[], objects: readonly CompletionObject[]): Map<string, CompletionObject> {
+  const aliases = new Map<string, CompletionObject>();
+  let i = 0;
+  while (i < tokens.length) {
+    const token = tokens[i]!;
+    if (!token.word || (token.upper !== "FROM" && token.upper !== "JOIN")) {
+      i += 1;
+      continue;
+    }
+    i += 1;
+    for (;;) {
+      const reference = readTableReference(tokens, i);
+      if (!reference) break;
+      i = reference.next;
+      if (reference.alias) {
+        const object = matchCompletionObject(reference, objects);
+        if (object) aliases.set(reference.alias.toLowerCase(), object);
+      }
+      const separator = tokens[i];
+      if (separator && !separator.word && separator.text === ",") {
+        i += 1;
+        continue;
+      }
+      break;
+    }
+  }
+  return aliases;
+}
+
+interface TableReference {
+  schema: string | null;
+  name: string;
+  alias: string | null;
+  next: number;
+}
+
+/** FROM/JOIN 后的一个表引用：schema.name 或 name，带可选 AS 别名或裸别名（标识符且非关键字）。 */
+function readTableReference(tokens: readonly StatementToken[], start: number): TableReference | null {
+  const first = tokens[start];
+  if (!first || !first.word) return null;
+  let i = start + 1;
+  let schema: string | null = null;
+  let name = first.text;
+  const dot = tokens[i];
+  if (dot && !dot.word && dot.text === ".") {
+    const second = tokens[i + 1];
+    if (second && second.word) {
+      schema = first.text;
+      name = second.text;
+      i += 2;
+    }
+  }
+  let alias: string | null = null;
+  const after = tokens[i];
+  if (after && after.word) {
+    if (after.upper === "AS") {
+      const named = tokens[i + 1];
+      if (named && named.word) {
+        alias = named.text;
+        i += 2;
+      }
+    } else if (!BARE_ALIAS_BLOCKERS.has(after.upper)) {
+      alias = after.text;
+      i += 1;
+    }
+  }
+  return { schema, name, alias, next: i };
+}
+
+function matchCompletionObject(reference: TableReference, objects: readonly CompletionObject[]): CompletionObject | undefined {
+  const wanted = reference.schema ? `${reference.schema}.${reference.name}` : reference.name;
+  const byLabel = objects.find((object) => object.label.toLowerCase() === wanted.toLowerCase());
+  if (byLabel) return byLabel;
+  const schema = reference.schema ? reference.schema.toLowerCase() : null;
+  const name = reference.name.toLowerCase();
+  if (schema != null) {
+    return objects.find((object) => object.schema.toLowerCase() === schema && object.name.toLowerCase() === name);
+  }
+  return objects.find((object) => object.name.toLowerCase() === name);
+}
+
+function eolAt(sql: string, index: number): number {
+  let i = index;
+  while (i < sql.length && sql[i] !== "\n" && sql[i] !== "\r") i += 1;
+  return i;
+}
+
+function quotedEndAt(sql: string, start: number): number {
+  const quote = sql[start] ?? "";
+  let i = start + 1;
+  while (i < sql.length) {
+    if (sql[i] === quote && sql[i + 1] === quote) {
+      i += 2;
+      continue;
+    }
+    if (sql[i] === quote) return i + 1;
+    i += 1;
+  }
+  return sql.length;
+}
+
 export function completionPlan(input: {
   prefix: string;
   connection: CatalogConnection | null;
   database: string | null;
   columns?: readonly CachedColumn[];
+  context?: { clause: StatementClause | null };
 }): {
   items: CompletionItem[];
   note: string;
@@ -97,27 +282,36 @@ export function completionPlan(input: {
 } {
   const meta = metadataNote(input.connection, input.database);
   const prefix = input.prefix.toLowerCase();
-  const items: CompletionItem[] = [];
+  const clause = input.context?.clause ?? null;
+  const objectItems: CompletionItem[] = [];
   if (!meta.keywordsOnly) {
     for (const object of meta.objects) {
       const matched = !prefix || object.label.toLowerCase().startsWith(prefix) || object.name.toLowerCase().startsWith(prefix);
       if (!matched) continue;
-      items.push({ label: object.label, kind: object.kind, detail: KIND_LABEL[object.kind] });
-      if (items.length >= 20) break;
-    }
-    for (const column of input.columns ?? []) {
-      if (items.length >= 40) break;
-      if (prefix && !column.label.toLowerCase().startsWith(prefix)) continue;
-      items.push({ label: column.label, kind: "column", detail: column.detail });
+      objectItems.push({ label: object.label, kind: object.kind, detail: KIND_LABEL[object.kind] });
+      if (objectItems.length >= 20) break;
     }
   }
+  const columnItems: CompletionItem[] = [];
+  if (!meta.keywordsOnly && clause !== "from" && clause !== "join") {
+    for (const column of input.columns ?? []) {
+      if (columnItems.length >= 40) break;
+      if (prefix && !column.label.toLowerCase().startsWith(prefix)) continue;
+      columnItems.push({ label: column.label, kind: "column", detail: column.detail });
+    }
+  }
+  const keywordItems: CompletionItem[] = [];
   for (const keyword of SQL_KEYWORDS) {
+    if (keywordItems.length >= 40) break;
     if (prefix && !keyword.toLowerCase().startsWith(prefix)) continue;
     if (keyword.toLowerCase() === prefix) continue;
-    items.push({ label: keyword, kind: "keyword", detail: "关键字" });
-    if (items.length >= 40) break;
+    keywordItems.push({ label: keyword, kind: "keyword", detail: "关键字" });
   }
-  return { items, note: meta.note, keywordsOnly: meta.keywordsOnly };
+  let ordered: CompletionItem[];
+  if (clause === "from" || clause === "join") ordered = [...objectItems, ...keywordItems];
+  else if (FIELD_FIRST_CLAUSES.has(clause)) ordered = [...columnItems, ...objectItems, ...keywordItems];
+  else ordered = [...objectItems, ...columnItems, ...keywordItems];
+  return { items: ordered.slice(0, 40), note: meta.note, keywordsOnly: meta.keywordsOnly };
 }
 
 export interface TargetOption {

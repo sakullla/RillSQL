@@ -28,8 +28,12 @@ export type Qualifier =
   | { kind: "ambiguous"; name: string }
   | { kind: "object"; object: CompletionObject; columnPrefix: string };
 
-/** 点号后只认已经读到的那一个对象。还在输入对象名时保持原来的对象补全。 */
-export function qualifierFor(prefix: string, objects: readonly CompletionObject[]): Qualifier {
+/** 点号后只认已经读到的那一个对象。还在输入对象名时保持原来的对象补全。别名表存语句里 FROM/JOIN 起的别名。 */
+export function qualifierFor(
+  prefix: string,
+  objects: readonly CompletionObject[],
+  aliases?: ReadonlyMap<string, CompletionObject>,
+): Qualifier {
   const dot = prefix.lastIndexOf(".");
   if (dot < 0) return { kind: "plain" };
   const qualifier = prefix.slice(0, dot);
@@ -51,6 +55,8 @@ export function qualifierFor(prefix: string, objects: readonly CompletionObject[
     const byName = objects.filter((object) => object.name.toLowerCase() === wanted);
     if (byName.length > 1) return { kind: "ambiguous", name: qualifier };
     if (byName.length === 1) return { kind: "object", object: byName[0]!, columnPrefix };
+    const aliased = aliases?.get(wanted);
+    if (aliased) return { kind: "object", object: aliased, columnPrefix };
   }
   return { kind: "unknown", name: qualifier };
 }

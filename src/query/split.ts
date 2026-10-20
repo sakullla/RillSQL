@@ -197,6 +197,93 @@ export function openDelimiter(sql: string, engine?: string): OpenDelimiter | nul
   return null;
 }
 
+export interface SyntaxFinding {
+  kind: "quote" | "block-comment" | "dollar" | "paren";
+  start: number;
+  message: string;
+}
+
+/** 编辑器实时标记用：沿用 openDelimiter 的扫描与跳过规则，记录未闭合结构的起点；括号只报首个未闭合处。 */
+export function inspectSyntax(sql: string, engine = "postgres"): SyntaxFinding[] {
+  const hash = hashComments(engine);
+  const findings: SyntaxFinding[] = [];
+  const parens: number[] = [];
+  let i = 0;
+  let quote: string | null = null;
+  let quoteAt = 0;
+  let dollar: string | null = null;
+  let dollarAt = 0;
+  let comment = false;
+  let commentAt = 0;
+  while (i < sql.length) {
+    if (dollar !== null) {
+      const marker = `$${dollar}$`;
+      if (sql.startsWith(marker, i)) {
+        i += marker.length;
+        dollar = null;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    if (quote !== null) {
+      if (sql[i] === quote && sql[i + 1] === quote) {
+        i += 2;
+        continue;
+      }
+      if (sql[i] === quote) quote = null;
+      i += 1;
+      continue;
+    }
+    if (comment) {
+      if (sql[i] === "*" && sql[i + 1] === "/") {
+        comment = false;
+        i += 2;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    if (hash && sql[i] === "#") {
+      i = eolAt(sql, i + 1);
+      continue;
+    }
+    if (sql.startsWith("--", i)) {
+      i = eolAt(sql, i + 2);
+      continue;
+    }
+    if (sql.startsWith("/*", i)) {
+      comment = true;
+      commentAt = i;
+      i += 2;
+      continue;
+    }
+    if (sql[i] === "'" || sql[i] === '"' || sql[i] === "`") {
+      quote = sql[i] ?? null;
+      quoteAt = i;
+      i += 1;
+      continue;
+    }
+    if (sql[i] === "$") {
+      const tag = dollarTag(sql, i);
+      if (tag !== null) {
+        dollar = tag;
+        dollarAt = i;
+        i += tag.length + 2;
+        continue;
+      }
+    }
+    if (sql[i] === "(") parens.push(i);
+    else if (sql[i] === ")" && parens.length) parens.pop();
+    i += 1;
+  }
+  if (quote !== null) findings.push({ kind: "quote", start: quoteAt, message: "引号没有闭合。" });
+  if (comment) findings.push({ kind: "block-comment", start: commentAt, message: "块注释没有闭合。" });
+  if (dollar !== null) findings.push({ kind: "dollar", start: dollarAt, message: "dollar-quote 没有闭合。" });
+  if (parens.length) findings.push({ kind: "paren", start: parens[0]!, message: "括号没有闭合。" });
+  return findings.sort((a, b) => a.start - b.start);
+}
+
 function scanStatement(sql: string, start: number, delimiter: string, hash: boolean): { piece: Piece | null; next: number; refusal: string | null } {
   let i = start;
   let quote: string | null = null;

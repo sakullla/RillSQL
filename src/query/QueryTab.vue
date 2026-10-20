@@ -3,6 +3,7 @@ import { autocompletion, startCompletion, type CompletionContext } from "@codemi
 import { toggleComment } from "@codemirror/commands";
 import { sql } from "@codemirror/lang-sql";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
+import { linter } from "@codemirror/lint";
 import { tags } from "@lezer/highlight";
 import { EditorState, Prec, StateEffect, StateField } from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, keymap } from "@codemirror/view";
@@ -21,14 +22,17 @@ import { loadSettings } from "../shell/settings";
 import { CONNECTION_STATUS_TEXT, type ConnectionStatus } from "../shell/status-text";
 import type { QueryTarget } from "../shell/session";
 import { ambiguousFieldNote, cachedColumns, fieldFailureNote, loadFields, qualifierFor, unknownFieldNote } from "./columns";
-import { completionPlan, connectionById, metadataNote, targetDetail, targetKey, targetOptions, type TargetOption } from "./complete";
+import { completionPlan, connectionById, metadataNote, statementContext, targetDetail, targetKey, targetOptions, type TargetOption } from "./complete";
 import { resolveEditor } from "./editor";
+import { fileOpenPlan, readSqlFile, saveSqlFile, sqlFileProblem, sqlSaveName, SQL_FILE_ACCEPT } from "./file-io";
 import { formatDocument } from "./format";
+import { sqlLintDiagnostics } from "./lint";
 import { analyzeSql, explainSql, hierarchicalSql, planStatement, presentPlan } from "./plan";
 import { gridModel } from "./rows";
 import { continueTabRun, requestCancel, startTabRun, tabRun, whenSettled } from "./runtime";
 import { QUERY_EDITOR_KEYS, rowLimit, sqlToRun } from "./scope";
 import { inspectSql, locateStatement, openDelimiter } from "./split";
+import { findVariables, substituteVariables, type VariableInput } from "./variables";
 
 const props = defineProps<{
   tabId: string;
@@ -77,6 +81,11 @@ const planKind = ref<"none" | "estimate" | "analyze">("none");
 const analyzePrompt = ref(false);
 const analyzeStatement = ref("");
 const analyzeAt = ref<{ from: number; to: number } | null>(null);
+/* 执行前变量面板：发现占位符时暂停执行，等用户填值或取消。 */
+const variablePrompt = ref(false);
+const variableFields = ref<VariableInput[]>([]);
+const variableValues = ref<Record<string, string>>({});
+const pendingExecute = ref<{ sql: string; from: number; to: number } | null>(null);
 const resultIndex = ref(0);
 const detailsOpen = ref(false);
 const historyRoot = ref<HTMLElement | null>(null);
@@ -93,6 +102,10 @@ const savedNameValue = ref("");
 const savedWriteError = ref("");
 const savedWriteMessage = ref("");
 const savedBusy = ref(false);
+const openFileInput = ref<HTMLInputElement | null>(null);
+const saveFileBusy = ref(false);
+const saveFileMessage = ref("");
+const saveFileError = ref("");
 let view: EditorView | undefined;
 let alive = true;
 
@@ -254,7 +267,11 @@ async function sqlCompletion(context: CompletionContext) {
   const ready = Boolean(props.connectionId && connection);
   const database = ready ? props.database : null;
   const meta = metadataNote(ready ? connection : null, database);
-  const qualified = qualifierFor(word.text, meta.objects);
+  /* 语句上下文：取当前语句起点到光标的前缀，解析子句与 FROM/JOIN 别名；定位不到语句时回退原有行为。 */
+  const located = locateStatement(context.state.doc.toString(), context.pos, props.engine ?? undefined);
+  const statementPiece = located.piece && !located.refusal ? located.piece : null;
+  const parsed = statementPiece ? statementContext(before.slice(statementPiece.start), meta.objects) : null;
+  const qualified = qualifierFor(word.text, meta.objects, parsed?.aliases);
   if (qualified.kind === "plain") {
     fieldNote.value = "";
     const columns = ready && connection && database != null && connection.status === "connected" && !meta.keywordsOnly
@@ -265,6 +282,7 @@ async function sqlCompletion(context: CompletionContext) {
       connection: ready ? connection : null,
       database,
       columns,
+      context: parsed ? { clause: parsed.clause } : undefined,
     });
     return {
       from: word.from,
@@ -336,6 +354,8 @@ function editorExtensions() {
       ]),
     ),
     autocompletion({ override: [sqlCompletion] }),
+    /* 结构 lint：只画内联波浪线（悬停显示消息），不加 gutter、不开诊断面板；每次调用读当前引擎。 */
+    linter((editor) => sqlLintDiagnostics(editor.state.doc.toString(), props.engine ?? "postgres")),
     EditorView.updateListener.of((update) => {
       if (!alive) return;
       if (update.selectionSet || update.docChanged) {
@@ -590,7 +610,23 @@ async function execute(scope: "auto" | "current" | "script") {
     actionError.value = inspected.notices.join("") || "只有空白或注释，没有发送。";
     return;
   }
-  markSendRange(editor, picked.from, picked.to);
+  const variables = findVariables(picked.sql);
+  if (variables.length) {
+    openVariablePrompt(variables, picked.sql, picked.from, picked.to);
+    return;
+  }
+  await sendExecute(picked.sql, picked.from, picked.to);
+}
+
+/** 标记原文的 send-range、发送 sqlText 并等待结束；变量代换后的发送与直发共用这一段。 */
+async function sendExecute(sqlText: string, from: number, to: number) {
+  mountEditor();
+  const editor = view;
+  if (!editor) {
+    actionError.value = "编辑器还没有准备好，请再试一次。";
+    return;
+  }
+  markSendRange(editor, from, to);
   submitting.value = true;
   menuOpen.value = false;
   runMenuOpen.value = false;
@@ -603,8 +639,8 @@ async function execute(scope: "auto" | "current" | "script") {
       connectionId: props.connectionId!,
       connectionName: props.connectionName!,
       database: props.database!,
-      engine,
-      sql: picked.sql,
+      engine: props.engine ?? "postgres",
+      sql: sqlText,
       limit: rowLimit(loadSettings().pageSize),
     });
   } catch (err) {
@@ -612,6 +648,36 @@ async function execute(scope: "auto" | "current" | "script") {
   } finally {
     submitting.value = false;
   }
+}
+
+/** 发现占位符时暂停执行并弹面板：submitting 维持已占用的状态，面板打开期间沿用既有阻塞，避免重入。 */
+function openVariablePrompt(variables: VariableInput[], sqlText: string, from: number, to: number) {
+  variablePrompt.value = true;
+  variableFields.value = variables;
+  variableValues.value = Object.fromEntries(variables.map((item) => [item.key, ""]));
+  pendingExecute.value = { sql: sqlText, from, to };
+  submitting.value = true;
+}
+
+/** 取消：不执行、不报错，只关面板并释放阻塞。 */
+function cancelVariables() {
+  variablePrompt.value = false;
+  variableFields.value = [];
+  variableValues.value = {};
+  pendingExecute.value = null;
+  submitting.value = false;
+}
+
+/** 继续：用代换后的 SQL 走原有执行流程。编辑器草稿与 send-range 标记保持原文范围，历史记录记代换后的 SQL。 */
+async function confirmVariables() {
+  const pending = pendingExecute.value;
+  if (!pending) return;
+  variablePrompt.value = false;
+  const sqlText = substituteVariables(pending.sql, variableValues.value);
+  variableFields.value = [];
+  variableValues.value = {};
+  pendingExecute.value = null;
+  await sendExecute(sqlText, pending.from, pending.to);
 }
 
 function continueRead() {
@@ -735,6 +801,51 @@ function chooseHistory(entry: HistoryEntry) {
 function chooseSaved(entry: SavedQuery) {
   savedOpen.value = false;
   applyOpenPlan(openSaved(entry, knownIds.value));
+}
+
+/** 从磁盘打开 .sql 文件：只把文件内容写进当前标签的草稿，不会执行，也不新开标签。 */
+function pickSqlFile() {
+  actionError.value = "";
+  openFileInput.value?.click();
+}
+
+async function onSqlFile(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file) return;
+  const problem = sqlFileProblem(file);
+  if (problem) {
+    actionError.value = problem;
+    return;
+  }
+  try {
+    applyOpenPlan(fileOpenPlan(await readSqlFile(file)));
+  } catch (err) {
+    actionError.value = `文件没有读出来：${failureMessage(err, "读取失败")}`;
+  }
+}
+
+/** 把草稿保存成磁盘 .sql 文件：原生先弹保存对话框再写文件，浏览器直接下载。 */
+async function saveSqlToFile() {
+  if (saveFileBusy.value) return;
+  saveFileMessage.value = "";
+  saveFileError.value = "";
+  mountEditor();
+  const editor = view;
+  if (!editor) {
+    saveFileError.value = "编辑器还没有准备好，请再试一次。";
+    return;
+  }
+  saveFileBusy.value = true;
+  try {
+    const outcome = await saveSqlFile({ defaultPath: sqlSaveName(), contents: editor.state.doc.toString() });
+    if (outcome.status === "cancelled") return;
+    if (outcome.status === "saved") saveFileMessage.value = outcome.message;
+    else saveFileError.value = outcome.message;
+  } finally {
+    saveFileBusy.value = false;
+  }
 }
 
 async function saveNamedQuery() {
@@ -961,6 +1072,8 @@ onBeforeUnmount(() => {
       <span v-if="connectionStatus" class="conn-state" :class="`st-${connectionStatus}`"><i></i>{{ CONNECTION_STATUS_TEXT[connectionStatus] }}</span>
       <span class="grow"></span>
       <button class="btn" type="button" data-action="format" title="格式化选中的 SQL；没有选中时格式化全部" @click="formatEditor">格式化</button>
+      <button class="btn" type="button" data-action="open-file" title="从 .sql 或 .txt 文件载入 SQL；只写进当前标签的草稿，不会执行" :disabled="running || submitting" @click="pickSqlFile">打开</button>
+      <input ref="openFileInput" class="hidden-file-input" type="file" data-action="open-file-input" :accept="SQL_FILE_ACCEPT" aria-label="打开 SQL 文件" @change="onSqlFile" />
       <div ref="historyRoot" class="q-pop">
         <button class="btn" type="button" data-action="history" title="从查询历史载入 SQL；只写进草稿，不会执行" :disabled="running || submitting" @click="toggleHistoryPanel">历史</button>
         <div v-if="historyOpen" class="pop-menu history-menu" role="menu" aria-label="查询历史" @keydown="onHistoryKey">
@@ -989,6 +1102,11 @@ onBeforeUnmount(() => {
             <p v-if="savedWriteError" class="pop-error" role="alert">{{ savedWriteError }}</p>
             <button class="btn sm primary" type="submit" data-action="save-named-query" :disabled="savedBusy">保存</button>
           </form>
+          <div class="pop-form">
+            <button class="btn sm" type="button" data-action="save-file" :disabled="saveFileBusy" @click="saveSqlToFile">{{ saveFileBusy ? "正在保存…" : "保存到文件" }}</button>
+            <p v-if="saveFileMessage" role="status">{{ saveFileMessage }}</p>
+            <p v-if="saveFileError" class="pop-error" role="alert">{{ saveFileError }}</p>
+          </div>
           <div class="menu-head">已保存的查询 · 打开只写进草稿，不会执行</div>
           <p v-if="savedError" class="pop-error" role="alert">保存的查询没有读出来：{{ savedError }}<button class="btn sm" type="button" data-action="retry-saved" @click="loadSaved">重试</button></p>
           <p v-else-if="savedLoading" class="pop-empty">正在读取保存的查询…</p>
@@ -1039,6 +1157,27 @@ onBeforeUnmount(() => {
       <div class="analyze-actions">
         <button class="btn" type="button" data-action="analyze-cancel" @click="cancelAnalyze">取消</button>
         <button class="btn" type="button" data-action="analyze-confirm" @click="confirmAnalyze">继续</button>
+      </div>
+    </div>
+    <div
+      v-if="variablePrompt"
+      class="analyze-dialog variable-dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-label="填写执行变量"
+      data-action="variables-dialog"
+      @keydown.escape.prevent="cancelVariables"
+    >
+      <p>发送前把占位符代换成字面量：留空按 NULL 发送，其余按字符串字面量发送（单引号会转义）。只改本次发送的文本，编辑器草稿保持原文。仅「执行」支持变量；「执行计划」与「实际执行并分析」不做代换。</p>
+      <div class="variable-fields">
+        <label v-for="field in variableFields" :key="field.key">
+          <span class="mono">{{ field.label }}</span>
+          <input v-model="variableValues[field.key]" type="text" :data-variable-key="field.key" :aria-label="`变量 ${field.label} 的值`" placeholder="留空发送 NULL" />
+        </label>
+      </div>
+      <div class="analyze-actions">
+        <button class="btn" type="button" data-action="variables-cancel" @click="cancelVariables">取消</button>
+        <button class="btn primary" type="button" data-action="variables-confirm" @click="confirmVariables">继续</button>
       </div>
     </div>
     <p v-if="notice" class="q-banner">{{ notice }}</p>
@@ -1163,6 +1302,7 @@ onBeforeUnmount(() => {
 .run-item:hover { background: var(--hover); }
 .run-item small { font-size: var(--fs-xs); color: var(--text-3); }
 .q-pop { position: relative; display: inline-flex; }
+.hidden-file-input { display: none; }
 .pop-menu { position: absolute; z-index: 30; top: calc(100% + var(--sp-1)); right: 0; min-width: 300px; max-width: 440px; max-height: 360px; overflow: auto; padding: var(--sp-1); background: var(--panel); border: 1px solid var(--line-2); border-radius: var(--r-md); box-shadow: var(--shadow); animation: pop-in var(--dur-fast) var(--ease-out); }
 .pop-item { display: flex; align-items: flex-start; gap: var(--sp-2); width: 100%; padding: var(--sp-2); border-radius: var(--r); text-align: left; }
 .pop-item:hover { background: var(--hover); }
@@ -1224,6 +1364,9 @@ onBeforeUnmount(() => {
 .analyze-dialog { margin: var(--sp-2) var(--sp-3); padding: var(--sp-3); border: 1px solid var(--line-2); border-radius: var(--r-md); background: var(--panel); }
 .analyze-dialog p { margin: 0 0 var(--sp-2); }
 .analyze-actions { display: flex; gap: var(--sp-2); }
+.variable-fields { display: flex; flex-direction: column; gap: var(--sp-2); margin: 0 0 var(--sp-2); }
+.variable-fields label { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-xs); color: var(--text-2); }
+.variable-fields input { font-family: var(--mono); }
 .query-pane :deep(.cm-send-range) { background: color-mix(in srgb, var(--accent) 22%, transparent); border-radius: 2px; }
 .plan-view table { border-collapse: collapse; font-family: var(--mono); font-size: var(--fs-xs); }
 .plan-view th, .plan-view td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; vertical-align: top; }
