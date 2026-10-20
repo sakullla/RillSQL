@@ -239,6 +239,14 @@ describe("explorer tree", () => {
     expect(wrapper.emitted("open-object")?.[1]?.[1]).toBe("structure");
     expect(wrapper.emitted("open-object")?.[1]?.[2]).toBe("columns");
 
+    // 键盘可达：Enter 与双击等价，不要求用户先找到鼠标
+    const keyboardRow = wrapper.get("[data-object=orders]");
+    expect(keyboardRow.attributes("tabindex")).toBe("0");
+    const before = wrapper.emitted("open-object")?.length ?? 0;
+    await keyboardRow.trigger("keydown", { key: "Enter" });
+    expect(wrapper.emitted("open-object")?.length).toBe(before + 1);
+    expect(wrapper.emitted("open-object")?.at(-1)?.[0]).toMatchObject({ name: "orders" });
+
     const view = wrapper.get("[data-object=v_note_summary]");
     view.element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 12, clientY: 18 }));
     await nextTick();

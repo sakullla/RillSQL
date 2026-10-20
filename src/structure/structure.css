@@ -123,13 +123,13 @@
 
 /* ---------- 执行前确认 / 执行结果 ---------- */
 .overlay {
-  position: absolute;
+  position: fixed;
   inset: 0;
   background: var(--overlay);
   backdrop-filter: blur(2px);
   display: grid;
   place-items: center;
-  z-index: 20;
+  z-index: var(--z-dialog);
   padding: var(--sp-4);
   animation: fade-in var(--dur-fast) var(--ease);
 }

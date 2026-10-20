@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { nextTick } from "vue";
 import { catalogFixture } from "../catalog/fixtures";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
+import { registerPending, resetCloseGuard } from "../shell/close-guard";
 import { shellCommands } from "../shell/commands";
 import { createSession } from "../shell/session";
 import { SHORTCUTS } from "../shell/shortcuts";
@@ -13,6 +14,7 @@ import type { RunDto } from "./api";
 import { clearColumnCache, qualifierFor } from "./columns";
 import { completionPlan, metadataNote } from "./complete";
 import { resolveEditor } from "./editor";
+import { resetExecuteRequest } from "./execute-request";
 import QueryTab from "./QueryTab.vue";
 import { adoptRun, attachCloser, connectionBusy, guardClose, requestCancel, resetQueryRuntime, startTabRun, tabRun } from "./runtime";
 import { QUERY_EDITOR_KEYS, sqlToRun } from "./scope";
@@ -47,6 +49,8 @@ afterEach(() => {
   resetQueryRuntime();
   resetCatalog();
   clearColumnCache();
+  resetCloseGuard();
+  resetExecuteRequest();
   invoke.mockReset();
 });
 
@@ -505,6 +509,36 @@ describe("query editing", () => {
     await flushPromises();
     expect(calls).toEqual(["SELECT 2;"]);
     expect(wrapper.find("[data-action='run']").exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("refuses to re-run while result edits are pending", async () => {
+    replaceCatalog(catalogFixture());
+    const calls: string[] = [];
+    invoke.mockImplementation(async (command: string, args?: { request?: { sql: string } }) => {
+      if (command === "query_start") calls.push(args?.request?.sql ?? "");
+      return runDto({ status: "done", statements: [] });
+    });
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-pending-result",
+        draft: "SELECT 1;",
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+        executeRequest: 0,
+      },
+    });
+    await flushPromises();
+    const stop = registerPending("query-pending-result", () => true);
+    await wrapper.setProps({ executeRequest: 1 });
+    await flushPromises();
+    expect(calls).toEqual([]);
+    expect(wrapper.get("[role='alert']").text()).toContain("未提交的更改");
+    stop();
     wrapper.unmount();
   });
 

@@ -113,6 +113,7 @@ function showGroups(): boolean {
       <div
         class="tree-row tr-group"
         role="treeitem"
+        tabindex="0"
         data-level="group"
         :data-kind-group="kind"
         :data-schema="schema.name"
@@ -160,6 +161,7 @@ function showGroups(): boolean {
           class="tree-row"
           :class="{ dropped: object.stale, active: selectedKey === objectKey(object) }"
           role="treeitem"
+          tabindex="0"
           data-level="object"
           :data-object="object.name"
           :data-key="objectKey(object)"

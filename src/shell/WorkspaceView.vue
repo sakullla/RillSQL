@@ -26,6 +26,7 @@ const emit = defineEmits<{
   structure: [];
   "query-target": [target: QueryTarget];
   draft: [id: string, draft: string];
+  executed: [id: string, sql: string];
   target: [id: string, target: QueryTarget];
   "table-view": [id: string, pane: "data" | "structure"];
   "copy-definition": [sql: string];
@@ -215,6 +216,7 @@ onBeforeUnmount(() => {
       :notice="active.targetNotice"
       :execute-request="executeRequest"
       @update:draft="onDraft"
+      @executed="(id, sql) => emit('executed', id, sql)"
       @target="onTarget"
     />
     <div v-else-if="active && active.kind === 'table'" class="table-workspace">

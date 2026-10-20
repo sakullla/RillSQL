@@ -28,6 +28,10 @@ const emit = defineEmits<{
 }>();
 const session = props.target ? reactive(new LiveTable(props.target, props.pageSize ?? loadSettings().pageSize)) : null;
 if (session) void session.open();
+/** 设置页的预览上限对网格立即生效，避免“改了没反应”。 */
+function previewBytes(): number {
+  return Math.max(1, loadSettings().previewKB) * 1024;
+}
 let releasePending: (() => void) | null = null;
 function releaseCellPending(): void {
   releasePending?.();
@@ -47,6 +51,7 @@ onBeforeUnmount(() => {
   releaseCellPending();
   stopDrag();
   resizeUp?.();
+  clearTimeout(discardTimer);
 });
 const rootEl = ref<HTMLElement | null>(null);
 const filterColumn = ref("");
@@ -67,6 +72,9 @@ const importOpen = ref(false);
 const exportMessage = ref("");
 const importMessage = ref("");
 const commitOpen = ref(false);
+const commitError = ref("");
+const discardArmed = ref(false);
+let discardTimer: ReturnType<typeof setTimeout> | undefined;
 const editing = ref<{ id: string; column: string; draft: string; isNull: boolean } | null>(null);
 const editError = ref("");
 const copyMessage = ref("");
@@ -159,7 +167,7 @@ watch(
 
 const selectedColumn = computed(() => columns.value.find((column) => column.name === session?.selectedColumn) ?? null);
 const selectedRaw = computed(() => (session?.selectedId && session.selectedColumn ? session.cellValue(session.selectedId, session.selectedColumn) : undefined));
-const selectedShown = computed(() => showCell(selectedRaw.value, { column: selectedColumn.value ?? undefined, opened: isRevealed(), resolved: session?.selectedId ? session.rowById(session.selectedId)?.resolved === true : false }));
+const selectedShown = computed(() => showCell(selectedRaw.value, { column: selectedColumn.value ?? undefined, previewBytes: previewBytes(), opened: isRevealed(), resolved: session?.selectedId ? session.rowById(session.selectedId)?.resolved === true : false }));
 const selectedPoints = computed(() => (anchor.value && focusCellPoint.value ? rectangleSelection(displayRows.value, columns.value, anchor.value, focusCellPoint.value) : []));
 /** 选中区即时统计（对标 DBeaver 的 Calc 面板）：NULL、空字符串、预览信封和 Number() 解析不了的格子不进数值统计。 */
 const calcStats = computed(() => {
@@ -256,8 +264,39 @@ function moveSelection(delta: number) {
   index = (index + delta + total) % total;
   const row = rows[Math.floor(index / cols.length)]!;
   const column = cols[index % cols.length]!;
+  anchor.value = { row: row.id, column: column.name };
+  focusCellPoint.value = { row: row.id, column: column.name };
   session.select(row.id, column.name);
   focusCell(row.id, column.name);
+}
+
+/** Shift+方向键：保留起点，扩展矩形选择。 */
+function extendSelection(rowStep: number, columnStep: number) {
+  if (!session) return;
+  const rows = displayRows.value;
+  const cols = columns.value;
+  const current = focusCellPoint.value;
+  if (!rows.length || !cols.length || !current) return;
+  const rowIndex = rows.findIndex((row) => row.id === current.row);
+  const columnIndex = cols.findIndex((column) => column.name === current.column);
+  if (rowIndex < 0 || columnIndex < 0) return;
+  const nextRow = rows[Math.min(rows.length - 1, Math.max(0, rowIndex + rowStep))]!;
+  const nextColumn = cols[Math.min(cols.length - 1, Math.max(0, columnIndex + columnStep))]!;
+  anchor.value ??= { row: current.row, column: current.column };
+  focusCellPoint.value = { row: nextRow.id, column: nextColumn.name };
+  session.select(nextRow.id, nextColumn.name);
+  focusCell(nextRow.id, nextColumn.name);
+}
+
+/** Ctrl+A：选中当前已读取的全部单元格，复制与统计都按矩形走。 */
+function selectAllCells() {
+  if (!session) return;
+  const rows = displayRows.value;
+  const cols = columns.value;
+  if (!rows.length || !cols.length) return;
+  anchor.value = { row: rows[0]!.id, column: cols[0]!.name };
+  focusCellPoint.value = { row: rows[rows.length - 1]!.id, column: cols[cols.length - 1]!.name };
+  session.select(rows[0]!.id, cols[0]!.name);
 }
 
 async function beginEdit(id: string, column: string) {
@@ -342,17 +381,51 @@ function onEditorKeydown(event: KeyboardEvent) {
   }
 }
 
-/** 未编辑时：Enter 开始编辑选中单元格，Tab 移动选中。 */
+/** 未编辑时：Enter 开始编辑，Tab/方向键移动，快捷键与帮助里写的一致。 */
 function onGridKeydown(event: KeyboardEvent) {
   if (editing.value) return;
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {
+  const mod = event.ctrlKey || event.metaKey;
+  const key = event.key.toLowerCase();
+  if (mod && event.shiftKey && key === "c") {
+    event.preventDefault();
+    void copySelected(true);
+    return;
+  }
+  if (mod && key === "c") {
     event.preventDefault();
     void copySelection();
     return;
   }
+  if (mod && key === "a") {
+    event.preventDefault();
+    selectAllCells();
+    return;
+  }
+  if (mod && key === "s") {
+    event.preventDefault();
+    if (session?.pendingCount) {
+      commitError.value = "";
+      commitOpen.value = true;
+    }
+    return;
+  }
+  if (event.key === "Delete") {
+    event.preventDefault();
+    const error = session?.deleteSelected();
+    if (error) {
+      editError.value = error;
+    } else {
+      editError.value = "";
+      receipt.value = null;
+    }
+    return;
+  }
   if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) {
     event.preventDefault();
-    moveSelection(event.key === "ArrowUp" ? -columns.value.length : event.key === "ArrowDown" ? columns.value.length : event.key === "ArrowLeft" ? -1 : 1);
+    const rowStep = event.key === "ArrowUp" ? -1 : event.key === "ArrowDown" ? 1 : 0;
+    const columnStep = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : 0;
+    if (event.shiftKey) extendSelection(rowStep, columnStep);
+    else moveSelection(rowStep * columns.value.length + columnStep);
   } else if (event.key === "Enter" || event.key === "F2") {
     if (session?.selectedId && session.selectedColumn) {
       event.preventDefault();
@@ -361,28 +434,55 @@ function onGridKeydown(event: KeyboardEvent) {
   } else if (event.key === "Tab") {
     event.preventDefault();
     moveSelection(event.shiftKey ? -1 : 1);
+  } else if (event.key === "Escape") {
+    (document.activeElement as HTMLElement | null)?.blur();
   }
 }
 
 function discardAll() {
-  session?.discard();
+  if (!session) return;
+  if (!discardArmed.value) {
+    discardArmed.value = true;
+    clearTimeout(discardTimer);
+    discardTimer = setTimeout(() => {
+      discardArmed.value = false;
+    }, 4000);
+    return;
+  }
+  clearTimeout(discardTimer);
+  discardArmed.value = false;
+  commitError.value = "";
+  session.discard();
   receipt.value = null;
 }
 
 async function commitChangesNow() {
   if (!session) return;
+  commitError.value = "";
   const report = await session.commit();
-  commitOpen.value = false;
-  if (!report) return;
+  if (!report) {
+    // 提交没有返回报告时，面板不能关掉：否则看起来像成功了。
+    commitError.value = session.commitError || "提交没有完成。未成功的更改仍保留在待提交列表中。";
+    return;
+  }
   const saved = report.applied.length;
-  const failed = report.failed ? 1 : 0;
-  receipt.value = failed ? `${saved} 处已保存，${failed} 处失败。失败的更改仍保留在待提交列表中，原因已标出。` : `${saved} 处已保存。`;
+  if (report.failed) {
+    commitError.value = `已保存 ${saved} 处，1 处失败。失败的更改仍保留在待提交列表中，原因已标出。`;
+    return;
+  }
+  commitOpen.value = false;
+  receipt.value = `${saved} 处已保存。`;
+}
+
+function openCommit() {
+  commitError.value = "";
+  commitOpen.value = true;
 }
 
 function shown(id: string, column: string) {
   const value = session?.cellValue(id, column);
   const meta = columns.value.find((item) => item.name === column);
-  return showCell(value, { column: meta, opened: revealed.has(`${id}:${column}`), resolved: session?.rowById(id)?.resolved === true });
+  return showCell(value, { column: meta, previewBytes: previewBytes(), opened: revealed.has(`${id}:${column}`), resolved: session?.rowById(id)?.resolved === true });
 }
 
 function isPicked(row: string, column: string): boolean {
@@ -795,9 +895,15 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
     </footer>
     <div v-if="pendingVisible" class="pending-bar" role="region" aria-label="未保存的更改">
       <span class="badge warn">{{ session.pendingCount }} 处更改未保存</span>
-      <button class="btn sm" type="button" @click="commitOpen = true">查看</button>
-      <button class="btn sm danger" type="button" @click="discardAll">放弃</button>
-      <button class="btn sm primary" type="button" :disabled="!session.pendingCount" @click="commitOpen = true">提交</button>
+      <button class="btn sm" type="button" @click="openCommit">查看</button>
+      <button
+        class="btn sm danger"
+        type="button"
+        :data-armed="discardArmed ? 'true' : undefined"
+        :title="discardArmed ? '再次点击，确认放弃全部未保存的更改' : '放弃全部未保存的更改'"
+        @click="discardAll"
+      >{{ discardArmed ? "确认放弃" : "放弃" }}</button>
+      <button class="btn sm primary" type="button" :disabled="!session.pendingCount" @click="openCommit">提交</button>
       <span v-if="receipt" class="receipt">{{ receipt }}</span>
       <p v-for="failure in commitFailures" :key="failure.id" class="commit-failure" role="alert">{{ failure.message }}</p>
     </div>
@@ -831,6 +937,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
           </div>
         </header>
         <div class="body">
+          <p v-if="commitError" class="sheet-error" role="alert" data-commit-error>{{ commitError }}</p>
           <ol class="sql-list">
             <li v-for="step in session.preview()" :key="step.id">
               <strong>{{ step.label }}</strong>

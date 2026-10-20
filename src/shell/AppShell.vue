@@ -9,7 +9,7 @@ import { exportTasks, taskStatusText } from "../export/tasks";
 import type { TableTarget } from "../grid/target";
 import type { SavedDraft } from "../history/saved";
 import { deletedConnectionNotice, type OpenPlan } from "../history/plan";
-import { attachCloser, startTabRun, tabRun } from "../query/runtime";
+import { attachCloser, requestCancel, startTabRun, tabRun } from "../query/runtime";
 import { rowLimit } from "../query/scope";
 import { parseHash } from "../router";
 import { chooseLeave, chooseStay, closePrompt, installCloseCoordinator, uninstallCloseCoordinator } from "./close-guard";
@@ -18,7 +18,7 @@ import CommandPalette from "./CommandPalette.vue";
 import { shellCommands, type PaletteItem } from "./commands";
 import { syncProductIdentity } from "./identity";
 import { loadSettings, saveSettings, type ShellSettings } from "./settings";
-import { createSession, restoreSession, SESSION_KEY, snapshotSession, STRUCTURE_PLACEHOLDER } from "./session";
+import { createSession, restoreSession, SESSION_KEY, snapshotSession, STRUCTURE_PLACEHOLDER, type ShellTab } from "./session";
 import type { ConnectionStatus, OperationActivity } from "./status-text";
 import ShortcutHelp from "./ShortcutHelp.vue";
 import Sidebar from "./Sidebar.vue";
@@ -140,19 +140,34 @@ const currentSavedDraft = computed<SavedDraft | null>(() => {
   };
 });
 
+const runningQueries = computed(() => {
+  const found: { tab: ShellTab; run: NonNullable<ReturnType<typeof tabRun>> }[] = [];
+  for (const tab of session.tabs.value) {
+    if (tab.kind !== "query") continue;
+    const run = tabRun(tab.id);
+    if (run && (run.status === "running" || run.status === "cancel-requested")) found.push({ tab, run });
+  }
+  return found;
+});
+
 /** 状态栏右侧的进行中操作：导出任务优先，其次正在执行的查询；都没有则留空。 */
 const activity = computed<OperationActivity | null>(() => {
   const exporting = exportTasks.find((task) => task.status === "running");
   if (exporting) return { state: "running", text: taskStatusText(exporting) };
-  for (const tab of session.tabs.value) {
-    if (tab.kind !== "query") continue;
-    const run = tabRun(tab.id);
-    if (run && (run.status === "running" || run.status === "cancel-requested")) {
-      return { state: "running", text: `正在执行查询：${tab.connectionName ?? ""} / ${tab.database || "main"}` };
-    }
+  const first = runningQueries.value[0];
+  if (first) {
+    const more = runningQueries.value.length > 1 ? `（共 ${runningQueries.value.length} 个）` : "";
+    return { state: "running", text: `正在执行查询：${first.tab.connectionName ?? ""} / ${first.tab.database || "main"}${more}` };
   }
   return null;
 });
+
+const activeRun = computed(() => runningQueries.value[0] ?? null);
+
+function onStatusCancel() {
+  const current = activeRun.value;
+  if (current) void requestCancel(current.tab.id);
+}
 
 const commands = computed<PaletteItem[]>(() => [
   ...listPaletteTables().map((table) => ({
@@ -192,6 +207,12 @@ const commands = computed<PaletteItem[]>(() => [
       session.showPage("history");
     },
     executeQuery: () => {
+      const active = session.activeTab.value;
+      if (active?.kind !== "query") {
+        const existing = session.tabs.value.find((tab) => tab.kind === "query");
+        if (existing) session.activateTab(existing.id);
+        else session.openQuery();
+      }
       executeRequest.value += 1;
     },
   }),
@@ -454,6 +475,7 @@ onBeforeUnmount(() => {
         @open-definition="onOpenDefinition"
         @query-object="onQueryObject"
         @focused-database="onFocusedDatabase"
+        @new-connection="session.showPage('connections')"
       />
       <main id="main" tabindex="-1">
         <WorkspaceView
@@ -470,6 +492,7 @@ onBeforeUnmount(() => {
           @palette="session.openPalette('all')"
           @structure="session.openStructure(STRUCTURE_PLACEHOLDER)"
           @draft="session.setDraft"
+          @executed="session.setExecuted"
           @target="session.setQueryTarget"
           @table-view="session.setTableView"
           @copy-definition="onCopyDefinition"
@@ -488,7 +511,14 @@ onBeforeUnmount(() => {
         <SettingsView v-else-if="session.page.value === 'settings'" :settings="settings" :data-dir="dataDir" @change="onSettings" @help="session.openHelp()" />
       </main>
     </div>
-    <StatusBar :tab="session.activeTab.value" :on-workspace="session.page.value === 'workspace'" :activity="activity" />
+    <StatusBar
+      :tab="session.activeTab.value"
+      :on-workspace="session.page.value === 'workspace'"
+      :activity="activity"
+      :running-tab-id="activeRun?.tab.id ?? null"
+      :cancel-requested="activeRun?.run.status === 'cancel-requested'"
+      @cancel="onStatusCancel"
+    />
     <CommandPalette :open="session.paletteOpen.value" :mode="session.paletteMode.value" :items="commands" @close="session.closePalette()" @run="runCommand" />
     <ShortcutHelp :open="session.helpOpen.value" @close="session.closeHelp()" />
     <dialog v-if="closePrompt.open" ref="closeDialog" class="modal" aria-labelledby="close-guard-title" @cancel.prevent="chooseStay">

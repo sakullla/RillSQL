@@ -25,6 +25,8 @@ export class LiveTable {
   truncated = false;
   counted: number | null = null;
   error: string | null = null;
+  /** 写入失败单独保存：不能复用到“读取失败”的提示里。 */
+  commitError: string | null = null;
   sql = "";
   edits = new Map<string, Record<string, Cell>>();
   inserts: InsertDraft[] = [];
@@ -314,6 +316,7 @@ export class LiveTable {
   }
 
   async commit(): Promise<CommitReport | null> {
+    this.commitError = null;
     try {
       const report = await gridCommit(this.target, this.payload());
       const appliedIds = new Set(report.applied.map((step) => step.id));
@@ -327,7 +330,7 @@ export class LiveTable {
       await this.readWindow(0, Math.max(this.pageSize, this.loaded.length || this.pageSize), true);
       return report;
     } catch (error) {
-      this.error = errorText(error);
+      this.commitError = errorText(error);
       return null;
     }
   }

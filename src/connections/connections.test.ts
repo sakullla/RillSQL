@@ -1,5 +1,5 @@
 import { flushPromises, mount } from "@vue/test-utils";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
 import type { CatalogConnection } from "../catalog/types";
 import type { ConnectionApi, EnvTagInput, TestReport } from "./api";
@@ -359,6 +359,33 @@ describe("connections page", () => {
     await wrapper.get("[data-action=confirm-delete]").trigger("click");
     await flushPromises();
     expect(wrapper.text()).toContain("数据库和其中的数据不受影响");
+    wrapper.unmount();
+  });
+
+  it("shows save failures inside the edit dialog and connects on double click", async () => {
+    const open = vi.fn(async () => ({ report: { status: "ok" as const, stages: [] }, connected: true, foreignKeys: null }));
+    const api: ConnectionApi = {
+      ...pageApi(() => ({ status: "ok", stages: [] })),
+      save: async () => {
+        throw new Error("连接名称已存在");
+      },
+      open,
+    };
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api } });
+    await flushPromises();
+    await wrapper.get("[data-action=conn-new]").trigger("click");
+    await wrapper.get("[data-field=host]").setValue("db.example.test");
+    await wrapper.get("[data-field=username]").setValue("reader");
+    await wrapper.get("[data-action=cf-save]").trigger("click");
+    await flushPromises();
+    // 错误必须出现在对话框里，而不是被遮罩挡在页面标题下
+    expect(wrapper.get("[data-dialog-error]").text()).toContain("连接名称已存在");
+    expect(wrapper.find("[data-action=cf-save]").exists()).toBe(true);
+
+    await wrapper.get(".modal-head .icon-btn").trigger("click");
+    await wrapper.get("article.conn-card").trigger("dblclick");
+    await flushPromises();
+    expect(open).toHaveBeenCalledWith("atlas", expect.objectContaining({ password: "" }));
     wrapper.unmount();
   });
 

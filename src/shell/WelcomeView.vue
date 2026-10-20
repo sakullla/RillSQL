@@ -17,6 +17,10 @@ const saved = computed(() => catalogConnections().length > 0);
         </div>
         <button class="btn primary" type="button" aria-label="新建查询" @click="emit('new-query')"><Icon name="plus" />新建查询</button>
       </header>
+      <div v-if="saved" class="welcome-quick">
+        <button class="btn" type="button" @click="emit('connections')"><Icon name="plus" />新建连接</button>
+        <button class="btn" type="button" @click="emit('sqlite')"><Icon name="file" />打开 SQLite 文件</button>
+      </div>
       <template v-else>
         <header class="desk-heading">
           <div>
@@ -34,6 +38,7 @@ const saved = computed(() => catalogConnections().length > 0);
 </template>
 
 <style scoped>
+.welcome-quick { display: flex; gap: var(--sp-2); flex-wrap: wrap; margin-top: var(--sp-4); }
 /* .btn 的固定高度会裁切带说明的入口；实心仍只来自 .primary。 */
 .desk-action.btn {
   height: auto;

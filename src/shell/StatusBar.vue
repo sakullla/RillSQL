@@ -7,7 +7,15 @@ import Icon from "./Icon.vue";
 import type { ShellTab } from "./session";
 import { CONNECTION_STATUS_TEXT, OPERATION_STATE_TEXT, type OperationActivity, type OperationState } from "./status-text";
 
-const props = defineProps<{ tab: ShellTab | null; onWorkspace: boolean; activity?: OperationActivity | null }>();
+const props = defineProps<{
+  tab: ShellTab | null;
+  onWorkspace: boolean;
+  activity?: OperationActivity | null;
+  /** 正在执行的查询标签；有值时状态栏提供取消入口，不必先找回原标签。 */
+  runningTabId?: string | null;
+  cancelRequested?: boolean;
+}>();
+const emit = defineEmits<{ cancel: [] }>();
 
 const tableEnvironment = computed(() => {
   const tab = props.tab;
@@ -59,6 +67,15 @@ const ACTIVITY_TONE: Record<OperationState, "info" | "ok" | "err" | "warn"> = {
         <span class="badge" :class="ACTIVITY_TONE[activity.state]">{{ OPERATION_STATE_TEXT[activity.state] }}</span>
         <span class="sb-activity-text">{{ activity.text }}</span>
       </span>
+      <button
+        v-if="runningTabId"
+        class="btn sm sb-cancel"
+        type="button"
+        data-action="status-cancel"
+        :disabled="cancelRequested"
+        :title="cancelRequested ? '已经请求取消，等待数据库确认' : '取消正在执行的查询'"
+        @click="emit('cancel')"
+      >{{ cancelRequested ? "正在取消…" : "取消查询" }}</button>
     </div>
   </footer>
 </template>

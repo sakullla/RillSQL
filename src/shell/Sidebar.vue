@@ -11,6 +11,7 @@ const emit = defineEmits<{
   "open-definition": [object: CatalogObjectRef];
   "query-object": [object: CatalogObjectRef, sql: string];
   "focused-database": [connectionId: string, database: string];
+  "new-connection": [];
 }>();
 
 function forwardOpen(object: CatalogObjectRef, pane: "data" | "structure", section?: "columns" | "drop") {
@@ -36,9 +37,9 @@ function onPointerDown(event: PointerEvent) {
   event.preventDefault();
   stopResize?.();
   const startX = event.clientX;
-  const startWidth = (event.currentTarget as HTMLElement).previousElementSibling?.getBoundingClientRect().width ?? 268;
+  const startWidth = (event.currentTarget as HTMLElement).previousElementSibling?.getBoundingClientRect().width ?? 234;
   const move = (ev: PointerEvent) => {
-    emit("resize", Math.min(460, Math.max(200, startWidth + ev.clientX - startX)));
+    emit("resize", Math.min(480, Math.max(200, startWidth + ev.clientX - startX)));
   };
   const stop = () => {
     window.removeEventListener("pointermove", move);
@@ -62,17 +63,19 @@ function onPointerDown(event: PointerEvent) {
       <Icon name="search" />
       <input v-model="filter" type="search" placeholder="筛选表" aria-label="筛选表" />
     </label>
-    <ExplorerTree :filter="filter" @open-object="forwardOpen" @open-definition="forwardDefinition" @query-object="forwardQuery" @focused-database="forwardFocus" />
+    <ExplorerTree :filter="filter" @open-object="forwardOpen" @open-definition="forwardDefinition" @query-object="forwardQuery" @focused-database="forwardFocus" @new-connection="emit('new-connection')" />
   </aside>
   <div
     class="sb-resizer"
     role="separator"
     aria-orientation="vertical"
     aria-label="调整资源管理器宽度"
+    title="拖动调整宽度，双击恢复默认"
     tabindex="0"
-    :aria-valuenow="width" :aria-valuemin="200" :aria-valuemax="460"
+    :aria-valuenow="width" :aria-valuemin="200" :aria-valuemax="480"
     @keydown.left.prevent="emit('resize', Math.max(200, props.width - 20))"
-    @keydown.right.prevent="emit('resize', Math.min(460, props.width + 20))"
+    @keydown.right.prevent="emit('resize', Math.min(480, props.width + 20))"
+    @dblclick="emit('resize', 234)"
     @pointerdown="onPointerDown"
   ></div>
 </template>

@@ -14,7 +14,7 @@ export const closePrompt = reactive({
 });
 
 let tabCloser: (id: string) => void = () => undefined;
-let openTabs: () => readonly { id: string; kind: string; draft: string }[] = () => [];
+let openTabs: () => readonly { id: string; kind: string; draft: string; lastExecutedSql?: string | null }[] = () => [];
 let windowDecision: Promise<boolean> | null = null;
 let resolveWindow: ((leave: boolean) => void) | null = null;
 /**
@@ -49,10 +49,10 @@ export function tabHasPending(tabId: string): boolean {
   return false;
 }
 
-/** Unexecuted SQL drafts are pending too: the text would be lost on close. */
+/** 只有还没成功执行过的 SQL 才算会被丢掉的草稿；刚跑过的语句可从历史找回。 */
 function draftPending(tabId: string): boolean {
   const tab = openTabs().find((item) => item.id === tabId);
-  return tab?.kind === "query" && tab.draft.trim() !== "";
+  return tab?.kind === "query" && tab.draft.trim() !== "" && tab.draft !== tab.lastExecutedSql;
 }
 
 function anyCellsPending(): boolean {
@@ -64,7 +64,7 @@ function anyCellsPending(): boolean {
 
 function anyDraftPending(): boolean {
   for (const tab of openTabs()) {
-    if (tab.kind === "query" && tab.draft.trim() !== "") return true;
+    if (tab.kind === "query" && tab.draft.trim() !== "" && tab.draft !== tab.lastExecutedSql) return true;
   }
   return false;
 }
@@ -80,7 +80,7 @@ export function anyPending(): boolean {
 }
 
 export function installCloseCoordinator(session: {
-  tabs: { value: readonly { id: string; kind: string; draft: string }[] };
+  tabs: { value: readonly { id: string; kind: string; draft: string; lastExecutedSql?: string | null }[] };
   closeTab: (id: string) => void;
   setCloseGuard: (guard: ((id: string) => boolean) | null) => void;
 }): void {

@@ -13,7 +13,7 @@ import { gridDescribe } from "./api";
 import { rectangleSelection, selectionTsv, type CellPoint } from "./clipboard";
 import { viewLoadedRows } from "./data";
 import { useRowWindow } from "./virtual";
-import { copyCellText, showCell } from "./display";
+import { copyCellText, copySqlValue, showCell } from "./display";
 import "./grid.css";
 import { loadSettings } from "../shell/settings";
 import { locateResultRows, provedEditableColumns, readSingleTable, resolveEditableTable, ResultEditSession, type TableHit } from "./result-edit";
@@ -45,6 +45,9 @@ const editSession = ref<ResultEditSession | null>(null);
 const editing = ref<{ id: string; column: string; draft: string; isNull: boolean } | null>(null);
 const editError = ref("");
 const commitOpen = ref(false);
+const commitError = ref("");
+const discardArmed = ref(false);
+let discardTimer: ReturnType<typeof setTimeout> | undefined;
 const receipt = ref<string | null>(null);
 const revealed = reactive(new Set<string>());
 const widths = reactive<Record<string, number>>({});
@@ -74,13 +77,28 @@ function tableHits(): TableHit[] {
   return hits;
 }
 
+/** 设置页的预览上限对结果网格也立即生效。 */
+function previewBytes(): number {
+  return Math.max(1, loadSettings().previewKB) * 1024;
+}
+
 watch(
-  () => [props.statement, props.connectionId, props.database, props.schema, props.engine, props.rows, props.columns] as const,
+  // 不监听 rows 引用：轮询会反复换行对象，旧实现因此每 400ms 重建一次编辑会话。
+  () => [props.statement, props.connectionId, props.database, props.schema, props.engine, tabRun(props.tabId)?.id, tabRun(props.tabId)?.status, props.rows.length] as const,
   () => { void resolveEdit(); },
   { immediate: true },
 );
 
 async function resolveEdit() {
+  // 已经暂存的修改不能被重新解析冲掉；QueryTab 也会在重跑前拦住有暂存的结果。
+  if (editSession.value && editSession.value.pendingCount > 0) return;
+  const run = tabRun(props.tabId);
+  if (run && (run.status === "running" || run.status === "cancel-requested")) {
+    editSession.value = null;
+    insertTarget.value = null;
+    reason.value = "查询还在执行，结束后才能修改结果。";
+    return;
+  }
   const current = ++generation;
   editing.value = null;
   commitOpen.value = false;
@@ -167,7 +185,7 @@ const visibleRows = computed(() => view.value.rows.slice(range.value.start, rang
   deleted: editSession.value?.deletes.includes(row.id) ?? false,
   failed: !!(editSession.value?.failures.get(`u:${row.id}`) || editSession.value?.failures.get(`d:${row.id}`)),
   failure: [editSession.value?.failures.get(`u:${row.id}`), editSession.value?.failures.get(`d:${row.id}`)].filter(Boolean).join("\n"),
-  cells: props.columns.map((column) => showCell(row.cells[column.name] ?? null, { column, opened: revealed.has(`${row.id}:${column.name}`), resolved: true })),
+  cells: props.columns.map((column) => showCell(row.cells[column.name] ?? null, { column, previewBytes: previewBytes(), opened: revealed.has(`${row.id}:${column.name}`), resolved: true })),
 })));
 const selectedPoints = computed(() => (anchor.value && focusPoint.value ? rectangleSelection(view.value.rows, props.columns, anchor.value, focusPoint.value) : []));
 watch([find, sort], reset);
@@ -221,6 +239,7 @@ onBeforeUnmount(() => {
   releaseCellPending();
   stopDrag();
   resizeUp?.();
+  clearTimeout(discardTimer);
 });
 
 function inspect(rowId: string, index: number) {
@@ -265,8 +284,38 @@ function moveSelection(delta: number) {
   const row = rows[Math.floor(index / cols.length)]!;
   const columnIndex = index % cols.length;
   const column = cols[columnIndex]!;
+  anchor.value = { row: row.id, column: column.name };
+  focusPoint.value = { row: row.id, column: column.name };
   inspect(row.id, columnIndex);
   focusCell(row.id, column.name);
+}
+
+/** Shift+方向键：保留起点，扩展矩形选择。 */
+function extendSelection(rowStep: number, columnStep: number) {
+  const rows = view.value.rows;
+  const cols = props.columns;
+  const current = focusPoint.value ?? (selected.value ? { row: selected.value.row, column: selected.value.column } : null);
+  if (!rows.length || !cols.length || !current) return;
+  const rowIndex = rows.findIndex((row) => row.id === current.row);
+  const columnIndex = cols.findIndex((column) => column.name === current.column);
+  if (rowIndex < 0 || columnIndex < 0) return;
+  const nextRow = rows[Math.min(rows.length - 1, Math.max(0, rowIndex + rowStep))]!;
+  const nextIndex = Math.min(cols.length - 1, Math.max(0, columnIndex + columnStep));
+  anchor.value ??= current;
+  focusPoint.value = { row: nextRow.id, column: cols[nextIndex]!.name };
+  inspect(nextRow.id, nextIndex);
+  focusCell(nextRow.id, cols[nextIndex]!.name);
+}
+
+/** Ctrl+A：选中当前已读取的全部单元格。 */
+function selectAllCells() {
+  const rows = view.value.rows;
+  const cols = props.columns;
+  if (!rows.length || !cols.length) return;
+  const first = rows[0]!;
+  anchor.value = { row: first.id, column: cols[0]!.name };
+  focusPoint.value = { row: rows[rows.length - 1]!.id, column: cols[cols.length - 1]!.name };
+  inspect(first.id, 0);
 }
 
 function beginEdit(id: string, column: string) {
@@ -347,6 +396,15 @@ async function copyValue() {
   const column = props.columns.find((item) => item.name === selected.value?.column);
   const text = copyCellText(selected.value.value, loadSettings().nullCopy, column, true);
   try { await navigator.clipboard.writeText(text); copyMessage.value = "已复制"; }
+  catch { copyMessage.value = "复制失败，请在值查看器中选中文本复制。"; }
+}
+
+/** 结果网格也能复制 SQL 字面量；NULL 写 NULL，文本按引擎转义。 */
+async function copySqlValueSelected() {
+  if (!selected.value) return;
+  const column = props.columns.find((item) => item.name === selected.value?.column);
+  const text = copySqlValue(selected.value.value, column, props.engine ?? "postgres");
+  try { await navigator.clipboard.writeText(text); copyMessage.value = "已复制 SQL 值"; }
   catch { copyMessage.value = "复制失败，请在值查看器中选中文本复制。"; }
 }
 
@@ -475,17 +533,42 @@ const inspectorColumn = computed(() => {
   return current ? props.columns.find((item) => item.name === current.column) : undefined;
 });
 
-/** 未编辑时：Enter 开始编辑选中单元格，方向键和 Tab 移动选中。 */
+/** 未编辑时：Enter 开始编辑，方向键和 Tab 移动选中，快捷键与帮助里写的一致。 */
 function onGridKeydown(event: KeyboardEvent) {
   if (editing.value) return;
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {
+  const mod = event.ctrlKey || event.metaKey;
+  const key = event.key.toLowerCase();
+  if (mod && event.shiftKey && key === "c") {
+    event.preventDefault();
+    void copySqlValueSelected();
+    return;
+  }
+  if (mod && key === "c") {
     event.preventDefault();
     void copySelection();
     return;
   }
+  if (mod && key === "a") {
+    event.preventDefault();
+    selectAllCells();
+    return;
+  }
+  if (mod && key === "s") {
+    event.preventDefault();
+    if (editSession.value?.pendingCount) openCommit();
+    return;
+  }
+  if (event.key === "Delete") {
+    event.preventDefault();
+    deleteSelected();
+    return;
+  }
   if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) {
     event.preventDefault();
-    moveSelection(event.key === "ArrowUp" ? -props.columns.length : event.key === "ArrowDown" ? props.columns.length : event.key === "ArrowLeft" ? -1 : 1);
+    const rowStep = event.key === "ArrowUp" ? -1 : event.key === "ArrowDown" ? 1 : 0;
+    const columnStep = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : 0;
+    if (event.shiftKey) extendSelection(rowStep, columnStep);
+    else moveSelection(rowStep * props.columns.length + columnStep);
   } else if (event.key === "Enter" || event.key === "F2") {
     if (selected.value) {
       event.preventDefault();
@@ -494,33 +577,64 @@ function onGridKeydown(event: KeyboardEvent) {
   } else if (event.key === "Tab") {
     event.preventDefault();
     moveSelection(event.shiftKey ? -1 : 1);
+  } else if (event.key === "Escape") {
+    (document.activeElement as HTMLElement | null)?.blur();
   }
 }
 
 function deleteSelected() {
   if (!selected.value || !editSession.value) return;
-  editSession.value.deleteRow(selected.value.row);
+  const error = editSession.value.deleteRow(selected.value.row);
+  if (error) {
+    editError.value = error;
+    return;
+  }
+  editError.value = "";
   receipt.value = null;
 }
 
 async function commitChangesNow() {
   const session = editSession.value;
   if (!session) return;
+  commitError.value = "";
   const pendingBefore = session.pendingCount;
   const report = await session.commit();
-  commitOpen.value = false;
   if (!report) {
-    receipt.value = "提交没有完成。尚未成功的暂存没有记成已成功。";
+    commitError.value = commitFailures.value[0]?.message || "提交没有完成。未成功的更改仍保留在待提交列表中。";
     return;
   }
   const saved = report.applied.length;
   if (report.failed) {
     const waiting = report.pendingIds.filter((id) => id !== report.failed?.id).length;
-    receipt.value = `${saved} 处已保存，1 处失败。失败的更改仍保留。还有 ${waiting} 处没有执行，没有记成已成功。`;
+    commitError.value = `${saved} 处已保存，1 处失败。失败的更改仍保留。还有 ${waiting} 处没有执行，没有记成已成功。`;
     return;
   }
+  commitOpen.value = false;
   receipt.value = `${saved} 处已保存。`;
   if (saved !== pendingBefore && session.pendingCount > 0) receipt.value += "尚未成功的暂存没有记成已成功。";
+}
+
+function openCommit() {
+  commitError.value = "";
+  commitOpen.value = true;
+}
+
+function discardAll() {
+  const session = editSession.value;
+  if (!session) return;
+  if (!discardArmed.value) {
+    discardArmed.value = true;
+    clearTimeout(discardTimer);
+    discardTimer = setTimeout(() => {
+      discardArmed.value = false;
+    }, 4000);
+    return;
+  }
+  clearTimeout(discardTimer);
+  discardArmed.value = false;
+  commitError.value = "";
+  session.discard();
+  receipt.value = null;
 }
 
 function startExport(payload: { scope: ExportScope; acknowledged: boolean; path: string; csv: CsvOptions; format: ExportFormat }) {
@@ -660,14 +774,37 @@ watch(() => props.rows, (rows) => {
     </footer>
     <div v-if="pendingVisible && editSession" class="pending-bar" role="region" aria-label="未保存的更改">
       <span class="badge warn">{{ editSession.pendingCount }} 处更改未保存</span>
-      <button class="btn sm" type="button" @click="commitOpen = true">查看</button>
-      <button class="btn sm danger" type="button" @click="editSession.discard(); receipt = null">放弃</button>
-      <button class="btn sm primary" type="button" :disabled="!editSession.pendingCount" @click="commitOpen = true">提交</button>
+      <button class="btn sm" type="button" @click="openCommit">查看</button>
+      <button
+        class="btn sm danger"
+        type="button"
+        :data-armed="discardArmed ? 'true' : undefined"
+        :title="discardArmed ? '再次点击，确认放弃全部未保存的更改' : '放弃全部未保存的更改'"
+        @click="discardAll"
+      >{{ discardArmed ? "确认放弃" : "放弃" }}</button>
+      <button class="btn sm primary" type="button" :disabled="!editSession.pendingCount" @click="openCommit">提交</button>
       <p v-for="failure in commitFailures" :key="failure.id" class="commit-failure" role="alert">{{ failure.message }}</p>
     </div>
-    <section v-if="selected" class="inspector" aria-label="查询值查看器"><div class="inspector-meta"><strong>{{ selected.column }}</strong><span class="col-type">{{ typeCaption(inspectorColumn) }}</span><span>{{ selected.value === null ? 'NULL' : selected.value === '' ? '空字符串（长度 0）' : '值' }}</span><span class="grow"></span><button class="btn sm" @click="selected = null">关闭</button></div><textarea readonly :value="showCell(selected.value, { column: inspectorColumn, opened: revealed.has(`${selected.row}:${selected.column}`), resolved: true }).body" :aria-label="`${selected.column} 的值`"></textarea><div class="inspector-actions"><button v-if="showCell(selected.value, { column: inspectorColumn, resolved: true }).kind === 'large'" class="btn sm" type="button" @click="revealSelected">读取完整值</button><button v-if="editSession" class="btn sm" type="button" :disabled="!editSession.canUpdate(editSession.rowById(selected.row)) || !editSession.canEditColumn(selected.column)" @click="beginEdit(selected.row, selected.column)">编辑</button><button class="btn sm" @click="copyValue">复制值</button><span role="status">{{ copyMessage }}</span></div></section>
+    <section v-if="selected" class="inspector" aria-label="查询值查看器">
+      <div class="inspector-meta">
+        <strong>{{ selected.column }}</strong>
+        <span class="col-type">{{ typeCaption(inspectorColumn) }}</span>
+        <span>{{ selected.value === null ? 'NULL' : selected.value === '' ? '空字符串（长度 0）' : '值' }}</span>
+        <span class="grow"></span>
+        <button class="btn sm" type="button" @click="selected = null">关闭</button>
+      </div>
+      <textarea readonly :value="showCell(selected.value, { column: inspectorColumn, previewBytes: previewBytes(), opened: revealed.has(`${selected.row}:${selected.column}`), resolved: true }).body" :aria-label="`${selected.column} 的值`"></textarea>
+      <div class="inspector-actions">
+        <button v-if="showCell(selected.value, { column: inspectorColumn, previewBytes: previewBytes(), resolved: true }).kind === 'large'" class="btn sm" type="button" @click="revealSelected">读取完整值</button>
+        <button v-if="editSession" class="btn sm" type="button" :disabled="!editSession.canUpdate(editSession.rowById(selected.row)) || !editSession.canEditColumn(selected.column)" @click="beginEdit(selected.row, selected.column)">编辑</button>
+        <button class="btn sm" type="button" @click="copyValue">复制值</button>
+        <button class="btn sm" type="button" @click="copySqlValueSelected">复制为 SQL 值</button>
+        <span role="status">{{ copyMessage }}</span>
+      </div>
+    </section>
     <div v-if="menu" class="cell-menu" role="menu" :style="{ left: `${menu.x}px`, top: `${menu.y}px` }" @contextmenu.prevent>
       <button type="button" role="menuitem" @click="copySelection(); menu = null">复制</button>
+      <button type="button" role="menuitem" @click="copySqlValueSelected(); menu = null">复制为 SQL 值</button>
       <button type="button" role="menuitem" @click="editFromMenu">编辑</button>
       <button type="button" role="menuitem" @click="setNullFromMenu">设为 NULL</button>
       <p v-if="menuError" class="menu-error" role="alert">{{ menuError }}</p>
@@ -675,7 +812,10 @@ watch(() => props.rows, (rows) => {
     <div v-if="commitOpen && editSession" class="overlay" role="presentation">
       <div class="sheet" role="dialog" aria-modal="true" aria-label="待提交的更改">
         <header><div><h2>提交这些更改？</h2><p class="hint" data-confirm-target>目标：{{ connectionName }} / {{ objectName }} <span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span></p><p class="hint">将按顺序逐条写入数据库，遇到错误即停止；已写入的不会自动撤销。查询结果不能新增行。</p></div></header>
-        <div class="body"><ol class="sql-list"><li v-for="step in editSession.preview()" :key="step.id"><strong>{{ step.label }}</strong><pre>{{ step.sql }}</pre></li></ol></div>
+        <div class="body">
+          <p v-if="commitError" class="sheet-error" role="alert" data-commit-error>{{ commitError }}</p>
+          <ol class="sql-list"><li v-for="step in editSession.preview()" :key="step.id"><strong>{{ step.label }}</strong><pre>{{ step.sql }}</pre></li></ol>
+        </div>
         <footer>
           <button class="btn" type="button" @click="commitOpen = false">取消</button>
           <span class="grow"></span>

@@ -226,6 +226,38 @@ describe("shell layout", () => {
     expect(quiet.find(".sb-activity").exists()).toBe(false);
   });
 
+  it("offers a cancel action while a query runs and explains the pending cancel", async () => {
+    const running = mount(StatusBar, {
+      props: {
+        tab: makeTab(),
+        onWorkspace: true,
+        activity: { state: "running", text: "正在执行查询：Atlas / atlas_dev" },
+        runningTabId: "q",
+      },
+    });
+    const cancel = running.get("[data-action='status-cancel']");
+    expect(cancel.text()).toBe("取消查询");
+    expect(cancel.attributes("disabled")).toBeUndefined();
+    await cancel.trigger("click");
+    expect(running.emitted("cancel")).toHaveLength(1);
+
+    const cancelling = mount(StatusBar, {
+      props: {
+        tab: makeTab(),
+        onWorkspace: true,
+        activity: { state: "running", text: "正在执行查询：Atlas / atlas_dev" },
+        runningTabId: "q",
+        cancelRequested: true,
+      },
+    });
+    const pending = cancelling.get("[data-action='status-cancel']");
+    expect(pending.text()).toContain("正在取消");
+    expect(pending.attributes("disabled")).toBeDefined();
+
+    const idle = mount(StatusBar, { props: { tab: makeTab(), onWorkspace: true } });
+    expect(idle.find("[data-action='status-cancel']").exists()).toBe(false);
+  });
+
   it("does not distinguish environment or status by color alone", () => {
     const pill = mount(EnvPill, { props: { env: "prod", label: ENVIRONMENT_LABELS.prod } });
     expect(pill.text()).toBe("生产");

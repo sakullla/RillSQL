@@ -206,6 +206,24 @@ describe("close guard", () => {
     expect(anyPending()).toBe(false);
   });
 
+  it("does not ask for a draft that was already executed, and asks again after editing it", () => {
+    const { session, id } = shellWithDraft("select finished");
+    session.setExecuted(id, "select finished");
+    expect(anyPending()).toBe(false);
+    session.closeTab(id);
+    expect(closePrompt.open).toBe(false);
+    expect(session.tabs.value).toHaveLength(0);
+
+    const next = shellWithDraft("select finished");
+    next.session.setExecuted(next.id, "select finished");
+    next.session.setDraft(next.id, "select finished -- edited");
+    expect(anyPending()).toBe(true);
+    next.session.closeTab(next.id);
+    expect(closePrompt.open).toBe(true);
+    expect(closePrompt.reason).toBe("draft");
+    chooseLeave();
+  });
+
   it("counts a non-empty SQL draft as pending for the window close", async () => {
     const { session, id } = shellWithDraft("select keep me");
     const event = { preventDefault: vi.fn() };

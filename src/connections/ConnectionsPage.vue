@@ -35,6 +35,8 @@ const connections = ref<SavedConnection[]>([]);
 const query = ref("");
 const loadError = ref("");
 const note = ref("");
+/** 对话框里的失败必须显示在对话框内部，不能写到被遮罩挡住的页面提示里。 */
+const dialogError = ref("");
 const busy = ref(false);
 const menuId = ref<string | null>(null);
 const dialog = ref<"edit" | "delete" | "password" | "details" | null>(null);
@@ -88,6 +90,14 @@ function openWorkspace(connection: SavedConnection) {
   const database = catalog?.defaultDatabase ?? catalog?.databases[0]?.name ?? connection.database ?? (connection.engine === "sqlite" ? "main" : null);
   if (database == null) { emit("workspace"); return; }
   emit("query-target", { connectionId: connection.id, connectionName: connection.name, database, engine: connection.engine, status: "connected" });
+}
+
+/** 双击卡片：已连接就直接打开，未连接就发起连接。按钮上的双击不触发。 */
+function onCardDoubleClick(connection: SavedConnection, event: MouseEvent) {
+  const target = event.target;
+  if (target instanceof Element && target.closest("button")) return;
+  if (connectionState(connection.id) === "connected") openWorkspace(connection);
+  else requestConnect(connection);
 }
 function connectionState(id: string) {
   return statuses.value[id] ?? catalogConnections().find(item => item.id === id)?.status ?? "disconnected";
@@ -185,6 +195,7 @@ function openEditor(existing?: SavedConnection, engine?: Engine) {
   report.value = null;
   fieldErrors.value = {};
   note.value = "";
+  dialogError.value = "";
   pasteText.value = "";
   pasteNote.value = "";
   pasteFailed.value = false;
@@ -299,6 +310,7 @@ async function saveDraft(connectAfter: boolean) {
     return;
   }
   busy.value = true;
+  dialogError.value = "";
   try {
     const outcome = await api.value.save(draft.value, currentSecrets());
     note.value = outcome.note ?? "";
@@ -307,7 +319,7 @@ async function saveDraft(connectAfter: boolean) {
     if (connectAfter) await connectSaved(outcome.connection, currentSecrets());
     else closeEditor();
   } catch (error) {
-    note.value = error instanceof Error ? error.message : "没有保存。";
+    dialogError.value = errorText(error, "没有保存。");
   } finally {
     busy.value = false;
   }
@@ -326,6 +338,7 @@ async function runTest() {
     return;
   }
   busy.value = true;
+  dialogError.value = "";
   try {
     const outcome = await api.value.save(draft.value, currentSecrets());
     draft.value.id = outcome.connection.id;
@@ -333,7 +346,7 @@ async function runTest() {
     report.value = await api.value.test(outcome.connection.id, currentSecrets());
     await reload();
   } catch (error) {
-    note.value = error instanceof Error ? error.message : "测试没有开始。";
+    dialogError.value = errorText(error, "测试没有开始。");
   } finally {
     busy.value = false;
   }
@@ -341,9 +354,14 @@ async function runTest() {
 
 async function trustHostKey() {
   if (!draft.value.id || !report.value?.fingerprint) return;
-  await api.value.confirmHostKey(draft.value.id, report.value.fingerprint);
-  knownHostKey.value = report.value.fingerprint;
-  await runTest();
+  dialogError.value = "";
+  try {
+    await api.value.confirmHostKey(draft.value.id, report.value.fingerprint);
+    knownHostKey.value = report.value.fingerprint;
+    await runTest();
+  } catch (error) {
+    dialogError.value = errorText(error, "没有保存主机指纹。");
+  }
 }
 
 function rejectHostKey() {
@@ -361,8 +379,13 @@ function rejectHostKey() {
 
 async function forgetHostKey() {
   if (!draft.value.id) return;
-  await api.value.forgetHostKey(draft.value.id);
-  knownHostKey.value = null;
+  dialogError.value = "";
+  try {
+    await api.value.forgetHostKey(draft.value.id);
+    knownHostKey.value = null;
+  } catch (error) {
+    dialogError.value = errorText(error, "没有清除主机指纹。");
+  }
 }
 
 async function connectSaved(connection: SavedConnection, typed: SecretInput) {
@@ -384,12 +407,15 @@ async function connectSaved(connection: SavedConnection, typed: SecretInput) {
     }
   } catch (error) {
     statuses.value = { ...statuses.value, [connection.id]: "error" };
-    note.value = error instanceof Error ? error.message : "连接失败。";
+    const message = errorText(error, "连接失败。");
+    if (dialog.value) dialogError.value = message;
+    else note.value = message;
   }
 }
 
 function requestConnect(connection: SavedConnection) {
   menuId.value = null;
+  dialogError.value = "";
   if (connection.engine !== "sqlite" && !connection.passwordSaved) {
     passwordTarget.value = connection;
     promptPassword.value = "";
@@ -404,27 +430,38 @@ function requestConnect(connection: SavedConnection) {
 async function submitPrompt() {
   const target = passwordTarget.value;
   if (!target) return;
+  dialogError.value = "";
   const typed = { password: promptPassword.value, sshPassword: "", passphrase: "" };
-  if (promptSave.value) {
-    const outcome = await api.value.save({ ...draftFromSaved(target), savePassword: true }, typed);
-    if (outcome.note) note.value = outcome.note;
-    await reload();
+  try {
+    if (promptSave.value) {
+      const outcome = await api.value.save({ ...draftFromSaved(target), savePassword: true }, typed);
+      if (outcome.note) note.value = outcome.note;
+      await reload();
+    }
+    closeDialog(otherDialog.value);
+    dialog.value = null;
+    await connectSaved(target, typed);
+  } catch (error) {
+    dialogError.value = errorText(error, "连接没有开始。");
   }
-  closeDialog(otherDialog.value);
-  dialog.value = null;
-  await connectSaved(target, typed);
 }
 
 async function disconnect(connection: SavedConnection) {
   menuId.value = null;
-  await api.value.disconnect(connection.id);
-  statuses.value = { ...statuses.value, [connection.id]: "disconnected" };
-  await refreshCatalog();
-  delete statuses.value[connection.id];
+  note.value = "";
+  try {
+    await api.value.disconnect(connection.id);
+    statuses.value = { ...statuses.value, [connection.id]: "disconnected" };
+    await refreshCatalog();
+    delete statuses.value[connection.id];
+  } catch (error) {
+    note.value = errorText(error, "断开连接失败。");
+  }
 }
 
 function askDelete(connection: SavedConnection) {
   menuId.value = null;
+  dialogError.value = "";
   deleteTarget.value = connection;
   dialog.value = "delete";
   requestAnimationFrame(() => show(otherDialog.value));
@@ -433,15 +470,21 @@ function askDelete(connection: SavedConnection) {
 async function confirmDelete() {
   const target = deleteTarget.value;
   if (!target) return;
-  const outcome = await api.value.remove(target.id);
-  note.value = outcome.databaseFileRemoved ? "连接配置已删除。" : `已删除连接配置“${target.name}”。数据库和其中的数据不受影响。`;
-  closeDialog(otherDialog.value);
-  dialog.value = null;
-  await reload();
+  dialogError.value = "";
+  try {
+    const outcome = await api.value.remove(target.id);
+    note.value = outcome.databaseFileRemoved ? "连接配置已删除。" : `已删除连接配置“${target.name}”。数据库和其中的数据不受影响。`;
+    closeDialog(otherDialog.value);
+    dialog.value = null;
+    await reload();
+  } catch (error) {
+    dialogError.value = errorText(error, "没有删除连接配置。");
+  }
 }
 
 function showDetails(connection: SavedConnection) {
   menuId.value = null;
+  dialogError.value = "";
   deleteTarget.value = connection;
   dialog.value = "details";
   requestAnimationFrame(() => show(otherDialog.value));
@@ -487,7 +530,14 @@ watch(
       <p v-if="loadError" class="page-note" role="alert">{{ loadError }}</p><p v-else-if="note" class="page-note" role="status">{{ note }}</p>
       <div class="conn-grid">
         <div class="connection-columns" aria-hidden="true"><span>连接 / 数据库</span><span>地址</span><span>传输与认证</span><span>状态 / 操作</span></div>
-        <article v-for="item in filtered" :key="item.id" class="conn-card" :class="`st-${connectionState(item.id)}`">
+        <article
+          v-for="item in filtered"
+          :key="item.id"
+          class="conn-card"
+          :class="`st-${connectionState(item.id)}`"
+          :title="connectionState(item.id) === 'connected' ? '双击打开' : '双击连接'"
+          @dblclick="onCardDoubleClick(item, $event)"
+        >
           <header>
             <span class="eng lg" :class="`eng-${item.engine}`">{{ engineMeta(item.engine).short }}</span>
             <div class="cc-title"><h3>{{ item.name }}</h3><p>{{ engineMeta(item.engine).label }} <span class="env" :class="`env-${envView(item.env).tone}`">{{ envView(item.env).label }}</span></p></div>
@@ -514,6 +564,7 @@ watch(
         <button class="icon-btn" type="button" aria-label="关闭" @click="closeEditor"><ConnIcon name="x" /></button>
       </div>
       <div class="modal-body">
+        <p v-if="dialogError" class="field-err modal-error" role="alert" data-dialog-error>{{ dialogError }}</p>
         <div class="ce-engines" role="radiogroup" aria-label="数据库类型">
           <label v-for="engine in ENGINES" :key="engine.id" class="ce-engine" :class="{ on: draft.engine === engine.id, disabled: Boolean(draft.id && draft.engine !== engine.id) }">
             <input type="radio" name="cf-engine" :value="engine.id" :checked="draft.engine === engine.id" :disabled="Boolean(draft.id && draft.engine !== engine.id)" @change="switchEngine(engine.id)" />
@@ -681,6 +732,7 @@ watch(
       <template v-if="dialog === 'delete' && deleteTarget">
         <div class="modal-head"><div class="modal-titles"><h2>删除连接「{{ deleteTarget.name }}」？</h2><p class="modal-sub">删除前请确认下面两条</p></div></div>
         <div class="modal-body">
+          <p v-if="dialogError" class="field-err modal-error" role="alert" data-dialog-error>{{ dialogError }}</p>
           <ul class="facts">
             <li><ConnIcon name="check" />会删除：本机保存的这条连接配置{{ deleteTarget.passwordSaved ? "，以及系统凭据库里保存的对应密码" : "" }}。</li>
             <li><ConnIcon name="x" />不会删除：{{ deleteTarget.engine === "sqlite" ? `SQLite 文件 ${deleteTarget.filePath}` : "数据库本身和其中的任何数据" }}。</li>
@@ -691,6 +743,7 @@ watch(
       <template v-else-if="dialog === 'password' && passwordTarget">
         <div class="modal-head"><div class="modal-titles"><h2>连接 {{ passwordTarget.name }}</h2><p class="modal-sub">这条连接没有保存密码，所以每次都会询问。</p></div></div>
         <div class="modal-body">
+          <p v-if="dialogError" class="field-err modal-error" role="alert" data-dialog-error>{{ dialogError }}</p>
           <label class="field"><span>数据库密码</span><input v-model="promptPassword" type="password" autocomplete="current-password" /></label>
           <label class="check"><input v-model="promptSave" type="checkbox" /><span>保存到系统凭据库，以后不再询问</span></label>
         </div>
@@ -699,6 +752,7 @@ watch(
       <template v-else-if="detailTarget">
         <div class="modal-head"><div class="modal-titles"><h2>{{ detailTarget.name }}</h2><p class="modal-sub">{{ engineMeta(detailTarget.engine).label }}</p></div></div>
         <div class="modal-body">
+          <p v-if="dialogError" class="field-err modal-error" role="alert" data-dialog-error>{{ dialogError }}</p>
           <dl class="kv">
             <template v-if="detailTarget.engine === 'sqlite'">
               <dt>文件</dt><dd class="mono">{{ detailTarget.filePath }}</dd>

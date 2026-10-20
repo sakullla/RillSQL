@@ -14,6 +14,7 @@ const emit = defineEmits<{
   "open-definition": [object: CatalogObjectRef];
   "query-object": [object: CatalogObjectRef, sql: string];
   "focused-database": [connectionId: string, database: string];
+  "new-connection": [];
 }>();
 const menu = ref<{ object: CatalogObjectRef; x: number; y: number; notice: string } | null>(null);
 const selectedKey = ref<string | null>(null);
@@ -233,6 +234,35 @@ function onTreeClick(event: MouseEvent) {
   selectedKey.value = objectKey(object);
 }
 
+/** 树行可用键盘到达：Enter 打开，空格选择/展开，Shift+F10 打开对象菜单。 */
+function onTreeKeydown(event: KeyboardEvent) {
+  const target = event.target;
+  if (!(target instanceof Element) || target.closest("button")) return;
+  const row = target.closest<HTMLElement>(".tree-row");
+  if (!row) return;
+  if (event.key === "Enter") {
+    event.preventDefault();
+    row.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    row.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    return;
+  }
+  if (event.key === " ") {
+    event.preventDefault();
+    row.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    return;
+  }
+  if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+    event.preventDefault();
+    const rect = row.getBoundingClientRect();
+    onContextMenu({
+      target: row,
+      clientX: rect.left + 24,
+      clientY: rect.bottom,
+      preventDefault: () => undefined,
+    } as unknown as MouseEvent);
+  }
+}
+
 function onTreeDblClick(event: MouseEvent) {
   const row = rowOf(event.target);
   if (!row) return;
@@ -324,7 +354,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="tree" role="tree" aria-label="数据库对象" @click="onTreeClick" @dblclick="onTreeDblClick" @contextmenu="onContextMenu" @scroll="closeMenu">
+  <div class="tree" role="tree" aria-label="数据库对象" @click="onTreeClick" @dblclick="onTreeDblClick" @contextmenu="onContextMenu" @keydown="onTreeKeydown" @scroll="closeMenu">
     <div class="tree-toolbar">
       <button class="btn ghost sm" type="button" data-action="tree-refresh" aria-label="刷新对象列表" :disabled="refreshing" @click="onRefresh">
         {{ refreshing ? "正在刷新…" : "刷新" }}
@@ -347,6 +377,7 @@ onBeforeUnmount(() => {
         :key="hit.id"
         class="tree-row tr-hit"
         role="treeitem"
+        tabindex="0"
         data-hit
         :data-connection="hit.connectionId"
         :data-database="hit.database"
@@ -382,13 +413,17 @@ onBeforeUnmount(() => {
         <span>{{ matches.skipped.join("、") }} 未连接，没有参与筛选</span>
       </div>
     </template>
-    <p v-else-if="connections.length === 0 && !loadError" class="tree-note">还没有打开的连接。到「连接」页新建连接后，这里会列出数据库、schema 和表。</p>
+    <div v-else-if="connections.length === 0 && !loadError" class="tree-note tree-empty">
+      <span>还没有打开的连接。新建连接后，这里会列出数据库、schema 和表。</span>
+      <button class="btn sm" type="button" data-action="tree-new-connection" @click="emit('new-connection')">新建连接</button>
+    </div>
     <template v-else>
       <section v-for="connection in connections" :key="connection.id" :data-engine="connection.engine" :data-connection="connection.id">
         <div
           class="tree-row tr-conn"
           :class="`st-${connection.status}`"
           role="treeitem"
+          tabindex="0"
           :style="depthStyle(0)"
           :aria-expanded="open(`c:${connection.id}`)"
           :title="`${connection.name} · ${ENGINE_LABEL[connection.engine]} · ${STATUS_TEXT[connection.status]}`"
@@ -462,6 +497,7 @@ onBeforeUnmount(() => {
               <div
                 class="tree-row"
                 role="treeitem"
+                tabindex="0"
                 data-level="database"
                 :data-database="database.name"
                 :style="depthStyle(1)"
@@ -512,6 +548,7 @@ onBeforeUnmount(() => {
                     v-if="engineShape(connection.engine).schemas && schema.name"
                     class="tree-row"
                     role="treeitem"
+                    tabindex="0"
                     data-level="schema"
                     :data-schema="schema.name"
                     :data-database="database.name"

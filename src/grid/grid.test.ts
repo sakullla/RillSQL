@@ -441,15 +441,18 @@ describe("grid views", () => {
     expect(wrapper.find("[aria-label='待提交的更改']").exists()).toBe(true);
     await wrapper.findAll("button").find((button) => button.text() === "提交 1 处更改")!.trigger("click");
     await flushPromises();
-    expect(wrapper.find("[aria-label='待提交的更改']").exists()).toBe(false);
+    // 失败时面板保持打开，错误写在面板里，而不是看起来像提交成功。
+    expect(wrapper.find("[aria-label='待提交的更改']").exists()).toBe(true);
+    expect(wrapper.get("[data-commit-error]").text()).toContain("1 处失败");
     const bar = wrapper.get(".pending-bar");
     expect(bar.text()).toContain("1 处更改未保存");
-    expect(bar.text()).toContain("0 处已保存，1 处失败");
     expect(bar.text()).toContain('duplicate key value violates unique constraint "customers_email_key"');
     expect(bar.text()).toContain("DETAIL: Key (email)=(u2@example.com) already exists.");
     const failed = wrapper.get("tr.row-failed");
     expect(failed.attributes("data-row-id")).toBe("1");
     expect(failed.attributes("title")).toBe(duplicate);
+    await wrapper.findAll("button").find((button) => button.text() === "取消")!.trigger("click");
+    expect(wrapper.find("[aria-label='待提交的更改']").exists()).toBe(false);
     wrapper.unmount();
   });
 
@@ -491,10 +494,51 @@ describe("grid views", () => {
     expect(wrapper.get('[data-cell="1:id"]').text()).toContain("将删除");
     expect(wrapper.get(".pending-bar").text()).toContain("1 处更改未保存");
     await wrapper.findAll("button").find((button) => button.text() === "放弃")!.trigger("click");
+    expect(wrapper.get(".pending-bar").text()).toContain("确认放弃");
+    expect(wrapper.find(".pending-bar").exists()).toBe(true);
+    await wrapper.findAll("button").find((button) => button.text() === "确认放弃")!.trigger("click");
     expect(wrapper.find(".pending-bar").exists()).toBe(false);
     expect(wrapper.get('[data-cell="1:name"]').text()).toBe("客户1");
     expect(wrapper.get("tr[data-row-id='1']").classes()).not.toContain("row-delete");
     wrapper.unmount();
+  });
+
+  it("honours the advertised grid shortcuts and preview limit", async () => {
+    localStorage.setItem("rillsql.shell", JSON.stringify({ previewKB: 4 }));
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") {
+        return {
+          rows: [
+            { ...customerRow(1), cells: { ...customerRow(1).cells, note: "长".repeat(600) } },
+            customerRow(2),
+          ],
+          truncated: false,
+          sql: 'SELECT "id" FROM "public"."customers" LIMIT 10',
+        };
+      }
+      throw new Error(command);
+    });
+    try {
+      const wrapper = mount(DataGrid, { props: { tabId: "table:shortcuts", draft: "", pageSize: 10, target: customersTarget } });
+      await flushPromises();
+      // 4 KB 上限下，1800 字节的文本不应被折叠成“大字段”
+      expect(wrapper.text()).not.toContain("大字段");
+      const scroll = wrapper.get(".grid-scroll");
+      await wrapper.get("[data-cell='1:name']").trigger("pointerdown");
+      await scroll.trigger("keydown", { key: "Delete" });
+      expect(wrapper.get("tr[data-row-id='1']").classes()).toContain("row-delete");
+      expect(wrapper.get(".pending-bar").text()).toContain("1 处更改未保存");
+      await scroll.trigger("keydown", { key: "a", ctrlKey: true });
+      expect(wrapper.get(".grid-foot").text()).toContain("已选 8 格");
+      await scroll.trigger("keydown", { key: "s", ctrlKey: true });
+      expect(wrapper.find("[aria-label='待提交的更改']").exists()).toBe(true);
+      expect(wrapper.get("[aria-label='待提交的更改']").text()).toContain("DELETE");
+      await wrapper.findAll("button").find((button) => button.text() === "取消")!.trigger("click");
+      wrapper.unmount();
+    } finally {
+      localStorage.clear();
+    }
   });
 
   it("jumps to the referenced rows from the cell menu", async () => {
@@ -737,6 +781,8 @@ describe("grid views", () => {
     expect(invoke.mock.calls.some((call) => call[0] === "grid_commit")).toBe(false);
     expect(tabHasPending("table:prod")).toBe(true);
     await wrapper.findAll("button").find((button) => button.text() === "放弃")!.trigger("click");
+    expect(tabHasPending("table:prod")).toBe(true);
+    await wrapper.findAll("button").find((button) => button.text() === "确认放弃")!.trigger("click");
     expect(tabHasPending("table:prod")).toBe(false);
     expect(anyPending()).toBe(false);
     wrapper.unmount();
@@ -1022,6 +1068,51 @@ describe("query result edits", () => {
     const commit = invoke.mock.calls.find((call) => call[0] === "grid_commit");
     expect(commit?.[1]).toMatchObject({ request: { table: "customers", schema: "public", changes: [{ kind: "update", id: "u:r0" }] } });
     expect(wrapper.get("[data-cell='r0:name']").text()).toContain("新名字");
+    wrapper.unmount();
+  });
+
+  it("supports delete, select-all, SQL copy and commit shortcuts on editable results", async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      throw new Error(command);
+    });
+    const model = gridModel({
+      columns: ["id", "name", "email"],
+      columnTypes: ["integer", "text", "text"],
+      rows: [["1", "甲", "a@example.com"], ["2", "乙", "b@example.com"]],
+    });
+    const wrapper = mount(QueryResultGrid, {
+      props: {
+        tabId: "query-shortcuts",
+        statement: "SELECT id, name, email FROM public.customers",
+        columns: model.columns,
+        rows: model.rows,
+        truncated: false,
+        connectionId: "shop",
+        engine: "postgres",
+        database: "app",
+        schema: "public",
+      },
+    });
+    await flushPromises();
+    const scroll = wrapper.get(".grid-scroll");
+    await wrapper.get("[data-cell='r0:name']").trigger("pointerdown");
+    await scroll.trigger("keydown", { key: "Delete" });
+    expect(wrapper.get("tr[data-row-id='r0']").classes()).toContain("row-delete");
+    expect(wrapper.get(".pending-bar").text()).toContain("1 处更改未保存");
+
+    await scroll.trigger("keydown", { key: "a", ctrlKey: true });
+    expect(wrapper.findAll(".cell-btn.range")).toHaveLength(6);
+    await wrapper.get("[data-cell='r0:name']").trigger("pointerdown");
+    await scroll.trigger("keydown", { key: "c", ctrlKey: true, shiftKey: true });
+    await flushPromises();
+    expect(writeText).toHaveBeenLastCalledWith("'甲'");
+
+    await scroll.trigger("keydown", { key: "s", ctrlKey: true });
+    expect(wrapper.find("[aria-label='待提交的更改']").exists()).toBe(true);
+    await wrapper.findAll("button").find((button) => button.text() === "取消")!.trigger("click");
     wrapper.unmount();
   });
 

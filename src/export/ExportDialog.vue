@@ -243,7 +243,7 @@ async function start() {
 </template>
 
 <style scoped>
-.ex-overlay { position: absolute; inset: 0; background: var(--overlay); display: grid; place-items: center; z-index: 5; padding: var(--sp-4); }
+.ex-overlay { position: fixed; inset: 0; background: var(--overlay); display: grid; place-items: center; z-index: var(--z-dialog); padding: var(--sp-4); }
 .ex-sheet { width: min(720px, 100%); max-height: min(88vh, 880px); display: flex; flex-direction: column; background: var(--panel); color: var(--text); border-radius: var(--r-xl); border: 1px solid var(--line-2); box-shadow: var(--shadow-lg); }
 .ex-head { display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line); }
 .ex-titles { flex: 1; min-width: 0; }

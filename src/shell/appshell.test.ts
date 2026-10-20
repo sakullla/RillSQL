@@ -115,8 +115,12 @@ describe("AppShell", () => {
     expect(solid).toHaveLength(1);
     expect(solid[0]!.text()).toContain("新建查询");
     expect(welcome.findAll(".desk-action")).toHaveLength(0);
-    expect(welcome.text()).not.toContain("新建连接");
-    expect(welcome.text()).not.toContain("打开 SQLite");
+    // 有连接时仍保留两条轻量入口，但不与主按钮争夺视觉主位
+    const quick = welcome.findAll(".welcome-quick .btn");
+    expect(quick).toHaveLength(2);
+    expect(quick[0]!.text()).toContain("新建连接");
+    expect(quick[1]!.text()).toContain("打开 SQLite 文件");
+    expect(quick.every((button) => !button.classes().includes("primary"))).toBe(true);
     wrapper.unmount();
   });
 

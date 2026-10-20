@@ -48,6 +48,8 @@ export interface SessionSnapshotTab {
   connectionStatus: ConnectionStatus | null;
   targetText: string | null;
   targetNotice: string | null;
+  /** 最近一次成功发出的 SQL；用于区分“刚执行过”和“从未执行的草稿”。 */
+  lastExecutedSql?: string | null;
 }
 
 export interface SessionSnapshot {
@@ -100,6 +102,7 @@ export interface ShellTab {
   engine: string | null;
   connectionStatus: ConnectionStatus | null;
   targetNotice: string | null;
+  lastExecutedSql?: string | null;
   tablePane: "data" | "structure";
   structureSection: "columns" | "indexes" | "foreign" | "drop";
   definition?: DefinitionRequest | null;
@@ -123,6 +126,7 @@ export interface ShellSession {
   openDefinition: (target: DefinitionTarget) => void;
   setTableView: (id: string, pane: "data" | "structure", section?: "columns" | "drop") => void;
   setDraft: (id: string, draft: string) => void;
+  setExecuted: (id: string, sql: string) => void;
   setQueryTarget: (id: string, target: QueryTarget | null) => void;
   setCloseGuard: (guard: ((id: string) => boolean) | null) => void;
   activateTab: (id: string) => void;
@@ -148,6 +152,7 @@ function blankTab(kind: TabKind, id: string, title: string, path: string | null,
     engine: null,
     connectionStatus: null,
     targetNotice: null,
+    lastExecutedSql: null,
     tablePane: "data",
     structureSection: "columns",
     definition: null,
@@ -187,6 +192,7 @@ export function snapshotSession(tabs: readonly ShellTab[], activeId: string | nu
       connectionStatus: tab.connectionStatus,
       targetText: tab.targetText,
       targetNotice: tab.targetNotice,
+      lastExecutedSql: tab.lastExecutedSql,
     })),
     // 活动标签若不是查询标签（快照里被剔除），回落到最后一个查询标签。
     activeId: kept.some((tab) => tab.id === activeId) ? activeId : kept[kept.length - 1]?.id ?? null,
@@ -226,6 +232,8 @@ export function restoreSession(raw: string | null): SessionSnapshot | null {
     if (!optionalText(tab.engine)) return null;
     if (!optionalText(tab.targetText)) return null;
     if (!optionalText(tab.targetNotice)) return null;
+    const lastExecutedSql = (tab.lastExecutedSql ?? null) as string | null;
+    if (!optionalText(lastExecutedSql)) return null;
     tabs.push({
       id: tab.id,
       title: tab.title,
@@ -237,6 +245,7 @@ export function restoreSession(raw: string | null): SessionSnapshot | null {
       connectionStatus: status as ConnectionStatus | null,
       targetText: tab.targetText as string | null,
       targetNotice: tab.targetNotice as string | null,
+      lastExecutedSql,
     });
   }
   const resolved = tabs.some((tab) => tab.id === activeId) ? activeId : tabs[tabs.length - 1]?.id ?? null;
@@ -252,6 +261,7 @@ function fromSnapshot(item: SessionSnapshotTab): ShellTab {
   tab.connectionStatus = item.connectionStatus;
   tab.targetText = item.targetText;
   tab.targetNotice = item.targetNotice;
+  tab.lastExecutedSql = item.lastExecutedSql ?? null;
   return tab;
 }
 
@@ -260,7 +270,7 @@ export function createSession(initialHash = "", restored: SessionSnapshot | null
   const tabs = ref<ShellTab[]>([]);
   const activeId = ref<string | null>(null);
   const sidebarHidden = ref(typeof window !== "undefined" && window.innerWidth <= 960);
-  const sidebarWidth = ref(268);
+  const sidebarWidth = ref(234);
   const paletteOpen = ref(false);
   const paletteMode = ref<"all" | "tables">("all");
   const helpOpen = ref(false);
@@ -385,6 +395,13 @@ export function createSession(initialHash = "", restored: SessionSnapshot | null
     tab.draft = draft;
   }
 
+  /** 记录成功发出的 SQL：之后草稿与它相同就不再视为“未执行草稿”。 */
+  function setExecuted(id: string, sql: string) {
+    const tab = tabs.value.find((item) => item.id === id);
+    if (!tab || tab.kind !== "query") return;
+    tab.lastExecutedSql = sql;
+  }
+
   function setQueryTarget(id: string, target: QueryTarget | null) {
     const tab = tabs.value.find((item) => item.id === id);
     if (!tab || tab.kind !== "query") return;
@@ -458,6 +475,7 @@ export function createSession(initialHash = "", restored: SessionSnapshot | null
     openDefinition,
     setTableView,
     setDraft,
+    setExecuted,
     setQueryTarget,
     setCloseGuard,
     activateTab,

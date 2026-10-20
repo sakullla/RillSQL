@@ -18,12 +18,14 @@ import { openSaved, savedName, savedNameError, savedNeedsTarget, type SavedQuery
 import QueryResultGrid from "../grid/QueryResultGrid.vue";
 import type { Engine } from "../grid/types";
 import Icon from "../shell/Icon.vue";
+import { tabHasPending } from "../shell/close-guard";
 import { loadSettings } from "../shell/settings";
 import { CONNECTION_STATUS_TEXT, type ConnectionStatus } from "../shell/status-text";
 import type { QueryTarget } from "../shell/session";
 import { ambiguousFieldNote, cachedColumns, fieldFailureNote, loadFields, qualifierFor, unknownFieldNote } from "./columns";
 import { completionPlan, connectionById, metadataNote, statementContext, targetDetail, targetKey, targetOptions, type TargetOption } from "./complete";
 import { resolveEditor } from "./editor";
+import { consumeExecuteRequest } from "./execute-request";
 import { fileOpenPlan, readSqlFile, saveSqlFile, sqlFileProblem, sqlSaveName, SQL_FILE_ACCEPT } from "./file-io";
 import { formatDocument } from "./format";
 import { sqlLintDiagnostics } from "./lint";
@@ -48,6 +50,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   "update:draft": [tabId: string, draft: string];
   target: [target: QueryTarget];
+  executed: [tabId: string, sql: string];
 }>();
 
 const editorPercent = ref(42);
@@ -168,6 +171,7 @@ const summary = computed(() => {
 const runStatusLine = computed(() => {
   const current = run.value;
   if (!current) return "";
+  if (current.pollError) return "状态刷新失败";
   if (current.cancel === "requested") return "取消中…";
   if (current.cancel === "confirmed" || current.status === "cancelled") return "已取消";
   if (current.cancel === "failed") return "取消失败，仍在执行";
@@ -574,6 +578,10 @@ async function execute(scope: "auto" | "current" | "script") {
   actionError.value = "";
   analyzePrompt.value = false;
   if (running.value || submitting.value) return;
+  if (tabHasPending(props.tabId)) {
+    actionError.value = "结果里还有未提交的更改。先提交或放弃这些更改，再重新执行，避免它们被新结果冲掉。";
+    return;
+  }
   mountEditor();
   const editor = view;
   if (!editor) {
@@ -620,6 +628,10 @@ async function execute(scope: "auto" | "current" | "script") {
 
 /** 标记原文的 send-range、发送 sqlText 并等待结束；变量代换后的发送与直发共用这一段。 */
 async function sendExecute(sqlText: string, from: number, to: number) {
+  if (tabHasPending(props.tabId)) {
+    actionError.value = "结果里还有未提交的更改。先提交或放弃这些更改，再重新执行，避免它们被新结果冲掉。";
+    return;
+  }
   mountEditor();
   const editor = view;
   if (!editor) {
@@ -643,6 +655,8 @@ async function sendExecute(sqlText: string, from: number, to: number) {
       sql: sqlText,
       limit: rowLimit(loadSettings().pageSize),
     });
+    // 成功发出才算“执行过”；之后关闭标签不会再提示这份草稿会丢失。
+    emit("executed", props.tabId, sqlText);
   } catch (err) {
     actionError.value = typeof err === "string" ? err : err instanceof Error ? err.message : "执行失败";
   } finally {
@@ -686,10 +700,12 @@ function continueRead() {
 
 watch(
   () => props.executeRequest,
-  (value, previous) => {
-    if (value == null || value === previous) return;
+  (value) => {
+    // immediate：命令面板请求可能先于本标签挂载发出；水位保证每个请求只消费一次。
+    if (!consumeExecuteRequest(value)) return;
     void execute("auto");
   },
+  { immediate: true },
 );
 
 function cancel() {
@@ -1190,7 +1206,8 @@ onBeforeUnmount(() => {
       <div class="results-heading"><span><Icon name="table" />结果</span><span v-if="run" class="q-summary" :data-status="run.status">{{ summary }}</span><span v-else class="muted">等待执行</span><span class="grow"></span><span class="muted">只读结果</span></div>
       <template v-if="run">
         <div v-if="run.statements.length > 1" class="result-tabs" role="tablist" aria-label="语句结果"><button v-for="(statement, index) in run.statements" :key="index" role="tab" :aria-selected="resultIndex === index" @click="resultIndex = index">结果 {{ index + 1 }} <span>{{ statement.columns.length ? `${statement.rows.length} 行` : statusLabel(statement.status) }}</span></button></div>
-        <p v-if="run.cancel === 'requested'" class="q-note" role="status">取消中…数据库确认后立即停止。</p>
+        <p v-if="run.pollError" class="q-note" role="alert">状态刷新失败：{{ run.pollError }}。已读取的结果保留，可以稍后重试读取。</p>
+        <p v-else-if="run.cancel === 'requested'" class="q-note" role="status">取消中…数据库确认后立即停止。</p>
         <p v-else-if="run.cancel === 'confirmed' || run.status === 'cancelled'" class="q-note" role="status">已取消。已读到的结果保留。</p>
         <p v-else-if="run.cancel === 'failed'" class="q-note" role="alert">取消失败，查询仍在执行。可以再次取消。</p>
         <template v-if="activeStatement">

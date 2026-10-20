@@ -54,6 +54,7 @@
 }
 
 /* 卡片上的操作菜单 */
+.modal-error { margin: 0 0 var(--sp-3); }
 .conn-menu { position: absolute; right: var(--sp-3); bottom: calc(var(--sp-8) + var(--sp-1)); z-index: 5; min-width: 180px; padding: var(--sp-1); border: 1px solid var(--line-2); border-radius: var(--r-md); background: var(--panel); box-shadow: var(--shadow); display: flex; flex-direction: column; animation: pop-in var(--dur-fast) var(--ease-out); }
 .conn-menu button { text-align: left; padding: var(--sp-2); border-radius: var(--r); display: flex; gap: var(--sp-2); align-items: center; font-size: var(--fs-sm); transition: background var(--dur-fast) var(--ease); }
 .conn-menu button:hover { background: var(--hover); }

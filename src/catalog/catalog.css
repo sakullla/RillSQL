@@ -38,6 +38,7 @@
 
 /* ---------- 树内说明条 ---------- */
 .tree .tree-note { padding-left: calc(var(--sp-6) + var(--d, 0) * var(--sp-4)); }
+.tree .tree-note.tree-empty { flex-wrap: wrap; align-items: center; }
 .tree .tree-note > div { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 0; }
 .tree .tree-note strong { font-size: var(--fs-sm); }
 .tree .tree-note .reason { color: var(--text-2); word-break: break-word; }
