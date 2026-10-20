@@ -6,6 +6,7 @@ import type { ConnectionApi, EnvTagInput, TestReport } from "./api";
 import ConnectionsPage from "./ConnectionsPage.vue";
 import { listPaletteConnections, MODULE_ID, replacePaletteConnections, setSqlitePicker } from "./index";
 import { blankDraft, storedConfigHidesSecrets, toStoredConfig, validate, type EnvTag, type SavedConnection, type SecretInput } from "./model";
+import { parseConnectionUrl } from "./url";
 
 const secret: SecretInput = { password: "db-secret-alpha", sshPassword: "ssh-secret-beta", passphrase: "key-pass-gamma" };
 
@@ -95,6 +96,58 @@ describe("connection model", () => {
     expect(storedConfigHidesSecrets(sqlite, secret)).toBe(true);
     expect(storedConfigHidesSecrets(mysql, secret)).toBe(true);
     expect(validate(blankDraft("sqlite")).filePath).toBe("请选择数据库文件");
+  });
+});
+
+describe("parseConnectionUrl", () => {
+  it("解析 postgres / mysql 标准连接串", () => {
+    const pg = parseConnectionUrl("postgres://app_user:secret@db.example.internal:5432/appdb");
+    expect(pg).toEqual({ ok: true, engine: "postgres", host: "db.example.internal", port: "5432", database: "appdb", username: "app_user", password: "secret", tlsMode: null });
+    const my = parseConnectionUrl("MYSQL://root@127.0.0.1:3307/inventory");
+    expect(my).toEqual({ ok: true, engine: "mysql", host: "127.0.0.1", port: "3307", database: "inventory", username: "root", password: "", tlsMode: null });
+  });
+
+  it("解码密码里的百分号编码，畸形百分号按原文保留", () => {
+    const decoded = parseConnectionUrl("postgres://u:p%40ss%21@h/db");
+    expect(decoded.ok && decoded.password).toBe("p@ss!");
+    const raw = parseConnectionUrl("postgres://u:pa%zz@h/db");
+    expect(raw.ok && raw.password).toBe("pa%zz");
+  });
+
+  it("缺端口时取引擎默认端口，IPv6 主机去括号", () => {
+    const pg = parseConnectionUrl("postgres://u@h/db");
+    expect(pg.ok && pg.port).toBe("5432");
+    const maria = parseConnectionUrl("mariadb://u@h/db");
+    expect(maria.ok && maria.port).toBe("3306");
+    const v6 = parseConnectionUrl("postgres://u@[::1]/db");
+    expect(v6.ok && v6.host).toBe("::1");
+  });
+
+  it("sslmode 映射 TLS 档位，未出现时不覆盖", () => {
+    const disable = parseConnectionUrl("postgres://u@h/db?sslmode=disable");
+    expect(disable.ok && disable.tlsMode).toBe("off");
+    const prefer = parseConnectionUrl("postgres://u@h/db?sslmode=prefer");
+    expect(prefer.ok && prefer.tlsMode).toBe("require");
+    const verify = parseConnectionUrl("postgres://u@h/db?sslmode=verify-full");
+    expect(verify.ok && verify.tlsMode).toBe("verify");
+    const verifyCa = parseConnectionUrl("postgres://u@h/db?sslmode=verify-ca");
+    expect(verifyCa.ok && verifyCa.tlsMode).toBe("verify");
+    const absent = parseConnectionUrl("mysql://u@h/db?ssl-mode=REQUIRED");
+    expect(absent.ok && absent.tlsMode).toBe(null);
+    const plain = parseConnectionUrl("postgres://u@h/db");
+    expect(plain.ok && plain.tlsMode).toBe(null);
+  });
+
+  it("不支持的前缀与残缺串给出中文原因", () => {
+    for (const text of ["sqlite:C:/data/notes.db", "jdbc:postgresql://h/db", "postgres:h", "   "]) {
+      expect(parseConnectionUrl(text)).toEqual({ ok: false, reason: expect.stringContaining("只支持") });
+    }
+    const noHost = parseConnectionUrl("postgres://");
+    expect(noHost.ok).toBe(false);
+    expect(!noHost.ok && noHost.reason).toContain("主机");
+    const badPort = parseConnectionUrl("postgres://h:notaport/db");
+    expect(badPort.ok).toBe(false);
+    expect(!badPort.ok && badPort.reason).toContain("格式");
   });
 });
 
@@ -229,6 +282,70 @@ describe("connections page", () => {
     expect(panel.get(".test-line").text()).toBe("连接成功 · PostgreSQL 16.4");
     expect(wrapper.find(".test-steps").exists()).toBe(false);
     expect(panel.text()).not.toContain("登录数据库");
+    wrapper.unmount();
+  });
+
+  it("新建时粘贴连接串一键填充，切换引擎且密码仅本次使用", async () => {
+    replacePaletteConnections([]);
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api: pageApi(() => ({ status: "ok", stages: [] })) } });
+    await flushPromises();
+    await wrapper.get("[data-action=conn-new]").trigger("click");
+
+    // 折叠入口默认收起，只对非 SQLite 引擎显示
+    const paste = wrapper.get('details[data-section="paste-url"]');
+    expect(paste.attributes("open")).toBeUndefined();
+    expect(paste.text()).toContain("从连接串粘贴");
+
+    await wrapper.get("[data-field=url-paste]").setValue("mysql://app_user:db-secret@db.example.test/inventory?sslmode=disable");
+    await wrapper.get("[data-action=cf-parse-url]").trigger("click");
+
+    expect((wrapper.get('input[value="mysql"]').element as HTMLInputElement).checked).toBe(true);
+    expect((wrapper.get("[data-field=host]").element as HTMLInputElement).value).toBe("db.example.test");
+    expect((wrapper.get("[data-field=port]").element as HTMLInputElement).value).toBe("3306");
+    expect((wrapper.get("[data-field=username]").element as HTMLInputElement).value).toBe("app_user");
+    expect((wrapper.get("[data-field=password]").element as HTMLInputElement).value).toBe("db-secret");
+    // 密码不自动勾选保存：只进本次会话，与系统凭据库语义对齐
+    expect((wrapper.get("[data-field=savePassword]").element as HTMLInputElement).checked).toBe(false);
+    expect((wrapper.find('input[name="cf-tls"][value="off"]').element as HTMLInputElement).checked).toBe(true);
+    const note = wrapper.get(".paste-note");
+    expect(note.text()).toContain("已把引擎切换为 MySQL");
+    expect(note.text()).toContain("密码已填入，仅本次使用；勾选保存才会写入系统凭据库");
+    expect(note.classes()).not.toContain("field-err");
+
+    await wrapper.get('input[value="sqlite"]').trigger("change");
+    expect(wrapper.find('details[data-section="paste-url"]').exists()).toBe(false);
+    wrapper.unmount();
+    replacePaletteConnections([]);
+  });
+
+  it("编辑已保存连接时粘贴不同引擎的连接串只填字段不换引擎", async () => {
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api: pageApi(() => ({ status: "ok", stages: [] })) } });
+    await flushPromises();
+    await wrapper.get("[data-action=conn-menu]").trigger("click");
+    await wrapper.get("[data-action=conn-edit]").trigger("click");
+
+    await wrapper.get("[data-field=url-paste]").setValue("postgres://pg_user@pg.example.test:5432/analytics");
+    await wrapper.get("[data-action=cf-parse-url]").trigger("click");
+
+    expect((wrapper.get('input[value="mysql"]').element as HTMLInputElement).checked).toBe(true);
+    expect((wrapper.get("[data-field=host]").element as HTMLInputElement).value).toBe("pg.example.test");
+    expect((wrapper.get("[data-field=port]").element as HTMLInputElement).value).toBe("5432");
+    expect((wrapper.get("[data-field=username]").element as HTMLInputElement).value).toBe("pg_user");
+    expect(wrapper.get(".paste-note").text()).toContain("连接串是 PostgreSQL 引擎，与该连接不同，仅填充主机等字段");
+    wrapper.unmount();
+  });
+
+  it("粘贴无法识别的连接串时显示中文原因", async () => {
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api: pageApi(() => ({ status: "ok", stages: [] })) } });
+    await flushPromises();
+    await wrapper.get("[data-action=conn-new]").trigger("click");
+
+    await wrapper.get("[data-field=url-paste]").setValue("sqlite:C:/data/notes.db");
+    await wrapper.get("[data-action=cf-parse-url]").trigger("click");
+
+    const note = wrapper.get(".paste-note");
+    expect(note.classes()).toContain("field-err");
+    expect(note.text()).toContain("只支持 postgres://、postgresql://、mysql:// 或 mariadb:// 开头的连接串");
     wrapper.unmount();
   });
 

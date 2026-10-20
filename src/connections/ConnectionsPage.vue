@@ -22,6 +22,7 @@ import {
   type SecretInput,
   type TlsMode,
 } from "./model";
+import { parseConnectionUrl } from "./url";
 import "./connections.css";
 
 const props = defineProps<{ sqlitePrompt: number; api?: ConnectionApi }>();
@@ -38,6 +39,9 @@ const busy = ref(false);
 const menuId = ref<string | null>(null);
 const dialog = ref<"edit" | "delete" | "password" | "details" | null>(null);
 const advancedOpen = ref(false);
+const pasteText = ref("");
+const pasteNote = ref("");
+const pasteFailed = ref(false);
 const draft = ref<ConnectionDraft>(blankDraft("postgres"));
 const fieldErrors = ref<Record<string, string>>({});
 const report = ref<TestReport | null>(null);
@@ -181,6 +185,9 @@ function openEditor(existing?: SavedConnection, engine?: Engine) {
   report.value = null;
   fieldErrors.value = {};
   note.value = "";
+  pasteText.value = "";
+  pasteNote.value = "";
+  pasteFailed.value = false;
   resetSecrets();
   if (existing) {
     draft.value = draftFromSaved(existing);
@@ -204,6 +211,38 @@ function switchEngine(engine: Engine) {
   draft.value = next;
   ensureDraftEnv();
   report.value = null;
+}
+
+/** 从连接串解析并填充表单。密码只进本次会话，不自动写入系统凭据库（对齐后端 secrets.rs 的语义）。 */
+function applyConnectionUrl() {
+  const parsed = parseConnectionUrl(pasteText.value);
+  if (!parsed.ok) {
+    pasteFailed.value = true;
+    pasteNote.value = parsed.reason;
+    return;
+  }
+  const parts: string[] = [];
+  if (parsed.engine === draft.value.engine) {
+    parts.push("已按连接串填好主机、端口、数据库和用户名。");
+  } else if (draft.value.id) {
+    // 编辑已保存的连接时不改引擎（switchEngine 对带 id 的草稿本来就不动），只填主机等字段。
+    parts.push(`连接串是 ${engineMeta(parsed.engine).label} 引擎，与该连接不同，仅填充主机等字段。`);
+  } else {
+    switchEngine(parsed.engine);
+    parts.push(`已把引擎切换为 ${engineMeta(parsed.engine).label}。`);
+  }
+  draft.value.host = parsed.host;
+  draft.value.port = parsed.port;
+  draft.value.database = parsed.database;
+  draft.value.username = parsed.username;
+  if (parsed.tlsMode) draft.value.tlsMode = parsed.tlsMode;
+  if (parsed.password) {
+    secrets.password = parsed.password;
+    draft.value.savePassword = false;
+    parts.push("密码已填入，仅本次使用；勾选保存才会写入系统凭据库。");
+  }
+  pasteFailed.value = false;
+  pasteNote.value = parts.join("");
 }
 
 function syncAdvanced(event: Event) {
@@ -483,6 +522,20 @@ watch(
           </label>
         </div>
 
+        <details v-if="draft.engine !== 'sqlite'" class="disclosure" data-section="paste-url">
+          <summary>从连接串粘贴 <span class="muted">postgres://user:pass@host:5432/db</span></summary>
+          <div class="disclosure-body">
+            <label class="field full">
+              <span>连接串</span>
+              <textarea v-model="pasteText" class="mono" data-field="url-paste" rows="2" placeholder="postgres://user:password@db.example.internal:5432/app?sslmode=require" aria-label="粘贴连接串"></textarea>
+            </label>
+            <div class="input-row">
+              <button class="btn" type="button" data-action="cf-parse-url" @click="applyConnectionUrl">解析并填充</button>
+              <p v-if="pasteNote" class="paste-note" :class="pasteFailed ? 'field-err' : 'muted'" role="status">{{ pasteNote }}</p>
+            </div>
+          </div>
+        </details>
+
         <div v-if="draft.engine === 'sqlite'" class="form-grid">
           <label class="field full"><span>连接名称</span><input v-model="draft.name" placeholder="例如 本地笔记" /></label>
           <label class="field full">
@@ -501,8 +554,8 @@ watch(
           <label class="field"><span>端口<em class="req">*</em></span><input v-model="draft.port" class="mono" data-field="port" :aria-invalid="Boolean(fieldErrors.port)" /><small v-if="fieldErrors.port" class="field-err">{{ fieldErrors.port }}</small></label>
           <label class="field"><span>数据库</span><input v-model="draft.database" class="mono" :placeholder="draft.engine === 'postgres' ? 'postgres' : '可选'" /></label>
           <label class="field"><span>用户名<em class="req">*</em></span><input v-model="draft.username" class="mono" data-field="username" :aria-invalid="Boolean(fieldErrors.username)" /><small v-if="fieldErrors.username" class="field-err">{{ fieldErrors.username }}</small></label>
-          <label class="field full"><span>密码</span><input v-model="secrets.password" type="password" autocomplete="new-password" /><small>留空则继续使用系统凭据库里已保存的密码。密码不会写入普通配置。</small></label>
-          <label class="check full"><input v-model="draft.savePassword" type="checkbox" /><span>把密码保存到系统凭据库<small>不勾选时，每次连接都会询问密码。</small></span></label>
+          <label class="field full"><span>密码</span><input v-model="secrets.password" type="password" data-field="password" autocomplete="new-password" /><small>留空则继续使用系统凭据库里已保存的密码。密码不会写入普通配置。</small></label>
+          <label class="check full"><input v-model="draft.savePassword" type="checkbox" data-field="savePassword" /><span>把密码保存到系统凭据库<small>不勾选时，每次连接都会询问密码。</small></span></label>
         </div>
         <div v-if="draft.engine === 'sqlite'" class="callout callout-info"><ConnIcon name="info" /><div>SQLite 是本地文件，不需要 TLS 或 SSH。连接后会显示外键约束（foreign_keys）的实际状态——SQLite 默认不强制外键。</div></div>
 
