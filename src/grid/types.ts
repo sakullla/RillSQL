@@ -1,7 +1,7 @@
 export type Engine = "postgres" | "mysql" | "mariadb" | "sqlite";
 export type TableKind = "table" | "view" | "query";
 export type Cell = string | null;
-export type FilterOp = "eq" | "ne" | "contains" | "starts" | "gt" | "lt" | "null" | "notnull" | "empty";
+export type FilterOp = "eq" | "ne" | "contains" | "starts" | "gt" | "lt" | "between" | "in" | "null" | "notnull" | "empty";
 
 export interface Column {
   name: string;
@@ -45,6 +45,10 @@ export interface Filter {
   column: string;
   op: FilterOp;
   value?: string;
+  /** between 的上界，value 是下界。 */
+  second?: string;
+  /** in 的精确匹配列表。 */
+  values?: string[];
 }
 
 export interface SortSpec {
@@ -111,6 +115,8 @@ export const FILTER_OPS: readonly FilterOpMeta[] = [
   { id: "starts", label: "开头是", needsValue: true },
   { id: "gt", label: ">", needsValue: true },
   { id: "lt", label: "<", needsValue: true },
+  { id: "between", label: "介于", needsValue: true },
+  { id: "in", label: "属于(in)", needsValue: true },
   { id: "null", label: "为 NULL", needsValue: false },
   { id: "notnull", label: "不为 NULL", needsValue: false },
   { id: "empty", label: "为空字符串", needsValue: false },

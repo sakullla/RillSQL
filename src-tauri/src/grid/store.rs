@@ -65,6 +65,8 @@ pub enum FilterOp {
     Starts,
     Gt,
     Lt,
+    Between,
+    In,
     Null,
     NotNull,
     Empty,
@@ -81,6 +83,8 @@ pub struct Filter {
     pub column: String,
     pub op: FilterOp,
     pub value: Option<String>,
+    pub second: Option<String>,
+    pub values: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +141,8 @@ pub fn touch_api() -> usize {
         FilterOp::Starts,
         FilterOp::Gt,
         FilterOp::Lt,
+        FilterOp::Between,
+        FilterOp::In,
         FilterOp::Null,
         FilterOp::NotNull,
         FilterOp::Empty,
@@ -281,7 +287,7 @@ fn order_text(type_name: &str, left: &str, right: &str) -> std::cmp::Ordering {
     left.cmp(right)
 }
 
-fn matches(column: &Column, value: &Cell, filter: &Filter) -> bool {
+pub(crate) fn matches(column: &Column, value: &Cell, filter: &Filter) -> bool {
     match filter.op {
         FilterOp::Null => value == &Cell::Null,
         FilterOp::NotNull => value != &Cell::Null,
@@ -292,6 +298,17 @@ fn matches(column: &Column, value: &Cell, filter: &Filter) -> bool {
         },
         FilterOp::Starts => match value {
             Cell::Text(text) => text.to_lowercase().starts_with(&filter.value.clone().unwrap_or_default().to_lowercase()),
+            Cell::Null => false,
+        },
+        FilterOp::Between => {
+            let Cell::Text(text) = value else { return false };
+            let (Some(low), Some(high)) = (filter.value.as_deref(), filter.second.as_deref()) else {
+                return false;
+            };
+            order_text(&column.type_name, text, low).is_ge() && order_text(&column.type_name, text, high).is_le()
+        }
+        FilterOp::In => match value {
+            Cell::Text(text) => filter.values.iter().any(|item| item == text),
             Cell::Null => false,
         },
         FilterOp::Eq | FilterOp::Ne | FilterOp::Gt | FilterOp::Lt => {

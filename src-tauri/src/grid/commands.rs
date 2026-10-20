@@ -23,6 +23,10 @@ pub struct FilterArg {
     pub column: String,
     pub op: String,
     pub value: Option<String>,
+    #[serde(default)]
+    pub second: Option<String>,
+    #[serde(default)]
+    pub values: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,6 +212,8 @@ fn filters_of(filters: &[FilterArg]) -> Result<Vec<Filter>, String> {
                 column: filter.column.clone(),
                 op: parse_op(&filter.op)?,
                 value: filter.value.clone(),
+                second: filter.second.clone(),
+                values: filter.values.clone(),
             })
         })
         .collect()
@@ -221,6 +227,8 @@ fn parse_op(op: &str) -> Result<FilterOp, String> {
         "starts" => FilterOp::Starts,
         "gt" => FilterOp::Gt,
         "lt" => FilterOp::Lt,
+        "between" => FilterOp::Between,
+        "in" => FilterOp::In,
         "null" => FilterOp::Null,
         "notnull" => FilterOp::NotNull,
         "empty" => FilterOp::Empty,

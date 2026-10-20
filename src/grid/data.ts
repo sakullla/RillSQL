@@ -77,6 +77,12 @@ export function matchesFilter(column: Column, value: Cell, filter: Filter): bool
   const raw = filter.value ?? "";
   if (filter.op === "contains") return value.toLowerCase().includes(raw.toLowerCase());
   if (filter.op === "starts") return value.toLowerCase().startsWith(raw.toLowerCase());
+  if (filter.op === "between") {
+    const second = filter.second ?? "";
+    if (!raw || !second) return false;
+    return compareValues(column, value, raw) >= 0 && compareValues(column, value, second) <= 0;
+  }
+  if (filter.op === "in") return (filter.values ?? []).includes(value);
   const order = compareValues(column, value, raw);
   if (filter.op === "eq") return order === 0;
   if (filter.op === "ne") return order !== 0;

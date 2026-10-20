@@ -10,16 +10,22 @@ import type { InsertTarget } from "../export/insert";
 import { catalogConnections } from "../catalog/store";
 import { registerPending } from "../shell/close-guard";
 import { loadSettings } from "../shell/settings";
+import { describeStructure } from "../structure/api";
+import type { StructureForeignKey } from "../structure/types";
 import { rectangleSelection, selectionTsv, type CellPoint } from "./clipboard";
 import { copyCellText, copySqlValue, needsFullRead, showCell, type NullCopy } from "./display";
+import { referenceJump, referenceQuery } from "./reference";
 import { isPreviewEnvelope, rejectWrite, typeCaption } from "./typeset";
 import "./grid.css";
 import { useRowWindow } from "./virtual";
 import { LiveTable } from "./live";
 import type { TableTarget } from "./target";
-import { FILTER_OPS, opLabel, opNeedsValue, type Cell, type FilterOp } from "./types";
+import { FILTER_OPS, opLabel, opNeedsValue, type Cell, type Filter, type FilterOp } from "./types";
 
 const props = defineProps<{ tabId: string; draft: string; pageSize?: number; nullCopy?: NullCopy; target?: TableTarget | null }>();
+const emit = defineEmits<{
+  "jump-reference": [sql: string, ref: string];
+}>();
 const session = props.target ? reactive(new LiveTable(props.target, props.pageSize ?? loadSettings().pageSize)) : null;
 if (session) void session.open();
 let releasePending: (() => void) | null = null;
@@ -53,6 +59,8 @@ watch(
 );
 const filterOp = ref<FilterOp>("eq");
 const filterValue = ref("");
+const filterSecond = ref("");
+const filterValues = ref("");
 const filterError = ref("");
 const exportOpen = ref(false);
 const importOpen = ref(false);
@@ -70,6 +78,9 @@ const focusCellPoint = ref<CellPoint | null>(null);
 const dragging = ref(false);
 const menu = ref<{ x: number; y: number; row: string; column: string } | null>(null);
 const menuError = ref("");
+/** 单元格菜单首次打开时读一次表结构，供外键值跳转；只在成功后缓存，失败允许下次再试。 */
+const referenceKeys = ref<StructureForeignKey[] | null>(null);
+let referenceLoad: Promise<void> | null = null;
 let editToken = 0;
 let resizeMove: ((event: PointerEvent) => void) | null = null;
 let resizeUp: (() => void) | null = null;
@@ -185,9 +196,16 @@ const noKeyHint = computed(() => {
 async function applyFilter() {
   if (!session) return;
   filterError.value = "";
-  const error = await session.addFilter({ column: filterColumn.value, op: filterOp.value, value: filterValue.value });
+  const filter: Filter = { column: filterColumn.value, op: filterOp.value, value: filterValue.value };
+  if (filterOp.value === "between") filter.second = filterSecond.value;
+  if (filterOp.value === "in") filter.values = filterValues.value.split(",").map((item) => item.trim()).filter(Boolean);
+  const error = await session.addFilter(filter);
   if (error && !session.error) filterError.value = error;
-  else if (!error) filterValue.value = "";
+  else if (!error) {
+    filterValue.value = "";
+    filterSecond.value = "";
+    filterValues.value = "";
+  }
 }
 
 async function clearFilters() {
@@ -429,6 +447,39 @@ function onCellMenu(row: string, column: string, event: MouseEvent) {
   session?.select(row, column);
   menuError.value = "";
   menu.value = { x: event.clientX, y: event.clientY, row, column };
+  loadReferenceKeys();
+}
+
+function loadReferenceKeys(): void {
+  if (referenceKeys.value || referenceLoad || !props.target) return;
+  referenceLoad = describeStructure(props.target).then(
+    (described) => {
+      referenceKeys.value = described.foreignKeyList;
+    },
+    () => {
+      referenceLoad = null;
+      if (menu.value) menuError.value = "读取表结构失败，暂时不能跳转引用行。";
+    },
+  );
+}
+
+/** 右键的格子命中可跳转的外键时给出菜单项：点击后在引用表上执行等值查询。 */
+const referenceMenuItem = computed<{ sql: string; label: string } | null>(() => {
+  const target = menu.value;
+  if (!target || !session || !referenceKeys.value) return null;
+  const rowCells: Record<string, Cell | undefined> = {};
+  for (const column of columns.value) rowCells[column.name] = session.cellValue(target.row, column.name);
+  const jump = referenceJump(referenceKeys.value, target.column, rowCells);
+  if (!jump) return null;
+  const label = jump.foreignKey.refSchema ? `${jump.foreignKey.refSchema}.${jump.foreignKey.refTable}` : jump.foreignKey.refTable;
+  return { sql: referenceQuery(session.store.schema.engine, jump.foreignKey, jump.values), label };
+});
+
+function jumpReferenceFromMenu(): void {
+  const item = referenceMenuItem.value;
+  if (!item) return;
+  menu.value = null;
+  emit("jump-reference", item.sql, item.label);
 }
 
 async function ensureFull(rowId: string, column: string): Promise<string | null> {
@@ -650,11 +701,16 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
         <select v-model="filterOp" aria-label="筛选条件">
           <option v-for="op in FILTER_OPS" :key="op.id" :value="op.id">{{ op.label }}</option>
         </select>
-        <input v-if="opNeedsValue(filterOp)" v-model="filterValue" aria-label="筛选值" />
+        <input v-if="opNeedsValue(filterOp)" v-model="filterValue" aria-label="筛选值" :placeholder="filterOp === 'between' ? '下界' : undefined" />
+        <input v-if="filterOp === 'between'" v-model="filterSecond" aria-label="筛选第二个值" placeholder="上界" />
+        <input v-if="filterOp === 'in'" v-model="filterValues" aria-label="筛选值列表" placeholder="多个值用逗号分隔，空段忽略" />
         <button class="btn sm" type="submit">筛选</button>
       </form>
       <span v-for="(filter, index) in session.filters" :key="`${filter.column}-${index}`" class="chip">
-        <b>{{ filter.column }}</b> {{ opLabel(filter.op) }} <code v-if="opNeedsValue(filter.op)">{{ filter.value }}</code>
+        <b>{{ filter.column }}</b> {{ opLabel(filter.op) }}
+        <code v-if="filter.op === 'between'">{{ filter.value }} ~ {{ filter.second }}</code>
+        <code v-else-if="filter.op === 'in'">{{ (filter.values ?? []).join(", ") }}</code>
+        <code v-else-if="opNeedsValue(filter.op)">{{ filter.value }}</code>
         <button class="chip-x" type="button" :aria-label="`移除条件 ${index + 1}`" @click="session.removeFilter(index)">×</button>
       </span>
       <span v-if="session.sort" class="chip">{{ session.sort.column }} {{ session.sort.direction === "asc" ? "升序" : "降序" }}
@@ -814,6 +870,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
       <button type="button" role="menuitem" @click="copySelection(); menu = null">复制</button>
       <button type="button" role="menuitem" @click="editFromMenu">编辑</button>
       <button type="button" role="menuitem" @click="setNullFromMenu">设为 NULL</button>
+      <button v-if="referenceMenuItem" type="button" role="menuitem" data-action="jump-reference" @click="jumpReferenceFromMenu">查看引用行 → {{ referenceMenuItem.label }}</button>
       <p v-if="menuError" class="menu-error" role="alert">{{ menuError }}</p>
     </div>
     </template>

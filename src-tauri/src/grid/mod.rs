@@ -28,4 +28,6 @@ pub fn module_id() -> &'static str {
 }
 
 #[cfg(test)]
+mod filter_tests;
+#[cfg(test)]
 mod tests;

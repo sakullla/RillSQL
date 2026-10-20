@@ -137,6 +137,14 @@ pub fn filter_clause(engine: Engine, column: &Column, filter: &Filter) -> String
         FilterOp::Starts => format!("{ident} LIKE {} ESCAPE '!'", like_literal(raw, false)),
         FilterOp::Gt => format!("{ident} > {}", sql_cell(engine, Some(column), &Cell::Text(raw.to_owned()))),
         FilterOp::Lt => format!("{ident} < {}", sql_cell(engine, Some(column), &Cell::Text(raw.to_owned()))),
+        FilterOp::Between => {
+            let high = filter.second.as_deref().unwrap_or("");
+            format!("{ident} BETWEEN {} AND {}", sql_cell(engine, Some(column), &Cell::Text(raw.to_owned())), sql_cell(engine, Some(column), &Cell::Text(high.to_owned())))
+        }
+        FilterOp::In => {
+            let list = filter.values.iter().map(|item| sql_cell(engine, Some(column), &Cell::Text(item.clone()))).collect::<Vec<_>>().join(", ");
+            format!("{ident} IN ({list})")
+        }
         FilterOp::Null => format!("{ident} IS NULL"),
         FilterOp::NotNull => format!("{ident} IS NOT NULL"),
         FilterOp::Empty => format!("{ident} = ''"),
@@ -158,7 +166,15 @@ pub fn compile_where(schema: &TableSchema, filters: &[Filter]) -> Result<String,
         let Some(column) = schema.columns.iter().find(|column| column.name == filter.column) else {
             return Err(format!("找不到列 {}，不能拼进筛选条件", filter.column));
         };
-        if filter.op.needs_value() && filter.value.as_deref().unwrap_or("").is_empty() {
+        if filter.op == FilterOp::Between {
+            if filter.value.as_deref().unwrap_or("").is_empty() || filter.second.as_deref().unwrap_or("").is_empty() {
+                return Err("between 需要两个值".to_owned());
+            }
+        } else if filter.op == FilterOp::In {
+            if filter.values.is_empty() {
+                return Err("IN 筛选至少要一个值".to_owned());
+            }
+        } else if filter.op.needs_value() && filter.value.as_deref().unwrap_or("").is_empty() {
             return Err("筛选值不能为空".to_owned());
         }
         parts.push(filter_clause(schema.engine, column, filter));

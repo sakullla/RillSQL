@@ -62,6 +62,10 @@ export function filterClause(engine: Engine, column: Column, filter: Filter): st
       return `${ident} > ${sqlValue(column, value)}`;
     case "lt":
       return `${ident} < ${sqlValue(column, value)}`;
+    case "between":
+      return `${ident} BETWEEN ${sqlValue(column, value)} AND ${sqlValue(column, filter.second ?? "")}`;
+    case "in":
+      return `${ident} IN (${(filter.values ?? []).map((item) => sqlValue(column, item)).join(", ")})`;
     case "null":
       return `${ident} IS NULL`;
     case "notnull":
@@ -80,6 +84,16 @@ export function compileWhere(schema: TableSchema, filters: readonly Filter[]): {
   for (const filter of filters) {
     const column = schema.columns.find((item) => item.name === filter.column);
     if (!column) return { ok: false, error: `未知列 ${filter.column}，不能拼接手写条件` };
+    if (filter.op === "between") {
+      if (!filter.value || !filter.second) return { ok: false, error: "between 需要两个值" };
+      parts.push(filterClause(schema.engine, column, filter));
+      continue;
+    }
+    if (filter.op === "in") {
+      if (!filter.values?.length) return { ok: false, error: "IN 筛选至少要一个值" };
+      parts.push(filterClause(schema.engine, column, filter));
+      continue;
+    }
     if (!opNeedsValue(filter.op)) {
       parts.push(filterClause(schema.engine, column, filter));
       continue;

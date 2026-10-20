@@ -8,16 +8,16 @@ import { anyPending, resetCloseGuard, tabHasPending } from "../shell/close-guard
 import type { CatalogConnection } from "../catalog/types";
 import { exportTasks, resetExportTasks } from "../export/tasks";
 import DataGrid from "./DataGrid.vue";
-import { commitChanges, queryPage, viewLoadedRows } from "./data";
+import { commitChanges, matchesFilter, queryPage, viewLoadedRows } from "./data";
 import { locateResultRows, readSingleTable, resolveEditableTable, ResultEditSession } from "./result-edit";
 import { gridModel } from "../query/rows";
 import { copyPlain, copySqlValue, showCell } from "./display";
 import { customersFixture, nokeyFixture, viewFixture } from "./fixture";
 import QueryResultGrid from "./QueryResultGrid.vue";
 import { TableSession } from "./session";
-import { selectExportGate } from "./sql";
+import { compileWhere, selectExportGate } from "./sql";
 import type { TableTarget } from "./target";
-import { COMMIT_RULE, type Column } from "./types";
+import { COMMIT_RULE, FILTER_OPS, opLabel, opNeedsValue, type Column } from "./types";
 
 const invoke = vi.hoisted(() => vi.fn());
 
@@ -100,6 +100,39 @@ describe("grid batches, nulls and server filters", () => {
     expect(broken.loaded).toHaveLength(0);
     expect(broken.error).toContain("读取失败");
     expect(queryPage(broken.store, { filters: broken.filters, sort: null, offset: 0, limit: 10 })).toMatchObject({ ok: false, emptyMatch: false });
+  });
+
+  it("adds between and in operators with metadata, SQL and local matching", () => {
+    const betweenMeta = FILTER_OPS.find((item) => item.id === "between");
+    expect(betweenMeta?.label).toBe("介于");
+    expect(betweenMeta?.needsValue).toBe(true);
+    const inMeta = FILTER_OPS.find((item) => item.id === "in");
+    expect(inMeta?.label).toBe("属于(in)");
+    expect(inMeta?.needsValue).toBe(true);
+    expect(opLabel("between")).toBe("介于");
+    expect(opNeedsValue("in")).toBe(true);
+
+    const store = customersFixture(20);
+    const between = queryPage(store, { filters: [{ column: "id", op: "between", value: "5", second: "8" }], sort: null, offset: 0, limit: 100 });
+    expect(between).toMatchObject({ ok: true, matched: 4 });
+    if (between.ok) expect(between.sql).toContain("\"id\" BETWEEN 5 AND 8");
+    const oneOf = queryPage(store, { filters: [{ column: "name", op: "in", values: ["小河", "000-first"] }], sort: null, offset: 0, limit: 100 });
+    expect(oneOf).toMatchObject({ ok: true, matched: 3 });
+    if (oneOf.ok) expect(oneOf.sql).toContain("\"name\" IN ('小河', '000-first')");
+    const mysql = compileWhere({ ...store.schema, engine: "mysql" }, [{ column: "id", op: "between", value: "5", second: "8" }]);
+    expect(mysql).toEqual({ ok: true, sql: "`id` BETWEEN 5 AND 8" });
+    expect(compileWhere(store.schema, [{ column: "id", op: "between", value: "5" }])).toEqual({ ok: false, error: "between 需要两个值" });
+    expect(compileWhere(store.schema, [{ column: "id", op: "in", values: [] }])).toEqual({ ok: false, error: "IN 筛选至少要一个值" });
+    expect(queryPage(store, { filters: [{ column: "id", op: "between", value: "5" }], sort: null, offset: 0, limit: 10 })).toMatchObject({ ok: false, emptyMatch: false });
+    expect(queryPage(store, { filters: [{ column: "id", op: "in", values: [] }], sort: null, offset: 0, limit: 10 })).toMatchObject({ ok: false, emptyMatch: false });
+
+    const note = store.schema.columns[3]!;
+    expect(matchesFilter(note, "b", { column: "note", op: "between", value: "a", second: "c" })).toBe(true);
+    expect(matchesFilter(note, "d", { column: "note", op: "between", value: "a", second: "c" })).toBe(false);
+    expect(matchesFilter(note, "b", { column: "note", op: "between", value: "a" })).toBe(false);
+    expect(matchesFilter(note, "甲", { column: "note", op: "in", values: ["甲", "乙"] })).toBe(true);
+    expect(matchesFilter(note, "丙", { column: "note", op: "in", values: ["甲", "乙"] })).toBe(false);
+    expect(matchesFilter(note, null, { column: "note", op: "in", values: ["甲"] })).toBe(false);
   });
 });
 
@@ -464,6 +497,66 @@ describe("grid views", () => {
     wrapper.unmount();
   });
 
+  it("jumps to the referenced rows from the cell menu", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") {
+        return {
+          rows: [customerRow(1), customerRow(4)],
+          truncated: false,
+          sql: "SELECT customers",
+        };
+      }
+      if (command === "ddl_describe") {
+        return {
+          foreignKeyList: [{
+            name: "orders_note_fk",
+            columns: ["note"],
+            refSchema: "public",
+            refTable: "customers",
+            refColumns: ["note"],
+            onDelete: "NO ACTION",
+            onUpdate: "NO ACTION",
+          }],
+        };
+      }
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:shop:app:public:customers", draft: "", pageSize: 10, target: customersTarget } });
+    await flushPromises();
+    // 表结构在单元格菜单第一次打开前不读。
+    expect(invoke.mock.calls.some((call) => call[0] === "ddl_describe")).toBe(false);
+    await wrapper.get("[data-cell='4:note']").trigger("contextmenu", { clientX: 24, clientY: 24 });
+    await flushPromises();
+    const jump = wrapper.get("[data-action='jump-reference']");
+    expect(jump.text()).toContain("查看引用行 → public.customers");
+    await jump.trigger("click");
+    expect(wrapper.emitted("jump-reference")).toEqual([['SELECT *\nFROM "public"."customers"\nWHERE "note" = \'备注4\';', "public.customers"]]);
+    expect(wrapper.find(".cell-menu").exists()).toBe(false);
+    // NULL 的外键值拼不出等值条件，菜单里不出现跳转项。
+    await wrapper.get("[data-cell='1:note']").trigger("contextmenu", { clientX: 24, clientY: 24 });
+    await flushPromises();
+    expect(wrapper.find("[data-action='jump-reference']").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("reports a failed structure read in the cell menu without blocking the basics", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") return { rows: [customerRow(1)], truncated: false, sql: "SELECT customers" };
+      if (command === "ddl_describe") throw new Error("连接已断开");
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:shop:app:public:customers", draft: "", pageSize: 10, target: customersTarget } });
+    await flushPromises();
+    await wrapper.get("[data-cell='1:name']").trigger("contextmenu", { clientX: 24, clientY: 24 });
+    await flushPromises();
+    expect(wrapper.get(".cell-menu .menu-error").text()).toContain("读取表结构失败");
+    expect(wrapper.find("[data-action='jump-reference']").exists()).toBe(false);
+    expect(wrapper.get(".cell-menu").text()).toContain("复制");
+    wrapper.unmount();
+  });
+
   it("shows a read failure instead of no matches", async () => {
     invoke.mockRejectedValue(new Error("连接已断开，读取失败"));
     const wrapper = mount(DataGrid, { props: { tabId: "table:shop:app:public:broken", draft: "", target: { ...customersTarget, table: "broken" } } });
@@ -514,6 +607,37 @@ describe("grid views", () => {
     expect(wrapper.find("[data-empty]").exists()).toBe(false);
     expect(wrapper.text()).toContain("客户1");
     expect(wrapper.text()).toContain("客户2");
+    wrapper.unmount();
+  });
+
+  it("submits between and in filters from the toolbar form", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") return { rows: [customerRow(1), customerRow(5)], truncated: false, sql: "SELECT customers" };
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:filter-ops", draft: "", pageSize: 10, target: customersTarget } });
+    await flushPromises();
+    await wrapper.get("select[aria-label='筛选列']").setValue("id");
+    await wrapper.get("select[aria-label='筛选条件']").setValue("between");
+    expect(wrapper.find("input[aria-label='筛选第二个值']").exists()).toBe(true);
+    await wrapper.get("input[aria-label='筛选值']").setValue("1");
+    await wrapper.get("input[aria-label='筛选第二个值']").setValue("9");
+    await wrapper.get("form.filter-form").trigger("submit");
+    await flushPromises();
+    const betweenCall = invoke.mock.calls.filter((call) => call[0] === "grid_page").at(-1);
+    expect(betweenCall?.[1]).toMatchObject({ request: { filters: [{ column: "id", op: "between", value: "1", second: "9" }] } });
+    expect(wrapper.text()).toContain("1 ~ 9");
+    await wrapper.get("button[aria-label='移除条件 1']").trigger("click");
+    await flushPromises();
+    await wrapper.get("select[aria-label='筛选条件']").setValue("in");
+    expect(wrapper.find("input[aria-label='筛选值列表']").exists()).toBe(true);
+    await wrapper.get("input[aria-label='筛选值列表']").setValue("1, 3 , ,5");
+    await wrapper.get("form.filter-form").trigger("submit");
+    await flushPromises();
+    const inCall = invoke.mock.calls.filter((call) => call[0] === "grid_page").at(-1);
+    expect(inCall?.[1]).toMatchObject({ request: { filters: [{ column: "id", op: "in", values: ["1", "3", "5"] }] } });
+    expect(wrapper.text()).toContain("1, 3, 5");
     wrapper.unmount();
   });
 

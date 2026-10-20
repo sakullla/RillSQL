@@ -119,6 +119,14 @@ export class LiveTable {
 
   async replaceFilters(filters: Filter[]): Promise<string | null> {
     for (const filter of filters) {
+      if (filter.op === "between") {
+        if (!filter.value || !filter.second) return "between 需要两个值";
+        continue;
+      }
+      if (filter.op === "in") {
+        if (!filter.values?.length) return "IN 筛选至少要一个值";
+        continue;
+      }
       if (opNeedsValue(filter.op) && !filter.value) return "筛选值不能为空";
     }
     this.filters = filters.map((filter) => ({ ...filter }));

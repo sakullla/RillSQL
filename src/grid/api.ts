@@ -86,6 +86,8 @@ function filtersPayload(filters: readonly Filter[]) {
     column: filter.column,
     op: filter.op,
     value: filter.value ?? null,
+    second: filter.second ?? null,
+    values: filter.values ?? [],
   }));
 }
 
