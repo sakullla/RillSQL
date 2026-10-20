@@ -33,13 +33,21 @@ pub struct HistoryDraft {
     pub summary: String,
 }
 
+/// 默认保留的历史条数。写入后按 started_at 只留最新的这些。
+const DEFAULT_HISTORY_CAP: i64 = 2000;
+
 #[derive(Clone)]
 pub struct HistoryStore {
     pool: sqlx::SqlitePool,
+    cap: i64,
 }
 
 impl HistoryStore {
     pub async fn open(path: &Path) -> Result<Self, String> {
+        Self::open_with_cap(path, DEFAULT_HISTORY_CAP).await
+    }
+
+    pub async fn open_with_cap(path: &Path, cap: i64) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|err| format!("建不了历史目录：{err}"))?;
@@ -72,7 +80,7 @@ impl HistoryStore {
         .await
         .map_err(|err| format!("建不了查询历史：{err}"))?;
         super::saved::ensure_schema(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self { pool, cap })
     }
 
     pub(super) fn pool(&self) -> &sqlx::SqlitePool {
@@ -96,6 +104,11 @@ impl HistoryStore {
         .execute(&self.pool)
         .await
         .map_err(|err| format!("写不了查询历史：{err}"))?;
+        sqlx::query("DELETE FROM query_history WHERE id NOT IN (SELECT id FROM query_history ORDER BY started_at DESC, id DESC LIMIT ?1)")
+            .bind(self.cap)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| format!("修剪不了查询历史：{err}"))?;
         Ok(())
     }
 
@@ -121,6 +134,15 @@ impl HistoryStore {
         .await
         .map_err(|err| format!("读不了查询历史：{err}"))?;
         rows.iter().map(entry_from_row).collect()
+    }
+
+    pub async fn delete(&self, id: &str) -> Result<(), String> {
+        sqlx::query("DELETE FROM query_history WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| format!("删不了这条查询历史：{err}"))?;
+        Ok(())
     }
 
     pub async fn clear(&self) -> Result<(), String> {

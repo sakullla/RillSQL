@@ -121,6 +121,7 @@ async fn sqlite_delimiter_without_statements_keeps_the_client_notice() {
             engine: "sqlite".to_owned(),
             sql: "DELIMITER $$".to_owned(),
             limit: 100,
+            timeout_ms: None,
         },
     )
     .await
@@ -137,6 +138,7 @@ async fn sqlite_delimiter_without_statements_keeps_the_client_notice() {
             engine: "sqlite".to_owned(),
             sql: "  -- note\n".to_owned(),
             limit: 100,
+            timeout_ms: None,
         },
     )
     .await
@@ -186,6 +188,56 @@ fn failure_marks_uncertain_writes_unknown_and_not_reads() {
     assert!(matches!(read, StatementStop::Error { .. }));
     let cancelled = classify_failure("SELECT 1", "canceling statement due to user request".to_owned(), true);
     assert!(matches!(cancelled, StatementStop::Cancelled { .. }));
+}
+
+#[test]
+fn timeout_statements_match_each_engine_and_none_disables_them() {
+    assert_eq!(
+        exec::timeout_statements("postgres", Some(30_000)),
+        vec!["SET statement_timeout = 30000".to_owned()]
+    );
+    assert_eq!(
+        exec::timeout_statements("mysql", Some(30_000)),
+        vec!["SET SESSION MAX_EXECUTION_TIME = 30000".to_owned()]
+    );
+    assert_eq!(
+        exec::timeout_statements("mariadb", Some(30_000)),
+        vec!["SET SESSION max_statement_time = 30".to_owned()]
+    );
+    assert!(exec::timeout_statements("sqlite", Some(30_000)).is_empty());
+    assert!(exec::timeout_statements("postgres", None).is_empty());
+    assert!(exec::timeout_statements("postgres", Some(0)).is_empty());
+    assert_eq!(
+        exec::timeout_reset_statements("postgres"),
+        vec!["SET statement_timeout = 0".to_owned()]
+    );
+    assert_eq!(
+        exec::timeout_reset_statements("mysql"),
+        vec!["SET SESSION MAX_EXECUTION_TIME = 0".to_owned()]
+    );
+    assert_eq!(
+        exec::timeout_reset_statements("mariadb"),
+        vec!["SET SESSION max_statement_time = 0".to_owned()]
+    );
+    assert!(exec::timeout_reset_statements("sqlite").is_empty());
+}
+
+#[test]
+fn statement_timeouts_report_as_error_instead_of_unknown() {
+    for message in [
+        "canceling statement due to statement timeout",
+        "Query execution was interrupted, maximum statement execution time exceeded",
+        "Query execution was interrupted (max_statement_time exceeded)",
+        "max_execution_time exceeded",
+    ] {
+        let stop = classify_failure("UPDATE t SET n = 1", message.to_owned(), false);
+        match stop {
+            StatementStop::Error { message: text } => assert!(text.starts_with("执行超时，语句已停止。"), "{text}"),
+            other => panic!("语句超时不能落到 {other:?}：{message}"),
+        }
+    }
+    let unknown = classify_failure("UPDATE t SET n = 1", "connection reset by peer".to_owned(), false);
+    assert!(matches!(unknown, StatementStop::Unknown { .. }));
 }
 
 #[tokio::test]
@@ -290,6 +342,7 @@ fn query_commands_are_appended_without_dropping_catalog_or_grid() {
         "query_cancel",
         "query_history",
         "query_history_clear",
+        "query_history_delete",
         "query_saved_list",
         "query_saved_save",
         "query_saved_rename",
@@ -354,6 +407,61 @@ async fn history_records_execution_without_a_password_column_and_restore_does_no
         summary: String::new(),
     };
     let _ = _typed;
+}
+
+#[tokio::test]
+async fn history_delete_removes_one_entry_and_stays_idempotent() {
+    let dir = std::env::temp_dir().join(format!("rillsql-history-delete-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = history::HistoryStore::open(&dir.join("query-history.sqlite")).await.unwrap();
+    for (id, started_at) in [("h1", "2026-10-14T10:00:00Z"), ("h2", "2026-10-15T10:00:00Z"), ("h3", "2026-10-16T10:00:00Z")] {
+        store
+            .insert(&HistoryDraft {
+                id: id.to_owned(),
+                sql: format!("SELECT '{id}'"),
+                connection_id: "notes".to_owned(),
+                connection_name: "笔记".to_owned(),
+                database_name: "main".to_owned(),
+                engine: "sqlite".to_owned(),
+                started_at: started_at.to_owned(),
+                summary: "执行中".to_owned(),
+            })
+            .await
+            .unwrap();
+    }
+    store.delete("h2").await.unwrap();
+    let left = store.list().await.unwrap();
+    assert_eq!(left.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), vec!["h3", "h1"]);
+    assert_eq!(left.iter().map(|item| item.sql.clone()).collect::<Vec<_>>(), vec!["SELECT 'h3'", "SELECT 'h1'"]);
+    store.delete("h2").await.unwrap();
+    store.delete("missing").await.unwrap();
+    assert_eq!(store.list().await.unwrap().len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn history_cap_keeps_only_the_latest_entries() {
+    let dir = std::env::temp_dir().join(format!("rillsql-history-cap-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = history::HistoryStore::open_with_cap(&dir.join("query-history.sqlite"), 5).await.unwrap();
+    for index in 0..8 {
+        store
+            .insert(&HistoryDraft {
+                id: format!("h{index}"),
+                sql: format!("SELECT {index}"),
+                connection_id: "notes".to_owned(),
+                connection_name: "笔记".to_owned(),
+                database_name: "main".to_owned(),
+                engine: "sqlite".to_owned(),
+                started_at: format!("2026-10-{:02}T10:00:00Z", index + 1),
+                summary: "执行中".to_owned(),
+            })
+            .await
+            .unwrap();
+    }
+    let listed = store.list().await.unwrap();
+    assert_eq!(listed.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), vec!["h7", "h6", "h5", "h4", "h3"]);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -514,6 +622,7 @@ async fn open_session_runs_sql_stops_and_can_cancel_without_a_second_execution_c
             engine: "sqlite".to_owned(),
             sql: "INSERT INTO t (id, name) VALUES (1, '');\nSELECT id, name FROM missing;\nINSERT INTO t (id, name) VALUES (2, 'x');".to_owned(),
             limit: 50,
+            timeout_ms: None,
         },
     )
     .await
@@ -525,7 +634,7 @@ async fn open_session_runs_sql_stops_and_can_cancel_without_a_second_execution_c
     assert_eq!(finished.statements[2].status, "skipped");
     assert_eq!(finished.statements[0].affected, Some(1));
     let session = service.catalog_session("notes").unwrap();
-    let check = exec::LiveDriver::attach(session, "sqlite", "main", service.cancel_transport("notes").unwrap())
+    let check = exec::LiveDriver::attach(session, "sqlite", "main", service.cancel_transport("notes").unwrap(), None)
         .await
         .unwrap();
     let rows = check.run("SELECT id, name FROM t", 10, &Arc::new(AtomicBool::new(false))).await.unwrap();
@@ -546,6 +655,7 @@ async fn open_session_runs_sql_stops_and_can_cancel_without_a_second_execution_c
             engine: "sqlite".to_owned(),
             sql: "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 5000000) SELECT sum(x) FROM c".to_owned(),
             limit: 10,
+            timeout_ms: None,
         },
     )
     .await
@@ -738,7 +848,7 @@ async fn mysql_batch_keeps_one_connection_and_stops_at_the_limit() {
                 .with_inactive_connection_ttl(Duration::from_secs(28_800)),
         );
     let pool = mysql_async::Pool::new(mysql_async::Opts::from(opts));
-    let driver = exec::LiveDriver::attach(CatalogSession::Mysql(pool.clone()), "mysql", "app", CancelTransport::None)
+    let driver = exec::LiveDriver::attach(CatalogSession::Mysql(pool.clone()), "mysql", "app", CancelTransport::None, None)
         .await
         .unwrap_or_else(|err| panic!("{err} queries={:?} failures={:?}", stub.queries.lock().unwrap(), stub.failures.lock().unwrap()));
     let flag = Arc::new(AtomicBool::new(false));
@@ -768,7 +878,7 @@ async fn mysql_batch_keeps_one_connection_and_stops_at_the_limit() {
     assert_eq!(stub.resets.load(Ordering::SeqCst), 0);
     assert_eq!(stub.accepts.load(Ordering::SeqCst), 1);
 
-    let driver = exec::LiveDriver::attach(CatalogSession::Mysql(pool.clone()), "mariadb", "app", CancelTransport::None)
+    let driver = exec::LiveDriver::attach(CatalogSession::Mysql(pool.clone()), "mariadb", "app", CancelTransport::None, Some(1_500))
         .await
         .unwrap();
     let limited = run_batch(&[piece("SELECT * FROM big")], 2, &flag, false, &driver).await;
@@ -778,7 +888,12 @@ async fn mysql_batch_keeps_one_connection_and_stops_at_the_limit() {
     assert!(!stub.uncapped.load(Ordering::SeqCst));
     let queries = stub.queries.lock().expect("queries").clone();
     assert!(queries.iter().any(|sql| sql.to_ascii_uppercase().contains("LIMIT 3")), "{queries:?}");
+    // attach 时下发会话级超时（MariaDB 单位是秒），整批结束后 finish 复位，不泄漏到目录连接。
+    assert!(queries.iter().any(|sql| sql.contains("max_statement_time = 1.5")), "{queries:?}");
+    driver.finish().await.unwrap();
     drop(driver);
+    let queries = stub.queries.lock().expect("queries").clone();
+    assert!(queries.iter().any(|sql| sql.contains("max_statement_time = 0")), "{queries:?}");
     assert_eq!(stub.resets.load(Ordering::SeqCst), 0);
     assert_eq!(stub.accepts.load(Ordering::SeqCst), 1, "MariaDB 批次不能再拨一条连接");
     let _ = tokio::time::timeout(Duration::from_secs(2), pool.disconnect()).await;
@@ -977,6 +1092,7 @@ fn run_request(sql: &str, database: &str) -> super::commands::StartRequest {
         engine: "sqlite".to_owned(),
         sql: sql.to_owned(),
         limit: 10,
+        timeout_ms: None,
     }
 }
 

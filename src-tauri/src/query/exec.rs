@@ -87,12 +87,55 @@ pub fn classify_failure(sql: &str, message: String, cancel_requested: bool) -> S
     if cancel_requested && cancel::is_cancel_error(&message) {
         return StatementStop::Cancelled { message };
     }
+    if is_statement_timeout(&message) {
+        return StatementStop::Error {
+            message: format!("执行超时，语句已停止。{message}"),
+        };
+    }
     if is_disconnect(&message) && is_write(sql) {
         return StatementStop::Unknown {
             message: format!("连接中断，无法确认写入是否完成。不会自动重放。{message}"),
         };
     }
     StatementStop::Error { message }
+}
+
+/// 语句超时的报错文案。这些词同样带 timeout / interrupted，必须先于断连判定，否则写入会被误标成结果未知。
+pub fn is_statement_timeout(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "statement timeout",
+        "max_execution_time",
+        "execution time exceeded",
+        "max_statement_time",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// 生成本批要下发的会话级语句超时设置。目录连接是共享会话，整批结束由 `LiveDriver::finish` 复位。
+/// MySQL 的 MAX_EXECUTION_TIME 只对 SELECT 生效；MariaDB 的单位是秒。
+pub fn timeout_statements(engine: &str, timeout_ms: Option<u64>) -> Vec<String> {
+    let ms = match timeout_ms {
+        Some(ms) if ms > 0 => ms,
+        _ => return Vec::new(),
+    };
+    match engine {
+        "postgres" => vec![format!("SET statement_timeout = {ms}")],
+        "mysql" => vec![format!("SET SESSION MAX_EXECUTION_TIME = {ms}")],
+        "mariadb" => vec![format!("SET SESSION max_statement_time = {}", ms as f64 / 1000.0)],
+        _ => Vec::new(),
+    }
+}
+
+/// 整批结束后把会话级超时设置复位，避免泄漏到目录连接。
+pub fn timeout_reset_statements(engine: &str) -> Vec<String> {
+    match engine {
+        "postgres" => vec!["SET statement_timeout = 0".to_owned()],
+        "mysql" => vec!["SET SESSION MAX_EXECUTION_TIME = 0".to_owned()],
+        "mariadb" => vec!["SET SESSION max_statement_time = 0".to_owned()],
+        _ => Vec::new(),
+    }
 }
 
 pub fn is_disconnect(message: &str) -> bool {
@@ -392,11 +435,13 @@ pub struct LiveDriver {
     engine: String,
     sink: Arc<dyn RowSink>,
     statement_index: AtomicUsize,
+    timeout_applied: bool,
 }
 
 impl LiveDriver {
     /// 整批只借出池里已有的那条连接。MySQL / MariaDB 归还时不发 COM_RESET_CONNECTION。
-    pub async fn attach(session: CatalogSession, engine: &str, database: &str, transport: CancelTransport) -> Result<Self, String> {
+    pub async fn attach(session: CatalogSession, engine: &str, database: &str, transport: CancelTransport, timeout_ms: Option<u64>) -> Result<Self, String> {
+        let setup = timeout_statements(engine, timeout_ms);
         let attached = match session {
             CatalogSession::Scripted => Attached::Scripted,
             CatalogSession::Sqlite { pool, .. } => match database_gate("sqlite", "main", database) {
@@ -410,13 +455,17 @@ impl LiveDriver {
                     transport.set_mysql_connection_id(id);
                 }
                 align_mysql(&mut conn, engine, database).await?;
+                run_mysql_statements(&mut conn, &setup).await?;
                 Attached::Mysql(conn)
             }
             CatalogSession::Postgres(client) => {
                 let current = postgres_current(&client).await?;
                 match database_gate("postgres", &current, database) {
                     DatabaseGate::Refuse => return Err(refuse_message(&current, database)),
-                    _ => Attached::Postgres(client),
+                    _ => {
+                        run_postgres_statements(&client, &setup).await?;
+                        Attached::Postgres(client)
+                    }
                 }
             }
         };
@@ -426,7 +475,25 @@ impl LiveDriver {
             engine: engine.to_owned(),
             sink: Arc::new(NopSink),
             statement_index: AtomicUsize::new(0),
+            timeout_applied: !setup.is_empty(),
         })
+    }
+
+    /// 整批结束后复位会话级超时设置，避免这一批的限制泄漏到共享的目录连接。
+    pub async fn finish(&self) -> Result<(), String> {
+        if !self.timeout_applied {
+            return Ok(());
+        }
+        let statements = timeout_reset_statements(&self.engine);
+        if statements.is_empty() {
+            return Ok(());
+        }
+        let mut attached = self.session.lock().await;
+        match &mut *attached {
+            Attached::Mysql(conn) => run_mysql_statements(conn, &statements).await,
+            Attached::Postgres(client) => run_postgres_statements(client, &statements).await,
+            _ => Ok(()),
+        }
     }
 
     pub fn set_sink(&mut self, sink: Arc<dyn RowSink>) {
@@ -461,6 +528,20 @@ async fn align_mysql(conn: &mut mysql_async::Conn, engine: &str, database: &str)
         }
         DatabaseGate::Ready => Ok(()),
     }
+}
+
+async fn run_mysql_statements(conn: &mut mysql_async::Conn, statements: &[String]) -> Result<(), String> {
+    for statement in statements {
+        conn.query_drop(statement).await.map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+async fn run_postgres_statements(client: &tokio_postgres::Client, statements: &[String]) -> Result<(), String> {
+    for statement in statements {
+        client.simple_query(statement).await.map_err(|err| err.to_string())?;
+    }
+    Ok(())
 }
 
 async fn postgres_current(client: &tokio_postgres::Client) -> Result<String, String> {

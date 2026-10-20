@@ -38,6 +38,7 @@
     "allow-query-cancel",
     "allow-query-history",
     "allow-query-history-clear",
+    "allow-query-history-delete",
     "allow-query-saved-list",
     "allow-query-saved-save",
     "allow-query-saved-rename",

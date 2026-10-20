@@ -1,4 +1,5 @@
 import { shallowReactive } from "vue";
+import { loadSettings } from "../shell/settings";
 import { queryCancel, queryPoll, queryStart, type RunDto, type StartRequest } from "./api";
 
 export interface RunSnapshot extends RunDto {
@@ -31,7 +32,9 @@ export async function startTabRun(input: StartRequest & { tabId: string }): Prom
   }
   const token = epoch;
   const { tabId, ...request } = input;
-  const dto = await queryStart(request);
+  // 语句超时是本机设置，每次发起时读取；0 表示不限制，字段整体缺省。
+  const timeoutSec = loadSettings().queryTimeoutSec;
+  const dto = await queryStart(timeoutSec > 0 ? { ...request, timeoutMs: timeoutSec * 1000 } : request);
   if (token !== epoch) return;
   adoptRun(tabId, dto);
   if (isLive(dto)) watchRun(tabId);

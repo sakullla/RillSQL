@@ -69,6 +69,7 @@ fn wire<R: tauri::Runtime>(builder: tauri::Builder<R>, state: connections::comma
         query::commands::query_cancel,
         query::commands::query_history,
         query::commands::query_history_clear,
+        query::commands::query_history_delete,
         query::commands::query_saved_list,
         query::commands::query_saved_save,
         query::commands::query_saved_rename,

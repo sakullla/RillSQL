@@ -154,6 +154,11 @@ description = "允许清空本机查询历史。"
 commands.allow = ["query_history_clear"]
 
 [[permission]]
+identifier = "allow-query-history-delete"
+description = "允许删除单条本机查询历史。"
+commands.allow = ["query_history_delete"]
+
+[[permission]]
 identifier = "allow-query-saved-list"
 description = "允许读取本机按名称保存的查询。"
 commands.allow = ["query_saved_list"]

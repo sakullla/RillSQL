@@ -172,4 +172,51 @@ describe("query history", () => {
     expect(wrapper.findAll("[data-action='open-history']")).toHaveLength(1);
     wrapper.unmount();
   });
+
+  it("deletes one history entry after a two-step confirm and reloads the list", async () => {
+    replaceCatalog(catalogFixture());
+    const rows = [
+      entry({}),
+      entry({ id: "h2", sql: "SELECT 1", connectionId: "shop", connectionName: "Shop", databaseName: "shop_staging", engine: "mysql", startedAt: "2026-10-13T09:00:00", status: "error", summary: "1 条语句失败" }),
+    ];
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "query_history") return rows;
+      if (command === "query_history_delete") return null;
+      throw new Error(command);
+    });
+    const wrapper = mount(HistoryPage);
+    await flushPromises();
+    expect(wrapper.findAll("[data-action='delete-run']")).toHaveLength(2);
+    await wrapper.findAll("[data-action='delete-run']")[0]!.trigger("click");
+    expect(invoke.mock.calls.map((call) => call[0])).toEqual(["query_history"]);
+    expect(wrapper.text()).toContain("删除这条查询历史");
+    await wrapper.get("[data-action='cancel-delete-run']").trigger("click");
+    expect(wrapper.find("[data-action='confirm-delete-run']").exists()).toBe(false);
+    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("query_history_delete");
+    await wrapper.findAll("[data-action='delete-run']")[0]!.trigger("click");
+    await wrapper.get("[data-action='confirm-delete-run']").trigger("click");
+    await flushPromises();
+    expect(invoke.mock.calls.filter((call) => call[0] === "query_history_delete").map((call) => call[1])).toEqual([{ id: "h1" }]);
+    expect(invoke.mock.calls.filter((call) => call[0] === "query_history")).toHaveLength(2);
+    expect(wrapper.find("[data-action='confirm-delete-run']").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("keeps the entry and shows a message when deleting one history entry fails", async () => {
+    replaceCatalog(catalogFixture());
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "query_history") return [entry({})];
+      if (command === "query_history_delete") throw "删不了这条查询历史：库被占用";
+      throw new Error(command);
+    });
+    const wrapper = mount(HistoryPage);
+    await flushPromises();
+    await wrapper.get("[data-action='delete-run']").trigger("click");
+    await wrapper.get("[data-action='confirm-delete-run']").trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("删不了这条查询历史");
+    expect(wrapper.text()).toContain("库被占用");
+    expect(wrapper.findAll("[data-action='open-history']")).toHaveLength(1);
+    wrapper.unmount();
+  });
 });

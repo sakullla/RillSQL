@@ -33,9 +33,17 @@ describe("shell settings", () => {
     expect(DEFAULT_SETTINGS.density).toBe("compact");
   });
 
+  it("defaults the statement timeout to unlimited and keeps stored overrides", () => {
+    expect(DEFAULT_SETTINGS.queryTimeoutSec).toBe(0);
+    localStorage.setItem("rillsql.shell", JSON.stringify({ pageSize: 50 }));
+    expect(loadSettings().queryTimeoutSec).toBe(0);
+    localStorage.setItem("rillsql.shell", JSON.stringify({ queryTimeoutSec: 30 }));
+    expect(loadSettings().queryTimeoutSec).toBe(30);
+  });
+
   it("round-trips through saveSettings", () => {
     const storage = fakeStorage();
-    const settings = { ...DEFAULT_SETTINGS, density: "standard" as const };
+    const settings = { ...DEFAULT_SETTINGS, density: "standard" as const, queryTimeoutSec: 60 };
     saveSettings(settings, storage);
     expect(loadSettings(storage)).toEqual(settings);
   });
@@ -52,6 +60,7 @@ describe("shell settings", () => {
       { label: "每次读取的行数", current: "100 行", option: "50 行", patch: { pageSize: 50 } },
       { label: "大字段预览上限", current: "1 KB", option: "4 KB", patch: { previewKB: 4 } },
       { label: "对象列表每次显示", current: "100 个", option: "200 个", patch: { objectPage: 200 } },
+      { label: "语句执行超时", current: "不限制", option: "30 秒", patch: { queryTimeoutSec: 30 } },
       { label: "复制 NULL 时写入", current: "NULL", option: "空文本", patch: { nullCopy: "empty" } },
     ];
     for (const item of cases) {

@@ -34,13 +34,14 @@ const fontOptions: ListboxOption[] = [12, 13, 14, 15, 16].map((size) => ({ value
 const pageOptions: ListboxOption[] = [50, 100, 200, 500].map((size) => ({ value: String(size), label: `${size} 行` }));
 const previewOptions: ListboxOption[] = [1, 4, 16].map((size) => ({ value: String(size), label: `${size} KB` }));
 const objectOptions: ListboxOption[] = [100, 200, 500].map((size) => ({ value: String(size), label: `${size} 个` }));
+const timeoutOptions: ListboxOption[] = [0, 10, 30, 60, 300].map((sec) => ({ value: String(sec), label: sec === 0 ? "不限制" : `${sec} 秒` }));
 const nullOptions: ListboxOption[] = [
   { value: "NULL", label: "NULL" },
   { value: "empty", label: "空文本" },
   { value: "N", label: "\\N" },
 ];
 
-function onNumber(key: "editorFont" | "pageSize" | "previewKB" | "objectPage", value: string) {
+function onNumber(key: "editorFont" | "pageSize" | "previewKB" | "objectPage" | "queryTimeoutSec", value: string) {
   const next = Number(value);
   if (!Number.isFinite(next)) return;
   emit("change", { [key]: next });
@@ -130,6 +131,15 @@ function onNullCopy(value: string) {
           </div>
           <div class="set-ctl">
             <Listbox :model-value="String(settings.objectPage)" :options="objectOptions" aria-label="对象列表每次显示" @update:model-value="onNumber('objectPage', $event)" />
+          </div>
+        </div>
+        <div class="set-row">
+          <div class="set-text">
+            <h4>语句执行超时</h4>
+            <p>单条语句超过上限时由数据库中止，整批结束后设置自动复位。仅对 PostgreSQL、MySQL、MariaDB 生效；MySQL 只限制 SELECT。</p>
+          </div>
+          <div class="set-ctl">
+            <Listbox :model-value="String(settings.queryTimeoutSec)" :options="timeoutOptions" aria-label="语句执行超时" @update:model-value="onNumber('queryTimeoutSec', $event)" />
           </div>
         </div>
         <div class="set-row">

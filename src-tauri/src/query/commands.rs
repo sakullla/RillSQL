@@ -71,6 +71,9 @@ pub struct StartRequest {
     pub engine: String,
     pub sql: String,
     pub limit: u64,
+    /// 语句超时（毫秒）。None 或 0 表示不限制；整批结束会话级设置会复位。
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl QueryState {
@@ -176,7 +179,7 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
     };
     // 任何 await 之前占住这条连接，失败时由 Reservation 撤掉占位。
     let mut reservation = reserve_run(state, snapshot.clone(), Arc::clone(&cancel_flag))?;
-    let mut driver = match exec::LiveDriver::attach(session, &request.engine, &request.database, transport).await {
+    let mut driver = match exec::LiveDriver::attach(session, &request.engine, &request.database, transport, request.timeout_ms).await {
         Ok(driver) => driver,
         Err(err) => return Err(err),
     };
@@ -208,6 +211,8 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
     tokio::spawn(async move {
         let _finish_pace = FinishPace(Arc::clone(&pace));
         let batch = exec::run_batch(&parts, limit, &cancel_flag, via_ssh, &driver).await;
+        // 目录连接是共享会话，整批结束后把语句超时设置复位，不泄漏到这一批之外。
+        let _ = driver.finish().await;
         finish_run(&slot, &batch, &notices);
         let summary = summary_of(&batch);
         let status = history_status(&batch.status);
@@ -438,6 +443,11 @@ pub async fn query_history(query: tauri::State<'_, QueryState>) -> Result<Vec<Hi
 #[tauri::command]
 pub async fn query_history_clear(query: tauri::State<'_, QueryState>) -> Result<(), String> {
     query.history().await?.clear().await
+}
+
+#[tauri::command]
+pub async fn query_history_delete(query: tauri::State<'_, QueryState>, id: String) -> Result<(), String> {
+    query.history().await?.delete(&id).await
 }
 
 #[tauri::command]

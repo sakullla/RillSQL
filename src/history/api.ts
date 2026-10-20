@@ -10,6 +10,10 @@ export function queryHistoryClear(): Promise<void> {
   return invoke<void>("query_history_clear");
 }
 
+export function queryHistoryDelete(id: string): Promise<void> {
+  return invoke<void>("query_history_delete", { id });
+}
+
 export function querySavedList(): Promise<SavedQuery[]> {
   return invoke<SavedQuery[]>("query_saved_list");
 }

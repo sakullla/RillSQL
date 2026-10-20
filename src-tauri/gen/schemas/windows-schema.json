@@ -357,6 +357,12 @@
           "markdownDescription": "允许清空本机查询历史。"
         },
         {
+          "description": "允许删除单条本机查询历史。",
+          "type": "string",
+          "const": "allow-query-history-delete",
+          "markdownDescription": "允许删除单条本机查询历史。"
+        },
+        {
           "description": "允许读取一次 SQL 执行的状态和已完成结果。",
           "type": "string",
           "const": "allow-query-poll",

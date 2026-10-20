@@ -10,8 +10,8 @@ export interface ShellSettings {
   previewKB: number;
   objectPage: number;
   nullCopy: NullCopy;
-  typeToConfirm: boolean;
-  confirmClose: boolean;
+  /** 单条语句的执行超时（秒）。0 表示不限制。 */
+  queryTimeoutSec: number;
 }
 
 export const DEFAULT_SETTINGS: ShellSettings = {
@@ -22,8 +22,7 @@ export const DEFAULT_SETTINGS: ShellSettings = {
   previewKB: 1,
   objectPage: 100,
   nullCopy: "NULL",
-  typeToConfirm: true,
-  confirmClose: true,
+  queryTimeoutSec: 0,
 };
 
 const STORAGE_KEY = "rillsql.shell";

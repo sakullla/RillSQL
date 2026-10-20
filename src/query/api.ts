@@ -34,6 +34,8 @@ export interface StartRequest {
   engine: string;
   sql: string;
   limit: number;
+  /** 语句超时（毫秒）。缺省表示不限制。 */
+  timeoutMs?: number;
 }
 
 export function queryStart(request: StartRequest): Promise<RunDto> {

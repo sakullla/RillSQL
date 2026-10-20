@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, ref, shallowRef, watch } from "vue";
 import { catalogConnections } from "../catalog/store";
 import Listbox from "../ui/Listbox.vue";
 import type { ListboxOption } from "../ui/types";
-import { queryHistory, queryHistoryClear, querySavedDelete, querySavedList, querySavedRename, querySavedSave } from "./api";
+import { queryHistory, queryHistoryClear, queryHistoryDelete, querySavedDelete, querySavedList, querySavedRename, querySavedSave } from "./api";
 import {
   elapsedLabel,
   filterHistory,
@@ -118,6 +118,17 @@ async function clearHistory() {
 
 function open(entry: HistoryEntry) {
   emit("open", openPlan(entry, knownIds.value));
+}
+
+async function confirmDeleteRun(entry: HistoryEntry) {
+  actionError.value = "";
+  try {
+    await queryHistoryDelete(entry.id);
+    pendingDeleteId.value = null;
+    await load();
+  } catch (err) {
+    actionError.value = messageOf(err, "删不了这条查询历史");
+  }
 }
 
 function messageOf(err: unknown, fallback: string): string {
@@ -246,6 +257,7 @@ onMounted(() => {
         <Listbox v-model="connectionId" :options="connectionOptions" aria-label="按连接筛选" />
         <Listbox v-model="status" :options="statusOptions" aria-label="按结果筛选" />
       </div>
+      <p v-if="actionError" class="saved-alert" role="alert">{{ actionError }}</p>
 
       <div v-if="loadError" class="hist-error" role="alert">
         <p>历史没有读出来：{{ loadError }}</p>
@@ -277,6 +289,12 @@ onMounted(() => {
               <span class="grow"></span>
               <span v-if="isDeleted(entry)" class="muted sm">载入后重新选择连接和库</span>
               <button class="btn sm" type="button" data-action="open-history" @click="open(entry)">载入编辑器 ↗</button>
+              <button v-if="pendingDeleteId !== entry.id" class="btn sm" type="button" data-action="delete-run" @click="pendingDeleteId = entry.id">删除</button>
+            </div>
+            <div v-if="pendingDeleteId === entry.id" class="hist-clear" role="alert">
+              <span>删除这条查询历史？取消后它仍留在列表里。</span>
+              <button class="btn sm" type="button" data-action="cancel-delete-run" @click="pendingDeleteId = null">取消</button>
+              <button class="btn sm danger" type="button" data-action="confirm-delete-run" @click="confirmDeleteRun(entry)">确认删除</button>
             </div>
           </li>
         </ul>
