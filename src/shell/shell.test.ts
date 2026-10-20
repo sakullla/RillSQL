@@ -117,9 +117,9 @@ describe("shell layout", () => {
     const caption = mount(TitleBar, { props: { theme: "system", caption: true } });
     expect(caption.get(".titlebar").attributes("data-tauri-drag-region")).toBe("deep");
     expect(caption.get(".tb-actions").attributes("data-tauri-drag-region")).toBe("false");
-    expect(caption.get("[aria-label='最小化']").exists()).toBe(true);
-    expect(caption.get("[aria-label='最大化']").exists()).toBe(true);
-    expect(caption.get("[aria-label='关闭']").exists()).toBe(true);
+    expect(caption.find("[aria-label='最小化']").exists()).toBe(true);
+    expect(caption.find("[aria-label='最大化']").exists()).toBe(true);
+    expect(caption.find("[aria-label='关闭']").exists()).toBe(true);
   });
 
   it("switches theme from the title bar menu", async () => {

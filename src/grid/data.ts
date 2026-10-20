@@ -149,7 +149,7 @@ function uniqueConflict(schema: TableSchema, rows: readonly Row[], cells: Record
   return null;
 }
 
-function nextAuto(schema: TableSchema, rows: readonly Row[], column: Column): string {
+function nextAuto(rows: readonly Row[], column: Column): string {
   const max = rows.reduce((peak, row) => {
     const value = row.cells[column.name];
     if (value === null || value === undefined || !/^-?\d+$/.test(value)) return peak;
@@ -203,7 +203,7 @@ export function commitChanges(store: TableStore, changes: readonly Change[]): Co
     }
     const draft: Record<string, Cell | undefined> = { ...change.values };
     for (const column of store.schema.columns) {
-      if (draft[column.name] === undefined && column.auto) draft[column.name] = nextAuto(store.schema, store.rows, column);
+      if (draft[column.name] === undefined && column.auto) draft[column.name] = nextAuto(store.rows, column);
     }
     for (const column of store.schema.columns) {
       if (!column.nullable && !column.auto && draft[column.name] === undefined) {

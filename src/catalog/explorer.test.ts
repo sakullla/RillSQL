@@ -1,4 +1,4 @@
-import { mount } from "@vue/test-utils";
+import { mount, type DOMWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { nextTick } from "vue";
 import { setFocusDatabase, setListConnections, setOpenConnection } from "./backend";
@@ -38,7 +38,7 @@ function savedConnection(id: string, passwordSaved: boolean): SavedConnection {
   };
 }
 
-function names(wrapper: ReturnType<typeof mount>, selector: string): string[] {
+function names(wrapper: { findAll(selector: string): DOMWrapper<Element>[] }, selector: string): string[] {
   return wrapper.findAll(selector).map((node) => node.attributes("data-object") ?? "");
 }
 
@@ -150,7 +150,7 @@ describe("explorer tree", () => {
     const wrapper = mount(ExplorerTree, { props: { filter: "" } });
     await wrapper.get("[data-connection=analytics] .tr-conn").trigger("click");
     expect(opened).toBe(false);
-    expect(wrapper.get("input[aria-label='数据库密码']").exists()).toBe(true);
+    expect(wrapper.find("input[aria-label='数据库密码']").exists()).toBe(true);
     wrapper.unmount();
   });
 

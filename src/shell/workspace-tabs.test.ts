@@ -50,13 +50,13 @@ function postgresCatalog(): CatalogConnection {
 }
 
 function editorText(wrapper: VueWrapper): string {
-  const view = EditorView.findFromDOM(wrapper.get(".cm-content").element);
+  const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement);
   expect(view).toBeTruthy();
   return view!.state.doc.toString();
 }
 
 async function replaceDraft(wrapper: VueWrapper, text: string) {
-  const view = EditorView.findFromDOM(wrapper.get(".cm-content").element);
+  const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement);
   expect(view).toBeTruthy();
   view!.dispatch({ changes: { from: 0, to: view!.state.doc.length, insert: text } });
   await nextTick();

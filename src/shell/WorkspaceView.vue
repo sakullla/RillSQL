@@ -119,6 +119,10 @@ function closeToTheRight(id: string) {
   closeIds(props.tabs.slice(index + 1).map((tab) => tab.id));
 }
 
+function isLastTab(id: string): boolean {
+  return props.tabs.findIndex((tab) => tab.id === id) >= props.tabs.length - 1;
+}
+
 function bindTarget(tabId: string, option: TargetOption) {
   emit("target", tabId, {
     connectionId: option.connectionId,
@@ -286,7 +290,7 @@ onBeforeUnmount(() => {
       </template>
       <button class="menu-item" type="button" data-action="close-tab" @click="closeIds([menuTab.id])">关闭</button>
       <button class="menu-item" type="button" data-action="close-others" :disabled="tabs.length < 2" @click="closeOthers(menuTab.id)">关闭其他</button>
-      <button class="menu-item" type="button" data-action="close-right" :disabled="tabs.findIndex((tab) => tab.id === menuTab.id) >= tabs.length - 1" @click="closeToTheRight(menuTab.id)">关闭右侧</button>
+      <button class="menu-item" type="button" data-action="close-right" :disabled="isLastTab(menuTab.id)" @click="closeToTheRight(menuTab.id)">关闭右侧</button>
       <button class="menu-item" type="button" data-action="close-all" @click="closeIds(tabs.map((tab) => tab.id))">关闭全部</button>
     </div>
   </Teleport>

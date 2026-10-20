@@ -440,7 +440,7 @@ function layout(tokens: Tok[]): { ok: true; sql: string } | { ok: false } {
     const lineComment = prev?.kind === "comment" && (prev.text.startsWith("--") || prev.text.startsWith("#"));
     let placed: "none" | "space" | "newline" = "none";
     let level = 0;
-    let nextBreakBody = breakBody;
+    let nextBreakBody: boolean = breakBody;
     if (depth === 0 && kind === "clause") {
       if (out.trim().length) {
         placed = "newline";
