@@ -1,4 +1,4 @@
-import { parseCsvDistinct } from "./csv";
+import { parseCsvDistinct, type CsvDelimiter } from "./csv";
 import type { ChangePayload } from "../grid/api";
 import type { Cell, Column, CommitReport } from "../grid/types";
 
@@ -13,10 +13,10 @@ function blankRow(row: { value: string | null; quoted: boolean }[]): boolean {
   return row.every((field) => field.value === null && !field.quoted);
 }
 
-export function parseImportCsv(text: string): ImportParse {
+export function parseImportCsv(text: string, delimiter: CsvDelimiter = ","): ImportParse {
   const source = text.trim();
   if (!source) return { ok: false, reason: "文件不是可用的 CSV。" };
-  const table = parseCsvDistinct(text);
+  const table = parseCsvDistinct(text, delimiter);
   if (!table.length || !table[0]?.length) return { ok: false, reason: "CSV 缺少列名。" };
   const columns: string[] = [];
   for (const field of table[0]) {

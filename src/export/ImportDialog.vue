@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, ref, watch, type ComponentPublicInstance } from "vue";
 import type { ListboxOption } from "../ui/types";
 import Listbox from "../ui/Listbox.vue";
 import { catalogConnections } from "../catalog/store";
@@ -8,6 +8,7 @@ import type { TableTarget } from "../grid/target";
 import type { TableSchema } from "../grid/types";
 import { useRowWindow } from "../grid/virtual";
 import { showCell } from "../grid/display";
+import type { CsvDelimiter } from "./csv";
 import {
   importChanges,
   importResultText,
@@ -32,6 +33,8 @@ const emit = defineEmits<{
 }>();
 
 const format = ref<"csv" | "json">("csv");
+const delimiter = ref<CsvDelimiter>(",");
+const lastText = ref("");
 const tableKey = ref("");
 const localSchema = ref<TableSchema | null>(null);
 const localTarget = ref<TableTarget | null>(null);
@@ -59,6 +62,11 @@ const columnOptions = computed<ListboxOption[]>(() => [
   { value: "", label: "不导入" },
   ...(parsed.value?.columns ?? []).map((name) => ({ value: name, label: name })),
 ]);
+const delimiterOptions: ListboxOption[] = [
+  { value: ",", label: "逗号 ," },
+  { value: ";", label: "分号 ;" },
+  { value: "\t", label: "制表符" },
+];
 
 function keyOf(schema: string, table: string): string {
   return `${schema}\u0000${table}`;
@@ -69,6 +77,8 @@ watch(
   (open) => {
     if (!open) return;
     format.value = "csv";
+    delimiter.value = ",";
+    lastText.value = "";
     parsed.value = null;
     mapping.value = {};
     parseError.value = "";
@@ -95,6 +105,10 @@ const previewRows = computed(() => (parsed.value ? mappedPreview(parsed.value.ro
 const { viewport, range, onScroll } = useRowWindow(computed(() => previewRows.value.length));
 const visibleRows = computed(() => previewRows.value.slice(range.value.start, range.value.end));
 const canWrite = computed(() => !!parsed.value && parsed.value.rows.length > 0 && gaps.value.length === 0 && !writing.value && !describing.value && !parseError.value && activeSchema.value.kind === "table");
+
+function setViewport(el: Element | ComponentPublicInstance | null) {
+  viewport.value = el instanceof HTMLElement ? el : null;
+}
 
 function onTable(value: string) {
   if (writing.value || value === tableKey.value) return;
@@ -132,13 +146,8 @@ async function chooseTable() {
   }
 }
 
-async function onFile(event: Event) {
-  const file = (event.target as HTMLInputElement).files?.[0];
-  resultText.value = "";
-  parsed.value = null;
-  if (!file) return;
-  const text = await file.text();
-  const outcome = format.value === "json" ? parseImportJson(text) : parseImportCsv(text);
+function applyText(text: string) {
+  const outcome = format.value === "json" ? parseImportJson(text) : parseImportCsv(text, delimiter.value);
   if (!outcome.ok) {
     parseError.value = outcome.reason;
     mapping.value = {};
@@ -147,6 +156,24 @@ async function onFile(event: Event) {
   parseError.value = "";
   parsed.value = outcome.data;
   mapping.value = suggestMapping(activeSchema.value.columns, outcome.data.columns);
+}
+
+async function onFile(event: Event) {
+  const file = (event.target as HTMLInputElement).files?.[0];
+  resultText.value = "";
+  parsed.value = null;
+  if (!file) return;
+  const text = await file.text();
+  lastText.value = text;
+  applyText(text);
+}
+
+function onDelimiter(value: string) {
+  if (value !== "," && value !== ";" && value !== "\t") return;
+  delimiter.value = value;
+  if (!lastText.value || format.value !== "csv") return;
+  parsed.value = null;
+  applyText(lastText.value);
 }
 
 async function confirm() {
@@ -191,8 +218,12 @@ async function confirm() {
           <label class="ex-choice" :class="{ on: format === 'csv' }"><input v-model="format" type="radio" name="im-format" value="csv" :disabled="writing" /><span><b>CSV</b><small>第一行是列名。没有引号的空字段是空值。</small></span></label>
           <label class="ex-choice" :class="{ on: format === 'json' }"><input v-model="format" type="radio" name="im-format" value="json" :disabled="writing" /><span><b>JSON 数组</b><small>必须是对象数组，确认前就会拒绝其他形状。</small></span></label>
         </fieldset>
+        <div v-if="format === 'csv'" class="ex-path">
+          <label for="import-delimiter">分隔符</label>
+          <Listbox id="import-delimiter" :model-value="delimiter" :options="delimiterOptions" aria-label="CSV 分隔符" :disabled="writing" @update:model-value="onDelimiter" />
+        </div>
         <label class="ex-path">选择文件
-          <input type="file" aria-label="导入文件" accept=".csv,.json,.txt,text/csv,application/json" :disabled="writing" @change="onFile" />
+          <input type="file" aria-label="导入文件" accept=".csv,.tsv,.json,.txt,text/csv,application/json" :disabled="writing" @change="onFile" />
         </label>
         <p v-if="parsed && gaps.length" class="ex-alert" role="alert">必填字段 {{ gaps.join("、") }} 没有对应列，不能开始写入。</p>
         <table v-if="parsed" class="map-table">
@@ -207,7 +238,7 @@ async function confirm() {
           </tbody>
         </table>
         <p v-if="parsed" class="ex-note">将写入 {{ parsed.rows.length }} 行。下面是对应好的字段，取消则不会写入。</p>
-        <div v-if="parsed" ref="viewport" class="preview-scroll" @scroll.passive="onScroll">
+        <div v-if="parsed" :ref="setViewport" class="preview-scroll" @scroll.passive="onScroll">
           <table class="map-table">
             <thead><tr><th v-for="column in activeSchema.columns" :key="column.name">{{ column.name }}</th></tr></thead>
             <tbody>

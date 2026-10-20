@@ -2,6 +2,7 @@ import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
 import ImportDialog from "./ImportDialog.vue";
+import { parseImportCsv } from "./import";
 import type { TableTarget } from "../grid/target";
 import type { TableSchema } from "../grid/types";
 
@@ -32,6 +33,14 @@ async function chooseFile(wrapper: ReturnType<typeof dialog>, name: string, cont
   const file = new File([contents], name, { type: "text/plain" });
   Object.defineProperty(input.element, "files", { value: { 0: file, length: 1, item: () => file } });
   await input.trigger("change");
+  await flushPromises();
+}
+
+async function pickDelimiter(wrapper: ReturnType<typeof dialog>, option: string) {
+  await wrapper.get('[role="combobox"][aria-label="CSV 分隔符"]').trigger("click");
+  const match = wrapper.findAll('[role="option"]').find((node) => node.text() === option);
+  expect(match, option).toBeTruthy();
+  await match!.trigger("click");
   await flushPromises();
 }
 
@@ -140,5 +149,65 @@ describe("import into an existing table", () => {
     expect(wrapper.emitted("close")).toHaveLength(1);
     expect(invoke).not.toHaveBeenCalled();
     wrapper.unmount();
+  });
+
+  it("reparses the file and rebuilds the mapping when the csv delimiter changes", async () => {
+    invoke.mockResolvedValue({
+      applied: [{ id: "import-1", sql: "INSERT", label: "新增 1 行" }],
+      failed: null,
+      pendingIds: [],
+      rolledBack: false,
+      rule: "按顺序逐条提交，遇到错误即停止；已成功的语句不撤销。",
+    });
+    const wrapper = dialog();
+    expect(wrapper.get('[role="combobox"][aria-label="CSV 分隔符"]').text()).toBe("逗号 ,");
+    await chooseFile(wrapper, "rows.csv", "name;email\r\n甲;a@example.com");
+    expect(wrapper.text()).toContain("必填字段 name、email 没有对应列");
+    expect(wrapper.get(".btn.primary").attributes("disabled")).toBeDefined();
+    await pickDelimiter(wrapper, "分号 ;");
+    expect(wrapper.text()).not.toContain("必填字段");
+    expect(wrapper.text()).toContain("将写入 1 行");
+    await wrapper.get(".btn.primary").trigger("click");
+    await flushPromises();
+    const call = invoke.mock.calls.find((item) => item[0] === "grid_commit");
+    const changes = call?.[1].request.changes as { values: { column: string; value: string | null }[] }[];
+    expect(changes?.[0]?.values).toEqual(expect.arrayContaining([{ column: "name", value: "甲" }, { column: "email", value: "a@example.com" }]));
+    wrapper.unmount();
+  });
+
+  it("imports tab separated rows after choosing the tab delimiter", async () => {
+    const wrapper = dialog();
+    await pickDelimiter(wrapper, "制表符");
+    await chooseFile(wrapper, "rows.tsv", "name\temail\r\n甲\ta@example.com");
+    expect(wrapper.text()).toContain("将写入 1 行");
+    expect(wrapper.get('[role="combobox"][aria-label="name 对应的列"]').text()).toBe("name");
+    wrapper.unmount();
+  });
+
+  it("resets the delimiter when the dialog reopens and accepts .tsv files", async () => {
+    const wrapper = dialog();
+    expect(wrapper.get("input[type='file']").attributes("accept")).toContain(".tsv");
+    await pickDelimiter(wrapper, "分号 ;");
+    await wrapper.setProps({ open: false });
+    await wrapper.setProps({ open: true });
+    expect(wrapper.get('[role="combobox"][aria-label="CSV 分隔符"]').text()).toBe("逗号 ,");
+    wrapper.unmount();
+  });
+});
+
+describe("parseImportCsv delimiter", () => {
+  it("parses semicolon separated csv into two columns and two rows", () => {
+    const outcome = parseImportCsv("a;b\n1;2", ";");
+    expect(outcome).toEqual({ ok: true, data: { columns: ["a", "b"], rows: [{ a: "1", b: "2" }] } });
+  });
+
+  it("parses tab separated files into two columns and two rows", () => {
+    const outcome = parseImportCsv("a\tb\n1\t2", "\t");
+    expect(outcome).toEqual({ ok: true, data: { columns: ["a", "b"], rows: [{ a: "1", b: "2" }] } });
+  });
+
+  it("keeps the comma behavior when no delimiter is passed", () => {
+    expect(parseImportCsv("a,b\n1,2")).toEqual({ ok: true, data: { columns: ["a", "b"], rows: [{ a: "1", b: "2" }] } });
+    expect(parseImportCsv("a;b\n1;2")).toEqual({ ok: true, data: { columns: ["a;b"], rows: [{ "a;b": "1;2" }] } });
   });
 });

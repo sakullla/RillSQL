@@ -307,7 +307,7 @@ describe("json and insert export", () => {
 async function pick(wrapper: ReturnType<typeof mount>, label: string, option: string) {
   const trigger = wrapper.get(`[role="combobox"][aria-label="${label}"]`);
   expect(trigger.element.closest("label")).toBeNull();
-  trigger.element.click();
+  (trigger.element as HTMLElement).click();
   await nextTick();
   expect(wrapper.find("select").exists()).toBe(false);
   const pop = wrapper.get(".listbox-pop");
@@ -315,7 +315,7 @@ async function pick(wrapper: ReturnType<typeof mount>, label: string, option: st
   const match = wrapper.findAll('[role="option"]').find((node) => node.text() === option);
   expect(match, option).toBeTruthy();
   expect(match!.element.closest("label")).toBeNull();
-  match!.element.click();
+  (match!.element as HTMLElement).click();
   await nextTick();
   expect(wrapper.find('[role="listbox"]').exists()).toBe(false);
 }
@@ -446,6 +446,7 @@ describe("import and export choices", () => {
     const boxes = wrapper.findAll('[role="combobox"]');
     expect(boxes.map((box) => box.attributes("aria-label"))).toEqual([
       "导入的表",
+      "CSV 分隔符",
       "id 对应的列",
       "name 对应的列",
       "email 对应的列",
@@ -453,7 +454,7 @@ describe("import and export choices", () => {
     ]);
     expect(boxes.every((box) => box.attributes("disabled") !== undefined)).toBe(true);
     await boxes[0]!.trigger("click");
-    await boxes[4]!.trigger("click");
+    await boxes[5]!.trigger("click");
     expect(wrapper.find('[role="listbox"]').exists()).toBe(false);
     expect(wrapper.find("select").exists()).toBe(false);
     expect(wrapper.get('[role="combobox"][aria-label="note 对应的列"]').text()).toBe("不导入");
