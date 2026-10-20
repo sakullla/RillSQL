@@ -190,6 +190,47 @@ describe("structure pane", () => {
     wrapper.unmount();
   });
 
+  it("shows the rebuilt create statement with a copy action for tables", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    const wrapper = mount(StructurePane, { props: { tabId: "table:c1", draft: "", purpose: "edit", target } });
+    await flushPromises();
+    const ddl = wrapper.get("details.struct-ddl");
+    expect(ddl.attributes("open")).toBeUndefined();
+    expect(ddl.get("pre").text()).toBe('CREATE TABLE "notes" (id INTEGER PRIMARY KEY, note TEXT)');
+    expect(ddl.text()).toContain("按当前结构重新生成，便于阅读；不是数据库里的原始定义");
+    await ddl.get("summary").trigger("click");
+    await buttonNamed(wrapper, "复制").trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledWith('CREATE TABLE "notes" (id INTEGER PRIMARY KEY, note TEXT)');
+    expect(ddl.text()).toContain("已复制");
+    wrapper.unmount();
+  });
+
+  it("hides the create-sql block when a view only has the placeholder comment", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "ddl_describe") return { ...described, kind: "view", displaySql: "-- main.v_notes" };
+      return {};
+    });
+    const wrapper = mount(StructurePane, { props: { tabId: "view:c1", draft: "", purpose: "edit", target } });
+    await flushPromises();
+    expect(wrapper.find("details.struct-ddl").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("shows the original sqlite_master text for SQLite views", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "ddl_describe") return { ...described, kind: "view", name: "v_notes", displaySql: "CREATE VIEW v_notes AS SELECT note FROM notes" };
+      return {};
+    });
+    const wrapper = mount(StructurePane, { props: { tabId: "view:c1", draft: "", purpose: "edit", target } });
+    await flushPromises();
+    const ddl = wrapper.get("details.struct-ddl");
+    expect(ddl.get("pre").text()).toContain("CREATE VIEW v_notes AS SELECT note FROM notes");
+    expect(ddl.text()).toContain("读自 SQLite 的 sqlite_master");
+    wrapper.unmount();
+  });
+
   it("explains the drop in plain words and keeps the typed-name confirmation", async () => {
     invoke.mockImplementation(async (command: string) => {
       if (command === "ddl_describe") return described;
@@ -207,7 +248,7 @@ describe("structure pane", () => {
     /* 删除区直白说明：数据量可见，依赖列表收进折叠详情（R3）。 */
     expect(wrapper.text()).toContain("将永久删除这张表和里面约 3 行数据");
     expect(wrapper.text()).toContain("1 个外键引用这张表");
-    const depDetails = wrapper.get("details.disclosure");
+    const depDetails = wrapper.get(".struct-drop details.disclosure");
     expect(depDetails.attributes("open")).toBeUndefined();
     await depDetails.get("summary").trigger("click");
     expect(wrapper.text()).toContain("logs.note_fkey");

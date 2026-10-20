@@ -34,6 +34,7 @@ const createName = ref("");
 const createConnection = ref("");
 const createDatabase = ref("");
 const createSchema = ref("");
+const ddlCopyNote = ref("");
 
 const connections = computed(() => catalogConnections().filter((item) => item.status === "connected"));
 
@@ -69,6 +70,32 @@ const activeEngine = computed(() => {
   const connection = connections.value.find((item) => item.id === createConnection.value);
   return connection?.engine ?? "";
 });
+
+/* 建表 SQL：表的定义按当前结构重建；视图只有读到真实定义才展示，MySQL/PG 视图后端只存占位注释。 */
+const ddlVisible = computed(() => {
+  const current = description.value;
+  if (purpose.value !== "edit" || !current || loading.value) return false;
+  const sql = current.displaySql.trim();
+  if (sql === "") return false;
+  return current.kind === "table" || !sql.startsWith("--");
+});
+
+const ddlOriginNote = computed(() => {
+  const current = description.value;
+  if (!current) return "";
+  if (current.kind !== "table" && current.engine === "sqlite") return "这段定义读自 SQLite 的 sqlite_master，是数据库里的原文。";
+  return "按当前结构重新生成，便于阅读；不是数据库里的原始定义。";
+});
+
+async function copyDdl() {
+  const sql = description.value?.displaySql ?? "";
+  try {
+    await navigator.clipboard.writeText(sql);
+    ddlCopyNote.value = "已复制";
+  } catch {
+    ddlCopyNote.value = "复制失败";
+  }
+}
 
 function requestOf(): StructureRequest | null {
   if (purpose.value === "edit") {
@@ -246,6 +273,17 @@ function createForeignKey(foreignKey: StructureForeignKey) {
         <span class="grow"></span>
         <button v-if="purpose === 'edit'" type="button" class="danger" :class="{ on: section === 'drop' }" @click="section = 'drop'">删除表</button>
       </nav>
+      <details v-if="ddlVisible" class="disclosure struct-ddl">
+        <summary>建表 SQL</summary>
+        <div class="disclosure-body">
+          <div class="struct-ddl-bar">
+            <button class="btn sm" type="button" @click="copyDdl">复制</button>
+            <span v-if="ddlCopyNote" class="muted" role="status">{{ ddlCopyNote }}</span>
+          </div>
+          <pre>{{ description?.displaySql }}</pre>
+          <p class="hint">{{ ddlOriginNote }}</p>
+        </div>
+      </details>
       <p v-if="errorText" class="struct-alert" role="alert">{{ errorText }}</p>
       <p v-if="loading" class="struct-loading muted">正在读取这张表的结构……</p>
       <div v-else class="struct-body">
@@ -321,3 +359,20 @@ function createForeignKey(foreignKey: StructureForeignKey) {
     />
   </div>
 </template>
+
+<style scoped>
+/* 建表 SQL 区块：折叠壳复用 base.css 的 disclosure，正文 pre 与 structure.css 的 pv-sql pre 同款。 */
+.struct-ddl { border-bottom: 1px solid var(--line); background: var(--panel-2); }
+.struct-ddl-bar { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-2); }
+.struct-ddl pre {
+  margin: 0 0 var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--sunken);
+  border-radius: var(--r);
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+</style>
