@@ -27,7 +27,7 @@ export interface ExportPlan {
 
 export function partialFileName(fileName: string): string {
   if (fileName.includes("（部分）")) return fileName;
-  const match = /\.(csv|json|sql)$/i.exec(fileName);
+  const match = /\.(csv|json|sql|md)$/i.exec(fileName);
   if (match) return fileName.replace(new RegExp(`\\.${match[1]}$`, "i"), `（部分）.${match[1]!.toLowerCase()}`);
   return `${fileName}（部分）`;
 }

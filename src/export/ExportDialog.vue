@@ -5,6 +5,7 @@ import Listbox from "../ui/Listbox.vue";
 import { renderCsv, type CsvCell, type CsvDelimiter, type CsvOptions, type NullToken } from "./csv";
 import { renderInsert, type InsertTarget } from "./insert";
 import { renderJson } from "./json";
+import { renderMarkdown } from "./markdown";
 import { planExport, type ExportOrigin, type ExportScope } from "./plan";
 import { chooseExportPath } from "./native";
 import type { ExportFormat } from "./write";
@@ -71,9 +72,9 @@ watch(
 
 watch(format, (next, previous) => {
   if (!props.open || next === previous) return;
-  const extension = next === "json" ? "json" : next === "insert" ? "sql" : "csv";
-  path.value = path.value.replace(/\.(csv|json|sql)$/i, `.${extension}`);
-  if (!/\.(csv|json|sql)$/i.test(path.value)) path.value = `${path.value}.${extension}`;
+  const extension = next === "json" ? "json" : next === "insert" ? "sql" : next === "markdown" ? "md" : "csv";
+  path.value = path.value.replace(/\.(csv|json|sql|md)$/i, `.${extension}`);
+  if (!/\.(csv|json|sql|md)$/i.test(path.value)) path.value = `${path.value}.${extension}`;
 });
 
 const csv = computed<CsvOptions>(() => ({ delimiter: delimiter.value, nullToken: nullToken.value, bom: bom.value, header: header.value }));
@@ -91,6 +92,7 @@ const insertBlocked = computed(() => format.value === "insert" && !props.insertT
 const preview = computed(() => {
   const rows = props.previewRows.slice(0, 4);
   if (format.value === "json") return renderJson(props.columns, rows);
+  if (format.value === "markdown") return renderMarkdown(props.columns, rows, { nullToken: nullToken.value });
   if (format.value === "insert" && props.insertTarget?.name) return renderInsert(props.insertTarget, props.columns, rows);
   if (format.value === "insert") return "";
   return renderCsv(props.columns, rows, { ...csv.value, bom: false });
@@ -136,10 +138,10 @@ async function start() {
 
 <template>
   <div v-if="open" class="ex-overlay" role="presentation">
-    <div class="ex-sheet" role="dialog" aria-modal="true" :aria-label="format === 'json' ? '导出为 JSON' : format === 'insert' ? '导出为 INSERT' : '导出为 CSV'">
+    <div class="ex-sheet" role="dialog" aria-modal="true" :aria-label="format === 'json' ? '导出为 JSON' : format === 'insert' ? '导出为 INSERT' : format === 'markdown' ? '导出为 Markdown' : '导出为 CSV'">
       <header class="ex-head">
         <div class="ex-titles">
-          <h2>{{ format === "json" ? "导出为 JSON" : format === "insert" ? "导出为 INSERT" : "导出为 CSV" }}</h2>
+          <h2>{{ format === "json" ? "导出为 JSON" : format === "insert" ? "导出为 INSERT" : format === "markdown" ? "导出为 Markdown" : "导出为 CSV" }}</h2>
           <p>这只是数据导出，不是数据库备份；要备份请用数据库自带的备份工具。</p>
         </div>
         <button class="icon-btn" type="button" aria-label="关闭" @click="emit('close')">
@@ -161,6 +163,10 @@ async function start() {
           <label class="ex-choice" :class="{ on: format === 'json' }">
             <input v-model="format" type="radio" name="ex-format" value="json" />
             <span><b>JSON 数组</b><small>每个对象是一行。空值仍是 null，空字符串仍是空字符串。</small></span>
+          </label>
+          <label class="ex-choice" :class="{ on: format === 'markdown' }">
+            <input v-model="format" type="radio" name="ex-format" value="markdown" />
+            <span><b>Markdown 表格</b><small>竖线分隔的表格文本。单元格里的 | 会转义，换行折叠成空格，空值写成空字段。</small></span>
           </label>
           <label class="ex-choice" :class="{ on: format === 'insert' }">
             <input v-model="format" type="radio" name="ex-format" value="insert" />

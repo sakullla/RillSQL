@@ -14,6 +14,7 @@ import ExportDialog from "./ExportDialog.vue";
 import ImportDialog from "./ImportDialog.vue";
 import { renderInsert } from "./insert";
 import { renderJson } from "./json";
+import { renderMarkdown } from "./markdown";
 import { planExport } from "./plan";
 import TaskCenter from "./TaskCenter.vue";
 import { exportTasks, resetExportTasks } from "./tasks";
@@ -301,6 +302,82 @@ describe("json and insert export", () => {
     expect(readFileSync(insertPath, "utf8")).toContain("NULL");
     expect(readFileSync(insertPath, "utf8")).not.toContain("old");
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("markdown export", () => {
+  const columns = ["id", "note"];
+
+  it("renders the header and rule, escapes pipes and folds newlines", () => {
+    const rows = [{ id: "1", note: null }, { id: "2", note: "a|b" }, { id: "3", note: "换\n行" }];
+    const text = renderMarkdown(columns, rows);
+    const lines = text.split("\r\n");
+    expect(lines[0]).toBe("| id | note |");
+    expect(lines[1]).toBe("| --- | --- |");
+    expect(text).toContain("| 1 |  |");
+    expect(text).toContain("| 2 | a\\|b |");
+    expect(text).toContain("| 3 | 换 行 |");
+    expect(text).not.toContain("a|b");
+    expect(renderMarkdown(columns, rows, { nullToken: "NULL" })).toContain("| 1 | NULL |");
+  });
+
+  it("writes the table through the rendered writer and marks partial .md names", () => {
+    expect(planExport({ origin: "table", scope: "loaded", truncated: true, fileName: "rows.md" }).fileName).toBe("rows（部分）.md");
+    const rows = [{ id: "1", note: null }, { id: "2", note: "a|b" }];
+    const dir = tempDir();
+    const written = join(dir, "out.md");
+    const done = startExport({
+      plan: planExport({ origin: "table", scope: "loaded", truncated: false, fileName: written }),
+      acknowledged: false,
+      path: written,
+      columns,
+      rows,
+      csv,
+      format: "markdown",
+    });
+    expect(done.success).toBe(true);
+    expect(readFileSync(written, "utf8")).toBe("| id | note |\r\n| --- | --- |\r\n| 1 |  |\r\n| 2 | a\\|b |");
+
+    const emptyPath = join(dir, "empty.md");
+    const empty = startExport({
+      plan: planExport({ origin: "table", scope: "loaded", truncated: false, fileName: emptyPath }),
+      acknowledged: false,
+      path: emptyPath,
+      columns,
+      rows: [],
+      csv,
+      format: "markdown",
+    });
+    expect(empty.success).toBe(true);
+    expect(readFileSync(emptyPath, "utf8")).toBe("| id | note |\r\n| --- | --- |");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("switches the dialog to markdown, retitles it, swaps the extension and previews the table", async () => {
+    const wrapper = mount(ExportDialog, {
+      props: {
+        open: true,
+        origin: "table",
+        truncated: false,
+        fileStem: "customers",
+        loadedCount: 2,
+        pending: 0,
+        columns,
+        previewRows: [{ id: "1", note: null }, { id: "2", note: "a|b" }],
+      },
+    });
+    await wrapper.get("input[value='markdown']").setValue();
+    expect(wrapper.get("h2").text()).toBe("导出为 Markdown");
+    expect(wrapper.get(".ex-sheet").attributes("aria-label")).toBe("导出为 Markdown");
+    expect((wrapper.get("input[aria-label='导出路径']").element as HTMLInputElement).value).toMatch(/\.md$/);
+    const preview = wrapper.get(".ex-preview").text();
+    expect(preview).toContain("| id | note |");
+    expect(preview).toContain("| 2 | a\\|b |");
+    await wrapper.get(".btn.primary").trigger("click");
+    await flushPromises();
+    expect(wrapper.emitted("start")?.[0]?.[0]).toMatchObject({ format: "markdown" });
+    expect((wrapper.emitted("start")?.[0]?.[0] as { path: string }).path).toMatch(/\.md$/);
+    wrapper.unmount();
   });
 });
 

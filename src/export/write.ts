@@ -3,9 +3,10 @@ import { dirname } from "node:path";
 import { renderCsv, type CsvCell, type CsvOptions } from "./csv";
 import { insertStatements, type InsertTarget } from "./insert";
 import { jsonLines } from "./json";
+import { markdownHeader, markdownLines } from "./markdown";
 import type { ExportPlan } from "./plan";
 
-export type ExportFormat = "csv" | "json" | "insert";
+export type ExportFormat = "csv" | "json" | "insert" | "markdown";
 
 export interface WriteControl {
   failAfterRows?: number;
@@ -297,16 +298,27 @@ export function startExport(options: {
         control: options.control,
         onProgress: options.onProgress,
       })
-    : writeRenderedFile({
-        path: options.path,
-        lines: format === "json" ? jsonLines(options.columns, rows) : insertStatements(options.insert!, options.columns, rows),
-        prefix: format === "json" ? "[" : "",
-        suffix: format === "json" ? "]" : "",
-        separator: format === "json" ? "," : "\r\n",
-        empty: format === "json" ? "[]" : "",
-        control: options.control,
-        onProgress: options.onProgress,
-      });
+    : format === "markdown"
+      ? writeRenderedFile({
+          path: options.path,
+          lines: markdownLines(options.columns, rows, { nullToken: options.csv.nullToken }),
+          prefix: `${markdownHeader(options.columns).join("\r\n")}\r\n`,
+          suffix: "",
+          separator: "\r\n",
+          empty: markdownHeader(options.columns).join("\r\n"),
+          control: options.control,
+          onProgress: options.onProgress,
+        })
+      : writeRenderedFile({
+          path: options.path,
+          lines: format === "json" ? jsonLines(options.columns, rows) : insertStatements(options.insert!, options.columns, rows),
+          prefix: format === "json" ? "[" : "",
+          suffix: format === "json" ? "]" : "",
+          separator: format === "json" ? "," : "\r\n",
+          empty: format === "json" ? "[]" : "",
+          control: options.control,
+          onProgress: options.onProgress,
+        });
   result.readCalled = readCalled;
   if (result.success && options.plan.partial) {
     result.message = `已导出 ${result.writtenRows} 行到 ${result.path}（仅已读取的行，不是完整结果）`;

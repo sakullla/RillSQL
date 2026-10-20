@@ -48,6 +48,22 @@ describe("native CSV export", () => {
     wrapper.unmount();
   });
 
+  it("offers the markdown filter when exporting as markdown", async () => {
+    save.mockResolvedValue(null);
+    const wrapper = dialog();
+    await wrapper.get("input[value='markdown']").setValue();
+    expect((wrapper.get("input[aria-label='导出路径']").element as HTMLInputElement).value).toMatch(/\.md$/);
+    await wrapper.get(".btn.primary").trigger("click");
+    await flushPromises();
+    expect(save).toHaveBeenCalledWith(expect.objectContaining({
+      title: "导出为 Markdown",
+      defaultPath: expect.stringMatching(/\.md$/),
+      filters: [{ name: "Markdown 文件", extensions: ["md"] }],
+    }));
+    expect(wrapper.emitted("start")).toBeUndefined();
+    wrapper.unmount();
+  });
+
   it("keeps the dialog open on cancellation and displays picker errors", async () => {
     const wrapper = dialog();
     save.mockResolvedValueOnce(null).mockRejectedValueOnce(new Error("保存对话框不可用"));

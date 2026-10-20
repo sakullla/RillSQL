@@ -361,6 +361,7 @@ fn export_format(spec: &ExportSpec) -> Result<&'static str, ExportOutcome> {
     match spec.format.as_str() {
         "" | "csv" => Ok("csv"),
         "json" => Ok("json"),
+        "markdown" => Ok("markdown"),
         "insert" => {
             if spec.table.trim().is_empty() {
                 Err(blocked("INSERT 导出需要一张表的名字"))
@@ -645,6 +646,13 @@ impl CsvFile {
 
     fn write_header(&mut self, names: &[String]) -> Option<ExportOutcome> {
         self.names = names.to_vec();
+        if self.format == "markdown" {
+            let rule = format!("| {} |", vec!["---"; names.len()].join(" | "));
+            if let Err(err) = self.write_line(&markdown_row(names.iter().map(|name| Some(name.as_str())), &self.null_token)).and_then(|()| self.write_line(&rule)) {
+                return Some(self.fail(&err.to_string()));
+            }
+            return None;
+        }
         if self.format != "csv" {
             return None;
         }
@@ -659,6 +667,9 @@ impl CsvFile {
         if self.format == "insert" {
             return self.write_insert(cells);
         }
+        if self.format == "markdown" {
+            return self.write_markdown(cells);
+        }
         let fields = cells
             .iter()
             .map(|cell| match cell {
@@ -667,6 +678,21 @@ impl CsvFile {
             })
             .collect::<Vec<_>>();
         if let Err(err) = self.write_line(&fields.join(&self.delimiter)) {
+            return Some(self.fail(&err.to_string()));
+        }
+        self.written += 1;
+        None
+    }
+
+    fn write_markdown(&mut self, cells: &[Cell]) -> Option<ExportOutcome> {
+        let row = markdown_row(
+            cells.iter().map(|cell| match cell {
+                Cell::Null => None,
+                Cell::Text(text) => Some(text.as_str()),
+            }),
+            &self.null_token,
+        );
+        if let Err(err) = self.write_line(&row) {
             return Some(self.fail(&err.to_string()));
         }
         self.written += 1;
@@ -779,11 +805,21 @@ fn encode_field(value: Option<&str>, null_token: &str) -> String {
     }
 }
 
+fn markdown_row<'a>(cells: impl Iterator<Item = Option<&'a str>>, null_token: &str) -> String {
+    let fields = cells
+        .map(|cell| match cell {
+            None => null_token.to_owned(),
+            Some(text) => text.replace('|', "\\|").replace(['\n', '\r'], " "),
+        })
+        .collect::<Vec<_>>();
+    format!("| {} |", fields.join(" | "))
+}
+
 fn output_path(path: &str, partial: bool) -> PathBuf {
     if !partial || path.contains("（部分）") {
         return PathBuf::from(path);
     }
-    for suffix in [".csv", ".CSV", ".json", ".JSON", ".sql", ".SQL"] {
+    for suffix in [".csv", ".CSV", ".json", ".JSON", ".sql", ".SQL", ".md", ".MD"] {
         if let Some(stripped) = path.strip_suffix(suffix) {
             return PathBuf::from(format!("{stripped}（部分）{}", suffix.to_ascii_lowercase()));
         }

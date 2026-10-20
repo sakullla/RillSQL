@@ -6,7 +6,7 @@ use super::store::{commit_changes, customers_fixture, nokey_fixture, query_page,
 use super::module_id;
 
 fn filt(column: &str, op: FilterOp, value: Option<&str>) -> Filter {
-    Filter { column: column.to_owned(), op, value: value.map(str::to_owned) }
+    Filter { column: column.to_owned(), op, value: value.map(str::to_owned), second: None, values: Vec::new() }
 }
 
 #[test]
@@ -929,6 +929,81 @@ async fn key_columns_keep_full_text_and_hex_for_locator_reads() {
     assert!(allowed.failed.is_none(), "{:?}", allowed.failed);
     let checked = live::query_page(&session, "main", "", "text_keys", "sqlite", &[filt("id", FilterOp::Eq, Some(long.as_str()))], None, 0, 1).await.unwrap();
     assert_eq!(checked.rows[0].cells.get("note"), Some(&Cell::Text(synthetic)));
+
+    drop(session);
+    drop(service);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn markdown_export_writes_header_rule_escapes_pipes_and_marks_partial() {
+    use super::live::{self, ExportMode, ExportSpec};
+    use crate::connections::Service;
+
+    let dir = std::env::temp_dir().join(format!("rillsql-grid-markdown-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("notes.sqlite");
+    let setup = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT)")
+        .execute(&setup)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO customers (id, name, note) VALUES (1, 'a|b', NULL)").execute(&setup).await.unwrap();
+    sqlx::query("INSERT INTO customers (id, name, note) VALUES (2, 'n2', '换\n行')").execute(&setup).await.unwrap();
+    setup.close().await;
+
+    let service = Service::new_for_test(dir.join("connections.sqlite"));
+    service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+    let session = service.catalog_session("notes").expect("已打开会话");
+
+    let spec = |id: &str, mode: ExportMode, path: String, limit: u64, truncated: bool| ExportSpec {
+        id: id.to_owned(),
+        mode,
+        database: "main".to_owned(),
+        schema: String::new(),
+        table: "customers".to_owned(),
+        engine_hint: "sqlite".to_owned(),
+        filters: Vec::new(),
+        sort: None,
+        limit,
+        truncated,
+        statement: String::new(),
+        acknowledged: true,
+        path,
+        delimiter: ",".to_owned(),
+        null_token: String::new(),
+        bom: false,
+        header: true,
+        format: "markdown".to_owned(),
+        fail_after_rows: None,
+        cancel_after_rows: None,
+    };
+
+    let full = live::run_export(&session, &spec("md-full", ExportMode::TableFull, dir.join("customers.md").display().to_string(), 0, false)).await;
+    assert!(full.success, "{}", full.message);
+    let body = fs::read_to_string(full.path.unwrap()).unwrap();
+    assert_eq!(body.lines().next().unwrap(), "| id | name | note |");
+    assert_eq!(body.lines().nth(1).unwrap(), "| --- | --- | --- |");
+    assert!(body.contains("| 1 | a\\|b |  |"), "{body}");
+    assert!(!body.contains("a|b"), "{body}");
+    assert!(body.contains("| 2 | n2 | 换 行 |"), "{body}");
+
+    let mut marked = spec("md-null", ExportMode::TableFull, dir.join("marked.md").display().to_string(), 0, false);
+    marked.null_token = "NULL".to_owned();
+    let nulls = live::run_export(&session, &marked).await;
+    assert!(nulls.success, "{}", nulls.message);
+    assert!(fs::read_to_string(nulls.path.unwrap()).unwrap().contains("| 1 | a\\|b | NULL |"));
+
+    let partial = live::run_export(&session, &spec("md-partial", ExportMode::TableLoaded, dir.join("loaded.md").display().to_string(), 1, true)).await;
+    assert!(partial.success, "{}", partial.message);
+    assert!(partial.partial);
+    let partial_file = PathBuf::from(partial.path.unwrap());
+    assert!(partial_file.display().to_string().contains("（部分）.md"), "{}", partial_file.display());
+    assert_eq!(partial.written_rows, 1);
 
     drop(session);
     drop(service);

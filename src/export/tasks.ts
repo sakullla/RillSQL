@@ -4,6 +4,7 @@ import type { Filter, SortSpec } from "../grid/types";
 import { renderCsv, type CsvCell, type CsvOptions } from "./csv";
 import { renderInsert, type InsertTarget } from "./insert";
 import { renderJson } from "./json";
+import { renderMarkdown } from "./markdown";
 import type { ExportPlan } from "./plan";
 import type { ExportFormat, WriteControl, WriteResult } from "./write";
 import { isNativeExport, writeNativeCsv } from "./native";
@@ -71,6 +72,7 @@ export function renderExportText(options: {
   insert?: InsertTarget;
 }): string {
   if (options.format === "json") return renderJson(options.columns, options.rows);
+  if (options.format === "markdown") return renderMarkdown(options.columns, options.rows, { nullToken: options.csv.nullToken });
   if (options.format === "insert") {
     if (!options.insert?.name) throw new Error("还不能确定 INSERT 要写入的表");
     return renderInsert(options.insert, options.columns, options.rows);
