@@ -85,15 +85,20 @@ async function ensureSchemas(id: string, database: string, schema: Ref<string>) 
   }
 }
 
+function dropUnavailableSchema(id: string, database: string, schema: Ref<string>) {
+  const value = schema.value.trim();
+  if (value && !schemaChoices(id, database).includes(value)) schema.value = "";
+}
+
+const schemaPending = computed(() => schemaEntry(baselineId.value, baselineDatabase.value) === "loading" || schemaEntry(targetId.value, targetDatabase.value) === "loading");
+
 watch([baselineId, baselineDatabase], () => {
-  const names = schemasOf(baselineId.value, baselineDatabase.value);
-  if (names.length && baselineSchema.value && !names.includes(baselineSchema.value)) baselineSchema.value = "";
+  dropUnavailableSchema(baselineId.value, baselineDatabase.value, baselineSchema);
   void ensureSchemas(baselineId.value, baselineDatabase.value, baselineSchema);
 });
 
 watch([targetId, targetDatabase], () => {
-  const names = schemasOf(targetId.value, targetDatabase.value);
-  if (names.length && targetSchema.value && !names.includes(targetSchema.value)) targetSchema.value = "";
+  dropUnavailableSchema(targetId.value, targetDatabase.value, targetSchema);
   void ensureSchemas(targetId.value, targetDatabase.value, targetSchema);
 });
 
@@ -116,10 +121,22 @@ function targetOf(): ScriptTarget {
   };
 }
 
+function schemaRejected(id: string, database: string, schema: string): string | null {
+  const known = connection(id);
+  if (!known || known.engine !== "postgres" || !database.trim()) return null;
+  if (schemaEntry(id, database) === "loading") return "PostgreSQL 的 schema 还在读取，选定前不生成脚本。";
+  const choices = schemaChoices(id, database);
+  const value = schema.trim();
+  if (choices.length && value && !choices.includes(value)) return "PostgreSQL 需要为基准和对照各选一个 schema，不生成脚本。";
+  return null;
+}
+
 function refuseLocal(left: CompareSide, right: CompareSide): string | null {
   if (left.engine !== right.engine) return "两侧引擎不同。MySQL 与 MariaDB 是不同引擎，不生成脚本。";
   if (!left.connectionId || !right.connectionId) return "有一侧还没有打开，不生成脚本。";
   if (left.engine !== "sqlite" && (!left.database || !right.database)) return "需要为两侧选择数据库，不生成脚本。";
+  const pending = schemaRejected(baselineId.value, baselineDatabase.value, baselineSchema.value) ?? schemaRejected(targetId.value, targetDatabase.value, targetSchema.value);
+  if (pending) return pending;
   if (left.engine === "postgres" && (!left.schema || !right.schema)) return "PostgreSQL 需要为基准和对照各选一个 schema，不生成脚本。";
   return null;
 }
@@ -238,7 +255,7 @@ function place(sql: string) {
           </fieldset>
         </div>
         <div class="compare-actions">
-          <button class="btn primary" type="button" data-action="compare-structure" :disabled="busy" @click="runStructure">对比结构</button>
+          <button class="btn primary" type="button" data-action="compare-structure" :disabled="busy || schemaPending" @click="runStructure">对比结构</button>
           <button class="btn" type="button" data-action="compare-cancel" :disabled="!busy" @click="cancelRun">取消</button>
         </div>
         <p v-if="errorText" class="struct-alert" role="alert">{{ errorText }}</p>
@@ -265,7 +282,7 @@ function place(sql: string) {
               <option v-for="key in table.keys" :key="key.name" :value="key.name">{{ key.name }}（{{ key.columns.join(", ") }}）</option>
             </select>
           </label>
-          <button class="btn" type="button" data-action="compare-data" :disabled="busy" @click="runData">对比数据</button>
+          <button class="btn" type="button" data-action="compare-data" :disabled="busy || schemaPending" @click="runData">对比数据</button>
           <p v-if="dataReport?.refused" class="struct-alert" role="alert">{{ dataReport.refused }}</p>
           <p v-if="dataReport?.incomplete" class="badge warn">数据脚本不完整</p>
           <ul v-if="dataReport" class="compare-list">

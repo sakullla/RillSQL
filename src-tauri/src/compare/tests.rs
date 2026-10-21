@@ -235,6 +235,54 @@ fn cancelled_data_keeps_rows_already_read() {
 }
 
 #[test]
+fn one_sided_columns_are_not_written_as_null() {
+    let columns = vec![
+        DataColumn { name: "id".to_owned(), type_name: "integer".to_owned(), nullable: false },
+        DataColumn { name: "note".to_owned(), type_name: "text".to_owned(), nullable: true },
+        DataColumn { name: "extra".to_owned(), type_name: "text".to_owned(), nullable: true },
+    ];
+    let differing = data_table(
+        "orders",
+        columns.clone(),
+        primary(),
+        vec![row(&[("id", Some("1")), ("note", Some("a")), ("only_base", Some("keep"))])],
+        vec![row(&[("id", Some("1")), ("note", Some("b")), ("extra", Some("t"))])],
+    );
+    let updated = diff_data(&DataInput { baseline_engine: "sqlite".to_owned(), target_engine: "sqlite".to_owned(), tables: vec![differing], cancelled: false });
+    assert!(updated.script.contains("列集合"));
+    assert!(updated.script.contains("only_base"));
+    assert!(updated.script.contains("extra"));
+    let updated_sql = statements_only(&updated.script);
+    assert!(updated_sql.contains("UPDATE"));
+    assert!(updated_sql.contains("note"));
+    assert!(!updated_sql.contains("extra"));
+    assert!(!updated_sql.contains("only_base"));
+    assert!(!updated_sql.to_ascii_uppercase().contains("NULL"));
+
+    let inserted = data_table(
+        "orders",
+        columns,
+        primary(),
+        vec![row(&[("id", Some("2")), ("note", Some("b")), ("only_base", Some("keep"))])],
+        Vec::new(),
+    );
+    let report = diff_data(&DataInput { baseline_engine: "sqlite".to_owned(), target_engine: "sqlite".to_owned(), tables: vec![inserted], cancelled: false });
+    assert!(report.script.contains("只在对照有 extra"));
+    assert!(report.script.contains("只在基准有 only_base"));
+    let sql = statements_only(&report.script);
+    assert!(sql.contains("INSERT"));
+    assert!(sql.contains("b"));
+    assert!(!sql.contains("extra"));
+    assert!(!sql.contains("only_base"));
+    assert!(!sql.to_ascii_uppercase().contains("NULL"));
+    assert!(!report.script.contains("没有数据差异"));
+}
+
+fn statements_only(script: &str) -> String {
+    script.lines().filter(|line| !line.trim_start().starts_with("--")).collect::<Vec<_>>().join("\n")
+}
+
+#[test]
 fn one_sided_table_is_structural() {
     let mut table = data_table("orders", orders_columns(), primary(), Vec::new(), Vec::new());
     table.only_side = Some("基准".to_owned());

@@ -237,4 +237,98 @@ describe("compare", () => {
     wrapper.unmount();
     resetCatalog();
   });
+
+  it("does not submit the previous schema while the next database is still loading", async () => {
+    invoke.mockReset();
+    let release: ((names: string[]) => void) | undefined;
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "compare_schemas") {
+        return await new Promise<string[]>((resolve) => {
+          release = resolve;
+        });
+      }
+      if (command === "compare_structure") {
+        return { refused: null, script: "-- 未执行\n", incomplete: false, notes: [], onlyBaseline: [], onlyTarget: [], changed: [], tables: [] };
+      }
+      return [];
+    });
+    replaceCatalog([
+      {
+        ...connection("postgres", "pg", "书店"),
+        databases: [
+          { name: "app", error: null, schemas: [{ name: "public", objects: [], total: 0, error: null }] },
+          { name: "other", error: "当前会话连在 app，没有另开连接读取 other", schemas: [] },
+        ],
+      },
+    ]);
+    const wrapper = mount(CompareDialog);
+    await wrapper.get("[data-side=baseline][data-field=connection]").setValue("pg");
+    await wrapper.get("[data-side=target][data-field=connection]").setValue("pg");
+    await wrapper.get("[data-side=baseline][data-field=database]").setValue("app");
+    await wrapper.get("[data-side=target][data-field=database]").setValue("app");
+    await wrapper.get("[data-side=baseline][data-field=schema]").setValue("public");
+    await wrapper.get("[data-side=target][data-field=schema]").setValue("public");
+    await wrapper.get("[data-side=target][data-field=database]").setValue("other");
+    expect(wrapper.get("[data-side=target][data-field=schema]").attributes("data-schema-state")).toBe("loading");
+    const compareStructure = wrapper.get("[data-action=compare-structure]");
+    expect((compareStructure.element as HTMLButtonElement).disabled).toBe(true);
+    (compareStructure.element as HTMLButtonElement).disabled = false;
+    await compareStructure.trigger("click");
+    expect(wrapper.get("[data-compare-refused]").text()).toContain("还在读取");
+    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("compare_structure");
+    release?.(["sales"]);
+    await flushPromises();
+    const targetSchema = wrapper.get("[data-side=target][data-field=schema]");
+    expect(targetSchema.element.tagName).toBe("SELECT");
+    expect((targetSchema.element as HTMLSelectElement).value).toBe("");
+    await wrapper.get("[data-action=compare-structure]").trigger("click");
+    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("compare_structure");
+    await targetSchema.setValue("sales");
+    await wrapper.get("[data-action=compare-structure]").trigger("click");
+    await flushPromises();
+    const compared = invoke.mock.calls.find((call) => call[0] === "compare_structure");
+    expect(compared?.[1]).toMatchObject({ request: { target: { database: "other", schema: "sales" } } });
+    wrapper.unmount();
+    resetCatalog();
+  });
+
+  it("drops a cached schema that is not one of the loaded choices", async () => {
+    invoke.mockReset();
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "compare_schemas") return ["sales"];
+      if (command === "compare_structure") {
+        return { refused: null, script: "-- 未执行\n", incomplete: false, notes: [], onlyBaseline: [], onlyTarget: [], changed: [], tables: [] };
+      }
+      return [];
+    });
+    replaceCatalog([
+      {
+        ...connection("postgres", "pg", "书店"),
+        databases: [
+          { name: "app", error: null, schemas: [{ name: "public", objects: [], total: 0, error: null }] },
+          { name: "other", error: "当前会话连在 app，没有另开连接读取 other", schemas: [] },
+        ],
+      },
+    ]);
+    const wrapper = mount(CompareDialog);
+    await wrapper.get("[data-side=baseline][data-field=connection]").setValue("pg");
+    await wrapper.get("[data-side=target][data-field=connection]").setValue("pg");
+    await wrapper.get("[data-side=baseline][data-field=database]").setValue("app");
+    await wrapper.get("[data-side=target][data-field=database]").setValue("other");
+    await flushPromises();
+    await wrapper.get("[data-side=baseline][data-field=schema]").setValue("public");
+    await wrapper.get("[data-side=target][data-field=database]").setValue("app");
+    await wrapper.get("[data-side=target][data-field=schema]").setValue("public");
+    await wrapper.get("[data-side=target][data-field=database]").setValue("other");
+    await flushPromises();
+    const targetSchema = wrapper.get("[data-side=target][data-field=schema]");
+    expect(targetSchema.text()).toContain("sales");
+    expect(targetSchema.text()).not.toContain("public");
+    expect((targetSchema.element as HTMLSelectElement).value).toBe("");
+    await wrapper.get("[data-action=compare-structure]").trigger("click");
+    expect(wrapper.get("[data-compare-refused]").text()).toContain("schema");
+    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("compare_structure");
+    wrapper.unmount();
+    resetCatalog();
+  });
 });

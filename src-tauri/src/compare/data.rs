@@ -1,6 +1,6 @@
 //! 按主键或唯一键生成数据差异脚本。字面量走网格已有的写入规则，不另做转义，也不执行。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::grid::{delete_sql, insert_sql, reject_literal, update_sql, Cell, Column, Engine as GridEngine, TableSchema};
 
@@ -114,6 +114,7 @@ fn diff_table(engine: GridEngine, table: &DataTable, key: &[String], statements:
         diffs.push(DataDiff { table: table.name.clone(), action: "skipped".to_owned(), key: String::new(), detail: "键列没有同时出现在两侧行中".to_owned() });
         return;
     }
+    note_column_gap(table, notes);
     if left.duplicate || right.duplicate {
         *incomplete = true;
         notes.push(format!("表 {} 有重复键，这些键不生成语句。", table.name));
@@ -211,8 +212,35 @@ fn locator(row: &BTreeMap<String, Cell>, key: &[String]) -> Vec<(String, Cell)> 
     key.iter().map(|column| (column.clone(), row.get(column).cloned().unwrap_or(Cell::Null))).collect()
 }
 
+/// 行 map 里没有的列不是 NULL。那是列集合差异，不能写进插入或更新。
 fn values_of(row: &BTreeMap<String, Cell>, columns: &[Column]) -> Vec<(String, Cell)> {
-    columns.iter().map(|column| (column.name.clone(), row.get(&column.name).cloned().unwrap_or(Cell::Null))).collect()
+    columns.iter().filter_map(|column| row.get(&column.name).cloned().map(|cell| (column.name.clone(), cell))).collect()
+}
+
+fn column_names(rows: &[BTreeMap<String, Cell>]) -> BTreeSet<String> {
+    rows.iter().flat_map(|row| row.keys().cloned()).collect()
+}
+
+fn note_column_gap(table: &DataTable, notes: &mut Vec<String>) {
+    let baseline = column_names(&table.baseline);
+    if baseline.is_empty() {
+        return;
+    }
+    let mut target = column_names(&table.target);
+    target.extend(table.columns.iter().map(|column| column.name.clone()));
+    let only_baseline = baseline.difference(&target).cloned().collect::<Vec<_>>();
+    let only_target = target.difference(&baseline).cloned().collect::<Vec<_>>();
+    if only_baseline.is_empty() && only_target.is_empty() {
+        return;
+    }
+    let mut parts = Vec::new();
+    if !only_baseline.is_empty() {
+        parts.push(format!("只在基准有 {}", only_baseline.join("、")));
+    }
+    if !only_target.is_empty() {
+        parts.push(format!("只在对照有 {}", only_target.join("、")));
+    }
+    notes.push(format!("表 {} 的列集合不同：{}。不为这些列生成赋值。", table.name, parts.join("，")));
 }
 
 fn rejection(schema: &TableSchema, pairs: &[(String, Cell)]) -> Option<String> {
@@ -266,8 +294,9 @@ fn push_update(
         if key.iter().any(|item| item == &column.name) {
             continue;
         }
-        let left = baseline.get(&column.name).cloned().unwrap_or(Cell::Null);
-        let right = target.get(&column.name).cloned().unwrap_or(Cell::Null);
+        let (Some(left), Some(right)) = (baseline.get(&column.name).cloned(), target.get(&column.name).cloned()) else {
+            continue;
+        };
         if left != right {
             sets.push((column.name.clone(), left));
         }
@@ -296,7 +325,7 @@ fn render(notes: &[String], statements: &[String], incomplete: bool) -> String {
     if statements.is_empty() {
         if incomplete {
             lines.push("-- 没有可放入完整脚本的行变更。".to_owned());
-        } else if notes.iter().any(|note| note.contains("无法对应") || note.contains("选定前") || note.contains("结构差异") || note.contains("未能生成") || note.contains("没有读到")) {
+        } else if notes.iter().any(|note| note.contains("无法对应") || note.contains("选定前") || note.contains("结构差异") || note.contains("未能生成") || note.contains("没有读到") || note.contains("列集合")) {
             lines.push("-- 没有可生成的行变更。".to_owned());
         } else {
             lines.push("-- 没有数据差异。".to_owned());
