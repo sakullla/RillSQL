@@ -1209,9 +1209,10 @@ fn plan_replace_view(snapshot: &Snapshot, table: &str, definition: &str) -> Plan
         }
     };
     // 名称按标识符边界比较。子串会把 table_id 当成 TABLE，或把 FROM v_notes 当成正在替换 v_notes。
-    let plain = match &head {
+    // 命中之后改写成快照的限定名和精确名称，不把无限定名或另一种大小写原样发出去。
+    let bound = match &head {
         ViewHead::Query => None,
-        ViewHead::Plain(view) if targets_current_view(snapshot, table, view) => Some(statement.as_str()),
+        ViewHead::Plain(view) if targets_current_view(snapshot, table, view) => Some(bind_view_name(statement, view, &qualified)),
         ViewHead::Plain(_) => {
             return finish(
                 snapshot.engine,
@@ -1239,8 +1240,8 @@ fn plan_replace_view(snapshot: &Snapshot, table: &str, definition: &str) -> Plan
     }];
     let steps = match snapshot.engine {
         Engine::Sqlite => {
-            let create = if let Some(sql) = plain {
-                ensure_semicolon(sql)
+            let create = if let Some(sql) = bound {
+                ensure_semicolon(&sql)
             } else {
                 format!("CREATE VIEW {qualified} AS\n{};", statement.trim().trim_end_matches(';').trim())
             };
@@ -1250,8 +1251,8 @@ fn plan_replace_view(snapshot: &Snapshot, table: &str, definition: &str) -> Plan
             ]
         }
         Engine::Postgres | Engine::Mysql | Engine::Mariadb => {
-            let sql = if let Some(sql) = plain {
-                ensure_semicolon(&ensure_or_replace(sql))
+            let sql = if let Some(sql) = bound {
+                ensure_semicolon(&ensure_or_replace(&sql))
             } else {
                 format!("CREATE OR REPLACE VIEW {qualified} AS\n{};", statement.trim().trim_end_matches(';').trim())
             };
@@ -1332,6 +1333,9 @@ enum ViewHead {
 struct ViewTarget {
     qualifier: Option<SqlIdent>,
     name: SqlIdent,
+    /// 语句里限定名和视图名的字节范围，含中间的点。
+    start: usize,
+    end: usize,
 }
 
 struct SqlIdent {
@@ -1339,7 +1343,13 @@ struct SqlIdent {
     quoted: bool,
 }
 
-enum Tok {
+struct Tok {
+    start: usize,
+    end: usize,
+    kind: TokKind,
+}
+
+enum TokKind {
     Word(String),
     Ident(String),
     Lit,
@@ -1393,10 +1403,10 @@ fn parse_view_head(sql: &str) -> Option<ViewHead> {
         }
         if word_is(token, "algorithm") {
             index += 1;
-            if matches!(tokens.get(index), Some(Tok::Symbol('='))) {
+            if tokens.get(index).is_some_and(|item| symbol_is(item, '=')) {
                 index += 1;
             }
-            if !matches!(tokens.get(index), Some(Tok::Word(_))) {
+            if !tokens.get(index).is_some_and(is_word) {
                 return None;
             }
             index += 1;
@@ -1404,7 +1414,7 @@ fn parse_view_head(sql: &str) -> Option<ViewHead> {
         }
         if word_is(token, "definer") {
             index += 1;
-            if matches!(tokens.get(index), Some(Tok::Symbol('='))) {
+            if tokens.get(index).is_some_and(|item| symbol_is(item, '=')) {
                 index += 1;
             }
             index = skip_definer(&tokens, index)?;
@@ -1437,29 +1447,37 @@ fn parse_view_head(sql: &str) -> Option<ViewHead> {
         }
         index += 3;
     }
-    let (name, qualifier) = read_view_name(&tokens, index)?;
-    Some(ViewHead::Plain(ViewTarget { qualifier, name }))
+    let (name, qualifier, start, end) = read_view_name(&tokens, index)?;
+    Some(ViewHead::Plain(ViewTarget { qualifier, name, start, end }))
+}
+
+fn bind_view_name(sql: &str, target: &ViewTarget, qualified: &str) -> String {
+    let mut bound = String::with_capacity(sql.len() + qualified.len());
+    bound.push_str(&sql[..target.start]);
+    bound.push_str(qualified);
+    bound.push_str(&sql[target.end..]);
+    bound
 }
 
 fn skip_definer(tokens: &[Tok], mut index: usize) -> Option<usize> {
     if tokens.get(index).is_some_and(|token| word_is(token, "current_user")) {
         index += 1;
-        if matches!(tokens.get(index), Some(Tok::Symbol('('))) {
+        if tokens.get(index).is_some_and(|token| symbol_is(token, '(')) {
             index += 1;
-            if !matches!(tokens.get(index), Some(Tok::Symbol(')'))) {
+            if !tokens.get(index).is_some_and(|token| symbol_is(token, ')')) {
                 return None;
             }
             index += 1;
         }
         return Some(index);
     }
-    if !matches!(tokens.get(index), Some(Tok::Word(_) | Tok::Ident(_) | Tok::Lit)) {
+    if !tokens.get(index).is_some_and(is_definer_atom) {
         return None;
     }
     index += 1;
-    if matches!(tokens.get(index), Some(Tok::Symbol('@'))) {
+    if tokens.get(index).is_some_and(|token| symbol_is(token, '@')) {
         index += 1;
-        if !matches!(tokens.get(index), Some(Tok::Word(_) | Tok::Ident(_) | Tok::Lit)) {
+        if !tokens.get(index).is_some_and(is_definer_atom) {
             return None;
         }
         index += 1;
@@ -1467,24 +1485,23 @@ fn skip_definer(tokens: &[Tok], mut index: usize) -> Option<usize> {
     Some(index)
 }
 
-fn read_view_name(tokens: &[Tok], mut index: usize) -> Option<(SqlIdent, Option<SqlIdent>)> {
+fn read_view_name(tokens: &[Tok], index: usize) -> Option<(SqlIdent, Option<SqlIdent>, usize, usize)> {
     let (first, next) = take_ident(tokens, index)?;
-    index = next;
-    if matches!(tokens.get(index), Some(Tok::Symbol('.'))) {
-        index += 1;
-        let (second, next) = take_ident(tokens, index)?;
-        if matches!(tokens.get(next), Some(Tok::Symbol('.'))) {
+    let start = tokens[index].start;
+    if tokens.get(next).is_some_and(|token| symbol_is(token, '.')) {
+        let (second, after) = take_ident(tokens, next + 1)?;
+        if tokens.get(after).is_some_and(|token| symbol_is(token, '.')) {
             return None;
         }
-        return Some((second, Some(first)));
+        return Some((second, Some(first), start, tokens[next + 1].end));
     }
-    Some((first, None))
+    Some((first, None, start, tokens[index].end))
 }
 
 fn take_ident(tokens: &[Tok], index: usize) -> Option<(SqlIdent, usize)> {
-    let ident = match tokens.get(index)? {
-        Tok::Word(text) => SqlIdent { text: text.clone(), quoted: false },
-        Tok::Ident(text) => SqlIdent { text: text.clone(), quoted: true },
+    let ident = match tokens.get(index).map(|token| &token.kind) {
+        Some(TokKind::Word(text)) => SqlIdent { text: text.clone(), quoted: false },
+        Some(TokKind::Ident(text)) => SqlIdent { text: text.clone(), quoted: true },
         _ => return None,
     };
     Some((ident, index + 1))
@@ -1522,82 +1539,105 @@ fn ident_matches(engine: Engine, ident: &SqlIdent, catalog: &str) -> bool {
 }
 
 fn word_is(token: &Tok, expected: &str) -> bool {
-    matches!(token, Tok::Word(text) if text.eq_ignore_ascii_case(expected))
+    matches!(&token.kind, TokKind::Word(text) if text.eq_ignore_ascii_case(expected))
+}
+
+fn symbol_is(token: &Tok, expected: char) -> bool {
+    matches!(token.kind, TokKind::Symbol(ch) if ch == expected)
+}
+
+fn is_word(token: &Tok) -> bool {
+    matches!(token.kind, TokKind::Word(_))
+}
+
+fn is_definer_atom(token: &Tok) -> bool {
+    matches!(token.kind, TokKind::Word(_) | TokKind::Ident(_) | TokKind::Lit)
 }
 
 fn tokenize_sql(sql: &str) -> Vec<Tok> {
-    let chars: Vec<char> = sql.chars().collect();
     let mut index = 0;
     let mut tokens = Vec::new();
-    while index < chars.len() {
-        let ch = chars[index];
+    while index < sql.len() {
+        let ch = sql[index..].chars().next().unwrap();
+        let len = ch.len_utf8();
         if ch.is_whitespace() {
-            index += 1;
+            index += len;
             continue;
         }
-        if ch == '-' && chars.get(index + 1) == Some(&'-') {
-            index += 2;
-            while index < chars.len() && chars[index] != '\n' {
-                index += 1;
+        if ch == '-' && sql[index + len..].starts_with('-') {
+            index += len + '-'.len_utf8();
+            while index < sql.len() {
+                let next = sql[index..].chars().next().unwrap();
+                if next == '\n' {
+                    break;
+                }
+                index += next.len_utf8();
             }
             continue;
         }
-        if ch == '/' && chars.get(index + 1) == Some(&'*') {
-            index += 2;
-            while index + 1 < chars.len() && !(chars[index] == '*' && chars[index + 1] == '/') {
-                index += 1;
+        if ch == '/' && sql[index + len..].starts_with('*') {
+            index += len + '*'.len_utf8();
+            while index < sql.len() {
+                let next = sql[index..].chars().next().unwrap();
+                let next_len = next.len_utf8();
+                if next == '*' && sql[index + next_len..].starts_with('/') {
+                    index += next_len + '/'.len_utf8();
+                    break;
+                }
+                index += next_len;
             }
-            index = (index + 2).min(chars.len());
             continue;
         }
         if matches!(ch, '\'' | '"' | '`' | '[') {
-            let (token, next) = read_quoted(&chars, index);
-            tokens.push(token);
+            let start = index;
+            let (kind, next) = read_quoted(sql, index);
+            tokens.push(Tok { start, end: next, kind });
             index = next;
             continue;
         }
         if is_ident_start(ch) {
             let start = index;
-            index += 1;
-            while index < chars.len() && is_ident_continue(chars[index]) {
-                index += 1;
+            index += len;
+            while index < sql.len() {
+                let next = sql[index..].chars().next().unwrap();
+                if !is_ident_continue(next) {
+                    break;
+                }
+                index += next.len_utf8();
             }
-            tokens.push(Tok::Word(chars[start..index].iter().collect()));
+            tokens.push(Tok { start, end: index, kind: TokKind::Word(sql[start..index].to_owned()) });
             continue;
         }
-        tokens.push(Tok::Symbol(ch));
-        index += 1;
+        tokens.push(Tok { start: index, end: index + len, kind: TokKind::Symbol(ch) });
+        index += len;
     }
     tokens
 }
 
-fn read_quoted(chars: &[char], start: usize) -> (Tok, usize) {
-    let opener = chars[start];
+fn read_quoted(sql: &str, start: usize) -> (TokKind, usize) {
+    let opener = sql[start..].chars().next().unwrap();
     let closer = if opener == '[' { ']' } else { opener };
-    let mut index = start + 1;
+    let mut index = start + opener.len_utf8();
     let mut text = String::new();
-    while index < chars.len() {
-        let ch = chars[index];
+    while index < sql.len() {
+        let ch = sql[index..].chars().next().unwrap();
+        let len = ch.len_utf8();
         if ch == closer {
-            let escaped = if opener == '[' {
-                chars.get(index + 1) == Some(&']')
-            } else {
-                chars.get(index + 1) == Some(&closer)
-            };
+            let next = index + len;
+            let escaped = sql[next..].chars().next() == Some(closer);
             if escaped {
                 text.push(closer);
-                index += 2;
+                index = next + closer.len_utf8();
                 continue;
             }
-            index += 1;
-            let token = if opener == '\'' { Tok::Lit } else { Tok::Ident(text) };
-            return (token, index);
+            let kind = if opener == '\'' { TokKind::Lit } else { TokKind::Ident(text) };
+            return (kind, next);
         }
         text.push(ch);
-        index += 1;
+        index += len;
     }
-    let token = if opener == '\'' { Tok::Lit } else { Tok::Ident(text) };
-    (token, chars.len())
+    let kind = if opener == '\'' { TokKind::Lit } else { TokKind::Ident(text) };
+    (kind, sql.len())
 }
 
 fn is_ident_start(ch: char) -> bool {

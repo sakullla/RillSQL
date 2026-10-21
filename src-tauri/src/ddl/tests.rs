@@ -213,6 +213,8 @@ fn replacing_a_view_lists_every_statement_and_refuses_unsafe_cases() {
     assert!(mysql_plan.blocked.is_empty(), "{:?}", mysql_plan.blocked);
     assert_eq!(mysql_plan.steps.len(), 1);
     assert!(mysql_plan.steps[0].sql.to_ascii_uppercase().contains("CREATE OR REPLACE"));
+    assert!(mysql_plan.steps[0].sql.contains("`app`.`v_notes`"));
+    assert!(!mysql_plan.steps[0].sql.contains("VIEW `v_notes`"));
     assert!(!mysql_plan.steps[0].sql.to_ascii_uppercase().contains("DROP"));
 
     let multi = plan(
@@ -287,7 +289,8 @@ fn view_replace_matches_the_created_identifier_not_a_substring() {
         &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW V_Notes AS SELECT table_id FROM notes".to_owned() },
     );
     assert!(unquoted_same.blocked.is_empty(), "{:?}", unquoted_same.blocked);
-    assert!(unquoted_same.steps[0].sql.contains("\"public\".\"v_notes\"") || unquoted_same.steps[0].sql.contains("V_Notes"));
+    assert!(unquoted_same.steps[0].sql.contains("CREATE OR REPLACE VIEW \"public\".\"v_notes\""));
+    assert!(!unquoted_same.steps[0].sql.contains("V_Notes"));
 
     let materialized_text = plan(
         &postgres,
@@ -317,7 +320,9 @@ fn view_replace_matches_the_created_identifier_not_a_substring() {
     assert!(mysql_show.blocked.is_empty(), "{:?}", mysql_show.blocked);
     assert_eq!(mysql_show.steps.len(), 1);
     assert!(mysql_show.steps[0].sql.starts_with("CREATE OR REPLACE ALGORITHM=UNDEFINED"));
-    assert!(mysql_show.steps[0].sql.contains("`v_notes`"));
+    assert!(mysql_show.steps[0].sql.contains("DEFINER=`root`@`localhost`"));
+    assert!(mysql_show.steps[0].sql.contains("VIEW `app`.`v_notes`"));
+    assert!(!mysql_show.steps[0].sql.contains("VIEW `v_notes`"));
     assert!(mysql_show.steps[0].sql.contains("table_id"));
     assert!(!mysql_show.steps[0].sql.to_ascii_uppercase().contains("DROP"));
 
@@ -351,6 +356,71 @@ fn view_replace_matches_the_created_identifier_not_a_substring() {
     );
     assert!(sqlite_other.steps.is_empty());
     assert!(sqlite_other.blocked.iter().any(|item| item.contains("不是当前视图")));
+}
+
+#[test]
+fn view_replace_binds_an_unqualified_name_to_the_opened_object() {
+    let mut postgres = view_of(Engine::Postgres, "CREATE OR REPLACE VIEW \"analytics\".\"v_notes\" AS\nSELECT 1;");
+    postgres.database = "shop".to_owned();
+    postgres.schema = "analytics".to_owned();
+    let unqualified = plan(
+        &postgres,
+        &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW v_notes (id) AS SELECT id FROM notes".to_owned() },
+    );
+    assert!(unqualified.blocked.is_empty(), "{:?}", unqualified.blocked);
+    assert_eq!(
+        unqualified.steps[0].sql,
+        "CREATE OR REPLACE VIEW \"analytics\".\"v_notes\" (id) AS SELECT id FROM notes;"
+    );
+    assert!(!unqualified.steps[0].sql.contains("VIEW v_notes"));
+
+    let mut mysql = view_of(Engine::Mysql, "CREATE VIEW `v_notes` AS select `id` from `notes`");
+    mysql.database = "shop".to_owned();
+    let show = plan(
+        &mysql,
+        &Action::ReplaceView {
+            table: "v_notes".to_owned(),
+            definition: "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `v_notes` AS select `id` from `notes`".to_owned(),
+        },
+    );
+    assert!(show.blocked.is_empty(), "{:?}", show.blocked);
+    assert_eq!(
+        show.steps[0].sql,
+        "CREATE OR REPLACE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `shop`.`v_notes` AS select `id` from `notes`;"
+    );
+    assert!(!show.steps[0].sql.contains("VIEW `v_notes`"));
+
+    let different_case = plan(
+        &mysql,
+        &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW V_Notes AS SELECT 1".to_owned() },
+    );
+    assert!(different_case.blocked.is_empty(), "{:?}", different_case.blocked);
+    assert_eq!(different_case.steps[0].sql, "CREATE OR REPLACE VIEW `shop`.`v_notes` AS SELECT 1;");
+    assert!(!different_case.steps[0].sql.contains("V_Notes"));
+
+    let qualified_case = plan(
+        &mysql,
+        &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW shop.V_Notes AS SELECT note FROM notes".to_owned() },
+    );
+    assert!(qualified_case.blocked.is_empty(), "{:?}", qualified_case.blocked);
+    assert_eq!(qualified_case.steps[0].sql, "CREATE OR REPLACE VIEW `shop`.`v_notes` AS SELECT note FROM notes;");
+    assert!(!qualified_case.steps[0].sql.contains("V_Notes"));
+
+    let quoted_case = plan(
+        &mysql,
+        &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW `V_Notes` AS SELECT 1".to_owned() },
+    );
+    assert!(quoted_case.steps.is_empty());
+    assert!(quoted_case.blocked.iter().any(|item| item.contains("不是当前视图")));
+
+    let maria = view_of(Engine::Mariadb, "CREATE VIEW `v_notes` AS select 1");
+    let maria_plan = plan(
+        &maria,
+        &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW v_notes AS select 2".to_owned() },
+    );
+    assert!(maria_plan.blocked.is_empty(), "{:?}", maria_plan.blocked);
+    assert!(maria_plan.steps[0].sql.contains("VIEW `app`.`v_notes`"));
+    assert!(!maria_plan.steps[0].sql.contains("VIEW v_notes"));
 }
 
 #[test]
