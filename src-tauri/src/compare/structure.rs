@@ -276,10 +276,11 @@ fn compare_pair(
             changed.push(item(base, "定义文本不同"));
             if allow_ddl && !blocked(baseline, target_side, Category::from_kind(base.kind)) {
                 // 名称和签名都没变时，PostgreSQL 上的 DROP 会被仍引用它的对象拒绝。
-                // 视图和函数直接替换；替换不了的仍走删除，由后续步骤先摘掉依赖。
+                // 能证明输出列兼容的视图，以及返回类型没变的函数，直接替换。
+                // 证明不了的视图先删依赖再 DROP，由后续步骤建回。
                 if replaces_in_place(engine, base, other) {
                     if let Some(sql) = create_definition(engine, target, base) {
-                        create_object.push(plan_create(base, ensure_or_replace_kind(&sql, base.kind)));
+                        create_object.push(plan_replace(base, other, ensure_or_replace_kind(&sql, base.kind)));
                     }
                 } else {
                     object_drops.push(plan_drop(engine, target, other));
@@ -322,7 +323,7 @@ fn compare_pair(
         changed.push(item(base, if column_diff { "列的名称、类型、可否为空或默认值不同" } else { "主键不同" }));
     }
     if emit_alter {
-        alters.extend(alter_table(engine, target, &base.name, left, right, with_fk, pk_trusted));
+        alters.extend(alter_table(engine, target, baseline, &base.name, left, right, with_fk, pk_trusted));
     }
     let rebuilt = emit_alter && engine == Engine::Sqlite && sqlite_needs_rebuild(left, right, with_fk);
     if left.indexes_read && right.indexes_read {
@@ -572,6 +573,8 @@ struct PlannedCreate {
     statement: String,
     definition: String,
     relation: String,
+    /// 对照上同名对象的现定义。空表示先删后建或全新对象，不是原地替换。
+    current_definition: String,
 }
 
 fn plan_drop(engine: Engine, side: &Side, object: &ObjectDef) -> PlannedDrop {
@@ -594,7 +597,14 @@ fn plan_create(object: &ObjectDef, statement: String) -> PlannedCreate {
         statement,
         definition: object.definition.clone(),
         relation: object.relation.clone(),
+        current_definition: String::new(),
     }
+}
+
+fn plan_replace(baseline: &ObjectDef, current: &ObjectDef, statement: String) -> PlannedCreate {
+    let mut planned = plan_create(baseline, statement);
+    planned.current_definition = current.definition.clone();
+    planned
 }
 
 fn referenced_tables(engine: Engine, side: &Side, object: &ObjectDef) -> Vec<String> {
@@ -672,9 +682,17 @@ fn assemble_statements(
     let mut view_creates = Vec::new();
     let mut trigger_creates = Vec::new();
     let drop_keys = changed_drops.iter().map(|item| item.key.clone()).collect::<BTreeSet<_>>();
+    let routine_drops = changed_drops
+        .iter()
+        .chain(only_target_drops.iter())
+        .filter(|drop| matches!(drop.kind, Kind::Function | Kind::Procedure))
+        .map(|drop| drop.name.clone())
+        .collect::<Vec<_>>();
+    let mut early_views = Vec::new();
     for create in creates {
         match create.kind {
             Kind::Table => table_creates.push(create),
+            Kind::View if is_early_view_replace(&create, &alters, &detach, &routine_drops) => early_views.push(create),
             Kind::View => view_creates.push(create),
             Kind::Trigger => trigger_creates.push(create),
             _ if drop_keys.contains(&create.key) => changed_creates.push(create),
@@ -696,6 +714,8 @@ fn assemble_statements(
     statements.extend(triggers.into_iter().map(|drop| drop.statement));
     statements.extend(order_dependents_first(views).into_iter().map(|drop| drop.statement));
     statements.extend(order_dependents_first(tables).into_iter().map(|drop| drop.statement));
+    // 当前视图还引用即将删掉的列或函数时，先换成不再引用它们的定义，后面的 ALTER / DROP 才过得去。
+    statements.extend(order_view_creates(early_views).into_iter().map(|create| create.statement));
     statements.extend(in_place);
     statements.extend(detach);
     statements.extend(freeing_alters);
@@ -1381,10 +1401,23 @@ fn replaces_in_place(engine: Engine, base: &ObjectDef, other: &ObjectDef) -> boo
 }
 
 fn view_columns_compatible(wanted: &str, current: &str) -> bool {
+    // 缺列清单时看不出旧输出列是否还在。pg_get_viewdef 通常没有列清单，不能当成可以 OR REPLACE。
     match (explicit_view_columns(wanted), explicit_view_columns(current)) {
         (Some(wanted), Some(current)) => wanted.len() >= current.len() && wanted[..current.len()] == current[..],
-        _ => true,
+        _ => false,
     }
+}
+
+/// 替换后的定义不再依赖即将删除的列或函数时，把 CREATE OR REPLACE 放到这些语句之前。
+fn is_early_view_replace(create: &PlannedCreate, alters: &[String], detach: &[String], routine_drops: &[String]) -> bool {
+    if create.current_definition.is_empty() {
+        return false;
+    }
+    let current = &create.current_definition;
+    if routine_drops.iter().any(|name| statement_mentions(current, name)) {
+        return true;
+    }
+    blocking_columns(alters).into_iter().chain(blocking_columns(detach)).any(|(table, column)| view_uses_table_column(current, &table, &column))
 }
 
 fn explicit_view_columns(definition: &str) -> Option<Vec<String>> {
@@ -1473,8 +1506,10 @@ fn preserve_dependents(
 ) {
     rewrite_kept_types(engine, target, baseline, drops, creates, in_place, detach, restore);
     rewrite_kept_sequences(engine, target, baseline, drops, creates, alters, in_place, detach, restore);
-    cover_dependents(engine, baseline, target, drops, creates);
     detach_routine_defaults(engine, baseline, target, drops, alters, detach, restore);
+    cover_dependents(engine, baseline, target, drops, creates, alters, detach);
+    demote_blocked_view_replacements(engine, baseline, target, drops, creates, alters, detach);
+    cover_dependents(engine, baseline, target, drops, creates, alters, detach);
 }
 
 fn rewrite_kept_types(
@@ -1628,8 +1663,17 @@ fn detach_routine_defaults(
     }
 }
 
-fn cover_dependents(engine: Engine, baseline: &Side, target: &Side, drops: &mut Vec<PlannedDrop>, creates: &mut Vec<PlannedCreate>) {
+fn cover_dependents(
+    engine: Engine,
+    baseline: &Side,
+    target: &Side,
+    drops: &mut Vec<PlannedDrop>,
+    creates: &mut Vec<PlannedCreate>,
+    alters: &[String],
+    detach: &[String],
+) {
     let objects = target.objects.clone();
+    let blocked = blocking_columns(alters).into_iter().chain(blocking_columns(detach)).collect::<Vec<_>>();
     for _ in 0..objects.len().saturating_add(1) {
         let dropped_views = drops.iter().filter(|drop| drop.kind == Kind::View).map(|drop| drop.name.clone()).collect::<Vec<_>>();
         let dropped_relations = drops
@@ -1648,7 +1692,20 @@ fn cover_dependents(engine: Engine, baseline: &Side, target: &Side, drops: &mut 
                 continue;
             }
             let hit = match object.kind {
-                Kind::View => referenced_relations(&object.definition).iter().any(|name| dropped_views.iter().any(|drop| drop.eq_ignore_ascii_case(name))),
+                // 正在原地替换的视图看新定义：新定义已经不再依赖时，不必先 DROP。
+                // 其余视图除了 FROM/JOIN，选择被改写的列或调用即将删除的函数也会挡住后面的语句。
+                Kind::View => {
+                    let current_body = object.definition.as_str();
+                    // 列和函数可以靠更早的 OR REPLACE 解开；视图依赖不行，因为删视图发生在替换之前。
+                    let next_body = creates
+                        .iter()
+                        .find(|create| create.key == identity(object) && !create.current_definition.is_empty())
+                        .map(|create| create.definition.as_str())
+                        .unwrap_or(current_body);
+                    referenced_relations(current_body).iter().any(|name| dropped_views.iter().any(|drop| drop.eq_ignore_ascii_case(name)))
+                        || dropped_routines.iter().any(|name| statement_mentions(next_body, name))
+                        || blocked.iter().any(|(table, column)| view_uses_table_column(next_body, table, column))
+                }
                 Kind::Trigger => {
                     dropped_relations.iter().any(|name| name.eq_ignore_ascii_case(&object.relation))
                         || dropped_routines.iter().any(|name| statement_mentions(&object.definition, name))
@@ -1672,6 +1729,151 @@ fn cover_dependents(engine: Engine, baseline: &Side, target: &Side, drops: &mut 
             break;
         }
     }
+}
+
+/// 新定义仍然依赖即将删除的函数或列，或者要用到还没建出来的对象时，不能先 OR REPLACE。
+fn demote_blocked_view_replacements(
+    engine: Engine,
+    baseline: &Side,
+    target: &Side,
+    drops: &mut Vec<PlannedDrop>,
+    creates: &mut Vec<PlannedCreate>,
+    alters: &[String],
+    detach: &[String],
+) {
+    let routine_drops = drops
+        .iter()
+        .filter(|drop| matches!(drop.kind, Kind::Function | Kind::Procedure))
+        .map(|drop| drop.name.clone())
+        .collect::<Vec<_>>();
+    let fresh_names = creates.iter().filter(|create| create.current_definition.is_empty()).map(|create| create.name.clone()).collect::<Vec<_>>();
+    let added = added_columns(alters);
+    let blocked = blocking_columns(alters).into_iter().chain(blocking_columns(detach)).collect::<Vec<_>>();
+    let keys = creates
+        .iter()
+        .filter(|create| create.kind == Kind::View && !create.current_definition.is_empty())
+        .filter(|create| {
+            let wanted = &create.definition;
+            let current = &create.current_definition;
+            let keeps_dropped_routine = routine_drops.iter().any(|name| statement_mentions(wanted, name));
+            let keeps_blocked_column = blocked.iter().any(|(table, column)| view_uses_table_column(wanted, table, column));
+            let needs_fresh = fresh_names
+                .iter()
+                .any(|name| !name.eq_ignore_ascii_case(&create.name) && statement_mentions(wanted, name) && !statement_mentions(current, name));
+            let needs_added = added.iter().any(|(table, column)| view_uses_table_column(wanted, table, column) && !view_uses_table_column(current, table, column));
+            keeps_dropped_routine || keeps_blocked_column || needs_fresh || needs_added
+        })
+        .map(|create| create.key.clone())
+        .collect::<Vec<_>>();
+    for key in keys {
+        let Some(index) = creates.iter().position(|create| create.key == key) else {
+            continue;
+        };
+        creates.remove(index);
+        let Some(current) = target.objects.iter().find(|object| identity(object) == key) else {
+            continue;
+        };
+        if !drops.iter().any(|drop| drop.key == key) {
+            drops.push(plan_drop(engine, target, current));
+        }
+        let source = baseline.objects.iter().find(|object| identity(object) == key).unwrap_or(current);
+        if let Some(sql) = create_definition(engine, target, source) {
+            creates.push(plan_create(source, sql));
+        }
+    }
+}
+
+fn blocking_columns(statements: &[String]) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for sql in statements {
+        if let Some(pair) = blocked_column(sql) {
+            if !found.iter().any(|item| item == &pair) {
+                found.push(pair);
+            }
+        }
+    }
+    found
+}
+
+fn added_columns(statements: &[String]) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for sql in statements {
+        if let Some(pair) = added_column(sql) {
+            if !found.iter().any(|item| item == &pair) {
+                found.push(pair);
+            }
+        }
+    }
+    found
+}
+
+fn blocked_column(sql: &str) -> Option<(String, String)> {
+    let tokens = sql_tokens(sql);
+    let table_at = tokens.iter().position(|token| is_word(token, "TABLE"))?;
+    let (table, mut index) = qualified_relation(&tokens, table_at + 1);
+    if table.is_empty() {
+        return None;
+    }
+    while index < tokens.len() {
+        if is_word(&tokens[index], "DROP") && tokens.get(index + 1).is_some_and(|token| is_word(token, "COLUMN")) {
+            let column = tokens.get(index + 2)?.text.clone();
+            return Some((table, column));
+        }
+        if is_word(&tokens[index], "ALTER") && tokens.get(index + 1).is_some_and(|token| is_word(token, "COLUMN")) {
+            let column = tokens.get(index + 2)?.text.clone();
+            if tokens[index + 3..].iter().any(|token| is_word(token, "TYPE")) {
+                return Some((table, column));
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn added_column(sql: &str) -> Option<(String, String)> {
+    let tokens = sql_tokens(sql);
+    let table_at = tokens.iter().position(|token| is_word(token, "TABLE"))?;
+    let (table, mut index) = qualified_relation(&tokens, table_at + 1);
+    if table.is_empty() {
+        return None;
+    }
+    while index + 1 < tokens.len() {
+        if is_word(&tokens[index], "ADD") && is_word(&tokens[index + 1], "COLUMN") {
+            let column = tokens.get(index + 2)?.text.clone();
+            return Some((table, column));
+        }
+        index += 1;
+    }
+    None
+}
+
+fn view_uses_table_column(definition: &str, table: &str, column: &str) -> bool {
+    if table.is_empty() || column.is_empty() {
+        return false;
+    }
+    let uses_table = referenced_relations(definition).iter().any(|name| name.eq_ignore_ascii_case(table));
+    if !uses_table {
+        return false;
+    }
+    select_list_has_star(definition) || statement_mentions(definition, column)
+}
+
+fn select_list_has_star(definition: &str) -> bool {
+    let tokens = sql_tokens(definition);
+    let mut index = 0;
+    while index < tokens.len() {
+        if is_word(&tokens[index], "SELECT") {
+            index += 1;
+            while index < tokens.len() && !is_word(&tokens[index], "FROM") {
+                if tokens[index].text == "*" {
+                    return true;
+                }
+                index += 1;
+            }
+        }
+        index += 1;
+    }
+    false
 }
 
 fn recreate_sql(engine: Engine, side: &Side, source: &ObjectDef) -> Option<String> {
@@ -2259,15 +2461,24 @@ fn create_definition(engine: Engine, side: &Side, object: &ObjectDef) -> Option<
     Some(sql)
 }
 
-fn alter_table(engine: Engine, side: &Side, name: &str, baseline: &TableShape, target: &TableShape, with_fk: bool, with_pk: bool) -> Vec<String> {
+fn alter_table(
+    engine: Engine,
+    side: &Side,
+    baseline_side: &Side,
+    name: &str,
+    baseline: &TableShape,
+    target: &TableShape,
+    with_fk: bool,
+    with_pk: bool,
+) -> Vec<String> {
     match engine {
         Engine::Sqlite => sqlite_alter(side, name, baseline, target, with_fk),
-        Engine::Postgres => postgres_alter(side, name, baseline, target, with_pk),
+        Engine::Postgres => postgres_alter(side, baseline_side, name, baseline, target, with_pk),
         Engine::Mysql | Engine::Mariadb => mysql_alter(engine, side, name, baseline, target, with_pk),
     }
 }
 
-fn postgres_alter(side: &Side, name: &str, baseline: &TableShape, target: &TableShape, with_pk: bool) -> Vec<String> {
+fn postgres_alter(side: &Side, baseline_side: &Side, name: &str, baseline: &TableShape, target: &TableShape, with_pk: bool) -> Vec<String> {
     let engine = Engine::Postgres;
     let table = qualify(engine, side, name);
     let mut statements = Vec::new();
@@ -2281,7 +2492,12 @@ fn postgres_alter(side: &Side, name: &str, baseline: &TableShape, target: &Table
             None => statements.push(format!("ALTER TABLE {table} ADD COLUMN {}", column_clause(engine, column))),
             Some(other) => {
                 if !column.type_name.eq_ignore_ascii_case(&other.type_name) {
-                    statements.push(format!("ALTER TABLE {table} ALTER COLUMN {} TYPE {}", quote(engine, &column.name), column.type_name.trim()));
+                    let using = enum_using(baseline_side, side, &other.type_name, &column.type_name, &column.name);
+                    statements.push(format!(
+                        "ALTER TABLE {table} ALTER COLUMN {} TYPE {}{using}",
+                        quote(engine, &column.name),
+                        column.type_name.trim()
+                    ));
                 }
                 if column.nullable != other.nullable {
                     let verb = if column.nullable { "DROP NOT NULL" } else { "SET NOT NULL" };
@@ -2301,6 +2517,19 @@ fn postgres_alter(side: &Side, name: &str, baseline: &TableShape, target: &Table
         push_primary_key(engine, &table, name, baseline, target, &mut statements);
     }
     statements
+}
+
+/// 两个枚举之间没有自动转型。经 text 转一次，标签对不上现有数据时由执行失败，而不是省略 USING。
+fn enum_using(baseline: &Side, target: &Side, from_type: &str, to_type: &str, column: &str) -> String {
+    if is_enum_type(target, from_type) && is_enum_type(baseline, to_type) {
+        format!(" USING {}::text::{}", quote(Engine::Postgres, column), to_type.trim())
+    } else {
+        String::new()
+    }
+}
+
+fn is_enum_type(side: &Side, type_name: &str) -> bool {
+    side.objects.iter().any(|object| object.kind == Kind::Enum && type_mentions(type_name, &object.name))
 }
 
 fn push_primary_key(engine: Engine, table: &str, name: &str, baseline: &TableShape, target: &TableShape, statements: &mut Vec<String>) {

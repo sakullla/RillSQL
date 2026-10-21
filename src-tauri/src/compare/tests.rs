@@ -664,8 +664,10 @@ fn create_statements_are_qualified_on_the_target_side() {
     let baseline_view = ObjectDef::defined(Kind::View, "v_orders", "CREATE OR REPLACE VIEW \"public\".\"v_orders\" AS SELECT 1");
     let target_view = ObjectDef::defined(Kind::View, "v_orders", "CREATE OR REPLACE VIEW \"sales\".\"v_orders\" AS SELECT 2");
     let views = diff_structure(&Side::ready("postgres", "app", "public", vec![baseline_view]), &Side::ready("postgres", "app", "sales", vec![target_view]));
-    assert!(!views.script.contains("DROP VIEW"));
-    assert!(views.script.contains("CREATE OR REPLACE VIEW \"sales\".\"v_orders\" AS SELECT 1"));
+    // 两侧都没有列清单，不能证明 OR REPLACE 合法，所以先删对照上的视图再按对照 schema 建回。
+    assert!(views.script.contains("DROP VIEW \"sales\".\"v_orders\""));
+    assert!(at(&views.script, "DROP VIEW \"sales\".\"v_orders\"") < at(&views.script, "VIEW \"sales\".\"v_orders\" AS SELECT 1"));
+    assert!(views.script.contains("VIEW \"sales\".\"v_orders\" AS SELECT 1"));
     assert!(!views.script.contains("\"public\".\"v_orders\""));
 
     let baseline_fn = ObjectDef::defined(Kind::Function, "add_customer", "CREATE FUNCTION public.add_customer() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$");
@@ -880,6 +882,7 @@ fn compare_commands_are_registered_and_do_not_focus_or_execute() {
 
 #[test]
 fn changed_views_and_functions_are_replaced_without_dropping_dependents() {
+    // 没有显式列清单时，少列的 CREATE OR REPLACE 会被 PostgreSQL 拒绝，必须先摘依赖再重建。
     let wanted = ObjectDef::defined(Kind::View, "v_base", "CREATE VIEW v_base AS SELECT id FROM notes");
     let current = ObjectDef::defined(Kind::View, "v_base", "CREATE VIEW v_base AS SELECT 1");
     let top = ObjectDef::defined(Kind::View, "v_top", "CREATE VIEW v_top AS SELECT * FROM v_base");
@@ -890,9 +893,21 @@ fn changed_views_and_functions_are_replaced_without_dropping_dependents() {
         &Side::ready("postgres", "app", "public", vec![current, top, trigger]),
     );
     let script = &views.script;
-    assert!(script.contains("CREATE OR REPLACE VIEW \"public\".\"v_base\" AS SELECT id FROM notes"), "{script}");
-    assert!(!script.contains("DROP VIEW"), "{script}");
-    assert!(!script.contains("DROP TRIGGER"), "{script}");
+    assert!(at(script, "DROP TRIGGER \"v_touch\" ON \"public\".\"v_base\"") < at(script, "DROP VIEW \"public\".\"v_base\""), "{script}");
+    assert!(at(script, "DROP VIEW \"public\".\"v_top\"") < at(script, "DROP VIEW \"public\".\"v_base\""), "{script}");
+    assert!(at(script, "CREATE VIEW \"public\".\"v_base\" AS SELECT id FROM notes") < at(script, "CREATE OR REPLACE VIEW \"public\".\"v_top\""), "{script}");
+    assert!(at(script, "CREATE VIEW \"public\".\"v_base\" AS SELECT id FROM notes") < at(script, "CREATE TRIGGER \"v_touch\""), "{script}");
+    assert!(!script.contains("CREATE OR REPLACE VIEW \"public\".\"v_base\""), "{script}");
+
+    let listed_wanted = ObjectDef::defined(Kind::View, "v_base", "CREATE VIEW v_base (id) AS SELECT id FROM notes");
+    let listed_current = ObjectDef::defined(Kind::View, "v_base", "CREATE VIEW v_base (id) AS SELECT 1 AS id");
+    let listed_top = ObjectDef::defined(Kind::View, "v_top", "CREATE VIEW v_top AS SELECT * FROM v_base");
+    let listed = diff_structure(
+        &Side::ready("postgres", "app", "public", vec![listed_wanted, listed_top.clone()]),
+        &Side::ready("postgres", "app", "public", vec![listed_current, listed_top]),
+    );
+    assert!(listed.script.contains("CREATE OR REPLACE VIEW \"public\".\"v_base\" (id) AS SELECT id FROM notes"), "{}", listed.script);
+    assert!(!listed.script.contains("DROP VIEW"), "{}", listed.script);
 
     let mut note = column("note", "text", true, false);
     note.default_sql = "label()".to_owned();
@@ -984,8 +999,8 @@ fn enums_and_sequences_still_used_by_columns_are_not_dropped_first() {
         ),
     );
     let script = &moved.script;
-    assert!(at(script, "CREATE TYPE \"public\".\"new_status\"") < at(script, "ALTER COLUMN \"status\" TYPE new_status"), "{script}");
-    assert!(at(script, "ALTER COLUMN \"status\" TYPE new_status") < at(script, "DROP TYPE \"public\".\"old_status\""), "{script}");
+    assert!(at(script, "CREATE TYPE \"public\".\"new_status\"") < at(script, "ALTER COLUMN \"status\" TYPE new_status USING \"status\"::text::new_status"), "{script}");
+    assert!(at(script, "ALTER COLUMN \"status\" TYPE new_status USING \"status\"::text::new_status") < at(script, "DROP TYPE \"public\".\"old_status\""), "{script}");
 
     let coded = ObjectDef::table("orders", shape(vec![column("id", "integer", false, true), column("code", "order_code", true, false)], vec![]));
     let domains = diff_structure(
@@ -1039,6 +1054,55 @@ fn view_cte_names_and_function_bodies_do_not_use_name_order() {
         &Side::ready("postgres", "app", "public", vec![]),
     );
     assert!(at(&functions.script, "CREATE FUNCTION \"public\".\"callee\"") < at(&functions.script, "CREATE FUNCTION \"public\".\"caller\""), "{}", functions.script);
+}
+
+#[test]
+fn unchanged_view_is_removed_before_function_or_column_type_changes() {
+    let view = ObjectDef::defined(Kind::View, "v_label", "CREATE VIEW v_label AS SELECT label() AS name FROM orders");
+    let mut note = column("note", "text", true, false);
+    note.default_sql = "label()".to_owned();
+    let orders = ObjectDef::table("orders", shape(vec![column("id", "integer", false, true), note], vec![]));
+    let wanted = ObjectDef::defined(Kind::Function, "label", "CREATE FUNCTION label() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$");
+    let current = ObjectDef::defined(Kind::Function, "label", "CREATE FUNCTION label() RETURNS text LANGUAGE sql AS $$ SELECT 'a' $$");
+    let report = diff_structure(
+        &Side::ready("postgres", "app", "public", vec![orders.clone(), view.clone(), wanted]),
+        &Side::ready("postgres", "app", "public", vec![orders, view, current]),
+    );
+    let script = &report.script;
+    assert!(at(script, "DROP VIEW \"public\".\"v_label\"") < at(script, "DROP FUNCTION \"public\".\"label\""), "{script}");
+    assert!(at(script, "CREATE FUNCTION \"public\".\"label\"") < at(script, "CREATE OR REPLACE VIEW \"public\".\"v_label\""), "{script}");
+
+    let status_view = ObjectDef::defined(Kind::View, "v_status", "CREATE VIEW v_status AS SELECT status FROM orders");
+    let typed = |labels: &str| {
+        vec![
+            ObjectDef::table("orders", shape(vec![column("id", "integer", false, true), column("status", "order_status", true, false)], vec![])),
+            ObjectDef::defined(Kind::Enum, "order_status", format!("CREATE TYPE order_status AS ENUM ({labels})")),
+            status_view.clone(),
+        ]
+    };
+    let enums = diff_structure(
+        &Side::ready("postgres", "app", "public", typed("'open'")),
+        &Side::ready("postgres", "app", "public", typed("'open', 'shut'")),
+    );
+    let script = &enums.script;
+    assert!(at(script, "DROP VIEW \"public\".\"v_status\"") < at(script, "ALTER COLUMN \"status\" TYPE text"), "{script}");
+    assert!(at(script, "ALTER COLUMN \"status\" TYPE \"public\".\"order_status\"") < at(script, "CREATE OR REPLACE VIEW \"public\".\"v_status\""), "{script}");
+}
+
+#[test]
+fn compatible_view_replace_runs_before_a_column_it_stops_using() {
+    let current = ObjectDef::defined(Kind::View, "v_notes", "CREATE VIEW v_notes (id, label) AS SELECT id, note FROM orders");
+    let wanted = ObjectDef::defined(Kind::View, "v_notes", "CREATE VIEW v_notes (id, label) AS SELECT id, 'x' AS label FROM orders");
+    let baseline = ObjectDef::table("orders", shape(vec![column("id", "integer", false, true)], vec![]));
+    let target = ObjectDef::table("orders", shape(vec![column("id", "integer", false, true), column("note", "text", true, false)], vec![]));
+    let report = diff_structure(
+        &Side::ready("postgres", "app", "public", vec![baseline, wanted]),
+        &Side::ready("postgres", "app", "public", vec![target, current]),
+    );
+    let script = &report.script;
+    assert!(script.contains("CREATE OR REPLACE VIEW \"public\".\"v_notes\""), "{script}");
+    assert!(!script.contains("DROP VIEW"), "{script}");
+    assert!(at(script, "CREATE OR REPLACE VIEW \"public\".\"v_notes\"") < at(script, "DROP COLUMN \"note\""), "{script}");
 }
 
 #[test]
