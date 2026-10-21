@@ -37,6 +37,9 @@ pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
     let mut create_index = Vec::new();
     let mut create_fk = Vec::new();
     let mut alters = Vec::new();
+    let mut in_place = Vec::new();
+    let mut detach = Vec::new();
+    let mut restore = Vec::new();
 
     let mut keys = std::collections::BTreeSet::new();
     for object in baseline.objects.iter().chain(target.objects.iter()) {
@@ -95,6 +98,7 @@ pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
             (None, None) => {}
         }
     }
+    preserve_dependents(engine, baseline, target, &mut drop_object, &mut create_object, &alters, &mut in_place, &mut detach, &mut restore);
     if blocked(baseline, target, Category::Index) {
         drop_index.clear();
         create_index.clear();
@@ -103,7 +107,20 @@ pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
         drop_fk.clear();
         create_fk.clear();
     }
-    let statements = assemble_statements(engine, target, drop_fk, drop_index, drop_object, alters, create_object, create_index, create_fk);
+    let statements = assemble_statements(
+        engine,
+        target,
+        drop_fk,
+        drop_index,
+        drop_object,
+        alters,
+        create_object,
+        create_index,
+        create_fk,
+        in_place,
+        detach,
+        restore,
+    );
     let tables = table_choices(engine, &baseline.objects, &target.objects);
     notes.sort();
     notes.dedup();
@@ -258,9 +275,17 @@ fn compare_pair(
         if base.definition != other.definition || base.materialized != other.materialized {
             changed.push(item(base, "定义文本不同"));
             if allow_ddl && !blocked(baseline, target_side, Category::from_kind(base.kind)) {
-                object_drops.push(plan_drop(engine, target, other));
-                if let Some(sql) = create_definition(engine, target, base) {
-                    create_object.push(plan_create(base, sql));
+                // 名称和签名都没变时，PostgreSQL 上的 DROP 会被仍引用它的对象拒绝。
+                // 视图和函数直接替换；替换不了的仍走删除，由后续步骤先摘掉依赖。
+                if replaces_in_place(engine, base, other) {
+                    if let Some(sql) = create_definition(engine, target, base) {
+                        create_object.push(plan_create(base, ensure_or_replace_kind(&sql, base.kind)));
+                    }
+                } else {
+                    object_drops.push(plan_drop(engine, target, other));
+                    if let Some(sql) = create_definition(engine, target, base) {
+                        create_object.push(plan_create(base, sql));
+                    }
                 }
             }
         }
@@ -601,6 +626,9 @@ fn assemble_statements(
     creates: Vec<PlannedCreate>,
     create_index: Vec<String>,
     create_fk: Vec<String>,
+    in_place: Vec<String>,
+    detach: Vec<String>,
+    restore: Vec<String>,
 ) -> Vec<String> {
     use std::collections::BTreeSet;
     let create_keys = creates.iter().map(|item| item.key.clone()).collect::<BTreeSet<_>>();
@@ -638,12 +666,6 @@ fn assemble_statements(
     }
     let changed_drops = order_support(changed_drops, true);
     let only_target_drops = order_support(only_target_drops, true);
-    let created_names = creates
-        .iter()
-        .filter(|item| matches!(item.kind, Kind::Enum | Kind::Domain | Kind::Sequence | Kind::Function | Kind::Procedure))
-        .map(|item| item.name.clone())
-        .collect::<Vec<_>>();
-    let (freeing_alters, using_alters) = split_alters(&alters, &created_names);
     let mut changed_creates = Vec::new();
     let mut fresh_creates = Vec::new();
     let mut table_creates = Vec::new();
@@ -662,6 +684,10 @@ fn assemble_statements(
     let by_create = |left: &PlannedCreate, right: &PlannedCreate| left.name.cmp(&right.name).then(left.statement.cmp(&right.statement));
     let changed_creates = order_support_creates(changed_creates);
     let fresh_creates = order_support_creates(fresh_creates);
+    let changed_names = changed_creates.iter().map(|item| item.name.clone()).collect::<Vec<_>>();
+    let fresh_names = fresh_creates.iter().map(|item| item.name.clone()).collect::<Vec<_>>();
+    // 改到新类型的 ALTER 会提到新名字。新对象还没建时不能先跑；旧类型还被列用着时也不能先 DROP。
+    let (freeing_alters, before_drop, after_recreate) = partition_alters(&alters, &fresh_names, &changed_names);
     table_creates.sort_by(by_create);
     trigger_creates.sort_by(by_create);
     let mut statements = Vec::new();
@@ -670,11 +696,15 @@ fn assemble_statements(
     statements.extend(triggers.into_iter().map(|drop| drop.statement));
     statements.extend(order_dependents_first(views).into_iter().map(|drop| drop.statement));
     statements.extend(order_dependents_first(tables).into_iter().map(|drop| drop.statement));
+    statements.extend(in_place);
+    statements.extend(detach);
     statements.extend(freeing_alters);
+    statements.extend(fresh_creates.into_iter().map(|create| create.statement));
+    statements.extend(before_drop);
     statements.extend(changed_drops.into_iter().flat_map(|drop| expand_sequence_drop(engine, target, drop)));
     statements.extend(changed_creates.into_iter().map(|create| create.statement));
-    statements.extend(fresh_creates.into_iter().map(|create| create.statement));
-    statements.extend(using_alters);
+    statements.extend(restore);
+    statements.extend(after_recreate);
     statements.extend(only_target_drops.into_iter().flat_map(|drop| expand_sequence_drop(engine, target, drop)));
     statements.extend(table_creates.into_iter().map(|create| create.statement));
     statements.extend(order_view_creates(view_creates).into_iter().map(|create| create.statement));
@@ -711,14 +741,9 @@ fn order_support_creates(items: Vec<PlannedCreate>) -> Vec<PlannedCreate> {
     ordered.into_iter().filter_map(|drop| by_key.remove(&drop.key)).collect()
 }
 
-/// 定义文本里点到的同批名字是依赖。函数和过程还依赖同批的类型与序列，避免正文被美元引号包住时看漏。
+/// 定义文本里点到的同批名字是依赖。美元引号里的函数体也要扫，否则调用顺序只能靠名称。
 fn attach_definition_references(items: &mut [PlannedDrop]) {
     let names = items.iter().map(|item| item.name.clone()).collect::<std::collections::BTreeSet<_>>();
-    let type_names = items
-        .iter()
-        .filter(|item| matches!(item.kind, Kind::Enum | Kind::Domain | Kind::Sequence))
-        .map(|item| item.name.clone())
-        .collect::<Vec<_>>();
     for item in items.iter_mut() {
         let mut refs = std::collections::BTreeSet::new();
         for token in sql_tokens(&item.definition) {
@@ -728,9 +753,6 @@ fn attach_definition_references(items: &mut [PlannedDrop]) {
             if let Some(known) = names.iter().find(|name| token.text.eq_ignore_ascii_case(name) && !name.eq_ignore_ascii_case(&item.name)) {
                 refs.insert(known.clone());
             }
-        }
-        if matches!(item.kind, Kind::Function | Kind::Procedure) {
-            refs.extend(type_names.iter().filter(|name| !name.eq_ignore_ascii_case(&item.name)).cloned());
         }
         item.references = refs.into_iter().collect();
     }
@@ -815,17 +837,24 @@ fn order_ranked(items: Vec<PlannedDrop>, dependents_first: bool, rank: fn(Kind) 
     result
 }
 
-fn split_alters(alters: &[String], created_names: &[String]) -> (Vec<String>, Vec<String>) {
+/// freeing：不依赖本次新建的对象，可以在删除之前执行。
+/// before_drop：要用到只新增、不用先删的对象，并且必须赶在旧对象的 DROP 之前。
+/// after_recreate：要用到先删后建的同名对象，只能等它建回来。
+fn partition_alters(alters: &[String], fresh_names: &[String], changed_names: &[String]) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut freeing = Vec::new();
-    let mut using = Vec::new();
+    let mut before_drop = Vec::new();
+    let mut after_recreate = Vec::new();
     for statement in alters {
-        if created_names.iter().any(|name| statement_mentions(statement, name) || default_references_sequence(statement, name)) {
-            using.push(statement.clone());
+        let mentions = |name: &String| statement_mentions(statement, name) || default_references_sequence(statement, name);
+        if changed_names.iter().any(mentions) {
+            after_recreate.push(statement.clone());
+        } else if fresh_names.iter().any(mentions) {
+            before_drop.push(statement.clone());
         } else {
             freeing.push(statement.clone());
         }
     }
-    (freeing, using)
+    (freeing, before_drop, after_recreate)
 }
 
 enum SequenceFate {
@@ -1005,27 +1034,78 @@ fn attach_view_dependencies(views: &mut [PlannedDrop]) {
     }
 }
 
-/// 关系名来自 FROM / JOIN。字符串、注释和别名不算引用。
+/// 关系名来自 FROM / JOIN。字符串、注释、别名和 WITH 里的 CTE 名不算引用。
 fn referenced_relations(sql: &str) -> Vec<String> {
     let tokens = sql_tokens(sql);
     let mut refs = Vec::new();
-    collect_relations(&tokens, &mut refs);
+    let mut ctes = Vec::new();
+    collect_relations(&tokens, &mut refs, &mut ctes);
     refs
 }
 
-fn collect_relations(tokens: &[SqlToken], refs: &mut Vec<String>) {
+fn collect_relations(tokens: &[SqlToken], refs: &mut Vec<String>, ctes: &mut Vec<String>) {
     let mut index = 0;
+    let scope = ctes.len();
     while index < tokens.len() {
+        if is_word(&tokens[index], "WITH") {
+            index = consume_with(tokens, index, refs, ctes);
+            continue;
+        }
         if is_word(&tokens[index], "FROM") || is_word(&tokens[index], "JOIN") {
-            let next = parse_table_list(tokens, index + 1, refs);
+            let next = parse_table_list(tokens, index + 1, refs, ctes);
             index = if next > index { next } else { index + 1 };
             continue;
         }
         index += 1;
     }
+    ctes.truncate(scope);
 }
 
-fn parse_table_list(tokens: &[SqlToken], mut index: usize, refs: &mut Vec<String>) -> usize {
+/// 读完 WITH 绑定的 CTE，并让这些名字在后续主查询里可见。返回主查询起点。
+fn consume_with(tokens: &[SqlToken], with_at: usize, refs: &mut Vec<String>, ctes: &mut Vec<String>) -> usize {
+    let mut index = with_at + 1;
+    if index < tokens.len() && is_word(&tokens[index], "RECURSIVE") {
+        index += 1;
+    }
+    loop {
+        if index >= tokens.len() || !is_ident_token(&tokens[index]) || is_from_stop(&tokens[index].text) {
+            break;
+        }
+        let name = tokens[index].text.clone();
+        let mut next = index + 1;
+        if next < tokens.len() && tokens[next].text == "(" {
+            let after = matching_paren(tokens, next).saturating_add(1);
+            if after < tokens.len() && is_word(&tokens[after], "AS") {
+                next = after;
+            }
+        }
+        if next >= tokens.len() || !is_word(&tokens[next], "AS") {
+            break;
+        }
+        next += 1;
+        if next < tokens.len() && is_word(&tokens[next], "NOT") {
+            next += 1;
+        }
+        if next < tokens.len() && is_word(&tokens[next], "MATERIALIZED") {
+            next += 1;
+        }
+        if next >= tokens.len() || tokens[next].text != "(" {
+            break;
+        }
+        let end = matching_paren(tokens, next);
+        ctes.push(name);
+        collect_relations(&tokens[next + 1..end], refs, ctes);
+        index = end.saturating_add(1);
+        if index < tokens.len() && tokens[index].text == "," {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    index
+}
+
+fn parse_table_list(tokens: &[SqlToken], mut index: usize, refs: &mut Vec<String>, ctes: &[String]) -> usize {
     while index < tokens.len() {
         if is_word(&tokens[index], "ONLY") || is_word(&tokens[index], "LATERAL") {
             index += 1;
@@ -1033,7 +1113,8 @@ fn parse_table_list(tokens: &[SqlToken], mut index: usize, refs: &mut Vec<String
         }
         if tokens[index].text == "(" {
             let end = matching_paren(tokens, index);
-            collect_relations(&tokens[index + 1..end], refs);
+            let mut nested = ctes.to_vec();
+            collect_relations(&tokens[index + 1..end], refs, &mut nested);
             index = end.saturating_add(1);
             index = skip_alias(tokens, index);
         } else if is_ident_token(&tokens[index]) {
@@ -1041,7 +1122,7 @@ fn parse_table_list(tokens: &[SqlToken], mut index: usize, refs: &mut Vec<String
             if next < tokens.len() && tokens[next].text == "(" {
                 index = matching_paren(tokens, next).saturating_add(1);
             } else {
-                if !name.is_empty() {
+                if !name.is_empty() && !ctes.iter().any(|cte| cte.eq_ignore_ascii_case(&name)) {
                     refs.push(name);
                 }
                 index = next;
@@ -1118,6 +1199,20 @@ fn sql_tokens(sql: &str) -> Vec<SqlToken> {
     let mut tokens = Vec::new();
     let mut index = 0;
     while index < sql.len() {
+        let ch = sql[index..].chars().next().unwrap();
+        // 函数体在美元引号里。整段跳过会看不见其中的调用，创建顺序就退回名称序。
+        if ch == '$' {
+            if let Some(end) = skip_dollar(sql, index) {
+                let delimiter_len = dollar_delimiter_len(sql, index).unwrap_or(0);
+                let body_start = index + delimiter_len;
+                let body_end = end.saturating_sub(delimiter_len);
+                if body_end > body_start {
+                    tokens.extend(sql_tokens(&sql[body_start..body_end]));
+                }
+                index = end;
+                continue;
+            }
+        }
         if let Some(next) = skip_delimited(sql, index) {
             let ch = sql[index..].chars().next().unwrap();
             if ch == '"' || ch == '`' || ch == '[' {
@@ -1126,7 +1221,6 @@ fn sql_tokens(sql: &str) -> Vec<SqlToken> {
             index = next;
             continue;
         }
-        let ch = sql[index..].chars().next().unwrap();
         if ch.is_whitespace() {
             index += ch.len_utf8();
             continue;
@@ -1271,6 +1365,622 @@ fn order_dependencies_first(items: Vec<PlannedDrop>) -> Vec<PlannedDrop> {
         }
     }
     result
+}
+
+fn replaces_in_place(engine: Engine, base: &ObjectDef, other: &ObjectDef) -> bool {
+    match base.kind {
+        Kind::View => match engine {
+            Engine::Mysql | Engine::Mariadb => !base.materialized && !other.materialized,
+            Engine::Postgres => !base.materialized && !other.materialized && view_columns_compatible(&base.definition, &other.definition),
+            Engine::Sqlite => false,
+        },
+        // 返回类型变了时 CREATE OR REPLACE FUNCTION 会被拒绝，只能先摘依赖再删。
+        Kind::Function | Kind::Procedure => matches!(engine, Engine::Postgres | Engine::Mariadb) && return_types_compatible(&base.definition, &other.definition),
+        _ => false,
+    }
+}
+
+fn view_columns_compatible(wanted: &str, current: &str) -> bool {
+    match (explicit_view_columns(wanted), explicit_view_columns(current)) {
+        (Some(wanted), Some(current)) => wanted.len() >= current.len() && wanted[..current.len()] == current[..],
+        _ => true,
+    }
+}
+
+fn explicit_view_columns(definition: &str) -> Option<Vec<String>> {
+    let tokens = sql_tokens(definition);
+    let view_at = tokens.iter().position(|token| is_word(token, "VIEW"))?;
+    let mut index = view_at + 1;
+    if index >= tokens.len() || !is_ident_token(&tokens[index]) {
+        return None;
+    }
+    index += 1;
+    while index + 1 < tokens.len() && tokens[index].text == "." && is_ident_token(&tokens[index + 1]) {
+        index += 2;
+    }
+    if index >= tokens.len() || tokens[index].text != "(" {
+        return None;
+    }
+    let end = matching_paren(&tokens, index);
+    let names = tokens[index + 1..end].iter().filter(|token| is_ident_token(token)).map(|token| token.text.clone()).collect::<Vec<_>>();
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
+    }
+}
+
+fn return_types_compatible(left: &str, right: &str) -> bool {
+    match (returns_clause(left), returns_clause(right)) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn returns_clause(definition: &str) -> Option<String> {
+    let tokens = sql_tokens(definition);
+    let index = tokens.iter().position(|token| is_word(token, "RETURNS"))?;
+    let mut parts = Vec::new();
+    for token in tokens.iter().skip(index + 1) {
+        if matches!(
+            token.text.to_ascii_uppercase().as_str(),
+            "LANGUAGE" | "AS" | "WINDOW" | "IMMUTABLE" | "STABLE" | "VOLATILE" | "LEAKPROOF" | "CALLED" | "STRICT" | "COST" | "ROWS" | "PARALLEL" | "SECURITY" | "SET" | "TRANSFORM" | "NOT"
+        ) && !token.quoted
+        {
+            break;
+        }
+        parts.push(token.text.to_ascii_lowercase());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+fn ensure_or_replace_kind(sql: &str, kind: Kind) -> String {
+    match kind {
+        Kind::View | Kind::Function | Kind::Procedure => ensure_or_replace(sql),
+        _ => sql.to_owned(),
+    }
+}
+
+fn ensure_or_replace(sql: &str) -> String {
+    let trimmed = sql.trim_start();
+    let offset = sql.len() - trimmed.len();
+    if trimmed.len() < 6 || !trimmed[..6].eq_ignore_ascii_case("CREATE") {
+        return sql.to_owned();
+    }
+    let rest = trimmed[6..].trim_start();
+    if rest.len() >= 10 && rest[..10].eq_ignore_ascii_case("OR REPLACE") {
+        return sql.to_owned();
+    }
+    format!("{}CREATE OR REPLACE{}", &sql[..offset], &sql[offset + 6..])
+}
+
+/// 仍被列引用的枚举、域和序列不先 DROP。视图、函数和触发器如果还指向即将删除的对象，先摘掉再按原定义建回。
+fn preserve_dependents(
+    engine: Engine,
+    baseline: &Side,
+    target: &Side,
+    drops: &mut Vec<PlannedDrop>,
+    creates: &mut Vec<PlannedCreate>,
+    alters: &[String],
+    in_place: &mut Vec<String>,
+    detach: &mut Vec<String>,
+    restore: &mut Vec<String>,
+) {
+    rewrite_kept_types(engine, target, baseline, drops, creates, in_place, detach, restore);
+    rewrite_kept_sequences(engine, target, baseline, drops, creates, alters, in_place, detach, restore);
+    cover_dependents(engine, baseline, target, drops, creates);
+    detach_routine_defaults(engine, baseline, target, drops, alters, detach, restore);
+}
+
+fn rewrite_kept_types(
+    engine: Engine,
+    target: &Side,
+    baseline: &Side,
+    drops: &mut Vec<PlannedDrop>,
+    creates: &mut Vec<PlannedCreate>,
+    in_place: &mut Vec<String>,
+    detach: &mut Vec<String>,
+    restore: &mut Vec<String>,
+) {
+    if engine != Engine::Postgres {
+        return;
+    }
+    let paired = drops
+        .iter()
+        .filter(|drop| matches!(drop.kind, Kind::Enum | Kind::Domain) && creates.iter().any(|create| create.key == drop.key))
+        .map(|drop| (drop.kind, drop.name.clone(), drop.key.clone()))
+        .collect::<Vec<_>>();
+    for (kind, name, key) in paired {
+        let target_cols = columns_of_type(target, &name);
+        if target_cols.is_empty() {
+            continue;
+        }
+        if kind == Kind::Enum {
+            if let (Some(wanted), Some(current)) = (object_definition(baseline, Kind::Enum, &name), object_definition(target, Kind::Enum, &name)) {
+                if let (Some(wanted_labels), Some(current_labels)) = (enum_labels(wanted), enum_labels(current)) {
+                    if let Some(adds) = enum_additions(&current_labels, &wanted_labels) {
+                        remove_planned(&key, drops, creates);
+                        for (label, before) in adds {
+                            in_place.push(enum_add_sql(engine, target, &name, &label, before.as_deref()));
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+        let baseline_cols = columns_of_type(baseline, &name);
+        for (table, column) in &target_cols {
+            detach.push(format!(
+                "ALTER TABLE {} ALTER COLUMN {} TYPE text USING {}::text",
+                qualify(engine, target, table),
+                quote(engine, column),
+                quote(engine, column)
+            ));
+            if baseline_cols.iter().any(|(base_table, base_column)| base_table == table && base_column == column) {
+                let type_name = qualify(engine, target, &name);
+                restore.push(format!(
+                    "ALTER TABLE {} ALTER COLUMN {} TYPE {type_name} USING {}::{type_name}",
+                    qualify(engine, target, table),
+                    quote(engine, column),
+                    quote(engine, column)
+                ));
+            }
+        }
+    }
+}
+
+fn rewrite_kept_sequences(
+    engine: Engine,
+    target: &Side,
+    baseline: &Side,
+    drops: &mut Vec<PlannedDrop>,
+    creates: &mut Vec<PlannedCreate>,
+    alters: &[String],
+    in_place: &mut Vec<String>,
+    detach: &mut Vec<String>,
+    restore: &mut Vec<String>,
+) {
+    if engine != Engine::Postgres {
+        return;
+    }
+    let paired = drops
+        .iter()
+        .filter(|drop| drop.kind == Kind::Sequence && creates.iter().any(|create| create.key == drop.key))
+        .map(|drop| (drop.name.clone(), drop.key.clone()))
+        .collect::<Vec<_>>();
+    for (name, key) in paired {
+        let wanted = object_definition(baseline, Kind::Sequence, &name);
+        let current = object_definition(target, Kind::Sequence, &name);
+        if let (Some(wanted), Some(current)) = (wanted, current) {
+            if let (Some(wanted_spec), Some(current_spec)) = (parse_sequence(wanted), parse_sequence(current)) {
+                let same_type = wanted_spec.data_type.is_empty() || current_spec.data_type.is_empty() || wanted_spec.data_type.eq_ignore_ascii_case(&current_spec.data_type);
+                if same_type {
+                    remove_planned(&key, drops, creates);
+                    in_place.push(sequence_alter_sql(engine, target, &name, &wanted_spec));
+                    continue;
+                }
+            }
+        }
+        detach_sequence_use(engine, target, baseline, &name, alters, detach, restore);
+    }
+}
+
+fn detach_sequence_use(engine: Engine, target: &Side, baseline: &Side, name: &str, alters: &[String], detach: &mut Vec<String>, restore: &mut Vec<String>) {
+    for object in target.objects.iter().filter(|object| object.kind == Kind::Table) {
+        let Some(shape) = object.table.as_ref() else { continue };
+        for column in &shape.columns {
+            if !default_references_sequence(&column.default_sql, name) {
+                continue;
+            }
+            if !changes_default(alters, &object.name, &column.name, true) && !changes_default(detach, &object.name, &column.name, true) {
+                detach.push(drop_default_sql(engine, target, &object.name, &column.name));
+            }
+            if let Some(base_column) = baseline_column(baseline, &object.name, &column.name) {
+                if !base_column.default_sql.trim().is_empty() && !changes_default(alters, &object.name, &column.name, false) && !changes_default(restore, &object.name, &column.name, false) {
+                    restore.push(set_default_sql(engine, target, &object.name, &column.name, base_column.default_sql.trim()));
+                }
+            }
+        }
+    }
+    if let Some(sequence) = baseline.objects.iter().find(|object| object.kind == Kind::Sequence && object.name.eq_ignore_ascii_case(name)) {
+        let (owner_table, owner_column) = object_sequence_owner(sequence);
+        if let (Some(table), Some(column)) = (owner_table, owner_column) {
+            restore.push(format!("ALTER SEQUENCE {} OWNED BY {}.{}", qualify(engine, target, name), qualify(engine, target, &table), quote(engine, &column)));
+        }
+    }
+}
+
+fn detach_routine_defaults(
+    engine: Engine,
+    baseline: &Side,
+    target: &Side,
+    drops: &[PlannedDrop],
+    alters: &[String],
+    detach: &mut Vec<String>,
+    restore: &mut Vec<String>,
+) {
+    let routines = drops.iter().filter(|drop| matches!(drop.kind, Kind::Function | Kind::Procedure)).map(|drop| drop.name.clone()).collect::<Vec<_>>();
+    for name in routines {
+        for object in target.objects.iter().filter(|object| object.kind == Kind::Table) {
+            let Some(shape) = object.table.as_ref() else { continue };
+            for column in &shape.columns {
+                if !statement_mentions(&column.default_sql, &name) {
+                    continue;
+                }
+                if !changes_default(alters, &object.name, &column.name, true) && !changes_default(detach, &object.name, &column.name, true) {
+                    detach.push(drop_default_sql(engine, target, &object.name, &column.name));
+                }
+                if let Some(base_column) = baseline_column(baseline, &object.name, &column.name) {
+                    if !base_column.default_sql.trim().is_empty()
+                        && !changes_default(alters, &object.name, &column.name, false)
+                        && !changes_default(restore, &object.name, &column.name, false)
+                    {
+                        restore.push(set_default_sql(engine, target, &object.name, &column.name, base_column.default_sql.trim()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn cover_dependents(engine: Engine, baseline: &Side, target: &Side, drops: &mut Vec<PlannedDrop>, creates: &mut Vec<PlannedCreate>) {
+    let objects = target.objects.clone();
+    for _ in 0..objects.len().saturating_add(1) {
+        let dropped_views = drops.iter().filter(|drop| drop.kind == Kind::View).map(|drop| drop.name.clone()).collect::<Vec<_>>();
+        let dropped_relations = drops
+            .iter()
+            .filter(|drop| matches!(drop.kind, Kind::View | Kind::Table))
+            .map(|drop| drop.name.clone())
+            .collect::<Vec<_>>();
+        let dropped_routines = drops
+            .iter()
+            .filter(|drop| matches!(drop.kind, Kind::Function | Kind::Procedure))
+            .map(|drop| drop.name.clone())
+            .collect::<Vec<_>>();
+        let mut progressed = false;
+        for object in &objects {
+            if planned_drop(drops, object) {
+                continue;
+            }
+            let hit = match object.kind {
+                Kind::View => referenced_relations(&object.definition).iter().any(|name| dropped_views.iter().any(|drop| drop.eq_ignore_ascii_case(name))),
+                Kind::Trigger => {
+                    dropped_relations.iter().any(|name| name.eq_ignore_ascii_case(&object.relation))
+                        || dropped_routines.iter().any(|name| statement_mentions(&object.definition, name))
+                }
+                Kind::Function | Kind::Procedure => dropped_routines.iter().any(|name| !name.eq_ignore_ascii_case(&object.name) && statement_mentions(&object.definition, name)),
+                _ => false,
+            };
+            if !hit {
+                continue;
+            }
+            drops.push(plan_drop(engine, target, object));
+            if !planned_create(creates, object) {
+                let source = same_object(baseline, object).unwrap_or(object);
+                if let Some(sql) = recreate_sql(engine, target, source) {
+                    creates.push(plan_create(source, sql));
+                }
+            }
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+}
+
+fn recreate_sql(engine: Engine, side: &Side, source: &ObjectDef) -> Option<String> {
+    let sql = create_definition(engine, side, source)?;
+    if source.materialized || !matches!(source.kind, Kind::View | Kind::Function | Kind::Procedure) {
+        Some(sql)
+    } else {
+        Some(ensure_or_replace(&sql))
+    }
+}
+
+fn remove_planned(key: &str, drops: &mut Vec<PlannedDrop>, creates: &mut Vec<PlannedCreate>) {
+    drops.retain(|drop| drop.key != key);
+    creates.retain(|create| create.key != key);
+}
+
+fn planned_drop(drops: &[PlannedDrop], object: &ObjectDef) -> bool {
+    let key = identity(object);
+    drops.iter().any(|drop| drop.key == key)
+}
+
+fn planned_create(creates: &[PlannedCreate], object: &ObjectDef) -> bool {
+    let key = identity(object);
+    creates.iter().any(|create| create.key == key)
+}
+
+fn same_object<'a>(side: &'a Side, object: &ObjectDef) -> Option<&'a ObjectDef> {
+    let key = identity(object);
+    side.objects.iter().find(|item| identity(item) == key)
+}
+
+fn object_definition<'a>(side: &'a Side, kind: Kind, name: &str) -> Option<&'a str> {
+    side.objects.iter().find(|object| object.kind == kind && object.name.eq_ignore_ascii_case(name)).map(|object| object.definition.as_str())
+}
+
+fn columns_of_type<'a>(side: &'a Side, type_name: &str) -> Vec<(&'a str, &'a str)> {
+    let mut found = Vec::new();
+    for object in side.objects.iter().filter(|object| object.kind == Kind::Table) {
+        let Some(shape) = object.table.as_ref() else { continue };
+        for column in &shape.columns {
+            if type_mentions(&column.type_name, type_name) {
+                found.push((object.name.as_str(), column.name.as_str()));
+            }
+        }
+    }
+    found
+}
+
+fn type_mentions(type_name: &str, object_name: &str) -> bool {
+    if object_name.is_empty() || type_name.trim().is_empty() {
+        return false;
+    }
+    let mut bare = type_name.trim().trim_end_matches("[]").trim();
+    if let Some(end) = bare.find('(') {
+        bare = bare[..end].trim();
+    }
+    let last = bare.rsplit(|ch: char| ch == '.' || ch == '"' || ch == '`').find(|part| !part.is_empty()).unwrap_or(bare);
+    last.eq_ignore_ascii_case(object_name)
+}
+
+fn baseline_column<'a>(baseline: &'a Side, table: &str, column: &str) -> Option<&'a ColumnShape> {
+    let object = baseline.objects.iter().find(|object| object.kind == Kind::Table && object.name == table)?;
+    object.table.as_ref()?.columns.iter().find(|item| item.name == column)
+}
+
+fn changes_default(statements: &[String], table: &str, column: &str, drop: bool) -> bool {
+    let needle = if drop { "DROP DEFAULT" } else { "SET DEFAULT" };
+    statements.iter().any(|sql| sql.to_ascii_uppercase().contains(needle) && statement_mentions(sql, table) && statement_mentions(sql, column))
+}
+
+fn drop_default_sql(engine: Engine, side: &Side, table: &str, column: &str) -> String {
+    let table = qualify(engine, side, table);
+    let column = quote(engine, column);
+    match engine {
+        Engine::Mysql | Engine::Mariadb => format!("ALTER TABLE {table} ALTER {column} DROP DEFAULT"),
+        _ => format!("ALTER TABLE {table} ALTER COLUMN {column} DROP DEFAULT"),
+    }
+}
+
+fn set_default_sql(engine: Engine, side: &Side, table: &str, column: &str, expression: &str) -> String {
+    let table = qualify(engine, side, table);
+    let column = quote(engine, column);
+    match engine {
+        Engine::Mysql | Engine::Mariadb => format!("ALTER TABLE {table} ALTER {column} SET DEFAULT {expression}"),
+        _ => format!("ALTER TABLE {table} ALTER COLUMN {column} SET DEFAULT {expression}"),
+    }
+}
+
+fn object_sequence_owner(object: &ObjectDef) -> (Option<String>, Option<String>) {
+    let relation = object.relation.trim();
+    if !relation.is_empty() {
+        let mut parts = relation.split('\u{1}');
+        return (parts.next().map(str::to_owned), parts.next().map(str::to_owned));
+    }
+    owned_by_clause(&object.definition)
+}
+
+fn enum_labels(definition: &str) -> Option<Vec<String>> {
+    let end = find_keyword_end(definition, "ENUM")?;
+    let start = skip_gap(definition, end);
+    if !definition[start..].starts_with('(') {
+        return None;
+    }
+    let close = raw_matching_paren(definition, start)?;
+    let labels = string_literals(&definition[start + 1..close]);
+    if labels.is_empty() {
+        None
+    } else {
+        Some(labels)
+    }
+}
+
+fn raw_matching_paren(sql: &str, open: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut index = open;
+    while index < sql.len() {
+        if let Some(next) = skip_delimited(sql, index) {
+            index = next;
+            continue;
+        }
+        let ch = sql[index..].chars().next()?;
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+        index += ch.len_utf8();
+    }
+    None
+}
+
+/// 只能加标签时返回新增项，以及应插到哪个已有标签之前。删除或换序返回 None。
+fn enum_additions(current: &[String], wanted: &[String]) -> Option<Vec<(String, Option<String>)>> {
+    if current.iter().any(|label| !wanted.iter().any(|item| item == label)) {
+        return None;
+    }
+    let mut cursor = 0;
+    let mut adds = Vec::new();
+    for (index, label) in wanted.iter().enumerate() {
+        if cursor < current.len() && &current[cursor] == label {
+            cursor += 1;
+            continue;
+        }
+        if current.iter().any(|item| item == label) {
+            return None;
+        }
+        let before = wanted[index + 1..].iter().find(|item| current.iter().any(|old| old == *item)).cloned();
+        adds.push((label.clone(), before));
+    }
+    if cursor != current.len() {
+        None
+    } else {
+        Some(adds)
+    }
+}
+
+fn enum_add_sql(engine: Engine, side: &Side, name: &str, label: &str, before: Option<&str>) -> String {
+    let mut sql = format!("ALTER TYPE {} ADD VALUE IF NOT EXISTS {}", qualify(engine, side, name), quote_literal(label));
+    if let Some(before) = before {
+        sql.push_str(" BEFORE ");
+        sql.push_str(&quote_literal(before));
+    }
+    sql
+}
+
+fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+struct SequenceSpec {
+    data_type: String,
+    increment: String,
+    min_value: String,
+    max_value: String,
+    start: String,
+    cache: String,
+    cycle: bool,
+}
+
+fn parse_sequence(definition: &str) -> Option<SequenceSpec> {
+    let tokens = loose_tokens(definition);
+    let seq_at = tokens.iter().position(|token| token.eq_ignore_ascii_case("SEQUENCE"))?;
+    let mut index = seq_at + 1;
+    while index < tokens.len() && !is_sequence_keyword(&tokens[index]) {
+        index += 1;
+    }
+    let mut spec = SequenceSpec {
+        data_type: String::new(),
+        increment: String::new(),
+        min_value: String::new(),
+        max_value: String::new(),
+        start: String::new(),
+        cache: String::new(),
+        cycle: false,
+    };
+    while index < tokens.len() {
+        let word = tokens[index].as_str();
+        if word.eq_ignore_ascii_case("AS") {
+            spec.data_type = tokens.get(index + 1)?.clone();
+            index += 2;
+        } else if word.eq_ignore_ascii_case("INCREMENT") {
+            index = skip_filler(&tokens, index);
+            spec.increment = tokens.get(index)?.clone();
+            index += 1;
+        } else if word.eq_ignore_ascii_case("MINVALUE") {
+            spec.min_value = tokens.get(index + 1)?.clone();
+            index += 2;
+        } else if word.eq_ignore_ascii_case("MAXVALUE") {
+            spec.max_value = tokens.get(index + 1)?.clone();
+            index += 2;
+        } else if word.eq_ignore_ascii_case("START") {
+            index = skip_filler(&tokens, index);
+            spec.start = tokens.get(index)?.clone();
+            index += 1;
+        } else if word.eq_ignore_ascii_case("CACHE") {
+            spec.cache = tokens.get(index + 1)?.clone();
+            index += 2;
+        } else if word.eq_ignore_ascii_case("CYCLE") {
+            spec.cycle = true;
+            index += 1;
+        } else if word.eq_ignore_ascii_case("NO") {
+            let next = tokens.get(index + 1).map(String::as_str).unwrap_or("");
+            if next.eq_ignore_ascii_case("CYCLE") {
+                spec.cycle = false;
+                index += 2;
+            } else if next.eq_ignore_ascii_case("MINVALUE") {
+                spec.min_value.clear();
+                index += 2;
+            } else if next.eq_ignore_ascii_case("MAXVALUE") {
+                spec.max_value.clear();
+                index += 2;
+            } else {
+                index += 1;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    if spec.increment.is_empty() {
+        None
+    } else {
+        Some(spec)
+    }
+}
+
+fn is_sequence_keyword(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "AS" | "INCREMENT" | "MINVALUE" | "MAXVALUE" | "START" | "RESTART" | "CACHE" | "CYCLE" | "NO" | "OWNED"
+    )
+}
+
+fn skip_filler(tokens: &[String], index: usize) -> usize {
+    let mut next = index + 1;
+    if tokens.get(next).is_some_and(|token| token.eq_ignore_ascii_case("BY") || token.eq_ignore_ascii_case("WITH")) {
+        next += 1;
+    }
+    next
+}
+
+fn loose_tokens(sql: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < sql.len() {
+        if let Some(next) = skip_delimited(sql, index) {
+            index = next;
+            continue;
+        }
+        let ch = sql[index..].chars().next().unwrap();
+        if ch.is_whitespace() {
+            index += ch.len_utf8();
+            continue;
+        }
+        if ch.is_ascii_digit() || (ch == '-' && sql[index + ch.len_utf8()..].chars().next().is_some_and(|item| item.is_ascii_digit())) {
+            let start = index;
+            if ch == '-' {
+                index += ch.len_utf8();
+            }
+            while index < sql.len() && sql[index..].chars().next().unwrap().is_ascii_digit() {
+                index += 1;
+            }
+            tokens.push(sql[start..index].to_owned());
+            continue;
+        }
+        if is_ident_start(ch) {
+            let end = ident_continue(sql, index);
+            tokens.push(sql[index..end].to_owned());
+            index = end;
+            continue;
+        }
+        index += ch.len_utf8();
+    }
+    tokens
+}
+
+fn sequence_alter_sql(engine: Engine, side: &Side, name: &str, spec: &SequenceSpec) -> String {
+    let min_value = if spec.min_value.is_empty() { "NO MINVALUE".to_owned() } else { format!("MINVALUE {}", spec.min_value) };
+    let max_value = if spec.max_value.is_empty() { "NO MAXVALUE".to_owned() } else { format!("MAXVALUE {}", spec.max_value) };
+    let start = if spec.start.is_empty() { "1" } else { spec.start.as_str() };
+    let cache = if spec.cache.is_empty() { "1" } else { spec.cache.as_str() };
+    let cycle = if spec.cycle { "CYCLE" } else { "NO CYCLE" };
+    format!(
+        "ALTER SEQUENCE {} INCREMENT BY {} {min_value} {max_value} START WITH {start} CACHE {cache} {cycle}",
+        qualify(engine, side, name),
+        spec.increment
+    )
 }
 
 fn drop_object(engine: Engine, side: &Side, object: &ObjectDef) -> String {
@@ -1507,14 +2217,20 @@ fn skip_quoted(sql: &str, start: usize, closer: char) -> Option<usize> {
     Some(sql.len())
 }
 
-fn skip_dollar(sql: &str, start: usize) -> Option<usize> {
+fn dollar_delimiter_len(sql: &str, start: usize) -> Option<usize> {
     let rest = sql.get(start..)?;
     let tag_end = rest[1..].find('$')?;
     let delimiter = &rest[..=tag_end + 1];
     if !delimiter[1..delimiter.len() - 1].chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
         return None;
     }
-    let body = start + delimiter.len();
+    Some(delimiter.len())
+}
+
+fn skip_dollar(sql: &str, start: usize) -> Option<usize> {
+    let delimiter_len = dollar_delimiter_len(sql, start)?;
+    let delimiter = &sql[start..start + delimiter_len];
+    let body = start + delimiter_len;
     sql[body..].find(delimiter).map(|at| body + at + delimiter.len())
 }
 
