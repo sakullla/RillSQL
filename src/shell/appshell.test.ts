@@ -7,8 +7,10 @@ import { exportTasks, resetExportTasks, taskStatusText, type ExportTask } from "
 import type { TableTarget } from "../grid/target";
 import type { RunDto } from "../query/api";
 import { adoptRun, resetQueryRuntime } from "../query/runtime";
+import type { CatalogObjectRef } from "../catalog/object-ref";
 import AppShell from "./AppShell.vue";
 import type { ShellTab } from "./session";
+import Sidebar from "./Sidebar.vue";
 import WorkspaceView from "./WorkspaceView.vue";
 
 const invoke = vi.hoisted(() => vi.fn());
@@ -76,7 +78,53 @@ function editorText(wrapper: VueWrapper): string {
   return view!.state.doc.toString();
 }
 
+function sequenceRef(): CatalogObjectRef {
+  return {
+    connectionId: "pg",
+    connectionName: "书店",
+    engine: "postgres",
+    database: "bookstore",
+    schema: "public",
+    name: "orders_id_seq",
+    kind: "sequence",
+    stale: false,
+    path: "书店 / bookstore / public",
+  };
+}
+
 describe("AppShell", () => {
+  it("opens a read-only sequence definition and copies that sql into a new query", async () => {
+    const sql = 'CREATE SEQUENCE "public"."orders_id_seq" AS bigint INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START WITH 1 CACHE 1 NO CYCLE;';
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "catalog_definition") return sql;
+      if (command === "catalog_sessions") return [];
+      return [];
+    });
+    const wrapper = mount(AppShell);
+    await flushPromises();
+    const sidebar = wrapper.getComponent(Sidebar);
+    sidebar.vm.$emit("open-definition", { ...sequenceRef(), kind: "table", name: "customers" });
+    await flushPromises();
+    expect(wrapper.find("[data-definition]").exists()).toBe(false);
+
+    sidebar.vm.$emit("open-definition", sequenceRef());
+    await vi.waitFor(() => {
+      expect(wrapper.find("[data-definition-sql]").exists()).toBe(true);
+    });
+    expect(wrapper.get("[data-definition]").attributes("data-kind")).toBe("sequence");
+    expect(wrapper.get("[data-definition-sql]").text()).toBe(sql);
+    expect(wrapper.get("[data-definition-sql]").attributes("data-readonly")).toBe("true");
+    expect(wrapper.get("[data-definition]").find("[data-action=save]").exists()).toBe(false);
+    expect(wrapper.get("[data-definition]").text()).not.toContain("保存");
+    expect(invoke).toHaveBeenCalledWith("catalog_definition", expect.objectContaining({ name: "orders_id_seq", kind: "sequence" }));
+
+    await wrapper.get("[data-action=copy-definition]").trigger("click");
+    await flushPromises();
+    const tabs = wrapper.getComponent(WorkspaceView).props("tabs") as ShellTab[];
+    expect(tabs.find((tab) => tab.kind === "query")?.draft).toBe(sql);
+    wrapper.unmount();
+  });
+
   it("opens the welcome page with two primary paths and no login gate", () => {
     const wrapper = mount(AppShell);
     const text = wrapper.text();
