@@ -705,12 +705,15 @@ fn assemble_statements(
         .filter(|drop| matches!(drop.kind, Kind::Function | Kind::Procedure))
         .map(|drop| drop.name.clone())
         .collect::<Vec<_>>();
-    let dropped_relations = dropped_view_names.iter().chain(dropped_tables.iter()).cloned().collect::<Vec<_>>();
+    let dropped_table_list = dropped_tables.iter().cloned().collect::<Vec<_>>();
+    let dropped_view_list = dropped_view_names.iter().cloned().collect::<Vec<_>>();
     let mut early_views = Vec::new();
     for create in creates {
         match create.kind {
             Kind::Table => table_creates.push(create),
-            Kind::View if is_early_view_replace(&create, &alters, &detach, &routine_drops, &dropped_relations) => early_views.push(create),
+            Kind::View if is_early_view_replace(&create, &alters, &detach, &routine_drops, &dropped_table_list, &dropped_view_list) => {
+                early_views.push(create)
+            }
             Kind::View => view_creates.push(create),
             Kind::Trigger => trigger_creates.push(create),
             _ if drop_keys.contains(&create.key) => changed_creates.push(create),
@@ -726,6 +729,9 @@ fn assemble_statements(
     let (fresh_creates, mut delayed_routines) = split_waiting(fresh_creates, &waiting_keys);
     let (changed_creates, delayed_more) = split_waiting(changed_creates, &waiting_keys);
     delayed_routines.extend(delayed_more);
+    // 提前替换已经写成基准定义。再 DROP 会把仍要保留的视图删掉，而这条创建不会再出现。
+    let early_view_keys = early_views.iter().map(|create| create.key.clone()).collect::<BTreeSet<_>>();
+    views.retain(|drop| !early_view_keys.contains(&drop.key));
     let changed_names = changed_creates.iter().map(|item| item.name.clone()).collect::<Vec<_>>();
     let fresh_names = fresh_creates.iter().map(|item| item.name.clone()).collect::<Vec<_>>();
     let delayed_names = delayed_routines.iter().map(|item| item.name.clone()).collect::<Vec<_>>();
@@ -2142,18 +2148,32 @@ fn view_columns_compatible(wanted: &str, current: &str) -> bool {
     }
 }
 
-/// 替换后的定义不再依赖即将删除的列、函数、表或视图时，把 CREATE OR REPLACE 放到这些语句之前。
-fn is_early_view_replace(create: &PlannedCreate, alters: &[String], detach: &[String], routine_drops: &[String], dropped_relations: &[String]) -> bool {
+/// 替换后的定义不再依赖即将删除的列、函数或表时，把 CREATE OR REPLACE 放到这些语句之前。
+/// 旧正文若还指向即将删除的视图，删视图发生在替换之前，提前替换会被随后的 DROP 吃掉且不再建回。
+fn is_early_view_replace(
+    create: &PlannedCreate,
+    alters: &[String],
+    detach: &[String],
+    routine_drops: &[String],
+    dropped_tables: &[String],
+    dropped_views: &[String],
+) -> bool {
     if create.current_definition.is_empty() {
         return false;
     }
     let current = &create.current_definition;
     let wanted = &create.definition;
-    let references_dropped = |definition: &str| {
-        referenced_relations(definition).iter().any(|found| dropped_relations.iter().any(|name| found.eq_ignore_ascii_case(name)))
+    let references = |definition: &str, names: &[String]| {
+        referenced_relations(definition).iter().any(|found| names.iter().any(|name| found.eq_ignore_ascii_case(name)))
     };
-    // 旧视图还指向即将删除的表时，先换成不再引用它的正文。新正文仍引用，或还要调用即将删除的例程时，不能提前替换。
-    if references_dropped(current) && !references_dropped(wanted) && !routine_drops.iter().any(|name| calls_routine(wanted, name)) {
+    if references(current, dropped_views) {
+        return false;
+    }
+    // 提前替换只解开即将删除的表。新正文仍引用表、视图，或还要调用即将删除的例程时，不能提前。
+    let wanted_still_depends = references(wanted, dropped_tables)
+        || references(wanted, dropped_views)
+        || routine_drops.iter().any(|name| calls_routine(wanted, name));
+    if references(current, dropped_tables) && !wanted_still_depends {
         return true;
     }
     if routine_drops.iter().any(|name| statement_mentions(current, name)) {

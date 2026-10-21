@@ -206,6 +206,36 @@ fn replaced_view_stops_using_a_table_before_that_table_is_dropped() {
 }
 
 #[test]
+fn replaced_view_that_reads_a_dropped_view_is_recreated_after_the_drop() {
+    let base = ObjectDef::defined(Kind::View, "v_base", "CREATE VIEW v_base AS SELECT 1 AS id");
+    let current = ObjectDef::defined(Kind::View, "v_top", "CREATE VIEW v_top (id) AS SELECT id FROM v_base");
+    let wanted = ObjectDef::defined(Kind::View, "v_top", "CREATE VIEW v_top (id) AS SELECT 1 AS id");
+    let cases = [
+        ("postgres", "app", "public", "\"public\".\"v_top\"", "\"public\".\"v_base\""),
+        ("mysql", "app", "", "`app`.`v_top`", "`app`.`v_base`"),
+        ("mariadb", "app", "", "`app`.`v_top`", "`app`.`v_base`"),
+    ];
+    for (engine, database, schema, top, base_name) in cases {
+        let report = diff_structure(
+            &Side::ready(engine, database, schema, vec![wanted.clone()]),
+            &Side::ready(engine, database, schema, vec![base.clone(), current.clone()]),
+        );
+        let script = &report.script;
+        let drop_top = format!("DROP VIEW {top}");
+        let drop_base = format!("DROP VIEW {base_name}");
+        let create_top = if script.contains(&format!("CREATE OR REPLACE VIEW {top}")) {
+            format!("CREATE OR REPLACE VIEW {top}")
+        } else {
+            format!("CREATE VIEW {top}")
+        };
+        assert!(at(script, &drop_top) < at(script, &drop_base), "{engine}\n{script}");
+        assert!(at(script, &drop_base) < at(script, &create_top), "{engine}\n{script}");
+        assert_eq!(script.matches(&drop_top).count(), 1, "{engine}\n{script}");
+        assert!(script.contains("SELECT 1 AS id"), "{engine}\n{script}");
+    }
+}
+
+#[test]
 fn routine_that_reads_a_dropped_table_is_dropped_first() {
     let notes = ObjectDef::table("notes", shape(vec![column("id", "integer", false, true)], vec![]));
     let function = ObjectDef::defined(Kind::Function, "read_notes", "CREATE FUNCTION read_notes() RETURNS integer LANGUAGE sql AS $$ SELECT id FROM notes $$");
