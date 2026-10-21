@@ -949,15 +949,22 @@ fn key_choice(key: DataKey) -> KeyChoice {
     KeyChoice { name: key.name, columns: key.columns, primary: key.primary }
 }
 
-/// 索引没读到，且主键不是来自列信息时，键是未知而不是没有。
+/// 索引没读到，且这一侧的列信息里没有主键时，键是未知而不是没有。
 #[derive(Debug)]
 pub struct KeysUnread;
 
-/// 任一侧索引没读全，且主键不来自列信息（SQLite 除外）时返回错误。
+/// 任一侧索引没读全，且该侧列信息没有主键时返回错误。
+/// 非 SQLite 的主键不来自列信息，索引没读到即未知。
+/// SQLite 两侧列上都有主键时仍按主键对比。
 pub fn table_data_keys(engine: Engine, left: Option<&TableShape>, right: Option<&TableShape>) -> Result<Vec<DataKey>, KeysUnread> {
-    let primary_from_columns = engine == Engine::Sqlite;
-    if left.into_iter().chain(right).any(|shape| !shape.indexes_read && !primary_from_columns) {
-        return Err(KeysUnread);
+    for shape in left.into_iter().chain(right) {
+        if shape.indexes_read {
+            continue;
+        }
+        let column_primary = shape.columns.iter().any(|column| column.primary);
+        if engine != Engine::Sqlite || !column_primary {
+            return Err(KeysUnread);
+        }
     }
     let Some(shape) = right.or(left) else {
         return Ok(Vec::new());

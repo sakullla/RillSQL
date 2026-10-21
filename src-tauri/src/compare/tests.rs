@@ -478,11 +478,64 @@ fn unread_index_metadata_is_not_a_missing_primary_key() {
 
     let sqlite_report = diff_structure(
         &Side::ready("sqlite", "main", "", vec![ObjectDef::table("orders", sqlite_unread.clone())]),
-        &Side::ready("sqlite", "main", "", vec![ObjectDef::table("orders", sqlite_unread)]),
+        &Side::ready("sqlite", "main", "", vec![ObjectDef::table("orders", sqlite_unread.clone())]),
     );
     let sqlite_choice = sqlite_report.tables.iter().find(|item| item.name == "orders").expect("orders");
     assert!(sqlite_choice.keys.iter().any(|key| key.primary));
     assert!(!sqlite_choice.needs_key_choice);
+
+    let mut sqlite_no_pk = shape(vec![column("code", "text", false, false)], vec![index("code_key", true, &[("code", false)])]);
+    sqlite_no_pk.indexes_read = false;
+    assert!(table_data_keys(Engine::Sqlite, Some(&sqlite_no_pk), Some(&sqlite_no_pk)).is_err());
+    assert!(table_data_keys(Engine::Sqlite, Some(&sqlite_unread), Some(&sqlite_no_pk)).is_err());
+    let mut pg_column_flag = shape(vec![column("id", "integer", false, true)], Vec::new());
+    pg_column_flag.indexes_read = false;
+    assert!(table_data_keys(Engine::Postgres, Some(&pg_column_flag), Some(&pg_column_flag)).is_err());
+    let readable_unique = shape(vec![column("code", "text", false, false)], vec![index("code_key", true, &[("code", false)])]);
+    let unique_keys = table_data_keys(Engine::Sqlite, Some(&readable_unique), Some(&readable_unique)).expect("unique key was read");
+    assert!(unique_keys.iter().any(|key| !key.primary && key.columns == ["code".to_owned()]));
+
+    let codes = diff_structure(
+        &Side::ready("sqlite", "main", "", vec![ObjectDef::table("codes", sqlite_no_pk.clone())]),
+        &Side::ready("sqlite", "main", "", vec![ObjectDef::table("codes", sqlite_no_pk)]),
+    );
+    let codes_choice = codes.tables.iter().find(|item| item.name == "codes").expect("codes");
+    assert!(codes_choice.keys.is_empty());
+    assert!(!codes_choice.needs_key_choice);
+}
+
+#[test]
+fn missing_key_column_does_not_drop_rows_or_claim_no_data_difference() {
+    let missing_on_baseline = data_table(
+        "orders",
+        orders_columns(),
+        primary(),
+        vec![row(&[("note", Some("a"))])],
+        vec![row(&[("id", Some("2")), ("note", Some("x"))])],
+    );
+    let dropped = diff_data(&DataInput { baseline_engine: "postgres".to_owned(), target_engine: "postgres".to_owned(), tables: vec![missing_on_baseline], cancelled: false });
+    assert!(dropped.script.contains("键列"));
+    assert!(dropped.script.contains("无法对应"));
+    assert!(!dropped.script.contains("没有数据差异"));
+    let upper = dropped.script.to_ascii_uppercase();
+    assert!(!upper.contains("INSERT"));
+    assert!(!upper.contains("UPDATE"));
+    assert!(!upper.contains("DELETE"));
+
+    let empty_target = data_table("orders", orders_columns(), primary(), vec![row(&[("note", Some("a"))])], Vec::new());
+    let quiet = diff_data(&DataInput { baseline_engine: "postgres".to_owned(), target_engine: "postgres".to_owned(), tables: vec![empty_target], cancelled: false });
+    assert!(quiet.script.contains("键列"));
+    assert!(!quiet.script.contains("没有数据差异"));
+    assert!(!quiet.script.to_ascii_uppercase().contains("INSERT"));
+
+    let mut noted = data_table("orders", orders_columns(), primary(), vec![row(&[("note", Some("a"))])], vec![row(&[("id", Some("2")), ("note", Some("x"))])]);
+    noted.read_error = Some("page failed".to_owned());
+    let kept = diff_data(&DataInput { baseline_engine: "postgres".to_owned(), target_engine: "postgres".to_owned(), tables: vec![noted], cancelled: false });
+    assert!(kept.script.contains("读取失败"));
+    assert!(kept.script.contains("page failed"));
+    assert!(kept.script.contains("键列"));
+    assert!(!kept.script.to_ascii_uppercase().contains("DELETE"));
+    assert!(!kept.script.contains("没有数据差异"));
 }
 
 #[test]

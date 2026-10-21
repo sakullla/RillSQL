@@ -109,6 +109,11 @@ fn diff_table(engine: GridEngine, table: &DataTable, key: &[String], statements:
     let schema = grid_schema(engine, table, key);
     let left = group_rows(&table.baseline, key);
     let right = group_rows(&table.target, key);
+    if left.missing_key || right.missing_key {
+        notes.push(format!("表 {} 的键列没有同时出现在两侧行中，无法对应行，不生成行变更。", table.name));
+        diffs.push(DataDiff { table: table.name.clone(), action: "skipped".to_owned(), key: String::new(), detail: "键列没有同时出现在两侧行中".to_owned() });
+        return;
+    }
     if left.duplicate || right.duplicate {
         *incomplete = true;
         notes.push(format!("表 {} 有重复键，这些键不生成语句。", table.name));
@@ -133,12 +138,15 @@ struct Grouped {
     rows: BTreeMap<String, BTreeMap<String, Cell>>,
     duplicates: std::collections::BTreeSet<String>,
     duplicate: bool,
+    /// 已读到的行里没有选定的键列。不能把这行当成不存在。
+    missing_key: bool,
 }
 
 fn group_rows(rows: &[BTreeMap<String, Cell>], key: &[String]) -> Grouped {
-    let mut grouped = Grouped { rows: BTreeMap::new(), duplicates: std::collections::BTreeSet::new(), duplicate: false };
+    let mut grouped = Grouped { rows: BTreeMap::new(), duplicates: std::collections::BTreeSet::new(), duplicate: false, missing_key: false };
     for row in rows {
         let Some(token) = key_token(row, key) else {
+            grouped.missing_key = true;
             continue;
         };
         if grouped.rows.contains_key(&token) {
