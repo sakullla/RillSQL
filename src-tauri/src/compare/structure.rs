@@ -32,8 +32,8 @@ pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
     let mut changed = Vec::new();
     let mut drop_fk = Vec::new();
     let mut drop_index = Vec::new();
-    let mut drop_object = Vec::new();
-    let mut create_object = Vec::new();
+    let mut drop_object: Vec<PlannedDrop> = Vec::new();
+    let mut create_object: Vec<PlannedCreate> = Vec::new();
     let mut create_index = Vec::new();
     let mut create_fk = Vec::new();
     let mut alters = Vec::new();
@@ -103,15 +103,7 @@ pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
         drop_fk.clear();
         create_fk.clear();
     }
-    let drop_object = arrange_drops(drop_object);
-    let mut statements = Vec::new();
-    statements.extend(drop_fk);
-    statements.extend(drop_index);
-    statements.extend(drop_object);
-    statements.extend(alters);
-    statements.extend(create_object);
-    statements.extend(create_index);
-    statements.extend(create_fk);
+    let statements = assemble_statements(engine, target, drop_fk, drop_index, drop_object, alters, create_object, create_index, create_fk);
     let tables = table_choices(engine, &baseline.objects, &target.objects);
     notes.sort();
     notes.dedup();
@@ -198,7 +190,7 @@ fn push_create(
     engine: Engine,
     target: &Side,
     object: &ObjectDef,
-    objects: &mut Vec<String>,
+    objects: &mut Vec<PlannedCreate>,
     indexes: &mut Vec<String>,
     foreign_keys: &mut Vec<String>,
     baseline: &Side,
@@ -213,7 +205,7 @@ fn push_create(
             // PostgreSQL 与 MySQL 在 CREATE TABLE 里引用还没建的表会失败，所以外键一律留到全部建表之后。
             let include_fk = !blocked(baseline, other, Category::ForeignKey);
             let inline_fk = engine == Engine::Sqlite && include_fk;
-            objects.push(create_table(engine, target, &object.name, shape, inline_fk));
+            objects.push(plan_create(object, create_table(engine, target, &object.name, shape, inline_fk)));
             if include_fk && engine != Engine::Sqlite {
                 foreign_keys.extend(shape.foreign_keys.iter().map(|key| add_foreign_key(engine, target, &object.name, key)));
             }
@@ -223,7 +215,7 @@ fn push_create(
         }
         _ => {
             if let Some(sql) = create_definition(engine, target, object) {
-                objects.push(sql);
+                objects.push(plan_create(object, sql));
             }
         }
     }
@@ -258,7 +250,7 @@ fn compare_pair(
     drop_fk: &mut Vec<String>,
     create_fk: &mut Vec<String>,
     object_drops: &mut Vec<PlannedDrop>,
-    create_object: &mut Vec<String>,
+    create_object: &mut Vec<PlannedCreate>,
     notes: &mut Vec<String>,
     incomplete: &mut bool,
 ) {
@@ -268,7 +260,7 @@ fn compare_pair(
             if allow_ddl && !blocked(baseline, target_side, Category::from_kind(base.kind)) {
                 object_drops.push(plan_drop(engine, target, other));
                 if let Some(sql) = create_definition(engine, target, base) {
-                    create_object.push(sql);
+                    create_object.push(plan_create(base, sql));
                 }
             }
         }
@@ -539,19 +531,44 @@ fn drop_foreign_key(engine: Engine, side: &Side, table: &str, key: &ForeignKeySh
 struct PlannedDrop {
     kind: Kind,
     name: String,
+    key: String,
     statement: String,
     definition: String,
+    /// 序列被表列拥有时是 `表` 或 `表\u{1}列`。触发器是所在的表或视图。
+    relation: String,
     /// 必须先于这些对象删除。表是外键指向的同范围表，视图是定义里点到的其他视图。
     references: Vec<String>,
+}
+
+struct PlannedCreate {
+    kind: Kind,
+    name: String,
+    key: String,
+    statement: String,
+    definition: String,
+    relation: String,
 }
 
 fn plan_drop(engine: Engine, side: &Side, object: &ObjectDef) -> PlannedDrop {
     PlannedDrop {
         kind: object.kind,
         name: object.name.clone(),
+        key: identity(object),
         statement: drop_object(engine, side, object),
         definition: object.definition.clone(),
+        relation: object.relation.clone(),
         references: referenced_tables(engine, side, object),
+    }
+}
+
+fn plan_create(object: &ObjectDef, statement: String) -> PlannedCreate {
+    PlannedCreate {
+        kind: object.kind,
+        name: object.name.clone(),
+        key: identity(object),
+        statement,
+        definition: object.definition.clone(),
+        relation: object.relation.clone(),
     }
 }
 
@@ -572,76 +589,580 @@ fn referenced_tables(engine: Engine, side: &Side, object: &ObjectDef) -> Vec<Str
     names
 }
 
-/// 标识的字典序会先删表再删视图。依赖方在前：视图（含视图之间）、触发器，然后其余对象，最后按外键把引用表放在被引用表之前。
-fn arrange_drops(drops: Vec<PlannedDrop>) -> Vec<String> {
-    let mut views = Vec::new();
+/// 触发器先于它所在的视图和表。视图按真实引用先删依赖方。表按外键先删引用方。
+/// 枚举、域、序列和函数不在这里：列还在用它们时不能先删，新建又必须赶在 ALTER 或 CREATE TABLE 之前。
+fn assemble_statements(
+    engine: Engine,
+    target: &Side,
+    drop_fk: Vec<String>,
+    drop_index: Vec<String>,
+    drops: Vec<PlannedDrop>,
+    alters: Vec<String>,
+    creates: Vec<PlannedCreate>,
+    create_index: Vec<String>,
+    create_fk: Vec<String>,
+) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let create_keys = creates.iter().map(|item| item.key.clone()).collect::<BTreeSet<_>>();
     let mut triggers = Vec::new();
-    let mut earlier = Vec::new();
+    let mut views = Vec::new();
     let mut tables = Vec::new();
+    let mut support_drops = Vec::new();
     for drop in drops {
         match drop.kind {
-            Kind::View => views.push(drop),
             Kind::Trigger => triggers.push(drop),
+            Kind::View => views.push(drop),
             Kind::Table => tables.push(drop),
-            _ => earlier.push(drop),
+            _ => support_drops.push(drop),
         }
     }
     let by_name = |left: &PlannedDrop, right: &PlannedDrop| left.name.cmp(&right.name).then(left.statement.cmp(&right.statement));
     attach_view_dependencies(&mut views);
     triggers.sort_by(by_name);
-    earlier.sort_by(|left, right| kind_listing_rank(left.kind).cmp(&kind_listing_rank(right.kind)).then(by_name(left, right)));
-    order_dependents_first(views)
-        .into_iter()
-        .chain(triggers)
-        .chain(earlier)
-        .chain(order_dependents_first(tables))
-        .map(|drop| drop.statement)
-        .collect()
+    let dropped_tables = tables.iter().map(|table| table.name.clone()).collect::<BTreeSet<_>>();
+    let mut changed_drops = Vec::new();
+    let mut only_target_drops = Vec::new();
+    for mut drop in support_drops {
+        match sequence_fate(&drop, &dropped_tables, &alters, target) {
+            SequenceFate::Omit => continue,
+            SequenceFate::IfExists => {
+                drop.statement = drop.statement.replacen("DROP SEQUENCE ", "DROP SEQUENCE IF EXISTS ", 1);
+            }
+            SequenceFate::Keep => {}
+        }
+        if create_keys.contains(&drop.key) {
+            changed_drops.push(drop);
+        } else {
+            only_target_drops.push(drop);
+        }
+    }
+    let changed_drops = order_support(changed_drops, true);
+    let only_target_drops = order_support(only_target_drops, true);
+    let created_names = creates
+        .iter()
+        .filter(|item| matches!(item.kind, Kind::Enum | Kind::Domain | Kind::Sequence | Kind::Function | Kind::Procedure))
+        .map(|item| item.name.clone())
+        .collect::<Vec<_>>();
+    let (freeing_alters, using_alters) = split_alters(&alters, &created_names);
+    let mut changed_creates = Vec::new();
+    let mut fresh_creates = Vec::new();
+    let mut table_creates = Vec::new();
+    let mut view_creates = Vec::new();
+    let mut trigger_creates = Vec::new();
+    let drop_keys = changed_drops.iter().map(|item| item.key.clone()).collect::<BTreeSet<_>>();
+    for create in creates {
+        match create.kind {
+            Kind::Table => table_creates.push(create),
+            Kind::View => view_creates.push(create),
+            Kind::Trigger => trigger_creates.push(create),
+            _ if drop_keys.contains(&create.key) => changed_creates.push(create),
+            _ => fresh_creates.push(create),
+        }
+    }
+    let by_create = |left: &PlannedCreate, right: &PlannedCreate| left.name.cmp(&right.name).then(left.statement.cmp(&right.statement));
+    let changed_creates = order_support_creates(changed_creates);
+    let fresh_creates = order_support_creates(fresh_creates);
+    table_creates.sort_by(by_create);
+    trigger_creates.sort_by(by_create);
+    let mut statements = Vec::new();
+    statements.extend(drop_fk);
+    statements.extend(drop_index);
+    statements.extend(triggers.into_iter().map(|drop| drop.statement));
+    statements.extend(order_dependents_first(views).into_iter().map(|drop| drop.statement));
+    statements.extend(order_dependents_first(tables).into_iter().map(|drop| drop.statement));
+    statements.extend(freeing_alters);
+    statements.extend(changed_drops.into_iter().flat_map(|drop| expand_sequence_drop(engine, target, drop)));
+    statements.extend(changed_creates.into_iter().map(|create| create.statement));
+    statements.extend(fresh_creates.into_iter().map(|create| create.statement));
+    statements.extend(using_alters);
+    statements.extend(only_target_drops.into_iter().flat_map(|drop| expand_sequence_drop(engine, target, drop)));
+    statements.extend(table_creates.into_iter().map(|create| create.statement));
+    statements.extend(order_view_creates(view_creates).into_iter().map(|create| create.statement));
+    statements.extend(trigger_creates.into_iter().map(|create| create.statement));
+    statements.extend(create_index);
+    statements.extend(create_fk);
+    statements
+}
+
+fn order_support(mut items: Vec<PlannedDrop>, dependents_first: bool) -> Vec<PlannedDrop> {
+    attach_definition_references(&mut items);
+    if dependents_first {
+        order_ranked(items, true, support_drop_rank)
+    } else {
+        order_ranked(items, false, support_create_rank)
+    }
+}
+
+fn order_support_creates(items: Vec<PlannedCreate>) -> Vec<PlannedCreate> {
+    let planned = items
+        .iter()
+        .map(|item| PlannedDrop {
+            kind: item.kind,
+            name: item.name.clone(),
+            key: item.key.clone(),
+            statement: item.statement.clone(),
+            definition: item.definition.clone(),
+            relation: item.relation.clone(),
+            references: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let ordered = order_support(planned, false);
+    let mut by_key = items.into_iter().map(|item| (item.key.clone(), item)).collect::<std::collections::BTreeMap<_, _>>();
+    ordered.into_iter().filter_map(|drop| by_key.remove(&drop.key)).collect()
+}
+
+/// 定义文本里点到的同批名字是依赖。函数和过程还依赖同批的类型与序列，避免正文被美元引号包住时看漏。
+fn attach_definition_references(items: &mut [PlannedDrop]) {
+    let names = items.iter().map(|item| item.name.clone()).collect::<std::collections::BTreeSet<_>>();
+    let type_names = items
+        .iter()
+        .filter(|item| matches!(item.kind, Kind::Enum | Kind::Domain | Kind::Sequence))
+        .map(|item| item.name.clone())
+        .collect::<Vec<_>>();
+    for item in items.iter_mut() {
+        let mut refs = std::collections::BTreeSet::new();
+        for token in sql_tokens(&item.definition) {
+            if !is_ident_token(&token) {
+                continue;
+            }
+            if let Some(known) = names.iter().find(|name| token.text.eq_ignore_ascii_case(name) && !name.eq_ignore_ascii_case(&item.name)) {
+                refs.insert(known.clone());
+            }
+        }
+        if matches!(item.kind, Kind::Function | Kind::Procedure) {
+            refs.extend(type_names.iter().filter(|name| !name.eq_ignore_ascii_case(&item.name)).cloned());
+        }
+        item.references = refs.into_iter().collect();
+    }
+}
+
+fn support_drop_rank(kind: Kind) -> u8 {
+    match kind {
+        Kind::Procedure => 0,
+        Kind::Function => 1,
+        Kind::Domain => 2,
+        Kind::Enum => 3,
+        Kind::Sequence => 4,
+        _ => 9,
+    }
+}
+
+fn support_create_rank(kind: Kind) -> u8 {
+    match kind {
+        Kind::Enum => 0,
+        Kind::Domain => 1,
+        Kind::Sequence => 2,
+        Kind::Function => 3,
+        Kind::Procedure => 4,
+        _ => 9,
+    }
+}
+
+fn order_ranked(items: Vec<PlannedDrop>, dependents_first: bool, rank: fn(Kind) -> u8) -> Vec<PlannedDrop> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut by_name: BTreeMap<String, Vec<PlannedDrop>> = BTreeMap::new();
+    let mut kind_of: BTreeMap<String, Kind> = BTreeMap::new();
+    for item in items {
+        kind_of.insert(item.name.clone(), item.kind);
+        by_name.entry(item.name.clone()).or_default().push(item);
+    }
+    let mut forward: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut indegree: BTreeMap<String, usize> = BTreeMap::new();
+    for name in by_name.keys() {
+        forward.insert(name.clone(), BTreeSet::new());
+        indegree.insert(name.clone(), 0);
+    }
+    for group in by_name.values() {
+        for item in group {
+            for referenced in &item.references {
+                if referenced.eq_ignore_ascii_case(&item.name) || !by_name.contains_key(referenced) {
+                    continue;
+                }
+                let (from, to) = if dependents_first { (item.name.clone(), referenced.clone()) } else { (referenced.clone(), item.name.clone()) };
+                if forward.get_mut(&from).expect("from").insert(to.clone()) {
+                    *indegree.get_mut(&to).expect("to") += 1;
+                }
+            }
+        }
+    }
+    let key = |name: &str| (rank(kind_of[name]), name.to_owned());
+    let mut ready: BTreeSet<(u8, String)> = indegree.iter().filter(|(_, degree)| **degree == 0).map(|(name, _)| key(name)).collect();
+    let mut ordered = Vec::new();
+    while let Some((_, name)) = ready.iter().next().cloned() {
+        ready.remove(&key(&name));
+        ordered.push(name.clone());
+        for next in forward.get(&name).into_iter().flatten() {
+            let degree = indegree.get_mut(next).expect("next");
+            *degree -= 1;
+            if *degree == 0 {
+                ready.insert(key(next));
+            }
+        }
+    }
+    let mut cyclic = indegree
+        .iter()
+        .filter(|(name, degree)| **degree > 0 && !ordered.iter().any(|item| item == *name))
+        .map(|(name, _)| key(name))
+        .collect::<Vec<_>>();
+    cyclic.sort();
+    ordered.extend(cyclic.into_iter().map(|(_, name)| name));
+    let mut result = Vec::new();
+    for name in ordered {
+        if let Some(group) = by_name.remove(&name) {
+            result.extend(group);
+        }
+    }
+    result
+}
+
+fn split_alters(alters: &[String], created_names: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut freeing = Vec::new();
+    let mut using = Vec::new();
+    for statement in alters {
+        if created_names.iter().any(|name| statement_mentions(statement, name) || default_references_sequence(statement, name)) {
+            using.push(statement.clone());
+        } else {
+            freeing.push(statement.clone());
+        }
+    }
+    (freeing, using)
+}
+
+enum SequenceFate {
+    /// 明确属于被删表或被删列。DROP TABLE / DROP COLUMN 会带走它，再删会因对象已不存在而失败。
+    Omit,
+    /// 只看到 nextval，不能确定是 serial 还是普通引用。放在删表之后，用 IF EXISTS 两种都成立。
+    IfExists,
+    Keep,
+}
+
+fn sequence_fate(seq: &PlannedDrop, dropped_tables: &std::collections::BTreeSet<String>, alters: &[String], target: &Side) -> SequenceFate {
+    if seq.kind != Kind::Sequence {
+        return SequenceFate::Keep;
+    }
+    let (owner_table, owner_column) = explicit_sequence_owner(seq);
+    if let Some(table) = owner_table.as_deref() {
+        if dropped_tables.contains(table) {
+            return SequenceFate::Omit;
+        }
+        if let Some(column) = owner_column.as_deref() {
+            if column_is_dropped(alters, table, column) {
+                return SequenceFate::Omit;
+            }
+        }
+    }
+    let mut referenced_by_removed_column = false;
+    for object in target.objects.iter().filter(|object| object.kind == Kind::Table) {
+        let Some(shape) = object.table.as_ref() else {
+            continue;
+        };
+        for column in &shape.columns {
+            if !default_references_sequence(&column.default_sql, &seq.name) {
+                continue;
+            }
+            if dropped_tables.contains(&object.name) || column_is_dropped(alters, &object.name, &column.name) {
+                referenced_by_removed_column = true;
+            }
+        }
+    }
+    if referenced_by_removed_column && owner_table.is_none() {
+        SequenceFate::IfExists
+    } else {
+        SequenceFate::Keep
+    }
+}
+
+fn explicit_sequence_owner(seq: &PlannedDrop) -> (Option<String>, Option<String>) {
+    let relation = seq.relation.trim();
+    if !relation.is_empty() {
+        let mut parts = relation.split('\u{1}');
+        return (parts.next().map(str::to_owned), parts.next().map(str::to_owned));
+    }
+    owned_by_clause(&seq.definition)
+}
+
+fn owned_by_clause(definition: &str) -> (Option<String>, Option<String>) {
+    let tokens = sql_tokens(definition);
+    let mut index = 0;
+    while index + 1 < tokens.len() {
+        if is_word(&tokens[index], "OWNED") && is_word(&tokens[index + 1], "BY") {
+            let parts = qualified_parts(&tokens[index + 2..]);
+            if parts.first().is_some_and(|part| part.eq_ignore_ascii_case("NONE")) || parts.is_empty() {
+                return (None, None);
+            }
+            return match parts.len() {
+                1 => (Some(parts[0].clone()), None),
+                2 => (Some(parts[0].clone()), Some(parts[1].clone())),
+                _ => (Some(parts[parts.len() - 2].clone()), Some(parts[parts.len() - 1].clone())),
+            };
+        }
+        index += 1;
+    }
+    (None, None)
+}
+
+fn qualified_parts(tokens: &[SqlToken]) -> Vec<String> {
+    if tokens.is_empty() || !is_ident_token(&tokens[0]) {
+        return Vec::new();
+    }
+    let mut parts = vec![tokens[0].text.clone()];
+    let mut index = 1;
+    while index + 1 < tokens.len() && tokens[index].text == "." && is_ident_token(&tokens[index + 1]) {
+        parts.push(tokens[index + 1].text.clone());
+        index += 2;
+    }
+    parts
+}
+
+fn column_is_dropped(alters: &[String], table: &str, column: &str) -> bool {
+    alters.iter().any(|sql| sql.to_ascii_uppercase().contains("DROP COLUMN") && statement_mentions(sql, table) && statement_mentions(sql, column))
+}
+
+fn expand_sequence_drop(engine: Engine, side: &Side, drop: PlannedDrop) -> Vec<String> {
+    let mut statements = Vec::new();
+    if engine == Engine::Postgres && drop.kind == Kind::Sequence && explicit_sequence_owner(&drop).0.is_some() {
+        statements.push(format!("ALTER SEQUENCE {} OWNED BY NONE", qualify(engine, side, &drop.name)));
+    }
+    statements.push(drop.statement);
+    statements
+}
+
+fn default_references_sequence(default_sql: &str, sequence: &str) -> bool {
+    if sequence.is_empty() || !default_sql.to_ascii_lowercase().contains("nextval") {
+        return false;
+    }
+    string_literals(default_sql).into_iter().any(|literal| {
+        literal
+            .split('.')
+            .last()
+            .unwrap_or(literal.as_str())
+            .trim_matches('"')
+            .eq_ignore_ascii_case(sequence)
+    }) || statement_mentions(default_sql, sequence)
+}
+
+fn string_literals(sql: &str) -> Vec<String> {
+    let mut literals = Vec::new();
+    let mut index = 0;
+    while index < sql.len() {
+        let rest = &sql[index..];
+        if rest.starts_with("--") {
+            index += rest.find('\n').map(|at| at + 1).unwrap_or(rest.len());
+            continue;
+        }
+        if rest.starts_with("/*") {
+            index = skip_block_comment(sql, index);
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        if ch == '\'' {
+            if let Some(end) = skip_quoted(sql, index, '\'') {
+                literals.push(unquote(&sql[index..end]));
+                index = end;
+                continue;
+            }
+        }
+        if ch == '$' {
+            if let Some(end) = skip_dollar(sql, index) {
+                index = end;
+                continue;
+            }
+        }
+        index += ch.len_utf8();
+    }
+    literals
+}
+
+fn order_view_creates(views: Vec<PlannedCreate>) -> Vec<PlannedCreate> {
+    let mut planned = views
+        .iter()
+        .map(|view| PlannedDrop {
+            kind: Kind::View,
+            name: view.name.clone(),
+            key: view.key.clone(),
+            statement: view.statement.clone(),
+            definition: view.definition.clone(),
+            relation: view.relation.clone(),
+            references: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    attach_view_dependencies(&mut planned);
+    let ordered = order_dependencies_first(planned);
+    let mut by_key = views.into_iter().map(|view| (view.key.clone(), view)).collect::<std::collections::BTreeMap<_, _>>();
+    ordered.into_iter().filter_map(|drop| by_key.remove(&drop.key)).collect()
 }
 
 fn attach_view_dependencies(views: &mut [PlannedDrop]) {
     let names = views.iter().map(|view| view.name.clone()).collect::<std::collections::BTreeSet<_>>();
-    for view in views {
-        view.references = names.iter().filter(|name| *name != &view.name && mentions_ident(&view.definition, name)).cloned().collect();
+    for view in views.iter_mut() {
+        view.references = referenced_relations(&view.definition)
+            .into_iter()
+            .filter_map(|found| names.iter().find(|name| found.eq_ignore_ascii_case(name)).cloned())
+            .filter(|name| !name.eq_ignore_ascii_case(&view.name))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
     }
 }
 
-fn mentions_ident(sql: &str, name: &str) -> bool {
-    if name.is_empty() || sql.is_empty() {
+/// 关系名来自 FROM / JOIN。字符串、注释和别名不算引用。
+fn referenced_relations(sql: &str) -> Vec<String> {
+    let tokens = sql_tokens(sql);
+    let mut refs = Vec::new();
+    collect_relations(&tokens, &mut refs);
+    refs
+}
+
+fn collect_relations(tokens: &[SqlToken], refs: &mut Vec<String>) {
+    let mut index = 0;
+    while index < tokens.len() {
+        if is_word(&tokens[index], "FROM") || is_word(&tokens[index], "JOIN") {
+            let next = parse_table_list(tokens, index + 1, refs);
+            index = if next > index { next } else { index + 1 };
+            continue;
+        }
+        index += 1;
+    }
+}
+
+fn parse_table_list(tokens: &[SqlToken], mut index: usize, refs: &mut Vec<String>) -> usize {
+    while index < tokens.len() {
+        if is_word(&tokens[index], "ONLY") || is_word(&tokens[index], "LATERAL") {
+            index += 1;
+            continue;
+        }
+        if tokens[index].text == "(" {
+            let end = matching_paren(tokens, index);
+            collect_relations(&tokens[index + 1..end], refs);
+            index = end.saturating_add(1);
+            index = skip_alias(tokens, index);
+        } else if is_ident_token(&tokens[index]) {
+            let (name, next) = qualified_relation(tokens, index);
+            if next < tokens.len() && tokens[next].text == "(" {
+                index = matching_paren(tokens, next).saturating_add(1);
+            } else {
+                if !name.is_empty() {
+                    refs.push(name);
+                }
+                index = next;
+            }
+            index = skip_alias(tokens, index);
+        } else {
+            break;
+        }
+        if index < tokens.len() && tokens[index].text == "," {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    index
+}
+
+fn qualified_relation(tokens: &[SqlToken], start: usize) -> (String, usize) {
+    let parts = qualified_parts(&tokens[start..]);
+    if parts.is_empty() {
+        return (String::new(), start);
+    }
+    let mut index = start + 1;
+    let mut seen = 1;
+    while seen < parts.len() {
+        if index + 1 < tokens.len() && tokens[index].text == "." {
+            index += 2;
+            seen += 1;
+        } else {
+            break;
+        }
+    }
+    (parts.last().cloned().unwrap_or_default(), index)
+}
+
+fn matching_paren(tokens: &[SqlToken], open: usize) -> usize {
+    let mut depth = 0;
+    for (index, token) in tokens.iter().enumerate().skip(open) {
+        if token.text == "(" {
+            depth += 1;
+        } else if token.text == ")" {
+            depth -= 1;
+            if depth == 0 {
+                return index;
+            }
+        }
+    }
+    tokens.len().saturating_sub(1)
+}
+
+fn skip_alias(tokens: &[SqlToken], mut index: usize) -> usize {
+    if index < tokens.len() && is_word(&tokens[index], "AS") {
+        index += 1;
+    }
+    if index < tokens.len() && is_ident_token(&tokens[index]) && !is_from_stop(&tokens[index].text) {
+        index += 1;
+    }
+    index
+}
+
+fn is_from_stop(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "WHERE" | "GROUP" | "HAVING" | "WINDOW" | "ORDER" | "LIMIT" | "OFFSET" | "UNION" | "EXCEPT" | "INTERSECT" | "FETCH" | "FOR" | "ON" | "USING" | "LEFT" | "RIGHT" | "INNER" | "OUTER" | "FULL" | "CROSS" | "NATURAL" | "JOIN" | "SELECT" | "SET" | "WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR"
+    )
+}
+
+struct SqlToken {
+    text: String,
+    quoted: bool,
+}
+
+fn sql_tokens(sql: &str) -> Vec<SqlToken> {
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < sql.len() {
+        if let Some(next) = skip_delimited(sql, index) {
+            let ch = sql[index..].chars().next().unwrap();
+            if ch == '"' || ch == '`' || ch == '[' {
+                tokens.push(SqlToken { text: unquote(&sql[index..next]), quoted: true });
+            }
+            index = next;
+            continue;
+        }
+        let ch = sql[index..].chars().next().unwrap();
+        if ch.is_whitespace() {
+            index += ch.len_utf8();
+            continue;
+        }
+        if is_ident_start(ch) {
+            let end = ident_continue(sql, index);
+            tokens.push(SqlToken { text: sql[index..end].to_owned(), quoted: false });
+            index = end;
+            continue;
+        }
+        tokens.push(SqlToken { text: ch.to_string(), quoted: false });
+        index += ch.len_utf8();
+    }
+    tokens
+}
+
+fn unquote(raw: &str) -> String {
+    let closer = if raw.starts_with('[') { ']' } else { raw.chars().next().unwrap_or('"') };
+    let open = if closer == ']' { '[' } else { closer };
+    let inner = raw.trim_start_matches(open).trim_end_matches(closer);
+    inner.replace(&format!("{closer}{closer}"), &closer.to_string())
+}
+
+fn is_word(token: &SqlToken, word: &str) -> bool {
+    !token.quoted && token.text.eq_ignore_ascii_case(word)
+}
+
+fn is_ident_token(token: &SqlToken) -> bool {
+    token.quoted || token.text.chars().next().is_some_and(is_ident_start)
+}
+
+fn statement_mentions(sql: &str, name: &str) -> bool {
+    if name.is_empty() {
         return false;
     }
-    let haystack = sql.to_ascii_lowercase();
-    let needle = name.to_ascii_lowercase();
-    let bytes = haystack.as_bytes();
-    let mut from = 0;
-    while let Some(found) = haystack[from..].find(&needle) {
-        let start = from + found;
-        let end = start + needle.len();
-        let before = start == 0 || !is_ident_byte(bytes[start - 1]);
-        let after = end >= bytes.len() || !is_ident_byte(bytes[end]);
-        if before && after {
-            return true;
-        }
-        from = start + 1;
-    }
-    false
-}
-
-fn is_ident_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80
-}
-
-fn kind_listing_rank(kind: Kind) -> u8 {
-    match kind {
-        Kind::Domain => 0,
-        Kind::Enum => 1,
-        Kind::Function => 2,
-        Kind::Procedure => 3,
-        Kind::Sequence => 4,
-        Kind::Table => 5,
-        Kind::Trigger => 6,
-        Kind::View => 7,
-    }
+    sql_tokens(sql).into_iter().any(|token| if token.quoted { token.text == name } else { token.text.eq_ignore_ascii_case(name) })
 }
 
 /// 入度是被同批对象引用的次数。先删没有入边的对象，也就是先删依赖方。成环的留在后面；表之间的环靠已经发出的 DROP CONSTRAINT 解开。
@@ -679,6 +1200,60 @@ fn order_dependents_first(tables: Vec<PlannedDrop>) -> Vec<PlannedDrop> {
             *degree -= 1;
             if *degree == 0 {
                 ready.insert(parent.clone());
+            }
+        }
+    }
+    let mut cyclic = indegree
+        .iter()
+        .filter(|(name, degree)| **degree > 0 && !ordered.iter().any(|item| item == *name))
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    cyclic.sort();
+    ordered.extend(cyclic);
+    let mut result = Vec::new();
+    for name in ordered {
+        if let Some(group) = by_name.remove(&name) {
+            result.extend(group);
+        }
+    }
+    result
+}
+
+/// 先输出被引用的对象。视图创建用这个顺序；成环的留在最后，不按名称把被引用方提前删掉。
+fn order_dependencies_first(items: Vec<PlannedDrop>) -> Vec<PlannedDrop> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut by_name: BTreeMap<String, Vec<PlannedDrop>> = BTreeMap::new();
+    for item in items {
+        by_name.entry(item.name.clone()).or_default().push(item);
+    }
+    let mut dependents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut indegree: BTreeMap<String, usize> = BTreeMap::new();
+    for name in by_name.keys() {
+        dependents.insert(name.clone(), BTreeSet::new());
+        indegree.insert(name.clone(), 0);
+    }
+    for group in by_name.values() {
+        for item in group {
+            for referenced in &item.references {
+                if referenced.eq_ignore_ascii_case(&item.name) || !by_name.contains_key(referenced) {
+                    continue;
+                }
+                if dependents.get_mut(referenced).expect("referenced").insert(item.name.clone()) {
+                    *indegree.get_mut(&item.name).expect("item") += 1;
+                }
+            }
+        }
+    }
+    let mut ready: BTreeSet<String> = indegree.iter().filter(|(_, degree)| **degree == 0).map(|(name, _)| name.clone()).collect();
+    let mut ordered = Vec::new();
+    while let Some(name) = ready.iter().next().cloned() {
+        ready.remove(&name);
+        ordered.push(name.clone());
+        for dependent in dependents.get(&name).into_iter().flatten() {
+            let degree = indegree.get_mut(dependent).expect("dependent");
+            *degree -= 1;
+            if *degree == 0 {
+                ready.insert(dependent.clone());
             }
         }
     }

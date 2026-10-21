@@ -446,12 +446,44 @@ async fn enrich(session: &CatalogSession, request: &SideRequest, database: &str,
                 return Vec::new();
             };
             match read_definition(session, engine, database, &request.schema, &object.name, kind_str(object.kind), &object.signature, &object.relation).await {
-                Ok(sql) => object.definition = sql,
+                Ok(sql) => {
+                    object.definition = sql;
+                    if object.kind == Kind::Sequence && request.engine == "postgres" {
+                        if let Some(owner) = postgres_sequence_owner(session, &request.schema, &object.name).await {
+                            object.relation = owner;
+                        }
+                    }
+                }
                 Err(message) => object.read_error = Some(message),
             }
             Vec::new()
         }
     }
+}
+
+/// serial / identity 的序列由列拥有。relation 记成 `表\u{1}列`，结构脚本不再无条件 DROP SEQUENCE。
+async fn postgres_sequence_owner(session: &CatalogSession, schema: &str, name: &str) -> Option<String> {
+    let CatalogSession::Postgres(client) = session else {
+        return None;
+    };
+    let sql = "SELECT tab.relname, att.attname FROM pg_class seq \
+        JOIN pg_namespace ns ON ns.oid = seq.relnamespace \
+        JOIN pg_depend dep ON dep.objid = seq.oid AND dep.deptype IN ('a', 'i') AND dep.classid = 'pg_class'::regclass AND dep.refclassid = 'pg_class'::regclass AND dep.refobjsubid > 0 \
+        JOIN pg_class tab ON tab.oid = dep.refobjid \
+        JOIN pg_attribute att ON att.attrelid = tab.oid AND att.attnum = dep.refobjsubid AND NOT att.attisdropped \
+        WHERE ns.nspname = $1 AND seq.relname = $2 AND seq.relkind = 'S' \
+        LIMIT 1";
+    let rows = client.query(sql, &[&schema, &name]).await.ok()?;
+    let row = rows.first()?;
+    let table: String = row.try_get(0).ok()?;
+    let column: String = row.try_get(1).ok()?;
+    if table.is_empty() {
+        return None;
+    }
+    if column.is_empty() {
+        return Some(table);
+    }
+    Some(format!("{table}\u{1}{column}"))
 }
 
 pub(super) fn absorb_snapshot(object: &mut ObjectDef, snapshot: &Snapshot) -> Vec<(Category, String)> {
