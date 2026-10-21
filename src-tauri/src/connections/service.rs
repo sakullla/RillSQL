@@ -154,6 +154,26 @@ impl CancelTransport {
     }
 }
 
+/// 一次对比用的临时 PostgreSQL 会话。丢弃时关闭它自己的通道，不动用户正在使用的会话。
+pub struct EphemeralRead {
+    catalog: CatalogSession,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl EphemeralRead {
+    pub fn catalog(&self) -> CatalogSession {
+        self.catalog.clone()
+    }
+}
+
+impl Drop for EphemeralRead {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
 /// 已打开会话的查询句柄。调用方只能拿去查元数据，不能据此再拨一条数据库连接。
 #[derive(Clone)]
 pub enum CatalogSession {
@@ -379,6 +399,67 @@ impl Service {
             return Ok(());
         }
         Err(focus_failure(&outcome.report))
+    }
+
+    /// 为这一次读取另开 PostgreSQL 会话。不替换当前会话，不调用改连，也不写已保存的配置。
+    pub async fn open_ephemeral_postgres(&self, id: &str, database: &str) -> Result<EphemeralRead, String> {
+        let database = database.trim();
+        if database.is_empty() {
+            return Err("需要数据库名。".to_owned());
+        }
+        let store = self.store().await?;
+        let saved = store.get(id).await.map_err(db_err)?.ok_or_else(|| "找不到这条连接配置".to_owned())?;
+        if saved.engine != Engine::Postgres {
+            return Err("只有 PostgreSQL 需要临时读取会话。".to_owned());
+        }
+        if !self.sessions.lock().expect("sessions").contains_key(id) {
+            return Err("这条连接还没有打开。".to_owned());
+        }
+        let saved_database = saved.database.clone();
+        let mut config = saved;
+        config.database = Some(database.to_owned());
+        let saved_fingerprint = match &config.ssh {
+            Some(ssh) => store.host_key(&ssh.host, ssh.port).await.map_err(db_err)?,
+            None => None,
+        };
+        let password = self.resolve_secret(&password_account(&config.id), None, config.password_saved);
+        let ssh_password = self.resolve_secret(&ssh_password_account(&config.id), None, config.ssh_password_saved);
+        let stages = stages::planned_stages(&config);
+        let mut attempt = Attempt {
+            config: config.clone(),
+            probes: self.probes.clone(),
+            password,
+            ssh_password,
+            passphrase: None,
+            saved_fingerprint,
+            ssh_fault: None,
+            ssh_started: false,
+            ssh_authed: false,
+            forwarder_port: None,
+            shutdown: None,
+            remote: Remote::Fresh,
+            sqlite_pool: None,
+            mysql_pool: None,
+            postgres: None,
+            schema_note: None,
+            foreign_keys: None,
+            cancel: CancelTransport::None,
+        };
+        let report = stages::execute_stages(&stages, &mut attempt).await;
+        let persisted = store.get(id).await.map_err(db_err)?.ok_or_else(|| "找不到这条连接配置".to_owned())?;
+        if persisted.database != saved_database {
+            return Err("临时读取会话改动了已保存的库名，已停止。".to_owned());
+        }
+        if !self.sessions.lock().expect("sessions").contains_key(id) {
+            return Err("临时读取会话替换了当前会话，已停止。".to_owned());
+        }
+        if report.status != TestStatus::Ok {
+            return Err(ephemeral_failure(&report));
+        }
+        let Some(client) = attempt.postgres.take() else {
+            return Err("没有打开临时读取会话。".to_owned());
+        };
+        Ok(EphemeralRead { catalog: CatalogSession::Postgres(Arc::new(client)), shutdown: attempt.shutdown.take() })
     }
 
     pub fn disconnect(&self, id: &str) {
@@ -1025,6 +1106,17 @@ fn rank(stage: StageKind) -> u8 {
         StageKind::ServerVersion => 3,
         _ => 9,
     }
+}
+
+fn ephemeral_failure(report: &TestReport) -> String {
+    let message = report
+        .stages
+        .iter()
+        .find(|stage| stage.status == StageStatus::Err)
+        .map(|stage| stage.message.as_str())
+        .filter(|message| !message.is_empty())
+        .unwrap_or("没有连上这个库");
+    format!("{message}。当前会话没有改连。")
 }
 
 fn focus_failure(report: &TestReport) -> String {

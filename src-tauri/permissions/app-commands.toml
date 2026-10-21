@@ -182,3 +182,18 @@ commands.allow = ["query_saved_delete"]
 identifier = "allow-export-write-loaded"
 description = "允许把已经读取的 CSV 数据保存到用户选择的本地文件。"
 commands.allow = ["export_write_loaded"]
+
+[[permission]]
+identifier = "allow-compare-structure"
+description = "允许读取两侧结构并生成不执行的差异脚本。"
+commands.allow = ["compare_structure"]
+
+[[permission]]
+identifier = "allow-compare-data"
+description = "允许按键读取选定表并生成不执行的数据差异脚本。"
+commands.allow = ["compare_data"]
+
+[[permission]]
+identifier = "allow-compare-cancel"
+description = "允许停止尚未完成的对比读取。"
+commands.allow = ["compare_cancel"]

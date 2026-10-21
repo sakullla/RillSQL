@@ -207,6 +207,24 @@
           "markdownDescription": "允许查看哪些连接会话已经打开。"
         },
         {
+          "description": "允许停止尚未完成的对比读取。",
+          "type": "string",
+          "const": "allow-compare-cancel",
+          "markdownDescription": "允许停止尚未完成的对比读取。"
+        },
+        {
+          "description": "允许按键读取选定表并生成不执行的数据差异脚本。",
+          "type": "string",
+          "const": "allow-compare-data",
+          "markdownDescription": "允许按键读取选定表并生成不执行的数据差异脚本。"
+        },
+        {
+          "description": "允许读取两侧结构并生成不执行的差异脚本。",
+          "type": "string",
+          "const": "allow-compare-structure",
+          "markdownDescription": "允许读取两侧结构并生成不执行的差异脚本。"
+        },
+        {
           "description": "允许确认 SSH 主机密钥。",
           "type": "string",
           "const": "allow-connections-confirm-host-key",

@@ -6,6 +6,10 @@ mod live;
 mod sql;
 mod store;
 
+pub(crate) use live::describe;
+pub(crate) use sql::{delete_sql, insert_sql, qualified_name, quote_ident, reject_literal, select_list, update_sql};
+pub(crate) use store::{Cell, Column, Engine, TableSchema};
+
 pub fn module_id() -> &'static str {
     let _linked = (
         std::any::type_name::<export::ExportPlan>(),

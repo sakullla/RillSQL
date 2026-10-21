@@ -24,6 +24,7 @@ export interface ShellActions {
   saveQuery: () => void;
   showSavedQueries: () => void;
   executeQuery?: () => void;
+  openCompare?: () => void;
 }
 
 export function shellCommands(actions: ShellActions): PaletteItem[] {
@@ -31,6 +32,7 @@ export function shellCommands(actions: ShellActions): PaletteItem[] {
     { id: "new-query", group: "命令", label: "新建查询", icon: "code", chord: "Mod+T", run: actions.openQuery },
     { id: "execute-query", group: "命令", label: "执行", icon: "play", chord: "Mod+Enter", run: () => actions.executeQuery?.() },
     { id: "open-structure", group: "命令", label: "新建表结构", icon: "table", run: actions.openStructure },
+    { id: "compare", group: "命令", label: "对比库", icon: "table", run: () => actions.openCompare?.() },
     { id: "new-connection", group: "命令", label: "新建连接", icon: "plus", run: () => actions.showPage("connections") },
     { id: "open-sqlite", group: "命令", label: "打开 SQLite 文件", icon: "file", run: actions.requestSqlite },
     { id: "history", group: "命令", label: "查询历史", icon: "history", run: () => actions.showPage("history") },

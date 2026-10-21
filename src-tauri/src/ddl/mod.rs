@@ -7,6 +7,9 @@ mod model;
 mod plan;
 mod sql;
 
+pub(crate) use introspect::load;
+pub(crate) use model::{Action, Engine as DdlEngine, Request, Snapshot};
+
 pub fn module_id() -> &'static str {
     let _linked = (
         std::any::type_name_of_val(&commands::ddl_describe),

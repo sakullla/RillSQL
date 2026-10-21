@@ -1,4 +1,5 @@
 mod catalog;
+mod compare;
 mod connections;
 mod ddl;
 mod grid;
@@ -55,6 +56,9 @@ fn wire<R: tauri::Runtime>(builder: tauri::Builder<R>, state: connections::comma
         catalog::commands::catalog_refresh,
         catalog::commands::catalog_page,
         catalog::commands::catalog_definition,
+        compare::commands::compare_structure,
+        compare::commands::compare_data,
+        compare::commands::compare_cancel,
         grid::commands::grid_describe,
         grid::commands::grid_page,
         grid::commands::grid_count,
@@ -121,6 +125,7 @@ fn fixed_dependency_markers() -> usize {
         query::module_id(),
         grid::module_id(),
         ddl::module_id(),
+        compare::module_id(),
     ];
     markers.len()
 }
@@ -159,6 +164,7 @@ mod tests {
         assert_eq!(super::query::module_id(), "query");
         assert_eq!(super::grid::module_id(), "grid");
         assert_eq!(super::ddl::module_id(), "ddl");
+        assert_eq!(super::compare::module_id(), "compare");
         assert!(super::fixed_dependency_markers() >= 12);
         assert!(!super::local_data_dir().is_empty());
     }

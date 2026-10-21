@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { listPaletteTables, startCatalog } from "../catalog";
+import CompareDialog from "../compare/CompareDialog.vue";
+import { placeCompareScript, type ScriptTarget } from "../compare/place";
 import { objectIdentity, type CatalogObjectRef } from "../catalog/object-ref";
 import { isDefinitionKind, objectLabel } from "../catalog/tree";
 import { catalogConnections } from "../catalog/store";
@@ -124,6 +126,7 @@ function onHistoryOpen(plan: OpenPlan) {
 const settings = reactive<ShellSettings>(loadSettings());
 const dataDir = ref<string | null>(null);
 const sqlitePrompt = ref(0);
+const compareOpen = ref(false);
 
 const historySection = ref<"runs" | "saved">("runs");
 const saveRequest = ref(0);
@@ -205,6 +208,10 @@ const commands = computed<PaletteItem[]>(() => [
     showSavedQueries: () => {
       historySection.value = "saved";
       session.showPage("history");
+    },
+    openCompare: () => {
+      compareOpen.value = true;
+      session.showPage("workspace");
     },
     executeQuery: () => {
       const active = session.activeTab.value;
@@ -334,6 +341,11 @@ async function onJumpReference(sql: string, ref: string, target: TableTarget | n
       tab.targetNotice = `${typeof err === "string" ? err : err instanceof Error ? err.message : "自动执行失败"} SQL 草稿仍保留，可稍后再执行。`;
     }
   }
+}
+
+function onPlaceCompare(sql: string, target: ScriptTarget) {
+  placeCompareScript(session.openQueryDraft, sql, target);
+  compareOpen.value = false;
 }
 
 function onFocusedDatabase(connectionId: string, database: string) {
@@ -520,6 +532,7 @@ onBeforeUnmount(() => {
       @cancel="onStatusCancel"
     />
     <CommandPalette :open="session.paletteOpen.value" :mode="session.paletteMode.value" :items="commands" @close="session.closePalette()" @run="runCommand" />
+    <CompareDialog v-if="compareOpen" @close="compareOpen = false" @place="onPlaceCompare" />
     <ShortcutHelp :open="session.helpOpen.value" @close="session.closeHelp()" />
     <dialog v-if="closePrompt.open" ref="closeDialog" class="modal" aria-labelledby="close-guard-title" @cancel.prevent="chooseStay">
       <div class="modal-head">
