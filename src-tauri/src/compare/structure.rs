@@ -49,7 +49,7 @@ pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
             (Some(base), None) => {
                 only_baseline.push(item(base, "仅基准拥有"));
                 if allow_ddl && readable(base) && !blocked(baseline, target, Category::from_kind(base.kind)) {
-                    push_create(engine, target, base, &mut create_object, &mut create_index, baseline, target);
+                    push_create(engine, target, base, &mut create_object, &mut create_index, &mut create_fk, baseline, target);
                 } else if base.read_error.is_some() {
                     incomplete = true;
                     notes.push(format!("{} {} 没有读全：{}", base.kind.label(), base.name, base.read_error.as_deref().unwrap_or("")));
@@ -58,7 +58,8 @@ pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
             (None, Some(other)) => {
                 only_target.push(item(other, "仅对照拥有"));
                 if allow_ddl && readable(other) && !blocked(baseline, target, Category::from_kind(other.kind)) {
-                    push_drop(engine, target, other, &mut drop_object, &mut drop_index, &mut drop_fk);
+                    let drop_owned_fk = engine != Engine::Sqlite && !blocked(baseline, target, Category::ForeignKey);
+                    push_drop(engine, target, other, &mut drop_object, &mut drop_fk, drop_owned_fk);
                 } else if other.read_error.is_some() {
                     incomplete = true;
                     notes.push(format!("{} {} 没有读全：{}", other.kind.label(), other.name, other.read_error.as_deref().unwrap_or("")));
@@ -102,6 +103,7 @@ pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
         drop_fk.clear();
         create_fk.clear();
     }
+    let drop_object = arrange_drops(drop_object);
     let mut statements = Vec::new();
     statements.extend(drop_fk);
     statements.extend(drop_index);
@@ -192,13 +194,29 @@ fn blocked(baseline: &Side, target: &Side, category: Category) -> bool {
     baseline.category_errors.iter().chain(target.category_errors.iter()).any(|(item, _)| *item == category)
 }
 
-fn push_create(engine: Engine, target: &Side, object: &ObjectDef, objects: &mut Vec<String>, indexes: &mut Vec<String>, baseline: &Side, other: &Side) {
+fn push_create(
+    engine: Engine,
+    target: &Side,
+    object: &ObjectDef,
+    objects: &mut Vec<String>,
+    indexes: &mut Vec<String>,
+    foreign_keys: &mut Vec<String>,
+    baseline: &Side,
+    other: &Side,
+) {
     match object.kind {
         Kind::Table => {
             let Some(shape) = object.table.as_ref() else {
                 return;
             };
-            objects.push(create_table(engine, target, &object.name, shape, !blocked(baseline, other, Category::ForeignKey)));
+            // SQLite 不能事后加外键，只能写在 CREATE TABLE 里，而且允许被引用表尚未存在。
+            // PostgreSQL 与 MySQL 在 CREATE TABLE 里引用还没建的表会失败，所以外键一律留到全部建表之后。
+            let include_fk = !blocked(baseline, other, Category::ForeignKey);
+            let inline_fk = engine == Engine::Sqlite && include_fk;
+            objects.push(create_table(engine, target, &object.name, shape, inline_fk));
+            if include_fk && engine != Engine::Sqlite {
+                foreign_keys.extend(shape.foreign_keys.iter().map(|key| add_foreign_key(engine, target, &object.name, key)));
+            }
             if !blocked(baseline, other, Category::Index) {
                 indexes.extend(shape.indexes.iter().filter(|index| !skip_index(index, shape)).map(|index| create_index(engine, target, &object.name, index)));
             }
@@ -211,9 +229,18 @@ fn push_create(engine: Engine, target: &Side, object: &ObjectDef, objects: &mut 
     }
 }
 
-fn push_drop(engine: Engine, target: &Side, object: &ObjectDef, objects: &mut Vec<String>, indexes: &mut Vec<String>, foreign_keys: &mut Vec<String>) {
-    let _ = (indexes, foreign_keys);
-    objects.push(drop_object(engine, target, object));
+fn push_drop(engine: Engine, target: &Side, object: &ObjectDef, objects: &mut Vec<PlannedDrop>, foreign_keys: &mut Vec<String>, drop_owned_foreign_keys: bool) {
+    if drop_owned_foreign_keys && object.kind == Kind::Table {
+        if let Some(shape) = object.table.as_ref() {
+            for key in &shape.foreign_keys {
+                if key.name.trim().is_empty() {
+                    continue;
+                }
+                foreign_keys.push(drop_foreign_key(engine, target, &object.name, key));
+            }
+        }
+    }
+    objects.push(plan_drop(engine, target, object));
 }
 
 fn compare_pair(
@@ -230,7 +257,7 @@ fn compare_pair(
     index_creates: &mut Vec<String>,
     drop_fk: &mut Vec<String>,
     create_fk: &mut Vec<String>,
-    object_drops: &mut Vec<String>,
+    object_drops: &mut Vec<PlannedDrop>,
     create_object: &mut Vec<String>,
     notes: &mut Vec<String>,
     incomplete: &mut bool,
@@ -239,7 +266,7 @@ fn compare_pair(
         if base.definition != other.definition || base.materialized != other.materialized {
             changed.push(item(base, "定义文本不同"));
             if allow_ddl && !blocked(baseline, target_side, Category::from_kind(base.kind)) {
-                object_drops.push(drop_object(engine, target, other));
+                object_drops.push(plan_drop(engine, target, other));
                 if let Some(sql) = create_definition(engine, target, base) {
                     create_object.push(sql);
                 }
@@ -507,6 +534,168 @@ fn drop_foreign_key(engine: Engine, side: &Side, table: &str, key: &ForeignKeySh
         Engine::Mysql | Engine::Mariadb => format!("ALTER TABLE {} DROP FOREIGN KEY {}", qualify(engine, side, table), quote(engine, &key.name)),
         _ => format!("ALTER TABLE {} DROP CONSTRAINT {}", qualify(engine, side, table), quote(engine, &key.name)),
     }
+}
+
+struct PlannedDrop {
+    kind: Kind,
+    name: String,
+    statement: String,
+    definition: String,
+    /// 必须先于这些对象删除。表是外键指向的同范围表，视图是定义里点到的其他视图。
+    references: Vec<String>,
+}
+
+fn plan_drop(engine: Engine, side: &Side, object: &ObjectDef) -> PlannedDrop {
+    PlannedDrop {
+        kind: object.kind,
+        name: object.name.clone(),
+        statement: drop_object(engine, side, object),
+        definition: object.definition.clone(),
+        references: referenced_tables(engine, side, object),
+    }
+}
+
+fn referenced_tables(engine: Engine, side: &Side, object: &ObjectDef) -> Vec<String> {
+    let Some(shape) = object.table.as_ref() else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for key in &shape.foreign_keys {
+        if key.ref_table.is_empty() {
+            continue;
+        }
+        if engine == Engine::Postgres && !key.ref_schema.is_empty() && key.ref_schema != side.schema {
+            continue;
+        }
+        names.push(key.ref_table.clone());
+    }
+    names
+}
+
+/// 标识的字典序会先删表再删视图。依赖方在前：视图（含视图之间）、触发器，然后其余对象，最后按外键把引用表放在被引用表之前。
+fn arrange_drops(drops: Vec<PlannedDrop>) -> Vec<String> {
+    let mut views = Vec::new();
+    let mut triggers = Vec::new();
+    let mut earlier = Vec::new();
+    let mut tables = Vec::new();
+    for drop in drops {
+        match drop.kind {
+            Kind::View => views.push(drop),
+            Kind::Trigger => triggers.push(drop),
+            Kind::Table => tables.push(drop),
+            _ => earlier.push(drop),
+        }
+    }
+    let by_name = |left: &PlannedDrop, right: &PlannedDrop| left.name.cmp(&right.name).then(left.statement.cmp(&right.statement));
+    attach_view_dependencies(&mut views);
+    triggers.sort_by(by_name);
+    earlier.sort_by(|left, right| kind_listing_rank(left.kind).cmp(&kind_listing_rank(right.kind)).then(by_name(left, right)));
+    order_dependents_first(views)
+        .into_iter()
+        .chain(triggers)
+        .chain(earlier)
+        .chain(order_dependents_first(tables))
+        .map(|drop| drop.statement)
+        .collect()
+}
+
+fn attach_view_dependencies(views: &mut [PlannedDrop]) {
+    let names = views.iter().map(|view| view.name.clone()).collect::<std::collections::BTreeSet<_>>();
+    for view in views {
+        view.references = names.iter().filter(|name| *name != &view.name && mentions_ident(&view.definition, name)).cloned().collect();
+    }
+}
+
+fn mentions_ident(sql: &str, name: &str) -> bool {
+    if name.is_empty() || sql.is_empty() {
+        return false;
+    }
+    let haystack = sql.to_ascii_lowercase();
+    let needle = name.to_ascii_lowercase();
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(found) = haystack[from..].find(&needle) {
+        let start = from + found;
+        let end = start + needle.len();
+        let before = start == 0 || !is_ident_byte(bytes[start - 1]);
+        let after = end >= bytes.len() || !is_ident_byte(bytes[end]);
+        if before && after {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80
+}
+
+fn kind_listing_rank(kind: Kind) -> u8 {
+    match kind {
+        Kind::Domain => 0,
+        Kind::Enum => 1,
+        Kind::Function => 2,
+        Kind::Procedure => 3,
+        Kind::Sequence => 4,
+        Kind::Table => 5,
+        Kind::Trigger => 6,
+        Kind::View => 7,
+    }
+}
+
+/// 入度是被同批对象引用的次数。先删没有入边的对象，也就是先删依赖方。成环的留在后面；表之间的环靠已经发出的 DROP CONSTRAINT 解开。
+fn order_dependents_first(tables: Vec<PlannedDrop>) -> Vec<PlannedDrop> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut by_name: BTreeMap<String, Vec<PlannedDrop>> = BTreeMap::new();
+    for table in tables {
+        by_name.entry(table.name.clone()).or_default().push(table);
+    }
+    let mut outgoing: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut indegree: BTreeMap<String, usize> = BTreeMap::new();
+    for name in by_name.keys() {
+        outgoing.insert(name.clone(), BTreeSet::new());
+        indegree.insert(name.clone(), 0);
+    }
+    for group in by_name.values() {
+        for table in group {
+            for referenced in &table.references {
+                if referenced == &table.name || !by_name.contains_key(referenced) {
+                    continue;
+                }
+                if outgoing.get_mut(&table.name).expect("table").insert(referenced.clone()) {
+                    *indegree.get_mut(referenced).expect("referenced") += 1;
+                }
+            }
+        }
+    }
+    let mut ready: BTreeSet<String> = indegree.iter().filter(|(_, degree)| **degree == 0).map(|(name, _)| name.clone()).collect();
+    let mut ordered = Vec::new();
+    while let Some(name) = ready.iter().next().cloned() {
+        ready.remove(&name);
+        ordered.push(name.clone());
+        for parent in outgoing.get(&name).into_iter().flatten() {
+            let degree = indegree.get_mut(parent).expect("parent");
+            *degree -= 1;
+            if *degree == 0 {
+                ready.insert(parent.clone());
+            }
+        }
+    }
+    let mut cyclic = indegree
+        .iter()
+        .filter(|(name, degree)| **degree > 0 && !ordered.iter().any(|item| item == *name))
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    cyclic.sort();
+    ordered.extend(cyclic);
+    let mut result = Vec::new();
+    for name in ordered {
+        if let Some(group) = by_name.remove(&name) {
+            result.extend(group);
+        }
+    }
+    result
 }
 
 fn drop_object(engine: Engine, side: &Side, object: &ObjectDef) -> String {

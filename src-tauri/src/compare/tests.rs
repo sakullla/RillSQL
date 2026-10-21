@@ -96,6 +96,118 @@ fn different_engines_do_not_generate_a_script() {
     assert!(report.only_baseline.is_empty());
 }
 
+fn foreign_key(name: &str, column: &str, ref_table: &str) -> ForeignKeyShape {
+    ForeignKeyShape {
+        name: name.to_owned(),
+        columns: vec![column.to_owned()],
+        ref_schema: String::new(),
+        ref_table: ref_table.to_owned(),
+        ref_columns: vec!["id".to_owned()],
+        on_delete: String::new(),
+        on_update: String::new(),
+    }
+}
+
+fn table_with_fk(name: &str, key: ForeignKeyShape) -> ObjectDef {
+    let mut object = ObjectDef::table(name, shape(vec![column("id", "integer", false, true), column(&key.columns[0], "integer", true, false)], vec![]));
+    object.table.as_mut().unwrap().foreign_keys.push(key);
+    object
+}
+
+fn at(script: &str, needle: &str) -> usize {
+    script.find(needle).unwrap_or_else(|| panic!("missing {needle} in {script}"))
+}
+
+#[test]
+fn drops_views_and_referencing_tables_before_referenced_tables() {
+    let notes = ObjectDef::table("notes", shape(vec![column("id", "integer", false, true)], vec![]));
+    let tickets = table_with_fk("tickets", foreign_key("tickets_note", "note_id", "notes"));
+    let view = ObjectDef::defined(Kind::View, "v_notes", "CREATE VIEW v_notes AS SELECT id FROM notes");
+    let cases = [
+        ("postgres", "app", "public", "DROP VIEW \"public\".\"v_notes\"", "DROP TABLE \"public\".\"tickets\"", "DROP TABLE \"public\".\"notes\"", "DROP CONSTRAINT \"tickets_note\""),
+        ("mysql", "app", "", "DROP VIEW `app`.`v_notes`", "DROP TABLE `app`.`tickets`", "DROP TABLE `app`.`notes`", "DROP FOREIGN KEY `tickets_note`"),
+        ("sqlite", "main", "", "DROP VIEW \"v_notes\"", "DROP TABLE \"tickets\"", "DROP TABLE \"notes\"", ""),
+    ];
+    for (engine, database, schema, drop_view, drop_child, drop_parent, drop_fk) in cases {
+        let report = diff_structure(
+            &Side::ready(engine, database, schema, vec![]),
+            &Side::ready(engine, database, schema, vec![notes.clone(), tickets.clone(), view.clone()]),
+        );
+        let script = &report.script;
+        assert!(at(script, drop_view) < at(script, drop_parent), "{engine}\n{script}");
+        assert!(at(script, drop_child) < at(script, drop_parent), "{engine}\n{script}");
+        if drop_fk.is_empty() {
+            assert!(!script.to_ascii_uppercase().contains("DROP CONSTRAINT"), "{script}");
+        } else {
+            assert!(at(script, drop_fk) < at(script, drop_parent), "{engine}\n{script}");
+            assert!(at(script, drop_fk) < at(script, drop_child), "{engine}\n{script}");
+        }
+    }
+}
+
+#[test]
+fn drops_a_view_before_the_view_it_selects() {
+    let base = ObjectDef::defined(Kind::View, "v_base", "CREATE VIEW v_base AS SELECT 1");
+    let top = ObjectDef::defined(Kind::View, "v_top", "CREATE VIEW v_top AS SELECT * FROM v_base");
+    let report = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![base, top]));
+    assert!(at(&report.script, "DROP VIEW \"public\".\"v_top\"") < at(&report.script, "DROP VIEW \"public\".\"v_base\""), "{}", report.script);
+}
+
+#[test]
+fn creates_foreign_keys_after_every_new_table() {
+    let users = ObjectDef::table("users", shape(vec![column("id", "integer", false, true)], vec![]));
+    let orders = table_with_fk("orders", foreign_key("orders_user", "user_id", "users"));
+    let cases = [
+        ("postgres", "public", "CREATE TABLE \"public\".\"orders\"", "CREATE TABLE \"public\".\"users\""),
+        ("mysql", "", "CREATE TABLE `app`.`orders`", "CREATE TABLE `app`.`users`"),
+        ("mariadb", "", "CREATE TABLE `app`.`orders`", "CREATE TABLE `app`.`users`"),
+    ];
+    for (engine, schema, create_orders, create_users) in cases {
+        let report = diff_structure(
+            &Side::ready(engine, "app", schema, vec![users.clone(), orders.clone()]),
+            &Side::ready(engine, "app", schema, vec![]),
+        );
+        let script = &report.script;
+        let orders_at = at(script, create_orders);
+        let body_end = orders_at + script[orders_at..].find(';').unwrap_or_else(|| panic!("{engine} {script}"));
+        assert!(!script[orders_at..=body_end].contains("FOREIGN KEY"), "{engine}\n{script}");
+        let fk_at = at(script, "FOREIGN KEY");
+        assert!(orders_at < fk_at && at(script, create_users) < fk_at, "{engine}\n{script}");
+        assert!(script.contains("ALTER TABLE"), "{engine}\n{script}");
+    }
+}
+
+#[test]
+fn sqlite_new_table_keeps_the_foreign_key_inside_create_table() {
+    let orders = table_with_fk("orders", foreign_key("orders_user", "user_id", "users"));
+    let report = diff_structure(&Side::ready("sqlite", "main", "", vec![orders]), &Side::ready("sqlite", "main", "", vec![]));
+    let script = &report.script;
+    let create_at = at(script, "CREATE TABLE \"orders\"");
+    let body_end = create_at + script[create_at..].find(';').expect("statement");
+    assert!(script[create_at..=body_end].contains("FOREIGN KEY"), "{script}");
+    assert!(!script.to_ascii_uppercase().contains("ALTER TABLE"), "{script}");
+}
+
+#[test]
+fn cyclic_foreign_keys_are_not_inlined_and_drop_before_either_table() {
+    let users = table_with_fk("users", foreign_key("users_order", "order_id", "orders"));
+    let orders = table_with_fk("orders", foreign_key("orders_user", "user_id", "users"));
+    let created = diff_structure(&Side::ready("postgres", "app", "public", vec![users.clone(), orders.clone()]), &Side::ready("postgres", "app", "public", vec![]));
+    let script = &created.script;
+    for marker in ["CREATE TABLE \"public\".\"orders\"", "CREATE TABLE \"public\".\"users\""] {
+        let start = at(script, marker);
+        let end = start + script[start..].find(';').expect("statement");
+        assert!(!script[start..=end].contains("FOREIGN KEY"), "{script}");
+        assert!(start < at(script, "CONSTRAINT \"orders_user\""), "{script}");
+        assert!(start < at(script, "CONSTRAINT \"users_order\""), "{script}");
+    }
+    let dropped = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![users, orders]));
+    let script = &dropped.script;
+    let first_drop = at(script, "DROP TABLE");
+    assert!(at(script, "DROP CONSTRAINT \"orders_user\"") < first_drop, "{script}");
+    assert!(at(script, "DROP CONSTRAINT \"users_order\"") < first_drop, "{script}");
+}
+
 #[test]
 fn index_read_failure_omits_index_statements_but_keeps_table_diffs() {
     let mut baseline = Side::ready(
