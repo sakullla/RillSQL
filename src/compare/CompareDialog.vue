@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from "vue";
+import { computed, reactive, ref, watch, type Ref } from "vue";
 import "../structure/structure.css";
 import { catalogConnections } from "../catalog/store";
 import type { CatalogConnection } from "../catalog/types";
-import { compareCancel, compareData, compareStructure } from "./api";
+import { compareCancel, compareData, compareSchemas, compareStructure } from "./api";
 import type { ScriptTarget } from "./place";
 import type { CompareSide, DataReport, StructureReport } from "./types";
 
@@ -22,6 +22,9 @@ const structure = ref<StructureReport | null>(null);
 const dataReport = ref<DataReport | null>(null);
 const selected = reactive<Record<string, boolean>>({});
 const chosenKey = reactive<Record<string, string>>({});
+const loadedSchemas = reactive<Record<string, string[]>>({});
+const schemaState = reactive<Record<string, "loading" | "manual" | "ready">>({});
+const schemaNote = reactive<Record<string, string>>({});
 
 const connections = computed(() => catalogConnections().filter((item) => item.status === "connected"));
 
@@ -35,8 +38,64 @@ function databasesOf(id: string): string[] {
 
 function schemasOf(id: string, database: string): string[] {
   const node = connection(id)?.databases.find((item) => item.name === database);
-  return node?.schemas.map((item) => item.name) ?? [];
+  return node?.schemas.map((item) => item.name).filter((name) => name.trim()) ?? [];
 }
+
+function schemaKey(id: string, database: string): string {
+  return `${id}\u0000${database}`;
+}
+
+function schemaChoices(id: string, database: string): string[] {
+  const catalogNames = schemasOf(id, database);
+  if (catalogNames.length) return catalogNames;
+  return loadedSchemas[schemaKey(id, database)] ?? [];
+}
+
+function schemaEntry(id: string, database: string): "choices" | "manual" | "loading" | "none" {
+  const known = connection(id);
+  if (!known || known.engine !== "postgres" || !database.trim()) return "none";
+  if (schemaChoices(id, database).length) return "choices";
+  if (schemaState[schemaKey(id, database)] === "manual") return "manual";
+  return "loading";
+}
+
+function schemaHint(id: string, database: string): string {
+  if (schemaEntry(id, database) !== "manual") return "";
+  const note = schemaNote[schemaKey(id, database)];
+  if (note) return `${note} 仍可填写已有 schema，不会改连当前会话。`;
+  return "目录里没有这个库的 schema，填写已有名称。不会改连当前会话。";
+}
+
+async function ensureSchemas(id: string, database: string, schema: Ref<string>) {
+  const known = connection(id);
+  const key = schemaKey(id, database);
+  if (!known || known.engine !== "postgres" || !database.trim() || schemasOf(id, database).length || schemaState[key]) return;
+  schemaState[key] = "loading";
+  const still = () => (schema === baselineSchema ? baselineId.value === id && baselineDatabase.value === database : targetId.value === id && targetDatabase.value === database);
+  try {
+    const names = (await compareSchemas(id, database.trim())).map((name) => name.trim()).filter(Boolean);
+    if (schemaState[key] !== "loading") return;
+    loadedSchemas[key] = names;
+    schemaState[key] = names.length ? "ready" : "manual";
+    if (still() && names.length && schema.value && !names.includes(schema.value)) schema.value = "";
+  } catch (err) {
+    if (schemaState[key] !== "loading") return;
+    schemaState[key] = "manual";
+    schemaNote[key] = err instanceof Error ? err.message : String(err);
+  }
+}
+
+watch([baselineId, baselineDatabase], () => {
+  const names = schemasOf(baselineId.value, baselineDatabase.value);
+  if (names.length && baselineSchema.value && !names.includes(baselineSchema.value)) baselineSchema.value = "";
+  void ensureSchemas(baselineId.value, baselineDatabase.value, baselineSchema);
+});
+
+watch([targetId, targetDatabase], () => {
+  const names = schemasOf(targetId.value, targetDatabase.value);
+  if (names.length && targetSchema.value && !names.includes(targetSchema.value)) targetSchema.value = "";
+  void ensureSchemas(targetId.value, targetDatabase.value, targetSchema);
+});
 
 function side(id: string, database: string, schema: string): CompareSide | null {
   const known = connection(id);
@@ -71,6 +130,7 @@ async function runStructure() {
   structure.value = null;
   dataReport.value = null;
   errorText.value = "";
+  resetSelection();
   if (!left || !right) {
     errorText.value = "请选择已打开的基准和对照。";
     return;
@@ -107,9 +167,9 @@ async function runData() {
     dataReport.value = { refused, script: "", incomplete: false, notes: [], diffs: [] };
     return;
   }
-  const tables = Object.entries(selected)
-    .filter(([, on]) => on)
-    .map(([name]) => ({ name, key: chosenKey[name] || null }));
+  const tables = (structure.value?.tables ?? [])
+    .filter((table) => table.onBoth && selected[table.name])
+    .map((table) => ({ name: table.name, key: chosenKey[table.name] || null }));
   if (tables.length === 0) {
     dataReport.value = { refused: "没有选择要对比的表，不生成脚本。", script: "", incomplete: false, notes: [], diffs: [] };
     return;
@@ -124,6 +184,11 @@ async function runData() {
   } finally {
     busy.value = false;
   }
+}
+
+function resetSelection() {
+  for (const name of Object.keys(selected)) delete selected[name];
+  for (const name of Object.keys(chosenKey)) delete chosenKey[name];
 }
 
 function cancelRun() {
@@ -151,13 +216,25 @@ function place(sql: string) {
             <legend>基准</legend>
             <label>连接<select v-model="baselineId" data-side="baseline" data-field="connection"><option value="">选择连接</option><option v-for="item in connections" :key="item.id" :value="item.id">{{ item.name }} · {{ item.engine }}</option></select></label>
             <label v-if="connection(baselineId)?.engine !== 'sqlite'">数据库<select v-model="baselineDatabase" data-side="baseline" data-field="database"><option value="">选择数据库</option><option v-for="name in databasesOf(baselineId)" :key="name" :value="name">{{ name }}</option></select></label>
-            <label v-if="connection(baselineId)?.engine === 'postgres'">schema<select v-model="baselineSchema" data-side="baseline" data-field="schema"><option value="">选择 schema</option><option v-for="name in schemasOf(baselineId, baselineDatabase)" :key="name" :value="name">{{ name }}</option></select></label>
+            <label v-if="connection(baselineId)?.engine === 'postgres'">schema
+              <select v-if="schemaEntry(baselineId, baselineDatabase) === 'choices'" v-model="baselineSchema" data-side="baseline" data-field="schema"><option value="">选择 schema</option><option v-for="name in schemaChoices(baselineId, baselineDatabase)" :key="name" :value="name">{{ name }}</option></select>
+              <input v-else-if="schemaEntry(baselineId, baselineDatabase) === 'manual'" v-model="baselineSchema" type="text" data-side="baseline" data-field="schema" placeholder="填写已有 schema" autocomplete="off" />
+              <span v-else-if="schemaEntry(baselineId, baselineDatabase) === 'loading'" class="muted" data-side="baseline" data-field="schema" data-schema-state="loading">正在读取 schema</span>
+              <select v-else v-model="baselineSchema" data-side="baseline" data-field="schema"><option value="">选择 schema</option></select>
+            </label>
+            <p v-if="schemaHint(baselineId, baselineDatabase)" class="muted" data-side="baseline" data-schema-hint>{{ schemaHint(baselineId, baselineDatabase) }}</p>
           </fieldset>
           <fieldset>
             <legend>对照</legend>
             <label>连接<select v-model="targetId" data-side="target" data-field="connection"><option value="">选择连接</option><option v-for="item in connections" :key="item.id" :value="item.id">{{ item.name }} · {{ item.engine }}</option></select></label>
             <label v-if="connection(targetId)?.engine !== 'sqlite'">数据库<select v-model="targetDatabase" data-side="target" data-field="database"><option value="">选择数据库</option><option v-for="name in databasesOf(targetId)" :key="name" :value="name">{{ name }}</option></select></label>
-            <label v-if="connection(targetId)?.engine === 'postgres'">schema<select v-model="targetSchema" data-side="target" data-field="schema"><option value="">选择 schema</option><option v-for="name in schemasOf(targetId, targetDatabase)" :key="name" :value="name">{{ name }}</option></select></label>
+            <label v-if="connection(targetId)?.engine === 'postgres'">schema
+              <select v-if="schemaEntry(targetId, targetDatabase) === 'choices'" v-model="targetSchema" data-side="target" data-field="schema"><option value="">选择 schema</option><option v-for="name in schemaChoices(targetId, targetDatabase)" :key="name" :value="name">{{ name }}</option></select>
+              <input v-else-if="schemaEntry(targetId, targetDatabase) === 'manual'" v-model="targetSchema" type="text" data-side="target" data-field="schema" placeholder="填写已有 schema" autocomplete="off" />
+              <span v-else-if="schemaEntry(targetId, targetDatabase) === 'loading'" class="muted" data-side="target" data-field="schema" data-schema-state="loading">正在读取 schema</span>
+              <select v-else v-model="targetSchema" data-side="target" data-field="schema"><option value="">选择 schema</option></select>
+            </label>
+            <p v-if="schemaHint(targetId, targetDatabase)" class="muted" data-side="target" data-schema-hint>{{ schemaHint(targetId, targetDatabase) }}</p>
           </fieldset>
         </div>
         <div class="compare-actions">
@@ -213,6 +290,7 @@ function place(sql: string) {
 .compare-sides { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-3); }
 .compare-sides fieldset { border: 1px solid var(--line); border-radius: var(--r-md); padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); }
 .compare-sides label, .compare-table, .compare-script { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-sm); }
+.compare-sides input, .compare-sides select { width: 100%; box-sizing: border-box; }
 .compare-script textarea { min-height: 140px; font-family: var(--font-mono, ui-monospace, monospace); }
 .compare-list { margin: 0; padding-left: 1.2em; }
 .compare-data { flex-wrap: wrap; align-items: flex-start; }

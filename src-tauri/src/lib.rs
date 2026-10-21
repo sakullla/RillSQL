@@ -59,6 +59,7 @@ fn wire<R: tauri::Runtime>(builder: tauri::Builder<R>, state: connections::comma
         compare::commands::compare_structure,
         compare::commands::compare_data,
         compare::commands::compare_cancel,
+        compare::commands::compare_schemas,
         grid::commands::grid_describe,
         grid::commands::grid_page,
         grid::commands::grid_count,

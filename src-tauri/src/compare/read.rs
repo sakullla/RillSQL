@@ -648,4 +648,51 @@ async fn ensure_scope(session: &CatalogSession, engine: &str, database: &str, sc
     }
 }
 
+/// 列出所选 PostgreSQL 库的 schema。另一个库走临时会话，不改连、不写配置。
+pub async fn list_schemas(service: &Service, connection_id: &str, database: &str) -> Result<Vec<String>, String> {
+    let database = database.trim();
+    if database.is_empty() {
+        return Err("需要数据库名".to_owned());
+    }
+    let Some(existing) = service.catalog_session(connection_id) else {
+        return Err("这一侧还没有打开".to_owned());
+    };
+    if !session_matches(&existing, "postgres") {
+        return Err("只有 PostgreSQL 需要选择 schema".to_owned());
+    }
+    let request = SideRequest {
+        connection_id: connection_id.to_owned(),
+        database: database.to_owned(),
+        schema: String::new(),
+        engine: "postgres".to_owned(),
+    };
+    let held = hold_session(service, &existing, &request, database).await?;
+    let CatalogSession::Postgres(client) = &held.session else {
+        return Err("会话类型和目标引擎不一致".to_owned());
+    };
+    let sql = crate::catalog::metadata_sql(CatalogEngine::Postgres)
+        .schemas
+        .ok_or_else(|| "PostgreSQL 缺少 schema 查询".to_owned())?;
+    let rows = client.query(sql, &[]).await.map_err(|err| err.to_string())?;
+    let mut names = Vec::new();
+    for row in &rows {
+        let name = schema_name(row)?;
+        if !name.is_empty() {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+fn schema_name(row: &tokio_postgres::Row) -> Result<String, String> {
+    if let Ok(value) = row.try_get::<_, String>(0) {
+        return Ok(value);
+    }
+    match row.try_get::<_, Option<String>>(0) {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => Err("schema 名是空值".to_owned()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
 

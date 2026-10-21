@@ -26,6 +26,7 @@
     "allow-compare-structure",
     "allow-compare-data",
     "allow-compare-cancel",
+    "allow-compare-schemas",
     "allow-ddl-describe",
     "allow-ddl-preview",
     "allow-ddl-execute",

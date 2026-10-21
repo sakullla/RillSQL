@@ -23,3 +23,7 @@ export function compareData(request: StructureRequest & { tables: DataTableReque
 export function compareCancel(id: string): Promise<void> {
   return invoke("compare_cancel", { id });
 }
+
+export function compareSchemas(connectionId: string, database: string): Promise<string[]> {
+  return invoke<string[]>("compare_schemas", { request: { connectionId, database } });
+}

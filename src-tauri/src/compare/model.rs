@@ -349,6 +349,13 @@ pub struct DataRequest {
     pub tables: Vec<DataTableRequest>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaListRequest {
+    pub connection_id: String,
+    pub database: String,
+}
+
 /// PostgreSQL 只有在要读的库不是当前会话库时才另开会话。
 pub fn needs_ephemeral_postgres(engine: &str, current_database: &str, requested: &str) -> bool {
     engine == "postgres" && !requested.is_empty() && current_database != requested

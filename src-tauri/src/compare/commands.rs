@@ -1,7 +1,7 @@
 use crate::connections::commands::ConnectionsState;
 
-use super::model::{DataReport, DataRequest, StructureReport, StructureRequest};
-use super::read::{self, read_data, read_structure};
+use super::model::{DataReport, DataRequest, SchemaListRequest, StructureReport, StructureRequest};
+use super::read::{self, list_schemas, read_data, read_structure};
 
 #[tauri::command]
 pub async fn compare_structure(state: tauri::State<'_, ConnectionsState>, request: StructureRequest) -> Result<StructureReport, String> {
@@ -16,4 +16,9 @@ pub async fn compare_data(state: tauri::State<'_, ConnectionsState>, request: Da
 #[tauri::command]
 pub fn compare_cancel(id: String) {
     read::request_cancel(&id);
+}
+
+#[tauri::command]
+pub async fn compare_schemas(state: tauri::State<'_, ConnectionsState>, request: SchemaListRequest) -> Result<Vec<String>, String> {
+    list_schemas(&state.service, &request.connection_id, &request.database).await
 }

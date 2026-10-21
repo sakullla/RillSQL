@@ -197,3 +197,8 @@ commands.allow = ["compare_data"]
 identifier = "allow-compare-cancel"
 description = "允许停止尚未完成的对比读取。"
 commands.allow = ["compare_cancel"]
+
+[[permission]]
+identifier = "allow-compare-schemas"
+description = "允许列出所选 PostgreSQL 库的 schema，不改连当前会话。"
+commands.allow = ["compare_schemas"]

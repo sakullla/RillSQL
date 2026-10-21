@@ -219,6 +219,12 @@
           "markdownDescription": "允许按键读取选定表并生成不执行的数据差异脚本。"
         },
         {
+          "description": "允许列出所选 PostgreSQL 库的 schema，不改连当前会话。",
+          "type": "string",
+          "const": "allow-compare-schemas",
+          "markdownDescription": "允许列出所选 PostgreSQL 库的 schema，不改连当前会话。"
+        },
+        {
           "description": "允许读取两侧结构并生成不执行的差异脚本。",
           "type": "string",
           "const": "allow-compare-structure",

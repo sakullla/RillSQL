@@ -555,7 +555,7 @@ fn compare_commands_are_registered_and_do_not_focus_or_execute() {
     let registration = fs::read_to_string(root.join("src/lib.rs")).unwrap();
     let wire = registration.split("fn wire").nth(1).unwrap_or("");
     let wire = wire.split("pub fn run").next().unwrap_or("");
-    for command in ["compare_structure", "compare_data", "compare_cancel"] {
+    for command in ["compare_structure", "compare_data", "compare_cancel", "compare_schemas"] {
         let allow = format!("allow-{}", command.replace('_', "-"));
         assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
         assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
@@ -563,6 +563,10 @@ fn compare_commands_are_registered_and_do_not_focus_or_execute() {
     }
     let reader = include_str!("read.rs");
     let commands = include_str!("commands.rs");
+    let schemas = reader.split("pub async fn list_schemas").nth(1).unwrap();
+    assert!(schemas.contains("hold_session"));
+    assert!(schemas.contains("metadata_sql"));
+    assert!(!schemas.contains("focus_database"));
     assert!(!reader.contains("focus_database"));
     assert!(!commands.contains("focus_database"));
     assert!(!commands.contains("query_start"));
@@ -595,6 +599,31 @@ async fn ephemeral_open_keeps_the_current_session_and_saved_config() {
         Err(error) => error,
         Ok(_) => panic!("SQLite 不应打开临时读取会话"),
     };
+    assert!(error.contains("只有 PostgreSQL"));
+    assert!(service.catalog_session("notes").is_some());
+    let after = service.list().await.unwrap();
+    assert_eq!(before[0].saved.database, after[0].saved.database);
+    assert_eq!(before[0].saved.file_path, after[0].saved.file_path);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn schema_list_rejects_a_closed_or_non_postgres_session_without_focusing() {
+    let dir = std::env::temp_dir().join(format!("rillsql-compare-schemas-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("notes.sqlite");
+    let setup = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+        .await
+        .unwrap();
+    setup.close().await;
+    let service = crate::connections::Service::new_for_test(dir.join("connections.sqlite"));
+    let missing = super::read::list_schemas(&service, "pg", "other").await.unwrap_err();
+    assert!(missing.contains("还没有打开"));
+    service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+    let before = service.list().await.unwrap();
+    let error = super::read::list_schemas(&service, "notes", "other").await.unwrap_err();
     assert!(error.contains("只有 PostgreSQL"));
     assert!(service.catalog_session("notes").is_some());
     let after = service.list().await.unwrap();

@@ -14,6 +14,7 @@ pub fn module_id() -> &'static str {
         std::any::type_name_of_val(&commands::compare_structure),
         std::any::type_name_of_val(&commands::compare_data),
         std::any::type_name_of_val(&commands::compare_cancel),
+        std::any::type_name_of_val(&commands::compare_schemas),
         std::any::type_name_of_val(&diff_structure),
         std::any::type_name_of_val(&diff_data),
     );
