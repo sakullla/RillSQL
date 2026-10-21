@@ -257,11 +257,6 @@ export function runRemoteExport(options: RemoteExportOptions): { task: ExportTas
   });
   taskSeq += 1;
   exportTasks.unshift(task);
-  if ((options.format ?? "csv") === "xlsx") {
-    task.status = "blocked";
-    task.message = "没有生成文件：xlsx 只写出已经读取的行，完整重新导出不会生成文件。";
-    return { task, done: Promise.resolve(task) };
-  }
   const done = gridExport({
     id: task.id,
     mode: options.mode,

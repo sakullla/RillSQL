@@ -17,7 +17,7 @@ import { renderJson } from "./json";
 import { renderMarkdown } from "./markdown";
 import { planExport } from "./plan";
 import TaskCenter from "./TaskCenter.vue";
-import { exportTasks, resetExportTasks } from "./tasks";
+import { exportTasks, resetExportTasks, runRemoteExport } from "./tasks";
 import { startExport } from "./write";
 import { parseImportXlsx } from "./xlsx";
 
@@ -663,5 +663,112 @@ describe("xlsx export", () => {
     await flushPromises();
     expect(wrapper.emitted("start")).toBeUndefined();
     wrapper.unmount();
+  });
+
+  it("lets a single select and a filtered table use the full xlsx range", async () => {
+    const selectDialog = mount(ExportDialog, {
+      props: {
+        open: true,
+        origin: "query",
+        statement: "SELECT id, note FROM customers",
+        truncated: true,
+        fileStem: "customers",
+        loadedCount: 2,
+        pending: 0,
+        columns,
+        previewRows: [{ id: "1", note: null }, { id: "2", note: "甲" }],
+      },
+    });
+    await selectDialog.get("input[value='xlsx']").setValue();
+    await selectDialog.get("input[value='full']").setValue();
+    expect(selectDialog.text()).not.toContain("完整重新导出不会生成文件");
+    expect(selectDialog.text()).toContain("会重新执行这条 SELECT");
+    expect(selectDialog.get(".btn.primary").attributes("disabled")).toBeDefined();
+    await selectDialog.get("input[type='checkbox']").setValue(true);
+    expect(selectDialog.get(".btn.primary").attributes("disabled")).toBeUndefined();
+    selectDialog.unmount();
+
+    const tableDialog = mount(ExportDialog, {
+      props: {
+        open: true,
+        origin: "table",
+        truncated: true,
+        fileStem: "customers",
+        loadedCount: 2,
+        pending: 0,
+        columns,
+        previewRows: [{ id: "1", note: null }],
+      },
+    });
+    await tableDialog.get("input[value='xlsx']").setValue();
+    await tableDialog.get("input[value='full']").setValue();
+    expect(tableDialog.text()).not.toContain("完整重新导出不会生成文件");
+    expect(tableDialog.text()).toContain("按当前筛选条件");
+    expect(tableDialog.get(".btn.primary").attributes("disabled")).toBeUndefined();
+    tableDialog.unmount();
+  });
+
+  it("asks the open connection to write a full xlsx instead of refusing first", async () => {
+    invoke.mockReset();
+    invoke.mockImplementation(async (command: string, args: { request?: { path?: string } }) => {
+      if (command !== "grid_export") throw new Error(command);
+      return {
+        status: "done",
+        success: true,
+        writtenRows: 2,
+        path: args.request?.path ?? "",
+        residualPath: null,
+        message: "已导出 2 行。",
+        partial: false,
+      };
+    });
+    const queryPlan = planExport({ origin: "query", scope: "full", statement: "SELECT id, note FROM customers", truncated: true, fileName: "q.xlsx" });
+    const query = runRemoteExport({
+      plan: queryPlan,
+      acknowledged: true,
+      path: "q.xlsx",
+      csv,
+      mode: "query",
+      connectionId: "shop",
+      database: "app",
+      schema: "public",
+      table: "customers",
+      engine: "postgres",
+      filters: [],
+      sort: null,
+      limit: 0,
+      truncated: true,
+      statement: "SELECT id, note FROM customers",
+      format: "xlsx",
+    });
+    const queryTask = await query.done;
+    expect(queryTask.status).toBe("done");
+    expect(queryTask.message).not.toContain("不会生成文件");
+    const tablePlan = planExport({ origin: "table", scope: "full", truncated: true, fileName: "customers.xlsx" });
+    const table = runRemoteExport({
+      plan: tablePlan,
+      acknowledged: true,
+      path: "customers.xlsx",
+      csv,
+      mode: "table-full",
+      connectionId: "shop",
+      database: "app",
+      schema: "public",
+      table: "customers",
+      engine: "postgres",
+      filters: [],
+      sort: null,
+      limit: 0,
+      truncated: true,
+      statement: "",
+      format: "xlsx",
+    });
+    const tableTask = await table.done;
+    expect(tableTask.status).toBe("done");
+    expect(invoke.mock.calls.map((call) => call[1]?.request)).toEqual([
+      expect.objectContaining({ format: "xlsx", mode: "query", statement: "SELECT id, note FROM customers" }),
+      expect.objectContaining({ format: "xlsx", mode: "table-full", table: "customers" }),
+    ]);
+    invoke.mockReset();
   });
 });

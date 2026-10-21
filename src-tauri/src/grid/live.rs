@@ -369,6 +369,7 @@ fn export_format(spec: &ExportSpec) -> Result<&'static str, ExportOutcome> {
                 Ok("insert")
             }
         }
+        "xlsx" => Ok("xlsx"),
         other => Err(blocked(format!("未知导出格式 {other}"))),
     }
 }
@@ -606,6 +607,7 @@ struct CsvFile {
     marked_partial: bool,
     started: bool,
     written: u64,
+    xlsx_rows: Vec<Vec<Option<String>>>,
 }
 
 impl CsvFile {
@@ -637,6 +639,7 @@ impl CsvFile {
             marked_partial: partial,
             started: false,
             written: 0,
+            xlsx_rows: Vec::new(),
         })
     }
 
@@ -661,6 +664,11 @@ impl CsvFile {
     }
 
     fn write_cells(&mut self, cells: &[Cell]) -> Option<ExportOutcome> {
+        if self.format == "xlsx" {
+            self.xlsx_rows.push(cells.iter().map(xlsx_value).collect());
+            self.written += 1;
+            return None;
+        }
         if self.format == "json" {
             return self.write_json(cells);
         }
@@ -755,6 +763,11 @@ impl CsvFile {
                 return residual(self.written, &self.partial_path, &err.to_string());
             }
         }
+        if self.format == "xlsx" {
+            if let Err(err) = self.write_xlsx_package() {
+                return residual(self.written, &self.partial_path, &err.to_string());
+            }
+        }
         let flush = self.file.as_mut().map(|file| file.flush()).transpose();
         self.file.take();
         if let Err(err) = flush {
@@ -784,8 +797,23 @@ impl CsvFile {
     }
 
     fn fail(&mut self, message: &str) -> ExportOutcome {
+        if self.format == "xlsx" && self.written > 0 {
+            if let Err(err) = self.write_xlsx_package() {
+                let message = format!("{message}；{err}");
+                self.file.take();
+                return residual(self.written, &self.partial_path, &message);
+            }
+        }
         self.file.take();
         residual(self.written, &self.partial_path, message)
+    }
+
+    fn write_xlsx_package(&mut self) -> io::Result<()> {
+        let bytes = xlsx_package(&self.names, &self.xlsx_rows);
+        let file = self.file.as_mut().ok_or_else(|| io::Error::other("文件已关闭"))?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        Ok(())
     }
 
     fn cancel(&mut self) -> ExportOutcome {
@@ -796,6 +824,174 @@ impl CsvFile {
         }
         cancelled(written)
     }
+}
+
+fn xlsx_value(cell: &Cell) -> Option<String> {
+    match cell {
+        Cell::Null => None,
+        Cell::Text(text) if text.is_empty() => None,
+        Cell::Text(text) => Some(text.clone()),
+    }
+}
+
+fn column_letters(index: usize) -> String {
+    let mut n = index + 1;
+    let mut chars = Vec::new();
+    while n > 0 {
+        n -= 1;
+        chars.push(b'A' + (n % 26) as u8);
+        n /= 26;
+    }
+    chars.reverse();
+    String::from_utf8(chars).unwrap_or_else(|_| "A".to_owned())
+}
+
+fn xml_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c if c == '\u{9}' || c == '\n' || c == '\r' || (c >= '\u{20}' && c != '\u{FFFE}' && c != '\u{FFFF}') => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn xlsx_row<'a>(row_number: usize, cells: impl Iterator<Item = Option<&'a str>>) -> String {
+    let mut out = format!("<row r=\"{row_number}\">");
+    for (index, cell) in cells.enumerate() {
+        let Some(text) = cell else { continue };
+        let refer = format!("{}{row_number}", column_letters(index));
+        out.push_str(&format!(
+            "<c r=\"{refer}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">{}</t></is></c>",
+            xml_text(text)
+        ));
+    }
+    out.push_str("</row>");
+    out
+}
+
+fn worksheet_xml(names: &[String], rows: &[Vec<Option<String>>]) -> String {
+    let cols = names.len().max(rows.iter().map(Vec::len).max().unwrap_or(0));
+    let height = rows.len() + usize::from(!names.is_empty());
+    let dim = if cols == 0 {
+        "A1".to_owned()
+    } else {
+        format!("A1:{}{}", column_letters(cols - 1), height.max(1))
+    };
+    let mut body = String::new();
+    let mut row_number = 1usize;
+    if !names.is_empty() {
+        body.push_str(&xlsx_row(row_number, names.iter().map(|name| Some(name.as_str()))));
+        row_number += 1;
+    }
+    for row in rows {
+        let cells = row.iter().map(|cell| cell.as_deref());
+        body.push_str(&xlsx_row(row_number, cells));
+        row_number += 1;
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><dimension ref=\"{dim}\"/><sheetData>{body}</sheetData></worksheet>"
+    )
+}
+
+fn xlsx_package(names: &[String], rows: &[Vec<Option<String>>]) -> Vec<u8> {
+    let sheet = worksheet_xml(names, rows);
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#;
+    let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
+    let workbook = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+    let workbook_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#;
+    zip_store(&[
+        ("[Content_Types].xml", content_types.as_bytes()),
+        ("_rels/.rels", rels.as_bytes()),
+        ("xl/workbook.xml", workbook.as_bytes()),
+        ("xl/_rels/workbook.xml.rels", workbook_rels.as_bytes()),
+        ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+    ])
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn zip_store(items: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, data) in items {
+        let offset = u32::try_from(out.len()).unwrap_or(u32::MAX);
+        let crc = crc32(data);
+        let name_bytes = name.as_bytes();
+        let size = u32::try_from(data.len()).unwrap_or(u32::MAX);
+        write_u32(&mut out, 0x0403_4B50);
+        write_u16(&mut out, 20);
+        write_u16(&mut out, 0);
+        write_u16(&mut out, 0);
+        write_u16(&mut out, 0);
+        write_u16(&mut out, 0x0021);
+        write_u32(&mut out, crc);
+        write_u32(&mut out, size);
+        write_u32(&mut out, size);
+        write_u16(&mut out, u16::try_from(name_bytes.len()).unwrap_or(u16::MAX));
+        write_u16(&mut out, 0);
+        out.extend_from_slice(name_bytes);
+        out.extend_from_slice(data);
+
+        write_u32(&mut central, 0x0201_4B50);
+        write_u16(&mut central, 20);
+        write_u16(&mut central, 20);
+        write_u16(&mut central, 0);
+        write_u16(&mut central, 0);
+        write_u16(&mut central, 0);
+        write_u16(&mut central, 0x0021);
+        write_u32(&mut central, crc);
+        write_u32(&mut central, size);
+        write_u32(&mut central, size);
+        write_u16(&mut central, u16::try_from(name_bytes.len()).unwrap_or(u16::MAX));
+        write_u16(&mut central, 0);
+        write_u16(&mut central, 0);
+        write_u16(&mut central, 0);
+        write_u16(&mut central, 0);
+        write_u32(&mut central, 0);
+        write_u32(&mut central, offset);
+        central.extend_from_slice(name_bytes);
+    }
+    let cd_offset = u32::try_from(out.len()).unwrap_or(u32::MAX);
+    let cd_size = u32::try_from(central.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&central);
+    write_u32(&mut out, 0x0605_4B50);
+    write_u16(&mut out, 0);
+    write_u16(&mut out, 0);
+    write_u16(&mut out, u16::try_from(items.len()).unwrap_or(u16::MAX));
+    write_u16(&mut out, u16::try_from(items.len()).unwrap_or(u16::MAX));
+    write_u32(&mut out, cd_size);
+    write_u32(&mut out, cd_offset);
+    write_u16(&mut out, 0);
+    out
+}
+
+fn write_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
 }
 
 fn encode_field(value: Option<&str>, null_token: &str) -> String {

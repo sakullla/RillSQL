@@ -106,7 +106,6 @@ const plan = computed(() =>
   }),
 );
 const insertBlocked = computed(() => format.value === "insert" && !props.insertTarget?.name);
-const xlsxFullBlocked = computed(() => format.value === "xlsx" && scope.value === "full" && plan.value.allowed);
 const title = computed(() => exportTitle(format.value));
 const preview = computed(() => {
   const rows = props.previewRows.slice(0, 4);
@@ -117,7 +116,7 @@ const preview = computed(() => {
   if (format.value === "insert") return "";
   return renderCsv(props.columns, rows, { ...csv.value, bom: false });
 });
-const canStart = computed(() => plan.value.allowed && !xlsxFullBlocked.value && !insertBlocked.value && (!plan.value.reexecutes || acknowledged.value) && path.value.trim().length > 0);
+const canStart = computed(() => plan.value.allowed && !insertBlocked.value && (!plan.value.reexecutes || acknowledged.value) && path.value.trim().length > 0);
 
 function onDelimiter(value: string) {
   if (value === "," || value === ";" || value === "\t") delimiter.value = value;
@@ -217,10 +216,9 @@ async function start() {
           </label>
         </fieldset>
 
-        <p v-if="xlsxFullBlocked" class="ex-alert" role="alert">xlsx 只写出已经读取的行，完整重新导出不会生成文件。</p>
-        <p v-else-if="plan.notice" class="ex-note" data-export-notice>{{ plan.notice }}</p>
+        <p v-if="plan.notice" class="ex-note" data-export-notice>{{ plan.notice }}</p>
         <p v-if="plan.rejectReason" class="ex-alert" role="alert">{{ plan.rejectReason }}</p>
-        <label v-if="plan.reexecutes && !xlsxFullBlocked" class="ex-ack">
+        <label v-if="plan.reexecutes" class="ex-ack">
           <input v-model="acknowledged" type="checkbox" />
           我明白：导出会重新执行这条 SELECT，结果可能和当前表格看到的不一样
         </label>

@@ -1009,3 +1009,161 @@ async fn markdown_export_writes_header_rule_escapes_pipes_and_marks_partial() {
     drop(service);
     let _ = fs::remove_dir_all(&dir);
 }
+
+fn read_xlsx_like_import(path: &PathBuf) -> serde_json::Value {
+    let module = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../node_modules/@e965/xlsx");
+    let script = r#"
+const fs = require("fs");
+const XLSX = require(process.env.XLSX_MODULE);
+const file = process.argv[process.argv.length - 1];
+const book = XLSX.read(fs.readFileSync(file), { type: "buffer", cellDates: false });
+const sheet = book.Sheets[book.SheetNames[0]];
+const matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: null, blankrows: true });
+function cellText(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") return value === "" ? null : value;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "boolean") return value ? "true" : "false";
+  return null;
+}
+const header = matrix[0] || [];
+const columns = header.map((cell) => (cellText(cell) || "").trim());
+const rows = matrix.slice(1).filter((row) => row.some((cell) => cellText(cell) !== null)).map((row) => {
+  const cells = {};
+  columns.forEach((name, index) => { cells[name] = cellText(row[index]) ?? null; });
+  return cells;
+});
+process.stdout.write(JSON.stringify({ sheets: book.SheetNames.length, columns, rows }));
+"#;
+    let output = std::process::Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .arg(path)
+        .env("XLSX_MODULE", &module)
+        .output()
+        .unwrap_or_else(|err| panic!("无法运行 node 读取 xlsx：{err}"));
+    assert!(
+        output.status.success(),
+        "读取 xlsx 失败\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|err| panic!("{err}: {}", String::from_utf8_lossy(&output.stdout)))
+}
+
+#[tokio::test]
+async fn xlsx_full_export_writes_select_and_table_rows_and_skips_updates() {
+    use super::live::{self, ExportMode, ExportSpec};
+    use crate::connections::Service;
+
+    let dir = std::env::temp_dir().join(format!("rillsql-grid-xlsx-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("items.sqlite");
+    let setup = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE items (id INTEGER PRIMARY KEY, note TEXT)").execute(&setup).await.unwrap();
+    sqlx::query("INSERT INTO items (id, note) VALUES (1, NULL), (2, ''), (3, '甲'), (4, ?1)")
+        .bind("a<b>&\"c\"\n下一行")
+        .execute(&setup)
+        .await
+        .unwrap();
+    setup.close().await;
+
+    let service = Service::new_for_test(dir.join("connections.sqlite"));
+    service.open_sqlite_for_test("items", "条目", &database).await.unwrap();
+    let session = service.catalog_session("items").expect("已打开会话");
+    let expected = serde_json::json!({
+        "sheets": 1,
+        "columns": ["id", "note"],
+        "rows": [
+            { "id": "1", "note": null },
+            { "id": "2", "note": null },
+            { "id": "3", "note": "甲" },
+            { "id": "4", "note": "a<b>&\"c\"\n下一行" }
+        ]
+    });
+    let spec = |id: &str, mode: ExportMode, path: String| ExportSpec {
+        id: id.to_owned(),
+        mode,
+        database: "main".to_owned(),
+        schema: String::new(),
+        table: "items".to_owned(),
+        engine_hint: "sqlite".to_owned(),
+        filters: Vec::new(),
+        sort: None,
+        limit: 0,
+        truncated: false,
+        statement: String::new(),
+        acknowledged: true,
+        path,
+        delimiter: ",".to_owned(),
+        null_token: String::new(),
+        bom: false,
+        header: true,
+        format: "xlsx".to_owned(),
+        fail_after_rows: None,
+        cancel_after_rows: None,
+    };
+
+    let table_path = dir.join("items.xlsx");
+    let table = live::run_export(&session, &spec("xlsx-table", ExportMode::TableFull, table_path.display().to_string())).await;
+    assert!(table.success, "{}", table.message);
+    assert_eq!(table.written_rows, 4);
+    assert!(!table.partial);
+    let table_file = PathBuf::from(table.path.unwrap());
+    assert_eq!(table_file, table_path);
+    assert!(!PathBuf::from(format!("{}.partial", table_path.display())).exists());
+    let table_sheet = String::from_utf8_lossy(&fs::read(&table_file).unwrap()).to_string();
+    assert!(table_sheet.contains("<worksheet"));
+    assert!(!table_sheet.contains("r=\"B2\""));
+    assert!(!table_sheet.contains("r=\"B3\""));
+    assert!(table_sheet.contains("r=\"B4\""));
+    assert_eq!(read_xlsx_like_import(&table_file), expected);
+
+    let mut filtered = spec("xlsx-filter", ExportMode::TableFull, dir.join("filtered.xlsx").display().to_string());
+    filtered.filters = vec![filt("id", FilterOp::Eq, Some("3"))];
+    let filtered_export = live::run_export(&session, &filtered).await;
+    assert!(filtered_export.success, "{}", filtered_export.message);
+    assert_eq!(filtered_export.written_rows, 1);
+    assert_eq!(
+        read_xlsx_like_import(&PathBuf::from(filtered_export.path.unwrap())),
+        serde_json::json!({
+            "sheets": 1,
+            "columns": ["id", "note"],
+            "rows": [{ "id": "3", "note": "甲" }]
+        })
+    );
+
+    let mut query = spec("xlsx-query", ExportMode::Query, dir.join("query.xlsx").display().to_string());
+    query.statement = "SELECT id, note FROM items ORDER BY id".to_owned();
+    let query_export = live::run_export(&session, &query).await;
+    assert!(query_export.success, "{}", query_export.message);
+    assert_eq!(query_export.written_rows, 4);
+    assert_eq!(read_xlsx_like_import(&PathBuf::from(query_export.path.unwrap())), expected);
+
+    let update_path = dir.join("update.xlsx");
+    let mut update = spec("xlsx-update", ExportMode::Query, update_path.display().to_string());
+    update.statement = "UPDATE items SET note = 'x'".to_owned();
+    let denied = live::run_export(&session, &update).await;
+    assert!(!denied.success);
+    assert_eq!(denied.status, "blocked");
+    assert!(denied.message.contains("SELECT"), "{}", denied.message);
+    assert!(!denied.message.contains("未知导出格式"), "{}", denied.message);
+    assert!(denied.path.is_none());
+    assert!(!update_path.exists());
+    assert!(!PathBuf::from(format!("{}.partial", update_path.display())).exists());
+
+    let mut cancelled = spec("xlsx-cancel", ExportMode::TableFull, dir.join("cancel.xlsx").display().to_string());
+    cancelled.cancel_after_rows = Some(1);
+    let cancel = live::run_export(&session, &cancelled).await;
+    assert_eq!(cancel.status, "cancelled");
+    assert!(!dir.join("cancel.xlsx").exists());
+    assert!(!PathBuf::from(format!("{}.partial", dir.join("cancel.xlsx").display())).exists());
+
+    drop(session);
+    drop(service);
+    let _ = fs::remove_dir_all(&dir);
+}
