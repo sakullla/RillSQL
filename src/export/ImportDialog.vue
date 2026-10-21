@@ -19,6 +19,7 @@ import {
   suggestMapping,
   type ParsedImport,
 } from "./import";
+import { parseImportXlsx } from "./xlsx";
 
 const props = defineProps<{
   open: boolean;
@@ -32,9 +33,10 @@ const emit = defineEmits<{
   done: [message: string];
 }>();
 
-const format = ref<"csv" | "json">("csv");
+const format = ref<"csv" | "json" | "xlsx">("csv");
 const delimiter = ref<CsvDelimiter>(",");
 const lastText = ref("");
+const lastBytes = ref<Uint8Array | null>(null);
 const tableKey = ref("");
 const localSchema = ref<TableSchema | null>(null);
 const localTarget = ref<TableTarget | null>(null);
@@ -76,13 +78,14 @@ watch(
   () => props.open,
   (open) => {
     if (!open) return;
-    format.value = "csv";
-    delimiter.value = ",";
     lastText.value = "";
+    lastBytes.value = null;
     parsed.value = null;
     mapping.value = {};
     parseError.value = "";
     resultText.value = "";
+    format.value = "csv";
+    delimiter.value = ",";
     writing.value = false;
     localSchema.value = props.schema;
     localTarget.value = props.target;
@@ -90,6 +93,18 @@ watch(
   },
   { immediate: true },
 );
+
+watch(format, (next) => {
+  parsed.value = null;
+  mapping.value = {};
+  parseError.value = "";
+  resultText.value = "";
+  if (next === "xlsx") {
+    if (lastBytes.value) applyBytes(lastBytes.value);
+    return;
+  }
+  if (lastText.value) applyText(lastText.value);
+});
 
 const activeSchema = computed(() => localSchema.value ?? props.schema);
 const boundConnection = computed(() => catalogConnections().find((item) => item.id === props.target.connectionId) ?? null);
@@ -146,10 +161,24 @@ async function chooseTable() {
   }
 }
 
+function applyBytes(bytes: Uint8Array) {
+  const outcome = parseImportXlsx(bytes);
+  if (!outcome.ok) {
+    parseError.value = outcome.reason;
+    parsed.value = null;
+    mapping.value = {};
+    return;
+  }
+  parseError.value = "";
+  parsed.value = outcome.data;
+  mapping.value = suggestMapping(activeSchema.value.columns, outcome.data.columns);
+}
+
 function applyText(text: string) {
   const outcome = format.value === "json" ? parseImportJson(text) : parseImportCsv(text, delimiter.value);
   if (!outcome.ok) {
     parseError.value = outcome.reason;
+    parsed.value = null;
     mapping.value = {};
     return;
   }
@@ -163,8 +192,17 @@ async function onFile(event: Event) {
   resultText.value = "";
   parsed.value = null;
   if (!file) return;
+  if (format.value === "xlsx" || file.name.toLowerCase().endsWith(".xlsx")) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    lastBytes.value = bytes;
+    lastText.value = "";
+    if (format.value !== "xlsx") format.value = "xlsx";
+    else applyBytes(bytes);
+    return;
+  }
   const text = await file.text();
   lastText.value = text;
+  lastBytes.value = null;
   applyText(text);
 }
 
@@ -217,13 +255,14 @@ async function confirm() {
           <legend>文件格式</legend>
           <label class="ex-choice" :class="{ on: format === 'csv' }"><input v-model="format" type="radio" name="im-format" value="csv" :disabled="writing" /><span><b>CSV</b><small>第一行是列名。没有引号的空字段是空值。</small></span></label>
           <label class="ex-choice" :class="{ on: format === 'json' }"><input v-model="format" type="radio" name="im-format" value="json" :disabled="writing" /><span><b>JSON 数组</b><small>必须是对象数组，确认前就会拒绝其他形状。</small></span></label>
+          <label class="ex-choice" :class="{ on: format === 'xlsx' }"><input v-model="format" type="radio" name="im-format" value="xlsx" :disabled="writing" /><span><b>Excel</b><small>只读第一个工作表。第一行必须是列名。空单元格是空值。</small></span></label>
         </fieldset>
         <div v-if="format === 'csv'" class="ex-path">
           <label for="import-delimiter">分隔符</label>
           <Listbox id="import-delimiter" :model-value="delimiter" :options="delimiterOptions" aria-label="CSV 分隔符" :disabled="writing" @update:model-value="onDelimiter" />
         </div>
         <label class="ex-path">选择文件
-          <input type="file" aria-label="导入文件" accept=".csv,.tsv,.json,.txt,text/csv,application/json" :disabled="writing" @change="onFile" />
+          <input type="file" aria-label="导入文件" accept=".csv,.tsv,.json,.txt,.xlsx,text/csv,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" :disabled="writing" @change="onFile" />
         </label>
         <p v-if="parsed && gaps.length" class="ex-alert" role="alert">必填字段 {{ gaps.join("、") }} 没有对应列，不能开始写入。</p>
         <table v-if="parsed" class="map-table">

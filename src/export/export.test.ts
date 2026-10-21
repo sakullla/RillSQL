@@ -19,6 +19,7 @@ import { planExport } from "./plan";
 import TaskCenter from "./TaskCenter.vue";
 import { exportTasks, resetExportTasks } from "./tasks";
 import { startExport } from "./write";
+import { parseImportXlsx } from "./xlsx";
 
 const invoke = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
@@ -539,6 +540,128 @@ describe("import and export choices", () => {
 
     release({ applied: [], failed: null, pendingIds: [], rolledBack: false, rule: "按顺序逐条提交，遇到错误即停止；已成功的语句不撤销。" });
     await flushPromises();
+    wrapper.unmount();
+  });
+});
+
+describe("xlsx export", () => {
+  const columns = ["id", "note"];
+
+  it("writes two rows and keeps an empty cell as null", () => {
+    const dir = tempDir();
+    const path = join(dir, "rows.xlsx");
+    const rows = [{ id: "1", note: null }, { id: "2", note: "甲" }];
+    const done = startExport({
+      plan: planExport({ origin: "table", scope: "loaded", truncated: false, fileName: path }),
+      acknowledged: false,
+      path,
+      columns,
+      rows,
+      csv,
+      format: "xlsx",
+    });
+    expect(done.success).toBe(true);
+    expect(done.writtenRows).toBe(2);
+    expect(parseImportXlsx(new Uint8Array(readFileSync(path)))).toEqual({
+      ok: true,
+      data: { columns, rows },
+    });
+    const blank = join(dir, "blank.xlsx");
+    const emptied = startExport({
+      plan: planExport({ origin: "table", scope: "loaded", truncated: false, fileName: blank }),
+      acknowledged: false,
+      path: blank,
+      columns,
+      rows: [{ id: "3", note: "" }],
+      csv,
+      format: "xlsx",
+    });
+    expect(emptied.success).toBe(true);
+    expect(parseImportXlsx(new Uint8Array(readFileSync(blank)))).toEqual({
+      ok: true,
+      data: { columns: ["id", "note"], rows: [{ id: "3", note: null }] },
+    });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("does not create a file when a full update export is refused", () => {
+    const plan = planExport({ origin: "query", scope: "full", statement: "UPDATE t SET a = 1", truncated: false, fileName: "q.xlsx" });
+    expect(plan.allowed).toBe(false);
+    expect(plan.rejectReason).toContain("SELECT");
+    const dir = tempDir();
+    const path = join(dir, plan.fileName);
+    const blocked = startExport({
+      plan,
+      acknowledged: true,
+      path,
+      columns: ["id"],
+      rows: [{ id: "1" }],
+      csv,
+      format: "xlsx",
+    });
+    expect(blocked.status).toBe("blocked");
+    expect(blocked.success).toBe(false);
+    expect(blocked.message).toContain("SELECT");
+    expect(existsSync(path)).toBe(false);
+    expect(existsSync(`${path}.partial`)).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("removes the unfinished file when xlsx export is cancelled", () => {
+    const dir = tempDir();
+    const path = join(dir, "cancel.xlsx");
+    const cancelled = startExport({
+      plan: planExport({ origin: "table", scope: "loaded", truncated: false, fileName: path }),
+      acknowledged: false,
+      path,
+      columns,
+      rows: [{ id: "1", note: "甲" }, { id: "2", note: "乙" }],
+      csv,
+      format: "xlsx",
+      control: { cancelAfterRows: 1 },
+    });
+    expect(cancelled.status).toBe("cancelled");
+    expect(cancelled.success).toBe(false);
+    expect(cancelled.message).toContain("未完成的文件已删除");
+    expect(existsSync(path)).toBe(false);
+    expect(existsSync(`${path}.partial`)).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("recognizes an xlsx name when marking a partial file", () => {
+    expect(planExport({ origin: "table", scope: "loaded", truncated: true, fileName: "customers-2026-10-14.xlsx" }).fileName).toBe("customers-2026-10-14（部分）.xlsx");
+    expect(planExport({ origin: "table", scope: "loaded", truncated: true, fileName: "Customers.XLSX" }).fileName).toBe("Customers（部分）.xlsx");
+  });
+
+  it("switches the dialog to excel and refuses a full update before writing", async () => {
+    const wrapper = mount(ExportDialog, {
+      props: {
+        open: true,
+        origin: "query",
+        statement: "UPDATE t SET a = 1",
+        truncated: true,
+        fileStem: "customers",
+        loadedCount: 2,
+        pending: 0,
+        columns,
+        previewRows: [{ id: "1", note: null }, { id: "2", note: "甲" }],
+      },
+    });
+    await wrapper.get("input[value='xlsx']").setValue();
+    expect(wrapper.get("h2").text()).toBe("导出为 Excel");
+    expect(wrapper.get(".ex-sheet").attributes("aria-label")).toBe("导出为 Excel");
+    expect((wrapper.get("input[aria-label='导出路径']").element as HTMLInputElement).value).toMatch(/\.xlsx$/);
+    const preview = wrapper.get(".ex-preview").text();
+    expect(preview).toContain("id");
+    expect(preview).toContain("甲");
+    expect(preview).not.toContain("\\N");
+    expect(preview).not.toContain("NULL");
+    await wrapper.get("input[value='full']").setValue();
+    expect(wrapper.text()).toContain("SELECT");
+    expect(wrapper.get(".btn.primary").attributes("disabled")).toBeDefined();
+    await wrapper.get(".btn.primary").trigger("click");
+    await flushPromises();
+    expect(wrapper.emitted("start")).toBeUndefined();
     wrapper.unmount();
   });
 });

@@ -5,8 +5,9 @@ import { insertStatements, type InsertTarget } from "./insert";
 import { jsonLines } from "./json";
 import { markdownHeader, markdownLines } from "./markdown";
 import type { ExportPlan } from "./plan";
+import { renderXlsx } from "./xlsx";
 
-export type ExportFormat = "csv" | "json" | "insert" | "markdown";
+export type ExportFormat = "csv" | "json" | "insert" | "markdown" | "xlsx";
 
 export interface WriteControl {
   failAfterRows?: number;
@@ -163,6 +164,104 @@ function refusePath(error: unknown): WriteResult {
   };
 }
 
+/** 已读取的 xlsx。空单元格不写记号。取消删除临时文件，不留下目标文件。 */
+export function writeXlsxFile(options: {
+  path: string;
+  columns: readonly string[];
+  rows: readonly Record<string, CsvCell>[];
+  control?: WriteControl;
+  onProgress?: (progress: WriteProgress) => void;
+}): WriteResult {
+  const total = options.rows.length;
+  const partialPath = `${options.path}.partial`;
+  const progress = (status: WriteProgress["status"], writtenRows: number) => {
+    options.onProgress?.({ status, writtenRows, totalRows: total });
+  };
+  progress("running", 0);
+  try {
+    mkdirSync(dirname(options.path), { recursive: false });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EEXIST") return refusePath(error);
+  }
+  const failAfter = options.control?.failAfterRows;
+  const cancelAfter = options.control?.cancelAfterRows;
+  const written: Record<string, CsvCell>[] = [];
+  const publish = () => writeFileSync(partialPath, renderXlsx(options.columns, written));
+  try {
+    publish();
+  } catch (error) {
+    return refusePath(error);
+  }
+  for (let index = 0; index < options.rows.length; index += 1) {
+    if (cancelAfter !== undefined && index === cancelAfter) {
+      rmSync(partialPath, { force: true });
+      progress("cancelled", index);
+      return {
+        status: "cancelled",
+        success: false,
+        writtenRows: index,
+        path: null,
+        residualPath: null,
+        message: `已取消导出：写入 ${index} 行后停止，未完成的文件已删除。`,
+        readCalled: false,
+      };
+    }
+    if (failAfter !== undefined && index === failAfter) {
+      progress("failed", index);
+      return {
+        status: "failed",
+        success: false,
+        writtenRows: index,
+        path: null,
+        residualPath: partialPath,
+        message: `${options.control?.failMessage ?? "写入失败"}。已写入 ${index} 行，不完整的文件保留为 ${partialPath}，不会冒充完整结果。`,
+        readCalled: false,
+      };
+    }
+    written.push(options.rows[index]!);
+    publish();
+    progress("running", index + 1);
+  }
+  if (cancelAfter !== undefined && cancelAfter === options.rows.length) {
+    rmSync(partialPath, { force: true });
+    progress("cancelled", options.rows.length);
+    return {
+      status: "cancelled",
+      success: false,
+      writtenRows: options.rows.length,
+      path: null,
+      residualPath: null,
+      message: `已取消导出：写入 ${options.rows.length} 行后停止，未完成的文件已删除。`,
+      readCalled: false,
+    };
+  }
+  try {
+    rmSync(options.path, { force: true });
+    renameSync(partialPath, options.path);
+  } catch (error) {
+    return {
+      status: "failed",
+      success: false,
+      writtenRows: written.length,
+      path: null,
+      residualPath: partialPath,
+      message: `${(error as Error).message}。已写入 ${written.length} 行，不完整的文件保留为 ${partialPath}，不会冒充完整结果。`,
+      readCalled: false,
+    };
+  }
+  progress("done", written.length);
+  return {
+    status: "done",
+    success: true,
+    writtenRows: written.length,
+    path: options.path,
+    residualPath: null,
+    message: `已导出 ${written.length} 行。`,
+    readCalled: false,
+  };
+}
+
 /** 已读取的 JSON 或 INSERT。先写入临时文件，失败或取消都不替换目标文件。 */
 export function writeRenderedFile(options: {
   path: string;
@@ -289,7 +388,15 @@ export function startExport(options: {
     readCalled = true;
     rows = options.readRows();
   }
-  const result = format === "csv"
+  const result = format === "xlsx"
+    ? writeXlsxFile({
+        path: options.path,
+        columns: options.columns,
+        rows,
+        control: options.control,
+        onProgress: options.onProgress,
+      })
+    : format === "csv"
     ? writeCsvFile({
         path: options.path,
         columns: options.columns,

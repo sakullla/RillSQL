@@ -4,8 +4,8 @@ export function isNativeExport(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
-export async function chooseExportPath(defaultPath: string, format: "csv" | "json" | "insert" | "markdown" | "sql" = "csv"): Promise<string | null> {
-  if (!isNativeExport()) return defaultPath;
+export async function chooseExportPath(defaultPath: string, format: "csv" | "json" | "insert" | "markdown" | "sql" | "xlsx" = "csv"): Promise<string | null> {
+  if (!isNativeExport() || format === "xlsx") return defaultPath;
   const { save } = await import("@tauri-apps/plugin-dialog");
   const filter = format === "json"
     ? { name: "JSON 文件", extensions: ["json"] }

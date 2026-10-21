@@ -8,6 +8,7 @@ import { renderMarkdown } from "./markdown";
 import type { ExportPlan } from "./plan";
 import type { ExportFormat, WriteControl, WriteResult } from "./write";
 import { isNativeExport, writeNativeCsv } from "./native";
+import { renderXlsx } from "./xlsx";
 
 export interface ExportTask {
   id: string;
@@ -52,6 +53,19 @@ function blockedExport(message: string): WriteResult {
   return { status: "blocked", success: false, writtenRows: 0, path: null, residualPath: null, message, readCalled: false };
 }
 
+function downloadBytes(fileName: string, bytes: Uint8Array, type: string): void {
+  const body = new Uint8Array(bytes);
+  const blob = new Blob([body.buffer as ArrayBuffer], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+}
+
 function downloadCsv(fileName: string, body: string): void {
   const blob = new Blob([body], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -71,6 +85,7 @@ export function renderExportText(options: {
   csv: CsvOptions;
   insert?: InsertTarget;
 }): string {
+  if (options.format === "xlsx") throw new Error("xlsx 不是文本");
   if (options.format === "json") return renderJson(options.columns, options.rows);
   if (options.format === "markdown") return renderMarkdown(options.columns, options.rows, { nullToken: options.csv.nullToken });
   if (options.format === "insert") {
@@ -102,7 +117,8 @@ function exportLoadedInBrowser(options: {
     rows = options.readRows();
   }
   const fileName = options.path.split(/[/\\]/).pop() || options.plan.fileName;
-  downloadCsv(fileName, renderExportText({ ...options, rows }));
+  if ((options.format ?? "csv") === "xlsx") downloadBytes(fileName, renderXlsx(options.columns, rows), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  else downloadCsv(fileName, renderExportText({ ...options, rows }));
   let message = `已导出 ${rows.length} 行，开始下载 ${fileName}。`;
   if (options.plan.partial) message = `已导出 ${rows.length} 行，开始下载 ${fileName}。这只是已读取的行，不是完整结果。`;
   if (options.plan.reexecutes) message = `${options.plan.notice}${message}`;
@@ -165,7 +181,7 @@ export async function runExportTask(options: {
   let result: WriteResult;
   try {
     if (!options.plan.allowed) result = blockedExport(options.plan.rejectReason ?? "不能导出");
-    else if (isNativeExport()) {
+    else if (isNativeExport() && (options.format ?? "csv") !== "xlsx") {
       if (options.plan.serverRead) result = blockedExport("全量导出需要使用已打开的数据库连接。");
       else {
         await writeNativeCsv(options.path, renderExportText(options));
@@ -241,6 +257,11 @@ export function runRemoteExport(options: RemoteExportOptions): { task: ExportTas
   });
   taskSeq += 1;
   exportTasks.unshift(task);
+  if ((options.format ?? "csv") === "xlsx") {
+    task.status = "blocked";
+    task.message = "没有生成文件：xlsx 只写出已经读取的行，完整重新导出不会生成文件。";
+    return { task, done: Promise.resolve(task) };
+  }
   const done = gridExport({
     id: task.id,
     mode: options.mode,

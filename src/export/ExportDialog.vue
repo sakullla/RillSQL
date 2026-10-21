@@ -9,6 +9,7 @@ import { renderMarkdown } from "./markdown";
 import { planExport, type ExportOrigin, type ExportScope } from "./plan";
 import { chooseExportPath } from "./native";
 import type { ExportFormat } from "./write";
+import { renderXlsxPreview } from "./xlsx";
 
 const props = defineProps<{
   open: boolean;
@@ -70,11 +71,27 @@ watch(
   { immediate: true },
 );
 
+function formatExtension(next: ExportFormat): string {
+  if (next === "json") return "json";
+  if (next === "insert") return "sql";
+  if (next === "markdown") return "md";
+  if (next === "xlsx") return "xlsx";
+  return "csv";
+}
+
+function exportTitle(next: ExportFormat): string {
+  if (next === "json") return "导出为 JSON";
+  if (next === "insert") return "导出为 INSERT";
+  if (next === "markdown") return "导出为 Markdown";
+  if (next === "xlsx") return "导出为 Excel";
+  return "导出为 CSV";
+}
+
 watch(format, (next, previous) => {
   if (!props.open || next === previous) return;
-  const extension = next === "json" ? "json" : next === "insert" ? "sql" : next === "markdown" ? "md" : "csv";
-  path.value = path.value.replace(/\.(csv|json|sql|md)$/i, `.${extension}`);
-  if (!/\.(csv|json|sql|md)$/i.test(path.value)) path.value = `${path.value}.${extension}`;
+  const extension = formatExtension(next);
+  path.value = path.value.replace(/\.(csv|json|sql|md|xlsx)$/i, `.${extension}`);
+  if (!/\.(csv|json|sql|md|xlsx)$/i.test(path.value)) path.value = `${path.value}.${extension}`;
 });
 
 const csv = computed<CsvOptions>(() => ({ delimiter: delimiter.value, nullToken: nullToken.value, bom: bom.value, header: header.value }));
@@ -89,15 +106,18 @@ const plan = computed(() =>
   }),
 );
 const insertBlocked = computed(() => format.value === "insert" && !props.insertTarget?.name);
+const xlsxFullBlocked = computed(() => format.value === "xlsx" && scope.value === "full" && plan.value.allowed);
+const title = computed(() => exportTitle(format.value));
 const preview = computed(() => {
   const rows = props.previewRows.slice(0, 4);
   if (format.value === "json") return renderJson(props.columns, rows);
   if (format.value === "markdown") return renderMarkdown(props.columns, rows, { nullToken: nullToken.value });
+  if (format.value === "xlsx") return renderXlsxPreview(props.columns, rows);
   if (format.value === "insert" && props.insertTarget?.name) return renderInsert(props.insertTarget, props.columns, rows);
   if (format.value === "insert") return "";
   return renderCsv(props.columns, rows, { ...csv.value, bom: false });
 });
-const canStart = computed(() => plan.value.allowed && !insertBlocked.value && (!plan.value.reexecutes || acknowledged.value) && path.value.trim().length > 0);
+const canStart = computed(() => plan.value.allowed && !xlsxFullBlocked.value && !insertBlocked.value && (!plan.value.reexecutes || acknowledged.value) && path.value.trim().length > 0);
 
 function onDelimiter(value: string) {
   if (value === "," || value === ";" || value === "\t") delimiter.value = value;
@@ -138,10 +158,10 @@ async function start() {
 
 <template>
   <div v-if="open" class="ex-overlay" role="presentation">
-    <div class="ex-sheet" role="dialog" aria-modal="true" :aria-label="format === 'json' ? '导出为 JSON' : format === 'insert' ? '导出为 INSERT' : format === 'markdown' ? '导出为 Markdown' : '导出为 CSV'">
+    <div class="ex-sheet" role="dialog" aria-modal="true" :aria-label="title">
       <header class="ex-head">
         <div class="ex-titles">
-          <h2>{{ format === "json" ? "导出为 JSON" : format === "insert" ? "导出为 INSERT" : format === "markdown" ? "导出为 Markdown" : "导出为 CSV" }}</h2>
+          <h2>{{ title }}</h2>
           <p>这只是数据导出，不是数据库备份；要备份请用数据库自带的备份工具。</p>
         </div>
         <button class="icon-btn" type="button" aria-label="关闭" @click="emit('close')">
@@ -163,6 +183,10 @@ async function start() {
           <label class="ex-choice" :class="{ on: format === 'json' }">
             <input v-model="format" type="radio" name="ex-format" value="json" />
             <span><b>JSON 数组</b><small>每个对象是一行。空值仍是 null，空字符串仍是空字符串。</small></span>
+          </label>
+          <label class="ex-choice" :class="{ on: format === 'xlsx' }">
+            <input v-model="format" type="radio" name="ex-format" value="xlsx" />
+            <span><b>Excel</b><small>xlsx 工作表。只包含这些行，不是整库转储，也不会搬到另一种数据库。空单元格是空值，不另写记号。</small></span>
           </label>
           <label class="ex-choice" :class="{ on: format === 'markdown' }">
             <input v-model="format" type="radio" name="ex-format" value="markdown" />
@@ -193,9 +217,10 @@ async function start() {
           </label>
         </fieldset>
 
-        <p v-if="plan.notice" class="ex-note" data-export-notice>{{ plan.notice }}</p>
+        <p v-if="xlsxFullBlocked" class="ex-alert" role="alert">xlsx 只写出已经读取的行，完整重新导出不会生成文件。</p>
+        <p v-else-if="plan.notice" class="ex-note" data-export-notice>{{ plan.notice }}</p>
         <p v-if="plan.rejectReason" class="ex-alert" role="alert">{{ plan.rejectReason }}</p>
-        <label v-if="plan.reexecutes" class="ex-ack">
+        <label v-if="plan.reexecutes && !xlsxFullBlocked" class="ex-ack">
           <input v-model="acknowledged" type="checkbox" />
           我明白：导出会重新执行这条 SELECT，结果可能和当前表格看到的不一样
         </label>
@@ -207,6 +232,7 @@ async function start() {
 
         <div class="ex-preview-wrap">
           <p v-if="format === 'csv'" class="ex-note">预览（前 4 行）：非 NULL 的值都会加引号，所以 "" 是空字符串，{{ nullToken === "" ? "空字段" : nullToken }} 是 NULL。</p>
+          <p v-else-if="format === 'xlsx'" class="ex-note">预览（前 4 行）。空单元格是空值，空字符串也留空。未提交的修改不会进入文件。</p>
           <p v-else class="ex-note">预览（前 4 行）。空值保持为空值。未提交的修改不会进入文件。</p>
           <pre class="ex-preview">{{ preview }}</pre>
         </div>
