@@ -1083,6 +1083,63 @@ fn sql_routines_that_read_a_view_wait_for_that_view() {
     assert!(at(&removed.script, "DROP VIEW \"public\".\"v_label\"") < at(&removed.script, "DROP FUNCTION \"public\".\"label\""), "{}", removed.script);
 }
 
+#[test]
+fn column_name_is_not_a_routine_call_and_real_cycles_are_broken() {
+    let notes = ObjectDef::defined(Kind::View, "v_notes", "CREATE VIEW v_notes AS SELECT note FROM notes");
+    let note = ObjectDef::defined(Kind::Function, "note", "CREATE FUNCTION note() RETURNS integer LANGUAGE sql AS $$ SELECT 1 FROM v_notes $$");
+    let created = diff_structure(&Side::ready("postgres", "app", "public", vec![notes.clone(), note.clone()]), &Side::ready("postgres", "app", "public", vec![]));
+    let script = &created.script;
+    assert!(at(script, "CREATE VIEW \"public\".\"v_notes\"") < function_create_at(script, "\"public\".\"note\""), "{script}");
+    assert!(!script.contains("NULL::integer"), "{script}");
+    let removed = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![notes, note]));
+    let script = &removed.script;
+    assert!(at(script, "DROP FUNCTION \"public\".\"note\"") < at(script, "DROP VIEW \"public\".\"v_notes\""), "{script}");
+    assert!(!script.contains("CREATE OR REPLACE FUNCTION"), "{script}");
+
+    let cycle_view = ObjectDef::defined(Kind::View, "v_cycle", "CREATE VIEW v_cycle AS SELECT cycle_fn()");
+    let cycle_fn = ObjectDef::defined(Kind::Function, "cycle_fn", "CREATE FUNCTION cycle_fn() RETURNS integer LANGUAGE sql AS $$ SELECT 1 FROM v_cycle $$");
+    let created = diff_structure(
+        &Side::ready("postgres", "app", "public", vec![cycle_view.clone(), cycle_fn.clone()]),
+        &Side::ready("postgres", "app", "public", vec![]),
+    );
+    let script = &created.script;
+    let stub = at(script, "SELECT NULL::integer");
+    let view_at = at(script, "CREATE VIEW \"public\".\"v_cycle\"");
+    let body = at(script, "FROM v_cycle");
+    assert!(stub < view_at && view_at < body, "{script}");
+    assert!(!script[..view_at].contains("v_cycle"), "{script}");
+    let removed = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![cycle_view, cycle_fn]));
+    let script = &removed.script;
+    let stub = at(script, "CREATE OR REPLACE FUNCTION \"public\".\"cycle_fn\"");
+    assert!(stub < at(script, "DROP VIEW \"public\".\"v_cycle\""), "{script}");
+    assert!(at(script, "DROP VIEW \"public\".\"v_cycle\"") < at(script, "DROP FUNCTION \"public\".\"cycle_fn\""), "{script}");
+    let stub_end = stub + script[stub..].find(';').expect("stub");
+    assert!(!script[stub..stub_end].contains("v_cycle"), "{script}");
+}
+
+#[test]
+fn insert_and_update_targets_wait_for_the_view() {
+    let view = ObjectDef::defined(Kind::View, "v_base", "CREATE VIEW v_base AS SELECT id FROM notes");
+    let ins = ObjectDef::defined(Kind::Function, "ins", "CREATE FUNCTION ins() RETURNS void LANGUAGE sql AS $$ INSERT INTO v_base (id) VALUES (1) $$");
+    let upd = ObjectDef::defined(Kind::Function, "upd", "CREATE FUNCTION upd() RETURNS void LANGUAGE sql AS $$ UPDATE v_base SET id = id $$");
+    let del = ObjectDef::defined(Kind::Function, "del", "CREATE FUNCTION del() RETURNS void LANGUAGE sql AS $$ DELETE FROM v_base $$");
+    let created = diff_structure(
+        &Side::ready("postgres", "app", "public", vec![view.clone(), ins.clone(), upd.clone(), del.clone()]),
+        &Side::ready("postgres", "app", "public", vec![]),
+    );
+    let script = &created.script;
+    let view_at = at(script, "CREATE VIEW \"public\".\"v_base\"");
+    assert!(view_at < function_create_at(script, "\"public\".\"ins\""), "{script}");
+    assert!(view_at < function_create_at(script, "\"public\".\"upd\""), "{script}");
+    assert!(view_at < function_create_at(script, "\"public\".\"del\""), "{script}");
+    let removed = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![view, ins, upd, del]));
+    let script = &removed.script;
+    let view_at = at(script, "DROP VIEW \"public\".\"v_base\"");
+    assert!(at(script, "DROP FUNCTION \"public\".\"ins\"") < view_at, "{script}");
+    assert!(at(script, "DROP FUNCTION \"public\".\"upd\"") < view_at, "{script}");
+    assert!(at(script, "DROP FUNCTION \"public\".\"del\"") < view_at, "{script}");
+}
+
 fn function_create_at(script: &str, name: &str) -> usize {
     let markers = [format!("CREATE OR REPLACE FUNCTION {name}"), format!("CREATE FUNCTION {name}"), format!("CREATE OR REPLACE PROCEDURE {name}"), format!("CREATE PROCEDURE {name}")];
     markers.iter().filter_map(|marker| script.find(marker)).min().unwrap_or_else(|| panic!("missing routine create {name} in {script}"))

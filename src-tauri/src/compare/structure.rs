@@ -554,6 +554,7 @@ fn drop_foreign_key(engine: Engine, side: &Side, table: &str, key: &ForeignKeySh
     }
 }
 
+#[derive(Clone)]
 struct PlannedDrop {
     kind: Kind,
     name: String,
@@ -755,7 +756,7 @@ fn assemble_statements(
     // 还引用即将删掉的函数时，先换成不再引用它的定义，后面的 DROP FUNCTION 才过得去。
     statements.extend(order_view_creates(early_views).into_iter().map(|create| create.statement));
     statements.extend(early_detach);
-    statements.extend(order_view_and_routines(views, early_routines, true).into_iter().map(|drop| drop.statement));
+    statements.extend(order_view_and_routines(engine, target, views, early_routines));
     statements.extend(order_dependents_first(tables).into_iter().map(|drop| drop.statement));
     statements.extend(in_place);
     statements.extend(detach);
@@ -768,7 +769,7 @@ fn assemble_statements(
     statements.extend(after_recreate);
     statements.extend(only_target_drops.into_iter().flat_map(|drop| expand_sequence_drop(engine, target, drop)));
     statements.extend(table_creates.into_iter().map(|create| create.statement));
-    statements.extend(order_view_and_routine_creates(view_creates, delayed_routines));
+    statements.extend(order_view_and_routine_creates(engine, target, view_creates, delayed_routines));
     statements.extend(late_freeing);
     statements.extend(late_before);
     statements.extend(late_after);
@@ -814,7 +815,7 @@ fn blocking_routine_keys(routines: &[(String, String, String)], view_names: &std
                 continue;
             }
             let on_view = referenced_relations(definition).iter().any(|found| view_names.iter().any(|view| found.eq_ignore_ascii_case(view)));
-            let on_routine = routines.iter().any(|(other_key, other_name, _)| blocking.contains(other_key) && other_key != key && statement_mentions(definition, other_name));
+            let on_routine = routines.iter().any(|(other_key, other_name, _)| blocking.contains(other_key) && other_key != key && calls_routine(definition, other_name));
             if on_view || on_routine {
                 blocking.insert(key.clone());
                 progressed = true;
@@ -866,16 +867,16 @@ fn take_default_drops_if(enabled: bool, items: Vec<String>) -> (Vec<String>, Vec
     (early, rest)
 }
 
-fn order_view_and_routines(mut views: Vec<PlannedDrop>, routines: Vec<PlannedDrop>, dependents_first: bool) -> Vec<PlannedDrop> {
+fn order_view_and_routines(engine: Engine, side: &Side, mut views: Vec<PlannedDrop>, routines: Vec<PlannedDrop>) -> Vec<String> {
     views.extend(routines);
     link_view_routine_references(&mut views);
-    order_planned(views, dependents_first)
+    order_linked(engine, side, views, true)
 }
 
-fn order_view_and_routine_creates(views: Vec<PlannedCreate>, routines: Vec<PlannedCreate>) -> Vec<String> {
+fn order_view_and_routine_creates(engine: Engine, side: &Side, views: Vec<PlannedCreate>, routines: Vec<PlannedCreate>) -> Vec<String> {
     let mut items = views.into_iter().chain(routines).map(drop_from_create).collect::<Vec<_>>();
     link_view_routine_references(&mut items);
-    order_planned(items, false).into_iter().map(|item| item.statement).collect()
+    order_linked(engine, side, items, false)
 }
 
 fn drop_from_create(create: PlannedCreate) -> PlannedDrop {
@@ -906,7 +907,8 @@ fn link_view_routine_references(items: &mut [PlannedDrop]) {
                 .filter(|key| key != &item.key)
                 .collect::<std::collections::BTreeSet<_>>();
             for (key, name) in &routines {
-                if statement_mentions(&item.definition, name) {
+                // 列名、别名和同名标识不是调用。只有 name( 才让视图依赖例程。
+                if calls_routine(&item.definition, name) {
                     refs.insert(key.clone());
                 }
             }
@@ -914,7 +916,7 @@ fn link_view_routine_references(items: &mut [PlannedDrop]) {
         } else if matches!(item.kind, Kind::Function | Kind::Procedure) {
             let mut refs = std::collections::BTreeSet::new();
             for (key, name) in &routines {
-                if key != &item.key && statement_mentions(&item.definition, name) {
+                if key != &item.key && calls_routine(&item.definition, name) {
                     refs.insert(key.clone());
                 }
             }
@@ -926,6 +928,402 @@ fn link_view_routine_references(items: &mut [PlannedDrop]) {
             item.references = refs.into_iter().collect();
         }
     }
+}
+
+/// 没有视图和例程互相引用的环时，沿用标识拓扑。有环则先把例程换成不引用对方的正文，再删或建真正对象，最后写回原定义。
+fn order_linked(engine: Engine, side: &Side, items: Vec<PlannedDrop>, dependents_first: bool) -> Vec<String> {
+    if engine == Engine::Postgres && mixed_view_routine_cycle(&items) {
+        emit_breaking_cycles(engine, side, items, dependents_first)
+    } else {
+        order_planned(items, dependents_first).into_iter().map(|item| item.statement).collect()
+    }
+}
+
+fn mixed_view_routine_cycle(items: &[PlannedDrop]) -> bool {
+    component_keys(items).into_iter().any(|component| {
+        component.len() > 1
+            && component.iter().any(|key| item_kind(items, key) == Some(Kind::View))
+            && component.iter().any(|key| matches!(item_kind(items, key), Some(Kind::Function | Kind::Procedure)))
+    })
+}
+
+fn item_kind(items: &[PlannedDrop], key: &str) -> Option<Kind> {
+    items.iter().find(|item| item.key == key).map(|item| item.kind)
+}
+
+fn dependency_map(items: &[PlannedDrop]) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    let mut map = std::collections::BTreeMap::new();
+    for item in items {
+        let entry = map.entry(item.key.clone()).or_insert_with(std::collections::BTreeSet::new);
+        for referenced in &item.references {
+            if referenced != &item.key && items.iter().any(|candidate| candidate.key == *referenced) {
+                entry.insert(referenced.clone());
+            }
+        }
+    }
+    map
+}
+
+fn component_keys(items: &[PlannedDrop]) -> Vec<Vec<String>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let deps = dependency_map(items);
+    let keys = deps.keys().cloned().collect::<Vec<_>>();
+    let mut reverse: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for key in &keys {
+        reverse.entry(key.clone()).or_default();
+        for dependency in deps.get(key).into_iter().flatten() {
+            reverse.entry(dependency.clone()).or_default().push(key.clone());
+        }
+    }
+    let mut seen = BTreeSet::new();
+    let mut order = Vec::new();
+    for key in &keys {
+        visit_forward(key, &deps, &mut seen, &mut order);
+    }
+    seen.clear();
+    let mut components = Vec::new();
+    for key in order.iter().rev() {
+        if seen.contains(key) {
+            continue;
+        }
+        let mut component = Vec::new();
+        visit_reverse(key, &reverse, &mut seen, &mut component);
+        component.sort();
+        components.push(component);
+    }
+    components
+}
+
+fn visit_forward(key: &str, deps: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, seen: &mut std::collections::BTreeSet<String>, order: &mut Vec<String>) {
+    if !seen.insert(key.to_owned()) {
+        return;
+    }
+    for next in deps.get(key).into_iter().flatten() {
+        visit_forward(next, deps, seen, order);
+    }
+    order.push(key.to_owned());
+}
+
+fn visit_reverse(key: &str, reverse: &std::collections::BTreeMap<String, Vec<String>>, seen: &mut std::collections::BTreeSet<String>, component: &mut Vec<String>) {
+    if !seen.insert(key.to_owned()) {
+        return;
+    }
+    component.push(key.to_owned());
+    for next in reverse.get(key).into_iter().flatten() {
+        visit_reverse(next, reverse, seen, component);
+    }
+}
+
+fn emit_breaking_cycles(engine: Engine, side: &Side, items: Vec<PlannedDrop>, dependents_first: bool) -> Vec<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let deps = dependency_map(&items);
+    let mut by_key: BTreeMap<String, Vec<PlannedDrop>> = BTreeMap::new();
+    for item in items {
+        by_key.entry(item.key.clone()).or_default().push(item);
+    }
+    let mut components = component_keys(&by_key.values().flatten().cloned().collect::<Vec<_>>());
+    components.sort_by(|left, right| left[0].cmp(&right[0]));
+    let key_component = components
+        .iter()
+        .enumerate()
+        .flat_map(|(index, component)| component.iter().map(move |key| (key.clone(), index)))
+        .collect::<BTreeMap<_, _>>();
+    let mut indegree = vec![0usize; components.len()];
+    let mut edges = vec![BTreeSet::new(); components.len()];
+    for (key, references) in &deps {
+        let Some(&from_component) = key_component.get(key) else {
+            continue;
+        };
+        for referenced in references {
+            let Some(&to_component) = key_component.get(referenced) else {
+                continue;
+            };
+            if from_component == to_component {
+                continue;
+            }
+            let (source, dest) = if dependents_first { (from_component, to_component) } else { (to_component, from_component) };
+            if edges[source].insert(dest) {
+                indegree[dest] += 1;
+            }
+        }
+    }
+    let mut ready = indegree.iter().enumerate().filter(|(_, degree)| **degree == 0).map(|(index, _)| index).collect::<BTreeSet<_>>();
+    let mut ordered = Vec::new();
+    while let Some(index) = ready.iter().next().cloned() {
+        ready.remove(&index);
+        ordered.push(index);
+        for next in edges[index].clone() {
+            indegree[next] -= 1;
+            if indegree[next] == 0 {
+                ready.insert(next);
+            }
+        }
+    }
+    for index in 0..components.len() {
+        if !ordered.contains(&index) {
+            ordered.push(index);
+        }
+    }
+    let mut statements = Vec::new();
+    for index in ordered {
+        let component = &components[index];
+        let mixed = component.iter().any(|key| by_key.get(key).and_then(|group| group.first()).is_some_and(|item| item.kind == Kind::View))
+            && component.iter().any(|key| by_key.get(key).and_then(|group| group.first()).is_some_and(|item| matches!(item.kind, Kind::Function | Kind::Procedure)));
+        if mixed && component.len() > 1 {
+            statements.extend(break_view_routine_cycle(engine, side, component, &by_key, dependents_first));
+        } else {
+            for key in component {
+                if let Some(group) = by_key.get(key) {
+                    statements.extend(group.iter().map(|item| item.statement.clone()));
+                }
+            }
+        }
+    }
+    statements
+}
+
+fn break_view_routine_cycle(
+    engine: Engine,
+    side: &Side,
+    component: &[String],
+    by_key: &std::collections::BTreeMap<String, Vec<PlannedDrop>>,
+    dependents_first: bool,
+) -> Vec<String> {
+    let mut routines = Vec::new();
+    let mut views = Vec::new();
+    for key in component {
+        for item in by_key.get(key).into_iter().flatten() {
+            if matches!(item.kind, Kind::Function | Kind::Procedure) {
+                routines.push(item.clone());
+            } else if item.kind == Kind::View {
+                views.push(item.clone());
+            }
+        }
+    }
+    routines.sort_by(|left, right| left.name.cmp(&right.name).then(left.key.cmp(&right.key)));
+    let view_statements = order_planned(views, dependents_first).into_iter().map(|item| item.statement);
+    let mut statements = Vec::new();
+    if dependents_first {
+        for routine in &routines {
+            if let Some(stub) = stub_existing_routine(engine, side, routine) {
+                statements.push(stub);
+            }
+        }
+        statements.extend(view_statements);
+        statements.extend(routines.iter().map(|routine| routine.statement.clone()));
+    } else {
+        for routine in &routines {
+            if let Some(stub) = stub_new_routine(&routine.statement) {
+                statements.push(stub);
+            }
+        }
+        statements.extend(view_statements);
+        statements.extend(routines.iter().map(|routine| ensure_or_replace(&routine.statement)));
+    }
+    statements
+}
+
+fn stub_existing_routine(engine: Engine, side: &Side, routine: &PlannedDrop) -> Option<String> {
+    let keyword = if routine.kind == Kind::Procedure { "PROCEDURE" } else { "FUNCTION" };
+    let source = routine.definition.trim().trim_end_matches(';').trim();
+    if source.len() < 6 || !source[..6].eq_ignore_ascii_case("CREATE") {
+        return None;
+    }
+    let qualified = replace_name_after(source, keyword, &qualify(engine, side, &routine.name))?;
+    Some(ensure_or_replace(&stub_routine(&qualified)?))
+}
+
+fn stub_new_routine(statement: &str) -> Option<String> {
+    let stub = stub_routine(statement)?;
+    if has_or_replace(statement) { Some(ensure_or_replace(&stub)) } else { Some(stub) }
+}
+
+fn has_or_replace(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    if trimmed.len() < 6 || !trimmed[..6].eq_ignore_ascii_case("CREATE") {
+        return false;
+    }
+    let rest = trimmed[6..].trim_start();
+    rest.len() >= 10 && rest[..10].eq_ignore_ascii_case("OR REPLACE")
+}
+
+/// 保留签名和返回类型，正文不再引用视图或其它例程。
+fn stub_routine(sql: &str) -> Option<String> {
+    let function_at = find_keyword_end(sql, "FUNCTION");
+    let procedure_at = find_keyword_end(sql, "PROCEDURE");
+    let (keyword_end, procedure) = match (function_at, procedure_at) {
+        (Some(function), Some(procedure)) if procedure < function => (procedure, true),
+        (Some(function), _) => (function, false),
+        (_, Some(procedure)) => (procedure, true),
+        _ => return None,
+    };
+    let name_end = qualified_name_end(sql, skip_gap(sql, keyword_end))?;
+    let mut index = skip_gap(sql, name_end);
+    if sql[index..].starts_with('(') {
+        index = skip_raw_paren(sql, index)?;
+    }
+    index = skip_gap(sql, index);
+    let mut returns = String::new();
+    if !procedure && starts_with_word(sql, index, "RETURNS") {
+        index = skip_gap(sql, skip_word(sql, index));
+        let start = index;
+        index = skip_returns_type(sql, index);
+        returns = sql[start..index].trim().to_owned();
+    }
+    let header = sql[..index].trim_end();
+    Some(stub_with_header(header, procedure, &returns))
+}
+
+fn stub_with_header(header: &str, procedure: bool, returns: &str) -> String {
+    if procedure {
+        return format!("{header} LANGUAGE plpgsql AS $$ BEGIN NULL; END $$");
+    }
+    let upper = returns.to_ascii_uppercase();
+    if returns.is_empty() || upper.contains("SETOF") || upper.contains("TABLE") || upper == "VOID" {
+        format!("{header} LANGUAGE plpgsql AS $$ BEGIN RETURN; END $$")
+    } else {
+        format!("{header} LANGUAGE sql AS $$ SELECT NULL::{returns} $$")
+    }
+}
+
+fn skip_returns_type(sql: &str, mut index: usize) -> usize {
+    let mut depth = 0i32;
+    while index < sql.len() {
+        if let Some(next) = skip_delimited(sql, index) {
+            index = next;
+            continue;
+        }
+        let ch = sql[index..].chars().next().unwrap();
+        if ch == '(' {
+            depth += 1;
+            index += 1;
+            continue;
+        }
+        if ch == ')' {
+            depth = depth.saturating_sub(1);
+            index += 1;
+            continue;
+        }
+        if depth == 0 && is_ident_start(ch) {
+            let end = ident_continue(sql, index);
+            if is_returns_stop(&sql[index..end]) {
+                return index;
+            }
+            index = end;
+            continue;
+        }
+        index += ch.len_utf8();
+    }
+    index
+}
+
+fn is_returns_stop(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "LANGUAGE" | "AS" | "WINDOW" | "IMMUTABLE" | "STABLE" | "VOLATILE" | "LEAKPROOF" | "CALLED" | "STRICT" | "COST" | "ROWS" | "PARALLEL" | "SECURITY" | "SET" | "TRANSFORM" | "NOT"
+    )
+}
+
+fn skip_raw_paren(sql: &str, open: usize) -> Option<usize> {
+    if !sql.get(open..)?.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut index = open;
+    while index < sql.len() {
+        if let Some(next) = skip_delimited(sql, index) {
+            index = next;
+            continue;
+        }
+        let ch = sql[index..].chars().next()?;
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+            index += 1;
+            if depth == 0 {
+                return Some(index);
+            }
+            continue;
+        }
+        index += ch.len_utf8();
+    }
+    None
+}
+
+fn calls_routine(sql: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let tokens = sql_tokens(sql);
+    let mut index = 0;
+    while index < tokens.len() {
+        if is_word(&tokens[index], "CREATE") {
+            let next = skip_created_signature(&tokens, index);
+            if next > index {
+                index = next;
+                continue;
+            }
+        }
+        if is_ident_token(&tokens[index]) {
+            let (found, next) = qualified_relation(&tokens, index);
+            if next > index && next < tokens.len() && tokens[next].text == "(" && found.eq_ignore_ascii_case(name) {
+                return true;
+            }
+            if next > index {
+                index = next;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+fn skip_created_signature(tokens: &[SqlToken], create_at: usize) -> usize {
+    let mut index = create_at + 1;
+    if index < tokens.len() && is_word(&tokens[index], "OR") {
+        index += 1;
+        if index < tokens.len() && is_word(&tokens[index], "REPLACE") {
+            index += 1;
+        }
+    }
+    let mut guard = 0;
+    while index < tokens.len() && guard < 6 {
+        if matches_created_keyword(&tokens[index]) {
+            break;
+        }
+        if is_word(&tokens[index], "TEMP") || is_word(&tokens[index], "TEMPORARY") {
+            index += 1;
+            guard += 1;
+            continue;
+        }
+        return create_at + 1;
+    }
+    if index >= tokens.len() {
+        return create_at + 1;
+    }
+    if is_word(&tokens[index], "MATERIALIZED") {
+        index += 1;
+    }
+    if index < tokens.len() && matches_created_keyword(&tokens[index]) && !is_word(&tokens[index], "MATERIALIZED") {
+        index += 1;
+    } else if index >= tokens.len() || !is_word(&tokens[index], "VIEW") {
+        return create_at + 1;
+    }
+    if index >= tokens.len() || !is_ident_token(&tokens[index]) {
+        return index;
+    }
+    let (_, next) = qualified_relation(tokens, index);
+    index = if next > index { next } else { index + 1 };
+    if index < tokens.len() && tokens[index].text == "(" {
+        index = matching_paren(tokens, index).saturating_add(1);
+    }
+    index
+}
+
+fn matches_created_keyword(token: &SqlToken) -> bool {
+    is_word(token, "VIEW") || is_word(token, "FUNCTION") || is_word(token, "PROCEDURE") || is_word(token, "TRIGGER") || is_word(token, "MATERIALIZED")
 }
 
 fn order_planned(items: Vec<PlannedDrop>, dependents_first: bool) -> Vec<PlannedDrop> {
@@ -1302,7 +1700,7 @@ fn attach_view_dependencies(views: &mut [PlannedDrop]) {
     }
 }
 
-/// 关系名来自 FROM / JOIN。字符串、注释、别名和 WITH 里的 CTE 名不算引用。
+/// 关系名来自 FROM / JOIN，以及 INSERT、UPDATE 的目标。字符串、注释、别名和 WITH 里的 CTE 名不算引用。
 fn referenced_relations(sql: &str) -> Vec<String> {
     let tokens = sql_tokens(sql);
     let mut refs = Vec::new();
@@ -1317,6 +1715,14 @@ fn collect_relations(tokens: &[SqlToken], refs: &mut Vec<String>, ctes: &mut Vec
     while index < tokens.len() {
         if is_word(&tokens[index], "WITH") {
             index = consume_with(tokens, index, refs, ctes);
+            continue;
+        }
+        if is_word(&tokens[index], "INSERT") {
+            index = consume_insert(tokens, index, refs, ctes);
+            continue;
+        }
+        if is_word(&tokens[index], "UPDATE") && is_table_update(tokens, index) {
+            index = consume_update(tokens, index, refs, ctes);
             continue;
         }
         if is_word(&tokens[index], "FROM") || is_word(&tokens[index], "JOIN") {
@@ -1335,6 +1741,74 @@ fn collect_relations(tokens: &[SqlToken], refs: &mut Vec<String>, ctes: &mut Vec
         index += 1;
     }
     ctes.truncate(scope);
+}
+
+/// FOR UPDATE、ON UPDATE、DO UPDATE 不是改表。BEFORE/AFTER UPDATE 是触发器时机。
+fn is_table_update(tokens: &[SqlToken], index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    let previous = &tokens[index - 1];
+    !is_word(previous, "FOR") && !is_word(previous, "ON") && !is_word(previous, "DO") && !is_word(previous, "BEFORE") && !is_word(previous, "AFTER")
+}
+
+fn consume_insert(tokens: &[SqlToken], insert_at: usize, refs: &mut Vec<String>, ctes: &[String]) -> usize {
+    let mut index = insert_at + 1;
+    if index < tokens.len() && is_word(&tokens[index], "INTO") {
+        index += 1;
+    }
+    if !starts_dml_target(tokens, index) {
+        return insert_at + 1;
+    }
+    parse_dml_target(tokens, index, refs, ctes)
+}
+
+fn consume_update(tokens: &[SqlToken], update_at: usize, refs: &mut Vec<String>, ctes: &[String]) -> usize {
+    let mut index = update_at + 1;
+    if index < tokens.len() && is_word(&tokens[index], "ONLY") {
+        index += 1;
+    }
+    if !starts_dml_target(tokens, index) {
+        return update_at + 1;
+    }
+    parse_dml_target(tokens, index, refs, ctes)
+}
+
+fn starts_dml_target(tokens: &[SqlToken], index: usize) -> bool {
+    if index >= tokens.len() {
+        return false;
+    }
+    if tokens[index].text == "(" {
+        return true;
+    }
+    is_ident_token(&tokens[index]) && !is_from_stop(&tokens[index].text) && !is_word(&tokens[index], "SET") && !is_word(&tokens[index], "VALUES") && !is_word(&tokens[index], "SELECT") && !is_word(&tokens[index], "DEFAULT")
+}
+
+fn parse_dml_target(tokens: &[SqlToken], mut index: usize, refs: &mut Vec<String>, ctes: &[String]) -> usize {
+    if index < tokens.len() && (is_word(&tokens[index], "ONLY") || is_word(&tokens[index], "LATERAL")) {
+        index += 1;
+    }
+    if index >= tokens.len() {
+        return index;
+    }
+    if tokens[index].text == "(" {
+        let end = matching_paren(tokens, index);
+        let mut nested = ctes.to_vec();
+        collect_relations(&tokens[index + 1..end], refs, &mut nested);
+        return skip_alias(tokens, end.saturating_add(1));
+    }
+    if !starts_dml_target(tokens, index) {
+        return index;
+    }
+    let (name, next) = qualified_relation(tokens, index);
+    if !name.is_empty() && !ctes.iter().any(|cte| cte.eq_ignore_ascii_case(&name)) {
+        refs.push(name);
+    }
+    index = next;
+    if index < tokens.len() && tokens[index].text == "(" {
+        index = matching_paren(tokens, index).saturating_add(1);
+    }
+    skip_alias(tokens, index)
 }
 
 /// 读完 WITH 绑定的 CTE，并让这些名字在后续主查询里可见。返回主查询起点。
@@ -1959,16 +2433,16 @@ fn cover_dependents(
                         .map(|create| create.definition.as_str())
                         .unwrap_or(current_body);
                     referenced_relations(current_body).iter().any(|name| dropped_views.iter().any(|drop| drop.eq_ignore_ascii_case(name)))
-                        || dropped_routines.iter().any(|name| statement_mentions(next_body, name))
+                        || dropped_routines.iter().any(|name| calls_routine(next_body, name))
                         || blocked.iter().any(|(table, column)| view_uses_table_column(next_body, table, column))
                 }
                 Kind::Trigger => {
                     dropped_relations.iter().any(|name| name.eq_ignore_ascii_case(&object.relation))
-                        || dropped_routines.iter().any(|name| statement_mentions(&object.definition, name))
+                        || dropped_routines.iter().any(|name| calls_routine(&object.definition, name))
                 }
-                // 例程正文里的 FROM/JOIN 会挡住 DROP VIEW。只看其他例程的名字盖不住视图。
+                // 例程正文里的 FROM/JOIN、INSERT、UPDATE 会挡住 DROP VIEW。调用才算依赖其它例程。
                 Kind::Function | Kind::Procedure => {
-                    let mentions_routine = dropped_routines.iter().any(|name| !name.eq_ignore_ascii_case(&object.name) && statement_mentions(&object.definition, name));
+                    let mentions_routine = dropped_routines.iter().any(|name| !name.eq_ignore_ascii_case(&object.name) && calls_routine(&object.definition, name));
                     let mentions_view = referenced_relations(&object.definition)
                         .iter()
                         .any(|found| dropped_views.iter().any(|name| found.eq_ignore_ascii_case(name)));
@@ -2018,7 +2492,7 @@ fn demote_blocked_view_replacements(
         .filter(|create| {
             let wanted = &create.definition;
             let current = &create.current_definition;
-            let keeps_dropped_routine = routine_drops.iter().any(|name| statement_mentions(wanted, name));
+            let keeps_dropped_routine = routine_drops.iter().any(|name| calls_routine(wanted, name));
             let keeps_blocked_column = blocked.iter().any(|(table, column)| view_uses_table_column(wanted, table, column));
             let needs_fresh = fresh_names
                 .iter()
