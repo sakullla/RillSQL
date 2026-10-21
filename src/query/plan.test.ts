@@ -167,6 +167,44 @@ describe("execution plan selection", () => {
     });
   });
 
+  it("reads a SQLite parent plan as a depth tree and leaves other tables as tables", () => {
+    expect(presentPlan(
+      ["id", "parent", "notused", "detail"],
+      [
+        ["1", "0", "0", "COMPOUND QUERY"],
+        ["2", "1", "0", "LEFT-MOST SUBQUERY"],
+        ["5", "2", "216", "SCAN t1"],
+        ["11", "1", "0", "UNION USING TEMP B-TREE"],
+        ["13", "11", "213", "SCAN t2 USING COVERING INDEX i4"],
+      ],
+    )).toEqual({
+      kind: "tree",
+      nodes: [
+        { depth: 0, operation: "COMPOUND QUERY", rows: null, extra: "" },
+        { depth: 1, operation: "LEFT-MOST SUBQUERY", rows: null, extra: "" },
+        { depth: 2, operation: "SCAN t1", rows: null, extra: "" },
+        { depth: 1, operation: "UNION USING TEMP B-TREE", rows: null, extra: "" },
+        { depth: 2, operation: "SCAN t2 USING COVERING INDEX i4", rows: null, extra: "" },
+      ],
+    });
+    expect(presentPlan(
+      ["id", "parent", "notused", "detail"],
+      [
+        ["3", "0", "48", "SEARCH t1 USING COVERING INDEX i2 (a=? AND b>?)"],
+        ["8", "0", "216", "SCAN t2"],
+      ],
+    )).toEqual({
+      kind: "tree",
+      nodes: [
+        { depth: 0, operation: "SEARCH t1 USING COVERING INDEX i2 (a=? AND b>?)", rows: null, extra: "" },
+        { depth: 0, operation: "SCAN t2", rows: null, extra: "" },
+      ],
+    });
+    expect(presentPlan(["id", "parent", "extra", "detail"], [["1", "0", "0", "SCAN t1"]])).toEqual({ kind: "table" });
+    expect(presentPlan(["id", "parent", "notused", "detail"], [])).toEqual({ kind: "table" });
+    expect(presentPlan(["id", "parent", "notused", "detail"], [["root", "0", "0", "SCAN t1"]])).toEqual({ kind: "table" });
+  });
+
   it("reads a MariaDB JSON plan into operations and estimated rows", () => {
     const json = JSON.stringify({
       query_block: {

@@ -96,8 +96,10 @@ export type PlanPresentation =
   | { kind: "tree"; nodes: PlanNode[] }
   | { kind: "table" };
 
-/** 单列缩进文本或 MariaDB 的 JSON 计划按层次展开；认不出时只当表格。 */
+/** 单列缩进文本、MariaDB 的 JSON，或 SQLite 的 id/parent/detail 按层次展开；认不出时只当表格。 */
 export function presentPlan(columns: string[], rows: (string | null)[][]): PlanPresentation {
+  const sqlite = sqliteQueryPlan(columns, rows);
+  if (sqlite) return sqlite;
   if (columns.length !== 1) return { kind: "table" };
   const text = rows.map((row) => row[0] ?? "").join("\n").trim();
   const json = parseJsonPlan(text);
@@ -109,6 +111,48 @@ export function presentPlan(columns: string[], rows: (string | null)[][]): PlanP
     nodes.push(parsePlanLine(line));
   }
   return nodes.length ? { kind: "tree", nodes } : { kind: "table" };
+}
+
+/** SQLite 的 EXPLAIN QUERY PLAN 固定为 id、parent、notused、detail。父 id 不在结果中时该节点是根。 */
+function sqliteQueryPlan(columns: string[], rows: (string | null)[][]): PlanPresentation | null {
+  if (columns.length !== 4 || rows.length === 0) return null;
+  const names = columns.map((column) => column.trim().toLowerCase());
+  if (names[0] !== "id" || names[1] !== "parent" || names[2] !== "notused" || names[3] !== "detail") return null;
+  const records: { id: string; parent: string; detail: string }[] = [];
+  for (const row of rows) {
+    const id = (row[0] ?? "").trim();
+    const parent = (row[1] ?? "").trim();
+    if (!/^\d+$/.test(id) || !/^\d+$/.test(parent)) return null;
+    records.push({ id, parent, detail: (row[3] ?? "").trim() });
+  }
+  if (!records.some((record) => record.detail)) return null;
+  const byId = new Map<string, { id: string; parent: string; detail: string }>();
+  for (const record of records) {
+    if (!byId.has(record.id)) byId.set(record.id, record);
+  }
+  const depthOf = new Map<string, number>();
+  const depth = (id: string, seen: Set<string>): number => {
+    const known = depthOf.get(id);
+    if (known != null) return known;
+    const record = byId.get(id);
+    if (!record || record.parent === id || !byId.has(record.parent) || seen.has(id)) {
+      depthOf.set(id, 0);
+      return 0;
+    }
+    seen.add(id);
+    const value = depth(record.parent, seen) + 1;
+    depthOf.set(id, value);
+    return value;
+  };
+  return {
+    kind: "tree",
+    nodes: records.map((record) => ({
+      depth: depth(record.id, new Set()),
+      operation: record.detail,
+      rows: null,
+      extra: "",
+    })),
+  };
 }
 
 function isIndentedPlan(text: string): boolean {
