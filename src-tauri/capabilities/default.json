@@ -30,6 +30,7 @@
     "allow-ddl-describe",
     "allow-ddl-preview",
     "allow-ddl-execute",
+    "allow-diagram-read",
     "allow-grid-describe",
     "allow-grid-page",
     "allow-grid-count",

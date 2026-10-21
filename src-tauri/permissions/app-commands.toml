@@ -84,6 +84,11 @@ description = "允许从已打开的会话读取函数、存储过程或触发�
 commands.allow = ["catalog_definition"]
 
 [[permission]]
+identifier = "allow-diagram-read"
+description = "允许从已打开的会话读取当前库或 schema 的只读关系图，不执行结构变更或数据写入。"
+commands.allow = ["diagram_read"]
+
+[[permission]]
 identifier = "allow-ddl-describe"
 description = "允许从已打开的会话读取表结构编辑信息。"
 commands.allow = ["ddl_describe"]

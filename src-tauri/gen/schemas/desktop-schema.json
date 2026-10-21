@@ -303,6 +303,12 @@
           "markdownDescription": "允许为已打开的会话生成结构变更预览，不执行。"
         },
         {
+          "description": "允许从已打开的会话读取当前库或 schema 的只读关系图，不执行结构变更或数据写入。",
+          "type": "string",
+          "const": "allow-diagram-read",
+          "markdownDescription": "允许从已打开的会话读取当前库或 schema 的只读关系图，不执行结构变更或数据写入。"
+        },
+        {
           "description": "允许删除环境标签，并把仍使用它的连接改为无标签。",
           "type": "string",
           "const": "allow-env-tags-delete",
