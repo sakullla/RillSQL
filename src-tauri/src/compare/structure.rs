@@ -655,8 +655,20 @@ fn assemble_statements(
         }
     }
     let by_name = |left: &PlannedDrop, right: &PlannedDrop| left.name.cmp(&right.name).then(left.statement.cmp(&right.statement));
-    attach_view_dependencies(&mut views);
     triggers.sort_by(by_name);
+    // 引用即将删除的视图的例程必须先于该视图删除，不能留在后面的固定阶段。
+    let dropped_view_names = views.iter().map(|view| view.name.clone()).collect::<BTreeSet<_>>();
+    let early_keys = routine_drop_keys(&support_drops, &dropped_view_names);
+    let mut early_routines = Vec::new();
+    let mut late_support = Vec::new();
+    for drop in support_drops {
+        if early_keys.contains(&drop.key) {
+            early_routines.push(drop);
+        } else {
+            late_support.push(drop);
+        }
+    }
+    let support_drops = late_support;
     let dropped_tables = tables.iter().map(|table| table.name.clone()).collect::<BTreeSet<_>>();
     let mut changed_drops = Vec::new();
     let mut only_target_drops = Vec::new();
@@ -681,10 +693,11 @@ fn assemble_statements(
     let mut table_creates = Vec::new();
     let mut view_creates = Vec::new();
     let mut trigger_creates = Vec::new();
-    let drop_keys = changed_drops.iter().map(|item| item.key.clone()).collect::<BTreeSet<_>>();
+    let drop_keys = changed_drops.iter().chain(early_routines.iter()).map(|item| item.key.clone()).collect::<BTreeSet<_>>();
     let routine_drops = changed_drops
         .iter()
         .chain(only_target_drops.iter())
+        .chain(early_routines.iter())
         .filter(|drop| matches!(drop.kind, Kind::Function | Kind::Procedure))
         .map(|drop| drop.name.clone())
         .collect::<Vec<_>>();
@@ -702,20 +715,48 @@ fn assemble_statements(
     let by_create = |left: &PlannedCreate, right: &PlannedCreate| left.name.cmp(&right.name).then(left.statement.cmp(&right.statement));
     let changed_creates = order_support_creates(changed_creates);
     let fresh_creates = order_support_creates(fresh_creates);
+    // 新建例程若要查询本次才创建的视图，就得跟视图一起排，不能全部放在视图前面。
+    let created_view_names = view_creates.iter().map(|view| view.name.clone()).collect::<BTreeSet<_>>();
+    let waiting_keys = create_keys_depending_on_views(&fresh_creates, &changed_creates, &created_view_names);
+    let (fresh_creates, mut delayed_routines) = split_waiting(fresh_creates, &waiting_keys);
+    let (changed_creates, delayed_more) = split_waiting(changed_creates, &waiting_keys);
+    delayed_routines.extend(delayed_more);
     let changed_names = changed_creates.iter().map(|item| item.name.clone()).collect::<Vec<_>>();
     let fresh_names = fresh_creates.iter().map(|item| item.name.clone()).collect::<Vec<_>>();
+    let delayed_names = delayed_routines.iter().map(|item| item.name.clone()).collect::<Vec<_>>();
     // 改到新类型的 ALTER 会提到新名字。新对象还没建时不能先跑；旧类型还被列用着时也不能先 DROP。
     let (freeing_alters, before_drop, after_recreate) = partition_alters(&alters, &fresh_names, &changed_names);
     table_creates.sort_by(by_create);
     trigger_creates.sort_by(by_create);
+    let (freeing_alters, late_freeing) = split_mentions(freeing_alters, &delayed_names);
+    let (before_drop, late_before) = split_mentions(before_drop, &delayed_names);
+    let (after_recreate, late_after) = split_mentions(after_recreate, &delayed_names);
+    let (restore_now, late_restore) = split_mentions(restore, &delayed_names);
+    // 列默认值的语句里没有函数名。引用被提前删除的例程时，先去掉默认值，否则 DROP FUNCTION 会被拒绝。
+    let pull_defaults = !early_routines.is_empty();
+    let (detach_defaults, detach) = take_default_drops_if(pull_defaults, detach);
+    let (alter_defaults, freeing_alters) = take_default_drops_if(pull_defaults, freeing_alters);
+    let (before_defaults, before_drop) = take_default_drops_if(pull_defaults, before_drop);
+    let (after_defaults, after_recreate) = take_default_drops_if(pull_defaults, after_recreate);
+    let (late_freeing_defaults, late_freeing) = take_default_drops_if(pull_defaults, late_freeing);
+    let (late_before_defaults, late_before) = take_default_drops_if(pull_defaults, late_before);
+    let (late_after_defaults, late_after) = take_default_drops_if(pull_defaults, late_after);
+    let mut early_detach = detach_defaults;
+    early_detach.extend(alter_defaults);
+    early_detach.extend(before_defaults);
+    early_detach.extend(after_defaults);
+    early_detach.extend(late_freeing_defaults);
+    early_detach.extend(late_before_defaults);
+    early_detach.extend(late_after_defaults);
     let mut statements = Vec::new();
     statements.extend(drop_fk);
     statements.extend(drop_index);
     statements.extend(triggers.into_iter().map(|drop| drop.statement));
-    statements.extend(order_dependents_first(views).into_iter().map(|drop| drop.statement));
-    statements.extend(order_dependents_first(tables).into_iter().map(|drop| drop.statement));
-    // 当前视图还引用即将删掉的列或函数时，先换成不再引用它们的定义，后面的 ALTER / DROP 才过得去。
+    // 还引用即将删掉的函数时，先换成不再引用它的定义，后面的 DROP FUNCTION 才过得去。
     statements.extend(order_view_creates(early_views).into_iter().map(|create| create.statement));
+    statements.extend(early_detach);
+    statements.extend(order_view_and_routines(views, early_routines, true).into_iter().map(|drop| drop.statement));
+    statements.extend(order_dependents_first(tables).into_iter().map(|drop| drop.statement));
     statements.extend(in_place);
     statements.extend(detach);
     statements.extend(freeing_alters);
@@ -723,15 +764,222 @@ fn assemble_statements(
     statements.extend(before_drop);
     statements.extend(changed_drops.into_iter().flat_map(|drop| expand_sequence_drop(engine, target, drop)));
     statements.extend(changed_creates.into_iter().map(|create| create.statement));
-    statements.extend(restore);
+    statements.extend(restore_now);
     statements.extend(after_recreate);
     statements.extend(only_target_drops.into_iter().flat_map(|drop| expand_sequence_drop(engine, target, drop)));
     statements.extend(table_creates.into_iter().map(|create| create.statement));
-    statements.extend(order_view_creates(view_creates).into_iter().map(|create| create.statement));
+    statements.extend(order_view_and_routine_creates(view_creates, delayed_routines));
+    statements.extend(late_freeing);
+    statements.extend(late_before);
+    statements.extend(late_after);
+    statements.extend(late_restore);
     statements.extend(trigger_creates.into_iter().map(|create| create.statement));
     statements.extend(create_index);
     statements.extend(create_fk);
     statements
+}
+
+fn routine_drop_keys(items: &[PlannedDrop], view_names: &std::collections::BTreeSet<String>) -> std::collections::BTreeSet<String> {
+    let routines = items
+        .iter()
+        .filter(|item| matches!(item.kind, Kind::Function | Kind::Procedure))
+        .map(|item| (item.key.clone(), item.name.clone(), item.definition.clone()))
+        .collect::<Vec<_>>();
+    blocking_routine_keys(&routines, view_names)
+}
+
+fn create_keys_depending_on_views(
+    fresh: &[PlannedCreate],
+    changed: &[PlannedCreate],
+    view_names: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    let routines = fresh
+        .iter()
+        .chain(changed.iter())
+        .filter(|item| matches!(item.kind, Kind::Function | Kind::Procedure))
+        .map(|item| (item.key.clone(), item.name.clone(), item.definition.clone()))
+        .collect::<Vec<_>>();
+    blocking_routine_keys(&routines, view_names)
+}
+
+/// 直接或间接查询这些视图的例程。视图引用例程不算，那种例程仍留在视图之后删除、之前创建。
+fn blocking_routine_keys(routines: &[(String, String, String)], view_names: &std::collections::BTreeSet<String>) -> std::collections::BTreeSet<String> {
+    use std::collections::BTreeSet;
+    let mut blocking = BTreeSet::new();
+    let mut progressed = true;
+    while progressed {
+        progressed = false;
+        for (key, _, definition) in routines {
+            if blocking.contains(key) {
+                continue;
+            }
+            let on_view = referenced_relations(definition).iter().any(|found| view_names.iter().any(|view| found.eq_ignore_ascii_case(view)));
+            let on_routine = routines.iter().any(|(other_key, other_name, _)| blocking.contains(other_key) && other_key != key && statement_mentions(definition, other_name));
+            if on_view || on_routine {
+                blocking.insert(key.clone());
+                progressed = true;
+            }
+        }
+    }
+    blocking
+}
+
+fn split_waiting(items: Vec<PlannedCreate>, waiting: &std::collections::BTreeSet<String>) -> (Vec<PlannedCreate>, Vec<PlannedCreate>) {
+    let mut kept = Vec::new();
+    let mut delayed = Vec::new();
+    for item in items {
+        if waiting.contains(&item.key) {
+            delayed.push(item);
+        } else {
+            kept.push(item);
+        }
+    }
+    (kept, delayed)
+}
+
+fn split_mentions(items: Vec<String>, names: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut moved = Vec::new();
+    for item in items {
+        if names.iter().any(|name| statement_mentions(&item, name)) {
+            moved.push(item);
+        } else {
+            kept.push(item);
+        }
+    }
+    (kept, moved)
+}
+
+fn take_default_drops_if(enabled: bool, items: Vec<String>) -> (Vec<String>, Vec<String>) {
+    if !enabled {
+        return (Vec::new(), items);
+    }
+    let mut early = Vec::new();
+    let mut rest = Vec::new();
+    for item in items {
+        if item.to_ascii_uppercase().contains("DROP DEFAULT") {
+            early.push(item);
+        } else {
+            rest.push(item);
+        }
+    }
+    (early, rest)
+}
+
+fn order_view_and_routines(mut views: Vec<PlannedDrop>, routines: Vec<PlannedDrop>, dependents_first: bool) -> Vec<PlannedDrop> {
+    views.extend(routines);
+    link_view_routine_references(&mut views);
+    order_planned(views, dependents_first)
+}
+
+fn order_view_and_routine_creates(views: Vec<PlannedCreate>, routines: Vec<PlannedCreate>) -> Vec<String> {
+    let mut items = views.into_iter().chain(routines).map(drop_from_create).collect::<Vec<_>>();
+    link_view_routine_references(&mut items);
+    order_planned(items, false).into_iter().map(|item| item.statement).collect()
+}
+
+fn drop_from_create(create: PlannedCreate) -> PlannedDrop {
+    PlannedDrop {
+        kind: create.kind,
+        name: create.name,
+        key: create.key,
+        statement: create.statement,
+        definition: create.definition,
+        relation: create.relation,
+        references: Vec::new(),
+    }
+}
+
+/// 视图之间只用 FROM/JOIN。例程查询视图、视图调用例程都记在同一张图里，避免全部函数固定在全部视图的一侧。
+fn link_view_routine_references(items: &mut [PlannedDrop]) {
+    let views = items.iter().filter(|item| item.kind == Kind::View).map(|item| (item.key.clone(), item.name.clone())).collect::<Vec<_>>();
+    let routines = items
+        .iter()
+        .filter(|item| matches!(item.kind, Kind::Function | Kind::Procedure))
+        .map(|item| (item.key.clone(), item.name.clone()))
+        .collect::<Vec<_>>();
+    for item in items.iter_mut() {
+        if item.kind == Kind::View {
+            let mut refs = referenced_relations(&item.definition)
+                .into_iter()
+                .filter_map(|found| views.iter().find(|(_, name)| found.eq_ignore_ascii_case(name)).map(|(key, _)| key.clone()))
+                .filter(|key| key != &item.key)
+                .collect::<std::collections::BTreeSet<_>>();
+            for (key, name) in &routines {
+                if statement_mentions(&item.definition, name) {
+                    refs.insert(key.clone());
+                }
+            }
+            item.references = refs.into_iter().collect();
+        } else if matches!(item.kind, Kind::Function | Kind::Procedure) {
+            let mut refs = std::collections::BTreeSet::new();
+            for (key, name) in &routines {
+                if key != &item.key && statement_mentions(&item.definition, name) {
+                    refs.insert(key.clone());
+                }
+            }
+            for (key, name) in &views {
+                if referenced_relations(&item.definition).iter().any(|found| found.eq_ignore_ascii_case(name)) {
+                    refs.insert(key.clone());
+                }
+            }
+            item.references = refs.into_iter().collect();
+        }
+    }
+}
+
+fn order_planned(items: Vec<PlannedDrop>, dependents_first: bool) -> Vec<PlannedDrop> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut by_key: BTreeMap<String, Vec<PlannedDrop>> = BTreeMap::new();
+    for item in items {
+        by_key.entry(item.key.clone()).or_default().push(item);
+    }
+    let mut forward: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut indegree: BTreeMap<String, usize> = BTreeMap::new();
+    for key in by_key.keys() {
+        forward.insert(key.clone(), BTreeSet::new());
+        indegree.insert(key.clone(), 0);
+    }
+    for group in by_key.values() {
+        for item in group {
+            for referenced in &item.references {
+                if referenced == &item.key || !by_key.contains_key(referenced) {
+                    continue;
+                }
+                let (from, to) = if dependents_first { (item.key.clone(), referenced.clone()) } else { (referenced.clone(), item.key.clone()) };
+                if forward.get_mut(&from).expect("from").insert(to.clone()) {
+                    *indegree.get_mut(&to).expect("to") += 1;
+                }
+            }
+        }
+    }
+    let mut ready: BTreeSet<String> = indegree.iter().filter(|(_, degree)| **degree == 0).map(|(key, _)| key.clone()).collect();
+    let mut ordered = Vec::new();
+    while let Some(key) = ready.iter().next().cloned() {
+        ready.remove(&key);
+        ordered.push(key.clone());
+        for next in forward.get(&key).into_iter().flatten() {
+            let degree = indegree.get_mut(next).expect("next");
+            *degree -= 1;
+            if *degree == 0 {
+                ready.insert(next.clone());
+            }
+        }
+    }
+    let mut cyclic = indegree
+        .iter()
+        .filter(|(key, degree)| **degree > 0 && !ordered.iter().any(|item| item == *key))
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    cyclic.sort();
+    ordered.extend(cyclic);
+    let mut result = Vec::new();
+    for key in ordered {
+        if let Some(group) = by_key.remove(&key) {
+            result.extend(group);
+        }
+    }
+    result
 }
 
 fn order_support(mut items: Vec<PlannedDrop>, dependents_first: bool) -> Vec<PlannedDrop> {
@@ -1074,6 +1322,14 @@ fn collect_relations(tokens: &[SqlToken], refs: &mut Vec<String>, ctes: &mut Vec
         if is_word(&tokens[index], "FROM") || is_word(&tokens[index], "JOIN") {
             let next = parse_table_list(tokens, index + 1, refs, ctes);
             index = if next > index { next } else { index + 1 };
+            continue;
+        }
+        // WHERE EXISTS 和标量子查询里的 FROM 也是引用，不能只扫本层。
+        if tokens[index].text == "(" {
+            let end = matching_paren(tokens, index);
+            let mut nested = ctes.clone();
+            collect_relations(&tokens[index + 1..end], refs, &mut nested);
+            index = end.saturating_add(1);
             continue;
         }
         index += 1;
@@ -1710,7 +1966,14 @@ fn cover_dependents(
                     dropped_relations.iter().any(|name| name.eq_ignore_ascii_case(&object.relation))
                         || dropped_routines.iter().any(|name| statement_mentions(&object.definition, name))
                 }
-                Kind::Function | Kind::Procedure => dropped_routines.iter().any(|name| !name.eq_ignore_ascii_case(&object.name) && statement_mentions(&object.definition, name)),
+                // 例程正文里的 FROM/JOIN 会挡住 DROP VIEW。只看其他例程的名字盖不住视图。
+                Kind::Function | Kind::Procedure => {
+                    let mentions_routine = dropped_routines.iter().any(|name| !name.eq_ignore_ascii_case(&object.name) && statement_mentions(&object.definition, name));
+                    let mentions_view = referenced_relations(&object.definition)
+                        .iter()
+                        .any(|found| dropped_views.iter().any(|name| found.eq_ignore_ascii_case(name)));
+                    mentions_routine || mentions_view
+                }
                 _ => false,
             };
             if !hit {

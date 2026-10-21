@@ -1039,6 +1039,56 @@ fn function_return_type_change_detaches_triggers_and_defaults_first() {
 }
 
 #[test]
+fn sql_routines_that_read_a_view_wait_for_that_view() {
+    let wanted = ObjectDef::defined(Kind::View, "v_base", "CREATE VIEW v_base AS SELECT id FROM notes");
+    let current = ObjectDef::defined(Kind::View, "v_base", "CREATE VIEW v_base AS SELECT 1");
+    let function = ObjectDef::defined(Kind::Function, "read_base", "CREATE FUNCTION read_base() RETURNS integer LANGUAGE sql AS $$ SELECT 1 FROM v_base $$");
+    let procedure = ObjectDef::defined(Kind::Procedure, "load_base", "CREATE PROCEDURE load_base() LANGUAGE sql AS $$ SELECT 1 WHERE EXISTS (SELECT 1 FROM v_base) $$");
+    let changed = diff_structure(
+        &Side::ready("postgres", "app", "public", vec![wanted.clone(), function.clone(), procedure.clone()]),
+        &Side::ready("postgres", "app", "public", vec![current.clone(), function.clone(), procedure.clone()]),
+    );
+    let script = &changed.script;
+    assert!(at(script, "DROP FUNCTION \"public\".\"read_base\"") < at(script, "DROP VIEW \"public\".\"v_base\""), "{script}");
+    assert!(at(script, "DROP PROCEDURE \"public\".\"load_base\"") < at(script, "DROP VIEW \"public\".\"v_base\""), "{script}");
+    assert!(function_create_at(script, "\"public\".\"read_base\"") > at(script, "CREATE VIEW \"public\".\"v_base\""), "{script}");
+    assert!(function_create_at(script, "\"public\".\"load_base\"") > at(script, "CREATE VIEW \"public\".\"v_base\""), "{script}");
+
+    let created = diff_structure(
+        &Side::ready("postgres", "app", "public", vec![wanted.clone(), function.clone(), procedure.clone()]),
+        &Side::ready("postgres", "app", "public", vec![]),
+    );
+    let script = &created.script;
+    assert!(function_create_at(script, "\"public\".\"read_base\"") > at(script, "CREATE VIEW \"public\".\"v_base\""), "{script}");
+    assert!(function_create_at(script, "\"public\".\"load_base\"") > at(script, "CREATE VIEW \"public\".\"v_base\""), "{script}");
+
+    let top = ObjectDef::defined(Kind::View, "v_top", "CREATE VIEW v_top AS SELECT read_base() AS n");
+    let chained = diff_structure(
+        &Side::ready("postgres", "app", "public", vec![wanted, function.clone(), top.clone()]),
+        &Side::ready("postgres", "app", "public", vec![current, function, top]),
+    );
+    let script = &chained.script;
+    assert!(at(script, "DROP VIEW \"public\".\"v_top\"") < at(script, "DROP FUNCTION \"public\".\"read_base\""), "{script}");
+    assert!(at(script, "DROP FUNCTION \"public\".\"read_base\"") < at(script, "DROP VIEW \"public\".\"v_base\""), "{script}");
+    assert!(at(script, "CREATE VIEW \"public\".\"v_base\"") < function_create_at(script, "\"public\".\"read_base\""), "{script}");
+    let top_create = script.find("CREATE OR REPLACE VIEW \"public\".\"v_top\"").or_else(|| script.find("CREATE VIEW \"public\".\"v_top\"")).expect("v_top");
+    assert!(function_create_at(script, "\"public\".\"read_base\"") < top_create, "{script}");
+
+    // 视图调用例程、例程不查询视图时，例程仍然先建后删。
+    let label = ObjectDef::defined(Kind::Function, "label", "CREATE FUNCTION label() RETURNS text LANGUAGE sql AS $$ SELECT 'a' $$");
+    let view = ObjectDef::defined(Kind::View, "v_label", "CREATE VIEW v_label AS SELECT label() AS name");
+    let kept = diff_structure(&Side::ready("postgres", "app", "public", vec![view.clone(), label.clone()]), &Side::ready("postgres", "app", "public", vec![]));
+    assert!(function_create_at(&kept.script, "\"public\".\"label\"") < at(&kept.script, "CREATE VIEW \"public\".\"v_label\""), "{}", kept.script);
+    let removed = diff_structure(&Side::ready("postgres", "app", "public", vec![]), &Side::ready("postgres", "app", "public", vec![view, label]));
+    assert!(at(&removed.script, "DROP VIEW \"public\".\"v_label\"") < at(&removed.script, "DROP FUNCTION \"public\".\"label\""), "{}", removed.script);
+}
+
+fn function_create_at(script: &str, name: &str) -> usize {
+    let markers = [format!("CREATE OR REPLACE FUNCTION {name}"), format!("CREATE FUNCTION {name}"), format!("CREATE OR REPLACE PROCEDURE {name}"), format!("CREATE PROCEDURE {name}")];
+    markers.iter().filter_map(|marker| script.find(marker)).min().unwrap_or_else(|| panic!("missing routine create {name} in {script}"))
+}
+
+#[test]
 fn view_cte_names_and_function_bodies_do_not_use_name_order() {
     let alias = ObjectDef::defined(Kind::View, "v_a", "CREATE VIEW v_a AS SELECT * FROM v_b");
     let cte = ObjectDef::defined(Kind::View, "v_b", "CREATE VIEW v_b AS WITH v_a AS (SELECT 1) SELECT * FROM v_a");
