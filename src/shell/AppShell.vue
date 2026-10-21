@@ -2,7 +2,7 @@
 import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { listPaletteTables, startCatalog } from "../catalog";
 import { objectIdentity, type CatalogObjectRef } from "../catalog/object-ref";
-import { objectLabel } from "../catalog/tree";
+import { isDefinitionKind, objectLabel } from "../catalog/tree";
 import { catalogConnections } from "../catalog/store";
 import { listPaletteConnections } from "../connections";
 import { exportTasks, taskStatusText } from "../export/tasks";
@@ -245,7 +245,7 @@ function onOpenObject(object: CatalogObjectRef, pane: "data" | "structure", sect
 }
 
 function onOpenDefinition(object: CatalogObjectRef) {
-  if (object.kind !== "function" && object.kind !== "procedure" && object.kind !== "trigger") return;
+  if (!isDefinitionKind(object.kind)) return;
   if (window.innerWidth <= 960) session.sidebarHidden.value = true;
   session.openDefinition({
     id: objectIdentity(object),

@@ -3,7 +3,7 @@ import { MODULE_ID } from "./index";
 import { createRefreshFixture, catalogFixture } from "./fixtures";
 import { listPaletteTables, refreshCatalog, replaceCatalog, resetCatalog, setRefreshSource } from "./store";
 import { browseSql, qualifiedObjectName } from "./object-ref";
-import { engineShape, objectGroups, objectPath, postgresSessionGap, reconcileObjects, refreshConnection, refreshSchema, schemaFailed, schemaIsEmpty, searchObjects, serverSliceCount, showsIndexGroup, successfulTotal, visibleTotal } from "./tree";
+import { engineShape, isDefinitionKind, objectGroups, objectPath, postgresSessionGap, reconcileObjects, refreshConnection, refreshSchema, schemaFailed, schemaIsEmpty, searchObjects, serverSliceCount, showsIndexGroup, successfulTotal, visibleTotal } from "./tree";
 import type { CatalogObject, SchemaNode } from "./types";
 
 function row(name: string, stale = false): CatalogObject {
@@ -25,6 +25,12 @@ describe("catalog tree", () => {
     expect(showsIndexGroup("view", false, 2)).toBe(false);
     expect(showsIndexGroup("view", true, 0)).toBe(false);
     expect(showsIndexGroup("view", true, 1)).toBe(true);
+    expect(isDefinitionKind("sequence")).toBe(true);
+    expect(isDefinitionKind("enum")).toBe(true);
+    expect(isDefinitionKind("domain")).toBe(true);
+    expect(isDefinitionKind("function")).toBe(true);
+    expect(isDefinitionKind("table")).toBe(false);
+    expect(isDefinitionKind("view")).toBe(false);
   });
 
   it("keeps the module id and separates engine levels", () => {

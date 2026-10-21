@@ -231,6 +231,129 @@ fn replacing_a_view_lists_every_statement_and_refuses_unsafe_cases() {
 }
 
 #[test]
+fn view_replace_matches_the_created_identifier_not_a_substring() {
+    let postgres = view_of(Engine::Postgres, "CREATE OR REPLACE VIEW \"public\".\"v_notes\" AS\nSELECT 1;");
+    let with_table_word = plan(
+        &postgres,
+        &Action::ReplaceView {
+            table: "v_notes".to_owned(),
+            definition: "CREATE VIEW \"public\".\"v_notes\" AS SELECT table_id, tableoid FROM notes".to_owned(),
+        },
+    );
+    assert!(with_table_word.blocked.is_empty(), "{:?}", with_table_word.blocked);
+    assert_eq!(with_table_word.steps.len(), 1);
+    assert!(with_table_word.steps[0].sql.contains("CREATE OR REPLACE VIEW"));
+    assert!(with_table_word.steps[0].sql.contains("\"v_notes\""));
+    assert!(with_table_word.steps[0].sql.contains("table_id"));
+    assert!(with_table_word.steps[0].sql.contains("tableoid"));
+    assert!(!with_table_word.steps[0].sql.to_ascii_uppercase().contains("DROP"));
+
+    let query_with_table_word = plan(
+        &postgres,
+        &Action::ReplaceView { table: "v_notes".to_owned(), definition: "SELECT table_id, tableoid FROM notes".to_owned() },
+    );
+    assert!(query_with_table_word.blocked.is_empty(), "{:?}", query_with_table_word.blocked);
+    assert!(query_with_table_word.steps[0].sql.starts_with("CREATE OR REPLACE VIEW \"public\".\"v_notes\""));
+
+    let other = plan(
+        &postgres,
+        &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW other_v AS SELECT 1 FROM v_notes".to_owned() },
+    );
+    assert!(other.steps.is_empty());
+    assert!(other.blocked.iter().any(|item| item.contains("不是当前视图") && item.contains("没有发送")));
+    assert!(other.steps.iter().all(|step| !step.sql.to_ascii_lowercase().contains("other_v")));
+
+    let other_schema = plan(
+        &postgres,
+        &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW \"other\".\"v_notes\" AS SELECT 1".to_owned() },
+    );
+    assert!(other_schema.steps.is_empty());
+    assert!(other_schema.blocked.iter().any(|item| item.contains("不是当前视图")));
+
+    let prefix = plan(
+        &postgres,
+        &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW v_notes_extra AS SELECT 1 FROM v_notes".to_owned() },
+    );
+    assert!(prefix.steps.is_empty());
+
+    let quoted_other_case = plan(
+        &postgres,
+        &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW \"V_Notes\" AS SELECT 1".to_owned() },
+    );
+    assert!(quoted_other_case.steps.is_empty());
+
+    let unquoted_same = plan(
+        &postgres,
+        &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW V_Notes AS SELECT table_id FROM notes".to_owned() },
+    );
+    assert!(unquoted_same.blocked.is_empty(), "{:?}", unquoted_same.blocked);
+    assert!(unquoted_same.steps[0].sql.contains("\"public\".\"v_notes\"") || unquoted_same.steps[0].sql.contains("V_Notes"));
+
+    let materialized_text = plan(
+        &postgres,
+        &Action::ReplaceView { table: "v_notes".to_owned(), definition: "SELECT 'MATERIALIZED VIEW' AS label".to_owned() },
+    );
+    assert!(materialized_text.blocked.is_empty(), "{:?}", materialized_text.blocked);
+    assert_eq!(materialized_text.steps.len(), 1);
+
+    let pasted_materialized = plan(
+        &postgres,
+        &Action::ReplaceView {
+            table: "v_notes".to_owned(),
+            definition: "CREATE MATERIALIZED VIEW \"public\".\"v_notes\" AS SELECT 1".to_owned(),
+        },
+    );
+    assert!(pasted_materialized.steps.is_empty());
+    assert!(pasted_materialized.blocked.iter().any(|item| item.contains("物化数据")));
+
+    let mysql = view_of(Engine::Mysql, "CREATE VIEW `v_notes` AS select `id` from `notes`");
+    let mysql_show = plan(
+        &mysql,
+        &Action::ReplaceView {
+            table: "v_notes".to_owned(),
+            definition: "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `v_notes` AS select `table_id` from `notes`".to_owned(),
+        },
+    );
+    assert!(mysql_show.blocked.is_empty(), "{:?}", mysql_show.blocked);
+    assert_eq!(mysql_show.steps.len(), 1);
+    assert!(mysql_show.steps[0].sql.starts_with("CREATE OR REPLACE ALGORITHM=UNDEFINED"));
+    assert!(mysql_show.steps[0].sql.contains("`v_notes`"));
+    assert!(mysql_show.steps[0].sql.contains("table_id"));
+    assert!(!mysql_show.steps[0].sql.to_ascii_uppercase().contains("DROP"));
+
+    let mysql_same_db = plan(
+        &mysql,
+        &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW `app`.`v_notes` AS select `table_id` from `notes`".to_owned() },
+    );
+    assert!(mysql_same_db.blocked.is_empty(), "{:?}", mysql_same_db.blocked);
+    assert!(mysql_same_db.steps[0].sql.contains("`app`.`v_notes`"));
+
+    let mysql_other_db = plan(
+        &mysql,
+        &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW `other`.`v_notes` AS select 1".to_owned() },
+    );
+    assert!(mysql_other_db.steps.is_empty());
+
+    let sqlite = view_of(Engine::Sqlite, "CREATE VIEW \"v_notes\" AS SELECT note FROM notes");
+    let sqlite_same = plan(
+        &sqlite,
+        &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW \"main\".\"v_notes\" AS SELECT table_id FROM notes".to_owned() },
+    );
+    assert!(sqlite_same.blocked.is_empty(), "{:?}", sqlite_same.blocked);
+    assert_eq!(sqlite_same.steps.len(), 2);
+    assert!(sqlite_same.steps[0].sql.starts_with("DROP VIEW"));
+    assert!(sqlite_same.steps[1].sql.contains("table_id"));
+    assert!(sqlite_same.steps.iter().position(|step| step.sql.contains("DROP")).unwrap() < sqlite_same.steps.iter().position(|step| step.sql.contains("CREATE VIEW")).unwrap());
+
+    let sqlite_other = plan(
+        &sqlite,
+        &Action::ReplaceView { table: "v_notes".to_owned(), definition: "CREATE VIEW \"other_v\" AS SELECT 1 FROM v_notes".to_owned() },
+    );
+    assert!(sqlite_other.steps.is_empty());
+    assert!(sqlite_other.blocked.iter().any(|item| item.contains("不是当前视图")));
+}
+
+#[test]
 fn drop_table_sql_contains_only_the_previewed_object() {
     let snapshot = notes("3.51.3");
     let planned = plan(&snapshot, &Action::DropTable { table: "notes".to_owned() });

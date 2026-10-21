@@ -46,6 +46,27 @@ describe("definition view", () => {
   });
 });
 
+describe("sequence definition", () => {
+  it("shows the read-only sequence sql and does not offer save", async () => {
+    const sequence = { ...object, schema: "public", name: "orders_id_seq", kind: "sequence" as const };
+    const sql = 'CREATE SEQUENCE "public"."orders_id_seq" AS bigint INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START WITH 1 CACHE 1 NO CYCLE;';
+    invoke.mockResolvedValueOnce(sql);
+    const wrapper = mount(DefinitionView, { props: { object: sequence, label: "orders_id_seq" } });
+    await vi.waitFor(() => {
+      expect(wrapper.find("[data-definition-sql]").exists()).toBe(true);
+    });
+    expect(wrapper.get("[data-definition]").attributes("data-kind")).toBe("sequence");
+    expect(wrapper.get("[data-definition-sql]").text()).toBe(sql);
+    expect(wrapper.get("[data-definition-sql]").attributes("data-readonly")).toBe("true");
+    expect(wrapper.find("[data-action=save]").exists()).toBe(false);
+    expect(wrapper.text()).not.toContain("保存");
+    await wrapper.get("[data-action=copy-definition]").trigger("click");
+    expect(wrapper.emitted("copy-sql")?.[0]?.[0]).toBe(sql);
+    expect(invoke).toHaveBeenCalledWith("catalog_definition", expect.objectContaining({ name: "orders_id_seq", kind: "sequence" }));
+    wrapper.unmount();
+  });
+});
+
 describe("definition command client", () => {
   it("rejects an empty payload instead of treating it as success", async () => {
     invoke.mockResolvedValueOnce("  ");

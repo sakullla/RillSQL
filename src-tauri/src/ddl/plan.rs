@@ -1155,7 +1155,12 @@ fn plan_replace_view(snapshot: &Snapshot, table: &str, definition: &str) -> Plan
     if statements.is_empty() {
         blocked.push("定义只剩空白和注释，没有发送。".to_owned());
     }
-    if snapshot.materialized || statements.iter().any(|item| item.to_ascii_uppercase().contains("MATERIALIZED VIEW")) {
+    // 只看语句开头是不是物化视图。查询正文里的 table_id、tableoid 或 “MATERIALIZED VIEW” 文本不是物化视图。
+    let head = match statements.as_slice() {
+        [statement] => classify_view_statement(statement),
+        _ => ViewHead::Other,
+    };
+    if snapshot.materialized || matches!(&head, ViewHead::Materialized) {
         blocked.push("无法在不丢弃物化数据的情况下替换这个物化视图，因此不发送。".to_owned());
     }
     if snapshot.engine == Engine::Sqlite {
@@ -1203,35 +1208,41 @@ fn plan_replace_view(snapshot: &Snapshot, table: &str, definition: &str) -> Plan
             return finish(snapshot.engine, false, target, vec![message], Vec::new(), Vec::new());
         }
     };
-    if !names_view(statement, table) && !is_query(statement) {
-        return finish(
-            snapshot.engine,
-            false,
-            target,
-            vec!["这段定义不能安全地替换当前视图，没有发送。".to_owned()],
-            Vec::new(),
-            Vec::new(),
-        );
-    }
+    // 名称按标识符边界比较。子串会把 table_id 当成 TABLE，或把 FROM v_notes 当成正在替换 v_notes。
+    let plain = match &head {
+        ViewHead::Query => None,
+        ViewHead::Plain(view) if targets_current_view(snapshot, table, view) => Some(statement.as_str()),
+        ViewHead::Plain(_) => {
+            return finish(
+                snapshot.engine,
+                false,
+                target,
+                vec!["这条语句创建的不是当前视图，没有发送。".to_owned()],
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+        ViewHead::Materialized | ViewHead::Other => {
+            return finish(
+                snapshot.engine,
+                false,
+                target,
+                vec!["这段定义不能安全地替换当前视图，没有发送。".to_owned()],
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+    };
     let risks = vec![Risk {
         level: "info".to_owned(),
         text: "将按下面的顺序替换视图定义。取消不会发送任何语句。".to_owned(),
     }];
     let steps = match snapshot.engine {
         Engine::Sqlite => {
-            let create = if is_create_view(statement) {
-                ensure_semicolon(statement)
-            } else if is_query(statement) {
-                format!("CREATE VIEW {qualified} AS\n{};", statement.trim().trim_end_matches(';').trim())
+            let create = if let Some(sql) = plain {
+                ensure_semicolon(sql)
             } else {
-                return finish(
-                    snapshot.engine,
-                    false,
-                    target,
-                    vec!["这段定义不能安全地替换当前视图，没有发送。".to_owned()],
-                    risks,
-                    Vec::new(),
-                );
+                format!("CREATE VIEW {qualified} AS\n{};", statement.trim().trim_end_matches(';').trim())
             };
             vec![
                 Step { label: format!("删除视图 {table}"), sql: format!("DROP VIEW {qualified};") },
@@ -1239,19 +1250,10 @@ fn plan_replace_view(snapshot: &Snapshot, table: &str, definition: &str) -> Plan
             ]
         }
         Engine::Postgres | Engine::Mysql | Engine::Mariadb => {
-            let sql = if is_create_view(statement) {
-                ensure_semicolon(&ensure_or_replace(statement))
-            } else if is_query(statement) {
-                format!("CREATE OR REPLACE VIEW {qualified} AS\n{};", statement.trim().trim_end_matches(';').trim())
+            let sql = if let Some(sql) = plain {
+                ensure_semicolon(&ensure_or_replace(sql))
             } else {
-                return finish(
-                    snapshot.engine,
-                    false,
-                    target,
-                    vec!["这段定义不能安全地替换当前视图，没有发送。".to_owned()],
-                    risks,
-                    Vec::new(),
-                );
+                format!("CREATE OR REPLACE VIEW {qualified} AS\n{};", statement.trim().trim_end_matches(';').trim())
             };
             vec![Step { label: format!("替换视图 {table}"), sql }]
         }
@@ -1320,24 +1322,290 @@ fn view_statements(input: &str) -> Vec<String> {
     statements
 }
 
-fn is_create_view(sql: &str) -> bool {
-    let upper = sql.trim().to_ascii_uppercase();
-    upper.starts_with("CREATE") && upper.contains(" VIEW") && !upper.contains("MATERIALIZED VIEW") && !upper.contains(" TABLE")
+enum ViewHead {
+    Query,
+    Plain(ViewTarget),
+    Materialized,
+    Other,
 }
 
-fn is_query(sql: &str) -> bool {
-    let upper = sql.trim().to_ascii_uppercase();
-    upper.starts_with("SELECT") || upper.starts_with("WITH")
+struct ViewTarget {
+    qualifier: Option<SqlIdent>,
+    name: SqlIdent,
 }
 
-fn names_view(sql: &str, name: &str) -> bool {
-    let lower = sql.to_ascii_lowercase();
-    let needle = name.to_ascii_lowercase();
-    lower.contains(&format!(".{needle}"))
-        || lower.contains(&format!(" {needle}"))
-        || lower.contains(&format!("`{needle}`"))
-        || lower.contains(&format!("\"{needle}\""))
-        || lower.contains(&format!("'{needle}'"))
+struct SqlIdent {
+    text: String,
+    quoted: bool,
+}
+
+enum Tok {
+    Word(String),
+    Ident(String),
+    Lit,
+    Symbol(char),
+}
+
+fn classify_view_statement(sql: &str) -> ViewHead {
+    parse_view_head(sql).unwrap_or(ViewHead::Other)
+}
+
+fn parse_view_head(sql: &str) -> Option<ViewHead> {
+    let tokens = tokenize_sql(sql);
+    let mut index = 0;
+    let first = tokens.get(index)?;
+    if word_is(first, "select") || word_is(first, "with") {
+        return Some(ViewHead::Query);
+    }
+    if !word_is(first, "create") {
+        return None;
+    }
+    index += 1;
+    let mut materialized = false;
+    let mut temporary = false;
+    loop {
+        let token = tokens.get(index)?;
+        if word_is(token, "view") {
+            index += 1;
+            break;
+        }
+        if word_is(token, "materialized") {
+            materialized = true;
+            index += 1;
+            continue;
+        }
+        if word_is(token, "temp") || word_is(token, "temporary") {
+            temporary = true;
+            index += 1;
+            continue;
+        }
+        if word_is(token, "or") {
+            index += 1;
+            if !tokens.get(index).is_some_and(|item| word_is(item, "replace")) {
+                return None;
+            }
+            index += 1;
+            continue;
+        }
+        if word_is(token, "recursive") {
+            index += 1;
+            continue;
+        }
+        if word_is(token, "algorithm") {
+            index += 1;
+            if matches!(tokens.get(index), Some(Tok::Symbol('='))) {
+                index += 1;
+            }
+            if !matches!(tokens.get(index), Some(Tok::Word(_))) {
+                return None;
+            }
+            index += 1;
+            continue;
+        }
+        if word_is(token, "definer") {
+            index += 1;
+            if matches!(tokens.get(index), Some(Tok::Symbol('='))) {
+                index += 1;
+            }
+            index = skip_definer(&tokens, index)?;
+            continue;
+        }
+        if word_is(token, "sql") {
+            index += 1;
+            if !tokens.get(index).is_some_and(|item| word_is(item, "security")) {
+                return None;
+            }
+            index += 1;
+            let security = tokens.get(index)?;
+            if !(word_is(security, "definer") || word_is(security, "invoker")) {
+                return None;
+            }
+            index += 1;
+            continue;
+        }
+        return None;
+    }
+    if materialized {
+        return Some(ViewHead::Materialized);
+    }
+    if temporary {
+        return None;
+    }
+    if tokens.get(index).is_some_and(|item| word_is(item, "if")) {
+        if !(tokens.get(index + 1).is_some_and(|item| word_is(item, "not")) && tokens.get(index + 2).is_some_and(|item| word_is(item, "exists"))) {
+            return None;
+        }
+        index += 3;
+    }
+    let (name, qualifier) = read_view_name(&tokens, index)?;
+    Some(ViewHead::Plain(ViewTarget { qualifier, name }))
+}
+
+fn skip_definer(tokens: &[Tok], mut index: usize) -> Option<usize> {
+    if tokens.get(index).is_some_and(|token| word_is(token, "current_user")) {
+        index += 1;
+        if matches!(tokens.get(index), Some(Tok::Symbol('('))) {
+            index += 1;
+            if !matches!(tokens.get(index), Some(Tok::Symbol(')'))) {
+                return None;
+            }
+            index += 1;
+        }
+        return Some(index);
+    }
+    if !matches!(tokens.get(index), Some(Tok::Word(_) | Tok::Ident(_) | Tok::Lit)) {
+        return None;
+    }
+    index += 1;
+    if matches!(tokens.get(index), Some(Tok::Symbol('@'))) {
+        index += 1;
+        if !matches!(tokens.get(index), Some(Tok::Word(_) | Tok::Ident(_) | Tok::Lit)) {
+            return None;
+        }
+        index += 1;
+    }
+    Some(index)
+}
+
+fn read_view_name(tokens: &[Tok], mut index: usize) -> Option<(SqlIdent, Option<SqlIdent>)> {
+    let (first, next) = take_ident(tokens, index)?;
+    index = next;
+    if matches!(tokens.get(index), Some(Tok::Symbol('.'))) {
+        index += 1;
+        let (second, next) = take_ident(tokens, index)?;
+        if matches!(tokens.get(next), Some(Tok::Symbol('.'))) {
+            return None;
+        }
+        return Some((second, Some(first)));
+    }
+    Some((first, None))
+}
+
+fn take_ident(tokens: &[Tok], index: usize) -> Option<(SqlIdent, usize)> {
+    let ident = match tokens.get(index)? {
+        Tok::Word(text) => SqlIdent { text: text.clone(), quoted: false },
+        Tok::Ident(text) => SqlIdent { text: text.clone(), quoted: true },
+        _ => return None,
+    };
+    Some((ident, index + 1))
+}
+
+fn targets_current_view(snapshot: &Snapshot, table: &str, target: &ViewTarget) -> bool {
+    if !ident_matches(snapshot.engine, &target.name, table) {
+        return false;
+    }
+    match &target.qualifier {
+        None => true,
+        Some(qualifier) => qualifier_matches(snapshot, qualifier),
+    }
+}
+
+fn qualifier_matches(snapshot: &Snapshot, qualifier: &SqlIdent) -> bool {
+    match snapshot.engine {
+        Engine::Postgres => ident_matches(snapshot.engine, qualifier, &snapshot.schema),
+        Engine::Mysql | Engine::Mariadb => ident_matches(snapshot.engine, qualifier, &snapshot.database),
+        Engine::Sqlite => ident_matches(Engine::Sqlite, qualifier, &snapshot.database) || ident_matches(Engine::Sqlite, qualifier, "main"),
+    }
+}
+
+fn ident_matches(engine: Engine, ident: &SqlIdent, catalog: &str) -> bool {
+    if catalog.is_empty() {
+        return false;
+    }
+    if ident.quoted {
+        return ident.text == catalog;
+    }
+    if engine == Engine::Postgres {
+        return ident.text.to_ascii_lowercase() == catalog;
+    }
+    ident.text.eq_ignore_ascii_case(catalog)
+}
+
+fn word_is(token: &Tok, expected: &str) -> bool {
+    matches!(token, Tok::Word(text) if text.eq_ignore_ascii_case(expected))
+}
+
+fn tokenize_sql(sql: &str) -> Vec<Tok> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut index = 0;
+    let mut tokens = Vec::new();
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch.is_whitespace() {
+            index += 1;
+            continue;
+        }
+        if ch == '-' && chars.get(index + 1) == Some(&'-') {
+            index += 2;
+            while index < chars.len() && chars[index] != '\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if ch == '/' && chars.get(index + 1) == Some(&'*') {
+            index += 2;
+            while index + 1 < chars.len() && !(chars[index] == '*' && chars[index + 1] == '/') {
+                index += 1;
+            }
+            index = (index + 2).min(chars.len());
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`' | '[') {
+            let (token, next) = read_quoted(&chars, index);
+            tokens.push(token);
+            index = next;
+            continue;
+        }
+        if is_ident_start(ch) {
+            let start = index;
+            index += 1;
+            while index < chars.len() && is_ident_continue(chars[index]) {
+                index += 1;
+            }
+            tokens.push(Tok::Word(chars[start..index].iter().collect()));
+            continue;
+        }
+        tokens.push(Tok::Symbol(ch));
+        index += 1;
+    }
+    tokens
+}
+
+fn read_quoted(chars: &[char], start: usize) -> (Tok, usize) {
+    let opener = chars[start];
+    let closer = if opener == '[' { ']' } else { opener };
+    let mut index = start + 1;
+    let mut text = String::new();
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == closer {
+            let escaped = if opener == '[' {
+                chars.get(index + 1) == Some(&']')
+            } else {
+                chars.get(index + 1) == Some(&closer)
+            };
+            if escaped {
+                text.push(closer);
+                index += 2;
+                continue;
+            }
+            index += 1;
+            let token = if opener == '\'' { Tok::Lit } else { Tok::Ident(text) };
+            return (token, index);
+        }
+        text.push(ch);
+        index += 1;
+    }
+    let token = if opener == '\'' { Tok::Lit } else { Tok::Ident(text) };
+    (token, chars.len())
+}
+
+fn is_ident_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic() || (!ch.is_ascii() && ch.is_alphabetic())
+}
+
+fn is_ident_continue(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphanumeric() || (!ch.is_ascii() && ch.is_alphanumeric())
 }
 
 fn ensure_semicolon(sql: &str) -> String {
