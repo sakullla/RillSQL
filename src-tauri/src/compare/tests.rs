@@ -3,9 +3,10 @@ use std::fs;
 
 use super::data::diff_data;
 use super::model::{
-    needs_ephemeral_postgres, Category, ColumnShape, DataColumn, DataInput, DataKey, DataTable, Engine, IndexShape, Kind, ObjectDef, Side, TableShape,
+    needs_ephemeral_postgres, Category, ColumnShape, DataColumn, DataInput, DataKey, DataTable, Engine, ForeignKeyShape, IndexShape, Kind, ObjectDef, Side, TableShape,
 };
-use super::structure::diff_structure;
+use super::read::absorb_snapshot;
+use super::structure::{diff_structure, render_script};
 use crate::grid::{insert_sql, Cell, Column, TableSchema};
 
 fn column(name: &str, type_name: &str, nullable: bool, primary: bool) -> ColumnShape {
@@ -13,7 +14,7 @@ fn column(name: &str, type_name: &str, nullable: bool, primary: bool) -> ColumnS
 }
 
 fn shape(columns: Vec<ColumnShape>, indexes: Vec<IndexShape>) -> TableShape {
-    TableShape { columns, indexes, foreign_keys: Vec::new() }
+    TableShape { columns, indexes, foreign_keys: Vec::new(), indexes_read: true, foreign_keys_read: true }
 }
 
 fn orders(type_name: &str) -> ObjectDef {
@@ -240,6 +241,149 @@ fn one_sided_table_is_structural() {
     let report = diff_data(&DataInput { baseline_engine: "sqlite".to_owned(), target_engine: "sqlite".to_owned(), tables: vec![table], cancelled: false });
     assert!(report.script.contains("结构差异"));
     assert!(!report.script.to_ascii_uppercase().contains("INSERT"));
+}
+
+fn pk_index(columns: &[(&str, bool)]) -> IndexShape {
+    let mut index = index("orders_pkey", true, columns);
+    index.reason = "由主键约束维护".to_owned();
+    index
+}
+
+fn orders_shape(primary: bool) -> ObjectDef {
+    let columns = vec![column("id", "integer", false, primary), column("note", "text", true, false)];
+    let indexes = if primary { vec![pk_index(&[("id", false)])] } else { Vec::new() };
+    ObjectDef::table("orders", shape(columns, indexes))
+}
+
+#[test]
+fn primary_key_script_drops_the_target_key_before_adding_the_baseline_key() {
+    let dropped = diff_structure(&Side::ready("postgres", "app", "public", vec![orders_shape(false)]), &Side::ready("postgres", "app", "public", vec![orders_shape(true)]));
+    assert!(dropped.changed.iter().any(|item| item.detail.contains("主键")));
+    assert!(dropped.script.contains("DROP CONSTRAINT \"orders_pkey\""));
+    assert!(!dropped.script.contains("ADD PRIMARY KEY"));
+    assert!(!dropped.script.contains("没有结构差异"));
+
+    let columns = vec![column("id", "integer", false, true), column("note", "text", true, false)];
+    let baseline = ObjectDef::table("orders", shape(columns.clone(), vec![pk_index(&[("id", false), ("note", false)])]));
+    let target = ObjectDef::table("orders", shape(columns, vec![pk_index(&[("id", false)])]));
+    let changed = diff_structure(&Side::ready("postgres", "app", "public", vec![baseline]), &Side::ready("postgres", "app", "public", vec![target]));
+    let drop_at = changed.script.find("DROP CONSTRAINT").expect("drop");
+    let add_at = changed.script.find("ADD PRIMARY KEY (\"id\", \"note\")").expect("add");
+    assert!(drop_at < add_at);
+
+    let with_pk = orders_shape(true);
+    let without_pk = orders_shape(false);
+    let add_only = diff_structure(&Side::ready("mysql", "shop", "", vec![with_pk.clone()]), &Side::ready("mysql", "shop", "", vec![without_pk.clone()]));
+    assert!(add_only.script.contains("ADD PRIMARY KEY"));
+    assert!(!add_only.script.to_ascii_uppercase().contains("DROP PRIMARY KEY"));
+    let drop_only = diff_structure(&Side::ready("mysql", "shop", "", vec![without_pk]), &Side::ready("mysql", "shop", "", vec![with_pk]));
+    assert!(drop_only.script.contains("DROP PRIMARY KEY"));
+    assert!(!drop_only.script.contains("ADD PRIMARY KEY"));
+}
+
+#[test]
+fn sqlite_foreign_key_only_difference_rebuilds_the_target_table() {
+    let columns = vec![column("id", "integer", false, true), column("customer_id", "integer", true, false)];
+    let mut with_fk = shape(columns.clone(), vec![pk_index(&[("id", false)])]);
+    with_fk.foreign_keys.push(ForeignKeyShape {
+        name: "orders_customer".to_owned(),
+        columns: vec!["customer_id".to_owned()],
+        ref_schema: String::new(),
+        ref_table: "customers".to_owned(),
+        ref_columns: vec!["id".to_owned()],
+        on_delete: String::new(),
+        on_update: String::new(),
+    });
+    let without_fk = shape(columns, vec![pk_index(&[("id", false)])]);
+    let report = diff_structure(
+        &Side::ready("sqlite", "main", "", vec![ObjectDef::table("orders", with_fk)]),
+        &Side::ready("sqlite", "main", "", vec![ObjectDef::table("orders", without_fk)]),
+    );
+    assert!(report.changed.iter().any(|item| item.kind == "外键"));
+    assert!(report.script.contains("CREATE TABLE"));
+    assert!(report.script.contains("FOREIGN KEY"));
+    assert!(report.script.contains("orders_customer"));
+    assert!(!report.script.contains("没有结构差异"));
+}
+
+#[test]
+fn create_statements_are_qualified_on_the_target_side() {
+    let baseline_view = ObjectDef::defined(Kind::View, "v_orders", "CREATE OR REPLACE VIEW \"public\".\"v_orders\" AS SELECT 1");
+    let target_view = ObjectDef::defined(Kind::View, "v_orders", "CREATE OR REPLACE VIEW \"sales\".\"v_orders\" AS SELECT 2");
+    let views = diff_structure(&Side::ready("postgres", "app", "public", vec![baseline_view]), &Side::ready("postgres", "app", "sales", vec![target_view]));
+    assert!(views.script.contains("DROP VIEW \"sales\".\"v_orders\""));
+    assert!(views.script.contains("CREATE OR REPLACE VIEW \"sales\".\"v_orders\" AS SELECT 1"));
+    assert!(!views.script.contains("\"public\".\"v_orders\""));
+
+    let baseline_fn = ObjectDef::defined(Kind::Function, "add_customer", "CREATE FUNCTION public.add_customer() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$");
+    let target_fn = ObjectDef::defined(Kind::Function, "add_customer", "CREATE FUNCTION sales.add_customer() RETURNS integer LANGUAGE sql AS $$ SELECT 2 $$");
+    let functions = diff_structure(&Side::ready("postgres", "app", "public", vec![baseline_fn]), &Side::ready("postgres", "app", "sales", vec![target_fn]));
+    assert!(functions.script.contains("DROP FUNCTION \"sales\".\"add_customer\""));
+    assert!(functions.script.contains("CREATE FUNCTION \"sales\".\"add_customer\"()"));
+    assert!(functions.script.contains("SELECT 1"));
+    assert!(!functions.script.contains("public.add_customer"));
+
+    let mut baseline_trigger = ObjectDef::defined(Kind::Trigger, "touch", "CREATE TRIGGER touch BEFORE UPDATE ON public.orders FOR EACH ROW EXECUTE FUNCTION public.touch()");
+    baseline_trigger.relation = "orders".to_owned();
+    let mut target_trigger = ObjectDef::defined(Kind::Trigger, "touch", "CREATE TRIGGER touch BEFORE UPDATE ON sales.orders FOR EACH ROW EXECUTE FUNCTION sales.touch()");
+    target_trigger.relation = "orders".to_owned();
+    let triggers = diff_structure(&Side::ready("postgres", "app", "public", vec![baseline_trigger]), &Side::ready("postgres", "app", "sales", vec![target_trigger]));
+    assert!(triggers.script.contains("DROP TRIGGER \"touch\" ON \"sales\".\"orders\""));
+    assert!(triggers.script.contains("ON \"sales\".\"orders\""));
+    assert!(!triggers.script.contains("ON public.orders"));
+
+    let baseline_mysql = ObjectDef::defined(
+        Kind::View,
+        "v_orders",
+        "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `shop`.`v_orders` AS select 1 AS `id`",
+    );
+    let target_mysql = ObjectDef::defined(Kind::View, "v_orders", "CREATE VIEW `other`.`v_orders` AS select 2");
+    let mysql = diff_structure(&Side::ready("mysql", "shop", "", vec![baseline_mysql]), &Side::ready("mysql", "other", "", vec![target_mysql]));
+    assert!(mysql.script.contains("DROP VIEW `other`.`v_orders`"));
+    assert!(mysql.script.contains("VIEW `other`.`v_orders` AS select 1"));
+    assert!(!mysql.script.contains("`shop`.`v_orders`"));
+
+    let mut partial = index("orders_note", false, &[("note", false)]);
+    partial.partial = true;
+    partial.sql = "CREATE INDEX orders_note ON public.orders USING btree (note) WHERE (note IS NOT NULL)".to_owned();
+    let indexed = ObjectDef::table("orders", shape(vec![column("id", "integer", false, true), column("note", "text", true, false)], vec![partial]));
+    let plain = orders("integer");
+    let indexes = diff_structure(&Side::ready("postgres", "app", "public", vec![indexed]), &Side::ready("postgres", "app", "sales", vec![plain]));
+    assert!(indexes.script.contains("ON \"sales\".\"orders\""));
+    assert!(!indexes.script.contains("ON public.orders"));
+}
+
+#[test]
+fn marked_differences_are_not_called_absent_when_no_statement_was_emitted() {
+    let marked = render_script(&[], &[], false, false, "没有结构差异。");
+    assert!(!marked.contains("没有结构差异"));
+    let clear = render_script(&[], &[], false, true, "没有结构差异。");
+    assert!(clear.contains("没有结构差异"));
+}
+
+#[test]
+fn index_or_foreign_key_failure_keeps_columns_for_the_table_diff() {
+    let snapshot = crate::ddl::Snapshot::sample_index_failure();
+    let mut object = ObjectDef::table("orders", shape(vec![], vec![]));
+    let errors = absorb_snapshot(&mut object, &snapshot);
+    assert!(object.read_error.is_none());
+    assert_eq!(object.table.as_ref().unwrap().columns.len(), 1);
+    assert!(!object.table.as_ref().unwrap().indexes_read);
+    assert!(!object.table.as_ref().unwrap().foreign_keys_read);
+    assert!(errors.iter().any(|(category, _)| *category == Category::Index));
+    assert!(errors.iter().any(|(category, _)| *category == Category::ForeignKey));
+    let mut baseline = Side::ready("postgres", "app", "public", vec![object]);
+    baseline.category_errors = errors;
+    let report = diff_structure(&baseline, &Side::ready("postgres", "app", "public", vec![orders("varchar(20)")]));
+    assert!(report.changed.iter().any(|item| item.kind == "表" && item.name == "orders"));
+    assert!(report.incomplete);
+    assert!(report.script.contains("不完整"));
+    assert!(report.script.to_ascii_uppercase().contains("ALTER TABLE"));
+    assert!(!report.script.to_ascii_uppercase().contains("CREATE INDEX"));
+    assert!(!report.script.to_ascii_uppercase().contains("DROP INDEX"));
+    assert!(!report.script.to_ascii_uppercase().contains("FOREIGN KEY"));
+    assert!(!report.script.contains("PRIMARY KEY"));
+    assert!(!report.script.contains("DROP CONSTRAINT"));
 }
 
 #[test]

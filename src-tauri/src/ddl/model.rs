@@ -117,6 +117,10 @@ pub struct Snapshot {
     pub materialized: bool,
     /// 视图原文读失败时的服务器错误。空字符串式的占位注释不能当作原文。
     pub definition_error: Option<String>,
+    /// 索引查询失败。列已经读到，不能把整表当成没读到。
+    pub index_error: Option<String>,
+    /// 外键查询失败。列已经读到，不能把整表当成没读到。
+    pub foreign_key_error: Option<String>,
 }
 
 impl Snapshot {
@@ -149,7 +153,28 @@ impl Snapshot {
             reference: None,
             materialized: false,
             definition_error: None,
+            index_error: None,
+            foreign_key_error: None,
         }
+    }
+}
+
+#[cfg(test)]
+impl Snapshot {
+    pub(crate) fn sample_index_failure() -> Self {
+        let mut snapshot = Self::bare(Engine::Postgres, "app", "public", "orders");
+        snapshot.columns.push(Column {
+            name: "note".to_owned(),
+            type_name: "text".to_owned(),
+            nullable: true,
+            default_sql: None,
+            primary: false,
+            auto: false,
+            generated: false,
+        });
+        snapshot.index_error = Some("permission denied".to_owned());
+        snapshot.foreign_key_error = Some("fk denied".to_owned());
+        snapshot
     }
 }
 

@@ -7,7 +7,7 @@ mod model;
 mod plan;
 mod sql;
 
-pub(crate) use introspect::load;
+pub(crate) use introspect::{load, load_partial};
 pub(crate) use model::{Action, Engine as DdlEngine, Request, Snapshot};
 
 pub fn module_id() -> &'static str {
@@ -18,6 +18,8 @@ pub fn module_id() -> &'static str {
         std::any::type_name_of_val(&plan::plan),
         std::any::type_name_of_val(&exec::preview),
         std::any::type_name_of_val(&exec::execute),
+        std::any::type_name_of_val(&load),
+        std::any::type_name_of_val(&load_partial),
     );
     "ddl"
 }

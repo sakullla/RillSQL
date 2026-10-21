@@ -111,9 +111,10 @@ pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
     let tables = table_choices(&baseline.objects, &target.objects);
     notes.sort();
     notes.dedup();
+    let unchanged = only_baseline.is_empty() && only_target.is_empty() && changed.is_empty();
     StructureReport {
         refused: None,
-        script: render_script(&notes, &statements, incomplete, "没有结构差异。"),
+        script: render_script(&notes, &statements, incomplete, unchanged, "没有结构差异。"),
         incomplete,
         notes,
         only_baseline,
@@ -247,27 +248,43 @@ fn compare_pair(
         return;
     };
     let column_diff = columns_differ(left, right);
-    let pk_diff = primary_columns(left) != primary_columns(right);
+    // SQLite 的主键来自列信息；其他引擎的主键来自索引查询。
+    let pk_trusted = engine == Engine::Sqlite || (left.indexes_read && right.indexes_read);
+    let pk_diff = pk_trusted && primary_columns(left) != primary_columns(right);
+    let fk_known = left.foreign_keys_read && right.foreign_keys_read;
+    let fk_diff = fk_known && foreign_keys_differ(left, right);
+    let with_fk = fk_known && !blocked(baseline, target_side, Category::ForeignKey);
+    let index_blocked = blocked(baseline, target_side, Category::Index) || !left.indexes_read || !right.indexes_read;
+    let sqlite_fk_only = engine == Engine::Sqlite && fk_diff && !column_diff && !pk_diff;
+    let structural = engine == Engine::Sqlite && sqlite_needs_rebuild(left, right, with_fk);
+    // 仅外键不同时 SQLite 只能重建。索引没读全时重建会连带丢掉索引，因此不生成这类语句。
+    let emit_alter = allow_ddl && !blocked(baseline, target_side, Category::Table) && !(structural && index_blocked) && (column_diff || pk_diff || (sqlite_fk_only && with_fk && !index_blocked));
     if column_diff || pk_diff {
         changed.push(item(base, if column_diff { "列的名称、类型、可否为空或默认值不同" } else { "主键不同" }));
-        if allow_ddl && !blocked(baseline, target_side, Category::Table) {
-            alters.extend(alter_table(engine, target, &base.name, left, right, !blocked(baseline, target_side, Category::ForeignKey)));
-        }
     }
-    compare_indexes(
-        engine,
-        target,
-        &base.name,
-        left,
-        right,
-        changed,
-        index_drops,
-        index_creates,
-        allow_ddl && !blocked(baseline, target_side, Category::Index),
-    );
-    if foreign_keys_differ(left, right) {
+    if emit_alter {
+        alters.extend(alter_table(engine, target, &base.name, left, right, with_fk, pk_trusted));
+    }
+    let rebuilt = emit_alter && engine == Engine::Sqlite && sqlite_needs_rebuild(left, right, with_fk);
+    if left.indexes_read && right.indexes_read {
+        compare_indexes(
+            engine,
+            target,
+            &base.name,
+            left,
+            right,
+            changed,
+            index_drops,
+            index_creates,
+            allow_ddl && !index_blocked && !rebuilt,
+        );
+    }
+    if rebuilt && !index_blocked {
+        index_creates.extend(left.indexes.iter().filter(|index| !skip_index(index, left)).map(|index| create_index(engine, target, &base.name, index)));
+    }
+    if fk_diff {
         changed.push(DiffItem { kind: "外键".to_owned(), name: base.name.clone(), detail: "外键不同".to_owned() });
-        if allow_ddl && !blocked(baseline, target_side, Category::ForeignKey) && engine != Engine::Sqlite {
+        if allow_ddl && with_fk && engine != Engine::Sqlite {
             for key in &right.foreign_keys {
                 if !left.foreign_keys.iter().any(|item| item.name == key.name && item == key) {
                     drop_fk.push(drop_foreign_key(engine, target, &base.name, key));
@@ -441,7 +458,7 @@ fn reference_name(engine: Engine, key: &ForeignKeyShape) -> String {
 
 fn create_index(engine: Engine, side: &Side, table: &str, index: &IndexShape) -> String {
     if (index.partial || index.expression) && !index.sql.trim().is_empty() {
-        return index.sql.trim().trim_end_matches(';').to_owned();
+        return retarget_index_sql(engine, side, table, index.sql.trim().trim_end_matches(';'));
     }
     let unique = if index.unique { "UNIQUE " } else { "" };
     let columns = if index.columns.is_empty() {
@@ -505,13 +522,232 @@ fn drop_routine(engine: Engine, side: &Side, word: &str, object: &ObjectDef) -> 
     }
 }
 
+fn retarget_create(engine: Engine, side: &Side, object: &ObjectDef, definition: &str) -> String {
+    let keyword = match object.kind {
+        Kind::View => "VIEW",
+        Kind::Sequence => "SEQUENCE",
+        Kind::Enum => "TYPE",
+        Kind::Domain => "DOMAIN",
+        Kind::Function => "FUNCTION",
+        Kind::Procedure => "PROCEDURE",
+        Kind::Trigger => "TRIGGER",
+        Kind::Table => return definition.to_owned(),
+    };
+    let mut sql = replace_name_after(definition, keyword, &qualify(engine, side, &object.name)).unwrap_or_else(|| definition.to_owned());
+    if object.kind == Kind::Trigger && !object.relation.is_empty() {
+        if let Some(rewritten) = replace_name_after(&sql, "ON", &qualify(engine, side, &object.relation)) {
+            sql = rewritten;
+        }
+    }
+    sql
+}
+
+fn retarget_index_sql(engine: Engine, side: &Side, table: &str, sql: &str) -> String {
+    replace_name_after(sql, "ON", &qualify(engine, side, table)).unwrap_or_else(|| sql.to_owned())
+}
+
+fn replace_name_after(sql: &str, keyword: &str, replacement: &str) -> Option<String> {
+    let mut index = find_keyword_end(sql, keyword)?;
+    index = skip_gap(sql, index);
+    if starts_with_word(sql, index, "IF") {
+        let after_if = skip_word(sql, index);
+        let not_at = skip_gap(sql, after_if);
+        if starts_with_word(sql, not_at, "NOT") {
+            let exists_at = skip_gap(sql, skip_word(sql, not_at));
+            if starts_with_word(sql, exists_at, "EXISTS") {
+                index = skip_gap(sql, skip_word(sql, exists_at));
+            }
+        }
+    }
+    if starts_with_word(sql, index, "ONLY") {
+        index = skip_gap(sql, skip_word(sql, index));
+    }
+    let start = skip_gap(sql, index);
+    let end = qualified_name_end(sql, start)?;
+    Some(format!("{}{}{}", &sql[..start], replacement, &sql[end..]))
+}
+
+fn find_keyword_end(sql: &str, keyword: &str) -> Option<usize> {
+    let mut index = 0;
+    while index < sql.len() {
+        if let Some(next) = skip_delimited(sql, index) {
+            index = next;
+            continue;
+        }
+        let ch = sql[index..].chars().next()?;
+        if ch.is_whitespace() {
+            index += ch.len_utf8();
+            continue;
+        }
+        if is_ident_start(ch) {
+            let start = index;
+            index = ident_continue(sql, index);
+            if sql[start..index].eq_ignore_ascii_case(keyword) {
+                return Some(index);
+            }
+            continue;
+        }
+        index += ch.len_utf8();
+    }
+    None
+}
+
+fn qualified_name_end(sql: &str, start: usize) -> Option<usize> {
+    let end = ident_end(sql, start)?;
+    let mut index = skip_gap(sql, end);
+    if sql[index..].starts_with('.') {
+        index = skip_gap(sql, index + 1);
+        return ident_end(sql, index);
+    }
+    Some(end)
+}
+
+fn ident_end(sql: &str, start: usize) -> Option<usize> {
+    if start >= sql.len() {
+        return None;
+    }
+    let ch = sql[start..].chars().next()?;
+    if ch == '"' || ch == '`' || ch == '[' {
+        let closer = if ch == '[' { ']' } else { ch };
+        return skip_quoted(sql, start, closer);
+    }
+    if !is_ident_start(ch) {
+        return None;
+    }
+    Some(ident_continue(sql, start))
+}
+
+fn ident_continue(sql: &str, start: usize) -> usize {
+    let mut index = start;
+    let mut first = true;
+    while index < sql.len() {
+        let ch = sql[index..].chars().next().unwrap();
+        let ok = if first { is_ident_start(ch) } else { is_ident_continue(ch) };
+        if !ok {
+            break;
+        }
+        first = false;
+        index += ch.len_utf8();
+    }
+    index
+}
+
+fn starts_with_word(sql: &str, index: usize, word: &str) -> bool {
+    let end = ident_continue(sql, index);
+    end > index && sql[index..end].eq_ignore_ascii_case(word)
+}
+
+fn skip_word(sql: &str, index: usize) -> usize {
+    ident_continue(sql, index)
+}
+
+fn skip_gap(sql: &str, mut index: usize) -> usize {
+    while index < sql.len() {
+        let rest = &sql[index..];
+        if rest.starts_with("--") {
+            index += rest.find('\n').map(|at| at + 1).unwrap_or(rest.len());
+            continue;
+        }
+        if rest.starts_with("/*") {
+            index = skip_block_comment(sql, index);
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        if ch.is_whitespace() {
+            index += ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    index
+}
+
+fn skip_delimited(sql: &str, index: usize) -> Option<usize> {
+    let rest = sql.get(index..)?;
+    if rest.starts_with("--") {
+        return Some(index + rest.find('\n').map(|at| at + 1).unwrap_or(rest.len()));
+    }
+    if rest.starts_with("/*") {
+        return Some(skip_block_comment(sql, index));
+    }
+    let ch = rest.chars().next()?;
+    if ch == '\'' || ch == '"' || ch == '`' {
+        return skip_quoted(sql, index, ch);
+    }
+    if ch == '$' {
+        return skip_dollar(sql, index);
+    }
+    None
+}
+
+fn skip_block_comment(sql: &str, start: usize) -> usize {
+    let mut index = start + 2;
+    let mut depth = 1;
+    while index < sql.len() {
+        if sql[index..].starts_with("/*") {
+            depth += 1;
+            index += 2;
+            continue;
+        }
+        if sql[index..].starts_with("*/") {
+            depth -= 1;
+            index += 2;
+            if depth == 0 {
+                return index;
+            }
+            continue;
+        }
+        index += sql[index..].chars().next().unwrap().len_utf8();
+    }
+    sql.len()
+}
+
+fn skip_quoted(sql: &str, start: usize, closer: char) -> Option<usize> {
+    let mut index = start + closer.len_utf8();
+    if closer == ']' {
+        index = start + 1;
+    }
+    while index < sql.len() {
+        let ch = sql[index..].chars().next()?;
+        if ch == closer {
+            let next = index + ch.len_utf8();
+            if sql[next..].starts_with(closer) {
+                index = next + ch.len_utf8();
+                continue;
+            }
+            return Some(next);
+        }
+        index += ch.len_utf8();
+    }
+    Some(sql.len())
+}
+
+fn skip_dollar(sql: &str, start: usize) -> Option<usize> {
+    let rest = sql.get(start..)?;
+    let tag_end = rest[1..].find('$')?;
+    let delimiter = &rest[..=tag_end + 1];
+    if !delimiter[1..delimiter.len() - 1].chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        return None;
+    }
+    let body = start + delimiter.len();
+    sql[body..].find(delimiter).map(|at| body + at + delimiter.len())
+}
+
+fn is_ident_start(ch: char) -> bool {
+    ch.is_alphabetic() || ch == '_'
+}
+
+fn is_ident_continue(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '$'
+}
+
 fn create_definition(engine: Engine, side: &Side, object: &ObjectDef) -> Option<String> {
     let definition = object.definition.trim();
     if definition.is_empty() || definition.starts_with("--") {
         return None;
     }
     if definition.len() >= 6 && definition[..6].eq_ignore_ascii_case("CREATE") {
-        return Some(definition.trim_end_matches(';').to_owned());
+        return Some(retarget_create(engine, side, object, definition.trim_end_matches(';').trim()));
     }
     let name = qualify(engine, side, &object.name);
     let sql = match object.kind {
@@ -522,15 +758,15 @@ fn create_definition(engine: Engine, side: &Side, object: &ObjectDef) -> Option<
     Some(sql)
 }
 
-fn alter_table(engine: Engine, side: &Side, name: &str, baseline: &TableShape, target: &TableShape, with_fk: bool) -> Vec<String> {
+fn alter_table(engine: Engine, side: &Side, name: &str, baseline: &TableShape, target: &TableShape, with_fk: bool, with_pk: bool) -> Vec<String> {
     match engine {
         Engine::Sqlite => sqlite_alter(side, name, baseline, target, with_fk),
-        Engine::Postgres => postgres_alter(side, name, baseline, target),
-        Engine::Mysql | Engine::Mariadb => mysql_alter(engine, side, name, baseline, target),
+        Engine::Postgres => postgres_alter(side, name, baseline, target, with_pk),
+        Engine::Mysql | Engine::Mariadb => mysql_alter(engine, side, name, baseline, target, with_pk),
     }
 }
 
-fn postgres_alter(side: &Side, name: &str, baseline: &TableShape, target: &TableShape) -> Vec<String> {
+fn postgres_alter(side: &Side, name: &str, baseline: &TableShape, target: &TableShape, with_pk: bool) -> Vec<String> {
     let engine = Engine::Postgres;
     let table = qualify(engine, side, name);
     let mut statements = Vec::new();
@@ -560,17 +796,47 @@ fn postgres_alter(side: &Side, name: &str, baseline: &TableShape, target: &Table
             }
         }
     }
-    if primary_columns(baseline) != primary_columns(target) {
-        let pk = primary_columns(baseline);
-        if !pk.is_empty() {
-            let names = pk.iter().map(|column| quote(engine, column)).collect::<Vec<_>>().join(", ");
-            statements.push(format!("ALTER TABLE {table} ADD PRIMARY KEY ({names})"));
-        }
+    if with_pk {
+        push_primary_key(engine, &table, name, baseline, target, &mut statements);
     }
     statements
 }
 
-fn mysql_alter(engine: Engine, side: &Side, name: &str, baseline: &TableShape, target: &TableShape) -> Vec<String> {
+fn push_primary_key(engine: Engine, table: &str, name: &str, baseline: &TableShape, target: &TableShape, statements: &mut Vec<String>) {
+    let wanted = primary_columns(baseline);
+    let current = primary_columns(target);
+    if wanted == current {
+        return;
+    }
+    match engine {
+        Engine::Postgres => {
+            if !current.is_empty() {
+                let constraint = primary_key_name(target).unwrap_or_else(|| format!("{name}_pkey"));
+                statements.push(format!("ALTER TABLE {table} DROP CONSTRAINT {}", quote(engine, &constraint)));
+            }
+            if !wanted.is_empty() {
+                let names = wanted.iter().map(|column| quote(engine, column)).collect::<Vec<_>>().join(", ");
+                statements.push(format!("ALTER TABLE {table} ADD PRIMARY KEY ({names})"));
+            }
+        }
+        Engine::Mysql | Engine::Mariadb => {
+            let names = wanted.iter().map(|column| quote(engine, column)).collect::<Vec<_>>().join(", ");
+            match (!current.is_empty(), !wanted.is_empty()) {
+                (true, true) => statements.push(format!("ALTER TABLE {table} DROP PRIMARY KEY, ADD PRIMARY KEY ({names})")),
+                (true, false) => statements.push(format!("ALTER TABLE {table} DROP PRIMARY KEY")),
+                (false, true) => statements.push(format!("ALTER TABLE {table} ADD PRIMARY KEY ({names})")),
+                (false, false) => {}
+            }
+        }
+        Engine::Sqlite => {}
+    }
+}
+
+fn primary_key_name(shape: &TableShape) -> Option<String> {
+    shape.indexes.iter().find(|index| index.reason.contains("主键")).map(|index| index.name.clone())
+}
+
+fn mysql_alter(engine: Engine, side: &Side, name: &str, baseline: &TableShape, target: &TableShape, with_pk: bool) -> Vec<String> {
     let table = qualify(engine, side, name);
     let mut statements = Vec::new();
     for column in &target.columns {
@@ -587,23 +853,23 @@ fn mysql_alter(engine: Engine, side: &Side, name: &str, baseline: &TableShape, t
             _ => {}
         }
     }
-    if primary_columns(baseline) != primary_columns(target) {
-        let pk = primary_columns(baseline);
-        if !pk.is_empty() {
-            let names = pk.iter().map(|column| quote(engine, column)).collect::<Vec<_>>().join(", ");
-            statements.push(format!("ALTER TABLE {table} DROP PRIMARY KEY, ADD PRIMARY KEY ({names})"));
-        }
+    if with_pk {
+        push_primary_key(engine, &table, name, baseline, target, &mut statements);
     }
     statements
 }
 
-fn sqlite_alter(side: &Side, name: &str, baseline: &TableShape, target: &TableShape, with_fk: bool) -> Vec<String> {
-    let engine = Engine::Sqlite;
-    let structural = primary_columns(baseline) != primary_columns(target)
+fn sqlite_needs_rebuild(baseline: &TableShape, target: &TableShape, with_fk: bool) -> bool {
+    primary_columns(baseline) != primary_columns(target)
         || baseline.columns.iter().any(|column| {
             target.columns.iter().any(|other| other.name == column.name && (!column.type_name.eq_ignore_ascii_case(&other.type_name) || column.nullable != other.nullable || column.default_sql.trim() != other.default_sql.trim()))
         })
-        || (with_fk && foreign_keys_differ(baseline, target));
+        || (with_fk && foreign_keys_differ(baseline, target))
+}
+
+fn sqlite_alter(side: &Side, name: &str, baseline: &TableShape, target: &TableShape, with_fk: bool) -> Vec<String> {
+    let engine = Engine::Sqlite;
+    let structural = sqlite_needs_rebuild(baseline, target, with_fk);
     if !structural {
         let table = qualify(engine, side, name);
         let mut statements = Vec::new();
@@ -686,7 +952,7 @@ fn key_choices(shape: &TableShape) -> Vec<KeyChoice> {
     keys
 }
 
-fn render_script(notes: &[String], statements: &[String], incomplete: bool, empty_message: &str) -> String {
+pub(super) fn render_script(notes: &[String], statements: &[String], incomplete: bool, unchanged: bool, empty_message: &str) -> String {
     let mut lines = vec!["-- 结构差异脚本。生成时没有执行。".to_owned()];
     if incomplete {
         lines.push("-- 脚本不完整。".to_owned());
@@ -697,7 +963,7 @@ fn render_script(notes: &[String], statements: &[String], incomplete: bool, empt
     if statements.is_empty() {
         if incomplete {
             lines.push("-- 没有可放入完整脚本的变更语句。".to_owned());
-        } else {
+        } else if unchanged {
             lines.push(format!("-- {empty_message}"));
         }
     }

@@ -6,6 +6,15 @@ use super::model::{Action, Column, DependentSql, Engine, ForeignKey, IncomingFor
 use super::sql::{mentions, qualified_table, quote_ident};
 
 pub async fn load(session: &CatalogSession, request: &Request, table: &str) -> Result<Snapshot, String> {
+    let snapshot = load_partial(session, request, table).await?;
+    // 结构编辑仍把索引或外键失败当成整次读取失败，避免把没读到的索引当成不存在。
+    if let Some(message) = snapshot.index_error.clone().or(snapshot.foreign_key_error.clone()) {
+        return Err(message);
+    }
+    Ok(snapshot)
+}
+
+pub async fn load_partial(session: &CatalogSession, request: &Request, table: &str) -> Result<Snapshot, String> {
     ensure_session(session, request.engine)?;
     let recorded = match session {
         CatalogSession::Sqlite { foreign_keys, .. } => *foreign_keys,
@@ -16,6 +25,18 @@ pub async fn load(session: &CatalogSession, request: &Request, table: &str) -> R
         CatalogSession::Sqlite { pool, .. } => load_sqlite(pool, &request.database, table, recorded).await,
         CatalogSession::Mysql(pool) => load_mysql(pool, request.engine, &request.database, table).await,
         CatalogSession::Postgres(client) => load_postgres(client, &request.database, &request.schema, table).await,
+    }
+}
+
+fn keep_rows<T>(error: &mut Option<String>, result: Result<Vec<T>, String>) -> Vec<T> {
+    match result {
+        Ok(rows) => rows,
+        Err(message) => {
+            if error.is_none() {
+                *error = Some(message);
+            }
+            Vec::new()
+        }
     }
 }
 
@@ -175,19 +196,44 @@ async fn load_sqlite(pool: &sqlx::SqlitePool, database: &str, table: &str, recor
     for column in &mut snapshot.columns {
         column.auto = auto_name.as_deref() == Some(column.name.as_str());
     }
-    let indexes = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA index_list({quoted})")))
-        .fetch_all(pool)
-        .await
-        .map_err(|err| err.to_string())?;
+    let indexes = keep_rows(
+        &mut snapshot.index_error,
+        sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA index_list({quoted})")))
+            .fetch_all(pool)
+            .await
+            .map_err(|err| err.to_string()),
+    );
     for index in &indexes {
-        let name = sqlite_text(index, 1)?;
+        if snapshot.index_error.is_some() {
+            snapshot.indexes.clear();
+            break;
+        }
+        let name = match sqlite_text(index, 1) {
+            Ok(name) => name,
+            Err(message) => {
+                snapshot.indexes.clear();
+                if snapshot.index_error.is_none() {
+                    snapshot.index_error = Some(message);
+                }
+                break;
+            }
+        };
         let unique = sqlite_i64(index, 2).unwrap_or(0) != 0;
         let origin = sqlite_text(index, 3).unwrap_or_default();
         let partial = sqlite_i64(index, 4).unwrap_or(0) != 0;
-        let info = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA index_xinfo({})", quote_ident(Engine::Sqlite, &name))))
+        let info = match sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA index_xinfo({})", quote_ident(Engine::Sqlite, &name))))
             .fetch_all(pool)
             .await
-            .map_err(|err| err.to_string())?;
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                snapshot.indexes.clear();
+                if snapshot.index_error.is_none() {
+                    snapshot.index_error = Some(err.to_string());
+                }
+                break;
+            }
+        };
         let mut columns = Vec::new();
         let mut expression = false;
         for column in &info {
@@ -204,19 +250,43 @@ async fn load_sqlite(pool: &sqlx::SqlitePool, database: &str, table: &str, recor
         } else {
             String::new()
         };
-        let sql: Option<String> = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1")
+        let sql: Option<String> = match sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1")
             .bind(&name)
             .fetch_optional(pool)
             .await
-            .map_err(|err| err.to_string())?;
+        {
+            Ok(sql) => sql,
+            Err(err) => {
+                snapshot.indexes.clear();
+                if snapshot.index_error.is_none() {
+                    snapshot.index_error = Some(err.to_string());
+                }
+                break;
+            }
+        };
         snapshot.indexes.push(Index { name, unique, columns, protected, reason, partial, expression, sql });
     }
-    let fk_rows = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA foreign_key_list({quoted})")))
-        .fetch_all(pool)
-        .await
-        .map_err(|err| err.to_string())?;
-    snapshot.foreign_keys = group_sqlite_fks(table, &snapshot.table_sql, &fk_rows)?;
-    snapshot.incoming = incoming_sqlite(pool, table).await?;
+    let fk_rows = keep_rows(
+        &mut snapshot.foreign_key_error,
+        sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA foreign_key_list({quoted})")))
+            .fetch_all(pool)
+            .await
+            .map_err(|err| err.to_string()),
+    );
+    if snapshot.foreign_key_error.is_none() {
+        match group_sqlite_fks(table, &snapshot.table_sql, &fk_rows) {
+            Ok(keys) => snapshot.foreign_keys = keys,
+            Err(message) => snapshot.foreign_key_error = Some(message),
+        }
+    }
+    match incoming_sqlite(pool, table).await {
+        Ok(keys) => snapshot.incoming = keys,
+        Err(message) => {
+            if snapshot.foreign_key_error.is_none() {
+                snapshot.foreign_key_error = Some(message);
+            }
+        }
+    }
     let triggers = sqlx::query("SELECT name, COALESCE(sql, '') FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?1")
         .bind(table)
         .fetch_all(pool)
@@ -437,13 +507,16 @@ async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, database: &str, ta
             generated,
         });
     }
-    let indexes: Vec<mysql_async::Row> = mysql_async::prelude::Queryable::exec(
-        &mut conn,
-        "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME, COLLATION FROM information_schema.statistics WHERE table_schema = ? AND table_name = ? ORDER BY INDEX_NAME, SEQ_IN_INDEX",
-        (database.to_owned(), table.to_owned()),
-    )
-    .await
-    .map_err(|err| err.to_string())?;
+    let indexes: Vec<mysql_async::Row> = keep_rows(
+        &mut snapshot.index_error,
+        mysql_async::prelude::Queryable::exec(
+            &mut conn,
+            "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME, COLLATION FROM information_schema.statistics WHERE table_schema = ? AND table_name = ? ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+            (database.to_owned(), table.to_owned()),
+        )
+        .await
+        .map_err(|err| err.to_string()),
+    );
     for row in &indexes {
         let name = mysql_string(row, 0);
         let column = IndexColumn { name: mysql_string(row, 2), descending: mysql_string(row, 3).eq_ignore_ascii_case("D") };
@@ -466,27 +539,35 @@ async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, database: &str, ta
     for column in &mut snapshot.columns {
         column.primary = snapshot.indexes.iter().any(|index| index.name.eq_ignore_ascii_case("PRIMARY") && index.columns.iter().any(|item| item.name == column.name));
     }
-    let foreign_keys: Vec<mysql_async::Row> = mysql_async::prelude::Queryable::exec(
-        &mut conn,
-        "SELECT k.CONSTRAINT_NAME, k.COLUMN_NAME, k.REFERENCED_TABLE_NAME, k.REFERENCED_COLUMN_NAME, r.DELETE_RULE, r.UPDATE_RULE FROM information_schema.KEY_COLUMN_USAGE k JOIN information_schema.REFERENTIAL_CONSTRAINTS r ON r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA AND r.CONSTRAINT_NAME = k.CONSTRAINT_NAME AND r.TABLE_NAME = k.TABLE_NAME WHERE k.TABLE_SCHEMA = ? AND k.TABLE_NAME = ? AND k.REFERENCED_TABLE_NAME IS NOT NULL ORDER BY k.CONSTRAINT_NAME, k.ORDINAL_POSITION",
-        (database.to_owned(), table.to_owned()),
-    )
-    .await
-    .map_err(|err| err.to_string())?;
-    push_mysql_fks(&mut snapshot.foreign_keys, &foreign_keys, false);
+    let foreign_keys: Vec<mysql_async::Row> = keep_rows(
+        &mut snapshot.foreign_key_error,
+        mysql_async::prelude::Queryable::exec(
+            &mut conn,
+            "SELECT k.CONSTRAINT_NAME, k.COLUMN_NAME, k.REFERENCED_TABLE_NAME, k.REFERENCED_COLUMN_NAME, r.DELETE_RULE, r.UPDATE_RULE FROM information_schema.KEY_COLUMN_USAGE k JOIN information_schema.REFERENTIAL_CONSTRAINTS r ON r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA AND r.CONSTRAINT_NAME = k.CONSTRAINT_NAME AND r.TABLE_NAME = k.TABLE_NAME WHERE k.TABLE_SCHEMA = ? AND k.TABLE_NAME = ? AND k.REFERENCED_TABLE_NAME IS NOT NULL ORDER BY k.CONSTRAINT_NAME, k.ORDINAL_POSITION",
+            (database.to_owned(), table.to_owned()),
+        )
+        .await
+        .map_err(|err| err.to_string()),
+    );
+    if snapshot.foreign_key_error.is_none() {
+        push_mysql_fks(&mut snapshot.foreign_keys, &foreign_keys, false);
+    }
     for key in &snapshot.foreign_keys {
         if let Some(index) = snapshot.indexes.iter_mut().find(|index| index.name == key.name) {
             index.protected = true;
             index.reason = format!("外键 {} 依赖此索引", key.name);
         }
     }
-    let incoming: Vec<mysql_async::Row> = mysql_async::prelude::Queryable::exec(
-        &mut conn,
-        "SELECT k.CONSTRAINT_NAME, k.TABLE_NAME, k.COLUMN_NAME, k.REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE k WHERE k.REFERENCED_TABLE_SCHEMA = ? AND k.REFERENCED_TABLE_NAME = ? AND k.REFERENCED_COLUMN_NAME IS NOT NULL ORDER BY k.CONSTRAINT_NAME, k.ORDINAL_POSITION",
-        (database.to_owned(), table.to_owned()),
-    )
-    .await
-    .map_err(|err| err.to_string())?;
+    let incoming: Vec<mysql_async::Row> = keep_rows(
+        &mut snapshot.foreign_key_error,
+        mysql_async::prelude::Queryable::exec(
+            &mut conn,
+            "SELECT k.CONSTRAINT_NAME, k.TABLE_NAME, k.COLUMN_NAME, k.REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE k WHERE k.REFERENCED_TABLE_SCHEMA = ? AND k.REFERENCED_TABLE_NAME = ? AND k.REFERENCED_COLUMN_NAME IS NOT NULL ORDER BY k.CONSTRAINT_NAME, k.ORDINAL_POSITION",
+            (database.to_owned(), table.to_owned()),
+        )
+        .await
+        .map_err(|err| err.to_string()),
+    );
     let mut incoming_keys = Vec::new();
     for row in &incoming {
         let name = mysql_string(row, 0);
@@ -608,13 +689,16 @@ async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: 
             generated: !generated.is_empty(),
         });
     }
-    let indexes = client
-        .query(
-            "SELECT i.relname, ix.indisunique, ix.indisprimary, ix.indpred IS NOT NULL, ix.indexprs IS NOT NULL, pg_get_indexdef(ix.indexrelid), a.attname, array_position(ix.indkey, a.attnum), COALESCE((ix.indoption[array_position(ix.indkey, a.attnum) - 1] & 1) = 1, false) FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = ANY (ix.indkey) WHERE ix.indrelid = $1 ORDER BY i.relname, array_position(ix.indkey, a.attnum)",
-            &[&oid],
-        )
-        .await
-        .map_err(|err| err.to_string())?;
+    let indexes = keep_rows(
+        &mut snapshot.index_error,
+        client
+            .query(
+                "SELECT i.relname, ix.indisunique, ix.indisprimary, ix.indpred IS NOT NULL, ix.indexprs IS NOT NULL, pg_get_indexdef(ix.indexrelid), a.attname, array_position(ix.indkey, a.attnum), COALESCE((ix.indoption[array_position(ix.indkey, a.attnum) - 1] & 1) = 1, false) FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = ANY (ix.indkey) WHERE ix.indrelid = $1 ORDER BY i.relname, array_position(ix.indkey, a.attnum)",
+                &[&oid],
+            )
+            .await
+            .map_err(|err| err.to_string()),
+    );
     for row in &indexes {
         let name: String = row.get(0);
         let column_name: Option<String> = row.get(6);
@@ -641,13 +725,16 @@ async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: 
             });
         }
     }
-    let constraints = client
-        .query(
-            "SELECT con.contype::text, con.conname, pg_get_constraintdef(con.oid), i.relname FROM pg_constraint con LEFT JOIN pg_class i ON i.oid = con.conindid WHERE con.conrelid = $1",
-            &[&oid],
-        )
-        .await
-        .map_err(|err| err.to_string())?;
+    let constraints = keep_rows(
+        &mut snapshot.foreign_key_error,
+        client
+            .query(
+                "SELECT con.contype::text, con.conname, pg_get_constraintdef(con.oid), i.relname FROM pg_constraint con LEFT JOIN pg_class i ON i.oid = con.conindid WHERE con.conrelid = $1",
+                &[&oid],
+            )
+            .await
+            .map_err(|err| err.to_string()),
+    );
     for row in &constraints {
         let contype: String = row.get(0);
         let name: String = row.get(1);
@@ -677,13 +764,16 @@ async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: 
     for column in &mut snapshot.columns {
         column.primary = snapshot.indexes.iter().any(|index| index.reason.contains("主键") && index.columns.iter().any(|item| item.name == column.name));
     }
-    let incoming = client
-        .query(
-            "SELECT con.conname, n.nspname, c.relname, pg_get_constraintdef(con.oid) FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE con.contype = 'f' AND con.confrelid = $1",
-            &[&oid],
-        )
-        .await
-        .map_err(|err| err.to_string())?;
+    let incoming = keep_rows(
+        &mut snapshot.foreign_key_error,
+        client
+            .query(
+                "SELECT con.conname, n.nspname, c.relname, pg_get_constraintdef(con.oid) FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE con.contype = 'f' AND con.confrelid = $1",
+                &[&oid],
+            )
+            .await
+            .map_err(|err| err.to_string()),
+    );
     for row in &incoming {
         let name: String = row.get(0);
         let schema_name: String = row.get(1);

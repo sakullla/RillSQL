@@ -7,7 +7,7 @@ use mysql_async::prelude::Queryable;
 
 use crate::catalog::{read_definition, read_object_page, Engine as CatalogEngine, ObjectKind, ObjectRow};
 use crate::connections::{CatalogSession, Service};
-use crate::ddl::{load, Action, DdlEngine, Request, Snapshot};
+use crate::ddl::{load_partial, Action, DdlEngine, Request, Snapshot};
 use crate::grid::{describe, qualified_name, quote_ident, select_list, Cell, TableSchema};
 
 use super::data::diff_data;
@@ -166,8 +166,6 @@ async fn load_side(service: &Service, request: &SideRequest, cancel_id: &str) ->
         }
         offset = seen;
     }
-    side.category_errors.sort();
-    side.category_errors.dedup();
     if side.listing_complete {
         for object in &mut side.objects {
             if is_cancelled(cancel_id) {
@@ -175,9 +173,11 @@ async fn load_side(service: &Service, request: &SideRequest, cancel_id: &str) ->
                 object.read_error = Some("对比已取消".to_owned());
                 continue;
             }
-            enrich(&held.session, request, &database, object).await;
+            side.category_errors.extend(enrich(&held.session, request, &database, object).await);
         }
     }
+    side.category_errors.sort();
+    side.category_errors.dedup();
     side
 }
 
@@ -396,7 +396,7 @@ fn cell_text(value: Option<String>) -> Cell {
     }
 }
 
-async fn enrich(session: &CatalogSession, request: &SideRequest, database: &str, object: &mut ObjectDef) {
+async fn enrich(session: &CatalogSession, request: &SideRequest, database: &str, object: &mut ObjectDef) -> Vec<(Category, String)> {
     match object.kind {
         Kind::Table | Kind::View => {
             let action = Action::DropTable { table: object.name.clone() };
@@ -404,25 +404,41 @@ async fn enrich(session: &CatalogSession, request: &SideRequest, database: &str,
                 Ok(engine) => engine,
                 Err(message) => {
                     object.read_error = Some(message);
-                    return;
+                    return Vec::new();
                 }
             }, action };
-            match load(session, &ddl_request, &object.name).await {
-                Ok(snapshot) => apply_snapshot(object, &snapshot),
-                Err(message) => object.read_error = Some(message),
+            match load_partial(session, &ddl_request, &object.name).await {
+                Ok(snapshot) => absorb_snapshot(object, &snapshot),
+                Err(message) => {
+                    object.read_error = Some(message);
+                    Vec::new()
+                }
             }
         }
         _ => {
             let Ok(engine) = catalog_engine(&request.engine) else {
                 object.read_error = Some("引擎不一致".to_owned());
-                return;
+                return Vec::new();
             };
             match read_definition(session, engine, database, &request.schema, &object.name, kind_str(object.kind), &object.signature, &object.relation).await {
                 Ok(sql) => object.definition = sql,
                 Err(message) => object.read_error = Some(message),
             }
+            Vec::new()
         }
     }
+}
+
+pub(super) fn absorb_snapshot(object: &mut ObjectDef, snapshot: &Snapshot) -> Vec<(Category, String)> {
+    let mut errors = Vec::new();
+    if let Some(message) = snapshot.index_error.clone() {
+        errors.push((Category::Index, message));
+    }
+    if let Some(message) = snapshot.foreign_key_error.clone() {
+        errors.push((Category::ForeignKey, message));
+    }
+    apply_snapshot(object, snapshot);
+    errors
 }
 
 fn apply_snapshot(object: &mut ObjectDef, snapshot: &Snapshot) {
@@ -479,6 +495,8 @@ fn apply_snapshot(object: &mut ObjectDef, snapshot: &Snapshot) {
                 on_update: key.on_update.clone(),
             })
             .collect(),
+        indexes_read: snapshot.index_error.is_none(),
+        foreign_keys_read: snapshot.foreign_key_error.is_none(),
     });
 }
 

@@ -21,6 +21,7 @@ impl Engine {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Postgres => "postgres",
@@ -140,6 +141,10 @@ pub struct TableShape {
     pub columns: Vec<ColumnShape>,
     pub indexes: Vec<IndexShape>,
     pub foreign_keys: Vec<ForeignKeyShape>,
+    /// 索引查询失败时为 false。不能把空列表当成没有索引或没有主键。
+    pub indexes_read: bool,
+    /// 外键查询失败时为 false。不能把空列表当成没有外键。
+    pub foreign_keys_read: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -155,6 +160,7 @@ pub struct ObjectDef {
 }
 
 impl ObjectDef {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn table(name: impl Into<String>, shape: TableShape) -> Self {
         Self {
             kind: Kind::Table,
@@ -168,6 +174,7 @@ impl ObjectDef {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn defined(kind: Kind, name: impl Into<String>, definition: impl Into<String>) -> Self {
         Self {
             kind,
@@ -197,6 +204,7 @@ pub struct Side {
 }
 
 impl Side {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn ready(engine: impl Into<String>, database: impl Into<String>, schema: impl Into<String>, objects: Vec<ObjectDef>) -> Self {
         Self {
             engine: engine.into(),
