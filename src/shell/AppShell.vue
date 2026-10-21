@@ -3,6 +3,7 @@ import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, r
 import { listPaletteTables, startCatalog } from "../catalog";
 import CompareDialog from "../compare/CompareDialog.vue";
 import { placeCompareScript, type ScriptTarget } from "../compare/place";
+import type { DiagramOpen } from "../diagram/types";
 import { objectIdentity, type CatalogObjectRef } from "../catalog/object-ref";
 import { isDefinitionKind, objectLabel } from "../catalog/tree";
 import { catalogConnections } from "../catalog/store";
@@ -271,6 +272,21 @@ function onOpenDefinition(object: CatalogObjectRef) {
   });
 }
 
+function onOpenDiagram(target: DiagramOpen) {
+  if (window.innerWidth <= 960) session.sidebarHidden.value = true;
+  session.openDiagram({
+    id: `${target.connectionId}:${target.database}:${target.schema}`,
+    label: target.label,
+    path: target.path,
+    connectionId: target.connectionId,
+    connectionName: target.connectionName,
+    database: target.database,
+    engine: target.engine,
+    status: "connected",
+    schema: target.schema,
+  });
+}
+
 function onCopyDefinition(sql: string) {
   const tab = session.activeTab.value;
   const ready = tab?.connectionId && tab.connectionName && tab.database != null && tab.engine && tab.connectionStatus;
@@ -485,6 +501,7 @@ onBeforeUnmount(() => {
         @resize="session.sidebarWidth.value = $event"
         @open-object="onOpenObject"
         @open-definition="onOpenDefinition"
+        @open-diagram="onOpenDiagram"
         @query-object="onQueryObject"
         @focused-database="onFocusedDatabase"
         @new-connection="session.showPage('connections')"

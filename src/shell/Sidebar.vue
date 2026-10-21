@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, ref } from "vue";
 import ExplorerTree from "../catalog/ExplorerTree.vue";
+import type { DiagramOpen } from "../diagram/types";
 import type { CatalogObjectRef } from "../catalog/object-ref";
 import Icon from "./Icon.vue";
 
@@ -11,6 +12,7 @@ const emit = defineEmits<{
   "open-definition": [object: CatalogObjectRef];
   "query-object": [object: CatalogObjectRef, sql: string];
   "focused-database": [connectionId: string, database: string];
+  "open-diagram": [target: DiagramOpen];
   "new-connection": [];
 }>();
 
@@ -28,6 +30,10 @@ function forwardQuery(object: CatalogObjectRef, sql: string) {
 
 function forwardFocus(connectionId: string, database: string) {
   emit("focused-database", connectionId, database);
+}
+
+function forwardDiagram(target: DiagramOpen) {
+  emit("open-diagram", target);
 }
 const filter = ref("");
 
@@ -63,7 +69,7 @@ function onPointerDown(event: PointerEvent) {
       <Icon name="search" />
       <input v-model="filter" type="search" placeholder="筛选表" aria-label="筛选表" />
     </label>
-    <ExplorerTree :filter="filter" @open-object="forwardOpen" @open-definition="forwardDefinition" @query-object="forwardQuery" @focused-database="forwardFocus" @new-connection="emit('new-connection')" />
+    <ExplorerTree :filter="filter" @open-object="forwardOpen" @open-definition="forwardDefinition" @query-object="forwardQuery" @focused-database="forwardFocus" @open-diagram="forwardDiagram" @new-connection="emit('new-connection')" />
   </aside>
   <div
     class="sb-resizer"

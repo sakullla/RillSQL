@@ -418,4 +418,46 @@ describe("explorer tree", () => {
     expect(menu?.textContent).not.toContain("保存");
     wrapper.unmount();
   });
+
+  it("opens a relationship diagram for the current schema, database, or sqlite file", async () => {
+    replaceCatalog(catalogFixture());
+    const wrapper = mount(ExplorerTree, { props: { filter: "" } });
+    await wrapper.get('[data-engine=postgres] [data-action=open-diagram][data-database=atlas_dev][data-schema=public]').trigger("click");
+    await wrapper.get('[data-engine=mysql] [data-action=open-diagram][data-database=shop_staging][data-schema=""]').trigger("click");
+    await wrapper.get('[data-engine=sqlite] [data-action=open-diagram][data-database=main][data-schema=""]').trigger("click");
+    const opened = wrapper.emitted("open-diagram") ?? [];
+    expect(opened.map((event) => event[0])).toMatchObject([
+      { connectionId: "atlas", database: "atlas_dev", schema: "public", engine: "postgres" },
+      { connectionId: "shop", database: "shop_staging", schema: "", engine: "mysql" },
+      { connectionId: "notes", database: "main", schema: "", engine: "sqlite" },
+    ]);
+    wrapper.unmount();
+
+    replaceCatalog([
+      {
+        id: "pg",
+        name: "书店",
+        engine: "postgres",
+        env: "dev",
+        envLabel: "开发",
+        envTone: "dev",
+        status: "connected",
+        defaultDatabase: "bookstore",
+        foreignKeys: null,
+        error: null,
+        databases: [
+          { name: "bookstore", error: null, schemas: [{ name: "public", objects: [], total: 0, error: null }] },
+          {
+            name: "other",
+            error: "当前会话连在 bookstore，没有另开连接读取 other",
+            schemas: [{ name: "public", objects: [], total: 0, error: null }],
+          },
+        ],
+      },
+    ]);
+    const gap = mount(ExplorerTree, { props: { filter: "" } });
+    expect(gap.find('[data-action=open-diagram][data-database=bookstore][data-schema=public]').exists()).toBe(true);
+    expect(gap.find('[data-action=open-diagram][data-database=other]').exists()).toBe(false);
+    gap.unmount();
+  });
 });

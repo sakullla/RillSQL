@@ -71,7 +71,9 @@ describe("product identity", () => {
     const text = wrapper.text();
     expect(text).toContain("澄库 · RillSQL");
     expect(text).toContain(ABOUT_ABSENT);
-    for (const item of ["AI", "云同步", "NoSQL", "关系图", "备份恢复", "运维监控"]) {
+    expect(text).toContain("只读关系图");
+    expect(text).not.toContain("没有 AI、云同步、NoSQL、关系图");
+    for (const item of ["AI", "云同步", "NoSQL", "备份恢复", "运维监控"]) {
       expect(text).toContain(item);
     }
     expect(text).toContain("颜色从不作为唯一的信息来源");

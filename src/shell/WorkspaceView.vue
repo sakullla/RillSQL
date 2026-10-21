@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref } from "vue";
 import DefinitionView from "../catalog/DefinitionView.vue";
+import DiagramView from "../diagram/DiagramView.vue";
 import { catalogConnections } from "../catalog/store";
 import type { CatalogObjectRef } from "../catalog/object-ref";
 import { resolveTableTarget, type TableTarget } from "../grid/target";
@@ -187,7 +188,7 @@ onBeforeUnmount(() => {
       @keydown.space.prevent="emit('activate', tab.id)"
       @keydown="onTabKey($event, tab.id)"
     >
-      <Icon :name="tab.kind === 'query' ? 'code' : 'table'" />
+      <Icon :name="tab.kind === 'query' ? 'code' : tab.kind === 'diagram' ? 'link' : 'table'" />
       <span class="tab-title">{{ tab.title }}</span>
       <span
         v-if="tab.targetText || tab.path || tab.kind === 'query'"
@@ -256,6 +257,14 @@ onBeforeUnmount(() => {
       :label="active.title"
       :object="definitionObject(active)!"
       @copy-sql="emit('copy-definition', $event)"
+    />
+    <DiagramView
+      v-else-if="active && active.kind === 'diagram' && active.connectionId && active.database != null"
+      :key="active.id"
+      :label="active.title"
+      :connection-id="active.connectionId"
+      :database="active.database"
+      :schema="active.diagram?.schema ?? ''"
     />
     <WelcomeView
       v-else

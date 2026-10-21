@@ -3,7 +3,7 @@ import type { AppPage } from "../router";
 import { parseHash, toHash } from "../router";
 import { CONNECTION_STATUS_TEXT, type ConnectionStatus } from "./status-text";
 
-export type TabKind = "query" | "table" | "structure" | "definition";
+export type TabKind = "query" | "table" | "structure" | "definition" | "diagram";
 
 export interface DefinitionRequest {
   schema: string;
@@ -57,6 +57,18 @@ export interface SessionSnapshot {
   activeId: string | null;
 }
 
+export interface DiagramTarget {
+  id: string;
+  label: string;
+  path?: string;
+  connectionId: string;
+  connectionName: string;
+  database: string;
+  engine: string;
+  status: ConnectionStatus;
+  schema: string;
+}
+
 export interface PlaceholderTarget {
   id: string;
   label: string;
@@ -106,6 +118,7 @@ export interface ShellTab {
   tablePane: "data" | "structure";
   structureSection: "columns" | "indexes" | "foreign" | "drop";
   definition?: DefinitionRequest | null;
+  diagram?: { schema: string } | null;
 }
 
 export interface ShellSession {
@@ -124,6 +137,7 @@ export interface ShellSession {
   openTable: (target: PlaceholderTarget) => void;
   openStructure: (target: PlaceholderTarget) => void;
   openDefinition: (target: DefinitionTarget) => void;
+  openDiagram: (target: DiagramTarget) => void;
   setTableView: (id: string, pane: "data" | "structure", section?: "columns" | "drop") => void;
   setDraft: (id: string, draft: string) => void;
   setExecuted: (id: string, sql: string) => void;
@@ -156,6 +170,7 @@ function blankTab(kind: TabKind, id: string, title: string, path: string | null,
     tablePane: "data",
     structureSection: "columns",
     definition: null,
+    diagram: null,
   };
 }
 
@@ -389,6 +404,29 @@ export function createSession(initialHash = "", restored: SessionSnapshot | null
     showPage("workspace");
   }
 
+  function openDiagram(target: DiagramTarget) {
+    const id = `diagram:${target.connectionId}:${target.database}:${target.schema}`;
+    const existing = tabs.value.find((tab) => tab.id === id);
+    if (existing) {
+      activeId.value = existing.id;
+      showPage("workspace");
+      return;
+    }
+    const tab = blankTab("diagram", id, target.label, target.path ?? null, "");
+    applyTarget(tab, {
+      connectionId: target.connectionId,
+      connectionName: target.connectionName,
+      database: target.database,
+      engine: target.engine,
+      status: target.status,
+    });
+    if (target.schema) tab.targetText = `${target.connectionName} / ${target.database} / ${target.schema}`;
+    tab.diagram = { schema: target.schema };
+    tabs.value = [...tabs.value, tab];
+    activeId.value = tab.id;
+    showPage("workspace");
+  }
+
   function setDraft(id: string, draft: string) {
     const tab = tabs.value.find((item) => item.id === id);
     if (!tab || tab.draft === draft) return;
@@ -473,6 +511,7 @@ export function createSession(initialHash = "", restored: SessionSnapshot | null
     openTable,
     openStructure,
     openDefinition,
+    openDiagram,
     setTableView,
     setDraft,
     setExecuted,

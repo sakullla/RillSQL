@@ -28,6 +28,8 @@
 .tree .tr-name { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .tree .tr-meta { margin-left: auto; padding-left: var(--sp-2); font-size: var(--fs-xs); color: var(--text-3); font-variant-numeric: tabular-nums; }
 .tree-row > .badge { margin-left: auto; }
+button.tree-row { width: 100%; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; }
+button.tree-row .tr-name { color: var(--text-2); }
 
 /* 连接行 */
 .tree .tr-conn { height: calc(var(--tree-h) + 2px); font-weight: 600; margin-top: var(--sp-2); }

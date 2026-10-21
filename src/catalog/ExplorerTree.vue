@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { OpenOutcome } from "../connections/api";
 import { fetchDefinition, focusDatabase, listConnections, openConnection } from "./backend";
 import { browseSql, qualifiedObjectName, type CatalogObjectRef } from "./object-ref";
+import type { DiagramOpen } from "../diagram/types";
 import SchemaBlock from "./SchemaBlock.vue";
 import { catalogConnections, catalogLoadError, refreshCatalog, schemaKey, setStructureFocus } from "./store";
 import { engineShape, isConnected, isDefinitionKind, objectKey, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
@@ -14,6 +15,7 @@ const emit = defineEmits<{
   "open-definition": [object: CatalogObjectRef];
   "query-object": [object: CatalogObjectRef, sql: string];
   "focused-database": [connectionId: string, database: string];
+  "open-diagram": [target: DiagramOpen];
   "new-connection": [];
 }>();
 const menu = ref<{ object: CatalogObjectRef; x: number; y: number; notice: string } | null>(null);
@@ -108,6 +110,19 @@ function sessionGap(database: DatabaseNode) {
 
 function focusKey(connectionId: string, database: string) {
   return `${connectionId}:${database}`;
+}
+
+function openDiagram(connection: CatalogConnection, database: string, schema: string) {
+  const path = [connection.name, database, schema].filter((part) => part.length > 0).join(" / ");
+  emit("open-diagram", {
+    connectionId: connection.id,
+    connectionName: connection.name,
+    database,
+    engine: connection.engine,
+    schema,
+    path,
+    label: schema ? `${schema} 关系图` : `${database || connection.name} 关系图`,
+  });
 }
 
 function failureText(error: unknown): string {
@@ -518,6 +533,20 @@ onBeforeUnmount(() => {
               <span>SQLite 的外键约束：{{ connection.foreignKeys ? "已开启" : "已关闭" }}（foreign_keys = {{ connection.foreignKeys ? "ON" : "OFF" }}）</span>
             </div>
             <template v-for="database in connection.databases" :key="database.name">
+              <button
+                class="tree-row"
+                type="button"
+                data-action="open-diagram"
+                data-level="diagram"
+                :data-connection="connection.id"
+                :data-database="database.name"
+                data-schema=""
+                :style="depthStyle(1)"
+                @click.stop="openDiagram(connection, database.name, '')"
+              >
+                <span class="tw"></span>
+                <span class="tr-name">关系图</span>
+              </button>
               <SchemaBlock
                 v-for="schema in database.schemas"
                 :key="`${database.name}:${schema.name}`"
@@ -580,6 +609,21 @@ onBeforeUnmount(() => {
                     </span>
                   </div>
                 </div>
+                <button
+                  v-if="!engineShape(connection.engine).schemas && !sessionGap(database)"
+                  class="tree-row"
+                  type="button"
+                  data-action="open-diagram"
+                  data-level="diagram"
+                  :data-connection="connection.id"
+                  :data-database="database.name"
+                  data-schema=""
+                  :style="depthStyle(2)"
+                  @click.stop="openDiagram(connection, database.name, '')"
+                >
+                  <span class="tw"></span>
+                  <span class="tr-name">关系图</span>
+                </button>
                 <template v-for="schema in database.schemas" :key="`${database.name}:${schema.name}`">
                   <div
                     v-if="engineShape(connection.engine).schemas && schema.name"
@@ -602,6 +646,21 @@ onBeforeUnmount(() => {
                     <span class="tr-name">{{ schema.name }}</span>
                     <span v-if="!schema.error" class="tr-meta">{{ schema.total }}</span>
                   </div>
+                  <button
+                    v-if="engineShape(connection.engine).schemas && schema.name && !sessionGap(database)"
+                    class="tree-row"
+                    type="button"
+                    data-action="open-diagram"
+                    data-level="diagram"
+                    :data-connection="connection.id"
+                    :data-database="database.name"
+                    :data-schema="schema.name"
+                    :style="depthStyle(3)"
+                    @click.stop="openDiagram(connection, database.name, schema.name)"
+                  >
+                    <span class="tw"></span>
+                    <span class="tr-name">关系图</span>
+                  </button>
                   <SchemaBlock
                     v-if="!engineShape(connection.engine).schemas || open(schemaKey(connection.id, database.name, schema.name))"
                     :connection="connection"

@@ -2,6 +2,7 @@ mod catalog;
 mod compare;
 mod connections;
 mod ddl;
+mod diagram;
 mod grid;
 mod native_export;
 mod product;
@@ -69,6 +70,7 @@ fn wire<R: tauri::Runtime>(builder: tauri::Builder<R>, state: connections::comma
         ddl::commands::ddl_describe,
         ddl::commands::ddl_preview,
         ddl::commands::ddl_execute,
+        diagram::commands::diagram_read,
         query::commands::query_start,
         query::commands::query_poll,
         query::commands::query_cancel,
@@ -126,6 +128,7 @@ fn fixed_dependency_markers() -> usize {
         query::module_id(),
         grid::module_id(),
         ddl::module_id(),
+        diagram::module_id(),
         compare::module_id(),
     ];
     markers.len()
@@ -165,6 +168,7 @@ mod tests {
         assert_eq!(super::query::module_id(), "query");
         assert_eq!(super::grid::module_id(), "grid");
         assert_eq!(super::ddl::module_id(), "ddl");
+        assert_eq!(super::diagram::module_id(), "diagram");
         assert_eq!(super::compare::module_id(), "compare");
         assert!(super::fixed_dependency_markers() >= 12);
         assert!(!super::local_data_dir().is_empty());
