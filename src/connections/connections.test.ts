@@ -5,7 +5,8 @@ import type { CatalogConnection } from "../catalog/types";
 import type { ConnectionApi, EnvTagInput, TestReport } from "./api";
 import ConnectionsPage from "./ConnectionsPage.vue";
 import { listPaletteConnections, MODULE_ID, replacePaletteConnections, setSqlitePicker } from "./index";
-import { blankDraft, storedConfigHidesSecrets, toStoredConfig, validate, type EnvTag, type SavedConnection, type SecretInput } from "./model";
+import { importConnectionText } from "./import";
+import { blankDraft, storedConfigHidesSecrets, toStoredConfig, validate, type ConnectionDraft, type EnvTag, type SavedConnection, type SecretInput } from "./model";
 import { parseConnectionUrl } from "./url";
 
 const secret: SecretInput = { password: "db-secret-alpha", sshPassword: "ssh-secret-beta", passphrase: "key-pass-gamma" };
@@ -538,5 +539,357 @@ describe("connections page", () => {
     expect(card.find("[data-action=conn-connect]").exists()).toBe(false);
     wrapper.unmount();
     resetCatalog();
+  });
+});
+
+const dbeaverFixture = `{
+  "folders": {},
+  "connections": {
+    "pg-1": {
+      "provider": "postgresql",
+      "driver": "postgres-jdbc",
+      "name": "生产库",
+      "save-password": true,
+      "configuration": {
+        "host": "pg.example.test",
+        "port": 5432,
+        "database": "analytics",
+        "url": "jdbc:postgresql://pg.example.test:5432/analytics",
+        "user": "analyst",
+        "password": "db-secret-should-not-save",
+        "handlers": {
+          "ssh_tunnel": {
+            "enabled": true,
+            "properties": {
+              "host": "bastion.example.test",
+              "port": "22",
+              "user": "jump",
+              "password": "ssh-secret-should-not-save",
+              "passphrase": "cert-passphrase-should-not-save"
+            }
+          }
+        }
+      }
+    },
+    "mssql-1": {
+      "provider": "sqlserver",
+      "driver": "mssql",
+      "name": "报表库",
+      "configuration": {
+        "host": "sql.example.test",
+        "port": "1433",
+        "database": "reports",
+        "url": "jdbc:sqlserver://sql.example.test:1433;databaseName=reports",
+        "user": "sa",
+        "password": "mssql-secret-should-not-save"
+      }
+    },
+    "my-1": {
+      "provider": "mysql",
+      "driver": "mysql8",
+      "name": "订单库",
+      "configuration": {
+        "host": "mysql.example.test",
+        "port": "3306",
+        "database": "orders",
+        "url": "jdbc:mysql://mysql.example.test:3306/orders",
+        "user": "shop"
+      }
+    },
+    "ma-1": {
+      "provider": "mariadb",
+      "driver": "mariaDB",
+      "name": "档案库",
+      "configuration": {
+        "host": "maria.example.test",
+        "port": "3307",
+        "database": "archive",
+        "url": "jdbc:mariadb://maria.example.test:3307/archive",
+        "user": "archivist"
+      }
+    },
+    "lite-1": {
+      "provider": "sqlite",
+      "driver": "sqlite_jdbc",
+      "name": "离线笔记",
+      "configuration": {
+        "url": "jdbc:sqlite:C:/missing/notes.sqlite?mode=ro",
+        "database": "should-not-be-the-path"
+      }
+    },
+    "no-host": {
+      "provider": "postgresql",
+      "name": "没有主机",
+      "configuration": {
+        "url": "jdbc:postgresql://hidden.example.test:5432/ghost",
+        "user": "ghost",
+        "database": "ghost"
+      }
+    }
+  }
+}`;
+
+const navicatFixture = `<?xml version="1.0" encoding="UTF-8"?>
+<Connections Ver="1.5">
+  <Connection ConnectionName="分析库" ConnType="PostgreSQL" Host="pg.example.test" Port="5432" UserName="analyst" Password="navicat-secret-should-not-save" Database="analytics" SSH="true" SSH_Host="bastion.example.test" SSH_Port="22" SSH_UserName="jump" SSH_Password="ssh-secret-should-not-save" SSH_Passphrase="cert-passphrase-should-not-save" SSL="true" />
+  <Connection ConnectionName="报表库" ConnType="MSSQL" Host="sql.example.test" Port="1433" UserName="sa" Database="reports" />
+  <Connection ConnectionName="订单库" ConnType="mysql" Host="mysql.example.test" Port="3306" UserName="shop" Database="orders" />
+  <Connection ConnectionName="档案库" ConnType="MariaDB" Host="maria.example.test" Port="3307" UserName="archivist" Database="archive" />
+  <Connection ConnectionName="离线笔记" ConnType="SQLITE" DatabaseFileName="C:/missing/notes.sqlite" Password="sqlite-secret-should-not-save" />
+  <Connection ConnectionName="没有主机" ConnType="postgres" UserName="ghost" Database="ghost" />
+  <ConnectionGroup Name="分组">
+    <Connection ConnectionName="不要导入分组里的库" ConnType="MYSQL" Host="group.example.test" Port="3306" UserName="grouped" Database="grouped" />
+  </ConnectionGroup>
+</Connections>`;
+
+function recordingSave(reject: (draft: ConnectionDraft) => string | null = () => null) {
+  const saved: SavedConnection[] = [];
+  const save = vi.fn(async (draft: ConnectionDraft, secrets: SecretInput) => {
+    const blob = JSON.stringify({ draft, secrets });
+    expect(secrets).toEqual({ password: "", sshPassword: "", passphrase: "" });
+    expect(draft.savePassword).toBe(false);
+    expect(draft.sshOn).toBe(false);
+    expect(draft.tlsMode).toBe("off");
+    expect(draft.sshHost).toBe("");
+    expect(blob).not.toContain("should-not-save");
+    expect(blob).not.toContain("bastion.example.test");
+    const reason = reject(draft);
+    if (reason) throw new Error(reason);
+    const connection = { ...toStoredConfig(draft, `imported-${saved.length + 1}`), passwordSaved: false, sshPasswordSaved: false };
+    saved.push(connection);
+    return { connection, note: null };
+  });
+  return { saved, save };
+}
+
+describe("connection import", () => {
+  it("imports DBeaver connections, skips SQL Server and a server without a host, and keeps MySQL distinct from MariaDB", async () => {
+    const { saved, save } = recordingSave();
+    const result = await importConnectionText(dbeaverFixture, save);
+    expect(result.recognized).toBe(true);
+    expect(save).toHaveBeenCalledTimes(4);
+    expect(saved.map((item) => item.engine)).toEqual(["postgres", "mysql", "mariadb", "sqlite"]);
+    expect(saved.map((item) => item.name)).toEqual(["生产库", "订单库", "档案库", "离线笔记"]);
+    const postgres = saved[0];
+    expect(postgres.host).toBe("pg.example.test");
+    expect(postgres.port).toBe(5432);
+    expect(postgres.username).toBe("analyst");
+    expect(postgres.database).toBe("analytics");
+    expect(postgres.passwordSaved).toBe(false);
+    expect(postgres.sshPasswordSaved).toBe(false);
+    expect(postgres.ssh).toBeNull();
+    expect(postgres.tls?.mode).toBe("off");
+    const sqlite = saved[3];
+    expect(sqlite.filePath).toBe("C:/missing/notes.sqlite");
+    expect(sqlite.database).toBeNull();
+    expect(sqlite.ssh).toBeNull();
+    expect(result.message).toContain("已导入 4 个连接");
+    expect(result.message).toContain("SQL Server");
+    expect(result.message).toContain("sqlserver");
+    expect(result.message).toContain("报表库");
+    expect(result.message).toContain("没有主机");
+    expect(result.message).toContain("缺少主机");
+    expect(result.message).not.toContain("should-not-save");
+    expect(saved.some((item) => item.name === "报表库" || item.name === "没有主机")).toBe(false);
+  });
+
+  it("imports a Navicat ncx the same way and ignores connections nested in a group", async () => {
+    const { saved, save } = recordingSave();
+    const result = await importConnectionText(navicatFixture, save);
+    expect(result.recognized).toBe(true);
+    expect(saved.map((item) => [item.name, item.engine])).toEqual([
+      ["分析库", "postgres"],
+      ["订单库", "mysql"],
+      ["档案库", "mariadb"],
+      ["离线笔记", "sqlite"],
+    ]);
+    expect(saved[0]).toMatchObject({ host: "pg.example.test", port: 5432, username: "analyst", database: "analytics", passwordSaved: false, sshPasswordSaved: false, ssh: null });
+    expect(saved[0].tls?.mode).toBe("off");
+    expect(saved[3].filePath).toBe("C:/missing/notes.sqlite");
+    expect(result.message).toContain("SQL Server");
+    expect(result.message).toContain("MSSQL");
+    expect(result.message).toContain("缺少主机");
+    expect(result.message).not.toContain("不要导入分组里的库");
+    expect(result.message).not.toContain("should-not-save");
+    expect(save.mock.calls.some((call) => JSON.stringify(call).includes("group.example.test"))).toBe(false);
+  });
+
+  it("reads the engine from driver or jdbc url and does not treat MySQL as MariaDB", async () => {
+    const byDriver = await importConnectionText(
+      JSON.stringify({ connections: { a: { driver: "mysql", name: "仅驱动", configuration: { host: "driver.example.test", user: "u", database: "d" } } } }),
+      recordingSave().save,
+    );
+    expect(byDriver.saved.map((item) => item.engine)).toEqual(["mysql"]);
+    expect(byDriver.saved[0].port).toBe(3306);
+
+    const byUrl = await importConnectionText(
+      JSON.stringify({
+        connections: {
+          a: {
+            provider: "generic",
+            driver: "postgres-jdbc",
+            name: "由地址识别",
+            configuration: { host: "url.example.test", port: "5432", user: "u", database: "d", url: "jdbc:postgresql://url.example.test:5432/d" },
+          },
+        },
+      }),
+      recordingSave().save,
+    );
+    expect(byUrl.saved[0].engine).toBe("postgres");
+
+    const mysqlNotMaria = await importConnectionText(
+      JSON.stringify({
+        connections: {
+          a: { provider: "mysql", name: "仍是 MySQL", configuration: { host: "h.example.test", port: "3306", user: "u", database: "d", url: "jdbc:mariadb://h.example.test:3306/d" } },
+        },
+      }),
+      recordingSave().save,
+    );
+    expect(mysqlNotMaria.saved[0].engine).toBe("mysql");
+
+    const sqliteUrl = await importConnectionText(
+      JSON.stringify({ connections: { a: { provider: "sqlite", name: "斜杠路径", configuration: { url: "jdbc:sqlite://C:/missing/slash.sqlite" } } } }),
+      recordingSave().save,
+    );
+    expect(sqliteUrl.saved[0].filePath).toBe("C:/missing/slash.sqlite");
+  });
+
+  it("adds nothing for plain text or an unrecognizable file", async () => {
+    for (const text of ["这不是连接文件，只是一段说明。", "", "{ \"folders\": {} }", "{ \"connections\": [] }", "<Connection ConnectionName=\"x\" ConnType=\"MYSQL\" />"]) {
+      const { save } = recordingSave();
+      const result = await importConnectionText(text, save);
+      expect(result.recognized).toBe(false);
+      expect(result.saved).toEqual([]);
+      expect(save).not.toHaveBeenCalled();
+      expect(result.message).toContain("无法识别");
+      expect(result.message).toContain("没有新增连接");
+    }
+  });
+
+  it("adds nothing when a recognized file has no importable connection", async () => {
+    const onlyServer = await importConnectionText(
+      JSON.stringify({ connections: { a: { provider: "sqlserver", name: "报表库", configuration: { host: "sql.example.test", user: "sa" } } } }),
+      recordingSave().save,
+    );
+    expect(onlyServer.recognized).toBe(true);
+    expect(onlyServer.saved).toEqual([]);
+    expect(onlyServer.message).toContain("没有新增连接");
+    expect(onlyServer.message).toContain("SQL Server");
+
+    const empty = await importConnectionText("{ \"connections\": {} }", recordingSave().save);
+    expect(empty.saved).toEqual([]);
+    expect(empty.message).toContain("没有可导入的连接");
+  });
+
+  it("keeps earlier saves when one row fails", async () => {
+    const { saved, save } = recordingSave((draft) => (draft.name === "第二行" ? "磁盘写入失败" : null));
+    const result = await importConnectionText(
+      JSON.stringify({
+        connections: {
+          a: { provider: "postgresql", name: "第一行", configuration: { host: "one.example.test", port: "5432", user: "a", database: "a" } },
+          b: { provider: "mysql", name: "第二行", configuration: { host: "two.example.test", port: "3306", user: "b", database: "b" } },
+          c: { provider: "mariadb", name: "第三行", configuration: { host: "three.example.test", port: "3306", user: "c", database: "c" } },
+        },
+      }),
+      save,
+    );
+    expect(save).toHaveBeenCalledTimes(3);
+    expect(saved.map((item) => item.name)).toEqual(["第一行", "第三行"]);
+    expect(result.failed.map((item) => item.name)).toEqual(["第二行"]);
+    expect(result.message).toContain("第二行");
+    expect(result.message).toContain("磁盘写入失败");
+    expect(result.message).toContain("已导入 2 个连接");
+  });
+
+  it("shows imported PostgreSQL in the list and asks for a password", async () => {
+    const stored: SavedConnection[] = [];
+    const open = vi.fn();
+    const save = vi.fn(async (draft: ConnectionDraft, secrets: SecretInput) => {
+      expect(secrets).toEqual({ password: "", sshPassword: "", passphrase: "" });
+      expect(JSON.stringify(draft)).not.toContain("should-not-save");
+      const connection = { ...toStoredConfig(draft, `imported-${stored.length + 1}`), passwordSaved: false, sshPasswordSaved: false };
+      stored.push(connection);
+      return { connection, note: null };
+    });
+    const api: ConnectionApi = {
+      list: async () => stored.map((item) => ({ ...item })),
+      ...tagApi(seedTags()),
+      save,
+      remove: async (id) => ({ connection: { ...savedMysql(), id }, databaseFileRemoved: false }),
+      test: async () => ({ status: "ok", stages: [] }),
+      open,
+      disconnect: async () => undefined,
+      confirmHostKey: async () => undefined,
+      forgetHostKey: async () => undefined,
+    };
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api } });
+    await flushPromises();
+    const input = wrapper.get("[data-action=conn-import-file]");
+    const file = new File([dbeaverFixture], "data-sources.json", { type: "application/json" });
+    Object.defineProperty(input.element, "files", { configurable: true, value: [file] });
+    await input.trigger("change");
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("已导入 4 个连接");
+    expect(wrapper.text()).toContain("SQL Server");
+    expect(wrapper.text()).toContain("报表库");
+    expect(wrapper.text()).not.toContain("should-not-save");
+    const postgres = wrapper.findAll("article.conn-card").find((card) => card.text().includes("生产库"));
+    expect(postgres?.text()).toContain("PostgreSQL");
+    expect(postgres?.find(".cc-addr").text()).toBe("pg.example.test:5432");
+    expect(postgres?.text()).toContain("analytics");
+    expect(postgres?.text()).toContain("每次询问密码");
+    expect(postgres?.text()).toContain("不加密");
+    expect(postgres?.text()).not.toContain("SSH");
+    const mysql = wrapper.findAll("article.conn-card").find((card) => card.text().includes("订单库"));
+    const maria = wrapper.findAll("article.conn-card").find((card) => card.text().includes("档案库"));
+    expect(mysql?.text()).toContain("MySQL");
+    expect(maria?.text()).toContain("MariaDB");
+    expect(wrapper.findAll("article.conn-card").some((card) => card.text().includes("报表库") || card.text().includes("没有主机"))).toBe(false);
+    const sqlite = wrapper.findAll("article.conn-card").find((card) => card.text().includes("离线笔记"));
+    expect(sqlite?.find(".cc-addr").text()).toBe("C:/missing/notes.sqlite");
+
+    await postgres!.get("[data-action=conn-menu]").trigger("click");
+    await postgres!.get(".conn-menu").findAll("button").find((button) => button.text().includes("连接详情"))!.trigger("click");
+    expect(wrapper.text()).toContain("analyst");
+    expect(wrapper.text()).toContain("每次连接时询问");
+    expect(wrapper.text()).toContain("不加密");
+    expect(wrapper.text()).not.toContain("经 SSH");
+
+    await postgres!.get("[data-action=conn-connect]").trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("这条连接没有保存密码");
+    expect(wrapper.text()).toContain("每次都会询问");
+    expect(open).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it("leaves the list unchanged when the file is plain text", async () => {
+    const save = vi.fn();
+    const api: ConnectionApi = {
+      list: async () => [savedMysql()],
+      ...tagApi(seedTags()),
+      save,
+      remove: async (id) => ({ connection: { ...savedMysql(), id }, databaseFileRemoved: false }),
+      test: async () => ({ status: "ok", stages: [] }),
+      open: async () => ({ report: { status: "ok", stages: [] }, connected: false, foreignKeys: null }),
+      disconnect: async () => undefined,
+      confirmHostKey: async () => undefined,
+      forgetHostKey: async () => undefined,
+    };
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api } });
+    await flushPromises();
+    expect(wrapper.findAll("article.conn-card")).toHaveLength(1);
+    const input = wrapper.get("[data-action=conn-import-file]");
+    const file = new File(["这不是连接文件，只是一段说明。"], "notes.txt", { type: "text/plain" });
+    Object.defineProperty(input.element, "files", { configurable: true, value: [file] });
+    await input.trigger("change");
+    await flushPromises();
+    expect(save).not.toHaveBeenCalled();
+    expect(wrapper.findAll("article.conn-card")).toHaveLength(1);
+    expect(wrapper.text()).toContain("Atlas");
+    expect(wrapper.text()).toContain("无法识别");
+    expect(wrapper.text()).toContain("没有新增连接");
+    wrapper.unmount();
   });
 });

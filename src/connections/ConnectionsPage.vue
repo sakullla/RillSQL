@@ -5,6 +5,7 @@ import Listbox from "../ui/Listbox.vue";
 import { tauriConnectionApi, type ConnectionApi, type EnvTagInput, type TestReport } from "./api";
 import ConnIcon from "./ConnIcon.vue";
 import EnvTagField from "./EnvTagField.vue";
+import { importConnectionText } from "./import";
 import { pickSqliteFile, replacePaletteConnections } from "./index";
 import {
   ENGINES,
@@ -58,6 +59,7 @@ const promptPassword = ref("");
 const promptSave = ref(false);
 const editDialog = ref<HTMLDialogElement | null>(null);
 const otherDialog = ref<HTMLDialogElement | null>(null);
+const importInput = ref<HTMLInputElement | null>(null);
 const tags = ref<EnvTag[]>([
   { id: "dev", label: "开发", tone: "dev", position: 0 },
   { id: "test", label: "测试", tone: "test", position: 1 },
@@ -298,6 +300,36 @@ async function browseSqlite() {
   if (!draft.value.name.trim()) draft.value.name = file.split(/[/\\]/).pop() ?? file;
 }
 
+function openImport() {
+  importInput.value?.click();
+}
+
+async function onImportPicked(event: Event) {
+  const input = event.target;
+  if (!(input instanceof HTMLInputElement)) return;
+  const file = input.files?.[0] ?? null;
+  input.value = "";
+  if (!file) return;
+  let text = "";
+  try {
+    text = await file.text();
+  } catch (error) {
+    note.value = errorText(error, "没有读到这份连接文件。");
+    return;
+  }
+  busy.value = true;
+  note.value = "";
+  try {
+    const outcome = await importConnectionText(text, (draftToSave, secrets) => api.value.save(draftToSave, secrets));
+    await reload();
+    note.value = outcome.message;
+  } catch (error) {
+    note.value = errorText(error, "没有导入连接。");
+  } finally {
+    busy.value = false;
+  }
+}
+
 function currentSecrets(): SecretInput {
   return { password: secrets.password, sshPassword: secrets.sshPassword, passphrase: secrets.passphrase };
 }
@@ -518,7 +550,7 @@ watch(
     <div class="page-inner">
       <div class="page-head">
         <div><h1>连接管理</h1><p>一个入口，管理你的本地与远程数据库。</p></div>
-        <div class="ph-actions"><button class="btn" type="button" @click="openEditor(undefined, 'sqlite')"><ConnIcon name="file" />打开 SQLite</button><button class="btn primary" type="button" data-action="conn-new" @click.stop="openEditor()"><ConnIcon name="plus" />新建连接</button></div>
+        <div class="ph-actions"><button class="btn" type="button" data-action="conn-import" :disabled="busy" @click="openImport"><ConnIcon name="file" />导入连接</button><input ref="importInput" hidden type="file" accept=".json,.ncx,.xml,application/json,text/xml" data-action="conn-import-file" aria-label="选择 DBeaver 或 Navicat 连接文件" @change="onImportPicked" /><button class="btn" type="button" @click="openEditor(undefined, 'sqlite')"><ConnIcon name="file" />打开 SQLite</button><button class="btn primary" type="button" data-action="conn-new" @click.stop="openEditor()"><ConnIcon name="plus" />新建连接</button></div>
       </div>
       <div class="connection-overview"><span><b>{{ connections.length }}</b> 个连接</span><span class="online-total"><i></i><b>{{ connectedCount }}</b> 个已连接</span><span class="grow"></span><span><ConnIcon name="lock" />凭据保存在本机</span></div>
       <div class="connection-filters">
