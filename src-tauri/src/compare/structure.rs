@@ -87,6 +87,8 @@ pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
                     &mut create_fk,
                     &mut drop_object,
                     &mut create_object,
+                    &mut notes,
+                    &mut incomplete,
                 );
             }
             (None, None) => {}
@@ -108,7 +110,7 @@ pub fn diff_structure(baseline: &Side, target: &Side) -> StructureReport {
     statements.extend(create_object);
     statements.extend(create_index);
     statements.extend(create_fk);
-    let tables = table_choices(&baseline.objects, &target.objects);
+    let tables = table_choices(engine, &baseline.objects, &target.objects);
     notes.sort();
     notes.dedup();
     let unchanged = only_baseline.is_empty() && only_target.is_empty() && changed.is_empty();
@@ -230,6 +232,8 @@ fn compare_pair(
     create_fk: &mut Vec<String>,
     object_drops: &mut Vec<String>,
     create_object: &mut Vec<String>,
+    notes: &mut Vec<String>,
+    incomplete: &mut bool,
 ) {
     if base.kind != Kind::Table {
         if base.definition != other.definition || base.materialized != other.materialized {
@@ -253,12 +257,23 @@ fn compare_pair(
     let pk_diff = pk_trusted && primary_columns(left) != primary_columns(right);
     let fk_known = left.foreign_keys_read && right.foreign_keys_read;
     let fk_diff = fk_known && foreign_keys_differ(left, right);
-    let with_fk = fk_known && !blocked(baseline, target_side, Category::ForeignKey);
+    let fk_blocked = !fk_known || blocked(baseline, target_side, Category::ForeignKey);
+    let with_fk = !fk_blocked;
     let index_blocked = blocked(baseline, target_side, Category::Index) || !left.indexes_read || !right.indexes_read;
     let sqlite_fk_only = engine == Engine::Sqlite && fk_diff && !column_diff && !pk_diff;
     let structural = engine == Engine::Sqlite && sqlite_needs_rebuild(left, right, with_fk);
+    // 外键没读全时不能把空列表当成没有外键。SQLite 重建会在新表里丢掉它们。
+    let rebuild_drops_unknown_fk = engine == Engine::Sqlite && fk_blocked && sqlite_needs_rebuild(left, right, false);
     // 仅外键不同时 SQLite 只能重建。索引没读全时重建会连带丢掉索引，因此不生成这类语句。
-    let emit_alter = allow_ddl && !blocked(baseline, target_side, Category::Table) && !(structural && index_blocked) && (column_diff || pk_diff || (sqlite_fk_only && with_fk && !index_blocked));
+    let emit_alter = allow_ddl
+        && !blocked(baseline, target_side, Category::Table)
+        && !(structural && index_blocked)
+        && !rebuild_drops_unknown_fk
+        && (column_diff || pk_diff || (sqlite_fk_only && with_fk && !index_blocked));
+    if rebuild_drops_unknown_fk && allow_ddl && !blocked(baseline, target_side, Category::Table) && (column_diff || pk_diff) {
+        *incomplete = true;
+        notes.push(format!("表 {} 的外键没有读全，不生成会丢掉外键的重建。", base.name));
+    }
     if column_diff || pk_diff {
         changed.push(item(base, if column_diff { "列的名称、类型、可否为空或默认值不同" } else { "主键不同" }));
     }
@@ -533,7 +548,13 @@ fn retarget_create(engine: Engine, side: &Side, object: &ObjectDef, definition: 
         Kind::Trigger => "TRIGGER",
         Kind::Table => return definition.to_owned(),
     };
-    let mut sql = replace_name_after(definition, keyword, &qualify(engine, side, &object.name)).unwrap_or_else(|| definition.to_owned());
+    // PostgreSQL 的触发器名不能带 schema，schema 只写在 ON 后面的表上。
+    let name = if object.kind == Kind::Trigger && engine == Engine::Postgres {
+        quote(engine, &object.name)
+    } else {
+        qualify(engine, side, &object.name)
+    };
+    let mut sql = replace_name_after(definition, keyword, &name).unwrap_or_else(|| definition.to_owned());
     if object.kind == Kind::Trigger && !object.relation.is_empty() {
         if let Some(rewritten) = replace_name_after(&sql, "ON", &qualify(engine, side, &object.relation)) {
             sql = rewritten;
@@ -902,7 +923,7 @@ fn sqlite_alter(side: &Side, name: &str, baseline: &TableShape, target: &TableSh
     statements
 }
 
-fn table_choices(baseline: &[ObjectDef], target: &[ObjectDef]) -> Vec<TableChoice> {
+fn table_choices(engine: Engine, baseline: &[ObjectDef], target: &[ObjectDef]) -> Vec<TableChoice> {
     let mut names = std::collections::BTreeSet::new();
     for object in baseline.iter().chain(target.iter()).filter(|object| object.kind == Kind::Table) {
         names.insert(object.name.clone());
@@ -912,24 +933,39 @@ fn table_choices(baseline: &[ObjectDef], target: &[ObjectDef]) -> Vec<TableChoic
         .map(|name| {
             let left = baseline.iter().find(|object| object.kind == Kind::Table && object.name == name);
             let right = target.iter().find(|object| object.kind == Kind::Table && object.name == name);
-            let shape = right.and_then(|object| object.table.as_ref()).or(left.and_then(|object| object.table.as_ref()));
-            let keys = shape.map(key_choices).unwrap_or_default();
+            let keys = table_data_keys(engine, left.and_then(|object| object.table.as_ref()), right.and_then(|object| object.table.as_ref())).unwrap_or_default();
             let unique = keys.iter().filter(|key| !key.primary).count();
             TableChoice {
                 name,
                 on_both: left.is_some() && right.is_some(),
                 needs_key_choice: keys.iter().all(|key| !key.primary) && unique > 1,
-                keys,
+                keys: keys.into_iter().map(key_choice).collect(),
             }
         })
         .collect()
 }
 
-pub fn keys_from_shape(shape: &TableShape) -> Vec<DataKey> {
-    key_choices(shape)
+fn key_choice(key: DataKey) -> KeyChoice {
+    KeyChoice { name: key.name, columns: key.columns, primary: key.primary }
+}
+
+/// 索引没读到，且主键不是来自列信息时，键是未知而不是没有。
+#[derive(Debug)]
+pub struct KeysUnread;
+
+/// 任一侧索引没读全，且主键不来自列信息（SQLite 除外）时返回错误。
+pub fn table_data_keys(engine: Engine, left: Option<&TableShape>, right: Option<&TableShape>) -> Result<Vec<DataKey>, KeysUnread> {
+    let primary_from_columns = engine == Engine::Sqlite;
+    if left.into_iter().chain(right).any(|shape| !shape.indexes_read && !primary_from_columns) {
+        return Err(KeysUnread);
+    }
+    let Some(shape) = right.or(left) else {
+        return Ok(Vec::new());
+    };
+    Ok(key_choices(shape)
         .into_iter()
         .map(|key| DataKey { name: key.name, columns: key.columns, primary: key.primary })
-        .collect()
+        .collect())
 }
 
 fn key_choices(shape: &TableShape) -> Vec<KeyChoice> {

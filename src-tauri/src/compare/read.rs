@@ -13,9 +13,9 @@ use crate::grid::{describe, qualified_name, quote_ident, select_list, Cell, Tabl
 use super::data::diff_data;
 use super::model::{
     needs_ephemeral_postgres, Category, ColumnShape, DataColumn, DataInput, DataReport, DataRequest, DataTable, ForeignKeyShape, IndexShape, Kind, ObjectDef, Side,
-    SideRequest, StructureReport, StructureRequest, TableShape,
+    Engine, SideRequest, StructureReport, StructureRequest, TableShape,
 };
-use super::structure::{diff_structure, keys_from_shape};
+use super::structure::{diff_structure, table_data_keys};
 
 static CANCELLED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
@@ -72,6 +72,7 @@ pub async fn read_data(service: &Service, request: &DataRequest) -> DataReport {
                 target: Vec::new(),
                 read_error: Some("对比已取消".to_owned()),
                 only_side: None,
+                keys_unknown: false,
             });
             continue;
         }
@@ -200,6 +201,7 @@ async fn load_data_table(
             qualify: String::new(),
             columns: Vec::new(),
             keys: Vec::new(),
+            keys_unknown: false,
             chosen_key,
             baseline: Vec::new(),
             target: Vec::new(),
@@ -210,11 +212,17 @@ async fn load_data_table(
     if let Some(message) = left.and_then(|object| object.read_error.clone()).or(right.and_then(|object| object.read_error.clone())) {
         return failed_table(name, chosen_key, message);
     }
-    let shape = right.and_then(|object| object.table.as_ref()).or(left.and_then(|object| object.table.as_ref()));
-    let Some(shape) = shape else {
+    let left_shape = left.and_then(|object| object.table.as_ref());
+    let right_shape = right.and_then(|object| object.table.as_ref());
+    if left_shape.or(right_shape).is_none() {
         return failed_table(name, chosen_key, "没有读到表结构".to_owned());
+    }
+    let Ok(engine) = Engine::parse(&target_request.engine) else {
+        return failed_table(name, chosen_key, format!("不支持的数据库 {}", target_request.engine));
     };
-    let keys = keys_from_shape(shape);
+    let Ok(keys) = table_data_keys(engine, left_shape, right_shape) else {
+        return unread_keys_table(name, chosen_key);
+    };
     let Some(base_session) = service.catalog_session(&baseline_request.connection_id) else {
         return failed_table(name, chosen_key, "基准连接还没有打开".to_owned());
     };
@@ -240,6 +248,7 @@ async fn load_data_table(
         qualify: described.schema.clone(),
         columns: described.columns.iter().map(|column| DataColumn { name: column.name.clone(), type_name: column.type_name.clone(), nullable: column.nullable }).collect(),
         keys,
+        keys_unknown: false,
         chosen_key,
         baseline: Vec::new(),
         target: Vec::new(),
@@ -260,10 +269,26 @@ fn failed_table(name: &str, chosen_key: Option<String>, message: String) -> Data
         qualify: String::new(),
         columns: Vec::new(),
         keys: Vec::new(),
+        keys_unknown: false,
         chosen_key,
         baseline: Vec::new(),
         target: Vec::new(),
         read_error: Some(message),
+        only_side: None,
+    }
+}
+
+fn unread_keys_table(name: &str, chosen_key: Option<String>) -> DataTable {
+    DataTable {
+        name: name.to_owned(),
+        qualify: String::new(),
+        columns: Vec::new(),
+        keys: Vec::new(),
+        keys_unknown: true,
+        chosen_key,
+        baseline: Vec::new(),
+        target: Vec::new(),
+        read_error: None,
         only_side: None,
     }
 }

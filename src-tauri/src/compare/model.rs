@@ -278,6 +278,8 @@ pub struct DataTable {
     pub qualify: String,
     pub columns: Vec<DataColumn>,
     pub keys: Vec<DataKey>,
+    /// 索引没读到，且主键不来自列信息。不能写成没有主键或唯一键。
+    pub keys_unknown: bool,
     pub chosen_key: Option<String>,
     pub baseline: Vec<std::collections::BTreeMap<String, crate::grid::Cell>>,
     pub target: Vec<std::collections::BTreeMap<String, crate::grid::Cell>>,

@@ -6,7 +6,7 @@ use super::model::{
     needs_ephemeral_postgres, Category, ColumnShape, DataColumn, DataInput, DataKey, DataTable, Engine, ForeignKeyShape, IndexShape, Kind, ObjectDef, Side, TableShape,
 };
 use super::read::absorb_snapshot;
-use super::structure::{diff_structure, render_script};
+use super::structure::{diff_structure, render_script, table_data_keys};
 use crate::grid::{insert_sql, Cell, Column, TableSchema};
 
 fn column(name: &str, type_name: &str, nullable: bool, primary: bool) -> ColumnShape {
@@ -42,7 +42,7 @@ fn row(pairs: &[(&str, Option<&str>)]) -> BTreeMap<String, Cell> {
 }
 
 fn data_table(name: &str, columns: Vec<DataColumn>, keys: Vec<DataKey>, baseline: Vec<BTreeMap<String, Cell>>, target: Vec<BTreeMap<String, Cell>>) -> DataTable {
-    DataTable { name: name.to_owned(), qualify: String::new(), columns, keys, chosen_key: None, baseline, target, read_error: None, only_side: None }
+    DataTable { name: name.to_owned(), qualify: String::new(), columns, keys, keys_unknown: false, chosen_key: None, baseline, target, read_error: None, only_side: None }
 }
 
 fn orders_columns() -> Vec<DataColumn> {
@@ -306,6 +306,63 @@ fn sqlite_foreign_key_only_difference_rebuilds_the_target_table() {
     assert!(!report.script.contains("没有结构差异"));
 }
 
+fn customer_fk() -> ForeignKeyShape {
+    ForeignKeyShape {
+        name: "orders_customer".to_owned(),
+        columns: vec!["customer_id".to_owned()],
+        ref_schema: String::new(),
+        ref_table: "customers".to_owned(),
+        ref_columns: vec!["id".to_owned()],
+        on_delete: String::new(),
+        on_update: String::new(),
+    }
+}
+
+#[test]
+fn sqlite_rebuild_is_withheld_when_foreign_keys_are_not_fully_known() {
+    let columns = |note: &str| vec![column("id", "integer", false, true), column("customer_id", "integer", true, false), column("note", note, true, false)];
+    let mut baseline = shape(columns("text"), vec![pk_index(&[("id", false)])]);
+    baseline.foreign_keys.push(customer_fk());
+    let mut target = shape(columns("varchar(20)"), vec![pk_index(&[("id", false)])]);
+    target.foreign_keys.push(customer_fk());
+    let kept = diff_structure(
+        &Side::ready("sqlite", "main", "", vec![ObjectDef::table("orders", baseline.clone())]),
+        &Side::ready("sqlite", "main", "", vec![ObjectDef::table("orders", target.clone())]),
+    );
+    assert!(kept.script.contains("DROP TABLE"));
+    assert!(kept.script.contains("FOREIGN KEY"));
+    assert!(kept.script.contains("orders_customer"));
+
+    baseline.foreign_keys_read = false;
+    target.foreign_keys_read = false;
+    let mut unread = Side::ready("sqlite", "main", "", vec![ObjectDef::table("orders", baseline.clone())]);
+    unread.category_errors.push((Category::ForeignKey, "fk denied".to_owned()));
+    let withheld = diff_structure(&unread, &Side::ready("sqlite", "main", "", vec![ObjectDef::table("orders", target.clone())]));
+    assert!(withheld.changed.iter().any(|item| item.kind == "表" && item.name == "orders"));
+    assert!(withheld.incomplete);
+    assert!(withheld.script.contains("不完整"));
+    assert!(withheld.script.contains("外键没有读全"));
+    let upper = withheld.script.to_ascii_uppercase();
+    assert!(!upper.contains("DROP TABLE"));
+    assert!(!upper.contains("CREATE TABLE"));
+    assert!(!upper.contains("FOREIGN KEY"));
+    assert!(!withheld.script.contains("没有结构差异"));
+
+    let mut blocked = Side::ready("sqlite", "main", "", vec![ObjectDef::table("orders", {
+        let mut known = baseline.clone();
+        known.foreign_keys_read = true;
+        known
+    })]);
+    blocked.category_errors.push((Category::ForeignKey, "fk denied".to_owned()));
+    let mut blocked_target = target.clone();
+    blocked_target.foreign_keys_read = true;
+    let category_blocked = diff_structure(&blocked, &Side::ready("sqlite", "main", "", vec![ObjectDef::table("orders", blocked_target)]));
+    assert!(category_blocked.changed.iter().any(|item| item.kind == "表"));
+    assert!(category_blocked.incomplete);
+    assert!(!category_blocked.script.to_ascii_uppercase().contains("DROP TABLE"));
+    assert!(!category_blocked.script.to_ascii_uppercase().contains("FOREIGN KEY"));
+}
+
 #[test]
 fn create_statements_are_qualified_on_the_target_side() {
     let baseline_view = ObjectDef::defined(Kind::View, "v_orders", "CREATE OR REPLACE VIEW \"public\".\"v_orders\" AS SELECT 1");
@@ -329,7 +386,9 @@ fn create_statements_are_qualified_on_the_target_side() {
     target_trigger.relation = "orders".to_owned();
     let triggers = diff_structure(&Side::ready("postgres", "app", "public", vec![baseline_trigger]), &Side::ready("postgres", "app", "sales", vec![target_trigger]));
     assert!(triggers.script.contains("DROP TRIGGER \"touch\" ON \"sales\".\"orders\""));
-    assert!(triggers.script.contains("ON \"sales\".\"orders\""));
+    assert!(triggers.script.contains("CREATE TRIGGER \"touch\" BEFORE UPDATE ON \"sales\".\"orders\""));
+    assert!(!triggers.script.contains("CREATE TRIGGER \"sales\".\"touch\""));
+    assert!(!triggers.script.contains("\"sales\".\"touch\""));
     assert!(!triggers.script.contains("ON public.orders"));
 
     let baseline_mysql = ObjectDef::defined(
@@ -384,6 +443,46 @@ fn index_or_foreign_key_failure_keeps_columns_for_the_table_diff() {
     assert!(!report.script.to_ascii_uppercase().contains("FOREIGN KEY"));
     assert!(!report.script.contains("PRIMARY KEY"));
     assert!(!report.script.contains("DROP CONSTRAINT"));
+}
+
+#[test]
+fn unread_index_metadata_is_not_a_missing_primary_key() {
+    let mut unread = shape(vec![column("id", "integer", false, false), column("note", "text", true, false)], Vec::new());
+    unread.indexes_read = false;
+    assert!(table_data_keys(Engine::Postgres, Some(&unread), Some(&unread)).is_err());
+    assert!(table_data_keys(Engine::Mysql, Some(&unread), Some(&unread)).is_err());
+    let known = shape(vec![column("id", "integer", false, true)], vec![pk_index(&[("id", false)])]);
+    assert!(table_data_keys(Engine::Postgres, Some(&known), Some(&unread)).is_err());
+
+    let mut sqlite_unread = shape(vec![column("id", "integer", false, true), column("note", "text", true, false)], Vec::new());
+    sqlite_unread.indexes_read = false;
+    let sqlite_keys = table_data_keys(Engine::Sqlite, Some(&sqlite_unread), Some(&sqlite_unread)).expect("sqlite primary key comes from columns");
+    assert!(sqlite_keys.iter().any(|key| key.primary && key.columns == ["id".to_owned()]));
+
+    let mut table = data_table("orders", orders_columns(), Vec::new(), vec![row(&[("id", Some("1")), ("note", Some("a"))])], Vec::new());
+    table.keys_unknown = true;
+    let report = diff_data(&DataInput { baseline_engine: "postgres".to_owned(), target_engine: "postgres".to_owned(), tables: vec![table], cancelled: false });
+    assert!(report.script.contains("索引或主键没有读到"));
+    assert!(!report.script.contains("没有主键或唯一键"));
+    assert!(!report.script.contains("没有数据差异"));
+    assert!(!report.script.to_ascii_uppercase().contains("INSERT"));
+    assert!(!report.script.to_ascii_uppercase().contains("UPDATE"));
+    assert!(!report.script.to_ascii_uppercase().contains("DELETE"));
+
+    let mut left = Side::ready("postgres", "app", "public", vec![ObjectDef::table("orders", unread.clone())]);
+    left.category_errors.push((Category::Index, "permission denied".to_owned()));
+    let listed = diff_structure(&left, &Side::ready("postgres", "app", "public", vec![ObjectDef::table("orders", unread)]));
+    let choice = listed.tables.iter().find(|item| item.name == "orders").expect("orders");
+    assert!(choice.keys.is_empty());
+    assert!(!choice.needs_key_choice);
+
+    let sqlite_report = diff_structure(
+        &Side::ready("sqlite", "main", "", vec![ObjectDef::table("orders", sqlite_unread.clone())]),
+        &Side::ready("sqlite", "main", "", vec![ObjectDef::table("orders", sqlite_unread)]),
+    );
+    let sqlite_choice = sqlite_report.tables.iter().find(|item| item.name == "orders").expect("orders");
+    assert!(sqlite_choice.keys.iter().any(|key| key.primary));
+    assert!(!sqlite_choice.needs_key_choice);
 }
 
 #[test]

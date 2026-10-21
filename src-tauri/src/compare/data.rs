@@ -46,6 +46,11 @@ pub fn diff_data(input: &DataInput) -> DataReport {
                 continue;
             }
         }
+        if table.keys_unknown {
+            notes.push(format!("表 {} 的索引或主键没有读到，不生成行变更。", table.name));
+            diffs.push(DataDiff { table: table.name.clone(), action: "skipped".to_owned(), key: String::new(), detail: "索引或主键没有读到".to_owned() });
+            continue;
+        }
         match resolve_key(&table.keys, table.chosen_key.as_deref()) {
             KeyUse::Ready { columns, label } => {
                 if let Some(label) = label {
@@ -283,7 +288,7 @@ fn render(notes: &[String], statements: &[String], incomplete: bool) -> String {
     if statements.is_empty() {
         if incomplete {
             lines.push("-- 没有可放入完整脚本的行变更。".to_owned());
-        } else if notes.iter().any(|note| note.contains("无法对应") || note.contains("选定前") || note.contains("结构差异") || note.contains("未能生成")) {
+        } else if notes.iter().any(|note| note.contains("无法对应") || note.contains("选定前") || note.contains("结构差异") || note.contains("未能生成") || note.contains("没有读到")) {
             lines.push("-- 没有可生成的行变更。".to_owned());
         } else {
             lines.push("-- 没有数据差异。".to_owned());
