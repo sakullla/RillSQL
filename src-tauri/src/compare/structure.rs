@@ -2148,8 +2148,9 @@ fn view_columns_compatible(wanted: &str, current: &str) -> bool {
     }
 }
 
-/// 替换后的定义不再依赖即将删除的列、函数或表时，把 CREATE OR REPLACE 放到这些语句之前。
+/// 替换后的定义不再依赖即将删除的列、函数、表或视图时，把 CREATE OR REPLACE 放到这些语句之前。
 /// 旧正文若还指向即将删除的视图，删视图发生在替换之前，提前替换会被随后的 DROP 吃掉且不再建回。
+/// 新正文若改去引用本次会 DROP 的视图，表、例程、列三条都不能提前，要降成先删后建。
 fn is_early_view_replace(
     create: &PlannedCreate,
     alters: &[String],
@@ -2169,11 +2170,13 @@ fn is_early_view_replace(
     if references(current, dropped_views) {
         return false;
     }
-    // 提前替换只解开即将删除的表。新正文仍引用表、视图，或还要调用即将删除的例程时，不能提前。
     let wanted_still_depends = references(wanted, dropped_tables)
         || references(wanted, dropped_views)
         || routine_drops.iter().any(|name| calls_routine(wanted, name));
-    if references(current, dropped_tables) && !wanted_still_depends {
+    if wanted_still_depends {
+        return false;
+    }
+    if references(current, dropped_tables) {
         return true;
     }
     if routine_drops.iter().any(|name| statement_mentions(current, name)) {
@@ -2500,7 +2503,7 @@ fn cover_dependents(
     }
 }
 
-/// 新定义仍然依赖即将删除的函数或列，或者要用到还没建出来的对象时，不能先 OR REPLACE。
+/// 新定义仍然依赖即将删除的函数或列，或者要用到还没建出来、以及本次会先 DROP 的视图时，不能先 OR REPLACE。
 fn demote_blocked_view_replacements(
     engine: Engine,
     baseline: &Side,
@@ -2515,7 +2518,17 @@ fn demote_blocked_view_replacements(
         .filter(|drop| matches!(drop.kind, Kind::Function | Kind::Procedure))
         .map(|drop| drop.name.clone())
         .collect::<Vec<_>>();
-    let fresh_names = creates.iter().filter(|create| create.current_definition.is_empty()).map(|create| create.name.clone()).collect::<Vec<_>>();
+    // 即将删除的视图即使还留着旧定义，重建前也不存在。不能只把 current_definition 为空的对象当成 fresh。
+    let mut fresh_names = creates.iter().filter(|create| create.current_definition.is_empty()).map(|create| create.name.clone()).collect::<Vec<_>>();
+    let mut dropped_views = Vec::new();
+    for drop in drops.iter().filter(|drop| drop.kind == Kind::View) {
+        if !dropped_views.iter().any(|name: &String| name.eq_ignore_ascii_case(&drop.name)) {
+            dropped_views.push(drop.name.clone());
+        }
+        if !fresh_names.iter().any(|name| name.eq_ignore_ascii_case(&drop.name)) {
+            fresh_names.push(drop.name.clone());
+        }
+    }
     let added = added_columns(alters);
     let blocked = blocking_columns(alters).into_iter().chain(blocking_columns(detach)).collect::<Vec<_>>();
     let keys = creates
@@ -2529,8 +2542,11 @@ fn demote_blocked_view_replacements(
             let needs_fresh = fresh_names
                 .iter()
                 .any(|name| !name.eq_ignore_ascii_case(&create.name) && statement_mentions(wanted, name) && !statement_mentions(current, name));
+            let needs_dropped_view = referenced_relations(wanted).iter().any(|found| {
+                dropped_views.iter().any(|name: &String| !name.eq_ignore_ascii_case(&create.name) && found.eq_ignore_ascii_case(name))
+            });
             let needs_added = added.iter().any(|(table, column)| view_uses_table_column(wanted, table, column) && !view_uses_table_column(current, table, column));
-            keeps_dropped_routine || keeps_blocked_column || needs_fresh || needs_added
+            keeps_dropped_routine || keeps_blocked_column || needs_fresh || needs_dropped_view || needs_added
         })
         .map(|create| create.key.clone())
         .collect::<Vec<_>>();

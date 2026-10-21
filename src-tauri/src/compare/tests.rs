@@ -235,6 +235,82 @@ fn replaced_view_that_reads_a_dropped_view_is_recreated_after_the_drop() {
     }
 }
 
+fn view_create_at(script: &str, name: &str) -> usize {
+    let replace = format!("CREATE OR REPLACE VIEW {name}");
+    let create = format!("CREATE VIEW {name}");
+    script.find(&replace).or_else(|| script.find(&create)).unwrap_or_else(|| panic!("missing view create {name} in {script}"))
+}
+
+#[test]
+fn view_retargeted_onto_a_dropped_view_is_dropped_before_rebuild() {
+    let notes = ObjectDef::table("notes", shape(vec![column("id", "integer", false, true)], vec![]));
+    let base = ObjectDef::defined(Kind::View, "v_base", "CREATE VIEW v_base (id) AS SELECT id FROM notes");
+    let current_mid = ObjectDef::defined(Kind::View, "v_mid", "CREATE VIEW v_mid (id) AS SELECT id FROM v_base");
+    let wanted_mid = ObjectDef::defined(Kind::View, "v_mid", "CREATE VIEW v_mid (id) AS SELECT 2 AS id");
+    let cases = [
+        ("postgres", "app", "public", "\"public\".\"v_top\"", "\"public\".\"v_mid\"", "\"public\".\"v_base\"", "\"public\".\"notes\""),
+        ("mysql", "app", "", "`app`.`v_top`", "`app`.`v_mid`", "`app`.`v_base`", "`app`.`notes`"),
+        ("mariadb", "app", "", "`app`.`v_top`", "`app`.`v_mid`", "`app`.`v_base`", "`app`.`notes`"),
+    ];
+    for (engine, database, schema, top, mid, base_name, notes_name) in cases {
+        let current_top = ObjectDef::defined(Kind::View, "v_top", "CREATE VIEW v_top (id) AS SELECT id FROM notes");
+        let wanted_top = ObjectDef::defined(Kind::View, "v_top", "CREATE VIEW v_top (id) AS SELECT id FROM v_mid");
+        let report = diff_structure(
+            &Side::ready(engine, database, schema, vec![wanted_mid.clone(), wanted_top]),
+            &Side::ready(engine, database, schema, vec![notes.clone(), base.clone(), current_mid.clone(), current_top]),
+        );
+        let script = &report.script;
+        let drop_top = format!("DROP VIEW {top}");
+        let drop_mid = format!("DROP VIEW {mid}");
+        let create_mid = view_create_at(script, mid);
+        let create_top = view_create_at(script, top);
+        assert!(at(script, &drop_top) < at(script, &format!("DROP TABLE {notes_name}")), "{engine}\n{script}");
+        assert!(at(script, &drop_mid) < at(script, &format!("DROP VIEW {base_name}")), "{engine}\n{script}");
+        assert!(at(script, &drop_mid) < create_top, "{engine}\n{script}");
+        assert!(create_mid < create_top, "{engine}\n{script}");
+        assert_eq!(script.matches(&drop_top).count(), 1, "{engine}\n{script}");
+        assert!(script.contains("SELECT id FROM v_mid"), "{engine}\n{script}");
+    }
+
+    let old_fn = ObjectDef::defined(Kind::Function, "old_fn", "CREATE FUNCTION old_fn() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$");
+    let routine = diff_structure(
+        &Side::ready("postgres", "app", "public", vec![wanted_mid.clone(), ObjectDef::defined(Kind::View, "v_top", "CREATE VIEW v_top (id) AS SELECT id FROM v_mid")]),
+        &Side::ready(
+            "postgres",
+            "app",
+            "public",
+            vec![notes.clone(), base.clone(), current_mid.clone(), old_fn, ObjectDef::defined(Kind::View, "v_top", "CREATE VIEW v_top (id) AS SELECT old_fn() AS id")],
+        ),
+    );
+    let script = &routine.script;
+    let create_top = view_create_at(script, "\"public\".\"v_top\"");
+    assert!(at(script, "DROP VIEW \"public\".\"v_top\"") < at(script, "DROP FUNCTION \"public\".\"old_fn\""), "{script}");
+    assert!(at(script, "DROP VIEW \"public\".\"v_mid\"") < create_top, "{script}");
+    assert!(view_create_at(script, "\"public\".\"v_mid\"") < create_top, "{script}");
+
+    let baseline_orders = ObjectDef::table("orders", shape(vec![column("id", "integer", false, true)], vec![]));
+    let target_orders = ObjectDef::table("orders", shape(vec![column("id", "integer", false, true), column("note", "text", true, false)], vec![]));
+    let column = diff_structure(
+        &Side::ready(
+            "postgres",
+            "app",
+            "public",
+            vec![baseline_orders, wanted_mid, ObjectDef::defined(Kind::View, "v_top", "CREATE VIEW v_top (id) AS SELECT id FROM v_mid")],
+        ),
+        &Side::ready(
+            "postgres",
+            "app",
+            "public",
+            vec![target_orders, notes, base, current_mid, ObjectDef::defined(Kind::View, "v_top", "CREATE VIEW v_top (id) AS SELECT note FROM orders")],
+        ),
+    );
+    let script = &column.script;
+    let create_top = view_create_at(script, "\"public\".\"v_top\"");
+    assert!(at(script, "DROP VIEW \"public\".\"v_top\"") < at(script, "DROP COLUMN \"note\""), "{script}");
+    assert!(at(script, "DROP VIEW \"public\".\"v_mid\"") < create_top, "{script}");
+    assert!(view_create_at(script, "\"public\".\"v_mid\"") < create_top, "{script}");
+}
+
 #[test]
 fn routine_that_reads_a_dropped_table_is_dropped_first() {
     let notes = ObjectDef::table("notes", shape(vec![column("id", "integer", false, true)], vec![]));
