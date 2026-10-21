@@ -178,6 +178,49 @@ fn creates_foreign_keys_after_every_new_table() {
 }
 
 #[test]
+fn replaced_view_stops_using_a_table_before_that_table_is_dropped() {
+    let notes = ObjectDef::table("notes", shape(vec![column("id", "integer", false, true)], vec![]));
+    let current = ObjectDef::defined(Kind::View, "v_notes", "CREATE VIEW v_notes (id) AS SELECT id FROM notes");
+    let wanted = ObjectDef::defined(Kind::View, "v_notes", "CREATE VIEW v_notes (id) AS SELECT 1 AS id");
+    let cases = [
+        ("postgres", "app", "public", "CREATE OR REPLACE VIEW \"public\".\"v_notes\"", "DROP TABLE \"public\".\"notes\""),
+        ("mysql", "app", "", "CREATE OR REPLACE VIEW `app`.`v_notes`", "DROP TABLE `app`.`notes`"),
+        ("mariadb", "app", "", "CREATE OR REPLACE VIEW `app`.`v_notes`", "DROP TABLE `app`.`notes`"),
+    ];
+    for (engine, database, schema, replace_view, drop_table) in cases {
+        let report = diff_structure(
+            &Side::ready(engine, database, schema, vec![wanted.clone()]),
+            &Side::ready(engine, database, schema, vec![notes.clone(), current.clone()]),
+        );
+        let script = &report.script;
+        assert!(at(script, replace_view) < at(script, drop_table), "{engine}\n{script}");
+        assert!(!script.contains("DROP VIEW"), "{engine}\n{script}");
+    }
+    let sqlite = diff_structure(
+        &Side::ready("sqlite", "main", "", vec![wanted]),
+        &Side::ready("sqlite", "main", "", vec![notes, current]),
+    );
+    let script = &sqlite.script;
+    assert!(at(script, "DROP VIEW \"v_notes\"") < at(script, "DROP TABLE \"notes\""), "{script}");
+    assert!(at(script, "DROP TABLE \"notes\"") < at(script, "CREATE VIEW \"v_notes\""), "{script}");
+}
+
+#[test]
+fn routine_that_reads_a_dropped_table_is_dropped_first() {
+    let notes = ObjectDef::table("notes", shape(vec![column("id", "integer", false, true)], vec![]));
+    let function = ObjectDef::defined(Kind::Function, "read_notes", "CREATE FUNCTION read_notes() RETURNS integer LANGUAGE sql AS $$ SELECT id FROM notes $$");
+    let procedure = ObjectDef::defined(Kind::Procedure, "load_notes", "CREATE PROCEDURE load_notes() LANGUAGE sql AS $$ SELECT id FROM notes $$");
+    let report = diff_structure(
+        &Side::ready("postgres", "app", "public", vec![]),
+        &Side::ready("postgres", "app", "public", vec![notes, function, procedure]),
+    );
+    let script = &report.script;
+    let drop_table = at(script, "DROP TABLE \"public\".\"notes\"");
+    assert!(at(script, "DROP FUNCTION \"public\".\"read_notes\"") < drop_table, "{script}");
+    assert!(at(script, "DROP PROCEDURE \"public\".\"load_notes\"") < drop_table, "{script}");
+}
+
+#[test]
 fn sqlite_new_table_keeps_the_foreign_key_inside_create_table() {
     let orders = table_with_fk("orders", foreign_key("orders_user", "user_id", "users"));
     let report = diff_structure(&Side::ready("sqlite", "main", "", vec![orders]), &Side::ready("sqlite", "main", "", vec![]));

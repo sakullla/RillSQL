@@ -657,9 +657,12 @@ fn assemble_statements(
     }
     let by_name = |left: &PlannedDrop, right: &PlannedDrop| left.name.cmp(&right.name).then(left.statement.cmp(&right.statement));
     triggers.sort_by(by_name);
-    // 引用即将删除的视图的例程必须先于该视图删除，不能留在后面的固定阶段。
+    // 引用即将删除的视图或表的例程必须先于该对象删除，不能留在后面的固定阶段。
     let dropped_view_names = views.iter().map(|view| view.name.clone()).collect::<BTreeSet<_>>();
-    let early_keys = routine_drop_keys(&support_drops, &dropped_view_names);
+    let dropped_table_names = tables.iter().map(|table| table.name.clone()).collect::<BTreeSet<_>>();
+    let mut blocking_relations = dropped_view_names.clone();
+    blocking_relations.extend(dropped_table_names.iter().cloned());
+    let early_keys = routine_drop_keys(&support_drops, &blocking_relations);
     let mut early_routines = Vec::new();
     let mut late_support = Vec::new();
     for drop in support_drops {
@@ -670,7 +673,7 @@ fn assemble_statements(
         }
     }
     let support_drops = late_support;
-    let dropped_tables = tables.iter().map(|table| table.name.clone()).collect::<BTreeSet<_>>();
+    let dropped_tables = dropped_table_names;
     let mut changed_drops = Vec::new();
     let mut only_target_drops = Vec::new();
     for mut drop in support_drops {
@@ -702,11 +705,12 @@ fn assemble_statements(
         .filter(|drop| matches!(drop.kind, Kind::Function | Kind::Procedure))
         .map(|drop| drop.name.clone())
         .collect::<Vec<_>>();
+    let dropped_relations = dropped_view_names.iter().chain(dropped_tables.iter()).cloned().collect::<Vec<_>>();
     let mut early_views = Vec::new();
     for create in creates {
         match create.kind {
             Kind::Table => table_creates.push(create),
-            Kind::View if is_early_view_replace(&create, &alters, &detach, &routine_drops) => early_views.push(create),
+            Kind::View if is_early_view_replace(&create, &alters, &detach, &routine_drops, &dropped_relations) => early_views.push(create),
             Kind::View => view_creates.push(create),
             Kind::Trigger => trigger_creates.push(create),
             _ if drop_keys.contains(&create.key) => changed_creates.push(create),
@@ -2138,12 +2142,20 @@ fn view_columns_compatible(wanted: &str, current: &str) -> bool {
     }
 }
 
-/// 替换后的定义不再依赖即将删除的列或函数时，把 CREATE OR REPLACE 放到这些语句之前。
-fn is_early_view_replace(create: &PlannedCreate, alters: &[String], detach: &[String], routine_drops: &[String]) -> bool {
+/// 替换后的定义不再依赖即将删除的列、函数、表或视图时，把 CREATE OR REPLACE 放到这些语句之前。
+fn is_early_view_replace(create: &PlannedCreate, alters: &[String], detach: &[String], routine_drops: &[String], dropped_relations: &[String]) -> bool {
     if create.current_definition.is_empty() {
         return false;
     }
     let current = &create.current_definition;
+    let wanted = &create.definition;
+    let references_dropped = |definition: &str| {
+        referenced_relations(definition).iter().any(|found| dropped_relations.iter().any(|name| found.eq_ignore_ascii_case(name)))
+    };
+    // 旧视图还指向即将删除的表时，先换成不再引用它的正文。新正文仍引用，或还要调用即将删除的例程时，不能提前替换。
+    if references_dropped(current) && !references_dropped(wanted) && !routine_drops.iter().any(|name| calls_routine(wanted, name)) {
+        return true;
+    }
     if routine_drops.iter().any(|name| statement_mentions(current, name)) {
         return true;
     }
