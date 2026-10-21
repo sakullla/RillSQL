@@ -3,7 +3,7 @@ import { ref } from "vue";
 import { canDropIndex } from "./logic";
 import type { StructureIndex } from "./types";
 
-defineProps<{ indexes: StructureIndex[]; columns: string[] }>();
+const props = defineProps<{ indexes: StructureIndex[]; columns: string[]; focusName?: string }>();
 const emit = defineEmits<{
   drop: [name: string];
   create: [payload: { name: string; unique: boolean; columns: { name: string; descending: boolean }[] }];
@@ -30,7 +30,7 @@ function previewCreate(columns: string[]) {
   <div class="struct-indexes">
     <p class="hint">由主键、唯一约束或外键自动维护的索引不能单独删除；要移除它，需要改对应的约束。</p>
     <p v-if="!indexes.length" class="muted">这张表还没有索引。</p>
-    <div v-for="index in indexes" :key="index.name" class="obj-row">
+    <div v-for="index in indexes" :key="index.name" class="obj-row" :class="{ 'row-focus': props.focusName === index.name }" :data-index="index.name" :data-focused="props.focusName === index.name ? 'true' : 'false'">
       <code>{{ index.name }}</code>
       <span class="badge sm">{{ index.unique ? "唯一" : "普通" }}</span>
       <span class="muted">{{ index.columns.map((item) => `${item.name}${item.descending ? "（降序）" : ""}`).join(" → ") }}</span>

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import Icon from "../shell/Icon.vue";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { catalogConnections, refreshCatalog } from "../catalog/store";
+import { catalogConnections, refreshCatalog, structureFocus } from "../catalog/store";
 import type { TableTarget } from "../grid/target";
 import { describeStructure, executeStructure, previewStructure, type StructureRequest } from "./api";
 import ChangePreviewDialog from "./ChangePreviewDialog.vue";
@@ -21,7 +21,10 @@ const props = defineProps<{
 }>();
 
 const purpose = computed(() => props.purpose ?? "create");
-const section = ref<"columns" | "indexes" | "foreign" | "drop">("columns");
+const section = ref<"columns" | "indexes" | "foreign" | "drop" | "definition">("columns");
+const focusedMember = ref("");
+const viewSql = ref("");
+const previewedViewSql = ref<string | null>(null);
 const description = ref<StructureDescription | null>(null);
 const rows = ref<ColumnDraft[]>([]);
 const errorText = ref("");
@@ -38,13 +41,45 @@ const ddlCopyNote = ref("");
 
 const connections = computed(() => catalogConnections().filter((item) => item.status === "connected"));
 
+const isView = computed(() => description.value?.kind === "view");
+const viewUnreadable = computed(() => {
+  if (!isView.value) return "";
+  if (description.value?.definitionError) return description.value.definitionError;
+  const sql = description.value?.displaySql.trim() ?? "";
+  if (sql === "" || sql.startsWith("--")) return "没有读到可编辑的视图定义，不能把占位说明当作原文。";
+  return "";
+});
+
 watch(
-  () => props.focusSection,
-  (value) => {
-    if (value) section.value = value;
+  () => [props.focusSection, structureFocus.value, props.target?.table, props.target?.connectionId] as const,
+  () => {
+    const focus = structureFocus.value;
+    const target = props.target;
+    if (
+      focus &&
+      target &&
+      focus.connectionId === target.connectionId &&
+      focus.database === target.database &&
+      focus.schema === target.schema &&
+      focus.table === target.table
+    ) {
+      section.value = focus.section;
+      focusedMember.value = focus.name;
+      return;
+    }
+    focusedMember.value = "";
+    if (props.focusSection) section.value = props.focusSection;
   },
   { immediate: true },
 );
+
+function chooseSection(next: "columns" | "indexes" | "foreign" | "drop" | "definition") {
+  if (structureFocus.value && structureFocus.value.section !== next) {
+    structureFocus.value = null;
+    focusedMember.value = "";
+  }
+  section.value = next;
+}
 const activeColumns = computed(() => rows.value.filter((row) => !row.dropped).map((row) => row.name).filter(Boolean));
 
 const boundConnection = computed(() => {
@@ -125,6 +160,9 @@ async function loadTable() {
     const loaded = await describeStructure(props.target);
     description.value = loaded;
     rows.value = draftsFromColumns(loaded.columns);
+    const sql = loaded.displaySql.trim();
+    viewSql.value = loaded.kind === "view" && sql !== "" && !sql.startsWith("--") ? loaded.displaySql : "";
+    previewedViewSql.value = null;
   } catch (error) {
     errorText.value = error instanceof Error ? error.message : String(error);
   } finally {
@@ -210,7 +248,25 @@ function previewColumns() {
   openPreview({ kind: "alterColumns", table: props.target.table, columns: rows.value.map((row) => ({ ...row })) });
 }
 
+function previewView() {
+  if (!props.target || !isView.value) return;
+  if (viewUnreadable.value) {
+    errorText.value = viewUnreadable.value;
+    return;
+  }
+  previewedViewSql.value = viewSql.value;
+  openPreview({ kind: "replaceView", table: props.target.table, definition: viewSql.value });
+}
+
+watch(viewSql, (value) => {
+  if (pending.value?.kind === "replaceView" && previewedViewSql.value !== null && value !== previewedViewSql.value) {
+    closePreview();
+    previewedViewSql.value = null;
+  }
+});
+
 function previewCurrent() {
+  if (section.value === "definition") previewView();
   if (section.value === "columns") previewColumns();
   if (section.value === "drop" && props.target) openPreview({ kind: "dropTable", table: props.target.table });
 }
@@ -227,7 +283,12 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 
 async function confirm() {
   const request = requestOf();
-  if (!request || !plan.value || !pending.value || plan.value.blocked.length) return;
+  if (!request || !plan.value || !pending.value || plan.value.blocked.length || plan.value.steps.length === 0) return;
+  if (pending.value.kind === "replaceView" && pending.value.definition !== viewSql.value) {
+    errorText.value = "定义在预览之后又改过，需要重新预览。没有发送。";
+    closePreview();
+    return;
+  }
   busy.value = true;
   try {
     const done = await executeStructure(request, pending.value, plan.value.steps.map((step) => step.sql));
@@ -267,11 +328,12 @@ function createForeignKey(foreignKey: StructureForeignKey) {
     <template v-else>
       <header class="structure-heading"><span class="action-icon"><Icon name="table" /></span><div><h2>{{ purpose === 'create' ? '设计新表' : target?.table }}</h2><p><span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span> {{ purpose === 'create' ? '定义字段、类型与约束，预览 SQL 后再创建。' : contextText }}</p></div><span class="grow"></span><div v-if="description" class="structure-stats"><span><b>{{ description.columns.length }}</b> 字段</span><span><b>{{ description.indexes.length }}</b> 索引</span></div></header>
       <nav class="struct-nav" aria-label="结构分区">
-        <button type="button" :class="{ on: section === 'columns' }" @click="section = 'columns'">字段</button>
-        <button v-if="purpose === 'edit'" type="button" :class="{ on: section === 'indexes' }" @click="section = 'indexes'">索引</button>
-        <button v-if="purpose === 'edit'" type="button" :class="{ on: section === 'foreign' }" @click="section = 'foreign'">外键</button>
+        <button type="button" :class="{ on: section === 'columns' }" @click="chooseSection('columns')">字段</button>
+        <button v-if="purpose === 'edit'" type="button" :class="{ on: section === 'indexes' }" @click="chooseSection('indexes')">索引</button>
+        <button v-if="purpose === 'edit'" type="button" :class="{ on: section === 'foreign' }" @click="chooseSection('foreign')">外键</button>
+        <button v-if="isView" type="button" :class="{ on: section === 'definition' }" data-section="definition" @click="chooseSection('definition')">定义</button>
         <span class="grow"></span>
-        <button v-if="purpose === 'edit'" type="button" class="danger" :class="{ on: section === 'drop' }" @click="section = 'drop'">删除表</button>
+        <button v-if="purpose === 'edit' && !isView" type="button" class="danger" :class="{ on: section === 'drop' }" @click="chooseSection('drop')">删除表</button>
       </nav>
       <details v-if="ddlVisible" class="disclosure struct-ddl">
         <summary>建表 SQL</summary>
@@ -298,14 +360,25 @@ function createForeignKey(foreignKey: StructureForeignKey) {
           <label>新表名<input v-model="createName" type="text" aria-label="新表名" /></label>
           <p v-if="!connections.length" class="muted">需要至少一个已打开的连接。</p>
         </form>
-        <StructureEditor v-if="section === 'columns'" :rows="rows" :baseline="description?.columns ?? []" :mode="purpose === 'create' ? 'create' : 'edit'" @preview="previewColumns" />
+        <StructureEditor v-if="section === 'columns'" :rows="rows" :baseline="description?.columns ?? []" :mode="purpose === 'create' ? 'create' : 'edit'" :focus-name="focusedMember" @preview="previewColumns" />
         <IndexEditor
           v-else-if="section === 'indexes' && description"
           :indexes="description.indexes"
           :columns="activeColumns"
+          :focus-name="focusedMember"
           @drop="openPreview({ kind: 'dropIndex', table: target!.table, name: $event })"
           @create="openPreview({ kind: 'createIndex', table: target!.table, name: $event.name, unique: $event.unique, columns: $event.columns })"
         />
+        <section v-else-if="section === 'definition' && isView" class="struct-view-def" data-view-definition>
+          <p v-if="viewUnreadable" class="struct-alert" role="alert" data-view-error>{{ viewUnreadable }}</p>
+          <template v-else>
+            <p class="muted">修改下面的定义。先列出将发送的全部语句；取消不发送，确认后才按这个顺序发送。函数、存储过程和触发器不能从这里保存。</p>
+            <textarea v-model="viewSql" data-view-sql aria-label="视图定义" spellcheck="false"></textarea>
+            <div>
+              <button class="btn primary" type="button" data-action="preview-view" @click="previewView">查看将要发生什么</button>
+            </div>
+          </template>
+        </section>
         <ForeignKeyEditor
           v-else-if="section === 'foreign' && description"
           :foreign-keys="description.foreignKeyList"
@@ -364,6 +437,17 @@ function createForeignKey(foreignKey: StructureForeignKey) {
 /* 建表 SQL 区块：折叠壳复用 base.css 的 disclosure，正文 pre 与 structure.css 的 pv-sql pre 同款。 */
 .struct-ddl { border-bottom: 1px solid var(--line); background: var(--panel-2); }
 .struct-ddl-bar { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-2); }
+.struct-view-def { display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-3); min-height: 0; }
+.struct-view-def textarea {
+  min-height: 180px;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--sunken);
+  color: var(--text);
+  font: var(--fs-sm) var(--mono);
+  resize: vertical;
+}
 .struct-ddl pre {
   margin: 0 0 var(--sp-2);
   padding: var(--sp-2) var(--sp-3);

@@ -3,7 +3,7 @@ import { computed } from "vue";
 import { columnImpact, columnMark, impactLevel, pendingCount } from "./logic";
 import type { ColumnDraft, StructureColumn } from "./types";
 
-const props = defineProps<{ rows: ColumnDraft[]; baseline: StructureColumn[]; mode: "create" | "edit" }>();
+const props = defineProps<{ rows: ColumnDraft[]; baseline: StructureColumn[]; mode: "create" | "edit"; focusName?: string }>();
 const emit = defineEmits<{ preview: [] }>();
 
 const changed = computed(() => pendingCount(props.rows, props.baseline));
@@ -74,7 +74,7 @@ function toggleDrop(draft: ColumnDraft) {
       </thead>
       <tbody>
         <template v-for="(draft, index) in rows" :key="draft.original ?? `new-${index}`">
-          <tr :class="{ 'row-drop': draft.dropped }">
+          <tr :class="{ 'row-drop': draft.dropped, 'row-focus': props.focusName === draft.name }" :data-column="draft.name" :data-focused="props.focusName === draft.name ? 'true' : 'false'">
             <td>
               <div class="cell-name">
                 <span v-if="markText(draft)" class="badge sm" :class="markBadge(draft)">{{ markText(draft) }}</span>

@@ -6,11 +6,26 @@ export const KIND_LABEL: Record<ObjectKind, string> = {
   function: "函数",
   procedure: "存储过程",
   trigger: "触发器",
+  sequence: "序列",
+  enum: "枚举",
+  domain: "域",
 };
 
 export function objectGroups(engine: Engine): ObjectKind[] {
-  if (engine === "sqlite") return ["table", "view", "trigger"];
-  return ["table", "view", "function", "procedure", "trigger"];
+  if (engine === "sqlite" || engine === "mysql") return engine === "sqlite" ? ["table", "view", "trigger"] : ["table", "view", "function", "procedure", "trigger"];
+  if (engine === "mariadb") return ["table", "view", "function", "procedure", "trigger", "sequence"];
+  return ["table", "view", "function", "procedure", "trigger", "sequence", "enum", "domain"];
+}
+
+/** 普通视图不显示索引分组。物化视图只有快照确实返回索引时才显示。表没有索引时仍显示空分组。 */
+export function showsIndexGroup(kind: ObjectKind, materialized: boolean, indexCount: number | null): boolean {
+  if (kind === "table") return true;
+  if (kind === "view" && materialized) return (indexCount ?? 0) > 0;
+  return false;
+}
+
+export function isDefinitionKind(kind: ObjectKind): boolean {
+  return kind === "function" || kind === "procedure" || kind === "trigger" || kind === "sequence" || kind === "enum" || kind === "domain";
 }
 
 export function objectKey(object: Pick<CatalogObject, "kind" | "name" | "signature" | "relation">): string {

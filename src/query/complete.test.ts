@@ -36,6 +36,10 @@ describe("catalog completion", () => {
     const item = plan.items.find((entry) => entry.kind === "function");
     expect(item).toMatchObject({ label: "public.add_customer(integer)", detail: "函数" });
     expect(completionPlan({ prefix: "sec", connection: atlas, database: "atlas_dev" }).items.some((entry) => entry.label.includes("secret_fn"))).toBe(false);
+
+    pub!.objects.push(routine("orders_id_seq", "sequence"));
+    const sequence = completionPlan({ prefix: "orders_id", connection: atlas, database: "atlas_dev" });
+    expect(sequence.items.find((entry) => entry.label.includes("orders_id_seq"))).toMatchObject({ kind: "sequence", detail: "序列" });
   });
 });
 

@@ -1,6 +1,6 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { replaceCatalog, resetCatalog } from "../catalog/store";
+import { replaceCatalog, resetCatalog, setStructureFocus } from "../catalog/store";
 import type { CatalogConnection } from "../catalog/types";
 import type { TableTarget } from "../grid/target";
 import {
@@ -216,6 +216,127 @@ describe("structure pane", () => {
     await flushPromises();
     expect(wrapper.find("details.struct-ddl").exists()).toBe(false);
     wrapper.unmount();
+  });
+
+  it("focuses the column or index chosen from the object tree", async () => {
+    setStructureFocus({ connectionId: "c1", database: "main", schema: "", table: "notes", section: "indexes", name: "idx_note" });
+    const wrapper = mount(StructurePane, { props: { tabId: "table:c1", draft: "", purpose: "edit", target } });
+    await flushPromises();
+    expect(wrapper.get("[data-index=idx_note]").attributes("data-focused")).toBe("true");
+    expect(wrapper.text()).toContain("idx_note");
+    wrapper.unmount();
+  });
+
+  it("previews a view replacement and does not send until confirm", async () => {
+    const original = "CREATE VIEW v_notes AS SELECT note FROM notes";
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "ddl_describe") return { ...described, kind: "view", name: "v_notes", displaySql: original };
+      if (command === "ddl_preview") {
+        return planOf({
+          steps: [
+            { sql: 'DROP VIEW "v_notes";', label: "删除视图 v_notes" },
+            { sql: 'CREATE VIEW "v_notes" AS SELECT id FROM notes;', label: "创建视图 v_notes" },
+          ],
+        });
+      }
+      if (command === "ddl_execute") {
+        return {
+          blocked: [],
+          rule: "这些语句逐条执行，失败即停。",
+          target: "sqlite / v_notes",
+          rebuild: false,
+          steps: [
+            { sql: 'DROP VIEW "v_notes";', label: "删除视图 v_notes", status: "ok", message: "" },
+            { sql: 'CREATE VIEW "v_notes" AS SELECT id FROM notes;', label: "创建视图 v_notes", status: "ok", message: "" },
+          ],
+        };
+      }
+      throw new Error(`unexpected ${command}`);
+    });
+    const wrapper = mount(StructurePane, { props: { tabId: "view:c1", draft: "", purpose: "edit", target: { ...target, table: "v_notes" } } });
+    await flushPromises();
+    await wrapper.get("[data-section=definition]").trigger("click");
+    const editor = wrapper.get("[data-view-sql]");
+    expect(editor.element).toBeInstanceOf(HTMLTextAreaElement);
+    expect((editor.element as HTMLTextAreaElement).value).toContain("CREATE VIEW v_notes");
+    await editor.setValue("CREATE VIEW v_notes AS SELECT id FROM notes");
+    await wrapper.get("[data-action=preview-view]").trigger("click");
+    await flushPromises();
+    const dialog = wrapper.get("[aria-label='变更预览']");
+    expect(dialog.text()).toContain("删除视图 v_notes");
+    expect(dialog.text()).toContain("创建视图 v_notes");
+    const details = dialog.get("details.disclosure");
+    expect(details.attributes("open")).toBeUndefined();
+    await details.get("summary").trigger("click");
+    const sql = dialog.findAll("pre").map((node) => node.text());
+    expect(sql).toEqual(['DROP VIEW "v_notes";', 'CREATE VIEW "v_notes" AS SELECT id FROM notes;']);
+    expect(invoke.mock.calls.some((call) => call[0] === "ddl_execute")).toBe(false);
+    await buttonNamed(wrapper, "取消").trigger("click");
+    expect(wrapper.find("[aria-label='变更预览']").exists()).toBe(false);
+    expect(invoke.mock.calls.some((call) => call[0] === "ddl_execute")).toBe(false);
+
+    await wrapper.get("[data-action=preview-view]").trigger("click");
+    await flushPromises();
+    await buttonNamed(wrapper, "确认执行").trigger("click");
+    await flushPromises();
+    const executed = invoke.mock.calls.find((call) => call[0] === "ddl_execute");
+    const confirmed = (executed?.[1] as { request: { confirmedSql: string[] } }).request.confirmedSql;
+    expect(confirmed).toEqual(['DROP VIEW "v_notes";', 'CREATE VIEW "v_notes" AS SELECT id FROM notes;']);
+    wrapper.unmount();
+  });
+
+  it("does not send a view change that is blocked, stale, or only a placeholder", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "ddl_describe") return { ...described, kind: "view", name: "v_notes", displaySql: "CREATE VIEW v_notes AS SELECT 1" };
+      if (command === "ddl_preview") return planOf({ blocked: ["无法在不丢弃物化数据的情况下替换这个物化视图，因此不发送。"] });
+      if (command === "ddl_execute") throw new Error("不应该发送");
+      return {};
+    });
+    const blocked = mount(StructurePane, { props: { tabId: "view:c1", draft: "", purpose: "edit", target: { ...target, table: "v_notes" } } });
+    await flushPromises();
+    await blocked.get("[data-section=definition]").trigger("click");
+    await blocked.get("[data-view-sql]").setValue("CREATE VIEW v_notes AS SELECT 2");
+    await blocked.get("[data-action=preview-view]").trigger("click");
+    await flushPromises();
+    const dialog = blocked.get("[aria-label='变更预览']");
+    expect(dialog.text()).toContain("物化数据");
+    expect(buttonNamed(blocked, "确认执行").attributes("disabled")).toBeDefined();
+    await buttonNamed(blocked, "确认执行").trigger("click");
+    expect(invoke.mock.calls.some((call) => call[0] === "ddl_execute")).toBe(false);
+    await blocked.get("[data-view-sql]").setValue("CREATE VIEW v_notes AS SELECT 3");
+    expect(blocked.find("[aria-label='变更预览']").exists()).toBe(false);
+    blocked.unmount();
+
+    invoke.mockClear();
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "ddl_describe") return { ...described, kind: "view", displaySql: "-- main.v_notes", definitionError: "没有读到视图定义" };
+      return {};
+    });
+    const placeholder = mount(StructurePane, { props: { tabId: "view:c1", draft: "", purpose: "edit", target: { ...target, table: "v_notes" } } });
+    await flushPromises();
+    await placeholder.get("[data-section=definition]").trigger("click");
+    expect(placeholder.get("[data-view-error]").text()).toContain("没有读到视图定义");
+    expect(placeholder.find("[data-view-sql]").exists()).toBe(false);
+    expect(invoke.mock.calls.some((call) => call[0] === "ddl_preview" || call[0] === "ddl_execute")).toBe(false);
+    placeholder.unmount();
+
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "ddl_describe") return { ...described, kind: "view", name: "v_notes", displaySql: "CREATE VIEW v_notes AS SELECT 1" };
+      if (command === "ddl_preview") return planOf({ steps: [{ sql: "CREATE OR REPLACE VIEW v_notes AS SELECT 2;", label: "替换视图 v_notes" }] });
+      if (command === "ddl_execute") throw new Error("服务器拒绝：syntax error");
+      return {};
+    });
+    const rejected = mount(StructurePane, { props: { tabId: "view:c1", draft: "", purpose: "edit", target: { ...target, table: "v_notes" } } });
+    await flushPromises();
+    await rejected.get("[data-section=definition]").trigger("click");
+    await rejected.get("[data-view-sql]").setValue("CREATE VIEW v_notes AS SELECT 2");
+    await rejected.get("[data-action=preview-view]").trigger("click");
+    await flushPromises();
+    await buttonNamed(rejected, "确认执行").trigger("click");
+    await flushPromises();
+    expect(rejected.text()).toContain("服务器拒绝：syntax error");
+    expect(rejected.text()).not.toContain("保存成功");
+    rejected.unmount();
   });
 
   it("shows the original sqlite_master text for SQLite views", async () => {

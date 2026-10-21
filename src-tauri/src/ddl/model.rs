@@ -113,6 +113,10 @@ pub struct Snapshot {
     pub null_counts: BTreeMap<String, i64>,
     pub object_exists: bool,
     pub reference: Option<Box<Snapshot>>,
+    /// PostgreSQL 物化视图。替换会丢掉已经物化的数据，因此不能发送。
+    pub materialized: bool,
+    /// 视图原文读失败时的服务器错误。空字符串式的占位注释不能当作原文。
+    pub definition_error: Option<String>,
 }
 
 impl Snapshot {
@@ -143,6 +147,8 @@ impl Snapshot {
             null_counts: BTreeMap::new(),
             object_exists: true,
             reference: None,
+            materialized: false,
+            definition_error: None,
         }
     }
 }
@@ -191,6 +197,8 @@ pub enum Action {
     DropTable { table: String },
     /// 只改变当前 SQLite 连接的 foreign_keys。不清理数据，也不表示约束已经验证通过。
     SetForeignKeys { enabled: bool },
+    /// 替换已有视图的定义。确认前只生成语句，不发送。
+    ReplaceView { table: String, definition: String },
 }
 
 #[derive(Clone, Debug)]

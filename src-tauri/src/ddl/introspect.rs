@@ -46,7 +46,8 @@ pub fn table_of(action: &Action) -> Option<&str> {
         | Action::DropIndex { table, .. }
         | Action::CreateForeignKey { table, .. }
         | Action::DropForeignKey { table, .. }
-        | Action::DropTable { table } => Some(table.as_str()),
+        | Action::DropTable { table }
+        | Action::ReplaceView { table, .. } => Some(table.as_str()),
     }
 }
 
@@ -237,6 +238,9 @@ async fn load_sqlite(pool: &sqlx::SqlitePool, database: &str, table: &str, recor
     }
     snapshot.row_count = Some(count_rows_sqlite(pool, table).await?);
     snapshot.object_exists = true;
+    if snapshot.kind == "view" && snapshot.table_sql.trim().is_empty() {
+        snapshot.definition_error = Some("没有读到视图定义".to_owned());
+    }
     Ok(snapshot)
 }
 
@@ -499,8 +503,33 @@ async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, database: &str, ta
     snapshot.incoming = incoming_keys;
     snapshot.row_count = Some(count_nulls_mysql_count(&mut conn, database, table).await?);
     snapshot.object_exists = true;
-    snapshot.table_sql = format!("-- {}.{table}", database);
+    if snapshot.kind == "view" {
+        match mysql_view_definition(&mut conn, database, table).await {
+            Ok(sql) => snapshot.table_sql = sql,
+            Err(message) => {
+                snapshot.table_sql.clear();
+                snapshot.definition_error = Some(message);
+            }
+        }
+    } else {
+        snapshot.table_sql = format!("-- {}.{table}", database);
+    }
     Ok(snapshot)
+}
+
+async fn mysql_view_definition(conn: &mut mysql_async::Conn, database: &str, table: &str) -> Result<String, String> {
+    let sql = format!(
+        "SHOW CREATE VIEW {}.{}",
+        quote_ident(Engine::Mysql, database),
+        quote_ident(Engine::Mysql, table)
+    );
+    let row: Option<mysql_async::Row> = mysql_async::prelude::Queryable::query_first(conn, sql).await.map_err(|err| err.to_string())?;
+    let row = row.ok_or_else(|| "没有读到视图定义".to_owned())?;
+    let text = mysql_string(&row, 1);
+    if text.trim().is_empty() || text.trim().starts_with("--") {
+        return Err("没有读到视图定义".to_owned());
+    }
+    Ok(text)
 }
 
 fn push_mysql_fks(target: &mut Vec<ForeignKey>, rows: &[mysql_async::Row], _incoming: bool) {
@@ -557,6 +586,7 @@ async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: 
     let oid: u32 = kind_row.get(1);
     let mut snapshot = Snapshot::bare(Engine::Postgres, database, schema, table);
     snapshot.kind = if kind_text == "r" || kind_text == "p" { "table" } else { "view" }.to_owned();
+    snapshot.materialized = kind_text == "m";
     let columns = client
         .query(
             "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), a.attnotnull, pg_get_expr(ad.adbin, ad.adrelid), a.attidentity::text, a.attgenerated::text FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
@@ -693,8 +723,43 @@ async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: 
         .map_err(|err| err.to_string())?;
     snapshot.row_count = Some(count.get(0));
     snapshot.object_exists = true;
-    snapshot.table_sql = format!("-- {schema}.{table}");
+    if snapshot.kind == "view" {
+        match postgres_view_definition(client, oid, database, schema, table, snapshot.materialized).await {
+            Ok(sql) => snapshot.table_sql = sql,
+            Err(message) => {
+                snapshot.table_sql.clear();
+                snapshot.definition_error = Some(message);
+            }
+        }
+    } else {
+        snapshot.table_sql = format!("-- {schema}.{table}");
+    }
     Ok(snapshot)
+}
+
+async fn postgres_view_definition(
+    client: &tokio_postgres::Client,
+    oid: u32,
+    database: &str,
+    schema: &str,
+    table: &str,
+    materialized: bool,
+) -> Result<String, String> {
+    let row = client
+        .query_one("SELECT pg_get_viewdef($1::oid, true)", &[&oid])
+        .await
+        .map_err(|err| err.to_string())?;
+    let body: String = row.get(0);
+    if body.trim().is_empty() {
+        return Err("没有读到视图定义".to_owned());
+    }
+    let qualified = qualified_table(Engine::Postgres, database, schema, table)?;
+    let body = body.trim().trim_end_matches(';').trim();
+    if materialized {
+        Ok(format!("CREATE MATERIALIZED VIEW {qualified} AS\n{body};"))
+    } else {
+        Ok(format!("CREATE OR REPLACE VIEW {qualified} AS\n{body};"))
+    }
 }
 
 fn parse_fk_def(name: &str, definition: &str) -> Option<ForeignKey> {

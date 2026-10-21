@@ -3,7 +3,7 @@ export const DEFAULT_OBJECT_PAGE = 100;
 export type Engine = "postgres" | "mysql" | "mariadb" | "sqlite";
 export type EnvTone = "dev" | "test" | "prod" | "local" | "none";
 export type ConnStatus = "connected" | "disconnected" | "connecting" | "error" | "lost";
-export type ObjectKind = "table" | "view" | "function" | "procedure" | "trigger";
+export type ObjectKind = "table" | "view" | "function" | "procedure" | "trigger" | "sequence" | "enum" | "domain";
 
 export interface CatalogObject {
   name: string;
@@ -12,6 +12,8 @@ export interface CatalogObject {
   stale: boolean;
   signature?: string;
   relation?: string;
+  /** PostgreSQL 物化视图仍放在视图组，只用这个标志区分。 */
+  materialized?: boolean;
 }
 
 export interface KindReport {

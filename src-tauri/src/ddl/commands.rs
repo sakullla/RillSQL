@@ -107,6 +107,8 @@ pub struct DescribeDto {
     foreign_key_list: Vec<ForeignKeyDto>,
     incoming: Vec<IncomingDto>,
     display_sql: String,
+    materialized: bool,
+    definition_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -210,6 +212,8 @@ fn describe_dto(snapshot: &Snapshot) -> DescribeDto {
             })
             .collect(),
         display_sql: display_sql(snapshot),
+        materialized: snapshot.materialized,
+        definition_error: snapshot.definition_error.clone(),
     }
 }
 

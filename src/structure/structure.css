@@ -37,6 +37,7 @@
 }
 .pane-switch button:hover,
 .struct-nav button:hover { background: var(--hover); color: var(--text); }
+.row-focus { background: var(--hover); }
 .pane-switch button[aria-selected="true"],
 .struct-nav button.on { background: var(--sel-strong); color: var(--accent-text); font-weight: 600; }
 .struct-nav button.danger { color: var(--err); }

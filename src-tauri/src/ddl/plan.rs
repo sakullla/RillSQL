@@ -15,6 +15,7 @@ pub fn plan(snapshot: &Snapshot, action: &Action) -> Plan {
         Action::DropForeignKey { table, name } => plan_drop_fk(snapshot, table, name),
         Action::DropTable { table } => plan_drop_table(snapshot, table),
         Action::SetForeignKeys { enabled } => plan_set_fk(snapshot, *enabled),
+        Action::ReplaceView { table, definition } => plan_replace_view(snapshot, table, definition),
     }
 }
 
@@ -1131,6 +1132,233 @@ fn same_type(left: &str, right: &str) -> bool {
 fn normalize_default(value: &str) -> Option<&str> {
     let text = value.trim();
     if text.is_empty() { None } else { Some(text) }
+}
+
+fn plan_replace_view(snapshot: &Snapshot, table: &str, definition: &str) -> Plan {
+    let target = target_label(snapshot.engine, &snapshot.database, &snapshot.schema, table);
+    let mut blocked = Vec::new();
+    if snapshot.kind == "missing" || !snapshot.object_exists {
+        blocked.push(format!("视图 {table} 已失效，没有发送。"));
+    }
+    if snapshot.name != table {
+        blocked.push("目标视图和已读取的结构不一致，没有生成语句。".to_owned());
+    }
+    if snapshot.kind != "view" && snapshot.kind != "missing" {
+        blocked.push("只有视图可以替换定义。函数、存储过程和触发器不能从这里保存。".to_owned());
+    }
+    if let Some(message) = snapshot.definition_error.clone() {
+        if snapshot.table_sql.trim().is_empty() || snapshot.table_sql.trim().starts_with("--") {
+            blocked.push(format!("没有读到可编辑的视图定义：{message}"));
+        }
+    }
+    let statements = view_statements(definition);
+    if statements.is_empty() {
+        blocked.push("定义只剩空白和注释，没有发送。".to_owned());
+    }
+    if snapshot.materialized || statements.iter().any(|item| item.to_ascii_uppercase().contains("MATERIALIZED VIEW")) {
+        blocked.push("无法在不丢弃物化数据的情况下替换这个物化视图，因此不发送。".to_owned());
+    }
+    if snapshot.engine == Engine::Sqlite {
+        let mut dependents: Vec<String> = snapshot
+            .views
+            .iter()
+            .filter(|view| view.name != snapshot.name)
+            .map(|view| view.name.clone())
+            .collect();
+        dependents.extend(snapshot.triggers.iter().map(|trigger| trigger.name.clone()));
+        if !dependents.is_empty() {
+            blocked.push(format!(
+                "视图被 {} 依赖，无法在不丢弃这些依赖的情况下替换，因此不发送。",
+                dependents.join("、")
+            ));
+        }
+    }
+    if !blocked.is_empty() {
+        return finish(snapshot.engine, false, target, blocked, Vec::new(), Vec::new());
+    }
+    if snapshot.table_sql.trim() == definition.trim() {
+        return finish(
+            snapshot.engine,
+            false,
+            target,
+            vec!["定义没有改动，没有发送。".to_owned()],
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+    if statements.len() != 1 {
+        return finish(
+            snapshot.engine,
+            false,
+            target,
+            vec!["定义包含多条语句，无法安全替换，没有发送。".to_owned()],
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+    let statement = &statements[0];
+    let qualified = match qualified_table(snapshot.engine, &snapshot.database, &snapshot.schema, table) {
+        Ok(value) => value,
+        Err(message) => {
+            return finish(snapshot.engine, false, target, vec![message], Vec::new(), Vec::new());
+        }
+    };
+    if !names_view(statement, table) && !is_query(statement) {
+        return finish(
+            snapshot.engine,
+            false,
+            target,
+            vec!["这段定义不能安全地替换当前视图，没有发送。".to_owned()],
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+    let risks = vec![Risk {
+        level: "info".to_owned(),
+        text: "将按下面的顺序替换视图定义。取消不会发送任何语句。".to_owned(),
+    }];
+    let steps = match snapshot.engine {
+        Engine::Sqlite => {
+            let create = if is_create_view(statement) {
+                ensure_semicolon(statement)
+            } else if is_query(statement) {
+                format!("CREATE VIEW {qualified} AS\n{};", statement.trim().trim_end_matches(';').trim())
+            } else {
+                return finish(
+                    snapshot.engine,
+                    false,
+                    target,
+                    vec!["这段定义不能安全地替换当前视图，没有发送。".to_owned()],
+                    risks,
+                    Vec::new(),
+                );
+            };
+            vec![
+                Step { label: format!("删除视图 {table}"), sql: format!("DROP VIEW {qualified};") },
+                Step { label: format!("创建视图 {table}"), sql: create },
+            ]
+        }
+        Engine::Postgres | Engine::Mysql | Engine::Mariadb => {
+            let sql = if is_create_view(statement) {
+                ensure_semicolon(&ensure_or_replace(statement))
+            } else if is_query(statement) {
+                format!("CREATE OR REPLACE VIEW {qualified} AS\n{};", statement.trim().trim_end_matches(';').trim())
+            } else {
+                return finish(
+                    snapshot.engine,
+                    false,
+                    target,
+                    vec!["这段定义不能安全地替换当前视图，没有发送。".to_owned()],
+                    risks,
+                    Vec::new(),
+                );
+            };
+            vec![Step { label: format!("替换视图 {table}"), sql }]
+        }
+    };
+    finish(snapshot.engine, false, target, Vec::new(), risks, steps)
+}
+
+fn view_statements(input: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = input.chars().collect();
+    let mut index = 0;
+    let mut quote: Option<char> = None;
+    while index < chars.len() {
+        let ch = chars[index];
+        if let Some(mark) = quote {
+            current.push(ch);
+            if ch == mark {
+                if chars.get(index + 1) == Some(&mark) {
+                    current.push(mark);
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '-' && chars.get(index + 1) == Some(&'-') {
+            index += 2;
+            while index < chars.len() && chars[index] != '\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if ch == '/' && chars.get(index + 1) == Some(&'*') {
+            index += 2;
+            while index + 1 < chars.len() && !(chars[index] == '*' && chars[index + 1] == '/') {
+                index += 1;
+            }
+            index = (index + 2).min(chars.len());
+            continue;
+        }
+        if ch == '\'' || ch == '"' || ch == '`' {
+            quote = Some(ch);
+            current.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == ';' {
+            let trimmed = current.trim();
+            if !trimmed.is_empty() {
+                statements.push(trimmed.to_owned());
+            }
+            current.clear();
+            index += 1;
+            continue;
+        }
+        current.push(ch);
+        index += 1;
+    }
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        statements.push(trimmed.to_owned());
+    }
+    statements
+}
+
+fn is_create_view(sql: &str) -> bool {
+    let upper = sql.trim().to_ascii_uppercase();
+    upper.starts_with("CREATE") && upper.contains(" VIEW") && !upper.contains("MATERIALIZED VIEW") && !upper.contains(" TABLE")
+}
+
+fn is_query(sql: &str) -> bool {
+    let upper = sql.trim().to_ascii_uppercase();
+    upper.starts_with("SELECT") || upper.starts_with("WITH")
+}
+
+fn names_view(sql: &str, name: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    let needle = name.to_ascii_lowercase();
+    lower.contains(&format!(".{needle}"))
+        || lower.contains(&format!(" {needle}"))
+        || lower.contains(&format!("`{needle}`"))
+        || lower.contains(&format!("\"{needle}\""))
+        || lower.contains(&format!("'{needle}'"))
+}
+
+fn ensure_semicolon(sql: &str) -> String {
+    let trimmed = sql.trim();
+    if trimmed.ends_with(';') {
+        trimmed.to_owned()
+    } else {
+        format!("{trimmed};")
+    }
+}
+
+fn ensure_or_replace(sql: &str) -> String {
+    let trimmed = sql.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("create or replace") {
+        return trimmed.to_owned();
+    }
+    if lower.starts_with("create") {
+        return format!("CREATE OR REPLACE{}", &trimmed[6..]);
+    }
+    trimmed.to_owned()
 }
 
 fn guard_table(snapshot: &Snapshot, table: &str) -> Option<String> {

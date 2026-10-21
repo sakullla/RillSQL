@@ -39,6 +39,9 @@ pub enum ObjectKind {
     Function,
     Procedure,
     Trigger,
+    Sequence,
+    Enum,
+    Domain,
 }
 
 pub fn kind_name(kind: ObjectKind) -> &'static str {
@@ -48,29 +51,53 @@ pub fn kind_name(kind: ObjectKind) -> &'static str {
         ObjectKind::Function => "function",
         ObjectKind::Procedure => "procedure",
         ObjectKind::Trigger => "trigger",
+        ObjectKind::Sequence => "sequence",
+        ObjectKind::Enum => "enum",
+        ObjectKind::Domain => "domain",
     }
 }
 
 pub fn parse_kind(kind: &str) -> ObjectKind {
     match kind.to_ascii_lowercase().as_str() {
-        "view" => ObjectKind::View,
+        "view" | "materialized" => ObjectKind::View,
         "function" => ObjectKind::Function,
         "procedure" => ObjectKind::Procedure,
         "trigger" => ObjectKind::Trigger,
+        "sequence" => ObjectKind::Sequence,
+        "enum" => ObjectKind::Enum,
+        "domain" => ObjectKind::Domain,
         _ => ObjectKind::Table,
     }
 }
 
-/// SQLite 没有函数和存储过程。其余引擎列出这五类。
+/// 只列出引擎真正拥有的独立对象。列和索引不是这里的种类。
 pub fn listed_kinds(engine: Engine) -> &'static [ObjectKind] {
     match engine {
         Engine::Sqlite => &[ObjectKind::Table, ObjectKind::View, ObjectKind::Trigger],
-        Engine::Postgres | Engine::Mysql | Engine::Mariadb => &[
+        Engine::Mysql => &[
             ObjectKind::Table,
             ObjectKind::View,
             ObjectKind::Function,
             ObjectKind::Procedure,
             ObjectKind::Trigger,
+        ],
+        Engine::Mariadb => &[
+            ObjectKind::Table,
+            ObjectKind::View,
+            ObjectKind::Function,
+            ObjectKind::Procedure,
+            ObjectKind::Trigger,
+            ObjectKind::Sequence,
+        ],
+        Engine::Postgres => &[
+            ObjectKind::Table,
+            ObjectKind::View,
+            ObjectKind::Function,
+            ObjectKind::Procedure,
+            ObjectKind::Trigger,
+            ObjectKind::Sequence,
+            ObjectKind::Enum,
+            ObjectKind::Domain,
         ],
     }
 }
@@ -100,6 +127,8 @@ pub struct ObjectRow {
     pub signature: String,
     /// 触发器所属的表。没有时为空。
     pub relation: String,
+    /// PostgreSQL 物化视图仍记在视图组里，用这个标志和普通视图分开。
+    pub materialized: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +153,7 @@ impl ObjectRow {
             stale: false,
             signature: String::new(),
             relation: String::new(),
+            materialized: false,
         }
     }
 
@@ -264,7 +294,19 @@ pub fn kind_sql(engine: Engine, kind: ObjectKind) -> KindSql {
             },
             ObjectKind::View => KindSql {
                 count: "SELECT COUNT(*)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relkind IN ('v', 'm')",
-                list: "SELECT c.relname, 'view', c.reltuples::bigint, ''::text, ''::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relkind IN ('v', 'm') ORDER BY c.relname LIMIT $2",
+                list: "SELECT c.relname, 'view', c.reltuples::bigint, CASE WHEN c.relkind = 'm' THEN 'materialized' ELSE ''::text END, ''::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relkind IN ('v', 'm') ORDER BY c.relname LIMIT $2",
+            },
+            ObjectKind::Sequence => KindSql {
+                count: "SELECT COUNT(*)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relkind = 'S'",
+                list: "SELECT c.relname, 'sequence', NULL::bigint, ''::text, ''::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relkind = 'S' ORDER BY c.relname LIMIT $2",
+            },
+            ObjectKind::Enum => KindSql {
+                count: "SELECT COUNT(*)::bigint FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1 AND t.typtype = 'e'",
+                list: "SELECT t.typname, 'enum', NULL::bigint, ''::text, ''::text FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1 AND t.typtype = 'e' ORDER BY t.typname LIMIT $2",
+            },
+            ObjectKind::Domain => KindSql {
+                count: "SELECT COUNT(*)::bigint FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1 AND t.typtype = 'd'",
+                list: "SELECT t.typname, 'domain', NULL::bigint, ''::text, ''::text FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1 AND t.typtype = 'd' ORDER BY t.typname LIMIT $2",
             },
             ObjectKind::Function => KindSql {
                 count: "SELECT COUNT(*)::bigint FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = $1 AND p.prokind = 'f'",
@@ -279,28 +321,7 @@ pub fn kind_sql(engine: Engine, kind: ObjectKind) -> KindSql {
                 list: "SELECT t.tgname, 'trigger', NULL::bigint, ''::text, c.relname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND NOT t.tgisinternal ORDER BY t.tgname, c.relname LIMIT $2",
             },
         },
-        Engine::Mysql | Engine::Mariadb => match kind {
-            ObjectKind::Table => KindSql {
-                count: "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE'",
-                list: "SELECT table_name, 'table', table_rows, '', '' FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE' ORDER BY table_name LIMIT ?",
-            },
-            ObjectKind::View => KindSql {
-                count: "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_type = 'VIEW'",
-                list: "SELECT table_name, 'view', NULL, '', '' FROM information_schema.tables WHERE table_schema = ? AND table_type = 'VIEW' ORDER BY table_name LIMIT ?",
-            },
-            ObjectKind::Function => KindSql {
-                count: "SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema = ? AND routine_type = 'FUNCTION'",
-                list: "SELECT routine_name, 'function', NULL, '', '' FROM information_schema.routines WHERE routine_schema = ? AND routine_type = 'FUNCTION' ORDER BY routine_name LIMIT ?",
-            },
-            ObjectKind::Procedure => KindSql {
-                count: "SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema = ? AND routine_type = 'PROCEDURE'",
-                list: "SELECT routine_name, 'procedure', NULL, '', '' FROM information_schema.routines WHERE routine_schema = ? AND routine_type = 'PROCEDURE' ORDER BY routine_name LIMIT ?",
-            },
-            ObjectKind::Trigger => KindSql {
-                count: "SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema = ?",
-                list: "SELECT trigger_name, 'trigger', NULL, '', event_object_table FROM information_schema.triggers WHERE trigger_schema = ? ORDER BY trigger_name, event_object_table LIMIT ?",
-            },
-        },
+        Engine::Mysql | Engine::Mariadb => mysql_kind_sql(engine, kind),
         Engine::Sqlite => match kind {
             ObjectKind::Table => KindSql {
                 count: "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
@@ -314,11 +335,48 @@ pub fn kind_sql(engine: Engine, kind: ObjectKind) -> KindSql {
                 count: "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name NOT LIKE 'sqlite_%'",
                 list: "SELECT name, 'trigger', '', '' FROM sqlite_master WHERE type = 'trigger' AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT ?1",
             },
-            ObjectKind::Function | ObjectKind::Procedure => KindSql {
+            ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Sequence | ObjectKind::Enum | ObjectKind::Domain => KindSql {
                 count: "SELECT 0",
                 list: "SELECT name, type, '', '' FROM sqlite_master WHERE 0",
             },
         },
+    }
+}
+
+fn empty_kind_sql() -> KindSql {
+    KindSql {
+        count: "SELECT 0",
+        list: "SELECT table_name, 'table', NULL, '', '' FROM information_schema.tables WHERE 0",
+    }
+}
+
+fn mysql_kind_sql(engine: Engine, kind: ObjectKind) -> KindSql {
+    match kind {
+        ObjectKind::Table => KindSql {
+            count: "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE'",
+            list: "SELECT table_name, 'table', table_rows, '', '' FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE' ORDER BY table_name LIMIT ?",
+        },
+        ObjectKind::View => KindSql {
+            count: "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_type = 'VIEW'",
+            list: "SELECT table_name, 'view', NULL, '', '' FROM information_schema.tables WHERE table_schema = ? AND table_type = 'VIEW' ORDER BY table_name LIMIT ?",
+        },
+        ObjectKind::Function => KindSql {
+            count: "SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema = ? AND routine_type = 'FUNCTION'",
+            list: "SELECT routine_name, 'function', NULL, '', '' FROM information_schema.routines WHERE routine_schema = ? AND routine_type = 'FUNCTION' ORDER BY routine_name LIMIT ?",
+        },
+        ObjectKind::Procedure => KindSql {
+            count: "SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema = ? AND routine_type = 'PROCEDURE'",
+            list: "SELECT routine_name, 'procedure', NULL, '', '' FROM information_schema.routines WHERE routine_schema = ? AND routine_type = 'PROCEDURE' ORDER BY routine_name LIMIT ?",
+        },
+        ObjectKind::Trigger => KindSql {
+            count: "SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema = ?",
+            list: "SELECT trigger_name, 'trigger', NULL, '', event_object_table FROM information_schema.triggers WHERE trigger_schema = ? ORDER BY trigger_name, event_object_table LIMIT ?",
+        },
+        ObjectKind::Sequence if engine == Engine::Mariadb => KindSql {
+            count: "SELECT COUNT(*) FROM information_schema.SEQUENCES WHERE SEQUENCE_SCHEMA = ?",
+            list: "SELECT SEQUENCE_NAME, 'sequence', NULL, '', '' FROM information_schema.SEQUENCES WHERE SEQUENCE_SCHEMA = ? ORDER BY SEQUENCE_NAME LIMIT ?",
+        },
+        ObjectKind::Sequence | ObjectKind::Enum | ObjectKind::Domain => empty_kind_sql(),
     }
 }
 

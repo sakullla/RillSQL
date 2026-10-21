@@ -2,11 +2,41 @@ import { shallowRef, reactive } from "vue";
 import { presentEnv, type EnvTag, type SavedConnection } from "../connections/model";
 import { loadSettings } from "../shell/settings";
 import { fetchCatalog, fetchPage, fetchSessions, listConnections, listEnvTags, type ObjectLimit } from "./backend";
+import { describeStructure } from "../structure/api";
 import { objectPath, refreshConnection, refreshSchema, serverSliceCount, successfulTotal } from "./tree";
-import { DEFAULT_OBJECT_PAGE, type CatalogConnection, type PageRequest, type PageResult, type PaletteTable, type SchemaNode } from "./types";
+import { DEFAULT_OBJECT_PAGE, type CatalogConnection, type Engine, type PageRequest, type PageResult, type PaletteTable, type SchemaNode } from "./types";
+
+export interface ObjectOutline {
+  status: "loading" | "ready" | "error";
+  error: string;
+  columns: string[];
+  indexes: string[];
+  materialized: boolean;
+}
+
+export interface OutlineTarget {
+  connectionId: string;
+  database: string;
+  schema: string;
+  name: string;
+  engine: Engine;
+  key: string;
+}
+
+export interface StructureFocus {
+  connectionId: string;
+  database: string;
+  schema: string;
+  table: string;
+  section: "columns" | "indexes";
+  name: string;
+}
 
 const connections = shallowRef<CatalogConnection[]>([]);
 const loadError = shallowRef<string | null>(null);
+const outlines = shallowRef<Record<string, ObjectOutline>>({});
+export const structureFocus = shallowRef<StructureFocus | null>(null);
+let outlineLoader: ((target: OutlineTarget) => Promise<ObjectOutline>) | null = null;
 const shown = reactive<Record<string, number>>({});
 let pageOverride: number | null = null;
 let refreshSource: (() => CatalogConnection[]) | null = null;
@@ -104,6 +134,9 @@ export function resetCatalog(): void {
     pollTimer = null;
   }
   for (const key of Object.keys(shown)) delete shown[key];
+  outlines.value = {};
+  structureFocus.value = null;
+  outlineLoader = null;
 }
 
 export function revealMore(connectionId: string, database: string, schemaName: string): void {
@@ -444,4 +477,71 @@ export function listPaletteTables(): PaletteTable[] {
     }
   }
   return tables;
+}
+
+export function outlineStorageKey(target: Pick<OutlineTarget, "connectionId" | "database" | "schema" | "key">): string {
+  return [target.connectionId, target.database, target.schema, target.key].join("\u0001");
+}
+
+export function objectOutlines(): Record<string, ObjectOutline> {
+  return outlines.value;
+}
+
+export function setOutlineLoader(loader: ((target: OutlineTarget) => Promise<ObjectOutline>) | null): void {
+  outlineLoader = loader;
+}
+
+export function setStructureFocus(focus: StructureFocus | null): void {
+  structureFocus.value = focus;
+}
+
+function outlineFailure(error: unknown): string {
+  if (typeof error === "string" && error) return error;
+  if (error instanceof Error && error.message) return error.message;
+  return "没有读到列和索引";
+}
+
+async function defaultOutline(target: OutlineTarget): Promise<ObjectOutline> {
+  const description = await describeStructure({
+    connectionId: target.connectionId,
+    database: target.database,
+    schema: target.schema,
+    table: target.name,
+    engine: target.engine,
+  });
+  return {
+    status: "ready",
+    error: "",
+    columns: description.columns.map((column) => column.name),
+    indexes: description.indexes.map((index) => index.name),
+    materialized: description.materialized === true,
+  };
+}
+
+export function loadObjectOutline(target: OutlineTarget): void {
+  const key = outlineStorageKey(target);
+  const current = outlines.value[key];
+  if (current?.status === "loading" || current?.status === "ready") return;
+  outlines.value = {
+    ...outlines.value,
+    [key]: { status: "loading", error: "", columns: [], indexes: [], materialized: false },
+  };
+  void (outlineLoader ?? defaultOutline)(target)
+    .then((outline) => {
+      outlines.value = { ...outlines.value, [key]: { ...outline, status: outline.status === "error" ? "error" : "ready" } };
+    })
+    .catch((error: unknown) => {
+      outlines.value = {
+        ...outlines.value,
+        [key]: { status: "error", error: outlineFailure(error), columns: [], indexes: [], materialized: false },
+      };
+    });
+}
+
+export function retryObjectOutline(target: OutlineTarget): void {
+  const key = outlineStorageKey(target);
+  const next = { ...outlines.value };
+  delete next[key];
+  outlines.value = next;
+  loadObjectOutline(target);
 }

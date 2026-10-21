@@ -3,7 +3,7 @@ import { MODULE_ID } from "./index";
 import { createRefreshFixture, catalogFixture } from "./fixtures";
 import { listPaletteTables, refreshCatalog, replaceCatalog, resetCatalog, setRefreshSource } from "./store";
 import { browseSql, qualifiedObjectName } from "./object-ref";
-import { engineShape, objectPath, postgresSessionGap, reconcileObjects, refreshConnection, refreshSchema, schemaFailed, schemaIsEmpty, searchObjects, serverSliceCount, successfulTotal, visibleTotal } from "./tree";
+import { engineShape, objectGroups, objectPath, postgresSessionGap, reconcileObjects, refreshConnection, refreshSchema, schemaFailed, schemaIsEmpty, searchObjects, serverSliceCount, showsIndexGroup, successfulTotal, visibleTotal } from "./tree";
 import type { CatalogObject, SchemaNode } from "./types";
 
 function row(name: string, stale = false): CatalogObject {
@@ -15,6 +15,18 @@ afterEach(() => {
 });
 
 describe("catalog tree", () => {
+  it("lists sequences, enums and domains only for engines that own them", () => {
+    expect(objectGroups("postgres")).toEqual(["table", "view", "function", "procedure", "trigger", "sequence", "enum", "domain"]);
+    expect(objectGroups("mariadb")).toEqual(["table", "view", "function", "procedure", "trigger", "sequence"]);
+    expect(objectGroups("mysql")).not.toContain("sequence");
+    expect(objectGroups("mysql")).not.toContain("enum");
+    expect(objectGroups("sqlite")).not.toContain("sequence");
+    expect(showsIndexGroup("table", false, 0)).toBe(true);
+    expect(showsIndexGroup("view", false, 2)).toBe(false);
+    expect(showsIndexGroup("view", true, 0)).toBe(false);
+    expect(showsIndexGroup("view", true, 1)).toBe(true);
+  });
+
   it("keeps the module id and separates engine levels", () => {
     expect(MODULE_ID).toBe("catalog");
     expect(engineShape("postgres")).toEqual({ databases: true, schemas: true, foreignKeys: false });

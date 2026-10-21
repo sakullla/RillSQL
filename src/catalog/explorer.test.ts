@@ -1,11 +1,12 @@
-import { mount, type DOMWrapper } from "@vue/test-utils";
+import { flushPromises, mount, type DOMWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { nextTick } from "vue";
 import { setFocusDatabase, setListConnections, setOpenConnection } from "./backend";
 import type { SavedConnection } from "../connections/model";
 import ExplorerTree from "./ExplorerTree.vue";
 import { catalogFixture, createRefreshFixture, pageArchive, pagedCatalog } from "./fixtures";
-import { refreshCatalog, replaceCatalog, resetCatalog, setObjectPage, setPageSource, setRefreshSource } from "./store";
+import { refreshCatalog, replaceCatalog, resetCatalog, setObjectPage, setOutlineLoader, setPageSource, setRefreshSource, structureFocus } from "./store";
+import type { ObjectOutline, OutlineTarget } from "./store";
 import type { CatalogConnection } from "./types";
 
 afterEach(() => {
@@ -332,6 +333,89 @@ describe("explorer tree", () => {
     expect(menu?.querySelector("[data-action=open-data]")).toBeNull();
     expect(menu?.querySelector("[data-action=open-structure]")).toBeNull();
     expect(menu?.querySelector("[data-action=drop-table]")).toBeNull();
+    wrapper.unmount();
+  });
+
+  it("browses columns and indexes, and keeps sequence kinds on the engines that own them", async () => {
+    const [postgres, mysql, mariadb, sqlite] = catalogFixture();
+    const pub = postgres.databases[0]!.schemas[0]!;
+    pub.objects = [
+      { name: "customers", kind: "table", estimatedRows: 2, stale: false },
+      { name: "orders", kind: "table", estimatedRows: 2, stale: false },
+      { name: "quiet", kind: "table", estimatedRows: 0, stale: false },
+      { name: "v_plain", kind: "view", estimatedRows: null, stale: false },
+      { name: "v_mat", kind: "view", estimatedRows: null, stale: false, materialized: true },
+      { name: "v_mat_empty", kind: "view", estimatedRows: null, stale: false, materialized: true },
+      { name: "orders_id_seq", kind: "sequence", estimatedRows: null, stale: false },
+      { name: "order_status", kind: "enum", estimatedRows: null, stale: false },
+      { name: "email_addr", kind: "domain", estimatedRows: null, stale: false },
+    ];
+    postgres.databases[0]!.schemas[1]!.kindReports = [{ kind: "enum", total: 0, error: "permission denied for type order_status" }];
+    replaceCatalog([postgres, mysql, mariadb, sqlite]);
+    setOutlineLoader(async (target: OutlineTarget): Promise<ObjectOutline> => {
+      if (target.name === "orders") throw new Error("permission denied for orders");
+      if (target.name === "v_plain") return { status: "ready", error: "", columns: ["id"], indexes: ["should_hide"], materialized: false };
+      if (target.name === "v_mat") return { status: "ready", error: "", columns: ["id"], indexes: ["v_mat_idx"], materialized: true };
+      if (target.name === "v_mat_empty") return { status: "ready", error: "", columns: ["id"], indexes: [], materialized: true };
+      if (target.name === "quiet") return { status: "ready", error: "", columns: ["id"], indexes: [], materialized: false };
+      return { status: "ready", error: "", columns: ["id"], indexes: ["customers_pkey"], materialized: false };
+    });
+    const wrapper = mount(ExplorerTree, { props: { filter: "" }, attachTo: document.body });
+
+    const ledger = wrapper.get("[data-connection=ledger]");
+    expect(wrapper.get("[data-engine=mysql]").find("[data-kind-group=sequence]").exists()).toBe(false);
+    expect(wrapper.get("[data-engine=mysql]").find("[data-kind-group=enum]").exists()).toBe(false);
+    expect(wrapper.get("[data-engine=mysql]").find("[data-kind-group=domain]").exists()).toBe(false);
+    expect(wrapper.get("[data-engine=sqlite]").find("[data-kind-group=sequence]").exists()).toBe(false);
+    expect(ledger.find("[data-kind-group=sequence]").exists()).toBe(true);
+    expect(ledger.find("[data-kind-group=enum]").exists()).toBe(false);
+    expect(ledger.find("[data-kind-group=domain]").exists()).toBe(false);
+    expect(wrapper.get("[data-kind-empty][data-kind-group=sequence][data-schema=analytics]").text()).toContain("没有序列");
+    expect(wrapper.get("[data-kind-empty][data-kind-group=sequence][data-schema=analytics]").text()).not.toContain("没读出来");
+
+    expect(wrapper.get("[data-kind-error][data-kind-group=enum][data-schema=analytics]").text()).toContain("permission denied");
+    expect(wrapper.find("[data-schema=public][data-object=customers]").exists()).toBe(true);
+    expect(wrapper.find("[data-schema=public][data-object=orders_id_seq]").exists()).toBe(true);
+    expect(wrapper.find("[data-schema=public][data-object=order_status]").exists()).toBe(true);
+    expect(wrapper.find("[data-schema=public][data-object=email_addr]").exists()).toBe(true);
+
+    await wrapper.get("[data-schema=public][data-object=customers] [data-action=toggle-members]").trigger("click");
+    await wrapper.get("[data-schema=public][data-object=orders] [data-action=toggle-members]").trigger("click");
+    await wrapper.get("[data-schema=public][data-object=quiet] [data-action=toggle-members]").trigger("click");
+    await wrapper.get("[data-schema=public][data-object=v_plain] [data-action=toggle-members]").trigger("click");
+    await wrapper.get("[data-schema=public][data-object=v_mat] [data-action=toggle-members]").trigger("click");
+    await wrapper.get("[data-schema=public][data-object=v_mat_empty] [data-action=toggle-members]").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find("[data-schema=public][data-member=id][data-object=customers]").exists()).toBe(true);
+    expect(wrapper.find("[data-schema=public][data-member=customers_pkey][data-object=customers]").exists()).toBe(true);
+    expect(wrapper.get("[data-schema=public][data-member-error][data-object=orders]").text()).toContain("permission denied");
+    expect(wrapper.find("[data-schema=public][data-object=customers]").exists()).toBe(true);
+    expect(wrapper.get("[data-index-empty][data-object=quiet]").text()).toContain("没有索引");
+    expect(wrapper.get("[data-index-empty][data-object=quiet]").classes()).not.toContain("err");
+    expect(wrapper.find("[data-member-group=indexes][data-object=v_plain]").exists()).toBe(false);
+    expect(wrapper.find("[data-member=should_hide]").exists()).toBe(false);
+    expect(wrapper.find("[data-member=v_mat_idx][data-object=v_mat]").exists()).toBe(true);
+    expect(wrapper.find("[data-member-group=indexes][data-object=v_mat_empty]").exists()).toBe(false);
+
+    await wrapper.get("[data-member=id][data-object=customers]").trigger("click");
+    expect(wrapper.emitted("open-object")).toBeUndefined();
+    expect(wrapper.get("[data-member=id][data-object=customers]").attributes("data-selected")).toBe("true");
+    await wrapper.get("[data-member=id][data-object=customers]").trigger("dblclick");
+    expect(wrapper.emitted("open-object")?.[0]?.[1]).toBe("structure");
+    expect(structureFocus.value).toMatchObject({ table: "customers", section: "columns", name: "id" });
+    await wrapper.get("[data-member=customers_pkey][data-object=customers]").trigger("dblclick");
+    expect(structureFocus.value).toMatchObject({ section: "indexes", name: "customers_pkey" });
+
+    const sequence = wrapper.get("[data-object=orders_id_seq]");
+    await sequence.trigger("dblclick");
+    expect(wrapper.emitted("open-definition")?.at(-1)?.[0]).toMatchObject({ name: "orders_id_seq", kind: "sequence" });
+    sequence.element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 16, clientY: 20 }));
+    await nextTick();
+    const menu = document.body.querySelector("[data-menu=object]");
+    expect(menu?.querySelector("[data-action=open-data]")).toBeNull();
+    expect(menu?.textContent).toContain("查看定义");
+    expect(menu?.textContent).not.toContain("保存");
     wrapper.unmount();
   });
 });

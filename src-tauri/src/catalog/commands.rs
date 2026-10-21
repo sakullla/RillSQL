@@ -24,6 +24,7 @@ pub struct ObjectDto {
     pub stale: bool,
     pub signature: String,
     pub relation: String,
+    pub materialized: bool,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
@@ -135,7 +136,7 @@ pub(crate) async fn load_catalog(
     Ok(catalogs)
 }
 
-pub(crate) async fn page_for_session(session: Option<&CatalogSession>, database: &str, schema: &str, offset: usize, limit: usize) -> PageDto {
+pub(crate) async fn page_for_session(session: Option<&CatalogSession>, engine: Engine, database: &str, schema: &str, offset: usize, limit: usize) -> PageDto {
     let Some(session) = session else {
         return PageDto {
             objects: Vec::new(),
@@ -144,7 +145,7 @@ pub(crate) async fn page_for_session(session: Option<&CatalogSession>, database:
             kind_reports: Vec::new(),
         };
     };
-    let body = read::read_object_page(session, database, schema, offset, limit).await;
+    let body = read::read_object_page(session, engine, database, schema, offset, limit).await;
     PageDto {
         objects: body.objects.iter().map(object_dto).collect(),
         total: body.total,
@@ -184,8 +185,10 @@ pub async fn catalog_definition(
         .service
         .catalog_session(&connection_id)
         .ok_or_else(|| "这条连接还没有打开，无法读取定义".to_owned())?;
+    let engine = saved_engine(&state, &connection_id).await?;
     read::read_definition(
         &session,
+        engine,
         &database,
         &schema,
         &name,
@@ -206,7 +209,17 @@ pub async fn catalog_page(
     limit: usize,
 ) -> Result<PageDto, String> {
     let session = state.service.catalog_session(&connection_id);
-    Ok(page_for_session(session.as_ref(), &database, &schema, offset, limit).await)
+    let engine = saved_engine(&state, &connection_id).await?;
+    Ok(page_for_session(session.as_ref(), engine, &database, &schema, offset, limit).await)
+}
+
+async fn saved_engine(state: &ConnectionsState, connection_id: &str) -> Result<Engine, String> {
+    let saved = state.service.list().await?;
+    saved
+        .into_iter()
+        .find(|item| item.saved.id == connection_id)
+        .map(|item| map_engine(item.saved.engine))
+        .ok_or_else(|| "找不到这条连接".to_owned())
 }
 
 fn describe_env(tags: &[EnvTag], id: &str) -> (String, String) {
@@ -270,6 +283,7 @@ fn object_dto(object: &ObjectRow) -> ObjectDto {
         stale: object.stale,
         signature: object.signature.clone(),
         relation: object.relation.clone(),
+        materialized: object.materialized,
     }
 }
 
@@ -295,6 +309,7 @@ mod estimate_tests {
             stale: false,
             signature: String::new(),
             relation: String::new(),
+            materialized: false,
         };
         let dto = object_dto(&unknown);
         assert_eq!(dto.estimated_rows, None);

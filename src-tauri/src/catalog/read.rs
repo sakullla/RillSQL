@@ -161,7 +161,7 @@ pub async fn read_catalog_outline(engine: Engine, session: &CatalogSession) -> C
     }
 }
 
-pub async fn read_object_page(session: &CatalogSession, database: &str, schema: &str, offset: usize, limit: usize) -> ObjectPageBody {
+pub async fn read_object_page(session: &CatalogSession, engine: Engine, database: &str, schema: &str, offset: usize, limit: usize) -> ObjectPageBody {
     let limit = read_limit(limit, 0);
     match session {
         CatalogSession::Scripted => empty_page(scripted_message()),
@@ -174,13 +174,14 @@ pub async fn read_object_page(session: &CatalogSession, database: &str, schema: 
             },
             Err(message) => empty_page(message),
         },
-        CatalogSession::Mysql(pool) => read_mysql_page(pool, database, offset, limit).await,
+        CatalogSession::Mysql(pool) => read_mysql_page(pool, engine, database, offset, limit).await,
         CatalogSession::Postgres(client) => read_postgres_page(client, database, schema, offset, limit).await,
     }
 }
 
 pub async fn read_definition(
     session: &CatalogSession,
+    engine: Engine,
     database: &str,
     schema: &str,
     name: &str,
@@ -194,7 +195,7 @@ pub async fn read_definition(
     match session {
         CatalogSession::Scripted => Err(definition_failure("这个连接没有连着可查询的数据库")),
         CatalogSession::Sqlite { pool, .. } => read_sqlite_definition(pool, name, kind).await,
-        CatalogSession::Mysql(pool) => read_mysql_definition(pool, database, name, kind).await,
+        CatalogSession::Mysql(pool) => read_mysql_definition(pool, engine, database, name, kind).await,
         CatalogSession::Postgres(client) => read_postgres_definition(client, schema, name, kind, signature, relation).await,
     }
 }
@@ -272,6 +273,9 @@ impl KindRank for ObjectRow {
             ObjectKind::Function => 2,
             ObjectKind::Procedure => 3,
             ObjectKind::Trigger => 4,
+            ObjectKind::Sequence => 5,
+            ObjectKind::Enum => 6,
+            ObjectKind::Domain => 7,
         }
     }
 }
@@ -333,6 +337,7 @@ async fn read_sqlite_objects(pool: &sqlx::SqlitePool, offset: usize, limit: usiz
             stale: false,
             signature,
             relation,
+            materialized: false,
         })
         .collect();
     Ok(SchemaNode {
@@ -346,10 +351,10 @@ async fn read_sqlite_objects(pool: &sqlx::SqlitePool, offset: usize, limit: usiz
 
 async fn read_sqlite_definition(pool: &sqlx::SqlitePool, name: &str, kind: &str) -> Result<String, String> {
     if kind != "trigger" {
-        return Err(definition_failure(if kind == "function" || kind == "procedure" {
-            "SQLite 没有函数或存储过程"
-        } else {
-            "只有函数、存储过程和触发器可以读取只读定义"
+        return Err(definition_failure(match kind {
+            "function" | "procedure" => "SQLite 没有函数或存储过程",
+            "sequence" | "enum" | "domain" => "SQLite 没有序列、枚举或域",
+            _ => "只有函数、存储过程和触发器可以读取只读定义",
         }));
     }
     let sql: Option<String> = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = ?1 AND type = 'trigger'")
@@ -374,7 +379,7 @@ async fn read_mysql(pool: &mysql_async::Pool, engine: Engine, page: usize, windo
     let mut databases = Vec::new();
     for name in names {
         let limit = requested_limit(&name, "", windows, page);
-        databases.push(read_mysql_database(&mut conn, &name, 0, limit).await);
+        databases.push(read_mysql_database(&mut conn, engine, &name, 0, limit).await);
     }
     Ok(databases)
 }
@@ -394,12 +399,12 @@ async fn read_mysql_outline(pool: &mysql_async::Pool, engine: Engine) -> Result<
     Ok(databases)
 }
 
-async fn read_mysql_page(pool: &mysql_async::Pool, database: &str, offset: usize, limit: usize) -> ObjectPageBody {
+async fn read_mysql_page(pool: &mysql_async::Pool, engine: Engine, database: &str, offset: usize, limit: usize) -> ObjectPageBody {
     let mut conn = match pool.get_conn().await {
         Ok(conn) => conn,
         Err(err) => return empty_page(read_failure(err)),
     };
-    let schema = read_mysql_objects(&mut conn, database, offset, limit).await;
+    let schema = read_mysql_objects(&mut conn, engine, database, offset, limit).await;
     ObjectPageBody {
         objects: schema.objects,
         total: schema.total,
@@ -408,8 +413,8 @@ async fn read_mysql_page(pool: &mysql_async::Pool, database: &str, offset: usize
     }
 }
 
-async fn read_mysql_database(conn: &mut mysql_async::Conn, database: &str, offset: usize, limit: usize) -> DatabaseNode {
-    let schema = read_mysql_objects(conn, database, offset, limit).await;
+async fn read_mysql_database(conn: &mut mysql_async::Conn, engine: Engine, database: &str, offset: usize, limit: usize) -> DatabaseNode {
+    let schema = read_mysql_objects(conn, engine, database, offset, limit).await;
     DatabaseNode {
         name: database.to_owned(),
         error: None,
@@ -417,11 +422,11 @@ async fn read_mysql_database(conn: &mut mysql_async::Conn, database: &str, offse
     }
 }
 
-async fn read_mysql_objects(conn: &mut mysql_async::Conn, database: &str, offset: usize, limit: usize) -> SchemaNode {
+async fn read_mysql_objects(conn: &mut mysql_async::Conn, engine: Engine, database: &str, offset: usize, limit: usize) -> SchemaNode {
     let window = offset.saturating_add(limit);
     let mut parts = Vec::new();
-    for kind in listed_kinds(Engine::Mysql) {
-        parts.push((*kind, read_mysql_kind(conn, database, *kind, window).await));
+    for kind in listed_kinds(engine) {
+        parts.push((*kind, read_mysql_kind(conn, engine, database, *kind, window).await));
     }
     let (objects, total, reports) = finish_kinds(parts, offset, limit);
     SchemaNode {
@@ -433,8 +438,8 @@ async fn read_mysql_objects(conn: &mut mysql_async::Conn, database: &str, offset
     }
 }
 
-async fn read_mysql_kind(conn: &mut mysql_async::Conn, database: &str, kind: ObjectKind, window: usize) -> Result<(usize, Vec<ObjectRow>), String> {
-    let sql = kind_sql(Engine::Mysql, kind);
+async fn read_mysql_kind(conn: &mut mysql_async::Conn, engine: Engine, database: &str, kind: ObjectKind, window: usize) -> Result<(usize, Vec<ObjectRow>), String> {
+    let sql = kind_sql(engine, kind);
     let count_row: Option<mysql_async::Row> = conn
         .exec_first(sql.count, (database.to_owned(),))
         .await
@@ -454,11 +459,19 @@ async fn read_mysql_kind(conn: &mut mysql_async::Conn, database: &str, kind: Obj
     Ok((total, objects))
 }
 
-async fn read_mysql_definition(pool: &mysql_async::Pool, database: &str, name: &str, kind: &str) -> Result<String, String> {
+async fn read_mysql_definition(pool: &mysql_async::Pool, engine: Engine, database: &str, name: &str, kind: &str) -> Result<String, String> {
     let statement = match kind {
         "function" => "FUNCTION",
         "procedure" => "PROCEDURE",
         "trigger" => "TRIGGER",
+        "sequence" if engine == Engine::Mariadb => "SEQUENCE",
+        "sequence" | "enum" | "domain" => {
+            return Err(definition_failure(if engine == Engine::Mariadb {
+                "MariaDB 没有独立的枚举或域"
+            } else {
+                "MySQL 没有独立的序列、枚举或域"
+            }));
+        }
         _ => return Err(definition_failure("只有函数、存储过程和触发器可以读取只读定义")),
     };
     if database.is_empty() {
@@ -468,22 +481,30 @@ async fn read_mysql_definition(pool: &mysql_async::Pool, database: &str, name: &
     let mut conn = pool.get_conn().await.map_err(definition_failure)?;
     let row: Option<mysql_async::Row> = conn.query_first(sql).await.map_err(definition_failure)?;
     let row = row.ok_or_else(|| definition_failure("没有读到定义"))?;
-    mysql_create_sql(&row)
+    // SHOW CREATE SEQUENCE 的语句在索引 1；函数、过程和触发器在索引 2。
+    let column = if statement == "SEQUENCE" { 1 } else { 2 };
+    mysql_create_sql(&row, column)
 }
 
 fn quote_mysql(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
-fn mysql_create_sql(row: &mysql_async::Row) -> Result<String, String> {
-    let statement = mysql_string(row, 2).ok();
-    mysql_show_create_statement(&[None, None, statement.as_deref()])
+fn mysql_create_sql(row: &mysql_async::Row, index: usize) -> Result<String, String> {
+    let statement = mysql_string(row, index).ok();
+    let mut columns = vec![None; index + 1];
+    columns[index] = statement.as_deref();
+    mysql_show_create_at(&columns, index)
 }
 
 /// SHOW CREATE FUNCTION、PROCEDURE、TRIGGER 的语句都在索引 2。
 /// 索引 0 是对象名，名称里的 CREATE 不是定义。
 fn mysql_show_create_statement(columns: &[Option<&str>]) -> Result<String, String> {
-    let text = columns.get(2).and_then(|item| *item).unwrap_or("");
+    mysql_show_create_at(columns, 2)
+}
+
+fn mysql_show_create_at(columns: &[Option<&str>], index: usize) -> Result<String, String> {
+    let text = columns.get(index).and_then(|item| *item).unwrap_or("");
     if text.trim().is_empty() {
         Err(definition_failure("没有读到定义"))
     } else {
@@ -627,6 +648,27 @@ async fn read_postgres_definition(
             }
             Ok(text)
         }
+        "sequence" => read_postgres_text(
+            client,
+            "SELECT format('CREATE SEQUENCE %I.%I AS %s INCREMENT BY %s MINVALUE %s MAXVALUE %s START WITH %s CACHE %s %s;', schemaname, sequencename, data_type, increment_by, min_value, max_value, start_value, cache_size, CASE WHEN cycle THEN 'CYCLE' ELSE 'NO CYCLE' END) FROM pg_catalog.pg_sequences WHERE schemaname = $1 AND sequencename = $2",
+            schema,
+            name,
+        )
+        .await,
+        "enum" => read_postgres_text(
+            client,
+            "SELECT format('CREATE TYPE %I.%I AS ENUM (%s);', n.nspname, t.typname, COALESCE((SELECT string_agg(quote_literal(e.enumlabel), ', ' ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = t.oid), '')) FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1 AND t.typname = $2 AND t.typtype = 'e'",
+            schema,
+            name,
+        )
+        .await,
+        "domain" => read_postgres_text(
+            client,
+            "SELECT format('CREATE DOMAIN %I.%I AS %s%s%s%s;', n.nspname, t.typname, pg_catalog.format_type(t.typbasetype, t.typtypmod), CASE WHEN t.typnotnull THEN ' NOT NULL' ELSE '' END, CASE WHEN t.typdefault IS NOT NULL THEN ' DEFAULT ' || t.typdefault ELSE '' END, COALESCE((SELECT ' ' || string_agg(pg_get_constraintdef(c.oid), ' ' ORDER BY c.oid) FROM pg_constraint c WHERE c.contypid = t.oid), '')) FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1 AND t.typname = $2 AND t.typtype = 'd'",
+            schema,
+            name,
+        )
+        .await,
         "trigger" => {
             let sql = "SELECT pg_get_triggerdef(t.oid, true) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND t.tgname = $2 AND NOT t.tgisinternal AND ($3 = '' OR c.relname = $3)";
             let rows = client.query(sql, &[&schema, &name, &relation]).await.map_err(definition_failure)?;
@@ -644,17 +686,31 @@ async fn read_postgres_definition(
     }
 }
 
+async fn read_postgres_text(client: &tokio_postgres::Client, sql: &str, schema: &str, name: &str) -> Result<String, String> {
+    let rows = client.query(sql, &[&schema, &name]).await.map_err(definition_failure)?;
+    let row = rows.first().ok_or_else(|| definition_failure("没有读到定义"))?;
+    let text = pg_string(row, 0).map_err(|err| definition_failure(err))?;
+    if text.trim().is_empty() {
+        Err(definition_failure("没有读到定义"))
+    } else {
+        Ok(text)
+    }
+}
+
 fn postgres_object(row: &tokio_postgres::Row) -> Result<ObjectRow, String> {
     let name = pg_string(row, 0)?;
     let kind = pg_string(row, 1)?;
     let estimated = pg_i64_opt(row, 2)?;
+    let signature = pg_text(row, 3);
+    let materialized = signature == "materialized";
     Ok(ObjectRow {
         name,
         kind: parse_kind(&kind),
         estimated_rows: known_row_estimate(estimated),
         stale: false,
-        signature: pg_text(row, 3),
+        signature: if materialized { String::new() } else { signature },
         relation: pg_text(row, 4),
+        materialized,
     })
 }
 
@@ -694,6 +750,7 @@ fn mysql_object(row: &mysql_async::Row) -> Result<ObjectRow, String> {
         stale: false,
         signature: mysql_text(row, 3),
         relation: mysql_text(row, 4),
+        materialized: false,
     })
 }
 
@@ -733,6 +790,11 @@ mod definition_column_tests {
         assert!(mysql_show_create_statement(&trigger).unwrap().starts_with("CREATE TRIGGER"));
         assert!(mysql_show_create_statement(&[Some("create_order"), Some("mode")]).is_err());
         assert!(mysql_show_create_statement(&[Some("create_order"), Some("mode"), Some("   ")]).is_err());
+
+        let sequence = [Some("orders_id_seq"), Some("CREATE SEQUENCE `orders_id_seq` START WITH 1")];
+        let sequence_sql = super::mysql_show_create_at(&sequence, 1).expect("sequence column");
+        assert!(sequence_sql.starts_with("CREATE SEQUENCE"));
+        assert_ne!(sequence_sql, "orders_id_seq");
     }
 }
 

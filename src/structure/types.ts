@@ -63,6 +63,8 @@ export interface StructureDescription {
   foreignKeyList: StructureForeignKey[];
   incoming: StructureIncoming[];
   displaySql: string;
+  materialized?: boolean;
+  definitionError?: string | null;
 }
 
 export interface PlanStep {
@@ -105,4 +107,5 @@ export type StructureAction =
   | { kind: "createForeignKey"; table: string; foreignKey: StructureForeignKey }
   | { kind: "dropForeignKey"; table: string; name: string }
   | { kind: "dropTable"; table: string }
-  | { kind: "setForeignKeys"; enabled: boolean };
+  | { kind: "setForeignKeys"; enabled: boolean }
+  | { kind: "replaceView"; table: string; definition: string };

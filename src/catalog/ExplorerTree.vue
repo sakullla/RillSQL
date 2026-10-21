@@ -4,8 +4,8 @@ import type { OpenOutcome } from "../connections/api";
 import { fetchDefinition, focusDatabase, listConnections, openConnection } from "./backend";
 import { browseSql, qualifiedObjectName, type CatalogObjectRef } from "./object-ref";
 import SchemaBlock from "./SchemaBlock.vue";
-import { catalogConnections, catalogLoadError, refreshCatalog, schemaKey } from "./store";
-import { engineShape, isConnected, objectKey, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
+import { catalogConnections, catalogLoadError, refreshCatalog, schemaKey, setStructureFocus } from "./store";
+import { engineShape, isConnected, isDefinitionKind, objectKey, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
 import type { CatalogConnection, DatabaseNode } from "./types";
 
 const props = defineProps<{ filter: string }>();
@@ -27,6 +27,7 @@ const connectTarget = ref<string | null>(null);
 const connectError = ref("");
 const passwordFor = ref<string | null>(null);
 const typedPassword = ref("");
+const structureNotice = ref("");
 
 const ICONS = {
   database: "M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3ZM4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3",
@@ -182,7 +183,7 @@ async function focusSession(connection: CatalogConnection, database: string) {
 
 function rowOf(target: EventTarget | null): HTMLElement | null {
   if (!(target instanceof Element)) return null;
-  const row = target.closest("[data-level=object], [data-hit]");
+  const row = target.closest("[data-level=member], [data-level=object], [data-hit]");
   return row instanceof HTMLElement ? row : null;
 }
 
@@ -213,7 +214,11 @@ function readRef(row: HTMLElement): CatalogObjectRef | null {
 }
 
 function isRoutine(object: CatalogObjectRef): boolean {
-  return object.kind === "function" || object.kind === "procedure" || object.kind === "trigger";
+  return isDefinitionKind(object.kind);
+}
+
+function memberSelection(row: HTMLElement): string {
+  return `member:${row.dataset.key ?? ""}:${row.dataset.section ?? "columns"}:${row.dataset.member ?? ""}`;
 }
 
 function closeMenu() {
@@ -221,7 +226,11 @@ function closeMenu() {
 }
 
 function openObject(object: CatalogObjectRef | null, pane: "data" | "structure", section?: "columns" | "drop") {
-  if (!object || object.stale) return;
+  if (!object || object.stale) {
+    if (object?.stale && pane === "structure") structureNotice.value = `${object.name} 已失效，不能打开结构。`;
+    return;
+  }
+  if (pane === "structure") setStructureFocus(null);
   closeMenu();
   emit("open-object", object, pane, section);
 }
@@ -229,6 +238,10 @@ function openObject(object: CatalogObjectRef | null, pane: "data" | "structure",
 function onTreeClick(event: MouseEvent) {
   const row = rowOf(event.target);
   if (!row) return;
+  if (row.dataset.level === "member") {
+    selectedKey.value = memberSelection(row);
+    return;
+  }
   const object = readRef(row);
   if (!object) return;
   selectedKey.value = objectKey(object);
@@ -267,7 +280,27 @@ function onTreeDblClick(event: MouseEvent) {
   const row = rowOf(event.target);
   if (!row) return;
   const object = readRef(row);
-  if (!object || object.stale) return;
+  if (!object || object.stale) {
+    if (object?.stale) structureNotice.value = `${object.name} 已失效，不能打开结构。`;
+    return;
+  }
+  if (row.dataset.level === "member") {
+    const section = row.dataset.section === "indexes" ? "indexes" : "columns";
+    const name = row.dataset.member ?? "";
+    if (!name) return;
+    selectedKey.value = memberSelection(row);
+    structureNotice.value = "";
+    setStructureFocus({
+      connectionId: object.connectionId,
+      database: object.database,
+      schema: object.schema,
+      table: object.name,
+      section,
+      name,
+    });
+    emit("open-object", object, "structure", "columns");
+    return;
+  }
   selectedKey.value = objectKey(object);
   if (isRoutine(object)) {
     emit("open-definition", object);
@@ -359,6 +392,10 @@ onBeforeUnmount(() => {
       <button class="btn ghost sm" type="button" data-action="tree-refresh" aria-label="刷新对象列表" :disabled="refreshing" @click="onRefresh">
         {{ refreshing ? "正在刷新…" : "刷新" }}
       </button>
+    </div>
+    <div v-if="structureNotice" class="tree-note err" data-structure-notice>
+      <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>
+      <span>{{ structureNotice }}</span>
     </div>
     <div v-if="loadError" class="tree-note err" data-load-error>
       <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>

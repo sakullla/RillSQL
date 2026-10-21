@@ -46,6 +46,7 @@ pub async fn read_sqlite_pool(
             stale: false,
             signature,
             relation,
+            materialized: false,
         })
         .collect();
     Ok(SqlitePage {

@@ -70,6 +70,30 @@ fn engines_keep_their_own_levels() {
     assert!(super::kind_sql(Engine::Mariadb, super::model::ObjectKind::Function).list.contains("information_schema.routines"));
     assert!(!super::model::listed_kinds(Engine::Sqlite).contains(&super::model::ObjectKind::Function));
     assert!(super::model::listed_kinds(Engine::Sqlite).contains(&super::model::ObjectKind::Trigger));
+    assert!(!super::model::listed_kinds(Engine::Sqlite).contains(&super::model::ObjectKind::Sequence));
+    assert!(!super::model::listed_kinds(Engine::Mysql).contains(&super::model::ObjectKind::Sequence));
+    assert!(!super::model::listed_kinds(Engine::Mysql).contains(&super::model::ObjectKind::Enum));
+    assert!(!super::model::listed_kinds(Engine::Mysql).contains(&super::model::ObjectKind::Domain));
+    assert!(super::model::listed_kinds(Engine::Mariadb).contains(&super::model::ObjectKind::Sequence));
+    assert!(!super::model::listed_kinds(Engine::Mariadb).contains(&super::model::ObjectKind::Enum));
+    assert!(!super::model::listed_kinds(Engine::Mariadb).contains(&super::model::ObjectKind::Domain));
+    assert!(super::model::listed_kinds(Engine::Postgres).contains(&super::model::ObjectKind::Sequence));
+    assert!(super::model::listed_kinds(Engine::Postgres).contains(&super::model::ObjectKind::Enum));
+    assert!(super::model::listed_kinds(Engine::Postgres).contains(&super::model::ObjectKind::Domain));
+    let sequence_sql = super::kind_sql(Engine::Postgres, super::model::ObjectKind::Sequence);
+    assert!(sequence_sql.list.contains("relkind = 'S'"));
+    let enum_sql = super::kind_sql(Engine::Postgres, super::model::ObjectKind::Enum);
+    assert!(enum_sql.list.contains("typtype = 'e'"));
+    let domain_sql = super::kind_sql(Engine::Postgres, super::model::ObjectKind::Domain);
+    assert!(domain_sql.list.contains("typtype = 'd'"));
+    let maria_sequence = super::kind_sql(Engine::Mariadb, super::model::ObjectKind::Sequence);
+    assert!(maria_sequence.list.contains("information_schema.SEQUENCES"));
+    assert!(super::kind_sql(Engine::Mysql, super::model::ObjectKind::Sequence).list.contains("WHERE 0"));
+    assert_eq!(super::model::parse_kind("sequence"), super::model::ObjectKind::Sequence);
+    assert_eq!(super::model::parse_kind("enum"), super::model::ObjectKind::Enum);
+    assert_eq!(super::model::parse_kind("domain"), super::model::ObjectKind::Domain);
+    let view_sql = super::kind_sql(Engine::Postgres, super::model::ObjectKind::View);
+    assert!(view_sql.list.contains("materialized"));
     assert!(postgres_sql.schemas.is_some());
     assert!(mysql_sql.objects.contains("information_schema.tables"));
     assert!(maria_sql.objects.contains("information_schema.tables"));
@@ -373,7 +397,7 @@ async fn scripted_and_unreachable_sessions_fail_instead_of_an_empty_catalog() {
     assert!(scripted.databases.is_empty());
     assert!(scripted.error.as_deref().unwrap().contains("没有连着可查询"));
 
-    let closed = page_for_session(None, "main", "", 0, 100).await;
+    let closed = page_for_session(None, Engine::Sqlite, "main", "", 0, 100).await;
     assert!(closed.objects.is_empty());
     assert!(closed.error.as_deref().unwrap().contains("还没有打开"));
 
@@ -445,7 +469,7 @@ async fn sqlite_catalog_reads_the_open_session_not_a_new_connection() {
     assert_eq!(json["databases"][0]["schemas"][0]["objects"][0]["estimatedRows"], serde_json::Value::Null);
 
     let session = service.catalog_session("notes").unwrap();
-    let next = page_for_session(Some(&session), "main", "", 100, 100).await;
+    let next = page_for_session(Some(&session), Engine::Sqlite, "main", "", 100, 100).await;
     assert!(next.error.is_none());
     assert_eq!(next.objects.len(), 5);
     assert!(next.objects.iter().any(|item| item.name == "v_notes" && item.kind == "view"));
@@ -539,13 +563,15 @@ async fn sqlite_lists_a_trigger_and_reads_its_sql_without_inventing_routines() {
         pool: pool.clone(),
         foreign_keys: Some(false),
     };
-    let sql = read_definition(&session, "main", "", "notes_touch", "trigger", "", "").await.unwrap();
+    let sql = read_definition(&session, Engine::Sqlite, "main", "", "notes_touch", "trigger", "", "").await.unwrap();
     assert!(sql.to_ascii_uppercase().contains("CREATE TRIGGER"));
-    let missing = read_definition(&session, "main", "", "missing", "trigger", "", "").await.unwrap_err();
+    let missing = read_definition(&session, Engine::Sqlite, "main", "", "missing", "trigger", "", "").await.unwrap_err();
     assert!(missing.contains("没有读到定义"));
     assert!(!missing.trim().is_empty());
-    let routine = read_definition(&session, "main", "", "notes", "function", "", "").await.unwrap_err();
+    let routine = read_definition(&session, Engine::Sqlite, "main", "", "notes", "function", "", "").await.unwrap_err();
     assert!(routine.contains("没有函数"));
+    let sequence = read_definition(&session, Engine::Sqlite, "main", "", "sqlite_sequence", "sequence", "", "").await.unwrap_err();
+    assert!(sequence.contains("没有序列"));
     pool.close().await;
     let _ = std::fs::remove_file(path);
 }
