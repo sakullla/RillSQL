@@ -14,8 +14,8 @@
     "No browser page errors"
   ],
   "metrics": {
-    "largeResultReadyMs": 2789,
-    "renderedRows": 23,
+    "largeResultReadyMs": 2874,
+    "renderedRows": 22,
     "standardDataRowPx": 30
   },
   "passed": true,

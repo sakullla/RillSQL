@@ -96,6 +96,6 @@ const choices: { id: ThemePreference; label: string }[] = [
 .theme-menu { position: relative; }
 .theme-menu summary { list-style: none; }
 .theme-menu summary::-webkit-details-marker { display: none; }
-.theme-menu-pop { position: absolute; right: 0; top: 32px; }
+.theme-menu-pop { position: absolute; right: 0; top: calc(100% + 6px); }
 .menu-item .check { margin-left: auto; }
 </style>

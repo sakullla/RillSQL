@@ -1,14 +1,16 @@
-/* Database workbench surfaces and layout. */
+/* 工作台层样式：欢迎页、二级页面骨架、网格表面与查询/表格布局安全网。
+   desk-、page-head、set- 系列类是下游特征页消费的公共语言——只升级质感，不改类名与语义。
+   颜色一律引用 tokens.css 令牌；卡片描边走 --stroke/--line，悬浮用阴影档位。 */
 .workspace-view { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; }
 .app-root .tb-brand { min-width: 0; }
 .app-root .cmd-trigger { max-width: 440px; }
 .app-root .rail { background: var(--nav-bg); border: 0; padding-top: var(--sp-2); gap: 4px; }
+.app-root .rail { background: var(--nav-bg); padding-top: var(--sp-2); }
+/* 活动栏消费导航令牌（nav 族），与主题令牌保持单一来源 */
 .app-root .rail-btn { color: var(--nav-fg); }
 .app-root .rail-btn:hover { color: var(--nav-active); background: var(--nav-hover); }
 .app-root .rail-btn.active { background: var(--nav-active-bg); color: var(--nav-active); }
 .app-root .rail-btn.active::before { background: var(--accent); }
-.app-root .sidebar { background: var(--panel-2); }
-.app-root .statusbar { background: var(--chrome); }
 
 /* ---------- 欢迎页：克制的品牌化首屏 ---------- */
 .welcome {
@@ -32,22 +34,23 @@
 .desk-action {
   display: flex; align-items: center; text-align: left; gap: 14px;
   padding: 18px 20px;
-  border: 1px solid var(--line); border-radius: var(--r-lg);
-  background: var(--panel);
+  border: 1px solid var(--stroke); border-radius: var(--r-lg);
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-sm);
   transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
 }
-.desk-action:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line-2)); box-shadow: var(--shadow-sm); transform: translateY(-1px); }
-.desk-action:active { transform: translateY(0); }
+.desk-action:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line-2)); box-shadow: var(--shadow); transform: translateY(-1px); }
+.desk-action:active { transform: translateY(0); box-shadow: inset 0 1px 2px var(--press), var(--shadow-sm); }
 .desk-action b { font-size: var(--fs-md); display: block; margin-bottom: 4px; }
 .desk-action small { color: var(--text-2); font-size: var(--fs-xs); }
-.action-icon { display: grid; place-items: center; width: 40px; height: 40px; border-radius: var(--r-lg); background: var(--accent-soft); color: var(--accent-text); flex-shrink: 0; }
+.action-icon { display: grid; place-items: center; width: 40px; height: 40px; border-radius: var(--r-md); background: var(--accent-soft); color: var(--accent-text); flex-shrink: 0; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 20%, transparent); }
 .action-icon .i { width: 20px; height: 20px; }
 .action-arrow { margin-left: auto; color: var(--text-3); font-size: 18px; }
 .desk-columns { display: grid; grid-template-columns: minmax(0, 1.75fr) minmax(240px, 1fr); gap: 28px; }
 .section-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; color: var(--text-2); }
 .section-heading h2 { margin: 0; font-size: var(--fs-md); color: var(--text); font-weight: 600; }
-.count { display: inline-grid; place-items: center; min-width: 20px; margin-left: 6px; border: 1px solid var(--line); border-radius: var(--r-sm); color: var(--text-2); font: var(--fs-xs) var(--mono); padding: 2px 4px; }
-.desk-db-list { border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; background: var(--panel); }
+.count { display: inline-grid; place-items: center; min-width: 20px; margin-left: 6px; border: 1px solid var(--stroke); border-radius: var(--r-sm); color: var(--text-2); font: var(--fs-xs) var(--mono); padding: 2px 4px; }
+.desk-db-list { border: 1px solid var(--stroke); border-radius: var(--r-lg); overflow: hidden; background: var(--surface-panel); box-shadow: var(--shadow-sm); }
 .desk-db { width: 100%; padding: 16px; display: flex; align-items: center; gap: 12px; text-align: left; border-bottom: 1px solid var(--line); }
 .desk-db:last-child { border-bottom: 0; }
 .desk-db:hover { background: var(--hover); }
@@ -58,7 +61,7 @@
 .db-copy small { display: block; color: var(--text-3); font: 10px var(--mono); margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .desk-manage { display: flex; width: 100%; justify-content: space-between; padding: 14px 2px; color: var(--text-2); font-size: var(--fs-sm); }
 .desk-manage:hover { color: var(--accent-text); }
-.desk-empty { padding: 34px 20px; text-align: center; background: var(--panel); border: 1px dashed var(--line-2); border-radius: var(--r-lg); }
+.desk-empty { padding: 34px 20px; text-align: center; background: var(--surface-panel); border: 1px dashed var(--line-2); border-radius: var(--r-lg); }
 .desk-empty > .i { width: 32px; height: 32px; color: var(--accent-text); }
 .desk-empty h3 { font-size: var(--fs-md); margin: 14px 0 8px; }
 .desk-empty p { color: var(--text-2); font-size: var(--fs-sm); line-height: 1.8; }
@@ -80,12 +83,12 @@
 .page .page-head p { font-size: var(--fs-sm); color: var(--text-2); }
 .page .eyebrow { font: 10px var(--mono); letter-spacing: .09em; }
 .page .page-inner.narrow { max-width: 1100px; }
-.page .set-sec { border: 1px solid var(--line); border-radius: var(--r-lg); padding: 20px 22px; background: var(--panel); margin-bottom: 16px; }
+.page .set-sec { border: 1px solid var(--stroke); border-radius: var(--r-lg); padding: 20px 22px; background: var(--surface-panel); box-shadow: var(--shadow-sm); margin-bottom: 16px; }
 .page .set-sec h2 { color: var(--accent-text); font-size: var(--fs-sm); margin-bottom: 12px; }
 .page .set-row:last-child { border-bottom: 0; padding-bottom: 0; }
 .page .set-row:first-of-type { padding-top: 4px; }
 .settings-nav { display: flex; gap: 6px; margin-bottom: 24px; flex-wrap: wrap; }
-.settings-nav a { padding: 7px 16px; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); color: var(--text-2); text-decoration: none; font-size: var(--fs-sm); }
+.settings-nav a { padding: 7px 16px; border: 1px solid var(--stroke); border-radius: var(--r); background: var(--surface-panel); color: var(--text-2); text-decoration: none; font-size: var(--fs-sm); box-shadow: var(--shadow-sm); }
 .settings-nav a:hover { border-color: var(--accent); color: var(--accent-text); }
 
 /* ---------- 数据网格外观 ---------- */
@@ -141,7 +144,7 @@
 
 .app-root .cmd-trigger > span:not(.kbd) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .sidebar-dismiss { display: none; }
-@media (max-width: 960px) { .sidebar-dismiss { display: block; position: absolute; inset: 0 0 0 var(--rail-w); background: var(--overlay); z-index: 29; } }
+@media (max-width: 960px) { .sidebar-dismiss { display: block; position: absolute; inset: 0 0 0 var(--rail-w); background: var(--overlay); z-index: var(--z-sticky); } }
 
 /* 查询和表格占满内容区；宽列只在表格内部滚动，不把页面撑出横向滚动。 */
 .app-root .workspace-view { min-width: 0; max-width: 100%; overflow: hidden; }
