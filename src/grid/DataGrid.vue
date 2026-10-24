@@ -15,7 +15,7 @@ import type { StructureForeignKey } from "../structure/types";
 import { rectangleSelection, selectionTsv, type CellPoint } from "./clipboard";
 import { copyCellText, copySqlValue, needsFullRead, showCell, type NullCopy } from "./display";
 import { referenceJump, referenceQuery } from "./reference";
-import { isPreviewEnvelope, rejectWrite, typeCaption } from "./typeset";
+import { isPreviewEnvelope, rejectWrite, typeCaption, valueFamily } from "./typeset";
 import "./grid.css";
 import { useRowWindow } from "./virtual";
 import { LiveTable } from "./live";
@@ -500,6 +500,12 @@ function columnStyle(name: string): Record<string, string> | undefined {
   return { width: `${width}px`, minWidth: `${width}px`, maxWidth: `${width}px` };
 }
 
+/** 数值列（整数/定点/浮点）右对齐，列头与单元格一致。 */
+function numericColumn(column: { typeName: string }): boolean {
+  const family = valueFamily(column.typeName);
+  return family === "integer" || family === "decimal" || family === "float";
+}
+
 function startResize(name: string, event: PointerEvent) {
   const th = ((event.currentTarget as HTMLElement | null) ?? (event.target as HTMLElement | null))?.closest("th");
   const startX = event.clientX;
@@ -843,8 +849,8 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
       <table class="grid-table">
         <thead>
           <tr>
-            <th v-for="column in columns" :key="column.name" scope="col" :style="columnStyle(column.name)" :data-type="typeCaption(column)" :aria-sort="session.sort?.column === column.name ? (session.sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'">
-              <button class="th-btn" type="button" :aria-label="`按 ${column.name} 排序`" @click="session.cycleSort(column.name)"><span>{{ column.name }}</span><span class="col-type">{{ typeCaption(column) }}</span></button>
+            <th v-for="column in columns" :key="column.name" scope="col" :class="{ num: numericColumn(column) }" :style="columnStyle(column.name)" :data-type="typeCaption(column)" :aria-sort="session.sort?.column === column.name ? (session.sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'">
+              <button class="th-btn" type="button" :aria-label="`按 ${column.name} 排序`" @click="session.cycleSort(column.name)"><span class="th-name">{{ column.name }}</span><span class="col-type">{{ typeCaption(column) }}</span><span v-if="session.sort?.column === column.name" class="sort-arrow" aria-hidden="true">{{ session.sort.direction === "asc" ? "↑" : "↓" }}</span></button>
               <span class="col-resize" role="separator" :aria-label="`调整 ${column.name} 列宽`" @pointerdown.stop.prevent="startResize(column.name, $event)"></span>
             </th>
           </tr>
@@ -855,7 +861,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
             <td class="grid-empty" :colspan="columns.length">正在读取表数据…</td>
           </tr>
           <tr v-for="row in visibleRows" :key="row.id" :class="{ 'row-insert': row.kind === 'insert', 'row-delete': row.deleted, 'row-failed': row.failed }" :data-row-id="row.id" :data-located="row.located" :title="row.failure || undefined">
-            <td v-for="(column, columnIndex) in columns" :key="column.name" :style="columnStyle(column.name)">
+            <td v-for="(column, columnIndex) in columns" :key="column.name" :class="{ num: numericColumn(column) }" :style="columnStyle(column.name)">
               <div v-if="editing && editing.id === row.id && editing.column === column.name" class="editor">
                 <input :ref="focusEditor" v-model="editing.draft" :aria-label="`编辑 ${column.name}`" :disabled="editing.isNull" @keydown="onEditorKeydown" />
                 <button class="btn sm" type="button" :disabled="!column.nullable" @click="editing.isNull = true">设为 NULL</button>

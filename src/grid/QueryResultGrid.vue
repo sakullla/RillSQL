@@ -17,7 +17,7 @@ import { copyCellText, copySqlValue, showCell } from "./display";
 import "./grid.css";
 import { loadSettings } from "../shell/settings";
 import { locateResultRows, provedEditableColumns, readSingleTable, resolveEditableTable, ResultEditSession, type TableHit } from "./result-edit";
-import { rejectWrite, typeCaption } from "./typeset";
+import { rejectWrite, typeCaption, valueFamily } from "./typeset";
 import type { Cell, Column, Engine, Row, SortSpec } from "./types";
 
 const props = defineProps<{
@@ -418,6 +418,12 @@ function columnStyle(name: string): Record<string, string> | undefined {
   return { width: `${width}px`, minWidth: `${width}px`, maxWidth: `${width}px` };
 }
 
+/** 数值列（整数/定点/浮点）右对齐，列头与单元格一致。 */
+function numericColumn(column: { typeName: string }): boolean {
+  const family = valueFamily(column.typeName);
+  return family === "integer" || family === "decimal" || family === "float";
+}
+
 function startResize(name: string, event: PointerEvent) {
   const th = ((event.currentTarget as HTMLElement | null) ?? (event.target as HTMLElement | null))?.closest("th");
   const startX = event.clientX;
@@ -734,8 +740,8 @@ watch(() => props.rows, (rows) => {
         <thead>
           <tr>
             <th class="row-number" aria-label="行号">#</th>
-            <th v-for="column in columns" :key="column.name" :style="columnStyle(column.name)" :data-type="typeCaption(column)" :aria-sort="sort?.column === column.name ? (sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'">
-              <button class="th-btn" type="button" :aria-label="`仅对已读取行按 ${column.name} 排序`" @click="cycle(column.name)"><span>{{ column.name }}</span><span class="col-type">{{ typeCaption(column) }}</span><span v-if="sort?.column === column.name" class="sort-arrow">{{ sort.direction === 'asc' ? '↑' : '↓' }}</span></button>
+            <th v-for="column in columns" :key="column.name" :class="{ num: numericColumn(column) }" :style="columnStyle(column.name)" :data-type="typeCaption(column)" :aria-sort="sort?.column === column.name ? (sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'">
+              <button class="th-btn" type="button" :aria-label="`仅对已读取行按 ${column.name} 排序`" @click="cycle(column.name)"><span class="th-name">{{ column.name }}</span><span class="col-type">{{ typeCaption(column) }}</span><span v-if="sort?.column === column.name" class="sort-arrow" aria-hidden="true">{{ sort.direction === 'asc' ? '↑' : '↓' }}</span></button>
               <span class="col-resize" role="separator" :aria-label="`调整 ${column.name} 列宽`" @pointerdown.stop.prevent="startResize(column.name, $event)"></span>
             </th>
           </tr>
@@ -744,7 +750,7 @@ watch(() => props.rows, (rows) => {
           <tr v-if="range.top" class="virtual-spacer" aria-hidden="true"><td :colspan="columns.length + 1" :style="{ height: `${range.top}px` }"></td></tr>
           <tr v-for="row in visibleRows" :key="row.id" :data-row-id="row.id" :aria-rowindex="row.number + 1" :class="{ 'row-delete': row.deleted, 'row-failed': row.failed }" :title="row.failure || undefined">
             <td class="row-number">{{ row.number }}<span v-if="row.deleted" class="row-flag del">将删除</span></td>
-            <td v-for="(cell, index) in row.cells" :key="index" :style="columnStyle(columns[index]?.name ?? '')">
+            <td v-for="(cell, index) in row.cells" :key="index" :class="{ num: columns[index] ? numericColumn(columns[index]) : false }" :style="columnStyle(columns[index]?.name ?? '')">
               <div v-if="editing && editing.id === row.id && editing.column === columns[index]?.name" class="editor">
                 <input :ref="focusEditor" v-model="editing.draft" :aria-label="`编辑 ${columns[index]?.name}`" :disabled="editing.isNull" @keydown="onEditorKeydown" />
                 <button class="btn sm" type="button" :disabled="columns[index] ? !((editSession?.schema.columns.find(item => item.name === columns[index]?.name)?.nullable) ?? true) : false" @click="editing.isNull = true">设为 NULL</button>

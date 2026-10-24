@@ -1,4 +1,6 @@
-/* 数据表格：数据表格与查询结果网格的样式。一律引用 tokens.css 令牌。 */
+/* 数据表格：表数据与查询结果网格的专业化样式（R3，对标 TablePlus 观感）。
+   一律引用 tokens.css 令牌；两处网格共用同一份规则，保证风格一致。
+   行高消费密度令牌 --row-h（compact 24px 默认）；排序/筛选语义锚点（aria-sort、.cell-btn 等）不变。 */
 
 .data-grid {
   position: relative;
@@ -22,27 +24,29 @@
   min-width: 0;
   max-width: 100%;
   padding: var(--sp-2) var(--sp-3);
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--line-2);
   flex-wrap: wrap;
 }
 .filter-form { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; min-width: 0; max-width: 100%; }
 .filter-form select,
 .filter-form input,
 .result-toolbar input { height: var(--control-h-sm); min-width: 0; max-width: min(240px, 100%); }
+.result-toolbar input { max-width: min(280px, 100%); }
 .toolbar-hint { margin: 0; font-size: var(--fs-xs); color: var(--text-3); max-width: 340px; }
 .key-hint { color: var(--warn); }
 
-/* ---------- 条件与排序标签 ---------- */
+/* ---------- 条件与排序标签：accent 软底 + 同色系内描边 ---------- */
 .chip {
   display: inline-flex;
   align-items: center;
   gap: var(--sp-1);
-  min-height: 22px;
+  min-height: 20px;
   padding: 0 var(--sp-2);
   border-radius: var(--r-full);
   background: var(--accent-soft);
   color: var(--accent-text);
   font-size: var(--fs-xs);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 .chip b { color: var(--accent-text); font-weight: 600; }
 .chip code { font-family: var(--mono); }
@@ -62,19 +66,31 @@
 
 /* ---------- 提示与告警 ---------- */
 .hint { color: var(--text-2); font-size: var(--fs-xs); }
-.export-message { margin: 0; padding: var(--sp-2) var(--sp-3) 0; }
+.export-message,
+.grid-hint { margin: 0; padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--line); font-size: var(--fs-xs); color: var(--text-2); }
 .grid-alert {
   margin: 0;
   padding: var(--sp-2) var(--sp-3);
   background: var(--err-soft);
   color: var(--err);
   border-bottom: 1px solid var(--err-line);
+  box-shadow: inset 3px 0 0 var(--err);
   font-size: var(--fs-sm);
 }
+.grid-alert .btn { margin-left: var(--sp-2); }
 
-/* ---------- 表格 ---------- */
+/* ---------- 表格主体 ---------- */
 .grid-scroll { flex: 1 1 0%; min-width: 0; min-height: 0; max-width: 100%; overflow: auto; }
-.grid-table { border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; max-width: none; font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
+.grid-table {
+  border-collapse: separate;
+  border-spacing: 0;
+  width: max-content;
+  min-width: 100%;
+  max-width: none;
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+}
 .grid-table th,
 .grid-table td {
   height: var(--row-h);
@@ -87,37 +103,152 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* 数字列右对齐（列头与单元格一致） */
+.grid-table th.num,
+.grid-table td.num { text-align: right; }
+.grid-table td.num .cell-btn { text-align: right; }
+.grid-table td.num .editor { justify-content: flex-end; }
+
+/* 斑马纹：只作用于普通数据行；插入/删除/失败行有自己的状态底色 */
+.grid-table tbody tr:not(.virtual-spacer):not(.row-insert):not(.row-delete):not(.row-failed):nth-child(even) {
+  background: color-mix(in srgb, var(--panel-2) 50%, var(--panel));
+}
+/* 悬停行态：覆盖在斑马纹之上，行号列保持自己的底色 */
+.grid-table tbody tr:not(.virtual-spacer):not(.row-insert):not(.row-delete):not(.row-failed):hover > td:not(.row-number) {
+  background: var(--hover);
+}
+
+/* ---------- 列头：双行排版（列名 + 类型）+ 排序语义 ---------- */
 .grid-table th {
-  position: sticky; top: 0; z-index: 2;
+  position: sticky;
+  top: 0;
+  z-index: 2;
   height: auto;
   min-height: var(--row-h);
   background: var(--panel-2);
   font-weight: 600;
+  font-size: var(--fs-xs);
+  color: var(--text-2);
   border-bottom-color: var(--line-2);
-  box-shadow: 0 1px 0 var(--line);
 }
-.col-type { display: block; font-size: var(--fs-xs); font-weight: 400; color: var(--text-3); }
+.grid-table th[aria-sort="ascending"],
+.grid-table th[aria-sort="descending"] {
+  color: var(--text);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+.th-btn {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0;
+  width: calc(100% + var(--sp-2));
+  margin: 0 calc(var(--sp-1) * -1);
+  padding: 3px var(--sp-1);
+  border-radius: var(--r-sm);
+  text-align: left;
+  font-weight: 600;
+  line-height: 1.25;
+  transition: background var(--dur-fast) var(--ease);
+}
+.th-btn:hover { background: var(--hover); }
+.th-name {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.col-type {
+  display: block;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  line-height: 1.2;
+  color: var(--text-3);
+}
+.grid-table th.num .th-btn { align-items: flex-end; text-align: right; }
+.sort-arrow {
+  position: absolute;
+  top: 3px;
+  right: var(--sp-3);
+  color: var(--accent-text);
+  font-size: var(--fs-xs);
+  line-height: 1;
+}
 .col-resize { position: absolute; top: 0; right: 0; width: 6px; height: 100%; cursor: col-resize; z-index: 3; }
-.cell-btn.range { background: var(--accent-soft); }
+.grid-table th:hover .col-resize { background: color-mix(in srgb, var(--accent) 35%, transparent); }
+
+/* 行号列：冻结在左侧 */
+.grid-table .row-number {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  width: 48px;
+  min-width: 48px;
+  text-align: right;
+  color: var(--text-3);
+  background: var(--panel-2);
+  font-size: var(--fs-xs);
+  user-select: none;
+  border-right-color: var(--line-2);
+}
+.grid-table th.row-number { z-index: 3; }
+
+/* ---------- 单元格 ---------- */
+.cell-btn { display: block; width: 100%; text-align: left; background: none; border-radius: 0; }
+.cell-btn.range { background: var(--sel); }
+.cell-btn.on { box-shadow: inset 0 0 0 2px var(--accent); border-radius: var(--r-sm); background: var(--sel-strong); }
+.v-null {
+  display: inline-block;
+  font: 600 var(--fs-xs)/16px var(--mono);
+  letter-spacing: 0.05em;
+  padding: 0 var(--sp-1);
+  border-radius: var(--r-sm);
+  background: var(--sunken);
+  color: var(--text-3);
+  box-shadow: inset 0 0 0 1px var(--stroke);
+}
+.v-empty { border-bottom: 1px dashed var(--text-3); color: var(--text-3); }
+.v-large { font-size: var(--fs-xs); color: var(--info); }
+
+/* ---------- 编辑态：accent 软底 + 同色系描边，两处网格一致 ---------- */
+.grid-table td:has(.editor) {
+  max-width: none;
+  overflow: visible;
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.editor { display: flex; gap: var(--sp-1); align-items: center; }
+.grid-table .editor input,
+.grid-table .editor .btn { height: calc(var(--row-h) - 4px); }
+.editor input { width: 160px; }
+
+/* ---------- 单元格菜单：overlay 表面浮层 ---------- */
 .cell-menu {
   position: fixed;
   z-index: var(--z-menu);
   display: flex;
   flex-direction: column;
-  min-width: 140px;
+  min-width: 160px;
   padding: var(--sp-1);
-  background: var(--panel);
-  border: 1px solid var(--line-2);
-  border-radius: var(--r-sm);
+  background: var(--surface-overlay);
+  border: 1px solid var(--stroke-strong);
+  border-radius: var(--r-md);
   box-shadow: var(--shadow);
 }
-.cell-menu button { text-align: left; padding: var(--sp-1) var(--sp-2); border-radius: var(--r-sm); }
-.cell-menu button:hover { background: var(--hover); }
+.cell-menu button {
+  display: flex;
+  align-items: center;
+  height: var(--control-h-sm);
+  text-align: left;
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-sm);
+}
+.cell-menu button:hover { background: var(--active); }
 .menu-error { margin: var(--sp-1) 0 0; color: var(--err); font-size: var(--fs-xs); }
-.grid-table td:has(.editor) { max-width: none; overflow: visible; }
-.th-btn { display: inline-flex; align-items: center; gap: var(--sp-1); width: 100%; text-align: left; font-weight: 600; }
-.th-btn:hover { color: var(--accent-text); }
-.grid-empty { text-align: center; color: var(--text-3); height: var(--row-h); }
 
 /* ---------- 行状态 ---------- */
 .row-insert td { background: var(--ok-soft); }
@@ -137,34 +268,20 @@
 }
 .row-flag.del { background: var(--err); }
 
-/* ---------- 单元格 ---------- */
-.cell-btn { display: block; width: 100%; text-align: left; background: none; border-radius: 0; }
-.cell-btn.on { box-shadow: inset 0 0 0 2px var(--accent); border-radius: var(--r-sm); }
-.v-null {
-  display: inline-block;
-  font: 600 var(--fs-xs)/17px var(--font);
-  letter-spacing: 0.04em;
-  padding: 0 5px;
-  border-radius: var(--r-sm);
-  background: var(--sunken);
-  color: var(--text-3);
-  box-shadow: inset 0 0 0 1px var(--line);
-}
-.v-empty { border-bottom: 1px dashed var(--text-3); color: var(--text-3); }
-.v-large { font-size: var(--fs-xs); color: var(--info); }
+/* ---------- 空态 / 加载态 ---------- */
+.grid-empty { text-align: center; color: var(--text-3); height: auto; padding: var(--sp-4); font-size: var(--fs-sm); }
+.grid-empty .btn { margin-left: var(--sp-2); }
 
-/* ---------- 编辑中 ---------- */
-.editor { display: flex; gap: var(--sp-1); align-items: center; }
-.editor input { height: var(--control-h-sm); width: 160px; }
-
-/* ---------- 底部状态 ---------- */
+/* ---------- 底部状态与分页计数条 ---------- */
 .grid-foot {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
   flex-wrap: wrap;
-  padding: var(--sp-2) var(--sp-3);
-  border-top: 1px solid var(--line);
+  min-height: calc(var(--control-h) + 2px);
+  padding: var(--sp-1) var(--sp-3);
+  border-top: 1px solid var(--line-2);
+  background: var(--panel-2);
   font-size: var(--fs-xs);
   color: var(--text-2);
 }
@@ -201,7 +318,7 @@
 
 /* ---------- 值查看器 ---------- */
 .inspector {
-  border-top: 1px solid var(--line);
+  border-top: 1px solid var(--line-2);
   padding: var(--sp-2) var(--sp-3) var(--sp-3);
   background: var(--panel-2);
 }
@@ -209,15 +326,18 @@
 .inspector textarea {
   width: 100%;
   min-height: 72px;
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--stroke);
   border-radius: var(--r);
-  background: var(--panel);
+  background: var(--sunken);
   color: var(--text);
   font-family: var(--mono);
   font-size: var(--fs-sm);
   padding: var(--sp-2) var(--sp-3);
   resize: vertical;
+  box-shadow: inset 0 1px 2px color-mix(in srgb, var(--press) 30%, transparent);
+  transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
 }
+.inspector textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--ring); }
 .inspector-actions { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; margin-top: var(--sp-2); }
 .copy-message { font-size: var(--fs-xs); color: var(--ok); }
 .legend {
@@ -230,7 +350,7 @@
   color: var(--text-3);
 }
 
-/* ---------- 提交预览 ---------- */
+/* ---------- 提交预览浮层：overlay 表面 ---------- */
 .overlay {
   position: fixed;
   inset: 0;
@@ -246,10 +366,10 @@
   width: min(720px, 100%);
   max-height: min(88vh, 880px);
   overflow: auto;
-  background: var(--panel);
+  background: var(--surface-overlay);
   color: var(--text);
   border-radius: var(--r-xl);
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--stroke-strong);
   box-shadow: var(--shadow-lg);
   display: flex;
   flex-direction: column;
@@ -258,8 +378,8 @@
 .sheet h2 { margin: 0; font-size: var(--fs-lg); letter-spacing: -0.01em; }
 .sheet header,
 .sheet footer { display: flex; gap: var(--sp-2); align-items: center; padding: var(--sp-3) var(--sp-4); }
-.sheet header { border-bottom: 1px solid var(--line); }
-.sheet footer { border-top: 1px solid var(--line); background: var(--panel-2); }
+.sheet header { border-bottom: 1px solid var(--line-2); }
+.sheet footer { border-top: 1px solid var(--line-2); background: color-mix(in srgb, var(--surface-overlay) 94%, var(--text) 6%); border-radius: 0 0 var(--r-xl) var(--r-xl); }
 .sheet .body { padding: var(--sp-3) var(--sp-4); display: flex; flex-direction: column; gap: var(--sp-2); overflow: auto; }
 .sheet-error {
   margin: 0;
@@ -291,5 +411,3 @@
 }
 
 .grid-table .virtual-spacer td { padding: 0; border: 0; }
-.grid-table .row-number { width: 48px; min-width: 48px; text-align: right; color: var(--text-3); background: var(--panel-2); font-size: 10px; user-select: none; }
-.grid-table .sort-arrow { margin-left: auto; color: var(--accent-text); }
