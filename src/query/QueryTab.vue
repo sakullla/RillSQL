@@ -250,10 +250,11 @@ const sendRangeField = StateField.define<DecorationSet>({
   provide: (field) => EditorView.decorations.from(field),
 });
 
+/* 编辑器走 sunken 下沉井表面（tokens：编辑器/井下沉），与结果区的 panel 面板拉开层级。 */
 const shellTheme = EditorView.theme({
-  "&": { backgroundColor: "var(--panel)", color: "var(--text)", height: "100%" },
+  "&": { backgroundColor: "var(--surface-sunken)", color: "var(--text)", height: "100%" },
   ".cm-content": { fontFamily: "var(--mono)", fontSize: "var(--editor-font)", caretColor: "var(--text)" },
-  ".cm-gutters": { backgroundColor: "var(--panel)", color: "var(--text-3)", borderRight: "1px solid var(--line)" },
+  ".cm-gutters": { backgroundColor: "var(--surface-sunken)", color: "var(--text-3)", borderRight: "1px solid var(--line)" },
   "&.cm-focused": { outline: "none" },
 });
 
@@ -1087,11 +1088,11 @@ onBeforeUnmount(() => {
       </div>
       <span v-if="connectionStatus" class="conn-state" :class="`st-${connectionStatus}`"><i></i>{{ CONNECTION_STATUS_TEXT[connectionStatus] }}</span>
       <span class="grow"></span>
-      <button class="btn" type="button" data-action="format" title="格式化选中的 SQL；没有选中时格式化全部" @click="formatEditor">格式化</button>
-      <button class="btn" type="button" data-action="open-file" title="从 .sql 或 .txt 文件载入 SQL；只写进当前标签的草稿，不会执行" :disabled="running || submitting" @click="pickSqlFile">打开</button>
+      <button class="btn" type="button" data-action="format" title="格式化选中的 SQL；没有选中时格式化全部" @click="formatEditor"><Icon name="format" />格式化</button>
+      <button class="btn" type="button" data-action="open-file" title="从 .sql 或 .txt 文件载入 SQL；只写进当前标签的草稿，不会执行" :disabled="running || submitting" @click="pickSqlFile"><Icon name="file" />打开</button>
       <input ref="openFileInput" class="hidden-file-input" type="file" data-action="open-file-input" :accept="SQL_FILE_ACCEPT" aria-label="打开 SQL 文件" @change="onSqlFile" />
       <div ref="historyRoot" class="q-pop">
-        <button class="btn" type="button" data-action="history" title="从查询历史载入 SQL；只写进草稿，不会执行" :disabled="running || submitting" @click="toggleHistoryPanel">历史</button>
+        <button class="btn" type="button" data-action="history" title="从查询历史载入 SQL；只写进草稿，不会执行" :disabled="running || submitting" @click="toggleHistoryPanel"><Icon name="history" />历史</button>
         <div v-if="historyOpen" class="pop-menu history-menu" role="menu" aria-label="查询历史" @keydown="onHistoryKey">
           <div class="menu-head">查询历史 · 载入只写进草稿，不会执行</div>
           <p v-if="historyError" class="pop-error" role="alert">历史没有读出来：{{ historyError }}<button class="btn sm" type="button" data-action="retry-history" @click="loadHistory">重试</button></p>
@@ -1110,7 +1111,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <div ref="savedRoot" class="q-pop">
-        <button class="btn" type="button" data-action="saved" title="按名称保存当前 SQL，或打开已保存的查询" :disabled="running || submitting" @click="toggleSavedPanel">保存</button>
+        <button class="btn" type="button" data-action="saved" title="按名称保存当前 SQL，或打开已保存的查询" :disabled="running || submitting" @click="toggleSavedPanel"><Icon name="save" />保存</button>
         <div v-if="savedOpen" class="pop-menu saved-menu" role="menu" aria-label="保存的查询" @keydown="onSavedKey">
           <form class="pop-form" @submit.prevent="saveNamedQuery">
             <label>保存当前 SQL 为<input v-model="savedNameValue" type="text" aria-label="保存查询的名称" data-action="saved-name" placeholder="名称" /></label>
@@ -1138,10 +1139,10 @@ onBeforeUnmount(() => {
           </template>
         </div>
       </div>
-      <button class="btn" type="button" data-action="plan" title="查看一条语句的执行计划，不使用 ANALYZE" :disabled="running || submitting" @click="requestPlan">执行计划</button>
+      <button class="btn" type="button" data-action="plan" title="查看一条语句的执行计划，不使用 ANALYZE" :disabled="running || submitting" @click="requestPlan"><Icon name="plan" />执行计划</button>
       <button class="btn" type="button" data-action="analyze" title="在服务器上实际执行并分析这一条语句" :disabled="running || submitting" @click="requestAnalyze">实际执行并分析</button>
       <div v-if="!running" ref="runRoot" class="run-group">
-        <button class="btn primary run-main" type="button" data-action="run" :disabled="submitting" @click="execute('auto')"><span aria-hidden="true">▶</span>{{ submitting ? "正在执行…" : hasSelection ? "执行选中" : "执行" }} <ChordKeys chord="Mod+Enter" /></button>
+        <button class="btn primary run-main" type="button" data-action="run" :disabled="submitting" @click="execute('auto')"><Icon name="play" class="run-glyph" />{{ submitting ? "正在执行…" : hasSelection ? "执行选中" : "执行" }} <ChordKeys chord="Mod+Enter" /></button>
         <button
           class="btn run-more"
           type="button"
@@ -1196,14 +1197,14 @@ onBeforeUnmount(() => {
         <button class="btn primary" type="button" data-action="variables-confirm" @click="confirmVariables">继续</button>
       </div>
     </div>
-    <p v-if="notice" class="q-banner">{{ notice }}</p>
-    <p v-if="actionError" class="q-banner" role="alert">{{ actionError }}</p>
+    <p v-if="notice" class="q-banner is-notice">{{ notice }}</p>
+    <p v-if="actionError" class="q-banner is-error" role="alert">{{ actionError }}</p>
     <p v-if="hintVisible" class="q-hint" :data-keywords-only="hint.keywordsOnly" :title="hint.note">{{ hint.note }}</p>
     <div ref="host" class="cm-host"></div>
     <div class="editor-position"><span class="q-guide">{{ operationGuide }}</span><span class="mono">Ln {{ cursor.line }}, Col {{ cursor.column }}</span></div>
     <div class="query-splitter" role="separator" tabindex="0" aria-label="调整编辑器与结果区域高度" aria-orientation="horizontal" :aria-valuenow="editorPercent" :aria-valuemin="20" :aria-valuemax="70" @pointerdown="resizeEditor" @keydown.up.prevent="editorPercent = Math.max(20, editorPercent - 5)" @keydown.down.prevent="editorPercent = Math.min(70, editorPercent + 5)"><span></span></div>
     <section class="q-results" aria-label="执行结果">
-      <div class="results-heading"><span><Icon name="table" />结果</span><span v-if="run" class="q-summary" :data-status="run.status">{{ summary }}</span><span v-else class="muted">等待执行</span><span class="grow"></span><span class="muted">只读结果</span></div>
+      <div class="results-heading"><span><Icon name="table" />结果</span><span v-if="run" class="q-summary" :data-status="run.status">{{ summary }}</span><span v-else class="muted">等待执行</span><span class="grow"></span><span class="badge">只读结果</span></div>
       <template v-if="run">
         <div v-if="run.statements.length > 1" class="result-tabs" role="tablist" aria-label="语句结果"><button v-for="(statement, index) in run.statements" :key="index" role="tab" :aria-selected="resultIndex === index" @click="resultIndex = index">结果 {{ index + 1 }} <span>{{ statement.columns.length ? `${statement.rows.length} 行` : statusLabel(statement.status) }}</span></button></div>
         <p v-if="run.pollError" class="q-note" role="alert">状态刷新失败：{{ run.pollError }}。已读取的结果保留，可以稍后重试读取。</p>
@@ -1280,11 +1281,17 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+/* 查询页 chrome（R1）：四层空间层级——工具条 chrome / 编辑器 sunken 井 / 结果区 panel / 浮层 overlay。
+   一律引用 tokens.css 令牌；控件描边走 --stroke/--stroke-strong，按压走 --press-*。 */
 .query-pane { display: flex; flex-direction: column; flex: 1; min-height: 0; }
-.q-toolbar { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--line); }
+
+/* ---------- 工具条：chrome 层实体控件带 ---------- */
+.q-toolbar { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; padding: var(--sp-2) var(--sp-3); min-height: calc(var(--control-h) + var(--sp-3)); border-bottom: 1px solid var(--line); background: var(--surface-chrome); }
+.q-toolbar .btn :deep(.i) { width: 14px; height: 14px; color: var(--text-3); }
 .q-target { position: relative; min-width: 0; }
-.target-btn { display: flex; align-items: center; gap: var(--sp-2); height: var(--control-h); max-width: 420px; min-width: 0; padding: 0 var(--sp-2); border: 1px solid var(--line-2); border-radius: var(--r); background: var(--panel); font-size: var(--fs-sm); transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease); }
-.target-btn:hover:not(:disabled) { border-color: var(--text-3); background: var(--hover); }
+.target-btn { display: flex; align-items: center; gap: var(--sp-2); height: var(--control-h); max-width: 420px; min-width: 0; padding: 0 var(--sp-2); border: 1px solid var(--stroke); border-radius: var(--r); background: var(--surface-panel); font-size: var(--fs-sm); box-shadow: var(--shadow-sm); transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease); }
+.target-btn:hover:not(:disabled) { border-color: var(--stroke-strong); background: var(--hover); }
+.target-btn:active:not(:disabled) { background: var(--active); box-shadow: inset 0 1px 2px var(--press); }
 .target-btn.on { border-color: var(--accent); box-shadow: 0 0 0 2px var(--ring); }
 .target-btn.none { border-style: dashed; color: var(--text-2); }
 .target-btn:disabled { opacity: 0.7; cursor: not-allowed; }
@@ -1294,12 +1301,14 @@ onBeforeUnmount(() => {
 .tg-sep { color: var(--text-3); }
 .tg-caret { width: 14px; height: 14px; margin-left: auto; color: var(--text-3); fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
 .target-btn :deep(.i) { width: 14px; height: 14px; color: var(--text-3); }
-.eng { --engc: var(--text-2); display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: var(--r-sm); font: 700 var(--fs-xs)/1 var(--font); color: var(--engc); background: color-mix(in srgb, var(--engc) 14%, transparent); flex-shrink: 0; }
+.eng { --engc: var(--text-2); display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: var(--r-sm); font: 700 var(--fs-xs)/1 var(--font); color: var(--engc); background: color-mix(in srgb, var(--engc) 14%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--engc) 24%, transparent); flex-shrink: 0; }
 .eng-postgres { --engc: var(--eng-postgres); }
 .eng-mysql { --engc: var(--eng-mysql); }
 .eng-mariadb { --engc: var(--eng-mariadb); }
 .eng-sqlite { --engc: var(--eng-sqlite); }
-.target-menu, .run-menu { position: absolute; z-index: 30; top: calc(100% + var(--sp-1)); left: 0; min-width: 280px; max-width: 420px; max-height: 320px; overflow: auto; padding: var(--sp-1); background: var(--panel); border: 1px solid var(--line-2); border-radius: var(--r-md); box-shadow: var(--shadow); animation: pop-in var(--dur-fast) var(--ease-out); }
+
+/* ---------- 浮层：overlay 表面 + md 圆角 + 单档浮层阴影 ---------- */
+.target-menu, .run-menu { position: absolute; z-index: var(--z-menu); top: calc(100% + var(--sp-1)); left: 0; min-width: 280px; max-width: 420px; max-height: 320px; overflow: auto; padding: var(--sp-1); background: var(--surface-overlay); border: 1px solid var(--stroke-strong); border-radius: var(--r-md); box-shadow: var(--shadow); animation: pop-in var(--dur-fast) var(--ease-out); }
 .target-empty { margin: 0; padding: var(--sp-2); font-size: var(--fs-sm); color: var(--text-3); }
 .target-option { display: flex; align-items: center; gap: var(--sp-2); width: 100%; min-height: 44px; padding: var(--sp-2); border-radius: var(--r); text-align: left; }
 .target-option.on { background: var(--hover); }
@@ -1310,19 +1319,29 @@ onBeforeUnmount(() => {
 .mi-title :deep(.i) { width: 13px; height: 13px; color: var(--text-3); flex-shrink: 0; }
 .target-option small { font-size: var(--fs-xs); color: var(--text-3); }
 .target-option .check { width: 14px; height: 14px; margin-left: auto; color: var(--accent); flex-shrink: 0; }
+
+/* ---------- 执行拆分按钮：主段 primary + 更多段同色系延伸（不带 primary 类） ---------- */
 .run-group { position: relative; display: flex; }
 .run-group .run-main { border-radius: var(--r) 0 0 var(--r); }
-.run-group .run-more { border-radius: 0 var(--r) var(--r) 0; margin-left: -1px; padding: 0 var(--sp-2); }
-.run-group .run-more .tg-caret { margin-left: 0; color: var(--text-2); }
+.run-group .run-more { border-radius: 0 var(--r) var(--r) 0; margin-left: -1px; padding: 0 var(--sp-2); border-color: transparent; background: var(--accent); color: var(--on-accent); box-shadow: var(--shadow-sm), inset 0 1px 0 color-mix(in srgb, var(--on-accent) 24%, transparent), inset 1px 0 0 color-mix(in srgb, var(--on-accent) 22%, transparent); }
+.run-group .run-more:hover:not(:disabled) { background: var(--accent-hover); border-color: transparent; }
+.run-group .run-more:active:not(:disabled) { background: var(--accent-active); box-shadow: inset 0 1px 2px var(--press-accent); }
+.run-group .run-more:disabled { background: var(--disabled-bg); color: var(--disabled-fg); border-color: var(--line); box-shadow: none; }
+.run-group .run-more .tg-caret { margin-left: 0; color: var(--on-accent); }
+.run-glyph { width: 13px; height: 13px; }
 .run-menu { min-width: 220px; }
 .run-item { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; padding: var(--sp-2); border-radius: var(--r); text-align: left; font-size: var(--fs-sm); }
 .run-item:hover { background: var(--hover); }
+.run-item:active { box-shadow: inset 0 1px 2px var(--press); }
 .run-item small { font-size: var(--fs-xs); color: var(--text-3); }
+
+/* ---------- 历史 / 保存浮出：overlay 表面 ---------- */
 .q-pop { position: relative; display: inline-flex; }
 .hidden-file-input { display: none; }
-.pop-menu { position: absolute; z-index: 30; top: calc(100% + var(--sp-1)); right: 0; min-width: 300px; max-width: 440px; max-height: 360px; overflow: auto; padding: var(--sp-1); background: var(--panel); border: 1px solid var(--line-2); border-radius: var(--r-md); box-shadow: var(--shadow); animation: pop-in var(--dur-fast) var(--ease-out); }
+.pop-menu { position: absolute; z-index: var(--z-menu); top: calc(100% + var(--sp-1)); right: 0; min-width: 300px; max-width: 440px; max-height: 360px; overflow: auto; padding: var(--sp-1); background: var(--surface-overlay); border: 1px solid var(--stroke-strong); border-radius: var(--r-md); box-shadow: var(--shadow); animation: pop-in var(--dur-fast) var(--ease-out); }
 .pop-item { display: flex; align-items: flex-start; gap: var(--sp-2); width: 100%; padding: var(--sp-2); border-radius: var(--r); text-align: left; }
 .pop-item:hover { background: var(--hover); }
+.pop-item:active { box-shadow: inset 0 1px 2px var(--press); }
 .pop-item .badge { flex-shrink: 0; }
 .pop-copy { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
 .pop-title { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; font-size: var(--fs-sm); }
@@ -1337,14 +1356,63 @@ onBeforeUnmount(() => {
 .pop-form label { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-xs); color: var(--text-2); }
 .pop-form p { margin: 0; font-size: var(--fs-xs); }
 .pop-form .btn { align-self: flex-start; }
+
+/* ---------- 提示条 / 横幅 ---------- */
 .q-note, .q-hint, .q-banner { margin: 0; font-size: var(--fs-sm); color: var(--text-2); }
-.q-hint, .q-banner { padding: var(--sp-1) var(--sp-3); }
-.q-banner { color: var(--text); background: var(--sunken); }
+.q-hint, .q-banner { padding: var(--sp-1) var(--sp-4); }
+.q-banner { color: var(--text); background: var(--surface-sunken); box-shadow: inset 2px 0 0 var(--line-2); }
+.q-banner.is-error { color: var(--err); background: var(--err-soft); box-shadow: inset 2px 0 0 var(--err); }
+
+/* ---------- 编辑器：sunken 下沉井 ---------- */
+.query-pane .cm-host { flex: 0 1 var(--editor-share); min-height: 90px; margin: var(--sp-2) var(--sp-3) 0; border: 1px solid var(--line); border-radius: var(--r-md); overflow: hidden; background: var(--surface-sunken); box-shadow: inset 0 1px 2px color-mix(in srgb, var(--press) 24%, transparent); }
+.query-pane :deep(.cm-content) { padding-top: var(--sp-3); line-height: 1.8; }
+.query-pane :deep(.cm-line) { padding-left: var(--sp-4); }
+.query-pane :deep(.cm-gutters) { background: var(--surface-sunken); color: var(--text-3); border-right: 1px solid var(--line); min-width: 44px; }
+.query-pane :deep(.cm-activeLine), .query-pane :deep(.cm-activeLineGutter) { background: var(--sel); }
+.query-pane :deep(.cm-activeLineGutter) { color: var(--text); }
+.query-pane :deep(.cm-cursor) { border-left-color: var(--accent); }
+.query-pane :deep(.cm-selectionBackground), .query-pane :deep(.cm-focused .cm-selectionBackground) { background: var(--sel-strong) !important; }
+.query-pane :deep(.cm-send-range) { background: color-mix(in srgb, var(--accent) 22%, transparent); border-radius: 2px; }
+.editor-position { display: flex; justify-content: space-between; align-items: center; gap: var(--sp-2); padding: var(--sp-1) var(--sp-4); color: var(--text-3); font-size: var(--fs-xs); }
+.q-guide { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+/* ---------- 分隔条：chrome 层抓手 ---------- */
+.query-splitter { height: 9px; flex-shrink: 0; display: grid; place-items: center; background: var(--surface-chrome); border-block: 1px solid var(--line); cursor: row-resize; touch-action: none; transition: background var(--dur-fast) var(--ease); }
+.query-splitter span { height: 3px; width: 34px; background: var(--line-2); border-radius: var(--r-full); transition: background var(--dur-fast) var(--ease); }
+.query-splitter:hover, .query-splitter:focus-visible { background: var(--accent-soft); }
+.query-splitter:hover span, .query-splitter:focus-visible span { background: var(--accent); }
+
+/* ---------- 结果区：panel 层 ---------- */
+.query-pane .q-results { flex: 1; min-height: 130px; padding: 0; gap: 0; border: 0; background: var(--surface-panel); }
 .q-results { min-height: 120px; overflow: auto; border-top: 1px solid var(--line); padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); }
+.results-heading { display: flex; align-items: center; gap: var(--sp-4); padding: var(--sp-2) var(--sp-4); border-bottom: 1px solid var(--line); font-size: var(--fs-xs); flex-shrink: 0; background: var(--surface-chrome); color: var(--text-2); }
+.results-heading > span:first-child { display: inline-flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); font-weight: 600; color: var(--text); }
+.results-heading > span:first-child :deep(.i) { width: 14px; height: 14px; color: var(--text-3); }
 .q-summary { margin: 0; font-size: var(--fs-md); font-weight: 600; color: var(--text); }
 .q-summary[data-status="error"] { color: var(--err); }
 .q-summary[data-status="unknown"] { color: var(--warn); }
-.q-details { font-size: var(--fs-sm); }
+.results-heading .q-summary { font-size: var(--fs-xs); font-weight: 500; color: var(--text-2); }
+.results-heading .q-summary[data-status="error"] { color: var(--err); }
+.results-heading .q-summary[data-status="unknown"] { color: var(--warn); }
+
+/* 语句结果页签：下缘指示条与结果区上缘连成一体 */
+.result-tabs { display: flex; flex-shrink: 0; gap: 2px; padding: 0 var(--sp-3); border-bottom: 1px solid var(--line); overflow: auto; background: var(--surface-chrome); }
+.result-tabs button { padding: var(--sp-2) var(--sp-3); font-size: var(--fs-xs); color: var(--text-2); white-space: nowrap; border-bottom: 2px solid transparent; border-radius: var(--r-sm) var(--r-sm) 0 0; transition: color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease); }
+.result-tabs button:hover { color: var(--text); border-bottom-color: var(--line-2); background: var(--hover); }
+.result-tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); background: var(--surface-panel); box-shadow: 0 1px 0 0 var(--surface-panel); }
+.result-tabs span { font-size: var(--fs-xs); color: var(--text-3); margin-left: var(--sp-1); }
+
+/* 执行计划视图 */
+.plan-view { padding: var(--sp-3) var(--sp-4); overflow: auto; }
+.plan-caption { margin: 0 0 var(--sp-2); font-size: var(--fs-sm); color: var(--text-2); }
+.plan-tree { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: var(--fs-xs); }
+.plan-tree li { display: flex; gap: var(--sp-2); padding-block: 2px; }
+.plan-view table { border-collapse: collapse; font-family: var(--mono); font-size: var(--fs-xs); }
+.plan-view th, .plan-view td { border: 1px solid var(--line); padding: var(--sp-1) var(--sp-2); text-align: left; vertical-align: top; }
+
+/* 详情披露与逐条语句时间线 */
+.q-details { flex-shrink: 0; font-size: var(--fs-sm); border: 0; border-top: 1px solid var(--line); border-radius: 0; background: var(--surface-panel); }
+.q-details .disclosure-body { max-height: 180px; overflow: auto; }
 .q-timeline { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
 .q-step { display: flex; flex-direction: column; gap: var(--sp-1); }
 .q-step-head { display: flex; align-items: center; gap: var(--sp-2); }
@@ -1357,45 +1425,15 @@ onBeforeUnmount(() => {
 .q-sql { margin: 0; white-space: pre-wrap; font-family: var(--mono); font-size: var(--fs-xs); color: var(--text-2); }
 .q-cancel-detail { margin-top: var(--sp-3); padding-top: var(--sp-2); border-top: 1px solid var(--line); font-size: var(--fs-sm); color: var(--text-2); }
 .q-cancel-detail p { margin: 0 0 var(--sp-1); }
-.query-pane .q-toolbar { background: var(--panel); min-height: 46px; }
-.query-pane .cm-host { flex: 0 1 var(--editor-share); min-height: 90px; }
-.query-pane :deep(.cm-content) { padding-top: 14px; line-height: 1.8; }
-.query-pane :deep(.cm-line) { padding-left: 16px; }
-.query-pane :deep(.cm-gutters) { background: var(--panel-2); color: var(--text-3); border-right: 1px solid var(--line); min-width: 44px; }
-.query-pane :deep(.cm-activeLine), .query-pane :deep(.cm-activeLineGutter) { background: var(--sel); }
-.query-pane :deep(.cm-activeLineGutter) { color: var(--text); }
-.query-pane :deep(.cm-cursor) { border-left-color: var(--accent); }
-.query-pane :deep(.cm-selectionBackground), .query-pane :deep(.cm-focused .cm-selectionBackground) { background: var(--sel-strong) !important; }
-.editor-position { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 4px 16px; color: var(--text-3); font-size: 10px; }
-.q-guide { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.query-splitter { height: 9px; flex-shrink: 0; display: grid; place-items: center; background: var(--panel-2); border-block: 1px solid var(--line); cursor: row-resize; touch-action: none; transition: background var(--dur-fast) var(--ease); }
-.query-splitter span { height: 3px; width: 34px; background: var(--line-2); border-radius: var(--r-full); transition: background var(--dur-fast) var(--ease); }
-.query-splitter:hover, .query-splitter:focus-visible { background: var(--accent-soft); }
-.query-splitter:hover span, .query-splitter:focus-visible span { background: var(--accent); }
-.query-pane .q-results { flex: 1; min-height: 130px; padding: 0; gap: 0; border: 0; }
-.results-heading { display: flex; align-items: center; gap: 20px; padding: 8px 16px; border-bottom: 1px solid var(--line); font-size: 11px; flex-shrink: 0; background: var(--panel-2); }
-.plan-view { padding: 12px 16px; overflow: auto; }
-.plan-caption { margin: 0 0 8px; font-size: var(--fs-sm); color: var(--text-2); }
-.plan-tree { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: var(--fs-xs); }
-.plan-tree li { display: flex; gap: 8px; padding-block: 2px; }
-.analyze-dialog { margin: var(--sp-2) var(--sp-3); padding: var(--sp-3); border: 1px solid var(--line-2); border-radius: var(--r-md); background: var(--panel); }
-.analyze-dialog p { margin: 0 0 var(--sp-2); }
+
+/* ---------- 行内确认面板：overlay 表面卡片 ---------- */
+.analyze-dialog { margin: var(--sp-2) var(--sp-3); padding: var(--sp-4); max-width: 560px; border: 1px solid var(--stroke-strong); border-radius: var(--r-lg); background: var(--surface-overlay); box-shadow: var(--shadow); }
+.analyze-dialog p { margin: 0 0 var(--sp-2); font-size: var(--fs-sm); color: var(--text-2); line-height: var(--lh); }
 .analyze-actions { display: flex; gap: var(--sp-2); }
 .variable-fields { display: flex; flex-direction: column; gap: var(--sp-2); margin: 0 0 var(--sp-2); }
 .variable-fields label { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-xs); color: var(--text-2); }
 .variable-fields input { font-family: var(--mono); }
-.query-pane :deep(.cm-send-range) { background: color-mix(in srgb, var(--accent) 22%, transparent); border-radius: 2px; }
-.plan-view table { border-collapse: collapse; font-family: var(--mono); font-size: var(--fs-xs); }
-.plan-view th, .plan-view td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; vertical-align: top; }
-.results-heading > span:first-child { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; }
-.results-heading .q-summary { font-size: 11px; font-weight: 400; }
-.result-tabs { display: flex; flex-shrink: 0; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--line); overflow: auto; background: var(--panel-2); }
-.result-tabs button { padding: 8px 12px; font-size: 11px; white-space: nowrap; border-bottom: 2px solid transparent; border-radius: var(--r) var(--r) 0 0; transition: color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease); }
-.result-tabs button:hover { color: var(--text); border-bottom-color: var(--line-2); }
-.result-tabs button[aria-selected="true"] { border-color: var(--accent); color: var(--accent-text); }
-.result-tabs span { font-size: 10px; color: var(--text-3); margin-left: 6px; }
-.q-details { flex-shrink: 0; border: 0; border-top: 1px solid var(--line); border-radius: 0; }
-.q-details .disclosure-body { max-height: 180px; overflow: auto; }
-.run-main :deep(kbd) { background: transparent; color: inherit; opacity: .75; border-color: currentColor; }
+
+.run-main :deep(kbd) { background: transparent; color: inherit; opacity: .75; border-color: currentColor; box-shadow: none; }
 @media (max-width: 800px) { .run-main :deep(.kbd) { display: none; } .target-btn { max-width: 290px; } .q-toolbar .conn-state { display: none; } .editor-position > span:first-child { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; } }
 </style>
