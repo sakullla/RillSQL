@@ -550,7 +550,7 @@ watch(
     <div class="page-inner">
       <div class="page-head">
         <div><h1>连接管理</h1><p>一个入口，管理你的本地与远程数据库。</p></div>
-        <div class="ph-actions"><button class="btn" type="button" data-action="conn-import" :disabled="busy" @click="openImport"><ConnIcon name="file" />导入连接</button><input ref="importInput" hidden type="file" accept=".json,.ncx,.xml,application/json,text/xml" data-action="conn-import-file" aria-label="选择 DBeaver 或 Navicat 连接文件" @change="onImportPicked" /><button class="btn" type="button" @click="openEditor(undefined, 'sqlite')"><ConnIcon name="file" />打开 SQLite</button><button class="btn primary" type="button" data-action="conn-new" @click.stop="openEditor()"><ConnIcon name="plus" />新建连接</button></div>
+        <div class="ph-actions"><button class="btn" type="button" data-action="conn-import" :disabled="busy" @click="openImport"><ConnIcon name="upload" />导入连接</button><input ref="importInput" hidden type="file" accept=".json,.ncx,.xml,application/json,text/xml" data-action="conn-import-file" aria-label="选择 DBeaver 或 Navicat 连接文件" @change="onImportPicked" /><button class="btn" type="button" @click="openEditor(undefined, 'sqlite')"><ConnIcon name="file" />打开 SQLite</button><button class="btn primary" type="button" data-action="conn-new" @click.stop="openEditor()"><ConnIcon name="plus" />新建连接</button></div>
       </div>
       <div class="connection-overview"><span><b>{{ connections.length }}</b> 个连接</span><span class="online-total"><i></i><b>{{ connectedCount }}</b> 个已连接</span><span class="grow"></span><span><ConnIcon name="lock" />凭据保存在本机</span></div>
       <div class="connection-filters">
@@ -572,7 +572,7 @@ watch(
         >
           <header>
             <span class="eng lg" :class="`eng-${item.engine}`">{{ engineMeta(item.engine).short }}</span>
-            <div class="cc-title"><h3>{{ item.name }}</h3><p>{{ engineMeta(item.engine).label }} <span class="env" :class="`env-${envView(item.env).tone}`">{{ envView(item.env).label }}</span></p></div>
+            <div class="cc-title"><h3>{{ item.name }}</h3><p>{{ engineMeta(item.engine).label }} <span class="env xs" :class="`env-${envView(item.env).tone}`">{{ envView(item.env).label }}</span></p></div>
           </header>
           <div class="cc-endpoint"><p v-if="item.engine === 'sqlite'" class="cc-addr mono" :title="item.filePath ?? ''">{{ item.filePath }}</p><p v-else class="cc-addr mono" :title="`${item.host}:${item.port}`">{{ item.host }}:{{ item.port }}</p><small>{{ item.engine === 'sqlite' ? '本地文件' : item.database || '未指定默认数据库' }}</small></div>
           <div class="cc-badges">
@@ -766,8 +766,8 @@ watch(
         <div class="modal-body">
           <p v-if="dialogError" class="field-err modal-error" role="alert" data-dialog-error>{{ dialogError }}</p>
           <ul class="facts">
-            <li><ConnIcon name="check" />会删除：本机保存的这条连接配置{{ deleteTarget.passwordSaved ? "，以及系统凭据库里保存的对应密码" : "" }}。</li>
-            <li><ConnIcon name="x" />不会删除：{{ deleteTarget.engine === "sqlite" ? `SQLite 文件 ${deleteTarget.filePath}` : "数据库本身和其中的任何数据" }}。</li>
+            <li class="fact-del"><ConnIcon name="trash" />会删除：本机保存的这条连接配置{{ deleteTarget.passwordSaved ? "，以及系统凭据库里保存的对应密码" : "" }}。</li>
+            <li class="fact-keep"><ConnIcon name="shield" />不会删除：{{ deleteTarget.engine === "sqlite" ? `SQLite 文件 ${deleteTarget.filePath}` : "数据库本身和其中的任何数据" }}。</li>
           </ul>
         </div>
         <div class="modal-foot"><span class="grow"></span><button class="btn" type="button" @click="closeDialog(otherDialog)">取消</button><button class="btn danger" type="button" data-action="confirm-delete" @click="confirmDelete">删除配置</button></div>
