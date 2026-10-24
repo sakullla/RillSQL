@@ -244,7 +244,7 @@ async function confirm() {
         </button>
       </header>
       <div class="ex-body">
-        <p class="ex-note" data-import-target>目标：{{ connectionName }} / {{ objectName }} <span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span></p>
+        <p class="ex-target" data-import-target>目标：<b>{{ connectionName }}</b><span class="ex-target-sep" aria-hidden="true">/</span><b class="mono">{{ objectName }}</b> <span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span></p>
         <p v-if="parseError" class="ex-alert" role="alert">{{ parseError }}</p>
         <p v-if="resultText" class="ex-note" role="status" data-import-result>{{ resultText }}</p>
         <div class="ex-path">
@@ -301,29 +301,50 @@ async function confirm() {
 </template>
 
 <style scoped>
-.ex-overlay { position: fixed; inset: 0; background: var(--overlay); display: grid; place-items: center; z-index: var(--z-dialog); padding: var(--sp-4); }
-.ex-sheet { width: min(720px, 100%); max-height: min(88vh, 880px); display: flex; flex-direction: column; background: var(--panel); color: var(--text); border-radius: var(--r-xl); border: 1px solid var(--line-2); box-shadow: var(--shadow-lg); }
-.ex-head { display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line); }
+/* 对话框：与 base.css 的 dialog.modal 同一套 overlay 表面体系。 */
+.ex-overlay { position: fixed; inset: 0; background: var(--overlay); backdrop-filter: blur(3px); display: grid; place-items: center; z-index: var(--z-dialog); padding: var(--sp-4); }
+.ex-sheet { width: min(720px, 100%); max-height: min(88vh, 880px); display: flex; flex-direction: column; background: var(--surface-overlay); color: var(--text); border-radius: var(--r-xl); border: 1px solid var(--stroke-strong); box-shadow: var(--shadow-lg); animation: modal-in var(--dur) var(--ease-out); }
+.ex-head { display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line-2); }
 .ex-titles { flex: 1; min-width: 0; }
-.ex-titles h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; }
+.ex-titles h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.01em; }
 .ex-titles p { margin: var(--sp-1) 0 0; font-size: var(--fs-sm); color: var(--text-2); }
 .ex-body { padding: var(--sp-4) var(--sp-5); overflow: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
+.ex-foot { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-5); border-top: 1px solid var(--line-2); background: color-mix(in srgb, var(--surface-overlay) 94%, var(--text) 6%); border-radius: 0 0 var(--r-xl) var(--r-xl); }
+.ex-note { margin: 0; font-size: var(--fs-sm); color: var(--text-2); line-height: var(--lh); }
+.ex-alert { margin: 0; padding: var(--sp-2) var(--sp-3); background: var(--err-soft); color: var(--err); border: 1px solid var(--err-line); border-radius: var(--r); font-size: var(--fs-sm); line-height: var(--lh); }
 .ex-path :deep(.listbox),
 .map-table :deep(.listbox) { width: 100%; }
 .ex-path :deep(.listbox-trigger),
 .map-table :deep(.listbox-trigger) { width: 100%; justify-content: space-between; }
-.ex-foot { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-5); border-top: 1px solid var(--line); background: var(--panel-2); border-radius: 0 0 var(--r-xl) var(--r-xl); }
-.ex-note { margin: 0; font-size: var(--fs-sm); color: var(--text-2); line-height: var(--lh); }
-.ex-alert { margin: 0; padding: var(--sp-2) var(--sp-3); background: var(--err-soft); color: var(--err); border: 1px solid var(--err-line); border-radius: var(--r); font-size: var(--fs-sm); }
-.ex-scope { margin: 0; padding: 0; border: 0; display: flex; flex-direction: column; gap: var(--sp-2); }
-.ex-scope legend { padding: 0; margin-bottom: var(--sp-1); font-size: var(--fs-sm); font-weight: 600; }
-.ex-choice { display: flex; gap: var(--sp-2); align-items: flex-start; padding: var(--sp-3); border: 1px solid var(--line); border-radius: var(--r-md); }
-.ex-choice.on { border-color: var(--accent); background: var(--accent-soft); }
-.ex-choice b { font-size: var(--fs-sm); }
-.ex-choice small { display: block; color: var(--text-2); font-size: var(--fs-xs); }
+
+/* 写入目标条：panel 实体卡 + mono 对象名 */
+.ex-target { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; margin: 0; padding: var(--sp-2) var(--sp-3); border: 1px solid var(--stroke); border-radius: var(--r-md); background: var(--surface-panel); box-shadow: var(--shadow-sm); font-size: var(--fs-sm); color: var(--text-2); }
+.ex-target b { font-weight: 600; color: var(--text); }
+.ex-target .mono { font-size: var(--fs-xs); }
+.ex-target-sep { color: var(--text-3); }
+
+/* 格式选择：实体选择卡（隐藏原生单选，选中以强调描边 + 指示点表达） */
+.ex-scope { margin: 0; padding: 0; border: 0; display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
+.ex-scope legend { padding: 0; margin-bottom: var(--sp-1); font-size: var(--fs-sm); font-weight: 600; color: var(--text-3); }
+.ex-choice { position: relative; display: flex; gap: var(--sp-2); align-items: flex-start; padding: var(--sp-3); border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface-panel); cursor: pointer; transition: border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease); }
+.ex-choice:hover { border-color: var(--line-2); background: var(--hover); }
+.ex-choice.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent-soft) 45%, var(--surface-panel)); box-shadow: 0 0 0 1px var(--accent); }
+.ex-choice.on::after { content: ""; position: absolute; top: var(--sp-2); right: var(--sp-2); width: 6px; height: 6px; border-radius: var(--r-full); background: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent); }
+.ex-choice:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+.ex-choice input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+.ex-choice b { font-size: var(--fs-sm); font-weight: 600; }
+.ex-choice small { display: block; color: var(--text-2); font-size: var(--fs-xs); line-height: var(--lh); margin-top: 2px; }
 .ex-path { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-sm); color: var(--text-2); }
+.ex-path input[type="file"] { width: 100%; margin-top: var(--sp-1); min-height: var(--control-h); padding: var(--sp-1); border: 1px dashed var(--line-2); border-radius: var(--r); background: var(--surface-sunken); color: var(--text-2); font-size: var(--fs-xs); }
+.ex-path input[type="file"]::file-selector-button { font: 500 var(--fs-xs) var(--font); height: var(--control-h-sm); margin-right: var(--sp-2); padding: 0 var(--sp-3); border: 1px solid var(--stroke); border-radius: var(--r); background: var(--surface-panel); color: var(--text); cursor: pointer; }
+
+/* 映射表与预览井 */
 .map-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
-.map-table th, .map-table td { text-align: left; padding: var(--sp-1) var(--sp-2); border-bottom: 1px solid var(--line); }
-.preview-scroll { max-height: 180px; overflow: auto; }
+.map-table th { padding: var(--sp-1) var(--sp-2); border-bottom: 1px solid var(--line-2); text-align: left; color: var(--text-3); font-size: var(--fs-xs); font-weight: 600; }
+.map-table td { padding: var(--sp-1) var(--sp-2); border-bottom: 1px solid var(--line); text-align: left; }
+.map-table td:first-child { font-family: var(--mono); font-size: var(--fs-xs); }
+.map-table td small { color: var(--err); font-size: var(--fs-xs); }
+.preview-scroll { max-height: 180px; overflow: auto; padding: var(--sp-1) var(--sp-2); border: 1px solid var(--stroke); border-radius: var(--r); background: var(--surface-sunken); box-shadow: inset 0 1px 2px color-mix(in srgb, var(--press) 30%, transparent); }
+.preview-scroll .map-table td, .preview-scroll .map-table th { border-bottom-color: var(--line); }
 .grow { flex: 1; }
 </style>

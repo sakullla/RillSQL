@@ -171,7 +171,7 @@ async function start() {
       <div class="ex-body">
         <p v-if="error" class="ex-alert" role="alert">{{ error }}</p>
         <fieldset class="ex-options" :disabled="choosing">
-        <p v-if="pending" class="ex-note warn">表格里还有 {{ pending }} 处更改没有提交。导出的是数据库里已提交的数据，不包含这些未提交的更改。</p>
+        <p v-if="pending" class="ex-note warn">表格里还有 <span class="num">{{ pending }}</span> 处更改没有提交。导出的是数据库里已提交的数据，不包含这些未提交的更改。</p>
 
         <fieldset class="ex-scope">
           <legend>导出成哪种文件</legend>
@@ -203,7 +203,7 @@ async function start() {
           <label class="ex-choice" :class="{ on: scope === 'loaded' }">
             <input v-model="scope" type="radio" name="ex-scope" value="loaded" />
             <span>
-              <b>只导出已读取的 {{ loadedCount }} 行</b>
+              <b>只导出已读取的 <span class="num">{{ loadedCount }}</span> 行</b>
               <small>{{ truncated ? "结果还没读完：没读出来的行不会写进文件，文件名会标注「（部分）」。" : "表格里已经读出了这次结果的全部行。" }}</small>
             </span>
           </label>
@@ -267,32 +267,45 @@ async function start() {
 </template>
 
 <style scoped>
-.ex-overlay { position: fixed; inset: 0; background: var(--overlay); display: grid; place-items: center; z-index: var(--z-dialog); padding: var(--sp-4); }
-.ex-sheet { width: min(720px, 100%); max-height: min(88vh, 880px); display: flex; flex-direction: column; background: var(--panel); color: var(--text); border-radius: var(--r-xl); border: 1px solid var(--line-2); box-shadow: var(--shadow-lg); }
-.ex-head { display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line); }
+/* 对话框：与 base.css 的 dialog.modal 同一套 overlay 表面体系。 */
+.ex-overlay { position: fixed; inset: 0; background: var(--overlay); backdrop-filter: blur(3px); display: grid; place-items: center; z-index: var(--z-dialog); padding: var(--sp-4); }
+.ex-sheet { width: min(720px, 100%); max-height: min(88vh, 880px); display: flex; flex-direction: column; background: var(--surface-overlay); color: var(--text); border-radius: var(--r-xl); border: 1px solid var(--stroke-strong); box-shadow: var(--shadow-lg); animation: modal-in var(--dur) var(--ease-out); }
+.ex-head { display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line-2); }
 .ex-titles { flex: 1; min-width: 0; }
-.ex-titles h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; }
+.ex-titles h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.01em; }
 .ex-titles p { margin: var(--sp-1) 0 0; font-size: var(--fs-sm); color: var(--text-2); }
 .ex-body { padding: var(--sp-4) var(--sp-5); overflow: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
+.ex-foot { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-5); border-top: 1px solid var(--line-2); background: color-mix(in srgb, var(--surface-overlay) 94%, var(--text) 6%); border-radius: 0 0 var(--r-xl) var(--r-xl); }
+.ex-options { margin: 0; padding: 0; border: 0; min-width: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
 .ex-advanced :deep(.listbox) { width: 100%; }
 .ex-advanced :deep(.listbox-trigger) { width: 100%; justify-content: space-between; }
-.ex-options { margin: 0; padding: 0; border: 0; min-width: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
-.ex-foot { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-5); border-top: 1px solid var(--line); background: var(--panel-2); border-radius: 0 0 var(--r-xl) var(--r-xl); }
 .ex-note { margin: 0; font-size: var(--fs-sm); color: var(--text-2); line-height: var(--lh); }
 .ex-note.warn { padding: var(--sp-2) var(--sp-3); border: 1px solid var(--warn-line); border-radius: var(--r); background: var(--warn-soft); color: var(--warn); }
-.ex-alert { margin: 0; padding: var(--sp-2) var(--sp-3); background: var(--err-soft); color: var(--err); border: 1px solid var(--err-line); border-radius: var(--r); font-size: var(--fs-sm); }
-.ex-scope { margin: 0; padding: 0; border: 0; display: flex; flex-direction: column; gap: var(--sp-2); }
-.ex-scope legend { padding: 0; margin-bottom: var(--sp-1); font-size: var(--fs-sm); font-weight: 600; }
-.ex-choice { display: flex; gap: var(--sp-2); align-items: flex-start; padding: var(--sp-3); border: 1px solid var(--line); border-radius: var(--r-md); cursor: pointer; transition: border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease); }
-.ex-choice:hover { background: var(--hover); }
-.ex-choice.on { border-color: var(--accent); background: var(--accent-soft); }
-.ex-choice input { margin-top: 3px; }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.ex-alert { margin: 0; padding: var(--sp-2) var(--sp-3); background: var(--err-soft); color: var(--err); border: 1px solid var(--err-line); border-radius: var(--r); font-size: var(--fs-sm); line-height: var(--lh); }
+
+/* 格式 / 范围选择：实体选择卡（隐藏原生单选，选中以强调描边 + 指示点表达） */
+.ex-scope { margin: 0; padding: 0; border: 0; display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
+.ex-scope legend { padding: 0; margin-bottom: var(--sp-1); font-size: var(--fs-sm); font-weight: 600; color: var(--text-3); }
+.ex-choice { position: relative; display: flex; gap: var(--sp-2); align-items: flex-start; padding: var(--sp-3); border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface-panel); cursor: pointer; transition: border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease); }
+.ex-choice:hover { border-color: var(--line-2); background: var(--hover); }
+.ex-choice.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent-soft) 45%, var(--surface-panel)); box-shadow: 0 0 0 1px var(--accent); }
+.ex-choice.on::after { content: ""; position: absolute; top: var(--sp-2); right: var(--sp-2); width: 6px; height: 6px; border-radius: var(--r-full); background: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent); }
+.ex-choice:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+.ex-choice input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
 .ex-choice b { font-size: var(--fs-sm); font-weight: 600; }
 .ex-choice small { display: block; color: var(--text-2); font-size: var(--fs-xs); line-height: var(--lh); margin-top: 2px; }
-.ex-ack { display: flex; gap: var(--sp-2); align-items: flex-start; font-size: var(--fs-sm); color: var(--text); }
+.ex-choice .num { color: var(--text); }
+
+/* 重执行确认：警告软底卡 */
+.ex-ack { display: flex; gap: var(--sp-2); align-items: flex-start; padding: var(--sp-2) var(--sp-3); border: 1px solid var(--warn-line); border-radius: var(--r); background: var(--warn-soft); font-size: var(--fs-sm); color: var(--text); line-height: var(--lh); cursor: pointer; }
+.ex-ack input { margin-top: 2px; }
 .ex-path { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-sm); color: var(--text-2); }
-.ex-path input { width: 100%; }
-.ex-preview { margin: var(--sp-1) 0 0; max-height: 140px; overflow: auto; background: var(--sunken); padding: var(--sp-2) var(--sp-3); border-radius: var(--r); font-family: var(--mono); font-size: var(--fs-xs); line-height: var(--lh); white-space: pre-wrap; word-break: break-all; }
+.ex-path input { width: 100%; font-family: var(--mono); font-size: var(--fs-xs); }
+
+/* 预览：下沉井 + 内描边 */
+.ex-preview-wrap { display: flex; flex-direction: column; gap: var(--sp-1); }
+.ex-preview { margin: 0; max-height: 140px; overflow: auto; padding: var(--sp-2) var(--sp-3); border-radius: var(--r); background: var(--surface-sunken); box-shadow: inset 0 0 0 1px var(--stroke); font-family: var(--mono); font-size: var(--fs-xs); line-height: var(--lh); white-space: pre-wrap; word-break: break-all; }
 .ex-advanced { display: flex; gap: var(--sp-3); flex-wrap: wrap; align-items: flex-end; }
 .ex-field { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-xs); color: var(--text-2); }
 .ex-advanced label.ex-header-row { flex-direction: row; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); color: var(--text); }

@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch, type Ref } from "vue";
-import "../structure/structure.css";
 import { catalogConnections } from "../catalog/store";
 import type { CatalogConnection } from "../catalog/types";
 import { compareCancel, compareData, compareSchemas, compareStructure } from "./api";
@@ -219,15 +218,18 @@ function place(sql: string) {
 </script>
 
 <template>
-  <div class="overlay" role="presentation" @click.self="emit('close')">
-    <div class="sheet compare-sheet" role="dialog" aria-modal="true" aria-label="对比库" data-compare>
-      <header>
-        <h2>对比库</h2>
-        <span class="grow"></span>
-        <button class="btn" type="button" @click="emit('close')">关闭</button>
+  <div class="cmp-overlay" role="presentation" @click.self="emit('close')">
+    <div class="cmp-sheet" role="dialog" aria-modal="true" aria-label="对比库" data-compare>
+      <header class="cmp-head">
+        <div class="cmp-titles">
+          <h2>对比库</h2>
+          <p class="cmp-sub">基准是期望的一侧。脚本只描述如何让对照变成基准，生成时不执行。</p>
+        </div>
+        <button class="icon-btn" type="button" aria-label="关闭" @click="emit('close')">
+          <svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
+        </button>
       </header>
-      <div class="body">
-        <p class="muted">基准是期望的一侧。脚本只描述如何让对照变成基准，生成时不执行。</p>
+      <div class="cmp-body">
         <div class="compare-sides">
           <fieldset>
             <legend>基准</legend>
@@ -257,9 +259,10 @@ function place(sql: string) {
         <div class="compare-actions">
           <button class="btn primary" type="button" data-action="compare-structure" :disabled="busy || schemaPending" @click="runStructure">对比结构</button>
           <button class="btn" type="button" data-action="compare-cancel" :disabled="!busy" @click="cancelRun">取消</button>
+          <span v-if="busy" class="cmp-hint">正在对比…</span>
         </div>
-        <p v-if="errorText" class="struct-alert" role="alert">{{ errorText }}</p>
-        <p v-if="structure?.refused" class="struct-alert" role="alert" data-compare-refused>{{ structure.refused }}</p>
+        <p v-if="errorText" class="cmp-alert" role="alert">{{ errorText }}</p>
+        <p v-if="structure?.refused" class="cmp-alert" role="alert" data-compare-refused>{{ structure.refused }}</p>
         <p v-if="structure?.incomplete" class="badge warn" data-compare-incomplete>脚本不完整</p>
         <ul v-if="structure && !structure.refused" class="compare-list" data-compare-diffs>
           <li v-for="item in structure.onlyBaseline" :key="`b-${item.kind}-${item.name}`">仅基准拥有 {{ item.kind }} {{ item.name }}</li>
@@ -275,7 +278,7 @@ function place(sql: string) {
           <p v-if="!structure.tables.length" class="muted">没有可对比的表。</p>
           <label v-for="table in structure.tables" :key="table.name" class="compare-table">
             <input v-model="selected[table.name]" type="checkbox" :disabled="!table.onBoth" :data-table="table.name" />
-            {{ table.name }}
+            <span class="mono">{{ table.name }}</span>
             <span v-if="!table.onBoth" class="muted">只在一侧，属于结构差异</span>
             <select v-if="table.needsKeyChoice" v-model="chosenKey[table.name]" :data-key="table.name">
               <option value="">选择唯一键</option>
@@ -283,10 +286,10 @@ function place(sql: string) {
             </select>
           </label>
           <button class="btn" type="button" data-action="compare-data" :disabled="busy || schemaPending" @click="runData">对比数据</button>
-          <p v-if="dataReport?.refused" class="struct-alert" role="alert">{{ dataReport.refused }}</p>
+          <p v-if="dataReport?.refused" class="cmp-alert" role="alert">{{ dataReport.refused }}</p>
           <p v-if="dataReport?.incomplete" class="badge warn">数据脚本不完整</p>
           <ul v-if="dataReport" class="compare-list">
-            <li v-for="(item, index) in dataReport.diffs" :key="`${item.table}-${item.action}-${index}`">{{ item.table }} {{ item.detail }} <template v-if="item.key">键 {{ item.key }}</template></li>
+            <li v-for="(item, index) in dataReport.diffs" :key="`${item.table}-${item.action}-${index}`"><span class="mono">{{ item.table }}</span> {{ item.detail }} <template v-if="item.key">键 {{ item.key }}</template></li>
             <li v-for="(note, index) in dataReport.notes" :key="`n-${index}`">{{ note }}</li>
           </ul>
           <template v-if="dataReport && !dataReport.refused">
@@ -300,16 +303,44 @@ function place(sql: string) {
 </template>
 
 <style scoped>
-.compare-sheet { width: min(880px, calc(100vw - 48px)); max-height: calc(100vh - 48px); display: flex; flex-direction: column; }
-.compare-sheet header, .compare-actions, .compare-data { display: flex; align-items: center; gap: var(--sp-2); }
-.compare-sheet header h2 { margin: 0; font-size: var(--fs-lg); }
-.compare-sheet .body { overflow: auto; display: flex; flex-direction: column; gap: var(--sp-3); padding: var(--sp-4); }
+/* 对话框：与 base.css 的 dialog.modal 同一套 overlay 表面体系
+   （--surface-overlay + --stroke-strong + --shadow-lg + --r-xl）。 */
+.cmp-overlay { position: fixed; inset: 0; background: var(--overlay); backdrop-filter: blur(3px); display: grid; place-items: center; z-index: var(--z-dialog); padding: var(--sp-4); }
+.cmp-sheet { width: min(880px, calc(100vw - 48px)); max-height: calc(100vh - 48px); display: flex; flex-direction: column; background: var(--surface-overlay); color: var(--text); border: 1px solid var(--stroke-strong); border-radius: var(--r-xl); box-shadow: var(--shadow-lg); animation: modal-in var(--dur) var(--ease-out); }
+.cmp-head { display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line-2); }
+.cmp-titles { flex: 1; min-width: 0; }
+.cmp-titles h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.01em; }
+.cmp-sub { margin: var(--sp-1) 0 0; font-size: var(--fs-sm); color: var(--text-2); }
+.cmp-body { flex: 1; min-height: 0; overflow: auto; padding: var(--sp-4) var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-3); }
+
+/* 基准 / 对照两侧：panel 表面实体卡 */
 .compare-sides { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-3); }
-.compare-sides fieldset { border: 1px solid var(--line); border-radius: var(--r-md); padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); }
-.compare-sides label, .compare-table, .compare-script { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-sm); }
-.compare-sides input, .compare-sides select { width: 100%; box-sizing: border-box; }
-.compare-script textarea { min-height: 140px; font-family: var(--font-mono, ui-monospace, monospace); }
-.compare-list { margin: 0; padding-left: 1.2em; }
-.compare-data { flex-wrap: wrap; align-items: flex-start; }
-.compare-table { flex-direction: row; align-items: center; }
+.compare-sides fieldset { margin: 0; padding: var(--sp-3); border: 1px solid var(--stroke); border-radius: var(--r-md); background: var(--surface-panel); box-shadow: var(--shadow-sm); display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
+.compare-sides legend { padding: 0 var(--sp-1); font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.06em; color: var(--text-3); }
+.compare-sides label { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-sm); color: var(--text-2); }
+.compare-sides input, .compare-sides select { width: 100%; }
+.compare-sides .muted[data-schema-hint] { margin: 0; font-size: var(--fs-xs); line-height: var(--lh); }
+
+/* 操作行与提示 */
+.compare-actions { display: flex; align-items: center; gap: var(--sp-2); }
+.cmp-hint { font-size: var(--fs-sm); color: var(--text-3); }
+.cmp-alert { margin: 0; padding: var(--sp-2) var(--sp-3); border: 1px solid var(--err-line); border-radius: var(--r); background: var(--err-soft); color: var(--err); font-size: var(--fs-sm); line-height: var(--lh); }
+
+/* 差异清单与脚本 */
+.compare-list { margin: 0; padding: 0 var(--sp-1) 0 var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-sm); color: var(--text-2); line-height: var(--lh); }
+.compare-list .mono { color: var(--text); }
+.compare-script { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-sm); color: var(--text-2); }
+.compare-script textarea { min-height: 140px; padding: var(--sp-2) var(--sp-3); border: 1px solid var(--stroke-strong); border-radius: var(--r); background: var(--surface-sunken); font-family: var(--mono); font-size: var(--fs-xs); line-height: var(--lh); resize: vertical; }
+
+/* 数据差异分区 */
+.compare-data { display: flex; flex-direction: column; gap: var(--sp-2); padding-top: var(--sp-3); border-top: 1px solid var(--line-2); }
+.compare-data h3 { margin: 0; font-size: var(--fs-sm); font-weight: 600; color: var(--text-3); }
+.compare-table { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-1) var(--sp-2); border-radius: var(--r-sm); font-size: var(--fs-sm); }
+.compare-table:hover { background: var(--hover); }
+.compare-table .mono { font-size: var(--fs-xs); }
+.compare-table .muted { font-size: var(--fs-xs); }
+.compare-table select { width: auto; min-width: 140px; }
+@media (max-width: 720px) {
+  .compare-sides { grid-template-columns: 1fr; }
+}
 </style>

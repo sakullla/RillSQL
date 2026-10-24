@@ -65,20 +65,29 @@ function percent(task: ExportTask): number {
 </template>
 
 <style scoped>
+/* 任务中心：触发器是 chrome 上的下沉胶囊，列表是 overlay 表面浮层（同菜单体系）。 */
 .task-center { position: relative; }
-.tc-trigger { white-space: nowrap; display: inline-flex; align-items: center; gap: var(--sp-1); height: 26px; padding: 0 var(--sp-3); border-radius: var(--r-full); background: var(--sunken); color: var(--text-2); font-size: var(--fs-xs); transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease); }
+.tc-trigger { white-space: nowrap; display: inline-flex; align-items: center; gap: var(--sp-1); height: var(--control-h-sm); padding: 0 var(--sp-3); border-radius: var(--r-full); background: var(--surface-sunken); box-shadow: inset 0 0 0 1px var(--stroke); color: var(--text-2); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease); }
 .tc-trigger:hover { background: var(--hover); color: var(--text); }
+.tc-trigger:active { box-shadow: inset 0 0 0 1px var(--stroke), inset 0 1px 2px var(--press); }
 .tc-trigger .i { width: 13px; height: 13px; }
-.tc-trigger.busy { background: var(--accent-soft); color: var(--accent-text); }
-.tc-pop { position: absolute; right: 0; top: 32px; width: 340px; max-height: 420px; overflow: auto; background: var(--panel); border: 1px solid var(--line-2); border-radius: var(--r-lg); box-shadow: var(--shadow); padding: var(--sp-3); z-index: 30; animation: pop-in var(--dur-fast) var(--ease-out); }
-.tc-head { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-2); }
-.tc-head strong { font-size: var(--fs-sm); }
-.tc-empty { margin: var(--sp-2) 0; color: var(--text-3); font-size: var(--fs-sm); }
-.tc-task { padding: var(--sp-2) 0; border-bottom: 1px solid var(--line); }
-.tc-task:last-child { border-bottom: 0; }
-.tc-task-top { display: flex; align-items: center; gap: var(--sp-2); }
-.tc-name { font-size: var(--fs-sm); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tc-progress { height: 4px; background: var(--sunken); border-radius: var(--r-full); margin: var(--sp-2) 0 var(--sp-1); overflow: hidden; }
+.tc-trigger.busy { background: var(--accent-soft); color: var(--accent-text); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent); }
+.tc-pop { position: absolute; right: 0; top: calc(100% + var(--sp-1)); width: 340px; max-height: 420px; overflow: auto; background: var(--surface-overlay); border: 1px solid var(--stroke-strong); border-radius: var(--r-md); box-shadow: var(--shadow); padding: var(--sp-2) var(--sp-3); z-index: var(--z-menu); animation: pop-in var(--dur-fast) var(--ease-out); }
+.tc-head { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-1) 0 var(--sp-2); border-bottom: 1px solid var(--line-2); }
+.tc-head strong { font-size: var(--fs-sm); font-weight: 600; }
+.tc-empty { margin: 0; padding: var(--sp-5) 0; color: var(--text-3); font-size: var(--fs-sm); text-align: center; }
+
+/* 任务行：状态语义走 badge 与左缘指示条 */
+.tc-task { position: relative; display: flex; flex-direction: column; gap: var(--sp-1); padding: var(--sp-2) 0 var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--line); }
+.tc-task:last-child { border-bottom: 0; padding-bottom: var(--sp-1); }
+.tc-task::before { content: ""; position: absolute; left: 0; top: var(--sp-2); bottom: var(--sp-2); width: 2px; border-radius: var(--r-full); background: var(--line-2); }
+.tc-task[data-status="running"]::before { background: var(--info); }
+.tc-task[data-status="done"]::before { background: var(--ok); }
+.tc-task[data-status="failed"]::before { background: var(--err); }
+.tc-task[data-status="cancelled"]::before { background: var(--warn); }
+.tc-task-top { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
+.tc-name { flex: 1; min-width: 0; font: 500 var(--fs-xs) var(--mono); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tc-progress { height: 4px; background: var(--surface-sunken); box-shadow: inset 0 0 0 1px var(--stroke); border-radius: var(--r-full); overflow: hidden; }
 .tc-progress i { display: block; height: 100%; background: var(--accent); border-radius: var(--r-full); transition: width var(--dur) var(--ease); }
-.tc-status { margin: var(--sp-1) 0 0; font-size: var(--fs-xs); color: var(--text-2); line-height: var(--lh); }
+.tc-status { margin: 0; font-size: var(--fs-xs); color: var(--text-2); line-height: var(--lh); }
 </style>
