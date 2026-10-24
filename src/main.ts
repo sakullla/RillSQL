@@ -3,6 +3,7 @@ import AppShell from "./shell/AppShell.vue";
 import { loadSettings } from "./shell/settings";
 import { applyDocumentTheme, prefersDarkScheme } from "./shell/theme";
 import "./styles/tokens.css";
+import "./styles/fonts.css";
 import "./styles/base.css";
 import "./styles/shell.css";
 import "./styles/workbench.css";

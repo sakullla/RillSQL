@@ -18,7 +18,33 @@ function tokenValue(scope: string, name: string): string {
   return match![1].trim();
 }
 
+function hexValue(scope: string, name: string): string {
+  const value = tokenValue(scope, name).toLowerCase();
+  expect(value, `${name} must be a hex color, got ${value}`).toMatch(/^#[0-9a-f]{6}$/);
+  return value;
+}
+
+function channel(byte: number): number {
+  const s = byte / 255;
+  return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+}
+
+function luminance(hex: string): number {
+  const n = Number.parseInt(hex.slice(1), 16);
+  return 0.2126 * channel((n >> 16) & 255) + 0.7152 * channel((n >> 8) & 255) + 0.0722 * channel(n & 255);
+}
+
+function contrast(fg: string, bg: string): number {
+  const [hi, lo] = [luminance(fg), luminance(bg)].sort((a, b) => b - a);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
 const THEME_TOKENS = [
+  "--surface-app",
+  "--surface-chrome",
+  "--surface-panel",
+  "--surface-sunken",
+  "--surface-overlay",
   "--bg",
   "--chrome",
   "--panel",
@@ -31,6 +57,8 @@ const THEME_TOKENS = [
   "--text-3",
   "--line",
   "--line-2",
+  "--stroke",
+  "--stroke-strong",
   "--accent",
   "--accent-hover",
   "--accent-active",
@@ -81,22 +109,59 @@ const THEME_TOKENS = [
   "--overlay",
 ];
 
+const THEME_SCOPES = {
+  light: () => block(":root[data-theme=\"light\"]"),
+  dark: () => block(":root[data-theme=\"dark\"]"),
+};
+
 describe("design tokens", () => {
   it("defines the full token set for both light and dark themes", () => {
-    const light = block(":root[data-theme=\"light\"]");
-    const dark = block(":root[data-theme=\"dark\"]");
-    for (const name of THEME_TOKENS) {
-      expect(tokenValue(light, name), `light ${name}`).toBeTruthy();
-      expect(tokenValue(dark, name), `dark ${name}`).toBeTruthy();
+    for (const scope of [THEME_SCOPES.light(), THEME_SCOPES.dark()]) {
+      for (const name of THEME_TOKENS) {
+        expect(tokenValue(scope, name), name).toBeTruthy();
+      }
     }
   });
 
   it("uses different values for key tokens across themes", () => {
-    const light = block(":root[data-theme=\"light\"]");
-    const dark = block(":root[data-theme=\"dark\"]");
-    for (const name of ["--bg", "--chrome", "--panel", "--text", "--text-2", "--accent", "--accent-soft", "--on-accent", "--ok", "--warn", "--err", "--info", "--ring", "--nav-bg", "--nav-fg", "--nav-active", "--nav-hover", "--nav-active-bg", "--overlay"]) {
+    const light = THEME_SCOPES.light();
+    const dark = THEME_SCOPES.dark();
+    for (const name of [
+      "--surface-app",
+      "--surface-chrome",
+      "--surface-panel",
+      "--text",
+      "--text-2",
+      "--stroke",
+      "--accent-hover",
+      "--accent-active",
+      "--accent-soft",
+      "--accent-text",
+      "--ok",
+      "--warn",
+      "--err",
+      "--info",
+      "--ring",
+      "--nav-bg",
+      "--nav-fg",
+      "--nav-active",
+      "--nav-hover",
+      "--nav-active-bg",
+      "--overlay",
+    ]) {
       expect(tokenValue(light, name), name).not.toBe(tokenValue(dark, name));
     }
+  });
+
+  it("anchors the accent family on radix iris-9 in both themes", () => {
+    for (const scope of [THEME_SCOPES.light(), THEME_SCOPES.dark()]) {
+      expect(hexValue(scope, "--accent")).toBe("#5b5bd6");
+    }
+  });
+
+  it("keeps the legacy indigo family fully removed", () => {
+    expect(css.toLowerCase()).not.toContain("#4f46e5");
+    expect(css.toLowerCase()).not.toContain("#8b7ff7");
   });
 
   it("keeps activity rail colors out of the theme-invariant root", () => {
@@ -110,17 +175,17 @@ describe("design tokens", () => {
   });
 
   it("declares light as the default color scheme", () => {
-    expect(block(":root[data-theme=\"light\"]")).toContain("color-scheme: light");
-    expect(block(":root[data-theme=\"dark\"]")).toContain("color-scheme: dark");
+    expect(THEME_SCOPES.light()).toContain("color-scheme: light");
+    expect(THEME_SCOPES.dark()).toContain("color-scheme: dark");
   });
 
-  it("uses the softened desktop shape scale: 6px controls, 10px panels, 4px tags", () => {
+  it("raises the radius scale by one step: 8px controls, 12px panels, 6px tags", () => {
     const root = block(":root {");
-    expect(tokenValue(root, "--r")).toBe("6px");
-    expect(tokenValue(root, "--r-sm")).toBe("4px");
-    expect(tokenValue(root, "--r-md")).toBe("8px");
-    expect(tokenValue(root, "--r-lg")).toBe("10px");
-    expect(tokenValue(root, "--r-xl")).toBe("12px");
+    expect(tokenValue(root, "--r")).toBe("8px");
+    expect(tokenValue(root, "--r-sm")).toBe("6px");
+    expect(tokenValue(root, "--r-md")).toBe("10px");
+    expect(tokenValue(root, "--r-lg")).toBe("12px");
+    expect(tokenValue(root, "--r-xl")).toBe("14px");
   });
 
   it("defines the five-step type scale and the float layer scale", () => {
@@ -153,6 +218,12 @@ describe("design tokens", () => {
     }
   });
 
+  it("leads the font stacks with the bundled Inter Variable and JetBrains Mono faces", () => {
+    const root = block(":root {");
+    expect(tokenValue(root, "--font").split(",")[0].trim()).toBe('"Inter Variable"');
+    expect(tokenValue(root, "--mono").split(",")[0].trim()).toBe('"JetBrains Mono"');
+  });
+
   it("provides motion duration tokens and a reduced-motion override", () => {
     const root = block(":root {");
     for (const name of ["--dur-fast", "--dur", "--dur-slow"]) {
@@ -165,23 +236,84 @@ describe("design tokens", () => {
     expect(reduced).toContain("--dur-slow: 0ms");
   });
 
-  it("defaults to compact density and widens in standard mode", () => {
+  it("defaults to compact density and widens in standard and relaxed modes", () => {
     const root = block(":root {");
-    expect(Number.parseInt(tokenValue(root, "--row-h"), 10)).toBe(26);
-    expect(Number.parseInt(tokenValue(root, "--tree-h"), 10)).toBe(23);
-    expect(Number.parseInt(tokenValue(root, "--control-h"), 10)).toBe(26);
+    expect(Number.parseInt(tokenValue(root, "--row-h"), 10)).toBe(24);
+    expect(Number.parseInt(tokenValue(root, "--tree-h"), 10)).toBe(22);
+    expect(Number.parseInt(tokenValue(root, "--control-h"), 10)).toBe(28);
     expect(Number.parseInt(tokenValue(root, "--control-h-sm"), 10)).toBe(24);
     const standard = block(":root[data-density=\"standard\"]");
-    expect(Number.parseInt(tokenValue(standard, "--row-h"), 10)).toBe(32);
-    expect(Number.parseInt(tokenValue(standard, "--tree-h"), 10)).toBe(30);
-    expect(Number.parseInt(tokenValue(standard, "--control-h"), 10)).toBe(30);
-    expect(Number.parseInt(tokenValue(standard, "--control-h-sm"), 10)).toBe(26);
+    expect(Number.parseInt(tokenValue(standard, "--row-h"), 10)).toBe(30);
+    expect(Number.parseInt(tokenValue(standard, "--tree-h"), 10)).toBe(28);
+    expect(Number.parseInt(tokenValue(standard, "--control-h"), 10)).toBe(34);
+    expect(Number.parseInt(tokenValue(standard, "--control-h-sm"), 10)).toBe(30);
+    const relaxed = block(":root[data-density=\"relaxed\"]");
+    expect(Number.parseInt(tokenValue(relaxed, "--row-h"), 10)).toBe(34);
+    expect(Number.parseInt(tokenValue(relaxed, "--tree-h"), 10)).toBe(32);
+    expect(Number.parseInt(tokenValue(relaxed, "--control-h"), 10)).toBe(38);
+    expect(Number.parseInt(tokenValue(relaxed, "--control-h-sm"), 10)).toBe(34);
   });
 
   it("keeps legacy token names resolvable for transitional module css", () => {
-    const light = block(":root[data-theme=\"light\"]");
+    const light = THEME_SCOPES.light();
     for (const name of ["--bg", "--text", "--accent", "--line", "--panel", "--hover", "--sel", "--sel-strong", "--shadow"]) {
       expect(tokenValue(light, name), name).toBeTruthy();
     }
   });
+});
+
+describe("token contrast (WCAG relative luminance)", () => {
+  for (const [theme, scope] of [["light", THEME_SCOPES.light()], ["dark", THEME_SCOPES.dark()]] as const) {
+    it(`keeps text tokens at >= 4.5:1 in the ${theme} theme`, () => {
+      const panel = hexValue(scope, "--surface-panel");
+      const textPairs: Array<[string, string, string]> = [
+        ["text on panel", "--text", panel],
+        ["text on app", "--text", hexValue(scope, "--surface-app")],
+        ["text-2 on panel", "--text-2", panel],
+        ["text-2 on chrome", "--text-2", hexValue(scope, "--surface-chrome")],
+        ["on-accent on accent", "--on-accent", hexValue(scope, "--accent")],
+        ["accent-text on panel", "--accent-text", panel],
+        ["accent-text on accent-soft", "--accent-text", hexValue(scope, "--accent-soft")],
+        ["ok on panel", "--ok", panel],
+        ["warn on panel", "--warn", panel],
+        ["err on panel", "--err", panel],
+        ["info on panel", "--info", panel],
+        ["tk-kw on editor bg", "--tk-kw", panel],
+        ["tk-str on editor bg", "--tk-str", panel],
+        ["tk-num on editor bg", "--tk-num", panel],
+        ["tk-com on editor bg", "--tk-com", panel],
+        ["tk-fn on editor bg", "--tk-fn", panel],
+        ["tk-id on editor bg", "--tk-id", panel],
+        ["env-dev on panel", "--env-dev", panel],
+        ["env-test on panel", "--env-test", panel],
+        ["env-prod on panel", "--env-prod", panel],
+        ["env-local on panel", "--env-local", panel],
+        ["env-none on panel", "--env-none", panel],
+        ["eng-postgres on panel", "--eng-postgres", panel],
+        ["eng-mysql on panel", "--eng-mysql", panel],
+        ["eng-mariadb on panel", "--eng-mariadb", panel],
+        ["eng-sqlite on panel", "--eng-sqlite", panel],
+      ];
+      for (const [label, fgName, bg] of textPairs) {
+        const ratio = contrast(hexValue(scope, fgName), bg);
+        expect(ratio, `${theme} ${label}`).toBeGreaterThanOrEqual(4.5);
+      }
+    });
+
+    it(`keeps non-text tokens at >= 3:1 in the ${theme} theme`, () => {
+      const nonTextPairs: Array<[string, string, string]> = [
+        ["accent on app", "--accent", "--surface-app"],
+        ["accent on chrome", "--accent", "--surface-chrome"],
+        ["ok on ok-soft", "--ok", "--ok-soft"],
+        ["warn on warn-soft", "--warn", "--warn-soft"],
+        ["err on err-soft", "--err", "--err-soft"],
+        ["info on info-soft", "--info", "--info-soft"],
+        ["accent-text on nav-bg", "--nav-active", "--nav-bg"],
+      ];
+      for (const [label, fgName, bgName] of nonTextPairs) {
+        const ratio = contrast(hexValue(scope, fgName), hexValue(scope, bgName));
+        expect(ratio, `${theme} ${label}`).toBeGreaterThanOrEqual(3);
+      }
+    });
+  }
 });

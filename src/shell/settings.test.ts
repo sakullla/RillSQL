@@ -1,6 +1,6 @@
 import { mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it } from "vitest";
-import { DEFAULT_SETTINGS, loadSettings, saveSettings } from "./settings";
+import { DEFAULT_SETTINGS, loadSettings, normalizeDensity, saveSettings } from "./settings";
 import SettingsView from "./SettingsView.vue";
 
 function fakeStorage(): Storage {
@@ -21,6 +21,21 @@ describe("shell settings", () => {
   it("migrates the legacy comfortable density to standard", () => {
     localStorage.setItem("rillsql.shell", JSON.stringify({ theme: "dark", density: "comfortable" }));
     expect(loadSettings()).toMatchObject({ theme: "dark", density: "standard" });
+  });
+
+  it("keeps relaxed as a first-class density and passes it through", () => {
+    localStorage.setItem("rillsql.shell", JSON.stringify({ density: "relaxed", pageSize: 50 }));
+    expect(loadSettings()).toMatchObject({ density: "relaxed", pageSize: 50 });
+  });
+
+  it("normalizes unknown density values back to the compact default", () => {
+    localStorage.setItem("rillsql.shell", JSON.stringify({ density: "cozy" }));
+    expect(loadSettings().density).toBe("compact");
+    localStorage.setItem("rillsql.shell", JSON.stringify({ density: null }));
+    expect(loadSettings().density).toBe("compact");
+    expect(normalizeDensity(undefined)).toBe("compact");
+    expect(normalizeDensity("comfortable")).toBe("standard");
+    expect(normalizeDensity("relaxed")).toBe("relaxed");
   });
 
   it("keeps compact and passes stored values through", () => {

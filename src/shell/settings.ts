@@ -27,14 +27,21 @@ export const DEFAULT_SETTINGS: ShellSettings = {
 
 const STORAGE_KEY = "rillsql.shell";
 
+const DENSITIES: readonly Density[] = ["compact", "standard", "relaxed"];
+
+export function normalizeDensity(value: unknown): Density {
+  if (value === "comfortable") return "standard"; // 历史版本把「标准」存成 comfortable
+  return DENSITIES.includes(value as Density) ? (value as Density) : DEFAULT_SETTINGS.density;
+}
+
 export function loadSettings(storage: Storage | null = safeStorage()): ShellSettings {
   if (!storage) return { ...DEFAULT_SETTINGS };
   try {
     const raw = storage.getItem(STORAGE_KEY);
     if (!raw) return { ...DEFAULT_SETTINGS };
-    const parsed = JSON.parse(raw) as Omit<Partial<ShellSettings>, "density"> & { density?: Density | "comfortable" };
-    // 历史版本把「标准」存成 comfortable，归一到 standard，避免样式选择器失配。
-    const density: Density = parsed.density === "comfortable" ? "standard" : parsed.density ?? DEFAULT_SETTINGS.density;
+    const parsed = JSON.parse(raw) as Omit<Partial<ShellSettings>, "density"> & { density?: string };
+    // 密度归一入口：历史值 comfortable 归到 standard，未知/缺失值归到默认档，避免样式选择器失配。
+    const density: Density = normalizeDensity(parsed.density);
     return { ...DEFAULT_SETTINGS, ...parsed, density };
   } catch {
     return { ...DEFAULT_SETTINGS };

@@ -16,4 +16,12 @@ describe("theme", () => {
     expect(root.dataset.density).toBe("standard");
     expect(root.style.getPropertyValue("--editor-font")).toBe("15px");
   });
+
+  it("supports all three density steps including relaxed", () => {
+    for (const density of ["compact", "standard", "relaxed"] as const) {
+      const root = document.createElement("html");
+      applyDocumentTheme("light", density, false, 13, root);
+      expect(root.dataset.density).toBe(density);
+    }
+  });
 });
