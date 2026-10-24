@@ -26,6 +26,8 @@ const props = defineProps<{ tabId: string; draft: string; pageSize?: number; nul
 const emit = defineEmits<{
   "jump-reference": [sql: string, ref: string];
 }>();
+/* 错误卡语义图标：圆 + 叉，与对象树/历史/导出等处的统一 err 线稿一致 */
+const ERROR_ICON = "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6";
 const session = props.target ? reactive(new LiveTable(props.target, props.pageSize ?? loadSettings().pageSize)) : null;
 if (session) void session.open();
 /** 设置页的预览上限对网格立即生效，避免“改了没反应”。 */
@@ -796,7 +798,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
 
 <template>
   <div ref="rootEl" class="data-grid" aria-label="数据表格" :data-tab-id="tabId" :data-draft="draft" :data-loaded="session ? session.loaded.length : 0" :data-truncated="session ? session.truncated : false">
-    <p v-if="!session" class="grid-alert" role="alert">没有绑定已打开的表，不能用示例数据代替。</p>
+    <p v-if="!session" class="grid-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ERROR_ICON" /></svg>没有绑定已打开的表，不能用示例数据代替。</p>
     <template v-else>
     <div class="grid-toolbar">
       <span v-if="environmentLabel" class="env xs" data-env :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span>
@@ -840,11 +842,11 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
       <summary>查看这次读取在数据库里执行的 SQL</summary>
       <div class="disclosure-body"><pre class="sql-code">{{ session.sql }}</pre></div>
     </details>
-    <p v-if="filterError" class="grid-alert" role="alert">{{ filterError }}</p>
-    <p v-if="editError && !editing" class="grid-alert" role="alert">{{ editError }}</p>
+    <p v-if="filterError" class="grid-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ERROR_ICON" /></svg>{{ filterError }}</p>
+    <p v-if="editError && !editing" class="grid-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ERROR_ICON" /></svg>{{ editError }}</p>
     <p v-if="importMessage" class="hint export-message" role="status">{{ importMessage }}</p>
     <p v-if="exportMessage" class="hint export-message" role="status">{{ exportMessage }}</p>
-    <p v-if="session.error" class="grid-alert" role="alert">读取失败：{{ session.error }}。这不是无匹配结果。筛选条件仍保留。 <button class="btn sm" type="button" :disabled="retrying" @click="retryRead">重试</button></p>
+    <p v-if="session.error" class="grid-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ERROR_ICON" /></svg>读取失败：{{ session.error }}。这不是无匹配结果。筛选条件仍保留。 <button class="btn sm" type="button" :disabled="retrying" @click="retryRead">重试</button></p>
     <div :ref="setViewport" class="grid-scroll" @scroll.passive="onScroll" @keydown="onGridKeydown">
       <table class="grid-table">
         <thead>
@@ -943,7 +945,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
           </div>
         </header>
         <div class="body">
-          <p v-if="commitError" class="sheet-error" role="alert" data-commit-error>{{ commitError }}</p>
+          <p v-if="commitError" class="sheet-error" role="alert" data-commit-error><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ERROR_ICON" /></svg>{{ commitError }}</p>
           <ol class="sql-list">
             <li v-for="step in session.preview()" :key="step.id">
               <strong>{{ step.label }}</strong>

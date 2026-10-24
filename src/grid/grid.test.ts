@@ -611,6 +611,31 @@ describe("grid views", () => {
     wrapper.unmount();
   });
 
+  it("renders the read failure and empty-table states in the unified state pattern", async () => {
+    // 失败态：err 软底卡（.grid-alert）带语义图标，role=alert
+    invoke.mockRejectedValue(new Error("连接已断开，读取失败"));
+    const broken = mount(DataGrid, { props: { tabId: "table:states-err", draft: "", target: { ...customersTarget, table: "broken" } } });
+    await flushPromises();
+    const alert = broken.get("p.grid-alert[role='alert']");
+    expect(alert.text()).toContain("读取失败");
+    expect(alert.find("svg.i").exists()).toBe(true);
+    broken.unmount();
+
+    // 空表态：两网格共用的 .grid-empty 呈现，区别于筛选无匹配
+    invoke.mockReset();
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") return { rows: [], truncated: false, sql: "SELECT empty" };
+      throw new Error(command);
+    });
+    const empty = mount(DataGrid, { props: { tabId: "table:states-empty", draft: "", pageSize: 10, target: customersTarget } });
+    await flushPromises();
+    expect(empty.get("[data-empty='table'] td").classes()).toContain("grid-empty");
+    expect(empty.get("[data-empty='table']").text()).toContain("这张表没有行");
+    expect(empty.find("[data-empty='filter']").exists()).toBe(false);
+    empty.unmount();
+  });
+
   it("keeps an unbound table tab empty instead of showing fixture rows", async () => {
     const wrapper = mount(DataGrid, { props: { tabId: "table:customers", draft: "" } });
     await flushPromises();

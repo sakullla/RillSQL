@@ -68,7 +68,12 @@
 .hint { color: var(--text-2); font-size: var(--fs-xs); }
 .export-message,
 .grid-hint { margin: 0; padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--line); font-size: var(--fs-xs); color: var(--text-2); }
+/* 错误条：err 软底卡 + 同色左缘 + 语义图标（R4 统一状态模式） */
 .grid-alert {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
   margin: 0;
   padding: var(--sp-2) var(--sp-3);
   background: var(--err-soft);
@@ -77,6 +82,7 @@
   box-shadow: inset 3px 0 0 var(--err);
   font-size: var(--fs-sm);
 }
+.grid-alert > .i { width: 14px; height: 14px; flex-shrink: 0; }
 .grid-alert .btn { margin-left: var(--sp-2); }
 
 /* ---------- 表格主体 ---------- */
@@ -120,10 +126,11 @@
 }
 
 /* ---------- 列头：双行排版（列名 + 类型）+ 排序语义 ---------- */
+/* 粘性层级只有 --z-base/--z-sticky 两档令牌；行号列与列宽抓手在 sticky 基准上做 ±1 的局部叠序 */
 .grid-table th {
   position: sticky;
   top: 0;
-  z-index: 2;
+  z-index: var(--z-sticky);
   height: auto;
   min-height: var(--row-h);
   background: var(--panel-2);
@@ -177,14 +184,14 @@
   font-size: var(--fs-xs);
   line-height: 1;
 }
-.col-resize { position: absolute; top: 0; right: 0; width: 6px; height: 100%; cursor: col-resize; z-index: 3; }
+.col-resize { position: absolute; top: 0; right: 0; width: 6px; height: 100%; cursor: col-resize; z-index: calc(var(--z-sticky) + 1); }
 .grid-table th:hover .col-resize { background: color-mix(in srgb, var(--accent) 35%, transparent); }
 
-/* 行号列：冻结在左侧 */
+/* 行号列：冻结在左侧（低于列头一档，滚走时从列头下方穿过） */
 .grid-table .row-number {
   position: sticky;
   left: 0;
-  z-index: 1;
+  z-index: calc(var(--z-sticky) - 1);
   width: 48px;
   min-width: 48px;
   text-align: right;
@@ -194,7 +201,7 @@
   user-select: none;
   border-right-color: var(--line-2);
 }
-.grid-table th.row-number { z-index: 3; }
+.grid-table th.row-number { z-index: calc(var(--z-sticky) + 1); }
 
 /* ---------- 单元格 ---------- */
 .cell-btn { display: block; width: 100%; text-align: left; background: none; border-radius: 0; }
@@ -381,17 +388,23 @@
 .sheet header { border-bottom: 1px solid var(--line-2); }
 .sheet footer { border-top: 1px solid var(--line-2); background: color-mix(in srgb, var(--surface-overlay) 94%, var(--text) 6%); border-radius: 0 0 var(--r-xl) var(--r-xl); }
 .sheet .body { padding: var(--sp-3) var(--sp-4); display: flex; flex-direction: column; gap: var(--sp-2); overflow: auto; }
+/* 提交失败卡：与 grid-alert 同一 err 模式（软底卡 + 左缘 + 语义图标） */
 .sheet-error {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
   margin: 0;
   padding: var(--sp-2) var(--sp-3);
   border: 1px solid var(--err-line);
   border-radius: var(--r);
   background: var(--err-soft);
   color: var(--err);
+  box-shadow: inset 3px 0 0 var(--err);
   font-size: var(--fs-sm);
   font-weight: 600;
   white-space: pre-wrap;
 }
+.sheet-error > .i { width: 14px; height: 14px; flex-shrink: 0; margin-top: 2px; }
 .btn.danger[data-armed="true"] {
   background: var(--err);
   border-color: var(--err);

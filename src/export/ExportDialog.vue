@@ -169,7 +169,7 @@ async function start() {
       </header>
 
       <div class="ex-body">
-        <p v-if="error" class="ex-alert" role="alert">{{ error }}</p>
+        <p v-if="error" class="ex-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>{{ error }}</p>
         <fieldset class="ex-options" :disabled="choosing">
         <p v-if="pending" class="ex-note warn">表格里还有 <span class="num">{{ pending }}</span> 处更改没有提交。导出的是数据库里已提交的数据，不包含这些未提交的更改。</p>
 
@@ -196,7 +196,7 @@ async function start() {
             <span><b>INSERT 语句</b><small>只包含这些行，不含建表或整库脚本。空值写成 NULL。</small></span>
           </label>
         </fieldset>
-        <p v-if="insertBlocked" class="ex-alert" role="alert">{{ insertReason || "还不能确定 INSERT 要写入的表，不能开始。" }}</p>
+        <p v-if="insertBlocked" class="ex-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>{{ insertReason || "还不能确定 INSERT 要写入的表，不能开始。" }}</p>
 
         <fieldset class="ex-scope">
           <legend>导出哪些行</legend>
@@ -217,7 +217,7 @@ async function start() {
         </fieldset>
 
         <p v-if="plan.notice" class="ex-note" data-export-notice>{{ plan.notice }}</p>
-        <p v-if="plan.rejectReason" class="ex-alert" role="alert">{{ plan.rejectReason }}</p>
+        <p v-if="plan.rejectReason" class="ex-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>{{ plan.rejectReason }}</p>
         <label v-if="plan.reexecutes" class="ex-ack">
           <input v-model="acknowledged" type="checkbox" />
           我明白：导出会重新执行这条 SELECT，结果可能和当前表格看到的不一样
@@ -282,7 +282,9 @@ async function start() {
 .ex-note { margin: 0; font-size: var(--fs-sm); color: var(--text-2); line-height: var(--lh); }
 .ex-note.warn { padding: var(--sp-2) var(--sp-3); border: 1px solid var(--warn-line); border-radius: var(--r); background: var(--warn-soft); color: var(--warn); }
 .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
-.ex-alert { margin: 0; padding: var(--sp-2) var(--sp-3); background: var(--err-soft); color: var(--err); border: 1px solid var(--err-line); border-radius: var(--r); font-size: var(--fs-sm); line-height: var(--lh); }
+/* 错误卡：与全局 err 模式一致（软底卡 + 同色 3px 左缘 + 语义图标） */
+.ex-alert { display: flex; align-items: flex-start; gap: var(--sp-2); margin: 0; padding: var(--sp-2) var(--sp-3); background: var(--err-soft); color: var(--err); border: 1px solid var(--err-line); border-radius: var(--r); box-shadow: inset 3px 0 0 var(--err); font-size: var(--fs-sm); line-height: var(--lh); }
+.ex-alert > .i { width: 14px; height: 14px; flex-shrink: 0; margin-top: 2px; }
 
 /* 格式 / 范围选择：实体选择卡（隐藏原生单选，选中以强调描边 + 指示点表达） */
 .ex-scope { margin: 0; padding: 0; border: 0; display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }

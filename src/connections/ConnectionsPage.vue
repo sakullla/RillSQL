@@ -559,7 +559,7 @@ watch(
         <Listbox v-model="envFilter" :options="envOptions" aria-label="按环境筛选" />
         <span class="grow"></span><span class="muted sm">{{ filtered.length }} 个连接</span>
       </div>
-      <p v-if="loadError" class="page-note" role="alert">{{ loadError }}</p><p v-else-if="note" class="page-note" role="status">{{ note }}</p>
+      <p v-if="loadError" class="page-note" role="alert"><ConnIcon name="alert" />{{ loadError }}</p><p v-else-if="note" class="page-note" role="status">{{ note }}</p>
       <div class="conn-grid">
         <div class="connection-columns" aria-hidden="true"><span>连接 / 数据库</span><span>地址</span><span>传输与认证</span><span>状态 / 操作</span></div>
         <article

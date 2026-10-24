@@ -245,7 +245,7 @@ async function confirm() {
       </header>
       <div class="ex-body">
         <p class="ex-target" data-import-target>目标：<b>{{ connectionName }}</b><span class="ex-target-sep" aria-hidden="true">/</span><b class="mono">{{ objectName }}</b> <span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span></p>
-        <p v-if="parseError" class="ex-alert" role="alert">{{ parseError }}</p>
+        <p v-if="parseError" class="ex-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>{{ parseError }}</p>
         <p v-if="resultText" class="ex-note" role="status" data-import-result>{{ resultText }}</p>
         <div class="ex-path">
           <label for="import-table">导入到</label>
@@ -264,7 +264,7 @@ async function confirm() {
         <label class="ex-path">选择文件
           <input type="file" aria-label="导入文件" accept=".csv,.tsv,.json,.txt,.xlsx,text/csv,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" :disabled="writing" @change="onFile" />
         </label>
-        <p v-if="parsed && gaps.length" class="ex-alert" role="alert">必填字段 {{ gaps.join("、") }} 没有对应列，不能开始写入。</p>
+        <p v-if="parsed && gaps.length" class="ex-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>必填字段 {{ gaps.join("、") }} 没有对应列，不能开始写入。</p>
         <table v-if="parsed" class="map-table">
           <thead><tr><th>表字段</th><th>文件列</th></tr></thead>
           <tbody>
@@ -311,7 +311,9 @@ async function confirm() {
 .ex-body { padding: var(--sp-4) var(--sp-5); overflow: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
 .ex-foot { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-5); border-top: 1px solid var(--line-2); background: color-mix(in srgb, var(--surface-overlay) 94%, var(--text) 6%); border-radius: 0 0 var(--r-xl) var(--r-xl); }
 .ex-note { margin: 0; font-size: var(--fs-sm); color: var(--text-2); line-height: var(--lh); }
-.ex-alert { margin: 0; padding: var(--sp-2) var(--sp-3); background: var(--err-soft); color: var(--err); border: 1px solid var(--err-line); border-radius: var(--r); font-size: var(--fs-sm); line-height: var(--lh); }
+/* 错误卡：与全局 err 模式一致（软底卡 + 同色 3px 左缘 + 语义图标） */
+.ex-alert { display: flex; align-items: flex-start; gap: var(--sp-2); margin: 0; padding: var(--sp-2) var(--sp-3); background: var(--err-soft); color: var(--err); border: 1px solid var(--err-line); border-radius: var(--r); box-shadow: inset 3px 0 0 var(--err); font-size: var(--fs-sm); line-height: var(--lh); }
+.ex-alert > .i { width: 14px; height: 14px; flex-shrink: 0; margin-top: 2px; }
 .ex-path :deep(.listbox),
 .map-table :deep(.listbox) { width: 100%; }
 .ex-path :deep(.listbox-trigger),

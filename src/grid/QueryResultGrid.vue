@@ -33,6 +33,8 @@ const props = defineProps<{
 }>();
 
 const rootEl = ref<HTMLElement | null>(null);
+/* 错误卡语义图标：圆 + 叉，与 DataGrid/对象树/历史等处的统一 err 线稿一致 */
+const ERROR_ICON = "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6";
 const find = ref("");
 const sort = ref<SortSpec | null>(null);
 const exportOpen = ref(false);
@@ -819,7 +821,7 @@ watch(() => props.rows, (rows) => {
       <div class="sheet" role="dialog" aria-modal="true" aria-label="待提交的更改">
         <header><div><h2>提交这些更改？</h2><p class="hint" data-confirm-target>目标：{{ connectionName }} / {{ objectName }} <span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span></p><p class="hint">将按顺序逐条写入数据库，遇到错误即停止；已写入的不会自动撤销。查询结果不能新增行。</p></div></header>
         <div class="body">
-          <p v-if="commitError" class="sheet-error" role="alert" data-commit-error>{{ commitError }}</p>
+          <p v-if="commitError" class="sheet-error" role="alert" data-commit-error><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ERROR_ICON" /></svg>{{ commitError }}</p>
           <ol class="sql-list"><li v-for="step in editSession.preview()" :key="step.id"><strong>{{ step.label }}</strong><pre>{{ step.sql }}</pre></li></ol>
         </div>
         <footer>

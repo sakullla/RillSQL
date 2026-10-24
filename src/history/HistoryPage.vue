@@ -261,6 +261,7 @@ onMounted(() => {
       <p v-if="actionError" class="saved-alert" role="alert">{{ actionError }}</p>
 
       <div v-if="loadError" class="hist-error" role="alert">
+        <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>
         <p>历史没有读出来：{{ loadError }}</p>
         <button class="btn sm" type="button" data-action="retry-history" @click="load">重试</button>
       </div>
@@ -332,6 +333,7 @@ onMounted(() => {
         </div>
         <p v-if="actionError" class="saved-alert" role="alert">{{ actionError }}</p>
         <div v-if="savedError" class="hist-error" role="alert">
+          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>
           <p>保存的查询没有读出来：{{ savedError }}</p>
           <button class="btn sm" type="button" data-action="retry-saved" @click="loadSaved">重试</button>
         </div>
@@ -400,7 +402,9 @@ onMounted(() => {
 .hist-filters input { flex: 1; min-width: 220px; max-width: 420px; }
 
 /* ---------- 错误与确认条 ---------- */
-.hist-error { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4); border: 1px solid var(--err-line); border-radius: var(--r-md); background: var(--err-soft); color: var(--err); font-size: var(--fs-sm); }
+/* 读取失败卡：与全局 err 模式一致（软底卡 + 同色 3px 左缘 + 语义图标） */
+.hist-error { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4); border: 1px solid var(--err-line); border-radius: var(--r-md); background: var(--err-soft); color: var(--err); box-shadow: inset 3px 0 0 var(--err); font-size: var(--fs-sm); }
+.hist-error .i { width: 14px; height: 14px; flex-shrink: 0; }
 .hist-error p { margin: 0; flex: 1; }
 .hist-clear { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; padding: var(--sp-2) var(--sp-3); margin-top: var(--sp-2); background: var(--warn-soft); border: 1px solid var(--warn-line); border-radius: var(--r-md); font-size: var(--fs-sm); }
 .hist-clear > span { flex: 1; min-width: 200px; }

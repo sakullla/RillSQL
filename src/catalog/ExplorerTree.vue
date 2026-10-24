@@ -51,7 +51,7 @@ const ICONS = {
   diagram: "M4 5h6v5H4zM14 5h6v5h-6zM9 16h6v5H9zM7 10v3h10v-3M12 13v3",
   structure: "M4 4h16v16H4zM4 10h16M10 10v10",
   query: "M6 4h12v16H6zM9 8h6M9 12h6M9 16h3",
-  braces: "M8 4c-2 0-2 3-2 3s0 3-2 3c2 0 2 3 2 3s0 3 2 3M16 4c2 0 2 3 2 3s0 3 2 3c-2 0-2 3-2 3s0 3-2 3",
+  braces: "M8 6c-2 0-2 3-2 3s0 3-2 3c2 0 2 3 2 3s0 3 2 3M16 6c2 0 2 3 2 3s0 3 2 3c-2 0-2 3-2 3s0 3 2 3",
   copy: "M9 9h11v11H9zM4 15V4h11",
   tag: "M4 4h7l9 9-7 7-9-9zM8 8h.01",
   trash: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6",
@@ -482,6 +482,7 @@ onBeforeUnmount(() => {
       </div>
     </template>
     <div v-else-if="connections.length === 0 && !loadError" class="tree-note tree-empty">
+      <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.info" /></svg>
       <span>还没有打开的连接。新建连接后，这里会列出数据库、schema 和表。</span>
       <button class="btn sm" type="button" data-action="tree-new-connection" @click="emit('new-connection')">新建连接</button>
     </div>

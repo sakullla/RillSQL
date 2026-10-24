@@ -1198,7 +1198,7 @@ onBeforeUnmount(() => {
       </div>
     </div>
     <p v-if="notice" class="q-banner is-notice">{{ notice }}</p>
-    <p v-if="actionError" class="q-banner is-error" role="alert">{{ actionError }}</p>
+    <p v-if="actionError" class="q-banner is-error" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>{{ actionError }}</p>
     <p v-if="hintVisible" class="q-hint" :data-keywords-only="hint.keywordsOnly" :title="hint.note">{{ hint.note }}</p>
     <div ref="host" class="cm-host"></div>
     <div class="editor-position"><span class="q-guide">{{ operationGuide }}</span><span class="mono">Ln {{ cursor.line }}, Col {{ cursor.column }}</span></div>
@@ -1360,8 +1360,10 @@ onBeforeUnmount(() => {
 /* ---------- 提示条 / 横幅 ---------- */
 .q-note, .q-hint, .q-banner { margin: 0; font-size: var(--fs-sm); color: var(--text-2); }
 .q-hint, .q-banner { padding: var(--sp-1) var(--sp-4); }
-.q-banner { color: var(--text); background: var(--surface-sunken); box-shadow: inset 2px 0 0 var(--line-2); }
-.q-banner.is-error { color: var(--err); background: var(--err-soft); box-shadow: inset 2px 0 0 var(--err); }
+.q-banner { display: flex; align-items: center; gap: var(--sp-2); color: var(--text); background: var(--surface-sunken); box-shadow: inset 2px 0 0 var(--line-2); }
+.q-banner .i { width: 14px; height: 14px; flex-shrink: 0; }
+/* 错误横幅与全局 err 模式一致：软底卡 + 同色 3px 左缘 + 语义图标 */
+.q-banner.is-error { color: var(--err); background: var(--err-soft); box-shadow: inset 3px 0 0 var(--err); }
 
 /* ---------- 编辑器：sunken 下沉井 ---------- */
 .query-pane .cm-host { flex: 0 1 var(--editor-share); min-height: 90px; margin: var(--sp-2) var(--sp-3) 0; border: 1px solid var(--line); border-radius: var(--r-md); overflow: hidden; background: var(--surface-sunken); box-shadow: inset 0 1px 2px color-mix(in srgb, var(--press) 24%, transparent); }

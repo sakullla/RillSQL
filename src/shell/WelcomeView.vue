@@ -49,6 +49,8 @@ const saved = computed(() => catalogConnections().length > 0);
 </template>
 
 <style scoped>
+/* 间距与字号尽量消费 --sp- 与 --fs- 前缀令牌；个别非 4px 刻度值（30px/28px/14px/10px）为既有视觉节奏，
+   就近刻度会带来可感知的 2px 位移，按任务约定保留原值并在此说明。 */
 /* .btn 的固定高度会裁切带说明的入口；实心仍只来自 .primary。 */
 .desk-action.btn,
 .resume-action.btn {
@@ -67,8 +69,8 @@ const saved = computed(() => catalogConnections().length > 0);
   color: color-mix(in srgb, var(--on-accent) 78%, transparent);
 }
 /* 品牌区：BrandMark + 中文导语，双主题令牌取色，不出现硬编码颜色。 */
-.welcome-hero { display: flex; align-items: center; gap: var(--sp-5); margin: 8px 0 30px; flex-wrap: wrap; }
-.hero-kicker { margin: 0 0 var(--sp-2); font: 600 11px/1 var(--mono); letter-spacing: .12em; color: var(--accent-text); }
+.welcome-hero { display: flex; align-items: center; gap: var(--sp-5); margin: var(--sp-2) 0 30px; flex-wrap: wrap; }
+.hero-kicker { margin: 0 0 var(--sp-2); font: 600 var(--fs-xs)/1 var(--mono); letter-spacing: .12em; color: var(--accent-text); }
 .welcome-hero h1 { font-size: var(--fs-xxl); letter-spacing: -.02em; margin: 0 0 10px; font-weight: 650; }
 .welcome-hero p { margin: 0; color: var(--text-2); font-size: var(--fs-md); }
 .hero-facts {
@@ -88,7 +90,7 @@ const saved = computed(() => catalogConnections().length > 0);
 .hero-facts li { display: flex; align-items: center; gap: var(--sp-1); }
 .hero-facts .i { width: 14px; height: 14px; color: var(--ok); flex-shrink: 0; }
 /* 继续态入口卡：复用空态入口的图标语言与悬浮上移质感。 */
-.welcome-quick { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 32px; }
+.welcome-quick { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: var(--sp-7); }
 .resume-action:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line-2)); box-shadow: var(--shadow); transform: translateY(-1px); }
 @media (max-width: 960px) {
   .welcome-quick { grid-template-columns: 1fr; gap: 10px; }

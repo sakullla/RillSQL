@@ -152,6 +152,31 @@ describe("query history", () => {
     expect(wrapper.get("[data-action='show-saved']").attributes("aria-selected")).toBe("true");
     expect(wrapper.findAll(".hist-switch button").every((button) => !button.classes().includes("primary"))).toBe(true);
     expect(wrapper.findAll("button.primary").map((button) => button.attributes("data-action"))).toEqual(["save-named-query"]);
+    // 空态走共享 .empty 模式，不是错误卡
+    expect(wrapper.get(".empty h3").text()).toBe("还没有保存的查询");
+    expect(wrapper.find(".hist-error").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("unifies the read-failure card and the empty state in the shared state patterns", async () => {
+    // 失败态：err 软底卡 + 语义图标 + role=alert，与网格/导出等处一致
+    invoke.mockRejectedValueOnce(new Error("磁盘读不了"));
+    const wrapper = mount(HistoryPage);
+    await flushPromises();
+    const card = wrapper.get(".hist-error");
+    expect(card.attributes("role")).toBe("alert");
+    expect(card.find("svg.i").exists()).toBe(true);
+    expect(card.text()).toContain("历史没有读出来");
+    expect(card.text()).toContain("磁盘读不了");
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "query_history") return [];
+      throw new Error(command);
+    });
+    await wrapper.get("[data-action='retry-history']").trigger("click");
+    await flushPromises();
+    const empty = wrapper.get(".empty");
+    expect(empty.find("h3").text()).toBe("历史为空");
+    expect(empty.find("p").text()).toContain("执行过的 SQL 会出现在这里");
     wrapper.unmount();
   });
 
