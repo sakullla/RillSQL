@@ -60,9 +60,9 @@ function onNullCopy(value: string) {
           <p>修改立即生效，只保存在本机。</p>
         </div>
       </div>
-      <nav class="settings-nav" aria-label="设置分区"><button class="btn sm" @click="scrollSection('appearance')">外观与编辑器</button><button class="btn sm" @click="scrollSection('reading')">数据读取</button><button class="btn sm" @click="scrollSection('local')">本地数据</button></nav>
+      <nav class="settings-nav" aria-label="设置分区"><button class="btn sm" @click="scrollSection('appearance')">外观</button><button class="btn sm" @click="scrollSection('reading')">数据读取</button><button class="btn sm" @click="scrollSection('behavior')">执行与复制</button><button class="btn sm" @click="scrollSection('local')">本机数据</button></nav>
       <section id="appearance" class="set-sec">
-        <h2>外观</h2>
+        <h2><Icon name="sliders" />外观</h2>
         <div class="set-row">
           <div class="set-text">
             <h4>主题</h4>
@@ -81,7 +81,7 @@ function onNullCopy(value: string) {
         <div class="set-row">
           <div class="set-text">
             <h4>界面密度</h4>
-            <p>紧凑适合大屏阅读更多行；标准更易点按。</p>
+            <p>行高与控件尺寸分三档：紧凑在大屏一次读更多行，标准均衡易点按，宽松进一步放宽行距。</p>
           </div>
           <div class="set-ctl">
             <div class="seg-radio">
@@ -90,6 +90,9 @@ function onNullCopy(value: string) {
               </label>
               <label :class="{ on: settings.density === 'standard' }">
                 <input type="radio" name="set-density" value="standard" :checked="settings.density === 'standard'" @change="setDensity('standard')" />标准
+              </label>
+              <label :class="{ on: settings.density === 'relaxed' }">
+                <input type="radio" name="set-density" value="relaxed" :checked="settings.density === 'relaxed'" @change="setDensity('relaxed')" />宽松
               </label>
             </div>
           </div>
@@ -105,7 +108,7 @@ function onNullCopy(value: string) {
         </div>
       </section>
       <section id="reading" class="set-sec">
-        <h2>数据读取</h2>
+        <h2><Icon name="table" />数据读取</h2>
         <div class="set-row">
           <div class="set-text">
             <h4>每次读取的行数</h4>
@@ -133,6 +136,9 @@ function onNullCopy(value: string) {
             <Listbox :model-value="String(settings.objectPage)" :options="objectOptions" aria-label="对象列表每次显示" @update:model-value="onNumber('objectPage', $event)" />
           </div>
         </div>
+      </section>
+      <section id="behavior" class="set-sec">
+        <h2><Icon name="play" />执行与复制</h2>
         <div class="set-row">
           <div class="set-text">
             <h4>语句执行超时</h4>
@@ -153,7 +159,7 @@ function onNullCopy(value: string) {
         </div>
       </section>
       <section id="local" class="set-sec">
-        <h2>本地数据</h2>
+        <h2><Icon name="lock" />本机数据</h2>
         <div class="set-row">
           <div class="set-text">
             <h4>配置与历史的位置</h4>
@@ -188,3 +194,27 @@ function onNullCopy(value: string) {
     </div>
   </div>
 </template>
+
+<style scoped>
+/* 分组卡片化：平铺的设置行落进面板卡片，与连接页/工作台的表面层级（panel + line 描边 + sm 阴影）一致；
+   about 区自带卡片，不套第二层。 */
+section.set-sec:not(.about) {
+  padding: 0 var(--sp-5);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-sm);
+}
+section.set-sec > h2 {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: var(--sp-3) 0 var(--sp-1);
+}
+section.set-sec > h2 .i { width: 14px; height: 14px; flex-shrink: 0; }
+section.set-sec:not(.about) .set-row:last-child { border-bottom: 0; padding-bottom: var(--sp-3); }
+@media (max-width: 720px) {
+  section.set-sec:not(.about) .set-row { flex-wrap: wrap; align-items: flex-start; }
+}
+</style>
