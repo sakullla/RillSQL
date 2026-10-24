@@ -268,6 +268,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+/* ADR-3 实体质感：触发器 1px 内描边 + 按压内阴影，弹层走 overlay 表面。颜色全部引用令牌。 */
 .listbox { position: relative; display: inline-flex; min-width: 0; }
 .listbox-trigger {
   display: inline-flex;
@@ -276,11 +277,12 @@ onBeforeUnmount(() => {
   height: var(--control-h);
   max-width: 100%;
   padding: 0 var(--sp-2) 0 var(--sp-3);
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--stroke-strong);
   border-radius: var(--r);
-  background: var(--panel);
+  background: var(--surface-panel);
   color: var(--text);
   font-size: var(--fs-sm);
+  box-shadow: var(--shadow-sm);
   transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
 }
 .listbox-trigger:hover:not(:disabled) { background: var(--hover); }
@@ -304,9 +306,9 @@ onBeforeUnmount(() => {
   z-index: var(--z-menu);
   max-width: min(320px, calc(100vw - 16px));
   padding: var(--sp-1);
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--stroke-strong);
   border-radius: var(--r-md);
-  background: var(--panel);
+  background: var(--surface-overlay);
   box-shadow: var(--shadow);
   animation: pop-in var(--dur-fast) var(--ease-out);
 }
@@ -315,9 +317,9 @@ onBeforeUnmount(() => {
   height: var(--control-h-sm);
   margin-bottom: var(--sp-1);
   padding: 0 var(--sp-2);
-  border: 1px solid var(--line-2);
-  border-radius: var(--r);
-  background: var(--panel);
+  border: 1px solid var(--stroke-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface-panel);
   font-size: var(--fs-sm);
 }
 .listbox-filter:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--ring); }
@@ -328,13 +330,13 @@ onBeforeUnmount(() => {
   gap: var(--sp-2);
   height: var(--control-h-sm);
   padding: 0 var(--sp-2);
-  border-radius: var(--r);
+  border-radius: var(--r-sm);
   font-size: var(--fs-sm);
   color: var(--text);
   cursor: default;
   white-space: nowrap;
 }
-.listbox-option.on { background: var(--hover); }
+.listbox-option.on { background: var(--active); }
 .listbox-option.picked { background: var(--sel-strong); color: var(--accent-text); font-weight: 600; }
 .listbox-option.disabled { color: var(--disabled-fg); }
 .listbox-option.disabled.on { background: none; }
