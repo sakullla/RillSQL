@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import Icon from "../shell/Icon.vue";
 import { ref } from "vue";
 import { fkActions, foreignKeyLabel } from "./logic";
 import type { StructureForeignKey, StructureIncoming } from "./types";
@@ -47,7 +48,7 @@ function previewCreate() {
 </script>
 
 <template>
-  <div class="struct-foreign">
+  <div class="struct-foreign struct-sec">
     <p v-if="engine === 'sqlite'" class="callout" :class="{ warn: enforced !== true }">
       SQLite 靠 foreign_keys 开关决定外键是否检查数据，当前这个连接是 {{ foreignKeyLabel(enforced) }}。
       <template v-if="enforced === false">新建的外键不会真正检查数据，可以先为这次连接开启。</template>
@@ -57,22 +58,26 @@ function previewCreate() {
     </p>
     <p v-if="myisam" class="callout warn">这张表使用 MyISAM，不支持外键；不会通过关闭检查来假装创建成功。</p>
 
-    <h3>这张表的外键</h3>
-    <p v-if="!foreignKeys.length" class="muted">这张表还没有外键。</p>
-    <div v-for="key in foreignKeys" :key="key.name" class="obj-row">
-      <code>{{ key.name }}</code>
-      <span>{{ key.columns.join(", ") }} → {{ key.refTable }}({{ key.refColumns.join(", ") }})</span>
-      <span class="badge sm">删除引用行时 {{ key.onDelete }} · 更新引用列时 {{ key.onUpdate }}</span>
-      <span class="grow"></span>
-      <button class="btn sm danger" type="button" @click="emit('drop', key.name)">删除</button>
+    <h3><Icon name="link" />这张表的外键</h3>
+    <div v-if="foreignKeys.length" class="obj-list">
+      <div v-for="key in foreignKeys" :key="key.name" class="obj-row">
+        <code>{{ key.name }}</code>
+        <span>{{ key.columns.join(", ") }} → {{ key.refTable }}({{ key.refColumns.join(", ") }})</span>
+        <span class="badge sm">删除引用行时 {{ key.onDelete }} · 更新引用列时 {{ key.onUpdate }}</span>
+        <span class="grow"></span>
+        <button class="btn sm danger" type="button" @click="emit('drop', key.name)">删除</button>
+      </div>
     </div>
+    <p v-else class="muted">这张表还没有外键。</p>
 
-    <h3>引用这张表的外键</h3>
-    <p v-if="!incoming.length" class="muted">没有其他表引用这张表。</p>
-    <div v-for="item in incoming" :key="`${item.table}.${item.name}`" class="obj-row">
-      <code>{{ item.table }}.{{ item.name }}</code>
-      <span class="muted">{{ item.columns.join(", ") }} → {{ item.refColumns.join(", ") }}</span>
+    <h3><Icon name="external" />引用这张表的外键</h3>
+    <div v-if="incoming.length" class="obj-list">
+      <div v-for="item in incoming" :key="`${item.table}.${item.name}`" class="obj-row">
+        <code>{{ item.table }}.{{ item.name }}</code>
+        <span class="muted">{{ item.columns.join(", ") }} → {{ item.refColumns.join(", ") }}</span>
+      </div>
     </div>
+    <p v-else class="muted">没有其他表引用这张表。</p>
 
     <form v-if="!myisam" class="struct-form" @submit.prevent="previewCreate">
       <label>名称<input v-model="name" type="text" aria-label="外键名称" /></label>

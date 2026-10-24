@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import Icon from "../shell/Icon.vue";
 import { computed, ref, watch } from "vue";
 import { riskLevelLabel, statusLabel, transactionSummary } from "./logic";
 import type { StructurePlan, StructureReceipt } from "./types";
@@ -39,6 +40,7 @@ async function copySql() {
   <div class="overlay" role="presentation" @click.self="emit('cancel')">
     <div class="sheet" role="dialog" aria-modal="true" aria-label="变更预览">
       <header>
+        <span class="sheet-icon" :class="{ danger: !receipt && plan.risks.some((risk) => risk.level === 'danger') }"><Icon :name="receipt ? 'terminal' : 'eye'" /></span>
         <h2>{{ receipt ? "执行结果" : "执行前确认" }}</h2>
         <span class="grow"></span>
       </header>
@@ -100,7 +102,7 @@ async function copySql() {
       <footer>
         <span class="grow"></span>
         <button class="btn" type="button" @click="emit('cancel')">{{ receipt ? "关闭" : "取消" }}</button>
-        <button v-if="!receipt" class="btn primary" type="button" :disabled="blocked || busy || !nameOk" @click="emit('confirm')">确认执行</button>
+        <button v-if="!receipt" class="btn" :class="expectName ? 'danger' : 'primary'" type="button" :disabled="blocked || busy || !nameOk" @click="emit('confirm')">确认执行</button>
       </footer>
     </div>
   </div>

@@ -1,5 +1,7 @@
 /* 结构管理：字段/索引/外键/删除表 与 执行前确认。
-   视觉一律引用 tokens.css 令牌与 base.css 基样式，不硬编码色值与间距。 */
+   R1 重做：对齐网格/对象树的新设计语言——surface-panel 卡片 + --stroke 描边 + --shadow-sm，
+   标识符与类型一律 mono、分区标题带图标、浮层走 --surface-overlay + --shadow-lg。
+   视觉值一律引用 tokens.css 令牌与 base.css 基样式，不硬编码色值与间距。 */
 
 /* ---------- 工作区容器与「数据/结构」切换条（shell 的 WorkspaceView 也使用这两个类） ---------- */
 .structure-pane,
@@ -37,26 +39,92 @@
 }
 .pane-switch button:hover,
 .struct-nav button:hover { background: var(--hover); color: var(--text); }
-.row-focus { background: var(--hover); }
 .pane-switch button[aria-selected="true"],
 .struct-nav button.on { background: var(--sel-strong); color: var(--accent-text); font-weight: 600; }
 .struct-nav button.danger { color: var(--err); }
 .struct-nav button.danger.on { background: var(--err-soft); }
 
-/* ---------- 结构视图正文 ---------- */
-.struct-context {
-  margin: 0;
-  padding: var(--sp-2) var(--sp-4);
+/* ---------- 页头：图标瓦片 + mono 标题 + 统计瓦片 ---------- */
+.structure-heading {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  min-width: 0;
+  max-width: 100%;
+  padding: var(--sp-3) var(--sp-5);
   border-bottom: 1px solid var(--line);
-  color: var(--text-2);
-  font-size: var(--fs-sm);
+  background: var(--panel);
 }
-.struct-context strong { color: var(--text); font-weight: 600; }
-.struct-loading { margin: 0; padding: var(--sp-3) var(--sp-4); }
-.struct-body { flex: 1; min-width: 0; min-height: 0; max-width: 100%; overflow: auto; padding: var(--sp-4); display: flex; flex-direction: column; gap: var(--sp-4); }
-.struct-body h3 { margin: 0; font-size: var(--fs-sm); font-weight: 600; }
+.structure-heading .action-icon { width: 34px; height: 34px; border-radius: var(--r); }
+.structure-heading .action-icon .i { width: 17px; height: 17px; }
+.sh-titles { min-width: 0; flex: 1; }
+.sh-eyebrow { margin: 0; font: 600 var(--fs-xs) var(--mono); letter-spacing: 0.08em; color: var(--text-3); }
+.structure-heading h2 {
+  margin: var(--sp-1) 0 0;
+  font: 600 var(--fs-xl) var(--mono);
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sh-sub { margin: 2px 0 0; color: var(--text-2); font-size: var(--fs-xs); display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
+.sh-sub .ctx { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.structure-stats { display: flex; gap: var(--sp-2); flex-shrink: 0; }
+.stat-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  min-width: 56px;
+  padding: var(--sp-1) var(--sp-3);
+  border: 1px solid var(--stroke);
+  border-radius: var(--r);
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-sm);
+}
+.stat-tile b { font: 600 var(--fs-lg)/1.2 var(--mono); font-variant-numeric: tabular-nums; color: var(--text); }
+.stat-tile span { font-size: var(--fs-xs); color: var(--text-3); white-space: nowrap; }
+
+/* ---------- 分区导航：下划线页签 + 分组图标（语言同对象树分组图标） ---------- */
+.structure-pane .struct-nav {
+  align-items: stretch;
+  gap: var(--sp-1);
+  padding: 0 var(--sp-5);
+  min-height: calc(var(--control-h) + var(--sp-3));
+  background: var(--panel);
+  border-bottom: 1px solid var(--line-2);
+  flex-wrap: nowrap;
+}
+.structure-pane .struct-nav button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  align-self: stretch;
+  height: auto;
+  padding: 0 var(--sp-2);
+  border-radius: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  background: transparent;
+  font-weight: 500;
+}
+.structure-pane .struct-nav button .i { width: 14px; height: 14px; color: var(--text-3); flex-shrink: 0; transition: color var(--dur-fast) var(--ease); }
+.structure-pane .struct-nav button:hover { background: transparent; color: var(--text); border-bottom-color: var(--line-2); }
+.structure-pane .struct-nav button:hover .i { color: var(--text-2); }
+.structure-pane .struct-nav button.on { background: transparent; border-bottom-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+.structure-pane .struct-nav button.on .i { color: var(--accent-text); }
+.structure-pane .struct-nav button.danger,
+.structure-pane .struct-nav button.danger .i { color: var(--err); }
+.structure-pane .struct-nav button.danger:hover,
+.structure-pane .struct-nav button.danger.on { background: transparent; border-bottom-color: var(--err); color: var(--err); }
+
+/* ---------- 正文与提示条 ---------- */
+.struct-loading { margin: 0; padding: var(--sp-3) var(--sp-5); color: var(--text-2); }
+.struct-body { flex: 1; min-width: 0; min-height: 0; max-width: 100%; overflow: auto; padding: var(--sp-5) var(--sp-6); display: flex; flex-direction: column; gap: var(--sp-4); background: var(--bg); }
+.struct-body h3 { display: flex; align-items: center; gap: var(--sp-2); margin: 0; font-size: var(--fs-sm); font-weight: 600; color: var(--text); }
+.struct-body h3 .i { width: 14px; height: 14px; color: var(--text-3); flex-shrink: 0; }
 .struct-alert {
-  margin: var(--sp-2) var(--sp-4) 0;
+  margin: var(--sp-2) var(--sp-5) 0;
   padding: var(--sp-2) var(--sp-3);
   border-radius: var(--r);
   border: 1px solid var(--err-line);
@@ -64,14 +132,15 @@
   color: var(--err);
   font-size: var(--fs-sm);
   line-height: var(--lh);
+  box-shadow: inset 3px 0 0 var(--err);
 }
 .struct-body .struct-alert,
 .sheet .struct-alert { margin: 0; }
 
-/* ---------- 字段表格 ---------- */
+/* ---------- 字段编辑卡片：网格同款列头 + 就地输入 ---------- */
 .struct-toolbar { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
 .struct-toolbar .muted { font-size: var(--fs-sm); }
-.struct-table { border-collapse: collapse; width: max-content; min-width: 100%; max-width: none; font-size: var(--fs-sm); }
+.struct-table { border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; max-width: none; font-size: var(--fs-sm); }
 .struct-table th,
 .struct-table td { border-bottom: 1px solid var(--line); padding: var(--sp-1) var(--sp-2); text-align: left; vertical-align: middle; }
 .struct-table th { color: var(--text-3); font-weight: 600; font-size: var(--fs-xs); }
@@ -81,35 +150,109 @@
 .struct-table .cell-check input { width: 14px; height: 14px; }
 .cell-name { display: flex; align-items: center; gap: var(--sp-2); min-width: 160px; }
 .cell-act { width: 84px; text-align: right; white-space: nowrap; }
-.row-drop td { opacity: 0.55; }
-.row-impact td { padding: 0 var(--sp-2) var(--sp-2); border-bottom: 1px solid var(--line); }
+
+.struct-editor {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  max-width: 100%;
+  overflow: auto;
+  flex-shrink: 0;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-lg);
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-sm);
+}
+.struct-editor .struct-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--line-2);
+  background: var(--panel-2);
+}
+.struct-editor .struct-toolbar .muted { font-size: var(--fs-xs); }
+.struct-editor .struct-table th {
+  padding: var(--sp-2);
+  color: var(--text-2);
+  letter-spacing: 0.03em;
+  background: var(--panel-2);
+  border-bottom-color: var(--line-2);
+  white-space: nowrap;
+}
+.struct-editor .struct-table td { padding: var(--sp-1) var(--sp-2); }
+.struct-editor .struct-table input[type="text"] {
+  height: calc(var(--control-h-sm) + 2px);
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  font: var(--fs-sm) var(--mono);
+}
+.struct-editor .struct-table input[type="text"]:hover { border-color: var(--line-2); }
+.struct-editor .struct-table input[type="text"]:focus { border-color: var(--accent); background: var(--accent-soft); }
+.struct-editor .struct-table tr:last-child td { border-bottom: 0; }
+.struct-editor .cell-act .btn { border-color: transparent; background: transparent; box-shadow: none; }
+.struct-editor .cell-act .btn:hover:not(:disabled) { border-color: var(--stroke-strong); background: var(--hover); }
+.struct-editor .struct-table tbody tr:hover > td { background: var(--hover); }
+.struct-table input[type="checkbox"] { accent-color: var(--accent); }
+
+/* 行状态：待删除红底 + 命中行强调左缘（语言同网格行状态） */
+.row-drop > td { background: var(--err-soft); }
+.struct-editor .row-drop input[type="text"] { color: var(--err); text-decoration: line-through; opacity: 0.75; }
+.row-impact > td { padding: 0 var(--sp-2) var(--sp-2); border-bottom: 1px solid var(--line); }
+.struct-table tr.row-focus > td { background: var(--sel-strong); }
+
+/* 影响说明：软底 + 同色系左缘 */
 .impact {
   margin: 0;
   padding: var(--sp-2) var(--sp-3);
-  border-radius: var(--r);
+  border-radius: var(--r-sm);
+  border-left: 3px solid var(--stroke-strong);
   background: var(--sunken);
   color: var(--text-2);
   font-size: var(--fs-sm);
   line-height: var(--lh);
 }
-.impact.warn { background: var(--warn-soft); color: var(--warn); }
-.impact.danger { background: var(--err-soft); color: var(--err); }
+.impact.info { border-left-color: var(--info); background: var(--info-soft); }
+.impact.warn { border-left-color: var(--warn); background: var(--warn-soft); color: var(--warn); }
+.impact.danger { border-left-color: var(--err); background: var(--err-soft); color: var(--err); }
 
-/* ---------- 索引 / 外键 ---------- */
+/* ---------- 索引 / 外键：分区标题 + 对象行卡片 ---------- */
 .hint { margin: 0; font-size: var(--fs-xs); color: var(--text-3); line-height: var(--lh); }
-.obj-row { display: flex; gap: var(--sp-3); align-items: center; padding: var(--sp-2) 0; border-bottom: 1px solid var(--line); font-size: var(--fs-sm); flex-wrap: wrap; }
-.obj-row code { font-family: var(--mono); font-size: var(--fs-xs); background: var(--sunken); padding: 1px var(--sp-1); border-radius: var(--r-sm); }
+.struct-sec { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
+.obj-list {
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-lg);
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+.obj-row {
+  display: flex;
+  gap: var(--sp-3);
+  align-items: center;
+  padding: var(--sp-2) var(--sp-4);
+  border-bottom: 1px solid var(--line);
+  font-size: var(--fs-sm);
+  flex-wrap: wrap;
+  transition: background var(--dur-fast) var(--ease);
+}
+.obj-list .obj-row:last-child { border-bottom: 0; }
+.obj-row:hover,
+.row-focus { background: var(--hover); }
+.obj-row.row-focus { box-shadow: inset 2px 0 0 var(--accent); background: var(--sel); }
+.obj-row code {
+  font: 500 var(--fs-xs) var(--mono);
+  background: var(--sunken);
+  padding: 1px var(--sp-1);
+  border-radius: var(--r-sm);
+  box-shadow: inset 0 0 0 1px var(--stroke);
+}
 .lock { color: var(--text-3); font-size: var(--fs-xs); }
-.struct-form { display: flex; flex-wrap: wrap; gap: var(--sp-3); align-items: flex-end; }
-.struct-form > label { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-xs); color: var(--text-3); }
-.struct-form .check { flex-direction: row; align-items: center; gap: var(--sp-1); color: var(--text-2); font-size: var(--fs-sm); min-height: var(--control-h); }
-.part-row { display: flex; gap: var(--sp-2); align-items: center; }
-.part-row > label { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-xs); color: var(--text-3); }
-.part-row .check { flex-direction: row; align-items: center; gap: var(--sp-1); color: var(--text-2); font-size: var(--fs-sm); }
 .callout {
   margin: 0;
   padding: var(--sp-2) var(--sp-3);
-  border-radius: var(--r);
+  border-radius: var(--r-md);
   background: var(--info-soft);
   color: var(--text);
   font-size: var(--fs-sm);
@@ -122,7 +265,42 @@
 .callout.warn { background: var(--warn-soft); color: var(--warn); }
 .plain-list { margin: 0; padding-left: var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-1); }
 
-/* ---------- 执行前确认 / 执行结果 ---------- */
+/* ---------- 表单卡片：字段标签 + 下沉井控件（基样式来自 base.css） ---------- */
+.struct-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3) var(--sp-4);
+  align-items: flex-end;
+  padding: var(--sp-4);
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-lg);
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-sm);
+}
+.struct-form > label { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-xs); font-weight: 500; color: var(--text-2); }
+.struct-form input[type="text"],
+.struct-form select { min-width: 140px; }
+.struct-form .check { flex-direction: row; align-items: center; gap: var(--sp-1); color: var(--text-2); font-size: var(--fs-sm); min-height: var(--control-h); font-weight: 400; }
+.part-row { display: flex; gap: var(--sp-2); align-items: flex-end; }
+.part-row > label { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-xs); font-weight: 500; color: var(--text-2); }
+.part-row .check { flex-direction: row; align-items: center; gap: var(--sp-1); color: var(--text-2); font-size: var(--fs-sm); }
+
+/* ---------- 删除表分区：危险色卡片 ---------- */
+.struct-drop {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  border: 1px solid var(--err-line);
+  border-radius: var(--r-lg);
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-sm);
+}
+.struct-drop h3 { font-size: var(--fs-md); }
+.struct-drop h3,
+.struct-drop h3 .i { color: var(--err); }
+
+/* ---------- 执行前确认 / 执行结果：overlay 浮层（与 grid.css 的 sheet 同一语言） ---------- */
 .overlay {
   position: fixed;
   inset: 0;
@@ -138,10 +316,10 @@
   width: min(720px, 100%);
   max-height: min(88vh, 880px);
   overflow: auto;
-  background: var(--panel);
+  background: var(--surface-overlay);
   color: var(--text);
   border-radius: var(--r-xl);
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--stroke-strong);
   box-shadow: var(--shadow-lg);
   display: flex;
   flex-direction: column;
@@ -150,22 +328,50 @@
 .sheet h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.01em; }
 .sheet header,
 .sheet footer { display: flex; gap: var(--sp-2); align-items: center; padding: var(--sp-3) var(--sp-4); }
-.sheet header { border-bottom: 1px solid var(--line); }
-.sheet footer { border-top: 1px solid var(--line); background: var(--panel-2); }
+.sheet header { border-bottom: 1px solid var(--line-2); }
+.sheet footer { border-top: 1px solid var(--line-2); background: color-mix(in srgb, var(--surface-overlay) 94%, var(--text) 6%); border-radius: 0 0 var(--r-xl) var(--r-xl); }
 .sheet .body { padding: var(--sp-3) var(--sp-4); display: flex; flex-direction: column; gap: var(--sp-3); overflow: auto; }
+.sheet-icon {
+  display: grid;
+  place-items: center;
+  width: var(--control-h);
+  height: var(--control-h);
+  border-radius: var(--r);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  flex-shrink: 0;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 20%, transparent);
+}
+.sheet-icon .i { width: 15px; height: 15px; }
+.sheet-icon.danger { background: var(--err-soft); color: var(--err); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--err) 22%, transparent); }
+
 .pv-sec { display: flex; flex-direction: column; gap: var(--sp-2); }
-.pv-h { margin: 0; font-size: var(--fs-sm); color: var(--text-3); font-weight: 600; }
+.pv-h { margin: 0; font-size: var(--fs-xs); color: var(--text-3); font-weight: 600; letter-spacing: 0.05em; }
 .pv-target { margin: 0; font-size: var(--fs-md); font-weight: 600; }
-.pv-steps { margin: 0; padding-left: var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-sm); }
+.pv-steps { margin: 0; padding-left: var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-sm); color: var(--text-2); }
+.pv-steps li::marker { font: 500 var(--fs-xs) var(--mono); color: var(--text-3); }
 .pv-risk { margin: 0; display: flex; gap: var(--sp-2); align-items: baseline; font-size: var(--fs-sm); line-height: var(--lh); }
 .pv-tx { margin: 0; display: flex; gap: var(--sp-2); align-items: baseline; font-size: var(--fs-sm); color: var(--text-2); line-height: var(--lh); }
-.pv-confirm { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-sm); color: var(--err); line-height: var(--lh); }
+.pv-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--err-line);
+  border-radius: var(--r);
+  background: var(--err-soft);
+  color: var(--err);
+  font-size: var(--fs-sm);
+  line-height: var(--lh);
+}
+.pv-confirm input { height: var(--control-h-sm); background: var(--surface-overlay); }
 .pv-sql { display: flex; flex-direction: column; gap: var(--sp-1); }
 .pv-sql strong { font-size: var(--fs-xs); color: var(--text-3); }
 .pv-sql pre {
   margin: 0;
   padding: var(--sp-2) var(--sp-3);
   background: var(--sunken);
+  border: 1px solid var(--stroke);
   border-radius: var(--r);
   overflow: auto;
   font-family: var(--mono);
@@ -175,32 +381,9 @@
 }
 .receipt-row { display: grid; grid-template-columns: auto 1fr; gap: var(--sp-2); align-items: baseline; padding: var(--sp-1) 0; border-bottom: 1px solid var(--line); font-size: var(--fs-sm); line-height: var(--lh); }
 
-.structure-heading { display: flex; align-items: center; gap: 14px; min-width: 0; max-width: 100%; padding: 20px 24px; border-bottom: 1px solid var(--line); background: var(--panel-2); }
-.structure-heading > div { min-width: 0; flex: 1; }
-.structure-heading h2,
-.structure-heading p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.structure-heading .eyebrow { font: 10px var(--mono); letter-spacing: .08em; }
-.structure-heading h2 { margin: 6px 0; font: 600 20px var(--mono); }
-.structure-heading p { margin: 0; color: var(--text-2); font-size: var(--fs-xs); }
-.structure-stats { display: flex; gap: 24px; color: var(--text-3); font-size: var(--fs-xs); }
-.structure-stats b { display: block; color: var(--text); font: 20px var(--mono); font-variant-numeric: tabular-nums; text-align: center; margin-bottom: 4px; }
-.structure-pane .struct-nav { gap: 16px; padding: 0 24px; min-height: 42px; background: var(--panel-2); }
-.structure-pane .struct-nav button { height: 42px; padding: 0 6px; border-radius: 0; border-bottom: 2px solid transparent; }
-.structure-pane .struct-nav button.on { border-bottom-color: var(--accent); color: var(--accent-text); background: transparent; }
-.structure-pane .struct-nav button:hover { border-bottom-color: var(--line-2); }
-.structure-pane .struct-nav button.on:hover { border-bottom-color: var(--accent); }
-.structure-pane .struct-body { padding: 20px 24px; background: var(--bg); }
-.struct-editor { border: 1px solid var(--line); background: var(--panel); border-radius: var(--r-lg); min-width: 0; max-width: 100%; overflow: auto; flex-shrink: 0; }
-.struct-editor .struct-toolbar { padding: 14px 16px; }
-.struct-editor .struct-toolbar .muted { font-size: var(--fs-xs); }
-.struct-editor .struct-table thead { background: var(--panel-2); }
-.struct-editor .struct-table th { padding-top: 10px; padding-bottom: 10px; }
-.struct-editor .struct-table td { padding-top: 7px; padding-bottom: 7px; }
-.struct-editor .struct-table input[type="text"] { border-color: transparent; background: transparent; font: var(--fs-sm) var(--mono); }
-.struct-editor .struct-table input[type="text"]:hover { border-color: var(--line-2); }
-.struct-editor .struct-table input[type="text"]:focus { border-color: var(--accent); background: var(--panel); }
-.struct-editor .struct-table tr:last-child td { border-bottom: 0; }
-.struct-editor .cell-act .btn { border-color: transparent; background: transparent; }
-.struct-editor .struct-table tbody tr:hover { background: var(--panel-2); }
-.struct-table input[type="checkbox"] { accent-color: var(--accent); }
-@media (max-width: 800px) { .structure-heading { padding: 16px; } .structure-stats { display: none; } .structure-pane .struct-body { padding: 12px; } }
+@media (max-width: 800px) {
+  .structure-heading { padding: var(--sp-3) var(--sp-4); }
+  .structure-stats { display: none; }
+  .structure-pane .struct-nav { padding: 0 var(--sp-3); }
+  .structure-pane .struct-body { padding: var(--sp-3); }
+}

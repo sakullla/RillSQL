@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import Icon from "../shell/Icon.vue";
 import { computed } from "vue";
 import { columnImpact, columnMark, impactLevel, pendingCount } from "./logic";
 import type { ColumnDraft, StructureColumn } from "./types";
@@ -57,7 +58,7 @@ function toggleDrop(draft: ColumnDraft) {
       <span v-else-if="mode === 'edit'" class="muted">直接改下面的字段；改动先记下来，不会立即写入数据库。</span>
       <span v-else class="muted">这张新表将包含下面这些字段。</span>
       <span class="grow"></span>
-      <button class="btn" type="button" @click="addColumn">新增字段</button>
+      <button class="btn" type="button" @click="addColumn"><Icon name="plus" />新增字段</button>
       <button class="btn primary" type="button" :disabled="!changed" @click="emit('preview')">查看将要发生什么</button>
     </div>
     <table class="struct-table">

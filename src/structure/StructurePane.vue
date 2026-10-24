@@ -326,14 +326,23 @@ function createForeignKey(foreignKey: StructureForeignKey) {
   <div class="structure-pane" aria-label="表结构" :data-tab-id="tabId" :data-draft="draft" tabindex="-1">
     <p v-if="purpose === 'edit' && !target" class="empty" role="alert">这张表还没有绑定已打开的连接。</p>
     <template v-else>
-      <header class="structure-heading"><span class="action-icon"><Icon name="table" /></span><div><h2>{{ purpose === 'create' ? '设计新表' : target?.table }}</h2><p><span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span> {{ purpose === 'create' ? '定义字段、类型与约束，预览 SQL 后再创建。' : contextText }}</p></div><span class="grow"></span><div v-if="description" class="structure-stats"><span><b>{{ description.columns.length }}</b> 字段</span><span><b>{{ description.indexes.length }}</b> 索引</span></div></header>
-      <nav class="struct-nav" aria-label="结构分区">
-        <button type="button" :class="{ on: section === 'columns' }" @click="chooseSection('columns')">字段</button>
-        <button v-if="purpose === 'edit'" type="button" :class="{ on: section === 'indexes' }" @click="chooseSection('indexes')">索引</button>
-        <button v-if="purpose === 'edit'" type="button" :class="{ on: section === 'foreign' }" @click="chooseSection('foreign')">外键</button>
-        <button v-if="isView" type="button" :class="{ on: section === 'definition' }" data-section="definition" @click="chooseSection('definition')">定义</button>
+      <header class="structure-heading">
+        <span class="action-icon"><Icon name="table" /></span>
+        <div class="sh-titles">
+          <p class="sh-eyebrow">{{ activeEngine ? `${activeEngine.toUpperCase()} · ` : "" }}表结构</p>
+          <h2>{{ purpose === 'create' ? '设计新表' : target?.table }}</h2>
+          <p class="sh-sub"><span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span><span class="ctx">{{ purpose === 'create' ? '定义字段、类型与约束，预览 SQL 后再创建。' : contextText }}</span></p>
+        </div>
         <span class="grow"></span>
-        <button v-if="purpose === 'edit' && !isView" type="button" class="danger" :class="{ on: section === 'drop' }" @click="chooseSection('drop')">删除表</button>
+        <div v-if="description" class="structure-stats"><div class="stat-tile"><b>{{ description.columns.length }}</b><span>字段</span></div><div class="stat-tile"><b>{{ description.indexes.length }}</b><span>索引</span></div></div>
+      </header>
+      <nav class="struct-nav" aria-label="结构分区">
+        <button type="button" :class="{ on: section === 'columns' }" @click="chooseSection('columns')"><Icon name="columns" />字段</button>
+        <button v-if="purpose === 'edit'" type="button" :class="{ on: section === 'indexes' }" @click="chooseSection('indexes')"><Icon name="sort" />索引</button>
+        <button v-if="purpose === 'edit'" type="button" :class="{ on: section === 'foreign' }" @click="chooseSection('foreign')"><Icon name="link" />外键</button>
+        <button v-if="isView" type="button" :class="{ on: section === 'definition' }" data-section="definition" @click="chooseSection('definition')"><Icon name="code" />定义</button>
+        <span class="grow"></span>
+        <button v-if="purpose === 'edit' && !isView" type="button" class="danger" :class="{ on: section === 'drop' }" @click="chooseSection('drop')"><Icon name="trash" />删除表</button>
       </nav>
       <details v-if="ddlVisible" class="disclosure struct-ddl">
         <summary>建表 SQL</summary>
@@ -392,7 +401,7 @@ function createForeignKey(foreignKey: StructureForeignKey) {
           @enable="openPreview({ kind: 'setForeignKeys', enabled: true })"
         />
         <section v-else-if="section === 'drop' && target" class="struct-drop">
-          <h3>删除表 {{ target.table }}</h3>
+          <h3><Icon name="trash" />删除表 {{ target.table }}</h3>
           <p class="impact danger">
             将永久删除这张表<template v-if="description?.rowCount != null">和里面约 {{ description.rowCount }} 行数据</template>
             <template v-else>和里面所有数据（暂时不知道有多少行）</template>，无法恢复。
@@ -437,21 +446,35 @@ function createForeignKey(foreignKey: StructureForeignKey) {
 /* 建表 SQL 区块：折叠壳复用 base.css 的 disclosure，正文 pre 与 structure.css 的 pv-sql pre 同款。 */
 .struct-ddl { border-bottom: 1px solid var(--line); background: var(--panel-2); }
 .struct-ddl-bar { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-2); }
-.struct-view-def { display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-3); min-height: 0; }
+.struct-view-def {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  min-height: 0;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-lg);
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-sm);
+}
 .struct-view-def textarea {
   min-height: 180px;
   padding: var(--sp-2) var(--sp-3);
-  border: 1px solid var(--line);
+  border: 1px solid var(--stroke);
   border-radius: var(--r);
   background: var(--sunken);
   color: var(--text);
   font: var(--fs-sm) var(--mono);
   resize: vertical;
+  box-shadow: inset 0 1px 2px color-mix(in srgb, var(--press) 30%, transparent);
+  transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
 }
+.struct-view-def textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--ring); }
 .struct-ddl pre {
   margin: 0 0 var(--sp-2);
   padding: var(--sp-2) var(--sp-3);
   background: var(--sunken);
+  border: 1px solid var(--stroke);
   border-radius: var(--r);
   overflow: auto;
   font-family: var(--mono);
