@@ -6,7 +6,7 @@ import { browseSql, qualifiedObjectName, type CatalogObjectRef } from "./object-
 import type { DiagramOpen } from "../diagram/types";
 import SchemaBlock from "./SchemaBlock.vue";
 import { catalogConnections, catalogLoadError, refreshCatalog, schemaKey, setStructureFocus } from "./store";
-import { engineShape, isConnected, isDefinitionKind, objectKey, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
+import { engineShape, isConnected, isDefinitionKind, KIND_LABEL, objectKey, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
 import type { CatalogConnection, DatabaseNode } from "./types";
 
 const props = defineProps<{ filter: string }>();
@@ -35,11 +35,26 @@ const ICONS = {
   database: "M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3ZM4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3",
   schema: "m12 3 9 5-9 5-9-5 9-5ZM3 13l9 5 9-5",
   table: "M4 4h16a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1ZM3 10h18M10 10v10",
+  view: "M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12ZM9 12a3 3 0 1 0 6 0 3 3 0 1 0-6 0",
+  function: "M8 7h3M8 12h3M8 17h3M14 7l2 5-2 5M4 4h16v16H4z",
+  procedure: "M6 7h12M6 12h12M6 17h8M4 4h16v16H4z",
+  trigger: "M12 3v4M12 17v4M4.9 6.5l3.5 2M15.6 15.5l3.5 2M4.9 17.5l3.5-2M15.6 8.5l3.5-2",
+  sequence: "M4 7h16M4 12h10M4 17h16",
+  enum: "M5 5h6v6H5zM13 5h6v6h-6zM5 13h6v6H5zM13 13h6v6h-6z",
+  domain: "M4 6h16v12H4zM8 10h8M8 14h5",
   right: "m9 6 6 6-6 6",
   down: "m6 9 6 6 6-6",
   info: "M2 12a10 10 0 1 0 20 0 10 10 0 1 0-20 0M12 11v5.5M12 7.5h.01",
   error: "M2 12a10 10 0 1 0 20 0 10 10 0 1 0-20 0M15 9l-6 6M9 9l6 6",
   warn: "M12 3.5 2.5 20h19ZM12 10v4.5M12 17.5h.01",
+  refresh: "M20 12a8 8 0 1 1-2.4-5.7M20 3.5V8h-4.5",
+  diagram: "M4 5h6v5H4zM14 5h6v5h-6zM9 16h6v5H9zM7 10v3h10v-3M12 13v3",
+  structure: "M4 4h16v16H4zM4 10h16M10 10v10",
+  query: "M6 4h12v16H6zM9 8h6M9 12h6M9 16h3",
+  braces: "M8 4c-2 0-2 3-2 3s0 3-2 3c2 0 2 3 2 3s0 3 2 3M16 4c2 0 2 3 2 3s0 3 2 3c-2 0-2 3-2 3s0 3-2 3",
+  copy: "M9 9h11v11H9zM4 15V4h11",
+  tag: "M4 4h7l9 9-7 7-9-9zM8 8h.01",
+  trash: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6",
 } as const;
 
 const ENGINE_SHORT = { postgres: "PG", mysql: "My", mariadb: "Ma", sqlite: "SQ" } as const;
@@ -405,6 +420,7 @@ onBeforeUnmount(() => {
   <div class="tree" role="tree" aria-label="数据库对象" @click="onTreeClick" @dblclick="onTreeDblClick" @contextmenu="onContextMenu" @keydown="onTreeKeydown" @scroll="closeMenu">
     <div class="tree-toolbar">
       <button class="btn ghost sm" type="button" data-action="tree-refresh" aria-label="刷新对象列表" :disabled="refreshing" @click="onRefresh">
+        <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.refresh" /></svg>
         {{ refreshing ? "正在刷新…" : "刷新" }}
       </button>
     </div>
@@ -441,7 +457,7 @@ onBeforeUnmount(() => {
         :class="{ dropped: hit.stale, active: selectedKey === hit.key }"
         :data-stale="hit.stale ? 'true' : 'false'"
       >
-        <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.table" /></svg>
+        <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS[hit.kind]" /></svg>
         <span class="hit-text">
           <span class="tr-name">
             <template v-for="(part, index) in splitMatch(hit.name, filter)" :key="index">
@@ -545,6 +561,7 @@ onBeforeUnmount(() => {
                 @click.stop="openDiagram(connection, database.name, '')"
               >
                 <span class="tw"></span>
+                <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.diagram" /></svg>
                 <span class="tr-name">关系图</span>
               </button>
               <SchemaBlock
@@ -659,6 +676,7 @@ onBeforeUnmount(() => {
                     @click.stop="openDiagram(connection, database.name, schema.name)"
                   >
                     <span class="tw"></span>
+                    <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.diagram" /></svg>
                     <span class="tr-name">关系图</span>
                   </button>
                   <SchemaBlock
@@ -689,21 +707,36 @@ onBeforeUnmount(() => {
       @click.stop
       @contextmenu.prevent
     >
+      <div class="menu-head">{{ menu.object.name }} · {{ KIND_LABEL[menu.object.kind] }}</div>
       <div v-if="menu.object.stale" class="menu-head">这个对象已失效——它在外部被删除，不能再打开</div>
       <template v-if="menu.object.kind === 'table' || menu.object.kind === 'view'">
-        <button class="menu-item" type="button" data-action="open-data" :disabled="menu.object.stale" @click="openObject(menu.object, 'data')">打开数据</button>
-        <button class="menu-item" type="button" data-action="open-structure" :disabled="menu.object.stale" @click="openObject(menu.object, 'structure', 'columns')">查看结构</button>
-        <button class="menu-item" type="button" data-action="new-query" :disabled="menu.object.stale" :title="browseSql(menu.object.engine, menu.object.schema, menu.object.name)" @click="onQuery">新建查询</button>
+        <button class="menu-item" type="button" data-action="open-data" :disabled="menu.object.stale" @click="openObject(menu.object, 'data')">
+          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.table" /></svg>打开数据
+        </button>
+        <button class="menu-item" type="button" data-action="open-structure" :disabled="menu.object.stale" @click="openObject(menu.object, 'structure', 'columns')">
+          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.structure" /></svg>查看结构
+        </button>
+        <button class="menu-item" type="button" data-action="new-query" :disabled="menu.object.stale" :title="browseSql(menu.object.engine, menu.object.schema, menu.object.name)" @click="onQuery">
+          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.query" /></svg>新建查询
+        </button>
       </template>
       <template v-else>
-        <button class="menu-item" type="button" data-action="open-definition" :disabled="menu.object.stale" @click="onDefine">查看定义</button>
-        <button class="menu-item" type="button" data-action="copy-definition" :disabled="menu.object.stale" @click="onCopyDefinition">复制到新查询</button>
+        <button class="menu-item" type="button" data-action="open-definition" :disabled="menu.object.stale" @click="onDefine">
+          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.braces" /></svg>查看定义
+        </button>
+        <button class="menu-item" type="button" data-action="copy-definition" :disabled="menu.object.stale" @click="onCopyDefinition">
+          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.copy" /></svg>复制到新查询
+        </button>
       </template>
-      <button class="menu-item" type="button" data-action="copy-name" @click="onCopy">复制完整名称</button>
+      <button class="menu-item" type="button" data-action="copy-name" @click="onCopy">
+        <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.tag" /></svg>复制完整名称
+      </button>
       <div v-if="menu.notice" class="menu-head">{{ menu.notice }}</div>
       <template v-if="menu.object.kind === 'table'">
         <div class="menu-sep" role="separator"></div>
-        <button class="menu-item danger" type="button" data-action="drop-table" :disabled="menu.object.stale" @click="openObject(menu.object, 'structure', 'drop')">删除表…</button>
+        <button class="menu-item danger" type="button" data-action="drop-table" :disabled="menu.object.stale" @click="openObject(menu.object, 'structure', 'drop')">
+          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.trash" /></svg>删除表…
+        </button>
       </template>
     </div>
   </Teleport>

@@ -25,6 +25,8 @@ const ICONS = {
   sequence: "M4 7h16M4 12h10M4 17h16",
   enum: "M5 5h6v6H5zM13 5h6v6h-6zM5 13h6v6H5zM13 13h6v6h-6z",
   domain: "M4 6h16v12H4zM8 10h8M8 14h5",
+  column: "M5 5h14v14H5zM12 5v14",
+  index: "M13 3 5 13h5l-1 8 8-10h-5l1-8",
   right: "m9 6 6 6-6 6",
   down: "m6 9 6 6 6-6",
   error: "M2 12a10 10 0 1 0 20 0 10 10 0 1 0-20 0M15 9l-6 6M9 9l6 6",
@@ -173,6 +175,7 @@ function showIndexes(object: CatalogObject): boolean {
         <span class="tw">
           <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="groupOpen(kind) ? ICONS.down : ICONS.right" /></svg>
         </span>
+        <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS[kind]" /></svg>
         <span class="tr-name">{{ KIND_LABEL[kind] }}</span>
         <span v-if="!reportOf(kind)?.error" class="tr-meta">{{ groupTotal(kind, objectsOf(kind).length) }}</span>
       </div>
@@ -251,6 +254,7 @@ function showIndexes(object: CatalogObject): boolean {
             <template v-else-if="outlineOf(object)?.status === 'ready'">
               <div class="tree-row tr-group" role="treeitem" tabindex="0" data-member-group="columns" :data-object="object.name" :style="depthStyle(depth + 2)" @click.stop @dblclick.stop>
                 <span class="tw"></span>
+                <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.column" /></svg>
                 <span class="tr-name">列</span>
                 <span class="tr-meta">{{ outlineOf(object)?.columns.length }}</span>
               </div>
@@ -282,6 +286,7 @@ function showIndexes(object: CatalogObject): boolean {
               <template v-if="showIndexes(object)">
                 <div class="tree-row tr-group" role="treeitem" tabindex="0" data-member-group="indexes" :data-object="object.name" :style="depthStyle(depth + 2)" @click.stop @dblclick.stop>
                   <span class="tw"></span>
+                  <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.index" /></svg>
                   <span class="tr-name">索引</span>
                   <span class="tr-meta">{{ outlineOf(object)?.indexes.length }}</span>
                 </div>
