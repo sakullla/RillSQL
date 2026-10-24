@@ -11,6 +11,15 @@ const REQUIRED = [
   "minimize", "gear", "key", "shield", "user", "text", "more",
 ] as const;
 
+// ADR-4 统一风格的形状契约：容器类图标一律 2px 圆角矩形（arc 拐角），
+// 点状笔画一律用 `h.01` 零长线 + CSS 圆端点渲染为圆点。
+const ROUNDED_CONTAINERS = [
+  "table", "sidebar", "columns", "grid", "monitor", "keyboard", "lock", "file",
+  "stop", "save", "folder", "copy", "clipboard", "external", "trash",
+] as const satisfies readonly IconName[];
+
+const DOT_STROKES = ["info", "alert", "keyboard", "more"] as const satisfies readonly IconName[];
+
 describe("icon library", () => {
   it("ships at least 50 icons", () => {
     expect(Object.keys(ICON_PATHS).length).toBeGreaterThanOrEqual(50);
@@ -27,6 +36,85 @@ describe("icon library", () => {
       // 既有 code / check 用小写 m 起笔（相对 moveto），渲染等价，不强制改名。
       expect(/^[Mm]/.test(ICON_PATHS[name].trim()), `${name} must start with a moveto`).toBe(true);
     }
+  });
+
+  it("uses the shared 2px rounded-corner container geometry", () => {
+    for (const name of ROUNDED_CONTAINERS) {
+      expect(ICON_PATHS[name], `${name} should draw arc corners`).toMatch(/a2 2 0 0 [01]/);
+    }
+  });
+
+  it("renders dots with the round-cap zero-length stroke idiom", () => {
+    for (const name of DOT_STROKES) {
+      expect(ICON_PATHS[name], `${name} should use h.01 dot strokes`).toContain("h.01");
+    }
+  });
+
+  it("matches the unified 24x24 outline-first shape snapshot", () => {
+    expect(ICON_PATHS).toMatchInlineSnapshot(`
+      {
+        "alert": "M12 4l9 16H3zM12 10v5M12 17.5h.01",
+        "arrow-down": "M12 5v14M6 13l6 6 6-6",
+        "arrow-right": "M5 12h14M13 6l6 6-6 6",
+        "arrow-up": "M12 19V5M6 11l6-6 6 6",
+        "check": "m5 12.5 4.5 4.5L19 7",
+        "chevron-down": "M6 9l6 6 6-6",
+        "chevron-left": "M15 6l-6 6 6 6",
+        "chevron-right": "M9 6l6 6-6 6",
+        "chevron-up": "M6 15l6-6 6 6",
+        "clipboard": "M9 3.5h6v3H9ZM8.5 5H7a2 2 0 0 0-2 2v11.5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-1.5",
+        "clock": "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M12 7v5l3 2",
+        "code": "m16 18 6-6-6-6M8 6l-6 6 6 6",
+        "columns": "M6 5h12a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2ZM12 5v14",
+        "command": "M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3Z",
+        "copy": "M15.5 5.5h-9a2 2 0 0 0-2 2v9M10.5 8.5h7a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-7a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2Z",
+        "database": "M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3ZM4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3",
+        "download": "M12 3.5V15M7 10l5 5 5-5M4.5 20h15",
+        "external": "M15 4h5v5M20 4l-8 8M18.5 13.5v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h4",
+        "eye": "M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6-10-6-10-6ZM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6",
+        "file": "M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9l-6-6ZM13 3v6h6",
+        "filter": "M4.5 5.5h15l-5.7 6.6v5.4l-3.6 1.8v-7.2L4.5 5.5Z",
+        "folder": "M3.5 18.5V8a2 2 0 0 1 2-2H10l2 2.5h6.5a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2Z",
+        "format": "M8 4H6a2 2 0 0 0-2 2v3a2 2 0 0 1-2 2 2 2 0 0 1 2 2v3a2 2 0 0 0 2 2h2M16 4h2a2 2 0 0 1 2 2v3a2 2 0 0 0 2 2 2 2 0 0 0-2 2v3a2 2 0 0 1-2 2h-2",
+        "gear": "M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2",
+        "grid": "M6 4.5h12a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-11a2 2 0 0 1 2-2ZM4 9.5h16M4 14.5h16M10 4.5v15",
+        "history": "M3 12a9 9 0 1 0 2.6-6.4L3 8M3 3v5h5M12 7v5l3.5 2",
+        "info": "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M12 11v6M12 7.5h.01",
+        "key": "M14 8a4 4 0 1 0-3.5 6.9L9 16.5H7v2H5v2H2.5v-3l6-6A4 4 0 0 1 14 8",
+        "keyboard": "M5 6.5h14a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2ZM6.5 10.5h.01M10 10.5h.01M13.5 10.5h.01M17 10.5h.01M7.5 14h9",
+        "link": "M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 1 0-5.7-5.7L11.5 6.8M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 1 0 5.7 5.7l1.5-1.5",
+        "list": "M4 7h16M4 12h16M4 17h10",
+        "lock": "M7.5 11h9a2 2 0 0 1 2 2v5.5a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2V13a2 2 0 0 1 2-2ZM8.5 11V7.5a3.5 3.5 0 0 1 7 0V11",
+        "maximize": "M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5",
+        "minimize": "M5 12h14",
+        "monitor": "M6.5 4.5h11a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2ZM9 20.5h6M12 15.5v5",
+        "moon": "M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z",
+        "more": "M12 5.5h.01M12 12h.01M12 18.5h.01",
+        "pencil": "M4.5 19.5l.9-3.6L16.6 4.7a2 2 0 0 1 2.8 2.8L8.2 18.7l-3.7.8ZM14.6 6.7l2.8 2.8",
+        "pin": "M12 3v8M8 11h8l-1 4H9zM12 15v6",
+        "plan": "M6 7.5a2 2 0 1 0 .01 0M18 7.5a2 2 0 1 0 .01 0M12 17.5a2 2 0 1 0 .01 0M7.5 9.2l3.2 6.6M16.5 9.2l-3.2 6.6",
+        "play": "M8.5 5.8v12.4L18.6 12 8.5 5.8Z",
+        "plug": "M8 4v6M16 4v6M6 10h12v3a6 6 0 0 1-12 0zM12 19v3",
+        "plus": "M12 5v14M5 12h14",
+        "power": "M12 4v8M7.5 6.5a7 7 0 1 0 9 0",
+        "refresh": "M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5",
+        "save": "M7 4.5h8.5l4 4v9a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-11a2 2 0 0 1 2-2ZM8.5 4.5V10h7M8.5 19.5V14h7v5.5",
+        "search": "M4 11a7 7 0 1 0 14 0 7 7 0 1 0-14 0M20 20l-4-4",
+        "shield": "M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z",
+        "sidebar": "M6 5h12a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2ZM9.5 5v14",
+        "sliders": "M4 6h9M17 6h3M15 4v4M4 12h3M11 12h9M9 10v4M4 18h11M19 18h1M17 16v4",
+        "sort": "M7 4v14M4 15l3 3 3-3M14 6h6M14 11h5M14 16h4",
+        "stop": "M8.5 6.5h7a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-7a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2Z",
+        "sun": "M8 12a4 4 0 1 0 8 0 4 4 0 1 0-8 0M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4",
+        "table": "M6 5h12a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2ZM4 10.5h16M12 10.5v8.5",
+        "terminal": "M4 17l6-5-6-5M12 19h8",
+        "text": "M5 6h14M5 12h10M5 18h7",
+        "trash": "M4.5 6.5h15M9.5 6.5V5a1.5 1.5 0 0 1 1.5-1.5h2a1.5 1.5 0 0 1 1.5 1.5v1.5M6.5 6.5l.8 12a2 2 0 0 0 2 1.9h5.4a2 2 0 0 0 2-1.9l.8-12M10 10.5v6M14 10.5v6",
+        "upload": "M12 4.5V16M8 8l4-4 4 4M4.5 20h15",
+        "user": "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8M4 20c1.5-4 4.5-6 8-6s6.5 2 8 6",
+        "x": "M6 6l12 12M18 6 6 18",
+      }
+    `);
   });
 
   it("renders the path through Icon", () => {
