@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { catalogConnections, refreshCatalog } from "../catalog/store";
 import { tr as t } from "../i18n";
+import { backendErrorText, codeHint, codeMessage } from "../i18n/backend-error";
 import Listbox from "../ui/Listbox.vue";
 import { tauriConnectionApi, type ConnectionApi, type EnvTagInput, type TestReport } from "./api";
 import ConnIcon from "./ConnIcon.vue";
@@ -181,6 +182,9 @@ function envView(id: string) {
 }
 
 function errorText(error: unknown, fallback: string): string {
+  // T6-A2/R6：后端错误码优先走字典（coded string 前缀或结构化 code），未知码回退原文。
+  const bridged = backendErrorText(error, "");
+  if (bridged) return bridged;
   if (typeof error === "string" && error.trim()) return error;
   if (error instanceof Error && error.message.trim()) return error.message;
   if (error && typeof error === "object" && "message" in error) {
@@ -840,8 +844,8 @@ watch(
           </template>
           <template v-else>
             <p class="test-line err"><ConnIcon name="x" />{{ t("connections.editor.test.failed", { stage: report.failStage || t("connections.editor.test.unknownReason") }) }}</p>
-            <p v-if="failedStage?.message" class="test-detail" data-test-fail>{{ failedStage.message }}</p>
-            <p v-if="report.hint" class="test-detail">{{ report.hint }}</p>
+            <p v-if="failedStage?.message" class="test-detail" data-test-fail>{{ failedStage.code ? codeMessage(failedStage.code) ?? failedStage.message : failedStage.message }}</p>
+            <p v-if="report.hint" class="test-detail">{{ report.code ? codeHint(report.code) ?? report.hint : report.hint }}</p>
             <details class="disclosure test-all">
               <summary>{{ t("connections.editor.test.allSteps") }} <span class="muted">{{ t("connections.editor.test.stepsCount", { n: report.stages.length }) }}</span></summary>
               <div class="disclosure-body">

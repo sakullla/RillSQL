@@ -838,7 +838,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
           <option v-for="column in columns" :key="column.name" :value="column.name">{{ column.name }}</option>
         </select>
         <select v-model="filterOp" :aria-label="t('grid.filter.condition')">
-          <option v-for="op in FILTER_OPS" :key="op.id" :value="op.id">{{ op.label }}</option>
+          <option v-for="op in FILTER_OPS" :key="op.id" :value="op.id">{{ opLabel(op.id) }}</option>
         </select>
         <input v-if="opNeedsValue(filterOp)" v-model="filterValue" :aria-label="t('grid.filter.value')" :placeholder="filterOp === 'between' ? t('grid.filter.lowerBound') : undefined" />
         <input v-if="filterOp === 'between'" v-model="filterSecond" :aria-label="t('grid.filter.secondValue')" :placeholder="t('grid.filter.upperBound')" />

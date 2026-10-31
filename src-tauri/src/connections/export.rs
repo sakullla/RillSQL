@@ -129,7 +129,7 @@ fn encrypt(envelope: &ExportEnvelope, passphrase: &str) -> Result<Vec<u8>, Strin
 fn open(file: &[u8], passphrase: &str) -> Result<Vec<u8>, String> {
     let body = &file[MAGIC.len()..];
     if body.len() < SALT_LEN + NONCE_LEN + TAG_LEN {
-        return Err("这份文件不是完整的 RillSQL 加密导出，已整体拒绝。".to_owned());
+        return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::IMPORT_UNRECOGNIZED, "这份文件不是完整的 RillSQL 加密导出，已整体拒绝。"));
     }
     let (salt, rest) = body.split_at(SALT_LEN);
     let (nonce, sealed) = rest.split_at(NONCE_LEN);
@@ -140,18 +140,18 @@ fn open(file: &[u8], passphrase: &str) -> Result<Vec<u8>, String> {
             XNonce::from_slice(nonce),
             Payload { msg: sealed, aad: MAGIC },
         )
-        .map_err(|_| "口令不正确或文件已损坏，已整体拒绝导入。".to_owned())
+        .map_err(|_| crate::connections::error_codes::coded_string(crate::connections::error_codes::IMPORT_BAD_PASSPHRASE, "口令不正确或文件已损坏，已整体拒绝导入。"))
 }
 
 pub fn parse_import(file: &[u8], passphrase: Option<&str>) -> Result<ParsedImport, String> {
     let payload = if file.starts_with(MAGIC) {
         let Some(passphrase) = passphrase.map(str::trim).filter(|value| !value.is_empty()) else {
-            return Err("这份文件带口令加密，请输入导出时设置的口令。".to_owned());
+            return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::IMPORT_PASSPHRASE_REQUIRED, "这份文件带口令加密，请输入导出时设置的口令。"));
         };
         open(file, passphrase)?
     } else {
         String::from_utf8(file.to_vec())
-            .map_err(|_| "无法识别这份文件：既不是 RillSQL 明文导出，也不是加密导出。".to_owned())?
+            .map_err(|_| crate::connections::error_codes::coded_string(crate::connections::error_codes::IMPORT_UNRECOGNIZED, "无法识别这份文件：既不是 RillSQL 明文导出，也不是加密导出。"))?
             .into_bytes()
     };
     parse_payload(&payload)
@@ -159,7 +159,7 @@ pub fn parse_import(file: &[u8], passphrase: Option<&str>) -> Result<ParsedImpor
 
 fn parse_payload(payload: &[u8]) -> Result<ParsedImport, String> {
     let raw: RawEnvelope = serde_json::from_slice(payload)
-        .map_err(|_| "文件内容无法识别为 RillSQL 连接导出，已整体拒绝。".to_owned())?;
+        .map_err(|_| crate::connections::error_codes::coded_string(crate::connections::error_codes::IMPORT_UNRECOGNIZED, "文件内容无法识别为 RillSQL 连接导出，已整体拒绝。"))?;
     if raw.format != EXPORT_FORMAT {
         return Err("这不是 RillSQL 导出的连接文件，已整体拒绝。".to_owned());
     }

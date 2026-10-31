@@ -35,19 +35,6 @@ export function partialFileName(fileName: string): string {
   return `${fileName}${partialMark}`;
 }
 
-export interface ExportPlan {
-  allowed: boolean;
-  partial: boolean;
-  complete: boolean;
-  fileName: string;
-  notice: string;
-  rejectReason: string | null;
-  reexecutes: boolean;
-  serverRead: boolean;
-  label: string;
-}
-
-
 export function planExport(input: ExportPlanInput): ExportPlan {
   const partial = input.scope === "loaded" && input.truncated;
   const fileName = partial ? partialFileName(input.fileName) : input.fileName;

@@ -197,24 +197,24 @@ function readQualifierPart(sql: string, index: number): { part: QualifierPart; e
 /** 点号之间的注释仍属于同一个限定名，下一段标识符不能丢掉。超过两段则无法证明单表。只被注释隔开的两个标识符不能拼成一张表。 */
 function walkQualifier(sql: string, start: number): { ok: true; parts: QualifierPart[]; end: number } | { ok: false; reason: string } {
   const first = readQualifierPart(sql, skipQualifierGap(sql, start));
-  if (!first) return { ok: false, reason: tr("grid.resultEdit.notProvenSingleTable") };
-  if (!first.part.quoted && first.part.name === "only") return { ok: false, reason: tr("grid.resultEdit.notProvenSingleTable") };
+  if (!first) return { ok: false, reason: "grid.resultEdit.notProvenSingleTable" };
+  if (!first.part.quoted && first.part.name === "only") return { ok: false, reason: "grid.resultEdit.notProvenSingleTable" };
   const parts = [first.part];
   let index = first.end;
   while (true) {
     const gap = scanQualifierGap(sql, index);
     if (sql[gap.index] === ".") {
       const next = readQualifierPart(sql, skipQualifierGap(sql, gap.index + 1));
-      if (!next) return { ok: false, reason: tr("grid.resultEdit.notProvenSingleTable") };
+      if (!next) return { ok: false, reason: "grid.resultEdit.notProvenSingleTable" };
       parts.push(next.part);
       index = next.end;
-      if (parts.length > 2) return { ok: false, reason: tr("grid.resultEdit.qualifiedTooLong") };
+      if (parts.length > 2) return { ok: false, reason: "grid.resultEdit.qualifiedTooLong" };
       continue;
     }
     if (gap.commentOnly) {
       const next = readQualifierPart(sql, gap.index);
       if (next && (next.part.quoted || !CLAUSES.has(next.part.name.toUpperCase()))) {
-        return { ok: false, reason: tr("grid.resultEdit.notProvenSingleTable") };
+        return { ok: false, reason: "grid.resultEdit.notProvenSingleTable" };
       }
     }
     break;
@@ -343,29 +343,29 @@ export function readSingleTable(sql: string, engine: Engine = "postgres"): EditP
   const scanned = preservedStatements(sql, engine);
   if (scanned.refusal) return { ok: false, reason: scanned.refusal };
   const statements = scanned.texts;
-  if (!statements.length) return { ok: false, reason: tr("grid.resultEdit.noEditableStatement") };
-  if (statements.length > 1) return { ok: false, reason: tr("grid.resultEdit.notSingleSelect") };
+  if (!statements.length) return { ok: false, reason: "grid.resultEdit.noEditableStatement" };
+  if (statements.length > 1) return { ok: false, reason: "grid.resultEdit.notSingleSelect" };
   const statement = statements[0]!;
   const tokens = tokenize(statement);
-  if (word(tokens[0]) !== "SELECT") return { ok: false, reason: tr("grid.resultEdit.selectOnlyEditable") };
+  if (word(tokens[0]) !== "SELECT") return { ok: false, reason: "grid.resultEdit.selectOnlyEditable" };
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index]!;
     const upper = word(token);
     if (upper && FORBIDDEN[upper]) return { ok: false, reason: FORBIDDEN[upper]! };
-    if (upper && AGGREGATES.has(upper) && tokens[index + 1]?.text === "(") return { ok: false, reason: tr("grid.resultEdit.aggregate") };
-    if (token.kind === "punct" && token.text === "(") return { ok: false, reason: tr("grid.resultEdit.subquery") };
+    if (upper && AGGREGATES.has(upper) && tokens[index + 1]?.text === "(") return { ok: false, reason: "grid.resultEdit.aggregate" };
+    if (token.kind === "punct" && token.text === "(") return { ok: false, reason: "grid.resultEdit.subquery" };
   }
   const fromAt = tokens.findIndex((token) => word(token) === "FROM");
   if (fromAt < 0 || tokens.findIndex((token, index) => index > fromAt && word(token) === "FROM") >= 0) {
-    return { ok: false, reason: tr("grid.resultEdit.notProvenSingleTable") };
+    return { ok: false, reason: "grid.resultEdit.notProvenSingleTable" };
   }
   const fromToken = tokens[fromAt];
-  if (!fromToken) return { ok: false, reason: tr("grid.resultEdit.notProvenSingleTable") };
+  if (!fromToken) return { ok: false, reason: "grid.resultEdit.notProvenSingleTable" };
   const walked = walkQualifier(statement, fromToken.at + fromToken.text.length);
   if (!walked.ok) return walked;
   const left = walked.parts[0];
   const right = walked.parts[1];
-  if (!left) return { ok: false, reason: tr("grid.resultEdit.notProvenSingleTable") };
+  if (!left) return { ok: false, reason: "grid.resultEdit.notProvenSingleTable" };
   let cursor = tokenFrom(tokens, fromAt + 1, walked.end);
   const table: TableRef = right
     ? { schema: left.name, table: right.name, qualifierSource: left.source }
@@ -373,7 +373,7 @@ export function readSingleTable(sql: string, engine: Engine = "postgres"): EditP
   let alias: string | null = null;
   if (word(tokens[cursor]) === "AS") {
     const name = readName(tokens[cursor + 1]);
-    if (!name) return { ok: false, reason: tr("grid.resultEdit.notProvenSingleTable") };
+    if (!name) return { ok: false, reason: "grid.resultEdit.notProvenSingleTable" };
     alias = name;
     cursor += 2;
   } else if ((tokens[cursor]?.kind === "word" || tokens[cursor]?.kind === "ident") && !CLAUSES.has(word(tokens[cursor])) && tokens[cursor]?.text !== ".") {
@@ -385,7 +385,7 @@ export function readSingleTable(sql: string, engine: Engine = "postgres"): EditP
     const token = tokens[index]!;
     const upper = word(token);
     if (token.kind === "punct" && token.text === ",") {
-      if (clause !== "ORDER") return { ok: false, reason: tr("grid.resultEdit.multiTable") };
+      if (clause !== "ORDER") return { ok: false, reason: "grid.resultEdit.multiTable" };
       continue;
     }
     if (upper === "ORDER") clause = "ORDER";
@@ -402,12 +402,12 @@ function nameMatches(tableName: string, hits: readonly TableHit[], schema: strin
 function uniqueTable(matches: readonly TableHit[], unqualified: boolean): ResolvedTable {
   if (matches.length === 0) {
     return unqualified
-      ? { ok: false, reason: tr("grid.resultEdit.schemaMissing") }
-      : { ok: false, reason: tr("grid.resultEdit.baseTableNotUnique") };
+      ? { ok: false, reason: "grid.resultEdit.schemaMissing" }
+      : { ok: false, reason: "grid.resultEdit.baseTableNotUnique" };
   }
   const schemas = new Set(matches.map((hit) => hit.schema));
-  if (schemas.size > 1) return { ok: false, reason: tr("grid.resultEdit.sameNameMultiSchema") };
-  if (matches.length > 1) return { ok: false, reason: tr("grid.resultEdit.caseOnlyTables") };
+  if (schemas.size > 1) return { ok: false, reason: "grid.resultEdit.sameNameMultiSchema" };
+  if (matches.length > 1) return { ok: false, reason: "grid.resultEdit.caseOnlyTables" };
   return { ok: true, schema: matches[0]!.schema, table: matches[0]!.name };
 }
 
@@ -416,15 +416,15 @@ export function resolveEditableTable(table: TableRef, hits: readonly TableHit[],
   if (table.schema && usesDatabaseQualifier(engine)) {
     const qualifier = table.qualifierSource ?? table.schema;
     if (!qualifierIsCurrentDatabase(engine, qualifier, database)) {
-      return { ok: false, reason: tr("grid.resultEdit.notCurrentDatabase") };
+      return { ok: false, reason: "grid.resultEdit.notCurrentDatabase" };
     }
     const matches = nameMatches(table.table, hits, null);
-    if (matches.length === 0) return { ok: false, reason: tr("grid.resultEdit.currentDbButUnproven") };
+    if (matches.length === 0) return { ok: false, reason: "grid.resultEdit.currentDbButUnproven" };
     return uniqueTable(matches, true);
   }
   if (table.schema) {
     const scoped = nameMatches(table.table, hits, table.schema);
-    if (scoped.length > 1) return { ok: false, reason: tr("grid.resultEdit.caseOnlyTables") };
+    if (scoped.length > 1) return { ok: false, reason: "grid.resultEdit.caseOnlyTables" };
     if (scoped.length === 1) return { ok: true, schema: scoped[0]!.schema, table: scoped[0]!.name };
     return { ok: true, schema: table.schema, table: table.table };
   }
@@ -456,20 +456,20 @@ export function provedEditableColumns(schema: TableSchema, columns: readonly Col
 }
 
 export function locateResultRows(schema: TableSchema, columns: readonly Column[], rows: readonly Row[], proof: ColumnProof | null = null): LocatedResult {
-  if (schema.kind !== "table") return { ok: false, reason: tr("grid.resultEdit.viewReadonlyEdit") };
-  if (!schema.key.length) return { ok: false, reason: tr("grid.errors.noKeyEditShort") };
+  if (schema.kind !== "table") return { ok: false, reason: "grid.resultEdit.viewReadonlyEdit" };
+  if (!schema.key.length) return { ok: false, reason: "grid.errors.noKeyEditShort" };
   const editable = provedEditableColumns(schema, columns, proof);
   const names = proof ? new Set(editable) : new Set(columns.map((column) => column.name));
   const missing = schema.key.filter((name) => !names.has(name));
   if (missing.length) {
     const visible = missing.filter((name) => columns.some((column) => column.name === name));
-    if (proof && visible.length) return { ok: false, reason: tr("grid.resultEdit.keyNotBaseColumns", { columns: visible.join(", ") }) };
-    return { ok: false, reason: tr("grid.resultEdit.keyNotInResult", { columns: missing.join(", ") }) };
+    if (proof && visible.length) return { ok: false, reason: "grid.resultEdit.keyNotBaseColumns" };
+    return { ok: false, reason: "grid.resultEdit.keyNotInResult" };
   }
   const merged = columns.map((column) => schema.columns.find((item) => item.name === column.name) ?? column);
   const next = rows.map(copyRow);
   refreshLocated(schema, next);
-  if (next.length > 0 && next.every((row) => !row.located)) return { ok: false, reason: tr("grid.resultEdit.rowsNotLocated") };
+  if (next.length > 0 && next.every((row) => !row.located)) return { ok: false, reason: "grid.resultEdit.rowsNotLocated" };
   return { ok: true, columns: merged, rows: next, editable };
 }
 

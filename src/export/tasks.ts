@@ -1,5 +1,6 @@
 import { reactive } from "vue";
 import { tr } from "../i18n";
+import { backendErrorText } from "../i18n/backend-error";
 import { gridExport, gridExportCancel, type ExportResult } from "../grid/api";
 import type { Filter, SortSpec } from "../grid/types";
 import { renderCsv, type CsvCell, type CsvOptions } from "./csv";
@@ -379,7 +380,8 @@ export function runDatabaseDump(options: DumpPayload): { task: ExportTask; done:
       applyDumpResult(task, result);
     } catch (error: unknown) {
       task.status = "failed";
-      task.message = error instanceof Error ? error.message : String(error);
+      // T6-A2/R6：dump/migrate 的后端错误带 [code] 前缀，先按码取字典，未知码回退原文。
+      task.message = backendErrorText(error, error instanceof Error ? error.message : String(error));
     }
     return task;
   })();
@@ -452,7 +454,8 @@ export function runMigrateTask(options: MigratePayload): { task: ExportTask; don
       applyMigrateResult(task, result);
     } catch (error: unknown) {
       task.status = "failed";
-      task.message = error instanceof Error ? error.message : String(error);
+      // T6-A2/R6：dump/migrate 的后端错误带 [code] 前缀，先按码取字典，未知码回退原文。
+      task.message = backendErrorText(error, error instanceof Error ? error.message : String(error));
     }
     return task;
   })();

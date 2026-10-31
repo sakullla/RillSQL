@@ -79,6 +79,9 @@ export const exportDict = {
     start: "Start export",
   },
   dialog: {
+    csvLabel: "CSV",
+    jsonLabel: "JSON array",
+    xlsxLabel: "Excel",
     comma: "Comma ,",
     semicolon: "Semicolon ;",
     tab: "Tab",

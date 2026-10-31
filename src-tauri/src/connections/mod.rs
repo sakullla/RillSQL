@@ -2,6 +2,7 @@
 
 pub mod commands;
 pub(crate) mod drivers;
+pub(crate) mod error_codes;
 pub(crate) mod export;
 pub(crate) mod forward;
 mod hostkey;

@@ -14,6 +14,11 @@ export type MessageKey = NestedKeyOf<MessageSchema>;
 
 export const LOCALES: readonly AppLocale[] = ["zh-CN", "en"];
 
+/** 测试环境标识：vitest 下 import.meta.env.MODE 为 "test"。 */
+const IS_TEST = typeof import.meta !== "undefined" && (import.meta as { env?: { MODE?: string; VITEST?: boolean } }).env !== undefined
+  && ((import.meta as { env?: { MODE?: string; VITEST?: boolean } }).env?.VITEST === true
+    || (import.meta as { env?: { MODE?: string; VITEST?: boolean } }).env?.MODE === "test");
+
 export const i18n = createI18n({
   legacy: false,
   locale: normalizeLocale(loadSettings().locale),
@@ -21,6 +26,13 @@ export const i18n = createI18n({
   messages: { "zh-CN": zhCN, en },
   missingWarn: false,
   fallbackWarn: false,
+  // 守卫（T6-A2/P1）：测试环境对缺失 key 直接抛错，任何 t()/tr() 调用点引用不存在的 key 都会让测试失败；
+  // 生产/预览保持静默回退，不因单处 key 缺失中断界面。
+  missing: IS_TEST
+    ? (_locale: unknown, key: unknown) => {
+        throw new Error(`[i18n] missing message key: ${String(key)}`);
+      }
+    : undefined,
 });
 
 /**

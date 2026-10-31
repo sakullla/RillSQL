@@ -6,6 +6,8 @@ export interface StageView {
   label: string;
   status: "ok" | "err" | "skipped" | "wait";
   message: string;
+  /** 稳定错误码（T6-A2/R6）：失败/等待阶段携带，前端按码取字典文案。 */
+  code?: string | null;
 }
 
 export interface TestReport {
@@ -16,6 +18,8 @@ export interface TestReport {
   fingerprint?: string | null;
   algorithm?: string | null;
   stages: StageView[];
+  /** 失败/等待阶段的稳定错误码（T6-A2/R6）：呈现处先查码取字典文案。 */
+  code?: string | null;
 }
 
 export interface SaveOutcome {

@@ -1412,11 +1412,12 @@ fn db_err(err: sqlx::Error) -> String {
 fn decision_error(decision: HostKeyDecision) -> StageError {
     match decision {
         HostKeyDecision::Unconfirmed { algorithm, fingerprint } => StageError::WaitHostKey { algorithm, fingerprint },
-        HostKeyDecision::Changed { presented, saved } => stages::fail(
+        HostKeyDecision::Changed { presented, saved } => stages::fail_code(
+            crate::connections::error_codes::CONN_HOST_KEY_CHANGED,
             format!("服务器出示的密钥 {presented} 与已保存的 {saved} 不同"),
             "已阻止连接，没有发送任何凭据。如果确认服务器更换了密钥，请先通过可信渠道核实新指纹，然后忘记已保存的密钥再重新测试。",
         ),
-        HostKeyDecision::Trusted => stages::fail("SSH 主机密钥状态不一致", "没有继续认证。"),
+        HostKeyDecision::Trusted => stages::fail_code(crate::connections::error_codes::CONN_HOST_KEY_INCONSISTENT, "SSH 主机密钥状态不一致", "没有继续认证。"),
     }
 }
 
@@ -1459,11 +1460,11 @@ struct Attempt {
 impl Attempt {
     fn route(&self) -> Result<Route, StageError> {
         let forwarder = if self.config.ssh.is_some() { Some(self.forwarder_port.unwrap_or(0)) } else { None };
-        route::resolve_route(&self.config, forwarder).map_err(|err| stages::fail(err, "没有改用转发器地址做证书校验。"))
+        route::resolve_route(&self.config, forwarder).map_err(|err| stages::fail_code(crate::connections::error_codes::CONN_ROUTE_RESOLVE_FAILED, err, "没有改用转发器地址做证书校验。"))
     }
 
     async fn begin_ssh(&mut self) -> Result<(), StageError> {
-        let ssh = self.config.ssh.clone().ok_or_else(|| stages::fail("没有 SSH 配置", "未执行"))?;
+        let ssh = self.config.ssh.clone().ok_or_else(|| stages::fail_code(crate::connections::error_codes::CONN_SSH_NOT_CONFIGURED, "没有 SSH 配置", "未执行"))?;
         if let Some(probe) = self.probes.ssh.clone() {
             let presented = probe.presented_key(&ssh).await?;
             let decision = hostkey::decide_host_key(self.saved_fingerprint.as_deref(), &presented.algorithm, &presented.fingerprint);
@@ -1517,7 +1518,7 @@ impl Attempt {
         }
         if let Some(probe) = self.probes.ssh.clone() {
             if !self.ssh_authed {
-                let ssh = self.config.ssh.clone().ok_or_else(|| stages::fail("没有 SSH 配置", "未执行"))?;
+                let ssh = self.config.ssh.clone().ok_or_else(|| stages::fail_code(crate::connections::error_codes::CONN_SSH_NOT_CONFIGURED, "没有 SSH 配置", "未执行"))?;
                 let message = probe
                     .authenticate(&ssh, self.ssh_password.as_ref().map(Secret::expose), self.passphrase.as_ref().map(Secret::expose))
                     .await?;
@@ -1538,13 +1539,13 @@ impl Attempt {
         let host = self.config.host.clone().unwrap_or_default();
         let port = self.config.port.unwrap_or(0);
         if let Some(probe) = self.probes.ssh.clone() {
-            let ssh = self.config.ssh.clone().ok_or_else(|| stages::fail("没有 SSH 配置", "未执行"))?;
+            let ssh = self.config.ssh.clone().ok_or_else(|| stages::fail_code(crate::connections::error_codes::CONN_SSH_NOT_CONFIGURED, "没有 SSH 配置", "未执行"))?;
             let tls_name = self.config.tls.as_ref().map(|tls| tls.server_name.clone()).unwrap_or_default();
             let message = probe.open_tunnel(&host, port, &tls_name, &ssh.host).await?;
             self.forwarder_port = Some(1);
             return Ok(message);
         }
-        let local = self.forwarder_port.ok_or_else(|| stages::fail("隧道没有建立", "尚未连接数据库。"))?;
+        let local = self.forwarder_port.ok_or_else(|| stages::fail_code(crate::connections::error_codes::CONN_TUNNEL_NOT_READY, "隧道没有建立", "尚未连接数据库。"))?;
         Ok(format!("本机 127.0.0.1:{local} 经 SSH 跳板机打通到数据库 {host}:{port} 的通道"))
     }
 
@@ -1574,7 +1575,7 @@ impl Attempt {
                 // 密码在 TCP/TLS 之前就缺了，不能按失败阶段的先后把前面标成已完成。
                 self.remote = Remote::Failed {
                     stage: StageKind::DatabaseAuthentication,
-                    error: stages::fail("请填写数据库密码", "凭据库没有可用密码，本次也没有输入。没有把空密码写入配置。"),
+                    error: stages::fail_code(crate::connections::error_codes::CONN_PASSWORD_REQUIRED, "请填写数据库密码", "凭据库没有可用密码，本次也没有输入。没有把空密码写入配置。"),
                     network_done: false,
                     tls_done: false,
                 };
@@ -1591,7 +1592,7 @@ impl Attempt {
         if self.config.ssh.is_some() && self.forwarder_port.is_none() {
             self.remote = remote_failed(
                 StageKind::Network,
-                stages::fail("隧道没有就绪", "尚未连接数据库。"),
+                stages::fail_code(crate::connections::error_codes::CONN_TUNNEL_NOT_READY, "隧道没有就绪", "尚未连接数据库。"),
                 tls_mode,
             );
             return;
@@ -1645,7 +1646,7 @@ impl Attempt {
                 self.mongo = Some(opened.client);
                 opened.version
             }),
-            Engine::Sqlite => Err(stages::fail("SQLite 不走远程连接", "未执行")),
+            Engine::Sqlite => Err(stages::fail_code(crate::connections::error_codes::CONN_SQLITE_NOT_REMOTE, "SQLite 不走远程连接", "未执行")),
         };
         match opened {
             Ok(version) => self.remote = Remote::Done { version },
@@ -1696,7 +1697,7 @@ impl Attempt {
                 }
                 Err(error.clone())
             }
-            Remote::Fresh | Remote::Probed => Err(stages::fail("连接没有开始", "未执行")),
+            Remote::Fresh | Remote::Probed => Err(stages::fail_code(crate::connections::error_codes::CONN_NOT_STARTED, "连接没有开始", "未执行")),
         }
     }
 
@@ -1726,7 +1727,7 @@ impl Attempt {
     async fn db_auth(&mut self) -> Result<String, StageError> {
         if let Some(probe) = self.probes.database.clone() {
             let password = self.password.as_ref().ok_or_else(|| {
-                stages::fail("请填写数据库密码", "凭据库没有可用密码，本次也没有输入。没有把空密码写入配置。")
+                stages::fail_code(crate::connections::error_codes::CONN_PASSWORD_REQUIRED, "请填写数据库密码", "凭据库没有可用密码，本次也没有输入。没有把空密码写入配置。")
             })?;
             let route = self.route()?;
             return probe.authenticate(&self.config, &route, password.expose()).await;
@@ -1875,7 +1876,7 @@ fn focus_failure(report: &TestReport) -> String {
 }
 
 fn classify_db(error: &StageError) -> StageKind {
-    let StageError::Fail { message, hint } = error else {
+    let StageError::Fail { message, hint, .. } = error else {
         return StageKind::Network;
     };
     if hint.contains("网络连接失败") || hint.contains("隧道没有") || hint.contains("通道没有打通") {
@@ -1919,7 +1920,7 @@ pub(crate) async fn report_canned_remote(config: SavedConnection, canned: Canned
         // 驱动只有在握手完成后才会报认证失败，所以网络和 TLS 都已完成。
         CannedRemote::AuthenticationFailed => remote_failed(
             StageKind::DatabaseAuthentication,
-            stages::fail("Access denied for user", "请检查数据库用户名和密码。"),
+            stages::fail_code(crate::connections::error_codes::CONN_AUTH_FAILED, "Access denied for user", "请检查数据库用户名和密码。"),
             tls_mode,
         ),
     };
@@ -1975,6 +1976,7 @@ mod health_tests {
                 label: kind.label_zh().to_owned(),
                 status,
                 message: if status == StageStatus::Err { "Access denied for user".to_owned() } else { String::new() },
+                code: None,
             });
         }
         TestReport {
@@ -1985,6 +1987,7 @@ mod health_tests {
             fingerprint: None,
             algorithm: None,
             stages,
+            code: None,
         }
     }
 

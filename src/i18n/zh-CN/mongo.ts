@@ -1,8 +1,8 @@
 /** MongoDB 域文案（R12）：集合文档浏览器/JSON 过滤/文档 CRUD 与确认。 */
 export const mongo = {
   docs: {
-    required: "请输入 JSON 文档，例如 {\"status\": \"active\"}。",
-    mustBeObject: "文档应为 JSON 对象（{\"字段\": 值}），不是数组或标量。",
+    required: "请输入 JSON 文档，例如 {'{'}\"status\": \"active\"{'}'}。",
+    mustBeObject: "文档应为 JSON 对象（{'{'}\"字段\": 值{'}'}），不是数组或标量。",
     syntaxError: "JSON 语法错误：{message}",
     syntaxErrorPlain: "JSON 语法错误。",
     apiFailedUnknown: "操作失败，原因未知。",
@@ -16,7 +16,7 @@ export const mongo = {
     deletedNote: "已删除 {n} 篇文档。",
   },
   tab: {
-    filterPlaceholder: "JSON 过滤，如 {\"status\": \"active\"}",
+    filterPlaceholder: "JSON 过滤，如 {'{'}\"status\": \"active\"{'}'}",
     filterLabel: "JSON 过滤",
     apply: "过滤",
     clearFilter: "清除过滤",

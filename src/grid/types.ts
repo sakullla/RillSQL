@@ -135,6 +135,8 @@ export function opNeedsValue(op: FilterOp): boolean {
 }
 
 export function opLabel(op: FilterOp): string {
-  const key = FILTER_OPS.find((item) => item.id === op)?.label;
-  return key ? tr(key) : op;
+  const label = FILTER_OPS.find((item) => item.id === op)?.label;
+  // eq/ne/gt/lt 的 label 是字面符号（= ≠ > <），只有含点号的字典 key（如 grid.ops.contains）才走翻译。
+  if (!label) return op;
+  return label.includes(".") ? tr(label) : label;
 }

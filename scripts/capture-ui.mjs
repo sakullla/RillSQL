@@ -25,6 +25,8 @@ const scenarioTitles = {
   "command-palette": "命令面板",
   shortcuts: "键盘快捷键",
   "title-theme": "标题栏主题菜单",
+  "connections-en": "连接管理（英文）",
+  "query-en": "查询结果（英文）",
 };
 
 /**
@@ -201,10 +203,10 @@ async function captureImage(page, name, theme, width, state) {
   console.log(path);
 }
 
-async function openWorkspace(page) {
-  const rail = page.getByRole("navigation", { name: "主导航" });
-  if ((await rail.getByRole("button", { name: "工作台" }).getAttribute("aria-current")) !== "page") {
-    await rail.getByRole("button", { name: "工作台" }).click();
+async function openWorkspace(page, labels = { nav: "主导航", workspace: "工作台" }) {
+  const rail = page.getByRole("navigation", { name: labels.nav });
+  if ((await rail.getByRole("button", { name: labels.workspace }).getAttribute("aria-current")) !== "page") {
+    await rail.getByRole("button", { name: labels.workspace }).click();
   }
 }
 
@@ -404,6 +406,36 @@ try {
         await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "设置" }).click();
         await page.getByLabel("编辑器字号").waitFor();
         await captureImage(page, "settings", theme, width, "外观、数据读取、执行与复制、本机数据和关于");
+
+        // 英文 locale 场景（T6-A2/P3）：在设置页把界面语言切到 English，连接页与查询页各取一张。
+        if (selectedScenarios.includes("connections-en") || selectedScenarios.includes("query-en")) {
+          await page.getByRole("combobox", { name: "界面语言" }).click();
+          await page.getByRole("option", { name: "English", exact: true }).click();
+          await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
+
+          await page.getByRole("navigation", { name: "Main navigation" }).getByRole("button", { name: "Connections" }).click();
+          await page.getByRole("heading", { name: "Connections" }).waitFor();
+          const enPostgres = page.locator("article.conn-card", { hasText: "书店 · 开发" });
+          const enSqlite = page.locator("article.conn-card", { hasText: "笔记" });
+          if (await enPostgres.getByRole("button", { name: "Connect", exact: true }).count()) await enPostgres.getByRole("button", { name: "Connect", exact: true }).click();
+          if (await enSqlite.getByRole("button", { name: "Connect", exact: true }).count()) await enSqlite.getByRole("button", { name: "Connect", exact: true }).click();
+          await expect(enPostgres).toContainText("Connected");
+          await expect(enSqlite).toContainText("Connected");
+          await expect(page.locator("article.conn-card", { hasText: "库存 · 本地" })).toContainText("Not connected");
+          await captureImage(page, "connections-en", theme, width, "英文界面语言下的连接管理页（已连接与未连接卡片）");
+
+          await openWorkspace(page, { nav: "Main navigation", workspace: "Workbench" });
+          await collapseOverlay(page, width);
+          await page.getByRole("button", { name: "New query", exact: true }).click();
+          await collapseOverlay(page, width);
+          await page.locator("[data-action='target']").click();
+          await page.getByRole("listbox", { name: "Execution target" }).getByRole("option", { name: /书店 · 开发.*bookstore/ }).click();
+          await page.locator(".cm-content").click();
+          await page.keyboard.insertText("select id, customer, status, total\nfrom orders\nwhere status <> 'cancelled';");
+          await page.locator("[data-action='run']").click();
+          await expect(page.getByLabel("Execution results")).toContainText("林夏");
+          await captureImage(page, "query-en", theme, width, "英文界面语言下的查询结果（含执行目标与只读结果徽标）");
+        }
       } catch (error) {
         const calls = await page.evaluate(() => (window.__uiCalls ?? []).slice(-8).map((call) => call.command)).catch(() => []);
         failures.push({ type: "scenario", theme, width, message: error instanceof Error ? error.message : String(error), calls });

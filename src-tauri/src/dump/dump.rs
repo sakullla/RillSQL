@@ -292,7 +292,7 @@ pub fn engine_name(engine: Engine) -> &'static str {
 
 async fn postgres_text_column(session: &CatalogSession, sql: &str) -> Result<Vec<String>, String> {
     let CatalogSession::Postgres(client) = session else {
-        return Err("连接类型和引擎不一致".to_owned());
+        return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_CONNECTION_MISMATCH, "连接类型和引擎不一致"));
     };
     let rows = client.query(sql, &[]).await.map_err(read_failure)?;
     rows.iter()
@@ -320,24 +320,24 @@ async fn current_postgres_database(session: &CatalogSession) -> Result<String, S
 async fn resolve_scope(engine: Engine, session: &CatalogSession, database: &str, schemas: &[String]) -> Result<(String, Vec<String>), String> {
     match engine {
         // Redis 不在全库导出面（capability 门控）。
-        Engine::Redis => return Err("Redis 没有整库导出；键空间经键浏览器访问。".to_owned()),
-        Engine::Mongodb => return Err("MongoDB 没有整库导出；集合文档经文档浏览器访问。".to_owned()),
+        Engine::Redis => return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_ENGINE_UNSUPPORTED, "Redis 没有整库导出；键空间经键浏览器访问。")),
+        Engine::Mongodb => return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_ENGINE_UNSUPPORTED, "MongoDB 没有整库导出；集合文档经文档浏览器访问。")),
         Engine::Sqlite => {
             if !database.is_empty() && database != "main" {
-                return Err(format!("当前连接打开的是 main，没有另开连接读取 {database}"));
+                return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_SESSION_GAP_MAIN, format!("当前连接打开的是 main，没有另开连接读取 {database}")));
             }
             Ok((String::new(), vec![String::new()]))
         }
         Engine::Mysql | Engine::Mariadb => {
             if database.trim().is_empty() {
-                return Err("需要数据库名，没有另开连接。".to_owned());
+                return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_DATABASE_REQUIRED, "需要数据库名，没有另开连接。"));
             }
             Ok((database.to_owned(), vec![String::new()]))
         }
         Engine::Postgres => {
             let current = current_postgres_database(session).await?;
             if !database.is_empty() && database != current {
-                return Err(format!("当前连接打开的是 {current}，没有另开连接读取 {database}"));
+                return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_SESSION_GAP, format!("当前连接打开的是 {current}，没有另开连接读取 {database}")));
             }
             if schemas.is_empty() {
                 let sql = metadata_sql(Engine::Postgres).schemas.ok_or_else(|| read_failure("PostgreSQL 缺少 schema 查询"))?;
@@ -353,7 +353,7 @@ async fn resolve_scope(engine: Engine, session: &CatalogSession, database: &str,
         Engine::Sqlserver => {
             let current = sqlserver_current_database(session).await?;
             if !database.is_empty() && database != current {
-                return Err(format!("当前连接打开的是 {current}，没有另开连接读取 {database}"));
+                return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_SESSION_GAP, format!("当前连接打开的是 {current}，没有另开连接读取 {database}")));
             }
             if schemas.is_empty() {
                 let sql = metadata_sql(Engine::Sqlserver).schemas.ok_or_else(|| read_failure("SQL Server 缺少 schema 查询"))?;
@@ -371,7 +371,7 @@ async fn resolve_scope(engine: Engine, session: &CatalogSession, database: &str,
 
 async fn sqlserver_current_database(session: &CatalogSession) -> Result<String, String> {
     let CatalogSession::Sqlserver(client) = session else {
-        return Err("连接类型和引擎不一致".to_owned());
+        return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_CONNECTION_MISMATCH, "连接类型和引擎不一致"));
     };
     let (_names, rows) = crate::grid::sqlserver_rows(client, "SELECT DB_NAME()").await.map_err(read_failure)?;
     match rows.first().and_then(|row| row.first()) {
@@ -382,7 +382,7 @@ async fn sqlserver_current_database(session: &CatalogSession) -> Result<String, 
 
 async fn sqlserver_text_column(session: &CatalogSession, sql: &str) -> Result<Vec<String>, String> {
     let CatalogSession::Sqlserver(client) = session else {
-        return Err("连接类型和引擎不一致".to_owned());
+        return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_CONNECTION_MISMATCH, "连接类型和引擎不一致"));
     };
     let (_names, rows) = crate::grid::sqlserver_rows(client, sql).await.map_err(read_failure)?;
     rows.iter()

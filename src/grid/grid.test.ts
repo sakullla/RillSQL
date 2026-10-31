@@ -1060,7 +1060,7 @@ describe("query result edits", () => {
       { schema: "sales", name: "orders", kind: "table" },
     ], "app");
     expect(ambiguous.ok).toBe(false);
-    if (!ambiguous.ok) expect(ambiguous.reason).toContain("多个模式");
+    if (!ambiguous.ok) expect(tr(ambiguous.reason)).toContain("多个模式");
     const named = resolveEditableTable(proof("SELECT status FROM public.orders"), [], "app", "postgres");
     expect(named).toEqual({ ok: true, schema: "public", table: "orders" });
     const folded = resolveEditableTable(proof("SELECT id, name FROM orders"), [
@@ -1068,7 +1068,7 @@ describe("query result edits", () => {
       { schema: "public", name: "orders", kind: "table" },
     ], "app", "postgres");
     expect(folded.ok).toBe(false);
-    if (!folded.ok) expect(folded.reason).toContain("大小写");
+    if (!folded.ok) expect(tr(folded.reason)).toContain("大小写");
     const namedFolded = resolveEditableTable(proof("SELECT id FROM public.orders"), [
       { schema: "public", name: "orders", kind: "table" },
       { schema: "public", name: "Orders", kind: "table" },
@@ -1079,7 +1079,7 @@ describe("query result edits", () => {
         { schema: "", name: "customers", kind: "table" },
       ], "app", engine);
       expect(foreign.ok).toBe(false);
-      if (!foreign.ok) expect(foreign.reason).toContain("限定名");
+      if (!foreign.ok) expect(tr(foreign.reason)).toContain("限定名");
       const current = resolveEditableTable(proof("SELECT id, name FROM app.customers"), [
         { schema: "", name: "customers", kind: "table" },
       ], "app", engine);
@@ -1090,7 +1090,7 @@ describe("query result edits", () => {
         { schema: "", name: "customers", kind: "table" },
       ], "shop", engine);
       expect(shopVersusShop.ok).toBe(false);
-      if (!shopVersusShop.ok) expect(shopVersusShop.reason).toContain("限定名");
+      if (!shopVersusShop.ok) expect(tr(shopVersusShop.reason)).toContain("限定名");
       const upperVersusShop = resolveEditableTable(proof("SELECT id, name FROM SHOP.customers"), [
         { schema: "", name: "customers", kind: "table" },
       ], "shop", engine);
@@ -1106,12 +1106,12 @@ describe("query result edits", () => {
     }
     const threePart = readSingleTable("SELECT id, name FROM app.public.customers");
     expect(threePart.ok).toBe(false);
-    if (!threePart.ok) expect(threePart.reason).toContain("两部分");
+    if (!threePart.ok) expect(tr(threePart.reason)).toContain("两部分");
     const attached = resolveEditableTable(proof("SELECT id FROM archive.customers"), [
       { schema: "", name: "customers", kind: "table" },
     ], "main", "sqlite");
     expect(attached.ok).toBe(false);
-    if (!attached.ok) expect(attached.reason).toContain("限定名");
+    if (!attached.ok) expect(tr(attached.reason)).toContain("限定名");
     const mainTable = resolveEditableTable(proof("SELECT id FROM main.customers"), [
       { schema: "", name: "customers", kind: "table" },
     ], "main", "sqlite");
@@ -1142,13 +1142,13 @@ describe("query result edits", () => {
     const model = gridModel({ columns: ["id", "name"], rows: [["1", "甲"], ["1", "乙"]] });
     const missingKey = locateResultRows({ ...customersFixture(1).schema, key: [] }, model.columns, model.rows);
     expect(missingKey.ok).toBe(false);
-    if (!missingKey.ok) expect(missingKey.reason).toContain("没有主键");
+    if (!missingKey.ok) expect(tr(missingKey.reason)).toContain("没有主键");
     const view = locateResultRows(viewFixture().schema, model.columns, model.rows);
     expect(view.ok).toBe(false);
-    if (!view.ok) expect(view.reason).toContain("视图");
+    if (!view.ok) expect(tr(view.reason)).toContain("视图");
     const duplicated = locateResultRows(customersFixture(1).schema, model.columns, model.rows);
     expect(duplicated.ok).toBe(false);
-    if (!duplicated.ok) expect(duplicated.reason).toContain("无法唯一确定");
+    if (!duplicated.ok) expect(tr(duplicated.reason)).toContain("无法唯一确定");
     const unique = gridModel({ columns: ["id", "status"], rows: [["7", "open"]] });
     const located = locateResultRows(customersFixture(1).schema, unique.columns, unique.rows);
     expect(located.ok).toBe(true);
@@ -1748,10 +1748,10 @@ describe("query result edits", () => {
   it("keeps identifiers around a comment in a qualifier and clears an unproved insert target", async () => {
     const block = readSingleTable("SELECT id, name FROM app.public/*c*/.customers");
     expect(block.ok).toBe(false);
-    if (!block.ok) expect(block.reason).toContain("两部分");
+    if (!block.ok) expect(tr(block.reason)).toContain("两部分");
     const line = readSingleTable("SELECT id, name FROM app.public--c\n.customers");
     expect(line.ok).toBe(false);
-    if (!line.ok) expect(line.reason).toContain("两部分");
+    if (!line.ok) expect(tr(line.reason)).toContain("两部分");
     expect(proof("SELECT id, name FROM public/*c*/.customers")).toEqual({
       schema: "public",
       table: "customers",
@@ -1810,7 +1810,7 @@ describe("query result edits", () => {
         { schema: "", name: "customers", kind: "table" },
       ], "shop", engine);
       expect(mismatched.ok).toBe(false);
-      if (!mismatched.ok) expect(mismatched.reason).toContain("限定名");
+      if (!mismatched.ok) expect(tr(mismatched.reason)).toContain("限定名");
       const exactShop = resolveEditableTable(proof("SELECT id, name FROM shop.customers"), [
         { schema: "", name: "customers", kind: "table" },
       ], "shop", engine);

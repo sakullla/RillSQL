@@ -79,6 +79,9 @@ export const exportDict = {
     start: "开始导出",
   },
   dialog: {
+    csvLabel: "CSV",
+    jsonLabel: "JSON 数组",
+    xlsxLabel: "Excel",
     comma: "逗号 ,",
     semicolon: "分号 ;",
     tab: "制表符",
@@ -105,7 +108,7 @@ export const exportDict = {
     csvDesc: "表格文本。空值按下面的 NULL 写法写出。",
     jsonDesc: "每个对象是一行。空值仍是 null，空字符串仍是空字符串。",
     xlsxDesc: "xlsx 工作表。只包含这些行，不是整库转储，也不会搬到另一种数据库。空单元格是空值，不另写记号。",
-    markdownDesc: "竖线分隔的表格文本。单元格里的 | 会转义，换行折叠成空格，空值写成空字段。",
+    markdownDesc: "竖线分隔的表格文本。单元格里的 {'|'} 会转义，换行折叠成空格，空值写成空字段。",
     insertDesc: "只包含这些行，不含建表或整库脚本。空值写成 NULL。",
     rowsLegend: "导出哪些行",
     loadedOnly: "只导出已读取的 {n} 行",

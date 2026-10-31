@@ -274,10 +274,10 @@ fn row_identity(key_positions: &[usize], ordinal: u64, cells: &[Cell]) -> String
 /// 一批放进一个事务：整批成功才提交。失败即回滚并返回错误，由调用方降级逐行重放。
 async fn insert_page(target: &CatalogSession, statement: &str) -> Result<(), String> {
     match target {
-        CatalogSession::Scripted => Err("这个连接没有连着可查询的数据库".to_owned()),
+        CatalogSession::Scripted => Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_NOT_QUERYABLE, "这个连接没有连着可查询的数据库")),
         // Redis 不在迁移目标面（capability 门控）；误入时拒绝写入。
-        CatalogSession::Redis(_) => Err("Redis 不是迁移目标；数据经键命令写入。".to_owned()),
-        CatalogSession::Mongo(_) => Err("MongoDB 不是迁移目标；文档经集合浏览器写入。".to_owned()),
+        CatalogSession::Redis(_) => Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_REDIS_NOT_TARGET, "Redis 不是迁移目标；数据经键命令写入。")),
+        CatalogSession::Mongo(_) => Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_MONGO_NOT_TARGET, "MongoDB 不是迁移目标；文档经集合浏览器写入。")),
         // SQLite 会话的池固定单连接，BEGIN/COMMIT 语句与数据语句落在同一条连接上。
         CatalogSession::Sqlite { pool, .. } => {
             exec_sqlite(pool, "BEGIN").await?;
@@ -333,9 +333,9 @@ async fn insert_page(target: &CatalogSession, statement: &str) -> Result<(), Str
 /// 逐行重放的单条自动提交语句（降级路径专用）。
 async fn exec_one(target: &CatalogSession, statement: &str) -> Result<(), String> {
     match target {
-        CatalogSession::Scripted => Err("这个连接没有连着可查询的数据库".to_owned()),
-        CatalogSession::Redis(_) => Err("Redis 不是迁移目标；数据经键命令写入。".to_owned()),
-        CatalogSession::Mongo(_) => Err("MongoDB 不是迁移目标；文档经集合浏览器写入。".to_owned()),
+        CatalogSession::Scripted => Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_NOT_QUERYABLE, "这个连接没有连着可查询的数据库")),
+        CatalogSession::Redis(_) => Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_REDIS_NOT_TARGET, "Redis 不是迁移目标；数据经键命令写入。")),
+        CatalogSession::Mongo(_) => Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_MONGO_NOT_TARGET, "MongoDB 不是迁移目标；文档经集合浏览器写入。")),
         CatalogSession::Sqlite { pool, .. } => exec_sqlite(pool, statement).await,
         CatalogSession::Mysql(pool) => {
             let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
@@ -405,13 +405,13 @@ async fn build_plan(
     let source_schema =
         describe(source, &source_ref.database, &source_ref.schema, &source_ref.table, &source_ref.engine)
             .await
-            .map_err(|message| format!("读取源表失败：{message}"))?;
+            .map_err(|message| crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_SOURCE_READ_FAILED, format!("读取源表失败：{message}")))?;
     let target_schema =
         describe(target, &target_ref.database, &target_ref.schema, &target_ref.table, &target_ref.engine)
             .await
-            .map_err(|message| format!("读取目标表失败：{message}"))?;
+            .map_err(|message| crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_TARGET_READ_FAILED, format!("读取目标表失败：{message}")))?;
     if target_schema.kind != "table" {
-        return Err("目标必须是已经存在的表；视图不能作为迁移目标。".to_owned());
+        return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_TARGET_NOT_TABLE, "目标必须是已经存在的表；视图不能作为迁移目标。"));
     }
 
     // 显式映射逐条校验；没给映射时按同名自动映射（精确优先，忽略大小写次之）。
@@ -423,7 +423,7 @@ async fn build_plan(
             }
         }
         if pairs.is_empty() {
-            return Err("没有可迁移的列：两边的列名都对不上，请在列映射里手动指定。".to_owned());
+            return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_NO_MAPPED_COLUMNS, "没有可迁移的列：两边的列名都对不上，请在列映射里手动指定。"));
         }
     } else {
         for pair in mapping {
@@ -435,7 +435,7 @@ async fn build_plan(
                 .iter()
                 .any(|item| item.target.name.eq_ignore_ascii_case(&target_column.name))
             {
-                return Err(format!("有两个源列都映射到目标列 {}。", target_column.name));
+                return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::MIGRATE_DUPLICATE_MAPPING, format!("有两个源列都映射到目标列 {}。", target_column.name)));
             }
             pairs.push(MigrationPair { source: source_column.clone(), target: target_column.clone() });
         }

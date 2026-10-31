@@ -11,6 +11,7 @@ import type { RedisApi } from "../redis/api";
 import SchemaBlock from "./SchemaBlock.vue";
 import { catalogConnections, catalogLoadError, refreshCatalog, schemaKey, setStructureFocus } from "./store";
 import { tr as t } from "../i18n";
+import { codeHint, codeMessage } from "../i18n/backend-error";
 import { engineShape, isConnected, isDefinitionKind, kindLabel, objectKey, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
 import type { CatalogConnection, DatabaseNode } from "./types";
 
@@ -163,8 +164,11 @@ function failureText(error: unknown): string {
 }
 
 function openFailure(report: OpenOutcome["report"]): string {
-  if (report.status === "wait") return report.hint || t("catalog.tree.hostKeyWait");
+  // T6-A2/R6：报告带稳定码时按码取字典，未知码回退原文。
+  if (report.status === "wait") return codeHint(report.code) ?? report.hint ?? t("catalog.tree.hostKeyWait");
   const stage = report.stages.find((item) => item.status === "err" && item.message);
+  const bridged = codeMessage(report.code);
+  if (bridged) return bridged;
   return stage?.message || report.hint || report.failStage || t("catalog.tree.notConnected");
 }
 

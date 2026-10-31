@@ -1,8 +1,8 @@
 /** MongoDB 域文案（R12）：集合文档浏览器/JSON 过滤/文档 CRUD 与确认。 */
 export const mongo = {
   docs: {
-    required: "Enter a JSON document, e.g. {\"status\": \"active\"}.",
-    mustBeObject: "The document must be a JSON object ({\"field\": value}), not an array or scalar.",
+    required: "Enter a JSON document, e.g. {'{'}\"status\": \"active\"{'}'}.",
+    mustBeObject: "The document must be a JSON object ({'{'}\"field\": value{'}'}), not an array or scalar.",
     syntaxError: "JSON syntax error: {message}",
     syntaxErrorPlain: "JSON syntax error.",
     apiFailedUnknown: "The operation failed for an unknown reason.",
@@ -16,7 +16,7 @@ export const mongo = {
     deletedNote: "Deleted {n} documents.",
   },
   tab: {
-    filterPlaceholder: "JSON filter, e.g. {\"status\": \"active\"}",
+    filterPlaceholder: "JSON filter, e.g. {'{'}\"status\": \"active\"{'}'}",
     filterLabel: "JSON filter",
     apply: "Filter",
     clearFilter: "Clear filter",
