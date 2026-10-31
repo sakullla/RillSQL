@@ -1017,6 +1017,10 @@ fn sqlserver_object(row: &tiberius::Row) -> Result<ObjectRow, String> {
 }
 
 /// SQL Server 的只读定义：函数/过程/触发器/视图走 OBJECT_DEFINITION，序列按 sys.sequences 重建。
+/// sys.sequences 的定义读取：start/increment/min/max 是 sql_variant、is_* 是位类型，
+/// 都在 SQL 侧投影成文本/0-1；读不到就报错，不静默编造 START 1 / NO CYCLE 之类的默认值。
+pub(crate) const SQLSERVER_SEQUENCE_SQL: &str = "SELECT TYPE_NAME(q.user_type_id), CAST(q.start_value AS NVARCHAR(40)), CAST(q.increment AS NVARCHAR(40)), CAST(q.minimum_value AS NVARCHAR(40)), CAST(q.maximum_value AS NVARCHAR(40)), CASE WHEN q.is_cycling THEN N'1' ELSE N'0' END, CASE WHEN q.is_cached THEN N'1' ELSE N'0' END, CAST(q.cache_size AS NVARCHAR(40)) FROM sys.sequences q JOIN sys.schemas s ON s.schema_id = q.schema_id WHERE s.name = @P1 AND q.name = @P2";
+
 async fn read_sqlserver_definition(client: &TdsHandle, schema: &str, name: &str, kind: &str) -> Result<String, String> {
     if schema.is_empty() {
         return Err(definition_failure("SQL Server 需要 schema"));
@@ -1036,16 +1040,16 @@ async fn read_sqlserver_definition(client: &TdsHandle, schema: &str, name: &str,
             Ok(text)
         }
         "sequence" => {
-            let sql = "SELECT TYPE_NAME(q.user_type_id), q.start_value, q.increment, q.minimum_value, q.maximum_value, q.is_cycling, q.is_cached, q.cache_size FROM sys.sequences q JOIN sys.schemas s ON s.schema_id = q.schema_id WHERE s.name = @P1 AND q.name = @P2";
+            let sql = SQLSERVER_SEQUENCE_SQL;
             let rows = tds_query_rows(client, sql, &[&schema, &name]).await.map_err(definition_failure)?;
             let row = rows.first().ok_or_else(|| definition_failure("没有读到定义"))?;
             let type_name = tds_text(row, 0).ok_or_else(|| definition_failure("没有读到定义"))?;
-            let start = tds_text(row, 1).unwrap_or_else(|| "1".to_owned());
-            let increment = tds_text(row, 2).unwrap_or_else(|| "1".to_owned());
-            let minimum = tds_text(row, 3).unwrap_or_default();
-            let maximum = tds_text(row, 4).unwrap_or_default();
+            let start = tds_text(row, 1).ok_or_else(|| definition_failure("没有读到序列起点"))?;
+            let increment = tds_text(row, 2).ok_or_else(|| definition_failure("没有读到序列步长"))?;
+            let minimum = tds_text(row, 3).ok_or_else(|| definition_failure("没有读到序列下限"))?;
+            let maximum = tds_text(row, 4).ok_or_else(|| definition_failure("没有读到序列上限"))?;
             let cycling = tds_text(row, 5).map(|value| value == "1").unwrap_or(false);
-            let cached = tds_text(row, 6).map(|value| value == "1").unwrap_or(true);
+            let cached = tds_text(row, 6).map(|value| value == "1").unwrap_or(false);
             let cache_size = tds_text(row, 7).unwrap_or_default();
             let cycle_text = if cycling { " CYCLE" } else { " NO CYCLE" };
             let cache_text = if cached && !cache_size.is_empty() {

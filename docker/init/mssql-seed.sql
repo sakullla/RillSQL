@@ -1,4 +1,5 @@
 -- SQL Server seed：与 postgres/mysql 夹具同风格——少量表、主键/自增/外键、一视图、一存储过程、少量数据行。
+-- CREATE VIEW / CREATE PROCEDURE 必须是批次首语句（T-SQL 规则），前后都补 GO 分批；sqlcmd 以 -f 65001 读入本文件。
 CREATE TABLE customers (
   id int IDENTITY(1, 1) PRIMARY KEY,
   name nvarchar(120) NOT NULL,
@@ -20,11 +21,13 @@ CREATE TABLE order_lines (
 );
 
 CREATE SEQUENCE note_seq AS int START WITH 100 INCREMENT BY 1;
+GO
 
 CREATE VIEW paid_orders AS
 SELECT id, customer_id, total
 FROM orders
 WHERE status = N'paid';
+GO
 
 CREATE PROCEDURE count_paid_orders
 AS

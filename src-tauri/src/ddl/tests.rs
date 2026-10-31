@@ -18,6 +18,7 @@ fn column(name: &str, type_name: &str, nullable: bool, primary: bool) -> Column 
         primary,
         auto: false,
         generated: false,
+        default_constraint: None,
     }
 }
 
@@ -910,4 +911,83 @@ async fn rebuild_restores_live_foreign_keys_and_enable_updates_the_session() {
     assert!(sql.to_ascii_lowercase().contains("note text"), "{sql}");
     assert_eq!(recorded_foreign_keys(&service.catalog_session("notes").expect("会话仍在")), Some(false));
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn sqlserver_alters_use_tsql_forms_without_inline_defaults() {
+    // 快照带 IDENTITY 主键、有具名默认约束的列。
+    let mut snapshot = Snapshot::bare(Engine::Sqlserver, "rillsql", "dbo", "notes");
+    let mut status = column("status", "nvarchar(20)", false, false);
+    status.default_sql = Some("N'open'".to_owned());
+    status.default_constraint = Some("DF_notes_status".to_owned());
+    snapshot.columns = vec![column("id", "int", false, true), status];
+    snapshot.row_count = Some(0);
+
+    // 改类型：ALTER COLUMN 只含列名/类型/NULL 性，不带 DEFAULT。
+    let mut drafts = snapshot.columns.iter().map(draft_of).collect::<Vec<_>>();
+    drafts.iter_mut().find(|column| column.name == "status").unwrap().type_name = "nvarchar(40)".to_owned();
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "notes".to_owned(), columns: drafts });
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert!(planned.steps.iter().any(|step| step.sql.contains("ALTER TABLE [dbo].[notes] ALTER COLUMN [status] nvarchar(40) NOT NULL;")), "{:?}", planned.steps);
+    assert!(!planned.steps.iter().any(|step| step.sql.contains("CHANGE COLUMN")), "T-SQL 没有 CHANGE COLUMN：{:?}", planned.steps);
+    assert!(!planned.steps.iter().any(|step| {
+        let upper = step.sql.to_ascii_uppercase();
+        upper.contains("ALTER COLUMN") && upper.contains(" DEFAULT")
+    }), "ALTER COLUMN 不能内联 DEFAULT：{:?}", planned.steps);
+
+    // 删默认值：用 sys.default_constraints 读到的约束名走 DROP CONSTRAINT。
+    let mut drop_default = snapshot.columns.iter().map(draft_of).collect::<Vec<_>>();
+    drop_default.iter_mut().find(|column| column.name == "status").unwrap().default_sql = String::new();
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "notes".to_owned(), columns: drop_default });
+    assert!(planned.steps.iter().any(|step| step.sql.contains("ALTER TABLE [dbo].[notes] DROP CONSTRAINT [DF_notes_status];")), "{:?}", planned.steps);
+
+    // 约束名缺失时按 sys.default_constraints 动态查找，不猜 DF_ 前缀名。
+    let mut unnamed = snapshot.clone();
+    unnamed.columns[1].default_constraint = None;
+    let mut drop_unnamed = unnamed.columns.iter().map(draft_of).collect::<Vec<_>>();
+    drop_unnamed.iter_mut().find(|column| column.name == "status").unwrap().default_sql = String::new();
+    let planned = plan(&unnamed, &Action::AlterColumns { table: "notes".to_owned(), columns: drop_unnamed });
+    let dynamic = planned.steps.iter().find(|step| step.sql.contains("DROP CONSTRAINT")).expect("应当生成删除默认值的语句");
+    assert!(dynamic.sql.contains("sys.default_constraints"), "{:?}", planned.steps);
+    assert!(dynamic.sql.contains("OBJECT_ID(N'[dbo].[notes]')"), "{:?}", planned.steps);
+
+    // 改默认值：ADD CONSTRAINT DF_<表>_<列> DEFAULT ... FOR。
+    let mut change_default = snapshot.columns.iter().map(draft_of).collect::<Vec<_>>();
+    change_default.iter_mut().find(|column| column.name == "status").unwrap().default_sql = "N'done'".to_owned();
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "notes".to_owned(), columns: change_default });
+    assert!(planned.steps.iter().any(|step| step.sql.contains("ALTER TABLE [dbo].[notes] ADD CONSTRAINT [DF_notes_status] DEFAULT N'done' FOR [status];")), "{:?}", planned.steps);
+
+    // 重命名：sp_rename，不生成 MySQL 式 CHANGE。
+    let mut renamed = snapshot.columns.iter().map(draft_of).collect::<Vec<_>>();
+    renamed.iter_mut().find(|column| column.name == "status").unwrap().name = "state".to_owned();
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "notes".to_owned(), columns: renamed });
+    assert!(planned.steps.iter().any(|step| step.sql.contains("EXEC sp_rename N'dbo.notes.status', N'state', 'COLUMN';")), "{:?}", planned.steps);
+
+    // 新增列：T-SQL 是 ADD，不是 ADD COLUMN。
+    let mut add = snapshot.columns.clone();
+    add.push(column("extra", "int", true, false));
+    let planned = plan(&snapshot, &Action::AlterColumns { table: "notes".to_owned(), columns: add.iter().map(draft_of).collect() });
+    assert!(planned.steps.iter().any(|step| step.sql.contains("ALTER TABLE [dbo].[notes] ADD [extra] int;")), "{:?}", planned.steps);
+    assert!(!planned.steps.iter().any(|step| step.sql.contains("ADD COLUMN")), "{:?}", planned.steps);
+
+    // 新建表的自增列是 IDENTITY(1, 1)（快照是已存在的表：建表动作按“新表”生成创建语句）。
+    let mut fresh = Snapshot::bare(Engine::Sqlserver, "rillsql", "dbo", "fresh");
+    fresh.object_exists = false;
+    let create = plan(
+        &fresh,
+        &Action::CreateTable {
+            name: "fresh".to_owned(),
+            columns: vec![ColumnDraft {
+                original: None,
+                name: "id".to_owned(),
+                type_name: "int".to_owned(),
+                nullable: false,
+                default_sql: String::new(),
+                primary: true,
+                auto: true,
+                dropped: false,
+            }],
+        },
+    );
+    assert!(create.steps.iter().any(|step| step.sql.contains("[id] int NOT NULL IDENTITY(1, 1)")), "{:?}", create.steps);
 }

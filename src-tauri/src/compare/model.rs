@@ -83,6 +83,8 @@ pub struct ColumnShape {
     pub nullable: bool,
     pub default_sql: String,
     pub primary: bool,
+    /// SQL Server 的具名默认约束（sys.default_constraints）；其余引擎为空。
+    pub default_constraint: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

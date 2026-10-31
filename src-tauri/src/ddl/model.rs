@@ -13,6 +13,8 @@ pub struct Column {
     pub primary: bool,
     pub auto: bool,
     pub generated: bool,
+    /// SQL Server 的默认值是具名约束（sys.default_constraints）；改/删默认值需要这个名字。其余引擎为 None。
+    pub default_constraint: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +146,7 @@ impl Snapshot {
             primary: false,
             auto: false,
             generated: false,
+            default_constraint: None,
         });
         snapshot.index_error = Some("permission denied".to_owned());
         snapshot.foreign_key_error = Some("fk denied".to_owned());

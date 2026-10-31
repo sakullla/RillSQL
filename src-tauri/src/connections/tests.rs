@@ -1069,3 +1069,28 @@ fn sqlserver_version_banner_parsing_maps_years_to_engine_majors() {
     assert!(sqlserver_product_major("Microsoft SQL Server 2022 (RTM) - 16.0.1000.6").unwrap() >= SQLSERVER_MIN_MAJOR);
     assert!(sqlserver_product_major("Microsoft SQL Server 2008 (SP3) - 10.0.5512.0").unwrap() < SQLSERVER_MIN_MAJOR);
 }
+
+#[test]
+fn mssql_fixture_seed_batches_and_sqlcmd_flags_stay_wired() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let compose = std::fs::read_to_string(root.join("../docker/compose.yaml")).unwrap();
+    let seed = std::fs::read_to_string(root.join("../docker/init/mssql-seed.sql")).unwrap();
+
+    // CREATE VIEW / CREATE PROCEDURE 必须是批次首语句（T-SQL 规则），seed 用 GO 分批。
+    // 按行首定位真实语句（首行注释里也提到这两个关键字）。
+    let view_at = seed.find("
+CREATE VIEW").map(|at| at + 1).expect("seed 有视图");
+    let proc_at = seed.find("
+CREATE PROCEDURE").map(|at| at + 1).expect("seed 有存储过程");
+    let before_view = seed[..view_at].trim_end();
+    let before_proc = seed[..proc_at].trim_end();
+    assert!(before_view.ends_with("GO"), "CREATE VIEW 前要有 GO 分批：{before_view}");
+    assert!(before_proc.ends_with("GO"), "CREATE PROCEDURE 前要有 GO 分批：{before_proc}");
+    assert!(seed[proc_at..].trim_end().ends_with(";"), "过程体结尾完整");
+
+    // sqlcmd：-b 让失败退出码可见；-f 65001 按 UTF-8 读 seed（中文数据不乱码）。
+    let init_command = compose.split("mssql-init:").nth(1).expect("compose 有 mssql-init");
+    assert!(init_command.contains("-b"), "sqlcmd 需要 -b：{init_command}");
+    assert!(init_command.contains("-f 65001"), "读 seed 需要 -f 65001：{init_command}");
+    assert!(init_command.contains("-i /seed/mssql-seed.sql"), "seed 挂载执行：{init_command}");
+}

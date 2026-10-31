@@ -5,7 +5,7 @@ mod exec;
 mod introspect;
 mod model;
 mod plan;
-mod sql;
+pub(crate) mod sql;
 
 pub(crate) use introspect::{load, load_partial};
 pub(crate) use model::{Action, Engine as DdlEngine, Request, Snapshot};

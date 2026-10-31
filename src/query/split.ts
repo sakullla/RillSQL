@@ -29,6 +29,11 @@ export function inspectSql(sql: string, engine = "postgres"): SplitReport {
   while (i < sql.length) {
     const begin = skipNoise(sql, i, hash);
     if (begin >= sql.length) break;
+    // T-SQL 的 GO 是客户端批次分隔，不是发往服务器的语句，整行跳过。
+    if (engine === "sqlserver" && isGoLine(sql, begin)) {
+      i = skipBreak(sql, eolAt(sql, begin));
+      continue;
+    }
     if (isDelimiterCommand(sql, begin)) {
       const lineEnd = eolAt(sql, begin);
       const arg = delimiterArgument(sql.slice(begin, lineEnd));
@@ -289,10 +294,14 @@ function scanStatement(sql: string, start: number, delimiter: string, hash: bool
   let quote: string | null = null;
   let dollar: string | null = null;
   let block = false;
+  // T-SQL 的方括号标识符 [name]，]] 是转义的 ]。
+  let bracket = false;
   let paren = 0;
   let beginDepth = 0;
   let routine = false;
   let openedBlock = false;
+  // END TRY 之后等待 BEGIN CATCH：期间分号不结束语句。
+  let catchPending = false;
   let decided = false;
   const words: string[] = [];
   let closed = false;
@@ -325,6 +334,24 @@ function scanStatement(sql: string, start: number, delimiter: string, hash: bool
         i += 2;
         continue;
       }
+      i += 1;
+      continue;
+    }
+    if (tsqlBlocks && bracket) {
+      if (sql[i] === "]") {
+        if (sql[i + 1] === "]") {
+          i += 2;
+          continue;
+        }
+        bracket = false;
+        i += 1;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    if (tsqlBlocks && sql[i] === "[") {
+      bracket = true;
       i += 1;
       continue;
     }
@@ -385,6 +412,16 @@ function scanStatement(sql: string, start: number, delimiter: string, hash: bool
       // 块内的分号不结束语句。BEGIN TRAN/TRANSACTION/DISTRIBUTED TRAN 是事务，不是块。
       // CASE 表达式同样以 END 收尾，成对计入深度，避免块内的 CASE END 提前扣减。
       const blockKeyword = routine || (tsqlBlocks && (upper === "CASE" || !beginsTransaction(sql, word.end, hash)));
+      // GO 独占一行时是批次分隔：当前语句在这里结束，GO 本身不进语句文本。
+      if (tsqlBlocks && upper === "GO" && beginDepth === 0 && isGoLine(sql, i)) {
+        closed = true;
+        closeAt = i;
+        i = word.end;
+        break;
+      }
+      if (upper === "CATCH") {
+        catchPending = false;
+      }
       if (upper === "BEGIN" && blockKeyword) {
         openedBlock = true;
         beginDepth += 1;
@@ -395,8 +432,20 @@ function scanStatement(sql: string, start: number, delimiter: string, hash: bool
         const next = peekWord(sql, word.end, hash);
         if (!next || !ROUTINE_TAIL.has(next)) {
           beginDepth -= 1;
-          // 块回到顶层时语句自闭合：END 后面不是 ELSE 就在这里结束。
-          if (beginDepth === 0 && openedBlock && tsqlBlocks && next !== "ELSE") {
+          if (tsqlBlocks && (next === "TRY" || next === "CATCH")) {
+            // END TRY / END CATCH 是复合收尾，语句边界在第二个词之后。
+            if (next === "TRY") {
+              // TRY 块结束但整个 TRY/CATCH 还没完：等待 BEGIN CATCH，期间分号不切分。
+              catchPending = true;
+            } else if (beginDepth === 0 && openedBlock) {
+              const catchEnd = endOfPeekedWord(sql, word.end, hash);
+              closed = true;
+              closeAt = catchEnd;
+              i = closeAt;
+              break;
+            }
+          } else if (beginDepth === 0 && openedBlock && tsqlBlocks && next !== "ELSE") {
+            // 块回到顶层时语句自闭合：END 后面不是 ELSE/TRY/CATCH 就在这里结束。
             closed = true;
             closeAt = word.end;
             i = closeAt;
@@ -407,7 +456,7 @@ function scanStatement(sql: string, start: number, delimiter: string, hash: bool
       i = word.end;
       continue;
     }
-    if (paren === 0 && beginDepth === 0 && delimiter.length > 0 && sql.startsWith(delimiter, i)) {
+    if (!catchPending && paren === 0 && beginDepth === 0 && delimiter.length > 0 && sql.startsWith(delimiter, i)) {
       closed = true;
       closeAt = i + delimiter.length;
       i = closeAt;
@@ -416,6 +465,7 @@ function scanStatement(sql: string, start: number, delimiter: string, hash: bool
     i += 1;
   }
   if (quote) return { piece: null, next: sql.length, refusal: "引号没有闭合，没有发送。" };
+  if (bracket) return { piece: null, next: sql.length, refusal: "方括号标识符没有闭合，没有发送。" };
   if (block) return { piece: null, next: sql.length, refusal: "块注释没有闭合，没有发送。" };
   if (dollar !== null) return { piece: null, next: sql.length, refusal: "dollar-quote 没有闭合，没有发送。" };
   if (beginDepth > 0) return { piece: null, next: sql.length, refusal: tsqlBlocks ? "BEGIN 块未闭合，没有发送。" : "例程体未闭合，没有发送。" };
@@ -490,6 +540,22 @@ function engineLabel(engine: string): string {
 function beginsTransaction(sql: string, index: number, hash: boolean): boolean {
   const next = peekWord(sql, index, hash);
   return next === "TRAN" || next === "TRANSACTION" || next === "DISTRIBUTED";
+}
+
+/** 复合收尾（END TRY / END CATCH）第二个词的结束位置。 */
+function endOfPeekedWord(sql: string, from: number, hash: boolean): number {
+  const at = skipNoise(sql, from, hash);
+  return readWord(sql, at).end;
+}
+
+/** GO 批次分隔的判定：GO 独占一行（行内剩余只允许空白或纯数字的批次计数），行中出现的 GO 不算。 */
+function isGoLine(sql: string, wordStart: number): boolean {
+  if (readWord(sql, wordStart).text.toUpperCase() !== "GO") return false;
+  let back = wordStart;
+  while (back > 0 && (sql[back - 1] === " " || sql[back - 1] === "\t" || sql[back - 1] === "\r")) back -= 1;
+  if (back > 0 && sql[back - 1] !== "\n") return false;
+  const rest = sql.slice(wordStart + 2, eolAt(sql, wordStart)).trim();
+  return rest.length === 0 || /^\d+$/.test(rest);
 }
 
 function hashComments(engine: string): boolean {

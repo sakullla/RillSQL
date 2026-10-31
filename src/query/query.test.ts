@@ -1472,4 +1472,26 @@ describe("tsql statement split", () => {
     expect(delimiter.pieces).toHaveLength(1);
     expect(delimiter.notices[0]).toContain("SQL Server 不使用 DELIMITER");
   });
+
+  it("treats bracket identifiers, TRY/CATCH and GO batches like the Rust splitter", () => {
+    // 方括号标识符：[end]/[case]/[a]]b] 不参与块计数与切分。
+    const brackets = splitSql("SELECT [end], [case], [a]]b] FROM t; SELECT 1;", "sqlserver");
+    expect(brackets).toHaveLength(2);
+    expect(brackets[0]!.text).toContain("[a]]b]");
+    const unclosed = inspectSql("SELECT [name FROM t;", "sqlserver");
+    expect(unclosed.refusal).toBe("方括号标识符没有闭合，没有发送。");
+
+    // TRY/CATCH 是一条语句：END TRY 后的分号不切分，END CATCH 才收束。
+    const tryCatch = splitSql("BEGIN TRY\n  SELECT 1;\nEND TRY;\nBEGIN CATCH\n  SELECT 2;\nEND CATCH\nSELECT 3;", "sqlserver");
+    expect(tryCatch).toHaveLength(2);
+    expect(tryCatch[0]!.text.trimEnd().endsWith("END CATCH")).toBe(true);
+
+    // GO 是批次分隔：不进语句文本；GO n 计数形式同样跳过；行中的 GO 只是普通词。
+    const batches = splitSql("SELECT 1;\nGO\nSELECT 2\nGO 5\nSELECT 3;", "sqlserver");
+    expect(batches).toHaveLength(3);
+    expect(batches.every((piece) => !piece.text.includes("GO"))).toBe(true);
+    expect(splitSql("SELECT 1 FROM gopher WHERE x = 1;", "sqlserver")).toHaveLength(1);
+    const noSemi = splitSql("UPDATE t SET n = 1\nGO\nUPDATE u SET m = 2\nGO", "sqlserver");
+    expect(noSemi).toHaveLength(2);
+  });
 });

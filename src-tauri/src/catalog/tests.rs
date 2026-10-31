@@ -657,3 +657,16 @@ fn sqlserver_shows_databases_and_schemas_layers() {
     assert!(Engine::Sqlserver.shows_schemas());
     assert!(!Engine::Sqlserver.shows_foreign_keys());
 }
+
+#[test]
+fn sqlserver_sequence_definition_projects_sql_variant_columns() {
+    // sql_variant 与位类型列必须先投影成文本：读不到时报错，而不是编造 START 1 / NO CYCLE。
+    let sql = super::read::SQLSERVER_SEQUENCE_SQL;
+    for column in ["start_value", "increment", "minimum_value", "maximum_value", "cache_size"] {
+        let cast = format!("CAST(q.{column} AS NVARCHAR(40))");
+        assert!(sql.contains(&cast), "{column} 需要 CAST 投影：{sql}");
+    }
+    assert!(sql.contains("CASE WHEN q.is_cycling THEN N'1' ELSE N'0' END"), "{sql}");
+    assert!(sql.contains("CASE WHEN q.is_cached THEN N'1' ELSE N'0' END"), "{sql}");
+    assert!(sql.contains("FROM sys.sequences"), "{sql}");
+}

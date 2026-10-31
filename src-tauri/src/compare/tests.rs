@@ -10,7 +10,7 @@ use super::structure::{diff_structure, render_script, table_data_keys};
 use crate::grid::{insert_sql, Cell, Column, TableSchema};
 
 fn column(name: &str, type_name: &str, nullable: bool, primary: bool) -> ColumnShape {
-    ColumnShape { name: name.to_owned(), type_name: type_name.to_owned(), nullable, default_sql: String::new(), primary }
+    ColumnShape { name: name.to_owned(), type_name: type_name.to_owned(), nullable, default_sql: String::new(), primary, default_constraint: String::new() }
 }
 
 fn shape(columns: Vec<ColumnShape>, indexes: Vec<IndexShape>) -> TableShape {
@@ -1514,4 +1514,47 @@ async fn sqlite_compare_reads_both_connections_and_does_not_execute_the_script()
     let extra: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders WHERE id = 2").fetch_one(&pool).await.unwrap();
     assert_eq!(extra, 1);
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sqlserver_alter_emits_constraint_based_default_changes() {
+    fn tsql_column(name: &str, type_name: &str, nullable: bool, primary: bool, default_sql: &str, constraint: &str) -> ColumnShape {
+        ColumnShape { name: name.to_owned(), type_name: type_name.to_owned(), nullable, default_sql: default_sql.to_owned(), primary, default_constraint: constraint.to_owned() }
+    }
+
+    fn tsql_table(status_default: &str, constraint: &str, status_type: &str) -> ObjectDef {
+        ObjectDef::table(
+            "notes",
+            shape(
+                vec![
+                    tsql_column("id", "int", false, true, "", ""),
+                    tsql_column("status", status_type, false, false, status_default, constraint),
+                ],
+                Vec::new(),
+            ),
+        )
+    }
+
+    // 目标库：默认值 N'open'（具名约束 DF_notes_status）；基准想要 N'done'。
+    let baseline = Side::ready("sqlserver", "rillsql", "dbo", vec![tsql_table("N'done'", "", "nvarchar(20)")]);
+    let target = Side::ready("sqlserver", "rillsql", "dbo", vec![tsql_table("N'open'", "DF_notes_status", "nvarchar(20)")]);
+    let report = diff_structure(&baseline, &target);
+    let script = &report.script;
+    assert!(script.contains("ALTER TABLE [dbo].[notes] DROP CONSTRAINT [DF_notes_status]"), "{script}");
+    assert!(script.contains("ALTER TABLE [dbo].[notes] ADD CONSTRAINT [DF_notes_status] DEFAULT N'done' FOR [status]"), "{script}");
+    assert!(!script.to_ascii_uppercase().contains("ALTER COLUMN [STATUS] SET DEFAULT"), "T-SQL 没有 ALTER COLUMN SET DEFAULT：{script}");
+    assert!(!script.to_ascii_uppercase().contains("ALTER COLUMN [STATUS] DROP DEFAULT"), "T-SQL 没有 ALTER COLUMN DROP DEFAULT：{script}");
+
+    // 目标侧没有读到约束名时按 sys.default_constraints 动态查找。
+    let target_unnamed = Side::ready("sqlserver", "rillsql", "dbo", vec![tsql_table("N'open'", "", "nvarchar(20)")]);
+    let report = diff_structure(&baseline, &target_unnamed);
+    assert!(report.script.contains("sys.default_constraints"), "{}", report.script);
+    assert!(report.script.contains("OBJECT_ID(N'[dbo].[notes]')"), "{}", report.script);
+
+    // 类型变化走 ALTER COLUMN，且不含内联 DEFAULT。
+    let baseline_retyped = Side::ready("sqlserver", "rillsql", "dbo", vec![tsql_table("N'open'", "DF_notes_status", "nvarchar(40)")]);
+    let report = diff_structure(&baseline_retyped, &target);
+    assert!(report.script.contains("ALTER TABLE [dbo].[notes] ALTER COLUMN [status] nvarchar(40) NOT NULL"), "{}", report.script);
+    let alter_column_line = report.script.lines().find(|line| line.contains("ALTER COLUMN [status]")).expect("ALTER COLUMN 语句");
+    assert!(!alter_column_line.to_ascii_uppercase().contains("DEFAULT"), "ALTER COLUMN 不能内联 DEFAULT：{alter_column_line}");
 }

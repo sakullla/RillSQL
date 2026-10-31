@@ -173,6 +173,7 @@ async fn load_sqlite(pool: &sqlx::SqlitePool, database: &str, table: &str, recor
             primary: sqlite_i64(row, 5).unwrap_or(0) > 0,
             auto: false,
             generated: hidden != 0,
+            default_constraint: None,
         });
     }
     if snapshot.columns.is_empty() {
@@ -515,6 +516,7 @@ async fn load_mysql(pool: &mysql_async::Pool, engine: Engine, database: &str, ta
             primary: false,
             auto: extra.contains("auto_increment"),
             generated,
+            default_constraint: None,
         });
     }
     let indexes: Vec<mysql_async::Row> = keep_rows(
@@ -673,7 +675,7 @@ async fn tds_strings(client: &TdsHandle, sql: &str) -> Result<Vec<Vec<String>>, 
 }
 
 fn tds_escape(value: &str) -> String {
-    value.replace('\'', "")
+    value.replace('\'', "''")
 }
 
 /// SQL Server 的结构读取：sys 视图给出列/索引/外键，视图原文走 OBJECT_DEFINITION。
@@ -700,7 +702,7 @@ async fn load_sqlserver(client: &TdsHandle, database: &str, schema: &str, table:
     let columns = tds_strings(
         client,
         &format!(
-            "SELECT c.name, TYPE_NAME(c.user_type_id) + CASE WHEN TYPE_NAME(c.system_type_id) IN ('varchar', 'nvarchar', 'varbinary') AND c.max_length = -1 THEN '(MAX)' ELSE '' END, c.is_nullable, c.is_identity, dc.definition, c.is_computed FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id WHERE s.name = N'{schema_q}' AND o.name = N'{table_q}' ORDER BY c.column_id"
+            "SELECT c.name, TYPE_NAME(c.user_type_id) + CASE WHEN TYPE_NAME(c.system_type_id) IN ('varchar', 'nvarchar', 'varbinary') AND c.max_length = -1 THEN '(MAX)' ELSE '' END, c.is_nullable, c.is_identity, dc.definition, c.is_computed, dc.name FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id WHERE s.name = N'{schema_q}' AND o.name = N'{table_q}' ORDER BY c.column_id"
         ),
     )
     .await
@@ -720,6 +722,11 @@ async fn load_sqlserver(client: &TdsHandle, database: &str, schema: &str, table:
             primary: false,
             auto: flag(3).unwrap_or(false),
             generated: flag(5).unwrap_or(false),
+            // sys.default_constraints 里的具名默认约束；改/删默认值用它，不猜 DF_ 前缀名。
+            default_constraint: {
+                let name = text(6);
+                if name.is_empty() { None } else { Some(name) }
+            },
         });
     }
     let indexes: Vec<Vec<String>> = keep_rows(
@@ -952,6 +959,7 @@ async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: 
             primary: false,
             auto: identity == "a" || identity == "d",
             generated: !generated.is_empty(),
+            default_constraint: None,
         });
     }
     let indexes = keep_rows(

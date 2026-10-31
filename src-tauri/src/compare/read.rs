@@ -529,6 +529,7 @@ fn apply_snapshot(object: &mut ObjectDef, snapshot: &Snapshot) {
                 nullable: column.nullable,
                 default_sql: column.default_sql.clone().unwrap_or_default(),
                 primary: column.primary,
+                default_constraint: column.default_constraint.clone().unwrap_or_default(),
             })
             .collect(),
         indexes: snapshot

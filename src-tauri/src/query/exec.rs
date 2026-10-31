@@ -614,6 +614,8 @@ async fn sqlserver_current(client: &std::sync::Arc<tokio::sync::Mutex<crate::con
 }
 
 /// TDS 执行：会返回行的语句走 simple_query 收行集，其余走 execute 拿受影响行数。
+/// SET 类语句（含 SET SHOWPLAN_ALL）一律走 simple_query：execute 是 sp_executesql，
+/// 其中的 SET 只作用于内层批次、结束后即还原，外层会话上的 SHOWPLAN_ALL 不会生效。
 async fn sqlserver_run(
     client: &std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>,
     engine: &str,
@@ -625,7 +627,7 @@ async fn sqlserver_run(
 ) -> Result<StatementValue, String> {
     let bounded = cap_result_sql(engine, sql, limit);
     let mut locked = client.lock().await;
-    if !looks_like_rows(&bounded) {
+    if !sqlserver_wants_rows(&bounded) {
         let done = locked.execute(bounded, &[]).await.map_err(|err| err.to_string())?;
         let value = StatementValue {
             columns: Vec::new(),
@@ -668,6 +670,8 @@ async fn sqlserver_run(
     }
     drop(stream);
     drop(locked);
+    // SHOWPLAN_ALL 行集按 NodeId 排成稳定的父先子后顺序（层次有效性经 showplan_outline 验证）。
+    let rows = order_showplan_results(&columns, rows);
     if columns.is_empty() {
         let value = StatementValue {
             columns,
@@ -680,6 +684,46 @@ async fn sqlserver_run(
         return Ok(value);
     }
     reveal_rows(sink, index, columns, column_types, rows, truncated, None, limit, cancel).await
+}
+
+/// SHOWPLAN 批次判定：以 SET SHOWPLAN_ALL 开头的语句即使整批到达也按收行路径执行。
+pub fn is_showplan_statement(sql: &str) -> bool {
+    let mut words = sql.trim_start().split_whitespace();
+    matches!(
+        (words.next(), words.next()),
+        (Some(first), Some(second)) if first.eq_ignore_ascii_case("SET") && second.eq_ignore_ascii_case("SHOWPLAN_ALL")
+    )
+}
+
+/// TDS 的收行路由：普通 SELECT 族、以及全部 SET 开头的会话设置语句。
+fn sqlserver_wants_rows(sql: &str) -> bool {
+    is_showplan_statement(sql) || split::first_keyword(sql) == "SET" || looks_like_rows(sql)
+}
+
+/// 把已收到的 SHOWPLAN_ALL 行集按 NodeId 升序排成父先子后。
+/// 先把行集还原成 (NodeId, Parent, 操作) 三元组走 showplan_outline 验证层次完整
+/// （父节点缺失或 NodeId 非数字时按原序返回，不猜）；有效层次才重排。
+pub fn order_showplan_results(columns: &[String], rows: Vec<Vec<Option<String>>>) -> Vec<Vec<Option<String>>> {
+    let names: Vec<String> = columns.iter().map(|column| column.trim().to_ascii_lowercase()).collect();
+    let (Some(node_at), Some(parent_at)) = (names.iter().position(|name| name == "nodeid"), names.iter().position(|name| name == "parent")) else {
+        return rows;
+    };
+    let text = |row: &Vec<Option<String>>, index: usize| -> String {
+        row.get(index).and_then(|cell| cell.as_deref()).unwrap_or("").trim().to_owned()
+    };
+    let mut triples = Vec::with_capacity(rows.len());
+    for (position, row) in rows.iter().enumerate() {
+        let (Some(node), Some(parent)) = (text(row, node_at).parse::<i64>().ok(), text(row, parent_at).parse::<i64>().ok()) else {
+            return rows;
+        };
+        triples.push((node, parent, position));
+    }
+    if showplan_outline(&triples.iter().map(|(node, parent, _)| (*node, *parent, String::new(), String::new())).collect::<Vec<_>>()).len() != rows.len() {
+        return rows;
+    }
+    let mut indexed = triples;
+    indexed.sort_by_key(|(node, _, _)| *node);
+    indexed.into_iter().map(|(_, _, position)| rows[position].clone()).collect()
 }
 
 fn tds_string_cell(row: &tiberius::Row, index: usize) -> Option<String> {
@@ -707,10 +751,67 @@ fn tds_string_cell(row: &tiberius::Row, index: usize) -> Option<String> {
     if let Ok(Some(bytes)) = row.try_get::<&[u8], _>(index) {
         return Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect());
     }
+    // decimal / numeric / money：Numeric 自带定点文本（含小数位）。
+    if let Ok(Some(value)) = row.try_get::<tiberius::numeric::Numeric, _>(index) {
+        return Some(tds_numeric_text(value));
+    }
+    // uniqueidentifier。
+    if let Ok(Some(value)) = row.try_get::<uuid::Uuid, _>(index) {
+        return Some(tds_uuid_text(value));
+    }
+    // xml（文档原文）：XmlData 只实现 FromSqlOwned，经 cells() 按 ColumnData 直接取。
+    if let Some((_, data)) = row.cells().nth(index) {
+        if let tiberius::ColumnData::Xml(Some(xml)) = data {
+            return Some(xml.to_string());
+        }
+    }
+    // datetime / datetime2 / smalldatetime → 本地日期时间文本。
+    if let Ok(Some(value)) = row.try_get::<chrono::NaiveDateTime, _>(index) {
+        return Some(tds_naive_datetime_text(value));
+    }
+    // date。
+    if let Ok(Some(value)) = row.try_get::<chrono::NaiveDate, _>(index) {
+        return Some(tds_naive_date_text(value));
+    }
+    // time(n)。
+    if let Ok(Some(value)) = row.try_get::<chrono::NaiveTime, _>(index) {
+        return Some(tds_naive_time_text(value));
+    }
+    // datetimeoffset（带时区偏移）。
+    if let Ok(Some(value)) = row.try_get::<chrono::DateTime<chrono::Utc>, _>(index) {
+        return Some(tds_datetime_offset_text(value));
+    }
     None
 }
 
-fn tds_type_name(kind: tiberius::ColumnType) -> &'static str {
+/// 以下格式化器把 TDS 专用类型落成与其它引擎一致的网格文本；
+/// 单独成函数是为了不经数据库就能单测格式口径。
+pub fn tds_numeric_text(value: tiberius::numeric::Numeric) -> String {
+    value.to_string()
+}
+
+pub fn tds_uuid_text(value: uuid::Uuid) -> String {
+    value.to_string()
+}
+
+pub fn tds_naive_datetime_text(value: chrono::NaiveDateTime) -> String {
+    // chrono Display：无小数 "2024-01-02 15:04:05"，有则补到 3/6/9 位。
+    value.to_string()
+}
+
+pub fn tds_naive_date_text(value: chrono::NaiveDate) -> String {
+    value.format("%Y-%m-%d").to_string()
+}
+
+pub fn tds_naive_time_text(value: chrono::NaiveTime) -> String {
+    value.to_string()
+}
+
+pub fn tds_datetime_offset_text(value: chrono::DateTime<chrono::Utc>) -> String {
+    value.to_rfc3339()
+}
+
+pub fn tds_type_name(kind: tiberius::ColumnType) -> &'static str {
     use tiberius::ColumnType::*;
     match kind {
         Bit | Bitn => "bit",

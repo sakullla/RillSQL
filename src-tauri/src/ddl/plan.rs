@@ -581,8 +581,10 @@ fn remote_alters(snapshot: &Snapshot, table: &str, changes: &[Change]) -> Result
         match change {
             Change::Add(draft) => {
                 let definition = column_sql(snapshot.engine, draft, false)?;
+                // T-SQL 没有 ADD COLUMN 关键字，只有 ADD。
+                let verb = if snapshot.engine == Engine::Sqlserver { "ADD" } else { "ADD COLUMN" };
                 steps.push(Step {
-                    sql: format!("ALTER TABLE {qualified} ADD COLUMN {definition};"),
+                    sql: format!("ALTER TABLE {qualified} {verb} {definition};"),
                     label: format!("新增字段 {}", draft.name.trim()),
                 });
             }
@@ -626,6 +628,50 @@ fn remote_alters(snapshot: &Snapshot, table: &str, changes: &[Change]) -> Result
                             format!("ALTER TABLE {qualified} ALTER COLUMN {column_name} SET DEFAULT {};", draft.default_sql.trim())
                         };
                         steps.push(Step { sql, label: format!("修改默认值 {}", draft.name.trim()) });
+                    }
+                } else if snapshot.engine == Engine::Sqlserver {
+                    // T-SQL：重命名走 sp_rename；类型/可空性走 ALTER COLUMN（不含内联 DEFAULT）；
+                    // 默认值是具名约束，走 DROP CONSTRAINT / ADD CONSTRAINT ... DEFAULT ... FOR。
+                    if draft.name.trim() != original.name {
+                        let rename_escaped = |value: &str| value.trim().replace('\'', "''");
+                        steps.push(Step {
+                            sql: format!(
+                                "EXEC sp_rename N'{}.{}.{}', N'{}', 'COLUMN';",
+                                rename_escaped(&snapshot.schema),
+                                rename_escaped(table),
+                                rename_escaped(&original.name),
+                                rename_escaped(draft.name.trim())
+                            ),
+                            label: format!("重命名 {} → {}", original.name, draft.name.trim()),
+                        });
+                    }
+                    let column_name = quote_ident(snapshot.engine, draft.name.trim());
+                    let type_changed = !same_type(&draft.type_name, &original.type_name);
+                    if type_changed || draft.nullable != original.nullable {
+                        let mut definition = format!("{} {}", column_name, draft.type_name.trim());
+                        if !draft.nullable {
+                            definition.push_str(" NOT NULL");
+                        }
+                        steps.push(Step {
+                            sql: format!("ALTER TABLE {qualified} ALTER COLUMN {definition};"),
+                            label: format!("修改字段 {}", draft.name.trim()),
+                        });
+                    }
+                    if normalize_default(&draft.default_sql) != original.default_sql.as_deref().map(str::trim) {
+                        if draft.default_sql.trim().is_empty() {
+                            let sql = format!(
+                                "{};",
+                                super::sql::sqlserver_drop_default_sql(&qualified, draft.name.trim(), original.default_constraint.as_deref().unwrap_or(""))
+                            );
+                            steps.push(Step { sql, label: format!("删除默认值 {}", draft.name.trim()) });
+                        } else {
+                            let table_name = super::sql::sqlserver_bare_table_name(&qualified);
+                            let sql = format!(
+                                "{};",
+                                super::sql::sqlserver_add_default_sql(&qualified, &table_name, draft.name.trim(), draft.default_sql.trim())
+                            );
+                            steps.push(Step { sql, label: format!("修改默认值 {}", draft.name.trim()) });
+                        }
                     }
                 } else {
                     let definition = column_sql(snapshot.engine, draft, false)?;
@@ -963,6 +1009,10 @@ fn column_sql(engine: Engine, draft: &ColumnDraft, sqlite_inline_auto: bool) -> 
     }
     if matches!(engine, Engine::Mysql | Engine::Mariadb) && draft.auto {
         sql.push_str(" AUTO_INCREMENT");
+    }
+    // T-SQL 的自增列是 IDENTITY(1, 1)。
+    if engine == Engine::Sqlserver && draft.auto {
+        sql.push_str(" IDENTITY(1, 1)");
     }
     if non_null_default(&draft.default_sql) && !draft.auto {
         sql.push_str(" DEFAULT ");

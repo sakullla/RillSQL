@@ -726,6 +726,62 @@ fn sqlserver_result_cap_uses_top_without_touching_with_statements() {
 }
 
 #[test]
+fn sqlserver_set_and_showplan_statements_route_through_the_row_path() {
+    // sp_executesql（execute 路径）里的 SET 只作用于内层批次；SET 语句必须走 simple_query 才会留在会话上。
+    assert!(exec::is_showplan_statement("SET SHOWPLAN_ALL ON"));
+    assert!(exec::is_showplan_statement("set showplan_all off"));
+    assert!(exec::is_showplan_statement("  SET SHOWPLAN_ALL ON;\nSELECT 1;\nSET SHOWPLAN_ALL OFF"));
+    assert!(!exec::is_showplan_statement("SELECT 1"));
+    assert!(!exec::is_showplan_statement("SET NOCOUNT ON"));
+    // 路由口径：SET 开头（会话设置）与 SELECT 族都走收行路径，写语句走 execute 拿受影响行数。
+    assert_eq!(split::first_keyword("SET NOCOUNT ON"), "SET");
+    assert_eq!(split::first_keyword("SET SHOWPLAN_ALL ON"), "SET");
+    assert_eq!(split::first_keyword("SELECT * FROM t"), "SELECT");
+    assert_eq!(split::first_keyword("UPDATE t SET n = 1"), "UPDATE");
+}
+
+#[test]
+fn sqlserver_showplan_batch_survives_the_real_split_and_routes_each_piece() {
+    // 真实批次（不经 synthetic 拦截）：整批按分号切成三条语句，每条都走收行路径，
+    // 中间的 SELECT 在 SHOWPLAN_ALL 下返回计划行集而不是执行语句。
+    let batch = exec::showplan_batch("SELECT * FROM [dbo].[orders]");
+    let report = split::split_sql("sqlserver", &batch);
+    assert_eq!(report.pieces.len(), 3, "{report:?}");
+    assert_eq!(report.pieces[0].text.trim_end_matches(';'), "SET SHOWPLAN_ALL ON");
+    assert_eq!(report.pieces[1].text.trim_end_matches(';'), "SELECT * FROM [dbo].[orders]");
+    assert_eq!(report.pieces[2].text.trim_end_matches(';'), "SET SHOWPLAN_ALL OFF");
+    for piece in &report.pieces {
+        let first = piece.text.split_whitespace().next().unwrap_or("");
+        assert!(first.eq_ignore_ascii_case("SET") || first.eq_ignore_ascii_case("SELECT"), "每条语句都应走 simple_query 收行路径：{}", piece.text);
+    }
+}
+
+#[test]
+fn sqlserver_showplan_result_rows_are_ordered_parents_first() {
+    // 乱序返回的 SHOWPLAN_ALL 行集按 NodeId 排成父先子后；非 SHOWPLAN 形状原样返回。
+    let columns: Vec<String> = ["StmtId", "NodeId", "Parent", "PhysicalOp", "LogicalOp", "Argument", "EstimateRows"]
+        .iter()
+        .map(|item| item.to_string())
+        .collect();
+    let rows = vec![
+        vec![Some("1".to_owned()), Some("4".to_owned()), Some("3".to_owned()), Some("Nested Loops".to_owned()), Some("".to_owned()), Some("".to_owned()), Some("10".to_owned())],
+        vec![Some("1".to_owned()), Some("1".to_owned()), Some("0".to_owned()), Some("".to_owned()), Some("".to_owned()), Some("SELECT".to_owned()), Some("1".to_owned())],
+        vec![Some("1".to_owned()), Some("3".to_owned()), Some("1".to_owned()), Some("Sort".to_owned()), Some("".to_owned()), Some("".to_owned()), Some("3".to_owned())],
+        vec![Some("1".to_owned()), Some("2".to_owned()), Some("1".to_owned()), Some("Clustered Index Scan".to_owned()), Some("".to_owned()), Some("".to_owned()), Some("3".to_owned())],
+    ];
+    let ordered = exec::order_showplan_results(&columns, rows);
+    let node_ids: Vec<&str> = ordered.iter().map(|row| row[1].as_deref().unwrap_or("")).collect();
+    assert_eq!(node_ids, vec!["1", "2", "3", "4"]);
+    // NodeId 非数字或父缺失（层次不完整）时按原序返回，不猜。
+    let plain = vec![Some("a".to_owned()), Some("b".to_owned())];
+    let kept = exec::order_showplan_results(&columns, vec![plain.clone()]);
+    assert_eq!(kept, vec![plain]);
+    let ordinary_columns: Vec<String> = ["id", "name"].iter().map(|item| item.to_string()).collect();
+    let untouched = exec::order_showplan_results(&ordinary_columns, vec![vec![Some("1".to_owned()), Some("x".to_owned())]]);
+    assert_eq!(untouched.len(), 1);
+}
+
+#[test]
 fn sqlserver_showplan_batch_wraps_the_statement_without_executing_it() {
     // SHOWPLAN 批次：SET 开、原语句、SET 关。原语句保持一行，不做改写。
     let batch = super::exec::showplan_batch("SELECT * FROM [dbo].[orders]");
@@ -1186,4 +1242,79 @@ async fn wait_done(state: &super::commands::QueryState, id: &str) -> super::comm
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("执行没有结束");
+}
+
+#[test]
+fn tds_value_formatters_cover_numeric_uuid_and_temporal_types() {
+    use super::exec::{tds_datetime_offset_text, tds_naive_date_text, tds_naive_datetime_text, tds_naive_time_text, tds_numeric_text, tds_uuid_text};
+    // decimal / money：定点文本保留小数位。
+    let money = tiberius::numeric::Numeric::new_with_scale(12850, 2);
+    assert_eq!(tds_numeric_text(money), "128.50");
+    // uniqueidentifier。
+    let id = uuid::Uuid::parse_str("0E984725-C51C-4BF4-9960-E1C80E27ABA0").unwrap();
+    assert_eq!(tds_uuid_text(id), "0e984725-c51c-4bf4-9960-e1c80e27aba0");
+    // datetime / datetime2 / smalldatetime。
+    let stamp = chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap().and_hms_opt(15, 4, 5).unwrap();
+    assert_eq!(tds_naive_datetime_text(stamp), "2024-01-02 15:04:05");
+    let with_nanos = chrono::NaiveDate::from_ymd_opt(2024, 1, 2)
+        .unwrap()
+        .and_hms_nano_opt(15, 4, 5, 123_456_000)
+        .unwrap();
+    assert_eq!(tds_naive_datetime_text(with_nanos), "2024-01-02 15:04:05.123456");
+    // date / time(n)。
+    assert_eq!(tds_naive_date_text(chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap()), "2024-01-02");
+    assert_eq!(tds_naive_time_text(chrono::NaiveTime::from_hms_opt(15, 4, 5).unwrap()), "15:04:05");
+    // datetimeoffset（RFC3339）。
+    let offset = chrono::DateTime::parse_from_rfc3339("2024-01-02T15:04:05+08:00").unwrap().with_timezone(&chrono::Utc);
+    assert_eq!(tds_datetime_offset_text(offset), "2024-01-02T07:04:05+00:00");
+}
+
+#[test]
+fn tds_type_names_map_temporal_numeric_and_xml_columns() {
+    use super::exec::tds_type_name;
+    use tiberius::ColumnType;
+    assert_eq!(tds_type_name(ColumnType::Datetime2), "datetime");
+    assert_eq!(tds_type_name(ColumnType::Daten), "date");
+    assert_eq!(tds_type_name(ColumnType::Timen), "time");
+    assert_eq!(tds_type_name(ColumnType::DatetimeOffsetn), "datetimeoffset");
+    assert_eq!(tds_type_name(ColumnType::Decimaln), "decimal");
+    assert_eq!(tds_type_name(ColumnType::Money), "decimal");
+    assert_eq!(tds_type_name(ColumnType::Guid), "uniqueidentifier");
+    assert_eq!(tds_type_name(ColumnType::Xml), "xml");
+}
+
+#[test]
+fn tsql_split_handles_bracket_identifiers_try_catch_and_go_batches() {
+    // 方括号标识符：[end]/[case]/[begin] 不参与块计数；]] 是转义的 ]。
+    let brackets = split::split_sql("sqlserver", "SELECT [end], [case], [a]]b] FROM t; SELECT 1;");
+    assert_eq!(brackets.pieces.len(), 2, "{brackets:?}");
+    assert!(brackets.pieces[0].text.contains("[a]]b]"));
+    // 未闭合的方括号整批拒绝。
+    let unclosed = split::split_sql("sqlserver", "SELECT [name FROM t;");
+    assert_eq!(unclosed.refusal.as_deref(), Some("方括号标识符没有闭合，没有发送。"));
+    // 方括号里的 TOP/LIMIT 不当关键字：行数上限照常改写为 TOP。
+    assert_eq!(
+        exec::cap_result_sql("sqlserver", "SELECT [limit] FROM t", 10),
+        "SELECT TOP (11) [limit] FROM t"
+    );
+
+    // TRY/CATCH 是一条语句：END TRY 后的分号不切分，END CATCH 才收束。
+    let try_catch = split::split_sql("sqlserver", "BEGIN TRY\n  SELECT 1;\nEND TRY\nBEGIN CATCH\n  SELECT 2;\nEND CATCH\nSELECT 3;");
+    assert_eq!(try_catch.pieces.len(), 2, "{try_catch:?}");
+    assert!(try_catch.pieces[0].text.contains("BEGIN TRY"));
+    assert!(try_catch.pieces[0].text.trim_end().ends_with("END CATCH"));
+    // END TRY 后面带分号的写法同样不提前切分。
+    let semicolon = split::split_sql("sqlserver", "BEGIN TRY\n  SELECT 1;\nEND TRY;\nBEGIN CATCH\n  SELECT 2;\nEND CATCH;");
+    assert_eq!(semicolon.pieces.len(), 1, "{semicolon:?}");
+
+    // GO 是批次分隔：不进语句文本，前后语句各自成条；GO n 计数形式同样跳过。
+    let batches = split::split_sql("sqlserver", "SELECT 1;\nGO\nSELECT 2\nGO 5\nSELECT 3;");
+    assert_eq!(batches.pieces.len(), 3, "{batches:?}");
+    assert!(batches.pieces.iter().all(|piece| !piece.text.trim_start().eq_ignore_ascii_case("GO") && !piece.text.contains("GO")));
+    // 行中的 GO 只是普通词（如表名前缀），不切分。
+    let mid_line = split::split_sql("sqlserver", "SELECT 1 FROM gopher WHERE x = 1;");
+    assert_eq!(mid_line.pieces.len(), 1, "{mid_line:?}");
+    // 语句之间裸 GO 且无分号：GO 前的语句在 GO 行收束。
+    let no_semi = split::split_sql("sqlserver", "UPDATE t SET n = 1\nGO\nUPDATE u SET m = 2\nGO");
+    assert_eq!(no_semi.pieces.len(), 2, "{no_semi:?}");
 }

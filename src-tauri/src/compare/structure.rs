@@ -2169,19 +2169,20 @@ fn changes_default(statements: &[String], table: &str, column: &str, drop: bool)
 
 fn drop_default_sql(engine: Engine, side: &Side, table: &str, column: &str) -> String {
     let table = qualify(engine, side, table);
-    let column = quote(engine, column);
     match engine {
-        Engine::Mysql | Engine::Mariadb => format!("ALTER TABLE {table} ALTER {column} DROP DEFAULT"),
-        _ => format!("ALTER TABLE {table} ALTER COLUMN {column} DROP DEFAULT"),
+        Engine::Mysql | Engine::Mariadb => format!("ALTER TABLE {table} ALTER {} DROP DEFAULT", quote(engine, column)),
+        // T-SQL 的默认值是具名约束：名字未知时按 sys.default_constraints 动态查找。
+        Engine::Sqlserver => tsql_drop_default(engine, &table, column, ""),
+        _ => format!("ALTER TABLE {table} ALTER COLUMN {} DROP DEFAULT", quote(engine, column)),
     }
 }
 
 fn set_default_sql(engine: Engine, side: &Side, table: &str, column: &str, expression: &str) -> String {
     let table = qualify(engine, side, table);
-    let column = quote(engine, column);
     match engine {
-        Engine::Mysql | Engine::Mariadb => format!("ALTER TABLE {table} ALTER {column} SET DEFAULT {expression}"),
-        _ => format!("ALTER TABLE {table} ALTER COLUMN {column} SET DEFAULT {expression}"),
+        Engine::Mysql | Engine::Mariadb => format!("ALTER TABLE {table} ALTER {} SET DEFAULT {expression}", quote(engine, column)),
+        Engine::Sqlserver => tsql_add_default(engine, &table, &crate::ddl::sql::sqlserver_bare_table_name(&table), column, expression),
+        _ => format!("ALTER TABLE {table} ALTER COLUMN {} SET DEFAULT {expression}", quote(engine, column)),
     }
 }
 
@@ -2620,15 +2621,11 @@ fn sqlserver_alter(side: &Side, name: &str, baseline: &TableShape, target: &Tabl
         match target.columns.iter().find(|item| item.name == column.name) {
             None => statements.push(format!("ALTER TABLE {table} ADD {}", column_clause(engine, column))),
             Some(other) if !column.type_name.eq_ignore_ascii_case(&other.type_name) || column.nullable != other.nullable => {
-                // T-SQL 的 ALTER COLUMN 需要显式 NULL/NOT NULL。
-                statements.push(format!("ALTER TABLE {table} ALTER COLUMN {}", column_clause(engine, column)));
+                // T-SQL 的 ALTER COLUMN 只接受列名/类型/NULL 性；默认值不能内联，走下面的约束分支。
+                statements.push(format!("ALTER TABLE {table} ALTER COLUMN {}", tsql_alter_column_clause(column)));
             }
             Some(other) if column.default_sql.trim() != other.default_sql.trim() => {
-                if column.default_sql.trim().is_empty() {
-                    statements.push(format!("ALTER TABLE {table} ALTER COLUMN {} DROP DEFAULT", quote(engine, &column.name)));
-                } else {
-                    statements.push(format!("ALTER TABLE {table} ALTER COLUMN {} SET DEFAULT {}", quote(engine, &column.name), column.default_sql.trim()));
-                }
+                statements.extend(tsql_default_change(engine, &table, name, column, other));
             }
             Some(_) => {}
         }
@@ -2637,6 +2634,42 @@ fn sqlserver_alter(side: &Side, name: &str, baseline: &TableShape, target: &Tabl
         push_primary_key(engine, &table, name, baseline, target, &mut statements);
     }
     statements
+}
+
+/// T-SQL 的 ALTER COLUMN 列定义：不含默认值（内联 DEFAULT 在 ALTER COLUMN 里非法）。
+fn tsql_alter_column_clause(column: &ColumnShape) -> String {
+    let mut line = format!("{} {}", quote(Engine::Sqlserver, &column.name), column.type_name.trim());
+    if !column.nullable {
+        line.push_str(" NOT NULL");
+    }
+    line
+}
+
+/// T-SQL 的默认值变更：具名约束的 DROP CONSTRAINT / ADD CONSTRAINT ... DEFAULT ... FOR。
+/// 删除时优先用从 sys.default_constraints 读到的约束名；名字缺失时动态查找，不猜 DF_ 前缀名。
+/// 新增用生成的 DF_<表>_<列> 名（与 SQL Server 自动命名习惯一致，重名冲突由执行报错暴露）。
+fn tsql_default_change(engine: Engine, table: &str, table_name: &str, wanted: &ColumnShape, current: &ColumnShape) -> Vec<String> {
+    let mut statements = Vec::new();
+    let wanted_default = wanted.default_sql.trim();
+    let current_default = current.default_sql.trim();
+    if wanted_default.is_empty() && current_default.is_empty() {
+        return statements;
+    }
+    if !current_default.is_empty() {
+        statements.push(tsql_drop_default(engine, table, &wanted.name, &current.default_constraint));
+    }
+    if !wanted_default.is_empty() {
+        statements.push(tsql_add_default(engine, table, table_name, &wanted.name, wanted_default));
+    }
+    statements
+}
+
+fn tsql_drop_default(engine: Engine, table: &str, column: &str, constraint: &str) -> String {
+    crate::ddl::sql::sqlserver_drop_default_sql(table, column, constraint)
+}
+
+fn tsql_add_default(engine: Engine, table: &str, table_name: &str, column: &str, expression: &str) -> String {
+    crate::ddl::sql::sqlserver_add_default_sql(table, table_name, column, expression)
 }
 
 fn postgres_alter(side: &Side, baseline_side: &Side, name: &str, baseline: &TableShape, target: &TableShape, with_pk: bool) -> Vec<String> {

@@ -28,6 +28,12 @@ pub fn split_sql(engine: &str, sql: &str) -> SplitReport {
         if begin >= sql.len() {
             break;
         }
+        // T-SQL 的 GO 是客户端批次分隔，不是发往服务器的语句，整行跳过。
+        if engine == "sqlserver" && is_go_line(sql, begin) {
+            let line_end = eol_at(sql, begin);
+            i = skip_break(sql, line_end);
+            continue;
+        }
         if is_delimiter_command(sql, begin) {
             let line_end = eol_at(sql, begin);
             let arg = delimiter_argument(&sql[begin..line_end]);
@@ -195,6 +201,23 @@ pub fn top_level_words(engine: &str, sql: &str) -> (Vec<(String, usize, usize)>,
             end_of_code = i;
             continue;
         }
+        // T-SQL 的 [name] 标识符：]] 转义；其中的词不参与顶层关键字判断（[top] 不是 TOP）。
+        if engine == "sqlserver" && bytes[i] == b'[' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b']' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b']' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += utf8_len(bytes[i]);
+            }
+            end_of_code = i.min(bytes.len());
+            continue;
+        }
         if bytes[i] == b'$' {
             if let Some(tag) = dollar_tag(sql, i) {
                 dollar = Some(tag.clone());
@@ -260,10 +283,14 @@ fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool, tsql_blo
     let mut quote: Option<u8> = None;
     let mut dollar: Option<String> = None;
     let mut block = false;
+    // T-SQL 的方括号标识符 [name]，]] 是转义的 ]。
+    let mut bracket = false;
     let mut paren = 0i32;
     let mut begin_depth = 0i32;
     let mut routine = false;
     let mut opened_block = false;
+    // END TRY 之后等待 BEGIN CATCH：期间分号不结束语句。
+    let mut catch_pending = false;
     let mut decided = false;
     let mut words: Vec<String> = Vec::new();
     let mut closed = false;
@@ -307,9 +334,27 @@ fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool, tsql_blo
             i = eol_at(sql, i + 1);
             continue;
         }
+        if tsql_blocks && bracket {
+            if bytes[i] == b']' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b']' {
+                    i += 2;
+                    continue;
+                }
+                bracket = false;
+                i += 1;
+                continue;
+            }
+            i += utf8_len(bytes[i]);
+            continue;
+        }
         if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
             block = true;
             i += 2;
+            continue;
+        }
+        if tsql_blocks && bytes[i] == b'[' {
+            bracket = true;
+            i += 1;
             continue;
         }
         if bytes[i] == b'\'' || bytes[i] == b'"' || bytes[i] == b'`' {
@@ -359,6 +404,16 @@ fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool, tsql_blo
             // CASE 表达式同样以 END 收尾，成对计入深度，避免块内的 CASE END 提前扣减。
             let block_keyword = routine
                 || (tsql_blocks && (upper == "CASE" || !begins_transaction(sql, word.1, hash)));
+            // GO 独占一行时是批次分隔：当前语句在这里结束，GO 本身不进语句文本。
+            if tsql_blocks && upper == "GO" && begin_depth == 0 && is_go_line(sql, i) {
+                closed = true;
+                close_at = i;
+                i = word.1;
+                break;
+            }
+            if upper == "CATCH" {
+                catch_pending = false;
+            }
             if upper == "BEGIN" && block_keyword {
                 opened_block = true;
                 begin_depth += 1;
@@ -369,9 +424,21 @@ fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool, tsql_blo
                 let next = peek_word(sql, word.1, hash);
                 if next.as_deref().map(|item| !is_routine_tail(item)).unwrap_or(true) {
                     begin_depth -= 1;
-                    // 块回到顶层时语句自闭合：END 后面不是 ELSE 就在这里结束。
-                    // 例程体（CREATE PROCEDURE 等）保持原有行为，仍按分号或文末收束。
-                    if begin_depth == 0 && opened_block && tsql_blocks && next.as_deref() != Some("ELSE") {
+                    if tsql_blocks && matches!(next.as_deref(), Some("TRY") | Some("CATCH")) {
+                        // END TRY / END CATCH 是复合收尾，语句边界在第二个词之后。
+                        if next.as_deref() == Some("TRY") {
+                            // TRY 块结束但整个 TRY/CATCH 还没完：等待 BEGIN CATCH，期间分号不切分。
+                            catch_pending = true;
+                        } else if begin_depth == 0 && opened_block {
+                            let catch_end = end_of_peeked_word(sql, word.1, hash);
+                            closed = true;
+                            close_at = catch_end;
+                            i = close_at;
+                            break;
+                        }
+                    } else if begin_depth == 0 && opened_block && tsql_blocks && next.as_deref() != Some("ELSE") {
+                        // 块回到顶层时语句自闭合：END 后面不是 ELSE/TRY/CATCH 就在这里结束。
+                        // 例程体（CREATE PROCEDURE 等）保持原有行为，仍按分号或文末收束。
                         closed = true;
                         close_at = word.1;
                         i = close_at;
@@ -382,7 +449,7 @@ fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool, tsql_blo
             i = word.1;
             continue;
         }
-        if paren == 0 && begin_depth == 0 && !delimiter.is_empty() && sql[i..].starts_with(delimiter) {
+        if !catch_pending && paren == 0 && begin_depth == 0 && !delimiter.is_empty() && sql[i..].starts_with(delimiter) {
             closed = true;
             close_at = i + delimiter.len();
             i = close_at;
@@ -392,6 +459,9 @@ fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool, tsql_blo
     }
     if quote.is_some() {
         return refuse("引号没有闭合，没有发送。");
+    }
+    if bracket {
+        return refuse("方括号标识符没有闭合，没有发送。");
     }
     if block {
         return refuse("块注释没有闭合，没有发送。");
@@ -551,6 +621,30 @@ fn engine_label(engine: &str) -> &'static str {
 /// T-SQL 的 BEGIN 后面跟 TRAN/TRANSACTION/DISTRIBUTED 时是事务语句，不进入块计数。
 fn begins_transaction(sql: &str, index: usize, hash: bool) -> bool {
     matches!(peek_word(sql, index, hash).as_deref(), Some("TRAN") | Some("TRANSACTION") | Some("DISTRIBUTED"))
+}
+
+/// 复合收尾（END TRY / END CATCH）第二个词的结束位置。
+fn end_of_peeked_word(sql: &str, from: usize, hash: bool) -> usize {
+    let at = skip_noise(sql, from, hash);
+    read_word(sql, at).1
+}
+
+/// GO 批次分隔的判定：GO 独占一行（行内剩余只允许空白或纯数字的批次计数），行中出现的 GO 不算。
+fn is_go_line(sql: &str, word_start: usize) -> bool {
+    let bytes = sql.as_bytes();
+    if read_word(sql, word_start).0.to_ascii_uppercase() != "GO" {
+        return false;
+    }
+    let mut back = word_start;
+    while back > 0 && (bytes[back - 1] == b' ' || bytes[back - 1] == b'\t' || bytes[back - 1] == b'\r') {
+        back -= 1;
+    }
+    if back > 0 && bytes[back - 1] != b'\n' {
+        return false;
+    }
+    let line_end = eol_at(sql, word_start);
+    let rest = sql[word_start + 2..line_end].trim();
+    rest.is_empty() || rest.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn hash_comments(engine: &str) -> bool {

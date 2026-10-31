@@ -43,6 +43,43 @@ pub fn qualified_table(engine: Engine, database: &str, schema: &str, table: &str
     }
 }
 
+/// SQL Server 的默认值是具名约束。删除时优先用读到的 sys.default_constraints 约束名；
+/// 名字缺失时按系统视图动态查找后删除，找不到就不发语句（不猜 DF_ 前缀名）。
+/// `table` 是已加引号的限定名（如 [dbo].[orders]），`column` 是裸列名。
+pub fn sqlserver_drop_default_sql(table: &str, column: &str, constraint: &str) -> String {
+    let name = constraint.trim();
+    if !name.is_empty() {
+        return format!("ALTER TABLE {table} DROP CONSTRAINT [{}]", name.replace(']', "]]"));
+    }
+    let column_escaped = column.replace('\'', "''");
+    let table_escaped = table.replace('\'', "''");
+    format!(
+        "DECLARE @dc sysname = (SELECT dc.name FROM sys.default_constraints dc JOIN sys.columns c ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id WHERE dc.parent_object_id = OBJECT_ID(N'{table_escaped}') AND c.name = N'{column_escaped}'); IF @dc IS NOT NULL EXEC(N'ALTER TABLE {table_escaped} DROP CONSTRAINT ' + QUOTENAME(@dc))"
+    )
+}
+
+/// 新增默认值：生成 DF_<表>_<列> 约束名（与 SQL Server 自动命名习惯一致，重名冲突由执行报错暴露）。
+pub fn sqlserver_add_default_sql(table: &str, table_name: &str, column: &str, expression: &str) -> String {
+    let constraint = format!("DF_{table_name}_{column}");
+    format!(
+        "ALTER TABLE {table} ADD CONSTRAINT [{}] DEFAULT {expression} FOR [{}]",
+        constraint.replace(']', "]]"),
+        column.replace(']', "]]")
+    )
+}
+
+/// 从限定名 [dbo].[orders] 取末段裸表名，用于生成 DF_<表>_<列> 约束名。
+pub fn sqlserver_bare_table_name(qualified: &str) -> String {
+    qualified
+        .rsplit('.')
+        .next()
+        .unwrap_or(qualified)
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned()
+}
+
 pub fn sqlite_at_least(version: &str, major: u64, minor: u64, patch: u64) -> bool {
     let mut parts = version.split(['.', '-', ' ']);
     let got = [
@@ -60,6 +97,13 @@ pub fn valid_default(engine: Engine, raw: &str) -> bool {
         return text.eq_ignore_ascii_case("null");
     }
     if is_number(text) || is_quoted(text) {
+        return true;
+    }
+    // T-SQL 的 Unicode 字符串默认值 N'...'。
+    if engine == Engine::Sqlserver
+        && (text.starts_with("N'") || text.starts_with("n'"))
+        && is_quoted(&text[1..])
+    {
         return true;
     }
     let upper = text.to_ascii_uppercase();

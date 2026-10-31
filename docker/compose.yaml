@@ -83,8 +83,8 @@ services:
       - ./init/mssql-seed.sql:/seed/mssql-seed.sql:ro
     command: >
       bash -c "
-        /opt/mssql-tools18/bin/sqlcmd -C -S mssql -U sa -P \"$$MSSQL_SA_PASSWORD\" -d master -Q \"IF DB_ID('rillsql') IS NULL CREATE DATABASE rillsql\"
-        && /opt/mssql-tools18/bin/sqlcmd -C -S mssql -U sa -P \"$$MSSQL_SA_PASSWORD\" -d rillsql -i /seed/mssql-seed.sql
+        /opt/mssql-tools18/bin/sqlcmd -C -b -S mssql -U sa -P \"$$MSSQL_SA_PASSWORD\" -d master -Q \"IF DB_ID('rillsql') IS NULL CREATE DATABASE rillsql\"
+        && /opt/mssql-tools18/bin/sqlcmd -C -b -f 65001 -S mssql -U sa -P \"$$MSSQL_SA_PASSWORD\" -d rillsql -i /seed/mssql-seed.sql
       "
     restart: "no"
 
