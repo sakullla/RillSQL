@@ -60,15 +60,12 @@ function field(source: Record<string, unknown>, key: string): string {
   return "";
 }
 
-/** 导入格式里的引擎别名换算到 ENGINES 的 id；支持的引擎集合以元数据表为准。 */
-const ENGINE_ALIASES: Record<string, Engine> = { postgresql: "postgres" };
-
-function matchEngine(raw: string): EngineHit | null {
+/** DBeaver 的 provider/driver/URL 只认引擎全称（ENGINES 的 label 小写）。postgres 这类简写 id 不在驱动名接受集里，维持基线的"不支持跳过"。 */
+function matchEngineName(raw: string): EngineHit | null {
   const key = raw.trim().toLowerCase();
   if (!key) return null;
-  const alias = ENGINE_ALIASES[key];
-  const id = alias ?? (ENGINES.some((engine) => engine.id === key) ? (key as Engine) : undefined);
-  return id ? { kind: "supported", engine: id } : null;
+  const engine = ENGINES.find((item) => item.label.toLowerCase() === key);
+  return engine ? { kind: "supported", engine: engine.id } : null;
 }
 
 function classify(raw: string): EngineHit {
@@ -76,9 +73,9 @@ function classify(raw: string): EngineHit {
   if (!trimmed) return { kind: "none" };
   const jdbc = /jdbc:([A-Za-z0-9]+):/.exec(trimmed);
   if (jdbc) {
-    return matchEngine(jdbc[1]) ?? { kind: "other", token: jdbc[1] };
+    return matchEngineName(jdbc[1]) ?? { kind: "other", token: jdbc[1] };
   }
-  const hit = matchEngine(trimmed);
+  const hit = matchEngineName(trimmed);
   if (hit) return hit;
   switch (trimmed.toLowerCase()) {
     case "generic":
@@ -102,10 +99,16 @@ function resolveEngine(provider: string, driver: string, url: string): EngineHit
   return { kind: "none" };
 }
 
+/** Navicat 的 ConnType 用引擎简写：id 与全称（postgresql 别名）都认，基线本就接受 POSTGRES。 */
+const NAVICAT_ENGINE_ALIASES: Record<string, Engine> = { postgresql: "postgres" };
+
 function navicatEngine(connType: string): EngineHit {
-  const hit = matchEngine(connType);
-  if (hit) return hit;
-  return connType.trim() ? { kind: "other", token: connType.trim() } : { kind: "none" };
+  const key = connType.trim().toLowerCase();
+  if (!key) return { kind: "none" };
+  const alias = NAVICAT_ENGINE_ALIASES[key];
+  const id = alias ?? (ENGINES.some((engine) => engine.id === key) ? (key as Engine) : undefined);
+  if (id) return { kind: "supported", engine: id };
+  return { kind: "other", token: connType.trim() };
 }
 
 function enginePhrase(token: string): string {

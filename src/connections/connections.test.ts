@@ -754,6 +754,33 @@ describe("connection import", () => {
     expect(sqliteUrl.saved[0].filePath).toBe("C:/missing/slash.sqlite");
   });
 
+  it("仅 postgres 简称的行按不支持跳过，全称 postgresql 才导入（基线等价回归）", async () => {
+    const { saved, save } = recordingSave();
+    const result = await importConnectionText(
+      JSON.stringify({
+        connections: {
+          a: {
+            provider: "generic",
+            driver: "postgres",
+            name: "简写驱动",
+            configuration: { host: "short.example.test", port: "5432", user: "u", database: "d", url: "jdbc:postgres://short.example.test:5432/d" },
+          },
+          b: { provider: "postgres", name: "简写提供者", configuration: { host: "plain.example.test", port: "5432", user: "u", database: "d" } },
+          c: { provider: "postgresql", name: "全称仍导入", configuration: { host: "full.example.test", port: "5432", user: "u", database: "d" } },
+        },
+      }),
+      save,
+    );
+    expect(result.recognized).toBe(true);
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(saved.map((item) => [item.name, item.engine])).toEqual([["全称仍导入", "postgres"]]);
+    expect(result.skipped.map((item) => item.name)).toEqual(["简写驱动", "简写提供者"]);
+    expect(result.message).toContain("已导入 1 个连接");
+    expect(result.message).toContain("已跳过「简写驱动」：postgres。");
+    expect(result.message).toContain("已跳过「简写提供者」：postgres。");
+    expect(saved.some((item) => item.name === "简写驱动" || item.name === "简写提供者")).toBe(false);
+  });
+
   it("adds nothing for plain text or an unrecognizable file", async () => {
     for (const text of ["这不是连接文件，只是一段说明。", "", "{ \"folders\": {} }", "{ \"connections\": [] }", "<Connection ConnectionName=\"x\" ConnType=\"MYSQL\" />"]) {
       const { save } = recordingSave();
