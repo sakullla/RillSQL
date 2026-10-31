@@ -9,7 +9,7 @@ pub(crate) mod model;
 pub(crate) mod route;
 mod secrets;
 mod service;
-mod stages;
+pub(crate) mod stages;
 mod store;
 mod verify;
 

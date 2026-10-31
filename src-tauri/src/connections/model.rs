@@ -456,6 +456,14 @@ fn normalize_remote(draft: &ConnectionDraft, id: String) -> Result<SavedConnecti
             });
         }
     }
+    // MongoDB 整串 URI 与 SSH 隧道互斥：URI 的地址直接进驱动 hosts，转发器地址没有入口，
+    // 组合会静默绕过隧道。保存阶段就拒绝，不留到连接阶段（届时隧道可能已建立）。
+    if draft.engine == Engine::Mongodb && Engine::host_is_mongo_uri(host) && draft.ssh_on {
+        errors.push(FieldError {
+            field: "ssh_host".to_owned(),
+            message: "整串 URI 暂不支持 SSH 隧道，请改用 host/port 表单".to_owned(),
+        });
+    }
     let mut ssh = None;
     if draft.ssh_on {
         let ssh_host = draft.ssh_host.trim();

@@ -81,7 +81,7 @@ pub async fn mongo_find_documents(
         return Err("需要数据库名和集合名。".to_owned());
     }
     let filter = match filter_json.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
-        Some(text) => docs::parse_document(text)?,
+        Some(text) => docs::parse_document("过滤", text)?,
         None => Document::new(),
     };
     let skip = skip.unwrap_or(0);
@@ -136,7 +136,7 @@ pub async fn mongo_replace_document(
 ) -> Result<ReplaceOutcome, String> {
     let (database, collection) = require_target(&database, &collection)?;
     let id = docs::parse_id(&id_json)?;
-    let replacement = docs::parse_document(&json)?;
+    let replacement = docs::parse_document("文档", &json)?;
     let outcome = with_mongo(&state, &connection_id, move |client, _| async move {
         client
             .database(&database)
@@ -167,7 +167,7 @@ pub async fn mongo_insert_document(
     json: String,
 ) -> Result<InsertOutcome, String> {
     let (database, collection) = require_target(&database, &collection)?;
-    let document = docs::parse_document(&json)?;
+    let document = docs::parse_document("文档", &json)?;
     let inserted = with_mongo(&state, &connection_id, move |client, _| async move {
         client
             .database(&database)

@@ -117,6 +117,9 @@ const advancedHint = computed(() =>
   draft.value.engine === "sqlite" ? "环境标签——本地文件不需要 TLS 或 SSH" : "TLS 加密、SSH 跳板机、环境标签——直连时通常保持默认即可",
 );
 
+/** MongoDB 整串 URI 与 SSH 隧道互斥（后端保存阶段同样拒绝）：主机是 URI 时锁死 SSH 段。 */
+const mongoUriBlocksSsh = computed(() => draft.value.engine === "mongodb" && isMongoUri(draft.value.host));
+
 function show(target: HTMLDialogElement | null) {
   if (!target) return;
   if (typeof target.showModal === "function") {
@@ -770,8 +773,9 @@ watch(
               <section class="adv-sec">
                 <h3>SSH 跳板机</h3>
                 <p class="adv-note">数据库无法从本机直接访问时，可以经过一台 SSH 服务器中转。</p>
-                <label class="check"><input v-model="draft.sshOn" type="checkbox" data-field="sshOn" /><span><b>通过 SSH 跳板机连接</b><small>支持单跳。每条连接单独打开一条到数据库的通道。</small></span></label>
-                <div v-if="draft.sshOn" class="form-grid">
+                <label class="check" :class="{ disabled: mongoUriBlocksSsh }"><input v-model="draft.sshOn" type="checkbox" data-field="sshOn" :disabled="mongoUriBlocksSsh" /><span><b>通过 SSH 跳板机连接</b><small>支持单跳。每条连接单独打开一条到数据库的通道。</small></span></label>
+                <p v-if="mongoUriBlocksSsh" class="adv-note" data-mongo-uri-ssh-note>主机填了 mongodb:// / mongodb+srv:// 整串时暂不支持 SSH 隧道：连接串的地址直接交给驱动，跳板机会被绕过。要经跳板机请改用 host/port 表单。</p>
+                <div v-if="draft.sshOn && !mongoUriBlocksSsh" class="form-grid">
                   <label class="field"><span>跳板机主机<em class="req">*</em></span><input v-model="draft.sshHost" class="mono" data-field="sshHost" /><small v-if="fieldErrors.sshHost" class="field-err">{{ fieldErrors.sshHost }}</small></label>
                   <label class="field"><span>SSH 端口</span><input v-model="draft.sshPort" class="mono" data-field="sshPort" /><small v-if="fieldErrors.sshPort" class="field-err">{{ fieldErrors.sshPort }}</small></label>
                   <label class="field"><span>SSH 用户<em class="req">*</em></span><input v-model="draft.sshUser" class="mono" data-field="sshUser" /><small v-if="fieldErrors.sshUser" class="field-err">{{ fieldErrors.sshUser }}</small></label>
@@ -782,7 +786,7 @@ watch(
                   </template>
                   <label v-else class="field full"><span>SSH 密码</span><input v-model="secrets.sshPassword" type="password" autocomplete="new-password" /></label>
                 </div>
-                <div v-if="draft.sshOn" class="host-key">
+                <div v-if="draft.sshOn && !mongoUriBlocksSsh" class="host-key">
                   <ConnIcon name="key" />
                   <div>
                     <b>跳板机身份</b>
@@ -791,7 +795,7 @@ watch(
                   </div>
                   <button v-if="knownHostKey" class="btn sm ghost" type="button" @click="forgetHostKey">忘记已保存的指纹</button>
                 </div>
-                <div v-if="draft.sshOn" class="route-box">
+                <div v-if="draft.sshOn && !mongoUriBlocksSsh" class="route-box">
                   <span class="muted sm">连接路径</span>
                   <div class="route">
                     <span class="route-hop"><ConnIcon name="monitor" />本机</span>

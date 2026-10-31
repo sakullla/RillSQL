@@ -35,8 +35,9 @@ rillsql.customers.insertMany([
   },
 ]);
 
-// 25 篇订单：前 10 篇 active（供 {"status":"active"} 过滤验收），其余分布 pending/paid/cancelled，
-// 状态与客户名交叉，翻页（第 1 页 20 篇 + 第 2 页 5 篇）能看出顺序稳定（按 _id 升序）。
+// 25 篇订单：前 10 篇固定 active，其余（11–25）按四态取模循环（statuses[index % 4]），
+// 实际分布为 active 14（前 10 + 12/16/20/24）、pending 4（13/17/21/25）、paid 3（14/18/22）、cancelled 4（11/15/19/23）。
+// {"status":"active"} 过滤验收预期 14 篇；翻页（第 1 页 20 篇 + 第 2 页 5 篇）能看出顺序稳定（按 _id 升序）。
 const customers = ["林夏", "周宁", "张伟"];
 const statuses = ["active", "pending", "paid", "cancelled"];
 const orderDocs = [];

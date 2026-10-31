@@ -186,6 +186,10 @@ export function validate(draft: ConnectionDraft): Record<string, string> {
     const dbError = validateRedisDbIndex(draft.database);
     if (dbError) errors.database = dbError;
   }
+  // MongoDB 整串 URI 与 SSH 隧道互斥（后端保存阶段同样拒绝）：URI 的地址直接进驱动，隧道会被绕过。
+  if (draft.engine === "mongodb" && isMongoUri(draft.host) && draft.sshOn) {
+    errors.sshHost = "整串 URI 暂不支持 SSH 隧道，请改用 host/port 表单";
+  }
   if (draft.sshOn && !draft.sshHost.trim()) errors.sshHost = "请填写跳板机主机";
   if (draft.sshOn && !draft.sshUser.trim()) errors.sshUser = "请填写 SSH 用户";
   const sshPort = Number(draft.sshPort);

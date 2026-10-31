@@ -477,9 +477,7 @@ pub struct MongoOpen {
 ///   串里带用户名而没带密码时用 keyring 密码补上（密码永远不落连接串之外的配置）。
 /// 建连后探活：ping 确认会话可用，buildInfo 取版本横幅。任何一档失败都不降级重试。
 pub async fn open_mongo(config: &SavedConnection, route: &Route, password: &str) -> Result<MongoOpen, StageError> {
-    let mut options = mongo_client_options(config, route, password)
-        .await
-        .map_err(|err| mongo_stage(route.tls_mode, &err))?;
+    let mut options = mongo_client_options(config, route, password).await?;
     options.server_selection_timeout = Some(Duration::from_secs(15));
     let client = mongodb::Client::with_options(options.clone()).map_err(|err| mongo_stage(route.tls_mode, &err))?;
     let admin = client.database("admin");
@@ -504,13 +502,23 @@ pub async fn open_mongo(config: &SavedConnection, route: &Route, password: &str)
 
 /// 装配 MongoDB ClientOptions。装配函数（不联网，plain mongodb:// 串解析也不发 DNS 查询），
 /// 供单测核对主机/凭据/副本集/TLS 三档。
+/// 整串 URI 与 SSH 隧道互斥：URI 的地址直接进驱动 hosts，route 的转发器地址没有入口，
+/// 组合会把隧道静默绕过——保存阶段已拒绝，这里再拦一道（不建隧道、不连接）。
 pub(crate) async fn mongo_client_options(
     config: &SavedConnection,
     route: &Route,
     password: &str,
-) -> Result<mongodb::options::ClientOptions, mongodb::error::Error> {
+) -> Result<mongodb::options::ClientOptions, StageError> {
     if Engine::host_is_mongo_uri(config.host.as_deref().unwrap_or_default()) {
-        let mut options = mongodb::options::ClientOptions::parse(config.host.clone().unwrap_or_default()).await?;
+        if config.ssh.is_some() {
+            return Err(stages::fail(
+                "整串 URI 暂不支持 SSH 隧道，请改用 host/port 表单",
+                "mongodb:// 连接串的地址会直接交给驱动，SSH 转发器地址没有入口，组合会静默绕过隧道。把主机拆成 host/port 填写后再开启跳板机。",
+            ));
+        }
+        let mut options = mongodb::options::ClientOptions::parse(config.host.clone().unwrap_or_default())
+            .await
+            .map_err(|err| mongo_stage(route.tls_mode, &err))?;
         // 串里带了用户名但没带密码：用 keyring/本次输入的密码补上，密码不回写连接串。
         let needs_password = options
             .credential
@@ -523,7 +531,7 @@ pub(crate) async fn mongo_client_options(
         }
         // 表单的 TLS 三档只在串里没有 tls 参数时生效（连接串写过的参数优先）。
         if options.tls.is_none() {
-            options.tls = mongo_tls(config);
+            options.tls = mongo_tls(config)?;
         }
         if options.repl_set_name.is_none() {
             options.repl_set_name = config.replica_set.clone().filter(|name| !name.trim().is_empty());
@@ -553,18 +561,20 @@ pub(crate) async fn mongo_client_options(
             .map(|source| source.to_owned());
         options.credential = Some(credential);
     }
-    options.tls = mongo_tls(config);
+    options.tls = mongo_tls(config)?;
     Ok(options)
 }
 
 /// TLS 三档映射：Off=不启用；Require=启用但不核对证书；Verify=启用并核对（CA 文件或 webpki 内置根）。
-fn mongo_tls(config: &SavedConnection) -> Option<mongodb::options::Tls> {
+/// 驱动把客户端证书与私钥放在同一个 PEM 文件（cert_key_file_path）：两栏填不同路径时报明确错误，
+/// 填同一路径即合并后的 PEM；只填一栏时按“该文件就是合并 PEM”处理。
+fn mongo_tls(config: &SavedConnection) -> Result<Option<mongodb::options::Tls>, StageError> {
     let mode = config.tls.as_ref().map(|tls| tls.mode).unwrap_or(TlsMode::Off);
     match mode {
-        TlsMode::Off => None,
-        TlsMode::Require => Some(mongodb::options::Tls::Enabled(
+        TlsMode::Off => Ok(None),
+        TlsMode::Require => Ok(Some(mongodb::options::Tls::Enabled(
             mongodb::options::TlsOptions::builder().allow_invalid_certificates(true).build(),
-        )),
+        ))),
         TlsMode::Verify => {
             let mut tls_options = mongodb::options::TlsOptions::builder().allow_invalid_certificates(false).build();
             if let Some(tls) = config.tls.as_ref() {
@@ -573,14 +583,27 @@ fn mongo_tls(config: &SavedConnection) -> Option<mongodb::options::Tls> {
                         tls_options.ca_file_path = Some(PathBuf::from(path));
                     }
                 }
-                if let (Some(cert), Some(key)) = (&tls.client_cert, &tls.client_key) {
-                    if !cert.trim().is_empty() && !key.trim().is_empty() {
-                        // 驱动把证书与私钥放在同一个 PEM 文件里：两处路径都指向用户提供的材料时取证书文件。
+                let cert = tls.client_cert.as_deref().map(str::trim).filter(|path| !path.is_empty());
+                let key = tls.client_key.as_deref().map(str::trim).filter(|path| !path.is_empty());
+                match (cert, key) {
+                    (Some(cert), Some(key)) => {
+                        if cert != key {
+                            return Err(stages::fail(
+                                "MongoDB 客户端证书需合并 PEM：证书与私钥需同一文件",
+                                "mongodb 驱动只接受一个证书+私钥合并的 PEM 文件。请先把两份材料合并到一个文件，再在两栏填同一路径。",
+                            ));
+                        }
+                        // 同一路径 = 合并后的 PEM。
                         tls_options.cert_key_file_path = Some(PathBuf::from(cert));
                     }
+                    // 只填一栏：该文件即合并 PEM（其余引擎的两栏语义由各自驱动处理）。
+                    (Some(path), None) | (None, Some(path)) => {
+                        tls_options.cert_key_file_path = Some(PathBuf::from(path));
+                    }
+                    (None, None) => {}
                 }
             }
-            Some(mongodb::options::Tls::Enabled(tls_options))
+            Ok(Some(mongodb::options::Tls::Enabled(tls_options)))
         }
     }
 }

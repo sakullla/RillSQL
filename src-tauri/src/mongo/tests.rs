@@ -113,6 +113,97 @@ async fn uri_without_tls_picks_up_form_verify_mode_with_ca_file() {
 }
 
 #[tokio::test]
+async fn uri_with_ssh_is_rejected_before_any_connection_or_tunnel() {
+    // P1 修复：整串 URI + SSH 的组合会在装配阶段被明确拒绝——URI 的地址直接进驱动 hosts，
+    // 转发器地址没有入口，组合等于静默绕过隧道。保存阶段（normalize）同样拒绝。
+    let uri = "mongodb://mongo.example.test:27017";
+    let mut config = saved(uri, 27017, None, Some("root"), None, TlsMode::Off);
+    config.ssh = Some(crate::connections::model::SshSettings {
+        host: "bastion.example.test".to_owned(),
+        port: 22,
+        username: "ops".to_owned(),
+        auth: crate::connections::model::SshAuthKind::Key,
+        key_path: None,
+    });
+    let error = mongo_client_options(&config, &route_for("mongo.example.test", 27017), "")
+        .await
+        .expect_err("URI+SSH 必须拒绝");
+    let crate::connections::stages::StageError::Fail { message: text, .. } = error else {
+        panic!("应是 Fail 错误：{error:?}")
+    };
+    assert!(text.contains("整串 URI 暂不支持 SSH 隧道"), "{text}");
+    assert!(text.contains("host/port"), "{text}");
+    // host/port 形态 + SSH 不受影响（走转发器地址，隧道有入口）。
+    let tunneled = saved("mongo.internal", 27017, None, Some("root"), None, TlsMode::Off);
+    assert!(mongo_client_options(&tunneled, &route_for("127.0.0.1", 51027), "").await.is_ok());
+}
+
+#[test]
+fn draft_normalize_rejects_uri_host_with_ssh_on() {
+    // 保存阶段拒绝：这条组合到不了连接阶段（届时 SSH 隧道可能已建立）。
+    let mut draft = ConnectionDraft::blank(Engine::Mongodb);
+    draft.host = "mongodb://mongo.example.test".to_owned();
+    draft.username = "root".to_owned();
+    draft.ssh_on = true;
+    draft.ssh_host = "bastion.example.test".to_owned();
+    draft.ssh_user = "ops".to_owned();
+    let errors = crate::connections::model::normalize(&draft, "id-uri-ssh".to_owned()).unwrap_err();
+    assert!(
+        errors.iter().any(|error| error.field == "ssh_host" && error.message.contains("整串 URI 暂不支持 SSH 隧道")),
+        "{errors:?}"
+    );
+    // host/port 形态开启 SSH 合法。
+    draft.host = "mongo.example.test".to_owned();
+    draft.port = "27017".to_owned();
+    assert!(crate::connections::model::normalize(&draft, "id-ok".to_owned()).is_ok());
+}
+
+#[tokio::test]
+async fn verify_mode_rejects_split_cert_and_key_paths() {
+    // P2 修复：驱动只接受证书+私钥合并的单个 PEM（cert_key_file_path）；两栏填不同路径时报明确错误，
+    // 不再静默忽略私钥栏。填同一路径 = 合并后的 PEM；只填一栏时按该文件即合并 PEM 处理。
+    let mut config = saved("mongo.example.test", 27017, None, Some("root"), None, TlsMode::Verify);
+    if let Some(tls) = config.tls.as_mut() {
+        tls.client_cert = Some("C:\\certs\\client.pem".to_owned());
+        tls.client_key = Some("C:\\certs\\client.key".to_owned());
+    }
+    let error = mongo_client_options(&config, &route_for("mongo.example.test", 27017), "")
+        .await
+        .expect_err("证书与私钥分属两个文件必须拒绝");
+    let crate::connections::stages::StageError::Fail { message: text, .. } = error else {
+        panic!("应是 Fail 错误：{error:?}")
+    };
+    assert!(text.contains("合并 PEM"), "{text}");
+    assert!(text.contains("同一文件"), "{text}");
+
+    if let Some(tls) = config.tls.as_mut() {
+        tls.client_key = Some("C:\\certs\\client.pem".to_owned());
+    }
+    let options = mongo_client_options(&config, &route_for("mongo.example.test", 27017), "").await.expect("options");
+    match options.tls.as_ref() {
+        Some(mongodb::options::Tls::Enabled(tls)) => assert_eq!(
+            tls.cert_key_file_path.as_deref().map(std::path::Path::to_string_lossy).as_deref(),
+            Some("C:\\certs\\client.pem"),
+            "同一路径即合并 PEM"
+        ),
+        other => panic!("Verify 档应启用 TLS：{other:?}"),
+    }
+
+    // 只填证书栏：该文件即合并 PEM（其余引擎的两栏语义由各自驱动处理）。
+    if let Some(tls) = config.tls.as_mut() {
+        tls.client_key = None;
+    }
+    let options = mongo_client_options(&config, &route_for("mongo.example.test", 27017), "").await.expect("options");
+    match options.tls.as_ref() {
+        Some(mongodb::options::Tls::Enabled(tls)) => assert_eq!(
+            tls.cert_key_file_path.as_deref().map(std::path::Path::to_string_lossy).as_deref(),
+            Some("C:\\certs\\client.pem")
+        ),
+        other => panic!("Verify 档应启用 TLS：{other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn uri_with_explicit_tls_wins_over_form_mode() {
     let uri = "mongodb://mongo.example.test/?tls=false";
     let config = saved(uri, 27017, None, None, None, TlsMode::Verify);
@@ -122,11 +213,11 @@ async fn uri_with_explicit_tls_wins_over_form_mode() {
 
 #[test]
 fn filter_errors_carry_line_and_column() {
-    let error = docs::parse_document("{\"city\": \"杭州\",}").unwrap_err();
+    let error = docs::parse_document("过滤", "{\"city\": \"杭州\",}").unwrap_err();
     assert!(error.contains("line"), "定位信息要含行号：{error}");
     assert!(error.contains("column"), "定位信息要含列号：{error}");
     // 合法过滤能读回字段。
-    let filter = docs::parse_document("{\"status\": \"active\", \"总数\": {\"$numberInt\": \"3\"}}").unwrap();
+    let filter = docs::parse_document("过滤", "{\"status\": \"active\", \"总数\": {\"$numberInt\": \"3\"}}").unwrap();
     assert_eq!(filter.get_str("status"), Ok("active"));
     // $numberInt 反序列化为 Int32；扩展 JSON 的类型标记保留 BSON 类型信息。
     assert_eq!(filter.get_i32("总数"), Ok(3));
@@ -145,15 +236,16 @@ fn delete_guard_requires_confirmation_and_valid_id_before_any_command() {
     let filter = docs::id_filter(id);
     assert_eq!(filter.get_object_id("_id").map(|oid| oid.to_hex()), Ok("65f2c1e4a1b2c3d4e5f60718".to_owned()));
     assert!(docs::parse_id("{bad json").is_err());
-    assert!(docs::parse_document("{\"a\":1").is_err());
+    assert!(docs::parse_document("过滤", "{\"a\":1").is_err());
+    assert!(docs::parse_document("文档", "{\"a\":1").unwrap_err().starts_with("文档语法错误"));
 }
 
 #[test]
 fn replace_and_insert_validate_json_before_commands() {
     // 整体 JSON 覆盖与新增都先走 parse_document：非法 JSON 在命令层就被拦截。
-    let replacement = docs::parse_document("{\"_id\": {\"$oid\": \"65f2c1e4a1b2c3d4e5f60718\"}, \"status\": \"paid\", \"明细\": [1, 2]}").unwrap();
+    let replacement = docs::parse_document("文档", "{\"_id\": {\"$oid\": \"65f2c1e4a1b2c3d4e5f60718\"}, \"status\": \"paid\", \"明细\": [1, 2]}").unwrap();
     assert_eq!(replacement.get_array("明细").map(Vec::len), Ok(2));
-    let error = docs::parse_document("{\"status\": paid}").unwrap_err();
+    let error = docs::parse_document("文档", "{\"status\": paid}").unwrap_err();
     assert!(error.contains("line"), "{error}");
 }
 

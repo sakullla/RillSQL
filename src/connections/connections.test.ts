@@ -222,6 +222,26 @@ describe("connections page", () => {
     wrapper.unmount();
   });
 
+  it("MongoDB 整串 URI 主机时禁用 SSH 段并给出说明，host/port 形态恢复可用", async () => {
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api: pageApi(() => ({ status: "ok", stages: [] })) } });
+    await flushPromises();
+    await wrapper.get("[data-action=conn-new]").trigger("click");
+    await wrapper.get('input[value="mongodb"]').trigger("change");
+    const sshToggle = wrapper.get('details[data-section="advanced"] [data-field="sshOn"]');
+    expect((sshToggle.element as HTMLInputElement).disabled).toBe(false);
+    // 主机填整串 URI：SSH 勾选禁用 + 说明文案（P1：组合会在连接侧被拒绝）。
+    await wrapper.get("[data-field=host]").setValue("mongodb://mongo.example.test:27017");
+    expect((sshToggle.element as HTMLInputElement).disabled).toBe(true);
+    expect(wrapper.find("[data-mongo-uri-ssh-note]").exists()).toBe(true);
+    expect(wrapper.get("[data-mongo-uri-ssh-note]").text()).toContain("暂不支持 SSH 隧道");
+    expect(wrapper.get("[data-mongo-uri-ssh-note]").text()).toContain("host/port");
+    // 改回 host/port 形态：SSH 段恢复可用，说明消失。
+    await wrapper.get("[data-field=host]").setValue("mongo.example.test");
+    expect((sshToggle.element as HTMLInputElement).disabled).toBe(false);
+    expect(wrapper.find("[data-mongo-uri-ssh-note]").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
   it("测试失败时自动展开失败阶段，其余阶段收进折叠详情", async () => {
     const failure: TestReport = {
       status: "err",
@@ -1077,6 +1097,15 @@ describe("engine metadata", () => {
     // ACL 用户名可留空；库索引必须是数字。
     expect(validate({ ...draft, host: "127.0.0.1" })).toEqual({});
     expect(validate({ ...draft, host: "127.0.0.1", database: "main" }).database).toBe("Redis 库索引应为 0 起的非负整数");
+  });
+
+  it("rejects a mongodb uri host combined with an ssh tunnel but allows host/port with ssh", () => {
+    const draft = blankDraft("mongodb");
+    const uriDraft = { ...draft, host: "mongodb://mongo.example.test", sshOn: true, sshHost: "bastion.example.test", sshUser: "ops" };
+    expect(validate(uriDraft).sshHost).toBe("整串 URI 暂不支持 SSH 隧道，请改用 host/port 表单");
+    // host/port 形态走 SSH 隧道合法（后端同样只拒绝 URI 形态）。
+    const hostPortDraft = { ...draft, host: "mongo.example.test", port: "27017", sshOn: true, sshHost: "bastion.example.test", sshUser: "ops" };
+    expect(validate(hostPortDraft).sshHost).toBeUndefined();
   });
 
   it("gives mongodb a local default env, optional username, plaintext TLS default and a round-tripping replica set", () => {

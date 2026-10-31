@@ -39,19 +39,20 @@ pub struct CollectionSummary {
 /// 把 JSON 文本解析成 BSON 文档。
 /// 语法错误（括号/引号/逗号）来自 serde_json，消息自带“at line L column C”定位；
 /// 语法正确但扩展 JSON 语义非法（如 {"$numberLong": 5}）来自 bson 转换，消息给出原因。
-pub fn parse_document(text: &str) -> Result<Document, String> {
+/// subject 是错误文案的主体词（调用方传入）：过滤用“过滤”，文档编辑/新增用“文档”。
+pub fn parse_document(subject: &str, text: &str) -> Result<Document, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Err("JSON 过滤为空：请输入 {\"字段\": 值} 形式的文档，或清空输入框取消过滤。".to_owned());
+        return Err(format!("{subject}为空：请输入 {{\"字段\": 值}} 形式的 JSON 对象。"));
     }
-    let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| format!("过滤语法错误：{err}"))?;
+    let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| format!("{subject}语法错误：{err}"))?;
     if !value.is_object() {
-        return Err(format!("过滤应是 JSON 对象（{{\"字段\": 值}}），不是 {kind}。", kind = json_kind(&value)));
+        return Err(format!("{subject}应是 JSON 对象（{{\"字段\": 值}}），不是 {kind}。", kind = json_kind(&value)));
     }
-    let bson: Bson = Bson::try_from(value).map_err(|err| format!("过滤里的扩展 JSON 值不合法：{err}"))?;
+    let bson: Bson = Bson::try_from(value).map_err(|err| format!("{subject}里的扩展 JSON 值不合法：{err}"))?;
     match bson {
         Bson::Document(document) => Ok(document),
-        other => Err(format!("过滤应是 JSON 对象，解析成了 {other:?}。")),
+        other => Err(format!("{subject}应是 JSON 对象，解析成了 {other:?}。")),
     }
 }
 
@@ -207,30 +208,36 @@ mod doc_tests {
 
     #[test]
     fn parse_document_reports_json_syntax_location() {
-        let error = parse_document("{\"status\": }").unwrap_err();
+        let error = parse_document("过滤", "{\"status\": }").unwrap_err();
         assert!(error.contains("line"), "语法错误要带行号定位：{error}");
         assert!(error.contains("column"), "语法错误要带列号定位：{error}");
         assert!(error.starts_with("过滤语法错误"), "{error}");
+        // 文档编辑/新增共用同一解析器：主体词换成“文档”。
+        let doc_error = parse_document("文档", "{\"status\": }").unwrap_err();
+        assert!(doc_error.starts_with("文档语法错误"), "{doc_error}");
     }
 
     #[test]
     fn parse_document_accepts_relaxed_and_extended_values() {
-        let doc = parse_document("{\"status\":\"active\",\"count\":{\"$numberLong\":\"5\"}}").unwrap();
+        let doc = parse_document("过滤", "{\"status\":\"active\",\"count\":{\"$numberLong\":\"5\"}}").unwrap();
         assert_eq!(doc.get_str("status"), Ok("active"));
         assert_eq!(doc.get_i64("count"), Ok(5));
     }
 
     #[test]
     fn parse_document_rejects_invalid_extended_json_with_reason() {
-        let error = parse_document("{\"count\":{\"$numberLong\":5}}").unwrap_err();
+        let error = parse_document("文档", "{\"count\":{\"$numberLong\":5}}").unwrap_err();
         assert!(error.contains("扩展 JSON"), "{error}");
+        assert!(error.starts_with("文档里的扩展 JSON"), "{error}");
     }
 
     #[test]
     fn parse_document_requires_object() {
-        let error = parse_document("[1,2]").unwrap_err();
+        let error = parse_document("文档", "[1,2]").unwrap_err();
         assert!(error.contains("JSON 对象"), "{error}");
-        assert!(parse_document("").is_err());
+        assert!(error.starts_with("文档应是"), "{error}");
+        assert!(parse_document("过滤", "").is_err());
+        assert!(parse_document("文档", "  ").unwrap_err().starts_with("文档为空"));
     }
 
     #[test]
@@ -256,7 +263,7 @@ mod doc_tests {
         assert!(json.contains("加急"), "{json}");
         assert!(json.contains("杭州"), "{json}");
         // 回读：编辑流程提交的正是这个形态。
-        let back = parse_document(&json).unwrap();
+        let back = parse_document("文档", &json).unwrap();
         assert_eq!(back.get_array("标签").map(Vec::len), Ok(2));
         assert_eq!(back.get_document("地址").map(|d| d.get_str("城市")), Ok(Ok("杭州")));
     }
