@@ -15,7 +15,7 @@ export function sqlSaveName(now: Date = new Date()): string {
 /** 载入前的检查：超大文件直接说明原因，不进入编辑器。 */
 export function sqlFileProblem(file: File): string | null {
   if (file.size <= MAX_SQL_FILE_BYTES) return null;
-  return `文件有 ${(file.size / 1024 / 1024).toFixed(1)} MB，超过 2 MB 上限，没有载入。`;
+  return tr("query.fileIo.tooLarge", { size: (file.size / 1024 / 1024).toFixed(1) });
 }
 
 export async function readSqlFile(file: File): Promise<string> {
@@ -51,18 +51,20 @@ export async function saveSqlFile(options: { defaultPath: string; contents: stri
   try {
     path = await chooseExportPath(options.defaultPath, "sql");
   } catch (error) {
-    return { status: "failed", message: `无法打开保存对话框：${error instanceof Error ? error.message : String(error)}` };
+    return { status: "failed", message: tr("query.fileIo.dialogFailed", { error: error instanceof Error ? error.message : String(error) }) };
   }
   if (!path) return { status: "cancelled", message: "" };
   const fileName = path.split(/[/\\]/).pop() || options.defaultPath;
   if (isNativeExport()) {
     try {
       await writeNativeFile(path, options.contents);
-      return { status: "saved", message: `已保存到 ${path}。` };
+      return { status: "saved", message: tr("query.fileIo.saved", { path }) };
     } catch (error) {
       return { status: "failed", message: error instanceof Error ? error.message : String(error) };
     }
   }
   downloadSqlFile(fileName, options.contents);
-  return { status: "saved", message: `已开始下载 ${fileName}。` };
+  return { status: "saved", message: tr("query.fileIo.downloading", { name: fileName }) };
 }
+
+import { tr } from "../i18n";

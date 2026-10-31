@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { tr as t } from "../i18n";
 import { computed, onMounted, reactive, ref } from "vue";
 import Icon from "../shell/Icon.vue";
 import RedisValueView from "../values/RedisValueView.vue";
@@ -119,10 +120,10 @@ async function saveTtl() {
   try {
     const outcome = await api.value.setTtl(props.connectionId, selectedKey.value, parsed.seconds);
     if (outcome.applied === 0) {
-      ttlError.value = "没有作用到键（键可能已不存在）。";
+      ttlError.value = t("redis.tab.ttlMissed");
       return;
     }
-    ttlNote.value = parsed.seconds == null ? "已移除过期（PERSIST）。" : `已设置 ${parsed.seconds} 秒过期（EXPIRE）。`;
+    ttlNote.value = parsed.seconds == null ? t("redis.tab.ttlRemoved") : t("redis.tab.ttlSet", { n: parsed.seconds });
     await refreshSelected();
     await refreshList();
   } catch (error) {
@@ -134,8 +135,8 @@ function askDelete() {
   if (!selectedKey.value) return;
   confirmState.open = true;
   confirmState.action = "delete";
-  confirmState.title = "删除键";
-  confirmState.prompt = `将删除键 ${selectedKey.value}，删除后不可恢复。确认删除？`;
+  confirmState.title = t("redis.tab.deleteTitle");
+  confirmState.prompt = t("redis.tab.deletePrompt", { key: selectedKey.value });
 }
 
 function askRename() {
@@ -149,8 +150,8 @@ function confirmRename() {
   if (!target) return;
   confirmState.open = true;
   confirmState.action = "rename";
-  confirmState.title = "重命名键";
-  confirmState.prompt = `将把键 ${selectedKey.value} 重命名为 ${target}。目标键已存在时会被覆盖。确认执行？`;
+  confirmState.title = t("redis.tab.renameTitle");
+  confirmState.prompt = t("redis.tab.renamePrompt", { key: selectedKey.value, target });
   renameOpen.value = false;
 }
 
@@ -166,7 +167,7 @@ async function runConfirm() {
   try {
     if (action === "delete" && selectedKey.value) {
       const outcome = await api.value.deleteKeys(props.connectionId, [selectedKey.value], true);
-      commandNote.value = `已删除 ${outcome.deleted} 个键。`;
+      commandNote.value = t("redis.tab.deletedCount", { n: outcome.deleted });
       const removed = selectedKey.value;
       selectedKey.value = "";
       detail.value = null;
@@ -175,7 +176,7 @@ async function runConfirm() {
     } else if (action === "rename" && selectedKey.value) {
       const target = renameTo.value.trim();
       await api.value.renameKey(props.connectionId, selectedKey.value, target, true);
-      commandNote.value = `已重命名为 ${target}。`;
+      commandNote.value = t("redis.tab.renamedNote", { target });
       renameTo.value = "";
       await refreshList();
       await selectKey(target);
@@ -191,7 +192,7 @@ async function execConfirmed() {
   const { command, args } = splitCommandline(commandInput.value);
   const outcome = await api.value.exec(props.connectionId, command, args, true);
   commandResult.value = outcome;
-  commandNote.value = "已执行。";
+  commandNote.value = t("redis.tab.executed");
   await refreshList();
   if (selectedKey.value) await refreshSelected();
 }
@@ -204,13 +205,13 @@ async function runCommand() {
   if (!line) return;
   const risk = classifyRedisCommand(line);
   if (risk === "blocked") {
-    commandError.value = "已禁用 KEYS：全量扫描会阻塞 Redis，键空间浏览请用左侧的模式过滤（SCAN）。";
+    commandError.value = t("redis.tab.keysRefused");
     return;
   }
   if (risk === "dangerous") {
     confirmState.open = true;
     confirmState.action = "exec";
-    confirmState.title = "写删类命令确认";
+    confirmState.title = t("redis.tab.confirmTitle");
     confirmState.prompt = dangerPrompt(line);
     return;
   }
@@ -246,11 +247,11 @@ onMounted(async () => {
           type="search"
           class="mono"
           data-field="redis-pattern"
-          placeholder="模式过滤（如 rillsql:*）"
-          aria-label="键模式过滤"
+          :placeholder="t('redis.tab.patternPlaceholder')"
+          :aria-label="t('redis.tab.patternLabel')"
         />
-        <button class="btn sm" type="submit" data-action="redis-apply-pattern" :disabled="loading">过滤</button>
-        <button class="btn sm ghost" type="button" data-action="redis-refresh" :disabled="loading" @click="refreshList">刷新</button>
+        <button class="btn sm" type="submit" data-action="redis-apply-pattern" :disabled="loading">{{ t("redis.tab.filter") }}</button>
+        <button class="btn sm ghost" type="button" data-action="redis-refresh" :disabled="loading" @click="refreshList">{{ t("redis.tab.refresh") }}</button>
       </form>
       <p v-if="listError" class="rk-error" role="alert" data-redis-list-error>{{ listError }}</p>
       <ul class="rk-keys" data-redis-keys>
@@ -270,12 +271,12 @@ onMounted(async () => {
           </button>
         </li>
       </ul>
-      <p v-if="!loading && keys.length === 0 && !listError" class="rk-empty">没有读到键。调整模式过滤或先写入一些键。</p>
+      <p v-if="!loading && keys.length === 0 && !listError" class="rk-empty">{{ t("redis.tab.emptyList") }}</p>
       <div class="rk-more">
         <button v-if="!done" class="btn sm" type="button" data-action="redis-more" :disabled="loading" @click="loadPage">
-          {{ loading ? "读取中…" : "再读取一批（SCAN）" }}
+          {{ loading ? t("redis.tab.loading") : t("redis.tab.loadMore") }}
         </button>
-        <span v-else class="rk-done">本轮流读完成（键空间可能有变化，刷新重新开始）</span>
+        <span v-else class="rk-done">{{ t("redis.tab.scanDone") }}</span>
       </div>
     </aside>
 
@@ -287,27 +288,27 @@ onMounted(async () => {
           <span class="rk-ttl-now">TTL：{{ ttlText }}</span>
         </header>
         <p v-if="detailError" class="rk-error" role="alert">{{ detailError }}</p>
-        <p v-else-if="detailLoading" class="rk-empty">读取中…</p>
+        <p v-else-if="detailLoading" class="rk-empty">{{ t("redis.tab.loading") }}</p>
         <RedisValueView v-else-if="detail" :value="detail.value" />
         <div class="rk-actions">
           <form class="rk-ttl-form" @submit.prevent="saveTtl">
-            <input v-model="ttlInput" class="mono" data-field="redis-ttl" placeholder="秒（留空=永不过期）" aria-label="TTL 秒数" />
-            <button class="btn sm" type="submit" data-action="redis-set-ttl">设置 TTL</button>
+            <input v-model="ttlInput" class="mono" data-field="redis-ttl" :placeholder="t('redis.tab.ttlPlaceholder')" :aria-label="t('redis.tab.ttlLabel')" />
+            <button class="btn sm" type="submit" data-action="redis-set-ttl">{{ t("redis.tab.setTtl") }}</button>
             <span v-if="ttlNote" class="rk-note ok" data-redis-ttl-note>{{ ttlNote }}</span>
             <span v-if="ttlError" class="rk-note err" data-redis-ttl-error>{{ ttlError }}</span>
           </form>
           <span class="grow"></span>
-          <button class="btn sm" type="button" data-action="redis-rename" @click="askRename">重命名…</button>
-          <button class="btn sm danger" type="button" data-action="redis-delete" @click="askDelete">删除…</button>
+          <button class="btn sm" type="button" data-action="redis-rename" @click="askRename">{{ t("redis.tab.rename") }}</button>
+          <button class="btn sm danger" type="button" data-action="redis-delete" @click="askDelete">{{ t("redis.tab.remove") }}</button>
         </div>
       </template>
-      <p v-else class="rk-empty">在左侧选择一个键查看内容。双击同样打开。</p>
+      <p v-else class="rk-empty">{{ t("redis.tab.pickKey") }}</p>
     </section>
 
     <form class="rk-cmd" @submit.prevent="runCommand">
       <Icon name="terminal" />
-      <input v-model="commandInput" class="mono" data-field="redis-command" placeholder="命令（如 GET key；写删类会先确认；KEYS 已禁用）" aria-label="Redis 命令" />
-      <button class="btn sm primary" type="submit" data-action="redis-exec">执行</button>
+      <input v-model="commandInput" class="mono" data-field="redis-command" :placeholder="t('redis.tab.commandPlaceholder')" :aria-label="t('redis.tab.commandLabel')" />
+      <button class="btn sm primary" type="submit" data-action="redis-exec">{{ t("redis.tab.execute") }}</button>
     </form>
     <div class="rk-result" aria-live="polite">
       <p v-if="commandError" class="rk-error" role="alert" data-redis-cmd-error>{{ commandError }}</p>
@@ -328,24 +329,24 @@ onMounted(async () => {
       </template>
     </div>
 
-    <div v-if="renameOpen" class="rk-overlay" data-menu="rename" role="dialog" aria-label="重命名键" @click.self="renameOpen = false">
+    <div v-if="renameOpen" class="rk-overlay" data-menu="rename" role="dialog" :aria-label="t('redis.tab.renameKeyTitle')" @click.self="renameOpen = false">
       <form class="rk-card" @submit.prevent="confirmRename">
-        <h4>重命名 {{ selectedKey }}</h4>
-        <input v-model="renameTo" class="mono" data-field="redis-rename-to" placeholder="新键名" aria-label="新键名" />
+        <h4>{{ t("redis.tab.renameKeyHeading", { key: selectedKey }) }}</h4>
+        <input v-model="renameTo" class="mono" data-field="redis-rename-to" :placeholder="t('redis.tab.renameToPlaceholder')" :aria-label="t('redis.tab.renameToLabel')" />
         <div class="rk-card-actions">
-          <button class="btn sm" type="button" data-action="redis-rename-cancel" @click="renameOpen = false">取消</button>
-          <button class="btn sm primary" type="submit" data-action="redis-rename-confirm" :disabled="!renameTo.trim()">继续</button>
+          <button class="btn sm" type="button" data-action="redis-rename-cancel" @click="renameOpen = false">{{ t("common.cancel") }}</button>
+          <button class="btn sm primary" type="submit" data-action="redis-rename-confirm" :disabled="!renameTo.trim()">{{ t("redis.tab.proceed") }}</button>
         </div>
       </form>
     </div>
 
-    <div v-if="confirmState.open" class="rk-overlay" data-menu="confirm" role="dialog" aria-label="写操作确认" @click.self="cancelConfirm">
+    <div v-if="confirmState.open" class="rk-overlay" data-menu="confirm" role="dialog" :aria-label="t('redis.tab.confirmAria')" @click.self="cancelConfirm">
       <div class="rk-card">
         <h4>{{ confirmState.title }}</h4>
         <p class="rk-prompt" data-redis-confirm-prompt>{{ confirmState.prompt }}</p>
         <div class="rk-card-actions">
-          <button class="btn sm" type="button" data-action="redis-confirm-cancel" @click="cancelConfirm">取消</button>
-          <button class="btn sm danger" type="button" data-action="redis-confirm-ok" @click="runConfirm">确认执行</button>
+          <button class="btn sm" type="button" data-action="redis-confirm-cancel" @click="cancelConfirm">{{ t("common.cancel") }}</button>
+          <button class="btn sm danger" type="button" data-action="redis-confirm-ok" @click="runConfirm">{{ t("redis.tab.confirmExecute") }}</button>
         </div>
       </div>
     </div>

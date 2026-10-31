@@ -75,14 +75,14 @@ export class LiveTable {
   }
 
   get scopeLabel(): string {
-    return "筛选和排序作用于整张表";
+    return tr("grid.scope.wholeTable");
   }
 
   get keyLabel(): string {
-    if (!this.ready) return "正在读取表结构";
-    if (this.store.schema.kind === "view") return "只读视图";
-    if (!this.store.schema.key.length) return "这张表没有主键，只能新增";
-    return `按 ${this.store.schema.key.join(" + ")} 定位行`;
+    if (!this.ready) return tr("grid.scope.loadingSchema");
+    if (this.store.schema.kind === "view") return tr("grid.scope.readonlyView");
+    if (!this.store.schema.key.length) return tr("grid.scope.noKeyInsertOnly");
+    return tr("grid.scope.locateByKey", { key: this.store.schema.key.join(" + ") });
   }
 
   get pendingCount(): number {
@@ -124,14 +124,14 @@ export class LiveTable {
   async replaceFilters(filters: Filter[]): Promise<string | null> {
     for (const filter of filters) {
       if (filter.op === "between") {
-        if (!filter.value || !filter.second) return "between 需要两个值";
+        if (!filter.value || !filter.second) return tr("grid.live.betweenNeedsTwo");
         continue;
       }
       if (filter.op === "in") {
-        if (!filter.values?.length) return "IN 筛选至少要一个值";
+        if (!filter.values?.length) return tr("grid.live.inNeedsValue");
         continue;
       }
-      if (opNeedsValue(filter.op) && !filter.value) return "筛选值不能为空";
+      if (opNeedsValue(filter.op) && !filter.value) return tr("grid.live.filterValueEmpty");
     }
     this.filters = filters.map((filter) => ({ ...filter }));
     return this.readWindow(0, this.pageSize, true);
@@ -178,7 +178,7 @@ export class LiveTable {
       if (row.resolved) continue;
       const needs = this.store.schema.columns.some((column) => needsFullRead(row.cells[column.name], column));
       if (!needs) continue;
-      if (!row.located) return "不能按主键读取完整值，预览不能导出";
+      if (!row.located) return tr("grid.live.previewNotExportable");
       const error = await this.readLocated(row.id);
       if (error) return error;
       const fresh = this.rowById(row.id);
@@ -186,7 +186,7 @@ export class LiveTable {
         const value = fresh?.cells[column.name];
         return typeof value === "string" && isPreviewEnvelope(value, column.typeName) && fresh?.resolved !== true;
       });
-      if (still) return "还没有读到完整值，不能导出";
+      if (still) return tr("grid.live.unreadFullValue");
     }
     return null;
   }
@@ -200,12 +200,12 @@ export class LiveTable {
       op: "eq",
       value: row.locator?.values[index] ?? "",
     }));
-    if (filters.some((filter) => !filter.value)) return "主键值不完整，不能另读这一格";
+    if (filters.some((filter) => !filter.value)) return tr("grid.live.keyIncomplete");
     try {
       const page = await gridPage(this.target, filters, null, 0, 1);
       const fresh = page.rows[0];
       const current = this.rowById(rowId);
-      if (!fresh || !current) return "没有读到这一格";
+      if (!fresh || !current) return tr("grid.live.cellNotRead");
       current.cells = { ...current.cells, ...fresh.cells };
       current.resolved = true;
       return null;
@@ -249,11 +249,11 @@ export class LiveTable {
 
   stageUpdate(rowId: string, column: string, value: Cell): string | null {
     const row = this.rowById(rowId);
-    if (!row) return "找不到行";
+    if (!row) return tr("grid.errors.rowNotFound");
     const found = this.store.schema.columns.find((item) => item.name === column);
     const rejected = rejectWrite(found, value, row.resolved === true);
     if (rejected) return rejected;
-    if (!this.canUpdate(row)) return "无法唯一确定这一行，不能修改";
+    if (!this.canUpdate(row)) return tr("grid.errors.cannotLocate");
     const sets = { ...(this.edits.get(rowId) ?? {}), [column]: value };
     this.edits.set(rowId, sets);
     this.failures.delete(`u:${rowId}`);
@@ -261,7 +261,7 @@ export class LiveTable {
   }
 
   addRow(): string | null {
-    if (!this.canInsert) return "只有数据表可以新增，视图不行";
+    if (!this.canInsert) return tr("grid.errors.onlyTableEdit");
     const id = `new-${draftSeq}`;
     draftSeq += 1;
     const cells: Record<string, Cell | undefined> = {};
@@ -274,7 +274,7 @@ export class LiveTable {
 
   stageInsert(id: string, column: string, value: Cell | undefined): string | null {
     const insert = this.inserts.find((item) => item.id === id);
-    if (!insert) return "找不到新增行";
+    if (!insert) return tr("grid.errors.insertNotFound");
     const found = this.store.schema.columns.find((item) => item.name === column);
     const rejected = rejectWrite(found, value);
     if (rejected) return rejected;
@@ -284,7 +284,7 @@ export class LiveTable {
   }
 
   deleteSelected(): string | null {
-    if (!this.selectedId) return "先选择一行";
+    if (!this.selectedId) return tr("grid.errors.selectRowFirst");
     return this.deleteRow(this.selectedId);
   }
 
@@ -295,7 +295,7 @@ export class LiveTable {
       if (this.selectedId === id) this.selectedId = null;
       return null;
     }
-    if (!this.canDeleteRow(id)) return "无法唯一确定这一行，不能删除";
+    if (!this.canDeleteRow(id)) return tr("grid.errors.cannotLocateDelete");
     if (!this.deletes.includes(id)) this.deletes.push(id);
     this.edits.delete(id);
     return null;
@@ -320,7 +320,7 @@ export class LiveTable {
     return this.changes().map((change) => ({
       id: change.id,
       sql: this.sqlFor(change),
-      label: change.kind === "insert" ? "新增 1 行" : change.kind === "delete" ? `删除 ${change.rowId}` : `修改 ${change.rowId}`,
+      label: change.kind === "insert" ? tr("grid.commit.labelInsert") : change.kind === "delete" ? tr("grid.commit.labelDelete", { id: change.rowId }) : tr("grid.commit.labelUpdate", { id: change.rowId }),
     }));
   }
 
@@ -391,3 +391,5 @@ export class LiveTable {
     return updateSql(this.store.schema, change.sets, row.locator.columns, row.locator.values);
   }
 }
+
+import { tr } from "../i18n";

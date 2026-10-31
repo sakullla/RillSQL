@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { tr } from "../i18n";
 import { valueFamily } from "../grid/typeset";
 import type { Column } from "../grid/types";
 
@@ -78,30 +79,30 @@ export function migrationHint(source: Column | undefined, target: Column | undef
   if (!source || !target) return null;
   const from = valueFamily(source.typeName);
   const to = valueFamily(target.typeName);
-  const lengthNote = target.typeName.includes("(") ? "目标列限长，超长行会计入失败而不会被截断。" : null;
-  if (from === "unknown" || to === "unknown") return "有一侧类型未知，写入前先确认。";
-  if (from === "raw" || to === "raw") return "有一侧类型不能判断写回方式，写入前先确认。";
-  if (from === "geometry" || to === "geometry") return "几何类型没有跨引擎的通用转换，这些行通常会计入失败。";
+  const lengthNote = target.typeName.includes("(") ? tr("export.migrateNotes.lengthLimited") : null;
+  if (from === "unknown" || to === "unknown") return tr("export.migrateNotes.unknownSide");
+  if (from === "raw" || to === "raw") return tr("export.migrateNotes.rawSide");
+  if (from === "geometry" || to === "geometry") return tr("export.migrateNotes.geometry");
   if (from === to) return lengthNote;
   if (to === "text") {
-    if (from === "binary") return "二进制将按十六进制文本写入。";
+    if (from === "binary") return tr("export.migrateNotes.binaryAsHex");
     return lengthNote;
   }
   if (from === "text") {
-    if (to === "bool") return "只有 t/f/true/false/0/1/yes/no 形状的值能转成布尔。";
-    if (to === "integer" || to === "decimal" || to === "float") return "文本值必须是数字才会被目标接受。";
-    if (to === "date" || to === "time" || to === "datetime") return "文本值必须符合目标引擎的日期时间格式。";
-    return "文本值必须是偶数长度的十六进制才能写成二进制。";
+    if (to === "bool") return tr("export.migrateNotes.boolShapes");
+    if (to === "integer" || to === "decimal" || to === "float") return tr("export.migrateNotes.numberNeeded");
+    if (to === "date" || to === "time" || to === "datetime") return tr("export.migrateNotes.datetimeNeeded");
+    return tr("export.migrateNotes.hexNeeded");
   }
   if (from === "integer" && (to === "decimal" || to === "float")) return lengthNote;
-  if (from === "integer" && to === "bool") return "只有 0/1 能转成布尔，其余值会计入失败。";
-  if ((from === "decimal" || from === "float") && to === "integer") return "小数进整数列会被拒绝或截断，不会静默截断。";
-  if ((from === "decimal" && to === "float") || (from === "float" && to === "decimal")) return "定点与浮点互换有精度损失。";
-  if ((from === "decimal" || from === "float") && to === "bool") return "小数转布尔不可靠，这些行通常会计入失败。";
-  if (from === "bool" && (to === "integer" || to === "decimal" || to === "float")) return "布尔写数值列在部分引擎（如 PostgreSQL）会被拒绝。";
+  if (from === "integer" && to === "bool") return tr("export.migrateNotes.intToBool");
+  if ((from === "decimal" || from === "float") && to === "integer") return tr("export.migrateNotes.decimalToInt");
+  if ((from === "decimal" && to === "float") || (from === "float" && to === "decimal")) return tr("export.migrateNotes.precisionLoss");
+  if ((from === "decimal" || from === "float") && to === "bool") return tr("export.migrateNotes.decimalToBool");
+  if (from === "bool" && (to === "integer" || to === "decimal" || to === "float")) return tr("export.migrateNotes.boolToNumber");
   if (from === "date" && to === "datetime") return lengthNote;
-  if (from === "datetime" && to === "date") return "日期时间进日期列会丢失时间部分。";
-  if ((from === "date" && to === "time") || (from === "time" && to === "date")) return "日期与时刻语义不同，值可能被拒绝。";
-  if ((from === "time" && to === "datetime") || (from === "datetime" && to === "time")) return "时刻与日期时间语义不同，值可能被拒绝。";
-  return "这两个类型族没有直接转换，这些行通常会计入失败。";
+  if (from === "datetime" && to === "date") return tr("export.migrateNotes.datetimeToDate");
+  if ((from === "date" && to === "time") || (from === "time" && to === "date")) return tr("export.migrateNotes.dateVsTime");
+  if ((from === "time" && to === "datetime") || (from === "datetime" && to === "time")) return tr("export.migrateNotes.timeVsDatetime");
+  return tr("export.migrateNotes.noDirect");
 }

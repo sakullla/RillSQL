@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { tr as t } from "../i18n";
 import Icon from "../shell/Icon.vue";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { catalogConnections, refreshCatalog, structureFocus } from "../catalog/store";
@@ -46,7 +47,7 @@ const viewUnreadable = computed(() => {
   if (!isView.value) return "";
   if (description.value?.definitionError) return description.value.definitionError;
   const sql = description.value?.displaySql.trim() ?? "";
-  if (sql === "" || sql.startsWith("--")) return "没有读到可编辑的视图定义，不能把占位说明当作原文。";
+  if (sql === "" || sql.startsWith("--")) return t("structure.pane.viewPlaceholder");
   return "";
 });
 
@@ -97,7 +98,7 @@ const contextText = computed(() => {
   if (purpose.value !== "edit" || !props.target) return "";
   const name = boundConnection.value?.name ?? props.target.connectionId;
   const place = props.target.schema ? `${props.target.database} / ${props.target.schema}` : props.target.database;
-  return `来自连接「${name}」的「${place}」`;
+  return t("structure.pane.fromConnection", { name, place });
 });
 
 const activeEngine = computed(() => {
@@ -118,17 +119,17 @@ const ddlVisible = computed(() => {
 const ddlOriginNote = computed(() => {
   const current = description.value;
   if (!current) return "";
-  if (current.kind !== "table" && current.engine === "sqlite") return "这段定义读自 SQLite 的 sqlite_master，是数据库里的原文。";
-  return "按当前结构重新生成，便于阅读；不是数据库里的原始定义。";
+  if (current.kind !== "table" && current.engine === "sqlite") return t("structure.pane.sqliteMasterNote");
+  return t("structure.pane.regeneratedNote");
 });
 
 async function copyDdl() {
   const sql = description.value?.displaySql ?? "";
   try {
     await navigator.clipboard.writeText(sql);
-    ddlCopyNote.value = "已复制";
+    ddlCopyNote.value = t("structure.pane.copied");
   } catch {
-    ddlCopyNote.value = "复制失败";
+    ddlCopyNote.value = t("structure.pane.copyFailed");
   }
 }
 
@@ -209,7 +210,7 @@ watch(connections, (list) => {
 function openPreview(action: StructureAction) {
   const request = requestOf();
   if (!request) {
-    errorText.value = purpose.value === "create" ? "需要至少一个已打开的连接。" : "这张表还没有绑定已打开的连接。";
+    errorText.value = purpose.value === "create" ? t("structure.pane.needConnection") : t("structure.pane.tableUnbound");
     return;
   }
   busy.value = true;
@@ -233,12 +234,12 @@ function openPreview(action: StructureAction) {
 function previewColumns() {
   const request = requestOf();
   if (!request) {
-    errorText.value = purpose.value === "create" ? "需要至少一个已打开的连接。" : "这张表还没有绑定已打开的连接。";
+    errorText.value = purpose.value === "create" ? t("structure.pane.needConnection") : t("structure.pane.tableUnbound");
     return;
   }
   if (purpose.value === "create") {
     if (!createName.value.trim()) {
-      errorText.value = "先给新表起个名字。";
+      errorText.value = t("structure.pane.nameFirst");
       return;
     }
     openPreview({ kind: "createTable", name: createName.value.trim(), columns: rows.value.map((row) => ({ ...row })) });
@@ -285,7 +286,7 @@ async function confirm() {
   const request = requestOf();
   if (!request || !plan.value || !pending.value || plan.value.blocked.length || plan.value.steps.length === 0) return;
   if (pending.value.kind === "replaceView" && pending.value.definition !== viewSql.value) {
-    errorText.value = "定义在预览之后又改过，需要重新预览。没有发送。";
+    errorText.value = t("structure.pane.staleAfterPreview");
     closePreview();
     return;
   }
@@ -303,7 +304,7 @@ async function confirm() {
       rule: plan.value.rule,
       target: plan.value.target,
       rebuild: plan.value.rebuild,
-      steps: [{ sql: "", label: "执行", status: "unknown", message: error instanceof Error ? error.message : String(error) }],
+      steps: [{ sql: "", label: t("structure.pane.executeLabel"), status: "unknown", message: error instanceof Error ? error.message : String(error) }],
     };
   } finally {
     busy.value = false;
@@ -323,32 +324,32 @@ function createForeignKey(foreignKey: StructureForeignKey) {
 </script>
 
 <template>
-  <div class="structure-pane" aria-label="表结构" :data-tab-id="tabId" :data-draft="draft" tabindex="-1">
-    <p v-if="purpose === 'edit' && !target" class="empty" role="alert">这张表还没有绑定已打开的连接。</p>
+  <div class="structure-pane" :aria-label="t('structure.pane.area')" :data-tab-id="tabId" :data-draft="draft" tabindex="-1">
+    <p v-if="purpose === 'edit' && !target" class="empty" role="alert">{{ t("structure.pane.tableUnbound") }}</p>
     <template v-else>
       <header class="structure-heading">
         <span class="action-icon"><Icon name="table" /></span>
         <div class="sh-titles">
-          <p class="sh-eyebrow">{{ activeEngine ? `${activeEngine.toUpperCase()} · ` : "" }}表结构</p>
-          <h2>{{ purpose === 'create' ? '设计新表' : target?.table }}</h2>
-          <p class="sh-sub"><span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span><span class="ctx">{{ purpose === 'create' ? '定义字段、类型与约束，预览 SQL 后再创建。' : contextText }}</span></p>
+          <p class="sh-eyebrow">{{ activeEngine ? `${activeEngine.toUpperCase()} · ` : "" }}{{ t("structure.pane.eyebrow") }}</p>
+          <h2>{{ purpose === 'create' ? t('structure.pane.createTitle') : target?.table }}</h2>
+          <p class="sh-sub"><span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span><span class="ctx">{{ purpose === 'create' ? t('structure.pane.createHint') : contextText }}</span></p>
         </div>
         <span class="grow"></span>
-        <div v-if="description" class="structure-stats"><div class="stat-tile"><b>{{ description.columns.length }}</b><span>字段</span></div><div class="stat-tile"><b>{{ description.indexes.length }}</b><span>索引</span></div></div>
+        <div v-if="description" class="structure-stats"><div class="stat-tile"><b>{{ description.columns.length }}</b><span>{{ t("structure.pane.statColumns") }}</span></div><div class="stat-tile"><b>{{ description.indexes.length }}</b><span>{{ t("structure.pane.statIndexes") }}</span></div></div>
       </header>
-      <nav class="struct-nav" aria-label="结构分区">
-        <button type="button" :class="{ on: section === 'columns' }" @click="chooseSection('columns')"><Icon name="columns" />字段</button>
-        <button v-if="purpose === 'edit'" type="button" :class="{ on: section === 'indexes' }" @click="chooseSection('indexes')"><Icon name="sort" />索引</button>
-        <button v-if="purpose === 'edit'" type="button" :class="{ on: section === 'foreign' }" @click="chooseSection('foreign')"><Icon name="link" />外键</button>
-        <button v-if="isView" type="button" :class="{ on: section === 'definition' }" data-section="definition" @click="chooseSection('definition')"><Icon name="code" />定义</button>
+      <nav class="struct-nav" :aria-label="t('structure.pane.navLabel')">
+        <button type="button" :class="{ on: section === 'columns' }" @click="chooseSection('columns')"><Icon name="columns" />{{ t("structure.pane.navColumns") }}</button>
+        <button v-if="purpose === 'edit'" type="button" :class="{ on: section === 'indexes' }" @click="chooseSection('indexes')"><Icon name="sort" />{{ t("structure.pane.navIndexes") }}</button>
+        <button v-if="purpose === 'edit'" type="button" :class="{ on: section === 'foreign' }" @click="chooseSection('foreign')"><Icon name="link" />{{ t("structure.pane.navForeign") }}</button>
+        <button v-if="isView" type="button" :class="{ on: section === 'definition' }" data-section="definition" @click="chooseSection('definition')"><Icon name="code" />{{ t("structure.pane.navDefinition") }}</button>
         <span class="grow"></span>
-        <button v-if="purpose === 'edit' && !isView" type="button" class="danger" :class="{ on: section === 'drop' }" @click="chooseSection('drop')"><Icon name="trash" />删除表</button>
+        <button v-if="purpose === 'edit' && !isView" type="button" class="danger" :class="{ on: section === 'drop' }" @click="chooseSection('drop')"><Icon name="trash" />{{ t("structure.pane.navDrop") }}</button>
       </nav>
       <details v-if="ddlVisible" class="disclosure struct-ddl">
-        <summary>建表 SQL</summary>
+        <summary>{{ t("structure.pane.ddlSummary") }}</summary>
         <div class="disclosure-body">
           <div class="struct-ddl-bar">
-            <button class="btn sm" type="button" @click="copyDdl">复制</button>
+            <button class="btn sm" type="button" @click="copyDdl">{{ t("common.copy") }}</button>
             <span v-if="ddlCopyNote" class="muted" role="status">{{ ddlCopyNote }}</span>
           </div>
           <pre>{{ description?.displaySql }}</pre>
@@ -356,18 +357,18 @@ function createForeignKey(foreignKey: StructureForeignKey) {
         </div>
       </details>
       <p v-if="errorText" class="struct-alert" role="alert">{{ errorText }}</p>
-      <p v-if="loading" class="struct-loading muted">正在读取这张表的结构……</p>
+      <p v-if="loading" class="struct-loading muted">{{ t("structure.pane.loading") }}</p>
       <div v-else class="struct-body">
         <form v-if="purpose === 'create'" class="struct-form" @submit.prevent="previewColumns">
-          <label>连接
-            <select v-model="createConnection" aria-label="目标连接">
+          <label>{{ t("structure.pane.fieldConnection") }}
+            <select v-model="createConnection" :aria-label="t('structure.pane.targetConnection')">
               <option v-for="item in connections" :key="item.id" :value="item.id">{{ item.name }}</option>
             </select>
           </label>
-          <label>数据库<input v-model="createDatabase" type="text" aria-label="目标数据库" /></label>
-          <label>Schema<input v-model="createSchema" type="text" aria-label="目标 schema" /></label>
-          <label>新表名<input v-model="createName" type="text" aria-label="新表名" /></label>
-          <p v-if="!connections.length" class="muted">需要至少一个已打开的连接。</p>
+          <label>{{ t("structure.pane.fieldDatabase") }}<input v-model="createDatabase" type="text" :aria-label="t('structure.pane.targetDatabase')" /></label>
+          <label>{{ t("structure.pane.fieldSchema") }}<input v-model="createSchema" type="text" :aria-label="t('structure.pane.targetSchema')" /></label>
+          <label>{{ t("structure.pane.fieldNewName") }}<input v-model="createName" type="text" :aria-label="t('structure.pane.targetNewName')" /></label>
+          <p v-if="!connections.length" class="muted">{{ t("structure.pane.needConnection") }}</p>
         </form>
         <StructureEditor v-if="section === 'columns'" :rows="rows" :baseline="description?.columns ?? []" :mode="purpose === 'create' ? 'create' : 'edit'" :focus-name="focusedMember" @preview="previewColumns" />
         <IndexEditor
@@ -381,10 +382,10 @@ function createForeignKey(foreignKey: StructureForeignKey) {
         <section v-else-if="section === 'definition' && isView" class="struct-view-def" data-view-definition>
           <p v-if="viewUnreadable" class="struct-alert" role="alert" data-view-error>{{ viewUnreadable }}</p>
           <template v-else>
-            <p class="muted">修改下面的定义。先列出将发送的全部语句；取消不发送，确认后才按这个顺序发送。函数、存储过程和触发器不能从这里保存。</p>
-            <textarea v-model="viewSql" data-view-sql aria-label="视图定义" spellcheck="false"></textarea>
+            <p class="muted">{{ t("structure.pane.viewEditHint") }}</p>
+            <textarea v-model="viewSql" data-view-sql :aria-label="t('structure.pane.viewDefinition')" spellcheck="false"></textarea>
             <div>
-              <button class="btn primary" type="button" data-action="preview-view" @click="previewView">查看将要发生什么</button>
+              <button class="btn primary" type="button" data-action="preview-view" @click="previewView">{{ t("structure.pane.previewView") }}</button>
             </div>
           </template>
         </section>
@@ -401,16 +402,16 @@ function createForeignKey(foreignKey: StructureForeignKey) {
           @enable="openPreview({ kind: 'setForeignKeys', enabled: true })"
         />
         <section v-else-if="section === 'drop' && target" class="struct-drop">
-          <h3><Icon name="trash" />删除表 {{ target.table }}</h3>
+          <h3><Icon name="trash" />{{ t("structure.pane.dropTitle", { table: target.table }) }}</h3>
           <p class="impact danger">
-            将永久删除这张表<template v-if="description?.rowCount != null">和里面约 {{ description.rowCount }} 行数据</template>
-            <template v-else>和里面所有数据（暂时不知道有多少行）</template>，无法恢复。
+            {{ t("structure.pane.dropImpactKnown") }}<template v-if="description?.rowCount != null">{{ t("structure.pane.dropWithRows", { n: description.rowCount }) }}</template>
+            <template v-else>{{ t("structure.pane.dropAllData") }}</template>{{ t("structure.pane.dropCantRecover") }}
           </p>
-          <p class="muted">只删除这一张表，不会连带删除其他表或对象。</p>
+          <p class="muted">{{ t("structure.pane.dropOnlyThis") }}</p>
           <template v-if="description?.incoming.length">
-            <p class="impact warn">有 {{ description.incoming.length }} 个外键引用这张表：删除可能被数据库拒绝，也可能留下无效的引用。</p>
+            <p class="impact warn">{{ t("structure.pane.dropIncoming", { n: description.incoming.length }) }}</p>
             <details class="disclosure">
-              <summary>查看引用它的外键</summary>
+              <summary>{{ t("structure.pane.dropIncomingList") }}</summary>
               <div class="disclosure-body">
                 <ul class="plain-list">
                   <li v-for="item in description.incoming" :key="`${item.table}.${item.name}`">
@@ -421,7 +422,7 @@ function createForeignKey(foreignKey: StructureForeignKey) {
             </details>
           </template>
           <div>
-            <button class="btn danger" type="button" @click="openPreview({ kind: 'dropTable', table: target.table })">查看将要发生什么</button>
+            <button class="btn danger" type="button" @click="openPreview({ kind: 'dropTable', table: target.table })">{{ t("structure.pane.preview") }}</button>
           </div>
         </section>
       </div>

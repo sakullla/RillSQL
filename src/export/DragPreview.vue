@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { tr as t } from "../i18n";
 import { computed } from "vue";
 import { showCell } from "../grid/display";
 import type { Cell } from "../grid/types";
@@ -24,7 +25,7 @@ const notice = computed(() => {
 
 const visible = computed(() => (ready.value ? previewRowsWithin(ready.value.parsed.rows, props.budgetBytes) : { rows: [] as Record<string, Cell>[], hidden: 0 }));
 const columns = computed(() => ready.value?.parsed.columns ?? []);
-const formatLabel = computed(() => (ready.value?.preview.format === "json" ? "JSON 数组" : "CSV"));
+const formatLabel = computed(() => (ready.value?.preview.format === "json" ? t("export.preview.jsonArray") : t("export.preview.csv")));
 
 /** 继续导入：把已读取的文本交给现有导入对话框的列映射流程重新解析；预览本身零写入。 */
 function proceed() {
@@ -39,13 +40,13 @@ function proceed() {
 
 <template>
   <div v-if="open && state" class="dp-overlay" role="presentation">
-    <div class="dp-sheet" role="dialog" aria-modal="true" aria-label="拖放文件预览">
+    <div class="dp-sheet" role="dialog" aria-modal="true" :aria-label="t('export.preview.dialogLabel')">
       <header class="dp-head">
         <div class="dp-titles">
-          <h2>拖放文件预览</h2>
-          <p>先看前几行再决定。取消不会写入任何数据；继续才会进入导入对话框的列映射。</p>
+          <h2>{{ t("export.preview.title") }}</h2>
+          <p>{{ t("export.preview.subtitle") }}</p>
         </div>
-        <button class="icon-btn" type="button" aria-label="关闭" @click="emit('cancel')">
+        <button class="icon-btn" type="button" :aria-label="t('common.close')" @click="emit('cancel')">
           <svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
         </button>
       </header>
@@ -54,9 +55,9 @@ function proceed() {
         <template v-if="ready">
           <p class="dp-meta" data-drop-meta><b class="mono">{{ ready.fileName }}</b> · {{ formatLabel }} · {{ formatDropBytes(ready.preview.fileSize) }}</p>
           <p v-if="ready.preview.truncated" class="dp-alert" role="note" data-drop-truncated>
-            文件有 {{ formatDropBytes(ready.preview.fileSize) }}，超过 2 MB 预览读取上限：只读取了前 {{ formatDropBytes(ready.preview.readBytes) }}，继续导入也只会写入已读取的这些行。
+            {{ t("export.preview.tooLarge", { size: formatDropBytes(ready.preview.fileSize), read: formatDropBytes(ready.preview.readBytes) }) }}
           </p>
-          <p class="dp-note" data-drop-count>解析出 {{ ready.parsed.rows.length }} 行，显示前 {{ visible.rows.length }} 行{{ visible.hidden > 0 ? `（其余 ${visible.hidden} 行已折叠，导入不受影响）` : "" }}。</p>
+          <p class="dp-note" data-drop-count>{{ t("export.preview.count", { rows: ready.parsed.rows.length, shown: visible.rows.length }) }}{{ visible.hidden > 0 ? t("export.preview.restSuffix", { n: visible.hidden }) : "" }}</p>
           <div class="dp-scroll">
             <table class="dp-table">
               <thead><tr><th v-for="column in columns" :key="column">{{ column }}</th></tr></thead>
@@ -70,10 +71,10 @@ function proceed() {
         </template>
       </div>
       <footer class="dp-foot">
-        <span class="muted sm">预览阶段不写入任何数据</span>
+        <span class="muted sm">{{ t("export.preview.noWrite") }}</span>
         <span class="grow"></span>
-        <button class="btn" type="button" data-action="drop-cancel" @click="emit('cancel')">取消</button>
-        <button v-if="ready" class="btn primary" type="button" data-action="drop-continue" @click="proceed">继续导入</button>
+        <button class="btn" type="button" data-action="drop-cancel" @click="emit('cancel')">{{ t("common.cancel") }}</button>
+        <button v-if="ready" class="btn primary" type="button" data-action="drop-continue" @click="proceed">{{ t("export.preview.continueImport") }}</button>
       </footer>
     </div>
   </div>

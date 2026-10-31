@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { tr as t } from "../i18n";
 import { computed, ref } from "vue";
 import Listbox from "../ui/Listbox.vue";
 import type { ListboxOption } from "../ui/types";
@@ -90,13 +91,13 @@ async function onTable(): Promise<void> {
     const schemaOfTable = await gridDescribe(request);
     if (!sameTarget(target.value, request)) return;
     if (schemaOfTable.kind !== "table") {
-      error.value = "只有数据表可以导入，不能从文件建表，也不能写入视图。";
+      error.value = t("export.common.onlyTableImport");
       return;
     }
     described.value = schemaOfTable;
   } catch (cause) {
     if (!sameTarget(target.value, request)) return;
-    error.value = `读取表结构失败：${cause instanceof Error ? cause.message : String(cause)}`;
+    error.value = t("export.common.schemaReadFailed", { error: cause instanceof Error ? cause.message : String(cause) });
   } finally {
     loading.value = false;
   }
@@ -126,40 +127,40 @@ resetConnection(connections.value[0]?.id ?? "");
 
 <template>
   <div class="di-overlay" role="presentation">
-    <div class="di-sheet" role="dialog" aria-modal="true" aria-label="选择导入目标">
+    <div class="di-sheet" role="dialog" aria-modal="true" :aria-label="t('export.dragImport.dialogLabel')">
       <header class="di-head">
         <div class="di-titles">
-          <h2>导入拖放的文件</h2>
-          <p>选择要把 <b class="mono">{{ seed.fileName ?? "文件" }}</b> 写进哪张已有的表。目标选定后进入与导入对话框一致的列映射流程。</p>
+          <h2>{{ t("export.dragImport.title") }}</h2>
+          <p>{{ t("export.dragImport.pickTable", { file: seed.fileName ?? t("export.dragImport.fileWord") }) }}</p>
         </div>
-        <button class="icon-btn" type="button" aria-label="关闭" @click="emit('close')">
+        <button class="icon-btn" type="button" :aria-label="t('common.close')" @click="emit('close')">
           <svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
         </button>
       </header>
       <div class="di-body">
         <p v-if="error" class="di-alert" role="alert">{{ error }}</p>
-        <p v-if="connections.length === 0" class="di-note">还没有已打开的连接。先到连接页打开要导入的连接，再重新拖放文件。</p>
+        <p v-if="connections.length === 0" class="di-note">{{ t("export.dragImport.noConnections") }}</p>
         <fieldset v-else class="di-picker">
-          <legend>导入到哪张表</legend>
-          <label class="di-field">连接
-            <Listbox id="drag-import-connection" v-model="connectionId" :options="connectionOptions" aria-label="导入的连接" @update:model-value="onConnection" />
+          <legend>{{ t("export.dragImport.legend") }}</legend>
+          <label class="di-field">{{ t("export.dragImport.connection") }}
+            <Listbox id="drag-import-connection" v-model="connectionId" :options="connectionOptions" :aria-label="t('export.dragImport.connectionAria')" @update:model-value="onConnection" />
           </label>
-          <label class="di-field">库
-            <Listbox id="drag-import-database" v-model="database" :options="(connection?.databases ?? []).map((name) => ({ value: name, label: name }))" aria-label="导入的库" @update:model-value="onDatabase" />
+          <label class="di-field">{{ t("export.dragImport.database") }}
+            <Listbox id="drag-import-database" v-model="database" :options="(connection?.databases ?? []).map((name) => ({ value: name, label: name }))" :aria-label="t('export.dragImport.databaseAria')" @update:model-value="onDatabase" />
           </label>
           <label v-if="schemaOptions.length > 0" class="di-field">schema
-            <Listbox id="drag-import-schema" v-model="schema" :options="schemaOptions" aria-label="导入的 schema" @update:model-value="onSchema" />
+            <Listbox id="drag-import-schema" v-model="schema" :options="schemaOptions" :aria-label="t('export.dragImport.schemaAria')" @update:model-value="onSchema" />
           </label>
-          <label class="di-field">表
-            <Listbox id="drag-import-table" v-model="table" :options="tableOptions" aria-label="导入的表" @update:model-value="() => void onTable()" />
+          <label class="di-field">{{ t("export.dragImport.table") }}
+            <Listbox id="drag-import-table" v-model="table" :options="tableOptions" :aria-label="t('export.dragImport.tableAria')" @update:model-value="() => void onTable()" />
           </label>
-          <p v-if="loading" class="di-note">正在读取表结构…</p>
+          <p v-if="loading" class="di-note">{{ t("export.dragImport.loading") }}</p>
         </fieldset>
       </div>
       <footer class="di-foot">
-        <span class="muted sm">取消不会写入任何数据</span>
+        <span class="muted sm">{{ t("export.dragImport.cancelNoWrite") }}</span>
         <span class="grow"></span>
-        <button class="btn" type="button" @click="emit('close')">取消</button>
+        <button class="btn" type="button" @click="emit('close')">{{ t("common.cancel") }}</button>
       </footer>
     </div>
   </div>

@@ -1,36 +1,41 @@
-export type ShortcutGroup = "全局" | "SQL 编辑器" | "表格";
+import { tr } from "../i18n";
+
+/** 快捷键分组标识；展示文字走字典 shell.shortcuts.group*。 */
+export type ShortcutGroup = "global" | "editor" | "table";
 
 export interface ShortcutDef {
+  id: string;
   group: ShortcutGroup;
   chord: string;
+  /** 字典 key（shell.shortcuts.*），渲染处用 tr 翻译。 */
   label: string;
 }
 
 export const SHORTCUTS: readonly ShortcutDef[] = [
-  { group: "全局", chord: "Mod+K", label: "命令面板（表、连接、命令）" },
-  { group: "全局", chord: "Mod+P", label: "快速打开表" },
-  { group: "全局", chord: "Mod+T", label: "新建查询" },
-  { group: "全局", chord: "Mod+W", label: "关闭当前标签" },
-  { group: "全局", chord: "Mod+B", label: "显示 / 隐藏资源管理器" },
-  { group: "全局", chord: "Alt+1…9", label: "切换到第 N 个标签" },
-  { group: "全局", chord: "Mod+,", label: "设置" },
-  { group: "全局", chord: "?", label: "快捷键帮助" },
-  { group: "SQL 编辑器", chord: "Mod+Enter", label: "执行选中内容；无选中时执行光标所在语句" },
-  { group: "SQL 编辑器", chord: "Mod+Shift+Enter", label: "只执行光标所在语句" },
-  { group: "SQL 编辑器", chord: "Mod+.", label: "请求取消执行" },
-  { group: "SQL 编辑器", chord: "Ctrl+Space", label: "补全" },
-  { group: "SQL 编辑器", chord: "Mod+/", label: "注释 / 取消注释" },
-  { group: "SQL 编辑器", chord: "Mod+Shift+F", label: "格式化选中的 SQL；无选中时格式化全部" },
-  { group: "SQL 编辑器", chord: "Mod+Shift+E", label: "查看当前语句的执行计划" },
-  { group: "SQL 编辑器", chord: "Tab", label: "离开编辑器（不会插入缩进）" },
-  { group: "表格", chord: "↑ ↓ ← →", label: "移动单元格；按住 Shift 扩展选择" },
-  { group: "表格", chord: "Mod+A", label: "选中已读取的全部单元格" },
-  { group: "表格", chord: "Enter / F2", label: "编辑单元格" },
-  { group: "表格", chord: "Esc", label: "取消编辑；未编辑时离开表格" },
-  { group: "表格", chord: "Delete", label: "标记删除选中的行（暂存）" },
-  { group: "表格", chord: "Mod+S", label: "预览并提交变更" },
-  { group: "表格", chord: "Mod+C", label: "复制选中区域（TSV）" },
-  { group: "表格", chord: "Mod+Shift+C", label: "复制为 SQL 值（区分 NULL）" },
+  { id: "command-palette", group: "global", chord: "Mod+K", label: "shell.shortcuts.commandPalette" },
+  { id: "quick-open", group: "global", chord: "Mod+P", label: "shell.shortcuts.quickOpen" },
+  { id: "new-query", group: "global", chord: "Mod+T", label: "shell.shortcuts.newQuery" },
+  { id: "close-tab", group: "global", chord: "Mod+W", label: "shell.shortcuts.closeTab" },
+  { id: "toggle-sidebar", group: "global", chord: "Mod+B", label: "shell.shortcuts.toggleSidebar" },
+  { id: "nth-tab", group: "global", chord: "Alt+1…9", label: "shell.shortcuts.nthTab" },
+  { id: "open-settings", group: "global", chord: "Mod+,", label: "shell.shortcuts.openSettings" },
+  { id: "shortcut-help", group: "global", chord: "?", label: "shell.shortcuts.shortcutHelp" },
+  { id: "run-selection", group: "editor", chord: "Mod+Enter", label: "shell.shortcuts.runSelection" },
+  { id: "run-current", group: "editor", chord: "Mod+Shift+Enter", label: "shell.shortcuts.runCurrent" },
+  { id: "request-cancel", group: "editor", chord: "Mod+.", label: "shell.shortcuts.requestCancel" },
+  { id: "autocomplete", group: "editor", chord: "Ctrl+Space", label: "shell.shortcuts.autocomplete" },
+  { id: "toggle-comment", group: "editor", chord: "Mod+/", label: "shell.shortcuts.toggleComment" },
+  { id: "format", group: "editor", chord: "Mod+Shift+F", label: "shell.shortcuts.format" },
+  { id: "explain", group: "editor", chord: "Mod+Shift+E", label: "shell.shortcuts.explain" },
+  { id: "leave-editor", group: "editor", chord: "Tab", label: "shell.shortcuts.leaveEditor" },
+  { id: "move-cells", group: "table", chord: "↑ ↓ ← →", label: "shell.shortcuts.moveCells" },
+  { id: "select-all-cells", group: "table", chord: "Mod+A", label: "shell.shortcuts.selectAllCells" },
+  { id: "edit-cell", group: "table", chord: "Enter / F2", label: "shell.shortcuts.editCell" },
+  { id: "cancel-edit", group: "table", chord: "Esc", label: "shell.shortcuts.cancelEdit" },
+  { id: "mark-delete", group: "table", chord: "Delete", label: "shell.shortcuts.markDelete" },
+  { id: "commit", group: "table", chord: "Mod+S", label: "shell.shortcuts.commit" },
+  { id: "copy-region", group: "table", chord: "Mod+C", label: "shell.shortcuts.copyRegion" },
+  { id: "copy-sql-value", group: "table", chord: "Mod+Shift+C", label: "shell.shortcuts.copySqlValue" },
 ];
 
 export function isMacPlatform(platform = "", userAgent = ""): boolean {
@@ -52,11 +57,10 @@ export function chordParts(chord: string, mac: boolean): string[] {
 }
 
 export function shortcutPlatformNote(mac: boolean): string {
-  return mac
-    ? "macOS 按键 · 关闭标签为 ⌘W，新建查询为 ⌘T"
-    : "Windows / Linux 按键 · 关闭标签为 Ctrl+W，新建查询为 Ctrl+T";
+  return tr(mac ? "shell.shortcuts.noteMac" : "shell.shortcuts.noteWin");
 }
 
-export function globalChord(label: string): string | undefined {
-  return SHORTCUTS.find((item) => item.group === "全局" && item.label === label)?.chord;
+/** 按快捷键条目 id 查全局快捷键（原按中文 label 查找，i18n 迁移后改为稳定 id）。 */
+export function globalChord(id: string): string | undefined {
+  return SHORTCUTS.find((item) => item.group === "global" && item.id === id)?.chord;
 }

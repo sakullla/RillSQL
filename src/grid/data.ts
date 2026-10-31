@@ -1,6 +1,6 @@
 import { browseSql, compileWhere, deleteSql, insertSql, isNumericType, updateSql } from "./sql";
 import {
-  COMMIT_RULE,
+  commitRule,
   type Cell,
   type Change,
   type Column,
@@ -104,7 +104,7 @@ export function queryPage(store: TableStore, request: PageRequest): PageOutcome 
   if (store.readError) return { ok: false, error: store.readError, sql, emptyMatch: false };
   if (!where.ok) return { ok: false, error: where.error, sql, emptyMatch: false };
   if (request.sort && !columnOf(store.schema, request.sort.column)) {
-    return { ok: false, error: `未知排序列 ${request.sort.column}`, sql: "", emptyMatch: false };
+    return { ok: false, error: tr("grid.sql.unknownSortColumn", { column: request.sort.column }), sql: "", emptyMatch: false };
   }
   let rows = store.rows.filter((row) =>
     request.filters.every((filter) => {
@@ -170,7 +170,7 @@ function fail(steps: CommitStep[], changeId: string, sql: string, message: strin
     failed: { id: changeId, sql, label: changeId, message },
     pendingIds,
     rolledBack: false,
-    rule: COMMIT_RULE,
+    rule: commitRule(),
   };
 }
 
@@ -180,31 +180,31 @@ export function commitChanges(store: TableStore, changes: readonly Change[]): Co
     const change = changes[index]!;
     const pendingIds = changes.slice(index).map((item) => item.id);
     if (store.schema.kind !== "table") {
-      return fail(applied, change.id, "", "只有数据表可以新增、修改或删除，视图不行", pendingIds);
+      return fail(applied, change.id, "", tr("grid.errors.onlyTableEditFull"), pendingIds);
     }
     if (change.kind === "update") {
       const row = store.rows.find((item) => item.id === change.rowId);
-      if (!row?.located || !row.locator) return fail(applied, change.id, "", "无法唯一确定这一行，不能修改", pendingIds);
+      if (!row?.located || !row.locator) return fail(applied, change.id, "", tr("grid.errors.cannotLocate"), pendingIds);
       const hits = store.rows.filter((item) => sameLocator(item.locator, row.locator));
       const sql = updateSql(store.schema, change.sets, row.locator.columns, row.locator.values);
-      if (hits.length !== 1) return fail(applied, change.id, sql, `影响 ${hits.length} 行，已停止。已成功的语句不撤销。`, pendingIds);
+      if (hits.length !== 1) return fail(applied, change.id, sql, tr("grid.commit.affectedRows", { n: hits.length }), pendingIds);
       const next = mergedCells(row, change.sets);
       const conflict = uniqueConflict(store.schema, store.rows, next, row.id);
       if (conflict) return fail(applied, change.id, sql, conflict, pendingIds);
       row.cells = next;
       refreshLocated(store.schema, store.rows);
-      applied.push({ id: change.id, sql, label: `修改 ${row.id}` });
+      applied.push({ id: change.id, sql, label: tr("grid.commit.labelUpdate", { id: row.id }) });
       continue;
     }
     if (change.kind === "delete") {
       const row = store.rows.find((item) => item.id === change.rowId);
-      if (!row?.located || !row.locator) return fail(applied, change.id, "", "无法唯一确定这一行，不能删除", pendingIds);
+      if (!row?.located || !row.locator) return fail(applied, change.id, "", tr("grid.errors.cannotLocateDelete"), pendingIds);
       const hits = store.rows.filter((item) => sameLocator(item.locator, row.locator));
       const sql = deleteSql(store.schema, row.locator.columns, row.locator.values);
-      if (hits.length !== 1) return fail(applied, change.id, sql, `影响 ${hits.length} 行，已停止。已成功的语句不撤销。`, pendingIds);
+      if (hits.length !== 1) return fail(applied, change.id, sql, tr("grid.commit.affectedRows", { n: hits.length }), pendingIds);
       store.rows = store.rows.filter((item) => item.id !== row.id);
       refreshLocated(store.schema, store.rows);
-      applied.push({ id: change.id, sql, label: `删除 ${row.id}` });
+      applied.push({ id: change.id, sql, label: tr("grid.commit.labelDelete", { id: row.id }) });
       continue;
     }
     const draft: Record<string, Cell | undefined> = { ...change.values };
@@ -213,7 +213,7 @@ export function commitChanges(store: TableStore, changes: readonly Change[]): Co
     }
     for (const column of store.schema.columns) {
       if (!column.nullable && !column.auto && draft[column.name] === undefined) {
-        return fail(applied, change.id, insertSql(store.schema, draft), `新增行缺少必填字段 ${column.name}`, pendingIds);
+        return fail(applied, change.id, insertSql(store.schema, draft), tr("grid.commit.insertMissingColumn", { column: column.name }), pendingIds);
       }
     }
     const conflict = uniqueConflict(store.schema, store.rows, draft, null);
@@ -227,9 +227,9 @@ export function commitChanges(store: TableStore, changes: readonly Change[]): Co
     const row: Row = { id: change.id, cells, locator: null, located: false };
     store.rows.push(row);
     refreshLocated(store.schema, store.rows);
-    applied.push({ id: change.id, sql, label: "新增 1 行" });
+    applied.push({ id: change.id, sql, label: tr("grid.commit.labelInsert") });
   }
-  return { applied, failed: null, pendingIds: [], rolledBack: false, rule: COMMIT_RULE };
+  return { applied, failed: null, pendingIds: [], rolledBack: false, rule: commitRule() };
 }
 
 /** 查询结果的查找和排序只接收已经读入的行，不会回表。 */
@@ -248,5 +248,7 @@ export function viewLoadedRows(rows: readonly Row[], columns: readonly Column[],
     const column = columns.find((item) => item.name === sort.column);
     next.sort((left, right) => compareCells(column, left.cells[sort.column] ?? null, right.cells[sort.column] ?? null) * (sort.direction === "desc" ? -1 : 1));
   }
-  return { rows: next, note: `仅作用于已读取的 ${rows.length} 行` };
+  return { rows: next, note: tr("grid.scope.loadedOnly", { n: rows.length }) };
 }
+
+import { tr } from "../i18n";

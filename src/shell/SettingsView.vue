@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { ListboxOption } from "../ui/types";
+import { tr as t } from "../i18n";
 import Listbox from "../ui/Listbox.vue";
-import { ABOUT_ABSENT, ABOUT_FACTS, ABOUT_TAGLINE, PRODUCT_LICENSE, PRODUCT_TITLE, PRODUCT_VERSION } from "./product";
-import { EDITOR_THEMES, localDataPathLabel, type EditorTheme, type ShellSettings } from "./settings";
+import { aboutAbsent, aboutFacts, aboutTagline, productTitle, PRODUCT_LICENSE, PRODUCT_VERSION } from "./product";
+import { EDITOR_THEMES, localDataPathLabel, type AppLocale, type EditorTheme, type ShellSettings } from "./settings";
 import { detectMac } from "./shortcuts";
 import BrandMark from "./BrandMark.vue";
 import Icon from "./Icon.vue";
@@ -17,9 +18,9 @@ const linux = !mac && /Linux/i.test(globalThis.navigator?.userAgent ?? "");
 const pathLabel = computed(() => props.dataDir || localDataPathLabel(mac, linux));
 
 const themes: { id: ThemePreference; label: string; icon: "sun" | "moon" | "monitor" }[] = [
-  { id: "light", label: "浅色", icon: "sun" },
-  { id: "dark", label: "深色", icon: "moon" },
-  { id: "system", label: "跟随系统", icon: "monitor" },
+  { id: "light", label: "shell.theme.light", icon: "sun" },
+  { id: "dark", label: "shell.theme.dark", icon: "moon" },
+  { id: "system", label: "shell.theme.system", icon: "monitor" },
 ];
 
 function scrollSection(id: string) { document.getElementById(id)?.scrollIntoView({ block: "start" }); }
@@ -30,24 +31,28 @@ function setTheme(theme: ThemePreference) {
 function setDensity(density: Density) {
   emit("change", { density });
 }
-const fontOptions: ListboxOption[] = [12, 13, 14, 15, 16].map((size) => ({ value: String(size), label: `${size} px` }));
-const pageOptions: ListboxOption[] = [50, 100, 200, 500].map((size) => ({ value: String(size), label: `${size} 行` }));
-const previewOptions: ListboxOption[] = [1, 4, 16].map((size) => ({ value: String(size), label: `${size} KB` }));
-const objectOptions: ListboxOption[] = [100, 200, 500].map((size) => ({ value: String(size), label: `${size} 个` }));
-const timeoutOptions: ListboxOption[] = [0, 10, 30, 60, 300].map((sec) => ({ value: String(sec), label: sec === 0 ? "不限制" : `${sec} 秒` }));
-const nullOptions: ListboxOption[] = [
+const fontOptions = computed<ListboxOption[]>(() => [12, 13, 14, 15, 16].map((size) => ({ value: String(size), label: `${size} px` })));
+const pageOptions = computed<ListboxOption[]>(() => [50, 100, 200, 500].map((size) => ({ value: String(size), label: t("common.rowsUnit", { n: size }) })));
+const previewOptions = computed<ListboxOption[]>(() => [1, 4, 16].map((size) => ({ value: String(size), label: `${size} KB` })));
+const objectOptions = computed<ListboxOption[]>(() => [100, 200, 500].map((size) => ({ value: String(size), label: t("common.itemsUnit", { n: size }) })));
+const timeoutOptions = computed<ListboxOption[]>(() => [0, 10, 30, 60, 300].map((sec) => ({ value: String(sec), label: sec === 0 ? t("common.unlimited") : t("common.secondsUnit", { n: sec }) })));
+const nullOptions = computed<ListboxOption[]>(() => [
   { value: "NULL", label: "NULL" },
-  { value: "empty", label: "空文本" },
+  { value: "empty", label: t("common.emptyText") },
   { value: "N", label: "\\N" },
-];
+]);
 const EDITOR_THEME_LABELS: Record<EditorTheme, string> = {
-  auto: "跟随主题",
-  contrast: "高对比",
-  warm: "暖色",
-  cool: "冷色",
-  mono: "弱化灰阶",
+  auto: "shell.settings.editorThemeAuto",
+  contrast: "shell.settings.editorThemeContrast",
+  warm: "shell.settings.editorThemeWarm",
+  cool: "shell.settings.editorThemeCool",
+  mono: "shell.settings.editorThemeMono",
 };
-const editorThemeOptions: ListboxOption[] = EDITOR_THEMES.map((theme) => ({ value: theme, label: EDITOR_THEME_LABELS[theme] }));
+const editorThemeOptions = computed<ListboxOption[]>(() => EDITOR_THEMES.map((theme) => ({ value: theme, label: t(EDITOR_THEME_LABELS[theme]) })));
+const localeOptions = computed<ListboxOption[]>(() => [
+  { value: "zh-CN", label: t("common.localeZh") },
+  { value: "en", label: t("common.localeEn") },
+]);
 
 function onNumber(key: "editorFont" | "pageSize" | "previewKB" | "objectPage" | "queryTimeoutSec", value: string) {
   const next = Number(value);
@@ -60,6 +65,9 @@ function onNullCopy(value: string) {
 function onEditorTheme(value: string) {
   if (EDITOR_THEMES.includes(value as EditorTheme)) emit("change", { editorTheme: value as EditorTheme });
 }
+function onLocale(value: string) {
+  if (value === "zh-CN" || value === "en") emit("change", { locale: value as AppLocale });
+}
 </script>
 
 <template>
@@ -67,133 +75,142 @@ function onEditorTheme(value: string) {
     <div class="page-inner narrow">
       <div class="page-head">
         <div>
-          <h1>设置</h1>
-          <p>修改立即生效，只保存在本机。</p>
+          <h1>{{ t("shell.settings.title") }}</h1>
+          <p>{{ t("shell.settings.subtitle") }}</p>
         </div>
       </div>
-      <nav class="settings-nav" aria-label="设置分区"><button class="btn sm" @click="scrollSection('appearance')">外观</button><button class="btn sm" @click="scrollSection('reading')">数据读取</button><button class="btn sm" @click="scrollSection('behavior')">执行与复制</button><button class="btn sm" @click="scrollSection('local')">本机数据</button></nav>
+      <nav class="settings-nav" :aria-label="t('shell.settings.navLabel')"><button class="btn sm" @click="scrollSection('appearance')">{{ t("shell.settings.navAppearance") }}</button><button class="btn sm" @click="scrollSection('reading')">{{ t("shell.settings.navReading") }}</button><button class="btn sm" @click="scrollSection('behavior')">{{ t("shell.settings.navBehavior") }}</button><button class="btn sm" @click="scrollSection('local')">{{ t("shell.settings.navLocal") }}</button></nav>
       <section id="appearance" class="set-sec">
-        <h2><Icon name="sliders" />外观</h2>
+        <h2><Icon name="sliders" />{{ t("shell.settings.navAppearance") }}</h2>
         <div class="set-row">
           <div class="set-text">
-            <h4>主题</h4>
-            <p>编辑器、表格和对话框同步切换。颜色从不作为唯一的信息来源。</p>
+            <h4>{{ t("shell.settings.theme") }}</h4>
+            <p>{{ t("shell.settings.themeHint") }}</p>
           </div>
           <div class="set-ctl">
             <div class="theme-cards">
               <label v-for="item in themes" :key="item.id" class="theme-card" :class="{ on: settings.theme === item.id }">
                 <input type="radio" name="set-theme" :value="item.id" :checked="settings.theme === item.id" @change="setTheme(item.id)" />
                 <span class="tc-prev" :class="`tc-${item.id}`"><i></i><i></i><i></i></span>
-                <span><Icon :name="item.icon" />{{ item.label }}</span>
+                <span><Icon :name="item.icon" />{{ t(item.label) }}</span>
               </label>
             </div>
           </div>
         </div>
         <div class="set-row">
           <div class="set-text">
-            <h4>界面密度</h4>
-            <p>行高与控件尺寸分三档：紧凑在大屏一次读更多行，标准均衡易点按，宽松进一步放宽行距。</p>
+            <h4>{{ t("shell.settings.density") }}</h4>
+            <p>{{ t("shell.settings.densityHint") }}</p>
           </div>
           <div class="set-ctl">
             <div class="seg-radio">
               <label :class="{ on: settings.density === 'compact' }">
-                <input type="radio" name="set-density" value="compact" :checked="settings.density === 'compact'" @change="setDensity('compact')" />紧凑
+                <input type="radio" name="set-density" value="compact" :checked="settings.density === 'compact'" @change="setDensity('compact')" />{{ t("shell.settings.densityCompact") }}
               </label>
               <label :class="{ on: settings.density === 'standard' }">
-                <input type="radio" name="set-density" value="standard" :checked="settings.density === 'standard'" @change="setDensity('standard')" />标准
+                <input type="radio" name="set-density" value="standard" :checked="settings.density === 'standard'" @change="setDensity('standard')" />{{ t("shell.settings.densityStandard") }}
               </label>
               <label :class="{ on: settings.density === 'relaxed' }">
-                <input type="radio" name="set-density" value="relaxed" :checked="settings.density === 'relaxed'" @change="setDensity('relaxed')" />宽松
+                <input type="radio" name="set-density" value="relaxed" :checked="settings.density === 'relaxed'" @change="setDensity('relaxed')" />{{ t("shell.settings.densityRelaxed") }}
               </label>
             </div>
           </div>
         </div>
         <div class="set-row">
           <div class="set-text">
-            <h4>编辑器字号</h4>
-            <p>同时影响 SQL 编辑器的行高。</p>
+            <h4>{{ t("shell.settings.language") }}</h4>
+            <p>{{ t("shell.settings.languageHint") }}</p>
           </div>
           <div class="set-ctl">
-            <Listbox :model-value="String(settings.editorFont)" :options="fontOptions" aria-label="编辑器字号" @update:model-value="onNumber('editorFont', $event)" />
+            <Listbox :model-value="settings.locale" :options="localeOptions" :aria-label="t('shell.settings.language')" @update:model-value="onLocale" />
           </div>
         </div>
         <div class="set-row">
           <div class="set-text">
-            <h4>编辑器配色</h4>
-            <p>SQL 编辑器的语法高亮配色。跟随主题沿用界面的浅/深配色；其余配色只在编辑器内生效，不影响界面主题。</p>
+            <h4>{{ t("shell.settings.editorFont") }}</h4>
+            <p>{{ t("shell.settings.editorFontHint") }}</p>
           </div>
           <div class="set-ctl">
-            <Listbox :model-value="settings.editorTheme" :options="editorThemeOptions" aria-label="编辑器配色" @update:model-value="onEditorTheme" />
+            <Listbox :model-value="String(settings.editorFont)" :options="fontOptions" :aria-label="t('shell.settings.editorFont')" @update:model-value="onNumber('editorFont', $event)" />
+          </div>
+        </div>
+        <div class="set-row">
+          <div class="set-text">
+            <h4>{{ t("shell.settings.editorTheme") }}</h4>
+            <p>{{ t("shell.settings.editorThemeHint") }}</p>
+          </div>
+          <div class="set-ctl">
+            <Listbox :model-value="settings.editorTheme" :options="editorThemeOptions" :aria-label="t('shell.settings.editorTheme')" @update:model-value="onEditorTheme" />
           </div>
         </div>
       </section>
       <section id="reading" class="set-sec">
-        <h2><Icon name="table" />数据读取</h2>
+        <h2><Icon name="table" />{{ t("shell.settings.navReading") }}</h2>
         <div class="set-row">
           <div class="set-text">
-            <h4>每次读取的行数</h4>
-            <p>表格和查询结果首次读取的上限；更多行需要主动继续读取。</p>
+            <h4>{{ t("shell.settings.rowsPerPage") }}</h4>
+            <p>{{ t("shell.settings.rowsPerPageHint") }}</p>
           </div>
           <div class="set-ctl">
-            <Listbox :model-value="String(settings.pageSize)" :options="pageOptions" aria-label="每次读取的行数" @update:model-value="onNumber('pageSize', $event)" />
+            <Listbox :model-value="String(settings.pageSize)" :options="pageOptions" :aria-label="t('shell.settings.rowsPerPage')" @update:model-value="onNumber('pageSize', $event)" />
           </div>
         </div>
         <div class="set-row">
           <div class="set-text">
-            <h4>大字段预览上限</h4>
-            <p>超过上限的值只显示预览，完整内容按需读取。</p>
+            <h4>{{ t("shell.settings.previewLimit") }}</h4>
+            <p>{{ t("shell.settings.previewLimitHint") }}</p>
           </div>
           <div class="set-ctl">
-            <Listbox :model-value="String(settings.previewKB)" :options="previewOptions" aria-label="大字段预览上限" @update:model-value="onNumber('previewKB', $event)" />
+            <Listbox :model-value="String(settings.previewKB)" :options="previewOptions" :aria-label="t('shell.settings.previewLimit')" @update:model-value="onNumber('previewKB', $event)" />
           </div>
         </div>
         <div class="set-row">
           <div class="set-text">
-            <h4>对象列表每次显示</h4>
-            <p>对象很多时分批显示，避免一次加载全部。</p>
+            <h4>{{ t("shell.settings.objectPage") }}</h4>
+            <p>{{ t("shell.settings.objectPageHint") }}</p>
           </div>
           <div class="set-ctl">
-            <Listbox :model-value="String(settings.objectPage)" :options="objectOptions" aria-label="对象列表每次显示" @update:model-value="onNumber('objectPage', $event)" />
+            <Listbox :model-value="String(settings.objectPage)" :options="objectOptions" :aria-label="t('shell.settings.objectPage')" @update:model-value="onNumber('objectPage', $event)" />
           </div>
         </div>
       </section>
       <section id="behavior" class="set-sec">
-        <h2><Icon name="play" />执行与复制</h2>
+        <h2><Icon name="play" />{{ t("shell.settings.navBehavior") }}</h2>
         <div class="set-row">
           <div class="set-text">
-            <h4>语句执行超时</h4>
-            <p>单条语句超过上限时由数据库中止，整批结束后设置自动复位。仅对 PostgreSQL、MySQL、MariaDB 生效；MySQL 只限制 SELECT。</p>
+            <h4>{{ t("shell.settings.timeout") }}</h4>
+            <p>{{ t("shell.settings.timeoutHint") }}</p>
           </div>
           <div class="set-ctl">
-            <Listbox :model-value="String(settings.queryTimeoutSec)" :options="timeoutOptions" aria-label="语句执行超时" @update:model-value="onNumber('queryTimeoutSec', $event)" />
+            <Listbox :model-value="String(settings.queryTimeoutSec)" :options="timeoutOptions" :aria-label="t('shell.settings.timeout')" @update:model-value="onNumber('queryTimeoutSec', $event)" />
           </div>
         </div>
         <div class="set-row">
           <div class="set-text">
-            <h4>复制 NULL 时写入</h4>
-            <p>“复制值”时 NULL 写成什么文本。“复制为 SQL 值”始终区分 NULL 与空字符串。</p>
+            <h4>{{ t("shell.settings.nullCopy") }}</h4>
+            <p>{{ t("shell.settings.nullCopyHint") }}</p>
           </div>
           <div class="set-ctl">
-            <Listbox :model-value="settings.nullCopy" :options="nullOptions" aria-label="复制 NULL 时写入" @update:model-value="onNullCopy" />
+            <Listbox :model-value="settings.nullCopy" :options="nullOptions" :aria-label="t('shell.settings.nullCopy')" @update:model-value="onNullCopy" />
           </div>
         </div>
       </section>
       <section id="local" class="set-sec">
-        <h2><Icon name="lock" />本机数据</h2>
+        <h2><Icon name="lock" />{{ t("shell.settings.navLocal") }}</h2>
         <div class="set-row">
           <div class="set-text">
-            <h4>配置与历史的位置</h4>
-            <p>连接配置、查询历史和已信任的 SSH 主机密钥保存在本机的一个 SQLite 文件中；密码不在其中。</p>
+            <h4>{{ t("shell.settings.localTitle") }}</h4>
+            <p>{{ t("shell.settings.localHint") }}</p>
           </div>
           <div class="set-ctl"><code class="path">{{ pathLabel }}</code></div>
         </div>
         <div class="set-row">
           <div class="set-text">
-            <h4>键盘快捷键</h4>
-            <p>全部快捷键都可以在界面中找到。</p>
+            <h4>{{ t("shell.settings.shortcutsTitle") }}</h4>
+            <p>{{ t("shell.settings.shortcutsHint") }}</p>
           </div>
           <div class="set-ctl">
-            <button class="btn" type="button" @click="emit('help')"><Icon name="keyboard" />查看快捷键</button>
+            <button class="btn" type="button" @click="emit('help')"><Icon name="keyboard" />{{ t("shell.settings.viewShortcuts") }}</button>
           </div>
         </div>
       </section>
@@ -201,12 +218,12 @@ function onEditorTheme(value: string) {
         <div class="about-card">
           <BrandMark large />
           <div>
-            <h3>{{ PRODUCT_TITLE }}</h3>
-            <p>版本 {{ PRODUCT_VERSION }} · {{ PRODUCT_LICENSE }}</p>
-            <p class="muted sm">{{ ABOUT_TAGLINE }}</p>
-            <p class="about-absent">{{ ABOUT_ABSENT }}</p>
+            <h3>{{ productTitle() }}</h3>
+            <p>{{ t("shell.settings.version", { version: PRODUCT_VERSION, license: PRODUCT_LICENSE }) }}</p>
+            <p class="muted sm">{{ aboutTagline() }}</p>
+            <p class="about-absent">{{ aboutAbsent() }}</p>
             <ul class="about-facts">
-              <li v-for="fact in ABOUT_FACTS" :key="fact"><Icon name="check" />{{ fact }}</li>
+              <li v-for="fact in aboutFacts()" :key="fact"><Icon name="check" />{{ fact }}</li>
             </ul>
           </div>
         </div>

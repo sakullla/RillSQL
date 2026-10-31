@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { tr as t } from "../i18n";
 import { computed, reactive, ref, watch } from "vue";
 import Listbox from "../ui/Listbox.vue";
 import type { ListboxOption } from "../ui/types";
@@ -135,7 +136,7 @@ async function loadColumns(): Promise<void> {
     if (!props.open) return;
     source.columns = null;
     target.columns = null;
-    error.value = `读取表结构失败：${cause instanceof Error ? cause.message : String(cause)}`;
+    error.value = t("export.common.schemaReadFailed", { error: cause instanceof Error ? cause.message : String(cause) });
   } finally {
     source.loading = false;
     target.loading = false;
@@ -165,7 +166,7 @@ const mappingRows = computed(() => {
 });
 
 const targetColumnOptions = computed<ListboxOption[]>(() => [
-  { value: "", label: "不迁移" },
+  { value: "", label: t("export.migrate.skip") },
   ...(target.columns?.columns ?? []).map((column) => ({ value: column.name, label: column.name, hint: column.typeName })),
 ]);
 
@@ -193,9 +194,9 @@ const ready = computed(() =>
   ),
 );
 const startNote = computed(() => {
-  if (sameTable.value) return "源表和目标表是同一张表：所有行都会因主键冲突计入跳过。";
-  if (warningCount.value > 0) return `有 ${warningCount.value} 对映射存在类型差异；不兼容的行会计入失败，不会静默截断。`;
-  return "任务进入后台任务中心，可随时取消；已提交的批次保留。";
+  if (sameTable.value) return t("export.migrate.sameTable");
+  if (warningCount.value > 0) return t("export.migrate.warningCount", { n: warningCount.value });
+  return t("export.migrate.taskNote");
 });
 
 function start(): void {
@@ -251,58 +252,58 @@ watch(
 
 <template>
   <div v-if="open" class="mg-overlay" role="presentation">
-    <div class="mg-sheet" role="dialog" aria-modal="true" aria-label="跨库数据迁移">
+    <div class="mg-sheet" role="dialog" aria-modal="true" :aria-label="t('export.migrate.dialogLabel')">
       <header class="mg-head">
         <div class="mg-titles">
-          <h2>跨库数据迁移</h2>
-          <p>把源表的行搬到另一条连接的目标表。目标表必须已经存在；主键/唯一冲突会计入跳过，单行失败会记录并继续。</p>
+          <h2>{{ t("export.migrate.title") }}</h2>
+          <p>{{ t("export.migrate.subtitle") }}</p>
         </div>
-        <button class="icon-btn" type="button" aria-label="关闭" @click="emit('close')">
+        <button class="icon-btn" type="button" :aria-label="t('common.close')" @click="emit('close')">
           <svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
         </button>
       </header>
 
       <div class="mg-body">
         <p v-if="error" class="mg-alert" role="alert">{{ error }}</p>
-        <p v-if="connections.length === 0" class="mg-note">还没有已打开的连接。先到连接页打开源与目标连接。</p>
+        <p v-if="connections.length === 0" class="mg-note">{{ t("export.common.needOpenConnection", { what: t("export.common.whatBoth") }) }}</p>
         <template v-else>
           <div class="mg-sides">
             <fieldset class="mg-side">
-              <legend>源（从这里读）</legend>
-              <label class="mg-field">连接
-                <Listbox :id="'migrate-source-connection'" v-model="source.connectionId" :options="connectionOptions" aria-label="源连接" @update:model-value="onConnection(source, $event)" />
+              <legend>{{ t("export.migrate.sourceLegend") }}</legend>
+              <label class="mg-field">{{ t("export.migrate.connection") }}
+                <Listbox :id="'migrate-source-connection'" v-model="source.connectionId" :options="connectionOptions" :aria-label="t('export.migrate.sourceConnection')" @update:model-value="onConnection(source, $event)" />
               </label>
-              <label class="mg-field">库
-                <Listbox :id="'migrate-source-database'" v-model="source.database" :options="(source.connection?.databases ?? []).map((name) => ({ value: name, label: name }))" aria-label="源库" @update:model-value="onDatabase(source)" />
+              <label class="mg-field">{{ t("export.migrate.database") }}
+                <Listbox :id="'migrate-source-database'" v-model="source.database" :options="(source.connection?.databases ?? []).map((name) => ({ value: name, label: name }))" :aria-label="t('export.migrate.sourceDatabase')" @update:model-value="onDatabase(source)" />
               </label>
               <label v-if="source.schemaOptions.length > 0" class="mg-field">schema
-                <Listbox :id="'migrate-source-schema'" v-model="source.schema" :options="source.schemaOptions" aria-label="源 schema" @update:model-value="onSchema(source)" />
+                <Listbox :id="'migrate-source-schema'" v-model="source.schema" :options="source.schemaOptions" :aria-label="t('export.migrate.sourceSchema')" @update:model-value="onSchema(source)" />
               </label>
-              <label class="mg-field">表
-                <Listbox :id="'migrate-source-table'" v-model="source.table" :options="source.tableOptions" aria-label="源表" @update:model-value="onTable(source)" />
+              <label class="mg-field">{{ t("export.migrate.table") }}
+                <Listbox :id="'migrate-source-table'" v-model="source.table" :options="source.tableOptions" :aria-label="t('export.migrate.sourceTable')" @update:model-value="onTable(source)" />
               </label>
             </fieldset>
             <fieldset class="mg-side">
-              <legend>目标（往这里写）</legend>
-              <label class="mg-field">连接
-                <Listbox :id="'migrate-target-connection'" v-model="target.connectionId" :options="connectionOptions" aria-label="目标连接" @update:model-value="onConnection(target, $event)" />
+              <legend>{{ t("export.migrate.targetLegend") }}</legend>
+              <label class="mg-field">{{ t("export.migrate.connection") }}
+                <Listbox :id="'migrate-target-connection'" v-model="target.connectionId" :options="connectionOptions" :aria-label="t('export.migrate.targetConnection')" @update:model-value="onConnection(target, $event)" />
               </label>
-              <label class="mg-field">库
-                <Listbox :id="'migrate-target-database'" v-model="target.database" :options="(target.connection?.databases ?? []).map((name) => ({ value: name, label: name }))" aria-label="目标库" @update:model-value="onDatabase(target)" />
+              <label class="mg-field">{{ t("export.migrate.database") }}
+                <Listbox :id="'migrate-target-database'" v-model="target.database" :options="(target.connection?.databases ?? []).map((name) => ({ value: name, label: name }))" :aria-label="t('export.migrate.targetDatabase')" @update:model-value="onDatabase(target)" />
               </label>
               <label v-if="target.schemaOptions.length > 0" class="mg-field">schema
-                <Listbox :id="'migrate-target-schema'" v-model="target.schema" :options="target.schemaOptions" aria-label="目标 schema" @update:model-value="onSchema(target)" />
+                <Listbox :id="'migrate-target-schema'" v-model="target.schema" :options="target.schemaOptions" :aria-label="t('export.migrate.targetSchema')" @update:model-value="onSchema(target)" />
               </label>
-              <label class="mg-field">表
-                <Listbox :id="'migrate-target-table'" v-model="target.table" :options="target.tableOptions" aria-label="目标表" @update:model-value="onTable(target)" />
+              <label class="mg-field">{{ t("export.migrate.table") }}
+                <Listbox :id="'migrate-target-table'" v-model="target.table" :options="target.tableOptions" :aria-label="t('export.migrate.targetTable')" @update:model-value="onTable(target)" />
               </label>
             </fieldset>
           </div>
 
-          <p v-if="source.table && target.table && source.loading" class="mg-note">正在读取两边的表结构…</p>
+          <p v-if="source.table && target.table && source.loading" class="mg-note">{{ t("export.migrate.loadingBoth") }}</p>
           <template v-if="mappingRows.length > 0">
             <fieldset class="mg-mapping">
-              <legend>列映射（{{ mappedCount }} / {{ mappingRows.length }} 列迁移）</legend>
+              <legend>{{ t("export.migrate.mappingLegend", { mapped: mappedCount, total: mappingRows.length }) }}</legend>
               <div v-for="row in mappingRows" :key="row.column.name" class="mg-map-row">
                 <span class="mg-map-src" :title="row.column.typeName">{{ row.column.name }}<em>{{ row.column.typeName }}</em></span>
                 <span class="mg-map-arrow" aria-hidden="true">→</span>
@@ -310,7 +311,7 @@ watch(
                   :id="`migrate-map-${row.column.name}`"
                   :model-value="row.targetName"
                   :options="targetColumnOptions"
-                  :aria-label="`源列 ${row.column.name} 映射到哪一列`"
+                  :aria-label="t('export.migrate.mapAria', { column: row.column.name })"
                   @update:model-value="mapping[row.column.name] = String($event ?? '')"
                 />
                 <span v-if="row.targetName && row.hint" class="mg-hint" role="note">{{ row.hint }}</span>
@@ -318,19 +319,19 @@ watch(
               </div>
             </fieldset>
 
-            <label class="mg-check"><input v-model="acknowledged" type="checkbox" /> 确认向目标表写入数据（目标表已有的主键/唯一冲突行会计入跳过）</label>
-            <label v-if="warningCount > 0" class="mg-check"><input v-model="warned" type="checkbox" /> 已了解类型差异：不兼容的行会计入失败，不会静默截断</label>
+            <label class="mg-check"><input v-model="acknowledged" type="checkbox" /> {{ t("export.migrate.ackWrite") }}</label>
+            <label v-if="warningCount > 0" class="mg-check"><input v-model="warned" type="checkbox" /> {{ t("export.migrate.ackTypes") }}</label>
             <p class="mg-note">{{ startNote }}</p>
           </template>
-          <p v-else-if="source.table && target.table && !source.loading && !error" class="mg-note">源表没有读到列。</p>
+          <p v-else-if="source.table && target.table && !source.loading && !error" class="mg-note">{{ t("export.migrate.sourceNoColumns") }}</p>
         </template>
       </div>
 
       <footer class="mg-foot">
-        <span class="muted sm">迁移任务进入后台任务中心，可取消；完成后报告插入/跳过/失败数。</span>
+        <span class="muted sm">{{ t("export.migrate.taskDoneNote") }}</span>
         <span class="grow"></span>
-        <button class="btn" type="button" @click="emit('close')">取消</button>
-        <button class="btn primary" type="button" :disabled="!ready" @click="start">{{ starting ? "正在启动…" : "开始迁移" }}</button>
+        <button class="btn" type="button" @click="emit('close')">{{ t("common.cancel") }}</button>
+        <button class="btn primary" type="button" :disabled="!ready" @click="start">{{ starting ? t("export.migrate.starting") : t("export.migrate.start") }}</button>
       </footer>
     </div>
   </div>

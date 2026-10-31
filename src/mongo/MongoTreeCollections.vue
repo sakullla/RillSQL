@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { tr as t } from "../i18n";
 import type { CatalogConnection } from "../catalog/types";
 
 const props = defineProps<{ connection: CatalogConnection }>();
@@ -58,7 +59,7 @@ function openCollection(database: string, collection: string) {
           <span class="tr-meta">{{ estimateText(collection.estimated) }}</span>
         </button>
         <div v-if="collections(database.name).length === 0" class="tree-note" :style="{ '--d': 2 }" :data-database="database.name" data-collection-empty>
-          <span>没有集合</span>
+          <span>{{ t("mongo.tab.noCollections") }}</span>
         </div>
       </template>
     </template>

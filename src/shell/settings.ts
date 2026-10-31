@@ -3,12 +3,15 @@ import type { Density, ThemePreference } from "./theme";
 export type NullCopy = "NULL" | "empty" | "N";
 /** SQL 编辑器配色：auto 跟随全局浅/深主题（现状默认配色），其余为 tokens.css 的命名变量组。 */
 export type EditorTheme = "auto" | "contrast" | "warm" | "cool" | "mono";
+/** 界面语言（R6）：默认简体中文，提供完整英文包；不承诺其他语言。 */
+export type AppLocale = "zh-CN" | "en";
 
 export interface ShellSettings {
   theme: ThemePreference;
   density: Density;
   editorFont: number;
   editorTheme: EditorTheme;
+  locale: AppLocale;
   pageSize: number;
   previewKB: number;
   objectPage: number;
@@ -22,6 +25,7 @@ export const DEFAULT_SETTINGS: ShellSettings = {
   density: "compact",
   editorFont: 13,
   editorTheme: "auto",
+  locale: "zh-CN",
   pageSize: 100,
   previewKB: 1,
   objectPage: 100,
@@ -43,17 +47,23 @@ export function normalizeEditorTheme(value: unknown): EditorTheme {
   return EDITOR_THEMES.includes(value as EditorTheme) ? (value as EditorTheme) : DEFAULT_SETTINGS.editorTheme;
 }
 
+export function normalizeLocale(value: unknown): AppLocale {
+  return value === "en" ? "en" : value === "zh-CN" ? "zh-CN" : DEFAULT_SETTINGS.locale;
+}
+
 export function loadSettings(storage: Storage | null = safeStorage()): ShellSettings {
   if (!storage) return { ...DEFAULT_SETTINGS };
   try {
     const raw = storage.getItem(STORAGE_KEY);
     if (!raw) return { ...DEFAULT_SETTINGS };
-    const parsed = JSON.parse(raw) as Omit<Partial<ShellSettings>, "density" | "editorTheme"> & { density?: string; editorTheme?: string };
+    const parsed = JSON.parse(raw) as Omit<Partial<ShellSettings>, "density" | "editorTheme" | "locale"> & { density?: string; editorTheme?: string; locale?: string };
     // 密度归一入口：历史值 comfortable 归到 standard，未知/缺失值归到默认档，避免样式选择器失配。
     const density: Density = normalizeDensity(parsed.density);
     // 编辑器配色同走归一：未知/缺失值归到 auto（跟随全局），避免 tokens.css 变量组选择器失配。
     const editorTheme: EditorTheme = normalizeEditorTheme(parsed.editorTheme);
-    return { ...DEFAULT_SETTINGS, ...parsed, density, editorTheme };
+    // 语言归一：未知/缺失值归到 zh-CN（默认中文），避免字典查找落空。
+    const locale: AppLocale = normalizeLocale(parsed.locale);
+    return { ...DEFAULT_SETTINGS, ...parsed, density, editorTheme, locale };
   } catch {
     return { ...DEFAULT_SETTINGS };
   }

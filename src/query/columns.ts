@@ -72,22 +72,22 @@ export function cachedColumns(connectionId: string, database: string): { label: 
 }
 
 export function fieldFailureNote(label: string, error: string): string {
-  return `读取 ${label} 的字段失败（${error}）：字段不可用，不会猜测字段名。`;
+  return tr("query.columns.readFailed", { label, error });
 }
 
 export function unknownFieldNote(name: string): string {
-  const shown = name || "点号前的名字";
-  return `“${shown}”不是当前目标已读取的表或视图：字段不可用，不会猜测字段名。`;
+  const shown = name || tr("query.columns.dotName");
+  return tr("query.columns.unknownTable", { name: shown });
 }
 
 export function ambiguousFieldNote(name: string): string {
-  return `“${name}”匹配到多张已读取的表或视图：请写成“模式.名称.”后再补全字段。不会猜测字段名。`;
+  return tr("query.columns.ambiguousTable", { name });
 }
 
 function errorText(err: unknown): string {
   if (typeof err === "string" && err.trim()) return err;
   if (err instanceof Error && err.message.trim()) return err.message;
-  return "读取字段失败";
+  return tr("query.columns.failed");
 }
 
 export async function loadFields(input: {
@@ -124,3 +124,5 @@ export async function loadFields(input: {
     return entry;
   }
 }
+
+import { tr } from "../i18n";

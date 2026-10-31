@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { tr } from "../i18n";
 import type { MenuItem } from "./types";
 
 const props = withDefaults(
   defineProps<{ open: boolean; x: number; y: number; items: MenuItem[]; label?: string }>(),
-  { label: "操作" },
+  { label: undefined },
 );
 
 const emit = defineEmits<{ close: []; select: [id: string] }>();
@@ -131,7 +132,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", onOutside, tru
       ref="menu"
       class="menu"
       role="menu"
-      :aria-label="label"
+      :aria-label="label ?? tr('common.actions')"
       :style="position"
       @click.stop
       @contextmenu.prevent

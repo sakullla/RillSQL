@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { PRODUCT_TITLE } from "./product";
+import { productTitle } from "./product";
 
 export interface AppInfo {
   title: string;
@@ -10,7 +10,7 @@ export interface AppInfo {
 }
 
 export async function syncProductIdentity(): Promise<AppInfo | null> {
-  document.title = PRODUCT_TITLE;
+  document.title = productTitle();
   try {
     const info = await invoke<AppInfo>("app_info");
     if (info.title) document.title = info.title;

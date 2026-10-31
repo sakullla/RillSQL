@@ -3,8 +3,8 @@ import { chordParts, formatChord, globalChord, isMacPlatform, SHORTCUTS, shortcu
 
 describe("desktop shortcuts", () => {
   it("uses platform tab shortcuts instead of the prototype browser keys", () => {
-    expect(globalChord("新建查询")).toBe("Mod+T");
-    expect(globalChord("关闭当前标签")).toBe("Mod+W");
+    expect(globalChord("new-query")).toBe("Mod+T");
+    expect(globalChord("close-tab")).toBe("Mod+W");
     const chords = SHORTCUTS.map((item) => item.chord);
     expect(chords).not.toContain("Alt+W");
     expect(chords).not.toContain("Mod+Alt+N");

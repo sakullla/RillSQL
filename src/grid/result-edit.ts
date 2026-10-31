@@ -40,15 +40,15 @@ type Token = { kind: "word" | "ident" | "punct" | "string"; text: string; source
 
 const CLAUSES = new Set(["WHERE", "ORDER", "LIMIT", "OFFSET", "FETCH", "FOR", "BY", "AND", "OR", "AS", "ASC", "DESC", "NULLS", "FIRST", "LAST", "ONLY", "ROWS", "ROW", "NEXT", "TIES", "SHARE", "NOWAIT", "SKIP", "LOCKED", "OF", "INTO"]);
 const FORBIDDEN: Record<string, string> = {
-  JOIN: "结果包含 JOIN，不能唯一确定一行。",
-  UNION: "结果包含 UNION，不能唯一确定一行。",
-  INTERSECT: "结果包含 INTERSECT，不能唯一确定一行。",
-  EXCEPT: "结果包含 EXCEPT，不能唯一确定一行。",
-  DISTINCT: "结果包含 DISTINCT，不能唯一确定一行。",
-  GROUP: "结果包含 GROUP，不能唯一确定一行。",
-  HAVING: "结果包含 HAVING，不能唯一确定一行。",
-  WINDOW: "结果包含 WINDOW，不能唯一确定一行。",
-  INTO: "这条 SELECT 会写入数据，不能修改查询结果。",
+  JOIN: "grid.resultEdit.join",
+  UNION: "grid.resultEdit.union",
+  INTERSECT: "grid.resultEdit.intersect",
+  EXCEPT: "grid.resultEdit.except",
+  DISTINCT: "grid.resultEdit.distinct",
+  GROUP: "grid.resultEdit.group",
+  HAVING: "grid.resultEdit.having",
+  WINDOW: "grid.resultEdit.window",
+  INTO: "grid.resultEdit.into",
 };
 const AGGREGATES = new Set(["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG", "ARRAY_AGG", "JSON_AGG", "TOTAL", "EVERY", "BOOL_AND", "BOOL_OR"]);
 
@@ -196,26 +196,25 @@ function readQualifierPart(sql: string, index: number): { part: QualifierPart; e
 
 /** 点号之间的注释仍属于同一个限定名，下一段标识符不能丢掉。超过两段则无法证明单表。只被注释隔开的两个标识符不能拼成一张表。 */
 function walkQualifier(sql: string, start: number): { ok: true; parts: QualifierPart[]; end: number } | { ok: false; reason: string } {
-  const unproved = "不能确定这条 SELECT 只读取一张基表。";
   const first = readQualifierPart(sql, skipQualifierGap(sql, start));
-  if (!first) return { ok: false, reason: unproved };
-  if (!first.part.quoted && first.part.name === "only") return { ok: false, reason: unproved };
+  if (!first) return { ok: false, reason: tr("grid.resultEdit.notProvenSingleTable") };
+  if (!first.part.quoted && first.part.name === "only") return { ok: false, reason: tr("grid.resultEdit.notProvenSingleTable") };
   const parts = [first.part];
   let index = first.end;
   while (true) {
     const gap = scanQualifierGap(sql, index);
     if (sql[gap.index] === ".") {
       const next = readQualifierPart(sql, skipQualifierGap(sql, gap.index + 1));
-      if (!next) return { ok: false, reason: unproved };
+      if (!next) return { ok: false, reason: tr("grid.resultEdit.notProvenSingleTable") };
       parts.push(next.part);
       index = next.end;
-      if (parts.length > 2) return { ok: false, reason: "限定名超过两部分，不能证明只是一张基表。" };
+      if (parts.length > 2) return { ok: false, reason: tr("grid.resultEdit.qualifiedTooLong") };
       continue;
     }
     if (gap.commentOnly) {
       const next = readQualifierPart(sql, gap.index);
       if (next && (next.part.quoted || !CLAUSES.has(next.part.name.toUpperCase()))) {
-        return { ok: false, reason: unproved };
+        return { ok: false, reason: tr("grid.resultEdit.notProvenSingleTable") };
       }
     }
     break;
@@ -344,29 +343,29 @@ export function readSingleTable(sql: string, engine: Engine = "postgres"): EditP
   const scanned = preservedStatements(sql, engine);
   if (scanned.refusal) return { ok: false, reason: scanned.refusal };
   const statements = scanned.texts;
-  if (!statements.length) return { ok: false, reason: "没有可修改的语句。" };
-  if (statements.length > 1) return { ok: false, reason: "不是单条 SELECT，不能修改查询结果。" };
+  if (!statements.length) return { ok: false, reason: tr("grid.resultEdit.noEditableStatement") };
+  if (statements.length > 1) return { ok: false, reason: tr("grid.resultEdit.notSingleSelect") };
   const statement = statements[0]!;
   const tokens = tokenize(statement);
-  if (word(tokens[0]) !== "SELECT") return { ok: false, reason: "只有单条 SELECT 可以修改查询结果。" };
+  if (word(tokens[0]) !== "SELECT") return { ok: false, reason: tr("grid.resultEdit.selectOnlyEditable") };
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index]!;
     const upper = word(token);
     if (upper && FORBIDDEN[upper]) return { ok: false, reason: FORBIDDEN[upper]! };
-    if (upper && AGGREGATES.has(upper) && tokens[index + 1]?.text === "(") return { ok: false, reason: "结果包含聚合，不能唯一确定一行。" };
-    if (token.kind === "punct" && token.text === "(") return { ok: false, reason: "结果包含子查询或函数，不能证明只是一张基表。" };
+    if (upper && AGGREGATES.has(upper) && tokens[index + 1]?.text === "(") return { ok: false, reason: tr("grid.resultEdit.aggregate") };
+    if (token.kind === "punct" && token.text === "(") return { ok: false, reason: tr("grid.resultEdit.subquery") };
   }
   const fromAt = tokens.findIndex((token) => word(token) === "FROM");
   if (fromAt < 0 || tokens.findIndex((token, index) => index > fromAt && word(token) === "FROM") >= 0) {
-    return { ok: false, reason: "不能确定这条 SELECT 只读取一张基表。" };
+    return { ok: false, reason: tr("grid.resultEdit.notProvenSingleTable") };
   }
   const fromToken = tokens[fromAt];
-  if (!fromToken) return { ok: false, reason: "不能确定这条 SELECT 只读取一张基表。" };
+  if (!fromToken) return { ok: false, reason: tr("grid.resultEdit.notProvenSingleTable") };
   const walked = walkQualifier(statement, fromToken.at + fromToken.text.length);
   if (!walked.ok) return walked;
   const left = walked.parts[0];
   const right = walked.parts[1];
-  if (!left) return { ok: false, reason: "不能确定这条 SELECT 只读取一张基表。" };
+  if (!left) return { ok: false, reason: tr("grid.resultEdit.notProvenSingleTable") };
   let cursor = tokenFrom(tokens, fromAt + 1, walked.end);
   const table: TableRef = right
     ? { schema: left.name, table: right.name, qualifierSource: left.source }
@@ -374,7 +373,7 @@ export function readSingleTable(sql: string, engine: Engine = "postgres"): EditP
   let alias: string | null = null;
   if (word(tokens[cursor]) === "AS") {
     const name = readName(tokens[cursor + 1]);
-    if (!name) return { ok: false, reason: "不能确定这条 SELECT 只读取一张基表。" };
+    if (!name) return { ok: false, reason: tr("grid.resultEdit.notProvenSingleTable") };
     alias = name;
     cursor += 2;
   } else if ((tokens[cursor]?.kind === "word" || tokens[cursor]?.kind === "ident") && !CLAUSES.has(word(tokens[cursor])) && tokens[cursor]?.text !== ".") {
@@ -386,7 +385,7 @@ export function readSingleTable(sql: string, engine: Engine = "postgres"): EditP
     const token = tokens[index]!;
     const upper = word(token);
     if (token.kind === "punct" && token.text === ",") {
-      if (clause !== "ORDER") return { ok: false, reason: "结果包含多张表，不能唯一确定一行。" };
+      if (clause !== "ORDER") return { ok: false, reason: tr("grid.resultEdit.multiTable") };
       continue;
     }
     if (upper === "ORDER") clause = "ORDER";
@@ -403,12 +402,12 @@ function nameMatches(tableName: string, hits: readonly TableHit[], schema: strin
 function uniqueTable(matches: readonly TableHit[], unqualified: boolean): ResolvedTable {
   if (matches.length === 0) {
     return unqualified
-      ? { ok: false, reason: "SQL 没有写出模式，还不能证明只对应一张基表。" }
-      : { ok: false, reason: "不能唯一确定这一张基表。" };
+      ? { ok: false, reason: tr("grid.resultEdit.schemaMissing") }
+      : { ok: false, reason: tr("grid.resultEdit.baseTableNotUnique") };
   }
   const schemas = new Set(matches.map((hit) => hit.schema));
-  if (schemas.size > 1) return { ok: false, reason: "同名表出现在多个模式，SQL 没有写出模式，不能唯一确定行。" };
-  if (matches.length > 1) return { ok: false, reason: "同一模式里有只靠大小写区分的表，不能唯一确定行。" };
+  if (schemas.size > 1) return { ok: false, reason: tr("grid.resultEdit.sameNameMultiSchema") };
+  if (matches.length > 1) return { ok: false, reason: tr("grid.resultEdit.caseOnlyTables") };
   return { ok: true, schema: matches[0]!.schema, table: matches[0]!.name };
 }
 
@@ -417,15 +416,15 @@ export function resolveEditableTable(table: TableRef, hits: readonly TableHit[],
   if (table.schema && usesDatabaseQualifier(engine)) {
     const qualifier = table.qualifierSource ?? table.schema;
     if (!qualifierIsCurrentDatabase(engine, qualifier, database)) {
-      return { ok: false, reason: "限定名不能证明是当前数据库中的对象，结果保持只读。" };
+      return { ok: false, reason: tr("grid.resultEdit.notCurrentDatabase") };
     }
     const matches = nameMatches(table.table, hits, null);
-    if (matches.length === 0) return { ok: false, reason: "限定名是当前数据库，但还不能证明只对应一张基表。" };
+    if (matches.length === 0) return { ok: false, reason: tr("grid.resultEdit.currentDbButUnproven") };
     return uniqueTable(matches, true);
   }
   if (table.schema) {
     const scoped = nameMatches(table.table, hits, table.schema);
-    if (scoped.length > 1) return { ok: false, reason: "同一模式里有只靠大小写区分的表，不能唯一确定行。" };
+    if (scoped.length > 1) return { ok: false, reason: tr("grid.resultEdit.caseOnlyTables") };
     if (scoped.length === 1) return { ok: true, schema: scoped[0]!.schema, table: scoped[0]!.name };
     return { ok: true, schema: table.schema, table: table.table };
   }
@@ -457,20 +456,20 @@ export function provedEditableColumns(schema: TableSchema, columns: readonly Col
 }
 
 export function locateResultRows(schema: TableSchema, columns: readonly Column[], rows: readonly Row[], proof: ColumnProof | null = null): LocatedResult {
-  if (schema.kind !== "table") return { ok: false, reason: "视图是只读的，不能修改或删除数据。" };
-  if (!schema.key.length) return { ok: false, reason: "这张表没有主键，无法唯一确定已有行，所以不能修改或删除。" };
+  if (schema.kind !== "table") return { ok: false, reason: tr("grid.resultEdit.viewReadonlyEdit") };
+  if (!schema.key.length) return { ok: false, reason: tr("grid.errors.noKeyEditShort") };
   const editable = provedEditableColumns(schema, columns, proof);
   const names = proof ? new Set(editable) : new Set(columns.map((column) => column.name));
   const missing = schema.key.filter((name) => !names.has(name));
   if (missing.length) {
     const visible = missing.filter((name) => columns.some((column) => column.name === name));
-    if (proof && visible.length) return { ok: false, reason: `主键列 ${visible.join("、")} 不能证明就是基表列，无法唯一确定已有行。` };
-    return { ok: false, reason: `主键列 ${missing.join("、")} 不在结果中，无法唯一确定已有行。` };
+    if (proof && visible.length) return { ok: false, reason: tr("grid.resultEdit.keyNotBaseColumns", { columns: visible.join(", ") }) };
+    return { ok: false, reason: tr("grid.resultEdit.keyNotInResult", { columns: missing.join(", ") }) };
   }
   const merged = columns.map((column) => schema.columns.find((item) => item.name === column.name) ?? column);
   const next = rows.map(copyRow);
   refreshLocated(schema, next);
-  if (next.length > 0 && next.every((row) => !row.located)) return { ok: false, reason: "无法唯一确定已有行，不能修改或删除。" };
+  if (next.length > 0 && next.every((row) => !row.located)) return { ok: false, reason: tr("grid.resultEdit.rowsNotLocated") };
   return { ok: true, columns: merged, rows: next, editable };
 }
 
@@ -502,7 +501,7 @@ export class ResultEditSession {
   }
 
   addRow(): string {
-    return "查询结果不能新增行。";
+    return tr("grid.resultEdit.cannotInsert");
   }
 
   select(id: string, column: string | null): void {
@@ -528,20 +527,20 @@ export class ResultEditSession {
 
   stageUpdate(rowId: string, column: string, value: Cell): string | null {
     const row = this.rowById(rowId);
-    if (!row) return "找不到行";
-    if (!this.canEditColumn(column)) return "这一列不是基表列，不能修改";
+    if (!row) return tr("grid.errors.rowNotFound");
+    if (!this.canEditColumn(column)) return tr("grid.resultEdit.notBaseColumn");
     const found = this.schema.columns.find((item) => item.name === column);
-    if (!found) return "这一列不属于基表，不能修改";
+    if (!found) return tr("grid.resultEdit.notBaseTableColumn");
     const rejected = rejectWrite(found, value, row.resolved === true);
     if (rejected) return rejected;
-    if (!this.canUpdate(row)) return "无法唯一确定这一行，不能修改";
+    if (!this.canUpdate(row)) return tr("grid.resultEdit.cannotLocateRow");
     this.edits.set(rowId, { ...(this.edits.get(rowId) ?? {}), [column]: value });
     this.failures.delete(`u:${rowId}`);
     return null;
   }
 
   deleteRow(id: string): string | null {
-    if (!this.canDeleteRow(id)) return "无法唯一确定这一行，不能删除";
+    if (!this.canDeleteRow(id)) return tr("grid.errors.cannotLocateDelete");
     if (!this.deletes.includes(id)) this.deletes.push(id);
     this.edits.delete(id);
     this.failures.delete(`u:${id}`);
@@ -569,7 +568,7 @@ export class ResultEditSession {
     return this.changes().map((change) => ({
       id: change.id,
       sql: this.sqlFor(change),
-      label: change.kind === "delete" ? `删除 ${change.rowId}` : `修改 ${change.rowId}`,
+      label: change.kind === "delete" ? tr("grid.commit.labelDelete", { id: change.rowId }) : tr("grid.commit.labelUpdate", { id: change.rowId }),
     }));
   }
 
@@ -636,3 +635,5 @@ export class ResultEditSession {
     return updateSql(this.schema, change.sets ?? {}, row.locator.columns, row.locator.values);
   }
 }
+
+import { tr } from "../i18n";

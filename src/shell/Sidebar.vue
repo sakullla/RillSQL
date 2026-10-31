@@ -4,6 +4,7 @@ import ExplorerTree from "../catalog/ExplorerTree.vue";
 import type { DiagramOpen } from "../diagram/types";
 import type { CatalogConnection } from "../catalog/types";
 import type { CatalogObjectRef } from "../catalog/object-ref";
+import { tr as t } from "../i18n";
 import Icon from "./Icon.vue";
 
 const props = defineProps<{ width: number }>();
@@ -72,13 +73,13 @@ function onPointerDown(event: PointerEvent) {
 </script>
 
 <template>
-  <aside class="sidebar" :style="{ width: `${width}px` }" aria-label="资源管理器">
+  <aside class="sidebar" :style="{ width: `${width}px` }" :aria-label="t('shell.sidebar.explorer')">
     <div class="sb-head">
-      <span class="sb-title">资源管理器</span>
+      <span class="sb-title">{{ t("shell.sidebar.explorer") }}</span>
     </div>
     <label class="sb-search">
       <Icon name="search" />
-      <input v-model="filter" type="search" placeholder="筛选表" aria-label="筛选表" />
+      <input v-model="filter" type="search" :placeholder="t('shell.sidebar.filterTables')" :aria-label="t('shell.sidebar.filterTables')" />
     </label>
     <ExplorerTree :filter="filter" @open-object="forwardOpen" @open-definition="forwardDefinition" @query-object="forwardQuery" @focused-database="forwardFocus" @open-diagram="forwardDiagram" @open-keys="forwardKeys" @open-docs="forwardDocs" @new-connection="emit('new-connection')" />
   </aside>
@@ -86,8 +87,8 @@ function onPointerDown(event: PointerEvent) {
     class="sb-resizer"
     role="separator"
     aria-orientation="vertical"
-    aria-label="调整资源管理器宽度"
-    title="拖动调整宽度，双击恢复默认"
+    :aria-label="t('shell.sidebar.resize')"
+    :title="t('shell.sidebar.resizeHint')"
     tabindex="0"
     :aria-valuenow="width" :aria-valuemin="200" :aria-valuemax="480"
     @keydown.left.prevent="emit('resize', Math.max(200, props.width - 20))"

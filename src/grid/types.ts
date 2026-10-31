@@ -1,4 +1,5 @@
 import type { Engine } from "../engines";
+import { tr } from "../i18n";
 
 export type { Engine };
 export type TableKind = "table" | "view" | "query";
@@ -102,7 +103,12 @@ export interface CommitReport {
   rule: string;
 }
 
-export const COMMIT_RULE = "按顺序逐条提交，遇到错误即停止；已成功的语句不撤销。";
+export function commitRule(): string {
+  return tr("grid.commit.rule");
+}
+
+/** 默认语言下的规则文案快照（测试与既有消费方使用；界面渲染处建议用 commitRule() 跟随语言）。 */
+export const COMMIT_RULE = tr("grid.commit.rule");
 
 export interface FilterOpMeta {
   id: FilterOp;
@@ -113,15 +119,15 @@ export interface FilterOpMeta {
 export const FILTER_OPS: readonly FilterOpMeta[] = [
   { id: "eq", label: "=", needsValue: true },
   { id: "ne", label: "≠", needsValue: true },
-  { id: "contains", label: "包含", needsValue: true },
-  { id: "starts", label: "开头是", needsValue: true },
+  { id: "contains", label: "grid.ops.contains", needsValue: true },
+  { id: "starts", label: "grid.ops.starts", needsValue: true },
   { id: "gt", label: ">", needsValue: true },
   { id: "lt", label: "<", needsValue: true },
-  { id: "between", label: "介于", needsValue: true },
-  { id: "in", label: "属于(in)", needsValue: true },
-  { id: "null", label: "为 NULL", needsValue: false },
-  { id: "notnull", label: "不为 NULL", needsValue: false },
-  { id: "empty", label: "为空字符串", needsValue: false },
+  { id: "between", label: "grid.ops.between", needsValue: true },
+  { id: "in", label: "grid.ops.in", needsValue: true },
+  { id: "null", label: "grid.ops.null", needsValue: false },
+  { id: "notnull", label: "grid.ops.notnull", needsValue: false },
+  { id: "empty", label: "grid.ops.empty", needsValue: false },
 ];
 
 export function opNeedsValue(op: FilterOp): boolean {
@@ -129,5 +135,6 @@ export function opNeedsValue(op: FilterOp): boolean {
 }
 
 export function opLabel(op: FilterOp): string {
-  return FILTER_OPS.find((item) => item.id === op)?.label ?? op;
+  const key = FILTER_OPS.find((item) => item.id === op)?.label;
+  return key ? tr(key) : op;
 }

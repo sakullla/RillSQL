@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { tr } from "../i18n";
 import { computed } from "vue";
 
 const props = defineProps<{ json: string; label?: string }>();
@@ -24,8 +25,8 @@ const valid = computed(() => {
 <!-- 文档 JSON 查看器（R12/ADR-4）：MongoDB 整档文档以 pretty JSON 展示，值查看器家族的一员。 -->
 <template>
   <div class="doc-json" data-value-kind="json">
-    <p v-if="!valid" class="dj-invalid">这份文档不是合法 JSON：{{ json }}</p>
-    <pre v-else class="dj-body mono" :aria-label="label ?? '文档 JSON'">{{ pretty }}</pre>
+    <p v-if="!valid" class="dj-invalid">{{ tr("mongo.docJson.invalid") }}{{ json }}</p>
+    <pre v-else class="dj-body mono" :aria-label="label ?? tr('mongo.docJson.aria')">{{ pretty }}</pre>
   </div>
 </template>
 

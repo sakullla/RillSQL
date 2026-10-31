@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { tr as t } from "../i18n";
 import { computed, reactive, ref, watch } from "vue";
 import Listbox from "../ui/Listbox.vue";
 import type { ListboxOption } from "../ui/types";
@@ -29,7 +30,7 @@ const databaseOptions = computed<ListboxOption[]>(() => {
   const current = connection.value;
   if (!current) return [];
   const preferred = current.defaultDatabase;
-  return current.databases.map((name) => ({ value: name, label: name, hint: name === preferred ? "默认库" : undefined }));
+  return current.databases.map((name) => ({ value: name, label: name, hint: name === preferred ? t("export.dump.defaultDb") : undefined }));
 });
 const schemaList = computed<string[]>(() => connection.value?.schemasOf(database.value) ?? []);
 const showsSchemas = computed(() => schemaList.value.length > 0);
@@ -99,10 +100,10 @@ const schemaMissing = computed(() => showsSchemas.value && schemas.checked.size 
 const pathReady = computed(() => path.value.trim().length > 0);
 const canStart = computed(() => connectionReady.value && database.value.length > 0 && !schemaMissing.value && pathReady.value && !choosing.value);
 const tableNote = computed(() => {
-  if (tableList.value.length === 0) return "目录树里还没有读到表清单：将按全部表导出。";
-  if (tableScope.all) return "按全部表导出。";
+  if (tableList.value.length === 0) return t("export.dump.noTablesLoaded");
+  if (tableScope.all) return t("export.dump.allTables");
   const picked = tableScope.checked.size;
-  return picked === 0 ? "没有勾选任何表，将按全部表导出。" : `只导出勾选的 ${picked} 张表；视图与例程仍全部导出。`;
+  return picked === 0 ? t("export.dump.nonePicked") : t("export.dump.pickedOnly", { n: picked });
 });
 
 async function start(): Promise<void> {
@@ -127,7 +128,7 @@ async function start(): Promise<void> {
     });
     emit("close");
   } catch (cause) {
-    error.value = `无法打开保存对话框：${cause instanceof Error ? cause.message : String(cause)}`;
+    error.value = t("export.common.dialogFailed", { error: cause instanceof Error ? cause.message : String(cause) });
   } finally {
     choosing.value = false;
   }
@@ -136,34 +137,34 @@ async function start(): Promise<void> {
 
 <template>
   <div v-if="open" class="dp-overlay" role="presentation">
-    <div class="dp-sheet" role="dialog" aria-modal="true" aria-label="全库导出">
+    <div class="dp-sheet" role="dialog" aria-modal="true" :aria-label="t('export.dump.dialogLabel')">
       <header class="dp-head">
         <div class="dp-titles">
-          <h2>全库导出</h2>
-          <p>把连接里的结构（可选数据）按依赖顺序写成一个 SQL 文件。这是导出，不是备份；生成过程只读，不执行任何语句。</p>
+          <h2>{{ t("export.dump.title") }}</h2>
+          <p>{{ t("export.dump.subtitle") }}</p>
         </div>
-        <button class="icon-btn" type="button" aria-label="关闭" @click="emit('close')">
+        <button class="icon-btn" type="button" :aria-label="t('common.close')" @click="emit('close')">
           <svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
         </button>
       </header>
 
       <div class="dp-body">
         <p v-if="error" class="dp-alert" role="alert">{{ error }}</p>
-        <p v-if="!connectionReady" class="dp-note">还没有已打开的连接。先到连接页打开要导出的连接。</p>
+        <p v-if="!connectionReady" class="dp-note">{{ t("export.common.needOpenConnection", { what: t("export.common.whatExport") }) }}</p>
         <template v-else>
           <div class="dp-grid">
             <div class="dp-field">
-              <label for="dump-connection">连接</label>
-              <Listbox id="dump-connection" v-model="connectionId" :options="connectionOptions" aria-label="连接" :disabled="choosing" />
+              <label for="dump-connection">{{ t("export.dump.connection") }}</label>
+              <Listbox id="dump-connection" v-model="connectionId" :options="connectionOptions" :aria-label="t('export.dump.connection')" :disabled="choosing" />
             </div>
             <div class="dp-field">
-              <label for="dump-database">库</label>
-              <Listbox id="dump-database" v-model="database" :options="databaseOptions" aria-label="库" :disabled="choosing" />
+              <label for="dump-database">{{ t("export.dump.database") }}</label>
+              <Listbox id="dump-database" v-model="database" :options="databaseOptions" :aria-label="t('export.dump.database')" :disabled="choosing" />
             </div>
           </div>
 
           <fieldset v-if="showsSchemas" class="dp-block">
-            <legend>schema 范围（PostgreSQL）</legend>
+            <legend>{{ t("export.dump.schemaLegend") }}</legend>
             <label v-for="name in schemaList" :key="name" class="dp-check">
               <input type="checkbox" :checked="schemas.checked.has(name)" @change="toggleSchema(name, $event)" />
               {{ name }}
@@ -171,10 +172,10 @@ async function start(): Promise<void> {
           </fieldset>
 
           <fieldset class="dp-block">
-            <legend>表范围</legend>
-            <label class="dp-check"><input v-model="tableScope.all" type="checkbox" /> 全部表</label>
+            <legend>{{ t("export.dump.tableLegend") }}</legend>
+            <label class="dp-check"><input v-model="tableScope.all" type="checkbox" /> {{ t("export.dump.allTablesCheck") }}</label>
             <details v-if="!tableScope.all && tableList.length > 0" class="dp-tables">
-              <summary>勾选要导出的表（{{ tableList.length }}）</summary>
+              <summary>{{ t("export.dump.pickTables", { n: tableList.length }) }}</summary>
               <label v-for="name in tableList" :key="name" class="dp-check">
                 <input type="checkbox" :checked="tableScope.checked.has(name)" @change="toggleTable(name, $event)" />
                 {{ name }}
@@ -183,20 +184,20 @@ async function start(): Promise<void> {
             <p class="dp-note">{{ tableNote }}</p>
           </fieldset>
 
-          <label class="dp-check dp-data"><input v-model="includeData" type="checkbox" /> 包含数据（每张表的 INSERT 跟在各自的建表语句之后；不勾选则只导结构）</label>
+          <label class="dp-check dp-data"><input v-model="includeData" type="checkbox" /> {{ t("export.dump.includeData") }}</label>
 
           <label class="dp-path">
-            保存到
-            <input v-model="path" aria-label="导出路径" spellcheck="false" />
+            {{ t("export.common.saveTo") }}
+            <input v-model="path" :aria-label="t('export.common.exportPath')" spellcheck="false" />
           </label>
         </template>
       </div>
 
       <footer class="dp-foot">
-        <span class="muted sm">任务进入后台任务中心，可随时取消；取消后不留下未完成文件。</span>
+        <span class="muted sm">{{ t("export.dump.taskNote") }}</span>
         <span class="grow"></span>
-        <button class="btn" type="button" @click="emit('close')">取消</button>
-        <button class="btn primary" type="button" :disabled="!canStart" @click="start">{{ choosing ? "选择保存位置…" : "开始导出" }}</button>
+        <button class="btn" type="button" @click="emit('close')">{{ t("common.cancel") }}</button>
+        <button class="btn primary" type="button" :disabled="!canStart" @click="start">{{ choosing ? t("export.common.chooseSaveLocation") : t("export.dump.start") }}</button>
       </footer>
     </div>
   </div>

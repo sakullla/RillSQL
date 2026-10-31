@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
+import { tr as t } from "../i18n";
 import type { ListboxOption } from "../ui/types";
 import Listbox from "../ui/Listbox.vue";
 import { renderCsv, type CsvCell, type CsvDelimiter, type CsvOptions, type NullToken } from "./csv";
@@ -32,18 +33,18 @@ const emit = defineEmits<{
 }>();
 
 const delimiterOptions: ListboxOption[] = [
-  { value: ",", label: "逗号 ," },
-  { value: ";", label: "分号 ;" },
-  { value: "\t", label: "制表符" },
+  { value: ",", label: t("export.dialog.comma") },
+  { value: ";", label: t("export.dialog.semicolon") },
+  { value: "\t", label: t("export.dialog.tab") },
 ];
 const nullOptions: ListboxOption[] = [
-  { value: "", label: "空字段（无引号）" },
+  { value: "", label: t("export.dialog.noQuote") },
   { value: "\\N", label: "\\N" },
-  { value: "NULL", label: "NULL（无引号）" },
+  { value: "NULL", label: t("export.dialog.nullToken") },
 ];
 const encodingOptions: ListboxOption[] = [
   { value: "utf8", label: "UTF-8" },
-  { value: "bom", label: "UTF-8 + BOM（Excel 打开不乱码）" },
+  { value: "bom", label: t("export.dialog.bom") },
 ];
 
 const scope = ref<ExportScope>("loaded");
@@ -80,11 +81,11 @@ function formatExtension(next: ExportFormat): string {
 }
 
 function exportTitle(next: ExportFormat): string {
-  if (next === "json") return "导出为 JSON";
-  if (next === "insert") return "导出为 INSERT";
-  if (next === "markdown") return "导出为 Markdown";
-  if (next === "xlsx") return "导出为 Excel";
-  return "导出为 CSV";
+  if (next === "json") return t("export.dialog.titleJson");
+  if (next === "insert") return t("export.dialog.titleInsert");
+  if (next === "markdown") return t("export.dialog.titleMarkdown");
+  if (next === "xlsx") return t("export.dialog.titleXlsx");
+  return t("export.dialog.titleCsv");
 }
 
 watch(format, (next, previous) => {
@@ -148,7 +149,7 @@ async function start() {
     path.value = selected;
     emit("start", { ...payload, path: selected });
   } catch (cause) {
-    error.value = `无法打开保存对话框：${cause instanceof Error ? cause.message : String(cause)}`;
+    error.value = t("export.common.dialogFailed", { error: cause instanceof Error ? cause.message : String(cause) });
   } finally {
     choosing.value = false;
   }
@@ -161,9 +162,9 @@ async function start() {
       <header class="ex-head">
         <div class="ex-titles">
           <h2>{{ title }}</h2>
-          <p>这只是数据导出，不是数据库备份；要备份请用数据库自带的备份工具。</p>
+          <p>{{ t("export.dialog.notBackup") }}</p>
         </div>
-        <button class="icon-btn" type="button" aria-label="关闭" @click="emit('close')">
+        <button class="icon-btn" type="button" :aria-label="t('common.close')" @click="emit('close')">
           <svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
         </button>
       </header>
@@ -171,47 +172,47 @@ async function start() {
       <div class="ex-body">
         <p v-if="error" class="ex-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>{{ error }}</p>
         <fieldset class="ex-options" :disabled="choosing">
-        <p v-if="pending" class="ex-note warn">表格里还有 <span class="num">{{ pending }}</span> 处更改没有提交。导出的是数据库里已提交的数据，不包含这些未提交的更改。</p>
+        <p v-if="pending" class="ex-note warn">{{ t("export.dialog.pendingNote", { n: pending }) }}</p>
 
         <fieldset class="ex-scope">
-          <legend>导出成哪种文件</legend>
+          <legend>{{ t("export.dialog.formatLegend") }}</legend>
           <label class="ex-choice" :class="{ on: format === 'csv' }">
             <input v-model="format" type="radio" name="ex-format" value="csv" />
-            <span><b>CSV</b><small>表格文本。空值按下面的 NULL 写法写出。</small></span>
+            <span><b>{{ t("export.dialog.csvLabel") }}</b><small>{{ t("export.dialog.csvDesc") }}</small></span>
           </label>
           <label class="ex-choice" :class="{ on: format === 'json' }">
             <input v-model="format" type="radio" name="ex-format" value="json" />
-            <span><b>JSON 数组</b><small>每个对象是一行。空值仍是 null，空字符串仍是空字符串。</small></span>
+            <span><b>{{ t("export.dialog.jsonLabel") }}</b><small>{{ t("export.dialog.jsonDesc") }}</small></span>
           </label>
           <label class="ex-choice" :class="{ on: format === 'xlsx' }">
             <input v-model="format" type="radio" name="ex-format" value="xlsx" />
-            <span><b>Excel</b><small>xlsx 工作表。只包含这些行，不是整库转储，也不会搬到另一种数据库。空单元格是空值，不另写记号。</small></span>
+            <span><b>{{ t("export.dialog.xlsxLabel") }}</b><small>{{ t("export.dialog.xlsxDesc") }}</small></span>
           </label>
           <label class="ex-choice" :class="{ on: format === 'markdown' }">
             <input v-model="format" type="radio" name="ex-format" value="markdown" />
-            <span><b>Markdown 表格</b><small>竖线分隔的表格文本。单元格里的 | 会转义，换行折叠成空格，空值写成空字段。</small></span>
+            <span><b>{{ t("export.dialog.markdownLabel") }}</b><small>{{ t("export.dialog.markdownDesc") }}</small></span>
           </label>
           <label class="ex-choice" :class="{ on: format === 'insert' }">
             <input v-model="format" type="radio" name="ex-format" value="insert" />
-            <span><b>INSERT 语句</b><small>只包含这些行，不含建表或整库脚本。空值写成 NULL。</small></span>
+            <span><b>{{ t("export.dialog.insertLabel") }}</b><small>{{ t("export.dialog.insertDesc") }}</small></span>
           </label>
         </fieldset>
-        <p v-if="insertBlocked" class="ex-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>{{ insertReason || "还不能确定 INSERT 要写入的表，不能开始。" }}</p>
+        <p v-if="insertBlocked" class="ex-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>{{ insertReason || t("export.dialog.insertBlocked") }}</p>
 
         <fieldset class="ex-scope">
-          <legend>导出哪些行</legend>
+          <legend>{{ t("export.dialog.rowsLegend") }}</legend>
           <label class="ex-choice" :class="{ on: scope === 'loaded' }">
             <input v-model="scope" type="radio" name="ex-scope" value="loaded" />
             <span>
-              <b>只导出已读取的 <span class="num">{{ loadedCount }}</span> 行</b>
-              <small>{{ truncated ? "结果还没读完：没读出来的行不会写进文件，文件名会标注「（部分）」。" : "表格里已经读出了这次结果的全部行。" }}</small>
+              <b>{{ t("export.dialog.loadedOnly", { n: loadedCount }) }}</b>
+              <small>{{ truncated ? t("export.dialog.loadedTruncatedNote") : t("export.dialog.loadedCompleteNote") }}</small>
             </span>
           </label>
           <label class="ex-choice" :class="{ on: scope === 'full' }">
             <input v-model="scope" type="radio" name="ex-scope" value="full" />
             <span>
-              <b>{{ origin === "query" ? "重新执行这条查询，导出全部结果" : "导出符合当前筛选的全部行" }}</b>
-              <small>{{ origin === "query" ? "只有单条 SELECT 可以重新执行；会一边读取一边写入文件。" : "由数据库读取并直接写入文件，不会先把全部行装进表格。" }}</small>
+              <b>{{ origin === "query" ? t("export.dialog.reexecuteQuery") : t("export.dialog.filterAll") }}</b>
+              <small>{{ origin === "query" ? t("export.dialog.reexecuteQueryNote") : t("export.dialog.filterAllNote") }}</small>
             </span>
           </label>
         </fieldset>
@@ -220,47 +221,47 @@ async function start() {
         <p v-if="plan.rejectReason" class="ex-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>{{ plan.rejectReason }}</p>
         <label v-if="plan.reexecutes" class="ex-ack">
           <input v-model="acknowledged" type="checkbox" />
-          我明白：导出会重新执行这条 SELECT，结果可能和当前表格看到的不一样
+          {{ t("export.dialog.acknowledge") }}
         </label>
 
         <label class="ex-path">
-          保存到
-          <input v-model="path" aria-label="导出路径" spellcheck="false" />
+          {{ t("export.common.saveTo") }}
+          <input v-model="path" :aria-label="t('export.common.exportPath')" spellcheck="false" />
         </label>
 
         <div class="ex-preview-wrap">
-          <p v-if="format === 'csv'" class="ex-note">预览（前 4 行）：非 NULL 的值都会加引号，所以 "" 是空字符串，{{ nullToken === "" ? "空字段" : nullToken }} 是 NULL。</p>
-          <p v-else-if="format === 'xlsx'" class="ex-note">预览（前 4 行）。空单元格是空值，空字符串也留空。未提交的修改不会进入文件。</p>
-          <p v-else class="ex-note">预览（前 4 行）。空值保持为空值。未提交的修改不会进入文件。</p>
+          <p v-if="format === 'csv'" class="ex-note">{{ t("export.dialog.csvPreviewNote", { token: nullToken === "" ? t("export.dialog.csvPreviewEmpty") : nullToken }) }}</p>
+          <p v-else-if="format === 'xlsx'" class="ex-note">{{ t("export.dialog.xlsxPreviewNote") }}</p>
+          <p v-else class="ex-note">{{ t("export.dialog.otherPreviewNote") }}</p>
           <pre class="ex-preview">{{ preview }}</pre>
         </div>
 
         <details v-if="format === 'csv'" class="disclosure">
-          <summary>高级选项 <span class="muted">分隔符、NULL 写法、编码、列名行</span></summary>
+          <summary>{{ t("export.dialog.advanced") }} <span class="muted">{{ t("export.dialog.advancedHint") }}</span></summary>
           <div class="disclosure-body ex-advanced">
             <div class="ex-field">
-              <label for="export-delimiter">分隔符</label>
-              <Listbox id="export-delimiter" :model-value="delimiter" :options="delimiterOptions" aria-label="分隔符" :disabled="choosing" @update:model-value="onDelimiter" />
+              <label for="export-delimiter">{{ t("export.dialog.delimiter") }}</label>
+              <Listbox id="export-delimiter" :model-value="delimiter" :options="delimiterOptions" :aria-label="t('export.dialog.delimiter')" :disabled="choosing" @update:model-value="onDelimiter" />
             </div>
             <div class="ex-field">
-              <label for="export-null">NULL 写为</label>
-              <Listbox id="export-null" :model-value="nullToken" :options="nullOptions" aria-label="NULL 写法" :disabled="choosing" @update:model-value="onNullToken" />
+              <label for="export-null">{{ t("export.dialog.nullWrite") }}</label>
+              <Listbox id="export-null" :model-value="nullToken" :options="nullOptions" :aria-label="t('export.dialog.nullWriteAria')" :disabled="choosing" @update:model-value="onNullToken" />
             </div>
             <div class="ex-field">
-              <label for="export-encoding">编码</label>
-              <Listbox id="export-encoding" :model-value="bom ? 'bom' : 'utf8'" :options="encodingOptions" aria-label="编码" :disabled="choosing" @update:model-value="onEncoding" />
+              <label for="export-encoding">{{ t("export.dialog.encoding") }}</label>
+              <Listbox id="export-encoding" :model-value="bom ? 'bom' : 'utf8'" :options="encodingOptions" :aria-label="t('export.dialog.encoding')" :disabled="choosing" @update:model-value="onEncoding" />
             </div>
-            <label class="ex-header-row"><input v-model="header" type="checkbox" /> 第一行写入列名</label>
+            <label class="ex-header-row"><input v-model="header" type="checkbox" /> {{ t("export.dialog.headerRow") }}</label>
           </div>
         </details>
         </fieldset>
       </div>
 
       <footer class="ex-foot">
-        <span class="muted sm">{{ plan.label }}{{ plan.partial ? " · 不是完整结果" : "" }}</span>
+        <span class="muted sm">{{ plan.label }}{{ plan.partial ? t("export.dialog.partialSuffix") : "" }}</span>
         <span class="grow"></span>
-        <button class="btn" type="button" @click="emit('close')">取消</button>
-        <button class="btn primary" type="button" :disabled="!canStart || choosing" @click="start">{{ choosing ? "选择保存位置…" : "导出" }}</button>
+        <button class="btn" type="button" @click="emit('close')">{{ t("common.cancel") }}</button>
+        <button class="btn primary" type="button" :disabled="!canStart || choosing" @click="start">{{ choosing ? t("export.common.chooseSaveLocation") : t("export.dialog.exportButton") }}</button>
       </footer>
     </div>
   </div>

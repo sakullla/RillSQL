@@ -40,13 +40,13 @@ export class TableSession {
   }
 
   get scopeLabel(): string {
-    return "筛选和排序作用于整张表";
+    return tr("grid.scope.wholeTable");
   }
 
   get keyLabel(): string {
-    if (this.store.schema.kind === "view") return "只读视图";
-    if (!this.store.schema.key.length) return "这张表没有主键，只能新增";
-    return `按 ${this.store.schema.key.join(" + ")} 定位行`;
+    if (this.store.schema.kind === "view") return tr("grid.scope.readonlyView");
+    if (!this.store.schema.key.length) return tr("grid.scope.noKeyInsertOnly");
+    return tr("grid.scope.locateByKey", { key: this.store.schema.key.join(" + ") });
   }
 
   get pendingCount(): number {
@@ -74,7 +74,7 @@ export class TableSession {
 
   replaceFilters(filters: Filter[]): string | null {
     for (const filter of filters) {
-      if (opNeedsValue(filter.op) && !filter.value) return "筛选值不能为空";
+      if (opNeedsValue(filter.op) && !filter.value) return tr("grid.live.filterValueEmpty");
     }
     this.filters = filters.map((filter) => ({ ...filter }));
     return this.readWindow(0, this.pageSize, true);
@@ -140,11 +140,11 @@ export class TableSession {
 
   stageUpdate(rowId: string, column: string, value: Cell): string | null {
     const row = this.rowById(rowId);
-    if (!row) return "找不到行";
+    if (!row) return tr("grid.errors.rowNotFound");
     const found = this.store.schema.columns.find((item) => item.name === column);
     const rejected = rejectWrite(found, value, row.resolved === true);
     if (rejected) return rejected;
-    if (!this.canUpdate(row)) return "无法唯一确定这一行，不能修改";
+    if (!this.canUpdate(row)) return tr("grid.errors.cannotLocate");
     const sets = { ...(this.edits.get(rowId) ?? {}), [column]: value };
     this.edits.set(rowId, sets);
     this.failures.delete(`u:${rowId}`);
@@ -152,7 +152,7 @@ export class TableSession {
   }
 
   addRow(): string | null {
-    if (!this.canInsert) return "只有数据表可以新增，视图不行";
+    if (!this.canInsert) return tr("grid.errors.onlyTableEdit");
     const id = `new-${draftSeq}`;
     draftSeq += 1;
     const cells: Record<string, Cell | undefined> = {};
@@ -165,7 +165,7 @@ export class TableSession {
 
   stageInsert(id: string, column: string, value: Cell | undefined): string | null {
     const insert = this.inserts.find((item) => item.id === id);
-    if (!insert) return "找不到新增行";
+    if (!insert) return tr("grid.errors.insertNotFound");
     const found = this.store.schema.columns.find((item) => item.name === column);
     const rejected = rejectWrite(found, value);
     if (rejected) return rejected;
@@ -175,7 +175,7 @@ export class TableSession {
   }
 
   deleteSelected(): string | null {
-    if (!this.selectedId) return "先选择一行";
+    if (!this.selectedId) return tr("grid.errors.selectRowFirst");
     return this.deleteRow(this.selectedId);
   }
 
@@ -186,7 +186,7 @@ export class TableSession {
       if (this.selectedId === id) this.selectedId = null;
       return null;
     }
-    if (!this.canDeleteRow(id)) return "无法唯一确定这一行，不能删除";
+    if (!this.canDeleteRow(id)) return tr("grid.errors.cannotLocateDelete");
     if (!this.deletes.includes(id)) this.deletes.push(id);
     this.edits.delete(id);
     return null;
@@ -211,7 +211,7 @@ export class TableSession {
     return this.changes().map((change) => ({
       id: change.id,
       sql: this.sqlFor(change),
-      label: change.kind === "insert" ? "新增 1 行" : change.kind === "delete" ? `删除 ${change.rowId}` : `修改 ${change.rowId}`,
+      label: change.kind === "insert" ? tr("grid.commit.labelInsert") : change.kind === "delete" ? tr("grid.commit.labelDelete", { id: change.rowId }) : tr("grid.commit.labelUpdate", { id: change.rowId }),
     }));
   }
 
@@ -246,3 +246,5 @@ export class TableSession {
     return updateSql(this.store.schema, change.sets, row.locator.columns, row.locator.values);
   }
 }
+
+import { tr } from "../i18n";

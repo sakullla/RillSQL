@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { tr } from "../i18n";
 import { computed } from "vue";
 // 模板里的分支判定直接用 value.kind（保持模板类型收窄），computed 只承担空态判断。
 import type { RedisValuePayload } from "../redis/api";
@@ -27,11 +28,11 @@ const empty = computed(() => {
 <!-- 结构化值查看器（R11）：按 Redis 类型渲染，不依赖 DataGrid。 -->
 <template>
   <div class="redis-value" :data-value-kind="value.kind">
-    <p v-if="value.kind === 'none'" class="rv-empty">键不存在或类型暂不支持结构化渲染。</p>
-    <p v-else-if="empty" class="rv-empty">这个键没有内容（空集合/空字符串）。</p>
+    <p v-if="value.kind === 'none'" class="rv-empty">{{ tr("redis.value.none") }}</p>
+    <p v-else-if="empty" class="rv-empty">{{ tr("redis.value.empty") }}</p>
     <pre v-else-if="value.kind === 'string'" class="rv-text mono">{{ value.text }}</pre>
     <table v-else-if="value.kind === 'hash'" class="rv-table">
-      <thead><tr><th>字段</th><th>值</th></tr></thead>
+      <thead><tr><th>{{ tr("redis.value.field") }}</th><th>{{ tr("redis.value.value") }}</th></tr></thead>
       <tbody>
         <tr v-for="entry in value.entries" :key="entry.field">
           <td class="mono rv-field">{{ entry.field }}</td>
@@ -46,7 +47,7 @@ const empty = computed(() => {
       <li v-for="item in value.items" :key="item" class="mono">{{ item }}</li>
     </ul>
     <table v-else-if="value.kind === 'zset'" class="rv-table">
-      <thead><tr><th>成员</th><th>分值</th></tr></thead>
+      <thead><tr><th>{{ tr("redis.value.member") }}</th><th>{{ tr("redis.value.score") }}</th></tr></thead>
       <tbody>
         <tr v-for="entry in value.entries" :key="entry.member">
           <td class="mono">{{ entry.member }}</td>

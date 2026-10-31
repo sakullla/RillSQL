@@ -17,6 +17,7 @@ import QueryResultGrid from "./QueryResultGrid.vue";
 import { TableSession } from "./session";
 import { browseSql, compileWhere, compileWhereWithSearch, searchClause, selectExportGate } from "./sql";
 import type { TableTarget } from "./target";
+import { tr } from "../i18n";
 import { COMMIT_RULE, FILTER_OPS, opLabel, opNeedsValue, type Column, type TableSchema } from "./types";
 
 const invoke = vi.hoisted(() => vi.fn());
@@ -104,10 +105,12 @@ describe("grid batches, nulls and server filters", () => {
 
   it("adds between and in operators with metadata, SQL and local matching", () => {
     const betweenMeta = FILTER_OPS.find((item) => item.id === "between");
-    expect(betweenMeta?.label).toBe("介于");
+    expect(opLabel("between")).toBe("介于");
+    expect(betweenMeta?.label).toBe("grid.ops.between");
     expect(betweenMeta?.needsValue).toBe(true);
     const inMeta = FILTER_OPS.find((item) => item.id === "in");
-    expect(inMeta?.label).toBe("属于(in)");
+    expect(opLabel("in")).toBe("属于(in)");
+    expect(inMeta?.label).toBe("grid.ops.in");
     expect(inMeta?.needsValue).toBe(true);
     expect(opLabel("between")).toBe("介于");
     expect(opNeedsValue("in")).toBe(true);
@@ -1031,11 +1034,11 @@ describe("query result edits", () => {
 
   it("only locates a proved single-table select that contains its primary key", () => {
     expect(readSingleTable("SELECT * FROM orders JOIN items ON items.id = orders.id").ok).toBe(false);
-    expect(rejectReason("SELECT status, COUNT(*) FROM orders GROUP BY status")).toContain("聚合");
-    expect(rejectReason("SELECT DISTINCT status FROM orders")).toContain("DISTINCT");
-    expect(rejectReason("SELECT id FROM orders UNION SELECT id FROM archive")).toContain("UNION");
-    expect(rejectReason("SELECT id FROM (SELECT id FROM orders) q")).toContain("子查询");
-    expect(rejectReason("DELETE FROM orders")).toContain("SELECT");
+    expect(tr(rejectReason("SELECT status, COUNT(*) FROM orders GROUP BY status"))).toContain("聚合");
+    expect(tr(rejectReason("SELECT DISTINCT status FROM orders"))).toContain("DISTINCT");
+    expect(tr(rejectReason("SELECT id FROM orders UNION SELECT id FROM archive"))).toContain("UNION");
+    expect(tr(rejectReason("SELECT id FROM (SELECT id FROM orders) q"))).toContain("子查询");
+    expect(tr(rejectReason("DELETE FROM orders"))).toContain("SELECT");
     expect(readSingleTable("SELECT id, name FROM ONLY orders").ok).toBe(false);
     const explicitAlias = readSingleTable("SELECT id, email AS name FROM customers");
     expect(explicitAlias.ok).toBe(true);
@@ -1877,10 +1880,10 @@ describe("query result edits", () => {
   it("does not join identifiers that a comment alone separates, and clears the insert target", async () => {
     const line = readSingleTable("SELECT id, name FROM public.cu--\nstomers");
     expect(line.ok).toBe(false);
-    if (!line.ok) expect(line.reason).toContain("不能确定");
+    if (!line.ok) expect(tr(line.reason)).toContain("不能确定");
     const block = readSingleTable("SELECT id, name FROM cu/*x*/stomers");
     expect(block.ok).toBe(false);
-    if (!block.ok) expect(block.reason).toContain("不能确定");
+    if (!block.ok) expect(tr(block.reason)).toContain("不能确定");
     expect(proof("SELECT id, name FROM public.customers--\nWHERE id = 1")).toEqual({
       schema: "public",
       table: "customers",

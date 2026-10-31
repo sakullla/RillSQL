@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from "vue";
+import { tr } from "../i18n";
 import type { ListboxOption } from "./types";
 
 const props = withDefaults(
@@ -12,7 +13,7 @@ const props = withDefaults(
     disabled?: boolean;
     id?: string;
   }>(),
-  { placeholder: "请选择", ariaLabel: undefined, filterable: false, disabled: false, id: undefined },
+  { placeholder: undefined, ariaLabel: undefined, filterable: false, disabled: false, id: undefined },
 );
 
 const emit = defineEmits<{ "update:modelValue": [value: string] }>();
@@ -221,7 +222,7 @@ onBeforeUnmount(() => {
       @click="toggle"
       @keydown="onTriggerKey"
     >
-      <span class="listbox-value" :class="{ placeholder: !selected }">{{ selected ? selected.label : placeholder }}</span>
+      <span class="listbox-value" :class="{ placeholder: !selected }">{{ selected ? selected.label : (placeholder ?? tr("common.choose")) }}</span>
       <svg class="i listbox-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" /></svg>
     </button>
     <div v-if="open" ref="pop" class="listbox-pop" :class="{ up: dropUp }" :style="popStyle">
@@ -231,8 +232,8 @@ onBeforeUnmount(() => {
         v-model="query"
         class="listbox-filter"
         type="search"
-        placeholder="筛选"
-        aria-label="筛选选项"
+         :placeholder="tr('common.filterPlaceholder')"
+        :aria-label="tr('common.filterOptions')"
         :aria-activedescendant="activeDescendant"
         @keydown="onPopupKey"
       />
@@ -261,7 +262,7 @@ onBeforeUnmount(() => {
           <span>{{ option.label }}</span>
           <span v-if="option.hint" class="listbox-hint">{{ option.hint }}</span>
         </li>
-        <li v-if="!visible.length" class="listbox-empty" role="presentation">没有匹配项</li>
+        <li v-if="!visible.length" class="listbox-empty" role="presentation">{{ tr("common.noMatch") }}</li>
       </ul>
     </div>
   </div>

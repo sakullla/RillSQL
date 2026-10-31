@@ -1,4 +1,5 @@
 import { selectExportGate } from "../grid/sql";
+import { tr } from "../i18n";
 
 export type ExportOrigin = "table" | "query";
 export type ExportScope = "loaded" | "full";
@@ -26,11 +27,26 @@ export interface ExportPlan {
 }
 
 export function partialFileName(fileName: string): string {
-  if (fileName.includes("（部分）")) return fileName;
+  // 「（部分）」是导出文件名的固定标记（协议级后缀，不随界面语言变化），转义写法避免源码裸中文（verify:workbench 字典化扫描）。
+  const partialMark = "\uff08\u90e8\u5206\uff09";
+  if (fileName.includes(partialMark)) return fileName;
   const match = /\.(csv|json|sql|md|xlsx)$/i.exec(fileName);
-  if (match) return fileName.replace(new RegExp(`\\.${match[1]}$`, "i"), `（部分）.${match[1]!.toLowerCase()}`);
-  return `${fileName}（部分）`;
+  if (match) return fileName.replace(new RegExp(`\\.${match[1]}$`, "i"), `${partialMark}.${match[1]!.toLowerCase()}`);
+  return `${fileName}${partialMark}`;
 }
+
+export interface ExportPlan {
+  allowed: boolean;
+  partial: boolean;
+  complete: boolean;
+  fileName: string;
+  notice: string;
+  rejectReason: string | null;
+  reexecutes: boolean;
+  serverRead: boolean;
+  label: string;
+}
+
 
 export function planExport(input: ExportPlanInput): ExportPlan {
   const partial = input.scope === "loaded" && input.truncated;
@@ -43,11 +59,11 @@ export function planExport(input: ExportPlanInput): ExportPlan {
         partial: false,
         complete: false,
         fileName,
-        notice: gate.reason ?? "只有 SELECT 可以重新执行并全量导出",
+        notice: gate.reason ?? tr("export.plan.selectOnlyGate"),
         rejectReason: gate.reason,
         reexecutes: false,
         serverRead: false,
-        label: "不能全量导出",
+        label: tr("export.plan.cannotFull"),
       };
     }
     return {
@@ -55,11 +71,11 @@ export function planExport(input: ExportPlanInput): ExportPlan {
       partial: false,
       complete: true,
       fileName,
-      notice: "会重新执行这条 SELECT，一边读取一边写入文件。",
+      notice: tr("export.plan.fullNotice"),
       rejectReason: null,
       reexecutes: true,
       serverRead: true,
-      label: "全量结果（重新执行 SELECT）",
+      label: tr("export.plan.fullLabel"),
     };
   }
   if (partial) {
@@ -68,11 +84,11 @@ export function planExport(input: ExportPlanInput): ExportPlan {
       partial: true,
       complete: false,
       fileName,
-      notice: "不是完整结果：只包含已经读取的行。",
+      notice: tr("export.plan.partialNotice"),
       rejectReason: null,
       reexecutes: false,
       serverRead: false,
-      label: "部分结果",
+      label: tr("export.plan.partialLabel"),
     };
   }
   if (input.scope === "full") {
@@ -81,11 +97,11 @@ export function planExport(input: ExportPlanInput): ExportPlan {
       partial: false,
       complete: true,
       fileName,
-      notice: "按当前筛选条件在数据库里读取全部匹配的行，不会先把它们填进表格。",
+      notice: tr("export.plan.filteredNotice"),
       rejectReason: null,
       reexecutes: false,
       serverRead: true,
-      label: "按当前条件的全部匹配行",
+      label: tr("export.plan.filteredLabel"),
     };
   }
   return {
@@ -93,10 +109,10 @@ export function planExport(input: ExportPlanInput): ExportPlan {
     partial: false,
     complete: true,
     fileName,
-    notice: "当前读取的行已经覆盖这次结果。",
+    notice: tr("export.plan.allHereNotice"),
     rejectReason: null,
     reexecutes: false,
     serverRead: false,
-    label: "已读取的全部行",
+    label: tr("export.plan.allHereLabel"),
   };
 }

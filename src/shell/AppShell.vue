@@ -9,6 +9,7 @@ import { isDefinitionKind, objectLabel, objectPath } from "../catalog/tree";
 import type { CatalogConnection } from "../catalog/types";
 import { catalogConnections, catalogLoaded } from "../catalog/store";
 import { listPaletteConnections } from "../connections";
+import { setLocale, tr as t } from "../i18n";
 import DragImportDialog from "../export/DragImportDialog.vue";
 import DragOverlay from "../export/DragOverlay.vue";
 import DragPreview from "../export/DragPreview.vue";
@@ -71,8 +72,8 @@ watch(
   { deep: true, flush: "sync" },
 );
 
-/** 恢复的标签指向已删除的连接时给出提示（R2）：不自动连接、不弹错误风暴。 */
-const DELETED_CONNECTION_TAB_NOTICE = "这个标签指向的连接已删除。可以关闭标签，或重新选择执行目标。";
+/** 恢复的标签指向已删除的连接时给出提示（R2）：不自动连接、不弹错误风暴。文案走字典（R6）。 */
+const DELETED_CONNECTION_TAB_NOTICE_KEY = "shell.activity.deletedTabNotice";
 
 watch(
   () => catalogLoaded(),
@@ -81,25 +82,25 @@ watch(
     const known = new Set(catalogConnections().map((item) => item.id));
     for (const tab of session.tabs.value) {
       if (!tab.connectionId || known.has(tab.connectionId)) continue;
-      if (tab.targetNotice === DELETED_CONNECTION_TAB_NOTICE) continue;
-      tab.targetNotice = DELETED_CONNECTION_TAB_NOTICE;
+      if (tab.targetNotice === t(DELETED_CONNECTION_TAB_NOTICE_KEY)) continue;
+      tab.targetNotice = t(DELETED_CONNECTION_TAB_NOTICE_KEY);
     }
   },
 );
 
-const CLOSE_PROMPT_TEXT = {
+const CLOSE_PROMPT_KEYS = {
   window: {
-    cells: "有标签含未提交的单元格修改。留下则窗口和修改都还在；离开会丢掉这些修改，不会写入数据库。",
-    draft: "有标签的 SQL 草稿尚未执行。留下则窗口和草稿都还在；离开会丢掉这些草稿。",
-    both: "有标签含未提交的单元格修改和未执行的 SQL 草稿。留下则窗口和内容都还在；离开会丢掉这些修改与草稿，不会写入数据库。",
+    cells: "shell.closeGuard.windowCells",
+    draft: "shell.closeGuard.windowDraft",
+    both: "shell.closeGuard.windowBoth",
   },
   tab: {
-    cells: "这个标签有未提交的单元格修改。留下则标签和修改都还在；离开会丢掉这些修改，不会写入数据库。",
-    draft: "这个标签的 SQL 草稿尚未执行。留下则标签和草稿都还在；离开会丢掉这份草稿。",
-    both: "这个标签有未提交的单元格修改和未执行的 SQL 草稿。留下则标签和内容都还在；离开会丢掉这些修改与草稿，不会写入数据库。",
+    cells: "shell.closeGuard.tabCells",
+    draft: "shell.closeGuard.tabDraft",
+    both: "shell.closeGuard.tabBoth",
   },
 } as const;
-const closePromptText = computed(() => CLOSE_PROMPT_TEXT[closePrompt.scope][closePrompt.reason]);
+const closePromptText = computed(() => t(CLOSE_PROMPT_KEYS[closePrompt.scope][closePrompt.reason]));
 
 watch(
   () => closePrompt.open,
@@ -198,8 +199,8 @@ const activity = computed<OperationActivity | null>(() => {
   if (exporting) return { state: "running", text: taskStatusText(exporting) };
   const first = runningQueries.value[0];
   if (first) {
-    const more = runningQueries.value.length > 1 ? `（共 ${runningQueries.value.length} 个）` : "";
-    return { state: "running", text: `正在执行查询：${first.tab.connectionName ?? ""} / ${first.tab.database || "main"}${more}` };
+    const more = runningQueries.value.length > 1 ? t("shell.activity.totalMore", { n: runningQueries.value.length }) : "";
+    return { state: "running", text: `${t("shell.activity.executingQuery", { conn: first.tab.connectionName ?? "", db: first.tab.database || "main" })}${more}` };
   }
   return null;
 });
@@ -214,7 +215,7 @@ function onStatusCancel() {
 const commands = computed<PaletteItem[]>(() => [
   ...listPaletteTables().map((table) => ({
     id: table.id,
-    group: "表与视图" as const,
+    group: "table" as const,
     label: table.label,
     icon: "table" as const,
     path: table.path,
@@ -222,7 +223,7 @@ const commands = computed<PaletteItem[]>(() => [
   })),
   ...listPaletteConnections().map((connection) => ({
     id: connection.id,
-    group: "连接" as const,
+    group: "connection" as const,
     label: connection.label,
     icon: "database" as const,
     path: connection.path,
@@ -314,7 +315,8 @@ function onOpenKeys(connection: CatalogConnection, key: string) {
   if (window.innerWidth <= 960) session.sidebarHidden.value = true;
   session.openKeys({
     id: connection.id,
-    label: `${connection.name} 键空间`,
+    label: t("shell.tabs.keyspaceTab", { name: connection.name }),
+    titleKey: { key: "shell.tabs.keyspaceTab", params: { name: connection.name } },
     path: objectPath(connection.name, "", ""),
     connectionId: connection.id,
     connectionName: connection.name,
@@ -329,7 +331,8 @@ function onOpenDocs(connection: CatalogConnection, database: string, collection:
   if (window.innerWidth <= 960) session.sidebarHidden.value = true;
   session.openDocs({
     id: `${connection.id}:${database}:${collection}`,
-    label: `${collection} 文档`,
+    label: t("shell.tabs.docsTab", { collection }),
+    titleKey: { key: "shell.tabs.docsTab", params: { collection } },
     path: objectPath(connection.name, database, ""),
     connectionId: connection.id,
     connectionName: connection.name,
@@ -395,7 +398,7 @@ async function onJumpReference(sql: string, ref: string, target: TableTarget | n
       engine: null,
       status: null,
       needsTarget: true,
-      notice: `跳转 ${ref} 需要先选择执行目标。`,
+      notice: t("shell.activity.jumpNeedTarget", { ref }),
     });
     return;
   }
@@ -422,7 +425,8 @@ async function onJumpReference(sql: string, ref: string, target: TableTarget | n
   } catch (err) {
     const tab = session.tabs.value.find((item) => item.id === tabId);
     if (tab) {
-      tab.targetNotice = `${typeof err === "string" ? err : err instanceof Error ? err.message : "自动执行失败"} SQL 草稿仍保留，可稍后再执行。`;
+      const reason = typeof err === "string" ? err : err instanceof Error ? err.message : t("shell.activity.autoRunFailed");
+      tab.targetNotice = t("shell.activity.draftKept", { reason });
     }
   }
 }
@@ -448,6 +452,7 @@ function onFocusedDatabase(connectionId: string, database: string) {
 
 function onSettings(patch: Partial<ShellSettings>) {
   Object.assign(settings, patch);
+  if (patch.locale) setLocale(patch.locale);
   persist();
 }
 
@@ -565,11 +570,11 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="app-root" :class="{ 'sidebar-hidden': session.sidebarHidden.value || session.page.value !== 'workspace', 'custom-chrome': windowChrome.custom, 'is-maximized': windowChrome.maximized }">
-    <a class="skip" href="#main">跳到主区域</a>
+    <a class="skip" href="#main">{{ t("shell.skipToMain") }}</a>
     <TitleBar :theme="settings.theme" @palette="session.openPalette('all')" @help="session.openHelp()" @set-theme="setTheme" @window-state="windowChrome = $event" @new-query="session.openQuery()" @toggle-sidebar="session.toggleSidebar()" />
     <div class="body">
       <ActivityRail :page="session.page.value" @navigate="onNavigate" />
-      <button v-if="session.page.value === 'workspace' && !session.sidebarHidden.value" class="sidebar-dismiss" aria-label="关闭资源管理器" @click="session.toggleSidebar()"></button>
+      <button v-if="session.page.value === 'workspace' && !session.sidebarHidden.value" class="sidebar-dismiss" :aria-label="t('shell.closeExplorer')" @click="session.toggleSidebar()"></button>
       <Sidebar
         v-if="session.page.value === 'workspace' && !session.sidebarHidden.value"
         :width="session.sidebarWidth.value"
@@ -640,14 +645,14 @@ onBeforeUnmount(() => {
     <dialog v-if="closePrompt.open" ref="closeDialog" class="modal" aria-labelledby="close-guard-title" @cancel.prevent="chooseStay">
       <div class="modal-head">
         <div class="modal-titles">
-          <h2 id="close-guard-title">{{ closePrompt.scope === "window" ? "关闭窗口？" : "关闭这个标签？" }}</h2>
+          <h2 id="close-guard-title">{{ closePrompt.scope === "window" ? t("shell.closeGuard.closeWindow") : t("shell.closeGuard.closeTab") }}</h2>
           <p class="modal-sub">{{ closePromptText }}</p>
         </div>
       </div>
       <div class="modal-foot">
         <span class="grow"></span>
-        <button class="btn" type="button" data-action="close-stay" @click="chooseStay">留下</button>
-        <button class="btn danger" type="button" data-action="close-leave" @click="chooseLeave">离开</button>
+        <button class="btn" type="button" data-action="close-stay" @click="chooseStay">{{ t("shell.closeGuard.stay") }}</button>
+        <button class="btn danger" type="button" data-action="close-leave" @click="chooseLeave">{{ t("shell.closeGuard.leave") }}</button>
       </div>
     </dialog>
   </div>

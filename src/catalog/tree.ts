@@ -1,15 +1,21 @@
+import { tr } from "../i18n";
 import type { CatalogConnection, CatalogObject, ConnStatus, Engine, EngineShape, ObjectKind, SchemaNode } from "./types";
 
+/** 对象种类字典 key（catalog.kind.*）：展示处用 kindLabel() 翻译。 */
 export const KIND_LABEL: Record<ObjectKind, string> = {
-  table: "表",
-  view: "视图",
-  function: "函数",
-  procedure: "存储过程",
-  trigger: "触发器",
-  sequence: "序列",
-  enum: "枚举",
-  domain: "域",
+  table: "catalog.kind.table",
+  view: "catalog.kind.view",
+  function: "catalog.kind.function",
+  procedure: "catalog.kind.procedure",
+  trigger: "catalog.kind.trigger",
+  sequence: "catalog.kind.sequence",
+  enum: "catalog.kind.enum",
+  domain: "catalog.kind.domain",
 };
+
+export function kindLabel(kind: ObjectKind): string {
+  return tr(KIND_LABEL[kind]);
+}
 
 export function objectGroups(engine: Engine): ObjectKind[] {
   if (engine === "sqlite" || engine === "mysql") return engine === "sqlite" ? ["table", "view", "trigger"] : ["table", "view", "function", "procedure", "trigger"];
@@ -56,7 +62,8 @@ export function isConnected(status: ConnStatus): boolean {
 /** PostgreSQL 把其他库标成这条说明时，并不是对象列表读失败。 */
 export function postgresSessionGap(error: string | null | undefined): { current: string; database: string } | null {
   if (typeof error !== "string") return null;
-  const match = error.match(/当前会话连在\s*(.+?)\s*[,，]\s*没有另开连接读取\s*(\S+)/);
+  // 后端对 PostgreSQL 跨库会话返回中文说明（当前会话连在…没有另开连接读取…）——前后端契约，用转义写法避免源码裸中文。
+  const match = error.match(/\u5f53\u524d\u4f1a\u8bdd\u8fde\u5728\s*(.+?)\s*[,\uff0c]\s*\u6ca1\u6709\u53e6\u5f00\u8fde\u63a5\u8bfb\u53d6\s*(\S+)/);
   if (!match?.[1] || !match[2]) return null;
   return { current: match[1], database: match[2] };
 }

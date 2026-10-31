@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, shallowRef, watch } from "vue";
 import { catalogConnections } from "../catalog/store";
+import { tr as t } from "../i18n";
 import Listbox from "../ui/Listbox.vue";
 import type { ListboxOption } from "../ui/types";
 import { queryHistory, queryHistoryClear, queryHistoryDelete, querySavedDelete, querySavedList, querySavedRename, querySavedSave } from "./api";
@@ -76,17 +77,17 @@ const connectionChoices = computed(() => {
   return [...seen.entries()];
 });
 const connectionOptions = computed<ListboxOption[]>(() => [
-  { value: "all", label: "全部连接" },
-  { value: "deleted", label: "原连接已删除" },
+  { value: "all", label: t("history.filters.allConnections") },
+  { value: "deleted", label: t("history.filters.deletedConnection") },
   ...connectionChoices.value.map(([id, name]) => ({ value: id, label: name })),
 ]);
 const statusOptions: ListboxOption[] = [
-  { value: "all", label: "全部结果" },
-  { value: "ok", label: "成功" },
-  { value: "error", label: "失败" },
-  { value: "cancelled", label: "已取消" },
-  { value: "unknown", label: "结果未知" },
-  { value: "running", label: "执行中" },
+  { value: "all", label: t("history.filters.allResults") },
+  { value: "ok", label: t("history.status.ok") },
+  { value: "error", label: t("history.status.error") },
+  { value: "cancelled", label: t("history.status.cancelled") },
+  { value: "unknown", label: t("history.status.unknown") },
+  { value: "running", label: t("history.status.running") },
 ];
 
 function isDeleted(entry: HistoryEntry): boolean {
@@ -99,7 +100,7 @@ async function load() {
     entries.value = await queryHistory();
     loadError.value = "";
   } catch (err) {
-    loadError.value = typeof err === "string" ? err : err instanceof Error ? err.message : "读不了查询历史";
+    loadError.value = typeof err === "string" ? err : err instanceof Error ? err.message : t("history.savedPanel.loadFailed");
   } finally {
     loading.value = false;
   }
@@ -127,7 +128,7 @@ async function confirmDeleteRun(entry: HistoryEntry) {
     pendingDeleteId.value = null;
     await load();
   } catch (err) {
-    actionError.value = messageOf(err, "删不了这条查询历史");
+    actionError.value = messageOf(err, t("history.savedPanel.deleteRunFailed"));
   }
 }
 
@@ -150,7 +151,7 @@ async function loadSaved() {
     savedError.value = "";
     if (pendingDeleteId.value && !savedEntries.value.some((item) => item.id === pendingDeleteId.value)) pendingDeleteId.value = null;
   } catch (err) {
-    savedError.value = messageOf(err, "读不了保存的查询");
+    savedError.value = messageOf(err, t("history.savedPanel.loadFailed"));
   } finally {
     savedLoading.value = false;
   }
@@ -161,7 +162,7 @@ async function saveCurrent() {
   saveMessage.value = "";
   const draft = props.currentDraft;
   if (!draft) {
-    saveError.value = "先打开一个查询标签，再保存其中的 SQL。";
+    saveError.value = t("history.savedPanel.saveErrorNeedTab");
     return;
   }
   const nameError = savedNameError(saveName.value);
@@ -180,12 +181,12 @@ async function saveCurrent() {
       engine: draft.engine,
     });
     saveMessage.value = written.created
-      ? `已保存「${written.query.name}」。没有执行，也没有写入执行历史。`
-      : `已更新「${written.query.name}」。没有执行，也没有写入执行历史。`;
+      ? t("history.savedPanel.savedDone", { name: written.query.name })
+      : t("history.savedPanel.savedUpdated", { name: written.query.name });
     saveName.value = "";
     await loadSaved();
   } catch (err) {
-    saveError.value = messageOf(err, "存不了这条查询");
+    saveError.value = messageOf(err, t("history.savedPanel.saveFailed"));
   }
 }
 
@@ -208,7 +209,7 @@ async function confirmRename(entry: SavedQuery) {
     renamingId.value = null;
     await loadSaved();
   } catch (err) {
-    renameError.value = messageOf(err, "改不了这个名称");
+    renameError.value = messageOf(err, t("history.savedPanel.renameFailed"));
   }
 }
 
@@ -220,7 +221,7 @@ async function confirmDelete(entry: SavedQuery) {
     renamingId.value = null;
     await loadSaved();
   } catch (err) {
-    actionError.value = messageOf(err, "删不了保存的查询");
+    actionError.value = messageOf(err, t("history.savedPanel.deleteFailed"));
   }
 }
 
@@ -239,40 +240,40 @@ onMounted(() => {
     <div class="page-inner">
       <div class="page-head">
         <div>
-          <h1>{{ section === "saved" ? "保存的查询" : "查询历史" }}</h1>
-          <p v-if="section === 'saved'">按名称保存当前 SQL。</p>
-          <p v-else>找回执行过的 SQL，检查结果，再回到编辑器继续工作。</p>
-          <div class="hist-switch" role="tablist" aria-label="历史与保存的查询">
-            <button class="btn sm" type="button" role="tab" :aria-selected="section === 'runs'" data-action="show-history" @click="showSection('runs')">执行历史</button>
-            <button class="btn sm" type="button" role="tab" :aria-selected="section === 'saved'" data-action="show-saved" @click="showSection('saved')">保存的查询</button>
+          <h1>{{ section === "saved" ? t("history.page.titleSaved") : t("history.page.titleRuns") }}</h1>
+          <p v-if="section === 'saved'">{{ t("history.page.subtitleSaved") }}</p>
+          <p v-else>{{ t("history.page.subtitleRuns") }}</p>
+          <div class="hist-switch" role="tablist" :aria-label="t('history.page.tabsLabel')">
+            <button class="btn sm" type="button" role="tab" :aria-selected="section === 'runs'" data-action="show-history" @click="showSection('runs')">{{ t("history.page.runs") }}</button>
+            <button class="btn sm" type="button" role="tab" :aria-selected="section === 'saved'" data-action="show-saved" @click="showSection('saved')">{{ t("history.page.saved") }}</button>
           </div>
         </div>
-        <button v-if="section === 'runs'" class="btn danger" type="button" data-action="clear-history" :disabled="!entries.length" @click="confirmingClear = true">清空历史</button>
+        <button v-if="section === 'runs'" class="btn danger" type="button" data-action="clear-history" :disabled="!entries.length" @click="confirmingClear = true">{{ t("history.page.clear") }}</button>
       </div>
 
       <template v-if="section === 'runs'">
-      <div v-if="confirmingClear" class="hist-clear" role="alert"><span>清空本机的全部查询历史？此操作无法撤销。</span><button class="btn sm" @click="confirmingClear = false">取消</button><button class="btn sm danger" data-action="confirm-clear-history" @click="clearHistory">确认清空</button></div>
+      <div v-if="confirmingClear" class="hist-clear" role="alert"><span>{{ t("history.page.clearConfirm") }}</span><button class="btn sm" @click="confirmingClear = false">{{ t("common.cancel") }}</button><button class="btn sm danger" data-action="confirm-clear-history" @click="clearHistory">{{ t("history.page.confirmClear") }}</button></div>
       <div class="hist-filters">
-        <input v-model="text" type="search" aria-label="搜索历史" placeholder="搜索 SQL 或连接名" />
-        <Listbox v-model="connectionId" :options="connectionOptions" aria-label="按连接筛选" />
-        <Listbox v-model="status" :options="statusOptions" aria-label="按结果筛选" />
+        <input v-model="text" type="search" :aria-label="t('history.page.searchLabel')" :placeholder="t('history.page.searchPlaceholder')" />
+        <Listbox v-model="connectionId" :options="connectionOptions" :aria-label="t('history.page.filterConnection')" />
+        <Listbox v-model="status" :options="statusOptions" :aria-label="t('history.page.filterStatus')" />
         <span class="grow"></span>
       </div>
       <p v-if="actionError" class="saved-alert" role="alert">{{ actionError }}</p>
 
       <div v-if="loadError" class="hist-error" role="alert">
         <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>
-        <p>历史没有读出来：{{ loadError }}</p>
-        <button class="btn sm" type="button" data-action="retry-history" @click="load">重试</button>
+        <p>{{ t("history.page.loadFailed", { error: loadError }) }}</p>
+        <button class="btn sm" type="button" data-action="retry-history" @click="load">{{ t("history.page.retry") }}</button>
       </div>
-      <div v-else-if="loading" class="empty"><p>正在读取历史…</p></div>
+      <div v-else-if="loading" class="empty"><p>{{ t("history.page.loading") }}</p></div>
       <div v-else-if="!visible.length" class="empty">
-        <h3>{{ entries.length ? "没有匹配的历史记录" : "历史为空" }}</h3>
-        <p>{{ entries.length ? "换个关键词或筛选条件试试。" : "执行过的 SQL 会出现在这里。" }}</p>
+        <h3>{{ entries.length ? t("history.page.noMatchTitle") : t("history.page.emptyTitle") }}</h3>
+        <p>{{ entries.length ? t("history.page.noMatchHint") : t("history.page.emptyHint") }}</p>
       </div>
 
       <div v-if="visible.length" class="history-layout"><div class="history-records">
-      <div class="history-count"><b>{{ visible.length }}</b> 条记录<span>仅保存在本机</span></div>
+      <div class="history-count"><b>{{ visible.length }}</b> {{ t("history.page.records", { n: visible.length }) }}<span>{{ t("history.page.localOnly") }}</span></div>
       <section v-for="group in groups" :key="group.key" class="hist-day">
         <h2>{{ group.label }}</h2>
         <ul class="hist-list">
@@ -280,94 +281,94 @@ onMounted(() => {
             <div class="hist-top">
               <span class="badge" :class="statusBadge(entry.status)">{{ statusLabel(entry.status) }}</span>
               <strong class="hist-target">{{ entry.connectionName }} / {{ entry.databaseName || "main" }}</strong>
-              <span v-if="isDeleted(entry)" class="badge warn">原连接已删除</span>
+              <span v-if="isDeleted(entry)" class="badge warn">{{ t("history.page.connectionDeleted") }}</span>
               <span class="grow"></span>
               <time v-if="timeOfDay(entry.startedAt)" class="muted sm mono">{{ timeOfDay(entry.startedAt) }}</time>
-              <span v-if="elapsedLabel(entry.elapsedMs)" class="muted sm mono">耗时 {{ elapsedLabel(entry.elapsedMs) }}</span>
+              <span v-if="elapsedLabel(entry.elapsedMs)" class="muted sm mono">{{ t("history.page.elapsed", { value: elapsedLabel(entry.elapsedMs) }) }}</span>
             </div>
-            <button class="hist-preview" :aria-label="`预览 SQL：${entry.sql.slice(0, 80)}`" @click="selectedId = entry.id"><code>{{ entry.sql }}</code></button>
+            <button class="hist-preview" :aria-label="t('history.page.previewSql', { sql: entry.sql.slice(0, 80) })" @click="selectedId = entry.id"><code>{{ entry.sql }}</code></button>
             <div class="hist-foot">
               <span class="muted sm">{{ entry.summary }}</span>
               <span class="grow"></span>
-              <span v-if="isDeleted(entry)" class="muted sm">载入后重新选择连接和库</span>
-              <button class="btn sm" type="button" data-action="open-history" @click="open(entry)">载入编辑器 ↗</button>
-              <button v-if="pendingDeleteId !== entry.id" class="btn sm danger" type="button" data-action="delete-run" @click="pendingDeleteId = entry.id">删除</button>
+              <span v-if="isDeleted(entry)" class="muted sm">{{ t("history.page.reloadNeeded") }}</span>
+              <button class="btn sm" type="button" data-action="open-history" @click="open(entry)">{{ t("history.page.loadToEditor") }}</button>
+              <button v-if="pendingDeleteId !== entry.id" class="btn sm danger" type="button" data-action="delete-run" @click="pendingDeleteId = entry.id">{{ t("common.remove") }}</button>
             </div>
             <div v-if="pendingDeleteId === entry.id" class="hist-clear" role="alert">
-              <span>删除这条查询历史？取消后它仍留在列表里。</span>
-              <button class="btn sm" type="button" data-action="cancel-delete-run" @click="pendingDeleteId = null">取消</button>
-              <button class="btn sm danger" type="button" data-action="confirm-delete-run" @click="confirmDeleteRun(entry)">确认删除</button>
+              <span>{{ t("history.page.deleteConfirm") }}</span>
+              <button class="btn sm" type="button" data-action="cancel-delete-run" @click="pendingDeleteId = null">{{ t("common.cancel") }}</button>
+              <button class="btn sm danger" type="button" data-action="confirm-delete-run" @click="confirmDeleteRun(entry)">{{ t("history.page.confirmDelete") }}</button>
             </div>
           </li>
         </ul>
       </section>
-      <footer class="history-pagination"><button class="btn sm" :disabled="page <= 1" @click="page--">上一页</button><span class="mono">{{ page }} / {{ pageCount }}</span><button class="btn sm" :disabled="page >= pageCount" @click="page++">下一页</button></footer>
+      <footer class="history-pagination"><button class="btn sm" :disabled="page <= 1" @click="page--">{{ t("history.page.prevPage") }}</button><span class="mono">{{ page }} / {{ pageCount }}</span><button class="btn sm" :disabled="page >= pageCount" @click="page++">{{ t("history.page.nextPage") }}</button></footer>
       </div>
       <aside v-if="selected" class="history-inspector">
-        <div class="inspector-head"><span>SQL 预览</span><span class="badge" :class="statusBadge(selected.status)">{{ statusLabel(selected.status) }}</span></div>
-        <dl><dt>连接</dt><dd>{{ selected.connectionName }}</dd><dt>数据库</dt><dd>{{ selected.databaseName || 'main' }}</dd><dt>执行耗时</dt><dd class="mono">{{ elapsedLabel(selected.elapsedMs) || '—' }}</dd></dl>
+        <div class="inspector-head"><span>{{ t("history.page.sqlPreview") }}</span><span class="badge" :class="statusBadge(selected.status)">{{ statusLabel(selected.status) }}</span></div>
+        <dl><dt>{{ t("history.page.fieldConnection") }}</dt><dd>{{ selected.connectionName }}</dd><dt>{{ t("history.page.fieldDatabase") }}</dt><dd>{{ selected.databaseName || 'main' }}</dd><dt>{{ t("history.page.fieldElapsed") }}</dt><dd class="mono">{{ elapsedLabel(selected.elapsedMs) || '—' }}</dd></dl>
         <pre>{{ selected.sql }}</pre>
         <p>{{ selected.summary }}</p>
-        <button class="btn primary" @click="open(selected)">载入编辑器</button>
-        <small>只载入 SQL，不会执行。</small>
+        <button class="btn primary" @click="open(selected)">{{ t("history.page.loadToEditorShort") }}</button>
+        <small>{{ t("history.page.loadOnlySql") }}</small>
       </aside>
       </div>
       </template>
 
-      <section v-else class="saved-panel" aria-label="保存的查询">
+      <section v-else class="saved-panel" :aria-label="t('history.savedPanel.label')">
         <form class="saved-form" @submit.prevent="saveCurrent">
-          <label>名称<input ref="nameInput" v-model="saveName" type="text" aria-label="保存查询的名称" data-action="saved-name" :disabled="!currentDraft" /></label>
-          <p v-if="!currentDraft">先打开一个查询标签，再保存其中的 SQL。</p>
+          <label>{{ t("history.savedPanel.nameLabel") }}<input ref="nameInput" v-model="saveName" type="text" :aria-label="t('history.savedPanel.nameLabel')" data-action="saved-name" :disabled="!currentDraft" /></label>
+          <p v-if="!currentDraft">{{ t("history.savedPanel.needTab") }}</p>
           <template v-else>
-            <p>保存当前编辑器中的 SQL<span v-if="currentDraft.connectionName">，并记住 {{ currentDraft.connectionName }} / {{ currentDraft.databaseName || "main" }}</span><span v-else>。还没有执行目标，打开时需要重新选择</span>。保存不会执行。</p>
+            <p>{{ t("history.savedPanel.saveCurrent") }}<span v-if="currentDraft.connectionName">{{ t("history.savedPanel.rememberTarget", { conn: currentDraft.connectionName, db: currentDraft.databaseName || "main" }) }}</span><span v-else>{{ t("history.savedPanel.noTargetNote") }}</span>{{ t("history.savedPanel.saveNoExec") }}</p>
             <pre class="saved-sql">{{ currentDraft.sql }}</pre>
           </template>
-          <p v-if="nameWillUpdate">这个名称已存在，保存会更新它的 SQL，不会执行。</p>
+          <p v-if="nameWillUpdate">{{ t("history.savedPanel.nameExists") }}</p>
           <p v-if="saveMessage" role="status">{{ saveMessage }}</p>
           <p v-if="saveError" class="saved-alert" role="alert">{{ saveError }}</p>
-          <button class="btn primary" type="submit" data-action="save-named-query" :disabled="!currentDraft">保存</button>
+          <button class="btn primary" type="submit" data-action="save-named-query" :disabled="!currentDraft">{{ t("history.savedPanel.save") }}</button>
         </form>
 
         <div class="hist-filters">
-          <input v-model="savedText" type="search" aria-label="按名称查找" placeholder="按名称查找" />
+          <input v-model="savedText" type="search" :aria-label="t('history.savedPanel.searchLabel')" :placeholder="t('history.savedPanel.searchLabel')" />
         </div>
         <p v-if="actionError" class="saved-alert" role="alert">{{ actionError }}</p>
         <div v-if="savedError" class="hist-error" role="alert">
           <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>
-          <p>保存的查询没有读出来：{{ savedError }}</p>
-          <button class="btn sm" type="button" data-action="retry-saved" @click="loadSaved">重试</button>
+          <p>{{ t("history.savedPanel.loadFailedText", { error: savedError }) }}</p>
+          <button class="btn sm" type="button" data-action="retry-saved" @click="loadSaved">{{ t("history.page.retry") }}</button>
         </div>
-        <div v-else-if="savedLoading" class="empty"><p>正在读取保存的查询…</p></div>
+        <div v-else-if="savedLoading" class="empty"><p>{{ t("history.savedPanel.loading") }}</p></div>
         <div v-else-if="!savedVisible.length" class="empty">
-          <h3>{{ savedEntries.length ? "没有匹配的名称" : "还没有保存的查询" }}</h3>
-          <p>{{ savedEntries.length ? "换个名称试试。" : "为当前 SQL 起一个名称后，它会出现在这里。" }}</p>
+          <h3>{{ savedEntries.length ? t("history.savedPanel.noMatchTitle") : t("history.savedPanel.emptyTitle") }}</h3>
+          <p>{{ savedEntries.length ? t("history.savedPanel.noMatchHint") : t("history.savedPanel.emptyHint") }}</p>
         </div>
         <ul v-else class="hist-list saved-list">
           <li v-for="item in savedVisible" :key="item.id" class="hist-card">
             <div class="hist-top">
               <strong class="hist-name">{{ item.name }}</strong>
-              <span class="muted sm">{{ item.connectionName ? `${item.connectionName} / ${item.databaseName || "main"}` : "未记录执行目标" }}</span>
+              <span class="muted sm">{{ item.connectionName ? `${item.connectionName} / ${item.databaseName || "main"}` : t("history.savedPanel.noTarget") }}</span>
               <span class="grow"></span>
-              <span v-if="savedNeedsTarget(item, knownIds)" class="badge warn">需要重新选择执行目标</span>
+              <span v-if="savedNeedsTarget(item, knownIds)" class="badge warn">{{ t("history.savedPanel.needsTarget") }}</span>
             </div>
             <pre class="saved-sql">{{ item.sql }}</pre>
             <div class="hist-foot">
-              <button class="btn sm" type="button" data-action="open-saved" @click="openSavedItem(item)">打开</button>
-              <button v-if="renamingId !== item.id" class="btn sm" type="button" data-action="rename-saved" @click="startRename(item)">重命名</button>
-              <button v-if="pendingDeleteId !== item.id" class="btn sm danger" type="button" data-action="delete-saved" @click="pendingDeleteId = item.id">删除</button>
+              <button class="btn sm" type="button" data-action="open-saved" @click="openSavedItem(item)">{{ t("history.savedPanel.open") }}</button>
+              <button v-if="renamingId !== item.id" class="btn sm" type="button" data-action="rename-saved" @click="startRename(item)">{{ t("history.savedPanel.rename") }}</button>
+              <button v-if="pendingDeleteId !== item.id" class="btn sm danger" type="button" data-action="delete-saved" @click="pendingDeleteId = item.id">{{ t("common.remove") }}</button>
               <span class="grow"></span>
-              <span class="muted sm">打开只载入 SQL，不会执行。</span>
+              <span class="muted sm">{{ t("history.savedPanel.openNote") }}</span>
             </div>
             <form v-if="renamingId === item.id" class="saved-rename" @submit.prevent="confirmRename(item)">
-              <input v-model="renameValue" type="text" :aria-label="`重命名 ${item.name}`" />
-              <button class="btn sm" type="button" data-action="cancel-rename-saved" @click="renamingId = null">取消</button>
-              <button class="btn sm" type="submit" data-action="confirm-rename-saved">确认重命名</button>
+              <input v-model="renameValue" type="text" :aria-label="t('history.savedPanel.renameLabel', { name: item.name })" />
+              <button class="btn sm" type="button" data-action="cancel-rename-saved" @click="renamingId = null">{{ t("common.cancel") }}</button>
+              <button class="btn sm" type="submit" data-action="confirm-rename-saved">{{ t("history.savedPanel.confirmRename") }}</button>
               <p v-if="renameError" class="saved-alert" role="alert">{{ renameError }}</p>
             </form>
             <div v-if="pendingDeleteId === item.id" class="hist-clear" role="alert">
-              <span>删除「{{ item.name }}」？取消后它仍留在列表里。</span>
-              <button class="btn sm" type="button" data-action="cancel-delete-saved" @click="pendingDeleteId = null">取消</button>
-              <button class="btn sm danger" type="button" data-action="confirm-delete-saved" @click="confirmDelete(item)">确认删除</button>
+              <span>{{ t("history.savedPanel.deleteConfirm", { name: item.name }) }}</span>
+              <button class="btn sm" type="button" data-action="cancel-delete-saved" @click="pendingDeleteId = null">{{ t("common.cancel") }}</button>
+              <button class="btn sm danger" type="button" data-action="confirm-delete-saved" @click="confirmDelete(item)">{{ t("history.page.confirmDelete") }}</button>
             </div>
           </li>
         </ul>

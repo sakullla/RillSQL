@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
+import { tr as t } from "../i18n";
 import { ENV_NONE, TONES, type EnvTag, type EnvTone } from "./model";
 
 const props = defineProps<{
@@ -63,15 +64,15 @@ function editSelected() {
 function submit() {
   const trimmed = label.value.trim();
   if (!trimmed) {
-    localError.value = "请填写标签名称";
+    localError.value = t("connections.tags.errRequired");
     return;
   }
   if ([...trimmed].length > 24) {
-    localError.value = "标签名称最多 24 个字";
+    localError.value = t("connections.tags.errTooLong");
     return;
   }
-  if (trimmed === "无标签") {
-    localError.value = "无标签表示不使用环境标签";
+  if (trimmed === t("connections.tags.none")) {
+    localError.value = t("connections.tags.errReserved");
     return;
   }
   localError.value = "";
@@ -109,45 +110,45 @@ watch(
 <template>
   <fieldset class="field env-field">
     <legend class="env-legend">
-      <span>环境标签</span>
+      <span>{{ t("connections.tags.legend") }}</span>
       <button class="btn ghost sm" type="button" data-action="env-manage" :aria-expanded="managing" @click="toggleManage">
-        {{ managing ? "完成" : "管理" }}
+        {{ managing ? t("connections.tags.done") : t("connections.tags.manage") }}
       </button>
     </legend>
-    <div class="env-pick" role="radiogroup" aria-label="环境标签">
+    <div class="env-pick" role="radiogroup" :aria-label="t('connections.tags.legend')">
       <label v-for="item in tags" :key="item.id" :class="{ on: modelValue === item.id }">
         <input type="radio" name="cf-env" :value="item.id" :checked="modelValue === item.id" @change="pick(item.id)" />
         <span class="env" :class="`env-${item.tone}`">{{ item.label }}</span>
       </label>
       <label :class="{ on: modelValue === ENV_NONE }">
         <input type="radio" name="cf-env" :value="ENV_NONE" :checked="modelValue === ENV_NONE" @change="pick(ENV_NONE)" />
-        <span class="env env-none">无标签</span>
+        <span class="env env-none">{{ t("connections.tags.none") }}</span>
       </label>
     </div>
     <div v-if="managing" class="env-manage">
       <div class="env-manage-head">
-        <b>{{ editing ? "编辑所选标签" : "添加标签" }}</b>
-        <button v-if="editing" class="btn ghost sm" type="button" data-action="env-add" @click="startAdd">添加新标签</button>
-        <button v-else-if="selected" class="btn ghost sm" type="button" data-action="env-edit" @click="editSelected">编辑所选</button>
+        <b>{{ editing ? t("connections.tags.editTitle") : t("connections.tags.addTitle") }}</b>
+        <button v-if="editing" class="btn ghost sm" type="button" data-action="env-add" @click="startAdd">{{ t("connections.tags.addNew") }}</button>
+        <button v-else-if="selected" class="btn ghost sm" type="button" data-action="env-edit" @click="editSelected">{{ t("connections.tags.editSelected") }}</button>
       </div>
       <label class="field">
-        <span>{{ editing ? "名称" : "新标签" }}</span>
-        <input v-model="label" data-field="env-label" maxlength="24" placeholder="例如 预发" @input="confirmDelete = false" />
+        <span>{{ editing ? t("connections.tags.nameLabel") : t("connections.tags.newLabel") }}</span>
+        <input v-model="label" data-field="env-label" maxlength="24" :placeholder="t('connections.tags.placeholder')" @input="confirmDelete = false" />
       </label>
-      <div class="tone-pick" role="radiogroup" aria-label="标签颜色">
+      <div class="tone-pick" role="radiogroup" :aria-label="t('connections.tags.color')">
         <label v-for="item in TONES" :key="item.id" :class="{ on: tone === item.id }">
           <input type="radio" name="cf-env-tone" :value="item.id" :checked="tone === item.id" @change="tone = item.id" />
-          <span class="env" :class="`env-${item.id}`">{{ item.label }}</span>
+          <span class="env" :class="`env-${item.id}`">{{ t(item.label) }}</span>
         </label>
       </div>
       <div class="env-manage-actions">
-        <button class="btn sm" type="button" data-action="env-save" @click="submit">{{ editing ? "保存" : "添加" }}</button>
+        <button class="btn sm" type="button" data-action="env-save" @click="submit">{{ editing ? t("common.save") : t("connections.tags.add") }}</button>
         <button v-if="editing" class="btn sm ghost danger" type="button" data-action="env-delete" @click="askRemove">
-          {{ confirmDelete ? "确认删除" : "删除" }}
+          {{ confirmDelete ? t("connections.tags.confirmDelete") : t("common.remove") }}
         </button>
       </div>
       <small v-if="localError || error" class="field-err">{{ localError || error }}</small>
-      <small v-else>删除后，使用这个标签的连接会改为无标签。改名会留在原来的连接上。</small>
+      <small v-else>{{ t("connections.tags.hint") }}</small>
     </div>
   </fieldset>
 </template>

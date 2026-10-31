@@ -2,10 +2,11 @@
 import { computed } from "vue";
 import { catalogConnections } from "../catalog/store";
 import { resolveTableTarget } from "../grid/target";
-import { PRODUCT_TITLE } from "./product";
+import { tr as t } from "../i18n";
+import { productTitle } from "./product";
 import Icon from "./Icon.vue";
 import type { ShellTab } from "./session";
-import { CONNECTION_STATUS_TEXT, OPERATION_STATE_TEXT, type OperationActivity, type OperationState } from "./status-text";
+import { connectionStatusText, operationStateText, type OperationActivity, type OperationState } from "./status-text";
 
 const props = defineProps<{
   tab: ShellTab | null;
@@ -30,7 +31,7 @@ const tableEnvironment = computed(() => {
 
 const statusLabel = computed(() => {
   const status = props.tab?.connectionStatus;
-  return status ? CONNECTION_STATUS_TEXT[status] : null;
+  return status ? connectionStatusText(status) : null;
 });
 
 const ACTIVITY_TONE: Record<OperationState, "info" | "ok" | "err" | "warn"> = {
@@ -46,7 +47,7 @@ const ACTIVITY_TONE: Record<OperationState, "info" | "ok" | "err" | "warn"> = {
     <div class="sb-left">
       <template v-if="onWorkspace && tab">
         <span v-if="tab.kind === 'query' && !tab.targetText" class="sb-item sb-warn">
-          <Icon name="database" />此查询还未选择执行目标——在查询里选一个连接和库
+          <Icon name="database" />{{ t("shell.statusbar.noTarget") }}
         </span>
         <span v-else-if="tab.targetText" class="sb-item sb-target">
           <Icon name="database" />
@@ -60,11 +61,11 @@ const ACTIVITY_TONE: Record<OperationState, "info" | "ok" | "err" | "warn"> = {
           <span v-if="tableEnvironment" class="env xs" :class="tableEnvironment.tone !== 'none' ? `env-${tableEnvironment.tone}` : undefined">{{ tableEnvironment.label }}</span>
         </span>
       </template>
-      <span v-else class="sb-item muted">{{ PRODUCT_TITLE }}</span>
+      <span v-else class="sb-item muted">{{ productTitle() }}</span>
     </div>
     <div class="sb-right">
       <span v-if="activity" class="sb-activity" :data-state="activity.state">
-        <span class="badge" :class="ACTIVITY_TONE[activity.state]">{{ OPERATION_STATE_TEXT[activity.state] }}</span>
+        <span class="badge" :class="ACTIVITY_TONE[activity.state]">{{ operationStateText(activity.state) }}</span>
         <span class="sb-activity-text">{{ activity.text }}</span>
       </span>
       <button
@@ -73,9 +74,9 @@ const ACTIVITY_TONE: Record<OperationState, "info" | "ok" | "err" | "warn"> = {
         type="button"
         data-action="status-cancel"
         :disabled="cancelRequested"
-        :title="cancelRequested ? '已经请求取消，等待数据库确认' : '取消正在执行的查询'"
+        :title="cancelRequested ? t('shell.statusbar.cancelRequestedTitle') : t('shell.statusbar.cancelTitle')"
         @click="emit('cancel')"
-      >{{ cancelRequested ? "正在取消…" : "取消查询" }}</button>
+      >{{ cancelRequested ? t("shell.statusbar.canceling") : t("shell.statusbar.cancelQuery") }}</button>
     </div>
   </footer>
 </template>

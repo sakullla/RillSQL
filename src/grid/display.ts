@@ -51,9 +51,9 @@ export function parseEnvelope(value: string): FieldEnvelope | null {
 export function showCell(value: Cell | undefined, previewBytesOrOptions: number | ShowOptions = PREVIEW_BYTES): ShownCell {
   const options: ShowOptions = typeof previewBytesOrOptions === "number" ? { previewBytes: previewBytesOrOptions } : previewBytesOrOptions;
   const previewBytes = options.previewBytes ?? PREVIEW_BYTES;
-  if (value === undefined) return { kind: "unset", label: "未填", title: "尚未填写", body: "" };
+  if (value === undefined) return { kind: "unset", label: tr("grid.value.unsetLabel"), title: tr("grid.value.unsetTitle"), body: "" };
   if (value === null) return { kind: "null", label: "NULL", title: "NULL", body: "" };
-  if (value === "") return { kind: "empty", label: "空字符串", title: "空字符串（长度 0）", body: "" };
+  if (value === "") return { kind: "empty", label: tr("grid.value.emptyLabel"), title: tr("grid.value.emptyTitle"), body: "" };
   const family = options.column ? valueFamily(options.column.typeName) : "text";
   if (family === "binary") return showBinary(value, options.opened === true);
   if (!options.resolved) {
@@ -116,8 +116,8 @@ export function isNumericColumn(column: Column | undefined): boolean {
 export { typeCaption };
 
 function largeText(bytes: number, preview: string): ShownCell {
-  const label = `大字段 · ${bytes} 字节 · ${preview}`;
-  return { kind: "large", label, title: "大字段，打开单元格查看完整内容", body: preview };
+  const label = tr("grid.value.largeLabel", { bytes, preview });
+  return { kind: "large", label, title: tr("grid.value.largeTitle"), body: preview };
 }
 
 function showBinary(value: string, opened: boolean): ShownCell {
@@ -125,14 +125,14 @@ function showBinary(value: string, opened: boolean): ShownCell {
   const hex = parseHex(value);
   const bytes = envelope?.kind === "binary" ? envelope.bytes : hex != null ? hex.length / 2 : byteLength(value);
   if (!opened || hex == null) {
-    return { kind: "large", label: `二进制 · ${bytes} 字节`, title: "二进制，打开后查看十六进制", body: "" };
+    return { kind: "large", label: tr("grid.value.binaryLabel", { bytes }), title: tr("grid.value.binaryTitle"), body: "" };
   }
   return { kind: "text", label: hex, title: hex, body: hex };
 }
 
 function formatText(value: string, family: ReturnType<typeof valueFamily>): string {
   if (family === "bool") return boolLiteral(value) ?? value;
-  if (family === "float") return `${value} · 近似`;
+  if (family === "float") return tr("grid.value.floatApprox", { value });
   if (family === "date" || family === "time" || family === "datetime") return formatTemporal(value, family);
   return value;
 }
@@ -152,3 +152,5 @@ function formatTemporal(value: string, family: "date" | "time" | "datetime"): st
 export function columnTemporal(typeName: string): ReturnType<typeof temporalKind> {
   return temporalKind(typeName);
 }
+
+import { tr } from "../i18n";

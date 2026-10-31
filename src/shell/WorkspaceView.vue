@@ -5,10 +5,11 @@ import DiagramView from "../diagram/DiagramView.vue";
 import { catalogConnections, catalogLoaded } from "../catalog/store";
 import type { CatalogObjectRef } from "../catalog/object-ref";
 import { resolveTableTarget, type TableTarget } from "../grid/target";
+import { tr as t } from "../i18n";
 import { targetDetail, targetKey, targetOptions, type TargetOption } from "../query/complete";
 import "../structure/structure.css";
 import Icon from "./Icon.vue";
-import type { QueryTarget, ShellTab } from "./session";
+import { tabTitle, type QueryTarget, type ShellTab } from "./session";
 import { loadSettings } from "./settings";
 import WelcomeView from "./WelcomeView.vue";
 
@@ -195,7 +196,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="workspace-view">
-  <div v-if="tabs.length" class="tabbar" role="tablist" aria-label="打开的标签" @contextmenu="onTabBarContext">
+  <div v-if="tabs.length" class="tabbar" role="tablist" :aria-label="t('shell.tabs.tablist')" @contextmenu="onTabBarContext">
     <div
       v-for="tab in tabs"
       :key="tab.id"
@@ -211,17 +212,17 @@ onBeforeUnmount(() => {
       @keydown="onTabKey($event, tab.id)"
     >
       <Icon :name="tab.kind === 'query' ? 'code' : tab.kind === 'diagram' ? 'link' : tab.kind === 'keys' ? 'key' : tab.kind === 'docs' ? 'columns' : 'table'" />
-      <span class="tab-title">{{ tab.title }}</span>
+      <span class="tab-title">{{ tabTitle(tab) }}</span>
       <span
         v-if="tab.targetText || tab.path || tab.kind === 'query'"
         class="tab-target"
         :class="{ none: !tab.targetText && !tab.path }"
-      >{{ tab.targetText || tab.path || "未选择连接" }}</span>
-      <button class="tab-x" type="button" :aria-label="`关闭 ${tab.title}`" title="关闭" @click.stop="emit('close', tab.id)">
+      >{{ tab.targetText || tab.path || t("shell.tabs.noConnection") }}</span>
+      <button class="tab-x" type="button" :aria-label="t('shell.tabs.closeAria', { title: tabTitle(tab) })" :title="t('common.close')" @click.stop="emit('close', tab.id)">
         <Icon name="x" />
       </button>
     </div>
-    <button class="icon-btn sm tab-new" type="button" aria-label="新建查询" title="新建查询" @click="emit('new-query')">
+    <button class="icon-btn sm tab-new" type="button" :aria-label="t('common.newQuery')" :title="t('common.newQuery')" @click="emit('new-query')">
       <Icon name="plus" />
     </button>
   </div>
@@ -244,15 +245,15 @@ onBeforeUnmount(() => {
     />
     <div v-else-if="active && danglingTarget(active)" class="tab-dangling" data-dangling-target>
       <div class="tab-dangling-card">
-        <h3>{{ active.title }}</h3>
-        <p>这个标签指向的连接已删除，内容没有恢复。标签可以关闭；查询草稿仍保留在标签里。</p>
+        <h3>{{ tabTitle(active) }}</h3>
+        <p>{{ t("shell.tabs.danglingNotice") }}</p>
         <p class="tab-dangling-path">{{ active.targetText || active.path || active.id }}</p>
       </div>
     </div>
     <div v-else-if="active && active.kind === 'table'" class="table-workspace">
-      <div class="pane-switch" role="tablist" aria-label="表内容">
-        <button type="button" role="tab" :aria-selected="paneOf(active) === 'data'" @click="showPane(active.id, 'data')">数据</button>
-        <button type="button" role="tab" :aria-selected="paneOf(active) === 'structure'" @click="showPane(active.id, 'structure')">结构</button>
+      <div class="pane-switch" role="tablist" :aria-label="t('shell.tabs.paneLabel')">
+        <button type="button" role="tab" :aria-selected="paneOf(active) === 'data'" @click="showPane(active.id, 'data')">{{ t("common.data") }}</button>
+        <button type="button" role="tab" :aria-selected="paneOf(active) === 'structure'" @click="showPane(active.id, 'structure')">{{ t("common.structure") }}</button>
       </div>
       <DataGrid
         v-if="paneOf(active) === 'data'"
@@ -303,14 +304,14 @@ onBeforeUnmount(() => {
     <DefinitionView
       v-else-if="active && active.kind === 'definition' && definitionObject(active)"
       :key="active.id"
-      :label="active.title"
+      :label="tabTitle(active)"
       :object="definitionObject(active)!"
       @copy-sql="emit('copy-definition', $event)"
     />
     <DiagramView
       v-else-if="active && active.kind === 'diagram' && active.connectionId && active.database != null"
       :key="active.id"
-      :label="active.title"
+      :label="tabTitle(active)"
       :connection-id="active.connectionId"
       :database="active.database"
       :schema="active.diagram?.schema ?? ''"
@@ -328,14 +329,14 @@ onBeforeUnmount(() => {
       class="menu tab-menu"
       data-menu="tab"
       role="menu"
-      :aria-label="`${menuTab.title} 的操作`"
+      :aria-label="t('shell.tabs.targetMenuLabel', { title: tabTitle(menuTab) })"
       :style="{ left: `${menu.x}px`, top: `${menu.y}px` }"
       @mousedown.stop
       @contextmenu.prevent
     >
       <template v-if="menuTab.kind === 'query'">
-        <div class="menu-head">选择执行目标</div>
-        <p v-if="!menuTargets.length" class="target-empty">还没有可用的连接——先在「连接」页新建一个。</p>
+        <div class="menu-head">{{ t("shell.tabs.pickTarget") }}</div>
+        <p v-if="!menuTargets.length" class="target-empty">{{ t("shell.tabs.noConnections") }}</p>
         <button
           v-for="option in menuTargets"
           :key="option.key"
@@ -352,14 +353,14 @@ onBeforeUnmount(() => {
         <div class="menu-sep" role="separator"></div>
       </template>
       <template v-else-if="menuTab.kind === 'table'">
-        <button class="menu-item" type="button" data-action="show-data" @click="showTablePane('data')">数据</button>
-        <button class="menu-item" type="button" data-action="show-structure" @click="showTablePane('structure')">结构</button>
+        <button class="menu-item" type="button" data-action="show-data" @click="showTablePane('data')">{{ t("common.data") }}</button>
+        <button class="menu-item" type="button" data-action="show-structure" @click="showTablePane('structure')">{{ t("common.structure") }}</button>
         <div class="menu-sep" role="separator"></div>
       </template>
-      <button class="menu-item" type="button" data-action="close-tab" @click="closeIds([menuTab.id])">关闭</button>
-      <button class="menu-item" type="button" data-action="close-others" :disabled="tabs.length < 2" @click="closeOthers(menuTab.id)">关闭其他</button>
-      <button class="menu-item" type="button" data-action="close-right" :disabled="isLastTab(menuTab.id)" @click="closeToTheRight(menuTab.id)">关闭右侧</button>
-      <button class="menu-item" type="button" data-action="close-all" @click="closeIds(tabs.map((tab) => tab.id))">关闭全部</button>
+      <button class="menu-item" type="button" data-action="close-tab" @click="closeIds([menuTab.id])">{{ t("common.close") }}</button>
+      <button class="menu-item" type="button" data-action="close-others" :disabled="tabs.length < 2" @click="closeOthers(menuTab.id)">{{ t("shell.tabs.closeOthers") }}</button>
+      <button class="menu-item" type="button" data-action="close-right" :disabled="isLastTab(menuTab.id)" @click="closeToTheRight(menuTab.id)">{{ t("shell.tabs.closeRight") }}</button>
+      <button class="menu-item" type="button" data-action="close-all" @click="closeIds(tabs.map((tab) => tab.id))">{{ t("shell.tabs.closeAll") }}</button>
     </div>
   </Teleport>
   </div>

@@ -23,16 +23,16 @@ export function scanRestart(pattern: string | null): { cursor: number; pattern: 
 /** PTTL 毫秒的展示：-1 永不过期；-2 键已不存在；其余换算成可读时长。 */
 export function describeTtl(ttlMs: number | null): string {
   if (ttlMs == null) return "—";
-  if (ttlMs === -1) return "永不过期";
-  if (ttlMs === -2) return "键已不存在";
-  if (ttlMs < 1000) return `${ttlMs} 毫秒`;
+  if (ttlMs === -1) return tr("redis.keys.neverExpire");
+  if (ttlMs === -2) return tr("redis.keys.missing");
+  if (ttlMs < 1000) return tr("redis.keys.ms", { n: ttlMs });
   const seconds = Math.floor(ttlMs / 1000);
-  if (seconds < 60) return `${seconds} 秒`;
+  if (seconds < 60) return tr("redis.keys.seconds", { n: seconds });
   const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`;
+  if (minutes < 60) return tr("redis.keys.minuteSeconds", { m: minutes, s: seconds % 60 });
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} 时 ${minutes % 60} 分`;
-  return `${Math.floor(hours / 24)} 天 ${hours % 24} 时`;
+  if (hours < 24) return tr("redis.keys.hourMinutes", { h: hours, m: minutes % 60 });
+  return tr("redis.keys.dayHours", { d: Math.floor(hours / 24), h: hours % 24 });
 }
 
 /** TTL 编辑输入 → 秒数：空串=移除过期（PERSIST）；非负整数=EXPIRE。 */
@@ -40,7 +40,7 @@ export function parseTtlInput(value: string): { seconds: number | null } | { err
   const trimmed = value.trim();
   if (!trimmed) return { seconds: null };
   if (!/^\d+$/.test(trimmed) || Number(trimmed) > 2_147_483_647) {
-    return { error: "TTL 秒数应为非负整数（留空表示永不过期）。" };
+    return { error: tr("redis.keys.ttlInvalid") };
   }
   return { seconds: Number(trimmed) };
 }
@@ -50,3 +50,5 @@ export function keyTypeBadge(keyType: string): string {
   const known = ["string", "hash", "list", "set", "zset", "stream"];
   return known.includes(keyType) ? keyType : keyType || "none";
 }
+
+import { tr } from "../i18n";

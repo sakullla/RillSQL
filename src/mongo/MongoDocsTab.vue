@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { tr as t } from "../i18n";
 import { computed, onMounted, ref } from "vue";
 import DocJsonView from "../values/DocJsonView.vue";
 import { failureOf, tauriMongoApi, type MongoApi, type MongoDoc } from "./api";
@@ -40,7 +41,7 @@ const confirmDelete = ref<MongoDoc | null>(null);
 
 const columns = computed(() => columnsOf(documents.value));
 const pageEnd = computed(() => skip.value + documents.value.length);
-const pageCount = computed(() => (filterApplied(appliedFilter.value) ? `匹配 ${total.value}` : `约 ${total.value} 篇`));
+const pageCount = computed(() => (filterApplied(appliedFilter.value) ? t("mongo.docs.matchedCount", { n: total.value }) : t("mongo.docs.aboutCount", { n: total.value })));
 
 async function loadPage() {
   if (loading.value) return;
@@ -101,9 +102,9 @@ async function copyJson(doc: MongoDoc) {
   try {
     const text = prettyJson(doc.json);
     await navigator.clipboard.writeText(text);
-    note.value = "已复制文档 JSON。";
+    note.value = t("mongo.docs.copiedJson");
   } catch {
-    actionError.value = "复制失败：浏览器剪贴板不可用。";
+    actionError.value = t("mongo.docs.copyFailed");
   }
 }
 
@@ -134,13 +135,13 @@ async function submitEditor() {
     if (editorMode.value === "edit" && viewDoc.value) {
       const outcome = await api.value.replaceDocument(props.connectionId, props.database, props.collection, viewDoc.value.idJson, text);
       if (outcome.matched === 0) {
-        editorError.value = "没有匹配到这篇文档（可能已被删除），本次没有改动任何数据。";
+        editorError.value = t("mongo.docs.notMatched");
         return;
       }
-      note.value = `已整体覆盖保存（matched ${outcome.matched}）。`;
+      note.value = t("mongo.docs.replacedNote", { matched: outcome.matched });
     } else {
       const outcome = await api.value.insertDocument(props.connectionId, props.database, props.collection, text);
-      note.value = `已新增文档，_id = ${outcome.insertedIdJson}。`;
+      note.value = t("mongo.docs.insertedNote", { id: outcome.insertedIdJson });
       skip.value = 0;
     }
     editorOpen.value = false;
@@ -165,7 +166,7 @@ async function runDelete() {
   if (!doc) return;
   try {
     const outcome = await api.value.deleteDocument(props.connectionId, props.database, props.collection, doc.idJson, true);
-    note.value = `已删除 ${outcome.deleted} 篇文档。`;
+    note.value = t("mongo.docs.deletedNote", { n: outcome.deleted });
     if (skip.value > 0 && documents.value.length === 1) skip.value = nextSkip(skip.value, DOC_PAGE_SIZE, -1);
     await loadPage();
   } catch (error) {
@@ -186,20 +187,20 @@ onMounted(loadPage);
           v-model="filterInput"
           class="mono"
           data-field="mongo-filter"
-          placeholder='JSON 过滤，如 {"status": "active"}'
-          aria-label="JSON 过滤"
+          :placeholder="t('mongo.tab.filterPlaceholder')"
+          :aria-label="t('mongo.tab.filterLabel')"
         />
-        <button class="btn sm" type="submit" data-action="mongo-apply-filter" :disabled="loading">过滤</button>
-        <button v-if="filterApplied(appliedFilter)" class="btn sm ghost" type="button" data-action="mongo-clear-filter" :disabled="loading" @click="clearFilter">清除</button>
+        <button class="btn sm" type="submit" data-action="mongo-apply-filter" :disabled="loading">{{ t("mongo.tab.apply") }}</button>
+        <button v-if="filterApplied(appliedFilter)" class="btn sm ghost" type="button" data-action="mongo-clear-filter" :disabled="loading" @click="clearFilter">{{ t("mongo.tab.clearFilter") }}</button>
       </form>
       <p v-if="filterError" class="md-error" role="alert" data-mongo-filter-error>{{ filterError }}</p>
       <div class="md-bar">
-        <span class="md-count" data-mongo-count>{{ pageCount }} · 第 {{ skip + 1 }}–{{ pageEnd }} 篇</span>
+        <span class="md-count" data-mongo-count>{{ pageCount }}{{ t("mongo.tab.pageRange", { from: skip + 1, to: pageEnd }) }}</span>
         <span class="grow"></span>
-        <button class="btn sm ghost" type="button" data-action="mongo-refresh" :disabled="loading" @click="refresh">刷新</button>
-        <button class="btn sm" type="button" data-action="mongo-prev" :disabled="loading || !canPrev(skip)" @click="turnPage(-1)">上一页</button>
-        <button class="btn sm" type="button" data-action="mongo-next" :disabled="loading || pageEnd >= total" @click="turnPage(1)">下一页</button>
-        <button class="btn sm primary" type="button" data-action="mongo-insert" @click="openInsert">新增文档</button>
+        <button class="btn sm ghost" type="button" data-action="mongo-refresh" :disabled="loading" @click="refresh">{{ t("mongo.tab.refresh") }}</button>
+        <button class="btn sm" type="button" data-action="mongo-prev" :disabled="loading || !canPrev(skip)" @click="turnPage(-1)">{{ t("mongo.tab.prevPage") }}</button>
+        <button class="btn sm" type="button" data-action="mongo-next" :disabled="loading || pageEnd >= total" @click="turnPage(1)">{{ t("mongo.tab.nextPage") }}</button>
+        <button class="btn sm primary" type="button" data-action="mongo-insert" @click="openInsert">{{ t("mongo.tab.insert") }}</button>
       </div>
       <p v-if="listError" class="md-error" role="alert" data-mongo-list-error>{{ listError }}</p>
       <p v-if="note" class="md-note ok" data-mongo-note>{{ note }}</p>
@@ -207,61 +208,61 @@ onMounted(loadPage);
     </header>
 
     <div class="md-grid-wrap">
-      <table v-if="documents.length" class="md-grid" aria-label="集合文档">
+      <table v-if="documents.length" class="md-grid" :aria-label="t('mongo.tab.gridLabel')">
         <thead>
           <tr>
             <th v-for="column in columns" :key="column" class="mono" :data-column="column">{{ column }}</th>
-            <th class="md-ops-col">操作</th>
+            <th class="md-ops-col">{{ t("mongo.tab.ops") }}</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="doc in documents" :key="doc.idJson" :data-doc-id="doc.idJson">
             <td v-for="column in columns" :key="column" class="mono md-cell" :data-cell="column" :title="cellText(doc.json, column)">{{ cellText(doc.json, column) }}</td>
             <td class="md-ops">
-              <button class="btn xs" type="button" data-action="mongo-view" @click="openView(doc)">查看</button>
-              <button class="btn xs" type="button" data-action="mongo-copy" @click="copyJson(doc)">复制</button>
-              <button class="btn xs" type="button" data-action="mongo-edit" @click="openEdit(doc)">编辑</button>
-              <button class="btn xs danger" type="button" data-action="mongo-delete" @click="askDelete(doc)">删除</button>
+              <button class="btn xs" type="button" data-action="mongo-view" @click="openView(doc)">{{ t("mongo.tab.view") }}</button>
+              <button class="btn xs" type="button" data-action="mongo-copy" @click="copyJson(doc)">{{ t("common.copy") }}</button>
+              <button class="btn xs" type="button" data-action="mongo-edit" @click="openEdit(doc)">{{ t("mongo.tab.edit") }}</button>
+              <button class="btn xs danger" type="button" data-action="mongo-delete" @click="askDelete(doc)">{{ t("common.remove") }}</button>
             </td>
           </tr>
         </tbody>
       </table>
       <p v-else-if="!loading && !listError" class="md-empty">
-        {{ filterApplied(appliedFilter) ? "没有匹配过滤条件的文档。" : "这个集合没有文档。" }}
+        {{ filterApplied(appliedFilter) ? t("mongo.tab.emptyFiltered") : t("mongo.tab.emptyCollection") }}
       </p>
-      <p v-else-if="loading" class="md-empty">读取中…</p>
+      <p v-else-if="loading" class="md-empty">{{ t("mongo.tab.loading") }}</p>
     </div>
 
-    <aside v-if="viewDoc" class="md-view" aria-label="文档 JSON">
+    <aside v-if="viewDoc" class="md-view" :aria-label="t('mongo.tab.viewLabel')">
       <header class="md-view-head">
-        <h4>文档 JSON</h4>
+        <h4>{{ t("mongo.tab.viewTitle") }}</h4>
         <span class="md-id mono">{{ viewDoc.idJson }}</span>
         <span class="grow"></span>
-        <button class="btn sm ghost" type="button" data-action="mongo-close-view" @click="viewDoc = null">关闭</button>
+        <button class="btn sm ghost" type="button" data-action="mongo-close-view" @click="viewDoc = null">{{ t("mongo.tab.close") }}</button>
       </header>
       <DocJsonView :json="viewDoc.json" />
     </aside>
 
-    <div v-if="editorOpen" class="md-overlay" data-menu="editor" role="dialog" aria-label="编辑文档 JSON" @click.self="editorOpen = false">
+    <div v-if="editorOpen" class="md-overlay" data-menu="editor" role="dialog" :aria-label="t('mongo.tab.editLabel')" @click.self="editorOpen = false">
       <form class="md-card" @submit.prevent="submitEditor">
-        <h4>{{ editorMode === "edit" ? "整体覆盖保存文档" : "新增文档" }}</h4>
-        <p class="md-hint">提交整份 JSON 覆盖原文档；非法 JSON 会被拦截，不会发出任何写入。</p>
-        <textarea v-model="editorText" class="mono" data-field="mongo-editor" rows="14" aria-label="文档 JSON"></textarea>
+        <h4>{{ editorMode === "edit" ? t("mongo.tab.editTitle") : t("mongo.tab.insertTitle") }}</h4>
+        <p class="md-hint">{{ t("mongo.tab.editHint") }}</p>
+        <textarea v-model="editorText" class="mono" data-field="mongo-editor" rows="14" :aria-label="t('mongo.tab.editorLabel')"></textarea>
         <p v-if="editorError" class="md-error" role="alert" data-mongo-editor-error>{{ editorError }}</p>
         <div class="md-card-actions">
-          <button class="btn sm" type="button" data-action="mongo-editor-cancel" @click="editorOpen = false">取消</button>
-          <button class="btn sm primary" type="submit" data-action="mongo-editor-save">{{ editorMode === "edit" ? "校验并覆盖保存" : "校验并新增" }}</button>
+          <button class="btn sm" type="button" data-action="mongo-editor-cancel" @click="editorOpen = false">{{ t("mongo.tab.cancel") }}</button>
+          <button class="btn sm primary" type="submit" data-action="mongo-editor-save">{{ editorMode === "edit" ? t("mongo.tab.saveReplace") : t("mongo.tab.saveInsert") }}</button>
         </div>
       </form>
     </div>
 
-    <div v-if="confirmDelete" class="md-overlay" data-menu="confirm" role="dialog" aria-label="删除文档确认" @click.self="cancelDelete">
+    <div v-if="confirmDelete" class="md-overlay" data-menu="confirm" role="dialog" :aria-label="t('mongo.tab.deleteLabel')" @click.self="cancelDelete">
       <div class="md-card">
-        <h4>删除文档</h4>
-        <p class="md-prompt" data-mongo-confirm-prompt>将删除这篇文档（_id {{ confirmDelete.idJson }}），删除后不可恢复。确认删除？</p>
+        <h4>{{ t("mongo.tab.deleteTitle") }}</h4>
+        <p class="md-prompt" data-mongo-confirm-prompt>{{ t("mongo.tab.deletePrompt", { id: confirmDelete.idJson }) }}</p>
         <div class="md-card-actions">
-          <button class="btn sm" type="button" data-action="mongo-confirm-cancel" @click="cancelDelete">取消</button>
-          <button class="btn sm danger" type="button" data-action="mongo-confirm-ok" @click="runDelete">确认删除</button>
+          <button class="btn sm" type="button" data-action="mongo-confirm-cancel" @click="cancelDelete">{{ t("mongo.tab.cancel") }}</button>
+          <button class="btn sm danger" type="button" data-action="mongo-confirm-ok" @click="runDelete">{{ t("mongo.tab.confirmDelete") }}</button>
         </div>
       </div>
     </div>

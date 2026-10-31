@@ -1,4 +1,5 @@
 import * as XLSX from "@e965/xlsx";
+import { tr } from "../i18n";
 import type { Cell } from "../grid/types";
 import type { ImportParse } from "./import";
 
@@ -8,7 +9,7 @@ function asBytes(out: unknown): Uint8Array {
   if (out instanceof Uint8Array) return out;
   if (out instanceof ArrayBuffer) return new Uint8Array(out);
   if (Array.isArray(out)) return Uint8Array.from(out as number[]);
-  throw new Error("无法生成 xlsx");
+  throw new Error(tr("export.xlsx.cannotGenerate"));
 }
 
 /** 空单元格不写记号。空字符串也留空，读回时与 NULL 相同。 */
@@ -73,31 +74,31 @@ function zipMagic(bytes: Uint8Array): boolean {
 
 /** 只读第一个工作表。第一行是列名。空单元格是 NULL，不识别额外的空值记号。 */
 export function parseImportXlsx(bytes: Uint8Array): ImportParse {
-  if (bytes.byteLength === 0) return { ok: false, reason: "xlsx 文件是空的。" };
-  if (!zipMagic(bytes)) return { ok: false, reason: "第一个工作表不是表。" };
+  if (bytes.byteLength === 0) return { ok: false, reason: tr("export.xlsx.emptyFile") };
+  if (!zipMagic(bytes)) return { ok: false, reason: tr("export.xlsx.firstSheetNotTable") };
   let book: XLSX.WorkBook;
   try {
     book = XLSX.read(bytes, { type: "array", cellDates: false });
   } catch {
-    return { ok: false, reason: "第一个工作表不是表。" };
+    return { ok: false, reason: tr("export.xlsx.firstSheetNotTable") };
   }
   const sheetName = book.SheetNames[0];
-  if (!sheetName) return { ok: false, reason: "xlsx 文件是空的。" };
+  if (!sheetName) return { ok: false, reason: tr("export.xlsx.emptyFile") };
   const sheet = book.Sheets[sheetName];
-  if (!sheet) return { ok: false, reason: "xlsx 文件是空的。" };
+  if (!sheet) return { ok: false, reason: tr("export.xlsx.emptyFile") };
   const kind = sheetKind(sheet);
-  if (kind && NON_TABLE.has(kind)) return { ok: false, reason: "第一个工作表不是表。" };
-  if (!hasCells(sheet) || !sheet["!ref"]) return { ok: false, reason: "xlsx 文件是空的。" };
+  if (kind && NON_TABLE.has(kind)) return { ok: false, reason: tr("export.xlsx.firstSheetNotTable") };
+  if (!hasCells(sheet) || !sheet["!ref"]) return { ok: false, reason: tr("export.xlsx.emptyFile") };
   const range = XLSX.utils.decode_range(sheet["!ref"]);
-  if (range.s.r !== 0) return { ok: false, reason: "xlsx 缺少列名。" };
+  if (range.s.r !== 0) return { ok: false, reason: tr("export.xlsx.noHeader") };
   const matrix = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1, raw: false, defval: null, blankrows: true });
   const header = matrix[0];
-  if (!header?.length) return { ok: false, reason: "xlsx 缺少列名。" };
+  if (!header?.length) return { ok: false, reason: tr("export.xlsx.noHeader") };
   const columns: string[] = [];
   for (const cell of header) {
     const name = cellText(cell)?.trim() ?? "";
-    if (!name) return { ok: false, reason: "xlsx 缺少列名。" };
-    if (columns.includes(name)) return { ok: false, reason: `xlsx 列名重复：${name}` };
+    if (!name) return { ok: false, reason: tr("export.xlsx.noHeader") };
+    if (columns.includes(name)) return { ok: false, reason: tr("export.xlsx.duplicate", { name }) };
     columns.push(name);
   }
   const rows = matrix.slice(1).filter((row) => row.some((cell) => cellText(cell) !== null)).map((row) => {

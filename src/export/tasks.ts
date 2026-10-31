@@ -1,4 +1,5 @@
 import { reactive } from "vue";
+import { tr } from "../i18n";
 import { gridExport, gridExportCancel, type ExportResult } from "../grid/api";
 import type { Filter, SortSpec } from "../grid/types";
 import { renderCsv, type CsvCell, type CsvOptions } from "./csv";
@@ -93,11 +94,11 @@ export function renderExportText(options: {
   csv: CsvOptions;
   insert?: InsertTarget;
 }): string {
-  if (options.format === "xlsx") throw new Error("xlsx 不是文本");
+  if (options.format === "xlsx") throw new Error(tr("export.tasks.notText"));
   if (options.format === "json") return renderJson(options.columns, options.rows);
   if (options.format === "markdown") return renderMarkdown(options.columns, options.rows, { nullToken: options.csv.nullToken });
   if (options.format === "insert") {
-    if (!options.insert?.name) throw new Error("还不能确定 INSERT 要写入的表");
+    if (!options.insert?.name) throw new Error(tr("export.tasks.noInsertTarget"));
     return renderInsert(options.insert, options.columns, options.rows);
   }
   return renderCsv(options.columns, options.rows, options.csv);
@@ -114,21 +115,21 @@ function exportLoadedInBrowser(options: {
   insert?: InsertTarget;
   readRows?: () => readonly Record<string, CsvCell>[];
 }): WriteResult {
-  if (!options.plan.allowed) return blockedExport(options.plan.rejectReason ?? "不能导出");
-  if (options.plan.reexecutes && !options.acknowledged) return blockedExport("执行前需说明会重新执行这条 SELECT");
-  if ((options.format ?? "csv") === "insert" && !options.insert?.name) return blockedExport("还不能确定 INSERT 要写入的表");
+  if (!options.plan.allowed) return blockedExport(options.plan.rejectReason ?? tr("export.tasks.blockedExport"));
+  if (options.plan.reexecutes && !options.acknowledged) return blockedExport(tr("export.tasks.needAck"));
+  if ((options.format ?? "csv") === "insert" && !options.insert?.name) return blockedExport(tr("export.tasks.noInsertTarget"));
   let readCalled = false;
   let rows = options.rows;
   if (options.plan.serverRead) {
-    if (!options.readRows) return blockedExport("没有可重新读取的数据源");
+    if (!options.readRows) return blockedExport(tr("export.tasks.noSource"));
     readCalled = true;
     rows = options.readRows();
   }
   const fileName = options.path.split(/[/\\]/).pop() || options.plan.fileName;
   if ((options.format ?? "csv") === "xlsx") downloadBytes(fileName, renderXlsx(options.columns, rows), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   else downloadCsv(fileName, renderExportText({ ...options, rows }));
-  let message = `已导出 ${rows.length} 行，开始下载 ${fileName}。`;
-  if (options.plan.partial) message = `已导出 ${rows.length} 行，开始下载 ${fileName}。这只是已读取的行，不是完整结果。`;
+  let message = tr("export.tasks.downloaded", { n: rows.length, name: fileName });
+  if (options.plan.partial) message = tr("export.tasks.downloadedPartial", { n: rows.length, name: fileName });
   if (options.plan.reexecutes) message = `${options.plan.notice}${message}`;
   return { status: "done", success: true, writtenRows: rows.length, path: options.path, residualPath: null, message, readCalled };
 }
@@ -180,7 +181,7 @@ export async function runExportTask(options: {
     doneRows: 0,
     totalRows: options.rows.length,
     partial: options.plan.partial,
-    message: "正在导出",
+    message: tr("export.tasks.exporting"),
     cancellable: false,
     residualPath: null,
   });
@@ -188,21 +189,21 @@ export async function runExportTask(options: {
   exportTasks.unshift(task);
   let result: WriteResult;
   try {
-    if (!options.plan.allowed) result = blockedExport(options.plan.rejectReason ?? "不能导出");
+    if (!options.plan.allowed) result = blockedExport(options.plan.rejectReason ?? tr("export.tasks.blockedExport"));
     else if (isNativeExport() && (options.format ?? "csv") !== "xlsx") {
-      if (options.plan.serverRead) result = blockedExport("全量导出需要使用已打开的数据库连接。");
+      if (options.plan.serverRead) result = blockedExport(tr("export.tasks.needConnectionFull"));
       else {
         await writeNativeCsv(options.path, renderExportText(options));
         result = {
           status: "done", success: true, writtenRows: options.rows.length, path: options.path,
           residualPath: null, readCalled: false,
-          message: `已导出 ${options.rows.length} 行到 ${options.path}。${options.plan.partial ? "仅包含已读取的行，不是完整结果。" : ""}`,
+          message: `${tr("export.tasks.exportedTo", { n: options.rows.length, path: options.path })}${options.plan.partial ? tr("export.tasks.partialOnly") : ""}`,
         };
       }
     } else result = import.meta.env.VITEST ? await startExportOnNode(options, task) : exportLoadedInBrowser(options);
   } catch (error) {
     result = { status: "failed", success: false, writtenRows: 0, path: null, residualPath: null, readCalled: false,
-      message: `导出失败：${error instanceof Error ? error.message : String(error)}` };
+      message: tr("export.tasks.exportFailed", { error: error instanceof Error ? error.message : String(error) }) };
   }
   applyWriteResult(task, result);
   return { task, result };
@@ -248,7 +249,7 @@ function applyExportResult(task: ExportTask, result: ExportResult): void {
   }
   if (result.success && result.status !== "done") {
     task.status = "failed";
-    task.message = result.message || "导出没有完成，不能记为成功";
+    task.message = result.message || tr("export.tasks.notFinished");
   }
 }
 
@@ -262,7 +263,7 @@ export function runRemoteExport(options: RemoteExportOptions): { task: ExportTas
     doneRows: 0,
     totalRows: options.mode === "table-loaded" ? options.limit : 0,
     partial: options.plan.partial,
-    message: "正在从已打开的连接导出",
+    message: tr("export.tasks.remoteExporting"),
     residualPath: null,
   });
   taskSeq += 1;
@@ -323,7 +324,7 @@ function applyDumpResult(task: ExportTask, result: DumpResult): void {
   }
   if (result.success && result.status !== "done") {
     task.status = "failed";
-    task.message = result.message || "导出没有完成，不能记为成功";
+    task.message = result.message || tr("export.tasks.notFinished");
   }
 }
 
@@ -334,9 +335,9 @@ export function applyDumpProgress(payload: DumpProgressEvent): void {
   task.object = payload.object;
   if (payload.phase === "data") {
     task.doneRows = payload.rows;
-    task.message = `正在导出 ${payload.object} 的数据：已写入 ${payload.rows} 行`;
+    task.message = tr("export.tasks.dataProgress", { object: payload.object, rows: payload.rows });
   } else {
-    task.message = `正在导出结构：${payload.object}`;
+    task.message = tr("export.tasks.structureProgress", { object: payload.object });
   }
 }
 
@@ -367,7 +368,7 @@ export function runDatabaseDump(options: DumpPayload): { task: ExportTask; done:
     doneRows: 0,
     totalRows: 0,
     partial: false,
-    message: "正在从已打开的连接导出整库",
+    message: tr("export.tasks.dumpExporting"),
     residualPath: null,
   });
   exportTasks.unshift(task);
@@ -399,7 +400,7 @@ function applyMigrateResult(task: ExportTask, result: MigrateResult): void {
   task.report = { failedIds: result.failedIds, firstErrors: result.firstErrors };
   if (result.success && result.status !== "done") {
     task.status = "failed";
-    task.message = result.message || "迁移没有完成，不能记为成功";
+    task.message = result.message || tr("export.tasks.migrateNotDone");
   }
 }
 
@@ -408,7 +409,7 @@ export function applyMigrateProgress(payload: MigrateProgressEvent): void {
   const task = exportTasks.find((item) => item.id === payload.id);
   if (!task || task.status !== "running") return;
   task.doneRows = payload.rows;
-  task.message = `正在迁移：已处理 ${payload.rows} 行（插入 ${payload.inserted}、跳过 ${payload.skipped}、失败 ${payload.failed}）`;
+  task.message = tr("export.migrate.migratingLine", { rows: payload.rows, inserted: payload.inserted, skipped: payload.skipped, failed: payload.failed });
 }
 
 let migrateListener: Promise<void> | null = null;
@@ -434,13 +435,13 @@ export function runMigrateTask(options: MigratePayload): { task: ExportTask; don
   const task = reactive<ExportTask>({
     id: options.id,
     kind: "migrate",
-    fileName: `迁移 ${name}`,
+    fileName: tr("export.migrate.migrationLabel", { name }),
     path: `${options.source.connectionId}/${options.source.table} → ${options.target.connectionId}/${options.target.table}`,
     status: "running",
     doneRows: 0,
     totalRows: 0,
     partial: false,
-    message: "正在准备迁移：读取两边的表结构",
+    message: tr("export.migrate.preparing"),
     residualPath: null,
   });
   exportTasks.unshift(task);
@@ -467,36 +468,36 @@ export function cancelTask(task: ExportTask): Promise<void> {
 
 /** 后台任务状态的直白文字：颜色不作唯一信息来源，状态词始终在。 */
 export function taskStatusLabel(status: ExportTask["status"]): string {
-  if (status === "running") return "进行中";
-  if (status === "done") return "已完成";
-  if (status === "cancelled") return "已取消";
-  if (status === "blocked") return "未开始";
-  return "失败";
+  if (status === "running") return tr("export.tasks.statusRunning");
+  if (status === "done") return tr("export.tasks.statusDone");
+  if (status === "cancelled") return tr("export.tasks.statusCancelled");
+  if (status === "blocked") return tr("export.tasks.statusBlocked");
+  return tr("export.tasks.statusFailed");
 }
 
 export function taskStatusText(task: ExportTask): string {
   if (task.status === "running") {
     if (task.kind === "dump" || task.kind === "migrate") return task.message;
-    return task.totalRows > 0 ? `正在导出：已写入 ${task.doneRows} / ${task.totalRows} 行` : `正在导出：已写入 ${task.doneRows} 行`;
+    return task.totalRows > 0 ? tr("export.tasks.exportProgressRows", { done: task.doneRows, total: task.totalRows }) : tr("export.tasks.exportProgressDone", { done: task.doneRows });
   }
   if (task.status === "done") {
     if (task.kind === "dump" || task.kind === "migrate") return task.message;
-    return `已完成：写入 ${task.totalRows} 行${task.partial ? "，只是已读取的行，不是完整结果" : ""}`;
+    return task.partial ? tr("export.tasks.doneRowsPartial", { n: task.totalRows }) : tr("export.tasks.doneRows", { n: task.totalRows });
   }
   if (task.status === "cancelled") {
     if (task.kind === "migrate") return task.message;
-    return "已取消：未完成的文件已删除";
+    return tr("export.tasks.cancelledDeleted");
   }
-  if (task.status === "blocked") return `没有开始：${task.message}`;
-  if (task.kind === "migrate") return `迁移失败：${task.message || "原因未知"}`;
-  return `导出失败：${task.message || "原因未知"}`;
+  if (task.status === "blocked") return tr("export.tasks.blockedStart", { message: task.message });
+  if (task.kind === "migrate") return tr("export.tasks.migrateFailedShort", { message: task.message || tr("export.tasks.unknownReason") });
+  return tr("export.tasks.exportFailedShort", { message: task.message || tr("export.tasks.unknownReason") });
 }
 
 /** 已读取的行不再查询数据库。停在 0 行的旧任务改成未完成，标题不再一直显示「导出 0/N」。 */
 export function failIdleRemoteExports(message: string): void {
   for (const task of exportTasks) {
     if (task.status !== "running" || task.doneRows !== 0 || task.totalRows <= 0) continue;
-    if (!task.message.startsWith("正在从已打开的连接导出")) continue;
+    if (!task.message.startsWith(tr("export.tasks.remoteExporting")) && !task.message.startsWith(tr("export.tasks.dumpExporting"))) continue;
     task.status = "failed";
     task.message = message;
   }

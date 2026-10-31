@@ -30,8 +30,8 @@ export function savedName(name: string): string {
 
 export function savedNameError(name: string): string | null {
   const trimmed = savedName(name);
-  if (!trimmed) return "请填写名称";
-  if ([...trimmed].length > 200) return "名称不能超过 200 个字";
+  if (!trimmed) return tr("history.savedValidate.required");
+  if ([...trimmed].length > 200) return tr("history.savedValidate.tooLong");
   return null;
 }
 
@@ -58,3 +58,5 @@ export function filterSaved(entries: readonly SavedQuery[], text: string): Saved
   if (!query) return [...entries];
   return entries.filter((entry) => entry.name.toLowerCase().includes(query));
 }
+
+import { tr } from "../i18n";

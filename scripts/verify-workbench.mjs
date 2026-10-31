@@ -1,9 +1,19 @@
 import { chromium, expect } from "@playwright/test";
 import fs from "node:fs";
 import { installSyntheticIpc } from "./synthetic-ipc.mjs";
+import { scanChineseUiText } from "./i18n-scan.mjs";
+
+// R6/T6：全仓界面文案字典化扫描——模板/渲染层不允许再出现裸中文（注释与纯数据/测试文件除外）。
+const chineseViolations = scanChineseUiText();
+if (chineseViolations.length) {
+  console.error(`[i18n-scan] ${chineseViolations.length} 处裸中文残留：\n  ` + chineseViolations.join("\n  "));
+  process.exit(1);
+}
+
 const base = process.env.RILLSQL_PREVIEW_URL ?? "http://localhost:1420";
 const browser = await chromium.launch();
 const report = { source: "Synthetic IPC; frontend behavior and rendering only", rows: 10000, columns: 12, checks: [], metrics: {} };
+const HAN = /[\u3400-\u4dbf\u4e00-\u9fff]/;
 const page = await browser.newPage({ viewport: { width: 1360, height: 900 } });
 async function pickOption(targetPage, comboboxName, optionName) {
   await targetPage.getByRole("combobox", { name: comboboxName }).click();
@@ -316,6 +326,69 @@ try {
   expect(await page.locator(".ce-engine").allInnerTexts().then(list => list.join("|"))).not.toContain("ClickHouse");
   await page.getByRole("button", { name: "取消", exact: true }).click();
   report.checks.push("Engine selector shows exactly seven engines with MongoDB and no eighth entry (R14)");
+
+  // ---- R6/T6：语言切换即时生效 + 英文界面无中文残留 + 切回中文无缺项 ----
+  // 切英文：设置页语言行 → English。
+  await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "设置", exact: true }).click();
+  await pickOption(page, "界面语言", "English");
+  await expect(page.getByRole("heading", { name: "Settings", exact: true })).toBeVisible();
+  // 设置页（除 about 卡：品牌名「澄库 · RillSQL」与品牌释义按品牌专名保留中文）不允许出现汉字。
+  expect(await page.locator("section.set-sec:not(.about)").first().innerText()).not.toMatch(HAN);
+  for (const section of await page.locator("section.set-sec:not(.about)").all()) {
+    expect(await section.innerText()).not.toMatch(HAN);
+  }
+  expect(await page.locator(".settings-nav").innerText()).not.toMatch(HAN);
+  report.checks.push("Language switches to English instantly from the settings row");
+
+  // 主要界面遍历：连接 / 查询历史 / 工作台（欢迎空态）。数据夹具值（连接名等）是数据不是界面文案，
+  // 因此对 chrome 区域（页头/导航/状态栏/标题栏）断言无汉字。
+  const englishSurfaces = [];
+  const navEn = page.getByRole("navigation", { name: "Main navigation" });
+  await navEn.getByRole("button", { name: "Connections", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Connections", exact: true })).toBeVisible();
+  englishSurfaces.push(await page.locator(".page-head").innerText());
+  await navEn.getByRole("button", { name: "Query history", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Query history", exact: true })).toBeVisible();
+  englishSurfaces.push(await page.locator(".page-head").innerText());
+  await navEn.getByRole("button", { name: "Workbench", exact: true }).click();
+  await page.getByRole("button", { name: "Open command palette" }).click();
+  const paletteEn = page.getByRole("dialog", { name: "Command palette" });
+  await expect(paletteEn).toBeVisible();
+  // 面板可能停在「表」模式（此前 Ctrl+P 用例），输入 > 只看命令——命令名/分组头全走字典。
+  await paletteEn.getByRole("combobox").fill(">");
+  await page.waitForTimeout(200);
+  const paletteText = await paletteEn.innerText();
+  expect(paletteText).toContain("New query");
+  expect(paletteText).not.toMatch(HAN);
+  await page.keyboard.press("Escape");
+  englishSurfaces.push(await page.locator(".titlebar").innerText());
+  englishSurfaces.push(await page.locator(".rail").innerText());
+  for (const surface of englishSurfaces) expect(surface, surface).not.toMatch(HAN);
+  // 状态栏左侧会显示当前标签的连接名（数据），只断言状态文字走英文。
+  expect(await page.locator(".statusbar").innerText()).toContain("Connected");
+  report.checks.push("English locale: major surfaces (connections/history headings, palette, titlebar, statusbar, rail) show no Chinese leftovers");
+
+  // 快捷键帮助（英文）。
+  await page.getByRole("button", { name: "Shortcuts and help" }).click();
+  const helpEn = page.getByRole("dialog").filter({ hasText: "Keyboard shortcuts" });
+  await expect(helpEn).toBeVisible();
+  expect(await helpEn.innerText()).not.toMatch(HAN);
+  await helpEn.getByRole("button", { name: "Got it" }).click();
+
+  // 切回中文：同一批界面恢复中文（无缺项）。
+  await navEn.getByRole("button", { name: "Settings", exact: true }).click();
+  await pickOption(page, "Language", "中文（简体）");
+  await expect(page.getByRole("heading", { name: "设置", exact: true })).toBeVisible();
+  await expect(page.locator(".settings-nav")).toContainText("外观");
+  await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "连接", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "连接管理", exact: true })).toBeVisible();
+  report.checks.push("Switching back to Chinese restores every checked surface in Chinese");
+
+  // 刷新后语言持久化（localStorage 设置快照）。
+  await page.reload();
+  await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "设置", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "设置", exact: true })).toBeVisible();
+  report.checks.push("Locale choice persists across reload");
 
   expect(errors).toEqual([]);
   report.checks.push("No browser page errors");

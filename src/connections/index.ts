@@ -22,7 +22,7 @@ async function defaultSqlitePicker(): Promise<string | null> {
   const { open } = await import("@tauri-apps/plugin-dialog");
   const picked = await open({
     multiple: false,
-    title: "打开 SQLite 文件",
+    title: tr("common.openSqlite"),
     filters: [{ name: "SQLite", extensions: ["sqlite", "db", "sqlite3"] }],
   });
   if (picked === null) return null;
@@ -42,9 +42,9 @@ export async function pickSqliteFile(): Promise<string | null> {
 async function defaultExportPathPicker(encrypted: boolean): Promise<string | null> {
   const { save } = await import("@tauri-apps/plugin-dialog");
   return save({
-    title: encrypted ? "导出加密的连接文件" : "导出连接文件",
+    title: encrypted ? tr("connections.dialogs.exportTitleEncrypted") : tr("connections.dialogs.exportTitlePlain"),
     defaultPath: encrypted ? "rillsql-connections.rillsqlcx" : "rillsql-connections.json",
-    filters: [{ name: "RillSQL 连接文件", extensions: ["json", "rillsqlcx"] }],
+    filters: [{ name: tr("connections.dialogs.fileTypeName"), extensions: ["json", "rillsqlcx"] }],
   });
 }
 
@@ -63,8 +63,8 @@ async function defaultConnectionsFilePicker(): Promise<string | null> {
   const { open } = await import("@tauri-apps/plugin-dialog");
   const picked = await open({
     multiple: false,
-    title: "选择 RillSQL 连接文件",
-    filters: [{ name: "RillSQL 连接文件", extensions: ["json", "rillsqlcx"] }],
+    title: tr("connections.dialogs.importTitle"),
+    filters: [{ name: tr("connections.dialogs.fileTypeName"), extensions: ["json", "rillsqlcx"] }],
   });
   if (picked === null) return null;
   return Array.isArray(picked) ? (picked[0] ?? null) : picked;
@@ -80,3 +80,5 @@ export function setConnectionsFilePicker(picker: () => Promise<string | null>): 
 export async function pickConnectionsFile(): Promise<string | null> {
   return connectionsFilePicker();
 }
+
+import { tr } from "../i18n";

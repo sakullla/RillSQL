@@ -9,10 +9,10 @@ export interface PlanSelection {
 export type PlanPick = { ok: true; statement: string; from: number; to: number } | { ok: false; reason: string };
 export type ExplainSql = { ok: true; sql: string } | { ok: false; reason: string };
 
-const EMPTY = "没有可查看计划的语句。";
-const MULTIPLE = "一次只能查看一条语句的执行计划。";
-const ANALYZE = "计划不使用 ANALYZE，没有发送这条语句。";
-const SQLITE_ANALYZE = "SQLite 不支持实际执行并分析，没有发送会修改数据的语句。";
+const EMPTY_KEY = "query.plan.empty";
+const MULTIPLE_KEY = "query.plan.multiple";
+const ANALYZE_KEY = "query.plan.noAnalyze";
+const SQLITE_ANALYZE_KEY = "query.plan.sqliteAnalyze";
 
 /** 无选区时用光标所在语句，有选区时用选区。空语句、多条或未闭合时不执行。 */
 export function planStatement(sql: string, selection: PlanSelection, engine = "postgres"): PlanPick {
@@ -37,9 +37,9 @@ function onePlan(text: string, engine: string, from: number, to: number): PlanPi
   if (report.refusal) return { ok: false, reason: report.refusal };
   if (report.pieces.length === 0) {
     if (report.notices.length) return { ok: false, reason: report.notices.join("") };
-    return { ok: false, reason: EMPTY };
+    return { ok: false, reason: tr(EMPTY_KEY) };
   }
-  if (report.pieces.length > 1) return { ok: false, reason: MULTIPLE };
+  if (report.pieces.length > 1) return { ok: false, reason: tr(MULTIPLE_KEY) };
   return { ok: true, statement: report.pieces[0]!.text, from, to };
 }
 
@@ -50,12 +50,12 @@ function statementHasAnalyze(sql: string, engine: string): boolean {
   return pieces.some((piece) => codeHasAnalyze(piece.text, engine));
 }
 
-const SQLSERVER_ANALYZE = "SQL Server 的计划不实际执行语句，没有发送会修改数据的语句。";
+const SQLSERVER_ANALYZE_KEY = "query.plan.sqlserverAnalyze";
 
 /** PostgreSQL、MySQL、MariaDB 用 EXPLAIN；SQLite 用 EXPLAIN QUERY PLAN；SQL Server 用 SET SHOWPLAN_ALL 只编译不执行。不加 ANALYZE。 */
 export function explainSql(engine: string, statement: string): ExplainSql {
   const body = statement.trim().replace(/;\s*$/, "");
-  if (statementHasAnalyze(body, engine)) return { ok: false, reason: ANALYZE };
+  if (statementHasAnalyze(body, engine)) return { ok: false, reason: tr(ANALYZE_KEY) };
   if (engine === "sqlserver") return { ok: true, sql: showplanBatch(body) };
   if (/^\s*explain\b/i.test(body)) {
     if (engine === "sqlite" && !/^\s*explain\s+query\s+plan\b/i.test(body)) {
@@ -89,9 +89,9 @@ export function hierarchicalSql(engine: string, statement: string): ExplainSql {
 /** 确认后才会调用。SQLite 不生成会执行的语句。 */
 export function analyzeSql(engine: string, statement: string): ExplainSql {
   const body = statement.trim().replace(/;\s*$/, "");
-  if (!body) return { ok: false, reason: EMPTY };
-  if (engine === "sqlite") return { ok: false, reason: SQLITE_ANALYZE };
-  if (engine === "sqlserver") return { ok: false, reason: SQLSERVER_ANALYZE };
+  if (!body) return { ok: false, reason: tr(EMPTY_KEY) };
+  if (engine === "sqlite") return { ok: false, reason: tr(SQLITE_ANALYZE_KEY) };
+  if (engine === "sqlserver") return { ok: false, reason: tr(SQLSERVER_ANALYZE_KEY) };
   const inner = body.replace(/^\s*explain(?:\s+query\s+plan|\s+analyze|\s+analyse)?\s+/i, "");
   if (engine === "mariadb") return { ok: true, sql: `ANALYZE ${inner}` };
   return { ok: true, sql: `EXPLAIN ANALYZE ${inner}` };
@@ -183,7 +183,7 @@ function showplanAllPlan(columns: string[], rows: (string | null)[][]): PlanPres
   if (nodeId < 0 || parent < 0 || physical < 0) return null;
   const cell = (row: (string | null)[], index: number): string => (index >= 0 && row[index] != null ? String(row[index]).trim() : "");
   const records = rows
-    .map((row) => ({ id: cell(row, nodeId), parent: cell(row, parent), operation: cell(row, physical) || cell(row, logical) || cell(row, argument) || "语句根", rows: cell(row, estimateRows), extra: cell(row, logical) && cell(row, logical) !== cell(row, physical) ? cell(row, logical) : "" }))
+    .map((row) => ({ id: cell(row, nodeId), parent: cell(row, parent), operation: cell(row, physical) || cell(row, logical) || cell(row, argument) || tr("query.plan.statementRoot"), rows: cell(row, estimateRows), extra: cell(row, logical) && cell(row, logical) !== cell(row, physical) ? cell(row, logical) : "" }))
     .filter((record) => /^\d+$/.test(record.id) && /^\d+$/.test(record.parent));
   if (records.length === 0 || !records.some((record) => record.operation)) return null;
   const byId = new Map<string, { id: string; parent: string }>();
@@ -333,3 +333,5 @@ function parsePlanLine(line: string): PlanNode {
   const rows = /rows\s*[=:]\s*([0-9]+(?:\.[0-9]+)?)/i.exec(extra || line) ?? /([0-9]+(?:\.[0-9]+)?)\s*rows?\b/i.exec(text);
   return { depth, operation: text || line.trim(), rows: rows?.[1] ?? null, extra };
 }
+
+import { tr } from "../i18n";

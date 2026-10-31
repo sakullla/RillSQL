@@ -1,4 +1,5 @@
 import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { tr } from "../i18n";
 import { dirname } from "node:path";
 import { renderCsv, type CsvCell, type CsvOptions } from "./csv";
 import { insertStatements, type InsertTarget } from "./insert";
@@ -60,7 +61,7 @@ export function writeCsvFile(options: {
         writtenRows: 0,
         path: null,
         residualPath: null,
-        message: `路径不可写：${(error as Error).message}。没有生成完整结果。`,
+        message: tr("export.write.pathNotWritable", { error: (error as Error).message }),
         readCalled: false,
       };
     }
@@ -77,7 +78,7 @@ export function writeCsvFile(options: {
       writtenRows: 0,
       path: null,
       residualPath: null,
-      message: `路径不可写：${(error as Error).message}。没有生成完整结果。`,
+      message: tr("export.write.pathNotWritable", { error: (error as Error).message }),
       readCalled: false,
     };
   }
@@ -93,7 +94,7 @@ export function writeCsvFile(options: {
         writtenRows: index,
         path: null,
         residualPath: null,
-        message: `已取消导出：写入 ${index} 行后停止，未完成的文件已删除。`,
+        message: tr("export.write.cancelledAt", { n: index }),
         readCalled: false,
       };
     }
@@ -105,7 +106,7 @@ export function writeCsvFile(options: {
         writtenRows: index,
         path: null,
         residualPath: partialPath,
-        message: `${options.control?.failMessage ?? "写入失败"}。已写入 ${index} 行，不完整的文件保留为 ${partialPath}，不会冒充完整结果。`,
+        message: tr("export.write.failKeepPartial", { reason: options.control?.failMessage ?? tr("export.write.writeFailed"), n: index, path: partialPath }),
         readCalled: false,
       };
     }
@@ -122,7 +123,7 @@ export function writeCsvFile(options: {
       writtenRows: options.rows.length,
       path: null,
       residualPath: null,
-      message: `已取消导出：写入 ${options.rows.length} 行后停止，未完成的文件已删除。`,
+      message: tr("export.write.cancelledAt", { n: options.rows.length }),
       readCalled: false,
     };
   }
@@ -136,7 +137,7 @@ export function writeCsvFile(options: {
       writtenRows: options.rows.length,
       path: null,
       residualPath: partialPath,
-      message: `${(error as Error).message}。已写入 ${options.rows.length} 行，不完整的文件保留为 ${partialPath}，不会冒充完整结果。`,
+      message: tr("export.write.errorKeepPartial", { error: (error as Error).message, n: options.rows.length, path: partialPath }),
       readCalled: false,
     };
   }
@@ -147,7 +148,7 @@ export function writeCsvFile(options: {
     writtenRows: options.rows.length,
     path: options.path,
     residualPath: null,
-    message: `已导出 ${options.rows.length} 行。`,
+    message: tr("export.write.exportedRows", { n: options.rows.length }),
     readCalled: false,
   };
 }
@@ -159,7 +160,7 @@ function refusePath(error: unknown): WriteResult {
     writtenRows: 0,
     path: null,
     residualPath: null,
-    message: `路径不可写：${(error as Error).message}。没有生成完整结果。`,
+    message: tr("export.write.pathNotWritable", { error: (error as Error).message }),
     readCalled: false,
   };
 }
@@ -203,7 +204,7 @@ export function writeXlsxFile(options: {
         writtenRows: index,
         path: null,
         residualPath: null,
-        message: `已取消导出：写入 ${index} 行后停止，未完成的文件已删除。`,
+        message: tr("export.write.cancelledAt", { n: index }),
         readCalled: false,
       };
     }
@@ -215,7 +216,7 @@ export function writeXlsxFile(options: {
         writtenRows: index,
         path: null,
         residualPath: partialPath,
-        message: `${options.control?.failMessage ?? "写入失败"}。已写入 ${index} 行，不完整的文件保留为 ${partialPath}，不会冒充完整结果。`,
+        message: tr("export.write.failKeepPartial", { reason: options.control?.failMessage ?? tr("export.write.writeFailed"), n: index, path: partialPath }),
         readCalled: false,
       };
     }
@@ -232,7 +233,7 @@ export function writeXlsxFile(options: {
       writtenRows: options.rows.length,
       path: null,
       residualPath: null,
-      message: `已取消导出：写入 ${options.rows.length} 行后停止，未完成的文件已删除。`,
+      message: tr("export.write.cancelledAt", { n: options.rows.length }),
       readCalled: false,
     };
   }
@@ -246,7 +247,7 @@ export function writeXlsxFile(options: {
       writtenRows: written.length,
       path: null,
       residualPath: partialPath,
-      message: `${(error as Error).message}。已写入 ${written.length} 行，不完整的文件保留为 ${partialPath}，不会冒充完整结果。`,
+      message: tr("export.write.errorKeepPartial", { error: (error as Error).message, n: written.length, path: partialPath }),
       readCalled: false,
     };
   }
@@ -257,7 +258,7 @@ export function writeXlsxFile(options: {
     writtenRows: written.length,
     path: options.path,
     residualPath: null,
-    message: `已导出 ${written.length} 行。`,
+    message: tr("export.write.exportedRows", { n: written.length }),
     readCalled: false,
   };
 }
@@ -304,7 +305,7 @@ export function writeRenderedFile(options: {
         writtenRows: index,
         path: null,
         residualPath: null,
-        message: `已取消导出：写入 ${index} 行后停止，未完成的文件已删除。`,
+        message: tr("export.write.cancelledAt", { n: index }),
         readCalled: false,
       };
     }
@@ -316,7 +317,7 @@ export function writeRenderedFile(options: {
         writtenRows: index,
         path: null,
         residualPath: partialPath,
-        message: `${options.control?.failMessage ?? "写入失败"}。已写入 ${index} 行，不完整的文件保留为 ${partialPath}，不会冒充完整结果。`,
+        message: tr("export.write.failKeepPartial", { reason: options.control?.failMessage ?? tr("export.write.writeFailed"), n: index, path: partialPath }),
         readCalled: false,
       };
     }
@@ -333,7 +334,7 @@ export function writeRenderedFile(options: {
       writtenRows: options.lines.length,
       path: null,
       residualPath: null,
-      message: `已取消导出：写入 ${options.lines.length} 行后停止，未完成的文件已删除。`,
+      message: tr("export.write.cancelledAt", { n: options.lines.length }),
       readCalled: false,
     };
   }
@@ -348,7 +349,7 @@ export function writeRenderedFile(options: {
       writtenRows: written.length,
       path: null,
       residualPath: partialPath,
-      message: `${(error as Error).message}。已写入 ${written.length} 行，不完整的文件保留为 ${partialPath}，不会冒充完整结果。`,
+      message: tr("export.write.errorKeepPartial", { error: (error as Error).message, n: written.length, path: partialPath }),
       readCalled: false,
     };
   }
@@ -359,7 +360,7 @@ export function writeRenderedFile(options: {
     writtenRows: written.length,
     path: options.path,
     residualPath: null,
-    message: `已导出 ${written.length} 行。`,
+    message: tr("export.write.exportedRows", { n: written.length }),
     readCalled: false,
   };
 }
@@ -377,14 +378,14 @@ export function startExport(options: {
   readRows?: () => readonly Record<string, CsvCell>[];
   onProgress?: (progress: WriteProgress) => void;
 }): WriteResult {
-  if (!options.plan.allowed) return blocked(options.plan.rejectReason ?? "不能导出");
-  if (options.plan.reexecutes && !options.acknowledged) return blocked("执行前需说明会重新执行这条 SELECT");
+  if (!options.plan.allowed) return blocked(options.plan.rejectReason ?? tr("export.write.blockedExport"));
+  if (options.plan.reexecutes && !options.acknowledged) return blocked(tr("export.write.needAck"));
   const format = options.format ?? "csv";
-  if (format === "insert" && !options.insert?.name) return blocked("还不能确定 INSERT 要写入的表");
+  if (format === "insert" && !options.insert?.name) return blocked(tr("export.write.noInsertTarget"));
   let readCalled = false;
   let rows = options.rows;
   if (options.plan.serverRead) {
-    if (!options.readRows) return blocked("没有可重新读取的数据源");
+    if (!options.readRows) return blocked(tr("export.write.noSource"));
     readCalled = true;
     rows = options.readRows();
   }
@@ -428,7 +429,7 @@ export function startExport(options: {
         });
   result.readCalled = readCalled;
   if (result.success && options.plan.partial) {
-    result.message = `已导出 ${result.writtenRows} 行到 ${result.path}（仅已读取的行，不是完整结果）`;
+    result.message = tr("export.write.partialToPath", { n: result.writtenRows, path: result.path });
   }
   if (options.plan.reexecutes && result.success) result.message = `${options.plan.notice}${result.message}`;
   return result;

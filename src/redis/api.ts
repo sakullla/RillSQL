@@ -48,7 +48,7 @@ function failureText(error: unknown): string {
     const message = (error as { message?: unknown }).message;
     if (typeof message === "string" && message.trim()) return message;
   }
-  return "操作失败，原因未知。";
+  return tr("redis.api.failedUnknown");
 }
 
 export interface RedisApi {
@@ -73,3 +73,5 @@ export const tauriRedisApi: RedisApi = {
   renameKey: (connectionId, from, to, confirmed) => invoke<{ renamed: boolean }>("redis_rename_key", { connectionId, from, to, confirmed }),
   exec: (connectionId, command, args, confirmed) => invoke<ExecOutcome>("redis_exec", { connectionId, command, args, confirmed }),
 };
+
+import { tr } from "../i18n";

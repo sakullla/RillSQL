@@ -1,4 +1,5 @@
 import { shallowRef, reactive } from "vue";
+import { tr } from "../i18n";
 import { engineMeta, presentEnv, type EnvTag, type SavedConnection } from "../connections/model";
 import { loadSettings } from "../shell/settings";
 import { fetchCatalog, fetchPage, fetchSessions, listConnections, listEnvTags, type ObjectLimit, type SessionStatusInfo } from "./backend";
@@ -247,7 +248,7 @@ function applySnapshot(incoming: CatalogConnection[]): void {
 function failureText(error: unknown): string {
   if (error instanceof Error && error.message) return error.message;
   if (typeof error === "string" && error) return error;
-  return "对象列表没读出来，原因未知。";
+  return tr("catalog.store.loadFailedUnknown");
 }
 
 function enqueueConnectionRead(id: string, run: () => Promise<void>): Promise<void> {
@@ -432,7 +433,7 @@ export async function refreshFromBackend(): Promise<void> {
   }
   if (generation !== refreshGeneration) return;
   if (sessions === null) {
-    loadError.value = "读不到已打开的连接。到「连接」页确认连接还能打开。";
+    loadError.value = tr("catalog.store.cannotReadOpen");
     return;
   }
   const statusById = new Map(sessions.map((item) => [item.id, item]));
@@ -465,7 +466,7 @@ export async function startCatalog(): Promise<void> {
   if (refreshSource) return;
   const sessions = await fetchSessions();
   if (sessions === null) {
-    if (connections.value.length === 0) loadError.value = "读不到已打开的连接。到「连接」页确认连接还能打开。";
+    if (connections.value.length === 0) loadError.value = tr("catalog.store.cannotReadOpen");
     return;
   }
   seenSessions = sessionsKey(sessions);
@@ -523,7 +524,7 @@ export function setStructureFocus(focus: StructureFocus | null): void {
 function outlineFailure(error: unknown): string {
   if (typeof error === "string" && error) return error;
   if (error instanceof Error && error.message) return error.message;
-  return "没有读到列和索引";
+  return tr("catalog.store.membersFailed");
 }
 
 async function defaultOutline(target: OutlineTarget): Promise<ObjectOutline> {

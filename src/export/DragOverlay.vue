@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { tr } from "../i18n";
 defineProps<{ active: boolean }>();
 </script>
 
@@ -7,8 +8,8 @@ defineProps<{ active: boolean }>();
   <div v-if="active" class="drop-overlay" aria-hidden="true">
     <div class="drop-card">
       <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
-      <b>松开以预览文件</b>
-      <small>拖放预览支持 CSV 与 JSON；其他格式会提示不支持</small>
+      <b>{{ tr("export.overlay.release") }}</b>
+      <small>{{ tr("export.overlay.hint") }}</small>
     </div>
   </div>
 </template>

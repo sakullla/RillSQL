@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { tr } from "../i18n";
 
 export function isNativeExport(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -8,15 +9,15 @@ export async function chooseExportPath(defaultPath: string, format: "csv" | "jso
   if (!isNativeExport() || format === "xlsx") return defaultPath;
   const { save } = await import("@tauri-apps/plugin-dialog");
   const filter = format === "json"
-    ? { name: "JSON 文件", extensions: ["json"] }
+    ? { name: tr("export.dialog.jsonFile"), extensions: ["json"] }
     : format === "insert"
-      ? { name: "SQL 文件", extensions: ["sql"] }
+      ? { name: tr("export.dialog.sqlFile"), extensions: ["sql"] }
       : format === "markdown"
-        ? { name: "Markdown 文件", extensions: ["md"] }
+        ? { name: tr("export.dialog.markdownFile"), extensions: ["md"] }
         : format === "sql"
-          ? { name: "SQL 文件", extensions: ["sql"] }
-          : { name: "CSV 文件", extensions: ["csv"] };
-  const title = format === "json" ? "导出为 JSON" : format === "insert" ? "导出为 INSERT" : format === "markdown" ? "导出为 Markdown" : format === "sql" ? "保存 SQL 文件" : "导出为 CSV";
+          ? { name: tr("export.dialog.sqlFile"), extensions: ["sql"] }
+          : { name: tr("export.dialog.csvFile"), extensions: ["csv"] };
+  const title = tr(format === "json" ? "export.dialog.titleJson" : format === "insert" ? "export.dialog.titleInsert" : format === "markdown" ? "export.dialog.titleMarkdown" : format === "sql" ? "export.dialog.saveSqlTitle" : "export.dialog.titleCsv");
   return save({ title, defaultPath, filters: [filter] });
 }
 

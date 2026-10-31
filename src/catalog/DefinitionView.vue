@@ -2,7 +2,8 @@
 import { onMounted, ref } from "vue";
 import { fetchDefinition } from "./backend";
 import type { CatalogObjectRef } from "./object-ref";
-import { KIND_LABEL } from "./tree";
+import { tr as t } from "../i18n";
+import { kindLabel } from "./tree";
 import type { ObjectKind } from "./types";
 
 const props = defineProps<{
@@ -33,7 +34,7 @@ onMounted(async () => {
   try {
     sql.value = await fetchDefinition(props.object);
   } catch (caught) {
-    error.value = caught instanceof Error && caught.message ? caught.message : typeof caught === "string" && caught ? caught : "没有读到定义";
+    error.value = caught instanceof Error && caught.message ? caught.message : typeof caught === "string" && caught ? caught : t("catalog.definition.failed");
     sql.value = "";
   } finally {
     loading.value = false;
@@ -54,9 +55,9 @@ function copy() {
       </span>
       <div class="definition-titles">
         <h2>{{ label }}</h2>
-        <p>{{ KIND_LABEL[object.kind] }} · 只读定义</p>
+        <p>{{ kindLabel(object.kind) }} · {{ t("catalog.definition.readOnly") }}</p>
       </div>
-      <button v-if="sql" class="btn sm" type="button" data-action="copy-definition" @click="copy">复制到新查询</button>
+      <button v-if="sql" class="btn sm" type="button" data-action="copy-definition" @click="copy">{{ t("catalog.definition.copy") }}</button>
     </header>
     <p v-if="error" class="definition-error" data-definition-error>
       <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ERROR_ICON" /></svg>
@@ -64,7 +65,7 @@ function copy() {
     </p>
     <div v-else-if="loading" class="definition-loading" data-definition-loading>
       <span class="definition-spin" aria-hidden="true"></span>
-      正在读取定义…
+      {{ t("catalog.definition.loading") }}
     </div>
     <pre v-else class="definition-sql" data-definition-sql data-readonly="true">{{ sql }}</pre>
   </section>

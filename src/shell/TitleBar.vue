@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, watch } from "vue";
 import type { ThemePreference } from "./theme";
+import { tr as t } from "../i18n";
 import BrandMark from "./BrandMark.vue";
 import ChordKeys from "./ChordKeys.vue";
 import Icon from "./Icon.vue";
@@ -25,10 +26,11 @@ watch(
 );
 
 const themeIcon = (theme: ThemePreference) => (theme === "system" ? "monitor" : theme === "dark" ? "moon" : "sun");
-const choices: { id: ThemePreference; label: string }[] = [
-  { id: "light", label: "浅色" },
-  { id: "dark", label: "深色" },
-  { id: "system", label: "跟随系统" },
+const themeLabel = (theme: ThemePreference) => t(theme === "light" ? "shell.theme.light" : theme === "dark" ? "shell.theme.dark" : "shell.theme.system");
+const choices: { id: ThemePreference }[] = [
+  { id: "light" },
+  { id: "dark" },
+  { id: "system" },
 ];
 </script>
 
@@ -41,23 +43,23 @@ const choices: { id: ThemePreference; label: string }[] = [
     <div class="tb-brand">
       <BrandMark />
       <strong>RillSQL</strong>
-      <span class="brand-cn">澄库</span>
-      <button class="icon-btn sidebar-toggle" data-tauri-drag-region="false" type="button" aria-label="显示或隐藏资源管理器" title="资源管理器 (Ctrl+B)" @click="emit('toggle-sidebar')"><Icon name="sidebar" /></button>
+      <span v-if="t('shell.titlebar.brandCn')" class="brand-cn">{{ t("shell.titlebar.brandCn") }}</span>
+      <button class="icon-btn sidebar-toggle" data-tauri-drag-region="false" type="button" :aria-label="t('shell.titlebar.toggleSidebar')" :title="t('shell.titlebar.sidebarTitle')" @click="emit('toggle-sidebar')"><Icon name="sidebar" /></button>
     </div>
-    <button class="cmd-trigger" type="button" aria-label="打开命令面板" @click="emit('palette')">
+    <button class="cmd-trigger" type="button" :aria-label="t('shell.titlebar.openPalette')" @click="emit('palette')">
       <Icon name="search" />
-      <span>搜索表、连接或命令</span>
+      <span>{{ t("shell.titlebar.searchPlaceholder") }}</span>
       <ChordKeys chord="Mod+K" />
     </button>
     <div class="tb-actions" :data-tauri-drag-region="showCaption ? 'false' : undefined">
-      <button class="btn sm title-query" type="button" @click="emit('new-query')"><Icon name="plus" /> SQL 查询</button>
+      <button class="btn sm title-query" type="button" @click="emit('new-query')"><Icon name="plus" />{{ t("shell.titlebar.sqlQuery") }}</button>
       <TaskCenter />
       <details class="theme-menu">
-        <summary class="icon-btn" :aria-label="`外观主题：${choices.find((item) => item.id === theme)?.label}`" title="外观主题">
+        <summary class="icon-btn" :aria-label="t('shell.titlebar.themeMenuLabel', { theme: themeLabel(theme) })" :title="t('shell.titlebar.appearanceMenu')">
           <Icon :name="themeIcon(theme)" />
         </summary>
-        <div class="menu theme-menu-pop" role="menu" aria-label="外观">
-          <div class="menu-head">外观</div>
+        <div class="menu theme-menu-pop" role="menu" :aria-label="t('shell.titlebar.appearanceMenu')">
+          <div class="menu-head">{{ t("shell.titlebar.appearanceMenu") }}</div>
           <button
             v-for="choice in choices"
             :key="choice.id"
@@ -68,23 +70,23 @@ const choices: { id: ThemePreference; label: string }[] = [
             @click="emit('set-theme', choice.id)"
           >
             <Icon :name="themeIcon(choice.id)" />
-            <span>{{ choice.label }}</span>
+            <span>{{ themeLabel(choice.id) }}</span>
             <Icon v-if="theme === choice.id" class="check" name="check" />
           </button>
         </div>
       </details>
-      <button class="icon-btn" type="button" title="快捷键 (?)" aria-label="快捷键与帮助" @click="emit('help')">
+      <button class="icon-btn" type="button" :title="t('shell.titlebar.shortcutsTitle')" :aria-label="t('shell.titlebar.shortcutsHelp')" @click="emit('help')">
         <Icon name="keyboard" />
       </button>
-      <div v-if="showCaption" class="caption" role="group" aria-label="窗口">
-        <button type="button" aria-label="最小化" title="最小化" @click="chrome.minimize()">
+      <div v-if="showCaption" class="caption" role="group" :aria-label="t('shell.titlebar.window')">
+        <button type="button" :aria-label="t('shell.titlebar.minimize')" :title="t('shell.titlebar.minimize')" @click="chrome.minimize()">
           <svg viewBox="0 0 10 10" aria-hidden="true"><path fill="currentColor" d="M0 5h10v1H0z" /></svg>
         </button>
-        <button type="button" :aria-label="chrome.maximized.value ? '还原' : '最大化'" :title="chrome.maximized.value ? '还原' : '最大化'" @click="chrome.toggleMaximize()">
+        <button type="button" :aria-label="chrome.maximized.value ? t('shell.titlebar.restore') : t('shell.titlebar.maximize')" :title="chrome.maximized.value ? t('shell.titlebar.restore') : t('shell.titlebar.maximize')" @click="chrome.toggleMaximize()">
           <svg v-if="chrome.maximized.value" viewBox="0 0 10 10" aria-hidden="true"><path fill="currentColor" d="M2.6.8h6.6v6.6H8V2H2.6V.8zM.8 2.6h6.6v6.6H.8V2.6zm1 1v4.6h4.6V3.6H1.8z" /></svg>
           <svg v-else viewBox="0 0 10 10" aria-hidden="true"><rect x="0.6" y="0.6" width="8.8" height="8.8" rx="1.2" fill="none" stroke="currentColor" stroke-width="1" /></svg>
         </button>
-        <button class="caption-close" type="button" aria-label="关闭" title="关闭" @click="chrome.close()">
+        <button class="caption-close" type="button" :aria-label="t('common.close')" :title="t('common.close')" @click="chrome.close()">
           <svg viewBox="0 0 10 10" aria-hidden="true"><path fill="currentColor" d="M1.1.4 5 4.3 8.9.4l.7.7L5.7 5l3.9 3.9-.7.7L5 5.7 1.1 9.6l-.7-.7L4.3 5 .4 1.1z" /></svg>
         </button>
       </div>

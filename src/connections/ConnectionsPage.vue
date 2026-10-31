@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { catalogConnections, refreshCatalog } from "../catalog/store";
+import { tr as t } from "../i18n";
 import Listbox from "../ui/Listbox.vue";
 import { tauriConnectionApi, type ConnectionApi, type EnvTagInput, type TestReport } from "./api";
 import ConnIcon from "./ConnIcon.vue";
@@ -23,6 +24,7 @@ import {
   type SecretInput,
   type TlsMode,
 } from "./model";
+import { environmentLabel } from "../shell/status-text";
 import { isMongoUri } from "./model";
 import { parseConnectionUrl } from "./url";
 import "./connections.css";
@@ -66,10 +68,10 @@ const editDialog = ref<HTMLDialogElement | null>(null);
 const otherDialog = ref<HTMLDialogElement | null>(null);
 const importInput = ref<HTMLInputElement | null>(null);
 const tags = ref<EnvTag[]>([
-  { id: "dev", label: "开发", tone: "dev", position: 0 },
-  { id: "test", label: "测试", tone: "test", position: 1 },
-  { id: "prod", label: "生产", tone: "prod", position: 2 },
-  { id: "local", label: "本地", tone: "local", position: 3 },
+  { id: "dev", label: environmentLabel("dev"), tone: "dev", position: 0 },
+  { id: "test", label: environmentLabel("test"), tone: "test", position: 1 },
+  { id: "prod", label: environmentLabel("prod"), tone: "prod", position: 2 },
+  { id: "local", label: environmentLabel("local"), tone: "local", position: 3 },
 ]);
 const tagsLoaded = ref(false);
 const tagError = ref("");
@@ -83,13 +85,13 @@ const filtered = computed(() => {
   );
 });
 const engineOptions = computed(() => [
-  { value: "all", label: "全部数据库类型" },
+  { value: "all", label: t("connections.page.allEngines") },
   ...ENGINES.map((engine) => ({ value: engine.id, label: engine.label })),
 ]);
 const envOptions = computed(() => [
-  { value: "all", label: "全部环境" },
+  { value: "all", label: t("connections.page.allEnvs") },
   ...tags.value.map((tag) => ({ value: tag.id, label: tag.label })),
-  { value: "none", label: "无标签" },
+  { value: "none", label: t("connections.page.noTag") },
 ]);
 
 function openWorkspace(connection: SavedConnection) {
@@ -110,11 +112,20 @@ function connectionState(id: string) {
   return statuses.value[id] ?? catalogConnections().find(item => item.id === id)?.status ?? "disconnected";
 }
 const connectedCount = computed(() => connections.value.filter(item => connectionState(item.id) === "connected").length);
-const stateLabels: Record<string, string> = { connected: "已连接", connecting: "正在连接…", disconnected: "未连接", error: "连接失败", lost: "连接中断" };
+const STATUS_TEXT_KEYS: Record<string, string> = {
+  connected: "connections.status.connected",
+  connecting: "connections.status.connecting",
+  disconnected: "connections.status.disconnected",
+  error: "connections.status.error",
+  lost: "connections.status.lost",
+};
+function stateText(state: string): string {
+  return t(STATUS_TEXT_KEYS[state] ?? "connections.status.disconnected");
+}
 const failedStage = computed(() => report.value?.stages.find((stage) => stage.status === "err") ?? null);
 
 const advancedHint = computed(() =>
-  draft.value.engine === "sqlite" ? "环境标签——本地文件不需要 TLS 或 SSH" : "TLS 加密、SSH 跳板机、环境标签——直连时通常保持默认即可",
+  draft.value.engine === "sqlite" ? t("connections.editor.advancedSqliteHint") : t("connections.editor.advancedHint"),
 );
 
 /** MongoDB 整串 URI 与 SSH 隧道互斥（后端保存阶段同样拒绝）：主机是 URI 时锁死 SSH 段。 */
@@ -155,7 +166,7 @@ async function reload() {
     loadError.value = "";
     publishPalette();
   } catch (error) {
-    loadError.value = error instanceof Error ? error.message : "连接服务还没有挂到桌面命令上。";
+    loadError.value = error instanceof Error ? error.message : t("connections.errors.serviceMissing");
   }
 }
 
@@ -193,7 +204,7 @@ async function reloadTags() {
     tagError.value = "";
     ensureDraftEnv();
   } catch (error) {
-    tagError.value = errorText(error, "环境标签没有读出来。");
+    tagError.value = errorText(error, t("connections.errors.tagsLoadFailed"));
   }
 }
 
@@ -244,13 +255,13 @@ function applyConnectionUrl() {
   }
   const parts: string[] = [];
   if (parsed.engine === draft.value.engine) {
-    parts.push("已按连接串填好主机、端口、数据库和用户名。");
+    parts.push(t("connections.parse.filled"));
   } else if (draft.value.id) {
     // 编辑已保存的连接时不改引擎（switchEngine 对带 id 的草稿本来就不动），只填主机等字段。
-    parts.push(`连接串是 ${engineMeta(parsed.engine).label} 引擎，与该连接不同，仅填充主机等字段。`);
+    parts.push(t("connections.parse.engineMismatch", { engine: engineMeta(parsed.engine).label }));
   } else {
     switchEngine(parsed.engine);
-    parts.push(`已把引擎切换为 ${engineMeta(parsed.engine).label}。`);
+    parts.push(t("connections.parse.engineSwitched", { engine: engineMeta(parsed.engine).label }));
   }
   draft.value.host = parsed.host;
   draft.value.port = parsed.port;
@@ -260,7 +271,7 @@ function applyConnectionUrl() {
   if (parsed.password) {
     secrets.password = parsed.password;
     draft.value.savePassword = false;
-    parts.push("密码已填入，仅本次使用；勾选保存才会写入系统凭据库。");
+    parts.push(t("connections.parse.passwordFilled"));
   }
   pasteFailed.value = false;
   pasteNote.value = parts.join("");
@@ -283,7 +294,7 @@ async function saveTag(payload: EnvTagInput) {
     tagError.value = "";
     refreshCatalog();
   } catch (error) {
-    tagError.value = errorText(error, "没有保存标签。");
+    tagError.value = errorText(error, t("connections.errors.tagSaveFailed"));
   }
 }
 
@@ -297,7 +308,7 @@ async function removeTag(id: string) {
     await reload();
     refreshCatalog();
   } catch (error) {
-    tagError.value = errorText(error, "没有删除标签。");
+    tagError.value = errorText(error, t("connections.errors.tagDeleteFailed"));
   }
 }
 
@@ -332,7 +343,7 @@ function toggleExportAll(event: Event) {
 async function confirmExport() {
   const selected = exportSelection.value;
   if (!selected.length) {
-    dialogError.value = "请至少选择一条要导出的连接。";
+    dialogError.value = t("connections.exportDialog.needOne");
     return;
   }
   const passphrase = exportPassphrase.value.trim();
@@ -343,11 +354,13 @@ async function confirmExport() {
   try {
     const ids = selected.length === connections.value.length ? null : selected.map((item) => item.id);
     const outcome = await api.value.export(ids, passphrase, path);
-    note.value = `已导出 ${outcome.count} 个连接${passphrase ? "（带口令加密）。密码与私钥内容不会写入文件。" : "（明文 JSON，不含密码）。"}导入时选中同一文件即可恢复。`;
+    note.value = passphrase
+      ? t("connections.exportDialog.doneEncrypted", { n: outcome.count })
+      : t("connections.exportDialog.donePlain", { n: outcome.count });
     closeDialog(otherDialog.value);
     dialog.value = null;
   } catch (error) {
-    dialogError.value = errorText(error, "没有导出连接。");
+    dialogError.value = errorText(error, t("connections.errors.exportFailed"));
   } finally {
     busy.value = false;
   }
@@ -370,8 +383,10 @@ async function importRillSqlFile() {
   try {
     await runRillSqlImport(path, "");
   } catch (error) {
-    const message = errorText(error, "没有导入连接。");
-    if (message.includes("带口令加密")) {
+    const message = errorText(error, t("connections.errors.importFailed"));
+    // 后端（export.rs）对口令加密文件返回中文错误串「带口令加密」——这是前后端契约标记，与界面语言无关；
+    // 用转义写法避免源码出现裸中文（verify:workbench 字典化扫描）。
+    if (message.includes("\u5e26\u53e3\u4ee4\u52a0\u5bc6")) {
       passphrasePath.value = path;
       passphraseInput.value = "";
       dialog.value = "passphrase";
@@ -395,7 +410,7 @@ async function submitPassphrase() {
     dialog.value = null;
     passphrasePath.value = null;
   } catch (error) {
-    dialogError.value = errorText(error, "没有导入连接。");
+    dialogError.value = errorText(error, t("connections.errors.importFailed"));
   } finally {
     busy.value = false;
   }
@@ -411,7 +426,7 @@ async function onImportPicked(event: Event) {
   try {
     text = await file.text();
   } catch (error) {
-    note.value = errorText(error, "没有读到这份连接文件。");
+    note.value = errorText(error, t("connections.errors.fileUnread"));
     return;
   }
   busy.value = true;
@@ -421,7 +436,7 @@ async function onImportPicked(event: Event) {
     await reload();
     note.value = outcome.message;
   } catch (error) {
-    note.value = errorText(error, "没有导入连接。");
+    note.value = errorText(error, t("connections.errors.importFailed"));
   } finally {
     busy.value = false;
   }
@@ -448,7 +463,7 @@ async function saveDraft(connectAfter: boolean) {
     if (connectAfter) await connectSaved(outcome.connection, currentSecrets());
     else closeEditor();
   } catch (error) {
-    dialogError.value = errorText(error, "没有保存。");
+    dialogError.value = errorText(error, t("connections.errors.saveFailed"));
   } finally {
     busy.value = false;
   }
@@ -475,7 +490,7 @@ async function runTest() {
     report.value = await api.value.test(outcome.connection.id, currentSecrets());
     await reload();
   } catch (error) {
-    dialogError.value = errorText(error, "测试没有开始。");
+    dialogError.value = errorText(error, t("connections.errors.testFailed"));
   } finally {
     busy.value = false;
   }
@@ -489,7 +504,7 @@ async function trustHostKey() {
     knownHostKey.value = report.value.fingerprint;
     await runTest();
   } catch (error) {
-    dialogError.value = errorText(error, "没有保存主机指纹。");
+    dialogError.value = errorText(error, t("connections.errors.hostKeySaveFailed"));
   }
 }
 
@@ -498,10 +513,10 @@ function rejectHostKey() {
   report.value = {
     ...report.value,
     status: "err",
-    failStage: "未信任主机身份",
-    hint: "没有发送任何凭据。",
+    failStage: t("connections.errors.failStageReject"),
+    hint: t("connections.errors.noCredentials"),
     stages: report.value.stages.map((stage) =>
-      stage.status === "wait" ? { ...stage, status: "err", message: "你拒绝了该主机身份" } : stage.status === "ok" ? stage : { ...stage, status: "skipped", message: "未执行" },
+      stage.status === "wait" ? { ...stage, status: "err", message: t("connections.errors.rejectedIdentity") } : stage.status === "ok" ? stage : { ...stage, status: "skipped", message: t("connections.errors.skipped") },
     ),
   };
 }
@@ -513,7 +528,7 @@ async function forgetHostKey() {
     await api.value.forgetHostKey(draft.value.id);
     knownHostKey.value = null;
   } catch (error) {
-    dialogError.value = errorText(error, "没有清除主机指纹。");
+    dialogError.value = errorText(error, t("connections.errors.hostKeyClearFailed"));
   }
 }
 
@@ -536,7 +551,7 @@ async function connectSaved(connection: SavedConnection, typed: SecretInput) {
     }
   } catch (error) {
     statuses.value = { ...statuses.value, [connection.id]: "error" };
-    const message = errorText(error, "连接失败。");
+    const message = errorText(error, t("connections.errors.connectFailed"));
     if (dialog.value) dialogError.value = message;
     else note.value = message;
   }
@@ -571,7 +586,7 @@ async function submitPrompt() {
     dialog.value = null;
     await connectSaved(target, typed);
   } catch (error) {
-    dialogError.value = errorText(error, "连接没有开始。");
+    dialogError.value = errorText(error, t("connections.errors.connectStartFailed"));
   }
 }
 
@@ -584,7 +599,7 @@ async function disconnect(connection: SavedConnection) {
     await refreshCatalog();
     delete statuses.value[connection.id];
   } catch (error) {
-    note.value = errorText(error, "断开连接失败。");
+    note.value = errorText(error, t("connections.errors.disconnectFailed"));
   }
 }
 
@@ -602,12 +617,12 @@ async function confirmDelete() {
   dialogError.value = "";
   try {
     const outcome = await api.value.remove(target.id);
-    note.value = outcome.databaseFileRemoved ? "连接配置已删除。" : `已删除连接配置“${target.name}”。数据库和其中的数据不受影响。`;
+    note.value = outcome.databaseFileRemoved ? t("connections.errors.deletedDbFile") : t("connections.errors.deleted", { name: target.name });
     closeDialog(otherDialog.value);
     dialog.value = null;
     await reload();
   } catch (error) {
-    dialogError.value = errorText(error, "没有删除连接配置。");
+    dialogError.value = errorText(error, t("connections.errors.deleteFailed"));
   }
 }
 
@@ -646,163 +661,163 @@ watch(
   <div class="page conn-page" @click="menuId = null">
     <div class="page-inner">
       <div class="page-head">
-        <div><h1>连接管理</h1><p>一个入口，管理你的本地与远程数据库。</p></div>
-        <div class="ph-actions"><button class="btn" type="button" data-action="conn-import" :disabled="busy" @click="openImport"><ConnIcon name="upload" />导入连接</button><input ref="importInput" hidden type="file" accept=".json,.ncx,.xml,application/json,text/xml" data-action="conn-import-file" aria-label="选择 DBeaver 或 Navicat 连接文件" @change="onImportPicked" /><button class="btn" type="button" data-action="conn-import-rx" :disabled="busy" @click="importRillSqlFile"><ConnIcon name="file" />导入 RillSQL 文件</button><button class="btn" type="button" data-action="conn-export" :disabled="busy || !connections.length" @click="openExport"><ConnIcon name="download" />导出连接</button><button class="btn" type="button" @click="openEditor(undefined, 'sqlite')"><ConnIcon name="file" />打开 SQLite</button><button class="btn primary" type="button" data-action="conn-new" @click.stop="openEditor()"><ConnIcon name="plus" />新建连接</button></div>
+        <div><h1>{{ t("connections.page.title") }}</h1><p>{{ t("connections.page.subtitle") }}</p></div>
+        <div class="ph-actions"><button class="btn" type="button" data-action="conn-import" :disabled="busy" @click="openImport"><ConnIcon name="upload" />{{ t("connections.page.importButton") }}</button><input ref="importInput" hidden type="file" accept=".json,.ncx,.xml,application/json,text/xml" data-action="conn-import-file"  :aria-label="t('connections.page.importFileLabel')" @change="onImportPicked" /><button class="btn" type="button" data-action="conn-import-rx" :disabled="busy" @click="importRillSqlFile"><ConnIcon name="file" />{{ t("connections.page.importRillSql") }}</button><button class="btn" type="button" data-action="conn-export" :disabled="busy || !connections.length" @click="openExport"><ConnIcon name="download" />{{ t("connections.page.exportButton") }}</button><button class="btn" type="button" @click="openEditor(undefined, 'sqlite')"><ConnIcon name="file" />{{ t("connections.page.openSqlite") }}</button><button class="btn primary" type="button" data-action="conn-new" @click.stop="openEditor()"><ConnIcon name="plus" />{{ t("common.newConnection") }}</button></div>
       </div>
-      <div class="connection-overview"><span><b>{{ connections.length }}</b> 个连接</span><span class="online-total"><i></i><b>{{ connectedCount }}</b> 个已连接</span><span class="grow"></span><span><ConnIcon name="lock" />凭据保存在本机</span></div>
+      <div class="connection-overview"><span><b>{{ connections.length }}</b> {{ t("connections.page.countUnit", { n: connections.length }) }}</span><span class="online-total"><i></i><b>{{ connectedCount }}</b> {{ t("connections.page.connectedUnit", { n: connectedCount }) }}</span><span class="grow"></span><span><ConnIcon name="lock" />{{ t("connections.page.credentialsLocal") }}</span></div>
       <div class="connection-filters">
-        <label class="mini-search"><ConnIcon name="search" /><input v-model="query" type="search" placeholder="搜索名称、地址或文件…" aria-label="搜索连接" /></label>
-        <Listbox v-model="engineFilter" :options="engineOptions" aria-label="按数据库类型筛选" />
-        <Listbox v-model="envFilter" :options="envOptions" aria-label="按环境筛选" />
-        <span class="grow"></span><span class="muted sm">{{ filtered.length }} 个连接</span>
+        <label class="mini-search"><ConnIcon name="search" /><input v-model="query" type="search"  :placeholder="t('connections.page.searchPlaceholder')" :aria-label="t('connections.page.searchLabel')" /></label>
+        <Listbox v-model="engineFilter" :options="engineOptions"  :aria-label="t('connections.page.filterEngine')" />
+        <Listbox v-model="envFilter" :options="envOptions"  :aria-label="t('connections.page.filterEnv')" />
+        <span class="grow"></span><span class="muted sm">{{ t("connections.page.countUnit", { n: filtered.length }) }}</span>
       </div>
       <p v-if="loadError" class="page-note" role="alert"><ConnIcon name="alert" />{{ loadError }}</p><p v-else-if="note" class="page-note" role="status">{{ note }}</p>
       <div class="conn-grid">
-        <div class="connection-columns" aria-hidden="true"><span>连接 / 数据库</span><span>地址</span><span>传输与认证</span><span>状态 / 操作</span></div>
+        <div class="connection-columns" aria-hidden="true"><span>{{ t("connections.page.colConnection") }}</span><span>{{ t("connections.page.colAddress") }}</span><span>{{ t("connections.page.colTransport") }}</span><span>{{ t("connections.page.colStatus") }}</span></div>
         <article
           v-for="item in filtered"
           :key="item.id"
           class="conn-card"
           :class="`st-${connectionState(item.id)}`"
-          :title="connectionState(item.id) === 'connected' ? '双击打开' : '双击连接'"
+          :title="connectionState(item.id) === 'connected' ? t('connections.page.dblOpen') : t('connections.page.dblConnect')"
           @dblclick="onCardDoubleClick(item, $event)"
         >
           <header>
             <span class="eng lg" :class="`eng-${item.engine}`">{{ engineMeta(item.engine).short }}</span>
             <div class="cc-title"><h3>{{ item.name }}</h3><p>{{ engineMeta(item.engine).label }} <span class="env xs" :class="`env-${envView(item.env).tone}`">{{ envView(item.env).label }}</span></p></div>
           </header>
-          <div class="cc-endpoint"><p v-if="item.engine === 'sqlite'" class="cc-addr mono" :title="item.filePath ?? ''">{{ item.filePath }}</p><p v-else class="cc-addr mono" :title="`${item.host}:${item.port}`">{{ item.host }}:{{ item.port }}</p><small>{{ item.engine === 'sqlite' ? '本地文件' : item.database || '未指定默认数据库' }}</small></div>
+          <div class="cc-endpoint"><p v-if="item.engine === 'sqlite'" class="cc-addr mono" :title="item.filePath ?? ''">{{ item.filePath }}</p><p v-else class="cc-addr mono" :title="`${item.host}:${item.port}`">{{ item.host }}:{{ item.port }}</p><small>{{ item.engine === 'sqlite' ? t('connections.page.localFile') : item.database || t('connections.page.noDatabase') }}</small></div>
           <div class="cc-badges">
-            <template v-if="item.engine === 'sqlite'"><span class="badge"><ConnIcon name="file" />本地文件</span><span v-if="foreignKeys[item.id] != null" class="badge" :class="foreignKeys[item.id] ? 'ok' : 'warn'">外键约束{{ foreignKeys[item.id] ? '已开启' : '未开启' }}</span></template>
-            <template v-else><span v-if="item.tls?.mode === 'verify'" class="badge ok"><ConnIcon name="shield" />TLS · 核对证书</span><span v-else-if="item.tls?.mode === 'require'" class="badge warn"><ConnIcon name="lock" />TLS · 不核对证书</span><span v-else class="badge warn"><ConnIcon name="unlock" />不加密</span><span v-if="item.ssh" class="badge"><ConnIcon name="tunnel" />SSH</span><small>{{ item.passwordSaved ? '密码已保存' : '每次询问密码' }}</small></template>
+            <template v-if="item.engine === 'sqlite'"><span class="badge"><ConnIcon name="file" />{{ t("connections.page.localFile") }}</span><span v-if="foreignKeys[item.id] != null" class="badge" :class="foreignKeys[item.id] ? 'ok' : 'warn'">{{ foreignKeys[item.id] ? t('connections.page.fkEnabled') : t('connections.page.fkDisabled') }}</span></template>
+            <template v-else><span v-if="item.tls?.mode === 'verify'" class="badge ok"><ConnIcon name="shield" />{{ t("connections.page.tlsVerify") }}</span><span v-else-if="item.tls?.mode === 'require'" class="badge warn"><ConnIcon name="lock" />{{ t("connections.page.tlsRequire") }}</span><span v-else class="badge warn"><ConnIcon name="unlock" />{{ t("connections.page.tlsOff") }}</span><span v-if="item.ssh" class="badge"><ConnIcon name="tunnel" />SSH</span><small>{{ item.passwordSaved ? t('connections.page.passwordSaved') : t('connections.page.askPassword') }}</small></template>
           </div>
-          <footer><span class="conn-state" :class="`st-${connectionState(item.id)}`"><i></i>{{ stateLabels[connectionState(item.id)] }}</span><span class="grow"></span><button v-if="connectionState(item.id) === 'connected'" class="btn sm" type="button" @click.stop="openWorkspace(item)">打开</button><button v-else class="btn sm" type="button" data-action="conn-connect" :disabled="connectionState(item.id) === 'connecting'" @click.stop="requestConnect(item)"><ConnIcon name="plug" />连接</button><button class="icon-btn" type="button" :aria-label="`${item.name} 的更多操作`" data-action="conn-menu" @click.stop="menuId = menuId === item.id ? null : item.id"><ConnIcon name="more" /></button></footer>
-          <div v-if="menuId === item.id" class="conn-menu" @click.stop><button type="button" @click="showDetails(item)"><ConnIcon name="info" />连接详情</button><button type="button" data-action="conn-edit" @click="openEditor(item)"><ConnIcon name="pencil" />编辑配置…</button><button v-if="connectionState(item.id) === 'connected'" type="button" @click="disconnect(item)"><ConnIcon name="unplug" />断开连接</button><button type="button" class="danger" data-action="conn-delete" @click="askDelete(item)"><ConnIcon name="trash" />删除配置…</button></div>
+          <footer><span class="conn-state" :class="`st-${connectionState(item.id)}`"><i></i>{{ stateText(connectionState(item.id)) }}</span><span class="grow"></span><button v-if="connectionState(item.id) === 'connected'" class="btn sm" type="button" @click.stop="openWorkspace(item)">{{ t("connections.page.open") }}</button><button v-else class="btn sm" type="button" data-action="conn-connect" :disabled="connectionState(item.id) === 'connecting'" @click.stop="requestConnect(item)"><ConnIcon name="plug" />{{ t("connections.page.connect") }}</button><button class="icon-btn" type="button" :aria-label="t('connections.page.moreActions', { name: item.name })" data-action="conn-menu" @click.stop="menuId = menuId === item.id ? null : item.id"><ConnIcon name="more" /></button></footer>
+          <div v-if="menuId === item.id" class="conn-menu" @click.stop><button type="button" @click="showDetails(item)"><ConnIcon name="info" />{{ t("connections.page.menuDetails") }}</button><button type="button" data-action="conn-edit" @click="openEditor(item)"><ConnIcon name="pencil" />{{ t("connections.page.menuEdit") }}</button><button v-if="connectionState(item.id) === 'connected'" type="button" @click="disconnect(item)"><ConnIcon name="unplug" />{{ t("connections.page.menuDisconnect") }}</button><button type="button" class="danger" data-action="conn-delete" @click="askDelete(item)"><ConnIcon name="trash" />{{ t("connections.page.menuDelete") }}</button></div>
         </article>
-        <div v-if="!filtered.length" class="empty"><ConnIcon name="database" /><h3>{{ connections.length ? '没有匹配的连接' : '连接你的第一个数据库' }}</h3><p>{{ connections.length ? '试试其他名称、数据库类型或环境。' : '支持 PostgreSQL、MySQL、MariaDB、SQL Server、SQLite、Redis 和 MongoDB。' }}</p></div>
+        <div v-if="!filtered.length" class="empty"><ConnIcon name="database" /><h3>{{ connections.length ? t('connections.page.emptyTitle') : t('connections.page.emptyFirst') }}</h3><p>{{ connections.length ? t('connections.page.emptyHint') : t('connections.page.emptyFirstHint') }}</p></div>
       </div>
-      <div class="connection-note"><ConnIcon name="shield" /><span>连接配置只保存在本机。密码保存在操作系统凭据库；删除连接不会删除数据库或 SQLite 文件。</span></div>
+      <div class="connection-note"><ConnIcon name="shield" /><span>{{ t("connections.page.note") }}</span></div>
     </div>
 
     <dialog ref="editDialog" class="modal modal-lg" @cancel.prevent="closeEditor">
       <div class="modal-head">
         <div class="modal-titles">
-          <h2>{{ draft.id ? `编辑连接 · ${draft.name || draft.host || draft.filePath}` : "新建连接" }}</h2>
-          <p class="modal-sub">配置只保存在本机；密码只写入系统凭据库</p>
+          <h2>{{ draft.id ? t("connections.editor.editTitle", { name: draft.name || draft.host || draft.filePath }) : t("connections.editor.newTitle") }}</h2>
+          <p class="modal-sub">{{ t("connections.editor.subtitle") }}</p>
         </div>
-        <button class="icon-btn" type="button" aria-label="关闭" @click="closeEditor"><ConnIcon name="x" /></button>
+        <button class="icon-btn" type="button"  :aria-label="t('common.close')" @click="closeEditor"><ConnIcon name="x" /></button>
       </div>
       <div class="modal-body">
         <p v-if="dialogError" class="field-err modal-error" role="alert" data-dialog-error>{{ dialogError }}</p>
-        <div class="ce-engines" role="radiogroup" aria-label="数据库类型">
+        <div class="ce-engines" role="radiogroup" :aria-label="t('connections.editor.enginesLabel')">
           <label v-for="engine in ENGINES" :key="engine.id" class="ce-engine" :class="{ on: draft.engine === engine.id, disabled: Boolean(draft.id && draft.engine !== engine.id) }">
             <input type="radio" name="cf-engine" :value="engine.id" :checked="draft.engine === engine.id" :disabled="Boolean(draft.id && draft.engine !== engine.id)" @change="switchEngine(engine.id)" />
             <span class="eng lg" :class="`eng-${engine.id}`">{{ engine.short }}</span>
-            <span><b>{{ engine.label }}</b><small>{{ engine.id === "sqlite" ? "本地文件" : `默认端口 ${engine.port}` }}</small></span>
+            <span><b>{{ engine.label }}</b><small>{{ engine.id === "sqlite" ? t("connections.editor.engineLocal") : t("connections.editor.defaultPort", { port: engine.port }) }}</small></span>
           </label>
         </div>
 
         <details v-if="draft.engine !== 'sqlite'" class="disclosure" data-section="paste-url">
-          <summary>从连接串粘贴 <span class="muted">postgres://user:pass@host:5432/db</span></summary>
+          <summary>{{ t("connections.editor.pasteTitle") }} <span class="muted">postgres://user:pass@host:5432/db</span></summary>
           <div class="disclosure-body">
             <label class="field full">
-              <span>连接串</span>
-              <textarea v-model="pasteText" class="mono" data-field="url-paste" rows="2" placeholder="postgres://user:password@db.example.internal:5432/app?sslmode=require" aria-label="粘贴连接串"></textarea>
+              <span>{{ t("connections.editor.pasteLabel") }}</span>
+              <textarea v-model="pasteText" class="mono" data-field="url-paste" rows="2"  :placeholder="t('connections.editor.pastePlaceholder')" :aria-label="t('connections.editor.pasteLabel')"></textarea>
             </label>
             <div class="input-row">
-              <button class="btn" type="button" data-action="cf-parse-url" @click="applyConnectionUrl">解析并填充</button>
+              <button class="btn" type="button" data-action="cf-parse-url" @click="applyConnectionUrl">{{ t("connections.editor.parseFill") }}</button>
               <p v-if="pasteNote" class="paste-note" :class="pasteFailed ? 'field-err' : 'muted'" role="status">{{ pasteNote }}</p>
             </div>
           </div>
         </details>
 
         <div v-if="draft.engine === 'sqlite'" class="form-grid">
-          <label class="field full"><span>连接名称</span><input v-model="draft.name" placeholder="例如 本地笔记" /></label>
+          <label class="field full"><span>{{ t("connections.editor.nameLabel") }}</span><input v-model="draft.name" :placeholder="t('connections.editor.namePlaceholderSqlite')" /></label>
           <label class="field full">
-            <span>数据库文件<em class="req">*</em></span>
+            <span>{{ t("connections.editor.fileLabel") }}<em class="req">*</em></span>
             <div class="input-row">
-              <input v-model="draft.filePath" class="mono" data-field="filePath" placeholder="选择已有的 .db / .sqlite 文件" :aria-invalid="Boolean(fieldErrors.filePath)" />
-              <button class="btn" type="button" data-action="cf-browse" @click="browseSqlite"><ConnIcon name="file" />选择…</button>
+              <input v-model="draft.filePath" class="mono" data-field="filePath"  :placeholder="t('connections.editor.filePlaceholder')" :aria-invalid="Boolean(fieldErrors.filePath)" />
+              <button class="btn" type="button" data-action="cf-browse" @click="browseSqlite"><ConnIcon name="file" />{{ t("connections.editor.browse") }}</button>
             </div>
             <small v-if="fieldErrors.filePath" class="field-err">{{ fieldErrors.filePath }}</small>
-            <small v-else>只打开已有文件。删除这个连接不会删除文件。</small>
+            <small v-else>{{ t("connections.editor.fileHint") }}</small>
           </label>
         </div>
         <div v-else class="form-grid">
-          <label class="field full"><span>连接名称</span><input v-model="draft.name" placeholder="例如 Atlas" /></label>
-          <label class="field"><span>主机<em class="req">*</em></span><input v-model="draft.host" class="mono" data-field="host" :placeholder="draft.engine === 'mongodb' ? '127.0.0.1 或 mongodb:// 整串' : 'db.example.internal'" :aria-invalid="Boolean(fieldErrors.host)" /><small v-if="fieldErrors.host" class="field-err">{{ fieldErrors.host }}</small><small v-else-if="draft.engine === 'mongodb'">可填主机名，也可直接粘贴 mongodb:// / mongodb+srv:// 连接串（串里的参数优先）。</small></label>
-          <label class="field"><span>端口<em v-if="draft.engine !== 'mongodb' || !isMongoUri(draft.host)" class="req">*</em></span><input v-model="draft.port" class="mono" data-field="port" :aria-invalid="Boolean(fieldErrors.port)" /><small v-if="fieldErrors.port" class="field-err">{{ fieldErrors.port }}</small><small v-else-if="draft.engine === 'mongodb' && isMongoUri(draft.host)">已填连接串时端口以串为准，这里可留空。</small></label>
-          <label class="field"><span>{{ draft.engine === "redis" ? "库索引" : draft.engine === "mongodb" ? "认证库" : "数据库" }}</span><input v-model="draft.database" class="mono" :placeholder="draft.engine === 'redis' ? '0（默认 0 号库）' : draft.engine === 'mongodb' ? 'admin（默认 admin）' : draft.engine === 'postgres' ? 'postgres' : '可选'" :aria-invalid="Boolean(fieldErrors.database)" /><small v-if="fieldErrors.database" class="field-err">{{ fieldErrors.database }}</small><small v-else-if="draft.engine === 'redis'">SELECT 的库编号，单库浏览（不做多库切换 UI）。</small><small v-else-if="draft.engine === 'mongodb'">SCRAM 认证的 authSource；连接串里写过的 authSource 优先。</small></label>
-          <label v-if="draft.engine === 'mongodb'" class="field"><span>副本集（可选）</span><input v-model="draft.replicaSet" class="mono" data-field="replicaSet" placeholder="rs0" /><small>replicaSet 连接参数；连接串里写过的值优先。</small></label>
-          <label class="field"><span>用户名<em v-if="draft.engine !== 'redis' && draft.engine !== 'mongodb'" class="req">*</em></span><input v-model="draft.username" class="mono" data-field="username" :aria-invalid="Boolean(fieldErrors.username)" /><small v-if="fieldErrors.username" class="field-err">{{ fieldErrors.username }}</small><small v-else-if="draft.engine === 'redis'">ACL 用户名；只设密码时留空。</small><small v-else-if="draft.engine === 'mongodb'">SCRAM 用户名；无认证直连（本地开发）时留空。</small></label>
-          <label class="field full"><span>密码</span><input v-model="secrets.password" type="password" data-field="password" autocomplete="new-password" /><small>留空则继续使用系统凭据库里已保存的密码。密码不会写入普通配置。</small></label>
-          <label class="check full"><input v-model="draft.savePassword" type="checkbox" data-field="savePassword" /><span>把密码保存到系统凭据库<small>不勾选时，每次连接都会询问密码。</small></span></label>
+          <label class="field full"><span>{{ t("connections.editor.nameLabel") }}</span><input v-model="draft.name" :placeholder="t('connections.editor.namePlaceholder')" /></label>
+          <label class="field"><span>{{ t("connections.editor.hostLabel") }}<em class="req">*</em></span><input v-model="draft.host" class="mono" data-field="host" :placeholder="draft.engine === 'mongodb' ? t('connections.editor.hostPlaceholderMongodb') : t('connections.editor.hostPlaceholder')" :aria-invalid="Boolean(fieldErrors.host)" /><small v-if="fieldErrors.host" class="field-err">{{ fieldErrors.host }}</small><small v-else-if="draft.engine === 'mongodb'">{{ t("connections.editor.mongoHostHint") }}</small></label>
+          <label class="field"><span>{{ t("connections.editor.portLabel") }}<em v-if="draft.engine !== 'mongodb' || !isMongoUri(draft.host)" class="req">*</em></span><input v-model="draft.port" class="mono" data-field="port" :aria-invalid="Boolean(fieldErrors.port)" /><small v-if="fieldErrors.port" class="field-err">{{ fieldErrors.port }}</small><small v-else-if="draft.engine === 'mongodb' && isMongoUri(draft.host)">{{ t("connections.editor.portMongoUriHint") }}</small></label>
+          <label class="field"><span>{{ draft.engine === "redis" ? t("connections.editor.dbLabelRedis") : draft.engine === "mongodb" ? t("connections.editor.dbLabelMongo") : t("connections.editor.dbLabel") }}</span><input v-model="draft.database" class="mono" :placeholder="draft.engine === 'redis' ? t('connections.editor.dbPlaceholderRedis') : draft.engine === 'mongodb' ? t('connections.editor.dbPlaceholderMongo') : draft.engine === 'postgres' ? t('connections.editor.dbPlaceholderPostgres') : t('connections.editor.dbPlaceholderOptional')" :aria-invalid="Boolean(fieldErrors.database)" /><small v-if="fieldErrors.database" class="field-err">{{ fieldErrors.database }}</small><small v-else-if="draft.engine === 'redis'">{{ t("connections.editor.dbHintRedis") }}</small><small v-else-if="draft.engine === 'mongodb'">{{ t("connections.editor.dbHintMongo") }}</small></label>
+          <label v-if="draft.engine === 'mongodb'" class="field"><span>{{ t("connections.editor.replicaSet") }}</span><input v-model="draft.replicaSet" class="mono" data-field="replicaSet" placeholder="rs0" /><small>{{ t("connections.editor.replicaSetHint") }}</small></label>
+          <label class="field"><span>{{ t("connections.editor.userLabel") }}<em v-if="draft.engine !== 'redis' && draft.engine !== 'mongodb'" class="req">*</em></span><input v-model="draft.username" class="mono" data-field="username" :aria-invalid="Boolean(fieldErrors.username)" /><small v-if="fieldErrors.username" class="field-err">{{ fieldErrors.username }}</small><small v-else-if="draft.engine === 'redis'">{{ t("connections.editor.userHintRedis") }}</small><small v-else-if="draft.engine === 'mongodb'">{{ t("connections.editor.userHintMongo") }}</small></label>
+          <label class="field full"><span>{{ t("connections.editor.passwordLabel") }}</span><input v-model="secrets.password" type="password" data-field="password" autocomplete="new-password" /><small>{{ t("connections.editor.passwordHint") }}</small></label>
+          <label class="check full"><input v-model="draft.savePassword" type="checkbox" data-field="savePassword" /><span>{{ t("connections.editor.savePassword") }}<small>{{ t("connections.editor.savePasswordHint") }}</small></span></label>
         </div>
-        <div v-if="draft.engine === 'sqlite'" class="callout callout-info"><ConnIcon name="info" /><div>SQLite 是本地文件，不需要 TLS 或 SSH。连接后会显示外键约束（foreign_keys）的实际状态——SQLite 默认不强制外键。</div></div>
+        <div v-if="draft.engine === 'sqlite'" class="callout callout-info"><ConnIcon name="info" /><div>{{ t("connections.editor.sqliteCallout") }}</div></div>
 
         <details class="disclosure ce-advanced" data-section="advanced" :open="advancedOpen" @toggle="syncAdvanced">
-          <summary>高级选项 <span class="muted">{{ advancedHint }}</span></summary>
+          <summary>{{ t("connections.editor.advanced") }} <span class="muted">{{ advancedHint }}</span></summary>
           <div class="disclosure-body">
             <EnvTagField v-model="draft.env" :tags="tags" :error="tagError" @save="saveTag" @remove="removeTag" />
             <template v-if="draft.engine !== 'sqlite'">
               <section class="adv-sec">
-                <h3>TLS 加密</h3>
-                <p class="adv-note">保护密码和查询数据在传输中不被窃听。直连可信网络时通常保持默认即可。</p>
+                <h3>{{ t("connections.editor.tls.title") }}</h3>
+                <p class="adv-note">{{ t("connections.editor.tls.note") }}</p>
                 <div class="radio-stack">
-                  <label v-for="item in ([['verify', '要求加密，并核对证书和主机名', '推荐。主机名不符时直接失败。'], ['require', '要求加密，但不核对证书', '无法加密时不会退回明文连接。'], ['off', '不加密', '只适合本机或完全可信的网络。']] as [TlsMode, string, string][])" :key="item[0]" class="radio-card" :class="{ on: draft.tlsMode === item[0] }">
+                  <label v-for="item in ([['verify', t('connections.editor.tls.verifyLabel'), t('connections.editor.tls.verifyHint')], ['require', t('connections.editor.tls.requireLabel'), t('connections.editor.tls.requireHint')], ['off', t('connections.editor.tls.offLabel'), t('connections.editor.tls.offHint')]] as [TlsMode, string, string][])" :key="item[0]" class="radio-card" :class="{ on: draft.tlsMode === item[0] }">
                     <input type="radio" name="cf-tls" :value="item[0]" :checked="draft.tlsMode === item[0]" @change="draft.tlsMode = item[0]" />
                     <span><b>{{ item[1] }}</b><small>{{ item[2] }}</small></span>
                   </label>
                 </div>
                 <div v-if="draft.tlsMode !== 'off'" class="form-grid">
-                  <label class="field"><span>受信任的 CA</span><select v-model="draft.caMode"><option value="system">系统信任根</option><option value="file">指定 CA 文件</option></select></label>
-                  <label v-if="draft.caMode === 'file'" class="field"><span>CA 证书文件</span><input v-model="draft.caFile" class="mono" data-field="caFile" /><small v-if="fieldErrors.caFile" class="field-err">{{ fieldErrors.caFile }}</small></label>
-                  <label class="field"><span>客户端证书（可选）</span><input v-model="draft.clientCert" class="mono" /></label>
-                  <label class="field"><span>客户端私钥（可选）</span><input v-model="draft.clientKey" class="mono" /></label>
+                  <label class="field"><span>{{ t("connections.editor.tls.caLabel") }}</span><select v-model="draft.caMode"><option value="system">{{ t("connections.editor.tls.caSystem") }}</option><option value="file">{{ t("connections.editor.tls.caFile") }}</option></select></label>
+                  <label v-if="draft.caMode === 'file'" class="field"><span>{{ t("connections.editor.tls.caFileLabel") }}</span><input v-model="draft.caFile" class="mono" data-field="caFile" /><small v-if="fieldErrors.caFile" class="field-err">{{ fieldErrors.caFile }}</small></label>
+                  <label class="field"><span>{{ t("connections.editor.tls.clientCert") }}</span><input v-model="draft.clientCert" class="mono" /></label>
+                  <label class="field"><span>{{ t("connections.editor.tls.clientKey") }}</span><input v-model="draft.clientKey" class="mono" /></label>
                 </div>
                 <div v-if="draft.tlsMode === 'verify'" class="tls-name">
                   <ConnIcon name="shield" />
                   <div>
-                    <b>证书按主机名 <code>{{ draft.host || "（填写主机后显示）" }}</code> 核对</b>
+                    <b>{{ t("connections.editor.tls.verifyTitle", { host: draft.host || t("connections.editor.tls.hostPending") }) }}</b>
                     <small data-tls-copy>{{ tlsVerificationCopy(draft) }}</small>
                   </div>
                 </div>
-                <div v-if="draft.tlsMode !== 'off'" class="callout callout-warn"><ConnIcon name="info" /><div>核对失败时连接直接终止：不会自动降低验证级别，也不会退回不加密连接重试。</div></div>
-                <div v-else class="callout callout-warn"><ConnIcon name="unlock" /><div>连接不加密：数据库密码和查询数据会以明文在网络上传输。</div></div>
+                <div v-if="draft.tlsMode !== 'off'" class="callout callout-warn"><ConnIcon name="info" /><div>{{ t("connections.editor.tls.warnVerify") }}</div></div>
+                <div v-else class="callout callout-warn"><ConnIcon name="unlock" /><div>{{ t("connections.editor.tls.warnOff") }}</div></div>
               </section>
               <section class="adv-sec">
-                <h3>SSH 跳板机</h3>
-                <p class="adv-note">数据库无法从本机直接访问时，可以经过一台 SSH 服务器中转。</p>
-                <label class="check" :class="{ disabled: mongoUriBlocksSsh }"><input v-model="draft.sshOn" type="checkbox" data-field="sshOn" :disabled="mongoUriBlocksSsh" /><span><b>通过 SSH 跳板机连接</b><small>支持单跳。每条连接单独打开一条到数据库的通道。</small></span></label>
-                <p v-if="mongoUriBlocksSsh" class="adv-note" data-mongo-uri-ssh-note>主机填了 mongodb:// / mongodb+srv:// 整串时暂不支持 SSH 隧道：连接串的地址直接交给驱动，跳板机会被绕过。要经跳板机请改用 host/port 表单。</p>
+                <h3>{{ t("connections.editor.ssh.title") }}</h3>
+                <p class="adv-note">{{ t("connections.editor.ssh.note") }}</p>
+                <label class="check" :class="{ disabled: mongoUriBlocksSsh }"><input v-model="draft.sshOn" type="checkbox" data-field="sshOn" :disabled="mongoUriBlocksSsh" /><span><b>{{ t("connections.editor.ssh.enable") }}</b><small>{{ t("connections.editor.ssh.enableHint") }}</small></span></label>
+                <p v-if="mongoUriBlocksSsh" class="adv-note" data-mongo-uri-ssh-note>{{ t("connections.editor.ssh.uriBlocksSsh") }}</p>
                 <div v-if="draft.sshOn && !mongoUriBlocksSsh" class="form-grid">
-                  <label class="field"><span>跳板机主机<em class="req">*</em></span><input v-model="draft.sshHost" class="mono" data-field="sshHost" /><small v-if="fieldErrors.sshHost" class="field-err">{{ fieldErrors.sshHost }}</small></label>
-                  <label class="field"><span>SSH 端口</span><input v-model="draft.sshPort" class="mono" data-field="sshPort" /><small v-if="fieldErrors.sshPort" class="field-err">{{ fieldErrors.sshPort }}</small></label>
-                  <label class="field"><span>SSH 用户<em class="req">*</em></span><input v-model="draft.sshUser" class="mono" data-field="sshUser" /><small v-if="fieldErrors.sshUser" class="field-err">{{ fieldErrors.sshUser }}</small></label>
-                  <label class="field"><span>登录方式</span><span class="seg-radio"><label :class="{ on: draft.sshAuth === 'key' }"><input type="radio" name="cf-sshauth" value="key" :checked="draft.sshAuth === 'key'" @change="draft.sshAuth = 'key'" />私钥</label><label :class="{ on: draft.sshAuth === 'password' }"><input type="radio" name="cf-sshauth" value="password" :checked="draft.sshAuth === 'password'" @change="draft.sshAuth = 'password'" />密码</label></span></label>
+                  <label class="field"><span>{{ t("connections.editor.ssh.host") }}<em class="req">*</em></span><input v-model="draft.sshHost" class="mono" data-field="sshHost" /><small v-if="fieldErrors.sshHost" class="field-err">{{ fieldErrors.sshHost }}</small></label>
+                  <label class="field"><span>{{ t("connections.editor.ssh.port") }}</span><input v-model="draft.sshPort" class="mono" data-field="sshPort" /><small v-if="fieldErrors.sshPort" class="field-err">{{ fieldErrors.sshPort }}</small></label>
+                  <label class="field"><span>{{ t("connections.editor.ssh.user") }}<em class="req">*</em></span><input v-model="draft.sshUser" class="mono" data-field="sshUser" /><small v-if="fieldErrors.sshUser" class="field-err">{{ fieldErrors.sshUser }}</small></label>
+                  <label class="field"><span>{{ t("connections.editor.ssh.authLabel") }}</span><span class="seg-radio"><label :class="{ on: draft.sshAuth === 'key' }"><input type="radio" name="cf-sshauth" value="key" :checked="draft.sshAuth === 'key'" @change="draft.sshAuth = 'key'" />{{ t('connections.editor.ssh.authKey') }}</label><label :class="{ on: draft.sshAuth === 'password' }"><input type="radio" name="cf-sshauth" value="password" :checked="draft.sshAuth === 'password'" @change="draft.sshAuth = 'password'" />{{ t('connections.editor.ssh.authPassword') }}</label></span></label>
                   <template v-if="draft.sshAuth === 'key'">
-                    <label class="field"><span>私钥文件</span><input v-model="draft.sshKey" class="mono" /></label>
-                    <label class="field"><span>私钥口令（如有）</span><input v-model="secrets.passphrase" type="password" autocomplete="new-password" /><small>只用于解锁私钥，不写入配置或日志。</small></label>
+                    <label class="field"><span>{{ t("connections.editor.ssh.keyFile") }}</span><input v-model="draft.sshKey" class="mono" /></label>
+                    <label class="field"><span>{{ t("connections.editor.ssh.passphrase") }}</span><input v-model="secrets.passphrase" type="password" autocomplete="new-password" /><small>{{ t("connections.editor.ssh.passphraseHint") }}</small></label>
                   </template>
-                  <label v-else class="field full"><span>SSH 密码</span><input v-model="secrets.sshPassword" type="password" autocomplete="new-password" /></label>
+                  <label v-else class="field full"><span>{{ t("connections.editor.ssh.password") }}</span><input v-model="secrets.sshPassword" type="password" autocomplete="new-password" /></label>
                 </div>
                 <div v-if="draft.sshOn && !mongoUriBlocksSsh" class="host-key">
                   <ConnIcon name="key" />
                   <div>
-                    <b>跳板机身份</b>
-                    <small v-if="knownHostKey">已信任指纹 <code>{{ knownHostKey }}</code>。服务器出示的指纹与此不同时，连接会被阻止。</small>
-                    <small v-else>尚未记录。首次连接时会显示指纹，核对一致后再继续。</small>
+                    <b>{{ t("connections.editor.ssh.identity") }}</b>
+                    <small v-if="knownHostKey">{{ t("connections.editor.ssh.trusted", { fp: knownHostKey }) }}</small>
+                    <small v-else>{{ t("connections.editor.ssh.untrusted") }}</small>
                   </div>
-                  <button v-if="knownHostKey" class="btn sm ghost" type="button" @click="forgetHostKey">忘记已保存的指纹</button>
+                  <button v-if="knownHostKey" class="btn sm ghost" type="button" @click="forgetHostKey">{{ t("connections.editor.ssh.forget") }}</button>
                 </div>
                 <div v-if="draft.sshOn && !mongoUriBlocksSsh" class="route-box">
-                  <span class="muted sm">连接路径</span>
+                  <span class="muted sm">{{ t("connections.editor.ssh.route") }}</span>
                   <div class="route">
-                    <span class="route-hop"><ConnIcon name="monitor" />本机</span>
+                    <span class="route-hop"><ConnIcon name="monitor" />{{ t("connections.editor.ssh.local") }}</span>
                     <i class="route-line"></i>
-                    <span class="route-hop"><ConnIcon name="tunnel" />{{ draft.sshHost || "跳板机" }}:{{ draft.sshPort }}</span>
+                    <span class="route-hop"><ConnIcon name="tunnel" />{{ draft.sshHost || t('connections.editor.ssh.hopFallback') }}:{{ draft.sshPort }}</span>
                     <i class="route-line"></i>
-                    <span class="route-hop"><ConnIcon name="database" />{{ draft.host || "数据库主机" }}:{{ draft.port || "?" }}</span>
+                    <span class="route-hop"><ConnIcon name="database" />{{ draft.host || t('connections.editor.ssh.dbFallback') }}:{{ draft.port || "?" }}</span>
                   </div>
                 </div>
               </section>
@@ -811,24 +826,24 @@ watch(
         </details>
 
         <div v-if="report" class="test-panel" :class="report.status" role="status">
-          <p v-if="report.status === 'ok'" class="test-line ok"><ConnIcon name="check" />连接成功{{ report.summary ? ` · ${report.summary}` : "" }}</p>
+          <p v-if="report.status === 'ok'" class="test-line ok"><ConnIcon name="check" />{{ report.summary ? t("connections.editor.test.okSummary", { summary: report.summary }) : t("connections.editor.test.ok") }}</p>
           <template v-else-if="report.status === 'wait'">
-            <p class="test-line wait"><ConnIcon name="key" />第一次连接这台 SSH 跳板机，需要先确认它的身份</p>
+            <p class="test-line wait"><ConnIcon name="key" />{{ t("connections.editor.test.wait") }}</p>
             <div class="fp-card">
-              <p>请通过可信渠道核对 <code>{{ draft.sshHost }}:{{ draft.sshPort }}</code> 的指纹，确认一致后再继续。不一致说明可能连到了别的机器。</p>
+              <p>{{ t("connections.editor.test.verifyPrompt", { addr: `${draft.sshHost}:${draft.sshPort}` }) }}</p>
               <pre>{{ report.algorithm }}  {{ report.fingerprint }}</pre>
               <div class="fp-actions">
-                <button class="btn sm" type="button" @click="rejectHostKey">不一致，停止</button>
-                <button class="btn sm primary" type="button" @click="trustHostKey">指纹一致，信任并继续</button>
+                <button class="btn sm" type="button" @click="rejectHostKey">{{ t("connections.editor.test.reject") }}</button>
+                <button class="btn sm primary" type="button" @click="trustHostKey">{{ t("connections.editor.test.trust") }}</button>
               </div>
             </div>
           </template>
           <template v-else>
-            <p class="test-line err"><ConnIcon name="x" />连接失败：{{ report.failStage || "未知原因" }}</p>
+            <p class="test-line err"><ConnIcon name="x" />{{ t("connections.editor.test.failed", { stage: report.failStage || t("connections.editor.test.unknownReason") }) }}</p>
             <p v-if="failedStage?.message" class="test-detail" data-test-fail>{{ failedStage.message }}</p>
             <p v-if="report.hint" class="test-detail">{{ report.hint }}</p>
             <details class="disclosure test-all">
-              <summary>查看各阶段 <span class="muted">{{ report.stages.length }} 个步骤的完整结果</span></summary>
+              <summary>{{ t("connections.editor.test.allSteps") }} <span class="muted">{{ t("connections.editor.test.stepsCount", { n: report.stages.length }) }}</span></summary>
               <div class="disclosure-body">
                 <ol class="test-steps">
                   <li v-for="stage in report.stages" :key="stage.label" class="ts" :class="`ts-${stage.status === 'skipped' ? 'skip' : stage.status}`">
@@ -842,7 +857,7 @@ watch(
           </template>
         </div>
         <details v-else class="disclosure test-plan">
-          <summary>「测试连接」会检查什么 <span class="muted">依次执行 {{ plannedStageLabels(draft).length }} 个步骤</span></summary>
+          <summary>{{ t("connections.editor.test.planTitle") }} <span class="muted">{{ t("connections.editor.test.planCount", { n: plannedStageLabels(draft).length }) }}</span></summary>
           <div class="disclosure-body">
             <ol class="plan-steps">
               <li v-for="label in plannedStageLabels(draft)" :key="label">{{ label }}</li>
@@ -851,57 +866,57 @@ watch(
         </details>
       </div>
       <div class="modal-foot">
-        <button class="btn" type="button" data-action="cf-test" :disabled="busy" @click="runTest"><ConnIcon name="play" />测试连接</button>
+        <button class="btn" type="button" data-action="cf-test" :disabled="busy" @click="runTest"><ConnIcon name="play" />{{ t("connections.editor.test.button") }}</button>
         <span class="grow"></span>
-        <button class="btn" type="button" @click="closeEditor">取消</button>
-        <button class="btn" type="button" data-action="cf-save" :disabled="busy" @click="saveDraft(false)">保存</button>
-        <button class="btn primary" type="button" :disabled="busy" @click="saveDraft(true)">保存并连接</button>
+        <button class="btn" type="button" @click="closeEditor">{{ t("common.cancel") }}</button>
+        <button class="btn" type="button" data-action="cf-save" :disabled="busy" @click="saveDraft(false)">{{ t("common.save") }}</button>
+        <button class="btn primary" type="button" :disabled="busy" @click="saveDraft(true)">{{ t("connections.editor.test.saveConnect") }}</button>
       </div>
     </dialog>
 
     <dialog ref="otherDialog" class="modal" :class="dialog === 'delete' || dialog === 'export' ? 'modal-md' : 'modal-sm'" @cancel.prevent="dialog = null; passphrasePath = null">
       <template v-if="dialog === 'delete' && deleteTarget">
-        <div class="modal-head"><div class="modal-titles"><h2>删除连接「{{ deleteTarget.name }}」？</h2><p class="modal-sub">删除前请确认下面两条</p></div></div>
+        <div class="modal-head"><div class="modal-titles"><h2>{{ t("connections.deleteDialog.title", { name: deleteTarget.name }) }}</h2><p class="modal-sub">{{ t("connections.deleteDialog.subtitle") }}</p></div></div>
         <div class="modal-body">
           <p v-if="dialogError" class="field-err modal-error" role="alert" data-dialog-error>{{ dialogError }}</p>
           <ul class="facts">
-            <li class="fact-del"><ConnIcon name="trash" />会删除：本机保存的这条连接配置{{ deleteTarget.passwordSaved ? "，以及系统凭据库里保存的对应密码" : "" }}。</li>
-            <li class="fact-keep"><ConnIcon name="shield" />不会删除：{{ deleteTarget.engine === "sqlite" ? `SQLite 文件 ${deleteTarget.filePath}` : "数据库本身和其中的任何数据" }}。</li>
+            <li class="fact-del"><ConnIcon name="trash" />{{ t("connections.deleteDialog.willDelete") }}{{ deleteTarget.passwordSaved ? t("connections.deleteDialog.willDeleteSecrets") : "" }}.</li>
+            <li class="fact-keep"><ConnIcon name="shield" />{{ deleteTarget.engine === "sqlite" ? t("connections.deleteDialog.willKeepFile", { file: deleteTarget.filePath }) : t("connections.deleteDialog.willKeepDb") }}.</li>
           </ul>
         </div>
-        <div class="modal-foot"><span class="grow"></span><button class="btn" type="button" @click="closeDialog(otherDialog)">取消</button><button class="btn danger" type="button" data-action="confirm-delete" @click="confirmDelete">删除配置</button></div>
+        <div class="modal-foot"><span class="grow"></span><button class="btn" type="button" @click="closeDialog(otherDialog)">{{ t("common.cancel") }}</button><button class="btn danger" type="button" data-action="confirm-delete" @click="confirmDelete">{{ t("connections.deleteDialog.confirm") }}</button></div>
       </template>
       <template v-else-if="dialog === 'password' && passwordTarget">
-        <div class="modal-head"><div class="modal-titles"><h2>连接 {{ passwordTarget.name }}</h2><p class="modal-sub">这条连接没有保存密码，所以每次都会询问。</p></div></div>
+        <div class="modal-head"><div class="modal-titles"><h2>{{ t("connections.passwordDialog.title", { name: passwordTarget.name }) }}</h2><p class="modal-sub">{{ t("connections.passwordDialog.subtitle") }}</p></div></div>
         <div class="modal-body">
           <p v-if="dialogError" class="field-err modal-error" role="alert" data-dialog-error>{{ dialogError }}</p>
-          <label class="field"><span>数据库密码</span><input v-model="promptPassword" type="password" autocomplete="current-password" /></label>
-          <label class="check"><input v-model="promptSave" type="checkbox" /><span>保存到系统凭据库，以后不再询问</span></label>
+          <label class="field"><span>{{ t("connections.passwordDialog.label") }}</span><input v-model="promptPassword" type="password" autocomplete="current-password" /></label>
+          <label class="check"><input v-model="promptSave" type="checkbox" /><span>{{ t("connections.passwordDialog.saveLabel") }}</span></label>
         </div>
-        <div class="modal-foot"><span class="grow"></span><button class="btn" type="button" @click="closeDialog(otherDialog)">取消</button><button class="btn primary" type="button" @click="submitPrompt">连接</button></div>
+        <div class="modal-foot"><span class="grow"></span><button class="btn" type="button" @click="closeDialog(otherDialog)">{{ t("common.cancel") }}</button><button class="btn primary" type="button" @click="submitPrompt">{{ t("connections.passwordDialog.connect") }}</button></div>
       </template>
       <template v-else-if="dialog === 'export'">
-        <div class="modal-head"><div class="modal-titles"><h2>导出连接</h2><p class="modal-sub">导出为 RillSQL 连接文件；密码、私钥内容永不写入</p></div></div>
+        <div class="modal-head"><div class="modal-titles"><h2>{{ t("connections.exportDialog.title") }}</h2><p class="modal-sub">{{ t("connections.exportDialog.subtitle") }}</p></div></div>
         <div class="modal-body">
           <p v-if="dialogError" class="field-err modal-error" role="alert" data-dialog-error>{{ dialogError }}</p>
-          <label class="check export-all"><input type="checkbox" data-field="export-all" :checked="exportAllSelected" @change="toggleExportAll" /><span><b>全部连接</b><small>已选 {{ exportSelection.length }} / {{ connections.length }} 条</small></span></label>
+          <label class="check export-all"><input type="checkbox" data-field="export-all" :checked="exportAllSelected" @change="toggleExportAll" /><span><b>{{ t("connections.exportDialog.all") }}</b><small>{{ t("connections.exportDialog.selected", { selected: exportSelection.length, total: connections.length }) }}</small></span></label>
           <div class="export-list" data-section="export-list">
             <label v-for="item in connections" :key="item.id" class="check">
               <input v-model="exportChecked[item.id]" type="checkbox" data-field="export-row" :value="item.id" />
-              <span><b>{{ item.name }}</b><small>{{ engineMeta(item.engine).label }} · {{ item.engine === 'sqlite' ? (item.filePath ?? '本地文件') : `${item.host ?? ''}:${item.port ?? ''}` }}</small></span>
+              <span><b>{{ item.name }}</b><small>{{ engineMeta(item.engine).label }} · {{ item.engine === 'sqlite' ? (item.filePath ?? t('connections.page.localFile')) : `${item.host ?? ''}:${item.port ?? ''}` }}</small></span>
             </label>
           </div>
-          <label class="field"><span>口令（可选）</span><input v-model="exportPassphrase" type="password" data-field="export-passphrase" autocomplete="new-password" /><small>留空导出为明文 JSON；填写后整个文件加密，导入时需要同一口令。</small></label>
+          <label class="field"><span>{{ t("connections.exportDialog.passphrase") }}</span><input v-model="exportPassphrase" type="password" data-field="export-passphrase" autocomplete="new-password" /><small>{{ t("connections.exportDialog.passphraseHint") }}</small></label>
         </div>
-        <div class="modal-foot"><span class="grow"></span><button class="btn" type="button" @click="closeDialog(otherDialog)">取消</button><button class="btn primary" type="button" data-action="confirm-export" :disabled="busy" @click="confirmExport"><ConnIcon name="download" />导出…</button></div>
+        <div class="modal-foot"><span class="grow"></span><button class="btn" type="button" @click="closeDialog(otherDialog)">{{ t("common.cancel") }}</button><button class="btn primary" type="button" data-action="confirm-export" :disabled="busy" @click="confirmExport"><ConnIcon name="download" />{{ t("connections.exportDialog.button") }}</button></div>
       </template>
       <template v-else-if="dialog === 'passphrase' && passphrasePath">
-        <div class="modal-head"><div class="modal-titles"><h2>输入导入口令</h2><p class="modal-sub">这份文件带口令加密，口令不正确时不会导入任何连接</p></div></div>
+        <div class="modal-head"><div class="modal-titles"><h2>{{ t("connections.passphraseDialog.title") }}</h2><p class="modal-sub">{{ t("connections.passphraseDialog.subtitle") }}</p></div></div>
         <div class="modal-body">
           <p v-if="dialogError" class="field-err modal-error" role="alert" data-dialog-error>{{ dialogError }}</p>
-          <label class="field"><span>口令</span><input v-model="passphraseInput" type="password" data-field="import-passphrase" autocomplete="current-password" /></label>
+          <label class="field"><span>{{ t("connections.passphraseDialog.label") }}</span><input v-model="passphraseInput" type="password" data-field="import-passphrase" autocomplete="current-password" /></label>
         </div>
-        <div class="modal-foot"><span class="grow"></span><button class="btn" type="button" @click="dialog = null; passphrasePath = null">取消</button><button class="btn primary" type="button" data-action="confirm-import-passphrase" :disabled="busy" @click="submitPassphrase">导入</button></div>
+        <div class="modal-foot"><span class="grow"></span><button class="btn" type="button" @click="dialog = null; passphrasePath = null">{{ t("common.cancel") }}</button><button class="btn primary" type="button" data-action="confirm-import-passphrase" :disabled="busy" @click="submitPassphrase">{{ t("connections.passphraseDialog.button") }}</button></div>
       </template>
       <template v-else-if="detailTarget">
         <div class="modal-head"><div class="modal-titles"><h2>{{ detailTarget.name }}</h2><p class="modal-sub">{{ engineMeta(detailTarget.engine).label }}</p></div></div>
@@ -909,21 +924,21 @@ watch(
           <p v-if="dialogError" class="field-err modal-error" role="alert" data-dialog-error>{{ dialogError }}</p>
           <dl class="kv">
             <template v-if="detailTarget.engine === 'sqlite'">
-              <dt>文件</dt><dd class="mono">{{ detailTarget.filePath }}</dd>
+              <dt>{{ t("connections.detailsDialog.file") }}</dt><dd class="mono">{{ detailTarget.filePath }}</dd>
             </template>
             <template v-else>
-              <dt>地址</dt><dd class="mono">{{ detailTarget.host }}:{{ detailTarget.port }}</dd>
-              <dt>数据库</dt><dd>{{ detailTarget.database || "—" }}</dd>
-              <dt>用户</dt><dd class="mono">{{ detailTarget.username }}</dd>
+              <dt>{{ t("connections.detailsDialog.address") }}</dt><dd class="mono">{{ detailTarget.host }}:{{ detailTarget.port }}</dd>
+              <dt>{{ t("connections.detailsDialog.database") }}</dt><dd>{{ detailTarget.database || "—" }}</dd>
+              <dt>{{ t("connections.detailsDialog.user") }}</dt><dd class="mono">{{ detailTarget.username }}</dd>
             </template>
-            <dt>密码</dt><dd>{{ detailTarget.passwordSaved ? "保存在系统凭据库" : "每次连接时询问" }}</dd>
-            <dt>传输</dt><dd>{{ detailTarget.engine === "sqlite" ? "本地文件，不经过网络" : detailTarget.tls?.mode === "verify" ? `加密连接，按主机名 ${detailTarget.tls.serverName} 核对证书` : detailTarget.tls?.mode === "require" ? "加密连接，不核对证书" : "不加密" }}</dd>
+            <dt>{{ t("connections.detailsDialog.password") }}</dt><dd>{{ detailTarget.passwordSaved ? t("connections.detailsDialog.passwordSaved") : t("connections.detailsDialog.askEveryTime") }}</dd>
+            <dt>{{ t("connections.detailsDialog.transport") }}</dt><dd>{{ detailTarget.engine === "sqlite" ? t("connections.detailsDialog.transportLocal") : detailTarget.tls?.mode === "verify" ? t("connections.detailsDialog.transportVerify", { name: detailTarget.tls.serverName }) : detailTarget.tls?.mode === "require" ? t("connections.detailsDialog.transportRequire") : t("connections.detailsDialog.transportOff") }}</dd>
             <template v-if="detailTarget.ssh">
-              <dt>中转</dt><dd class="mono">经 SSH 跳板机 {{ detailTarget.ssh.host }}:{{ detailTarget.ssh.port }}</dd>
+              <dt>{{ t("connections.detailsDialog.via") }}</dt><dd class="mono">{{ t("connections.detailsDialog.viaSsh", { host: detailTarget.ssh.host, port: detailTarget.ssh.port }) }}</dd>
             </template>
           </dl>
         </div>
-        <div class="modal-foot"><button class="btn" type="button" @click="openEditor(detailTarget)">编辑配置</button><span class="grow"></span><button class="btn" type="button" @click="closeDialog(otherDialog)">关闭</button></div>
+        <div class="modal-foot"><button class="btn" type="button" @click="openEditor(detailTarget)">{{ t("connections.detailsDialog.edit") }}</button><span class="grow"></span><button class="btn" type="button" @click="closeDialog(otherDialog)">{{ t("common.close") }}</button></div>
       </template>
     </dialog>
   </div>

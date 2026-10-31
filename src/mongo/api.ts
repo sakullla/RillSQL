@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { tr } from "../i18n";
 
 /** 库摘要：名称 + 集合数（不含 admin/config/local）。 */
 export interface MongoDatabaseSummary {
@@ -59,7 +60,7 @@ function failureText(error: unknown): string {
     const message = (error as { message?: unknown }).message;
     if (typeof message === "string" && message.trim()) return message;
   }
-  return "操作失败，原因未知。";
+  return tr("mongo.docs.apiFailedUnknown");
 }
 
 export function failureOf(error: unknown): string {

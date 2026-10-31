@@ -1,6 +1,8 @@
 /** Redis 命令风险分类（C2/R11）：写删类执行前前端二次确认；只读类直通；KEYS 无条件禁用。
  * 清单与后端 src-tauri/src/redis/exec.rs 的 BLOCKED/DANGEROUS 保持一致（后端同样强制）。 */
 
+import { tr } from "../i18n";
+
 export type CommandRisk = "blocked" | "dangerous" | "readonly";
 
 /** 无条件禁用：KEYS 全量扫描会阻塞服务端，键空间一律走 SCAN 分页。 */
@@ -59,8 +61,8 @@ export function splitCommandline(line: string): { command: string; args: string[
 /** 危险命令确认对话框的提示文案。 */
 export function dangerPrompt(line: string): string {
   const word = splitCommandline(line).command.toUpperCase();
-  if (word === "FLUSHDB") return "FLUSHDB 会清空当前库的全部键，且不可撤销。确认执行？";
-  if (word === "FLUSHALL") return "FLUSHALL 会清空这台服务器的全部库，且不可撤销。确认执行？";
-  if (word === "SHUTDOWN") return "SHUTDOWN 会直接关闭 Redis 服务器。确认执行？";
-  return `${word} 属于写删类命令，可能修改或删除数据。确认执行？`;
+  if (word === "FLUSHDB") return tr("redis.danger.flushdb");
+  if (word === "FLUSHALL") return tr("redis.danger.flushall");
+  if (word === "SHUTDOWN") return tr("redis.danger.shutdown");
+  return tr("redis.danger.generic", { word });
 }

@@ -24,7 +24,7 @@ export interface OpenPlan {
 
 /** 原连接已不在目录中时，编辑器要写出这句话，并且这次打开不执行。 */
 export function deletedConnectionNotice(): string {
-  return "需要重新选择执行目标。原来的连接已删除，这次只载入 SQL，不会执行。";
+  return tr("history.plan.deletedNotice");
 }
 
 export function openPlan(entry: HistoryEntry, knownIds: ReadonlySet<string>): OpenPlan {
@@ -42,11 +42,11 @@ export function openPlan(entry: HistoryEntry, knownIds: ReadonlySet<string>): Op
 
 /** 原始状态值翻译成直白中文；颜色不作唯一信息来源，文字始终在。 */
 export function statusLabel(status: string): string {
-  if (status === "ok") return "成功";
-  if (status === "error") return "失败";
-  if (status === "cancelled") return "已取消";
-  if (status === "running") return "执行中";
-  return "结果未知";
+  if (status === "ok") return tr("history.status.ok");
+  if (status === "error") return tr("history.status.error");
+  if (status === "cancelled") return tr("history.status.cancelled");
+  if (status === "running") return tr("history.status.running");
+  return tr("history.status.unknown");
 }
 
 export function statusBadge(status: string): string {
@@ -77,12 +77,12 @@ export function groupHistoryByDay(entries: readonly HistoryEntry[], now: Date = 
   for (const entry of entries) {
     const started = new Date(entry.startedAt);
     if (Number.isNaN(started.getTime())) {
-      const fallback = groups.find((group) => group.key === "unknown") ?? groups[groups.push({ key: "unknown", label: "时间未知", entries: [] }) - 1]!;
+      const fallback = groups.find((group) => group.key === "unknown") ?? groups[groups.push({ key: "unknown", label: tr("history.plan.groupUnknown"), entries: [] }) - 1]!;
       fallback.entries.push(entry);
       continue;
     }
     const key = dayKey(started);
-    const label = key === todayKey ? "今天" : key === yesterdayKey ? "昨天" : `${started.getFullYear()} 年 ${started.getMonth() + 1} 月 ${started.getDate()} 日`;
+    const label = key === todayKey ? tr("history.plan.today") : key === yesterdayKey ? tr("history.plan.yesterday") : tr("history.plan.dateLabel", { y: started.getFullYear(), m: started.getMonth() + 1, d: started.getDate() });
     const group = groups.find((item) => item.key === key) ?? groups[groups.push({ key, label, entries: [] }) - 1]!;
     group.entries.push(entry);
   }
@@ -97,8 +97,8 @@ export function timeOfDay(iso: string): string {
 
 export function elapsedLabel(ms: number | null): string {
   if (ms == null) return "";
-  if (ms < 1000) return `${ms} 毫秒`;
-  return `${(ms / 1000).toFixed(1)} 秒`;
+  if (ms < 1000) return tr("history.plan.ms", { n: ms });
+  return tr("history.plan.seconds", { n: (ms / 1000).toFixed(1) });
 }
 
 export function filterHistory(
@@ -118,3 +118,5 @@ export function filterHistory(
     return true;
   });
 }
+
+import { tr } from "../i18n";

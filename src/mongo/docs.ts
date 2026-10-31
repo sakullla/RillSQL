@@ -1,4 +1,5 @@
 import type { MongoDoc } from "./api";
+import { tr } from "../i18n";
 
 /** 文档网格默认页大小（与表网格一致）。 */
 export const DOC_PAGE_SIZE = 20;
@@ -9,16 +10,16 @@ export const DOC_PAGE_SIZE = 20;
  */
 export function quickValidateJson(text: string): string | null {
   const trimmed = text.trim();
-  if (!trimmed) return "请输入 JSON 文档，例如 {\"status\": \"active\"}。";
+  if (!trimmed) return tr("mongo.docs.required");
   try {
     const parsed: unknown = JSON.parse(trimmed);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      return "文档应为 JSON 对象（{\"字段\": 值}），不是数组或标量。";
+      return tr("mongo.docs.mustBeObject");
     }
     return null;
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
-    return message ? `JSON 语法错误：${message}` : "JSON 语法错误。";
+    return message ? tr("mongo.docs.syntaxError", { message }) : tr("mongo.docs.syntaxErrorPlain");
   }
 }
 

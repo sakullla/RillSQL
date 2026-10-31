@@ -1,4 +1,5 @@
 import { ENGINES, engineMeta, type Engine } from "../engines";
+import { tr } from "../i18n";
 
 export { ENGINES, engineMeta };
 export type { Engine };
@@ -86,16 +87,16 @@ export interface EnvTag {
 }
 
 export const TONES: { id: EnvTone; label: string }[] = [
-  { id: "dev", label: "青绿" },
-  { id: "test", label: "蓝色" },
-  { id: "prod", label: "红色" },
-  { id: "local", label: "紫色" },
+  { id: "dev", label: "connections.tones.dev" },
+  { id: "test", label: "connections.tones.test" },
+  { id: "prod", label: "connections.tones.prod" },
+  { id: "local", label: "connections.tones.local" },
 ];
 
 export function presentEnv(env: string, tags: readonly EnvTag[]): { label: string; tone: EnvTone | "none" } {
-  if (!env || env === ENV_NONE) return { label: "无标签", tone: "none" };
+  if (!env || env === ENV_NONE) return { label: tr("connections.page.noTag"), tone: "none" };
   const tag = tags.find((item) => item.id === env);
-  if (!tag) return { label: "无标签", tone: "none" };
+  if (!tag) return { label: tr("connections.page.noTag"), tone: "none" };
   return { label: tag.label, tone: tag.tone };
 }
 
@@ -132,7 +133,7 @@ export function blankDraft(engine: Engine): ConnectionDraft {
 export function validateRedisDbIndex(value: string): string | null {
   const trimmed = value.trim();
   if (!trimmed) return null;
-  if (!/^\d+$/.test(trimmed)) return "Redis 库索引应为 0 起的非负整数";
+  if (!/^\d+$/.test(trimmed)) return tr("connections.validate.redisDbIndex");
   return null;
 }
 
@@ -172,29 +173,29 @@ export function draftFromSaved(saved: SavedConnection): ConnectionDraft {
 export function validate(draft: ConnectionDraft): Record<string, string> {
   const errors: Record<string, string> = {};
   if (draft.engine === "sqlite") {
-    if (!draft.filePath.trim()) errors.filePath = "请选择数据库文件";
+    if (!draft.filePath.trim()) errors.filePath = tr("connections.validate.chooseFile");
     return errors;
   }
-  if (!draft.host.trim()) errors.host = "请填写主机";
+  if (!draft.host.trim()) errors.host = tr("connections.validate.hostRequired");
   // MongoDB 填整条连接串时地址与端口都在串里，端口字段可留空。
   const mongoUri = draft.engine === "mongodb" && isMongoUri(draft.host);
   const port = Number(draft.port);
-  if (!mongoUri && (!/^\d+$/.test(draft.port.trim()) || port < 1 || port > 65535)) errors.port = "端口应为 1–65535";
+  if (!mongoUri && (!/^\d+$/.test(draft.port.trim()) || port < 1 || port > 65535)) errors.port = tr("connections.validate.portRange");
   // Redis 的用户名是 ACL 用户名（密码认证可留空）；MongoDB 允许无认证直连（本地开发）。
-  if (!draft.username.trim() && draft.engine !== "redis" && draft.engine !== "mongodb") errors.username = "请填写用户名";
+  if (!draft.username.trim() && draft.engine !== "redis" && draft.engine !== "mongodb") errors.username = tr("connections.validate.userRequired");
   if (draft.engine === "redis") {
     const dbError = validateRedisDbIndex(draft.database);
     if (dbError) errors.database = dbError;
   }
   // MongoDB 整串 URI 与 SSH 隧道互斥（后端保存阶段同样拒绝）：URI 的地址直接进驱动，隧道会被绕过。
   if (draft.engine === "mongodb" && isMongoUri(draft.host) && draft.sshOn) {
-    errors.sshHost = "整串 URI 暂不支持 SSH 隧道，请改用 host/port 表单";
+    errors.sshHost = tr("connections.validate.mongoUriSsh");
   }
-  if (draft.sshOn && !draft.sshHost.trim()) errors.sshHost = "请填写跳板机主机";
-  if (draft.sshOn && !draft.sshUser.trim()) errors.sshUser = "请填写 SSH 用户";
+  if (draft.sshOn && !draft.sshHost.trim()) errors.sshHost = tr("connections.validate.sshHostRequired");
+  if (draft.sshOn && !draft.sshUser.trim()) errors.sshUser = tr("connections.validate.sshUserRequired");
   const sshPort = Number(draft.sshPort);
-  if (draft.sshOn && (!/^\d+$/.test(draft.sshPort.trim()) || sshPort < 1 || sshPort > 65535)) errors.sshPort = "端口应为 1–65535";
-  if (draft.tlsMode !== "off" && draft.caMode === "file" && !draft.caFile.trim()) errors.caFile = "请填写 CA 证书文件";
+  if (draft.sshOn && (!/^\d+$/.test(draft.sshPort.trim()) || sshPort < 1 || sshPort > 65535)) errors.sshPort = tr("connections.validate.portRange");
+  if (draft.tlsMode !== "off" && draft.caMode === "file" && !draft.caFile.trim()) errors.caFile = tr("connections.validate.caFileRequired");
   return errors;
 }
 
@@ -261,19 +262,23 @@ export function toStoredConfig(draft: ConnectionDraft, id: string): SavedConnect
 
 /** 与后端 src-tauri/src/connections/stages.rs 的阶段标签保持一致。 */
 export function plannedStageLabels(draft: ConnectionDraft): string[] {
-  if (draft.engine === "sqlite") return ["打开文件", "读取表结构清单", "检查外键设置"];
-  const stages = draft.sshOn ? ["确认 SSH 跳板机身份", "登录 SSH 跳板机", "通过 SSH 跳板机打通到数据库的通道"] : ["连接数据库服务器"];
-  if (draft.tlsMode !== "off") stages.push(draft.tlsMode === "verify" ? "加密连接并核对证书" : "加密连接");
-  stages.push("登录数据库", "读取数据库版本");
+  if (draft.engine === "sqlite") {
+    return [tr("connections.stages.sqliteOpen"), tr("connections.stages.sqliteTables"), tr("connections.stages.sqliteForeignKeys")];
+  }
+  const stages = draft.sshOn
+    ? [tr("connections.stages.sshConfirm"), tr("connections.stages.sshLogin"), tr("connections.stages.sshTunnel")]
+    : [tr("connections.stages.connectServer")];
+  if (draft.tlsMode !== "off") stages.push(draft.tlsMode === "verify" ? tr("connections.stages.tlsVerify") : tr("connections.stages.tlsRequire"));
+  stages.push(tr("connections.stages.login"), tr("connections.stages.version"));
   return stages;
 }
 
 export function tlsVerificationCopy(draft: ConnectionDraft): string {
-  const host = draft.host.trim() || "（填写主机后显示）";
+  const host = draft.host.trim() || tr("connections.tlsCopy.hostPending");
   if (draft.sshOn) {
-    return `证书仍按数据库主机名 ${host} 校验，网络指向 127.0.0.1，不会改用 localhost，也不会关闭验证后重试。`;
+    return tr("connections.tlsCopy.viaSsh", { host });
   }
-  return "直连时，网络地址和证书主机名都是数据库主机。";
+  return tr("connections.tlsCopy.direct");
 }
 
 export function storedConfigHidesSecrets(stored: SavedConnection, secrets: SecretInput): boolean {

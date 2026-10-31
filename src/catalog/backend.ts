@@ -62,7 +62,7 @@ export async function fetchDefinition(object: Pick<CatalogObjectRef, "connection
     signature: object.signature ?? "",
     relation: object.relation ?? "",
   });
-  if (!sql.trim()) throw new Error("没有读到定义");
+  if (!sql.trim()) throw new Error(tr("catalog.definition.failed"));
   return sql;
 }
 
@@ -113,3 +113,5 @@ export function setListConnections(list: (() => Promise<SavedConnection[]>) | nu
 export function listConnections(): Promise<SavedConnection[]> {
   return listConnectionsImpl();
 }
+
+import { tr } from "../i18n";

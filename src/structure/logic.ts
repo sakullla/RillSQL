@@ -1,3 +1,4 @@
+import { tr } from "../i18n";
 import type { ColumnDraft, StructureColumn, StructureIndex } from "./types";
 
 export function draftsFromColumns(columns: readonly StructureColumn[]): ColumnDraft[] {
@@ -26,10 +27,12 @@ export function blankColumn(): ColumnDraft {
   };
 }
 
-export function columnMark(draft: ColumnDraft, baseline: StructureColumn | undefined): "" | "新" | "改" | "删" {
-  if (draft.dropped && draft.original) return "删";
-  if (!baseline && !draft.dropped) return "新";
-  if (columnChanged(draft, baseline)) return "改";
+export type ColumnMark = "" | "new" | "changed" | "dropped";
+
+export function columnMark(draft: ColumnDraft, baseline: StructureColumn | undefined): ColumnMark {
+  if (draft.dropped && draft.original) return "dropped";
+  if (!baseline && !draft.dropped) return "new";
+  if (columnChanged(draft, baseline)) return "changed";
   return "";
 }
 
@@ -49,15 +52,15 @@ export function columnChanged(draft: ColumnDraft, baseline: StructureColumn | un
 /** 每行「将要发生什么」的直白摘要；与后端 ddl 文案口径一致。 */
 export function columnImpact(draft: ColumnDraft, baseline: StructureColumn | undefined): string {
   if (!baseline) {
-    return draft.dropped ? "" : `新增字段 ${draft.name.trim() || "（还没有名字）"}，类型 ${draft.typeName.trim() || "（还没有填写）"}`;
+    return draft.dropped ? "" : tr("structure.logic.addColumnUnnamed", { name: draft.name.trim() || tr("structure.logic.unnamed"), type: draft.typeName.trim() || tr("structure.logic.unfilled") });
   }
-  if (draft.dropped) return `删除字段 ${baseline.name}：该列的数据会永久丢掉`;
+  if (draft.dropped) return tr("structure.logic.dropColumn", { name: baseline.name });
   const parts: string[] = [];
-  if (draft.name.trim() !== baseline.name) parts.push(`重命名 ${baseline.name} → ${draft.name.trim()}：仍在用旧名字的查询要跟着改`);
+  if (draft.name.trim() !== baseline.name) parts.push(tr("structure.logic.renameColumn", { from: baseline.name, to: draft.name.trim() }));
   if (draft.typeName.trim() !== baseline.typeName)
-    parts.push(`类型由 ${baseline.typeName} 改为 ${draft.typeName.trim()}：无法转换的值会使执行失败，数据不会被自动截断或清空`);
-  if (draft.nullable !== baseline.nullable) parts.push(draft.nullable ? "改为允许空" : "改为不允许空：现有的空值会使执行失败");
-  if (draft.defaultSql.trim() !== (baseline.defaultSql ?? "").trim()) parts.push("默认值改变：只影响之后写入的行");
+    parts.push(tr("structure.logic.typeChange", { from: baseline.typeName, to: draft.typeName.trim() }));
+  if (draft.nullable !== baseline.nullable) parts.push(draft.nullable ? tr("structure.logic.nullableOn") : tr("structure.logic.nullableOff"));
+  if (draft.defaultSql.trim() !== (baseline.defaultSql ?? "").trim()) parts.push(tr("structure.logic.defaultChange"));
   return parts.join("；");
 }
 
@@ -86,42 +89,42 @@ export function fkActions(engine: string): string[] {
 export function statusLabel(status: string): string {
   switch (status) {
     case "ok":
-      return "已完成";
+      return tr("structure.logic.done");
     case "failed":
-      return "失败";
+      return tr("structure.logic.failed");
     case "skipped":
-      return "未执行";
+      return tr("structure.logic.skipped");
     case "unknown":
-      return "结果未知";
+      return tr("structure.logic.unknown");
     case "rolled_back":
-      return "已回滚";
+      return tr("structure.logic.rolledBack");
     default:
       return status;
   }
 }
 
 export function riskLevelLabel(level: string): string {
-  if (level === "danger") return "危险";
-  if (level === "warn") return "注意";
-  return "说明";
+  if (level === "danger") return tr("structure.logic.danger");
+  if (level === "warn") return tr("structure.logic.warn");
+  return tr("structure.logic.info");
 }
 
 /** 事务语义一句大白话；与后端 rule_text 口径一致，不承诺这里没有的回滚能力。 */
 export function transactionSummary(engine: string, rebuild: boolean): string {
   if (rebuild) {
-    return "这次修改会重建整张表：建新表、复制数据、替换旧表在同一个事务里完成，任一步失败都会整体回滚，不会留下半截改动。";
+    return tr("structure.logic.txRebuild");
   }
   if (engine === "postgres") {
-    return "PostgreSQL 可以把多次修改放进一个事务、失败时整体回滚；但这次逐条执行、失败即停，已经成功的语句不会撤销。";
+    return tr("structure.logic.txPg");
   }
   if (engine === "mysql" || engine === "mariadb") {
-    return "MySQL 与 MariaDB 的每条结构语句改完立即生效，不能整体回滚；逐条执行、失败即停，已经成功的语句不会撤销。";
+    return tr("structure.logic.txMysql");
   }
-  return "这些语句逐条执行，失败即停：已经成功的不会撤销，后面的不再执行。";
+  return tr("structure.logic.txPlain");
 }
 
 export function foreignKeyLabel(value: boolean | null): string {
   if (value === true) return "ON";
   if (value === false) return "OFF";
-  return "未知";
+  return tr("structure.logic.unknownStatus");
 }

@@ -14,10 +14,10 @@ import HistoryPage from "../history/HistoryPage.vue";
 import ActivityRail from "./ActivityRail.vue";
 import { filterPalette, shellCommands } from "./commands";
 import EnvPill from "./EnvPill.vue";
-import { PRODUCT_TITLE } from "./product";
+import { productTitle } from "./product";
 import { createSession, type ShellTab } from "./session";
 import StatusBar from "./StatusBar.vue";
-import { CONNECTION_STATUS_TEXT, ENVIRONMENT_LABELS, OPERATION_STATE_TEXT, type OperationState } from "./status-text";
+import { connectionStatusText, environmentLabel, operationStateText, type ConnectionStatus, type OperationState } from "./status-text";
 import TitleBar from "./TitleBar.vue";
 import { desktopShell } from "./window-chrome";
 
@@ -185,7 +185,7 @@ describe("shell layout", () => {
     expect(unlabeled.text()).not.toContain("生产");
 
     const idle = mount(StatusBar, { props: { tab: null, onWorkspace: false } });
-    expect(idle.text()).toContain(PRODUCT_TITLE);
+    expect(idle.text()).toContain(productTitle());
   });
 
   it("drops the english eyebrows from connections, history, and settings", () => {
@@ -215,9 +215,9 @@ describe("shell layout", () => {
       });
       const activity = bar.get(".sb-activity");
       expect(activity.attributes("data-state")).toBe(state);
-      expect(activity.text()).toContain(OPERATION_STATE_TEXT[state]);
+      expect(activity.text()).toContain(operationStateText(state));
       expect(activity.text()).toContain("导出 customers.csv");
-      return OPERATION_STATE_TEXT[state];
+      return operationStateText(state);
     });
     expect(new Set(labels).size).toBe(4);
     expect(labels).toEqual(["进行中", "成功", "失败", "结果未知"]);
@@ -259,11 +259,12 @@ describe("shell layout", () => {
   });
 
   it("does not distinguish environment or status by color alone", () => {
-    const pill = mount(EnvPill, { props: { env: "prod", label: ENVIRONMENT_LABELS.prod } });
+    const pill = mount(EnvPill, { props: { env: "prod", label: environmentLabel("prod") } });
     expect(pill.text()).toBe("生产");
     expect(pill.classes()).toContain("env-prod");
-    for (const label of Object.values(CONNECTION_STATUS_TEXT)) {
-      expect(label.length).toBeGreaterThan(1);
+    const statuses: ConnectionStatus[] = ["connected", "disconnected", "connecting", "error", "lost"];
+    for (const status of statuses) {
+      expect(connectionStatusText(status).length).toBeGreaterThan(1);
     }
   });
 
@@ -309,8 +310,8 @@ describe("shell layout", () => {
   it("puts the product title on the window and the html document", () => {
     const html = readFileSync(resolve(root, "index.html"), "utf8");
     const tauri = readFileSync(resolve(root, "src-tauri/tauri.conf.json"), "utf8");
-    expect(html).toContain(`<title>${PRODUCT_TITLE}</title>`);
-    expect(tauri).toContain(`"title": "${PRODUCT_TITLE}"`);
-    expect(tauri).toContain(`"productName": "${PRODUCT_TITLE}"`);
+    expect(html).toContain(`<title>${productTitle()}</title>`);
+    expect(tauri).toContain(`"title": "${productTitle()}"`);
+    expect(tauri).toContain(`"productName": "${productTitle()}"`);
   });
 });

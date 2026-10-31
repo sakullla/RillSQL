@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { tr } from "../i18n";
 import { onMounted, ref } from "vue";
 import { fetchDiagram } from "./api";
 import type { Diagram, DiagramEdge } from "./types";
@@ -19,7 +20,7 @@ onMounted(async () => {
     diagram.value = await fetchDiagram(props.connectionId, props.database, props.schema);
   } catch (caught) {
     diagram.value = null;
-    error.value = caught instanceof Error && caught.message ? caught.message : typeof caught === "string" && caught ? caught : "没有读到关系图";
+    error.value = caught instanceof Error && caught.message ? caught.message : typeof caught === "string" && caught ? caught : tr("diagram.failed");
   } finally {
     loading.value = false;
   }
@@ -34,9 +35,9 @@ function edgeKey(edge: DiagramEdge): string {
   <section class="diagram-view" data-diagram data-readonly="true">
     <header class="diagram-bar">
       <h2>{{ label }}</h2>
-      <p data-diagram-readonly>只读。打开和查看这张图不会发送建表、改表、删表或数据写入。</p>
+      <p data-diagram-readonly>{{ tr("diagram.readonly") }}</p>
     </header>
-    <p v-if="loading" class="diagram-loading" data-diagram-loading>正在读取关系图…</p>
+    <p v-if="loading" class="diagram-loading" data-diagram-loading>{{ tr("diagram.loading") }}</p>
     <p v-else-if="error" class="diagram-error" data-diagram-error>{{ error }}</p>
     <template v-else-if="diagram">
       <p v-if="diagram.notice" class="diagram-notice" data-diagram-notice>{{ diagram.notice }}</p>
@@ -52,7 +53,7 @@ function edgeKey(edge: DiagramEdge): string {
           <p v-for="(note, index) in table.outside" :key="`${table.name}:outside:${index}`" class="diagram-note" data-outside>{{ note }}</p>
         </article>
       </div>
-      <div v-if="diagram.edges.length" class="diagram-links" aria-label="外键">
+      <div v-if="diagram.edges.length" class="diagram-links" :aria-label="tr('diagram.foreignKeys')">
         <div
           v-for="edge in diagram.edges"
           :key="edgeKey(edge)"

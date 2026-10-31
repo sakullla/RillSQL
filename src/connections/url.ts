@@ -1,4 +1,5 @@
 import { engineMeta, type Engine, type TlsMode } from "./model";
+import { tr } from "../i18n";
 
 export type ParsedConnectionUrl =
   | {
@@ -24,7 +25,7 @@ const SCHEME_PREFIX = /^(postgresql|postgres|mysql|mariadb|sqlserver|mssql|redis
 export function parseConnectionUrl(text: string): ParsedConnectionUrl {
   const trimmed = text.trim();
   const matched = SCHEME_PREFIX.exec(trimmed);
-  if (!matched) return { ok: false, reason: "只支持 postgres://、postgresql://、mysql://、mariadb://、sqlserver://、redis://、rediss://、mongodb:// 或 mongodb+srv:// 开头的连接串。" };
+  if (!matched) return { ok: false, reason: tr("connections.url.unsupported") };
   const scheme = matched[1].toLowerCase();
   const engine: Engine =
     scheme === "mysql"
@@ -42,11 +43,11 @@ export function parseConnectionUrl(text: string): ParsedConnectionUrl {
   try {
     url = new URL(trimmed);
   } catch {
-    return { ok: false, reason: "连接串格式无法解析，请检查主机和端口的写法。" };
+    return { ok: false, reason: tr("connections.url.parseFailed") };
   }
   // WHATWG URL 对 IPv6 主机保留方括号，表单里按裸地址填写。
   const host = url.hostname.replace(/^\[(.+)\]$/, "$1");
-  if (!host) return { ok: false, reason: "连接串里没有主机地址。" };
+  if (!host) return { ok: false, reason: tr("connections.url.noHost") };
   if (engine === "mongodb") {
     // MongoDB：整串保存进主机字段（后端按连接串解析，串里的参数优先）；
     // SRV 形态端口由 DNS 记录决定，表单端口留空。

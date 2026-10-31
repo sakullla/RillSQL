@@ -1,4 +1,5 @@
 import { parseCsvDistinct, type CsvDelimiter } from "./csv";
+import { tr } from "../i18n";
 import type { ChangePayload } from "../grid/api";
 import type { Cell, Column, CommitReport } from "../grid/types";
 
@@ -23,14 +24,14 @@ function blankRow(row: { value: string | null; quoted: boolean }[]): boolean {
 
 export function parseImportCsv(text: string, delimiter: CsvDelimiter = ","): ImportParse {
   const source = text.trim();
-  if (!source) return { ok: false, reason: "文件不是可用的 CSV。" };
+  if (!source) return { ok: false, reason: tr("export.importParse.notCsv") };
   const table = parseCsvDistinct(text, delimiter);
-  if (!table.length || !table[0]?.length) return { ok: false, reason: "CSV 缺少列名。" };
+  if (!table.length || !table[0]?.length) return { ok: false, reason: tr("export.importParse.csvNoHeader") };
   const columns: string[] = [];
   for (const field of table[0]) {
     const name = field.value?.trim() ?? "";
-    if (!name) return { ok: false, reason: "CSV 缺少列名。" };
-    if (columns.includes(name)) return { ok: false, reason: `CSV 列名重复：${name}` };
+    if (!name) return { ok: false, reason: tr("export.importParse.csvNoHeader") };
+    if (columns.includes(name)) return { ok: false, reason: tr("export.importParse.csvDuplicate", { name }) };
     columns.push(name);
   }
   const rows = table.slice(1).filter((row) => !blankRow(row)).map((row) => {
@@ -45,24 +46,24 @@ export function parseImportCsv(text: string, delimiter: CsvDelimiter = ","): Imp
 
 export function parseImportJson(text: string): ImportParse {
   const source = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
-  if (!source.trim()) return { ok: false, reason: "JSON 必须是由对象组成的数组。" };
+  if (!source.trim()) return { ok: false, reason: tr("export.importParse.jsonNotArray") };
   let parsed: unknown;
   try {
     parsed = JSON.parse(source);
   } catch {
-    return { ok: false, reason: "JSON 必须是由对象组成的数组。" };
+    return { ok: false, reason: tr("export.importParse.jsonNotArray") };
   }
-  if (!Array.isArray(parsed)) return { ok: false, reason: "JSON 必须是由对象组成的数组。" };
+  if (!Array.isArray(parsed)) return { ok: false, reason: tr("export.importParse.jsonNotArray") };
   const columns: string[] = [];
   const rows: Record<string, Cell>[] = [];
   for (const item of parsed) {
-    if (!item || typeof item !== "object" || Array.isArray(item)) return { ok: false, reason: "JSON 必须是由对象组成的数组。" };
+    if (!item || typeof item !== "object" || Array.isArray(item)) return { ok: false, reason: tr("export.importParse.jsonNotArray") };
     const cells: Record<string, Cell> = {};
     for (const [key, value] of Object.entries(item as Record<string, unknown>)) {
       if (!columns.includes(key)) columns.push(key);
       if (value === null) cells[key] = null;
       else if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") cells[key] = String(value);
-      else return { ok: false, reason: "JSON 字段只能是字符串、数字、布尔或空值。" };
+      else return { ok: false, reason: tr("export.importParse.jsonFieldType") };
     }
     rows.push(cells);
   }
@@ -113,11 +114,11 @@ export function mappedPreview(rows: readonly Record<string, Cell>[], mapping: Re
 
 export function importResultText(report: CommitReport, total: number): { allSucceeded: boolean; text: string } {
   const written = report.applied.length;
-  if (!report.failed) return { allSucceeded: written === total, text: `已写入 ${written} 行。` };
+  if (!report.failed) return { allSucceeded: written === total, text: tr("export.importParse.writtenAll", { n: written }) };
   const row = /^import-(\d+)$/.exec(report.failed.id)?.[1] ?? report.failed.id;
   const waiting = report.pendingIds.filter((id) => id !== report.failed?.id).length;
   return {
     allSucceeded: false,
-    text: `第 ${row} 行失败：${report.failed.message}。已写入 ${written} 行，还有 ${waiting} 行没有写入。导入不是全部成功。`,
+    text: tr("export.importParse.rowFailed", { row, message: report.failed.message, written, waiting }),
   };
 }

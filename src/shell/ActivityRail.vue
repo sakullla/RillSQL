@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { AppPage } from "../router";
+import { tr as t } from "../i18n";
 import ChordKeys from "./ChordKeys.vue";
 import Icon from "./Icon.vue";
 import type { IconName } from "./icons";
@@ -8,23 +9,23 @@ defineProps<{ page: AppPage }>();
 const emit = defineEmits<{ navigate: [page: AppPage] }>();
 
 const items: { id: AppPage; icon: IconName; label: string }[] = [
-  { id: "workspace", icon: "terminal", label: "工作台" },
-  { id: "connections", icon: "database", label: "连接" },
-  { id: "history", icon: "history", label: "查询历史" },
+  { id: "workspace", icon: "terminal", label: "shell.nav.workspace" },
+  { id: "connections", icon: "database", label: "shell.nav.connections" },
+  { id: "history", icon: "history", label: "shell.nav.history" },
 ];
 </script>
 
 <template>
-  <nav class="rail" aria-label="主导航">
+  <nav class="rail" :aria-label="t('shell.nav.main')">
     <button
       v-for="item in items"
       :key="item.id"
       class="rail-btn"
       :class="{ active: page === item.id }"
       type="button"
-      :aria-label="item.label"
+      :aria-label="t(item.label)"
       :aria-current="page === item.id ? 'page' : 'false'"
-      :title="item.id === 'workspace' ? '工作台（再次点击切换资源管理器）' : item.label"
+      :title="item.id === 'workspace' ? t('shell.nav.workspaceHint') : t(item.label)"
       @click="emit('navigate', item.id)"
     >
       <Icon :name="item.icon" />
@@ -34,9 +35,9 @@ const items: { id: AppPage; icon: IconName; label: string }[] = [
       class="rail-btn"
       :class="{ active: page === 'settings' }"
       type="button"
-      aria-label="设置"
+      :aria-label="t('shell.nav.settings')"
       :aria-current="page === 'settings' ? 'page' : 'false'"
-      title="设置"
+      :title="t('shell.nav.settings')"
       @click="emit('navigate', 'settings')"
     >
       <Icon name="sliders" />

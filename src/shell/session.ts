@@ -1,9 +1,16 @@
 import { computed, ref, type Ref } from "vue";
 import type { AppPage } from "../router";
 import { parseHash, toHash } from "../router";
-import { CONNECTION_STATUS_TEXT, type ConnectionStatus } from "./status-text";
+import { tr } from "../i18n";
+import { isConnectionStatus, type ConnectionStatus } from "./status-text";
 
 export type TabKind = "query" | "table" | "structure" | "definition" | "diagram" | "keys" | "docs";
+
+/** 字典化标签标题：key + 参数。带 titleKey 的标签在语言切换后标题跟随重算（R6）。 */
+export interface TabTitleKey {
+  key: string;
+  params?: Record<string, string | number>;
+}
 
 export interface DefinitionRequest {
   schema: string;
@@ -71,6 +78,8 @@ export interface SessionSnapshotTab {
   /** docs 标签（MongoDB）恢复时指向的集合。 */
   docDatabase?: string | null;
   docCollection?: string | null;
+  /** 字典化标题（R6）：恢复后语言切换仍能跟随。 */
+  titleKey?: TabTitleKey | null;
 }
 
 export interface SessionSnapshot {
@@ -89,6 +98,7 @@ export interface DocsTarget {
   engine: string;
   status: ConnectionStatus;
   collection: string;
+  titleKey?: TabTitleKey | null;
 }
 
 /** Redis 键浏览器标签（R11）的目标：一条连接 + 可选的初始选中键。 */
@@ -102,6 +112,7 @@ export interface RedisTarget {
   engine: string;
   status: ConnectionStatus;
   key?: string;
+  titleKey?: TabTitleKey | null;
 }
 
 export interface DiagramTarget {
@@ -122,11 +133,13 @@ export interface PlaceholderTarget {
   path?: string;
   pane?: "data" | "structure";
   section?: "columns" | "drop";
+  titleKey?: TabTitleKey | null;
 }
 
 export const STRUCTURE_PLACEHOLDER: PlaceholderTarget = {
   id: "placeholder",
-  label: "新建表结构",
+  label: tr("shell.tabs.newStructure"),
+  titleKey: { key: "shell.tabs.newStructure" },
 };
 
 export interface QueryTarget {
@@ -152,6 +165,8 @@ export interface ShellTab {
   id: string;
   kind: TabKind;
   title: string;
+  /** 字典化标题（R6）：渲染处用 tabTitle() 取值，语言切换即时更新。 */
+  titleKey?: TabTitleKey | null;
   targetText: string | null;
   path: string | null;
   draft: string;
@@ -205,11 +220,12 @@ export interface ShellSession {
   closeHelp: () => void;
 }
 
-function blankTab(kind: TabKind, id: string, title: string, path: string | null, draft: string): ShellTab {
+function blankTab(kind: TabKind, id: string, title: string, path: string | null, draft: string, titleKey: TabTitleKey | null = null): ShellTab {
   return {
     id,
     kind,
     title,
+    titleKey,
     targetText: null,
     path,
     draft,
@@ -248,6 +264,12 @@ function applyTarget(tab: ShellTab, target: QueryTarget | null) {
   tab.targetNotice = null;
 }
 
+/** 标签展示标题：优先字典 key（语言切换即时更新），否则用打开时的数据标题（对象名等）。 */
+export function tabTitle(tab: ShellTab): string {
+  if (tab.titleKey) return tr(tab.titleKey.key, tab.titleKey.params);
+  return tab.title;
+}
+
 export function snapshotSession(tabs: readonly ShellTab[], activeId: string | null): SessionSnapshot {
   return {
     tabs: tabs.map((tab) => ({
@@ -271,6 +293,7 @@ export function snapshotSession(tabs: readonly ShellTab[], activeId: string | nu
       redisKey: tab.kind === "keys" ? tab.redis?.key ?? null : null,
       docDatabase: tab.kind === "docs" ? tab.doc?.database ?? null : null,
       docCollection: tab.kind === "docs" ? tab.doc?.collection ?? null : null,
+      titleKey: tab.titleKey ? { key: tab.titleKey.key, params: tab.titleKey.params ? { ...tab.titleKey.params } : undefined } : null,
     })),
     activeId: tabs.some((tab) => tab.id === activeId) ? activeId : tabs[tabs.length - 1]?.id ?? null,
   };
@@ -298,6 +321,23 @@ function validDefinition(value: unknown): SessionSnapshotTab["definition"] {
   return { schema: item.schema, name: item.name, kind: item.kind, signature: item.signature, relation: item.relation };
 }
 
+/** 快照里的字典化标题：形状不符按“无 titleKey”处理（回退到 title），不让整个快照失效。 */
+function validTitleKey(value: unknown): TabTitleKey | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "object") return null;
+  const item = value as Record<string, unknown>;
+  if (typeof item.key !== "string" || item.key === "") return null;
+  const params: Record<string, string | number> = {};
+  if (item.params !== null && item.params !== undefined) {
+    if (typeof item.params !== "object") return null;
+    for (const [name, param] of Object.entries(item.params as Record<string, unknown>)) {
+      if (typeof param !== "string" && typeof param !== "number") return null;
+      params[name] = param;
+    }
+  }
+  return { key: item.key, params: Object.keys(params).length ? params : undefined };
+}
+
 /** Parse persisted session JSON. Any malformed shape or field returns null so the app starts fresh. */
 export function restoreSession(raw: string | null): SessionSnapshot | null {
   if (!raw) return null;
@@ -323,7 +363,7 @@ export function restoreSession(raw: string | null): SessionSnapshot | null {
     const kind = tab.kind === undefined ? "query" : tab.kind;
     if (!isTabKind(kind)) return null;
     const status = tab.connectionStatus ?? null;
-    if (status !== null && !(typeof status === "string" && status in CONNECTION_STATUS_TEXT)) return null;
+    if (status !== null && !isConnectionStatus(status)) return null;
     if (!optionalText(tab.connectionId)) return null;
     if (!optionalText(tab.connectionName)) return null;
     if (!optionalText(tab.database)) return null;
@@ -348,9 +388,11 @@ export function restoreSession(raw: string | null): SessionSnapshot | null {
     if (docDatabase === null && tab.docDatabase !== undefined && tab.docDatabase !== null) return null;
     const docCollection = textOrNull(tab.docCollection ?? null);
     if (docCollection === null && tab.docCollection !== undefined && tab.docCollection !== null) return null;
+    const titleKey = validTitleKey(tab.titleKey ?? null);
     tabs.push({
       id: tab.id,
       title: tab.title,
+      titleKey,
       kind,
       draft: tab.draft,
       connectionId: tab.connectionId as string | null,
@@ -377,7 +419,7 @@ export function restoreSession(raw: string | null): SessionSnapshot | null {
 
 function fromSnapshot(item: SessionSnapshotTab): ShellTab {
   const kind = item.kind ?? "query";
-  const tab = blankTab(kind, item.id, item.title, item.path ?? null, item.draft);
+  const tab = blankTab(kind, item.id, item.title, item.path ?? null, item.draft, item.titleKey ?? null);
   tab.restored = true;
   tab.connectionId = item.connectionId;
   tab.connectionName = item.connectionName;
@@ -442,7 +484,10 @@ export function createSession(initialHash = "", restored: SessionSnapshot | null
 
   function openQuery() {
     const count = tabs.value.filter((tab) => tab.kind === "query").length + 1;
-    const tab = blankTab("query", `query-${sequence}`, `查询 ${count}`, null, NEW_QUERY_DRAFT);
+    const tab = blankTab("query", `query-${sequence}`, tr("shell.tabs.queryTitle", { n: count }), null, NEW_QUERY_DRAFT, {
+      key: "shell.tabs.queryTitle",
+      params: { n: count },
+    });
     sequence += 1;
     tabs.value = [...tabs.value, tab];
     activeId.value = tab.id;
@@ -451,7 +496,10 @@ export function createSession(initialHash = "", restored: SessionSnapshot | null
 
   function openQueryDraft(input: QueryDraftInput): string {
     const count = tabs.value.filter((tab) => tab.kind === "query").length + 1;
-    const tab = blankTab("query", `query-${sequence}`, `查询 ${count}`, null, input.sql);
+    const tab = blankTab("query", `query-${sequence}`, tr("shell.tabs.queryTitle", { n: count }), null, input.sql, {
+      key: "shell.tabs.queryTitle",
+      params: { n: count },
+    });
     sequence += 1;
     tab.targetNotice = input.notice;
     if (!input.needsTarget && input.connectionId && input.connectionName && input.database != null && input.engine && input.status) {
@@ -479,7 +527,7 @@ export function createSession(initialHash = "", restored: SessionSnapshot | null
       showPage("workspace");
       return;
     }
-    const tab = blankTab(kind, id, target.label, target.path ?? null, "");
+    const tab = blankTab(kind, id, target.label, target.path ?? null, "", target.titleKey ?? null);
     if (target.pane) tab.tablePane = target.pane;
     if (target.section) tab.structureSection = target.section;
     tabs.value = [...tabs.value, tab];
@@ -562,7 +610,7 @@ export function createSession(initialHash = "", restored: SessionSnapshot | null
       showPage("workspace");
       return;
     }
-    const tab = blankTab("keys", id, target.label, target.path ?? null, "");
+    const tab = blankTab("keys", id, target.label, target.path ?? null, "", target.titleKey ?? null);
     applyTarget(tab, {
       connectionId: target.connectionId,
       connectionName: target.connectionName,
@@ -585,7 +633,7 @@ export function createSession(initialHash = "", restored: SessionSnapshot | null
       showPage("workspace");
       return;
     }
-    const tab = blankTab("docs", id, target.label, target.path ?? null, "");
+    const tab = blankTab("docs", id, target.label, target.path ?? null, "", target.titleKey ?? null);
     applyTarget(tab, {
       connectionId: target.connectionId,
       connectionName: target.connectionName,

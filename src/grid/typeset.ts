@@ -16,7 +16,7 @@ export function baseType(typeName: string): string {
 
 export function isUnknownType(typeName: string | undefined): boolean {
   const name = typeName?.trim() ?? "";
-  return name.length === 0 || name === "类型未知";
+  return name.length === 0 || name === tr("grid.typeset.unknown");
 }
 
 const PREVIEW_MARK = "\u0001";
@@ -69,7 +69,7 @@ export function temporalKind(typeName: string): TemporalKind | null {
 }
 
 export function typeCaption(column: Pick<Column, "typeName"> | undefined): string {
-  if (!column || isUnknownType(column.typeName)) return "类型未知";
+  if (!column || isUnknownType(column.typeName)) return tr("grid.typeset.unknown");
   return column.typeName;
 }
 
@@ -77,13 +77,13 @@ export function typeCaption(column: Pick<Column, "typeName"> | undefined): strin
 export function rejectWrite(column: Column | undefined, value: Cell | undefined, resolved = false): string | null {
   if (value === undefined) return null;
   const family = valueFamily(column?.typeName);
-  if (family === "unknown") return "类型未知，不能编辑";
-  if (family === "geometry") return "几何类型不能从格子保存";
-  if (family === "raw") return "不能判断写回方式，不能编辑";
+  if (family === "unknown") return tr("grid.typeset.unknownNotEditable");
+  if (family === "geometry") return tr("grid.typeset.geometryNotEditable");
+  if (family === "raw") return tr("grid.typeset.rawNotEditable");
   if (value === null) return null;
-  if (!resolved && isPreviewEnvelope(value, column?.typeName)) return "预览内容不能写回";
-  if (family === "binary" && parseHex(value) == null) return "这不是十六进制";
-  if (family === "bool" && !boolLiteral(value)) return "不能写成布尔字面量";
+  if (!resolved && isPreviewEnvelope(value, column?.typeName)) return tr("grid.errors.previewWriteback");
+  if (family === "binary" && parseHex(value) == null) return tr("grid.typeset.notHex");
+  if (family === "bool" && !boolLiteral(value)) return tr("grid.typeset.notBool");
   return null;
 }
 
@@ -149,3 +149,5 @@ function isFloatName(name: string): boolean {
 function isTextName(name: string): boolean {
   return name === "text" || name === "tinytext" || name === "mediumtext" || name === "longtext" || name === "clob" || name === "nclob" || name === "varchar" || name === "nvarchar" || name === "char" || name === "nchar" || name === "character" || name === "character varying" || name === "varchar2" || name === "nvarchar2" || name === "string" || name === "json" || name === "jsonb" || name === "uuid" || name === "uniqueidentifier" || name === "ntext" || name === "enum" || name === "set" || name === "xml" || name === "citext" || name === "name" || name === "bpchar" || name === "varying" || name.startsWith("character ");
 }
+
+import { tr } from "../i18n";

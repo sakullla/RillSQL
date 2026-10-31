@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { tr as t } from "../i18n";
 import { onMounted, ref } from "vue";
 import type { CatalogConnection } from "../catalog/types";
 import { failureOf, tauriRedisApi, type RedisApi, type RedisKeyInfo } from "./api";
@@ -43,7 +44,7 @@ onMounted(loadMore);
   <div class="rtk" :data-connection="connection.id" data-redis-tree>
     <div class="tree-row rtk-head" :style="{ '--d': 1 }">
       <span class="tw"></span>
-      <span class="tr-name">键空间 · 已读 {{ keys.length }} 个（双击键打开）</span>
+      <span class="tr-name">{{ t("redis.tab.keyspaceTree", { n: keys.length }) }}</span>
     </div>
     <p v-if="error" class="rtk-error">{{ error }}</p>
     <button
@@ -64,7 +65,7 @@ onMounted(loadMore);
     </button>
     <button v-if="!done" class="tree-row rtk-more" type="button" data-action="tree-more" :style="{ '--d': 2 }" :disabled="loading" @click="loadMore">
       <span class="tw"></span>
-      <span class="tr-name">{{ loading ? "读取中…" : "再显示" }}</span>
+      <span class="tr-name">{{ loading ? t("redis.tab.loading") : t("redis.tab.showMoreTree") }}</span>
     </button>
   </div>
 </template>

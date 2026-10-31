@@ -20,9 +20,10 @@ import type { Engine } from "../grid/types";
 import Icon from "../shell/Icon.vue";
 import { tabHasPending } from "../shell/close-guard";
 import { loadSettings, onSettingsSaved, type EditorTheme } from "../shell/settings";
-import { CONNECTION_STATUS_TEXT, type ConnectionStatus } from "../shell/status-text";
+import { connectionStatusText, type ConnectionStatus } from "../shell/status-text";
 import type { QueryTarget } from "../shell/session";
 import { ambiguousFieldNote, cachedColumns, fieldFailureNote, loadFields, qualifierFor, unknownFieldNote } from "./columns";
+import { tr as t } from "../i18n";
 import { completionPlan, connectionById, metadataNote, statementContext, targetDetail, targetKey, targetOptions, type TargetOption } from "./complete";
 import { resolveEditor } from "./editor";
 import { consumeExecuteRequest } from "./execute-request";
@@ -120,14 +121,14 @@ const selectedKey = computed(() => (props.connectionId && props.database != null
 const currentOption = computed(() => options.value.find((item) => item.key === selectedKey.value) ?? null);
 const buttonEngine = computed(() => currentOption.value?.engine ?? asEngine(props.engine ?? undefined));
 const buttonLabel = computed(() => {
-  if (!props.connectionName) return "执行目标";
+  if (!props.connectionName) return t("query.target.button");
   const engine = buttonEngine.value ? engineMeta(buttonEngine.value).label : "";
-  return `执行目标 ${engine} ${props.connectionName} / ${props.database || "main"}`.replace(/\s+/g, " ").trim();
+  return t("query.target.buttonLabel", { engine, conn: props.connectionName, db: props.database || "main" }).replace(/\s+/g, " ").trim();
 });
 const hint = computed(() => {
   const connection = connectionById(catalogConnections(), props.connectionId);
   const base = props.connectionId && !connection
-    ? { keywordsOnly: true, note: "原连接已不在目录中：补全只提供关键字。字段不可用。请重新选择执行目标。", objects: [] }
+    ? { keywordsOnly: true, note: t("query.complete.connGone"), objects: [], failure: false }
     : metadataNote(connection, props.connectionId ? props.database : null);
   if (!fieldNote.value) return base;
   return { ...base, note: fieldNote.value };
@@ -141,54 +142,54 @@ const summary = computed(() => {
   const current = run.value;
   if (!current) return "";
   const elapsed = `${current.elapsedMs} ms`;
-  if (current.status === "running") return "执行中…";
-  if (current.status === "cancel-requested") return "取消中…";
-  if (current.status === "cancelled") return `已取消。已读到的结果保留 · ${elapsed}`;
-  if (current.status === "unknown") return `连接中断，结果未知 · ${elapsed}`;
+  if (current.status === "running") return t("query.run.running");
+  if (current.status === "cancel-requested") return t("query.run.canceling");
+  if (current.status === "cancelled") return t("query.run.summaryCancelled", { elapsed });
+  if (current.status === "unknown") return t("query.run.summaryUnknown", { elapsed });
   const statements = current.statements;
   if (current.status === "error") {
     const failedIndex = statements.findIndex((statement) => statement.status === "error");
     const doneCount = statements.filter((statement) => statement.status === "ok").length;
     const skippedCount = statements.filter((statement) => statement.status === "skipped").length;
-    const where = statements.length > 1 && failedIndex >= 0 ? `第 ${failedIndex + 1} 条语句失败` : "执行失败";
-    const kept = doneCount ? `已完成 ${doneCount} 条的结果保留` : "";
-    const skipped = skippedCount ? `其余 ${skippedCount} 条未执行` : "";
-    const tail = [kept, skipped].filter(Boolean).join("，");
+    const where = statements.length > 1 && failedIndex >= 0 ? t("query.run.statementFailed", { n: failedIndex + 1 }) : t("query.run.executeFailed");
+    const kept = doneCount ? t("query.run.keptResults", { n: doneCount }) : "";
+    const skipped = skippedCount ? t("query.run.skippedRest", { n: skippedCount }) : "";
+    const tail = [kept, skipped].filter(Boolean).join(t("query.run.joinComma"));
     return `${where}${tail ? `。${tail}` : ""} · ${elapsed}`;
   }
   if (statements.length === 1 && statements[0]) {
     const statement = statements[0];
     if (statement.status === "ok" && statement.columns.length) {
-      return `${statement.rows.length} 行${statement.truncated ? "（还有未读行）" : ""} · ${elapsed}`;
+      return `${t(statement.truncated ? "query.run.rowsReadTruncated" : "query.run.rowsRead", { n: statement.rows.length })} · ${elapsed}`;
     }
-    if (statement.status === "ok") return `${statement.affected ?? 0} 行受影响 · ${elapsed}`;
+    if (statement.status === "ok") return `${t("query.run.rowsAffected", { n: statement.affected ?? 0 })} · ${elapsed}`;
   }
   const rowStatements = statements.filter((statement) => statement.status === "ok" && statement.columns.length).length;
-  return `${statements.length} 条语句完成${rowStatements ? `，${rowStatements} 条返回了行` : ""} · ${elapsed}`;
+  return `${t("query.run.statementsDone", { n: statements.length })}${rowStatements ? t("query.run.statementsWithRows", { n: rowStatements }) : ""} · ${elapsed}`;
 });
 
 /* 工具栏状态行：取消只呈现直白三态，机制名词不出现在这里。 */
 const runStatusLine = computed(() => {
   const current = run.value;
   if (!current) return "";
-  if (current.pollError) return "状态刷新失败";
-  if (current.cancel === "requested") return "取消中…";
-  if (current.cancel === "confirmed" || current.status === "cancelled") return "已取消";
-  if (current.cancel === "failed") return "取消失败，仍在执行";
-  const labels: Record<string, string> = { running: "执行中…", done: "完成", error: "执行失败", unknown: "结果未知" };
+  if (current.pollError) return t("query.run.statusRefreshFailed");
+  if (current.cancel === "requested") return t("query.run.canceling");
+  if (current.cancel === "confirmed" || current.status === "cancelled") return t("query.run.statusCancelled");
+  if (current.cancel === "failed") return t("query.run.statusCancelFailed");
+  const labels: Record<string, string> = { running: t("query.run.statusRunning"), done: t("query.run.statusDone"), error: t("query.run.executeFailed"), unknown: t("query.run.statusUnknown") };
   return labels[current.status] ?? statusLabel(current.status);
 });
 const cancelButtonLabel = computed(() => {
-  if (run.value?.cancel === "requested") return "取消中…";
-  if (run.value?.cancel === "failed") return "再次取消";
-  return "取消";
+  if (run.value?.cancel === "requested") return t("query.run.canceling");
+  if (run.value?.cancel === "failed") return t("query.run.cancelAgain");
+  return t("query.run.cancel");
 });
 const detailsCaption = computed(() => {
   const current = run.value;
-  return current ? `共 ${current.statements.length} 条语句` : "";
+  return current ? t("query.run.detailCaption", { n: current.statements.length }) : "";
 });
-const operationGuide = "选择执行目标，编写 SQL，然后执行。有选中时只运行选中部分，无选中时执行光标所在语句。";
-const planCaption = computed(() => (planKind.value === "analyze" ? "该语句已在服务器上执行" : "执行计划 · 只读 · 未使用 ANALYZE"));
+const operationGuide = computed(() => t("query.editor.guide"));
+const planCaption = computed(() => t(planKind.value === "analyze" ? "query.plan.captionAnalyze" : "query.plan.caption"));
 const planView = computed(() => {
   const statement = activeStatement.value;
   if (!planMode.value || !statement?.columns.length) return null;
@@ -196,7 +197,7 @@ const planView = computed(() => {
 });
 const canContinue = computed(() => Boolean(running.value && activeStatement.value && activeStatement.value.rows.length > 0 && !activeStatement.value.truncated));
 /* 没有目标、未连接、尚未读到对象时不另起说明；字段说明和含「失败」的原因仍显示。 */
-const hintVisible = computed(() => Boolean(fieldNote.value) || hint.value.note.includes("失败"));
+const hintVisible = computed(() => Boolean(fieldNote.value) || hint.value.failure);
 
 watch(
   () => run.value?.id,
@@ -310,7 +311,7 @@ async function sqlCompletion(context: CompletionContext) {
   }
   const engine = asEngine(props.engine ?? connection.engine);
   if (!engine) {
-    fieldNote.value = "当前目标的引擎未知：字段不可用，不会猜测字段名。";
+    fieldNote.value = t("query.editor.unknownEngine");
     return { from: columnFrom, filter: false, options: [] };
   }
   const loaded = await loadFields({
@@ -406,7 +407,7 @@ function formatEditor() {
   mountEditor();
   const editor = view;
   if (!editor) {
-    actionError.value = "编辑器还没有准备好，请再试一次。";
+    actionError.value = t("query.editor.notReady");
     return;
   }
   const doc = editor.state.doc.toString();
@@ -430,13 +431,14 @@ function formatEditor() {
   });
 }
 
-function targetProblem(purpose: "执行" | "查看执行计划"): string | null {
+const PURPOSE_KEYS = { execute: "query.errors.purposeExecute", plan: "query.errors.purposePlan" } as const;
+function targetProblem(purpose: keyof typeof PURPOSE_KEYS): string | null {
   const connection = connectionById(catalogConnections(), props.connectionId);
   if (!props.connectionId || props.database == null || !props.connectionName || !props.engine || !connection) {
-    return props.connectionId && !connection ? "原连接已删除，请重新选择执行目标。" : "请选择执行目标（连接和数据库）。";
+    return props.connectionId && !connection ? t("query.errors.connGone") : t("query.errors.needTarget");
   }
   if (connection.status !== "connected") {
-    return `${props.connectionName} 当前${CONNECTION_STATUS_TEXT[connection.status]}，无法${purpose}。`;
+    return t("query.errors.targetProblem", { conn: props.connectionName, status: connectionStatusText(connection.status), purpose: t(PURPOSE_KEYS[purpose]) });
   }
   return null;
 }
@@ -452,10 +454,10 @@ async function requestPlan() {
   mountEditor();
   const editor = view;
   if (!editor) {
-    actionError.value = "编辑器还没有准备好，请再试一次。";
+    actionError.value = t("query.editor.notReady");
     return;
   }
-  const blocked = targetProblem("查看执行计划");
+  const blocked = targetProblem("plan");
   if (blocked) {
     actionError.value = blocked;
     return;
@@ -510,7 +512,7 @@ async function requestPlan() {
   } catch (err) {
     planMode.value = false;
     planKind.value = "none";
-    actionError.value = typeof err === "string" ? err : err instanceof Error ? err.message : "执行计划失败";
+    actionError.value = typeof err === "string" ? err : err instanceof Error ? err.message : t("query.errors.planFailed");
   } finally {
     submitting.value = false;
   }
@@ -522,10 +524,10 @@ function requestAnalyze() {
   mountEditor();
   const editor = view;
   if (!editor) {
-    actionError.value = "编辑器还没有准备好，请再试一次。";
+    actionError.value = t("query.editor.notReady");
     return;
   }
-  const blocked = targetProblem("查看执行计划");
+  const blocked = targetProblem("plan");
   if (blocked) {
     actionError.value = blocked;
     return;
@@ -581,12 +583,12 @@ async function confirmAnalyze() {
     await whenSettled(props.tabId);
     const failed = tabRun(props.tabId)?.statements.find((item) => item.status === "error");
     if (failed && planKind.value === "analyze") {
-      actionError.value = `服务器不支持实际执行并分析，没有再发送会修改数据的语句。${failed.message}`;
+      actionError.value = t("query.errors.analyzeRejected", { message: failed.message });
     }
   } catch (err) {
     planMode.value = false;
     planKind.value = "none";
-    actionError.value = typeof err === "string" ? err : err instanceof Error ? err.message : "执行计划失败";
+    actionError.value = typeof err === "string" ? err : err instanceof Error ? err.message : t("query.errors.planFailed");
   } finally {
     submitting.value = false;
   }
@@ -597,16 +599,16 @@ async function execute(scope: "auto" | "current" | "script") {
   analyzePrompt.value = false;
   if (running.value || submitting.value) return;
   if (tabHasPending(props.tabId)) {
-    actionError.value = "结果里还有未提交的更改。先提交或放弃这些更改，再重新执行，避免它们被新结果冲掉。";
+    actionError.value = t("query.errors.dirtyResults");
     return;
   }
   mountEditor();
   const editor = view;
   if (!editor) {
-    actionError.value = "编辑器还没有准备好，请再试一次。";
+    actionError.value = t("query.editor.notReady");
     return;
   }
-  const blocked = targetProblem("执行");
+  const blocked = targetProblem("execute");
   if (blocked) {
     actionError.value = blocked;
     return;
@@ -623,7 +625,7 @@ async function execute(scope: "auto" | "current" | "script") {
     }
     if (!located.piece) {
       const document = inspectSql(doc, engine);
-      actionError.value = document.refusal ?? (document.notices.join("") || "只有空白或注释，没有发送。");
+      actionError.value = document.refusal ?? (document.notices.join("") || t("query.errors.blankOnly"));
       return;
     }
   }
@@ -633,7 +635,7 @@ async function execute(scope: "auto" | "current" | "script") {
     return;
   }
   if (inspected.pieces.length === 0) {
-    actionError.value = inspected.notices.join("") || "只有空白或注释，没有发送。";
+    actionError.value = inspected.notices.join("") || t("query.errors.blankOnly");
     return;
   }
   const variables = findVariables(picked.sql);
@@ -647,13 +649,13 @@ async function execute(scope: "auto" | "current" | "script") {
 /** 标记原文的 send-range、发送 sqlText 并等待结束；变量代换后的发送与直发共用这一段。 */
 async function sendExecute(sqlText: string, from: number, to: number) {
   if (tabHasPending(props.tabId)) {
-    actionError.value = "结果里还有未提交的更改。先提交或放弃这些更改，再重新执行，避免它们被新结果冲掉。";
+    actionError.value = t("query.errors.dirtyResults");
     return;
   }
   mountEditor();
   const editor = view;
   if (!editor) {
-    actionError.value = "编辑器还没有准备好，请再试一次。";
+    actionError.value = t("query.editor.notReady");
     return;
   }
   markSendRange(editor, from, to);
@@ -676,7 +678,7 @@ async function sendExecute(sqlText: string, from: number, to: number) {
     // 成功发出才算“执行过”；之后关闭标签不会再提示这份草稿会丢失。
     emit("executed", props.tabId, sqlText);
   } catch (err) {
-    actionError.value = typeof err === "string" ? err : err instanceof Error ? err.message : "执行失败";
+    actionError.value = typeof err === "string" ? err : err instanceof Error ? err.message : t("query.errors.executeFailed");
   } finally {
     submitting.value = false;
   }
@@ -773,7 +775,7 @@ async function loadHistory() {
     historyEntries.value = await queryHistory();
     historyError.value = "";
   } catch (err) {
-    historyError.value = failureMessage(err, "读不了查询历史");
+    historyError.value = failureMessage(err, t("query.errors.historyLoadFailed"));
   } finally {
     historyLoading.value = false;
   }
@@ -793,7 +795,7 @@ async function loadSaved() {
     savedEntries.value = await querySavedList();
     savedError.value = "";
   } catch (err) {
-    savedError.value = failureMessage(err, "读不了保存的查询");
+    savedError.value = failureMessage(err, t("query.errors.savedLoadFailed"));
   } finally {
     savedLoading.value = false;
   }
@@ -805,7 +807,7 @@ function applyOpenPlan(plan: OpenPlan) {
   mountEditor();
   const editor = view;
   if (!editor) {
-    actionError.value = "编辑器还没有准备好，请再试一次。";
+    actionError.value = t("query.editor.notReady");
     return;
   }
   if (editor.state.doc.toString() !== plan.sql) {
@@ -856,7 +858,7 @@ async function onSqlFile(event: Event) {
   try {
     applyOpenPlan(fileOpenPlan(await readSqlFile(file)));
   } catch (err) {
-    actionError.value = `文件没有读出来：${failureMessage(err, "读取失败")}`;
+    actionError.value = t("query.errors.fileUnread", { error: failureMessage(err, t("query.errors.fileReadFailed")) });
   }
 }
 
@@ -868,7 +870,7 @@ async function saveSqlToFile() {
   mountEditor();
   const editor = view;
   if (!editor) {
-    saveFileError.value = "编辑器还没有准备好，请再试一次。";
+    saveFileError.value = t("query.editor.notReady");
     return;
   }
   saveFileBusy.value = true;
@@ -893,7 +895,7 @@ async function saveNamedQuery() {
   mountEditor();
   const editor = view;
   if (!editor) {
-    savedWriteError.value = "编辑器还没有准备好，请再试一次。";
+    savedWriteError.value = t("query.editor.notReady");
     return;
   }
   savedBusy.value = true;
@@ -907,12 +909,12 @@ async function saveNamedQuery() {
       name: savedName(savedNameValue.value),
     });
     savedWriteMessage.value = written.created
-      ? `已保存「${written.query.name}」。只保存草稿，不会执行。`
-      : `已覆盖更新「${written.query.name}」。只保存草稿，不会执行。`;
+      ? t("query.errors.savedQueryDone", { name: written.query.name })
+      : t("query.errors.savedQueryUpdated", { name: written.query.name });
     savedNameValue.value = "";
     await loadSaved();
   } catch (err) {
-    savedWriteError.value = failureMessage(err, "存不了这条查询");
+    savedWriteError.value = failureMessage(err, t("query.errors.savedWriteFailed"));
   } finally {
     savedBusy.value = false;
   }
@@ -1016,15 +1018,15 @@ watch(running, (value) => {
 
 function statusLabel(status: string): string {
   const labels: Record<string, string> = {
-    pending: "等待",
-    running: "执行中",
-    ok: "完成",
-    error: "失败",
-    skipped: "未执行",
-    cancelled: "已取消",
-    unknown: "未知",
+    pending: "query.status.pending",
+    running: "query.status.running",
+    ok: "query.status.ok",
+    error: "query.status.error",
+    skipped: "query.status.skipped",
+    cancelled: "query.status.cancelled",
+    unknown: "query.status.unknown",
   };
-  return labels[status] ?? status;
+  return t(labels[status] ?? "query.status.unknown");
 }
 
 watch(host, (element) => {
@@ -1057,7 +1059,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="query-pane" aria-label="查询" :data-tab-id="tabId" :data-editor-theme="editorTheme === 'auto' ? undefined : editorTheme" :style="{ '--editor-share': `${editorPercent}%` }">
+  <section class="query-pane" :aria-label="t('query.editor.area')" :data-tab-id="tabId" :data-editor-theme="editorTheme === 'auto' ? undefined : editorTheme" :style="{ '--editor-share': `${editorPercent}%` }">
     <div class="q-toolbar">
       <div ref="targetRoot" class="q-target">
         <button
@@ -1069,7 +1071,7 @@ onBeforeUnmount(() => {
           aria-haspopup="listbox"
           :aria-expanded="menuOpen"
           :disabled="running || submitting"
-          :title="running ? '执行期间不能切换目标' : '选择执行目标（连接与数据库）'"
+          :title="running ? t('query.target.locked') : t('query.target.pickTitle')"
           @click="toggleMenu"
           @keydown="onTargetKey"
         >
@@ -1080,13 +1082,13 @@ onBeforeUnmount(() => {
           </template>
           <template v-else>
             <Icon name="database" />
-            <span class="tg-name">选择执行目标</span>
+            <span class="tg-name">{{ t("query.target.pick") }}</span>
           </template>
           <svg class="tg-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
         </button>
-        <div v-if="menuOpen" class="target-menu" role="listbox" aria-label="执行目标">
-          <div class="menu-head">选择连接和数据库</div>
-          <p v-if="!options.length" class="target-empty">还没有可选的数据库。</p>
+        <div v-if="menuOpen" class="target-menu" role="listbox" :aria-label="t('query.target.menu')">
+          <div class="menu-head">{{ t("query.target.menuHead") }}</div>
+          <p v-if="!options.length" class="target-empty">{{ t("query.target.empty") }}</p>
           <button
             v-for="(option, index) in options"
             :key="option.key"
@@ -1108,68 +1110,68 @@ onBeforeUnmount(() => {
           </button>
         </div>
       </div>
-      <span v-if="connectionStatus" class="conn-state" :class="`st-${connectionStatus}`"><i></i>{{ CONNECTION_STATUS_TEXT[connectionStatus] }}</span>
+      <span v-if="connectionStatus" class="conn-state" :class="`st-${connectionStatus}`"><i></i>{{ connectionStatusText(connectionStatus) }}</span>
       <span class="grow"></span>
-      <button class="btn" type="button" data-action="format" title="格式化选中的 SQL；没有选中时格式化全部" @click="formatEditor"><Icon name="format" />格式化</button>
-      <button class="btn" type="button" data-action="open-file" title="从 .sql 或 .txt 文件载入 SQL；只写进当前标签的草稿，不会执行" :disabled="running || submitting" @click="pickSqlFile"><Icon name="file" />打开</button>
-      <input ref="openFileInput" class="hidden-file-input" type="file" data-action="open-file-input" :accept="SQL_FILE_ACCEPT" aria-label="打开 SQL 文件" @change="onSqlFile" />
+      <button class="btn" type="button" data-action="format" :title="t('query.toolbar.formatTitle')" @click="formatEditor"><Icon name="format" />{{ t("query.toolbar.format") }}</button>
+      <button class="btn" type="button" data-action="open-file" :title="t('query.toolbar.openTitle')" :disabled="running || submitting" @click="pickSqlFile"><Icon name="file" />{{ t("query.toolbar.open") }}</button>
+      <input ref="openFileInput" class="hidden-file-input" type="file" data-action="open-file-input" :accept="SQL_FILE_ACCEPT" :aria-label="t('query.toolbar.openLabel')" @change="onSqlFile" />
       <div ref="historyRoot" class="q-pop">
-        <button class="btn" type="button" data-action="history" title="从查询历史载入 SQL；只写进草稿，不会执行" :disabled="running || submitting" @click="toggleHistoryPanel"><Icon name="history" />历史</button>
-        <div v-if="historyOpen" class="pop-menu history-menu" role="menu" aria-label="查询历史" @keydown="onHistoryKey">
-          <div class="menu-head">查询历史 · 载入只写进草稿，不会执行</div>
-          <p v-if="historyError" class="pop-error" role="alert">历史没有读出来：{{ historyError }}<button class="btn sm" type="button" data-action="retry-history" @click="loadHistory">重试</button></p>
-          <p v-else-if="historyLoading" class="pop-empty">正在读取历史…</p>
-          <p v-else-if="!historyEntries.length" class="pop-empty">还没有执行过查询。</p>
+        <button class="btn" type="button" data-action="history" :title="t('query.toolbar.historyTitle')" :disabled="running || submitting" @click="toggleHistoryPanel"><Icon name="history" />{{ t("query.toolbar.history") }}</button>
+        <div v-if="historyOpen" class="pop-menu history-menu" role="menu" :aria-label="t('query.history.menu')" @keydown="onHistoryKey">
+          <div class="menu-head">{{ t("query.history.head") }}</div>
+          <p v-if="historyError" class="pop-error" role="alert">{{ t("query.history.failed", { error: historyError }) }}<button class="btn sm" type="button" data-action="retry-history" @click="loadHistory">{{ t("query.history.retry") }}</button></p>
+          <p v-else-if="historyLoading" class="pop-empty">{{ t("query.history.loading") }}</p>
+          <p v-else-if="!historyEntries.length" class="pop-empty">{{ t("query.history.empty") }}</p>
           <template v-else>
             <button v-for="entry in historyEntries" :key="entry.id" class="pop-item" type="button" role="menuitem" data-action="open-history" :title="entry.sql" @click="chooseHistory(entry)">
               <span class="badge" :class="statusBadge(entry.status)">{{ historyStatusLabel(entry.status) }}</span>
               <span class="pop-copy">
-                <span class="pop-title"><b>{{ entry.connectionName }} / {{ entry.databaseName || "main" }}</b><span v-if="!knownIds.has(entry.connectionId)" class="pop-warn">原连接已删除</span></span>
+                <span class="pop-title"><b>{{ entry.connectionName }} / {{ entry.databaseName || "main" }}</b><span v-if="!knownIds.has(entry.connectionId)" class="pop-warn">{{ t("query.history.connectionDeleted") }}</span></span>
                 <code>{{ sqlSummary(entry.sql) }}</code>
-                <small>耗时 {{ elapsedLabel(entry.elapsedMs) || "未知" }}</small>
+                <small>{{ t("query.history.elapsed", { value: elapsedLabel(entry.elapsedMs) || "—" }) }}</small>
               </span>
             </button>
           </template>
         </div>
       </div>
       <div ref="savedRoot" class="q-pop">
-        <button class="btn" type="button" data-action="saved" title="按名称保存当前 SQL，或打开已保存的查询" :disabled="running || submitting" @click="toggleSavedPanel"><Icon name="save" />保存</button>
-        <div v-if="savedOpen" class="pop-menu saved-menu" role="menu" aria-label="保存的查询" @keydown="onSavedKey">
+        <button class="btn" type="button" data-action="saved" :title="t('query.toolbar.saveTitle')" :disabled="running || submitting" @click="toggleSavedPanel"><Icon name="save" />{{ t("query.toolbar.save") }}</button>
+        <div v-if="savedOpen" class="pop-menu saved-menu" role="menu" :aria-label="t('query.saved.menu')" @keydown="onSavedKey">
           <form class="pop-form" @submit.prevent="saveNamedQuery">
-            <label>保存当前 SQL 为<input v-model="savedNameValue" type="text" aria-label="保存查询的名称" data-action="saved-name" placeholder="名称" /></label>
+            <label>{{ t("query.saved.saveAs") }}<input v-model="savedNameValue" type="text" :aria-label="t('query.saved.nameLabel')" data-action="saved-name" :placeholder="t('query.saved.namePlaceholder')" /></label>
             <p v-if="savedWriteMessage" role="status">{{ savedWriteMessage }}</p>
             <p v-if="savedWriteError" class="pop-error" role="alert">{{ savedWriteError }}</p>
-            <button class="btn sm primary" type="submit" data-action="save-named-query" :disabled="savedBusy">保存</button>
+            <button class="btn sm primary" type="submit" data-action="save-named-query" :disabled="savedBusy">{{ t("query.saved.save") }}</button>
           </form>
           <div class="pop-form">
-            <button class="btn sm" type="button" data-action="save-file" :disabled="saveFileBusy" @click="saveSqlToFile">{{ saveFileBusy ? "正在保存…" : "保存到文件" }}</button>
+            <button class="btn sm" type="button" data-action="save-file" :disabled="saveFileBusy" @click="saveSqlToFile">{{ saveFileBusy ? t("query.saved.saving") : t("query.saved.saveToFile") }}</button>
             <p v-if="saveFileMessage" role="status">{{ saveFileMessage }}</p>
             <p v-if="saveFileError" class="pop-error" role="alert">{{ saveFileError }}</p>
           </div>
-          <div class="menu-head">已保存的查询 · 打开只写进草稿，不会执行</div>
-          <p v-if="savedError" class="pop-error" role="alert">保存的查询没有读出来：{{ savedError }}<button class="btn sm" type="button" data-action="retry-saved" @click="loadSaved">重试</button></p>
-          <p v-else-if="savedLoading" class="pop-empty">正在读取保存的查询…</p>
-          <p v-else-if="!savedEntries.length" class="pop-empty">还没有保存的查询。</p>
+          <div class="menu-head">{{ t("query.saved.head") }}</div>
+          <p v-if="savedError" class="pop-error" role="alert">{{ t("query.saved.failed", { error: savedError }) }}<button class="btn sm" type="button" data-action="retry-saved" @click="loadSaved">{{ t("query.history.retry") }}</button></p>
+          <p v-else-if="savedLoading" class="pop-empty">{{ t("query.saved.loading") }}</p>
+          <p v-else-if="!savedEntries.length" class="pop-empty">{{ t("query.saved.empty") }}</p>
           <template v-else>
             <button v-for="item in savedEntries" :key="item.id" class="pop-item" type="button" role="menuitem" data-action="open-saved" :title="item.sql" @click="chooseSaved(item)">
               <span class="pop-copy">
-                <span class="pop-title"><b>{{ item.name }}</b><span v-if="savedNeedsTarget(item, knownIds)" class="pop-warn">需要重新选择执行目标</span></span>
-                <small>{{ item.connectionName ? `${item.connectionName} / ${item.databaseName || "main"}` : "未记录执行目标" }}</small>
+                <span class="pop-title"><b>{{ item.name }}</b><span v-if="savedNeedsTarget(item, knownIds)" class="pop-warn">{{ t("query.saved.needsTarget") }}</span></span>
+                <small>{{ item.connectionName ? `${item.connectionName} / ${item.databaseName || "main"}` : t("query.saved.noTarget") }}</small>
                 <code>{{ sqlSummary(item.sql) }}</code>
               </span>
             </button>
           </template>
         </div>
       </div>
-      <button class="btn" type="button" data-action="plan" title="查看一条语句的执行计划，不使用 ANALYZE" :disabled="running || submitting" @click="requestPlan"><Icon name="plan" />执行计划</button>
-      <button class="btn" type="button" data-action="analyze" title="在服务器上实际执行并分析这一条语句" :disabled="running || submitting" @click="requestAnalyze">实际执行并分析</button>
+      <button class="btn" type="button" data-action="plan" :title="t('query.toolbar.planTitle')" :disabled="running || submitting" @click="requestPlan"><Icon name="plan" />{{ t("query.toolbar.plan") }}</button>
+      <button class="btn" type="button" data-action="analyze" :title="t('query.toolbar.analyzeTitle')" :disabled="running || submitting" @click="requestAnalyze">{{ t("query.toolbar.analyze") }}</button>
       <div v-if="!running" ref="runRoot" class="run-group">
-        <button class="btn primary run-main" type="button" data-action="run" :disabled="submitting" @click="execute('auto')"><Icon name="play" class="run-glyph" />{{ submitting ? "正在执行…" : hasSelection ? "执行选中" : "执行" }} <ChordKeys chord="Mod+Enter" /></button>
+        <button class="btn primary run-main" type="button" data-action="run" :disabled="submitting" @click="execute('auto')"><Icon name="play" class="run-glyph" />{{ submitting ? t("query.run.submitting") : hasSelection ? t("query.run.runSelection") : t("query.run.run") }} <ChordKeys chord="Mod+Enter" /></button>
         <button
           class="btn run-more"
           type="button"
           data-action="run-menu"
-          aria-label="更多执行方式"
+          :aria-label="t('query.run.more')"
           aria-haspopup="menu"
           :aria-expanded="runMenuOpen"
           :disabled="submitting"
@@ -1177,25 +1179,25 @@ onBeforeUnmount(() => {
         >
           <svg class="tg-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
         </button>
-        <div v-if="runMenuOpen" class="run-menu" role="menu" aria-label="执行方式" @keydown="onRunMenuKey">
+        <div v-if="runMenuOpen" class="run-menu" role="menu" :aria-label="t('query.run.menu')" @keydown="onRunMenuKey">
           <button class="run-item" type="button" role="menuitem" data-action="run-current" @click="execute('current')">
-            <span>执行当前语句</span>
-            <small>只执行光标所在的语句</small>
+            <span>{{ t("query.run.current") }}</span>
+            <small>{{ t("query.run.currentHint") }}</small>
           </button>
           <button class="run-item" type="button" role="menuitem" data-action="run-script" @click="execute('script')">
-            <span>执行脚本</span>
-            <small>按顺序执行编辑器里的全部语句</small>
+            <span>{{ t("query.run.script") }}</span>
+            <small>{{ t("query.run.scriptHint") }}</small>
           </button>
         </div>
       </div>
       <button v-else class="btn danger" type="button" data-action="cancel" :disabled="run?.cancel === 'requested'" @click="cancel">{{ cancelButtonLabel }}</button>
       <span v-if="run" class="q-note" role="status">{{ runStatusLine }} · {{ run.elapsedMs }} ms</span>
     </div>
-    <div v-if="analyzePrompt" class="analyze-dialog" role="dialog" aria-modal="true" aria-label="实际执行并分析">
-      <p>这条语句会在服务器上执行。</p>
+    <div v-if="analyzePrompt" class="analyze-dialog" role="dialog" aria-modal="true" :aria-label="t('query.analyze.dialog')">
+      <p>{{ t("query.analyze.prompt") }}</p>
       <div class="analyze-actions">
-        <button class="btn" type="button" data-action="analyze-cancel" @click="cancelAnalyze">取消</button>
-        <button class="btn" type="button" data-action="analyze-confirm" @click="confirmAnalyze">继续</button>
+        <button class="btn" type="button" data-action="analyze-cancel" @click="cancelAnalyze">{{ t("query.analyze.cancel") }}</button>
+        <button class="btn" type="button" data-action="analyze-confirm" @click="confirmAnalyze">{{ t("query.analyze.proceed") }}</button>
       </div>
     </div>
     <div
@@ -1203,20 +1205,20 @@ onBeforeUnmount(() => {
       class="analyze-dialog variable-dialog"
       role="dialog"
       aria-modal="true"
-      aria-label="填写执行变量"
+      :aria-label="t('query.variables.dialog')"
       data-action="variables-dialog"
       @keydown.escape.prevent="cancelVariables"
     >
-      <p>发送前把占位符代换成字面量：留空按 NULL 发送，其余按字符串字面量发送（单引号会转义）。只改本次发送的文本，编辑器草稿保持原文。仅「执行」支持变量；「执行计划」与「实际执行并分析」不做代换。</p>
+      <p>{{ t("query.variables.note") }}</p>
       <div class="variable-fields">
         <label v-for="field in variableFields" :key="field.key">
           <span class="mono">{{ field.label }}</span>
-          <input v-model="variableValues[field.key]" type="text" :data-variable-key="field.key" :aria-label="`变量 ${field.label} 的值`" placeholder="留空发送 NULL" />
+          <input v-model="variableValues[field.key]" type="text" :data-variable-key="field.key" :aria-label="t('query.variables.valueLabel', { name: field.label })" :placeholder="t('query.variables.placeholder')" />
         </label>
       </div>
       <div class="analyze-actions">
-        <button class="btn" type="button" data-action="variables-cancel" @click="cancelVariables">取消</button>
-        <button class="btn primary" type="button" data-action="variables-confirm" @click="confirmVariables">继续</button>
+        <button class="btn" type="button" data-action="variables-cancel" @click="cancelVariables">{{ t("query.variables.cancel") }}</button>
+        <button class="btn primary" type="button" data-action="variables-confirm" @click="confirmVariables">{{ t("query.variables.proceed") }}</button>
       </div>
     </div>
     <p v-if="notice" class="q-banner is-notice">{{ notice }}</p>
@@ -1224,26 +1226,26 @@ onBeforeUnmount(() => {
     <p v-if="hintVisible" class="q-hint" :data-keywords-only="hint.keywordsOnly" :title="hint.note">{{ hint.note }}</p>
     <div ref="host" class="cm-host"></div>
     <div class="editor-position"><span class="q-guide">{{ operationGuide }}</span><span class="mono">Ln {{ cursor.line }}, Col {{ cursor.column }}</span></div>
-    <div class="query-splitter" role="separator" tabindex="0" aria-label="调整编辑器与结果区域高度" aria-orientation="horizontal" :aria-valuenow="editorPercent" :aria-valuemin="20" :aria-valuemax="70" @pointerdown="resizeEditor" @keydown.up.prevent="editorPercent = Math.max(20, editorPercent - 5)" @keydown.down.prevent="editorPercent = Math.min(70, editorPercent + 5)"><span></span></div>
-    <section class="q-results" aria-label="执行结果">
-      <div class="results-heading"><span><Icon name="table" />结果</span><span v-if="run" class="q-summary" :data-status="run.status">{{ summary }}</span><span v-else class="muted">等待执行</span><span class="grow"></span><span class="badge">只读结果</span></div>
+    <div class="query-splitter" role="separator" tabindex="0" :aria-label="t('query.editor.splitter')" aria-orientation="horizontal" :aria-valuenow="editorPercent" :aria-valuemin="20" :aria-valuemax="70" @pointerdown="resizeEditor" @keydown.up.prevent="editorPercent = Math.max(20, editorPercent - 5)" @keydown.down.prevent="editorPercent = Math.min(70, editorPercent + 5)"><span></span></div>
+    <section class="q-results" :aria-label="t('query.results.area')">
+      <div class="results-heading"><span><Icon name="table" />{{ t("query.results.heading") }}</span><span v-if="run" class="q-summary" :data-status="run.status">{{ summary }}</span><span v-else class="muted">{{ t("query.results.waiting") }}</span><span class="grow"></span><span class="badge">{{ t("query.results.readonly") }}</span></div>
       <template v-if="run">
-        <div v-if="run.statements.length > 1" class="result-tabs" role="tablist" aria-label="语句结果"><button v-for="(statement, index) in run.statements" :key="index" role="tab" :aria-selected="resultIndex === index" @click="resultIndex = index">结果 {{ index + 1 }} <span>{{ statement.columns.length ? `${statement.rows.length} 行` : statusLabel(statement.status) }}</span></button></div>
-        <p v-if="run.pollError" class="q-note" role="alert">状态刷新失败：{{ run.pollError }}。已读取的结果保留，可以稍后重试读取。</p>
-        <p v-else-if="run.cancel === 'requested'" class="q-note" role="status">取消中…数据库确认后立即停止。</p>
-        <p v-else-if="run.cancel === 'confirmed' || run.status === 'cancelled'" class="q-note" role="status">已取消。已读到的结果保留。</p>
-        <p v-else-if="run.cancel === 'failed'" class="q-note" role="alert">取消失败，查询仍在执行。可以再次取消。</p>
+        <div v-if="run.statements.length > 1" class="result-tabs" role="tablist" :aria-label="t('query.results.statementTabs')"><button v-for="(statement, index) in run.statements" :key="index" role="tab" :aria-selected="resultIndex === index" @click="resultIndex = index">{{ t("query.run.statementTab", { n: index + 1 }) }} <span>{{ statement.columns.length ? t("query.run.statementRows", { n: statement.rows.length }) : statusLabel(statement.status) }}</span></button></div>
+        <p v-if="run.pollError" class="q-note" role="alert">{{ t("query.run.pollErrorNote", { error: run.pollError }) }}</p>
+        <p v-else-if="run.cancel === 'requested'" class="q-note" role="status">{{ t("query.run.cancelingNote") }}</p>
+        <p v-else-if="run.cancel === 'confirmed' || run.status === 'cancelled'" class="q-note" role="status">{{ t("query.run.cancelledNote") }}</p>
+        <p v-else-if="run.cancel === 'failed'" class="q-note" role="alert">{{ t("query.run.cancelFailedNote") }}</p>
         <template v-if="activeStatement">
-          <p v-if="activeStatement.status === 'unknown'" class="q-note">写入结果未知。不会自动重放，草稿保留。</p>
-          <p v-else-if="activeStatement.status === 'skipped'" class="q-note">这条语句没有执行。</p>
+          <p v-if="activeStatement.status === 'unknown'" class="q-note">{{ t("query.run.unknownNote") }}</p>
+          <p v-else-if="activeStatement.status === 'skipped'" class="q-note">{{ t("query.run.skippedNote") }}</p>
           <p v-else-if="activeStatement.status === 'ok' && activeStatement.message" class="q-note">{{ activeStatement.message }}</p>
-          <p v-if="canContinue" class="q-note"><button class="btn sm" type="button" data-action="continue-read" @click="continueRead">继续读取</button></p>
+          <p v-if="canContinue" class="q-note"><button class="btn sm" type="button" data-action="continue-read" @click="continueRead">{{ t("query.run.continueRead") }}</button></p>
           <div v-if="planMode && planView" class="plan-view" data-result="plan">
             <p class="plan-caption">{{ planCaption }}</p>
             <ol v-if="planView.kind === 'tree'" class="plan-tree">
               <li v-for="(node, nodeIndex) in planView.nodes" :key="nodeIndex" :style="{ paddingLeft: `${node.depth * 16}px` }">
                 <span>{{ node.operation }}</span>
-                <span v-if="node.rows">估计 {{ node.rows }} 行</span>
+                <span v-if="node.rows">{{ t("query.results.estimatedRows", { n: node.rows }) }}</span>
                 <span v-if="node.extra">{{ node.extra }}</span>
               </li>
             </ol>
@@ -1256,7 +1258,7 @@ onBeforeUnmount(() => {
                   </tr>
                 </tbody>
               </table>
-              <p>没有层次结果</p>
+              <p>{{ t("query.results.noTree") }}</p>
             </template>
           </div>
           <QueryResultGrid
@@ -1272,29 +1274,29 @@ onBeforeUnmount(() => {
           />
         </template>
         <details class="disclosure q-details" :open="detailsOpen">
-          <summary @click.prevent="detailsOpen = !detailsOpen">详情 <span class="muted">{{ detailsCaption }}</span></summary>
+          <summary @click.prevent="detailsOpen = !detailsOpen">{{ t("query.results.details") }} <span class="muted">{{ detailsCaption }}</span></summary>
           <div v-if="detailsOpen" class="disclosure-body">
             <ol class="q-timeline">
               <li v-for="(statement, index) in run.statements" :key="`${run.id}-${index}`" class="q-step" :class="`st-${statement.status}`">
                 <div class="q-step-head">
                   <button class="q-step-pick" type="button" :data-statement-index="index" :aria-current="index === resultIndex" @click="resultIndex = index">
-                    第 {{ index + 1 }} 条 · {{ statusLabel(statement.status) }}
+                    {{ t("query.results.step", { n: index + 1 }) }} · {{ statusLabel(statement.status) }}
                   </button>
-                  <button v-if="statement.status === 'error'" class="btn sm" type="button" data-action="locate" @click="locateInEditor(statement.sql)">在编辑器中定位</button>
+                  <button v-if="statement.status === 'error'" class="btn sm" type="button" data-action="locate" @click="locateInEditor(statement.sql)">{{ t("query.run.locate") }}</button>
                 </div>
                 <pre class="q-sql">{{ statement.sql }}</pre>
                 <p v-if="statement.status === 'error'" class="q-step-msg" role="alert">{{ statement.message }}</p>
-                <p v-else-if="statement.status === 'unknown'" class="q-step-msg">{{ statement.message ? `${statement.message}。` : "" }}写入结果未知，不会自动重放。</p>
-                <p v-else-if="statement.status === 'skipped'" class="q-step-msg">前面的语句失败后，这条语句没有发送到数据库。</p>
-                <p v-else-if="statement.status === 'cancelled'" class="q-step-msg">数据库已确认取消这条语句。</p>
+                <p v-else-if="statement.status === 'unknown'" class="q-step-msg">{{ statement.message ? `${statement.message}。` : "" }}{{ t("query.run.stepUnknown") }}</p>
+                <p v-else-if="statement.status === 'skipped'" class="q-step-msg">{{ t("query.run.stepSkipped") }}</p>
+                <p v-else-if="statement.status === 'cancelled'" class="q-step-msg">{{ t("query.run.stepCancelled") }}</p>
                 <p v-else-if="statement.message" class="q-step-msg">{{ statement.message }}</p>
               </li>
             </ol>
             <div v-if="run.cancelMessage" class="q-cancel-detail">
               <p>{{ run.cancelMessage }}</p>
-              <p v-if="run.viaSsh && run.freshChannel" class="muted">这个连接经 SSH 转发，取消是另开一条通道送达数据库的。</p>
+              <p v-if="run.viaSsh && run.freshChannel" class="muted">{{ t("query.run.sshCancelNote") }}</p>
             </div>
-            <p v-if="run.pollError" class="q-step-msg" role="alert">状态刷新失败：{{ run.pollError }}</p>
+            <p v-if="run.pollError" class="q-step-msg" role="alert">{{ t("query.run.pollErrorShort", { error: run.pollError }) }}</p>
           </div>
         </details>
       </template>

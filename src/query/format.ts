@@ -21,13 +21,13 @@ const HOLDS: Record<string, readonly string[]> = {
 };
 
 const OPEN_REASON: Record<OpenDelimiter, string> = {
-  quote: "无法格式化：引号未闭合。",
-  comment: "无法格式化：注释未闭合。",
-  dollar: "无法格式化：dollar-quote 未闭合。",
+  quote: "query.format.quote",
+  comment: "query.format.comment",
+  dollar: "query.format.dollar",
 };
-const ADJACENT_REASON = "无法格式化：会把原本相连的字符拆开。";
-const COMMENT_BREAK_REASON = "无法格式化：会把行注释断开，后面的文本会变成 SQL。";
-const EDGE_GLUE_REASON = "无法格式化：会去掉选区边缘的空白，使两边的字符粘在一起。";
+const ADJACENT_REASON_KEY = "query.format.adjacent";
+const COMMENT_BREAK_REASON_KEY = "query.format.commentBreak";
+const EDGE_GLUE_REASON_KEY = "query.format.edgeGlue";
 
 export type FormatResult = { ok: true; sql: string } | { ok: false; reason: string; sql: string };
 
@@ -41,10 +41,10 @@ interface Tok {
 
 export function formatSql(sql: string): FormatResult {
   const open = openDelimiter(sql);
-  if (open) return { ok: false, reason: OPEN_REASON[open], sql };
+  if (open) return { ok: false, reason: tr(OPEN_REASON[open]), sql };
   const laid = layout(tokenize(sql));
   if (!laid.ok || !keepsAdjacentNonWhitespace(sql, laid.sql)) {
-    return { ok: false, reason: ADJACENT_REASON, sql };
+    return { ok: false, reason: tr(ADJACENT_REASON_KEY), sql };
   }
   return { ok: true, sql: laid.sql };
 }
@@ -56,8 +56,8 @@ export function formatDocument(sql: string, range?: { from: number; to: number }
   const formatted = formatSql(sql.slice(from, to));
   if (!formatted.ok) return { ok: false, reason: formatted.reason, sql };
   const next = sql.slice(0, from) + formatted.sql + sql.slice(to);
-  if (lineCommentBrokenByNewline(sql, next)) return { ok: false, reason: COMMENT_BREAK_REASON, sql };
-  if (edgeWhitespaceRemoved(sql, from, to, formatted.sql)) return { ok: false, reason: EDGE_GLUE_REASON, sql };
+  if (lineCommentBrokenByNewline(sql, next)) return { ok: false, reason: tr(COMMENT_BREAK_REASON_KEY), sql };
+  if (edgeWhitespaceRemoved(sql, from, to, formatted.sql)) return { ok: false, reason: tr(EDGE_GLUE_REASON_KEY), sql };
   return { ok: true, sql: next };
 }
 
@@ -509,3 +509,5 @@ function keepsAdjacentNonWhitespace(source: string, formatted: string): boolean 
   while (j < right.length && blank(right[j] ?? "")) j += 1;
   return i === left.length && j === right.length;
 }
+
+import { tr } from "../i18n";

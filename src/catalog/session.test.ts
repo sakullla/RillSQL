@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { Engine } from "../engines";
 import { auditTables, catalogFixture, pagedCatalog } from "./fixtures";
 import {
   catalogConnections,
@@ -30,7 +31,7 @@ beforeEach(() => {
   setObjectPage(100);
 });
 
-function saved(id: string, engine: "postgres" | "mysql" | "sqlite", database: string | null) {
+function saved(id: string, engine: Engine, database: string | null) {
   return {
     id,
     name: id,
@@ -49,7 +50,7 @@ function saved(id: string, engine: "postgres" | "mysql" | "sqlite", database: st
   };
 }
 
-function outline(id: string, engine: "postgres" | "mysql" | "sqlite", databases: { name: string; schemas: string[] }[]) {
+function outline(id: string, engine: Engine, databases: { name: string; schemas: string[] }[]) {
   return {
     id,
     name: id,

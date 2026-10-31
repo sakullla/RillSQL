@@ -9,6 +9,7 @@ import { replaceCatalog, resetCatalog } from "../catalog/store";
 import { registerPending, resetCloseGuard } from "../shell/close-guard";
 import { shellCommands } from "../shell/commands";
 import { createSession } from "../shell/session";
+import { tr } from "../i18n";
 import { SHORTCUTS } from "../shell/shortcuts";
 import type { RunDto } from "./api";
 import { clearColumnCache, qualifierFor } from "./columns";
@@ -70,8 +71,8 @@ describe("query editing", () => {
     expect(QUERY_EDITOR_KEYS).toEqual(["Mod-Enter", "Mod-Shift-Enter", "Mod-.", "Ctrl-Space", "Mod-/"]);
     expect(QUERY_EDITOR_KEYS).not.toContain("Alt-W");
     expect(QUERY_EDITOR_KEYS).not.toContain("Ctrl-Alt-N");
-    expect(SHORTCUTS.find((item) => item.chord === "Mod+Enter")?.label).toBe("执行选中内容；无选中时执行光标所在语句");
-    expect(SHORTCUTS.find((item) => item.chord === "Mod+Shift+Enter")?.label).toBe("只执行光标所在语句");
+    expect(tr(SHORTCUTS.find((item) => item.chord === "Mod+Enter")?.label ?? "")).toBe("执行选中内容；无选中时执行光标所在语句");
+    expect(tr(SHORTCUTS.find((item) => item.chord === "Mod+Shift+Enter")?.label ?? "")).toBe("只执行光标所在语句");
   });
 
   it("lists 执行 in the command palette with Mod+Enter", () => {
@@ -88,7 +89,7 @@ describe("query editing", () => {
       showSavedQueries: () => undefined,
       executeQuery: () => { ran += 1; },
     }).find((entry) => entry.label === "执行");
-    expect(item?.group).toBe("命令");
+    expect(item?.group).toBe("command");
     expect(item?.chord).toBe("Mod+Enter");
     item?.run();
     expect(ran).toBe(1);

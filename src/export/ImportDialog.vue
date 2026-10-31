@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { tr as t } from "../i18n";
 import { computed, ref, watch, type ComponentPublicInstance } from "vue";
 import type { ListboxOption } from "../ui/types";
 import Listbox from "../ui/Listbox.vue";
@@ -65,13 +66,13 @@ const tableOptions = computed<ListboxOption[]>(() =>
   })),
 );
 const columnOptions = computed<ListboxOption[]>(() => [
-  { value: "", label: "不导入" },
+  { value: "", label: t("export.importDialog.skip") },
   ...(parsed.value?.columns ?? []).map((name) => ({ value: name, label: name })),
 ]);
 const delimiterOptions: ListboxOption[] = [
-  { value: ",", label: "逗号 ," },
-  { value: ";", label: "分号 ;" },
-  { value: "\t", label: "制表符" },
+  { value: ",", label: t("export.dialog.comma") },
+  { value: ";", label: t("export.dialog.semicolon") },
+  { value: "\t", label: t("export.dialog.tab") },
 ];
 
 function keyOf(schema: string, table: string): string {
@@ -163,7 +164,7 @@ async function chooseTable() {
     const described = await gridDescribe(nextTarget);
     localTarget.value = nextTarget;
     localSchema.value = described;
-    if (described.kind !== "table") parseError.value = "只有数据表可以导入，不能从文件建表，也不能写入视图。";
+    if (described.kind !== "table") parseError.value = t("export.common.onlyTableImport");
     if (parsed.value) mapping.value = suggestMapping(described.columns, parsed.value.columns);
   } catch (error) {
     parseError.value = error instanceof Error ? error.message : String(error);
@@ -235,7 +236,7 @@ async function confirm() {
     resultText.value = summary.text;
     emit("done", summary.text);
   } catch (error) {
-    resultText.value = `导入没有完成：${error instanceof Error ? error.message : String(error)}。没有把未写入的行记成成功。`;
+    resultText.value = t("export.importDialog.incomplete", { error: error instanceof Error ? error.message : String(error) });
   } finally {
     writing.value = false;
   }
@@ -247,51 +248,51 @@ resetForOpen();
 
 <template>
   <div v-if="open" class="ex-overlay" role="presentation">
-    <div class="ex-sheet" role="dialog" aria-modal="true" aria-label="导入到已有表">
+    <div class="ex-sheet" role="dialog" aria-modal="true" :aria-label="t('export.importDialog.dialogLabel')">
       <header class="ex-head">
         <div class="ex-titles">
-          <h2>导入到已有表</h2>
-          <p>只把文件里的行插入一张已有的表。不会建表，也不会把表上还没提交的修改写进去。</p>
+          <h2>{{ t("export.importDialog.title") }}</h2>
+          <p>{{ t("export.importDialog.subtitle") }}</p>
         </div>
-        <button class="icon-btn" type="button" aria-label="关闭" @click="emit('close')">
+        <button class="icon-btn" type="button" :aria-label="t('common.close')" @click="emit('close')">
           <svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
         </button>
       </header>
       <div class="ex-body">
-        <p class="ex-target" data-import-target>目标：<b>{{ connectionName }}</b><span class="ex-target-sep" aria-hidden="true">/</span><b class="mono">{{ objectName }}</b> <span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span></p>
+        <p class="ex-target" data-import-target>{{ t("export.importDialog.target") }}<b>{{ connectionName }}</b><span class="ex-target-sep" aria-hidden="true">/</span><b class="mono">{{ objectName }}</b> <span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span></p>
         <p v-if="parseError" class="ex-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>{{ parseError }}</p>
         <p v-if="resultText" class="ex-note" role="status" data-import-result>{{ resultText }}</p>
         <div class="ex-path">
-          <label for="import-table">导入到</label>
-          <Listbox id="import-table" :model-value="tableKey" :options="tableOptions" aria-label="导入的表" :disabled="writing" @update:model-value="onTable" />
+          <label for="import-table">{{ t("export.importDialog.importTo") }}</label>
+          <Listbox id="import-table" :model-value="tableKey" :options="tableOptions" :aria-label="t('export.importDialog.tableAria')" :disabled="writing" @update:model-value="onTable" />
         </div>
         <fieldset class="ex-scope">
-          <legend>文件格式</legend>
-          <label class="ex-choice" :class="{ on: format === 'csv' }"><input v-model="format" type="radio" name="im-format" value="csv" :disabled="writing" /><span><b>CSV</b><small>第一行是列名。没有引号的空字段是空值。</small></span></label>
-          <label class="ex-choice" :class="{ on: format === 'json' }"><input v-model="format" type="radio" name="im-format" value="json" :disabled="writing" /><span><b>JSON 数组</b><small>必须是对象数组，确认前就会拒绝其他形状。</small></span></label>
-          <label class="ex-choice" :class="{ on: format === 'xlsx' }"><input v-model="format" type="radio" name="im-format" value="xlsx" :disabled="writing" /><span><b>Excel</b><small>只读第一个工作表。第一行必须是列名。空单元格是空值。</small></span></label>
+          <legend>{{ t("export.importDialog.formatLegend") }}</legend>
+          <label class="ex-choice" :class="{ on: format === 'csv' }"><input v-model="format" type="radio" name="im-format" value="csv" :disabled="writing" /><span><b>{{ t("export.importDialog.csvLabel") }}</b><small>{{ t("export.importDialog.csvHint") }}</small></span></label>
+          <label class="ex-choice" :class="{ on: format === 'json' }"><input v-model="format" type="radio" name="im-format" value="json" :disabled="writing" /><span><b>{{ t("export.importDialog.jsonLabel") }}</b><small>{{ t("export.importDialog.jsonHint") }}</small></span></label>
+          <label class="ex-choice" :class="{ on: format === 'xlsx' }"><input v-model="format" type="radio" name="im-format" value="xlsx" :disabled="writing" /><span><b>{{ t("export.importDialog.xlsxLabel") }}</b><small>{{ t("export.importDialog.xlsxHint") }}</small></span></label>
         </fieldset>
         <div v-if="format === 'csv'" class="ex-path">
-          <label for="import-delimiter">分隔符</label>
-          <Listbox id="import-delimiter" :model-value="delimiter" :options="delimiterOptions" aria-label="CSV 分隔符" :disabled="writing" @update:model-value="onDelimiter" />
+          <label for="import-delimiter">{{ t("export.dialog.delimiter") }}</label>
+          <Listbox id="import-delimiter" :model-value="delimiter" :options="delimiterOptions" :aria-label="t('export.importDialog.delimiterAria')" :disabled="writing" @update:model-value="onDelimiter" />
         </div>
-        <label class="ex-path">选择文件
-          <input type="file" aria-label="导入文件" accept=".csv,.tsv,.json,.txt,.xlsx,text/csv,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" :disabled="writing" @change="onFile" />
+        <label class="ex-path">{{ t("export.importDialog.chooseFile") }}
+          <input type="file" :aria-label="t('export.importDialog.fileAria')" accept=".csv,.tsv,.json,.txt,.xlsx,text/csv,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" :disabled="writing" @change="onFile" />
         </label>
-        <p v-if="droppedName" class="ex-note" data-dropped-file>已读取拖放的 {{ droppedName }}。也可以另选文件重新解析。</p>
-        <p v-if="parsed && gaps.length" class="ex-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>必填字段 {{ gaps.join("、") }} 没有对应列，不能开始写入。</p>
+        <p v-if="droppedName" class="ex-note" data-dropped-file>{{ t("export.importDialog.droppedRead", { name: droppedName }) }}</p>
+        <p v-if="parsed && gaps.length" class="ex-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>{{ t("export.importDialog.gapsBlocked", { fields: gaps.join(t("common.listJoin")) }) }}</p>
         <table v-if="parsed" class="map-table">
-          <thead><tr><th>表字段</th><th>文件列</th></tr></thead>
+          <thead><tr><th>{{ t("export.importDialog.columnTableField") }}</th><th>{{ t("export.importDialog.columnFileField") }}</th></tr></thead>
           <tbody>
             <tr v-for="column in activeSchema.columns" :key="column.name">
-              <td>{{ column.name }}<small v-if="!column.nullable && !column.auto"> 必填</small></td>
+              <td>{{ column.name }}<small v-if="!column.nullable && !column.auto"> {{ t("export.importDialog.required") }}</small></td>
               <td>
-                <Listbox :model-value="mapping[column.name] ?? ''" :options="columnOptions" :aria-label="`${column.name} 对应的列`" :disabled="writing" @update:model-value="onColumn(column.name, $event)" />
+                <Listbox :model-value="mapping[column.name] ?? ''" :options="columnOptions" :aria-label="t('export.importDialog.columnMapAria', { column: column.name })" :disabled="writing" @update:model-value="onColumn(column.name, $event)" />
               </td>
             </tr>
           </tbody>
         </table>
-        <p v-if="parsed" class="ex-note">将写入 {{ parsed.rows.length }} 行。下面是对应好的字段，取消则不会写入。</p>
+        <p v-if="parsed" class="ex-note">{{ t("export.importDialog.willWrite", { n: parsed.rows.length }) }}</p>
         <div v-if="parsed" :ref="setViewport" class="preview-scroll" @scroll.passive="onScroll">
           <table class="map-table">
             <thead><tr><th v-for="column in activeSchema.columns" :key="column.name">{{ column.name }}</th></tr></thead>
@@ -306,10 +307,10 @@ resetForOpen();
         </div>
       </div>
       <footer class="ex-foot">
-        <span class="muted sm">{{ describing ? "正在读取表结构…" : writing ? "正在逐行写入…" : "确认后才写入" }}</span>
+        <span class="muted sm">{{ describing ? t("export.importDialog.describing") : writing ? t("export.importDialog.writing") : t("export.importDialog.confirmFirst") }}</span>
         <span class="grow"></span>
-        <button class="btn" type="button" :disabled="writing" @click="emit('close')">取消</button>
-        <button class="btn primary" type="button" :disabled="!canWrite" @click="confirm">导入</button>
+        <button class="btn" type="button" :disabled="writing" @click="emit('close')">{{ t("common.cancel") }}</button>
+        <button class="btn primary" type="button" :disabled="!canWrite" @click="confirm">{{ t("export.importDialog.importButton") }}</button>
       </footer>
     </div>
   </div>

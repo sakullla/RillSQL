@@ -2,7 +2,8 @@
 import { ref } from "vue";
 import { loadObjectOutline, objectOutlines, outlineStorageKey, retryObjectOutline, type OutlineTarget } from "./store";
 import { objectPageSize, refreshCatalog, revealMore, schemaKey, shownCount } from "./store";
-import { KIND_LABEL, objectGroups, objectKey, objectLabel, serverSliceCount, showsIndexGroup, successfulTotal, visibleTotal } from "./tree";
+import { tr as t } from "../i18n";
+import { kindLabel, objectGroups, objectKey, objectLabel, serverSliceCount, showsIndexGroup, successfulTotal, visibleTotal } from "./tree";
 import type { CatalogConnection, CatalogObject, ObjectKind, SchemaNode } from "./types";
 
 const props = defineProps<{
@@ -51,16 +52,16 @@ function shownLabel(): string {
     shownCount(schemaKey(props.connection.id, props.database, props.schema.name), props.schema.objects.length),
     props.schema.objects.length,
   );
-  return `已显示 ${count} / ${Math.max(visibleTotal(props.schema), props.schema.objects.length)} 个`;
+  return t("catalog.schema.shownCount", { shown: count, total: Math.max(visibleTotal(props.schema), props.schema.objects.length) });
 }
 
 function objectMeta(object: CatalogObject): string {
   if (object.stale) return "";
-  if (object.kind === "view") return object.materialized ? "物化视图" : "视图";
-  if (object.kind === "function") return "函数";
-  if (object.kind === "procedure") return "存储过程";
-  if (object.kind === "trigger") return object.relation ? `触发器 · ${object.relation}` : "触发器";
-  if (object.kind === "sequence" || object.kind === "enum" || object.kind === "domain") return KIND_LABEL[object.kind];
+  if (object.kind === "view") return object.materialized ? t("catalog.kind.materializedView") : t("catalog.kind.view");
+  if (object.kind === "function") return t("catalog.kind.function");
+  if (object.kind === "procedure") return t("catalog.kind.procedure");
+  if (object.kind === "trigger") return object.relation ? t("catalog.kind.triggerWithRelation", { relation: object.relation }) : t("catalog.kind.trigger");
+  if (object.kind === "sequence" || object.kind === "enum" || object.kind === "domain") return kindLabel(object.kind);
   return knownEstimate(object.estimatedRows);
 }
 
@@ -75,7 +76,7 @@ function objectPath(): string {
 
 function objectTitle(object: CatalogObject): string {
   const path = `${objectPath()} / ${objectLabel(props.connection.engine, object)}`;
-  return object.stale ? `${path} · 已在外部被删除，下次刷新后不再显示` : path;
+  return object.stale ? t("catalog.schema.stalePath", { path }) : path;
 }
 
 function groupOpen(kind: ObjectKind): boolean {
@@ -150,10 +151,10 @@ function showIndexes(object: CatalogObject): boolean {
   <div v-if="schema.error" class="tree-note err" :style="depthStyle(depth)" data-schema-error>
     <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>
     <div>
-      <strong>这部分对象列表没读出来</strong>
+      <strong>{{ t("catalog.schema.partFailed") }}</strong>
       <span class="reason">{{ schema.error }}</span>
       <span class="tree-note-acts">
-        <button class="btn sm" type="button" data-action="tree-retry" :data-schema="schema.name" @click="refreshCatalog()">重试</button>
+        <button class="btn sm" type="button" data-action="tree-retry" :data-schema="schema.name" @click="refreshCatalog()">{{ t("catalog.tree.retry") }}</button>
       </span>
     </div>
   </div>
@@ -176,14 +177,14 @@ function showIndexes(object: CatalogObject): boolean {
           <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="groupOpen(kind) ? ICONS.down : ICONS.right" /></svg>
         </span>
         <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS[kind]" /></svg>
-        <span class="tr-name">{{ KIND_LABEL[kind] }}</span>
+        <span class="tr-name">{{ kindLabel(kind) }}</span>
         <span v-if="!reportOf(kind)?.error" class="tr-meta">{{ groupTotal(kind, objectsOf(kind).length) }}</span>
       </div>
       <template v-if="groupOpen(kind)">
         <div v-if="reportOf(kind)?.error" class="tree-note err" :style="depthStyle(depth + 1)" data-kind-error :data-kind-group="kind" :data-schema="schema.name" :data-database="database">
           <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>
           <div>
-            <strong>这类对象没读出来</strong>
+            <strong>{{ t("catalog.schema.kindFailed") }}</strong>
             <span class="reason">{{ reportOf(kind)?.error }}</span>
           </div>
         </div>
@@ -196,7 +197,7 @@ function showIndexes(object: CatalogObject): boolean {
           :data-schema="schema.name"
           :data-database="database"
         >
-          <span>正在读取…</span>
+          <span>{{ t("catalog.schema.loading") }}</span>
         </div>
         <div
           v-else-if="objectsOf(kind).length === 0 && groupTotal(kind, 0) === 0"
@@ -207,7 +208,7 @@ function showIndexes(object: CatalogObject): boolean {
           :data-schema="schema.name"
           :data-database="database"
         >
-          <span>没有{{ KIND_LABEL[kind] }}</span>
+          <span>{{ t("catalog.schema.noneOfKind", { kind: kindLabel(kind) }) }}</span>
         </div>
         <template v-for="object in objectsOf(kind)" :key="objectKey(object)">
           <div
@@ -234,20 +235,20 @@ function showIndexes(object: CatalogObject): boolean {
             <span v-else class="tw"></span>
             <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS[object.kind]" /></svg>
             <span class="tr-name">{{ objectLabel(connection.engine, object) }}</span>
-            <span v-if="object.stale" class="badge err">已失效</span>
+            <span v-if="object.stale" class="badge err">{{ t("catalog.tree.staleBadge") }}</span>
             <span v-else-if="objectMeta(object)" class="tr-meta">{{ objectMeta(object) }}</span>
           </div>
           <template v-if="objectOpen(object)">
             <div v-if="outlineOf(object)?.status === 'loading'" class="tree-note" :style="depthStyle(depth + 2)" data-member-loading :data-object="object.name" :data-schema="schema.name" :data-database="database">
-              <span>正在读取列和索引…</span>
+              <span>{{ t("catalog.schema.loadingMembers") }}</span>
             </div>
             <div v-else-if="outlineOf(object)?.status === 'error'" class="tree-note err" :style="depthStyle(depth + 2)" data-member-error :data-object="object.name" :data-schema="schema.name" :data-database="database">
               <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>
               <div>
-                <strong>这张表的列和索引没读出来</strong>
+                <strong>{{ t("catalog.schema.membersFailed") }}</strong>
                 <span class="reason">{{ outlineOf(object)?.error }}</span>
                 <span class="tree-note-acts">
-                  <button class="btn sm" type="button" data-action="retry-members" :data-object="object.name" @click="retryObjectOutline(outlineTarget(object))">重试</button>
+                  <button class="btn sm" type="button" data-action="retry-members" :data-object="object.name" @click="retryObjectOutline(outlineTarget(object))">{{ t("catalog.tree.retry") }}</button>
                 </span>
               </div>
             </div>
@@ -255,11 +256,11 @@ function showIndexes(object: CatalogObject): boolean {
               <div class="tree-row tr-group" role="treeitem" tabindex="0" data-member-group="columns" :data-object="object.name" :style="depthStyle(depth + 2)" @click.stop @dblclick.stop>
                 <span class="tw"></span>
                 <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.column" /></svg>
-                <span class="tr-name">列</span>
+                <span class="tr-name">{{ t("catalog.schema.columns") }}</span>
                 <span class="tr-meta">{{ outlineOf(object)?.columns.length }}</span>
               </div>
               <div v-if="!outlineOf(object)?.columns.length" class="tree-note" :style="depthStyle(depth + 3)" data-column-empty :data-object="object.name" :data-schema="schema.name" :data-database="database">
-                <span>没有列</span>
+                <span>{{ t("catalog.schema.noColumns") }}</span>
               </div>
               <div
                 v-for="column in outlineOf(object)?.columns ?? []"
@@ -287,11 +288,11 @@ function showIndexes(object: CatalogObject): boolean {
                 <div class="tree-row tr-group" role="treeitem" tabindex="0" data-member-group="indexes" :data-object="object.name" :style="depthStyle(depth + 2)" @click.stop @dblclick.stop>
                   <span class="tw"></span>
                   <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.index" /></svg>
-                  <span class="tr-name">索引</span>
+                  <span class="tr-name">{{ t("catalog.schema.indexes") }}</span>
                   <span class="tr-meta">{{ outlineOf(object)?.indexes.length }}</span>
                 </div>
                 <div v-if="!outlineOf(object)?.indexes.length" class="tree-note" :style="depthStyle(depth + 3)" data-index-empty :data-object="object.name" :data-schema="schema.name" :data-database="database">
-                  <span>没有索引</span>
+                  <span>{{ t("catalog.schema.noIndexes") }}</span>
                 </div>
                 <div
                   v-for="indexName in outlineOf(object)?.indexes ?? []"
@@ -330,7 +331,7 @@ function showIndexes(object: CatalogObject): boolean {
         :data-key="schemaKey(connection.id, database, schema.name)"
         @click="revealMore(connection.id, database, schema.name)"
       >
-        再显示 {{ objectPageSize() }} 个
+        {{ t("catalog.schema.showMore", { n: objectPageSize() }) }}
       </button>
     </div>
   </template>

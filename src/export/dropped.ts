@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { tr } from "../i18n";
 import type { Cell } from "../grid/types";
 import { isNativeExport } from "./native";
 import { parseImportCsv, parseImportJson, type ImportSeed, type ParsedImport } from "./import";
@@ -43,9 +44,9 @@ export function routeDroppedFile(path: string): { kind: "preview"; format: "csv"
 
 /** 不支持格式的提示文案：含格式名；电子表格补充仍可从导入对话框进入。 */
 export function unsupportedDropText(extension: string): string {
-  const name = extension ? `.${extension} 文件` : "没有扩展名的文件";
-  const spreadsheet = extension === "xlsx" || extension === "xls" ? "Excel 文件仍可以从数据网格的导入对话框进入。" : "";
-  return `不支持拖放 ${name}：拖放预览只支持 CSV 与 JSON。${spreadsheet}`;
+  const name = extension ? tr("export.dropped.extFile", { ext: extension }) : tr("export.dropped.noExtFile");
+  const spreadsheet = extension === "xlsx" || extension === "xls" ? tr("export.dropped.xlsxHint") : "";
+  return tr("export.dropped.unsupported", { name, spreadsheet });
 }
 
 export function readDroppedPreview(path: string, limit: number = MAX_DROPPED_PREVIEW_BYTES): Promise<DroppedPreview> {
@@ -110,7 +111,7 @@ export function createDroppedFileHandler(options: {
       (preview) => {
         const outcome = preview.format === "json" ? parseImportJson(preview.text) : parseImportCsv(preview.text);
         if (!outcome.ok) {
-          options.setState({ kind: "error", fileName: route.fileName, message: `${outcome.reason}文件可能不是这种格式，或已损坏。` });
+          options.setState({ kind: "error", fileName: route.fileName, message: `${outcome.reason}${tr("export.dropped.parseFailedSuffix")}` });
           return;
         }
         options.setState({ kind: "ready", fileName: route.fileName, preview, parsed: outcome.data });

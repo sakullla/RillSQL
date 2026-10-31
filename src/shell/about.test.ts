@@ -2,7 +2,7 @@ import { mount } from "@vue/test-utils";
 import { afterEach, describe, expect, it } from "vitest";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
 import type { CatalogConnection } from "../catalog/types";
-import { ABOUT_ABSENT } from "./product";
+import { aboutAbsent } from "./product";
 import { DEFAULT_SETTINGS } from "./settings";
 import SettingsView from "./SettingsView.vue";
 import WelcomeView from "./WelcomeView.vue";
@@ -70,7 +70,7 @@ describe("product identity", () => {
     const wrapper = mount(SettingsView, { props: { settings: { ...DEFAULT_SETTINGS }, dataDir: null } });
     const text = wrapper.text();
     expect(text).toContain("澄库 · RillSQL");
-    expect(text).toContain(ABOUT_ABSENT);
+    expect(text).toContain(aboutAbsent());
     expect(text).toContain("只读关系图");
     expect(text).not.toContain("没有 AI、云同步、NoSQL、关系图");
     for (const item of ["AI", "云同步", "NoSQL", "备份恢复", "运维监控"]) {

@@ -121,11 +121,11 @@ function enginePhrase(token: string): string {
 }
 
 function rowLabel(name: string, fallback: string): string {
-  return name.trim() || fallback.trim() || "未命名连接";
+  return name.trim() || fallback.trim() || tr("connections.importReport.unnamed");
 }
 
 function skip(name: string, message: string): ImportNote {
-  return { name, message: `已跳过「${name}」：${message}` };
+  return { name, message: tr("connections.importReport.skipped", { name, reason: message }) };
 }
 
 function sqlitePath(url: string): string {
@@ -175,8 +175,8 @@ function draftFor(engine: Engine, name: string, host: string, port: string, user
 function prepare(name: string, hit: EngineHit, host: string, port: string, user: string, database: string, filePath: string): { row?: PreparedRow; note?: ImportNote } {
   const label = rowLabel(name, hit.kind === "supported" && hit.engine === "sqlite" ? filePath : host);
   if (hit.kind === "other") return { note: skip(label, `${enginePhrase(hit.token)}。`) };
-  if (hit.kind === "none") return { note: skip(label, "没有标明引擎。") };
-  if (hit.engine !== "sqlite" && !host.trim()) return { note: skip(label, "服务器连接缺少主机。") };
+  if (hit.kind === "none") return { note: skip(label, tr("connections.importReport.noEngine")) };
+  if (hit.engine !== "sqlite" && !host.trim()) return { note: skip(label, tr("connections.importReport.noHost")) };
   return { row: { name: label, draft: draftFor(hit.engine, name.trim(), host, port, user, database, filePath) } };
 }
 
@@ -188,7 +188,7 @@ function parseDbeaver(parsed: Record<string, unknown>): { rows: PreparedRow[]; s
   for (const [key, value] of Object.entries(parsed.connections)) {
     const entry = isRecord(value) ? value : null;
     if (!entry) {
-      skipped.push(skip(rowLabel("", key), "这条记录不是连接。"));
+      skipped.push(skip(rowLabel("", key), tr("connections.importReport.notConnection")));
       continue;
     }
     const configuration = isRecord(entry.configuration) ? entry.configuration : {};
@@ -271,13 +271,13 @@ function failureText(error: unknown): string {
     const message = (error as { message?: unknown }).message;
     if (typeof message === "string" && message.trim()) return message.trim();
   }
-  return "没有保存。";
+  return tr("connections.importReport.notSaved");
 }
 
 function summarize(recognized: boolean, saved: SavedConnection[], skipped: ImportNote[], failed: ImportNote[]): string {
-  if (!recognized) return "无法识别这份文件，没有新增连接。";
-  if (!saved.length && !skipped.length && !failed.length) return "没有可导入的连接，没有新增连接。";
-  const parts = [saved.length ? `已导入 ${saved.length} 个连接。` : "没有新增连接。"];
+  if (!recognized) return tr("connections.importReport.unrecognized");
+  if (!saved.length && !skipped.length && !failed.length) return tr("connections.importReport.nothingImportable");
+  const parts = [saved.length ? tr("connections.importReport.imported", { n: saved.length }) : tr("connections.importReport.noneNew")];
   for (const note of skipped) parts.push(note.message);
   for (const note of failed) parts.push(note.message);
   return parts.join(" ");
@@ -297,7 +297,7 @@ export async function importConnectionText(
         const outcome = await save(row.draft, { ...EMPTY_SECRETS });
         saved.push(outcome.connection);
       } catch (error) {
-        failed.push({ name: row.name, message: `「${row.name}」没有保存：${failureText(error)}` });
+        failed.push({ name: row.name, message: tr("connections.importReport.rowNotSaved", { name: row.name, reason: failureText(error) }) });
       }
     }
   }
@@ -323,7 +323,7 @@ export async function importRillSqlConnections(
       const outcomeRow = await save(draft, { ...EMPTY_SECRETS });
       saved.push(outcomeRow.connection);
     } catch (error) {
-      failed.push({ name: connection.name, message: `「${connection.name}」没有保存：${failureText(error)}` });
+      failed.push({ name: connection.name, message: tr("connections.importReport.rowNotSaved", { name: connection.name, reason: failureText(error) }) });
     }
   }
   const skipped = outcome.skipped.map((row) => skip(row.name, row.reason));
@@ -335,3 +335,5 @@ export async function importRillSqlConnections(
     message: summarize(true, saved, skipped, failed),
   };
 }
+
+import { tr } from "../i18n";

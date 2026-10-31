@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import Icon from "../shell/Icon.vue";
 import { ref } from "vue";
+import { tr as t } from "../i18n";
 import { fkActions, foreignKeyLabel } from "./logic";
 import type { StructureForeignKey, StructureIncoming } from "./types";
 
@@ -50,52 +51,52 @@ function previewCreate() {
 <template>
   <div class="struct-foreign struct-sec">
     <p v-if="engine === 'sqlite'" class="callout" :class="{ warn: enforced !== true }">
-      SQLite 靠 foreign_keys 开关决定外键是否检查数据，当前这个连接是 {{ foreignKeyLabel(enforced) }}。
-      <template v-if="enforced === false">新建的外键不会真正检查数据，可以先为这次连接开启。</template>
-      <template v-else-if="enforced === true">新外键会正常检查数据。</template>
-      <template v-else>没读到这个开关的状态，新外键可能不会检查数据。</template>
-      <button v-if="enforced === false" class="btn sm" type="button" @click="emit('enable')">为这次连接开启</button>
+      {{ t("structure.foreign.sqliteSwitch", { state: foreignKeyLabel(enforced) }) }}
+      <template v-if="enforced === false">{{ t("structure.foreign.offNote") }}</template>
+      <template v-else-if="enforced === true">{{ t("structure.foreign.onNote") }}</template>
+      <template v-else>{{ t("structure.foreign.unknownNote") }}</template>
+      <button v-if="enforced === false" class="btn sm" type="button" @click="emit('enable')">{{ t("structure.foreign.enableForConnection") }}</button>
     </p>
-    <p v-if="myisam" class="callout warn">这张表使用 MyISAM，不支持外键；不会通过关闭检查来假装创建成功。</p>
+    <p v-if="myisam" class="callout warn">{{ t("structure.foreign.myisam") }}</p>
 
-    <h3><Icon name="link" />这张表的外键</h3>
+    <h3><Icon name="link" />{{ t("structure.foreign.ownTitle") }}</h3>
     <div v-if="foreignKeys.length" class="obj-list">
       <div v-for="key in foreignKeys" :key="key.name" class="obj-row">
         <code>{{ key.name }}</code>
         <span>{{ key.columns.join(", ") }} → {{ key.refTable }}({{ key.refColumns.join(", ") }})</span>
-        <span class="badge sm">删除引用行时 {{ key.onDelete }} · 更新引用列时 {{ key.onUpdate }}</span>
+        <span class="badge sm">{{ t("structure.foreign.ruleLabel", { onDelete: key.onDelete, onUpdate: key.onUpdate }) }}</span>
         <span class="grow"></span>
-        <button class="btn sm danger" type="button" @click="emit('drop', key.name)">删除</button>
+        <button class="btn sm danger" type="button" @click="emit('drop', key.name)">{{ t("structure.foreign.deleteBtn") }}</button>
       </div>
     </div>
-    <p v-else class="muted">这张表还没有外键。</p>
+    <p v-else class="muted">{{ t("structure.foreign.ownEmpty") }}</p>
 
-    <h3><Icon name="external" />引用这张表的外键</h3>
+    <h3><Icon name="external" />{{ t("structure.foreign.incomingTitle") }}</h3>
     <div v-if="incoming.length" class="obj-list">
       <div v-for="item in incoming" :key="`${item.table}.${item.name}`" class="obj-row">
         <code>{{ item.table }}.{{ item.name }}</code>
         <span class="muted">{{ item.columns.join(", ") }} → {{ item.refColumns.join(", ") }}</span>
       </div>
     </div>
-    <p v-else class="muted">没有其他表引用这张表。</p>
+    <p v-else class="muted">{{ t("structure.foreign.incomingEmpty") }}</p>
 
     <form v-if="!myisam" class="struct-form" @submit.prevent="previewCreate">
-      <label>名称<input v-model="name" type="text" aria-label="外键名称" /></label>
-      <label>本表字段<input v-model="column" type="text" aria-label="外键列" placeholder="一列，或多列用逗号分隔" /></label>
-      <label v-if="engine === 'postgres'">目标 schema<input v-model="refSchema" type="text" aria-label="目标 schema" /></label>
-      <label>目标表<input v-model="refTable" type="text" aria-label="目标表" /></label>
-      <label>目标字段<input v-model="refColumn" type="text" aria-label="目标列" placeholder="一列，或多列用逗号分隔" /></label>
-      <label>删除引用行时
-        <select v-model="onDelete" aria-label="删除引用行时">
+      <label>{{ t("structure.foreign.nameLabel") }}<input v-model="name" type="text" :aria-label="t('structure.foreign.nameAria')" /></label>
+      <label>{{ t("structure.foreign.columnLabel") }}<input v-model="column" type="text" :aria-label="t('structure.foreign.columnAria')" :placeholder="t('structure.foreign.columnPlaceholder')" /></label>
+      <label v-if="engine === 'postgres'">{{ t("structure.foreign.refSchemaLabel") }}<input v-model="refSchema" type="text" :aria-label="t('structure.foreign.refSchemaAria')" /></label>
+      <label>{{ t("structure.foreign.refTableLabel") }}<input v-model="refTable" type="text" :aria-label="t('structure.foreign.refTableAria')" /></label>
+      <label>{{ t("structure.foreign.refColumnLabel") }}<input v-model="refColumn" type="text" :aria-label="t('structure.foreign.refColumnAria')" :placeholder="t('structure.foreign.columnPlaceholder')" /></label>
+      <label>{{ t("structure.foreign.onDelete") }}
+        <select v-model="onDelete" :aria-label="t('structure.foreign.onDelete')">
           <option v-for="action in fkActions(engine)" :key="action">{{ action }}</option>
         </select>
       </label>
-      <label>更新引用列时
-        <select v-model="onUpdate" aria-label="更新引用列时">
+      <label>{{ t("structure.foreign.onUpdate") }}
+        <select v-model="onUpdate" :aria-label="t('structure.foreign.onUpdate')">
           <option v-for="action in fkActions(engine)" :key="action">{{ action }}</option>
         </select>
       </label>
-      <button class="btn primary" type="submit">查看将要发生什么</button>
+      <button class="btn primary" type="submit">{{ t("structure.foreign.preview") }}</button>
     </form>
   </div>
 </template>

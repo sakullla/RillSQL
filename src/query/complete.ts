@@ -1,7 +1,8 @@
+import { tr } from "../i18n";
 import { KIND_LABEL, objectLabel } from "../catalog/tree";
 import type { CatalogConnection, ObjectKind } from "../catalog/types";
 import { engineMeta } from "../connections/model";
-import { CONNECTION_STATUS_TEXT } from "../shell/status-text";
+import { connectionStatusText } from "../shell/status-text";
 
 export const SQL_KEYWORDS = [
   "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "NULL", "IS", "IN", "EXISTS",
@@ -22,6 +23,8 @@ export interface MetadataNote {
   keywordsOnly: boolean;
   note: string;
   objects: CompletionObject[];
+  /** 读取失败类提示（i18n 后不再用文案子串判断提示可见性）。 */
+  failure: boolean;
 }
 
 export interface CompletionItem {
@@ -37,26 +40,26 @@ export interface CachedColumn {
 
 export function metadataNote(connection: CatalogConnection | null, database: string | null): MetadataNote {
   if (!connection || database == null) {
-    return { keywordsOnly: true, note: "未选择执行目标：补全只提供关键字。字段不可用。", objects: [] };
+    return { keywordsOnly: true, note: tr("query.complete.noTarget"), objects: [], failure: false };
   }
   if (connection.status !== "connected") {
-    return { keywordsOnly: true, note: `${connection.name} 当前${CONNECTION_STATUS_TEXT[connection.status]}：补全只提供关键字。字段不可用。`, objects: [] };
+    return { keywordsOnly: true, note: tr("query.complete.statusNote", { conn: connection.name, status: connectionStatusText(connection.status) }), objects: [], failure: false };
   }
   if (connection.error) {
-    return { keywordsOnly: true, note: `读取 ${connection.name} 的表和视图失败（${connection.error}）：补全只提供关键字。字段不可用。`, objects: [] };
+    return { keywordsOnly: true, note: tr("query.complete.readFailed", { conn: connection.name, error: connection.error }), objects: [], failure: true };
   }
   const db = connection.databases.find((item) => item.name === database);
   if (!db) {
-    return { keywordsOnly: true, note: `还没有读到数据库 ${database || "main"} 的表和视图：补全只提供关键字。字段不可用。`, objects: [] };
+    return { keywordsOnly: true, note: tr("query.complete.noObjects", { db: database || "main" }), objects: [], failure: false };
   }
   if (db.error) {
-    return { keywordsOnly: true, note: `读取数据库的表和视图失败（${db.error}）：补全只提供关键字。字段不可用。`, objects: [] };
+    return { keywordsOnly: true, note: tr("query.complete.dbFailed", { error: db.error }), objects: [], failure: true };
   }
   const failed = db.schemas.filter((schema) => schema.error);
   const ready = db.schemas.filter((schema) => !schema.error);
   if (db.schemas.length > 0 && ready.length === 0) {
-    const reason = failed.map((schema) => `${schema.name || "默认"}：${schema.error}`).join("；");
-    return { keywordsOnly: true, note: `读取表和视图失败（${reason}）：补全只提供关键字。字段不可用。`, objects: [] };
+    const reason = failed.map((schema) => `${schema.name || tr("query.complete.defaultSchema")}: ${schema.error}`).join(tr("query.complete.schemaListJoin"));
+    return { keywordsOnly: true, note: tr("query.complete.schemasFailed", { reason }), objects: [], failure: true };
   }
   const objects: CompletionObject[] = [];
   for (const schema of ready) {
@@ -72,16 +75,17 @@ export function metadataNote(connection: CatalogConnection | null, database: str
     }
   }
   if (failed.length) {
-    const reason = failed.map((schema) => `${schema.name || "默认"}（${schema.error}）`).join("、");
-    return { keywordsOnly: false, note: `部分对象读取失败，补全可能不全：${reason}。`, objects };
+    const reason = failed.map((schema) => `${schema.name || tr("query.complete.defaultSchema")} (${schema.error})`).join(tr("query.complete.schemaListSoft"));
+    return { keywordsOnly: false, note: tr("query.complete.partialFailed", { reason }), objects, failure: true };
   }
   if (!objects.length) {
-    return { keywordsOnly: true, note: "当前目标还没有读到表或视图：补全只提供关键字。字段不可用。", objects: [] };
+    return { keywordsOnly: true, note: tr("query.complete.noTables"), objects: [], failure: false };
   }
   return {
     keywordsOnly: false,
-    note: `补全来自 ${connection.name} / ${database || "main"} 已读取的表和视图。已读取的字段会列出，未读取的字段不可用。`,
+    note: tr("query.complete.sourceNote", { conn: connection.name, db: database || "main" }),
     objects,
+    failure: false,
   };
 }
 
@@ -288,7 +292,7 @@ export function completionPlan(input: {
     for (const object of meta.objects) {
       const matched = !prefix || object.label.toLowerCase().startsWith(prefix) || object.name.toLowerCase().startsWith(prefix);
       if (!matched) continue;
-      objectItems.push({ label: object.label, kind: object.kind, detail: KIND_LABEL[object.kind] });
+      objectItems.push({ label: object.label, kind: object.kind, detail: tr(KIND_LABEL[object.kind]) });
       if (objectItems.length >= 20) break;
     }
   }
@@ -305,7 +309,7 @@ export function completionPlan(input: {
     if (keywordItems.length >= 40) break;
     if (prefix && !keyword.toLowerCase().startsWith(prefix)) continue;
     if (keyword.toLowerCase() === prefix) continue;
-    keywordItems.push({ label: keyword, kind: "keyword", detail: "关键字" });
+    keywordItems.push({ label: keyword, kind: "keyword", detail: tr("query.complete.keyword") });
   }
   let ordered: CompletionItem[];
   if (clause === "from" || clause === "join") ordered = [...objectItems, ...keywordItems];
@@ -330,7 +334,7 @@ export interface TargetOption {
 export function targetDetail(option: TargetOption): string {
   const parts = [engineMeta(option.engine).label];
   if (option.envTone !== "none" && option.envLabel) parts.push(option.envLabel);
-  if (option.status !== "connected") parts.push(CONNECTION_STATUS_TEXT[option.status]);
+  if (option.status !== "connected") parts.push(connectionStatusText(option.status));
   return parts.join(" · ");
 }
 

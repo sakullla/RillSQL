@@ -1,4 +1,5 @@
 import { shallowReactive } from "vue";
+import { tr } from "../i18n";
 import { loadSettings } from "../shell/settings";
 import { queryCancel, queryPoll, queryStart, type RunDto, type StartRequest } from "./api";
 
@@ -28,7 +29,7 @@ export function connectionBusy(connectionId: string, exceptTabId: string): boole
 
 export async function startTabRun(input: StartRequest & { tabId: string }): Promise<void> {
   if (connectionBusy(input.connectionId, input.tabId)) {
-    throw new Error("这个连接已有正在执行的查询。可以切换到其他标签继续编辑。");
+    throw new Error(tr("query.runtime.busyConnection"));
   }
   const token = epoch;
   const { tabId, ...request } = input;
@@ -82,7 +83,7 @@ export async function requestCancel(tabId: string): Promise<void> {
   current.status = "cancel-requested";
   current.cancel = "requested";
   if (!current.cancelMessage) {
-    current.cancelMessage = current.viaSsh ? "已请求取消，将另开一条通道。" : "已请求取消，等待数据库确认。";
+    current.cancelMessage = tr(current.viaSsh ? "query.runtime.cancelViaSsh" : "query.runtime.cancelWait");
   }
   const token = epoch;
   const runId = current.id;
@@ -204,5 +205,5 @@ function cancelRank(cancel: string): number {
 export function errorText(err: unknown): string {
   if (typeof err === "string") return err;
   if (err instanceof Error) return err.message;
-  return "执行失败";
+  return tr("query.runtime.executeFailed");
 }

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch, type Ref } from "vue";
+import { tr as t } from "../i18n";
 import { catalogConnections } from "../catalog/store";
 import type { CatalogConnection } from "../catalog/types";
 import { engineMeta } from "../engines";
@@ -63,8 +64,8 @@ function schemaEntry(id: string, database: string): "choices" | "manual" | "load
 function schemaHint(id: string, database: string): string {
   if (schemaEntry(id, database) !== "manual") return "";
   const note = schemaNote[schemaKey(id, database)];
-  if (note) return `${note} 仍可填写已有 schema，不会改连当前会话。`;
-  return "目录里没有这个库的 schema，填写已有名称。不会改连当前会话。";
+  if (note) return `${note}${t("compare.gates.schemaNoteSuffix")}`;
+  return t("compare.gates.schemaNotInCatalog");
 }
 
 async function ensureSchemas(id: string, database: string, schema: Ref<string>) {
@@ -125,21 +126,21 @@ function targetOf(): ScriptTarget {
 function schemaRejected(id: string, database: string, schema: string): string | null {
   const known = connection(id);
   if (!known || (known.engine !== "postgres" && known.engine !== "sqlserver") || !database.trim()) return null;
-  if (schemaEntry(id, database) === "loading") return "PostgreSQL 的 schema 还在读取，选定前不生成脚本。";
+  if (schemaEntry(id, database) === "loading") return t("compare.gates.schemaStillLoading");
   const choices = schemaChoices(id, database);
   const value = schema.trim();
-  if (choices.length && value && !choices.includes(value)) return "PostgreSQL 需要为基准和对照各选一个 schema，不生成脚本。";
+  if (choices.length && value && !choices.includes(value)) return t("compare.gates.schemaBothNeeded");
   return null;
 }
 
 function refuseLocal(left: CompareSide, right: CompareSide): string | null {
-  if (left.engine !== right.engine) return "两侧引擎不同。MySQL 与 MariaDB 是不同引擎，不生成脚本。";
-  if (!left.connectionId || !right.connectionId) return "有一侧还没有打开，不生成脚本。";
-  if (left.engine !== "sqlite" && (!left.database || !right.database)) return "需要为两侧选择数据库，不生成脚本。";
+  if (left.engine !== right.engine) return t("compare.gates.engineMismatch");
+  if (!left.connectionId || !right.connectionId) return t("compare.gates.sideNotOpen");
+  if (left.engine !== "sqlite" && (!left.database || !right.database)) return t("compare.gates.databasesNeeded");
   const pending = schemaRejected(baselineId.value, baselineDatabase.value, baselineSchema.value) ?? schemaRejected(targetId.value, targetDatabase.value, targetSchema.value);
   if (pending) return pending;
-  if (left.engine === "postgres" && (!left.schema || !right.schema)) return "PostgreSQL 需要为基准和对照各选一个 schema，不生成脚本。";
-  if (left.engine === "sqlserver" && (!left.schema || !right.schema)) return "SQL Server 需要为基准和对照各选一个 schema，不生成脚本。";
+  if (left.engine === "postgres" && (!left.schema || !right.schema)) return t("compare.gates.schemaBothNeeded");
+  if (left.engine === "sqlserver" && (!left.schema || !right.schema)) return t("compare.gates.sqlserverSchemaNeeded");
   return null;
 }
 
@@ -151,7 +152,7 @@ async function runStructure() {
   errorText.value = "";
   resetSelection();
   if (!left || !right) {
-    errorText.value = "请选择已打开的基准和对照。";
+    errorText.value = t("compare.gates.chooseBoth");
     return;
   }
   const refused = refuseLocal(left, right);
@@ -178,7 +179,7 @@ async function runData() {
   dataReport.value = null;
   errorText.value = "";
   if (!left || !right) {
-    errorText.value = "请选择已打开的基准和对照。";
+    errorText.value = t("compare.gates.chooseBoth");
     return;
   }
   const refused = refuseLocal(left, right);
@@ -190,7 +191,7 @@ async function runData() {
     .filter((table) => table.onBoth && selected[table.name])
     .map((table) => ({ name: table.name, key: chosenKey[table.name] || null }));
   if (tables.length === 0) {
-    dataReport.value = { refused: "没有选择要对比的表，不生成脚本。", script: "", incomplete: false, notes: [], diffs: [] };
+    dataReport.value = { refused: t("compare.gates.noTablesPicked"), script: "", incomplete: false, notes: [], diffs: [] };
     return;
   }
   const id = `compare-data-${Date.now()}`;
@@ -222,82 +223,82 @@ function place(sql: string) {
 
 <template>
   <div class="cmp-overlay" role="presentation" @click.self="emit('close')">
-    <div class="cmp-sheet" role="dialog" aria-modal="true" aria-label="对比库" data-compare>
+    <div class="cmp-sheet" role="dialog" aria-modal="true" :aria-label="t('compare.dialog.title')" data-compare>
       <header class="cmp-head">
         <div class="cmp-titles">
-          <h2>对比库</h2>
-          <p class="cmp-sub">基准是期望的一侧。脚本只描述如何让对照变成基准，生成时不执行。</p>
+          <h2>{{ t("compare.dialog.title") }}</h2>
+          <p class="cmp-sub">{{ t("compare.dialog.subtitle") }}</p>
         </div>
-        <button class="icon-btn" type="button" aria-label="关闭" @click="emit('close')">
+        <button class="icon-btn" type="button" :aria-label="t('common.close')" @click="emit('close')">
           <svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
         </button>
       </header>
       <div class="cmp-body">
         <div class="compare-sides">
           <fieldset>
-            <legend>基准</legend>
-            <label>连接<select v-model="baselineId" data-side="baseline" data-field="connection"><option value="">选择连接</option><option v-for="item in connections" :key="item.id" :value="item.id">{{ item.name }} · {{ item.engine }}</option></select></label>
-            <label v-if="connection(baselineId)?.engine !== 'sqlite'">数据库<select v-model="baselineDatabase" data-side="baseline" data-field="database"><option value="">选择数据库</option><option v-for="name in databasesOf(baselineId)" :key="name" :value="name">{{ name }}</option></select></label>
+            <legend>{{ t("compare.dialog.baseline") }}</legend>
+            <label>{{ t("compare.dialog.connection") }}<select v-model="baselineId" data-side="baseline" data-field="connection"><option value="">{{ t("compare.dialog.chooseConnection") }}</option><option v-for="item in connections" :key="item.id" :value="item.id">{{ item.name }} · {{ item.engine }}</option></select></label>
+            <label v-if="connection(baselineId)?.engine !== 'sqlite'">{{ t("compare.dialog.database") }}<select v-model="baselineDatabase" data-side="baseline" data-field="database"><option value="">{{ t("compare.dialog.chooseDatabase") }}</option><option v-for="name in databasesOf(baselineId)" :key="name" :value="name">{{ name }}</option></select></label>
             <label v-if="connection(baselineId)?.engine === 'postgres'">schema
-              <select v-if="schemaEntry(baselineId, baselineDatabase) === 'choices'" v-model="baselineSchema" data-side="baseline" data-field="schema"><option value="">选择 schema</option><option v-for="name in schemaChoices(baselineId, baselineDatabase)" :key="name" :value="name">{{ name }}</option></select>
-              <input v-else-if="schemaEntry(baselineId, baselineDatabase) === 'manual'" v-model="baselineSchema" type="text" data-side="baseline" data-field="schema" placeholder="填写已有 schema" autocomplete="off" />
-              <span v-else-if="schemaEntry(baselineId, baselineDatabase) === 'loading'" class="muted" data-side="baseline" data-field="schema" data-schema-state="loading">正在读取 schema</span>
-              <select v-else v-model="baselineSchema" data-side="baseline" data-field="schema"><option value="">选择 schema</option></select>
+              <select v-if="schemaEntry(baselineId, baselineDatabase) === 'choices'" v-model="baselineSchema" data-side="baseline" data-field="schema"><option value="">{{ t("compare.dialog.chooseSchema") }}</option><option v-for="name in schemaChoices(baselineId, baselineDatabase)" :key="name" :value="name">{{ name }}</option></select>
+              <input v-else-if="schemaEntry(baselineId, baselineDatabase) === 'manual'" v-model="baselineSchema" type="text" data-side="baseline" data-field="schema" :placeholder="t('compare.dialog.schemaManualPlaceholder')" autocomplete="off" />
+              <span v-else-if="schemaEntry(baselineId, baselineDatabase) === 'loading'" class="muted" data-side="baseline" data-field="schema" data-schema-state="loading">{{ t("compare.dialog.schemaLoading") }}</span>
+              <select v-else v-model="baselineSchema" data-side="baseline" data-field="schema"><option value="">{{ t("compare.dialog.chooseSchema") }}</option></select>
             </label>
             <p v-if="schemaHint(baselineId, baselineDatabase)" class="muted" data-side="baseline" data-schema-hint>{{ schemaHint(baselineId, baselineDatabase) }}</p>
           </fieldset>
           <fieldset>
-            <legend>对照</legend>
-            <label>连接<select v-model="targetId" data-side="target" data-field="connection"><option value="">选择连接</option><option v-for="item in connections" :key="item.id" :value="item.id">{{ item.name }} · {{ item.engine }}</option></select></label>
-            <label v-if="connection(targetId)?.engine !== 'sqlite'">数据库<select v-model="targetDatabase" data-side="target" data-field="database"><option value="">选择数据库</option><option v-for="name in databasesOf(targetId)" :key="name" :value="name">{{ name }}</option></select></label>
+            <legend>{{ t("compare.dialog.target") }}</legend>
+            <label>{{ t("compare.dialog.connection") }}<select v-model="targetId" data-side="target" data-field="connection"><option value="">{{ t("compare.dialog.chooseConnection") }}</option><option v-for="item in connections" :key="item.id" :value="item.id">{{ item.name }} · {{ item.engine }}</option></select></label>
+            <label v-if="connection(targetId)?.engine !== 'sqlite'">{{ t("compare.dialog.database") }}<select v-model="targetDatabase" data-side="target" data-field="database"><option value="">{{ t("compare.dialog.chooseDatabase") }}</option><option v-for="name in databasesOf(targetId)" :key="name" :value="name">{{ name }}</option></select></label>
             <label v-if="connection(targetId)?.engine === 'postgres'">schema
-              <select v-if="schemaEntry(targetId, targetDatabase) === 'choices'" v-model="targetSchema" data-side="target" data-field="schema"><option value="">选择 schema</option><option v-for="name in schemaChoices(targetId, targetDatabase)" :key="name" :value="name">{{ name }}</option></select>
-              <input v-else-if="schemaEntry(targetId, targetDatabase) === 'manual'" v-model="targetSchema" type="text" data-side="target" data-field="schema" placeholder="填写已有 schema" autocomplete="off" />
-              <span v-else-if="schemaEntry(targetId, targetDatabase) === 'loading'" class="muted" data-side="target" data-field="schema" data-schema-state="loading">正在读取 schema</span>
-              <select v-else v-model="targetSchema" data-side="target" data-field="schema"><option value="">选择 schema</option></select>
+              <select v-if="schemaEntry(targetId, targetDatabase) === 'choices'" v-model="targetSchema" data-side="target" data-field="schema"><option value="">{{ t("compare.dialog.chooseSchema") }}</option><option v-for="name in schemaChoices(targetId, targetDatabase)" :key="name" :value="name">{{ name }}</option></select>
+              <input v-else-if="schemaEntry(targetId, targetDatabase) === 'manual'" v-model="targetSchema" type="text" data-side="target" data-field="schema" :placeholder="t('compare.dialog.schemaManualPlaceholder')" autocomplete="off" />
+              <span v-else-if="schemaEntry(targetId, targetDatabase) === 'loading'" class="muted" data-side="target" data-field="schema" data-schema-state="loading">{{ t("compare.dialog.schemaLoading") }}</span>
+              <select v-else v-model="targetSchema" data-side="target" data-field="schema"><option value="">{{ t("compare.dialog.chooseSchema") }}</option></select>
             </label>
             <p v-if="schemaHint(targetId, targetDatabase)" class="muted" data-side="target" data-schema-hint>{{ schemaHint(targetId, targetDatabase) }}</p>
           </fieldset>
         </div>
         <div class="compare-actions">
-          <button class="btn primary" type="button" data-action="compare-structure" :disabled="busy || schemaPending" @click="runStructure">对比结构</button>
-          <button class="btn" type="button" data-action="compare-cancel" :disabled="!busy" @click="cancelRun">取消</button>
-          <span v-if="busy" class="cmp-hint">正在对比…</span>
+          <button class="btn primary" type="button" data-action="compare-structure" :disabled="busy || schemaPending" @click="runStructure">{{ t("compare.dialog.compareStructure") }}</button>
+          <button class="btn" type="button" data-action="compare-cancel" :disabled="!busy" @click="cancelRun">{{ t("common.cancel") }}</button>
+          <span v-if="busy" class="cmp-hint">{{ t("compare.dialog.comparing") }}</span>
         </div>
         <p v-if="errorText" class="cmp-alert" role="alert">{{ errorText }}</p>
         <p v-if="structure?.refused" class="cmp-alert" role="alert" data-compare-refused>{{ structure.refused }}</p>
-        <p v-if="structure?.incomplete" class="badge warn" data-compare-incomplete>脚本不完整</p>
+        <p v-if="structure?.incomplete" class="badge warn" data-compare-incomplete>{{ t("compare.dialog.scriptIncomplete") }}</p>
         <ul v-if="structure && !structure.refused" class="compare-list" data-compare-diffs>
-          <li v-for="item in structure.onlyBaseline" :key="`b-${item.kind}-${item.name}`">仅基准拥有 {{ item.kind }} {{ item.name }}</li>
-          <li v-for="item in structure.onlyTarget" :key="`t-${item.kind}-${item.name}`">仅对照拥有 {{ item.kind }} {{ item.name }}</li>
+          <li v-for="item in structure.onlyBaseline" :key="`b-${item.kind}-${item.name}`">{{ t("compare.dialog.onlyBaseline", { kind: item.kind, name: item.name }) }}</li>
+          <li v-for="item in structure.onlyTarget" :key="`t-${item.kind}-${item.name}`">{{ t("compare.dialog.onlyTarget", { kind: item.kind, name: item.name }) }}</li>
           <li v-for="item in structure.changed" :key="`c-${item.kind}-${item.name}`">{{ item.kind }} {{ item.name }}：{{ item.detail }}</li>
         </ul>
         <template v-if="structure && !structure.refused">
-          <label class="compare-script">结构脚本<textarea readonly :value="structure.script" data-compare-script></textarea></label>
-          <button class="btn" type="button" data-action="place-structure" :disabled="!structure.script.trim()" @click="place(structure.script)">放入新查询</button>
+          <label class="compare-script">{{ t("compare.dialog.structureScript") }}<textarea readonly :value="structure.script" data-compare-script></textarea></label>
+          <button class="btn" type="button" data-action="place-structure" :disabled="!structure.script.trim()" @click="place(structure.script)">{{ t("compare.dialog.placeToQuery") }}</button>
         </template>
         <section v-if="structure && !structure.refused" class="compare-data">
-          <h3>数据差异</h3>
-          <p v-if="!structure.tables.length" class="muted">没有可对比的表。</p>
+          <h3>{{ t("compare.dialog.dataTitle") }}</h3>
+          <p v-if="!structure.tables.length" class="muted">{{ t("compare.dialog.noTables") }}</p>
           <label v-for="table in structure.tables" :key="table.name" class="compare-table">
             <input v-model="selected[table.name]" type="checkbox" :disabled="!table.onBoth" :data-table="table.name" />
             <span class="mono">{{ table.name }}</span>
-            <span v-if="!table.onBoth" class="muted">只在一侧，属于结构差异</span>
+            <span v-if="!table.onBoth" class="muted">{{ t("compare.dialog.oneSideOnly") }}</span>
             <select v-if="table.needsKeyChoice" v-model="chosenKey[table.name]" :data-key="table.name">
-              <option value="">选择唯一键</option>
+              <option value="">{{ t("compare.dialog.chooseKey") }}</option>
               <option v-for="key in table.keys" :key="key.name" :value="key.name">{{ key.name }}（{{ key.columns.join(", ") }}）</option>
             </select>
           </label>
-          <button class="btn" type="button" data-action="compare-data" :disabled="busy || schemaPending" @click="runData">对比数据</button>
+          <button class="btn" type="button" data-action="compare-data" :disabled="busy || schemaPending" @click="runData">{{ t("compare.dialog.compareData") }}</button>
           <p v-if="dataReport?.refused" class="cmp-alert" role="alert">{{ dataReport.refused }}</p>
-          <p v-if="dataReport?.incomplete" class="badge warn">数据脚本不完整</p>
+          <p v-if="dataReport?.incomplete" class="badge warn">{{ t("compare.dialog.dataScriptIncomplete") }}</p>
           <ul v-if="dataReport" class="compare-list">
-            <li v-for="(item, index) in dataReport.diffs" :key="`${item.table}-${item.action}-${index}`"><span class="mono">{{ item.table }}</span> {{ item.detail }} <template v-if="item.key">键 {{ item.key }}</template></li>
+            <li v-for="(item, index) in dataReport.diffs" :key="`${item.table}-${item.action}-${index}`"><span class="mono">{{ item.table }}</span> {{ item.detail }} <template v-if="item.key">{{ t("compare.dialog.key") }} {{ item.key }}</template></li>
             <li v-for="(note, index) in dataReport.notes" :key="`n-${index}`">{{ note }}</li>
           </ul>
           <template v-if="dataReport && !dataReport.refused">
-            <label class="compare-script">数据脚本<textarea readonly :value="dataReport.script" data-data-script></textarea></label>
-            <button class="btn" type="button" data-action="place-data" :disabled="!dataReport.script.trim()" @click="place(dataReport.script)">放入新查询</button>
+            <label class="compare-script">{{ t("compare.dialog.dataScript") }}<textarea readonly :value="dataReport.script" data-data-script></textarea></label>
+            <button class="btn" type="button" data-action="place-data" :disabled="!dataReport.script.trim()" @click="place(dataReport.script)">{{ t("compare.dialog.placeToQuery") }}</button>
           </template>
         </section>
       </div>

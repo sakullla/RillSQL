@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { tr as t, tr } from "../i18n";
 import { computed, ref } from "vue";
 import DumpDialog from "./DumpDialog.vue";
 import MigrateDialog from "./MigrateDialog.vue";
@@ -11,9 +12,9 @@ const running = computed(() => exportTasks.find((task) => task.status === "runni
 const hasFinished = computed(() => exportTasks.some((task) => task.status !== "running"));
 const label = computed(() => {
   const task = running.value;
-  if (!task) return "任务";
-  const verb = task.kind === "migrate" ? "迁移中" : "导出中";
-  return task.totalRows > 0 ? `${verb} ${task.doneRows}/${task.totalRows}` : `${verb} ${task.doneRows} 行`;
+  if (!task) return tr("export.taskCenter.task");
+  const verb = task.kind === "migrate" ? tr("export.taskCenter.migrating") : tr("export.taskCenter.exporting");
+  return task.totalRows > 0 ? tr("export.taskCenter.progressRows", { verb, done: task.doneRows, total: task.totalRows }) : tr("export.taskCenter.progressDoneRows", { verb, done: task.doneRows });
 });
 
 function cancel(task: ExportTask) {
@@ -40,25 +41,25 @@ function percent(task: ExportTask): number {
 
 <template>
   <div class="task-center" data-module="export">
-    <button class="tc-trigger" :class="{ busy: running }" type="button" aria-label="后台任务" :aria-expanded="open" @click="open = !open">
+    <button class="tc-trigger" :class="{ busy: running }" type="button" :aria-label="t('export.taskCenter.trigger')" :aria-expanded="open" @click="open = !open">
       <svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v6l3 2" /><circle cx="8" cy="8" r="6.2" /></svg>
       {{ label }}
     </button>
-    <div v-if="open" class="tc-pop" role="dialog" aria-label="任务列表">
+    <div v-if="open" class="tc-pop" role="dialog" :aria-label="t('export.taskCenter.listLabel')">
       <div class="tc-head">
-        <strong>后台任务</strong>
+        <strong>{{ t("export.taskCenter.title") }}</strong>
         <span class="grow"></span>
-        <button class="btn sm ghost" type="button" data-action="dump-open" @click="dumpOpen = true">全库导出</button>
-        <button class="btn sm ghost" type="button" data-action="migrate-open" @click="migrateOpen = true">跨库迁移</button>
-        <button class="btn sm ghost" type="button" data-action="clear-finished" :disabled="!hasFinished" @click="clearFinishedTasks">清除已结束的</button>
+        <button class="btn sm ghost" type="button" data-action="dump-open" @click="dumpOpen = true">{{ t("export.taskCenter.dump") }}</button>
+        <button class="btn sm ghost" type="button" data-action="migrate-open" @click="migrateOpen = true">{{ t("export.taskCenter.migrate") }}</button>
+        <button class="btn sm ghost" type="button" data-action="clear-finished" :disabled="!hasFinished" @click="clearFinishedTasks">{{ t("export.taskCenter.clearFinished") }}</button>
       </div>
-      <p v-if="!exportTasks.length" class="tc-empty">没有后台任务。</p>
+      <p v-if="!exportTasks.length" class="tc-empty">{{ t("export.taskCenter.empty") }}</p>
       <article v-for="task in exportTasks" :key="task.id" class="tc-task" :data-status="task.status">
         <div class="tc-task-top">
           <span class="badge" :class="badgeVariant(task.status)">{{ taskStatusLabel(task.status) }}</span>
           <span class="tc-name" :title="task.path">{{ task.fileName }}</span>
           <span class="grow"></span>
-          <button v-if="task.status === 'running' && task.cancellable !== false" class="btn sm" type="button" @click="cancel(task)">取消</button>
+          <button v-if="task.status === 'running' && task.cancellable !== false" class="btn sm" type="button" @click="cancel(task)">{{ t("export.taskCenter.cancel") }}</button>
         </div>
         <div
           v-if="task.status === 'running'"
@@ -67,17 +68,17 @@ function percent(task: ExportTask): number {
           aria-valuemin="0"
           :aria-valuemax="Math.max(1, task.totalRows)"
           :aria-valuenow="task.doneRows"
-          :aria-label="`导出 ${task.fileName} 的进度`"
+          :aria-label="t('export.taskCenter.progressAria', { name: task.fileName })"
         >
           <i :style="{ width: `${percent(task)}%` }"></i>
         </div>
         <p class="tc-status">{{ taskStatusText(task) }}</p>
         <details v-if="task.report && (task.report.failedIds.length > 0 || task.report.firstErrors.length > 0)" class="tc-report">
-          <summary>失败明细（{{ task.report.failedIds.length }} 个标识）</summary>
+          <summary>{{ t("export.taskCenter.failedDetail", { n: task.report.failedIds.length }) }}</summary>
           <ul class="tc-failed">
             <li v-for="id in failedSample(task).ids" :key="id">{{ id }}</li>
           </ul>
-          <p v-if="failedSample(task).more > 0" class="tc-more">还有 {{ failedSample(task).more }} 个未展示。</p>
+          <p v-if="failedSample(task).more > 0" class="tc-more">{{ t("export.taskCenter.more", { n: failedSample(task).more }) }}</p>
           <ul class="tc-errors">
             <li v-for="item in task.report.firstErrors.slice(0, 5)" :key="item">{{ item }}</li>
           </ul>

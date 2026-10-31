@@ -39,13 +39,13 @@ export function inspectSql(sql: string, engine = "postgres"): SplitReport {
       const arg = delimiterArgument(sql.slice(begin, lineEnd));
       if (engine === "postgres" || engine === "sqlite" || engine === "sqlserver") {
         if (!noticed) {
-          notices.push(`${engineLabel(engine)} 不使用 DELIMITER 这条客户端指令，已跳过。其余语句仍按该引擎执行。`);
+          notices.push(tr("query.split.skipDelimiter", { engine: engineLabel(engine) }));
           noticed = true;
         }
         i = skipBreak(sql, lineEnd);
         continue;
       }
-      if (arg == null) return { pieces, notices, refusal: "自定义结束符没有写明，没有发送。", refusalFrom: begin };
+      if (arg == null) return { pieces, notices, refusal: tr("query.split.missingDelimiter"), refusalFrom: begin };
       delimiter = arg;
       i = skipBreak(sql, lineEnd);
       continue;
@@ -282,10 +282,10 @@ export function inspectSyntax(sql: string, engine = "postgres"): SyntaxFinding[]
     else if (sql[i] === ")" && parens.length) parens.pop();
     i += 1;
   }
-  if (quote !== null) findings.push({ kind: "quote", start: quoteAt, message: "引号没有闭合。" });
-  if (comment) findings.push({ kind: "block-comment", start: commentAt, message: "块注释没有闭合。" });
-  if (dollar !== null) findings.push({ kind: "dollar", start: dollarAt, message: "dollar-quote 没有闭合。" });
-  if (parens.length) findings.push({ kind: "paren", start: parens[0]!, message: "括号没有闭合。" });
+  if (quote !== null) findings.push({ kind: "quote", start: quoteAt, message: tr("query.split.quoteUnclosed") });
+  if (comment) findings.push({ kind: "block-comment", start: commentAt, message: tr("query.split.blockCommentUnclosed") });
+  if (dollar !== null) findings.push({ kind: "dollar", start: dollarAt, message: tr("query.split.dollarUnclosed") });
+  if (parens.length) findings.push({ kind: "paren", start: parens[0]!, message: tr("query.split.parenUnclosed") });
   return findings.sort((a, b) => a.start - b.start);
 }
 
@@ -464,13 +464,13 @@ function scanStatement(sql: string, start: number, delimiter: string, hash: bool
     }
     i += 1;
   }
-  if (quote) return { piece: null, next: sql.length, refusal: "引号没有闭合，没有发送。" };
-  if (bracket) return { piece: null, next: sql.length, refusal: "方括号标识符没有闭合，没有发送。" };
-  if (block) return { piece: null, next: sql.length, refusal: "块注释没有闭合，没有发送。" };
-  if (dollar !== null) return { piece: null, next: sql.length, refusal: "dollar-quote 没有闭合，没有发送。" };
-  if (beginDepth > 0) return { piece: null, next: sql.length, refusal: tsqlBlocks ? "BEGIN 块未闭合，没有发送。" : "例程体未闭合，没有发送。" };
+  if (quote) return { piece: null, next: sql.length, refusal: tr("query.split.quoteRefusal") };
+  if (bracket) return { piece: null, next: sql.length, refusal: tr("query.split.bracketRefusal") };
+  if (block) return { piece: null, next: sql.length, refusal: tr("query.split.blockRefusal") };
+  if (dollar !== null) return { piece: null, next: sql.length, refusal: tr("query.split.dollarRefusal") };
+  if (beginDepth > 0) return { piece: null, next: sql.length, refusal: tr(tsqlBlocks ? "query.split.beginRefusal" : "query.split.routineRefusal") };
   if (!closed && delimiter !== ";" && meaningful(sql.slice(start, i), hash)) {
-    return { piece: null, next: sql.length, refusal: "自定义结束符没有闭合，没有发送。" };
+    return { piece: null, next: sql.length, refusal: tr("query.split.delimiterRefusal") };
   }
   const end = closed ? closeAt : i;
   return { piece: makePiece(sql, start, end, delimiter, closed, hash), next: end, refusal: null };
@@ -688,3 +688,5 @@ function dollarTag(sql: string, start: number): string | null {
   if (/^[A-Za-z0-9_]*$/.test(tag)) return tag;
   return null;
 }
+
+import { tr } from "../i18n";

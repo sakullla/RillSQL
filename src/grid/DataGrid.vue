@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch, type ComponentPublicInstance } from "vue";
+import { tr as t } from "../i18n";
 import ExportDialog from "../export/ExportDialog.vue";
 import ImportDialog from "../export/ImportDialog.vue";
 import { planExport, type ExportScope } from "../export/plan";
@@ -206,8 +207,8 @@ const calcStats = computed(() => {
 const previewRows = computed(() => session?.loaded.slice(0, 4).map((row) => ({ ...row.cells })) ?? []);
 const noKeyHint = computed(() => {
   if (!session) return "";
-  if (session.store.schema.kind === "view") return "视图是只读的，不能新增、修改或删除数据。";
-  if (!session.store.schema.key.length) return "这张表没有主键，无法唯一确定已有行，所以不能修改或删除它们。";
+  if (session.store.schema.kind === "view") return t("grid.errors.viewReadonly");
+  if (!session.store.schema.key.length) return t("grid.errors.noKeyEdit");
   return "";
 });
 
@@ -350,7 +351,7 @@ async function beginEdit(id: string, column: string) {
   const current = session.cellValue(id, column);
   const resolved = session.rowById(id)?.resolved === true;
   if (typeof current === "string" && isPreviewEnvelope(current, meta?.typeName) && !resolved) {
-    const message = "预览内容不能写回";
+    const message = t("grid.errors.previewWriteback");
     editError.value = message;
     if (menu.value?.row === id && menu.value.column === column) menuError.value = message;
     return;
@@ -493,16 +494,16 @@ async function commitChangesNow() {
   const report = await session.commit();
   if (!report) {
     // 提交没有返回报告时，面板不能关掉：否则看起来像成功了。
-    commitError.value = session.commitError || "提交没有完成。未成功的更改仍保留在待提交列表中。";
+    commitError.value = session.commitError || t("grid.commit.incomplete");
     return;
   }
   const saved = report.applied.length;
   if (report.failed) {
-    commitError.value = `已保存 ${saved} 处，1 处失败。失败的更改仍保留在待提交列表中，原因已标出。`;
+    commitError.value = t("grid.commit.savedOneFailed", { n: saved });
     return;
   }
   commitOpen.value = false;
-  receipt.value = `${saved} 处已保存。`;
+  receipt.value = t("grid.commit.savedAll", { n: saved });
 }
 
 function openCommit() {
@@ -595,7 +596,7 @@ function loadReferenceKeys(): void {
     },
     () => {
       referenceLoad = null;
-      if (menu.value) menuError.value = "读取表结构失败，暂时不能跳转引用行。";
+      if (menu.value) menuError.value = t("grid.errors.schemaReadFailed");
     },
   );
 }
@@ -645,7 +646,7 @@ async function copySelection() {
   const text = selectionTsv(points, (point) => copyCellText(session.cellValue(point.row, point.column), props.nullCopy ?? loadSettings().nullCopy, columns.value.find((item) => item.name === point.column), session.rowById(point.row)?.resolved === true));
   try {
     await navigator.clipboard.writeText(text);
-    copyMessage.value = "已复制";
+    copyMessage.value = t("grid.value.copied");
   } catch {
     copyMessage.value = text;
   }
@@ -662,7 +663,7 @@ function editFromMenu() {
   }
   const row = displayRows.value.find((item) => item.id === target.row);
   if (row?.kind === "data" && !session.canUpdate(session.rowById(target.row))) {
-    menuError.value = "只读，不能修改";
+    menuError.value = t("grid.errors.readonlyCell");
     return;
   }
   menu.value = null;
@@ -679,7 +680,7 @@ function setNullFromMenu() {
     return;
   }
   if (meta && !meta.nullable && !session.inserts.some((insert) => insert.id === target.row)) {
-    menuError.value = "这一列不能是 NULL";
+    menuError.value = t("grid.errors.columnNotNull");
     return;
   }
   const error = session.inserts.some((insert) => insert.id === target.row)
@@ -704,9 +705,9 @@ async function copySelected(asSql: boolean) {
   const text = asSql ? copySqlValue(selectedRaw.value, column, session.store.schema.engine) : copyCellText(selectedRaw.value, props.nullCopy ?? loadSettings().nullCopy, column, resolved);
   try {
     await navigator.clipboard.writeText(text);
-    copyMessage.value = "已复制";
+    copyMessage.value = t("grid.value.copied");
   } catch {
-    copyMessage.value = text || "复制失败，请在值查看器中选中文本复制。";
+    copyMessage.value = text || t("grid.errors.clipboardFailed");
   }
 }
 
@@ -779,7 +780,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
   });
   exportOpen.value = false;
   if (payload.scope === "loaded") {
-    exportMessage.value = payload.format === "csv" ? "正在保存 CSV…" : "正在保存已读取的行…";
+    exportMessage.value = payload.format === "csv" ? t("grid.export.savingCsv") : t("grid.export.savingLoaded");
     const blocked = await session.expandPreviews();
     if (blocked) {
       exportMessage.value = blocked;
@@ -800,7 +801,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
     });
     return;
   }
-  exportMessage.value = "正在从已打开的连接导出全部匹配行。";
+  exportMessage.value = t("grid.export.exportingAll");
   const { done } = runRemoteExport({
     plan,
     acknowledged: payload.acknowledged,
@@ -827,153 +828,153 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
 </script>
 
 <template>
-  <div ref="rootEl" class="data-grid" aria-label="数据表格" :data-tab-id="tabId" :data-draft="draft" :data-loaded="session ? session.loaded.length : 0" :data-truncated="session ? session.truncated : false">
-    <p v-if="!session" class="grid-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ERROR_ICON" /></svg>没有绑定已打开的表，不能用示例数据代替。</p>
+  <div ref="rootEl" class="data-grid" :aria-label="t('grid.tableArea')" :data-tab-id="tabId" :data-draft="draft" :data-loaded="session ? session.loaded.length : 0" :data-truncated="session ? session.truncated : false">
+    <p v-if="!session" class="grid-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ERROR_ICON" /></svg>{{ t("grid.unbound") }}</p>
     <template v-else>
     <div class="grid-toolbar">
       <span v-if="environmentLabel" class="env xs" data-env :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span>
       <form class="filter-form" @submit.prevent="applyFilter">
-        <select v-model="filterColumn" aria-label="筛选列">
+        <select v-model="filterColumn" :aria-label="t('grid.filter.column')">
           <option v-for="column in columns" :key="column.name" :value="column.name">{{ column.name }}</option>
         </select>
-        <select v-model="filterOp" aria-label="筛选条件">
+        <select v-model="filterOp" :aria-label="t('grid.filter.condition')">
           <option v-for="op in FILTER_OPS" :key="op.id" :value="op.id">{{ op.label }}</option>
         </select>
-        <input v-if="opNeedsValue(filterOp)" v-model="filterValue" aria-label="筛选值" :placeholder="filterOp === 'between' ? '下界' : undefined" />
-        <input v-if="filterOp === 'between'" v-model="filterSecond" aria-label="筛选第二个值" placeholder="上界" />
-        <input v-if="filterOp === 'in'" v-model="filterValues" aria-label="筛选值列表" placeholder="多个值用逗号分隔，空段忽略" />
-        <button class="btn sm" type="submit">筛选</button>
-        <input v-model="searchDraft" type="search" aria-label="搜索关键字" placeholder="整表搜索：% 和 _ 按字面匹配" @keydown.enter="onSearchEnter" />
-        <button class="btn sm" type="button" @click="applySearch">搜索</button>
+        <input v-if="opNeedsValue(filterOp)" v-model="filterValue" :aria-label="t('grid.filter.value')" :placeholder="filterOp === 'between' ? t('grid.filter.lowerBound') : undefined" />
+        <input v-if="filterOp === 'between'" v-model="filterSecond" :aria-label="t('grid.filter.secondValue')" :placeholder="t('grid.filter.upperBound')" />
+        <input v-if="filterOp === 'in'" v-model="filterValues" :aria-label="t('grid.filter.valueList')" :placeholder="t('grid.filter.valueListHint')" />
+        <button class="btn sm" type="submit">{{ t("grid.filter.apply") }}</button>
+        <input v-model="searchDraft" type="search" :aria-label="t('grid.filter.searchKeyword')" :placeholder="t('grid.filter.searchPlaceholder')" @keydown.enter="onSearchEnter" />
+        <button class="btn sm" type="button" @click="applySearch">{{ t("grid.filter.search") }}</button>
       </form>
       <span v-for="(filter, index) in session.filters" :key="`${filter.column}-${index}`" class="chip">
         <b>{{ filter.column }}</b> {{ opLabel(filter.op) }}
         <code v-if="filter.op === 'between'">{{ filter.value }} ~ {{ filter.second }}</code>
         <code v-else-if="filter.op === 'in'">{{ (filter.values ?? []).join(", ") }}</code>
         <code v-else-if="opNeedsValue(filter.op)">{{ filter.value }}</code>
-        <button class="chip-x" type="button" :aria-label="`移除条件 ${index + 1}`" @click="session.removeFilter(index)">×</button>
+        <button class="chip-x" type="button" :aria-label="t('grid.filter.removeCondition', { n: index + 1 })" @click="session.removeFilter(index)">×</button>
       </span>
-      <span v-if="session.sort" class="chip">{{ session.sort.column }} {{ session.sort.direction === "asc" ? "升序" : "降序" }}
-        <button class="chip-x" type="button" aria-label="清除排序" @click="session.clearSort()">×</button>
+      <span v-if="session.sort" class="chip">{{ session.sort.column }} {{ session.sort.direction === "asc" ? t("grid.filter.asc") : t("grid.filter.desc") }}
+        <button class="chip-x" type="button" :aria-label="t('grid.filter.clearSort')" @click="session.clearSort()">×</button>
       </span>
-      <p class="toolbar-hint">{{ session.scopeLabel }}，不限于已读取的行。</p>
+      <p class="toolbar-hint">{{ session.scopeLabel }}{{ t("grid.filter.hintWholeTable") }}</p>
       <span class="grow"></span>
       <p v-if="noKeyHint" class="toolbar-hint key-hint">{{ noKeyHint }}</p>
-      <button class="btn sm" type="button" :disabled="!session.canInsert" @click="session.addRow()">新增行</button>
+      <button class="btn sm" type="button" :disabled="!session.canInsert" @click="session.addRow()">{{ t("grid.toolbar.addRow") }}</button>
       <button
         class="btn sm"
         type="button"
         :disabled="!session.canDeleteSelection()"
-        :title="session.store.schema.key.length ? '删除选中的行' : '这张表没有主键，无法唯一确定已有行，不能删除'"
+        :title="session.store.schema.key.length ? t('grid.toolbar.deleteRowTitle') : t('grid.toolbar.noKeyDeleteTitle')"
         @click="session.deleteSelected()"
-      >删除行</button>
-      <button class="btn sm" type="button" :disabled="session.store.schema.kind !== 'table'" @click="importOpen = true">导入</button>
-      <button class="btn sm" type="button" @click="exportOpen = true">导出</button>
+      >{{ t("grid.toolbar.deleteRow") }}</button>
+      <button class="btn sm" type="button" :disabled="session.store.schema.kind !== 'table'" @click="importOpen = true">{{ t("grid.toolbar.import") }}</button>
+      <button class="btn sm" type="button" @click="exportOpen = true">{{ t("grid.toolbar.export") }}</button>
     </div>
     <details v-if="(session.filters.length || session.sort || session.search) && session.sql" class="disclosure grid-sql">
-      <summary>查看这次读取在数据库里执行的 SQL</summary>
+      <summary>{{ t("grid.toolbar.viewSql") }}</summary>
       <div class="disclosure-body"><pre class="sql-code">{{ session.sql }}</pre></div>
     </details>
     <p v-if="filterError" class="grid-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ERROR_ICON" /></svg>{{ filterError }}</p>
     <p v-if="editError && !editing" class="grid-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ERROR_ICON" /></svg>{{ editError }}</p>
     <p v-if="importMessage" class="hint export-message" role="status">{{ importMessage }}</p>
     <p v-if="exportMessage" class="hint export-message" role="status">{{ exportMessage }}</p>
-    <p v-if="session.error" class="grid-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ERROR_ICON" /></svg>读取失败：{{ session.error }}。这不是无匹配结果。筛选条件仍保留。 <button class="btn sm" type="button" :disabled="retrying" @click="retryRead">重试</button></p>
+    <p v-if="session.error" class="grid-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ERROR_ICON" /></svg>{{ t("grid.read.failed", { error: session.error }) }} <button class="btn sm" type="button" :disabled="retrying" @click="retryRead">{{ t("grid.read.retry") }}</button></p>
     <div :ref="setViewport" class="grid-scroll" @scroll.passive="onScroll" @keydown="onGridKeydown">
       <table class="grid-table">
         <thead>
           <tr>
             <th v-for="column in columns" :key="column.name" scope="col" :class="{ num: numericColumn(column) }" :style="columnStyle(column.name)" :data-type="typeCaption(column)" :aria-sort="session.sort?.column === column.name ? (session.sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'">
-              <button class="th-btn" type="button" :aria-label="`按 ${column.name} 排序`" @click="session.cycleSort(column.name)"><span class="th-name">{{ column.name }}</span><span class="col-type">{{ typeCaption(column) }}</span><span v-if="session.sort?.column === column.name" class="sort-arrow" aria-hidden="true">{{ session.sort.direction === "asc" ? "↑" : "↓" }}</span></button>
-              <span class="col-resize" role="separator" :aria-label="`调整 ${column.name} 列宽`" @pointerdown.stop.prevent="startResize(column.name, $event)"></span>
+              <button class="th-btn" type="button" :aria-label="t('grid.read.sortLabel', { column: column.name })" @click="session.cycleSort(column.name)"><span class="th-name">{{ column.name }}</span><span class="col-type">{{ typeCaption(column) }}</span><span v-if="session.sort?.column === column.name" class="sort-arrow" aria-hidden="true">{{ session.sort.direction === "asc" ? "↑" : "↓" }}</span></button>
+              <span class="col-resize" role="separator" :aria-label="t('grid.read.resizeColumn', { column: column.name })" @pointerdown.stop.prevent="startResize(column.name, $event)"></span>
             </th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="padTop" class="virtual-spacer" aria-hidden="true"><td :colspan="columns.length" :style="{ height: `${padTop}px` }"></td></tr>
           <tr v-if="loading">
-            <td class="grid-empty" :colspan="columns.length">正在读取表数据…</td>
+            <td class="grid-empty" :colspan="columns.length">{{ t("grid.read.loading") }}</td>
           </tr>
           <tr v-for="row in visibleRows" :key="row.id" :class="{ 'row-insert': row.kind === 'insert', 'row-delete': row.deleted, 'row-failed': row.failed }" :data-row-id="row.id" :data-located="row.located" :title="row.failure || undefined">
             <td v-for="(column, columnIndex) in columns" :key="column.name" :class="{ num: numericColumn(column) }" :style="columnStyle(column.name)">
               <div v-if="editing && editing.id === row.id && editing.column === column.name" class="editor">
-                <input :ref="focusEditor" v-model="editing.draft" :aria-label="`编辑 ${column.name}`" :disabled="editing.isNull" @keydown="onEditorKeydown" />
-                <button class="btn sm" type="button" :disabled="!column.nullable" @click="editing.isNull = true">设为 NULL</button>
-                <button class="btn sm" type="button" @click="editing.isNull = false">空字符串</button>
-                <button class="btn sm primary" type="button" @click="saveEdit">确定</button>
-                <button class="btn sm ghost" type="button" @click="cancelEdit">取消</button>
+                <input :ref="focusEditor" v-model="editing.draft" :aria-label="t('grid.editor.editColumn', { column: column.name })" :disabled="editing.isNull" @keydown="onEditorKeydown" />
+                <button class="btn sm" type="button" :disabled="!column.nullable" @click="editing.isNull = true">{{ t("grid.editor.setNull") }}</button>
+                <button class="btn sm" type="button" @click="editing.isNull = false">{{ t("grid.editor.emptyString") }}</button>
+                <button class="btn sm primary" type="button" @click="saveEdit">{{ t("common.ok") }}</button>
+                <button class="btn sm ghost" type="button" @click="cancelEdit">{{ t("common.cancel") }}</button>
                 <p v-if="editError" class="menu-error" role="alert">{{ editError }}</p>
               </div>
               <button v-else class="cell-btn" :class="{ on: session.selectedId === row.id && session.selectedColumn === column.name, range: isPicked(row.id, column.name) }" :data-cell="`${row.id}:${column.name}`" type="button" @pointerdown="onCellDown(row.id, column.name, $event)" @pointerenter="onCellEnter(row.id, column.name)" @click="session.select(row.id, column.name)" @contextmenu="onCellMenu(row.id, column.name, $event)" @dblclick="beginEdit(row.id, column.name)">
-                <span v-if="columnIndex === 0 && row.kind === 'insert'" class="row-flag">新增</span>
-                <span v-if="columnIndex === 0 && row.deleted" class="row-flag del">将删除</span>
+                <span v-if="columnIndex === 0 && row.kind === 'insert'" class="row-flag">{{ t("grid.editor.newFlag") }}</span>
+                <span v-if="columnIndex === 0 && row.deleted" class="row-flag del">{{ t("grid.editor.deleteFlag") }}</span>
                 <span :class="{ 'v-null': row.cells[columnIndex]?.kind === 'null', 'v-empty': row.cells[columnIndex]?.kind === 'empty', 'v-large': row.cells[columnIndex]?.kind === 'large' }">{{ row.cells[columnIndex]?.label }}</span>
               </button>
             </td>
           </tr>
           <tr v-if="padBottom" class="virtual-spacer" aria-hidden="true"><td :colspan="columns.length" :style="{ height: `${padBottom}px` }"></td></tr>
           <tr v-if="showEmptyTable" data-empty="table">
-            <td class="grid-empty" :colspan="Math.max(columns.length, 1)">{{ session.store.schema.kind === "view" ? "这个视图没有行。" : "这张表没有行。" }}<button v-if="session.canInsert" class="btn sm" type="button" @click="session.addRow()">新增行</button></td>
+            <td class="grid-empty" :colspan="Math.max(columns.length, 1)">{{ session.store.schema.kind === "view" ? t("grid.read.viewEmpty") : t("grid.read.tableEmpty") }}<button v-if="session.canInsert" class="btn sm" type="button" @click="session.addRow()">{{ t("grid.toolbar.addRow") }}</button></td>
           </tr>
           <tr v-else-if="showNoMatch" data-empty="filter">
-            <td class="grid-empty" :colspan="Math.max(columns.length, 1)">没有匹配行。 <button v-if="session.filters.length" class="btn sm" type="button" @click="clearFilters">清除筛选</button> <button v-if="session.search" class="btn sm" type="button" @click="clearSearch">清除关键字</button></td>
+            <td class="grid-empty" :colspan="Math.max(columns.length, 1)">{{ t("grid.read.noMatch") }} <button v-if="session.filters.length" class="btn sm" type="button" @click="clearFilters">{{ t("grid.read.clearFilters") }}</button> <button v-if="session.search" class="btn sm" type="button" @click="clearSearch">{{ t("grid.read.clearSearch") }}</button></td>
           </tr>
         </tbody>
       </table>
     </div>
     <footer class="grid-foot">
       <template v-if="session.truncated">
-        <span>已读取前 <b>{{ session.loaded.length }}</b> 行，还有匹配的行没有读取。</span>
-        <button class="btn sm" type="button" aria-label="继续读取" @click="session.loadMore()">继续读取</button>
+        <span>{{ t("grid.read.loadedPrefixA") }}<b>{{ session.loaded.length }}</b>{{ t("grid.read.loadedPrefixB", { n: session.loaded.length }) }}</span>
+        <button class="btn sm" type="button" :aria-label="t('grid.read.continueRead')" @click="session.loadMore()">{{ t("grid.read.continueRead") }}</button>
       </template>
-      <span v-else-if="session.loaded.length">已读取全部匹配行（{{ session.loaded.length }} 行）。</span>
+      <span v-else-if="session.loaded.length">{{ t("grid.read.allMatched", { n: session.loaded.length }) }}</span>
       <span class="grow"></span>
-      <button class="btn sm" type="button" @click="session.count()">统计匹配行数</button>
-      <span v-if="session.counted !== null" role="status">共 {{ session.counted }} 行匹配</span>
-      <span v-else class="muted">匹配行数未统计</span>
-      <span v-if="calcStats" class="calc-stat" role="status">已选 {{ calcStats.cells }} 格 · 数值 {{ calcStats.numeric }} 个<template v-if="calcStats.numeric > 0"> · 总和 {{ calcStats.sum }} · 平均 {{ calcStats.avg }} · 最小 {{ calcStats.min }} · 最大 {{ calcStats.max }}</template></span>
+      <button class="btn sm" type="button" @click="session.count()">{{ t("grid.read.countMatches") }}</button>
+      <span v-if="session.counted !== null" role="status">{{ t("grid.read.matchedCount", { n: session.counted }) }}</span>
+      <span v-else class="muted">{{ t("grid.read.countPending") }}</span>
+      <span v-if="calcStats" class="calc-stat" role="status">{{ t("grid.read.stats", { cells: calcStats.cells, numeric: calcStats.numeric }) }}<template v-if="calcStats.numeric > 0">{{ t("grid.read.statsNumeric", { sum: calcStats.sum, avg: calcStats.avg, min: calcStats.min, max: calcStats.max }) }}</template></span>
     </footer>
-    <div v-if="pendingVisible" class="pending-bar" role="region" aria-label="未保存的更改">
-      <span class="badge warn">{{ session.pendingCount }} 处更改未保存</span>
-      <button class="btn sm" type="button" @click="openCommit">查看</button>
+    <div v-if="pendingVisible" class="pending-bar" role="region" :aria-label="t('grid.commit.region')">
+      <span class="badge warn">{{ t("grid.commit.pendingCount", { n: session.pendingCount }) }}</span>
+      <button class="btn sm" type="button" @click="openCommit">{{ t("grid.commit.view") }}</button>
       <button
         class="btn sm danger"
         type="button"
         :data-armed="discardArmed ? 'true' : undefined"
-        :title="discardArmed ? '再次点击，确认放弃全部未保存的更改' : '放弃全部未保存的更改'"
+        :title="discardArmed ? t('grid.commit.discardConfirmTitle') : t('grid.commit.discardTitle')"
         @click="discardAll"
-      >{{ discardArmed ? "确认放弃" : "放弃" }}</button>
-      <button class="btn sm primary" type="button" :disabled="!session.pendingCount" @click="openCommit">提交</button>
+      >{{ discardArmed ? t("grid.commit.discardConfirm") : t("grid.commit.discard") }}</button>
+      <button class="btn sm primary" type="button" :disabled="!session.pendingCount" @click="openCommit">{{ t("grid.commit.submit") }}</button>
       <span v-if="receipt" class="receipt">{{ receipt }}</span>
       <p v-for="failure in commitFailures" :key="failure.id" class="commit-failure" role="alert">{{ failure.message }}</p>
     </div>
     <p v-else-if="receipt" class="commit-receipt" role="status">{{ receipt }}</p>
-    <section v-if="session.selectedId" class="inspector" aria-label="值查看器">
+    <section v-if="session.selectedId" class="inspector" :aria-label="t('grid.value.viewer')">
       <div class="inspector-meta">
-        <span>列 <strong>{{ session.selectedColumn }}</strong></span>
-        <span>值 <em :class="selectedShown.kind === 'null' ? 'v-null' : selectedShown.kind === 'empty' ? 'v-empty' : ''">{{ selectedShown.kind === "null" ? "NULL" : selectedShown.kind === "empty" ? "空字符串（长度 0）" : selectedShown.kind === "large" ? "大字段，当前不是完整值" : selectedShown.title }}</em></span>
+        <span>{{ t("grid.value.column") }} <strong>{{ session.selectedColumn }}</strong></span>
+        <span>{{ t("grid.value.value") }} <em :class="selectedShown.kind === 'null' ? 'v-null' : selectedShown.kind === 'empty' ? 'v-empty' : ''">{{ selectedShown.kind === "null" ? "NULL" : selectedShown.kind === "empty" ? t("grid.value.emptyTitle") : selectedShown.kind === "large" ? t("grid.value.largeCurrent") : selectedShown.title }}</em></span>
       </div>
-      <textarea readonly :value="selectedShown.body" :aria-label="`${session.selectedColumn} 的值`"></textarea>
+      <textarea readonly :value="selectedShown.body" :aria-label="t('grid.value.columnValue', { column: session.selectedColumn })"></textarea>
       <div class="inspector-actions">
-        <button v-if="selectedShown.kind === 'large'" class="btn sm" type="button" @click="fullValue">读取完整值</button>
-        <button class="btn sm" type="button" :disabled="editDisabled()" @click="editSelected">编辑</button>
-        <button class="btn sm" type="button" @click="copySelected(false)">复制值</button>
-        <button class="btn sm" type="button" @click="copySelected(true)">复制为 SQL 值</button>
+        <button v-if="selectedShown.kind === 'large'" class="btn sm" type="button" @click="fullValue">{{ t("grid.value.readFull") }}</button>
+        <button class="btn sm" type="button" :disabled="editDisabled()" @click="editSelected">{{ t("common.edit") }}</button>
+        <button class="btn sm" type="button" @click="copySelected(false)">{{ t("grid.value.copyValue") }}</button>
+        <button class="btn sm" type="button" @click="copySelected(true)">{{ t("grid.value.copySqlValue") }}</button>
         <span v-if="copyMessage" class="copy-message" data-copy>{{ copyMessage }}</span>
       </div>
       <p class="legend">
-        <span><span class="v-null">NULL</span> 空值</span>
-        <span><span class="v-empty">空字符串</span> 长度为 0 的文本</span>
-        <span>灰字「大字段 · N 字节」只预览了开头，读取完整值可看全部</span>
+        <span><span class="v-null">NULL</span> {{ t("grid.value.nullLabel") }}</span>
+        <span><span class="v-empty">{{ t("grid.value.emptyLabel") }}</span> {{ t("grid.value.emptyZeroLength") }}</span>
+        <span>{{ t("grid.value.legendLarge") }}</span>
       </p>
     </section>
     <div v-if="commitOpen" class="overlay" role="presentation" @keydown.esc="commitOpen = false">
-      <div class="sheet" role="dialog" aria-modal="true" aria-label="待提交的更改">
+      <div class="sheet" role="dialog" aria-modal="true" :aria-label="t('grid.commit.title')">
         <header>
           <div>
-            <h2>提交这些更改？</h2>
-            <p class="hint" data-confirm-target>目标：{{ connectionName }} / {{ objectName }} <span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span></p>
-            <p class="hint">将按顺序逐条写入数据库，遇到错误即停止；已写入的不会自动撤销。</p>
+            <h2>{{ t("grid.commit.heading") }}</h2>
+            <p class="hint" data-confirm-target>{{ t("grid.commit.target", { conn: connectionName, object: objectName }) }} <span v-if="environmentLabel" class="env xs" :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span></p>
+            <p class="hint">{{ t("grid.commit.writeRule") }}</p>
           </div>
         </header>
         <div class="body">
@@ -986,9 +987,9 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
           </ol>
         </div>
         <footer>
-          <button class="btn" type="button" @click="commitOpen = false">取消</button>
+          <button class="btn" type="button" @click="commitOpen = false">{{ t("common.cancel") }}</button>
           <span class="grow"></span>
-          <button class="btn primary" type="button" :disabled="!session.pendingCount" @click="commitChangesNow()">提交 {{ session.pendingCount }} 处更改</button>
+          <button class="btn primary" type="button" :disabled="!session.pendingCount" @click="commitChangesNow()">{{ t("grid.commit.submitCount", { n: session.pendingCount }) }}</button>
         </footer>
       </div>
     </div>
@@ -1014,10 +1015,10 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
       @done="onImportDone"
     />
     <div v-if="menu" class="cell-menu" role="menu" :style="{ left: `${menu.x}px`, top: `${menu.y}px` }" @contextmenu.prevent>
-      <button type="button" role="menuitem" @click="copySelection(); menu = null">复制</button>
-      <button type="button" role="menuitem" @click="editFromMenu">编辑</button>
-      <button type="button" role="menuitem" @click="setNullFromMenu">设为 NULL</button>
-      <button v-if="referenceMenuItem" type="button" role="menuitem" data-action="jump-reference" @click="jumpReferenceFromMenu">查看引用行 → {{ referenceMenuItem.label }}</button>
+      <button type="button" role="menuitem" @click="copySelection(); menu = null">{{ t("grid.menu.copy") }}</button>
+      <button type="button" role="menuitem" @click="editFromMenu">{{ t("common.edit") }}</button>
+      <button type="button" role="menuitem" @click="setNullFromMenu">{{ t("grid.editor.setNull") }}</button>
+      <button v-if="referenceMenuItem" type="button" role="menuitem" data-action="jump-reference" @click="jumpReferenceFromMenu">{{ t("grid.menu.jumpReference", { label: referenceMenuItem.label }) }}</button>
       <p v-if="menuError" class="menu-error" role="alert">{{ menuError }}</p>
     </div>
     </template>

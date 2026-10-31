@@ -10,7 +10,8 @@ import RedisTreeKeys from "../redis/RedisTreeKeys.vue";
 import type { RedisApi } from "../redis/api";
 import SchemaBlock from "./SchemaBlock.vue";
 import { catalogConnections, catalogLoadError, refreshCatalog, schemaKey, setStructureFocus } from "./store";
-import { engineShape, isConnected, isDefinitionKind, KIND_LABEL, objectKey, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
+import { tr as t } from "../i18n";
+import { engineShape, isConnected, isDefinitionKind, kindLabel, objectKey, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
 import type { CatalogConnection, DatabaseNode } from "./types";
 
 const props = defineProps<{ filter: string; redisApi?: RedisApi }>();
@@ -63,13 +64,16 @@ const ICONS = {
   trash: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6",
 } as const;
 
-const STATUS_TEXT = {
-  connected: "已连接",
-  disconnected: "未连接",
-  connecting: "正在连接",
-  error: "连接失败",
-  lost: "连接已断开",
-} as const;
+const STATUS_TEXT_KEYS: Record<string, string> = {
+  connected: "connections.status.connected",
+  disconnected: "connections.status.disconnected",
+  connecting: "connections.status.connecting",
+  error: "connections.status.error",
+  lost: "connections.status.lost",
+};
+function statusText(status: string): string {
+  return t(STATUS_TEXT_KEYS[status] ?? "connections.status.disconnected");
+}
 
 const connections = computed(() => catalogConnections());
 const loadError = computed(() => catalogLoadError());
@@ -129,7 +133,7 @@ function sessionGap(database: DatabaseNode) {
 
 /** lost 提示带上分阶段原因（探活失败 / 重连放弃的原因），没有原因时用通用文案。 */
 function lostNote(connection: CatalogConnection): string {
-  const base = "连接已断开，这里显示的是断开前读到的内容，可能不是最新。";
+  const base = t("catalog.tree.lostBase");
   const reason = connection.error?.trim();
   return reason ? `${base}（${reason}）` : base;
 }
@@ -147,7 +151,7 @@ function openDiagram(connection: CatalogConnection, database: string, schema: st
     engine: connection.engine,
     schema,
     path,
-    label: schema ? `${schema} 关系图` : `${database || connection.name} 关系图`,
+    label: t("catalog.tree.diagramLabel", { name: schema || database || connection.name }),
   });
 }
 
@@ -155,13 +159,13 @@ function failureText(error: unknown): string {
   if (typeof error === "string" && error) return error;
   if (error instanceof Error && error.message) return error.message;
   if (error && typeof error === "object" && "message" in error && typeof error.message === "string") return error.message;
-  return "没有连上这个库，原来的会话还在。";
+  return t("catalog.tree.lostNote");
 }
 
 function openFailure(report: OpenOutcome["report"]): string {
-  if (report.status === "wait") return report.hint || "需要先在连接页确认主机身份。";
+  if (report.status === "wait") return report.hint || t("catalog.tree.hostKeyWait");
   const stage = report.stages.find((item) => item.status === "err" && item.message);
-  return stage?.message || report.hint || report.failStage || "没有连上。";
+  return stage?.message || report.hint || report.failStage || t("catalog.tree.notConnected");
 }
 
 async function onRefresh() {
@@ -192,7 +196,8 @@ async function connectSession(connection: CatalogConnection, password = "") {
     if (!outcome.connected) {
       const message = openFailure(outcome.report);
       connectError.value = message;
-      if (message.includes("请填写数据库密码")) passwordFor.value = connection.id;
+      // 后端在连接需要密码时返回中文错误串「请填写数据库密码」——前后端契约标记，与界面语言无关（转义写法避免源码裸中文）。
+      if (message.includes("\u8bf7\u586b\u5199\u6570\u636e\u5e93\u5bc6\u7801")) passwordFor.value = connection.id;
       return;
     }
     passwordFor.value = null;
@@ -268,7 +273,7 @@ function closeMenu() {
 
 function openObject(object: CatalogObjectRef | null, pane: "data" | "structure", section?: "columns" | "drop") {
   if (!object || object.stale) {
-    if (object?.stale && pane === "structure") structureNotice.value = `${object.name} 已失效，不能打开结构。`;
+    if (object?.stale && pane === "structure") structureNotice.value = t("catalog.tree.staleStructure", { name: object.name });
     return;
   }
   // MongoDB 集合（含筛选命中行）：打开集合文档标签，不进表网格（document 引擎能力门控）。
@@ -328,7 +333,7 @@ function onTreeDblClick(event: MouseEvent) {
   if (!row) return;
   const object = readRef(row);
   if (!object || object.stale) {
-    if (object?.stale) structureNotice.value = `${object.name} 已失效，不能打开结构。`;
+    if (object?.stale) structureNotice.value = t("catalog.tree.staleStructure", { name: object.name });
     return;
   }
   if (row.dataset.level === "member") {
@@ -407,7 +412,7 @@ async function onCopy() {
     await navigator.clipboard.writeText(qualifiedObjectName(object.engine, object.schema, object.name));
     closeMenu();
   } catch {
-    if (menu.value) menu.value = { ...menu.value, notice: "无法写入剪贴板" };
+    if (menu.value) menu.value = { ...menu.value, notice: t("catalog.tree.clipboardFailed") };
   }
 }
 
@@ -434,11 +439,11 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="tree" role="tree" aria-label="数据库对象" @click="onTreeClick" @dblclick="onTreeDblClick" @contextmenu="onContextMenu" @keydown="onTreeKeydown" @scroll="closeMenu">
+  <div class="tree" role="tree" :aria-label="t('catalog.tree.label')" @click="onTreeClick" @dblclick="onTreeDblClick" @contextmenu="onContextMenu" @keydown="onTreeKeydown" @scroll="closeMenu">
     <div class="tree-toolbar">
-      <button class="btn ghost sm" type="button" data-action="tree-refresh" aria-label="刷新对象列表" :disabled="refreshing" @click="onRefresh">
+      <button class="btn ghost sm" type="button" data-action="tree-refresh" :aria-label="t('catalog.tree.refresh')" :disabled="refreshing" @click="onRefresh">
         <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.refresh" /></svg>
-        {{ refreshing ? "正在刷新…" : "刷新" }}
+        {{ refreshing ? t("catalog.tree.refreshing") : t("catalog.tree.refreshButton") }}
       </button>
     </div>
     <div v-if="structureNotice" class="tree-note err" data-structure-notice>
@@ -448,15 +453,15 @@ onBeforeUnmount(() => {
     <div v-if="loadError" class="tree-note err" data-load-error>
       <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>
       <div>
-        <strong>对象列表没读出来</strong>
+        <strong>{{ t("catalog.tree.loadFailed") }}</strong>
         <span class="reason">{{ loadError }}</span>
         <span class="tree-note-acts">
-          <button class="btn sm" type="button" data-action="tree-retry" @click="onRefresh">重试</button>
+          <button class="btn sm" type="button" data-action="tree-retry" @click="onRefresh">{{ t("catalog.tree.retry") }}</button>
         </span>
       </div>
     </div>
     <template v-if="filter.trim()">
-      <div class="tree-filter-head">找到 {{ matches.hits.length }} 个名称包含“{{ filter.trim() }}”的对象</div>
+      <div class="tree-filter-head">{{ t("catalog.tree.foundCount", { n: matches.hits.length, filter: filter.trim() }) }}</div>
       <div
         v-for="hit in matches.hits"
         :key="hit.id"
@@ -485,23 +490,23 @@ onBeforeUnmount(() => {
           <span class="hit-path">
             <span v-if="hit.env !== 'none' && hit.envTone !== 'none'" class="env xs" :class="`env-${hit.envTone}`">{{ hit.envLabel }}</span>
             {{ hit.path }}
-            <span v-if="hit.stale" class="badge err" title="这个对象已在外部被删除，下次刷新后不再显示">已失效</span>
+            <span v-if="hit.stale" class="badge err" :title="t('catalog.tree.staleTitle')">{{ t("catalog.tree.staleBadge") }}</span>
           </span>
         </span>
       </div>
       <div v-if="matches.hits.length === 0" class="tree-note" style="--d: 0">
         <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.info" /></svg>
-        <span>已连接的数据库里没有名称包含“{{ filter.trim() }}”的表或视图</span>
+        <span>{{ t("catalog.tree.noMatch", { filter: filter.trim() }) }}</span>
       </div>
       <div v-if="matches.skipped.length" class="tree-note subtle" style="--d: 0" data-skipped>
         <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.info" /></svg>
-        <span>{{ matches.skipped.join("、") }} 未连接，没有参与筛选</span>
+        <span>{{ t("catalog.tree.skippedNote", { list: matches.skipped.join(", ") }) }}</span>
       </div>
     </template>
     <div v-else-if="connections.length === 0 && !loadError" class="tree-note tree-empty">
       <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.info" /></svg>
-      <span>还没有打开的连接。新建连接后，这里会列出数据库、schema 和表。</span>
-      <button class="btn sm" type="button" data-action="tree-new-connection" @click="emit('new-connection')">新建连接</button>
+      <span>{{ t("catalog.tree.empty") }}</span>
+      <button class="btn sm" type="button" data-action="tree-new-connection" @click="emit('new-connection')">{{ t("common.newConnection") }}</button>
     </div>
     <template v-else>
       <section v-for="connection in connections" :key="connection.id" :data-engine="connection.engine" :data-connection="connection.id">
@@ -512,7 +517,7 @@ onBeforeUnmount(() => {
           tabindex="0"
           :style="depthStyle(0)"
           :aria-expanded="open(`c:${connection.id}`)"
-          :title="`${connection.name} · ${engineMeta(connection.engine).label} · ${STATUS_TEXT[connection.status]}`"
+          :title="`${connection.name} · ${engineMeta(connection.engine).label} · ${statusText(connection.status)}`"
           @click="onConnectionRow(connection)"
         >
           <span class="tw" @click.stop="toggle(`c:${connection.id}`)">
@@ -531,10 +536,10 @@ onBeforeUnmount(() => {
               :disabled="connecting === connection.id || connection.status === 'connecting'"
               @click.stop="connectSession(connection)"
             >
-              {{ connecting === connection.id ? "正在连接…" : connection.status === "lost" ? "重新连接" : "连接" }}
+              {{ connecting === connection.id ? t("catalog.tree.connecting") : connection.status === "lost" ? t("catalog.tree.reconnect") : t("catalog.tree.connect") }}
             </button>
             <span class="conn-state" :class="`st-${connection.status}`">
-              <i></i><span v-if="connection.status !== 'connected'">{{ STATUS_TEXT[connection.status] }}</span>
+              <i></i><span v-if="connection.status !== 'connected'">{{ statusText(connection.status) }}</span>
             </span>
           </span>
         </div>
@@ -542,10 +547,10 @@ onBeforeUnmount(() => {
           <div v-if="!isConnected(connection.status)" class="tree-note" :class="{ warn: connection.status === 'lost' }" :style="depthStyle(1)" data-disconnected>
             <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="connection.status === 'lost' ? ICONS.warn : ICONS.info" /></svg>
             <div>
-              <span>{{ connection.status === "lost" ? lostNote(connection) : "未连接——连接后才会读取这里的表。" }}</span>
+              <span>{{ connection.status === "lost" ? lostNote(connection) : t("catalog.tree.disconnectedNote") }}</span>
               <form v-if="passwordFor === connection.id" class="tree-connect" @submit.prevent="connectSession(connection, typedPassword)">
-                <input v-model="typedPassword" type="password" autocomplete="current-password" aria-label="数据库密码" />
-                <button class="btn sm primary" type="submit" data-action="tree-connect" :data-connection="connection.id" :disabled="connecting === connection.id">连接</button>
+                <input v-model="typedPassword" type="password" autocomplete="current-password" :aria-label="t('catalog.tree.passwordLabel')" />
+                <button class="btn sm primary" type="submit" data-action="tree-connect" :data-connection="connection.id" :disabled="connecting === connection.id">{{ t("catalog.tree.connect") }}</button>
               </form>
               <span v-if="connectError && connectTarget === connection.id" class="tree-inline-err" data-connect-error>{{ connectError }}</span>
             </div>
@@ -554,10 +559,10 @@ onBeforeUnmount(() => {
           <div v-if="connection.error" class="tree-note err" data-connection-error :style="depthStyle(1)">
             <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>
             <div>
-              <strong>对象列表没读出来</strong>
+              <strong>{{ t("catalog.tree.loadFailed") }}</strong>
               <span class="reason">{{ connection.error }}</span>
               <span class="tree-note-acts">
-                <button class="btn sm" type="button" data-action="tree-retry" @click="onRefresh">重试</button>
+                <button class="btn sm" type="button" data-action="tree-retry" @click="onRefresh">{{ t("catalog.tree.retry") }}</button>
               </span>
             </div>
           </div>
@@ -568,7 +573,7 @@ onBeforeUnmount(() => {
           <template v-else-if="!engineShape(connection.engine).databases">
             <div v-if="connection.foreignKeys !== null" class="tree-note subtle" :style="depthStyle(1)" data-foreign-keys>
               <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.info" /></svg>
-              <span>SQLite 的外键约束：{{ connection.foreignKeys ? "已开启" : "已关闭" }}（foreign_keys = {{ connection.foreignKeys ? "ON" : "OFF" }}）</span>
+              <span>{{ t("catalog.tree.fkLine", { state: connection.foreignKeys ? t("catalog.tree.fkOn") : t("catalog.tree.fkOff"), value: connection.foreignKeys ? "ON" : "OFF" }) }}</span>
             </div>
             <template v-for="database in connection.databases" :key="database.name">
               <button
@@ -584,7 +589,7 @@ onBeforeUnmount(() => {
               >
                 <span class="tw"></span>
                 <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.diagram" /></svg>
-                <span class="tr-name">关系图</span>
+                <span class="tr-name">{{ t("catalog.tree.diagram") }}</span>
               </button>
               <SchemaBlock
                 v-for="schema in database.schemas"
@@ -614,13 +619,13 @@ onBeforeUnmount(() => {
                 </span>
                 <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.database" /></svg>
                 <span class="tr-name">{{ database.name }}</span>
-                <span v-if="database.name === connection.defaultDatabase" class="badge current-db" title="当前会话连接的数据库">当前</span>
+                <span v-if="database.name === connection.defaultDatabase" class="badge current-db" :title="t('catalog.tree.currentDatabaseTitle')">{{ t("catalog.tree.currentDatabase") }}</span>
               </div>
               <template v-if="open(`d:${connection.id}:${database.name}`)">
                 <div v-if="sessionGap(database)" class="tree-note" :style="depthStyle(2)" data-other-database>
                   <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.info" /></svg>
                   <div>
-                    <span>这条会话现在连在 {{ sessionGap(database)?.current }}，PostgreSQL 一次只能读取一个库。要浏览 {{ database.name }} 的表，先把会话连过去。</span>
+                    <span>{{ t("catalog.tree.sessionGapNote", { current: sessionGap(database)?.current, database: database.name }) }}</span>
                     <span class="tree-note-acts">
                       <button
                         class="btn sm"
@@ -629,10 +634,10 @@ onBeforeUnmount(() => {
                         :data-database="database.name"
                         :data-connection="connection.id"
                         :disabled="focusing === focusKey(connection.id, database.name)"
-                        :title="`把当前会话改连到 ${database.name}。正在执行的语句会断开，已保存的连接配置不变。`"
+                        :title="t('catalog.tree.focusTitle', { name: database.name })"
                         @click.stop="focusSession(connection, database.name)"
                       >
-                        {{ focusing === focusKey(connection.id, database.name) ? "正在连接…" : `连接到 ${database.name}` }}
+                        {{ focusing === focusKey(connection.id, database.name) ? t("catalog.tree.connecting") : t("catalog.tree.connectTo", { name: database.name }) }}
                       </button>
                     </span>
                     <span v-if="focusError && focusTarget === focusKey(connection.id, database.name)" class="tree-inline-err" data-focus-error>{{ focusError }}</span>
@@ -641,10 +646,10 @@ onBeforeUnmount(() => {
                 <div v-else-if="database.error" class="tree-note err" :style="depthStyle(2)">
                   <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>
                   <div>
-                    <strong>对象列表没读出来</strong>
+                    <strong>{{ t("catalog.tree.loadFailed") }}</strong>
                     <span class="reason">{{ database.error }}</span>
                     <span class="tree-note-acts">
-                      <button class="btn sm" type="button" data-action="tree-retry" @click="onRefresh">重试</button>
+                      <button class="btn sm" type="button" data-action="tree-retry" @click="onRefresh">{{ t("catalog.tree.retry") }}</button>
                     </span>
                   </div>
                 </div>
@@ -661,7 +666,7 @@ onBeforeUnmount(() => {
                   @click.stop="openDiagram(connection, database.name, '')"
                 >
                   <span class="tw"></span>
-                  <span class="tr-name">关系图</span>
+                  <span class="tr-name">{{ t("catalog.tree.diagram") }}</span>
                 </button>
                 <template v-for="schema in database.schemas" :key="`${database.name}:${schema.name}`">
                   <div
@@ -699,7 +704,7 @@ onBeforeUnmount(() => {
                   >
                     <span class="tw"></span>
                     <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.diagram" /></svg>
-                    <span class="tr-name">关系图</span>
+                    <span class="tr-name">{{ t("catalog.tree.diagram") }}</span>
                   </button>
                   <SchemaBlock
                     v-if="!engineShape(connection.engine).schemas || open(schemaKey(connection.id, database.name, schema.name))"
@@ -724,40 +729,40 @@ onBeforeUnmount(() => {
       class="menu object-menu"
       data-menu="object"
       role="menu"
-      :aria-label="`${menu.object.name} 的操作`"
+      :aria-label="t('catalog.tree.menuLabel', { name: menu.object.name })"
       :style="{ left: `${menu.x}px`, top: `${menu.y}px` }"
       @click.stop
       @contextmenu.prevent
     >
-      <div class="menu-head">{{ menu.object.name }} · {{ KIND_LABEL[menu.object.kind] }}</div>
-      <div v-if="menu.object.stale" class="menu-head">这个对象已失效——它在外部被删除，不能再打开</div>
+      <div class="menu-head">{{ menu.object.name }} · {{ kindLabel(menu.object.kind) }}</div>
+      <div v-if="menu.object.stale" class="menu-head">{{ t("catalog.tree.menuStale") }}</div>
       <template v-if="menu.object.kind === 'table' || menu.object.kind === 'view'">
         <button class="menu-item" type="button" data-action="open-data" :disabled="menu.object.stale" @click="openObject(menu.object, 'data')">
-          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.table" /></svg>打开数据
+          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.table" /></svg>{{ t("catalog.tree.openData") }}
         </button>
         <button class="menu-item" type="button" data-action="open-structure" :disabled="menu.object.stale" @click="openObject(menu.object, 'structure', 'columns')">
-          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.structure" /></svg>查看结构
+          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.structure" /></svg>{{ t("catalog.tree.viewStructure") }}
         </button>
         <button class="menu-item" type="button" data-action="new-query" :disabled="menu.object.stale" :title="browseSql(menu.object.engine, menu.object.schema, menu.object.name)" @click="onQuery">
-          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.query" /></svg>新建查询
+          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.query" /></svg>{{ t("common.newQuery") }}
         </button>
       </template>
       <template v-else>
         <button class="menu-item" type="button" data-action="open-definition" :disabled="menu.object.stale" @click="onDefine">
-          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.braces" /></svg>查看定义
+          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.braces" /></svg>{{ t("catalog.tree.viewDefinition") }}
         </button>
         <button class="menu-item" type="button" data-action="copy-definition" :disabled="menu.object.stale" @click="onCopyDefinition">
-          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.copy" /></svg>复制到新查询
+          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.copy" /></svg>{{ t("catalog.tree.copyToQuery") }}
         </button>
       </template>
       <button class="menu-item" type="button" data-action="copy-name" @click="onCopy">
-        <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.tag" /></svg>复制完整名称
+        <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.tag" /></svg>{{ t("catalog.tree.copyFullName") }}
       </button>
       <div v-if="menu.notice" class="menu-head">{{ menu.notice }}</div>
       <template v-if="menu.object.kind === 'table'">
         <div class="menu-sep" role="separator"></div>
         <button class="menu-item danger" type="button" data-action="drop-table" :disabled="menu.object.stale" @click="openObject(menu.object, 'structure', 'drop')">
-          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.trash" /></svg>删除表…
+          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.trash" /></svg>{{ t("catalog.tree.dropTable") }}
         </button>
       </template>
     </div>

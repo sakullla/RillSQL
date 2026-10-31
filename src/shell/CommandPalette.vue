@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
-import { filterPalette, type PaletteItem } from "./commands";
+import { filterPalette, paletteGroupLabel, type PaletteItem } from "./commands";
+import { tr as t } from "../i18n";
 import ChordKeys from "./ChordKeys.vue";
 import Icon from "./Icon.vue";
 
@@ -52,13 +53,13 @@ function onKey(event: KeyboardEvent) {
 
 <template>
   <div v-if="open" id="palette" @mousedown.self="emit('close')">
-    <div class="pal-box" role="dialog" aria-label="命令面板">
+    <div class="pal-box" role="dialog" :aria-label="t('shell.palette.title')">
       <label class="pal-input">
         <Icon :name="mode === 'tables' ? 'table' : 'search'" />
         <input
           ref="input"
           v-model="query"
-          :placeholder="mode === 'tables' ? '输入表名，在所有已连接的数据库中查找' : '搜索表、连接或命令（输入 > 只看命令）'"
+          :placeholder="mode === 'tables' ? t('shell.palette.placeholderTables') : t('shell.palette.placeholderAll')"
           autocomplete="off"
           spellcheck="false"
           role="combobox"
@@ -69,11 +70,11 @@ function onKey(event: KeyboardEvent) {
       </label>
       <div id="pal-list" class="pal-list" role="listbox">
         <p v-if="!visible.length" class="pal-none">
-          {{ mode === "tables" ? "没有匹配的表。" : "没有匹配项" }}
+          {{ mode === "tables" ? t("shell.palette.noTables") : t("shell.palette.noMatch") }}
         </p>
         <template v-else>
           <template v-for="(item, index) in visible" :key="item.id">
-            <div v-if="index === 0 || visible[index - 1]?.group !== item.group" class="pal-group">{{ item.group }}</div>
+            <div v-if="index === 0 || visible[index - 1]?.group !== item.group" class="pal-group">{{ paletteGroupLabel(item.group) }}</div>
             <button
               class="pal-item"
               :class="{ active: index === active }"
@@ -92,11 +93,11 @@ function onKey(event: KeyboardEvent) {
         </template>
       </div>
       <div class="pal-foot">
-        <span><ChordKeys chord="Up" /><ChordKeys chord="Down" /> 选择</span>
-        <span><ChordKeys chord="Enter" /> 打开</span>
-        <span><ChordKeys chord="Esc" /> 关闭</span>
+        <span><ChordKeys chord="Up" /><ChordKeys chord="Down" /> {{ t("shell.palette.hintSelect") }}</span>
+        <span><ChordKeys chord="Enter" /> {{ t("shell.palette.hintOpen") }}</span>
+        <span><ChordKeys chord="Esc" /> {{ t("common.close") }}</span>
         <span class="grow"></span>
-        <span>{{ mode === "tables" ? "结果显示所属连接与 schema" : "输入 > 只搜索命令" }}</span>
+        <span>{{ mode === "tables" ? t("shell.palette.hintTables") : t("shell.palette.hintCommands") }}</span>
       </div>
     </div>
   </div>

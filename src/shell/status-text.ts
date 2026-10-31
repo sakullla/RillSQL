@@ -1,29 +1,50 @@
-export const CONNECTION_STATUS_TEXT = {
-  connected: "已连接",
-  disconnected: "未连接",
-  connecting: "正在连接",
-  error: "连接失败",
-  lost: "连接已断开",
-} as const;
+import { tr } from "../i18n";
 
-export type ConnectionStatus = keyof typeof CONNECTION_STATUS_TEXT;
+/** 连接状态枚举：状态字走字典 shell.status.*（原来是常量表，i18n 后改为函数按当前语言取值）。 */
+export type ConnectionStatus = "connected" | "disconnected" | "connecting" | "error" | "lost";
 
-export const ENVIRONMENT_LABELS = {
-  dev: "开发",
-  test: "测试",
-  prod: "生产",
-  local: "本地",
-} as const;
+const CONNECTION_STATUS_KEYS: Record<ConnectionStatus, string> = {
+  connected: "shell.status.connected",
+  disconnected: "shell.status.disconnected",
+  connecting: "shell.status.connecting",
+  error: "shell.status.error",
+  lost: "shell.status.lost",
+};
+
+export function isConnectionStatus(status: unknown): status is ConnectionStatus {
+  return typeof status === "string" && status in CONNECTION_STATUS_KEYS;
+}
+
+export function connectionStatusText(status: ConnectionStatus): string {
+  return tr(CONNECTION_STATUS_KEYS[status]);
+}
+
+export type EnvironmentTag = "dev" | "test" | "prod" | "local";
+
+const ENVIRONMENT_KEYS: Record<EnvironmentTag, string> = {
+  dev: "shell.environment.dev",
+  test: "shell.environment.test",
+  prod: "shell.environment.prod",
+  local: "shell.environment.local",
+};
+
+export function environmentLabel(tag: EnvironmentTag): string {
+  return tr(ENVIRONMENT_KEYS[tag]);
+}
 
 /** 进行中操作的四态（R4）：状态用文字表达，颜色只作辅助。 */
-export const OPERATION_STATE_TEXT = {
-  running: "进行中",
-  ok: "成功",
-  error: "失败",
-  unknown: "结果未知",
-} as const;
+export type OperationState = "running" | "ok" | "error" | "unknown";
 
-export type OperationState = keyof typeof OPERATION_STATE_TEXT;
+const OPERATION_STATE_KEYS: Record<OperationState, string> = {
+  running: "shell.status.running",
+  ok: "shell.status.ok",
+  error: "shell.status.failed",
+  unknown: "shell.status.unknown",
+};
+
+export function operationStateText(state: OperationState): string {
+  return tr(OPERATION_STATE_KEYS[state]);
+}
 
 export interface OperationActivity {
   state: OperationState;

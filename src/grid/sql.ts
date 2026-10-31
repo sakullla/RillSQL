@@ -126,14 +126,14 @@ export function compileWhere(schema: TableSchema, filters: readonly Filter[]): {
   const parts: string[] = [];
   for (const filter of filters) {
     const column = schema.columns.find((item) => item.name === filter.column);
-    if (!column) return { ok: false, error: `未知列 ${filter.column}，不能拼接手写条件` };
+    if (!column) return { ok: false, error: tr("grid.sql.unknownColumn", { column: filter.column }) };
     if (filter.op === "between") {
-      if (!filter.value || !filter.second) return { ok: false, error: "between 需要两个值" };
+      if (!filter.value || !filter.second) return { ok: false, error: tr("grid.live.betweenNeedsTwo") };
       parts.push(filterClause(schema.engine, column, filter));
       continue;
     }
     if (filter.op === "in") {
-      if (!filter.values?.length) return { ok: false, error: "IN 筛选至少要一个值" };
+      if (!filter.values?.length) return { ok: false, error: tr("grid.live.inNeedsValue") };
       parts.push(filterClause(schema.engine, column, filter));
       continue;
     }
@@ -141,7 +141,7 @@ export function compileWhere(schema: TableSchema, filters: readonly Filter[]): {
       parts.push(filterClause(schema.engine, column, filter));
       continue;
     }
-    if (filter.value === undefined || filter.value === "") return { ok: false, error: "筛选值不能为空" };
+    if (filter.value === undefined || filter.value === "") return { ok: false, error: tr("grid.live.filterValueEmpty") };
     parts.push(filterClause(schema.engine, column, filter));
   }
   return { ok: true, sql: parts.join(" AND ") };
@@ -208,11 +208,11 @@ export function selectExportGate(sql: string, engine = "postgres"): SelectGate {
   const report = inspectSql(sql, engine);
   if (report.refusal) return { ok: false, reason: report.refusal, statement: null };
   const statements = report.pieces.map((piece) => piece.text.trim()).filter(Boolean);
-  if (!statements.length) return { ok: false, reason: "没有可导出的语句", statement: null };
-  if (statements.length > 1) return { ok: false, reason: "完整导出只接受单条 SELECT 语句", statement: null };
+  if (!statements.length) return { ok: false, reason: tr("grid.sql.noExportableStatement"), statement: null };
+  if (statements.length > 1) return { ok: false, reason: tr("grid.sql.singleSelectOnly"), statement: null };
   const statement = statements[0]!;
   const keyword = /^[A-Za-z]+/.exec(statement)?.[0]?.toUpperCase() ?? "";
-  if (keyword !== "SELECT") return { ok: false, reason: "只有 SELECT 可以重新执行并完整导出", statement };
+  if (keyword !== "SELECT") return { ok: false, reason: tr("grid.sql.selectOnly"), statement };
   return { ok: true, reason: null, statement };
 }
 
@@ -220,3 +220,5 @@ export function selectExportGate(sql: string, engine = "postgres"): SelectGate {
 export function splitSql(sql: string, engine = "postgres"): string[] {
   return inspectSql(sql, engine).pieces.map((piece) => piece.text).filter((text) => text.trim().length > 0);
 }
+
+import { tr } from "../i18n";
