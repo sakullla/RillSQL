@@ -1,5 +1,5 @@
 {
-  "capturedAt": "2026-10-31T08:00:00.513Z",
+  "capturedAt": "2026-10-31T16:29:59.005Z",
   "synthetic": true,
   "invocation": "node scripts/capture-ui.mjs",
   "previewUrl": "http://localhost:1420",
@@ -33,11 +33,13 @@
     "settings",
     "command-palette",
     "shortcuts",
-    "title-theme"
+    "title-theme",
+    "connections-en",
+    "query-en"
   ],
   "missing": [],
   "success": true,
-  "imageCount": 114,
+  "imageCount": 126,
   "captures": [
     {
       "name": "welcome",
@@ -211,6 +213,24 @@
       "state": "外观、数据读取、执行与复制、本机数据和关于"
     },
     {
+      "name": "connections-en",
+      "title": "连接管理（英文）",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "connections-en-light-1360.png",
+      "state": "英文界面语言下的连接管理页（已连接与未连接卡片）"
+    },
+    {
+      "name": "query-en",
+      "title": "查询结果（英文）",
+      "theme": "light",
+      "width": 1360,
+      "height": 1000,
+      "file": "query-en-light-1360.png",
+      "state": "英文界面语言下的查询结果（含执行目标与只读结果徽标）"
+    },
+    {
       "name": "welcome",
       "title": "欢迎页与资源管理器",
       "theme": "dark",
@@ -380,6 +400,24 @@
       "height": 1000,
       "file": "settings-dark-1360.png",
       "state": "外观、数据读取、执行与复制、本机数据和关于"
+    },
+    {
+      "name": "connections-en",
+      "title": "连接管理（英文）",
+      "theme": "dark",
+      "width": 1360,
+      "height": 1000,
+      "file": "connections-en-dark-1360.png",
+      "state": "英文界面语言下的连接管理页（已连接与未连接卡片）"
+    },
+    {
+      "name": "query-en",
+      "title": "查询结果（英文）",
+      "theme": "dark",
+      "width": 1360,
+      "height": 1000,
+      "file": "query-en-dark-1360.png",
+      "state": "英文界面语言下的查询结果（含执行目标与只读结果徽标）"
     },
     {
       "name": "welcome",
@@ -553,6 +591,24 @@
       "state": "外观、数据读取、执行与复制、本机数据和关于"
     },
     {
+      "name": "connections-en",
+      "title": "连接管理（英文）",
+      "theme": "light",
+      "width": 900,
+      "height": 1000,
+      "file": "connections-en-light-900.png",
+      "state": "英文界面语言下的连接管理页（已连接与未连接卡片）"
+    },
+    {
+      "name": "query-en",
+      "title": "查询结果（英文）",
+      "theme": "light",
+      "width": 900,
+      "height": 1000,
+      "file": "query-en-light-900.png",
+      "state": "英文界面语言下的查询结果（含执行目标与只读结果徽标）"
+    },
+    {
       "name": "welcome",
       "title": "欢迎页与资源管理器",
       "theme": "dark",
@@ -722,6 +778,24 @@
       "height": 1000,
       "file": "settings-dark-900.png",
       "state": "外观、数据读取、执行与复制、本机数据和关于"
+    },
+    {
+      "name": "connections-en",
+      "title": "连接管理（英文）",
+      "theme": "dark",
+      "width": 900,
+      "height": 1000,
+      "file": "connections-en-dark-900.png",
+      "state": "英文界面语言下的连接管理页（已连接与未连接卡片）"
+    },
+    {
+      "name": "query-en",
+      "title": "查询结果（英文）",
+      "theme": "dark",
+      "width": 900,
+      "height": 1000,
+      "file": "query-en-dark-900.png",
+      "state": "英文界面语言下的查询结果（含执行目标与只读结果徽标）"
     },
     {
       "name": "welcome",
@@ -895,6 +969,24 @@
       "state": "外观、数据读取、执行与复制、本机数据和关于"
     },
     {
+      "name": "connections-en",
+      "title": "连接管理（英文）",
+      "theme": "light",
+      "width": 640,
+      "height": 1000,
+      "file": "connections-en-light-640.png",
+      "state": "英文界面语言下的连接管理页（已连接与未连接卡片）"
+    },
+    {
+      "name": "query-en",
+      "title": "查询结果（英文）",
+      "theme": "light",
+      "width": 640,
+      "height": 1000,
+      "file": "query-en-light-640.png",
+      "state": "英文界面语言下的查询结果（含执行目标与只读结果徽标）"
+    },
+    {
       "name": "welcome",
       "title": "欢迎页与资源管理器",
       "theme": "dark",
@@ -1064,6 +1156,24 @@
       "height": 1000,
       "file": "settings-dark-640.png",
       "state": "外观、数据读取、执行与复制、本机数据和关于"
+    },
+    {
+      "name": "connections-en",
+      "title": "连接管理（英文）",
+      "theme": "dark",
+      "width": 640,
+      "height": 1000,
+      "file": "connections-en-dark-640.png",
+      "state": "英文界面语言下的连接管理页（已连接与未连接卡片）"
+    },
+    {
+      "name": "query-en",
+      "title": "查询结果（英文）",
+      "theme": "dark",
+      "width": 640,
+      "height": 1000,
+      "file": "query-en-dark-640.png",
+      "state": "英文界面语言下的查询结果（含执行目标与只读结果徽标）"
     }
   ],
   "failures": []

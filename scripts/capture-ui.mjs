@@ -411,7 +411,7 @@ try {
         if (selectedScenarios.includes("connections-en") || selectedScenarios.includes("query-en")) {
           await page.getByRole("combobox", { name: "界面语言" }).click();
           await page.getByRole("option", { name: "English", exact: true }).click();
-          await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
+          await expect(page.getByRole("heading", { name: "Settings", exact: true })).toBeVisible();
 
           await page.getByRole("navigation", { name: "Main navigation" }).getByRole("button", { name: "Connections" }).click();
           await page.getByRole("heading", { name: "Connections" }).waitFor();

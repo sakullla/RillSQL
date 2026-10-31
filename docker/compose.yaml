@@ -73,7 +73,10 @@ services:
       start_period: 30s
 
   mssql-init:
-    image: mcr.microsoft.com/mssql/tools18
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    # tools18 独立镜像已不可拉取（MCR 无 latest/版本标签）；2022 server 镜像自带 /opt/mssql-tools18/bin/sqlcmd。
+    # 覆写 entrypoint 以免 server 启动脚本吞掉 seed 命令。
+    entrypoint: ["bash", "-c"]
     depends_on:
       mssql:
         condition: service_healthy
@@ -81,11 +84,10 @@ services:
       MSSQL_SA_PASSWORD: "Rillsql-Passw0rd!"
     volumes:
       - ./init/mssql-seed.sql:/seed/mssql-seed.sql:ro
-    command: >
-      bash -c "
-        /opt/mssql-tools18/bin/sqlcmd -C -b -S mssql -U sa -P \"$$MSSQL_SA_PASSWORD\" -d master -Q \"IF DB_ID('rillsql') IS NULL CREATE DATABASE rillsql\"
-        && /opt/mssql-tools18/bin/sqlcmd -C -b -f 65001 -S mssql -U sa -P \"$$MSSQL_SA_PASSWORD\" -d rillsql -i /seed/mssql-seed.sql
-      "
+    command:
+      - >-
+        /opt/mssql-tools18/bin/sqlcmd -C -b -S mssql -U sa -P "$$MSSQL_SA_PASSWORD" -d master -Q "IF DB_ID('rillsql') IS NULL CREATE DATABASE rillsql"
+        && /opt/mssql-tools18/bin/sqlcmd -C -b -f 65001 -S mssql -U sa -P "$$MSSQL_SA_PASSWORD" -d rillsql -i /seed/mssql-seed.sql
     restart: "no"
 
   # Redis 7 夹具（R11）：--requirepass 密码认证；seed 由 redis-init 容器 healthy 后执行。

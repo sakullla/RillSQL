@@ -12,7 +12,7 @@ RILLSQL_PREVIEW_URL=http://localhost:1420 node scripts/capture-ui.mjs
 
 `--theme light|dark|all`、`--size 1360,900,640`、`--only 'connection-*'` 可缩小范围，`--list` 列出场景。RILLSQL_CAPTURE_OUT 可指定输出目录。预览地址默认 http://localhost:1420。
 
-本次生成 114 张图片，0 项检查失败。合成 IPC 数据仅用于界面检查，不构成真实数据库、SSH 或平台验收。
+本次生成 126 张图片，0 项检查失败。合成 IPC 数据仅用于界面检查，不构成真实数据库、SSH 或平台验收。
 
 | 场景 | 图片 |
 | --- | --- |
@@ -35,3 +35,5 @@ RILLSQL_PREVIEW_URL=http://localhost:1420 node scripts/capture-ui.mjs
 | 查询历史（成功、失败，以及原连接已删除） | [light 1360](history-light-1360.png) · [dark 1360](history-dark-1360.png) · [light 900](history-light-900.png) · [dark 900](history-dark-900.png) · [light 640](history-light-640.png) · [dark 640](history-dark-640.png) |
 | 保存的查询（保存的名称与 SQL，旧连接需要重选执行目标） | [light 1360](history-saved-light-1360.png) · [dark 1360](history-saved-dark-1360.png) · [light 900](history-saved-light-900.png) · [dark 900](history-saved-dark-900.png) · [light 640](history-saved-light-640.png) · [dark 640](history-saved-dark-640.png) |
 | 设置（外观、数据读取、执行与复制、本机数据和关于） | [light 1360](settings-light-1360.png) · [dark 1360](settings-dark-1360.png) · [light 900](settings-light-900.png) · [dark 900](settings-dark-900.png) · [light 640](settings-light-640.png) · [dark 640](settings-dark-640.png) |
+| 连接管理（英文）（英文界面语言下的连接管理页（已连接与未连接卡片）） | [light 1360](connections-en-light-1360.png) · [dark 1360](connections-en-dark-1360.png) · [light 900](connections-en-light-900.png) · [dark 900](connections-en-dark-900.png) · [light 640](connections-en-light-640.png) · [dark 640](connections-en-dark-640.png) |
+| 查询结果（英文）（英文界面语言下的查询结果（含执行目标与只读结果徽标）） | [light 1360](query-en-light-1360.png) · [dark 1360](query-en-dark-1360.png) · [light 900](query-en-light-900.png) · [dark 900](query-en-dark-900.png) · [light 640](query-en-light-640.png) · [dark 640](query-en-dark-640.png) |
