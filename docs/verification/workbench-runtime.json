@@ -18,10 +18,15 @@
     "Capability gating: the SQL executor target list has no redis or mongodb connection",
     "MongoDB: collection tree with counts, docs grid with _id columns, located filter errors, JSON edit interception, insert id report, delete confirm with count",
     "Engine selector shows exactly seven engines with MongoDB and no eighth entry (R14)",
+    "Language switches to English instantly from the settings row",
+    "English locale: major surfaces (connections/history headings, palette, titlebar, statusbar, rail) show no Chinese leftovers",
+    "English locale: failed connection test maps stage kinds and error codes to dictionary text with no Chinese leftovers",
+    "Switching back to Chinese restores every checked surface in Chinese",
+    "Locale choice persists across reload",
     "No browser page errors"
   ],
   "metrics": {
-    "largeResultReadyMs": 3195,
+    "largeResultReadyMs": 2685,
     "renderedRows": 22,
     "standardDataRowPx": 30
   },
