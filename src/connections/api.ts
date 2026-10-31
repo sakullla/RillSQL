@@ -40,6 +40,16 @@ export interface EnvTagInput {
   tone: EnvTone;
 }
 
+export interface ExportOutcome {
+  count: number;
+}
+
+/** RillSQL 导出文件解密后的逐条解析结果：引擎不受支持的条目进 skipped 报告。 */
+export interface ImportFileOutcome {
+  connections: SavedConnection[];
+  skipped: { name: string; reason: string }[];
+}
+
 export interface ConnectionApi {
   list(): Promise<SavedConnection[]>;
   listTags(): Promise<EnvTag[]>;
@@ -52,6 +62,8 @@ export interface ConnectionApi {
   disconnect(id: string): Promise<void>;
   confirmHostKey(id: string, fingerprint: string): Promise<void>;
   forgetHostKey(id: string): Promise<void>;
+  export(ids: string[] | null, passphrase: string, path: string): Promise<ExportOutcome>;
+  importFile(path: string, passphrase: string): Promise<ImportFileOutcome>;
 }
 
 function emptyToNull(value: string): string | null {
@@ -89,4 +101,8 @@ export const tauriConnectionApi: ConnectionApi = {
   disconnect: (id) => invoke<void>("connections_disconnect", { id }),
   confirmHostKey: (id, fingerprint) => invoke<void>("connections_confirm_host_key", { id, fingerprint }),
   forgetHostKey: (id) => invoke<void>("connections_forget_host_key", { id }),
+  export: (ids, passphrase, path) =>
+    invoke<ExportOutcome>("connections_export", { ids, passphrase: emptyToNull(passphrase), path }),
+  importFile: (path, passphrase) =>
+    invoke<ImportFileOutcome>("connections_import_file", { path, passphrase: emptyToNull(passphrase) }),
 };

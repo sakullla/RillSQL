@@ -102,6 +102,11 @@
 .check input { margin: 2px 0 0; }
 .check small { color: var(--text-2); }
 
+/* ---------- 导出对话框 ---------- */
+.export-all { padding-bottom: var(--sp-2); border-bottom: 1px solid var(--line); }
+.export-list { display: grid; gap: var(--sp-1); max-height: 40vh; overflow: auto; margin: var(--sp-2) 0 var(--sp-3); padding: var(--sp-2); border: 1px solid var(--line); border-radius: var(--r-md); }
+.export-list .check { margin-bottom: 0; }
+
 /* ---------- 引擎选择 ---------- */
 .ce-engines { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--sp-2); margin-bottom: var(--sp-4); }
 .ce-engine { position: relative; display: flex; align-items: center; gap: var(--sp-3); min-width: 0; padding: var(--sp-3); border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface-panel); cursor: pointer; overflow: hidden; transition: border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease); }

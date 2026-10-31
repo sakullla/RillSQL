@@ -249,6 +249,12 @@
           "markdownDescription": "允许断开已打开的连接。"
         },
         {
+          "description": "允许把全部或选中的连接配置导出为 RillSQL 文件（可选口令加密），凭据永不写入。",
+          "type": "string",
+          "const": "allow-connections-export",
+          "markdownDescription": "允许把全部或选中的连接配置导出为 RillSQL 文件（可选口令加密），凭据永不写入。"
+        },
+        {
           "description": "允许把已打开的 PostgreSQL 会话改连到同一个服务器上的另一个库，不修改已保存的配置。",
           "type": "string",
           "const": "allow-connections-focus-database",
@@ -259,6 +265,12 @@
           "type": "string",
           "const": "allow-connections-forget-host-key",
           "markdownDescription": "允许忘记已保存的 SSH 主机密钥。"
+        },
+        {
+          "description": "允许读取 RillSQL 连接导出文件并按口令解密；格式不符或口令错误时整体拒绝。",
+          "type": "string",
+          "const": "allow-connections-import-file",
+          "markdownDescription": "允许读取 RillSQL 连接导出文件并按口令解密；格式不符或口令错误时整体拒绝。"
         },
         {
           "description": "允许列出已保存的连接。",

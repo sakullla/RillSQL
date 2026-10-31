@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
 
+use crate::connections::export::ParsedImport;
 use crate::connections::model::{ConnectionDraft, EnvTag, FieldError, Secret, SecretInput};
 use crate::connections::secrets::KeyringStore;
 use crate::connections::service::{self, ConnectionRecord, DeleteOutcome, OpenOutcome, SaveOutcome, Service, ServiceError};
@@ -162,4 +163,41 @@ pub async fn connections_confirm_host_key(
 #[tauri::command]
 pub async fn connections_forget_host_key(state: tauri::State<'_, ConnectionsState>, id: String) -> Result<(), CommandError> {
     state.service.forget_host_key(&id).await.map_err(CommandError::from)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportOutcome {
+    pub count: usize,
+}
+
+/// 导出全部（ids 为 None）或选中连接。passphrase 留空导出明文 JSON；填写则整体加密。
+/// 文件路径来自前端的原生保存对话框，后端只写这一个文件。
+#[tauri::command]
+pub async fn connections_export(
+    state: tauri::State<'_, ConnectionsState>,
+    ids: Option<Vec<String>>,
+    passphrase: Option<String>,
+    path: String,
+) -> Result<ExportOutcome, CommandError> {
+    let count = state
+        .service
+        .export_connections(ids, passphrase.as_deref(), Path::new(&path))
+        .await
+        .map_err(CommandError::from)?;
+    Ok(ExportOutcome { count })
+}
+
+/// 导入 RillSQL 导出文件：识别 RILLSQLCX1 加密头则要求口令；格式不符或口令错误整体拒绝。
+#[tauri::command]
+pub async fn connections_import_file(
+    state: tauri::State<'_, ConnectionsState>,
+    path: String,
+    passphrase: Option<String>,
+) -> Result<ParsedImport, CommandError> {
+    state
+        .service
+        .import_file(Path::new(&path), passphrase.as_deref())
+        .await
+        .map_err(CommandError::from)
 }

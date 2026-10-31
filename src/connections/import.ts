@@ -1,6 +1,6 @@
-import type { SaveOutcome } from "./api";
+import type { ImportFileOutcome, SaveOutcome } from "./api";
 import { ENGINES } from "../engines";
-import { blankDraft, engineMeta, type ConnectionDraft, type Engine, type SavedConnection, type SecretInput } from "./model";
+import { blankDraft, draftFromSaved, engineMeta, type ConnectionDraft, type Engine, type SavedConnection, type SecretInput } from "./model";
 
 export interface ImportNote {
   name: string;
@@ -307,5 +307,31 @@ export async function importConnectionText(
     skipped: parsed.skipped,
     failed,
     message: summarize(parsed.recognized, saved, parsed.skipped, failed),
+  };
+}
+
+/** RillSQL 导出文件解密后的逐条导入：沿用与 DBeaver/Navicat 相同的报告机制，秘密保持为空。 */
+export async function importRillSqlConnections(
+  outcome: ImportFileOutcome,
+  save: (draft: ConnectionDraft, secrets: SecretInput) => Promise<SaveOutcome>,
+): Promise<ImportResult> {
+  const saved: SavedConnection[] = [];
+  const failed: ImportNote[] = [];
+  for (const connection of outcome.connections) {
+    const draft = { ...draftFromSaved(connection), savePassword: false };
+    try {
+      const outcomeRow = await save(draft, { ...EMPTY_SECRETS });
+      saved.push(outcomeRow.connection);
+    } catch (error) {
+      failed.push({ name: connection.name, message: `「${connection.name}」没有保存：${failureText(error)}` });
+    }
+  }
+  const skipped = outcome.skipped.map((row) => skip(row.name, row.reason));
+  return {
+    recognized: true,
+    saved,
+    skipped,
+    failed,
+    message: summarize(true, saved, skipped, failed),
   };
 }

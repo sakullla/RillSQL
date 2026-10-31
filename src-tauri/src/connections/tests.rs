@@ -757,3 +757,101 @@ async fn mysql_system_roots_come_from_the_os_store_and_ca_files_drop_them() {
     assert_eq!(bytes, std::fs::read(&ca).unwrap());
     assert_ne!(bytes, expected.concat());
 }
+
+/// 与前端 draftFromSaved 对齐的测试助手：把导出文件里的连接变回保存草稿（不带任何机密）。
+fn redraft(saved: &model::SavedConnection) -> ConnectionDraft {
+    let mut draft = ConnectionDraft::blank(saved.engine);
+    draft.id = Some(saved.id.clone());
+    draft.name = saved.name.clone();
+    draft.env = saved.env.clone();
+    draft.save_password = false;
+    if saved.engine == Engine::Sqlite {
+        draft.file_path = saved.file_path.clone().unwrap_or_default();
+        return draft;
+    }
+    draft.host = saved.host.clone().unwrap_or_default();
+    draft.port = saved.port.map(|port| port.to_string()).unwrap_or_default();
+    draft.database = saved.database.clone().unwrap_or_default();
+    draft.username = saved.username.clone().unwrap_or_default();
+    if let Some(tls) = &saved.tls {
+        draft.tls_mode = tls.mode;
+        draft.ca_mode = tls.ca_mode;
+        draft.ca_file = tls.ca_file.clone().unwrap_or_default();
+        draft.client_cert = tls.client_cert.clone().unwrap_or_default();
+        draft.client_key = tls.client_key.clone().unwrap_or_default();
+    }
+    if let Some(ssh) = &saved.ssh {
+        draft.ssh_on = true;
+        draft.ssh_host = ssh.host.clone();
+        draft.ssh_port = ssh.port.to_string();
+        draft.ssh_user = ssh.username.clone();
+        draft.ssh_auth = ssh.auth;
+        draft.ssh_key = ssh.key_path.clone().unwrap_or_default();
+    }
+    draft
+}
+
+#[tokio::test]
+async fn export_delete_import_roundtrip_restores_config_with_empty_password() {
+    let dir = temp_workspace();
+    let service = Service::new(dir.join("connections.sqlite"), Arc::new(MemoryStore::default()));
+
+    let mut draft = remote_draft(Engine::Postgres);
+    draft.env = "prod".to_owned();
+    draft.tls_mode = TlsMode::Verify;
+    draft.ca_mode = CaMode::File;
+    draft.ca_file = "C:/certs/ca.pem".to_owned();
+    draft.ssh_on = true;
+    draft.ssh_host = "bastion.example.test".to_owned();
+    draft.ssh_user = "jump".to_owned();
+    draft.ssh_key = "C:/ssh/id_ed25519".to_owned();
+    let saved = service.save(draft, secrets("db-secret-value", "ssh-secret-value", "key-secret-value")).await.unwrap();
+    assert!(saved.connection.password_saved);
+    let mut lite = ConnectionDraft::blank(Engine::Sqlite);
+    lite.id = Some("lite-1".to_owned());
+    lite.file_path = dir.join("notes.sqlite").display().to_string();
+    service.save(lite, SecretInput::default()).await.unwrap();
+
+    let export_path = dir.join("rillsql-connections.rillsqlcx");
+    let count = service
+        .export_connections(None, Some("导出口令"), &export_path)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+    let file = std::fs::read(&export_path).unwrap();
+    assert!(file.starts_with(super::export::MAGIC));
+    assert!(!String::from_utf8_lossy(&file).contains("db-secret-value"));
+
+    for id in [saved.connection.id.as_str(), "lite-1"] {
+        let _ = service.delete(id).await;
+    }
+    assert!(service.list().await.unwrap().is_empty());
+
+    // 错误口令整体拒绝：一条也不导入。
+    let wrong = service.import_file(&export_path, Some("错误口令")).await.unwrap_err();
+    assert!(wrong.contains("口令不正确"), "{wrong}");
+
+    let parsed = service.import_file(&export_path, Some("导出口令")).await.unwrap();
+    assert!(parsed.skipped.is_empty());
+    assert_eq!(parsed.connections.len(), 2);
+    for row in &parsed.connections {
+        let outcome = service.save(redraft(row), SecretInput::default()).await.unwrap();
+        assert!(!outcome.connection.password_saved);
+        assert!(!outcome.connection.ssh_password_saved);
+    }
+
+    let restored = service.list().await.unwrap();
+    let pg = restored.iter().find(|item| item.saved.name.contains("PostgreSQL")).unwrap();
+    assert_eq!(pg.saved.env, "prod");
+    let tls = pg.saved.tls.as_ref().unwrap();
+    assert_eq!(tls.mode, TlsMode::Verify);
+    assert_eq!(tls.ca_mode, CaMode::File);
+    assert_eq!(tls.ca_file.as_deref(), Some("C:/certs/ca.pem"));
+    let ssh = pg.saved.ssh.as_ref().unwrap();
+    assert_eq!(ssh.host, "bastion.example.test");
+    assert_eq!(ssh.auth, model::SshAuthKind::Key);
+    assert_eq!(ssh.key_path.as_deref(), Some("C:/ssh/id_ed25519"));
+    assert!(!pg.saved.password_saved);
+    assert!(!pg.saved.ssh_password_saved);
+    let _ = std::fs::remove_dir_all(dir);
+}

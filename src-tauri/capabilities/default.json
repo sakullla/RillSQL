@@ -16,6 +16,8 @@
     "allow-connections-disconnect",
     "allow-connections-confirm-host-key",
     "allow-connections-forget-host-key",
+    "allow-connections-export",
+    "allow-connections-import-file",
     "allow-env-tags-list",
     "allow-env-tags-save",
     "allow-env-tags-delete",

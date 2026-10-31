@@ -4,7 +4,7 @@ import { replaceCatalog, resetCatalog } from "../catalog/store";
 import type { CatalogConnection } from "../catalog/types";
 import type { ConnectionApi, EnvTagInput, TestReport } from "./api";
 import ConnectionsPage from "./ConnectionsPage.vue";
-import { listPaletteConnections, MODULE_ID, replacePaletteConnections, setSqlitePicker } from "./index";
+import { listPaletteConnections, MODULE_ID, replacePaletteConnections, setConnectionsFilePicker, setExportPathPicker, setSqlitePicker } from "./index";
 import { importConnectionText } from "./import";
 import { blankDraft, storedConfigHidesSecrets, toStoredConfig, validate, type ConnectionDraft, type EnvTag, type SavedConnection, type SecretInput } from "./model";
 import { parseConnectionUrl } from "./url";
@@ -164,6 +164,8 @@ describe("connections page", () => {
       disconnect: async () => undefined,
       confirmHostKey: async () => undefined,
       forgetHostKey: async () => undefined,
+      export: async () => ({ count: 0 }),
+      importFile: async () => ({ connections: [], skipped: [] }),
     };
   }
 
@@ -402,6 +404,8 @@ describe("connections page", () => {
       disconnect: async () => undefined,
       confirmHostKey: async () => undefined,
       forgetHostKey: async () => undefined,
+      export: async () => ({ count: 0 }),
+      importFile: async () => ({ connections: [], skipped: [] }),
     };
     const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api } });
     await flushPromises();
@@ -539,6 +543,119 @@ describe("connections page", () => {
     expect(card.find("[data-action=conn-connect]").exists()).toBe(false);
     wrapper.unmount();
     resetCatalog();
+  });
+
+  it("导出对话框默认全选、可改选中并携带可选口令", async () => {
+    replacePaletteConnections([]);
+    setExportPathPicker(async (encrypted) => (encrypted ? "C:/tmp/conns.rillsqlcx" : "C:/tmp/conns.json"));
+    const exported: { ids: string[] | null; passphrase: string; path: string }[] = [];
+    const api: ConnectionApi = {
+      ...pageApi(() => ({ status: "ok", stages: [] }), [savedMysql(), savedSqlite()]),
+      export: async (ids, passphrase, path) => {
+        exported.push({ ids, passphrase, path });
+        return { count: ids ? ids.length : 2 };
+      },
+    };
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api } });
+    await flushPromises();
+
+    await wrapper.get("[data-action=conn-export]").trigger("click");
+    const rows = wrapper.findAll('[data-section="export-list"] [data-field="export-row"]');
+    expect(rows).toHaveLength(2);
+    expect((rows[0].element as HTMLInputElement).checked).toBe(true);
+    expect(wrapper.text()).toContain("已选 2 / 2 条");
+    expect(wrapper.text()).toContain("密码、私钥内容永不写入");
+
+    // 取消一条后只导出选中项，口令非空则整体加密
+    await rows[0].setValue(false);
+    expect(wrapper.text()).toContain("已选 1 / 2 条");
+    await wrapper.get("[data-field=export-passphrase]").setValue("秘密口令");
+    await wrapper.get("[data-action=confirm-export]").trigger("click");
+    await flushPromises();
+    expect(exported).toEqual([{ ids: ["notes"], passphrase: "秘密口令", path: "C:/tmp/conns.rillsqlcx" }]);
+    expect(wrapper.text()).toContain("已导出 1 个连接（带口令加密）");
+    expect(wrapper.text()).toContain("密码与私钥内容不会写入文件");
+    wrapper.unmount();
+    setExportPathPicker(async () => null);
+    replacePaletteConnections([]);
+  });
+
+  it("不填口令时按全部连接导出明文 JSON", async () => {
+    replacePaletteConnections([]);
+    setExportPathPicker(async () => "C:/tmp/conns.json");
+    const exported: { ids: string[] | null; passphrase: string; path: string }[] = [];
+    const api: ConnectionApi = {
+      ...pageApi(() => ({ status: "ok", stages: [] }), [savedMysql()]),
+      export: async (ids, passphrase, path) => {
+        exported.push({ ids, passphrase, path });
+        return { count: ids ? ids.length : 1 };
+      },
+    };
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api } });
+    await flushPromises();
+
+    await wrapper.get("[data-action=conn-export]").trigger("click");
+    await wrapper.get("[data-action=confirm-export]").trigger("click");
+    await flushPromises();
+    expect(exported).toEqual([{ ids: null, passphrase: "", path: "C:/tmp/conns.json" }]);
+    expect(wrapper.text()).toContain("已导出 1 个连接（明文 JSON，不含密码）");
+    wrapper.unmount();
+    setExportPathPicker(async () => null);
+    replacePaletteConnections([]);
+  });
+
+  it("加密文件先要口令，逐条保存并沿用导入报告，错误口令整体拒绝", async () => {
+    setConnectionsFilePicker(async () => "C:/tmp/conns.rillsqlcx");
+    const save = vi.fn(async (draft: ConnectionDraft, secrets: SecretInput) => {
+      expect(secrets).toEqual({ password: "", sshPassword: "", passphrase: "" });
+      expect(draft.id).toBe("atlas");
+      expect(draft.savePassword).toBe(false);
+      expect(draft.tlsMode).toBe("verify");
+      expect(draft.env).toBe("dev");
+      return { connection: toStoredConfig(draft, draft.id ?? "created"), note: null };
+    });
+    const importFile = vi.fn(async (path: string, passphrase: string) => {
+      expect(path).toBe("C:/tmp/conns.rillsqlcx");
+      if (!passphrase) throw new Error("这份文件带口令加密，请输入导出时设置的口令。");
+      if (passphrase === "错误口令") throw new Error("口令不正确或文件已损坏，已整体拒绝导入。");
+      return {
+        connections: [savedMysql()],
+        skipped: [{ name: "报表库", reason: "不支持的数据库引擎 clickhouse。" }],
+      };
+    });
+    const api: ConnectionApi = {
+      ...pageApi(() => ({ status: "ok", stages: [] }), []),
+      save,
+      importFile,
+    };
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api } });
+    await flushPromises();
+
+    await wrapper.get("[data-action=conn-import-rx]").trigger("click");
+    await flushPromises();
+    // 空口令被整体拒绝：先弹口令对话框，而不是失败在页面提示里
+    expect(importFile).toHaveBeenCalledWith("C:/tmp/conns.rillsqlcx", "");
+    expect(wrapper.text()).toContain("输入导入口令");
+    expect(save).not.toHaveBeenCalled();
+
+    // 错误口令：仍整体拒绝，原因显示在对话框内
+    await wrapper.get("[data-field=import-passphrase]").setValue("错误口令");
+    await wrapper.get("[data-action=confirm-import-passphrase]").trigger("click");
+    await flushPromises();
+    expect(wrapper.get("[data-dialog-error]").text()).toContain("口令不正确");
+    expect(save).not.toHaveBeenCalled();
+
+    // 正确口令：逐条保存并沿用行级报告
+    await wrapper.get("[data-field=import-passphrase]").setValue("正确口令");
+    await wrapper.get("[data-action=confirm-import-passphrase]").trigger("click");
+    await flushPromises();
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(wrapper.text()).toContain("已导入 1 个连接");
+    expect(wrapper.text()).toContain("报表库");
+    expect(wrapper.text()).toContain("clickhouse");
+    expect(wrapper.find("[data-field=import-passphrase]").exists()).toBe(false);
+    wrapper.unmount();
+    setConnectionsFilePicker(async () => null);
   });
 });
 
@@ -848,6 +965,8 @@ describe("connection import", () => {
       disconnect: async () => undefined,
       confirmHostKey: async () => undefined,
       forgetHostKey: async () => undefined,
+      export: async () => ({ count: 0 }),
+      importFile: async () => ({ connections: [], skipped: [] }),
     };
     const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api } });
     await flushPromises();
@@ -903,6 +1022,8 @@ describe("connection import", () => {
       disconnect: async () => undefined,
       confirmHostKey: async () => undefined,
       forgetHostKey: async () => undefined,
+      export: async () => ({ count: 0 }),
+      importFile: async () => ({ connections: [], skipped: [] }),
     };
     const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api } });
     await flushPromises();

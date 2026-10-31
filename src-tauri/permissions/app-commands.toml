@@ -49,6 +49,16 @@ description = "允许忘记已保存的 SSH 主机密钥。"
 commands.allow = ["connections_forget_host_key"]
 
 [[permission]]
+identifier = "allow-connections-export"
+description = "允许把全部或选中的连接配置导出为 RillSQL 文件（可选口令加密），凭据永不写入。"
+commands.allow = ["connections_export"]
+
+[[permission]]
+identifier = "allow-connections-import-file"
+description = "允许读取 RillSQL 连接导出文件并按口令解密；格式不符或口令错误时整体拒绝。"
+commands.allow = ["connections_import_file"]
+
+[[permission]]
 identifier = "allow-env-tags-list"
 description = "允许读取用户维护的环境标签。"
 commands.allow = ["env_tags_list"]

@@ -348,6 +348,50 @@ impl Service {
         })
     }
 
+    /// 导出全部（ids 为 None）或选中的连接到用户经保存对话框选定的路径。
+    /// 机密永不进入导出内容；写入失败时返回明确原因。
+    pub async fn export_connections(
+        &self,
+        ids: Option<Vec<String>>,
+        passphrase: Option<&str>,
+        path: &Path,
+    ) -> Result<usize, String> {
+        let store = self.store().await?;
+        let rows = store.list().await.map_err(db_err)?;
+        let selected = match ids {
+            None => rows,
+            Some(wanted) => {
+                let mut picked = Vec::with_capacity(wanted.len());
+                let mut absent = Vec::new();
+                for id in &wanted {
+                    match rows.iter().find(|row| &row.id == id) {
+                        Some(row) => picked.push(row.clone()),
+                        None => absent.push(id.clone()),
+                    }
+                }
+                if !absent.is_empty() {
+                    return Err(format!("找不到要导出的连接：{}", absent.join("、")));
+                }
+                picked
+            }
+        };
+        let bytes = super::export::encode_export(&selected, passphrase)?;
+        tokio::fs::write(path, &bytes)
+            .await
+            .map_err(|err| format!("写入导出文件失败：{err}"))?;
+        self.log(format!("已导出 {} 条连接配置到 {}", selected.len(), path.display()));
+        Ok(selected.len())
+    }
+
+    /// 读取 RillSQL 导出文件并解密。格式不符或口令错误时整体拒绝（Err），
+    /// 解密成功后逐条解析：引擎不受支持的条目进 skipped 报告，不阻塞其余条目。
+    pub async fn import_file(&self, path: &Path, passphrase: Option<&str>) -> Result<super::export::ParsedImport, String> {
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|err| format!("读不到这份连接文件：{err}"))?;
+        super::export::parse_import(&bytes, passphrase)
+    }
+
     pub async fn delete(&self, id: &str) -> Result<DeleteOutcome, String> {
         self.disconnect(id);
         let store = self.store().await?;

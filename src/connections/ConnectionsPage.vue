@@ -5,8 +5,8 @@ import Listbox from "../ui/Listbox.vue";
 import { tauriConnectionApi, type ConnectionApi, type EnvTagInput, type TestReport } from "./api";
 import ConnIcon from "./ConnIcon.vue";
 import EnvTagField from "./EnvTagField.vue";
-import { importConnectionText } from "./import";
-import { pickSqliteFile, replacePaletteConnections } from "./index";
+import { importConnectionText, importRillSqlConnections } from "./import";
+import { pickConnectionsFile, pickExportPath, pickSqliteFile, replacePaletteConnections } from "./index";
 import {
   ENGINES,
   blankDraft,
@@ -40,8 +40,12 @@ const note = ref("");
 const dialogError = ref("");
 const busy = ref(false);
 const menuId = ref<string | null>(null);
-const dialog = ref<"edit" | "delete" | "password" | "details" | null>(null);
+const dialog = ref<"edit" | "delete" | "password" | "details" | "export" | "passphrase" | null>(null);
 const advancedOpen = ref(false);
+const exportChecked = ref<Record<string, boolean>>({});
+const exportPassphrase = ref("");
+const passphrasePath = ref<string | null>(null);
+const passphraseInput = ref("");
 const pasteText = ref("");
 const pasteNote = ref("");
 const pasteFailed = ref(false);
@@ -304,6 +308,95 @@ function openImport() {
   importInput.value?.click();
 }
 
+const exportSelection = computed(() => connections.value.filter((item) => exportChecked.value[item.id]));
+const exportAllSelected = computed(() => connections.value.length > 0 && exportSelection.value.length === connections.value.length);
+
+/** 导出对话框：默认全选，可改为部分选中；口令留空导出明文 JSON。 */
+function openExport() {
+  exportChecked.value = Object.fromEntries(connections.value.map((item) => [item.id, true]));
+  exportPassphrase.value = "";
+  dialogError.value = "";
+  dialog.value = "export";
+  requestAnimationFrame(() => show(otherDialog.value));
+}
+
+function toggleExportAll(event: Event) {
+  const checked = (event.target as HTMLInputElement).checked;
+  exportChecked.value = Object.fromEntries(connections.value.map((item) => [item.id, checked]));
+}
+
+async function confirmExport() {
+  const selected = exportSelection.value;
+  if (!selected.length) {
+    dialogError.value = "请至少选择一条要导出的连接。";
+    return;
+  }
+  const passphrase = exportPassphrase.value.trim();
+  const path = await pickExportPath(Boolean(passphrase));
+  if (!path) return;
+  busy.value = true;
+  dialogError.value = "";
+  try {
+    const ids = selected.length === connections.value.length ? null : selected.map((item) => item.id);
+    const outcome = await api.value.export(ids, passphrase, path);
+    note.value = `已导出 ${outcome.count} 个连接${passphrase ? "（带口令加密）。密码与私钥内容不会写入文件。" : "（明文 JSON，不含密码）。"}导入时选中同一文件即可恢复。`;
+    closeDialog(otherDialog.value);
+    dialog.value = null;
+  } catch (error) {
+    dialogError.value = errorText(error, "没有导出连接。");
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function runRillSqlImport(path: string, passphrase: string): Promise<void> {
+  const outcome = await api.value.importFile(path, passphrase);
+  const result = await importRillSqlConnections(outcome, (draftToSave, secrets) => api.value.save(draftToSave, secrets));
+  await reload();
+  note.value = result.message;
+}
+
+/** RillSQL 文件导入：原生对话框选文件；文件带口令时先要口令，口令错误整体拒绝。 */
+async function importRillSqlFile() {
+  const path = await pickConnectionsFile();
+  if (!path) return;
+  busy.value = true;
+  note.value = "";
+  dialogError.value = "";
+  try {
+    await runRillSqlImport(path, "");
+  } catch (error) {
+    const message = errorText(error, "没有导入连接。");
+    if (message.includes("带口令加密")) {
+      passphrasePath.value = path;
+      passphraseInput.value = "";
+      dialog.value = "passphrase";
+      requestAnimationFrame(() => show(otherDialog.value));
+      return;
+    }
+    note.value = message;
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function submitPassphrase() {
+  const path = passphrasePath.value;
+  if (!path) return;
+  dialogError.value = "";
+  busy.value = true;
+  try {
+    await runRillSqlImport(path, passphraseInput.value);
+    closeDialog(otherDialog.value);
+    dialog.value = null;
+    passphrasePath.value = null;
+  } catch (error) {
+    dialogError.value = errorText(error, "没有导入连接。");
+  } finally {
+    busy.value = false;
+  }
+}
+
 async function onImportPicked(event: Event) {
   const input = event.target;
   if (!(input instanceof HTMLInputElement)) return;
@@ -550,7 +643,7 @@ watch(
     <div class="page-inner">
       <div class="page-head">
         <div><h1>连接管理</h1><p>一个入口，管理你的本地与远程数据库。</p></div>
-        <div class="ph-actions"><button class="btn" type="button" data-action="conn-import" :disabled="busy" @click="openImport"><ConnIcon name="upload" />导入连接</button><input ref="importInput" hidden type="file" accept=".json,.ncx,.xml,application/json,text/xml" data-action="conn-import-file" aria-label="选择 DBeaver 或 Navicat 连接文件" @change="onImportPicked" /><button class="btn" type="button" @click="openEditor(undefined, 'sqlite')"><ConnIcon name="file" />打开 SQLite</button><button class="btn primary" type="button" data-action="conn-new" @click.stop="openEditor()"><ConnIcon name="plus" />新建连接</button></div>
+        <div class="ph-actions"><button class="btn" type="button" data-action="conn-import" :disabled="busy" @click="openImport"><ConnIcon name="upload" />导入连接</button><input ref="importInput" hidden type="file" accept=".json,.ncx,.xml,application/json,text/xml" data-action="conn-import-file" aria-label="选择 DBeaver 或 Navicat 连接文件" @change="onImportPicked" /><button class="btn" type="button" data-action="conn-import-rx" :disabled="busy" @click="importRillSqlFile"><ConnIcon name="file" />导入 RillSQL 文件</button><button class="btn" type="button" data-action="conn-export" :disabled="busy || !connections.length" @click="openExport"><ConnIcon name="download" />导出连接</button><button class="btn" type="button" @click="openEditor(undefined, 'sqlite')"><ConnIcon name="file" />打开 SQLite</button><button class="btn primary" type="button" data-action="conn-new" @click.stop="openEditor()"><ConnIcon name="plus" />新建连接</button></div>
       </div>
       <div class="connection-overview"><span><b>{{ connections.length }}</b> 个连接</span><span class="online-total"><i></i><b>{{ connectedCount }}</b> 个已连接</span><span class="grow"></span><span><ConnIcon name="lock" />凭据保存在本机</span></div>
       <div class="connection-filters">
@@ -760,7 +853,7 @@ watch(
       </div>
     </dialog>
 
-    <dialog ref="otherDialog" class="modal" :class="dialog === 'delete' ? 'modal-md' : 'modal-sm'" @cancel.prevent="dialog = null">
+    <dialog ref="otherDialog" class="modal" :class="dialog === 'delete' || dialog === 'export' ? 'modal-md' : 'modal-sm'" @cancel.prevent="dialog = null; passphrasePath = null">
       <template v-if="dialog === 'delete' && deleteTarget">
         <div class="modal-head"><div class="modal-titles"><h2>删除连接「{{ deleteTarget.name }}」？</h2><p class="modal-sub">删除前请确认下面两条</p></div></div>
         <div class="modal-body">
@@ -780,6 +873,29 @@ watch(
           <label class="check"><input v-model="promptSave" type="checkbox" /><span>保存到系统凭据库，以后不再询问</span></label>
         </div>
         <div class="modal-foot"><span class="grow"></span><button class="btn" type="button" @click="closeDialog(otherDialog)">取消</button><button class="btn primary" type="button" @click="submitPrompt">连接</button></div>
+      </template>
+      <template v-else-if="dialog === 'export'">
+        <div class="modal-head"><div class="modal-titles"><h2>导出连接</h2><p class="modal-sub">导出为 RillSQL 连接文件；密码、私钥内容永不写入</p></div></div>
+        <div class="modal-body">
+          <p v-if="dialogError" class="field-err modal-error" role="alert" data-dialog-error>{{ dialogError }}</p>
+          <label class="check export-all"><input type="checkbox" data-field="export-all" :checked="exportAllSelected" @change="toggleExportAll" /><span><b>全部连接</b><small>已选 {{ exportSelection.length }} / {{ connections.length }} 条</small></span></label>
+          <div class="export-list" data-section="export-list">
+            <label v-for="item in connections" :key="item.id" class="check">
+              <input v-model="exportChecked[item.id]" type="checkbox" data-field="export-row" :value="item.id" />
+              <span><b>{{ item.name }}</b><small>{{ engineMeta(item.engine).label }} · {{ item.engine === 'sqlite' ? (item.filePath ?? '本地文件') : `${item.host ?? ''}:${item.port ?? ''}` }}</small></span>
+            </label>
+          </div>
+          <label class="field"><span>口令（可选）</span><input v-model="exportPassphrase" type="password" data-field="export-passphrase" autocomplete="new-password" /><small>留空导出为明文 JSON；填写后整个文件加密，导入时需要同一口令。</small></label>
+        </div>
+        <div class="modal-foot"><span class="grow"></span><button class="btn" type="button" @click="closeDialog(otherDialog)">取消</button><button class="btn primary" type="button" data-action="confirm-export" :disabled="busy" @click="confirmExport"><ConnIcon name="download" />导出…</button></div>
+      </template>
+      <template v-else-if="dialog === 'passphrase' && passphrasePath">
+        <div class="modal-head"><div class="modal-titles"><h2>输入导入口令</h2><p class="modal-sub">这份文件带口令加密，口令不正确时不会导入任何连接</p></div></div>
+        <div class="modal-body">
+          <p v-if="dialogError" class="field-err modal-error" role="alert" data-dialog-error>{{ dialogError }}</p>
+          <label class="field"><span>口令</span><input v-model="passphraseInput" type="password" data-field="import-passphrase" autocomplete="current-password" /></label>
+        </div>
+        <div class="modal-foot"><span class="grow"></span><button class="btn" type="button" @click="dialog = null; passphrasePath = null">取消</button><button class="btn primary" type="button" data-action="confirm-import-passphrase" :disabled="busy" @click="submitPassphrase">导入</button></div>
       </template>
       <template v-else-if="detailTarget">
         <div class="modal-head"><div class="modal-titles"><h2>{{ detailTarget.name }}</h2><p class="modal-sub">{{ engineMeta(detailTarget.engine).label }}</p></div></div>
