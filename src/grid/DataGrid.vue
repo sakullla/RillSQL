@@ -814,6 +814,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
     engine: session.target.engine,
     filters: session.filters,
     sort: session.sort,
+    search: session.search ?? null,
     limit: 0,
     truncated: session.truncated,
     statement: "",

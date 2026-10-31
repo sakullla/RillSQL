@@ -2,6 +2,7 @@ import { reactive } from "vue";
 import { gridExport, gridExportCancel, type ExportResult } from "../grid/api";
 import type { Filter, SortSpec } from "../grid/types";
 import { renderCsv, type CsvCell, type CsvOptions } from "./csv";
+import { databaseDump, databaseDumpCancel, type DumpPayload, type DumpProgressEvent, type DumpResult } from "./dump";
 import { renderInsert, type InsertTarget } from "./insert";
 import { renderJson } from "./json";
 import { renderMarkdown } from "./markdown";
@@ -12,6 +13,8 @@ import { renderXlsx } from "./xlsx";
 
 export interface ExportTask {
   id: string;
+  /** dump 表示全库导出任务；缺省是表/查询导出。取消通道按它分流。 */
+  kind?: "export" | "dump";
   fileName: string;
   path: string;
   status: "running" | "done" | "failed" | "cancelled" | "blocked";
@@ -21,6 +24,8 @@ export interface ExportTask {
   message: string;
   residualPath: string | null;
   cancellable?: boolean;
+  /** dump 正在处理的对象名（进度事件给出）。 */
+  object?: string;
 }
 
 export const exportTasks = reactive<ExportTask[]>([]);
@@ -213,6 +218,8 @@ export interface RemoteExportOptions {
   engine: string;
   filters: readonly Filter[];
   sort: SortSpec | null;
+  /** 整表关键字：table 模式全量导出与网格同一口径。 */
+  search?: string | null;
   limit: number;
   truncated: boolean;
   statement: string;
@@ -267,6 +274,7 @@ export function runRemoteExport(options: RemoteExportOptions): { task: ExportTas
     engine: options.engine,
     filters: options.filters,
     sort: options.sort,
+    search: options.search ?? null,
     limit: options.limit,
     truncated: options.truncated,
     statement: options.statement,
@@ -294,6 +302,91 @@ export function cancelRemoteExport(id: string): Promise<void> {
   return gridExportCancel(id);
 }
 
+// ---------------------------------------------------------------- 全库导出（R7）任务
+
+function asDumpStatus(status: string): ExportTask["status"] {
+  if (status === "done" || status === "failed" || status === "cancelled" || status === "blocked" || status === "running") return status;
+  return "failed";
+}
+
+function applyDumpResult(task: ExportTask, result: DumpResult): void {
+  task.status = asDumpStatus(result.status);
+  task.doneRows = result.rows;
+  task.message = result.message;
+  task.residualPath = result.residualPath;
+  if (result.path) {
+    task.path = result.path;
+    task.fileName = result.path.split(/[/\\]/).pop() || task.fileName;
+  }
+  if (result.success && result.status !== "done") {
+    task.status = "failed";
+    task.message = result.message || "导出没有完成，不能记为成功";
+  }
+}
+
+/** dump_progress 事件落到任务行：结构段报对象名，数据段报该表已写入的行数。 */
+export function applyDumpProgress(payload: DumpProgressEvent): void {
+  const task = exportTasks.find((item) => item.id === payload.id);
+  if (!task || task.status !== "running") return;
+  task.object = payload.object;
+  if (payload.phase === "data") {
+    task.doneRows = payload.rows;
+    task.message = `正在导出 ${payload.object} 的数据：已写入 ${payload.rows} 行`;
+  } else {
+    task.message = `正在导出结构：${payload.object}`;
+  }
+}
+
+let dumpListener: Promise<void> | null = null;
+
+/** 进度事件只在桌面端订阅；浏览器与测试环境由调用方直接喂 applyDumpProgress。 */
+function ensureDumpProgressListener(): Promise<void> {
+  if (!isNativeExport()) return Promise.resolve();
+  if (!dumpListener) {
+    dumpListener = import("@tauri-apps/api/event")
+      .then(({ listen }) => listen<DumpProgressEvent>("dump_progress", (event) => applyDumpProgress(event.payload)))
+      .then((unlisten) => {
+        window.addEventListener("beforeunload", () => unlisten(), { once: true });
+      })
+      .catch(() => undefined);
+  }
+  return dumpListener;
+}
+
+export function runDatabaseDump(options: DumpPayload): { task: ExportTask; done: Promise<ExportTask> } {
+  const fileName = options.path.split(/[/\\]/).pop() || "database.sql";
+  const task = reactive<ExportTask>({
+    id: options.id,
+    kind: "dump",
+    fileName,
+    path: options.path,
+    status: "running",
+    doneRows: 0,
+    totalRows: 0,
+    partial: false,
+    message: "正在从已打开的连接导出整库",
+    residualPath: null,
+  });
+  exportTasks.unshift(task);
+  const done = (async () => {
+    await ensureDumpProgressListener();
+    try {
+      const result = await databaseDump(options);
+      applyDumpResult(task, result);
+    } catch (error: unknown) {
+      task.status = "failed";
+      task.message = error instanceof Error ? error.message : String(error);
+    }
+    return task;
+  })();
+  return { task, done };
+}
+
+/** 取消按任务类型分流：表/查询导出走 grid_export_cancel，全库导出走 database_dump_cancel。 */
+export function cancelTask(task: ExportTask): Promise<void> {
+  return task.kind === "dump" ? databaseDumpCancel(task.id) : gridExportCancel(task.id);
+}
+
 /** 后台任务状态的直白文字：颜色不作唯一信息来源，状态词始终在。 */
 export function taskStatusLabel(status: ExportTask["status"]): string {
   if (status === "running") return "进行中";
@@ -305,9 +398,13 @@ export function taskStatusLabel(status: ExportTask["status"]): string {
 
 export function taskStatusText(task: ExportTask): string {
   if (task.status === "running") {
+    if (task.kind === "dump") return task.message;
     return task.totalRows > 0 ? `正在导出：已写入 ${task.doneRows} / ${task.totalRows} 行` : `正在导出：已写入 ${task.doneRows} 行`;
   }
-  if (task.status === "done") return `已完成：写入 ${task.totalRows} 行${task.partial ? "，只是已读取的行，不是完整结果" : ""}`;
+  if (task.status === "done") {
+    if (task.kind === "dump") return task.message;
+    return `已完成：写入 ${task.totalRows} 行${task.partial ? "，只是已读取的行，不是完整结果" : ""}`;
+  }
   if (task.status === "cancelled") return "已取消：未完成的文件已删除";
   if (task.status === "blocked") return `没有开始：${task.message}`;
   return `导出失败：${task.message || "原因未知"}`;

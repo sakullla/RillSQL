@@ -97,6 +97,9 @@ pub struct ExportRequest {
     pub table: TableRef,
     pub filters: Vec<FilterArg>,
     pub sort: Option<SortArg>,
+    /// 整表关键字（R3）。全表远程导出携带当前网格关键字，与界面读到同一组行。
+    #[serde(default)]
+    pub search: Option<String>,
     pub limit: u64,
     pub truncated: bool,
     pub statement: String,
@@ -402,6 +405,7 @@ pub async fn grid_export(state: tauri::State<'_, ConnectionsState>, request: Exp
         engine_hint: request.table.engine,
         filters: filters_of(&request.filters)?,
         sort: sort_of(request.sort.as_ref()),
+        search: request.search.clone(),
         limit: request.limit,
         truncated: request.truncated,
         statement: request.statement,

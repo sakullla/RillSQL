@@ -4,12 +4,15 @@ import { join, resolve } from "node:path";
 import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { nextTick } from "vue";
+import { replaceCatalog, resetCatalog } from "../catalog/store";
+import type { CatalogConnection } from "../catalog/types";
 import { customersFixture } from "../grid/fixture";
 import { queryPage } from "../grid/data";
 import { selectExportGate } from "../grid/sql";
 import type { TableTarget } from "../grid/target";
 import type { TableSchema } from "../grid/types";
 import { parseCsvDistinct, renderCsv, type CsvOptions } from "./csv";
+import DumpDialog from "./DumpDialog.vue";
 import ExportDialog from "./ExportDialog.vue";
 import ImportDialog from "./ImportDialog.vue";
 import { renderInsert } from "./insert";
@@ -17,7 +20,7 @@ import { renderJson } from "./json";
 import { renderMarkdown } from "./markdown";
 import { planExport } from "./plan";
 import TaskCenter from "./TaskCenter.vue";
-import { exportTasks, resetExportTasks, runRemoteExport } from "./tasks";
+import { applyDumpProgress, cancelTask, exportTasks, resetExportTasks, runDatabaseDump, runRemoteExport } from "./tasks";
 import { startExport } from "./write";
 import { parseImportXlsx } from "./xlsx";
 
@@ -28,6 +31,7 @@ const csv: CsvOptions = { delimiter: ",", nullToken: "", bom: false, header: tru
 
 afterEach(() => {
   resetExportTasks();
+  resetCatalog();
 });
 
 function tempDir(): string {
@@ -770,5 +774,128 @@ describe("xlsx export", () => {
       expect.objectContaining({ format: "xlsx", mode: "table-full", table: "customers" }),
     ]);
     invoke.mockReset();
+  });
+});
+
+describe("database dump", () => {
+  const dumpTask = { id: "dump-9", kind: "dump" as const, fileName: "app.sql", path: "/tmp/app.sql", status: "running" as const, doneRows: 0, totalRows: 0, partial: false, message: "正在从已打开的连接导出整库", residualPath: null };
+
+  function catalogFixture(): CatalogConnection[] {
+    return [
+      {
+        id: "shop",
+        name: "商城",
+        engine: "postgres",
+        env: "none",
+        envLabel: "",
+        envTone: "none",
+        status: "connected",
+        defaultDatabase: "app",
+        foreignKeys: null,
+        error: null,
+        databases: [
+          {
+            name: "app",
+            error: null,
+            schemas: [
+              {
+                name: "public",
+                objects: [
+                  { name: "orders", kind: "table", estimatedRows: 3, stale: false },
+                  { name: "customers", kind: "table", estimatedRows: 2, stale: false },
+                  { name: "v_orders", kind: "view", estimatedRows: null, stale: false },
+                ],
+                total: 3,
+                error: null,
+              },
+            ],
+          },
+        ],
+      },
+    ];
+  }
+
+  it("runs a dump task, applies progress events and routes cancel by task kind", async () => {
+    invoke.mockReset();
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "database_dump") {
+        return { status: "done", success: true, path: "/tmp/app.sql", residualPath: null, message: "已导出 6 个对象到 /tmp/app.sql。含数据 5 行。", objects: 6, rows: 5 };
+      }
+      if (command === "database_dump_cancel" || command === "grid_export_cancel") return undefined;
+      throw new Error(`unexpected ${command}`);
+    });
+    const { task, done } = runDatabaseDump({
+      id: "dump-1",
+      connectionId: "shop",
+      engine: "postgres",
+      database: "app",
+      schemas: ["public"],
+      tables: [],
+      includeData: true,
+      path: "/tmp/app.sql",
+    });
+    applyDumpProgress({ id: "dump-1", object: "表 orders", phase: "ddl", rows: 0 });
+    applyDumpProgress({ id: "dump-1", object: "orders", phase: "data", rows: 12 });
+    expect(task.status).toBe("running");
+    expect(task.doneRows).toBe(12);
+    expect(task.message).toBe("正在导出 orders 的数据：已写入 12 行");
+    expect(task.message).not.toContain("未完成");
+    applyDumpProgress({ id: "missing", object: "x", phase: "data", rows: 1 });
+    const finished = await done;
+    expect(finished.status).toBe("done");
+    expect(finished.doneRows).toBe(5);
+    expect(invoke).toHaveBeenCalledWith("database_dump", {
+      request: expect.objectContaining({ connectionId: "shop", engine: "postgres", database: "app", schemas: ["public"], tables: [], includeData: true, path: "/tmp/app.sql" }),
+    });
+
+    exportTasks.push({ ...dumpTask }, { id: "export-2", fileName: "rows.csv", path: "/tmp/rows.csv", status: "running", doneRows: 0, totalRows: 0, partial: false, message: "正在从已打开的连接导出", residualPath: null });
+    const dumpRunning = exportTasks.find((item) => item.id === "dump-9")!;
+    const exportRunning = exportTasks.find((item) => item.id === "export-2")!;
+    applyDumpProgress({ id: "dump-9", object: "orders", phase: "data", rows: 3 });
+    expect(dumpRunning.message).toContain("orders");
+    await cancelTask(dumpRunning);
+    await cancelTask(exportRunning);
+    const commands = invoke.mock.calls.map((call) => call[0]);
+    expect(commands).toContain("database_dump_cancel");
+    expect(commands).toContain("grid_export_cancel");
+    expect(invoke).toHaveBeenCalledWith("database_dump_cancel", { id: "dump-9" });
+    invoke.mockReset();
+  });
+
+  it("starts a dump from the dialog with the checked schema and data switch", async () => {
+    invoke.mockReset();
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "database_dump") return { status: "cancelled", success: false, path: null, residualPath: null, message: "已取消导出", objects: 0, rows: 0 };
+      throw new Error(`unexpected ${command}`);
+    });
+    replaceCatalog(catalogFixture());
+    const wrapper = mount(TaskCenter);
+    await wrapper.get("[aria-label='后台任务']").trigger("click");
+    await wrapper.get("[data-action='dump-open']").trigger("click");
+    const dialog = wrapper.getComponent(DumpDialog);
+    expect(dialog.get("h2").text()).toBe("全库导出");
+    expect(dialog.get('[role="combobox"][aria-label="连接"]').text()).toBe("商城");
+    expect(dialog.get('[role="combobox"][aria-label="库"]').text()).toBe("app");
+    expect(dialog.get("input[type='checkbox']").element as HTMLInputElement).toBeTruthy();
+    const dataToggle = dialog.findAll("input[type='checkbox']").at(-1)!;
+    expect((dataToggle.element as HTMLInputElement).checked).toBe(true);
+    await dataToggle.setValue(false);
+    await dialog.get(".btn.primary").trigger("click");
+    await flushPromises();
+    expect(dialog.emitted("close")).toHaveLength(1);
+    expect(invoke).toHaveBeenCalledWith("database_dump", {
+      request: expect.objectContaining({ connectionId: "shop", engine: "postgres", database: "app", schemas: ["public"], tables: [], includeData: false }),
+    });
+    const task = exportTasks.find((item) => item.kind === "dump");
+    expect(task?.fileName).toMatch(/\.sql$/);
+    await Promise.resolve(task ? undefined : undefined);
+    wrapper.unmount();
+  });
+
+  it("marks an empty catalog with a hint and keeps start disabled", async () => {
+    const wrapper = mount(DumpDialog, { props: { open: true } });
+    expect(wrapper.text()).toContain("还没有已打开的连接");
+    expect(wrapper.get(".btn.primary").attributes("disabled")).toBeDefined();
+    wrapper.unmount();
   });
 });

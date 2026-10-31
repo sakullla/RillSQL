@@ -297,6 +297,18 @@
           "markdownDescription": "允许按阶段测试连接。"
         },
         {
+          "description": "允许从已打开的会话把整库结构（可选数据）按依赖序导出为单个 SQL 文件，只读不执行。",
+          "type": "string",
+          "const": "allow-database-dump",
+          "markdownDescription": "允许从已打开的会话把整库结构（可选数据）按依赖序导出为单个 SQL 文件，只读不执行。"
+        },
+        {
+          "description": "允许取消尚未完成的全库导出并删除未完成文件。",
+          "type": "string",
+          "const": "allow-database-dump-cancel",
+          "markdownDescription": "允许取消尚未完成的全库导出并删除未完成文件。"
+        },
+        {
           "description": "允许从已打开的会话读取表结构编辑信息。",
           "type": "string",
           "const": "allow-ddl-describe",

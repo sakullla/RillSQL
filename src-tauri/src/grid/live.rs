@@ -82,6 +82,8 @@ pub struct ExportSpec {
     pub engine_hint: String,
     pub filters: Vec<Filter>,
     pub sort: Option<Sort>,
+    /// 整表关键字（R3）。table 模式的全量导出与网格读到同一组行，口径一致。
+    pub search: Option<String>,
     pub limit: u64,
     pub truncated: bool,
     pub statement: String,
@@ -428,9 +430,9 @@ async fn export_body(session: &CatalogSession, spec: &ExportSpec, flag: &AtomicB
             };
             let partial = spec.mode == ExportMode::TableLoaded && spec.truncated;
             let sql = match if spec.mode == ExportMode::TableFull {
-                page_sql_unlimited(&schema, &spec.filters, None, spec.sort.as_ref())
+                page_sql_unlimited(&schema, &spec.filters, spec.search.as_deref(), spec.sort.as_ref())
             } else {
-                page_sql_full(&schema, &spec.filters, None, spec.sort.as_ref(), spec.limit)
+                page_sql_full(&schema, &spec.filters, spec.search.as_deref(), spec.sort.as_ref(), spec.limit)
             } {
                 Ok(sql) => sql,
                 Err(message) => return failed_message(message),
@@ -1085,7 +1087,8 @@ fn json_object(names: &[String], cells: &[Cell]) -> String {
     format!("{{{fields}}}")
 }
 
-fn insert_line(engine: Engine, schema_name: &str, table: &str, columns: &[Column], names: &[String], cells: &[Cell]) -> String {
+/// 一行 Cell 写成一条带分号的 INSERT。全库导出（R7）的数据段复用同一套字面量规则（含二进制 hex）。
+pub fn insert_line(engine: Engine, schema_name: &str, table: &str, columns: &[Column], names: &[String], cells: &[Cell]) -> String {
     let values = names
         .iter()
         .enumerate()
@@ -1232,7 +1235,8 @@ fn live_row(schema: &TableSchema, cells: Vec<Cell>, offset: u64, index: usize) -
     LiveRow { id, cells: map, located, locator }
 }
 
-async fn fetch_cells(session: &CatalogSession, sql: &str, width: usize) -> Result<Vec<Vec<Cell>>, String> {
+/// 按列数把一页行读成 Cell 矩阵。全库导出（R7）的流式分页读走这里，与网格同一套单元转换。
+pub async fn fetch_cells(session: &CatalogSession, sql: &str, width: usize) -> Result<Vec<Vec<Cell>>, String> {
     match session {
         CatalogSession::Scripted => Err(no_channel()),
         CatalogSession::Sqlite { pool, .. } => {

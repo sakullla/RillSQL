@@ -3,6 +3,7 @@ mod compare;
 mod connections;
 mod ddl;
 mod diagram;
+mod dump;
 mod grid;
 mod native_export;
 mod product;
@@ -69,6 +70,8 @@ fn wire<R: tauri::Runtime>(builder: tauri::Builder<R>, state: connections::comma
         grid::commands::grid_commit,
         grid::commands::grid_export,
         grid::commands::grid_export_cancel,
+        dump::commands::database_dump,
+        dump::commands::database_dump_cancel,
         ddl::commands::ddl_describe,
         ddl::commands::ddl_preview,
         ddl::commands::ddl_execute,
@@ -132,6 +135,7 @@ fn fixed_dependency_markers() -> usize {
         ddl::module_id(),
         diagram::module_id(),
         compare::module_id(),
+        dump::module_id(),
     ];
     markers.len()
 }
@@ -157,6 +161,9 @@ mod tests {
         "env_tags_delete",
     ];
 
+    /// 全库导出（R7）的命令也要三件套齐备：lib.rs 注册、权限清单、能力文件。
+    const DUMP_COMMANDS: &[&str] = &["database_dump", "database_dump_cancel"];
+
     #[test]
     fn title_names_the_product() {
         assert_eq!(product::TITLE, "澄库 · RillSQL");
@@ -174,8 +181,26 @@ mod tests {
         assert_eq!(super::ddl::module_id(), "ddl");
         assert_eq!(super::diagram::module_id(), "diagram");
         assert_eq!(super::compare::module_id(), "compare");
+        assert_eq!(super::dump::module_id(), "dump");
         assert!(super::fixed_dependency_markers() >= 12);
         assert!(!super::local_data_dir().is_empty());
+    }
+
+    #[test]
+    fn main_window_registers_dump_commands() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capability: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("capabilities/default.json")).unwrap()).unwrap();
+        let permissions = capability["permissions"].as_array().unwrap();
+        let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
+        let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        let wire = registration.split("fn wire").nth(1).unwrap_or("");
+        let wire = wire.split("pub fn run").next().unwrap_or("");
+        for command in DUMP_COMMANDS {
+            let allow = format!("allow-{}", command.replace('_', "-"));
+            assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
+            assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
+            assert!(wire.contains(&format!("dump::commands::{command}")), "{command}");
+        }
     }
 
     #[test]

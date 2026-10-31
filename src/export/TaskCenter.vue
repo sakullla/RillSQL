@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { cancelRemoteExport, clearFinishedTasks, exportTasks, taskStatusLabel, taskStatusText, type ExportTask } from "./tasks";
+import DumpDialog from "./DumpDialog.vue";
+import { cancelTask, clearFinishedTasks, exportTasks, taskStatusLabel, taskStatusText, type ExportTask } from "./tasks";
 
 const open = ref(false);
+const dumpOpen = ref(false);
 const running = computed(() => exportTasks.find((task) => task.status === "running"));
 const hasFinished = computed(() => exportTasks.some((task) => task.status !== "running"));
 const label = computed(() => {
@@ -11,8 +13,8 @@ const label = computed(() => {
   return task.totalRows > 0 ? `导出中 ${task.doneRows}/${task.totalRows}` : `导出中 ${task.doneRows} 行`;
 });
 
-function cancel(id: string) {
-  void cancelRemoteExport(id);
+function cancel(task: ExportTask) {
+  void cancelTask(task);
 }
 
 function badgeVariant(status: ExportTask["status"]): string {
@@ -37,6 +39,7 @@ function percent(task: ExportTask): number {
       <div class="tc-head">
         <strong>后台任务</strong>
         <span class="grow"></span>
+        <button class="btn sm ghost" type="button" data-action="dump-open" @click="dumpOpen = true">全库导出</button>
         <button class="btn sm ghost" type="button" data-action="clear-finished" :disabled="!hasFinished" @click="clearFinishedTasks">清除已结束的</button>
       </div>
       <p v-if="!exportTasks.length" class="tc-empty">没有后台任务。</p>
@@ -45,7 +48,7 @@ function percent(task: ExportTask): number {
           <span class="badge" :class="badgeVariant(task.status)">{{ taskStatusLabel(task.status) }}</span>
           <span class="tc-name" :title="task.path">{{ task.fileName }}</span>
           <span class="grow"></span>
-          <button v-if="task.status === 'running' && task.cancellable !== false" class="btn sm" type="button" @click="cancel(task.id)">取消</button>
+          <button v-if="task.status === 'running' && task.cancellable !== false" class="btn sm" type="button" @click="cancel(task)">取消</button>
         </div>
         <div
           v-if="task.status === 'running'"
@@ -61,6 +64,7 @@ function percent(task: ExportTask): number {
         <p class="tc-status">{{ taskStatusText(task) }}</p>
       </article>
     </div>
+    <DumpDialog :open="dumpOpen" @close="dumpOpen = false" />
   </div>
 </template>
 

@@ -26,6 +26,8 @@ export interface ExportPayload {
   engine: string;
   filters: readonly Filter[];
   sort: SortSpec | null;
+  /** 整表关键字（R3）。全表远程导出带上它，导出的行与网格看到的是同一组。 */
+  search?: string | null;
   limit: number;
   truncated: boolean;
   statement: string;
@@ -156,6 +158,7 @@ export function gridExport(payload: ExportPayload): Promise<ExportResult> {
       engine: payload.engine,
       filters: filtersPayload(payload.filters),
       sort: sortPayload(payload.sort),
+      search: payload.search ?? null,
       limit: payload.limit,
       truncated: payload.truncated,
       statement: payload.statement,

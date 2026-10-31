@@ -40,6 +40,8 @@
     "allow-grid-export",
     "allow-export-write-loaded",
     "allow-grid-export-cancel",
+    "allow-database-dump",
+    "allow-database-dump-cancel",
     "allow-query-start",
     "allow-query-poll",
     "allow-query-cancel",
