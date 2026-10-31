@@ -21,6 +21,8 @@ function errorText(error: unknown): string {
 export class LiveTable {
   filters: Filter[] = [];
   sort: SortSpec | null = null;
+  /** 整表关键字搜索（R3）：null 表示没有搜索；与筛选、排序叠加。 */
+  search: string | null = null;
   loaded: Row[] = [];
   truncated = false;
   counted: number | null = null;
@@ -102,7 +104,7 @@ export class LiveTable {
   async readWindow(offset: number, limit: number, replace: boolean): Promise<string | null> {
     const generation = ++this.readGeneration;
     try {
-      const page = await gridPage(this.target, this.filters, this.sort, offset, limit);
+      const page = await gridPage(this.target, this.filters, this.sort, offset, limit, this.search);
       if (generation !== this.readGeneration) return null;
       this.sql = page.sql;
       this.error = null;
@@ -137,6 +139,13 @@ export class LiveTable {
 
   addFilter(filter: Filter): Promise<string | null> {
     return this.replaceFilters([...this.filters, filter]);
+  }
+
+  /** 整表关键字变化后回到第一页重读（R3）；空白视为清除。筛选与排序保持不变。 */
+  async replaceSearch(keyword: string): Promise<string | null> {
+    const trimmed = keyword.trim();
+    this.search = trimmed ? trimmed : null;
+    return this.readWindow(0, this.pageSize, true);
   }
 
   removeFilter(index: number): Promise<string | null> {
@@ -207,7 +216,7 @@ export class LiveTable {
 
   async count(): Promise<string | null> {
     try {
-      this.counted = await gridCount(this.target, this.filters);
+      this.counted = await gridCount(this.target, this.filters, this.search);
       return null;
     } catch (error) {
       const message = errorText(error);

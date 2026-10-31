@@ -116,7 +116,7 @@ export async function gridDescribe(target: TableTarget): Promise<TableSchema> {
   };
 }
 
-export async function gridPage(target: TableTarget, filters: readonly Filter[], sort: SortSpec | null, offset: number, limit: number): Promise<LivePage> {
+export async function gridPage(target: TableTarget, filters: readonly Filter[], sort: SortSpec | null, offset: number, limit: number, search: string | null = null): Promise<LivePage> {
   const dto = await invoke<PageDto>("grid_page", {
     request: {
       ...targetFields(target),
@@ -124,14 +124,15 @@ export async function gridPage(target: TableTarget, filters: readonly Filter[], 
       sort: sortPayload(sort),
       offset,
       limit,
+      search,
     },
   });
   return { rows: dto.rows.map(toRow), truncated: dto.truncated, sql: dto.sql };
 }
 
-export async function gridCount(target: TableTarget, filters: readonly Filter[]): Promise<number> {
+export async function gridCount(target: TableTarget, filters: readonly Filter[], search: string | null = null): Promise<number> {
   const dto = await invoke<{ matched: number }>("grid_count", {
-    request: { ...targetFields(target), filters: filtersPayload(filters) },
+    request: { ...targetFields(target), filters: filtersPayload(filters), search },
   });
   return dto.matched;
 }

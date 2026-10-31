@@ -45,6 +45,9 @@ pub struct PageRequest {
     pub sort: Option<SortArg>,
     pub offset: u64,
     pub limit: u64,
+    /// 整表关键字搜索（R3），与筛选 AND 组合；空表示没有搜索。
+    #[serde(default)]
+    pub search: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +56,9 @@ pub struct CountRequest {
     #[serde(flatten)]
     pub table: TableRef,
     pub filters: Vec<FilterArg>,
+    /// 与 grid_page 相同的关键字，保证计数与分页读到同一组行。
+    #[serde(default)]
+    pub search: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,7 +294,7 @@ pub async fn grid_page(state: tauri::State<'_, ConnectionsState>, request: PageR
     let session = require_session(&state, &request.table.connection_id)?;
     let filters = filters_of(&request.filters)?;
     let sort = sort_of(request.sort.as_ref());
-    let page = live::query_page(
+    let page = live::query_page_search(
         &session,
         &request.table.database,
         &request.table.schema,
@@ -296,6 +302,7 @@ pub async fn grid_page(state: tauri::State<'_, ConnectionsState>, request: PageR
         &request.table.engine,
         &filters,
         sort.as_ref(),
+        request.search.as_deref(),
         request.offset,
         request.limit,
     )
@@ -321,7 +328,7 @@ pub async fn grid_page(state: tauri::State<'_, ConnectionsState>, request: PageR
 pub async fn grid_count(state: tauri::State<'_, ConnectionsState>, request: CountRequest) -> Result<CountDto, String> {
     let session = require_session(&state, &request.table.connection_id)?;
     let filters = filters_of(&request.filters)?;
-    let matched = live::count_rows(&session, &request.table.database, &request.table.schema, &request.table.table, &request.table.engine, &filters).await?;
+    let matched = live::count_rows_search(&session, &request.table.database, &request.table.schema, &request.table.table, &request.table.engine, &filters, request.search.as_deref()).await?;
     Ok(CountDto { matched })
 }
 

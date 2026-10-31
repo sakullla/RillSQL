@@ -1,7 +1,7 @@
 import { inspectSql } from "../query/split";
 import type { Column, Engine, Filter, SortSpec, TableSchema } from "./types";
 import { opNeedsValue } from "./types";
-import { binaryLiteral, boolLiteral, numericLiteral, parseHex, valueFamily } from "./typeset";
+import { binaryLiteral, boolLiteral, numericLiteral, parseHex, valueFamily, type ValueFamily } from "./typeset";
 
 export function isNumericType(typeName: string): boolean {
   return /int|numeric|decimal|real|double|float|serial|number/i.test(typeName);
@@ -79,6 +79,40 @@ export function filterClause(engine: Engine, column: Column, filter: Filter): st
   }
 }
 
+/** 与 Rust plain_cast 镜像：把任意列投影成文本形态，数字/日期等也按显示出来的文本参与匹配。 */
+function plainCast(engine: Engine, ident: string): string {
+  if (engine === "postgres") return `${ident}::text`;
+  if (engine === "mysql" || engine === "mariadb") return `CAST(${ident} AS CHAR)`;
+  return `CAST(${ident} AS TEXT)`;
+}
+
+/** 可作为文本匹配的列：二进制、几何与类型未知之外的列都参与（R3，Rust 编译层同规则）。 */
+function searchableFamily(family: ValueFamily): boolean {
+  return family !== "binary" && family !== "geometry" && family !== "unknown";
+}
+
+/** 整表关键字搜索子句，与 Rust search_clause 镜像：跨文本可匹配列 OR-LIKE，%/_/! 按 ESCAPE '!' 字面转义；
+ * postgres 用 ILIKE、其余引擎 LIKE；没有可参与列时恒假；空关键字返回 null 表示没有搜索。 */
+export function searchClause(engine: Engine, columns: readonly Column[], keyword: string): string | null {
+  const trimmed = keyword.trim();
+  if (!trimmed) return null;
+  const op = engine === "postgres" ? "ILIKE" : "LIKE";
+  const pattern = likeLiteral(trimmed, "contains");
+  const parts = columns
+    .filter((column) => searchableFamily(valueFamily(column.typeName)))
+    .map((column) => `${plainCast(engine, quoteIdent(engine, column.name))} ${op} ${pattern} ESCAPE '!'`);
+  return parts.length ? `(${parts.join(" OR ")})` : "1 = 0";
+}
+
+/** compileWhere 的搜索叠加形态：筛选条件与整表关键字 AND 组合，分页与计数共用（与 Rust compile_where_with_search 镜像）。 */
+export function compileWhereWithSearch(schema: TableSchema, filters: readonly Filter[], search: string | null): { ok: true; sql: string } | { ok: false; error: string } {
+  const where = compileWhere(schema, filters);
+  if (!where.ok) return where;
+  const clause = search === null ? null : searchClause(schema.engine, schema.columns, search);
+  if (!clause) return where;
+  return { ok: true, sql: where.sql ? `${where.sql} AND ${clause}` : clause };
+}
+
 export function compileWhere(schema: TableSchema, filters: readonly Filter[]): { ok: true; sql: string } | { ok: false; error: string } {
   const parts: string[] = [];
   for (const filter of filters) {
@@ -104,8 +138,8 @@ export function compileWhere(schema: TableSchema, filters: readonly Filter[]): {
   return { ok: true, sql: parts.join(" AND ") };
 }
 
-export function browseSql(schema: TableSchema, filters: readonly Filter[], sort: SortSpec | null, limit: number, offset: number): string {
-  const where = compileWhere(schema, filters);
+export function browseSql(schema: TableSchema, filters: readonly Filter[], sort: SortSpec | null, limit: number, offset: number, search: string | null = null): string {
+  const where = compileWhereWithSearch(schema, filters, search);
   const clause = where.ok && where.sql ? ` WHERE ${where.sql}` : "";
   const order = sort ? ` ORDER BY ${quoteIdent(schema.engine, sort.column)} ${sort.direction === "desc" ? "DESC" : "ASC"}` : "";
   const tail = offset > 0 ? ` LIMIT ${limit} OFFSET ${offset}` : ` LIMIT ${limit}`;

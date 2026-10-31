@@ -15,9 +15,9 @@ import { copyPlain, copySqlValue, showCell } from "./display";
 import { customersFixture, nokeyFixture, viewFixture } from "./fixture";
 import QueryResultGrid from "./QueryResultGrid.vue";
 import { TableSession } from "./session";
-import { compileWhere, selectExportGate } from "./sql";
+import { browseSql, compileWhere, compileWhereWithSearch, searchClause, selectExportGate } from "./sql";
 import type { TableTarget } from "./target";
-import { COMMIT_RULE, FILTER_OPS, opLabel, opNeedsValue, type Column } from "./types";
+import { COMMIT_RULE, FILTER_OPS, opLabel, opNeedsValue, type Column, type TableSchema } from "./types";
 
 const invoke = vi.hoisted(() => vi.fn());
 
@@ -133,6 +133,49 @@ describe("grid batches, nulls and server filters", () => {
     expect(matchesFilter(note, "甲", { column: "note", op: "in", values: ["甲", "乙"] })).toBe(true);
     expect(matchesFilter(note, "丙", { column: "note", op: "in", values: ["甲", "乙"] })).toBe(false);
     expect(matchesFilter(note, null, { column: "note", op: "in", values: ["甲"] })).toBe(false);
+  });
+
+  it("compiles server-side keyword search across text-matchable columns (R3)", () => {
+    const typed = (name: string, typeName: string): Column => ({ name, typeName, nullable: true, primary: false, unique: false, auto: false });
+    const columns: Column[] = [
+      typed("id", "integer"),
+      typed("name", "text"),
+      typed("email", "varchar(64)"),
+      typed("joined", "date"),
+      typed("avatar", "bytea"),
+      typed("shape", "geometry"),
+    ];
+    const schema: TableSchema = { engine: "postgres", schema: "public", name: "customers", kind: "table", columns, key: ["id"] };
+    expect(searchClause("postgres", columns, " 甲'x ")).toBe(
+      '("id"::text ILIKE \'%甲\'\'x%\' ESCAPE \'!\' OR "name"::text ILIKE \'%甲\'\'x%\' ESCAPE \'!\' OR "email"::text ILIKE \'%甲\'\'x%\' ESCAPE \'!\' OR "joined"::text ILIKE \'%甲\'\'x%\' ESCAPE \'!\')',
+    );
+    const mysql = searchClause("mysql", columns, "甲'x");
+    expect(mysql).toBe(
+      "(CAST(`id` AS CHAR) LIKE '%甲''x%' ESCAPE '!' OR CAST(`name` AS CHAR) LIKE '%甲''x%' ESCAPE '!' OR CAST(`email` AS CHAR) LIKE '%甲''x%' ESCAPE '!' OR CAST(`joined` AS CHAR) LIKE '%甲''x%' ESCAPE '!')",
+    );
+    expect(searchClause("mariadb", columns, "甲'x")).toBe(mysql);
+    expect(searchClause("sqlite", columns, "甲'x")).toBe(
+      '(CAST("id" AS TEXT) LIKE \'%甲\'\'x%\' ESCAPE \'!\' OR CAST("name" AS TEXT) LIKE \'%甲\'\'x%\' ESCAPE \'!\' OR CAST("email" AS TEXT) LIKE \'%甲\'\'x%\' ESCAPE \'!\' OR CAST("joined" AS TEXT) LIKE \'%甲\'\'x%\' ESCAPE \'!\')',
+    );
+    // 模式字符按字面匹配
+    expect(searchClause("sqlite", columns, "50%")).toContain("'%50!%%' ESCAPE '!'");
+    expect(searchClause("sqlite", columns, "a_b!c")).toContain("'%a!_b!!c%' ESCAPE '!'");
+    // 二进制与几何列不参与；全部排除时恒假；空关键字不生成子句
+    expect(searchClause("postgres", columns, "x")).not.toContain("avatar");
+    expect(searchClause("postgres", columns, "x")).not.toContain("shape");
+    expect(searchClause("postgres", [typed("avatar", "blob"), typed("shape", "geography")], "x")).toBe("1 = 0");
+    expect(searchClause("postgres", columns, "")).toBeNull();
+    expect(searchClause("postgres", columns, "   ")).toBeNull();
+    // 与筛选 AND 组合，筛选错误先暴露
+    const keyword = searchClause("mysql", columns, "小河");
+    expect(compileWhereWithSearch({ ...schema, engine: "mysql" }, [{ column: "id", op: "gt", value: "10" }], "小河")).toEqual({ ok: true, sql: "`id` > 10 AND " + keyword });
+    expect(compileWhereWithSearch(schema, [], null)).toEqual({ ok: true, sql: "" });
+    expect(compileWhereWithSearch(schema, [{ column: "id", op: "in", values: [] }], "小河")).toEqual({ ok: false, error: "IN 筛选至少要一个值" });
+    // 浏览 SQL 与排序、分页叠加；无关键字时与存量行为一致
+    expect(browseSql({ ...schema, engine: "mysql" }, [], { column: "id", direction: "desc" }, 20, 40, "小河")).toBe(
+      "SELECT * FROM `public`.`customers` WHERE " + keyword + " ORDER BY `id` DESC LIMIT 20 OFFSET 40",
+    );
+    expect(browseSql({ ...schema, engine: "mysql" }, [], null, 10, 0)).toBe("SELECT * FROM `public`.`customers` LIMIT 10");
   });
 });
 
@@ -644,6 +687,60 @@ describe("grid views", () => {
     expect(wrapper.text()).toContain("没有绑定已打开的表，不能用示例数据代替。");
     expect(invoke).not.toHaveBeenCalled();
     expect(wrapper.text()).not.toContain("客户1");
+    wrapper.unmount();
+  });
+
+  it("sends the toolbar keyword to grid_page and grid_count, stacks with filters and clears to restore", async () => {
+    invoke.mockImplementation(async (command: string, args: { request?: { search?: string | null; filters?: unknown[] } }) => {
+      if (command === "grid_describe") return customerSchema();
+      if (command === "grid_page") {
+        const filters = args.request?.filters ?? [];
+        if (filters.length > 0) return { rows: [], truncated: false, sql: "SELECT WHERE filter" };
+        const search = args.request?.search ?? null;
+        if (search === null) return { rows: [customerRow(1), customerRow(2)], truncated: false, sql: "SELECT customers" };
+        return { rows: [], truncated: false, sql: `SELECT customers WHERE ${search}` };
+      }
+      if (command === "grid_count") return { matched: args.request?.search ? 0 : 2 };
+      throw new Error(command);
+    });
+    const wrapper = mount(DataGrid, { props: { tabId: "table:search", draft: "", pageSize: 10, target: customersTarget } });
+    await flushPromises();
+    expect(wrapper.text()).toContain("客户1");
+    await wrapper.get("input[aria-label='搜索关键字']").setValue("50%");
+    await wrapper.findAll("button").find((button) => button.text() === "搜索")!.trigger("click");
+    await flushPromises();
+    expect(invoke.mock.calls.filter((call) => call[0] === "grid_page").at(-1)?.[1]).toMatchObject({ request: { search: "50%" } });
+    expect(wrapper.get("[data-empty='filter']").text()).toContain("没有匹配行");
+    expect((wrapper.get("input[aria-label='搜索关键字']").element as HTMLInputElement).value).toBe("50%");
+    // 空态可清除关键字恢复行集
+    await wrapper.get("[data-empty='filter'] button").trigger("click");
+    await flushPromises();
+    expect(invoke.mock.calls.filter((call) => call[0] === "grid_page").at(-1)?.[1]).toMatchObject({ request: { search: null } });
+    expect(wrapper.text()).toContain("客户1");
+    expect(wrapper.find("[data-empty]").exists()).toBe(false);
+    // 与筛选叠加：同一个请求同时携带筛选与关键字
+    await wrapper.get("input[aria-label='搜索关键字']").setValue("小河");
+    await wrapper.findAll("button").find((button) => button.text() === "搜索")!.trigger("click");
+    await flushPromises();
+    await wrapper.get("select[aria-label='筛选列']").setValue("name");
+    await wrapper.get("input[aria-label='筛选值']").setValue("a");
+    await wrapper.get("form.filter-form").trigger("submit");
+    await flushPromises();
+    expect(invoke.mock.calls.filter((call) => call[0] === "grid_page").at(-1)?.[1]).toMatchObject({
+      request: { search: "小河", filters: [{ column: "name", op: "eq", value: "a" }] },
+    });
+    // 计数路径同样吃关键字
+    await wrapper.findAll("button").find((button) => button.text() === "统计匹配行数")!.trigger("click");
+    await flushPromises();
+    expect(invoke.mock.calls.filter((call) => call[0] === "grid_count").at(-1)?.[1]).toMatchObject({
+      request: { search: "小河", filters: [{ column: "name", op: "eq", value: "a" }] },
+    });
+    await wrapper.findAll("button").find((button) => button.text() === "清除关键字")!.trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("清除筛选");
+    await wrapper.get("[data-empty='filter'] button").trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("客户1");
     wrapper.unmount();
   });
 

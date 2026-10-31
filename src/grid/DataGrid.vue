@@ -54,6 +54,7 @@ onBeforeUnmount(() => {
   stopDrag();
   resizeUp?.();
   clearTimeout(discardTimer);
+  clearTimeout(searchTimer);
 });
 const rootEl = ref<HTMLElement | null>(null);
 const filterColumn = ref("");
@@ -69,6 +70,13 @@ const filterValue = ref("");
 const filterSecond = ref("");
 const filterValues = ref("");
 const filterError = ref("");
+/** 整表关键字搜索（R3）：输入停顿或回车后重新读取，清空即恢复；筛选与排序可叠加。 */
+const searchDraft = ref("");
+let searchTimer: ReturnType<typeof setTimeout> | undefined;
+watch(searchDraft, () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => void applySearch(), 300);
+});
 const exportOpen = ref(false);
 const importOpen = ref(false);
 const exportMessage = ref("");
@@ -142,8 +150,8 @@ const visibleRows = computed(() => displayRows.value.slice(range.value.start, ra
 const padTop = computed(() => range.value.top);
 const padBottom = computed(() => range.value.bottom);
 const loading = computed(() => !!session && !session.ready && !session.error);
-const showEmptyTable = computed(() => !!session && session.ready && !session.error && session.filters.length === 0 && displayRows.value.length === 0);
-const showNoMatch = computed(() => !!session && session.ready && !session.error && session.filters.length > 0 && displayRows.value.length === 0);
+const showEmptyTable = computed(() => !!session && session.ready && !session.error && session.filters.length === 0 && !session.search && displayRows.value.length === 0);
+const showNoMatch = computed(() => !!session && session.ready && !session.error && (session.filters.length > 0 || !!session.search) && displayRows.value.length === 0);
 const boundConnection = computed(() => {
   const id = session?.target.connectionId;
   if (!id) return null;
@@ -222,6 +230,27 @@ async function clearFilters() {
   if (!session) return;
   filterError.value = "";
   await session.replaceFilters([]);
+}
+
+/** 关键字与已生效值一致时不重读；中文输入法回车确认候选时不触发。 */
+async function applySearch(): Promise<void> {
+  if (!session) return;
+  clearTimeout(searchTimer);
+  const keyword = searchDraft.value.trim();
+  if (keyword === (session.search ?? "")) return;
+  await session.replaceSearch(keyword);
+}
+
+function onSearchEnter(event: KeyboardEvent): void {
+  if (event.isComposing) return;
+  event.preventDefault();
+  void applySearch();
+}
+
+/** 空态里的“清除关键字”立即恢复，不等输入停顿。 */
+function clearSearch(): void {
+  searchDraft.value = "";
+  void applySearch();
 }
 
 async function retryRead() {
@@ -813,6 +842,8 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
         <input v-if="filterOp === 'between'" v-model="filterSecond" aria-label="筛选第二个值" placeholder="上界" />
         <input v-if="filterOp === 'in'" v-model="filterValues" aria-label="筛选值列表" placeholder="多个值用逗号分隔，空段忽略" />
         <button class="btn sm" type="submit">筛选</button>
+        <input v-model="searchDraft" type="search" aria-label="搜索关键字" placeholder="整表搜索：% 和 _ 按字面匹配" @keydown.enter="onSearchEnter" />
+        <button class="btn sm" type="button" @click="applySearch">搜索</button>
       </form>
       <span v-for="(filter, index) in session.filters" :key="`${filter.column}-${index}`" class="chip">
         <b>{{ filter.column }}</b> {{ opLabel(filter.op) }}
@@ -838,7 +869,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
       <button class="btn sm" type="button" :disabled="session.store.schema.kind !== 'table'" @click="importOpen = true">导入</button>
       <button class="btn sm" type="button" @click="exportOpen = true">导出</button>
     </div>
-    <details v-if="(session.filters.length || session.sort) && session.sql" class="disclosure grid-sql">
+    <details v-if="(session.filters.length || session.sort || session.search) && session.sql" class="disclosure grid-sql">
       <summary>查看这次读取在数据库里执行的 SQL</summary>
       <div class="disclosure-body"><pre class="sql-code">{{ session.sql }}</pre></div>
     </details>
@@ -884,7 +915,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
             <td class="grid-empty" :colspan="Math.max(columns.length, 1)">{{ session.store.schema.kind === "view" ? "这个视图没有行。" : "这张表没有行。" }}<button v-if="session.canInsert" class="btn sm" type="button" @click="session.addRow()">新增行</button></td>
           </tr>
           <tr v-else-if="showNoMatch" data-empty="filter">
-            <td class="grid-empty" :colspan="Math.max(columns.length, 1)">没有匹配行。 <button class="btn sm" type="button" @click="clearFilters">清除筛选</button></td>
+            <td class="grid-empty" :colspan="Math.max(columns.length, 1)">没有匹配行。 <button v-if="session.filters.length" class="btn sm" type="button" @click="clearFilters">清除筛选</button> <button v-if="session.search" class="btn sm" type="button" @click="clearSearch">清除关键字</button></td>
           </tr>
         </tbody>
       </table>

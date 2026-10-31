@@ -182,8 +182,49 @@ pub fn compile_where(schema: &TableSchema, filters: &[Filter]) -> Result<String,
     Ok(parts.join(" AND "))
 }
 
+/// 表数据网格的整表关键字搜索（R3）：跨可作为文本匹配的列生成 OR-LIKE。
+/// `%`/`_`/`!` 经现有 like_literal 的 ESCAPE '!' 字面转义；postgres 用 ILIKE、其余引擎 LIKE，与筛选 contains 同方言。
+/// 二进制、几何与类型未知的列不参与；全部列被排除时给出恒假子句，让“无匹配”空态仍然成立。
+/// 关键字去空白后为空时返回 None，表示没有搜索。
+pub fn search_clause(engine: Engine, columns: &[Column], keyword: &str) -> Option<String> {
+    let keyword = keyword.trim();
+    if keyword.is_empty() {
+        return None;
+    }
+    let op = if engine == Engine::Postgres { "ILIKE" } else { "LIKE" };
+    let pattern = like_literal(keyword, true);
+    let parts = columns
+        .iter()
+        .filter(|column| searchable_family(&column.type_name))
+        .map(|column| format!("{} {op} {pattern} ESCAPE '!'", plain_cast(engine, &quote_ident(engine, &column.name))))
+        .collect::<Vec<_>>();
+    Some(if parts.is_empty() { "1 = 0".to_owned() } else { format!("({})", parts.join(" OR ")) })
+}
+
+/// 与网格投影同源的文本形态判定：二进制、几何与未知类型之外的列都能按文本匹配（数字/日期等先转文本再比）。
+fn searchable_family(type_name: &str) -> bool {
+    !matches!(value_family(type_name), ValueFamily::Binary | ValueFamily::Geometry | ValueFamily::Unknown)
+}
+
+/// compile_where 的搜索叠加形态：筛选条件与整表关键字 AND 组合，分页与计数共用。
+pub fn compile_where_with_search(schema: &TableSchema, filters: &[Filter], search: Option<&str>) -> Result<String, String> {
+    let mut where_sql = compile_where(schema, filters)?;
+    if let Some(clause) = search.and_then(|keyword| search_clause(schema.engine, &schema.columns, keyword)) {
+        if where_sql.is_empty() {
+            where_sql = clause;
+        } else {
+            where_sql = format!("{where_sql} AND {clause}");
+        }
+    }
+    Ok(where_sql)
+}
+
 pub fn browse_sql(schema: &TableSchema, filters: &[Filter], sort: Option<&Sort>, limit: u64, offset: u64) -> Result<String, String> {
-    let where_sql = compile_where(schema, filters)?;
+    browse_sql_with_search(schema, filters, None, sort, limit, offset)
+}
+
+pub fn browse_sql_with_search(schema: &TableSchema, filters: &[Filter], search: Option<&str>, sort: Option<&Sort>, limit: u64, offset: u64) -> Result<String, String> {
+    let where_sql = compile_where_with_search(schema, filters, search)?;
     let clause = if where_sql.is_empty() { String::new() } else { format!(" WHERE {where_sql}") };
     let order = sort
         .map(|item| format!(" ORDER BY {} {}", quote_ident(schema.engine, &item.column), if item.descending { "DESC" } else { "ASC" }))

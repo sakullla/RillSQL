@@ -146,6 +146,22 @@ pub async fn query_page(
     offset: u64,
     limit: u64,
 ) -> Result<LivePage, String> {
+    query_page_search(session, database, schema_name, table, engine_hint, filters, sort, None, offset, limit).await
+}
+
+/// query_page 的整表关键字形态（R3）：搜索子句与筛选在 WHERE 里 AND 组合。
+pub async fn query_page_search(
+    session: &CatalogSession,
+    database: &str,
+    schema_name: &str,
+    table: &str,
+    engine_hint: &str,
+    filters: &[Filter],
+    sort: Option<&Sort>,
+    search: Option<&str>,
+    offset: u64,
+    limit: u64,
+) -> Result<LivePage, String> {
     let schema = describe(session, database, schema_name, table, engine_hint).await?;
     let limit = limit.min(MAX_PAGE);
     if let Some(sort) = sort {
@@ -153,11 +169,11 @@ pub async fn query_page(
             return Err(format!("未知排序列 {}", sort.column));
         }
     }
-    let display = page_sql(&schema, filters, sort, limit, offset)?;
+    let display = page_sql(&schema, filters, search, sort, limit, offset)?;
     if limit == 0 {
         return Ok(LivePage { rows: Vec::new(), truncated: false, sql: display });
     }
-    let executed = page_sql(&schema, filters, sort, limit.saturating_add(1), offset)?;
+    let executed = page_sql(&schema, filters, search, sort, limit.saturating_add(1), offset)?;
     let width = schema.columns.len();
     let mut fetched = fetch_cells(session, &executed, width).await?;
     let truncated = fetched.len() as u64 > limit;
@@ -180,8 +196,21 @@ pub async fn count_rows(
     engine_hint: &str,
     filters: &[Filter],
 ) -> Result<i64, String> {
+    count_rows_search(session, database, schema_name, table, engine_hint, filters, None).await
+}
+
+/// count_rows 的整表关键字形态（R3）：统计行数与分页读到同一组行。
+pub async fn count_rows_search(
+    session: &CatalogSession,
+    database: &str,
+    schema_name: &str,
+    table: &str,
+    engine_hint: &str,
+    filters: &[Filter],
+    search: Option<&str>,
+) -> Result<i64, String> {
     let schema = describe(session, database, schema_name, table, engine_hint).await?;
-    let sql = count_sql(&schema, filters)?;
+    let sql = count_sql(&schema, filters, search)?;
     fetch_count(session, &sql).await
 }
 
@@ -399,9 +428,9 @@ async fn export_body(session: &CatalogSession, spec: &ExportSpec, flag: &AtomicB
             };
             let partial = spec.mode == ExportMode::TableLoaded && spec.truncated;
             let sql = match if spec.mode == ExportMode::TableFull {
-                page_sql_unlimited(&schema, &spec.filters, spec.sort.as_ref())
+                page_sql_unlimited(&schema, &spec.filters, None, spec.sort.as_ref())
             } else {
-                page_sql_full(&schema, &spec.filters, spec.sort.as_ref(), spec.limit)
+                page_sql_full(&schema, &spec.filters, None, spec.sort.as_ref(), spec.limit)
             } {
                 Ok(sql) => sql,
                 Err(message) => return failed_message(message),
@@ -1118,30 +1147,30 @@ fn residual(written: u64, path: &Path, message: &str) -> ExportOutcome {
     }
 }
 
-fn page_sql(schema: &TableSchema, filters: &[Filter], sort: Option<&Sort>, limit: u64, offset: u64) -> Result<String, String> {
-    let body = page_body(schema, filters, sort, false)?;
+fn page_sql(schema: &TableSchema, filters: &[Filter], search: Option<&str>, sort: Option<&Sort>, limit: u64, offset: u64) -> Result<String, String> {
+    let body = page_body(schema, filters, search, sort, false)?;
     let tail = if offset == 0 { format!(" LIMIT {limit}") } else { format!(" LIMIT {limit} OFFSET {offset}") };
     Ok(format!("{body}{tail}"))
 }
 
-fn page_sql_full(schema: &TableSchema, filters: &[Filter], sort: Option<&Sort>, limit: u64) -> Result<String, String> {
-    let body = page_body(schema, filters, sort, true)?;
+fn page_sql_full(schema: &TableSchema, filters: &[Filter], search: Option<&str>, sort: Option<&Sort>, limit: u64) -> Result<String, String> {
+    let body = page_body(schema, filters, search, sort, true)?;
     Ok(format!("{body} LIMIT {limit}"))
 }
 
-fn page_sql_unlimited(schema: &TableSchema, filters: &[Filter], sort: Option<&Sort>) -> Result<String, String> {
-    page_body(schema, filters, sort, true)
+fn page_sql_unlimited(schema: &TableSchema, filters: &[Filter], search: Option<&str>, sort: Option<&Sort>) -> Result<String, String> {
+    page_body(schema, filters, search, sort, true)
 }
 
-fn page_body(schema: &TableSchema, filters: &[Filter], sort: Option<&Sort>, full: bool) -> Result<String, String> {
+fn page_body(schema: &TableSchema, filters: &[Filter], search: Option<&str>, sort: Option<&Sort>, full: bool) -> Result<String, String> {
     let list = sql::select_list(schema, full || sql::reads_full_values(schema, filters));
-    let where_sql = sql::compile_where(schema, filters)?;
+    let where_sql = sql::compile_where_with_search(schema, filters, search)?;
     let clause = if where_sql.is_empty() { String::new() } else { format!(" WHERE {where_sql}") };
     Ok(format!("SELECT {list} FROM {}{clause}{}", sql::qualified_name(schema), order_clause(schema, sort)))
 }
 
-fn count_sql(schema: &TableSchema, filters: &[Filter]) -> Result<String, String> {
-    let where_sql = sql::compile_where(schema, filters)?;
+fn count_sql(schema: &TableSchema, filters: &[Filter], search: Option<&str>) -> Result<String, String> {
+    let where_sql = sql::compile_where_with_search(schema, filters, search)?;
     let clause = if where_sql.is_empty() { String::new() } else { format!(" WHERE {where_sql}") };
     let count = match schema.engine {
         Engine::Postgres => "COUNT(*)::bigint",
