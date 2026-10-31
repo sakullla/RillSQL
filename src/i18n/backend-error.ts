@@ -18,16 +18,24 @@ export interface CodedError {
   hint?: string | null;
 }
 
-const CODED_PREFIX = /^\[([a-z0-9]+(?:\.[a-z0-9_]+)+)((?:\s+[a-z_][a-z0-9_]*="[^"]*")*)\] /;
+// 参数段引号感知（T6-A4）：值允许含空格；双引号与反斜杠按后端约定转义为 \" 与 \\。
+const CODED_PREFIX = /^\[([a-z0-9]+(?:\.[a-z0-9_]+)+)((?:\s+[a-z_][a-z0-9_]*="(?:[^"\\]|\\.)*")*)\] /;
+const PARAM_PAIR = /[a-z_][a-z0-9_]*="((?:[^"\\]|\\.)*)"/g;
+
+/** 反转义参数值：\" → "、\\ → \；未约定的 \x 序列宽容地还原为 x。 */
+function unescapeParamValue(value: string): string {
+  return value.replace(/\\(.)/g, "$1");
+}
 
 /** 剥离 `[code key="value"] ` 前缀：返回 {code, params, text}；无前缀时 code 为 null、text 原样。 */
 export function parseCodedText(text: string): { code: string | null; params: Record<string, string>; text: string } {
   const match = CODED_PREFIX.exec(text);
   if (!match) return { code: null, params: {}, text };
   const params: Record<string, string> = {};
-  for (const pair of match[2]!.split(/\s+/).filter(Boolean)) {
-    const equals = pair.indexOf("=");
-    if (equals > 0) params[pair.slice(0, equals)] = pair.slice(equals + 2, -1);
+  // 逐对 matchAll 解析（不按空白 split）：值中的空格属于引号边界内，不能当分隔符。
+  for (const pair of match[2]!.matchAll(PARAM_PAIR)) {
+    const equals = pair[0].indexOf("=");
+    params[pair[0].slice(0, equals)] = unescapeParamValue(pair[1]!);
   }
   return { code: match[1]!, params, text: text.slice(match[0].length) };
 }

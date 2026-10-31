@@ -26,6 +26,33 @@ describe("backend error code bridge", () => {
     expect(parsed.text).toBe("当前连接打开的是 bookstore，没有另开连接读取 reports");
   });
 
+  it("keeps spaces inside quoted values and round-trips escaped quotes (T6-A4)", () => {
+    // 值含空格（含中文空格库名）：不按空白截断。
+    const spaced = parseCodedText('[dump.session_gap current="My Database" database="报表 中心"] 当前连接打开的是 My Database，没有另开连接读取 报表 中心');
+    expect(spaced.code).toBe("dump.session_gap");
+    expect(spaced.params).toEqual({ current: "My Database", database: "报表 中心" });
+    // 值含转义的双引号与反斜杠：按后端约定 \" 与 \\ 往返还原。
+    const quoted = parseCodedText('[dump.session_gap current="My \\"Book\\" Store" database="a\\\\b"] 原文');
+    expect(quoted.params).toEqual({ current: 'My "Book" Store', database: "a\\b" });
+    expect(quoted.text).toBe("原文");
+  });
+
+  it("interpolates the full database name end to end in English (T6-A4)", () => {
+    const error = '[dump.session_gap current="My Database" database="报表 中心"] 当前连接打开的是 My Database，没有另开连接读取 报表 中心';
+    setLocale("en");
+    try {
+      const text = backendErrorText(error);
+      expect(text).toContain("My Database");
+      expect(text).toContain("报表 中心");
+      expect(text).not.toContain("[dump.session_gap");
+    } finally {
+      setLocale("zh-CN");
+    }
+    // zh 回退原文，前缀同样剥离完整。
+    expect(backendErrorText(error)).not.toContain("[dump.session_gap");
+    expect(backendErrorText(error)).toContain("报表 中心");
+  });
+
   it("extracts codes from strings, Errors and coded objects (errorCodeOf)", () => {
     expect(errorCodeOf(CODED)).toBe("import.passphrase_required");
     expect(errorCodeOf(new Error(SESSION_GAP))).toBe("dump.session_gap");

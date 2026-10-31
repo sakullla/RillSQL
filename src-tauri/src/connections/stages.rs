@@ -386,4 +386,25 @@ mod error_code_tests {
         let plain = error_codes::coded_string_params(error_codes::DUMP_DATABASE_REQUIRED, &[], "需要数据库名，没有另开连接。");
         assert!(plain.starts_with("[dump.database_required] "));
     }
+
+    /// T6-A4：值中的双引号/反斜杠强制转义、空格不截断——前缀始终可被前端剥离（不再依赖 debug_assert）。
+    #[test]
+    fn coded_string_params_escape_quotes_and_keep_spaces() {
+        let text = error_codes::coded_string_params(
+            error_codes::DUMP_SESSION_GAP,
+            &[("current", "My \"Book\" Store"), ("database", "报表 中心")],
+            "原文保持不变",
+        );
+        assert!(text.starts_with("[dump.session_gap current=\"My \\\"Book\\\" Store\" database=\"报表 中心\"] "));
+        assert!(text.ends_with("原文保持不变"));
+        // 转义后参数段语法完整：除两对包裹引号外，其余引号均以 \" 转义形式出现。
+        let prefix = &text[..text.find("] ").unwrap() + 2];
+        let quotes = prefix.matches('"').count();
+        let escaped = prefix.matches("\\\"").count();
+        assert_eq!(quotes - escaped, 4);
+        assert_eq!(escaped, 2);
+        // 反斜杠同样成对转义，避免与 \" 转义歧义。
+        let slashed = error_codes::coded_string_params(error_codes::DUMP_SESSION_GAP, &[("database", "a\\b")], "x");
+        assert!(slashed.starts_with("[dump.session_gap database=\"a\\\\b\"] "));
+    }
 }
