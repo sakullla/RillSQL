@@ -705,6 +705,11 @@ fn sqlserver_wants_rows(sql: &str) -> bool {
 /// （父节点缺失或 NodeId 非数字时按原序返回，不猜）；有效层次才重排。
 pub fn order_showplan_results(columns: &[String], rows: Vec<Vec<Option<String>>>) -> Vec<Vec<Option<String>>> {
     let names: Vec<String> = columns.iter().map(|column| column.trim().to_ascii_lowercase()).collect();
+    // 只对 SHOWPLAN_ALL 形状应用：除 NodeId/Parent 外还须有 PhysicalOp/LogicalOp/StmtId 等
+    // SHOWPLAN 专属列同现——普通查询恰好有 NodeId+Parent 数字列时不重排、保持原序。
+    if !names.iter().any(|name| matches!(name.as_str(), "physicalop" | "logicalop" | "stmtid" | "estimaterows" | "totalsubtreecost")) {
+        return rows;
+    }
     let (Some(node_at), Some(parent_at)) = (names.iter().position(|name| name == "nodeid"), names.iter().position(|name| name == "parent")) else {
         return rows;
     };

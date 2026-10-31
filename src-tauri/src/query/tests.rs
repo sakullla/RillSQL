@@ -776,6 +776,14 @@ fn sqlserver_showplan_result_rows_are_ordered_parents_first() {
     let plain = vec![Some("a".to_owned()), Some("b".to_owned())];
     let kept = exec::order_showplan_results(&columns, vec![plain.clone()]);
     assert_eq!(kept, vec![plain]);
+    // 普通结果集恰好带 NodeId+Parent 数字列（无 SHOWPLAN 专属列）时不重排、保持原序。
+    let ordinary_columns: Vec<String> = ["NodeId", "Parent", "value"].iter().map(|item| item.to_string()).collect();
+    let ordinary = vec![
+        vec![Some("2".to_owned()), Some("1".to_owned()), Some("second".to_owned())],
+        vec![Some("1".to_owned()), Some("0".to_owned()), Some("first".to_owned())],
+    ];
+    let unchanged = exec::order_showplan_results(&ordinary_columns, ordinary.clone());
+    assert_eq!(unchanged, ordinary, "非 SHOWPLAN 形状不得静默重排");
     let ordinary_columns: Vec<String> = ["id", "name"].iter().map(|item| item.to_string()).collect();
     let untouched = exec::order_showplan_results(&ordinary_columns, vec![vec![Some("1".to_owned()), Some("x".to_owned())]]);
     assert_eq!(untouched.len(), 1);
@@ -1292,6 +1300,11 @@ fn tsql_split_handles_bracket_identifiers_try_catch_and_go_batches() {
     // 未闭合的方括号整批拒绝。
     let unclosed = split::split_sql("sqlserver", "SELECT [name FROM t;");
     assert_eq!(unclosed.refusal.as_deref(), Some("方括号标识符没有闭合，没有发送。"));
+    // 方括号标识符里的 -- 不是注释（与 TS 镜像同序）：标识符完整保留、正常切分。
+    let dashed = split::split_sql("sqlserver", "SELECT [a--b] FROM t; SELECT 1;");
+    assert_eq!(dashed.pieces.len(), 2, "{dashed:?}");
+    assert!(dashed.pieces[0].text.contains("[a--b]"), "{dashed:?}");
+    assert!(dashed.refusal.is_none(), "{dashed:?}");
     // 方括号里的 TOP/LIMIT 不当关键字：行数上限照常改写为 TOP。
     assert_eq!(
         exec::cap_result_sql("sqlserver", "SELECT [limit] FROM t", 10),

@@ -1480,6 +1480,10 @@ describe("tsql statement split", () => {
     expect(brackets[0]!.text).toContain("[a]]b]");
     const unclosed = inspectSql("SELECT [name FROM t;", "sqlserver");
     expect(unclosed.refusal).toBe("方括号标识符没有闭合，没有发送。");
+    // 方括号标识符里的 -- 不是注释（与 Rust 镜像同序）：标识符完整保留、正常切分。
+    const dashed = splitSql("SELECT [a--b] FROM t; SELECT 1;", "sqlserver");
+    expect(dashed).toHaveLength(2);
+    expect(dashed[0]!.text).toContain("[a--b]");
 
     // TRY/CATCH 是一条语句：END TRY 后的分号不切分，END CATCH 才收束。
     const tryCatch = splitSql("BEGIN TRY\n  SELECT 1;\nEND TRY;\nBEGIN CATCH\n  SELECT 2;\nEND CATCH\nSELECT 3;", "sqlserver");

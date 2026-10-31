@@ -326,14 +326,8 @@ fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool, tsql_blo
             i += utf8_len(bytes[i]);
             continue;
         }
-        if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-            i = eol_at(sql, i + 2);
-            continue;
-        }
-        if hash && bytes[i] == b'#' {
-            i = eol_at(sql, i + 1);
-            continue;
-        }
+        // 方括号标识符态先于注释判定：[a--b]/[a/*b] 里的 -- 与 /* 是标识符内容，
+        // 与 TS 镜像（split.ts）的检查顺序同序。
         if tsql_blocks && bracket {
             if bytes[i] == b']' {
                 if i + 1 < bytes.len() && bytes[i + 1] == b']' {
@@ -345,6 +339,14 @@ fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool, tsql_blo
                 continue;
             }
             i += utf8_len(bytes[i]);
+            continue;
+        }
+        if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            i = eol_at(sql, i + 2);
+            continue;
+        }
+        if hash && bytes[i] == b'#' {
+            i = eol_at(sql, i + 1);
             continue;
         }
         if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {

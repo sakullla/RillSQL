@@ -951,11 +951,16 @@ fn sqlserver_alters_use_tsql_forms_without_inline_defaults() {
     assert!(dynamic.sql.contains("sys.default_constraints"), "{:?}", planned.steps);
     assert!(dynamic.sql.contains("OBJECT_ID(N'[dbo].[notes]')"), "{:?}", planned.steps);
 
-    // 改默认值：ADD CONSTRAINT DF_<表>_<列> DEFAULT ... FOR。
+    // 改默认值：先摘既有约束再 ADD（同名 2714 / 不同名 1781 都会失败），ADD 用 DF_<表>_<列> 名。
     let mut change_default = snapshot.columns.iter().map(draft_of).collect::<Vec<_>>();
     change_default.iter_mut().find(|column| column.name == "status").unwrap().default_sql = "N'done'".to_owned();
     let planned = plan(&snapshot, &Action::AlterColumns { table: "notes".to_owned(), columns: change_default });
-    assert!(planned.steps.iter().any(|step| step.sql.contains("ALTER TABLE [dbo].[notes] ADD CONSTRAINT [DF_notes_status] DEFAULT N'done' FOR [status];")), "{:?}", planned.steps);
+    let drop_at = planned.steps.iter().position(|step| step.sql.contains("ALTER TABLE [dbo].[notes] DROP CONSTRAINT [DF_notes_status];"));
+    let add_at = planned.steps.iter().position(|step| step.sql.contains("ALTER TABLE [dbo].[notes] ADD CONSTRAINT [DF_notes_status] DEFAULT N'done' FOR [status];"));
+    let (Some(drop), Some(add)) = (drop_at, add_at) else {
+        panic!("改默认值应先 DROP 再 ADD：{:?}", planned.steps);
+    };
+    assert!(drop < add, "DROP 必须在 ADD 之前：{:?}", planned.steps);
 
     // 重命名：sp_rename，不生成 MySQL 式 CHANGE。
     let mut renamed = snapshot.columns.iter().map(draft_of).collect::<Vec<_>>();

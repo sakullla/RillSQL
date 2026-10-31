@@ -665,6 +665,15 @@ fn remote_alters(snapshot: &Snapshot, table: &str, changes: &[Change]) -> Result
                             );
                             steps.push(Step { sql, label: format!("删除默认值 {}", draft.name.trim()) });
                         } else {
+                            // 既有默认值要先摘除：直接 ADD 同名约束报 2714、不同名报 1781，脚本必失败。
+                            // 与对比侧 tsql_default_change 同口径（有名走 DROP CONSTRAINT，无名按 sys.default_constraints 动态查找）。
+                            if original.default_sql.as_deref().map(str::trim).is_some_and(|value| !value.is_empty()) {
+                                let drop = format!(
+                                    "{};",
+                                    super::sql::sqlserver_drop_default_sql(&qualified, original.name.trim(), original.default_constraint.as_deref().unwrap_or(""))
+                                );
+                                steps.push(Step { sql: drop, label: format!("删除原默认值 {}", original.name) });
+                            }
                             let table_name = super::sql::sqlserver_bare_table_name(&qualified);
                             let sql = format!(
                                 "{};",
