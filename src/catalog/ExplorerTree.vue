@@ -122,6 +122,13 @@ function sessionGap(database: DatabaseNode) {
   return postgresSessionGap(database.error);
 }
 
+/** lost 提示带上分阶段原因（探活失败 / 重连放弃的原因），没有原因时用通用文案。 */
+function lostNote(connection: CatalogConnection): string {
+  const base = "连接已断开，这里显示的是断开前读到的内容，可能不是最新。";
+  const reason = connection.error?.trim();
+  return reason ? `${base}（${reason}）` : base;
+}
+
 function focusKey(connectionId: string, database: string) {
   return `${connectionId}:${database}`;
 }
@@ -524,7 +531,7 @@ onBeforeUnmount(() => {
           <div v-if="!isConnected(connection.status)" class="tree-note" :class="{ warn: connection.status === 'lost' }" :style="depthStyle(1)" data-disconnected>
             <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="connection.status === 'lost' ? ICONS.warn : ICONS.info" /></svg>
             <div>
-              <span>{{ connection.status === "lost" ? "连接已断开，这里显示的是断开前读到的内容，可能不是最新。" : "未连接——连接后才会读取这里的表。" }}</span>
+              <span>{{ connection.status === "lost" ? lostNote(connection) : "未连接——连接后才会读取这里的表。" }}</span>
               <form v-if="passwordFor === connection.id" class="tree-connect" @submit.prevent="connectSession(connection, typedPassword)">
                 <input v-model="typedPassword" type="password" autocomplete="current-password" aria-label="数据库密码" />
                 <button class="btn sm primary" type="submit" data-action="tree-connect" :data-connection="connection.id" :disabled="connecting === connection.id">连接</button>

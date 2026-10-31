@@ -9,7 +9,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::connections::commands::ConnectionsState;
-use crate::connections::{CancelTransport, CatalogSession, Service};
+use crate::connections::{CancelTransport, CatalogSession, Service, SessionCondition};
 
 use super::cancel::{self, CancelView};
 use super::exec::{self, RowSink, StatementReport, StatementValue};
@@ -137,9 +137,14 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
     }
     let notices = report.notices;
     let parts = report.pieces;
-    let session = service
-        .catalog_session(&request.connection_id)
-        .ok_or_else(|| "这条连接还没有打开，没有另开新的连接。".to_owned())?;
+    let session = service.catalog_session(&request.connection_id).ok_or_else(|| {
+        // lost 状态明确拒绝新执行：结果未知的写语句不会被静默排队重放（R4）。
+        if matches!(service.session_condition(&request.connection_id), Some(SessionCondition::Lost { .. })) {
+            "连接已断开，自动重连成功后才能执行。没有把这次语句排队重发。".to_owned()
+        } else {
+            "这条连接还没有打开，没有另开新的连接。".to_owned()
+        }
+    })?;
     if matches!(session, CatalogSession::Scripted) {
         return Err("这个连接没有连着可查询的数据库".to_owned());
     }

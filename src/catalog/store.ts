@@ -1,7 +1,7 @@
 import { shallowRef, reactive } from "vue";
 import { presentEnv, type EnvTag, type SavedConnection } from "../connections/model";
 import { loadSettings } from "../shell/settings";
-import { fetchCatalog, fetchPage, fetchSessions, listConnections, listEnvTags, type ObjectLimit } from "./backend";
+import { fetchCatalog, fetchPage, fetchSessions, listConnections, listEnvTags, type ObjectLimit, type SessionStatusInfo } from "./backend";
 import { describeStructure } from "../structure/api";
 import { objectPath, refreshConnection, refreshSchema, serverSliceCount, successfulTotal } from "./tree";
 import { DEFAULT_OBJECT_PAGE, type CatalogConnection, type Engine, type PageRequest, type PageResult, type PaletteTable, type SchemaNode } from "./types";
@@ -34,6 +34,8 @@ export interface StructureFocus {
 
 const connections = shallowRef<CatalogConnection[]>([]);
 const loadError = shallowRef<string | null>(null);
+/** 目录是否已经成功读过一次：恢复的标签据此判断“连接已删”还是“还在加载”。 */
+const loaded = shallowRef(false);
 const outlines = shallowRef<Record<string, ObjectOutline>>({});
 export const structureFocus = shallowRef<StructureFocus | null>(null);
 let outlineLoader: ((target: OutlineTarget) => Promise<ObjectOutline>) | null = null;
@@ -74,6 +76,10 @@ export function catalogConnections(): CatalogConnection[] {
 
 export function catalogLoadError(): string | null {
   return loadError.value;
+}
+
+export function catalogLoaded(): boolean {
+  return loaded.value;
 }
 
 export function refreshLimit(loaded: number, page: number): number {
@@ -117,6 +123,7 @@ function rememberShown(list: CatalogConnection[]): void {
 export function replaceCatalog(list: CatalogConnection[]): void {
   connections.value = list;
   loadError.value = null;
+  loaded.value = true;
   rememberShown(list);
 }
 
@@ -125,6 +132,7 @@ export function resetCatalog(): void {
   connectionReads.clear();
   connections.value = [];
   loadError.value = null;
+  loaded.value = false;
   refreshSource = null;
   pageSource = null;
   pageOverride = null;
@@ -226,6 +234,7 @@ function patchSchema(connectionId: string, database: string, schemaName: string,
 
 function applySnapshot(incoming: CatalogConnection[]): void {
   loadError.value = null;
+  loaded.value = true;
   const previous = new Map(connections.value.map((connection) => [connection.id, connection]));
   const merged = incoming.map((connection) => {
     const old = previous.get(connection.id);
@@ -254,7 +263,7 @@ function enqueueConnectionRead(id: string, run: () => Promise<void>): Promise<vo
   return next;
 }
 
-function connectionShell(saved: SavedConnection, connected: boolean, tags: readonly EnvTag[]): CatalogConnection {
+function connectionShell(saved: SavedConnection, status: CatalogConnection["status"], reason: string | null, tags: readonly EnvTag[]): CatalogConnection {
   const env = presentEnv(saved.env, tags);
   return {
     id: saved.id,
@@ -263,16 +272,18 @@ function connectionShell(saved: SavedConnection, connected: boolean, tags: reado
     env: saved.env,
     envLabel: env.label,
     envTone: env.tone,
-    status: connected ? "connected" : "disconnected",
+    status,
     defaultDatabase: saved.database ?? null,
     foreignKeys: null,
-    error: null,
+    // lost 状态下没有目录读取，error 字段用来带出断开原因（重连失败的分阶段原因）。
+    error: status === "lost" ? reason : null,
     databases: [],
   };
 }
 
 function applyShells(shells: CatalogConnection[]): void {
   loadError.value = null;
+  loaded.value = true;
   const previous = new Map(connections.value.map((connection) => [connection.id, connection]));
   connections.value = shells.map((shell) => {
     const old = previous.get(shell.id);
@@ -280,7 +291,8 @@ function applyShells(shells: CatalogConnection[]): void {
     return {
       ...shell,
       foreignKeys: shell.engine === "sqlite" ? old.foreignKeys : null,
-      error: old.error,
+      // lost 的原因随本次快照更新；其余状态沿用已读到的目录错误。
+      error: shell.status === "lost" ? shell.error : old.error,
       databases: old.databases,
     };
   });
@@ -395,10 +407,21 @@ async function readConnectionTargets(connectionId: string, page: number, generat
   }
 }
 
+/** 轮询键包含状态与原因：断线/重连/原因变化都会触发一次目录刷新。 */
+function sessionsKey(sessions: readonly SessionStatusInfo[]): string {
+  return sessions.map((item) => `${item.id}:${item.status}:${item.reason ?? ""}`).join("\n");
+}
+
+function sessionStatus(info: SessionStatusInfo | undefined): CatalogConnection["status"] {
+  if (!info) return "disconnected";
+  if (info.status === "reconnecting") return "connecting";
+  return info.status;
+}
+
 export async function refreshFromBackend(): Promise<void> {
   const generation = refreshGeneration;
   const page = objectPageSize();
-  let sessions: string[] | null;
+  let sessions: SessionStatusInfo[] | null;
   let saved: SavedConnection[];
   let tags: EnvTag[];
   try {
@@ -412,11 +435,11 @@ export async function refreshFromBackend(): Promise<void> {
     loadError.value = "读不到已打开的连接。到「连接」页确认连接还能打开。";
     return;
   }
-  const open = new Set(sessions);
-  applyShells(saved.map((item) => connectionShell(item, open.has(item.id), tags)));
+  const statusById = new Map(sessions.map((item) => [item.id, item]));
+  applyShells(saved.map((item) => connectionShell(item, sessionStatus(statusById.get(item.id)), statusById.get(item.id)?.reason ?? null, tags)));
   await Promise.all(
     saved
-      .filter((item) => open.has(item.id))
+      .filter((item) => statusById.get(item.id)?.status === "connected")
       .map((item) => enqueueConnectionRead(item.id, () => readConnectionTargets(item.id, page, generation))),
   );
 }
@@ -430,9 +453,9 @@ function armPoll(): void {
 
 async function pollSessions(): Promise<void> {
   if (refreshSource) return;
-  const ids = await fetchSessions();
-  if (ids === null) return;
-  const key = ids.join("\n");
+  const sessions = await fetchSessions();
+  if (sessions === null) return;
+  const key = sessionsKey(sessions);
   if (key === seenSessions) return;
   seenSessions = key;
   await refreshFromBackend();
@@ -440,13 +463,13 @@ async function pollSessions(): Promise<void> {
 
 export async function startCatalog(): Promise<void> {
   if (refreshSource) return;
-  const ids = await fetchSessions();
-  if (ids === null) {
+  const sessions = await fetchSessions();
+  if (sessions === null) {
     if (connections.value.length === 0) loadError.value = "读不到已打开的连接。到「连接」页确认连接还能打开。";
     return;
   }
+  seenSessions = sessionsKey(sessions);
   await refreshFromBackend();
-  seenSessions = ids.join("\n");
   armPoll();
 }
 

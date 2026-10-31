@@ -13,7 +13,7 @@ mod stages;
 mod store;
 mod verify;
 
-pub use service::{CancelTransport, CatalogSession, EphemeralRead, Service};
+pub use service::{CancelTransport, CatalogSession, EphemeralRead, Service, SessionCondition, SessionHealth, SessionStatus};
 
 pub fn module_id() -> &'static str {
     let _linked = (

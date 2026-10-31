@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -91,6 +92,36 @@ pub struct Probes {
     pub ssh: Option<Arc<dyn SshProbe>>,
     pub database: Option<Arc<dyn DatabaseProbe>>,
     pub sqlite: Option<Arc<dyn SqliteProbe>>,
+    /// 探活探针。None 时用真实探针（PG SELECT 1 / MySQL ping；SQLite 免）。
+    pub health: Option<Arc<dyn HealthProbe>>,
+}
+
+/// 会话探活：在已打开的会话上发一条最小语句确认连接还活着。
+#[async_trait::async_trait]
+pub trait HealthProbe: Send + Sync {
+    async fn check(&self, session: &CatalogSession) -> Result<(), String>;
+}
+
+struct SelectOneProbe;
+
+#[async_trait::async_trait]
+impl HealthProbe for SelectOneProbe {
+    async fn check(&self, session: &CatalogSession) -> Result<(), String> {
+        use mysql_async::prelude::Queryable;
+        match session {
+            // SQLite 是本地文件，没有“断线”可言，免探活（这里到不了，防御返回成功）。
+            CatalogSession::Sqlite { .. } | CatalogSession::Scripted => Ok(()),
+            CatalogSession::Mysql(pool) => {
+                let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
+                conn.ping().await.map_err(|err| err.to_string())
+            }
+            CatalogSession::Postgres(client) => client
+                .simple_query("SELECT 1")
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -113,21 +144,125 @@ struct Session {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     foreign_keys: Option<bool>,
     cancel: CancelTransport,
+    health: Arc<SessionHealth>,
+}
+
+/// 会话健康状态（R4）。执行路径通过 `CancelTransport` 报告断线类错误（suspect），
+/// 轮询探活消费这个标记：探活失败把会话置为 lost，有限次退避重连成功后由新会话替代。
+pub struct SessionHealth {
+    suspect: AtomicBool,
+    lost: AtomicBool,
+    reason: Mutex<Option<String>>,
+    busy: AtomicUsize,
+    probing: AtomicBool,
+    last_ok: Mutex<Instant>,
+}
+
+impl Default for SessionHealth {
+    fn default() -> Self {
+        Self {
+            suspect: AtomicBool::new(false),
+            lost: AtomicBool::new(false),
+            reason: Mutex::new(None),
+            busy: AtomicUsize::new(0),
+            probing: AtomicBool::new(false),
+            last_ok: Mutex::new(Instant::now()),
+        }
+    }
+}
+
+impl SessionHealth {
+    pub fn note_activity(&self) {
+        *self.last_ok.lock().expect("last_ok") = Instant::now();
+    }
+
+    /// 执行路径看到断线类错误：不直接判死，交给下一次轮询探活确认。
+    pub fn note_disconnect(&self) {
+        self.suspect.store(true, Ordering::SeqCst);
+    }
+
+    pub fn clear_suspect(&self) {
+        self.suspect.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_suspect(&self) -> bool {
+        self.suspect.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_lost(&self, reason: String) {
+        self.suspect.store(false, Ordering::SeqCst);
+        self.lost.store(true, Ordering::SeqCst);
+        *self.reason.lock().expect("reason") = Some(reason);
+    }
+
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+
+    pub fn lost_reason(&self) -> Option<String> {
+        self.reason.lock().expect("reason").clone()
+    }
+
+    /// 重连放弃等原因更新（保持 lost，不改变其余状态）。
+    pub fn set_lost_reason(&self, reason: Option<String>) {
+        *self.reason.lock().expect("reason") = reason;
+    }
+
+    pub fn note_busy(&self) {
+        self.busy.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn note_idle(&self) {
+        self.busy.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub fn busy(&self) -> usize {
+        self.busy.load(Ordering::SeqCst)
+    }
+
+    /// 空闲多久了。最近一次成功活动或打开时间起算。
+    pub fn idle_for(&self) -> Duration {
+        self.last_ok.lock().expect("last_ok").elapsed()
+    }
+
+    /// 探活是否需要触发：上次操作报告过断线，或空闲超过阈值。SQLite 免探活。
+    pub fn needs_probe(&self, sqlite: bool) -> bool {
+        if sqlite {
+            return false;
+        }
+        self.is_suspect() || self.idle_for() >= IDLE_PROBE_AFTER
+    }
+
+    fn begin_probe(&self) -> bool {
+        !self.probing.swap(true, Ordering::SeqCst)
+    }
+
+    fn end_probe(&self) {
+        self.probing.store(false, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub fn rewind_idle(&self, elapsed: Duration) {
+        let mut last_ok = self.last_ok.lock().expect("last_ok");
+        *last_ok = last_ok.checked_sub(elapsed).unwrap_or(*last_ok);
+    }
 }
 
 /// 取消正在执行的语句。查询本身仍走已打开的会话，不从这里再拨一条执行连接。
 #[derive(Clone)]
 pub enum CancelTransport {
-    Sqlite(Arc<AtomicBool>),
+    Sqlite(Arc<AtomicBool>, Arc<SessionHealth>),
     Mysql {
         connection_id: Arc<AtomicU64>,
         opts: mysql_async::Opts,
         via_ssh: bool,
+        health: Arc<SessionHealth>,
     },
     Postgres {
         token: tokio_postgres::CancelToken,
         tls: Option<tokio_postgres_rustls::MakeRustlsConnect>,
         via_ssh: bool,
+        health: Arc<SessionHealth>,
     },
     None,
 }
@@ -142,7 +277,7 @@ impl CancelTransport {
 
     pub fn sqlite_flag(&self) -> Option<Arc<AtomicBool>> {
         match self {
-            Self::Sqlite(flag) => Some(Arc::clone(flag)),
+            Self::Sqlite(flag, _) => Some(Arc::clone(flag)),
             _ => None,
         }
     }
@@ -150,6 +285,35 @@ impl CancelTransport {
     pub fn set_mysql_connection_id(&self, id: u64) {
         if let Self::Mysql { connection_id, .. } = self {
             connection_id.store(id, Ordering::SeqCst);
+        }
+    }
+
+    pub fn health(&self) -> Option<&Arc<SessionHealth>> {
+        match self {
+            Self::Sqlite(_, health) | Self::Mysql { health, .. } | Self::Postgres { health, .. } => Some(health),
+            Self::None => None,
+        }
+    }
+
+    /// 会话入表时把执行共享的健康句柄接到取消通道上，执行路径据此报告断线。
+    pub fn attach_health(&mut self, health: Arc<SessionHealth>) {
+        match self {
+            Self::Sqlite(_, slot) => *slot = health,
+            Self::Mysql { health: slot, .. } => *slot = health,
+            Self::Postgres { health: slot, .. } => *slot = health,
+            Self::None => {}
+        }
+    }
+
+    pub fn note_activity(&self) {
+        if let Some(health) = self.health() {
+            health.note_activity();
+        }
+    }
+
+    pub fn note_disconnect(&self) {
+        if let Some(health) = self.health() {
+            health.note_disconnect();
         }
     }
 }
@@ -195,6 +359,8 @@ pub struct Service {
     sessions: Mutex<HashMap<String, Session>>,
     pending: Mutex<HashMap<String, PendingHostKey>>,
     probes: Probes,
+    /// lost 会话的自动重连计划：有限次退避，确定性错误直接放弃（R4）。
+    reconnects: Mutex<HashMap<String, ReconnectPlan>>,
 }
 
 impl Service {
@@ -212,6 +378,7 @@ impl Service {
             sessions: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             probes,
+            reconnects: Mutex::new(HashMap::new()),
         }
     }
 
@@ -227,6 +394,12 @@ impl Service {
     #[cfg(test)]
     pub fn is_connected(&self, id: &str) -> bool {
         self.sessions.lock().expect("sessions").contains_key(id)
+    }
+
+    /// 测试访问器：直接拿到会话健康句柄，模拟空闲超时或执行路径的断线报告。
+    #[cfg(test)]
+    pub fn session_health(&self, id: &str) -> Option<std::sync::Arc<SessionHealth>> {
+        self.sessions.lock().expect("sessions").get(id).map(|session| std::sync::Arc::clone(&session.health))
     }
 
     pub async fn list(&self) -> Result<Vec<ConnectionRecord>, String> {
@@ -508,6 +681,7 @@ impl Service {
 
     pub fn disconnect(&self, id: &str) {
         let session = self.sessions.lock().expect("sessions").remove(id);
+        self.reconnects.lock().expect("reconnects").remove(id);
         if let Some(session) = session {
             if let Some(shutdown) = session.shutdown {
                 let _ = shutdown.send(());
@@ -662,15 +836,21 @@ impl Service {
             } else {
                 SessionKind::Scripted
             };
+            let health = Arc::new(SessionHealth::default());
+            let mut cancel = attempt.cancel.clone();
+            cancel.attach_health(Arc::clone(&health));
             self.sessions.lock().expect("sessions").insert(
                 id.to_owned(),
                 Session {
                     kind,
                     shutdown: attempt.shutdown.take(),
                     foreign_keys,
-                    cancel: attempt.cancel.clone(),
+                    cancel,
+                    health,
                 },
             );
+            // 新会话（手动打开或自动重连成功）都视为健康，旧的自动重连计划作废。
+            self.reconnects.lock().expect("reconnects").remove(id);
         }
         Ok(OpenOutcome {
             report,
@@ -695,10 +875,18 @@ impl Service {
         let _ = message;
     }
 
-    pub fn open_session_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.sessions.lock().expect("sessions").keys().cloned().collect();
-        ids.sort();
-        ids
+    /// 会话当前状态：Some(Connected) / Some(Lost) / None（未打开）。lost 会话仍留在表里，
+    /// 树上显示断开前读到的内容，但不再接受新的执行（R4：不静默排队重放）。
+    pub fn session_condition(&self, id: &str) -> Option<SessionCondition> {
+        let sessions = self.sessions.lock().expect("sessions");
+        let session = sessions.get(id)?;
+        Some(if session.health.is_lost() {
+            SessionCondition::Lost {
+                reason: session.health.lost_reason(),
+            }
+        } else {
+            SessionCondition::Connected
+        })
     }
 
     pub fn cancel_transport(&self, id: &str) -> Option<CancelTransport> {
@@ -706,8 +894,13 @@ impl Service {
     }
 
     pub fn catalog_session(&self, id: &str) -> Option<CatalogSession> {
-        let sessions = self.sessions.lock().expect("sessions");
-        let session = sessions.get(id)?;
+        let mut sessions = self.sessions.lock().expect("sessions");
+        let session = sessions.get_mut(id)?;
+        if session.health.is_lost() {
+            return None;
+        }
+        // 读路径也算活动：目录/网格读取会刷新空闲计时，避免长任务期间误探活。
+        session.health.note_activity();
         Some(match &session.kind {
             SessionKind::Sqlite(pool) => CatalogSession::Sqlite {
                 pool: pool.clone(),
@@ -717,6 +910,214 @@ impl Service {
             SessionKind::Postgres(client) => CatalogSession::Postgres(Arc::clone(client)),
             SessionKind::Scripted => CatalogSession::Scripted,
         })
+    }
+
+    /// 前端 1s 轮询的落点：返回全部会话状态，并按需探活、驱动有限次退避重连（R4）。
+    pub async fn session_statuses(self: &Arc<Self>) -> Vec<SessionStatus> {
+        let targets: Vec<SessionHealthProbe> = {
+            let sessions = self.sessions.lock().expect("sessions");
+            sessions
+                .iter()
+                .map(|(id, session)| SessionHealthProbe {
+                    id: id.clone(),
+                    sqlite: matches!(session.kind, SessionKind::Sqlite(_)),
+                    health: Arc::clone(&session.health),
+                })
+                .collect()
+        };
+        let mut out = Vec::with_capacity(targets.len());
+        for target in targets {
+            if !target.health.is_lost() && target.health.needs_probe(target.sqlite) {
+                self.probe_session(&target).await;
+            }
+            let Some(condition) = self.session_condition(&target.id) else {
+                // 快照与状态之间会话被显式断开：不再报告。
+                continue;
+            };
+            match condition {
+                SessionCondition::Connected => out.push(SessionStatus {
+                    id: target.id,
+                    status: "connected",
+                    reason: None,
+                }),
+                SessionCondition::Lost { .. } => {
+                    self.run_reconnect_if_due(&target.id).await;
+                    // 重连可能就发生在这次调用里：成功后按 connected 报告
+                    match self.session_condition(&target.id) {
+                        Some(SessionCondition::Connected) => out.push(SessionStatus {
+                            id: target.id,
+                            status: "connected",
+                            reason: None,
+                        }),
+                        _ => {
+                            if self.reconnect_pending(&target.id) {
+                                out.push(SessionStatus {
+                                    id: target.id,
+                                    status: "reconnecting",
+                                    reason: None,
+                                });
+                            } else {
+                                let reason = self.session_condition(&target.id).and_then(|item| match item {
+                                    SessionCondition::Lost { reason } => reason,
+                                    _ => None,
+                                });
+                                out.push(SessionStatus {
+                                    id: target.id,
+                                    status: "lost",
+                                    reason,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 探活一个会话：失败标记 lost 并安排重连；超时无法判定，不动状态下一轮再试。
+    async fn probe_session(&self, target: &SessionHealthProbe) {
+        if target.health.busy() > 0 || !target.health.begin_probe() {
+            return;
+        }
+        let session = {
+            let sessions = self.sessions.lock().expect("sessions");
+            match sessions.get(&target.id) {
+                Some(session) if !session.health.is_lost() => Some(clone_catalog_handle(&session.kind)),
+                _ => None,
+            }
+        };
+        let Some(session) = session else {
+            target.health.end_probe();
+            return;
+        };
+        let probe = self.probes.health.as_deref().unwrap_or(&SelectOneProbe);
+        let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe.check(&session)).await;
+        target.health.end_probe();
+        match outcome {
+            Ok(Ok(())) => {
+                target.health.clear_suspect();
+                target.health.note_activity();
+            }
+            Ok(Err(reason)) => {
+                let text = format!("探活失败：{reason}");
+                target.health.mark_lost(text);
+                self.reconnects
+                    .lock()
+                    .expect("reconnects")
+                    .entry(target.id.clone())
+                    .or_insert_with(ReconnectPlan::fresh);
+            }
+            Err(_elapsed) => {
+                // 探活超时说明无法判定（可能只是这条连接正忙）：不改状态。
+            }
+        }
+    }
+
+    /// lost 会话到期就重连一次（内联执行，in_flight 防止轮询并发重复拨号）。
+    async fn run_reconnect_if_due(&self, id: &str) {
+        {
+            let mut plans = self.reconnects.lock().expect("reconnects");
+            let Some(plan) = plans.get_mut(id) else { return };
+            if plan.in_flight || plan.gave_up {
+                return;
+            }
+            match plan.next_due {
+                Some(due) if due <= Instant::now() => {}
+                _ => return,
+            }
+            plan.in_flight = true;
+        }
+        self.attempt_reconnect(id).await;
+    }
+
+    /// 拨一次重连并按结果推进计划：确定性错误立即放弃，网络类按退避重试到上限。
+    pub(crate) async fn attempt_reconnect(&self, id: &str) {
+        let config = match self.store().await {
+            Ok(store) => store.get(id).await.ok().flatten(),
+            Err(_) => None,
+        };
+        let Some(config) = config else {
+            self.finish_reconnect(
+                id,
+                DecisionWithMessage {
+                    decision: RetryDecision::Stop {
+                        reason: "连接配置已删除或读不出来，不再自动重连。".to_owned(),
+                    },
+                    message: String::new(),
+                },
+            );
+            return;
+        };
+        if config.engine != Engine::Sqlite && !config.password_saved {
+            self.finish_reconnect(
+                id,
+                DecisionWithMessage {
+                    decision: RetryDecision::Stop {
+                        reason: "凭据库里没有保存的密码，已停在断开状态，请手动重连。".to_owned(),
+                    },
+                    message: String::new(),
+                },
+            );
+            return;
+        }
+        let outcome = match self.exercise_overriding(id, SecretInput::default(), true, None).await {
+            Ok(outcome) => outcome,
+            Err(reason) => {
+                self.finish_reconnect(
+                    id,
+                    DecisionWithMessage {
+                        decision: RetryDecision::Stop { reason },
+                        message: String::new(),
+                    },
+                );
+                return;
+            }
+        };
+        if outcome.connected {
+            // exercise 已用新会话替换旧条目（全新健康状态），计划也已在插入时清掉。
+            return;
+        }
+        let message = report_failure_text(&outcome.report);
+        let decision = classify_reconnect_failure(&outcome.report);
+        self.finish_reconnect(id, DecisionWithMessage { decision, message });
+    }
+
+    fn finish_reconnect(&self, id: &str, decision: DecisionWithMessage) {
+        let DecisionWithMessage { decision, message } = decision;
+        let mut plans = self.reconnects.lock().expect("reconnects");
+        let plan = plans.entry(id.to_owned()).or_insert_with(ReconnectPlan::fresh);
+        plan.in_flight = false;
+        match decision {
+            RetryDecision::Stop { reason } => {
+                plan.gave_up = true;
+                plan.next_due = None;
+                plan.reason = Some(reason);
+            }
+            RetryDecision::Retry => {
+                plan.attempts += 1;
+                if plan.attempts >= MAX_RECONNECT_ATTEMPTS {
+                    plan.gave_up = true;
+                    plan.next_due = None;
+                    plan.reason = Some(format!("{message}。已重试 {} 次仍失败，停止自动重连。", plan.attempts));
+                } else {
+                    plan.next_due = Some(Instant::now() + reconnect_backoff(plan.attempts));
+                }
+            }
+        }
+        // 退避等待期间保留探活失败的原因；只有最终结论（放弃）才更新提示。
+        if let Some(reason) = plan.reason.clone() {
+            if let Some(session) = self.sessions.lock().expect("sessions").get_mut(id) {
+                if session.health.is_lost() {
+                    session.health.set_lost_reason(Some(reason));
+                }
+            }
+        }
+    }
+
+    fn reconnect_pending(&self, id: &str) -> bool {
+        let plans = self.reconnects.lock().expect("reconnects");
+        plans.get(id).is_some_and(|plan| !plan.gave_up)
     }
 
     pub fn set_catalog_foreign_keys(&self, id: &str, value: Option<bool>) -> bool {
@@ -757,6 +1158,125 @@ impl Service {
         }
         Ok(())
     }
+}
+
+/// 空闲多久后开始探活（R4：长时间空闲或断线类错误后触发，避免每秒全量 ping）。
+pub const IDLE_PROBE_AFTER: Duration = Duration::from_secs(30);
+/// 单次探活的判定时限。超时视为无法判定，不改状态。
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// 自动重连的最大尝试次数（有限退避，之后停在 lost 等手动重连）。
+pub const MAX_RECONNECT_ATTEMPTS: u32 = 3;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStatus {
+    pub id: String,
+    /// connected | lost | reconnecting
+    pub status: &'static str,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionCondition {
+    Connected,
+    Lost { reason: Option<String> },
+}
+
+struct SessionHealthProbe {
+    id: String,
+    sqlite: bool,
+    health: Arc<SessionHealth>,
+}
+
+fn clone_catalog_handle(kind: &SessionKind) -> CatalogSession {
+    match kind {
+        SessionKind::Sqlite(pool) => CatalogSession::Sqlite {
+            pool: pool.clone(),
+            foreign_keys: None,
+        },
+        SessionKind::Mysql(pool) => CatalogSession::Mysql(pool.clone()),
+        SessionKind::Postgres(client) => CatalogSession::Postgres(Arc::clone(client)),
+        SessionKind::Scripted => CatalogSession::Scripted,
+    }
+}
+
+#[derive(Default)]
+struct ReconnectPlan {
+    attempts: u32,
+    next_due: Option<Instant>,
+    gave_up: bool,
+    reason: Option<String>,
+    in_flight: bool,
+}
+
+impl ReconnectPlan {
+    fn fresh() -> Self {
+        Self {
+            attempts: 0,
+            next_due: Some(Instant::now()),
+            gave_up: false,
+            reason: None,
+            in_flight: false,
+        }
+    }
+}
+
+struct DecisionWithMessage {
+    decision: RetryDecision,
+    message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryDecision {
+    /// 认证 / TLS / 主机密钥 / 打不开文件等确定性错误：不重试，直接 lost + 原因（R4）。
+    Stop { reason: String },
+    /// 网络类失败：按退避再试。
+    Retry,
+}
+
+/// 有限退避：第 n 次失败后等多久再试。
+pub fn reconnect_backoff(attempt: u32) -> Duration {
+    match attempt {
+        1 => Duration::from_secs(1),
+        2 => Duration::from_secs(5),
+        _ => Duration::from_secs(15),
+    }
+}
+
+/// 从分阶段报告判断重连是否值得再试：只有网络/隧道/版本类失败是瞬态的。
+pub fn classify_reconnect_failure(report: &TestReport) -> RetryDecision {
+    if report.status == TestStatus::Wait {
+        return RetryDecision::Stop {
+            reason: "服务器出示了新的 SSH 主机密钥，需要先在连接页确认后才能重连。".to_owned(),
+        };
+    }
+    let Some(stage) = report.stages.iter().find(|stage| stage.status == StageStatus::Err) else {
+        return RetryDecision::Stop {
+            reason: report.summary.clone().unwrap_or_else(|| "重连没有成功".to_owned()),
+        };
+    };
+    let message = report_failure_text(report);
+    match stage.kind {
+        StageKind::SshHostIdentity | StageKind::SshAuthentication | StageKind::Tls | StageKind::DatabaseAuthentication | StageKind::OpenFile => {
+            RetryDecision::Stop {
+                reason: format!("{message}。这是确定性错误，不会再自动重试。"),
+            }
+        }
+        _ => RetryDecision::Retry,
+    }
+}
+
+/// 分阶段报告里最可读的失败原因：先取失败阶段消息，其次提示，再次阶段名。
+pub fn report_failure_text(report: &TestReport) -> String {
+    if let Some(stage) = report.stages.iter().find(|stage| stage.status == StageStatus::Err) {
+        if !stage.message.is_empty() {
+            return stage.message.clone();
+        }
+    }
+    if let Some(hint) = report.hint.as_deref().filter(|hint| !hint.is_empty()) {
+        return hint.to_owned();
+    }
+    report.fail_stage.clone().unwrap_or_else(|| "重连没有成功".to_owned())
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -953,6 +1473,7 @@ impl Attempt {
                     connection_id: Arc::new(AtomicU64::new(opened.connection_id)),
                     opts: opened.kill_opts,
                     via_ssh,
+                    health: Arc::new(SessionHealth::default()),
                 };
                 self.mysql_pool = Some(opened.pool);
                 opened.version
@@ -963,6 +1484,7 @@ impl Attempt {
                     token: opened.cancel,
                     tls: opened.tls,
                     via_ssh,
+                    health: Arc::new(SessionHealth::default()),
                 };
                 self.postgres = Some(opened.client);
                 opened.version
@@ -1076,7 +1598,7 @@ impl Attempt {
         self.schema_note = Some(format!("SQLite {} · 读取到 {} 个表或视图", opened.version, opened.schema_objects));
         self.foreign_keys = Some(opened.foreign_keys);
         self.sqlite_pool = Some(opened.pool);
-        self.cancel = CancelTransport::Sqlite(Arc::new(AtomicBool::new(false)));
+        self.cancel = CancelTransport::Sqlite(Arc::new(AtomicBool::new(false)), Arc::new(SessionHealth::default()));
         Ok(path)
     }
 
@@ -1244,4 +1766,120 @@ pub(crate) async fn report_canned_remote(config: SavedConnection, canned: Canned
         cancel: CancelTransport::None,
     };
     stages::execute_stages(&stages::planned_stages(&config), &mut attempt).await
+}
+
+#[cfg(test)]
+mod health_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{
+        classify_reconnect_failure, reconnect_backoff, report_failure_text, CancelTransport, RetryDecision, SessionHealth,
+        IDLE_PROBE_AFTER, MAX_RECONNECT_ATTEMPTS,
+    };
+    use crate::connections::stages::{StageKind, StageStatus, StageView, TestReport, TestStatus};
+
+    fn report(failed: Option<StageKind>, wait: bool) -> TestReport {
+        let mut stages = Vec::new();
+        for kind in [StageKind::SshHostIdentity, StageKind::Network, StageKind::Tls, StageKind::DatabaseAuthentication] {
+            let status = if failed == Some(kind) {
+                if wait { StageStatus::Wait } else { StageStatus::Err }
+            } else if failed.is_some() {
+                StageStatus::Skipped
+            } else {
+                StageStatus::Ok
+            };
+            stages.push(StageView {
+                kind,
+                label: kind.label_zh().to_owned(),
+                status,
+                message: if status == StageStatus::Err { "Access denied for user".to_owned() } else { String::new() },
+            });
+        }
+        TestReport {
+            status: if wait { TestStatus::Wait } else if failed.is_some() { TestStatus::Err } else { TestStatus::Ok },
+            fail_stage: failed.map(|kind| kind.label_zh().to_owned()),
+            hint: None,
+            summary: None,
+            fingerprint: None,
+            algorithm: None,
+            stages,
+        }
+    }
+
+    #[test]
+    fn probe_triggers_on_suspect_or_idle_but_never_for_sqlite() {
+        let health = SessionHealth::default();
+        assert!(!health.needs_probe(false));
+        health.note_disconnect();
+        assert!(health.needs_probe(false));
+        assert!(!health.needs_probe(true), "SQLite 免探活");
+        health.clear_suspect();
+        assert!(!health.needs_probe(false));
+        health.rewind_idle(Duration::from_secs(31));
+        assert!(health.idle_for() >= IDLE_PROBE_AFTER);
+        assert!(health.needs_probe(false));
+    }
+
+    #[test]
+    fn busy_sessions_are_not_probed() {
+        let health = SessionHealth::default();
+        health.note_disconnect();
+        health.note_busy();
+        // busy 只是轮询侧的跳过条件，这里确认计数语义
+        assert_eq!(health.busy(), 1);
+        health.note_idle();
+        assert_eq!(health.busy(), 0);
+    }
+
+    #[test]
+    fn transport_notes_disconnect_on_the_shared_health_handle() {
+        let shared = Arc::new(SessionHealth::default());
+        let placeholder = Arc::new(SessionHealth::default());
+        let mut transport = CancelTransport::Sqlite(Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::clone(&placeholder));
+        transport.note_disconnect();
+        assert!(placeholder.is_suspect(), "断线报告落在当前挂着的句柄上");
+        transport.attach_health(Arc::clone(&shared));
+        assert!(!shared.is_suspect(), "替换句柄时旧状态不带入");
+        transport.note_disconnect();
+        assert!(shared.is_suspect());
+        transport.note_activity();
+        shared.clear_suspect();
+        assert!(!shared.is_suspect());
+        // lost 之后执行路径的断线报告不会再把状态改回去
+        shared.mark_lost("探活失败：connection reset".to_owned());
+        assert!(shared.is_lost());
+        assert_eq!(shared.lost_reason().as_deref(), Some("探活失败：connection reset"));
+        transport.note_disconnect();
+        assert!(shared.is_lost());
+    }
+
+    #[test]
+    fn deterministic_failures_stop_reconnect_and_network_failures_retry() {
+        let auth = classify_reconnect_failure(&report(Some(StageKind::DatabaseAuthentication), false));
+        let RetryDecision::Stop { reason } = &auth else {
+            panic!("认证失败必须停止重试");
+        };
+        assert!(reason.contains("Access denied"));
+        assert!(reason.contains("不会再自动重试"));
+        assert!(matches!(classify_reconnect_failure(&report(Some(StageKind::Tls), false)), RetryDecision::Stop { .. }));
+        assert!(matches!(
+            classify_reconnect_failure(&report(Some(StageKind::SshHostIdentity), false)),
+            RetryDecision::Stop { .. }
+        ));
+        // 等待确认主机密钥也直接停：需要人工介入
+        assert!(matches!(classify_reconnect_failure(&report(Some(StageKind::SshHostIdentity), true)), RetryDecision::Stop { .. }));
+        assert!(matches!(classify_reconnect_failure(&report(Some(StageKind::Network), false)), RetryDecision::Retry));
+        // 完全成功的报告没有失败原因可读
+        assert_eq!(report_failure_text(&report(None, false)), "重连没有成功");
+    }
+
+    #[test]
+    fn backoff_is_bounded_and_limited() {
+        assert_eq!(reconnect_backoff(1), Duration::from_secs(1));
+        assert_eq!(reconnect_backoff(2), Duration::from_secs(5));
+        assert_eq!(reconnect_backoff(3), Duration::from_secs(15));
+        assert_eq!(reconnect_backoff(9), Duration::from_secs(15));
+        assert_eq!(MAX_RECONNECT_ATTEMPTS, 3);
+    }
 }

@@ -33,13 +33,21 @@ export const NEW_QUERY_DRAFT = "";
 
 export const SESSION_KEY = "rillsql.session";
 
+const TAB_KINDS: readonly TabKind[] = ["query", "table", "structure", "definition", "diagram"];
+
+export function isTabKind(value: unknown): value is TabKind {
+  return typeof value === "string" && (TAB_KINDS as readonly string[]).includes(value);
+}
+
 /**
- * Persisted query tab. Table/structure/definition tabs depend on catalog state
- * that is not restored on startup, so only query tabs are snapshotted.
+ * Persisted tab of any kind (R2). 查询草稿沿用 draft/lastExecutedSql；表/结构/定义/关系图
+ * 标签带目标参数，恢复后按目标重新拉取（等同用户重新打开）。未提交网格变更从不进入快照。
  */
 export interface SessionSnapshotTab {
   id: string;
   title: string;
+  /** 旧快照没有这个字段：缺省按 query 解析。 */
+  kind?: TabKind;
   draft: string;
   connectionId: string | null;
   connectionName: string | null;
@@ -48,8 +56,16 @@ export interface SessionSnapshotTab {
   connectionStatus: ConnectionStatus | null;
   targetText: string | null;
   targetNotice: string | null;
-  /** 最近一次成功发出的 SQL；用于区分“刚执行过”和“从未执行的草稿”。 */
+  path: string | null;
+  /** 最近一次成功发出的 SQL；用于区分“刚执行过”和“从未执行的草稿”。仅查询标签有意义。 */
   lastExecutedSql?: string | null;
+  /** 表标签的当前面板与结构分区。 */
+  tablePane?: "data" | "structure";
+  structureSection?: "columns" | "indexes" | "foreign" | "drop";
+  /** 定义标签的目标对象（schema/名称/种类/签名）。 */
+  definition?: { schema: string; name: string; kind: string; signature: string; relation: string } | null;
+  /** 关系图标签的 schema。 */
+  diagramSchema?: string | null;
 }
 
 export interface SessionSnapshot {
@@ -119,6 +135,8 @@ export interface ShellTab {
   structureSection: "columns" | "indexes" | "foreign" | "drop";
   definition?: DefinitionRequest | null;
   diagram?: { schema: string } | null;
+  /** 恢复自快照的标签（R2）：只有这类标签按“连接已删”呈现空态。不持久化。 */
+  restored?: boolean;
 }
 
 export interface ShellSession {
@@ -194,11 +212,11 @@ function applyTarget(tab: ShellTab, target: QueryTarget | null) {
 }
 
 export function snapshotSession(tabs: readonly ShellTab[], activeId: string | null): SessionSnapshot {
-  const kept = tabs.filter((tab) => tab.kind === "query");
   return {
-    tabs: kept.map((tab) => ({
+    tabs: tabs.map((tab) => ({
       id: tab.id,
       title: tab.title,
+      kind: tab.kind,
       draft: tab.draft,
       connectionId: tab.connectionId,
       connectionName: tab.connectionName,
@@ -207,15 +225,37 @@ export function snapshotSession(tabs: readonly ShellTab[], activeId: string | nu
       connectionStatus: tab.connectionStatus,
       targetText: tab.targetText,
       targetNotice: tab.targetNotice,
-      lastExecutedSql: tab.lastExecutedSql,
+      path: tab.path,
+      lastExecutedSql: tab.kind === "query" ? tab.lastExecutedSql : null,
+      tablePane: tab.kind === "table" ? tab.tablePane : undefined,
+      structureSection: tab.kind === "table" ? tab.structureSection : undefined,
+      definition: tab.definition ? { ...tab.definition } : null,
+      diagramSchema: tab.kind === "diagram" ? tab.diagram?.schema ?? null : null,
     })),
-    // 活动标签若不是查询标签（快照里被剔除），回落到最后一个查询标签。
-    activeId: kept.some((tab) => tab.id === activeId) ? activeId : kept[kept.length - 1]?.id ?? null,
+    activeId: tabs.some((tab) => tab.id === activeId) ? activeId : tabs[tabs.length - 1]?.id ?? null,
   };
 }
 
 function optionalText(value: unknown): boolean {
   return value === null || typeof value === "string";
+}
+
+function textOrNull(value: unknown): string | null {
+  return optionalText(value) ? (value as string | null) : null;
+}
+
+function validEnum<T extends string>(value: unknown, allowed: readonly T[]): T | null {
+  return typeof value === "string" && (allowed as readonly string[]).includes(value) ? (value as T) : null;
+}
+
+function validDefinition(value: unknown): SessionSnapshotTab["definition"] {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "object") return undefined;
+  const item = value as Record<string, unknown>;
+  if (typeof item.schema !== "string" || typeof item.name !== "string" || typeof item.kind !== "string" || typeof item.signature !== "string" || typeof item.relation !== "string") {
+    return undefined;
+  }
+  return { schema: item.schema, name: item.name, kind: item.kind, signature: item.signature, relation: item.relation };
 }
 
 /** Parse persisted session JSON. Any malformed shape or field returns null so the app starts fresh. */
@@ -239,6 +279,9 @@ export function restoreSession(raw: string | null): SessionSnapshot | null {
     if (typeof tab.id !== "string" || tab.id === "") return null;
     if (typeof tab.title !== "string") return null;
     if (typeof tab.draft !== "string") return null;
+    // 旧快照只有查询标签：kind 缺省按 query 解析。
+    const kind = tab.kind === undefined ? "query" : tab.kind;
+    if (!isTabKind(kind)) return null;
     const status = tab.connectionStatus ?? null;
     if (status !== null && !(typeof status === "string" && status in CONNECTION_STATUS_TEXT)) return null;
     if (!optionalText(tab.connectionId)) return null;
@@ -247,11 +290,22 @@ export function restoreSession(raw: string | null): SessionSnapshot | null {
     if (!optionalText(tab.engine)) return null;
     if (!optionalText(tab.targetText)) return null;
     if (!optionalText(tab.targetNotice)) return null;
+    if (!optionalText(tab.path)) return null;
     const lastExecutedSql = (tab.lastExecutedSql ?? null) as string | null;
     if (!optionalText(lastExecutedSql)) return null;
+    const tablePane = tab.tablePane === undefined ? null : validEnum(tab.tablePane, ["data", "structure"] as const);
+    if (tab.tablePane !== undefined && tablePane === null) return null;
+    const structureSection =
+      tab.structureSection === undefined ? null : validEnum(tab.structureSection, ["columns", "indexes", "foreign", "drop"] as const);
+    if (tab.structureSection !== undefined && structureSection === null) return null;
+    const definition = validDefinition(tab.definition);
+    if (definition === undefined) return null;
+    const diagramSchema = textOrNull(tab.diagramSchema ?? null);
+    if (diagramSchema === null && tab.diagramSchema !== undefined && tab.diagramSchema !== null) return null;
     tabs.push({
       id: tab.id,
       title: tab.title,
+      kind,
       draft: tab.draft,
       connectionId: tab.connectionId as string | null,
       connectionName: tab.connectionName as string | null,
@@ -260,7 +314,12 @@ export function restoreSession(raw: string | null): SessionSnapshot | null {
       connectionStatus: status as ConnectionStatus | null,
       targetText: tab.targetText as string | null,
       targetNotice: tab.targetNotice as string | null,
+      path: tab.path as string | null,
       lastExecutedSql,
+      tablePane: tablePane ?? undefined,
+      structureSection: structureSection ?? undefined,
+      definition,
+      diagramSchema,
     });
   }
   const resolved = tabs.some((tab) => tab.id === activeId) ? activeId : tabs[tabs.length - 1]?.id ?? null;
@@ -268,7 +327,9 @@ export function restoreSession(raw: string | null): SessionSnapshot | null {
 }
 
 function fromSnapshot(item: SessionSnapshotTab): ShellTab {
-  const tab = blankTab("query", item.id, item.title, null, item.draft);
+  const kind = item.kind ?? "query";
+  const tab = blankTab(kind, item.id, item.title, item.path ?? null, item.draft);
+  tab.restored = true;
   tab.connectionId = item.connectionId;
   tab.connectionName = item.connectionName;
   tab.database = item.database;
@@ -276,7 +337,17 @@ function fromSnapshot(item: SessionSnapshotTab): ShellTab {
   tab.connectionStatus = item.connectionStatus;
   tab.targetText = item.targetText;
   tab.targetNotice = item.targetNotice;
-  tab.lastExecutedSql = item.lastExecutedSql ?? null;
+  if (kind === "table") {
+    tab.tablePane = item.tablePane ?? "data";
+    tab.structureSection = item.structureSection ?? "columns";
+  }
+  if (kind === "definition") {
+    tab.definition = item.definition ? { ...item.definition } : null;
+  }
+  if (kind === "diagram") {
+    tab.diagram = { schema: item.diagramSchema ?? "" };
+  }
+  tab.lastExecutedSql = kind === "query" ? item.lastExecutedSql ?? null : null;
   return tab;
 }
 

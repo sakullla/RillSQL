@@ -11,7 +11,7 @@ use super::tree::{
     direct_objects, object_path, refresh_connection, refresh_schema, search_objects, take_page,
     visible_database_names, visible_schema_names,
 };
-use crate::connections::{CatalogSession, Service};
+use crate::connections::{CatalogSession, Service, SessionCondition};
 
 fn row(name: &str) -> ObjectRow {
     ObjectRow::table(name, Some(1))
@@ -449,7 +449,7 @@ async fn sqlite_catalog_reads_the_open_session_not_a_new_connection() {
     let service = Service::new_for_test(dir.join("connections.sqlite"));
     service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
     assert!(service.catalog_session("notes").is_some());
-    assert_eq!(service.open_session_ids(), vec!["notes".to_owned()]);
+    assert_eq!(service.session_condition("notes"), Some(SessionCondition::Connected));
     assert!(service.set_catalog_foreign_keys("notes", Some(true)));
 
     let loaded = load_catalog(&service, 100, &[], None, false).await.unwrap();

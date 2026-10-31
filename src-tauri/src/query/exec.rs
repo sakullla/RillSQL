@@ -429,6 +429,15 @@ enum Attached {
     Scripted,
 }
 
+/// 批处理进行中压住探活：正在跑的语句不该被空闲计时误判成断线（R4）。
+struct BusyGuard(Arc<crate::connections::SessionHealth>);
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.note_idle();
+    }
+}
+
 pub struct LiveDriver {
     session: tokio::sync::Mutex<Attached>,
     transport: CancelTransport,
@@ -436,6 +445,16 @@ pub struct LiveDriver {
     sink: Arc<dyn RowSink>,
     statement_index: AtomicUsize,
     timeout_applied: bool,
+    /// 只为 Drop 语义保留：批处理结束后释放探活忙标记。
+    _busy: Option<BusyGuard>,
+}
+
+/// attach 阶段的失败也走断线分类：池里借不出连接通常就是断线（R4）。
+fn attach_failure(transport: &CancelTransport, message: String) -> String {
+    if is_disconnect(&message) {
+        transport.note_disconnect();
+    }
+    message
 }
 
 impl LiveDriver {
@@ -449,26 +468,41 @@ impl LiveDriver {
                 _ => Attached::Sqlite(pool),
             },
             CatalogSession::Mysql(pool) => {
-                let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
+                let mut conn = pool
+                    .get_conn()
+                    .await
+                    .map_err(|err| attach_failure(&transport, err.to_string()))?;
                 conn.reset_connection(false);
                 if let Ok(Some(id)) = conn.query_first::<u64, _>("SELECT CONNECTION_ID()").await {
                     transport.set_mysql_connection_id(id);
                 }
-                align_mysql(&mut conn, engine, database).await?;
-                run_mysql_statements(&mut conn, &setup).await?;
+                if let Err(err) = align_mysql(&mut conn, engine, database).await {
+                    return Err(attach_failure(&transport, err));
+                }
+                if let Err(err) = run_mysql_statements(&mut conn, &setup).await {
+                    return Err(attach_failure(&transport, err));
+                }
                 Attached::Mysql(conn)
             }
             CatalogSession::Postgres(client) => {
-                let current = postgres_current(&client).await?;
+                let current = postgres_current(&client)
+                    .await
+                    .map_err(|err| attach_failure(&transport, err))?;
                 match database_gate("postgres", &current, database) {
                     DatabaseGate::Refuse => return Err(refuse_message(&current, database)),
                     _ => {
-                        run_postgres_statements(&client, &setup).await?;
+                        if let Err(err) = run_postgres_statements(&client, &setup).await {
+                            return Err(attach_failure(&transport, err));
+                        }
                         Attached::Postgres(client)
                     }
                 }
             }
         };
+        let busy = transport.health().map(|health| {
+            health.note_busy();
+            BusyGuard(Arc::clone(health))
+        });
         Ok(Self {
             session: tokio::sync::Mutex::new(attached),
             transport,
@@ -476,6 +510,7 @@ impl LiveDriver {
             sink: Arc::new(NopSink),
             statement_index: AtomicUsize::new(0),
             timeout_applied: !setup.is_empty(),
+            _busy: busy,
         })
     }
 
@@ -512,6 +547,16 @@ impl StatementDriver for LiveDriver {
             Attached::Mysql(conn) => mysql_run(conn, &self.transport, &self.engine, sql, limit, cancel, self.sink.as_ref(), index).await,
             Attached::Postgres(client) => postgres_run(client, &self.engine, sql, limit, cancel, self.sink.as_ref(), index).await,
         };
+        // 成功语句刷新空闲计时；断线类错误挂起 suspect 标记，交轮询探活确认（R4）。
+        // 语句超时的报错同样带 timeout 字样，不算断线。
+        match &result {
+            Ok(_) => self.transport.note_activity(),
+            Err(message) => {
+                if is_disconnect(message) && !is_statement_timeout(message) {
+                    self.transport.note_disconnect();
+                }
+            }
+        }
         result.map_err(|message| classify_failure(sql, message, cancel.load(Ordering::SeqCst)))
     }
 }

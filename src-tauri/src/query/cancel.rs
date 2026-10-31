@@ -82,15 +82,20 @@ pub fn fresh_cancel_channel(opens: &[OpenRecord], busy_id: u64) -> Result<&OpenR
 /// 返回 true 表示这次取消使用了新的传输通道。
 pub async fn deliver_cancel(transport: &CancelTransport) -> Result<bool, String> {
     match transport {
-        CancelTransport::Sqlite(flag) => {
+        CancelTransport::Sqlite(flag, _) => {
             flag.store(true, Ordering::SeqCst);
             Ok(false)
         }
-        CancelTransport::Mysql { connection_id, opts, via_ssh } => {
+        CancelTransport::Mysql {
+            connection_id,
+            opts,
+            via_ssh,
+            ..
+        } => {
             kill_mysql(connection_id, opts, *via_ssh).await?;
             Ok(true)
         }
-        CancelTransport::Postgres { token, tls, via_ssh } => {
+        CancelTransport::Postgres { token, tls, via_ssh, .. } => {
             cancel_postgres(token, tls.as_ref()).await?;
             if *via_ssh {
                 Ok(true)

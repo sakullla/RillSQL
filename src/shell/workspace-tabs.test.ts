@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { nextTick } from "vue";
 import { resetCatalog, replaceCatalog } from "../catalog/store";
 import type { CatalogConnection } from "../catalog/types";
-import { createSession } from "./session";
+import { createSession, SESSION_KEY } from "./session";
 
 vi.mock("../catalog", () => ({
   listPaletteTables: () => [{ id: "customers", label: "customers", path: "shop / public" }],
@@ -309,6 +309,76 @@ describe("workspace tab identity", () => {
     await vi.dynamicImportSettled();
     await flushPromises();
     expect(wrapper.get("[aria-label='数据表格']").attributes("data-tab-id")).toBe("table:customers");
+    wrapper.unmount();
+  });
+
+  it("restores table and query tabs after restart and flags tabs whose connection is gone", async () => {
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        tabs: [
+          {
+            id: "query-1",
+            kind: "query",
+            title: "查询 1",
+            draft: "select 1",
+            connectionId: "gone",
+            connectionName: "旧库",
+            database: "app",
+            engine: "postgres",
+            connectionStatus: "connected",
+            targetText: "旧库 / app",
+            targetNotice: null,
+            path: null,
+            lastExecutedSql: null,
+          },
+          {
+            id: "table:old:bookstore:public:orders",
+            kind: "table",
+            title: "orders",
+            draft: "",
+            connectionId: null,
+            connectionName: null,
+            database: null,
+            engine: null,
+            connectionStatus: null,
+            targetText: null,
+            targetNotice: null,
+            path: "旧库 / bookstore / public",
+            tablePane: "data",
+            structureSection: "columns",
+          },
+        ],
+        activeId: "table:old:bookstore:public:orders",
+      }),
+    );
+    const wrapper = mount(AppShell);
+    await flushPromises();
+    await vi.dynamicImportSettled();
+    // 目录读完之前不判定“连接已删”，避免加载期误报
+    expect(wrapper.find("[data-dangling-target]").exists()).toBe(false);
+
+    replaceCatalog([postgresCatalog()]);
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+
+    // 两个标签都恢复，活动标签是恢复的表标签
+    expect(wrapper.findAll(".tab")).toHaveLength(2);
+    expect(wrapper.get(".tab.active .tab-title").text()).toBe("orders");
+    // 表标签指向已删除的连接：显示该标签的空态提示，不自动连接
+    expect(wrapper.get("[data-dangling-target]").text()).toContain("连接已删除");
+    // 标签可以关闭
+    await wrapper.get(".tab.active .tab-x").trigger("click");
+    await flushPromises();
+    expect(wrapper.findAll(".tab")).toHaveLength(1);
+
+    // 查询标签恢复草稿，并提示连接已删除
+    await wrapper.findAll(".tab")[0]!.trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    expect(editorText(wrapper)).toBe("select 1");
+    expect(wrapper.text()).toContain("连接已删除");
     wrapper.unmount();
   });
 });

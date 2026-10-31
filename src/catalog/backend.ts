@@ -11,11 +11,29 @@ export interface ObjectLimit {
   limit: number;
 }
 
-export async function fetchSessions(): Promise<string[] | null> {
+/** 轮询返回的会话状态（R4）：connected / lost / reconnecting。 */
+export interface SessionStatusInfo {
+  id: string;
+  status: "connected" | "lost" | "reconnecting";
+  reason: string | null;
+}
+
+function isSessionStatusInfo(value: unknown): value is SessionStatusInfo {
+  if (typeof value !== "object" || value === null) return false;
+  const item = value as Record<string, unknown>;
+  return (
+    typeof item.id === "string" &&
+    (item.status === "connected" || item.status === "lost" || item.status === "reconnecting") &&
+    (item.reason === null || typeof item.reason === "string")
+  );
+}
+
+export async function fetchSessions(): Promise<SessionStatusInfo[] | null> {
   try {
-    const ids = await invoke<string[]>("catalog_sessions");
-    // 调用方会把结果交给 Set。非数组不能变成未处理拒绝。
-    return Array.isArray(ids) ? ids : null;
+    const sessions = await invoke<unknown>("catalog_sessions");
+    // 调用方会把结果交给 Map。非数组或形状不对不能变成未处理拒绝。
+    if (!Array.isArray(sessions)) return null;
+    return sessions.every(isSessionStatusInfo) ? (sessions as SessionStatusInfo[]) : null;
   } catch {
     return null;
   }

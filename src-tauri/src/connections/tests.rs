@@ -9,6 +9,7 @@ use super::model::{self, leaked_secret, CaMode, ConnectionDraft, Engine, Secret,
 use super::route::{self, Retry};
 use super::secrets::{MemoryStore, UnavailableStore};
 use super::service::{DatabaseProbe, Probes, Service, SshProbe};
+use super::CatalogSession;
 use super::stages::{self, StageError, StageKind, StageRunner, StageStatus, TestStatus};
 use super::store::persisted_bytes;
 
@@ -339,6 +340,7 @@ async fn unavailable_keyring_keeps_the_typed_password_out_of_config() {
             ssh: Some(ssh),
             database: Some(probe.clone()),
             sqlite: None,
+            health: None,
         },
     );
     let mut draft = remote_draft(Engine::Mysql);
@@ -366,6 +368,7 @@ async fn tls_failure_skips_authentication_and_uses_the_database_name_over_ssh() 
             ssh: Some(ssh.clone()),
             database: Some(probe.clone()),
             sqlite: None,
+            health: None,
         },
     );
     let mut draft = remote_draft(Engine::Postgres);
@@ -425,6 +428,7 @@ async fn deleting_one_connection_keeps_a_shared_host_key_and_does_not_create_a_m
         ssh: Some(ssh),
         database: None,
         sqlite: None,
+        health: None,
     });
     // 主机密钥存在另一份配置库里，这里直接写入当前库。
     let store = super::store::Store::open(service.config_path()).await.unwrap();
@@ -460,6 +464,7 @@ async fn focusing_another_postgres_database_does_not_rewrite_the_saved_config() 
             ssh: None,
             database: Some(probe.clone()),
             sqlite: None,
+            health: None,
         },
     );
     let saved = service.save(remote_draft(Engine::Postgres), secrets("db-secret-alpha", "", "")).await.unwrap();
@@ -527,6 +532,7 @@ async fn stored_password_is_reused_without_being_copied_into_the_config() {
             ssh: None,
             database: Some(probe.clone()),
             sqlite: None,
+            health: None,
         },
     );
     let input = secrets("db-secret-alpha", "", "");
@@ -853,5 +859,198 @@ async fn export_delete_import_roundtrip_restores_config_with_empty_password() {
     assert_eq!(ssh.key_path.as_deref(), Some("C:/ssh/id_ed25519"));
     assert!(!pg.saved.password_saved);
     assert!(!pg.saved.ssh_password_saved);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+struct FlakyHealth {
+    fail: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl super::service::HealthProbe for FlakyHealth {
+    async fn check(&self, _session: &CatalogSession) -> Result<(), String> {
+        if self.fail.load(Ordering::SeqCst) {
+            Err("connection reset by peer".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// 可切换失败的探针：认证或版本读取失败用来驱动确定性/瞬态重连分支。
+struct SwitchingDb {
+    fail_auth: std::sync::atomic::AtomicBool,
+    fail_version: std::sync::atomic::AtomicBool,
+    auth_calls: AtomicUsize,
+    version_calls: AtomicUsize,
+}
+
+impl SwitchingDb {
+    fn new() -> Self {
+        Self {
+            fail_auth: std::sync::atomic::AtomicBool::new(false),
+            fail_version: std::sync::atomic::AtomicBool::new(false),
+            auth_calls: AtomicUsize::new(0),
+            version_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl DatabaseProbe for SwitchingDb {
+    async fn check_tls(&self, _route: &route::Route) -> Result<String, StageError> {
+        Ok("证书主机名已验证".to_owned())
+    }
+
+    async fn authenticate(&self, _config: &model::SavedConnection, _route: &route::Route, _password: &str) -> Result<String, StageError> {
+        self.auth_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_auth.load(Ordering::SeqCst) {
+            return Err(stages::fail("Access denied for user 'app_user'", "请检查数据库用户名和密码。"));
+        }
+        Ok("用户 app_user".to_owned())
+    }
+
+    async fn server_version(&self, _config: &model::SavedConnection, _route: &route::Route) -> Result<String, StageError> {
+        self.version_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_version.load(Ordering::SeqCst) {
+            return Err(stages::fail("server closed the connection unexpectedly", "没有读到版本。"));
+        }
+        Ok("PostgreSQL 16.2".to_owned())
+    }
+}
+
+fn health_probes(database: Arc<dyn DatabaseProbe>, health: Arc<FlakyHealth>) -> Probes {
+    Probes {
+        database: Some(database),
+        health: Some(health),
+        ..Probes::default()
+    }
+}
+
+#[tokio::test]
+async fn idle_session_probes_marks_lost_then_reconnects_with_saved_password() {
+    let dir = temp_workspace();
+    let db = Arc::new(SwitchingDb::new());
+    let health = Arc::new(FlakyHealth { fail: std::sync::atomic::AtomicBool::new(true) });
+    let service = Arc::new(Service::with_probes(
+        dir.join("conn.sqlite"),
+        Arc::new(MemoryStore::default()),
+        health_probes(db.clone(), health.clone()),
+    ));
+    let mut draft = remote_draft(Engine::Postgres);
+    draft.id = Some("pg".to_owned());
+    service.save(draft, secrets("pw", "", "")).await.unwrap();
+    assert!(service.open("pg", SecretInput::default()).await.unwrap().connected);
+    assert_eq!(db.auth_calls.load(Ordering::SeqCst), 1);
+
+    // 空闲超过阈值 → 探活失败标记 lost；同一次轮询里按保存凭据重连成功，恢复 connected
+    service.session_health("pg").unwrap().rewind_idle(std::time::Duration::from_secs(60));
+    let statuses = Arc::clone(&service).session_statuses().await;
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].status, "connected", "{:?}", statuses[0]);
+    // 打开一次 + 重连一次
+    assert_eq!(db.auth_calls.load(Ordering::SeqCst), 2);
+    assert!(service.catalog_session("pg").is_some());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn lost_session_without_saved_password_stays_lost_without_dialing() {
+    let dir = temp_workspace();
+    let db = Arc::new(SwitchingDb::new());
+    let health = Arc::new(FlakyHealth { fail: std::sync::atomic::AtomicBool::new(true) });
+    let service = Arc::new(Service::with_probes(
+        dir.join("conn.sqlite"),
+        Arc::new(MemoryStore::default()),
+        health_probes(db.clone(), health.clone()),
+    ));
+    let mut draft = remote_draft(Engine::Postgres);
+    draft.id = Some("pg".to_owned());
+    draft.save_password = false;
+    service.save(draft, SecretInput::default()).await.unwrap();
+    // 打开时手输密码但不保存：会话可用，凭据库里没有可供自动重连使用的密码
+    let typed = SecretInput {
+        password: Some(Secret::new("typed-once")),
+        ssh_password: None,
+        ssh_passphrase: None,
+        save_password: false,
+    };
+    assert!(service.open("pg", typed).await.unwrap().connected);
+    service.session_health("pg").unwrap().rewind_idle(std::time::Duration::from_secs(60));
+
+    let statuses = Arc::clone(&service).session_statuses().await;
+    assert_eq!(statuses[0].status, "lost");
+    assert!(statuses[0].reason.as_deref().unwrap_or_default().contains("手动重连"), "{:?}", statuses[0]);
+    // 没有保存密码：一次重连拨号都没有，等手动入口
+    assert_eq!(db.auth_calls.load(Ordering::SeqCst), 1);
+    // lost 会话不再提供执行句柄：重连期间不重发写语句
+    assert!(service.catalog_session("pg").is_none());
+    assert_eq!(service.session_condition("pg"), Some(super::service::SessionCondition::Lost { reason: statuses[0].reason.clone() }));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn deterministic_auth_failure_is_not_retried() {
+    let dir = temp_workspace();
+    let db = Arc::new(SwitchingDb::new());
+    let health = Arc::new(FlakyHealth { fail: std::sync::atomic::AtomicBool::new(true) });
+    let service = Arc::new(Service::with_probes(
+        dir.join("conn.sqlite"),
+        Arc::new(MemoryStore::default()),
+        health_probes(db.clone(), health.clone()),
+    ));
+    let mut draft = remote_draft(Engine::Postgres);
+    draft.id = Some("pg".to_owned());
+    service.save(draft, secrets("pw", "", "")).await.unwrap();
+    assert!(service.open("pg", SecretInput::default()).await.unwrap().connected);
+
+    db.fail_auth.store(true, Ordering::SeqCst);
+    service.session_health("pg").unwrap().rewind_idle(std::time::Duration::from_secs(60));
+    let statuses = Arc::clone(&service).session_statuses().await;
+    assert_eq!(statuses[0].status, "lost");
+    let reason = statuses[0].reason.clone().unwrap_or_default();
+    assert!(reason.contains("Access denied"), "{reason}");
+    assert!(reason.contains("不会再自动重试"), "{reason}");
+    let dialed = db.auth_calls.load(Ordering::SeqCst);
+
+    // 再轮询也不再拨号
+    let again = Arc::clone(&service).session_statuses().await;
+    assert_eq!(again[0].status, "lost");
+    assert_eq!(db.auth_calls.load(Ordering::SeqCst), dialed);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn transient_failures_back_off_then_give_up_after_limited_attempts() {
+    let dir = temp_workspace();
+    let db = Arc::new(SwitchingDb::new());
+    let health = Arc::new(FlakyHealth { fail: std::sync::atomic::AtomicBool::new(true) });
+    let service = Arc::new(Service::with_probes(
+        dir.join("conn.sqlite"),
+        Arc::new(MemoryStore::default()),
+        health_probes(db.clone(), health.clone()),
+    ));
+    let mut draft = remote_draft(Engine::Postgres);
+    draft.id = Some("pg".to_owned());
+    service.save(draft, secrets("pw", "", "")).await.unwrap();
+    assert!(service.open("pg", SecretInput::default()).await.unwrap().connected);
+    let initial_version_calls = db.version_calls.load(Ordering::SeqCst);
+
+    // 读版本失败是瞬态：第一次失败后处于退避等待，不是放弃
+    db.fail_version.store(true, Ordering::SeqCst);
+    service.session_health("pg").unwrap().rewind_idle(std::time::Duration::from_secs(60));
+    let statuses = Arc::clone(&service).session_statuses().await;
+    assert_eq!(statuses[0].status, "reconnecting", "{:?}", statuses[0]);
+    assert_eq!(db.version_calls.load(Ordering::SeqCst), initial_version_calls + 1);
+
+    // 退避到期后的两次重试都失败：达到上限，放弃并带出原因
+    service.attempt_reconnect("pg").await;
+    service.attempt_reconnect("pg").await;
+    let settled = Arc::clone(&service).session_statuses().await;
+    assert_eq!(settled[0].status, "lost");
+    let reason = settled[0].reason.clone().unwrap_or_default();
+    assert!(reason.contains("server closed"), "{reason}");
+    assert!(reason.contains("停止自动重连"), "{reason}");
+    assert_eq!(db.version_calls.load(Ordering::SeqCst), initial_version_calls + 3);
     let _ = std::fs::remove_dir_all(dir);
 }

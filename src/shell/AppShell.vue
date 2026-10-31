@@ -6,7 +6,7 @@ import { placeCompareScript, type ScriptTarget } from "../compare/place";
 import type { DiagramOpen } from "../diagram/types";
 import { objectIdentity, type CatalogObjectRef } from "../catalog/object-ref";
 import { isDefinitionKind, objectLabel } from "../catalog/tree";
-import { catalogConnections } from "../catalog/store";
+import { catalogConnections, catalogLoaded } from "../catalog/store";
 import { listPaletteConnections } from "../connections";
 import { exportTasks, taskStatusText } from "../export/tasks";
 import type { TableTarget } from "../grid/target";
@@ -61,7 +61,24 @@ watch(
       // 配额满或隐私模式下持久化失败：静默放弃，不影响当前会话。
     }
   },
-  { deep: true },
+  // flush: sync —— 标签/草稿一变就同步写 localStorage，进程被终止也不留微任务窗口（R2）。
+  { deep: true, flush: "sync" },
+);
+
+/** 恢复的标签指向已删除的连接时给出提示（R2）：不自动连接、不弹错误风暴。 */
+const DELETED_CONNECTION_TAB_NOTICE = "这个标签指向的连接已删除。可以关闭标签，或重新选择执行目标。";
+
+watch(
+  () => catalogLoaded(),
+  (ready) => {
+    if (!ready) return;
+    const known = new Set(catalogConnections().map((item) => item.id));
+    for (const tab of session.tabs.value) {
+      if (!tab.connectionId || known.has(tab.connectionId)) continue;
+      if (tab.targetNotice === DELETED_CONNECTION_TAB_NOTICE) continue;
+      tab.targetNotice = DELETED_CONNECTION_TAB_NOTICE;
+    }
+  },
 );
 
 const CLOSE_PROMPT_TEXT = {

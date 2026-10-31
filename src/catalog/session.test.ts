@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { auditTables, catalogFixture, pagedCatalog } from "./fixtures";
 import {
   catalogConnections,
+  catalogLoaded,
   catalogLoadError,
   limitsForRefresh,
   refreshFromBackend,
@@ -68,6 +69,10 @@ function outline(id: string, engine: "postgres" | "mysql" | "sqlite", databases:
   };
 }
 
+function sessionInfo(ids: string[], status: "connected" | "lost" | "reconnecting" = "connected", reason: string | null = null) {
+  return ids.map((id) => ({ id, status, reason }));
+}
+
 describe("catalog session reads", () => {
   it("asks once per schema with the loaded window and appends the next page", async () => {
     expect(refreshLimit(120, 100)).toBe(120);
@@ -77,7 +82,7 @@ describe("catalog session reads", () => {
     expect(archive?.limit).toBe(120);
 
     invoke.mockImplementation(async (command: string, args?: { schema?: string; connectionId?: string; limit?: number }) => {
-      if (command === "catalog_sessions") return ["atlas"];
+      if (command === "catalog_sessions") return sessionInfo(["atlas"]);
       if (command === "connections_list") return [saved("atlas", "postgres", "atlas_dev")];
       if (command === "env_tags_list") return [];
       if (command === "catalog_refresh") return [outline("atlas", "postgres", [{ name: "atlas_dev", schemas: ["public", "archive"] }])];
@@ -159,7 +164,7 @@ describe("catalog session reads", () => {
     expect(catalogConnections()[0].databases[0].schemas[0].objects.map((item) => item.name)).toEqual(["customers", "orders", "categories"]);
 
     invoke.mockImplementation(async (command: string, args?: { schema?: string }) => {
-      if (command === "catalog_sessions") return ["atlas"];
+      if (command === "catalog_sessions") return sessionInfo(["atlas"]);
       if (command === "connections_list") return [saved("atlas", "postgres", "atlas_dev")];
       if (command === "env_tags_list") return [];
       if (command === "catalog_refresh") return [outline("atlas", "postgres", [{ name: "atlas_dev", schemas: ["public"] }])];
@@ -179,7 +184,7 @@ describe("catalog session reads", () => {
     });
     let secondStarted = false;
     invoke.mockImplementation(async (command: string, args?: { schema?: string }) => {
-      if (command === "catalog_sessions") return ["atlas"];
+      if (command === "catalog_sessions") return sessionInfo(["atlas"]);
       if (command === "connections_list") return [saved("atlas", "postgres", "app")];
       if (command === "env_tags_list") return [];
       if (command === "catalog_refresh") return [outline("atlas", "postgres", [{ name: "app", schemas: ["public", "analytics"] }])];
@@ -210,7 +215,7 @@ describe("catalog session reads", () => {
     vi.useFakeTimers();
     let ids: string[] = [];
     invoke.mockImplementation(async (command: string) => {
-      if (command === "catalog_sessions") return ids;
+      if (command === "catalog_sessions") return sessionInfo(ids);
       if (command === "connections_list") return [];
       if (command === "env_tags_list") return [];
       if (command === "catalog_refresh") return [];
@@ -221,5 +226,62 @@ describe("catalog session reads", () => {
     ids = ["notes"];
     await vi.advanceTimersByTimeAsync(1000);
     expect(invoke.mock.calls.filter((call) => call[0] === "connections_list").length).toBeGreaterThan(1);
+  });
+
+  it("marks the connection lost with its reason and keeps the stale tree without reading it", async () => {
+    replaceCatalog(catalogFixture());
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "catalog_sessions") return sessionInfo(["atlas"], "lost", "探活失败：connection reset");
+      if (command === "connections_list") return [saved("atlas", "postgres", "atlas_dev")];
+      if (command === "env_tags_list") return [];
+      if (command === "catalog_refresh") return [outline("atlas", "postgres", [{ name: "atlas_dev", schemas: ["public"] }])];
+      return { objects: [], total: 0, error: null };
+    });
+    await refreshFromBackend();
+
+    const connection = catalogConnections()[0]!;
+    expect(connection.status).toBe("lost");
+    expect(connection.error).toContain("探活失败");
+    // 断开前读到的内容保留（树上提示“可能不是最新”），不再发起目录读取
+    expect(connection.databases[0]!.schemas[0]!.objects.map((item) => item.name)).toEqual(["customers", "orders", "categories"]);
+    expect(invoke.mock.calls.some((call) => call[0] === "catalog_refresh")).toBe(false);
+    expect(invoke.mock.calls.some((call) => call[0] === "catalog_page")).toBe(false);
+    expect(catalogLoaded()).toBe(true);
+  });
+
+  it("presents a reconnecting session as connecting and refreshes when it recovers", async () => {
+    replaceCatalog(catalogFixture());
+    let sessions = sessionInfo(["atlas"], "reconnecting");
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "catalog_sessions") return sessions;
+      if (command === "connections_list") return [saved("atlas", "postgres", "atlas_dev")];
+      if (command === "env_tags_list") return [];
+      if (command === "catalog_refresh") return [outline("atlas", "postgres", [{ name: "atlas_dev", schemas: ["public"] }])];
+      return { objects: [{ name: "customers", kind: "table", estimatedRows: 1, stale: false }], total: 1, error: null };
+    });
+    await refreshFromBackend();
+    expect(catalogConnections()[0]!.status).toBe("connecting");
+
+    sessions = sessionInfo(["atlas"]);
+    await refreshFromBackend();
+    const recovered = catalogConnections()[0]!;
+    expect(recovered.status).toBe("connected");
+    expect(invoke.mock.calls.some((call) => call[0] === "catalog_refresh")).toBe(true);
+  });
+
+  it("keeps polling quiet while session states do not change", async () => {
+    vi.useFakeTimers();
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "catalog_sessions") return sessionInfo(["atlas"], "lost", "探活失败：connection reset");
+      if (command === "connections_list") return [saved("atlas", "postgres", "atlas_dev")];
+      if (command === "env_tags_list") return [];
+      if (command === "catalog_refresh") return [outline("atlas", "postgres", [{ name: "atlas_dev", schemas: ["public"] }])];
+      return { objects: [], total: 0, error: null };
+    });
+    await startCatalog();
+    const reads = invoke.mock.calls.filter((call) => call[0] === "connections_list").length;
+    await vi.advanceTimersByTimeAsync(3000);
+    // 状态与原因都没变：轮询不重复刷新
+    expect(invoke.mock.calls.filter((call) => call[0] === "connections_list").length).toBe(reads);
   });
 });

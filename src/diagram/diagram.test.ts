@@ -91,7 +91,7 @@ describe("relationship diagram", () => {
     refused.unmount();
   });
 
-  it("opens one read-only diagram tab from the current range and does not keep it in the saved session", async () => {
+  it("opens one read-only diagram tab from the current range and keeps one entry in the saved session", async () => {
     invoke.mockImplementation(async (command: string) => {
       if (command === "diagram_read") return linked;
       return [];
@@ -135,6 +135,14 @@ describe("relationship diagram", () => {
     session.openDiagram(target);
     expect(session.tabs.value.filter((tab) => tab.kind === "diagram")).toHaveLength(1);
     expect(session.activeTab.value?.diagram).toEqual({ schema: "public" });
-    expect(snapshotSession(session.tabs.value, session.activeId.value).tabs).toEqual([]);
+    // R2 起关系图标签随会话快照恢复：重复打开仍只保留一条
+    const snapshot = snapshotSession(session.tabs.value, session.activeId.value);
+    expect(snapshot.tabs.filter((tab) => tab.kind === "diagram")).toHaveLength(1);
+    expect(snapshot.tabs.find((tab) => tab.kind === "diagram")).toMatchObject({
+      id: "diagram:pg:bookstore:public",
+      diagramSchema: "public",
+      connectionId: "pg",
+      database: "bookstore",
+    });
   });
 });

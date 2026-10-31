@@ -2,7 +2,7 @@
 import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref } from "vue";
 import DefinitionView from "../catalog/DefinitionView.vue";
 import DiagramView from "../diagram/DiagramView.vue";
-import { catalogConnections } from "../catalog/store";
+import { catalogConnections, catalogLoaded } from "../catalog/store";
 import type { CatalogObjectRef } from "../catalog/object-ref";
 import { resolveTableTarget, type TableTarget } from "../grid/target";
 import { targetDetail, targetKey, targetOptions, type TargetOption } from "../query/complete";
@@ -47,6 +47,26 @@ function showPane(tabId: string, pane: "data" | "structure") {
 
 function tableTarget(tabId: string) {
   return resolveTableTarget(tabId, catalogConnections());
+}
+
+/** 表标签 id 前缀是连接 id：目录里找不到这个前缀就说明连接已删除。 */
+function tableConnectionGone(tabId: string): boolean {
+  if (!tabId.startsWith("table:")) return false;
+  const identity = tabId.slice("table:".length);
+  return !catalogConnections().some((item) => identity.startsWith(`${item.id}:`));
+}
+
+/**
+ * 恢复的标签指向已删除的连接（R2）：显示该标签的空态提示，不自动连接。
+ * 只判定快照恢复的标签——会话内打开的标签本来就有活目录。目录还没读完时不判定，避免加载期误报。
+ */
+function danglingTarget(tab: ShellTab): boolean {
+  if (!catalogLoaded() || tab.restored !== true) return false;
+  if (tab.kind === "table") return tableConnectionGone(tab.id);
+  if (tab.kind === "definition" || tab.kind === "diagram") {
+    return tab.connectionId != null && !catalogConnections().some((item) => item.id === tab.connectionId);
+  }
+  return false;
 }
 
 function definitionObject(tab: ShellTab): Pick<CatalogObjectRef, "connectionId" | "database" | "schema" | "name" | "kind" | "signature" | "relation"> | null {
@@ -220,6 +240,13 @@ onBeforeUnmount(() => {
       @executed="(id, sql) => emit('executed', id, sql)"
       @target="onTarget"
     />
+    <div v-else-if="active && danglingTarget(active)" class="tab-dangling" data-dangling-target>
+      <div class="tab-dangling-card">
+        <h3>{{ active.title }}</h3>
+        <p>这个标签指向的连接已删除，内容没有恢复。标签可以关闭；查询草稿仍保留在标签里。</p>
+        <p class="tab-dangling-path">{{ active.targetText || active.path || active.id }}</p>
+      </div>
+    </div>
     <div v-else-if="active && active.kind === 'table'" class="table-workspace">
       <div class="pane-switch" role="tablist" aria-label="表内容">
         <button type="button" role="tab" :aria-selected="paneOf(active) === 'data'" @click="showPane(active.id, 'data')">数据</button>
@@ -315,3 +342,19 @@ onBeforeUnmount(() => {
   </Teleport>
   </div>
 </template>
+
+<style scoped>
+.tab-dangling { display: grid; place-items: center; height: 100%; min-height: 0; }
+.tab-dangling-card {
+  max-width: 420px;
+  padding: var(--sp-4);
+  border: 1px dashed var(--line);
+  border-radius: var(--r-md);
+  color: var(--text-2);
+  text-align: center;
+  display: grid;
+  gap: var(--sp-2);
+}
+.tab-dangling-card h3 { margin: 0; color: var(--text); font-size: var(--fs-md, 15px); }
+.tab-dangling-path { margin: 0; font-size: 12px; color: var(--text-3); word-break: break-all; }
+</style>

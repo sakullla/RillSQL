@@ -4,7 +4,7 @@ use crate::catalog::model::{kind_name, known_row_estimate, ConnStatus, Engine, K
 use crate::catalog::read::{self, ObjectWindow};
 use crate::connections::commands::ConnectionsState;
 use crate::connections::model::{EnvTag, ENV_NONE};
-use crate::connections::{CatalogSession, Service};
+use crate::connections::{CatalogSession, Service, SessionCondition, SessionStatus};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -93,8 +93,13 @@ pub(crate) async fn load_catalog(
             continue;
         }
         let engine = record.saved.engine;
-        let session = service.catalog_session(&record.saved.id);
-        let connected = session.is_some();
+        let condition = service.session_condition(&record.saved.id);
+        // lost 会话不再读取目录：树上显示断开前读到的内容（R4）。
+        let session = if matches!(condition, Some(SessionCondition::Connected)) {
+            service.catalog_session(&record.saved.id)
+        } else {
+            None
+        };
         let windows: Vec<ObjectWindow> = limits
             .iter()
             .filter(|item| item.connection_id == record.saved.id)
@@ -114,6 +119,11 @@ pub(crate) async fn load_catalog(
             },
         };
         let (env_label, env_tone) = describe_env(&tags, &record.saved.env);
+        let (status, error) = match condition {
+            Some(SessionCondition::Lost { reason }) => (ConnStatus::Lost.as_api(), reason.or(body.error)),
+            Some(SessionCondition::Connected) => (ConnStatus::Connected.as_api(), body.error),
+            None => (ConnStatus::Disconnected.as_api(), body.error),
+        };
         catalogs.push(CatalogDto {
             id: record.saved.id,
             name: record.saved.name,
@@ -121,15 +131,10 @@ pub(crate) async fn load_catalog(
             env: record.saved.env,
             env_label,
             env_tone,
-            status: if connected {
-                ConnStatus::Connected
-            } else {
-                ConnStatus::Disconnected
-            }
-            .as_api(),
+            status,
             default_database: record.saved.database,
             foreign_keys: if engine.shows_foreign_keys() { body.foreign_keys } else { None },
-            error: body.error,
+            error,
             databases: body.databases.into_iter().map(database_dto).collect(),
         });
     }
@@ -155,8 +160,8 @@ pub(crate) async fn page_for_session(session: Option<&CatalogSession>, engine: E
 }
 
 #[tauri::command]
-pub async fn catalog_sessions(state: tauri::State<'_, ConnectionsState>) -> Result<Vec<String>, String> {
-    Ok(state.service.open_session_ids())
+pub async fn catalog_sessions(state: tauri::State<'_, ConnectionsState>) -> Result<Vec<SessionStatus>, String> {
+    Ok(std::sync::Arc::clone(&state.service).session_statuses().await)
 }
 
 #[tauri::command]
