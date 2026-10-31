@@ -128,6 +128,7 @@ describe("data migration", () => {
         source: expect.objectContaining({ connectionId: "pg", table: "orders" }),
         target: expect.objectContaining({ connectionId: "my", table: "t_orders" }),
         mapping: [{ source: "id", target: "id" }],
+        options: null,
       }),
     });
     await cancelTask(finished);
@@ -177,6 +178,7 @@ describe("data migration", () => {
         source: expect.objectContaining({ connectionId: "pg", engine: "postgres", database: "app", schema: "public", table: "orders" }),
         target: expect.objectContaining({ connectionId: "my", engine: "mysql", database: "app", table: "t_orders" }),
         mapping: [{ source: "id", target: "id" }, { source: "name", target: "Name" }, { source: "amount", target: "amount" }],
+        options: null,
       }),
     });
     const task = exportTasks.find((item) => item.kind === "migrate");

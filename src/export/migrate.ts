@@ -26,6 +26,7 @@ export interface MigratePayload {
   source: MigrateTableRef;
   target: MigrateTableRef;
   mapping: MigrateColumnPair[];
+  /** 允许显式 null：MigrateDialog 固定传 null，Rust 端以 Option 承接并落到默认选项。 */
   options?: MigrateOptions | null;
 }
 

@@ -52,7 +52,7 @@ fn request(id: &str, source: MigrateTableRef, target: MigrateTableRef, mapping: 
             .iter()
             .map(|(source, target)| ColumnPair { source: (*source).to_owned(), target: (*target).to_owned() })
             .collect(),
-        options: MigrateOptions::default(),
+        options: Some(MigrateOptions::default()),
     }
 }
 
@@ -233,7 +233,7 @@ async fn cancel_stops_and_keeps_the_reported_progress() {
                 source: ref_of("src", "logs"),
                 target: ref_of("dst", "logs"),
                 mapping: Vec::new(),
-                options: MigrateOptions { batch_rows: 5 },
+                options: Some(MigrateOptions { batch_rows: 5 }),
             },
             &|payload| {
                 let mut armed = cancel_at.lock().unwrap();
@@ -380,4 +380,32 @@ fn request_cancel_flags_a_running_job() {
     request_cancel("migrate-cancel-test");
     assert!(flag.load(Ordering::Relaxed));
     finish_job("migrate-cancel-test");
+}
+
+/// IPC 边界穿透：MigrateDialog.vue 固定传 `options: null`，而 serde(default) 只覆盖字段缺失、
+/// 不接受显式 null（曾报 invalid type: null, expected struct MigrateOptions，所有 UI 发起的迁移零行写入）。
+/// 这里从与 invoke 载荷同形的 JSON 反序列化（不直构结构体），保证前端 `options: null` 能落到默认选项。
+#[test]
+fn migrate_request_accepts_null_or_missing_options_from_the_ipc_payload() {
+    let base = serde_json::json!({
+        "id": "m0",
+        "source": { "connectionId": "src", "engine": "sqlite", "database": "", "schema": "", "table": "people" },
+        "target": { "connectionId": "dst", "engine": "sqlite", "database": "", "schema": "", "table": "people" },
+        "mapping": [],
+    });
+
+    let mut null_payload = base.clone();
+    null_payload["options"] = serde_json::Value::Null;
+    let request: MigrateRequest =
+        serde_json::from_value(null_payload).expect("options:null 必须能通过 IPC 反序列化");
+    assert!(request.options.is_none());
+    assert_eq!(request.effective_options().batch_rows, MigrateOptions::default().batch_rows);
+
+    let missing: MigrateRequest = serde_json::from_value(base.clone()).expect("缺 options 字段必须能通过 IPC 反序列化");
+    assert_eq!(missing.effective_options().batch_rows, 0);
+
+    let mut tuned_payload = base.clone();
+    tuned_payload["options"] = serde_json::json!({ "batchRows": 5 });
+    let tuned: MigrateRequest = serde_json::from_value(tuned_payload).expect("显式 options 必须按值生效");
+    assert_eq!(tuned.effective_options().batch_rows, 5);
 }

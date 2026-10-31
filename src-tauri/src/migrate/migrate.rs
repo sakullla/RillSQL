@@ -81,7 +81,7 @@ pub struct ColumnPair {
     pub target: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrateOptions {
     /// 每批提交的行数；0 按默认页粒度，越界值取上限。
@@ -99,8 +99,17 @@ pub struct MigrateRequest {
     /// 源列名 → 目标列名。空列表按同名自动映射。
     #[serde(default)]
     pub mapping: Vec<ColumnPair>,
+    /// UI 固定传 `options: null`：serde(default) 只覆盖字段缺失、不接受显式 null，
+    /// 所以这里用 Option 承接，取值时统一落到默认值。
     #[serde(default)]
-    pub options: MigrateOptions,
+    pub options: Option<MigrateOptions>,
+}
+
+impl MigrateRequest {
+    /// 生效选项：None（显式 null 或整个字段缺失）都按默认页粒度执行。
+    pub(crate) fn effective_options(&self) -> MigrateOptions {
+        self.options.clone().unwrap_or_default()
+    }
 }
 
 #[derive(Serialize)]
@@ -541,7 +550,8 @@ async fn migrate_body(
     if matches!(source, CatalogSession::Scripted) || matches!(target, CatalogSession::Scripted) {
         return blocked("这个连接没有连着可查询的数据库".to_owned());
     }
-    let plan = match build_plan(source, &request.source, target, &request.target, &request.mapping, &request.options).await {
+    let options = request.effective_options();
+    let plan = match build_plan(source, &request.source, target, &request.target, &request.mapping, &options).await {
         Ok(plan) => plan,
         Err(message) => return blocked(message),
     };
