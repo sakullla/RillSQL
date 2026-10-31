@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { catalogConnections, refreshCatalog } from "../catalog/store";
-import { tr as t } from "../i18n";
-import { backendErrorText, codeHint, codeMessage } from "../i18n/backend-error";
+import { currentLocale, tr as t } from "../i18n";
+import { backendErrorText, codeHint, codeMessage, errorCodeOf } from "../i18n/backend-error";
 import Listbox from "../ui/Listbox.vue";
-import { tauriConnectionApi, type ConnectionApi, type EnvTagInput, type TestReport } from "./api";
+import { tauriConnectionApi, type ConnectionApi, type EnvTagInput, type StageView, type TestReport } from "./api";
 import ConnIcon from "./ConnIcon.vue";
 import EnvTagField from "./EnvTagField.vue";
 import { importConnectionText, importRillSqlConnections } from "./import";
@@ -16,6 +16,8 @@ import {
   engineMeta,
   presentEnv,
   plannedStageLabels,
+  stageKindLabel,
+  stageOkSummary,
   tlsVerificationCopy,
   validate,
   type ConnectionDraft,
@@ -124,6 +126,22 @@ function stateText(state: string): string {
   return t(STATUS_TEXT_KEYS[state] ?? "connections.status.disconnected");
 }
 const failedStage = computed(() => report.value?.stages.find((stage) => stage.status === "err") ?? null);
+
+/** T6-A3：阶段名按 kind 映射（zh 保留后端 label 原文，含 TLS verify 措辞；其他 locale 走字典）。 */
+function stageLabel(stage: StageView): string {
+  return currentLocale() === "zh-CN" ? stage.label : stageKindLabel(stage.kind, stage.label);
+}
+/** T6-A3：阶段消息——跳过态映射固定句；失败/等待态先查码（zh 回退原文）；ok 态 zh 保留动态细节、其他 locale 用 kind 摘要。 */
+function stageMessage(stage: StageView): string {
+  if (stage.status === "skipped") return t("connections.editor.test.stageNotRun");
+  if (stage.status === "err" || stage.status === "wait") return codeMessage(stage.code) ?? stage.message;
+  return currentLocale() === "zh-CN" ? stage.message : stageOkSummary(stage.kind, stage.message);
+}
+/** 失败首行的阶段名：优先按失败阶段 kind 映射，回退后端 failStage 文本。 */
+function failedStageName(): string {
+  if (failedStage.value) return stageLabel(failedStage.value);
+  return report.value?.failStage || t("connections.editor.test.unknownReason");
+}
 
 const advancedHint = computed(() =>
   draft.value.engine === "sqlite" ? t("connections.editor.advancedSqliteHint") : t("connections.editor.advancedHint"),
@@ -387,17 +405,16 @@ async function importRillSqlFile() {
   try {
     await runRillSqlImport(path, "");
   } catch (error) {
-    const message = errorText(error, t("connections.errors.importFailed"));
-    // 后端（export.rs）对口令加密文件返回中文错误串「带口令加密」——这是前后端契约标记，与界面语言无关；
-    // 用转义写法避免源码出现裸中文（verify:workbench 字典化扫描）。
-    if (message.includes("\u5e26\u53e3\u4ee4\u52a0\u5bc6")) {
+    // T6-A3：口令加密文件的识别改按后端稳定码判断（[import.passphrase_required] 前缀），
+    // 不再对翻译后的文本做中文子串匹配——en locale 下旧写法永不命中。
+    if (errorCodeOf(error) === "import.passphrase_required") {
       passphrasePath.value = path;
       passphraseInput.value = "";
       dialog.value = "passphrase";
       requestAnimationFrame(() => show(otherDialog.value));
       return;
     }
-    note.value = message;
+    note.value = errorText(error, t("connections.errors.importFailed"));
   } finally {
     busy.value = false;
   }
@@ -843,17 +860,17 @@ watch(
             </div>
           </template>
           <template v-else>
-            <p class="test-line err"><ConnIcon name="x" />{{ t("connections.editor.test.failed", { stage: report.failStage || t("connections.editor.test.unknownReason") }) }}</p>
-            <p v-if="failedStage?.message" class="test-detail" data-test-fail>{{ failedStage.code ? codeMessage(failedStage.code) ?? failedStage.message : failedStage.message }}</p>
+            <p class="test-line err"><ConnIcon name="x" />{{ t("connections.editor.test.failed", { stage: failedStageName() }) }}</p>
+            <p v-if="failedStage && failedStage.message" class="test-detail" data-test-fail>{{ stageMessage(failedStage) }}</p>
             <p v-if="report.hint" class="test-detail">{{ report.code ? codeHint(report.code) ?? report.hint : report.hint }}</p>
             <details class="disclosure test-all">
               <summary>{{ t("connections.editor.test.allSteps") }} <span class="muted">{{ t("connections.editor.test.stepsCount", { n: report.stages.length }) }}</span></summary>
               <div class="disclosure-body">
                 <ol class="test-steps">
-                  <li v-for="stage in report.stages" :key="stage.label" class="ts" :class="`ts-${stage.status === 'skipped' ? 'skip' : stage.status}`">
+                  <li v-for="stage in report.stages" :key="stage.kind" class="ts" :class="`ts-${stage.status === 'skipped' ? 'skip' : stage.status}`">
                     <span class="ts-i"><ConnIcon :name="stage.status === 'ok' ? 'check' : stage.status === 'err' ? 'x' : stage.status === 'wait' ? 'key' : 'minus'" /></span>
-                    <span class="ts-name">{{ stage.label }}</span>
-                    <span class="ts-msg">{{ stage.message }}</span>
+                    <span class="ts-name">{{ stageLabel(stage) }}</span>
+                    <span class="ts-msg">{{ stageMessage(stage) }}</span>
                   </li>
                 </ol>
               </div>

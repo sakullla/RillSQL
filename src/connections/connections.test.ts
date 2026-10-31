@@ -1,5 +1,6 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import { describe, expect, it, vi } from "vitest";
+import { setLocale } from "../i18n";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
 import type { CatalogConnection } from "../catalog/types";
 import type { ConnectionApi, EnvTagInput, TestReport } from "./api";
@@ -637,8 +638,8 @@ describe("connections page", () => {
     });
     const importFile = vi.fn(async (path: string, passphrase: string) => {
       expect(path).toBe("C:/tmp/conns.rillsqlcx");
-      if (!passphrase) throw new Error("这份文件带口令加密，请输入导出时设置的口令。");
-      if (passphrase === "错误口令") throw new Error("口令不正确或文件已损坏，已整体拒绝导入。");
+      if (!passphrase) throw new Error("[import.passphrase_required] 这份文件带口令加密，请输入导出时设置的口令。");
+      if (passphrase === "错误口令") throw new Error("[import.bad_passphrase] 口令不正确或文件已损坏，已整体拒绝导入。");
       return {
         connections: [savedMysql()],
         skipped: [{ name: "报表库", reason: "不支持的数据库引擎 clickhouse。" }],
@@ -677,6 +678,35 @@ describe("connections page", () => {
     expect(wrapper.find("[data-field=import-passphrase]").exists()).toBe(false);
     wrapper.unmount();
     setConnectionsFilePicker(async () => null);
+  });
+
+  it("英文 locale 下按错误码触发口令对话框（不再依赖中文子串契约）", async () => {
+    setLocale("en");
+    try {
+      setConnectionsFilePicker(async () => "C:/tmp/conns.rillsqlcx");
+      const importFile = vi.fn(async (path: string) => {
+        expect(path).toBe("C:/tmp/conns.rillsqlcx");
+        throw new Error("[import.passphrase_required] 这份文件带口令加密，请输入导出时设置的口令。");
+      });
+      const api: ConnectionApi = {
+        ...pageApi(() => ({ status: "ok", stages: [] }), []),
+        importFile,
+      };
+      const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api } });
+      await flushPromises();
+
+      await wrapper.get("[data-action=conn-import-rx]").trigger("click");
+      await flushPromises();
+      // T6-A3：识别依据是 import.passphrase_required 稳定码；en 下对话框文案走 en 字典。
+      expect(importFile).toHaveBeenCalledWith("C:/tmp/conns.rillsqlcx", "");
+      expect(wrapper.text()).toContain("Enter import passphrase");
+      expect(wrapper.text()).toContain("passphrase-encrypted");
+      expect(wrapper.text()).not.toContain("输入导入口令");
+      wrapper.unmount();
+      setConnectionsFilePicker(async () => null);
+    } finally {
+      setLocale("zh-CN");
+    }
   });
 });
 

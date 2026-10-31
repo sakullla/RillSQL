@@ -368,6 +368,56 @@ try {
   expect(await page.locator(".statusbar").innerText()).toContain("Connected");
   report.checks.push("English locale: major surfaces (connections/history headings, palette, titlebar, statusbar, rail) show no Chinese leftovers");
 
+  // ---- T6-A3：英文 locale 的连接测试失败路径无中文残留 ----
+  // 运行时把 connections_test 换成带稳定码的失败报告（阶段 label/ok 消息/hint 均为后端中文原文），
+  // 断言呈现层按 kind 映射阶段名、按码取字典、跳过态走固定句——en 下整条失败路径无汉字。
+  await page.evaluate(() => {
+    const core = window.__TAURI_INTERNALS__;
+    core.__originalTestInvoke = core.invoke;
+    core.invoke = async (command, args = {}) => {
+      if (command === "connections_test") {
+        return {
+          status: "err",
+          failStage: "登录数据库",
+          hint: "请检查数据库用户名和密码。",
+          summary: null,
+          fingerprint: null,
+          algorithm: null,
+          code: "conn.auth_failed",
+          stages: [
+            { kind: "network", label: "连接数据库服务器", status: "ok", message: "127.0.0.1:5432 可达" },
+            { kind: "tls", label: "加密连接并核对证书", status: "ok", message: "TLS 已连接 (TLSv1.3)" },
+            { kind: "database_authentication", label: "登录数据库", status: "err", message: "密码错误", code: "conn.auth_failed" },
+            { kind: "server_version", label: "读取数据库版本", status: "skipped", message: "未执行" },
+          ],
+        };
+      }
+      return core.__originalTestInvoke(command, args);
+    };
+  });
+  await navEn.getByRole("button", { name: "Connections", exact: true }).click();
+  const failCard = page.locator("article.conn-card", { hasText: "书店 · 开发" });
+  await failCard.locator("[data-action=conn-menu]").click();
+  await page.locator("[data-action=conn-edit]").click();
+  await expect(page.getByRole("heading", { name: /Edit connection/ })).toBeVisible();
+  await page.locator("[data-action=cf-test]").click();
+  await expect(page.locator(".test-panel.err")).toBeVisible();
+  const failLineText = await page.locator(".test-panel.err .test-line").innerText();
+  expect(failLineText).toContain("Connection failed: Log in to the database");
+  expect(await page.locator(".test-panel.err").innerText()).not.toMatch(HAN);
+  await page.locator("details.test-all > summary").click();
+  const stepsTextEn = await page.locator(".test-steps").innerText();
+  expect(stepsTextEn).toContain("Not run");
+  expect(stepsTextEn).not.toMatch(HAN);
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(page.getByRole("heading", { name: /Edit connection/ })).toBeHidden();
+  await page.evaluate(() => {
+    const core = window.__TAURI_INTERNALS__;
+    core.invoke = core.__originalTestInvoke;
+    delete core.__originalTestInvoke;
+  });
+  report.checks.push("English locale: failed connection test maps stage kinds and error codes to dictionary text with no Chinese leftovers");
+
   // 快捷键帮助（英文）。
   await page.getByRole("button", { name: "Shortcuts and help" }).click();
   const helpEn = page.getByRole("dialog").filter({ hasText: "Keyboard shortcuts" });

@@ -371,4 +371,19 @@ mod error_code_tests {
         assert!(text.contains("带口令加密"));
         assert!(text.ends_with("请输入导出时设置的口令。"));
     }
+
+    /// T6-A3：带插值参数的加码前缀——前端非 zh-CN locale 用字典条目插值 {current}/{database}。
+    #[test]
+    fn coded_string_params_carry_interpolation_values() {
+        let text = error_codes::coded_string_params(
+            error_codes::DUMP_SESSION_GAP,
+            &[("current", "bookstore"), ("database", "reports")],
+            "当前连接打开的是 bookstore，没有另开连接读取 reports",
+        );
+        assert!(text.starts_with("[dump.session_gap current=\"bookstore\" database=\"reports\"] "));
+        assert!(text.ends_with("没有另开连接读取 reports"));
+        // 空参数退化为普通前缀，前端解析保持单一形态。
+        let plain = error_codes::coded_string_params(error_codes::DUMP_DATABASE_REQUIRED, &[], "需要数据库名，没有另开连接。");
+        assert!(plain.starts_with("[dump.database_required] "));
+    }
 }

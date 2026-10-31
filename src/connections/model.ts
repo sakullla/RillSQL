@@ -1,5 +1,5 @@
 import { ENGINES, engineMeta, type Engine } from "../engines";
-import { tr } from "../i18n";
+import { i18n, tr } from "../i18n";
 
 export { ENGINES, engineMeta };
 export type { Engine };
@@ -271,6 +271,22 @@ export function plannedStageLabels(draft: ConnectionDraft): string[] {
   if (draft.tlsMode !== "off") stages.push(draft.tlsMode === "verify" ? tr("connections.stages.tlsVerify") : tr("connections.stages.tlsRequire"));
   stages.push(tr("connections.stages.login"), tr("connections.stages.version"));
   return stages;
+}
+
+/**
+ * 按 StageView.kind（后端 StageKind 的 snake_case 码）取阶段名（T6-A3）：
+ * zh-CN 直接用后端 label 原文（保留 TLS verify 等措辞）；其他 locale 用 connections.stageKinds 字典，
+ * 未知 kind 回退后端 label 原文。
+ */
+export function stageKindLabel(kind: string, fallback: string): string {
+  const key = `connections.stageKinds.${kind}`;
+  return i18n.global.te(key) ? tr(key as Parameters<typeof tr>[0]) : fallback;
+}
+
+/** 按 kind 的成功阶段摘要（T6-A3）：非 zh-CN locale 的 ok 消息映射；未知 kind 回退动态原文。 */
+export function stageOkSummary(kind: string, fallback: string): string {
+  const key = `connections.stageOk.${kind}`;
+  return i18n.global.te(key) ? tr(key as Parameters<typeof tr>[0]) : fallback;
 }
 
 export function tlsVerificationCopy(draft: ConnectionDraft): string {

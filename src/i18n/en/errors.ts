@@ -1,4 +1,8 @@
-/** Backend error-code copy domain (T6-A2/R6): keys mirror the stable codes in src-tauri error_codes.rs. */
+/**
+ * Backend error-code copy domain (T6-A2/R6, revised T6-A3): keys mirror the stable codes in src-tauri error_codes.rs.
+ * English-only dictionary: zh-CN renders the backend's original Chinese message directly (it already carries
+ * driver details and interpolated values), so these entries are consulted only for non-zh-CN locales.
+ */
 export const errors = {
   conn: {
     stage_failed: {
@@ -152,11 +156,11 @@ export const errors = {
       hint: "",
     },
     session_gap: {
-      message: "The current connection has another database open; no separate connection was made to read this one.",
+      message: "The current connection has {current} open; no separate connection was made to read {database}.",
       hint: "",
     },
     session_gap_main: {
-      message: "The current connection has main open; no separate connection was made to read another database.",
+      message: "The current connection has main open; no separate connection was made to read {database}.",
       hint: "",
     },
     database_required: {

@@ -1,4 +1,8 @@
-/** 后端错误码文案域（T6-A2/R6）：key 与 src-tauri error_codes.rs 的稳定码一一对应。 */
+/**
+ * 后端错误码文案域（T6-A2/R6，T6-A3 修订）：key 与 src-tauri error_codes.rs 的稳定码一一对应。
+ * zh-CN 不经此字典——后端原文即面向用户的中文（含驱动细节与动态参数），呈现层直接回退原文；
+ * 本文件仅为 en/errors.ts 的 MessageSchema 结构对齐保留（条目文本与后端原文保持镜像）。
+ */
 export const errors = {
   conn: {
     stage_failed: {
@@ -152,11 +156,11 @@ export const errors = {
       hint: "",
     },
     session_gap: {
-      message: "当前连接打开的是别的数据库，没有另开连接读取。",
+      message: "当前连接打开的是 {current}，没有另开连接读取 {database}。",
       hint: "",
     },
     session_gap_main: {
-      message: "当前连接打开的是 main，没有另开连接读取其它库。",
+      message: "当前连接打开的是 main，没有另开连接读取 {database}。",
       hint: "",
     },
     database_required: {

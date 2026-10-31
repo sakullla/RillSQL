@@ -12,6 +12,7 @@ import SchemaBlock from "./SchemaBlock.vue";
 import { catalogConnections, catalogLoadError, refreshCatalog, schemaKey, setStructureFocus } from "./store";
 import { tr as t } from "../i18n";
 import { codeHint, codeMessage } from "../i18n/backend-error";
+import { stageKindLabel } from "../connections/model";
 import { engineShape, isConnected, isDefinitionKind, kindLabel, objectKey, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
 import type { CatalogConnection, DatabaseNode } from "./types";
 
@@ -164,12 +165,14 @@ function failureText(error: unknown): string {
 }
 
 function openFailure(report: OpenOutcome["report"]): string {
-  // T6-A2/R6：报告带稳定码时按码取字典，未知码回退原文。
+  // T6-A2/R6：报告带稳定码时按码取字典，未知码回退原文；T6-A3：zh 原文直出（codeMessage 仅非 zh-CN 生效）。
   if (report.status === "wait") return codeHint(report.code) ?? report.hint ?? t("catalog.tree.hostKeyWait");
   const stage = report.stages.find((item) => item.status === "err" && item.message);
   const bridged = codeMessage(report.code);
   if (bridged) return bridged;
-  return stage?.message || report.hint || report.failStage || t("catalog.tree.notConnected");
+  // failStage 兜底按失败阶段 kind 映射（connections.stageKinds），避免 en 下透出后端中文标签。
+  const failStageText = stage ? stageKindLabel(stage.kind, report.failStage ?? "") : report.failStage;
+  return stage?.message || report.hint || failStageText || t("catalog.tree.notConnected");
 }
 
 async function onRefresh() {
@@ -198,10 +201,9 @@ async function connectSession(connection: CatalogConnection, password = "") {
     }
     const outcome = await openConnection(connection.id, password);
     if (!outcome.connected) {
-      const message = openFailure(outcome.report);
-      connectError.value = message;
-      // 后端在连接需要密码时返回中文错误串「请填写数据库密码」——前后端契约标记，与界面语言无关（转义写法避免源码裸中文）。
-      if (message.includes("\u8bf7\u586b\u5199\u6570\u636e\u5e93\u5bc6\u7801")) passwordFor.value = connection.id;
+      connectError.value = openFailure(outcome.report);
+      // T6-A3：需要密码的识别改按报告稳定码判断，不再对呈现文本做中文子串匹配（en 下旧写法永不命中）。
+      if (outcome.report.code === "conn.password_required") passwordFor.value = connection.id;
       return;
     }
     passwordFor.value = null;

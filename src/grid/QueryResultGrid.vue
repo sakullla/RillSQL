@@ -17,7 +17,7 @@ import { useRowWindow } from "./virtual";
 import { copyCellText, copySqlValue, showCell } from "./display";
 import "./grid.css";
 import { loadSettings } from "../shell/settings";
-import { locateResultRows, provedEditableColumns, readSingleTable, resolveEditableTable, ResultEditSession, type TableHit } from "./result-edit";
+import { locateResultRows, provedEditableColumns, readSingleTable, refusalText, resolveEditableTable, ResultEditSession, type TableHit } from "./result-edit";
 import { rejectWrite, typeCaption, valueFamily } from "./typeset";
 import type { Cell, Column, Engine, Row, SortSpec } from "./types";
 
@@ -110,12 +110,12 @@ async function resolveEdit() {
   const structural = readSingleTable(props.statement, props.engine ?? "postgres");
   const engine = props.engine ?? "postgres";
   if (!structural.ok) {
-    reason.value = t(structural.reason);
+    reason.value = refusalText(structural.reason);
     return;
   }
   const resolved = resolveEditableTable(structural.table, tableHits(), props.database ?? "", engine);
   if (!resolved.ok) {
-    reason.value = t(resolved.reason);
+    reason.value = refusalText(resolved.reason);
     return;
   }
   if (!props.connectionId) {
@@ -147,7 +147,7 @@ async function resolveEdit() {
     const located = locateResultRows(described, props.columns, props.rows, structural.columns);
     if (!located.ok) {
       editSession.value = null;
-      reason.value = t(located.reason);
+      reason.value = refusalText(located.reason);
       return;
     }
     editSession.value = reactive(new ResultEditSession(described, {

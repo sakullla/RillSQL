@@ -324,7 +324,11 @@ async fn resolve_scope(engine: Engine, session: &CatalogSession, database: &str,
         Engine::Mongodb => return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_ENGINE_UNSUPPORTED, "MongoDB 没有整库导出；集合文档经文档浏览器访问。")),
         Engine::Sqlite => {
             if !database.is_empty() && database != "main" {
-                return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_SESSION_GAP_MAIN, format!("当前连接打开的是 main，没有另开连接读取 {database}")));
+                return Err(crate::connections::error_codes::coded_string_params(
+                    crate::connections::error_codes::DUMP_SESSION_GAP_MAIN,
+                    &[("database", database)],
+                    format!("当前连接打开的是 main，没有另开连接读取 {database}"),
+                ));
             }
             Ok((String::new(), vec![String::new()]))
         }
@@ -337,7 +341,11 @@ async fn resolve_scope(engine: Engine, session: &CatalogSession, database: &str,
         Engine::Postgres => {
             let current = current_postgres_database(session).await?;
             if !database.is_empty() && database != current {
-                return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_SESSION_GAP, format!("当前连接打开的是 {current}，没有另开连接读取 {database}")));
+                return Err(crate::connections::error_codes::coded_string_params(
+                    crate::connections::error_codes::DUMP_SESSION_GAP,
+                    &[("current", &current), ("database", database)],
+                    format!("当前连接打开的是 {current}，没有另开连接读取 {database}"),
+                ));
             }
             if schemas.is_empty() {
                 let sql = metadata_sql(Engine::Postgres).schemas.ok_or_else(|| read_failure("PostgreSQL 缺少 schema 查询"))?;
@@ -353,7 +361,11 @@ async fn resolve_scope(engine: Engine, session: &CatalogSession, database: &str,
         Engine::Sqlserver => {
             let current = sqlserver_current_database(session).await?;
             if !database.is_empty() && database != current {
-                return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_SESSION_GAP, format!("当前连接打开的是 {current}，没有另开连接读取 {database}")));
+                return Err(crate::connections::error_codes::coded_string_params(
+                    crate::connections::error_codes::DUMP_SESSION_GAP,
+                    &[("current", &current), ("database", database)],
+                    format!("当前连接打开的是 {current}，没有另开连接读取 {database}"),
+                ));
             }
             if schemas.is_empty() {
                 let sql = metadata_sql(Engine::Sqlserver).schemas.ok_or_else(|| read_failure("SQL Server 缺少 schema 查询"))?;

@@ -9,7 +9,7 @@ import type { CatalogConnection } from "../catalog/types";
 import { exportTasks, resetExportTasks } from "../export/tasks";
 import DataGrid from "./DataGrid.vue";
 import { commitChanges, matchesFilter, queryPage, viewLoadedRows } from "./data";
-import { locateResultRows, readSingleTable, resolveEditableTable, ResultEditSession } from "./result-edit";
+import { locateResultRows, readSingleTable, refusalText, resolveEditableTable, ResultEditSession } from "./result-edit";
 import { gridModel } from "../query/rows";
 import { copyPlain, copySqlValue, showCell } from "./display";
 import { customersFixture, nokeyFixture, viewFixture } from "./fixture";
@@ -17,7 +17,7 @@ import QueryResultGrid from "./QueryResultGrid.vue";
 import { TableSession } from "./session";
 import { browseSql, compileWhere, compileWhereWithSearch, searchClause, selectExportGate } from "./sql";
 import type { TableTarget } from "./target";
-import { tr } from "../i18n";
+import { setLocale } from "../i18n";
 import { COMMIT_RULE, FILTER_OPS, opLabel, opNeedsValue, type Column, type TableSchema } from "./types";
 
 const invoke = vi.hoisted(() => vi.fn());
@@ -1023,22 +1023,22 @@ describe("query result edits", () => {
   function proof(sql: string) {
     const parsed = readSingleTable(sql);
     expect(parsed.ok).toBe(true);
-    if (!parsed.ok) throw new Error(parsed.reason);
+    if (!parsed.ok) throw new Error(refusalText(parsed.reason));
     return parsed.table;
   }
 
   function rejectReason(sql: string): string {
     const parsed = readSingleTable(sql);
-    return parsed.ok ? "" : parsed.reason;
+    return parsed.ok ? "" : refusalText(parsed.reason);
   }
 
   it("only locates a proved single-table select that contains its primary key", () => {
     expect(readSingleTable("SELECT * FROM orders JOIN items ON items.id = orders.id").ok).toBe(false);
-    expect(tr(rejectReason("SELECT status, COUNT(*) FROM orders GROUP BY status"))).toContain("聚合");
-    expect(tr(rejectReason("SELECT DISTINCT status FROM orders"))).toContain("DISTINCT");
-    expect(tr(rejectReason("SELECT id FROM orders UNION SELECT id FROM archive"))).toContain("UNION");
-    expect(tr(rejectReason("SELECT id FROM (SELECT id FROM orders) q"))).toContain("子查询");
-    expect(tr(rejectReason("DELETE FROM orders"))).toContain("SELECT");
+    expect(rejectReason("SELECT status, COUNT(*) FROM orders GROUP BY status")).toContain("聚合");
+    expect(rejectReason("SELECT DISTINCT status FROM orders")).toContain("DISTINCT");
+    expect(rejectReason("SELECT id FROM orders UNION SELECT id FROM archive")).toContain("UNION");
+    expect(rejectReason("SELECT id FROM (SELECT id FROM orders) q")).toContain("子查询");
+    expect(rejectReason("DELETE FROM orders")).toContain("SELECT");
     expect(readSingleTable("SELECT id, name FROM ONLY orders").ok).toBe(false);
     const explicitAlias = readSingleTable("SELECT id, email AS name FROM customers");
     expect(explicitAlias.ok).toBe(true);
@@ -1060,7 +1060,7 @@ describe("query result edits", () => {
       { schema: "sales", name: "orders", kind: "table" },
     ], "app");
     expect(ambiguous.ok).toBe(false);
-    if (!ambiguous.ok) expect(tr(ambiguous.reason)).toContain("多个模式");
+    if (!ambiguous.ok) expect(refusalText(ambiguous.reason)).toContain("多个模式");
     const named = resolveEditableTable(proof("SELECT status FROM public.orders"), [], "app", "postgres");
     expect(named).toEqual({ ok: true, schema: "public", table: "orders" });
     const folded = resolveEditableTable(proof("SELECT id, name FROM orders"), [
@@ -1068,7 +1068,7 @@ describe("query result edits", () => {
       { schema: "public", name: "orders", kind: "table" },
     ], "app", "postgres");
     expect(folded.ok).toBe(false);
-    if (!folded.ok) expect(tr(folded.reason)).toContain("大小写");
+    if (!folded.ok) expect(refusalText(folded.reason)).toContain("大小写");
     const namedFolded = resolveEditableTable(proof("SELECT id FROM public.orders"), [
       { schema: "public", name: "orders", kind: "table" },
       { schema: "public", name: "Orders", kind: "table" },
@@ -1079,7 +1079,7 @@ describe("query result edits", () => {
         { schema: "", name: "customers", kind: "table" },
       ], "app", engine);
       expect(foreign.ok).toBe(false);
-      if (!foreign.ok) expect(tr(foreign.reason)).toContain("限定名");
+      if (!foreign.ok) expect(refusalText(foreign.reason)).toContain("限定名");
       const current = resolveEditableTable(proof("SELECT id, name FROM app.customers"), [
         { schema: "", name: "customers", kind: "table" },
       ], "app", engine);
@@ -1090,7 +1090,7 @@ describe("query result edits", () => {
         { schema: "", name: "customers", kind: "table" },
       ], "shop", engine);
       expect(shopVersusShop.ok).toBe(false);
-      if (!shopVersusShop.ok) expect(tr(shopVersusShop.reason)).toContain("限定名");
+      if (!shopVersusShop.ok) expect(refusalText(shopVersusShop.reason)).toContain("限定名");
       const upperVersusShop = resolveEditableTable(proof("SELECT id, name FROM SHOP.customers"), [
         { schema: "", name: "customers", kind: "table" },
       ], "shop", engine);
@@ -1106,12 +1106,12 @@ describe("query result edits", () => {
     }
     const threePart = readSingleTable("SELECT id, name FROM app.public.customers");
     expect(threePart.ok).toBe(false);
-    if (!threePart.ok) expect(tr(threePart.reason)).toContain("两部分");
+    if (!threePart.ok) expect(refusalText(threePart.reason)).toContain("两部分");
     const attached = resolveEditableTable(proof("SELECT id FROM archive.customers"), [
       { schema: "", name: "customers", kind: "table" },
     ], "main", "sqlite");
     expect(attached.ok).toBe(false);
-    if (!attached.ok) expect(tr(attached.reason)).toContain("限定名");
+    if (!attached.ok) expect(refusalText(attached.reason)).toContain("限定名");
     const mainTable = resolveEditableTable(proof("SELECT id FROM main.customers"), [
       { schema: "", name: "customers", kind: "table" },
     ], "main", "sqlite");
@@ -1142,13 +1142,26 @@ describe("query result edits", () => {
     const model = gridModel({ columns: ["id", "name"], rows: [["1", "甲"], ["1", "乙"]] });
     const missingKey = locateResultRows({ ...customersFixture(1).schema, key: [] }, model.columns, model.rows);
     expect(missingKey.ok).toBe(false);
-    if (!missingKey.ok) expect(tr(missingKey.reason)).toContain("没有主键");
+    if (!missingKey.ok) expect(refusalText(missingKey.reason)).toContain("没有主键");
     const view = locateResultRows(viewFixture().schema, model.columns, model.rows);
     expect(view.ok).toBe(false);
-    if (!view.ok) expect(tr(view.reason)).toContain("视图");
+    if (!view.ok) expect(refusalText(view.reason)).toContain("视图");
     const duplicated = locateResultRows(customersFixture(1).schema, model.columns, model.rows);
     expect(duplicated.ok).toBe(false);
-    if (!duplicated.ok) expect(tr(duplicated.reason)).toContain("无法唯一确定");
+    if (!duplicated.ok) expect(refusalText(duplicated.reason)).toContain("无法唯一确定");
+    // T6-A3：主键列缺失的拒绝原因带具体列名（{columns} 插值），zh/en 都列出列清单。
+    const partialKeyModel = gridModel({ columns: ["id"], rows: [["7"]] });
+    const keyNotInResult = locateResultRows({ ...customersFixture(1).schema, key: ["id", "name"] }, partialKeyModel.columns, partialKeyModel.rows);
+    expect(keyNotInResult.ok).toBe(false);
+    if (!keyNotInResult.ok) {
+      expect(refusalText(keyNotInResult.reason)).toContain("name");
+      setLocale("en");
+      try {
+        expect(refusalText(keyNotInResult.reason)).toContain("name");
+      } finally {
+        setLocale("zh-CN");
+      }
+    }
     const unique = gridModel({ columns: ["id", "status"], rows: [["7", "open"]] });
     const located = locateResultRows(customersFixture(1).schema, unique.columns, unique.rows);
     expect(located.ok).toBe(true);
@@ -1748,10 +1761,10 @@ describe("query result edits", () => {
   it("keeps identifiers around a comment in a qualifier and clears an unproved insert target", async () => {
     const block = readSingleTable("SELECT id, name FROM app.public/*c*/.customers");
     expect(block.ok).toBe(false);
-    if (!block.ok) expect(tr(block.reason)).toContain("两部分");
+    if (!block.ok) expect(refusalText(block.reason)).toContain("两部分");
     const line = readSingleTable("SELECT id, name FROM app.public--c\n.customers");
     expect(line.ok).toBe(false);
-    if (!line.ok) expect(tr(line.reason)).toContain("两部分");
+    if (!line.ok) expect(refusalText(line.reason)).toContain("两部分");
     expect(proof("SELECT id, name FROM public/*c*/.customers")).toEqual({
       schema: "public",
       table: "customers",
@@ -1810,7 +1823,7 @@ describe("query result edits", () => {
         { schema: "", name: "customers", kind: "table" },
       ], "shop", engine);
       expect(mismatched.ok).toBe(false);
-      if (!mismatched.ok) expect(tr(mismatched.reason)).toContain("限定名");
+      if (!mismatched.ok) expect(refusalText(mismatched.reason)).toContain("限定名");
       const exactShop = resolveEditableTable(proof("SELECT id, name FROM shop.customers"), [
         { schema: "", name: "customers", kind: "table" },
       ], "shop", engine);
@@ -1880,10 +1893,10 @@ describe("query result edits", () => {
   it("does not join identifiers that a comment alone separates, and clears the insert target", async () => {
     const line = readSingleTable("SELECT id, name FROM public.cu--\nstomers");
     expect(line.ok).toBe(false);
-    if (!line.ok) expect(tr(line.reason)).toContain("不能确定");
+    if (!line.ok) expect(refusalText(line.reason)).toContain("不能确定");
     const block = readSingleTable("SELECT id, name FROM cu/*x*/stomers");
     expect(block.ok).toBe(false);
-    if (!block.ok) expect(tr(block.reason)).toContain("不能确定");
+    if (!block.ok) expect(refusalText(block.reason)).toContain("不能确定");
     expect(proof("SELECT id, name FROM public.customers--\nWHERE id = 1")).toEqual({
       schema: "public",
       table: "customers",

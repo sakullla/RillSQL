@@ -90,3 +90,24 @@ pub const MIGRATE_TABLE_MISSING: &str = "migrate.table_missing";
 pub fn coded_string(code: &str, message: impl Into<String>) -> String {
     format!("[{code}] {}", message.into())
 }
+
+/// 带插值参数的附码前缀：`[code key="value"] 原文`（T6-A3）。
+/// 供前端在非 zh-CN locale 用字典条目插值（如 dump.session_gap 的 {current}/{database}）；
+/// 参数值统一双引号包裹，值内不允许出现双引号（库名/列名标识符本身不含双引号）。
+pub fn coded_string_params(code: &str, params: &[(&str, &str)], message: impl Into<String>) -> String {
+    debug_assert!(params.iter().all(|(key, _)| is_valid_param_key(key)), "参数名须为小写下划线标识符");
+    debug_assert!(params.iter().all(|(_, value)| !value.contains('"')), "参数值不允许包含双引号");
+    let joined = params
+        .iter()
+        .map(|(key, value)| format!("{key}=\"{value}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if joined.is_empty() {
+        return coded_string(code, message);
+    }
+    format!("[{code} {joined}] {}", message.into())
+}
+
+fn is_valid_param_key(key: &str) -> bool {
+    !key.is_empty() && key.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}

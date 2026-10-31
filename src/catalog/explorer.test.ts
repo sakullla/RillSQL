@@ -1,6 +1,7 @@
 import { flushPromises, mount, type DOMWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { nextTick } from "vue";
+import { setLocale } from "../i18n";
 import { setFocusDatabase, setListConnections, setOpenConnection } from "./backend";
 import type { SavedConnection } from "../connections/model";
 import ExplorerTree from "./ExplorerTree.vue";
@@ -154,6 +155,36 @@ describe("explorer tree", () => {
     expect(opened).toBe(false);
     expect(wrapper.find("input[aria-label='数据库密码']").exists()).toBe(true);
     wrapper.unmount();
+  });
+
+  it("asks for the database password by report code in English (no Chinese-substring contract)", async () => {
+    setLocale("en");
+    try {
+      replaceCatalog(catalogFixture().filter((item) => item.id === "analytics"));
+      setListConnections(async () => [savedConnection("analytics", true)]);
+      setOpenConnection(async () => ({
+        connected: false,
+        report: {
+          status: "err",
+          failStage: "登录数据库",
+          hint: "凭据库没有可用密码，本次也没有输入。没有把空密码写入配置。",
+          code: "conn.password_required",
+          stages: [
+            { kind: "network", label: "连接数据库服务器", status: "ok", message: "服务器可达" },
+            { kind: "database_authentication", label: "登录数据库", status: "err", message: "请填写数据库密码", code: "conn.password_required" },
+          ],
+        },
+      }));
+      const wrapper = mount(ExplorerTree, { props: { filter: "" } });
+      await wrapper.get("[data-connection=analytics] .tr-conn").trigger("click");
+      await flushPromises();
+      // T6-A3：触发依据是报告稳定码 conn.password_required；en 下失败文案与输入框标签都走字典。
+      expect(wrapper.find("input[aria-label='Database password']").exists()).toBe(true);
+      expect(wrapper.get("[data-connect-error]").text()).toContain("Enter the database password");
+      wrapper.unmount();
+    } finally {
+      setLocale("zh-CN");
+    }
   });
 
   it("connects the postgres session to another database instead of showing a failed list", async () => {
