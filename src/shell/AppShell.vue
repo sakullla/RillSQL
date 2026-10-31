@@ -5,7 +5,8 @@ import CompareDialog from "../compare/CompareDialog.vue";
 import { placeCompareScript, type ScriptTarget } from "../compare/place";
 import type { DiagramOpen } from "../diagram/types";
 import { objectIdentity, type CatalogObjectRef } from "../catalog/object-ref";
-import { isDefinitionKind, objectLabel } from "../catalog/tree";
+import { isDefinitionKind, objectLabel, objectPath } from "../catalog/tree";
+import type { CatalogConnection } from "../catalog/types";
 import { catalogConnections, catalogLoaded } from "../catalog/store";
 import { listPaletteConnections } from "../connections";
 import DragImportDialog from "../export/DragImportDialog.vue";
@@ -309,6 +310,21 @@ function onOpenDefinition(object: CatalogObjectRef) {
   });
 }
 
+function onOpenKeys(connection: CatalogConnection, key: string) {
+  if (window.innerWidth <= 960) session.sidebarHidden.value = true;
+  session.openKeys({
+    id: connection.id,
+    label: `${connection.name} 键空间`,
+    path: objectPath(connection.name, "", ""),
+    connectionId: connection.id,
+    connectionName: connection.name,
+    database: connection.defaultDatabase || "0",
+    engine: connection.engine,
+    status: "connected",
+    key: key || undefined,
+  });
+}
+
 function onOpenDiagram(target: DiagramOpen) {
   if (window.innerWidth <= 960) session.sidebarHidden.value = true;
   session.openDiagram({
@@ -546,6 +562,7 @@ onBeforeUnmount(() => {
         @open-object="onOpenObject"
         @open-definition="onOpenDefinition"
         @open-diagram="onOpenDiagram"
+        @open-keys="onOpenKeys"
         @query-object="onQueryObject"
         @focused-database="onFocusedDatabase"
         @new-connection="session.showPage('connections')"

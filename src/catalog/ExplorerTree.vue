@@ -5,18 +5,21 @@ import { fetchDefinition, focusDatabase, listConnections, openConnection } from 
 import { browseSql, qualifiedObjectName, type CatalogObjectRef } from "./object-ref";
 import type { DiagramOpen } from "../diagram/types";
 import { engineMeta } from "../engines";
+import RedisTreeKeys from "../redis/RedisTreeKeys.vue";
+import type { RedisApi } from "../redis/api";
 import SchemaBlock from "./SchemaBlock.vue";
 import { catalogConnections, catalogLoadError, refreshCatalog, schemaKey, setStructureFocus } from "./store";
 import { engineShape, isConnected, isDefinitionKind, KIND_LABEL, objectKey, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
 import type { CatalogConnection, DatabaseNode } from "./types";
 
-const props = defineProps<{ filter: string }>();
+const props = defineProps<{ filter: string; redisApi?: RedisApi }>();
 const emit = defineEmits<{
   "open-object": [object: CatalogObjectRef, pane: "data" | "structure", section?: "columns" | "drop"];
   "open-definition": [object: CatalogObjectRef];
   "query-object": [object: CatalogObjectRef, sql: string];
   "focused-database": [connectionId: string, database: string];
   "open-diagram": [target: DiagramOpen];
+  "open-keys": [connection: CatalogConnection, key: string];
   "new-connection": [];
 }>();
 const menu = ref<{ object: CatalogObjectRef; x: number; y: number; notice: string } | null>(null);
@@ -550,7 +553,9 @@ onBeforeUnmount(() => {
               </span>
             </div>
           </div>
-          <template v-if="!engineShape(connection.engine).databases">
+          <!-- Redis（kv 引擎）：连接节点下直接展开键空间分页列表；没有库/schema/关系图入口（ADR-2/ADR-4）。 -->
+          <RedisTreeKeys v-if="connection.engine === 'redis'" :connection="connection" :api="props.redisApi" @open-key="(target, key) => emit('open-keys', target, key)" />
+          <template v-else-if="!engineShape(connection.engine).databases">
             <div v-if="connection.foreignKeys !== null" class="tree-note subtle" :style="depthStyle(1)" data-foreign-keys>
               <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.info" /></svg>
               <span>SQLite 的外键约束：{{ connection.foreignKeys ? "已开启" : "已关闭" }}（foreign_keys = {{ connection.foreignKeys ? "ON" : "OFF" }}）</span>

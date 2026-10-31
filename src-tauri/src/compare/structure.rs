@@ -465,6 +465,8 @@ fn quote(engine: Engine, name: &str) -> String {
         }
         // T-SQL 的括号标识符转义是 ]]。
         Engine::Sqlserver => format!("[{}]", name.replace(']', "]]")),
+        // Redis 不进对比（capability 门控）；占位保持穷尽。
+        Engine::Redis => format!("\"{}\"", name.replace('"', "\"\"")),
     }
 }
 
@@ -473,6 +475,8 @@ fn qualify(engine: Engine, side: &Side, name: &str) -> String {
         Engine::Sqlite => quote(engine, name),
         Engine::Mysql | Engine::Mariadb => format!("{}.{}", quote(engine, &side.database), quote(engine, name)),
         Engine::Postgres | Engine::Sqlserver => format!("{}.{}", quote(engine, &side.schema), quote(engine, name)),
+        // Redis 不进对比（capability 门控）；占位保持穷尽。
+        Engine::Redis => quote(engine, name),
     }
 }
 
@@ -553,6 +557,8 @@ fn drop_index(engine: Engine, side: &Side, table: &str, index: &IndexShape) -> S
         Engine::Mysql | Engine::Mariadb | Engine::Sqlserver => format!("DROP INDEX {} ON {}", quote(engine, &index.name), qualify(engine, side, table)),
         Engine::Postgres => format!("DROP INDEX {}.{}", quote(engine, &side.schema), quote(engine, &index.name)),
         Engine::Sqlite => format!("DROP INDEX {}", quote(engine, &index.name)),
+        // Redis 不进对比（capability 门控）；占位保持穷尽。
+        Engine::Redis => format!("DROP INDEX {}", quote(engine, &index.name)),
     }
 }
 
@@ -1571,6 +1577,8 @@ fn replaces_in_place(engine: Engine, base: &ObjectDef, other: &ObjectDef) -> boo
             Engine::Postgres => !base.materialized && !other.materialized && view_columns_compatible(&base.definition, &other.definition),
             // T-SQL 没有 CREATE OR REPLACE VIEW，只能先摘依赖再删除重建。
             Engine::Sqlite | Engine::Sqlserver => false,
+            // Redis 不进对比（capability 门控）。
+            Engine::Redis => false,
         },
         // 返回类型变了时 CREATE OR REPLACE FUNCTION 会被拒绝，只能先摘依赖再删。
         Kind::Function | Kind::Procedure => matches!(engine, Engine::Postgres | Engine::Mariadb) && return_types_compatible(&base.definition, &other.definition),
@@ -2425,6 +2433,8 @@ fn drop_object(engine: Engine, side: &Side, object: &ObjectDef) -> String {
             Engine::Mysql | Engine::Mariadb => format!("DROP TRIGGER {}", qualify(engine, side, &object.name)),
             // T-SQL 的 DDL 触发器之外，DML 触发器名挂在表上。
             Engine::Sqlite | Engine::Sqlserver => format!("DROP TRIGGER {}", quote(engine, &object.name)),
+            // Redis 不进对比（capability 门控）；占位保持穷尽。
+            Engine::Redis => format!("DROP TRIGGER {}", quote(engine, &object.name)),
         },
     }
 }
@@ -2436,6 +2446,8 @@ fn drop_routine(engine: Engine, side: &Side, word: &str, object: &ObjectDef) -> 
         Engine::Sqlite => format!("DROP {word} {}", quote(engine, &object.name)),
         Engine::Mysql | Engine::Mariadb => format!("DROP {word} {}", qualify(engine, side, &object.name)),
         Engine::Sqlserver => format!("DROP {word} {}", qualify(engine, side, &object.name)),
+        // Redis 不进对比（capability 门控）；占位保持穷尽。
+        Engine::Redis => format!("DROP {word} {}", quote(engine, &object.name)),
     }
 }
 
@@ -2604,6 +2616,8 @@ fn alter_table(
         Engine::Postgres => postgres_alter(side, baseline_side, name, baseline, target, with_pk),
         Engine::Mysql | Engine::Mariadb => mysql_alter(engine, side, name, baseline, target, with_pk),
         Engine::Sqlserver => sqlserver_alter(side, name, baseline, target, with_pk),
+        // Redis 不进对比（capability 门控）；空差异保持穷尽。
+        Engine::Redis => Vec::new(),
     }
 }
 
@@ -2753,6 +2767,8 @@ fn push_primary_key(engine: Engine, table: &str, name: &str, baseline: &TableSha
             }
         }
         Engine::Sqlite => {}
+        // Redis 不进对比（capability 门控）。
+        Engine::Redis => {}
     }
 }
 

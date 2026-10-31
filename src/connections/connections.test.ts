@@ -349,7 +349,7 @@ describe("connections page", () => {
 
     const note = wrapper.get(".paste-note");
     expect(note.classes()).toContain("field-err");
-    expect(note.text()).toContain("只支持 postgres://、postgresql://、mysql://、mariadb:// 或 sqlserver:// 开头的连接串");
+    expect(note.text()).toContain("只支持 postgres://、postgresql://、mysql://、mariadb://、sqlserver://、redis:// 或 rediss:// 开头的连接串");
     wrapper.unmount();
   });
 
@@ -509,7 +509,7 @@ describe("connections page", () => {
     });
     await flushPromises();
     expect(wrapper.text()).toContain("连接你的第一个数据库");
-    expect(wrapper.text()).toContain("支持 PostgreSQL、MySQL、MariaDB、SQL Server 和 SQLite。");
+    expect(wrapper.text()).toContain("支持 PostgreSQL、MySQL、MariaDB、SQL Server、SQLite 和 Redis。");
     expect(wrapper.text()).not.toContain("没有匹配的连接");
     expect(wrapper.findAll("button").filter((button) => button.text().includes("新建连接"))).toHaveLength(1);
     wrapper.unmount();
@@ -1044,11 +1044,15 @@ describe("connection import", () => {
 });
 
 describe("engine metadata", () => {
-  it("exposes exactly five relational engines with SQL Server metadata", () => {
-    expect(ENGINES.map((item) => item.id)).toEqual(["postgres", "mysql", "mariadb", "sqlserver", "sqlite"]);
+  it("exposes six engines: five relational plus the redis kv engine", () => {
+    expect(ENGINES.map((item) => item.id)).toEqual(["postgres", "mysql", "mariadb", "sqlserver", "sqlite", "redis"]);
     const sqlserver = ENGINES.find((item) => item.id === "sqlserver");
     expect(sqlserver).toMatchObject({ label: "SQL Server", port: "1433", relational: true, document: false, kv: false });
-    expect(ENGINES.every((item) => item.relational)).toBe(true);
+    // Redis 是 kv 能力：SQL 执行器/结构编辑/对比/导出对它不可达（ADR-2）。
+    const redis = ENGINES.find((item) => item.id === "redis");
+    expect(redis).toMatchObject({ label: "Redis", port: "6379", relational: false, document: false, kv: true });
+    expect(ENGINES.filter((item) => item.relational).map((item) => item.id)).toEqual(["postgres", "mysql", "mariadb", "sqlserver", "sqlite"]);
+    // 连接表单默认值来自元数据表：默认端口与 TLS 默认档。
     // 连接表单默认值来自元数据表：默认端口与 TLS 默认档。
     const draft = blankDraft("sqlserver");
     expect(draft.port).toBe("1433");
@@ -1057,6 +1061,17 @@ describe("engine metadata", () => {
     // 默认端口已由元数据表填好：空表单只报主机与用户名。
     expect(validate({ ...draft })).toEqual({ host: "请填写主机", username: "请填写用户名" });
     expect(validate({ ...draft, host: "db.example.test", username: "sa", port: "notaport" }).port).toBe("端口应为 1–65535");
+  });
+
+  it("gives redis a local default env, db index 0, no ACL username requirement and plaintext TLS default", () => {
+    const draft = blankDraft("redis");
+    expect(draft.port).toBe("6379");
+    expect(draft.database).toBe("0");
+    expect(draft.env).toBe("local");
+    expect(draft.tlsMode).toBe("off");
+    // ACL 用户名可留空；库索引必须是数字。
+    expect(validate({ ...draft, host: "127.0.0.1" })).toEqual({});
+    expect(validate({ ...draft, host: "127.0.0.1", database: "main" }).database).toBe("Redis 库索引应为 0 起的非负整数");
   });
 });
 
@@ -1130,5 +1145,47 @@ describe("SQL Server import classification (T10 decision)", () => {
     expect(strict.ok && strict.tlsMode).toBe("verify");
     const off = parseConnectionUrl("sqlserver://sa@db.example.test/reports?encrypt=false");
     expect(off.ok && off.tlsMode).toBe("off");
+  });
+
+  it("parses redis:// and rediss:// connection strings with the db index", () => {
+    const plain = parseConnectionUrl("redis://cache.example.test:6380/2");
+    expect(plain).toEqual({ ok: true, engine: "redis", host: "cache.example.test", port: "6380", database: "2", username: "", password: "", tlsMode: null });
+    // 缺端口取默认 6379；rediss://（TLS）按“加密但不核对证书”档填入。
+    const noPort = parseConnectionUrl("redis://127.0.0.1");
+    expect(noPort.ok && noPort.port).toBe("6379");
+    expect(noPort.ok && noPort.database).toBe("");
+    const tls = parseConnectionUrl("rediss://:secret@cache.example.test/0");
+    expect(tls).toEqual({ ok: true, engine: "redis", host: "cache.example.test", port: "6379", database: "0", username: "", password: "secret", tlsMode: "require" });
+  });
+});
+
+describe("Redis import classification (T11 decision)", () => {
+  // 决策记录：Redis 的全称 label 与正典 id 都是 "redis"（大小写不敏感），因此——
+  // 可导入的 token：DBeaver 的 driver/provider 全称 "redis"（label 小写匹配）与 Navicat 的 ConnType "redis"（正典 id 匹配）。
+  // 不可导入的 token：valkey/keydb 等其它键值产品不在 ENGINES 里，按“不支持跳过”报告。
+  it("imports a Navicat row with ConnType redis", async () => {
+    const imported = await importConnectionText(
+      `<?xml version="1.0" encoding="UTF-8"?>
+<Connections Ver="1.5">
+  <Connection ConnectionName="缓存" ConnType="redis" Host="cache.example.test" Port="6379" Database="2" />
+</Connections>`,
+      recordingSave().save,
+    );
+    expect(imported.saved.map((item) => [item.name, item.engine])).toEqual([["缓存", "redis"]]);
+    expect(imported.saved[0]).toMatchObject({ host: "cache.example.test", port: 6379, database: "2" });
+    expect(imported.message).toContain("已导入 1 个连接");
+  });
+
+  it("skips valkey as unsupported instead of mapping it to redis", async () => {
+    const skipped = await importConnectionText(
+      `<?xml version="1.0" encoding="UTF-8"?>
+<Connections Ver="1.5">
+  <Connection ConnectionName="旧缓存" ConnType="valkey" Host="cache.example.test" Port="6379" />
+</Connections>`,
+      recordingSave().save,
+    );
+    expect(skipped.saved).toEqual([]);
+    expect(skipped.message).toContain("已跳过「旧缓存」");
+    expect(skipped.message).toContain("valkey");
   });
 });

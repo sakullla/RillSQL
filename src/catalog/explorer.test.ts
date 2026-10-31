@@ -4,6 +4,7 @@ import { nextTick } from "vue";
 import { setFocusDatabase, setListConnections, setOpenConnection } from "./backend";
 import type { SavedConnection } from "../connections/model";
 import ExplorerTree from "./ExplorerTree.vue";
+import type { RedisApi } from "../redis/api";
 import { catalogFixture, createRefreshFixture, pageArchive, pagedCatalog } from "./fixtures";
 import { refreshCatalog, replaceCatalog, resetCatalog, setObjectPage, setOutlineLoader, setPageSource, setRefreshSource, structureFocus } from "./store";
 import type { ObjectOutline, OutlineTarget } from "./store";
@@ -459,5 +460,64 @@ describe("explorer tree", () => {
     expect(gap.find('[data-action=open-diagram][data-database=bookstore][data-schema=public]').exists()).toBe(true);
     expect(gap.find('[data-action=open-diagram][data-database=other]').exists()).toBe(false);
     gap.unmount();
+  });
+});
+
+describe("explorer tree: redis key space (R11)", () => {
+  it("renders the scan key list under a redis connection without relational entries", async () => {
+    const scanCalls: Array<{ cursor: number; pattern: string | null }> = [];
+    const api: RedisApi = {
+      scanKeys: async (_id: string, cursor: number, pattern: string | null) => {
+        scanCalls.push({ cursor, pattern });
+        return {
+          cursor: cursor === 0 ? 55 : 0,
+          done: cursor !== 0,
+          keys: [
+            { name: "rillsql:string:welcome", keyType: "string", ttlMs: -1 },
+            { name: "rillsql:zset:rank", keyType: "zset", ttlMs: 1_800_000 },
+          ],
+        };
+      },
+      readKey: async () => ({ keyType: "string", ttlMs: -1, value: { kind: "none" } }),
+      setTtl: async () => ({ applied: 1 }),
+      deleteKeys: async () => ({ deleted: 0 }),
+      renameKey: async () => ({ renamed: true }),
+      exec: async () => ({ command: "", reply: { kind: "nil", text: null, int: null, items: null } }),
+    };
+    const connection: CatalogConnection = {
+      id: "cache",
+      name: "缓存",
+      engine: "redis",
+      env: "none",
+      envLabel: "无标签",
+      envTone: "none",
+      status: "connected",
+      defaultDatabase: "0",
+      foreignKeys: null,
+      error: null,
+      databases: [],
+    };
+    replaceCatalog([connection]);
+    const wrapper = mount(ExplorerTree, { props: { filter: "", redisApi: api } });
+    await flushPromises();
+    const section = wrapper.find('section[data-connection="cache"]');
+    expect(section.exists()).toBe(true);
+    expect(section.find("[data-redis-tree]").exists()).toBe(true);
+    const keyRows = section.findAll('[data-level="key"]');
+    expect(keyRows).toHaveLength(2);
+    expect(keyRows[0]!.attributes("data-key")).toBe("rillsql:string:welcome");
+    expect(keyRows[1]!.attributes("data-type")).toBe("zset");
+    // 没有 SQL 面入口：库/schema/关系图按钮都不出现。
+    expect(section.find('[data-level="database"]').exists()).toBe(false);
+    expect(section.find('[data-action="open-diagram"]').exists()).toBe(false);
+    expect(section.text()).not.toContain("关系图");
+    // 双击键 → open-keys 事件携带键名；「再显示」用返回的游标继续 SCAN。
+    await keyRows[1]!.trigger("dblclick");
+    const emitted = wrapper.emitted("open-keys");
+    expect(emitted?.[0]?.[1]).toBe("rillsql:zset:rank");
+    await section.find('[data-action="tree-more"]').trigger("click");
+    await flushPromises();
+    expect(scanCalls.map((call) => call.cursor)).toEqual([0, 55]);
+    wrapper.unmount();
   });
 });

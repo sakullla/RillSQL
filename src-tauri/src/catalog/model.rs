@@ -58,6 +58,8 @@ pub fn parse_kind(kind: &str) -> ObjectKind {
 /// 只列出引擎真正拥有的独立对象。列和索引不是这里的种类。
 pub fn listed_kinds(engine: Engine) -> &'static [ObjectKind] {
     match engine {
+        // Redis 是键值专项引擎：没有关系型对象种类，键空间走 SCAN 专项通路。
+        Engine::Redis => &[],
         Engine::Sqlite => &[ObjectKind::Table, ObjectKind::View, ObjectKind::Trigger],
         Engine::Mysql => &[
             ObjectKind::Table,
@@ -242,6 +244,13 @@ pub struct MetadataSql {
 
 pub fn metadata_sql(engine: Engine) -> MetadataSql {
     match engine {
+        // Redis 没有元数据 SQL；这行只保证穷尽，键空间浏览不经这里。
+        Engine::Redis => MetadataSql {
+            databases: "",
+            schemas: None,
+            objects: "",
+            foreign_keys: None,
+        },
         Engine::Postgres => MetadataSql {
             databases: "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname",
             schemas: Some(
@@ -275,6 +284,8 @@ pub fn metadata_sql(engine: Engine) -> MetadataSql {
 
 pub fn object_count_sql(engine: Engine) -> &'static str {
     match engine {
+        // Redis 没有对象计数 SQL；键计数经 DBSIZE/SCAN 专项通路。
+        Engine::Redis => "",
         Engine::Postgres => "SELECT COUNT(*)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm')",
         Engine::Mysql | Engine::Mariadb => "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_type IN ('BASE TABLE', 'VIEW')",
         Engine::Sqlite => "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table', 'view', 'trigger') AND name NOT LIKE 'sqlite_%'",
@@ -290,6 +301,8 @@ pub struct KindSql {
 /// 每一类单独计数、单独取窗口，这样某一类失败不会清掉其他类。
 pub fn kind_sql(engine: Engine, kind: ObjectKind) -> KindSql {
     match engine {
+        // Redis 没有分类对象 SQL；键空间浏览不经这里。
+        Engine::Redis => KindSql { count: "", list: "" },
         Engine::Postgres => match kind {
             ObjectKind::Table => KindSql {
                 count: "SELECT COUNT(*)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relkind IN ('r', 'p')",

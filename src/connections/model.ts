@@ -100,13 +100,15 @@ export function blankDraft(engine: Engine): ConnectionDraft {
   return {
     name: "",
     engine,
-    env: engine === "sqlite" ? "local" : "dev",
+    env: engine === "sqlite" || engine === "redis" ? "local" : "dev",
     host: "",
     port: meta.port,
-    database: "",
+    // Redis 的“数据库”字段是库索引（SELECT），默认 0 号库。
+    database: engine === "redis" ? "0" : "",
     username: "",
     filePath: "",
-    tlsMode: engine === "sqlite" ? "off" : "verify",
+    // Redis 自部署多为明文端口（TLS 由 rediss 提供）；默认不加密，避免夹具/本机直连被默认 Verify 挡住。
+    tlsMode: engine === "sqlite" || engine === "redis" ? "off" : "verify",
     caMode: "system",
     caFile: "",
     clientCert: "",
@@ -119,6 +121,14 @@ export function blankDraft(engine: Engine): ConnectionDraft {
     sshKey: "",
     savePassword: engine !== "sqlite",
   };
+}
+
+/** Redis 的“数据库”字段语义是库索引：空串或非负整数（服务器端通常 0–15）。 */
+export function validateRedisDbIndex(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (!/^\d+$/.test(trimmed)) return "Redis 库索引应为 0 起的非负整数";
+  return null;
 }
 
 export function draftFromSaved(saved: SavedConnection): ConnectionDraft {
@@ -156,7 +166,12 @@ export function validate(draft: ConnectionDraft): Record<string, string> {
   if (!draft.host.trim()) errors.host = "请填写主机";
   const port = Number(draft.port);
   if (!/^\d+$/.test(draft.port.trim()) || port < 1 || port > 65535) errors.port = "端口应为 1–65535";
-  if (!draft.username.trim()) errors.username = "请填写用户名";
+  // Redis 的用户名是 ACL 用户名：密码认证时可留空。
+  if (!draft.username.trim() && draft.engine !== "redis") errors.username = "请填写用户名";
+  if (draft.engine === "redis") {
+    const dbError = validateRedisDbIndex(draft.database);
+    if (dbError) errors.database = dbError;
+  }
   if (draft.sshOn && !draft.sshHost.trim()) errors.sshHost = "请填写跳板机主机";
   if (draft.sshOn && !draft.sshUser.trim()) errors.sshUser = "请填写 SSH 用户";
   const sshPort = Number(draft.sshPort);

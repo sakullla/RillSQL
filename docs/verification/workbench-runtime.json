@@ -11,10 +11,15 @@
     "95 history entries paginate and filter globally; cancelling clear does not erase data",
     "Connection engine and environment filters compose correctly",
     "SQLite file picker opens exactly once on request and does not reopen when returning to connections",
+    "SQL Server: top-level BEGIN...END block is sent as one statement in current-statement mode",
+    "SQL Server: plan wraps the statement in a SET SHOWPLAN_ALL batch and renders the rowset as a tree",
+    "SQL Server: grid edit preview emits T-SQL with bracket identifiers and N'' literals",
+    "Redis: SCAN pagination with cursor, typed value viewers, KEYS refused, FLUSHDB confirm-cancel leaves keys intact",
+    "Capability gating: the SQL executor target list has no redis connection",
     "No browser page errors"
   ],
   "metrics": {
-    "largeResultReadyMs": 2719,
+    "largeResultReadyMs": 2353,
     "renderedRows": 22,
     "standardDataRowPx": 30
   },

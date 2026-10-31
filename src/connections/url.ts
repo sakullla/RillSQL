@@ -4,16 +4,26 @@ export type ParsedConnectionUrl =
   | { ok: true; engine: Engine; host: string; port: string; database: string; username: string; password: string; tlsMode: TlsMode | null }
   | { ok: false; reason: string };
 
-const SCHEME_PREFIX = /^(postgresql|postgres|mysql|mariadb|sqlserver|mssql):\/\//i;
+const SCHEME_PREFIX = /^(postgresql|postgres|mysql|mariadb|sqlserver|mssql|redis|rediss):\/\//i;
 
 /** 解析 postgres://user:pass@host:5432/db?sslmode=… 形式的连接串，供编辑对话框一键填充。
- * SQL Server 的 jdbc:sqlserver:// 与 mssql:// 短串都归一到 sqlserver 引擎（微软自家也用 mssql 短名）。 */
+ * SQL Server 的 jdbc:sqlserver:// 与 mssql:// 短串都归一到 sqlserver 引擎（微软自家也用 mssql 短名）。
+ * Redis 的 redis://（明文）与 rediss://（TLS）也归一：database 段是库索引。 */
 export function parseConnectionUrl(text: string): ParsedConnectionUrl {
   const trimmed = text.trim();
   const matched = SCHEME_PREFIX.exec(trimmed);
-  if (!matched) return { ok: false, reason: "只支持 postgres://、postgresql://、mysql://、mariadb:// 或 sqlserver:// 开头的连接串。" };
+  if (!matched) return { ok: false, reason: "只支持 postgres://、postgresql://、mysql://、mariadb://、sqlserver://、redis:// 或 rediss:// 开头的连接串。" };
   const scheme = matched[1].toLowerCase();
-  const engine: Engine = scheme === "mysql" ? "mysql" : scheme === "mariadb" ? "mariadb" : scheme === "sqlserver" || scheme === "mssql" ? "sqlserver" : "postgres";
+  const engine: Engine =
+    scheme === "mysql"
+      ? "mysql"
+      : scheme === "mariadb"
+        ? "mariadb"
+        : scheme === "sqlserver" || scheme === "mssql"
+          ? "sqlserver"
+          : scheme === "redis" || scheme === "rediss"
+            ? "redis"
+            : "postgres";
   let url: URL;
   try {
     url = new URL(trimmed);
@@ -31,7 +41,8 @@ export function parseConnectionUrl(text: string): ParsedConnectionUrl {
     database: url.pathname.replace(/^\//, ""),
     username: decodeLoose(url.username),
     password: decodeLoose(url.password),
-    tlsMode: tlsModeFrom(url),
+    // rediss:// 表示 TLS：没有额外 CA 材料时按“加密但不核对证书”档填入（与后端 Require 档对应）。
+    tlsMode: scheme === "rediss" ? "require" : tlsModeFrom(url),
   };
 }
 

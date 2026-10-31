@@ -12,6 +12,8 @@ pub fn quote_ident(engine: Engine, name: &str) -> String {
         }
         // T-SQL 的括号标识符转义是 ]]。
         Engine::Sqlserver => format!("[{}]", name.replace(']', "]]")),
+        // Redis 没有 SQL 表网格；TableSchema 不会带这个引擎（live::describe 已拒绝）。
+        Engine::Redis => format!("\"{}\"", name.replace('"', "\"\"")),
     }
 }
 
@@ -381,6 +383,8 @@ fn plain_cast(engine: Engine, ident: &str) -> String {
         Engine::Sqlite => format!("CAST({ident} AS TEXT)"),
         // NVARCHAR(MAX) 承接任意长度的文本形态，日期/数字等隐式转换后参与 LIKE 匹配。
         Engine::Sqlserver => format!("CAST({ident} AS NVARCHAR(MAX))"),
+        // Redis 不会进入 SQL 编译（live::describe 已拒绝），占位保持穷尽。
+        Engine::Redis => ident.to_owned(),
     }
 }
 
@@ -391,6 +395,8 @@ fn text_preview(engine: Engine, plain: &str) -> String {
         Engine::Sqlite => format!("CASE WHEN length(CAST({plain} AS BLOB)) > 1024 THEN char(1) || 't:' || length(CAST({plain} AS BLOB)) || ':' || substr({plain}, 1, 1024) ELSE {plain} END"),
         // LEN 按字符计；预览协议的字节数对文本形态按字符数呈现，超长截断仍以 1024 字符为界。
         Engine::Sqlserver => format!("CASE WHEN LEN({plain}) > 1024 THEN CHAR(1) + N't:' + CAST(LEN({plain}) AS NVARCHAR(20)) + N':' + LEFT({plain}, 1024) ELSE {plain} END"),
+        // Redis 不会进入 SQL 编译（live::describe 已拒绝），占位保持穷尽。
+        Engine::Redis => plain.to_owned(),
     }
 }
 
@@ -400,6 +406,8 @@ fn binary_length(engine: Engine, ident: &str) -> String {
         Engine::Mysql | Engine::Mariadb => format!("CASE WHEN {ident} IS NULL THEN NULL ELSE CONCAT(CHAR(1), 'b:', LENGTH({ident})) END"),
         Engine::Sqlite => format!("CASE WHEN {ident} IS NULL THEN NULL ELSE char(1) || 'b:' || length({ident}) END"),
         Engine::Sqlserver => format!("CASE WHEN {ident} IS NULL THEN NULL ELSE CHAR(1) + N'b:' + CAST(DATALENGTH({ident}) AS NVARCHAR(20)) END"),
+        // Redis 不会进入 SQL 编译（live::describe 已拒绝），占位保持穷尽。
+        Engine::Redis => format!("CASE WHEN {ident} IS NULL THEN NULL ELSE {ident} END"),
     }
 }
 
@@ -410,6 +418,8 @@ fn binary_hex(engine: Engine, ident: &str) -> String {
         Engine::Sqlite => format!("lower(hex({ident}))"),
         // CONVERT 样式 2 输出不带 0x 前缀的小写十六进制。
         Engine::Sqlserver => format!("LOWER(CONVERT(VARCHAR(MAX), {ident}, 2))"),
+        // Redis 不会进入 SQL 编译（live::describe 已拒绝），占位保持穷尽。
+        Engine::Redis => ident.to_owned(),
     };
     format!("CASE WHEN {ident} IS NULL THEN NULL ELSE {hex} END")
 }
@@ -535,6 +545,8 @@ fn binary_literal(engine: Engine, hex: &str) -> String {
         Engine::Mysql | Engine::Mariadb | Engine::Sqlite => format!("X'{hex}'"),
         // T-SQL 的二进制字面量是 0x 前缀（空二进制是 0x）。
         Engine::Sqlserver => format!("0x{hex}"),
+        // Redis 不会进入 SQL 编译（live::describe 已拒绝），占位保持穷尽。
+        Engine::Redis => format!("X'{hex}'"),
     }
 }
 

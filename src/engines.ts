@@ -1,5 +1,5 @@
 /** 全仓唯一的引擎元数据源：Engine 联合与 ENGINES 表都在这里，其他模块只 re-export。 */
-export type Engine = "mysql" | "mariadb" | "postgres" | "sqlite" | "sqlserver";
+export type Engine = "mysql" | "mariadb" | "postgres" | "sqlite" | "sqlserver" | "redis";
 
 export interface EngineMeta {
   id: Engine;
@@ -20,6 +20,7 @@ export const ENGINES: EngineMeta[] = [
   { id: "mariadb", label: "MariaDB", short: "MA", port: "3306", relational: true, document: false, kv: false },
   { id: "sqlserver", label: "SQL Server", short: "MS", port: "1433", relational: true, document: false, kv: false },
   { id: "sqlite", label: "SQLite", short: "SQL", port: "", relational: true, document: false, kv: false },
+  { id: "redis", label: "Redis", short: "RD", port: "6379", relational: false, document: false, kv: true },
 ];
 
 export function engineMeta(engine: Engine): EngineMeta {

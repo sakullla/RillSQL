@@ -107,7 +107,8 @@ pub async fn deliver_cancel(transport: &CancelTransport) -> Result<bool, String>
             kill_sqlserver(spid, config, *via_ssh).await?;
             Ok(true)
         }
-        CancelTransport::None => Err("这条连接没有可用来取消的数据库通道。查询仍在执行。".to_owned()),
+        // Redis 命令没有服务端取消通道（探活/断线走健康句柄），语义与无通道一致。
+        CancelTransport::Redis { .. } | CancelTransport::None => Err("这条连接没有可用来取消的数据库通道。查询仍在执行。".to_owned()),
     }
 }
 

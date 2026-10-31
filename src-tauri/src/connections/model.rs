@@ -13,6 +13,7 @@ pub enum Engine {
     Postgres,
     Sqlite,
     Sqlserver,
+    Redis,
 }
 
 impl Engine {
@@ -23,6 +24,7 @@ impl Engine {
             Engine::Postgres => "postgres",
             Engine::Sqlite => "sqlite",
             Engine::Sqlserver => "sqlserver",
+            Engine::Redis => "redis",
         }
     }
 
@@ -33,6 +35,7 @@ impl Engine {
             "postgres" => Ok(Engine::Postgres),
             "sqlite" => Ok(Engine::Sqlite),
             "sqlserver" => Ok(Engine::Sqlserver),
+            "redis" => Ok(Engine::Redis),
             other => Err(format!("不支持的数据库 {other}")),
         }
     }
@@ -43,6 +46,7 @@ impl Engine {
             Engine::Mysql | Engine::Mariadb => Some(3306),
             Engine::Postgres => Some(5432),
             Engine::Sqlserver => Some(1433),
+            Engine::Redis => Some(6379),
             Engine::Sqlite => None,
         }
     }
@@ -52,6 +56,11 @@ impl Engine {
         !matches!(self, Engine::Sqlite)
     }
 
+    /// Redis 是键值专项引擎：没有 SQL 执行、表网格、结构编辑、对比或导出等关系面。
+    pub fn is_relational(self) -> bool {
+        !matches!(self, Engine::Redis)
+    }
+
     pub fn label_zh(self) -> &'static str {
         match self {
             Engine::Mysql => "MySQL",
@@ -59,6 +68,7 @@ impl Engine {
             Engine::Postgres => "PostgreSQL",
             Engine::Sqlite => "SQLite",
             Engine::Sqlserver => "SQL Server",
+            Engine::Redis => "Redis",
         }
     }
 }
@@ -408,11 +418,20 @@ fn normalize_remote(draft: &ConnectionDraft, id: String) -> Result<SavedConnecti
         }
     };
     let username = draft.username.trim();
-    if username.is_empty() {
+    if username.is_empty() && draft.engine != Engine::Redis {
         errors.push(FieldError {
             field: "username".to_owned(),
             message: "请填写用户名".to_owned(),
         });
+    }
+    if draft.engine == Engine::Redis && !draft.database.trim().is_empty() {
+        // Redis 的“数据库”字段是库索引（SELECT），只接受非负整数。
+        if !draft.database.trim().chars().all(|ch| ch.is_ascii_digit()) {
+            errors.push(FieldError {
+                field: "database".to_owned(),
+                message: "Redis 库索引应为 0 起的非负整数".to_owned(),
+            });
+        }
     }
     let mut ssh = None;
     if draft.ssh_on {
@@ -478,7 +497,8 @@ fn normalize_remote(draft: &ConnectionDraft, id: String) -> Result<SavedConnecti
         host: Some(host),
         port,
         database: nonempty(&draft.database),
-        username: Some(username.to_owned()),
+        // Redis 允许无 ACL 用户名（密码认证）；关系引擎已在上面的校验里要求非空。
+        username: if username.is_empty() { None } else { Some(username.to_owned()) },
         file_path: None,
         tls,
         ssh,

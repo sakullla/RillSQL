@@ -58,7 +58,7 @@ describe("session persistence", () => {
     expect(revived.targetText).toBe("书店 / shop");
   });
 
-  it("snapshots all five tab kinds and keeps a non-query active tab", () => {
+  it("snapshots all six tab kinds including the redis keys tab", () => {
     const session = createSession();
     session.openQuery();
     session.openTable({ id: "shop:shop:public:customers", label: "customers", path: "书店 / shop / public", pane: "structure" });
@@ -89,12 +89,64 @@ describe("session persistence", () => {
       status: "connected",
       schema: "public",
     });
+    session.openKeys({
+      id: "cache",
+      label: "缓存 键空间",
+      path: "缓存 / db 0",
+      connectionId: "cache",
+      connectionName: "缓存",
+      database: "0",
+      engine: "redis",
+      status: "connected",
+      key: "rillsql:string:welcome",
+    });
     const tableId = session.tabs.value.find((tab) => tab.kind === "table")!.id;
     session.activeId.value = tableId;
 
     const snapshot = snapshotSession(session.tabs.value, session.activeId.value);
-    expect(snapshot.tabs.map((tab) => tab.kind)).toEqual(["query", "table", "structure", "definition", "diagram"]);
+    expect(snapshot.tabs.map((tab) => tab.kind)).toEqual(["query", "table", "structure", "definition", "diagram", "keys"]);
     expect(snapshot.activeId).toBe(tableId);
+    // keys 标签的目标连接与选中键进快照（T3 快照已支持全 TabKind）。
+    const keysTab = snapshot.tabs.find((tab) => tab.kind === "keys")!;
+    expect(keysTab.connectionId).toBe("cache");
+    expect(keysTab.redisKey).toBe("rillsql:string:welcome");
+  });
+
+  it("round-trips a redis keys tab with its selected key", () => {
+    const session = createSession();
+    session.openKeys({
+      id: "cache",
+      label: "缓存 键空间",
+      connectionId: "cache",
+      connectionName: "缓存",
+      database: "2",
+      engine: "redis",
+      status: "connected",
+      key: "rillsql:zset:rank",
+    });
+    const restored = restoreSession(JSON.stringify(snapshotSession(session.tabs.value, session.tabs.value[0]!.id)));
+    expect(restored?.tabs).toHaveLength(1);
+    const revived = restored!.tabs[0]!;
+    expect(revived.kind).toBe("keys");
+    expect(revived.redisKey).toBe("rillsql:zset:rank");
+    const session2 = createSession("", restored);
+    const tab = session2.tabs.value[0]!;
+    expect(tab.kind).toBe("keys");
+    expect(tab.redis).toEqual({ key: "rillsql:zset:rank" });
+    expect(tab.connectionId).toBe("cache");
+    // 再次打开同一连接的键标签复用现有标签并切换选中键。
+    session2.openKeys({
+      id: "cache",
+      label: "缓存 键空间",
+      connectionId: "cache",
+      connectionName: "缓存",
+      database: "2",
+      engine: "redis",
+      status: "connected",
+      key: "rillsql:hash:order:1001",
+    });
+    expect(session2.tabs.value).toHaveLength(1);
+    expect(session2.tabs.value[0]!.redis).toEqual({ key: "rillsql:hash:order:1001" });
   });
 
   it("round-trips a table tab with pane, section, path and dangling notice", () => {

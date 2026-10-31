@@ -88,6 +88,28 @@ services:
       "
     restart: "no"
 
+  # Redis 7 夹具（R11）：--requirepass 密码认证；seed 由 redis-init 容器 healthy 后执行。
+  redis:
+    image: redis:7
+    command: ["redis-server", "--requirepass", "rillsql-redis"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a rillsql-redis ping | grep -q PONG"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  redis-init:
+    image: redis:7
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./init/redis-seed.sh:/seed/redis-seed.sh:ro
+    command: ["sh", "/seed/redis-seed.sh"]
+    restart: "no"
+
 volumes:
   pg:
   mysql:

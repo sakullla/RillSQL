@@ -341,6 +341,8 @@ export function targetKey(connectionId: string, database: string): string {
 export function targetOptions(connections: CatalogConnection[]): TargetOption[] {
   const options: TargetOption[] = [];
   for (const connection of connections) {
+    // 能力门控（ADR-2）：kv/document 引擎没有 SQL 执行器，不出现在查询目标里。
+    if (!engineMeta(connection.engine).relational) continue;
     const databases = connection.databases.length
       ? connection.databases
       : [{ name: connection.defaultDatabase || (connection.engine === "sqlite" ? "main" : ""), schemas: [], error: connection.error }];

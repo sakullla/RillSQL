@@ -64,6 +64,22 @@ export function installSyntheticIpc(initialTheme) {
       sshHostKey: null,
     },
     {
+      id: "redis-cache",
+      name: "缓存 · Redis",
+      engine: "redis",
+      env: "local",
+      host: "127.0.0.1",
+      port: 6379,
+      database: "0",
+      username: null,
+      filePath: null,
+      tls: { mode: "off", serverName: "127.0.0.1", caMode: "system", caFile: null, clientCert: null, clientKey: null },
+      ssh: null,
+      passwordSaved: true,
+      sshPasswordSaved: false,
+      sshHostKey: null,
+    },
+    {
       id: "sqlite-notes",
       name: "笔记",
       engine: "sqlite",
@@ -132,6 +148,20 @@ export function installSyntheticIpc(initialTheme) {
           ],
         },
       ],
+    },
+    {
+      id: "redis-cache",
+      name: "缓存 · Redis",
+      engine: "redis",
+      env: "local",
+      envLabel: "本地",
+      envTone: "local",
+      status: "connected",
+      defaultDatabase: "0",
+      foreignKeys: null,
+      error: null,
+      // Redis 会话没有库/schema 层级：键空间经 redis_scan_keys 分页读取。
+      databases: [],
     },
     {
       id: "mysql-stock",
@@ -262,6 +292,21 @@ export function installSyntheticIpc(initialTheme) {
     },
   ];
   function testReport(connection) {
+    if (connection.engine === "redis") {
+      return {
+        status: "ok",
+        failStage: null,
+        hint: null,
+        summary: "Redis 7.4.1",
+        fingerprint: null,
+        algorithm: null,
+        stages: [
+          { kind: "network", label: "连接数据库服务器", status: "ok", message: "127.0.0.1:6379" },
+          { kind: "database_authentication", label: "登录数据库", status: "ok", message: "密码认证" },
+          { kind: "server_version", label: "读取数据库版本", status: "ok", message: "Redis 7.4.1" },
+        ],
+      };
+    }
     if (connection.engine === "sqlite") {
       return {
         status: "ok",
@@ -453,6 +498,73 @@ export function installSyntheticIpc(initialTheme) {
         if (command === "ddl_describe") return { ...structure, name: args.request?.table || structure.name };
         if (command === "ddl_preview") return { blocked: [], risks: [], steps: [{ sql: "select 1;", label: "预览" }], rule: "逐条执行", rebuild: false, target: "orders" };
         if (command === "ddl_execute") return { blocked: [], rule: "逐条执行", target: "orders", rebuild: false, steps: [] };
+        // ---- Redis 合成用例（T11）：SCAN 分页/类型化值/危险确认语义，不依赖 docker ----
+        if (command === "redis_scan_keys") {
+          const cursor = args.cursor ?? 0;
+          if (cursor === 0) {
+            return {
+              cursor: 37,
+              done: false,
+              keys: [
+                { name: "rillsql:hash:order:1001", keyType: "hash", ttlMs: -1 },
+                { name: "rillsql:string:welcome", keyType: "string", ttlMs: -1 },
+                { name: "rillsql:string:temp-token", keyType: "string", ttlMs: 3_600_000 },
+              ],
+            };
+          }
+          return {
+            cursor: 0,
+            done: true,
+            keys: [
+              { name: "rillsql:zset:rank", keyType: "zset", ttlMs: 1_800_000 },
+              { name: "rillsql:stream:events", keyType: "stream", ttlMs: -1 },
+            ],
+          };
+        }
+        if (command === "redis_read_key") {
+          const key = args.key ?? "";
+          if (key === "rillsql:string:welcome") return { keyType: "string", ttlMs: -1, value: { kind: "string", text: "澄库 Redis 夹具 · 中文值" } };
+          if (key === "rillsql:hash:order:1001") {
+            return {
+              keyType: "hash",
+              ttlMs: -1,
+              value: { kind: "hash", entries: [{ field: "status", value: "paid" }, { field: "customer", value: "林夏" }, { field: "total", value: "128.5" }] },
+            };
+          }
+          if (key === "rillsql:zset:rank") {
+            return {
+              keyType: "zset",
+              ttlMs: 1_800_000,
+              value: { kind: "zset", entries: [{ member: "张伟", score: "90" }, { member: "林夏", score: "85" }] },
+            };
+          }
+          if (key === "rillsql:stream:events") {
+            return {
+              keyType: "stream",
+              ttlMs: -1,
+              value: { kind: "stream", messages: [{ id: "1698751000000-0", fields: [{ field: "event", value: "order.created" }, { field: "operator", value: "管理员" }] }] },
+            };
+          }
+          return { keyType: "string", ttlMs: -1, value: { kind: "string", text: "" } };
+        }
+        if (command === "redis_set_ttl") return { applied: 1 };
+        if (command === "redis_delete_keys") {
+          if (!args.confirmed) throw "删除 1 个键属于写删操作，需要先在界面确认。";
+          return { deleted: 1 };
+        }
+        if (command === "redis_rename_key") {
+          if (!args.confirmed) throw "重命名键属于写删操作，需要先在界面确认。";
+          return { renamed: true };
+        }
+        if (command === "redis_exec") {
+          const word = (args.command ?? "").trim().toUpperCase();
+          if (word === "KEYS") throw "已禁用 KEYS：全量扫描会阻塞 Redis，键空间浏览一律走 SCAN 分页。";
+          const dangerous = ["DEL", "UNLINK", "FLUSHDB", "FLUSHALL", "RENAME", "EXPIRE", "PERSIST", "SET", "HSET", "LPOP", "RPOP", "SPOP", "ZREM"];
+          if (dangerous.includes(word) && !args.confirmed) throw `${word} 属于写删类命令，需要先在界面确认。`;
+          if (word === "GET") return { command: args.command, reply: { kind: "bulk", text: "澄库 Redis 夹具 · 中文值", int: null, items: null } };
+          if (word === "DBSIZE") return { command: args.command, reply: { kind: "int", text: null, int: 5, items: null } };
+          return { command: args.command, reply: { kind: "status", text: "OK", int: null, items: null } };
+        }
         if (command === "query_start" || command === "query_poll" || command === "query_cancel") return queryResult(args);
         if (command === "query_history") return history;
         if (command === "query_history_clear") return null;

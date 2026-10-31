@@ -471,6 +471,42 @@
           "markdownDescription": "允许读取拖放到窗口的 CSV/JSON 文件的前段文本用于预览；只读且最多 2 MB，不写入任何数据。"
         },
         {
+          "description": "允许删除 Redis 键；写删操作需前端二次确认（confirmed 标记）后才执行。",
+          "type": "string",
+          "const": "allow-redis-delete-keys",
+          "markdownDescription": "允许删除 Redis 键；写删操作需前端二次确认（confirmed 标记）后才执行。"
+        },
+        {
+          "description": "允许在 Redis 会话上执行命令并结构化返回结果；KEYS 全量扫描无条件禁用，写删类命令需前端确认。",
+          "type": "string",
+          "const": "allow-redis-exec",
+          "markdownDescription": "允许在 Redis 会话上执行命令并结构化返回结果；KEYS 全量扫描无条件禁用，写删类命令需前端确认。"
+        },
+        {
+          "description": "允许读取 Redis 键的类型、TTL 与按类型的值。",
+          "type": "string",
+          "const": "allow-redis-read-key",
+          "markdownDescription": "允许读取 Redis 键的类型、TTL 与按类型的值。"
+        },
+        {
+          "description": "允许重命名 Redis 键；写删操作需前端二次确认（confirmed 标记）后才执行。",
+          "type": "string",
+          "const": "allow-redis-rename-key",
+          "markdownDescription": "允许重命名 Redis 键；写删操作需前端二次确认（confirmed 标记）后才执行。"
+        },
+        {
+          "description": "允许在已打开的 Redis 会话上按 SCAN 游标分页浏览键空间（MATCH 模式过滤），不使用 KEYS。",
+          "type": "string",
+          "const": "allow-redis-scan-keys",
+          "markdownDescription": "允许在已打开的 Redis 会话上按 SCAN 游标分页浏览键空间（MATCH 模式过滤），不使用 KEYS。"
+        },
+        {
+          "description": "允许修改 Redis 键的 TTL（EXPIRE）或移除过期（PERSIST）。",
+          "type": "string",
+          "const": "allow-redis-set-ttl",
+          "markdownDescription": "允许修改 Redis 键的 TTL（EXPIRE）或移除过期（PERSIST）。"
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

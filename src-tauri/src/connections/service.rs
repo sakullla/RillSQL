@@ -131,6 +131,15 @@ impl HealthProbe for SelectOneProbe {
                 }
                 Ok(())
             }
+            CatalogSession::Redis(conn) => {
+                let mut conn = conn.lock().await;
+                let pong: String = redis::cmd("PING").query_async(&mut *conn).await.map_err(|err| err.to_string())?;
+                if pong.eq_ignore_ascii_case("pong") {
+                    Ok(())
+                } else {
+                    Err(format!("PING 返回了 {pong}"))
+                }
+            }
         }
     }
 }
@@ -148,6 +157,7 @@ enum SessionKind {
     Mysql(mysql_async::Pool),
     Postgres(Arc<tokio_postgres::Client>),
     Sqlserver(Arc<tokio::sync::Mutex<TdsClient>>),
+    Redis(Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>),
     Scripted,
 }
 
@@ -282,6 +292,10 @@ pub enum CancelTransport {
         via_ssh: bool,
         health: Arc<SessionHealth>,
     },
+    /// Redis 命令没有服务端取消通道；这里只承载共享健康句柄（活动/断线报告）。
+    Redis {
+        health: Arc<SessionHealth>,
+    },
     None,
 }
 
@@ -308,7 +322,9 @@ impl CancelTransport {
 
     pub fn health(&self) -> Option<&Arc<SessionHealth>> {
         match self {
-            Self::Sqlite(_, health) | Self::Mysql { health, .. } | Self::Postgres { health, .. } | Self::Sqlserver { health, .. } => Some(health),
+            Self::Sqlite(_, health) | Self::Mysql { health, .. } | Self::Postgres { health, .. } | Self::Sqlserver { health, .. } | Self::Redis { health } => {
+                Some(health)
+            }
             Self::None => None,
         }
     }
@@ -320,6 +336,7 @@ impl CancelTransport {
             Self::Mysql { health: slot, .. } => *slot = health,
             Self::Postgres { health: slot, .. } => *slot = health,
             Self::Sqlserver { health: slot, .. } => *slot = health,
+            Self::Redis { health: slot } => *slot = health,
             Self::None => {}
         }
     }
@@ -368,6 +385,8 @@ pub enum CatalogSession {
     Postgres(Arc<tokio_postgres::Client>),
     /// tiberius 句柄不可共享借用，目录/查询/网格/对比都经这一把互斥锁串行使用同一条连接。
     Sqlserver(Arc<tokio::sync::Mutex<TdsClient>>),
+    /// Redis 单条多路复用连接：键浏览、值读取与命令行共用，经互斥锁串行。
+    Redis(Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>),
     Scripted,
 }
 
@@ -680,6 +699,7 @@ impl Service {
             mysql_pool: None,
             postgres: None,
             sqlserver: None,
+            redis: None,
             schema_note: None,
             foreign_keys: None,
             cancel: CancelTransport::None,
@@ -828,6 +848,7 @@ impl Service {
             mysql_pool: None,
             postgres: None,
             sqlserver: None,
+            redis: None,
             schema_note: None,
             foreign_keys: None,
             cancel: CancelTransport::None,
@@ -858,6 +879,8 @@ impl Service {
                 SessionKind::Postgres(Arc::new(client))
             } else if let Some(client) = attempt.sqlserver.take() {
                 SessionKind::Sqlserver(Arc::new(tokio::sync::Mutex::new(client)))
+            } else if let Some(conn) = attempt.redis.take() {
+                SessionKind::Redis(Arc::new(tokio::sync::Mutex::new(conn)))
             } else {
                 SessionKind::Scripted
             };
@@ -934,8 +957,27 @@ impl Service {
             SessionKind::Mysql(pool) => CatalogSession::Mysql(pool.clone()),
             SessionKind::Postgres(client) => CatalogSession::Postgres(Arc::clone(client)),
             SessionKind::Sqlserver(client) => CatalogSession::Sqlserver(Arc::clone(client)),
+            SessionKind::Redis(conn) => CatalogSession::Redis(Arc::clone(conn)),
             SessionKind::Scripted => CatalogSession::Scripted,
         })
+    }
+
+    /// Redis 会话句柄：键浏览、值读取与命令行共用同一条多路复用连接（互斥锁串行）。
+    /// 返回共享的健康句柄供执行路径报告断线（R4 探活消费）。
+    pub fn redis_session(
+        &self,
+        id: &str,
+    ) -> Option<(std::sync::Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>, std::sync::Arc<SessionHealth>)> {
+        let sessions = self.sessions.lock().expect("sessions");
+        let session = sessions.get(id)?;
+        if session.health.is_lost() {
+            return None;
+        }
+        session.health.note_activity();
+        match &session.kind {
+            SessionKind::Redis(conn) => Some((Arc::clone(conn), Arc::clone(&session.health))),
+            _ => None,
+        }
     }
 
     /// 前端 1s 轮询的落点：返回全部会话状态，并按需探活、驱动有限次退避重连（R4）。
@@ -1075,7 +1117,9 @@ impl Service {
             );
             return;
         };
-        if config.engine != Engine::Sqlite && !config.password_saved {
+        // Redis 可以无密码直连：没有保存密码不阻止自动重连；其余远程引擎仍要求已保存密码。
+        let passwordless_ok = matches!(config.engine, Engine::Sqlite | Engine::Redis);
+        if !passwordless_ok && !config.password_saved {
             self.finish_reconnect(
                 id,
                 DecisionWithMessage {
@@ -1223,6 +1267,7 @@ fn clone_catalog_handle(kind: &SessionKind) -> CatalogSession {
         SessionKind::Mysql(pool) => CatalogSession::Mysql(pool.clone()),
         SessionKind::Postgres(client) => CatalogSession::Postgres(Arc::clone(client)),
         SessionKind::Sqlserver(client) => CatalogSession::Sqlserver(Arc::clone(client)),
+        SessionKind::Redis(conn) => CatalogSession::Redis(Arc::clone(conn)),
         SessionKind::Scripted => CatalogSession::Scripted,
     }
 }
@@ -1362,6 +1407,7 @@ struct Attempt {
     mysql_pool: Option<mysql_async::Pool>,
     postgres: Option<tokio_postgres::Client>,
     sqlserver: Option<TdsClient>,
+    redis: Option<redis::aio::MultiplexedConnection>,
     schema_note: Option<String>,
     foreign_keys: Option<bool>,
     cancel: CancelTransport,
@@ -1468,15 +1514,24 @@ impl Attempt {
             return;
         }
         let tls_mode = self.tls_mode();
-        let Some(password) = self.password.as_ref() else {
-            // 密码在 TCP/TLS 之前就缺了，不能按失败阶段的先后把前面标成已完成。
-            self.remote = Remote::Failed {
-                stage: StageKind::DatabaseAuthentication,
-                error: stages::fail("请填写数据库密码", "凭据库没有可用密码，本次也没有输入。没有把空密码写入配置。"),
-                network_done: false,
-                tls_done: false,
-            };
-            return;
+        // Redis 允许无密码直连（本地开发常见）：空密码不是“凭据缺失”，照常建连。
+        let empty_password;
+        let password = match self.password.as_ref() {
+            Some(secret) => secret,
+            None if self.config.engine == Engine::Redis => {
+                empty_password = Secret::new("");
+                &empty_password
+            }
+            None => {
+                // 密码在 TCP/TLS 之前就缺了，不能按失败阶段的先后把前面标成已完成。
+                self.remote = Remote::Failed {
+                    stage: StageKind::DatabaseAuthentication,
+                    error: stages::fail("请填写数据库密码", "凭据库没有可用密码，本次也没有输入。没有把空密码写入配置。"),
+                    network_done: false,
+                    tls_done: false,
+                };
+                return;
+            }
         };
         let route = match self.route() {
             Ok(route) => route,
@@ -1526,6 +1581,13 @@ impl Attempt {
                     health: Arc::new(SessionHealth::default()),
                 };
                 self.sqlserver = Some(opened.client);
+                opened.version
+            }),
+            Engine::Redis => drivers::open_redis(&self.config, &route, &password).await.map(|opened| {
+                self.cancel = CancelTransport::Redis {
+                    health: Arc::new(SessionHealth::default()),
+                };
+                self.redis = Some(opened.conn);
                 opened.version
             }),
             Engine::Sqlite => Err(stages::fail("SQLite 不走远程连接", "未执行")),
@@ -1616,6 +1678,14 @@ impl Attempt {
         }
         self.ensure_remote().await;
         let user = self.config.username.clone().unwrap_or_default();
+        if self.config.engine == Engine::Redis {
+            let note = if user.is_empty() {
+                "密码认证".to_owned()
+            } else {
+                format!("ACL 用户 {user}")
+            };
+            return self.finish_stage(StageKind::DatabaseAuthentication, || note);
+        }
         self.finish_stage(StageKind::DatabaseAuthentication, || format!("用户 {user}"))
     }
 
@@ -1801,6 +1871,7 @@ pub(crate) async fn report_canned_remote(config: SavedConnection, canned: Canned
         mysql_pool: None,
         postgres: None,
         sqlserver: None,
+        redis: None,
         schema_note: None,
         foreign_keys: None,
         cancel: CancelTransport::None,

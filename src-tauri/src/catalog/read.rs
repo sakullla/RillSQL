@@ -111,6 +111,12 @@ pub async fn read_catalog_session(engine: Engine, session: &CatalogSession, page
                 databases: Vec::new(),
             },
         },
+        // Redis 没有库/schema/对象层级：键空间由前端经 redis_scan_keys 分页读取。
+        (Engine::Redis, CatalogSession::Redis(_)) => ConnectionBody {
+            error: None,
+            foreign_keys: None,
+            databases: Vec::new(),
+        },
         (_, CatalogSession::Scripted) => ConnectionBody {
             error: Some(scripted_message()),
             foreign_keys: None,
@@ -201,6 +207,7 @@ pub async fn read_object_page(session: &CatalogSession, engine: Engine, database
         CatalogSession::Mysql(pool) => read_mysql_page(pool, engine, database, offset, limit).await,
         CatalogSession::Postgres(client) => read_postgres_page(client, database, schema, offset, limit).await,
         CatalogSession::Sqlserver(client) => read_sqlserver_page(client, database, schema, offset, limit).await,
+        CatalogSession::Redis(_) => empty_page("Redis 键空间经键浏览器分页读取，不走对象分页。"),
     }
 }
 
@@ -223,6 +230,7 @@ pub async fn read_definition(
         CatalogSession::Mysql(pool) => read_mysql_definition(pool, engine, database, name, kind).await,
         CatalogSession::Postgres(client) => read_postgres_definition(client, schema, name, kind, signature, relation).await,
         CatalogSession::Sqlserver(client) => read_sqlserver_definition(client, schema, name, kind).await,
+        CatalogSession::Redis(_) => Err(definition_failure("Redis 没有对象定义")),
     }
 }
 

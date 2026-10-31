@@ -275,6 +275,8 @@ fn row_identity(key_positions: &[usize], ordinal: u64, cells: &[Cell]) -> String
 async fn insert_page(target: &CatalogSession, statement: &str) -> Result<(), String> {
     match target {
         CatalogSession::Scripted => Err("这个连接没有连着可查询的数据库".to_owned()),
+        // Redis 不在迁移目标面（capability 门控）；误入时拒绝写入。
+        CatalogSession::Redis(_) => Err("Redis 不是迁移目标；数据经键命令写入。".to_owned()),
         // SQLite 会话的池固定单连接，BEGIN/COMMIT 语句与数据语句落在同一条连接上。
         CatalogSession::Sqlite { pool, .. } => {
             exec_sqlite(pool, "BEGIN").await?;
@@ -331,6 +333,7 @@ async fn insert_page(target: &CatalogSession, statement: &str) -> Result<(), Str
 async fn exec_one(target: &CatalogSession, statement: &str) -> Result<(), String> {
     match target {
         CatalogSession::Scripted => Err("这个连接没有连着可查询的数据库".to_owned()),
+        CatalogSession::Redis(_) => Err("Redis 不是迁移目标；数据经键命令写入。".to_owned()),
         CatalogSession::Sqlite { pool, .. } => exec_sqlite(pool, statement).await,
         CatalogSession::Mysql(pool) => {
             let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;

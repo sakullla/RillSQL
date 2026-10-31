@@ -10,6 +10,7 @@ mod migrate;
 mod native_export;
 mod product;
 mod query;
+mod redis;
 
 use serde::Serialize;
 
@@ -77,6 +78,12 @@ fn wire<R: tauri::Runtime>(builder: tauri::Builder<R>, state: connections::comma
         dump::commands::database_dump_cancel,
         migrate::commands::migrate_data,
         migrate::commands::migrate_cancel,
+        redis::commands::redis_scan_keys,
+        redis::commands::redis_read_key,
+        redis::commands::redis_set_ttl,
+        redis::commands::redis_delete_keys,
+        redis::commands::redis_rename_key,
+        redis::commands::redis_exec,
         ddl::commands::ddl_describe,
         ddl::commands::ddl_preview,
         ddl::commands::ddl_execute,
@@ -125,6 +132,8 @@ fn fixed_dependency_markers() -> usize {
         std::any::type_name::<mysql_async::Opts>(),
         std::any::type_name::<tiberius::Config>(),
         std::any::type_name::<tiberius::EncryptionLevel>(),
+        std::any::type_name::<::redis::Client>(),
+        std::any::type_name::<::redis::aio::MultiplexedConnection>(),
         std::any::type_name::<tokio_util::compat::Compat<tokio::net::TcpStream>>(),
         std::any::type_name::<keyring::Entry>(),
         std::any::type_name::<russh::client::Config>(),
@@ -145,6 +154,7 @@ fn fixed_dependency_markers() -> usize {
         compare::module_id(),
         dump::module_id(),
         migrate::module_id(),
+        redis::module_id(),
     ];
     markers.len()
 }
@@ -178,6 +188,16 @@ mod tests {
 
     /// 拖放预览（R9）的命令同样要三件套齐备：lib.rs 注册、权限清单、能力文件。
     const DROPPED_COMMANDS: &[&str] = &["read_dropped_preview"];
+
+    /// Redis 键浏览器（R11）的命令同样要三件套齐备：lib.rs 注册、权限清单、能力文件。
+    const REDIS_COMMANDS: &[&str] = &[
+        "redis_scan_keys",
+        "redis_read_key",
+        "redis_set_ttl",
+        "redis_delete_keys",
+        "redis_rename_key",
+        "redis_exec",
+    ];
 
     #[test]
     fn title_names_the_product() {
@@ -251,6 +271,24 @@ mod tests {
             assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
             assert!(wire.contains(&format!("dropped::{command}")), "{command}");
         }
+    }
+
+    #[test]
+    fn main_window_registers_redis_commands() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capability: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("capabilities/default.json")).unwrap()).unwrap();
+        let permissions = capability["permissions"].as_array().unwrap();
+        let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
+        let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        let wire = registration.split("fn wire").nth(1).unwrap_or("");
+        let wire = wire.split("pub fn run").next().unwrap_or("");
+        for command in REDIS_COMMANDS {
+            let allow = format!("allow-{}", command.replace('_', "-"));
+            assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
+            assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
+            assert!(wire.contains(&format!("redis::commands::{command}")), "{command}");
+        }
+        assert_eq!(super::redis::module_id(), "redis");
     }
 
     #[test]

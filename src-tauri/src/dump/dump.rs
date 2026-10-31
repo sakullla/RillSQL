@@ -256,6 +256,8 @@ impl DumpScope {
             Engine::Mysql | Engine::Mariadb => format!("{}.{}", quote_ident(engine, &self.database), quote_ident(engine, name)),
             Engine::Postgres => format!("{}.{}", quote_ident(engine, schema), quote_ident(engine, name)),
             Engine::Sqlserver => format!("{}.{}", quote_ident(engine, schema), quote_ident(engine, name)),
+            // Redis 不在全库导出面（capability 门控）；占位保持穷尽。
+            Engine::Redis => quote_ident(engine, name),
         }
     }
 }
@@ -283,6 +285,7 @@ pub fn engine_name(engine: Engine) -> &'static str {
         Engine::Mariadb => "mariadb",
         Engine::Sqlite => "sqlite",
         Engine::Sqlserver => "sqlserver",
+        Engine::Redis => "redis",
     }
 }
 
@@ -315,6 +318,8 @@ async fn current_postgres_database(session: &CatalogSession) -> Result<String, S
 /// 解析要导出的范围：库与 schema 列表。PostgreSQL 限定当前连接的库，schema 缺省全部。
 async fn resolve_scope(engine: Engine, session: &CatalogSession, database: &str, schemas: &[String]) -> Result<(String, Vec<String>), String> {
     match engine {
+        // Redis 不在全库导出面（capability 门控）。
+        Engine::Redis => return Err("Redis 没有整库导出；键空间经键浏览器访问。".to_owned()),
         Engine::Sqlite => {
             if !database.is_empty() && database != "main" {
                 return Err(format!("当前连接打开的是 main，没有另开连接读取 {database}"));
@@ -1062,6 +1067,8 @@ fn write_header(out: &mut BufWriter<File>, engine: Engine, scope: &DumpScope, re
         Engine::Mariadb => "MariaDB",
         Engine::Sqlite => "SQLite",
         Engine::Sqlserver => "SQL Server",
+        // Redis 不在全库导出面（capability 门控）；占位保持穷尽。
+        Engine::Redis => "Redis",
     };
     let database = if scope.database.is_empty() { "main".to_owned() } else { scope.database.clone() };
     let schemas = if matches!(engine, Engine::Postgres | Engine::Sqlserver) { scope.schemas.join(", ") } else { String::new() };

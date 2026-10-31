@@ -464,6 +464,8 @@ impl LiveDriver {
         let setup = timeout_statements(engine, timeout_ms);
         let attached = match session {
             CatalogSession::Scripted => Attached::Scripted,
+            // Redis 没有 SQL 执行器（capability 门控）：命令行经 redis_exec 专项通道。
+            CatalogSession::Redis(_) => return Err("Redis 不执行 SQL；命令在键浏览器里输入。".to_owned()),
             CatalogSession::Sqlite { pool, .. } => match database_gate("sqlite", "main", database) {
                 DatabaseGate::Refuse => return Err(refuse_message("main", database)),
                 _ => Attached::Sqlite(pool),

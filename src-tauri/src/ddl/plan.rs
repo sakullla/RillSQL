@@ -252,6 +252,8 @@ fn plan_drop_fk(snapshot: &Snapshot, table: &str, name: &str) -> Plan {
             quote_ident(snapshot.engine, name)
         ),
         Engine::Sqlite => String::new(),
+        // Redis 没有结构编辑（capability 门控）；占位保持穷尽。
+        Engine::Redis => String::new(),
     };
     if sql.contains("需要") || sql.contains("没有另开") {
         return finish(snapshot.engine, false, target, vec![sql], risks, Vec::new());
@@ -1051,6 +1053,8 @@ fn drop_index_sql(snapshot: &Snapshot, name: &str) -> Result<String, String> {
         Engine::Mysql | Engine::Mariadb => format!("DROP INDEX {index} ON {};", qualified_table(snapshot.engine, &snapshot.database, &snapshot.schema, &snapshot.name)?),
         // T-SQL 的索引名不带 schema 前缀，DROP INDEX 直接落在表上。
         Engine::Sqlserver => format!("DROP INDEX {index} ON {};", qualified_table(snapshot.engine, &snapshot.database, &snapshot.schema, &snapshot.name)?),
+        // Redis 没有结构编辑（capability 门控）。
+        Engine::Redis => return Err("Redis 没有结构编辑。".to_owned()),
     })
 }
 
@@ -1337,6 +1341,8 @@ fn plan_replace_view(snapshot: &Snapshot, table: &str, definition: &str) -> Plan
                 Step { label: format!("创建视图 {table}"), sql: create },
             ]
         }
+        // Redis 没有结构编辑（capability 门控）；占位保持穷尽。
+        Engine::Redis => Vec::new(),
     };
     finish(snapshot.engine, false, target, Vec::new(), risks, steps)
 }
@@ -1601,6 +1607,8 @@ fn qualifier_matches(snapshot: &Snapshot, qualifier: &SqlIdent) -> bool {
         Engine::Postgres | Engine::Sqlserver => ident_matches(snapshot.engine, qualifier, &snapshot.schema),
         Engine::Mysql | Engine::Mariadb => ident_matches(snapshot.engine, qualifier, &snapshot.database),
         Engine::Sqlite => ident_matches(Engine::Sqlite, qualifier, &snapshot.database) || ident_matches(Engine::Sqlite, qualifier, "main"),
+        // Redis 没有结构编辑（capability 门控）。
+        Engine::Redis => false,
     }
 }
 
@@ -1783,6 +1791,8 @@ fn target_label(engine: Engine, database: &str, schema: &str, table: &str) -> St
         Engine::Mysql => format!("mysql / {database}.{table}"),
         Engine::Mariadb => format!("mariadb / {database}.{table}"),
         Engine::Sqlserver => format!("sqlserver / {database} / {schema}.{table}"),
+        // Redis 没有结构编辑（capability 门控）；占位保持穷尽。
+        Engine::Redis => format!("redis / {table}"),
     }
 }
 

@@ -242,3 +242,33 @@ commands.allow = ["compare_cancel"]
 identifier = "allow-compare-schemas"
 description = "允许列出所选 PostgreSQL 库的 schema，不改连当前会话。"
 commands.allow = ["compare_schemas"]
+
+[[permission]]
+identifier = "allow-redis-scan-keys"
+description = "允许在已打开的 Redis 会话上按 SCAN 游标分页浏览键空间（MATCH 模式过滤），不使用 KEYS。"
+commands.allow = ["redis_scan_keys"]
+
+[[permission]]
+identifier = "allow-redis-read-key"
+description = "允许读取 Redis 键的类型、TTL 与按类型的值。"
+commands.allow = ["redis_read_key"]
+
+[[permission]]
+identifier = "allow-redis-set-ttl"
+description = "允许修改 Redis 键的 TTL（EXPIRE）或移除过期（PERSIST）。"
+commands.allow = ["redis_set_ttl"]
+
+[[permission]]
+identifier = "allow-redis-delete-keys"
+description = "允许删除 Redis 键；写删操作需前端二次确认（confirmed 标记）后才执行。"
+commands.allow = ["redis_delete_keys"]
+
+[[permission]]
+identifier = "allow-redis-rename-key"
+description = "允许重命名 Redis 键；写删操作需前端二次确认（confirmed 标记）后才执行。"
+commands.allow = ["redis_rename_key"]
+
+[[permission]]
+identifier = "allow-redis-exec"
+description = "允许在 Redis 会话上执行命令并结构化返回结果；KEYS 全量扫描无条件禁用，写删类命令需前端确认。"
+commands.allow = ["redis_exec"]

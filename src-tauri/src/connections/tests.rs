@@ -1094,3 +1094,49 @@ CREATE PROCEDURE").map(|at| at + 1).expect("seed 有存储过程");
     assert!(init_command.contains("-f 65001"), "读 seed 需要 -f 65001：{init_command}");
     assert!(init_command.contains("-i /seed/mssql-seed.sql"), "seed 挂载执行：{init_command}");
 }
+
+#[test]
+fn redis_engine_variant_is_canonical_and_relational_gated() {
+    use super::model::{normalize, ConnectionDraft, Engine, SecretInput};
+    // serde 正典值是 "redis"（与前端 ENGINES 的 id 一致），能力位为 kv。
+    assert_eq!(serde_json::to_string(&Engine::Redis).unwrap(), "\"redis\"");
+    assert_eq!(Engine::parse("redis").unwrap(), Engine::Redis);
+    assert!(Engine::parse("valkey").is_err(), "只接受 redis 一种键值引擎");
+    assert!(!Engine::Redis.is_relational(), "Redis 没有 SQL 面/结构编辑/对比/导出");
+    assert!(Engine::Postgres.is_relational());
+
+    // Redis 表单：用户名可留空（密码认证），database 字段是库索引。
+    let mut draft = ConnectionDraft::blank(Engine::Redis);
+    draft.host = "127.0.0.1".to_owned();
+    draft.port = "6379".to_owned();
+    draft.database = "2".to_owned();
+    draft.username = String::new();
+    let saved = normalize(&draft, "redis-1".to_owned()).unwrap();
+    assert_eq!(saved.database.as_deref(), Some("2"));
+    assert_eq!(saved.username, None, "空 ACL 用户名按匿名密码认证保存");
+    // 库索引必须是数字。
+    draft.database = "main".to_owned();
+    let errors = normalize(&draft, "redis-2".to_owned()).unwrap_err();
+    assert!(errors.iter().any(|item| item.field == "database" && item.message.contains("库索引")));
+
+    // 无密码 Redis 直连是合法场景：保存不要求密码（凭据缺失错误只在关系引擎出现）。
+    let _ = SecretInput::default();
+}
+
+#[test]
+fn redis_fixture_seed_covers_all_value_types_and_tls_free_healthcheck() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let compose = std::fs::read_to_string(root.join("../docker/compose.yaml")).unwrap();
+    let seed = std::fs::read_to_string(root.join("../docker/init/redis-seed.sh")).unwrap();
+    let redis = compose.split("  redis:").nth(1).unwrap_or("").split("  redis-init:").next().unwrap_or("");
+    // 密码夹具 + 健康检查带认证。
+    assert!(redis.contains("--requirepass"), "redis 夹具要求密码：{redis}");
+    assert!(redis.contains("redis-cli"), "healthcheck 用 redis-cli 探活：{redis}");
+    // seed：string/hash/list/set/zset/stream 各至少一键，含中文值，TTL 有差异。
+    for needle in ["rillsql:string", "rillsql:hash", "rillsql:list", "rillsql:set", "rillsql:zset", "rillsql:stream"] {
+        assert!(seed.contains(needle), "seed 缺少 {needle}");
+    }
+    assert!(seed.contains("林夏"), "seed 含中文值");
+    assert!(seed.contains("EXPIRE"), "seed 设置不同 TTL");
+    assert!(!seed.contains("\nKEYS ") && !seed.starts_with("KEYS "), "seed 不使用 KEYS");
+}

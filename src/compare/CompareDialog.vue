@@ -2,6 +2,7 @@
 import { computed, reactive, ref, watch, type Ref } from "vue";
 import { catalogConnections } from "../catalog/store";
 import type { CatalogConnection } from "../catalog/types";
+import { engineMeta } from "../engines";
 import { compareCancel, compareData, compareSchemas, compareStructure } from "./api";
 import type { ScriptTarget } from "./place";
 import type { CompareSide, DataReport, StructureReport } from "./types";
@@ -25,7 +26,8 @@ const loadedSchemas = reactive<Record<string, string[]>>({});
 const schemaState = reactive<Record<string, "loading" | "manual" | "ready">>({});
 const schemaNote = reactive<Record<string, string>>({});
 
-const connections = computed(() => catalogConnections().filter((item) => item.status === "connected"));
+// 能力门控（ADR-2）：kv/document 引擎没有结构/数据对比，不出现在两侧连接里。
+const connections = computed(() => catalogConnections().filter((item) => item.status === "connected" && engineMeta(item.engine).relational));
 
 function connection(id: string): CatalogConnection | null {
   return connections.value.find((item) => item.id === id) ?? null;

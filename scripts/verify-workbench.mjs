@@ -195,6 +195,65 @@ try {
   await page.getByRole("button", { name: "确认放弃", exact: true }).click();
   report.checks.push("SQL Server: grid edit preview emits T-SQL with bracket identifiers and N'' literals");
 
+  // ---- Redis 合成用例（T11）：SCAN 分页/类型化值渲染/危险命令确认，不依赖 docker ----
+  await expect(tree).toContainText("缓存 · Redis");
+  const redisSection = tree.locator('section[data-connection="redis-cache"]');
+  // data-redis-tree 容器是 display:contents（无自身盒），用计数断言存在性。
+  await expect(redisSection.locator("[data-redis-tree]")).toHaveCount(1);
+  // 能力门控：Redis 连接节点下没有库/schema/关系图入口。
+  await expect(redisSection.locator('[data-level="database"]')).toHaveCount(0);
+  await expect(redisSection.locator('[data-action="open-diagram"]')).toHaveCount(0);
+  await expect(redisSection.locator('[data-level="key"]')).toHaveCount(3);
+  // SCAN 分页：「再显示」用返回的游标继续，第二页补齐 zset/stream。
+  await redisSection.locator('[data-action="tree-more"]').click();
+  await expect(redisSection.locator('[data-level="key"]')).toHaveCount(5);
+  // 分页语义：「再显示」之后出现过 cursor=37 的续读（首读的重复游标 0 不影响——树可能因目录刷新重挂载）。
+  const scanCalls = await page.evaluate(() => window.__uiCalls.filter(call => call.command === "redis_scan_keys").map(call => call.args.cursor));
+  expect(scanCalls.filter(cursor => cursor !== 0)).toEqual([37]);
+  expect(new Set(scanCalls).has(0)).toBe(true);
+  // 双击 zset 键开键浏览器标签：分值列表渲染，TTL 展示。
+  await redisSection.locator('[data-key="rillsql:zset:rank"]').dblclick();
+  await expect(page.locator("[data-redis-key-title]")).toHaveText("rillsql:zset:rank");
+  await expect(page.locator("[data-value-kind=zset]")).toContainText("张伟");
+  await expect(page.locator("[data-value-kind=zset]")).toContainText("85");
+  await expect(page.locator(".rk-ttl-now")).toContainText("30 分");
+  // 标签页自己的键列表按 SCAN 分页：先「再读取一批」补齐第二页（zset/stream）。
+  await page.locator('[data-action=redis-more]').click();
+  await expect(page.locator(".redis-tab [data-redis-keys] [data-key]")).toHaveCount(5);
+  // hash 值查看：键值表格渲染中文值（标签页内的键列表，区别于树的同名 data-key）。
+  await page.locator('.redis-tab [data-key="rillsql:hash:order:1001"]').dblclick();
+  await expect(page.locator("[data-value-kind=hash]")).toContainText("林夏");
+  // stream 值查看：消息列表带 ID 与字段。
+  await page.locator('.redis-tab [data-key="rillsql:stream:events"]').dblclick();
+  await expect(page.locator("[data-value-kind=stream]")).toContainText("1698751000000-0");
+  await expect(page.locator("[data-value-kind=stream]")).toContainText("管理员");
+  // 命令行：只读直通（GET → bulk 文本）。
+  await page.locator("[data-field=redis-command]").fill("GET rillsql:string:welcome");
+  await page.locator("[data-action=redis-exec]").click();
+  await expect(page.locator("[data-reply-kind=bulk]")).toContainText("澄库 Redis 夹具 · 中文值");
+  // KEYS 被拒绝并提示改用 SCAN。
+  await page.locator("[data-field=redis-command]").fill("KEYS *");
+  await page.locator("[data-action=redis-exec]").click();
+  await expect(page.locator("[data-redis-cmd-error]")).toContainText("已禁用 KEYS");
+  // FLUSHDB 二次确认：取消后没有 confirmed=true 的调用，键列表不变。
+  await page.locator("[data-field=redis-command]").fill("FLUSHDB");
+  await page.locator("[data-action=redis-exec]").click();
+  await expect(page.locator("[data-redis-confirm-prompt]")).toContainText("清空当前库");
+  await page.locator("[data-action=redis-confirm-cancel]").click();
+  const execCallsAfterCancel = await page.evaluate(() => window.__uiCalls.filter(call => call.command === "redis_exec"));
+  expect(execCallsAfterCancel.filter(call => call.args.confirmed === true)).toHaveLength(0);
+  await expect(page.locator('.redis-tab [data-key="rillsql:string:welcome"]')).toBeVisible();
+  report.checks.push("Redis: SCAN pagination with cursor, typed value viewers, KEYS refused, FLUSHDB confirm-cancel leaves keys intact");
+
+  // 能力门控：查询目标下拉不出现 Redis 连接（SQL 执行器对 kv 引擎不可达）。
+  await page.getByRole("button", { name: "新建查询", exact: true }).click();
+  await page.locator("[data-action=target]").click();
+  const targetNames = await page.getByRole("listbox", { name: "执行目标" }).getByRole("option").allInnerTexts();
+  expect(targetNames.some(name => name.includes("缓存 · Redis"))).toBe(false);
+  expect(targetNames.some(name => name.includes("书店 · 开发"))).toBe(true);
+  await page.keyboard.press("Escape");
+  report.checks.push("Capability gating: the SQL executor target list has no redis connection");
+
   expect(errors).toEqual([]);
   report.checks.push("No browser page errors");
   report.passed = true;

@@ -3,7 +3,7 @@ import type { AppPage } from "../router";
 import { parseHash, toHash } from "../router";
 import { CONNECTION_STATUS_TEXT, type ConnectionStatus } from "./status-text";
 
-export type TabKind = "query" | "table" | "structure" | "definition" | "diagram";
+export type TabKind = "query" | "table" | "structure" | "definition" | "diagram" | "keys";
 
 export interface DefinitionRequest {
   schema: string;
@@ -33,7 +33,7 @@ export const NEW_QUERY_DRAFT = "";
 
 export const SESSION_KEY = "rillsql.session";
 
-const TAB_KINDS: readonly TabKind[] = ["query", "table", "structure", "definition", "diagram"];
+const TAB_KINDS: readonly TabKind[] = ["query", "table", "structure", "definition", "diagram", "keys"];
 
 export function isTabKind(value: unknown): value is TabKind {
   return typeof value === "string" && (TAB_KINDS as readonly string[]).includes(value);
@@ -66,11 +66,26 @@ export interface SessionSnapshotTab {
   definition?: { schema: string; name: string; kind: string; signature: string; relation: string } | null;
   /** 关系图标签的 schema。 */
   diagramSchema?: string | null;
+  /** keys 标签（Redis）恢复时选中的键名。 */
+  redisKey?: string | null;
 }
 
 export interface SessionSnapshot {
   tabs: SessionSnapshotTab[];
   activeId: string | null;
+}
+
+/** Redis 键浏览器标签（R11）的目标：一条连接 + 可选的初始选中键。 */
+export interface RedisTarget {
+  id: string;
+  label: string;
+  path?: string;
+  connectionId: string;
+  connectionName: string;
+  database: string;
+  engine: string;
+  status: ConnectionStatus;
+  key?: string;
 }
 
 export interface DiagramTarget {
@@ -135,6 +150,7 @@ export interface ShellTab {
   structureSection: "columns" | "indexes" | "foreign" | "drop";
   definition?: DefinitionRequest | null;
   diagram?: { schema: string } | null;
+  redis?: { key: string } | null;
   /** 恢复自快照的标签（R2）：只有这类标签按“连接已删”呈现空态。不持久化。 */
   restored?: boolean;
 }
@@ -156,6 +172,7 @@ export interface ShellSession {
   openStructure: (target: PlaceholderTarget) => void;
   openDefinition: (target: DefinitionTarget) => void;
   openDiagram: (target: DiagramTarget) => void;
+  openKeys: (target: RedisTarget) => void;
   setTableView: (id: string, pane: "data" | "structure", section?: "columns" | "drop") => void;
   setDraft: (id: string, draft: string) => void;
   setExecuted: (id: string, sql: string) => void;
@@ -189,6 +206,7 @@ function blankTab(kind: TabKind, id: string, title: string, path: string | null,
     structureSection: "columns",
     definition: null,
     diagram: null,
+    redis: null,
   };
 }
 
@@ -231,6 +249,7 @@ export function snapshotSession(tabs: readonly ShellTab[], activeId: string | nu
       structureSection: tab.kind === "table" ? tab.structureSection : undefined,
       definition: tab.definition ? { ...tab.definition } : null,
       diagramSchema: tab.kind === "diagram" ? tab.diagram?.schema ?? null : null,
+      redisKey: tab.kind === "keys" ? tab.redis?.key ?? null : null,
     })),
     activeId: tabs.some((tab) => tab.id === activeId) ? activeId : tabs[tabs.length - 1]?.id ?? null,
   };
@@ -302,6 +321,8 @@ export function restoreSession(raw: string | null): SessionSnapshot | null {
     if (definition === undefined) return null;
     const diagramSchema = textOrNull(tab.diagramSchema ?? null);
     if (diagramSchema === null && tab.diagramSchema !== undefined && tab.diagramSchema !== null) return null;
+    const redisKey = textOrNull(tab.redisKey ?? null);
+    if (redisKey === null && tab.redisKey !== undefined && tab.redisKey !== null) return null;
     tabs.push({
       id: tab.id,
       title: tab.title,
@@ -320,6 +341,7 @@ export function restoreSession(raw: string | null): SessionSnapshot | null {
       structureSection: structureSection ?? undefined,
       definition,
       diagramSchema,
+      redisKey,
     });
   }
   const resolved = tabs.some((tab) => tab.id === activeId) ? activeId : tabs[tabs.length - 1]?.id ?? null;
@@ -346,6 +368,9 @@ function fromSnapshot(item: SessionSnapshotTab): ShellTab {
   }
   if (kind === "diagram") {
     tab.diagram = { schema: item.diagramSchema ?? "" };
+  }
+  if (kind === "keys") {
+    tab.redis = { key: item.redisKey ?? "" };
   }
   tab.lastExecutedSql = kind === "query" ? item.lastExecutedSql ?? null : null;
   return tab;
@@ -498,6 +523,30 @@ export function createSession(initialHash = "", restored: SessionSnapshot | null
     showPage("workspace");
   }
 
+  function openKeys(target: RedisTarget) {
+    const id = `keys:${target.connectionId}`;
+    const existing = tabs.value.find((tab) => tab.id === id);
+    if (existing) {
+      if (target.key != null) existing.redis = { key: target.key };
+      activeId.value = existing.id;
+      showPage("workspace");
+      return;
+    }
+    const tab = blankTab("keys", id, target.label, target.path ?? null, "");
+    applyTarget(tab, {
+      connectionId: target.connectionId,
+      connectionName: target.connectionName,
+      database: target.database,
+      engine: target.engine,
+      status: target.status,
+    });
+    if (target.database) tab.targetText = `${target.connectionName} / db ${target.database}`;
+    tab.redis = { key: target.key ?? "" };
+    tabs.value = [...tabs.value, tab];
+    activeId.value = tab.id;
+    showPage("workspace");
+  }
+
   function setDraft(id: string, draft: string) {
     const tab = tabs.value.find((item) => item.id === id);
     if (!tab || tab.draft === draft) return;
@@ -583,6 +632,7 @@ export function createSession(initialHash = "", restored: SessionSnapshot | null
     openStructure,
     openDefinition,
     openDiagram,
+    openKeys,
     setTableView,
     setDraft,
     setExecuted,
