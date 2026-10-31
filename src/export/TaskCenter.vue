@@ -1,20 +1,29 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import DumpDialog from "./DumpDialog.vue";
+import MigrateDialog from "./MigrateDialog.vue";
 import { cancelTask, clearFinishedTasks, exportTasks, taskStatusLabel, taskStatusText, type ExportTask } from "./tasks";
 
 const open = ref(false);
 const dumpOpen = ref(false);
+const migrateOpen = ref(false);
 const running = computed(() => exportTasks.find((task) => task.status === "running"));
 const hasFinished = computed(() => exportTasks.some((task) => task.status !== "running"));
 const label = computed(() => {
   const task = running.value;
   if (!task) return "任务";
-  return task.totalRows > 0 ? `导出中 ${task.doneRows}/${task.totalRows}` : `导出中 ${task.doneRows} 行`;
+  const verb = task.kind === "migrate" ? "迁移中" : "导出中";
+  return task.totalRows > 0 ? `${verb} ${task.doneRows}/${task.totalRows}` : `${verb} ${task.doneRows} 行`;
 });
 
 function cancel(task: ExportTask) {
   void cancelTask(task);
+}
+
+/** 迁移报告的失败标识最多展示前 10 个，其余以计数说明。 */
+function failedSample(task: ExportTask): { ids: string[]; more: number } {
+  const ids = task.report?.failedIds ?? [];
+  return { ids: ids.slice(0, 10), more: Math.max(0, ids.length - 10) };
 }
 
 function badgeVariant(status: ExportTask["status"]): string {
@@ -40,6 +49,7 @@ function percent(task: ExportTask): number {
         <strong>后台任务</strong>
         <span class="grow"></span>
         <button class="btn sm ghost" type="button" data-action="dump-open" @click="dumpOpen = true">全库导出</button>
+        <button class="btn sm ghost" type="button" data-action="migrate-open" @click="migrateOpen = true">跨库迁移</button>
         <button class="btn sm ghost" type="button" data-action="clear-finished" :disabled="!hasFinished" @click="clearFinishedTasks">清除已结束的</button>
       </div>
       <p v-if="!exportTasks.length" class="tc-empty">没有后台任务。</p>
@@ -62,9 +72,20 @@ function percent(task: ExportTask): number {
           <i :style="{ width: `${percent(task)}%` }"></i>
         </div>
         <p class="tc-status">{{ taskStatusText(task) }}</p>
+        <details v-if="task.report && (task.report.failedIds.length > 0 || task.report.firstErrors.length > 0)" class="tc-report">
+          <summary>失败明细（{{ task.report.failedIds.length }} 个标识）</summary>
+          <ul class="tc-failed">
+            <li v-for="id in failedSample(task).ids" :key="id">{{ id }}</li>
+          </ul>
+          <p v-if="failedSample(task).more > 0" class="tc-more">还有 {{ failedSample(task).more }} 个未展示。</p>
+          <ul class="tc-errors">
+            <li v-for="item in task.report.firstErrors.slice(0, 5)" :key="item">{{ item }}</li>
+          </ul>
+        </details>
       </article>
     </div>
     <DumpDialog :open="dumpOpen" @close="dumpOpen = false" />
+    <MigrateDialog :open="migrateOpen" @close="migrateOpen = false" />
   </div>
 </template>
 
@@ -94,4 +115,12 @@ function percent(task: ExportTask): number {
 .tc-progress { height: 4px; background: var(--surface-sunken); box-shadow: inset 0 0 0 1px var(--stroke); border-radius: var(--r-full); overflow: hidden; }
 .tc-progress i { display: block; height: 100%; background: var(--accent); border-radius: var(--r-full); transition: width var(--dur) var(--ease); }
 .tc-status { margin: 0; font-size: var(--fs-xs); color: var(--text-2); line-height: var(--lh); }
+/* 迁移报告：失败标识与首批错误折叠展示，避免长表刷屏。 */
+.tc-report { font-size: var(--fs-xs); color: var(--text-2); }
+.tc-report summary { cursor: pointer; color: var(--text-3); }
+.tc-failed { display: flex; flex-wrap: wrap; gap: var(--sp-1); margin: var(--sp-1) 0 0; padding: 0; list-style: none; }
+.tc-failed li { padding: 0 var(--sp-2); border: 1px solid var(--line); border-radius: var(--r-full); font: 500 var(--fs-xs) var(--mono); color: var(--text); }
+.tc-more { margin: var(--sp-1) 0 0; color: var(--text-3); }
+.tc-errors { margin: var(--sp-1) 0 0; padding-left: var(--sp-4); color: var(--text-3); }
+.tc-errors li { margin: 0; }
 </style>

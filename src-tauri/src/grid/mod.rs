@@ -7,7 +7,7 @@ mod sql;
 mod store;
 
 pub(crate) use live::{describe, fetch_cells, insert_line};
-pub(crate) use sql::{delete_sql, insert_sql, qualified_name, quote_ident, reject_literal, select_list, update_sql};
+pub(crate) use sql::{delete_sql, insert_sql, qualified_name, quote_ident, reject_literal, select_list, sql_cell, update_sql, value_family, ValueFamily};
 pub(crate) use store::{Cell, Column, Engine, TableSchema};
 
 pub fn module_id() -> &'static str {

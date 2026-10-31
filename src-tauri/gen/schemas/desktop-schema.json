@@ -393,6 +393,18 @@
           "markdownDescription": "允许从已打开的会话分页读取表数据。"
         },
         {
+          "description": "允许取消尚未完成的跨库迁移；已提交的批次保留。",
+          "type": "string",
+          "const": "allow-migrate-cancel",
+          "markdownDescription": "允许取消尚未完成的跨库迁移；已提交的批次保留。"
+        },
+        {
+          "description": "允许把源表的数据流式迁移到另一条已打开连接的目标表，冲突跳过、单行失败记录并继续。",
+          "type": "string",
+          "const": "allow-migrate-data",
+          "markdownDescription": "允许把源表的数据流式迁移到另一条已打开连接的目标表，冲突跳过、单行失败记录并继续。"
+        },
+        {
           "description": "允许请求取消正在执行的 SQL。",
           "type": "string",
           "const": "allow-query-cancel",

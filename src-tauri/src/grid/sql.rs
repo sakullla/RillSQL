@@ -386,8 +386,9 @@ fn locator_sql(schema: &TableSchema, locator: &[(String, Cell)]) -> String {
         .join(" AND ")
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ValueFamily {
+/// 列类型的值家族。迁移（R8）按两侧家族给出兼容提示，与字面量生成共用这一张表。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ValueFamily {
     Unknown,
     Bool,
     Integer,
@@ -402,7 +403,7 @@ enum ValueFamily {
     Raw,
 }
 
-fn value_family(type_name: &str) -> ValueFamily {
+pub fn value_family(type_name: &str) -> ValueFamily {
     let name = base_type(type_name);
     if name.is_empty() || name == "类型未知" {
         return ValueFamily::Unknown;

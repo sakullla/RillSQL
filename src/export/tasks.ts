@@ -3,6 +3,7 @@ import { gridExport, gridExportCancel, type ExportResult } from "../grid/api";
 import type { Filter, SortSpec } from "../grid/types";
 import { renderCsv, type CsvCell, type CsvOptions } from "./csv";
 import { databaseDump, databaseDumpCancel, type DumpPayload, type DumpProgressEvent, type DumpResult } from "./dump";
+import { migrateCancel, migrateData, type MigratePayload, type MigrateProgressEvent, type MigrateResult } from "./migrate";
 import { renderInsert, type InsertTarget } from "./insert";
 import { renderJson } from "./json";
 import { renderMarkdown } from "./markdown";
@@ -13,8 +14,8 @@ import { renderXlsx } from "./xlsx";
 
 export interface ExportTask {
   id: string;
-  /** dump 表示全库导出任务；缺省是表/查询导出。取消通道按它分流。 */
-  kind?: "export" | "dump";
+  /** dump 表示全库导出任务；migrate 表示跨库迁移；缺省是表/查询导出。取消通道按它分流。 */
+  kind?: "export" | "dump" | "migrate";
   fileName: string;
   path: string;
   status: "running" | "done" | "failed" | "cancelled" | "blocked";
@@ -26,6 +27,8 @@ export interface ExportTask {
   cancellable?: boolean;
   /** dump 正在处理的对象名（进度事件给出）。 */
   object?: string;
+  /** migrate 的完成报告：失败行的主键/行号样本与首批错误。 */
+  report?: { failedIds: string[]; firstErrors: string[] };
 }
 
 export const exportTasks = reactive<ExportTask[]>([]);
@@ -382,9 +385,84 @@ export function runDatabaseDump(options: DumpPayload): { task: ExportTask; done:
   return { task, done };
 }
 
-/** 取消按任务类型分流：表/查询导出走 grid_export_cancel，全库导出走 database_dump_cancel。 */
+// ---------------------------------------------------------------- 跨库迁移（R8）任务
+
+function asMigrateStatus(status: string): ExportTask["status"] {
+  if (status === "done" || status === "failed" || status === "cancelled" || status === "blocked" || status === "running") return status;
+  return "failed";
+}
+
+function applyMigrateResult(task: ExportTask, result: MigrateResult): void {
+  task.status = asMigrateStatus(result.status);
+  task.doneRows = result.inserted + result.skipped + result.failed;
+  task.message = result.message;
+  task.report = { failedIds: result.failedIds, firstErrors: result.firstErrors };
+  if (result.success && result.status !== "done") {
+    task.status = "failed";
+    task.message = result.message || "迁移没有完成，不能记为成功";
+  }
+}
+
+/** migrate_progress 事件落到任务行：迁移没有总行数，展示已处理的插入/跳过/失败。 */
+export function applyMigrateProgress(payload: MigrateProgressEvent): void {
+  const task = exportTasks.find((item) => item.id === payload.id);
+  if (!task || task.status !== "running") return;
+  task.doneRows = payload.rows;
+  task.message = `正在迁移：已处理 ${payload.rows} 行（插入 ${payload.inserted}、跳过 ${payload.skipped}、失败 ${payload.failed}）`;
+}
+
+let migrateListener: Promise<void> | null = null;
+
+/** 迁移进度事件只在桌面端订阅；浏览器与测试环境由调用方直接喂 applyMigrateProgress。 */
+function ensureMigrateProgressListener(): Promise<void> {
+  if (!isNativeExport()) return Promise.resolve();
+  if (!migrateListener) {
+    migrateListener = import("@tauri-apps/api/event")
+      .then(({ listen }) => listen<MigrateProgressEvent>("migrate_progress", (event) => applyMigrateProgress(event.payload)))
+      .then((unlisten) => {
+        window.addEventListener("beforeunload", () => unlisten(), { once: true });
+      })
+      .catch(() => undefined);
+  }
+  return migrateListener;
+}
+
+export function runMigrateTask(options: MigratePayload): { task: ExportTask; done: Promise<ExportTask> } {
+  const name = options.source.table === options.target.table
+    ? options.source.table
+    : `${options.source.table} → ${options.target.table}`;
+  const task = reactive<ExportTask>({
+    id: options.id,
+    kind: "migrate",
+    fileName: `迁移 ${name}`,
+    path: `${options.source.connectionId}/${options.source.table} → ${options.target.connectionId}/${options.target.table}`,
+    status: "running",
+    doneRows: 0,
+    totalRows: 0,
+    partial: false,
+    message: "正在准备迁移：读取两边的表结构",
+    residualPath: null,
+  });
+  exportTasks.unshift(task);
+  const done = (async () => {
+    await ensureMigrateProgressListener();
+    try {
+      const result = await migrateData(options);
+      applyMigrateResult(task, result);
+    } catch (error: unknown) {
+      task.status = "failed";
+      task.message = error instanceof Error ? error.message : String(error);
+    }
+    return task;
+  })();
+  return { task, done };
+}
+
+/** 取消按任务类型分流：表/查询导出走 grid_export_cancel，全库导出走 database_dump_cancel，迁移走 migrate_cancel。 */
 export function cancelTask(task: ExportTask): Promise<void> {
-  return task.kind === "dump" ? databaseDumpCancel(task.id) : gridExportCancel(task.id);
+  if (task.kind === "dump") return databaseDumpCancel(task.id);
+  if (task.kind === "migrate") return migrateCancel(task.id);
+  return gridExportCancel(task.id);
 }
 
 /** 后台任务状态的直白文字：颜色不作唯一信息来源，状态词始终在。 */
@@ -398,15 +476,19 @@ export function taskStatusLabel(status: ExportTask["status"]): string {
 
 export function taskStatusText(task: ExportTask): string {
   if (task.status === "running") {
-    if (task.kind === "dump") return task.message;
+    if (task.kind === "dump" || task.kind === "migrate") return task.message;
     return task.totalRows > 0 ? `正在导出：已写入 ${task.doneRows} / ${task.totalRows} 行` : `正在导出：已写入 ${task.doneRows} 行`;
   }
   if (task.status === "done") {
-    if (task.kind === "dump") return task.message;
+    if (task.kind === "dump" || task.kind === "migrate") return task.message;
     return `已完成：写入 ${task.totalRows} 行${task.partial ? "，只是已读取的行，不是完整结果" : ""}`;
   }
-  if (task.status === "cancelled") return "已取消：未完成的文件已删除";
+  if (task.status === "cancelled") {
+    if (task.kind === "migrate") return task.message;
+    return "已取消：未完成的文件已删除";
+  }
   if (task.status === "blocked") return `没有开始：${task.message}`;
+  if (task.kind === "migrate") return `迁移失败：${task.message || "原因未知"}`;
   return `导出失败：${task.message || "原因未知"}`;
 }
 

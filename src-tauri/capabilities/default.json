@@ -42,6 +42,8 @@
     "allow-grid-export-cancel",
     "allow-database-dump",
     "allow-database-dump-cancel",
+    "allow-migrate-data",
+    "allow-migrate-cancel",
     "allow-query-start",
     "allow-query-poll",
     "allow-query-cancel",

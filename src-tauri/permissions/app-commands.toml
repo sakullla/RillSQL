@@ -154,6 +154,16 @@ description = "允许取消尚未完成的全库导出并删除未完成文件�
 commands.allow = ["database_dump_cancel"]
 
 [[permission]]
+identifier = "allow-migrate-data"
+description = "允许把源表的数据流式迁移到另一条已打开连接的目标表，冲突跳过、单行失败记录并继续。"
+commands.allow = ["migrate_data"]
+
+[[permission]]
+identifier = "allow-migrate-cancel"
+description = "允许取消尚未完成的跨库迁移；已提交的批次保留。"
+commands.allow = ["migrate_cancel"]
+
+[[permission]]
 identifier = "allow-query-start"
 description = "允许在已打开的会话上执行 SQL。"
 commands.allow = ["query_start"]

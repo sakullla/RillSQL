@@ -779,7 +779,8 @@ enum DumpStop {
     Failed(String),
 }
 
-fn data_order_clause(schema: &grid::TableSchema) -> String {
+/// 数据段的稳定排序：键列优先，SQLite 无键表按 rowid。迁移（R8）的流式分页读沿用同一规则。
+pub(crate) fn data_order_clause(schema: &grid::TableSchema) -> String {
     if !schema.key.is_empty() {
         let columns = schema
             .key
