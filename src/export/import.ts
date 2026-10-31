@@ -7,6 +7,14 @@ export interface ParsedImport {
   rows: Record<string, Cell>[];
 }
 
+/** 从拖放预览接进来的已读文本：对话框走同一条 parseImportCsv/Json 解析路径，不再读文件。 */
+export interface ImportSeed {
+  format: "csv" | "json";
+  text: string;
+  delimiter?: CsvDelimiter;
+  fileName?: string;
+}
+
 export type ImportParse = { ok: true; data: ParsedImport } | { ok: false; reason: string };
 
 function blankRow(row: { value: string | null; quoted: boolean }[]): boolean {

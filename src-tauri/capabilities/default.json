@@ -39,6 +39,7 @@
     "allow-grid-commit",
     "allow-grid-export",
     "allow-export-write-loaded",
+    "allow-read-dropped-preview",
     "allow-grid-export-cancel",
     "allow-database-dump",
     "allow-database-dump-cancel",

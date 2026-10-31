@@ -17,6 +17,7 @@ import {
   parseImportJson,
   requiredGaps,
   suggestMapping,
+  type ImportSeed,
   type ParsedImport,
 } from "./import";
 import { parseImportXlsx } from "./xlsx";
@@ -26,6 +27,7 @@ const props = defineProps<{
   target: TableTarget;
   schema: TableSchema;
   tables?: { schema: string; table: string }[];
+  seed?: ImportSeed | null;
 }>();
 
 const emit = defineEmits<{
@@ -46,6 +48,8 @@ const parseError = ref("");
 const resultText = ref("");
 const writing = ref(false);
 const describing = ref(false);
+/** 拖放接进来时展示来源文件名，提示内容已读取、仍可另选文件。 */
+const droppedName = ref("");
 
 const choices = computed(() => {
   const list = [...(props.tables ?? [])];
@@ -74,25 +78,32 @@ function keyOf(schema: string, table: string): string {
   return `${schema}\u0000${table}`;
 }
 
-watch(
-  () => props.open,
-  (open) => {
-    if (!open) return;
-    lastText.value = "";
-    lastBytes.value = null;
-    parsed.value = null;
-    mapping.value = {};
-    parseError.value = "";
-    resultText.value = "";
-    format.value = "csv";
-    delimiter.value = ",";
-    writing.value = false;
-    localSchema.value = props.schema;
-    localTarget.value = props.target;
-    tableKey.value = keyOf(props.target.schema, props.target.table);
-  },
-  { immediate: true },
-);
+/** 打开时的复位；拖放 seed 在复位后直接走 applyText，与手动选文件同一条解析路径。 */
+function resetForOpen(): void {
+  lastText.value = "";
+  lastBytes.value = null;
+  parsed.value = null;
+  mapping.value = {};
+  parseError.value = "";
+  resultText.value = "";
+  format.value = "csv";
+  delimiter.value = ",";
+  writing.value = false;
+  localSchema.value = props.schema;
+  localTarget.value = props.target;
+  tableKey.value = keyOf(props.target.schema, props.target.table);
+  droppedName.value = props.seed?.fileName ?? "";
+  if (props.seed) {
+    format.value = props.seed.format;
+    delimiter.value = props.seed.delimiter ?? ",";
+    lastText.value = props.seed.text;
+    applyText(props.seed.text);
+  }
+}
+
+watch(() => props.open, (open) => {
+  if (open) resetForOpen();
+});
 
 watch(format, (next) => {
   parsed.value = null;
@@ -229,6 +240,9 @@ async function confirm() {
     writing.value = false;
   }
 }
+
+// 初次挂载即按 open 状态复位（原先由 immediate watch 承担，移到声明之后以便 seed 能用同一套 computed）。
+resetForOpen();
 </script>
 
 <template>
@@ -264,6 +278,7 @@ async function confirm() {
         <label class="ex-path">选择文件
           <input type="file" aria-label="导入文件" accept=".csv,.tsv,.json,.txt,.xlsx,text/csv,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" :disabled="writing" @change="onFile" />
         </label>
+        <p v-if="droppedName" class="ex-note" data-dropped-file>已读取拖放的 {{ droppedName }}。也可以另选文件重新解析。</p>
         <p v-if="parsed && gaps.length" class="ex-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>必填字段 {{ gaps.join("、") }} 没有对应列，不能开始写入。</p>
         <table v-if="parsed" class="map-table">
           <thead><tr><th>表字段</th><th>文件列</th></tr></thead>

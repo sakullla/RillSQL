@@ -78,6 +78,54 @@ describe("import into an existing table", () => {
     wrapper.unmount();
   });
 
+  it("seeds a dropped csv without choosing a file and imports through the same mapping", async () => {
+    invoke.mockResolvedValue({
+      applied: [
+        { id: "import-1", sql: "INSERT", label: "新增 1 行" },
+        { id: "import-2", sql: "INSERT", label: "新增 1 行" },
+      ],
+      failed: null,
+      pendingIds: [],
+      rolledBack: false,
+      rule: "按顺序逐条提交，遇到错误即停止；已成功的语句不撤销。",
+    });
+    const wrapper = mount(ImportDialog, {
+      props: {
+        open: true,
+        target,
+        schema,
+        tables: [{ schema: "public", table: "customers" }],
+        seed: { format: "csv", text: "name,email,note\r\n甲,a@example.com,\r\n乙,b@example.com,备注", fileName: "rows.csv" },
+      },
+    });
+    expect(wrapper.get("[data-dropped-file]").text()).toContain("rows.csv");
+    expect(wrapper.text()).toContain("将写入 2 行");
+    await wrapper.get(".btn.primary").trigger("click");
+    await flushPromises();
+    const call = invoke.mock.calls.find((item) => item[0] === "grid_commit");
+    const changes = call?.[1].request.changes as { values: { column: string; value: string | null }[] }[];
+    expect(changes).toHaveLength(2);
+    expect(changes[0]?.values).toEqual(expect.arrayContaining([{ column: "name", value: "甲" }, { column: "email", value: "a@example.com" }]));
+    wrapper.unmount();
+  });
+
+  it("seeds a dropped json array under the json format without re-reading a file", async () => {
+    const wrapper = mount(ImportDialog, {
+      props: {
+        open: true,
+        target,
+        schema,
+        tables: [{ schema: "public", table: "customers" }],
+        seed: { format: "json", text: "[{\"name\":\"甲\",\"email\":\"a@example.com\"}]", fileName: "rows.json" },
+      },
+    });
+    expect((wrapper.get("input[value='json']").element as HTMLInputElement).checked).toBe(true);
+    expect(wrapper.get("[data-dropped-file]").text()).toContain("rows.json");
+    expect(wrapper.text()).toContain("将写入 1 行");
+    expect(invoke).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
   it("does not write when import is cancelled or a required column is missing", async () => {
     const cancelled = dialog();
     await chooseFile(cancelled, "rows.csv", "name,email\r\n甲,a@example.com");

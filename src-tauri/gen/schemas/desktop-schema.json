@@ -465,6 +465,12 @@
           "markdownDescription": "允许在已打开的会话上执行 SQL。"
         },
         {
+          "description": "允许读取拖放到窗口的 CSV/JSON 文件的前段文本用于预览；只读且最多 2 MB，不写入任何数据。",
+          "type": "string",
+          "const": "allow-read-dropped-preview",
+          "markdownDescription": "允许读取拖放到窗口的 CSV/JSON 文件的前段文本用于预览；只读且最多 2 MB，不写入任何数据。"
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

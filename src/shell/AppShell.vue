@@ -8,6 +8,11 @@ import { objectIdentity, type CatalogObjectRef } from "../catalog/object-ref";
 import { isDefinitionKind, objectLabel } from "../catalog/tree";
 import { catalogConnections, catalogLoaded } from "../catalog/store";
 import { listPaletteConnections } from "../connections";
+import DragImportDialog from "../export/DragImportDialog.vue";
+import DragOverlay from "../export/DragOverlay.vue";
+import DragPreview from "../export/DragPreview.vue";
+import { connectDroppedFiles, createDroppedFileHandler, previewBudgetBytes, type DroppedFileState } from "../export/dropped";
+import type { ImportSeed } from "../export/import";
 import { exportTasks, taskStatusText } from "../export/tasks";
 import type { TableTarget } from "../grid/target";
 import type { SavedDraft } from "../history/saved";
@@ -149,6 +154,21 @@ const compareOpen = ref(false);
 const historySection = ref<"runs" | "saved">("runs");
 const saveRequest = ref(0);
 const executeRequest = ref(0);
+
+/** 拖放 CSV/JSON 预览（R9）：Tauri 原生 drag-drop 事件 → 扩展名分流 → 预览 → 继续进导入对话框。 */
+const dragHovering = ref(false);
+const dragState = ref<DroppedFileState | null>(null);
+const dragImport = ref<ImportSeed | null>(null);
+const onDragDrop = createDroppedFileHandler({
+  setState: (state) => {
+    dragState.value = state;
+  },
+  setHovering: (hovering) => {
+    dragHovering.value = hovering;
+  },
+});
+let stopDragDrop: (() => void) | null = null;
+let dragDropAlive = true;
 const currentSavedDraft = computed<SavedDraft | null>(() => {
   const tab = session.activeTab.value;
   if (!tab || tab.kind !== "query") return null;
@@ -494,9 +514,16 @@ onMounted(() => {
     dataDir.value = info?.data_dir ?? null;
   });
   void startCatalog();
+  void connectDroppedFiles(onDragDrop).then((stop) => {
+    if (dragDropAlive) stopDragDrop = stop;
+    else stop?.();
+  });
 });
 
 onBeforeUnmount(() => {
+  dragDropAlive = false;
+  stopDragDrop?.();
+  stopDragDrop = null;
   window.removeEventListener("keydown", onKey);
   window.removeEventListener("hashchange", onHashChange);
   media?.removeEventListener("change", onSchemeChange);
@@ -567,6 +594,15 @@ onBeforeUnmount(() => {
     />
     <CommandPalette :open="session.paletteOpen.value" :mode="session.paletteMode.value" :items="commands" @close="session.closePalette()" @run="runCommand" />
     <CompareDialog v-if="compareOpen" @close="compareOpen = false" @place="onPlaceCompare" />
+    <DragOverlay :active="dragHovering" />
+    <DragPreview
+      :open="dragState !== null"
+      :state="dragState"
+      :budget-bytes="previewBudgetBytes(settings.previewKB)"
+      @cancel="dragState = null"
+      @proceed="seed => { dragImport = seed; dragState = null; }"
+    />
+    <DragImportDialog v-if="dragImport" :seed="dragImport" @close="dragImport = null" />
     <ShortcutHelp :open="session.helpOpen.value" @close="session.closeHelp()" />
     <dialog v-if="closePrompt.open" ref="closeDialog" class="modal" aria-labelledby="close-guard-title" @cancel.prevent="chooseStay">
       <div class="modal-head">

@@ -3,6 +3,7 @@ mod compare;
 mod connections;
 mod ddl;
 mod diagram;
+mod dropped;
 mod dump;
 mod grid;
 mod migrate;
@@ -43,6 +44,7 @@ fn wire<R: tauri::Runtime>(builder: tauri::Builder<R>, state: connections::comma
     builder.manage(state).manage(query_state).invoke_handler(tauri::generate_handler![
         app_info,
         native_export::export_write_loaded,
+        dropped::read_dropped_preview,
         connections::commands::connections_list,
         connections::commands::connections_save,
         connections::commands::connections_delete,
@@ -171,6 +173,9 @@ mod tests {
     /// 跨库迁移（R8）的命令同样要三件套齐备：lib.rs 注册、权限清单、能力文件。
     const MIGRATE_COMMANDS: &[&str] = &["migrate_data", "migrate_cancel"];
 
+    /// 拖放预览（R9）的命令同样要三件套齐备：lib.rs 注册、权限清单、能力文件。
+    const DROPPED_COMMANDS: &[&str] = &["read_dropped_preview"];
+
     #[test]
     fn title_names_the_product() {
         assert_eq!(product::TITLE, "澄库 · RillSQL");
@@ -225,6 +230,23 @@ mod tests {
             assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
             assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
             assert!(wire.contains(&format!("migrate::commands::{command}")), "{command}");
+        }
+    }
+
+    #[test]
+    fn main_window_registers_dropped_commands() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capability: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("capabilities/default.json")).unwrap()).unwrap();
+        let permissions = capability["permissions"].as_array().unwrap();
+        let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
+        let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        let wire = registration.split("fn wire").nth(1).unwrap_or("");
+        let wire = wire.split("pub fn run").next().unwrap_or("");
+        for command in DROPPED_COMMANDS {
+            let allow = format!("allow-{}", command.replace('_', "-"));
+            assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
+            assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
+            assert!(wire.contains(&format!("dropped::{command}")), "{command}");
         }
     }
 

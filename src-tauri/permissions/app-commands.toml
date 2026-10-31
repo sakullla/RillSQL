@@ -214,6 +214,11 @@ description = "允许删除一条本机保存的查询。"
 commands.allow = ["query_saved_delete"]
 
 [[permission]]
+identifier = "allow-read-dropped-preview"
+description = "允许读取拖放到窗口的 CSV/JSON 文件的前段文本用于预览；只读且最多 2 MB，不写入任何数据。"
+commands.allow = ["read_dropped_preview"]
+
+[[permission]]
 identifier = "allow-export-write-loaded"
 description = "允许把已经读取的 CSV 数据保存到用户选择的本地文件。"
 commands.allow = ["export_write_loaded"]
