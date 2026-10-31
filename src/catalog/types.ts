@@ -1,6 +1,8 @@
+import type { Engine } from "../engines";
+
 export const DEFAULT_OBJECT_PAGE = 100;
 
-export type Engine = "postgres" | "mysql" | "mariadb" | "sqlite";
+export type { Engine };
 export type EnvTone = "dev" | "test" | "prod" | "local" | "none";
 export type ConnStatus = "connected" | "disconnected" | "connecting" | "error" | "lost";
 export type ObjectKind = "table" | "view" | "function" | "procedure" | "trigger" | "sequence" | "enum" | "domain";

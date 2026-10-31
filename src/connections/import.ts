@@ -1,4 +1,5 @@
 import type { SaveOutcome } from "./api";
+import { ENGINES } from "../engines";
 import { blankDraft, engineMeta, type ConnectionDraft, type Engine, type SavedConnection, type SecretInput } from "./model";
 
 export interface ImportNote {
@@ -59,34 +60,27 @@ function field(source: Record<string, unknown>, key: string): string {
   return "";
 }
 
+/** 导入格式里的引擎别名换算到 ENGINES 的 id；支持的引擎集合以元数据表为准。 */
+const ENGINE_ALIASES: Record<string, Engine> = { postgresql: "postgres" };
+
+function matchEngine(raw: string): EngineHit | null {
+  const key = raw.trim().toLowerCase();
+  if (!key) return null;
+  const alias = ENGINE_ALIASES[key];
+  const id = alias ?? (ENGINES.some((engine) => engine.id === key) ? (key as Engine) : undefined);
+  return id ? { kind: "supported", engine: id } : null;
+}
+
 function classify(raw: string): EngineHit {
   const trimmed = raw.trim();
   if (!trimmed) return { kind: "none" };
   const jdbc = /jdbc:([A-Za-z0-9]+):/.exec(trimmed);
   if (jdbc) {
-    const scheme = jdbc[1];
-    switch (scheme.toLowerCase()) {
-      case "postgresql":
-        return { kind: "supported", engine: "postgres" };
-      case "mysql":
-        return { kind: "supported", engine: "mysql" };
-      case "mariadb":
-        return { kind: "supported", engine: "mariadb" };
-      case "sqlite":
-        return { kind: "supported", engine: "sqlite" };
-      default:
-        return { kind: "other", token: scheme };
-    }
+    return matchEngine(jdbc[1]) ?? { kind: "other", token: jdbc[1] };
   }
+  const hit = matchEngine(trimmed);
+  if (hit) return hit;
   switch (trimmed.toLowerCase()) {
-    case "postgresql":
-      return { kind: "supported", engine: "postgres" };
-    case "mysql":
-      return { kind: "supported", engine: "mysql" };
-    case "mariadb":
-      return { kind: "supported", engine: "mariadb" };
-    case "sqlite":
-      return { kind: "supported", engine: "sqlite" };
     case "generic":
     case "custom":
     case "unknown":
@@ -109,19 +103,9 @@ function resolveEngine(provider: string, driver: string, url: string): EngineHit
 }
 
 function navicatEngine(connType: string): EngineHit {
-  switch (connType.trim().toUpperCase()) {
-    case "MYSQL":
-      return { kind: "supported", engine: "mysql" };
-    case "MARIADB":
-      return { kind: "supported", engine: "mariadb" };
-    case "POSTGRESQL":
-    case "POSTGRES":
-      return { kind: "supported", engine: "postgres" };
-    case "SQLITE":
-      return { kind: "supported", engine: "sqlite" };
-    default:
-      return connType.trim() ? { kind: "other", token: connType.trim() } : { kind: "none" };
-  }
+  const hit = matchEngine(connType);
+  if (hit) return hit;
+  return connType.trim() ? { kind: "other", token: connType.trim() } : { kind: "none" };
 }
 
 function enginePhrase(token: string): string {

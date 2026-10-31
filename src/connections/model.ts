@@ -1,4 +1,8 @@
-export type Engine = "mysql" | "mariadb" | "postgres" | "sqlite";
+import { ENGINES, engineMeta, type Engine } from "../engines";
+
+export { ENGINES, engineMeta };
+export type { Engine };
+
 export type EnvTone = "dev" | "test" | "prod" | "local";
 export type TlsMode = "off" | "require" | "verify";
 export type CaMode = "system" | "file";
@@ -68,13 +72,6 @@ export interface SavedConnection {
   sshHostKey?: string | null;
 }
 
-export const ENGINES: { id: Engine; label: string; short: string; port: string }[] = [
-  { id: "postgres", label: "PostgreSQL", short: "PG", port: "5432" },
-  { id: "mysql", label: "MySQL", short: "MY", port: "3306" },
-  { id: "mariadb", label: "MariaDB", short: "MA", port: "3306" },
-  { id: "sqlite", label: "SQLite", short: "SQL", port: "" },
-];
-
 export const ENV_NONE = "none";
 
 export interface EnvTag {
@@ -90,10 +87,6 @@ export const TONES: { id: EnvTone; label: string }[] = [
   { id: "prod", label: "红色" },
   { id: "local", label: "紫色" },
 ];
-
-export function engineMeta(engine: Engine) {
-  return ENGINES.find((item) => item.id === engine) ?? ENGINES[0];
-}
 
 export function presentEnv(env: string, tags: readonly EnvTag[]): { label: string; tone: EnvTone | "none" } {
   if (!env || env === ENV_NONE) return { label: "无标签", tone: "none" };

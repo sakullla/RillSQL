@@ -4,6 +4,7 @@ import type { OpenOutcome } from "../connections/api";
 import { fetchDefinition, focusDatabase, listConnections, openConnection } from "./backend";
 import { browseSql, qualifiedObjectName, type CatalogObjectRef } from "./object-ref";
 import type { DiagramOpen } from "../diagram/types";
+import { engineMeta } from "../engines";
 import SchemaBlock from "./SchemaBlock.vue";
 import { catalogConnections, catalogLoadError, refreshCatalog, schemaKey, setStructureFocus } from "./store";
 import { engineShape, isConnected, isDefinitionKind, KIND_LABEL, objectKey, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
@@ -57,8 +58,6 @@ const ICONS = {
   trash: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6",
 } as const;
 
-const ENGINE_SHORT = { postgres: "PG", mysql: "My", mariadb: "Ma", sqlite: "SQ" } as const;
-const ENGINE_LABEL = { postgres: "PostgreSQL", mysql: "MySQL", mariadb: "MariaDB", sqlite: "SQLite" } as const;
 const STATUS_TEXT = {
   connected: "已连接",
   disconnected: "未连接",
@@ -495,13 +494,13 @@ onBeforeUnmount(() => {
           tabindex="0"
           :style="depthStyle(0)"
           :aria-expanded="open(`c:${connection.id}`)"
-          :title="`${connection.name} · ${ENGINE_LABEL[connection.engine]} · ${STATUS_TEXT[connection.status]}`"
+          :title="`${connection.name} · ${engineMeta(connection.engine).label} · ${STATUS_TEXT[connection.status]}`"
           @click="onConnectionRow(connection)"
         >
           <span class="tw" @click.stop="toggle(`c:${connection.id}`)">
             <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="open(`c:${connection.id}`) ? ICONS.down : ICONS.right" /></svg>
           </span>
-          <span class="eng" :class="`eng-${connection.engine}`">{{ ENGINE_SHORT[connection.engine] }}</span>
+          <span class="eng" :class="`eng-${connection.engine}`">{{ engineMeta(connection.engine).short }}</span>
           <span class="tr-name">{{ connection.name }}</span>
           <span v-if="connection.env !== 'none' && connection.envTone !== 'none'" class="env xs" :class="`env-${connection.envTone}`">{{ connection.envLabel }}</span>
           <span class="conn-acts">

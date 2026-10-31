@@ -2,35 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Engine {
-    Postgres,
-    Mysql,
-    Mariadb,
-    Sqlite,
-}
-
-impl Engine {
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "postgres" => Ok(Self::Postgres),
-            "mysql" => Ok(Self::Mysql),
-            "mariadb" => Ok(Self::Mariadb),
-            "sqlite" => Ok(Self::Sqlite),
-            other => Err(format!("不支持的数据库 {other}")),
-        }
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Postgres => "postgres",
-            Self::Mysql => "mysql",
-            Self::Mariadb => "mariadb",
-            Self::Sqlite => "sqlite",
-        }
-    }
-}
+pub use crate::connections::model::Engine;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {

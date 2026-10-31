@@ -339,21 +339,3 @@ fn render(notes: &[String], statements: &[String], incomplete: bool) -> String {
     }
     lines.join("\n")
 }
-
-trait ParseGridEngine {
-    fn parse(value: &str) -> Result<Self, String>
-    where
-        Self: Sized;
-}
-
-impl ParseGridEngine for GridEngine {
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "postgres" => Ok(Self::Postgres),
-            "mysql" => Ok(Self::Mysql),
-            "mariadb" => Ok(Self::Mariadb),
-            "sqlite" => Ok(Self::Sqlite),
-            other => Err(format!("不支持的数据库 {other}")),
-        }
-    }
-}

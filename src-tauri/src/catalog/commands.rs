@@ -92,7 +92,7 @@ pub(crate) async fn load_catalog(
         if connection_id.is_some_and(|id| id != record.saved.id) {
             continue;
         }
-        let engine = map_engine(record.saved.engine);
+        let engine = record.saved.engine;
         let session = service.catalog_session(&record.saved.id);
         let connected = session.is_some();
         let windows: Vec<ObjectWindow> = limits
@@ -218,7 +218,7 @@ async fn saved_engine(state: &ConnectionsState, connection_id: &str) -> Result<E
     saved
         .into_iter()
         .find(|item| item.saved.id == connection_id)
-        .map(|item| map_engine(item.saved.engine))
+        .map(|item| item.saved.engine)
         .ok_or_else(|| "找不到这条连接".to_owned())
 }
 
@@ -229,15 +229,6 @@ fn describe_env(tags: &[EnvTag], id: &str) -> (String, String) {
     match tags.iter().find(|tag| tag.id == id) {
         Some(tag) => (tag.label.clone(), tag.tone.clone()),
         None => ("无标签".to_owned(), ENV_NONE.to_owned()),
-    }
-}
-
-fn map_engine(engine: crate::connections::model::Engine) -> Engine {
-    match engine {
-        crate::connections::model::Engine::Postgres => Engine::Postgres,
-        crate::connections::model::Engine::Mysql => Engine::Mysql,
-        crate::connections::model::Engine::Mariadb => Engine::Mariadb,
-        crate::connections::model::Engine::Sqlite => Engine::Sqlite,
     }
 }
 

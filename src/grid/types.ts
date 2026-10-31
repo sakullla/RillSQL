@@ -1,4 +1,6 @@
-export type Engine = "postgres" | "mysql" | "mariadb" | "sqlite";
+import type { Engine } from "../engines";
+
+export type { Engine };
 export type TableKind = "table" | "view" | "query";
 export type Cell = string | null;
 export type FilterOp = "eq" | "ne" | "contains" | "starts" | "gt" | "lt" | "between" | "in" | "null" | "notnull" | "empty";

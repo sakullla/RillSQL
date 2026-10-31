@@ -3,8 +3,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+/// 全仓唯一的引擎正典：catalog、grid、compare、ddl 等模块从这里 re-export，不另建副本。
 /// MySQL 与 MariaDB 是两种连接，不能因为协议相近而合并。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Engine {
     Mysql,
@@ -23,13 +24,13 @@ impl Engine {
         }
     }
 
-    pub fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Result<Self, String> {
         match value {
-            "mysql" => Some(Engine::Mysql),
-            "mariadb" => Some(Engine::Mariadb),
-            "postgres" => Some(Engine::Postgres),
-            "sqlite" => Some(Engine::Sqlite),
-            _ => None,
+            "mysql" => Ok(Engine::Mysql),
+            "mariadb" => Ok(Engine::Mariadb),
+            "postgres" => Ok(Engine::Postgres),
+            "sqlite" => Ok(Engine::Sqlite),
+            other => Err(format!("不支持的数据库 {other}")),
         }
     }
 

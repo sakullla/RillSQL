@@ -2,13 +2,7 @@ use std::collections::BTreeMap;
 
 use super::sql::{browse_sql, delete_sql, insert_sql, update_sql};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Engine {
-    Postgres,
-    Mysql,
-    Mariadb,
-    Sqlite,
-}
+pub use crate::connections::model::Engine;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Cell {

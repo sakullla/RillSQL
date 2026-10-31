@@ -1,24 +1,9 @@
 pub const DEFAULT_OBJECT_PAGE: usize = 100;
 
-/// MySQL 与 MariaDB 共用库这一层，但仍是两种引擎。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Engine {
-    Postgres,
-    Mysql,
-    Mariadb,
-    Sqlite,
-}
+pub use crate::connections::model::Engine;
 
+/// 目录树的层级形状属于 catalog 语义，直接挂在正典 Engine 上。
 impl Engine {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Engine::Postgres => "postgres",
-            Engine::Mysql => "mysql",
-            Engine::Mariadb => "mariadb",
-            Engine::Sqlite => "sqlite",
-        }
-    }
-
     pub fn shows_databases(self) -> bool {
         !matches!(self, Engine::Sqlite)
     }

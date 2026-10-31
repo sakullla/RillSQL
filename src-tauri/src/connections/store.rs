@@ -357,7 +357,7 @@ fn row_to_tag(row: &sqlx::sqlite::SqliteRow) -> Result<EnvTag, sqlx::Error> {
 }
 
 fn row_to_connection(row: &sqlx::sqlite::SqliteRow) -> Result<SavedConnection, sqlx::Error> {
-    let engine = Engine::parse(row.try_get::<String, _>(2)?.as_str()).ok_or_else(|| sqlx::Error::Protocol("未知引擎".into()))?;
+    let engine = Engine::parse(row.try_get::<String, _>(2)?.as_str()).map_err(|_| sqlx::Error::Protocol("未知引擎".into()))?;
     let env = {
         let value: String = row.try_get(3)?;
         let trimmed = value.trim();

@@ -1,4 +1,6 @@
-export type EngineName = "postgres" | "mysql" | "mariadb" | "sqlite";
+import type { Engine } from "../engines";
+
+export type EngineName = Engine;
 
 export interface ColumnDraft {
   original: string | null;
