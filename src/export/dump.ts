@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { catalogConnections } from "../catalog/store";
+import { engineMeta } from "../engines";
 import type { CatalogConnection, Engine } from "../catalog/types";
 
 /** 全库导出（R7）的请求载荷：结构与 grid_export 的 TableRef 同源，engine 由目录树给出。 */
@@ -75,10 +76,12 @@ function tableNames(connection: CatalogConnection, database: string, schemas: re
   return [...names].sort((left, right) => left.localeCompare(right));
 }
 
-/** 已打开的连接转成对话框可选项；未打开的连接没有会话可复用，不进列表。 */
+/** 已打开的连接转成对话框可选项；未打开的连接没有会话可复用，不进列表。
+ *  能力门控（ADR-2）：kv/document 引擎没有整库导出/迁移，不进列表。 */
 export function dumpConnections(): DumpConnection[] {
   return catalogConnections()
     .filter((connection) => connection.status === "connected")
+    .filter((connection) => engineMeta(connection.engine).relational)
     .map((connection) => ({
       id: connection.id,
       name: connection.name,

@@ -272,3 +272,38 @@ commands.allow = ["redis_rename_key"]
 identifier = "allow-redis-exec"
 description = "允许在 Redis 会话上执行命令并结构化返回结果；KEYS 全量扫描无条件禁用，写删类命令需前端确认。"
 commands.allow = ["redis_exec"]
+
+[[permission]]
+identifier = "allow-mongo-list-databases"
+description = "允许在已打开的 MongoDB 会话上列出数据库与集合数（不含 admin/config/local）。"
+commands.allow = ["mongo_list_databases"]
+
+[[permission]]
+identifier = "allow-mongo-list-collections"
+description = "允许列出 MongoDB 库的集合清单与 estimatedDocumentCount 计数。"
+commands.allow = ["mongo_list_collections"]
+
+[[permission]]
+identifier = "allow-mongo-find-documents"
+description = "允许按 skip/limit 分页读取 MongoDB 集合文档；JSON 过滤在解析阶段返回行列定位错误，非法过滤不发查询。"
+commands.allow = ["mongo_find_documents"]
+
+[[permission]]
+identifier = "allow-mongo-read-document"
+description = "允许按 _id 读取单个 MongoDB 文档并以 relaxed 扩展 JSON 文本返回。"
+commands.allow = ["mongo_read_document"]
+
+[[permission]]
+identifier = "allow-mongo-replace-document"
+description = "允许整体 JSON 覆盖编辑 MongoDB 文档；JSON 校验通过才执行 replace_one。"
+commands.allow = ["mongo_replace_document"]
+
+[[permission]]
+identifier = "allow-mongo-insert-document"
+description = "允许新增 MongoDB 文档；JSON 校验通过才执行 insert_one，返回服务器生成的 _id。"
+commands.allow = ["mongo_insert_document"]
+
+[[permission]]
+identifier = "allow-mongo-delete-document"
+description = "允许按 _id 删除 MongoDB 文档；写删操作需前端二次确认（confirmed 标记）后才执行并返回删除计数。"
+commands.allow = ["mongo_delete_document"]

@@ -15,6 +15,7 @@ const emit = defineEmits<{
   "focused-database": [connectionId: string, database: string];
   "open-diagram": [target: DiagramOpen];
   "open-keys": [connection: CatalogConnection, key: string];
+  "open-docs": [connection: CatalogConnection, database: string, collection: string];
   "new-connection": [];
 }>();
 
@@ -40,6 +41,10 @@ function forwardDiagram(target: DiagramOpen) {
 
 function forwardKeys(connection: CatalogConnection, key: string) {
   emit("open-keys", connection, key);
+}
+
+function forwardDocs(connection: CatalogConnection, database: string, collection: string) {
+  emit("open-docs", connection, database, collection);
 }
 const filter = ref("");
 
@@ -75,7 +80,7 @@ function onPointerDown(event: PointerEvent) {
       <Icon name="search" />
       <input v-model="filter" type="search" placeholder="筛选表" aria-label="筛选表" />
     </label>
-    <ExplorerTree :filter="filter" @open-object="forwardOpen" @open-definition="forwardDefinition" @query-object="forwardQuery" @focused-database="forwardFocus" @open-diagram="forwardDiagram" @open-keys="forwardKeys" @new-connection="emit('new-connection')" />
+    <ExplorerTree :filter="filter" @open-object="forwardOpen" @open-definition="forwardDefinition" @query-object="forwardQuery" @focused-database="forwardFocus" @open-diagram="forwardDiagram" @open-keys="forwardKeys" @open-docs="forwardDocs" @new-connection="emit('new-connection')" />
   </aside>
   <div
     class="sb-resizer"

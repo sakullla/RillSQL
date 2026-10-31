@@ -111,7 +111,7 @@ fn search_clause_compiles_or_like_in_each_engine_dialect() {
             // T-SQL 用括号标识符、NVARCHAR 投影与 N'' 模式串。
             Engine::Sqlserver => ("CAST([id] AS NVARCHAR(MAX))".to_owned(), "CAST([name] AS NVARCHAR(MAX))".to_owned(), "CAST([email] AS NVARCHAR(MAX))".to_owned(), "CAST([joined] AS NVARCHAR(MAX))".to_owned()),
             // 循环只遍历关系型引擎；Redis 没有 SQL 编译。
-            Engine::Redis => unreachable!("Redis 不参与全文搜索方言测试"),
+            Engine::Redis | Engine::Mongodb => unreachable!("专项引擎不参与全文搜索方言测试"),
         };
         let pattern = if engine == Engine::Sqlserver { r#"N'%甲''x%'"# } else { r"'%甲''x%'" };
         assert_eq!(clause, format!("({id} {op} {pattern} ESCAPE '!' OR {name} {op} {pattern} ESCAPE '!' OR {email} {op} {pattern} ESCAPE '!' OR {joined} {op} {pattern} ESCAPE '!')"), "engine {engine:?}");

@@ -245,14 +245,77 @@ try {
   await expect(page.locator('.redis-tab [data-key="rillsql:string:welcome"]')).toBeVisible();
   report.checks.push("Redis: SCAN pagination with cursor, typed value viewers, KEYS refused, FLUSHDB confirm-cancel leaves keys intact");
 
-  // 能力门控：查询目标下拉不出现 Redis 连接（SQL 执行器对 kv 引擎不可达）。
+  // 能力门控：查询目标下拉不出现 Redis/MongoDB 连接（SQL 执行器对 kv/document 引擎不可达）。
   await page.getByRole("button", { name: "新建查询", exact: true }).click();
   await page.locator("[data-action=target]").click();
   const targetNames = await page.getByRole("listbox", { name: "执行目标" }).getByRole("option").allInnerTexts();
   expect(targetNames.some(name => name.includes("缓存 · Redis"))).toBe(false);
+  expect(targetNames.some(name => name.includes("文档 · MongoDB"))).toBe(false);
   expect(targetNames.some(name => name.includes("书店 · 开发"))).toBe(true);
   await page.keyboard.press("Escape");
-  report.checks.push("Capability gating: the SQL executor target list has no redis connection");
+  report.checks.push("Capability gating: the SQL executor target list has no redis or mongodb connection");
+
+  // ---- MongoDB 合成用例（T12）：集合树计数/文档分页/过滤定位/CRUD 断言/选择器 7 项，不依赖 docker ----
+  await expect(tree).toContainText("文档 · MongoDB");
+  const mongoSection = tree.locator('section[data-connection="mongo-docs"]');
+  await expect(mongoSection.locator("[data-mongo-tree]")).toHaveCount(1);
+  // 能力门控：document 引擎没有关系图/SQL 对象入口；集合行是 data-level=collection。
+  await expect(mongoSection.locator('[data-action="open-diagram"]')).toHaveCount(0);
+  await expect(mongoSection.locator('[data-level="object"]')).toHaveCount(0);
+  await expect(mongoSection.locator('[data-level="database"]')).toHaveCount(1);
+  await expect(mongoSection.locator('[data-level="collection"]')).toHaveCount(2);
+  await expect(mongoSection.locator('[data-collection="orders"]')).toContainText("25");
+  await expect(mongoSection.locator('[data-collection="customers"]')).toContainText("3");
+  // 双击集合开文档标签：_id 与顶层字段为列，中文值渲染，计数呈现。
+  await mongoSection.locator('[data-collection="orders"]').dblclick();
+  await expect(page.locator("[data-mongo-collection-title]")).toContainText("rillsql / orders");
+  await expect(page.locator('th[data-column="_id"]')).toHaveCount(1);
+  await expect(page.locator('th[data-column="客户"]')).toHaveCount(1);
+  await expect(page.locator('[data-cell="客户"]').first()).toContainText("林夏");
+  await expect(page.locator("[data-mongo-count]")).toContainText("25");
+  // JSON 过滤：非法过滤给定位提示（line/column），不是静默空结果。
+  await page.locator("[data-field=mongo-filter]").fill('{"status": }');
+  await page.locator("[data-action=mongo-apply-filter]").click();
+  await expect(page.locator("[data-mongo-filter-error]")).toContainText("line 1 column");
+  // 合法过滤只显示匹配文档，计数切换为精确匹配。
+  await page.locator("[data-field=mongo-filter]").fill('{"status": "active"}');
+  await page.locator("[data-action=mongo-apply-filter]").click();
+  await expect(page.locator("[data-mongo-count]")).toContainText("匹配 1");
+  await expect(page.locator("[data-cell=status]").first()).toContainText("active");
+  // 文档查看：JSON 查看器保留扩展 JSON 形态（$oid）。
+  await page.locator("[data-action=mongo-view]").first().click();
+  await expect(page.locator("[data-value-kind=json]")).toContainText("$oid");
+  await page.locator("[data-action=mongo-close-view]").click();
+  // 编辑：非法 JSON 前端拦截，没有发出替换请求。
+  await page.locator("[data-action=mongo-edit]").first().click();
+  await page.locator("[data-field=mongo-editor]").fill('{"status": paid}');
+  await page.locator("[data-action=mongo-editor-save]").click();
+  await expect(page.locator("[data-mongo-editor-error]")).toContainText("JSON 语法错误");
+  expect(await page.evaluate(() => window.__uiCalls.filter(call => call.command === "mongo_replace_document").length)).toBe(0);
+  await page.locator("[data-action=mongo-editor-cancel]").click();
+  // 新增：校验通过提交，报告服务器生成的 _id。
+  await page.locator("[data-action=mongo-insert]").click();
+  await page.locator("[data-field=mongo-editor]").fill('{"status":"new","备注":"加急"}');
+  await page.locator("[data-action=mongo-editor-save]").click();
+  await expect(page.locator("[data-mongo-note]")).toContainText("65f2c1e4a1b2c3d4e5f6f001");
+  // 删除：确认弹层带 _id；取消后没有 confirmed=true 的调用；确认后报告删除计数。
+  await page.locator("[data-action=mongo-delete]").first().click();
+  await expect(page.locator("[data-mongo-confirm-prompt]")).toContainText("$oid");
+  await page.locator("[data-action=mongo-confirm-cancel]").click();
+  expect(await page.evaluate(() => window.__uiCalls.filter(call => call.command === "mongo_delete_document" && call.args.confirmed === true).length)).toBe(0);
+  await page.locator("[data-action=mongo-delete]").first().click();
+  await page.locator("[data-action=mongo-confirm-ok]").click();
+  await expect(page.locator("[data-mongo-note]")).toContainText("已删除 1 篇文档");
+  report.checks.push("MongoDB: collection tree with counts, docs grid with _id columns, located filter errors, JSON edit interception, insert id report, delete confirm with count");
+
+  // R14：引擎选择器最终恰 7 项（无第八项）。
+  await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "连接", exact: true }).click();
+  await page.getByRole("button", { name: "新建连接", exact: true }).click();
+  await expect(page.locator(".ce-engine")).toHaveCount(7);
+  await expect(page.locator(".ce-engine").filter({ hasText: "MongoDB" })).toHaveCount(1);
+  expect(await page.locator(".ce-engine").allInnerTexts().then(list => list.join("|"))).not.toContain("ClickHouse");
+  await page.getByRole("button", { name: "取消", exact: true }).click();
+  report.checks.push("Engine selector shows exactly seven engines with MongoDB and no eighth entry (R14)");
 
   expect(errors).toEqual([]);
   report.checks.push("No browser page errors");

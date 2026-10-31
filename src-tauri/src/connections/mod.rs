@@ -6,7 +6,7 @@ pub(crate) mod export;
 pub(crate) mod forward;
 mod hostkey;
 pub(crate) mod model;
-mod route;
+pub(crate) mod route;
 mod secrets;
 mod service;
 mod stages;

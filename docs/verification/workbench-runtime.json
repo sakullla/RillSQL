@@ -15,11 +15,13 @@
     "SQL Server: plan wraps the statement in a SET SHOWPLAN_ALL batch and renders the rowset as a tree",
     "SQL Server: grid edit preview emits T-SQL with bracket identifiers and N'' literals",
     "Redis: SCAN pagination with cursor, typed value viewers, KEYS refused, FLUSHDB confirm-cancel leaves keys intact",
-    "Capability gating: the SQL executor target list has no redis connection",
+    "Capability gating: the SQL executor target list has no redis or mongodb connection",
+    "MongoDB: collection tree with counts, docs grid with _id columns, located filter errors, JSON edit interception, insert id report, delete confirm with count",
+    "Engine selector shows exactly seven engines with MongoDB and no eighth entry (R14)",
     "No browser page errors"
   ],
   "metrics": {
-    "largeResultReadyMs": 2353,
+    "largeResultReadyMs": 3195,
     "renderedRows": 22,
     "standardDataRowPx": 30
   },

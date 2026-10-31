@@ -110,8 +110,27 @@ services:
     command: ["sh", "/seed/redis-seed.sh"]
     restart: "no"
 
+  # MongoDB 8 夹具（R12）：root 用户密码认证（SCRAM）。官方镜像支持 /docker-entrypoint-initdb.d
+  # 的 .js seed（首次建库时以 root 执行），不需要像 mssql/redis 那样另起 init 容器。
+  mongo:
+    image: mongo:8
+    ports:
+      - "127.0.0.1:27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: rillsql-mongo
+    volumes:
+      - mongo:/data/db
+      - ./init/mongo-seed.js:/docker-entrypoint-initdb.d/mongo-seed.js:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --authenticationDatabase admin -u root -p rillsql-mongo --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
 volumes:
   pg:
   mysql:
   mariadb:
   mssql:
+  mongo:

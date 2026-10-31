@@ -58,7 +58,7 @@ describe("session persistence", () => {
     expect(revived.targetText).toBe("书店 / shop");
   });
 
-  it("snapshots all six tab kinds including the redis keys tab", () => {
+  it("snapshots all seven tab kinds including the mongo docs tab", () => {
     const session = createSession();
     session.openQuery();
     session.openTable({ id: "shop:shop:public:customers", label: "customers", path: "书店 / shop / public", pane: "structure" });
@@ -100,16 +100,81 @@ describe("session persistence", () => {
       status: "connected",
       key: "rillsql:string:welcome",
     });
+    session.openDocs({
+      id: "docs:mongo:rillsql:orders",
+      label: "orders 文档",
+      path: "文档库 / rillsql",
+      connectionId: "mongo",
+      connectionName: "文档库",
+      database: "rillsql",
+      engine: "mongodb",
+      status: "connected",
+      collection: "orders",
+    });
     const tableId = session.tabs.value.find((tab) => tab.kind === "table")!.id;
     session.activeId.value = tableId;
 
     const snapshot = snapshotSession(session.tabs.value, session.activeId.value);
-    expect(snapshot.tabs.map((tab) => tab.kind)).toEqual(["query", "table", "structure", "definition", "diagram", "keys"]);
+    expect(snapshot.tabs.map((tab) => tab.kind)).toEqual(["query", "table", "structure", "definition", "diagram", "keys", "docs"]);
     expect(snapshot.activeId).toBe(tableId);
     // keys 标签的目标连接与选中键进快照（T3 快照已支持全 TabKind）。
     const keysTab = snapshot.tabs.find((tab) => tab.kind === "keys")!;
     expect(keysTab.connectionId).toBe("cache");
     expect(keysTab.redisKey).toBe("rillsql:string:welcome");
+    // docs 标签的库与集合进快照（R12：docs 标签随会话恢复）。
+    const docsTab = snapshot.tabs.find((tab) => tab.kind === "docs")!;
+    expect(docsTab.connectionId).toBe("mongo");
+    expect(docsTab.docDatabase).toBe("rillsql");
+    expect(docsTab.docCollection).toBe("orders");
+  });
+
+  it("round-trips a mongo docs tab with its database and collection", () => {
+    const session = createSession();
+    session.openDocs({
+      id: "mongo:rillsql:orders",
+      label: "orders 文档",
+      connectionId: "mongo",
+      connectionName: "文档库",
+      database: "rillsql",
+      engine: "mongodb",
+      status: "connected",
+      collection: "orders",
+    });
+    const restored = restoreSession(JSON.stringify(snapshotSession(session.tabs.value, session.tabs.value[0]!.id)));
+    expect(restored?.tabs).toHaveLength(1);
+    const revived = restored!.tabs[0]!;
+    expect(revived.kind).toBe("docs");
+    expect(revived.docDatabase).toBe("rillsql");
+    expect(revived.docCollection).toBe("orders");
+    const session2 = createSession("", restored);
+    const tab = session2.tabs.value[0]!;
+    expect(tab.kind).toBe("docs");
+    expect(tab.doc).toEqual({ database: "rillsql", collection: "orders" });
+    expect(tab.targetText).toBe("文档库 / rillsql / orders");
+    // 再次打开同一集合复用现有标签。
+    session2.openDocs({
+      id: "mongo:rillsql:orders",
+      label: "orders 文档",
+      connectionId: "mongo",
+      connectionName: "文档库",
+      database: "rillsql",
+      engine: "mongodb",
+      status: "connected",
+      collection: "orders",
+    });
+    expect(session2.tabs.value).toHaveLength(1);
+    // 打开同一连接的另一集合是新标签。
+    session2.openDocs({
+      id: "mongo:rillsql:customers",
+      label: "customers 文档",
+      connectionId: "mongo",
+      connectionName: "文档库",
+      database: "rillsql",
+      engine: "mongodb",
+      status: "connected",
+      collection: "customers",
+    });
+    expect(session2.tabs.value).toHaveLength(2);
   });
 
   it("round-trips a redis keys tab with its selected key", () => {

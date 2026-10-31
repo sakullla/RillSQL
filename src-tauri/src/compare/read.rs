@@ -338,6 +338,7 @@ async fn fetch_page(session: &CatalogSession, schema: &TableSchema, offset: u64,
         CatalogSession::Sqlserver(client) => fetch_sqlserver(client, &sql).await?,
         // Redis 没有关系型表读取：对比入口对 kv 引擎不可达（capability 门控）。
         CatalogSession::Redis(_) => return Err("Redis 没有表数据对比；键值引擎不进对比。".to_owned()),
+        CatalogSession::Mongo(_) => return Err("MongoDB 没有表数据对比；文档引擎不进对比。".to_owned()),
     };
     let mut rows = Vec::new();
     for cells in matrix {

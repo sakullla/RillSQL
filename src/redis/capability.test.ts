@@ -37,9 +37,9 @@ function postgresConnection(): CatalogConnection {
 }
 
 describe("engine capability gating (ADR-2 / R11)", () => {
-  it("keeps ENGINES at six entries with redis as the only kv engine", () => {
-    expect(ENGINES).toHaveLength(6);
-    expect(ENGINES.map((item) => item.id)).toEqual(["postgres", "mysql", "mariadb", "sqlserver", "sqlite", "redis"]);
+  it("keeps ENGINES at seven entries with redis as the only kv engine (R14 final set)", () => {
+    expect(ENGINES).toHaveLength(7);
+    expect(ENGINES.map((item) => item.id)).toEqual(["postgres", "mysql", "mariadb", "sqlserver", "sqlite", "redis", "mongodb"]);
     expect(engineMeta("redis")).toMatchObject({ relational: false, document: false, kv: true });
     expect(ENGINES.filter((item) => item.kv).map((item) => item.id)).toEqual(["redis"]);
   });

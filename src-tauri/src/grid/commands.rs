@@ -257,6 +257,7 @@ fn engine_name(engine: super::store::Engine) -> &'static str {
         super::store::Engine::Sqlite => "sqlite",
         super::store::Engine::Sqlserver => "sqlserver",
         super::store::Engine::Redis => "redis",
+        super::store::Engine::Mongodb => "mongodb",
     }
 }
 

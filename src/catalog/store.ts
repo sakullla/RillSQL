@@ -1,5 +1,5 @@
 import { shallowRef, reactive } from "vue";
-import { presentEnv, type EnvTag, type SavedConnection } from "../connections/model";
+import { engineMeta, presentEnv, type EnvTag, type SavedConnection } from "../connections/model";
 import { loadSettings } from "../shell/settings";
 import { fetchCatalog, fetchPage, fetchSessions, listConnections, listEnvTags, type ObjectLimit, type SessionStatusInfo } from "./backend";
 import { describeStructure } from "../structure/api";
@@ -485,6 +485,8 @@ export function listPaletteTables(): PaletteTable[] {
   const tables: PaletteTable[] = [];
   for (const connection of connections.value) {
     if (connection.status !== "connected") continue;
+    // 能力门控（ADR-2）：kv/document 引擎没有表网格，“打开表”快捷面板只列关系引擎。
+    if (!engineMeta(connection.engine).relational) continue;
     for (const database of connection.databases) {
       for (const schema of database.schemas) {
         if (schema.error && schema.objects.length === 0) continue;

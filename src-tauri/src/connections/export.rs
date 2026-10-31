@@ -225,6 +225,7 @@ mod tests {
                 auth: SshAuthKind::Key,
                 key_path: Some("C:/ssh/id_ed25519".to_owned()),
             }),
+            replica_set: None,
             // 已保存密码的连接：导出后必须既没有值也没有标志。
             password_saved: true,
             ssh_password_saved: true,
@@ -244,6 +245,7 @@ mod tests {
             file_path: Some("C:/data/notes.sqlite".to_owned()),
             tls: None,
             ssh: None,
+            replica_set: None,
             password_saved: false,
             ssh_password_saved: false,
         }

@@ -116,6 +116,7 @@ pub async fn describe(session: &CatalogSession, database: &str, schema: &str, ta
         CatalogSession::Scripted => Err(no_channel()),
         // Redis 是键值专项引擎（R11）：不经 TableTarget→grid_describe 的 SQL 通路。
         CatalogSession::Redis(_) => Err("Redis 没有表数据网格；请使用键浏览器。".to_owned()),
+        CatalogSession::Mongo(_) => Err("MongoDB 没有表数据网格；请使用集合文档浏览器。".to_owned()),
         CatalogSession::Sqlite { pool, .. } => {
             if !database.is_empty() && database != "main" {
                 return Err(other_database("main", database));
@@ -487,6 +488,7 @@ async fn stream_statement(
         CatalogSession::Scripted => failed_message(no_channel()),
         // Redis 不参与五格式导出（capability 门控）；误入时明确拒绝。
         CatalogSession::Redis(_) => failed_message("Redis 没有表数据导出；请使用键浏览器。".to_owned()),
+        CatalogSession::Mongo(_) => failed_message("MongoDB 没有表数据导出；请使用集合文档浏览器。".to_owned()),
         CatalogSession::Sqlite { pool, .. } => {
             let names = match known_names {
                 Some(names) => names,
@@ -1253,7 +1255,7 @@ fn count_sql(schema: &TableSchema, filters: &[Filter], search: Option<&str>) -> 
         Engine::Sqlite | Engine::Mysql | Engine::Mariadb => "COUNT(*)",
         Engine::Sqlserver => "CAST(COUNT_BIG(*) AS BIGINT)",
         // Redis 没有表网格；TableSchema 不会带这个引擎（describe 已拒绝）。
-        Engine::Redis => "COUNT(*)",
+        Engine::Redis | Engine::Mongodb => "COUNT(*)",
     };
     Ok(format!("SELECT {count} FROM {}{clause}", sql::qualified_name(schema)))
 }
@@ -1316,6 +1318,7 @@ pub async fn fetch_cells(session: &CatalogSession, sql: &str, width: usize) -> R
     match session {
         CatalogSession::Scripted => Err(no_channel()),
         CatalogSession::Redis(_) => Err("Redis 没有 SQL 行读取；数据经键浏览专项通路。".to_owned()),
+        CatalogSession::Mongo(_) => Err("MongoDB 没有 SQL 行读取；文档经集合浏览器分页。".to_owned()),
         CatalogSession::Sqlite { pool, .. } => {
             let rows = sqlx::query(audited(sql)).fetch_all(pool).await.map_err(db_err)?;
             rows.iter().map(|row| read_width(row, width, sqlite_cell)).collect()
@@ -1342,6 +1345,7 @@ async fn fetch_count(session: &CatalogSession, sql: &str) -> Result<i64, String>
     match session {
         CatalogSession::Scripted => Err(no_channel()),
         CatalogSession::Redis(_) => Err("Redis 没有 SQL 计数；键空间计数走专项通路。".to_owned()),
+        CatalogSession::Mongo(_) => Err("MongoDB 没有 SQL 计数；文档计数走 estimatedDocumentCount。".to_owned()),
         CatalogSession::Sqlite { pool, .. } => sqlx::query_scalar(audited(sql)).fetch_one(pool).await.map_err(db_err),
         CatalogSession::Mysql(pool) => {
             let (_names, rows) = mysql_rows(pool, sql).await?;
@@ -1368,6 +1372,7 @@ async fn execute_sql(session: &CatalogSession, sql: &str) -> Result<u64, String>
     match session {
         CatalogSession::Scripted => Err(no_channel()),
         CatalogSession::Redis(_) => Err("Redis 不执行 SQL；命令经 redis_exec 专项通道。".to_owned()),
+        CatalogSession::Mongo(_) => Err("MongoDB 不执行 SQL；文档操作经 mongo_* 专项通道。".to_owned()),
         CatalogSession::Sqlite { pool, .. } => sqlx::query(audited(sql)).execute(pool).await.map(|done| done.rows_affected()).map_err(db_err),
         CatalogSession::Mysql(pool) => {
             let mut conn = pool.get_conn().await.map_err(db_err)?;

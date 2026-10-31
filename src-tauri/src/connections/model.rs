@@ -14,6 +14,7 @@ pub enum Engine {
     Sqlite,
     Sqlserver,
     Redis,
+    Mongodb,
 }
 
 impl Engine {
@@ -25,6 +26,7 @@ impl Engine {
             Engine::Sqlite => "sqlite",
             Engine::Sqlserver => "sqlserver",
             Engine::Redis => "redis",
+            Engine::Mongodb => "mongodb",
         }
     }
 
@@ -36,6 +38,7 @@ impl Engine {
             "sqlite" => Ok(Engine::Sqlite),
             "sqlserver" => Ok(Engine::Sqlserver),
             "redis" => Ok(Engine::Redis),
+            "mongodb" => Ok(Engine::Mongodb),
             other => Err(format!("不支持的数据库 {other}")),
         }
     }
@@ -47,6 +50,7 @@ impl Engine {
             Engine::Postgres => Some(5432),
             Engine::Sqlserver => Some(1433),
             Engine::Redis => Some(6379),
+            Engine::Mongodb => Some(27017),
             Engine::Sqlite => None,
         }
     }
@@ -56,9 +60,9 @@ impl Engine {
         !matches!(self, Engine::Sqlite)
     }
 
-    /// Redis 是键值专项引擎：没有 SQL 执行、表网格、结构编辑、对比或导出等关系面。
+    /// Redis 与 MongoDB 是专项引擎：没有 SQL 执行、表网格、结构编辑、对比或导出等关系面。
     pub fn is_relational(self) -> bool {
-        !matches!(self, Engine::Redis)
+        !matches!(self, Engine::Redis | Engine::Mongodb)
     }
 
     pub fn label_zh(self) -> &'static str {
@@ -69,7 +73,14 @@ impl Engine {
             Engine::Sqlite => "SQLite",
             Engine::Sqlserver => "SQL Server",
             Engine::Redis => "Redis",
+            Engine::Mongodb => "MongoDB",
         }
+    }
+
+    /// MongoDB 的主机字段也可以直接填 mongodb:// / mongodb+srv:// 连接串；此时端口字段不参与。
+    pub fn host_is_mongo_uri(host: &str) -> bool {
+        let lowered = host.trim().to_ascii_lowercase();
+        lowered.starts_with("mongodb://") || lowered.starts_with("mongodb+srv://")
     }
 }
 
@@ -231,6 +242,8 @@ pub struct SavedConnection {
     pub database: Option<String>,
     pub username: Option<String>,
     pub file_path: Option<String>,
+    /// MongoDB 专用：replicaSet 连接串参数。其余引擎恒为 None。
+    pub replica_set: Option<String>,
     pub tls: Option<TlsSettings>,
     pub ssh: Option<SshSettings>,
     pub password_saved: bool,
@@ -303,6 +316,8 @@ pub struct ConnectionDraft {
     pub database: String,
     pub username: String,
     pub file_path: String,
+    /// MongoDB 专用：replicaSet 名（可选）。
+    pub replica_set: String,
     pub tls_mode: TlsMode,
     pub ca_mode: CaMode,
     pub ca_file: String,
@@ -338,6 +353,7 @@ impl ConnectionDraft {
             database: String::new(),
             username: String::new(),
             file_path: String::new(),
+            replica_set: String::new(),
             tls_mode: if engine.is_remote() {
                 TlsMode::Verify
             } else {
@@ -391,6 +407,7 @@ fn normalize_sqlite(draft: &ConnectionDraft, id: String) -> Result<SavedConnecti
         database: None,
         username: None,
         file_path: Some(file_path.to_owned()),
+        replica_set: None,
         tls: None,
         ssh: None,
         password_saved: false,
@@ -407,18 +424,24 @@ fn normalize_remote(draft: &ConnectionDraft, id: String) -> Result<SavedConnecti
             message: "请填写主机".to_owned(),
         });
     }
-    let port = match parse_port(&draft.port) {
-        Some(port) => Some(port),
-        None => {
-            errors.push(FieldError {
-                field: "port".to_owned(),
-                message: "端口应为 1–65535".to_owned(),
-            });
-            None
+    // MongoDB 的主机字段可以是完整 mongodb:// 连接串：地址和端口都在串里，端口字段不再必填。
+    let mongo_uri = draft.engine == Engine::Mongodb && Engine::host_is_mongo_uri(host);
+    let port = if mongo_uri {
+        draft.port.trim().parse::<u16>().ok().filter(|port| *port != 0).or(Some(27017))
+    } else {
+        match parse_port(&draft.port) {
+            Some(port) => Some(port),
+            None => {
+                errors.push(FieldError {
+                    field: "port".to_owned(),
+                    message: "端口应为 1–65535".to_owned(),
+                });
+                None
+            }
         }
     };
     let username = draft.username.trim();
-    if username.is_empty() && draft.engine != Engine::Redis {
+    if username.is_empty() && !matches!(draft.engine, Engine::Redis | Engine::Mongodb) {
         errors.push(FieldError {
             field: "username".to_owned(),
             message: "请填写用户名".to_owned(),
@@ -497,9 +520,10 @@ fn normalize_remote(draft: &ConnectionDraft, id: String) -> Result<SavedConnecti
         host: Some(host),
         port,
         database: nonempty(&draft.database),
-        // Redis 允许无 ACL 用户名（密码认证）；关系引擎已在上面的校验里要求非空。
+        // Redis 允许无 ACL 用户名（密码认证）；MongoDB 允许无认证直连（本地开发）；关系引擎已在上面的校验里要求非空。
         username: if username.is_empty() { None } else { Some(username.to_owned()) },
         file_path: None,
+        replica_set: if draft.engine == Engine::Mongodb { nonempty(&draft.replica_set) } else { None },
         tls,
         ssh,
         password_saved: false,

@@ -466,6 +466,163 @@ pub(crate) fn redis_stage(mode: TlsMode, err: &redis::RedisError) -> StageError 
     stages::fail(text, "连接已终止，没有自动改用另一种加密方式重试。")
 }
 
+pub struct MongoOpen {
+    pub client: mongodb::Client,
+    pub version: String,
+}
+
+/// MongoDB 连接（R12）。主机字段两种形态：
+/// · host/port：装配 ClientOptions（SCRAM 凭据、authSource=认证库、replicaSet 参数、TLS 三档）；
+/// · mongodb:// 或 mongodb+srv:// 整串：交给驱动解析，表单的认证库/副本集/TLS 档仅在串里没写对应参数时补齐，
+///   串里带用户名而没带密码时用 keyring 密码补上（密码永远不落连接串之外的配置）。
+/// 建连后探活：ping 确认会话可用，buildInfo 取版本横幅。任何一档失败都不降级重试。
+pub async fn open_mongo(config: &SavedConnection, route: &Route, password: &str) -> Result<MongoOpen, StageError> {
+    let mut options = mongo_client_options(config, route, password)
+        .await
+        .map_err(|err| mongo_stage(route.tls_mode, &err))?;
+    options.server_selection_timeout = Some(Duration::from_secs(15));
+    let client = mongodb::Client::with_options(options.clone()).map_err(|err| mongo_stage(route.tls_mode, &err))?;
+    let admin = client.database("admin");
+    let pong = admin
+        .run_command(mongodb::bson::doc! { "ping": 1 })
+        .await
+        .map_err(|err| mongo_stage(route.tls_mode, &err))?;
+    if pong.get_i32("ok") != Ok(1) && pong.get_f64("ok") != Ok(1.0) {
+        return Err(stages::fail(format!("ping 返回了 {pong:?}"), "探活没有通过，连接没有建立为可用会话。"));
+    }
+    let build = client
+        .database("admin")
+        .run_command(mongodb::bson::doc! { "buildInfo": 1 })
+        .await
+        .map_err(|err| mongo_stage(route.tls_mode, &err))?;
+    let version = build
+        .get_str("version")
+        .map(|value| format!("MongoDB {value}"))
+        .unwrap_or_else(|_| "MongoDB 未知版本".to_owned());
+    Ok(MongoOpen { client, version })
+}
+
+/// 装配 MongoDB ClientOptions。装配函数（不联网，plain mongodb:// 串解析也不发 DNS 查询），
+/// 供单测核对主机/凭据/副本集/TLS 三档。
+pub(crate) async fn mongo_client_options(
+    config: &SavedConnection,
+    route: &Route,
+    password: &str,
+) -> Result<mongodb::options::ClientOptions, mongodb::error::Error> {
+    if Engine::host_is_mongo_uri(config.host.as_deref().unwrap_or_default()) {
+        let mut options = mongodb::options::ClientOptions::parse(config.host.clone().unwrap_or_default()).await?;
+        // 串里带了用户名但没带密码：用 keyring/本次输入的密码补上，密码不回写连接串。
+        let needs_password = options
+            .credential
+            .as_ref()
+            .is_some_and(|credential| credential.username.is_some() && credential.password.is_none());
+        if needs_password && !password.is_empty() {
+            if let Some(credential) = options.credential.as_mut() {
+                credential.password = Some(password.to_owned());
+            }
+        }
+        // 表单的 TLS 三档只在串里没有 tls 参数时生效（连接串写过的参数优先）。
+        if options.tls.is_none() {
+            options.tls = mongo_tls(config);
+        }
+        if options.repl_set_name.is_none() {
+            options.repl_set_name = config.replica_set.clone().filter(|name| !name.trim().is_empty());
+        }
+        return Ok(options);
+    }
+    let mut options = mongodb::options::ClientOptions::builder().build();
+    options.hosts = vec![mongodb::options::ServerAddress::Tcp {
+        host: route.transport_host.clone(),
+        port: Some(route.transport_port),
+    }];
+    options.app_name = Some("RillSQL".to_owned());
+    if let Some(replica_set) = config.replica_set.as_deref().filter(|name| !name.trim().is_empty()) {
+        options.repl_set_name = Some(replica_set.trim().to_owned());
+    }
+    let username = config.username.as_deref().unwrap_or("").trim();
+    if !username.is_empty() {
+        // SCRAM 凭据：机制留空由服务器协商（SCRAM-SHA-256 优先），认证库默认 admin。
+        let mut credential = mongodb::options::Credential::default();
+        credential.username = Some(username.to_owned());
+        credential.password = (!password.is_empty()).then(|| password.to_owned());
+        credential.source = config
+            .database
+            .as_deref()
+            .map(str::trim)
+            .filter(|source| !source.is_empty())
+            .map(|source| source.to_owned());
+        options.credential = Some(credential);
+    }
+    options.tls = mongo_tls(config);
+    Ok(options)
+}
+
+/// TLS 三档映射：Off=不启用；Require=启用但不核对证书；Verify=启用并核对（CA 文件或 webpki 内置根）。
+fn mongo_tls(config: &SavedConnection) -> Option<mongodb::options::Tls> {
+    let mode = config.tls.as_ref().map(|tls| tls.mode).unwrap_or(TlsMode::Off);
+    match mode {
+        TlsMode::Off => None,
+        TlsMode::Require => Some(mongodb::options::Tls::Enabled(
+            mongodb::options::TlsOptions::builder().allow_invalid_certificates(true).build(),
+        )),
+        TlsMode::Verify => {
+            let mut tls_options = mongodb::options::TlsOptions::builder().allow_invalid_certificates(false).build();
+            if let Some(tls) = config.tls.as_ref() {
+                if tls.ca_mode == CaMode::File {
+                    if let Some(path) = tls.ca_file.as_deref().filter(|path| !path.trim().is_empty()) {
+                        tls_options.ca_file_path = Some(PathBuf::from(path));
+                    }
+                }
+                if let (Some(cert), Some(key)) = (&tls.client_cert, &tls.client_key) {
+                    if !cert.trim().is_empty() && !key.trim().is_empty() {
+                        // 驱动把证书与私钥放在同一个 PEM 文件里：两处路径都指向用户提供的材料时取证书文件。
+                        tls_options.cert_key_file_path = Some(PathBuf::from(cert));
+                    }
+                }
+            }
+            Some(mongodb::options::Tls::Enabled(tls_options))
+        }
+    }
+}
+
+/// MongoDB 连接错误分类：TCP / 认证 / TLS 分开报，不降级重试（与 redis_stage 同纪律）。
+pub(crate) fn mongo_stage(mode: TlsMode, err: &mongodb::error::Error) -> StageError {
+    let text = err.to_string();
+    let lowered = text.to_ascii_lowercase();
+    let is_auth = matches!(&*err.kind, mongodb::error::ErrorKind::Authentication { .. })
+        || matches!(&*err.kind, mongodb::error::ErrorKind::Command(command) if command.code == 18 || command.code == 13 || command.code == 33)
+        || lowered.contains("authentication")
+        || lowered.contains("auth failed")
+        || lowered.contains("scram")
+        || text.contains("认证");
+    if is_auth {
+        return stages::fail(text, "请检查 MongoDB 用户名和密码（认证库默认 admin）。");
+    }
+    if matches!(&*err.kind, mongodb::error::ErrorKind::InvalidTlsConfig { .. })
+        || lowered.contains("certificate")
+        || lowered.contains("tls")
+        || lowered.contains("ssl")
+        || text.contains("证书")
+    {
+        let _ = route::on_tls_failure(mode);
+        return stages::fail(text, "连接已终止。没有降级为不加密或不验证后重试。");
+    }
+    if matches!(
+        &*err.kind,
+        mongodb::error::ErrorKind::Io(_)
+            | mongodb::error::ErrorKind::ServerSelection { .. }
+            | mongodb::error::ErrorKind::ConnectionPoolCleared { .. }
+            | mongodb::error::ErrorKind::DnsResolve { .. }
+    ) || lowered.contains("timed out")
+        || lowered.contains("timeout")
+        || lowered.contains("refused")
+        || lowered.contains("connection")
+    {
+        return stages::fail(text, "网络连接失败，没有改用加密连接重试。");
+    }
+    stages::fail(text, "连接已终止，没有自动改用另一种加密方式重试。")
+}
+
 pub async fn open_postgres(config: &SavedConnection, route: &Route, password: &str) -> Result<PostgresOpen, StageError> {
     let plan = route::postgres_tls_plan(route).map_err(|err| stages::fail(err, "没有改用转发器地址做证书校验。"))?;
     if plan.verify_hostname && plan.host == "127.0.0.1" && route.tls_server_name.as_deref() != Some("127.0.0.1") {

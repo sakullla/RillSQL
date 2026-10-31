@@ -140,6 +140,18 @@ impl HealthProbe for SelectOneProbe {
                     Err(format!("PING 返回了 {pong}"))
                 }
             }
+            CatalogSession::Mongo(client) => {
+                let reply = client
+                    .database("admin")
+                    .run_command(mongodb::bson::doc! { "ping": 1 })
+                    .await
+                    .map_err(|err| err.to_string())?;
+                if reply.get_f64("ok") == Ok(1.0) || reply.get_i32("ok") == Ok(1) {
+                    Ok(())
+                } else {
+                    Err(format!("ping 返回了 {reply:?}"))
+                }
+            }
         }
     }
 }
@@ -158,6 +170,8 @@ enum SessionKind {
     Postgres(Arc<tokio_postgres::Client>),
     Sqlserver(Arc<tokio::sync::Mutex<TdsClient>>),
     Redis(Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>),
+    /// mongodb::Client 内部共享连接池，克隆廉价；库/集合/文档操作共用这一个句柄。
+    Mongo(mongodb::Client),
     Scripted,
 }
 
@@ -296,6 +310,10 @@ pub enum CancelTransport {
     Redis {
         health: Arc<SessionHealth>,
     },
+    /// MongoDB 文档操作同样没有会话级取消通道；只承载共享健康句柄（R4 探活消费）。
+    Mongo {
+        health: Arc<SessionHealth>,
+    },
     None,
 }
 
@@ -322,7 +340,7 @@ impl CancelTransport {
 
     pub fn health(&self) -> Option<&Arc<SessionHealth>> {
         match self {
-            Self::Sqlite(_, health) | Self::Mysql { health, .. } | Self::Postgres { health, .. } | Self::Sqlserver { health, .. } | Self::Redis { health } => {
+            Self::Sqlite(_, health) | Self::Mysql { health, .. } | Self::Postgres { health, .. } | Self::Sqlserver { health, .. } | Self::Redis { health } | Self::Mongo { health } => {
                 Some(health)
             }
             Self::None => None,
@@ -337,6 +355,7 @@ impl CancelTransport {
             Self::Postgres { health: slot, .. } => *slot = health,
             Self::Sqlserver { health: slot, .. } => *slot = health,
             Self::Redis { health: slot } => *slot = health,
+            Self::Mongo { health: slot } => *slot = health,
             Self::None => {}
         }
     }
@@ -387,6 +406,8 @@ pub enum CatalogSession {
     Sqlserver(Arc<tokio::sync::Mutex<TdsClient>>),
     /// Redis 单条多路复用连接：键浏览、值读取与命令行共用，经互斥锁串行。
     Redis(Arc<tokio::sync::Mutex<redis::aio::MultiplexedConnection>>),
+    /// MongoDB 客户端：库/集合目录与文档 CRUD 共用（驱动内部自带连接池）。
+    Mongo(mongodb::Client),
     Scripted,
 }
 
@@ -700,6 +721,7 @@ impl Service {
             postgres: None,
             sqlserver: None,
             redis: None,
+            mongo: None,
             schema_note: None,
             foreign_keys: None,
             cancel: CancelTransport::None,
@@ -849,6 +871,7 @@ impl Service {
             postgres: None,
             sqlserver: None,
             redis: None,
+            mongo: None,
             schema_note: None,
             foreign_keys: None,
             cancel: CancelTransport::None,
@@ -881,6 +904,8 @@ impl Service {
                 SessionKind::Sqlserver(Arc::new(tokio::sync::Mutex::new(client)))
             } else if let Some(conn) = attempt.redis.take() {
                 SessionKind::Redis(Arc::new(tokio::sync::Mutex::new(conn)))
+            } else if let Some(client) = attempt.mongo.take() {
+                SessionKind::Mongo(client)
             } else {
                 SessionKind::Scripted
             };
@@ -958,6 +983,7 @@ impl Service {
             SessionKind::Postgres(client) => CatalogSession::Postgres(Arc::clone(client)),
             SessionKind::Sqlserver(client) => CatalogSession::Sqlserver(Arc::clone(client)),
             SessionKind::Redis(conn) => CatalogSession::Redis(Arc::clone(conn)),
+            SessionKind::Mongo(client) => CatalogSession::Mongo(client.clone()),
             SessionKind::Scripted => CatalogSession::Scripted,
         })
     }
@@ -976,6 +1002,21 @@ impl Service {
         session.health.note_activity();
         match &session.kind {
             SessionKind::Redis(conn) => Some((Arc::clone(conn), Arc::clone(&session.health))),
+            _ => None,
+        }
+    }
+
+    /// MongoDB 会话句柄：库/集合浏览与文档 CRUD 共用这一个客户端（驱动内部连接池）。
+    /// 返回共享的健康句柄供执行路径报告断线（R4 探活消费）。
+    pub fn mongo_session(&self, id: &str) -> Option<(mongodb::Client, std::sync::Arc<SessionHealth>)> {
+        let sessions = self.sessions.lock().expect("sessions");
+        let session = sessions.get(id)?;
+        if session.health.is_lost() {
+            return None;
+        }
+        session.health.note_activity();
+        match &session.kind {
+            SessionKind::Mongo(client) => Some((client.clone(), Arc::clone(&session.health))),
             _ => None,
         }
     }
@@ -1117,8 +1158,8 @@ impl Service {
             );
             return;
         };
-        // Redis 可以无密码直连：没有保存密码不阻止自动重连；其余远程引擎仍要求已保存密码。
-        let passwordless_ok = matches!(config.engine, Engine::Sqlite | Engine::Redis);
+        // Redis / MongoDB 都可以无认证直连（本地开发常见）：没有保存密码不阻止自动重连；其余远程引擎仍要求已保存密码。
+        let passwordless_ok = matches!(config.engine, Engine::Sqlite | Engine::Redis | Engine::Mongodb);
         if !passwordless_ok && !config.password_saved {
             self.finish_reconnect(
                 id,
@@ -1268,6 +1309,7 @@ fn clone_catalog_handle(kind: &SessionKind) -> CatalogSession {
         SessionKind::Postgres(client) => CatalogSession::Postgres(Arc::clone(client)),
         SessionKind::Sqlserver(client) => CatalogSession::Sqlserver(Arc::clone(client)),
         SessionKind::Redis(conn) => CatalogSession::Redis(Arc::clone(conn)),
+        SessionKind::Mongo(client) => CatalogSession::Mongo(client.clone()),
         SessionKind::Scripted => CatalogSession::Scripted,
     }
 }
@@ -1408,6 +1450,7 @@ struct Attempt {
     postgres: Option<tokio_postgres::Client>,
     sqlserver: Option<TdsClient>,
     redis: Option<redis::aio::MultiplexedConnection>,
+    mongo: Option<mongodb::Client>,
     schema_note: Option<String>,
     foreign_keys: Option<bool>,
     cancel: CancelTransport,
@@ -1515,10 +1558,15 @@ impl Attempt {
         }
         let tls_mode = self.tls_mode();
         // Redis 允许无密码直连（本地开发常见）：空密码不是“凭据缺失”，照常建连。
+        // MongoDB 无用户名时同样是无认证直连；有用户名而没有密码仍按凭据缺失报错。
         let empty_password;
         let password = match self.password.as_ref() {
             Some(secret) => secret,
             None if self.config.engine == Engine::Redis => {
+                empty_password = Secret::new("");
+                &empty_password
+            }
+            None if self.config.engine == Engine::Mongodb && self.config.username.as_deref().unwrap_or("").trim().is_empty() => {
                 empty_password = Secret::new("");
                 &empty_password
             }
@@ -1588,6 +1636,13 @@ impl Attempt {
                     health: Arc::new(SessionHealth::default()),
                 };
                 self.redis = Some(opened.conn);
+                opened.version
+            }),
+            Engine::Mongodb => drivers::open_mongo(&self.config, &route, &password).await.map(|opened| {
+                self.cancel = CancelTransport::Mongo {
+                    health: Arc::new(SessionHealth::default()),
+                };
+                self.mongo = Some(opened.client);
                 opened.version
             }),
             Engine::Sqlite => Err(stages::fail("SQLite 不走远程连接", "未执行")),
@@ -1683,6 +1738,20 @@ impl Attempt {
                 "密码认证".to_owned()
             } else {
                 format!("ACL 用户 {user}")
+            };
+            return self.finish_stage(StageKind::DatabaseAuthentication, || note);
+        }
+        if self.config.engine == Engine::Mongodb {
+            let source = self
+                .config
+                .database
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "admin".to_owned());
+            let note = if user.is_empty() {
+                "无认证直连".to_owned()
+            } else {
+                format!("SCRAM 用户 {user}（认证库 {source}）")
             };
             return self.finish_stage(StageKind::DatabaseAuthentication, || note);
         }
@@ -1872,6 +1941,7 @@ pub(crate) async fn report_canned_remote(config: SavedConnection, canned: Canned
         postgres: None,
         sqlserver: None,
         redis: None,
+        mongo: None,
         schema_note: None,
         foreign_keys: None,
         cancel: CancelTransport::None,

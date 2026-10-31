@@ -466,6 +466,8 @@ impl LiveDriver {
             CatalogSession::Scripted => Attached::Scripted,
             // Redis 没有 SQL 执行器（capability 门控）：命令行经 redis_exec 专项通道。
             CatalogSession::Redis(_) => return Err("Redis 不执行 SQL；命令在键浏览器里输入。".to_owned()),
+            // MongoDB 不做 SQL 面（R12）：文档在集合浏览器里查看与编辑。
+            CatalogSession::Mongo(_) => return Err("MongoDB 不执行 SQL；文档在集合浏览器里查看。".to_owned()),
             CatalogSession::Sqlite { pool, .. } => match database_gate("sqlite", "main", database) {
                 DatabaseGate::Refuse => return Err(refuse_message("main", database)),
                 _ => Attached::Sqlite(pool),

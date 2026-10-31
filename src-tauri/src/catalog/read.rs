@@ -117,6 +117,19 @@ pub async fn read_catalog_session(engine: Engine, session: &CatalogSession, page
             foreign_keys: None,
             databases: Vec::new(),
         },
+        // MongoDB（R12）：库列表 + 每库集合清单（estimatedDocumentCount 作为行估算），复用 MySQL 的 databases/无 schema 形状。
+        (Engine::Mongodb, CatalogSession::Mongo(client)) => match read_mongo(client, page, windows).await {
+            Ok(databases) => ConnectionBody {
+                error: None,
+                foreign_keys: None,
+                databases,
+            },
+            Err(message) => ConnectionBody {
+                error: Some(message),
+                foreign_keys: None,
+                databases: Vec::new(),
+            },
+        },
         (_, CatalogSession::Scripted) => ConnectionBody {
             error: Some(scripted_message()),
             foreign_keys: None,
@@ -178,6 +191,18 @@ pub async fn read_catalog_outline(engine: Engine, session: &CatalogSession) -> C
                 databases: Vec::new(),
             },
         },
+        (Engine::Mongodb, CatalogSession::Mongo(client)) => match read_mongo_outline(client).await {
+            Ok(databases) => ConnectionBody {
+                error: None,
+                foreign_keys: None,
+                databases,
+            },
+            Err(message) => ConnectionBody {
+                error: Some(message),
+                foreign_keys: None,
+                databases: Vec::new(),
+            },
+        },
         (_, CatalogSession::Scripted) => ConnectionBody {
             error: Some(scripted_message()),
             foreign_keys: None,
@@ -208,6 +233,7 @@ pub async fn read_object_page(session: &CatalogSession, engine: Engine, database
         CatalogSession::Postgres(client) => read_postgres_page(client, database, schema, offset, limit).await,
         CatalogSession::Sqlserver(client) => read_sqlserver_page(client, database, schema, offset, limit).await,
         CatalogSession::Redis(_) => empty_page("Redis 键空间经键浏览器分页读取，不走对象分页。"),
+        CatalogSession::Mongo(client) => read_mongo_page(client, database, offset, limit).await,
     }
 }
 
@@ -231,6 +257,7 @@ pub async fn read_definition(
         CatalogSession::Postgres(client) => read_postgres_definition(client, schema, name, kind, signature, relation).await,
         CatalogSession::Sqlserver(client) => read_sqlserver_definition(client, schema, name, kind).await,
         CatalogSession::Redis(_) => Err(definition_failure("Redis 没有对象定义")),
+        CatalogSession::Mongo(_) => Err(definition_failure("MongoDB 集合没有 SQL 定义；文档在集合浏览器查看")),
     }
 }
 
@@ -522,6 +549,101 @@ async fn read_mysql_definition(pool: &mysql_async::Pool, engine: Engine, databas
 
 fn quote_mysql(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
+}
+
+async fn read_mongo(client: &mongodb::Client, page: usize, windows: &[ObjectWindow]) -> Result<Vec<DatabaseNode>, String> {
+    let mut names = client.list_database_names().await.map_err(read_failure)?;
+    names.retain(|name| !crate::mongo::docs::catalog_hidden(name));
+    names.sort();
+    let mut databases = Vec::new();
+    for name in names {
+        let limit = requested_limit(&name, "", windows, page);
+        databases.push(read_mongo_database(client, &name, 0, limit).await);
+    }
+    Ok(databases)
+}
+
+async fn read_mongo_outline(client: &mongodb::Client) -> Result<Vec<DatabaseNode>, String> {
+    let mut names = client.list_database_names().await.map_err(read_failure)?;
+    names.retain(|name| !crate::mongo::docs::catalog_hidden(name));
+    names.sort();
+    Ok(names
+        .into_iter()
+        .map(|name| DatabaseNode {
+            name,
+            error: None,
+            schemas: vec![SchemaNode::empty("")],
+        })
+        .collect())
+}
+
+async fn read_mongo_page(client: &mongodb::Client, database: &str, offset: usize, limit: usize) -> ObjectPageBody {
+    let schema = read_mongo_objects(client, database, offset, limit).await;
+    ObjectPageBody {
+        objects: schema.objects,
+        total: schema.total,
+        error: schema.error,
+        kind_reports: schema.kind_reports,
+    }
+}
+
+async fn read_mongo_database(client: &mongodb::Client, database: &str, offset: usize, limit: usize) -> DatabaseNode {
+    let schema = read_mongo_objects(client, database, offset, limit).await;
+    DatabaseNode {
+        name: database.to_owned(),
+        error: None,
+        schemas: vec![schema],
+    }
+}
+
+/// 集合清单 + estimatedDocumentCount 计数（树上的行估算）。计数失败不拖垮清单，只让估算留空。
+async fn read_mongo_objects(client: &mongodb::Client, database: &str, offset: usize, limit: usize) -> SchemaNode {
+    let mut names = match client.database(database).list_collection_names().await {
+        Ok(names) => names,
+        Err(message) => {
+            let error = read_failure(message);
+            return SchemaNode {
+                name: String::new(),
+                objects: Vec::new(),
+                total: 0,
+                error: Some(error),
+                kind_reports: Vec::new(),
+            };
+        }
+    };
+    names.sort();
+    let total = names.len();
+    let window = offset.saturating_add(limit);
+    let mut objects = Vec::new();
+    for name in names.into_iter().take(window).skip(offset) {
+        let estimated = client
+            .database(database)
+            .collection::<mongodb::bson::Document>(&name)
+            .estimated_document_count()
+            .await
+            .ok()
+            .and_then(|count| i64::try_from(count).ok());
+        objects.push(ObjectRow {
+            name,
+            kind: ObjectKind::Table,
+            estimated_rows: known_row_estimate(estimated),
+            stale: false,
+            signature: String::new(),
+            relation: String::new(),
+            materialized: false,
+        });
+    }
+    SchemaNode {
+        name: String::new(),
+        objects,
+        total,
+        error: None,
+        kind_reports: vec![KindReport {
+            kind: ObjectKind::Table,
+            total,
+            error: None,
+        }],
+    }
 }
 
 fn mysql_create_sql(row: &mysql_async::Row, index: usize) -> Result<String, String> {

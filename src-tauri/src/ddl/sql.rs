@@ -12,7 +12,7 @@ pub fn quote_ident(engine: Engine, name: &str) -> String {
         }
         Engine::Sqlserver => format!("[{}]", name.replace(']', "]]")),
         // Redis 没有结构编辑（capability 门控），占位保持穷尽。
-        Engine::Redis => format!("\"{}\"", name.replace('"', "\"\"")),
+        Engine::Redis | Engine::Mongodb => format!("\"{}\"", name.replace('"', "\"\"")),
     }
 }
 
@@ -20,6 +20,7 @@ pub fn qualified_table(engine: Engine, database: &str, schema: &str, table: &str
     match engine {
         // Redis 没有结构编辑（capability 门控）。
         Engine::Redis => return Err("Redis 没有结构编辑。".to_owned()),
+        Engine::Mongodb => return Err("MongoDB 没有结构编辑。".to_owned()),
         Engine::Sqlite => {
             if !database.is_empty() && database != "main" {
                 return Err(format!("当前连接打开的是 main，没有另开连接修改 {database}"));
@@ -148,7 +149,7 @@ pub fn valid_type(engine: Engine, raw: &str) -> bool {
         Engine::Mysql | Engine::Mariadb => MYSQL_TYPES.iter().any(|item| *item == base),
         Engine::Sqlserver => SQLSERVER_TYPES.iter().any(|item| *item == base),
         // Redis 没有列类型（不进结构编辑）。
-        Engine::Redis => false,
+        Engine::Redis | Engine::Mongodb => false,
     }
 }
 

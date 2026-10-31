@@ -5,6 +5,7 @@ import { fetchDefinition, focusDatabase, listConnections, openConnection } from 
 import { browseSql, qualifiedObjectName, type CatalogObjectRef } from "./object-ref";
 import type { DiagramOpen } from "../diagram/types";
 import { engineMeta } from "../engines";
+import MongoTreeCollections from "../mongo/MongoTreeCollections.vue";
 import RedisTreeKeys from "../redis/RedisTreeKeys.vue";
 import type { RedisApi } from "../redis/api";
 import SchemaBlock from "./SchemaBlock.vue";
@@ -20,6 +21,7 @@ const emit = defineEmits<{
   "focused-database": [connectionId: string, database: string];
   "open-diagram": [target: DiagramOpen];
   "open-keys": [connection: CatalogConnection, key: string];
+  "open-docs": [connection: CatalogConnection, database: string, collection: string];
   "new-connection": [];
 }>();
 const menu = ref<{ object: CatalogObjectRef; x: number; y: number; notice: string } | null>(null);
@@ -267,6 +269,12 @@ function closeMenu() {
 function openObject(object: CatalogObjectRef | null, pane: "data" | "structure", section?: "columns" | "drop") {
   if (!object || object.stale) {
     if (object?.stale && pane === "structure") structureNotice.value = `${object.name} 已失效，不能打开结构。`;
+    return;
+  }
+  // MongoDB 集合（含筛选命中行）：打开集合文档标签，不进表网格（document 引擎能力门控）。
+  if (object.engine === "mongodb") {
+    const connection = catalogConnections().find((item) => item.id === object.connectionId);
+    if (connection) emit("open-docs", connection, object.database, object.name);
     return;
   }
   if (pane === "structure") setStructureFocus(null);
@@ -555,6 +563,8 @@ onBeforeUnmount(() => {
           </div>
           <!-- Redis（kv 引擎）：连接节点下直接展开键空间分页列表；没有库/schema/关系图入口（ADR-2/ADR-4）。 -->
           <RedisTreeKeys v-if="connection.engine === 'redis'" :connection="connection" :api="props.redisApi" @open-key="(target, key) => emit('open-keys', target, key)" />
+          <!-- MongoDB（document 引擎）：库 → 集合（estimatedDocumentCount 计数），双击集合开文档标签；没有 SQL/结构/关系图入口（ADR-2/ADR-4）。 -->
+          <MongoTreeCollections v-else-if="connection.engine === 'mongodb'" :connection="connection" @open-collection="(target, database, collection) => emit('open-docs', target, database, collection)" />
           <template v-else-if="!engineShape(connection.engine).databases">
             <div v-if="connection.foreignKeys !== null" class="tree-note subtle" :style="depthStyle(1)" data-foreign-keys>
               <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.info" /></svg>

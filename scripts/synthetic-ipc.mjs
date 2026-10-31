@@ -80,6 +80,23 @@ export function installSyntheticIpc(initialTheme) {
       sshHostKey: null,
     },
     {
+      id: "mongo-docs",
+      name: "文档 · MongoDB",
+      engine: "mongodb",
+      env: "local",
+      host: "127.0.0.1",
+      port: 27017,
+      database: "admin",
+      username: "root",
+      filePath: null,
+      replicaSet: null,
+      tls: { mode: "off", serverName: "127.0.0.1", caMode: "system", caFile: null, clientCert: null, clientKey: null },
+      ssh: null,
+      passwordSaved: true,
+      sshPasswordSaved: false,
+      sshHostKey: null,
+    },
+    {
       id: "sqlite-notes",
       name: "笔记",
       engine: "sqlite",
@@ -162,6 +179,33 @@ export function installSyntheticIpc(initialTheme) {
       error: null,
       // Redis 会话没有库/schema 层级：键空间经 redis_scan_keys 分页读取。
       databases: [],
+    },
+    {
+      id: "mongo-docs",
+      name: "文档 · MongoDB",
+      engine: "mongodb",
+      env: "local",
+      envLabel: "本地",
+      envTone: "local",
+      status: "connected",
+      defaultDatabase: "admin",
+      foreignKeys: null,
+      error: null,
+      // 目录形状复用 MySQL 先例（databases/无 schema）；集合行估算就是文档计数。
+      databases: [
+        {
+          name: "rillsql",
+          error: null,
+          schemas: [
+            {
+              name: "",
+              error: null,
+              total: 2,
+              objects: [object("orders", "table", 25), object("customers", "table", 3)],
+            },
+          ],
+        },
+      ],
     },
     {
       id: "mysql-stock",
@@ -466,6 +510,7 @@ export function installSyntheticIpc(initialTheme) {
             database: draft.database || null,
             username: draft.username || null,
             filePath: draft.filePath || null,
+            replicaSet: draft.engine === "mongodb" ? draft.replicaSet || null : null,
             tls: null,
             ssh: draft.sshOn ? { host: draft.sshHost, port: Number(draft.sshPort || 22), username: draft.sshUser, auth: draft.sshAuth, keyPath: draft.sshKey } : null,
             passwordSaved: Boolean(draft.savePassword),
@@ -548,6 +593,53 @@ export function installSyntheticIpc(initialTheme) {
           return { keyType: "string", ttlMs: -1, value: { kind: "string", text: "" } };
         }
         if (command === "redis_set_ttl") return { applied: 1 };
+        // ---- MongoDB 合成用例（T12）：过滤定位错误/文档 CRUD 断言语义，不依赖 docker ----
+        if (command === "mongo_list_databases") {
+          return [{ name: "rillsql", collections: 2 }];
+        }
+        if (command === "mongo_list_collections") {
+          return [
+            { name: "customers", estimatedDocuments: 3 },
+            { name: "orders", estimatedDocuments: 25 },
+          ];
+        }
+        if (command === "mongo_find_documents") {
+          const filterJson = (args.filterJson ?? "").trim();
+          if (filterJson) {
+            // 与后端一致：语法错误给出行列定位，非法扩展 JSON 给出原因。
+            try {
+              JSON.parse(filterJson);
+            } catch (error) {
+              throw `过滤语法错误：${error.message} at line 1 column 13`;
+            }
+            if (filterJson.includes("$numberLong:5")) {
+              throw "过滤里的扩展 JSON 值不合法：$numberLong must be a string";
+            }
+          }
+          const page = [
+            { idJson: '{"$oid":"65f2c1e4a1b2c3d4e5f61001"}', json: '{"_id":{"$oid":"65f2c1e4a1b2c3d4e5f61001"},"单号":"SO-1001","客户":"林夏","status":"active","总额":17.5,"备注":null}' },
+            { idJson: '{"$oid":"65f2c1e4a1b2c3d4e5f61002"}', json: '{"_id":{"$oid":"65f2c1e4a1b2c3d4e5f61002"},"单号":"SO-1002","客户":"周宁","status":"pending","总额":35}' },
+          ];
+          if (filterJson.includes('"status"') && filterJson.includes("active")) {
+            return { total: 1, documents: page.slice(0, 1) };
+          }
+          return { total: 25, documents: page };
+        }
+        if (command === "mongo_read_document") {
+          return { json: '{"_id":{"$oid":"65f2c1e4a1b2c3d4e5f61001"},"单号":"SO-1001","客户":"林夏","status":"active","总额":17.5}' };
+        }
+        if (command === "mongo_replace_document") {
+          JSON.parse(args.json ?? "{}");
+          return { matched: 1, modified: 1 };
+        }
+        if (command === "mongo_insert_document") {
+          JSON.parse(args.json ?? "{}");
+          return { insertedIdJson: '{"$oid":"65f2c1e4a1b2c3d4e5f6f001"}' };
+        }
+        if (command === "mongo_delete_document") {
+          if (!args.confirmed) throw "删除文档属于写删操作，需要先在界面确认。";
+          return { deleted: 1 };
+        }
         if (command === "redis_delete_keys") {
           if (!args.confirmed) throw "删除 1 个键属于写删操作，需要先在界面确认。";
           return { deleted: 1 };

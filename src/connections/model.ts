@@ -18,6 +18,8 @@ export interface ConnectionDraft {
   database: string;
   username: string;
   filePath: string;
+  /** MongoDB 专用：replicaSet 名（可选，空串=不设置）。 */
+  replicaSet: string;
   tlsMode: TlsMode;
   caMode: CaMode;
   caFile: string;
@@ -65,6 +67,8 @@ export interface SavedConnection {
   database?: string | null;
   username?: string | null;
   filePath?: string | null;
+  /** MongoDB 专用：replicaSet 连接串参数；其余引擎恒为 null。 */
+  replicaSet?: string | null;
   tls?: TlsSettings | null;
   ssh?: SshSettings | null;
   passwordSaved: boolean;
@@ -100,15 +104,16 @@ export function blankDraft(engine: Engine): ConnectionDraft {
   return {
     name: "",
     engine,
-    env: engine === "sqlite" || engine === "redis" ? "local" : "dev",
+    env: engine === "sqlite" || engine === "redis" || engine === "mongodb" ? "local" : "dev",
     host: "",
     port: meta.port,
     // Redis 的“数据库”字段是库索引（SELECT），默认 0 号库。
     database: engine === "redis" ? "0" : "",
     username: "",
     filePath: "",
-    // Redis 自部署多为明文端口（TLS 由 rediss 提供）；默认不加密，避免夹具/本机直连被默认 Verify 挡住。
-    tlsMode: engine === "sqlite" || engine === "redis" ? "off" : "verify",
+    replicaSet: "",
+    // Redis/MongoDB 自部署多为明文端口；默认不加密，避免夹具/本机直连被默认 Verify 挡住。
+    tlsMode: engine === "sqlite" || engine === "redis" || engine === "mongodb" ? "off" : "verify",
     caMode: "system",
     caFile: "",
     clientCert: "",
@@ -131,6 +136,12 @@ export function validateRedisDbIndex(value: string): string | null {
   return null;
 }
 
+/** MongoDB 的主机字段可以填整条 mongodb:// 或 mongodb+srv:// 连接串；此时端口/认证库等以串为准。 */
+export function isMongoUri(host: string): boolean {
+  const lowered = host.trim().toLowerCase();
+  return lowered.startsWith("mongodb://") || lowered.startsWith("mongodb+srv://");
+}
+
 export function draftFromSaved(saved: SavedConnection): ConnectionDraft {
   return {
     id: saved.id,
@@ -142,6 +153,7 @@ export function draftFromSaved(saved: SavedConnection): ConnectionDraft {
     database: saved.database ?? "",
     username: saved.username ?? "",
     filePath: saved.filePath ?? "",
+    replicaSet: saved.replicaSet ?? "",
     tlsMode: saved.engine === "sqlite" ? "off" : (saved.tls?.mode ?? "verify"),
     caMode: saved.tls?.caMode ?? "system",
     caFile: saved.tls?.caFile ?? "",
@@ -164,10 +176,12 @@ export function validate(draft: ConnectionDraft): Record<string, string> {
     return errors;
   }
   if (!draft.host.trim()) errors.host = "请填写主机";
+  // MongoDB 填整条连接串时地址与端口都在串里，端口字段可留空。
+  const mongoUri = draft.engine === "mongodb" && isMongoUri(draft.host);
   const port = Number(draft.port);
-  if (!/^\d+$/.test(draft.port.trim()) || port < 1 || port > 65535) errors.port = "端口应为 1–65535";
-  // Redis 的用户名是 ACL 用户名：密码认证时可留空。
-  if (!draft.username.trim() && draft.engine !== "redis") errors.username = "请填写用户名";
+  if (!mongoUri && (!/^\d+$/.test(draft.port.trim()) || port < 1 || port > 65535)) errors.port = "端口应为 1–65535";
+  // Redis 的用户名是 ACL 用户名（密码认证可留空）；MongoDB 允许无认证直连（本地开发）。
+  if (!draft.username.trim() && draft.engine !== "redis" && draft.engine !== "mongodb") errors.username = "请填写用户名";
   if (draft.engine === "redis") {
     const dbError = validateRedisDbIndex(draft.database);
     if (dbError) errors.database = dbError;
@@ -200,6 +214,7 @@ export function toStoredConfig(draft: ConnectionDraft, id: string): SavedConnect
       database: null,
       username: null,
       filePath,
+      replicaSet: null,
       tls: null,
       ssh: null,
       passwordSaved: false,
@@ -217,6 +232,7 @@ export function toStoredConfig(draft: ConnectionDraft, id: string): SavedConnect
     database: nonempty(draft.database),
     username: draft.username.trim(),
     filePath: null,
+    replicaSet: draft.engine === "mongodb" ? nonempty(draft.replicaSet) : null,
     tls: {
       mode: draft.tlsMode,
       serverName: host,

@@ -51,11 +51,19 @@ impl Store {
                 ssh_auth TEXT,
                 ssh_key_path TEXT,
                 password_saved INTEGER NOT NULL,
-                ssh_password_saved INTEGER NOT NULL
+                ssh_password_saved INTEGER NOT NULL,
+                replica_set TEXT
             )",
         )
         .execute(&self.pool)
         .await?;
+        // 旧配置库补列（MongoDB 副本集参数，R12）；列已存在时报错直接忽略。
+        if let Err(err) = sqlx::query("ALTER TABLE connections ADD COLUMN replica_set TEXT").execute(&self.pool).await {
+            let text = err.to_string();
+            if !text.contains("duplicate column") {
+                return Err(err);
+            }
+        }
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS ssh_host_keys (
                 ssh_host TEXT NOT NULL,
@@ -132,8 +140,8 @@ impl Store {
                 id, name, engine, env, host, port, database_name, username, file_path,
                 tls_mode, tls_server_name, ca_mode, ca_file, client_cert, client_key,
                 ssh_host, ssh_port, ssh_user, ssh_auth, ssh_key_path,
-                password_saved, ssh_password_saved
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+                password_saved, ssh_password_saved, replica_set
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 engine = excluded.engine,
@@ -155,7 +163,8 @@ impl Store {
                 ssh_auth = excluded.ssh_auth,
                 ssh_key_path = excluded.ssh_key_path,
                 password_saved = excluded.password_saved,
-                ssh_password_saved = excluded.ssh_password_saved",
+                ssh_password_saved = excluded.ssh_password_saved,
+                replica_set = excluded.replica_set",
         )
         .bind(&connection.id)
         .bind(&connection.name)
@@ -179,6 +188,7 @@ impl Store {
         .bind(ssh.and_then(|item| item.key_path.clone()))
         .bind(i64::from(u8::from(connection.password_saved)))
         .bind(i64::from(u8::from(connection.ssh_password_saved)))
+        .bind(&connection.replica_set)
         .execute(&self.pool)
         .await?;
         self.checkpoint().await?;
@@ -190,7 +200,7 @@ impl Store {
             "SELECT id, name, engine, env, host, port, database_name, username, file_path,
                     tls_mode, tls_server_name, ca_mode, ca_file, client_cert, client_key,
                     ssh_host, ssh_port, ssh_user, ssh_auth, ssh_key_path,
-                    password_saved, ssh_password_saved
+                    password_saved, ssh_password_saved, replica_set
              FROM connections ORDER BY name",
         )
         .fetch_all(&self.pool)
@@ -203,7 +213,7 @@ impl Store {
             "SELECT id, name, engine, env, host, port, database_name, username, file_path,
                     tls_mode, tls_server_name, ca_mode, ca_file, client_cert, client_key,
                     ssh_host, ssh_port, ssh_user, ssh_auth, ssh_key_path,
-                    password_saved, ssh_password_saved
+                    password_saved, ssh_password_saved, replica_set
              FROM connections WHERE id = ?1",
         )
         .bind(id)
@@ -408,6 +418,7 @@ fn row_to_connection(row: &sqlx::sqlite::SqliteRow) -> Result<SavedConnection, s
         database: row.try_get(6)?,
         username: row.try_get(7)?,
         file_path: row.try_get(8)?,
+        replica_set: row.try_get(22)?,
         tls,
         ssh,
         password_saved: row.try_get::<i64, _>(20)? != 0,

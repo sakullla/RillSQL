@@ -325,6 +325,21 @@ function onOpenKeys(connection: CatalogConnection, key: string) {
   });
 }
 
+function onOpenDocs(connection: CatalogConnection, database: string, collection: string) {
+  if (window.innerWidth <= 960) session.sidebarHidden.value = true;
+  session.openDocs({
+    id: `${connection.id}:${database}:${collection}`,
+    label: `${collection} 文档`,
+    path: objectPath(connection.name, database, ""),
+    connectionId: connection.id,
+    connectionName: connection.name,
+    database,
+    engine: connection.engine,
+    status: "connected",
+    collection,
+  });
+}
+
 function onOpenDiagram(target: DiagramOpen) {
   if (window.innerWidth <= 960) session.sidebarHidden.value = true;
   session.openDiagram({
@@ -563,6 +578,7 @@ onBeforeUnmount(() => {
         @open-definition="onOpenDefinition"
         @open-diagram="onOpenDiagram"
         @open-keys="onOpenKeys"
+        @open-docs="onOpenDocs"
         @query-object="onQueryObject"
         @focused-database="onFocusedDatabase"
         @new-connection="session.showPage('connections')"

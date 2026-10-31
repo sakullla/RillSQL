@@ -143,7 +143,7 @@ fn view_of(engine: Engine, sql: &str) -> Snapshot {
         Engine::Sqlite => Snapshot::bare(Engine::Sqlite, "main", "", "v_notes"),
         Engine::Sqlserver => Snapshot::bare(Engine::Sqlserver, "app", "dbo", "v_notes"),
         // Redis 没有结构编辑（capability 门控），测试不构造该引擎。
-        Engine::Redis => unreachable!("Redis 不参与结构编辑测试"),
+        Engine::Redis | Engine::Mongodb => unreachable!("专项引擎不参与结构编辑测试"),
     };
     snapshot.kind = "view".to_owned();
     snapshot.table_sql = sql.to_owned();

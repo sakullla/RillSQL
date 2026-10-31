@@ -83,6 +83,7 @@ pub async fn run_steps(session: &CatalogSession, steps: &[Step], restore_foreign
     match session {
         // Redis 没有结构编辑：误入时拒绝执行而不是生成无意义语句。
         CatalogSession::Redis(_) => return Err("Redis 没有结构编辑。".to_owned()),
+        CatalogSession::Mongo(_) => return Err("MongoDB 没有结构编辑。".to_owned()),
         CatalogSession::Scripted => Err("这个连接没有连着可查询的数据库。".to_owned()),
         CatalogSession::Sqlite { pool, .. } => run_sqlite(pool, steps, restore_foreign_keys).await,
         CatalogSession::Mysql(pool) => run_mysql(pool, steps).await,

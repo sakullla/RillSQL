@@ -7,6 +7,7 @@ mod dropped;
 mod dump;
 mod grid;
 mod migrate;
+mod mongo;
 mod native_export;
 mod product;
 mod query;
@@ -84,6 +85,13 @@ fn wire<R: tauri::Runtime>(builder: tauri::Builder<R>, state: connections::comma
         redis::commands::redis_delete_keys,
         redis::commands::redis_rename_key,
         redis::commands::redis_exec,
+        mongo::commands::mongo_list_databases,
+        mongo::commands::mongo_list_collections,
+        mongo::commands::mongo_find_documents,
+        mongo::commands::mongo_read_document,
+        mongo::commands::mongo_replace_document,
+        mongo::commands::mongo_insert_document,
+        mongo::commands::mongo_delete_document,
         ddl::commands::ddl_describe,
         ddl::commands::ddl_preview,
         ddl::commands::ddl_execute,
@@ -134,6 +142,8 @@ fn fixed_dependency_markers() -> usize {
         std::any::type_name::<tiberius::EncryptionLevel>(),
         std::any::type_name::<::redis::Client>(),
         std::any::type_name::<::redis::aio::MultiplexedConnection>(),
+        std::any::type_name::<::mongodb::Client>(),
+        std::any::type_name::<mongodb::options::ClientOptions>(),
         std::any::type_name::<tokio_util::compat::Compat<tokio::net::TcpStream>>(),
         std::any::type_name::<keyring::Entry>(),
         std::any::type_name::<russh::client::Config>(),
@@ -155,6 +165,7 @@ fn fixed_dependency_markers() -> usize {
         dump::module_id(),
         migrate::module_id(),
         redis::module_id(),
+        mongo::module_id(),
     ];
     markers.len()
 }
@@ -197,6 +208,17 @@ mod tests {
         "redis_delete_keys",
         "redis_rename_key",
         "redis_exec",
+    ];
+
+    /// MongoDB 集合文档浏览器（R12）的命令同样要三件套齐备：lib.rs 注册、权限清单、能力文件。
+    const MONGO_COMMANDS: &[&str] = &[
+        "mongo_list_databases",
+        "mongo_list_collections",
+        "mongo_find_documents",
+        "mongo_read_document",
+        "mongo_replace_document",
+        "mongo_insert_document",
+        "mongo_delete_document",
     ];
 
     #[test]
@@ -271,6 +293,24 @@ mod tests {
             assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
             assert!(wire.contains(&format!("dropped::{command}")), "{command}");
         }
+    }
+
+    #[test]
+    fn main_window_registers_mongo_commands() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let capability: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("capabilities/default.json")).unwrap()).unwrap();
+        let permissions = capability["permissions"].as_array().unwrap();
+        let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
+        let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        let wire = registration.split("fn wire").nth(1).unwrap_or("");
+        let wire = wire.split("pub fn run").next().unwrap_or("");
+        for command in MONGO_COMMANDS {
+            let allow = format!("allow-{}", command.replace('_', "-"));
+            assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
+            assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
+            assert!(wire.contains(&format!("mongo::commands::{command}")), "{command}");
+        }
+        assert_eq!(super::mongo::module_id(), "mongo");
     }
 
     #[test]

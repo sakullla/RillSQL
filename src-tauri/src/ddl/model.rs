@@ -253,7 +253,7 @@ pub struct StepReceipt {
 pub fn fk_actions(engine: Engine) -> &'static [&'static str] {
     match engine {
         // Redis 没有结构编辑（capability 门控），空清单保持穷尽。
-        Engine::Redis => &[],
+        Engine::Redis | Engine::Mongodb => &[],
         Engine::Mysql | Engine::Mariadb => &["RESTRICT", "CASCADE", "SET NULL", "NO ACTION"],
         Engine::Postgres | Engine::Sqlite | Engine::Sqlserver => &["RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION"],
     }
@@ -270,5 +270,6 @@ pub fn rule_text(engine: Engine, rebuild: bool) -> String {
         Engine::Sqlserver => "这些语句逐条执行，失败即停。已成功的语句不撤销；这里也不把整批包进一个事务，不能据此声称可以整体回滚。".to_owned(),
         // Redis 没有结构编辑（capability 门控）。
         Engine::Redis => "Redis 没有结构编辑。".to_owned(),
+        Engine::Mongodb => "MongoDB 没有结构编辑。".to_owned(),
     }
 }

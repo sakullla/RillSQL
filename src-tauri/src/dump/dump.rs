@@ -257,7 +257,7 @@ impl DumpScope {
             Engine::Postgres => format!("{}.{}", quote_ident(engine, schema), quote_ident(engine, name)),
             Engine::Sqlserver => format!("{}.{}", quote_ident(engine, schema), quote_ident(engine, name)),
             // Redis 不在全库导出面（capability 门控）；占位保持穷尽。
-            Engine::Redis => quote_ident(engine, name),
+            Engine::Redis | Engine::Mongodb => quote_ident(engine, name),
         }
     }
 }
@@ -286,6 +286,7 @@ pub fn engine_name(engine: Engine) -> &'static str {
         Engine::Sqlite => "sqlite",
         Engine::Sqlserver => "sqlserver",
         Engine::Redis => "redis",
+        Engine::Mongodb => "mongodb",
     }
 }
 
@@ -320,6 +321,7 @@ async fn resolve_scope(engine: Engine, session: &CatalogSession, database: &str,
     match engine {
         // Redis 不在全库导出面（capability 门控）。
         Engine::Redis => return Err("Redis 没有整库导出；键空间经键浏览器访问。".to_owned()),
+        Engine::Mongodb => return Err("MongoDB 没有整库导出；集合文档经文档浏览器访问。".to_owned()),
         Engine::Sqlite => {
             if !database.is_empty() && database != "main" {
                 return Err(format!("当前连接打开的是 main，没有另开连接读取 {database}"));
@@ -1069,6 +1071,7 @@ fn write_header(out: &mut BufWriter<File>, engine: Engine, scope: &DumpScope, re
         Engine::Sqlserver => "SQL Server",
         // Redis 不在全库导出面（capability 门控）；占位保持穷尽。
         Engine::Redis => "Redis",
+        Engine::Mongodb => "MongoDB",
     };
     let database = if scope.database.is_empty() { "main".to_owned() } else { scope.database.clone() };
     let schemas = if matches!(engine, Engine::Postgres | Engine::Sqlserver) { scope.schemas.join(", ") } else { String::new() };

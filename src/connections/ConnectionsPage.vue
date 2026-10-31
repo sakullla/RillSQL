@@ -23,6 +23,7 @@ import {
   type SecretInput,
   type TlsMode,
 } from "./model";
+import { isMongoUri } from "./model";
 import { parseConnectionUrl } from "./url";
 import "./connections.css";
 
@@ -675,7 +676,7 @@ watch(
           <footer><span class="conn-state" :class="`st-${connectionState(item.id)}`"><i></i>{{ stateLabels[connectionState(item.id)] }}</span><span class="grow"></span><button v-if="connectionState(item.id) === 'connected'" class="btn sm" type="button" @click.stop="openWorkspace(item)">打开</button><button v-else class="btn sm" type="button" data-action="conn-connect" :disabled="connectionState(item.id) === 'connecting'" @click.stop="requestConnect(item)"><ConnIcon name="plug" />连接</button><button class="icon-btn" type="button" :aria-label="`${item.name} 的更多操作`" data-action="conn-menu" @click.stop="menuId = menuId === item.id ? null : item.id"><ConnIcon name="more" /></button></footer>
           <div v-if="menuId === item.id" class="conn-menu" @click.stop><button type="button" @click="showDetails(item)"><ConnIcon name="info" />连接详情</button><button type="button" data-action="conn-edit" @click="openEditor(item)"><ConnIcon name="pencil" />编辑配置…</button><button v-if="connectionState(item.id) === 'connected'" type="button" @click="disconnect(item)"><ConnIcon name="unplug" />断开连接</button><button type="button" class="danger" data-action="conn-delete" @click="askDelete(item)"><ConnIcon name="trash" />删除配置…</button></div>
         </article>
-        <div v-if="!filtered.length" class="empty"><ConnIcon name="database" /><h3>{{ connections.length ? '没有匹配的连接' : '连接你的第一个数据库' }}</h3><p>{{ connections.length ? '试试其他名称、数据库类型或环境。' : '支持 PostgreSQL、MySQL、MariaDB、SQL Server、SQLite 和 Redis。' }}</p></div>
+        <div v-if="!filtered.length" class="empty"><ConnIcon name="database" /><h3>{{ connections.length ? '没有匹配的连接' : '连接你的第一个数据库' }}</h3><p>{{ connections.length ? '试试其他名称、数据库类型或环境。' : '支持 PostgreSQL、MySQL、MariaDB、SQL Server、SQLite、Redis 和 MongoDB。' }}</p></div>
       </div>
       <div class="connection-note"><ConnIcon name="shield" /><span>连接配置只保存在本机。密码保存在操作系统凭据库；删除连接不会删除数据库或 SQLite 文件。</span></div>
     </div>
@@ -726,10 +727,11 @@ watch(
         </div>
         <div v-else class="form-grid">
           <label class="field full"><span>连接名称</span><input v-model="draft.name" placeholder="例如 Atlas" /></label>
-          <label class="field"><span>主机<em class="req">*</em></span><input v-model="draft.host" class="mono" data-field="host" placeholder="db.example.internal" :aria-invalid="Boolean(fieldErrors.host)" /><small v-if="fieldErrors.host" class="field-err">{{ fieldErrors.host }}</small></label>
-          <label class="field"><span>端口<em class="req">*</em></span><input v-model="draft.port" class="mono" data-field="port" :aria-invalid="Boolean(fieldErrors.port)" /><small v-if="fieldErrors.port" class="field-err">{{ fieldErrors.port }}</small></label>
-          <label class="field"><span>{{ draft.engine === "redis" ? "库索引" : "数据库" }}</span><input v-model="draft.database" class="mono" :placeholder="draft.engine === 'redis' ? '0（默认 0 号库）' : draft.engine === 'postgres' ? 'postgres' : '可选'" :aria-invalid="Boolean(fieldErrors.database)" /><small v-if="fieldErrors.database" class="field-err">{{ fieldErrors.database }}</small><small v-else-if="draft.engine === 'redis'">SELECT 的库编号，单库浏览（不做多库切换 UI）。</small></label>
-          <label class="field"><span>用户名<em v-if="draft.engine !== 'redis'" class="req">*</em></span><input v-model="draft.username" class="mono" data-field="username" :aria-invalid="Boolean(fieldErrors.username)" /><small v-if="fieldErrors.username" class="field-err">{{ fieldErrors.username }}</small><small v-else-if="draft.engine === 'redis'">ACL 用户名；只设密码时留空。</small></label>
+          <label class="field"><span>主机<em class="req">*</em></span><input v-model="draft.host" class="mono" data-field="host" :placeholder="draft.engine === 'mongodb' ? '127.0.0.1 或 mongodb:// 整串' : 'db.example.internal'" :aria-invalid="Boolean(fieldErrors.host)" /><small v-if="fieldErrors.host" class="field-err">{{ fieldErrors.host }}</small><small v-else-if="draft.engine === 'mongodb'">可填主机名，也可直接粘贴 mongodb:// / mongodb+srv:// 连接串（串里的参数优先）。</small></label>
+          <label class="field"><span>端口<em v-if="draft.engine !== 'mongodb' || !isMongoUri(draft.host)" class="req">*</em></span><input v-model="draft.port" class="mono" data-field="port" :aria-invalid="Boolean(fieldErrors.port)" /><small v-if="fieldErrors.port" class="field-err">{{ fieldErrors.port }}</small><small v-else-if="draft.engine === 'mongodb' && isMongoUri(draft.host)">已填连接串时端口以串为准，这里可留空。</small></label>
+          <label class="field"><span>{{ draft.engine === "redis" ? "库索引" : draft.engine === "mongodb" ? "认证库" : "数据库" }}</span><input v-model="draft.database" class="mono" :placeholder="draft.engine === 'redis' ? '0（默认 0 号库）' : draft.engine === 'mongodb' ? 'admin（默认 admin）' : draft.engine === 'postgres' ? 'postgres' : '可选'" :aria-invalid="Boolean(fieldErrors.database)" /><small v-if="fieldErrors.database" class="field-err">{{ fieldErrors.database }}</small><small v-else-if="draft.engine === 'redis'">SELECT 的库编号，单库浏览（不做多库切换 UI）。</small><small v-else-if="draft.engine === 'mongodb'">SCRAM 认证的 authSource；连接串里写过的 authSource 优先。</small></label>
+          <label v-if="draft.engine === 'mongodb'" class="field"><span>副本集（可选）</span><input v-model="draft.replicaSet" class="mono" data-field="replicaSet" placeholder="rs0" /><small>replicaSet 连接参数；连接串里写过的值优先。</small></label>
+          <label class="field"><span>用户名<em v-if="draft.engine !== 'redis' && draft.engine !== 'mongodb'" class="req">*</em></span><input v-model="draft.username" class="mono" data-field="username" :aria-invalid="Boolean(fieldErrors.username)" /><small v-if="fieldErrors.username" class="field-err">{{ fieldErrors.username }}</small><small v-else-if="draft.engine === 'redis'">ACL 用户名；只设密码时留空。</small><small v-else-if="draft.engine === 'mongodb'">SCRAM 用户名；无认证直连（本地开发）时留空。</small></label>
           <label class="field full"><span>密码</span><input v-model="secrets.password" type="password" data-field="password" autocomplete="new-password" /><small>留空则继续使用系统凭据库里已保存的密码。密码不会写入普通配置。</small></label>
           <label class="check full"><input v-model="draft.savePassword" type="checkbox" data-field="savePassword" /><span>把密码保存到系统凭据库<small>不勾选时，每次连接都会询问密码。</small></span></label>
         </div>

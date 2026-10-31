@@ -3,7 +3,7 @@ import type { AppPage } from "../router";
 import { parseHash, toHash } from "../router";
 import { CONNECTION_STATUS_TEXT, type ConnectionStatus } from "./status-text";
 
-export type TabKind = "query" | "table" | "structure" | "definition" | "diagram" | "keys";
+export type TabKind = "query" | "table" | "structure" | "definition" | "diagram" | "keys" | "docs";
 
 export interface DefinitionRequest {
   schema: string;
@@ -33,7 +33,7 @@ export const NEW_QUERY_DRAFT = "";
 
 export const SESSION_KEY = "rillsql.session";
 
-const TAB_KINDS: readonly TabKind[] = ["query", "table", "structure", "definition", "diagram", "keys"];
+const TAB_KINDS: readonly TabKind[] = ["query", "table", "structure", "definition", "diagram", "keys", "docs"];
 
 export function isTabKind(value: unknown): value is TabKind {
   return typeof value === "string" && (TAB_KINDS as readonly string[]).includes(value);
@@ -68,11 +68,27 @@ export interface SessionSnapshotTab {
   diagramSchema?: string | null;
   /** keys 标签（Redis）恢复时选中的键名。 */
   redisKey?: string | null;
+  /** docs 标签（MongoDB）恢复时指向的集合。 */
+  docDatabase?: string | null;
+  docCollection?: string | null;
 }
 
 export interface SessionSnapshot {
   tabs: SessionSnapshotTab[];
   activeId: string | null;
+}
+
+/** MongoDB 集合文档标签（R12）的目标：一条连接 + 库 + 集合。 */
+export interface DocsTarget {
+  id: string;
+  label: string;
+  path?: string;
+  connectionId: string;
+  connectionName: string;
+  database: string;
+  engine: string;
+  status: ConnectionStatus;
+  collection: string;
 }
 
 /** Redis 键浏览器标签（R11）的目标：一条连接 + 可选的初始选中键。 */
@@ -151,6 +167,7 @@ export interface ShellTab {
   definition?: DefinitionRequest | null;
   diagram?: { schema: string } | null;
   redis?: { key: string } | null;
+  doc?: { database: string; collection: string } | null;
   /** 恢复自快照的标签（R2）：只有这类标签按“连接已删”呈现空态。不持久化。 */
   restored?: boolean;
 }
@@ -173,6 +190,7 @@ export interface ShellSession {
   openDefinition: (target: DefinitionTarget) => void;
   openDiagram: (target: DiagramTarget) => void;
   openKeys: (target: RedisTarget) => void;
+  openDocs: (target: DocsTarget) => void;
   setTableView: (id: string, pane: "data" | "structure", section?: "columns" | "drop") => void;
   setDraft: (id: string, draft: string) => void;
   setExecuted: (id: string, sql: string) => void;
@@ -207,6 +225,7 @@ function blankTab(kind: TabKind, id: string, title: string, path: string | null,
     definition: null,
     diagram: null,
     redis: null,
+    doc: null,
   };
 }
 
@@ -250,6 +269,8 @@ export function snapshotSession(tabs: readonly ShellTab[], activeId: string | nu
       definition: tab.definition ? { ...tab.definition } : null,
       diagramSchema: tab.kind === "diagram" ? tab.diagram?.schema ?? null : null,
       redisKey: tab.kind === "keys" ? tab.redis?.key ?? null : null,
+      docDatabase: tab.kind === "docs" ? tab.doc?.database ?? null : null,
+      docCollection: tab.kind === "docs" ? tab.doc?.collection ?? null : null,
     })),
     activeId: tabs.some((tab) => tab.id === activeId) ? activeId : tabs[tabs.length - 1]?.id ?? null,
   };
@@ -323,6 +344,10 @@ export function restoreSession(raw: string | null): SessionSnapshot | null {
     if (diagramSchema === null && tab.diagramSchema !== undefined && tab.diagramSchema !== null) return null;
     const redisKey = textOrNull(tab.redisKey ?? null);
     if (redisKey === null && tab.redisKey !== undefined && tab.redisKey !== null) return null;
+    const docDatabase = textOrNull(tab.docDatabase ?? null);
+    if (docDatabase === null && tab.docDatabase !== undefined && tab.docDatabase !== null) return null;
+    const docCollection = textOrNull(tab.docCollection ?? null);
+    if (docCollection === null && tab.docCollection !== undefined && tab.docCollection !== null) return null;
     tabs.push({
       id: tab.id,
       title: tab.title,
@@ -342,6 +367,8 @@ export function restoreSession(raw: string | null): SessionSnapshot | null {
       definition,
       diagramSchema,
       redisKey,
+      docDatabase,
+      docCollection,
     });
   }
   const resolved = tabs.some((tab) => tab.id === activeId) ? activeId : tabs[tabs.length - 1]?.id ?? null;
@@ -371,6 +398,9 @@ function fromSnapshot(item: SessionSnapshotTab): ShellTab {
   }
   if (kind === "keys") {
     tab.redis = { key: item.redisKey ?? "" };
+  }
+  if (kind === "docs") {
+    tab.doc = { database: item.docDatabase ?? "", collection: item.docCollection ?? "" };
   }
   tab.lastExecutedSql = kind === "query" ? item.lastExecutedSql ?? null : null;
   return tab;
@@ -547,6 +577,29 @@ export function createSession(initialHash = "", restored: SessionSnapshot | null
     showPage("workspace");
   }
 
+  function openDocs(target: DocsTarget) {
+    const id = `docs:${target.connectionId}:${target.database}:${target.collection}`;
+    const existing = tabs.value.find((tab) => tab.id === id);
+    if (existing) {
+      activeId.value = existing.id;
+      showPage("workspace");
+      return;
+    }
+    const tab = blankTab("docs", id, target.label, target.path ?? null, "");
+    applyTarget(tab, {
+      connectionId: target.connectionId,
+      connectionName: target.connectionName,
+      database: target.database,
+      engine: target.engine,
+      status: target.status,
+    });
+    if (target.database) tab.targetText = `${target.connectionName} / ${target.database} / ${target.collection}`;
+    tab.doc = { database: target.database, collection: target.collection };
+    tabs.value = [...tabs.value, tab];
+    activeId.value = tab.id;
+    showPage("workspace");
+  }
+
   function setDraft(id: string, draft: string) {
     const tab = tabs.value.find((item) => item.id === id);
     if (!tab || tab.draft === draft) return;
@@ -633,6 +686,7 @@ export function createSession(initialHash = "", restored: SessionSnapshot | null
     openDefinition,
     openDiagram,
     openKeys,
+    openDocs,
     setTableView,
     setDraft,
     setExecuted,

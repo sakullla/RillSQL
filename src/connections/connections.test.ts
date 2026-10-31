@@ -6,7 +6,7 @@ import type { ConnectionApi, EnvTagInput, TestReport } from "./api";
 import ConnectionsPage from "./ConnectionsPage.vue";
 import { listPaletteConnections, MODULE_ID, replacePaletteConnections, setConnectionsFilePicker, setExportPathPicker, setSqlitePicker } from "./index";
 import { importConnectionText } from "./import";
-import { blankDraft, storedConfigHidesSecrets, toStoredConfig, validate, type ConnectionDraft, type EnvTag, type SavedConnection, type SecretInput } from "./model";
+import { blankDraft, draftFromSaved, storedConfigHidesSecrets, toStoredConfig, validate, type ConnectionDraft, type EnvTag, type SavedConnection, type SecretInput } from "./model";
 import { ENGINES } from "../engines";
 import { parseConnectionUrl } from "./url";
 
@@ -349,7 +349,7 @@ describe("connections page", () => {
 
     const note = wrapper.get(".paste-note");
     expect(note.classes()).toContain("field-err");
-    expect(note.text()).toContain("只支持 postgres://、postgresql://、mysql://、mariadb://、sqlserver://、redis:// 或 rediss:// 开头的连接串");
+    expect(note.text()).toContain("只支持 postgres://、postgresql://、mysql://、mariadb://、sqlserver://、redis://、rediss://、mongodb:// 或 mongodb+srv:// 开头的连接串");
     wrapper.unmount();
   });
 
@@ -509,7 +509,7 @@ describe("connections page", () => {
     });
     await flushPromises();
     expect(wrapper.text()).toContain("连接你的第一个数据库");
-    expect(wrapper.text()).toContain("支持 PostgreSQL、MySQL、MariaDB、SQL Server、SQLite 和 Redis。");
+    expect(wrapper.text()).toContain("支持 PostgreSQL、MySQL、MariaDB、SQL Server、SQLite、Redis 和 MongoDB。");
     expect(wrapper.text()).not.toContain("没有匹配的连接");
     expect(wrapper.findAll("button").filter((button) => button.text().includes("新建连接"))).toHaveLength(1);
     wrapper.unmount();
@@ -1044,14 +1044,19 @@ describe("connection import", () => {
 });
 
 describe("engine metadata", () => {
-  it("exposes six engines: five relational plus the redis kv engine", () => {
-    expect(ENGINES.map((item) => item.id)).toEqual(["postgres", "mysql", "mariadb", "sqlserver", "sqlite", "redis"]);
+  it("exposes exactly seven engines: five relational plus redis kv and mongodb document (R14)", () => {
+    expect(ENGINES.map((item) => item.id)).toEqual(["postgres", "mysql", "mariadb", "sqlserver", "sqlite", "redis", "mongodb"]);
     const sqlserver = ENGINES.find((item) => item.id === "sqlserver");
     expect(sqlserver).toMatchObject({ label: "SQL Server", port: "1433", relational: true, document: false, kv: false });
     // Redis 是 kv 能力：SQL 执行器/结构编辑/对比/导出对它不可达（ADR-2）。
     const redis = ENGINES.find((item) => item.id === "redis");
     expect(redis).toMatchObject({ label: "Redis", port: "6379", relational: false, document: false, kv: true });
+    // MongoDB 是 document 能力（R12）：没有 SQL 面，集合文档经专项浏览器（R14 选择器第 7 项后不再新增）。
+    const mongodb = ENGINES.find((item) => item.id === "mongodb");
+    expect(mongodb).toMatchObject({ label: "MongoDB", port: "27017", relational: false, document: true, kv: false });
     expect(ENGINES.filter((item) => item.relational).map((item) => item.id)).toEqual(["postgres", "mysql", "mariadb", "sqlserver", "sqlite"]);
+    expect(ENGINES.filter((item) => item.kv).map((item) => item.id)).toEqual(["redis"]);
+    expect(ENGINES.filter((item) => item.document).map((item) => item.id)).toEqual(["mongodb"]);
     // 连接表单默认值来自元数据表：默认端口与 TLS 默认档。
     // 连接表单默认值来自元数据表：默认端口与 TLS 默认档。
     const draft = blankDraft("sqlserver");
@@ -1072,6 +1077,24 @@ describe("engine metadata", () => {
     // ACL 用户名可留空；库索引必须是数字。
     expect(validate({ ...draft, host: "127.0.0.1" })).toEqual({});
     expect(validate({ ...draft, host: "127.0.0.1", database: "main" }).database).toBe("Redis 库索引应为 0 起的非负整数");
+  });
+
+  it("gives mongodb a local default env, optional username, plaintext TLS default and a round-tripping replica set", () => {
+    const draft = blankDraft("mongodb");
+    expect(draft.port).toBe("27017");
+    expect(draft.database).toBe("");
+    expect(draft.replicaSet).toBe("");
+    expect(draft.env).toBe("local");
+    expect(draft.tlsMode).toBe("off");
+    // SCRAM 用户名可留空（无认证直连）；host 填整条 mongodb:// 串时端口可留空。
+    expect(validate({ ...draft, host: "127.0.0.1" })).toEqual({});
+    expect(validate({ ...draft, host: "mongodb://mongo.example.test" })).toEqual({});
+    expect(validate({ ...draft, host: "127.0.0.1", port: "" }).port).toBe("端口应为 1–65535");
+    // 副本集参数只对 mongodb 保存，并在草稿/存储间往返。
+    const stored = toStoredConfig({ ...draft, host: "mongo.example.test", username: "root", replicaSet: " rs0 " }, "id-1");
+    expect(stored.replicaSet).toBe("rs0");
+    expect(draftFromSaved(stored).replicaSet).toBe("rs0");
+    expect(toStoredConfig({ ...blankDraft("mysql"), host: "db", username: "root", replicaSet: "rs0" }, "id-2").replicaSet).toBeNull();
   });
 });
 
@@ -1157,6 +1180,16 @@ describe("SQL Server import classification (T10 decision)", () => {
     const tls = parseConnectionUrl("rediss://:secret@cache.example.test/0");
     expect(tls).toEqual({ ok: true, engine: "redis", host: "cache.example.test", port: "6379", database: "0", username: "", password: "secret", tlsMode: "require" });
   });
+
+  it("parses mongodb:// and mongodb+srv:// connection strings keeping the whole uri as host", () => {
+    const plain = parseConnectionUrl("mongodb://root:secret@mongo.example.test:27018/shop?replicaSet=rs0");
+    // 整串保存进主机字段（后端按连接串解析），认证库来自路径段。
+    expect(plain).toMatchObject({ ok: true, engine: "mongodb", host: "mongodb://root:secret@mongo.example.test:27018/shop?replicaSet=rs0", port: "27018", database: "shop", username: "root", password: "secret", tlsMode: null });
+    expect(plain.ok && plain.original?.host).toBe("mongo.example.test");
+    // +srv 形态端口由 DNS 决定：端口留空，TLS 按 Require 档填入。
+    const srv = parseConnectionUrl("mongodb+srv://cluster.example.test/shop");
+    expect(srv).toMatchObject({ ok: true, engine: "mongodb", host: "mongodb+srv://cluster.example.test/shop", port: "", database: "shop", tlsMode: "require" });
+  });
 });
 
 describe("Redis import classification (T11 decision)", () => {
@@ -1187,5 +1220,63 @@ describe("Redis import classification (T11 decision)", () => {
     expect(skipped.saved).toEqual([]);
     expect(skipped.message).toContain("已跳过「旧缓存」");
     expect(skipped.message).toContain("valkey");
+  });
+});
+
+describe("MongoDB import classification (T12 decision)", () => {
+  // 决策记录：MongoDB 的全称 label 是 "MongoDB"（label 小写匹配接受 DBeaver 的 driver/provider 全称 "mongodb"，
+  // 大小写不敏感），正典 id 也是 "mongodb"（接受 Navicat 的 ConnType "mongodb"）。二者同形，不存在别名分歧。
+  // 不可导入的 token：couchdb/documentdb 等其它文档库不在 ENGINES 里，按“不支持跳过”报告（R14 同一选择器纪律）。
+  it("imports a Navicat row with ConnType mongodb", async () => {
+    const imported = await importConnectionText(
+      `<?xml version="1.0" encoding="UTF-8"?>
+<Connections Ver="1.5">
+  <Connection ConnectionName="文档库" ConnType="mongodb" Host="mongo.example.test" Port="27017" Database="admin" UserName="root" />
+</Connections>`,
+      recordingSave().save,
+    );
+    expect(imported.saved.map((item) => [item.name, item.engine])).toEqual([["文档库", "mongodb"]]);
+    expect(imported.saved[0]).toMatchObject({ host: "mongo.example.test", port: 27017, database: "admin", username: "root" });
+    expect(imported.saved[0]!.replicaSet ?? null).toBeNull();
+  });
+
+  it("accepts the DBeaver driver name mongodb via label matching", async () => {
+    const imported = await importConnectionText(
+      JSON.stringify({
+        folders: {},
+        connections: {
+          "docs-1": {
+            provider: "mongodb",
+            driver: "mongodb",
+            name: "订单文档",
+            configuration: {
+              host: "mongo.example.test",
+              port: 27017,
+              database: "orders",
+              url: "jdbc:mongodb://mongo.example.test:27017/orders",
+              user: "root",
+              password: "secret",
+            },
+          },
+        },
+      }),
+      recordingSave().save,
+    );
+    expect(imported.saved.map((item) => [item.name, item.engine])).toEqual([["订单文档", "mongodb"]]);
+    expect(imported.saved[0]).toMatchObject({ host: "mongo.example.test", port: 27017, username: "root" });
+    expect(imported.saved[0]!.replicaSet ?? null).toBeNull();
+  });
+
+  it("skips couchdb as unsupported instead of mapping it to mongodb", async () => {
+    const skipped = await importConnectionText(
+      `<?xml version="1.0" encoding="UTF-8"?>
+<Connections Ver="1.5">
+  <Connection ConnectionName="旧文档库" ConnType="couchdb" Host="couch.example.test" Port="5984" />
+</Connections>`,
+      recordingSave().save,
+    );
+    expect(skipped.saved).toEqual([]);
+    expect(skipped.message).toContain("已跳过「旧文档库」");
+    expect(skipped.message).toContain("couchdb");
   });
 });

@@ -16,6 +16,8 @@ export function objectGroups(engine: Engine): ObjectKind[] {
   if (engine === "mariadb") return ["table", "view", "function", "procedure", "trigger", "sequence"];
   // SQL Server 有独立序列，没有独立枚举或域。
   if (engine === "sqlserver") return ["table", "view", "function", "procedure", "trigger", "sequence"];
+  // MongoDB 只有集合一种对象（映射到 table；树里的集合分支不经 SchemaBlock 渲染）。
+  if (engine === "mongodb") return ["table"];
   return ["table", "view", "function", "procedure", "trigger", "sequence", "enum", "domain"];
 }
 

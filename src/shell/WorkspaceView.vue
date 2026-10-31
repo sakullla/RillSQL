@@ -13,6 +13,7 @@ import { loadSettings } from "./settings";
 import WelcomeView from "./WelcomeView.vue";
 
 const DataGrid = defineAsyncComponent(() => import("../grid/DataGrid.vue"));
+const MongoDocsTab = defineAsyncComponent(() => import("../mongo/MongoDocsTab.vue"));
 const QueryTab = defineAsyncComponent(() => import("../query/QueryTab.vue"));
 const RedisTab = defineAsyncComponent(() => import("../redis/RedisTab.vue"));
 const StructurePane = defineAsyncComponent(() => import("../structure/StructurePane.vue"));
@@ -64,7 +65,7 @@ function tableConnectionGone(tabId: string): boolean {
 function danglingTarget(tab: ShellTab): boolean {
   if (!catalogLoaded() || tab.restored !== true) return false;
   if (tab.kind === "table") return tableConnectionGone(tab.id);
-  if (tab.kind === "definition" || tab.kind === "diagram" || tab.kind === "keys") {
+  if (tab.kind === "definition" || tab.kind === "diagram" || tab.kind === "keys" || tab.kind === "docs") {
     return tab.connectionId != null && !catalogConnections().some((item) => item.id === tab.connectionId);
   }
   return false;
@@ -209,7 +210,7 @@ onBeforeUnmount(() => {
       @keydown.space.prevent="emit('activate', tab.id)"
       @keydown="onTabKey($event, tab.id)"
     >
-      <Icon :name="tab.kind === 'query' ? 'code' : tab.kind === 'diagram' ? 'link' : tab.kind === 'keys' ? 'key' : 'table'" />
+      <Icon :name="tab.kind === 'query' ? 'code' : tab.kind === 'diagram' ? 'link' : tab.kind === 'keys' ? 'key' : tab.kind === 'docs' ? 'columns' : 'table'" />
       <span class="tab-title">{{ tab.title }}</span>
       <span
         v-if="tab.targetText || tab.path || tab.kind === 'query'"
@@ -281,6 +282,16 @@ onBeforeUnmount(() => {
       :database="active.database ?? '0'"
       :status="active.connectionStatus ?? 'connected'"
       :initial-key="active.redis?.key"
+    />
+    <MongoDocsTab
+      v-else-if="active && active.kind === 'docs' && active.connectionId && active.doc"
+      :key="active.id"
+      :tab-id="active.id"
+      :connection-id="active.connectionId"
+      :connection-name="active.connectionName ?? ''"
+      :database="active.doc.database"
+      :collection="active.doc.collection"
+      :status="active.connectionStatus ?? 'connected'"
     />
     <StructurePane
       v-else-if="active && active.kind === 'structure'"

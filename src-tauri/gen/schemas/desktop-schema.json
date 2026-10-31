@@ -405,6 +405,48 @@
           "markdownDescription": "允许把源表的数据流式迁移到另一条已打开连接的目标表，冲突跳过、单行失败记录并继续。"
         },
         {
+          "description": "允许按 _id 删除 MongoDB 文档；写删操作需前端二次确认（confirmed 标记）后才执行并返回删除计数。",
+          "type": "string",
+          "const": "allow-mongo-delete-document",
+          "markdownDescription": "允许按 _id 删除 MongoDB 文档；写删操作需前端二次确认（confirmed 标记）后才执行并返回删除计数。"
+        },
+        {
+          "description": "允许按 skip/limit 分页读取 MongoDB 集合文档；JSON 过滤在解析阶段返回行列定位错误，非法过滤不发查询。",
+          "type": "string",
+          "const": "allow-mongo-find-documents",
+          "markdownDescription": "允许按 skip/limit 分页读取 MongoDB 集合文档；JSON 过滤在解析阶段返回行列定位错误，非法过滤不发查询。"
+        },
+        {
+          "description": "允许新增 MongoDB 文档；JSON 校验通过才执行 insert_one，返回服务器生成的 _id。",
+          "type": "string",
+          "const": "allow-mongo-insert-document",
+          "markdownDescription": "允许新增 MongoDB 文档；JSON 校验通过才执行 insert_one，返回服务器生成的 _id。"
+        },
+        {
+          "description": "允许列出 MongoDB 库的集合清单与 estimatedDocumentCount 计数。",
+          "type": "string",
+          "const": "allow-mongo-list-collections",
+          "markdownDescription": "允许列出 MongoDB 库的集合清单与 estimatedDocumentCount 计数。"
+        },
+        {
+          "description": "允许在已打开的 MongoDB 会话上列出数据库与集合数（不含 admin/config/local）。",
+          "type": "string",
+          "const": "allow-mongo-list-databases",
+          "markdownDescription": "允许在已打开的 MongoDB 会话上列出数据库与集合数（不含 admin/config/local）。"
+        },
+        {
+          "description": "允许按 _id 读取单个 MongoDB 文档并以 relaxed 扩展 JSON 文本返回。",
+          "type": "string",
+          "const": "allow-mongo-read-document",
+          "markdownDescription": "允许按 _id 读取单个 MongoDB 文档并以 relaxed 扩展 JSON 文本返回。"
+        },
+        {
+          "description": "允许整体 JSON 覆盖编辑 MongoDB 文档；JSON 校验通过才执行 replace_one。",
+          "type": "string",
+          "const": "allow-mongo-replace-document",
+          "markdownDescription": "允许整体 JSON 覆盖编辑 MongoDB 文档；JSON 校验通过才执行 replace_one。"
+        },
+        {
           "description": "允许请求取消正在执行的 SQL。",
           "type": "string",
           "const": "allow-query-cancel",
