@@ -31,7 +31,7 @@ pub fn split_sql(engine: &str, sql: &str) -> SplitReport {
         if is_delimiter_command(sql, begin) {
             let line_end = eol_at(sql, begin);
             let arg = delimiter_argument(&sql[begin..line_end]);
-            if engine == "postgres" || engine == "sqlite" {
+            if engine == "postgres" || engine == "sqlite" || engine == "sqlserver" {
                 if !noticed {
                     notices.push(format!(
                         "{} 不使用 DELIMITER 这条客户端指令，已跳过。其余语句仍按该引擎执行。",
@@ -54,7 +54,7 @@ pub fn split_sql(engine: &str, sql: &str) -> SplitReport {
             i = skip_break(sql, line_end);
             continue;
         }
-        let scanned = scan_statement(sql, begin, &delimiter, hash);
+        let scanned = scan_statement(sql, begin, &delimiter, hash, engine == "sqlserver");
         if let Some(piece) = scanned.piece {
             pieces.push(piece);
         }
@@ -254,7 +254,7 @@ struct Scanned {
     refusal: Option<String>,
 }
 
-fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool) -> Scanned {
+fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool, tsql_blocks: bool) -> Scanned {
     let bytes = sql.as_bytes();
     let mut i = start;
     let mut quote: Option<u8> = None;
@@ -263,6 +263,7 @@ fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool) -> Scann
     let mut paren = 0i32;
     let mut begin_depth = 0i32;
     let mut routine = false;
+    let mut opened_block = false;
     let mut decided = false;
     let mut words: Vec<String> = Vec::new();
     let mut closed = false;
@@ -353,12 +354,29 @@ fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool) -> Scann
                     Look::Maybe => {}
                 }
             }
-            if upper == "BEGIN" && routine {
+            // T-SQL 的 BEGIN...END 不只出现在例程体里：顶层批处理块同样按深度计数，
+            // 块内的分号不结束语句。BEGIN TRAN/TRANSACTION/DISTRIBUTED TRAN 是事务，不是块。
+            // CASE 表达式同样以 END 收尾，成对计入深度，避免块内的 CASE END 提前扣减。
+            let block_keyword = routine
+                || (tsql_blocks && (upper == "CASE" || !begins_transaction(sql, word.1, hash)));
+            if upper == "BEGIN" && block_keyword {
+                opened_block = true;
                 begin_depth += 1;
-            } else if upper == "END" && routine && begin_depth > 0 {
+            } else if upper == "CASE" && tsql_blocks {
+                opened_block = true;
+                begin_depth += 1;
+            } else if upper == "END" && block_keyword && begin_depth > 0 {
                 let next = peek_word(sql, word.1, hash);
                 if next.as_deref().map(|item| !is_routine_tail(item)).unwrap_or(true) {
                     begin_depth -= 1;
+                    // 块回到顶层时语句自闭合：END 后面不是 ELSE 就在这里结束。
+                    // 例程体（CREATE PROCEDURE 等）保持原有行为，仍按分号或文末收束。
+                    if begin_depth == 0 && opened_block && tsql_blocks && next.as_deref() != Some("ELSE") {
+                        closed = true;
+                        close_at = word.1;
+                        i = close_at;
+                        break;
+                    }
                 }
             }
             i = word.1;
@@ -382,7 +400,7 @@ fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool) -> Scann
         return refuse("dollar-quote 没有闭合，没有发送。");
     }
     if begin_depth > 0 {
-        return refuse("例程体未闭合，没有发送。");
+        return refuse(if tsql_blocks { "BEGIN 块未闭合，没有发送。" } else { "例程体未闭合，没有发送。" });
     }
     if !closed && delimiter != ";" && meaningful(&sql[start..i], hash) {
         return refuse("自定义结束符没有闭合，没有发送。");
@@ -412,7 +430,8 @@ fn make_piece(sql: &str, start: usize, end: usize, delimiter: &str, closed: bool
     let raw = &sql[start..body_end.max(start)];
     let lead = leading_noise(raw, hash);
     let body = raw[lead..].trim_end();
-    if !meaningful(body, hash) {
+    // 只剩分号（块自闭合后残留的结束符）不算一条语句。
+    if !meaningful(&body.replace(';', " "), hash) {
         return None;
     }
     let text_start = start + lead;
@@ -524,8 +543,14 @@ fn engine_label(engine: &str) -> &'static str {
         "sqlite" => "SQLite",
         "mysql" => "MySQL",
         "mariadb" => "MariaDB",
+        "sqlserver" => "SQL Server",
         _ => "PostgreSQL",
     }
+}
+
+/// T-SQL 的 BEGIN 后面跟 TRAN/TRANSACTION/DISTRIBUTED 时是事务语句，不进入块计数。
+fn begins_transaction(sql: &str, index: usize, hash: bool) -> bool {
+    matches!(peek_word(sql, index, hash).as_deref(), Some("TRAN") | Some("TRANSACTION") | Some("DISTRIBUTED"))
 }
 
 fn hash_comments(engine: &str) -> bool {

@@ -101,15 +101,17 @@ fn between_and_in_reject_missing_values() {
 #[test]
 fn search_clause_compiles_or_like_in_each_engine_dialect() {
     let columns = rich_schema(Engine::Postgres).columns;
-    for engine in [Engine::Postgres, Engine::Mysql, Engine::Mariadb, Engine::Sqlite] {
+    for engine in [Engine::Postgres, Engine::Mysql, Engine::Mariadb, Engine::Sqlite, Engine::Sqlserver] {
         let clause = search_clause(engine, &columns, " 甲'x ").expect("非空关键字生成子句");
         let op = if engine == Engine::Postgres { "ILIKE" } else { "LIKE" };
         let (id, name, email, joined) = match engine {
             Engine::Postgres => (r#""id"::text"#.to_owned(), r#""name"::text"#.to_owned(), r#""email"::text"#.to_owned(), r#""joined"::text"#.to_owned()),
             Engine::Mysql | Engine::Mariadb => ("CAST(`id` AS CHAR)".to_owned(), "CAST(`name` AS CHAR)".to_owned(), "CAST(`email` AS CHAR)".to_owned(), "CAST(`joined` AS CHAR)".to_owned()),
             Engine::Sqlite => (r#"CAST("id" AS TEXT)"#.to_owned(), r#"CAST("name" AS TEXT)"#.to_owned(), r#"CAST("email" AS TEXT)"#.to_owned(), r#"CAST("joined" AS TEXT)"#.to_owned()),
+            // T-SQL 用括号标识符、NVARCHAR 投影与 N'' 模式串。
+            Engine::Sqlserver => ("CAST([id] AS NVARCHAR(MAX))".to_owned(), "CAST([name] AS NVARCHAR(MAX))".to_owned(), "CAST([email] AS NVARCHAR(MAX))".to_owned(), "CAST([joined] AS NVARCHAR(MAX))".to_owned()),
         };
-        let pattern = r"'%甲''x%'";
+        let pattern = if engine == Engine::Sqlserver { r#"N'%甲''x%'"# } else { r"'%甲''x%'" };
         assert_eq!(clause, format!("({id} {op} {pattern} ESCAPE '!' OR {name} {op} {pattern} ESCAPE '!' OR {email} {op} {pattern} ESCAPE '!' OR {joined} {op} {pattern} ESCAPE '!')"), "engine {engine:?}");
     }
     assert_eq!(search_clause(Engine::Postgres, &columns, ""), None);
@@ -156,4 +158,69 @@ fn search_clause_combines_with_filters_sort_and_paging() {
     assert_eq!(sorted, format!("SELECT * FROM `public`.`customers` WHERE {clause} ORDER BY `id` DESC LIMIT 10"));
     // 没有关键字时与既有 browse_sql 完全一致（存量行为不变）。
     assert_eq!(browse_sql_with_search(&schema, &[], None, Some(&sort), 10, 0).unwrap(), browse_sql(&schema, &[], Some(&sort), 10, 0).unwrap());
+}
+
+#[test]
+fn sqlserver_dialect_quotes_identifiers_and_literals() {
+    use super::sql::{quote_ident, text_literal};
+    assert_eq!(quote_ident(Engine::Sqlserver, "order"), "[order]");
+    assert_eq!(quote_ident(Engine::Sqlserver, "br]acket"), "[br]]acket]");
+    // Unicode 字符串用 N''，普通转义仍是双单引号。
+    assert_eq!(text_literal(Engine::Sqlserver, "a'b"), "N'a''b'");
+    assert_eq!(text_literal(Engine::Mysql, "a'b"), "'a''b'");
+}
+
+#[test]
+fn sqlserver_cell_literals_cover_binary_and_bool() {
+    use super::sql::sql_cell;
+    use super::store::Column;
+    fn col(type_name: &str) -> Column {
+        Column { name: "c".to_owned(), type_name: type_name.to_owned(), nullable: true, primary: false, unique: false, auto: false }
+    }
+    // 0x 前缀的二进制字面量；空二进制是 0x。
+    assert_eq!(sql_cell(Engine::Sqlserver, Some(&col("varbinary")), &Cell::Text("0xAB10".to_owned())), "0xab10".to_owned());
+    assert_eq!(sql_cell(Engine::Sqlserver, Some(&col("varbinary")), &Cell::Text("".to_owned())), "0x".to_owned());
+    // bit 列走 TRUE/FALSE 字面量。
+    assert_eq!(sql_cell(Engine::Sqlserver, Some(&col("bit")), &Cell::Text("1".to_owned())), "TRUE".to_owned());
+    assert_eq!(sql_cell(Engine::Sqlserver, Some(&col("bit")), &Cell::Text("f".to_owned())), "FALSE".to_owned());
+    // 文本列 N''，数字列保持数字。
+    assert_eq!(sql_cell(Engine::Sqlserver, Some(&col("nvarchar")), &Cell::Text("值'x".to_owned())), "N'值''x'".to_owned());
+    assert_eq!(sql_cell(Engine::Sqlserver, Some(&col("int")), &Cell::Text("42".to_owned())), "42".to_owned());
+}
+
+#[test]
+fn sqlserver_paging_uses_offset_fetch_and_defaults_to_a_stable_order() {
+    let schema = schema_of(Engine::Sqlserver);
+    let sort = Sort { column: "id".to_owned(), descending: false };
+    // 有排序时直接 OFFSET/FETCH。
+    let sorted = browse_sql_with_search(&schema, &[], None, Some(&sort), 20, 40).unwrap();
+    assert_eq!(sorted, "SELECT * FROM [public].[customers] ORDER BY [id] ASC OFFSET 40 ROWS FETCH NEXT 20 ROWS ONLY");
+    // 无排序时补恒定序（OFFSET/FETCH 必须跟在 ORDER BY 后面）。
+    let unsorted = browse_sql_with_search(&schema, &[], None, None, 20, 40).unwrap();
+    assert_eq!(unsorted, "SELECT * FROM [public].[customers] ORDER BY (SELECT NULL) OFFSET 40 ROWS FETCH NEXT 20 ROWS ONLY");
+    // 首页同样显式 OFFSET 0。
+    let first = browse_sql_with_search(&schema, &[], None, Some(&sort), 20, 0).unwrap();
+    assert!(first.ends_with("ORDER BY [id] ASC OFFSET 0 ROWS FETCH NEXT 20 ROWS ONLY"));
+}
+
+#[test]
+fn sqlserver_empty_insert_uses_default_values() {
+    use super::sql::insert_sql;
+    let schema = schema_of(Engine::Sqlserver);
+    assert_eq!(insert_sql(&schema, &[]), "INSERT INTO [public].[customers] DEFAULT VALUES");
+}
+
+#[test]
+fn sqlserver_value_family_maps_tsql_type_names() {
+    use super::sql::value_family_test::test_names;
+    let families = test_names();
+    assert_eq!(families.get("datetime2"), Some(&super::sql::ValueFamily::Datetime));
+    assert_eq!(families.get("datetimeoffset"), Some(&super::sql::ValueFamily::Datetime));
+    assert_eq!(families.get("smalldatetime"), Some(&super::sql::ValueFamily::Datetime));
+    assert_eq!(families.get("money"), Some(&super::sql::ValueFamily::Decimal));
+    assert_eq!(families.get("smallmoney"), Some(&super::sql::ValueFamily::Decimal));
+    assert_eq!(families.get("bit"), Some(&super::sql::ValueFamily::Bool));
+    assert_eq!(families.get("uniqueidentifier"), Some(&super::sql::ValueFamily::Text));
+    assert_eq!(families.get("nvarchar"), Some(&super::sql::ValueFamily::Text));
+    assert_eq!(families.get("varbinary"), Some(&super::sql::ValueFamily::Binary));
 }

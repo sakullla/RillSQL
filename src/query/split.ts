@@ -32,7 +32,7 @@ export function inspectSql(sql: string, engine = "postgres"): SplitReport {
     if (isDelimiterCommand(sql, begin)) {
       const lineEnd = eolAt(sql, begin);
       const arg = delimiterArgument(sql.slice(begin, lineEnd));
-      if (engine === "postgres" || engine === "sqlite") {
+      if (engine === "postgres" || engine === "sqlite" || engine === "sqlserver") {
         if (!noticed) {
           notices.push(`${engineLabel(engine)} 不使用 DELIMITER 这条客户端指令，已跳过。其余语句仍按该引擎执行。`);
           noticed = true;
@@ -45,7 +45,7 @@ export function inspectSql(sql: string, engine = "postgres"): SplitReport {
       i = skipBreak(sql, lineEnd);
       continue;
     }
-    const scanned = scanStatement(sql, begin, delimiter, hash);
+    const scanned = scanStatement(sql, begin, delimiter, hash, engine === "sqlserver");
     if (scanned.piece) pieces.push(scanned.piece);
     if (scanned.refusal) return { pieces, notices, refusal: scanned.refusal, refusalFrom: begin };
     if (scanned.next <= begin) break;
@@ -284,7 +284,7 @@ export function inspectSyntax(sql: string, engine = "postgres"): SyntaxFinding[]
   return findings.sort((a, b) => a.start - b.start);
 }
 
-function scanStatement(sql: string, start: number, delimiter: string, hash: boolean): { piece: Piece | null; next: number; refusal: string | null } {
+function scanStatement(sql: string, start: number, delimiter: string, hash: boolean, tsqlBlocks: boolean): { piece: Piece | null; next: number; refusal: string | null } {
   let i = start;
   let quote: string | null = null;
   let dollar: string | null = null;
@@ -292,6 +292,7 @@ function scanStatement(sql: string, start: number, delimiter: string, hash: bool
   let paren = 0;
   let beginDepth = 0;
   let routine = false;
+  let openedBlock = false;
   let decided = false;
   const words: string[] = [];
   let closed = false;
@@ -380,10 +381,28 @@ function scanStatement(sql: string, start: number, delimiter: string, hash: bool
           decided = true;
         } else if (look === "no") decided = true;
       }
-      if (upper === "BEGIN" && routine) beginDepth += 1;
-      else if (upper === "END" && routine && beginDepth > 0) {
+      // T-SQL 的 BEGIN...END 不只出现在例程体里：顶层批处理块同样按深度计数，
+      // 块内的分号不结束语句。BEGIN TRAN/TRANSACTION/DISTRIBUTED TRAN 是事务，不是块。
+      // CASE 表达式同样以 END 收尾，成对计入深度，避免块内的 CASE END 提前扣减。
+      const blockKeyword = routine || (tsqlBlocks && (upper === "CASE" || !beginsTransaction(sql, word.end, hash)));
+      if (upper === "BEGIN" && blockKeyword) {
+        openedBlock = true;
+        beginDepth += 1;
+      } else if (upper === "CASE" && tsqlBlocks) {
+        openedBlock = true;
+        beginDepth += 1;
+      } else if (upper === "END" && blockKeyword && beginDepth > 0) {
         const next = peekWord(sql, word.end, hash);
-        if (!next || !ROUTINE_TAIL.has(next)) beginDepth -= 1;
+        if (!next || !ROUTINE_TAIL.has(next)) {
+          beginDepth -= 1;
+          // 块回到顶层时语句自闭合：END 后面不是 ELSE 就在这里结束。
+          if (beginDepth === 0 && openedBlock && tsqlBlocks && next !== "ELSE") {
+            closed = true;
+            closeAt = word.end;
+            i = closeAt;
+            break;
+          }
+        }
       }
       i = word.end;
       continue;
@@ -399,7 +418,7 @@ function scanStatement(sql: string, start: number, delimiter: string, hash: bool
   if (quote) return { piece: null, next: sql.length, refusal: "引号没有闭合，没有发送。" };
   if (block) return { piece: null, next: sql.length, refusal: "块注释没有闭合，没有发送。" };
   if (dollar !== null) return { piece: null, next: sql.length, refusal: "dollar-quote 没有闭合，没有发送。" };
-  if (beginDepth > 0) return { piece: null, next: sql.length, refusal: "例程体未闭合，没有发送。" };
+  if (beginDepth > 0) return { piece: null, next: sql.length, refusal: tsqlBlocks ? "BEGIN 块未闭合，没有发送。" : "例程体未闭合，没有发送。" };
   if (!closed && delimiter !== ";" && meaningful(sql.slice(start, i), hash)) {
     return { piece: null, next: sql.length, refusal: "自定义结束符没有闭合，没有发送。" };
   }
@@ -412,7 +431,8 @@ function makePiece(sql: string, start: number, end: number, delimiter: string, c
   const raw = sql.slice(start, Math.max(start, bodyEnd));
   const lead = leadingNoise(raw, hash);
   const body = raw.slice(lead).trimEnd();
-  if (!meaningful(body, hash)) return null;
+  // 只剩分号（块自闭合后残留的结束符）不算一条语句。
+  if (!meaningful(body.replaceAll(";", " "), hash)) return null;
   const textStart = start + lead;
   return { text: body, start: textStart, end: textStart + body.length };
 }
@@ -462,7 +482,14 @@ function engineLabel(engine: string): string {
   if (engine === "sqlite") return "SQLite";
   if (engine === "mysql") return "MySQL";
   if (engine === "mariadb") return "MariaDB";
+  if (engine === "sqlserver") return "SQL Server";
   return "PostgreSQL";
+}
+
+/** T-SQL 的 BEGIN 后面跟 TRAN/TRANSACTION/DISTRIBUTED 时是事务语句，不进入块计数。 */
+function beginsTransaction(sql: string, index: number, hash: boolean): boolean {
+  const next = peekWord(sql, index, hash);
+  return next === "TRAN" || next === "TRANSACTION" || next === "DISTRIBUTED";
 }
 
 function hashComments(engine: string): boolean {

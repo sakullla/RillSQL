@@ -14,6 +14,8 @@ export const KIND_LABEL: Record<ObjectKind, string> = {
 export function objectGroups(engine: Engine): ObjectKind[] {
   if (engine === "sqlite" || engine === "mysql") return engine === "sqlite" ? ["table", "view", "trigger"] : ["table", "view", "function", "procedure", "trigger"];
   if (engine === "mariadb") return ["table", "view", "function", "procedure", "trigger", "sequence"];
+  // SQL Server 有独立序列，没有独立枚举或域。
+  if (engine === "sqlserver") return ["table", "view", "function", "procedure", "trigger", "sequence"];
   return ["table", "view", "function", "procedure", "trigger", "sequence", "enum", "domain"];
 }
 
@@ -40,7 +42,7 @@ export function objectLabel(engine: Engine, object: Pick<CatalogObject, "name" |
 }
 
 export function engineShape(engine: Engine): EngineShape {
-  if (engine === "postgres") return { databases: true, schemas: true, foreignKeys: false };
+  if (engine === "postgres" || engine === "sqlserver") return { databases: true, schemas: true, foreignKeys: false };
   if (engine === "sqlite") return { databases: false, schemas: false, foreignKeys: true };
   return { databases: true, schemas: false, foreignKeys: false };
 }

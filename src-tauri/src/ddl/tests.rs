@@ -140,6 +140,7 @@ fn view_of(engine: Engine, sql: &str) -> Snapshot {
         Engine::Mysql => Snapshot::bare(Engine::Mysql, "app", "", "v_notes"),
         Engine::Mariadb => Snapshot::bare(Engine::Mariadb, "app", "", "v_notes"),
         Engine::Sqlite => Snapshot::bare(Engine::Sqlite, "main", "", "v_notes"),
+        Engine::Sqlserver => Snapshot::bare(Engine::Sqlserver, "app", "dbo", "v_notes"),
     };
     snapshot.kind = "view".to_owned();
     snapshot.table_sql = sql.to_owned();

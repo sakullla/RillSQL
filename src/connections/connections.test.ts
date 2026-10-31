@@ -7,6 +7,7 @@ import ConnectionsPage from "./ConnectionsPage.vue";
 import { listPaletteConnections, MODULE_ID, replacePaletteConnections, setConnectionsFilePicker, setExportPathPicker, setSqlitePicker } from "./index";
 import { importConnectionText } from "./import";
 import { blankDraft, storedConfigHidesSecrets, toStoredConfig, validate, type ConnectionDraft, type EnvTag, type SavedConnection, type SecretInput } from "./model";
+import { ENGINES } from "../engines";
 import { parseConnectionUrl } from "./url";
 
 const secret: SecretInput = { password: "db-secret-alpha", sshPassword: "ssh-secret-beta", passphrase: "key-pass-gamma" };
@@ -348,7 +349,7 @@ describe("connections page", () => {
 
     const note = wrapper.get(".paste-note");
     expect(note.classes()).toContain("field-err");
-    expect(note.text()).toContain("只支持 postgres://、postgresql://、mysql:// 或 mariadb:// 开头的连接串");
+    expect(note.text()).toContain("只支持 postgres://、postgresql://、mysql://、mariadb:// 或 sqlserver:// 开头的连接串");
     wrapper.unmount();
   });
 
@@ -508,7 +509,7 @@ describe("connections page", () => {
     });
     await flushPromises();
     expect(wrapper.text()).toContain("连接你的第一个数据库");
-    expect(wrapper.text()).toContain("支持 PostgreSQL、MySQL、MariaDB 和 SQLite。");
+    expect(wrapper.text()).toContain("支持 PostgreSQL、MySQL、MariaDB、SQL Server 和 SQLite。");
     expect(wrapper.text()).not.toContain("没有匹配的连接");
     expect(wrapper.findAll("button").filter((button) => button.text().includes("新建连接"))).toHaveLength(1);
     wrapper.unmount();
@@ -1039,5 +1040,95 @@ describe("connection import", () => {
     expect(wrapper.text()).toContain("无法识别");
     expect(wrapper.text()).toContain("没有新增连接");
     wrapper.unmount();
+  });
+});
+
+describe("engine metadata", () => {
+  it("exposes exactly five relational engines with SQL Server metadata", () => {
+    expect(ENGINES.map((item) => item.id)).toEqual(["postgres", "mysql", "mariadb", "sqlserver", "sqlite"]);
+    const sqlserver = ENGINES.find((item) => item.id === "sqlserver");
+    expect(sqlserver).toMatchObject({ label: "SQL Server", port: "1433", relational: true, document: false, kv: false });
+    expect(ENGINES.every((item) => item.relational)).toBe(true);
+    // 连接表单默认值来自元数据表：默认端口与 TLS 默认档。
+    const draft = blankDraft("sqlserver");
+    expect(draft.port).toBe("1433");
+    expect(draft.tlsMode).toBe("verify");
+    expect(validate({ ...draft, host: "db.example.test", username: "sa" })).toEqual({});
+    // 默认端口已由元数据表填好：空表单只报主机与用户名。
+    expect(validate({ ...draft })).toEqual({ host: "请填写主机", username: "请填写用户名" });
+    expect(validate({ ...draft, host: "db.example.test", username: "sa", port: "notaport" }).port).toBe("端口应为 1–65535");
+  });
+});
+
+describe("SQL Server import classification (T10 decision)", () => {
+  // 决策记录：matchEngineName 只认引擎全称（label 小写）。追加 sqlserver 条目后——
+  // 变为可导入的 token：driver/provider 的全称 "SQL Server"（小写 sql server）与 Navicat 的 ConnType "sqlserver"（正典 id）。
+  // 维持跳过的 token：DBeaver 的 provider "sqlserver" / jdbc:sqlserver scheme / "mssql"，与 postgres 简写同口径（基线行为不变）。
+  it("keeps the DBeaver provider token sqlserver skipped with the SQL Server notice (baseline)", async () => {
+    const { saved, save } = recordingSave();
+    const result = await importConnectionText(
+      JSON.stringify({
+        connections: {
+          a: { provider: "sqlserver", driver: "mssql", name: "报表库", configuration: { host: "sql.example.test", port: "1433", user: "sa", database: "reports", url: "jdbc:sqlserver://sql.example.test:1433;databaseName=reports" } },
+        },
+      }),
+      save,
+    );
+    expect(result.recognized).toBe(true);
+    expect(save).not.toHaveBeenCalled();
+    expect(saved).toEqual([]);
+    expect(result.message).toContain("已跳过「报表库」：SQL Server（sqlserver）。");
+  });
+
+  it("imports a DBeaver row whose driver is the full name SQL Server", async () => {
+    const { saved, save } = recordingSave();
+    const result = await importConnectionText(
+      JSON.stringify({
+        connections: {
+          a: { provider: "generic", driver: "SQL Server", name: "报表库", configuration: { host: "sql.example.test", port: "1433", user: "sa", database: "reports" } },
+        },
+      }),
+      save,
+    );
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(saved[0]).toMatchObject({ engine: "sqlserver", host: "sql.example.test", port: 1433, username: "sa", database: "reports" });
+    expect(result.message).toContain("已导入 1 个连接");
+  });
+
+  it("imports a Navicat row with ConnType sqlserver and still skips MSSQL", async () => {
+    const imported = await importConnectionText(
+      `<?xml version="1.0" encoding="UTF-8"?>
+<Connections Ver="1.5">
+  <Connection ConnectionName="报表库" ConnType="sqlserver" Host="sql.example.test" Port="1433" UserName="sa" Database="reports" />
+</Connections>`,
+      recordingSave().save,
+    );
+    expect(imported.saved.map((item) => [item.name, item.engine])).toEqual([["报表库", "sqlserver"]]);
+    expect(imported.saved[0]).toMatchObject({ host: "sql.example.test", port: 1433, username: "sa", database: "reports" });
+
+    const skipped = await importConnectionText(
+      `<?xml version="1.0" encoding="UTF-8"?>
+<Connections Ver="1.5">
+  <Connection ConnectionName="旧称" ConnType="MSSQL" Host="sql.example.test" Port="1433" UserName="sa" Database="reports" />
+</Connections>`,
+      recordingSave().save,
+    );
+    expect(skipped.saved).toEqual([]);
+    expect(skipped.message).toContain("已跳过「旧称」：SQL Server（MSSQL）。");
+  });
+
+  it("parses sqlserver:// connection strings including encrypt parameters", () => {
+    const plain = parseConnectionUrl("sqlserver://sa:secret@db.example.test:1433/reports");
+    expect(plain).toEqual({ ok: true, engine: "sqlserver", host: "db.example.test", port: "1433", database: "reports", username: "sa", password: "secret", tlsMode: null });
+    // 缺端口时取引擎默认端口；mssql:// 短 scheme 同样归一到 sqlserver。
+    const mssql = parseConnectionUrl("mssql://sa@db.example.test/reports");
+    expect(mssql.ok && mssql.port).toBe("1433");
+    expect(mssql.ok && mssql.engine).toBe("sqlserver");
+    const encrypted = parseConnectionUrl("sqlserver://sa@db.example.test/reports?encrypt=true&trustServerCertificate=true");
+    expect(encrypted.ok && encrypted.tlsMode).toBe("require");
+    const strict = parseConnectionUrl("sqlserver://sa@db.example.test/reports?encrypt=strict");
+    expect(strict.ok && strict.tlsMode).toBe("verify");
+    const off = parseConnectionUrl("sqlserver://sa@db.example.test/reports?encrypt=false");
+    expect(off.ok && off.tlsMode).toBe("off");
   });
 });

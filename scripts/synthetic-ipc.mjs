@@ -48,6 +48,22 @@ export function installSyntheticIpc(initialTheme) {
       sshHostKey: null,
     },
     {
+      id: "mssql-report",
+      name: "报表 · SQL Server",
+      engine: "sqlserver",
+      env: "test",
+      host: "sql.internal",
+      port: 1433,
+      database: "rillsql",
+      username: "sa",
+      filePath: null,
+      tls: { mode: "require", serverName: "sql.internal", caMode: "system", caFile: null, clientCert: null, clientKey: null },
+      ssh: null,
+      passwordSaved: true,
+      sshPasswordSaved: false,
+      sshHostKey: null,
+    },
+    {
       id: "sqlite-notes",
       name: "笔记",
       engine: "sqlite",
@@ -86,6 +102,32 @@ export function installSyntheticIpc(initialTheme) {
               error: null,
               total: 4,
               objects: [object("customers", "table", 86), object("orders", "table", 128), object("order_items", "table", 340), object("order_totals", "view", null)],
+            },
+          ],
+        },
+      ],
+    },
+    {
+      id: "mssql-report",
+      name: "报表 · SQL Server",
+      engine: "sqlserver",
+      env: "test",
+      envLabel: "测试",
+      envTone: "test",
+      status: "connected",
+      defaultDatabase: "rillsql",
+      foreignKeys: null,
+      error: null,
+      databases: [
+        {
+          name: "rillsql",
+          error: null,
+          schemas: [
+            {
+              name: "dbo",
+              error: null,
+              total: 3,
+              objects: [object("customers", "table", 3), object("orders", "table", 3), object("paid_orders", "view", null), object("count_paid_orders", "procedure", null), object("note_seq", "sequence", null)],
             },
           ],
         },
@@ -149,7 +191,30 @@ export function installSyntheticIpc(initialTheme) {
       return { id: String(values[0]), cells, located: true, locatorColumns: [key], locatorValues: [values[0]] };
     });
   }
-  function schemaFor(table) {
+  const sqlserverColumns = [
+    { name: "id", typeName: "int", nullable: false, defaultSql: "", primary: true, auto: true, generated: false },
+    { name: "customer_id", typeName: "int", nullable: false, defaultSql: "", primary: false, auto: false, generated: false },
+    { name: "status", typeName: "nvarchar", nullable: false, defaultSql: "", primary: false, auto: false, generated: false },
+    { name: "total", typeName: "decimal", nullable: false, defaultSql: "0", primary: false, auto: false, generated: false },
+  ];
+  const sqlserverRows = [
+    ["1", "1", "paid", "128.50"],
+    ["2", "1", "pending", "42.00"],
+    ["3", "2", "paid", "76.20"],
+  ];
+  function schemaFor(table, engineHint) {
+    if (engineHint === "sqlserver") {
+      return {
+        engine: "sqlserver",
+        schema: "dbo",
+        name: "orders",
+        kind: "table",
+        columns: sqlserverColumns,
+        key: ["id"],
+        rows: rowsOf(sqlserverColumns, sqlserverRows, "id"),
+        sql: "SELECT * FROM [dbo].[orders] ORDER BY [id] ASC OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY",
+      };
+    }
     if (table === "notes") {
       return { engine: "sqlite", schema: "", name: "notes", kind: "table", columns: noteColumns, key: ["id"], rows: rowsOf(noteColumns, noteRows, "id"), sql: 'select "id", "title", "body" from "notes" limit 100' };
     }
@@ -232,6 +297,30 @@ export function installSyntheticIpc(initialTheme) {
   function queryResult(args) {
     const request = args.request ?? {};
     const sqlite = request.engine === "sqlite" || request.connectionId === "sqlite-notes";
+    if (request.engine === "sqlserver" && /SET\s+SHOWPLAN_ALL\s+ON/i.test(request.sql ?? "")) {
+      // SHOWPLAN_ALL 行集：按 NodeId/Parent 的层次（合成形状与真实输出同列名）。
+      const showplanColumns = ["StmtId", "NodeId", "Parent", "PhysicalOp", "LogicalOp", "Argument", "EstimateRows"];
+      const showplanRows = [
+        ["1", "1", "0", "", "", "SELECT", "1"],
+        ["1", "2", "1", "Clustered Index Scan", "Clustered Index Scan", "OBJECT:([dbo].[orders])", "3"],
+        ["1", "3", "1", "Sort", "Sort", "ORDER BY:", "3"],
+      ];
+      return {
+        id: "run-capture",
+        connectionId: request.connectionId ?? "mssql-report",
+        connectionName: request.connectionName ?? "报表 · SQL Server",
+        database: request.database ?? "rillsql",
+        engine: "sqlserver",
+        status: "ok",
+        cancel: "idle",
+        cancelMessage: "",
+        viaSsh: false,
+        freshChannel: false,
+        startedAt: "2026-10-31T02:10:00.000Z",
+        elapsedMs: 12,
+        statements: [{ sql: request.sql ?? "", status: "ok", message: "", columns: showplanColumns, rows: showplanRows, truncated: false, affected: null }],
+      };
+    }
     const columns = sqlite ? ["id", "title", "body"] : ["id", "customer", "status", "total"];
     const rows = sqlite ? noteRows : orderRows.slice(0, 2).map((row) => row.slice(0, 4));
     return {
@@ -351,14 +440,14 @@ export function installSyntheticIpc(initialTheme) {
         }
         if (command === "connections_disconnect" || command === "connections_confirm_host_key" || command === "connections_forget_host_key" || command === "connections_delete") return command === "connections_delete" ? { connection: saved[0], databaseFileRemoved: false } : null;
         if (command === "grid_describe") {
-          const schema = schemaFor(args.request?.table);
+          const schema = schemaFor(args.request?.table, args.request?.engine);
           return { engine: schema.engine, schema: schema.schema, name: schema.name, kind: schema.kind, columns: schema.columns, key: schema.key };
         }
         if (command === "grid_page") {
-          const schema = schemaFor(args.request?.table);
+          const schema = schemaFor(args.request?.table, args.request?.engine);
           return { rows: schema.rows, truncated: false, sql: schema.sql };
         }
-        if (command === "grid_count") return { matched: schemaFor(args.request?.table).rows.length };
+        if (command === "grid_count") return { matched: schemaFor(args.request?.table, args.request?.engine).rows.length };
         if (command === "grid_export") return { status: "ok", success: true, writtenRows: 3, path: args.request?.path ?? "orders.csv", residualPath: null, message: "已写入", partial: false };
         if (command === "grid_export_cancel" || command === "grid_commit") return command === "grid_commit" ? { applied: [], failed: null, pendingIds: [], rolledBack: false, rule: "按顺序逐条提交，遇到错误即停止；已成功的语句不会自动撤销。" } : null;
         if (command === "ddl_describe") return { ...structure, name: args.request?.table || structure.name };

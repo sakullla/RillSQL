@@ -246,6 +246,11 @@ fn plan_drop_fk(snapshot: &Snapshot, table: &str, name: &str) -> Plan {
             qualified_table(snapshot.engine, &snapshot.database, &snapshot.schema, table).unwrap_or_else(|err| err),
             quote_ident(snapshot.engine, name)
         ),
+        Engine::Sqlserver => format!(
+            "ALTER TABLE {} DROP CONSTRAINT {};",
+            qualified_table(snapshot.engine, &snapshot.database, &snapshot.schema, table).unwrap_or_else(|err| err),
+            quote_ident(snapshot.engine, name)
+        ),
         Engine::Sqlite => String::new(),
     };
     if sql.contains("需要") || sql.contains("没有另开") {
@@ -985,6 +990,8 @@ fn drop_index_sql(snapshot: &Snapshot, name: &str) -> Result<String, String> {
         Engine::Postgres => format!("DROP INDEX {}.{index};", quote_ident(snapshot.engine, &snapshot.schema)),
         Engine::Sqlite => format!("DROP INDEX {index};"),
         Engine::Mysql | Engine::Mariadb => format!("DROP INDEX {index} ON {};", qualified_table(snapshot.engine, &snapshot.database, &snapshot.schema, &snapshot.name)?),
+        // T-SQL 的索引名不带 schema 前缀，DROP INDEX 直接落在表上。
+        Engine::Sqlserver => format!("DROP INDEX {index} ON {};", qualified_table(snapshot.engine, &snapshot.database, &snapshot.schema, &snapshot.name)?),
     })
 }
 
@@ -1258,6 +1265,19 @@ fn plan_replace_view(snapshot: &Snapshot, table: &str, definition: &str) -> Plan
             };
             vec![Step { label: format!("替换视图 {table}"), sql }]
         }
+        // T-SQL 没有 CREATE OR REPLACE VIEW，沿用 SQLite 的先删后建。
+        Engine::Sqlserver => {
+            let create = if let Some(sql) = bound {
+                ensure_semicolon(&sql)
+            } else {
+                format!("CREATE VIEW {qualified} AS
+{};", statement.trim().trim_end_matches(';').trim())
+            };
+            vec![
+                Step { label: format!("删除视图 {table}"), sql: format!("DROP VIEW {qualified};") },
+                Step { label: format!("创建视图 {table}"), sql: create },
+            ]
+        }
     };
     finish(snapshot.engine, false, target, Vec::new(), risks, steps)
 }
@@ -1519,7 +1539,7 @@ fn targets_current_view(snapshot: &Snapshot, table: &str, target: &ViewTarget) -
 
 fn qualifier_matches(snapshot: &Snapshot, qualifier: &SqlIdent) -> bool {
     match snapshot.engine {
-        Engine::Postgres => ident_matches(snapshot.engine, qualifier, &snapshot.schema),
+        Engine::Postgres | Engine::Sqlserver => ident_matches(snapshot.engine, qualifier, &snapshot.schema),
         Engine::Mysql | Engine::Mariadb => ident_matches(snapshot.engine, qualifier, &snapshot.database),
         Engine::Sqlite => ident_matches(Engine::Sqlite, qualifier, &snapshot.database) || ident_matches(Engine::Sqlite, qualifier, "main"),
     }
@@ -1703,6 +1723,7 @@ fn target_label(engine: Engine, database: &str, schema: &str, table: &str) -> St
         Engine::Postgres => format!("postgres / {database} / {schema}.{table}"),
         Engine::Mysql => format!("mysql / {database}.{table}"),
         Engine::Mariadb => format!("mariadb / {database}.{table}"),
+        Engine::Sqlserver => format!("sqlserver / {database} / {schema}.{table}"),
     }
 }
 

@@ -12,6 +12,7 @@ pub enum Engine {
     Mariadb,
     Postgres,
     Sqlite,
+    Sqlserver,
 }
 
 impl Engine {
@@ -21,6 +22,7 @@ impl Engine {
             Engine::Mariadb => "mariadb",
             Engine::Postgres => "postgres",
             Engine::Sqlite => "sqlite",
+            Engine::Sqlserver => "sqlserver",
         }
     }
 
@@ -30,6 +32,7 @@ impl Engine {
             "mariadb" => Ok(Engine::Mariadb),
             "postgres" => Ok(Engine::Postgres),
             "sqlite" => Ok(Engine::Sqlite),
+            "sqlserver" => Ok(Engine::Sqlserver),
             other => Err(format!("不支持的数据库 {other}")),
         }
     }
@@ -39,6 +42,7 @@ impl Engine {
         match self {
             Engine::Mysql | Engine::Mariadb => Some(3306),
             Engine::Postgres => Some(5432),
+            Engine::Sqlserver => Some(1433),
             Engine::Sqlite => None,
         }
     }
@@ -54,6 +58,7 @@ impl Engine {
             Engine::Mariadb => "MariaDB",
             Engine::Postgres => "PostgreSQL",
             Engine::Sqlite => "SQLite",
+            Engine::Sqlserver => "SQL Server",
         }
     }
 }

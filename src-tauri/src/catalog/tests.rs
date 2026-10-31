@@ -614,3 +614,46 @@ fn body_as_node(body: &super::read::ConnectionBody) -> ConnectionNode {
         error: body.error.clone(),
     }
 }
+
+#[test]
+fn sqlserver_catalog_sql_lists_supported_kinds_and_uses_sys_views() {
+    use super::model::{kind_sql, listed_kinds, metadata_sql, ObjectKind};
+    let kinds: Vec<&str> = listed_kinds(Engine::Sqlserver).iter().map(|kind| super::model::kind_name(*kind)).collect();
+    assert_eq!(kinds, vec!["table", "view", "function", "procedure", "trigger", "sequence"]);
+
+    let tables = kind_sql(Engine::Sqlserver, ObjectKind::Table);
+    assert!(tables.count.contains("FROM sys.tables"));
+    assert!(tables.list.contains("JOIN sys.schemas"));
+    // 分页窗口走 OFFSET/FETCH（2012+ 方言），并按名称排序。
+    assert!(tables.list.contains("ORDER BY t.name OFFSET 0 ROWS FETCH NEXT @P2 ROWS ONLY"));
+
+    let triggers = kind_sql(Engine::Sqlserver, ObjectKind::Trigger);
+    // sys.triggers 没有自己的 schema 列，跟随父对象。
+    assert!(triggers.count.contains("JOIN sys.objects p ON p.object_id = t.parent_id"));
+    assert!(triggers.list.contains("OBJECT_NAME(t.parent_id)"));
+
+    let functions = kind_sql(Engine::Sqlserver, ObjectKind::Function);
+    assert!(functions.count.contains("o.type IN ('FN', 'IF', 'TF', 'AF', 'FT')"));
+
+    let procedures = kind_sql(Engine::Sqlserver, ObjectKind::Procedure);
+    assert!(procedures.list.contains("o.type IN ('P', 'PC')"));
+
+    let sequences = kind_sql(Engine::Sqlserver, ObjectKind::Sequence);
+    assert!(sequences.count.contains("FROM sys.sequences"));
+
+    // 没有独立枚举或域：沿用空清单降级。
+    let empty = kind_sql(Engine::Sqlserver, ObjectKind::Enum);
+    assert_eq!(empty.count, "SELECT 0");
+
+    let metadata = metadata_sql(Engine::Sqlserver);
+    assert!(metadata.databases.contains("FROM sys.databases"));
+    assert!(metadata.databases.contains("'master', 'tempdb', 'model', 'msdb'"));
+    assert!(metadata.schemas.unwrap().contains("FROM sys.schemas"));
+}
+
+#[test]
+fn sqlserver_shows_databases_and_schemas_layers() {
+    assert!(Engine::Sqlserver.shows_databases());
+    assert!(Engine::Sqlserver.shows_schemas());
+    assert!(!Engine::Sqlserver.shows_foreign_keys());
+}

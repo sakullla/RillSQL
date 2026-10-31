@@ -22,6 +22,8 @@ export function objectIdentity(ref: Pick<CatalogObjectRef, "connectionId" | "dat
 }
 
 export function quoteIdent(engine: Engine, name: string): string {
+  // T-SQL 的括号标识符转义是 ]]。
+  if (engine === "sqlserver") return `[${name.replaceAll("]", "]]")}]`;
   const quote = engine === "mysql" || engine === "mariadb" ? "`" : '"';
   return `${quote}${name.split(quote).join(quote + quote)}${quote}`;
 }

@@ -226,3 +226,43 @@ describe("execution plan selection", () => {
     expect(items?.extra).toContain("Using where");
   });
 });
+
+describe("sqlserver SHOWPLAN_ALL plan", () => {
+  it("wraps the statement in a SET SHOWPLAN_ALL batch that compiles without executing", () => {
+    const plan = explainSql("sqlserver", "SELECT * FROM [dbo].[orders]");
+    expect(plan).toEqual({ ok: true, sql: "SET SHOWPLAN_ALL ON;\nSELECT * FROM [dbo].[orders];\nSET SHOWPLAN_ALL OFF" });
+    // 已经是 SHOWPLAN 批次的语句不再包一层。
+    expect(explainSql("sqlserver", "SET SHOWPLAN_ALL ON;\nSELECT 1;\nSET SHOWPLAN_ALL OFF")).toEqual({
+      ok: true,
+      sql: "SET SHOWPLAN_ALL ON;\nSELECT 1;\nSET SHOWPLAN_ALL OFF",
+    });
+    // 层次格式与普通格式一致：行集本身就是层次数据。
+    expect(hierarchicalSql("sqlserver", "SELECT 1")).toEqual(explainSql("sqlserver", "SELECT 1"));
+  });
+
+  it("refuses actual-execution analysis like SQLite", () => {
+    expect(analyzeSql("sqlserver", "SELECT 1")).toEqual({ ok: false, reason: expect.stringContaining("不实际执行语句") });
+  });
+
+  it("builds a tree from SHOWPLAN_ALL rows by NodeId/Parent", () => {
+    const columns = [
+      "StmtId", "NodeId", "Parent", "PhysicalOp", "LogicalOp", "Argument", "DefinedValues", "EstimateRows", "EstimateIO", "EstimateCPU",
+    ];
+    const rows: (string | null)[][] = [
+      ["1", "1", "0", "", "", "SELECT", "", "1", "", ""],
+      ["1", "2", "1", "Clustered Index Scan", "Clustered Index Scan", "OBJECT:([dbo].[orders])", "", "42", "", ""],
+      ["1", "3", "1", "Sort", "Sort", "ORDER BY", "", "42", "", ""],
+      ["1", "4", "3", "Nested Loops", "Inner Join", "OUTER REFERENCES", "", "10", "", ""],
+    ];
+    const plan = presentPlan(columns, rows);
+    expect(plan.kind).toBe("tree");
+    if (plan.kind !== "tree") return;
+    expect(plan.nodes).toHaveLength(4);
+    expect(plan.nodes[0]).toMatchObject({ depth: 0, operation: "SELECT", rows: "1" });
+    expect(plan.nodes[1]).toMatchObject({ depth: 1, operation: "Clustered Index Scan", rows: "42" });
+    expect(plan.nodes[2]).toMatchObject({ depth: 1, operation: "Sort" });
+    expect(plan.nodes[3]).toMatchObject({ depth: 2, operation: "Nested Loops" });
+    // 没有 SHOWPLAN 列名时不当树处理。
+    expect(presentPlan(["a", "b"], [["1", "2"]]).kind).toBe("table");
+  });
+});

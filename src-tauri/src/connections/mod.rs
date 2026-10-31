@@ -1,7 +1,7 @@
 //! 连接：保存、测试、打开和删除，TLS 校验名与 SSH 通道分开。
 
 pub mod commands;
-mod drivers;
+pub(crate) mod drivers;
 pub(crate) mod export;
 pub(crate) mod forward;
 mod hostkey;

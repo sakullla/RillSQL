@@ -47,7 +47,8 @@ export function isPreviewEnvelope(value: string, typeName?: string): boolean {
 export function valueFamily(typeName: string | undefined): ValueFamily {
   if (isUnknownType(typeName)) return "unknown";
   const name = baseType(typeName ?? "");
-  if (name === "bool" || name === "boolean") return "bool";
+  // bit 是 T-SQL 的布尔类型；MySQL 的 bit 约定同走布尔家族（与 Rust value_family 镜像）。
+  if (name === "bool" || name === "boolean" || name === "bit") return "bool";
   if (isBinaryName(name)) return "binary";
   if (isGeometryName(name)) return "geometry";
   const temporal = temporalKind(name);
@@ -62,7 +63,7 @@ export function valueFamily(typeName: string | undefined): ValueFamily {
 export function temporalKind(typeName: string): TemporalKind | null {
   const name = baseType(typeName);
   if (name === "date") return "date";
-  if (name === "datetime" || name === "timestamptz" || name.startsWith("timestamp")) return "datetime";
+  if (name === "datetime" || name === "datetime2" || name === "datetimeoffset" || name === "smalldatetime" || name === "timestamptz" || name.startsWith("timestamp")) return "datetime";
   if (name === "time" || name.startsWith("time ")) return "time";
   return null;
 }
@@ -116,6 +117,8 @@ export function parseHex(value: string): string | null {
 
 export function binaryLiteral(engine: Engine, hex: string): string {
   if (engine === "postgres") return `'\\x${hex}'`;
+  // T-SQL 的二进制字面量是 0x 前缀（空二进制是 0x）。
+  if (engine === "sqlserver") return `0x${hex}`;
   return `X'${hex}'`;
 }
 
@@ -136,7 +139,7 @@ function isIntegerName(name: string): boolean {
 }
 
 function isDecimalName(name: string): boolean {
-  return name === "numeric" || name === "decimal" || name === "number" || name.startsWith("numeric ") || name.startsWith("decimal ");
+  return name === "numeric" || name === "decimal" || name === "number" || name === "money" || name === "smallmoney" || name.startsWith("numeric ") || name.startsWith("decimal ");
 }
 
 function isFloatName(name: string): boolean {
@@ -144,5 +147,5 @@ function isFloatName(name: string): boolean {
 }
 
 function isTextName(name: string): boolean {
-  return name === "text" || name === "tinytext" || name === "mediumtext" || name === "longtext" || name === "clob" || name === "nclob" || name === "varchar" || name === "nvarchar" || name === "char" || name === "nchar" || name === "character" || name === "character varying" || name === "varchar2" || name === "nvarchar2" || name === "string" || name === "json" || name === "jsonb" || name === "uuid" || name === "enum" || name === "set" || name === "xml" || name === "citext" || name === "name" || name === "bpchar" || name === "varying" || name.startsWith("character ");
+  return name === "text" || name === "tinytext" || name === "mediumtext" || name === "longtext" || name === "clob" || name === "nclob" || name === "varchar" || name === "nvarchar" || name === "char" || name === "nchar" || name === "character" || name === "character varying" || name === "varchar2" || name === "nvarchar2" || name === "string" || name === "json" || name === "jsonb" || name === "uuid" || name === "uniqueidentifier" || name === "ntext" || name === "enum" || name === "set" || name === "xml" || name === "citext" || name === "name" || name === "bpchar" || name === "varying" || name.startsWith("character ");
 }

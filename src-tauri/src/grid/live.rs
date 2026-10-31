@@ -134,6 +134,16 @@ pub async fn describe(session: &CatalogSession, database: &str, schema: &str, ta
             }
             describe_postgres(client, schema, table).await
         }
+        CatalogSession::Sqlserver(client) => {
+            if database.is_empty() {
+                return Err("需要数据库名，没有另开连接。".to_owned());
+            }
+            ensure_sqlserver_database(client, database).await?;
+            if schema.is_empty() {
+                return Err("SQL Server 需要指定 schema（表所在的分组名），没有另开连接。".to_owned());
+            }
+            describe_sqlserver(client, schema, table).await
+        }
     }
 }
 
@@ -384,6 +394,7 @@ fn engine_from(hint: &str) -> Engine {
         "mysql" => Engine::Mysql,
         "mariadb" => Engine::Mariadb,
         "sqlite" => Engine::Sqlite,
+        "sqlserver" => Engine::Sqlserver,
         _ => Engine::Postgres,
     }
 }
@@ -614,6 +625,57 @@ async fn stream_statement(
                     Err(err) => return csv.fail(&err.to_string()),
                 }
             }
+        }
+        CatalogSession::Sqlserver(client) => {
+            let mut locked = client.lock().await;
+            let mut stream = match locked.simple_query(sql).await {
+                Ok(stream) => stream,
+                Err(err) => return failed_message(err.to_string()),
+            };
+            let mut names = known_names;
+            let mut rows: Vec<tiberius::Row> = Vec::new();
+            {
+                use futures::TryStreamExt;
+                // QueryItem 不公开导出，经 as_metadata/into_row 取内容。
+                while let Ok(Some(item)) = stream.try_next().await {
+                    if let Some(meta) = item.as_metadata() {
+                        if names.is_none() {
+                            names = Some(meta.columns().iter().map(|column| column.name().to_owned()).collect());
+                        }
+                        continue;
+                    }
+                    if let Some(row) = item.into_row() {
+                        rows.push(row);
+                    }
+                }
+            }
+            drop(stream);
+            drop(locked);
+            let names = names.unwrap_or_default();
+            let typed = plain_columns(&names, columns);
+            let mut csv = match CsvFile::create(&spec.path, partial, spec, &typed, engine) {
+                Ok(csv) => csv,
+                Err(outcome) => return outcome,
+            };
+            csv.set_names(&names);
+            if let Some(outcome) = csv.control(flag, spec) {
+                return outcome;
+            }
+            if spec.header {
+                if let Some(outcome) = csv.write_header(&names) {
+                    return outcome;
+                }
+            }
+            for row in rows {
+                if let Some(outcome) = csv.control(flag, spec) {
+                    return outcome;
+                }
+                let cells = (0..names.len()).map(|index| tds_cell(&row, index)).collect::<Vec<_>>();
+                if let Some(outcome) = csv.write_cells(&cells) {
+                    return outcome;
+                }
+            }
+            csv.finish()
         }
     }
 }
@@ -1151,25 +1213,32 @@ fn residual(written: u64, path: &Path, message: &str) -> ExportOutcome {
 }
 
 fn page_sql(schema: &TableSchema, filters: &[Filter], search: Option<&str>, sort: Option<&Sort>, limit: u64, offset: u64) -> Result<String, String> {
-    let body = page_body(schema, filters, search, sort, false)?;
-    let tail = if offset == 0 { format!(" LIMIT {limit}") } else { format!(" LIMIT {limit} OFFSET {offset}") };
+    let (body, ordered) = page_body(schema, filters, search, sort, false)?;
+    let tail = sql::page_tail(schema.engine, limit, offset, ordered);
     Ok(format!("{body}{tail}"))
 }
 
 fn page_sql_full(schema: &TableSchema, filters: &[Filter], search: Option<&str>, sort: Option<&Sort>, limit: u64) -> Result<String, String> {
-    let body = page_body(schema, filters, search, sort, true)?;
-    Ok(format!("{body} LIMIT {limit}"))
+    let (body, ordered) = page_body(schema, filters, search, sort, true)?;
+    let tail = if schema.engine == Engine::Sqlserver {
+        sql::page_tail(schema.engine, limit, 0, ordered)
+    } else {
+        format!(" LIMIT {limit}")
+    };
+    Ok(format!("{body}{tail}"))
 }
 
 fn page_sql_unlimited(schema: &TableSchema, filters: &[Filter], search: Option<&str>, sort: Option<&Sort>) -> Result<String, String> {
-    page_body(schema, filters, search, sort, true)
+    page_body(schema, filters, search, sort, true).map(|(sql, _)| sql)
 }
 
-fn page_body(schema: &TableSchema, filters: &[Filter], search: Option<&str>, sort: Option<&Sort>, full: bool) -> Result<String, String> {
+fn page_body(schema: &TableSchema, filters: &[Filter], search: Option<&str>, sort: Option<&Sort>, full: bool) -> Result<(String, bool), String> {
     let list = sql::select_list(schema, full || sql::reads_full_values(schema, filters));
     let where_sql = sql::compile_where_with_search(schema, filters, search)?;
     let clause = if where_sql.is_empty() { String::new() } else { format!(" WHERE {where_sql}") };
-    Ok(format!("SELECT {list} FROM {}{clause}{}", sql::qualified_name(schema), order_clause(schema, sort)))
+    let order = order_clause(schema, sort);
+    let ordered = order.starts_with(" ORDER BY");
+    Ok((format!("SELECT {list} FROM {}{clause}{}", sql::qualified_name(schema), order), ordered))
 }
 
 fn count_sql(schema: &TableSchema, filters: &[Filter], search: Option<&str>) -> Result<String, String> {
@@ -1178,6 +1247,7 @@ fn count_sql(schema: &TableSchema, filters: &[Filter], search: Option<&str>) -> 
     let count = match schema.engine {
         Engine::Postgres => "COUNT(*)::bigint",
         Engine::Sqlite | Engine::Mysql | Engine::Mariadb => "COUNT(*)",
+        Engine::Sqlserver => "CAST(COUNT_BIG(*) AS BIGINT)",
     };
     Ok(format!("SELECT {count} FROM {}{clause}", sql::qualified_name(schema)))
 }
@@ -1253,6 +1323,11 @@ pub async fn fetch_cells(session: &CatalogSession, sql: &str, width: usize) -> R
                 .map(|row| (0..width).map(|index| pg_cell(row, index)).collect::<Result<Vec<_>, _>>())
                 .collect()
         }
+        CatalogSession::Sqlserver(client) => {
+            let (_names, rows) = sqlserver_rows(client, sql).await?;
+            let _ = width;
+            Ok(rows)
+        }
     }
 }
 
@@ -1271,6 +1346,13 @@ async fn fetch_count(session: &CatalogSession, sql: &str) -> Result<i64, String>
             let row = client.query_one(sql, &[]).await.map_err(db_err)?;
             row.try_get(0).map_err(db_err)
         }
+        CatalogSession::Sqlserver(client) => {
+            let (_names, rows) = sqlserver_rows(client, sql).await?;
+            match rows.first().and_then(|row| row.first()) {
+                Some(Cell::Text(text)) => text.parse::<i64>().map_err(|_| format!("计数无效 {text}")),
+                _ => Err("没有计数".to_owned()),
+            }
+        }
     }
 }
 
@@ -1286,6 +1368,11 @@ async fn execute_sql(session: &CatalogSession, sql: &str) -> Result<u64, String>
             Ok(affected)
         }
         CatalogSession::Postgres(client) => client.execute(sql, &[]).await.map_err(db_err),
+        // execute 走 sp_executesql，返回受影响行数；结果流在下一条语句前会被 tiberius 排空。
+        CatalogSession::Sqlserver(client) => {
+            let mut client = client.lock().await;
+            client.execute(sql, &[]).await.map(|done| done.total()).map_err(db_err)
+        }
     }
 }
 
@@ -1597,4 +1684,199 @@ fn mysql_text(row: &mysql_async::Row, index: usize) -> Result<String, String> {
         Cell::Text(text) => Ok(text),
         Cell::Null => Err("元数据列是空值".to_owned()),
     }
+}
+
+fn tds_text_cell(row: &tiberius::Row, index: usize) -> Option<String> {
+    row.try_get::<&str, _>(index).ok().flatten().map(str::to_owned)
+}
+
+/// TDS 行到 Cell：文本优先，数字/浮点/布尔逐类兜底，二进制转十六进制（与前端投影协议一致）。
+fn tds_cell(row: &tiberius::Row, index: usize) -> Cell {
+    if let Some(text) = tds_text_cell(row, index) {
+        return Cell::Text(text);
+    }
+    if let Ok(Some(value)) = row.try_get::<i64, _>(index) {
+        return Cell::Text(value.to_string());
+    }
+    if let Ok(Some(value)) = row.try_get::<i32, _>(index) {
+        return Cell::Text(value.to_string());
+    }
+    if let Ok(Some(value)) = row.try_get::<i16, _>(index) {
+        return Cell::Text(value.to_string());
+    }
+    if let Ok(Some(value)) = row.try_get::<u8, _>(index) {
+        return Cell::Text(value.to_string());
+    }
+    if let Ok(Some(value)) = row.try_get::<f64, _>(index) {
+        return Cell::Text(value.to_string());
+    }
+    if let Ok(Some(value)) = row.try_get::<f32, _>(index) {
+        return Cell::Text(value.to_string());
+    }
+    if let Ok(Some(value)) = row.try_get::<bool, _>(index) {
+        return Cell::Text(if value { "1" } else { "0" }.to_owned());
+    }
+    if let Ok(Some(value)) = row.try_get::<&[u8], _>(index) {
+        return Cell::Text(to_hex_text(value));
+    }
+    Cell::Null
+}
+
+fn to_hex_text(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+type TdsHandle = std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>;
+
+pub(crate) async fn sqlserver_rows(client: &TdsHandle, sql: &str) -> Result<(Vec<String>, Vec<Vec<Cell>>), String> {
+    let mut locked = client.lock().await;
+    let mut stream = locked.simple_query(sql).await.map_err(db_err)?;
+    let mut names: Vec<String> = Vec::new();
+    let mut rows = Vec::new();
+    {
+        use futures::TryStreamExt;
+        // QueryItem 不公开导出，经 as_metadata/into_row 取内容。
+        while let Some(item) = stream.try_next().await.map_err(|err| db_err(err.to_string()))? {
+            if let Some(meta) = item.as_metadata() {
+                if names.is_empty() {
+                    names = meta.columns().iter().map(|column| column.name().to_owned()).collect();
+                }
+                continue;
+            }
+            if let Some(row) = item.into_row() {
+                if names.is_empty() {
+                    names = (0..row.len()).map(|index| format!("col{}", index + 1)).collect();
+                }
+                let cells = (0..names.len()).map(|index| tds_cell(&row, index)).collect();
+                rows.push(cells);
+            }
+        }
+    }
+    Ok((names, rows))
+}
+
+async fn ensure_sqlserver_database(client: &TdsHandle, database: &str) -> Result<(), String> {
+    let (_names, rows) = sqlserver_rows(client, "SELECT DB_NAME()").await?;
+    let current = match rows.first().and_then(|row| row.first()) {
+        Some(Cell::Text(text)) => text.clone(),
+        _ => String::new(),
+    };
+    if current != database {
+        return Err(other_database(&current, database));
+    }
+    Ok(())
+}
+
+async fn describe_sqlserver(client: &TdsHandle, schema: &str, table: &str) -> Result<TableSchema, String> {
+    let kind_rows = sqlserver_rows(
+        client,
+        &format!(
+            "SELECT CASE WHEN o.type = 'V' THEN 'VIEW' ELSE 'BASE TABLE' END FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = N'{}' AND o.name = N'{}' AND o.type IN ('U', 'V')",
+            escape_tds_text(schema),
+            escape_tds_text(table)
+        ),
+    )
+    .await?;
+    let kind_text = match kind_rows.1.first().and_then(|row| row.first()) {
+        Some(Cell::Text(text)) => text.clone(),
+        _ => return Err(format!("找不到表或视图 {schema}.{table}")),
+    };
+    let kind = if kind_text.eq_ignore_ascii_case("VIEW") { "view" } else { "table" };
+    let column_rows = sqlserver_rows(
+        client,
+        &format!(
+            "SELECT c.name, TYPE_NAME(c.user_type_id), c.is_nullable, c.is_identity, dc.definition FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id WHERE s.name = N'{}' AND o.name = N'{}' ORDER BY c.column_id",
+            escape_tds_text(schema),
+            escape_tds_text(table)
+        ),
+    )
+    .await?;
+    let pk_rows = sqlserver_rows(
+        client,
+        &format!(
+            "SELECT c.name FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE i.is_primary_key = 1 AND s.name = N'{}' AND o.name = N'{}' ORDER BY ic.key_ordinal",
+            escape_tds_text(schema),
+            escape_tds_text(table)
+        ),
+    )
+    .await?;
+    let unique_rows = sqlserver_rows(
+        client,
+        &format!(
+            "SELECT i.name, i.is_unique, ic.key_ordinal, c.name FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE i.is_unique = 1 AND i.is_primary_key = 0 AND s.name = N'{}' AND o.name = N'{}' ORDER BY i.name, ic.key_ordinal",
+            escape_tds_text(schema),
+            escape_tds_text(table)
+        ),
+    )
+    .await?;
+    let pk: Vec<String> = pk_rows
+        .1
+        .iter()
+        .filter_map(|row| match row.first() {
+            Some(Cell::Text(text)) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut groups: Vec<(String, bool, Vec<String>)> = Vec::new();
+    for row in &unique_rows.1 {
+        let cells: Vec<&Cell> = row.iter().collect();
+        let name = match cells.first().and_then(|cell| match cell {
+            Cell::Text(text) => Some(text.as_str()),
+            _ => None,
+        }) {
+            Some(name) => name.to_owned(),
+            None => continue,
+        };
+        let unique = cells.get(1).map(|cell| matches!(cell, Cell::Text(text) if text == "1")).unwrap_or(false);
+        let column = cells
+            .get(3)
+            .and_then(|cell| match cell {
+                Cell::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if let Some(group) = groups.iter_mut().find(|group| group.0 == name) {
+            group.2.push(column);
+        } else {
+            groups.push((name, unique, vec![column]));
+        }
+    }
+    let key = if !pk.is_empty() {
+        pk.clone()
+    } else {
+        groups.iter().find(|group| group.1).map(|group| group.2.clone()).unwrap_or_default()
+    };
+    let mut columns = Vec::new();
+    for row in &column_rows.1 {
+        let cells: Vec<&Cell> = row.iter().collect();
+        let name = match cells.first().and_then(|cell| match cell {
+            Cell::Text(text) => Some(text.clone()),
+            _ => None,
+        }) {
+            Some(name) => name,
+            None => return Err("列名是空的".to_owned()),
+        };
+        let type_name = cells.get(1).and_then(|cell| match cell {
+            Cell::Text(text) => Some(text.clone()),
+            _ => None,
+        }).unwrap_or_default();
+        let nullable = cells.get(2).map(|cell| matches!(cell, Cell::Text(text) if text == "1")).unwrap_or(true);
+        let identity = cells.get(3).map(|cell| matches!(cell, Cell::Text(text) if text == "1")).unwrap_or(false);
+        let primary = pk.iter().any(|item| item == &name);
+        let unique = primary || groups.iter().any(|group| group.1 && group.2.len() == 1 && group.2[0] == name);
+        // IDENTITY 列即网格的自增列：插入时省略、UPDATE 不进 SET。
+        columns.push(Column { name, type_name, nullable, primary, unique, auto: identity });
+    }
+    Ok(TableSchema { engine: Engine::Sqlserver, schema: schema.to_owned(), name: table.to_owned(), kind, columns, key })
+}
+
+/// 元数据查询里内联的 N'...' 文本转义。标识符与表名来自用户输入。
+fn escape_tds_text(value: &str) -> String {
+    value.replace('\'', "''")
 }

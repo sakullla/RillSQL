@@ -1054,3 +1054,18 @@ async fn transient_failures_back_off_then_give_up_after_limited_attempts() {
     assert_eq!(db.version_calls.load(Ordering::SeqCst), initial_version_calls + 3);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn sqlserver_version_banner_parsing_maps_years_to_engine_majors() {
+    use super::drivers::{sqlserver_product_major, SQLSERVER_MIN_MAJOR};
+    assert_eq!(sqlserver_product_major("Microsoft SQL Server 2022 (RTM) - 16.0.1000.6 (X64)"), Some(16));
+    assert_eq!(sqlserver_product_major("Microsoft SQL Server 2019 (RTM) - 15.0.2000.5"), Some(15));
+    assert_eq!(sqlserver_product_major("Microsoft SQL Server 2012 (SP4) - 11.0.7001.08"), Some(11));
+    assert_eq!(sqlserver_product_major("Microsoft SQL Server 2008 (SP3) - 10.0.5512.0"), Some(10));
+    assert_eq!(sqlserver_product_major("Microsoft SQL Server 2005 - 9.00.5000.00"), Some(0));
+    assert_eq!(sqlserver_product_major(""), None);
+    // 方言下限：2012 是 OFFSET/FETCH 与新版目录视图的边界。
+    assert_eq!(SQLSERVER_MIN_MAJOR, 11);
+    assert!(sqlserver_product_major("Microsoft SQL Server 2022 (RTM) - 16.0.1000.6").unwrap() >= SQLSERVER_MIN_MAJOR);
+    assert!(sqlserver_product_major("Microsoft SQL Server 2008 (SP3) - 10.0.5512.0").unwrap() < SQLSERVER_MIN_MAJOR);
+}

@@ -203,7 +203,11 @@ fn length_note(target_type: &str) -> Option<String> {
 /// 主键/唯一键冲突的识别：三族引擎对同一错误的措辞不同。
 pub(crate) fn is_conflict_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("duplicate entry") || lower.contains("duplicate key") || lower.contains("unique constraint")
+    lower.contains("duplicate entry")
+        || lower.contains("duplicate key")
+        || lower.contains("unique constraint")
+        || lower.contains("violation of primary key constraint")
+        || lower.contains("violation of unique key constraint")
 }
 
 fn engine_matches(session: &CatalogSession, engine: Engine) -> bool {
@@ -212,6 +216,7 @@ fn engine_matches(session: &CatalogSession, engine: Engine) -> bool {
         (Engine::Sqlite, CatalogSession::Sqlite { .. })
             | (Engine::Mysql | Engine::Mariadb, CatalogSession::Mysql(_))
             | (Engine::Postgres, CatalogSession::Postgres(_))
+            | (Engine::Sqlserver, CatalogSession::Sqlserver(_))
     )
 }
 
@@ -307,6 +312,18 @@ async fn insert_page(target: &CatalogSession, statement: &str) -> Result<(), Str
                 }
             }
         }
+        // 同一条 TDS 连接上的显式事务；失败回滚后由调用方降级逐行重放。
+        CatalogSession::Sqlserver(client) => {
+            let mut locked = client.lock().await;
+            locked.execute("BEGIN TRANSACTION", &[]).await.map_err(|err| err.to_string())?;
+            match locked.execute(statement.to_owned(), &[]).await {
+                Ok(_) => locked.execute("COMMIT", &[]).await.map(|_| ()).map_err(|err| err.to_string()),
+                Err(error) => {
+                    let _ = locked.execute("ROLLBACK", &[]).await;
+                    Err(error.to_string())
+                }
+            }
+        }
     }
 }
 
@@ -322,6 +339,10 @@ async fn exec_one(target: &CatalogSession, statement: &str) -> Result<(), String
                 .map_err(|err| err.to_string())
         }
         CatalogSession::Postgres(client) => client.execute(statement, &[]).await.map(|_| ()).map_err(|err| err.to_string()),
+        CatalogSession::Sqlserver(client) => {
+            let mut locked = client.lock().await;
+            locked.execute(statement.to_owned(), &[]).await.map(|_| ()).map_err(|err| err.to_string())
+        }
     }
 }
 

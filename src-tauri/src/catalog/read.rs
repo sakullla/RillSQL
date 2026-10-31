@@ -99,6 +99,18 @@ pub async fn read_catalog_session(engine: Engine, session: &CatalogSession, page
                 databases: Vec::new(),
             },
         },
+        (Engine::Sqlserver, CatalogSession::Sqlserver(client)) => match read_sqlserver(client, page, windows).await {
+            Ok(databases) => ConnectionBody {
+                error: None,
+                foreign_keys: None,
+                databases,
+            },
+            Err(message) => ConnectionBody {
+                error: Some(message),
+                foreign_keys: None,
+                databases: Vec::new(),
+            },
+        },
         (_, CatalogSession::Scripted) => ConnectionBody {
             error: Some(scripted_message()),
             foreign_keys: None,
@@ -148,6 +160,18 @@ pub async fn read_catalog_outline(engine: Engine, session: &CatalogSession) -> C
                 databases: Vec::new(),
             },
         },
+        (Engine::Sqlserver, CatalogSession::Sqlserver(client)) => match read_sqlserver_outline(client).await {
+            Ok(databases) => ConnectionBody {
+                error: None,
+                foreign_keys: None,
+                databases,
+            },
+            Err(message) => ConnectionBody {
+                error: Some(message),
+                foreign_keys: None,
+                databases: Vec::new(),
+            },
+        },
         (_, CatalogSession::Scripted) => ConnectionBody {
             error: Some(scripted_message()),
             foreign_keys: None,
@@ -176,6 +200,7 @@ pub async fn read_object_page(session: &CatalogSession, engine: Engine, database
         },
         CatalogSession::Mysql(pool) => read_mysql_page(pool, engine, database, offset, limit).await,
         CatalogSession::Postgres(client) => read_postgres_page(client, database, schema, offset, limit).await,
+        CatalogSession::Sqlserver(client) => read_sqlserver_page(client, database, schema, offset, limit).await,
     }
 }
 
@@ -197,6 +222,7 @@ pub async fn read_definition(
         CatalogSession::Sqlite { pool, .. } => read_sqlite_definition(pool, name, kind).await,
         CatalogSession::Mysql(pool) => read_mysql_definition(pool, engine, database, name, kind).await,
         CatalogSession::Postgres(client) => read_postgres_definition(client, schema, name, kind, signature, relation).await,
+        CatalogSession::Sqlserver(client) => read_sqlserver_definition(client, schema, name, kind).await,
     }
 }
 
@@ -806,5 +832,239 @@ fn mysql_i64(row: &mysql_async::Row, index: usize) -> Option<i64> {
         mysql_async::Value::UInt(number) => i64::try_from(*number).ok(),
         mysql_async::Value::Bytes(bytes) => std::str::from_utf8(bytes).ok().and_then(|text| text.parse().ok()),
         _ => None,
+    }
+}
+
+type TdsHandle = std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>;
+
+/// 执行带参数的查询并收齐所有行。分类查询都不大，一次性收完即可。
+async fn tds_query_rows(client: &TdsHandle, sql: &str, params: &[&dyn tiberius::ToSql]) -> Result<Vec<tiberius::Row>, String> {
+    use futures::TryStreamExt;
+    let mut client = client.lock().await;
+    let mut stream = client.query(sql, params).await.map_err(read_failure)?;
+    let mut rows = Vec::new();
+    while let Some(item) = stream.try_next().await.map_err(|err| read_failure(err.to_string()))? {
+        if let Some(row) = item.into_row() {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+async fn tds_query_scalar(client: &TdsHandle, sql: &str, params: &[&dyn tiberius::ToSql]) -> Result<String, String> {
+    let rows = tds_query_rows(client, sql, params).await?;
+    let row = rows.into_iter().next().ok_or_else(|| read_failure("没有结果"))?;
+    tds_text(&row, 0).ok_or_else(|| read_failure("元数据列是空值"))
+}
+
+fn tds_text(row: &tiberius::Row, index: usize) -> Option<String> {
+    row.try_get::<&str, _>(index).ok().flatten().map(str::to_owned)
+}
+
+fn tds_i64(row: &tiberius::Row, index: usize) -> Option<i64> {
+    if let Ok(Some(value)) = row.try_get::<i64, _>(index) {
+        return Some(value);
+    }
+    if let Ok(Some(value)) = row.try_get::<i32, _>(index) {
+        return Some(i64::from(value));
+    }
+    tds_text(row, index).and_then(|text| text.parse().ok())
+}
+
+async fn sqlserver_current_database(client: &TdsHandle) -> Result<String, String> {
+    tds_query_scalar(client, "SELECT DB_NAME()", &[]).await
+}
+
+fn assemble_sqlserver(names: &[String], current: &str, schemas: Result<Vec<SchemaNode>, String>) -> Vec<DatabaseNode> {
+    names
+        .iter()
+        .map(|name| {
+            if name == current {
+                match &schemas {
+                    Ok(nodes) => DatabaseNode {
+                        name: name.clone(),
+                        schemas: nodes.clone(),
+                        error: None,
+                    },
+                    Err(message) => DatabaseNode {
+                        name: name.clone(),
+                        schemas: Vec::new(),
+                        error: Some(message.clone()),
+                    },
+                }
+            } else {
+                DatabaseNode {
+                    name: name.clone(),
+                    schemas: Vec::new(),
+                    error: Some(other_database_message(current, name)),
+                }
+            }
+        })
+        .collect()
+}
+
+async fn sqlserver_database_names(client: &TdsHandle) -> Result<(Vec<String>, String), String> {
+    let sql = metadata_sql(Engine::Sqlserver);
+    let rows = tds_query_rows(client, sql.databases, &[]).await?;
+    let mut names = Vec::new();
+    for row in &rows {
+        names.push(tds_text(row, 0).ok_or_else(|| read_failure("元数据列是空值"))?);
+    }
+    let current = sqlserver_current_database(client).await?;
+    if !names.iter().any(|name| name == &current) {
+        names.push(current.clone());
+        names.sort();
+    }
+    Ok((names, current))
+}
+
+async fn read_sqlserver(client: &TdsHandle, page: usize, windows: &[ObjectWindow]) -> Result<Vec<DatabaseNode>, String> {
+    let (names, current) = sqlserver_database_names(client).await?;
+    let schemas_sql = metadata_sql(Engine::Sqlserver)
+        .schemas
+        .ok_or_else(|| read_failure("SQL Server 缺少 schema 查询"))?;
+    let schema_result = match tds_query_rows(client, schemas_sql, &[]).await {
+        Ok(rows) => {
+            let mut schemas = Vec::new();
+            for row in &rows {
+                let name = tds_text(row, 0).ok_or_else(|| read_failure("元数据列是空值"))?;
+                let limit = requested_limit(&current, &name, windows, page);
+                schemas.push(read_sqlserver_schema(client, &name, 0, limit).await);
+            }
+            Ok(schemas)
+        }
+        Err(message) => Err(message),
+    };
+    Ok(assemble_sqlserver(&names, &current, schema_result))
+}
+
+async fn read_sqlserver_outline(client: &TdsHandle) -> Result<Vec<DatabaseNode>, String> {
+    let (names, current) = sqlserver_database_names(client).await?;
+    let schemas_sql = metadata_sql(Engine::Sqlserver)
+        .schemas
+        .ok_or_else(|| read_failure("SQL Server 缺少 schema 查询"))?;
+    let schema_result = match tds_query_rows(client, schemas_sql, &[]).await {
+        Ok(rows) => {
+            let mut schemas = Vec::new();
+            for row in &rows {
+                schemas.push(SchemaNode::empty(tds_text(row, 0).ok_or_else(|| read_failure("元数据列是空值"))?));
+            }
+            Ok(schemas)
+        }
+        Err(message) => Err(message),
+    };
+    Ok(assemble_sqlserver(&names, &current, schema_result))
+}
+
+async fn read_sqlserver_page(client: &TdsHandle, database: &str, schema: &str, offset: usize, limit: usize) -> ObjectPageBody {
+    let current = match sqlserver_current_database(client).await {
+        Ok(name) => name,
+        Err(message) => return empty_page(message),
+    };
+    if database != current {
+        return empty_page(other_database_message(&current, database));
+    }
+    let schema_node = read_sqlserver_schema(client, schema, offset, limit).await;
+    ObjectPageBody {
+        objects: schema_node.objects,
+        total: schema_node.total,
+        error: schema_node.error,
+        kind_reports: schema_node.kind_reports,
+    }
+}
+
+async fn read_sqlserver_schema(client: &TdsHandle, schema: &str, offset: usize, limit: usize) -> SchemaNode {
+    let window = offset.saturating_add(limit);
+    let mut parts = Vec::new();
+    for kind in listed_kinds(Engine::Sqlserver) {
+        parts.push((*kind, read_sqlserver_kind(client, schema, *kind, window).await));
+    }
+    let (objects, total, reports) = finish_kinds(parts, offset, limit);
+    SchemaNode {
+        name: schema.to_owned(),
+        objects,
+        total,
+        error: None,
+        kind_reports: reports,
+    }
+}
+
+async fn read_sqlserver_kind(client: &TdsHandle, schema: &str, kind: ObjectKind, window: usize) -> Result<(usize, Vec<ObjectRow>), String> {
+    let sql = kind_sql(Engine::Sqlserver, kind);
+    let count_rows = tds_query_rows(client, sql.count, &[&schema]).await?;
+    let total = tds_i64(count_rows.first().ok_or_else(|| read_failure("没有对象数量"))?, 0).unwrap_or(0) as usize;
+    let window_i = i64::try_from(window).unwrap_or(i64::MAX);
+    let rows = tds_query_rows(client, sql.list, &[&schema, &window_i]).await?;
+    let mut objects = Vec::new();
+    for row in &rows {
+        objects.push(sqlserver_object(row)?);
+    }
+    Ok((total, objects))
+}
+
+fn sqlserver_object(row: &tiberius::Row) -> Result<ObjectRow, String> {
+    let name = tds_text(row, 0).ok_or_else(|| read_failure("元数据列是空值"))?;
+    let kind = tds_text(row, 1).ok_or_else(|| read_failure("元数据列是空值"))?;
+    Ok(ObjectRow {
+        name,
+        kind: parse_kind(&kind),
+        estimated_rows: known_row_estimate(tds_i64(row, 2)),
+        stale: false,
+        signature: tds_text(row, 3).unwrap_or_default(),
+        relation: tds_text(row, 4).unwrap_or_default(),
+        materialized: false,
+    })
+}
+
+/// SQL Server 的只读定义：函数/过程/触发器/视图走 OBJECT_DEFINITION，序列按 sys.sequences 重建。
+async fn read_sqlserver_definition(client: &TdsHandle, schema: &str, name: &str, kind: &str) -> Result<String, String> {
+    if schema.is_empty() {
+        return Err(definition_failure("SQL Server 需要 schema"));
+    }
+    match kind {
+        "function" | "procedure" | "trigger" | "view" => {
+            let sql = "SELECT OBJECT_DEFINITION(o.object_id) FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = @P1 AND o.name = @P2";
+            let rows = tds_query_rows(client, sql, &[&schema, &name]).await.map_err(definition_failure)?;
+            if rows.len() > 1 {
+                return Err(definition_failure("有多个同名对象，需要更具体的名称"));
+            }
+            let row = rows.first().ok_or_else(|| definition_failure("没有读到定义"))?;
+            let text = tds_text(row, 0).ok_or_else(|| definition_failure("没有读到定义"))?;
+            if text.trim().is_empty() {
+                return Err(definition_failure("没有读到定义"));
+            }
+            Ok(text)
+        }
+        "sequence" => {
+            let sql = "SELECT TYPE_NAME(q.user_type_id), q.start_value, q.increment, q.minimum_value, q.maximum_value, q.is_cycling, q.is_cached, q.cache_size FROM sys.sequences q JOIN sys.schemas s ON s.schema_id = q.schema_id WHERE s.name = @P1 AND q.name = @P2";
+            let rows = tds_query_rows(client, sql, &[&schema, &name]).await.map_err(definition_failure)?;
+            let row = rows.first().ok_or_else(|| definition_failure("没有读到定义"))?;
+            let type_name = tds_text(row, 0).ok_or_else(|| definition_failure("没有读到定义"))?;
+            let start = tds_text(row, 1).unwrap_or_else(|| "1".to_owned());
+            let increment = tds_text(row, 2).unwrap_or_else(|| "1".to_owned());
+            let minimum = tds_text(row, 3).unwrap_or_default();
+            let maximum = tds_text(row, 4).unwrap_or_default();
+            let cycling = tds_text(row, 5).map(|value| value == "1").unwrap_or(false);
+            let cached = tds_text(row, 6).map(|value| value == "1").unwrap_or(true);
+            let cache_size = tds_text(row, 7).unwrap_or_default();
+            let cycle_text = if cycling { " CYCLE" } else { " NO CYCLE" };
+            let cache_text = if cached && !cache_size.is_empty() {
+                format!(" CACHE {cache_size}")
+            } else if cached {
+                " CACHE".to_owned()
+            } else {
+                " NO CACHE".to_owned()
+            };
+            let bounds = format!(
+                "{}{}",
+                if minimum.is_empty() { String::new() } else { format!(" MINVALUE {minimum}") },
+                if maximum.is_empty() { String::new() } else { format!(" MAXVALUE {maximum}") },
+            );
+            Ok(format!(
+                "CREATE SEQUENCE [{schema}].[{name}] AS {type_name} START WITH {start} INCREMENT BY {increment}{bounds}{cycle_text}{cache_text};"
+            ))
+        }
+        "enum" | "domain" => Err(definition_failure("SQL Server 没有独立的枚举或域")),
+        _ => Err(definition_failure("只有函数、存储过程、触发器、视图和序列可以读取只读定义")),
     }
 }

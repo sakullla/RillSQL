@@ -52,7 +52,7 @@ function schemaChoices(id: string, database: string): string[] {
 
 function schemaEntry(id: string, database: string): "choices" | "manual" | "loading" | "none" {
   const known = connection(id);
-  if (!known || known.engine !== "postgres" || !database.trim()) return "none";
+  if (!known || (known.engine !== "postgres" && known.engine !== "sqlserver") || !database.trim()) return "none";
   if (schemaChoices(id, database).length) return "choices";
   if (schemaState[schemaKey(id, database)] === "manual") return "manual";
   return "loading";
@@ -68,7 +68,7 @@ function schemaHint(id: string, database: string): string {
 async function ensureSchemas(id: string, database: string, schema: Ref<string>) {
   const known = connection(id);
   const key = schemaKey(id, database);
-  if (!known || known.engine !== "postgres" || !database.trim() || schemasOf(id, database).length || schemaState[key]) return;
+  if (!known || (known.engine !== "postgres" && known.engine !== "sqlserver") || !database.trim() || schemasOf(id, database).length || schemaState[key]) return;
   schemaState[key] = "loading";
   const still = () => (schema === baselineSchema ? baselineId.value === id && baselineDatabase.value === database : targetId.value === id && targetDatabase.value === database);
   try {
@@ -105,7 +105,7 @@ function side(id: string, database: string, schema: string): CompareSide | null 
   const known = connection(id);
   if (!known) return null;
   const resolvedDatabase = known.engine === "sqlite" ? "main" : database.trim();
-  const resolvedSchema = known.engine === "postgres" ? schema.trim() : "";
+  const resolvedSchema = known.engine === "postgres" || known.engine === "sqlserver" ? schema.trim() : "";
   return { connectionId: id, database: resolvedDatabase, schema: resolvedSchema, engine: known.engine };
 }
 
@@ -122,7 +122,7 @@ function targetOf(): ScriptTarget {
 
 function schemaRejected(id: string, database: string, schema: string): string | null {
   const known = connection(id);
-  if (!known || known.engine !== "postgres" || !database.trim()) return null;
+  if (!known || (known.engine !== "postgres" && known.engine !== "sqlserver") || !database.trim()) return null;
   if (schemaEntry(id, database) === "loading") return "PostgreSQL 的 schema 还在读取，选定前不生成脚本。";
   const choices = schemaChoices(id, database);
   const value = schema.trim();
@@ -137,6 +137,7 @@ function refuseLocal(left: CompareSide, right: CompareSide): string | null {
   const pending = schemaRejected(baselineId.value, baselineDatabase.value, baselineSchema.value) ?? schemaRejected(targetId.value, targetDatabase.value, targetSchema.value);
   if (pending) return pending;
   if (left.engine === "postgres" && (!left.schema || !right.schema)) return "PostgreSQL 需要为基准和对照各选一个 schema，不生成脚本。";
+  if (left.engine === "sqlserver" && (!left.schema || !right.schema)) return "SQL Server 需要为基准和对照各选一个 schema，不生成脚本。";
   return null;
 }
 

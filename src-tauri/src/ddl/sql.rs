@@ -1,11 +1,17 @@
 use super::model::Engine;
 
 pub fn quote_ident(engine: Engine, name: &str) -> String {
-    let quote = match engine {
-        Engine::Mysql | Engine::Mariadb => '`',
-        Engine::Postgres | Engine::Sqlite => '"',
-    };
-    format!("{quote}{}{quote}", name.replace(quote, &format!("{quote}{quote}")))
+    match engine {
+        Engine::Mysql | Engine::Mariadb => {
+            let quote = '`';
+            format!("{quote}{}{quote}", name.replace(quote, &format!("{quote}{quote}")))
+        }
+        Engine::Postgres | Engine::Sqlite => {
+            let quote = '"';
+            format!("{quote}{}{quote}", name.replace(quote, &format!("{quote}{quote}")))
+        }
+        Engine::Sqlserver => format!("[{}]", name.replace(']', "]]")),
+    }
 }
 
 pub fn qualified_table(engine: Engine, database: &str, schema: &str, table: &str) -> Result<String, String> {
@@ -25,6 +31,12 @@ pub fn qualified_table(engine: Engine, database: &str, schema: &str, table: &str
         Engine::Postgres => {
             if schema.is_empty() {
                 return Err("PostgreSQL 需要指定 schema（表所在的分组名），没有另开连接。".to_owned());
+            }
+            Ok(format!("{}.{}", quote_ident(engine, schema), quote_ident(engine, table)))
+        }
+        Engine::Sqlserver => {
+            if schema.is_empty() {
+                return Err("SQL Server 需要指定 schema（表所在的分组名），没有另开连接。".to_owned());
             }
             Ok(format!("{}.{}", quote_ident(engine, schema), quote_ident(engine, table)))
         }
@@ -60,6 +72,10 @@ pub fn valid_default(engine: Engine, raw: &str) -> bool {
     if matches!(engine, Engine::Mysql | Engine::Mariadb) && upper == "CURRENT_TIMESTAMP()" {
         return true;
     }
+    // T-SQL 的 GETDATE()/SYSDATETIME() 是常见默认值；GETUTCDATE() 同属当前时间函数。
+    if engine == Engine::Sqlserver && matches!(upper.as_str(), "GETDATE()" | "GETDATE" | "SYSDATETIME()" | "GETUTCDATE()" | "SYSUTCDATETIME()") {
+        return true;
+    }
     false
 }
 
@@ -82,8 +98,16 @@ pub fn valid_type(engine: Engine, raw: &str) -> bool {
         Engine::Sqlite => !base.is_empty() && base.chars().next().is_some_and(|ch| ch.is_ascii_alphabetic()),
         Engine::Postgres => POSTGRES_TYPES.iter().any(|item| *item == base),
         Engine::Mysql | Engine::Mariadb => MYSQL_TYPES.iter().any(|item| *item == base),
+        Engine::Sqlserver => SQLSERVER_TYPES.iter().any(|item| *item == base),
     }
 }
+
+const SQLSERVER_TYPES: &[&str] = &[
+    "bigint", "int", "smallint", "tinyint", "bit", "decimal", "numeric", "money", "smallmoney",
+    "float", "real", "date", "datetime", "datetime2", "datetimeoffset", "smalldatetime", "time",
+    "char", "varchar", "text", "nchar", "nvarchar", "ntext", "binary", "varbinary", "image",
+    "uniqueidentifier", "xml",
+];
 
 pub fn valid_name(name: &str) -> bool {
     let text = name.trim();

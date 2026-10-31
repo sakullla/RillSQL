@@ -9,7 +9,7 @@ impl Engine {
     }
 
     pub fn shows_schemas(self) -> bool {
-        matches!(self, Engine::Postgres)
+        matches!(self, Engine::Postgres | Engine::Sqlserver)
     }
 
     pub fn shows_foreign_keys(self) -> bool {
@@ -83,6 +83,15 @@ pub fn listed_kinds(engine: Engine) -> &'static [ObjectKind] {
             ObjectKind::Sequence,
             ObjectKind::Enum,
             ObjectKind::Domain,
+        ],
+        // SQL Server 有独立序列（2012+），没有独立枚举或域。
+        Engine::Sqlserver => &[
+            ObjectKind::Table,
+            ObjectKind::View,
+            ObjectKind::Function,
+            ObjectKind::Procedure,
+            ObjectKind::Trigger,
+            ObjectKind::Sequence,
         ],
     }
 }
@@ -253,6 +262,14 @@ pub fn metadata_sql(engine: Engine) -> MetadataSql {
             objects: "SELECT name, type, '', '' FROM sqlite_master WHERE type IN ('table', 'view', 'trigger') AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT ?1 OFFSET ?2",
             foreign_keys: Some("PRAGMA foreign_keys"),
         },
+        Engine::Sqlserver => MetadataSql {
+            databases: "SELECT name FROM sys.databases WHERE state = 0 AND name NOT IN ('master', 'tempdb', 'model', 'msdb') ORDER BY name",
+            schemas: Some(
+                "SELECT name FROM sys.schemas WHERE name NOT IN ('guest', 'INFORMATION_SCHEMA', 'sys') AND name NOT LIKE 'db[_]%' ORDER BY name",
+            ),
+            objects: "SELECT o.name, x.kind, NULL, '', '' FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id CROSS APPLY (SELECT CASE o.type WHEN 'U' THEN 'table' WHEN 'V' THEN 'view' WHEN 'FN' THEN 'function' WHEN 'IF' THEN 'function' WHEN 'TF' THEN 'function' WHEN 'AF' THEN 'function' WHEN 'FT' THEN 'function' WHEN 'P' THEN 'procedure' WHEN 'PC' THEN 'procedure' WHEN 'SO' THEN 'sequence' ELSE 'table' END AS kind) x WHERE s.name = @P1 AND o.type IN ('U', 'V', 'FN', 'IF', 'TF', 'AF', 'FT', 'P', 'PC', 'SO') ORDER BY o.name OFFSET 0 ROWS FETCH NEXT @P2 ROWS ONLY",
+            foreign_keys: None,
+        },
     }
 }
 
@@ -261,6 +278,7 @@ pub fn object_count_sql(engine: Engine) -> &'static str {
         Engine::Postgres => "SELECT COUNT(*)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm')",
         Engine::Mysql | Engine::Mariadb => "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_type IN ('BASE TABLE', 'VIEW')",
         Engine::Sqlite => "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table', 'view', 'trigger') AND name NOT LIKE 'sqlite_%'",
+        Engine::Sqlserver => "SELECT COUNT(*) FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = @P1 AND o.type IN ('U', 'V', 'FN', 'IF', 'TF', 'AF', 'FT', 'P', 'PC', 'SO')",
     }
 }
 
@@ -307,6 +325,7 @@ pub fn kind_sql(engine: Engine, kind: ObjectKind) -> KindSql {
             },
         },
         Engine::Mysql | Engine::Mariadb => mysql_kind_sql(engine, kind),
+        Engine::Sqlserver => sqlserver_kind_sql(kind),
         Engine::Sqlite => match kind {
             ObjectKind::Table => KindSql {
                 count: "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
@@ -332,6 +351,39 @@ fn empty_kind_sql() -> KindSql {
     KindSql {
         count: "SELECT 0",
         list: "SELECT table_name, 'table', NULL, '', '' FROM information_schema.tables WHERE 0",
+    }
+}
+
+/// SQL Server 的分类查询。@P1 是 schema 名，@P2 是窗口大小；OFFSET/FETCH 需要 ORDER BY，都按名称排序。
+fn sqlserver_kind_sql(kind: ObjectKind) -> KindSql {
+    match kind {
+        ObjectKind::Table => KindSql {
+            count: "SELECT COUNT(*) FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = @P1",
+            list: "SELECT t.name, 'table', (SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = t.object_id AND p.index_id IN (0, 1)), '', '' FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = @P1 ORDER BY t.name OFFSET 0 ROWS FETCH NEXT @P2 ROWS ONLY",
+        },
+        ObjectKind::View => KindSql {
+            count: "SELECT COUNT(*) FROM sys.views v JOIN sys.schemas s ON s.schema_id = v.schema_id WHERE s.name = @P1",
+            list: "SELECT v.name, 'view', NULL, '', '' FROM sys.views v JOIN sys.schemas s ON s.schema_id = v.schema_id WHERE s.name = @P1 ORDER BY v.name OFFSET 0 ROWS FETCH NEXT @P2 ROWS ONLY",
+        },
+        ObjectKind::Function => KindSql {
+            count: "SELECT COUNT(*) FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = @P1 AND o.type IN ('FN', 'IF', 'TF', 'AF', 'FT')",
+            list: "SELECT o.name, 'function', NULL, '', '' FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = @P1 AND o.type IN ('FN', 'IF', 'TF', 'AF', 'FT') ORDER BY o.name OFFSET 0 ROWS FETCH NEXT @P2 ROWS ONLY",
+        },
+        ObjectKind::Procedure => KindSql {
+            count: "SELECT COUNT(*) FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = @P1 AND o.type IN ('P', 'PC')",
+            list: "SELECT o.name, 'procedure', NULL, '', '' FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = @P1 AND o.type IN ('P', 'PC') ORDER BY o.name OFFSET 0 ROWS FETCH NEXT @P2 ROWS ONLY",
+        },
+        ObjectKind::Trigger => KindSql {
+            // sys.triggers 没有自己的 schema 列，跟随父对象的 schema。
+            count: "SELECT COUNT(*) FROM sys.triggers t JOIN sys.objects p ON p.object_id = t.parent_id JOIN sys.schemas s ON s.schema_id = p.schema_id WHERE s.name = @P1",
+            list: "SELECT t.name, 'trigger', NULL, '', OBJECT_NAME(t.parent_id) FROM sys.triggers t JOIN sys.objects p ON p.object_id = t.parent_id JOIN sys.schemas s ON s.schema_id = p.schema_id WHERE s.name = @P1 ORDER BY t.name OFFSET 0 ROWS FETCH NEXT @P2 ROWS ONLY",
+        },
+        ObjectKind::Sequence => KindSql {
+            count: "SELECT COUNT(*) FROM sys.sequences q JOIN sys.schemas s ON s.schema_id = q.schema_id WHERE s.name = @P1",
+            list: "SELECT q.name, 'sequence', NULL, '', '' FROM sys.sequences q JOIN sys.schemas s ON s.schema_id = q.schema_id WHERE s.name = @P1 ORDER BY q.name OFFSET 0 ROWS FETCH NEXT @P2 ROWS ONLY",
+        },
+        // SQL Server 没有独立的枚举或域，沿用 MySQL 的空清单降级先例。
+        ObjectKind::Enum | ObjectKind::Domain => empty_kind_sql(),
     }
 }
 

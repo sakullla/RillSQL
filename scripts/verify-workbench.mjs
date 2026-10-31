@@ -17,7 +17,8 @@ try {
     const invoke = window.__TAURI_INTERNALS__.invoke;
     window.__TAURI_INTERNALS__.invoke = async (command, args) => {
       const result = await invoke(command, args);
-      if (command === "query_start") {
+      // SQL Server 的 SHOWPLAN_ALL 批次返回计划行集，不套用大结果集改写。
+      if (command === "query_start" && result.engine !== "sqlserver") {
         result.statements[0].columns = Array.from({ length: 12 }, (_, i) => i === 0 ? "id" : `column_${i}`);
         result.statements[0].rows = Array.from({ length: 10000 }, (_, row) => Array.from({ length: 12 }, (_, col) => col === 0 ? String(row + 1) : `value-${row + 1}-${col}`));
       }
@@ -76,7 +77,8 @@ try {
   await expect(page.locator(".cm-content")).toContainText("SELECT * FROM orders;");
   report.checks.push("Navigation preserves the editor instance and draft; undo and redo still work after returning");
   await page.keyboard.press("Control+p");
-  await page.getByRole("option", { name: /^orders/ }).click();
+  // sqlserver 夹具也有一张 orders：命令面板定位到书店（postgres）那张，保持原有场景。
+  await page.getByRole("option", { name: /^orders 书店/ }).click();
   await expect(page.locator('[aria-label="数据表格"]')).toHaveAttribute("data-loaded", "1000");
   expect(await page.locator("[data-row-id]").count()).toBeLessThan(50);
   await page.locator('[data-cell="1:id"]').click();
@@ -131,6 +133,68 @@ try {
   expect(await fresh.evaluate(() => window.__uiCalls.filter(call => call.command === "plugin:dialog|open").length)).toBe(1);
   report.checks.push("SQLite file picker opens exactly once on request and does not reopen when returning to connections");
   await fresh.close();
+
+  // ---- SQL Server 合成用例（T10）：方言生成/切分/计划解析不依赖 docker ----
+  await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "工作台", exact: true }).click();
+  await expect(tree).toContainText("报表 · SQL Server");
+  await expect(tree).toContainText("dbo");
+  await page.getByRole("button", { name: "新建查询", exact: true }).click();
+  await page.locator("[data-action=target]").click();
+  await page.getByRole("listbox", { name: "执行目标" }).getByRole("option", { name: /报表 · SQL Server/ }).click();
+  await expect(page.locator("[data-action=target]")).toContainText("rillsql");
+
+  // 顶层 BEGIN...END 块在「当前语句」模式下是一条语句：块内分号不切分。
+  await page.locator(".cm-content").click();
+  await page.keyboard.insertText("BEGIN\n  UPDATE [dbo].[orders] SET [status] = N'paid';\n  UPDATE [dbo].[orders] SET [total] = 1;\nEND\nSELECT 1;");
+  // 光标移进块内（END 行），用「执行当前语句」模式验证切分：块是一条语句。
+  await page.keyboard.press("ArrowUp");
+  await page.locator("[data-action=run-menu]").click();
+  await page.getByRole("menuitem", { name: "执行当前语句" }).click();
+  const blockRun = await page.evaluate(() => window.__uiCalls.filter(call => call.command === "query_start").at(-1).args.request);
+  expect(blockRun.sql.replace(/\s+/g, " ").trim()).toBe("BEGIN UPDATE [dbo].[orders] SET [status] = N'paid'; UPDATE [dbo].[orders] SET [total] = 1; END");
+  expect(blockRun.engine).toBe("sqlserver");
+  report.checks.push("SQL Server: top-level BEGIN...END block is sent as one statement in current-statement mode");
+
+  // 执行计划：SET SHOWPLAN_ALL 批次 + 行集按层次呈现。
+  await page.keyboard.press("Control+z");
+  await page.keyboard.insertText("SELECT * FROM [dbo].[orders];");
+  await page.getByRole("button", { name: "执行计划", exact: true }).click();
+  const planRun = await page.evaluate(() => window.__uiCalls.filter(call => call.command === "query_start").at(-1).args.request);
+  expect(planRun.sql).toBe("SET SHOWPLAN_ALL ON;\nSELECT * FROM [dbo].[orders];\nSET SHOWPLAN_ALL OFF");
+  await expect(page.locator("[data-result=plan]")).toContainText("Clustered Index Scan");
+  report.checks.push("SQL Server: plan wraps the statement in a SET SHOWPLAN_ALL batch and renders the rowset as a tree");
+
+  // 网格编辑生成 T-SQL：括号标识符与 N'' 字面量（IDENTITY 列不进 UPDATE SET）。
+  // 当前仍在工作台视图（再次点击「工作台」会切换侧栏显示，这里不再点导航）。
+  // 逐级确认展开（会话默认展开，但前序操作可能折叠过），再打开 sqlserver 的 orders 表数据。
+  const mssqlTree = tree.locator('section[data-connection="mssql-report"]');
+  const expand = async (row) => {
+    if ((await row.getAttribute("aria-expanded")) === "false") await row.click();
+  };
+  await expand(mssqlTree.locator(".tr-conn"));
+  const mssqlDatabase = mssqlTree.locator('[data-level="database"][data-database="rillsql"]');
+  await mssqlDatabase.waitFor();
+  await expand(mssqlDatabase);
+  const mssqlSchema = mssqlTree.locator('[data-level="schema"][data-schema="dbo"]');
+  await mssqlSchema.waitFor();
+  await expand(mssqlSchema);
+  // 对象清单按页显示：先点「再显示」让表出现在树里。
+  await mssqlTree.locator('[data-action="tree-more"]').click();
+  const mssqlOrders = mssqlTree.locator('[data-level="object"][data-object="orders"][data-kind="table"]');
+  await mssqlOrders.waitFor();
+  await mssqlOrders.dblclick();
+  await expect(page.locator('[aria-label="数据表格"]')).toBeVisible();
+  await page.locator('[data-cell="1:status"]').dblclick();
+  await page.getByRole("textbox", { name: "编辑 status" }).fill("shipped");
+  await page.getByRole("button", { name: "确定", exact: true }).click();
+  await page.getByRole("button", { name: "提交", exact: true }).click();
+  const preview = await page.getByRole("dialog", { name: "待提交的更改" }).locator("pre").first().textContent();
+  expect(preview).toContain("UPDATE [dbo].[orders] SET [status] = N'shipped' WHERE [id] = 1");
+  await page.getByRole("dialog", { name: "待提交的更改" }).getByRole("button", { name: "取消" }).click();
+  await page.getByRole("button", { name: "放弃", exact: true }).click();
+  await page.getByRole("button", { name: "确认放弃", exact: true }).click();
+  report.checks.push("SQL Server: grid edit preview emits T-SQL with bracket identifiers and N'' literals");
+
   expect(errors).toEqual([]);
   report.checks.push("No browser page errors");
   report.passed = true;

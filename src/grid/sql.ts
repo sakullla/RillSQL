@@ -8,12 +8,20 @@ export function isNumericType(typeName: string): boolean {
 }
 
 export function quoteIdent(engine: Engine, name: string): string {
+  // T-SQL 的括号标识符转义是 ]]。
+  if (engine === "sqlserver") return `[${name.replaceAll("]", "]]")}]`;
   const quote = engine === "mysql" || engine === "mariadb" ? "`" : '"';
   return `${quote}${name.split(quote).join(quote + quote)}${quote}`;
 }
 
 export function quoteLiteral(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
+}
+
+/** T-SQL 的 Unicode 字符串字面量。其余引擎与 quoteLiteral 相同。 */
+export function textLiteral(engine: Engine, value: string): string {
+  if (engine === "sqlserver") return `N'${value.replaceAll("'", "''")}'`;
+  return quoteLiteral(value);
 }
 
 export function qualifiedName(schema: TableSchema): string {
@@ -29,21 +37,21 @@ export function sqlValue(column: Column, value: string): string {
 
 export function sqlCell(column: Column | undefined, value: string | null, engine: Engine = "postgres"): string {
   if (value === null) return "NULL";
-  if (!column) return quoteLiteral(value);
+  if (!column) return textLiteral(engine, value);
   const family = valueFamily(column.typeName);
-  if (family === "bool") return boolLiteral(value) ?? quoteLiteral(value);
+  if (family === "bool") return boolLiteral(value) ?? textLiteral(engine, value);
   if (family === "binary") {
     const hex = parseHex(value);
-    return hex == null ? quoteLiteral(value) : binaryLiteral(engine, hex);
+    return hex == null ? textLiteral(engine, value) : binaryLiteral(engine, hex);
   }
   if (isNumericType(column.typeName) && numericLiteral(value)) return value;
-  return quoteLiteral(value);
+  return textLiteral(engine, value);
 }
 
-function likeLiteral(value: string, mode: "contains" | "starts"): string {
+function likeLiteral(engine: Engine, value: string, mode: "contains" | "starts"): string {
   const escaped = value.replaceAll("!", "!!").replaceAll("%", "!%").replaceAll("_", "!_").replaceAll("'", "''");
   const pattern = mode === "contains" ? `%${escaped}%` : `${escaped}%`;
-  return `'${pattern}'`;
+  return engine === "sqlserver" ? `N'${pattern}'` : `'${pattern}'`;
 }
 
 export function filterClause(engine: Engine, column: Column, filter: Filter): string {
@@ -55,9 +63,9 @@ export function filterClause(engine: Engine, column: Column, filter: Filter): st
     case "ne":
       return `${ident} <> ${sqlValue(column, value)}`;
     case "contains":
-      return `${ident} ${engine === "postgres" ? "ILIKE" : "LIKE"} ${likeLiteral(value, "contains")} ESCAPE '!'`;
+      return `${ident} ${engine === "postgres" ? "ILIKE" : "LIKE"} ${likeLiteral(engine, value, "contains")} ESCAPE '!'`;
     case "starts":
-      return `${ident} LIKE ${likeLiteral(value, "starts")} ESCAPE '!'`;
+      return `${ident} LIKE ${likeLiteral(engine, value, "starts")} ESCAPE '!'`;
     case "gt":
       return `${ident} > ${sqlValue(column, value)}`;
     case "lt":
@@ -83,6 +91,7 @@ export function filterClause(engine: Engine, column: Column, filter: Filter): st
 function plainCast(engine: Engine, ident: string): string {
   if (engine === "postgres") return `${ident}::text`;
   if (engine === "mysql" || engine === "mariadb") return `CAST(${ident} AS CHAR)`;
+  if (engine === "sqlserver") return `CAST(${ident} AS NVARCHAR(MAX))`;
   return `CAST(${ident} AS TEXT)`;
 }
 
@@ -97,7 +106,7 @@ export function searchClause(engine: Engine, columns: readonly Column[], keyword
   const trimmed = keyword.trim();
   if (!trimmed) return null;
   const op = engine === "postgres" ? "ILIKE" : "LIKE";
-  const pattern = likeLiteral(trimmed, "contains");
+  const pattern = likeLiteral(engine, trimmed, "contains");
   const parts = columns
     .filter((column) => searchableFamily(valueFamily(column.typeName)))
     .map((column) => `${plainCast(engine, quoteIdent(engine, column.name))} ${op} ${pattern} ESCAPE '!'`);
@@ -142,8 +151,18 @@ export function browseSql(schema: TableSchema, filters: readonly Filter[], sort:
   const where = compileWhereWithSearch(schema, filters, search);
   const clause = where.ok && where.sql ? ` WHERE ${where.sql}` : "";
   const order = sort ? ` ORDER BY ${quoteIdent(schema.engine, sort.column)} ${sort.direction === "desc" ? "DESC" : "ASC"}` : "";
-  const tail = offset > 0 ? ` LIMIT ${limit} OFFSET ${offset}` : ` LIMIT ${limit}`;
+  const tail = pageTail(schema.engine, limit, offset, order !== "");
   return `SELECT * FROM ${qualifiedName(schema)}${clause}${order}${tail}`;
+}
+
+/** 分页尾段。T-SQL 的 OFFSET/FETCH 必须跟在 ORDER BY 后面，没有排序时补一个恒定序。 */
+export function pageTail(engine: Engine, limit: number, offset: number, ordered: boolean): string {
+  if (engine === "sqlserver") {
+    return ordered
+      ? ` OFFSET ${offset} ROWS FETCH NEXT ${limit} ROWS ONLY`
+      : ` ORDER BY (SELECT NULL) OFFSET ${offset} ROWS FETCH NEXT ${limit} ROWS ONLY`;
+  }
+  return offset > 0 ? ` LIMIT ${limit} OFFSET ${offset}` : ` LIMIT ${limit}`;
 }
 
 export function whereLocator(schema: TableSchema, columns: readonly string[], values: readonly (string | null)[]): string {

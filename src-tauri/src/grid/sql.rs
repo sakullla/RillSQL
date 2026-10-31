@@ -1,15 +1,31 @@
 use super::store::{Cell, Column, Engine, Filter, FilterOp, Sort, TableSchema};
 
 pub fn quote_ident(engine: Engine, name: &str) -> String {
-    let quote = match engine {
-        Engine::Mysql | Engine::Mariadb => '`',
-        Engine::Postgres | Engine::Sqlite => '"',
-    };
-    format!("{quote}{}{quote}", name.replace(quote, &format!("{quote}{quote}")))
+    match engine {
+        Engine::Mysql | Engine::Mariadb => {
+            let quote = '`';
+            format!("{quote}{}{quote}", name.replace(quote, &format!("{quote}{quote}")))
+        }
+        Engine::Postgres | Engine::Sqlite => {
+            let quote = '"';
+            format!("{quote}{}{quote}", name.replace(quote, &format!("{quote}{quote}")))
+        }
+        // T-SQL 的括号标识符转义是 ]]。
+        Engine::Sqlserver => format!("[{}]", name.replace(']', "]]")),
+    }
 }
 
 pub fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+/// T-SQL 的 Unicode 字符串字面量。其余引擎与 quote_literal 相同。
+pub fn text_literal(engine: Engine, value: &str) -> String {
+    if engine == Engine::Sqlserver {
+        format!("N'{}'", value.replace('\'', "''"))
+    } else {
+        quote_literal(value)
+    }
 }
 
 fn is_numeric(type_name: &str) -> bool {
@@ -44,10 +60,10 @@ pub fn sql_cell(engine: Engine, column: Option<&Column>, value: &Cell) -> String
     match value {
         Cell::Null => "NULL".to_owned(),
         Cell::Text(text) => match column.map(|item| value_family(&item.type_name)) {
-            Some(ValueFamily::Bool) => bool_literal(text).unwrap_or_else(|| quote_literal(text)),
-            Some(ValueFamily::Binary) => parse_hex(text).map(|hex| binary_literal(engine, &hex)).unwrap_or_else(|| quote_literal(text)),
+            Some(ValueFamily::Bool) => bool_literal(text).unwrap_or_else(|| text_literal(engine, text)),
+            Some(ValueFamily::Binary) => parse_hex(text).map(|hex| binary_literal(engine, &hex)).unwrap_or_else(|| text_literal(engine, text)),
             _ if column.is_some_and(|item| is_numeric(&item.type_name) && number_literal(text)) => text.clone(),
-            _ => quote_literal(text),
+            _ => text_literal(engine, text),
         },
     }
 }
@@ -115,12 +131,13 @@ fn is_preview_envelope(value: &str) -> bool {
     false
 }
 
-fn like_literal(value: &str, contains: bool) -> String {
+fn like_literal(engine: Engine, value: &str, contains: bool) -> String {
     let escaped = value.replace('!', "!!").replace('%', "!%").replace('_', "!_").replace('\'', "''");
+    let prefix = if engine == Engine::Sqlserver { "N" } else { "" };
     if contains {
-        format!("'%{escaped}%'")
+        format!("{prefix}'%{escaped}%'")
     } else {
-        format!("'{escaped}%'")
+        format!("{prefix}'{escaped}%'")
     }
 }
 
@@ -132,9 +149,9 @@ pub fn filter_clause(engine: Engine, column: &Column, filter: &Filter) -> String
         FilterOp::Ne => format!("{ident} <> {}", sql_cell(engine, Some(column), &Cell::Text(raw.to_owned()))),
         FilterOp::Contains => {
             let op = if engine == Engine::Postgres { "ILIKE" } else { "LIKE" };
-            format!("{ident} {op} {} ESCAPE '!'", like_literal(raw, true))
+            format!("{ident} {op} {} ESCAPE '!'", like_literal(engine, raw, true))
         }
-        FilterOp::Starts => format!("{ident} LIKE {} ESCAPE '!'", like_literal(raw, false)),
+        FilterOp::Starts => format!("{ident} LIKE {} ESCAPE '!'", like_literal(engine, raw, false)),
         FilterOp::Gt => format!("{ident} > {}", sql_cell(engine, Some(column), &Cell::Text(raw.to_owned()))),
         FilterOp::Lt => format!("{ident} < {}", sql_cell(engine, Some(column), &Cell::Text(raw.to_owned()))),
         FilterOp::Between => {
@@ -192,7 +209,7 @@ pub fn search_clause(engine: Engine, columns: &[Column], keyword: &str) -> Optio
         return None;
     }
     let op = if engine == Engine::Postgres { "ILIKE" } else { "LIKE" };
-    let pattern = like_literal(keyword, true);
+    let pattern = like_literal(engine, keyword, true);
     let parts = columns
         .iter()
         .filter(|column| searchable_family(&column.type_name))
@@ -229,8 +246,23 @@ pub fn browse_sql_with_search(schema: &TableSchema, filters: &[Filter], search: 
     let order = sort
         .map(|item| format!(" ORDER BY {} {}", quote_ident(schema.engine, &item.column), if item.descending { "DESC" } else { "ASC" }))
         .unwrap_or_default();
-    let tail = if offset == 0 { format!(" LIMIT {limit}") } else { format!(" LIMIT {limit} OFFSET {offset}") };
+    let tail = page_tail(schema.engine, limit, offset, !order.is_empty());
     Ok(format!("SELECT * FROM {}{clause}{order}{tail}", qualified_name(schema)))
+}
+
+/// 分页尾段。T-SQL 的 OFFSET/FETCH 必须跟在 ORDER BY 后面，没有排序时补一个恒定序。
+pub fn page_tail(engine: Engine, limit: u64, offset: u64, ordered: bool) -> String {
+    match engine {
+        Engine::Sqlserver => {
+            if ordered {
+                format!(" OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY")
+            } else {
+                format!(" ORDER BY (SELECT NULL) OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY")
+            }
+        }
+        _ if offset == 0 => format!(" LIMIT {limit}"),
+        _ => format!(" LIMIT {limit} OFFSET {offset}"),
+    }
 }
 
 pub fn select_export_gate(sql: &str) -> Result<String, String> {
@@ -347,6 +379,8 @@ fn plain_cast(engine: Engine, ident: &str) -> String {
         Engine::Postgres => format!("{ident}::text"),
         Engine::Mysql | Engine::Mariadb => format!("CAST({ident} AS CHAR)"),
         Engine::Sqlite => format!("CAST({ident} AS TEXT)"),
+        // NVARCHAR(MAX) 承接任意长度的文本形态，日期/数字等隐式转换后参与 LIKE 匹配。
+        Engine::Sqlserver => format!("CAST({ident} AS NVARCHAR(MAX))"),
     }
 }
 
@@ -355,6 +389,8 @@ fn text_preview(engine: Engine, plain: &str) -> String {
         Engine::Postgres => format!("CASE WHEN octet_length({plain}) > 1024 THEN chr(1) || 't:' || octet_length({plain})::text || ':' || left({plain}, 1024) ELSE {plain} END"),
         Engine::Mysql | Engine::Mariadb => format!("CASE WHEN LENGTH({plain}) > 1024 THEN CONCAT(CHAR(1), 't:', LENGTH({plain}), ':', LEFT({plain}, 1024)) ELSE {plain} END"),
         Engine::Sqlite => format!("CASE WHEN length(CAST({plain} AS BLOB)) > 1024 THEN char(1) || 't:' || length(CAST({plain} AS BLOB)) || ':' || substr({plain}, 1, 1024) ELSE {plain} END"),
+        // LEN 按字符计；预览协议的字节数对文本形态按字符数呈现，超长截断仍以 1024 字符为界。
+        Engine::Sqlserver => format!("CASE WHEN LEN({plain}) > 1024 THEN CHAR(1) + N't:' + CAST(LEN({plain}) AS NVARCHAR(20)) + N':' + LEFT({plain}, 1024) ELSE {plain} END"),
     }
 }
 
@@ -363,6 +399,7 @@ fn binary_length(engine: Engine, ident: &str) -> String {
         Engine::Postgres => format!("CASE WHEN {ident} IS NULL THEN NULL ELSE chr(1) || 'b:' || octet_length({ident})::text END"),
         Engine::Mysql | Engine::Mariadb => format!("CASE WHEN {ident} IS NULL THEN NULL ELSE CONCAT(CHAR(1), 'b:', LENGTH({ident})) END"),
         Engine::Sqlite => format!("CASE WHEN {ident} IS NULL THEN NULL ELSE char(1) || 'b:' || length({ident}) END"),
+        Engine::Sqlserver => format!("CASE WHEN {ident} IS NULL THEN NULL ELSE CHAR(1) + N'b:' + CAST(DATALENGTH({ident}) AS NVARCHAR(20)) END"),
     }
 }
 
@@ -371,6 +408,8 @@ fn binary_hex(engine: Engine, ident: &str) -> String {
         Engine::Postgres => format!("encode({ident}, 'hex')"),
         Engine::Mysql | Engine::Mariadb => format!("LOWER(HEX({ident}))"),
         Engine::Sqlite => format!("lower(hex({ident}))"),
+        // CONVERT 样式 2 输出不带 0x 前缀的小写十六进制。
+        Engine::Sqlserver => format!("LOWER(CONVERT(VARCHAR(MAX), {ident}, 2))"),
     };
     format!("CASE WHEN {ident} IS NULL THEN NULL ELSE {hex} END")
 }
@@ -408,7 +447,8 @@ pub fn value_family(type_name: &str) -> ValueFamily {
     if name.is_empty() || name == "类型未知" {
         return ValueFamily::Unknown;
     }
-    if name == "bool" || name == "boolean" {
+    // bit 是 T-SQL 的布尔类型；MySQL 的 bit 约定同走布尔家族（TRUE/FALSE 字面量两者都接受）。
+    if name == "bool" || name == "boolean" || name == "bit" {
         return ValueFamily::Bool;
     }
     if is_binary_name(&name) {
@@ -420,7 +460,7 @@ pub fn value_family(type_name: &str) -> ValueFamily {
     if name == "date" {
         return ValueFamily::Date;
     }
-    if name == "datetime" || name == "timestamptz" || name.starts_with("timestamp") {
+    if name == "datetime" || name == "datetime2" || name == "datetimeoffset" || name == "smalldatetime" || name == "timestamptz" || name.starts_with("timestamp") {
         return ValueFamily::Datetime;
     }
     if name == "time" || name.starts_with("time ") {
@@ -429,7 +469,7 @@ pub fn value_family(type_name: &str) -> ValueFamily {
     if is_integer_name(&name) {
         return ValueFamily::Integer;
     }
-    if name == "numeric" || name == "decimal" || name == "number" {
+    if name == "numeric" || name == "decimal" || name == "number" || name == "money" || name == "smallmoney" {
         return ValueFamily::Decimal;
     }
     if is_float_name(&name) {
@@ -493,6 +533,24 @@ fn binary_literal(engine: Engine, hex: &str) -> String {
     match engine {
         Engine::Postgres => format!("'\\x{hex}'"),
         Engine::Mysql | Engine::Mariadb | Engine::Sqlite => format!("X'{hex}'"),
+        // T-SQL 的二进制字面量是 0x 前缀（空二进制是 0x）。
+        Engine::Sqlserver => format!("0x{hex}"),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod value_family_test {
+    use super::value_family;
+
+    pub fn test_names() -> std::collections::HashMap<&'static str, super::ValueFamily> {
+        let mut map = std::collections::HashMap::new();
+        for name in [
+            "datetime2", "datetimeoffset", "smalldatetime", "money", "smallmoney", "bit",
+            "uniqueidentifier", "nvarchar", "varbinary", "int", "float", "date", "text",
+        ] {
+            map.insert(name, value_family(name));
+        }
+        map
     }
 }
 
@@ -517,6 +575,6 @@ fn is_float_name(name: &str) -> bool {
 fn is_text_name(name: &str) -> bool {
     matches!(
         name,
-        "text" | "tinytext" | "mediumtext" | "longtext" | "clob" | "nclob" | "varchar" | "nvarchar" | "char" | "nchar" | "character" | "character varying" | "varchar2" | "nvarchar2" | "string" | "json" | "jsonb" | "uuid" | "enum" | "set" | "xml" | "citext" | "name" | "bpchar" | "varying"
+        "text" | "tinytext" | "mediumtext" | "longtext" | "clob" | "nclob" | "varchar" | "nvarchar" | "char" | "nchar" | "character" | "character varying" | "varchar2" | "nvarchar2" | "string" | "json" | "jsonb" | "uuid" | "uniqueidentifier" | "ntext" | "enum" | "set" | "xml" | "citext" | "name" | "bpchar" | "varying"
     ) || name.starts_with("character ")
 }

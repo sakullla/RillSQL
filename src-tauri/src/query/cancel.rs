@@ -1,6 +1,6 @@
 //! 取消分已请求、已确认和失败。经 SSH 时必须另开一条通道。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use mysql_async::prelude::Queryable;
 
@@ -103,8 +103,42 @@ pub async fn deliver_cancel(transport: &CancelTransport) -> Result<bool, String>
                 Ok(true)
             }
         }
+        CancelTransport::Sqlserver { spid, config, via_ssh, .. } => {
+            kill_sqlserver(spid, config, *via_ssh).await?;
+            Ok(true)
+        }
         CancelTransport::None => Err("这条连接没有可用来取消的数据库通道。查询仍在执行。".to_owned()),
     }
+}
+
+/// 取消语句的 SQL。spid 是连接建立时读到的会话编号，纯函数供单测核对。
+pub fn kill_sql(spid: u32) -> String {
+    format!("KILL {spid}")
+}
+
+async fn kill_sqlserver(spid: &AtomicU32, config: &tiberius::Config, via_ssh: bool) -> Result<(), String> {
+    let id = spid.load(Ordering::SeqCst);
+    if id == 0 {
+        return Err("还没有读到正在执行的会话编号，取消失败。查询仍在执行。".to_owned());
+    }
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+    // 另开一条传输（经 SSH 时指向本地转发器，是新的 direct-tcpip），不复用正在执行的那条连接。
+    let tcp = tokio::net::TcpStream::connect(config.get_addr()).await.map_err(|err| {
+        if via_ssh {
+            format!("经 SSH 另开取消连接失败：{err}。查询仍在执行。")
+        } else {
+            format!("取消失败：{err}。查询仍在执行。")
+        }
+    })?;
+    tcp.set_nodelay(true).map_err(|err| format!("取消失败：{err}。查询仍在执行。"))?;
+    let mut client = tiberius::Client::connect(config.clone(), tcp.compat())
+        .await
+        .map_err(|err| format!("取消失败：{err}。查询仍在执行。"))?;
+    client
+        .execute(kill_sql(id), &[])
+        .await
+        .map_err(|err| format!("取消失败：{err}。查询仍在执行。"))?;
+    Ok(())
 }
 
 async fn kill_mysql(connection_id: &AtomicU64, opts: &mysql_async::Opts, via_ssh: bool) -> Result<(), String> {
@@ -144,5 +178,8 @@ pub fn is_cancel_error(message: &str) -> bool {
         || lower.contains("cancelling statement")
         || lower.contains("query execution was interrupted")
         || lower.contains("57014")
+        // KILL spid 后正在执行的会话收到这两类报错。
+        || lower.contains("killed")
+        || lower.contains("severe error occurred")
         || message.contains("已取消")
 }

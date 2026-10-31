@@ -25,6 +25,7 @@ pub async fn load_partial(session: &CatalogSession, request: &Request, table: &s
         CatalogSession::Sqlite { pool, .. } => load_sqlite(pool, &request.database, table, recorded).await,
         CatalogSession::Mysql(pool) => load_mysql(pool, request.engine, &request.database, table).await,
         CatalogSession::Postgres(client) => load_postgres(client, &request.database, &request.schema, table).await,
+        CatalogSession::Sqlserver(client) => load_sqlserver(client, &request.database, &request.schema, table).await,
     }
 }
 
@@ -112,6 +113,7 @@ fn ensure_session(session: &CatalogSession, engine: Engine) -> Result<(), String
         (CatalogSession::Sqlite { .. }, Engine::Sqlite) => true,
         (CatalogSession::Mysql(_), Engine::Mysql | Engine::Mariadb) => true,
         (CatalogSession::Postgres(_), Engine::Postgres) => true,
+        (CatalogSession::Sqlserver(_), Engine::Sqlserver) => true,
         (CatalogSession::Scripted, _) => return Err("这个连接没有连着可查询的数据库。".to_owned()),
         _ => false,
     };
@@ -462,6 +464,14 @@ async fn count_nulls(session: &CatalogSession, snapshot: &Snapshot, column: &str
             let row = row.ok_or_else(|| "没有读到 NULL 计数".to_owned())?;
             Ok(mysql_i64(&row, 0))
         }
+        CatalogSession::Sqlserver(client) => {
+            let (_names, rows) = crate::grid::sqlserver_rows(client, &sql).await?;
+            let text = match rows.first().and_then(|row| row.first()) {
+                Some(crate::grid::Cell::Text(text)) => text.clone(),
+                _ => return Err("没有读到 NULL 计数".to_owned()),
+            };
+            text.parse::<i64>().map_err(|_| format!("不是整数 {text}"))
+        }
         CatalogSession::Scripted => Err("这个连接没有连着可查询的数据库。".to_owned()),
     }
 }
@@ -642,6 +652,261 @@ async fn count_nulls_mysql_count(conn: &mut mysql_async::Conn, database: &str, t
     let sql = format!("SELECT COUNT(*) FROM {}", qualified_table(Engine::Mysql, database, "", table)?);
     let row: Option<mysql_async::Row> = mysql_async::prelude::Queryable::query_first(conn, sql).await.map_err(|err| err.to_string())?;
     Ok(mysql_i64(&row.ok_or_else(|| "没有读到行数".to_owned())?, 0))
+}
+
+type TdsHandle = std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>;
+
+async fn tds_strings(client: &TdsHandle, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    let (_names, rows) = crate::grid::sqlserver_rows(client, sql).await?;
+    Ok(rows
+        .into_iter()
+        .map(|cells| {
+            cells
+                .into_iter()
+                .map(|cell| match cell {
+                    crate::grid::Cell::Text(text) => text,
+                    crate::grid::Cell::Null => String::new(),
+                })
+                .collect()
+        })
+        .collect())
+}
+
+fn tds_escape(value: &str) -> String {
+    value.replace('\'', "")
+}
+
+/// SQL Server 的结构读取：sys 视图给出列/索引/外键，视图原文走 OBJECT_DEFINITION。
+async fn load_sqlserver(client: &TdsHandle, database: &str, schema: &str, table: &str) -> Result<Snapshot, String> {
+    if database.is_empty() {
+        return Err("需要数据库名，没有另开连接。".to_owned());
+    }
+    if schema.is_empty() {
+        return Err("SQL Server 需要指定 schema（表所在的分组名），没有另开连接。".to_owned());
+    }
+    let (schema_q, table_q) = (tds_escape(schema), tds_escape(table));
+    let kind_rows = tds_strings(
+        client,
+        &format!(
+            "SELECT CASE WHEN o.type = 'V' THEN 'VIEW' ELSE 'BASE TABLE' END FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = N'{schema_q}' AND o.name = N'{table_q}' AND o.type IN ('U', 'V')"
+        ),
+    )
+    .await?;
+    let Some(kind_row) = kind_rows.first() else {
+        return Err(format!("找不到表或视图 {schema}.{table}"));
+    };
+    let mut snapshot = Snapshot::bare(Engine::Sqlserver, database, schema, table);
+    snapshot.kind = if kind_row.first().map(|text| text.eq_ignore_ascii_case("VIEW")).unwrap_or(false) { "view" } else { "table" }.to_owned();
+    let columns = tds_strings(
+        client,
+        &format!(
+            "SELECT c.name, TYPE_NAME(c.user_type_id) + CASE WHEN TYPE_NAME(c.system_type_id) IN ('varchar', 'nvarchar', 'varbinary') AND c.max_length = -1 THEN '(MAX)' ELSE '' END, c.is_nullable, c.is_identity, dc.definition, c.is_computed FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id WHERE s.name = N'{schema_q}' AND o.name = N'{table_q}' ORDER BY c.column_id"
+        ),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+    for row in &columns {
+        let cells: Vec<&String> = row.iter().collect();
+        let flag = |index: usize| cells.get(index).map(|value| value.as_str() == "1");
+        let text = |index: usize| cells.get(index).map(|value| (*value).clone()).unwrap_or_default();
+        snapshot.columns.push(Column {
+            name: text(0),
+            type_name: text(1),
+            nullable: flag(2).unwrap_or(true),
+            default_sql: {
+                let value = text(4);
+                if value.is_empty() { None } else { Some(value) }
+            },
+            primary: false,
+            auto: flag(3).unwrap_or(false),
+            generated: flag(5).unwrap_or(false),
+        });
+    }
+    let indexes: Vec<Vec<String>> = keep_rows(
+        &mut snapshot.index_error,
+        tds_strings(
+            client,
+            &format!(
+                "SELECT i.name, i.is_primary_key, i.is_unique, ic.is_descending_key, c.name FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = N'{schema_q}' AND o.name = N'{table_q}' AND i.name IS NOT NULL ORDER BY i.name, ic.key_ordinal"
+            ),
+        )
+        .await,
+    );
+    for row in &indexes {
+        let cells: Vec<&String> = row.iter().collect();
+        let flag = |index: usize| cells.get(index).map(|value| value.as_str() == "1");
+        let text = |index: usize| cells.get(index).map(|value| (*value).clone()).unwrap_or_default();
+        let name = text(0);
+        let column = IndexColumn { name: text(4), descending: flag(3).unwrap_or(false) };
+        if let Some(index) = snapshot.indexes.iter_mut().find(|index| index.name == name) {
+            index.columns.push(column);
+        } else {
+            let primary = flag(1).unwrap_or(false);
+            let unique = flag(2).unwrap_or(false);
+            snapshot.indexes.push(Index {
+                name,
+                unique,
+                columns: vec![column],
+                protected: primary,
+                reason: if primary { "由主键约束维护".to_owned() } else { String::new() },
+                partial: false,
+                expression: false,
+                sql: None,
+            });
+        }
+    }
+    for column in &mut snapshot.columns {
+        column.primary = snapshot
+            .indexes
+            .iter()
+            .any(|index| index.protected && index.columns.iter().any(|item| item.name == column.name));
+    }
+    let foreign_keys: Vec<Vec<String>> = keep_rows(
+        &mut snapshot.foreign_key_error,
+        tds_strings(
+            client,
+            &format!(
+                "SELECT fk.name, OBJECT_NAME(fk.parent_object_id), OBJECT_NAME(fk.referenced_object_id), fk.delete_referential_action_desc, fk.update_referential_action_desc FROM sys.foreign_keys fk JOIN sys.objects o ON o.object_id = fk.parent_object_id JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = N'{schema_q}' AND o.name = N'{table_q}'"
+            ),
+        )
+        .await,
+    );
+    // FK 的列对来自 sys.foreign_key_columns；外键行与列行分开读，失败只记在 foreign_key_error。
+    let fk_columns: Vec<Vec<String>> = keep_rows(
+        &mut snapshot.foreign_key_error,
+        tds_strings(
+            client,
+            &format!(
+                "SELECT fk.name, pc.name, rc.name FROM sys.foreign_keys fk JOIN sys.objects o ON o.object_id = fk.parent_object_id JOIN sys.schemas s ON s.schema_id = o.schema_id JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id WHERE s.name = N'{schema_q}' AND o.name = N'{table_q}' ORDER BY fk.name, fkc.constraint_column_id"
+            ),
+        )
+        .await,
+    );
+    if snapshot.foreign_key_error.is_none() {
+        let actions: std::collections::HashMap<String, (String, String)> = foreign_keys
+            .iter()
+            .map(|row| {
+                (
+                    row.first().cloned().unwrap_or_default(),
+                    (
+                        row.get(3).cloned().unwrap_or_else(|| "NO_ACTION".to_owned()),
+                        row.get(4).cloned().unwrap_or_else(|| "NO_ACTION".to_owned()),
+                    ),
+                )
+            })
+            .collect();
+        let ref_tables: std::collections::HashMap<String, String> = foreign_keys
+            .iter()
+            .map(|row| (row.first().cloned().unwrap_or_default(), row.get(2).cloned().unwrap_or_default()))
+            .collect();
+        for row in &fk_columns {
+            let cells: Vec<&String> = row.iter().collect();
+            let text = |index: usize| cells.get(index).map(|value| (*value).clone()).unwrap_or_default();
+            let name = text(0);
+            let column = text(1);
+            let ref_column = text(2);
+            if let Some(key) = snapshot.foreign_keys.iter_mut().find(|key| key.name == name) {
+                key.columns.push(column);
+                key.ref_columns.push(ref_column);
+            } else {
+                let (on_delete, on_update) = actions
+                    .get(&name)
+                    .map(|item| (tsql_fk_action(&item.0), tsql_fk_action(&item.1)))
+                    .unwrap_or_else(|| ("NO ACTION".to_owned(), "NO ACTION".to_owned()));
+                snapshot.foreign_keys.push(ForeignKey {
+                    name: name.clone(),
+                    columns: vec![column],
+                    ref_schema: String::new(),
+                    ref_table: ref_tables.get(&name).cloned().unwrap_or_default(),
+                    ref_columns: vec![ref_column],
+                    on_delete,
+                    on_update,
+                });
+            }
+        }
+    }
+    for key in &snapshot.foreign_keys {
+        if let Some(index) = snapshot.indexes.iter_mut().find(|index| index.name == key.name) {
+            index.protected = true;
+            index.reason = format!("外键 {} 依赖此索引", key.name);
+        }
+    }
+    let incoming: Vec<Vec<String>> = keep_rows(
+        &mut snapshot.foreign_key_error,
+        tds_strings(
+            client,
+            &format!(
+                "SELECT fk.name, OBJECT_NAME(fk.parent_object_id), pc.name, rc.name FROM sys.foreign_keys fk JOIN sys.objects o ON o.object_id = fk.referenced_object_id JOIN sys.schemas s ON s.schema_id = o.schema_id JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id WHERE s.name = N'{schema_q}' AND o.name = N'{table_q}' ORDER BY fk.name, fkc.constraint_column_id"
+            ),
+        )
+        .await,
+    );
+    let mut incoming_keys: Vec<IncomingForeignKey> = Vec::new();
+    for row in &incoming {
+        let cells: Vec<&String> = row.iter().collect();
+        let text = |index: usize| cells.get(index).map(|value| (*value).clone()).unwrap_or_default();
+        let name = text(0);
+        let child = text(1);
+        let column = text(2);
+        let referenced = text(3);
+        if let Some(key) = incoming_keys.iter_mut().find(|key| key.name == name && key.table == child) {
+            key.columns.push(column);
+            key.ref_columns.push(referenced);
+        } else {
+            incoming_keys.push(IncomingForeignKey { name, table: child, schema: schema.to_owned(), columns: vec![column], ref_columns: vec![referenced] });
+        }
+    }
+    snapshot.incoming = incoming_keys;
+    snapshot.row_count = Some(tds_count(client, &qualified_table(Engine::Sqlserver, database, schema, table)?).await?);
+    snapshot.object_exists = true;
+    if snapshot.kind == "view" {
+        match tds_view_definition(client, schema, table).await {
+            Ok(sql) => snapshot.table_sql = sql,
+            Err(message) => {
+                snapshot.table_sql.clear();
+                snapshot.definition_error = Some(message);
+            }
+        }
+    } else {
+        snapshot.table_sql = format!("-- {}.{table}", schema);
+    }
+    Ok(snapshot)
+}
+
+async fn tds_count(client: &TdsHandle, qualified: &str) -> Result<i64, String> {
+    let rows = tds_strings(client, &format!("SELECT COUNT_BIG(*) FROM {qualified}")).await?;
+    let text = rows
+        .first()
+        .and_then(|row| row.first().cloned())
+        .ok_or_else(|| "没有读到行数".to_owned())?;
+    text.parse::<i64>().map_err(|_| format!("不是整数 {text}"))
+}
+
+async fn tds_view_definition(client: &TdsHandle, schema: &str, table: &str) -> Result<String, String> {
+    let rows = tds_strings(
+        client,
+        &format!(
+            "SELECT OBJECT_DEFINITION(o.object_id) FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = N'{}' AND o.name = N'{}' AND o.type = 'V'",
+            tds_escape(schema),
+            tds_escape(table)
+        ),
+    )
+    .await?;
+    let text = rows.first().and_then(|row| row.first().cloned()).unwrap_or_default();
+    if text.trim().is_empty() || text.trim().starts_with("--") {
+        return Err("没有读到视图定义".to_owned());
+    }
+    Ok(text)
+}
+
+/// T-SQL 的引用动作描述（CASCADE / NO_ACTION / SET_NULL / SET_DEFAULT）映射回统一文案。
+fn tsql_fk_action(value: &str) -> String {
+    let normalized = value.to_ascii_uppercase().replace('_', " ");
+    if normalized.is_empty() || normalized == "NO ACTION" {
+        "NO ACTION".to_owned()
+    } else {
+        normalized
+    }
 }
 
 async fn load_postgres(client: &tokio_postgres::Client, database: &str, schema: &str, table: &str) -> Result<Snapshot, String> {

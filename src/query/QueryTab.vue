@@ -259,7 +259,7 @@ const shellTheme = EditorView.theme({
 });
 
 function asEngine(value: string | undefined): Engine | undefined {
-  if (value === "postgres" || value === "mysql" || value === "mariadb" || value === "sqlite") return value;
+  if (value === "postgres" || value === "mysql" || value === "mariadb" || value === "sqlite" || value === "sqlserver") return value;
   return undefined;
 }
 

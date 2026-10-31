@@ -85,7 +85,32 @@ pub async fn run_steps(session: &CatalogSession, steps: &[Step], restore_foreign
         CatalogSession::Sqlite { pool, .. } => run_sqlite(pool, steps, restore_foreign_keys).await,
         CatalogSession::Mysql(pool) => run_mysql(pool, steps).await,
         CatalogSession::Postgres(client) => run_postgres(client, steps).await,
+        CatalogSession::Sqlserver(client) => run_sqlserver(client, steps).await,
     }
+}
+
+async fn run_sqlserver(client: &std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>, steps: &[Step]) -> Result<Vec<StepReceipt>, String> {
+    let mut locked = client.lock().await;
+    let mut results = Vec::new();
+    let mut stop = false;
+    for step in steps {
+        if stop {
+            results.push(receipt(step, StepStatus::Skipped, "前面的语句没有成功，这条没有执行。"));
+            continue;
+        }
+        match locked.execute(step.sql.clone(), &[]).await {
+            Ok(_) => results.push(receipt(step, StepStatus::Ok, "")),
+            Err(tiberius::error::Error::Server(err)) => {
+                stop = true;
+                results.push(receipt(step, StepStatus::Failed, &err.to_string()));
+            }
+            Err(err) => {
+                stop = true;
+                results.push(receipt(step, StepStatus::Unknown, &err.to_string()));
+            }
+        }
+    }
+    Ok(results)
 }
 
 pub(crate) fn committed_foreign_keys(action: &Action, receipt: &Receipt) -> Option<bool> {

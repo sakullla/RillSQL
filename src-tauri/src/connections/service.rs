@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::connections::drivers::{self, TunnelFault};
+use crate::connections::drivers::{self, TunnelFault, TdsClient};
 use crate::connections::hostkey::{self, HostKeyDecision, PresentedKey};
 use crate::connections::model::{
     password_account, ssh_password_account, validate_tag_label, ConnectionDraft, Engine, EnvTag, FieldError, SavedConnection, Secret, SecretInput,
@@ -120,6 +120,17 @@ impl HealthProbe for SelectOneProbe {
                 .await
                 .map(|_| ())
                 .map_err(|err| err.to_string()),
+            CatalogSession::Sqlserver(client) => {
+                let mut client = client.lock().await;
+                use futures::TryStreamExt;
+                let mut stream = client.simple_query("SELECT 1").await.map_err(|err| err.to_string())?;
+                while let Some(item) = stream.try_next().await.map_err(|err| err.to_string())? {
+                    if item.into_row().is_some() {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -136,6 +147,7 @@ enum SessionKind {
     Sqlite(sqlx::SqlitePool),
     Mysql(mysql_async::Pool),
     Postgres(Arc<tokio_postgres::Client>),
+    Sqlserver(Arc<tokio::sync::Mutex<TdsClient>>),
     Scripted,
 }
 
@@ -264,13 +276,19 @@ pub enum CancelTransport {
         via_ssh: bool,
         health: Arc<SessionHealth>,
     },
+    Sqlserver {
+        spid: Arc<AtomicU32>,
+        config: tiberius::Config,
+        via_ssh: bool,
+        health: Arc<SessionHealth>,
+    },
     None,
 }
 
 impl CancelTransport {
     pub fn via_ssh(&self) -> bool {
         match self {
-            Self::Mysql { via_ssh, .. } | Self::Postgres { via_ssh, .. } => *via_ssh,
+            Self::Mysql { via_ssh, .. } | Self::Postgres { via_ssh, .. } | Self::Sqlserver { via_ssh, .. } => *via_ssh,
             _ => false,
         }
     }
@@ -290,7 +308,7 @@ impl CancelTransport {
 
     pub fn health(&self) -> Option<&Arc<SessionHealth>> {
         match self {
-            Self::Sqlite(_, health) | Self::Mysql { health, .. } | Self::Postgres { health, .. } => Some(health),
+            Self::Sqlite(_, health) | Self::Mysql { health, .. } | Self::Postgres { health, .. } | Self::Sqlserver { health, .. } => Some(health),
             Self::None => None,
         }
     }
@@ -301,6 +319,7 @@ impl CancelTransport {
             Self::Sqlite(_, slot) => *slot = health,
             Self::Mysql { health: slot, .. } => *slot = health,
             Self::Postgres { health: slot, .. } => *slot = health,
+            Self::Sqlserver { health: slot, .. } => *slot = health,
             Self::None => {}
         }
     }
@@ -347,6 +366,8 @@ pub enum CatalogSession {
     },
     Mysql(mysql_async::Pool),
     Postgres(Arc<tokio_postgres::Client>),
+    /// tiberius 句柄不可共享借用，目录/查询/网格/对比都经这一把互斥锁串行使用同一条连接。
+    Sqlserver(Arc<tokio::sync::Mutex<TdsClient>>),
     Scripted,
 }
 
@@ -658,6 +679,7 @@ impl Service {
             sqlite_pool: None,
             mysql_pool: None,
             postgres: None,
+            sqlserver: None,
             schema_note: None,
             foreign_keys: None,
             cancel: CancelTransport::None,
@@ -805,6 +827,7 @@ impl Service {
             sqlite_pool: None,
             mysql_pool: None,
             postgres: None,
+            sqlserver: None,
             schema_note: None,
             foreign_keys: None,
             cancel: CancelTransport::None,
@@ -833,6 +856,8 @@ impl Service {
                 SessionKind::Mysql(pool)
             } else if let Some(client) = attempt.postgres.take() {
                 SessionKind::Postgres(Arc::new(client))
+            } else if let Some(client) = attempt.sqlserver.take() {
+                SessionKind::Sqlserver(Arc::new(tokio::sync::Mutex::new(client)))
             } else {
                 SessionKind::Scripted
             };
@@ -908,6 +933,7 @@ impl Service {
             },
             SessionKind::Mysql(pool) => CatalogSession::Mysql(pool.clone()),
             SessionKind::Postgres(client) => CatalogSession::Postgres(Arc::clone(client)),
+            SessionKind::Sqlserver(client) => CatalogSession::Sqlserver(Arc::clone(client)),
             SessionKind::Scripted => CatalogSession::Scripted,
         })
     }
@@ -1196,6 +1222,7 @@ fn clone_catalog_handle(kind: &SessionKind) -> CatalogSession {
         },
         SessionKind::Mysql(pool) => CatalogSession::Mysql(pool.clone()),
         SessionKind::Postgres(client) => CatalogSession::Postgres(Arc::clone(client)),
+        SessionKind::Sqlserver(client) => CatalogSession::Sqlserver(Arc::clone(client)),
         SessionKind::Scripted => CatalogSession::Scripted,
     }
 }
@@ -1334,6 +1361,7 @@ struct Attempt {
     sqlite_pool: Option<sqlx::SqlitePool>,
     mysql_pool: Option<mysql_async::Pool>,
     postgres: Option<tokio_postgres::Client>,
+    sqlserver: Option<TdsClient>,
     schema_note: Option<String>,
     foreign_keys: Option<bool>,
     cancel: CancelTransport,
@@ -1487,6 +1515,17 @@ impl Attempt {
                     health: Arc::new(SessionHealth::default()),
                 };
                 self.postgres = Some(opened.client);
+                opened.version
+            }),
+            Engine::Sqlserver => drivers::open_sqlserver(&self.config, &route, &password).await.map(|opened| {
+                let via_ssh = self.config.ssh.is_some();
+                self.cancel = CancelTransport::Sqlserver {
+                    spid: Arc::new(AtomicU32::new(opened.spid)),
+                    config: opened.kill_config,
+                    via_ssh,
+                    health: Arc::new(SessionHealth::default()),
+                };
+                self.sqlserver = Some(opened.client);
                 opened.version
             }),
             Engine::Sqlite => Err(stages::fail("SQLite 不走远程连接", "未执行")),
@@ -1761,6 +1800,7 @@ pub(crate) async fn report_canned_remote(config: SavedConnection, canned: Canned
         sqlite_pool: None,
         mysql_pool: None,
         postgres: None,
+        sqlserver: None,
         schema_note: None,
         foreign_keys: None,
         cancel: CancelTransport::None,

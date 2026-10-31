@@ -291,7 +291,8 @@ try {
         await page.getByRole("button", { name: "打开命令面板" }).click();
         const palette = page.getByRole("dialog", { name: "命令面板" });
         await palette.getByRole("combobox").fill("orders");
-        await palette.getByRole("option", { name: /^orders/ }).click();
+        // sqlserver 夹具也有一张 orders，命令面板定位到书店（postgres）那张。
+        await palette.getByRole("option", { name: /^orders 书店/ }).click();
         await collapseOverlay(page, width);
         await expect(page.getByLabel("数据表格")).toContainText("林夏");
         await captureImage(page, "data-grid", theme, width, "orders 已读取的三行，含 NULL");

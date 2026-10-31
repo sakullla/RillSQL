@@ -127,7 +127,7 @@ pub struct CommitReport {
 pub const COMMIT_RULE: &str = "按顺序逐条提交，遇到错误即停止；已成功的语句不撤销。";
 
 pub fn touch_api() -> usize {
-    let engines = [Engine::Postgres, Engine::Mysql, Engine::Mariadb, Engine::Sqlite];
+    let engines = [Engine::Postgres, Engine::Mysql, Engine::Mariadb, Engine::Sqlite, Engine::Sqlserver];
     let ops = [
         FilterOp::Eq,
         FilterOp::Ne,

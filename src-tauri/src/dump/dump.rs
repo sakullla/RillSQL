@@ -255,6 +255,7 @@ impl DumpScope {
             Engine::Sqlite => quote_ident(engine, name),
             Engine::Mysql | Engine::Mariadb => format!("{}.{}", quote_ident(engine, &self.database), quote_ident(engine, name)),
             Engine::Postgres => format!("{}.{}", quote_ident(engine, schema), quote_ident(engine, name)),
+            Engine::Sqlserver => format!("{}.{}", quote_ident(engine, schema), quote_ident(engine, name)),
         }
     }
 }
@@ -268,7 +269,10 @@ fn read_failure(err: impl std::fmt::Display) -> String {
 fn engine_matches(session: &CatalogSession, engine: Engine) -> bool {
     matches!(
         (engine, session),
-        (Engine::Sqlite, CatalogSession::Sqlite { .. }) | (Engine::Mysql | Engine::Mariadb, CatalogSession::Mysql(_)) | (Engine::Postgres, CatalogSession::Postgres(_))
+        (Engine::Sqlite, CatalogSession::Sqlite { .. })
+            | (Engine::Mysql | Engine::Mariadb, CatalogSession::Mysql(_))
+            | (Engine::Postgres, CatalogSession::Postgres(_))
+            | (Engine::Sqlserver, CatalogSession::Sqlserver(_))
     )
 }
 
@@ -278,6 +282,7 @@ pub fn engine_name(engine: Engine) -> &'static str {
         Engine::Mysql => "mysql",
         Engine::Mariadb => "mariadb",
         Engine::Sqlite => "sqlite",
+        Engine::Sqlserver => "sqlserver",
     }
 }
 
@@ -338,7 +343,47 @@ async fn resolve_scope(engine: Engine, session: &CatalogSession, database: &str,
                 Ok((current, schemas.to_vec()))
             }
         }
+        Engine::Sqlserver => {
+            let current = sqlserver_current_database(session).await?;
+            if !database.is_empty() && database != current {
+                return Err(format!("当前连接打开的是 {current}，没有另开连接读取 {database}"));
+            }
+            if schemas.is_empty() {
+                let sql = metadata_sql(Engine::Sqlserver).schemas.ok_or_else(|| read_failure("SQL Server 缺少 schema 查询"))?;
+                let all = sqlserver_text_column(session, sql).await?;
+                if all.is_empty() {
+                    return Err(read_failure("没有读到 schema"));
+                }
+                Ok((current, all))
+            } else {
+                Ok((current, schemas.to_vec()))
+            }
+        }
     }
+}
+
+async fn sqlserver_current_database(session: &CatalogSession) -> Result<String, String> {
+    let CatalogSession::Sqlserver(client) = session else {
+        return Err("连接类型和引擎不一致".to_owned());
+    };
+    let (_names, rows) = crate::grid::sqlserver_rows(client, "SELECT DB_NAME()").await.map_err(read_failure)?;
+    match rows.first().and_then(|row| row.first()) {
+        Some(crate::grid::Cell::Text(text)) => Ok(text.clone()),
+        _ => Err(read_failure("没有当前数据库")),
+    }
+}
+
+async fn sqlserver_text_column(session: &CatalogSession, sql: &str) -> Result<Vec<String>, String> {
+    let CatalogSession::Sqlserver(client) = session else {
+        return Err("连接类型和引擎不一致".to_owned());
+    };
+    let (_names, rows) = crate::grid::sqlserver_rows(client, sql).await.map_err(read_failure)?;
+    rows.iter()
+        .map(|row| match row.first() {
+            Some(crate::grid::Cell::Text(text)) => Ok(text.clone()),
+            _ => Err(read_failure("元数据列是空值")),
+        })
+        .collect()
 }
 
 async fn enumerate_objects(engine: Engine, session: &CatalogSession, scope: &DumpScope, flag: &AtomicBool) -> Result<Vec<DumpObject>, String> {
@@ -1016,9 +1061,10 @@ fn write_header(out: &mut BufWriter<File>, engine: Engine, scope: &DumpScope, re
         Engine::Mysql => "MySQL",
         Engine::Mariadb => "MariaDB",
         Engine::Sqlite => "SQLite",
+        Engine::Sqlserver => "SQL Server",
     };
     let database = if scope.database.is_empty() { "main".to_owned() } else { scope.database.clone() };
-    let schemas = if engine == Engine::Postgres { scope.schemas.join(", ") } else { String::new() };
+    let schemas = if matches!(engine, Engine::Postgres | Engine::Sqlserver) { scope.schemas.join(", ") } else { String::new() };
     writeln!(out, "-- RillSQL 全库导出：只读生成，未执行任何语句。")?;
     writeln!(out, "-- 引擎：{engine_label}；库：{database}{}", if schemas.is_empty() { String::new() } else { format!("；schema：{schemas}") })?;
     writeln!(out, "-- 生成时间：{}；{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), if request.include_data { "含结构与数据。" } else { "仅结构，不含数据。" })?;

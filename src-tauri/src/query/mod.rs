@@ -27,6 +27,8 @@ pub fn module_id() -> &'static str {
         std::any::type_name_of_val(&split_sql),
         std::any::type_name_of_val(&cancel::deliver_cancel),
         std::any::type_name_of_val(&exec::run_batch),
+        std::any::type_name_of_val(&exec::showplan_batch),
+        std::any::type_name_of_val(&exec::showplan_outline),
     );
     let _ = _linked;
     "query"

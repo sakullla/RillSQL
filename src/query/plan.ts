@@ -50,10 +50,13 @@ function statementHasAnalyze(sql: string, engine: string): boolean {
   return pieces.some((piece) => codeHasAnalyze(piece.text, engine));
 }
 
-/** PostgreSQL、MySQL、MariaDB 用 EXPLAIN；SQLite 用 EXPLAIN QUERY PLAN。不加 ANALYZE。 */
+const SQLSERVER_ANALYZE = "SQL Server 的计划不实际执行语句，没有发送会修改数据的语句。";
+
+/** PostgreSQL、MySQL、MariaDB 用 EXPLAIN；SQLite 用 EXPLAIN QUERY PLAN；SQL Server 用 SET SHOWPLAN_ALL 只编译不执行。不加 ANALYZE。 */
 export function explainSql(engine: string, statement: string): ExplainSql {
   const body = statement.trim().replace(/;\s*$/, "");
   if (statementHasAnalyze(body, engine)) return { ok: false, reason: ANALYZE };
+  if (engine === "sqlserver") return { ok: true, sql: showplanBatch(body) };
   if (/^\s*explain\b/i.test(body)) {
     if (engine === "sqlite" && !/^\s*explain\s+query\s+plan\b/i.test(body)) {
       return { ok: true, sql: body.replace(/^\s*explain\b/i, "EXPLAIN QUERY PLAN") };
@@ -64,11 +67,19 @@ export function explainSql(engine: string, statement: string): ExplainSql {
   return { ok: true, sql: `${prefix} ${body}` };
 }
 
-/** MySQL / MariaDB 先要层次格式。被拒绝时再退回 explainSql，不执行原语句。 */
+/** SQL Server 的计划批次：SET SHOWPLAN_ALL ON 后只编译不执行，读完行集再关掉。与后端 exec::showplan_batch 镜像。 */
+export function showplanBatch(statement: string): string {
+  const body = statement.trim().replace(/;\s*$/, "");
+  if (/^\s*SET\s+SHOWPLAN_ALL\s+ON\b/i.test(body)) return body;
+  return `SET SHOWPLAN_ALL ON;\n${body};\nSET SHOWPLAN_ALL OFF`;
+}
+
+/** MySQL / MariaDB 先要层次格式。SQL Server 的 SHOWPLAN_ALL 行集本身就是层次数据。被拒绝时再退回 explainSql，不执行原语句。 */
 export function hierarchicalSql(engine: string, statement: string): ExplainSql {
   const plain = explainSql(engine, statement);
   if (!plain.ok) return plain;
-  if (engine !== "mysql" && engine !== "mariadb") return plain;
+  if (engine !== "mysql" && engine !== "mariadb" && engine !== "sqlserver") return plain;
+  if (engine === "sqlserver") return plain;
   const inner = plain.sql.replace(/^\s*EXPLAIN\s+/i, "");
   if (/^\s*FORMAT\s*=/i.test(inner)) return plain;
   const prefix = engine === "mariadb" ? "EXPLAIN FORMAT=JSON" : "EXPLAIN FORMAT=TREE";
@@ -80,6 +91,7 @@ export function analyzeSql(engine: string, statement: string): ExplainSql {
   const body = statement.trim().replace(/;\s*$/, "");
   if (!body) return { ok: false, reason: EMPTY };
   if (engine === "sqlite") return { ok: false, reason: SQLITE_ANALYZE };
+  if (engine === "sqlserver") return { ok: false, reason: SQLSERVER_ANALYZE };
   const inner = body.replace(/^\s*explain(?:\s+query\s+plan|\s+analyze|\s+analyse)?\s+/i, "");
   if (engine === "mariadb") return { ok: true, sql: `ANALYZE ${inner}` };
   return { ok: true, sql: `EXPLAIN ANALYZE ${inner}` };
@@ -100,6 +112,8 @@ export type PlanPresentation =
 export function presentPlan(columns: string[], rows: (string | null)[][]): PlanPresentation {
   const sqlite = sqliteQueryPlan(columns, rows);
   if (sqlite) return sqlite;
+  const showplan = showplanAllPlan(columns, rows);
+  if (showplan) return showplan;
   if (columns.length !== 1) return { kind: "table" };
   const text = rows.map((row) => row[0] ?? "").join("\n").trim();
   const json = parseJsonPlan(text);
@@ -153,6 +167,50 @@ function sqliteQueryPlan(columns: string[], rows: (string | null)[][]): PlanPres
       extra: "",
     })),
   };
+}
+
+/** SHOWPLAN_ALL 的行集按 NodeId/Parent 层次化：根的 Parent 不在结果里时深度为 0。
+ * 操作展示 PhysicalOp（为空时用 LogicalOp，比如语句根行），估算行数取 EstimateRows，其余进 extra。 */
+function showplanAllPlan(columns: string[], rows: (string | null)[][]): PlanPresentation | null {
+  if (rows.length === 0) return null;
+  const names = columns.map((column) => column.trim().toLowerCase());
+  const nodeId = names.indexOf("nodeid");
+  const parent = names.indexOf("parent");
+  const physical = names.indexOf("physicalop");
+  const logical = names.indexOf("logicalop");
+  const estimateRows = names.indexOf("estimaterows");
+  const argument = names.indexOf("argument");
+  if (nodeId < 0 || parent < 0 || physical < 0) return null;
+  const cell = (row: (string | null)[], index: number): string => (index >= 0 && row[index] != null ? String(row[index]).trim() : "");
+  const records = rows
+    .map((row) => ({ id: cell(row, nodeId), parent: cell(row, parent), operation: cell(row, physical) || cell(row, logical) || cell(row, argument) || "语句根", rows: cell(row, estimateRows), extra: cell(row, logical) && cell(row, logical) !== cell(row, physical) ? cell(row, logical) : "" }))
+    .filter((record) => /^\d+$/.test(record.id) && /^\d+$/.test(record.parent));
+  if (records.length === 0 || !records.some((record) => record.operation)) return null;
+  const byId = new Map<string, { id: string; parent: string }>();
+  for (const record of records) {
+    if (!byId.has(record.id)) byId.set(record.id, record);
+  }
+  const depthOf = new Map<string, number>();
+  const depth = (id: string, seen: Set<string>): number => {
+    const known = depthOf.get(id);
+    if (known != null) return known;
+    const record = byId.get(id);
+    if (!record || record.parent === id || !byId.has(record.parent) || seen.has(id)) {
+      depthOf.set(id, 0);
+      return 0;
+    }
+    seen.add(id);
+    const value = depth(record.parent, seen) + 1;
+    depthOf.set(id, value);
+    return value;
+  };
+  const nodes = records.map((record) => ({
+    depth: depth(record.id, new Set()),
+    operation: record.operation,
+    rows: record.rows || null,
+    extra: record.extra,
+  }));
+  return { kind: "tree", nodes };
 }
 
 function isIndentedPlan(text: string): boolean {

@@ -672,6 +672,87 @@ async fn open_session_runs_sql_stops_and_can_cancel_without_a_second_execution_c
 }
 
 #[test]
+fn tsql_split_keeps_top_level_begin_end_blocks_together() {
+    // 顶层 BEGIN...END 是一条语句：块内的分号不结束语句。
+    let batch = split::split_sql("sqlserver", "BEGIN\n  UPDATE t SET n = 1;\n  UPDATE u SET m = 2;\nEND\nSELECT 1;");
+    assert_eq!(batch.pieces.len(), 2, "{batch:?}");
+    assert!(batch.pieces[0].text.starts_with("BEGIN"));
+    assert!(batch.pieces[0].text.trim_end().ends_with("END"));
+    assert_eq!(batch.pieces[1].text.trim_end_matches(';'), "SELECT 1");
+
+    // 嵌套块与 CREATE PROCEDURE 体同规则。
+    let nested = split::split_sql("sqlserver", "BEGIN\n  BEGIN\n    SELECT 1;\n  END\n  SELECT 2;\nEND;");
+    assert_eq!(nested.pieces.len(), 1, "{nested:?}");
+
+    // 块内的字符串分号不参与计数。
+    let quoted = split::split_sql("sqlserver", "BEGIN\n  SELECT 'a;b';\nEND;");
+    assert_eq!(quoted.pieces.len(), 1, "{quoted:?}");
+
+    // BEGIN TRAN 是事务语句，不是块：分号照常切分。
+    let transaction = split::split_sql("sqlserver", "BEGIN TRAN;\nUPDATE t SET n = 1;\nCOMMIT;");
+    assert_eq!(transaction.pieces.len(), 3, "{transaction:?}");
+    let spelled = split::split_sql("sqlserver", "BEGIN TRANSACTION;\nSELECT 1;");
+    assert_eq!(spelled.pieces.len(), 2, "{spelled:?}");
+
+    // 未闭合的 BEGIN 块整批拒绝发送。
+    let unclosed = split::split_sql("sqlserver", "SELECT 1;\nBEGIN\n  SELECT 2;");
+    assert_eq!(unclosed.pieces.len(), 1);
+    assert_eq!(unclosed.refusal.as_deref(), Some("BEGIN 块未闭合，没有发送。"));
+
+    // DELIMITER 是 mysql 客户端指令，T-SQL 同样跳过并提示。
+    let delimiter = split::split_sql("sqlserver", "DELIMITER //\nSELECT 1;");
+    assert_eq!(delimiter.pieces.len(), 1);
+    assert!(delimiter.notices.iter().any(|item| item.contains("SQL Server 不使用 DELIMITER")));
+}
+
+#[test]
+fn sqlserver_cancel_uses_kill_spid_statement() {
+    assert_eq!(cancel::kill_sql(57), "KILL 57");
+    assert_eq!(cancel::kill_sql(0), "KILL 0");
+}
+
+#[test]
+fn sqlserver_result_cap_uses_top_without_touching_with_statements() {
+    assert_eq!(exec::cap_result_sql("sqlserver", "SELECT * FROM t", 10), "SELECT TOP (11) * FROM t");
+    assert_eq!(exec::cap_result_sql("sqlserver", "SELECT * FROM t;", 10), "SELECT TOP (11) * FROM t;");
+    assert_eq!(exec::cap_result_sql("sqlserver", "select * from t", 10), "select TOP (11) * from t");
+    assert_eq!(exec::cap_result_sql("sqlserver", "SELECT * FROM t OFFSET 5 ROWS FETCH NEXT 1000 ROWS ONLY", 10), "SELECT * FROM t OFFSET 5 ROWS FETCH NEXT 11 ROWS ONLY");
+    assert_eq!(exec::cap_result_sql("sqlserver", "SELECT * FROM t FETCH NEXT 5 ROWS ONLY", 10), "SELECT * FROM t FETCH NEXT 5 ROWS ONLY");
+    assert_eq!(exec::cap_result_sql("sqlserver", "SELECT TOP 1000 * FROM t", 10), "SELECT TOP 11 * FROM t");
+    assert_eq!(exec::cap_result_sql("sqlserver", "SELECT TOP (5) * FROM t", 10), "SELECT TOP (5) * FROM t");
+    // WITH 开头的语句不能盲目改写外层，保持原样。
+    assert_eq!(exec::cap_result_sql("sqlserver", "WITH c AS (SELECT * FROM t) SELECT * FROM c", 10), "WITH c AS (SELECT * FROM t) SELECT * FROM c");
+    assert_eq!(exec::cap_result_sql("sqlserver", "UPDATE t SET n = 1", 10), "UPDATE t SET n = 1");
+}
+
+#[test]
+fn sqlserver_showplan_batch_wraps_the_statement_without_executing_it() {
+    // SHOWPLAN 批次：SET 开、原语句、SET 关。原语句保持一行，不做改写。
+    let batch = super::exec::showplan_batch("SELECT * FROM [dbo].[orders]");
+    assert_eq!(batch, "SET SHOWPLAN_ALL ON;\nSELECT * FROM [dbo].[orders];\nSET SHOWPLAN_ALL OFF");
+    assert!(batch.starts_with("SET SHOWPLAN_ALL ON"));
+    assert!(batch.ends_with("SET SHOWPLAN_ALL OFF"));
+    assert!(batch.contains("\nSELECT * FROM [dbo].[orders];\n"));
+}
+
+#[test]
+fn showplan_rows_build_an_outline_by_parent() {
+    // SHOWPLAN_ALL 行集按 Parent/NodeId 层次化：根在 0 层，子算子逐层加深。
+    let rows = vec![
+        (1, 0, "SELECT".to_owned(), "0.03".to_owned()),
+        (2, 1, "Clustered Index Scan".to_owned(), "0.02".to_owned()),
+        (3, 1, "Sort".to_owned(), "0.01".to_owned()),
+        (4, 3, "Nested Loops".to_owned(), "0.005".to_owned()),
+    ];
+    let outline = super::exec::showplan_outline(&rows);
+    assert_eq!(outline.len(), 4);
+    assert_eq!(outline[0], (0, "SELECT".to_owned(), "0.03".to_owned()));
+    assert_eq!(outline[1], (1, "Clustered Index Scan".to_owned(), "0.02".to_owned()));
+    assert_eq!(outline[2], (1, "Sort".to_owned(), "0.01".to_owned()));
+    assert_eq!(outline[3], (2, "Nested Loops".to_owned(), "0.005".to_owned()));
+}
+
+#[test]
 fn result_cap_limits_the_server_read_without_raising_a_smaller_limit() {
     let capped = exec::cap_result_sql("postgres", "SELECT * FROM t", 10);
     assert_eq!(capped, "SELECT * FROM t LIMIT 11");

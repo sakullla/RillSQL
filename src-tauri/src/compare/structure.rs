@@ -454,18 +454,25 @@ fn skip_index(index: &IndexShape, shape: &TableShape) -> bool {
 }
 
 fn quote(engine: Engine, name: &str) -> String {
-    let mark = match engine {
-        Engine::Mysql | Engine::Mariadb => '`',
-        Engine::Postgres | Engine::Sqlite => '"',
-    };
-    format!("{mark}{}{mark}", name.replace(mark, &format!("{mark}{mark}")))
+    match engine {
+        Engine::Mysql | Engine::Mariadb => {
+            let mark = '`';
+            format!("{mark}{}{mark}", name.replace(mark, &format!("{mark}{mark}")))
+        }
+        Engine::Postgres | Engine::Sqlite => {
+            let mark = '"';
+            format!("{mark}{}{mark}", name.replace(mark, &format!("{mark}{mark}")))
+        }
+        // T-SQL 的括号标识符转义是 ]]。
+        Engine::Sqlserver => format!("[{}]", name.replace(']', "]]")),
+    }
 }
 
 fn qualify(engine: Engine, side: &Side, name: &str) -> String {
     match engine {
         Engine::Sqlite => quote(engine, name),
         Engine::Mysql | Engine::Mariadb => format!("{}.{}", quote(engine, &side.database), quote(engine, name)),
-        Engine::Postgres => format!("{}.{}", quote(engine, &side.schema), quote(engine, name)),
+        Engine::Postgres | Engine::Sqlserver => format!("{}.{}", quote(engine, &side.schema), quote(engine, name)),
     }
 }
 
@@ -543,7 +550,7 @@ fn create_index(engine: Engine, side: &Side, table: &str, index: &IndexShape) ->
 
 fn drop_index(engine: Engine, side: &Side, table: &str, index: &IndexShape) -> String {
     match engine {
-        Engine::Mysql | Engine::Mariadb => format!("DROP INDEX {} ON {}", quote(engine, &index.name), qualify(engine, side, table)),
+        Engine::Mysql | Engine::Mariadb | Engine::Sqlserver => format!("DROP INDEX {} ON {}", quote(engine, &index.name), qualify(engine, side, table)),
         Engine::Postgres => format!("DROP INDEX {}.{}", quote(engine, &side.schema), quote(engine, &index.name)),
         Engine::Sqlite => format!("DROP INDEX {}", quote(engine, &index.name)),
     }
@@ -1562,7 +1569,8 @@ fn replaces_in_place(engine: Engine, base: &ObjectDef, other: &ObjectDef) -> boo
         Kind::View => match engine {
             Engine::Mysql | Engine::Mariadb => !base.materialized && !other.materialized,
             Engine::Postgres => !base.materialized && !other.materialized && view_columns_compatible(&base.definition, &other.definition),
-            Engine::Sqlite => false,
+            // T-SQL 没有 CREATE OR REPLACE VIEW，只能先摘依赖再删除重建。
+            Engine::Sqlite | Engine::Sqlserver => false,
         },
         // 返回类型变了时 CREATE OR REPLACE FUNCTION 会被拒绝，只能先摘依赖再删。
         Kind::Function | Kind::Procedure => matches!(engine, Engine::Postgres | Engine::Mariadb) && return_types_compatible(&base.definition, &other.definition),
@@ -2414,7 +2422,8 @@ fn drop_object(engine: Engine, side: &Side, object: &ObjectDef) -> String {
         Kind::Trigger => match engine {
             Engine::Postgres => format!("DROP TRIGGER {} ON {}", quote(engine, &object.name), qualify(engine, side, &object.relation)),
             Engine::Mysql | Engine::Mariadb => format!("DROP TRIGGER {}", qualify(engine, side, &object.name)),
-            Engine::Sqlite => format!("DROP TRIGGER {}", quote(engine, &object.name)),
+            // T-SQL 的 DDL 触发器之外，DML 触发器名挂在表上。
+            Engine::Sqlite | Engine::Sqlserver => format!("DROP TRIGGER {}", quote(engine, &object.name)),
         },
     }
 }
@@ -2425,6 +2434,7 @@ fn drop_routine(engine: Engine, side: &Side, word: &str, object: &ObjectDef) -> 
         Engine::Postgres => format!("DROP {word} {}.{}", quote(engine, &side.schema), quote(engine, &object.name)),
         Engine::Sqlite => format!("DROP {word} {}", quote(engine, &object.name)),
         Engine::Mysql | Engine::Mariadb => format!("DROP {word} {}", qualify(engine, side, &object.name)),
+        Engine::Sqlserver => format!("DROP {word} {}", qualify(engine, side, &object.name)),
     }
 }
 
@@ -2592,7 +2602,41 @@ fn alter_table(
         Engine::Sqlite => sqlite_alter(side, name, baseline, target, with_fk),
         Engine::Postgres => postgres_alter(side, baseline_side, name, baseline, target, with_pk),
         Engine::Mysql | Engine::Mariadb => mysql_alter(engine, side, name, baseline, target, with_pk),
+        Engine::Sqlserver => sqlserver_alter(side, name, baseline, target, with_pk),
     }
+}
+
+/// T-SQL 的表差异：ADD/DROP COLUMN，改类型或可空性用 ALTER COLUMN <def>，主键按约束增删。
+fn sqlserver_alter(side: &Side, name: &str, baseline: &TableShape, target: &TableShape, with_pk: bool) -> Vec<String> {
+    let engine = Engine::Sqlserver;
+    let table = qualify(engine, side, name);
+    let mut statements = Vec::new();
+    for column in &target.columns {
+        if !baseline.columns.iter().any(|item| item.name == column.name) {
+            statements.push(format!("ALTER TABLE {table} DROP COLUMN {}", quote(engine, &column.name)));
+        }
+    }
+    for column in &baseline.columns {
+        match target.columns.iter().find(|item| item.name == column.name) {
+            None => statements.push(format!("ALTER TABLE {table} ADD {}", column_clause(engine, column))),
+            Some(other) if !column.type_name.eq_ignore_ascii_case(&other.type_name) || column.nullable != other.nullable => {
+                // T-SQL 的 ALTER COLUMN 需要显式 NULL/NOT NULL。
+                statements.push(format!("ALTER TABLE {table} ALTER COLUMN {}", column_clause(engine, column)));
+            }
+            Some(other) if column.default_sql.trim() != other.default_sql.trim() => {
+                if column.default_sql.trim().is_empty() {
+                    statements.push(format!("ALTER TABLE {table} ALTER COLUMN {} DROP DEFAULT", quote(engine, &column.name)));
+                } else {
+                    statements.push(format!("ALTER TABLE {table} ALTER COLUMN {} SET DEFAULT {}", quote(engine, &column.name), column.default_sql.trim()));
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    if with_pk {
+        push_primary_key(engine, &table, name, baseline, target, &mut statements);
+    }
+    statements
 }
 
 fn postgres_alter(side: &Side, baseline_side: &Side, name: &str, baseline: &TableShape, target: &TableShape, with_pk: bool) -> Vec<String> {
@@ -2656,7 +2700,7 @@ fn push_primary_key(engine: Engine, table: &str, name: &str, baseline: &TableSha
         return;
     }
     match engine {
-        Engine::Postgres => {
+        Engine::Postgres | Engine::Sqlserver => {
             if !current.is_empty() {
                 let constraint = primary_key_name(target).unwrap_or_else(|| format!("{name}_pkey"));
                 statements.push(format!("ALTER TABLE {table} DROP CONSTRAINT {}", quote(engine, &constraint)));

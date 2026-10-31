@@ -335,6 +335,7 @@ async fn fetch_page(session: &CatalogSession, schema: &TableSchema, offset: u64,
         CatalogSession::Sqlite { pool, .. } => fetch_sqlite(pool, &sql, width).await?,
         CatalogSession::Mysql(pool) => fetch_mysql(pool, &sql).await?,
         CatalogSession::Postgres(client) => fetch_postgres(client, &sql, width).await?,
+        CatalogSession::Sqlserver(client) => fetch_sqlserver(client, &sql).await?,
     };
     let mut rows = Vec::new();
     for cells in matrix {
@@ -385,6 +386,11 @@ async fn fetch_postgres(client: &tokio_postgres::Client, sql: &str, width: usize
         matrix.push(cells);
     }
     Ok(matrix)
+}
+
+async fn fetch_sqlserver(client: &std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>, sql: &str) -> Result<Vec<Vec<Cell>>, String> {
+    let (_names, rows) = crate::grid::sqlserver_rows(client, sql).await?;
+    Ok(rows)
 }
 
 async fn fetch_mysql(pool: &mysql_async::Pool, sql: &str) -> Result<Vec<Vec<Cell>>, String> {
@@ -606,6 +612,7 @@ fn catalog_engine(value: &str) -> Result<CatalogEngine, String> {
         "mysql" => Ok(CatalogEngine::Mysql),
         "mariadb" => Ok(CatalogEngine::Mariadb),
         "sqlite" => Ok(CatalogEngine::Sqlite),
+        "sqlserver" => Ok(CatalogEngine::Sqlserver),
         other => Err(format!("不支持的数据库 {other}")),
     }
 }
@@ -615,6 +622,7 @@ fn session_matches(session: &CatalogSession, engine: &str) -> bool {
         (CatalogSession::Sqlite { .. }, "sqlite") => true,
         (CatalogSession::Mysql(_), "mysql" | "mariadb") => true,
         (CatalogSession::Postgres(_), "postgres") => true,
+        (CatalogSession::Sqlserver(_), "sqlserver") => true,
         _ => false,
     }
 }
@@ -676,11 +684,41 @@ async fn ensure_scope(session: &CatalogSession, engine: &str, database: &str, sc
             }
             Ok(())
         }
+        "sqlserver" => {
+            let CatalogSession::Sqlserver(client) = session else {
+                return Err("会话类型和目标引擎不一致".to_owned());
+            };
+            // SQL Server 不改连也不开临时会话：对比只落在当前连接的库上，点名其他库直接说明。
+            let (_names, rows) = crate::grid::sqlserver_rows(client, "SELECT DB_NAME()").await.map_err(|err| err.to_string())?;
+            let current = match rows.first().and_then(|row| row.first()) {
+                Some(crate::grid::Cell::Text(text)) => text.clone(),
+                _ => String::new(),
+            };
+            if current != database {
+                return Err(format!("当前连接打开的是 {current}，没有另开连接读取 {database}"));
+            }
+            if schema.trim().is_empty() {
+                return Err("SQL Server 需要指定 schema".to_owned());
+            }
+            let (_names, rows) = crate::grid::sqlserver_rows(
+                client,
+                &format!(
+                    "SELECT name FROM sys.schemas WHERE name = N'{}'",
+                    schema.trim().replace('\'', "''")
+                ),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+            if rows.is_empty() {
+                return Err(format!("schema {schema} 不存在"));
+            }
+            Ok(())
+        }
         _ => Err(format!("不支持的数据库 {engine}")),
     }
 }
 
-/// 列出所选 PostgreSQL 库的 schema。另一个库走临时会话，不改连、不写配置。
+/// 列出所选 PostgreSQL / SQL Server 库的 schema。PostgreSQL 的另一个库走临时会话，不改连、不写配置。
 pub async fn list_schemas(service: &Service, connection_id: &str, database: &str) -> Result<Vec<String>, String> {
     let database = database.trim();
     if database.is_empty() {
@@ -689,16 +727,38 @@ pub async fn list_schemas(service: &Service, connection_id: &str, database: &str
     let Some(existing) = service.catalog_session(connection_id) else {
         return Err("这一侧还没有打开".to_owned());
     };
-    if !session_matches(&existing, "postgres") {
-        return Err("只有 PostgreSQL 需要选择 schema".to_owned());
+    let engine = match &existing {
+        CatalogSession::Postgres(_) => "postgres",
+        CatalogSession::Sqlserver(_) => "sqlserver",
+        _ => {
+            return Err("只有 PostgreSQL 和 SQL Server 需要选择 schema".to_owned());
+        }
+    };
+    if !session_matches(&existing, engine) {
+        return Err("只有 PostgreSQL 和 SQL Server 需要选择 schema".to_owned());
     }
     let request = SideRequest {
         connection_id: connection_id.to_owned(),
         database: database.to_owned(),
         schema: String::new(),
-        engine: "postgres".to_owned(),
+        engine: engine.to_owned(),
     };
     let held = hold_session(service, &existing, &request, database).await?;
+    if let CatalogSession::Sqlserver(client) = &held.session {
+        let sql = crate::catalog::metadata_sql(CatalogEngine::Sqlserver)
+            .schemas
+            .ok_or_else(|| "SQL Server 缺少 schema 查询".to_owned())?;
+        let (_names, rows) = crate::grid::sqlserver_rows(client, sql).await.map_err(|err| err.to_string())?;
+        let mut names = Vec::new();
+        for row in &rows {
+            if let Some(crate::grid::Cell::Text(name)) = row.first() {
+                if !name.is_empty() {
+                    names.push(name.clone());
+                }
+            }
+        }
+        return Ok(names);
+    }
     let CatalogSession::Postgres(client) = &held.session else {
         return Err("会话类型和目标引擎不一致".to_owned());
     };

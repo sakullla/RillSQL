@@ -1438,3 +1438,38 @@ describe("query editing", () => {
     wrapper.unmount();
   });
 });
+
+describe("tsql statement split", () => {
+  it("keeps top-level BEGIN...END blocks together and closes at END", () => {
+    const parts = splitSql("BEGIN\n  UPDATE t SET n = 1;\n  UPDATE u SET m = 2;\nEND\nSELECT 1;", "sqlserver");
+    expect(parts).toHaveLength(2);
+    expect(parts[0]!.text.startsWith("BEGIN")).toBe(true);
+    expect(parts[0]!.text.trimEnd().endsWith("END")).toBe(true);
+    expect(parts[1]!.text.replace(/;$/, "")).toBe("SELECT 1");
+
+    // 嵌套块是一条语句。
+    expect(splitSql("BEGIN\n  BEGIN\n    SELECT 1;\n  END\n  SELECT 2;\nEND;", "sqlserver")).toHaveLength(1);
+
+    // 字符串里的分号不切分。
+    expect(splitSql("BEGIN\n  SELECT 'a;b';\nEND;", "sqlserver")).toHaveLength(1);
+
+    // END 后跟 ELSE 时不提前闭合（IF ... ELSE）。
+    const ifElse = inspectSql("IF 1 = 1 BEGIN SELECT 1; END ELSE BEGIN SELECT 2; END", "sqlserver");
+    expect(ifElse.pieces).toHaveLength(1);
+    expect(ifElse.refusal).toBeNull();
+
+    // BEGIN TRAN 是事务语句，不是块。
+    expect(splitSql("BEGIN TRAN;\nUPDATE t SET n = 1;\nCOMMIT;", "sqlserver")).toHaveLength(3);
+    expect(splitSql("BEGIN TRANSACTION;\nSELECT 1;", "sqlserver")).toHaveLength(2);
+
+    // 未闭合块整批拒绝。
+    const unclosed = inspectSql("SELECT 1;\nBEGIN\n  SELECT 2;", "sqlserver");
+    expect(unclosed.pieces).toHaveLength(1);
+    expect(unclosed.refusal).toBe("BEGIN 块未闭合，没有发送。");
+
+    // DELIMITER 是 mysql 客户端指令，T-SQL 跳过并提示。
+    const delimiter = inspectSql("DELIMITER //\nSELECT 1;", "sqlserver");
+    expect(delimiter.pieces).toHaveLength(1);
+    expect(delimiter.notices[0]).toContain("SQL Server 不使用 DELIMITER");
+  });
+});

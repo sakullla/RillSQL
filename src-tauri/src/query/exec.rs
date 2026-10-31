@@ -65,7 +65,7 @@ pub fn database_gate(engine: &str, current: &str, requested: &str) -> DatabaseGa
     }
     match engine {
         "mysql" | "mariadb" => DatabaseGate::Switch,
-        "postgres" => DatabaseGate::Refuse,
+        "postgres" | "sqlserver" => DatabaseGate::Refuse,
         "sqlite" => {
             if requested == "main" || current == "main" && requested == "main" {
                 DatabaseGate::Ready
@@ -426,6 +426,7 @@ enum Attached {
     Sqlite(sqlx::SqlitePool),
     Mysql(mysql_async::Conn),
     Postgres(Arc<tokio_postgres::Client>),
+    Sqlserver(std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>),
     Scripted,
 }
 
@@ -498,6 +499,15 @@ impl LiveDriver {
                     }
                 }
             }
+            CatalogSession::Sqlserver(client) => {
+                let current = sqlserver_current(&client)
+                    .await
+                    .map_err(|err| attach_failure(&transport, err))?;
+                match database_gate("sqlserver", &current, database) {
+                    DatabaseGate::Refuse => return Err(refuse_message(&current, database)),
+                    _ => Attached::Sqlserver(client),
+                }
+            }
         };
         let busy = transport.health().map(|health| {
             health.note_busy();
@@ -546,6 +556,7 @@ impl StatementDriver for LiveDriver {
             Attached::Sqlite(pool) => sqlite_run(pool, &self.engine, sql, limit, cancel, self.sink.as_ref(), index).await,
             Attached::Mysql(conn) => mysql_run(conn, &self.transport, &self.engine, sql, limit, cancel, self.sink.as_ref(), index).await,
             Attached::Postgres(client) => postgres_run(client, &self.engine, sql, limit, cancel, self.sink.as_ref(), index).await,
+            Attached::Sqlserver(client) => sqlserver_run(client, &self.engine, sql, limit, cancel, self.sink.as_ref(), index).await,
         };
         // 成功语句刷新空闲计时；断线类错误挂起 suspect 标记，交轮询探活确认（R4）。
         // 语句超时的报错同样带 timeout 字样，不算断线。
@@ -592,6 +603,135 @@ async fn run_postgres_statements(client: &tokio_postgres::Client, statements: &[
 async fn postgres_current(client: &tokio_postgres::Client) -> Result<String, String> {
     let row = client.query_one("SELECT current_database()", &[]).await.map_err(|err| err.to_string())?;
     row.try_get(0).map_err(|err| err.to_string())
+}
+
+async fn sqlserver_current(client: &std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>) -> Result<String, String> {
+    let (_names, rows) = crate::grid::sqlserver_rows(client, "SELECT DB_NAME()").await?;
+    match rows.first().and_then(|row| row.first()) {
+        Some(crate::grid::Cell::Text(text)) => Ok(text.clone()),
+        _ => Err("没有当前数据库".to_owned()),
+    }
+}
+
+/// TDS 执行：会返回行的语句走 simple_query 收行集，其余走 execute 拿受影响行数。
+async fn sqlserver_run(
+    client: &std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>,
+    engine: &str,
+    sql: &str,
+    limit: usize,
+    cancel: &Arc<AtomicBool>,
+    sink: &dyn RowSink,
+    index: usize,
+) -> Result<StatementValue, String> {
+    let bounded = cap_result_sql(engine, sql, limit);
+    let mut locked = client.lock().await;
+    if !looks_like_rows(&bounded) {
+        let done = locked.execute(bounded, &[]).await.map_err(|err| err.to_string())?;
+        let value = StatementValue {
+            columns: Vec::new(),
+            column_types: Vec::new(),
+            rows: Vec::new(),
+            truncated: false,
+            affected: Some(done.total()),
+        };
+        sink.publish(index, &value).await;
+        return Ok(value);
+    }
+    let mut stream = locked.simple_query(bounded).await.map_err(|err| err.to_string())?;
+    let mut columns: Vec<String> = Vec::new();
+    let mut column_types: Vec<String> = Vec::new();
+    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+    let mut truncated = false;
+    {
+        use futures::TryStreamExt;
+        while let Some(item) = stream.try_next().await.map_err(|err| err.to_string())? {
+            if let Some(meta) = item.as_metadata() {
+                if columns.is_empty() {
+                    columns = meta.columns().iter().map(|column| column.name().to_owned()).collect();
+                    column_types = meta.columns().iter().map(|column| tds_type_name(column.column_type()).to_owned()).collect();
+                }
+                continue;
+            }
+            if let Some(row) = item.into_row() {
+                if columns.is_empty() {
+                    columns = (0..row.len()).map(|column| format!("col{column}")).collect();
+                    column_types = vec!["类型未知".to_owned(); columns.len()];
+                }
+                if rows.len() >= limit {
+                    truncated = true;
+                    break;
+                }
+                let cells = (0..columns.len()).map(|cell| tds_string_cell(&row, cell)).collect();
+                rows.push(cells);
+            }
+        }
+    }
+    drop(stream);
+    drop(locked);
+    if columns.is_empty() {
+        let value = StatementValue {
+            columns,
+            column_types,
+            rows,
+            truncated: false,
+            affected: None,
+        };
+        sink.publish(index, &value).await;
+        return Ok(value);
+    }
+    reveal_rows(sink, index, columns, column_types, rows, truncated, None, limit, cancel).await
+}
+
+fn tds_string_cell(row: &tiberius::Row, index: usize) -> Option<String> {
+    if let Ok(Some(text)) = row.try_get::<&str, _>(index) {
+        return Some(text.to_owned());
+    }
+    if let Ok(Some(value)) = row.try_get::<i64, _>(index) {
+        return Some(value.to_string());
+    }
+    if let Ok(Some(value)) = row.try_get::<i32, _>(index) {
+        return Some(value.to_string());
+    }
+    if let Ok(Some(value)) = row.try_get::<i16, _>(index) {
+        return Some(value.to_string());
+    }
+    if let Ok(Some(value)) = row.try_get::<u8, _>(index) {
+        return Some(value.to_string());
+    }
+    if let Ok(Some(value)) = row.try_get::<f64, _>(index) {
+        return Some(value.to_string());
+    }
+    if let Ok(Some(value)) = row.try_get::<bool, _>(index) {
+        return Some(if value { "1" } else { "0" }.to_owned());
+    }
+    if let Ok(Some(bytes)) = row.try_get::<&[u8], _>(index) {
+        return Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect());
+    }
+    None
+}
+
+fn tds_type_name(kind: tiberius::ColumnType) -> &'static str {
+    use tiberius::ColumnType::*;
+    match kind {
+        Bit | Bitn => "bit",
+        Int1 => "tinyint",
+        Int2 => "smallint",
+        Int4 => "int",
+        Int8 | Intn => "bigint",
+        Datetime4 | Datetime | Datetimen | Datetime2 => "datetime",
+        DatetimeOffsetn => "datetimeoffset",
+        Daten => "date",
+        Timen => "time",
+        Float4 | Floatn => "real",
+        Float8 => "float",
+        Money | Money4 | Decimaln | Numericn => "decimal",
+        Guid => "uniqueidentifier",
+        BigVarBin | BigBinary | Image => "varbinary",
+        BigVarChar | BigChar | Text => "varchar",
+        NVarchar | NChar | NText => "nvarchar",
+        Xml => "xml",
+        Udt | SSVariant | Null => "类型未知",
+    }
 }
 
 fn quote_mysql(name: &str) -> String {
@@ -1065,12 +1205,50 @@ async fn postgres_run(
     reveal_rows(sink, index, columns, types, rows, truncated, None, limit, cancel).await
 }
 
+/// SQL Server 的执行计划批次：SET SHOWPLAN_ALL ON 后服务器只编译不执行，读完行集再关掉。
+/// 与前端 src/query/plan.ts 的 sqlserver 形态互为镜像；这里钉住批次文本的契约。
+pub fn showplan_batch(statement: &str) -> String {
+    let body = statement.trim().trim_end_matches(';');
+    format!("SET SHOWPLAN_ALL ON;\n{body};\nSET SHOWPLAN_ALL OFF")
+}
+
+/// SHOWPLAN_ALL 行集的层次展开（纯函数）：(NodeId, Parent, 操作, 估算行数) 按父节点深度排成缩进大纲。
+/// 根节点的 Parent 不在结果里时深度为 0；父节点缺失按根处理，成环按根处理。
+pub fn showplan_outline(rows: &[(i64, i64, String, String)]) -> Vec<(usize, String, String)> {
+    let ids: Vec<i64> = rows.iter().map(|(node, _, _, _)| *node).collect();
+    let depth_of = |node: i64| -> usize {
+        let mut seen = std::collections::HashSet::new();
+        let mut depth = 0usize;
+        let mut current = node;
+        loop {
+            if !seen.insert(current) {
+                return depth;
+            }
+            let Some((_, parent, _, _)) = rows.iter().find(|(candidate, _, _, _)| *candidate == current) else {
+                return depth;
+            };
+            if *parent == current || !ids.contains(parent) {
+                return depth;
+            }
+            depth += 1;
+            current = *parent;
+        }
+    };
+    rows.iter()
+        .map(|(node, _, operation, est_rows)| (depth_of(*node), operation.clone(), est_rows.clone()))
+        .collect()
+}
+
 pub fn clamp_limit(limit: u64) -> usize {
     usize::try_from(limit.clamp(1, 10_000)).unwrap_or(10_000)
 }
 
 /// 给会返回行的语句加上不超过 `cap + 1` 的 LIMIT。多出来的一行只用来判断截断。
+/// SQL Server 走 TOP：语句以 SELECT 开头时改写第一个 SELECT，其余（WITH、FETCH 已有）不改写或按计数改写。
 pub fn cap_result_sql(engine: &str, sql: &str, cap: usize) -> String {
+    if engine == "sqlserver" {
+        return cap_result_sql_sqlserver(sql, cap);
+    }
     let probe = cap.saturating_add(1);
     let (body, suffix) = peel_trailing_semi(sql);
     if !limit_target(body) {
@@ -1116,6 +1294,73 @@ pub fn cap_result_sql(engine: &str, sql: &str, cap: usize) -> String {
     rewritten.push_str(&body[insert_at..]);
     rewritten.push_str(suffix);
     rewritten
+}
+
+/// T-SQL 的行数上限：SELECT 直接改写为 SELECT TOP (n)；FETCH NEXT 已有时只改数字；
+/// TOP 已有时只改数字；WITH 开头的语句不改写（TOP 需要落在内层 SELECT，盲改会破坏语义）。
+fn cap_result_sql_sqlserver(sql: &str, cap: usize) -> String {
+    let probe = cap.saturating_add(1);
+    let (body, suffix) = peel_trailing_semi(sql);
+    if !limit_target(body) {
+        return sql.to_owned();
+    }
+    let scan = scan_top("sqlserver", body);
+    if scan.has_into {
+        return sql.to_owned();
+    }
+    if let Some(fetch) = scan.fetch {
+        if fetch.value <= probe as u64 {
+            return sql.to_owned();
+        }
+        let mut rewritten = String::new();
+        rewritten.push_str(&body[..fetch.span.0]);
+        rewritten.push_str(&probe.to_string());
+        rewritten.push_str(&body[fetch.span.1..]);
+        rewritten.push_str(suffix);
+        return rewritten;
+    }
+    if let Some(top) = scan_top_n(body) {
+        if top.value <= probe as u64 {
+            return sql.to_owned();
+        }
+        let mut rewritten = String::new();
+        rewritten.push_str(&body[..top.span.0]);
+        rewritten.push_str(&probe.to_string());
+        rewritten.push_str(&body[top.span.1..]);
+        rewritten.push_str(suffix);
+        return rewritten;
+    }
+    if split::first_keyword(body) != "SELECT" {
+        return sql.to_owned();
+    }
+    let mut rewritten = String::new();
+    let cut = body.to_ascii_uppercase().find("SELECT").unwrap_or(0) + "SELECT".len();
+    rewritten.push_str(&body[..cut]);
+    rewritten.push_str(" TOP (");
+    rewritten.push_str(&probe.to_string());
+    rewritten.push(')');
+    rewritten.push_str(&body[cut..]);
+    rewritten.push_str(suffix);
+    rewritten
+}
+
+/// 顶层 TOP n 的数量区间。TOP 与数量之间允许括号。
+fn scan_top_n(sql: &str) -> Option<CountSpan> {
+    let (words, _) = split::top_level_words("sqlserver", sql);
+    let mut index = 0usize;
+    while index < words.len() {
+        if words[index].0 == "TOP" {
+            let mut at = skip_noise(sql, words[index].2);
+            let bytes = sql.as_bytes();
+            if at < bytes.len() && bytes[at] == b'(' {
+                at = skip_noise(sql, at + 1);
+            }
+            let (value, end) = read_u64(sql, at)?;
+            return Some(CountSpan { value, span: (at, end) });
+        }
+        index += 1;
+    }
+    None
 }
 
 struct CountSpan {

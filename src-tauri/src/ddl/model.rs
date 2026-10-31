@@ -250,7 +250,7 @@ pub struct StepReceipt {
 pub fn fk_actions(engine: Engine) -> &'static [&'static str] {
     match engine {
         Engine::Mysql | Engine::Mariadb => &["RESTRICT", "CASCADE", "SET NULL", "NO ACTION"],
-        Engine::Postgres | Engine::Sqlite => &["RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION"],
+        Engine::Postgres | Engine::Sqlite | Engine::Sqlserver => &["RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION"],
     }
 }
 
@@ -262,5 +262,6 @@ pub fn rule_text(engine: Engine, rebuild: bool) -> String {
         Engine::Mysql | Engine::Mariadb => "这些语句逐条执行，失败即停。MySQL 与 MariaDB 会立即提交每条结构变更语句，中途失败不会撤销已经成功的语句，不能声称已经全部回滚。".to_owned(),
         Engine::Postgres => "这些语句逐条执行，失败即停。已经成功的语句不撤销。PostgreSQL 虽然可以把结构变更放进事务，这里也不包成一个大事务，不能据此认为所有数据库都会回滚。".to_owned(),
         Engine::Sqlite => "这些语句逐条执行，失败即停。已经成功的语句不撤销，后面的语句不执行。".to_owned(),
+        Engine::Sqlserver => "这些语句逐条执行，失败即停。已成功的语句不撤销；这里也不把整批包进一个事务，不能据此声称可以整体回滚。".to_owned(),
     }
 }
