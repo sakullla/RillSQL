@@ -5,7 +5,7 @@ import { sql } from "@codemirror/lang-sql";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { linter } from "@codemirror/lint";
 import { tags } from "@lezer/highlight";
-import { EditorState, Prec, StateEffect, StateField } from "@codemirror/state";
+import { Compartment, EditorState, Prec, StateEffect, StateField } from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, keymap } from "@codemirror/view";
 import { basicSetup } from "codemirror";
 import ChordKeys from "../shell/ChordKeys.vue";
@@ -19,7 +19,7 @@ import QueryResultGrid from "../grid/QueryResultGrid.vue";
 import type { Engine } from "../grid/types";
 import Icon from "../shell/Icon.vue";
 import { tabHasPending } from "../shell/close-guard";
-import { loadSettings } from "../shell/settings";
+import { loadSettings, onSettingsSaved, type EditorTheme } from "../shell/settings";
 import { CONNECTION_STATUS_TEXT, type ConnectionStatus } from "../shell/status-text";
 import type { QueryTarget } from "../shell/session";
 import { ambiguousFieldNote, cachedColumns, fieldFailureNote, loadFields, qualifierFor, unknownFieldNote } from "./columns";
@@ -333,19 +333,36 @@ async function sqlCompletion(context: CompletionContext) {
   return { from: columnFrom, filter: false, options };
 }
 
+/* SQL 编辑器配色（R5）：compartment 持有高亮样式提供运行时切换通道；颜色全部取 --tk-* 变量，
+   由容器上的 data-editor-theme 决定用 tokens.css 的哪套变量组，auto 不设属性即沿用全局主题默认配色。
+   切换只重配样式，不重建编辑器，草稿与执行结果不动。 */
+const highlightCompartment = new Compartment();
+const editorTheme = ref<EditorTheme>(loadSettings().editorTheme);
+let detachSettings: (() => void) | null = null;
+
+watch(editorTheme, () => {
+  view?.dispatch({ effects: highlightCompartment.reconfigure(editorHighlight()) });
+});
+
+function editorHighlight() {
+  return syntaxHighlighting(HighlightStyle.define([
+    { tag: tags.keyword, color: "var(--tk-kw)" },
+    { tag: tags.string, color: "var(--tk-str)" },
+    { tag: tags.number, color: "var(--tk-num)" },
+    { tag: tags.comment, color: "var(--tk-com)", fontStyle: "italic" },
+    { tag: tags.operator, color: "var(--text-2)" },
+    { tag: tags.name, color: "var(--tk-id)" },
+    /* 内建函数（SQL 解析器标记为 standard(name)）启用已定义的 --tk-fn 变量 */
+    { tag: tags.standard(tags.name), color: "var(--tk-fn)" },
+  ]));
+}
+
 function editorExtensions() {
   return [
     basicSetup,
     sendRangeField,
     sql(),
-    syntaxHighlighting(HighlightStyle.define([
-      { tag: tags.keyword, color: "var(--tk-kw)" },
-      { tag: tags.string, color: "var(--tk-str)" },
-      { tag: tags.number, color: "var(--tk-num)" },
-      { tag: tags.comment, color: "var(--tk-com)", fontStyle: "italic" },
-      { tag: tags.operator, color: "var(--text-2)" },
-      { tag: tags.name, color: "var(--tk-id)" },
-    ])),
+    highlightCompartment.of(editorHighlight()),
     shellTheme,
     Prec.high(
       keymap.of([
@@ -1023,19 +1040,24 @@ watch(
 
 onMounted(() => {
   document.addEventListener("pointerdown", onPointerDown);
+  // 设置保存即通知：QueryTab 不接收 settings 属性，借此即时跟随编辑器配色切换。
+  detachSettings = onSettingsSaved((saved) => {
+    editorTheme.value = saved.editorTheme;
+  });
   mountEditor();
 });
 
 onBeforeUnmount(() => {
   alive = false;
   stopResize?.();
+  detachSettings?.();
   document.removeEventListener("pointerdown", onPointerDown);
   view?.destroy();
 });
 </script>
 
 <template>
-  <section class="query-pane" aria-label="查询" :data-tab-id="tabId" :style="{ '--editor-share': `${editorPercent}%` }">
+  <section class="query-pane" aria-label="查询" :data-tab-id="tabId" :data-editor-theme="editorTheme === 'auto' ? undefined : editorTheme" :style="{ '--editor-share': `${editorPercent}%` }">
     <div class="q-toolbar">
       <div ref="targetRoot" class="q-target">
         <button

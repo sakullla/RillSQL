@@ -1,6 +1,6 @@
 import { mount } from "@vue/test-utils";
 import { beforeEach, describe, expect, it } from "vitest";
-import { DEFAULT_SETTINGS, loadSettings, normalizeDensity, saveSettings } from "./settings";
+import { DEFAULT_SETTINGS, loadSettings, normalizeDensity, normalizeEditorTheme, saveSettings } from "./settings";
 import SettingsView from "./SettingsView.vue";
 
 function fakeStorage(): Storage {
@@ -56,6 +56,27 @@ describe("shell settings", () => {
     expect(loadSettings().queryTimeoutSec).toBe(30);
   });
 
+  it("defaults the editor theme to auto and normalizes unknown values back", () => {
+    expect(DEFAULT_SETTINGS.editorTheme).toBe("auto");
+    expect(normalizeEditorTheme(undefined)).toBe("auto");
+    expect(normalizeEditorTheme("sepia")).toBe("auto");
+    localStorage.setItem("rillsql.shell", JSON.stringify({ editorTheme: "nope" }));
+    expect(loadSettings().editorTheme).toBe("auto");
+    localStorage.setItem("rillsql.shell", JSON.stringify({ editorTheme: null }));
+    expect(loadSettings().editorTheme).toBe("auto");
+  });
+
+  it("keeps named editor themes through load and round-trips them", () => {
+    for (const theme of ["contrast", "warm", "cool", "mono"] as const) {
+      localStorage.setItem("rillsql.shell", JSON.stringify({ editorTheme: theme }));
+      expect(loadSettings().editorTheme).toBe(theme);
+      const storage = fakeStorage();
+      const settings = { ...DEFAULT_SETTINGS, editorTheme: theme };
+      saveSettings(settings, storage);
+      expect(loadSettings(storage)).toEqual(settings);
+    }
+  });
+
   it("round-trips through saveSettings", () => {
     const storage = fakeStorage();
     const settings = { ...DEFAULT_SETTINGS, density: "standard" as const, queryTimeoutSec: 60 };
@@ -72,6 +93,7 @@ describe("shell settings", () => {
 
     const cases = [
       { label: "编辑器字号", current: "13 px", option: "15 px", patch: { editorFont: 15 } },
+      { label: "编辑器配色", current: "跟随主题", option: "高对比", patch: { editorTheme: "contrast" as const } },
       { label: "每次读取的行数", current: "100 行", option: "50 行", patch: { pageSize: 50 } },
       { label: "大字段预览上限", current: "1 KB", option: "4 KB", patch: { previewKB: 4 } },
       { label: "对象列表每次显示", current: "100 个", option: "200 个", patch: { objectPage: 200 } },

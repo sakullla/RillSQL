@@ -3,7 +3,7 @@ import { computed } from "vue";
 import type { ListboxOption } from "../ui/types";
 import Listbox from "../ui/Listbox.vue";
 import { ABOUT_ABSENT, ABOUT_FACTS, ABOUT_TAGLINE, PRODUCT_LICENSE, PRODUCT_TITLE, PRODUCT_VERSION } from "./product";
-import { localDataPathLabel, type ShellSettings } from "./settings";
+import { EDITOR_THEMES, localDataPathLabel, type EditorTheme, type ShellSettings } from "./settings";
 import { detectMac } from "./shortcuts";
 import BrandMark from "./BrandMark.vue";
 import Icon from "./Icon.vue";
@@ -40,6 +40,14 @@ const nullOptions: ListboxOption[] = [
   { value: "empty", label: "空文本" },
   { value: "N", label: "\\N" },
 ];
+const EDITOR_THEME_LABELS: Record<EditorTheme, string> = {
+  auto: "跟随主题",
+  contrast: "高对比",
+  warm: "暖色",
+  cool: "冷色",
+  mono: "弱化灰阶",
+};
+const editorThemeOptions: ListboxOption[] = EDITOR_THEMES.map((theme) => ({ value: theme, label: EDITOR_THEME_LABELS[theme] }));
 
 function onNumber(key: "editorFont" | "pageSize" | "previewKB" | "objectPage" | "queryTimeoutSec", value: string) {
   const next = Number(value);
@@ -48,6 +56,9 @@ function onNumber(key: "editorFont" | "pageSize" | "previewKB" | "objectPage" | 
 }
 function onNullCopy(value: string) {
   if (value === "NULL" || value === "empty" || value === "N") emit("change", { nullCopy: value });
+}
+function onEditorTheme(value: string) {
+  if (EDITOR_THEMES.includes(value as EditorTheme)) emit("change", { editorTheme: value as EditorTheme });
 }
 </script>
 
@@ -104,6 +115,15 @@ function onNullCopy(value: string) {
           </div>
           <div class="set-ctl">
             <Listbox :model-value="String(settings.editorFont)" :options="fontOptions" aria-label="编辑器字号" @update:model-value="onNumber('editorFont', $event)" />
+          </div>
+        </div>
+        <div class="set-row">
+          <div class="set-text">
+            <h4>编辑器配色</h4>
+            <p>SQL 编辑器的语法高亮配色。跟随主题沿用界面的浅/深配色；其余配色只在编辑器内生效，不影响界面主题。</p>
+          </div>
+          <div class="set-ctl">
+            <Listbox :model-value="settings.editorTheme" :options="editorThemeOptions" aria-label="编辑器配色" @update:model-value="onEditorTheme" />
           </div>
         </div>
       </section>

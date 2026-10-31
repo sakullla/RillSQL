@@ -274,6 +274,90 @@
   --overlay: rgba(4, 6, 10, 0.55);
 }
 
+/* ---------- SQL 编辑器命名配色（R5）：auto 不设 data-editor-theme，直接继承上方全局默认（浅/深各一套）。
+   命名主题只改写 --tk-* 变量组，属性挂在查询页容器（QueryTab 根节点）上，不影响界面主题与其它区域；
+   每个命名主题按浅/深全局主题各给一套值（编辑器底为 --surface-sunken：浅 #f0f0f3 / 深 #111113），
+   关键字/字符串/数字/注释四类令牌在两套底色下均拉开色相或明度差。 ---------- */
+[data-editor-theme="contrast"] {
+  /* 高对比·浅：深靛蓝/深琥珀/深洋红/深青 + 近黑标识符，色相间距最大化 */
+  --tk-kw: #2323a8;
+  --tk-str: #8f4600;
+  --tk-num: #a11062;
+  --tk-com: #55585f;
+  --tk-fn: #0b7285;
+  --tk-id: #101215;
+}
+
+:root[data-theme="dark"] [data-editor-theme="contrast"] {
+  /* 高对比·深：亮薰衣草/亮橙/亮粉/亮青 + 近白标识符，全部提到高明度 */
+  --tk-kw: #c7c2ff;
+  --tk-str: #ffb867;
+  --tk-num: #ff7ab8;
+  --tk-com: #c3c6cd;
+  --tk-fn: #5fd4e8;
+  --tk-id: #fbfcfe;
+}
+
+[data-editor-theme="warm"] {
+  /* 暖色·浅：铁锈红/暗金/暖李紫/橄榄 + 暖灰，同处暖色家族内拉开明度 */
+  --tk-kw: #a03d12;
+  --tk-str: #91700a;
+  --tk-num: #8d4c6e;
+  --tk-com: #7a7168;
+  --tk-fn: #6f7f1a;
+  --tk-id: #2b2018;
+}
+
+:root[data-theme="dark"] [data-editor-theme="warm"] {
+  /* 暖色·深：鲑橙/金/暖粉/浅橄榄 + 暖白 */
+  --tk-kw: #ff9d70;
+  --tk-str: #f2c94c;
+  --tk-num: #e395bd;
+  --tk-com: #b0a699;
+  --tk-fn: #cdd96e;
+  --tk-id: #f8f1e7;
+}
+
+[data-editor-theme="cool"] {
+  /* 冷色·浅：深蔚蓝/墨绿/长春花紫/青 + 冷灰 */
+  --tk-kw: #114faf;
+  --tk-str: #0d7862;
+  --tk-num: #5a55d6;
+  --tk-com: #5f6875;
+  --tk-fn: #0b7ea0;
+  --tk-id: #16202b;
+}
+
+:root[data-theme="dark"] [data-editor-theme="cool"] {
+  /* 冷色·深：浅蔚蓝/亮墨绿/浅紫/亮青 + 冷白 */
+  --tk-kw: #82b1ff;
+  --tk-str: #57d6bd;
+  --tk-num: #b3a8ff;
+  --tk-com: #9aa5b5;
+  --tk-fn: #58c7e8;
+  --tk-id: #e8eff8;
+}
+
+[data-editor-theme="mono"] {
+  /* 弱化灰阶·浅：低饱和，令牌主要靠明度阶梯区分（注释再加斜体），标识符近黑承担主体对比 */
+  --tk-kw: #454a5a;
+  --tk-str: #6d6353;
+  --tk-num: #57667a;
+  --tk-com: #8d9099;
+  --tk-fn: #4d5a66;
+  --tk-id: #33363d;
+}
+
+:root[data-theme="dark"] [data-editor-theme="mono"] {
+  /* 弱化灰阶·深：同一明度阶梯的高光侧 */
+  --tk-kw: #c6cad9;
+  --tk-str: #b0a695;
+  --tk-num: #9db0c3;
+  --tk-com: #7c8087;
+  --tk-fn: #a8b4c4;
+  --tk-id: #e2e4e8;
+}
+
 /* 动效降级：用户要求减少动效时，所有时长令牌归零 */
 @media (prefers-reduced-motion: reduce) {
   :root {
