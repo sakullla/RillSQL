@@ -135,6 +135,18 @@ export interface CompletionContext {
   onConditions?: readonly string[];
   /** 外键缺失时按命名约定推断的条件，detail 会标注来源。 */
   inferredConditions?: readonly string[];
+  /** 本地词频（小写标识符 → 执行次数）：只参与同分候选排序，不参与筛选。 */
+  frequency?: Readonly<Record<string, number>>;
+}
+
+/** 词频权重：限定名先看整段，再看点号后的裸名，大小写不敏感。 */
+function frequencyWeight(frequency: Readonly<Record<string, number>> | undefined, label: string): number {
+  if (!frequency) return 0;
+  const lower = label.toLowerCase();
+  const direct = frequency[lower] ?? 0;
+  const dot = lower.lastIndexOf(".");
+  if (dot < 0) return direct;
+  return Math.max(direct, frequency[lower.slice(dot + 1)] ?? 0);
 }
 
 /** 按候选的标签做一次前缀/子序列筛选并保留顺序语义。 */
@@ -247,16 +259,18 @@ export function completionPlan(input: {
       ...rankItems(snippetItems, prefix, 6),
     ];
   }
-  /* 跨组排序：匹配等级优先；全大写前缀视为在写关键字（SQL 惯例），关键字组提前；其余保持组内顺序。 */
+  /* 跨组排序（R3）：匹配等级 → 关键字优先（全大写前缀视为在写关键字）→ 本地词频降序 → 组内顺序。 */
   const keywordFirst = prefix.length > 0 && prefix === prefix.toUpperCase();
+  const frequency = input.context?.frequency;
   ordered = ordered
     .map((item, order) => ({
       item,
       score: matchKind(item.label, prefix),
       keyword: keywordFirst && item.kind === "keyword" ? 0 : 1,
+      weight: frequencyWeight(frequency, item.label),
       order,
     }))
-    .sort((a, b) => a.score - b.score || a.keyword - b.keyword || a.order - b.order)
+    .sort((a, b) => a.score - b.score || a.keyword - b.keyword || b.weight - a.weight || a.order - b.order)
     .map((entry) => entry.item);
   const seen = new Set<string>();
   const unique = ordered.filter((item) => {

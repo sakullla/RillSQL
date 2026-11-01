@@ -16,6 +16,7 @@ import { SHORTCUTS } from "../shell/shortcuts";
 import type { RunDto } from "./api";
 import { clearColumnCache, qualifierFor } from "./columns";
 import { completionPlan, metadataNote } from "./complete";
+import { FREQUENCY_KEY, bumpIdentifiers, loadFrequency } from "./completion/frequency";
 import { resolveEditor } from "./editor";
 import { resetExecuteRequest } from "./execute-request";
 import QueryTab from "./QueryTab.vue";
@@ -1575,3 +1576,87 @@ describe("tsql statement split", () => {
     resetEditors();
   });
 });
+
+describe("completion frequency wiring", () => {
+  function shopTab(tabId: string, draft: string) {
+    return mount(QueryTab, {
+      props: {
+        tabId,
+        draft,
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+  }
+
+  it("orders same-class candidates by the stored identifier frequency", async () => {
+    replaceCatalog(catalogFixture());
+    localStorage.clear();
+    bumpIdentifiers("SELECT state FROM orders");
+    bumpIdentifiers("SELECT state FROM orders");
+    invoke.mockImplementation(async (command: string) => {
+      if (command !== "grid_describe") throw new Error(command);
+      return {
+        engine: "mysql",
+        schema: "",
+        name: "orders",
+        kind: "table",
+        key: ["id"],
+        columns: [
+          { name: "status", typeName: "varchar", nullable: false, primary: false, unique: false, auto: false },
+          { name: "state", typeName: "varchar", nullable: false, primary: false, unique: false, auto: false },
+        ],
+      };
+    });
+    const wrapper = shopTab("query-frequency-order", "SELECT st FROM orders");
+    await nextTick();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
+    view.dispatch({ selection: { anchor: "SELECT st".length } });
+    startCompletion(view);
+    await vi.waitFor(() => {
+      expect(currentCompletions(view.state).some((item) => item.label === "state")).toBe(true);
+    });
+    const labels = currentCompletions(view.state).map((item) => item.label);
+    expect(labels.indexOf("state")).toBeLessThan(labels.indexOf("status"));
+    wrapper.unmount();
+    clearColumnCache();
+    localStorage.clear();
+  });
+
+  it("counts identifiers from a successful run and stores no SQL text", async () => {
+    replaceCatalog(catalogFixture());
+    localStorage.clear();
+    invoke.mockImplementation(async (command: string, args?: { request?: { sql?: string } }) => {
+      if (command !== "query_start") throw new Error(command);
+      return runDto({
+        status: "done",
+        statements: [{
+          sql: args?.request?.sql ?? "",
+          status: "ok",
+          message: "",
+          columns: [],
+          rows: [],
+          truncated: false,
+          affected: 1,
+        }],
+      });
+    });
+    const wrapper = shopTab("query-frequency-run", "UPDATE orders SET state = 'paid' WHERE order_no = 7");
+    await nextTick();
+    await wrapper.get("[data-action='run']").trigger("click");
+    await flushPromises();
+    const stored = loadFrequency();
+    expect(stored).toEqual({ orders: 1, state: 1, order_no: 1 });
+    expect(stored).not.toHaveProperty("paid");
+    expect(stored).not.toHaveProperty("where");
+    expect(stored).not.toHaveProperty("update");
+    expect(localStorage.getItem(FREQUENCY_KEY) ?? "").not.toContain("UPDATE orders SET");
+    wrapper.unmount();
+    localStorage.clear();
+  });
+});
+

@@ -27,6 +27,7 @@ import type { QueryTarget } from "../shell/session";
 import { ambiguousFieldNote, cachedColumns, fieldFailureNote, loadFields, qualifierFor, unknownFieldNote } from "./columns";
 import { tr as t } from "../i18n";
 import { completionPlan, connectionById, metadataNote, statementContext, targetDetail, targetKey, targetOptions, type CompletionObject, type CompletionSource, type TargetOption } from "./complete";
+import { bumpIdentifiers, loadFrequency, type FrequencyMap } from "./completion/frequency";
 import { catalogIndex, resolveTable } from "./catalog-index";
 import { parseScope, type ScopeTable } from "./completion/scope";
 import { locateForCompletion } from "./completion/scan";
@@ -119,6 +120,11 @@ let view: EditorView | undefined;
 let alive = true;
 
 const run = computed(() => tabRun(props.tabId));
+/* 本地词频（R3）：只按成功执行的语句累计标识符，不含整条 SQL；参与同分候选排序。 */
+const frequency = shallowRef<FrequencyMap>(loadFrequency());
+/* 只统计用户执行的语句：EXPLAIN 计划请求登记不进来，因此不计入。 */
+const bumpableRuns = new Set<string>();
+const countedRuns = new Set<string>();
 const resultTools = ref<HTMLElement | null>(null);
 provide("resultTools", resultTools);
 const running = computed(() => run.value?.status === "running" || run.value?.status === "cancel-requested");
@@ -220,6 +226,27 @@ watch(
     if (status === "error" || cancel === "failed") detailsOpen.value = true;
   },
   { immediate: true },
+);
+
+/** 运行结束后把成功语句里的标识符计入本地词频；仍在执行或已统计过的运行直接跳过。 */
+function countRunIdentifiers(tabId: string, runId: string): void {
+  if (!bumpableRuns.has(runId) || countedRuns.has(runId)) return;
+  const settled = tabRun(tabId);
+  if (!settled || settled.id !== runId) return;
+  if (settled.status === "running" || settled.status === "cancel-requested") return;
+  countedRuns.add(runId);
+  const succeeded = settled.statements.filter((statement) => statement.status === "ok" && statement.sql).map((statement) => statement.sql);
+  if (!succeeded.length) return;
+  frequency.value = bumpIdentifiers(succeeded.join("\n"));
+}
+
+/* 运行从执行中转为结束（done/error/cancelled/unknown）时统计一次词频。 */
+watch(
+  () => [run.value?.id, run.value?.status] as const,
+  ([id, status]) => {
+    if (!id || !status) return;
+    countRunIdentifiers(props.tabId, id);
+  },
 );
 
 /** 默认结果区展示的语句：优先最后一条有结果集的，否则最后一条。 */
@@ -339,6 +366,7 @@ async function sqlCompletion(context: CompletionContext) {
         targetTable: scope.target?.alias,
         onConditions: on.conditions,
         inferredConditions: on.inferred,
+        frequency: frequency.value,
       },
     });
     return {
@@ -840,6 +868,12 @@ async function sendExecute(sqlText: string, from: number, to: number) {
       sql: sqlText,
       limit: rowLimit(loadSettings().pageSize),
     });
+    /* 这次是用户执行（不是 EXPLAIN）：登记运行，结束后按成功语句累计本地词频（R3）。 */
+    const started = tabRun(props.tabId);
+    if (started) {
+      bumpableRuns.add(started.id);
+      countRunIdentifiers(props.tabId, started.id);
+    }
     // 成功发出才算“执行过”；之后关闭标签不会再提示这份草稿会丢失。
     emit("executed", props.tabId, sqlText);
   } catch (err) {

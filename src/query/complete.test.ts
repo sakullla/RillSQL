@@ -209,6 +209,34 @@ describe("rule-based completion", () => {
     expect(plan.items[0]).toMatchObject({ kind: "keyword", label: "SELECT" });
   });
 
+  it("breaks matching ties by local identifier frequency", () => {
+    const columns = [
+      { label: "status", detail: "public.orders" },
+      { label: "state", detail: "public.orders" },
+    ];
+    const labels = (frequency?: Record<string, number>) => completionPlan({
+      prefix: "st",
+      connection: atlas,
+      database: "atlas_dev",
+      engine: "postgres",
+      columns,
+      context: { clause: null, frequency },
+    }).items.map((item) => item.label);
+    expect(labels().indexOf("status")).toBeLessThan(labels().indexOf("state"));
+    expect(labels({ state: 3 }).indexOf("state")).toBeLessThan(labels({ state: 3 }).indexOf("status"));
+  });
+
+  it("ignores a frequency that only carries other identifiers", () => {
+    const plan = completionPlan({
+      prefix: "sel",
+      connection: atlas,
+      database: "atlas_dev",
+      engine: "postgres",
+      context: { clause: null, frequency: { unrelated_name: 9 } },
+    });
+    expect(plan.items[0]).toMatchObject({ kind: "keyword", label: "SELECT" });
+  });
+
   it("offers only databases after USE", () => {
     const plan = completionPlan({
       prefix: "",
