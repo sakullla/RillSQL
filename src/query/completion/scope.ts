@@ -6,7 +6,7 @@ export interface ScopeTable {
   schema: string | null;
   name: string;
   /** 引用所在的括号深度，用于隔离子查询作用域。 */
-  depth: number;
+  depth?: number;
 }
 
 export interface StatementScope {
@@ -133,7 +133,7 @@ export function parseScope(statement: string): StatementScope {
     if (found) clause = found;
   }
 
-  return { clause, tables: tables.filter((table) => table.depth <= depth), ctes, target };
+  return { clause, tables: tables.filter((table) => (table.depth ?? 0) <= depth), ctes, target };
 }
 
 function readTarget(tokens: Token[], start: number, depth: number): { table: ScopeTable | null; next: number } {

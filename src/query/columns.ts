@@ -12,10 +12,37 @@ export interface CachedFields {
   error: string | null;
 }
 
+const MAX_TABLES = 200;
 const cache = new Map<string, CachedFields>();
+const inFlight = new Map<string, Promise<CachedFields>>();
 
 export function clearColumnCache(): void {
   cache.clear();
+  inFlight.clear();
+}
+
+/** 供测试与诊断读取当前缓存规模。 */
+export function columnCacheSize(): number {
+  return cache.size;
+}
+
+function remember(key: string, entry: CachedFields): CachedFields {
+  cache.delete(key);
+  cache.set(key, entry);
+  while (cache.size > MAX_TABLES) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+  return entry;
+}
+
+function recall(key: string): CachedFields | undefined {
+  const entry = cache.get(key);
+  if (!entry) return undefined;
+  cache.delete(key);
+  cache.set(key, entry);
+  return entry;
 }
 
 export function columnKey(connectionId: string, database: string, schema: string, table: string): string {
@@ -98,8 +125,12 @@ export async function loadFields(input: {
   refresh?: boolean;
 }): Promise<CachedFields> {
   const key = columnKey(input.connectionId, input.database, input.object.schema, input.object.name);
-  const existing = cache.get(key);
-  if (existing && !input.refresh) return existing;
+  if (!input.refresh) {
+    const cached = recall(key);
+    if (cached) return cached;
+    const pending = inFlight.get(key);
+    if (pending) return pending;
+  }
   const base = {
     connectionId: input.connectionId,
     database: input.database,
@@ -107,22 +138,24 @@ export async function loadFields(input: {
     table: input.object.name,
     label: input.object.label,
   };
-  try {
-    const schema = await gridDescribe({
-      connectionId: input.connectionId,
-      database: input.database,
-      schema: input.object.schema,
-      table: input.object.name,
-      engine: input.engine,
-    });
-    const entry: CachedFields = { ...base, columns: schema.columns.map((column) => column.name), error: null };
-    cache.set(key, entry);
-    return entry;
-  } catch (err) {
-    const entry: CachedFields = { ...base, columns: [], error: errorText(err) };
-    cache.set(key, entry);
-    return entry;
-  }
+  const request = (async (): Promise<CachedFields> => {
+    try {
+      const schema = await gridDescribe({
+        connectionId: input.connectionId,
+        database: input.database,
+        schema: input.object.schema,
+        table: input.object.name,
+        engine: input.engine,
+      });
+      return remember(key, { ...base, columns: schema.columns.map((column) => column.name), error: null });
+    } catch (err) {
+      return remember(key, { ...base, columns: [], error: errorText(err) });
+    } finally {
+      inFlight.delete(key);
+    }
+  })();
+  inFlight.set(key, request);
+  return request;
 }
 
 import { tr } from "../i18n";
