@@ -57,6 +57,7 @@ interface SchemaDto {
   kind: TableKind;
   columns: Column[];
   key: string[];
+  foreignKeys?: TableSchema["foreignKeys"];
 }
 
 interface RowDto {
@@ -73,13 +74,14 @@ interface PageDto {
   sql: string;
 }
 
-function targetFields(target: TableTarget) {
+function targetFields(target: TableTarget, includeForeignKeys = false) {
   return {
     connectionId: target.connectionId,
     database: target.database,
     schema: target.schema,
     table: target.table,
     engine: target.engine,
+    includeForeignKeys,
   };
 }
 
@@ -106,8 +108,8 @@ function toRow(dto: RowDto): Row {
   };
 }
 
-export async function gridDescribe(target: TableTarget): Promise<TableSchema> {
-  const dto = await invoke<SchemaDto>("grid_describe", { request: targetFields(target) });
+export async function gridDescribe(target: TableTarget, options: { includeForeignKeys?: boolean } = {}): Promise<TableSchema> {
+  const dto = await invoke<SchemaDto>("grid_describe", { request: targetFields(target, options.includeForeignKeys === true) });
   return {
     engine: dto.engine,
     schema: dto.schema,
@@ -115,6 +117,7 @@ export async function gridDescribe(target: TableTarget): Promise<TableSchema> {
     kind: dto.kind,
     columns: dto.columns,
     key: dto.key,
+    ...(dto.foreignKeys ? { foreignKeys: dto.foreignKeys } : {}),
   };
 }
 

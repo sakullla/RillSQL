@@ -15,6 +15,9 @@ pub struct TableRef {
     pub schema: String,
     pub table: String,
     pub engine: String,
+    /// 只有补全需要外键，默认关闭以免每次打开表都多查一次。
+    #[serde(default)]
+    pub include_foreign_keys: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +137,18 @@ pub struct SchemaDto {
     pub kind: String,
     pub columns: Vec<ColumnDto>,
     pub key: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foreign_keys: Option<Vec<ForeignKeyDto>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForeignKeyDto {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub ref_schema: String,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -261,7 +276,7 @@ fn engine_name(engine: super::store::Engine) -> &'static str {
     }
 }
 
-fn schema_dto(schema: &super::store::TableSchema, database: &str) -> SchemaDto {
+fn schema_dto(schema: &super::store::TableSchema, database: &str, foreign_keys: Option<Vec<super::live::ForeignKey>>) -> SchemaDto {
     SchemaDto {
         engine: engine_name(schema.engine).to_owned(),
         database: database.to_owned(),
@@ -269,6 +284,17 @@ fn schema_dto(schema: &super::store::TableSchema, database: &str) -> SchemaDto {
         name: schema.name.clone(),
         kind: schema.kind.to_owned(),
         key: schema.key.clone(),
+        foreign_keys: foreign_keys.map(|list| {
+            list.into_iter()
+                .map(|item| ForeignKeyDto {
+                    name: item.name,
+                    columns: item.columns,
+                    ref_schema: item.ref_schema,
+                    ref_table: item.ref_table,
+                    ref_columns: item.ref_columns,
+                })
+                .collect()
+        }),
         columns: schema
             .columns
             .iter()
@@ -292,7 +318,13 @@ fn require_session(state: &ConnectionsState, id: &str) -> Result<crate::connecti
 pub async fn grid_describe(state: tauri::State<'_, ConnectionsState>, request: TableRef) -> Result<SchemaDto, String> {
     let session = require_session(&state, &request.connection_id)?;
     let schema = live::describe(&session, &request.database, &request.schema, &request.table, &request.engine).await?;
-    Ok(schema_dto(&schema, &request.database))
+    let foreign_keys = if request.include_foreign_keys {
+        // 外键失败只让这一项为空，不影响表结构本身。
+        Some(live::foreign_keys(&session, &request.database, &request.schema, &request.table, &request.engine).await.unwrap_or_default())
+    } else {
+        None
+    };
+    Ok(schema_dto(&schema, &request.database, foreign_keys))
 }
 
 #[tauri::command]

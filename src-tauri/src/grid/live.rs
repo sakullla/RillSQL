@@ -9,6 +9,7 @@ use std::sync::{Mutex, OnceLock};
 
 use futures::TryStreamExt;
 use sqlx::Column as _;
+use sqlx::Row as _;
 use sqlx::Executor;
 use sqlx::SqlSafeStr;
 use sqlx::Statement as _;
@@ -1893,4 +1894,118 @@ async fn describe_sqlserver(client: &TdsHandle, schema: &str, table: &str) -> Re
 /// 元数据查询里内联的 N'...' 文本转义。标识符与表名来自用户输入。
 fn escape_tds_text(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignKey {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub ref_schema: String,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+}
+
+fn push_key(list: &mut Vec<ForeignKey>, name: &str, column: &str, ref_schema: &str, ref_table: &str, ref_column: &str) {
+    if let Some(existing) = list.iter_mut().find(|item| item.name == name) {
+        existing.columns.push(column.to_owned());
+        existing.ref_columns.push(ref_column.to_owned());
+        return;
+    }
+    list.push(ForeignKey {
+        name: name.to_owned(),
+        columns: vec![column.to_owned()],
+        ref_schema: ref_schema.to_owned(),
+        ref_table: ref_table.to_owned(),
+        ref_columns: vec![ref_column.to_owned()],
+    });
+}
+
+/// 表级出向外键；只读，失败不影响表结构本身的读取。
+pub async fn foreign_keys(session: &CatalogSession, database: &str, schema_name: &str, table: &str, engine_hint: &str) -> Result<Vec<ForeignKey>, String> {
+    if table.is_empty() {
+        return Ok(Vec::new());
+    }
+    match session {
+        CatalogSession::Scripted => Ok(Vec::new()),
+        CatalogSession::Redis(_) | CatalogSession::Mongo(_) => Ok(Vec::new()),
+        CatalogSession::Sqlite { pool, .. } => {
+            if !database.is_empty() && database != "main" {
+                return Err(other_database("main", database));
+            }
+            let quoted = sql::quote_ident(Engine::Sqlite, table);
+            let rows = sqlx::query(audited(&format!("PRAGMA foreign_key_list({quoted})")))
+                .fetch_all(pool)
+                .await
+                .map_err(db_err)?;
+            let mut list: Vec<ForeignKey> = Vec::new();
+            for row in rows {
+                let id: i64 = row.try_get("id").map_err(db_err)?;
+                let column: String = row.try_get("from").map_err(db_err)?;
+                let ref_table: String = row.try_get("table").map_err(db_err)?;
+                let ref_column: Option<String> = row.try_get("to").ok();
+                push_key(&mut list, &format!("fk_{id}"), &column, "main", &ref_table, &ref_column.unwrap_or_else(|| "id".to_owned()));
+            }
+            Ok(list)
+        }
+        CatalogSession::Mysql(pool) => {
+            if database.is_empty() {
+                return Ok(Vec::new());
+            }
+            let _ = engine_hint;
+            let mut conn = pool.get_conn().await.map_err(db_err)?;
+            let rows: Vec<mysql_async::Row> = mysql_async::prelude::Queryable::exec(
+                &mut conn,
+                "SELECT CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION",
+                (database.to_owned(), table.to_owned()),
+            )
+            .await
+            .map_err(db_err)?;
+            let mut list: Vec<ForeignKey> = Vec::new();
+            for row in &rows {
+                let name = mysql_text(row, 0)?;
+                let column = mysql_text(row, 1)?;
+                let ref_schema = mysql_text(row, 2)?;
+                let ref_table = mysql_text(row, 3)?;
+                let ref_column = mysql_text(row, 4)?;
+                let scope = if ref_schema.is_empty() { database.to_owned() } else { ref_schema };
+                push_key(&mut list, &name, &column, &scope, &ref_table, &ref_column);
+            }
+            Ok(list)
+        }
+
+        CatalogSession::Postgres(client) => {
+            ensure_postgres_database(client, database).await?;
+            if schema_name.is_empty() {
+                return Ok(Vec::new());
+            }
+            let rows = client
+                .query(
+                    "SELECT c.conname AS name, a.attname AS column_name, fs.nspname AS ref_schema, ft.relname AS ref_table, af.attname AS ref_column \
+                     FROM pg_constraint c \
+                     JOIN pg_class t ON t.oid = c.conrelid \
+                     JOIN pg_namespace s ON s.oid = t.relnamespace \
+                     JOIN pg_class ft ON ft.oid = c.confrelid \
+                     JOIN pg_namespace fs ON fs.oid = ft.relnamespace \
+                     JOIN LATERAL unnest(c.conkey, c.confkey) WITH ORDINALITY AS k(attnum, fattnum, ord) ON true \
+                     JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
+                     JOIN pg_attribute af ON af.attrelid = ft.oid AND af.attnum = k.fattnum \
+                     WHERE s.nspname = $1 AND t.relname = $2 AND c.contype = 'f' \
+                     ORDER BY c.conname, k.ord",
+                    &[&schema_name, &table],
+                )
+                .await
+                .map_err(db_err)?;
+            let mut list: Vec<ForeignKey> = Vec::new();
+            for row in &rows {
+                let name: String = row.get("name");
+                let column: String = row.get("column_name");
+                let ref_schema: String = row.get("ref_schema");
+                let ref_table: String = row.get("ref_table");
+                let ref_column: String = row.get("ref_column");
+                push_key(&mut list, &name, &column, &ref_schema, &ref_table, &ref_column);
+            }
+            Ok(list)
+        }
+        CatalogSession::Sqlserver(_) => Ok(Vec::new()),
+    }
 }

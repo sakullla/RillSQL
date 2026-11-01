@@ -1171,3 +1171,42 @@ async fn xlsx_full_export_writes_select_and_table_rows_and_skips_updates() {
     drop(service);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[cfg(test)]
+mod fk_limits {
+    use super::super::live;
+    use crate::connections::Service;
+
+    #[tokio::test]
+    async fn reads_foreign_keys_for_sqlite() {
+        let dir = std::env::temp_dir().join(format!("rillsql-fk-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("fk.sqlite");
+        let setup = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE customers (id INTEGER PRIMARY KEY)")
+            .execute(&setup)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES customers(id))")
+            .execute(&setup)
+            .await
+            .unwrap();
+        setup.close().await;
+
+        let service = Service::new_for_test(dir.join("connections.sqlite"));
+        service.open_sqlite_for_test("fk", "FK", &database).await.unwrap();
+        let session = service.catalog_session("fk").expect("session");
+        let keys = live::foreign_keys(&session, "main", "", "orders", "sqlite").await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].ref_table, "customers");
+        assert_eq!(keys[0].columns, vec!["customer_id".to_owned()]);
+        assert_eq!(keys[0].ref_columns, vec!["id".to_owned()]);
+        drop(session);
+        drop(service);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -29,6 +29,14 @@ export interface Row {
   resolved?: boolean;
 }
 
+export interface ForeignKey {
+  name: string;
+  columns: string[];
+  refSchema: string;
+  refTable: string;
+  refColumns: string[];
+}
+
 export interface TableSchema {
   engine: Engine;
   schema: string;
@@ -36,6 +44,8 @@ export interface TableSchema {
   kind: TableKind;
   columns: Column[];
   key: string[];
+  /** 只有显式请求时才有：表级出向外键，供补全推断 JOIN。 */
+  foreignKeys?: ForeignKey[];
 }
 
 export interface TableStore {
