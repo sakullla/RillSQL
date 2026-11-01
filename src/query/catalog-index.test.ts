@@ -28,4 +28,20 @@ describe("catalog index", () => {
     expect(sources).toEqual([{ alias: "o", label: expect.stringContaining("orders"), columns: ["id", "customer_id"] }]);
     expect(expandStar([...sources, { alias: "c", label: "public.customers", columns: ["id", "name"] }])).toEqual(["id", "customer_id", "name"]);
   });
+
+  it("uses the database name as qualifier when the engine has no schema", () => {
+    const mysql = {
+      ...atlas,
+      engine: "mysql" as const,
+      databases: [
+        { name: "shop", error: null, schemas: [{ name: "", objects: [{ name: "orders", kind: "table" as const, estimatedRows: null, stale: false }], total: 1, error: null }] },
+        { name: "archive", error: null, schemas: [{ name: "", objects: [{ name: "orders", kind: "table" as const, estimatedRows: null, stale: false }], total: 1, error: null }] },
+      ],
+    };
+    const index = catalogIndex(mysql);
+    expect(index.byQualified.has("shop.orders")).toBe(true);
+    expect(resolveTable(index, { alias: "o", schema: "shop", name: "orders" })?.schema).toBe("shop");
+    expect(resolveTable(index, { alias: "o", schema: null, name: "orders" }, "archive")?.schema).toBe("archive");
+    expect(resolveTable(index, { alias: "o", schema: null, name: "orders" })).toBeNull();
+  });
 });

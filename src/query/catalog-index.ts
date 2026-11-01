@@ -24,10 +24,12 @@ export function catalogIndex(connection: CatalogConnection | null): CatalogIndex
     const names: string[] = [];
     for (const schema of database.schemas) {
       if (schema.name && !names.includes(schema.name)) names.push(schema.name);
+      /* MySQL/SQLite 的目录里 schema 为空串，库名才是限定前缀；统一收敛成"有效限定符"。 */
+      const qualifier = schema.name || database.name;
       for (const object of schema.objects) {
         if (object.stale) continue;
-        const label = schema.name ? `${schema.name}.${objectLabel(connection.engine, object)}` : objectLabel(connection.engine, object);
-        const item: CompletionObject = { label, name: object.name, schema: schema.name, kind: object.kind };
+        const label = qualifier ? `${qualifier}.${objectLabel(connection.engine, object)}` : objectLabel(connection.engine, object);
+        const item: CompletionObject = { label, name: object.name, schema: qualifier, kind: object.kind };
         index.objects.push(item);
         index.byQualified.set(label.toLowerCase(), item);
         const bucket = index.byName.get(object.name.toLowerCase());
@@ -46,7 +48,7 @@ function emptyIndex(): CatalogIndex {
 }
 
 /** 解析语句里的表引用：先按限定名，再按裸名；裸名有歧义时不猜。 */
-export function resolveTable(index: CatalogIndex, table: ScopeTable): CompletionObject | null {
+export function resolveTable(index: CatalogIndex, table: ScopeTable, preferred: string | null = null): CompletionObject | null {
   const qualified = table.schema ? `${table.schema}.${table.name}`.toLowerCase() : null;
   if (qualified) {
     const exact = index.byQualified.get(qualified);
@@ -55,14 +57,24 @@ export function resolveTable(index: CatalogIndex, table: ScopeTable): Completion
     if (bySchema) return bySchema;
   }
   const candidates = index.byName.get(table.name.toLowerCase()) ?? [];
-  return candidates.length === 1 ? candidates[0]! : null;
+  if (candidates.length === 1) return candidates[0]!;
+  if (preferred) {
+    const scoped = candidates.filter((object) => object.schema.toLowerCase() === preferred.toLowerCase());
+    return scoped.length === 1 ? scoped[0]! : null;
+  }
+  return null;
 }
 
 /** 把 FROM/JOIN 的表转成候选来源；列由调用方按缓存注入，未加载时为空数组。 */
-export function sourcesFor(index: CatalogIndex, tables: readonly ScopeTable[], columnsOf: (object: CompletionObject) => string[] = () => []): CompletionSource[] {
+export function sourcesFor(
+  index: CatalogIndex,
+  tables: readonly ScopeTable[],
+  columnsOf: (object: CompletionObject) => string[] = () => [],
+  preferred: string | null = null,
+): CompletionSource[] {
   const sources: CompletionSource[] = [];
   for (const table of tables) {
-    const object = resolveTable(index, table);
+    const object = resolveTable(index, table, preferred);
     if (!object) continue;
     sources.push({ alias: table.alias, label: object.label, columns: columnsOf(object) });
   }

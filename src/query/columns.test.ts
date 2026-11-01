@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CompletionObject } from "./complete";
-import { cachedColumns, clearColumnCache, columnCacheSize, loadFields } from "./columns";
+import { cachedColumns, clearColumnCache, columnCacheSize, invalidateColumns, loadFields } from "./columns";
 
 const api = vi.hoisted(() => ({ gridDescribe: vi.fn() }));
 vi.mock("../grid/api", () => api);
@@ -44,6 +44,27 @@ describe("column cache", () => {
     expect(api.gridDescribe.mock.calls.length).toBe(calls + 1);
     await loadFields({ connectionId: "db", database: "app", engine: "postgres", object: object("t0") });
     expect(api.gridDescribe.mock.calls.length).toBe(calls + 1);
+  });
+
+  it("joins an in-flight request even when the caller asks for a refresh", async () => {
+    let release!: (value: unknown) => void;
+    api.gridDescribe.mockImplementation(() => new Promise((resolve) => { release = resolve; }));
+    const first = loadFields({ connectionId: "db", database: "app", engine: "postgres", object: object("orders") });
+    const refreshed = loadFields({ connectionId: "db", database: "app", engine: "postgres", object: object("orders"), refresh: true });
+    expect(api.gridDescribe).toHaveBeenCalledTimes(1);
+    release(columnsFor("orders"));
+    await Promise.all([first, refreshed]);
+    expect(api.gridDescribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("invalidates a connection prefix without touching other connections", async () => {
+    api.gridDescribe.mockImplementation((request: { table: string }) => Promise.resolve(columnsFor(request.table)));
+    await loadFields({ connectionId: "db", database: "app", engine: "postgres", object: object("orders") });
+    await loadFields({ connectionId: "db2", database: "app", engine: "postgres", object: object("orders") });
+    invalidateColumns("db\u0000");
+    expect(columnCacheSize()).toBe(1);
+    expect(cachedColumns("db", "app")).toEqual([]);
+    expect(cachedColumns("db2", "app").length).toBe(2);
   });
 
   it("keeps a failure for the next lookup and flattens only successful tables", async () => {

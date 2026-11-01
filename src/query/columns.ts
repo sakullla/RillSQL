@@ -26,6 +26,17 @@ export function columnCacheSize(): number {
   return cache.size;
 }
 
+/** 结构变更或断开后由调用方按前缀失效；不传参数即清空。 */
+export function invalidateColumns(prefix?: string): void {
+  if (!prefix) {
+    clearColumnCache();
+    return;
+  }
+  for (const key of [...cache.keys()]) {
+    if (key.startsWith(prefix)) cache.delete(key);
+  }
+}
+
 function remember(key: string, entry: CachedFields): CachedFields {
   cache.delete(key);
   cache.set(key, entry);
@@ -125,11 +136,11 @@ export async function loadFields(input: {
   refresh?: boolean;
 }): Promise<CachedFields> {
   const key = columnKey(input.connectionId, input.database, input.object.schema, input.object.name);
+  const running = inFlight.get(key);
+  if (running) return running;
   if (!input.refresh) {
     const cached = recall(key);
     if (cached) return cached;
-    const pending = inFlight.get(key);
-    if (pending) return pending;
   }
   const base = {
     connectionId: input.connectionId,
@@ -138,7 +149,8 @@ export async function loadFields(input: {
     table: input.object.name,
     label: input.object.label,
   };
-  const request = (async (): Promise<CachedFields> => {
+  let request: Promise<CachedFields> | null = null;
+  request = (async (): Promise<CachedFields> => {
     try {
       const schema = await gridDescribe({
         connectionId: input.connectionId,
@@ -151,7 +163,7 @@ export async function loadFields(input: {
     } catch (err) {
       return remember(key, { ...base, columns: [], error: errorText(err) });
     } finally {
-      inFlight.delete(key);
+      if (request && inFlight.get(key) === request) inFlight.delete(key);
     }
   })();
   inFlight.set(key, request);
