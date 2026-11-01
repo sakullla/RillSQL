@@ -40,9 +40,9 @@ Versions follow SemVer. `.github/workflows/release.yml` runs when a `v*` tag is 
    - `src-tauri/tauri.conf.json`
    - `PRODUCT_VERSION` in `src/shell/product.ts`
 3. Validate locally: `npm test`, `npm run build`, `node scripts/i18n-scan.mjs`, `node --test .github/scripts/release.test.mjs`. For UI changes, also start Vite and run `npm run verify:workbench` and `npm run capture:ui`.
-4. Commit as `chore: 发布 vX.Y.Z`, then create an annotated tag: `git tag -a vX.Y.Z -m "RillSQL vX.Y.Z"`. `release.mjs check vX.Y.Z` rejects a tag that does not match the version.
-5. Push the branch and the tag: `git push origin release/vX.Y.Z vX.Y.Z`.
-6. Follow the run with `gh run watch` and confirm the release at `gh release view vX.Y.Z`.
-7. After the release is published, fast-forward `main`: `git push origin release/vX.Y.Z:main`.
+4. Commit as `chore: 发布 vX.Y.Z`, push the branch, and fast-forward `main`: `git push origin release/vX.Y.Z release/vX.Y.Z:main`. GitHub only registers a workflow once it exists on the default branch; a tag pushed before that starts nothing and reports no error.
+5. Wait for CI on `main` to pass: `gh run watch`. The release job depends on the same CI, so a failure here would stop the release anyway.
+6. Create and push an annotated tag: `git tag -a vX.Y.Z -m "RillSQL vX.Y.Z"`, then `git push origin vX.Y.Z`. `release.mjs check vX.Y.Z` rejects a tag that does not match the version.
+7. Follow the run with `gh run watch` and confirm the release with `gh release view vX.Y.Z`.
 
-If the run fails before publishing, fix the cause on the release branch, delete the tag locally and on the remote, and tag the new commit with the same version; the workflow resumes the existing draft. A published version is never reused: fix forward with a new version. A tag containing `-` (for example `v0.3.0-rc.1`) is published as a pre-release.
+If the run fails before publishing, fix the cause, repeat steps 4 and 5, delete the tag locally and on the remote, and tag the new commit with the same version; the workflow resumes the existing draft. A published version is never reused: fix forward with a new version. A tag containing `-` (for example `v0.3.0-rc.1`) is published as a pre-release.
