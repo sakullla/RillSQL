@@ -46,6 +46,21 @@ function names(wrapper: { findAll(selector: string): DOMWrapper<Element>[] }, se
 }
 
 describe("explorer tree", () => {
+  it("keeps the enabled foreign key state in the connection row", async () => {
+    const catalog = pagedCatalog().map((item) => (item.engine === "sqlite" ? { ...item, foreignKeys: true } : item));
+    setPageSource(pageArchive);
+    replaceCatalog(catalog);
+    const wrapper = mount(ExplorerTree, { props: { filter: "" } });
+    const sqlite = wrapper.get("[data-engine=sqlite]");
+    const chip = sqlite.get("[data-fk-chip]");
+    expect(chip.attributes("data-fk-chip")).toBe("on");
+    expect(chip.text()).toContain("外键 ON");
+    expect(sqlite.find("[data-foreign-keys-off]").exists()).toBe(false);
+    expect(sqlite.find("[data-foreign-keys]").exists()).toBe(false);
+    wrapper.unmount();
+    resetCatalog();
+  });
+
   it("shows engine levels, a plain failed-read note with retry, the sqlite foreign key state, and the next batch", async () => {
     setPageSource(pageArchive);
     replaceCatalog(pagedCatalog());
@@ -62,6 +77,9 @@ describe("explorer tree", () => {
     ]);
     expect(postgres.find(".current-db").attributes("title")).toBe("当前会话连接的数据库");
     const failed = postgres.get("[data-schema-error]");
+    expect(failed.classes()).toContain("one-line");
+    expect(failed.findAll("div")).toHaveLength(0);
+    expect(failed.attributes("title")).toContain("没有权限读取 restricted 里的对象");
     expect(failed.text()).toContain("这部分对象列表没读出来");
     expect(failed.text()).toContain("没有权限读取 restricted 里的对象");
     expect(failed.get('[data-action="tree-retry"]').text()).toBe("重试");
@@ -92,7 +110,8 @@ describe("explorer tree", () => {
     expect(notice.text()).toContain("foreign_keys = OFF");
     expect(notice.element.closest(".tree-entries")).toBeNull();
     expect(sqlite.find(".tree-entries [data-level=diagram]").exists()).toBe(true);
-    expect(notice.element.scrollHeight).toBeLessThanOrEqual(notice.element.clientHeight + 4);
+    expect(notice.classes()).toContain("one-line");
+    expect(notice.findAll("div")).toHaveLength(0);
     expect(names(sqlite, "[data-level=object]")).toEqual(["notes", "v_note_summary"]);
     expect(sqlite.find("[data-kind-group=function]").exists()).toBe(false);
     expect(sqlite.find("[data-kind-group=procedure]").exists()).toBe(false);

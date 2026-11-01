@@ -33,6 +33,14 @@ const ICONS = {
   error: "M2 12a10 10 0 1 0 20 0 10 10 0 1 0-20 0M15 9l-6 6M9 9l6 6",
 } as const;
 
+function partFailedTitle(text: string): string {
+  return `${t("catalog.schema.partFailed")}：${text}`;
+}
+
+function kindFailedTitle(kind: ObjectKind): string {
+  return `${t("catalog.schema.kindFailed")}：${reportOf(kind)?.error ?? ""}`;
+}
+
 function depthStyle(depth: number) {
   return { "--d": String(depth) };
 }
@@ -173,15 +181,11 @@ function showIndexes(object: CatalogObject): boolean {
 </script>
 
 <template>
-  <div v-if="schema.error" class="tree-note err" :style="depthStyle(depth)" data-schema-error>
+  <div v-if="schema.error" class="tree-note err one-line" :style="depthStyle(depth)" data-schema-error :title="partFailedTitle(schema.error)">
     <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>
-    <div>
-      <strong>{{ t("catalog.schema.partFailed") }}</strong>
-      <span class="reason">{{ schema.error }}</span>
-      <span class="tree-note-acts">
-        <button class="btn sm" type="button" data-action="tree-retry" :data-schema="schema.name" @click="refreshCatalog()">{{ t("catalog.tree.retry") }}</button>
-      </span>
-    </div>
+    <strong>{{ t("catalog.schema.partFailed") }}</strong>
+    <span class="reason">{{ schema.error }}</span>
+    <button class="btn sm" type="button" data-action="tree-retry" :data-schema="schema.name" @click="refreshCatalog()">{{ t("catalog.tree.retry") }}</button>
   </div>
   <div v-if="firstLoad()" class="tree-note" :style="depthStyle(depth)" data-kind-pending :data-schema="schema.name" :data-database="database">
     <span>{{ t("catalog.schema.loading") }}</span>
@@ -209,12 +213,10 @@ function showIndexes(object: CatalogObject): boolean {
         <span v-if="!reportOf(kind)?.error" class="tr-meta">{{ groupTotal(kind, objectsOf(kind).length) }}</span>
       </div>
       <template v-if="groupOpen(kind)">
-        <div v-if="reportOf(kind)?.error" class="tree-note err" :style="depthStyle(depth + 1)" data-kind-error :data-kind-group="kind" :data-schema="schema.name" :data-database="database">
+        <div v-if="reportOf(kind)?.error" class="tree-note err one-line" :style="depthStyle(depth + 1)" data-kind-error :data-kind-group="kind" :data-schema="schema.name" :data-database="database" :title="kindFailedTitle(kind)">
           <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>
-          <div>
-            <strong>{{ t("catalog.schema.kindFailed") }}</strong>
-            <span class="reason">{{ reportOf(kind)?.error }}</span>
-          </div>
+          <strong>{{ t("catalog.schema.kindFailed") }}</strong>
+          <span class="reason">{{ reportOf(kind)?.error }}</span>
         </div>
         <div
           v-else-if="objectsOf(kind).length === 0 && groupTotal(kind, 0) === 0"

@@ -518,6 +518,10 @@ async function onCopy() {
   }
 }
 
+function loadFailedTitle(text: string): string {
+  return `${t("catalog.tree.loadFailed")}：${text}`;
+}
+
 function fkLine(connection: CatalogConnection): string {
   return t("catalog.tree.fkLine", {
     state: connection.foreignKeys ? t("catalog.tree.fkOn") : t("catalog.tree.fkOff"),
@@ -679,15 +683,11 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <template v-else>
-          <div v-if="connection.error" class="tree-note err" data-connection-error :style="depthStyle(1)">
+          <div v-if="connection.error" class="tree-note err one-line" data-connection-error :style="depthStyle(1)" :title="loadFailedTitle(connection.error)">
             <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>
-            <div>
-              <strong>{{ t("catalog.tree.loadFailed") }}</strong>
-              <span class="reason">{{ connection.error }}</span>
-              <span class="tree-note-acts">
-                <button class="btn sm" type="button" data-action="tree-retry" @click="onRefresh">{{ t("catalog.tree.retry") }}</button>
-              </span>
-            </div>
+            <strong>{{ t("catalog.tree.loadFailed") }}</strong>
+            <span class="reason">{{ connection.error }}</span>
+            <button class="btn sm" type="button" data-action="tree-retry" @click="onRefresh">{{ t("catalog.tree.retry") }}</button>
           </div>
           <!-- Redis（kv 引擎）：连接节点下直接展开键空间分页列表；没有库/schema/关系图入口（ADR-2/ADR-4）。 -->
           <RedisTreeKeys v-if="connection.engine === 'redis'" :connection="connection" :api="props.redisApi" @open-key="(target, key) => emit('open-keys', target, key)" />
@@ -787,15 +787,11 @@ onBeforeUnmount(() => {
                     <span v-if="focusError && focusTarget === focusKey(connection.id, database.name)" class="tree-inline-err" data-focus-error>{{ focusError }}</span>
                   </div>
                 </div>
-                <div v-else-if="database.error" class="tree-note err" :style="depthStyle(2)">
+                <div v-else-if="database.error" class="tree-note err one-line" :style="depthStyle(2)" data-database-error :title="loadFailedTitle(database.error)">
                   <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>
-                  <div>
-                    <strong>{{ t("catalog.tree.loadFailed") }}</strong>
-                    <span class="reason">{{ database.error }}</span>
-                    <span class="tree-note-acts">
-                      <button class="btn sm" type="button" data-action="tree-retry" @click="onRefresh">{{ t("catalog.tree.retry") }}</button>
-                    </span>
-                  </div>
+                  <strong>{{ t("catalog.tree.loadFailed") }}</strong>
+                  <span class="reason">{{ database.error }}</span>
+                  <button class="btn sm" type="button" data-action="tree-retry" @click="onRefresh">{{ t("catalog.tree.retry") }}</button>
                 </div>
                 <template v-for="schema in database.schemas" :key="`${database.name}:${schema.name}`">
                   <div

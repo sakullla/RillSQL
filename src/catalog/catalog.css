@@ -134,7 +134,9 @@ button.tree-row .tr-name { color: var(--text-2); }
 /* 入口与对象分组同层：关系图是入口区首行，提示不进入该区。 */
 .tree .tree-entries { display: contents; }
 .tree .tree-note.one-line { flex-wrap: nowrap; }
-.tree .tree-note.one-line > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree .tree-note.one-line > .reason { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree .tree-note.one-line > strong { flex-shrink: 0; }
+.tree .tree-note.one-line > .btn { flex-shrink: 0; }
 .tree .tree-note.tree-empty { flex-wrap: wrap; align-items: center; }
 .tree .tree-note > div { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 0; }
 .tree .tree-note > .i { width: 14px; height: 14px; flex-shrink: 0; margin-top: 2px; }
