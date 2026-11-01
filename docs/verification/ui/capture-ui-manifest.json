@@ -1,5 +1,5 @@
 {
-  "capturedAt": "2026-11-01T03:57:10.694Z",
+  "capturedAt": "2026-11-01T09:52:13.575Z",
   "synthetic": true,
   "invocation": "node scripts/capture-ui.mjs",
   "previewUrl": "http://localhost:1420",
@@ -37,9 +37,250 @@
     "connections-en",
     "query-en"
   ],
-  "missing": [],
-  "success": true,
-  "imageCount": 126,
+  "missing": [
+    {
+      "name": "compare",
+      "theme": "light",
+      "width": 1360
+    },
+    {
+      "name": "close-guard",
+      "theme": "light",
+      "width": 1360
+    },
+    {
+      "name": "history",
+      "theme": "light",
+      "width": 1360
+    },
+    {
+      "name": "history-saved",
+      "theme": "light",
+      "width": 1360
+    },
+    {
+      "name": "settings",
+      "theme": "light",
+      "width": 1360
+    },
+    {
+      "name": "title-theme",
+      "theme": "light",
+      "width": 1360
+    },
+    {
+      "name": "connections-en",
+      "theme": "light",
+      "width": 1360
+    },
+    {
+      "name": "query-en",
+      "theme": "light",
+      "width": 1360
+    },
+    {
+      "name": "compare",
+      "theme": "dark",
+      "width": 1360
+    },
+    {
+      "name": "close-guard",
+      "theme": "dark",
+      "width": 1360
+    },
+    {
+      "name": "history",
+      "theme": "dark",
+      "width": 1360
+    },
+    {
+      "name": "history-saved",
+      "theme": "dark",
+      "width": 1360
+    },
+    {
+      "name": "settings",
+      "theme": "dark",
+      "width": 1360
+    },
+    {
+      "name": "title-theme",
+      "theme": "dark",
+      "width": 1360
+    },
+    {
+      "name": "connections-en",
+      "theme": "dark",
+      "width": 1360
+    },
+    {
+      "name": "query-en",
+      "theme": "dark",
+      "width": 1360
+    },
+    {
+      "name": "compare",
+      "theme": "light",
+      "width": 900
+    },
+    {
+      "name": "close-guard",
+      "theme": "light",
+      "width": 900
+    },
+    {
+      "name": "history",
+      "theme": "light",
+      "width": 900
+    },
+    {
+      "name": "history-saved",
+      "theme": "light",
+      "width": 900
+    },
+    {
+      "name": "settings",
+      "theme": "light",
+      "width": 900
+    },
+    {
+      "name": "title-theme",
+      "theme": "light",
+      "width": 900
+    },
+    {
+      "name": "connections-en",
+      "theme": "light",
+      "width": 900
+    },
+    {
+      "name": "query-en",
+      "theme": "light",
+      "width": 900
+    },
+    {
+      "name": "compare",
+      "theme": "dark",
+      "width": 900
+    },
+    {
+      "name": "close-guard",
+      "theme": "dark",
+      "width": 900
+    },
+    {
+      "name": "history",
+      "theme": "dark",
+      "width": 900
+    },
+    {
+      "name": "history-saved",
+      "theme": "dark",
+      "width": 900
+    },
+    {
+      "name": "settings",
+      "theme": "dark",
+      "width": 900
+    },
+    {
+      "name": "title-theme",
+      "theme": "dark",
+      "width": 900
+    },
+    {
+      "name": "connections-en",
+      "theme": "dark",
+      "width": 900
+    },
+    {
+      "name": "query-en",
+      "theme": "dark",
+      "width": 900
+    },
+    {
+      "name": "compare",
+      "theme": "light",
+      "width": 640
+    },
+    {
+      "name": "close-guard",
+      "theme": "light",
+      "width": 640
+    },
+    {
+      "name": "history",
+      "theme": "light",
+      "width": 640
+    },
+    {
+      "name": "history-saved",
+      "theme": "light",
+      "width": 640
+    },
+    {
+      "name": "settings",
+      "theme": "light",
+      "width": 640
+    },
+    {
+      "name": "title-theme",
+      "theme": "light",
+      "width": 640
+    },
+    {
+      "name": "connections-en",
+      "theme": "light",
+      "width": 640
+    },
+    {
+      "name": "query-en",
+      "theme": "light",
+      "width": 640
+    },
+    {
+      "name": "compare",
+      "theme": "dark",
+      "width": 640
+    },
+    {
+      "name": "close-guard",
+      "theme": "dark",
+      "width": 640
+    },
+    {
+      "name": "history",
+      "theme": "dark",
+      "width": 640
+    },
+    {
+      "name": "history-saved",
+      "theme": "dark",
+      "width": 640
+    },
+    {
+      "name": "settings",
+      "theme": "dark",
+      "width": 640
+    },
+    {
+      "name": "title-theme",
+      "theme": "dark",
+      "width": 640
+    },
+    {
+      "name": "connections-en",
+      "theme": "dark",
+      "width": 640
+    },
+    {
+      "name": "query-en",
+      "theme": "dark",
+      "width": 640
+    }
+  ],
+  "success": false,
+  "imageCount": 78,
   "captures": [
     {
       "name": "welcome",
@@ -159,78 +400,6 @@
       "state": "全局、SQL 编辑器和表格快捷键"
     },
     {
-      "name": "compare",
-      "title": "对比库",
-      "theme": "light",
-      "width": 1360,
-      "height": 1000,
-      "file": "compare-light-1360.png",
-      "state": "仅一侧拥有的表、列差异与两侧脚本"
-    },
-    {
-      "name": "close-guard",
-      "title": "关闭守卫",
-      "theme": "light",
-      "width": 1360,
-      "height": 1000,
-      "file": "close-guard-light-1360.png",
-      "state": "未执行草稿的标签关闭确认"
-    },
-    {
-      "name": "title-theme",
-      "title": "标题栏主题菜单",
-      "theme": "light",
-      "width": 1360,
-      "height": 1000,
-      "file": "title-theme-light-1360.png",
-      "state": "标题栏外观菜单：浅色 / 深色 / 跟随系统"
-    },
-    {
-      "name": "history",
-      "title": "查询历史",
-      "theme": "light",
-      "width": 1360,
-      "height": 1000,
-      "file": "history-light-1360.png",
-      "state": "成功、失败，以及原连接已删除"
-    },
-    {
-      "name": "history-saved",
-      "title": "保存的查询",
-      "theme": "light",
-      "width": 1360,
-      "height": 1000,
-      "file": "history-saved-light-1360.png",
-      "state": "保存的名称与 SQL，旧连接需要重选执行目标"
-    },
-    {
-      "name": "settings",
-      "title": "设置",
-      "theme": "light",
-      "width": 1360,
-      "height": 1000,
-      "file": "settings-light-1360.png",
-      "state": "外观、数据读取、执行与复制、本机数据和关于"
-    },
-    {
-      "name": "connections-en",
-      "title": "连接管理（英文）",
-      "theme": "light",
-      "width": 1360,
-      "height": 1000,
-      "file": "connections-en-light-1360.png",
-      "state": "英文界面语言下的连接管理页（已连接与未连接卡片）"
-    },
-    {
-      "name": "query-en",
-      "title": "查询结果（英文）",
-      "theme": "light",
-      "width": 1360,
-      "height": 1000,
-      "file": "query-en-light-1360.png",
-      "state": "英文界面语言下的查询结果（含执行目标与只读结果徽标）"
-    },
-    {
       "name": "welcome",
       "title": "欢迎页与资源管理器",
       "theme": "dark",
@@ -346,78 +515,6 @@
       "height": 1000,
       "file": "shortcuts-dark-1360.png",
       "state": "全局、SQL 编辑器和表格快捷键"
-    },
-    {
-      "name": "compare",
-      "title": "对比库",
-      "theme": "dark",
-      "width": 1360,
-      "height": 1000,
-      "file": "compare-dark-1360.png",
-      "state": "仅一侧拥有的表、列差异与两侧脚本"
-    },
-    {
-      "name": "close-guard",
-      "title": "关闭守卫",
-      "theme": "dark",
-      "width": 1360,
-      "height": 1000,
-      "file": "close-guard-dark-1360.png",
-      "state": "未执行草稿的标签关闭确认"
-    },
-    {
-      "name": "title-theme",
-      "title": "标题栏主题菜单",
-      "theme": "dark",
-      "width": 1360,
-      "height": 1000,
-      "file": "title-theme-dark-1360.png",
-      "state": "标题栏外观菜单：浅色 / 深色 / 跟随系统"
-    },
-    {
-      "name": "history",
-      "title": "查询历史",
-      "theme": "dark",
-      "width": 1360,
-      "height": 1000,
-      "file": "history-dark-1360.png",
-      "state": "成功、失败，以及原连接已删除"
-    },
-    {
-      "name": "history-saved",
-      "title": "保存的查询",
-      "theme": "dark",
-      "width": 1360,
-      "height": 1000,
-      "file": "history-saved-dark-1360.png",
-      "state": "保存的名称与 SQL，旧连接需要重选执行目标"
-    },
-    {
-      "name": "settings",
-      "title": "设置",
-      "theme": "dark",
-      "width": 1360,
-      "height": 1000,
-      "file": "settings-dark-1360.png",
-      "state": "外观、数据读取、执行与复制、本机数据和关于"
-    },
-    {
-      "name": "connections-en",
-      "title": "连接管理（英文）",
-      "theme": "dark",
-      "width": 1360,
-      "height": 1000,
-      "file": "connections-en-dark-1360.png",
-      "state": "英文界面语言下的连接管理页（已连接与未连接卡片）"
-    },
-    {
-      "name": "query-en",
-      "title": "查询结果（英文）",
-      "theme": "dark",
-      "width": 1360,
-      "height": 1000,
-      "file": "query-en-dark-1360.png",
-      "state": "英文界面语言下的查询结果（含执行目标与只读结果徽标）"
     },
     {
       "name": "welcome",
@@ -537,78 +634,6 @@
       "state": "全局、SQL 编辑器和表格快捷键"
     },
     {
-      "name": "compare",
-      "title": "对比库",
-      "theme": "light",
-      "width": 900,
-      "height": 1000,
-      "file": "compare-light-900.png",
-      "state": "仅一侧拥有的表、列差异与两侧脚本"
-    },
-    {
-      "name": "close-guard",
-      "title": "关闭守卫",
-      "theme": "light",
-      "width": 900,
-      "height": 1000,
-      "file": "close-guard-light-900.png",
-      "state": "未执行草稿的标签关闭确认"
-    },
-    {
-      "name": "title-theme",
-      "title": "标题栏主题菜单",
-      "theme": "light",
-      "width": 900,
-      "height": 1000,
-      "file": "title-theme-light-900.png",
-      "state": "标题栏外观菜单：浅色 / 深色 / 跟随系统"
-    },
-    {
-      "name": "history",
-      "title": "查询历史",
-      "theme": "light",
-      "width": 900,
-      "height": 1000,
-      "file": "history-light-900.png",
-      "state": "成功、失败，以及原连接已删除"
-    },
-    {
-      "name": "history-saved",
-      "title": "保存的查询",
-      "theme": "light",
-      "width": 900,
-      "height": 1000,
-      "file": "history-saved-light-900.png",
-      "state": "保存的名称与 SQL，旧连接需要重选执行目标"
-    },
-    {
-      "name": "settings",
-      "title": "设置",
-      "theme": "light",
-      "width": 900,
-      "height": 1000,
-      "file": "settings-light-900.png",
-      "state": "外观、数据读取、执行与复制、本机数据和关于"
-    },
-    {
-      "name": "connections-en",
-      "title": "连接管理（英文）",
-      "theme": "light",
-      "width": 900,
-      "height": 1000,
-      "file": "connections-en-light-900.png",
-      "state": "英文界面语言下的连接管理页（已连接与未连接卡片）"
-    },
-    {
-      "name": "query-en",
-      "title": "查询结果（英文）",
-      "theme": "light",
-      "width": 900,
-      "height": 1000,
-      "file": "query-en-light-900.png",
-      "state": "英文界面语言下的查询结果（含执行目标与只读结果徽标）"
-    },
-    {
       "name": "welcome",
       "title": "欢迎页与资源管理器",
       "theme": "dark",
@@ -724,78 +749,6 @@
       "height": 1000,
       "file": "shortcuts-dark-900.png",
       "state": "全局、SQL 编辑器和表格快捷键"
-    },
-    {
-      "name": "compare",
-      "title": "对比库",
-      "theme": "dark",
-      "width": 900,
-      "height": 1000,
-      "file": "compare-dark-900.png",
-      "state": "仅一侧拥有的表、列差异与两侧脚本"
-    },
-    {
-      "name": "close-guard",
-      "title": "关闭守卫",
-      "theme": "dark",
-      "width": 900,
-      "height": 1000,
-      "file": "close-guard-dark-900.png",
-      "state": "未执行草稿的标签关闭确认"
-    },
-    {
-      "name": "title-theme",
-      "title": "标题栏主题菜单",
-      "theme": "dark",
-      "width": 900,
-      "height": 1000,
-      "file": "title-theme-dark-900.png",
-      "state": "标题栏外观菜单：浅色 / 深色 / 跟随系统"
-    },
-    {
-      "name": "history",
-      "title": "查询历史",
-      "theme": "dark",
-      "width": 900,
-      "height": 1000,
-      "file": "history-dark-900.png",
-      "state": "成功、失败，以及原连接已删除"
-    },
-    {
-      "name": "history-saved",
-      "title": "保存的查询",
-      "theme": "dark",
-      "width": 900,
-      "height": 1000,
-      "file": "history-saved-dark-900.png",
-      "state": "保存的名称与 SQL，旧连接需要重选执行目标"
-    },
-    {
-      "name": "settings",
-      "title": "设置",
-      "theme": "dark",
-      "width": 900,
-      "height": 1000,
-      "file": "settings-dark-900.png",
-      "state": "外观、数据读取、执行与复制、本机数据和关于"
-    },
-    {
-      "name": "connections-en",
-      "title": "连接管理（英文）",
-      "theme": "dark",
-      "width": 900,
-      "height": 1000,
-      "file": "connections-en-dark-900.png",
-      "state": "英文界面语言下的连接管理页（已连接与未连接卡片）"
-    },
-    {
-      "name": "query-en",
-      "title": "查询结果（英文）",
-      "theme": "dark",
-      "width": 900,
-      "height": 1000,
-      "file": "query-en-dark-900.png",
-      "state": "英文界面语言下的查询结果（含执行目标与只读结果徽标）"
     },
     {
       "name": "welcome",
@@ -915,78 +868,6 @@
       "state": "全局、SQL 编辑器和表格快捷键"
     },
     {
-      "name": "compare",
-      "title": "对比库",
-      "theme": "light",
-      "width": 640,
-      "height": 1000,
-      "file": "compare-light-640.png",
-      "state": "仅一侧拥有的表、列差异与两侧脚本"
-    },
-    {
-      "name": "close-guard",
-      "title": "关闭守卫",
-      "theme": "light",
-      "width": 640,
-      "height": 1000,
-      "file": "close-guard-light-640.png",
-      "state": "未执行草稿的标签关闭确认"
-    },
-    {
-      "name": "title-theme",
-      "title": "标题栏主题菜单",
-      "theme": "light",
-      "width": 640,
-      "height": 1000,
-      "file": "title-theme-light-640.png",
-      "state": "标题栏外观菜单：浅色 / 深色 / 跟随系统"
-    },
-    {
-      "name": "history",
-      "title": "查询历史",
-      "theme": "light",
-      "width": 640,
-      "height": 1000,
-      "file": "history-light-640.png",
-      "state": "成功、失败，以及原连接已删除"
-    },
-    {
-      "name": "history-saved",
-      "title": "保存的查询",
-      "theme": "light",
-      "width": 640,
-      "height": 1000,
-      "file": "history-saved-light-640.png",
-      "state": "保存的名称与 SQL，旧连接需要重选执行目标"
-    },
-    {
-      "name": "settings",
-      "title": "设置",
-      "theme": "light",
-      "width": 640,
-      "height": 1000,
-      "file": "settings-light-640.png",
-      "state": "外观、数据读取、执行与复制、本机数据和关于"
-    },
-    {
-      "name": "connections-en",
-      "title": "连接管理（英文）",
-      "theme": "light",
-      "width": 640,
-      "height": 1000,
-      "file": "connections-en-light-640.png",
-      "state": "英文界面语言下的连接管理页（已连接与未连接卡片）"
-    },
-    {
-      "name": "query-en",
-      "title": "查询结果（英文）",
-      "theme": "light",
-      "width": 640,
-      "height": 1000,
-      "file": "query-en-light-640.png",
-      "state": "英文界面语言下的查询结果（含执行目标与只读结果徽标）"
-    },
-    {
       "name": "welcome",
       "title": "欢迎页与资源管理器",
       "theme": "dark",
@@ -1102,79 +983,349 @@
       "height": 1000,
       "file": "shortcuts-dark-640.png",
       "state": "全局、SQL 编辑器和表格快捷键"
-    },
-    {
-      "name": "compare",
-      "title": "对比库",
-      "theme": "dark",
-      "width": 640,
-      "height": 1000,
-      "file": "compare-dark-640.png",
-      "state": "仅一侧拥有的表、列差异与两侧脚本"
-    },
-    {
-      "name": "close-guard",
-      "title": "关闭守卫",
-      "theme": "dark",
-      "width": 640,
-      "height": 1000,
-      "file": "close-guard-dark-640.png",
-      "state": "未执行草稿的标签关闭确认"
-    },
-    {
-      "name": "title-theme",
-      "title": "标题栏主题菜单",
-      "theme": "dark",
-      "width": 640,
-      "height": 1000,
-      "file": "title-theme-dark-640.png",
-      "state": "标题栏外观菜单：浅色 / 深色 / 跟随系统"
-    },
-    {
-      "name": "history",
-      "title": "查询历史",
-      "theme": "dark",
-      "width": 640,
-      "height": 1000,
-      "file": "history-dark-640.png",
-      "state": "成功、失败，以及原连接已删除"
-    },
-    {
-      "name": "history-saved",
-      "title": "保存的查询",
-      "theme": "dark",
-      "width": 640,
-      "height": 1000,
-      "file": "history-saved-dark-640.png",
-      "state": "保存的名称与 SQL，旧连接需要重选执行目标"
-    },
-    {
-      "name": "settings",
-      "title": "设置",
-      "theme": "dark",
-      "width": 640,
-      "height": 1000,
-      "file": "settings-dark-640.png",
-      "state": "外观、数据读取、执行与复制、本机数据和关于"
-    },
-    {
-      "name": "connections-en",
-      "title": "连接管理（英文）",
-      "theme": "dark",
-      "width": 640,
-      "height": 1000,
-      "file": "connections-en-dark-640.png",
-      "state": "英文界面语言下的连接管理页（已连接与未连接卡片）"
-    },
-    {
-      "name": "query-en",
-      "title": "查询结果（英文）",
-      "theme": "dark",
-      "width": 640,
-      "height": 1000,
-      "file": "query-en-dark-640.png",
-      "state": "英文界面语言下的查询结果（含执行目标与只读结果徽标）"
     }
   ],
-  "failures": []
+  "failures": [
+    {
+      "type": "scenario",
+      "theme": "light",
+      "width": 1360,
+      "message": "locator.selectOption: Error: Element is not a <select> element\nCall log:\n\u001b[2m  - waiting for getByRole('dialog', { name: '对比库' }).locator('[data-side=\"baseline\"][data-field=\"connection\"]')\u001b[22m\n\u001b[2m    - locator resolved to <div class=\"listbox\" data-v-aece8d6b=\"\" data-v-6dfa3300=\"\" data-side=\"baseline\" data-field=\"connection\">…</div>\u001b[22m\n\u001b[2m  - attempting select option action\u001b[22m\n\u001b[2m    - waiting for element to be visible and enabled\u001b[22m\n",
+      "calls": [
+        "grid_page",
+        "catalog_sessions",
+        "ddl_describe",
+        "grid_describe",
+        "grid_page",
+        "catalog_sessions",
+        "catalog_sessions",
+        "catalog_sessions"
+      ]
+    },
+    {
+      "type": "scenario",
+      "theme": "dark",
+      "width": 1360,
+      "message": "locator.selectOption: Error: Element is not a <select> element\nCall log:\n\u001b[2m  - waiting for getByRole('dialog', { name: '对比库' }).locator('[data-side=\"baseline\"][data-field=\"connection\"]')\u001b[22m\n\u001b[2m    - locator resolved to <div class=\"listbox\" data-v-aece8d6b=\"\" data-v-6dfa3300=\"\" data-side=\"baseline\" data-field=\"connection\">…</div>\u001b[22m\n\u001b[2m  - attempting select option action\u001b[22m\n\u001b[2m    - waiting for element to be visible and enabled\u001b[22m\n",
+      "calls": [
+        "grid_page",
+        "catalog_sessions",
+        "ddl_describe",
+        "grid_describe",
+        "grid_page",
+        "catalog_sessions",
+        "catalog_sessions",
+        "catalog_sessions"
+      ]
+    },
+    {
+      "type": "scenario",
+      "theme": "light",
+      "width": 900,
+      "message": "locator.selectOption: Error: Element is not a <select> element\nCall log:\n\u001b[2m  - waiting for getByRole('dialog', { name: '对比库' }).locator('[data-side=\"baseline\"][data-field=\"connection\"]')\u001b[22m\n\u001b[2m    - locator resolved to <div class=\"listbox\" data-v-aece8d6b=\"\" data-v-6dfa3300=\"\" data-side=\"baseline\" data-field=\"connection\">…</div>\u001b[22m\n\u001b[2m  - attempting select option action\u001b[22m\n\u001b[2m    - waiting for element to be visible and enabled\u001b[22m\n",
+      "calls": [
+        "catalog_sessions",
+        "grid_describe",
+        "grid_page",
+        "redis_scan_keys",
+        "catalog_sessions",
+        "redis_scan_keys",
+        "catalog_sessions",
+        "redis_scan_keys"
+      ]
+    },
+    {
+      "type": "scenario",
+      "theme": "dark",
+      "width": 900,
+      "message": "locator.selectOption: Error: Element is not a <select> element\nCall log:\n\u001b[2m  - waiting for getByRole('dialog', { name: '对比库' }).locator('[data-side=\"baseline\"][data-field=\"connection\"]')\u001b[22m\n\u001b[2m    - locator resolved to <div class=\"listbox\" data-v-aece8d6b=\"\" data-v-6dfa3300=\"\" data-side=\"baseline\" data-field=\"connection\">…</div>\u001b[22m\n\u001b[2m  - attempting select option action\u001b[22m\n\u001b[2m    - waiting for element to be visible and enabled\u001b[22m\n",
+      "calls": [
+        "ddl_describe",
+        "grid_describe",
+        "grid_page",
+        "catalog_sessions",
+        "redis_scan_keys",
+        "redis_scan_keys",
+        "catalog_sessions",
+        "redis_scan_keys"
+      ]
+    },
+    {
+      "type": "scenario",
+      "theme": "light",
+      "width": 640,
+      "message": "locator.selectOption: Error: Element is not a <select> element\nCall log:\n\u001b[2m  - waiting for getByRole('dialog', { name: '对比库' }).locator('[data-side=\"baseline\"][data-field=\"connection\"]')\u001b[22m\n\u001b[2m    - locator resolved to <div class=\"listbox\" data-v-aece8d6b=\"\" data-v-6dfa3300=\"\" data-side=\"baseline\" data-field=\"connection\">…</div>\u001b[22m\n\u001b[2m  - attempting select option action\u001b[22m\n\u001b[2m    - waiting for element to be visible and enabled\u001b[22m\n",
+      "calls": [
+        "grid_describe",
+        "grid_page",
+        "catalog_sessions",
+        "redis_scan_keys",
+        "catalog_sessions",
+        "redis_scan_keys",
+        "catalog_sessions",
+        "redis_scan_keys"
+      ]
+    },
+    {
+      "type": "scenario",
+      "theme": "dark",
+      "width": 640,
+      "message": "locator.selectOption: Error: Element is not a <select> element\nCall log:\n\u001b[2m  - waiting for getByRole('dialog', { name: '对比库' }).locator('[data-side=\"baseline\"][data-field=\"connection\"]')\u001b[22m\n\u001b[2m    - locator resolved to <div class=\"listbox\" data-v-aece8d6b=\"\" data-v-6dfa3300=\"\" data-side=\"baseline\" data-field=\"connection\">…</div>\u001b[22m\n\u001b[2m  - attempting select option action\u001b[22m\n\u001b[2m    - waiting for element to be visible and enabled\u001b[22m\n",
+      "calls": [
+        "catalog_sessions",
+        "grid_describe",
+        "grid_page",
+        "catalog_sessions",
+        "redis_scan_keys",
+        "redis_scan_keys",
+        "catalog_sessions",
+        "redis_scan_keys"
+      ]
+    },
+    {
+      "type": "missing",
+      "missing": [
+        {
+          "name": "compare",
+          "theme": "light",
+          "width": 1360
+        },
+        {
+          "name": "close-guard",
+          "theme": "light",
+          "width": 1360
+        },
+        {
+          "name": "history",
+          "theme": "light",
+          "width": 1360
+        },
+        {
+          "name": "history-saved",
+          "theme": "light",
+          "width": 1360
+        },
+        {
+          "name": "settings",
+          "theme": "light",
+          "width": 1360
+        },
+        {
+          "name": "title-theme",
+          "theme": "light",
+          "width": 1360
+        },
+        {
+          "name": "connections-en",
+          "theme": "light",
+          "width": 1360
+        },
+        {
+          "name": "query-en",
+          "theme": "light",
+          "width": 1360
+        },
+        {
+          "name": "compare",
+          "theme": "dark",
+          "width": 1360
+        },
+        {
+          "name": "close-guard",
+          "theme": "dark",
+          "width": 1360
+        },
+        {
+          "name": "history",
+          "theme": "dark",
+          "width": 1360
+        },
+        {
+          "name": "history-saved",
+          "theme": "dark",
+          "width": 1360
+        },
+        {
+          "name": "settings",
+          "theme": "dark",
+          "width": 1360
+        },
+        {
+          "name": "title-theme",
+          "theme": "dark",
+          "width": 1360
+        },
+        {
+          "name": "connections-en",
+          "theme": "dark",
+          "width": 1360
+        },
+        {
+          "name": "query-en",
+          "theme": "dark",
+          "width": 1360
+        },
+        {
+          "name": "compare",
+          "theme": "light",
+          "width": 900
+        },
+        {
+          "name": "close-guard",
+          "theme": "light",
+          "width": 900
+        },
+        {
+          "name": "history",
+          "theme": "light",
+          "width": 900
+        },
+        {
+          "name": "history-saved",
+          "theme": "light",
+          "width": 900
+        },
+        {
+          "name": "settings",
+          "theme": "light",
+          "width": 900
+        },
+        {
+          "name": "title-theme",
+          "theme": "light",
+          "width": 900
+        },
+        {
+          "name": "connections-en",
+          "theme": "light",
+          "width": 900
+        },
+        {
+          "name": "query-en",
+          "theme": "light",
+          "width": 900
+        },
+        {
+          "name": "compare",
+          "theme": "dark",
+          "width": 900
+        },
+        {
+          "name": "close-guard",
+          "theme": "dark",
+          "width": 900
+        },
+        {
+          "name": "history",
+          "theme": "dark",
+          "width": 900
+        },
+        {
+          "name": "history-saved",
+          "theme": "dark",
+          "width": 900
+        },
+        {
+          "name": "settings",
+          "theme": "dark",
+          "width": 900
+        },
+        {
+          "name": "title-theme",
+          "theme": "dark",
+          "width": 900
+        },
+        {
+          "name": "connections-en",
+          "theme": "dark",
+          "width": 900
+        },
+        {
+          "name": "query-en",
+          "theme": "dark",
+          "width": 900
+        },
+        {
+          "name": "compare",
+          "theme": "light",
+          "width": 640
+        },
+        {
+          "name": "close-guard",
+          "theme": "light",
+          "width": 640
+        },
+        {
+          "name": "history",
+          "theme": "light",
+          "width": 640
+        },
+        {
+          "name": "history-saved",
+          "theme": "light",
+          "width": 640
+        },
+        {
+          "name": "settings",
+          "theme": "light",
+          "width": 640
+        },
+        {
+          "name": "title-theme",
+          "theme": "light",
+          "width": 640
+        },
+        {
+          "name": "connections-en",
+          "theme": "light",
+          "width": 640
+        },
+        {
+          "name": "query-en",
+          "theme": "light",
+          "width": 640
+        },
+        {
+          "name": "compare",
+          "theme": "dark",
+          "width": 640
+        },
+        {
+          "name": "close-guard",
+          "theme": "dark",
+          "width": 640
+        },
+        {
+          "name": "history",
+          "theme": "dark",
+          "width": 640
+        },
+        {
+          "name": "history-saved",
+          "theme": "dark",
+          "width": 640
+        },
+        {
+          "name": "settings",
+          "theme": "dark",
+          "width": 640
+        },
+        {
+          "name": "title-theme",
+          "theme": "dark",
+          "width": 640
+        },
+        {
+          "name": "connections-en",
+          "theme": "dark",
+          "width": 640
+        },
+        {
+          "name": "query-en",
+          "theme": "dark",
+          "width": 640
+        }
+      ]
+    }
+  ]
 }
