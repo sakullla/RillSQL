@@ -13,7 +13,7 @@ Run commands from the repository root:
 - `npm run build`: type-check and build the frontend.
 - `npm run tauri -- build`: build and bundle the desktop application.
 - `npm test`: run the frontend test suite once.
-- `cargo test --manifest-path src-tauri/Cargo.toml`: run Rust tests.
+- `cargo test --manifest-path src-tauri/Cargo.toml`: run Rust tests; run `npm run build` first because `tauri::generate_context!` embeds `dist/`.
 - `docker compose -f docker/compose.yaml up -d`: start local PostgreSQL, MySQL, and MariaDB fixtures.
 
 ## Coding Style & Naming Conventions
@@ -24,3 +24,25 @@ Frontend tests use Vitest, jsdom, and Vue Test Utils; name them `*.test.ts`. Rus
 
 ## Commit & Pull Request Guidelines
 Recent history commonly uses `feat:`, `fix:`, and `docs:` prefixes with short English or Chinese descriptions. Follow that pattern. PRs should describe the behavior change, link relevant issues, list validation performed, and include screenshots for visual changes. Identify whether evidence comes from synthetic browser fixtures or the native application.
+
+## CI
+`.github/workflows/ci.yml` runs on pull requests, pushes to `main`, and as part of a release: frontend checks, browser verification with synthetic IPC (screenshots are uploaded as the `ui-capture` artifact), and Rust tests plus Clippy on Windows, macOS, and Linux.
+
+## Release Process
+Versions follow SemVer. `.github/workflows/release.yml` runs when a `v*` tag is pushed: it runs CI, creates a draft release with notes generated from commit subjects, builds the Windows (NSIS), macOS ARM64 (DMG), and Linux (DEB, AppImage) installers, checks that each exists exactly once and is not empty, then publishes the draft. Installers are not signed.
+
+1. Create `release/vX.Y.Z` from an up-to-date `main`.
+2. Set the same version in all six places; `node .github/scripts/release.mjs check` fails on any mismatch:
+   - `package.json`
+   - `package-lock.json` (top-level `version` and `packages[""].version`)
+   - `src-tauri/Cargo.toml`
+   - `src-tauri/Cargo.lock` (the `rillsql` package)
+   - `src-tauri/tauri.conf.json`
+   - `PRODUCT_VERSION` in `src/shell/product.ts`
+3. Validate locally: `npm test`, `npm run build`, `node scripts/i18n-scan.mjs`, `node --test .github/scripts/release.test.mjs`. For UI changes, also start Vite and run `npm run verify:workbench` and `npm run capture:ui`.
+4. Commit as `chore: 发布 vX.Y.Z`, then create an annotated tag: `git tag -a vX.Y.Z -m "RillSQL vX.Y.Z"`. `release.mjs check vX.Y.Z` rejects a tag that does not match the version.
+5. Push the branch and the tag: `git push origin release/vX.Y.Z vX.Y.Z`.
+6. Follow the run with `gh run watch` and confirm the release at `gh release view vX.Y.Z`.
+7. After the release is published, fast-forward `main`: `git push origin release/vX.Y.Z:main`.
+
+If the run fails before publishing, fix the cause on the release branch, delete the tag locally and on the remote, and tag the new commit with the same version; the workflow resumes the existing draft. A published version is never reused: fix forward with a new version. A tag containing `-` (for example `v0.3.0-rc.1`) is published as a pre-release.
