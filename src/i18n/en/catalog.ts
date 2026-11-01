@@ -44,6 +44,7 @@ export const catalog = {
     staleStructure: "{name} is stale and its structure cannot be opened.",
     clipboardFailed: "Could not write to the clipboard",
     fkLine: "SQLite foreign keys: {state} (foreign_keys = {value})",
+    fkChip: "FK {value}",
     fkOn: "on",
     fkOff: "off",
     diagram: "Diagram",

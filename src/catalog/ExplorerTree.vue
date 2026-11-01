@@ -518,6 +518,13 @@ async function onCopy() {
   }
 }
 
+function fkLine(connection: CatalogConnection): string {
+  return t("catalog.tree.fkLine", {
+    state: connection.foreignKeys ? t("catalog.tree.fkOn") : t("catalog.tree.fkOff"),
+    value: connection.foreignKeys ? "ON" : "OFF",
+  });
+}
+
 function onWindowPointer(event: MouseEvent) {
   if (event.button === 2) return;
   const target = event.target;
@@ -634,6 +641,14 @@ onBeforeUnmount(() => {
           <span class="eng" :class="`eng-${connection.engine}`">{{ engineMeta(connection.engine).short }}</span>
           <span class="tr-name">{{ connection.name }}</span>
           <span v-if="connection.env !== 'none' && connection.envTone !== 'none'" class="env xs" :class="`env-${connection.envTone}`">{{ connection.envLabel }}</span>
+          <span
+            v-if="connection.foreignKeys !== null"
+            class="tree-chip"
+            :class="{ warn: connection.foreignKeys === false }"
+            :data-fk-chip="connection.foreignKeys ? 'on' : 'off'"
+            :title="fkLine(connection)"
+            :aria-label="fkLine(connection)"
+          >{{ t("catalog.tree.fkChip", { value: connection.foreignKeys ? "ON" : "OFF" }) }}</span>
           <span class="conn-acts">
             <button
               v-if="!isConnected(connection.status) && passwordFor !== connection.id"
@@ -679,36 +694,38 @@ onBeforeUnmount(() => {
           <!-- MongoDB（document 引擎）：库 → 集合（estimatedDocumentCount 计数），双击集合开文档标签；没有 SQL/结构/关系图入口（ADR-2/ADR-4）。 -->
           <MongoTreeCollections v-else-if="connection.engine === 'mongodb'" :connection="connection" @open-collection="(target, database, collection) => emit('open-docs', target, database, collection)" />
           <template v-else-if="!engineShape(connection.engine).databases">
-            <div v-if="connection.foreignKeys !== null" class="tree-note subtle" :style="depthStyle(1)" data-foreign-keys>
-              <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.info" /></svg>
-              <span>{{ t("catalog.tree.fkLine", { state: connection.foreignKeys ? t("catalog.tree.fkOn") : t("catalog.tree.fkOff"), value: connection.foreignKeys ? "ON" : "OFF" }) }}</span>
+            <div v-if="connection.foreignKeys === false" class="tree-note subtle one-line" :style="depthStyle(1)" data-foreign-keys-off>
+              <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.warn" /></svg>
+              <span>{{ fkLine(connection) }}</span>
             </div>
-            <template v-for="database in connection.databases" :key="database.name">
-              <button
-                class="tree-row"
-                type="button"
-                data-action="open-diagram"
-                data-level="diagram"
-                :data-connection="connection.id"
-                :data-database="database.name"
-                data-schema=""
-                :style="depthStyle(1)"
-                @click.stop="openDiagram(connection, database.name, '')"
-              >
-                <span class="tw"></span>
-                <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.diagram" /></svg>
-                <span class="tr-name">{{ t("catalog.tree.diagram") }}</span>
-              </button>
-              <SchemaBlock
-                v-for="schema in database.schemas"
-                :key="`${database.name}:${schema.name}`"
-                :connection="connection"
-                :database="database.name"
-                :schema="schema"
-                :depth="1"
-                :selected-key="selectedIn(connection.id, database.name, schema.name)"
-              />
-            </template>
+            <div class="tree-entries">
+              <template v-for="database in connection.databases" :key="database.name">
+                <button
+                  class="tree-row"
+                  type="button"
+                  data-action="open-diagram"
+                  data-level="diagram"
+                  :data-connection="connection.id"
+                  :data-database="database.name"
+                  data-schema=""
+                  :style="depthStyle(1)"
+                  @click.stop="openDiagram(connection, database.name, '')"
+                >
+                  <span class="tw"></span>
+                  <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.diagram" /></svg>
+                  <span class="tr-name">{{ t("catalog.tree.diagram") }}</span>
+                </button>
+                <SchemaBlock
+                  v-for="schema in database.schemas"
+                  :key="`${database.name}:${schema.name}`"
+                  :connection="connection"
+                  :database="database.name"
+                  :schema="schema"
+                  :depth="1"
+                  :selected-key="selectedIn(connection.id, database.name, schema.name)"
+                />
+              </template>
+            </div>
           </template>
           <template v-else>
             <template v-for="database in connection.databases" :key="database.name">

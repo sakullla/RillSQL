@@ -117,6 +117,24 @@ button.tree-row .tr-name { color: var(--text-2); }
 
 /* ---------- 树内说明条 ---------- */
 .tree .tree-note { border-radius: var(--r-sm); padding-left: calc(var(--sp-6) + var(--d, 0) * var(--sp-4)); }
+/* 连接行状态位：正常态不占树行，只在悬停/聚焦时给全文。 */
+.tree .tree-chip {
+  flex-shrink: 0;
+  margin-left: var(--sp-1);
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  color: var(--text-3);
+  font-size: var(--fs-xs);
+  line-height: 16px;
+  white-space: nowrap;
+}
+.tree .tree-chip.warn { border-color: var(--warn); color: var(--warn); }
+/* 单行提示：不折行，超长截断，全文走 title。 */
+/* 入口与对象分组同层：关系图是入口区首行，提示不进入该区。 */
+.tree .tree-entries { display: contents; }
+.tree .tree-note.one-line { flex-wrap: nowrap; }
+.tree .tree-note.one-line > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tree .tree-note.tree-empty { flex-wrap: wrap; align-items: center; }
 .tree .tree-note > div { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 0; }
 .tree .tree-note > .i { width: 14px; height: 14px; flex-shrink: 0; margin-top: 2px; }

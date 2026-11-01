@@ -44,6 +44,7 @@ export const catalog = {
     staleStructure: "{name} 已失效，不能打开结构。",
     clipboardFailed: "无法写入剪贴板",
     fkLine: "SQLite 的外键约束：{state}（foreign_keys = {value}）",
+    fkChip: "外键 {value}",
     fkOn: "已开启",
     fkOff: "已关闭",
     diagram: "关系图",
