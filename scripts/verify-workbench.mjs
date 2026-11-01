@@ -443,8 +443,10 @@ try {
   report.passed = true;
 } finally {
   report.errors = errors;
-  fs.mkdirSync("docs/verification", { recursive: true });
-  fs.writeFileSync("docs/verification/workbench-runtime.json", JSON.stringify(report, null, 2));
+  /* 验证产物不是交付物：写到未跟踪目录，避免每次运行的耗时指标污染候选。 */
+  const reportDir = process.env.RILLSQL_VERIFY_OUT_DIR ?? "docs/verification/run";
+  fs.mkdirSync(reportDir, { recursive: true });
+  fs.writeFileSync(`${reportDir}/workbench-runtime.json`, JSON.stringify(report, null, 2));
   await browser.close();
 }
 console.log(JSON.stringify(report, null, 2));

@@ -252,26 +252,34 @@ function place(sql: string) {
         <div class="compare-sides">
           <fieldset>
             <legend>{{ t("compare.dialog.baseline") }}</legend>
-            <label>{{ t('compare.dialog.connection') }}<Listbox :model-value="baselineId" :options="connectionOptions" :filterable="connectionOptions.length > 8" :disabled="!connectionOptions.length" :placeholder="t('compare.dialog.chooseConnection')" :aria-label="t('compare.dialog.connection')" data-side="baseline" data-field="connection" @update:model-value="baselineId = $event" /></label>
-            <label v-if="connection(baselineId)?.engine !== 'sqlite'">{{ t('compare.dialog.database') }}<Listbox :model-value="baselineDatabase" :options="databaseOptions(baselineId)" :filterable="databaseOptions(baselineId).length > 8" :disabled="!databaseOptions(baselineId).length" :placeholder="t('compare.dialog.chooseDatabase')" :aria-label="t('compare.dialog.database')" data-side="baseline" data-field="database" @update:model-value="baselineDatabase = $event" /></label>
-            <label v-if="connection(baselineId)?.engine === 'postgres'">schema
+            <div class="cmp-field"><span class="cmp-field-label">{{ t('compare.dialog.connection') }}</span>
+              <Listbox :model-value="baselineId" :options="connectionOptions" :filterable="connectionOptions.length > 8" :disabled="!connectionOptions.length" :placeholder="t('compare.dialog.chooseConnection')" :aria-label="t('compare.dialog.connection')" data-side="baseline" data-field="connection" @update:model-value="baselineId = $event" />
+            </div>
+            <div v-if="connection(baselineId)?.engine !== 'sqlite'" class="cmp-field"><span class="cmp-field-label">{{ t('compare.dialog.database') }}</span>
+              <Listbox :model-value="baselineDatabase" :options="databaseOptions(baselineId)" :filterable="databaseOptions(baselineId).length > 8" :disabled="!databaseOptions(baselineId).length" :placeholder="t('compare.dialog.chooseDatabase')" :aria-label="t('compare.dialog.database')" data-side="baseline" data-field="database" @update:model-value="baselineDatabase = $event" />
+            </div>
+            <div v-if="connection(baselineId)?.engine === 'postgres'" class="cmp-field"><span class="cmp-field-label">schema</span>
               <Listbox v-if="schemaEntry(baselineId, baselineDatabase) === 'choices'" :model-value="baselineSchema" :options="schemaOptions(baselineId, baselineDatabase)" :filterable="schemaOptions(baselineId, baselineDatabase).length > 8" :placeholder="t('compare.dialog.chooseSchema')" :aria-label="'schema'" data-side="baseline" data-field="schema" @update:model-value="baselineSchema = $event ?? ''" />
               <input v-else-if="schemaEntry(baselineId, baselineDatabase) === 'manual'" v-model="baselineSchema" type="text" data-side="baseline" data-field="schema" :placeholder="t('compare.dialog.schemaManualPlaceholder')" autocomplete="off" />
               <span v-else-if="schemaEntry(baselineId, baselineDatabase) === 'loading'" class="muted" data-side="baseline" data-field="schema" data-schema-state="loading">{{ t('compare.dialog.schemaLoading') }}</span>
               <Listbox v-else :model-value="baselineSchema" :options="schemaOptions(baselineId, baselineDatabase)" disabled :placeholder="t('compare.dialog.chooseSchema')" :aria-label="'schema'" data-side="baseline" data-field="schema" @update:model-value="baselineSchema = $event ?? ''" />
-            </label>
+            </div>
             <p v-if="schemaHint(baselineId, baselineDatabase)" class="muted" data-side="baseline" data-schema-hint>{{ schemaHint(baselineId, baselineDatabase) }}</p>
           </fieldset>
           <fieldset>
-            <legend>{{ t('compare.dialog.target') }}</legend>
-            <label>{{ t('compare.dialog.connection') }}<Listbox :model-value="targetId" :options="connectionOptions" :filterable="connectionOptions.length > 8" :disabled="!connectionOptions.length" :placeholder="t('compare.dialog.chooseConnection')" :aria-label="t('compare.dialog.connection')" data-side="target" data-field="connection" @update:model-value="targetId = $event" /></label>
-            <label v-if="connection(targetId)?.engine !== 'sqlite'">{{ t('compare.dialog.database') }}<Listbox :model-value="targetDatabase" :options="databaseOptions(targetId)" :filterable="databaseOptions(targetId).length > 8" :disabled="!databaseOptions(targetId).length" :placeholder="t('compare.dialog.chooseDatabase')" :aria-label="t('compare.dialog.database')" data-side="target" data-field="database" @update:model-value="targetDatabase = $event" /></label>
-            <label v-if="connection(targetId)?.engine === 'postgres'">schema
+            <legend>{{ t("compare.dialog.target") }}</legend>
+            <div class="cmp-field"><span class="cmp-field-label">{{ t('compare.dialog.connection') }}</span>
+              <Listbox :model-value="targetId" :options="connectionOptions" :filterable="connectionOptions.length > 8" :disabled="!connectionOptions.length" :placeholder="t('compare.dialog.chooseConnection')" :aria-label="t('compare.dialog.connection')" data-side="target" data-field="connection" @update:model-value="targetId = $event" />
+            </div>
+            <div v-if="connection(targetId)?.engine !== 'sqlite'" class="cmp-field"><span class="cmp-field-label">{{ t('compare.dialog.database') }}</span>
+              <Listbox :model-value="targetDatabase" :options="databaseOptions(targetId)" :filterable="databaseOptions(targetId).length > 8" :disabled="!databaseOptions(targetId).length" :placeholder="t('compare.dialog.chooseDatabase')" :aria-label="t('compare.dialog.database')" data-side="target" data-field="database" @update:model-value="targetDatabase = $event" />
+            </div>
+            <div v-if="connection(targetId)?.engine === 'postgres'" class="cmp-field"><span class="cmp-field-label">schema</span>
               <Listbox v-if="schemaEntry(targetId, targetDatabase) === 'choices'" :model-value="targetSchema" :options="schemaOptions(targetId, targetDatabase)" :filterable="schemaOptions(targetId, targetDatabase).length > 8" :placeholder="t('compare.dialog.chooseSchema')" :aria-label="'schema'" data-side="target" data-field="schema" @update:model-value="targetSchema = $event ?? ''" />
               <input v-else-if="schemaEntry(targetId, targetDatabase) === 'manual'" v-model="targetSchema" type="text" data-side="target" data-field="schema" :placeholder="t('compare.dialog.schemaManualPlaceholder')" autocomplete="off" />
               <span v-else-if="schemaEntry(targetId, targetDatabase) === 'loading'" class="muted" data-side="target" data-field="schema" data-schema-state="loading">{{ t('compare.dialog.schemaLoading') }}</span>
               <Listbox v-else :model-value="targetSchema" :options="schemaOptions(targetId, targetDatabase)" disabled :placeholder="t('compare.dialog.chooseSchema')" :aria-label="'schema'" data-side="target" data-field="schema" @update:model-value="targetSchema = $event ?? ''" />
-            </label>
+            </div>
             <p v-if="schemaHint(targetId, targetDatabase)" class="muted" data-side="target" data-schema-hint>{{ schemaHint(targetId, targetDatabase) }}</p>
           </fieldset>
         </div>
@@ -333,7 +341,7 @@ function place(sql: string) {
 .compare-sides { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-3); }
 .compare-sides fieldset { margin: 0; padding: var(--sp-3); border: 1px solid var(--stroke); border-radius: var(--r-md); background: var(--surface-panel); box-shadow: var(--shadow-sm); display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
 .compare-sides legend { padding: 0 var(--sp-1); font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.06em; color: var(--text-3); }
-.compare-sides label { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-sm); color: var(--text-2); }
+.compare-sides .cmp-field { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-sm); color: var(--text-2); }
 .compare-sides input, .compare-sides select { width: 100%; }
 .compare-sides .muted[data-schema-hint] { margin: 0; font-size: var(--fs-xs); line-height: var(--lh); }
 

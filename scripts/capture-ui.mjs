@@ -151,7 +151,7 @@ if (process.argv.includes("--list")) {
 }
 
 const root = fileURLToPath(new URL("../", import.meta.url)).replace(/\\/g, "/").replace(/\/$/, "");
-const out = process.env.RILLSQL_CAPTURE_OUT ?? `${root}/docs/verification/ui`;
+const out = process.env.RILLSQL_CAPTURE_OUT ?? `${root}/docs/verification/run/ui`;
 fs.mkdirSync(out, { recursive: true });
 const previewUrl = process.env.RILLSQL_PREVIEW_URL ?? "http://localhost:1420";
 let previewReady = false;
@@ -238,6 +238,22 @@ async function expandEditorAdvanced(page) {
 const importCsvDir = fs.mkdtempSync(`${os.tmpdir()}/rillsql-capture-`);
 const importCsvPath = `${importCsvDir}/orders-new.csv`;
 fs.writeFileSync(importCsvPath, "id,customer,status,total,note,created_at\n1004,陈溯,paid,88.00,,2026-10-20 10:00\n1005,许青,pending,12.50,加急,2026-10-21 18:30\n", "utf8");
+
+async function pickField(scope, selector, value) {
+  const control = scope.locator(selector);
+  const trigger = control.locator(".listbox-trigger");
+  const option = control.locator(`.listbox-option[data-value="${value}"]`);
+  /* 目录可能是异步到达的：弹层保持打开轮询选项，必要时重新打开。 */
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if ((await trigger.getAttribute("aria-expanded")) !== "true") await trigger.click({ force: true });
+    if (await option.count()) {
+      await option.click();
+      return;
+    }
+    await control.page().waitForTimeout(250);
+  }
+  throw new Error(`对比字段 ${selector} 没有选项 ${value}`);
+}
 
 const browser = await chromium.launch();
 try {
@@ -360,12 +376,12 @@ try {
         await comparePalette.getByRole("option", { name: /对比库/ }).click();
         const compareDialog = page.getByRole("dialog", { name: "对比库" });
         await compareDialog.waitFor();
-        await compareDialog.locator('[data-side="baseline"][data-field="connection"]').selectOption("pg-dev");
-        await compareDialog.locator('[data-side="baseline"][data-field="database"]').selectOption("bookstore");
-        await compareDialog.locator('[data-side="baseline"][data-field="schema"]').selectOption("public");
-        await compareDialog.locator('[data-side="target"][data-field="connection"]').selectOption("pg-dev");
-        await compareDialog.locator('[data-side="target"][data-field="database"]').selectOption("bookstore");
-        await compareDialog.locator('[data-side="target"][data-field="schema"]').selectOption("public");
+        await pickField(compareDialog, '[data-side="baseline"][data-field="connection"]', "pg-dev");
+        await pickField(compareDialog, '[data-side="baseline"][data-field="database"]', "bookstore");
+        await pickField(compareDialog, '[data-side="baseline"][data-field="schema"]', "public");
+        await pickField(compareDialog, '[data-side="target"][data-field="connection"]', "pg-dev");
+        await pickField(compareDialog, '[data-side="target"][data-field="database"]', "bookstore");
+        await pickField(compareDialog, '[data-side="target"][data-field="schema"]', "public");
         await compareDialog.getByRole("button", { name: "对比结构", exact: true }).click();
         await expect(compareDialog.locator("[data-compare-script]")).toHaveValue(/alter table/);
         await compareDialog.getByRole("button", { name: "对比数据", exact: true }).click();
@@ -460,7 +476,7 @@ function writeGallery() {
   if (missing.length) failures.push({ type: "missing", missing });
   const manifestName = "capture-ui-manifest.json";
   fs.writeFileSync(`${out}/index.html`, `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>澄库 · RillSQL UI 捕获</title><style>
-body{margin:0;background:#101114;color:#f5f2ec;font:15px system-ui}header{position:sticky;top:0;padding:20px 4vw;background:#191b20;z-index:2;border-bottom:1px solid #34363d}h1{font-size:24px;margin:0 0 8px}p{color:#b3afa6}.filters{display:flex;flex-wrap:wrap;gap:10px;align-items:end}label{display:grid;gap:5px;font-size:13px;color:#c9c6c0}select,input,button{font:inherit;padding:9px;border:1px solid #555;border-radius:8px;background:#25272d;color:#f5f2ec;max-width:100%;box-sizing:border-box}select{max-width:min(350px,80vw)}button{cursor:pointer}input{width:240px}.result{display:flex;gap:18px;flex-wrap:wrap;margin:12px 0 0}main{padding:24px 4vw;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));gap:24px}figure{margin:0;padding:12px;border:1px solid #34363d;border-radius:12px;min-width:0}img{width:100%;height:340px;object-fit:contain;background:#070709}figcaption{padding:12px 0 0;overflow-wrap:anywhere}a{color:#b8d2ff}small{display:block;color:#b3afa6;margin-top:5px}#empty{padding:24px 4vw}[hidden]{display:none!important}</style></head><body><header><h1>澄库 · RillSQL UI 捕获</h1><p>${failures.length ? "捕获有失败，请查看清单" : "捕获完成"} · ${captures.length} 张 · 合成 IPC 数据，仅用于界面检查。</p><form class="filters" id="filters"><label>场景<select id="scenario" aria-label="场景"><option value="">全部场景</option>${scenarioOptions}</select></label><label>主题<select id="theme" aria-label="主题"><option value="">全部主题</option><option value="light">浅色 light</option><option value="dark">深色 dark</option></select></label><label>宽度<select id="width" aria-label="宽度"><option value="">全部宽度</option>${widths.map((width) => `<option>${width}</option>`).join("")}</select></label><label>关键词<input id="query" type="search" placeholder="如 连接 / 表格 / 导出" aria-label="场景或关键词"></label><button type="reset">重置筛选</button></form><div class="result"><output id="count" aria-live="polite"></output><a href="${manifestName}">捕获清单</a></div></header><p id="empty" hidden>没有匹配的图片，请调整筛选或重置。</p><main>${cards}</main><script>
+body{margin:0;background:#101114;color:#f5f2ec;font:15px system-ui}header{position:sticky;top:0;padding:20px 4vw;background:#191b20;z-index:2;border-bottom:1px solid #34363d}h1{font-size:24px;margin:0 0 8px}p{color:#b3afa6}.filters{display:flex;flex-wrap:wrap;gap:10px;align-items:end}label{display:grid;gap:5px;font-size:13px;color:#c9c6c0}select,input,button{font:inherit;padding:9px;border:1px solid #555;border-radius:8px;background:#25272d;color:#f5f2ec;max-width:100%;box-sizing:border-box}select{max-width:min(350px,80vw)}button{cursor:pointer}input{width:240px}.result{display:flex;gap:18px;flex-wrap:wrap;margin:12px 0 0}main{padding:24px 4vw;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));gap:24px}figure{margin:0;padding:12px;border:1px solid #34363d;border-radius:12px;min-width:0}img{width:100%;height:340px;object-fit:contain;background:#070709}figcaption{padding:12px 0 0;overflow-wrap:anywhere}a{color:#b8d2ff}small{display:block;color:#b3afa6;margin-top:5px}#empty{padding:24px 4vw}[hidden]{display:none!important}</style></head><body><header><h1>澄库 · RillSQL UI 捕获</h1><p>${failures.length ? "捕获有失败，请查看清单" : "捕获完成"} · ${captures.length} 张 · 合成 IPC 数据，仅用于界面检查。</p><form class="filters" id="filters"><label>场景<select id="scenario" aria-label="场景"><option value="">全部场景</option>${scenarioOptions}</select></label><label>主题<select id="theme" aria-label="主题"><option value="">全部主题</option><option value="light">浅色 light</option><option value="dark">深色 dark</option></select></label><label>宽度<select id="width" aria-label="宽度"><option value="">全部宽度</option>${widths.map((width) => `<option>${width}</option>`).join("")}</select></label><label>关键词<input id="query" type="search" placeholder="如 连接 / 表格 / 导出" aria-label="场景或关键词"></label><button type="reset">重置筛选</button></form><div class="result"><output id="count" aria-live="polite"></output><a href="${manifestName}">捕获清单</a></div></header><p id="empty" hidden>没有匹配的图片，请调整筛选或重置。</p><main>${cards}</main>... [truncated]
 const ids=['scenario','theme','width','query'];const controls=ids.map(id=>document.getElementById(id));const cards=[...document.querySelectorAll('figure')];function filter(){let count=0;const query=controls[3].value.trim().toLowerCase();for(const card of cards){card.hidden=controls.slice(0,3).some((control,index)=>control.value&&card.dataset[ids[index]]!==control.value)||!card.dataset.keywords.includes(query);if(!card.hidden)count++;}document.getElementById('count').textContent='显示 '+count+' / '+cards.length+' 张';document.getElementById('empty').hidden=count!==0;}controls.forEach(control=>control.addEventListener('input',filter));document.getElementById('filters').addEventListener('submit',event=>event.preventDefault());document.getElementById('filters').addEventListener('reset',()=>setTimeout(filter,0));filter();
 </script></body></html>`);
   const rows = [...new Map(captures.map((item) => [item.name, label(item)]))].map(([name, title]) => {
