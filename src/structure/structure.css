@@ -177,7 +177,7 @@
 .struct-table td { border-bottom: 1px solid var(--line); padding: var(--sp-1) var(--sp-2); text-align: left; vertical-align: middle; }
 .struct-table th { color: var(--text-3); font-weight: 600; font-size: var(--fs-xs); }
 .struct-table input[type="text"],
-.struct-table select { width: 100%; min-width: 72px; }
+.struct-table .listbox { width: 100%; min-width: 72px; }
 .struct-table .cell-check { width: 44px; text-align: center; }
 .struct-table .cell-check input { width: 14px; height: 14px; }
 .cell-name { display: flex; align-items: center; gap: var(--sp-2); min-width: 160px; }
@@ -311,7 +311,7 @@
 }
 .struct-form > label { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-xs); font-weight: 500; color: var(--text-2); }
 .struct-form input[type="text"],
-.struct-form select { min-width: 140px; }
+.struct-form .listbox { min-width: 140px; }
 .struct-form .check { flex-direction: row; align-items: center; gap: var(--sp-1); color: var(--text-2); font-size: var(--fs-sm); min-height: var(--control-h); font-weight: 400; }
 .part-row { display: flex; gap: var(--sp-2); align-items: flex-end; }
 .part-row > label { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-xs); font-weight: 500; color: var(--text-2); }

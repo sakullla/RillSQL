@@ -4,16 +4,17 @@ import { tr as t } from "../i18n";
 import { catalogConnections } from "../catalog/store";
 import type { CatalogConnection } from "../catalog/types";
 import { engineMeta } from "../engines";
+import { Listbox, type ListboxOption } from "../ui";
 import { compareCancel, compareData, compareSchemas, compareStructure } from "./api";
 import type { ScriptTarget } from "./place";
 import type { CompareSide, DataReport, StructureReport } from "./types";
 
 const emit = defineEmits<{ close: []; place: [sql: string, target: ScriptTarget] }>();
 
-const baselineId = ref("");
-const targetId = ref("");
-const baselineDatabase = ref("");
-const targetDatabase = ref("");
+const baselineId = ref<string | null>(null);
+const targetId = ref<string | null>(null);
+const baselineDatabase = ref<string | null>(null);
+const targetDatabase = ref<string | null>(null);
 const baselineSchema = ref("");
 const targetSchema = ref("");
 const busy = ref(false);
@@ -30,52 +31,66 @@ const schemaNote = reactive<Record<string, string>>({});
 // 能力门控（ADR-2）：kv/document 引擎没有结构/数据对比，不出现在两侧连接里。
 const connections = computed(() => catalogConnections().filter((item) => item.status === "connected" && engineMeta(item.engine).relational));
 
-function connection(id: string): CatalogConnection | null {
+const connectionOptions = computed<ListboxOption[]>(() => connections.value.map((item) => ({ value: item.id, label: item.name, hint: item.engine })));
+
+function databaseOptions(id: string | null): ListboxOption[] {
+  return databasesOf(id).map((name) => ({ value: name, label: name }));
+}
+
+function schemaOptions(id: string | null, database: string | null): ListboxOption[] {
+  return schemaChoices(id, database).map((name) => ({ value: name, label: name }));
+}
+
+function keyOptions(table: { keys: { name: string; columns: string[] }[] }): ListboxOption[] {
+  return table.keys.map((key) => ({ value: key.name, label: `${key.name}（${key.columns.join(", ")}）` }));
+}
+
+function connection(id: string | null): CatalogConnection | null {
   return connections.value.find((item) => item.id === id) ?? null;
 }
 
-function databasesOf(id: string): string[] {
+function databasesOf(id: string | null): string[] {
   return connection(id)?.databases.map((item) => item.name) ?? [];
 }
 
-function schemasOf(id: string, database: string): string[] {
+function schemasOf(id: string | null, database: string | null): string[] {
   const node = connection(id)?.databases.find((item) => item.name === database);
   return node?.schemas.map((item) => item.name).filter((name) => name.trim()) ?? [];
 }
 
-function schemaKey(id: string, database: string): string {
-  return `${id}\u0000${database}`;
+function schemaKey(id: string | null, database: string | null): string {
+  return `${id ?? ""}\u0000${database ?? ""}`;
 }
 
-function schemaChoices(id: string, database: string): string[] {
+function schemaChoices(id: string | null, database: string | null): string[] {
   const catalogNames = schemasOf(id, database);
   if (catalogNames.length) return catalogNames;
   return loadedSchemas[schemaKey(id, database)] ?? [];
 }
 
-function schemaEntry(id: string, database: string): "choices" | "manual" | "loading" | "none" {
+function schemaEntry(id: string | null, database: string | null): "choices" | "manual" | "loading" | "none" {
   const known = connection(id);
-  if (!known || (known.engine !== "postgres" && known.engine !== "sqlserver") || !database.trim()) return "none";
+  if (!known || (known.engine !== "postgres" && known.engine !== "sqlserver") || !(database ?? "").trim()) return "none";
   if (schemaChoices(id, database).length) return "choices";
   if (schemaState[schemaKey(id, database)] === "manual") return "manual";
   return "loading";
 }
 
-function schemaHint(id: string, database: string): string {
+function schemaHint(id: string | null, database: string | null): string {
   if (schemaEntry(id, database) !== "manual") return "";
   const note = schemaNote[schemaKey(id, database)];
   if (note) return `${note}${t("compare.gates.schemaNoteSuffix")}`;
   return t("compare.gates.schemaNotInCatalog");
 }
 
-async function ensureSchemas(id: string, database: string, schema: Ref<string>) {
+async function ensureSchemas(id: string | null, database: string | null, schema: Ref<string>) {
   const known = connection(id);
   const key = schemaKey(id, database);
-  if (!known || (known.engine !== "postgres" && known.engine !== "sqlserver") || !database.trim() || schemasOf(id, database).length || schemaState[key]) return;
+  if (!id || !known || (known.engine !== "postgres" && known.engine !== "sqlserver") || !(database ?? "").trim() || schemasOf(id, database).length || schemaState[key]) return;
   schemaState[key] = "loading";
   const still = () => (schema === baselineSchema ? baselineId.value === id && baselineDatabase.value === database : targetId.value === id && targetDatabase.value === database);
   try {
-    const names = (await compareSchemas(id, database.trim())).map((name) => name.trim()).filter(Boolean);
+    const names = (await compareSchemas(id, (database ?? "").trim())).map((name) => name.trim()).filter(Boolean);
     if (schemaState[key] !== "loading") return;
     loadedSchemas[key] = names;
     schemaState[key] = names.length ? "ready" : "manual";
@@ -87,7 +102,7 @@ async function ensureSchemas(id: string, database: string, schema: Ref<string>) 
   }
 }
 
-function dropUnavailableSchema(id: string, database: string, schema: Ref<string>) {
+function dropUnavailableSchema(id: string | null, database: string | null, schema: Ref<string>) {
   const value = schema.value.trim();
   if (value && !schemaChoices(id, database).includes(value)) schema.value = "";
 }
@@ -104,10 +119,10 @@ watch([targetId, targetDatabase], () => {
   void ensureSchemas(targetId.value, targetDatabase.value, targetSchema);
 });
 
-function side(id: string, database: string, schema: string): CompareSide | null {
+function side(id: string | null, database: string | null, schema: string): CompareSide | null {
   const known = connection(id);
-  if (!known) return null;
-  const resolvedDatabase = known.engine === "sqlite" ? "main" : database.trim();
+  if (!id || !known) return null;
+  const resolvedDatabase = known.engine === "sqlite" ? "main" : (database ?? "").trim();
   const resolvedSchema = known.engine === "postgres" || known.engine === "sqlserver" ? schema.trim() : "";
   return { connectionId: id, database: resolvedDatabase, schema: resolvedSchema, engine: known.engine };
 }
@@ -123,9 +138,9 @@ function targetOf(): ScriptTarget {
   };
 }
 
-function schemaRejected(id: string, database: string, schema: string): string | null {
+function schemaRejected(id: string | null, database: string | null, schema: string): string | null {
   const known = connection(id);
-  if (!known || (known.engine !== "postgres" && known.engine !== "sqlserver") || !database.trim()) return null;
+  if (!known || (known.engine !== "postgres" && known.engine !== "sqlserver") || !(database ?? "").trim()) return null;
   if (schemaEntry(id, database) === "loading") return t("compare.gates.schemaStillLoading");
   const choices = schemaChoices(id, database);
   const value = schema.trim();
@@ -237,25 +252,25 @@ function place(sql: string) {
         <div class="compare-sides">
           <fieldset>
             <legend>{{ t("compare.dialog.baseline") }}</legend>
-            <label>{{ t("compare.dialog.connection") }}<select v-model="baselineId" data-side="baseline" data-field="connection"><option value="">{{ t("compare.dialog.chooseConnection") }}</option><option v-for="item in connections" :key="item.id" :value="item.id">{{ item.name }} · {{ item.engine }}</option></select></label>
-            <label v-if="connection(baselineId)?.engine !== 'sqlite'">{{ t("compare.dialog.database") }}<select v-model="baselineDatabase" data-side="baseline" data-field="database"><option value="">{{ t("compare.dialog.chooseDatabase") }}</option><option v-for="name in databasesOf(baselineId)" :key="name" :value="name">{{ name }}</option></select></label>
+            <label>{{ t('compare.dialog.connection') }}<Listbox :model-value="baselineId" :options="connectionOptions" filterable :placeholder="t('compare.dialog.chooseConnection')" :aria-label="t('compare.dialog.connection')" data-side="baseline" data-field="connection" @update:model-value="baselineId = $event" /></label>
+            <label v-if="connection(baselineId)?.engine !== 'sqlite'">{{ t('compare.dialog.database') }}<Listbox :model-value="baselineDatabase" :options="databaseOptions(baselineId)" filterable :disabled="!databaseOptions(baselineId).length" :placeholder="t('compare.dialog.chooseDatabase')" :aria-label="t('compare.dialog.database')" data-side="baseline" data-field="database" @update:model-value="baselineDatabase = $event" /></label>
             <label v-if="connection(baselineId)?.engine === 'postgres'">schema
-              <select v-if="schemaEntry(baselineId, baselineDatabase) === 'choices'" v-model="baselineSchema" data-side="baseline" data-field="schema"><option value="">{{ t("compare.dialog.chooseSchema") }}</option><option v-for="name in schemaChoices(baselineId, baselineDatabase)" :key="name" :value="name">{{ name }}</option></select>
+              <Listbox v-if="schemaEntry(baselineId, baselineDatabase) === 'choices'" :model-value="baselineSchema" :options="schemaOptions(baselineId, baselineDatabase)" filterable :placeholder="t('compare.dialog.chooseSchema')" :aria-label="'schema'" data-side="baseline" data-field="schema" @update:model-value="baselineSchema = $event ?? ''" />
               <input v-else-if="schemaEntry(baselineId, baselineDatabase) === 'manual'" v-model="baselineSchema" type="text" data-side="baseline" data-field="schema" :placeholder="t('compare.dialog.schemaManualPlaceholder')" autocomplete="off" />
-              <span v-else-if="schemaEntry(baselineId, baselineDatabase) === 'loading'" class="muted" data-side="baseline" data-field="schema" data-schema-state="loading">{{ t("compare.dialog.schemaLoading") }}</span>
-              <select v-else v-model="baselineSchema" data-side="baseline" data-field="schema"><option value="">{{ t("compare.dialog.chooseSchema") }}</option></select>
+              <span v-else-if="schemaEntry(baselineId, baselineDatabase) === 'loading'" class="muted" data-side="baseline" data-field="schema" data-schema-state="loading">{{ t('compare.dialog.schemaLoading') }}</span>
+              <Listbox v-else :model-value="baselineSchema" :options="schemaOptions(baselineId, baselineDatabase)" disabled :placeholder="t('compare.dialog.chooseSchema')" :aria-label="'schema'" data-side="baseline" data-field="schema" @update:model-value="baselineSchema = $event ?? ''" />
             </label>
             <p v-if="schemaHint(baselineId, baselineDatabase)" class="muted" data-side="baseline" data-schema-hint>{{ schemaHint(baselineId, baselineDatabase) }}</p>
           </fieldset>
           <fieldset>
-            <legend>{{ t("compare.dialog.target") }}</legend>
-            <label>{{ t("compare.dialog.connection") }}<select v-model="targetId" data-side="target" data-field="connection"><option value="">{{ t("compare.dialog.chooseConnection") }}</option><option v-for="item in connections" :key="item.id" :value="item.id">{{ item.name }} · {{ item.engine }}</option></select></label>
-            <label v-if="connection(targetId)?.engine !== 'sqlite'">{{ t("compare.dialog.database") }}<select v-model="targetDatabase" data-side="target" data-field="database"><option value="">{{ t("compare.dialog.chooseDatabase") }}</option><option v-for="name in databasesOf(targetId)" :key="name" :value="name">{{ name }}</option></select></label>
+            <legend>{{ t('compare.dialog.target') }}</legend>
+            <label>{{ t('compare.dialog.connection') }}<Listbox :model-value="targetId" :options="connectionOptions" filterable :placeholder="t('compare.dialog.chooseConnection')" :aria-label="t('compare.dialog.connection')" data-side="target" data-field="connection" @update:model-value="targetId = $event" /></label>
+            <label v-if="connection(targetId)?.engine !== 'sqlite'">{{ t('compare.dialog.database') }}<Listbox :model-value="targetDatabase" :options="databaseOptions(targetId)" filterable :disabled="!databaseOptions(targetId).length" :placeholder="t('compare.dialog.chooseDatabase')" :aria-label="t('compare.dialog.database')" data-side="target" data-field="database" @update:model-value="targetDatabase = $event" /></label>
             <label v-if="connection(targetId)?.engine === 'postgres'">schema
-              <select v-if="schemaEntry(targetId, targetDatabase) === 'choices'" v-model="targetSchema" data-side="target" data-field="schema"><option value="">{{ t("compare.dialog.chooseSchema") }}</option><option v-for="name in schemaChoices(targetId, targetDatabase)" :key="name" :value="name">{{ name }}</option></select>
+              <Listbox v-if="schemaEntry(targetId, targetDatabase) === 'choices'" :model-value="targetSchema" :options="schemaOptions(targetId, targetDatabase)" filterable :placeholder="t('compare.dialog.chooseSchema')" :aria-label="'schema'" data-side="target" data-field="schema" @update:model-value="targetSchema = $event ?? ''" />
               <input v-else-if="schemaEntry(targetId, targetDatabase) === 'manual'" v-model="targetSchema" type="text" data-side="target" data-field="schema" :placeholder="t('compare.dialog.schemaManualPlaceholder')" autocomplete="off" />
-              <span v-else-if="schemaEntry(targetId, targetDatabase) === 'loading'" class="muted" data-side="target" data-field="schema" data-schema-state="loading">{{ t("compare.dialog.schemaLoading") }}</span>
-              <select v-else v-model="targetSchema" data-side="target" data-field="schema"><option value="">{{ t("compare.dialog.chooseSchema") }}</option></select>
+              <span v-else-if="schemaEntry(targetId, targetDatabase) === 'loading'" class="muted" data-side="target" data-field="schema" data-schema-state="loading">{{ t('compare.dialog.schemaLoading') }}</span>
+              <Listbox v-else :model-value="targetSchema" :options="schemaOptions(targetId, targetDatabase)" disabled :placeholder="t('compare.dialog.chooseSchema')" :aria-label="'schema'" data-side="target" data-field="schema" @update:model-value="targetSchema = $event ?? ''" />
             </label>
             <p v-if="schemaHint(targetId, targetDatabase)" class="muted" data-side="target" data-schema-hint>{{ schemaHint(targetId, targetDatabase) }}</p>
           </fieldset>
@@ -284,10 +299,7 @@ function place(sql: string) {
             <input v-model="selected[table.name]" type="checkbox" :disabled="!table.onBoth" :data-table="table.name" />
             <span class="mono">{{ table.name }}</span>
             <span v-if="!table.onBoth" class="muted">{{ t("compare.dialog.oneSideOnly") }}</span>
-            <select v-if="table.needsKeyChoice" v-model="chosenKey[table.name]" :data-key="table.name">
-              <option value="">{{ t("compare.dialog.chooseKey") }}</option>
-              <option v-for="key in table.keys" :key="key.name" :value="key.name">{{ key.name }}（{{ key.columns.join(", ") }}）</option>
-            </select>
+            <Listbox v-if="table.needsKeyChoice" :model-value="chosenKey[table.name] ?? ''" :options="keyOptions(table)" :placeholder="t('compare.dialog.chooseKey')" :aria-label="t('compare.dialog.chooseKey')" :data-key="table.name" @update:model-value="chosenKey[table.name] = $event" />
           </label>
           <button class="btn" type="button" data-action="compare-data" :disabled="busy || schemaPending" @click="runData">{{ t("compare.dialog.compareData") }}</button>
           <p v-if="dataReport?.refused" class="cmp-alert" role="alert">{{ dataReport.refused }}</p>

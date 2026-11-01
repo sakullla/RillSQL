@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import Icon from "../shell/Icon.vue";
-import { ref } from "vue";
+import { computed, ref } from "vue";
+import Listbox from "../ui/Listbox.vue";
 import { tr as t } from "../i18n";
 import { fkActions, foreignKeyLabel } from "./logic";
 import type { StructureForeignKey, StructureIncoming } from "./types";
@@ -27,6 +28,7 @@ const refColumn = ref("");
 const onDelete = ref("NO ACTION");
 const onUpdate = ref("NO ACTION");
 const myisam = props.storage?.toLowerCase() === "myisam";
+const actionOptions = computed(() => fkActions(props.engine).map((action) => ({ value: action, label: action })));
 
 function splitColumns(value: string): string[] {
   return value.split(",").map((item) => item.trim()).filter(Boolean);
@@ -87,14 +89,10 @@ function previewCreate() {
       <label>{{ t("structure.foreign.refTableLabel") }}<input v-model="refTable" type="text" :aria-label="t('structure.foreign.refTableAria')" /></label>
       <label>{{ t("structure.foreign.refColumnLabel") }}<input v-model="refColumn" type="text" :aria-label="t('structure.foreign.refColumnAria')" :placeholder="t('structure.foreign.columnPlaceholder')" /></label>
       <label>{{ t("structure.foreign.onDelete") }}
-        <select v-model="onDelete" :aria-label="t('structure.foreign.onDelete')">
-          <option v-for="action in fkActions(engine)" :key="action">{{ action }}</option>
-        </select>
+        <Listbox :model-value="onDelete" :options="actionOptions" :aria-label="t('structure.foreign.onDelete')" @update:model-value="onDelete = $event" />
       </label>
       <label>{{ t("structure.foreign.onUpdate") }}
-        <select v-model="onUpdate" :aria-label="t('structure.foreign.onUpdate')">
-          <option v-for="action in fkActions(engine)" :key="action">{{ action }}</option>
-        </select>
+        <Listbox :model-value="onUpdate" :options="actionOptions" :aria-label="t('structure.foreign.onUpdate')" @update:model-value="onUpdate = $event" />
       </label>
       <button class="btn primary" type="submit">{{ t("structure.foreign.preview") }}</button>
     </form>

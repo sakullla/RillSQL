@@ -8,6 +8,7 @@ import { describeStructure, executeStructure, previewStructure, type StructureRe
 import ChangePreviewDialog from "./ChangePreviewDialog.vue";
 import ForeignKeyEditor from "./ForeignKeyEditor.vue";
 import IndexEditor from "./IndexEditor.vue";
+import Listbox from "../ui/Listbox.vue";
 import { draftsFromColumns } from "./logic";
 import StructureEditor from "./StructureEditor.vue";
 import "./structure.css";
@@ -41,6 +42,7 @@ const createSchema = ref("");
 const ddlCopyNote = ref("");
 
 const connections = computed(() => catalogConnections().filter((item) => item.status === "connected"));
+const connectionOptions = computed(() => connections.value.map((item) => ({ value: item.id, label: item.name })));
 
 const isView = computed(() => description.value?.kind === "view");
 const viewUnreadable = computed(() => {
@@ -361,9 +363,7 @@ function createForeignKey(foreignKey: StructureForeignKey) {
       <div v-else class="struct-body">
         <form v-if="purpose === 'create'" class="struct-form" @submit.prevent="previewColumns">
           <label>{{ t("structure.pane.fieldConnection") }}
-            <select v-model="createConnection" :aria-label="t('structure.pane.targetConnection')">
-              <option v-for="item in connections" :key="item.id" :value="item.id">{{ item.name }}</option>
-            </select>
+            <Listbox :model-value="createConnection" :options="connectionOptions" :aria-label="t('structure.pane.targetConnection')" @update:model-value="createConnection = $event" />
           </label>
           <label>{{ t("structure.pane.fieldDatabase") }}<input v-model="createDatabase" type="text" :aria-label="t('structure.pane.targetDatabase')" /></label>
           <label>{{ t("structure.pane.fieldSchema") }}<input v-model="createSchema" type="text" :aria-label="t('structure.pane.targetSchema')" /></label>

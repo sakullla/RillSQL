@@ -1,4 +1,4 @@
-import { flushPromises, mount } from "@vue/test-utils";
+import { flushPromises, mount, type DOMWrapper } from "@vue/test-utils";
 import { describe, expect, it, vi } from "vitest";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
 import type { CatalogConnection } from "../catalog/types";
@@ -8,6 +8,14 @@ import CompareDialog from "./CompareDialog.vue";
 import { placeCompareScript } from "./place";
 
 const invoke = vi.hoisted(() => vi.fn());
+
+async function pick(control: Omit<DOMWrapper<Element>, "exists">, value: string) {
+  await control.get(".listbox-trigger").trigger("click");
+  const option = control.findAll(".listbox-option").find((item) => item.attributes("data-value") === value);
+  if (!option) throw new Error(`missing option: ${value}`);
+  await option.trigger("click");
+  await flushPromises();
+}
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke,
@@ -60,10 +68,10 @@ describe("compare", () => {
   it("refuses a cross-engine compare and does not offer to run the script", async () => {
     replaceCatalog([connection("mysql", "my", "商店"), connection("mariadb", "maria", "商店旧库")]);
     const wrapper = mount(CompareDialog);
-    await wrapper.get("[data-side=baseline][data-field=connection]").setValue("my");
-    await wrapper.get("[data-side=target][data-field=connection]").setValue("maria");
-    await wrapper.get("[data-side=baseline][data-field=database]").setValue("app");
-    await wrapper.get("[data-side=target][data-field=database]").setValue("app");
+    await pick(wrapper.get("[data-side=baseline][data-field=connection]"), "my");
+    await pick(wrapper.get("[data-side=target][data-field=connection]"), "maria");
+    await pick(wrapper.get("[data-side=baseline][data-field=database]"), "app");
+    await pick(wrapper.get("[data-side=target][data-field=database]"), "app");
     await wrapper.get("[data-action=compare-structure]").trigger("click");
     expect(wrapper.get("[data-compare-refused]").text()).toContain("引擎不同");
     expect(wrapper.find("[data-action=place-structure]").exists()).toBe(false);
@@ -92,12 +100,12 @@ describe("compare", () => {
     });
     replaceCatalog([connection("postgres", "left", "基准"), connection("postgres", "right", "对照")]);
     const wrapper = mount(CompareDialog);
-    await wrapper.get("[data-side=baseline][data-field=connection]").setValue("left");
-    await wrapper.get("[data-side=target][data-field=connection]").setValue("right");
-    await wrapper.get("[data-side=baseline][data-field=database]").setValue("app");
-    await wrapper.get("[data-side=target][data-field=database]").setValue("app");
-    await wrapper.get("[data-side=baseline][data-field=schema]").setValue("public");
-    await wrapper.get("[data-side=target][data-field=schema]").setValue("public");
+    await pick(wrapper.get("[data-side=baseline][data-field=connection]"), "left");
+    await pick(wrapper.get("[data-side=target][data-field=connection]"), "right");
+    await pick(wrapper.get("[data-side=baseline][data-field=database]"), "app");
+    await pick(wrapper.get("[data-side=target][data-field=database]"), "app");
+    await pick(wrapper.get("[data-side=baseline][data-field=schema]"), "public");
+    await pick(wrapper.get("[data-side=target][data-field=schema]"), "public");
     await wrapper.get("[data-action=compare-structure]").trigger("click");
     await flushPromises();
     expect(wrapper.get("[data-compare-script]").element).toHaveProperty("readOnly", true);
@@ -130,16 +138,15 @@ describe("compare", () => {
       },
     ]);
     const wrapper = mount(CompareDialog);
-    await wrapper.get("[data-side=baseline][data-field=connection]").setValue("pg");
-    await wrapper.get("[data-side=target][data-field=connection]").setValue("pg");
-    await wrapper.get("[data-side=baseline][data-field=database]").setValue("app");
-    await wrapper.get("[data-side=target][data-field=database]").setValue("other");
+    await pick(wrapper.get("[data-side=baseline][data-field=connection]"), "pg");
+    await pick(wrapper.get("[data-side=target][data-field=connection]"), "pg");
+    await pick(wrapper.get("[data-side=baseline][data-field=database]"), "app");
+    await pick(wrapper.get("[data-side=target][data-field=database]"), "other");
     await flushPromises();
-    await wrapper.get("[data-side=baseline][data-field=schema]").setValue("public");
+    await pick(wrapper.get("[data-side=baseline][data-field=schema]"), "public");
     const targetSchema = wrapper.get("[data-side=target][data-field=schema]");
-    expect(targetSchema.element.tagName).toBe("SELECT");
-    expect(targetSchema.text()).toContain("sales");
-    await targetSchema.setValue("sales");
+    expect(targetSchema.find(".listbox-trigger").exists()).toBe(true);
+    await pick(targetSchema, "sales");
     await wrapper.get("[data-action=compare-structure]").trigger("click");
     await flushPromises();
     expect(wrapper.find("[data-compare-refused]").exists()).toBe(false);
@@ -177,12 +184,12 @@ describe("compare", () => {
       },
     ]);
     const wrapper = mount(CompareDialog);
-    await wrapper.get("[data-side=baseline][data-field=connection]").setValue("pg");
-    await wrapper.get("[data-side=target][data-field=connection]").setValue("pg");
-    await wrapper.get("[data-side=baseline][data-field=database]").setValue("app");
-    await wrapper.get("[data-side=target][data-field=database]").setValue("other");
+    await pick(wrapper.get("[data-side=baseline][data-field=connection]"), "pg");
+    await pick(wrapper.get("[data-side=target][data-field=connection]"), "pg");
+    await pick(wrapper.get("[data-side=baseline][data-field=database]"), "app");
+    await pick(wrapper.get("[data-side=target][data-field=database]"), "other");
     await flushPromises();
-    await wrapper.get("[data-side=baseline][data-field=schema]").setValue("public");
+    await pick(wrapper.get("[data-side=baseline][data-field=schema]"), "public");
     const targetSchema = wrapper.get("[data-side=target][data-field=schema]");
     expect(targetSchema.element.tagName).toBe("INPUT");
     expect(wrapper.get("[data-side=target][data-schema-hint]").text()).toContain("临时读取会话失败");
@@ -219,10 +226,10 @@ describe("compare", () => {
     });
     replaceCatalog([connection("mysql", "left", "基准"), connection("mysql", "right", "对照")]);
     const wrapper = mount(CompareDialog);
-    await wrapper.get("[data-side=baseline][data-field=connection]").setValue("left");
-    await wrapper.get("[data-side=target][data-field=connection]").setValue("right");
-    await wrapper.get("[data-side=baseline][data-field=database]").setValue("app");
-    await wrapper.get("[data-side=target][data-field=database]").setValue("app");
+    await pick(wrapper.get("[data-side=baseline][data-field=connection]"), "left");
+    await pick(wrapper.get("[data-side=target][data-field=connection]"), "right");
+    await pick(wrapper.get("[data-side=baseline][data-field=database]"), "app");
+    await pick(wrapper.get("[data-side=target][data-field=database]"), "app");
     await wrapper.get("[data-action=compare-structure]").trigger("click");
     await flushPromises();
     expect((wrapper.get("[data-table=orders]").element as HTMLInputElement).checked).toBe(true);
@@ -262,13 +269,13 @@ describe("compare", () => {
       },
     ]);
     const wrapper = mount(CompareDialog);
-    await wrapper.get("[data-side=baseline][data-field=connection]").setValue("pg");
-    await wrapper.get("[data-side=target][data-field=connection]").setValue("pg");
-    await wrapper.get("[data-side=baseline][data-field=database]").setValue("app");
-    await wrapper.get("[data-side=target][data-field=database]").setValue("app");
-    await wrapper.get("[data-side=baseline][data-field=schema]").setValue("public");
-    await wrapper.get("[data-side=target][data-field=schema]").setValue("public");
-    await wrapper.get("[data-side=target][data-field=database]").setValue("other");
+    await pick(wrapper.get("[data-side=baseline][data-field=connection]"), "pg");
+    await pick(wrapper.get("[data-side=target][data-field=connection]"), "pg");
+    await pick(wrapper.get("[data-side=baseline][data-field=database]"), "app");
+    await pick(wrapper.get("[data-side=target][data-field=database]"), "app");
+    await pick(wrapper.get("[data-side=baseline][data-field=schema]"), "public");
+    await pick(wrapper.get("[data-side=target][data-field=schema]"), "public");
+    await pick(wrapper.get("[data-side=target][data-field=database]"), "other");
     expect(wrapper.get("[data-side=target][data-field=schema]").attributes("data-schema-state")).toBe("loading");
     const compareStructure = wrapper.get("[data-action=compare-structure]");
     expect((compareStructure.element as HTMLButtonElement).disabled).toBe(true);
@@ -279,11 +286,10 @@ describe("compare", () => {
     release?.(["sales"]);
     await flushPromises();
     const targetSchema = wrapper.get("[data-side=target][data-field=schema]");
-    expect(targetSchema.element.tagName).toBe("SELECT");
-    expect((targetSchema.element as HTMLSelectElement).value).toBe("");
+    expect(targetSchema.find(".listbox-value.placeholder").exists()).toBe(true);
     await wrapper.get("[data-action=compare-structure]").trigger("click");
     expect(invoke.mock.calls.map((call) => call[0])).not.toContain("compare_structure");
-    await targetSchema.setValue("sales");
+    await pick(targetSchema, "sales");
     await wrapper.get("[data-action=compare-structure]").trigger("click");
     await flushPromises();
     const compared = invoke.mock.calls.find((call) => call[0] === "compare_structure");
@@ -311,20 +317,23 @@ describe("compare", () => {
       },
     ]);
     const wrapper = mount(CompareDialog);
-    await wrapper.get("[data-side=baseline][data-field=connection]").setValue("pg");
-    await wrapper.get("[data-side=target][data-field=connection]").setValue("pg");
-    await wrapper.get("[data-side=baseline][data-field=database]").setValue("app");
-    await wrapper.get("[data-side=target][data-field=database]").setValue("other");
+    await pick(wrapper.get("[data-side=baseline][data-field=connection]"), "pg");
+    await pick(wrapper.get("[data-side=target][data-field=connection]"), "pg");
+    await pick(wrapper.get("[data-side=baseline][data-field=database]"), "app");
+    await pick(wrapper.get("[data-side=target][data-field=database]"), "other");
     await flushPromises();
-    await wrapper.get("[data-side=baseline][data-field=schema]").setValue("public");
-    await wrapper.get("[data-side=target][data-field=database]").setValue("app");
-    await wrapper.get("[data-side=target][data-field=schema]").setValue("public");
-    await wrapper.get("[data-side=target][data-field=database]").setValue("other");
+    await pick(wrapper.get("[data-side=baseline][data-field=schema]"), "public");
+    await pick(wrapper.get("[data-side=target][data-field=database]"), "app");
+    await pick(wrapper.get("[data-side=target][data-field=schema]"), "public");
+    await pick(wrapper.get("[data-side=target][data-field=database]"), "other");
     await flushPromises();
     const targetSchema = wrapper.get("[data-side=target][data-field=schema]");
-    expect(targetSchema.text()).toContain("sales");
-    expect(targetSchema.text()).not.toContain("public");
-    expect((targetSchema.element as HTMLSelectElement).value).toBe("");
+    await targetSchema.get(".listbox-trigger").trigger("click");
+    const labels = targetSchema.findAll(".listbox-option").map((item) => item.text()).join(" ");
+    expect(labels).toContain("sales");
+    expect(labels).not.toContain("public");
+    await targetSchema.get(".listbox-trigger").trigger("click");
+    expect(targetSchema.find(".listbox-value.placeholder").exists()).toBe(true);
     await wrapper.get("[data-action=compare-structure]").trigger("click");
     expect(wrapper.get("[data-compare-refused]").text()).toContain("schema");
     expect(invoke.mock.calls.map((call) => call[0])).not.toContain("compare_structure");

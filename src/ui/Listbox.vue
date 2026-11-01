@@ -251,6 +251,7 @@ onBeforeUnmount(() => {
           v-for="(option, index) in visible"
           :key="option.value"
           :id="optionId(index)"
+          :data-value="option.value"
           class="listbox-option"
           :class="{ on: index === active, picked: option.value === modelValue, disabled: option.disabled }"
           role="option"

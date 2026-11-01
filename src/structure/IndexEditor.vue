@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import Icon from "../shell/Icon.vue";
-import { ref } from "vue";
+import { computed, ref } from "vue";
+import Listbox from "../ui/Listbox.vue";
 import { tr as t } from "../i18n";
 import { canDropIndex } from "./logic";
 import type { StructureIndex } from "./types";
@@ -14,6 +15,7 @@ const emit = defineEmits<{
 const name = ref("");
 const unique = ref(false);
 const parts = ref<{ name: string; descending: boolean }[]>([{ name: "", descending: false }]);
+const columnOptions = computed(() => props.columns.map((item) => ({ value: item, label: item })));
 
 function addPart() {
   parts.value.push({ name: "", descending: false });
@@ -47,9 +49,7 @@ function previewCreate(columns: string[]) {
       <label>{{ t("structure.index.nameLabel") }}<input v-model="name" type="text" :aria-label="t('structure.index.nameAria')" /></label>
       <div v-for="(part, index) in parts" :key="index" class="part-row">
         <label>{{ t("structure.index.partLabel", { n: index + 1 }) }}
-          <select v-model="part.name" :aria-label="t('structure.index.partAria', { n: index + 1 })">
-            <option v-for="item in columns" :key="item" :value="item">{{ item }}</option>
-          </select>
+          <Listbox :model-value="part.name" :options="columnOptions" :aria-label="t('structure.index.partAria', { n: index + 1 })" @update:model-value="part.name = $event" />
         </label>
         <label class="check"><input v-model="part.descending" type="checkbox" />{{ t("structure.index.descendingCheck") }}</label>
       </div>

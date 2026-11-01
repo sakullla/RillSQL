@@ -56,6 +56,10 @@ const pasteText = ref("");
 const pasteNote = ref("");
 const pasteFailed = ref(false);
 const draft = ref<ConnectionDraft>(blankDraft("postgres"));
+const caModeOptions = computed(() => [
+  { value: "system", label: t("connections.editor.tls.caSystem") },
+  { value: "file", label: t("connections.editor.tls.caFile") },
+]);
 const fieldErrors = ref<Record<string, string>>({});
 const report = ref<TestReport | null>(null);
 const knownHostKey = ref<string | null>(null);
@@ -790,7 +794,7 @@ watch(
                   </label>
                 </div>
                 <div v-if="draft.tlsMode !== 'off'" class="form-grid">
-                  <label class="field"><span>{{ t("connections.editor.tls.caLabel") }}</span><select v-model="draft.caMode"><option value="system">{{ t("connections.editor.tls.caSystem") }}</option><option value="file">{{ t("connections.editor.tls.caFile") }}</option></select></label>
+                  <label class="field"><span>{{ t("connections.editor.tls.caLabel") }}</span><Listbox :model-value="draft.caMode" :options="caModeOptions" :aria-label="t('connections.editor.tls.caLabel')" @update:model-value="draft.caMode = $event as 'system' | 'file'" /></label>
                   <label v-if="draft.caMode === 'file'" class="field"><span>{{ t("connections.editor.tls.caFileLabel") }}</span><input v-model="draft.caFile" class="mono" data-field="caFile" /><small v-if="fieldErrors.caFile" class="field-err">{{ fieldErrors.caFile }}</small></label>
                   <label class="field"><span>{{ t("connections.editor.tls.clientCert") }}</span><input v-model="draft.clientCert" class="mono" /></label>
                   <label class="field"><span>{{ t("connections.editor.tls.clientKey") }}</span><input v-model="draft.clientKey" class="mono" /></label>
