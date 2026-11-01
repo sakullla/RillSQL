@@ -38,6 +38,28 @@ function connection(engine: CatalogConnection["engine"], id: string, name: strin
 }
 
 describe("compare", () => {
+  it("disables connection controls when no relational connection is open", async () => {
+    replaceCatalog([]);
+    const wrapper = mount(CompareDialog);
+    const control = wrapper.get("[data-side=baseline][data-field=connection]");
+    const trigger = control.get(".listbox-trigger");
+    expect(trigger.attributes("disabled")).toBeDefined();
+    await trigger.trigger("click");
+    expect(control.find(".listbox-pop").exists()).toBe(false);
+    wrapper.unmount();
+    resetCatalog();
+  });
+
+  it("offers a filter only when the connection list is long", async () => {
+    replaceCatalog(Array.from({ length: 9 }, (_, index) => connection("mysql", `c${index}`, `库${index}`)));
+    const wrapper = mount(CompareDialog);
+    const control = wrapper.get("[data-side=baseline][data-field=connection]");
+    await control.get(".listbox-trigger").trigger("click");
+    expect(control.find(".listbox-filter").exists()).toBe(true);
+    wrapper.unmount();
+    resetCatalog();
+  });
+
   it("adds a command palette entry and places the script in a new query without executing it", () => {
     const commands = shellCommands({
       openQuery: () => undefined,

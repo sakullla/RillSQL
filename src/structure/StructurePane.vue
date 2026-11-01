@@ -363,7 +363,7 @@ function createForeignKey(foreignKey: StructureForeignKey) {
       <div v-else class="struct-body">
         <form v-if="purpose === 'create'" class="struct-form" @submit.prevent="previewColumns">
           <label>{{ t("structure.pane.fieldConnection") }}
-            <Listbox :model-value="createConnection" :options="connectionOptions" :aria-label="t('structure.pane.targetConnection')" @update:model-value="createConnection = $event" />
+            <Listbox :model-value="createConnection" :options="connectionOptions" :filterable="connectionOptions.length > 8" :disabled="!connectionOptions.length" :aria-label="t('structure.pane.targetConnection')" @update:model-value="createConnection = $event" />
           </label>
           <label>{{ t("structure.pane.fieldDatabase") }}<input v-model="createDatabase" type="text" :aria-label="t('structure.pane.targetDatabase')" /></label>
           <label>{{ t("structure.pane.fieldSchema") }}<input v-model="createSchema" type="text" :aria-label="t('structure.pane.targetSchema')" /></label>

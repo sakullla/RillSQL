@@ -49,7 +49,7 @@ function previewCreate(columns: string[]) {
       <label>{{ t("structure.index.nameLabel") }}<input v-model="name" type="text" :aria-label="t('structure.index.nameAria')" /></label>
       <div v-for="(part, index) in parts" :key="index" class="part-row">
         <label>{{ t("structure.index.partLabel", { n: index + 1 }) }}
-          <Listbox :model-value="part.name" :options="columnOptions" :aria-label="t('structure.index.partAria', { n: index + 1 })" @update:model-value="part.name = $event" />
+          <Listbox :model-value="part.name" :options="columnOptions" :filterable="columnOptions.length > 8" :aria-label="t('structure.index.partAria', { n: index + 1 })" @update:model-value="part.name = $event" />
         </label>
         <label class="check"><input v-model="part.descending" type="checkbox" />{{ t("structure.index.descendingCheck") }}</label>
       </div>
