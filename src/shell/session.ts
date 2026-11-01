@@ -4,7 +4,7 @@ import { parseHash, toHash } from "../router";
 import { tr } from "../i18n";
 import { isConnectionStatus, type ConnectionStatus } from "./status-text";
 
-export type TabKind = "query" | "table" | "structure" | "definition" | "diagram" | "keys" | "docs";
+export type TabKind = "query" | "table" | "structure" | "definition" | "diagram" | "keys" | "docs" | "database";
 
 /** 字典化标签标题：key + 参数。带 titleKey 的标签在语言切换后标题跟随重算（R6）。 */
 export interface TabTitleKey {
@@ -40,7 +40,7 @@ export const NEW_QUERY_DRAFT = "";
 
 export const SESSION_KEY = "rillsql.session";
 
-const TAB_KINDS: readonly TabKind[] = ["query", "table", "structure", "definition", "diagram", "keys", "docs"];
+const TAB_KINDS: readonly TabKind[] = ["query", "table", "structure", "definition", "diagram", "keys", "docs", "database"];
 
 export function isTabKind(value: unknown): value is TabKind {
   return typeof value === "string" && (TAB_KINDS as readonly string[]).includes(value);
@@ -73,6 +73,8 @@ export interface SessionSnapshotTab {
   definition?: { schema: string; name: string; kind: string; signature: string; relation: string } | null;
   /** 关系图标签的 schema。 */
   diagramSchema?: string | null;
+  /** 数据库级标签（R5）要读的 schema；空串表示这个引擎不需要 schema。 */
+  adminSchema?: string | null;
   /** keys 标签（Redis）恢复时选中的键名。 */
   redisKey?: string | null;
   /** docs 标签（MongoDB）恢复时指向的集合。 */
@@ -112,6 +114,18 @@ export interface RedisTarget {
   engine: string;
   status: ConnectionStatus;
   key?: string;
+  titleKey?: TabTitleKey | null;
+}
+
+/** 数据库级标签（R5）的目标：一条连接 + 一个库（+ PostgreSQL 的 schema）。 */
+export interface DatabaseTarget {
+  id: string;
+  connectionId: string;
+  connectionName: string;
+  database: string;
+  engine: string;
+  status: ConnectionStatus;
+  schema?: string;
   titleKey?: TabTitleKey | null;
 }
 
@@ -183,6 +197,8 @@ export interface ShellTab {
   diagram?: { schema: string } | null;
   redis?: { key: string } | null;
   doc?: { database: string; collection: string } | null;
+  /** 数据库级标签（R5）的 schema 选择。 */
+  admin?: { schema: string } | null;
   /** 恢复自快照的标签（R2）：只有这类标签按“连接已删”呈现空态。不持久化。 */
   restored?: boolean;
 }
@@ -206,6 +222,7 @@ export interface ShellSession {
   openDiagram: (target: DiagramTarget) => void;
   openKeys: (target: RedisTarget) => void;
   openDocs: (target: DocsTarget) => void;
+  openDatabase: (target: DatabaseTarget) => void;
   setTableView: (id: string, pane: "data" | "structure", section?: "columns" | "drop") => void;
   setDraft: (id: string, draft: string) => void;
   setExecuted: (id: string, sql: string) => void;
@@ -242,6 +259,7 @@ function blankTab(kind: TabKind, id: string, title: string, path: string | null,
     diagram: null,
     redis: null,
     doc: null,
+    admin: null,
   };
 }
 
@@ -293,6 +311,7 @@ export function snapshotSession(tabs: readonly ShellTab[], activeId: string | nu
       redisKey: tab.kind === "keys" ? tab.redis?.key ?? null : null,
       docDatabase: tab.kind === "docs" ? tab.doc?.database ?? null : null,
       docCollection: tab.kind === "docs" ? tab.doc?.collection ?? null : null,
+      adminSchema: tab.kind === "database" ? tab.admin?.schema ?? null : null,
       titleKey: tab.titleKey ? { key: tab.titleKey.key, params: tab.titleKey.params ? { ...tab.titleKey.params } : undefined } : null,
     })),
     activeId: tabs.some((tab) => tab.id === activeId) ? activeId : tabs[tabs.length - 1]?.id ?? null,
@@ -388,6 +407,8 @@ export function restoreSession(raw: string | null): SessionSnapshot | null {
     if (docDatabase === null && tab.docDatabase !== undefined && tab.docDatabase !== null) return null;
     const docCollection = textOrNull(tab.docCollection ?? null);
     if (docCollection === null && tab.docCollection !== undefined && tab.docCollection !== null) return null;
+    const adminSchema = textOrNull(tab.adminSchema ?? null);
+    if (adminSchema === null && tab.adminSchema !== undefined && tab.adminSchema !== null) return null;
     const titleKey = validTitleKey(tab.titleKey ?? null);
     tabs.push({
       id: tab.id,
@@ -411,6 +432,7 @@ export function restoreSession(raw: string | null): SessionSnapshot | null {
       redisKey,
       docDatabase,
       docCollection,
+      adminSchema,
     });
   }
   const resolved = tabs.some((tab) => tab.id === activeId) ? activeId : tabs[tabs.length - 1]?.id ?? null;
@@ -443,6 +465,9 @@ function fromSnapshot(item: SessionSnapshotTab): ShellTab {
   }
   if (kind === "docs") {
     tab.doc = { database: item.docDatabase ?? "", collection: item.docCollection ?? "" };
+  }
+  if (kind === "database") {
+    tab.admin = { schema: item.adminSchema ?? "" };
   }
   tab.lastExecutedSql = kind === "query" ? item.lastExecutedSql ?? null : null;
   return tab;
@@ -648,6 +673,34 @@ export function createSession(initialHash = "", restored: SessionSnapshot | null
     showPage("workspace");
   }
 
+  /** 数据库级标签（R5）：一个连接 + 一个库（+ PostgreSQL schema），按需读对象详情。 */
+  function openDatabase(target: DatabaseTarget) {
+    const schema = target.schema ?? "";
+    const id = `database:${target.connectionId}:${target.database}:${schema}`;
+    const existing = tabs.value.find((tab) => tab.id === id);
+    if (existing) {
+      activeId.value = existing.id;
+      showPage("workspace");
+      return;
+    }
+    const titleKey = target.titleKey ?? { key: "admin.tab.title" };
+    const tab = blankTab("database", id, tr(titleKey.key, titleKey.params), null, "", titleKey);
+    applyTarget(tab, {
+      connectionId: target.connectionId,
+      connectionName: target.connectionName,
+      database: target.database,
+      engine: target.engine,
+      status: target.status,
+    });
+    tab.targetText = schema
+      ? `${target.connectionName} / ${target.database} / ${schema}`
+      : `${target.connectionName} / ${target.database}`;
+    tab.admin = { schema };
+    tabs.value = [...tabs.value, tab];
+    activeId.value = tab.id;
+    showPage("workspace");
+  }
+
   function setDraft(id: string, draft: string) {
     const tab = tabs.value.find((item) => item.id === id);
     if (!tab || tab.draft === draft) return;
@@ -735,6 +788,7 @@ export function createSession(initialHash = "", restored: SessionSnapshot | null
     openDiagram,
     openKeys,
     openDocs,
+    openDatabase,
     setTableView,
     setDraft,
     setExecuted,

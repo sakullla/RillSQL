@@ -12,6 +12,7 @@ import { compare } from "./compare";
 import { diagram } from "./diagram";
 import { redis } from "./redis";
 import { mongo } from "./mongo";
+import { admin } from "./admin";
 
 /** zh-CN 字典（默认语言）：按域拆分文件，域内按界面分组嵌套。 */
 export const zhCN = {
@@ -29,4 +30,5 @@ export const zhCN = {
   diagram,
   redis,
   mongo,
+  admin,
 };

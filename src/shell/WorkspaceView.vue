@@ -4,6 +4,7 @@ import DefinitionView from "../catalog/DefinitionView.vue";
 import DiagramView from "../diagram/DiagramView.vue";
 import { catalogConnections, catalogLoaded } from "../catalog/store";
 import type { CatalogObjectRef } from "../catalog/object-ref";
+import type { Engine } from "../engines";
 import { resolveTableTarget, type TableTarget } from "../grid/target";
 import type { OpenPlan } from "../history/plan";
 import { tr as t } from "../i18n";
@@ -14,6 +15,7 @@ import { tabTitle, type QueryTarget, type ShellTab } from "./session";
 import { loadSettings } from "./settings";
 import WelcomeView from "./WelcomeView.vue";
 
+const DatabasePanel = defineAsyncComponent(() => import("../admin/DatabasePanel.vue"));
 const DataGrid = defineAsyncComponent(() => import("../grid/DataGrid.vue"));
 const MongoDocsTab = defineAsyncComponent(() => import("../mongo/MongoDocsTab.vue"));
 const QueryTab = defineAsyncComponent(() => import("../query/QueryTab.vue"));
@@ -84,10 +86,17 @@ function tableConnectionGone(tabId: string): boolean {
 function danglingTarget(tab: ShellTab): boolean {
   if (!catalogLoaded() || tab.restored !== true) return false;
   if (tab.kind === "table") return tableConnectionGone(tab.id);
-  if (tab.kind === "definition" || tab.kind === "diagram" || tab.kind === "keys" || tab.kind === "docs") {
+  if (tab.kind === "definition" || tab.kind === "diagram" || tab.kind === "keys" || tab.kind === "docs" || tab.kind === "database") {
     return tab.connectionId != null && !catalogConnections().some((item) => item.id === tab.connectionId);
   }
   return false;
+}
+
+/** 数据库级标签（R5）要的引擎：标签里存的是字符串，这里收窄成 Engine，未知回退 postgres（面板按引擎只渲染有内容的分节）。 */
+function adminEngine(tab: ShellTab): Engine {
+  const value = tab.engine ?? "";
+  if (value === "mysql" || value === "mariadb" || value === "sqlite" || value === "sqlserver" || value === "redis" || value === "mongodb") return value;
+  return "postgres";
 }
 
 function definitionObject(tab: ShellTab): Pick<CatalogObjectRef, "connectionId" | "database" | "schema" | "name" | "kind" | "signature" | "relation"> | null {
@@ -229,7 +238,7 @@ onBeforeUnmount(() => {
       @keydown.space.prevent="emit('activate', tab.id)"
       @keydown="onTabKey($event, tab.id)"
     >
-      <Icon :name="tab.kind === 'query' ? 'code' : tab.kind === 'diagram' ? 'link' : tab.kind === 'keys' ? 'key' : tab.kind === 'docs' ? 'columns' : 'table'" />
+      <Icon :name="tab.kind === 'query' ? 'code' : tab.kind === 'diagram' ? 'link' : tab.kind === 'keys' ? 'key' : tab.kind === 'docs' ? 'columns' : tab.kind === 'database' ? 'database' : 'table'" />
       <span v-if="tabEnvTone(tab)" class="tab-env" :class="`env-${tabEnvTone(tab)}`" aria-hidden="true"></span>
       <span class="tab-title">{{ tabTitle(tab) }}</span>
       <span
@@ -294,6 +303,17 @@ onBeforeUnmount(() => {
         :focus-section="active.structureSection"
       />
     </div>
+    <DatabasePanel
+      v-else-if="active && active.kind === 'database'"
+      :key="active.id"
+      :connection-id="active.connectionId ?? ''"
+      :connection-name="active.connectionName ?? ''"
+      :database="active.database ?? ''"
+      :engine="adminEngine(active)"
+      :schema="active.admin?.schema ?? ''"
+      :env-label="tabConnection(active)?.envLabel"
+      :env-tone="tabEnvTone(active)"
+    />
     <RedisTab
       v-else-if="active && active.kind === 'keys' && active.connectionId"
       :key="active.id"

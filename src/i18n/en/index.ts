@@ -13,6 +13,7 @@ import { compare } from "./compare";
 import { diagram } from "./diagram";
 import { redis } from "./redis";
 import { mongo } from "./mongo";
+import { admin } from "./admin";
 
 /** en 字典：结构与 zh-CN 逐 key 对齐（MessageSchema 约束，缺 key 编译报错）。 */
 export const en: MessageSchema = {
@@ -30,4 +31,5 @@ export const en: MessageSchema = {
   diagram,
   redis,
   mongo,
+  admin,
 };

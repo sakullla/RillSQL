@@ -58,7 +58,7 @@ describe("session persistence", () => {
     expect(revived.targetText).toBe("书店 / shop");
   });
 
-  it("snapshots all seven tab kinds including the mongo docs tab", () => {
+  it("snapshots all eight tab kinds including the mongo docs and database tabs", () => {
     const session = createSession();
     session.openQuery();
     session.openTable({ id: "shop:shop:public:customers", label: "customers", path: "书店 / shop / public", pane: "structure" });
@@ -111,11 +111,29 @@ describe("session persistence", () => {
       status: "connected",
       collection: "orders",
     });
+    session.openDatabase({
+      id: "shop:shop:public",
+      connectionId: "shop",
+      connectionName: "书店",
+      database: "shop",
+      engine: "postgres",
+      status: "connected",
+      schema: "public",
+    });
     const tableId = session.tabs.value.find((tab) => tab.kind === "table")!.id;
     session.activeId.value = tableId;
 
     const snapshot = snapshotSession(session.tabs.value, session.activeId.value);
-    expect(snapshot.tabs.map((tab) => tab.kind)).toEqual(["query", "table", "structure", "definition", "diagram", "keys", "docs"]);
+    expect(snapshot.tabs.map((tab) => tab.kind)).toEqual([
+      "query",
+      "table",
+      "structure",
+      "definition",
+      "diagram",
+      "keys",
+      "docs",
+      "database",
+    ]);
     expect(snapshot.activeId).toBe(tableId);
     // keys 标签的目标连接与选中键进快照（T3 快照已支持全 TabKind）。
     const keysTab = snapshot.tabs.find((tab) => tab.kind === "keys")!;
@@ -126,6 +144,66 @@ describe("session persistence", () => {
     expect(docsTab.connectionId).toBe("mongo");
     expect(docsTab.docDatabase).toBe("rillsql");
     expect(docsTab.docCollection).toBe("orders");
+    // 数据库标签的 schema 进快照（R5：数据库级标签随会话恢复）。
+    const databaseTab = snapshot.tabs.find((tab) => tab.kind === "database")!;
+    expect(databaseTab.database).toBe("shop");
+    expect(databaseTab.adminSchema).toBe("public");
+  });
+
+  it("round-trips a database tab with its schema and reuses it for the same target", () => {
+    const session = createSession();
+    session.openDatabase({
+      id: "shop:shop:public",
+      connectionId: "shop",
+      connectionName: "书店",
+      database: "shop",
+      engine: "postgres",
+      status: "connected",
+      schema: "public",
+    });
+    const tab = session.tabs.value[0]!;
+    expect(tab.kind).toBe("database");
+    expect(tab.id).toBe("database:shop:shop:public");
+    expect(tab.titleKey).toEqual({ key: "admin.tab.title" });
+    expect(tab.targetText).toBe("书店 / shop / public");
+    expect(tab.admin).toEqual({ schema: "public" });
+
+    const restored = restoreSession(JSON.stringify(snapshotSession(session.tabs.value, tab.id)));
+    expect(restored?.tabs).toHaveLength(1);
+    expect(restored!.tabs[0]!.kind).toBe("database");
+    expect(restored!.tabs[0]!.adminSchema).toBe("public");
+
+    const session2 = createSession("", restored);
+    const revived = session2.tabs.value[0]!;
+    expect(revived.kind).toBe("database");
+    expect(revived.admin).toEqual({ schema: "public" });
+    expect(revived.connectionId).toBe("shop");
+    expect(revived.database).toBe("shop");
+
+    // 同一目标复用现有标签，不同 schema 是新标签。
+    session2.openDatabase({
+      id: "shop:shop:public",
+      connectionId: "shop",
+      connectionName: "书店",
+      database: "shop",
+      engine: "postgres",
+      status: "connected",
+      schema: "public",
+    });
+    expect(session2.tabs.value).toHaveLength(1);
+    session2.openDatabase({
+      id: "shop:shop:audit",
+      connectionId: "shop",
+      connectionName: "书店",
+      database: "shop",
+      engine: "postgres",
+      status: "connected",
+      schema: "audit",
+    });
+    expect(session2.tabs.value.map((item) => item.id)).toEqual([
+      "database:shop:shop:public",
+      "database:shop:shop:audit",
+    ]);
   });
 
   it("round-trips a mongo docs tab with its database and collection", () => {

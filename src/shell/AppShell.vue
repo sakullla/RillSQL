@@ -267,6 +267,13 @@ const commands = computed<PaletteItem[]>(() => [
       executeRequest.value += 1;
     },
   }),
+  {
+    id: "database-tools",
+    group: "command" as const,
+    label: t("admin.command.open"),
+    icon: "database" as const,
+    run: onOpenDatabaseTools,
+  },
 ]);
 
 /** 已连接的关系库直接开查询；其余情况去连接页处理。 */
@@ -278,6 +285,34 @@ function onPaletteConnection(id: string) {
     return;
   }
   session.showPage("connections");
+}
+
+/**
+ * 数据库级标签（R5）：优先用当前标签的连接与库，否则取第一条已连接的关系库。
+ * schema 留空表示这个引擎不需要 schema（PostgreSQL 时读全部 schema 的序列）。
+ */
+function onOpenDatabaseTools() {
+  const tab = session.activeTab.value;
+  const tabConnection = tab?.connectionId ? catalogConnections().find((item) => item.id === tab.connectionId) ?? null : null;
+  const connected = catalogConnections().filter((item) => asStatus(item.status) === "connected" && engineMeta(item.engine).relational);
+  const known = tabConnection && engineMeta(tabConnection.engine).relational ? tabConnection : connected[0] ?? null;
+  if (!known) {
+    toast(t("admin.panel.needConnection"), "err");
+    return;
+  }
+  const sameTarget = tab !== null && tab.connectionId === known.id;
+  const database = (sameTarget ? tab.database : null) || known.defaultDatabase || known.databases[0]?.name || "";
+  const schema = sameTarget && tab.kind === "database" ? tab.admin?.schema ?? "" : "";
+  if (window.innerWidth <= 960) session.sidebarHidden.value = true;
+  session.openDatabase({
+    id: `${known.id}:${database}`,
+    connectionId: known.id,
+    connectionName: known.name,
+    database,
+    engine: known.engine,
+    status: "connected",
+    schema,
+  });
 }
 
 function applyTheme() {

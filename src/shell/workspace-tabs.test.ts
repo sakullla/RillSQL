@@ -393,4 +393,55 @@ describe("workspace tab identity", () => {
     expect(wrapper.text()).toContain("连接已删除");
     wrapper.unmount();
   });
+
+  it("opens the database tools tab from the command palette", async () => {
+    replaceCatalog([postgresCatalog()]);
+    const wrapper = mount(AppShell);
+    await flushPromises();
+    await openCommand(wrapper, "打开数据库工具");
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    expect(wrapper.get(".tab.active").attributes("data-tab-id")).toBe("database:pg:rillsql:");
+    expect(wrapper.get(".tab.active .tab-title").text()).toBe("数据库工具");
+    expect(wrapper.get(".tab.active .tab-target").text()).toBe("127.0.0.1 / rillsql");
+    expect(wrapper.find("[data-admin-panel]").exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("restores a database tab and shows its empty state when the connection is gone", async () => {
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        tabs: [
+          {
+            id: "database:gone:app:public",
+            kind: "database",
+            title: "数据库工具",
+            draft: "",
+            connectionId: "gone",
+            connectionName: "旧库",
+            database: "app",
+            engine: "postgres",
+            connectionStatus: "connected",
+            targetText: "旧库 / app / public",
+            targetNotice: null,
+            path: null,
+            adminSchema: "public",
+          },
+        ],
+        activeId: "database:gone:app:public",
+      }),
+    );
+    const wrapper = mount(AppShell);
+    await flushPromises();
+    replaceCatalog([postgresCatalog()]);
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    expect(wrapper.findAll(".tab")).toHaveLength(1);
+    expect(wrapper.get(".tab.active .tab-title").text()).toBe("数据库工具");
+    expect(wrapper.get("[data-dangling-target]").text()).toContain("连接已删除");
+    expect(wrapper.find("[data-admin-panel]").exists()).toBe(false);
+    wrapper.unmount();
+  });
 });
