@@ -182,4 +182,36 @@ describe("rule-based completion", () => {
     const scope = statementContext("WITH recent AS (SELECT 1) SELECT ", metadataNote(atlas, "atlas_dev").objects);
     expect(scope.clause).toBe("select");
   });
+
+  it("ranks SELECT before snippets and offers databases and schemas", () => {
+    const plan = completionPlan({ prefix: "SEL", connection: atlas, database: "atlas_dev", engine: "postgres" });
+    expect(plan.items[0]).toMatchObject({ kind: "keyword", label: "SELECT" });
+    const all = completionPlan({ prefix: "", connection: atlas, database: "atlas_dev", engine: "postgres" });
+    expect(all.items.some((item) => item.kind === "database")).toBe(true);
+    expect(all.items.some((item) => item.kind === "schema")).toBe(true);
+  });
+
+  it("offers only databases after USE", () => {
+    const plan = completionPlan({
+      prefix: "",
+      connection: atlas,
+      database: "atlas_dev",
+      engine: "postgres",
+      context: { clause: "use" },
+    });
+    expect(plan.items.length).toBeGreaterThan(0);
+    expect(plan.items.every((item) => item.kind === "database")).toBe(true);
+  });
+
+  it("gives no columns inside ON when the joined tables are unknown", () => {
+    const plan = completionPlan({
+      prefix: "",
+      connection: atlas,
+      database: "atlas_dev",
+      engine: "postgres",
+      columns: [{ label: "other_col", detail: "public.other" }],
+      context: { clause: "on" },
+    });
+    expect(plan.items.some((item) => item.kind === "column")).toBe(false);
+  });
 });

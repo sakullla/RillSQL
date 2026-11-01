@@ -221,6 +221,8 @@ export const query = {
     sourceNote: "Completion comes from the tables and views already read from {conn} / {db}. Loaded fields are listed; unloaded ones are unavailable.",
     keyword: "keyword",
     cte: "CTE",
+    database: "database",
+    schema: "schema",
     functionBuiltin: "built-in function",
     functionBuiltinSqlite: "SQLite built-in function",
     defaultSchema: "default",

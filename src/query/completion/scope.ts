@@ -1,4 +1,4 @@
-export type ScopeClause = "select" | "from" | "join" | "on" | "where" | "group" | "order" | "having" | "set" | "values";
+export type ScopeClause = "select" | "from" | "join" | "on" | "where" | "group" | "order" | "having" | "set" | "values" | "use";
 
 export interface ScopeTable {
   /** 语句里使用的名字：显式别名优先，否则是表名。 */
@@ -34,6 +34,7 @@ const CLAUSE_BY_WORD: Record<string, ScopeClause> = {
   HAVING: "having",
   SET: "set",
   VALUES: "values",
+  USE: "use",
 };
 
 /** 子句只认查询结构关键字；DELETE/INSERT 等由最近的关键字决定其后的列上下文。 */

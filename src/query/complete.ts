@@ -35,7 +35,7 @@ export interface MetadataNote {
 
 export interface CompletionItem {
   label: string;
-  kind: "keyword" | ObjectKind | "column" | "function" | "snippet" | "cte";
+  kind: "keyword" | ObjectKind | "column" | "function" | "snippet" | "cte" | "database" | "schema";
   detail: string;
 }
 
@@ -95,9 +95,9 @@ export function metadataNote(connection: CatalogConnection | null, database: str
   };
 }
 
-export type StatementClause = "select" | "from" | "join" | "on" | "where" | "group" | "order" | "having" | "set" | "values";
+export type StatementClause = "select" | "from" | "join" | "on" | "where" | "group" | "order" | "having" | "set" | "values" | "use";
 
-const FIELD_FIRST_CLAUSES = new Set<StatementClause | null>(["select", "where", "group", "order", "having"]);
+const FIELD_FIRST_CLAUSES = new Set<StatementClause>(["select", "where", "group", "order", "having"]);
 
 export interface StatementContext {
   clause: StatementClause | null;
@@ -177,46 +177,64 @@ export function completionPlan(input: {
       if (!inTarget) continue;
       for (const column of source.columns) columnItems.push({ label: column, kind: "column", detail: source.label });
     }
-    if (!sources.length) {
+    if (!sources.length && clause !== "on") {
       for (const column of input.columns ?? []) columnItems.push({ label: column.label, kind: "column", detail: column.detail });
     }
   }
 
-  const cteItems: CompletionItem[] = (input.context?.ctes ?? []).map((name) => ({ label: name, kind: "cte", detail: tr("query.complete.cte") }));
+  const databaseItems: CompletionItem[] = (input.connection?.databases ?? []).map((item) => ({ label: item.name, kind: "database" as const, detail: tr("query.complete.database") }));
+  const current = input.connection?.databases.find((item) => item.name === input.database);
+  const schemaItems: CompletionItem[] = (current?.schemas ?? [])
+    .map((item) => item.name)
+    .filter(Boolean)
+    .map((name) => ({ label: name, kind: "schema" as const, detail: tr("query.complete.schema") }));
+  const cteItems: CompletionItem[] = (input.context?.ctes ?? []).map((name) => ({ label: name, kind: "cte" as const, detail: tr("query.complete.cte") }));
   const functionItems: CompletionItem[] = functionCatalog()
     .filter((name) => matchKind(name, prefix) >= 0)
     .slice(0, 40)
-    .map((name) => ({ label: name, kind: "function", detail: functionDetail(engine, name) }));
+    .map((name) => ({ label: name, kind: "function" as const, detail: functionDetail(engine, name) }));
   const keywordItems: CompletionItem[] = assets.keywords
     .filter((keyword) => matchKind(keyword, prefix) >= 0 && keyword.toUpperCase() !== prefix.toUpperCase())
     .slice(0, 40)
-    .map((keyword) => ({ label: keyword.toUpperCase(), kind: "keyword", detail: tr("query.complete.keyword") }));
-  const snippetItems: CompletionItem[] = clause === "from" || clause === "join" ? [] : snippetCandidates(prefix).map((item) => ({ label: item.label, kind: "snippet", detail: item.detail }));
+    .map((keyword) => ({ label: keyword.toUpperCase(), kind: "keyword" as const, detail: tr("query.complete.keyword") }));
+  const snippetItems: CompletionItem[] = clause === "from" || clause === "join"
+    ? []
+    : snippetCandidates(prefix).map((item) => ({ label: item.label, kind: "snippet" as const, detail: item.detail }));
 
   let ordered: CompletionItem[];
-  if (clause === "on") {
-    ordered = rankItems(columnItems, prefix);
-  } else if (clause === "set" || clause === "values") {
+  if (clause === "use") {
+    ordered = rankItems(databaseItems, prefix);
+  } else if (clause === "on" || clause === "set" || clause === "values") {
     ordered = rankItems(columnItems, prefix);
   } else if (clause === "from" || clause === "join") {
-    ordered = [...rankItems(objectItems, prefix), ...rankItems(cteItems, prefix), ...rankItems(keywordItems, prefix)];
-  } else if (FIELD_FIRST_CLAUSES.has(clause)) {
+    ordered = [
+      ...rankItems(objectItems, prefix),
+      ...rankItems(databaseItems, prefix, 20),
+      ...rankItems(schemaItems, prefix, 20),
+      ...rankItems(cteItems, prefix, 20),
+      ...rankItems(keywordItems, prefix),
+    ];
+  } else if (clause !== null && FIELD_FIRST_CLAUSES.has(clause)) {
     ordered = [
       ...rankItems(columnItems, prefix),
       ...rankItems(objectItems, prefix),
-      ...rankItems(cteItems, prefix),
+      ...rankItems(databaseItems, prefix, 20),
+      ...rankItems(schemaItems, prefix, 20),
+      ...rankItems(cteItems, prefix, 20),
       ...rankItems(functionItems, prefix),
-      ...rankItems(snippetItems, prefix),
       ...rankItems(keywordItems, prefix),
+      ...rankItems(snippetItems, prefix, 6),
     ];
   } else {
     ordered = [
+      ...rankItems(databaseItems, prefix, 20),
+      ...rankItems(schemaItems, prefix, 20),
       ...rankItems(objectItems, prefix),
-      ...rankItems(cteItems, prefix),
+      ...rankItems(cteItems, prefix, 20),
       ...rankItems(columnItems, prefix),
       ...rankItems(functionItems, prefix),
-      ...rankItems(snippetItems, prefix),
       ...rankItems(keywordItems, prefix),
+      ...rankItems(snippetItems, prefix, 6),
     ];
   }
   const seen = new Set<string>();
