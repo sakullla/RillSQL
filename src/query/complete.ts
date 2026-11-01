@@ -237,10 +237,16 @@ export function completionPlan(input: {
       ...rankItems(snippetItems, prefix, 6),
     ];
   }
-  /* 跨组按匹配等级稳定排序：前缀命中优先于子序列命中，同等等级保持组内顺序。 */
+  /* 跨组排序：匹配等级优先；全大写前缀视为在写关键字（SQL 惯例），关键字组提前；其余保持组内顺序。 */
+  const keywordFirst = prefix.length > 0 && prefix === prefix.toUpperCase();
   ordered = ordered
-    .map((item, order) => ({ item, score: matchKind(item.label, prefix), order }))
-    .sort((a, b) => a.score - b.score || a.order - b.order)
+    .map((item, order) => ({
+      item,
+      score: matchKind(item.label, prefix),
+      keyword: keywordFirst && item.kind === "keyword" ? 0 : 1,
+      order,
+    }))
+    .sort((a, b) => a.score - b.score || a.keyword - b.keyword || a.order - b.order)
     .map((entry) => entry.item);
   const seen = new Set<string>();
   const unique = ordered.filter((item) => {
