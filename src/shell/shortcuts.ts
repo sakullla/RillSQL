@@ -17,6 +17,7 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
   { id: "new-query", group: "global", chord: "Mod+T", label: "shell.shortcuts.newQuery" },
   { id: "close-tab", group: "global", chord: "Mod+W", label: "shell.shortcuts.closeTab" },
   { id: "toggle-sidebar", group: "global", chord: "Mod+B", label: "shell.shortcuts.toggleSidebar" },
+  { id: "next-tab", group: "global", chord: "Ctrl+Tab", label: "shell.shortcuts.nextTab" },
   { id: "nth-tab", group: "global", chord: "Alt+1…9", label: "shell.shortcuts.nthTab" },
   { id: "open-settings", group: "global", chord: "Mod+,", label: "shell.shortcuts.openSettings" },
   { id: "shortcut-help", group: "global", chord: "?", label: "shell.shortcuts.shortcutHelp" },

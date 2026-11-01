@@ -105,6 +105,31 @@ function showGroups(): boolean {
   return !props.schema.error || props.schema.objects.length > 0;
 }
 
+const showEmpty = ref(false);
+
+function groupEmpty(kind: ObjectKind): boolean {
+  return !reportOf(kind)?.error && objectsOf(kind).length === 0 && groupTotal(kind, 0) === 0;
+}
+
+/** 空分类默认收进一行：大多数库只有表和视图，八个空分组只会把真正的对象挤出屏幕。 */
+function listedKinds(): ObjectKind[] {
+  const kinds = objectGroups(props.connection.engine);
+  return showEmpty.value ? kinds : kinds.filter((kind) => !groupEmpty(kind));
+}
+
+function hiddenEmptyCount(): number {
+  return objectGroups(props.connection.engine).filter(groupEmpty).length;
+}
+
+/** 首批对象还没到：只给一行加载提示，避免一闪而过的空分组。 */
+function firstLoad(): boolean {
+  return awaitingFirstPage() && props.schema.objects.length === 0;
+}
+
+function awaitingFirstPage(): boolean {
+  return props.schema.pending === true && !props.schema.kindReports;
+}
+
 function canExpand(object: CatalogObject): boolean {
   return object.kind === "table" || object.kind === "view";
 }
@@ -158,8 +183,11 @@ function showIndexes(object: CatalogObject): boolean {
       </span>
     </div>
   </div>
-  <template v-if="showGroups()">
-    <template v-for="kind in objectGroups(connection.engine)" :key="kind">
+  <div v-if="firstLoad()" class="tree-note" :style="depthStyle(depth)" data-kind-pending :data-schema="schema.name" :data-database="database">
+    <span>{{ t("catalog.schema.loading") }}</span>
+  </div>
+  <template v-else-if="showGroups()">
+    <template v-for="kind in listedKinds()" :key="kind">
       <div
         class="tree-row tr-group"
         role="treeitem"
@@ -187,17 +215,6 @@ function showIndexes(object: CatalogObject): boolean {
             <strong>{{ t("catalog.schema.kindFailed") }}</strong>
             <span class="reason">{{ reportOf(kind)?.error }}</span>
           </div>
-        </div>
-        <div
-          v-else-if="schema.pending && !schema.kindReports && objectsOf(kind).length === 0"
-          class="tree-note"
-          :style="depthStyle(depth + 1)"
-          data-kind-pending
-          :data-kind-group="kind"
-          :data-schema="schema.name"
-          :data-database="database"
-        >
-          <span>{{ t("catalog.schema.loading") }}</span>
         </div>
         <div
           v-else-if="objectsOf(kind).length === 0 && groupTotal(kind, 0) === 0"
@@ -322,6 +339,9 @@ function showIndexes(object: CatalogObject): boolean {
         </template>
       </template>
     </template>
+    <button v-if="hiddenEmptyCount()" class="tree-show-empty" type="button" data-action="tree-show-empty" :aria-expanded="showEmpty" :style="depthStyle(depth)" @click.stop="showEmpty = !showEmpty">
+      {{ showEmpty ? t("catalog.schema.hideEmpty") : t("catalog.schema.showEmpty", { n: hiddenEmptyCount() }) }}
+    </button>
     <div v-if="needsMore() && !schema.error" class="tree-note more" :style="depthStyle(depth)" data-more>
       <span>{{ shownLabel() }}</span>
       <button

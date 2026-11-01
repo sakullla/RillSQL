@@ -3,16 +3,22 @@
    R1 重做要点：行高消费密度令牌 --tree-h（compact 22px）；层级用缩进导线 + 分级字重/图标明度表达；
    计数与行数统一为胶囊徽标；搜索命中行带强调色左缘；选中行有左缘指示条；双主题全部走令牌。 */
 
-.tree-toolbar { display: flex; justify-content: flex-end; padding: 0 var(--sp-1) var(--sp-1); }
+/* 树头：连接数概览 + 树级操作，滚动时吸顶 */
+.tree-toolbar { position: sticky; top: 0; z-index: var(--z-sticky); display: flex; align-items: center; gap: 2px; height: 28px; margin-bottom: 2px; padding-left: var(--sp-2); background: var(--bg); }
+.tree-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-xs); font-weight: 600; color: var(--text-2); }
+.tree-toolbar .icon-btn { width: 24px; height: 24px; }
+.tree-toolbar .icon-btn .i { width: 14px; height: 14px; }
+.tree-toolbar .spin .i { animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 
 /* ---------- 树行 ---------- */
 .tree-row {
   position: relative;
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
+  gap: 6px;
   height: var(--tree-h);
-  padding: 0 var(--sp-2) 0 calc(var(--sp-1) + var(--d, 0) * var(--sp-4));
+  padding: 0 var(--sp-1) 0 calc(var(--sp-1) + var(--d, 0) * var(--sp-4));
   border-radius: var(--r-sm);
   cursor: pointer;
   font-size: var(--fs-sm);
@@ -26,24 +32,24 @@
   transition: background-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
 .tree-row:hover { background-color: var(--hover); }
-.tree-row.active { background-color: var(--sel-strong); }
+.tree-row.active { background-color: var(--sel-strong); background-image: none; }
 .tree-row.active::before {
   content: "";
   position: absolute;
   left: 0;
-  top: 3px;
-  bottom: 3px;
-  width: 3px;
+  top: 5px;
+  bottom: 5px;
+  width: 2px;
   border-radius: var(--r-full);
   background: var(--accent);
 }
-.tree-row.active .tr-name { color: var(--accent-text); font-weight: 600; }
+.tree-row.active .tr-name { color: var(--text); font-weight: 600; }
 .tree-row.active > .i { color: var(--accent-text); }
 .tree-row:focus-visible { outline-offset: -2px; }
 .tree .tw { width: 14px; display: grid; place-items: center; color: var(--text-3); flex-shrink: 0; transition: color var(--dur-fast) var(--ease); }
 .tree .tw .i { width: 12px; height: 12px; }
 .tree-row:hover .tw { color: var(--text-2); }
-.tree-row > .i { width: 15px; height: 15px; color: var(--text-3); flex-shrink: 0; }
+.tree-row > .i { width: 14px; height: 14px; color: var(--text-3); flex-shrink: 0; }
 /* 容器层级（库 / schema / 分组）的图标比叶子亮一档，读树时先看到骨架 */
 .tree [data-level="database"] > .i,
 .tree [data-level="schema"] > .i,
@@ -58,20 +64,28 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 18px;
+  min-width: 16px;
   height: 16px;
-  padding: 0 5px;
+  padding: 0 2px;
   border-radius: var(--r-sm);
-  background-color: color-mix(in srgb, var(--text-3) 10%, transparent);
   color: var(--text-3);
   font: 500 var(--fs-xs)/1 var(--mono);
   font-variant-numeric: tabular-nums;
   flex-shrink: 0;
   transition: background-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
-.tree-row:hover .tr-meta { background-color: color-mix(in srgb, var(--text-3) 16%, transparent); color: var(--text-2); }
-.tree-row.active .tr-meta { background-color: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent-text); }
+.tree-row:hover .tr-meta { color: var(--text-2); }
+.tree-row.active .tr-meta { color: var(--accent-text); }
+/* 行尾动作：悬停或键盘聚焦才出现，平时不和名字抢位置 */
+.tree-acts { margin-left: auto; display: none; align-items: center; gap: 2px; flex-shrink: 0; }
+.tree-row:hover .tree-acts, .tree-row:focus-within .tree-acts { display: inline-flex; }
+.tree-row:hover .tree-acts ~ .tr-meta, .tree-row:hover .tree-acts ~ .badge, .tree-row:focus-within .tree-acts ~ .tr-meta, .tree-row:focus-within .tree-acts ~ .badge { display: none; }
+.tree-act { width: 20px; height: 20px; display: grid; place-items: center; border-radius: var(--r-sm); color: var(--text-3); }
+.tree-act .i { width: 13px; height: 13px; }
+.tree-act:hover { background: var(--active); color: var(--text); }
 .tree-row > .badge { margin-left: auto; }
+/* 分组标题已说明类型：行尾不再重复，把宽度留给对象名；物化视图与触发器的说明仍有信息量 */
+.tree [data-level="object"]:not([data-kind="table"]):not([data-kind="trigger"]):not([data-materialized="true"]) .tr-meta { display: none; }
 button.tree-row { width: 100%; border: 0; background-color: transparent; color: inherit; font: inherit; text-align: left; }
 button.tree-row .tr-name { color: var(--text-2); }
 
@@ -81,16 +95,21 @@ button.tree-row .tr-name { color: var(--text-2); }
 .tree [data-level="member"] .tr-name { font-size: var(--fs-xs); }
 
 /* 连接行 */
-.tree .tr-conn { height: calc(var(--tree-h) + 2px); font-weight: 600; margin-top: var(--sp-2); }
-.tree section:first-of-type .tr-conn { margin-top: 0; }
+.tree .tr-conn { height: calc(var(--tree-h) + 4px); font-weight: 600; margin-top: 2px; padding-right: var(--sp-2); }
+.tree .tr-conn .tr-name { flex: 0 1 auto; }
+.tree .tr-conn .env { font-weight: 500; max-width: 64px; overflow: hidden; text-overflow: ellipsis; }
 .tree .conn-acts { margin-left: auto; display: inline-flex; align-items: center; gap: var(--sp-2); flex-shrink: 0; }
+/* 状态文字留给读屏与悬停提示，行内只留状态点；连接按钮悬停才出现 */
+.tree .conn-acts .conn-state > span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.tree .tr-conn .btn { display: none; height: 20px; padding: 0 6px; font-size: var(--fs-xs); }
+.tree .tr-conn:hover .btn, .tree .tr-conn:focus-within .btn, .tree .tr-conn .btn:disabled { display: inline-flex; }
+.tree .tr-conn.st-disconnected .tr-name { color: var(--text-2); font-weight: 500; }
+.tree .tr-conn.st-disconnected .eng { opacity: .72; }
 
-/* 当前会话数据库徽标走强调色 */
-.tree .current-db {
-  background: var(--accent-soft);
-  color: var(--accent-text);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
-}
+/* 当前会话数据库：小字 + 强调色，不占块面 */
+.tree .current-db { min-height: 16px; padding: 0 2px; background: transparent; color: var(--accent-text); box-shadow: none; font-weight: 500; }
+.tree-show-empty { display: flex; align-items: center; width: 100%; height: calc(var(--tree-h) - 4px); padding-left: calc(var(--sp-5) + 2px + var(--d, 0) * var(--sp-4)); border-radius: var(--r-sm); font-size: var(--fs-xs); color: var(--text-3); text-align: left; }
+.tree-show-empty:hover { background: var(--hover); color: var(--text-2); }
 
 /* 失效对象：删除线之外另有「已失效」文字徽标，颜色不作唯一信息来源 */
 .tree-row.dropped .tr-name { text-decoration: line-through; color: var(--text-3); }
@@ -130,27 +149,13 @@ button.tree-row .tr-name { color: var(--text-2); }
 .tree mark { background: var(--accent-soft); color: var(--accent-text); font-weight: 600; border-radius: var(--r-sm); padding: 0 2px; }
 
 /* ---------- 引擎缩写块 ---------- */
-.tree .eng {
-  --engc: var(--text-2);
-  display: inline-grid;
-  place-items: center;
-  width: 20px;
-  height: 20px;
-  border-radius: var(--r-sm);
-  font: 700 var(--fs-xs)/1 var(--font);
-  letter-spacing: -0.2px;
-  color: var(--engc);
-  background: color-mix(in srgb, var(--engc) 12%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--engc) 20%, transparent);
-  flex-shrink: 0;
-}
-.tree .eng-postgres { --engc: var(--eng-postgres); }
-.tree .eng-mysql { --engc: var(--eng-mysql); }
-.tree .eng-mariadb { --engc: var(--eng-mariadb); }
-.tree .eng-sqlite { --engc: var(--eng-sqlite); }
+.tree .eng { width: 20px; height: 20px; font-size: 10px; }
 
 /* ---------- 对象右键菜单（其余菜单样式来自 base.css 的 .menu） ---------- */
 .object-menu { min-width: 200px; }
 .object-menu .menu-sep { height: 1px; margin: var(--sp-1) var(--sp-2); background: var(--line); }
 .object-menu .menu-item .i { width: 14px; height: 14px; color: var(--text-3); flex-shrink: 0; }
 .object-menu .menu-item.danger .i { color: inherit; }
+
+/* Redis 键 / Mongo 集合：等宽名字收一号，和表名同重量 */
+.tree .tree-row .mono { font-size: var(--fs-xs); }

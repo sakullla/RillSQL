@@ -335,7 +335,9 @@ try {
         // 关系图：资源管理器每个 schema 下的“关系图”入口，卡片画布 + 外键连线清单。
         if (selectedScenarios.includes("diagram")) {
           await showOverlay(page, width);
-          await page.locator('[data-action="open-diagram"][data-schema="public"]').click();
+          // 关系图入口在 schema 行尾，悬停才显示。
+          await page.locator('[data-level="schema"][data-schema="public"]').first().hover();
+          await page.locator('[data-action="open-diagram"][data-schema="public"]').first().click();
           await expect(page.locator("[data-diagram] [data-table-name='orders']")).toBeVisible();
           await collapseOverlay(page, width);
           await captureImage(page, "diagram", theme, width, "基表卡片与外键连线，只读");

@@ -4,7 +4,7 @@
 
 /* ---------- 页面头 ---------- */
 .conn-page .ph-actions { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; }
-.conn-page .mini-search { display: inline-flex; align-items: center; gap: var(--sp-2); height: var(--control-h); padding: 0 var(--sp-3); border: 1px solid var(--stroke-strong); border-radius: var(--r); background: var(--surface-panel); box-shadow: inset 0 1px 1px color-mix(in srgb, var(--press) 35%, transparent); transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease); }
+.conn-page .mini-search { display: inline-flex; align-items: center; gap: var(--sp-2); height: var(--control-h); padding: 0 var(--sp-3); border: 1px solid var(--stroke-strong); border-radius: var(--r); background: var(--surface-panel); transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease); }
 .conn-page .mini-search:hover { border-color: var(--text-3); }
 .conn-page .mini-search:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px var(--ring); }
 .conn-page .mini-search input { border: 0; height: var(--control-h-sm); background: transparent; min-width: 180px; padding: 0; }
@@ -13,57 +13,47 @@
 .page-note { color: var(--warn); margin: 0 0 var(--sp-3); }
 
 /* Connection inventory: scan name, endpoint, transport and session on one row. */
-.connection-overview { display: flex; align-items: center; gap: var(--sp-6); padding: var(--sp-3) var(--sp-4); background: var(--surface-panel); border: 1px solid var(--stroke); border-radius: var(--r-lg); box-shadow: var(--shadow-sm); margin-bottom: var(--sp-4); font-size: var(--fs-sm); color: var(--text-2); }
-.connection-overview > span { display: inline-flex; align-items: center; gap: var(--sp-2); }
-.connection-overview b { color: var(--text); font: 600 var(--fs-lg) var(--mono); font-variant-numeric: tabular-nums; }
-.connection-overview .i { width: 14px; height: 14px; color: var(--text-3); }
-.online-total i { width: 7px; height: 7px; background: var(--ok); border-radius: var(--r-full); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent); }
-.connection-filters { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-2); margin-bottom: var(--sp-3); }
+.online-total { display: inline-flex; align-items: center; gap: var(--sp-2); color: var(--text-2); }
+.online-total i { width: 7px; height: 7px; background: var(--ok); border-radius: var(--r-full); }
+.connection-filters { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-2); margin-bottom: var(--sp-4); }
 .connection-filters .mini-search { flex: 1; max-width: 420px; }
 .connection-filters input { width: 100%; }
-/* 不用 overflow:hidden 裁圆角：卡片菜单向上弹出时会被裁掉，改由首尾子元素各自收角 */
-.conn-grid { display: flex; flex-direction: column; border: 1px solid var(--stroke); border-radius: var(--r-lg); background: var(--surface-panel); box-shadow: var(--shadow-sm); }
-.conn-grid > :first-child { border-radius: var(--r-lg) var(--r-lg) 0 0; }
-.conn-grid > :last-child { border-radius: 0 0 var(--r-lg) var(--r-lg); }
-.connection-columns, .conn-card { display: grid; grid-template-columns: minmax(200px, 1.3fr) minmax(140px, 1fr) minmax(170px, 1fr) minmax(190px, .9fr); gap: var(--sp-5); padding: var(--sp-3) var(--sp-4); align-items: center; }
-.connection-columns { padding-top: var(--sp-2); padding-bottom: var(--sp-2); font-size: var(--fs-xs); font-weight: 600; letter-spacing: .05em; color: var(--text-3); background: var(--panel-2); border-radius: var(--r-lg) var(--r-lg) 0 0; }
-.conn-card { position: relative; border-top: 1px solid var(--line); text-align: left; transition: background var(--dur-fast) var(--ease); }
-.conn-card:hover { background: var(--hover); }
-/* 会话状态左缘指示条：用状态令牌着色，双主题自动映射 */
-.conn-card.st-connecting { box-shadow: inset 2px 0 0 var(--info); }
-.conn-card.st-connected { box-shadow: inset 2px 0 0 var(--ok); }
-.conn-card.st-error { box-shadow: inset 2px 0 0 var(--err); }
-.conn-card.st-lost { box-shadow: inset 2px 0 0 var(--warn); }
+/* 连接卡片：一眼看清是哪个库、连到哪、安不安全 */
+.conn-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: var(--sp-3); }
+.connection-columns { display: none; }
+.conn-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-lg);
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-sm);
+  text-align: left;
+  transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
+}
+.conn-card:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line-2)); box-shadow: var(--shadow); }
 .conn-card header { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; }
 .cc-title { flex: 1; min-width: 0; }
 .cc-title h3 { margin: 0; font-size: var(--fs-md); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cc-title p { margin: 4px 0 0; font-size: var(--fs-xs); color: var(--text-3); display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; }
-.cc-endpoint { min-width: 0; }
-.cc-addr { margin: 0; font-size: var(--fs-sm); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cc-endpoint small, .cc-badges small { color: var(--text-3); font-size: var(--fs-xs); margin-top: var(--sp-1); }
-.cc-badges { display: flex; flex-wrap: wrap; gap: var(--sp-1); align-items: center; }
-.cc-badges small { width: 100%; }
+.cc-title p { margin: 3px 0 0; font-size: var(--fs-xs); color: var(--text-3); display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; }
+.cc-endpoint { min-width: 0; display: flex; align-items: baseline; gap: var(--sp-2); }
+.cc-addr { margin: 0; font-size: var(--fs-sm); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.cc-endpoint small, .cc-badges small { color: var(--text-3); font-size: var(--fs-xs); white-space: nowrap; }
+.cc-badges { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-2); align-items: center; min-height: 20px; }
 .cc-badges .badge .i { width: 12px; height: 12px; }
-.conn-card footer { display: flex; align-items: center; gap: var(--sp-2); }
+.conn-card footer { display: flex; align-items: center; gap: var(--sp-1); margin-top: auto; padding-top: var(--sp-2); border-top: 1px solid var(--line); }
 .connection-note { display: flex; gap: var(--sp-2); color: var(--text-3); font-size: var(--fs-xs); margin-top: var(--sp-4); line-height: var(--lh); }
 .connection-note .i { width: 14px; height: 14px; flex-shrink: 0; margin-top: 1px; }
 .conn-grid .empty { padding: var(--sp-8) var(--sp-5); }
 .conn-grid .empty > .i { width: 32px; height: 32px; color: var(--accent-text); margin-bottom: var(--sp-2); }
-@media (max-width: 1100px) {
-  .connection-columns { display: none; }
-  .conn-card { grid-template-columns: 1fr 1fr; gap: var(--sp-3) var(--sp-5); }
-  .conn-card:first-of-type { border-top: 0; }
-  .conn-card footer { justify-content: flex-end; }
-}
-@media (max-width: 720px) {
-  .connection-overview { gap: var(--sp-4); }
-  .connection-overview > span:last-child { display: none; }
-  .conn-card { gap: var(--sp-3); padding: var(--sp-3); }
-}
+.conn-grid > .empty { grid-column: 1 / -1; }
 
 /* 卡片上的操作菜单：overlay 表面浮层 */
 .modal-error { margin: 0 0 var(--sp-3); }
-.conn-menu { position: absolute; right: var(--sp-3); bottom: calc(var(--sp-8) + var(--sp-1)); z-index: var(--z-float); min-width: 190px; padding: var(--sp-1); border: 1px solid var(--stroke-strong); border-radius: var(--r-md); background: var(--surface-overlay); box-shadow: var(--shadow); display: flex; flex-direction: column; animation: pop-in var(--dur-fast) var(--ease-out); }
+.conn-menu { position: absolute; right: var(--sp-3); bottom: calc(var(--sp-7) + var(--sp-3)); z-index: var(--z-float); min-width: 190px; padding: var(--sp-1); border: 1px solid var(--stroke-strong); border-radius: var(--r-md); background: var(--surface-overlay); box-shadow: var(--shadow); display: flex; flex-direction: column; animation: pop-in var(--dur-fast) var(--ease-out); }
 .conn-menu button { text-align: left; height: var(--control-h-sm); padding: 0 var(--sp-2); border-radius: var(--r-sm); display: flex; gap: var(--sp-2); align-items: center; font-size: var(--fs-sm); color: var(--text-2); transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease); }
 .conn-menu button .i { width: 14px; height: 14px; color: var(--text-3); }
 .conn-menu button:hover { background: var(--active); color: var(--text); }
@@ -71,13 +61,6 @@
 .conn-menu button.danger, .conn-menu button.danger .i { color: var(--err); }
 .conn-menu button.danger:hover { background: var(--err-soft); }
 
-/* ---------- 引擎标记：--eng-* 令牌色软底 + 同色系内描边 ---------- */
-.eng { --engc: var(--text-2); display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: var(--r-sm); font: 700 var(--fs-xs)/1 var(--font); color: var(--engc); background: color-mix(in srgb, var(--engc) 12%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--engc) 20%, transparent); flex-shrink: 0; }
-.eng.lg { width: 34px; height: 34px; font-size: var(--fs-md); border-radius: var(--r-md); }
-.eng-postgres { --engc: var(--eng-postgres); }
-.eng-mysql { --engc: var(--eng-mysql); }
-.eng-mariadb { --engc: var(--eng-mariadb); }
-.eng-sqlite { --engc: var(--eng-sqlite); }
 
 /* ---------- 提示条 ---------- */
 .callout { display: flex; gap: var(--sp-2); align-items: flex-start; padding: var(--sp-2) var(--sp-3); border-radius: var(--r-md); font-size: var(--fs-sm); line-height: var(--lh); margin: 0 0 var(--sp-3); }

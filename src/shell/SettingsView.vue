@@ -80,6 +80,7 @@ function onLocale(value: string) {
         </div>
       </div>
       <nav class="settings-nav" :aria-label="t('shell.settings.navLabel')"><button class="btn sm" @click="scrollSection('appearance')">{{ t("shell.settings.navAppearance") }}</button><button class="btn sm" @click="scrollSection('reading')">{{ t("shell.settings.navReading") }}</button><button class="btn sm" @click="scrollSection('behavior')">{{ t("shell.settings.navBehavior") }}</button><button class="btn sm" @click="scrollSection('local')">{{ t("shell.settings.navLocal") }}</button></nav>
+      <div class="settings-body">
       <section id="appearance" class="set-sec">
         <h2><Icon name="sliders" />{{ t("shell.settings.navAppearance") }}</h2>
         <div class="set-row">
@@ -228,29 +229,38 @@ function onLocale(value: string) {
           </div>
         </div>
       </section>
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-/* 分组卡片化：平铺的设置行落进面板卡片，与连接页/工作台的表面层级（panel + line 描边 + sm 阴影）一致；
-   about 区自带卡片，不套第二层。 */
-section.set-sec:not(.about) {
-  padding: 0 var(--sp-5);
-  border: 1px solid var(--line);
-  border-radius: var(--r-lg);
-  background: var(--surface-panel);
-  box-shadow: var(--shadow-sm);
-}
+/* 左侧分区导航 + 右侧设置列：长页面不用来回滚 */
+.page-inner.narrow { display: grid; grid-template-columns: 160px minmax(0, 1fr); gap: 0 var(--sp-7); align-items: start; }
+.page-inner.narrow > .page-head { grid-column: 1 / -1; }
+.settings-nav { position: sticky; top: 0; display: flex; flex-direction: column; gap: 2px; margin: 0; }
+.settings-nav .btn { justify-content: flex-start; width: 100%; height: var(--control-h); background: transparent; border-color: transparent; box-shadow: none; color: var(--text-2); font-size: var(--fs-sm); }
+.settings-nav .btn:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.settings-body { min-width: 0; }
+section.set-sec { margin-bottom: var(--sp-6); }
+section.set-sec :deep(.set-text h4) { font-weight: 550; }
 section.set-sec > h2 {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
   margin: 0;
-  padding: var(--sp-3) 0 var(--sp-1);
+  padding: 0 0 var(--sp-2);
+  font-size: var(--fs-md);
+  color: var(--text);
+  border-bottom: 1px solid var(--line-2);
 }
 section.set-sec > h2 .i { width: 14px; height: 14px; flex-shrink: 0; }
 section.set-sec:not(.about) .set-row:last-child { border-bottom: 0; padding-bottom: var(--sp-3); }
+@media (max-width: 800px) {
+  .page-inner.narrow { display: block; }
+  .settings-nav { position: static; flex-direction: row; flex-wrap: wrap; margin-bottom: var(--sp-4); }
+  .settings-nav .btn { width: auto; }
+}
 @media (max-width: 720px) {
   section.set-sec:not(.about) .set-row { flex-wrap: wrap; align-items: flex-start; }
 }

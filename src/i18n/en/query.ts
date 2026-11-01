@@ -84,6 +84,10 @@ export const query = {
     unknown: "Unknown",
   },
   results: {
+    emptyReady: "Write some SQL and run it",
+    emptyReadyHint: "Results appear here. You can also press",
+    emptyNoTarget: "Pick a target first",
+    emptyNoTargetHint: "Use the target picker above, or start a query from a database in the tree.",
     area: "Execution results",
     heading: "Results",
     waiting: "Waiting to run",

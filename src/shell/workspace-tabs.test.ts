@@ -126,6 +126,18 @@ describe("workspace tab identity", () => {
     wrapper.unmount();
   });
 
+  it("marks production tabs with an always-visible stripe and a tab dot", async () => {
+    replaceCatalog([{ ...postgresCatalog(), env: "prod", envLabel: "生产", envTone: "prod" }]);
+    const session = createSession("", null);
+    const tabId = session.openQueryDraft({ sql: "", connectionId: "pg", connectionName: "127.0.0.1", database: "rillsql", engine: "postgres", status: "connected", needsTarget: false, notice: null });
+    localStorage.setItem(SESSION_KEY, JSON.stringify({ tabs: session.tabs.value, activeId: tabId }));
+    const wrapper = mount(AppShell);
+    await flushPromises();
+    expect(wrapper.find("[data-env-stripe]").exists()).toBe(true);
+    expect(wrapper.find(".tab .tab-env.env-prod").exists()).toBe(true);
+    wrapper.unmount();
+  });
+
   it("opens table and structure tabs from the command palette", async () => {
     const welcome = mount(AppShell);
     await openCommand(welcome, "新建表结构");

@@ -55,18 +55,41 @@ export function shellCommands(actions: ShellActions): PaletteItem[] {
   ];
 }
 
+/** 相关度：前缀 > 包含 > 子序列（odrs 能找到 orders）；0 表示不匹配。 */
+function matchScore(text: string, query: string): number {
+  const haystack = text.toLowerCase();
+  if (haystack.startsWith(query)) return 3;
+  if (haystack.includes(query)) return 2;
+  let at = 0;
+  for (const char of query) {
+    at = haystack.indexOf(char, at);
+    if (at < 0) return 0;
+    at += 1;
+  }
+  return 1;
+}
+
+function ranked(items: readonly PaletteItem[], query: string): PaletteItem[] {
+  const scored = items
+    .map((item) => ({ item, score: Math.max(matchScore(item.label, query), (item.path ?? "").toLowerCase().includes(query) ? 1 : 0) }))
+    .filter((entry) => entry.score > 0);
+  // 分组标题按相邻项渲染：只在组内排序，组序沿用输入顺序。
+  const groups = [...new Set(scored.map((entry) => entry.item.group))];
+  return groups.flatMap((group) => scored.filter((entry) => entry.item.group === group).sort((a, b) => b.score - a.score).map((entry) => entry.item));
+}
+
 export function filterPalette(items: readonly PaletteItem[], query: string, mode: "all" | "tables"): PaletteItem[] {
   const trimmed = query.trim().toLowerCase();
   if (mode === "tables") {
-    const q = trimmed;
-    return items.filter((item) => item.group === "table" && (!q || item.label.toLowerCase().includes(q)));
+    const tables = items.filter((item) => item.group === "table");
+    return trimmed ? ranked(tables, trimmed) : tables;
   }
   if (trimmed.startsWith(">")) {
     const q = trimmed.slice(1).trim();
-    return items.filter((item) => item.group === "command" && item.label.toLowerCase().includes(q));
+    const commands = items.filter((item) => item.group === "command");
+    return q ? ranked(commands, q) : commands;
   }
-  return items.filter((item) => {
-    if (!trimmed) return true;
-    return item.label.toLowerCase().includes(trimmed) || (item.path ?? "").toLowerCase().includes(trimmed);
-  });
+  // 空输入先给命令：库里表再多，常用动作也不会被挤到列表底部。
+  if (!trimmed) return [...items.filter((item) => item.group === "command"), ...items.filter((item) => item.group !== "command")];
+  return ranked(items, trimmed);
 }

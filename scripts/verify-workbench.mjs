@@ -102,7 +102,7 @@ try {
   await page.locator(".grid-scroll").evaluate(el => { el.scrollTop = el.scrollHeight; });
   await expect(page.locator('[data-row-id="1000"]')).toBeVisible();
   const measuredHeight = await page.locator('[data-row-id="1000"]').evaluate(el => el.getBoundingClientRect().height);
-  expect(measuredHeight).toBe(30); // ADR-6 密度三档：standard 行高 = compact 24 + 6px 步进
+  expect(measuredHeight).toBe(32); // 密度三档：standard 行高 = compact 28 + 4px 步进
   report.metrics.standardDataRowPx = measuredHeight;
   await page.getByRole("button", { name: "按 id 排序", exact: true }).click();
   expect(await page.evaluate(() => window.__uiCalls.filter(call => call.command === "grid_page").at(-1).args.request.limit)).toBe(500);
@@ -188,8 +188,6 @@ try {
   const mssqlSchema = mssqlTree.locator('[data-level="schema"][data-schema="dbo"]');
   await mssqlSchema.waitFor();
   await expand(mssqlSchema);
-  // 对象清单按页显示：先点「再显示」让表出现在树里。
-  await mssqlTree.locator('[data-action="tree-more"]').click();
   const mssqlOrders = mssqlTree.locator('[data-level="object"][data-object="orders"][data-kind="table"]');
   await mssqlOrders.waitFor();
   await mssqlOrders.dblclick();

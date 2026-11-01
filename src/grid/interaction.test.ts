@@ -449,7 +449,7 @@ describe("grid column width, clipboard and paging", () => {
     const wrapper = mount(DataGrid, { props: { tabId: "table:docs-export", draft: "", pageSize: 10, target } });
     await flushPromises();
     const dir = mkdtempSync(join(tmpdir(), "rillsql-grid-preview-"));
-    await wrapper.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
+    await wrapper.get("button[aria-label='导出']").trigger("click");
     await wrapper.get("input[aria-label='导出路径']").setValue(join(dir, "docs.csv"));
     await wrapper.findAll("button").filter((button) => button.text() === "导出").at(-1)!.trigger("click");
     const written = join(dir, "docs.csv");

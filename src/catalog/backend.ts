@@ -4,6 +4,10 @@ import type { EnvTag, SavedConnection } from "../connections/model";
 import type { CatalogObjectRef } from "./object-ref";
 import type { CatalogConnection, PageRequest, PageResult } from "./types";
 
+export function disconnectConnection(id: string): Promise<void> {
+  return tauriConnectionApi.disconnect(id);
+}
+
 export interface ObjectLimit {
   connectionId: string;
   database: string;

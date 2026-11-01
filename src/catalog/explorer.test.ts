@@ -88,7 +88,13 @@ describe("explorer tree", () => {
     expect(sqlite.find("[data-kind-group=function]").exists()).toBe(false);
     expect(sqlite.find("[data-kind-group=procedure]").exists()).toBe(false);
     expect(sqlite.find("[data-kind-group=view]").exists()).toBe(true);
+    // 空分类默认收进一行，展开后才列出
+    expect(sqlite.find("[data-kind-group=trigger]").exists()).toBe(false);
+    await sqlite.get("[data-action=tree-show-empty]").trigger("click");
     expect(sqlite.find("[data-kind-group=trigger]").exists()).toBe(true);
+    for (const toggle of wrapper.findAll("[data-action=tree-show-empty]")) {
+      if (toggle.attributes("aria-expanded") === "false") await toggle.trigger("click");
+    }
     expect(wrapper.get("[data-engine=mysql]").find("[data-kind-group=function]").exists()).toBe(true);
     expect(wrapper.get("[data-engine=mysql]").find("[data-kind-group=procedure]").exists()).toBe(true);
     expect(wrapper.get("[data-engine=postgres]").find("[data-kind-group=trigger]").exists()).toBe(true);
@@ -334,6 +340,28 @@ describe("explorer tree", () => {
     wrapper.unmount();
   });
 
+  it("highlights only the clicked table when two connections share a table name", async () => {
+    const shape = (id: string): CatalogConnection => ({
+      id,
+      name: id,
+      engine: "postgres",
+      env: "dev",
+      envLabel: "dev",
+      envTone: "dev",
+      status: "connected",
+      defaultDatabase: "app",
+      foreignKeys: null,
+      error: null,
+      databases: [{ name: "app", error: null, schemas: [{ name: "public", error: null, total: 1, objects: [{ name: "orders", kind: "table", estimatedRows: 1, stale: false }] }] }],
+    });
+    replaceCatalog([shape("first"), shape("second")]);
+    const wrapper = mount(ExplorerTree, { props: { filter: "" }, attachTo: document.body });
+    await wrapper.get("section[data-connection=first] [data-object=orders]").trigger("click");
+    expect(wrapper.get("section[data-connection=first] [data-object=orders]").attributes("data-selected")).toBe("true");
+    expect(wrapper.get("section[data-connection=second] [data-object=orders]").attributes("data-selected")).toBe("false");
+    wrapper.unmount();
+  });
+
   it("selects a routine without opening data or the structure editor", async () => {
     const [postgres] = catalogFixture();
     postgres.databases[0]?.schemas[0]?.objects.push(
@@ -346,6 +374,7 @@ describe("explorer tree", () => {
     const fn = wrapper.get("[data-object=add_customer]");
     expect(fn.text()).toContain("add_customer(integer)");
     expect(wrapper.get("[data-database=atlas_dev][data-schema=public][data-level=group][data-kind-group=function]").text()).toContain("函数");
+    for (const toggle of wrapper.findAll("[data-action=tree-show-empty]")) await toggle.trigger("click");
     const emptyViews = wrapper.findAll("[data-kind-empty][data-kind-group=view]");
     expect(emptyViews.length).toBeGreaterThan(0);
     expect(emptyViews.every((node) => node.text().includes("没有视图") && !node.text().includes("没读出来"))).toBe(true);
@@ -394,6 +423,7 @@ describe("explorer tree", () => {
     });
     const wrapper = mount(ExplorerTree, { props: { filter: "" }, attachTo: document.body });
 
+    for (const toggle of wrapper.findAll("[data-action=tree-show-empty]")) await toggle.trigger("click");
     const ledger = wrapper.get("[data-connection=ledger]");
     expect(wrapper.get("[data-engine=mysql]").find("[data-kind-group=sequence]").exists()).toBe(false);
     expect(wrapper.get("[data-engine=mysql]").find("[data-kind-group=enum]").exists()).toBe(false);

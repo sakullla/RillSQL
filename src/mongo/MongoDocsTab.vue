@@ -219,10 +219,12 @@ onMounted(loadPage);
           <tr v-for="doc in documents" :key="doc.idJson" :data-doc-id="doc.idJson">
             <td v-for="column in columns" :key="column" class="mono md-cell" :data-cell="column" :title="cellText(doc.json, column)">{{ cellText(doc.json, column) }}</td>
             <td class="md-ops">
+              <span class="md-ops-row">
               <button class="btn xs" type="button" data-action="mongo-view" @click="openView(doc)">{{ t("mongo.tab.view") }}</button>
               <button class="btn xs" type="button" data-action="mongo-copy" @click="copyJson(doc)">{{ t("common.copy") }}</button>
               <button class="btn xs" type="button" data-action="mongo-edit" @click="openEdit(doc)">{{ t("mongo.tab.edit") }}</button>
               <button class="btn xs danger" type="button" data-action="mongo-delete" @click="askDelete(doc)">{{ t("common.remove") }}</button>
+              </span>
             </td>
           </tr>
         </tbody>
@@ -270,31 +272,42 @@ onMounted(loadPage);
 </template>
 
 <style scoped>
-.mongo-tab { display: grid; grid-template-columns: 1fr minmax(280px, 34%); grid-template-rows: auto 1fr; gap: var(--sp-2); height: 100%; min-height: 0; padding: var(--sp-2); }
-.md-head { grid-column: 1 / -1; display: grid; gap: var(--sp-1); }
-.md-head h3 { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
-.md-filter { display: flex; gap: var(--sp-1); }
+.mongo-tab { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); height: 100%; min-height: 0; }
+/* 文档查看器打开时才分栏，平时表格占满 */
+.mongo-tab:has(.md-view) { grid-template-columns: minmax(0, 1fr) minmax(300px, 34%); }
+.md-head { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-1) var(--sp-2); min-height: var(--toolbar-h); padding: var(--sp-1) var(--sp-2); border-bottom: 1px solid var(--line); }
+.md-head > p { flex-basis: 100%; }
+.md-head h3 { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.md-filter { display: flex; flex: 1 1 280px; gap: var(--sp-1); }
 .md-filter input { flex: 1; min-width: 0; }
 .md-bar { display: flex; align-items: center; gap: var(--sp-1); }
-.md-count { font-size: 12px; color: var(--text-3); }
-.md-error { color: var(--danger, #c0392b); font-size: 12px; margin: 0; }
+.md-bar .grow { display: none; }
+.md-count { font-size: var(--fs-xs); color: var(--text-3); margin: 0 var(--sp-2); white-space: nowrap; }
+.md-error { color: var(--err); font-size: 12px; margin: 0; }
 .md-note { font-size: 12px; margin: 0; }
-.md-note.ok { color: var(--ok, #2e7d32); }
-.md-note.err { color: var(--danger, #c0392b); }
-.md-grid-wrap { min-height: 0; overflow: auto; border: 1px solid var(--line); border-radius: var(--r-md, 8px); }
-.md-grid { border-collapse: collapse; width: 100%; font-size: 12px; }
-.md-grid th { text-align: left; font-size: 11px; color: var(--text-3); padding: var(--sp-1) var(--sp-2); border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg-1, var(--bg)); white-space: nowrap; }
-.md-grid td { padding: var(--sp-1) var(--sp-2); border-bottom: 1px solid var(--line); vertical-align: top; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.md-ops-col { width: 1%; }
-.md-ops { white-space: nowrap; display: flex; gap: var(--sp-1); }
+.md-note.ok { color: var(--ok); }
+.md-note.err { color: var(--err); }
+.md-grid-wrap { min-height: 0; min-width: 0; overflow: auto; }
+.md-grid { border-collapse: separate; border-spacing: 0; width: 100%; font-size: var(--fs-sm); }
+.md-grid th { text-align: left; height: var(--row-h); font-size: var(--fs-sm); font-weight: 600; color: var(--text); padding: 0 var(--sp-3); border-bottom: 1px solid var(--line-2); position: sticky; top: 0; background: var(--panel-2); z-index: 1; white-space: nowrap; }
+.md-grid td { height: var(--row-h); padding: 0 var(--sp-3); border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent); max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.md-grid tbody tr:hover td { background: var(--hover); }
+/* 操作列吸右：文档字段再多，查看/编辑/删除也始终可达 */
+.md-ops-col { width: 1%; right: 0; z-index: 2; }
+.md-grid th.md-ops-col { position: sticky; box-shadow: inset 1px 0 0 var(--line); }
+.md-grid td.md-ops { position: sticky; right: 0; background: var(--panel); box-shadow: inset 1px 0 0 var(--line); max-width: none; overflow: visible; padding: 0 var(--sp-1); }
+.md-ops-row { display: inline-flex; align-items: center; gap: 2px; height: 100%; }
+.md-ops-row .btn { height: 22px; padding: 0 6px; font-size: var(--fs-xs); background: transparent; border-color: transparent; box-shadow: none; color: var(--text-2); }
+.md-ops-row .btn:hover:not(:disabled) { background: var(--active); color: var(--text); }
+.md-ops-row .btn.danger { color: var(--err); }
 .md-empty { color: var(--text-3); font-size: 12px; padding: var(--sp-3); }
-.md-view { min-height: 0; overflow: hidden; display: flex; flex-direction: column; gap: var(--sp-2); border: 1px solid var(--line); border-radius: var(--r-md, 8px); padding: var(--sp-2); }
+.md-view { min-height: 0; overflow: hidden; display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-3); border-left: 1px solid var(--line); background: var(--panel-2); }
 .md-view-head { display: flex; align-items: center; gap: var(--sp-2); }
 .md-view-head h4 { margin: 0; font-size: 13px; }
 .md-id { font-size: 11px; color: var(--text-3); overflow-wrap: anywhere; }
 .md-view > :not(header) { flex: 1; min-height: 0; }
-.md-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.35); display: grid; place-items: center; z-index: 60; }
-.md-card { background: var(--bg, #fff); color: var(--text, inherit); border-radius: var(--r-md, 8px); padding: var(--sp-3); min-width: 420px; max-width: min(720px, 92vw); display: grid; gap: var(--sp-2); box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18); }
+.md-overlay { position: fixed; inset: 0; background: var(--overlay); display: grid; place-items: center; z-index: var(--z-dialog); animation: fade-in var(--dur-fast) var(--ease); }
+.md-card { background: var(--surface-overlay); color: var(--text, inherit); border-radius: var(--r-md); padding: var(--sp-4); min-width: 420px; max-width: min(720px, 92vw); display: grid; gap: var(--sp-2); box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);  box-shadow: var(--shadow-lg); border-radius: var(--r-xl); }
 .md-card h4 { margin: 0; font-size: 14px; }
 .md-hint { margin: 0; font-size: 12px; color: var(--text-2); }
 .md-card textarea { width: 100%; resize: vertical; font-size: 12px; }

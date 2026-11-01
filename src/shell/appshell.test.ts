@@ -155,6 +155,26 @@ describe("AppShell", () => {
     wrapper.unmount();
   });
 
+  it("lists recent runs on the welcome page and reopens them without executing", async () => {
+    replaceCatalog([savedConnection()]);
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "query_history") {
+        return [{ id: "h1", sql: "select\n  1", connectionId: "pg", connectionName: "书店", databaseName: "bookstore", engine: "postgres", startedAt: "2026-10-20T09:00:00.000Z", finishedAt: null, status: "ok", elapsedMs: 3, summary: "" }];
+      }
+      if (command === "query_saved_list") return [];
+      throw new Error("backend unavailable");
+    });
+    const wrapper = mount(AppShell);
+    await flushPromises();
+    const entry = wrapper.get("[data-action=welcome-recent]");
+    expect(entry.text()).toContain("select 1");
+    await entry.trigger("click");
+    await flushPromises();
+    expect(wrapper.findAll(".tab")).toHaveLength(1);
+    expect(invoke.mock.calls.some((call) => call[0] === "query_start")).toBe(false);
+    wrapper.unmount();
+  });
+
   it("keeps new query as the only solid welcome action when a connection exists", () => {
     replaceCatalog([savedConnection()]);
     const wrapper = mount(AppShell);
@@ -163,9 +183,9 @@ describe("AppShell", () => {
     expect(solid).toHaveLength(1);
     expect(solid[0]!.text()).toContain("新建查询");
     expect(welcome.findAll(".desk-action")).toHaveLength(0);
-    // 有连接时仍保留两条轻量入口，但不与主按钮争夺视觉主位
+    // 有连接时保留轻量入口，但不与主按钮争夺视觉主位
     const quick = welcome.findAll(".welcome-quick .btn");
-    expect(quick).toHaveLength(2);
+    expect(quick).toHaveLength(3);
     expect(quick[0]!.text()).toContain("新建连接");
     expect(quick[1]!.text()).toContain("打开 SQLite 文件");
     expect(quick.every((button) => !button.classes().includes("primary"))).toBe(true);

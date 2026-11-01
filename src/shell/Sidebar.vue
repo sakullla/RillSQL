@@ -18,6 +18,7 @@ const emit = defineEmits<{
   "open-keys": [connection: CatalogConnection, key: string];
   "open-docs": [connection: CatalogConnection, database: string, collection: string];
   "new-connection": [];
+  "new-query": [connection: CatalogConnection, database: string];
 }>();
 
 function forwardOpen(object: CatalogObjectRef, pane: "data" | "structure", section?: "columns" | "drop") {
@@ -47,6 +48,11 @@ function forwardKeys(connection: CatalogConnection, key: string) {
 function forwardDocs(connection: CatalogConnection, database: string, collection: string) {
   emit("open-docs", connection, database, collection);
 }
+
+function forwardNewQuery(connection: CatalogConnection, database: string) {
+  emit("new-query", connection, database);
+}
+
 const filter = ref("");
 
 let stopResize: (() => void) | null = null;
@@ -74,14 +80,11 @@ function onPointerDown(event: PointerEvent) {
 
 <template>
   <aside class="sidebar" :style="{ width: `${width}px` }" :aria-label="t('shell.sidebar.explorer')">
-    <div class="sb-head">
-      <span class="sb-title">{{ t("shell.sidebar.explorer") }}</span>
-    </div>
     <label class="sb-search">
       <Icon name="search" />
       <input v-model="filter" type="search" :placeholder="t('shell.sidebar.filterTables')" :aria-label="t('shell.sidebar.filterTables')" />
     </label>
-    <ExplorerTree :filter="filter" @open-object="forwardOpen" @open-definition="forwardDefinition" @query-object="forwardQuery" @focused-database="forwardFocus" @open-diagram="forwardDiagram" @open-keys="forwardKeys" @open-docs="forwardDocs" @new-connection="emit('new-connection')" />
+    <ExplorerTree :filter="filter" @open-object="forwardOpen" @open-definition="forwardDefinition" @query-object="forwardQuery" @focused-database="forwardFocus" @open-diagram="forwardDiagram" @open-keys="forwardKeys" @open-docs="forwardDocs" @new-connection="emit('new-connection')" @new-query="forwardNewQuery" />
   </aside>
   <div
     class="sb-resizer"

@@ -9,6 +9,7 @@ import { isDefinitionKind, objectLabel, objectPath } from "../catalog/tree";
 import type { CatalogConnection } from "../catalog/types";
 import { catalogConnections, catalogLoaded } from "../catalog/store";
 import { listPaletteConnections } from "../connections";
+import { engineMeta } from "../engines";
 import { setLocale, tr as t } from "../i18n";
 import DragImportDialog from "../export/DragImportDialog.vue";
 import DragOverlay from "../export/DragOverlay.vue";
@@ -22,6 +23,7 @@ import { deletedConnectionNotice, type OpenPlan } from "../history/plan";
 import { attachCloser, requestCancel, startTabRun, tabRun } from "../query/runtime";
 import { rowLimit } from "../query/scope";
 import { parseHash } from "../router";
+import { ToastHost } from "../ui";
 import { chooseLeave, chooseStay, closePrompt, installCloseCoordinator, uninstallCloseCoordinator } from "./close-guard";
 import ActivityRail from "./ActivityRail.vue";
 import CommandPalette from "./CommandPalette.vue";
@@ -227,7 +229,7 @@ const commands = computed<PaletteItem[]>(() => [
     label: connection.label,
     icon: "database" as const,
     path: connection.path,
-    run: () => session.showPage("connections"),
+    run: () => onPaletteConnection(connection.id),
   })),
   ...shellCommands({
     openQuery: session.openQuery,
@@ -264,6 +266,17 @@ const commands = computed<PaletteItem[]>(() => [
     },
   }),
 ]);
+
+/** 已连接的关系库直接开查询；其余情况去连接页处理。 */
+function onPaletteConnection(id: string) {
+  const known = catalogConnections().find((item) => item.id === id);
+  const database = known?.defaultDatabase || known?.databases[0]?.name;
+  if (known && asStatus(known.status) === "connected" && database != null && engineMeta(known.engine).relational) {
+    onTreeNewQuery(known, database);
+    return;
+  }
+  session.showPage("connections");
+}
 
 function applyTheme() {
   applyDocumentTheme(settings.theme, settings.density, prefersDarkScheme(), settings.editorFont);
@@ -369,6 +382,21 @@ function onCopyDefinition(sql: string) {
     engine: ready ? tab.engine : null,
     status: ready ? tab.connectionStatus : null,
     needsTarget: !ready,
+    notice: null,
+  });
+}
+
+/** 树上的「在此库新建查询」：连接已开，目标直接绑定，光标落进空编辑器。 */
+function onTreeNewQuery(connection: CatalogConnection, database: string) {
+  if (window.innerWidth <= 960) session.sidebarHidden.value = true;
+  session.openQueryDraft({
+    sql: "",
+    connectionId: connection.id,
+    connectionName: connection.name,
+    database,
+    engine: connection.engine,
+    status: "connected",
+    needsTarget: false,
     notice: null,
   });
 }
@@ -515,6 +543,15 @@ function onKey(event: KeyboardEvent) {
     session.showPage("settings");
     return;
   }
+  if (event.ctrlKey && event.key === "Tab") {
+    event.preventDefault();
+    const tabs = session.tabs.value;
+    if (tabs.length < 2) return;
+    const index = tabs.findIndex((tab) => tab.id === session.activeId.value);
+    const step = event.shiftKey ? -1 : 1;
+    session.activateTab(tabs[(index + step + tabs.length) % tabs.length]!.id);
+    return;
+  }
   if (!mod && event.altKey && /^[1-9]$/.test(event.key)) {
     const tab = session.tabs.value[Number(event.key) - 1];
     if (tab) {
@@ -587,6 +624,7 @@ onBeforeUnmount(() => {
         @query-object="onQueryObject"
         @focused-database="onFocusedDatabase"
         @new-connection="session.showPage('connections')"
+        @new-query="onTreeNewQuery"
       />
       <main id="main" tabindex="-1">
         <WorkspaceView
@@ -600,6 +638,10 @@ onBeforeUnmount(() => {
           @new-query="session.openQuery()"
           @connections="session.showPage('connections')"
           @sqlite="requestSqlite()"
+          @compare="compareOpen = true"
+          @history-open="onHistoryOpen"
+          @show-history="section => { historySection = section; session.showPage('history'); }"
+          @help="session.openHelp()"
           @palette="session.openPalette('all')"
           @structure="session.openStructure(STRUCTURE_PLACEHOLDER)"
           @draft="session.setDraft"
@@ -641,6 +683,7 @@ onBeforeUnmount(() => {
       @proceed="seed => { dragImport = seed; dragState = null; }"
     />
     <DragImportDialog v-if="dragImport" :seed="dragImport" @close="dragImport = null" />
+    <ToastHost />
     <ShortcutHelp :open="session.helpOpen.value" @close="session.closeHelp()" />
     <dialog v-if="closePrompt.open" ref="closeDialog" class="modal" aria-labelledby="close-guard-title" @cancel.prevent="chooseStay">
       <div class="modal-head">

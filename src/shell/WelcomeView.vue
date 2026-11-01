@@ -1,12 +1,65 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { catalogConnections } from "../catalog/store";
+import { queryHistory, querySavedList } from "../history/api";
+import { openPlan, type HistoryEntry, type OpenPlan } from "../history/plan";
+import type { SavedQuery } from "../history/saved";
 import { tr as t } from "../i18n";
 import BrandMark from "./BrandMark.vue";
+import ChordKeys from "./ChordKeys.vue";
 import Icon from "./Icon.vue";
 
-const emit = defineEmits<{ "new-query": []; connections: []; sqlite: [] }>();
+const RECENT_LIMIT = 6;
+const SAVED_LIMIT = 4;
+
+const emit = defineEmits<{
+  "new-query": [];
+  connections: [];
+  sqlite: [];
+  compare: [];
+  "history-open": [plan: OpenPlan];
+  "show-history": [section: "runs" | "saved"];
+  help: [];
+}>();
 const saved = computed(() => catalogConnections().length > 0);
+const knownIds = computed(() => new Set(catalogConnections().map((item) => item.id)));
+const recent = ref<HistoryEntry[]>([]);
+const savedQueries = ref<SavedQuery[]>([]);
+
+/** 首页只是便捷入口：读不到历史时安静留空，不在这里报错。 */
+onMounted(async () => {
+  try {
+    recent.value = (await queryHistory()).slice(0, RECENT_LIMIT);
+  } catch {
+    recent.value = [];
+  }
+  try {
+    savedQueries.value = (await querySavedList()).slice(0, SAVED_LIMIT);
+  } catch {
+    savedQueries.value = [];
+  }
+});
+
+function sqlLine(sql: string): string {
+  return sql.replace(/\s+/g, " ").trim();
+}
+
+function reopen(entry: HistoryEntry) {
+  emit("history-open", openPlan(entry, knownIds.value));
+}
+
+function reopenSaved(item: SavedQuery) {
+  const exists = knownIds.value.has(item.connectionId);
+  emit("history-open", {
+    sql: item.sql,
+    connectionId: exists ? item.connectionId : null,
+    connectionName: item.connectionName,
+    database: exists ? item.databaseName : null,
+    engine: item.engine,
+    needsTarget: !exists,
+    execute: false,
+  });
+}
 </script>
 
 <template>
@@ -18,12 +71,57 @@ const saved = computed(() => catalogConnections().length > 0);
             <h1>{{ t("shell.welcome.resumeTitle") }}</h1>
             <p>{{ t("shell.welcome.resumeHint") }}</p>
           </div>
-          <button class="btn primary" type="button" :aria-label="t('common.newQuery')" @click="emit('new-query')"><Icon name="plus" />{{ t("common.newQuery") }}</button>
+          <button class="btn primary" type="button" :aria-label="t('common.newQuery')" @click="emit('new-query')"><Icon name="plus" />{{ t("common.newQuery") }}<ChordKeys chord="Mod+T" /></button>
         </header>
-        <!-- 继续态入口卡：与空态 .desk-action 同一质感；容器沿用 welcome-quick 锚点类，升级为卡片栅格。 -->
         <div class="welcome-quick">
           <button class="btn resume-action" type="button" @click="emit('connections')"><span class="action-icon"><Icon name="database" /></span><span><b>{{ t("common.newConnection") }}</b><small>{{ t("shell.welcome.newConnectionHint") }}</small></span></button>
           <button class="btn resume-action" type="button" @click="emit('sqlite')"><span class="action-icon"><Icon name="file" /></span><span><b>{{ t("common.openSqlite") }}</b><small>{{ t("shell.welcome.openSqliteHint") }}</small></span></button>
+          <button class="btn resume-action" type="button" @click="emit('compare')"><span class="action-icon"><Icon name="columns" /></span><span><b>{{ t("shell.welcome.compare") }}</b><small>{{ t("shell.welcome.compareHint") }}</small></span></button>
+        </div>
+        <div class="desk-columns">
+          <section :aria-label="t('shell.welcome.recent')">
+            <div class="section-heading">
+              <h2>{{ t("shell.welcome.recent") }}</h2>
+              <button class="desk-link" type="button" @click="emit('show-history', 'runs')">{{ t("shell.welcome.viewAll") }}</button>
+            </div>
+            <p v-if="!recent.length" class="desk-none">{{ t("shell.welcome.recentEmpty") }}</p>
+            <ul v-else class="desk-list">
+              <li v-for="entry in recent" :key="entry.id">
+                <button class="desk-entry" type="button" data-action="welcome-recent" :title="entry.sql" @click="reopen(entry)">
+                  <code>{{ sqlLine(entry.sql) }}</code>
+                  <small>{{ entry.connectionName }}{{ entry.databaseName ? ` / ${entry.databaseName}` : "" }}</small>
+                </button>
+              </li>
+            </ul>
+          </section>
+          <div class="desk-side">
+            <section :aria-label="t('shell.welcome.saved')">
+              <div class="section-heading">
+                <h2>{{ t("shell.welcome.saved") }}</h2>
+                <button class="desk-link" type="button" @click="emit('show-history', 'saved')">{{ t("shell.welcome.viewAll") }}</button>
+              </div>
+              <p v-if="!savedQueries.length" class="desk-none">{{ t("shell.welcome.savedEmpty") }}</p>
+              <ul v-else class="desk-list">
+                <li v-for="item in savedQueries" :key="item.id">
+                  <button class="desk-entry" type="button" data-action="welcome-saved" :title="item.sql" @click="reopenSaved(item)">
+                    <b>{{ item.name }}</b>
+                    <small>{{ item.connectionName }}{{ item.databaseName ? ` / ${item.databaseName}` : "" }}</small>
+                  </button>
+                </li>
+              </ul>
+            </section>
+            <section :aria-label="t('shell.welcome.keys')">
+              <div class="section-heading">
+                <h2>{{ t("shell.welcome.keys") }}</h2>
+                <button class="desk-link" type="button" @click="emit('help')">{{ t("shell.welcome.viewAll") }}</button>
+              </div>
+              <ul class="desk-keys">
+                <li><span>{{ t("shell.welcome.keyPalette") }}</span><ChordKeys chord="Mod+K" /></li>
+                <li><span>{{ t("shell.welcome.keyTables") }}</span><ChordKeys chord="Mod+P" /></li>
+                <li><span>{{ t("shell.welcome.keyRun") }}</span><ChordKeys chord="Mod+Enter" /></li>
+              </ul>
+            </section>
+          </div>
         </div>
       </template>
       <template v-else>
@@ -50,51 +148,28 @@ const saved = computed(() => catalogConnections().length > 0);
 </template>
 
 <style scoped>
-/* 间距与字号尽量消费 --sp- 与 --fs- 前缀令牌；个别非 4px 刻度值（30px/28px/14px/10px）为既有视觉节奏，
-   就近刻度会带来可感知的 2px 位移，按任务约定保留原值并在此说明。 */
-/* .btn 的固定高度会裁切带说明的入口；实心仍只来自 .primary。 */
-.desk-action.btn,
+.welcome-quick { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--sp-3); margin-bottom: var(--sp-7); }
 .resume-action.btn {
   height: auto;
   width: 100%;
   min-width: 0;
+  padding: var(--sp-3);
+  gap: var(--sp-3);
   justify-content: flex-start;
+  text-align: left;
   white-space: normal;
-  transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
-}
-.desk-action.primary .action-icon {
-  background: color-mix(in srgb, var(--on-accent) 18%, transparent);
-  color: var(--on-accent);
-}
-.desk-action.primary small {
-  color: color-mix(in srgb, var(--on-accent) 78%, transparent);
-}
-/* 品牌区：BrandMark + 中文导语，双主题令牌取色，不出现硬编码颜色。 */
-.welcome-hero { display: flex; align-items: center; gap: var(--sp-5); margin: var(--sp-2) 0 30px; flex-wrap: wrap; }
-.hero-kicker { margin: 0 0 var(--sp-2); font: 600 var(--fs-xs)/1 var(--mono); letter-spacing: .12em; color: var(--accent-text); }
-.welcome-hero h1 { font-size: var(--fs-xxl); letter-spacing: -.02em; margin: 0 0 10px; font-weight: 650; }
-.welcome-hero p { margin: 0; color: var(--text-2); font-size: var(--fs-md); }
-.hero-facts {
-  list-style: none;
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--sp-2) var(--sp-5);
-  margin: 28px 0 0;
-  padding: var(--sp-4) var(--sp-5);
-  border: 1px solid var(--line);
   border-radius: var(--r-lg);
-  background: var(--surface-panel);
-  box-shadow: var(--shadow-sm);
-  color: var(--text-2);
-  font-size: var(--fs-sm);
+  transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
 }
-.hero-facts li { display: flex; align-items: center; gap: var(--sp-1); }
-.hero-facts .i { width: 14px; height: 14px; color: var(--ok); flex-shrink: 0; }
-/* 继续态入口卡：复用空态入口的图标语言与悬浮上移质感。 */
-.welcome-quick { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: var(--sp-7); }
-.resume-action:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line-2)); box-shadow: var(--shadow); transform: translateY(-1px); }
+.resume-action.btn:hover:not(:disabled) { background: var(--surface-panel); border-color: color-mix(in srgb, var(--accent) 50%, var(--line-2)); box-shadow: var(--shadow); }
+.resume-action b { display: block; font-size: var(--fs-md); font-weight: 600; margin-bottom: 2px; }
+.resume-action small { display: block; color: var(--text-2); font-size: var(--fs-xs); font-weight: 400; }
+.desk-action.primary .action-icon { background: color-mix(in srgb, var(--on-accent) 18%, transparent); color: var(--on-accent); }
+.desk-action.primary b, .desk-action.primary small { color: var(--on-accent); }
+.desk-heading .btn :deep(kbd) { background: transparent; color: inherit; border-color: currentColor; opacity: .7; box-shadow: none; }
+.desk-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 @media (max-width: 960px) {
-  .welcome-quick { grid-template-columns: 1fr; gap: 10px; }
-  .welcome-hero { align-items: flex-start; }
+  .welcome-quick { grid-template-columns: 1fr; gap: var(--sp-2); margin-bottom: var(--sp-6); }
+  .desk-actions { grid-template-columns: 1fr; }
 }
 </style>

@@ -417,7 +417,9 @@ describe("close guard", () => {
     await flushPromises();
     await wrapper.get("[data-action='close-leave']").trigger("click");
     expect(wrapper.find(`[data-tab-id='${id}']`).exists()).toBe(false);
-    expect(invoke.mock.calls.map((call) => call[0])).toEqual(["app_info", "catalog_sessions"]);
+    // 首页的最近查询只读本地历史；关闭标签不产生任何后端写入或连接操作。
+    const welcomeReads = new Set(["query_history", "query_saved_list"]);
+    expect(invoke.mock.calls.map((call) => call[0]).filter((name) => !welcomeReads.has(name))).toEqual(["app_info", "catalog_sessions"]);
     wrapper.unmount();
   });
 

@@ -7,6 +7,7 @@ import { createSession, snapshotSession } from "../shell/session";
 import WorkspaceView from "../shell/WorkspaceView.vue";
 import type { Diagram } from "./types";
 import DiagramView from "./DiagramView.vue";
+import { edgePath, layoutColumns } from "./layout";
 
 const invoke = vi.hoisted(() => vi.fn());
 
@@ -49,7 +50,7 @@ describe("relationship diagram", () => {
     await flushPromises();
     expect(wrapper.get("[data-diagram]").attributes("data-readonly")).toBe("true");
     expect(wrapper.find("button").exists()).toBe(false);
-    expect(wrapper.findAll("[data-table]").map((node) => node.attributes("data-table-name"))).toEqual(["customers", "orders", "notes"]);
+    expect(wrapper.findAll("[data-table]").map((node) => node.attributes("data-table-name"))).toEqual(["customers", "notes", "orders"]);
     expect(wrapper.text()).not.toContain("v_orders");
     expect(wrapper.get("[data-table-name=customers]").text()).toContain("id");
     expect(wrapper.get("[data-table-name=customers]").text()).toContain("name");
@@ -144,5 +145,24 @@ describe("relationship diagram", () => {
       connectionId: "pg",
       database: "bookstore",
     });
+  });
+});
+
+describe("diagram layout", () => {
+  const table = (name: string) => ({ name, columns: [], outside: [] });
+  const edge = (fromTable: string, toTable: string) => ({ name: `${fromTable}_${toTable}`, fromTable, fromColumns: ["id"], toTable, toColumns: ["id"] });
+
+  it("places referenced tables left of the tables that point at them", () => {
+    const columns = layoutColumns([table("items"), table("orders"), table("customers")], [edge("orders", "customers"), edge("items", "orders")]);
+    expect(columns.map((group) => group.map((item) => item.name))).toEqual([["customers"], ["orders"], ["items"]]);
+  });
+
+  it("terminates on foreign key cycles and ignores self references", () => {
+    const columns = layoutColumns([table("a"), table("b")], [edge("a", "b"), edge("b", "a"), edge("a", "a")]);
+    expect(columns.flat().map((item) => item.name).sort()).toEqual(["a", "b"]);
+  });
+
+  it("draws a same-column link as a loop outside the cards", () => {
+    expect(edgePath({ x: 100, y: 10 }, { x: 100, y: 90 })).toBe("M 100 10 C 156 10, 156 90, 100 90");
   });
 });

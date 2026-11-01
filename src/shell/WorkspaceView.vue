@@ -5,6 +5,7 @@ import DiagramView from "../diagram/DiagramView.vue";
 import { catalogConnections, catalogLoaded } from "../catalog/store";
 import type { CatalogObjectRef } from "../catalog/object-ref";
 import { resolveTableTarget, type TableTarget } from "../grid/target";
+import type { OpenPlan } from "../history/plan";
 import { tr as t } from "../i18n";
 import { targetDetail, targetKey, targetOptions, type TargetOption } from "../query/complete";
 import "../structure/structure.css";
@@ -26,6 +27,10 @@ const emit = defineEmits<{
   "new-query": [];
   connections: [];
   sqlite: [];
+  compare: [];
+  "history-open": [plan: OpenPlan];
+  "show-history": [section: "runs" | "saved"];
+  help: [];
   palette: [];
   structure: [];
   "query-target": [target: QueryTarget];
@@ -39,6 +44,19 @@ const emit = defineEmits<{
 
 const active = computed(() => props.tabs.find((tab) => tab.id === props.activeId) ?? null);
 const pageSize = computed(() => props.pageSize ?? loadSettings().pageSize);
+
+/** 标签所在环境色：查询标签带连接 id，表标签从标签 id 解析。 */
+function tabConnection(tab: ShellTab) {
+  const id = tab.connectionId ?? (tab.kind === "table" ? tableTarget(tab.id)?.connectionId : null);
+  return id ? catalogConnections().find((item) => item.id === id) ?? null : null;
+}
+
+function tabEnvTone(tab: ShellTab): string {
+  const tone = tabConnection(tab)?.envTone;
+  return tone && tone !== "none" ? tone : "";
+}
+
+const activeProduction = computed(() => (active.value ? tabEnvTone(active.value) === "prod" : false));
 
 function paneOf(tab: { tablePane?: "data" | "structure" }): "data" | "structure" {
   return tab.tablePane ?? "data";
@@ -196,7 +214,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="workspace-view">
-  <div v-if="tabs.length" class="tabbar" role="tablist" :aria-label="t('shell.tabs.tablist')" @contextmenu="onTabBarContext">
+  <div v-if="tabs.length" class="tabbar" role="tablist" :aria-label="t('shell.tabs.tablist')" @contextmenu="onTabBarContext" @dblclick.self="emit('new-query')">
     <div
       v-for="tab in tabs"
       :key="tab.id"
@@ -212,6 +230,7 @@ onBeforeUnmount(() => {
       @keydown="onTabKey($event, tab.id)"
     >
       <Icon :name="tab.kind === 'query' ? 'code' : tab.kind === 'diagram' ? 'link' : tab.kind === 'keys' ? 'key' : tab.kind === 'docs' ? 'columns' : 'table'" />
+      <span v-if="tabEnvTone(tab)" class="tab-env" :class="`env-${tabEnvTone(tab)}`" aria-hidden="true"></span>
       <span class="tab-title">{{ tabTitle(tab) }}</span>
       <span
         v-if="tab.targetText || tab.path || tab.kind === 'query'"
@@ -226,6 +245,7 @@ onBeforeUnmount(() => {
       <Icon name="plus" />
     </button>
   </div>
+  <div v-if="activeProduction" class="env-stripe" data-env-stripe aria-hidden="true"></div>
   <div class="tab-body" id="tab-body">
     <QueryTab
       v-if="active && active.kind === 'query'"
@@ -252,8 +272,8 @@ onBeforeUnmount(() => {
     </div>
     <div v-else-if="active && active.kind === 'table'" class="table-workspace">
       <div class="pane-switch" role="tablist" :aria-label="t('shell.tabs.paneLabel')">
-        <button type="button" role="tab" :aria-selected="paneOf(active) === 'data'" @click="showPane(active.id, 'data')">{{ t("common.data") }}</button>
-        <button type="button" role="tab" :aria-selected="paneOf(active) === 'structure'" @click="showPane(active.id, 'structure')">{{ t("common.structure") }}</button>
+        <button type="button" role="tab" :aria-selected="paneOf(active) === 'data'" @click="showPane(active.id, 'data')"><Icon name="grid" />{{ t("common.data") }}</button>
+        <button type="button" role="tab" :aria-selected="paneOf(active) === 'structure'" @click="showPane(active.id, 'structure')"><Icon name="columns" />{{ t("common.structure") }}</button>
       </div>
       <DataGrid
         v-if="paneOf(active) === 'data'"
@@ -321,6 +341,10 @@ onBeforeUnmount(() => {
       @new-query="emit('new-query')"
       @connections="emit('connections')"
       @sqlite="emit('sqlite')"
+      @compare="emit('compare')"
+      @history-open="emit('history-open', $event)"
+      @show-history="emit('show-history', $event)"
+      @help="emit('help')"
     />
   </div>
   <Teleport to="body">

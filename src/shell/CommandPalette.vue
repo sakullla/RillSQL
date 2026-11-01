@@ -93,7 +93,7 @@ function onKey(event: KeyboardEvent) {
         </template>
       </div>
       <div class="pal-foot">
-        <span><ChordKeys chord="Up" /><ChordKeys chord="Down" /> {{ t("shell.palette.hintSelect") }}</span>
+        <span><span class="kbd"><kbd>↑</kbd><kbd>↓</kbd></span> {{ t("shell.palette.hintSelect") }}</span>
         <span><ChordKeys chord="Enter" /> {{ t("shell.palette.hintOpen") }}</span>
         <span><ChordKeys chord="Esc" /> {{ t("common.close") }}</span>
         <span class="grow"></span>

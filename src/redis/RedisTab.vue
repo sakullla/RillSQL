@@ -354,41 +354,42 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-.redis-tab { display: grid; grid-template-columns: minmax(220px, 320px) 1fr; grid-template-rows: 1fr auto auto; gap: var(--sp-2); height: 100%; min-height: 0; padding: var(--sp-2); }
-.rk-list { display: flex; flex-direction: column; gap: var(--sp-2); min-height: 0; border: 1px solid var(--line); border-radius: var(--r-md, 8px); padding: var(--sp-2); overflow: hidden; }
+.redis-tab { display: grid; grid-template-columns: minmax(240px, 320px) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto auto; height: 100%; min-height: 0; }
+.rk-list { display: flex; flex-direction: column; gap: var(--sp-2); min-height: 0; padding: var(--sp-2); border-right: 1px solid var(--line); background: var(--panel-2); overflow: hidden; }
 .rk-filter { display: flex; gap: var(--sp-1); }
 .rk-filter input { flex: 1; min-width: 0; }
 .rk-keys { margin: 0; padding: 0; list-style: none; overflow: auto; display: grid; gap: 2px; align-content: start; }
-.rk-key { display: grid; grid-template-columns: auto 1fr auto; gap: var(--sp-2); align-items: center; width: 100%; text-align: left; padding: var(--sp-1) var(--sp-2); border: 0; border-radius: var(--r-sm, 6px); background: transparent; color: inherit; cursor: pointer; }
-.rk-key:hover { background: var(--bg-2, rgba(127, 127, 127, 0.12)); }
-.rk-key.active { background: var(--accent-soft, rgba(127, 127, 127, 0.2)); }
+.rk-key { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: var(--sp-2); align-items: center; width: 100%; height: var(--tree-h); padding: 0 var(--sp-2); border-radius: var(--r-sm); text-align: left; font-size: var(--fs-sm); }
+.rk-key:hover { background: var(--hover); }
+.rk-key.active { background: var(--sel-strong); }
 .rk-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.rk-badge { font-size: 11px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--line); color: var(--text-2); }
+.rk-badge { font-size: 10.5px; line-height: 16px; padding: 0 5px; border-radius: var(--r-sm); background: var(--sunken); color: var(--text-2); }
 .rk-badge.lg { font-size: 12px; }
 .rk-ttl { font-size: 11px; color: var(--text-3); white-space: nowrap; }
 .rk-empty { color: var(--text-3); font-size: 12px; margin: var(--sp-2) 0; }
-.rk-error { color: var(--danger, #c0392b); font-size: 12px; margin: 0; }
+.rk-error { color: var(--err); font-size: 12px; margin: 0; }
 .rk-more { display: flex; align-items: center; gap: var(--sp-2); }
 .rk-done { font-size: 11px; color: var(--text-3); }
-.rk-detail { display: flex; flex-direction: column; gap: var(--sp-2); min-height: 0; border: 1px solid var(--line); border-radius: var(--r-md, 8px); padding: var(--sp-2); overflow: hidden; }
+.rk-detail { display: flex; flex-direction: column; gap: var(--sp-2); min-height: 0; min-width: 0; padding: var(--sp-3); overflow: hidden; }
 .rk-head { display: flex; align-items: center; gap: var(--sp-2); }
-.rk-head h3 { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
+.rk-head h3 { margin: 0; font-size: var(--fs-md); font-weight: 600; overflow-wrap: anywhere; }
 .rk-ttl-now { font-size: 12px; color: var(--text-3); }
 .rk-detail > :not(header, .rk-empty, .rk-error) { flex: 1; min-height: 0; }
-.rk-actions { display: flex; align-items: center; gap: var(--sp-2); flex: initial; flex-wrap: wrap; }
+.rk-detail > .rk-actions { display: flex; align-items: center; gap: var(--sp-2); flex: 0 0 auto; flex-wrap: wrap; padding-top: var(--sp-2); border-top: 1px solid var(--line); }
 .rk-ttl-form { display: flex; align-items: center; gap: var(--sp-1); }
 .rk-ttl-form input { width: 150px; }
 .rk-note { font-size: 12px; }
-.rk-note.ok { color: var(--ok, #2e7d32); }
-.rk-cmd { grid-column: 1 / -1; display: flex; align-items: center; gap: var(--sp-2); }
+.rk-note.ok { color: var(--ok); }
+.rk-cmd { grid-column: 1 / -1; display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) var(--sp-3); border-top: 1px solid var(--line); background: var(--panel-2); }
 .rk-cmd input { flex: 1; min-width: 0; }
-.rk-result { grid-column: 1 / -1; max-height: 160px; overflow: auto; display: grid; gap: var(--sp-1); align-content: start; }
+.rk-result { grid-column: 1 / -1; max-height: 160px; overflow: auto; display: grid; gap: var(--sp-1); align-content: start; padding: var(--sp-2) var(--sp-3); border-top: 1px solid var(--line); font-family: var(--mono); }
+.rk-result:not(:has(*)) { display: none; }
 .rk-reply-kind { display: flex; gap: var(--sp-2); align-items: center; margin: 0; font-size: 13px; }
 .rk-kind { font-size: 11px; color: var(--text-3); }
 .rk-reply-items { margin: 0; padding: 0; list-style: none; display: grid; gap: 2px; font-size: 12px; }
 .rk-index { color: var(--text-3); margin-right: var(--sp-2); }
-.rk-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.35); display: grid; place-items: center; z-index: 60; }
-.rk-card { background: var(--bg, #fff); color: var(--text, inherit); border-radius: var(--r-md, 8px); padding: var(--sp-3); min-width: 320px; display: grid; gap: var(--sp-2); box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18); }
+.rk-overlay { position: fixed; inset: 0; background: var(--overlay); display: grid; place-items: center; z-index: var(--z-dialog); animation: fade-in var(--dur-fast) var(--ease); }
+.rk-card { background: var(--surface-overlay); color: var(--text, inherit); border-radius: var(--r-md); padding: var(--sp-4); min-width: 320px; display: grid; gap: var(--sp-2); box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);  box-shadow: var(--shadow-lg); border-radius: var(--r-xl); }
 .rk-card h4 { margin: 0; font-size: 14px; }
 .rk-prompt { margin: 0; font-size: 13px; color: var(--text-2); overflow-wrap: anywhere; }
 .rk-card-actions { display: flex; justify-content: flex-end; gap: var(--sp-2); }

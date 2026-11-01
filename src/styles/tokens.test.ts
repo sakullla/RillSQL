@@ -101,6 +101,9 @@ const THEME_TOKENS = [
   "--eng-mysql",
   "--eng-mariadb",
   "--eng-sqlite",
+  "--eng-sqlserver",
+  "--eng-redis",
+  "--eng-mongodb",
   "--nav-bg",
   "--nav-fg",
   "--nav-active",
@@ -133,6 +136,8 @@ describe("design tokens", () => {
       "--text",
       "--text-2",
       "--stroke",
+      "--accent",
+      "--on-accent",
       "--accent-hover",
       "--accent-active",
       "--accent-soft",
@@ -142,7 +147,6 @@ describe("design tokens", () => {
       "--err",
       "--info",
       "--ring",
-      "--nav-bg",
       "--nav-fg",
       "--nav-active",
       "--nav-hover",
@@ -153,10 +157,9 @@ describe("design tokens", () => {
     }
   });
 
-  it("anchors the accent family on radix iris-9 in both themes", () => {
-    for (const scope of [THEME_SCOPES.light(), THEME_SCOPES.dark()]) {
-      expect(hexValue(scope, "--accent")).toBe("#5b5bd6");
-    }
+  it("anchors the accent on the teal of the app icon, tuned per theme", () => {
+    expect(hexValue(THEME_SCOPES.light(), "--accent")).toBe("#0b7a70");
+    expect(hexValue(THEME_SCOPES.dark(), "--accent")).toBe("#2fcfba");
   });
 
   it("keeps the legacy indigo family fully removed", () => {
@@ -171,7 +174,7 @@ describe("design tokens", () => {
     expect(root).not.toContain("--nav-active");
     expect(root).not.toContain("--nav-hover");
     expect(root).not.toContain("--overlay");
-    expect(tokenValue(root, "--fs-xxl")).toBe("15px");
+    expect(tokenValue(root, "--fs-xxl")).toBe("18px");
   });
 
   it("declares light as the default color scheme", () => {
@@ -190,9 +193,9 @@ describe("design tokens", () => {
 
   it("defines the five-step type scale and the float layer scale", () => {
     const root = block(":root {");
-    expect(tokenValue(root, "--fs-xs")).toBe("11px");
-    expect(tokenValue(root, "--fs-sm")).toBe("12px");
-    expect(tokenValue(root, "--fs-md")).toBe("13px");
+    expect(tokenValue(root, "--fs-xs")).toBe("11.5px");
+    expect(tokenValue(root, "--fs-sm")).toBe("12.5px");
+    expect(tokenValue(root, "--fs-md")).toBe("13.5px");
     expect(tokenValue(root, "--fs-lg")).toBe("15px");
     expect(tokenValue(root, "--fs-xl")).toBe("18px");
     // 六档浮层层级必须严格递增，否则菜单/对话框/Toast 的叠放会互相压住
@@ -238,18 +241,18 @@ describe("design tokens", () => {
 
   it("defaults to compact density and widens in standard and relaxed modes", () => {
     const root = block(":root {");
-    expect(Number.parseInt(tokenValue(root, "--row-h"), 10)).toBe(24);
-    expect(Number.parseInt(tokenValue(root, "--tree-h"), 10)).toBe(22);
-    expect(Number.parseInt(tokenValue(root, "--control-h"), 10)).toBe(28);
-    expect(Number.parseInt(tokenValue(root, "--control-h-sm"), 10)).toBe(24);
+    expect(Number.parseInt(tokenValue(root, "--row-h"), 10)).toBe(28);
+    expect(Number.parseInt(tokenValue(root, "--tree-h"), 10)).toBe(26);
+    expect(Number.parseInt(tokenValue(root, "--control-h"), 10)).toBe(30);
+    expect(Number.parseInt(tokenValue(root, "--control-h-sm"), 10)).toBe(26);
     const standard = block(":root[data-density=\"standard\"]");
-    expect(Number.parseInt(tokenValue(standard, "--row-h"), 10)).toBe(30);
-    expect(Number.parseInt(tokenValue(standard, "--tree-h"), 10)).toBe(28);
+    expect(Number.parseInt(tokenValue(standard, "--row-h"), 10)).toBe(32);
+    expect(Number.parseInt(tokenValue(standard, "--tree-h"), 10)).toBe(30);
     expect(Number.parseInt(tokenValue(standard, "--control-h"), 10)).toBe(34);
     expect(Number.parseInt(tokenValue(standard, "--control-h-sm"), 10)).toBe(30);
     const relaxed = block(":root[data-density=\"relaxed\"]");
-    expect(Number.parseInt(tokenValue(relaxed, "--row-h"), 10)).toBe(34);
-    expect(Number.parseInt(tokenValue(relaxed, "--tree-h"), 10)).toBe(32);
+    expect(Number.parseInt(tokenValue(relaxed, "--row-h"), 10)).toBe(36);
+    expect(Number.parseInt(tokenValue(relaxed, "--tree-h"), 10)).toBe(34);
     expect(Number.parseInt(tokenValue(relaxed, "--control-h"), 10)).toBe(38);
     expect(Number.parseInt(tokenValue(relaxed, "--control-h-sm"), 10)).toBe(34);
   });

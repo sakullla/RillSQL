@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, reactive, ref, watch, type ComponentPublicInstance } from "vue";
+import { computed, inject, nextTick, onBeforeUnmount, reactive, ref, watch, type ComponentPublicInstance, type Ref } from "vue";
 import { tr as t } from "../i18n";
 import { catalogConnections } from "../catalog/store";
 import { registerPending } from "../shell/close-guard";
@@ -16,6 +16,8 @@ import { viewLoadedRows } from "./data";
 import { useRowWindow } from "./virtual";
 import { copyCellText, copySqlValue, showCell } from "./display";
 import "./grid.css";
+import Icon from "../shell/Icon.vue";
+import { toast } from "../ui/toast";
 import { loadSettings } from "../shell/settings";
 import { locateResultRows, provedEditableColumns, readSingleTable, refusalText, resolveEditableTable, ResultEditSession, type TableHit } from "./result-edit";
 import { rejectWrite, typeCaption, valueFamily } from "./typeset";
@@ -42,6 +44,9 @@ const exportOpen = ref(false);
 const exportMessage = ref("");
 const selected = ref<{ row: string; column: string; value: Cell } | null>(null);
 const copyMessage = ref("");
+/** 查询页把结果标题栏留给查找与导出，省掉一整行工具栏；单独挂载时留在网格内。 */
+const toolsHost = inject<Ref<HTMLElement | null> | null>("resultTools", null);
+const toolsTarget = computed(() => toolsHost?.value ?? null);
 const reason = ref(t("grid.resultEdit.readonly"));
 const insertTarget = ref<InsertTarget | null>(null);
 const editSession = ref<ResultEditSession | null>(null);
@@ -490,6 +495,7 @@ async function copySelection() {
   try {
     await navigator.clipboard.writeText(text);
     copyMessage.value = t("grid.value.copied");
+    toast(t("grid.menu.copiedCells", { n: points.length }));
   } catch {
     copyMessage.value = t("grid.errors.clipboardFailed");
   }
@@ -728,14 +734,17 @@ watch(() => props.rows, (rows) => {
 
 <template>
   <div ref="rootEl" class="data-grid" :aria-label="t('grid.queryArea')" :data-tab-id="tabId" data-scope="loaded" :data-editable="editSession ? 'true' : 'false'">
+    <div class="grid-main">
+    <Teleport :to="toolsTarget" :disabled="!toolsTarget">
     <div class="result-toolbar">
-      <input v-model="find" :aria-label="t('grid.find.label')" :placeholder="t('grid.find.label')" />
-      <span class="toolbar-hint" :title="t('grid.find.hintTitle', { note: view.note })">{{ t("grid.find.hint", { n: rows.length }) }}</span>
+      <input v-model="find" :aria-label="t('grid.find.label')" :placeholder="t('grid.find.label')" :title="t('grid.find.hintTitle', { note: view.note })" />
+      <span class="sr">{{ t("grid.find.hint", { n: rows.length }) }}</span>
       <span class="grow"></span>
-      <span class="hint key-hint">{{ reason }}</span>
+      <span class="toolbar-hint key-hint" :title="reason">{{ reason }}</span>
       <button v-if="editSession" class="btn sm" type="button" :disabled="!selected || !editSession.canDeleteRow(selected.row)" @click="deleteSelected">{{ t("grid.toolbar.deleteRow") }}</button>
-      <button class="btn sm" type="button" @click="exportOpen = true">{{ t("grid.toolbar.export") }}</button>
+      <button class="btn sm" type="button" @click="exportOpen = true"><Icon name="download" />{{ t("grid.toolbar.export") }}</button>
     </div>
+    </Teleport>
     <p v-if="exportMessage" class="grid-hint" role="status">{{ exportMessage }}</p>
     <p v-if="receipt" class="grid-hint" role="status">{{ receipt }}</p>
     <div :ref="setViewport" class="grid-scroll" @scroll.passive="onScroll" @keydown="onGridKeydown">
@@ -775,7 +784,7 @@ watch(() => props.rows, (rows) => {
         </tbody>
       </table>
     </div>
-    <footer class="grid-foot">
+    <footer class="grid-foot" :class="{ quiet: !find && !truncated }">
       <span v-if="find">{{ t("grid.find.matched", { n: view.rows.length }) }}</span>
       <span v-if="truncated">{{ t("grid.find.truncatedNoteA") }}<b>{{ rows.length }}</b>{{ t("grid.find.truncatedNoteB", { n: rows.length }) }}</span>
       <span v-else>{{ t("grid.find.allRows", { n: rows.length }) }}</span>
@@ -793,6 +802,7 @@ watch(() => props.rows, (rows) => {
       >{{ discardArmed ? t("grid.commit.discardConfirm") : t("grid.commit.discard") }}</button>
       <button class="btn sm primary" type="button" :disabled="!editSession.pendingCount" @click="openCommit">{{ t("grid.commit.submit") }}</button>
       <p v-for="failure in commitFailures" :key="failure.id" class="commit-failure" role="alert">{{ failure.message }}</p>
+    </div>
     </div>
     <section v-if="selected" class="inspector" :aria-label="t('grid.value.queryViewer')">
       <div class="inspector-meta">
@@ -812,10 +822,10 @@ watch(() => props.rows, (rows) => {
       </div>
     </section>
     <div v-if="menu" class="cell-menu" role="menu" :style="{ left: `${menu.x}px`, top: `${menu.y}px` }" @contextmenu.prevent>
-      <button type="button" role="menuitem" @click="copySelection(); menu = null">{{ t("grid.menu.copy") }}</button>
-      <button type="button" role="menuitem" @click="copySqlValueSelected(); menu = null">{{ t("grid.value.copySqlValue") }}</button>
-      <button type="button" role="menuitem" @click="editFromMenu">{{ t("common.edit") }}</button>
-      <button type="button" role="menuitem" @click="setNullFromMenu">{{ t("grid.editor.setNull") }}</button>
+      <button type="button" role="menuitem" @click="copySelection(); menu = null"><Icon name="copy" />{{ t("grid.menu.copy") }}</button>
+      <button type="button" role="menuitem" @click="copySqlValueSelected(); menu = null"><Icon name="code" />{{ t("grid.value.copySqlValue") }}</button>
+      <button type="button" role="menuitem" @click="editFromMenu"><Icon name="pencil" />{{ t("common.edit") }}</button>
+      <button type="button" role="menuitem" @click="setNullFromMenu"><Icon name="x" />{{ t("grid.editor.setNull") }}</button>
       <p v-if="menuError" class="menu-error" role="alert">{{ menuError }}</p>
     </div>
     <div v-if="commitOpen && editSession" class="overlay" role="presentation">

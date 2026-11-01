@@ -85,12 +85,12 @@ describe("shell layout", () => {
     expect(title.find(".caption").exists()).toBe(false);
   });
 
-  it("shows activity rail icons without visible page names", async () => {
+  it("labels activity rail icons with their page names", async () => {
     const labels = ["工作台", "连接", "查询历史", "设置"] as const;
     const rail = mount(ActivityRail, { props: { page: "workspace" } });
     const buttons = rail.findAll(".rail-btn");
     expect(buttons).toHaveLength(labels.length);
-    for (const label of labels) expect(rail.text()).not.toContain(label);
+    for (const label of labels) expect(rail.text()).toContain(label);
     expect(buttons.map((button) => button.attributes("aria-label"))).toEqual([...labels]);
     expect(buttons.map((button) => button.attributes("title"))).toEqual([
       "工作台（再次点击切换资源管理器）",
@@ -284,7 +284,7 @@ describe("shell layout", () => {
     expect(items.some((item) => item.label === "保存当前查询")).toBe(true);
     expect(items.some((item) => item.label === "保存的查询")).toBe(true);
     const commands = filterPalette(items, ">主题", "all");
-    expect(commands.map((item) => item.label)).toEqual(["切换到浅色主题", "切换到深色主题", "主题跟随系统"]);
+    expect(commands.map((item) => item.label)).toEqual(["主题跟随系统", "切换到浅色主题", "切换到深色主题"]);
     expect(filterPalette(items, "customers", "tables")).toEqual([]);
     // 两条主路径同样能从命令面板直达
     expect(items.some((item) => item.label === "新建连接")).toBe(true);
@@ -304,7 +304,7 @@ describe("shell layout", () => {
     expect(css).not.toMatch(/font-size:\s*[\d.]+px/);
     expect(css).not.toMatch(/[\d.]+ms/);
     const narrow = css.slice(css.indexOf("@media (max-width: 720px)"));
-    expect(narrow).toContain(".rail-btn span { display: none; }");
+    expect(narrow).toContain(".rail-label { display: none; }");
   });
 
   it("puts the product title on the window and the html document", () => {

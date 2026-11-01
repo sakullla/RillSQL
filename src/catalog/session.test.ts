@@ -11,7 +11,9 @@ import {
   replaceCatalog,
   resetCatalog,
   revealMore,
+  schemaKey,
   setObjectPage,
+  shownCount,
   startCatalog,
 } from "./store";
 
@@ -210,6 +212,27 @@ describe("catalog session reads", () => {
     await pending;
     expect(secondStarted).toBe(true);
     expect(catalogConnections()[0]?.databases[0]?.schemas.some((schema) => schema.objects.some((item) => item.name === "metrics"))).toBe(true);
+  });
+
+  it("shows objects that arrive after the pending outline on a first connect", async () => {
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "catalog_sessions") return sessionInfo(["atlas"]);
+      if (command === "connections_list") return [saved("atlas", "postgres", "app")];
+      if (command === "env_tags_list") return [];
+      if (command === "catalog_refresh") return [outline("atlas", "postgres", [{ name: "app", schemas: ["public"] }])];
+      return {
+        objects: [
+          { name: "customers", kind: "table", estimatedRows: 2, stale: false },
+          { name: "orders", kind: "table", estimatedRows: 3, stale: false },
+        ],
+        total: 2,
+        error: null,
+      };
+    });
+    await refreshFromBackend();
+    expect(catalogConnections()[0]?.databases[0]?.schemas[0]?.objects).toHaveLength(2);
+    // 回归：占位阶段不能把「已显示 0 个」记下来，否则树里一张表都看不到。
+    expect(shownCount(schemaKey("atlas", "app", "public"), 2)).toBe(2);
   });
 
   it("reads again after an open session appears", async () => {

@@ -1,17 +1,18 @@
-/* RillSQL 设计令牌：Radix slate/iris 12 阶双主题、五层表面、实体质感。所有视觉值只从这里取。
-   色值取自 @radix-ui/colors 官方色表（slate/iris/grass/amber/red/blue/cyan，sRGB 步阶）。 */
+/* RillSQL 设计令牌「澄水」：品牌色取自应用图标的水色青绿，中性色带一丝青调。
+   所有视觉值只从这里取。窗框融入 app 画布，工作面（panel）是唯一的悬浮层级。 */
 :root {
   /* 字体：Inter Variable + JetBrains Mono 自托管（@font-face 见 fonts.css），CJK 回退栈不变 */
   --font: "Inter Variable", "Inter", "Segoe UI Variable Text", "Segoe UI", -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
   --mono: "JetBrains Mono", ui-monospace, "Cascadia Code", "SF Mono", Consolas, "Microsoft YaHei", monospace;
 
   /* 字号五档 */
-  --fs-xs: 11px;
-  --fs-sm: 12px;
-  --fs-md: 13px;
+  --fs-2xs: 10.5px; /* 只用于活动栏标签 */
+  --fs-xs: 11.5px;
+  --fs-sm: 12.5px;
+  --fs-md: 13.5px;
   --fs-lg: 15px;
   --fs-xl: 18px;
-  --fs-xxl: 15px; /* = --fs-lg：兼容 .page-head h1 的过渡别名，不是第六档 */
+  --fs-xxl: 18px; /* = --fs-xl：页面标题，不是第六档 */
   /* 行高 */
   --lh-tight: 1.3;
   --lh: 1.45;
@@ -50,233 +51,242 @@
   --z-toast: 400;
 
   /* 布局尺寸 */
-  --titlebar-h: 32px;
-  --toolbar-h: 38px;
+  --titlebar-h: 40px;
+  --toolbar-h: 44px;
   --status-h: 26px;
-  --rail-w: 50px;
-  --editor-font: 12px;
+  --rail-w: 60px;
+  --gutter: 6px; /* 工作面与窗框之间的留白 */
+  --editor-font: 13px;
 
-  /* 密度三档，默认 compact（紧凑桌面）：行 24 / 树 22 / 控件 28 */
-  --row-h: 24px;
-  --tree-h: 22px;
-  --control-h: 28px;
-  --control-h-sm: 24px;
+  /* 密度三档，默认 compact（紧凑桌面）：行 28 / 树 26 / 控件 30 */
+  --row-h: 28px;
+  --tree-h: 26px;
+  --control-h: 30px;
+  --control-h-sm: 26px;
 }
 
 :root[data-density="standard"] {
-  --row-h: 30px;
-  --tree-h: 28px;
+  --row-h: 32px;
+  --tree-h: 30px;
   --control-h: 34px;
   --control-h-sm: 30px;
 }
 
 :root[data-density="relaxed"] {
-  --row-h: 34px;
-  --tree-h: 32px;
+  --row-h: 36px;
+  --tree-h: 34px;
   --control-h: 38px;
   --control-h-sm: 34px;
 }
 
-/* ---------- 浅色主题（默认）：Radix slate 表面 + iris 强调（锚点 iris-9） ---------- */
+/* ---------- 浅色主题（默认）：雾白画布 + 纯白工作面 + 深水青强调 ---------- */
 :root,
 :root[data-theme="light"] {
   color-scheme: light;
 
-  /* 表面五层语义：app（应用画布）/ chrome（窗框与工具条）/ panel（内容面板与编辑器底）/ sunken（下沉井）/ overlay-surface（浮层） */
-  --surface-app: #f0f0f3;      /* slate-3 */
-  --surface-chrome: #f9f9fb;   /* slate-2 */
-  --surface-panel: #ffffff;    /* slate-1 上提纯白 */
-  --surface-sunken: #f0f0f3;   /* slate-3 */
-  --surface-overlay: #ffffff;  /* 菜单/对话框浮层 */
+  /* 表面五层语义：app（画布，窗框同面）/ chrome（工具条）/ panel（工作面）/ sunken（下沉井）/ overlay-surface（浮层） */
+  --surface-app: #e9eeee;
+  --surface-chrome: #f6f8f8;
+  --surface-panel: #ffffff;
+  --surface-sunken: #f1f4f4;
+  --surface-overlay: #ffffff;
   --bg: var(--surface-app);
   --chrome: var(--surface-chrome);
   --panel: var(--surface-panel);
-  --panel-2: #f9f9fb;          /* slate-2 */
+  --panel-2: #f6f8f8;
   --sunken: var(--surface-sunken);
-  --hover: #e8e8ec;            /* slate-4 */
-  --active: #e0e1e6;           /* slate-5 */
+  --hover: #e6ecec;
+  --active: #dbe3e3;
 
   /* 文本三级 */
-  --text: #1c2024;             /* slate-12 */
-  --text-2: #60646c;           /* slate-11 */
-  --text-3: #80838d;           /* slate-10 */
+  --text: #162322;
+  --text-2: #4d5e5c;
+  --text-3: #6c7d7b;
 
   /* 分隔线与内描边 */
-  --line: #e0e1e6;             /* slate-5 */
-  --line-2: #cdced6;           /* slate-7 */
-  --stroke: #d9d9e0;           /* slate-6：控件 1px 内描边 */
-  --stroke-strong: #cdced6;    /* slate-7：输入/焦点前描边 */
+  --line: #e2e8e8;
+  --line-2: #cfd9d8;
+  --stroke: #d8e0e0;
+  --stroke-strong: #c6d1d0;
 
-  /* 强调（iris，锚点 iris-9） */
-  --accent: #5b5bd6;           /* iris-9 */
-  --accent-hover: #5151cd;     /* iris-10 */
-  --accent-active: #5753c6;    /* iris-11 */
-  --accent-soft: #f0f1fe;      /* iris-3 */
-  --accent-text: #5753c6;      /* iris-11 */
+  /* 强调：与应用图标同色系 */
+  --accent: #0b7a70;
+  --accent-hover: #09685f;
+  --accent-active: #075850;
+  --accent-soft: #dff3ef;
+  --accent-text: #08665d;
   --on-accent: #ffffff;
 
-  /* 状态：ok / warn / err / info（正文取 11 阶，软底取 3 阶） */
-  --ok: #2a7e3b;               /* grass-11 */
-  --ok-soft: #e9f6e9;          /* grass-3 */
-  --warn: #ab6400;             /* amber-11 */
-  --warn-soft: #fff7c2;        /* amber-3 */
-  --warn-line: #f3d673;        /* amber-6 */
-  --err: #ce2c31;              /* red-11 */
-  --err-soft: #feebec;         /* red-3 */
-  --err-line: #fdbdbe;         /* red-6 */
-  --info: #0d74ce;             /* blue-11 */
-  --info-soft: #e6f4fe;        /* blue-3 */
+  /* 状态 */
+  --ok: #18794e;
+  --ok-soft: #dff3e6;
+  --warn: #925400;
+  --warn-soft: #fff1cf;
+  --warn-line: #efcf85;
+  --err: #cd2b31;
+  --err-soft: #fdeaea;
+  --err-line: #f6bcbd;
+  --info: #0b68cb;
+  --info-soft: #e3f0fd;
 
   /* 选中 */
-  --sel: rgba(91, 91, 214, 0.08);
-  --sel-strong: rgba(91, 91, 214, 0.16);
+  --sel: rgba(11, 122, 112, 0.09);
+  --sel-strong: rgba(11, 122, 112, 0.17);
 
   /* 焦点环与禁用态 */
-  --ring: rgba(91, 91, 214, 0.32);
-  --disabled-fg: #8b8d98;      /* slate-9 */
-  --disabled-bg: #f9f9fb;      /* slate-2 */
+  --ring: rgba(11, 122, 112, 0.28);
+  --disabled-fg: #8b9a98;
+  --disabled-bg: #eff3f3;
 
-  /* 阴影：只给浮层，面板不投影（柔化） */
-  --shadow-sm: 0 1px 2px rgba(28, 32, 36, 0.05), 0 1px 3px rgba(28, 32, 36, 0.03);
-  --shadow: 0 12px 32px rgba(28, 32, 36, 0.12), 0 2px 8px rgba(28, 32, 36, 0.06);
-  --shadow-lg: 0 24px 64px rgba(28, 32, 36, 0.20), 0 6px 16px rgba(28, 32, 36, 0.08);
+  /* 阴影：工作面极浅，浮层柔和 */
+  --shadow-panel: 0 1px 2px rgba(18, 38, 36, 0.05), 0 0 0 1px rgba(18, 38, 36, 0.05);
+  --shadow-sm: 0 1px 2px rgba(18, 38, 36, 0.06);
+  --shadow: 0 10px 28px rgba(18, 38, 36, 0.13), 0 2px 6px rgba(18, 38, 36, 0.06);
+  --shadow-lg: 0 24px 64px rgba(18, 38, 36, 0.22), 0 6px 16px rgba(18, 38, 36, 0.08);
 
   /* 按压态内阴影：中性 / 强调 / 危险。组件里不许硬编码颜色。 */
-  --press: rgba(28, 32, 36, 0.12);
-  --press-accent: rgba(28, 32, 36, 0.28);
-  --press-danger: rgba(206, 44, 49, 0.16);
+  --press: rgba(18, 38, 36, 0.12);
+  --press-accent: rgba(4, 40, 36, 0.32);
+  --press-danger: rgba(205, 43, 49, 0.16);
 
   /* 语法高亮（编辑器底为 --panel） */
-  --tk-kw: #5753c6;            /* iris-11 */
-  --tk-str: #ab6400;           /* amber-11 */
-  --tk-num: #0d74ce;           /* blue-11 */
-  --tk-com: #60646c;           /* slate-11 */
-  --tk-fn: #107d98;            /* cyan-11 */
-  --tk-id: #1c2024;            /* slate-12 */
+  --tk-kw: #6b3fc4;
+  --tk-str: #a14a00;
+  --tk-num: #0b68cb;
+  --tk-com: #5f706e;
+  --tk-fn: #08706b;
+  --tk-id: #162322;
 
   /* 环境标签色 */
-  --env-dev: #2a7e3b;          /* grass-11 */
-  --env-test: #0d74ce;         /* blue-11 */
-  --env-prod: #ce2c31;         /* red-11 */
-  --env-local: #5753c6;        /* iris-11 */
-  --env-none: #60646c;         /* slate-11 */
+  --env-dev: #18794e;
+  --env-test: #0b68cb;
+  --env-prod: #cd2b31;
+  --env-local: #6b3fc4;
+  --env-none: #4d5e5c;
 
   /* 引擎色 */
   --eng-postgres: #336791;
   --eng-mysql: #00758f;
   --eng-mariadb: #a85f35;
-  --eng-sqlite: #0d74ce;
+  --eng-sqlite: #0b68cb;
+  --eng-sqlserver: #b3261e;
+  --eng-redis: #c5281c;
+  --eng-mongodb: #13794b;
 
   /* 活动栏与页面遮罩：两套主题各自改写，组件里不再写死。 */
-  --nav-bg: #e8e8ec;           /* slate-4 */
-  --nav-fg: #60646c;           /* slate-11 */
-  --nav-active: #5753c6;       /* iris-11 */
-  --nav-hover: rgba(91, 91, 214, 0.08);
-  --nav-active-bg: rgba(91, 91, 214, 0.12);
-  --overlay: rgba(28, 32, 36, 0.32);
+  --nav-bg: #e9eeee;
+  --nav-fg: #4d5e5c;
+  --nav-active: #08665d;
+  --nav-hover: rgba(18, 38, 36, 0.06);
+  --nav-active-bg: #ffffff;
+  --overlay: rgba(16, 28, 27, 0.34);
 }
 
-/* ---------- 深色主题（深色优先设计，独立映射，不是机械反色） ---------- */
+/* ---------- 深色主题：深潭底 + 亮水青强调（独立设计，不是机械反色） ---------- */
 :root[data-theme="dark"] {
   color-scheme: dark;
 
-  /* 表面五层语义：panel 最亮、app/sunken 最深，overlay 略升 */
-  --surface-app: #111113;      /* slate-1 */
-  --surface-chrome: #18191b;   /* slate-2 */
-  --surface-panel: #212225;    /* slate-3 */
-  --surface-sunken: #111113;   /* slate-1：编辑器/井下沉 */
-  --surface-overlay: #2e3135;  /* slate-5：菜单/对话框浮层 */
+  /* 工作面最亮、画布最深，浮层再升一档 */
+  --surface-app: #0b1011;
+  --surface-chrome: #141b1c;
+  --surface-panel: #111718;
+  --surface-sunken: #0d1314;
+  --surface-overlay: #1b2425;
   --bg: var(--surface-app);
   --chrome: var(--surface-chrome);
   --panel: var(--surface-panel);
-  --panel-2: #272a2d;          /* slate-4 */
+  --panel-2: #161e1f;
   --sunken: var(--surface-sunken);
-  --hover: #2e3135;            /* slate-5 */
-  --active: #363a3f;           /* slate-6 */
+  --hover: #1f2a2b;
+  --active: #283536;
 
   /* 文本三级 */
-  --text: #edeef0;             /* slate-12 */
-  --text-2: #b0b4ba;           /* slate-11 */
-  --text-3: #777b84;           /* slate-10 */
+  --text: #e6eeed;
+  --text-2: #a4b4b2;
+  --text-3: #7e8f8d;
 
   /* 分隔线与内描边 */
-  --line: #2e3135;             /* slate-5 */
-  --line-2: #43484e;           /* slate-7 */
-  --stroke: #363a3f;           /* slate-6 */
-  --stroke-strong: #43484e;    /* slate-7 */
+  --line: #212c2d;
+  --line-2: #314040;
+  --stroke: #2a3738;
+  --stroke-strong: #394a4a;
 
-  /* 强调（iris 暗色映射：实体底仍是 iris-9 配白字，文本用 iris-11） */
-  --accent: #5b5bd6;           /* iris-9（暗色阶同值，配白字） */
-  --accent-hover: #6e6ade;     /* iris-10 dark */
-  --accent-active: #5151cd;    /* iris-10 light（按压回沉） */
-  --accent-soft: #202248;      /* iris-3 dark */
-  --accent-text: #b1a9ff;      /* iris-11 dark */
-  --on-accent: #ffffff;
+  /* 强调：实体底是亮水青，配深字 */
+  --accent: #2fcfba;
+  --accent-hover: #5adfcd;
+  --accent-active: #22b3a1;
+  --accent-soft: #0f2f2c;
+  --accent-text: #62e3d1;
+  --on-accent: #04211e;
 
   /* 状态 */
-  --ok: #71d083;               /* grass-11 dark */
-  --ok-soft: #1b2a1e;          /* grass-3 dark */
-  --warn: #ffca16;             /* amber-11 dark */
-  --warn-soft: #302008;        /* amber-3 dark */
-  --warn-line: #5c3d05;        /* amber-6 dark */
-  --err: #ff9592;              /* red-11 dark */
-  --err-soft: #3b1219;         /* red-3 dark */
-  --err-line: #72232d;         /* red-6 dark */
-  --info: #70b8ff;             /* blue-11 dark */
-  --info-soft: #0d2847;        /* blue-3 dark */
+  --ok: #5fd38d;
+  --ok-soft: #12291c;
+  --warn: #f5c04e;
+  --warn-soft: #2e2208;
+  --warn-line: #5c4412;
+  --err: #ff8f8c;
+  --err-soft: #331517;
+  --err-line: #6b2a2d;
+  --info: #72b8ff;
+  --info-soft: #10263f;
 
   /* 选中 */
-  --sel: rgba(91, 91, 214, 0.20);
-  --sel-strong: rgba(91, 91, 214, 0.32);
+  --sel: rgba(47, 207, 186, 0.11);
+  --sel-strong: rgba(47, 207, 186, 0.21);
 
   /* 焦点环与禁用态 */
-  --ring: rgba(91, 91, 214, 0.55);
-  --disabled-fg: #696e77;      /* slate-9 dark */
-  --disabled-bg: #272a2d;      /* slate-4 */
+  --ring: rgba(47, 207, 186, 0.36);
+  --disabled-fg: #5f6f6e;
+  --disabled-bg: #182021;
 
   /* 阴影 */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.40);
-  --shadow: 0 12px 32px rgba(0, 0, 0, 0.50), 0 2px 8px rgba(0, 0, 0, 0.32);
-  --shadow-lg: 0 24px 64px rgba(0, 0, 0, 0.60), 0 6px 16px rgba(0, 0, 0, 0.38);
+  --shadow-panel: 0 0 0 1px #1c2627;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow: 0 12px 32px rgba(0, 0, 0, 0.52), 0 2px 8px rgba(0, 0, 0, 0.34);
+  --shadow-lg: 0 24px 64px rgba(0, 0, 0, 0.62), 0 6px 16px rgba(0, 0, 0, 0.4);
 
   /* 按压态内阴影 */
-  --press: rgba(0, 0, 0, 0.40);
-  --press-accent: rgba(0, 0, 0, 0.36);
-  --press-danger: rgba(229, 72, 77, 0.20);
+  --press: rgba(0, 0, 0, 0.4);
+  --press-accent: rgba(0, 0, 0, 0.3);
+  --press-danger: rgba(229, 72, 77, 0.2);
 
   /* 语法高亮（编辑器底为 --panel） */
-  --tk-kw: #b1a9ff;            /* iris-11 dark */
-  --tk-str: #ffa057;           /* orange-11 dark */
-  --tk-num: #70b8ff;           /* blue-11 dark */
-  --tk-com: #b0b4ba;           /* slate-11 dark */
-  --tk-fn: #4ccce6;            /* cyan-11 dark */
-  --tk-id: #edeef0;            /* slate-12 dark */
+  --tk-kw: #b9a5ff;
+  --tk-str: #f5b071;
+  --tk-num: #72b8ff;
+  --tk-com: #84958f;
+  --tk-fn: #5adfcd;
+  --tk-id: #e6eeed;
 
   /* 环境标签色 */
-  --env-dev: #71d083;
-  --env-test: #70b8ff;
-  --env-prod: #ff9592;
-  --env-local: #b1a9ff;
-  --env-none: #b0b4ba;
+  --env-dev: #5fd38d;
+  --env-test: #72b8ff;
+  --env-prod: #ff8f8c;
+  --env-local: #b9a5ff;
+  --env-none: #a4b4b2;
 
   /* 引擎色 */
   --eng-postgres: #8bb3dc;
   --eng-mysql: #61c2d8;
   --eng-mariadb: #e09d7c;
   --eng-sqlite: #74b8ea;
+  --eng-sqlserver: #f28b82;
+  --eng-redis: #ff8a7a;
+  --eng-mongodb: #6fd39a;
 
   /* 活动栏与页面遮罩 */
-  --nav-bg: #111113;           /* slate-1 */
-  --nav-fg: #777b84;           /* slate-10 */
-  --nav-active: #b1a9ff;       /* iris-11 dark */
-  --nav-hover: rgba(91, 91, 214, 0.14);
-  --nav-active-bg: rgba(91, 91, 214, 0.22);
-  --overlay: rgba(4, 6, 10, 0.55);
+  --nav-bg: #0b1011;
+  --nav-fg: #8d9e9c;
+  --nav-active: #62e3d1;
+  --nav-hover: rgba(230, 238, 237, 0.06);
+  --nav-active-bg: #182223;
+  --overlay: rgba(2, 6, 6, 0.6);
 }
 
 /* ---------- SQL 编辑器命名配色（R5）：auto 不设 data-editor-theme，直接继承上方全局默认（浅/深各一套）。
    命名主题只改写 --tk-* 变量组，属性挂在查询页容器（QueryTab 根节点）上，不影响界面主题与其它区域；
-   每个命名主题按浅/深全局主题各给一套值（编辑器底为 --surface-sunken：浅 #f0f0f3 / 深 #111113），
+   每个命名主题按浅/深全局主题各给一套值（编辑器底为 --surface-panel：浅 #ffffff / 深 #111718），
    关键字/字符串/数字/注释四类令牌在两套底色下均拉开色相或明度差。 ---------- */
 [data-editor-theme="contrast"] {
   /* 高对比·浅：深靛蓝/深琥珀/深洋红/深青 + 近黑标识符，色相间距最大化 */

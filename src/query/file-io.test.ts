@@ -56,7 +56,7 @@ describe("query file io", () => {
     const input = wrapper.get("[data-action='open-file-input']");
     expect(input.attributes("accept")).toBe(".sql,.txt,text/plain");
     expect(input.attributes("type")).toBe("file");
-    expect(wrapper.get("[data-action='open-file']").text()).toBe("打开");
+    expect(wrapper.get("[data-action='open-file']").attributes("aria-label")).toBe("打开");
     wrapper.unmount();
   });
 

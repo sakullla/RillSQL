@@ -51,9 +51,9 @@ describe("desktop control base styles", () => {
     expect(css).toContain(".icon-btn:active:not(:disabled)");
   });
 
-  it("keeps focus rings at 2px and routes overlays through the z tokens", () => {
+  it("keeps visible focus rings and routes overlays through the z tokens", () => {
     // 输入框焦点环要锁在焦点规则本身，避免别处出现同款字符串就假通过
-    expect(block('input:not([type="checkbox"]):not([type="radio"]):focus,')).toContain("box-shadow: 0 0 0 2px var(--ring)");
+    expect(block('input:not([type="checkbox"]):not([type="radio"]):focus,')).toContain("box-shadow: 0 0 0 3px var(--ring)");
     expect(block(".menu {")).toContain("z-index: var(--z-menu)");
     expect(block(".tooltip {")).toContain("z-index: var(--z-float)");
     expect(block(".skip {")).toContain("z-index: var(--z-toast)");
@@ -61,15 +61,15 @@ describe("desktop control base styles", () => {
     expect(css).toContain("outline: 2px solid var(--accent)");
   });
 
-  it("uses square tags, compact menu rows, small page titles and a 12px body", () => {
+  it("uses square tags, compact menu rows, modest page titles and a 13.5px body", () => {
     expect(block(".badge {")).toContain("border-radius: var(--r-sm)");
     expect(block(".menu-item {")).toContain("height: var(--control-h-sm)");
     expect(block(".page-head h1 {")).toContain("font-size: var(--fs-xxl)");
     // 页面标题的字重是 Task 3 的改动，必须钉住
-    expect(block(".page-head h1 {")).toContain("font-weight: 600");
+    expect(block(".page-head h1 {")).toContain("font-weight: 650");
     expect(block(".empty {")).toContain("padding: var(--sp-6)");
     // base.css 里 `body {` 出现两次（html,body 重置 + 字体规则），block() 无法区分，改为全文断言同一条声明
-    expect(css).toContain("font: var(--fs-sm)/1 var(--font);");
+    expect(css).toContain("font: var(--fs-md)/1 var(--font);");
   });
 
   it("keeps menus on the panel token with the single menu-level shadow", () => {
@@ -89,7 +89,7 @@ describe("desktop control base styles", () => {
     expect(rule(workbench, ".app-root .grid-scroll {")).toContain("overflow: auto");
   });
 
-  it("keeps welcome and page titles on the 15px token", () => {
+  it("keeps welcome and page titles on the title token", () => {
     expect(block(".page-head h1 {")).toContain("font-size: var(--fs-xxl)");
     const welcomeTitle = rule(workbench, ".desk-heading h1 {");
     expect(welcomeTitle).toContain("font-size: var(--fs-xxl)");
@@ -97,6 +97,12 @@ describe("desktop control base styles", () => {
     expect(rule(workbench, ".page .page-head h1 {")).not.toMatch(/font-size:\s*[\d.]+px/);
     expect(workbench).not.toContain("font-size: 26px");
     expect(workbench).not.toContain("clamp(24px, 2.8vw, 36px)");
+  });
+
+  it("keeps the first-run primary card solid after the generic card rule", () => {
+    // 通用卡片规则把底色设成面板色；实心规则必须更靠后，否则首屏主按钮白底白字。
+    expect(workbench.indexOf(".desk-action.btn.primary {")).toBeGreaterThan(workbench.indexOf(".desk-action.btn {"));
+    expect(rule(workbench, ".desk-action.btn.primary {")).toContain("background: var(--accent)");
   });
 
   it("uses theme tokens for rail hover and page masks", () => {

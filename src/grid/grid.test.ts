@@ -323,6 +323,17 @@ function customerRow(id: number) {
   };
 }
 
+/** 筛选列与条件是 Listbox：打开后按选项值定位（条件的显示文字随语言变化，这里用序号映射）。 */
+const OP_LABELS: Record<string, string> = { between: "介于", in: "属于(in)" };
+async function pickFilter(wrapper: { get: (selector: string) => { trigger: (event: string) => Promise<void> }; findAll: (selector: string) => { text: () => string; trigger: (event: string) => Promise<void> }[] }, label: string, value: string) {
+  await wrapper.get(`[role=combobox][aria-label='${label}']`).trigger("click");
+  await flushPromises();
+  const wanted = OP_LABELS[value] ?? value;
+  const option = wrapper.findAll(".listbox-option").find((item) => item.text().includes(wanted));
+  await option!.trigger("click");
+  await flushPromises();
+}
+
 describe("grid views", () => {
   beforeEach(() => {
     invoke.mockReset();
@@ -373,8 +384,7 @@ describe("grid views", () => {
       message: "正在从已打开的连接导出",
       residualPath: null,
     });
-    const exportButton = wrapper.findAll("button").find((button) => button.text() === "导出");
-    await exportButton!.trigger("click");
+    await wrapper.get("button[aria-label='导出']").trigger("click");
     const dir = mkdtempSync(join(tmpdir(), "rillsql-grid-view-"));
     const requested = join(dir, "customers.csv");
     await wrapper.get("input[aria-label='导出路径']").setValue(requested);
@@ -394,8 +404,7 @@ describe("grid views", () => {
     expect(exportTasks.find((task) => task.id !== "stuck")?.status).toBe("done");
     expect(wrapper.get("[role='status']").text()).toContain("已导出 100 行");
     expect(wrapper.get("[role='status']").text()).toContain("customers（部分）.csv");
-    const again = wrapper.findAll("button").find((button) => button.text() === "导出");
-    await again!.trigger("click");
+    await wrapper.get("button[aria-label='导出']").trigger("click");
     await wrapper.get("input[value='full']").setValue(true);
     await wrapper.get("input[aria-label='导出路径']").setValue(join(dir, "all.csv"));
     const exportAll = wrapper.findAll("button").filter((button) => button.text() === "导出").at(-1)!;
@@ -725,7 +734,7 @@ describe("grid views", () => {
     await wrapper.get("input[aria-label='搜索关键字']").setValue("小河");
     await wrapper.findAll("button").find((button) => button.text() === "搜索")!.trigger("click");
     await flushPromises();
-    await wrapper.get("select[aria-label='筛选列']").setValue("name");
+    await pickFilter(wrapper, "筛选列", "name");
     await wrapper.get("input[aria-label='筛选值']").setValue("a");
     await wrapper.get("form.filter-form").trigger("submit");
     await flushPromises();
@@ -763,7 +772,7 @@ describe("grid views", () => {
     expect(wrapper.text()).toContain("客户1");
     expect(tabHasPending("table:shop:app:public:customers")).toBe(false);
     expect(anyPending()).toBe(false);
-    await wrapper.get("select[aria-label='筛选列']").setValue("name");
+    await pickFilter(wrapper, "筛选列", "name");
     await wrapper.get("input[aria-label='筛选值']").setValue("不存在");
     await wrapper.get("form.filter-form").trigger("submit");
     await flushPromises();
@@ -787,8 +796,8 @@ describe("grid views", () => {
     });
     const wrapper = mount(DataGrid, { props: { tabId: "table:filter-ops", draft: "", pageSize: 10, target: customersTarget } });
     await flushPromises();
-    await wrapper.get("select[aria-label='筛选列']").setValue("id");
-    await wrapper.get("select[aria-label='筛选条件']").setValue("between");
+    await pickFilter(wrapper, "筛选列", "id");
+    await pickFilter(wrapper, "筛选条件", "between");
     expect(wrapper.find("input[aria-label='筛选第二个值']").exists()).toBe(true);
     await wrapper.get("input[aria-label='筛选值']").setValue("1");
     await wrapper.get("input[aria-label='筛选第二个值']").setValue("9");
@@ -799,7 +808,7 @@ describe("grid views", () => {
     expect(wrapper.text()).toContain("1 ~ 9");
     await wrapper.get("button[aria-label='移除条件 1']").trigger("click");
     await flushPromises();
-    await wrapper.get("select[aria-label='筛选条件']").setValue("in");
+    await pickFilter(wrapper, "筛选条件", "in");
     expect(wrapper.find("input[aria-label='筛选值列表']").exists()).toBe(true);
     await wrapper.get("input[aria-label='筛选值列表']").setValue("1, 3 , ,5");
     await wrapper.get("form.filter-form").trigger("submit");
@@ -929,8 +938,7 @@ describe("grid views", () => {
     expect(wrapper.text()).toContain("结果没有读完");
     await wrapper.get("[aria-label='在已读取行中查找']").setValue("000-first");
     expect(wrapper.find("[data-row-id]").exists()).toBe(false);
-    const exportButton = wrapper.findAll("button").find((button) => button.text() === "导出");
-    await exportButton!.trigger("click");
+    await wrapper.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
     await wrapper.get("input[value='full']").setValue("full");
     expect(wrapper.text()).toContain("只有 SELECT 可以重新执行并完整导出");
     wrapper.unmount();

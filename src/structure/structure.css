@@ -15,7 +15,38 @@
   background: var(--panel);
 }
 .table-workspace { overflow: hidden; }
-.pane-switch,
+.table-workspace { position: relative; }
+/* 数据/结构分段控件：表数据页与筛选工具条同排，省掉一整行 */
+.pane-switch {
+  display: inline-flex;
+  align-self: flex-start;
+  gap: 2px;
+  margin: var(--sp-2);
+  padding: 2px;
+  border-radius: var(--r);
+  background: var(--sunken);
+}
+.table-workspace:has(.grid-toolbar) > .pane-switch { position: absolute; top: 0; left: 0; z-index: 1; }
+.table-workspace:has(.grid-toolbar) .grid-toolbar { padding-left: 176px; }
+.pane-switch button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-sm);
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.pane-switch button .i { width: 13px; height: 13px; }
+.pane-switch button:hover { color: var(--text); }
+.pane-switch button[aria-selected="true"] { background: var(--surface-panel); color: var(--text); font-weight: 600; box-shadow: var(--shadow-sm); }
+@media (max-width: 720px) {
+  .table-workspace:has(.grid-toolbar) > .pane-switch { position: static; }
+  .table-workspace:has(.grid-toolbar) .grid-toolbar { padding-left: var(--sp-2); }
+}
 .struct-nav {
   display: flex;
   align-items: center;
@@ -27,8 +58,10 @@
   border-bottom: 1px solid var(--line);
   flex-wrap: wrap;
 }
-.pane-switch button,
 .struct-nav button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   height: var(--control-h-sm);
   padding: 0 var(--sp-3);
   border-radius: var(--r);
@@ -37,9 +70,8 @@
   white-space: nowrap;
   transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
-.pane-switch button:hover,
+.struct-nav button .i { width: 14px; height: 14px; }
 .struct-nav button:hover { background: var(--hover); color: var(--text); }
-.pane-switch button[aria-selected="true"],
 .struct-nav button.on { background: var(--sel-strong); color: var(--accent-text); font-weight: 600; }
 .struct-nav button.danger { color: var(--err); }
 .struct-nav button.danger.on { background: var(--err-soft); }
@@ -51,7 +83,7 @@
   gap: var(--sp-4);
   min-width: 0;
   max-width: 100%;
-  padding: var(--sp-3) var(--sp-5);
+  padding: var(--sp-2) var(--sp-3);
   border-bottom: 1px solid var(--line);
   background: var(--panel);
 }
@@ -387,3 +419,7 @@
   .structure-pane .struct-nav { padding: 0 var(--sp-3); }
   .structure-pane .struct-body { padding: var(--sp-3); }
 }
+
+/* 建表 SQL 贴边展开，不再是悬在页面中间的卡片 */
+.struct-ddl.disclosure { border-width: 0 0 1px; border-radius: 0; background: var(--panel); }
+.struct-ddl.disclosure > summary { padding: var(--sp-2) var(--sp-3); border-radius: 0; font-size: var(--fs-sm); }

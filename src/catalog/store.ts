@@ -114,6 +114,8 @@ function rememberShown(list: CatalogConnection[]): void {
   for (const connection of list) {
     for (const database of connection.databases) {
       for (const schema of database.schemas) {
+        // 占位中的 schema 还没读到对象：此时记 0 会把随后到达的对象全部藏起来。
+        if (schema.pending) continue;
         const key = schemaKey(connection.id, database.name, schema.name);
         if (shown[key] === undefined) shown[key] = Math.min(page, schema.objects.length);
       }

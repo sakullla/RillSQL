@@ -7,14 +7,15 @@
 *::before,
 *::after { box-sizing: border-box; }
 * { scrollbar-width: thin; scrollbar-color: var(--line-2) transparent; }
-*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar { width: 11px; height: 11px; }
 *::-webkit-scrollbar-thumb { background: var(--line-2); border: 3px solid transparent; border-radius: 8px; background-clip: padding-box; }
 *::-webkit-scrollbar-thumb:hover { background: var(--text-3); border: 3px solid transparent; background-clip: padding-box; }
 *::-webkit-scrollbar-corner, *::-webkit-scrollbar-track { background: transparent; }
 html,
 body { height: 100%; margin: 0; max-width: 100%; }
 body {
-  font: var(--fs-sm)/1 var(--font);
+  font: var(--fs-md)/1 var(--font);
+  font-feature-settings: "cv11", "ss03";
   line-height: var(--lh);
   color: var(--text);
   background: var(--bg);
@@ -61,15 +62,31 @@ select {
   color: var(--text);
   font-size: var(--fs-sm);
   min-width: 0;
-  box-shadow: inset 0 1px 1px color-mix(in srgb, var(--press) 35%, transparent);
   transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
+}
+/* 原生下拉：去掉系统箭头，与 Listbox 同一套外观 */
+select {
+  appearance: none;
+  padding-right: 26px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-3) 50%), linear-gradient(135deg, var(--text-3) 50%, transparent 50%);
+  background-position: calc(100% - 14px) 50%, calc(100% - 10px) 50%;
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+}
+textarea {
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--stroke-strong);
+  border-radius: var(--r);
+  background: var(--surface-panel);
+  font-size: var(--fs-sm);
+  transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
 }
 input:not([type="checkbox"]):not([type="radio"]):not(:disabled):hover,
 select:not(:disabled):hover,
-textarea:not(:disabled):hover { border-color: var(--text-3); }
+textarea:not(:disabled):hover { border-color: var(--line-2); }
 input:not([type="checkbox"]):not([type="radio"]):focus,
 select:focus,
-textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--ring); }
+textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--ring); }
 input:disabled,
 select:disabled,
 textarea:disabled { background: var(--disabled-bg); color: var(--disabled-fg); border-color: var(--line); box-shadow: none; cursor: not-allowed; }
@@ -98,7 +115,7 @@ kbd {
   justify-content: center;
   gap: var(--sp-2);
   height: var(--control-h);
-  padding: 0 var(--sp-4);
+  padding: 0 var(--sp-3);
   border-radius: var(--r);
   border: 1px solid var(--stroke);
   background: var(--surface-panel);
@@ -117,7 +134,7 @@ kbd {
   border-color: transparent;
   color: var(--on-accent);
   font-weight: 600;
-  box-shadow: var(--shadow-sm), inset 0 1px 0 color-mix(in srgb, var(--on-accent) 24%, transparent);
+  box-shadow: var(--shadow-sm);
 }
 .btn.primary:disabled { background: var(--disabled-bg); color: var(--disabled-fg); border-color: var(--line); box-shadow: none; }
 .btn.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: transparent; }
@@ -128,7 +145,9 @@ kbd {
 .btn.danger { color: var(--err); }
 .btn.danger:hover:not(:disabled) { background: var(--err-soft); border-color: var(--err-line); }
 .btn.danger:active:not(:disabled) { background: var(--err-soft); border-color: var(--err-line); box-shadow: inset 0 1px 2px var(--press-danger); }
-.btn.sm { height: var(--control-h-sm); padding: 0 var(--sp-3); font-size: var(--fs-xs); gap: var(--sp-1); }
+.btn.sm { height: var(--control-h-sm); padding: 0 var(--sp-2); font-size: var(--fs-sm); gap: var(--sp-1); }
+.btn .i { width: 15px; height: 15px; }
+.btn.sm .i { width: 14px; height: 14px; }
 
 .icon-btn {
   width: var(--control-h);
@@ -144,6 +163,8 @@ kbd {
 .icon-btn:active:not(:disabled) { background: var(--active); box-shadow: inset 0 1px 2px var(--press); transform: translateY(.5px); }
 .icon-btn:disabled { color: var(--disabled-fg); background: none; }
 .icon-btn.sm { width: var(--control-h-sm); height: var(--control-h-sm); }
+.icon-btn.on { background: var(--sel-strong); color: var(--accent-text); }
+.toolbar-sep { width: 1px; height: 16px; margin: 0 var(--sp-1); background: var(--line-2); flex-shrink: 0; }
 
 /* ---------- 徽标 / badge：软底 + 同色系 1px 内描边 ---------- */
 .badge {
@@ -151,7 +172,7 @@ kbd {
   align-items: center;
   gap: var(--sp-1);
   min-height: 20px;
-  padding: 0 var(--sp-2);
+  padding: 0 6px;
   border-radius: var(--r-sm);
   background: var(--surface-sunken);
   color: var(--text-2);
@@ -228,19 +249,29 @@ details.disclosure > summary .muted { font-weight: 400; }
   font-size: var(--fs-xs);
   font-weight: 600;
   color: var(--envc);
-  background: color-mix(in srgb, var(--envc) 11%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--envc) 28%, transparent);
+  background: color-mix(in srgb, var(--envc) 12%, transparent);
   white-space: nowrap;
   flex-shrink: 0;
 }
-.env::before { content: ""; width: 6px; height: 6px; border-radius: 2px; background: var(--envc); }
-.env.xs { height: 18px; font-size: 11px; padding: 0 5px; gap: var(--sp-1); }
+.env::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--envc); }
+.env.xs { height: 18px; font-size: 11px; padding: 0 6px 0 5px; gap: var(--sp-1); }
 .env.xs::before { width: 5px; height: 5px; }
 .env-dev { --envc: var(--env-dev); }
 .env-test { --envc: var(--env-test); }
 .env-prod { --envc: var(--env-prod); }
 .env-local { --envc: var(--env-local); }
 .env-none { --envc: var(--env-none); }
+
+/* ---------- 引擎标记：--eng-* 令牌色软底 + 同色系内描边 ---------- */
+.eng { --engc: var(--text-2); display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: var(--r-sm); font: 700 10px/1 var(--font); letter-spacing: -0.02em; color: var(--engc); background: color-mix(in srgb, var(--engc) 14%, transparent); flex-shrink: 0; }
+.eng.lg { width: 34px; height: 34px; font-size: var(--fs-md); border-radius: var(--r-md); }
+.eng-postgres { --engc: var(--eng-postgres); }
+.eng-mysql { --engc: var(--eng-mysql); }
+.eng-mariadb { --engc: var(--eng-mariadb); }
+.eng-sqlite { --engc: var(--eng-sqlite); }
+.eng-sqlserver { --engc: var(--eng-sqlserver); }
+.eng-redis { --engc: var(--eng-redis); }
+.eng-mongodb { --engc: var(--eng-mongodb); }
 
 /* ---------- 连接状态点 ---------- */
 .conn-state { display: inline-flex; align-items: center; gap: 5px; font-size: var(--fs-xs); color: var(--text-2); white-space: nowrap; }
@@ -262,15 +293,15 @@ details.disclosure > summary .muted { font-weight: 400; }
 .page-inner { max-width: min(1180px, 100%); margin: 0 auto; padding: var(--sp-6) var(--sp-7) var(--sp-8); min-width: 0; }
 .page-inner.narrow { max-width: 920px; }
 .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: var(--sp-4); margin-bottom: var(--sp-6); flex-wrap: wrap; }
-.page-head h1 { font-size: var(--fs-xxl); margin: var(--sp-1) 0 var(--sp-2); font-weight: 600; letter-spacing: -0.01em; }
+.page-head h1 { font-size: var(--fs-xxl); margin: 0 0 2px; font-weight: 650; letter-spacing: -0.01em; }
 .page-head p { margin: 0; color: var(--text-2); max-width: 640px; line-height: var(--lh); }
 .eyebrow { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); font-weight: 600; color: var(--accent-text); }
 .eyebrow .i { width: 14px; height: 14px; }
 
 /* ---------- 设置页 ---------- */
 .set-sec { margin-bottom: var(--sp-7); }
-.set-sec h2 { font-size: var(--fs-md); color: var(--text-3); font-weight: 600; margin: 0 0 var(--sp-1); }
-.set-row { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-6); padding: var(--sp-4) 0; border-bottom: 1px solid var(--line); }
+.set-sec h2 { font-size: var(--fs-md); color: var(--text); font-weight: 600; margin: 0 0 var(--sp-1); }
+.set-row { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-6); padding: var(--sp-3) 0; border-bottom: 1px solid var(--line); }
 .set-text h4 { margin: 0 0 3px; font-size: var(--fs-md); font-weight: 600; }
 .set-text p { margin: 0; font-size: var(--fs-sm); color: var(--text-2); max-width: 520px; line-height: var(--lh); }
 .set-ctl { flex-shrink: 0; }
@@ -327,11 +358,10 @@ details.disclosure > summary .muted { font-weight: 400; }
   border: 1px solid var(--stroke);
   border-radius: var(--r-md);
   flex-wrap: wrap;
-  box-shadow: inset 0 1px 2px color-mix(in srgb, var(--press) 30%, transparent);
-}
-.seg-radio label { position: relative; display: flex; align-items: center; height: 26px; padding: 0 var(--sp-3); border-radius: var(--r); font-size: var(--fs-sm); color: var(--text-2); cursor: pointer; white-space: nowrap; transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease); }
+  }
+.seg-radio label { position: relative; display: flex; align-items: center; height: 26px; padding: 0 var(--sp-3); border-radius: var(--r-sm); font-size: var(--fs-sm); color: var(--text-2); cursor: pointer; white-space: nowrap; transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease); }
 .seg-radio input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
-.seg-radio label.on { background: var(--surface-panel); color: var(--text); box-shadow: var(--shadow-sm), inset 0 0 0 1px var(--stroke); font-weight: 500; }
+.seg-radio label.on { background: var(--surface-panel); color: var(--text); box-shadow: var(--shadow-sm); font-weight: 550; }
 .seg-radio label:focus-within { outline: 2px solid var(--accent); outline-offset: -1px; }
 
 /* ---------- 对话框：overlay 表面 + 大圆角 + lg 阴影 ---------- */
@@ -347,7 +377,7 @@ dialog.modal {
 }
 dialog.modal[open] { display: flex; flex-direction: column; animation: modal-in var(--dur) var(--ease-out); }
 .modal-lg { width: 780px; }
-dialog::backdrop { background: var(--overlay); backdrop-filter: blur(3px); }
+dialog::backdrop { background: var(--overlay); backdrop-filter: blur(2px); }
 .modal-head { display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line-2); }
 .modal-titles { flex: 1; min-width: 0; }
 .modal-head h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.01em; }
@@ -363,7 +393,7 @@ dialog::backdrop { background: var(--overlay); backdrop-filter: blur(3px); }
 .menu {
   position: fixed;
   z-index: var(--z-menu);
-  min-width: 180px;
+  min-width: 190px;
   max-height: calc(100vh - 16px);
   overflow: auto;
   background: var(--surface-overlay);
@@ -375,8 +405,8 @@ dialog::backdrop { background: var(--overlay); backdrop-filter: blur(3px); }
 }
 .menu-head { font-size: var(--fs-xs); color: var(--text-3); padding: var(--sp-2) var(--sp-2) var(--sp-1); font-weight: 600; }
 .menu-item { display: flex; align-items: center; gap: var(--sp-2); width: 100%; height: var(--control-h-sm); padding: 0 var(--sp-2); border-radius: var(--r-sm); font-size: var(--fs-sm); text-align: left; transition: background var(--dur-fast) var(--ease); }
-.menu-item:hover,
-.menu-item:focus { background: var(--active); }
+.menu-item:hover:not(:disabled),
+.menu-item:focus { background: var(--hover); }
 .menu-item:active:not(:disabled) { box-shadow: inset 0 1px 2px var(--press); }
 .menu-item:disabled { color: var(--disabled-fg); }
 .menu-item.danger { color: var(--err); }
@@ -384,6 +414,12 @@ dialog::backdrop { background: var(--overlay); backdrop-filter: blur(3px); }
 .menu-item .check { width: 14px; color: var(--accent); }
 .menu-sep { height: 1px; margin: var(--sp-1) var(--sp-2); background: var(--line-2); }
 .menu-key { margin-left: auto; font-size: var(--fs-xs); color: var(--text-3); font-family: var(--mono); }
+
+/* ---------- Toast：操作回执，右下角堆叠 ---------- */
+.toast-host { position: fixed; right: var(--sp-4); bottom: calc(var(--status-h) + var(--sp-3)); z-index: var(--z-toast); display: flex; flex-direction: column; align-items: flex-end; gap: var(--sp-1); pointer-events: none; }
+.toast { display: flex; align-items: center; gap: var(--sp-2); max-width: 360px; padding: var(--sp-2) var(--sp-3); border-radius: var(--r); background: var(--surface-overlay); color: var(--text); font-size: var(--fs-sm); box-shadow: var(--shadow), 0 0 0 1px var(--stroke); animation: pop-in var(--dur) var(--ease-out); }
+.toast::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex-shrink: 0; }
+.toast-err::before { background: var(--err); }
 
 /* ---------- 浮层入场动效 ---------- */
 @keyframes pop-in {

@@ -18,6 +18,9 @@ import { copyCellText, copySqlValue, needsFullRead, showCell, type NullCopy } fr
 import { referenceJump, referenceQuery } from "./reference";
 import { isPreviewEnvelope, rejectWrite, typeCaption, valueFamily } from "./typeset";
 import "./grid.css";
+import Icon from "../shell/Icon.vue";
+import { Listbox } from "../ui";
+import { toast } from "../ui/toast";
 import { useRowWindow } from "./virtual";
 import { LiveTable } from "./live";
 import type { TableTarget } from "./target";
@@ -67,6 +70,13 @@ watch(
   { immediate: true },
 );
 const filterOp = ref<FilterOp>("eq");
+const columnOptions = computed(() => columns.value.map((column) => ({ value: column.name, label: column.name })));
+const opOptions = computed(() => FILTER_OPS.map((op) => ({ value: op.id, label: opLabel(op.id) })));
+/** 手动收起值检视后，换一个单元格再重新展开。 */
+const inspectorHidden = ref(false);
+watch(() => [session?.selectedId, session?.selectedColumn], () => {
+  inspectorHidden.value = false;
+});
 const filterValue = ref("");
 const filterSecond = ref("");
 const filterValues = ref("");
@@ -576,6 +586,22 @@ function onCellEnter(row: string, column: string) {
   session?.select(row, column);
 }
 
+/** 右键「按此值筛选」：走与工具栏相同的整表筛选；大字段预览不是完整值，不提供。 */
+const menuValue = computed(() => (menu.value && session ? session.cellValue(menu.value.row, menu.value.column) : undefined));
+const canFilterByValue = computed(() => {
+  const value = menuValue.value;
+  return value !== undefined && !(typeof value === "string" && isPreviewEnvelope(value));
+});
+
+async function filterByValue() {
+  const current = menu.value;
+  if (!session || !current) return;
+  const value = menuValue.value;
+  menu.value = null;
+  const error = await session.addFilter(value === null ? { column: current.column, op: "null", value: "" } : { column: current.column, op: "eq", value: String(value) });
+  filterError.value = error ?? "";
+}
+
 function onCellMenu(row: string, column: string, event: MouseEvent) {
   event.preventDefault();
   if (!isPicked(row, column)) {
@@ -647,6 +673,7 @@ async function copySelection() {
   try {
     await navigator.clipboard.writeText(text);
     copyMessage.value = t("grid.value.copied");
+    toast(t("grid.menu.copiedCells", { n: points.length }));
   } catch {
     copyMessage.value = text;
   }
@@ -831,20 +858,17 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
   <div ref="rootEl" class="data-grid" :aria-label="t('grid.tableArea')" :data-tab-id="tabId" :data-draft="draft" :data-loaded="session ? session.loaded.length : 0" :data-truncated="session ? session.truncated : false">
     <p v-if="!session" class="grid-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ERROR_ICON" /></svg>{{ t("grid.unbound") }}</p>
     <template v-else>
+    <div class="grid-main">
     <div class="grid-toolbar">
       <span v-if="environmentLabel" class="env xs" data-env :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span>
       <form class="filter-form" @submit.prevent="applyFilter">
-        <select v-model="filterColumn" :aria-label="t('grid.filter.column')">
-          <option v-for="column in columns" :key="column.name" :value="column.name">{{ column.name }}</option>
-        </select>
-        <select v-model="filterOp" :aria-label="t('grid.filter.condition')">
-          <option v-for="op in FILTER_OPS" :key="op.id" :value="op.id">{{ opLabel(op.id) }}</option>
-        </select>
+        <Listbox v-model="filterColumn" :options="columnOptions" filterable :aria-label="t('grid.filter.column')" />
+        <Listbox :model-value="filterOp" :options="opOptions" :aria-label="t('grid.filter.condition')" @update:model-value="filterOp = $event as FilterOp" />
         <input v-if="opNeedsValue(filterOp)" v-model="filterValue" :aria-label="t('grid.filter.value')" :placeholder="filterOp === 'between' ? t('grid.filter.lowerBound') : undefined" />
         <input v-if="filterOp === 'between'" v-model="filterSecond" :aria-label="t('grid.filter.secondValue')" :placeholder="t('grid.filter.upperBound')" />
         <input v-if="filterOp === 'in'" v-model="filterValues" :aria-label="t('grid.filter.valueList')" :placeholder="t('grid.filter.valueListHint')" />
         <button class="btn sm" type="submit">{{ t("grid.filter.apply") }}</button>
-        <input v-model="searchDraft" type="search" :aria-label="t('grid.filter.searchKeyword')" :placeholder="t('grid.filter.searchPlaceholder')" @keydown.enter="onSearchEnter" />
+        <input v-model="searchDraft" type="search" :aria-label="t('grid.filter.searchKeyword')" :placeholder="t('grid.filter.searchPlaceholder')" :title="`${session.scopeLabel}${t('grid.filter.hintWholeTable')}`" @keydown.enter="onSearchEnter" />
         <button class="btn sm" type="button" @click="applySearch">{{ t("grid.filter.search") }}</button>
       </form>
       <span v-for="(filter, index) in session.filters" :key="`${filter.column}-${index}`" class="chip">
@@ -857,19 +881,20 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
       <span v-if="session.sort" class="chip">{{ session.sort.column }} {{ session.sort.direction === "asc" ? t("grid.filter.asc") : t("grid.filter.desc") }}
         <button class="chip-x" type="button" :aria-label="t('grid.filter.clearSort')" @click="session.clearSort()">×</button>
       </span>
-      <p class="toolbar-hint">{{ session.scopeLabel }}{{ t("grid.filter.hintWholeTable") }}</p>
+      <p class="sr">{{ session.scopeLabel }}{{ t("grid.filter.hintWholeTable") }}</p>
       <span class="grow"></span>
       <p v-if="noKeyHint" class="toolbar-hint key-hint">{{ noKeyHint }}</p>
-      <button class="btn sm" type="button" :disabled="!session.canInsert" @click="session.addRow()">{{ t("grid.toolbar.addRow") }}</button>
+      <button class="btn sm" type="button" :disabled="!session.canInsert" @click="session.addRow()"><Icon name="plus" />{{ t("grid.toolbar.addRow") }}</button>
       <button
         class="btn sm"
         type="button"
         :disabled="!session.canDeleteSelection()"
         :title="session.store.schema.key.length ? t('grid.toolbar.deleteRowTitle') : t('grid.toolbar.noKeyDeleteTitle')"
         @click="session.deleteSelected()"
-      >{{ t("grid.toolbar.deleteRow") }}</button>
-      <button class="btn sm" type="button" :disabled="session.store.schema.kind !== 'table'" @click="importOpen = true">{{ t("grid.toolbar.import") }}</button>
-      <button class="btn sm" type="button" @click="exportOpen = true">{{ t("grid.toolbar.export") }}</button>
+      ><Icon name="trash" />{{ t("grid.toolbar.deleteRow") }}</button>
+      <span class="toolbar-sep" aria-hidden="true"></span>
+      <button class="icon-btn" type="button" :aria-label="t('grid.toolbar.import')" :title="t('grid.toolbar.import')" :disabled="session.store.schema.kind !== 'table'" @click="importOpen = true"><Icon name="upload" /></button>
+      <button class="icon-btn" type="button" :aria-label="t('grid.toolbar.export')" :title="t('grid.toolbar.export')" @click="exportOpen = true"><Icon name="download" /></button>
     </div>
     <details v-if="(session.filters.length || session.sort || session.search) && session.sql" class="disclosure grid-sql">
       <summary>{{ t("grid.toolbar.viewSql") }}</summary>
@@ -949,8 +974,10 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
       <p v-for="failure in commitFailures" :key="failure.id" class="commit-failure" role="alert">{{ failure.message }}</p>
     </div>
     <p v-else-if="receipt" class="commit-receipt" role="status">{{ receipt }}</p>
-    <section v-if="session.selectedId" class="inspector" :aria-label="t('grid.value.viewer')">
+    </div>
+    <section v-if="session.selectedId && !inspectorHidden" class="inspector" :aria-label="t('grid.value.viewer')">
       <div class="inspector-meta">
+        <button class="icon-btn sm inspector-close" type="button" :aria-label="t('common.close')" :title="t('common.close')" @click="inspectorHidden = true"><Icon name="x" /></button>
         <span>{{ t("grid.value.column") }} <strong>{{ session.selectedColumn }}</strong></span>
         <span>{{ t("grid.value.value") }} <em :class="selectedShown.kind === 'null' ? 'v-null' : selectedShown.kind === 'empty' ? 'v-empty' : ''">{{ selectedShown.kind === "null" ? "NULL" : selectedShown.kind === "empty" ? t("grid.value.emptyTitle") : selectedShown.kind === "large" ? t("grid.value.largeCurrent") : selectedShown.title }}</em></span>
       </div>
@@ -1015,9 +1042,10 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
       @done="onImportDone"
     />
     <div v-if="menu" class="cell-menu" role="menu" :style="{ left: `${menu.x}px`, top: `${menu.y}px` }" @contextmenu.prevent>
-      <button type="button" role="menuitem" @click="copySelection(); menu = null">{{ t("grid.menu.copy") }}</button>
-      <button type="button" role="menuitem" @click="editFromMenu">{{ t("common.edit") }}</button>
-      <button type="button" role="menuitem" @click="setNullFromMenu">{{ t("grid.editor.setNull") }}</button>
+      <button type="button" role="menuitem" @click="copySelection(); menu = null"><Icon name="copy" />{{ t("grid.menu.copy") }}</button>
+      <button v-if="canFilterByValue" type="button" role="menuitem" data-action="filter-by-value" @click="filterByValue"><Icon name="filter" />{{ t("grid.menu.filterByValue") }}</button>
+      <button type="button" role="menuitem" @click="editFromMenu"><Icon name="pencil" />{{ t("common.edit") }}</button>
+      <button type="button" role="menuitem" @click="setNullFromMenu"><Icon name="x" />{{ t("grid.editor.setNull") }}</button>
       <button v-if="referenceMenuItem" type="button" role="menuitem" data-action="jump-reference" @click="jumpReferenceFromMenu">{{ t("grid.menu.jumpReference", { label: referenceMenuItem.label }) }}</button>
       <p v-if="menuError" class="menu-error" role="alert">{{ menuError }}</p>
     </div>

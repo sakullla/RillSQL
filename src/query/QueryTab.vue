@@ -9,7 +9,7 @@ import { Compartment, EditorState, Prec, StateEffect, StateField } from "@codemi
 import { Decoration, type DecorationSet, EditorView, keymap } from "@codemirror/view";
 import { basicSetup } from "codemirror";
 import ChordKeys from "../shell/ChordKeys.vue";
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, provide, ref, shallowRef, watch } from "vue";
 import { catalogConnections } from "../catalog/store";
 import { engineMeta } from "../connections/model";
 import { queryHistory, querySavedList, querySavedSave } from "../history/api";
@@ -114,6 +114,8 @@ let view: EditorView | undefined;
 let alive = true;
 
 const run = computed(() => tabRun(props.tabId));
+const resultTools = ref<HTMLElement | null>(null);
+provide("resultTools", resultTools);
 const running = computed(() => run.value?.status === "running" || run.value?.status === "cancel-requested");
 const options = computed(() => targetOptions(catalogConnections()));
 const knownIds = computed(() => new Set(catalogConnections().map((item) => item.id)));
@@ -253,9 +255,9 @@ const sendRangeField = StateField.define<DecorationSet>({
 
 /* 编辑器走 sunken 下沉井表面（tokens：编辑器/井下沉），与结果区的 panel 面板拉开层级。 */
 const shellTheme = EditorView.theme({
-  "&": { backgroundColor: "var(--surface-sunken)", color: "var(--text)", height: "100%" },
+  "&": { backgroundColor: "var(--surface-panel)", color: "var(--text)", height: "100%" },
   ".cm-content": { fontFamily: "var(--mono)", fontSize: "var(--editor-font)", caretColor: "var(--text)" },
-  ".cm-gutters": { backgroundColor: "var(--surface-sunken)", color: "var(--text-3)", borderRight: "1px solid var(--line)" },
+  ".cm-gutters": { backgroundColor: "var(--surface-panel)", color: "var(--text-3)", borderRight: "0" },
   "&.cm-focused": { outline: "none" },
 });
 
@@ -1061,6 +1063,32 @@ onBeforeUnmount(() => {
 <template>
   <section class="query-pane" :aria-label="t('query.editor.area')" :data-tab-id="tabId" :data-editor-theme="editorTheme === 'auto' ? undefined : editorTheme" :style="{ '--editor-share': `${editorPercent}%` }">
     <div class="q-toolbar">
+      <div v-if="!running" ref="runRoot" class="run-group">
+        <button class="btn primary run-main" type="button" data-action="run" :disabled="submitting" @click="execute('auto')"><Icon name="play" class="run-glyph" />{{ submitting ? t("query.run.submitting") : hasSelection ? t("query.run.runSelection") : t("query.run.run") }} <ChordKeys chord="Mod+Enter" /></button>
+        <button
+          class="btn run-more"
+          type="button"
+          data-action="run-menu"
+          :aria-label="t('query.run.more')"
+          aria-haspopup="menu"
+          :aria-expanded="runMenuOpen"
+          :disabled="submitting"
+          @click="toggleRunMenu"
+        >
+          <svg class="tg-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+        </button>
+        <div v-if="runMenuOpen" class="run-menu" role="menu" :aria-label="t('query.run.menu')" @keydown="onRunMenuKey">
+          <button class="run-item" type="button" role="menuitem" data-action="run-current" @click="execute('current')">
+            <span>{{ t("query.run.current") }}</span>
+            <small>{{ t("query.run.currentHint") }}</small>
+          </button>
+          <button class="run-item" type="button" role="menuitem" data-action="run-script" @click="execute('script')">
+            <span>{{ t("query.run.script") }}</span>
+            <small>{{ t("query.run.scriptHint") }}</small>
+          </button>
+        </div>
+      </div>
+      <button v-else class="btn danger" type="button" data-action="cancel" :disabled="run?.cancel === 'requested'" @click="cancel">{{ cancelButtonLabel }}</button>
       <div ref="targetRoot" class="q-target">
         <button
           class="target-btn"
@@ -1111,12 +1139,14 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <span v-if="connectionStatus" class="conn-state" :class="`st-${connectionStatus}`"><i></i>{{ connectionStatusText(connectionStatus) }}</span>
+      <span v-if="run" class="q-note" role="status">{{ runStatusLine }} · {{ run.elapsedMs }} ms</span>
       <span class="grow"></span>
-      <button class="btn" type="button" data-action="format" :title="t('query.toolbar.formatTitle')" @click="formatEditor"><Icon name="format" />{{ t("query.toolbar.format") }}</button>
-      <button class="btn" type="button" data-action="open-file" :title="t('query.toolbar.openTitle')" :disabled="running || submitting" @click="pickSqlFile"><Icon name="file" />{{ t("query.toolbar.open") }}</button>
+      <button class="icon-btn" type="button" data-action="format" :aria-label="t('query.toolbar.format')" :title="t('query.toolbar.formatTitle')" @click="formatEditor"><Icon name="format" /></button>
+      <button class="icon-btn" type="button" data-action="open-file" :aria-label="t('query.toolbar.open')" :title="t('query.toolbar.openTitle')" :disabled="running || submitting" @click="pickSqlFile"><Icon name="file" /></button>
       <input ref="openFileInput" class="hidden-file-input" type="file" data-action="open-file-input" :accept="SQL_FILE_ACCEPT" :aria-label="t('query.toolbar.openLabel')" @change="onSqlFile" />
+      <span class="toolbar-sep" aria-hidden="true"></span>
       <div ref="historyRoot" class="q-pop">
-        <button class="btn" type="button" data-action="history" :title="t('query.toolbar.historyTitle')" :disabled="running || submitting" @click="toggleHistoryPanel"><Icon name="history" />{{ t("query.toolbar.history") }}</button>
+        <button class="icon-btn" type="button" data-action="history" :aria-label="t('query.toolbar.history')" :title="t('query.toolbar.historyTitle')" :disabled="running || submitting" @click="toggleHistoryPanel"><Icon name="history" /></button>
         <div v-if="historyOpen" class="pop-menu history-menu" role="menu" :aria-label="t('query.history.menu')" @keydown="onHistoryKey">
           <div class="menu-head">{{ t("query.history.head") }}</div>
           <p v-if="historyError" class="pop-error" role="alert">{{ t("query.history.failed", { error: historyError }) }}<button class="btn sm" type="button" data-action="retry-history" @click="loadHistory">{{ t("query.history.retry") }}</button></p>
@@ -1135,7 +1165,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <div ref="savedRoot" class="q-pop">
-        <button class="btn" type="button" data-action="saved" :title="t('query.toolbar.saveTitle')" :disabled="running || submitting" @click="toggleSavedPanel"><Icon name="save" />{{ t("query.toolbar.save") }}</button>
+        <button class="icon-btn" type="button" data-action="saved" :aria-label="t('query.toolbar.save')" :title="t('query.toolbar.saveTitle')" :disabled="running || submitting" @click="toggleSavedPanel"><Icon name="save" /></button>
         <div v-if="savedOpen" class="pop-menu saved-menu" role="menu" :aria-label="t('query.saved.menu')" @keydown="onSavedKey">
           <form class="pop-form" @submit.prevent="saveNamedQuery">
             <label>{{ t("query.saved.saveAs") }}<input v-model="savedNameValue" type="text" :aria-label="t('query.saved.nameLabel')" data-action="saved-name" :placeholder="t('query.saved.namePlaceholder')" /></label>
@@ -1163,36 +1193,11 @@ onBeforeUnmount(() => {
           </template>
         </div>
       </div>
-      <button class="btn" type="button" data-action="plan" :title="t('query.toolbar.planTitle')" :disabled="running || submitting" @click="requestPlan"><Icon name="plan" />{{ t("query.toolbar.plan") }}</button>
-      <button class="btn" type="button" data-action="analyze" :title="t('query.toolbar.analyzeTitle')" :disabled="running || submitting" @click="requestAnalyze">{{ t("query.toolbar.analyze") }}</button>
-      <div v-if="!running" ref="runRoot" class="run-group">
-        <button class="btn primary run-main" type="button" data-action="run" :disabled="submitting" @click="execute('auto')"><Icon name="play" class="run-glyph" />{{ submitting ? t("query.run.submitting") : hasSelection ? t("query.run.runSelection") : t("query.run.run") }} <ChordKeys chord="Mod+Enter" /></button>
-        <button
-          class="btn run-more"
-          type="button"
-          data-action="run-menu"
-          :aria-label="t('query.run.more')"
-          aria-haspopup="menu"
-          :aria-expanded="runMenuOpen"
-          :disabled="submitting"
-          @click="toggleRunMenu"
-        >
-          <svg class="tg-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
-        </button>
-        <div v-if="runMenuOpen" class="run-menu" role="menu" :aria-label="t('query.run.menu')" @keydown="onRunMenuKey">
-          <button class="run-item" type="button" role="menuitem" data-action="run-current" @click="execute('current')">
-            <span>{{ t("query.run.current") }}</span>
-            <small>{{ t("query.run.currentHint") }}</small>
-          </button>
-          <button class="run-item" type="button" role="menuitem" data-action="run-script" @click="execute('script')">
-            <span>{{ t("query.run.script") }}</span>
-            <small>{{ t("query.run.scriptHint") }}</small>
-          </button>
-        </div>
-      </div>
-      <button v-else class="btn danger" type="button" data-action="cancel" :disabled="run?.cancel === 'requested'" @click="cancel">{{ cancelButtonLabel }}</button>
-      <span v-if="run" class="q-note" role="status">{{ runStatusLine }} · {{ run.elapsedMs }} ms</span>
+      <span class="toolbar-sep" aria-hidden="true"></span>
+      <button class="icon-btn" type="button" data-action="plan" :aria-label="t('query.toolbar.plan')" :title="t('query.toolbar.planTitle')" :disabled="running || submitting" @click="requestPlan"><Icon name="plan" /></button>
+      <button class="icon-btn" type="button" data-action="analyze" :aria-label="t('query.toolbar.analyze')" :title="t('query.toolbar.analyzeTitle')" :disabled="running || submitting" @click="requestAnalyze"><Icon name="clock" /></button>
     </div>
+    <div v-if="running" class="q-progress" role="presentation"></div>
     <div v-if="analyzePrompt" class="analyze-dialog" role="dialog" aria-modal="true" :aria-label="t('query.analyze.dialog')">
       <p>{{ t("query.analyze.prompt") }}</p>
       <div class="analyze-actions">
@@ -1228,7 +1233,13 @@ onBeforeUnmount(() => {
     <div class="editor-position"><span class="q-guide">{{ operationGuide }}</span><span class="mono">Ln {{ cursor.line }}, Col {{ cursor.column }}</span></div>
     <div class="query-splitter" role="separator" tabindex="0" :aria-label="t('query.editor.splitter')" aria-orientation="horizontal" :aria-valuenow="editorPercent" :aria-valuemin="20" :aria-valuemax="70" @pointerdown="resizeEditor" @keydown.up.prevent="editorPercent = Math.max(20, editorPercent - 5)" @keydown.down.prevent="editorPercent = Math.min(70, editorPercent + 5)"><span></span></div>
     <section class="q-results" :aria-label="t('query.results.area')">
-      <div class="results-heading"><span><Icon name="table" />{{ t("query.results.heading") }}</span><span v-if="run" class="q-summary" :data-status="run.status">{{ summary }}</span><span v-else class="muted">{{ t("query.results.waiting") }}</span><span class="grow"></span><span class="badge">{{ t("query.results.readonly") }}</span></div>
+      <div class="results-heading"><span><Icon name="table" />{{ t("query.results.heading") }}</span><span v-if="run" class="q-summary" :data-status="run.status">{{ summary }}</span><span v-else class="muted">{{ t("query.results.waiting") }}</span><span ref="resultTools" class="results-tools"></span><span class="badge">{{ t("query.results.readonly") }}</span></div>
+      <div v-if="!run" class="q-empty" data-query-empty>
+        <span class="action-icon"><Icon :name="connectionName ? 'play' : 'database'" /></span>
+        <b>{{ connectionName ? t("query.results.emptyReady") : t("query.results.emptyNoTarget") }}</b>
+        <p v-if="connectionName">{{ t("query.results.emptyReadyHint") }} <ChordKeys chord="Mod+Enter" /></p>
+        <p v-else>{{ t("query.results.emptyNoTargetHint") }}</p>
+      </div>
       <template v-if="run">
         <div v-if="run.statements.length > 1" class="result-tabs" role="tablist" :aria-label="t('query.results.statementTabs')"><button v-for="(statement, index) in run.statements" :key="index" role="tab" :aria-selected="resultIndex === index" @click="resultIndex = index">{{ t("query.run.statementTab", { n: index + 1 }) }} <span>{{ statement.columns.length ? t("query.run.statementRows", { n: statement.rows.length }) : statusLabel(statement.status) }}</span></button></div>
         <p v-if="run.pollError" class="q-note" role="alert">{{ t("query.run.pollErrorNote", { error: run.pollError }) }}</p>
@@ -1310,14 +1321,15 @@ onBeforeUnmount(() => {
 .query-pane { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 
 /* ---------- 工具条：chrome 层实体控件带 ---------- */
-.q-toolbar { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; padding: var(--sp-2) var(--sp-3); min-height: calc(var(--control-h) + var(--sp-3)); border-bottom: 1px solid var(--line); background: var(--surface-chrome); }
+.q-toolbar { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; padding: var(--sp-1) var(--sp-2); min-height: var(--toolbar-h); border-bottom: 1px solid var(--line); background: var(--surface-panel); }
+.q-toolbar .icon-btn { width: 28px; height: 28px; }
 .q-toolbar .btn :deep(.i) { width: 14px; height: 14px; color: var(--text-3); }
 .q-target { position: relative; min-width: 0; }
-.target-btn { display: flex; align-items: center; gap: var(--sp-2); height: var(--control-h); max-width: 420px; min-width: 0; padding: 0 var(--sp-2); border: 1px solid var(--stroke); border-radius: var(--r); background: var(--surface-panel); font-size: var(--fs-sm); box-shadow: var(--shadow-sm); transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease); }
+.target-btn { display: flex; align-items: center; gap: var(--sp-2); height: var(--control-h); max-width: 420px; min-width: 0; padding: 0 var(--sp-2) 0 var(--sp-1); border: 1px solid transparent; border-radius: var(--r); background: transparent; font-size: var(--fs-sm); transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease); }
 .target-btn:hover:not(:disabled) { border-color: var(--stroke-strong); background: var(--hover); }
 .target-btn:active:not(:disabled) { background: var(--active); box-shadow: inset 0 1px 2px var(--press); }
 .target-btn.on { border-color: var(--accent); box-shadow: 0 0 0 2px var(--ring); }
-.target-btn.none { border-style: dashed; color: var(--text-2); }
+.target-btn.none { border: 1px dashed var(--line-2); color: var(--text-2); padding-left: var(--sp-2); }
 .target-btn:disabled { opacity: 0.7; cursor: not-allowed; }
 .tg-name { font-weight: 600; white-space: nowrap; }
 .tg-db { display: inline-flex; align-items: center; gap: var(--sp-1); min-width: 0; color: var(--text-2); }
@@ -1347,12 +1359,12 @@ onBeforeUnmount(() => {
 /* ---------- 执行拆分按钮：主段 primary + 更多段同色系延伸（不带 primary 类） ---------- */
 .run-group { position: relative; display: flex; }
 .run-group .run-main { border-radius: var(--r) 0 0 var(--r); }
-.run-group .run-more { border-radius: 0 var(--r) var(--r) 0; margin-left: -1px; padding: 0 var(--sp-2); border-color: transparent; background: var(--accent); color: var(--on-accent); box-shadow: var(--shadow-sm), inset 0 1px 0 color-mix(in srgb, var(--on-accent) 24%, transparent), inset 1px 0 0 color-mix(in srgb, var(--on-accent) 22%, transparent); }
+.run-group .run-more { border-radius: 0 var(--r) var(--r) 0; margin-left: -1px; padding: 0 6px; border-color: transparent; background: var(--accent); color: var(--on-accent); box-shadow: var(--shadow-sm), inset 1px 0 0 color-mix(in srgb, var(--on-accent) 26%, transparent); }
 .run-group .run-more:hover:not(:disabled) { background: var(--accent-hover); border-color: transparent; }
 .run-group .run-more:active:not(:disabled) { background: var(--accent-active); box-shadow: inset 0 1px 2px var(--press-accent); }
 .run-group .run-more:disabled { background: var(--disabled-bg); color: var(--disabled-fg); border-color: var(--line); box-shadow: none; }
 .run-group .run-more .tg-caret { margin-left: 0; color: var(--on-accent); }
-.run-glyph { width: 13px; height: 13px; }
+.q-toolbar .run-main :deep(.run-glyph) { width: 13px; height: 13px; color: inherit; fill: currentColor; }
 .run-menu { min-width: 220px; }
 .run-item { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; padding: var(--sp-2); border-radius: var(--r); text-align: left; font-size: var(--fs-sm); }
 .run-item:hover { background: var(--hover); }
@@ -1382,47 +1394,61 @@ onBeforeUnmount(() => {
 .pop-form .btn { align-self: flex-start; }
 
 /* ---------- 提示条 / 横幅 ---------- */
-.q-note, .q-hint, .q-banner { margin: 0; font-size: var(--fs-sm); color: var(--text-2); }
-.q-hint, .q-banner { padding: var(--sp-1) var(--sp-4); }
+.q-note, .q-hint, .q-banner { margin: 0; font-size: var(--fs-xs); color: var(--text-2); }
+.q-toolbar .q-note { color: var(--text-3); white-space: nowrap; }
+.q-results .q-note { padding: var(--sp-1) var(--sp-3); }
+.q-hint, .q-banner { padding: var(--sp-1) var(--sp-3); }
+.q-toolbar { position: relative; }
+/* 运行中：工作面下缘一条流动细线，不打断阅读 */
+.q-progress { position: relative; height: 2px; margin-bottom: -2px; flex-shrink: 0; overflow: hidden; z-index: 2; }
+.q-progress::after { content: ""; position: absolute; inset: 0 auto 0 0; width: 34%; border-radius: var(--r-full); background: var(--accent); animation: q-flow 1.2s var(--ease) infinite; }
+@keyframes q-flow { from { transform: translateX(-100%); } to { transform: translateX(300%); } }
+.q-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--sp-1); min-height: 0; padding: var(--sp-4); color: var(--text-2); text-align: center; }
+.q-empty .action-icon { margin-bottom: var(--sp-2); }
+.q-empty b { font-size: var(--fs-md); font-weight: 600; color: var(--text); }
+.q-empty p { display: inline-flex; align-items: center; gap: var(--sp-2); margin: 0; font-size: var(--fs-sm); }
 .q-banner { display: flex; align-items: center; gap: var(--sp-2); color: var(--text); background: var(--surface-sunken); box-shadow: inset 2px 0 0 var(--line-2); }
 .q-banner .i { width: 14px; height: 14px; flex-shrink: 0; }
 /* 错误横幅与全局 err 模式一致：软底卡 + 同色 3px 左缘 + 语义图标 */
 .q-banner.is-error { color: var(--err); background: var(--err-soft); box-shadow: inset 3px 0 0 var(--err); }
 
 /* ---------- 编辑器：sunken 下沉井 ---------- */
-.query-pane .cm-host { flex: 0 1 var(--editor-share); min-height: 90px; margin: var(--sp-2) var(--sp-3) 0; border: 1px solid var(--line); border-radius: var(--r-md); overflow: hidden; background: var(--surface-sunken); box-shadow: inset 0 1px 2px color-mix(in srgb, var(--press) 24%, transparent); }
-.query-pane :deep(.cm-content) { padding-top: var(--sp-3); line-height: 1.8; }
-.query-pane :deep(.cm-line) { padding-left: var(--sp-4); }
-.query-pane :deep(.cm-gutters) { background: var(--surface-sunken); color: var(--text-3); border-right: 1px solid var(--line); min-width: 44px; }
-.query-pane :deep(.cm-activeLine), .query-pane :deep(.cm-activeLineGutter) { background: var(--sel); }
+.query-pane .cm-host { flex: 0 1 var(--editor-share); min-height: 90px; overflow: hidden; background: var(--surface-panel); }
+.query-pane :deep(.cm-content) { padding-top: var(--sp-2); line-height: 1.7; }
+.query-pane :deep(.cm-line) { padding-left: var(--sp-3); }
+.query-pane :deep(.cm-gutters) { min-width: 40px; }
+.query-pane :deep(.cm-activeLine), .query-pane :deep(.cm-activeLineGutter) { background: color-mix(in srgb, var(--text) 4%, transparent); }
 .query-pane :deep(.cm-activeLineGutter) { color: var(--text); }
 .query-pane :deep(.cm-cursor) { border-left-color: var(--accent); }
 .query-pane :deep(.cm-selectionBackground), .query-pane :deep(.cm-focused .cm-selectionBackground) { background: var(--sel-strong) !important; }
-.query-pane :deep(.cm-send-range) { background: color-mix(in srgb, var(--accent) 22%, transparent); border-radius: 2px; }
-.editor-position { display: flex; justify-content: space-between; align-items: center; gap: var(--sp-2); padding: var(--sp-1) var(--sp-4); color: var(--text-3); font-size: var(--fs-xs); }
+.query-pane :deep(.cm-send-range) { background: color-mix(in srgb, var(--accent) 9%, transparent); border-radius: 2px; }
+/* 折叠标记自绘，不依赖系统字体里有没有 ⌄ 字形 */
+.query-pane :deep(.cm-foldGutter span[title]) { display: inline-block; width: 6px; height: 6px; margin: 0 4px; font-size: 0; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: translateY(-2px) rotate(45deg); opacity: .7; }
+.query-pane :deep(.cm-foldGutter span[title="Unfold line"]) { transform: rotate(-45deg); }
+.editor-position { display: flex; justify-content: space-between; align-items: center; gap: var(--sp-2); padding: 3px var(--sp-3); color: var(--text-3); font-size: var(--fs-xs); }
 .q-guide { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 
 /* ---------- 分隔条：chrome 层抓手 ---------- */
-.query-splitter { height: 9px; flex-shrink: 0; display: grid; place-items: center; background: var(--surface-chrome); border-block: 1px solid var(--line); cursor: row-resize; touch-action: none; transition: background var(--dur-fast) var(--ease); }
-.query-splitter span { height: 3px; width: 34px; background: var(--line-2); border-radius: var(--r-full); transition: background var(--dur-fast) var(--ease); }
-.query-splitter:hover, .query-splitter:focus-visible { background: var(--accent-soft); }
-.query-splitter:hover span, .query-splitter:focus-visible span { background: var(--accent); }
+.query-splitter { position: relative; z-index: 1; height: 1px; margin-block: -3px; padding-block: 3px; box-sizing: content-box; flex-shrink: 0; display: grid; place-items: center; background: var(--line); background-clip: content-box; cursor: row-resize; touch-action: none; transition: background var(--dur-fast) var(--ease); }
+.query-splitter span { display: none; }
+.query-splitter:hover, .query-splitter:focus-visible { background-color: var(--accent); padding-block: 2px; height: 3px; }
 
 /* ---------- 结果区：panel 层 ---------- */
 .query-pane .q-results { flex: 1; min-height: 130px; padding: 0; gap: 0; border: 0; background: var(--surface-panel); }
 .q-results { min-height: 120px; overflow: auto; border-top: 1px solid var(--line); padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); }
-.results-heading { display: flex; align-items: center; gap: var(--sp-4); padding: var(--sp-2) var(--sp-4); border-bottom: 1px solid var(--line); font-size: var(--fs-xs); flex-shrink: 0; background: var(--surface-chrome); color: var(--text-2); }
+.results-heading { display: flex; align-items: center; gap: var(--sp-3); min-height: 36px; padding: 0 var(--sp-3); border-bottom: 1px solid var(--line); font-size: var(--fs-xs); flex-shrink: 0; background: var(--surface-panel); color: var(--text-2); }
 .results-heading > span:first-child { display: inline-flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); font-weight: 600; color: var(--text); }
 .results-heading > span:first-child :deep(.i) { width: 14px; height: 14px; color: var(--text-3); }
 .q-summary { margin: 0; font-size: var(--fs-md); font-weight: 600; color: var(--text); }
 .q-summary[data-status="error"] { color: var(--err); }
+.results-heading .q-summary { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40%; }
 .q-summary[data-status="unknown"] { color: var(--warn); }
 .results-heading .q-summary { font-size: var(--fs-xs); font-weight: 500; color: var(--text-2); }
 .results-heading .q-summary[data-status="error"] { color: var(--err); }
 .results-heading .q-summary[data-status="unknown"] { color: var(--warn); }
 
 /* 语句结果页签：下缘指示条与结果区上缘连成一体 */
-.result-tabs { display: flex; flex-shrink: 0; gap: 2px; padding: 0 var(--sp-3); border-bottom: 1px solid var(--line); overflow: auto; background: var(--surface-chrome); }
+.result-tabs { display: flex; flex-shrink: 0; gap: 2px; padding: 0 var(--sp-2); border-bottom: 1px solid var(--line); overflow: auto; background: var(--surface-panel); }
 .result-tabs button { padding: var(--sp-2) var(--sp-3); font-size: var(--fs-xs); color: var(--text-2); white-space: nowrap; border-bottom: 2px solid transparent; border-radius: var(--r-sm) var(--r-sm) 0 0; transition: color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease); }
 .result-tabs button:hover { color: var(--text); border-bottom-color: var(--line-2); background: var(--hover); }
 .result-tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); background: var(--surface-panel); box-shadow: 0 1px 0 0 var(--surface-panel); }
@@ -1438,6 +1464,7 @@ onBeforeUnmount(() => {
 
 /* 详情披露与逐条语句时间线 */
 .q-details { flex-shrink: 0; font-size: var(--fs-sm); border: 0; border-top: 1px solid var(--line); border-radius: 0; background: var(--surface-panel); }
+.q-details .disclosure-body { padding: var(--sp-1) var(--sp-3) var(--sp-3); }
 .q-details .disclosure-body { max-height: 180px; overflow: auto; }
 .q-timeline { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
 .q-step { display: flex; flex-direction: column; gap: var(--sp-1); }
@@ -1460,6 +1487,7 @@ onBeforeUnmount(() => {
 .variable-fields label { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-xs); color: var(--text-2); }
 .variable-fields input { font-family: var(--mono); }
 
-.run-main :deep(kbd) { background: transparent; color: inherit; opacity: .75; border-color: currentColor; box-shadow: none; }
+.run-main :deep(kbd) { background: transparent; color: inherit; opacity: .7; border-color: currentColor; box-shadow: none; }
+.q-details > summary { padding: var(--sp-1) var(--sp-3); font-size: var(--fs-xs); }
 @media (max-width: 800px) { .run-main :deep(.kbd) { display: none; } .target-btn { max-width: 290px; } .q-toolbar .conn-state { display: none; } .editor-position > span:first-child { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; } }
 </style>

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { OpenOutcome } from "../connections/api";
-import { fetchDefinition, focusDatabase, listConnections, openConnection } from "./backend";
+import { disconnectConnection, fetchDefinition, focusDatabase, listConnections, openConnection } from "./backend";
 import { browseSql, qualifiedObjectName, type CatalogObjectRef } from "./object-ref";
 import type { DiagramOpen } from "../diagram/types";
 import { engineMeta } from "../engines";
@@ -11,6 +11,7 @@ import type { RedisApi } from "../redis/api";
 import SchemaBlock from "./SchemaBlock.vue";
 import { catalogConnections, catalogLoadError, refreshCatalog, schemaKey, setStructureFocus } from "./store";
 import { tr as t } from "../i18n";
+import { toast } from "../ui/toast";
 import { codeHint, codeMessage } from "../i18n/backend-error";
 import { stageKindLabel } from "../connections/model";
 import { engineShape, isConnected, isDefinitionKind, kindLabel, objectKey, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
@@ -26,9 +27,13 @@ const emit = defineEmits<{
   "open-keys": [connection: CatalogConnection, key: string];
   "open-docs": [connection: CatalogConnection, database: string, collection: string];
   "new-connection": [];
+  "new-query": [connection: CatalogConnection, database: string];
 }>();
 const menu = ref<{ object: CatalogObjectRef; x: number; y: number; notice: string } | null>(null);
+const connMenu = ref<{ connection: CatalogConnection; x: number; y: number } | null>(null);
 const selectedKey = ref<string | null>(null);
+/** 选中项所在的 连接/库/schema：同名表可以同时存在于多个连接，只比键会让它们一起高亮。 */
+const selectedOwner = ref("");
 const refreshing = ref(false);
 const focusing = ref<string | null>(null);
 const focusTarget = ref<string | null>(null);
@@ -57,6 +62,9 @@ const ICONS = {
   error: "M2 12a10 10 0 1 0 20 0 10 10 0 1 0-20 0M15 9l-6 6M9 9l6 6",
   warn: "M12 3.5 2.5 20h19ZM12 10v4.5M12 17.5h.01",
   refresh: "M20 12a8 8 0 1 1-2.4-5.7M20 3.5V8h-4.5",
+  plus: "M12 5v14M5 12h14",
+  collapse: "M8 4l4 4 4-4M8 20l4-4 4 4M4 12h16",
+  newQuery: "M4 17l6-5-6-5M12 19h4M19 12v6M16 15h6",
   diagram: "M4 5h6v5H4zM14 5h6v5h-6zM9 16h6v5H9zM7 10v3h10v-3M12 13v3",
   structure: "M4 4h16v16H4zM4 10h16M10 10v10",
   query: "M6 4h12v16H6zM9 8h6M9 12h6M9 16h3",
@@ -78,6 +86,7 @@ function statusText(status: string): string {
 }
 
 const connections = computed(() => catalogConnections());
+const connectedCount = computed(() => connections.value.filter((item) => isConnected(item.status)).length);
 const loadError = computed(() => catalogLoadError());
 const matches = computed(() => searchObjects(connections.value, props.filter));
 const expanded = ref<Record<string, boolean>>({});
@@ -113,6 +122,10 @@ function open(key: string): boolean {
 
 function toggle(key: string) {
   expanded.value = { ...expanded.value, [key]: !open(key) };
+}
+
+function collapseAll() {
+  expanded.value = Object.fromEntries(Object.keys(expanded.value).map((key) => [key, false]));
 }
 
 function onConnectionRow(connection: CatalogConnection) {
@@ -273,8 +286,23 @@ function memberSelection(row: HTMLElement): string {
   return `member:${row.dataset.key ?? ""}:${row.dataset.section ?? "columns"}:${row.dataset.member ?? ""}`;
 }
 
+function ownerOf(connectionId: string, database: string, schema: string): string {
+  return [connectionId, database, schema].join("\u0001");
+}
+
+function selectRow(key: string, object: CatalogObjectRef | null) {
+  selectedKey.value = key;
+  selectedOwner.value = object ? ownerOf(object.connectionId, object.database, object.schema) : "";
+}
+
+function selectedIn(connectionId: string, database: string, schema: string): string | undefined {
+  if (!selectedKey.value || selectedOwner.value !== ownerOf(connectionId, database, schema)) return undefined;
+  return selectedKey.value;
+}
+
 function closeMenu() {
   menu.value = null;
+  connMenu.value = null;
 }
 
 function openObject(object: CatalogObjectRef | null, pane: "data" | "structure", section?: "columns" | "drop") {
@@ -297,12 +325,12 @@ function onTreeClick(event: MouseEvent) {
   const row = rowOf(event.target);
   if (!row) return;
   if (row.dataset.level === "member") {
-    selectedKey.value = memberSelection(row);
+    selectRow(memberSelection(row), readRef(row));
     return;
   }
   const object = readRef(row);
   if (!object) return;
-  selectedKey.value = objectKey(object);
+  selectRow(objectKey(object), object);
 }
 
 /** 树行可用键盘到达：Enter 打开，空格选择/展开，Shift+F10 打开对象菜单。 */
@@ -311,6 +339,19 @@ function onTreeKeydown(event: KeyboardEvent) {
   if (!(target instanceof Element) || target.closest("button")) return;
   const row = target.closest<HTMLElement>(".tree-row");
   if (!row) return;
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const rows = [...(row.closest(".tree")?.querySelectorAll<HTMLElement>(".tree-row") ?? [])];
+    rows[rows.indexOf(row) + (event.key === "ArrowDown" ? 1 : -1)]?.focus();
+    return;
+  }
+  if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+    const state = row.getAttribute("aria-expanded");
+    if (state === null) return;
+    event.preventDefault();
+    if ((state === "true") !== (event.key === "ArrowRight")) row.querySelector<HTMLElement>(":scope > .tw")?.click();
+    return;
+  }
   if (event.key === "Enter") {
     event.preventDefault();
     row.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -346,7 +387,7 @@ function onTreeDblClick(event: MouseEvent) {
     const section = row.dataset.section === "indexes" ? "indexes" : "columns";
     const name = row.dataset.member ?? "";
     if (!name) return;
-    selectedKey.value = memberSelection(row);
+    selectRow(memberSelection(row), object);
     structureNotice.value = "";
     setStructureFocus({
       connectionId: object.connectionId,
@@ -359,7 +400,7 @@ function onTreeDblClick(event: MouseEvent) {
     emit("open-object", object, "structure", "columns");
     return;
   }
-  selectedKey.value = objectKey(object);
+  selectRow(objectKey(object), object);
   if (isRoutine(object)) {
     emit("open-definition", object);
     return;
@@ -367,8 +408,62 @@ function onTreeDblClick(event: MouseEvent) {
   openObject(object, "data");
 }
 
+function queryDatabase(connection: CatalogConnection): string | null {
+  if (!engineMeta(connection.engine).relational) return null;
+  return connection.defaultDatabase || connection.databases[0]?.name || null;
+}
+
+function onConnQuery(connection: CatalogConnection) {
+  const database = queryDatabase(connection);
+  closeMenu();
+  if (database !== null) emit("new-query", connection, database);
+}
+
+function onConnConnect(connection: CatalogConnection) {
+  closeMenu();
+  expanded.value = { ...expanded.value, [`c:${connection.id}`]: true };
+  void connectSession(connection);
+}
+
+async function onConnDisconnect(connection: CatalogConnection) {
+  closeMenu();
+  try {
+    await disconnectConnection(connection.id);
+    await refreshCatalog();
+    toast(t("catalog.tree.disconnected", { name: connection.name }));
+  } catch (error) {
+    toast(failureText(error), "err");
+  }
+}
+
+function onConnManage() {
+  closeMenu();
+  emit("new-connection");
+}
+
+function onConnRefresh() {
+  closeMenu();
+  void onRefresh();
+}
+
 function onContextMenu(event: MouseEvent) {
   event.preventDefault();
+  const target = event.target;
+  const connRow = target instanceof Element ? target.closest(".tr-conn") : null;
+  if (connRow) {
+    const id = connRow.closest("section")?.getAttribute("data-connection");
+    const connection = connections.value.find((item) => item.id === id);
+    if (connection) {
+      menu.value = null;
+      connMenu.value = {
+        connection,
+        x: Math.max(8, Math.min(event.clientX, window.innerWidth - 220)),
+        y: Math.max(8, Math.min(event.clientY, window.innerHeight - 170)),
+      };
+    }
+    return;
+  }
+  connMenu.value = null;
   const row = rowOf(event.target);
   const object = row ? readRef(row) : null;
   if (!object) {
@@ -417,6 +512,7 @@ async function onCopy() {
   try {
     await navigator.clipboard.writeText(qualifiedObjectName(object.engine, object.schema, object.name));
     closeMenu();
+    toast(t("catalog.tree.copied"));
   } catch {
     if (menu.value) menu.value = { ...menu.value, notice: t("catalog.tree.clipboardFailed") };
   }
@@ -447,9 +543,15 @@ onBeforeUnmount(() => {
 <template>
   <div class="tree" role="tree" :aria-label="t('catalog.tree.label')" @click="onTreeClick" @dblclick="onTreeDblClick" @contextmenu="onContextMenu" @keydown="onTreeKeydown" @scroll="closeMenu">
     <div class="tree-toolbar">
-      <button class="btn ghost sm" type="button" data-action="tree-refresh" :aria-label="t('catalog.tree.refresh')" :disabled="refreshing" @click="onRefresh">
+      <span class="tree-title">{{ t("catalog.tree.heading", { connected: connectedCount, total: connections.length }) }}</span>
+      <button class="icon-btn" type="button" data-action="tree-collapse" :aria-label="t('catalog.tree.collapseAll')" :title="t('catalog.tree.collapseAll')" @click="collapseAll">
+        <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.collapse" /></svg>
+      </button>
+      <button class="icon-btn" :class="{ spin: refreshing }" type="button" data-action="tree-refresh" :aria-label="t('catalog.tree.refresh')" :title="refreshing ? t('catalog.tree.refreshing') : t('catalog.tree.refresh')" :disabled="refreshing" @click="onRefresh">
         <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.refresh" /></svg>
-        {{ refreshing ? t("catalog.tree.refreshing") : t("catalog.tree.refreshButton") }}
+      </button>
+      <button class="icon-btn" type="button" data-action="tree-add-connection" :aria-label="t('common.newConnection')" :title="t('common.newConnection')" @click="emit('new-connection')">
+        <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.plus" /></svg>
       </button>
     </div>
     <div v-if="structureNotice" class="tree-note err" data-structure-notice>
@@ -604,7 +706,7 @@ onBeforeUnmount(() => {
                 :database="database.name"
                 :schema="schema"
                 :depth="1"
-                :selected-key="selectedKey ?? undefined"
+                :selected-key="selectedIn(connection.id, database.name, schema.name)"
               />
             </template>
           </template>
@@ -625,6 +727,25 @@ onBeforeUnmount(() => {
                 </span>
                 <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.database" /></svg>
                 <span class="tr-name">{{ database.name }}</span>
+                <span v-if="!sessionGap(database)" class="tree-acts">
+                  <button class="tree-act" type="button" data-action="tree-new-query" :data-database="database.name" :aria-label="t('catalog.tree.newQueryHere', { name: database.name })" :title="t('catalog.tree.newQueryHere', { name: database.name })" @click.stop="emit('new-query', connection, database.name)">
+                    <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.newQuery" /></svg>
+                  </button>
+                  <button
+                    v-if="!engineShape(connection.engine).schemas"
+                    class="tree-act"
+                    type="button"
+                    data-action="open-diagram"
+                    :data-connection="connection.id"
+                    :data-database="database.name"
+                    data-schema=""
+                    :aria-label="t('catalog.tree.diagram')"
+                    :title="t('catalog.tree.diagram')"
+                    @click.stop="openDiagram(connection, database.name, '')"
+                  >
+                    <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.diagram" /></svg>
+                  </button>
+                </span>
                 <span v-if="database.name === connection.defaultDatabase" class="badge current-db" :title="t('catalog.tree.currentDatabaseTitle')">{{ t("catalog.tree.currentDatabase") }}</span>
               </div>
               <template v-if="open(`d:${connection.id}:${database.name}`)">
@@ -659,21 +780,6 @@ onBeforeUnmount(() => {
                     </span>
                   </div>
                 </div>
-                <button
-                  v-if="!engineShape(connection.engine).schemas && !sessionGap(database)"
-                  class="tree-row"
-                  type="button"
-                  data-action="open-diagram"
-                  data-level="diagram"
-                  :data-connection="connection.id"
-                  :data-database="database.name"
-                  data-schema=""
-                  :style="depthStyle(2)"
-                  @click.stop="openDiagram(connection, database.name, '')"
-                >
-                  <span class="tw"></span>
-                  <span class="tr-name">{{ t("catalog.tree.diagram") }}</span>
-                </button>
                 <template v-for="schema in database.schemas" :key="`${database.name}:${schema.name}`">
                   <div
                     v-if="engineShape(connection.engine).schemas && schema.name"
@@ -694,31 +800,30 @@ onBeforeUnmount(() => {
                     </span>
                     <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.schema" /></svg>
                     <span class="tr-name">{{ schema.name }}</span>
+                    <span v-if="!sessionGap(database)" class="tree-acts">
+                      <button
+                        class="tree-act"
+                        type="button"
+                        data-action="open-diagram"
+                        :data-connection="connection.id"
+                        :data-database="database.name"
+                        :data-schema="schema.name"
+                        :aria-label="t('catalog.tree.diagram')"
+                        :title="t('catalog.tree.diagram')"
+                        @click.stop="openDiagram(connection, database.name, schema.name)"
+                      >
+                        <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.diagram" /></svg>
+                      </button>
+                    </span>
                     <span v-if="!schema.error" class="tr-meta">{{ schema.total }}</span>
                   </div>
-                  <button
-                    v-if="engineShape(connection.engine).schemas && schema.name && !sessionGap(database)"
-                    class="tree-row"
-                    type="button"
-                    data-action="open-diagram"
-                    data-level="diagram"
-                    :data-connection="connection.id"
-                    :data-database="database.name"
-                    :data-schema="schema.name"
-                    :style="depthStyle(3)"
-                    @click.stop="openDiagram(connection, database.name, schema.name)"
-                  >
-                    <span class="tw"></span>
-                    <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.diagram" /></svg>
-                    <span class="tr-name">{{ t("catalog.tree.diagram") }}</span>
-                  </button>
                   <SchemaBlock
                     v-if="!engineShape(connection.engine).schemas || open(schemaKey(connection.id, database.name, schema.name))"
                     :connection="connection"
                     :database="database.name"
                     :schema="schema"
                     :depth="engineShape(connection.engine).schemas ? 3 : 2"
-                    :selected-key="selectedKey ?? undefined"
+                    :selected-key="selectedIn(connection.id, database.name, schema.name)"
                   />
                 </template>
               </template>
@@ -729,6 +834,38 @@ onBeforeUnmount(() => {
       </section>
     </template>
   </div>
+  <Teleport to="body">
+    <div
+      v-if="connMenu"
+      class="menu object-menu"
+      data-menu="object"
+      role="menu"
+      :aria-label="connMenu.connection.name"
+      :style="{ left: `${connMenu.x}px`, top: `${connMenu.y}px` }"
+      @click.stop
+      @contextmenu.prevent
+    >
+      <div class="menu-head">{{ connMenu.connection.name }}</div>
+      <template v-if="isConnected(connMenu.connection.status)">
+        <button v-if="queryDatabase(connMenu.connection) !== null" class="menu-item" type="button" data-action="conn-new-query" @click="onConnQuery(connMenu!.connection)">
+          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.newQuery" /></svg>{{ t("common.newQuery") }}
+        </button>
+        <button class="menu-item" type="button" data-action="conn-refresh" @click="onConnRefresh">
+          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.refresh" /></svg>{{ t("catalog.tree.refresh") }}
+        </button>
+        <button class="menu-item" type="button" data-action="conn-disconnect" @click="onConnDisconnect(connMenu!.connection)">
+          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>{{ t("catalog.tree.disconnect") }}
+        </button>
+      </template>
+      <button v-else class="menu-item" type="button" data-action="conn-connect" @click="onConnConnect(connMenu!.connection)">
+        <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.refresh" /></svg>{{ t("catalog.tree.connect") }}
+      </button>
+      <div class="menu-sep" role="separator"></div>
+      <button class="menu-item" type="button" data-action="conn-manage" @click="onConnManage">
+        <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.database" /></svg>{{ t("catalog.tree.manageConnections") }}
+      </button>
+    </div>
+  </Teleport>
   <Teleport to="body">
     <div
       v-if="menu"

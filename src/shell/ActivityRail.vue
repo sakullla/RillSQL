@@ -29,6 +29,7 @@ const items: { id: AppPage; icon: IconName; label: string }[] = [
       @click="emit('navigate', item.id)"
     >
       <Icon :name="item.icon" />
+      <span class="rail-label" aria-hidden="true">{{ t(item.label) }}</span>
     </button>
     <span class="grow"></span>
     <button
@@ -41,6 +42,7 @@ const items: { id: AppPage; icon: IconName; label: string }[] = [
       @click="emit('navigate', 'settings')"
     >
       <Icon name="sliders" />
+      <span class="rail-label" aria-hidden="true">{{ t("shell.nav.settings") }}</span>
       <ChordKeys class="sr" chord="Mod+," />
     </button>
   </nav>

@@ -84,6 +84,10 @@ export const query = {
     unknown: "未知",
   },
   results: {
+    emptyReady: "写好 SQL 就可以执行",
+    emptyReadyHint: "结果会显示在这里，也可以按",
+    emptyNoTarget: "先选一个执行目标",
+    emptyNoTargetHint: "点上方「选择执行目标」，或从左侧树的数据库上新建查询。",
     area: "执行结果",
     heading: "结果",
     waiting: "等待执行",
