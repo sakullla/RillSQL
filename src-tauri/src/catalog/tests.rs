@@ -1,10 +1,11 @@
 use std::path::Path;
 
-use super::commands::{load_catalog, page_for_session};
+use super::commands::{load_catalog, load_catalog_inner, page_for_session};
 use super::model::{
     metadata_sql, schema_status, ConnStatus, ConnectionNode, DatabaseNode, Engine, ObjectRow,
     SchemaNode, SchemaStatus,
 };
+use super::objects::{read_extras, ExtrasScope};
 use super::read::{assemble_postgres, read_catalog_session, read_definition, read_limit, ObjectWindow};
 use super::sqlite::{read_sqlite_file, read_sqlite_pool};
 use super::tree::{
@@ -669,4 +670,81 @@ fn sqlserver_sequence_definition_projects_sql_variant_columns() {
     assert!(sql.contains("CASE WHEN q.is_cycling THEN N'1' ELSE N'0' END"), "{sql}");
     assert!(sql.contains("CASE WHEN q.is_cached THEN N'1' ELSE N'0' END"), "{sql}");
     assert!(sql.contains("FROM sys.sequences"), "{sql}");
+}
+
+#[tokio::test]
+async fn scripted_extras_report_every_section_instead_of_pretending_to_be_empty() {
+    let body = read_extras(&CatalogSession::Scripted, Engine::Postgres, "", "").await;
+    assert!(body.extensions.items.is_empty());
+    assert!(body.extensions.error.as_deref().unwrap().contains("没有连着可查询"));
+    assert!(body.sequences.error.is_some());
+    assert!(body.events.error.is_some());
+    assert!(body.partitions.error.is_some());
+    assert!(body.pragmas.error.is_some() && body.pragmas.value.is_none());
+    assert!(body.attached.error.is_some());
+}
+
+#[tokio::test]
+async fn sqlite_extras_read_pragmas_and_attached_databases_on_the_open_session() {
+    let dir = std::env::temp_dir().join(format!("rillsql-catalog-extras-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("notes.sqlite");
+    let setup = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE customers (id INTEGER PRIMARY KEY)")
+        .execute(&setup)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA user_version = 7")
+        .execute(&setup)
+        .await
+        .unwrap();
+    setup.close().await;
+
+    let service = Service::new_for_test(dir.join("connections.sqlite"));
+    service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+    let session = service.catalog_session("notes").unwrap();
+    let body = read_extras(&session, Engine::Sqlite, "main", "").await;
+    let pragmas = body.pragmas.value.expect("PRAGMA 应该读到值");
+    assert_eq!(pragmas.user_version, Some(7));
+    assert!(pragmas.journal_mode.is_some());
+    assert!(body.pragmas.error.is_none());
+    assert!(body.attached.items.iter().any(|item| item.name == "main"));
+    assert!(body.attached.error.is_none());
+    // SQLite 没有扩展、序列、事件或分区：空清单且不报错，不编造。
+    assert!(body.extensions.items.is_empty() && body.extensions.error.is_none());
+    assert!(body.events.items.is_empty() && body.events.error.is_none());
+    assert!(body.partitions.items.is_empty() && body.partitions.error.is_none());
+
+    let scope = ExtrasScope {
+        connection_id: "notes".to_owned(),
+        database: "main".to_owned(),
+        schema: String::new(),
+    };
+    let plain = load_catalog(&service, 100, &[], None, false).await.unwrap();
+    assert!(plain[0].extras.is_none());
+    let loaded = load_catalog_inner(&service, 100, &[], None, false, Some(&scope))
+        .await
+        .unwrap();
+    let extras = loaded[0].extras.as_ref().expect("要求了就应该返回 extras");
+    assert_eq!(extras.pragmas.user_version, Some(7));
+    assert!(extras.pragmas.error.is_none());
+    assert!(extras.extensions.error.is_none());
+    assert!(extras.sequences.error.is_none());
+    assert!(extras.events.error.is_none());
+    assert!(extras.partitions.error.is_none());
+    assert!(extras.attached.error.is_none());
+    let json = serde_json::to_value(&loaded[0]).unwrap();
+    assert!(json["extras"]["attached"]["items"].as_array().unwrap().iter().any(|item| item["name"] == "main"));
+    assert!(json["extras"]["extensions"]["error"].is_null());
+
+    match &session {
+        CatalogSession::Sqlite { pool, .. } => pool.close().await,
+        _ => panic!("会话应该是已经打开的 SQLite 池"),
+    }
+    drop(service);
+    let _ = std::fs::remove_dir_all(dir);
 }

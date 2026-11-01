@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { tauriConnectionApi, type OpenOutcome } from "../connections/api";
 import type { EnvTag, SavedConnection } from "../connections/model";
 import type { CatalogObjectRef } from "./object-ref";
-import type { CatalogConnection, PageRequest, PageResult } from "./types";
+import type { CatalogConnection, CatalogExtras, PageRequest, PageResult } from "./types";
 
 export function disconnectConnection(id: string): Promise<void> {
   return tauriConnectionApi.disconnect(id);
@@ -50,6 +50,34 @@ export async function fetchCatalog(limits: ObjectLimit[], page: number, connecti
     connectionId: connectionId ?? null,
     outline,
   });
+}
+
+/** 对象详情读取范围：一个连接上具体某个库/schema（R5）。 */
+export interface ExtrasRequest {
+  connectionId: string;
+  database: string;
+  schema: string;
+}
+
+/**
+ * 按需读取一个连接的对象详情：扩展与序列、事件与分区、PRAGMA 与附加库。
+ * 每一节自带失败原因，读不到的节为空，不影响已经加载的树。
+ */
+export async function fetchExtras(scope: ExtrasRequest): Promise<CatalogExtras | null> {
+  const catalogs = await invoke<CatalogConnection[]>("catalog_refresh", {
+    limits: [],
+    page: 0,
+    connectionId: scope.connectionId,
+    // 只要对象详情：走轻量 outline，不为了 extras 重读整棵树的对象。
+    outline: true,
+    extras: {
+      connectionId: scope.connectionId,
+      database: scope.database,
+      schema: scope.schema,
+    },
+  });
+  if (!Array.isArray(catalogs)) return null;
+  return catalogs.find((item) => item.id === scope.connectionId)?.extras ?? null;
 }
 
 export async function listEnvTags(): Promise<EnvTag[]> {

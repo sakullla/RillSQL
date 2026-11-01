@@ -2,6 +2,7 @@
 
 pub mod commands;
 mod model;
+mod objects;
 mod read;
 mod sqlite;
 mod tree;
@@ -10,6 +11,7 @@ pub use model::{
     kind_sql, metadata_sql, schema_status, Engine, SchemaNode, SchemaStatus, DEFAULT_OBJECT_PAGE,
 };
 pub(crate) use model::{ObjectKind, ObjectRow};
+pub use objects::{read_extras, ExtrasBody, ExtrasScope};
 pub(crate) use read::{read_definition, read_object_page};
 pub use sqlite::{read_sqlite_file, read_sqlite_pool};
 pub use commands::{catalog_definition, catalog_page, catalog_refresh, catalog_sessions};
@@ -43,6 +45,8 @@ pub fn module_id() -> &'static str {
         std::any::type_name_of_val(&read::read_object_page),
         std::any::type_name_of_val(&read::read_definition),
         std::any::type_name_of_val(&kind_sql),
+        std::any::type_name_of_val(&read_extras),
+        std::any::type_name_of_val(&ExtrasScope { connection_id: String::new(), database: String::new(), schema: String::new() }),
     );
     let _ = (
         DEFAULT_OBJECT_PAGE,
