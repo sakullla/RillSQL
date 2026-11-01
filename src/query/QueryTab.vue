@@ -16,6 +16,7 @@ import { queryHistory, querySavedList, querySavedSave } from "../history/api";
 import { deletedConnectionNotice, elapsedLabel, openPlan, statusBadge, statusLabel as historyStatusLabel, type HistoryEntry, type OpenPlan } from "../history/plan";
 import { openSaved, savedName, savedNameError, savedNeedsTarget, type SavedQuery } from "../history/saved";
 import QueryResultGrid from "../grid/QueryResultGrid.vue";
+import { gridDescribe } from "../grid/api";
 import type { Engine } from "../grid/types";
 import Icon from "../shell/Icon.vue";
 import { tabHasPending } from "../shell/close-guard";
@@ -274,58 +275,77 @@ async function sqlCompletion(context: CompletionContext) {
   const before = doc.slice(0, context.pos);
   if (/--[^\n]*$/.test(before) || openDelimiter(before, props.engine ?? undefined)) return null;
   const word = context.matchBefore(/[A-Za-z0-9_.]*$/);
-  if (!word || (word.from === word.to && !context.explicit)) return null;
-  /* SELECT * 展开：显式触发且光标紧跟星号时，用 FROM 表的列替换星号。 */
   const star = context.explicit ? /\*\s*$/.exec(before) : null;
+  if (!star && (!word || (word.from === word.to && !context.explicit))) return null;
+
   const connection = connectionById(catalogConnections(), props.connectionId);
   const ready = Boolean(props.connectionId && connection && props.database != null && connection.status === "connected");
   const database = ready ? props.database : null;
   const meta = metadataNote(ready ? connection : null, database);
   const engine = asEngine(props.engine ?? connection?.engine) ?? "postgres";
 
-  /* 只在当前语句内解析；遇到未闭合字符串/注释时退回关键字候选，不阻塞输入。 */
+  /* 语句作用域取整条语句（FROM 可能在光标之后），子句只按光标前缀判定。 */
   const located = locateForCompletion(doc, context.pos);
-  const statement = located.refusal ? "" : doc.slice(located.start, context.pos);
-  const scope = parseScope(statement);
-  const parsed = statementContext(statement, meta.objects);
-  const qualified = qualifierFor(word.text, meta.objects, parsed.aliases);
+  const fullStatement = located.refusal ? "" : doc.slice(located.start, located.end);
+  const prefixStatement = located.refusal ? "" : doc.slice(located.start, context.pos);
+  const scope = located.refusal ? { clause: null, tables: [], ctes: [], target: null } : parseScope(fullStatement);
+  const cursorClause = located.refusal ? null : parseScope(prefixStatement).clause;
+  const parsed = statementContext(prefixStatement, meta.objects);
+  const tables = scope.target ? [...scope.tables, { ...scope.target, alias: scope.target.alias }] : scope.tables;
 
-  if (star && ready && connection && database != null && scope.clause === "select") {
-    const sources = await loadSources(connection, database, engine, scope.tables);
+  if (star) {
+    if (!ready || !connection || database == null || (cursorClause !== "select" && cursorClause !== null)) return null;
+    const sources = await loadSources(connection, database, engine, tables);
     const columns = sources.flatMap((source) => source.columns);
+    if (!columns.length) return null;
+    const from = context.pos - star[0].length;
     fieldNote.value = "";
+    const expand = {
+      label: t("query.complete.expandStar"),
+      type: "snippet",
+      detail: columns.join(", ").slice(0, 80),
+      apply: (view: EditorView, _completion: unknown, applyFrom: number, applyTo: number) => {
+        view.dispatch({ changes: { from: applyFrom, to: applyTo, insert: columns.join(", ") }, selection: { anchor: applyFrom + columns.join(", ").length } });
+      },
+    };
     return {
-      from: context.pos - (star[0].length - 1),
+      from,
       filter: false,
-      options: columns.slice(0, 80).map((name) => ({ label: name, type: "property", detail: t("query.complete.column") })),
+      options: [expand, ...columns.slice(0, 80).map((name) => ({ label: name, type: "property", detail: t("query.complete.column") }))],
     };
   }
 
+  const qualified = qualifierFor(word!.text, meta.objects, parsed.aliases);
+
   if (qualified.kind === "plain") {
     fieldNote.value = "";
-    const sources = ready && connection && database != null ? await loadSources(connection, database, engine, scope.tables) : [];
+    const sources = ready && connection && database != null ? await loadSources(connection, database, engine, tables) : [];
+    const onConditions = cursorClause === "on" && ready && connection && database != null
+      ? await loadOnConditions(connection, database, engine, scope.tables.slice(-2))
+      : [];
     const columns = !sources.length && ready ? cachedColumns(connection!.id, database!) : [];
     const plan = completionPlan({
-      prefix: word.text,
+      prefix: word!.text,
       connection: ready ? connection : null,
       database,
       engine,
       columns,
       context: {
-        clause: scope.clause,
+        clause: cursorClause,
         ctes: scope.ctes,
         sources,
         onTables: scope.tables.slice(-2).map((table) => table.alias),
         targetTable: scope.target?.alias,
+        onConditions,
       },
     });
     return {
-      from: word.from,
+      from: word!.from,
       filter: false,
       options: plan.items.map((item) => ({ label: item.label, type: item.kind, detail: item.detail })),
     };
   }
-  const columnFrom = word.to - (qualified.kind === "object" ? qualified.columnPrefix.length : 0);
+  const columnFrom = word!.to - (qualified.kind === "object" ? qualified.columnPrefix.length : 0);
   if (!connection || database == null || connection.status !== "connected") {
     fieldNote.value = meta.note;
     return { from: columnFrom, filter: false, options: [] };
@@ -358,7 +378,7 @@ async function sqlCompletion(context: CompletionContext) {
   return { from: columnFrom, filter: false, options };
 }
 
-/** FROM/JOIN 的表转成候选来源：最多读 4 张，列走同一份缓存与单飞。 */
+/** FROM/JOIN 与目标表转成候选来源：最多读 4 张，列走同一份缓存与单飞；失败只提示一次。 */
 async function loadSources(
   connection: Parameters<typeof connectionById>[0][number],
   database: string,
@@ -370,12 +390,52 @@ async function loadSources(
   const resolved = picked
     .map((table) => ({ table, object: resolveTable(index, table, database) }))
     .filter((entry): entry is { table: ScopeTable; object: CompletionObject } => entry.object !== null);
-  return Promise.all(
+  const loaded = await Promise.all(
     resolved.map(async (entry) => {
       const fields = await loadFields({ connectionId: connection.id, database, engine, object: entry.object });
-      return { alias: entry.table.alias, label: entry.object.label, columns: fields.columns };
+      return { entry, fields };
     }),
   );
+  const failed = loaded.filter((item) => item.fields.error);
+  fieldNote.value = failed.length ? fieldFailureNote(failed[0]!.entry.object.label, failed[0]!.fields.error ?? "") : fieldNote.value;
+  return loaded
+    .filter((item) => !item.fields.error)
+    .map((item) => ({ alias: item.entry.table.alias, label: item.entry.object.label, columns: item.fields.columns }));
+}
+
+/** 外键推断：两侧表的出向外键能对上时给出 "a.col = b.col" 候选。 */
+async function loadOnConditions(
+  connection: Parameters<typeof connectionById>[0][number],
+  database: string,
+  engine: Engine,
+  tables: readonly ScopeTable[],
+): Promise<string[]> {
+  if (tables.length < 2) return [];
+  const index = catalogIndex(connection);
+  const resolved = tables
+    .map((table) => ({ table, object: resolveTable(index, table, database) }))
+    .filter((entry): entry is { table: ScopeTable; object: CompletionObject } => entry.object !== null);
+  if (resolved.length < 2) return [];
+  const [left, right] = resolved;
+  const conditions: string[] = [];
+  for (const [from, to] of [[left, right], [right, left]]) {
+    try {
+      const schema = await gridDescribe(
+        { connectionId: connection.id, database, schema: from.object.schema, table: from.object.name, engine },
+        { includeForeignKeys: true },
+      );
+      for (const key of schema.foreignKeys ?? []) {
+        if (key.refTable.toLowerCase() !== to.object.name.toLowerCase()) continue;
+        key.columns.forEach((column, index) => {
+          const refColumn = key.refColumns[index];
+          if (refColumn) conditions.push(`${from.table.alias}.${column} = ${to.table.alias}.${refColumn}`);
+        });
+      }
+    } catch {
+      /* 外键只是辅助候选，失败不打断补全。 */
+    }
+  }
+  return [...new Set(conditions)];
 }
 
 /* SQL 编辑器配色（R5）：compartment 持有高亮样式提供运行时切换通道；颜色全部取 --tk-* 变量，

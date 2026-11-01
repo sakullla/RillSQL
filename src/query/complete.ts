@@ -35,7 +35,7 @@ export interface MetadataNote {
 
 export interface CompletionItem {
   label: string;
-  kind: "keyword" | ObjectKind | "column" | "function" | "snippet" | "cte" | "database" | "schema";
+  kind: "keyword" | ObjectKind | "column" | "function" | "snippet" | "cte" | "database" | "schema" | "condition";
   detail: string;
 }
 
@@ -131,6 +131,8 @@ export interface CompletionContext {
   onTables?: readonly string[];
   /** UPDATE / INSERT 的目标表（名或别名），用于 SET 与 VALUES 的列收敛。 */
   targetTable?: string;
+  /** 外键推断出的 ON 条件候选（已格式化为 "a.col = b.col"）。 */
+  onConditions?: readonly string[];
 }
 
 /** 按候选的标签做一次前缀/子序列筛选并保留顺序语义。 */
@@ -203,10 +205,13 @@ export function completionPlan(input: {
     ? []
     : snippetCandidates(prefix).map((item) => ({ label: item.label, kind: "snippet" as const, detail: item.detail }));
 
+  const conditionItems: CompletionItem[] = (input.context?.onConditions ?? []).map((text) => ({ label: text, kind: "condition" as const, detail: tr("query.complete.joinCondition") }));
   let ordered: CompletionItem[];
   if (clause === "use") {
     ordered = rankItems(databaseItems, prefix);
-  } else if (clause === "on" || clause === "set" || clause === "values") {
+  } else if (clause === "on") {
+    ordered = [...rankItems(conditionItems, prefix, 10), ...rankItems(columnItems, prefix)];
+  } else if (clause === "set" || clause === "values") {
     ordered = rankItems(columnItems, prefix);
   } else if (clause === "from" || clause === "join") {
     ordered = [

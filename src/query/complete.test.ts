@@ -232,4 +232,24 @@ describe("rule-based completion", () => {
     });
     expect(plan.items.some((item) => item.kind === "column")).toBe(false);
   });
+
+  it("offers inferred join conditions before columns inside ON", () => {
+    const plan = completionPlan({
+      prefix: "",
+      connection: atlas,
+      database: "atlas_dev",
+      engine: "postgres",
+      context: {
+        clause: "on",
+        sources: [
+          { alias: "o", label: "public.orders", columns: ["id", "customer_id"] },
+          { alias: "c", label: "public.customers", columns: ["id", "name"] },
+        ],
+        onTables: ["o", "c"],
+        onConditions: ["o.customer_id = c.id"],
+      },
+    });
+    expect(plan.items[0]).toMatchObject({ kind: "condition", label: "o.customer_id = c.id" });
+    expect(plan.items.some((item) => item.kind === "column")).toBe(true);
+  });
 });

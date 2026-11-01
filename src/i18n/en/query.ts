@@ -222,6 +222,8 @@ export const query = {
     keyword: "keyword",
     cte: "CTE",
     column: "column",
+    joinCondition: "foreign key condition",
+    expandStar: "Expand to columns",
     database: "database",
     schema: "schema",
     functionBuiltin: "built-in function",

@@ -222,6 +222,8 @@ export const query = {
     keyword: "关键字",
     cte: "CTE",
     column: "字段",
+    joinCondition: "外键条件",
+    expandStar: "展开为列清单",
     database: "数据库",
     schema: "schema",
     functionBuiltin: "内建函数",
