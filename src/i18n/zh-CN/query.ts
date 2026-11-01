@@ -223,6 +223,7 @@ export const query = {
     cte: "CTE",
     column: "字段",
     joinCondition: "外键条件",
+    inferredCondition: "按命名推断",
     expandStar: "展开为列清单",
     database: "数据库",
     schema: "schema",

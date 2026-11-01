@@ -223,6 +223,7 @@ export const query = {
     cte: "CTE",
     column: "column",
     joinCondition: "foreign key condition",
+    inferredCondition: "inferred by naming",
     expandStar: "Expand to columns",
     database: "database",
     schema: "schema",

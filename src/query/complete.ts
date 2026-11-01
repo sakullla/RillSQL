@@ -133,6 +133,8 @@ export interface CompletionContext {
   targetTable?: string;
   /** 外键推断出的 ON 条件候选（已格式化为 "a.col = b.col"）。 */
   onConditions?: readonly string[];
+  /** 外键缺失时按命名约定推断的条件，detail 会标注来源。 */
+  inferredConditions?: readonly string[];
 }
 
 /** 按候选的标签做一次前缀/子序列筛选并保留顺序语义。 */
@@ -205,7 +207,10 @@ export function completionPlan(input: {
     ? []
     : snippetCandidates(prefix).map((item) => ({ label: item.label, kind: "snippet" as const, detail: item.detail }));
 
-  const conditionItems: CompletionItem[] = (input.context?.onConditions ?? []).map((text) => ({ label: text, kind: "condition" as const, detail: tr("query.complete.joinCondition") }));
+  const conditionItems: CompletionItem[] = [
+    ...(input.context?.onConditions ?? []).map((text) => ({ label: text, kind: "condition" as const, detail: tr("query.complete.joinCondition") })),
+    ...(input.context?.inferredConditions ?? []).map((text) => ({ label: text, kind: "condition" as const, detail: tr("query.complete.inferredCondition") })),
+  ];
   let ordered: CompletionItem[];
   if (clause === "use") {
     ordered = rankItems(databaseItems, prefix);

@@ -320,9 +320,9 @@ async function sqlCompletion(context: CompletionContext) {
   if (qualified.kind === "plain") {
     fieldNote.value = "";
     const sources = ready && connection && database != null ? await loadSources(connection, database, engine, tables) : [];
-    const onConditions = cursorClause === "on" && ready && connection && database != null
+    const on = cursorClause === "on" && ready && connection && database != null
       ? await loadOnConditions(connection, database, engine, scope.tables.slice(-2))
-      : [];
+      : { conditions: [], inferred: [] };
     const columns = !sources.length && ready ? cachedColumns(connection!.id, database!) : [];
     const plan = completionPlan({
       prefix: word!.text,
@@ -336,7 +336,8 @@ async function sqlCompletion(context: CompletionContext) {
         sources,
         onTables: scope.tables.slice(-2).map((table) => table.alias),
         targetTable: scope.target?.alias,
-        onConditions,
+        onConditions: on.conditions,
+        inferredConditions: on.inferred,
       },
     });
     return {
@@ -403,20 +404,20 @@ async function loadSources(
     .map((item) => ({ alias: item.entry.table.alias, label: item.entry.object.label, columns: item.fields.columns }));
 }
 
-/** 外键推断：两侧表的出向外键能对上时给出 "a.col = b.col" 候选。 */
+/** 外键推断：两侧表的出向外键能对上时给出 "a.col = b.col"；缺失时按命名约定降级并标注。 */
 async function loadOnConditions(
   connection: Parameters<typeof connectionById>[0][number],
   database: string,
   engine: Engine,
   tables: readonly ScopeTable[],
-): Promise<string[]> {
-  if (tables.length < 2) return [];
+): Promise<{ conditions: string[]; inferred: string[] }> {
+  if (tables.length < 2) return { conditions: [], inferred: [] };
   const index = catalogIndex(connection);
   const resolved = tables
     .map((table) => ({ table, object: resolveTable(index, table, database) }))
     .filter((entry): entry is { table: ScopeTable; object: CompletionObject } => entry.object !== null);
-  if (resolved.length < 2) return [];
-  const [left, right] = resolved;
+  if (resolved.length < 2) return { conditions: [], inferred: [] };
+  const [left, right] = resolved as [{ table: ScopeTable; object: CompletionObject }, { table: ScopeTable; object: CompletionObject }];
   const conditions: string[] = [];
   for (const [from, to] of [[left, right], [right, left]]) {
     try {
@@ -426,8 +427,8 @@ async function loadOnConditions(
       );
       for (const key of schema.foreignKeys ?? []) {
         if (key.refTable.toLowerCase() !== to.object.name.toLowerCase()) continue;
-        key.columns.forEach((column, index) => {
-          const refColumn = key.refColumns[index];
+        key.columns.forEach((column, position) => {
+          const refColumn = key.refColumns[position];
           if (refColumn) conditions.push(`${from.table.alias}.${column} = ${to.table.alias}.${refColumn}`);
         });
       }
@@ -435,9 +436,32 @@ async function loadOnConditions(
       /* 外键只是辅助候选，失败不打断补全。 */
     }
   }
-  return [...new Set(conditions)];
-}
+  if (conditions.length) return { conditions: [...new Set(conditions)], inferred: [] };
 
+  const inferred: string[] = [];
+  const columnsOf = async (object: CompletionObject) =>
+    (await loadFields({ connectionId: connection.id, database, engine, object })).columns;
+  const [leftColumns, rightColumns] = await Promise.all([columnsOf(left.object), columnsOf(right.object)]);
+  const singular = (name: string) => name.toLowerCase().replace(/s$/, "");
+  for (const [from, to, fromColumns, toColumns] of [
+    [left, right, leftColumns, rightColumns],
+    [right, left, rightColumns, leftColumns],
+  ] as const) {
+    for (const column of fromColumns) {
+      const lower = column.toLowerCase();
+      if (!lower.endsWith("_id")) continue;
+      if (singular(to.object.name) !== lower.slice(0, -3)) continue;
+      const target = toColumns.find((item) => item.toLowerCase() === "id");
+      if (target) inferred.push(`${from.table.alias}.${column} = ${to.table.alias}.${target}`);
+    }
+    for (const column of fromColumns) {
+      if (column.toLowerCase() === "id") continue;
+      const target = toColumns.find((item) => item.toLowerCase() === column.toLowerCase());
+      if (target) inferred.push(`${from.table.alias}.${column} = ${to.table.alias}.${target}`);
+    }
+  }
+  return { conditions: [], inferred: [...new Set(inferred)] };
+}
 /* SQL 编辑器配色（R5）：compartment 持有高亮样式提供运行时切换通道；颜色全部取 --tk-* 变量，
    由容器上的 data-editor-theme 决定用 tokens.css 的哪套变量组，auto 不设属性即沿用全局主题默认配色。
    切换只重配样式，不重建编辑器，草稿与执行结果不动。 */
