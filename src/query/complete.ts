@@ -102,6 +102,8 @@ const FIELD_FIRST_CLAUSES = new Set<StatementClause>(["select", "where", "group"
 export interface StatementContext {
   clause: StatementClause | null;
   aliases: Map<string, CompletionObject>;
+  ctes: string[];
+  target: { alias: string; schema: string | null; name: string } | null;
 }
 
 /** 光标前当前语句的子句与 FROM/JOIN 表别名；解析不到子句时 clause 为 null，调用方回退原有行为。 */
@@ -112,7 +114,7 @@ export function statementContext(statementBefore: string, objects: readonly Comp
     const match = objects.find((object) => object.name.toLowerCase() === table.name.toLowerCase() && (!table.schema || object.schema.toLowerCase() === table.schema.toLowerCase()));
     if (match) aliases.set(table.alias.toLowerCase(), match);
   }
-  return { clause: scope.clause, aliases };
+  return { clause: scope.clause, aliases, ctes: scope.ctes, target: scope.target };
 }
 
 export interface CompletionSource {
@@ -189,7 +191,7 @@ export function completionPlan(input: {
     .filter(Boolean)
     .map((name) => ({ label: name, kind: "schema" as const, detail: tr("query.complete.schema") }));
   const cteItems: CompletionItem[] = (input.context?.ctes ?? []).map((name) => ({ label: name, kind: "cte" as const, detail: tr("query.complete.cte") }));
-  const functionItems: CompletionItem[] = functionCatalog()
+  const functionItems: CompletionItem[] = functionCatalog(engine)
     .filter((name) => matchKind(name, prefix) >= 0)
     .slice(0, 40)
     .map((name) => ({ label: name, kind: "function" as const, detail: functionDetail(engine, name) }));
@@ -209,8 +211,6 @@ export function completionPlan(input: {
   } else if (clause === "from" || clause === "join") {
     ordered = [
       ...rankItems(objectItems, prefix),
-      ...rankItems(databaseItems, prefix, 20),
-      ...rankItems(schemaItems, prefix, 20),
       ...rankItems(cteItems, prefix, 20),
       ...rankItems(keywordItems, prefix),
     ];
@@ -237,6 +237,11 @@ export function completionPlan(input: {
       ...rankItems(snippetItems, prefix, 6),
     ];
   }
+  /* 跨组按匹配等级稳定排序：前缀命中优先于子序列命中，同等等级保持组内顺序。 */
+  ordered = ordered
+    .map((item, order) => ({ item, score: matchKind(item.label, prefix), order }))
+    .sort((a, b) => a.score - b.score || a.order - b.order)
+    .map((entry) => entry.item);
   const seen = new Set<string>();
   const unique = ordered.filter((item) => {
     const key = `${item.kind}:${item.label.toLowerCase()}`;

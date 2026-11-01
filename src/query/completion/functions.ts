@@ -52,9 +52,25 @@ export function signatureFor(name: string): string | null {
   return SIGNATURES[name.toLowerCase()] ?? null;
 }
 
-/** 三引擎共用的函数清单来自手写签名表；未收录的方言函数不猜。 */
-export function functionCatalog(): string[] {
-  return [...KNOWN_FUNCTIONS];
+const BASE_FUNCTIONS = [
+  "count", "sum", "avg", "min", "max", "coalesce", "nullif", "concat", "length", "lower", "upper",
+  "substring", "trim", "replace", "round", "floor", "ceil", "abs", "now", "current_date", "cast",
+  "row_number", "rank", "lag", "lead",
+];
+
+const PG_ONLY = [
+  "string_agg", "date_trunc", "extract", "to_char", "date_part", "generate_series", "array_agg",
+  "jsonb_build_object", "jsonb_agg", "jsonb_extract_path_text", "make_interval",
+];
+
+const MYSQL_ONLY = ["date_format", "ifnull", "group_concat", "json_extract", "date_add", "datediff"];
+
+const SQLITE_ONLY = ["strftime", "datetime", "unixepoch", "json_extract", "json_group_array"];
+
+/** 函数候选按引擎区分：方言 builtin 噪声太大，只用签名表与各引擎补充清单的并集。 */
+export function functionCatalog(engine: Engine): string[] {
+  const extra = engine === "sqlite" ? SQLITE_ONLY : engine === "mysql" || engine === "mariadb" ? MYSQL_ONLY : PG_ONLY;
+  return [...new Set([...BASE_FUNCTIONS, ...extra, ...KNOWN_FUNCTIONS.filter((name) => BASE_FUNCTIONS.includes(name))])];
 }
 
 export function functionDetail(engine: Engine, name: string): string {

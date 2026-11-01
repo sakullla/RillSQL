@@ -191,6 +191,17 @@ describe("rule-based completion", () => {
     expect(all.items.some((item) => item.kind === "schema")).toBe(true);
   });
 
+  it("keeps SELECT ahead of subsequence matches from other groups", () => {
+    const plan = completionPlan({
+      prefix: "SEL",
+      connection: atlas,
+      database: "atlas_dev",
+      engine: "postgres",
+      columns: [{ label: "serial_number", detail: "public.orders" }],
+    });
+    expect(plan.items[0]).toMatchObject({ kind: "keyword", label: "SELECT" });
+  });
+
   it("offers only databases after USE", () => {
     const plan = completionPlan({
       prefix: "",
