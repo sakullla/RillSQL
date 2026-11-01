@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
 import { fetchExtras } from "../catalog/backend";
+import { refreshCatalog } from "../catalog/store";
 import type { CatalogExtras, SequenceInfo } from "../catalog/types";
 import type { Engine } from "../engines";
 import { tr as t } from "../i18n";
@@ -100,6 +101,8 @@ async function confirmRun(): Promise<void> {
     );
     const failed = receipt.value.blocked.length > 0 || receipt.value.steps.some((step) => step.status !== "ok");
     if (!failed) toast(t("admin.maintenance.done"), "ok");
+    /* 写操作改的是目录状态（外键开关、附加库、事件），树要跟着重读。 */
+    if (!failed) await refreshCatalog();
     await load();
   } catch (caught) {
     toast(t("admin.panel.executeFailed", { reason: reasonOf(caught) }), "err");
