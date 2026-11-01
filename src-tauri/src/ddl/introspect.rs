@@ -2,7 +2,11 @@ use sqlx::Row;
 
 use crate::connections::CatalogSession;
 
-use super::model::{Action, Column, DependentSql, Engine, ForeignKey, IncomingForeignKey, Index, IndexColumn, Request, Snapshot};
+use std::collections::BTreeMap;
+
+use super::model::{
+    Action, AttachedDatabase, Column, DependentSql, DomainState, Engine, ForeignKey, IncomingForeignKey, Index, IndexColumn, Request, SequenceState, Snapshot,
+};
 use super::sql::{mentions, qualified_table, quote_ident};
 
 pub async fn load(session: &CatalogSession, request: &Request, table: &str) -> Result<Snapshot, String> {
@@ -63,9 +67,34 @@ pub async fn enrich(session: &CatalogSession, snapshot: &mut Snapshot, action: &
     Ok(())
 }
 
+/// 数据库级动作（序列、枚举、域、事件、PRAGMA、附加库、维护）不针对某张表，
+/// 走 object_snapshot 读它们自己的状态。
+pub fn is_object_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::AlterSequence { .. }
+            | Action::AddEnumValue { .. }
+            | Action::AlterDomain { .. }
+            | Action::SetEventEnabled { .. }
+            | Action::SetPragma { .. }
+            | Action::AttachDatabase { .. }
+            | Action::Vacuum
+            | Action::Reindex { .. }
+    )
+}
+
 pub fn table_of(action: &Action) -> Option<&str> {
     match action {
         Action::CreateTable { .. } | Action::SetForeignKeys { .. } => None,
+        // 数据库级动作没有目标表；plan 只根据 object_snapshot 读到的状态生成语句。
+        Action::AlterSequence { .. }
+        | Action::AddEnumValue { .. }
+        | Action::AlterDomain { .. }
+        | Action::SetEventEnabled { .. }
+        | Action::SetPragma { .. }
+        | Action::AttachDatabase { .. }
+        | Action::Vacuum
+        | Action::Reindex { .. } => None,
         Action::AlterColumns { table, .. }
         | Action::CreateIndex { table, .. }
         | Action::DropIndex { table, .. }
@@ -124,6 +153,200 @@ fn ensure_session(session: &CatalogSession, engine: Engine) -> Result<(), String
         Ok(())
     } else {
         Err("会话类型和目标数据库不一致，没有另开连接。".to_owned())
+    }
+}
+
+/// 读数据库级动作自己的状态：序列参数、枚举取值、域定义、事件状态、SQLite PRAGMA 与附加库。
+/// 读不到就返回原因，plan 不会用猜出来的当前值判断“没有变化”。
+pub async fn object_snapshot(session: &CatalogSession, request: &Request) -> Result<Snapshot, String> {
+    ensure_session(session, request.engine)?;
+    let mut snapshot = Snapshot::bare(request.engine, &request.database, &request.schema, "");
+    snapshot.table_sql.clear();
+    match &request.action {
+        Action::AlterSequence { sequence, .. } => {
+            snapshot.kind = "sequence".to_owned();
+            snapshot.name = sequence.clone();
+            if request.engine == Engine::Postgres {
+                let CatalogSession::Postgres(client) = session else {
+                    return Err("会话类型和目标数据库不一致，没有另开连接。".to_owned());
+                };
+                snapshot.sequence = Some(postgres_sequence(client, &request.schema, sequence).await?);
+            }
+        }
+        Action::AddEnumValue { enum_name, .. } => {
+            snapshot.kind = "enum".to_owned();
+            snapshot.name = enum_name.clone();
+            if request.engine == Engine::Postgres {
+                let CatalogSession::Postgres(client) = session else {
+                    return Err("会话类型和目标数据库不一致，没有另开连接。".to_owned());
+                };
+                snapshot.enum_values = postgres_enum_values(client, &request.schema, enum_name).await?;
+            }
+        }
+        Action::AlterDomain { domain, .. } => {
+            snapshot.kind = "domain".to_owned();
+            snapshot.name = domain.clone();
+            if request.engine == Engine::Postgres {
+                let CatalogSession::Postgres(client) = session else {
+                    return Err("会话类型和目标数据库不一致，没有另开连接。".to_owned());
+                };
+                snapshot.domain = Some(postgres_domain(client, &request.schema, domain).await?);
+            }
+        }
+        Action::SetEventEnabled { event, .. } => {
+            snapshot.kind = "event".to_owned();
+            snapshot.name = event.clone();
+            if matches!(request.engine, Engine::Mysql | Engine::Mariadb) {
+                let CatalogSession::Mysql(pool) = session else {
+                    return Err("会话类型和目标数据库不一致，没有另开连接。".to_owned());
+                };
+                snapshot.event_enabled = mysql_event_enabled(pool, &request.database, event).await?;
+            }
+        }
+        Action::SetPragma { .. } | Action::AttachDatabase { .. } | Action::Vacuum | Action::Reindex { .. } => {
+            snapshot.kind = "database".to_owned();
+            if request.engine == Engine::Sqlite {
+                let CatalogSession::Sqlite { pool, foreign_keys } = session else {
+                    return Err("会话类型和目标数据库不一致，没有另开连接。".to_owned());
+                };
+                let state = sqlite_state(pool).await?;
+                snapshot.recorded_foreign_keys = *foreign_keys;
+                snapshot.live_foreign_keys = state.foreign_keys;
+                snapshot.pragmas = state.pragmas;
+                snapshot.attached = state.attached;
+            }
+        }
+        _ => return Err("这个动作需要指定表，不是数据库级动作。".to_owned()),
+    }
+    Ok(snapshot)
+}
+
+struct SqliteState {
+    foreign_keys: Option<bool>,
+    pragmas: BTreeMap<String, String>,
+    attached: Vec<AttachedDatabase>,
+}
+
+async fn sqlite_state(pool: &sqlx::SqlitePool) -> Result<SqliteState, String> {
+    let mut pragmas = BTreeMap::new();
+    let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(pool).await.map_err(|err| err.to_string())?;
+    pragmas.insert("foreign_keys".to_owned(), if foreign_keys != 0 { "ON" } else { "OFF" }.to_owned());
+    let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode").fetch_one(pool).await.map_err(|err| err.to_string())?;
+    pragmas.insert("journal_mode".to_owned(), journal_mode);
+    let user_version: i64 = sqlx::query_scalar("PRAGMA user_version").fetch_one(pool).await.map_err(|err| err.to_string())?;
+    pragmas.insert("user_version".to_owned(), user_version.to_string());
+    let rows = sqlx::query("PRAGMA database_list").fetch_all(pool).await.map_err(|err| err.to_string())?;
+    let attached = rows
+        .iter()
+        .map(|row| AttachedDatabase { name: sqlite_text(row, 1).unwrap_or_default(), path: sqlite_text(row, 2).unwrap_or_default() })
+        .collect::<Vec<_>>();
+    Ok(SqliteState { foreign_keys: Some(foreign_keys != 0), pragmas, attached })
+}
+
+async fn postgres_sequence(client: &tokio_postgres::Client, schema: &str, name: &str) -> Result<SequenceState, String> {
+    let row = client
+        .query_opt(
+            "SELECT start_value, increment_by, min_value, max_value, cycle FROM pg_catalog.pg_sequences WHERE schemaname = $1 AND sequencename = $2",
+            &[&schema, &name],
+        )
+        .await
+        .map_err(|err| format!("读不到序列 {name}：{err}"))?;
+    let Some(row) = row else {
+        return Err(format!("找不到序列 {name}。"));
+    };
+    // 没有权限时这些列是 NULL：plan 会因此拒绝生成语句，而不是当成 0。
+    Ok(SequenceState {
+        start: row.get::<_, Option<i64>>(0),
+        increment: row.get::<_, Option<i64>>(1),
+        min_value: row.get::<_, Option<i64>>(2),
+        max_value: row.get::<_, Option<i64>>(3),
+        cycle: row.get::<_, Option<bool>>(4),
+    })
+}
+
+async fn postgres_type_kind(client: &tokio_postgres::Client, schema: &str, name: &str) -> Result<Option<String>, String> {
+    let row = client
+        .query_opt(
+            "SELECT t.typtype::text FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1 AND t.typname = $2",
+            &[&schema, &name],
+        )
+        .await
+        .map_err(|err| format!("读不到类型 {name}：{err}"))?;
+    Ok(row.map(|row| row.get::<_, String>(0)))
+}
+
+async fn postgres_enum_values(client: &tokio_postgres::Client, schema: &str, name: &str) -> Result<Vec<String>, String> {
+    match postgres_type_kind(client, schema, name).await?.as_deref() {
+        None => return Err(format!("找不到类型 {name}。")),
+        Some("e") => {}
+        Some(_) => return Err(format!("{name} 不是枚举类型，枚举值只能加在枚举上。")),
+    }
+    let rows = client
+        .query(
+            "SELECT e.enumlabel FROM pg_catalog.pg_enum e JOIN pg_catalog.pg_type t ON t.oid = e.enumtypid JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1 AND t.typname = $2 ORDER BY e.enumsortorder",
+            &[&schema, &name],
+        )
+        .await
+        .map_err(|err| format!("读不到枚举 {name} 的取值：{err}"))?;
+    Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
+}
+
+async fn postgres_domain(client: &tokio_postgres::Client, schema: &str, name: &str) -> Result<DomainState, String> {
+    match postgres_type_kind(client, schema, name).await?.as_deref() {
+        None => return Err(format!("找不到类型 {name}。")),
+        Some("d") => {}
+        Some(_) => return Err(format!("{name} 不是域（domain）。")),
+    }
+    let row = client
+        .query_opt(
+            "SELECT t.typnotnull, pg_catalog.pg_get_expr(t.typdefaultbin, 0) FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = $1 AND t.typname = $2",
+            &[&schema, &name],
+        )
+        .await
+        .map_err(|err| format!("读不到域 {name} 的定义：{err}"))?;
+    let Some(row) = row else {
+        return Err(format!("找不到域 {name}。"));
+    };
+    Ok(DomainState { not_null: row.get::<_, bool>(0), default_sql: row.get::<_, Option<String>>(1) })
+}
+
+async fn mysql_event_enabled(pool: &mysql_async::Pool, database: &str, event: &str) -> Result<Option<bool>, String> {
+    if database.is_empty() {
+        return Err("需要数据库名，没有另开连接。".to_owned());
+    }
+    let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
+    let row: Option<mysql_async::Row> = mysql_async::prelude::Queryable::exec_first(
+        &mut conn,
+        "SELECT STATUS FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ? AND EVENT_NAME = ?",
+        (database.to_owned(), event.to_owned()),
+    )
+    .await
+    .map_err(|err| format!("读不到事件 {event}：{err}"))?;
+    let Some(row) = row else {
+        return Err(format!("找不到事件 {database}.{event}。"));
+    };
+    Ok(Some(mysql_string(&row, 0).eq_ignore_ascii_case("ENABLED")))
+}
+
+/// 维护动作完成后的结果反馈。读不到就只给一句“已完成”，不编造数字。
+pub async fn maintenance_note(session: &CatalogSession, action: &Action) -> Option<String> {
+    if !matches!(action, Action::Vacuum | Action::Reindex { .. }) {
+        return None;
+    }
+    let CatalogSession::Sqlite { pool, .. } = session else {
+        return None;
+    };
+    match action {
+        Action::Vacuum => {
+            let pages: Option<i64> = sqlx::query_scalar("PRAGMA page_count").fetch_one(pool).await.ok();
+            let free: Option<i64> = sqlx::query_scalar("PRAGMA freelist_count").fetch_one(pool).await.ok();
+            Some(match (pages, free) {
+                (Some(pages), Some(free)) => format!("VACUUM 已完成：数据库现在有 {pages} 页，其中空闲 {free} 页。"),
+                _ => "VACUUM 已完成。".to_owned(),
+            })
+        }
+        Action::Reindex { .. } => Some("REINDEX 已完成：索引已按当前的表结构重建。".to_owned()),
+        _ => None,
     }
 }
 

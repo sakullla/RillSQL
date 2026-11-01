@@ -1,5 +1,5 @@
 use super::model::{
-    fk_actions, rule_text, Action, Column, ColumnDraft, Engine, ForeignKey, ForeignKeyDraft, Index, Plan, Risk, Snapshot, Step,
+    fk_actions, rule_text, Action, Column, ColumnDraft, Engine, ForeignKey, ForeignKeyDraft, Index, Plan, Risk, SequenceState, Snapshot, Step,
 };
 use super::sql::{mentions, non_null_default, qualified_table, quote_ident, sqlite_at_least, valid_default, valid_name, valid_type};
 
@@ -16,6 +16,18 @@ pub fn plan(snapshot: &Snapshot, action: &Action) -> Plan {
         Action::DropTable { table } => plan_drop_table(snapshot, table),
         Action::SetForeignKeys { enabled } => plan_set_fk(snapshot, *enabled),
         Action::ReplaceView { table, definition } => plan_replace_view(snapshot, table, definition),
+        Action::AlterSequence { sequence, start, increment, min_value, max_value, cycle } => plan_alter_sequence(
+            snapshot,
+            sequence,
+            &SequenceState { start: *start, increment: *increment, min_value: *min_value, max_value: *max_value, cycle: *cycle },
+        ),
+        Action::AddEnumValue { enum_name, value, before } => plan_add_enum_value(snapshot, enum_name, value, before.as_deref()),
+        Action::AlterDomain { domain, default_sql, not_null } => plan_alter_domain(snapshot, domain, default_sql.as_deref(), *not_null),
+        Action::SetEventEnabled { event, enabled } => plan_set_event_enabled(snapshot, event, *enabled),
+        Action::SetPragma { pragma, value } => plan_set_pragma(snapshot, pragma, value),
+        Action::AttachDatabase { path, name } => plan_attach_database(snapshot, path, name),
+        Action::Vacuum => plan_vacuum(snapshot),
+        Action::Reindex { target } => plan_reindex(snapshot, target.as_deref()),
     }
 }
 
@@ -286,6 +298,425 @@ fn plan_set_fk(snapshot: &Snapshot, enabled: bool) -> Plan {
             vec![Step { sql: format!("PRAGMA foreign_keys = {value};"), label: format!("设置 foreign_keys = {value}") }],
         ),
     }
+}
+
+fn plan_alter_sequence(snapshot: &Snapshot, sequence: &str, wanted: &SequenceState) -> Plan {
+    let target = target_label(snapshot.engine, &snapshot.database, &snapshot.schema, sequence);
+    let mut risks = vec![Risk {
+        level: "info".to_owned(),
+        text: "序列参数改完立即生效，之后取号按新参数生成。已有数据里的号不会因此改变。".to_owned(),
+    }];
+    if snapshot.engine != Engine::Postgres {
+        return finish(
+            snapshot.engine,
+            false,
+            target,
+            vec!["只有 PostgreSQL 的序列参数由这里修改；其它引擎请在查询里自己写 ALTER SEQUENCE。".to_owned()],
+            risks,
+            Vec::new(),
+        );
+    }
+    let mut blocked = Vec::new();
+    if !valid_name(sequence) {
+        blocked.push("序列名无效。".to_owned());
+    }
+    let Some(current) = snapshot.sequence.as_ref() else {
+        blocked.push(format!("没有读到序列 {sequence} 的参数，没有生成语句。"));
+        return finish(snapshot.engine, false, target, blocked, risks, Vec::new());
+    };
+    if current.start.is_none() && current.increment.is_none() && current.min_value.is_none() && current.max_value.is_none() && current.cycle.is_none() {
+        blocked.push(format!("序列 {sequence} 的参数读不到（可能是权限不足），没有生成语句。"));
+    }
+    if wanted.increment == Some(0) {
+        blocked.push("步长不能是 0。".to_owned());
+    }
+    if let (Some(min), Some(max)) = (wanted.min_value.or(current.min_value), wanted.max_value.or(current.max_value)) {
+        if min >= max {
+            blocked.push("最小值必须小于最大值。".to_owned());
+        }
+    }
+    let mut clauses: Vec<String> = Vec::new();
+    if let Some(value) = wanted.increment {
+        if current.increment != Some(value) {
+            clauses.push(format!("INCREMENT BY {value}"));
+        }
+    }
+    if let Some(value) = wanted.min_value {
+        if current.min_value != Some(value) {
+            clauses.push(format!("MINVALUE {value}"));
+        }
+    }
+    if let Some(value) = wanted.max_value {
+        if current.max_value != Some(value) {
+            clauses.push(format!("MAXVALUE {value}"));
+        }
+    }
+    if let Some(value) = wanted.start {
+        if current.start != Some(value) {
+            clauses.push(format!("START WITH {value}"));
+        }
+    }
+    if let Some(cycle) = wanted.cycle {
+        if current.cycle != Some(cycle) {
+            clauses.push(if cycle { "CYCLE".to_owned() } else { "NO CYCLE".to_owned() });
+        }
+    }
+    if clauses.iter().any(|clause| clause.starts_with("START WITH")) {
+        risks.push(Risk {
+            level: "warn".to_owned(),
+            text: "START WITH 只改以后 RESTART 用的起点，不会移动已经取到的号；要移动当前号得另外 RESTART。".to_owned(),
+        });
+    }
+    if clauses.iter().any(|clause| clause.starts_with("MAXVALUE") || clause.starts_with("MINVALUE")) {
+        risks.push(Risk {
+            level: "warn".to_owned(),
+            text: "调小上界或调大下界可能让之后的取号失败；这里不检查已经用掉的号。".to_owned(),
+        });
+    }
+    if !blocked.is_empty() {
+        return finish(snapshot.engine, false, target, blocked, risks, Vec::new());
+    }
+    if clauses.is_empty() {
+        return finish(snapshot.engine, false, target, vec![format!("序列 {sequence} 的参数没有变化。")], risks, Vec::new());
+    }
+    match qualified_table(snapshot.engine, &snapshot.database, &snapshot.schema, sequence) {
+        Ok(name) => {
+            let sql = format!("ALTER SEQUENCE {name} {};", clauses.join(" "));
+            finish(snapshot.engine, false, target, Vec::new(), risks, vec![Step { label: format!("修改序列 {sequence}"), sql }])
+        }
+        Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
+    }
+}
+
+fn plan_add_enum_value(snapshot: &Snapshot, enum_name: &str, value: &str, before: Option<&str>) -> Plan {
+    let target = target_label(snapshot.engine, &snapshot.database, &snapshot.schema, enum_name);
+    let mut risks = vec![Risk {
+        level: "info".to_owned(),
+        text: "枚举值只能追加，不能删除或调整顺序；已有的行不会被改写。".to_owned(),
+    }];
+    if snapshot.engine != Engine::Postgres {
+        return finish(snapshot.engine, false, target, vec!["只有 PostgreSQL 有枚举类型，这里不生成语句。".to_owned()], risks, Vec::new());
+    }
+    let trimmed = value.trim();
+    let mut blocked = Vec::new();
+    if !valid_name(enum_name) {
+        blocked.push("枚举名无效。".to_owned());
+    }
+    if trimmed.is_empty() {
+        blocked.push("枚举值不能为空。".to_owned());
+    } else if trimmed.chars().any(char::is_control) {
+        blocked.push("枚举值里不能有控制字符。".to_owned());
+    } else if trimmed.len() > 63 {
+        blocked.push("PostgreSQL 的枚举值最长 63 字节。".to_owned());
+    }
+    if snapshot.enum_values.is_empty() {
+        blocked.push(format!("没有读到枚举 {enum_name} 的现有取值（可能不是枚举或权限不足），没有生成语句。"));
+    } else if snapshot.enum_values.iter().any(|item| item == trimmed) {
+        blocked.push(format!("{trimmed} 已经是 {enum_name} 的值，没有生成语句。"));
+    }
+    let before = before.map(str::trim).filter(|item| !item.is_empty());
+    if let Some(at) = before {
+        if !snapshot.enum_values.iter().any(|item| item == at) {
+            blocked.push(format!("找不到枚举值 {at}，没有生成语句。"));
+        }
+        if at == trimmed {
+            blocked.push("不能把新值放在它自己前面。".to_owned());
+        }
+    }
+    if !blocked.is_empty() {
+        return finish(snapshot.engine, false, target, blocked, risks, Vec::new());
+    }
+    risks.push(Risk {
+        level: "warn".to_owned(),
+        text: "新值要在这条语句执行完之后才能被使用；这里单条执行，不把追加值和使用它的语句放进同一个事务。".to_owned(),
+    });
+    let literal = format!("'{}'", trimmed.replace('\'', "''"));
+    let placement = match before {
+        Some(at) => format!(" BEFORE '{}'", at.replace('\'', "''")),
+        None => String::new(),
+    };
+    match qualified_table(snapshot.engine, &snapshot.database, &snapshot.schema, enum_name) {
+        Ok(name) => {
+            let sql = format!("ALTER TYPE {name} ADD VALUE {literal}{placement};");
+            finish(snapshot.engine, false, target, Vec::new(), risks, vec![Step { label: format!("给 {enum_name} 追加值 {trimmed}"), sql }])
+        }
+        Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
+    }
+}
+
+fn plan_alter_domain(snapshot: &Snapshot, domain: &str, default_sql: Option<&str>, not_null: Option<bool>) -> Plan {
+    let target = target_label(snapshot.engine, &snapshot.database, &snapshot.schema, domain);
+    let mut risks = vec![Risk {
+        level: "info".to_owned(),
+        text: "域的默认值只影响之后插入的行，不改已有数据。".to_owned(),
+    }];
+    if snapshot.engine != Engine::Postgres {
+        return finish(snapshot.engine, false, target, vec!["只有 PostgreSQL 有域（domain）对象，这里不生成语句。".to_owned()], risks, Vec::new());
+    }
+    let mut blocked = Vec::new();
+    if !valid_name(domain) {
+        blocked.push("域名无效。".to_owned());
+    }
+    let Some(current) = snapshot.domain.as_ref() else {
+        blocked.push(format!("没有读到域 {domain} 的定义，没有生成语句。"));
+        return finish(snapshot.engine, false, target, blocked, risks, Vec::new());
+    };
+    let mut changes: Vec<(String, String)> = Vec::new();
+    if let Some(raw) = default_sql {
+        let text = raw.trim();
+        if text.is_empty() || text.eq_ignore_ascii_case("null") {
+            if current.default_sql.is_some() {
+                changes.push(("删除域默认值".to_owned(), "DROP DEFAULT".to_owned()));
+            }
+        } else if !valid_default(Engine::Postgres, text) {
+            blocked.push("默认值只接受字面量、TRUE/FALSE、now() 或 CURRENT_TIMESTAMP。".to_owned());
+        } else if current.default_sql.as_deref() != Some(text) {
+            changes.push(("修改域默认值".to_owned(), format!("SET DEFAULT {text}")));
+        }
+    }
+    if let Some(not_null) = not_null {
+        if current.not_null != not_null {
+            changes.push(("修改域 NOT NULL".to_owned(), if not_null { "SET NOT NULL".to_owned() } else { "DROP NOT NULL".to_owned() }));
+            if not_null {
+                risks.push(Risk {
+                    level: "warn".to_owned(),
+                    text: "SET NOT NULL 会先检查已有数据，存在空值时数据库会报错；这里不先改写数据。".to_owned(),
+                });
+            }
+        }
+    }
+    if !blocked.is_empty() {
+        return finish(snapshot.engine, false, target, blocked, risks, Vec::new());
+    }
+    if changes.is_empty() {
+        return finish(snapshot.engine, false, target, vec![format!("域 {domain} 的默认值与 NOT NULL 没有变化。")], risks, Vec::new());
+    }
+    match qualified_table(snapshot.engine, &snapshot.database, &snapshot.schema, domain) {
+        Ok(name) => {
+            let steps = changes
+                .into_iter()
+                .map(|(label, clause)| Step { sql: format!("ALTER DOMAIN {name} {clause};"), label })
+                .collect::<Vec<_>>();
+            finish(snapshot.engine, false, target, Vec::new(), risks, steps)
+        }
+        Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
+    }
+}
+
+fn plan_set_event_enabled(snapshot: &Snapshot, event: &str, enabled: bool) -> Plan {
+    let target = target_label(snapshot.engine, &snapshot.database, &snapshot.schema, event);
+    let mut risks = vec![Risk { level: "info".to_owned(), text: "只改事件的启停状态，不改它的事件体。".to_owned() }];
+    if !matches!(snapshot.engine, Engine::Mysql | Engine::Mariadb) {
+        return finish(snapshot.engine, false, target, vec!["只有 MySQL 与 MariaDB 有事件（event）对象，这里不生成语句。".to_owned()], risks, Vec::new());
+    }
+    let mut blocked = Vec::new();
+    if !valid_name(event) {
+        blocked.push("事件名无效。".to_owned());
+    }
+    match snapshot.event_enabled {
+        None => blocked.push(format!("没有读到事件 {event}，没有生成语句。")),
+        Some(current) if current == enabled => {
+            blocked.push(format!("事件 {event} 已经是 {}。", if enabled { "enabled" } else { "disabled" }));
+        }
+        Some(_) => {}
+    }
+    if !blocked.is_empty() {
+        return finish(snapshot.engine, false, target, blocked, risks, Vec::new());
+    }
+    risks.push(Risk {
+        level: "warn".to_owned(),
+        text: "event_scheduler 关闭时事件仍然不会执行；这里不改调度器状态。".to_owned(),
+    });
+    match qualified_table(snapshot.engine, &snapshot.database, "", event) {
+        Ok(name) => {
+            let keyword = if enabled { "ENABLE" } else { "DISABLE" };
+            let sql = format!("ALTER EVENT {name} {keyword};");
+            finish(
+                snapshot.engine,
+                false,
+                target,
+                Vec::new(),
+                risks,
+                vec![Step { label: format!("{}事件 {event}", if enabled { "启用" } else { "停用" }), sql }],
+            )
+        }
+        Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
+    }
+}
+
+fn plan_set_pragma(snapshot: &Snapshot, pragma: &str, value: &str) -> Plan {
+    let name = pragma.trim().to_ascii_lowercase();
+    let target = format!("sqlite / pragma {name}");
+    if snapshot.engine != Engine::Sqlite {
+        return finish(snapshot.engine, false, target, vec!["只有 SQLite 用 PRAGMA 改这些开关，这里不生成语句。".to_owned()], Vec::new(), Vec::new());
+    }
+    if name == "foreign_keys" {
+        return finish(
+            snapshot.engine,
+            false,
+            target,
+            vec!["foreign_keys 走外键开关动作（SetForeignKeys），这里不重复生成同一条 PRAGMA。".to_owned()],
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+    let mut blocked = Vec::new();
+    let mut risks = Vec::new();
+    let normalized = match name.as_str() {
+        "journal_mode" => {
+            let mode = value.trim().to_ascii_lowercase();
+            const MODES: [&str; 6] = ["delete", "truncate", "persist", "memory", "wal", "off"];
+            if !MODES.contains(&mode.as_str()) {
+                blocked.push("journal_mode 只能是 delete、truncate、persist、memory、wal 或 off。".to_owned());
+            }
+            risks.push(Risk { level: "info".to_owned(), text: "journal_mode 写进数据库文件头，重新打开这个文件后仍然是这个模式。".to_owned() });
+            if mode == "wal" {
+                risks.push(Risk {
+                    level: "warn".to_owned(),
+                    text: "WAL 会在库文件旁边多出 -wal 与 -shm 文件，需要文件系统支持共享内存。".to_owned(),
+                });
+            }
+            if mode == "off" {
+                risks.push(Risk { level: "warn".to_owned(), text: "关掉日志后崩溃时无法回滚未完成的事务。".to_owned() });
+            }
+            if blocked.is_empty() { mode.to_ascii_uppercase() } else { String::new() }
+        }
+        "user_version" => {
+            let number = value.trim().parse::<i64>().ok().filter(|number| (0..=2_147_483_647).contains(number));
+            match number {
+                Some(number) => number.to_string(),
+                None => {
+                    blocked.push("user_version 只接受 0 到 2147483647 的整数。".to_owned());
+                    String::new()
+                }
+            }
+        }
+        _ => {
+            blocked.push("这里只改 journal_mode 与 user_version，其它 PRAGMA 不放行。".to_owned());
+            String::new()
+        }
+    };
+    if blocked.is_empty() {
+        if let Some(current) = snapshot.pragmas.get(&name) {
+            if current.eq_ignore_ascii_case(normalized.trim()) {
+                blocked.push(format!("{name} 已经是 {normalized}，没有生成语句。"));
+            }
+        }
+    }
+    if !blocked.is_empty() {
+        return finish(snapshot.engine, false, target, blocked, risks, Vec::new());
+    }
+    let sql = format!("PRAGMA {name} = {normalized};");
+    finish(
+        snapshot.engine,
+        false,
+        target,
+        Vec::new(),
+        risks,
+        vec![Step { label: format!("设置 {name} = {normalized}"), sql }],
+    )
+}
+
+fn plan_attach_database(snapshot: &Snapshot, path: &str, name: &str) -> Plan {
+    let trimmed_name = name.trim();
+    let target = format!("sqlite / attach {trimmed_name}");
+    if snapshot.engine != Engine::Sqlite {
+        return finish(snapshot.engine, false, target, vec!["只有 SQLite 用 ATTACH 附加数据库文件，这里不生成语句。".to_owned()], Vec::new(), Vec::new());
+    }
+    let trimmed_path = path.trim();
+    let mut blocked = Vec::new();
+    if trimmed_path.is_empty() {
+        blocked.push("要附加的数据库文件路径不能为空。".to_owned());
+    } else if trimmed_path.chars().any(char::is_control) {
+        blocked.push("文件路径里不能有控制字符。".to_owned());
+    } else if trimmed_path.len() > 1024 {
+        blocked.push("文件路径太长。".to_owned());
+    }
+    if !valid_name(trimmed_name) {
+        blocked.push("附加库的名字无效。".to_owned());
+    } else if trimmed_name.eq_ignore_ascii_case("main") || trimmed_name.eq_ignore_ascii_case("temp") {
+        blocked.push(format!("{trimmed_name} 是 SQLite 保留的库名，不能用来附加。"));
+    } else if snapshot.attached.iter().any(|item| item.name.eq_ignore_ascii_case(trimmed_name)) {
+        blocked.push(format!("{trimmed_name} 已经附加在这个连接上，没有生成语句。"));
+    }
+    let mut risks = vec![
+        Risk { level: "warn".to_owned(), text: "路径上没有库文件时 SQLite 会新建一个空库；这里不检查文件是否已经存在。".to_owned() },
+        Risk { level: "info".to_owned(), text: "ATTACH 只对当前连接生效，断开连接后不保留。".to_owned() },
+    ];
+    if let Some(same) = snapshot.attached.iter().find(|item| !item.path.is_empty() && item.path == trimmed_path) {
+        risks.push(Risk {
+            level: "warn".to_owned(),
+            text: format!("同一个文件已经作为 {} 附加过；再加一次会在写入时互相干扰。", same.name),
+        });
+    }
+    if !blocked.is_empty() {
+        return finish(snapshot.engine, false, target, blocked, risks, Vec::new());
+    }
+    let literal = trimmed_path.replace('\'', "''");
+    let sql = format!("ATTACH DATABASE '{literal}' AS {};", quote_ident(Engine::Sqlite, trimmed_name));
+    finish(
+        snapshot.engine,
+        false,
+        target,
+        Vec::new(),
+        risks,
+        vec![Step { label: format!("附加 {trimmed_name}"), sql }],
+    )
+}
+
+fn plan_vacuum(snapshot: &Snapshot) -> Plan {
+    let target = "sqlite / vacuum".to_owned();
+    let risks = vec![
+        Risk {
+            level: "warn".to_owned(),
+            text: "VACUUM 会重写整个数据库文件，需要额外的临时磁盘空间；不确认执行就不会写入。".to_owned(),
+        },
+        Risk { level: "info".to_owned(), text: "VACUUM 不能在事务里执行，这里单条执行，不改表结构也不改数据。".to_owned() },
+    ];
+    if snapshot.engine != Engine::Sqlite {
+        return finish(snapshot.engine, false, target, vec!["维护动作只对 SQLite 提供；其它引擎请在查询里自己写 VACUUM。".to_owned()], risks, Vec::new());
+    }
+    finish(
+        snapshot.engine,
+        false,
+        target,
+        Vec::new(),
+        risks,
+        vec![Step { sql: "VACUUM;".to_owned(), label: "整理数据库文件".to_owned() }],
+    )
+}
+
+fn plan_reindex(snapshot: &Snapshot, target_name: Option<&str>) -> Plan {
+    let wanted = target_name.map(str::trim).filter(|item| !item.is_empty());
+    let target = match wanted {
+        Some(name) => format!("sqlite / reindex {name}"),
+        None => "sqlite / reindex".to_owned(),
+    };
+    let risks = vec![
+        Risk { level: "info".to_owned(), text: "REINDEX 只重建索引，不改表里的数据。".to_owned() },
+        Risk { level: "warn".to_owned(), text: "大表重建索引期间会占用写锁，其它写入要等它结束。".to_owned() },
+    ];
+    if snapshot.engine != Engine::Sqlite {
+        return finish(snapshot.engine, false, target, vec!["维护动作只对 SQLite 提供；其它引擎请在查询里自己写 REINDEX。".to_owned()], risks, Vec::new());
+    }
+    let mut blocked = Vec::new();
+    if let Some(name) = wanted {
+        if !valid_name(name) {
+            blocked.push("要重建的索引或表名无效。".to_owned());
+        }
+    }
+    if !blocked.is_empty() {
+        return finish(snapshot.engine, false, target, blocked, risks, Vec::new());
+    }
+    let sql = match wanted {
+        Some(name) => format!("REINDEX {};", quote_ident(Engine::Sqlite, name)),
+        None => "REINDEX;".to_owned(),
+    };
+    let label = match wanted {
+        Some(name) => format!("重建 {name} 的索引"),
+        None => "重建当前库的索引".to_owned(),
+    };
+    finish(snapshot.engine, false, target, Vec::new(), risks, vec![Step { sql, label }])
 }
 
 fn plan_drop_table(snapshot: &Snapshot, table: &str) -> Plan {

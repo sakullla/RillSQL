@@ -61,6 +61,30 @@ pub struct DependentSql {
     pub sql: String,
 }
 
+/// 序列参数。读不到的字段是 None：plan 不会用猜出来的当前值判断“没有变化”。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SequenceState {
+    pub start: Option<i64>,
+    pub increment: Option<i64>,
+    pub min_value: Option<i64>,
+    pub max_value: Option<i64>,
+    pub cycle: Option<bool>,
+}
+
+/// 域的默认值与 NOT NULL。默认值为 None 表示这个域没有默认值。
+#[derive(Clone, Debug, Default)]
+pub struct DomainState {
+    pub default_sql: Option<String>,
+    pub not_null: bool,
+}
+
+/// SQLite 已附加的库。main 与 temp 也在列表里，它们的 path 为空。
+#[derive(Clone, Debug, Default)]
+pub struct AttachedDatabase {
+    pub name: String,
+    pub path: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub engine: Engine,
@@ -96,6 +120,18 @@ pub struct Snapshot {
     pub index_error: Option<String>,
     /// 外键查询失败。列已经读到，不能把整表当成没读到。
     pub foreign_key_error: Option<String>,
+    /// PostgreSQL 序列的现有参数。只有序列动作会读。
+    pub sequence: Option<SequenceState>,
+    /// PostgreSQL 枚举的现有取值，按定义顺序。空表示没读到或不是枚举。
+    pub enum_values: Vec<String>,
+    /// PostgreSQL 域的现有默认值与 NOT NULL。
+    pub domain: Option<DomainState>,
+    /// MySQL 事件的启用状态。None 表示没读到或事件不存在。
+    pub event_enabled: Option<bool>,
+    /// SQLite 的 foreign_keys / journal_mode / user_version 现值。
+    pub pragmas: BTreeMap<String, String>,
+    /// SQLite 已附加的库（含 main 与 temp）。
+    pub attached: Vec<AttachedDatabase>,
 }
 
 impl Snapshot {
@@ -130,6 +166,12 @@ impl Snapshot {
             definition_error: None,
             index_error: None,
             foreign_key_error: None,
+            sequence: None,
+            enum_values: Vec::new(),
+            domain: None,
+            event_enabled: None,
+            pragmas: BTreeMap::new(),
+            attached: Vec::new(),
         }
     }
 }
@@ -200,6 +242,22 @@ pub enum Action {
     SetForeignKeys { enabled: bool },
     /// 替换已有视图的定义。确认前只生成语句，不发送。
     ReplaceView { table: String, definition: String },
+    /// 改 PostgreSQL 序列的参数。只有填了值的子句会进语句。
+    AlterSequence { sequence: String, start: Option<i64>, increment: Option<i64>, min_value: Option<i64>, max_value: Option<i64>, cycle: Option<bool> },
+    /// 给 PostgreSQL 枚举追加一个值。枚举值只能追加，不能删除或重排。
+    AddEnumValue { enum_name: String, value: String, before: Option<String> },
+    /// 改 PostgreSQL 域的默认值与 NOT NULL。默认值为空串表示删掉默认值。
+    AlterDomain { domain: String, default_sql: Option<String>, not_null: Option<bool> },
+    /// 启停 MySQL/MariaDB 事件。事件的事件体仍然只读。
+    SetEventEnabled { event: String, enabled: bool },
+    /// 改 SQLite 的 PRAGMA 值。foreign_keys 走 SetForeignKeys，这里不重复。
+    SetPragma { pragma: String, value: String },
+    /// 附加一个 SQLite 数据库文件。只对当前连接生效。
+    AttachDatabase { path: String, name: String },
+    /// SQLite 维护：整理数据库文件。确认前不写入。
+    Vacuum,
+    /// SQLite 维护：重建索引。不带名字时重建整个库的索引。
+    Reindex { target: Option<String> },
 }
 
 #[derive(Clone, Debug)]

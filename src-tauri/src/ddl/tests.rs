@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use super::commands;
 use super::exec::{self, run_steps};
 use super::model::{
-    Action, Column, ColumnDraft, DependentSql, Engine, ForeignKey, Index, IndexColumn, IndexColumnDraft, Request, Snapshot, Step, StepStatus,
+    Action, AttachedDatabase, Column, ColumnDraft, DependentSql, DomainState, Engine, ForeignKey, Index, IndexColumn, IndexColumnDraft, Request, SequenceState,
+    Snapshot, Step, StepStatus,
 };
 use super::plan::plan;
 use crate::connections::{CatalogSession, Service};
@@ -997,4 +998,384 @@ fn sqlserver_alters_use_tsql_forms_without_inline_defaults() {
         },
     );
     assert!(create.steps.iter().any(|step| step.sql.contains("[id] int NOT NULL IDENTITY(1, 1)")), "{:?}", create.steps);
+}
+
+
+fn sequence_snapshot() -> Snapshot {
+    let mut snapshot = Snapshot::bare(Engine::Postgres, "app", "public", "");
+    snapshot.kind = "sequence".to_owned();
+    snapshot.name = "orders_id_seq".to_owned();
+    snapshot.sequence = Some(SequenceState {
+        start: Some(1),
+        increment: Some(1),
+        min_value: Some(1),
+        max_value: Some(2_147_483_647),
+        cycle: Some(false),
+    });
+    snapshot
+}
+
+#[test]
+fn postgres_sequence_alter_only_emits_changed_clauses() {
+    let snapshot = sequence_snapshot();
+    let planned = plan(
+        &snapshot,
+        &Action::AlterSequence { sequence: "orders_id_seq".to_owned(), start: Some(1), increment: Some(5), min_value: None, max_value: None, cycle: Some(true) },
+    );
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert_eq!(planned.steps.len(), 1);
+    assert_eq!(planned.steps[0].sql, "ALTER SEQUENCE \"public\".\"orders_id_seq\" INCREMENT BY 5 CYCLE;");
+    assert!(planned.risks.iter().any(|risk| risk.text.contains("序列参数改完立即生效")));
+
+    // 和现值完全一致时不给执行入口。
+    let same = plan(
+        &snapshot,
+        &Action::AlterSequence { sequence: "orders_id_seq".to_owned(), start: Some(1), increment: Some(1), min_value: None, max_value: None, cycle: Some(false) },
+    );
+    assert!(same.steps.is_empty());
+    assert!(same.blocked.iter().any(|item| item.contains("没有变化")));
+
+    let zero = plan(
+        &snapshot,
+        &Action::AlterSequence { sequence: "orders_id_seq".to_owned(), start: None, increment: Some(0), min_value: None, max_value: None, cycle: None },
+    );
+    assert!(zero.steps.is_empty());
+    assert!(zero.blocked.iter().any(|item| item.contains("步长不能是 0")));
+
+    let bounds = plan(
+        &snapshot,
+        &Action::AlterSequence { sequence: "orders_id_seq".to_owned(), start: None, increment: None, min_value: Some(9), max_value: Some(9), cycle: None },
+    );
+    assert!(bounds.steps.is_empty());
+    assert!(bounds.blocked.iter().any(|item| item.contains("最小值必须小于最大值")));
+}
+
+#[test]
+fn sequence_alter_blocks_without_state_or_postgres() {
+    let missing = Snapshot::bare(Engine::Postgres, "app", "public", "");
+    let planned = plan(
+        &missing,
+        &Action::AlterSequence { sequence: "orders_id_seq".to_owned(), start: None, increment: Some(5), min_value: None, max_value: None, cycle: None },
+    );
+    assert!(planned.steps.is_empty());
+    assert!(planned.blocked.iter().any(|item| item.contains("没有读到序列")), "{:?}", planned.blocked);
+
+    let mut unreadable = sequence_snapshot();
+    unreadable.sequence = Some(SequenceState::default());
+    let planned = plan(
+        &unreadable,
+        &Action::AlterSequence { sequence: "orders_id_seq".to_owned(), start: None, increment: Some(5), min_value: None, max_value: None, cycle: None },
+    );
+    assert!(planned.blocked.iter().any(|item| item.contains("读不到")), "{:?}", planned.blocked);
+
+    let sqlite = Snapshot::bare(Engine::Sqlite, "main", "", "");
+    let planned = plan(
+        &sqlite,
+        &Action::AlterSequence { sequence: "orders_id_seq".to_owned(), start: None, increment: Some(5), min_value: None, max_value: None, cycle: None },
+    );
+    assert!(planned.steps.is_empty());
+    assert!(planned.blocked.iter().any(|item| item.contains("只有 PostgreSQL")), "{:?}", planned.blocked);
+}
+
+#[test]
+fn postgres_enum_add_value_previews_placement_and_blocks_duplicates() {
+    let mut snapshot = Snapshot::bare(Engine::Postgres, "app", "public", "");
+    snapshot.kind = "enum".to_owned();
+    snapshot.name = "mood".to_owned();
+    snapshot.enum_values = vec!["sad".to_owned(), "ok".to_owned()];
+
+    let planned = plan(&snapshot, &Action::AddEnumValue { enum_name: "mood".to_owned(), value: "great".to_owned(), before: Some("ok".to_owned()) });
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert_eq!(planned.steps[0].sql, "ALTER TYPE \"public\".\"mood\" ADD VALUE 'great' BEFORE 'ok';");
+
+    let escaped = plan(&snapshot, &Action::AddEnumValue { enum_name: "mood".to_owned(), value: "it's".to_owned(), before: None });
+    assert_eq!(escaped.steps[0].sql, "ALTER TYPE \"public\".\"mood\" ADD VALUE 'it''s';");
+
+    let duplicate = plan(&snapshot, &Action::AddEnumValue { enum_name: "mood".to_owned(), value: "ok".to_owned(), before: None });
+    assert!(duplicate.steps.is_empty());
+    assert!(duplicate.blocked.iter().any(|item| item.contains("已经是 mood 的值")), "{:?}", duplicate.blocked);
+
+    let anchor = plan(&snapshot, &Action::AddEnumValue { enum_name: "mood".to_owned(), value: "great".to_owned(), before: Some("angry".to_owned()) });
+    assert!(anchor.blocked.iter().any(|item| item.contains("找不到枚举值 angry")), "{:?}", anchor.blocked);
+
+    let blank = plan(&snapshot, &Action::AddEnumValue { enum_name: "mood".to_owned(), value: "  ".to_owned(), before: None });
+    assert!(blank.blocked.iter().any(|item| item.contains("枚举值不能为空")), "{:?}", blank.blocked);
+
+    let mut unread = snapshot.clone();
+    unread.enum_values.clear();
+    let planned = plan(&unread, &Action::AddEnumValue { enum_name: "mood".to_owned(), value: "great".to_owned(), before: None });
+    assert!(planned.steps.is_empty());
+    assert!(planned.blocked.iter().any(|item| item.contains("没有读到枚举")), "{:?}", planned.blocked);
+
+    let mysql = Snapshot::bare(Engine::Mysql, "app", "", "");
+    let planned = plan(&mysql, &Action::AddEnumValue { enum_name: "mood".to_owned(), value: "great".to_owned(), before: None });
+    assert!(planned.blocked.iter().any(|item| item.contains("只有 PostgreSQL")), "{:?}", planned.blocked);
+}
+
+#[test]
+fn postgres_domain_alter_previews_default_and_not_null() {
+    let mut snapshot = Snapshot::bare(Engine::Postgres, "app", "public", "");
+    snapshot.kind = "domain".to_owned();
+    snapshot.name = "email".to_owned();
+    snapshot.domain = Some(DomainState { default_sql: Some("'none@example.com'".to_owned()), not_null: false });
+
+    let planned = plan(
+        &snapshot,
+        &Action::AlterDomain { domain: "email".to_owned(), default_sql: Some("'na@example.com'".to_owned()), not_null: Some(true) },
+    );
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    let sql: Vec<&str> = planned.steps.iter().map(|step| step.sql.as_str()).collect();
+    assert_eq!(
+        sql,
+        vec!["ALTER DOMAIN \"public\".\"email\" SET DEFAULT 'na@example.com';", "ALTER DOMAIN \"public\".\"email\" SET NOT NULL;"]
+    );
+    assert!(planned.risks.iter().any(|risk| risk.level == "warn" && risk.text.contains("SET NOT NULL 会先检查已有数据")));
+
+    let drop_default = plan(&snapshot, &Action::AlterDomain { domain: "email".to_owned(), default_sql: Some(String::new()), not_null: None });
+    assert_eq!(drop_default.steps[0].sql, "ALTER DOMAIN \"public\".\"email\" DROP DEFAULT;");
+
+    let unchanged = plan(
+        &snapshot,
+        &Action::AlterDomain { domain: "email".to_owned(), default_sql: Some("'none@example.com'".to_owned()), not_null: Some(false) },
+    );
+    assert!(unchanged.steps.is_empty());
+    assert!(unchanged.blocked.iter().any(|item| item.contains("没有变化")), "{:?}", unchanged.blocked);
+
+    let bad_default = plan(&snapshot, &Action::AlterDomain { domain: "email".to_owned(), default_sql: Some("now() + 1".to_owned()), not_null: None });
+    assert!(bad_default.blocked.iter().any(|item| item.contains("默认值只接受")), "{:?}", bad_default.blocked);
+
+    let not_domain = Snapshot::bare(Engine::Postgres, "app", "public", "");
+    let planned = plan(&not_domain, &Action::AlterDomain { domain: "email".to_owned(), default_sql: None, not_null: Some(true) });
+    assert!(planned.blocked.iter().any(|item| item.contains("没有读到域")), "{:?}", planned.blocked);
+}
+
+#[test]
+fn mysql_event_toggle_previews_and_blocks_noop() {
+    let mut snapshot = Snapshot::bare(Engine::Mysql, "shop", "", "");
+    snapshot.kind = "event".to_owned();
+    snapshot.name = "nightly".to_owned();
+    snapshot.event_enabled = Some(true);
+
+    let planned = plan(&snapshot, &Action::SetEventEnabled { event: "nightly".to_owned(), enabled: false });
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert_eq!(planned.steps[0].sql, "ALTER EVENT `shop`.`nightly` DISABLE;");
+    assert!(planned.risks.iter().any(|risk| risk.text.contains("event_scheduler")));
+
+    let noop = plan(&snapshot, &Action::SetEventEnabled { event: "nightly".to_owned(), enabled: true });
+    assert!(noop.steps.is_empty());
+    assert!(noop.blocked.iter().any(|item| item.contains("已经是 enabled")), "{:?}", noop.blocked);
+
+    let mut maria = snapshot.clone();
+    maria.engine = Engine::Mariadb;
+    let planned = plan(&maria, &Action::SetEventEnabled { event: "nightly".to_owned(), enabled: false });
+    assert_eq!(planned.steps[0].sql, "ALTER EVENT `shop`.`nightly` DISABLE;");
+
+    let mut missing = snapshot.clone();
+    missing.event_enabled = None;
+    let planned = plan(&missing, &Action::SetEventEnabled { event: "nightly".to_owned(), enabled: false });
+    assert!(planned.blocked.iter().any(|item| item.contains("没有读到事件")), "{:?}", planned.blocked);
+
+    let postgres = Snapshot::bare(Engine::Postgres, "shop", "public", "");
+    let planned = plan(&postgres, &Action::SetEventEnabled { event: "nightly".to_owned(), enabled: true });
+    assert!(planned.blocked.iter().any(|item| item.contains("只有 MySQL")), "{:?}", planned.blocked);
+}
+
+#[test]
+fn sqlite_pragma_plan_covers_journal_mode_and_user_version() {
+    let mut snapshot = Snapshot::bare(Engine::Sqlite, "main", "", "");
+    snapshot.kind = "database".to_owned();
+    snapshot.pragmas.insert("journal_mode".to_owned(), "delete".to_owned());
+    snapshot.pragmas.insert("user_version".to_owned(), "0".to_owned());
+    snapshot.pragmas.insert("foreign_keys".to_owned(), "ON".to_owned());
+
+    let planned = plan(&snapshot, &Action::SetPragma { pragma: "journal_mode".to_owned(), value: "wal".to_owned() });
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert_eq!(planned.steps[0].sql, "PRAGMA journal_mode = WAL;");
+    assert!(planned.risks.iter().any(|risk| risk.level == "warn" && risk.text.contains("-wal")));
+
+    let version = plan(&snapshot, &Action::SetPragma { pragma: "user_version".to_owned(), value: "3".to_owned() });
+    assert_eq!(version.steps[0].sql, "PRAGMA user_version = 3;");
+
+    let unchanged = plan(&snapshot, &Action::SetPragma { pragma: "journal_mode".to_owned(), value: "DELETE".to_owned() });
+    assert!(unchanged.steps.is_empty());
+    assert!(unchanged.blocked.iter().any(|item| item.contains("已经是 DELETE")), "{:?}", unchanged.blocked);
+
+    let foreign_keys = plan(&snapshot, &Action::SetPragma { pragma: "foreign_keys".to_owned(), value: "OFF".to_owned() });
+    assert!(foreign_keys.steps.is_empty());
+    assert!(foreign_keys.blocked.iter().any(|item| item.contains("外键开关动作")), "{:?}", foreign_keys.blocked);
+
+    let unknown = plan(&snapshot, &Action::SetPragma { pragma: "page_size".to_owned(), value: "4096".to_owned() });
+    assert!(unknown.blocked.iter().any(|item| item.contains("只改 journal_mode")), "{:?}", unknown.blocked);
+
+    let bad_version = plan(&snapshot, &Action::SetPragma { pragma: "user_version".to_owned(), value: "abc".to_owned() });
+    assert!(bad_version.blocked.iter().any(|item| item.contains("0 到 2147483647")), "{:?}", bad_version.blocked);
+
+    let postgres = Snapshot::bare(Engine::Postgres, "app", "public", "");
+    let planned = plan(&postgres, &Action::SetPragma { pragma: "journal_mode".to_owned(), value: "wal".to_owned() });
+    assert!(planned.blocked.iter().any(|item| item.contains("只有 SQLite")), "{:?}", planned.blocked);
+}
+
+#[test]
+fn sqlite_attach_plan_blocks_duplicate_and_reserved_names() {
+    let mut snapshot = Snapshot::bare(Engine::Sqlite, "main", "", "");
+    snapshot.kind = "database".to_owned();
+    snapshot.attached = vec![
+        AttachedDatabase { name: "main".to_owned(), path: "/tmp/notes.sqlite".to_owned() },
+        AttachedDatabase { name: "aux".to_owned(), path: "/tmp/aux.sqlite".to_owned() },
+        AttachedDatabase { name: "temp".to_owned(), path: String::new() },
+    ];
+
+    let planned = plan(&snapshot, &Action::AttachDatabase { path: "/tmp/other.db".to_owned(), name: "other".to_owned() });
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert_eq!(planned.steps[0].sql, "ATTACH DATABASE '/tmp/other.db' AS \"other\";");
+
+    let quoted = plan(&snapshot, &Action::AttachDatabase { path: "/tmp/it's.db".to_owned(), name: "extra".to_owned() });
+    assert_eq!(quoted.steps[0].sql, "ATTACH DATABASE '/tmp/it''s.db' AS \"extra\";");
+
+    let duplicate = plan(&snapshot, &Action::AttachDatabase { path: "/tmp/x.db".to_owned(), name: "AUX".to_owned() });
+    assert!(duplicate.steps.is_empty());
+    assert!(duplicate.blocked.iter().any(|item| item.contains("已经附加")), "{:?}", duplicate.blocked);
+
+    let reserved = plan(&snapshot, &Action::AttachDatabase { path: "/tmp/x.db".to_owned(), name: "temp".to_owned() });
+    assert!(reserved.blocked.iter().any(|item| item.contains("保留的库名")), "{:?}", reserved.blocked);
+
+    let blank = plan(&snapshot, &Action::AttachDatabase { path: "  ".to_owned(), name: "aux2".to_owned() });
+    assert!(blank.blocked.iter().any(|item| item.contains("路径不能为空")), "{:?}", blank.blocked);
+
+    let same_file = plan(&snapshot, &Action::AttachDatabase { path: "/tmp/aux.sqlite".to_owned(), name: "aux2".to_owned() });
+    assert!(same_file.blocked.is_empty(), "{:?}", same_file.blocked);
+    assert!(same_file.risks.iter().any(|risk| risk.text.contains("已经作为 aux 附加过")), "{:?}", same_file.risks);
+}
+
+#[test]
+fn sqlite_maintenance_plans_cover_vacuum_and_reindex() {
+    let snapshot = Snapshot::bare(Engine::Sqlite, "main", "", "");
+    let vacuum = plan(&snapshot, &Action::Vacuum);
+    assert!(vacuum.blocked.is_empty(), "{:?}", vacuum.blocked);
+    assert_eq!(vacuum.steps[0].sql, "VACUUM;");
+    assert!(vacuum.risks.iter().any(|risk| risk.level == "warn" && risk.text.contains("重写整个数据库文件")));
+
+    let reindex = plan(&snapshot, &Action::Reindex { target: None });
+    assert_eq!(reindex.steps[0].sql, "REINDEX;");
+    let indexed = plan(&snapshot, &Action::Reindex { target: Some("orders".to_owned()) });
+    assert_eq!(indexed.steps[0].sql, "REINDEX \"orders\";");
+
+    let postgres = Snapshot::bare(Engine::Postgres, "app", "public", "");
+    let planned = plan(&postgres, &Action::Vacuum);
+    assert!(planned.steps.is_empty());
+    assert!(planned.blocked.iter().any(|item| item.contains("维护动作只对 SQLite")), "{:?}", planned.blocked);
+}
+
+async fn user_version_of(session: &CatalogSession) -> i64 {
+    let CatalogSession::Sqlite { pool, .. } = session else { panic!("sqlite") };
+    sqlx::query_scalar("PRAGMA user_version").fetch_one(pool).await.unwrap()
+}
+
+async fn page_count_of(session: &CatalogSession) -> i64 {
+    let CatalogSession::Sqlite { pool, .. } = session else { panic!("sqlite") };
+    sqlx::query_scalar("PRAGMA page_count").fetch_one(pool).await.unwrap()
+}
+
+#[tokio::test]
+async fn sqlite_pragma_and_attach_round_trip() {
+    let (dir, _service, session) = open_notes(&["CREATE TABLE notes (id INTEGER PRIMARY KEY, note TEXT)"]).await;
+
+    let action = Action::SetPragma { pragma: "user_version".to_owned(), value: "3".to_owned() };
+    let planned = exec::preview(&session, &request(action.clone())).await.unwrap();
+    assert_eq!(planned.steps.len(), 1, "{:?}", planned.blocked);
+    let confirmed: Vec<String> = planned.steps.iter().map(|step| step.sql.clone()).collect();
+    let receipt = exec::execute(&session, &request(action), &confirmed).await.unwrap();
+    assert!(receipt.steps.iter().all(|step| step.status == StepStatus::Ok), "{:?}", receipt.steps);
+    assert_eq!(user_version_of(&session).await, 3);
+
+    // 已经是这个值时 preview 不给执行入口。
+    let again = exec::preview(&session, &request(Action::SetPragma { pragma: "user_version".to_owned(), value: "3".to_owned() })).await.unwrap();
+    assert!(again.steps.is_empty());
+    assert!(again.blocked.iter().any(|item| item.contains("已经是")), "{:?}", again.blocked);
+
+    // journal_mode 会带回一行结果：执行路径不能因为“返回了结果”失败。
+    let current_mode = {
+        let CatalogSession::Sqlite { pool, .. } = &session else { panic!("sqlite") };
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode").fetch_one(pool).await.unwrap();
+        mode
+    };
+    let target_mode = if current_mode.eq_ignore_ascii_case("delete") { "wal" } else { "delete" };
+    let action = Action::SetPragma { pragma: "journal_mode".to_owned(), value: target_mode.to_owned() };
+    let planned = exec::preview(&session, &request(action.clone())).await.unwrap();
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    let confirmed: Vec<String> = planned.steps.iter().map(|step| step.sql.clone()).collect();
+    let receipt = exec::execute(&session, &request(action), &confirmed).await.unwrap();
+    assert_eq!(receipt.steps[0].status, StepStatus::Ok, "{:?}", receipt.steps);
+    assert!(receipt.steps[0].message.contains("数据库返回"), "{}", receipt.steps[0].message);
+
+    // ATTACH 后能读到附加库里的表。
+    let extra = dir.join("extra.sqlite");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&extra).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE tags (id INTEGER PRIMARY KEY)").execute(&pool).await.unwrap();
+    pool.close().await;
+    let path = extra.to_string_lossy().to_string();
+    let attach = Action::AttachDatabase { path: path.clone(), name: "extra".to_owned() };
+    let planned = exec::preview(&session, &request(attach.clone())).await.unwrap();
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    let confirmed: Vec<String> = planned.steps.iter().map(|step| step.sql.clone()).collect();
+    let receipt = exec::execute(&session, &request(attach), &confirmed).await.unwrap();
+    assert!(receipt.steps.iter().all(|step| step.status == StepStatus::Ok), "{:?}", receipt.steps);
+    let CatalogSession::Sqlite { pool, .. } = &session else { panic!("sqlite") };
+    let tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM extra.sqlite_master WHERE type = 'table' AND name = 'tags'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(tags, 1);
+    let attached: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_database_list").fetch_all(pool).await.unwrap();
+    assert!(attached.iter().any(|name| name == "extra"), "{attached:?}");
+
+    // 同名再附加：preview 直接挡住。
+    let duplicate = exec::preview(&session, &request(Action::AttachDatabase { path, name: "extra".to_owned() })).await.unwrap();
+    assert!(duplicate.steps.is_empty());
+    assert!(duplicate.blocked.iter().any(|item| item.contains("已经附加")), "{:?}", duplicate.blocked);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn sqlite_maintenance_reports_result_and_writes_only_when_executed() {
+    let (dir, _service, session) = open_notes(&[
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, note TEXT)",
+        "CREATE INDEX notes_note ON notes (note)",
+        "INSERT INTO notes (id, note) VALUES (1, 'a')",
+    ])
+    .await;
+    let pages_before = page_count_of(&session).await;
+    let planned = exec::preview(&session, &request(Action::Vacuum)).await.unwrap();
+    assert_eq!(planned.steps.len(), 1);
+    assert_eq!(planned.steps[0].sql, "VACUUM;");
+    // 取消（不执行）时没有任何写入。
+    assert_eq!(page_count_of(&session).await, pages_before);
+    assert!(master_sql(&session, "notes").await.is_some());
+
+    let confirmed: Vec<String> = planned.steps.iter().map(|step| step.sql.clone()).collect();
+    let receipt = exec::execute(&session, &request(Action::Vacuum), &confirmed).await.unwrap();
+    assert_eq!(receipt.steps.len(), 1);
+    assert_eq!(receipt.steps[0].status, StepStatus::Ok, "{:?}", receipt.steps);
+    assert!(receipt.steps[0].message.contains("VACUUM 已完成"), "{}", receipt.steps[0].message);
+
+    let reindex = Action::Reindex { target: Some("notes_note".to_owned()) };
+    let planned = exec::preview(&session, &request(reindex.clone())).await.unwrap();
+    assert_eq!(planned.steps[0].sql, "REINDEX \"notes_note\";");
+    let confirmed: Vec<String> = planned.steps.iter().map(|step| step.sql.clone()).collect();
+    let receipt = exec::execute(&session, &request(reindex), &confirmed).await.unwrap();
+    assert_eq!(receipt.steps[0].status, StepStatus::Ok, "{:?}", receipt.steps);
+    assert!(receipt.steps[0].message.contains("REINDEX 已完成"), "{}", receipt.steps[0].message);
+
+    // 会话类型对不上时直接返回原因，不去猜语句。
+    let mismatched = exec::preview(
+        &session,
+        &Request { database: "app".to_owned(), schema: "public".to_owned(), engine: Engine::Postgres, action: Action::Vacuum },
+    )
+    .await;
+    assert!(mismatched.is_err(), "{mismatched:?}");
+    let _ = fs::remove_dir_all(dir);
 }

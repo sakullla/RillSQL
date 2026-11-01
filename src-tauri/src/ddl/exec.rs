@@ -1,6 +1,8 @@
+use sqlx::{Row, ValueRef};
+
 use crate::connections::CatalogSession;
 
-use super::introspect::{attach_reference, enrich, load, session_snapshot, table_of};
+use super::introspect::{attach_reference, enrich, is_object_action, load, maintenance_note, object_snapshot, session_snapshot, table_of};
 use super::model::{Action, Plan, Request, Snapshot, Step, StepReceipt, StepStatus};
 use super::plan;
 
@@ -38,13 +40,24 @@ pub async fn execute(session: &CatalogSession, request: &Request, confirmed_sql:
         Action::SetForeignKeys { enabled } => Some(*enabled),
         _ => snapshot.live_foreign_keys,
     };
-    let steps = run_steps(session, &plan.steps, restore).await?;
+    let mut steps = run_steps(session, &plan.steps, restore).await?;
+    // 维护动作（VACUUM/REINDEX）没有返回值，完成后补一句读到的结果，别让界面只看到“成功”。
+    if !steps.is_empty() && steps.iter().all(|step| step.status == StepStatus::Ok) {
+        if let Some(note) = maintenance_note(session, &request.action).await {
+            if let Some(last) = steps.last_mut() {
+                last.message = note;
+            }
+        }
+    }
     Ok(Receipt { blocked: Vec::new(), rule: plan.rule, steps, target: plan.target, rebuild: plan.rebuild })
 }
 
 async fn prepare_snapshot(session: &CatalogSession, request: &Request) -> Result<Snapshot, String> {
     if matches!(request.action, Action::SetForeignKeys { .. }) {
         return session_snapshot(session, request).await;
+    }
+    if is_object_action(&request.action) {
+        return object_snapshot(session, request).await;
     }
     if let Action::CreateTable { name, .. } = &request.action {
         return match load(session, request, name).await {
@@ -139,35 +152,42 @@ async fn run_sqlite(pool: &sqlx::SqlitePool, steps: &[Step], restore: Option<boo
             continue;
         }
         let kind = statement_kind(&step.sql);
-        let executed = if kind == StmtKind::Check {
-            sqlx::query(sqlx::AssertSqlSafe(step.sql.clone()))
+        let executed: Result<Option<String>, String> = match kind {
+            StmtKind::Check => sqlx::query(sqlx::AssertSqlSafe(step.sql.clone()))
                 .fetch_all(&mut *conn)
                 .await
                 .map(|rows| {
                     if rows.is_empty() {
-                        Ok(())
+                        Ok(None)
                     } else {
                         Err(format!("foreign_key_check 发现 {} 处违规，不会把这次重建当成成功。", rows.len()))
                     }
                 })
                 .map_err(|err| err.to_string())
-                .and_then(|item| item)
-        } else {
-            sqlx::query(sqlx::AssertSqlSafe(step.sql.clone()))
+                .and_then(|item| item),
+            // PRAGMA 可能带回一行（journal_mode 就会），用 fetch_all 接住并当成结果反馈。
+            StmtKind::Probe => sqlx::query(sqlx::AssertSqlSafe(step.sql.clone()))
+                .fetch_all(&mut *conn)
+                .await
+                .map(|rows| Ok::<Option<String>, String>(probe_note(&rows)))
+                .map_err(|err| err.to_string())
+                .and_then(|item| item),
+            _ => sqlx::query(sqlx::AssertSqlSafe(step.sql.clone()))
                 .execute(&mut *conn)
                 .await
-                .map(|_| ())
+                .map(|_| Ok::<Option<String>, String>(None))
                 .map_err(|err| err.to_string())
+                .and_then(|item| item),
         };
         match executed {
-            Ok(()) => {
+            Ok(note) => {
                 if kind == StmtKind::Begin {
                     txn_from = Some(results.len());
                 }
                 if kind == StmtKind::Commit {
                     txn_from = None;
                 }
-                results.push(receipt(step, StepStatus::Ok, ""));
+                results.push(receipt(step, StepStatus::Ok, note.as_deref().unwrap_or("")));
             }
             Err(message) if sqlite_unknown(&message) => {
                 unknown = true;
@@ -299,6 +319,8 @@ enum StmtKind {
     Begin,
     Commit,
     Check,
+    /// 会带回结果的 PRAGMA：execute 会因为“返回了结果”报错，必须用 fetch_all。
+    Probe,
     Other,
 }
 
@@ -310,9 +332,30 @@ fn statement_kind(sql: &str) -> StmtKind {
         StmtKind::Commit
     } else if text.starts_with("pragma foreign_key_check") {
         StmtKind::Check
+    } else if text.starts_with("pragma ") {
+        StmtKind::Probe
     } else {
         StmtKind::Other
     }
+}
+
+/// PRAGMA 的回显就是结果反馈（例如 journal_mode 会回显新模式）。
+fn probe_note(rows: &[sqlx::sqlite::SqliteRow]) -> Option<String> {
+    let row = rows.first()?;
+    let raw = row.try_get_raw(0).ok()?;
+    if raw.is_null() {
+        return None;
+    }
+    if let Ok(text) = row.try_get::<String, _>(0) {
+        return Some(format!("数据库返回：{text}"));
+    }
+    if let Ok(number) = row.try_get::<i64, _>(0) {
+        return Some(format!("数据库返回：{number}"));
+    }
+    if let Ok(number) = row.try_get::<f64, _>(0) {
+        return Some(format!("数据库返回：{number}"));
+    }
+    None
 }
 
 fn is_fk_off(sql: &str) -> bool {
