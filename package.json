@@ -12,7 +12,8 @@
     "test": "vitest run",
     "typecheck": "vue-tsc --noEmit -p tsconfig.app.json && vue-tsc --noEmit -p tsconfig.node.json",
     "capture:ui": "node scripts/capture-ui.mjs",
-    "verify:workbench": "node scripts/verify-workbench.mjs"
+    "verify:workbench": "node scripts/verify-workbench.mjs",
+    "verify:ddl": "node scripts/verify-ddl-fixtures.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "6.20.3",
