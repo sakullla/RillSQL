@@ -11,6 +11,8 @@ export const KIND_LABEL: Record<ObjectKind, string> = {
   sequence: "catalog.kind.sequence",
   enum: "catalog.kind.enum",
   domain: "catalog.kind.domain",
+  extension: "catalog.kind.extension",
+  event: "catalog.kind.event",
 };
 
 export function kindLabel(kind: ObjectKind): string {
@@ -18,13 +20,16 @@ export function kindLabel(kind: ObjectKind): string {
 }
 
 export function objectGroups(engine: Engine): ObjectKind[] {
-  if (engine === "sqlite" || engine === "mysql") return engine === "sqlite" ? ["table", "view", "trigger"] : ["table", "view", "function", "procedure", "trigger"];
-  if (engine === "mariadb") return ["table", "view", "function", "procedure", "trigger", "sequence"];
+  if (engine === "sqlite") return ["table", "view", "trigger"];
+  // 事件跟着库走：MySQL 与 MariaDB 都有。
+  if (engine === "mysql") return ["table", "view", "function", "procedure", "trigger", "event"];
+  if (engine === "mariadb") return ["table", "view", "function", "procedure", "trigger", "sequence", "event"];
   // SQL Server 有独立序列，没有独立枚举或域。
   if (engine === "sqlserver") return ["table", "view", "function", "procedure", "trigger", "sequence"];
   // MongoDB 只有集合一种对象（映射到 table；树里的集合分支不经 SchemaBlock 渲染）。
   if (engine === "mongodb") return ["table"];
-  return ["table", "view", "function", "procedure", "trigger", "sequence", "enum", "domain"];
+  // 扩展装在 schema 里，跟着 schema 分组出现。
+  return ["table", "view", "function", "procedure", "trigger", "sequence", "enum", "domain", "extension"];
 }
 
 /** 普通视图不显示索引分组。物化视图只有快照确实返回索引时才显示。表没有索引时仍显示空分组。 */
@@ -34,8 +39,22 @@ export function showsIndexGroup(kind: ObjectKind, materialized: boolean, indexCo
   return false;
 }
 
+/** 有只读定义可看：事件用 SHOW CREATE EVENT 的事件体，扩展没有 DDL。 */
 export function isDefinitionKind(kind: ObjectKind): boolean {
-  return kind === "function" || kind === "procedure" || kind === "trigger" || kind === "sequence" || kind === "enum" || kind === "domain";
+  return (
+    kind === "function" ||
+    kind === "procedure" ||
+    kind === "trigger" ||
+    kind === "sequence" ||
+    kind === "enum" ||
+    kind === "domain" ||
+    kind === "event"
+  );
+}
+
+/** 只有表与视图能进数据网格：扩展、事件、序列等对象没有行数据。 */
+export function isDataKind(kind: ObjectKind): boolean {
+  return kind === "table" || kind === "view";
 }
 
 export function objectKey(object: Pick<CatalogObject, "kind" | "name" | "signature" | "relation">): string {

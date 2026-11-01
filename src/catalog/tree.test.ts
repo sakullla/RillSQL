@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { MODULE_ID } from "./index";
 import { createRefreshFixture, catalogFixture } from "./fixtures";
 import { listPaletteTables, refreshCatalog, replaceCatalog, resetCatalog, setRefreshSource } from "./store";
-import { browseSql, qualifiedObjectName } from "./object-ref";
-import { engineShape, isDefinitionKind, objectGroups, objectPath, postgresSessionGap, reconcileObjects, refreshConnection, refreshSchema, schemaFailed, schemaIsEmpty, searchObjects, serverSliceCount, showsIndexGroup, successfulTotal, visibleTotal } from "./tree";
+import { browseSql, qualifiedObjectName, queryScope } from "./object-ref";
+import { engineShape, isDataKind, isDefinitionKind, objectGroups, objectPath, postgresSessionGap, reconcileObjects, refreshConnection, refreshSchema, schemaFailed, schemaIsEmpty, searchObjects, serverSliceCount, showsIndexGroup, successfulTotal, visibleTotal } from "./tree";
 import type { CatalogObject, SchemaNode } from "./types";
 
 function row(name: string, stale = false): CatalogObject {
@@ -16,11 +16,13 @@ afterEach(() => {
 
 describe("catalog tree", () => {
   it("lists sequences, enums and domains only for engines that own them", () => {
-    expect(objectGroups("postgres")).toEqual(["table", "view", "function", "procedure", "trigger", "sequence", "enum", "domain"]);
-    expect(objectGroups("mariadb")).toEqual(["table", "view", "function", "procedure", "trigger", "sequence"]);
+    expect(objectGroups("postgres")).toEqual(["table", "view", "function", "procedure", "trigger", "sequence", "enum", "domain", "extension"]);
+    expect(objectGroups("mariadb")).toEqual(["table", "view", "function", "procedure", "trigger", "sequence", "event"]);
     expect(objectGroups("mysql")).not.toContain("sequence");
     expect(objectGroups("mysql")).not.toContain("enum");
+    expect(objectGroups("mysql")).toContain("event");
     expect(objectGroups("sqlite")).not.toContain("sequence");
+    expect(objectGroups("sqlite")).not.toContain("event");
     expect(showsIndexGroup("table", false, 0)).toBe(true);
     expect(showsIndexGroup("view", false, 2)).toBe(false);
     expect(showsIndexGroup("view", true, 0)).toBe(false);
@@ -31,6 +33,12 @@ describe("catalog tree", () => {
     expect(isDefinitionKind("function")).toBe(true);
     expect(isDefinitionKind("table")).toBe(false);
     expect(isDefinitionKind("view")).toBe(false);
+    // 事件有只读 DDL 可看；扩展没有 DDL，也不算数据对象。
+    expect(isDefinitionKind("event")).toBe(true);
+    expect(isDefinitionKind("extension")).toBe(false);
+    expect(isDataKind("table")).toBe(true);
+    expect(isDataKind("extension")).toBe(false);
+    expect(isDataKind("event")).toBe(false);
   });
 
   it("keeps the module id and separates engine levels", () => {
@@ -50,6 +58,11 @@ describe("catalog tree", () => {
     expect(qualifiedObjectName("postgres", "public", "customers")).toBe('"public"."customers"');
     expect(qualifiedObjectName("mysql", "", "orders")).toBe("`orders`");
     expect(browseSql("sqlite", "", "notes")).toBe('SELECT *\nFROM "notes"\nLIMIT 100;');
+    // ATTACH 上来的库在 SQL 里是限定名；main 保持不限定（R5）。
+    expect(queryScope("sqlite", "main", "")).toBe("");
+    expect(queryScope("sqlite", "extra", "")).toBe("extra");
+    expect(browseSql("sqlite", queryScope("sqlite", "extra", ""), "invoices")).toBe('SELECT *\nFROM "extra"."invoices"\nLIMIT 100;');
+    expect(queryScope("postgres", "app", "public")).toBe("public");
     expect(objectPath("Shop", "shop_staging", "")).toBe("Shop / shop_staging");
   });
 

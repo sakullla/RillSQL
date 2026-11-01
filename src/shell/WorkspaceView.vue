@@ -99,6 +99,15 @@ function adminEngine(tab: ShellTab): Engine {
   return "postgres";
 }
 
+/** 定义标签的引擎：只认已知值，猜错会让枚举/域的编辑入口出现在别的引擎上。 */
+function definitionEngine(tab: ShellTab): Engine | undefined {
+  const value = tab.engine ?? "";
+  if (value === "postgres" || value === "mysql" || value === "mariadb" || value === "sqlite" || value === "sqlserver" || value === "mongodb" || value === "redis") {
+    return value;
+  }
+  return undefined;
+}
+
 function definitionObject(tab: ShellTab): Pick<CatalogObjectRef, "connectionId" | "database" | "schema" | "name" | "kind" | "signature" | "relation"> | null {
   if (!tab.definition || !tab.connectionId || tab.database == null) return null;
   return {
@@ -346,6 +355,7 @@ onBeforeUnmount(() => {
       :key="active.id"
       :label="tabTitle(active)"
       :object="definitionObject(active)!"
+      :engine="definitionEngine(active!)"
       @copy-sql="emit('copy-definition', $event)"
     />
     <DiagramView

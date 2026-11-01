@@ -192,6 +192,13 @@ function toggleEvent(name: string, enabled: boolean): void {
   void request({ kind: "setEventEnabled", event: name, enabled });
 }
 
+/** 事件体只读：展开看 DDL，仍然只有启停是写操作（R5）。 */
+const openDdl = ref("");
+
+function toggleDdl(name: string): void {
+  openDdl.value = openDdl.value === name ? "" : name;
+}
+
 const editing = ref<SequenceInfo | null>(null);
 const draft = ref<SequenceDraft>({ increment: "", minValue: "", maxValue: "", start: "", cycle: false });
 
@@ -463,31 +470,46 @@ watch(
             </tr>
           </thead>
           <tbody>
-            <tr v-for="item in events" :key="`${item.database}.${item.name}`" :data-event="item.name">
-              <td class="mono">{{ item.name }}</td>
-              <td><span class="badge" :class="item.status.toLowerCase() === 'enabled' ? 'ok' : 'warn'" data-event-state>{{ item.status }}</span></td>
-              <td class="mono wrap">{{ item.schedule }}</td>
-              <td class="mono">{{ item.onCompletion }}</td>
-              <td class="mono">{{ item.lastExecuted ?? "—" }}</td>
-              <td>
-                <button
-                  v-if="item.status.toLowerCase() === 'enabled'"
-                  class="btn sm"
-                  type="button"
-                  data-action="disable-event"
-                  :disabled="busy"
-                  @click="toggleEvent(item.name, false)"
-                >{{ t("admin.events.disable") }}</button>
-                <button
-                  v-else
-                  class="btn sm"
-                  type="button"
-                  data-action="enable-event"
-                  :disabled="busy"
-                  @click="toggleEvent(item.name, true)"
-                >{{ t("admin.events.enable") }}</button>
-              </td>
-            </tr>
+            <template v-for="item in events" :key="`${item.database}.${item.name}`">
+              <tr :data-event="item.name">
+                <td class="mono">{{ item.name }}</td>
+                <td><span class="badge" :class="item.status.toLowerCase() === 'enabled' ? 'ok' : 'warn'" data-event-state>{{ item.status }}</span></td>
+                <td class="mono wrap">{{ item.schedule }}</td>
+                <td class="mono">{{ item.onCompletion }}</td>
+                <td class="mono">{{ item.lastExecuted ?? "—" }}</td>
+                <td class="admin-event-acts">
+                  <button
+                    class="btn sm"
+                    type="button"
+                    data-action="toggle-event-ddl"
+                    :aria-expanded="openDdl === item.name"
+                    @click="toggleDdl(item.name)"
+                  >{{ openDdl === item.name ? t("admin.events.hideDdl") : t("admin.events.viewDdl") }}</button>
+                  <button
+                    v-if="item.status.toLowerCase() === 'enabled'"
+                    class="btn sm"
+                    type="button"
+                    data-action="disable-event"
+                    :disabled="busy"
+                    @click="toggleEvent(item.name, false)"
+                  >{{ t("admin.events.disable") }}</button>
+                  <button
+                    v-else
+                    class="btn sm"
+                    type="button"
+                    data-action="enable-event"
+                    :disabled="busy"
+                    @click="toggleEvent(item.name, true)"
+                  >{{ t("admin.events.enable") }}</button>
+                </td>
+              </tr>
+              <tr v-if="openDdl === item.name" :data-event-ddl="item.name">
+                <td colspan="6">
+                  <pre v-if="item.definition" class="admin-ddl" data-event-definition>{{ item.definition }}</pre>
+                  <span v-else class="muted sm" data-event-definition-empty>{{ t("admin.events.ddlEmpty") }}</span>
+                </td>
+              </tr>
+            </template>
           </tbody>
         </table>
         <p v-else class="muted sm" data-event-empty>{{ t("admin.events.empty") }}</p>
@@ -599,4 +621,15 @@ watch(
 .admin-card p { margin: 0; font-size: 12px; color: var(--text-3); }
 .admin-alert { margin: 0; padding: var(--sp-2); border-radius: var(--r-sm); background: color-mix(in srgb, var(--danger, #c0392b) 12%, transparent); color: var(--danger-text, var(--text)); font-size: 12px; }
 .admin-loading { margin: 0; font-size: 12px; color: var(--text-3); }
+.admin-event-acts { display: flex; gap: var(--sp-1, 4px); flex-wrap: wrap; }
+.admin-ddl {
+  margin: 0;
+  padding: var(--sp-2);
+  border-radius: var(--r-sm);
+  background: var(--surface-sunken, var(--surface));
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
 </style>

@@ -271,6 +271,7 @@ describe("database panel", () => {
         onCompletion: "PRESERVE",
         definer: "rillsql@%",
         lastExecuted: "2026-10-31 10:00:00",
+        definition: "UPDATE orders SET stale = 0",
       },
     ];
     extras.partitions.items = [
@@ -288,6 +289,13 @@ describe("database panel", () => {
     expect(wrapper.get("[data-event='cleanup']").text()).toContain("ENABLED");
     expect(wrapper.get("[data-partition-table='orders']").text()).toContain("RANGE");
     expect(wrapper.get("[data-partition-table='orders']").text()).toContain("p2025");
+
+    // 事件体只读：展开就能看 DDL，写操作仍然只有启停。
+    expect(wrapper.find("[data-event-definition]").exists()).toBe(false);
+    await wrapper.get("[data-action='toggle-event-ddl']").trigger("click");
+    await flushPromises();
+    expect(wrapper.get("[data-event-definition]").text()).toBe("UPDATE orders SET stale = 0");
+    expect(previewCalls()).toEqual([]);
 
     await wrapper.get("[data-action='disable-event']").trigger("click");
     await flushPromises();

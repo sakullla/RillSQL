@@ -26,6 +26,8 @@ const ICONS = {
   sequence: "M4 7h16M4 12h10M4 17h16",
   enum: "M5 5h6v6H5zM13 5h6v6h-6zM5 13h6v6H5zM13 13h6v6h-6z",
   domain: "M4 6h16v12H4zM8 10h8M8 14h5",
+  extension: "M10 3h4v7h7v4h-7v7h-4v-7H3v-4h7z",
+  event: "M12 4a8 8 0 1 1 0 16 8 8 0 0 1 0-16M12 8v4.5l3 2",
   column: "M5 5h14v14H5zM12 5v14",
   index: "M13 3 5 13h5l-1 8 8-10h-5l1-8",
   right: "m9 6 6 6-6 6",
@@ -69,6 +71,15 @@ function objectMeta(object: CatalogObject): string {
   if (object.kind === "function") return t("catalog.kind.function");
   if (object.kind === "procedure") return t("catalog.kind.procedure");
   if (object.kind === "trigger") return object.relation ? t("catalog.kind.triggerWithRelation", { relation: object.relation }) : t("catalog.kind.trigger");
+  // 扩展的 signature 是已安装版本，事件的 signature 是启停状态：树上直接读得到（R5）。
+  if (object.kind === "extension") {
+    const version = object.signature ?? "";
+    return version ? t("catalog.kind.extensionWithVersion", { version }) : kindLabel(object.kind);
+  }
+  if (object.kind === "event") {
+    const status = (object.signature ?? "").toLowerCase();
+    return status ? t("catalog.kind.eventWithStatus", { status }) : kindLabel(object.kind);
+  }
   if (object.kind === "sequence" || object.kind === "enum" || object.kind === "domain") return kindLabel(object.kind);
   return knownEstimate(object.estimatedRows);
 }

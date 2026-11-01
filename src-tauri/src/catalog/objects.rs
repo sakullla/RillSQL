@@ -68,6 +68,8 @@ pub struct EventRow {
     pub on_completion: String,
     pub definer: String,
     pub last_executed: Option<String>,
+    /// information_schema.EVENTS.EVENT_DEFINITION：事件体原文，面板按需展开只读查看。
+    pub definition: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,7 +134,7 @@ const POSTGRES_SEQUENCES: &str = "SELECT s.schemaname, s.sequencename, s.data_ty
 
 const POSTGRES_SEQUENCES_ALL: &str = "SELECT s.schemaname, s.sequencename, s.data_type::text, s.start_value, s.min_value, s.max_value, s.increment_by, s.cache_size, s.cycle, s.last_value FROM pg_catalog.pg_sequences s WHERE s.schemaname NOT IN ('pg_catalog', 'information_schema') ORDER BY s.schemaname, s.sequencename";
 
-const MYSQL_EVENTS: &str = "SELECT EVENT_SCHEMA, EVENT_NAME, STATUS, DEFINER, CAST(EXECUTE_AT AS CHAR), INTERVAL_VALUE, INTERVAL_FIELD, ON_COMPLETION, CAST(LAST_EXECUTED AS CHAR) FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ? ORDER BY EVENT_NAME";
+const MYSQL_EVENTS: &str = "SELECT EVENT_SCHEMA, EVENT_NAME, STATUS, DEFINER, CAST(EXECUTE_AT AS CHAR), INTERVAL_VALUE, INTERVAL_FIELD, ON_COMPLETION, CAST(LAST_EXECUTED AS CHAR), EVENT_DEFINITION FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ? ORDER BY EVENT_NAME";
 
 const MYSQL_PARTITIONS: &str = "SELECT TABLE_SCHEMA, TABLE_NAME, PARTITION_NAME, PARTITION_METHOD, PARTITION_EXPRESSION, PARTITION_DESCRIPTION, TABLE_ROWS FROM information_schema.PARTITIONS WHERE TABLE_SCHEMA = ? AND PARTITION_NAME IS NOT NULL ORDER BY TABLE_NAME, PARTITION_ORDINAL_POSITION";
 
@@ -350,6 +352,7 @@ async fn read_mysql_extras(pool: &mysql_async::Pool, database: &str) -> ExtrasBo
                         schedule: event_schedule(&mysql_text(row, 5), &mysql_text(row, 6), &execute_at),
                         on_completion: mysql_text(row, 7),
                         last_executed: if last_executed.is_empty() { None } else { Some(last_executed) },
+                        definition: mysql_text(row, 9),
                     }
                 })
                 .collect();
@@ -473,6 +476,9 @@ mod extras_sql_tests {
         assert!(MYSQL_EVENTS.contains("information_schema.EVENTS"));
         assert!(MYSQL_EVENTS.contains("EVENT_SCHEMA = ?"));
         assert!(MYSQL_EVENTS.contains("STATUS"));
+        // 事件体只读展示用这一列；位置固定在最后，前面各列索引不变。
+        assert!(MYSQL_EVENTS.contains("EVENT_DEFINITION"));
+        assert!(MYSQL_EVENTS.ends_with("EVENT_DEFINITION FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ? ORDER BY EVENT_NAME"));
         assert!(MYSQL_PARTITIONS.contains("information_schema.PARTITIONS"));
         assert!(MYSQL_PARTITIONS.contains("PARTITION_METHOD"));
         assert!(MYSQL_PARTITIONS.contains("PARTITION_NAME IS NOT NULL"));

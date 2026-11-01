@@ -105,6 +105,9 @@ export const admin = {
     enable: "启用…",
     disable: "停用…",
     empty: "这个库里没有事件。",
+    viewDdl: "查看 DDL",
+    hideDdl: "收起 DDL",
+    ddlEmpty: "没有读到事件体。",
   },
   partitions: {
     title: "分区",

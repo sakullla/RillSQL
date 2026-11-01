@@ -90,6 +90,22 @@ fn engines_keep_their_own_levels() {
     let maria_sequence = super::kind_sql(Engine::Mariadb, super::model::ObjectKind::Sequence);
     assert!(maria_sequence.list.contains("information_schema.SEQUENCES"));
     assert!(super::kind_sql(Engine::Mysql, super::model::ObjectKind::Sequence).list.contains("WHERE 0"));
+    // 扩展（PG）与事件（MySQL/MariaDB）是树上的独立分类：安装扩展、建事件之后要能看见。
+    assert!(super::model::listed_kinds(Engine::Postgres).contains(&super::model::ObjectKind::Extension));
+    assert!(super::model::listed_kinds(Engine::Mysql).contains(&super::model::ObjectKind::Event));
+    assert!(super::model::listed_kinds(Engine::Mariadb).contains(&super::model::ObjectKind::Event));
+    assert!(!super::model::listed_kinds(Engine::Sqlite).contains(&super::model::ObjectKind::Extension));
+    assert!(!super::model::listed_kinds(Engine::Sqlserver).contains(&super::model::ObjectKind::Event));
+    let extension_sql = super::kind_sql(Engine::Postgres, super::model::ObjectKind::Extension);
+    assert!(extension_sql.list.contains("pg_extension"));
+    assert!(extension_sql.list.contains("extversion"));
+    assert!(extension_sql.list.contains("extnamespace"));
+    let event_sql = super::kind_sql(Engine::Mysql, super::model::ObjectKind::Event);
+    assert!(event_sql.list.contains("information_schema.EVENTS"));
+    assert!(event_sql.list.contains("EVENT_SCHEMA = ?"));
+    assert_eq!(super::model::parse_kind("extension"), super::model::ObjectKind::Extension);
+    assert_eq!(super::model::parse_kind("event"), super::model::ObjectKind::Event);
+    assert_eq!(super::model::kind_name(super::model::ObjectKind::Event), "event");
     assert_eq!(super::model::parse_kind("sequence"), super::model::ObjectKind::Sequence);
     assert_eq!(super::model::parse_kind("enum"), super::model::ObjectKind::Enum);
     assert_eq!(super::model::parse_kind("domain"), super::model::ObjectKind::Domain);
@@ -740,6 +756,88 @@ async fn sqlite_extras_read_pragmas_and_attached_databases_on_the_open_session()
     let json = serde_json::to_value(&loaded[0]).unwrap();
     assert!(json["extras"]["attached"]["items"].as_array().unwrap().iter().any(|item| item["name"] == "main"));
     assert!(json["extras"]["extensions"]["error"].is_null());
+
+    match &session {
+        CatalogSession::Sqlite { pool, .. } => pool.close().await,
+        _ => panic!("会话应该是已经打开的 SQLite 池"),
+    }
+    drop(service);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// ATTACH 之后新库要出现在树上，并且能按库读到它自己的对象与定义（R5）。
+#[tokio::test]
+async fn sqlite_attached_database_shows_up_in_the_tree_and_reads_its_own_objects() {
+    let dir = std::env::temp_dir().join(format!("rillsql-catalog-attach-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("notes.sqlite");
+    let extra = dir.join("archive.sqlite");
+
+    let setup = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE customers (id INTEGER PRIMARY KEY)")
+        .execute(&setup)
+        .await
+        .unwrap();
+    setup.close().await;
+
+    let archive = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&extra).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE invoices (id INTEGER PRIMARY KEY)")
+        .execute(&archive)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER touch_invoice AFTER INSERT ON invoices BEGIN SELECT 1; END")
+        .execute(&archive)
+        .await
+        .unwrap();
+    archive.close().await;
+
+    let service = Service::new_for_test(dir.join("connections.sqlite"));
+    service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+    let session = service.catalog_session("notes").unwrap();
+    let CatalogSession::Sqlite { pool, .. } = &session else {
+        panic!("会话应该是已经打开的 SQLite 池");
+    };
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ATTACH DATABASE '{}' AS extra",
+        extra.display()
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let outline = super::read::read_catalog_outline(Engine::Sqlite, &session).await;
+    let names: Vec<&str> = outline.databases.iter().map(|item| item.name.as_str()).collect();
+    assert_eq!(names, vec!["main", "extra"]);
+
+    let body = read_catalog_session(Engine::Sqlite, &session, 100, &[]).await;
+    assert!(body.error.is_none());
+    let extra_node = body
+        .databases
+        .iter()
+        .find(|item| item.name == "extra")
+        .expect("附加库应该在树上");
+    assert!(extra_node.schemas[0].objects.iter().any(|item| item.name == "invoices"));
+    let main_node = body.databases.iter().find(|item| item.name == "main").unwrap();
+    assert!(main_node.schemas[0].objects.iter().any(|item| item.name == "customers"));
+    assert!(!main_node.schemas[0].objects.iter().any(|item| item.name == "invoices"));
+
+    let page = page_for_session(Some(&session), Engine::Sqlite, "extra", "", 0, 100).await;
+    assert!(page.error.is_none());
+    assert!(page.objects.iter().any(|item| item.name == "invoices" && item.kind == "table"));
+    assert!(page.objects.iter().any(|item| item.name == "touch_invoice" && item.kind == "trigger"));
+
+    let definition = read_definition(&session, Engine::Sqlite, "extra", "", "touch_invoice", "trigger", "", "")
+        .await
+        .expect("附加库的触发器定义应该读得到");
+    assert!(definition.contains("CREATE TRIGGER"));
 
     match &session {
         CatalogSession::Sqlite { pool, .. } => pool.close().await,

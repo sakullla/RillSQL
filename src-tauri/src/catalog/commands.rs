@@ -123,6 +123,8 @@ pub struct EventDto {
     pub on_completion: String,
     pub definer: String,
     pub last_executed: Option<String>,
+    /// 事件体原文（EVENT_DEFINITION），面板展开只读查看。
+    pub definition: String,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
@@ -446,6 +448,7 @@ fn extras_dto(body: ExtrasBody) -> ExtrasDto {
             on_completion: item.on_completion.clone(),
             definer: item.definer.clone(),
             last_executed: item.last_executed.clone(),
+            definition: item.definition.clone(),
         }),
         partitions: extras_list(body.partitions, |item| PartitionDto {
             database: item.database.clone(),

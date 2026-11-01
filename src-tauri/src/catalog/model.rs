@@ -27,6 +27,10 @@ pub enum ObjectKind {
     Sequence,
     Enum,
     Domain,
+    /// PostgreSQL 扩展：装在某个 schema 里的独立对象，读取时带已安装版本。
+    Extension,
+    /// MySQL / MariaDB 事件（EVENT）：库级对象，读取时带启停状态。
+    Event,
 }
 
 pub fn kind_name(kind: ObjectKind) -> &'static str {
@@ -39,6 +43,8 @@ pub fn kind_name(kind: ObjectKind) -> &'static str {
         ObjectKind::Sequence => "sequence",
         ObjectKind::Enum => "enum",
         ObjectKind::Domain => "domain",
+        ObjectKind::Extension => "extension",
+        ObjectKind::Event => "event",
     }
 }
 
@@ -51,6 +57,8 @@ pub fn parse_kind(kind: &str) -> ObjectKind {
         "sequence" => ObjectKind::Sequence,
         "enum" => ObjectKind::Enum,
         "domain" => ObjectKind::Domain,
+        "extension" => ObjectKind::Extension,
+        "event" => ObjectKind::Event,
         _ => ObjectKind::Table,
     }
 }
@@ -63,12 +71,14 @@ pub fn listed_kinds(engine: Engine) -> &'static [ObjectKind] {
         Engine::Redis => &[],
         Engine::Mongodb => &[ObjectKind::Table],
         Engine::Sqlite => &[ObjectKind::Table, ObjectKind::View, ObjectKind::Trigger],
+        // 事件在 MySQL 与 MariaDB 都存在，跟着库走（information_schema.EVENTS.EVENT_SCHEMA）。
         Engine::Mysql => &[
             ObjectKind::Table,
             ObjectKind::View,
             ObjectKind::Function,
             ObjectKind::Procedure,
             ObjectKind::Trigger,
+            ObjectKind::Event,
         ],
         Engine::Mariadb => &[
             ObjectKind::Table,
@@ -77,6 +87,7 @@ pub fn listed_kinds(engine: Engine) -> &'static [ObjectKind] {
             ObjectKind::Procedure,
             ObjectKind::Trigger,
             ObjectKind::Sequence,
+            ObjectKind::Event,
         ],
         Engine::Postgres => &[
             ObjectKind::Table,
@@ -87,6 +98,8 @@ pub fn listed_kinds(engine: Engine) -> &'static [ObjectKind] {
             ObjectKind::Sequence,
             ObjectKind::Enum,
             ObjectKind::Domain,
+            // 扩展是装在某个 schema 里的对象：按 pg_extension.extnamespace 归到该 schema。
+            ObjectKind::Extension,
         ],
         // SQL Server 有独立序列（2012+），没有独立枚举或域。
         Engine::Sqlserver => &[
@@ -347,6 +360,16 @@ pub fn kind_sql(engine: Engine, kind: ObjectKind) -> KindSql {
                 count: "SELECT COUNT(*)::bigint FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND NOT t.tgisinternal",
                 list: "SELECT t.tgname, 'trigger', NULL::bigint, ''::text, c.relname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND NOT t.tgisinternal ORDER BY t.tgname, c.relname LIMIT $2",
             },
+            // 扩展的已安装版本放在 signature 列：树上因此能直接读到版本号。
+            ObjectKind::Extension => KindSql {
+                count: "SELECT COUNT(*)::bigint FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE n.nspname = $1",
+                list: "SELECT e.extname, 'extension', NULL::bigint, e.extversion, ''::text FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE n.nspname = $1 ORDER BY e.extname LIMIT $2",
+            },
+            // 事件只属于 MySQL / MariaDB：PostgreSQL 不给这一组编造任何行。
+            ObjectKind::Event => KindSql {
+                count: "SELECT 0::bigint",
+                list: "SELECT ''::text, 'event', NULL::bigint, ''::text, ''::text WHERE false",
+            },
         },
         Engine::Mysql | Engine::Mariadb => mysql_kind_sql(engine, kind),
         Engine::Sqlserver => sqlserver_kind_sql(kind),
@@ -363,7 +386,13 @@ pub fn kind_sql(engine: Engine, kind: ObjectKind) -> KindSql {
                 count: "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name NOT LIKE 'sqlite_%'",
                 list: "SELECT name, 'trigger', '', '' FROM sqlite_master WHERE type = 'trigger' AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT ?1",
             },
-            ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Sequence | ObjectKind::Enum | ObjectKind::Domain => KindSql {
+            ObjectKind::Function
+            | ObjectKind::Procedure
+            | ObjectKind::Sequence
+            | ObjectKind::Enum
+            | ObjectKind::Domain
+            | ObjectKind::Extension
+            | ObjectKind::Event => KindSql {
                 count: "SELECT 0",
                 list: "SELECT name, type, '', '' FROM sqlite_master WHERE 0",
             },
@@ -406,8 +435,8 @@ fn sqlserver_kind_sql(kind: ObjectKind) -> KindSql {
             count: "SELECT COUNT(*) FROM sys.sequences q JOIN sys.schemas s ON s.schema_id = q.schema_id WHERE s.name = @P1",
             list: "SELECT q.name, 'sequence', NULL, '', '' FROM sys.sequences q JOIN sys.schemas s ON s.schema_id = q.schema_id WHERE s.name = @P1 ORDER BY q.name OFFSET 0 ROWS FETCH NEXT @P2 ROWS ONLY",
         },
-        // SQL Server 没有独立的枚举或域，沿用 MySQL 的空清单降级先例。
-        ObjectKind::Enum | ObjectKind::Domain => empty_kind_sql(),
+        // SQL Server 没有独立的枚举、域、扩展或事件，沿用 MySQL 的空清单降级先例。
+        ObjectKind::Enum | ObjectKind::Domain | ObjectKind::Extension | ObjectKind::Event => empty_kind_sql(),
     }
 }
 
@@ -437,10 +466,31 @@ fn mysql_kind_sql(engine: Engine, kind: ObjectKind) -> KindSql {
             count: "SELECT COUNT(*) FROM information_schema.SEQUENCES WHERE SEQUENCE_SCHEMA = ?",
             list: "SELECT SEQUENCE_NAME, 'sequence', NULL, '', '' FROM information_schema.SEQUENCES WHERE SEQUENCE_SCHEMA = ? ORDER BY SEQUENCE_NAME LIMIT ?",
         },
-        ObjectKind::Sequence | ObjectKind::Enum | ObjectKind::Domain => empty_kind_sql(),
+        // 事件跟着库走：EVENT_SCHEMA 就是 database 参数。STATUS 放在 signature 列，树上直接读状态。
+        ObjectKind::Event => KindSql {
+            count: "SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ?",
+            list: "SELECT EVENT_NAME, 'event', NULL, LOWER(STATUS), '' FROM information_schema.EVENTS WHERE EVENT_SCHEMA = ? ORDER BY EVENT_NAME LIMIT ?",
+        },
+        ObjectKind::Extension | ObjectKind::Sequence | ObjectKind::Enum | ObjectKind::Domain => empty_kind_sql(),
     }
 }
 
-pub fn sqlite_kind_count_sql() -> &'static str {
-    "SELECT type, COUNT(*) FROM sqlite_master WHERE type IN ('table', 'view', 'trigger') AND name NOT LIKE 'sqlite_%' GROUP BY type"
+/// SQLite 的对象按「库」分开读：main 与每个 ATTACH 上来的库各有自己的 sqlite_master。
+/// 名字用双引号括起来，内嵌双引号按 SQL 规则翻倍。
+pub fn quote_sqlite(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+pub fn sqlite_kind_count_sql(database: &str) -> String {
+    format!(
+        "SELECT type, COUNT(*) FROM {}.sqlite_master WHERE type IN ('table', 'view', 'trigger') AND name NOT LIKE 'sqlite_%' GROUP BY type",
+        quote_sqlite(database)
+    )
+}
+
+pub fn sqlite_object_page_sql(database: &str) -> String {
+    format!(
+        "SELECT name, type, '', '' FROM {}.sqlite_master WHERE type IN ('table', 'view', 'trigger') AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT ?1 OFFSET ?2",
+        quote_sqlite(database)
+    )
 }

@@ -590,6 +590,8 @@ fn map_kind(kind: ObjectKind) -> Option<Kind> {
         ObjectKind::Sequence => Kind::Sequence,
         ObjectKind::Enum => Kind::Enum,
         ObjectKind::Domain => Kind::Domain,
+        // 扩展与事件不是可比较的结构对象，比较侧不列它们。
+        ObjectKind::Extension | ObjectKind::Event => return None,
     })
 }
 

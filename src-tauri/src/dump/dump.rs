@@ -122,8 +122,9 @@ enum DumpKind {
 }
 
 impl DumpKind {
-    fn from_catalog(kind: ObjectKind) -> Self {
-        match kind {
+    /// 目录里的扩展与事件不是可导出的结构对象（扩展靠安装脚本、事件不在 R5 的导出范围），跳过它们。
+    fn from_catalog(kind: ObjectKind) -> Option<Self> {
+        Some(match kind {
             ObjectKind::Table => Self::Table,
             ObjectKind::View => Self::View,
             ObjectKind::Function => Self::Function,
@@ -132,7 +133,8 @@ impl DumpKind {
             ObjectKind::Sequence => Self::Sequence,
             ObjectKind::Enum => Self::Enum,
             ObjectKind::Domain => Self::Domain,
-        }
+            ObjectKind::Extension | ObjectKind::Event => return None,
+        })
     }
 
     fn kind_str(self) -> &'static str {
@@ -419,7 +421,9 @@ async fn enumerate_objects(engine: Engine, session: &CatalogSession, scope: &Dum
             }
             let count = page.objects.len();
             for row in page.objects {
-                objects.push(DumpObject::bare(DumpKind::from_catalog(row.kind), schema, row));
+                if let Some(kind) = DumpKind::from_catalog(row.kind) {
+                    objects.push(DumpObject::bare(kind, schema, row));
+                }
             }
             if count == 0 || offset + count >= page.total {
                 break;

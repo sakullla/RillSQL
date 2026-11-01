@@ -107,6 +107,9 @@ export const admin: MessageSchema["admin"] = {
     enable: "Enable…",
     disable: "Disable…",
     empty: "This database has no events.",
+    viewDdl: "View DDL",
+    hideDdl: "Hide DDL",
+    ddlEmpty: "The event body could not be read.",
   },
   partitions: {
     title: "Partitions",

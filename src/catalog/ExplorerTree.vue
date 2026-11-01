@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { OpenOutcome } from "../connections/api";
 import { disconnectConnection, fetchDefinition, focusDatabase, listConnections, openConnection } from "./backend";
-import { browseSql, qualifiedObjectName, type CatalogObjectRef } from "./object-ref";
+import { browseSql, qualifiedObjectName, queryScope, type CatalogObjectRef } from "./object-ref";
 import type { DiagramOpen } from "../diagram/types";
 import { engineMeta } from "../engines";
 import MongoTreeCollections from "../mongo/MongoTreeCollections.vue";
@@ -15,7 +15,7 @@ import { toast } from "../ui/toast";
 import { codeHint, codeMessage } from "../i18n/backend-error";
 import { stageKindLabel } from "../connections/model";
 import type { InsertReference } from "../shell/query-editor";
-import { engineShape, isConnected, isDefinitionKind, kindLabel, objectKey, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
+import { engineShape, isConnected, isDataKind, isDefinitionKind, kindLabel, objectKey, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
 import type { CatalogConnection, DatabaseNode } from "./types";
 
 const props = defineProps<{ filter: string; redisApi?: RedisApi }>();
@@ -59,6 +59,8 @@ const ICONS = {
   sequence: "M4 7h16M4 12h10M4 17h16",
   enum: "M5 5h6v6H5zM13 5h6v6h-6zM5 13h6v6H5zM13 13h6v6h-6z",
   domain: "M4 6h16v12H4zM8 10h8M8 14h5",
+  extension: "M10 3h4v7h7v4h-7v7h-4v-7H3v-4h7z",
+  event: "M12 4a8 8 0 1 1 0 16 8 8 0 0 1 0-16M12 8v4.5l3 2",
   right: "m9 6 6 6-6 6",
   down: "m6 9 6 6 6-6",
   info: "M2 12a10 10 0 1 0 20 0 10 10 0 1 0-20 0M12 11v5.5M12 7.5h.01",
@@ -104,9 +106,10 @@ watch(
       if (next[connectionKey] === undefined) next[connectionKey] = true;
       const shape = engineShape(connection.engine);
       for (const database of connection.databases) {
-        if (!shape.databases) continue;
+        // SQLite 平时没有库层；ATTACH 之后每个附加库也是一行，同样默认展开。
         const databaseKey = `d:${connection.id}:${database.name}`;
         if (next[databaseKey] === undefined) next[databaseKey] = true;
+        if (!shape.databases) continue;
         if (!shape.schemas) continue;
         for (const schema of database.schemas) {
           const key = schemaKey(connection.id, database.name, schema.name);
@@ -319,6 +322,8 @@ function openObject(object: CatalogObjectRef | null, pane: "data" | "structure",
     if (connection) emit("open-docs", connection, object.database, object.name);
     return;
   }
+  // 扩展没有表网格也没有结构：只保留选中与复制名称。
+  if (!isDataKind(object.kind) && pane !== "structure") return;
   if (pane === "structure") setStructureFocus(null);
   closeMenu();
   emit("open-object", object, pane, section);
@@ -346,7 +351,7 @@ function scheduleInsert(object: CatalogObjectRef, column: string | null) {
     connectionName: object.connectionName,
     engine: object.engine,
     database: object.database,
-    schema: object.schema,
+    schema: queryScope(object.engine, object.database, object.schema),
     table: object.name,
     column,
   };
@@ -537,7 +542,7 @@ function onContextMenu(event: MouseEvent) {
 function onQuery() {
   const object = menu.value?.object;
   if (!object || object.stale) return;
-  const sql = browseSql(object.engine, object.schema, object.name);
+  const sql = browseSql(object.engine, queryScope(object.engine, object.database, object.schema), object.name);
   closeMenu();
   emit("query-object", object, sql);
 }
@@ -565,7 +570,9 @@ async function onCopy() {
   const object = menu.value?.object;
   if (!object) return;
   try {
-    await navigator.clipboard.writeText(qualifiedObjectName(object.engine, object.schema, object.name));
+    await navigator.clipboard.writeText(
+      qualifiedObjectName(object.engine, queryScope(object.engine, object.database, object.schema), object.name),
+    );
     closeMenu();
     toast(t("catalog.tree.copied"));
   } catch {
@@ -756,30 +763,60 @@ onBeforeUnmount(() => {
             </div>
             <div class="tree-entries">
               <template v-for="database in connection.databases" :key="database.name">
-                <button
+                <!-- SQLite 没有库层，但 ATTACH 之后每个附加库都要在树上单独一行（R5）：多于一个库时才出现这一层。 -->
+                <div
+                  v-if="connection.databases.length > 1"
                   class="tree-row"
-                  type="button"
-                  data-action="open-diagram"
-                  data-level="diagram"
-                  :data-connection="connection.id"
+                  role="treeitem"
+                  tabindex="0"
+                  data-level="database"
                   :data-database="database.name"
-                  data-schema=""
+                  :data-connection="connection.id"
                   :style="depthStyle(1)"
-                  @click.stop="openDiagram(connection, database.name, '')"
+                  :aria-expanded="open(`d:${connection.id}:${database.name}`)"
+                  @click="toggle(`d:${connection.id}:${database.name}`)"
                 >
-                  <span class="tw"></span>
-                  <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.diagram" /></svg>
-                  <span class="tr-name">{{ t("catalog.tree.diagram") }}</span>
-                </button>
-                <SchemaBlock
-                  v-for="schema in database.schemas"
-                  :key="`${database.name}:${schema.name}`"
-                  :connection="connection"
-                  :database="database.name"
-                  :schema="schema"
-                  :depth="1"
-                  :selected-key="selectedIn(connection.id, database.name, schema.name)"
-                />
+                  <span class="tw">
+                    <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="open(`d:${connection.id}:${database.name}`) ? ICONS.down : ICONS.right" /></svg>
+                  </span>
+                  <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.database" /></svg>
+                  <span class="tr-name">{{ database.name }}</span>
+                  <span v-if="database.name === 'main'" class="badge current-db" :title="t('catalog.tree.currentDatabaseTitle')">{{ t("catalog.tree.currentDatabase") }}</span>
+                </div>
+                <template v-if="connection.databases.length === 1 || open(`d:${connection.id}:${database.name}`)">
+                  <div v-if="database.error" class="tree-note err one-line" :style="depthStyle(2)" data-database-error :title="loadFailedTitle(database.error)">
+                    <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.error" /></svg>
+                    <strong>{{ t("catalog.tree.loadFailed") }}</strong>
+                    <span class="reason">{{ database.error }}</span>
+                    <button class="btn sm" type="button" data-action="tree-retry" @click="onRefresh">{{ t("catalog.tree.retry") }}</button>
+                  </div>
+                  <template v-if="!database.error">
+                    <button
+                      class="tree-row"
+                      type="button"
+                      data-action="open-diagram"
+                      data-level="diagram"
+                      :data-connection="connection.id"
+                      :data-database="database.name"
+                      data-schema=""
+                      :style="depthStyle(connection.databases.length > 1 ? 2 : 1)"
+                      @click.stop="openDiagram(connection, database.name, '')"
+                    >
+                      <span class="tw"></span>
+                      <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.diagram" /></svg>
+                      <span class="tr-name">{{ t("catalog.tree.diagram") }}</span>
+                    </button>
+                    <SchemaBlock
+                      v-for="schema in database.schemas"
+                      :key="`${database.name}:${schema.name}`"
+                      :connection="connection"
+                      :database="database.name"
+                      :schema="schema"
+                      :depth="connection.databases.length > 1 ? 2 : 1"
+                      :selected-key="selectedIn(connection.id, database.name, schema.name)"
+                    />
+                  </template>
+                </template>
               </template>
             </div>
           </template>

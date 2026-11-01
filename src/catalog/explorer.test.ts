@@ -135,6 +135,76 @@ describe("explorer tree", () => {
     wrapper.unmount();
   });
 
+  it("lists attached sqlite databases and shows extension and event groups", async () => {
+    const catalog = catalogFixture().map((item) => {
+      if (item.engine === "sqlite") {
+        return {
+          ...item,
+          databases: [
+            ...item.databases,
+            {
+              name: "extra",
+              error: null,
+              schemas: [
+                { name: "", error: null, total: 1, objects: [{ name: "invoices", kind: "table" as const, estimatedRows: 3, stale: false }] },
+              ],
+            },
+          ],
+        };
+      }
+      if (item.engine === "mysql") {
+        return {
+          ...item,
+          databases: item.databases.map((database) => ({
+            ...database,
+            schemas: database.schemas.map((schema) => ({
+              ...schema,
+              objects: [
+                ...schema.objects,
+                { name: "cleanup", kind: "event" as const, estimatedRows: null, stale: false, signature: "enabled" },
+              ],
+            })),
+          })),
+        };
+      }
+      if (item.engine === "postgres") {
+        return {
+          ...item,
+          databases: item.databases.map((database) => ({
+            ...database,
+            schemas: database.schemas.map((schema) => ({
+              ...schema,
+              objects: [
+                ...schema.objects,
+                { name: "pgcrypto", kind: "extension" as const, estimatedRows: null, stale: false, signature: "1.3" },
+              ],
+            })),
+          })),
+        };
+      }
+      return item;
+    });
+    replaceCatalog(catalog);
+    const wrapper = mount(ExplorerTree, { props: { filter: "" } });
+
+    // SQLite 平时没有库层；ATTACH 之后附加库单独一行并默认展开（R5）。
+    const sqlite = wrapper.get("[data-engine=sqlite]");
+    expect(sqlite.findAll("[data-level=database]").map((node) => node.attributes("data-database"))).toEqual(["main", "extra"]);
+    expect(names(sqlite, "[data-level=object]")).toContain("invoices");
+    expect(names(sqlite, "[data-level=object]")).toContain("notes");
+
+    // 事件与扩展各自成组，树上能直接读到状态与版本。
+    const mysql = wrapper.get("[data-engine=mysql]");
+    expect(mysql.find("[data-kind-group=event]").exists()).toBe(true);
+    expect(names(mysql, "[data-level=object]")).toContain("cleanup");
+    expect(mysql.text()).toContain("enabled");
+    const postgres = wrapper.get("[data-engine=postgres]");
+    expect(postgres.find("[data-kind-group=extension]").exists()).toBe(true);
+    expect(names(postgres, "[data-level=object]")).toContain("pgcrypto");
+    expect(postgres.text()).toContain("1.3");
+    wrapper.unmount();
+  });
+
   it("keeps same-named tables distinguishable in filter results with full paths", async () => {
     replaceCatalog(catalogFixture());
     const wrapper = mount(ExplorerTree, { props: { filter: "customers" } });

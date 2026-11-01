@@ -110,4 +110,21 @@ export type StructureAction =
   | { kind: "dropForeignKey"; table: string; name: string }
   | { kind: "dropTable"; table: string }
   | { kind: "setForeignKeys"; enabled: boolean }
-  | { kind: "replaceView"; table: string; definition: string };
+  | { kind: "replaceView"; table: string; definition: string }
+  // 数据库级动作与 Rust 侧 ddl::model::Action 同名同字段（R5）：预览/执行共用一条通道。
+  | { kind: "setPragma"; pragma: string; value: string }
+  | { kind: "attachDatabase"; path: string; name: string }
+  | { kind: "vacuum" }
+  | { kind: "reindex"; target: string | null }
+  | {
+      kind: "alterSequence";
+      sequence: string;
+      start: number | null;
+      increment: number | null;
+      minValue: number | null;
+      maxValue: number | null;
+      cycle: boolean | null;
+    }
+  | { kind: "addEnumValue"; enumName: string; value: string; before: string | null }
+  | { kind: "alterDomain"; domain: string; defaultSql: string | null; notNull: boolean | null }
+  | { kind: "setEventEnabled"; event: string; enabled: boolean };

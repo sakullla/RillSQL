@@ -1,14 +1,23 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
+import { tr as t } from "../i18n";
+import type { Engine } from "../engines";
+import Listbox from "../ui/Listbox.vue";
+import type { ListboxOption } from "../ui/types";
+import { executeStructure, previewStructure, type StructureRequest } from "../structure/api";
+import ChangePreviewDialog from "../structure/ChangePreviewDialog.vue";
+import type { StructureAction, StructurePlan, StructureReceipt } from "../structure/types";
 import { fetchDefinition } from "./backend";
 import type { CatalogObjectRef } from "./object-ref";
-import { tr as t } from "../i18n";
+import { catalogConnections } from "./store";
 import { kindLabel } from "./tree";
 import type { ObjectKind } from "./types";
 
 const props = defineProps<{
   object: Pick<CatalogObjectRef, "connectionId" | "database" | "schema" | "name" | "kind" | "signature" | "relation">;
   label: string;
+  /** 目录里这条连接的引擎；不给时从目录快照里查。 */
+  engine?: Engine;
 }>();
 const emit = defineEmits<{ "copy-sql": [sql: string] }>();
 
@@ -25,21 +34,151 @@ const ICONS: Record<ObjectKind, string> = {
   sequence: "M4 7h16M4 12h10M4 17h16",
   enum: "M5 5h6v6H5zM13 5h6v6h-6zM5 13h6v6H5zM13 13h6v6h-6z",
   domain: "M4 6h16v12H4zM8 10h8M8 14h5",
+  extension: "M10 3h4v7h7v4h-7v7h-4v-7H3v-4h7z",
+  event: "M12 4a8 8 0 1 1 0 16 8 8 0 0 1 0-16M12 8v4.5l3 2",
 };
 
 /** 错误态图标独立于按 ObjectKind 索引的映射，不进 ICONS。 */
 const ERROR_ICON = "M2 12a10 10 0 1 0 20 0 10 10 0 1 0-20 0M15 9l-6 6M9 9l6 6";
 
-onMounted(async () => {
+const connection = computed(() => catalogConnections().find((item) => item.id === props.object.connectionId) ?? null);
+const engine = computed<Engine | null>(() => props.engine ?? connection.value?.engine ?? null);
+const environmentLabel = computed(() => connection.value?.envLabel.trim() ?? "");
+const environmentTone = computed(() => connection.value?.envTone ?? "none");
+
+/** 枚举与域在 PostgreSQL 上有内容可改：接 T9 的 addEnumValue / alterDomain，先预览再执行。 */
+const editable = computed(() => engine.value === "postgres" && (props.object.kind === "enum" || props.object.kind === "domain"));
+
+const enumValue = ref("");
+const enumBefore = ref("");
+const domainDefault = ref("");
+const domainNotNull = ref<"keep" | "set" | "clear">("keep");
+const editError = ref("");
+const plan = ref<StructurePlan | null>(null);
+const receipt = ref<StructureReceipt | null>(null);
+const pending = ref<StructureAction | null>(null);
+const busy = ref(false);
+
+const notNullOptions = computed<ListboxOption[]>(() => [
+  { value: "keep", label: t("catalog.definition.notNullKeep") },
+  { value: "set", label: t("catalog.definition.notNullSet") },
+  { value: "clear", label: t("catalog.definition.notNullClear") },
+]);
+
+async function load(): Promise<void> {
+  loading.value = true;
   try {
     sql.value = await fetchDefinition(props.object);
+    error.value = "";
   } catch (caught) {
-    error.value = caught instanceof Error && caught.message ? caught.message : typeof caught === "string" && caught ? caught : t("catalog.definition.failed");
+    error.value =
+      caught instanceof Error && caught.message
+        ? caught.message
+        : typeof caught === "string" && caught
+          ? caught
+          : t("catalog.definition.failed");
     sql.value = "";
   } finally {
     loading.value = false;
   }
-});
+}
+
+onMounted(load);
+
+function requestOf(): StructureRequest | null {
+  if (!engine.value) return null;
+  return {
+    connectionId: props.object.connectionId,
+    database: props.object.database,
+    schema: props.object.schema,
+    engine: engine.value,
+  };
+}
+
+function openPreview(action: StructureAction): void {
+  const request = requestOf();
+  if (!request) {
+    editError.value = t("catalog.definition.editNeedsConnection");
+    return;
+  }
+  busy.value = true;
+  editError.value = "";
+  receipt.value = null;
+  pending.value = action;
+  previewStructure(request, action)
+    .then((next) => {
+      plan.value = next;
+    })
+    .catch((caught: unknown) => {
+      plan.value = null;
+      pending.value = null;
+      editError.value = caught instanceof Error && caught.message ? caught.message : String(caught);
+    })
+    .finally(() => {
+      busy.value = false;
+    });
+}
+
+function previewEnum(): void {
+  const value = enumValue.value.trim();
+  if (!value) {
+    editError.value = t("catalog.definition.enumValueRequired");
+    return;
+  }
+  const before = enumBefore.value.trim();
+  openPreview({ kind: "addEnumValue", enumName: props.object.name, value, before: before || null });
+}
+
+function previewDomain(): void {
+  const defaultSql = domainDefault.value.trim();
+  const notNull = domainNotNull.value === "keep" ? null : domainNotNull.value === "set";
+  if (defaultSql === "" && notNull === null) {
+    editError.value = t("catalog.definition.domainNoChange");
+    return;
+  }
+  // 空串表示「不改默认值」：只有填了内容才进语句，避免顺手把已有默认值删掉。
+  openPreview({ kind: "alterDomain", domain: props.object.name, defaultSql: defaultSql || null, notNull });
+}
+
+async function confirm(): Promise<void> {
+  const request = requestOf();
+  const action = pending.value;
+  const current = plan.value;
+  if (!request || !action || !current || current.blocked.length > 0 || current.steps.length === 0) return;
+  busy.value = true;
+  try {
+    receipt.value = await executeStructure(request, action, current.steps.map((step) => step.sql));
+    const failed = receipt.value.blocked.length > 0 || receipt.value.steps.some((step) => step.status !== "ok");
+    if (!failed) {
+      enumValue.value = "";
+      enumBefore.value = "";
+      await load();
+    }
+  } catch (caught) {
+    receipt.value = {
+      blocked: [],
+      rule: current.rule,
+      target: current.target,
+      rebuild: current.rebuild,
+      steps: [
+        {
+          sql: "",
+          label: t("catalog.definition.executeLabel"),
+          status: "unknown",
+          message: caught instanceof Error ? caught.message : String(caught),
+        },
+      ],
+    };
+  } finally {
+    busy.value = false;
+  }
+}
+
+function closePreview(): void {
+  plan.value = null;
+  receipt.value = null;
+  pending.value = null;
+}
 
 function copy() {
   if (!sql.value.trim()) return;
@@ -55,7 +194,7 @@ function copy() {
       </span>
       <div class="definition-titles">
         <h2>{{ label }}</h2>
-        <p>{{ kindLabel(object.kind) }} · {{ t("catalog.definition.readOnly") }}</p>
+        <p>{{ kindLabel(object.kind) }} · {{ editable ? t("catalog.definition.editable") : t("catalog.definition.readOnly") }}</p>
       </div>
       <button v-if="sql" class="btn sm" type="button" data-action="copy-definition" @click="copy">{{ t("catalog.definition.copy") }}</button>
     </header>
@@ -68,6 +207,51 @@ function copy() {
       {{ t("catalog.definition.loading") }}
     </div>
     <pre v-else class="definition-sql" data-definition-sql data-readonly="true">{{ sql }}</pre>
+
+    <form v-if="editable" class="definition-edit" data-definition-edit :data-edit-kind="object.kind" @submit.prevent="object.kind === 'enum' ? previewEnum() : previewDomain()">
+      <h3>{{ t("catalog.definition.editTitle") }}</h3>
+      <template v-if="object.kind === 'enum'">
+        <p class="definition-edit-hint">{{ t("catalog.definition.enumHint") }}</p>
+        <label class="definition-field">
+          <span>{{ t("catalog.definition.enumValue") }}</span>
+          <input v-model="enumValue" type="text" data-field="enum-value" :aria-label="t('catalog.definition.enumValueAria')" :placeholder="t('catalog.definition.enumValuePlaceholder')" />
+        </label>
+        <label class="definition-field">
+          <span>{{ t("catalog.definition.enumBefore") }}</span>
+          <input v-model="enumBefore" type="text" data-field="enum-before" :aria-label="t('catalog.definition.enumBeforeAria')" :placeholder="t('catalog.definition.enumBeforePlaceholder')" />
+        </label>
+      </template>
+      <template v-else>
+        <p class="definition-edit-hint">{{ t("catalog.definition.domainHint") }}</p>
+        <label class="definition-field">
+          <span>{{ t("catalog.definition.domainDefault") }}</span>
+          <input v-model="domainDefault" type="text" data-field="domain-default" :aria-label="t('catalog.definition.domainDefaultAria')" :placeholder="t('catalog.definition.domainDefaultPlaceholder')" />
+        </label>
+        <label class="definition-field">
+          <span>{{ t("catalog.definition.domainNotNull") }}</span>
+          <Listbox v-model="domainNotNull" :options="notNullOptions" :aria-label="t('catalog.definition.domainNotNullAria')" />
+        </label>
+      </template>
+      <p v-if="editError" class="definition-error" role="alert" data-edit-error>{{ editError }}</p>
+      <div class="definition-edit-actions">
+        <button class="btn primary sm" type="submit" data-action="preview-definition-edit" :disabled="busy">
+          {{ t("catalog.definition.previewEdit") }}
+        </button>
+      </div>
+    </form>
+
+    <ChangePreviewDialog
+      v-if="plan"
+      :plan="plan"
+      :receipt="receipt"
+      :busy="busy"
+      :engine="engine ?? ''"
+      :connection-name="connection?.name ?? ''"
+      :env-label="environmentLabel"
+      :env-tone="environmentTone"
+      @cancel="closePreview"
+      @confirm="confirm"
+    />
   </section>
 </template>
 
@@ -119,5 +303,27 @@ function copy() {
   white-space: pre;
   box-shadow: inset 0 1px 2px color-mix(in srgb, var(--press) 25%, transparent);
 }
+.definition-edit {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-md);
+  background: var(--surface-panel);
+}
+.definition-edit h3 { margin: 0; font-size: var(--fs-sm); font-weight: 600; }
+.definition-edit-hint { margin: 0; color: var(--text-3); font-size: var(--fs-xs); }
+.definition-field { display: flex; flex-direction: column; gap: 2px; font-size: var(--fs-xs); color: var(--text-3); }
+.definition-field input {
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-sm);
+}
+.definition-edit-actions { display: flex; gap: var(--sp-2); }
 @keyframes definition-spin { to { transform: rotate(1turn); } }
 </style>

@@ -5,7 +5,19 @@ export const DEFAULT_OBJECT_PAGE = 100;
 export type { Engine };
 export type EnvTone = "dev" | "test" | "prod" | "local" | "none";
 export type ConnStatus = "connected" | "disconnected" | "connecting" | "error" | "lost";
-export type ObjectKind = "table" | "view" | "function" | "procedure" | "trigger" | "sequence" | "enum" | "domain";
+export type ObjectKind =
+  | "table"
+  | "view"
+  | "function"
+  | "procedure"
+  | "trigger"
+  | "sequence"
+  | "enum"
+  | "domain"
+  /** PostgreSQL 扩展：装在某个 schema 里，signature 存已安装版本。 */
+  | "extension"
+  /** MySQL / MariaDB 事件：库级对象，signature 存启停状态。 */
+  | "event";
 
 export interface CatalogObject {
   name: string;
@@ -76,6 +88,8 @@ export interface EventInfo {
   onCompletion: string;
   definer: string;
   lastExecuted: string | null;
+  /** 事件体原文（EVENT_DEFINITION）：只读查看 DDL，没有编辑入口。 */
+  definition: string;
 }
 
 export interface PartitionItem {

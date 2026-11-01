@@ -6,7 +6,7 @@ use crate::catalog::model::{
     kind_sql, known_row_estimate, listed_kinds, metadata_sql, parse_kind, DatabaseNode, Engine, KindReport, ObjectKind,
     ObjectRow, SchemaNode, DEFAULT_OBJECT_PAGE,
 };
-use crate::catalog::model::sqlite_kind_count_sql;
+use crate::catalog::model::{quote_sqlite, sqlite_kind_count_sql, sqlite_object_page_sql};
 use crate::connections::CatalogSession;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,14 +146,18 @@ pub async fn read_catalog_session(engine: Engine, session: &CatalogSession, page
 /// 只读取库名；PostgreSQL 再读取 schema 名。对象留给 catalog_page。
 pub async fn read_catalog_outline(engine: Engine, session: &CatalogSession) -> ConnectionBody {
     match (engine, session) {
-        (Engine::Sqlite, CatalogSession::Sqlite { foreign_keys, .. }) => ConnectionBody {
-            error: None,
-            foreign_keys: *foreign_keys,
-            databases: vec![DatabaseNode {
-                name: "main".to_owned(),
+        // SQLite 的“库”就是 main 与每个 ATTACH 上来的库：ATTACH 之后它们同样出现在树上。
+        (Engine::Sqlite, CatalogSession::Sqlite { pool, foreign_keys }) => match sqlite_database_names(pool).await {
+            Ok(databases) => ConnectionBody {
                 error: None,
-                schemas: vec![SchemaNode::empty("")],
-            }],
+                foreign_keys: *foreign_keys,
+                databases,
+            },
+            Err(message) => ConnectionBody {
+                error: Some(message),
+                foreign_keys: *foreign_keys,
+                databases: Vec::new(),
+            },
         },
         (Engine::Mysql | Engine::Mariadb, CatalogSession::Mysql(pool)) => match read_mysql_outline(pool, engine).await {
             Ok(databases) => ConnectionBody {
@@ -220,7 +224,7 @@ pub async fn read_object_page(session: &CatalogSession, engine: Engine, database
     let limit = read_limit(limit, 0);
     match session {
         CatalogSession::Scripted => empty_page(scripted_message()),
-        CatalogSession::Sqlite { pool, .. } => match read_sqlite_objects(pool, offset, limit).await {
+        CatalogSession::Sqlite { pool, .. } => match read_sqlite_objects(pool, database, offset, limit).await {
             Ok(schema_node) => ObjectPageBody {
                 objects: schema_node.objects,
                 total: schema_node.total,
@@ -252,7 +256,7 @@ pub async fn read_definition(
     }
     match session {
         CatalogSession::Scripted => Err(definition_failure("这个连接没有连着可查询的数据库")),
-        CatalogSession::Sqlite { pool, .. } => read_sqlite_definition(pool, name, kind).await,
+        CatalogSession::Sqlite { pool, .. } => read_sqlite_definition(pool, database, name, kind).await,
         CatalogSession::Mysql(pool) => read_mysql_definition(pool, engine, database, name, kind).await,
         CatalogSession::Postgres(client) => read_postgres_definition(client, schema, name, kind, signature, relation).await,
         CatalogSession::Sqlserver(client) => read_sqlserver_definition(client, schema, name, kind).await,
@@ -337,33 +341,82 @@ impl KindRank for ObjectRow {
             ObjectKind::Sequence => 5,
             ObjectKind::Enum => 6,
             ObjectKind::Domain => 7,
+            ObjectKind::Extension => 8,
+            ObjectKind::Event => 9,
         }
     }
 }
 
-async fn read_sqlite(pool: &sqlx::SqlitePool, foreign_keys: Option<bool>, page: usize, windows: &[ObjectWindow]) -> ConnectionBody {
-    let limit = requested_limit("main", "", windows, page);
-    match read_sqlite_objects(pool, 0, limit).await {
-        Ok(schema) => ConnectionBody {
+/// SQLite 的库清单来自 PRAGMA database_list：main 之后是每个 ATTACH 上来的库。
+/// temp 不是用户库，不进树。
+async fn sqlite_database_names(pool: &sqlx::SqlitePool) -> Result<Vec<DatabaseNode>, String> {
+    let rows: Vec<(i64, String, String)> = sqlx::query_as("PRAGMA database_list")
+        .fetch_all(pool)
+        .await
+        .map_err(read_failure)?;
+    let databases: Vec<DatabaseNode> = rows
+        .into_iter()
+        .filter(|(_, name, _)| name != "temp")
+        .map(|(_, name, _)| DatabaseNode {
+            name,
             error: None,
-            foreign_keys,
-            databases: vec![DatabaseNode {
-                name: "main".to_owned(),
+            schemas: vec![SchemaNode::empty("")],
+        })
+        .collect();
+    if databases.is_empty() {
+        return Err(read_failure("没有读到 SQLite 数据库"));
+    }
+    Ok(databases)
+}
+
+async fn read_sqlite(pool: &sqlx::SqlitePool, foreign_keys: Option<bool>, page: usize, windows: &[ObjectWindow]) -> ConnectionBody {
+    let names = match sqlite_database_names(pool).await {
+        Ok(names) => names,
+        Err(message) => {
+            return ConnectionBody {
+                error: Some(message),
+                foreign_keys,
+                databases: Vec::new(),
+            };
+        }
+    };
+    let mut databases = Vec::new();
+    for node in names {
+        let limit = requested_limit(&node.name, "", windows, page);
+        // 单个附加库读失败只让这个库带原因，其它库照常显示。
+        databases.push(match read_sqlite_objects(pool, &node.name, 0, limit).await {
+            Ok(schema) => DatabaseNode {
+                name: node.name,
                 error: None,
                 schemas: vec![schema],
-            }],
-        },
-        Err(message) => ConnectionBody {
-            error: Some(message),
-            foreign_keys,
-            databases: Vec::new(),
-        },
+            },
+            Err(message) => DatabaseNode {
+                name: node.name,
+                error: Some(message),
+                schemas: vec![SchemaNode::empty("")],
+            },
+        });
+    }
+    ConnectionBody {
+        error: None,
+        foreign_keys,
+        databases,
     }
 }
 
-async fn read_sqlite_objects(pool: &sqlx::SqlitePool, offset: usize, limit: usize) -> Result<SchemaNode, String> {
-    let sql = metadata_sql(Engine::Sqlite);
-    let counts: Vec<(String, i64)> = sqlx::query_as(sqlite_kind_count_sql())
+/// 空库名按 main 处理：调用方不带库名时读的就是这条连接自己的库。
+fn sqlite_database_or_main(database: &str) -> &str {
+    if database.is_empty() {
+        "main"
+    } else {
+        database
+    }
+}
+
+async fn read_sqlite_objects(pool: &sqlx::SqlitePool, database: &str, offset: usize, limit: usize) -> Result<SchemaNode, String> {
+    let database = sqlite_database_or_main(database);
+    // 库名只来自 PRAGMA database_list，并且按 SQL 标识符规则加引号；表名仍走绑定参数。
+    let counts: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sqlite_kind_count_sql(database)))
         .fetch_all(pool)
         .await
         .map_err(read_failure)?;
@@ -383,7 +436,7 @@ async fn read_sqlite_objects(pool: &sqlx::SqlitePool, offset: usize, limit: usiz
         }
     }
     let total = reports.iter().map(|item| item.total).sum();
-    let rows: Vec<(String, String, String, String)> = sqlx::query_as(sql.objects)
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sqlite_object_page_sql(database)))
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
         .bind(i64::try_from(offset).unwrap_or(i64::MAX))
         .fetch_all(pool)
@@ -410,7 +463,8 @@ async fn read_sqlite_objects(pool: &sqlx::SqlitePool, offset: usize, limit: usiz
     })
 }
 
-async fn read_sqlite_definition(pool: &sqlx::SqlitePool, name: &str, kind: &str) -> Result<String, String> {
+async fn read_sqlite_definition(pool: &sqlx::SqlitePool, database: &str, name: &str, kind: &str) -> Result<String, String> {
+    let database = sqlite_database_or_main(database);
     if kind != "trigger" {
         return Err(definition_failure(match kind {
             "function" | "procedure" => "SQLite 没有函数或存储过程",
@@ -418,7 +472,12 @@ async fn read_sqlite_definition(pool: &sqlx::SqlitePool, name: &str, kind: &str)
             _ => "只有函数、存储过程和触发器可以读取只读定义",
         }));
     }
-    let sql: Option<String> = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = ?1 AND type = 'trigger'")
+    // 附加库的触发器在它自己的 sqlite_master 里，必须带上库名限定。
+    let statement = format!(
+        "SELECT sql FROM {}.sqlite_master WHERE name = ?1 AND type = 'trigger'",
+        quote_sqlite(database)
+    );
+    let sql: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
         .bind(name)
         .fetch_optional(pool)
         .await
@@ -525,6 +584,8 @@ async fn read_mysql_definition(pool: &mysql_async::Pool, engine: Engine, databas
         "function" => "FUNCTION",
         "procedure" => "PROCEDURE",
         "trigger" => "TRIGGER",
+        // 事件的事件体只读：这里只给 SHOW CREATE EVENT 的原文。
+        "event" => "EVENT",
         "sequence" if engine == Engine::Mariadb => "SEQUENCE",
         "sequence" | "enum" | "domain" => {
             return Err(definition_failure(if engine == Engine::Mariadb {
@@ -533,7 +594,7 @@ async fn read_mysql_definition(pool: &mysql_async::Pool, engine: Engine, databas
                 "MySQL 没有独立的序列、枚举或域"
             }));
         }
-        _ => return Err(definition_failure("只有函数、存储过程和触发器可以读取只读定义")),
+        _ => return Err(definition_failure("只有函数、存储过程、触发器、事件和视图可以读取只读定义")),
     };
     if database.is_empty() {
         return Err(definition_failure("需要数据库名"));
@@ -543,8 +604,20 @@ async fn read_mysql_definition(pool: &mysql_async::Pool, engine: Engine, databas
     let row: Option<mysql_async::Row> = conn.query_first(sql).await.map_err(definition_failure)?;
     let row = row.ok_or_else(|| definition_failure("没有读到定义"))?;
     // SHOW CREATE SEQUENCE 的语句在索引 1；函数、过程和触发器在索引 2。
-    let column = if statement == "SEQUENCE" { 1 } else { 2 };
+    // SHOW CREATE EVENT 的列名是 Create Event（不同版本列序会变），按列名定位，读不到时退回索引 3。
+    let column = match statement {
+        "SEQUENCE" => 1,
+        "EVENT" => mysql_column_index(&row, "Create Event").unwrap_or(3),
+        _ => 2,
+    };
     mysql_create_sql(&row, column)
+}
+
+/// 按列名定位 SHOW CREATE 的语句列；列名大小写按服务器返回值。
+fn mysql_column_index(row: &mysql_async::Row, label: &str) -> Option<usize> {
+    row.columns_ref()
+        .iter()
+        .position(|column| column.name_str().eq_ignore_ascii_case(label))
 }
 
 fn quote_mysql(name: &str) -> String {
