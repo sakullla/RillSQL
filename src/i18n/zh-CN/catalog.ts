@@ -62,6 +62,8 @@ export const catalog = {
     copyToQuery: "复制到新查询",
     copyFullName: "复制完整名称",
     dropTable: "删除表…",
+    insertBlockedReadonly: "这个标签只读，不能插入标识符。",
+    insertBlockedRunning: "查询正在执行，结束之后再插入。",
   },
   schema: {
     shownCount: "已显示 {shown} / {total} 个",

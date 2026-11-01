@@ -550,6 +550,55 @@ describe("explorer tree", () => {
     expect(gap.find('[data-action=open-diagram][data-database=other]').exists()).toBe(false);
     gap.unmount();
   });
+
+  it("offers a single click insert for tables and columns and keeps double click for opening", async () => {
+    const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    replaceCatalog(catalogFixture());
+    setOutlineLoader(async (): Promise<ObjectOutline> => ({
+      status: "ready",
+      error: "",
+      columns: ["id", "status"],
+      indexes: ["customers_pkey"],
+      materialized: false,
+    }));
+    const wrapper = mount(ExplorerTree, { props: { filter: "" } });
+
+    await wrapper.get("[data-engine=postgres] [data-schema=public][data-object=customers]").trigger("click");
+    expect(wrapper.emitted("insert-object")).toBeUndefined();
+    await wait(260);
+    expect(wrapper.emitted("insert-object")?.[0]?.[0]).toMatchObject({
+      connectionId: "atlas",
+      engine: "postgres",
+      database: "atlas_dev",
+      schema: "public",
+      table: "customers",
+      column: null,
+    });
+
+    // 双击只打开数据：先到的单击不得留下半次插入。
+    await wrapper.get("[data-engine=postgres] [data-schema=public][data-object=orders]").trigger("click");
+    await wrapper.get("[data-engine=postgres] [data-schema=public][data-object=orders]").trigger("dblclick");
+    await wait(260);
+    expect(wrapper.emitted("insert-object")).toHaveLength(1);
+    expect(wrapper.emitted("open-object")?.at(-1)?.[1]).toBe("data");
+
+    await wrapper.get("[data-schema=public][data-object=customers] [data-action=toggle-members]").trigger("click");
+    await flushPromises();
+    await wrapper.get("[data-member=status][data-object=customers]").trigger("click");
+    await wait(260);
+    expect(wrapper.emitted("insert-object")?.at(-1)?.[0]).toMatchObject({ table: "customers", column: "status" });
+
+    const before = wrapper.emitted("insert-object")?.length ?? 0;
+    await wrapper.get("[data-member=customers_pkey][data-object=customers]").trigger("click");
+    await wait(260);
+    expect(wrapper.emitted("insert-object")).toHaveLength(before);
+
+    // 键盘导航（空格选择）不插入，只有指针单击才走插入通道。
+    await wrapper.get("[data-engine=postgres] [data-schema=public][data-object=customers]").trigger("keydown", { key: " " });
+    await wait(260);
+    expect(wrapper.emitted("insert-object")).toHaveLength(before);
+    wrapper.unmount();
+  });
 });
 
 describe("explorer tree: redis key space (R11)", () => {

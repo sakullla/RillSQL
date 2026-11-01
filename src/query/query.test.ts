@@ -1,4 +1,5 @@
 import { currentCompletions, startCompletion } from "@codemirror/autocomplete";
+import { undo } from "@codemirror/commands";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { flushPromises, mount } from "@vue/test-utils";
@@ -7,6 +8,7 @@ import { nextTick } from "vue";
 import { catalogFixture } from "../catalog/fixtures";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
 import { registerPending, resetCloseGuard } from "../shell/close-guard";
+import { insertAtCursor, resetEditors, setEditorFocus } from "../shell/query-editor";
 import { shellCommands } from "../shell/commands";
 import { createSession } from "../shell/session";
 import { tr } from "../i18n";
@@ -1498,5 +1500,78 @@ describe("tsql statement split", () => {
     expect(splitSql("SELECT 1 FROM gopher WHERE x = 1;", "sqlserver")).toHaveLength(1);
     const noSemi = splitSql("UPDATE t SET n = 1\nGO\nUPDATE u SET m = 2\nGO", "sqlserver");
     expect(noSemi).toHaveLength(2);
+  });
+
+  it("inserts a tree reference at the cursor as one undo step", async () => {
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-insert",
+        draft: "SELECT * FROM orders o WHERE ",
+        connectionId: "atlas",
+        connectionName: "Atlas",
+        database: "atlas_dev",
+        engine: "postgres",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement);
+    expect(view).toBeTruthy();
+    const cursor = view!.state.doc.length;
+    view!.dispatch({ selection: { anchor: cursor } });
+    setEditorFocus("query-insert", true);
+
+    const outcome = insertAtCursor("query-insert", {
+      connectionId: "atlas",
+      connectionName: "Atlas",
+      engine: "postgres",
+      database: "atlas_dev",
+      schema: "public",
+      table: "orders",
+      column: "status",
+    });
+    expect(outcome).toBe("ok");
+    expect(view!.state.doc.toString()).toBe("SELECT * FROM orders o WHERE o.status");
+    expect(view!.state.selection.main.head).toBe(cursor + "o.status".length);
+    expect(wrapper.emitted("update:draft")?.at(-1)?.[1]).toBe("SELECT * FROM orders o WHERE o.status");
+
+    // 一次撤销回到插入前，不残留半截限定名。
+    undo(view!);
+    expect(view!.state.doc.toString()).toBe("SELECT * FROM orders o WHERE ");
+    undo(view!);
+
+    // 执行中的标签不接收插入。
+    adoptRun(
+      "query-insert",
+      runDto({ status: "running", connectionId: "atlas", connectionName: "Atlas", database: "atlas_dev", engine: "postgres" }),
+    );
+    await nextTick();
+    expect(
+      insertAtCursor("query-insert", {
+        connectionId: "atlas",
+        connectionName: "Atlas",
+        engine: "postgres",
+        database: "atlas_dev",
+        schema: "public",
+        table: "orders",
+        column: "status",
+      }),
+    ).toBe("running");
+    expect(view!.state.doc.toString()).toBe("SELECT * FROM orders o WHERE ");
+
+    wrapper.unmount();
+    expect(
+      insertAtCursor("query-insert", {
+        connectionId: "atlas",
+        connectionName: "Atlas",
+        engine: "postgres",
+        database: "atlas_dev",
+        schema: "public",
+        table: "orders",
+        column: "status",
+      }),
+    ).toBe("none");
+    resetEditors();
   });
 });

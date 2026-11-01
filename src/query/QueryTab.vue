@@ -20,6 +20,7 @@ import { gridDescribe } from "../grid/api";
 import type { Engine } from "../grid/types";
 import Icon from "../shell/Icon.vue";
 import { tabHasPending } from "../shell/close-guard";
+import { buildInsertText, registerEditor, setEditorFocus, unregisterEditor, type InsertReference, type QueryEditorApi } from "../shell/query-editor";
 import { loadSettings, onSettingsSaved, type EditorTheme } from "../shell/settings";
 import { connectionStatusText, type ConnectionStatus } from "../shell/status-text";
 import type { QueryTarget } from "../shell/session";
@@ -509,6 +510,8 @@ function editorExtensions() {
     linter((editor) => sqlLintDiagnostics(editor.state.doc.toString(), props.engine ?? "postgres")),
     EditorView.updateListener.of((update) => {
       if (!alive) return;
+      /* 目录树单击插入靠这份焦点标记判断「查询编辑器持有焦点」（R4）。 */
+      if (update.focusChanged) setEditorFocus(props.tabId, update.view.hasFocus);
       if (update.selectionSet || update.docChanged) {
         const range = update.state.selection.main;
         hasSelection.value = range.from !== range.to;
@@ -522,12 +525,46 @@ function editorExtensions() {
   ];
 }
 
+const editorRegistryApi: QueryEditorApi = {
+  insert: (reference) => insertReference(reference),
+  focus: () => {
+    mountEditor();
+    view?.focus();
+  },
+  isRunning: () => running.value,
+};
+
 function mountEditor() {
   ensureRangeClientRects();
   view = resolveEditor(view, host.value, (parent) => new EditorView({
     parent,
     state: EditorState.create({ doc: props.draft, extensions: editorExtensions() }),
   }));
+  if (view) registerEditor(props.tabId, editorRegistryApi);
+}
+
+/**
+ * 目录树单击插入（R4）：整段写入作为一个 CM 事务，一次 Ctrl+Z 回到插入前；
+ * 写完后把焦点留在编辑器。guard（只读/执行中）由注册表在调用前判定。
+ */
+function insertReference(reference: InsertReference): boolean {
+  mountEditor();
+  const editor = view;
+  if (!editor) {
+    actionError.value = t("query.editor.notReady");
+    return false;
+  }
+  const doc = editor.state.doc.toString();
+  const range = editor.state.selection.main;
+  const text = buildInsertText(reference, doc, range.head, props.database);
+  const from = Math.min(range.from, range.to);
+  const to = Math.max(range.from, range.to);
+  editor.dispatch({
+    changes: { from, to, insert: text },
+    selection: { anchor: from + text.length },
+  });
+  editor.focus();
+  return true;
 }
 
 function formatEditor() {
@@ -1182,6 +1219,7 @@ onBeforeUnmount(() => {
   stopResize?.();
   detachSettings?.();
   document.removeEventListener("pointerdown", onPointerDown);
+  unregisterEditor(props.tabId);
   view?.destroy();
 });
 </script>

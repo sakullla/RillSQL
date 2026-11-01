@@ -14,6 +14,7 @@ import { tr as t } from "../i18n";
 import { toast } from "../ui/toast";
 import { codeHint, codeMessage } from "../i18n/backend-error";
 import { stageKindLabel } from "../connections/model";
+import type { InsertReference } from "../shell/query-editor";
 import { engineShape, isConnected, isDefinitionKind, kindLabel, objectKey, objectPath, postgresSessionGap, searchObjects, splitMatch } from "./tree";
 import type { CatalogConnection, DatabaseNode } from "./types";
 
@@ -28,6 +29,8 @@ const emit = defineEmits<{
   "open-docs": [connection: CatalogConnection, database: string, collection: string];
   "new-connection": [];
   "new-query": [connection: CatalogConnection, database: string];
+  /** 单击表/字段：交给外壳决定插入还是只选中（R4）。 */
+  "insert-object": [reference: InsertReference];
 }>();
 const menu = ref<{ object: CatalogObjectRef; x: number; y: number; notice: string } | null>(null);
 const connMenu = ref<{ connection: CatalogConnection; x: number; y: number } | null>(null);
@@ -321,16 +324,66 @@ function openObject(object: CatalogObjectRef | null, pane: "data" | "structure",
   emit("open-object", object, pane, section);
 }
 
+/** 单击插入的延迟：等过双击窗口再派发，双击仍然只做打开，不残留半次插入。 */
+const INSERT_CLICK_DELAY = 200;
+let insertTimer: ReturnType<typeof setTimeout> | null = null;
+
+function cancelPendingInsert() {
+  if (insertTimer === null) return;
+  clearTimeout(insertTimer);
+  insertTimer = null;
+}
+
+/** 只有表与视图（及其列）是插入目标；失效对象、函数/序列等保持原样。 */
+function insertable(object: CatalogObjectRef): boolean {
+  return !object.stale && (object.kind === "table" || object.kind === "view");
+}
+
+function scheduleInsert(object: CatalogObjectRef, column: string | null) {
+  cancelPendingInsert();
+  const reference: InsertReference = {
+    connectionId: object.connectionId,
+    connectionName: object.connectionName,
+    engine: object.engine,
+    database: object.database,
+    schema: object.schema,
+    table: object.name,
+    column,
+  };
+  insertTimer = setTimeout(() => {
+    insertTimer = null;
+    emit("insert-object", reference);
+  }, INSERT_CLICK_DELAY);
+}
+
+/** 键盘派发的合成 click（Enter/空格）只做选择与打开，不触发插入。 */
+let keyboardClick = false;
+
+function syntheticClick(row: HTMLElement) {
+  keyboardClick = true;
+  try {
+    row.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  } finally {
+    keyboardClick = false;
+  }
+}
+
 function onTreeClick(event: MouseEvent) {
   const row = rowOf(event.target);
   if (!row) return;
   if (row.dataset.level === "member") {
-    selectRow(memberSelection(row), readRef(row));
+    const object = readRef(row);
+    selectRow(memberSelection(row), object);
+    if (keyboardClick || !object || !insertable(object)) return;
+    if ((row.dataset.section ?? "columns") !== "columns") return;
+    const column = row.dataset.member ?? "";
+    if (column) scheduleInsert(object, column);
     return;
   }
   const object = readRef(row);
   if (!object) return;
   selectRow(objectKey(object), object);
+  if (!keyboardClick && insertable(object)) scheduleInsert(object, null);
 }
 
 /** 树行可用键盘到达：Enter 打开，空格选择/展开，Shift+F10 打开对象菜单。 */
@@ -354,13 +407,13 @@ function onTreeKeydown(event: KeyboardEvent) {
   }
   if (event.key === "Enter") {
     event.preventDefault();
-    row.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    syntheticClick(row);
     row.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
     return;
   }
   if (event.key === " ") {
     event.preventDefault();
-    row.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    syntheticClick(row);
     return;
   }
   if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
@@ -376,6 +429,8 @@ function onTreeKeydown(event: KeyboardEvent) {
 }
 
 function onTreeDblClick(event: MouseEvent) {
+  /* 双击是「打开数据/结构」，取消单击排队的插入（R4：双击行为不变）。 */
+  cancelPendingInsert();
   const row = rowOf(event.target);
   if (!row) return;
   const object = readRef(row);
@@ -546,6 +601,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  cancelPendingInsert();
   window.removeEventListener("mousedown", onWindowPointer);
   window.removeEventListener("keydown", onWindowKey);
 });

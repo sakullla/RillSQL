@@ -24,6 +24,8 @@ import { attachCloser, requestCancel, startTabRun, tabRun } from "../query/runti
 import { rowLimit } from "../query/scope";
 import { parseHash } from "../router";
 import { ToastHost } from "../ui";
+import { toast } from "../ui/toast";
+import { buildInsertText, focusedEditor, insertAtCursor, insertPlan, type InsertReference } from "./query-editor";
 import { chooseLeave, chooseStay, closePrompt, installCloseCoordinator, uninstallCloseCoordinator } from "./close-guard";
 import ActivityRail from "./ActivityRail.vue";
 import CommandPalette from "./CommandPalette.vue";
@@ -401,6 +403,36 @@ function onTreeNewQuery(connection: CatalogConnection, database: string) {
   });
 }
 
+/**
+ * 目录树单击（R4）：有聚焦编辑器就插入到光标处；否则有查询标签只选中；
+ * 一个查询标签都没有时新建标签并写入标识符。只读与执行中的标签给提示、不改草稿。
+ */
+function onInsertObject(reference: InsertReference) {
+  const target = focusedEditor();
+  const hasQueryTab = session.tabs.value.some((tab) => tab.kind === "query");
+  const plan = insertPlan(target !== null, hasQueryTab);
+  if (plan === "insert" && target) {
+    const outcome = insertAtCursor(target.tabId, reference);
+    if (outcome === "ok") return;
+    if (outcome === "running") toast(t("catalog.tree.insertBlockedRunning"), "err");
+    else if (outcome === "readonly") toast(t("catalog.tree.insertBlockedReadonly"), "err");
+    /* none：编辑器刚好卸载，下面按「有无查询标签」继续判定。 */
+    if (outcome === "running" || outcome === "readonly") return;
+  }
+  if (hasQueryTab) return;
+  if (window.innerWidth <= 960) session.sidebarHidden.value = true;
+  session.openQueryDraft({
+    sql: buildInsertText(reference, "", 0, reference.database),
+    connectionId: reference.connectionId,
+    connectionName: reference.connectionName,
+    database: reference.database,
+    engine: reference.engine,
+    status: "connected",
+    needsTarget: false,
+    notice: null,
+  });
+}
+
 function onQueryObject(object: CatalogObjectRef, sql: string) {
   session.openQueryDraft({
     sql,
@@ -622,6 +654,7 @@ onBeforeUnmount(() => {
         @open-keys="onOpenKeys"
         @open-docs="onOpenDocs"
         @query-object="onQueryObject"
+        @insert-object="onInsertObject"
         @focused-database="onFocusedDatabase"
         @new-connection="session.showPage('connections')"
         @new-query="onTreeNewQuery"

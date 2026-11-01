@@ -5,6 +5,7 @@ import type { DiagramOpen } from "../diagram/types";
 import type { CatalogConnection } from "../catalog/types";
 import type { CatalogObjectRef } from "../catalog/object-ref";
 import { tr as t } from "../i18n";
+import type { InsertReference } from "./query-editor";
 import Icon from "./Icon.vue";
 
 const props = defineProps<{ width: number }>();
@@ -19,6 +20,7 @@ const emit = defineEmits<{
   "open-docs": [connection: CatalogConnection, database: string, collection: string];
   "new-connection": [];
   "new-query": [connection: CatalogConnection, database: string];
+  "insert-object": [reference: InsertReference];
 }>();
 
 function forwardOpen(object: CatalogObjectRef, pane: "data" | "structure", section?: "columns" | "drop") {
@@ -53,6 +55,10 @@ function forwardNewQuery(connection: CatalogConnection, database: string) {
   emit("new-query", connection, database);
 }
 
+function forwardInsert(reference: InsertReference) {
+  emit("insert-object", reference);
+}
+
 const filter = ref("");
 
 let stopResize: (() => void) | null = null;
@@ -84,7 +90,7 @@ function onPointerDown(event: PointerEvent) {
       <Icon name="search" />
       <input v-model="filter" type="search" :placeholder="t('shell.sidebar.filterTables')" :aria-label="t('shell.sidebar.filterTables')" />
     </label>
-    <ExplorerTree :filter="filter" @open-object="forwardOpen" @open-definition="forwardDefinition" @query-object="forwardQuery" @focused-database="forwardFocus" @open-diagram="forwardDiagram" @open-keys="forwardKeys" @open-docs="forwardDocs" @new-connection="emit('new-connection')" @new-query="forwardNewQuery" />
+    <ExplorerTree :filter="filter" @open-object="forwardOpen" @open-definition="forwardDefinition" @query-object="forwardQuery" @focused-database="forwardFocus" @open-diagram="forwardDiagram" @open-keys="forwardKeys" @open-docs="forwardDocs" @new-connection="emit('new-connection')" @new-query="forwardNewQuery" @insert-object="forwardInsert" />
   </aside>
   <div
     class="sb-resizer"

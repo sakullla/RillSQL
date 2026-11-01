@@ -62,6 +62,8 @@ export const catalog = {
     copyToQuery: "Copy to a new query",
     copyFullName: "Copy full name",
     dropTable: "Drop table…",
+    insertBlockedReadonly: "This tab is read-only, so identifiers cannot be inserted.",
+    insertBlockedRunning: "The query is still running — insert again when it finishes.",
   },
   schema: {
     shownCount: "Showing {shown} / {total}",
