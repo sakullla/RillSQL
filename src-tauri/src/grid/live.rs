@@ -1938,28 +1938,42 @@ pub async fn foreign_keys(session: &CatalogSession, database: &str, schema_name:
                 .await
                 .map_err(db_err)?;
             let mut list: Vec<ForeignKey> = Vec::new();
+            let mut pk_cache: HashMap<String, Vec<String>> = HashMap::new();
             for row in rows {
                 let id: i64 = row.try_get("id").map_err(db_err)?;
+                let seq: i64 = row.try_get("seq").unwrap_or(0);
                 let column: String = row.try_get("from").map_err(db_err)?;
                 let ref_table: String = row.try_get("table").map_err(db_err)?;
                 let explicit: Option<String> = row.try_get("to").ok().flatten();
                 let ref_column = match explicit {
                     Some(name) if !name.is_empty() => name,
-                    // 引用父表主键时 PRAGMA 的 to 为 NULL：去父表找主键，找不到就跳过，不猜 "id"。
+                    // 引用父表主键时 PRAGMA 的 to 为 NULL：按 seq 取父表主键序号，找不到就跳过。
                     _ => {
-                        let parent = sql::quote_ident(Engine::Sqlite, &ref_table);
-                        let info = sqlx::query(audited(&format!("PRAGMA table_info({parent})")))
-                            .fetch_all(pool)
-                            .await
-                            .map_err(db_err)?;
-                        match info.iter().find(|item| item.try_get::<i64, _>("pk").unwrap_or(0) > 0) {
-                            Some(item) => item.try_get::<String, _>("name").map_err(db_err)?,
+                        if !pk_cache.contains_key(&ref_table) {
+                            let parent = sql::quote_ident(Engine::Sqlite, &ref_table);
+                            let info = sqlx::query(audited(&format!("PRAGMA table_info({parent})")))
+                                .fetch_all(pool)
+                                .await
+                                .map_err(db_err)?;
+                            let mut keys: Vec<(i64, String)> = info
+                                .iter()
+                                .filter_map(|item| {
+                                    let pk = item.try_get::<i64, _>("pk").unwrap_or(0);
+                                    if pk > 0 { item.try_get::<String, _>("name").ok().map(|name| (pk, name)) } else { None }
+                                })
+                                .collect();
+                            keys.sort_by_key(|(pk, _)| *pk);
+                            pk_cache.insert(ref_table.clone(), keys.into_iter().map(|(_, name)| name).collect());
+                        }
+                        match pk_cache.get(&ref_table).and_then(|keys| keys.get(seq as usize)) {
+                            Some(name) => name.clone(),
                             None => continue,
                         }
                     }
                 };
                 push_key(&mut list, &format!("fk_{id}"), &column, "main", &ref_table, &ref_column);
             }
+
 
             Ok(list)
         }

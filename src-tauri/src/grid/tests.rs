@@ -1203,6 +1203,14 @@ mod fk_limits {
             .execute(&setup)
             .await
             .unwrap();
+        sqlx::query("CREATE TABLE pairs (a TEXT, b TEXT, PRIMARY KEY (a, b))")
+            .execute(&setup)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE compound (x TEXT, y TEXT, FOREIGN KEY (x, y) REFERENCES pairs)")
+            .execute(&setup)
+            .await
+            .unwrap();
         setup.close().await;
 
         let service = Service::new_for_test(dir.join("connections.sqlite"));
@@ -1219,6 +1227,11 @@ mod fk_limits {
         assert_eq!(implicit.len(), 1);
         assert_eq!(implicit[0].ref_table, "codes");
         assert_eq!(implicit[0].ref_columns, vec!["code".to_owned()]);
+
+        let compound = live::foreign_keys(&session, "main", "", "compound", "sqlite").await.unwrap();
+        assert_eq!(compound.len(), 1);
+        assert_eq!(compound[0].columns, vec!["x".to_owned(), "y".to_owned()]);
+        assert_eq!(compound[0].ref_columns, vec!["a".to_owned(), "b".to_owned()]);
         drop(session);
         drop(service);
         let _ = std::fs::remove_dir_all(&dir);
