@@ -24,7 +24,10 @@ import { connectionStatusText, type ConnectionStatus } from "../shell/status-tex
 import type { QueryTarget } from "../shell/session";
 import { ambiguousFieldNote, cachedColumns, fieldFailureNote, loadFields, qualifierFor, unknownFieldNote } from "./columns";
 import { tr as t } from "../i18n";
-import { completionPlan, connectionById, metadataNote, statementContext, targetDetail, targetKey, targetOptions, type TargetOption } from "./complete";
+import { completionPlan, connectionById, metadataNote, statementContext, targetDetail, targetKey, targetOptions, type CompletionObject, type CompletionSource, type TargetOption } from "./complete";
+import { catalogIndex, resolveTable } from "./catalog-index";
+import { parseScope, type ScopeTable } from "./completion/scope";
+import { locateForCompletion } from "./completion/scan";
 import { resolveEditor } from "./editor";
 import { consumeExecuteRequest } from "./execute-request";
 import { fileOpenPlan, readSqlFile, saveSqlFile, sqlFileProblem, sqlSaveName, SQL_FILE_ACCEPT } from "./file-io";
@@ -267,30 +270,54 @@ function asEngine(value: string | undefined): Engine | undefined {
 }
 
 async function sqlCompletion(context: CompletionContext) {
-  const before = context.state.sliceDoc(0, context.pos);
+  const doc = context.state.doc.toString();
+  const before = doc.slice(0, context.pos);
   if (/--[^\n]*$/.test(before) || openDelimiter(before, props.engine ?? undefined)) return null;
   const word = context.matchBefore(/[A-Za-z0-9_.]*$/);
   if (!word || (word.from === word.to && !context.explicit)) return null;
+  /* SELECT * 展开：显式触发且光标紧跟星号时，用 FROM 表的列替换星号。 */
+  const star = context.explicit ? /\*\s*$/.exec(before) : null;
   const connection = connectionById(catalogConnections(), props.connectionId);
-  const ready = Boolean(props.connectionId && connection);
+  const ready = Boolean(props.connectionId && connection && props.database != null && connection.status === "connected");
   const database = ready ? props.database : null;
   const meta = metadataNote(ready ? connection : null, database);
-  /* 语句上下文：取当前语句起点到光标的前缀，解析子句与 FROM/JOIN 别名；定位不到语句时回退原有行为。 */
-  const located = locateStatement(context.state.doc.toString(), context.pos, props.engine ?? undefined);
-  const statementPiece = located.piece && !located.refusal ? located.piece : null;
-  const parsed = statementPiece ? statementContext(before.slice(statementPiece.start), meta.objects) : null;
-  const qualified = qualifierFor(word.text, meta.objects, parsed?.aliases);
+  const engine = asEngine(props.engine ?? connection?.engine) ?? "postgres";
+
+  /* 只在当前语句内解析；遇到未闭合字符串/注释时退回关键字候选，不阻塞输入。 */
+  const located = locateForCompletion(doc, context.pos);
+  const statement = located.refusal ? "" : doc.slice(located.start, context.pos);
+  const scope = parseScope(statement);
+  const parsed = statementContext(statement, meta.objects);
+  const qualified = qualifierFor(word.text, meta.objects, parsed.aliases);
+
+  if (star && ready && connection && database != null && scope.clause === "select") {
+    const sources = await loadSources(connection, database, engine, scope.tables);
+    const columns = sources.flatMap((source) => source.columns);
+    fieldNote.value = "";
+    return {
+      from: context.pos - (star[0].length - 1),
+      filter: false,
+      options: columns.slice(0, 80).map((name) => ({ label: name, type: "property", detail: t("query.complete.column") })),
+    };
+  }
+
   if (qualified.kind === "plain") {
     fieldNote.value = "";
-    const columns = ready && connection && database != null && connection.status === "connected" && !meta.keywordsOnly
-      ? cachedColumns(connection.id, database)
-      : [];
+    const sources = ready && connection && database != null ? await loadSources(connection, database, engine, scope.tables) : [];
+    const columns = !sources.length && ready ? cachedColumns(connection!.id, database!) : [];
     const plan = completionPlan({
       prefix: word.text,
       connection: ready ? connection : null,
       database,
+      engine,
       columns,
-      context: parsed ? { clause: parsed.clause } : undefined,
+      context: {
+        clause: scope.clause,
+        ctes: scope.ctes,
+        sources,
+        onTables: scope.tables.slice(-2).map((table) => table.alias),
+        targetTable: scope.target?.alias,
+      },
     });
     return {
       from: word.from,
@@ -311,11 +338,6 @@ async function sqlCompletion(context: CompletionContext) {
     fieldNote.value = ambiguousFieldNote(qualified.name);
     return { from: columnFrom, filter: false, options: [] };
   }
-  const engine = asEngine(props.engine ?? connection.engine);
-  if (!engine) {
-    fieldNote.value = t("query.editor.unknownEngine");
-    return { from: columnFrom, filter: false, options: [] };
-  }
   const loaded = await loadFields({
     connectionId: connection.id,
     database,
@@ -334,6 +356,26 @@ async function sqlCompletion(context: CompletionContext) {
     .slice(0, 40)
     .map((name) => ({ label: name, type: "property", detail: qualified.object.label }));
   return { from: columnFrom, filter: false, options };
+}
+
+/** FROM/JOIN 的表转成候选来源：最多读 4 张，列走同一份缓存与单飞。 */
+async function loadSources(
+  connection: Parameters<typeof connectionById>[0][number],
+  database: string,
+  engine: Engine,
+  tables: readonly ScopeTable[],
+): Promise<CompletionSource[]> {
+  const index = catalogIndex(connection);
+  const picked = tables.slice(-4);
+  const resolved = picked
+    .map((table) => ({ table, object: resolveTable(index, table, database) }))
+    .filter((entry): entry is { table: ScopeTable; object: CompletionObject } => entry.object !== null);
+  return Promise.all(
+    resolved.map(async (entry) => {
+      const fields = await loadFields({ connectionId: connection.id, database, engine, object: entry.object });
+      return { alias: entry.table.alias, label: entry.object.label, columns: fields.columns };
+    }),
+  );
 }
 
 /* SQL 编辑器配色（R5）：compartment 持有高亮样式提供运行时切换通道；颜色全部取 --tk-* 变量，

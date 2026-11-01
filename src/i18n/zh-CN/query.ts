@@ -221,6 +221,7 @@ export const query = {
     sourceNote: "补全来自 {conn} / {db} 已读取的表和视图。已读取的字段会列出，未读取的字段不可用。",
     keyword: "关键字",
     cte: "CTE",
+    column: "字段",
     database: "数据库",
     schema: "schema",
     functionBuiltin: "内建函数",

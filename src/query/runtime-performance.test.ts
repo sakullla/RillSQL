@@ -46,3 +46,22 @@ describe("slow query status requests", () => {
     expect(api.queryStart).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("completion latency", () => {
+  it("keeps statement scanning and scope parsing within one frame on a 10k-line script", async () => {
+    const { locateForCompletion } = await import("./completion/scan");
+    const { parseScope } = await import("./completion/scope");
+    const statement = "SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.status = 'paid'";
+    const doc = Array.from({ length: 10_000 }, () => statement + ";").join("\n");
+    const at = doc.length - 5;
+    const runs: number[] = [];
+    for (let index = 0; index < 5; index += 1) {
+      const started = performance.now();
+      const located = locateForCompletion(doc, at);
+      parseScope(doc.slice(located.start, at));
+      runs.push(performance.now() - started);
+    }
+    runs.sort((a, b) => a - b);
+    expect(runs[Math.floor(runs.length / 2)]).toBeLessThanOrEqual(16);
+  });
+});
