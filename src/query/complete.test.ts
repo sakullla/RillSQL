@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { catalogFixture } from "../catalog/fixtures";
 import type { CatalogObject } from "../catalog/types";
 import { qualifierFor } from "./columns";
-import { completionPlan, metadataNote, statementContext } from "./complete";
+import { completionPlan, metadataNote, quotedIdentifier, statementContext } from "./complete";
 
 function routine(name: string, kind: CatalogObject["kind"], signature = "", relation = ""): CatalogObject {
   return { name, kind, estimatedRows: null, stale: false, signature, relation };
@@ -108,5 +108,43 @@ describe("statement completion context", () => {
   it("still reports unknown when the qualifier hits no object and no alias", () => {
     const parsed = statementContext("SELECT * FROM public.orders u WHERE z.", objects);
     expect(qualifierFor("z.", objects, parsed.aliases)).toEqual({ kind: "unknown", name: "z" });
+  });
+});
+
+describe("rule-based completion", () => {
+  const atlas = catalogFixture()[0]!;
+  const sources = [
+    { alias: "o", label: "public.orders", columns: ["id", "customer_id", "status"] },
+    { alias: "c", label: "public.customers", columns: ["id", "name"] },
+  ];
+
+  it("narrows ON candidates to the joined tables", () => {
+    const plan = completionPlan({
+      prefix: "",
+      connection: atlas,
+      database: "atlas_dev",
+      engine: "postgres",
+      context: { clause: "on", sources, onTables: ["o"] },
+    });
+    expect(plan.items.filter((item) => item.kind === "column").map((item) => item.label)).toEqual(["id", "customer_id", "status"]);
+  });
+
+  it("offers functions with signatures and snippets by prefix", () => {
+    const fn = completionPlan({ prefix: "cou", connection: atlas, database: "atlas_dev", engine: "mysql" });
+    expect(fn.items).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "function", label: "count", detail: "count(expr) → bigint" })]));
+    const snippet = completionPlan({ prefix: "sel", connection: atlas, database: "atlas_dev", engine: "sqlite" });
+    expect(snippet.items.some((item) => item.kind === "snippet" && item.label === "select-from")).toBe(true);
+  });
+
+  it("uses each dialect's keyword set", () => {
+    const pg = completionPlan({ prefix: "ili", connection: atlas, database: "atlas_dev", engine: "postgres" });
+    const mysql = completionPlan({ prefix: "ili", connection: atlas, database: "atlas_dev", engine: "mysql" });
+    expect(pg.items.some((item) => item.label === "ILIKE")).toBe(true);
+    expect(mysql.items.some((item) => item.label === "ILIKE")).toBe(false);
+  });
+
+  it("quotes identifiers by engine", () => {
+    expect(quotedIdentifier("postgres", "order items")).toBe('"order items"');
+    expect(quotedIdentifier("mysql", "order items")).toBe("\u0060order items\u0060");
   });
 });
