@@ -5,7 +5,7 @@ import { engineMeta } from "../connections/model";
 import { connectionStatusText } from "../shell/status-text";
 import type { Engine } from "../engines";
 import { dialectAssets, quoteIdentifier } from "./completion/dialect";
-import { functionDetail, KNOWN_FUNCTIONS } from "./completion/functions";
+import { functionCatalog, functionDetail } from "./completion/functions";
 import { rankBy, matchKind } from "./completion/rank";
 import { snippetCandidates } from "./completion/snippets";
 import { parseScope } from "./completion/scope";
@@ -127,12 +127,14 @@ export interface CompletionContext {
   sources?: readonly CompletionSource[];
   /** ON 子句里参与该 JOIN 的两侧（别名或表名）。 */
   onTables?: readonly string[];
+  /** UPDATE / INSERT 的目标表（名或别名），用于 SET 与 VALUES 的列收敛。 */
+  targetTable?: string;
 }
 
 /** 按候选的标签做一次前缀/子序列筛选并保留顺序语义。 */
-function rankItems(items: readonly CompletionItem[], prefix: string): CompletionItem[] {
+function rankItems(items: readonly CompletionItem[], prefix: string, cap = 40): CompletionItem[] {
   const matched = items.filter((item) => matchKind(item.label, prefix) >= 0);
-  return rankBy(matched, prefix, (item) => item.label);
+  return rankBy(matched, prefix, (item) => item.label).slice(0, cap);
 }
 
 export function completionPlan(input: {
@@ -157,40 +159,48 @@ export function completionPlan(input: {
   if (!meta.keywordsOnly) {
     for (const object of meta.objects) {
       objectItems.push({ label: object.label, kind: object.kind, detail: tr(KIND_LABEL[object.kind]) });
-      if (objectItems.length >= 20) break;
+      if (object.name.toLowerCase() !== object.label.toLowerCase()) {
+        objectItems.push({ label: object.name, kind: object.kind, detail: tr(KIND_LABEL[object.kind]) });
+      }
     }
   }
 
   const sources = input.context?.sources ?? [];
   const onTables = new Set((input.context?.onTables ?? []).map((item) => item.toLowerCase()));
+  const targetTable = input.context?.targetTable?.toLowerCase() ?? null;
   const columnItems: CompletionItem[] = [];
   if (!meta.keywordsOnly && clause !== "from" && clause !== "join") {
-    if (sources.length) {
-      for (const source of sources) {
-        const scoped = clause === "on" && onTables.size > 0 && !onTables.has(source.alias.toLowerCase()) && !onTables.has(source.label.toLowerCase());
-        if (scoped) continue;
-        for (const column of source.columns) {
-          columnItems.push({ label: column, kind: "column", detail: source.label });
-        }
-      }
-    } else {
+    for (const source of sources) {
+      const inOn = clause !== "on" || onTables.size === 0 || onTables.has(source.alias.toLowerCase()) || onTables.has(source.label.toLowerCase());
+      if (!inOn) continue;
+      const inTarget = clause !== "set" && clause !== "values" ? true : !targetTable || targetTable === source.alias.toLowerCase() || targetTable === source.label.toLowerCase() || targetTable === source.label.split(".").pop()?.toLowerCase();
+      if (!inTarget) continue;
+      for (const column of source.columns) columnItems.push({ label: column, kind: "column", detail: source.label });
+    }
+    if (!sources.length) {
       for (const column of input.columns ?? []) columnItems.push({ label: column.label, kind: "column", detail: column.detail });
     }
   }
 
   const cteItems: CompletionItem[] = (input.context?.ctes ?? []).map((name) => ({ label: name, kind: "cte", detail: tr("query.complete.cte") }));
-  const functionNames = [...new Set([...assets.builtin, ...KNOWN_FUNCTIONS])].slice(0, 40);
-  const functionItems: CompletionItem[] = functionNames.map((name) => ({ label: name, kind: "function", detail: functionDetail(engine, name) }));
+  const functionItems: CompletionItem[] = functionCatalog()
+    .filter((name) => matchKind(name, prefix) >= 0)
+    .slice(0, 40)
+    .map((name) => ({ label: name, kind: "function", detail: functionDetail(engine, name) }));
   const keywordItems: CompletionItem[] = assets.keywords
     .filter((keyword) => matchKind(keyword, prefix) >= 0 && keyword.toUpperCase() !== prefix.toUpperCase())
     .slice(0, 40)
     .map((keyword) => ({ label: keyword.toUpperCase(), kind: "keyword", detail: tr("query.complete.keyword") }));
-  const snippetItems: CompletionItem[] = snippetCandidates(prefix).map((item) => ({ label: item.label, kind: "snippet", detail: item.detail }));
+  const snippetItems: CompletionItem[] = clause === "from" || clause === "join" ? [] : snippetCandidates(prefix).map((item) => ({ label: item.label, kind: "snippet", detail: item.detail }));
 
   let ordered: CompletionItem[];
-  if (clause === "from" || clause === "join") {
-    ordered = [...rankItems(objectItems, prefix), ...rankItems(cteItems, prefix), ...rankItems(keywordItems, prefix), ...rankItems(snippetItems, prefix)];
-  } else if (FIELD_FIRST_CLAUSES.has(clause) || clause === "on") {
+  if (clause === "on") {
+    ordered = rankItems(columnItems, prefix);
+  } else if (clause === "set" || clause === "values") {
+    ordered = rankItems(columnItems, prefix);
+  } else if (clause === "from" || clause === "join") {
+    ordered = [...rankItems(objectItems, prefix), ...rankItems(cteItems, prefix), ...rankItems(keywordItems, prefix)];
+  } else if (FIELD_FIRST_CLAUSES.has(clause)) {
     ordered = [
       ...rankItems(columnItems, prefix),
       ...rankItems(objectItems, prefix),
@@ -216,7 +226,7 @@ export function completionPlan(input: {
     seen.add(key);
     return true;
   });
-  return { items: unique.slice(0, 80), note: meta.note, keywordsOnly: meta.keywordsOnly };
+  return { items: unique.slice(0, 120), note: meta.note, keywordsOnly: meta.keywordsOnly };
 }
 
 /** 引用名（别名或表名）按引擎规则加引号；补全插入时使用。 */

@@ -33,7 +33,7 @@ describe("catalog completion", () => {
     expect(note.objects.some((item) => item.name === "gone_view" || item.name === "secret_fn")).toBe(false);
 
     const plan = completionPlan({ prefix: "add_cus", connection: atlas, database: "atlas_dev" });
-    const item = plan.items.find((entry) => entry.kind === "function");
+    const item = plan.items.find((entry) => entry.kind === "function" && entry.label.includes("."));
     expect(item).toMatchObject({ label: "public.add_customer(integer)", detail: "函数" });
     expect(completionPlan({ prefix: "sec", connection: atlas, database: "atlas_dev" }).items.some((entry) => entry.label.includes("secret_fn"))).toBe(false);
 
@@ -146,5 +146,40 @@ describe("rule-based completion", () => {
   it("quotes identifiers by engine", () => {
     expect(quotedIdentifier("postgres", "order items")).toBe('"order items"');
     expect(quotedIdentifier("mysql", "order items")).toBe("\u0060order items\u0060");
+  });
+
+  it("keeps bare names and qualified names as separate candidates", () => {
+    const plan = completionPlan({ prefix: "ord", connection: atlas, database: "atlas_dev", engine: "postgres" });
+    const labels = plan.items.map((item) => item.label);
+    expect(labels).toContain("public.orders");
+    expect(labels).toContain("orders");
+  });
+
+  it("returns only columns inside ON", () => {
+    const plan = completionPlan({
+      prefix: "",
+      connection: atlas,
+      database: "atlas_dev",
+      engine: "postgres",
+      context: { clause: "on", sources, onTables: ["o", "c"] },
+    });
+    expect(plan.items.every((item) => item.kind === "column")).toBe(true);
+  });
+
+  it("narrows UPDATE SET and INSERT VALUES to the target table", () => {
+    const plan = completionPlan({
+      prefix: "",
+      connection: atlas,
+      database: "atlas_dev",
+      engine: "postgres",
+      context: { clause: "set", sources, targetTable: "customers" },
+    });
+    expect(plan.items.map((item) => item.label)).toEqual(["id", "name"]);
+    expect(plan.items.every((item) => item.kind === "column")).toBe(true);
+  });
+
+  it("reads the clause of a WITH statement", () => {
+    const scope = statementContext("WITH recent AS (SELECT 1) SELECT ", metadataNote(atlas, "atlas_dev").objects);
+    expect(scope.clause).toBe("select");
   });
 });

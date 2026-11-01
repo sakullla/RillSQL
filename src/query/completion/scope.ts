@@ -13,6 +13,8 @@ export interface StatementScope {
   clause: ScopeClause | null;
   tables: ScopeTable[];
   ctes: string[];
+  /** UPDATE / INSERT 的目标表；没有则为 null。 */
+  target: ScopeTable | null;
 }
 
 interface Token {
@@ -101,6 +103,7 @@ export function parseScope(statement: string): StatementScope {
   let clause: ScopeClause | null = null;
   let depth = 0;
   let here = 0;
+  let target: ScopeTable | null = null;
 
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index]!;
@@ -111,7 +114,13 @@ export function parseScope(statement: string): StatementScope {
       continue;
     }
     if (token.upper === "WITH") {
-      index = readCtes(tokens, index + 1, ctes);
+      index = readCtes(tokens, index + 1, ctes) - 1;
+      continue;
+    }
+    if (token.upper === "UPDATE" || (token.upper === "INTO" && !target)) {
+      const read = readTarget(tokens, index + 1, here);
+      if (read.table) target = read.table;
+      index = read.next - 1;
       continue;
     }
     if (token.upper === "FROM" || token.upper === "JOIN") {
@@ -123,7 +132,24 @@ export function parseScope(statement: string): StatementScope {
     if (found) clause = found;
   }
 
-  return { clause, tables: tables.filter((table) => table.depth <= depth), ctes };
+  return { clause, tables: tables.filter((table) => table.depth <= depth), ctes, target };
+}
+
+function readTarget(tokens: Token[], start: number, depth: number): { table: ScopeTable | null; next: number } {
+  const first = tokens[start];
+  if (!first?.word || RESERVED.has(first.upper)) return { table: null, next: start };
+  let schema: string | null = null;
+  let name = first.text;
+  let next = start + 1;
+  if (tokens[next]?.text === ".") {
+    const second = tokens[next + 1];
+    if (second?.word) {
+      schema = first.text;
+      name = second.text;
+      next += 2;
+    }
+  }
+  return { table: { alias: name, schema, name, depth }, next };
 }
 
 function readCtes(tokens: Token[], start: number, ctes: string[]): number {
