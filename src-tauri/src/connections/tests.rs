@@ -729,7 +729,9 @@ async fn users_keep_their_own_environment_tags() {
 async fn mysql_system_roots_come_from_the_os_store_and_ca_files_drop_them() {
     let native = rustls_native_certs::load_native_certs();
     assert!(!native.certs.is_empty(), "{:?}", native.errors);
-    let expected: Vec<Vec<u8>> = native.certs.iter().map(|cert| cert.as_ref().to_vec()).collect();
+    // macOS 的信任库经 HashMap 收集，每次加载顺序都不同：比较集合，不比较顺序。
+    let mut expected: Vec<Vec<u8>> = native.certs.iter().map(|cert| cert.as_ref().to_vec()).collect();
+    expected.sort();
     assert!(!mysql_async::SslOpts::default().disable_built_in_roots());
 
     for engine in [Engine::Mysql, Engine::Mariadb] {
@@ -745,6 +747,7 @@ async fn mysql_system_roots_come_from_the_os_store_and_ca_files_drop_them() {
             for cert in ssl.root_certs() {
                 actual.push(cert.read().await.unwrap().into_owned());
             }
+            actual.sort();
             assert_eq!(actual, expected, "{engine:?} {mode:?}");
         }
     }
