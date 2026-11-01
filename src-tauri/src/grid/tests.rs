@@ -1195,6 +1195,14 @@ mod fk_limits {
             .execute(&setup)
             .await
             .unwrap();
+        sqlx::query("CREATE TABLE codes (code TEXT PRIMARY KEY)")
+            .execute(&setup)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE items (id INTEGER PRIMARY KEY, item_code TEXT REFERENCES codes)")
+            .execute(&setup)
+            .await
+            .unwrap();
         setup.close().await;
 
         let service = Service::new_for_test(dir.join("connections.sqlite"));
@@ -1205,6 +1213,12 @@ mod fk_limits {
         assert_eq!(keys[0].ref_table, "customers");
         assert_eq!(keys[0].columns, vec!["customer_id".to_owned()]);
         assert_eq!(keys[0].ref_columns, vec!["id".to_owned()]);
+
+        // 父表主键不叫 id 且子表未显式列引用列时，必须回到父表找主键。
+        let implicit = live::foreign_keys(&session, "main", "", "items", "sqlite").await.unwrap();
+        assert_eq!(implicit.len(), 1);
+        assert_eq!(implicit[0].ref_table, "codes");
+        assert_eq!(implicit[0].ref_columns, vec!["code".to_owned()]);
         drop(session);
         drop(service);
         let _ = std::fs::remove_dir_all(&dir);
