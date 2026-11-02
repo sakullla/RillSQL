@@ -39,7 +39,11 @@ function rgbaValue(scope: string, name: string): Rgba {
   return { r: Number(match![1]), g: Number(match![2]), b: Number(match![3]), a: match![4] === undefined ? 1 : Number(match![4]) };
 }
 
-/** 半透明层压在不透明底色上的实际渲染色，用来算光标与选区叠在一起的真实对比。 */
+/**
+ * 半透明层压在不透明底色上的合成色。编辑器的选区只有 drawSelection 的一层
+ * .cm-selectionBackground（原生 ::selection 被 CodeMirror 置为透明），所以「面板底色 + 单层选区」
+ * 就是真实渲染结果，可以据此算光标压在选区上的对比度。
+ */
 function blend(base: string, layer: Rgba): string {
   const under = Number.parseInt(base.slice(1), 16);
   const mix = (over: number, below: number) => Math.round(over * layer.a + below * (1 - layer.a));
@@ -326,7 +330,9 @@ describe("design tokens", () => {
     }
   });
 
-  it("renders the editor caret, selection, range and match feedback from those tokens", () => {
+  // 只读 SFC 源文本：这只能守住「编辑器样式仍接在这些令牌上」的接线，不证明任何实际渲染结果。
+  // 明暗主题下的真实层级与对比度由 T2 的浏览器截图和原生 Windows 验收覆盖。
+  it("keeps editor token wiring in the query tab styles", () => {
     for (const name of [
       "--caret",
       "--editor-active-line",
@@ -338,8 +344,7 @@ describe("design tokens", () => {
     ]) {
       expect(queryTab, name).toContain(`var(${name})`);
     }
-    // 聚焦与失焦选区不再共用同一个强制色。
-    expect(queryTab).not.toContain("var(--sel-strong)");
+    expect(queryTab, "selection layers").toContain("cm-selectionBackground");
   });
 
   it("keeps legacy token names resolvable for transitional module css", () => {

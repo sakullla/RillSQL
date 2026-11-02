@@ -1682,21 +1682,23 @@ describe("editor caret and selection stability", () => {
     });
   }
 
-  it("keeps typing, undo, redo and delete on the clicked caret position", async () => {
+  // 这里用 EditorState 上的 selection 直接定位「当前光标」，不走鼠标事件，
+  // 因此它只覆盖输入/撤销/重做/删除与光标的关系；真实鼠标点击定位由 T2 的浏览器与原生验收覆盖。
+  it("keeps typing, undo, redo and delete on the current caret position", async () => {
     const sql = "-- 订单筛选\nSELECT id, 名称 FROM orders;\nSELECT 2;";
     const wrapper = queryTab(sql, "query-caret");
     await nextTick();
     const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
-    const clicked = sql.indexOf("名称") + 1;
-    view.dispatch({ selection: { anchor: clicked } });
+    const caret = sql.indexOf("名称") + 1;
+    view.dispatch({ selection: { anchor: caret } });
     await nextTick();
 
-    // 输入落在点击位置，光标停在新字符之后，其余字符不移动。
+    // 输入落在当前光标处，光标停在新字符之后，其余字符不移动。
     view.dispatch(view.state.replaceSelection("新"));
     await nextTick();
-    const typed = sql.slice(0, clicked) + "新" + sql.slice(clicked);
+    const typed = sql.slice(0, caret) + "新" + sql.slice(caret);
     expect(view.state.doc.toString()).toBe(typed);
-    expect(view.state.selection.main.head).toBe(clicked + 1);
+    expect(view.state.selection.main.head).toBe(caret + 1);
     const drafts = () => (wrapper.emitted("update:draft") ?? []).map((call) => call[1]);
     expect(drafts()).toEqual([typed]);
 
@@ -1704,7 +1706,7 @@ describe("editor caret and selection stability", () => {
     undo(view);
     await nextTick();
     expect(view.state.doc.toString()).toBe(sql);
-    expect(view.state.selection.main.head).toBe(clicked);
+    expect(view.state.selection.main.head).toBe(caret);
     // 撤销回已提交的草稿：不再重复回写同一份文本。
     expect(drafts()).toEqual([typed]);
 
@@ -1712,18 +1714,18 @@ describe("editor caret and selection stability", () => {
     redo(view);
     await nextTick();
     expect(view.state.doc.toString()).toBe(typed);
-    expect(view.state.selection.main.head).toBe(clicked + 1);
+    expect(view.state.selection.main.head).toBe(caret + 1);
     expect(drafts()).toEqual([typed, typed]);
 
     // 删除只影响光标所在字符，中文与注释行保持原样。
-    view.dispatch({ changes: { from: clicked, to: clicked + 1 } });
+    view.dispatch({ changes: { from: caret, to: caret + 1 } });
     await nextTick();
     expect(view.state.doc.toString()).toBe(sql);
-    expect(view.state.selection.main.head).toBe(clicked);
+    expect(view.state.selection.main.head).toBe(caret);
     wrapper.unmount();
   });
 
-  it("keeps the caret on its own line when the whole document is formatted", async () => {
+  it("drops the caret to the end of the formatted document when formatting reflows lines", async () => {
     const sql = "select  1;\nselect   2;\nselect 3;";
     const wrapper = queryTab(sql, "query-format-caret");
     await nextTick();
@@ -1731,11 +1733,85 @@ describe("editor caret and selection stability", () => {
     view.dispatch({ selection: { anchor: sql.indexOf("select   2;") + 8 } });
     await wrapper.get("[data-action='format']").trigger("click");
     const next = view.state.doc.toString();
-    expect(next).not.toBe(sql);
+    // 每条语句都被拆成「关键字行 + 内容行」：先钉住格式化结果本身。
+    expect(next).toBe("SELECT\n  1;\nSELECT\n  2;\nSELECT\n  3;");
     const head = view.state.selection.main.head;
-    // 整篇格式化后光标留在原来的行，不跳到文档末尾。
-    expect(view.state.doc.lineAt(head).number).toBe(2);
-    expect(head).toBeLessThan(next.length);
+    // 行数变化后原「行号 + 列」不再成立，光标退回到格式化文档末尾（"3;" 之后）。
+    expect(head).toBe(next.length);
+    expect(view.state.doc.lineAt(head).number).toBe(view.state.doc.lines);
+    // 明确排除两种错位：上一条语句行尾、以及 SELECT 与列清单之间。
+    expect(head).not.toBe(next.indexOf("  1;") + "  1;".length);
+    expect(head).not.toBe(next.indexOf("  2;") + "  2;".length);
+    expect(head).not.toBe("SELECT".length);
+    wrapper.unmount();
+  });
+
+  it("keeps an end-of-draft caret at the end after formatting a single line", async () => {
+    const sql = "select id, name from t";
+    const wrapper = queryTab(sql, "query-format-caret-end");
+    await nextTick();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
+    view.dispatch({ selection: { anchor: sql.length } });
+    await wrapper.get("[data-action='format']").trigger("click");
+    const next = view.state.doc.toString();
+    expect(next).toBe("SELECT\n  id,\n  name\nFROM\n  t");
+    const head = view.state.selection.main.head;
+    // 一行拆成五行：光标落在格式化文档末尾，不停在 SELECT 之后或列清单中间。
+    expect(head).toBe(next.length);
+    expect(head).not.toBe("SELECT".length);
+    expect(head).not.toBe(next.indexOf("  id,") + 1);
+    wrapper.unmount();
+  });
+
+  it("falls back to the document end when formatting trims the caret column", async () => {
+    const sql = "select\n  id   \nfrom\n  t";
+    const wrapper = queryTab(sql, "query-format-caret-column");
+    await nextTick();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
+    // 光标停在行尾空白里：格式化会删掉这段空白，原列偏移随之越界。
+    view.dispatch({ selection: { anchor: sql.indexOf("  id   ") + "  id   ".length } });
+    await wrapper.get("[data-action='format']").trigger("click");
+    const next = view.state.doc.toString();
+    expect(next).toBe("SELECT\n  id\nFROM\n  t");
+    // 行数没变，但列越界：同样退回到末尾，不停在被截短后的行尾。
+    expect(view.state.selection.main.head).toBe(next.length);
+    wrapper.unmount();
+  });
+
+  it("keeps the caret on the same line when formatting leaves the line count untouched", async () => {
+    const sql = "select\n  id\nfrom\n  t";
+    const wrapper = queryTab(sql, "query-format-caret-same-line");
+    await nextTick();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
+    view.dispatch({ selection: { anchor: sql.indexOf("id") } });
+    await wrapper.get("[data-action='format']").trigger("click");
+    const next = view.state.doc.toString();
+    // 只改关键字大小写：行数与列都不变，光标仍在 id 之前。
+    expect(next).toBe("SELECT\n  id\nFROM\n  t");
+    expect(view.state.selection.main.head).toBe(next.indexOf("id"));
+    wrapper.unmount();
+  });
+
+  it("drops the caret to the document end when formatting rewrites the indentation before it", async () => {
+    // 四条语句各自成行，格式化后行数依旧是 4，原光标列 4 也没有越界；
+    // 但光标前的缩进从「四个空格」被重排成「两个空格」，同一列已经从 id 之前挪到 id 之后。
+    const sql = "select\n    id\nfrom\n  t";
+    const wrapper = queryTab(sql, "query-format-caret-indent");
+    await nextTick();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
+    const caret = sql.indexOf("id");
+    view.dispatch({ selection: { anchor: caret } });
+    await wrapper.get("[data-action='format']").trigger("click");
+    const next = view.state.doc.toString();
+    expect(next).toBe("SELECT\n  id\nFROM\n  t");
+    // 前提确认：行数没变、原列没越界，所以这个用例命中的正是「光标前文本被改写」这一条守卫。
+    expect(next.split("\n")).toHaveLength(sql.split("\n").length);
+    expect(next.split("\n")[1]!.length).toBeGreaterThanOrEqual("    ".length);
+    const head = view.state.selection.main.head;
+    expect(head).toBe(next.length);
+    // 明确排除「同列」错位结果：id 之后（旧逻辑会落在这里）。
+    expect(head).not.toBe(next.indexOf("id") + "id".length);
+    expect(head).not.toBe(next.indexOf("id"));
     wrapper.unmount();
   });
 

@@ -643,19 +643,34 @@ function formatEditor() {
   });
 }
 
+/** 只折叠 ASCII 大小写，非 ASCII 字符按原样比较，避免依赖 Unicode 大小写规则。 */
+function asciiLower(text: string): string {
+  return text.replace(/[A-Z]/g, (ch) => ch.toLowerCase());
+}
+
 /**
- * 整篇格式化会重排换行，不能沿用字符位置：按「原行号 + 行内列偏移」映射回新文本，
- * 让光标留在原来的编辑区，而不是跳到文档末尾（R1：格式化后逐字输入不落在错误位置）。
+ * 整篇格式化会按子句重排换行、重排缩进并丢掉行尾空白，所以字符位置和「行号 + 列」都不能直接沿用。
+ * 这里只是一个带守卫的保守回退：仅当格式化前后行数相同、原列没有越过该行新长度，
+ * 并且「原行光标前的文本」与「新行光标前的文本」忽略 ASCII 大小写后完全相同时，才保留同一列；
+ * 其余情况（语句被拆成多行、行尾空白被删导致列越界、缩进被重排、关键字被改写）一律退到文档末尾。
+ * 它不试图把光标映射到同一个 token，也不保证语义定位，只是把光标放到一个可预测的位置（R1）。
  */
 function caretAfterWholeFormat(doc: string, caret: number, next: string): number {
-  const before = doc.slice(0, Math.min(Math.max(caret, 0), doc.length));
+  const clamped = Math.min(Math.max(caret, 0), doc.length);
+  const before = doc.slice(0, clamped);
+  const lineBreak = before.lastIndexOf("\n");
   const line = before.split("\n").length - 1;
-  const column = before.length - (before.lastIndexOf("\n") + 1);
+  const linePrefix = before.slice(lineBreak + 1);
+  const column = linePrefix.length;
   const lines = next.split("\n");
-  const target = Math.min(line, lines.length - 1);
+  if (lines.length !== doc.split("\n").length) return next.length;
+  const target = lines[line];
+  if (target === undefined || column > target.length) return next.length;
+  // 光标前的文本被格式化改动（缩进重排、关键字改写、空白折叠）时，同一列已经指向别的字符。
+  if (asciiLower(target.slice(0, column)) !== asciiLower(linePrefix)) return next.length;
   let offset = 0;
-  for (let index = 0; index < target; index += 1) offset += lines[index]!.length + 1;
-  return offset + Math.min(column, lines[target]!.length);
+  for (let index = 0; index < line; index += 1) offset += lines[index]!.length + 1;
+  return offset + column;
 }
 
 const PURPOSE_KEYS = { execute: "query.errors.purposeExecute", plan: "query.errors.purposePlan" } as const;
@@ -1660,14 +1675,15 @@ onBeforeUnmount(() => {
 .query-pane :deep(.cm-line) { padding-left: var(--sp-3); }
 .query-pane :deep(.cm-gutters) { min-width: 40px; }
 /* 编辑器四层反馈各用一枚令牌（R1、R2）：当前行 < 执行范围 < 失焦选区 < 聚焦选区。
-   选区不再聚焦/失焦同色：失焦仍可辨认，又与聚焦态区分；光标提到 2px 中性高对比色，不被选区底吞没。 */
+   选区不再聚焦/失焦同色：失焦仍可辨认，又与聚焦态区分；光标提到 2px 中性高对比色，不被选区底吞没。
+   选区只由 drawSelection 的 .cm-selectionBackground 单层绘制：CodeMirror 已把原生 ::selection 置为透明，
+   这里再给 ::selection 上色会和选区层叠加，实际透明度翻倍，与令牌和对比度测试都不符。 */
 .query-pane :deep(.cm-activeLine), .query-pane :deep(.cm-activeLineGutter) { background: var(--editor-active-line); }
 .query-pane :deep(.cm-activeLineGutter) { color: var(--text); }
 .query-pane :deep(.cm-cursor), .query-pane :deep(.cm-dropCursor) { border-left: 2px solid var(--caret); margin-left: -1px; }
-.query-pane :deep(.cm-selectionBackground), .query-pane :deep(.cm-content ::selection) { background: var(--editor-selection-blur) !important; }
+.query-pane :deep(.cm-selectionBackground) { background: var(--editor-selection-blur) !important; }
 .query-pane :deep(.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground),
-.query-pane :deep(.cm-focused .cm-selectionBackground),
-.query-pane :deep(.cm-focused .cm-content ::selection) { background: var(--editor-selection) !important; }
+.query-pane :deep(.cm-focused .cm-selectionBackground) { background: var(--editor-selection) !important; }
 .query-pane :deep(.cm-send-range) { background: var(--editor-send-range); border-radius: 2px; }
 /* 搜索与匹配高亮取暖色：与选区/当前行/执行范围既不同色相也不同强度。
    base.css 的全局匹配色带 !important；这里用更高特异性的令牌覆盖，并把「当前匹配」也留在暖色系，
