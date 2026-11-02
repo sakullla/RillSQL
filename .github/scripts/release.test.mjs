@@ -2,11 +2,44 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { checkProject, formatNotes, validateVersions, verifyRelease } from "./release.mjs";
 import { waitForMainCi } from "./wait-for-main-ci.cjs";
+import { buildUpdaterManifest, updaterFiles, validateSignature } from "./updater.mjs";
 
 const uploaded = (name) => ({ name, state: "uploaded", size: 1024 });
 const INSTALLERS = ["RillSQL_0.1.0_x64-setup.exe", "RillSQL_0.1.0_aarch64.dmg", "RillSQL_0.1.0_amd64.deb", "RillSQL_0.1.0_amd64.AppImage"];
 const SHA = "a".repeat(40);
 const draft = () => ({ tag_name: "v0.1.0", draft: true, prerelease: false, target_commitish: SHA, assets: INSTALLERS.map(uploaded) });
+
+function signedFixture(version = "0.1.0") {
+  const packet = Buffer.alloc(74, 1);
+  const key = Buffer.alloc(42, 1);
+  const pubkey = Buffer.from(`untrusted comment: public key\n${key.toString("base64")}\n`).toString("base64");
+  const signature = Buffer.from(`untrusted comment: signature\n${packet.toString("base64")}\ntrusted comment: timestamp:123\tversion:${version}\n${Buffer.alloc(64, 2).toString("base64")}\n`).toString("base64");
+  const release = draft();
+  for (const name of Object.values(updaterFiles(version))) {
+    if (!release.assets.some((asset) => asset.name === name)) release.assets.push(uploaded(name));
+    release.assets.push(uploaded(`${name}.sig`));
+  }
+  return { release, signature, pubkey };
+}
+
+test("updater manifest contains every package format and immutable version URLs", () => {
+  const { release, signature, pubkey } = signedFixture();
+  const manifest = buildUpdaterManifest(release, "v0.1.0", SHA, "sakullla/RillSQL", () => signature, pubkey);
+  assert.equal(Object.keys(manifest.platforms).length, 7);
+  assert.equal(manifest.platforms["linux-x86_64-deb"].url, "https://github.com/sakullla/RillSQL/releases/download/v0.1.0/RillSQL_0.1.0_amd64.deb");
+  assert.equal(manifest.platforms["darwin-aarch64-app"].signature, signature);
+  assert.equal(manifest.platforms["windows-x86_64"], manifest.platforms["windows-x86_64-nsis"]);
+});
+
+test("updater publication rejects missing or empty signatures and wrong keys or versions", () => {
+  const { release, signature, pubkey } = signedFixture();
+  release.assets = release.assets.filter((asset) => !asset.name.endsWith(".deb.sig"));
+  assert.throws(() => buildUpdaterManifest(release, "v0.1.0", SHA, "sakullla/RillSQL", () => signature, pubkey), /deb.sig/);
+  assert.throws(() => validateSignature("", pubkey, "0.1.0"), /encoding/);
+  assert.throws(() => validateSignature(signature, pubkey, "0.2.0"), /version/);
+  const otherKey = Buffer.from(`untrusted comment: public key\n${Buffer.alloc(42, 3).toString("base64")}\n`).toString("base64");
+  assert.throws(() => validateSignature(signature, otherKey, "0.1.0"), /another public key/);
+});
 
 test("the checked-out project has consistent release metadata", () => {
   assert.match(checkProject(), /^\d+\.\d+\.\d+/);

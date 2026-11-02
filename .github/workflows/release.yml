@@ -139,10 +139,21 @@ jobs:
           cache-bin: false
           save-if: false
       - run: npm ci --prefer-offline --no-audit --no-fund
+      - name: Require updater signing key
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is required for signed app updates."
+            exit 1
+          fi
       - name: Build and upload to draft release
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # CI=true makes Tauri skip the Finder layout step of the DMG.
           TAURI_BUNDLER_DMG_IGNORE_CI: ${{ runner.os == 'macOS' }}
         with:
@@ -151,6 +162,8 @@ jobs:
           releaseDraft: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           retryAttempts: 2
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: true
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
 
   publish:
@@ -177,6 +190,18 @@ jobs:
           set -euo pipefail
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > release.json
           node .github/scripts/release.mjs verify release.json "$RELEASE_TAG" "$RELEASE_SHA"
+      - name: Generate the complete signed updater manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ needs.gate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/updater-manifest"
+          mkdir -p "$work"
+          gh release download "$RELEASE_TAG" --pattern '*.sig' --dir "$work"
+          node .github/scripts/updater.mjs release.json "$RELEASE_TAG" "$RELEASE_SHA" "$work" "$GITHUB_REPOSITORY" > "$work/latest.json"
+          gh release upload "$RELEASE_TAG" "$work/latest.json" --clobber
       - name: Publish verified release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

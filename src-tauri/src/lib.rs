@@ -114,6 +114,8 @@ pub fn run() {
     let _ = fixed_dependency_markers();
     wire(tauri::Builder::default(), connections::commands::ConnectionsState::new())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .run(tauri::generate_context!())
         .expect("启动 RillSQL 失败");
 }

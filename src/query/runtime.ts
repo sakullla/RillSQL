@@ -15,6 +15,11 @@ const pendingPolls = new Map<string, string>();
 const settledWaiters = new Map<string, Set<{ runId: string; resolve: () => void }>>();
 let closer: ((id: string) => void) | null = null;
 let epoch = 0;
+let startingQueries = 0;
+
+export function hasRunningQueries(): boolean {
+  return startingQueries > 0 || Object.values(runs).some(isLive);
+}
 
 export function tabRun(tabId: string): RunSnapshot | undefined {
   return runs[tabId];
@@ -36,7 +41,13 @@ export async function startTabRun(input: StartRequest & { tabId: string }): Prom
   const { tabId, ...request } = input;
   // 语句超时是本机设置，每次发起时读取；0 表示不限制，字段整体缺省。
   const timeoutSec = loadSettings().queryTimeoutSec;
-  const dto = await queryStart(timeoutSec > 0 ? { ...request, timeoutMs: timeoutSec * 1000 } : request);
+  startingQueries += 1;
+  let dto: RunDto;
+  try {
+    dto = await queryStart(timeoutSec > 0 ? { ...request, timeoutMs: timeoutSec * 1000 } : request);
+  } finally {
+    startingQueries -= 1;
+  }
   if (token !== epoch) return;
   adoptRun(tabId, dto);
   if (isLive(dto)) watchRun(tabId);

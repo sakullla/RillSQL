@@ -1,6 +1,6 @@
 [package]
 name = "rillsql"
-version = "0.2.2"
+version = "0.2.3"
 description = "RillSQL"
 authors = ["RillSQL"]
 edition = "2021"
@@ -44,6 +44,8 @@ futures = "0.3.34"
 directories = "6.0.0"
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
 chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
+tauri-plugin-updater = "2.14.1"
+tauri-plugin-process = "2.4.0"
 
 [features]
 default = ["custom-protocol"]

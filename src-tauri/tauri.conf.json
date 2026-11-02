@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "RillSQL",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "identifier": "app.rillsql.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -26,7 +26,9 @@
     ],
     "security": {
       "csp": null,
-      "capabilities": ["default"]
+      "capabilities": [
+        "default"
+      ]
     }
   },
   "bundle": {
@@ -38,6 +40,19 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVDMUFGMEEzQjI1REM2RDQKUldUVXhsMnlvL0FhWFBuNHFJRUcrZ2xWYVBmaU5yaHFMUklmVTRRRExlTnJDbmk5eFNSSXRIV0gK",
+      "endpoints": [
+        "https://github.com/sakullla/RillSQL/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      },
+      "requireSignedVersion": true
+    }
   }
 }

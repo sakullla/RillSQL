@@ -8,10 +8,11 @@ import Icon from "./Icon.vue";
 import TaskCenter from "../export/TaskCenter.vue";
 import { useWindowChrome } from "./window-chrome";
 
-const props = defineProps<{ theme: ThemePreference; caption?: boolean }>();
+const props = defineProps<{ theme: ThemePreference; caption?: boolean; updateVersion?: string }>();
 const emit = defineEmits<{
   palette: [];
   help: [];
+  updates: [];
   "new-query": [];
   "toggle-sidebar": [];
   "set-theme": [theme: ThemePreference];
@@ -51,6 +52,7 @@ const choices: { id: ThemePreference }[] = [
       <ChordKeys chord="Mod+K" />
     </button>
     <div class="tb-actions" :data-tauri-drag-region="showCaption ? 'false' : undefined">
+      <button v-if="updateVersion" class="btn sm" type="button" :title="t('shell.update.available', { version: updateVersion })" @click="emit('updates')"><Icon name="refresh" />{{ t("shell.update.open") }}</button>
       <button class="btn sm title-query" type="button" @click="emit('new-query')"><Icon name="plus" />{{ t("shell.titlebar.sqlQuery") }}</button>
       <TaskCenter />
       <details class="theme-menu">

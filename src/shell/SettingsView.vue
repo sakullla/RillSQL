@@ -8,9 +8,10 @@ import { EDITOR_THEMES, localDataPathLabel, type AppLocale, type EditorTheme, ty
 import { detectMac } from "./shortcuts";
 import BrandMark from "./BrandMark.vue";
 import Icon from "./Icon.vue";
+import AppUpdate from "./AppUpdate.vue";
 import type { Density, ThemePreference } from "./theme";
 
-const props = defineProps<{ settings: ShellSettings; dataDir: string | null }>();
+const props = defineProps<{ settings: ShellSettings; dataDir: string | null; prepareUpdate?: () => void }>();
 const emit = defineEmits<{ change: [patch: Partial<ShellSettings>]; help: [] }>();
 
 const mac = detectMac();
@@ -79,8 +80,9 @@ function onLocale(value: string) {
           <p>{{ t("shell.settings.subtitle") }}</p>
         </div>
       </div>
-      <nav class="settings-nav" :aria-label="t('shell.settings.navLabel')"><button class="btn sm" @click="scrollSection('appearance')">{{ t("shell.settings.navAppearance") }}</button><button class="btn sm" @click="scrollSection('reading')">{{ t("shell.settings.navReading") }}</button><button class="btn sm" @click="scrollSection('behavior')">{{ t("shell.settings.navBehavior") }}</button><button class="btn sm" @click="scrollSection('local')">{{ t("shell.settings.navLocal") }}</button></nav>
+      <nav class="settings-nav" :aria-label="t('shell.settings.navLabel')"><button class="btn sm" @click="scrollSection('app-update')">{{ t("shell.update.title") }}</button><button class="btn sm" @click="scrollSection('appearance')">{{ t("shell.settings.navAppearance") }}</button><button class="btn sm" @click="scrollSection('reading')">{{ t("shell.settings.navReading") }}</button><button class="btn sm" @click="scrollSection('behavior')">{{ t("shell.settings.navBehavior") }}</button><button class="btn sm" @click="scrollSection('local')">{{ t("shell.settings.navLocal") }}</button></nav>
       <div class="settings-body">
+      <AppUpdate :auto-check="settings.autoCheckUpdates" :prepare="prepareUpdate" @auto-check="emit('change', { autoCheckUpdates: $event })" />
       <section id="appearance" class="set-sec">
         <h2><Icon name="sliders" />{{ t("shell.settings.navAppearance") }}</h2>
         <div class="set-row">
@@ -244,7 +246,7 @@ function onLocale(value: string) {
 .settings-body { min-width: 0; }
 section.set-sec { margin-bottom: var(--sp-6); }
 section.set-sec :deep(.set-text h4) { font-weight: 550; }
-section.set-sec > h2 {
+section.set-sec :deep(h2) {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
@@ -254,14 +256,14 @@ section.set-sec > h2 {
   color: var(--text);
   border-bottom: 1px solid var(--line-2);
 }
-section.set-sec > h2 .i { width: 14px; height: 14px; flex-shrink: 0; }
-section.set-sec:not(.about) .set-row:last-child { border-bottom: 0; padding-bottom: var(--sp-3); }
+section.set-sec :deep(h2 .i) { width: 14px; height: 14px; flex-shrink: 0; }
+section.set-sec:not(.about) :deep(.set-row):last-child { border-bottom: 0; padding-bottom: var(--sp-3); }
 @media (max-width: 800px) {
   .page-inner.narrow { display: block; }
   .settings-nav { position: static; flex-direction: row; flex-wrap: wrap; margin-bottom: var(--sp-4); }
   .settings-nav .btn { width: auto; }
 }
 @media (max-width: 720px) {
-  section.set-sec:not(.about) .set-row { flex-wrap: wrap; align-items: flex-start; }
+  section.set-sec:not(.about) :deep(.set-row) { flex-wrap: wrap; align-items: flex-start; }
 }
 </style>

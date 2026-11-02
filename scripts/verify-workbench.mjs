@@ -88,6 +88,10 @@ try {
   await page.locator(".cm-content").evaluate(el => { window.__editorBeforeNavigation = el; });
   await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "设置", exact: true }).click();
   await expect(page.getByRole("heading", { name: "设置", exact: true })).toBeVisible();
+  await page.locator("#app-update").getByRole("button", { name: "检查更新", exact: true }).click();
+  await expect(page.locator("#app-update [role=status]")).toContainText("已是最新版本");
+  expect(await page.evaluate(() => window.__uiCalls.some(call => call.command === "plugin:updater|download" || call.command === "plugin:updater|install"))).toBe(false);
+  report.checks.push("Manual update check reports the current version without downloading or installing");
   await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "工作台", exact: true }).click();
   expect(await page.locator(".cm-content").evaluate(el => el === window.__editorBeforeNavigation)).toBe(true);
   await expect(page.locator(".cm-content")).toContainText("SELECT * FROM orders;");
@@ -448,6 +452,56 @@ try {
   await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "设置", exact: true }).click();
   await expect(page.getByRole("heading", { name: "设置", exact: true })).toBeVisible();
   report.checks.push("Locale choice persists across reload");
+
+  // Exercise the real updater JS API against synthetic native commands; no installer is run.
+  const updates = await browser.newPage({ viewport: { width: 640, height: 900 } });
+  updates.on("pageerror", error => errors.push(error.message));
+  await updates.addInitScript(installSyntheticIpc, "dark");
+  await updates.addInitScript(() => {
+    const core = window.__TAURI_INTERNALS__;
+    const original = core.invoke;
+    window.__updateCalls = [];
+    core.invoke = async (command, args = {}) => {
+      window.__updateCalls.push(command);
+      if (command === "plugin:updater|check") return { rid: 800, currentVersion: "0.2.3", version: "0.2.4", body: "Synthetic update notes <b>plain text</b>" };
+      if (command === "plugin:updater|download") {
+        args.onEvent.onmessage({ event: "Started", data: { contentLength: 100 } });
+        args.onEvent.onmessage({ event: "Progress", data: { chunkLength: 50 } });
+        return new Promise(resolve => { window.__finishUpdateDownload = () => resolve(801); });
+      }
+      if (command === "plugin:updater|install") {
+        window.__updateCheckpoint = JSON.parse(localStorage.getItem("rillsql.session"));
+        return new Promise(resolve => { window.__finishUpdateInstall = resolve; });
+      }
+      if (command === "plugin:process|restart") throw new Error("Synthetic restart failure");
+      return original(command, args);
+    };
+  });
+  await updates.goto(base);
+  // The delayed startup check only offers the update, even with an unsaved SQL draft.
+  await updates.getByRole("button", { name: "新建查询", exact: true }).click();
+  await updates.locator(".cm-content").fill("SELECT 'update draft';");
+  await expect(updates.getByRole("button", { name: "有更新", exact: true })).toBeVisible({ timeout: 15000 });
+  expect(await updates.evaluate(() => window.__updateCalls.includes("plugin:updater|download"))).toBe(false);
+  await updates.getByRole("button", { name: "有更新", exact: true }).click();
+  await expect(updates.locator("#app-update")).toContainText("发现新版本 0.2.4");
+  await updates.locator("#app-update summary").click();
+  await expect(updates.locator("#app-update pre")).toContainText("<b>plain text</b>");
+  expect(await updates.locator("#app-update pre b").count()).toBe(0);
+  expect(await updates.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await updates.getByRole("button", { name: "下载并重启安装", exact: true }).click();
+  await expect(updates.locator("#app-update progress")).toHaveAttribute("value", "50");
+  await updates.evaluate(() => window.__finishUpdateDownload());
+  await expect(updates.getByRole("dialog", { name: "正在安装更新" })).toBeVisible();
+  expect(await updates.evaluate(() => window.__updateCheckpoint.tabs.some(tab => tab.draft === "SELECT 'update draft';"))).toBe(true);
+  await updates.keyboard.press("Escape");
+  await expect(updates.getByRole("dialog", { name: "正在安装更新" })).toBeVisible();
+  await updates.evaluate(() => window.__finishUpdateInstall());
+  await expect(updates.getByRole("dialog", { name: "正在安装更新" })).toHaveCount(0);
+  await expect(updates.getByRole("button", { name: "重新启动", exact: true })).toBeVisible();
+  await expect(updates.locator("#app-update [role=alert]")).toContainText("Synthetic restart failure");
+  await updates.close();
+  report.checks.push("Synthetic update: startup offer, narrow layout, explicit download progress, draft checkpoint, install modal and restart failure recovery");
 
   expect(errors).toEqual([]);
   report.checks.push("No browser page errors");

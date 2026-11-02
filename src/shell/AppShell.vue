@@ -20,13 +20,15 @@ import { exportTasks, taskStatusText } from "../export/tasks";
 import type { TableTarget } from "../grid/target";
 import type { SavedDraft } from "../history/saved";
 import { deletedConnectionNotice, type OpenPlan } from "../history/plan";
-import { attachCloser, requestCancel, startTabRun, tabRun } from "../query/runtime";
+import { attachCloser, hasRunningQueries, requestCancel, startTabRun, tabRun } from "../query/runtime";
 import { rowLimit } from "../query/scope";
 import { parseHash } from "../router";
 import { ToastHost } from "../ui";
 import { toast } from "../ui/toast";
 import { buildInsertText, focusedEditor, insertAtCursor, insertPlan, type InsertReference } from "./query-editor";
-import { chooseLeave, chooseStay, closePrompt, installCloseCoordinator, uninstallCloseCoordinator } from "./close-guard";
+import { chooseLeave, chooseStay, closePrompt, installCloseCoordinator, registerWindowBlocker, uninstallCloseCoordinator } from "./close-guard";
+import { appUpdater } from "./app-update";
+import { checkpointForUpdate } from "./update-session";
 import ActivityRail from "./ActivityRail.vue";
 import CommandPalette from "./CommandPalette.vue";
 import { shellCommands, type PaletteItem } from "./commands";
@@ -60,6 +62,15 @@ const session = createSession(
 );
 const windowChrome = ref({ custom: false, maximized: false });
 const closeDialog = ref<HTMLDialogElement | null>(null);
+const updateDialog = ref<HTMLDialogElement | null>(null);
+const updateInstalling = computed(() => appUpdater.state.stage === "installing" || appUpdater.state.stage === "restarting");
+const releaseUpdateBlocker = registerWindowBlocker(() => updateInstalling.value);
+watch(updateInstalling, async (busy) => {
+  if (!busy) return;
+  await nextTick();
+  updateDialog.value?.showModal();
+});
+let updateTimer: ReturnType<typeof setTimeout> | null = null;
 attachCloser((id) => session.closeTab(id));
 installCloseCoordinator(session);
 
@@ -577,6 +588,7 @@ function typingTarget(event: KeyboardEvent): boolean {
 }
 
 function onKey(event: KeyboardEvent) {
+  if (updateInstalling.value) { event.preventDefault(); return; }
   if (session.paletteOpen.value) return;
   const mod = event.ctrlKey || event.metaKey;
   const key = event.key.toLowerCase();
@@ -654,6 +666,9 @@ onMounted(() => {
     dataDir.value = info?.data_dir ?? null;
   });
   void startCatalog();
+  if (appUpdater.available()) updateTimer = setTimeout(() => {
+    if (settings.autoCheckUpdates) void appUpdater.check(true);
+  }, 8000);
   void connectDroppedFiles(onDragDrop).then((stop) => {
     if (dragDropAlive) stopDragDrop = stop;
     else stop?.();
@@ -661,6 +676,9 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  if (updateTimer !== null) clearTimeout(updateTimer);
+  appUpdater.dispose();
+  releaseUpdateBlocker();
   dragDropAlive = false;
   stopDragDrop?.();
   stopDragDrop = null;
@@ -670,12 +688,24 @@ onBeforeUnmount(() => {
   attachCloser(() => undefined);
   uninstallCloseCoordinator(session);
 });
+
+function prepareUpdate() {
+  checkpointForUpdate(session.tabs.value, session.activeId.value,
+    hasRunningQueries() || exportTasks.some((task) => task.status === "running") || compareOpen.value || dragImport.value !== null,
+    localStorage);
+}
+
+async function openUpdates() {
+  session.showPage("settings");
+  await nextTick();
+  document.getElementById("app-update")?.scrollIntoView({ block: "start" });
+}
 </script>
 
 <template>
   <div class="app-root" :class="{ 'sidebar-hidden': session.sidebarHidden.value || session.page.value !== 'workspace', 'custom-chrome': windowChrome.custom, 'is-maximized': windowChrome.maximized }">
     <a class="skip" href="#main">{{ t("shell.skipToMain") }}</a>
-    <TitleBar :theme="settings.theme" @palette="session.openPalette('all')" @help="session.openHelp()" @set-theme="setTheme" @window-state="windowChrome = $event" @new-query="session.openQuery()" @toggle-sidebar="session.toggleSidebar()" />
+    <TitleBar :theme="settings.theme" :update-version="appUpdater.state.stage === 'available' ? appUpdater.state.version : undefined" @updates="openUpdates" @palette="session.openPalette('all')" @help="session.openHelp()" @set-theme="setTheme" @window-state="windowChrome = $event" @new-query="session.openQuery()" @toggle-sidebar="session.toggleSidebar()" />
     <div class="body">
       <ActivityRail :page="session.page.value" @navigate="onNavigate" />
       <button v-if="session.page.value === 'workspace' && !session.sidebarHidden.value" class="sidebar-dismiss" :aria-label="t('shell.closeExplorer')" @click="session.toggleSidebar()"></button>
@@ -729,7 +759,7 @@ onBeforeUnmount(() => {
           @open="onHistoryOpen"
           @update:section="historySection = $event"
         />
-        <SettingsView v-else-if="session.page.value === 'settings'" :settings="settings" :data-dir="dataDir" @change="onSettings" @help="session.openHelp()" />
+        <SettingsView v-else-if="session.page.value === 'settings'" :settings="settings" :data-dir="dataDir" :prepare-update="prepareUpdate" @change="onSettings" @help="session.openHelp()" />
       </main>
     </div>
     <StatusBar
@@ -753,6 +783,10 @@ onBeforeUnmount(() => {
     <DragImportDialog v-if="dragImport" :seed="dragImport" @close="dragImport = null" />
     <ToastHost />
     <ShortcutHelp :open="session.helpOpen.value" @close="session.closeHelp()" />
+    <dialog v-if="updateInstalling" ref="updateDialog" class="modal" aria-modal="true" :aria-label="t('shell.update.installing')" @cancel.prevent>
+      <div class="modal-head"><h2>{{ t("shell.update.installing") }}</h2></div>
+      <div class="modal-body"><p role="status">{{ t("shell.update.wait") }}</p></div>
+    </dialog>
     <dialog v-if="closePrompt.open" ref="closeDialog" class="modal" aria-labelledby="close-guard-title" @cancel.prevent="chooseStay">
       <div class="modal-head">
         <div class="modal-titles">

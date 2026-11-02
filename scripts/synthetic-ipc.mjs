@@ -474,6 +474,7 @@ export function installSyntheticIpc(initialTheme) {
       convertFileSrc(filePath) { return filePath; },
       async invoke(command, args = {}) {
         window.__uiCalls.push({ command, args });
+        if (command === "plugin:updater|check") return null;
         if (command === "plugin:window|is_maximized") return false;
         if (command === "plugin:window|is_focused") return true;
         if (command.startsWith("plugin:event|")) return 1;

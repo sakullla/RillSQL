@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isReactive } from "vue";
 import type { RunDto } from "./api";
-import { adoptRun, continueTabRun, guardClose, requestCancel, resetQueryRuntime, startTabRun, tabRun, whenSettled } from "./runtime";
+import { adoptRun, continueTabRun, guardClose, hasRunningQueries, requestCancel, resetQueryRuntime, startTabRun, tabRun, whenSettled } from "./runtime";
 const api = vi.hoisted(() => ({ queryStart: vi.fn(), queryPoll: vi.fn(), queryCancel: vi.fn(), queryRelease: vi.fn().mockResolvedValue(true) }));
 vi.mock("./api", () => api);
 const dto = (status = "running"): RunDto => ({ id: "run", connectionId: "db", connectionName: "DB", database: "main", engine: "sqlite", status, cancel: "none", cancelMessage: "", viaSsh: false, freshChannel: false, statements: [], elapsedMs: 0, startedAt: "" });
@@ -16,6 +16,19 @@ it("does not proxy nested result rows and releases completed results when their 
   expect(tabRun("q")).toBeUndefined();
 });
 describe("slow query status requests", () => {
+  it("blocks updates while query start is pending and clears the guard on failure", async () => {
+    let rejectStart!: (reason: Error) => void;
+    api.queryStart.mockImplementationOnce(() => new Promise<RunDto>((_, reject) => { rejectStart = reject; }));
+    const pending = startTabRun({ tabId: "q", connectionId: "db", connectionName: "DB", database: "main", engine: "sqlite", sql: "SELECT 1", limit: 100 });
+    expect(hasRunningQueries()).toBe(true);
+    rejectStart(new Error("connection lost"));
+    await expect(pending).rejects.toThrow("connection lost");
+    expect(hasRunningQueries()).toBe(false);
+    adoptRun("q", dto());
+    expect(hasRunningQueries()).toBe(true);
+    adoptRun("q", dto("done"));
+    expect(hasRunningQueries()).toBe(false);
+  });
   it("resolves run waiters without timers and releases them on replacement or reset", async () => {
     vi.useFakeTimers();
     adoptRun("q", dto());

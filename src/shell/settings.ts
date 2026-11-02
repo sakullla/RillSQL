@@ -18,6 +18,7 @@ export interface ShellSettings {
   nullCopy: NullCopy;
   /** 单条语句的执行超时（秒）。0 表示不限制。 */
   queryTimeoutSec: number;
+  autoCheckUpdates: boolean;
 }
 
 export const DEFAULT_SETTINGS: ShellSettings = {
@@ -31,6 +32,7 @@ export const DEFAULT_SETTINGS: ShellSettings = {
   objectPage: 100,
   nullCopy: "NULL",
   queryTimeoutSec: 0,
+  autoCheckUpdates: true,
 };
 
 const STORAGE_KEY = "rillsql.shell";
@@ -63,7 +65,8 @@ export function loadSettings(storage: Storage | null = safeStorage()): ShellSett
     const editorTheme: EditorTheme = normalizeEditorTheme(parsed.editorTheme);
     // 语言归一：未知/缺失值归到 zh-CN（默认中文），避免字典查找落空。
     const locale: AppLocale = normalizeLocale(parsed.locale);
-    return { ...DEFAULT_SETTINGS, ...parsed, density, editorTheme, locale };
+    const autoCheckUpdates = typeof parsed.autoCheckUpdates === "boolean" ? parsed.autoCheckUpdates : DEFAULT_SETTINGS.autoCheckUpdates;
+    return { ...DEFAULT_SETTINGS, ...parsed, density, editorTheme, locale, autoCheckUpdates };
   } catch {
     return { ...DEFAULT_SETTINGS };
   }

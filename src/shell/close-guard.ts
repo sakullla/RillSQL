@@ -3,6 +3,12 @@ import { guardClose, tabRun } from "../query/runtime";
 
 const checks = new Map<string, Set<() => boolean>>();
 const discardOnce = new Set<string>();
+const windowBlockers = new Set<() => boolean>();
+
+export function registerWindowBlocker(blocked: () => boolean): () => void {
+  windowBlockers.add(blocked);
+  return () => { windowBlockers.delete(blocked); };
+}
 
 /** Close prompt shown for a tab or the whole window. */
 export const closePrompt = reactive({
@@ -151,6 +157,7 @@ function askWindow(): Promise<boolean> {
 
 /** Whether the window may close. Title bar and onCloseRequested both use this. */
 export function evaluateWindowClose(): Promise<boolean> {
+  if ([...windowBlockers].some((blocked) => blocked())) return Promise.resolve(false);
   if (releaseSystemClose) return Promise.resolve(true);
   if (blockLiveQueries()) return Promise.resolve(false);
   if (!anyPending()) return Promise.resolve(true);
@@ -243,6 +250,7 @@ export function closeFromTitleBar(nativeClose: () => Promise<void>): Promise<voi
 }
 
 export function resetCloseGuard(): void {
+  windowBlockers.clear();
   checks.clear();
   discardOnce.clear();
   releaseSystemClose = false;
