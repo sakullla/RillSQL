@@ -50,3 +50,7 @@ export function queryPoll(runId: string, continueRead = false): Promise<RunDto> 
 export function queryCancel(runId: string): Promise<RunDto> {
   return invoke<RunDto>("query_cancel", { runId });
 }
+
+export async function queryRelease(runId: string): Promise<boolean> {
+  return invoke<boolean>("query_release", { runId });
+}

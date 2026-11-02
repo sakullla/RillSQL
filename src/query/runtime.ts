@@ -1,7 +1,7 @@
 import { shallowReactive } from "vue";
 import { tr } from "../i18n";
 import { loadSettings } from "../shell/settings";
-import { queryCancel, queryPoll, queryStart, type RunDto, type StartRequest } from "./api";
+import { queryCancel, queryPoll, queryRelease, queryStart, type RunDto, type StartRequest } from "./api";
 
 export interface RunSnapshot extends RunDto {
   tabId: string;
@@ -12,6 +12,7 @@ const runs = shallowReactive<Record<string, RunSnapshot>>({});
 const timers = new Map<string, ReturnType<typeof setInterval>>();
 const closeAfter = new Set<string>();
 const pendingPolls = new Map<string, string>();
+const settledWaiters = new Map<string, Set<{ runId: string; resolve: () => void }>>();
 let closer: ((id: string) => void) | null = null;
 let epoch = 0;
 
@@ -55,7 +56,7 @@ export async function continueTabRun(tabId: string): Promise<void> {
   } catch (err) {
     if (token !== epoch) return;
     const run = runs[tabId];
-    if (run?.id === runId) run.pollError = errorText(err);
+    if (run?.id === runId && isLive(run)) run.pollError = errorText(err);
   }
   settle(tabId);
 }
@@ -66,14 +67,22 @@ export function whenSettled(tabId: string): Promise<void> {
   if (!current || !isLive(current)) return Promise.resolve();
   const runId = current.id;
   return new Promise((resolve) => {
-    const timer = setInterval(() => {
-      const run = runs[tabId];
-      if (!run || run.id !== runId || !isLive(run)) {
-        clearInterval(timer);
-        resolve();
-      }
-    }, 40);
+    let waiters = settledWaiters.get(tabId);
+    if (!waiters) settledWaiters.set(tabId, waiters = new Set());
+    waiters.add({ runId, resolve });
   });
+}
+
+function resolveSettled(tabId: string) {
+  const waiters = settledWaiters.get(tabId);
+  if (!waiters) return;
+  const current = runs[tabId];
+  for (const waiter of waiters) {
+    if (current?.id === waiter.runId && isLive(current)) continue;
+    waiters.delete(waiter);
+    waiter.resolve();
+  }
+  if (!waiters.size) settledWaiters.delete(tabId);
 }
 
 export async function requestCancel(tabId: string): Promise<void> {
@@ -89,12 +98,12 @@ export async function requestCancel(tabId: string): Promise<void> {
   const runId = current.id;
   try {
     const next = await queryCancel(runId);
-    if (token !== epoch) return;
+    if (token !== epoch || runs[tabId]?.id !== runId) return;
     apply(tabId, next);
   } catch (err) {
     if (token !== epoch) return;
     const run = runs[tabId];
-    if (!run) return;
+    if (!run || run.id !== runId || !isLive(run)) return;
     run.cancel = "failed";
     run.status = "running";
     run.cancelMessage = errorText(err);
@@ -104,7 +113,12 @@ export async function requestCancel(tabId: string): Promise<void> {
 
 export function guardClose(tabId: string): boolean {
   const run = runs[tabId];
-  if (!run || !isLive(run)) { delete runs[tabId]; return true; }
+  if (!run || !isLive(run)) {
+    delete runs[tabId];
+    stopTimer(tabId);
+    resolveSettled(tabId);
+    return true;
+  }
   closeAfter.add(tabId);
   void requestCancel(tabId);
   return false;
@@ -112,6 +126,13 @@ export function guardClose(tabId: string): boolean {
 
 export function adoptRun(tabId: string, dto: RunDto) {
   runs[tabId] = shallowReactive({ ...dto, tabId, pollError: "" });
+  releaseFinished(dto);
+  resolveSettled(tabId);
+}
+
+function releaseFinished(dto: RunDto) {
+  // UI 持有最终结果；后端无需再为历史查询保留一份结果集。释放失败不改变查询结果。
+  if (!isLive(dto)) void queryRelease(dto.id).catch(() => undefined);
 }
 
 export function resetQueryRuntime() {
@@ -122,6 +143,7 @@ export function resetQueryRuntime() {
   closeAfter.clear();
   closer = null;
   for (const id of Object.keys(runs)) delete runs[id];
+  for (const tabId of settledWaiters.keys()) resolveSettled(tabId);
 }
 
 function watchRun(tabId: string) {
@@ -149,7 +171,7 @@ async function refresh(tabId: string) {
   } catch (err) {
     if (token !== epoch) return;
     const run = runs[tabId];
-    if (run?.id === runId) run.pollError = errorText(err);
+    if (run?.id === runId && isLive(run)) run.pollError = errorText(err);
   } finally {
     if (pendingPolls.get(tabId) === runId) pendingPolls.delete(tabId);
   }
@@ -158,6 +180,8 @@ async function refresh(tabId: string) {
 
 function apply(tabId: string, next: RunDto) {
   const current = runs[tabId];
+  // 并发的继续读取/取消/轮询可能晚到，不允许把终态退回执行中。
+  if (current?.id === next.id && !isLive(current)) return;
   if (current && current.id === next.id && cancelRank(next.cancel) < cancelRank(current.cancel) && isLive(next)) {
     runs[tabId] = shallowReactive({
       ...next,
@@ -170,6 +194,8 @@ function apply(tabId: string, next: RunDto) {
     return;
   }
   runs[tabId] = shallowReactive({ ...next, tabId, pollError: "" });
+  releaseFinished(next);
+  resolveSettled(tabId);
 }
 
 function settle(tabId: string) {

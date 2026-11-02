@@ -1,4 +1,5 @@
-import { shallowRef, reactive } from "vue";
+import { shallowRef, reactive, watch } from "vue";
+import { invalidateColumns } from "../query/columns";
 import { tr } from "../i18n";
 import { engineMeta, presentEnv, type EnvTag, type SavedConnection } from "../connections/model";
 import { loadSettings } from "../shell/settings";
@@ -34,6 +35,13 @@ export interface StructureFocus {
 }
 
 const connections = shallowRef<CatalogConnection[]>([]);
+// 刷新目录、断开或删除连接时，同时释放补全元数据和进行中的旧缓存请求。
+watch(connections, (next, previous) => {
+  const current = new Map(next.map((connection) => [connection.id, connection]));
+  for (const connection of previous) {
+    if (current.get(connection.id) !== connection) invalidateColumns(`${connection.id}\u0000`);
+  }
+}, { flush: "sync" });
 const loadError = shallowRef<string | null>(null);
 /** 目录是否已经成功读过一次：恢复的标签据此判断“连接已删”还是“还在加载”。 */
 const loaded = shallowRef(false);
@@ -46,6 +54,7 @@ let refreshSource: (() => CatalogConnection[]) | null = null;
 let pageSource: ((request: PageRequest) => PageResult) | null = null;
 let seenSessions = "";
 let pollTimer: ReturnType<typeof setInterval> | null = null;
+let sessionPoll: Promise<void> | null = null;
 let refreshGeneration = 0;
 const connectionReads = new Map<string, Promise<void>>();
 
@@ -133,6 +142,7 @@ export function replaceCatalog(list: CatalogConnection[]): void {
 export function resetCatalog(): void {
   refreshGeneration += 1;
   connectionReads.clear();
+  sessionPoll = null;
   connections.value = [];
   loadError.value = null;
   loaded.value = false;
@@ -256,13 +266,10 @@ function failureText(error: unknown): string {
 function enqueueConnectionRead(id: string, run: () => Promise<void>): Promise<void> {
   const previous = connectionReads.get(id) ?? Promise.resolve();
   const next = previous.then(run, run);
-  connectionReads.set(
-    id,
-    next.then(
-      () => undefined,
-      () => undefined,
-    ),
-  );
+  const settled = next.then(() => undefined, () => undefined).then(() => {
+    if (connectionReads.get(id) === settled) connectionReads.delete(id);
+  });
+  connectionReads.set(id, settled);
   return next;
 }
 
@@ -454,10 +461,20 @@ function armPoll(): void {
   }, 1000);
 }
 
-async function pollSessions(): Promise<void> {
-  if (refreshSource) return;
+function pollSessions(): Promise<void> {
+  if (refreshSource) return Promise.resolve();
+  if (sessionPoll) return sessionPoll;
+  const pending = readSessionChanges().finally(() => {
+    if (sessionPoll === pending) sessionPoll = null;
+  });
+  sessionPoll = pending;
+  return pending;
+}
+
+async function readSessionChanges(): Promise<void> {
+  const generation = refreshGeneration;
   const sessions = await fetchSessions();
-  if (sessions === null) return;
+  if (generation !== refreshGeneration || sessions === null) return;
   const key = sessionsKey(sessions);
   if (key === seenSessions) return;
   seenSessions = key;
@@ -466,14 +483,16 @@ async function pollSessions(): Promise<void> {
 
 export async function startCatalog(): Promise<void> {
   if (refreshSource) return;
+  const generation = refreshGeneration;
   const sessions = await fetchSessions();
+  if (generation !== refreshGeneration) return;
   if (sessions === null) {
     if (connections.value.length === 0) loadError.value = tr("catalog.store.cannotReadOpen");
     return;
   }
   seenSessions = sessionsKey(sessions);
   await refreshFromBackend();
-  armPoll();
+  if (generation === refreshGeneration) armPoll();
 }
 
 export function refreshCatalog(): Promise<void> {

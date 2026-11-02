@@ -174,6 +174,11 @@ description = "允许读取一次 SQL 执行的状态和已完成结果。"
 commands.allow = ["query_poll"]
 
 [[permission]]
+identifier = "allow-query-release"
+description = "Release a completed query snapshot after the frontend receives it."
+commands.allow = ["query_release"]
+
+[[permission]]
 identifier = "allow-query-cancel"
 description = "允许请求取消正在执行的 SQL。"
 commands.allow = ["query_cancel"]

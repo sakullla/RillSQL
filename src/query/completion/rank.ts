@@ -17,13 +17,19 @@ export interface Ranked<T> {
   item: T;
 }
 
-/** 分数越小越靠前；同分保持传入顺序，再由调用方按字典序收尾。 */
-export function rankBy<T>(items: readonly T[], prefix: string, label: (item: T) => string): T[] {
-  const scored: Ranked<T>[] = [];
-  items.forEach((item, order) => {
+/** 两种匹配分别收集，保持同分顺序；满额前缀命中后无需再扫描或排序。 */
+export function rankBy<T>(items: Iterable<T>, prefix: string, label: (item: T) => string, cap = Infinity): T[] {
+  if (cap <= 0) return [];
+  const exact: T[] = [];
+  const fuzzy: T[] = [];
+  for (const item of items) {
     const match = matchKind(label(item), prefix);
-    if (match < 0) return;
-    scored.push({ score: match * 1000 + order, item });
-  });
-  return scored.sort((a, b) => a.score - b.score).map((entry) => entry.item);
+    if (match === 0) {
+      exact.push(item);
+      if (exact.length >= cap) break;
+    } else if (match === 1 && fuzzy.length < cap) {
+      fuzzy.push(item);
+    }
+  }
+  return exact.concat(fuzzy.slice(0, cap - exact.length));
 }

@@ -308,4 +308,34 @@ describe("catalog session reads", () => {
     // 状态与原因都没变：轮询不重复刷新
     expect(invoke.mock.calls.filter((call) => call[0] === "connections_list").length).toBe(reads);
   });
+
+  it("does not restart polling when a pending startup finishes after reset", async () => {
+    vi.useFakeTimers();
+    let resolve!: (value: unknown) => void;
+    invoke.mockImplementation(() => new Promise((done) => { resolve = done; }));
+    const startup = startCatalog();
+    resetCatalog();
+    resolve([]);
+    await startup;
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(catalogLoaded()).toBe(false);
+  });
+
+  it("keeps one slow session poll in flight and discards it after reset", async () => {
+    vi.useFakeTimers();
+    invoke.mockImplementation(async (command: string) => command === "catalog_sessions" ? [] : []);
+    await startCatalog();
+    invoke.mockClear();
+    let resolve!: (value: unknown) => void;
+    invoke.mockImplementation(() => new Promise((done) => { resolve = done; }));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    resetCatalog();
+    resolve(sessionInfo(["late"]));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(catalogConnections()).toEqual([]);
+    expect(catalogLoaded()).toBe(false);
+  });
 });

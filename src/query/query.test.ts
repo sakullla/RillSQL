@@ -157,6 +157,7 @@ describe("query editing", () => {
     replaceCatalog(catalogFixture());
     const calls: { command: string; sql?: string }[] = [];
     invoke.mockImplementation(async (command: string, args?: { request?: { sql: string } }) => {
+      if (command === "query_release") return true;
       calls.push({ command, sql: args?.request?.sql });
       return runDto({
         status: "done",
@@ -868,6 +869,7 @@ describe("query editing", () => {
     replaceCatalog(catalogFixture());
     const calls: { command: string; sql?: string }[] = [];
     invoke.mockImplementation(async (command: string, args?: { request?: { sql: string } }) => {
+      if (command === "query_release") return true;
       calls.push({ command, sql: args?.request?.sql });
       return runDto({
         status: "done",
@@ -915,6 +917,7 @@ describe("query editing", () => {
 
     const sqliteCalls: string[] = [];
     invoke.mockImplementation(async (command: string, args?: { request?: { sql: string } }) => {
+      if (command === "query_release") return true;
       sqliteCalls.push(args?.request?.sql ?? command);
       return runDto({
         engine: "sqlite",
@@ -1017,6 +1020,7 @@ describe("query editing", () => {
     replaceCatalog(catalogFixture());
     const calls: string[] = [];
     invoke.mockImplementation(async (_command: string, args?: { request?: { sql: string } }) => {
+      if (_command === "query_release") return true;
       calls.push(args?.request?.sql ?? "");
       return runDto({ status: "done", statements: [{ sql: args?.request?.sql ?? "", status: "ok", message: "", columns: [], rows: [], truncated: false, affected: 1 }] });
     });
@@ -1080,6 +1084,7 @@ describe("query editing", () => {
     replaceCatalog(catalogFixture());
     const calls: string[] = [];
     invoke.mockImplementation(async (_command: string, args?: { request?: { sql: string } }) => {
+      if (_command === "query_release") return true;
       calls.push(args?.request?.sql ?? "");
       return runDto({
         status: "done",
@@ -1182,6 +1187,7 @@ describe("query editing", () => {
     replaceCatalog(catalogFixture());
     const calls: string[] = [];
     invoke.mockImplementation(async (_command: string, args?: { request?: { sql: string } }) => {
+      if (_command === "query_release") return true;
       calls.push(args?.request?.sql ?? "");
       return runDto();
     });

@@ -60,6 +60,7 @@
     "allow-mongo-delete-document",
     "allow-query-start",
     "allow-query-poll",
+    "allow-query-release",
     "allow-query-cancel",
     "allow-query-history",
     "allow-query-history-clear",

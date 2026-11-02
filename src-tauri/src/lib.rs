@@ -98,6 +98,7 @@ fn wire<R: tauri::Runtime>(builder: tauri::Builder<R>, state: connections::comma
         diagram::commands::diagram_read,
         query::commands::query_start,
         query::commands::query_poll,
+        query::commands::query_release,
         query::commands::query_cancel,
         query::commands::query_history,
         query::commands::query_history_clear,

@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isReactive } from "vue";
 import type { RunDto } from "./api";
-import { adoptRun, continueTabRun, guardClose, resetQueryRuntime, startTabRun, tabRun } from "./runtime";
-const api = vi.hoisted(() => ({ queryStart: vi.fn(), queryPoll: vi.fn(), queryCancel: vi.fn() }));
+import { adoptRun, continueTabRun, guardClose, requestCancel, resetQueryRuntime, startTabRun, tabRun, whenSettled } from "./runtime";
+const api = vi.hoisted(() => ({ queryStart: vi.fn(), queryPoll: vi.fn(), queryCancel: vi.fn(), queryRelease: vi.fn().mockResolvedValue(true) }));
 vi.mock("./api", () => api);
 const dto = (status = "running"): RunDto => ({ id: "run", connectionId: "db", connectionName: "DB", database: "main", engine: "sqlite", status, cancel: "none", cancelMessage: "", viaSsh: false, freshChannel: false, statements: [], elapsedMs: 0, startedAt: "" });
 afterEach(() => { resetQueryRuntime(); vi.useRealTimers(); vi.clearAllMocks(); });
@@ -11,10 +11,54 @@ it("does not proxy nested result rows and releases completed results when their 
   adoptRun("q", result);
   expect(isReactive(tabRun("q"))).toBe(true);
   expect(isReactive(tabRun("q")!.statements)).toBe(false);
+  expect(api.queryRelease).toHaveBeenCalledWith("run");
   expect(guardClose("q")).toBe(true);
   expect(tabRun("q")).toBeUndefined();
 });
 describe("slow query status requests", () => {
+  it("resolves run waiters without timers and releases them on replacement or reset", async () => {
+    vi.useFakeTimers();
+    adoptRun("q", dto());
+    const done = vi.fn();
+    const first = whenSettled("q").then(done);
+    expect(vi.getTimerCount()).toBe(0);
+    adoptRun("q", { ...dto(), id: "replacement" });
+    await first;
+    expect(done).toHaveBeenCalledTimes(1);
+    const second = whenSettled("q").then(done);
+    resetQueryRuntime();
+    await second;
+    expect(done).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it("releases final snapshots once and ignores older concurrent responses", async () => {
+    vi.useFakeTimers();
+    let resolvePoll!: (value: RunDto) => void;
+    api.queryStart.mockResolvedValue(dto());
+    api.queryPoll.mockImplementation(() => new Promise<RunDto>((resolve) => { resolvePoll = resolve; }));
+    api.queryCancel.mockResolvedValue({ ...dto("cancelled"), cancel: "confirmed" });
+    await startTabRun({ tabId: "q", connectionId: "db", connectionName: "DB", database: "main", engine: "sqlite", sql: "SELECT 1", limit: 100 });
+    expect(api.queryRelease).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(400);
+    await requestCancel("q");
+    expect(api.queryRelease).toHaveBeenCalledExactlyOnceWith("run");
+    resolvePoll(dto());
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(tabRun("q")?.status).toBe("cancelled");
+    expect(api.queryRelease).toHaveBeenCalledTimes(1);
+    expect(api.queryPoll).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not let an old cancellation overwrite a replacement run", async () => {
+    let resolveCancel!: (value: RunDto) => void;
+    api.queryCancel.mockImplementation(() => new Promise<RunDto>((resolve) => { resolveCancel = resolve; }));
+    adoptRun("q", dto());
+    const cancelled = requestCancel("q");
+    adoptRun("q", { ...dto("done"), id: "new" });
+    resolveCancel({ ...dto("cancelled"), cancel: "confirmed" });
+    await cancelled;
+    expect(tabRun("q")?.id).toBe("new");
+  });
   it("does not poll a result that already completed during start", async () => {
     vi.useFakeTimers();
     api.queryStart.mockResolvedValue(dto("done"));

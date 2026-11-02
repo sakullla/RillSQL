@@ -16,7 +16,6 @@ import { queryHistory, querySavedList, querySavedSave } from "../history/api";
 import { deletedConnectionNotice, elapsedLabel, openPlan, statusBadge, statusLabel as historyStatusLabel, type HistoryEntry, type OpenPlan } from "../history/plan";
 import { openSaved, savedName, savedNameError, savedNeedsTarget, type SavedQuery } from "../history/saved";
 import QueryResultGrid from "../grid/QueryResultGrid.vue";
-import { gridDescribe } from "../grid/api";
 import type { Engine } from "../grid/types";
 import Icon from "../shell/Icon.vue";
 import { tabHasPending } from "../shell/close-guard";
@@ -24,7 +23,7 @@ import { buildInsertText, registerEditor, setEditorFocus, unregisterEditor, type
 import { loadSettings, onSettingsSaved, type EditorTheme } from "../shell/settings";
 import { connectionStatusText, type ConnectionStatus } from "../shell/status-text";
 import type { QueryTarget } from "../shell/session";
-import { ambiguousFieldNote, cachedColumns, fieldFailureNote, loadFields, qualifierFor, unknownFieldNote } from "./columns";
+import { ambiguousFieldNote, iterateCachedColumns, fieldFailureNote, loadFields, loadForeignKeys, qualifierFor, unknownFieldNote } from "./columns";
 import { tr as t } from "../i18n";
 import { completionPlan, connectionById, metadataNote, statementContext, targetDetail, targetKey, targetOptions, type CompletionObject, type CompletionSource, type TargetOption } from "./complete";
 import { bumpIdentifiers, loadFrequency, type FrequencyMap } from "./completion/frequency";
@@ -138,11 +137,12 @@ const buttonLabel = computed(() => {
   const engine = buttonEngine.value ? engineMeta(buttonEngine.value).label : "";
   return t("query.target.buttonLabel", { engine, conn: props.connectionName, db: props.database || "main" }).replace(/\s+/g, " ").trim();
 });
+const completionConnection = computed(() => connectionById(catalogConnections(), props.connectionId));
+const completionMetadata = computed(() => metadataNote(completionConnection.value, props.connectionId ? props.database : null));
 const hint = computed(() => {
-  const connection = connectionById(catalogConnections(), props.connectionId);
-  const base = props.connectionId && !connection
+  const base = props.connectionId && !completionConnection.value
     ? { keywordsOnly: true, note: t("query.complete.connGone"), objects: [], failure: false }
-    : metadataNote(connection, props.connectionId ? props.database : null);
+    : completionMetadata.value;
   if (!fieldNote.value) return base;
   return { ...base, note: fieldNote.value };
 });
@@ -299,6 +299,11 @@ function asEngine(value: string | undefined): Engine | undefined {
 }
 
 async function sqlCompletion(context: CompletionContext) {
+  const connection = completionConnection.value;
+  const targetDatabase = props.database;
+  const current = () => alive && !context.aborted && view?.state.doc === context.state.doc
+    && view.state.selection.main.head === context.pos
+    && completionConnection.value === connection && props.database === targetDatabase;
   const doc = context.state.doc.toString();
   const before = doc.slice(0, context.pos);
   if (/--[^\n]*$/.test(before) || openDelimiter(before, props.engine ?? undefined)) return null;
@@ -306,10 +311,9 @@ async function sqlCompletion(context: CompletionContext) {
   const star = context.explicit ? /\*\s*$/.exec(before) : null;
   if (!star && (!word || (word.from === word.to && !context.explicit))) return null;
 
-  const connection = connectionById(catalogConnections(), props.connectionId);
   const ready = Boolean(props.connectionId && connection && props.database != null && connection.status === "connected");
   const database = ready ? props.database : null;
-  const meta = metadataNote(ready ? connection : null, database);
+  const meta = completionMetadata.value;
   const engine = asEngine(props.engine ?? connection?.engine) ?? "postgres";
 
   /* 语句作用域取整条语句（FROM 可能在光标之后），子句只按光标前缀判定。 */
@@ -317,13 +321,14 @@ async function sqlCompletion(context: CompletionContext) {
   const fullStatement = located.refusal ? "" : doc.slice(located.start, located.end);
   const prefixStatement = located.refusal ? "" : doc.slice(located.start, context.pos);
   const scope = located.refusal ? { clause: null, tables: [], ctes: [], target: null } : parseScope(fullStatement);
-  const cursorClause = located.refusal ? null : parseScope(prefixStatement).clause;
-  const parsed = statementContext(prefixStatement, meta.objects);
+  const prefixScope = fullStatement === prefixStatement ? scope : parseScope(prefixStatement);
+  const cursorClause = prefixScope.clause;
   const tables = scope.target ? [...scope.tables, { ...scope.target, alias: scope.target.alias }] : scope.tables;
 
   if (star) {
     if (!ready || !connection || database == null || (cursorClause !== "select" && cursorClause !== null)) return null;
-    const sources = await loadSources(connection, database, engine, tables);
+    const sources = await loadSources(connection, database, engine, tables, current);
+    if (!current()) return null;
     const columns = sources.flatMap((source) => source.columns);
     if (!columns.length) return null;
     const from = context.pos - star[0].length;
@@ -343,20 +348,26 @@ async function sqlCompletion(context: CompletionContext) {
     };
   }
 
-  const qualified = qualifierFor(word!.text, meta.objects, parsed.aliases);
+  const aliases = word!.text.includes(".") ? statementContext(prefixStatement, meta.objects, prefixScope).aliases : undefined;
+  const qualified = qualifierFor(word!.text, meta.objects, aliases);
 
   if (qualified.kind === "plain") {
     fieldNote.value = "";
-    const sources = ready && connection && database != null ? await loadSources(connection, database, engine, tables) : [];
-    const on = cursorClause === "on" && ready && connection && database != null
-      ? await loadOnConditions(connection, database, engine, scope.tables.slice(-2))
-      : { conditions: [], inferred: [] };
-    const columns = !sources.length && ready ? cachedColumns(connection!.id, database!) : [];
+    const needsColumns = cursorClause !== "from" && cursorClause !== "join" && cursorClause !== "use";
+    const [sources, on] = await Promise.all([
+      needsColumns && ready && connection && database != null ? loadSources(connection, database, engine, tables, current) : [],
+      cursorClause === "on" && ready && connection && database != null
+        ? loadOnConditions(connection, database, engine, scope.tables.slice(-2), current)
+        : { conditions: [], inferred: [] },
+    ]);
+    if (!current()) return null;
+    const columns = needsColumns && !sources.length && ready ? iterateCachedColumns(connection!.id, database!) : [];
     const plan = completionPlan({
       prefix: word!.text,
       connection: ready ? connection : null,
       database,
       engine,
+      metadata: meta,
       columns,
       context: {
         clause: cursorClause,
@@ -395,6 +406,7 @@ async function sqlCompletion(context: CompletionContext) {
     object: qualified.object,
     refresh: context.explicit,
   });
+  if (!current()) return null;
   if (loaded.error) {
     fieldNote.value = fieldFailureNote(qualified.object.label, loaded.error);
     return { from: columnFrom, filter: false, options: [] };
@@ -414,6 +426,7 @@ async function loadSources(
   database: string,
   engine: Engine,
   tables: readonly ScopeTable[],
+  current: () => boolean,
 ): Promise<CompletionSource[]> {
   const index = catalogIndex(connection);
   const picked = tables.slice(-4);
@@ -426,6 +439,7 @@ async function loadSources(
       return { entry, fields };
     }),
   );
+  if (!current()) return [];
   const failed = loaded.filter((item) => item.fields.error);
   fieldNote.value = failed.length ? fieldFailureNote(failed[0]!.entry.object.label, failed[0]!.fields.error ?? "") : fieldNote.value;
   return loaded
@@ -439,6 +453,7 @@ async function loadOnConditions(
   database: string,
   engine: Engine,
   tables: readonly ScopeTable[],
+  current: () => boolean,
 ): Promise<{ conditions: string[]; inferred: string[] }> {
   if (tables.length < 2) return { conditions: [], inferred: [] };
   const index = catalogIndex(connection);
@@ -448,21 +463,17 @@ async function loadOnConditions(
   if (resolved.length < 2) return { conditions: [], inferred: [] };
   const [left, right] = resolved as [{ table: ScopeTable; object: CompletionObject }, { table: ScopeTable; object: CompletionObject }];
   const conditions: string[] = [];
-  for (const [from, to] of [[left, right], [right, left]]) {
-    try {
-      const schema = await gridDescribe(
-        { connectionId: connection.id, database, schema: from.object.schema, table: from.object.name, engine },
-        { includeForeignKeys: true },
-      );
-      for (const key of schema.foreignKeys ?? []) {
-        if (key.refTable.toLowerCase() !== to.object.name.toLowerCase()) continue;
-        key.columns.forEach((column, position) => {
-          const refColumn = key.refColumns[position];
-          if (refColumn) conditions.push(`${from.table.alias}.${column} = ${to.table.alias}.${refColumn}`);
-        });
-      }
-    } catch {
-      /* 外键只是辅助候选，失败不打断补全。 */
+  const keys = await Promise.all([left, right].map((entry) => loadForeignKeys({
+    connectionId: connection.id, database, engine, object: entry.object,
+  })));
+  if (!current()) return { conditions: [], inferred: [] };
+  for (const [from, to, foreignKeys] of [[left, right, keys[0]], [right, left, keys[1]]] as const) {
+    for (const key of foreignKeys) {
+      if (key.refTable.toLowerCase() !== to.object.name.toLowerCase()) continue;
+      key.columns.forEach((column, position) => {
+        const refColumn = key.refColumns[position];
+        if (refColumn) conditions.push(`${from.table.alias}.${column} = ${to.table.alias}.${refColumn}`);
+      });
     }
   }
   if (conditions.length) return { conditions: [...new Set(conditions)], inferred: [] };
@@ -471,21 +482,27 @@ async function loadOnConditions(
   const columnsOf = async (object: CompletionObject) =>
     (await loadFields({ connectionId: connection.id, database, engine, object })).columns;
   const [leftColumns, rightColumns] = await Promise.all([columnsOf(left.object), columnsOf(right.object)]);
+  if (!current()) return { conditions: [], inferred: [] };
   const singular = (name: string) => name.toLowerCase().replace(/s$/, "");
   for (const [from, to, fromColumns, toColumns] of [
     [left, right, leftColumns, rightColumns],
     [right, left, rightColumns, leftColumns],
   ] as const) {
+    const targetColumns = new Map<string, string>();
+    for (const column of toColumns) {
+      const lower = column.toLowerCase();
+      if (!targetColumns.has(lower)) targetColumns.set(lower, column);
+    }
     for (const column of fromColumns) {
       const lower = column.toLowerCase();
       if (!lower.endsWith("_id")) continue;
       if (singular(to.object.name) !== lower.slice(0, -3)) continue;
-      const target = toColumns.find((item) => item.toLowerCase() === "id");
+      const target = targetColumns.get("id");
       if (target) inferred.push(`${from.table.alias}.${column} = ${to.table.alias}.${target}`);
     }
     for (const column of fromColumns) {
       if (column.toLowerCase() === "id") continue;
-      const target = toColumns.find((item) => item.toLowerCase() === column.toLowerCase());
+      const target = targetColumns.get(column.toLowerCase());
       if (target) inferred.push(`${from.table.alias}.${column} = ${to.table.alias}.${target}`);
     }
   }

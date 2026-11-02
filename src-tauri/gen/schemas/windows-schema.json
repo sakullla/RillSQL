@@ -477,6 +477,12 @@
           "markdownDescription": "允许读取一次 SQL 执行的状态和已完成结果。"
         },
         {
+          "description": "Release a completed query snapshot after the frontend receives it.",
+          "type": "string",
+          "const": "allow-query-release",
+          "markdownDescription": "Release a completed query snapshot after the frontend receives it."
+        },
+        {
           "description": "允许删除一条本机保存的查询。",
           "type": "string",
           "const": "allow-query-saved-delete",

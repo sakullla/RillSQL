@@ -1,5 +1,5 @@
 import { gridDescribe } from "../grid/api";
-import type { Engine } from "../grid/types";
+import type { Engine, ForeignKey } from "../grid/types";
 import type { CompletionObject } from "./complete";
 
 export interface CachedFields {
@@ -15,10 +15,14 @@ export interface CachedFields {
 const MAX_TABLES = 200;
 const cache = new Map<string, CachedFields>();
 const inFlight = new Map<string, Promise<CachedFields>>();
+const foreignKeys = new Map<string, ForeignKey[]>();
+const foreignKeysInFlight = new Map<string, Promise<ForeignKey[]>>();
 
 export function clearColumnCache(): void {
   cache.clear();
   inFlight.clear();
+  foreignKeys.clear();
+  foreignKeysInFlight.clear();
 }
 
 /** 供测试与诊断读取当前缓存规模。 */
@@ -32,8 +36,10 @@ export function invalidateColumns(prefix?: string): void {
     clearColumnCache();
     return;
   }
-  for (const key of [...cache.keys()]) {
-    if (key.startsWith(prefix)) cache.delete(key);
+  for (const entries of [cache, inFlight, foreignKeys, foreignKeysInFlight]) {
+    for (const key of entries.keys()) {
+      if (key.startsWith(prefix)) entries.delete(key);
+    }
   }
 }
 
@@ -100,13 +106,16 @@ export function qualifierFor(
 }
 
 export function cachedColumns(connectionId: string, database: string): { label: string; detail: string }[] {
+  return [...iterateCachedColumns(connectionId, database)];
+}
+
+/** 候选生成可以达到上限即停止，不必展开所有已缓存表的字段。 */
+export function* iterateCachedColumns(connectionId: string, database: string): Iterable<{ label: string; detail: string }> {
   const prefix = `${connectionId}\u0000${database}\u0000`;
-  const items: { label: string; detail: string }[] = [];
   for (const [key, entry] of cache) {
     if (!key.startsWith(prefix) || entry.error) continue;
-    for (const column of entry.columns) items.push({ label: column, detail: entry.label });
+    for (const column of entry.columns) yield { label: column, detail: entry.label };
   }
-  return items;
 }
 
 export function fieldFailureNote(label: string, error: string): string {
@@ -128,13 +137,45 @@ function errorText(err: unknown): string {
   return tr("query.columns.failed");
 }
 
-export async function loadFields(input: {
+interface FieldRequest {
   connectionId: string;
   database: string;
   engine: Engine;
   object: CompletionObject;
   refresh?: boolean;
-}): Promise<CachedFields> {
+}
+
+/** 外键独立按需读取，保留精简结果；与字段共享失效边界和 200 表 LRU 上限。 */
+export async function loadForeignKeys(input: FieldRequest): Promise<ForeignKey[]> {
+  const key = columnKey(input.connectionId, input.database, input.object.schema, input.object.name);
+  const running = foreignKeysInFlight.get(key);
+  if (running) return running;
+  const cached = foreignKeys.get(key);
+  if (cached && !input.refresh) {
+    foreignKeys.delete(key);
+    foreignKeys.set(key, cached);
+    return cached;
+  }
+  const request = gridDescribe({
+    connectionId: input.connectionId, database: input.database, engine: input.engine,
+    schema: input.object.schema, table: input.object.name,
+  }, { includeForeignKeys: true })
+    .then((schema) => schema.foreignKeys ?? [], () => [])
+    .then((keys) => {
+      // 断开/刷新期间返回的旧请求不能把已失效的数据重新写入。
+      if (foreignKeysInFlight.get(key) === request) {
+        foreignKeysInFlight.delete(key);
+        foreignKeys.delete(key);
+        foreignKeys.set(key, keys);
+        if (foreignKeys.size > MAX_TABLES) foreignKeys.delete(foreignKeys.keys().next().value!);
+      }
+      return keys;
+    });
+  foreignKeysInFlight.set(key, request);
+  return request;
+}
+
+export async function loadFields(input: FieldRequest): Promise<CachedFields> {
   const key = columnKey(input.connectionId, input.database, input.object.schema, input.object.name);
   const running = inFlight.get(key);
   if (running) return running;
@@ -150,6 +191,7 @@ export async function loadFields(input: {
     label: input.object.label,
   };
   let request: Promise<CachedFields> | null = null;
+  const save = (entry: CachedFields) => inFlight.get(key) === request ? remember(key, entry) : entry;
   request = (async (): Promise<CachedFields> => {
     try {
       const schema = await gridDescribe({
@@ -159,9 +201,9 @@ export async function loadFields(input: {
         table: input.object.name,
         engine: input.engine,
       });
-      return remember(key, { ...base, columns: schema.columns.map((column) => column.name), error: null });
+      return save({ ...base, columns: schema.columns.map((column) => column.name), error: null });
     } catch (err) {
-      return remember(key, { ...base, columns: [], error: errorText(err) });
+      return save({ ...base, columns: [], error: errorText(err) });
     } finally {
       if (request && inFlight.get(key) === request) inFlight.delete(key);
     }

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { tr as t } from "../i18n";
-import { computed, ref, watch, type ComponentPublicInstance } from "vue";
+import { computed, onBeforeUnmount, ref, shallowRef, watch, type ComponentPublicInstance } from "vue";
 import type { ListboxOption } from "../ui/types";
 import Listbox from "../ui/Listbox.vue";
 import { catalogConnections } from "../catalog/store";
@@ -21,7 +21,6 @@ import {
   type ImportSeed,
   type ParsedImport,
 } from "./import";
-import { parseImportXlsx } from "./xlsx";
 
 const props = defineProps<{
   open: boolean;
@@ -43,7 +42,9 @@ const lastBytes = ref<Uint8Array | null>(null);
 const tableKey = ref("");
 const localSchema = ref<TableSchema | null>(null);
 const localTarget = ref<TableTarget | null>(null);
-const parsed = ref<ParsedImport | null>(null);
+const parsed = shallowRef<ParsedImport | null>(null);
+let parseVersion = 0;
+let fileVersion = 0;
 const mapping = ref<Record<string, string>>({});
 const parseError = ref("");
 const resultText = ref("");
@@ -81,6 +82,8 @@ function keyOf(schema: string, table: string): string {
 
 /** 打开时的复位；拖放 seed 在复位后直接走 applyText，与手动选文件同一条解析路径。 */
 function resetForOpen(): void {
+  parseVersion += 1;
+  fileVersion += 1;
   lastText.value = "";
   lastBytes.value = null;
   parsed.value = null;
@@ -104,15 +107,26 @@ function resetForOpen(): void {
 
 watch(() => props.open, (open) => {
   if (open) resetForOpen();
+  else releaseImportData();
 });
 
+function releaseImportData() {
+  parseVersion += 1;
+  fileVersion += 1;
+  parsed.value = null;
+  lastText.value = "";
+  lastBytes.value = null;
+}
+onBeforeUnmount(releaseImportData);
+
 watch(format, (next) => {
+  parseVersion += 1;
   parsed.value = null;
   mapping.value = {};
   parseError.value = "";
   resultText.value = "";
   if (next === "xlsx") {
-    if (lastBytes.value) applyBytes(lastBytes.value);
+    if (lastBytes.value) void applyBytes(lastBytes.value);
     return;
   }
   if (lastText.value) applyText(lastText.value);
@@ -173,7 +187,16 @@ async function chooseTable() {
   }
 }
 
-function applyBytes(bytes: Uint8Array) {
+async function applyBytes(bytes: Uint8Array) {
+  const version = ++parseVersion;
+  let parseImportXlsx: typeof import("./xlsx").parseImportXlsx;
+  try {
+    ({ parseImportXlsx } = await import("./xlsx"));
+  } catch (error) {
+    if (version === parseVersion) parseError.value = error instanceof Error ? error.message : String(error);
+    return;
+  }
+  if (version !== parseVersion || !props.open) return;
   const outcome = parseImportXlsx(bytes);
   if (!outcome.ok) {
     parseError.value = outcome.reason;
@@ -187,6 +210,7 @@ function applyBytes(bytes: Uint8Array) {
 }
 
 function applyText(text: string) {
+  parseVersion += 1;
   const outcome = format.value === "json" ? parseImportJson(text) : parseImportCsv(text, delimiter.value);
   if (!outcome.ok) {
     parseError.value = outcome.reason;
@@ -200,19 +224,23 @@ function applyText(text: string) {
 }
 
 async function onFile(event: Event) {
+  const version = ++fileVersion;
+  parseVersion += 1;
   const file = (event.target as HTMLInputElement).files?.[0];
   resultText.value = "";
   parsed.value = null;
   if (!file) return;
   if (format.value === "xlsx" || file.name.toLowerCase().endsWith(".xlsx")) {
     const bytes = new Uint8Array(await file.arrayBuffer());
+    if (version !== fileVersion || !props.open) return;
     lastBytes.value = bytes;
     lastText.value = "";
     if (format.value !== "xlsx") format.value = "xlsx";
-    else applyBytes(bytes);
+    else await applyBytes(bytes);
     return;
   }
   const text = await file.text();
+  if (version !== fileVersion || !props.open) return;
   lastText.value = text;
   lastBytes.value = null;
   applyText(text);

@@ -20,13 +20,21 @@ async function pickOption(targetPage, comboboxName, optionName) {
   await targetPage.getByRole("option", { name: optionName, exact: true }).click();
 }
 const errors = [];
+const spreadsheetScripts = [];
+page.on("request", request => {
+  if (request.resourceType() === "script" && !request.url().includes("/xlsx-preview") && /\/(?:xlsx(?:-[^/]*)?\.js|xlsx\.ts|@e965_xlsx[^/]*\.js)(?:\?|$)/.test(request.url())) {
+    spreadsheetScripts.push(request.url());
+  }
+});
 page.on("pageerror", error => errors.push(error.message));
 try {
   await page.addInitScript(installSyntheticIpc, "dark");
   await page.addInitScript(() => {
+    window.__releasedQueryRuns = [];
     const invoke = window.__TAURI_INTERNALS__.invoke;
     window.__TAURI_INTERNALS__.invoke = async (command, args) => {
       const result = await invoke(command, args);
+      if (command === "query_release") window.__releasedQueryRuns.push(args.runId);
       // SQL Server 的 SHOWPLAN_ALL 批次返回计划行集，不套用大结果集改写。
       if (command === "query_start" && result.engine !== "sqlserver") {
         result.statements[0].columns = Array.from({ length: 12 }, (_, i) => i === 0 ? "id" : `column_${i}`);
@@ -54,6 +62,9 @@ try {
   await page.locator("[data-action=run]").click();
   await expect(page.locator(".q-summary")).toContainText("10000 行");
   report.metrics.largeResultReadyMs = Math.round(performance.now() - started);
+  await expect.poll(() => page.evaluate(() => window.__releasedQueryRuns.length)).toBe(1);
+  expect(spreadsheetScripts).toEqual([]);
+  report.checks.push("Completed query releases its backend snapshot; normal querying does not load the Excel codec");
   const rendered = await page.locator("[data-row-id]").count();
   expect(rendered).toBeLessThan(50);
   report.metrics.renderedRows = rendered;

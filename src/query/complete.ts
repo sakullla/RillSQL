@@ -8,7 +8,7 @@ import { dialectAssets, quoteIdentifier } from "./completion/dialect";
 import { functionCatalog, functionDetail } from "./completion/functions";
 import { rankBy, matchKind } from "./completion/rank";
 import { snippetCandidates } from "./completion/snippets";
-import { parseScope } from "./completion/scope";
+import { parseScope, type StatementScope } from "./completion/scope";
 
 export const SQL_KEYWORDS = [
   "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "NULL", "IS", "IN", "EXISTS",
@@ -107,8 +107,7 @@ export interface StatementContext {
 }
 
 /** 光标前当前语句的子句与 FROM/JOIN 表别名；解析不到子句时 clause 为 null，调用方回退原有行为。 */
-export function statementContext(statementBefore: string, objects: readonly CompletionObject[]): StatementContext {
-  const scope = parseScope(statementBefore);
+export function statementContext(statementBefore: string, objects: readonly CompletionObject[], scope: StatementScope = parseScope(statementBefore)): StatementContext {
   const aliases = new Map<string, CompletionObject>();
   for (const table of scope.tables) {
     const match = objects.find((object) => object.name.toLowerCase() === table.name.toLowerCase() && (!table.schema || object.schema.toLowerCase() === table.schema.toLowerCase()));
@@ -150,72 +149,80 @@ function frequencyWeight(frequency: Readonly<Record<string, number>> | undefined
 }
 
 /** 按候选的标签做一次前缀/子序列筛选并保留顺序语义。 */
-function rankItems(items: readonly CompletionItem[], prefix: string, cap = 40): CompletionItem[] {
-  const matched = items.filter((item) => matchKind(item.label, prefix) >= 0);
-  return rankBy(matched, prefix, (item) => item.label).slice(0, cap);
+function rankItems(items: Iterable<CompletionItem>, prefix: string, cap = 40): CompletionItem[] {
+  return rankBy(items, prefix, (item) => item.label, cap);
+}
+
+function* objectCandidates(objects: readonly CompletionObject[]): Iterable<CompletionItem> {
+  for (const object of objects) {
+    yield { label: object.label, kind: object.kind, detail: "" };
+    if (object.name.toLowerCase() !== object.label.toLowerCase()) {
+      yield { label: object.name, kind: object.kind, detail: "" };
+    }
+  }
 }
 
 export function completionPlan(input: {
   prefix: string;
   connection: CatalogConnection | null;
   database: string | null;
-  columns?: readonly CachedColumn[];
+  columns?: Iterable<CachedColumn>;
   context?: CompletionContext;
   engine?: Engine;
+  /** 编辑器按目录/语言变化重算，按键期间复用。 */
+  metadata?: MetadataNote;
 }): {
   items: CompletionItem[];
   note: string;
   keywordsOnly: boolean;
 } {
-  const meta = metadataNote(input.connection, input.database);
+  const meta = input.metadata ?? metadataNote(input.connection, input.database);
   const prefix = input.prefix;
   const clause = input.context?.clause ?? null;
   const engine: Engine = input.engine ?? input.connection?.engine ?? "postgres";
   const assets = dialectAssets(engine);
+  const relationClause = clause === "from" || clause === "join";
+  const generalClause = !relationClause && clause !== "on" && clause !== "set" && clause !== "values" && clause !== "use";
 
-  const objectItems: CompletionItem[] = [];
-  if (!meta.keywordsOnly) {
-    for (const object of meta.objects) {
-      objectItems.push({ label: object.label, kind: object.kind, detail: tr(KIND_LABEL[object.kind]) });
-      if (object.name.toLowerCase() !== object.label.toLowerCase()) {
-        objectItems.push({ label: object.name, kind: object.kind, detail: tr(KIND_LABEL[object.kind]) });
-      }
-    }
-  }
+  const objectsNeeded = !meta.keywordsOnly && clause !== "on" && clause !== "set" && clause !== "values" && clause !== "use";
+  const objectItems: CompletionItem[] = objectsNeeded
+    ? rankItems(objectCandidates(meta.objects), prefix).map((item) => ({ ...item, detail: tr(KIND_LABEL[item.kind as ObjectKind]) }))
+    : [];
 
   const sources = input.context?.sources ?? [];
   const onTables = new Set((input.context?.onTables ?? []).map((item) => item.toLowerCase()));
   const targetTable = input.context?.targetTable?.toLowerCase() ?? null;
-  const columnItems: CompletionItem[] = [];
-  if (!meta.keywordsOnly && clause !== "from" && clause !== "join") {
+  function* columnCandidates(): Iterable<CompletionItem> {
+    if (meta.keywordsOnly || relationClause || clause === "use") return;
     for (const source of sources) {
       const inOn = clause !== "on" || onTables.size === 0 || onTables.has(source.alias.toLowerCase()) || onTables.has(source.label.toLowerCase());
       if (!inOn) continue;
       const inTarget = clause !== "set" && clause !== "values" ? true : !targetTable || targetTable === source.alias.toLowerCase() || targetTable === source.label.toLowerCase() || targetTable === source.label.split(".").pop()?.toLowerCase();
       if (!inTarget) continue;
-      for (const column of source.columns) columnItems.push({ label: column, kind: "column", detail: source.label });
+      for (const column of source.columns) yield { label: column, kind: "column", detail: source.label };
     }
     if (!sources.length && clause !== "on") {
-      for (const column of input.columns ?? []) columnItems.push({ label: column.label, kind: "column", detail: column.detail });
+      for (const column of input.columns ?? []) yield { label: column.label, kind: "column", detail: column.detail };
     }
   }
+  const columnItems = columnCandidates();
 
-  const databaseItems: CompletionItem[] = (input.connection?.databases ?? []).map((item) => ({ label: item.name, kind: "database" as const, detail: tr("query.complete.database") }));
+  const databaseItems: CompletionItem[] = (generalClause || clause === "use" ? input.connection?.databases ?? [] : []).map((item) => ({ label: item.name, kind: "database" as const, detail: tr("query.complete.database") }));
   const current = input.connection?.databases.find((item) => item.name === input.database);
-  const schemaItems: CompletionItem[] = (current?.schemas ?? [])
+  const schemaItems: CompletionItem[] = (generalClause ? current?.schemas ?? [] : [])
     .map((item) => item.name)
     .filter(Boolean)
     .map((name) => ({ label: name, kind: "schema" as const, detail: tr("query.complete.schema") }));
-  const cteItems: CompletionItem[] = (input.context?.ctes ?? []).map((name) => ({ label: name, kind: "cte" as const, detail: tr("query.complete.cte") }));
-  const functionItems: CompletionItem[] = functionCatalog(engine)
+  const cteItems: CompletionItem[] = (generalClause || relationClause ? input.context?.ctes ?? [] : []).map((name) => ({ label: name, kind: "cte" as const, detail: tr("query.complete.cte") }));
+  const functionItems: CompletionItem[] = (generalClause ? functionCatalog(engine) : [])
     .filter((name) => matchKind(name, prefix) >= 0)
     .slice(0, 40)
     .map((name) => ({ label: name, kind: "function" as const, detail: functionDetail(engine, name) }));
-  const keywordItems: CompletionItem[] = assets.keywords
+  const keywordItems: CompletionItem[] = (generalClause || relationClause ? assets.keywords : [])
     .filter((keyword) => matchKind(keyword, prefix) >= 0 && keyword.toUpperCase() !== prefix.toUpperCase())
     .slice(0, 40)
     .map((keyword) => ({ label: keyword.toUpperCase(), kind: "keyword" as const, detail: tr("query.complete.keyword") }));
-  const snippetItems: CompletionItem[] = clause === "from" || clause === "join"
+  const snippetItems: CompletionItem[] = !generalClause
     ? []
     : snippetCandidates(prefix).map((item) => ({ label: item.label, kind: "snippet" as const, detail: item.detail }));
 

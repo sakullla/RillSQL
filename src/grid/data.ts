@@ -46,6 +46,11 @@ export function locatorFrom(schema: TableSchema, cells: Record<string, Cell | un
 
 export function refreshLocated(schema: TableSchema, rows: Row[]): void {
   const locators = rows.map((row) => locatorFrom(schema, row.cells));
+  const keys = locators.map((locator) => locator ? JSON.stringify(locator.values) : null);
+  const counts = new Map<string, number>();
+  for (const key of keys) {
+    if (key !== null) counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
   rows.forEach((row, index) => {
     const locator = locators[index] ?? null;
     if (!locator) {
@@ -53,7 +58,7 @@ export function refreshLocated(schema: TableSchema, rows: Row[]): void {
       row.located = false;
       return;
     }
-    const copies = locators.filter((item) => sameLocator(item, locator)).length;
+    const copies = counts.get(keys[index]!);
     row.locator = copies === 1 ? locator : null;
     row.located = copies === 1;
   });
@@ -235,7 +240,8 @@ export function commitChanges(store: TableStore, changes: readonly Change[]): Co
 /** 查询结果的查找和排序只接收已经读入的行，不会回表。 */
 export function viewLoadedRows(rows: readonly Row[], columns: readonly Column[], find: string, sort: SortSpec | null): { rows: Row[]; note: string } {
   const needle = find.trim().toLowerCase();
-  let next = rows.map(copyRow);
+  // 查找/排序只改变视图顺序，不修改行；共享单元格，避免每次复制整个结果集。
+  let next = [...rows];
   if (needle) {
     next = next.filter((row) =>
       columns.some((column) => {

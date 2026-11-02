@@ -12,7 +12,6 @@ import { renderMarkdown } from "./markdown";
 import type { ExportPlan } from "./plan";
 import type { ExportFormat, WriteControl, WriteResult } from "./write";
 import { isNativeExport, writeNativeCsv } from "./native";
-import { renderXlsx } from "./xlsx";
 
 export interface ExportTask {
   id: string;
@@ -105,7 +104,7 @@ export function renderExportText(options: {
   return renderCsv(options.columns, options.rows, options.csv);
 }
 
-function exportLoadedInBrowser(options: {
+async function exportLoadedInBrowser(options: {
   plan: ExportPlan;
   acknowledged: boolean;
   path: string;
@@ -115,7 +114,7 @@ function exportLoadedInBrowser(options: {
   format?: ExportFormat;
   insert?: InsertTarget;
   readRows?: () => readonly Record<string, CsvCell>[];
-}): WriteResult {
+}): Promise<WriteResult> {
   if (!options.plan.allowed) return blockedExport(options.plan.rejectReason ?? tr("export.tasks.blockedExport"));
   if (options.plan.reexecutes && !options.acknowledged) return blockedExport(tr("export.tasks.needAck"));
   if ((options.format ?? "csv") === "insert" && !options.insert?.name) return blockedExport(tr("export.tasks.noInsertTarget"));
@@ -127,7 +126,10 @@ function exportLoadedInBrowser(options: {
     rows = options.readRows();
   }
   const fileName = options.path.split(/[/\\]/).pop() || options.plan.fileName;
-  if ((options.format ?? "csv") === "xlsx") downloadBytes(fileName, renderXlsx(options.columns, rows), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  if ((options.format ?? "csv") === "xlsx") {
+    const { renderXlsx } = await import("./xlsx");
+    downloadBytes(fileName, renderXlsx(options.columns, rows), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  }
   else downloadCsv(fileName, renderExportText({ ...options, rows }));
   let message = tr("export.tasks.downloaded", { n: rows.length, name: fileName });
   if (options.plan.partial) message = tr("export.tasks.downloadedPartial", { n: rows.length, name: fileName });
@@ -201,7 +203,7 @@ export async function runExportTask(options: {
           message: `${tr("export.tasks.exportedTo", { n: options.rows.length, path: options.path })}${options.plan.partial ? tr("export.tasks.partialOnly") : ""}`,
         };
       }
-    } else result = import.meta.env.VITEST ? await startExportOnNode(options, task) : exportLoadedInBrowser(options);
+    } else result = import.meta.env.VITEST ? await startExportOnNode(options, task) : await exportLoadedInBrowser(options);
   } catch (error) {
     result = { status: "failed", success: false, writtenRows: 0, path: null, residualPath: null, readCalled: false,
       message: tr("export.tasks.exportFailed", { error: error instanceof Error ? error.message : String(error) }) };

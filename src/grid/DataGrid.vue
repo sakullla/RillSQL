@@ -10,7 +10,7 @@ import type { ExportFormat } from "../export/write";
 import type { InsertTarget } from "../export/insert";
 import { catalogConnections } from "../catalog/store";
 import { registerPending } from "../shell/close-guard";
-import { loadSettings } from "../shell/settings";
+import { useGridSettings } from "./settings";
 import { describeStructure } from "../structure/api";
 import type { StructureForeignKey } from "../structure/types";
 import { rectangleSelection, selectionTsv, type CellPoint } from "./clipboard";
@@ -32,11 +32,12 @@ const emit = defineEmits<{
 }>();
 /* 错误卡语义图标：圆 + 叉，与对象树/历史/导出等处的统一 err 线稿一致 */
 const ERROR_ICON = "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6";
-const session = props.target ? reactive(new LiveTable(props.target, props.pageSize ?? loadSettings().pageSize)) : null;
+const settings = useGridSettings();
+const session = props.target ? reactive(new LiveTable(props.target, props.pageSize ?? settings.value.pageSize)) : null;
 if (session) void session.open();
 /** 设置页的预览上限对网格立即生效，避免“改了没反应”。 */
 function previewBytes(): number {
-  return Math.max(1, loadSettings().previewKB) * 1024;
+  return Math.max(1, settings.value.previewKB) * 1024;
 }
 let releasePending: (() => void) | null = null;
 function releaseCellPending(): void {
@@ -669,7 +670,7 @@ async function copySelection() {
       return;
     }
   }
-  const text = selectionTsv(points, (point) => copyCellText(session.cellValue(point.row, point.column), props.nullCopy ?? loadSettings().nullCopy, columns.value.find((item) => item.name === point.column), session.rowById(point.row)?.resolved === true));
+  const text = selectionTsv(points, (point) => copyCellText(session.cellValue(point.row, point.column), props.nullCopy ?? settings.value.nullCopy, columns.value.find((item) => item.name === point.column), session.rowById(point.row)?.resolved === true));
   try {
     await navigator.clipboard.writeText(text);
     copyMessage.value = t("grid.value.copied");
@@ -729,7 +730,7 @@ async function copySelected(asSql: boolean) {
   }
   const column = selectedColumn.value ?? undefined;
   const resolved = session.rowById(session.selectedId)?.resolved === true;
-  const text = asSql ? copySqlValue(selectedRaw.value, column, session.store.schema.engine) : copyCellText(selectedRaw.value, props.nullCopy ?? loadSettings().nullCopy, column, resolved);
+  const text = asSql ? copySqlValue(selectedRaw.value, column, session.store.schema.engine) : copyCellText(selectedRaw.value, props.nullCopy ?? settings.value.nullCopy, column, resolved);
   try {
     await navigator.clipboard.writeText(text);
     copyMessage.value = t("grid.value.copied");

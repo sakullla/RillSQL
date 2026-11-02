@@ -10,7 +10,7 @@ import { renderMarkdown } from "./markdown";
 import { planExport, type ExportOrigin, type ExportScope } from "./plan";
 import { chooseExportPath } from "./native";
 import type { ExportFormat } from "./write";
-import { renderXlsxPreview } from "./xlsx";
+import { renderXlsxPreview } from "./xlsx-preview";
 
 const props = defineProps<{
   open: boolean;

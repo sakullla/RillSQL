@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RunDto } from "./api";
 import { resetQueryRuntime, startTabRun } from "./runtime";
 
-const api = vi.hoisted(() => ({ queryStart: vi.fn(), queryPoll: vi.fn(), queryCancel: vi.fn() }));
+const api = vi.hoisted(() => ({ queryStart: vi.fn(), queryPoll: vi.fn(), queryCancel: vi.fn(), queryRelease: vi.fn().mockResolvedValue(true) }));
 vi.mock("./api", () => api);
 
 const dto = (): RunDto => ({ id: "run", connectionId: "db", connectionName: "DB", database: "main", engine: "postgres", status: "done", cancel: "none", cancelMessage: "", viaSsh: false, freshChannel: false, statements: [], elapsedMs: 0, startedAt: "" });

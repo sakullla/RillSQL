@@ -36,17 +36,7 @@ export function renderXlsx(columns: readonly string[], rows: readonly Record<str
   return asBytes(XLSX.write(book, { type: "array", bookType: "xlsx" }));
 }
 
-export function renderXlsxPreview(columns: readonly string[], rows: readonly Record<string, string | null>[]): string {
-  const lines = [columns.join("\t")];
-  for (const row of rows) {
-    lines.push(columns.map((name) => {
-      const value = row[name];
-      if (value === null || value === undefined || value === "") return "";
-      return value.replaceAll("\t", " ").replaceAll("\n", " ");
-    }).join("\t"));
-  }
-  return lines.join("\r\n");
-}
+export { renderXlsxPreview } from "./xlsx-preview";
 
 function cellText(value: unknown): string | null {
   if (value === null || value === undefined) return null;

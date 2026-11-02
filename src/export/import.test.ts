@@ -361,6 +361,22 @@ describe("xlsx import", () => {
     resetCatalog();
   });
 
+  it("does not restore a file that finishes loading after the dialog closes", async () => {
+    const wrapper = dialog();
+    let release!: (bytes: ArrayBuffer) => void;
+    const file = { name: "late.xlsx", arrayBuffer: () => new Promise<ArrayBuffer>((resolve) => { release = resolve; }) };
+    const input = wrapper.get("input[type='file']");
+    Object.defineProperty(input.element, "files", { value: [file] });
+    await input.trigger("change");
+    await wrapper.setProps({ open: false });
+    release(new Uint8Array(rows).buffer);
+    await flushPromises();
+    await wrapper.setProps({ open: true });
+    expect(wrapper.text()).not.toContain("a@example.com");
+    expect(wrapper.text()).not.toContain("将写入 2 行");
+    wrapper.unmount();
+  });
+
   it("writes mapped rows from the first sheet only", async () => {
     invoke.mockResolvedValue({
       applied: [

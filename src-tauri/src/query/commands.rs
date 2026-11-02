@@ -218,9 +218,9 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
         let batch = exec::run_batch(&parts, limit, &cancel_flag, via_ssh, &driver).await;
         // 目录连接是共享会话，整批结束后把语句超时设置复位，不泄漏到这一批之外。
         let _ = driver.finish().await;
-        finish_run(&slot, &batch, &notices);
         let summary = summary_of(&batch);
         let status = history_status(&batch.status);
+        finish_run(&slot, batch, &notices);
         if let Ok(store) = history_state.history().await {
             let _ = store
                 .finish(&id, &chrono::Utc::now().to_rfc3339(), status, slot.started.elapsed().as_millis() as i64, &summary)
@@ -251,44 +251,44 @@ fn reserve_run(state: &QueryState, snapshot: RunDto, cancel_flag: Arc<AtomicBool
     })
 }
 
-fn finish_run(slot: &RunSlot, batch: &exec::BatchReport, notices: &[String]) {
+fn finish_run(slot: &RunSlot, batch: exec::BatchReport, notices: &[String]) {
     let mut snap = slot.snapshot.lock().expect("snapshot");
     if batch.cancel.phase != "none" {
         snap.cancel = batch.cancel.phase.to_owned();
-        snap.cancel_message = batch.cancel.message.clone();
+        snap.cancel_message = batch.cancel.message;
         snap.fresh_channel = batch.cancel.fresh_channel;
     }
     snap.status = batch.status.to_owned();
     snap.elapsed_ms = u64::try_from(slot.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let mut statements = batch.statements.iter().map(statement_dto).collect::<Vec<_>>();
+    let mut statements = batch.statements.into_iter().map(statement_dto).collect::<Vec<_>>();
     if let Some(first) = statements.first_mut() {
         if !notices.is_empty() {
             let note = notices.join("");
             first.message = if first.message.is_empty() { note } else { format!("{note}{}", first.message) };
         }
     }
-    for (next, previous) in statements.iter_mut().zip(snap.statements.iter()) {
+    for (next, previous) in statements.iter_mut().zip(snap.statements.iter_mut()) {
         let keep = next.rows.is_empty()
             && !previous.rows.is_empty()
             && matches!(next.status.as_str(), "cancelled" | "error" | "unknown");
         if keep {
-            next.columns = previous.columns.clone();
-            next.column_types = previous.column_types.clone();
-            next.rows = previous.rows.clone();
+            next.columns = std::mem::take(&mut previous.columns);
+            next.column_types = std::mem::take(&mut previous.column_types);
+            next.rows = std::mem::take(&mut previous.rows);
             next.truncated = previous.truncated;
         }
     }
     snap.statements = statements;
 }
 
-fn statement_dto(statement: &StatementReport) -> StatementDto {
+fn statement_dto(statement: StatementReport) -> StatementDto {
     StatementDto {
-        sql: statement.sql.clone(),
+        sql: statement.sql,
         status: statement.status.to_owned(),
-        message: statement.message.clone(),
-        columns: statement.columns.clone(),
-        column_types: statement.column_types.clone(),
-        rows: statement.rows.clone(),
+        message: statement.message,
+        columns: statement.columns,
+        column_types: statement.column_types,
+        rows: statement.rows,
         truncated: statement.truncated,
         affected: statement.affected,
     }
@@ -425,6 +425,23 @@ pub async fn poll_run(state: &QueryState, run_id: &str, continue_read: bool) -> 
     Ok(snap)
 }
 
+/// 前端已收到最终快照后释放后端副本；执行中和等待读取的运行仍由原生命周期持有。
+pub fn release_run(state: &QueryState, run_id: &str) -> bool {
+    let mut runs = state.runs.lock().expect("runs");
+    let finished = runs.get(run_id).is_some_and(|slot| {
+        !matches!(slot.snapshot.lock().expect("snapshot").status.as_str(), "running" | "cancel-requested")
+    });
+    if finished {
+        runs.remove(run_id);
+    }
+    finished
+}
+
+#[tauri::command]
+pub fn query_release(query: tauri::State<'_, QueryState>, run_id: String) -> bool {
+    release_run(&query, &run_id)
+}
+
 #[tauri::command]
 pub async fn query_start(connections: tauri::State<'_, ConnectionsState>, query: tauri::State<'_, QueryState>, request: StartRequest) -> Result<RunDto, String> {
     start_run(&connections.service, &query, request).await
@@ -473,4 +490,50 @@ pub async fn query_saved_rename(query: tauri::State<'_, QueryState>, request: Re
 #[tauri::command]
 pub async fn query_saved_delete(query: tauri::State<'_, QueryState>, id: String) -> Result<(), String> {
     query.history().await?.delete_saved(&id).await
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    fn snapshot(id: &str, status: &str) -> RunDto {
+        RunDto {
+            id: id.to_owned(), connection_id: "db".to_owned(), connection_name: "DB".to_owned(),
+            database: "main".to_owned(), engine: "sqlite".to_owned(), status: status.to_owned(),
+            cancel: "none".to_owned(), cancel_message: String::new(), via_ssh: false, fresh_channel: false,
+            statements: vec![StatementDto {
+                sql: "SELECT value".to_owned(), status: "ok".to_owned(), message: String::new(),
+                columns: vec!["value".to_owned()], column_types: vec!["text".to_owned()],
+                rows: vec![vec![Some("x".repeat(1024))]; 1000], truncated: false, affected: None,
+            }],
+            started_at: String::new(), elapsed_ms: 0,
+        }
+    }
+
+    #[test]
+    fn received_results_release_their_backend_allocation() {
+        let state = QueryState::new(PathBuf::new());
+        for index in 0..20 {
+            let id = index.to_string();
+            let mut reservation = reserve_run(&state, snapshot(&id, "done"), Arc::new(AtomicBool::new(false))).unwrap();
+            reservation.active = false;
+            let weak = Arc::downgrade(&reservation.slot);
+            drop(reservation);
+            assert!(release_run(&state, &id));
+            assert!(weak.upgrade().is_none(), "结果集仍被后端持有");
+            assert!(state.runs.lock().unwrap().is_empty());
+            assert!(!release_run(&state, &id));
+        }
+    }
+
+    #[test]
+    fn release_cannot_discard_running_or_cancelling_queries() {
+        for status in ["running", "cancel-requested"] {
+            let state = QueryState::new(PathBuf::new());
+            let reservation = reserve_run(&state, snapshot("active", status), Arc::new(AtomicBool::new(false))).unwrap();
+            assert!(!release_run(&state, "active"));
+            assert!(state.is_connection_busy("db"));
+            assert_eq!(reservation.slot.snapshot.lock().unwrap().statements[0].rows.len(), 1000);
+        }
+    }
 }

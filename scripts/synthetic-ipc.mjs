@@ -657,6 +657,7 @@ export function installSyntheticIpc(initialTheme) {
           if (word === "DBSIZE") return { command: args.command, reply: { kind: "int", text: null, int: 5, items: null } };
           return { command: args.command, reply: { kind: "status", text: "OK", int: null, items: null } };
         }
+        if (command === "query_release") return true;
         if (command === "query_start" || command === "query_poll" || command === "query_cancel") return queryResult(args);
         if (command === "query_history") return history;
         if (command === "query_history_clear") return null;

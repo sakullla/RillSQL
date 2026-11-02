@@ -18,7 +18,7 @@ import { copyCellText, copySqlValue, showCell } from "./display";
 import "./grid.css";
 import Icon from "../shell/Icon.vue";
 import { toast } from "../ui/toast";
-import { loadSettings } from "../shell/settings";
+import { useGridSettings } from "./settings";
 import { locateResultRows, provedEditableColumns, readSingleTable, refusalText, resolveEditableTable, ResultEditSession, type TableHit } from "./result-edit";
 import { rejectWrite, typeCaption, valueFamily } from "./typeset";
 import type { Cell, Column, Engine, Row, SortSpec } from "./types";
@@ -36,6 +36,7 @@ const props = defineProps<{
 }>();
 
 const rootEl = ref<HTMLElement | null>(null);
+const settings = useGridSettings();
 /* 错误卡语义图标：圆 + 叉，与 DataGrid/对象树/历史等处的统一 err 线稿一致 */
 const ERROR_ICON = "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6";
 const find = ref("");
@@ -87,7 +88,7 @@ function tableHits(): TableHit[] {
 
 /** 设置页的预览上限对结果网格也立即生效。 */
 function previewBytes(): number {
-  return Math.max(1, loadSettings().previewKB) * 1024;
+  return Math.max(1, settings.value.previewKB) * 1024;
 }
 
 watch(
@@ -100,6 +101,7 @@ watch(
 async function resolveEdit() {
   // 已经暂存的修改不能被重新解析冲掉；QueryTab 也会在重跑前拦住有暂存的结果。
   if (editSession.value && editSession.value.pendingCount > 0) return;
+  const current = ++generation;
   const run = tabRun(props.tabId);
   if (run && (run.status === "running" || run.status === "cancel-requested")) {
     editSession.value = null;
@@ -107,7 +109,6 @@ async function resolveEdit() {
     reason.value = t("grid.resultEdit.stillRunning");
     return;
   }
-  const current = ++generation;
   editing.value = null;
   commitOpen.value = false;
   editSession.value = null;
@@ -244,6 +245,7 @@ watch(
   { immediate: true },
 );
 onBeforeUnmount(() => {
+  generation += 1;
   releaseCellPending();
   stopDrag();
   resizeUp?.();
@@ -402,7 +404,7 @@ function exportRows(): Record<string, Cell>[] {
 async function copyValue() {
   if (!selected.value) return;
   const column = props.columns.find((item) => item.name === selected.value?.column);
-  const text = copyCellText(selected.value.value, loadSettings().nullCopy, column, true);
+  const text = copyCellText(selected.value.value, settings.value.nullCopy, column, true);
   try { await navigator.clipboard.writeText(text); copyMessage.value = t("grid.value.copied"); }
   catch { copyMessage.value = t("grid.errors.clipboardFailed"); }
 }
@@ -490,7 +492,7 @@ async function copySelection() {
     const column = props.columns.find((item) => item.name === point.column);
     const row = sourceRows.value.find((item) => item.id === point.row);
     const value = editSession.value?.cellValue(point.row, point.column) ?? row?.cells[point.column] ?? null;
-    return copyCellText(value, loadSettings().nullCopy, column, true);
+    return copyCellText(value, settings.value.nullCopy, column, true);
   });
   try {
     await navigator.clipboard.writeText(text);
