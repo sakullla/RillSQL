@@ -63,6 +63,8 @@ const widths = reactive<Record<string, number>>({});
 const anchor = ref<CellPoint | null>(null);
 const focusPoint = ref<CellPoint | null>(null);
 const dragging = ref(false);
+/** 指针捕获目标：捕获期间 pointermove 的 target 会固定在起始格，命中只能按坐标算。 */
+let dragCapture: { pointerId: number; el: Element } | null = null;
 const menu = ref<{ x: number; y: number; row: string; column: string } | null>(null);
 const menuError = ref("");
 /** 值查看器独立于当前单元格：只有右键「查看值」会打开它。 */
@@ -427,8 +429,11 @@ async function copyCellValue(target: CellPoint, asSql: boolean) {
   try {
     await navigator.clipboard.writeText(text);
     copyMessage.value = asSql ? t("grid.value.copiedSqlValue") : t("grid.value.copied");
+    // 查看器默认关闭：单格复制（含复制 SQL 值）的成败都要有全局可见反馈。
+    toast(asSql ? t("grid.value.copiedSqlValue") : t("grid.value.copied"));
   } catch {
     copyMessage.value = t("grid.errors.clipboardFailed");
+    toast(t("grid.errors.clipboardFailed"), "err");
   }
 }
 
@@ -475,14 +480,29 @@ function startResize(name: string, event: PointerEvent) {
   window.addEventListener("pointerup", resizeUp);
 }
 
-/** 用指针落点命中当前网格内的单元格；行 id 可能含冒号，所以按 data-row/data-column 取。 */
-function cellFromEvent(event: Event): CellPoint | null {
-  const hit = event.target instanceof Element ? event.target.closest(".cell-btn") : null;
+/** 从单元格元素读出坐标；行 id 可能含冒号，所以按 data-row/data-column 取。 */
+function pointFromElement(el: Element | null): CellPoint | null {
+  const hit = el?.closest(".cell-btn") ?? null;
   if (!hit || !rootEl.value?.contains(hit)) return null;
   const row = hit.getAttribute("data-row");
   const column = hit.getAttribute("data-column");
   if (!row || !column) return null;
   return { row, column };
+}
+
+/** 捕获期间只能用坐标命中：事件目标一直是起始格，按目标算会永远停在锚点。 */
+function pointAt(x: number, y: number): CellPoint | null {
+  if (typeof document.elementFromPoint !== "function") return null;
+  return pointFromElement(document.elementFromPoint(x, y));
+}
+
+/** 指针落点命中：有捕获时按坐标，没有捕获（合成事件、旧实现）时退回事件目标。 */
+function cellFromEvent(event: PointerEvent): CellPoint | null {
+  if (dragCapture) {
+    if (!Number.isFinite(event.clientX) || !Number.isFinite(event.clientY)) return null;
+    return pointAt(event.clientX, event.clientY);
+  }
+  return pointFromElement(event.target instanceof Element ? event.target : null);
 }
 
 function samePoint(a: CellPoint | null, b: CellPoint | null): boolean {
@@ -497,12 +517,42 @@ function onDragMove(event: PointerEvent) {
   focusPoint.value = hit;
 }
 
-/** 结束拖动并摘下全部窗口监听；pointerup 与 pointercancel 共用。 */
+/** 结束拖动并摘下全部捕获与监听；pointerup、pointercancel、window blur 共用。 */
 function stopDrag() {
   dragging.value = false;
+  releaseCapture();
   window.removeEventListener("pointermove", onDragMove);
   window.removeEventListener("pointerup", onDragEnd);
   window.removeEventListener("pointercancel", onDragCancel);
+  window.removeEventListener("blur", onDragCancel);
+}
+
+/** 捕获指针，保证拖出窗口后仍能收到 move/up；合成事件拿不到捕获就退回事件目标。 */
+function capturePointer(el: Element | null, pointerId: number | undefined): void {
+  dragCapture = null;
+  if (!el || pointerId === undefined || pointerId < 0) return;
+  const target = el as Element & { setPointerCapture?: (id: number) => void };
+  if (typeof target.setPointerCapture !== "function") return;
+  try {
+    target.setPointerCapture(pointerId);
+    dragCapture = { pointerId, el };
+  } catch {
+    dragCapture = null;
+  }
+}
+
+/** 释放捕获；指针已经结束时浏览器会自行收尾，这里的失败可以忽略。 */
+function releaseCapture(): void {
+  const current = dragCapture;
+  dragCapture = null;
+  if (!current) return;
+  const target = current.el as Element & { releasePointerCapture?: (id: number) => void };
+  if (typeof target.releasePointerCapture !== "function") return;
+  try {
+    target.releasePointerCapture(current.pointerId);
+  } catch {
+    // 指针已结束或元素已移除。
+  }
 }
 
 function onDragEnd(event: PointerEvent) {
@@ -522,14 +572,19 @@ function onDragCancel() {
 
 function onCellDown(row: string, column: string, event: PointerEvent) {
   if (event.button !== 0) return;
+  // 上一次拖动没收到 up（例如在窗口外松开）时先收尾，避免残留监听叠加。
+  stopDrag();
   anchor.value = { row, column };
   focusPoint.value = { row, column };
   dragging.value = true;
   menu.value = null;
   inspect(row, props.columns.findIndex((item) => item.name === column));
+  capturePointer((event.currentTarget as Element | null) ?? (event.target instanceof Element ? event.target : null), event.pointerId);
   window.addEventListener("pointermove", onDragMove);
   window.addEventListener("pointerup", onDragEnd);
   window.addEventListener("pointercancel", onDragCancel);
+  // 窗口失焦收不到 pointerup：作为兜底结束拖动，不留下卡住的 dragging。
+  window.addEventListener("blur", onDragCancel);
 }
 
 /** pointerenter 只是快速移动的兜底：同样只移动可见终点。 */
@@ -537,6 +592,17 @@ function onCellEnter(row: string, column: string) {
   if (!dragging.value) return;
   if (samePoint(focusPoint.value, { row, column })) return;
   focusPoint.value = { row, column };
+}
+
+/** 键盘触发的 contextmenu 坐标是 0：用目标单元格的矩形定位，菜单不会跑到左上角。 */
+function menuPosition(event: MouseEvent): { x: number; y: number } {
+  const x = event.clientX;
+  const y = event.clientY;
+  if (Number.isFinite(x) && Number.isFinite(y) && (x !== 0 || y !== 0)) return { x, y };
+  const el = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+  const rect = el?.getBoundingClientRect();
+  if (!rect || (!rect.width && !rect.height)) return { x: Number.isFinite(x) ? x : 0, y: Number.isFinite(y) ? y : 0 };
+  return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
 }
 
 function onCellMenu(row: string, column: string, event: MouseEvent) {
@@ -550,7 +616,7 @@ function onCellMenu(row: string, column: string, event: MouseEvent) {
   const alreadyViewed = viewer.value?.row === row && viewer.value?.column === column;
   if (!alreadyViewed) inspect(row, props.columns.findIndex((item) => item.name === column));
   menuError.value = "";
-  menu.value = { x: event.clientX, y: event.clientY, row, column };
+  menu.value = { ...menuPosition(event), row, column };
 }
 
 /** 右键「查看值」：以右键单元格为目标建立选择并显式打开查看器。 */
@@ -590,6 +656,7 @@ async function copySelection() {
     toast(t("grid.menu.copiedCells", { n: points.length }));
   } catch {
     copyMessage.value = t("grid.errors.clipboardFailed");
+    toast(t("grid.errors.clipboardFailed"), "err");
   }
 }
 

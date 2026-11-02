@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resetExportTasks } from "../export/tasks";
 import { resetCatalog } from "../catalog/store";
 import { resetCloseGuard } from "../shell/close-guard";
+import { toasts } from "../ui/toast";
 import { rectangleSelection, selectionTsv, toTsv } from "./clipboard";
 import { copyCellText, showCell } from "./display";
 import DataGrid from "./DataGrid.vue";
@@ -771,6 +772,190 @@ describe("data grid pointer selection and on-demand value viewer", () => {
     expect(writeText).toHaveBeenCalledWith("1\t小河\n2\t客户2");
     wrapper.unmount();
   });
+
+  /** 查看器默认关闭：复制 SQL 值的成败都必须落在全局轻提示上。 */
+  it("keeps SQL-value copy feedback visible while the viewer stays closed", async () => {
+    const wrapper = mountCustomers("table:copy-toast");
+    await flushPromises();
+    await wrapper.get("[data-cell='1:name']").trigger("pointerdown");
+    await wrapper.get("[data-cell='1:name']").trigger("pointerup");
+    await flushPromises();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    toasts.splice(0, toasts.length);
+    await wrapper.get(".grid-scroll").trigger("keydown", { ctrlKey: true, shiftKey: true, key: "c" });
+    await flushPromises();
+    expect(writeText).toHaveBeenLastCalledWith("'小河'");
+    expect(toasts.map((item) => item.text)).toEqual(["已复制 SQL 值"]);
+    expect(toasts[0]?.tone).toBe("ok");
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    writeText.mockRejectedValueOnce(new Error("denied"));
+    toasts.splice(0, toasts.length);
+    await wrapper.get(".grid-scroll").trigger("keydown", { ctrlKey: true, shiftKey: true, key: "c" });
+    await flushPromises();
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]?.tone).toBe("err");
+    expect(toasts[0]?.text).toContain("复制失败");
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("closes an opened viewer on arrow-key navigation without reopening it", async () => {
+    const wrapper = mountCustomers("table:viewer-keys");
+    await flushPromises();
+    await openViewer(wrapper, "1:name");
+    expect(wrapper.find(".inspector").exists()).toBe(true);
+
+    await wrapper.get(".grid-scroll").trigger("keydown", { key: "ArrowRight" });
+    await flushPromises();
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("1:email");
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    await wrapper.get(".grid-scroll").trigger("keydown", { key: "ArrowDown" });
+    await flushPromises();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    // Shift+方向键扩展选区同样不重开查看器。
+    await wrapper.get(".grid-scroll").trigger("keydown", { key: "ArrowDown", shiftKey: true });
+    await flushPromises();
+    expect(wrapper.find("button.cell-btn.range").exists()).toBe(true);
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("ignores a pointerup that follows pointercancel", async () => {
+    const wrapper = mountCustomers("table:cancel-then-up");
+    await flushPromises();
+    await wrapper.get("[data-cell='1:id']").trigger("pointerdown");
+    pointerMove(wrapper.get("[data-cell='2:name']").element);
+    await nextTick();
+    window.dispatchEvent(new PointerEvent("pointercancel"));
+    await nextTick();
+    // 取消后紧跟的 up 不能把选中提交到释放点，也不能进入编辑。
+    pointerMove(wrapper.get("[data-cell='3:email']").element, "pointerup");
+    await flushPromises();
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("1:id");
+    expect(rangeCells(wrapper)).toEqual(["1:id", "1:name", "2:id", "2:name"]);
+    expect(wrapper.find("input[aria-label='编辑 email']").exists()).toBe(false);
+    expect(wrapper.find(".pending-bar").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("ends the drag when the window loses focus", async () => {
+    const wrapper = mountCustomers("table:drag-blur");
+    await flushPromises();
+    await wrapper.get("[data-cell='1:id']").trigger("pointerdown");
+    pointerMove(wrapper.get("[data-cell='2:name']").element);
+    await nextTick();
+    expect(rangeCells(wrapper)).toEqual(["1:id", "1:name", "2:id", "2:name"]);
+
+    window.dispatchEvent(new Event("blur"));
+    await nextTick();
+    // 失焦后不再跟随指针，也不把当前单元格提交到释放点。
+    pointerMove(wrapper.get("[data-cell='3:email']").element);
+    pointerMove(wrapper.get("[data-cell='3:email']").element, "pointerup");
+    await flushPromises();
+    expect(rangeCells(wrapper)).toEqual(["1:id", "1:name", "2:id", "2:name"]);
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("1:id");
+    wrapper.unmount();
+  });
+
+  it("keeps the dragged range and its copy consistent after a resize or scroll", async () => {
+    const wrapper = mountCustomers("table:drag-resize");
+    await flushPromises();
+    await wrapper.get("[data-cell='1:id']").trigger("pointerdown");
+    pointerMove(wrapper.get("[data-cell='2:name']").element);
+    await nextTick();
+    expect(rangeCells(wrapper)).toEqual(["1:id", "1:name", "2:id", "2:name"]);
+
+    // 拖选期间改列宽：窗口上的 resize 监听不能把终点或选区改坏。
+    const handle = wrapper.get("[aria-label='调整 name 列宽']");
+    handle.element.dispatchEvent(new PointerEvent("pointerdown", { clientX: 100, bubbles: true }));
+    window.dispatchEvent(new PointerEvent("pointermove", { clientX: 160 }));
+    window.dispatchEvent(new PointerEvent("pointerup"));
+    await flushPromises();
+    expect((handle.element.closest("th") as HTMLElement).style.width).toBe("60px");
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("2:name");
+    expect(rangeCells(wrapper)).toEqual(["1:id", "1:name", "2:id", "2:name"]);
+
+    // 新一次拖动中滚动网格：小数据集的虚拟窗口不换行，命中仍落在指针所在单元格。
+    await wrapper.get("[data-cell='1:id']").trigger("pointerdown");
+    pointerMove(wrapper.get("[data-cell='1:id']").element);
+    wrapper.get(".grid-scroll").element.dispatchEvent(new Event("scroll"));
+    await nextTick();
+    pointerMove(wrapper.get("[data-cell='2:email']").element);
+    pointerMove(wrapper.get("[data-cell='2:email']").element, "pointerup");
+    await flushPromises();
+    expect(rangeCells(wrapper)).toEqual(["1:id", "1:name", "1:email", "2:id", "2:name", "2:email"]);
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("2:email");
+
+    toasts.splice(0, toasts.length);
+    await wrapper.get(".grid-scroll").trigger("keydown", { ctrlKey: true, key: "c" });
+    await flushPromises();
+    expect(writeText).toHaveBeenLastCalledWith("1\t小河\tu1@example.com\n2\t客户2\tu2@example.com");
+    wrapper.unmount();
+  });
+
+  /** 真实指针会拿到捕获：target 固定在起始格，命中必须按坐标，而不是钉在锚点上。 */
+  it("hits by coordinates while the pointer is captured and drops capture on release", async () => {
+    const wrapper = mountCustomers("table:capture-hit");
+    await flushPromises();
+    const start = wrapper.get("[data-cell='1:id']").element as HTMLElement;
+    const captured: number[] = [];
+    const released: number[] = [];
+    start.setPointerCapture = (id: number) => captured.push(id);
+    start.releasePointerCapture = (id: number) => released.push(id);
+    const original = document.elementFromPoint;
+    let hit: Element | null = wrapper.get("[data-cell='3:email']").element;
+    document.elementFromPoint = () => hit;
+
+    start.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, pointerId: 7, clientX: 10, clientY: 10 }));
+    await nextTick();
+    expect(captured).toEqual([7]);
+    // 事件目标仍是起始格，只有坐标命中才能拖到 3:email。
+    start.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, pointerId: 7, clientX: 300, clientY: 300 }));
+    await nextTick();
+    // 1:id → 3:email 是三行三列。
+    expect(rangeCells(wrapper)).toHaveLength(9);
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("1:id");
+
+    // 网格外释放：坐标没有命中时保留最后一个有效区域，不回落到起始格。
+    hit = null;
+    start.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 7, clientX: 900, clientY: 900 }));
+    await flushPromises();
+    expect(released).toEqual([7]);
+    expect(rangeCells(wrapper)).toHaveLength(9);
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("3:email");
+
+    // 捕获指针时浏览器把 click 发到起始格：不能把当前单元格拉回锚点。
+    start.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await flushPromises();
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("3:email");
+    document.elementFromPoint = original;
+    wrapper.unmount();
+  });
+
+  it("anchors a keyboard context menu on the target cell instead of the top-left corner", async () => {
+    const wrapper = mountCustomers("table:menu-keyboard");
+    await flushPromises();
+    const cell = wrapper.get("[data-cell='2:name']").element as HTMLElement;
+    cell.getBoundingClientRect = () =>
+      ({ x: 120, y: 40, left: 120, top: 40, right: 240, bottom: 68, width: 120, height: 28, toJSON: () => ({}) }) as DOMRect;
+    // 键盘触发（Shift+F10/菜单键）没有指针坐标：用单元格矩形定位。
+    await wrapper.get("[data-cell='2:name']").trigger("contextmenu", { clientX: 0, clientY: 0 });
+    await flushPromises();
+    const style = wrapper.get(".cell-menu").attributes("style") ?? "";
+    expect(style).toContain("left: 180px");
+    expect(style).toContain("top: 54px");
+    // 鼠标右键仍按指针坐标。
+    await wrapper.get("[data-cell='1:id']").trigger("contextmenu", { clientX: 12, clientY: 34 });
+    await flushPromises();
+    const pointerStyle = wrapper.get(".cell-menu").attributes("style") ?? "";
+    expect(pointerStyle).toContain("left: 12px");
+    expect(pointerStyle).toContain("top: 34px");
+    wrapper.unmount();
+  });
 });
 
 describe("query result pointer selection and on-demand value viewer", () => {
@@ -862,6 +1047,125 @@ describe("query result pointer selection and on-demand value viewer", () => {
     // 取消之后不再扩展成两行两列。
     expect(rangeCells(wrapper)).toEqual(["r0:id", "r1:id"]);
     expect(wrapper.find(".inspector").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  /** 查看器默认关闭：快捷键和右键“复制 SQL 值”都必须有全局可见回执。 */
+  it("toasts SQL-value copy from the shortcut and from the context menu", async () => {
+    const wrapper = mountResult("query-copy-toast");
+    await flushPromises();
+    await wrapper.get("[data-cell='r0:name']").trigger("pointerdown");
+    await wrapper.get("[data-cell='r0:name']").trigger("pointerup");
+    await flushPromises();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    toasts.splice(0, toasts.length);
+    await wrapper.get(".grid-scroll").trigger("keydown", { ctrlKey: true, shiftKey: true, key: "c" });
+    await flushPromises();
+    expect(writeText).toHaveBeenLastCalledWith("'甲'");
+    expect(toasts.map((item) => item.text)).toEqual(["已复制 SQL 值"]);
+    expect(toasts[0]?.tone).toBe("ok");
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    toasts.splice(0, toasts.length);
+    await wrapper.get("[data-cell='r1:name']").trigger("contextmenu", { clientX: 6, clientY: 66 });
+    await flushPromises();
+    await wrapper.get(".cell-menu").findAll("button").find((button) => button.text() === "复制为 SQL 值")!.trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenLastCalledWith("'乙'");
+    expect(toasts[0]?.text).toBe("已复制 SQL 值");
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    writeText.mockRejectedValueOnce(new Error("denied"));
+    toasts.splice(0, toasts.length);
+    await wrapper.get(".grid-scroll").trigger("keydown", { ctrlKey: true, shiftKey: true, key: "c" });
+    await flushPromises();
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]?.tone).toBe("err");
+    expect(toasts[0]?.text).toContain("复制失败");
+    wrapper.unmount();
+  });
+
+  it("closes an opened query viewer on arrow-key navigation without reopening it", async () => {
+    const wrapper = mountResult("query-viewer-keys");
+    await flushPromises();
+    await wrapper.get("[data-cell='r0:name']").trigger("contextmenu", { clientX: 6, clientY: 66 });
+    await flushPromises();
+    await wrapper.get(".cell-menu [data-action='view-value']").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".inspector").exists()).toBe(true);
+
+    await wrapper.get(".grid-scroll").trigger("keydown", { key: "ArrowRight" });
+    await flushPromises();
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("r1:id");
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    await wrapper.get(".grid-scroll").trigger("keydown", { key: "ArrowDown" });
+    await flushPromises();
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("r0:id");
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    // Shift+方向键扩展选区同样不重开查看器。
+    await wrapper.get(".grid-scroll").trigger("keydown", { key: "ArrowRight", shiftKey: true });
+    await flushPromises();
+    expect(wrapper.find("button.cell-btn.range").exists()).toBe(true);
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("ignores a pointerup that follows pointercancel", async () => {
+    const wrapper = mountResult("query-cancel-then-up");
+    await flushPromises();
+    await wrapper.get("[data-cell='r0:id']").trigger("pointerdown");
+    pointerMove(wrapper.get("[data-cell='r1:id']").element);
+    await nextTick();
+    window.dispatchEvent(new PointerEvent("pointercancel"));
+    await nextTick();
+    // 取消后紧跟的 up 不能把当前单元格提交到释放点。
+    pointerMove(wrapper.get("[data-cell='r1:name']").element, "pointerup");
+    await flushPromises();
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("r0:id");
+    expect(rangeCells(wrapper)).toEqual(["r0:id", "r1:id"]);
+    expect(wrapper.find("input[aria-label='编辑 name']").exists()).toBe(false);
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("ends the drag when the window loses focus", async () => {
+    const wrapper = mountResult("query-drag-blur");
+    await flushPromises();
+    await wrapper.get("[data-cell='r0:id']").trigger("pointerdown");
+    pointerMove(wrapper.get("[data-cell='r1:id']").element);
+    await nextTick();
+    expect(rangeCells(wrapper)).toEqual(["r0:id", "r1:id"]);
+
+    window.dispatchEvent(new Event("blur"));
+    await nextTick();
+    pointerMove(wrapper.get("[data-cell='r1:name']").element);
+    pointerMove(wrapper.get("[data-cell='r1:name']").element, "pointerup");
+    await flushPromises();
+    expect(rangeCells(wrapper)).toEqual(["r0:id", "r1:id"]);
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("r0:id");
+    wrapper.unmount();
+  });
+
+  it("anchors a keyboard context menu on the target cell instead of the top-left corner", async () => {
+    const wrapper = mountResult("query-menu-keyboard");
+    await flushPromises();
+    const cell = wrapper.get("[data-cell='r1:name']").element as HTMLElement;
+    cell.getBoundingClientRect = () =>
+      ({ x: 40, y: 80, left: 40, top: 80, right: 160, bottom: 108, width: 120, height: 28, toJSON: () => ({}) }) as DOMRect;
+    await wrapper.get("[data-cell='r1:name']").trigger("contextmenu", { clientX: 0, clientY: 0 });
+    await flushPromises();
+    const style = wrapper.get(".cell-menu").attributes("style") ?? "";
+    expect(style).toContain("left: 100px");
+    expect(style).toContain("top: 94px");
+
+    await wrapper.get("[data-cell='r0:id']").trigger("contextmenu", { clientX: 22, clientY: 44 });
+    await flushPromises();
+    const pointerStyle = wrapper.get(".cell-menu").attributes("style") ?? "";
+    expect(pointerStyle).toContain("left: 22px");
+    expect(pointerStyle).toContain("top: 44px");
     wrapper.unmount();
   });
 });

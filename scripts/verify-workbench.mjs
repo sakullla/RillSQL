@@ -86,9 +86,43 @@ async function verifyMousePaths(host, theme) {
   const resultRange = await host.locator(".cell-btn.range").count();
   expect(resultRange).toBeGreaterThanOrEqual(4);
   // 复制回执的格数必须等于可见选区，拖动也不进入编辑。
-  await host.keyboard.press("Control+c");
-  await expect(host.locator(".toast").last()).toContainText("已复制 " + resultRange + " 个单元格");
-  expect(await host.locator("input[aria-label^='编辑']").count()).toBe(0);
+    await host.keyboard.press("Control+c");
+    await expect(host.locator(".toast").last()).toContainText("已复制 " + resultRange + " 个单元格");
+    expect(await host.locator("input[aria-label^='编辑']").count()).toBe(0);
+
+    // 查看器默认关闭：Ctrl+Shift+C 的回执必须落在全局轻提示上，不能只写进隐藏的查看器。
+    await host.keyboard.press("Control+Shift+C");
+    await expect(host.locator(".toast").last()).toContainText("已复制 SQL 值");
+    await expect(host.getByRole("region", { name: "查询值查看器" })).toHaveCount(0);
+
+    // 键盘触发的右键菜单没有指针坐标：菜单必须贴在目标单元格上，而不是跑到左上角。
+    await host.locator('[data-cell="r1:id"]').dispatchEvent("contextmenu", { clientX: 0, clientY: 0 });
+    const keyboardMenu = host.locator(".cell-menu");
+    await expect(keyboardMenu).toBeVisible();
+    const keyboardCell = await host.locator('[data-cell="r1:id"]').boundingBox();
+    const keyboardMenuBox = await keyboardMenu.boundingBox();
+    expect(keyboardMenuBox.x).toBeGreaterThan(keyboardCell.x - 4);
+    expect(keyboardMenuBox.y).toBeGreaterThan(keyboardCell.y - 4);
+    // 菜单正好盖住右键格：用事件收尾，避免点不到下面的单元格。
+    await host.locator('[data-cell="r0:column_1"]').dispatchEvent("pointerdown");
+    await host.evaluate(() => window.dispatchEvent(new PointerEvent("pointerup")));
+    await expect(keyboardMenu).toHaveCount(0);
+
+    // 拖出网格后松手：保留最后有效区域，此后移动鼠标不再扩选，也不残留拖动。
+    const gridBox = await host.locator(".grid-scroll").first().boundingBox();
+    const dragCell = await host.locator('[data-cell="r0:id"]').boundingBox();
+    await host.mouse.move(dragCell.x + dragCell.width / 2, dragCell.y + dragCell.height / 2);
+    await host.mouse.down();
+    await host.mouse.move(gridBox.x + gridBox.width / 2, gridBox.y + Math.min(gridBox.height - 6, 90), { steps: 8 });
+    await host.mouse.move(gridBox.x + gridBox.width / 2, gridBox.y + gridBox.height + 24, { steps: 8 });
+    await host.mouse.up();
+    const outsideRange = await host.locator(".cell-btn.range").count();
+    expect(outsideRange).toBeGreaterThanOrEqual(2);
+    const settledCell = await host.locator("button.cell-btn.on").getAttribute("data-cell");
+    await host.mouse.move(dragCell.x + dragCell.width / 2, dragCell.y + dragCell.height / 2);
+    await host.mouse.move(dragCell.x + dragCell.width / 2, dragCell.y + dragCell.height / 2 + 24);
+    expect(await host.locator(".cell-btn.range").count()).toBe(outsideRange);
+    await expect(host.locator("button.cell-btn.on")).toHaveAttribute("data-cell", settledCell);
 
   // 右键「查看值」以右键单元格为目标，关闭后换格不重开。
   await host.locator('[data-cell="r1:column_1"]').click({ button: "right" });
@@ -101,7 +135,7 @@ async function verifyMousePaths(host, theme) {
   await expect(resultViewer).toHaveCount(0);
   await host.locator('[data-cell="r3:id"]').click();
   await expect(resultViewer).toHaveCount(0);
-  report.checks.push(theme + ": SQL drag selects without running; query grid drags a rectangle, copies exactly that cell count and opens the viewer only for the context-menu target");
+  report.checks.push(theme + ": SQL drag selects without running; query grid drags a rectangle, copies exactly that cell count, keeps SQL-value copy feedback global, anchors a keyboard context menu on the cell, ends an outside release without a stuck drag and opens the viewer only for the context-menu target");
 
   // 数据表格：同样的单击、拖选和右键查看值。
   await host.getByRole("button", { name: "打开命令面板" }).click();
@@ -117,9 +151,14 @@ async function verifyMousePaths(host, theme) {
   await expect(host.locator('[data-cell="3:customer"]')).toHaveClass(/range/);
   const tableRange = await host.locator(".cell-btn.range").count();
   expect(tableRange).toBeGreaterThanOrEqual(4);
-  await host.keyboard.press("Control+c");
-  await expect(host.locator(".toast").last()).toContainText("已复制 " + tableRange + " 个单元格");
-  expect(await host.locator("input[aria-label^='编辑']").count()).toBe(0);
+    await host.keyboard.press("Control+c");
+    await expect(host.locator(".toast").last()).toContainText("已复制 " + tableRange + " 个单元格");
+    expect(await host.locator("input[aria-label^='编辑']").count()).toBe(0);
+
+    // 数据表格的「复制 SQL 值」同样只在全局轻提示里回执。
+    await host.keyboard.press("Control+Shift+C");
+    await expect(host.locator(".toast").last()).toContainText("已复制 SQL 值");
+    await expect(host.getByRole("region", { name: "值查看器" })).toHaveCount(0);
   await host.locator('[data-cell="2:customer"]').click({ button: "right" });
   await host.getByRole("menuitem", { name: "查看值" }).click();
   const tableViewer = host.getByRole("region", { name: "值查看器" });

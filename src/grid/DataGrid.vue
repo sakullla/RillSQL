@@ -112,6 +112,8 @@ const widths = reactive<Record<string, number>>({});
 const anchor = ref<CellPoint | null>(null);
 const focusCellPoint = ref<CellPoint | null>(null);
 const dragging = ref(false);
+/** 指针捕获目标：捕获期间 pointermove 的 target 会固定在起始格，命中只能按坐标算。 */
+let dragCapture: { pointerId: number; el: Element } | null = null;
 const menu = ref<{ x: number; y: number; row: string; column: string } | null>(null);
 const menuError = ref("");
 /** 单元格菜单首次打开时读一次表结构，供外键值跳转；只在成功后缓存，失败允许下次再试。 */
@@ -569,14 +571,29 @@ function startResize(name: string, event: PointerEvent) {
   window.addEventListener("pointerup", resizeUp);
 }
 
-/** 用指针落点命中当前网格内的单元格；行 id 可能含冒号，所以按 data-row/data-column 取。 */
-function cellFromEvent(event: Event): CellPoint | null {
-  const hit = event.target instanceof Element ? event.target.closest(".cell-btn") : null;
+/** 从单元格元素读出坐标；行 id 可能含冒号，所以按 data-row/data-column 取。 */
+function pointFromElement(el: Element | null): CellPoint | null {
+  const hit = el?.closest(".cell-btn") ?? null;
   if (!hit || !rootEl.value?.contains(hit)) return null;
   const row = hit.getAttribute("data-row");
   const column = hit.getAttribute("data-column");
   if (!row || !column) return null;
   return { row, column };
+}
+
+/** 捕获期间只能用坐标命中：事件目标一直是起始格，按目标算会永远停在锚点。 */
+function pointAt(x: number, y: number): CellPoint | null {
+  if (typeof document.elementFromPoint !== "function") return null;
+  return pointFromElement(document.elementFromPoint(x, y));
+}
+
+/** 指针落点命中：有捕获时按坐标，没有捕获（合成事件、旧实现）时退回事件目标。 */
+function cellFromEvent(event: PointerEvent): CellPoint | null {
+  if (dragCapture) {
+    if (!Number.isFinite(event.clientX) || !Number.isFinite(event.clientY)) return null;
+    return pointAt(event.clientX, event.clientY);
+  }
+  return pointFromElement(event.target instanceof Element ? event.target : null);
 }
 
 function samePoint(a: CellPoint | null, b: CellPoint | null): boolean {
@@ -591,12 +608,42 @@ function onDragMove(event: PointerEvent) {
   focusCellPoint.value = hit;
 }
 
-/** 结束拖动并摘下全部窗口监听；pointerup 与 pointercancel 共用。 */
+/** 结束拖动并摘下全部捕获与监听；pointerup、pointercancel、window blur 共用。 */
 function stopDrag() {
   dragging.value = false;
+  releaseCapture();
   window.removeEventListener("pointermove", onDragMove);
   window.removeEventListener("pointerup", onDragEnd);
   window.removeEventListener("pointercancel", onDragCancel);
+  window.removeEventListener("blur", onDragCancel);
+}
+
+/** 捕获指针，保证拖出窗口后仍能收到 move/up；合成事件拿不到捕获就退回事件目标。 */
+function capturePointer(el: Element | null, pointerId: number | undefined): void {
+  dragCapture = null;
+  if (!el || pointerId === undefined || pointerId < 0) return;
+  const target = el as Element & { setPointerCapture?: (id: number) => void };
+  if (typeof target.setPointerCapture !== "function") return;
+  try {
+    target.setPointerCapture(pointerId);
+    dragCapture = { pointerId, el };
+  } catch {
+    dragCapture = null;
+  }
+}
+
+/** 释放捕获；指针已经结束时浏览器会自行收尾，这里的失败可以忽略。 */
+function releaseCapture(): void {
+  const current = dragCapture;
+  dragCapture = null;
+  if (!current) return;
+  const target = current.el as Element & { releasePointerCapture?: (id: number) => void };
+  if (typeof target.releasePointerCapture !== "function") return;
+  try {
+    target.releasePointerCapture(current.pointerId);
+  } catch {
+    // 指针已结束或元素已移除。
+  }
 }
 
 function onDragEnd(event: PointerEvent) {
@@ -616,15 +663,27 @@ function onDragCancel() {
 
 function onCellDown(row: string, column: string, event: PointerEvent) {
   if (event.button !== 0 || !session) return;
+  // 上一次拖动没收到 up（例如在窗口外松开）时先收尾，避免残留监听叠加。
+  stopDrag();
   anchor.value = { row, column };
   focusCellPoint.value = { row, column };
   dragging.value = true;
   menu.value = null;
   viewer.value = null;
   session.select(row, column);
+  capturePointer((event.currentTarget as Element | null) ?? (event.target instanceof Element ? event.target : null), event.pointerId);
   window.addEventListener("pointermove", onDragMove);
   window.addEventListener("pointerup", onDragEnd);
   window.addEventListener("pointercancel", onDragCancel);
+  // 窗口失焦收不到 pointerup：作为兜底结束拖动，不留下卡住的 dragging。
+  window.addEventListener("blur", onDragCancel);
+}
+
+/** 捕获指针后浏览器会把 click 发到按下时的单元格：不能让它把当前单元格拉回锚点。 */
+function onCellClick(row: string, column: string) {
+  if (dragging.value) return;
+  if (focusCellPoint.value && !samePoint(focusCellPoint.value, { row, column })) return;
+  session?.select(row, column);
 }
 
 /** pointerenter 只是快速移动的兜底：同样只移动可见终点。 */
@@ -664,6 +723,17 @@ function viewFromMenu() {
   menu.value = null;
 }
 
+/** 键盘触发的 contextmenu 坐标是 0：用目标单元格的矩形定位，菜单不会跑到左上角。 */
+function menuPosition(event: MouseEvent): { x: number; y: number } {
+  const x = event.clientX;
+  const y = event.clientY;
+  if (Number.isFinite(x) && Number.isFinite(y) && (x !== 0 || y !== 0)) return { x, y };
+  const el = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+  const rect = el?.getBoundingClientRect();
+  if (!rect || (!rect.width && !rect.height)) return { x: Number.isFinite(x) ? x : 0, y: Number.isFinite(y) ? y : 0 };
+  return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+}
+
 function onCellMenu(row: string, column: string, event: MouseEvent) {
   event.preventDefault();
   if (!isPicked(row, column)) {
@@ -672,7 +742,7 @@ function onCellMenu(row: string, column: string, event: MouseEvent) {
   }
   session?.select(row, column);
   menuError.value = "";
-  menu.value = { x: event.clientX, y: event.clientY, row, column };
+  menu.value = { ...menuPosition(event), row, column };
   loadReferenceKeys();
 }
 
@@ -738,6 +808,7 @@ async function copySelection() {
     toast(t("grid.menu.copiedCells", { n: points.length }));
   } catch {
     copyMessage.value = text;
+    toast(t("grid.errors.clipboardFailed"), "err");
   }
 }
 
@@ -788,6 +859,7 @@ async function copyCell(rowId: string, columnName: string, asSql: boolean) {
   const error = await ensureFull(rowId, columnName);
   if (error) {
     copyMessage.value = error;
+    toast(error, "err");
     return;
   }
   const column = columns.value.find((item) => item.name === columnName);
@@ -797,8 +869,11 @@ async function copyCell(rowId: string, columnName: string, asSql: boolean) {
   try {
     await navigator.clipboard.writeText(text);
     copyMessage.value = t("grid.value.copied");
+    // 查看器默认关闭：单格复制（含复制 SQL 值）的成败都要有全局可见反馈。
+    toast(asSql ? t("grid.value.copiedSqlValue") : t("grid.value.copied"));
   } catch {
     copyMessage.value = text || t("grid.errors.clipboardFailed");
+    toast(t("grid.errors.clipboardFailed"), "err");
   }
 }
 
@@ -1006,7 +1081,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
                 <button class="btn sm ghost" type="button" @click="cancelEdit">{{ t("common.cancel") }}</button>
                 <p v-if="editError" class="menu-error" role="alert">{{ editError }}</p>
               </div>
-              <button v-else class="cell-btn" :class="{ on: session.selectedId === row.id && session.selectedColumn === column.name, range: isPicked(row.id, column.name) }" :data-cell="`${row.id}:${column.name}`" :data-row="row.id" :data-column="column.name" type="button" @pointerdown="onCellDown(row.id, column.name, $event)" @pointerenter="onCellEnter(row.id, column.name)" @click="session.select(row.id, column.name)" @contextmenu="onCellMenu(row.id, column.name, $event)" @dblclick="beginEdit(row.id, column.name)">
+              <button v-else class="cell-btn" :class="{ on: session.selectedId === row.id && session.selectedColumn === column.name, range: isPicked(row.id, column.name) }" :data-cell="`${row.id}:${column.name}`" :data-row="row.id" :data-column="column.name" type="button" @pointerdown="onCellDown(row.id, column.name, $event)" @pointerenter="onCellEnter(row.id, column.name)" @click="onCellClick(row.id, column.name)" @contextmenu="onCellMenu(row.id, column.name, $event)" @dblclick="beginEdit(row.id, column.name)">
                 <span v-if="columnIndex === 0 && row.kind === 'insert'" class="row-flag">{{ t("grid.editor.newFlag") }}</span>
                 <span v-if="columnIndex === 0 && row.deleted" class="row-flag del">{{ t("grid.editor.deleteFlag") }}</span>
                 <span :class="{ 'v-null': row.cells[columnIndex]?.kind === 'null', 'v-empty': row.cells[columnIndex]?.kind === 'empty', 'v-large': row.cells[columnIndex]?.kind === 'large' }">{{ row.cells[columnIndex]?.label }}</span>
