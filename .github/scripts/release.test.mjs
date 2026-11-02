@@ -41,6 +41,14 @@ test("updater publication rejects missing or empty signatures and wrong keys or 
   assert.throws(() => validateSignature(signature, otherKey, "0.1.0"), /another public key/);
 });
 
+test("a DMG-only macOS build cannot publish an incomplete updater release", () => {
+  const { release, signature, pubkey } = signedFixture();
+  // A successful DMG build is not evidence that Tauri produced the app updater archive.
+  release.assets = release.assets.filter((asset) => !asset.name.includes(".app.tar.gz"));
+  assert.doesNotThrow(() => verifyRelease(release, "v0.1.0", SHA));
+  assert.throws(() => buildUpdaterManifest(release, "v0.1.0", SHA, "sakullla/RillSQL", () => signature, pubkey), /aarch64\.app\.tar\.gz/);
+});
+
 test("the checked-out project has consistent release metadata", () => {
   assert.match(checkProject(), /^\d+\.\d+\.\d+/);
 });

@@ -112,7 +112,8 @@ jobs:
           - os: macos-latest
             platform: macOS ARM64
             target: aarch64-apple-darwin
-            bundles: dmg
+            # DMG alone does not retain the app or create its signed updater archive.
+            bundles: app,dmg
           - os: ubuntu-22.04
             platform: Linux x64
             target: x86_64-unknown-linux-gnu
