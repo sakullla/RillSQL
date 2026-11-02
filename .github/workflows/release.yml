@@ -12,11 +12,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  validate:
-    uses: ./.github/workflows/ci.yml
+  gate:
+    name: Require main CI for the tagged commit
+    runs-on: ubuntu-22.04
+    timeout-minutes: 65
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Resolve tag to commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Wait for main CI
+        uses: actions/github-script@v9
+        env:
+          RELEASE_SHA: ${{ steps.commit.outputs.sha }}
+        with:
+          script: |
+            const { waitForMainCi } = require('./.github/scripts/wait-for-main-ci.cjs');
+            await waitForMainCi({ github, repo: context.repo, sha: process.env.RELEASE_SHA, log: core.info });
 
   prepare:
     name: Prepare draft release
+    needs: gate
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
@@ -26,6 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ needs.gate.outputs.sha }}
           fetch-depth: 0
           filter: blob:none
       - uses: actions/setup-node@v7
@@ -34,7 +58,9 @@ jobs:
       - name: Validate tag and generate changelog
         env:
           RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ needs.gate.outputs.sha }}
         run: |
+          test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$RELEASE_SHA"
           node .github/scripts/release.mjs check "$RELEASE_TAG"
           node .github/scripts/release.mjs notes "$RELEASE_TAG" > release-notes.md
       - name: Create or resume draft
@@ -43,6 +69,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ github.ref_name }}
           PRERELEASE: ${{ contains(github.ref_name, '-') }}
+          RELEASE_SHA: ${{ needs.gate.outputs.sha }}
         run: |
           set -euo pipefail
           release=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --slurp \
@@ -54,18 +81,22 @@ jobs:
               echo "::error::Release is already published; use a new version tag."
               exit 1
             fi
+            if [[ $(jq -r '.target_commitish' <<< "$release") != "$RELEASE_SHA" ]]; then
+              echo "::error::Draft belongs to another commit; use a new version tag."
+              exit 1
+            fi
             endpoint="$endpoint/$(jq -r '.id' <<< "$release")"
             method=PATCH
           fi
           release_id=$(gh api --method "$method" "$endpoint" \
-            -f tag_name="$RELEASE_TAG" -f target_commitish="$GITHUB_SHA" \
+            -f tag_name="$RELEASE_TAG" -f target_commitish="$RELEASE_SHA" \
             -f name="RillSQL $RELEASE_TAG" -F body=@release-notes.md \
             -F draft=true -F prerelease="$PRERELEASE" --jq '.id')
           echo "release-id=$release_id" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.platform }}
-    needs: prepare
+    needs: [gate, prepare]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     permissions:
@@ -88,6 +119,8 @@ jobs:
             bundles: appimage,deb
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         timeout-minutes: 10
@@ -102,9 +135,9 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
-          cache-workspace-crates: true
+          shared-key: release-v1-${{ matrix.target }}
           cache-bin: false
-          cache-on-failure: true
+          save-if: false
       - run: npm ci --prefer-offline --no-audit --no-fund
       - name: Build and upload to draft release
         uses: tauri-apps/tauri-action@v1
@@ -122,13 +155,15 @@ jobs:
 
   publish:
     name: Verify assets and publish
-    needs: [validate, prepare, build]
+    needs: [gate, prepare, build]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -137,14 +172,23 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_ID: ${{ needs.prepare.outputs.release-id }}
           RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ needs.gate.outputs.sha }}
         run: |
           set -euo pipefail
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > release.json
-          node .github/scripts/release.mjs verify release.json "$RELEASE_TAG"
+          node .github/scripts/release.mjs verify release.json "$RELEASE_TAG" "$RELEASE_SHA"
       - name: Publish verified release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_ID: ${{ needs.prepare.outputs.release-id }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ needs.gate.outputs.sha }}
         run: |
+          set -euo pipefail
+          current_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq '.sha')
+          if [[ "$current_sha" != "$RELEASE_SHA" ]]; then
+            echo "::error::Tag moved during the release; refusing to publish."
+            exit 1
+          fi
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
             -F draft=false --jq '.html_url'

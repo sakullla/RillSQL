@@ -26,10 +26,10 @@ Frontend tests use Vitest, jsdom, and Vue Test Utils; name them `*.test.ts`. Rus
 Recent history commonly uses `feat:`, `fix:`, and `docs:` prefixes with short English or Chinese descriptions. Follow that pattern. PRs should describe the behavior change, link relevant issues, list validation performed, and include screenshots for visual changes. Identify whether evidence comes from synthetic browser fixtures or the native application.
 
 ## CI
-`.github/workflows/ci.yml` runs on pull requests, pushes to `main`, and as part of a release: frontend checks, browser verification with synthetic IPC (screenshots are uploaded as the `ui-capture` artifact), and Rust tests plus Clippy on Windows, macOS, and Linux.
+`.github/workflows/ci.yml` runs on pull requests and pushes to `main`: frontend checks, browser verification of the production build with synthetic IPC (screenshots are uploaded as the `ui-capture` artifact), and Rust tests plus Clippy on Windows, macOS, and Linux. The frontend build is shared between jobs. Main pushes also seed release-profile Rust dependency caches on cache misses.
 
 ## Release Process
-Versions follow SemVer. `.github/workflows/release.yml` runs when a `v*` tag is pushed: it runs CI, creates a draft release with notes generated from commit subjects, builds the Windows (NSIS), macOS ARM64 (DMG), and Linux (DEB, AppImage) installers, checks that each exists exactly once and is not empty, then publishes the draft. Installers are not signed.
+Versions follow SemVer. `.github/workflows/release.yml` runs when a `v*` tag is pushed: it requires successful main CI for that exact commit, creates a draft release with notes generated from commit subjects, builds the Windows (NSIS), macOS ARM64 (DMG), and Linux (DEB, AppImage) installers, verifies their exact version/architecture filenames and nonempty uploads, then publishes the draft. Every checkout and draft is bound to the verified commit SHA; publication checks the tag has not moved. Installers are not signed. See `.github/README.md` for cache and retry details.
 
 1. Create `release/vX.Y.Z` from an up-to-date `main`.
 2. Set the same version in all six places; `node .github/scripts/release.mjs check` fails on any mismatch:
@@ -45,4 +45,4 @@ Versions follow SemVer. `.github/workflows/release.yml` runs when a `v*` tag is 
 6. Create and push an annotated tag: `git tag -a vX.Y.Z -m "RillSQL vX.Y.Z"`, then `git push origin vX.Y.Z`. `release.mjs check vX.Y.Z` rejects a tag that does not match the version.
 7. Follow the run with `gh run watch` and confirm the release with `gh release view vX.Y.Z`.
 
-If the run fails before publishing, fix the cause, repeat steps 4 and 5, delete the tag locally and on the remote, and tag the new commit with the same version; the workflow resumes the existing draft. A published version is never reused: fix forward with a new version. A tag containing `-` (for example `v0.3.0-rc.1`) is published as a pre-release.
+For infrastructure failures, rerun the failed jobs on the same tag and commit; the workflow resumes only a matching draft. If code must change, use a new patch version and tag. Do not move a pushed release tag or reuse a published version. A tag containing `-` (for example `v0.2.1-rc.1`) is published as a pre-release.

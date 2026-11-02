@@ -101,13 +101,20 @@ export function generateNotes(tag, root = ROOT) {
   return formatNotes(subjects, previous);
 }
 
-export function verifyRelease(release, tag) {
+export function verifyRelease(release, tag, sha) {
   if (!tag || release.tag_name !== tag) throw new Error("Release tag does not match this run.");
+  const version = tag.slice(1);
+  if (!tag.startsWith("v") || !SEMVER.test(version)) throw new Error("Invalid release version.");
   if (release.draft !== true) throw new Error("Release must remain a draft until verification succeeds.");
+  if (sha && release.target_commitish !== sha) throw new Error("Release commit does not match the verified SHA.");
+  if (release.prerelease !== version.includes("-")) throw new Error("Release prerelease flag does not match the version.");
   const assets = release.assets ?? [];
-  for (const suffix of INSTALLERS) {
+  const expected = [`RillSQL_${version}_x64-setup.exe`, `RillSQL_${version}_aarch64.dmg`,
+    `RillSQL_${version}_amd64.deb`, `RillSQL_${version}_amd64.AppImage`];
+  for (const [index, suffix] of INSTALLERS.entries()) {
     const matches = assets.filter((asset) => asset.name.endsWith(suffix));
     if (matches.length !== 1) throw new Error(`Expected exactly one ${suffix} installer, found ${matches.length}.`);
+    if (matches[0].name !== expected[index]) throw new Error(`Expected installer ${expected[index]}, got ${matches[0].name}.`);
     if (matches[0].state !== "uploaded" || !(matches[0].size > 0)) {
       throw new Error(`Installer is empty or upload is incomplete: ${matches[0].name}`);
     }
@@ -117,11 +124,13 @@ export function verifyRelease(release, tag) {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const [command, argument, tag] = process.argv.slice(2);
+    const [command, argument, tag, sha] = process.argv.slice(2);
     if (command === "check") console.log(`Release metadata verified: ${checkProject(argument)}`);
     else if (command === "notes") process.stdout.write(generateNotes(argument));
-    else if (command === "verify") console.log(verifyRelease(json(argument), tag).join("\n"));
-    else throw new Error("Usage: release.mjs check [tag] | notes <tag> | verify <release.json> <tag>");
+    else if (command === "verify") {
+      if (!sha || !/^[a-f0-9]{40}$/.test(sha)) throw new Error("verify requires the verified commit SHA.");
+      console.log(verifyRelease(json(argument), tag, sha).join("\n"));
+    } else throw new Error("Usage: release.mjs check [tag] | notes <tag> | verify <release.json> <tag> <sha>");
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;

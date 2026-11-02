@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { checkProject, formatNotes, validateVersions, verifyRelease } from "./release.mjs";
+import { waitForMainCi } from "./wait-for-main-ci.cjs";
 
 const uploaded = (name) => ({ name, state: "uploaded", size: 1024 });
-const INSTALLERS = ["a_0.1.0_x64-setup.exe", "a_0.1.0_aarch64.dmg", "a_0.1.0_amd64.deb", "a_0.1.0_amd64.AppImage"];
+const INSTALLERS = ["RillSQL_0.1.0_x64-setup.exe", "RillSQL_0.1.0_aarch64.dmg", "RillSQL_0.1.0_amd64.deb", "RillSQL_0.1.0_amd64.AppImage"];
+const SHA = "a".repeat(40);
+const draft = () => ({ tag_name: "v0.1.0", draft: true, prerelease: false, target_commitish: SHA, assets: INSTALLERS.map(uploaded) });
 
 test("the checked-out project has consistent release metadata", () => {
   assert.match(checkProject(), /^\d+\.\d+\.\d+/);
@@ -25,7 +28,7 @@ test("escapes commit subjects and groups them by type", () => {
 });
 
 test("requires each installer exactly once before publishing", () => {
-  const release = { tag_name: "v0.1.0", draft: true, assets: INSTALLERS.map(uploaded) };
+  const release = draft();
   assert.equal(verifyRelease(release, "v0.1.0").length, 4);
   assert.throws(() => verifyRelease({ ...release, assets: release.assets.slice(1) }, "v0.1.0"), /\.exe/);
   assert.throws(() => verifyRelease({ ...release, draft: false }, "v0.1.0"), /draft/);
@@ -33,5 +36,50 @@ test("requires each installer exactly once before publishing", () => {
 
 test("rejects an empty installer", () => {
   const assets = [{ ...uploaded(INSTALLERS[0]), size: 0 }, ...INSTALLERS.slice(1).map(uploaded)];
-  assert.throws(() => verifyRelease({ tag_name: "v0.1.0", draft: true, assets }, "v0.1.0"), /empty/);
+  assert.throws(() => verifyRelease({ ...draft(), assets }, "v0.1.0"), /empty/);
+});
+
+test("rejects mismatched commit, prerelease, version, architecture and duplicate installers", () => {
+  assert.equal(verifyRelease(draft(), "v0.1.0", SHA).length, 4);
+  assert.throws(() => verifyRelease(draft(), "v0.1.0", "b".repeat(40)), /commit/);
+  assert.throws(() => verifyRelease({ ...draft(), prerelease: true }, "v0.1.0", SHA), /prerelease/);
+  for (const name of ["RillSQL_0.0.9_x64-setup.exe", "RillSQL_0.1.0_arm64-setup.exe"]) {
+    const release = draft();
+    release.assets[0].name = name;
+    assert.throws(() => verifyRelease(release, "v0.1.0", SHA), /Expected installer/);
+  }
+  const release = draft();
+  release.assets.push(uploaded(INSTALLERS[0]));
+  assert.throws(() => verifyRelease(release, "v0.1.0", SHA), /exactly one/);
+});
+
+const run = (overrides = {}) => ({ id: 1, head_sha: SHA, head_branch: "main", event: "push", status: "completed", conclusion: "success", html_url: "https://example.test/run", ...overrides });
+function gate(runs, comparison = "identical") {
+  let calls = 0;
+  return {
+    sha: SHA, repo: { owner: "test", repo: "rillsql" }, attempts: 2, log() {}, sleep: async () => {},
+    github: { rest: {
+      actions: { listWorkflowRuns: async (params) => {
+        assert.equal(params.head_sha, SHA);
+        return { data: { workflow_runs: runs[Math.min(calls++, runs.length - 1)] } };
+      } },
+      repos: { compareCommitsWithBasehead: async () => ({ data: { status: comparison } }) },
+    } },
+  };
+}
+
+test("main gate waits for the exact commit and latest run", async () => {
+  const latest = run({ id: 2 });
+  assert.equal(await waitForMainCi(gate([
+    [run({ head_sha: "wrong" }), run({ event: "pull_request" }), run(), run({ id: 2, status: "in_progress" })],
+    [run(), latest],
+  ], "ahead")), latest);
+});
+
+test("main gate rejects failed latest runs, missing runs and commits outside main", async () => {
+  await assert.rejects(waitForMainCi(gate([[run(), run({ id: 2, conclusion: "failure" })]])), /did not succeed/);
+  await assert.rejects(waitForMainCi(gate([[run({ event: "pull_request" }), run({ head_sha: "wrong" })]])), /Timed out/);
+  for (const status of ["behind", "diverged"]) {
+    await assert.rejects(waitForMainCi(gate([[run()]], status)), /no longer on main/);
+  }
 });

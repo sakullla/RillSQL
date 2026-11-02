@@ -36,9 +36,17 @@ jobs:
         run: npm test
       - name: Type-check and build
         run: npm run build
+      - name: Share the verified frontend build
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-dist
+          path: dist
+          if-no-files-found: error
+          retention-days: 1
 
   ui:
     name: Browser verification
+    needs: frontend
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
@@ -48,11 +56,15 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci --prefer-offline --no-audit --no-fund
+      - uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: dist
       - name: Install Chromium
         run: npx playwright install --with-deps chromium
-      - name: Start Vite
+      - name: Preview the production build
         run: |
-          npm run dev > vite.log 2>&1 &
+          npm run preview -- --host 127.0.0.1 --port 1420 > vite.log 2>&1 &
           for _ in $(seq 1 60); do
             curl -fsS http://localhost:1420 > /dev/null && exit 0
             sleep 1
@@ -77,6 +89,7 @@ jobs:
 
   rust:
     name: Rust (${{ matrix.platform }})
+    needs: frontend
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -95,10 +108,6 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 10
         run: bash .github/scripts/install-linux-deps.sh
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: npm
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -108,10 +117,53 @@ jobs:
           cache-workspace-crates: true
           cache-bin: false
           save-if: ${{ github.event_name != 'pull_request' }}
-      - run: npm ci --prefer-offline --no-audit --no-fund
       # tauri::generate_context! embeds ../dist, so the frontend must exist first.
-      - run: npm run build
+      - uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: dist
       - name: Test backend
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - name: Clippy
         run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets
+
+  release-cache:
+    name: Prepare release cache (${{ matrix.target }})
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: frontend
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        id: release-cache
+        with:
+          # Must match release.yml; tags restore main's release dependencies.
+          shared-key: release-v1-${{ matrix.target }}
+          workspaces: src-tauri -> target
+          cache-bin: false
+      - name: Install Linux dependencies
+        if: steps.release-cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
+        timeout-minutes: 10
+        run: bash .github/scripts/install-linux-deps.sh
+      - uses: actions/download-artifact@v8
+        if: steps.release-cache.outputs.cache-hit != 'true'
+        with:
+          name: frontend-dist
+          path: dist
+      - name: Compile release dependencies without packaging
+        if: steps.release-cache.outputs.cache-hit != 'true'
+        run: cargo build --release --locked --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }} --features tauri/custom-protocol
