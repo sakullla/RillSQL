@@ -1,4 +1,4 @@
-import { closeCompletion, currentCompletions, startCompletion } from "@codemirror/autocomplete";
+import { acceptCompletion, closeCompletion, currentCompletions, startCompletion } from "@codemirror/autocomplete";
 import { EditorView } from "@codemirror/view";
 import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, expect, it, vi } from "vitest";
@@ -64,6 +64,28 @@ it.each([true, false])("reuses JOIN metadata and recomputes aliases (foreign key
   startCompletion(view);
   await vi.waitFor(() => expect(currentCompletions(view.state).some((item) => item.label === "ord.customer_id = cust.id")).toBe(true));
   expect(invoke).toHaveBeenCalledTimes(4);
+});
+
+it("accepts a completion without extra characters or caret drift", async () => {
+  invoke.mockImplementation(async (command: string) => {
+    expect(command).toBe("grid_describe");
+    return {
+      engine: "postgres", schema: "public", name: "orders", kind: "table", key: ["id"],
+      columns: [{ name: "status" }], foreignKeys: [],
+    };
+  });
+  const { view } = await editor("SELECT orders.");
+  await vi.waitFor(() => expect(currentCompletions(view.state).some((item) => item.label === "status")).toBe(true));
+  // CodeMirror 的候选打开后有一段交互延迟（75ms）才接受回车确认，这里等它过去。
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  const scrollBefore = view.scrollDOM.scrollTop;
+  expect(acceptCompletion(view)).toBe(true);
+  // 只插入用户确认的补全词：内容、光标、选区与滚动都没有额外变化。
+  expect(view.state.doc.toString()).toBe("SELECT orders.status");
+  expect(view.state.selection.main.head).toBe("SELECT orders.status".length);
+  expect(view.state.selection.main.empty).toBe(true);
+  expect(currentCompletions(view.state)).toEqual([]);
+  expect(view.scrollDOM.scrollTop).toBe(scrollBefore);
 });
 
 it("discards a slow field error after the user edits the statement", async () => {

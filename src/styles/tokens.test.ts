@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const css = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "tokens.css"), "utf8");
+const queryTab = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "../query/QueryTab.vue"), "utf8");
 
 function block(selector: string): string {
   const needle = selector.endsWith("{") ? selector : `${selector} {`;
@@ -22,6 +23,29 @@ function hexValue(scope: string, name: string): string {
   const value = tokenValue(scope, name).toLowerCase();
   expect(value, `${name} must be a hex color, got ${value}`).toMatch(/^#[0-9a-f]{6}$/);
   return value;
+}
+
+interface Rgba {
+  r: number;
+  g: number;
+  b: number;
+  a: number;
+}
+
+function rgbaValue(scope: string, name: string): Rgba {
+  const value = tokenValue(scope, name);
+  const match = value.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+)\s*)?\)$/);
+  expect(match, `${name} must be an rgba color, got ${value}`).toBeTruthy();
+  return { r: Number(match![1]), g: Number(match![2]), b: Number(match![3]), a: match![4] === undefined ? 1 : Number(match![4]) };
+}
+
+/** 半透明层压在不透明底色上的实际渲染色，用来算光标与选区叠在一起的真实对比。 */
+function blend(base: string, layer: Rgba): string {
+  const under = Number.parseInt(base.slice(1), 16);
+  const mix = (over: number, below: number) => Math.round(over * layer.a + below * (1 - layer.a));
+  return `#${[mix(layer.r, (under >> 16) & 255), mix(layer.g, (under >> 8) & 255), mix(layer.b, under & 255)]
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("")}`;
 }
 
 function channel(byte: number): number {
@@ -77,6 +101,13 @@ const THEME_TOKENS = [
   "--info-soft",
   "--sel",
   "--sel-strong",
+  "--caret",
+  "--editor-active-line",
+  "--editor-send-range",
+  "--editor-selection-blur",
+  "--editor-selection",
+  "--editor-match",
+  "--editor-match-active",
   "--ring",
   "--disabled-fg",
   "--disabled-bg",
@@ -255,6 +286,60 @@ describe("design tokens", () => {
     expect(Number.parseInt(tokenValue(relaxed, "--tree-h"), 10)).toBe(34);
     expect(Number.parseInt(tokenValue(relaxed, "--control-h"), 10)).toBe(38);
     expect(Number.parseInt(tokenValue(relaxed, "--control-h-sm"), 10)).toBe(34);
+  });
+
+  it("stacks the editor feedback from the active line up to the focused selection", () => {
+    for (const [theme, scope] of [["light", THEME_SCOPES.light()], ["dark", THEME_SCOPES.dark()]] as const) {
+      const activeLine = rgbaValue(scope, "--editor-active-line");
+      const sendRange = rgbaValue(scope, "--editor-send-range");
+      const blurred = rgbaValue(scope, "--editor-selection-blur");
+      const focused = rgbaValue(scope, "--editor-selection");
+      // 当前行 < 执行范围 < 失焦选区 < 聚焦选区：四层同时出现时仍能分辨先后。
+      expect(activeLine.a, theme).toBeLessThan(sendRange.a);
+      expect(sendRange.a, theme).toBeLessThan(blurred.a);
+      expect(blurred.a, theme).toBeLessThan(focused.a);
+      // 失焦选区必须还看得见，聚焦选区不能把文字压住。
+      expect(blurred.a, theme).toBeGreaterThanOrEqual(0.1);
+      expect(focused.a, theme).toBeLessThanOrEqual(0.35);
+    }
+  });
+
+  it("keeps match highlights in a different hue family from the selection", () => {
+    for (const [theme, scope] of [["light", THEME_SCOPES.light()], ["dark", THEME_SCOPES.dark()]] as const) {
+      const selection = rgbaValue(scope, "--editor-selection");
+      const match = rgbaValue(scope, "--editor-match");
+      const activeMatch = rgbaValue(scope, "--editor-match-active");
+      // 选区是水青（绿多于红），匹配是暖色（红远多于蓝）：既不撞色相也不撞强度。
+      expect(selection.g - selection.r, theme).toBeGreaterThan(60);
+      expect(match.r - match.b, theme).toBeGreaterThan(60);
+      expect(activeMatch.a, theme).toBeGreaterThan(match.a);
+    }
+  });
+
+  it("keeps the caret readable on the panel and on top of both selection states", () => {
+    for (const [theme, scope] of [["light", THEME_SCOPES.light()], ["dark", THEME_SCOPES.dark()]] as const) {
+      const panel = hexValue(scope, "--surface-panel");
+      const caret = hexValue(scope, "--caret");
+      expect(contrast(caret, panel), theme).toBeGreaterThanOrEqual(7);
+      expect(contrast(caret, blend(panel, rgbaValue(scope, "--editor-selection"))), theme).toBeGreaterThanOrEqual(4.5);
+      expect(contrast(caret, blend(panel, rgbaValue(scope, "--editor-selection-blur"))), theme).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  it("renders the editor caret, selection, range and match feedback from those tokens", () => {
+    for (const name of [
+      "--caret",
+      "--editor-active-line",
+      "--editor-send-range",
+      "--editor-selection",
+      "--editor-selection-blur",
+      "--editor-match",
+      "--editor-match-active",
+    ]) {
+      expect(queryTab, name).toContain(`var(${name})`);
+    }
+    // 聚焦与失焦选区不再共用同一个强制色。
+    expect(queryTab).not.toContain("var(--sel-strong)");
   });
 
   it("keeps legacy token names resolvable for transitional module css", () => {

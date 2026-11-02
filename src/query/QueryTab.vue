@@ -288,7 +288,7 @@ const sendRangeField = StateField.define<DecorationSet>({
 /* 编辑器走 sunken 下沉井表面（tokens：编辑器/井下沉），与结果区的 panel 面板拉开层级。 */
 const shellTheme = EditorView.theme({
   "&": { backgroundColor: "var(--surface-panel)", color: "var(--text)", height: "100%" },
-  ".cm-content": { fontFamily: "var(--mono)", fontSize: "var(--editor-font)", caretColor: "var(--text)" },
+  ".cm-content": { fontFamily: "var(--mono)", fontSize: "var(--editor-font)", caretColor: "var(--caret)" },
   ".cm-gutters": { backgroundColor: "var(--surface-panel)", color: "var(--text-3)", borderRight: "0" },
   "&.cm-focused": { outline: "none" },
 });
@@ -637,8 +637,25 @@ function formatEditor() {
   const inserted = formatted.sql.slice(insertFrom, formatted.sql.length - suffixLength);
   editor.dispatch({
     changes: { from: insertFrom, to: insertTo, insert: inserted },
-    selection: selected ? { anchor: insertFrom, head: insertFrom + inserted.length } : { anchor: formatted.sql.length },
+    selection: selected
+      ? { anchor: insertFrom, head: insertFrom + inserted.length }
+      : { anchor: caretAfterWholeFormat(doc, range.head, formatted.sql) },
   });
+}
+
+/**
+ * 整篇格式化会重排换行，不能沿用字符位置：按「原行号 + 行内列偏移」映射回新文本，
+ * 让光标留在原来的编辑区，而不是跳到文档末尾（R1：格式化后逐字输入不落在错误位置）。
+ */
+function caretAfterWholeFormat(doc: string, caret: number, next: string): number {
+  const before = doc.slice(0, Math.min(Math.max(caret, 0), doc.length));
+  const line = before.split("\n").length - 1;
+  const column = before.length - (before.lastIndexOf("\n") + 1);
+  const lines = next.split("\n");
+  const target = Math.min(line, lines.length - 1);
+  let offset = 0;
+  for (let index = 0; index < target; index += 1) offset += lines[index]!.length + 1;
+  return offset + Math.min(column, lines[target]!.length);
 }
 
 const PURPOSE_KEYS = { execute: "query.errors.purposeExecute", plan: "query.errors.purposePlan" } as const;
@@ -1027,7 +1044,13 @@ function applyOpenPlan(plan: OpenPlan) {
     return;
   }
   if (editor.state.doc.toString() !== plan.sql) {
-    editor.dispatch({ changes: { from: 0, to: editor.state.doc.length, insert: plan.sql } });
+    /* 整篇替换来自历史、保存查询或文件：光标回到开头并从顶部看起，
+       不继承旧文档里映射出来的位置，也不停在载入内容的末尾。 */
+    editor.dispatch({
+      changes: { from: 0, to: editor.state.doc.length, insert: plan.sql },
+      selection: { anchor: 0 },
+      effects: EditorView.scrollIntoView(0, { y: "start" }),
+    });
   }
   if (plan.needsTarget) {
     actionError.value = deletedConnectionNotice();
@@ -1321,7 +1344,7 @@ onBeforeUnmount(() => {
           <template v-if="connectionName">
             <span v-if="buttonEngine" class="eng" :class="`eng-${buttonEngine}`" :title="engineMeta(buttonEngine).label">{{ engineMeta(buttonEngine).short }}</span>
             <span v-if="currentOption && currentOption.envTone !== 'none'" class="env xs" :class="`env-${currentOption.envTone}`">{{ currentOption.envLabel }}</span>
-            <span class="tg-name">{{ connectionName }}</span><span class="tg-sep"> / </span><span class="tg-db"><Icon name="database" /><span>{{ database || "main" }}</span></span>
+            <span class="tg-name" :title="connectionName">{{ connectionName }}</span><span class="tg-sep"> / </span><span class="tg-db"><Icon name="database" /><span>{{ database || "main" }}</span></span>
           </template>
           <template v-else>
             <Icon name="database" />
@@ -1354,7 +1377,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <span v-if="connectionStatus" class="conn-state" :class="`st-${connectionStatus}`"><i></i>{{ connectionStatusText(connectionStatus) }}</span>
-      <span v-if="run" class="q-note" role="status">{{ runStatusLine }} · {{ run.elapsedMs }} ms</span>
+      <span v-if="run" class="q-note" role="status" :title="`${runStatusLine} · ${run.elapsedMs} ms`">{{ runStatusLine }} · {{ run.elapsedMs }} ms</span>
       <span class="grow"></span>
       <button class="icon-btn" type="button" data-action="format" :aria-label="t('query.toolbar.format')" :title="t('query.toolbar.formatTitle')" @click="formatEditor"><Icon name="format" /></button>
       <button class="icon-btn" type="button" data-action="open-file" :aria-label="t('query.toolbar.open')" :title="t('query.toolbar.openTitle')" :disabled="running || submitting" @click="pickSqlFile"><Icon name="file" /></button>
@@ -1546,7 +1569,10 @@ onBeforeUnmount(() => {
 .target-btn.on { border-color: var(--accent); box-shadow: 0 0 0 2px var(--ring); }
 .target-btn.none { border: 1px dashed var(--line-2); color: var(--text-2); padding-left: var(--sp-2); }
 .target-btn:disabled { opacity: 0.7; cursor: not-allowed; }
-.tg-name { font-weight: 600; white-space: nowrap; }
+/* 长连接名不参与撑宽（R4）：超出部分省略，完整名称仍在 title 与 aria-label 里。 */
+.tg-name { font-weight: 600; white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* 工具条文字一律不换行：按钮文案在「执行 / 执行选中」之间切换时不会把工具条撑成两行，编辑区高度不跳。 */
+.q-toolbar .btn { white-space: nowrap; }
 .tg-db { display: inline-flex; align-items: center; gap: var(--sp-1); min-width: 0; color: var(--text-2); }
 .tg-db span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tg-sep { color: var(--text-3); }
@@ -1610,7 +1636,8 @@ onBeforeUnmount(() => {
 
 /* ---------- 提示条 / 横幅 ---------- */
 .q-note, .q-hint, .q-banner { margin: 0; font-size: var(--fs-xs); color: var(--text-2); }
-.q-toolbar .q-note { color: var(--text-3); white-space: nowrap; }
+/* 运行状态也参与收缩：窄窗口下先省略状态文字，不把右侧高频入口挤出去。 */
+.q-toolbar .q-note { color: var(--text-3); white-space: nowrap; min-width: 0; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
 .q-results .q-note { padding: var(--sp-1) var(--sp-3); }
 .q-hint, .q-banner { padding: var(--sp-1) var(--sp-3); }
 .q-toolbar { position: relative; }
@@ -1632,11 +1659,21 @@ onBeforeUnmount(() => {
 .query-pane :deep(.cm-content) { padding-top: var(--sp-2); line-height: 1.7; }
 .query-pane :deep(.cm-line) { padding-left: var(--sp-3); }
 .query-pane :deep(.cm-gutters) { min-width: 40px; }
-.query-pane :deep(.cm-activeLine), .query-pane :deep(.cm-activeLineGutter) { background: color-mix(in srgb, var(--text) 4%, transparent); }
+/* 编辑器四层反馈各用一枚令牌（R1、R2）：当前行 < 执行范围 < 失焦选区 < 聚焦选区。
+   选区不再聚焦/失焦同色：失焦仍可辨认，又与聚焦态区分；光标提到 2px 中性高对比色，不被选区底吞没。 */
+.query-pane :deep(.cm-activeLine), .query-pane :deep(.cm-activeLineGutter) { background: var(--editor-active-line); }
 .query-pane :deep(.cm-activeLineGutter) { color: var(--text); }
-.query-pane :deep(.cm-cursor) { border-left-color: var(--accent); }
-.query-pane :deep(.cm-selectionBackground), .query-pane :deep(.cm-focused .cm-selectionBackground) { background: var(--sel-strong) !important; }
-.query-pane :deep(.cm-send-range) { background: color-mix(in srgb, var(--accent) 9%, transparent); border-radius: 2px; }
+.query-pane :deep(.cm-cursor), .query-pane :deep(.cm-dropCursor) { border-left: 2px solid var(--caret); margin-left: -1px; }
+.query-pane :deep(.cm-selectionBackground), .query-pane :deep(.cm-content ::selection) { background: var(--editor-selection-blur) !important; }
+.query-pane :deep(.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground),
+.query-pane :deep(.cm-focused .cm-selectionBackground),
+.query-pane :deep(.cm-focused .cm-content ::selection) { background: var(--editor-selection) !important; }
+.query-pane :deep(.cm-send-range) { background: var(--editor-send-range); border-radius: 2px; }
+/* 搜索与匹配高亮取暖色：与选区/当前行/执行范围既不同色相也不同强度。
+   base.css 的全局匹配色带 !important；这里用更高特异性的令牌覆盖，并把「当前匹配」也留在暖色系，
+   不再沿用与选区同色的 --sel-strong。 */
+.query-pane :deep(.cm-searchMatch) { background: var(--editor-match) !important; border-radius: 2px; }
+.query-pane :deep(.cm-searchMatch.cm-searchMatch-selected) { background: var(--editor-match-active) !important; border-radius: 2px; box-shadow: inset 0 0 0 1px var(--caret); }
 /* 折叠标记自绘，不依赖系统字体里有没有 ⌄ 字形 */
 .query-pane :deep(.cm-foldGutter span[title]) { display: inline-block; width: 6px; height: 6px; margin: 0 4px; font-size: 0; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: translateY(-2px) rotate(45deg); opacity: .7; }
 .query-pane :deep(.cm-foldGutter span[title="Unfold line"]) { transform: rotate(-45deg); }

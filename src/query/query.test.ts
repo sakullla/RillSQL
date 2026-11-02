@@ -1,5 +1,5 @@
 import { currentCompletions, startCompletion } from "@codemirror/autocomplete";
-import { undo } from "@codemirror/commands";
+import { redo, undo } from "@codemirror/commands";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { flushPromises, mount } from "@vue/test-utils";
@@ -1665,4 +1665,150 @@ describe("completion frequency wiring", () => {
     localStorage.clear();
   });
 });
+describe("editor caret and selection stability", () => {
+  function queryTab(draft: string, tabId: string) {
+    replaceCatalog(catalogFixture());
+    return mount(QueryTab, {
+      props: {
+        tabId,
+        draft,
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+  }
 
+  it("keeps typing, undo, redo and delete on the clicked caret position", async () => {
+    const sql = "-- 订单筛选\nSELECT id, 名称 FROM orders;\nSELECT 2;";
+    const wrapper = queryTab(sql, "query-caret");
+    await nextTick();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
+    const clicked = sql.indexOf("名称") + 1;
+    view.dispatch({ selection: { anchor: clicked } });
+    await nextTick();
+
+    // 输入落在点击位置，光标停在新字符之后，其余字符不移动。
+    view.dispatch(view.state.replaceSelection("新"));
+    await nextTick();
+    const typed = sql.slice(0, clicked) + "新" + sql.slice(clicked);
+    expect(view.state.doc.toString()).toBe(typed);
+    expect(view.state.selection.main.head).toBe(clicked + 1);
+    const drafts = () => (wrapper.emitted("update:draft") ?? []).map((call) => call[1]);
+    expect(drafts()).toEqual([typed]);
+
+    // 撤销回到原文：内容与光标一起回退，不丢字符也不重复。
+    undo(view);
+    await nextTick();
+    expect(view.state.doc.toString()).toBe(sql);
+    expect(view.state.selection.main.head).toBe(clicked);
+    // 撤销回已提交的草稿：不再重复回写同一份文本。
+    expect(drafts()).toEqual([typed]);
+
+    // 重做再次落回输入后的内容与光标位置。
+    redo(view);
+    await nextTick();
+    expect(view.state.doc.toString()).toBe(typed);
+    expect(view.state.selection.main.head).toBe(clicked + 1);
+    expect(drafts()).toEqual([typed, typed]);
+
+    // 删除只影响光标所在字符，中文与注释行保持原样。
+    view.dispatch({ changes: { from: clicked, to: clicked + 1 } });
+    await nextTick();
+    expect(view.state.doc.toString()).toBe(sql);
+    expect(view.state.selection.main.head).toBe(clicked);
+    wrapper.unmount();
+  });
+
+  it("keeps the caret on its own line when the whole document is formatted", async () => {
+    const sql = "select  1;\nselect   2;\nselect 3;";
+    const wrapper = queryTab(sql, "query-format-caret");
+    await nextTick();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
+    view.dispatch({ selection: { anchor: sql.indexOf("select   2;") + 8 } });
+    await wrapper.get("[data-action='format']").trigger("click");
+    const next = view.state.doc.toString();
+    expect(next).not.toBe(sql);
+    const head = view.state.selection.main.head;
+    // 整篇格式化后光标留在原来的行，不跳到文档末尾。
+    expect(view.state.doc.lineAt(head).number).toBe(2);
+    expect(head).toBeLessThan(next.length);
+    wrapper.unmount();
+  });
+
+  it("puts the caret at the start when a history entry replaces the whole draft", async () => {
+    replaceCatalog(catalogFixture());
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "query_history") {
+        return [{
+          id: "h1",
+          sql: "SELECT count(*) FROM orders;",
+          connectionId: "shop",
+          connectionName: "Shop",
+          databaseName: "shop_staging",
+          engine: "mysql",
+          startedAt: "2026-10-20T09:30:00Z",
+          finishedAt: "2026-10-20T09:30:01Z",
+          status: "ok",
+          elapsedMs: 34,
+          summary: "1 行",
+        }];
+      }
+      throw new Error(command);
+    });
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-history-caret",
+        draft: "SELECT 1",
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
+    view.dispatch({ selection: { anchor: 8 } });
+    await wrapper.get("[data-action='history']").trigger("click");
+    await flushPromises();
+    await wrapper.get("[data-action='open-history']").trigger("click");
+    await flushPromises();
+    expect(view.state.doc.toString()).toBe("SELECT count(*) FROM orders;");
+    expect(view.state.selection.main.head).toBe(0);
+    // 载入后从开头继续编辑，不再追加到末尾。
+    view.dispatch(view.state.replaceSelection("-- 补充\n"));
+    expect(view.state.doc.toString().startsWith("-- 补充\nSELECT")).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("keeps the selection and the editor document when the run status refreshes", async () => {
+    const sql = "SELECT 1;\nSELECT 2;";
+    const wrapper = queryTab(sql, "query-refresh");
+    await nextTick();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
+    const element = wrapper.get(".cm-content").element;
+    const docBefore = view.state.doc;
+    view.dispatch({ selection: { anchor: 9, head: 18 } });
+    await nextTick();
+    adoptRun("query-refresh", runDto({ status: "running", statements: [] }));
+    await nextTick();
+    adoptRun("query-refresh", runDto({
+      status: "done",
+      statements: [{ sql: "SELECT 2;", status: "ok", message: "", columns: ["n"], rows: [["2"]], truncated: false, affected: 0 }],
+    }));
+    await flushPromises();
+    // 状态刷新只改结果区：同一个编辑器、同一份文档、同一段选区。
+    const range = view.state.selection.main;
+    expect([range.from, range.to]).toEqual([9, 18]);
+    expect(view.state.doc).toBe(docBefore);
+    expect(EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)).toBe(view);
+    expect(wrapper.get(".cm-content").element).toBe(element);
+    expect(wrapper.get("[data-action='run']").text()).toContain("执行选中");
+    wrapper.unmount();
+  });
+});

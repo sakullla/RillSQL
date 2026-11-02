@@ -133,6 +133,17 @@
   --sel: rgba(11, 122, 112, 0.09);
   --sel-strong: rgba(11, 122, 112, 0.17);
 
+  /* SQL 编辑器分层（R1、R2）：当前行 < 执行范围 < 失焦选区 < 聚焦选区，视觉强度依次递增，
+     四个层次都能同时看见。光标用不受选区色影响的高对比中性色；匹配高亮取暖色，
+     与选区的水青拉开色相，避免「选区、当前行、匹配、执行范围」糊成一片。 */
+  --caret: #10201f;
+  --editor-active-line: rgba(18, 38, 36, 0.045);
+  --editor-send-range: rgba(11, 122, 112, 0.08);
+  --editor-selection-blur: rgba(11, 122, 112, 0.14);
+  --editor-selection: rgba(11, 122, 112, 0.26);
+  --editor-match: rgba(214, 158, 12, 0.26);
+  --editor-match-active: rgba(214, 158, 12, 0.46);
+
   /* 焦点环与禁用态 */
   --ring: rgba(11, 122, 112, 0.28);
   --disabled-fg: #8b9a98;
@@ -234,6 +245,15 @@
   /* 选中 */
   --sel: rgba(47, 207, 186, 0.11);
   --sel-strong: rgba(47, 207, 186, 0.21);
+
+  /* SQL 编辑器分层：与浅色同一套职责，深底上整体提亮一档，保证失焦选区仍可辨认。 */
+  --caret: #f2fbfa;
+  --editor-active-line: rgba(230, 238, 237, 0.05);
+  --editor-send-range: rgba(47, 207, 186, 0.10);
+  --editor-selection-blur: rgba(47, 207, 186, 0.16);
+  --editor-selection: rgba(47, 207, 186, 0.32);
+  --editor-match: rgba(245, 192, 78, 0.24);
+  --editor-match-active: rgba(245, 192, 78, 0.44);
 
   /* 焦点环与禁用态 */
   --ring: rgba(47, 207, 186, 0.36);
