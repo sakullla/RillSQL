@@ -19,6 +19,119 @@ async function pickOption(targetPage, comboboxName, optionName) {
   await targetPage.getByRole("combobox", { name: comboboxName }).click();
   await targetPage.getByRole("option", { name: optionName, exact: true }).click();
 }
+
+/** 鼠标轨迹用例的合成数据：宽结果集与可编辑表格，形状与主流程一致但行数更小。 */
+function installMouseOverrides() {
+  const invoke = window.__TAURI_INTERNALS__.invoke;
+  window.__TAURI_INTERNALS__.invoke = async (command, args) => {
+    const result = await invoke(command, args);
+    if (command === "query_start" && result.engine !== "sqlserver") {
+      result.statements[0].columns = Array.from({ length: 12 }, (_, index) => index === 0 ? "id" : "column_" + index);
+      result.statements[0].rows = Array.from({ length: 200 }, (_, row) => Array.from({ length: 12 }, (_, col) => col === 0 ? String(row + 1) : "value-" + (row + 1) + "-" + col));
+    }
+    if (command === "grid_page") {
+      result.rows = Array.from({ length: 200 }, (_, index) => ({ ...result.rows[0], id: String(index + 1), cells: { ...result.rows[0].cells, id: String(index + 1), customer: "customer-" + (index + 1) }, locatorValues: [String(index + 1)] }));
+    }
+    return result;
+  };
+}
+
+/** 真实鼠标轨迹：在起点按下、跨格移动、在终点松开。 */
+async function dragBetween(host, from, to, steps = 12) {
+  const start = await host.locator(from).boundingBox();
+  const end = await host.locator(to).boundingBox();
+  expect(start, from).not.toBeNull();
+  expect(end, to).not.toBeNull();
+  await host.mouse.move(start.x + start.width / 2, start.y + start.height / 2);
+  await host.mouse.down();
+  await host.mouse.move(start.x + start.width / 2 + 4, start.y + start.height / 2, { steps: 2 });
+  await host.mouse.move(end.x + end.width / 2, end.y + end.height / 2, { steps });
+  await host.mouse.up();
+}
+
+/**
+ * R3/R7：真实鼠标轨迹覆盖 SQL 文本选择、两套表格拖选和右键按需查看值。
+ * 明暗主题各跑一次；单击必须只改选中，查看器只能由右键「查看值」打开。
+ */
+async function verifyMousePaths(host, theme) {
+  const queryRuns = () => host.evaluate(() => window.__uiCalls.filter(call => call.command === "query_start").length);
+  await host.getByRole("button", { name: "新建查询", exact: true }).click();
+  await host.locator("[data-action=target]").click();
+  await host.getByRole("listbox", { name: "执行目标" }).getByRole("option", { name: /书店 · 开发/ }).click();
+  await host.locator(".cm-content").click();
+  await host.keyboard.insertText("SELECT id, customer, status FROM orders;");
+
+  // SQL 编辑器：从右下往左上反向拖选，按钮切换成“执行选中”，拖动本身不发起查询。
+  const runsBeforeDrag = await queryRuns();
+  const editor = await host.locator(".cm-content").boundingBox();
+  await host.mouse.move(editor.x + editor.width - 24, editor.y + editor.height - 6);
+  await host.mouse.down();
+  await host.mouse.move(editor.x + editor.width / 2, editor.y + editor.height - 6, { steps: 6 });
+  await host.mouse.move(editor.x + 4, editor.y + 4, { steps: 12 });
+  await host.mouse.up();
+  await expect(host.locator("[data-action=run]")).toContainText("执行选中");
+  expect(await queryRuns()).toBe(runsBeforeDrag);
+
+  // 收起选区后执行整条语句，进入查询结果表格。
+  await host.locator(".cm-content").click();
+  await host.locator("[data-action=run]").click();
+  await expect(host.locator('[data-cell="r0:id"]')).toBeVisible();
+
+  await host.locator('[data-cell="r0:id"]').click();
+  await expect(host.getByRole("region", { name: "查询值查看器" })).toHaveCount(0);
+  await dragBetween(host, '[data-cell="r0:id"]', '[data-cell="r2:column_2"]');
+  await expect(host.locator("button.cell-btn.on")).toHaveAttribute("data-cell", "r2:column_2");
+  await expect(host.locator('[data-cell="r0:id"]')).toHaveClass(/range/);
+  await expect(host.locator('[data-cell="r2:column_2"]')).toHaveClass(/range/);
+  const resultRange = await host.locator(".cell-btn.range").count();
+  expect(resultRange).toBeGreaterThanOrEqual(4);
+  // 复制回执的格数必须等于可见选区，拖动也不进入编辑。
+  await host.keyboard.press("Control+c");
+  await expect(host.locator(".toast").last()).toContainText("已复制 " + resultRange + " 个单元格");
+  expect(await host.locator("input[aria-label^='编辑']").count()).toBe(0);
+
+  // 右键「查看值」以右键单元格为目标，关闭后换格不重开。
+  await host.locator('[data-cell="r1:column_1"]').click({ button: "right" });
+  await host.getByRole("menuitem", { name: "查看值" }).click();
+  const resultViewer = host.getByRole("region", { name: "查询值查看器" });
+  await expect(resultViewer).toBeVisible();
+  await expect(resultViewer).toContainText("column_1");
+  await expect(resultViewer.getByRole("textbox", { name: "column_1 的值" })).toHaveValue("value-2-1");
+  await resultViewer.getByRole("button", { name: "关闭" }).click();
+  await expect(resultViewer).toHaveCount(0);
+  await host.locator('[data-cell="r3:id"]').click();
+  await expect(resultViewer).toHaveCount(0);
+  report.checks.push(theme + ": SQL drag selects without running; query grid drags a rectangle, copies exactly that cell count and opens the viewer only for the context-menu target");
+
+  // 数据表格：同样的单击、拖选和右键查看值。
+  await host.getByRole("button", { name: "打开命令面板" }).click();
+  const palette = host.getByRole("dialog", { name: "命令面板" });
+  await palette.getByRole("combobox").fill("orders");
+  await palette.getByRole("option", { name: /^orders 书店/ }).click();
+  await expect(host.locator('[data-cell="1:customer"]')).toBeVisible();
+  await host.locator('[data-cell="1:customer"]').click();
+  await expect(host.getByRole("region", { name: "值查看器" })).toHaveCount(0);
+  await dragBetween(host, '[data-cell="1:id"]', '[data-cell="3:customer"]');
+  await expect(host.locator("button.cell-btn.on")).toHaveAttribute("data-cell", "3:customer");
+  await expect(host.locator('[data-cell="1:id"]')).toHaveClass(/range/);
+  await expect(host.locator('[data-cell="3:customer"]')).toHaveClass(/range/);
+  const tableRange = await host.locator(".cell-btn.range").count();
+  expect(tableRange).toBeGreaterThanOrEqual(4);
+  await host.keyboard.press("Control+c");
+  await expect(host.locator(".toast").last()).toContainText("已复制 " + tableRange + " 个单元格");
+  expect(await host.locator("input[aria-label^='编辑']").count()).toBe(0);
+  await host.locator('[data-cell="2:customer"]').click({ button: "right" });
+  await host.getByRole("menuitem", { name: "查看值" }).click();
+  const tableViewer = host.getByRole("region", { name: "值查看器" });
+  await expect(tableViewer).toBeVisible();
+  await expect(tableViewer).toContainText("customer");
+  await expect(tableViewer.getByRole("textbox", { name: "customer 的值" })).toHaveValue("customer-2");
+  await tableViewer.getByRole("button", { name: "关闭" }).click();
+  await expect(tableViewer).toHaveCount(0);
+  await host.locator('[data-cell="4:customer"]').click();
+  await expect(tableViewer).toHaveCount(0);
+  report.checks.push(theme + ": table drag keeps current cell and range in sync, copies that count and opens the viewer only from the right-click target");
+}
 const errors = [];
 const spreadsheetScripts = [];
 page.on("request", request => {
@@ -73,9 +186,16 @@ try {
   await page.getByRole("textbox", { name: "在已读取行中查找" }).fill("value-9876-1");
   await expect(page.locator("[data-row-id]")).toHaveCount(1);
   await expect(page.locator("[data-row-id]")).toContainText("9876");
+  // R7：普通单击只改选中，值查看器必须由右键「查看值」按需打开。
   await page.locator("[data-row-id] .cell-btn").nth(1).click();
+  await expect(page.getByRole("region", { name: "查询值查看器" })).toHaveCount(0);
+  await page.locator("[data-row-id] .cell-btn").nth(1).click({ button: "right" });
+  await page.getByRole("menuitem", { name: "查看值" }).click();
   await expect(page.getByRole("textbox", { name: "column_1 的值" })).toHaveValue("value-9876-1");
   await page.getByRole("region", { name: "查询值查看器" }).getByRole("button", { name: "关闭" }).click();
+  await expect(page.getByRole("region", { name: "查询值查看器" })).toHaveCount(0);
+  await page.locator("[data-row-id] .cell-btn").nth(2).click();
+  await expect(page.getByRole("region", { name: "查询值查看器" })).toHaveCount(0);
   await page.getByRole("textbox", { name: "在已读取行中查找" }).fill("");
   await page.getByRole("button", { name: "仅对已读取行按 id 排序", exact: true }).click();
   await expect(page.locator('th[aria-sort="ascending"]')).toHaveCount(1);
@@ -502,6 +622,22 @@ try {
   await expect(updates.locator("#app-update [role=alert]")).toContainText("Synthetic restart failure");
   await updates.close();
   report.checks.push("Synthetic update: startup offer, narrow layout, explicit download progress, draft checkpoint, install modal and restart failure recovery");
+
+  // R3/R4/R7：明暗主题下各跑一次真实鼠标轨迹（独立页面，互不污染主流程状态）。
+  for (const theme of ["dark", "light"]) {
+    const host = await browser.newPage({ viewport: { width: 1360, height: 900 } });
+    host.on("pageerror", error => errors.push(error.message));
+    // 复制回执要真实写剪贴板，才能验证选区与复制格数一致。
+    await host.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: base });
+    await host.addInitScript(installSyntheticIpc, theme);
+    await host.addInitScript(installMouseOverrides);
+    await host.goto(base);
+    try {
+      await verifyMousePaths(host, theme);
+    } finally {
+      await host.close();
+    }
+  }
 
   expect(errors).toEqual([]);
   report.checks.push("No browser page errors");

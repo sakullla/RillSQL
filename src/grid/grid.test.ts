@@ -18,6 +18,7 @@ import { TableSession } from "./session";
 import { browseSql, compileWhere, compileWhereWithSearch, searchClause, selectExportGate } from "./sql";
 import type { TableTarget } from "./target";
 import { setLocale } from "../i18n";
+import { toasts } from "../ui/toast";
 import { COMMIT_RULE, FILTER_OPS, opLabel, opNeedsValue, type Column, type TableSchema } from "./types";
 
 const invoke = vi.hoisted(() => vi.fn());
@@ -2015,10 +2016,12 @@ describe("query result keyboard navigation", () => {
     const wrapper = mountReadOnly("keys-copy");
     await flushPromises();
     await wrapper.get("[data-cell='r1:name']").trigger("pointerdown");
+    toasts.splice(0, toasts.length);
     await wrapper.get(".grid-scroll").trigger("keydown", { ctrlKey: true, key: "c" });
     await flushPromises();
     expect(writeText).toHaveBeenCalledWith("乙");
-    expect(wrapper.text()).toContain("已复制");
+    // 查看器默认隐藏：复制回执由全局轻提示承担，不再只出现在值查看器里。
+    expect(toasts.map((item) => item.text).join(" ")).toContain("已复制");
     wrapper.unmount();
   });
 });

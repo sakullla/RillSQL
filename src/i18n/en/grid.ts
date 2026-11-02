@@ -144,6 +144,7 @@ export const grid = {
     copiedSqlValue: "SQL value copied",
   },
   menu: {
+    viewValue: "View value",
     filterByValue: "Filter by this value",
     copiedCells: "Copied {n} cells",
     copy: "Copy",

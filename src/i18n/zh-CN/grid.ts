@@ -144,6 +144,7 @@ export const grid = {
     copiedSqlValue: "已复制 SQL 值",
   },
   menu: {
+    viewValue: "查看值",
     filterByValue: "按此值筛选",
     copiedCells: "已复制 {n} 个单元格",
     copy: "复制",

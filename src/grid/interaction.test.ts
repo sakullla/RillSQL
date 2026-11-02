@@ -347,7 +347,9 @@ describe("grid column width, clipboard and paging", () => {
     const wrapper = mount(DataGrid, { props: { tabId: "table:docs-binary-shape", draft: "", pageSize: 10, target } });
     await flushPromises();
     expect(wrapper.get("[data-cell='1:note']").text()).toContain(shaped);
-    await wrapper.get("[data-cell='1:note']").trigger("click");
+    await wrapper.get("[data-cell='1:note']").trigger("contextmenu", { clientX: 4, clientY: 4 });
+    await wrapper.get(".cell-menu").findAll("button").find((button) => button.text() === "查看值")!.trigger("click");
+    await flushPromises();
     await wrapper.findAll("button").find((button) => button.text() === "复制值")!.trigger("click");
     await flushPromises();
     expect(writeText).toHaveBeenCalledWith(shaped);
@@ -376,7 +378,9 @@ describe("grid column width, clipboard and paging", () => {
     const wrapper = mount(DataGrid, { props: { tabId: "table:docs-null-key", draft: "", pageSize: 10, target } });
     await flushPromises();
     expect(wrapper.get("[data-cell='o:0:0:note']").text()).toContain("t:3000");
-    await wrapper.get("[data-cell='o:0:0:note']").trigger("click");
+    await wrapper.get("[data-cell='o:0:0:note']").trigger("contextmenu", { clientX: 4, clientY: 4 });
+    await wrapper.get(".cell-menu").findAll("button").find((button) => button.text() === "查看值")!.trigger("click");
+    await flushPromises();
     await wrapper.findAll("button").find((button) => button.text() === "读取完整值")!.trigger("click");
     await flushPromises();
     expect((wrapper.get("textarea").element as HTMLTextAreaElement).value).toBe(synthetic);
@@ -402,7 +406,9 @@ describe("grid column width, clipboard and paging", () => {
     const view = mount(DataGrid, { props: { tabId: "table:docs-protocol-view", draft: "", pageSize: 10, target } });
     await flushPromises();
     expect(view.get("[data-cell='1:note']").text()).toContain("t:3000");
-    await view.get("[data-cell='1:note']").trigger("click");
+    await view.get("[data-cell='1:note']").trigger("contextmenu", { clientX: 4, clientY: 4 });
+    await view.get(".cell-menu").findAll("button").find((button) => button.text() === "查看值")!.trigger("click");
+    await flushPromises();
     await view.findAll("button").find((button) => button.text() === "读取完整值")!.trigger("click");
     await flushPromises();
     expect((view.get("textarea").element as HTMLTextAreaElement).value).toBe(synthetic);
@@ -420,7 +426,9 @@ describe("grid column width, clipboard and paging", () => {
     const located = mount(DataGrid, { props: { tabId: "table:docs-protocol-located", draft: "", pageSize: 10, target } });
     await flushPromises();
     expect(located.get("[data-cell='1:note']").text()).not.toContain("t:3000");
-    await located.get("[data-cell='1:note']").trigger("click");
+    await located.get("[data-cell='1:note']").trigger("contextmenu", { clientX: 4, clientY: 4 });
+    await located.get(".cell-menu").findAll("button").find((button) => button.text() === "查看值")!.trigger("click");
+    await flushPromises();
     await located.findAll("button").find((button) => button.text() === "读取完整值")!.trigger("click");
     await flushPromises();
     expect((located.get("textarea").element as HTMLTextAreaElement).value).toBe(synthetic);
@@ -536,7 +544,9 @@ describe("grid column width, clipboard and paging", () => {
     });
     await flushPromises();
     expect(wrapper.get("[data-cell='r0:note']").text()).toContain("t:3000");
-    await wrapper.get("[data-cell='r0:note']").trigger("pointerdown");
+    await wrapper.get("[data-cell='r0:note']").trigger("contextmenu", { clientX: 4, clientY: 4 });
+    await wrapper.get(".cell-menu").findAll("button").find((button) => button.text() === "查看值")!.trigger("click");
+    await flushPromises();
     await wrapper.findAll("button").find((button) => button.text() === "读取完整值")!.trigger("click");
     expect((wrapper.get("textarea").element as HTMLTextAreaElement).value).toBe(synthetic);
     await wrapper.findAll("button").find((button) => button.text() === "复制值")!.trigger("click");
@@ -564,3 +574,295 @@ describe("grid column width, clipboard and paging", () => {
     wrapper.unmount();
   });
 });
+
+const pointerTarget: TableTarget = { ...target, table: "customers" };
+
+/** 指针事件不依赖真实布局：直接派发到命中的单元格，冒泡到窗口监听。 */
+function pointerMove(el: Element, type = "pointermove") {
+  el.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true }));
+}
+
+function rangeCells(wrapper: { findAll: (selector: string) => { attributes: (name: string) => string | undefined }[] }) {
+  return wrapper.findAll(".cell-btn.range").map((button) => button.attributes("data-cell"));
+}
+
+describe("data grid pointer selection and on-demand value viewer", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    continueTabRun.mockClear();
+    tabRun.mockReset();
+    writeText.mockClear();
+    resetExportTasks();
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    resetCloseGuard();
+    resetCatalog();
+  });
+
+  function mountCustomers(tabId: string) {
+    const store = customersFixture(3);
+    invoke.mockImplementation(async (command: string, args: { request?: { offset?: number; limit?: number } }) => {
+      if (command === "grid_describe") return store.schema;
+      if (command === "grid_page") {
+        const offset = args.request?.offset ?? 0;
+        const limit = args.request?.limit ?? 100;
+        const rows = store.rows.slice(offset, offset + limit).map((row) => ({
+          id: row.id,
+          cells: { ...row.cells },
+          located: row.located,
+          locatorColumns: row.locator?.columns ?? [],
+          locatorValues: row.locator?.values ?? [],
+        }));
+        return { rows, truncated: offset + limit < store.rows.length, sql: "SELECT customers" };
+      }
+      if (command === "ddl_describe") return { foreignKeyList: [] };
+      throw new Error(command);
+    });
+    // 窗口级的 pointermove 监听只有在挂到文档上时才会收到冒泡的指针事件。
+    return mount(DataGrid, { attachTo: document.body, props: { tabId, draft: "", pageSize: 10, target: pointerTarget } });
+  }
+
+  /** 右键菜单里的“查看值”是唯一打开查看器的入口。 */
+  async function openViewer(wrapper: ReturnType<typeof mountCustomers>, cell: string) {
+    await wrapper.get("[data-cell='" + cell + "']").trigger("contextmenu", { clientX: 8, clientY: 8 });
+    await flushPromises();
+    await wrapper.get(".cell-menu [data-action='view-value']").trigger("click");
+    await flushPromises();
+  }
+
+  it("keeps the viewer closed for clicks, keyboard moves and drags", async () => {
+    const wrapper = mountCustomers("table:viewer-closed");
+    await flushPromises();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    await wrapper.get("[data-cell='1:name']").trigger("pointerdown");
+    await wrapper.get("[data-cell='1:name']").trigger("pointerup");
+    await wrapper.get("[data-cell='1:name']").trigger("click");
+    await flushPromises();
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("1:name");
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    await wrapper.get(".grid-scroll").trigger("keydown", { key: "ArrowRight" });
+    await flushPromises();
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("1:email");
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    await wrapper.get("[data-cell='2:id']").trigger("pointerdown");
+    pointerMove(wrapper.get("[data-cell='3:note']").element);
+    await wrapper.get(".grid-scroll").trigger("keydown", { key: "ArrowDown" });
+    await flushPromises();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    expect(wrapper.find("textarea").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("opens the viewer from the context menu for the right-clicked cell", async () => {
+    const wrapper = mountCustomers("table:viewer-menu");
+    await flushPromises();
+    await openViewer(wrapper, "2:email");
+    const inspector = wrapper.get(".inspector");
+    expect(inspector.attributes("aria-label")).toBe("值查看器");
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("2:email");
+    expect(inspector.text()).toContain("email");
+    expect((wrapper.get("textarea").element as HTMLTextAreaElement).value).toBe("u2@example.com");
+    expect(wrapper.find("[aria-label='email 的值']").exists()).toBe(true);
+    expect(wrapper.find(".cell-menu").exists()).toBe(false);
+    // 查看器里的复制使用这次明确查看的单元格。
+    await wrapper.findAll("button").find((button) => button.text() === "复制值")!.trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledWith("u2@example.com");
+    wrapper.unmount();
+  });
+
+  it("closes an open viewer on the next ordinary selection and never reopens on cell change", async () => {
+    const wrapper = mountCustomers("table:viewer-close");
+    await flushPromises();
+    await openViewer(wrapper, "1:name");
+    expect(wrapper.find(".inspector").exists()).toBe(true);
+
+    await wrapper.get(".inspector-close").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    // 关闭后换格、再换回来都不重新展开。
+    await wrapper.get("[data-cell='2:name']").trigger("pointerdown");
+    pointerMove(wrapper.get("[data-cell='1:name']").element);
+    await wrapper.get("[data-cell='1:name']").trigger("pointerup");
+    await flushPromises();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    // 已打开时进行普通选择：查看器关闭，而不是立刻展示新值。
+    await openViewer(wrapper, "1:name");
+    expect(wrapper.find(".inspector").exists()).toBe(true);
+    await wrapper.get("[data-cell='3:name']").trigger("pointerdown");
+    await wrapper.get("[data-cell='3:name']").trigger("pointerup");
+    await flushPromises();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("3:name");
+    wrapper.unmount();
+  });
+
+  it("follows fast pointer moves, keeps the last region on an outside release and clears on cancel", async () => {
+    const wrapper = mountCustomers("table:drag-lifecycle");
+    await flushPromises();
+
+    await wrapper.get("[data-cell='1:id']").trigger("pointerdown");
+    // 一次跨两行三列的移动：不能只依赖指针经过的每个单元格。
+    pointerMove(wrapper.get("[data-cell='3:note']").element);
+    await nextTick();
+    expect(rangeCells(wrapper)).toEqual([
+      "1:id", "1:name", "1:email", "1:note",
+      "2:id", "2:name", "2:email", "2:note",
+      "3:id", "3:name", "3:email", "3:note",
+    ]);
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    // 网格外释放：保留最后有效区域并结束拖动。
+    window.dispatchEvent(new PointerEvent("pointerup"));
+    await nextTick();
+    expect(rangeCells(wrapper)).toHaveLength(12);
+    pointerMove(wrapper.get("[data-cell='1:email']").element);
+    await nextTick();
+    expect(rangeCells(wrapper)).toHaveLength(12);
+    expect(wrapper.find("input[aria-label='编辑 name']").exists()).toBe(false);
+    expect(wrapper.find(".pending-bar").exists()).toBe(false);
+
+    // pointercancel：结束拖动、不编辑、不复制，之后移动不再扩展。
+    await wrapper.get("[data-cell='1:id']").trigger("pointerdown");
+    pointerMove(wrapper.get("[data-cell='2:name']").element);
+    await nextTick();
+    expect(rangeCells(wrapper)).toEqual(["1:id", "1:name", "2:id", "2:name"]);
+    window.dispatchEvent(new PointerEvent("pointercancel"));
+    await nextTick();
+    pointerMove(wrapper.get("[data-cell='3:note']").element);
+    await nextTick();
+    // 取消之后不再扩展：仍是取消前的两行两列。
+    expect(rangeCells(wrapper)).toEqual(["1:id", "1:name", "2:id", "2:name"]);
+    expect(writeText).not.toHaveBeenCalled();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("commits the last dragged cell without entering editing", async () => {
+    const wrapper = mountCustomers("table:drag-commit");
+    await flushPromises();
+    await wrapper.get("[data-cell='1:name']").trigger("pointerdown");
+    pointerMove(wrapper.get("[data-cell='2:name']").element);
+    pointerMove(wrapper.get("[data-cell='2:name']").element, "pointerup");
+    await flushPromises();
+    expect(wrapper.find("input[aria-label='编辑 name']").exists()).toBe(false);
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("2:name");
+    expect(rangeCells(wrapper)).toEqual(["1:name", "2:name"]);
+    // 拖选结束后双击仍然进入编辑。
+    await wrapper.get("[data-cell='2:name']").trigger("dblclick");
+    await flushPromises();
+    expect(wrapper.find("input[aria-label='编辑 name']").exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("copies exactly the rectangle the drag selected", async () => {
+    const wrapper = mountCustomers("table:drag-copy");
+    await flushPromises();
+    await wrapper.get("[data-cell='1:id']").trigger("pointerdown");
+    pointerMove(wrapper.get("[data-cell='2:name']").element);
+    pointerMove(wrapper.get("[data-cell='2:name']").element, "pointerup");
+    await flushPromises();
+    await wrapper.get(".grid-scroll").trigger("keydown", { ctrlKey: true, key: "c" });
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledWith("1\t小河\n2\t客户2");
+    wrapper.unmount();
+  });
+});
+
+describe("query result pointer selection and on-demand value viewer", () => {
+  beforeEach(() => {
+    writeText.mockClear();
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+  });
+
+  function mountResult(tabId: string) {
+    return mount(QueryResultGrid, {
+      // 窗口级的 pointermove 监听只有在挂到文档上时才会收到冒泡的指针事件。
+      attachTo: document.body,
+      props: {
+        tabId,
+        statement: "SELECT * FROM orders JOIN items ON items.id = orders.id",
+        columns: [column("id", "integer"), column("name", "text")],
+        rows: [
+          { id: "r0", cells: { id: "1", name: "甲" }, located: false, locator: null },
+          { id: "r1", cells: { id: "2", name: "乙" }, located: false, locator: null },
+        ],
+        truncated: false,
+        engine: "postgres",
+      },
+    });
+  }
+
+  it("shows the query viewer only when the context menu asks for it", async () => {
+    const wrapper = mountResult("query-viewer-menu");
+    await flushPromises();
+    await wrapper.get("[data-cell='r1:name']").trigger("pointerdown");
+    await wrapper.get("[data-cell='r1:name']").trigger("pointerup");
+    await flushPromises();
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("r1:name");
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    await wrapper.get("[data-cell='r0:name']").trigger("contextmenu", { clientX: 6, clientY: 6 });
+    await flushPromises();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    await wrapper.get(".cell-menu [data-action='view-value']").trigger("click");
+    await flushPromises();
+    expect(wrapper.get(".inspector").attributes("aria-label")).toBe("查询值查看器");
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("r0:name");
+    expect((wrapper.get("[aria-label='name 的值']").element as HTMLTextAreaElement).value).toBe("甲");
+
+    // 关闭后换格不重开。
+    await wrapper.get(".inspector").findAll("button").find((button) => button.text() === "关闭")!.trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    await wrapper.get("[data-cell='r1:id']").trigger("pointerdown");
+    await wrapper.get("[data-cell='r1:id']").trigger("pointerup");
+    await flushPromises();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    // 已打开时普通选择关闭查看器。
+    await wrapper.get("[data-cell='r0:name']").trigger("contextmenu", { clientX: 6, clientY: 6 });
+    await flushPromises();
+    await wrapper.get(".cell-menu [data-action='view-value']").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".inspector").exists()).toBe(true);
+    await wrapper.get("[data-cell='r1:name']").trigger("pointerdown");
+    await wrapper.get("[data-cell='r1:name']").trigger("pointerup");
+    await flushPromises();
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("keeps the dragged rectangle across fast moves and pointer cancel", async () => {
+    const wrapper = mountResult("query-drag-lifecycle");
+    await flushPromises();
+    await wrapper.get("[data-cell='r0:id']").trigger("pointerdown");
+    pointerMove(wrapper.get("[data-cell='r1:name']").element);
+    await nextTick();
+    expect(rangeCells(wrapper)).toEqual(["r0:id", "r0:name", "r1:id", "r1:name"]);
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+
+    pointerMove(wrapper.get("[data-cell='r1:name']").element, "pointerup");
+    await flushPromises();
+    expect(rangeCells(wrapper)).toHaveLength(4);
+    expect(wrapper.get("button.cell-btn.on").attributes("data-cell")).toBe("r1:name");
+
+    await wrapper.get("[data-cell='r0:id']").trigger("pointerdown");
+    pointerMove(wrapper.get("[data-cell='r1:id']").element);
+    await nextTick();
+    expect(rangeCells(wrapper)).toEqual(["r0:id", "r1:id"]);
+    window.dispatchEvent(new PointerEvent("pointercancel"));
+    await nextTick();
+    pointerMove(wrapper.get("[data-cell='r1:name']").element);
+    await nextTick();
+    // 取消之后不再扩展成两行两列。
+    expect(rangeCells(wrapper)).toEqual(["r0:id", "r1:id"]);
+    expect(wrapper.find(".inspector").exists()).toBe(false);
+    wrapper.unmount();
+  });
+});
+

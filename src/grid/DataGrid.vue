@@ -73,11 +73,17 @@ watch(
 const filterOp = ref<FilterOp>("eq");
 const columnOptions = computed(() => columns.value.map((column) => ({ value: column.name, label: column.name })));
 const opOptions = computed(() => FILTER_OPS.map((op) => ({ value: op.id, label: opLabel(op.id) })));
-/** 手动收起值检视后，换一个单元格再重新展开。 */
-const inspectorHidden = ref(false);
-watch(() => [session?.selectedId, session?.selectedColumn], () => {
-  inspectorHidden.value = false;
-});
+/** 值查看器只在右键「查看值」时打开：普通单击、键盘导航和拖选都不展开它。 */
+const viewer = ref<CellPoint | null>(null);
+/** 普通选择换了单元格就关掉已打开的查看器，而不是立即展示新值。 */
+watch(
+  () => [session?.selectedId, session?.selectedColumn] as const,
+  ([id, column]) => {
+    const target = viewer.value;
+    if (!target) return;
+    if (target.row !== id || target.column !== column) viewer.value = null;
+  },
+);
 const filterValue = ref("");
 const filterSecond = ref("");
 const filterValues = ref("");
@@ -187,9 +193,11 @@ watch(
   },
 );
 
-const selectedColumn = computed(() => columns.value.find((column) => column.name === session?.selectedColumn) ?? null);
-const selectedRaw = computed(() => (session?.selectedId && session.selectedColumn ? session.cellValue(session.selectedId, session.selectedColumn) : undefined));
-const selectedShown = computed(() => showCell(selectedRaw.value, { column: selectedColumn.value ?? undefined, previewBytes: previewBytes(), opened: isRevealed(), resolved: session?.selectedId ? session.rowById(session.selectedId)?.resolved === true : false }));
+/** 查看器内容只跟显式的查看目标走，不随普通选择漂移。 */
+const viewerKey = computed(() => (viewer.value ? `${viewer.value.row}:${viewer.value.column}` : ""));
+const viewerColumn = computed(() => columns.value.find((column) => column.name === viewer.value?.column) ?? null);
+const viewerRaw = computed(() => (viewer.value && session ? session.cellValue(viewer.value.row, viewer.value.column) : undefined));
+const viewerShown = computed(() => showCell(viewerRaw.value, { column: viewerColumn.value ?? undefined, previewBytes: previewBytes(), opened: revealed.has(viewerKey.value), resolved: viewer.value && session ? session.rowById(viewer.value.row)?.resolved === true : false }));
 const selectedPoints = computed(() => (anchor.value && focusCellPoint.value ? rectangleSelection(displayRows.value, columns.value, anchor.value, focusCellPoint.value) : []));
 /** 选中区即时统计（对标 DBeaver 的 Calc 面板）：NULL、空字符串、预览信封和 Number() 解析不了的格子不进数值统计。 */
 const calcStats = computed(() => {
@@ -370,11 +378,6 @@ async function beginEdit(id: string, column: string) {
   editError.value = "";
   editing.value = { id, column, draft: current ?? "", isNull: current === null };
   session.select(id, column);
-}
-
-function editSelected() {
-  if (!session?.selectedId || !session.selectedColumn) return;
-  beginEdit(session.selectedId, session.selectedColumn);
 }
 
 function saveEdit() {
@@ -566,9 +569,49 @@ function startResize(name: string, event: PointerEvent) {
   window.addEventListener("pointerup", resizeUp);
 }
 
+/** 用指针落点命中当前网格内的单元格；行 id 可能含冒号，所以按 data-row/data-column 取。 */
+function cellFromEvent(event: Event): CellPoint | null {
+  const hit = event.target instanceof Element ? event.target.closest(".cell-btn") : null;
+  if (!hit || !rootEl.value?.contains(hit)) return null;
+  const row = hit.getAttribute("data-row");
+  const column = hit.getAttribute("data-column");
+  if (!row || !column) return null;
+  return { row, column };
+}
+
+function samePoint(a: CellPoint | null, b: CellPoint | null): boolean {
+  return !!a && !!b && a.row === b.row && a.column === b.column;
+}
+
+/** 拖动期间只移动可见终点：不重开查看器，也不逐格提交选中。 */
+function onDragMove(event: PointerEvent) {
+  if (!dragging.value) return;
+  const hit = cellFromEvent(event);
+  if (!hit || samePoint(hit, focusCellPoint.value)) return;
+  focusCellPoint.value = hit;
+}
+
+/** 结束拖动并摘下全部窗口监听；pointerup 与 pointercancel 共用。 */
 function stopDrag() {
   dragging.value = false;
-  window.removeEventListener("pointerup", stopDrag);
+  window.removeEventListener("pointermove", onDragMove);
+  window.removeEventListener("pointerup", onDragEnd);
+  window.removeEventListener("pointercancel", onDragCancel);
+}
+
+function onDragEnd(event: PointerEvent) {
+  if (!dragging.value) return;
+  // 网格外释放：保留最后一个有效区域，不额外扩展，也不残留拖动状态。
+  const hit = cellFromEvent(event);
+  if (hit) focusCellPoint.value = hit;
+  const last = focusCellPoint.value;
+  stopDrag();
+  if (last) session?.select(last.row, last.column);
+}
+
+function onDragCancel() {
+  // 指针取消不编辑、不复制，只清理监听。
+  stopDrag();
 }
 
 function onCellDown(row: string, column: string, event: PointerEvent) {
@@ -577,14 +620,18 @@ function onCellDown(row: string, column: string, event: PointerEvent) {
   focusCellPoint.value = { row, column };
   dragging.value = true;
   menu.value = null;
+  viewer.value = null;
   session.select(row, column);
-  window.addEventListener("pointerup", stopDrag);
+  window.addEventListener("pointermove", onDragMove);
+  window.addEventListener("pointerup", onDragEnd);
+  window.addEventListener("pointercancel", onDragCancel);
 }
 
+/** pointerenter 只是快速移动的兜底：同样只移动可见终点。 */
 function onCellEnter(row: string, column: string) {
   if (!dragging.value) return;
+  if (samePoint(focusCellPoint.value, { row, column })) return;
   focusCellPoint.value = { row, column };
-  session?.select(row, column);
 }
 
 /** 右键「按此值筛选」：走与工具栏相同的整表筛选；大字段预览不是完整值，不提供。 */
@@ -601,6 +648,20 @@ async function filterByValue() {
   menu.value = null;
   const error = await session.addFilter(value === null ? { column: current.column, op: "null", value: "" } : { column: current.column, op: "eq", value: String(value) });
   filterError.value = error ?? "";
+}
+
+/** 右键「查看值」：以右键单元格为目标建立选择并显式打开查看器。 */
+function viewFromMenu() {
+  const target = menu.value;
+  if (!target || !session) return;
+  if (!isPicked(target.row, target.column)) {
+    anchor.value = { row: target.row, column: target.column };
+    focusCellPoint.value = { row: target.row, column: target.column };
+  }
+  session.select(target.row, target.column);
+  viewer.value = { row: target.row, column: target.column };
+  copyMessage.value = "";
+  menu.value = null;
 }
 
 function onCellMenu(row: string, column: string, event: MouseEvent) {
@@ -721,16 +782,18 @@ function setNullFromMenu() {
   }
 }
 
-async function copySelected(asSql: boolean) {
-  if (!session?.selectedColumn || !session.selectedId) return;
-  const error = await ensureFull(session.selectedId, session.selectedColumn);
+/** 复制一格的原值或 SQL 字面量；查看器与快捷键只是目标来源不同。 */
+async function copyCell(rowId: string, columnName: string, asSql: boolean) {
+  if (!session) return;
+  const error = await ensureFull(rowId, columnName);
   if (error) {
     copyMessage.value = error;
     return;
   }
-  const column = selectedColumn.value ?? undefined;
-  const resolved = session.rowById(session.selectedId)?.resolved === true;
-  const text = asSql ? copySqlValue(selectedRaw.value, column, session.store.schema.engine) : copyCellText(selectedRaw.value, props.nullCopy ?? settings.value.nullCopy, column, resolved);
+  const column = columns.value.find((item) => item.name === columnName);
+  const resolved = session.rowById(rowId)?.resolved === true;
+  const raw = session.cellValue(rowId, columnName);
+  const text = asSql ? copySqlValue(raw, column, session.store.schema.engine) : copyCellText(raw, props.nullCopy ?? settings.value.nullCopy, column, resolved);
   try {
     await navigator.clipboard.writeText(text);
     copyMessage.value = t("grid.value.copied");
@@ -739,28 +802,40 @@ async function copySelected(asSql: boolean) {
   }
 }
 
-function revealKey(): string {
-  if (!session) return "";
-  return `${session.selectedId}:${session.selectedColumn}`;
+function copySelected(asSql: boolean) {
+  if (!session?.selectedId || !session.selectedColumn) return;
+  void copyCell(session.selectedId, session.selectedColumn, asSql);
 }
 
-function isRevealed(): boolean {
-  return revealed.has(revealKey());
+/** 查看器按钮始终复制本次明确查看的单元格。 */
+function copyViewed(asSql: boolean) {
+  const target = viewer.value;
+  if (!target) return;
+  void copyCell(target.row, target.column, asSql);
 }
 
 async function fullValue() {
-  if (!session || !session.selectedId || !session.selectedColumn) return;
-  const error = await ensureFull(session.selectedId, session.selectedColumn);
+  const target = viewer.value;
+  if (!session || !target) return;
+  const error = await ensureFull(target.row, target.column);
   if (error) {
     copyMessage.value = error;
     return;
   }
-  revealed.add(revealKey());
+  revealed.add(viewerKey.value);
 }
 
 function editDisabled(): boolean {
-  if (!session || !session.selectedId || !session.selectedColumn) return true;
-  return !session.canDeleteRow(session.selectedId);
+  const target = viewer.value;
+  if (!session || !target) return true;
+  return !session.canDeleteRow(target.row);
+}
+
+/** 查看器里的“编辑”只作用于本次明确查看的单元格。 */
+function editViewed() {
+  const target = viewer.value;
+  if (!target) return;
+  void beginEdit(target.row, target.column);
 }
 
 const importTables = computed(() => {
@@ -931,7 +1006,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
                 <button class="btn sm ghost" type="button" @click="cancelEdit">{{ t("common.cancel") }}</button>
                 <p v-if="editError" class="menu-error" role="alert">{{ editError }}</p>
               </div>
-              <button v-else class="cell-btn" :class="{ on: session.selectedId === row.id && session.selectedColumn === column.name, range: isPicked(row.id, column.name) }" :data-cell="`${row.id}:${column.name}`" type="button" @pointerdown="onCellDown(row.id, column.name, $event)" @pointerenter="onCellEnter(row.id, column.name)" @click="session.select(row.id, column.name)" @contextmenu="onCellMenu(row.id, column.name, $event)" @dblclick="beginEdit(row.id, column.name)">
+              <button v-else class="cell-btn" :class="{ on: session.selectedId === row.id && session.selectedColumn === column.name, range: isPicked(row.id, column.name) }" :data-cell="`${row.id}:${column.name}`" :data-row="row.id" :data-column="column.name" type="button" @pointerdown="onCellDown(row.id, column.name, $event)" @pointerenter="onCellEnter(row.id, column.name)" @click="session.select(row.id, column.name)" @contextmenu="onCellMenu(row.id, column.name, $event)" @dblclick="beginEdit(row.id, column.name)">
                 <span v-if="columnIndex === 0 && row.kind === 'insert'" class="row-flag">{{ t("grid.editor.newFlag") }}</span>
                 <span v-if="columnIndex === 0 && row.deleted" class="row-flag del">{{ t("grid.editor.deleteFlag") }}</span>
                 <span :class="{ 'v-null': row.cells[columnIndex]?.kind === 'null', 'v-empty': row.cells[columnIndex]?.kind === 'empty', 'v-large': row.cells[columnIndex]?.kind === 'large' }">{{ row.cells[columnIndex]?.label }}</span>
@@ -976,18 +1051,18 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
     </div>
     <p v-else-if="receipt" class="commit-receipt" role="status">{{ receipt }}</p>
     </div>
-    <section v-if="session.selectedId && !inspectorHidden" class="inspector" :aria-label="t('grid.value.viewer')">
+    <section v-if="viewer" class="inspector" :aria-label="t('grid.value.viewer')">
       <div class="inspector-meta">
-        <button class="icon-btn sm inspector-close" type="button" :aria-label="t('common.close')" :title="t('common.close')" @click="inspectorHidden = true"><Icon name="x" /></button>
-        <span>{{ t("grid.value.column") }} <strong>{{ session.selectedColumn }}</strong></span>
-        <span>{{ t("grid.value.value") }} <em :class="selectedShown.kind === 'null' ? 'v-null' : selectedShown.kind === 'empty' ? 'v-empty' : ''">{{ selectedShown.kind === "null" ? "NULL" : selectedShown.kind === "empty" ? t("grid.value.emptyTitle") : selectedShown.kind === "large" ? t("grid.value.largeCurrent") : selectedShown.title }}</em></span>
+        <button class="icon-btn sm inspector-close" type="button" :aria-label="t('common.close')" :title="t('common.close')" @click="viewer = null"><Icon name="x" /></button>
+        <span>{{ t("grid.value.column") }} <strong>{{ viewer.column }}</strong></span>
+        <span>{{ t("grid.value.value") }} <em :class="viewerShown.kind === 'null' ? 'v-null' : viewerShown.kind === 'empty' ? 'v-empty' : ''">{{ viewerShown.kind === "null" ? "NULL" : viewerShown.kind === "empty" ? t("grid.value.emptyTitle") : viewerShown.kind === "large" ? t("grid.value.largeCurrent") : viewerShown.title }}</em></span>
       </div>
-      <textarea readonly :value="selectedShown.body" :aria-label="t('grid.value.columnValue', { column: session.selectedColumn })"></textarea>
+      <textarea readonly :value="viewerShown.body" :aria-label="t('grid.value.columnValue', { column: viewer.column })"></textarea>
       <div class="inspector-actions">
-        <button v-if="selectedShown.kind === 'large'" class="btn sm" type="button" @click="fullValue">{{ t("grid.value.readFull") }}</button>
-        <button class="btn sm" type="button" :disabled="editDisabled()" @click="editSelected">{{ t("common.edit") }}</button>
-        <button class="btn sm" type="button" @click="copySelected(false)">{{ t("grid.value.copyValue") }}</button>
-        <button class="btn sm" type="button" @click="copySelected(true)">{{ t("grid.value.copySqlValue") }}</button>
+        <button v-if="viewerShown.kind === 'large'" class="btn sm" type="button" @click="fullValue">{{ t("grid.value.readFull") }}</button>
+        <button class="btn sm" type="button" :disabled="editDisabled()" @click="editViewed">{{ t("common.edit") }}</button>
+        <button class="btn sm" type="button" @click="copyViewed(false)">{{ t("grid.value.copyValue") }}</button>
+        <button class="btn sm" type="button" @click="copyViewed(true)">{{ t("grid.value.copySqlValue") }}</button>
         <span v-if="copyMessage" class="copy-message" data-copy>{{ copyMessage }}</span>
       </div>
       <p class="legend">
@@ -1043,6 +1118,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
       @done="onImportDone"
     />
     <div v-if="menu" class="cell-menu" role="menu" :style="{ left: `${menu.x}px`, top: `${menu.y}px` }" @contextmenu.prevent>
+      <button type="button" role="menuitem" data-action="view-value" @click="viewFromMenu"><Icon name="eye" />{{ t("grid.menu.viewValue") }}</button>
       <button type="button" role="menuitem" @click="copySelection(); menu = null"><Icon name="copy" />{{ t("grid.menu.copy") }}</button>
       <button v-if="canFilterByValue" type="button" role="menuitem" data-action="filter-by-value" @click="filterByValue"><Icon name="filter" />{{ t("grid.menu.filterByValue") }}</button>
       <button type="button" role="menuitem" @click="editFromMenu"><Icon name="pencil" />{{ t("common.edit") }}</button>

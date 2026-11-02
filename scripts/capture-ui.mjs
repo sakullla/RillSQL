@@ -11,7 +11,11 @@ const scenarioTitles = {
   "connection-editor": "编辑连接",
   "connection-ssh": "SSH 隧道",
   query: "查询结果",
+  "query-selection": "查询结果拖选",
+  "query-viewer": "查询结果右键查看值",
   "data-grid": "数据表格",
+  "data-grid-selection": "数据表格拖选",
+  "data-grid-viewer": "数据表格右键查看值",
   structure: "表结构",
   definition: "函数定义",
   diagram: "关系图",
@@ -203,6 +207,18 @@ async function captureImage(page, name, theme, width, state) {
   console.log(path);
 }
 
+/** 真实鼠标轨迹：在起点按下、跨格移动、在终点松开。 */
+async function dragCells(host, from, to, steps = 12) {
+  const start = await host.locator(from).boundingBox();
+  const end = await host.locator(to).boundingBox();
+  if (!start || !end) throw new Error("拖选目标不可见：" + from + " → " + to);
+  await host.mouse.move(start.x + start.width / 2, start.y + start.height / 2);
+  await host.mouse.down();
+  await host.mouse.move(start.x + start.width / 2 + 4, start.y + start.height / 2, { steps: 2 });
+  await host.mouse.move(end.x + end.width / 2, end.y + end.height / 2, { steps });
+  await host.mouse.up();
+}
+
 async function openWorkspace(page, labels = { nav: "主导航", workspace: "工作台" }) {
   const rail = page.getByRole("navigation", { name: labels.nav });
   if ((await rail.getByRole("button", { name: labels.workspace }).getAttribute("aria-current")) !== "page") {
@@ -306,6 +322,18 @@ try {
         await expect(page.getByLabel("执行结果")).toContainText("林夏");
         await captureImage(page, "query", theme, width, "选择执行目标后的查询结果");
 
+        // R3/R7：真实鼠标拖选与右键按需查看值（查看器默认不出现）。
+        if (selectedScenarios.includes("query-selection") || selectedScenarios.includes("query-viewer")) {
+          await dragCells(page, '[data-cell="r0:id"]', '[data-cell="r1:customer"]');
+          await captureImage(page, "query-selection", theme, width, "鼠标拖选形成的连续区域与当前单元格");
+          await page.locator('[data-cell="r1:customer"]').click({ button: "right" });
+          await page.getByRole("menuitem", { name: "查看值" }).click();
+          await expect(page.getByRole("region", { name: "查询值查看器" })).toBeVisible();
+          await captureImage(page, "query-viewer", theme, width, "右键「查看值」打开的查询值查看器，目标是右键单元格");
+          await page.getByRole("region", { name: "查询值查看器" }).getByRole("button", { name: "关闭" }).click();
+          await expect(page.getByRole("region", { name: "查询值查看器" })).toHaveCount(0);
+        }
+
         await page.getByRole("button", { name: "打开命令面板" }).click();
         const palette = page.getByRole("dialog", { name: "命令面板" });
         await palette.getByRole("combobox").fill("orders");
@@ -314,6 +342,17 @@ try {
         await collapseOverlay(page, width);
         await expect(page.getByLabel("数据表格")).toContainText("林夏");
         await captureImage(page, "data-grid", theme, width, "orders 已读取的三行，含 NULL");
+
+        if (selectedScenarios.includes("data-grid-selection") || selectedScenarios.includes("data-grid-viewer")) {
+          await dragCells(page, '[data-cell="1001:id"]', '[data-cell="1003:customer"]');
+          await captureImage(page, "data-grid-selection", theme, width, "数据表格的拖选区域与当前单元格");
+          await page.locator('[data-cell="1002:customer"]').click({ button: "right" });
+          await page.getByRole("menuitem", { name: "查看值" }).click();
+          await expect(page.getByRole("region", { name: "值查看器" })).toBeVisible();
+          await captureImage(page, "data-grid-viewer", theme, width, "右键「查看值」打开的值查看器，单次单击不会打开");
+          await page.getByRole("region", { name: "值查看器" }).getByRole("button", { name: "关闭" }).click();
+          await expect(page.getByRole("region", { name: "值查看器" })).toHaveCount(0);
+        }
 
         await collapseOverlay(page, width);
         await page.getByRole("tab", { name: "结构", exact: true }).click();
