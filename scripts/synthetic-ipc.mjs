@@ -479,7 +479,7 @@ export function installSyntheticIpc(initialTheme) {
         if (command.startsWith("plugin:event|")) return 1;
         if (command === "plugin:dialog|open" || command === "plugin:dialog|save") return null;
         if (command === "app_info") {
-          return { title: "澄库 · RillSQL", name_zh: "澄库", name_en: "RillSQL", license: "GPL-3.0-only", data_dir: "C:\\Users\\local\\AppData\\Roaming\\RillSQL" };
+          return { title: "RillSQL", name_en: "RillSQL", license: "GPL-3.0-only", data_dir: "C:\\Users\\local\\AppData\\Roaming\\RillSQL" };
         }
         if (command === "catalog_sessions") return catalog.map((item) => ({ id: item.id, status: "connected", reason: null }));
         if (command === "catalog_refresh") return catalog;

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "澄库主窗口：默认核心权限、文件对话框和连接命令。",
+  "description": "RillSQL main window: default core permissions, file dialogs and connection commands.",
   "windows": ["main"],
   "permissions": [
     "core:default",

@@ -79,7 +79,7 @@ describe("shell layout", () => {
   it("keeps the brand and the command entry visible", () => {
     const title = mount(TitleBar, { props: { theme: "system" } });
     expect(title.text()).toContain("RillSQL");
-    expect(title.text()).toContain("澄库");
+    expect(title.text()).not.toContain("澄库");
     expect(title.find(".cmd-trigger").attributes("aria-label")).toBe("打开命令面板");
     expect(desktopShell()).toBe(false);
     expect(title.find(".caption").exists()).toBe(false);
@@ -308,6 +308,7 @@ describe("shell layout", () => {
   });
 
   it("puts the product title on the window and the html document", () => {
+    expect(productTitle()).toBe("RillSQL");
     const html = readFileSync(resolve(root, "index.html"), "utf8");
     const tauri = readFileSync(resolve(root, "src-tauri/tauri.conf.json"), "utf8");
     expect(html).toContain(`<title>${productTitle()}</title>`);

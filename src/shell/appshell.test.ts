@@ -128,7 +128,7 @@ describe("AppShell", () => {
   it("opens the welcome page with two primary paths and no login gate", () => {
     const wrapper = mount(AppShell);
     const text = wrapper.text();
-    expect(text).toContain("澄库");
+    expect(text).not.toContain("澄库");
     expect(text).toContain("RillSQL");
     expect(wrapper.find(".welcome").exists()).toBe(true);
     expect(wrapper.find(".titlebar").exists()).toBe(true);

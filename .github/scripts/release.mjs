@@ -65,6 +65,10 @@ export function checkTauriVersions(root = ROOT) {
 export function checkProject(tag, root = ROOT) {
   const version = validateVersions(readVersions(root), tag);
   checkTauriVersions(root);
+  const config = json(resolve(root, "src-tauri/tauri.conf.json"));
+  if (config.productName !== "RillSQL") {
+    throw new Error("Keep productName as RillSQL: it is used in installation paths and bundle names.");
+  }
   return version;
 }
 

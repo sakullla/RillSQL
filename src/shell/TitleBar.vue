@@ -43,7 +43,6 @@ const choices: { id: ThemePreference }[] = [
     <div class="tb-brand">
       <BrandMark />
       <strong>RillSQL</strong>
-      <span v-if="t('shell.titlebar.brandCn')" class="brand-cn">{{ t("shell.titlebar.brandCn") }}</span>
       <button class="icon-btn sidebar-toggle" data-tauri-drag-region="false" type="button" :aria-label="t('shell.titlebar.toggleSidebar')" :title="t('shell.titlebar.sidebarTitle')" @click="emit('toggle-sidebar')"><Icon name="sidebar" /></button>
     </div>
     <button class="cmd-trigger" type="button" :aria-label="t('shell.titlebar.openPalette')" @click="emit('palette')">

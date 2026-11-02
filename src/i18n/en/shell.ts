@@ -16,7 +16,6 @@ export const shell = {
     system: "Follow system",
   },
   titlebar: {
-    brandCn: "",
     toggleSidebar: "Show or hide the explorer",
     sidebarTitle: "Explorer (Ctrl+B)",
     openPalette: "Open command palette",
@@ -138,7 +137,7 @@ export const shell = {
     version: "Version {version} · {license}",
   },
   about: {
-    tagline: "“澄” for clarity, “库” for database; Rill means a small stream. A lightweight SQL workbench for individual developers.",
+    tagline: "Rill means a small stream. A lightweight SQL workbench for individual developers.",
     absent: "Provides a read-only diagram of the current database or schema. No AI, cloud sync, NoSQL, backup or ops monitoring.",
     factOffline: "No account needed, works offline, no cloud sign-in on the welcome page",
     factNoCloud: "No cloud sync, no telemetry",
@@ -161,7 +160,7 @@ export const shell = {
     newConnectionHint: "PostgreSQL, MySQL, SQL Server, Redis and more",
     openSqliteHint: "Pick a database file on this machine",
     kicker: "A LOCAL-FIRST DATABASE WORKBENCH",
-    title: "澄库 · RillSQL",
+    title: "RillSQL",
     subtitle: "Settings stay on this machine, passwords go to the system credential store, no account needed.",
     factLocal: "Settings and query history stay local",
     factKeyring: "Passwords are kept in the system credential store",
@@ -240,6 +239,6 @@ export const shell = {
     help: "Keyboard shortcuts",
   },
   product: {
-    title: "澄库 · RillSQL",
+    title: "RillSQL",
   },
 };

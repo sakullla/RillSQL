@@ -1250,7 +1250,7 @@ fn alter_risks(snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Vec<Risk> {
         if !same_type(&draft.type_name, &original.type_name) {
             risks.push(Risk {
                 level: "warn".to_owned(),
-                text: format!("字段 {} 的类型由 {} 改为 {}。无法转换的值会使执行失败；澄库不会自动截断或清空数据。", original.name, original.type_name, draft.type_name.trim()),
+                text: format!("字段 {} 的类型由 {} 改为 {}。无法转换的值会使执行失败；RillSQL 不会自动截断或清空数据。", original.name, original.type_name, draft.type_name.trim()),
             });
         }
         if draft.name.trim() != original.name {

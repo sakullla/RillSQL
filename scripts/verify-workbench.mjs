@@ -341,9 +341,9 @@ try {
   await page.getByRole("navigation", { name: "主导航" }).getByRole("button", { name: "设置", exact: true }).click();
   await pickOption(page, "界面语言", "English");
   await expect(page.getByRole("heading", { name: "Settings", exact: true })).toBeVisible();
-  // 设置页（除 about 卡：品牌名「澄库 · RillSQL」与品牌释义按品牌专名保留中文）不允许出现汉字。
-  expect(await page.locator("section.set-sec:not(.about)").first().innerText()).not.toMatch(HAN);
-  for (const section of await page.locator("section.set-sec:not(.about)").all()) {
+  // 包括关于页在内，英文设置界面不应残留中文品牌名或释义。
+  expect(await page.locator("section.set-sec").first().innerText()).not.toMatch(HAN);
+  for (const section of await page.locator("section.set-sec").all()) {
     expect(await section.innerText()).not.toMatch(HAN);
   }
   expect(await page.locator(".settings-nav").innerText()).not.toMatch(HAN);

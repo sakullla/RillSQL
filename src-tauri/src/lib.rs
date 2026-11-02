@@ -18,7 +18,6 @@ use serde::Serialize;
 #[derive(Serialize)]
 struct AppInfo {
     title: &'static str,
-    name_zh: &'static str,
     name_en: &'static str,
     license: &'static str,
     data_dir: String,
@@ -28,7 +27,6 @@ struct AppInfo {
 fn app_info() -> AppInfo {
     AppInfo {
         title: product::TITLE,
-        name_zh: product::NAME_ZH,
         name_en: product::NAME_EN,
         license: product::LICENSE,
         data_dir: local_data_dir(),
@@ -117,7 +115,7 @@ pub fn run() {
     wire(tauri::Builder::default(), connections::commands::ConnectionsState::new())
         .plugin(tauri_plugin_dialog::init())
         .run(tauri::generate_context!())
-        .expect("启动澄库 · RillSQL 失败");
+        .expect("启动 RillSQL 失败");
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -224,8 +222,7 @@ mod tests {
 
     #[test]
     fn title_names_the_product() {
-        assert_eq!(product::TITLE, "澄库 · RillSQL");
-        assert!(product::TITLE.contains(product::NAME_ZH));
+        assert_eq!(product::TITLE, "RillSQL");
         assert!(product::TITLE.contains(product::NAME_EN));
         assert_eq!(product::LICENSE, "GPL-3.0-only");
     }

@@ -28,10 +28,10 @@ function savedConnection(): CatalogConnection {
 }
 
 describe("product identity", () => {
-  it("shows both names and the two primary paths on the welcome page", () => {
+  it("shows the product name and the two primary paths on the welcome page", () => {
     const wrapper = mount(WelcomeView);
     const text = wrapper.text();
-    expect(text).toContain("澄库");
+    expect(text).not.toContain("澄库");
     expect(text).toContain("RillSQL");
     expect(text).toContain("无需账号");
     expect(text).toContain("配置留在本机");
@@ -69,7 +69,7 @@ describe("product identity", () => {
   it("states the first release exclusions on the about section", () => {
     const wrapper = mount(SettingsView, { props: { settings: { ...DEFAULT_SETTINGS }, dataDir: null } });
     const text = wrapper.text();
-    expect(text).toContain("澄库 · RillSQL");
+    expect(text).toContain("RillSQL");
     expect(text).toContain(aboutAbsent());
     expect(text).toContain("只读关系图");
     expect(text).not.toContain("没有 AI、云同步、NoSQL、关系图");

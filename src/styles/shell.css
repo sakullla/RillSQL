@@ -35,8 +35,7 @@
   app-region: drag;
 }
 .titlebar.custom-chrome .tb-brand { min-width: 0; padding-left: var(--sp-3); }
-.titlebar.custom-chrome .tb-brand strong,
-.titlebar.custom-chrome .brand-cn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.titlebar.custom-chrome .tb-brand strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .titlebar.custom-chrome .cmd-trigger,
 .titlebar.custom-chrome .tb-actions { -webkit-app-region: no-drag; app-region: no-drag; }
 .titlebar.custom-chrome .cmd-trigger { width: 100%; min-width: 0; max-width: 100%; margin: 0; }
@@ -68,7 +67,6 @@
 
 .tb-brand { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
 .tb-brand strong { font-size: var(--fs-md); letter-spacing: -0.01em; font-weight: 650; }
-.brand-cn { color: var(--text-3); font-size: var(--fs-sm); }
 .brand-mark { display: inline-grid; flex-shrink: 0; }
 .brand-mark svg { width: 22px; height: 22px; }
 .brand-mark rect { fill: var(--accent); }
@@ -293,7 +291,6 @@
 
 /* ---------- 响应式 ---------- */
 @media (max-width: 960px) {
-  .brand-cn,
   .cmd-trigger .kbd { display: none; }
   .app-root:not(.sidebar-hidden) .sidebar {
     position: absolute;

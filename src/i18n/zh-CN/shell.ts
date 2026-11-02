@@ -16,7 +16,6 @@ export const shell = {
     system: "跟随系统",
   },
   titlebar: {
-    brandCn: "澄库",
     toggleSidebar: "显示或隐藏资源管理器",
     sidebarTitle: "资源管理器 (Ctrl+B)",
     openPalette: "打开命令面板",
@@ -138,7 +137,7 @@ export const shell = {
     version: "版本 {version} · {license}",
   },
   about: {
-    tagline: "“澄”取清澈之意，“库”指数据库；Rill 意为细流。面向个人开发者的轻量 SQL 工作台。",
+    tagline: "Rill 意为细流。面向个人开发者的轻量 SQL 工作台。",
     absent: "已提供当前库或 schema 的只读关系图。没有 AI、云同步、NoSQL、备份恢复和运维监控入口。",
     factOffline: "无需账号，离线可用，进入欢迎页不需要云登录",
     factNoCloud: "不做云同步，不收集遥测",
@@ -161,7 +160,7 @@ export const shell = {
     newConnectionHint: "PostgreSQL、MySQL、SQL Server、Redis 等",
     openSqliteHint: "选择本机上的数据库文件",
     kicker: "本地优先的数据库工作台",
-    title: "澄库 · RillSQL",
+    title: "RillSQL",
     subtitle: "配置留在本机，密码进入系统凭据库，无需账号。",
     factLocal: "配置与查询历史只写在本机",
     factKeyring: "密码保存在系统凭据库",
@@ -240,6 +239,6 @@ export const shell = {
     help: "键盘快捷键",
   },
   product: {
-    title: "澄库 · RillSQL",
+    title: "RillSQL",
   },
 };

@@ -3,7 +3,6 @@ import { productTitle } from "./product";
 
 export interface AppInfo {
   title: string;
-  name_zh: string;
   name_en: string;
   license: string;
   data_dir: string;
