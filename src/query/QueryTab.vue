@@ -651,8 +651,10 @@ function asciiLower(text: string): string {
 /**
  * 整篇格式化会按子句重排换行、重排缩进并丢掉行尾空白，所以字符位置和「行号 + 列」都不能直接沿用。
  * 这里只是一个带守卫的保守回退：仅当格式化前后行数相同、原列没有越过该行新长度，
- * 并且「原行光标前的文本」与「新行光标前的文本」忽略 ASCII 大小写后完全相同时，才保留同一列；
- * 其余情况（语句被拆成多行、行尾空白被删导致列越界、缩进被重排、关键字被改写）一律退到文档末尾。
+ * 并且「原行光标前的文本」与「新行光标前的文本」忽略 ASCII 大小写后完全相同时，才保留同一列。
+ * 换句话说，只有「光标前的文本仅发生 ASCII 大小写改写」（如 select → SELECT）才保留同一列；
+ * 其余情况（语句被拆成多行、行尾空白被删导致列越界、缩进被重排、大小写之外被改写的关键字）
+ * 一律退到文档末尾。
  * 它不试图把光标映射到同一个 token，也不保证语义定位，只是把光标放到一个可预测的位置（R1）。
  */
 function caretAfterWholeFormat(doc: string, caret: number, next: string): number {
@@ -666,7 +668,8 @@ function caretAfterWholeFormat(doc: string, caret: number, next: string): number
   if (lines.length !== doc.split("\n").length) return next.length;
   const target = lines[line];
   if (target === undefined || column > target.length) return next.length;
-  // 光标前的文本被格式化改动（缩进重排、关键字改写、空白折叠）时，同一列已经指向别的字符。
+  // 除「仅 ASCII 大小写变化」外，光标前的文本被格式化改写（缩进重排、空白折叠、关键字改写）后，
+  // 同一列已经指向别的字符。
   if (asciiLower(target.slice(0, column)) !== asciiLower(linePrefix)) return next.length;
   let offset = 0;
   for (let index = 0; index < line; index += 1) offset += lines[index]!.length + 1;

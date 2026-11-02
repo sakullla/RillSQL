@@ -1792,6 +1792,27 @@ describe("editor caret and selection stability", () => {
     wrapper.unmount();
   });
 
+  it("keeps the caret column when formatting only rewrites ASCII case before it", async () => {
+    const sql = "select\n  id\nfrom\n  t";
+    const wrapper = queryTab(sql, "query-format-caret-case");
+    await nextTick();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
+    // 光标停在首行 select 的中间（"sel|ect"）：格式化只把这个关键字改写成大写。
+    const anchor = 3;
+    expect(sql.slice(anchor)).toBe("ect\n  id\nfrom\n  t");
+    view.dispatch({ selection: { anchor } });
+    await wrapper.get("[data-action='format']").trigger("click");
+    const next = view.state.doc.toString();
+    expect(next).toBe("SELECT\n  id\nFROM\n  t");
+    // 行数没变、列没越界，且光标前的文本只有 ASCII 大小写差异（sel → SEL），所以保留同一列。
+    expect(next.slice(0, anchor)).toBe("SEL");
+    expect(view.state.selection.main.head).toBe(anchor);
+    // 排除退到末尾与退到行首两种错位。
+    expect(view.state.selection.main.head).not.toBe(next.length);
+    expect(view.state.selection.main.head).not.toBe(0);
+    wrapper.unmount();
+  });
+
   it("drops the caret to the document end when formatting rewrites the indentation before it", async () => {
     // 四条语句各自成行，格式化后行数依旧是 4，原光标列 4 也没有越界；
     // 但光标前的缩进从「四个空格」被重排成「两个空格」，同一列已经从 id 之前挪到 id 之后。
