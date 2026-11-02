@@ -89,7 +89,7 @@ export const grid = {
     columnNotNull: "This column cannot be NULL",
     readonlyCell: "Read-only, cannot modify",
     previewWriteback: "Preview content cannot be written back",
-    clipboardFailed: "Copy failed; select the text in the value viewer and copy it there.",
+    clipboardFailed: "Copy failed. Try again, or open View value and copy the text manually.",
     schemaReadFailed: "Reading the table schema failed; reference rows cannot be opened right now.",
   },
   commit: {

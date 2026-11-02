@@ -89,7 +89,7 @@ export const grid = {
     columnNotNull: "这一列不能是 NULL",
     readonlyCell: "只读，不能修改",
     previewWriteback: "预览内容不能写回",
-    clipboardFailed: "复制失败，请在值查看器中选中文本复制。",
+    clipboardFailed: "复制失败，请重试；仍失败可右键“查看值”后手动选择文本复制。",
     schemaReadFailed: "读取表结构失败，暂时不能跳转引用行。",
   },
   commit: {
