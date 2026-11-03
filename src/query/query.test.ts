@@ -1620,7 +1620,7 @@ describe("query editing", () => {
     });
     await nextTick();
     expect(wrapper.get("[data-action='run']").text()).toContain("执行");
-    expect(wrapper.get("[data-action='run-menu']").exists()).toBe(true);
+    expect(wrapper.find("[data-action='run-menu']").exists()).toBe(true);
     expect(wrapper.get(".q-toolbar .conn-state").text().length).toBeGreaterThan(0);
     expect(wrapper.find("[data-menu='more-tools']").exists()).toBe(false);
     await wrapper.get("[data-action='more-tools']").trigger("click");
@@ -1635,7 +1635,7 @@ describe("query editing", () => {
       "实际执行并分析",
     ]);
     expect(menu.find("[data-action='run']").exists()).toBe(false);
-    expect(wrapper.get(".run-group [data-action='run']").exists()).toBe(true);
+    expect(wrapper.find(".run-group [data-action='run']").exists()).toBe(true);
     await menu.get("[data-action='outline']").trigger("click");
     expect(wrapper.find("[data-menu='more-tools']").exists()).toBe(false);
     expect(wrapper.get("[data-action='outline']").attributes("aria-pressed")).toBe("true");
@@ -1643,10 +1643,10 @@ describe("query editing", () => {
     const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
     await wrapper.get("[data-menu='more-tools'] [data-action='format']").trigger("click");
     expect(view.state.doc.toString()).not.toBe("select  1");
-    expect(wrapper.get("[data-action='run']").exists()).toBe(true);
+    expect(wrapper.find("[data-action='run']").exists()).toBe(true);
     const badge = wrapper.get(".results-heading > .badge");
     expect(badge.text()).toContain("只读结果");
-    const reason = wrapper.getCurrentComponent().provides.resultEditReason as Ref<string>;
+    const reason = (wrapper.getCurrentComponent() as unknown as { provides: { resultEditReason: Ref<string> } }).provides.resultEditReason;
     reason.value = "按 id 定位行，查询结果不能新增行";
     await nextTick();
     expect(badge.attributes("title")).toBe("按 id 定位行，查询结果不能新增行");

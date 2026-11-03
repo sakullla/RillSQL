@@ -25,10 +25,10 @@ import { COMMIT_RULE, FILTER_OPS, opLabel, opNeedsValue, type Column, type Table
 /** 查询结果把编辑原因写进查询页提供的 ref，测试从这里读，而不是从工具栏正文读。 */
 const resultEditReason = ref("");
 
-function mount(component: Parameters<typeof mountComponent>[0], options?: MountingOptions<never>) {
+function mount(component: Parameters<typeof mountComponent>[0], options?: MountingOptions<any>) {
   if (component === QueryResultGrid) {
     resultEditReason.value = "";
-    return mountComponent(component, {
+    return mountComponent(component as any, {
       ...options,
       global: {
         ...options?.global,
@@ -36,7 +36,7 @@ function mount(component: Parameters<typeof mountComponent>[0], options?: Mounti
       },
     });
   }
-  return mountComponent(component, options);
+  return mountComponent(component as any, options as any);
 }
 
 const invoke = vi.hoisted(() => vi.fn());

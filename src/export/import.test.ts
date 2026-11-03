@@ -467,7 +467,7 @@ describe("xlsx import", () => {
     expect(source).toContain(".ex-choice.on small { display: block;");
     expect(source).toContain(".ex-file-input { display: none; }");
     expect(source).toContain(".map-table td small.req { margin-inline-start: var(--sp-2); }");
-    expect(wrapper.get("[data-action=pick-import-file]").exists()).toBe(true);
+    expect(wrapper.find("[data-action=pick-import-file]").exists()).toBe(true);
     expect(wrapper.get(".ex-choice.on small").text()).toContain("第一行是列名");
     const hidden = wrapper.findAll(".ex-choice:not(.on)");
     expect(hidden).toHaveLength(2);
