@@ -31,18 +31,17 @@ Recent history commonly uses `feat:`, `fix:`, and `docs:` prefixes with short En
 ## Release Process
 Versions follow SemVer. `.github/workflows/release.yml` runs when a `v*` tag is pushed: it requires successful main CI for that exact commit, creates a draft release with notes generated from commit subjects, builds the Windows (NSIS), macOS ARM64 (DMG), and Linux (DEB, AppImage) installers, verifies their exact version/architecture filenames and nonempty uploads, then publishes the draft. Every checkout and draft is bound to the verified commit SHA; publication checks the tag has not moved. Updater packages are signed with a dedicated RillSQL key and published with a complete `latest.json` after all platform builds finish. Installers are not platform code-signed. See `.github/README.md` for cache and retry details.
 
-1. Create `release/vX.Y.Z` from an up-to-date `main`.
-2. Set the same version in all six places; `node .github/scripts/release.mjs check` fails on any mismatch:
+1. On an up-to-date `main`, set the same version in all six places; `node .github/scripts/release.mjs check` fails on any mismatch:
    - `package.json`
    - `package-lock.json` (top-level `version` and `packages[""].version`)
    - `src-tauri/Cargo.toml`
    - `src-tauri/Cargo.lock` (the `rillsql` package)
    - `src-tauri/tauri.conf.json`
    - `PRODUCT_VERSION` in `src/shell/product.ts`
-3. Validate locally: `npm test`, `npm run build`, `node scripts/i18n-scan.mjs`, `node --test .github/scripts/release.test.mjs`. For UI changes, also start Vite and run `npm run verify:workbench` and `npm run capture:ui`.
-4. Commit as `chore: 发布 vX.Y.Z`, push the branch, and fast-forward `main`: `git push origin release/vX.Y.Z release/vX.Y.Z:main`. GitHub only registers a workflow once it exists on the default branch; a tag pushed before that starts nothing and reports no error.
-5. Wait for CI on `main` to pass: `gh run watch`. The release job depends on the same CI, so a failure here would stop the release anyway.
-6. Create and push an annotated tag: `git tag -a vX.Y.Z -m "RillSQL vX.Y.Z"`, then `git push origin vX.Y.Z`. `release.mjs check vX.Y.Z` rejects a tag that does not match the version.
-7. Follow the run with `gh run watch` and confirm the release with `gh release view vX.Y.Z`.
+2. Validate locally: `npm test`, `npm run build`, `node scripts/i18n-scan.mjs`, `node --test .github/scripts/release.test.mjs`. For UI changes, also start Vite and run `npm run verify:workbench` and `npm run capture:ui`.
+3. Commit as `chore: 发布 vX.Y.Z` on `main` and push it: `git push origin main`. GitHub only registers a workflow once it exists on the default branch; a tag pushed before that starts nothing and reports no error.
+4. Wait for CI on `main` to pass: `gh run watch`. The release job depends on the same CI, so a failure here would stop the release anyway.
+5. Create and push an annotated tag: `git tag -a vX.Y.Z -m "RillSQL vX.Y.Z"`, then `git push origin vX.Y.Z`. `release.mjs check vX.Y.Z` rejects a tag that does not match the version.
+6. Follow the run with `gh run watch` and confirm the release with `gh release view vX.Y.Z`.
 
 For infrastructure failures, rerun the failed jobs on the same tag and commit; the workflow resumes only a matching draft. If code must change, use a new patch version and tag. Do not move a pushed release tag or reuse a published version. A tag containing `-` (for example `v0.2.1-rc.1`) is published as a pre-release.
