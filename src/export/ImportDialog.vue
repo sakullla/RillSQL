@@ -52,6 +52,9 @@ const writing = ref(false);
 const describing = ref(false);
 /** 拖放接进来时展示来源文件名，提示内容已读取、仍可另选文件。 */
 const droppedName = ref("");
+/** 应用内文件按钮（R4）：隐藏原生 input，由按钮触发，并展示已选文件名。 */
+const fileInput = ref<HTMLInputElement | null>(null);
+const chosenName = ref("");
 
 const choices = computed(() => {
   const list = [...(props.tables ?? [])];
@@ -97,6 +100,8 @@ function resetForOpen(): void {
   localTarget.value = props.target;
   tableKey.value = keyOf(props.target.schema, props.target.table);
   droppedName.value = props.seed?.fileName ?? "";
+  chosenName.value = "";
+  if (fileInput.value) fileInput.value.value = "";
   if (props.seed) {
     format.value = props.seed.format;
     delimiter.value = props.seed.delimiter ?? ",";
@@ -223,6 +228,11 @@ function applyText(text: string) {
   mapping.value = suggestMapping(activeSchema.value.columns, outcome.data.columns);
 }
 
+function pickFile() {
+  if (writing.value) return;
+  fileInput.value?.click();
+}
+
 async function onFile(event: Event) {
   const version = ++fileVersion;
   parseVersion += 1;
@@ -230,6 +240,8 @@ async function onFile(event: Event) {
   resultText.value = "";
   parsed.value = null;
   if (!file) return;
+  chosenName.value = file.name;
+  droppedName.value = "";
   if (format.value === "xlsx" || file.name.toLowerCase().endsWith(".xlsx")) {
     const bytes = new Uint8Array(await file.arrayBuffer());
     if (version !== fileVersion || !props.open) return;
@@ -304,9 +316,17 @@ resetForOpen();
           <label for="import-delimiter">{{ t("export.dialog.delimiter") }}</label>
           <Listbox id="import-delimiter" :model-value="delimiter" :options="delimiterOptions" :aria-label="t('export.importDialog.delimiterAria')" :disabled="writing" @update:model-value="onDelimiter" />
         </div>
-        <label class="ex-path">{{ t("export.importDialog.chooseFile") }}
-          <input type="file" :aria-label="t('export.importDialog.fileAria')" accept=".csv,.tsv,.json,.txt,.xlsx,text/csv,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" :disabled="writing" @change="onFile" />
-        </label>
+        <div class="ex-path ex-file">
+          <span class="ex-file-label">{{ t("export.importDialog.chooseFile") }}</span>
+          <div class="ex-file-row">
+            <button class="btn sm" type="button" data-action="pick-import-file" :disabled="writing" @click="pickFile">
+              <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM13 3v5h5" /></svg>
+              {{ t("export.importDialog.pickFileButton") }}
+            </button>
+            <span class="ex-file-name" :class="{ none: !chosenName }" :title="chosenName || undefined">{{ chosenName ? t("export.importDialog.fileChosen", { name: chosenName }) : t("export.importDialog.noFileChosen") }}</span>
+          </div>
+          <input ref="fileInput" class="ex-file-input" type="file" :aria-label="t('export.importDialog.fileAria')" accept=".csv,.tsv,.json,.txt,.xlsx,text/csv,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" :disabled="writing" @change="onFile" />
+        </div>
         <p v-if="droppedName" class="ex-note" data-dropped-file>{{ t("export.importDialog.droppedRead", { name: droppedName }) }}</p>
         <p v-if="parsed && gaps.length" class="ex-alert" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>{{ t("export.importDialog.gapsBlocked", { fields: gaps.join(t("common.listJoin")) }) }}</p>
         <table v-if="parsed" class="map-table">
@@ -337,8 +357,8 @@ resetForOpen();
       <footer class="ex-foot">
         <span class="muted sm">{{ describing ? t("export.importDialog.describing") : writing ? t("export.importDialog.writing") : t("export.importDialog.confirmFirst") }}</span>
         <span class="grow"></span>
-        <button class="btn" type="button" :disabled="writing" @click="emit('close')">{{ t("common.cancel") }}</button>
-        <button class="btn primary" type="button" :disabled="!canWrite" @click="confirm">{{ t("export.importDialog.importButton") }}</button>
+        <button class="btn" type="button" data-action="import-cancel" :disabled="writing" @click="emit('close')">{{ t("common.cancel") }}</button>
+        <button class="btn primary" type="button" data-action="import-confirm" :disabled="!canWrite" @click="confirm">{{ t("export.importDialog.importButton") }}</button>
       </footer>
     </div>
   </div>
@@ -381,8 +401,12 @@ resetForOpen();
 .ex-choice b { font-size: var(--fs-sm); font-weight: 600; }
 .ex-choice small { display: block; color: var(--text-2); font-size: var(--fs-xs); line-height: var(--lh); margin-top: 2px; }
 .ex-path { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-sm); color: var(--text-2); }
-.ex-path input[type="file"] { width: 100%; margin-top: var(--sp-1); min-height: var(--control-h); padding: var(--sp-1); border: 1px dashed var(--line-2); border-radius: var(--r); background: var(--surface-sunken); color: var(--text-2); font-size: var(--fs-xs); }
-.ex-path input[type="file"]::file-selector-button { font: 500 var(--fs-xs) var(--font); height: var(--control-h-sm); margin-right: var(--sp-2); padding: 0 var(--sp-3); border: 1px solid var(--stroke); border-radius: var(--r); background: var(--surface-panel); color: var(--text); cursor: pointer; }
+/* 应用内文件选择（R4）：隐藏原生 input，用按钮触发并展示已选文件名 */
+.ex-file-input { display: none; }
+.ex-file-label { font-size: var(--fs-sm); color: var(--text-2); }
+.ex-file-row { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; flex-wrap: wrap; }
+.ex-file-name { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-xs); color: var(--text-2); }
+.ex-file-name.none { color: var(--text-3); }
 
 /* 映射表与预览井 */
 .map-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }

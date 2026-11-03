@@ -16,7 +16,7 @@ import type { StructureForeignKey } from "../structure/types";
 import { rectangleSelection, selectionTsv, type CellPoint } from "./clipboard";
 import { copyCellText, copySqlValue, needsFullRead, showCell, type NullCopy } from "./display";
 import { referenceJump, referenceQuery } from "./reference";
-import { isPreviewEnvelope, rejectWrite, typeCaption, valueFamily } from "./typeset";
+import { columnTypeSuffix, isPreviewEnvelope, rejectWrite, typeCaption, valueFamily } from "./typeset";
 import "./grid.css";
 import Icon from "../shell/Icon.vue";
 import { Listbox } from "../ui";
@@ -1061,7 +1061,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
         <thead>
           <tr>
             <th v-for="column in columns" :key="column.name" scope="col" :class="{ num: numericColumn(column) }" :style="columnStyle(column.name)" :data-type="typeCaption(column)" :aria-sort="session.sort?.column === column.name ? (session.sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'">
-              <button class="th-btn" type="button" :aria-label="t('grid.read.sortLabel', { column: column.name })" @click="session.cycleSort(column.name)"><span class="th-name">{{ column.name }}</span><span class="col-type">{{ typeCaption(column) }}</span><span v-if="session.sort?.column === column.name" class="sort-arrow" aria-hidden="true">{{ session.sort.direction === "asc" ? "↑" : "↓" }}</span></button>
+              <button class="th-btn" type="button" :aria-label="t('grid.read.sortLabel', { column: column.name })" @click="session.cycleSort(column.name)"><span class="th-name">{{ column.name }}</span><span v-if="columnTypeSuffix(column)" class="col-type">{{ columnTypeSuffix(column) }}</span><span v-if="session.sort?.column === column.name" class="sort-arrow" aria-hidden="true">{{ session.sort.direction === "asc" ? "↑" : "↓" }}</span></button>
               <span class="col-resize" role="separator" :aria-label="t('grid.read.resizeColumn', { column: column.name })" @pointerdown.stop.prevent="startResize(column.name, $event)"></span>
             </th>
           </tr>

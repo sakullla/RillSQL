@@ -73,6 +73,13 @@ export function typeCaption(column: Pick<Column, "typeName"> | undefined): strin
   return column.typeName;
 }
 
+/** 列头弱化类型尾注（R2）：类型已知时返回类型名，未知时返回空串——避免逐列重复「类型未知」。
+   列头的 data-type 与值检视仍用 typeCaption 给出完整说明。 */
+export function columnTypeSuffix(column: Pick<Column, "typeName"> | undefined): string {
+  if (!column || isUnknownType(column.typeName)) return "";
+  return column.typeName;
+}
+
 /** 类型本身不能写回时给出原因。NULL 不能绕过几何、原文和类型未知。resolved 表示主键另读已经返回这段原文。 */
 export function rejectWrite(column: Column | undefined, value: Cell | undefined, resolved = false): string | null {
   if (value === undefined) return null;

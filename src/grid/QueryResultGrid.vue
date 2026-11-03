@@ -20,7 +20,7 @@ import Icon from "../shell/Icon.vue";
 import { toast } from "../ui/toast";
 import { useGridSettings } from "./settings";
 import { locateResultRows, provedEditableColumns, readSingleTable, refusalText, resolveEditableTable, ResultEditSession, type TableHit } from "./result-edit";
-import { rejectWrite, typeCaption, valueFamily } from "./typeset";
+import { columnTypeSuffix, rejectWrite, typeCaption, valueFamily } from "./typeset";
 import type { Cell, Column, Engine, Row, SortSpec } from "./types";
 
 const props = defineProps<{
@@ -998,7 +998,7 @@ watch(() => props.rows, (rows) => {
           <tr>
             <th class="row-number" :aria-label="t('grid.cell.rowNumber')">#</th>
             <th v-for="column in columns" :key="column.name" :class="{ num: numericColumn(column) }" :style="columnStyle(column.name)" :data-type="typeCaption(column)" :aria-sort="sort?.column === column.name ? (sort.direction === 'asc' ? 'ascending' : 'descending') : 'none'">
-              <button class="th-btn" type="button" :aria-label="t('grid.cell.sortLoaded', { column: column.name })" @click="cycle(column.name)"><span class="th-name">{{ column.name }}</span><span class="col-type">{{ typeCaption(column) }}</span><span v-if="sort?.column === column.name" class="sort-arrow" aria-hidden="true">{{ sort.direction === 'asc' ? '↑' : '↓' }}</span></button>
+              <button class="th-btn" type="button" :aria-label="t('grid.cell.sortLoaded', { column: column.name })" @click="cycle(column.name)"><span class="th-name">{{ column.name }}</span><span v-if="columnTypeSuffix(column)" class="col-type">{{ columnTypeSuffix(column) }}</span><span v-if="sort?.column === column.name" class="sort-arrow" aria-hidden="true">{{ sort.direction === 'asc' ? '↑' : '↓' }}</span></button>
               <span class="col-resize" role="separator" :aria-label="t('grid.read.resizeColumn', { column: column.name })" @pointerdown.stop.prevent="startResize(column.name, $event)"></span>
             </th>
           </tr>

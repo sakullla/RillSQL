@@ -129,7 +129,7 @@ describe("import into an existing table", () => {
   it("does not write when import is cancelled or a required column is missing", async () => {
     const cancelled = dialog();
     await chooseFile(cancelled, "rows.csv", "name,email\r\n甲,a@example.com");
-    await cancelled.get(".btn").trigger("click");
+    await cancelled.get("[data-action='import-cancel']").trigger("click");
     expect(cancelled.emitted("close")).toHaveLength(1);
     expect(invoke).not.toHaveBeenCalled();
     cancelled.unmount();
@@ -410,7 +410,7 @@ describe("xlsx import", () => {
   it("writes nothing when import is cancelled or the sheet cannot be mapped", async () => {
     const cancelled = dialog();
     await chooseBytes(cancelled, "rows.xlsx", rows);
-    await cancelled.get(".btn").trigger("click");
+    await cancelled.get("[data-action='import-cancel']").trigger("click");
     expect(cancelled.emitted("close")).toHaveLength(1);
     expect(invoke).not.toHaveBeenCalled();
     cancelled.unmount();

@@ -1,6 +1,6 @@
 import { tr } from "../i18n";
 
-export const PRODUCT_VERSION = "0.2.6";
+export const PRODUCT_VERSION = "0.2.7";
 export const PRODUCT_LICENSE = "GPL-3.0-only";
 
 /** 窗口/文档标题：品牌名不随界面语言变化（品牌专名，两语言一致）。 */
