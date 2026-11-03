@@ -407,7 +407,8 @@ describe("compare", () => {
     expect(structureDetails.contains(wrapper.get("[data-action=place-structure]").element)).toBe(true);
     expect(wrapper.get(".cmp-foot").element.contains(wrapper.get("[data-action=compare-structure]").element)).toBe(true);
     expect(wrapper.get(".cmp-body").element.contains(wrapper.get("[data-action=compare-structure]").element)).toBe(false);
-    expect(wrapper.get("[data-action=compare-close]").classes()).not.toContain("primary");
+    expect(wrapper.find("[data-action=compare-close]").exists()).toBe(false);
+    expect(wrapper.get(".cmp-foot .btn.primary").attributes("data-action")).toBe("compare-structure");
     await wrapper.get("[data-action=compare-data]").trigger("click");
     await flushPromises();
     const dataDetails = wrapper.get("[data-data-script]").element.closest("details") as HTMLDetailsElement;

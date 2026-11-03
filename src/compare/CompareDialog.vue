@@ -357,7 +357,6 @@ function place(sql: string) {
         <span v-if="busy" class="cmp-hint">{{ t("compare.dialog.comparing") }}</span>
         <span class="grow"></span>
         <button class="btn" type="button" data-action="compare-cancel" :disabled="!busy" @click="cancelRun">{{ t("common.cancel") }}</button>
-        <button class="btn" type="button" data-action="compare-close" @click="closeDialog">{{ t("common.close") }}</button>
         <button class="btn primary" type="button" data-action="compare-structure" :disabled="busy || schemaPending" @click="runStructure">{{ t("compare.dialog.compareStructure") }}</button>
       </footer>
     </div>
