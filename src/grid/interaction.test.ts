@@ -1022,6 +1022,37 @@ describe("query result pointer selection and on-demand value viewer", () => {
     wrapper.unmount();
   });
 
+  it("copies a whole row, a whole column and a WHERE condition from the cell menu", async () => {
+    const wrapper = mountResult("query-menu-copy-shapes");
+    await flushPromises();
+    /* 只读结果（无连接）：不出现删除标记项。 */
+    await wrapper.get("[data-cell='r1:name']").trigger("contextmenu", { clientX: 6, clientY: 6 });
+    expect(wrapper.get(".cell-menu").text()).toContain("复制整行");
+    expect(wrapper.get(".cell-menu").text()).toContain("复制整列");
+    expect(wrapper.get(".cell-menu").text()).toContain("复制为 WHERE 条件");
+    expect(wrapper.get(".cell-menu").text()).not.toContain("标记删除行");
+    await wrapper.get(".cell-menu").findAll("button").find((button) => button.text() === "复制整行")!.trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenLastCalledWith("2\t乙");
+
+    await wrapper.get("[data-cell='r1:name']").trigger("contextmenu", { clientX: 6, clientY: 6 });
+    await wrapper.get(".cell-menu").findAll("button").find((button) => button.text() === "复制整列")!.trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenLastCalledWith("甲\n乙");
+
+    await wrapper.get("[data-cell='r1:name']").trigger("contextmenu", { clientX: 6, clientY: 6 });
+    await wrapper.get(".cell-menu").findAll("button").find((button) => button.text() === "复制为 WHERE 条件")!.trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenLastCalledWith("name = '乙'");
+
+    // 数字列同样按字面量条件复制。
+    await wrapper.get("[data-cell='r0:id']").trigger("contextmenu", { clientX: 6, clientY: 6 });
+    await wrapper.get(".cell-menu").findAll("button").find((button) => button.text() === "复制为 WHERE 条件")!.trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenLastCalledWith("id = 1");
+    wrapper.unmount();
+  });
+
   it("keeps the dragged rectangle across fast moves and pointer cancel", async () => {
     const wrapper = mountResult("query-drag-lifecycle");
     await flushPromises();

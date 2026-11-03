@@ -148,6 +148,11 @@ export const grid = {
     filterByValue: "按此值筛选",
     copiedCells: "已复制 {n} 个单元格",
     copy: "复制",
+    copyRow: "复制整行",
+    copyColumn: "复制整列",
+    copyWhere: "复制为 WHERE 条件",
+    markDelete: "标记删除行",
+    unmarkDelete: "取消删除标记",
     jumpReference: "查看引用行 → {label}",
   },
   cell: {

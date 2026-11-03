@@ -235,6 +235,7 @@
 .cell-menu button { gap: var(--sp-2); }
 .cell-menu button .i { width: 14px; height: 14px; color: var(--text-3); }
 .cell-menu button:hover { background: var(--hover); }
+.cell-menu-sep { height: 1px; margin: var(--sp-1) var(--sp-2); background: var(--line); }
 .menu-error { margin: var(--sp-1) 0 0; color: var(--err); font-size: var(--fs-xs); }
 
 /* ---------- 行状态 ---------- */

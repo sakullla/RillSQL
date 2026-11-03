@@ -81,6 +81,7 @@ export const shell = {
     requestCancel: "请求取消执行",
     autocomplete: "补全",
     toggleComment: "注释 / 取消注释",
+    toggleResults: "显示 / 隐藏查询结果区",
     format: "格式化选中的 SQL；无选中时格式化全部",
     explain: "查看当前语句的执行计划",
     leaveEditor: "离开编辑器（不会插入缩进）",

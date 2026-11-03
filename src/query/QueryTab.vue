@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { autocompletion, startCompletion, type CompletionContext } from "@codemirror/autocomplete";
-import { toggleComment } from "@codemirror/commands";
+import { selectAll, toggleComment } from "@codemirror/commands";
 import { sql } from "@codemirror/lang-sql";
 import { foldService, HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { linter } from "@codemirror/lint";
@@ -19,6 +19,9 @@ import QueryResultGrid from "../grid/QueryResultGrid.vue";
 import type { Engine } from "../grid/types";
 import Icon from "../shell/Icon.vue";
 import { tabHasPending } from "../shell/close-guard";
+import ContextMenu from "../ui/ContextMenu.vue";
+import type { MenuItem } from "../ui/types";
+import { toast } from "../ui/toast";
 import { buildInsertText, registerEditor, setEditorFocus, unregisterEditor, type InsertReference, type QueryEditorApi } from "../shell/query-editor";
 import { loadSettings, onSettingsSaved, type EditorTheme } from "../shell/settings";
 import { connectionStatusText, type ConnectionStatus } from "../shell/status-text";
@@ -135,6 +138,10 @@ let outlineTouched = false;
 let piecesCache: { text: string; engine: string; list: OutlineStatement[] } | null = null;
 /* 编辑器聚焦态：well 容器获得/失去焦点时切换聚焦环。 */
 const editorFocused = ref(false);
+/* 编辑器右键菜单：锚点在编辑器内部弹出的屏幕坐标，null 表示关闭。 */
+const editorMenu = ref<{ x: number; y: number } | null>(null);
+/* 隐藏结果区 = 全屏编辑 SQL；比例记在 editorPercent 里，恢复时原样带回。 */
+const resultsHidden = ref(false);
 /* 运行中实时计时：run.elapsedMs 只在轮询时刷新，这里用本地计时让状态条平滑走动。 */
 const runStartedAt = ref(0);
 const runTick = ref(0);
@@ -411,9 +418,111 @@ function stepStatement(delta: -1 | 1): void {
   jumpToStatement(list[next]!);
 }
 
+/** 大纲右键「执行此语句」：不移动光标，直接发送这条语句，守卫与编辑器内执行一致。 */
+async function runStatement(statement: OutlineStatement): Promise<void> {
+  actionError.value = "";
+  analyzePrompt.value = false;
+  if (running.value || submitting.value) return;
+  if (tabHasPending(props.tabId)) {
+    actionError.value = t("query.errors.dirtyResults");
+    return;
+  }
+  mountEditor();
+  const blocked = targetProblem("execute");
+  if (blocked) {
+    actionError.value = blocked;
+    return;
+  }
+  const engine = props.engine ?? "postgres";
+  const inspected = inspectSql(statement.text, engine);
+  if (inspected.refusal) {
+    actionError.value = inspected.refusal;
+    return;
+  }
+  const variables = findVariables(statement.text);
+  if (variables.length) {
+    openVariablePrompt(variables, statement.text, statement.start, statement.end);
+    return;
+  }
+  await sendExecute(statement.text, statement.start, statement.end);
+}
+
+/** 大纲右键「复制语句」：复制语句全文到剪贴板。 */
+function copyStatement(statement: OutlineStatement): void {
+  navigator.clipboard.writeText(statement.text)
+    .then(() => toast(t("grid.value.copied")))
+    .catch(() => toast(t("grid.errors.clipboardFailed"), "err"));
+}
+
 function toggleOutline(): void {
   outlineTouched = true;
   outlineOpen.value = !outlineOpen.value;
+}
+
+/* ---------- 编辑器右键菜单 ---------- */
+
+const editorMenuItems = computed<MenuItem[]>(() => [
+  { kind: "item", id: "run", label: t("query.editor.menu.run"), shortcut: formatChord("Mod+Enter", macPlatform), disabled: running.value || submitting.value },
+  { kind: "item", id: "run-current", label: t("query.editor.menu.runCurrent"), shortcut: formatChord("Mod+Shift+Enter", macPlatform), disabled: running.value || submitting.value },
+  { kind: "item", id: "run-script", label: t("query.editor.menu.runScript"), disabled: running.value || submitting.value },
+  { kind: "sep" },
+  { kind: "item", id: "format", label: t("query.editor.menu.format"), shortcut: formatChord("Mod+Shift+F", macPlatform), disabled: running.value || submitting.value },
+  { kind: "item", id: "plan", label: t("query.editor.menu.plan"), shortcut: formatChord("Mod+Shift+E", macPlatform), disabled: running.value || submitting.value },
+  { kind: "item", id: "analyze", label: t("query.editor.menu.analyze"), disabled: running.value || submitting.value },
+  { kind: "sep" },
+  { kind: "item", id: "copy", label: t("query.editor.menu.copy"), disabled: !hasSelection.value, title: hasSelection.value ? undefined : t("query.editor.menu.copyDisabled") },
+  { kind: "item", id: "select-all", label: t("query.editor.menu.selectAll") },
+  { kind: "item", id: "clear", label: t("query.editor.menu.clear"), disabled: !docText.value.trim() },
+  { kind: "sep" },
+  { kind: "item", id: "toggle-results", label: resultsHidden.value ? t("query.results.show") : t("query.results.hide"), shortcut: formatChord("Mod+J", macPlatform) },
+]);
+
+function onEditorContextMenu(event: MouseEvent): void {
+  event.preventDefault();
+  editorMenu.value = { x: event.clientX, y: event.clientY };
+}
+
+function copyEditorSelection(): void {
+  const editor = view;
+  if (!editor) return;
+  const range = editor.state.selection.main;
+  const text = editor.state.sliceDoc(range.from, range.to);
+  if (!text) return;
+  navigator.clipboard.writeText(text)
+    .then(() => toast(t("grid.value.copied")))
+    .catch(() => toast(t("grid.errors.clipboardFailed"), "err"));
+}
+
+function clearEditor(): void {
+  const editor = view;
+  if (!editor) return;
+  editor.dispatch({ changes: { from: 0, to: editor.state.doc.length, insert: "" }, selection: { anchor: 0 } });
+  editor.focus();
+}
+
+function toggleResults(): void {
+  resultsHidden.value = !resultsHidden.value;
+}
+
+/* 发起执行/计划时结果区自动回来：执行就是为了看输出。放在发送侧而不是监听运行对象，
+   轮询刷新不会误触发，重复执行同一批语句（运行 id 不变）也会正常展开。 */
+function revealResults(): void {
+  resultsHidden.value = false;
+}
+
+function onEditorMenuSelect(id: string): void {
+  switch (id) {
+    case "run": void execute("auto"); break;
+    case "run-current": void execute("current"); break;
+    case "run-script": void execute("script"); break;
+    case "format": formatEditor(); break;
+    case "plan": void requestPlan(); break;
+    case "analyze": requestAnalyze(); break;
+    case "copy": copyEditorSelection(); break;
+    case "select-all": if (view) selectAll(view); break;
+    case "clear": clearEditor(); break;
+    case "toggle-results": toggleResults(); break;
+  }
 }
 
 /** 语句级折叠：按 splitSql 的语句边界给 gutter 提供折叠范围，跨行语句才能折。 */
@@ -744,9 +853,16 @@ function editorExtensions() {
         { key: QUERY_EDITOR_KEYS[4], run: toggleComment },
         { key: "Mod-Shift-f", run: () => { formatEditor(); return true; } },
         { key: "Mod-Shift-e", run: () => { void requestPlan(); return true; } },
+        { key: "Mod-j", run: () => { toggleResults(); return true; } },
       ]),
     ),
     autocompletion({ override: [sqlCompletion] }),
+    /* 编辑器右键菜单：锚点是屏幕坐标，菜单本体走共享 ContextMenu。 */
+    EditorView.domEventHandlers({
+      contextmenu(event) {
+        onEditorContextMenu(event);
+      },
+    }),
     /* 结构 lint：只画内联波浪线（悬停显示消息），不加 gutter、不开诊断面板；每次调用读当前引擎。 */
     linter((editor) => sqlLintDiagnostics(editor.state.doc.toString(), props.engine ?? "postgres")),
     EditorView.updateListener.of((update) => {
@@ -943,6 +1059,7 @@ async function requestPlan() {
     planMode.value = true;
     planKind.value = "estimate";
     await nextTick();
+    revealResults();
     await startTabRun({
       tabId: props.tabId,
       connectionId: props.connectionId!,
@@ -1031,6 +1148,7 @@ async function confirmAnalyze() {
     planMode.value = true;
     planKind.value = "analyze";
     await nextTick();
+    revealResults();
     await startTabRun({
       tabId: props.tabId,
       connectionId: props.connectionId!,
@@ -1126,6 +1244,7 @@ async function sendExecute(sqlText: string, from: number, to: number) {
   planKind.value = "none";
   try {
     await nextTick();
+    revealResults();
     await startTabRun({
       tabId: props.tabId,
       connectionId: props.connectionId!,
@@ -1494,6 +1613,7 @@ watch(running, (value) => {
   runMenuOpen.value = false;
   historyOpen.value = false;
   savedOpen.value = false;
+  editorMenu.value = null;
 });
 
 function statusLabel(status: string): string {
@@ -1554,7 +1674,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="query-pane" :aria-label="t('query.editor.area')" :data-tab-id="tabId" :data-editor-theme="editorTheme === 'auto' ? undefined : editorTheme" :style="{ '--editor-share': `${editorPercent}%` }">
+  <section class="query-pane" :aria-label="t('query.editor.area')" :data-tab-id="tabId" :data-editor-theme="editorTheme === 'auto' ? undefined : editorTheme" :data-results-hidden="resultsHidden ? 'true' : undefined" :style="{ '--editor-share': `${editorPercent}%` }">
     <div class="q-toolbar">
       <div v-if="!running" ref="runRoot" class="run-group">
         <button class="btn primary run-main" type="button" data-action="run" :disabled="submitting" @click="execute('auto')"><Icon name="play" class="run-glyph" />{{ submitting ? t("query.run.submitting") : hasSelection ? t("query.run.runSelection") : t("query.run.run") }} <ChordKeys chord="Mod+Enter" /></button>
@@ -1738,7 +1858,7 @@ onBeforeUnmount(() => {
         </button>
         <div ref="host" class="cm-host"></div>
       </div>
-      <StatementOutline v-if="outlineOpen" :statements="outlineItems" :active-index="cursorIndex" @jump="jumpToStatement" />
+      <StatementOutline v-if="outlineOpen" :statements="outlineItems" :active-index="cursorIndex" @jump="jumpToStatement" @run="runStatement" @copy="copyStatement" />
     </div>
     <div class="editor-position">
       <span class="q-guide" :title="hasSelection ? t('query.editor.selectionCountTitle', { n: selChars }) : ''">{{ operationGuide }}</span>
@@ -1752,6 +1872,13 @@ onBeforeUnmount(() => {
       </span>
     </div>
     <div class="query-splitter" role="separator" tabindex="0" :aria-label="t('query.editor.splitter')" aria-orientation="horizontal" :aria-valuenow="editorPercent" :aria-valuemin="20" :aria-valuemax="70" @pointerdown="resizeEditor" @keydown.up.prevent="editorPercent = Math.max(20, editorPercent - 5)" @keydown.down.prevent="editorPercent = Math.min(70, editorPercent + 5)"><span></span></div>
+    <button v-if="resultsHidden" class="results-collapsed" type="button" data-action="show-results" :aria-label="t('query.results.show')" :title="t('query.results.show')" @click="resultsHidden = false">
+      <Icon name="chevron-up" class="i" />
+      <span class="rc-label">{{ t("query.results.show") }}</span>
+      <span v-if="run" class="rc-summary">{{ summary }}</span>
+      <span class="grow"></span>
+      <ChordKeys chord="Mod+J" />
+    </button>
     <section class="q-results" :aria-label="t('query.results.area')">
       <div class="results-heading">
         <span class="rh-title"><Icon name="table" />{{ t("query.results.heading") }}</span>
@@ -1766,6 +1893,7 @@ onBeforeUnmount(() => {
         <span v-else class="muted">{{ t("query.results.waiting") }}</span>
         <span class="grow"></span>
         <button v-if="canContinue" class="btn sm" type="button" data-action="continue-read" @click="continueRead">{{ t("query.run.continueRead") }}</button>
+        <button class="icon-btn" type="button" data-action="hide-results" :aria-label="t('query.results.hide')" :title="`${t('query.results.hideTitle')} (${formatChord('Mod+J', macPlatform)})`" @click="resultsHidden = true"><Icon name="chevron-down" /></button>
         <span ref="resultTools" class="results-tools"></span>
         <span class="badge">{{ t("query.results.readonly") }}</span>
       </div>
@@ -1867,6 +1995,15 @@ onBeforeUnmount(() => {
         </details>
       </template>
     </section>
+    <ContextMenu
+      :open="editorMenu !== null"
+      :x="editorMenu?.x ?? 0"
+      :y="editorMenu?.y ?? 0"
+      :items="editorMenuItems"
+      :label="t('query.editor.area')"
+      @close="editorMenu = null"
+      @select="onEditorMenuSelect"
+    />
   </section>
 </template>
 
@@ -2069,6 +2206,30 @@ onBeforeUnmount(() => {
 
 /* ---------- 结果区：panel 层 ---------- */
 .query-pane .q-results { flex: 1; min-height: 130px; padding: 0; gap: 0; border: 0; background: var(--surface-panel); }
+/* 隐藏结果区 = 全屏编辑 SQL：编辑器吃掉全部高度，结果区与分隔条收起，底部留一条可点开的细条。 */
+.query-pane[data-results-hidden="true"] .editor-row { flex: 1 1 auto; }
+.query-pane[data-results-hidden="true"] .q-results,
+.query-pane[data-results-hidden="true"] .query-splitter { display: none; }
+.results-collapsed {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-shrink: 0;
+  height: 26px;
+  padding: 0 var(--sp-3);
+  border-top: 1px solid var(--line);
+  background: var(--surface-chrome);
+  color: var(--text-2);
+  font-size: var(--fs-xs);
+  text-align: left;
+}
+.results-collapsed:hover { background: var(--hover); color: var(--text); }
+.results-collapsed:active { box-shadow: inset 0 1px 2px var(--press); }
+.results-collapsed .i { width: 12px; height: 12px; color: var(--text-3); flex-shrink: 0; }
+.rc-label { font-weight: 600; flex-shrink: 0; }
+.rc-summary { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--text-3); }
+.results-collapsed .grow { flex: 1; }
+.results-collapsed :deep(kbd) { opacity: 0.7; }
 .q-results { min-height: 120px; overflow: auto; border-top: 1px solid var(--line); padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); }
 .results-heading { display: flex; align-items: center; gap: var(--sp-2); min-height: 36px; padding: 0 var(--sp-3); border-bottom: 1px solid var(--line); font-size: var(--fs-xs); flex-shrink: 0; background: var(--surface-panel); color: var(--text-2); }
 .rh-title { display: inline-flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); font-weight: 600; color: var(--text); flex-shrink: 0; }

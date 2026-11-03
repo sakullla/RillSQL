@@ -660,6 +660,78 @@ async function copySelection() {
   }
 }
 
+/** 复制某一批单元格为 TSV（行/列/区域共用这个出口）。 */
+async function copyPoints(points: CellPoint[]): Promise<void> {
+  if (!points.length) return;
+  const text = selectionTsv(points, (point) => {
+    const column = props.columns.find((item) => item.name === point.column);
+    const row = sourceRows.value.find((item) => item.id === point.row);
+    const value = editSession.value?.cellValue(point.row, point.column) ?? row?.cells[point.column] ?? null;
+    return copyCellText(value, settings.value.nullCopy, column, true);
+  });
+  try {
+    await navigator.clipboard.writeText(text);
+    copyMessage.value = t("grid.value.copied");
+    toast(t("grid.menu.copiedCells", { n: points.length }));
+  } catch {
+    copyMessage.value = t("grid.errors.clipboardFailed");
+    toast(t("grid.errors.clipboardFailed"), "err");
+  }
+}
+
+/** 右键「复制整行」：该行全部列的 TSV。 */
+function copyRowFromMenu(): void {
+  const target = menu.value;
+  if (!target) return;
+  void copyPoints(props.columns.map((column) => ({ row: target.row, column: column.name })));
+  menu.value = null;
+}
+
+/** 右键「复制整列」：已读取行里该列全部值的 TSV。 */
+function copyColumnFromMenu(): void {
+  const target = menu.value;
+  if (!target) return;
+  void copyPoints(sourceRows.value.map((row) => ({ row: row.id, column: target.column })));
+  menu.value = null;
+}
+
+/** 右键「复制为 WHERE 条件」：NULL 给 IS NULL，其余按引擎转义成 col = literal。 */
+function copyWhereFromMenu(): void {
+  const target = menu.value;
+  if (!target) return;
+  const column = props.columns.find((item) => item.name === target.column);
+  const value = cellValueOf(target);
+  const literal = value === null
+    ? `${target.column} IS NULL`
+    : `${target.column} = ${copySqlValue(value, column, props.engine ?? "postgres")}`;
+  navigator.clipboard.writeText(literal)
+    .then(() => toast(t("grid.value.copied")))
+    .catch(() => toast(t("grid.errors.clipboardFailed"), "err"));
+  menu.value = null;
+}
+
+/** 右键「标记删除行 / 取消删除标记」：走同一条切换路径，错误留在菜单里可见。 */
+function toggleDeleteFromMenu(): void {
+  const target = menu.value;
+  const session = editSession.value;
+  if (!target) return;
+  if (!session || !session.rowById(target.row)?.located) {
+    menuError.value = t("grid.errors.readonlyCell");
+    return;
+  }
+  if (session.deletes.includes(target.row)) {
+    session.deletes.splice(session.deletes.indexOf(target.row), 1);
+  } else {
+    const error = session.deleteRow(target.row);
+    if (error) {
+      menuError.value = error;
+      return;
+    }
+  }
+  receipt.value = null;
+  menu.value = null;
+}
+
 function editFromMenu() {
   const target = menu.value;
   if (!target) return;
@@ -996,10 +1068,19 @@ watch(() => props.rows, (rows) => {
     </section>
     <div v-if="menu" class="cell-menu" role="menu" :style="{ left: `${menu.x}px`, top: `${menu.y}px` }" @contextmenu.prevent>
       <button type="button" role="menuitem" data-action="view-value" @click="viewFromMenu"><Icon name="eye" />{{ t("grid.menu.viewValue") }}</button>
+      <span class="cell-menu-sep" role="separator"></span>
       <button type="button" role="menuitem" @click="copySelection(); menu = null"><Icon name="copy" />{{ t("grid.menu.copy") }}</button>
+      <button type="button" role="menuitem" @click="copyRowFromMenu"><Icon name="table" />{{ t("grid.menu.copyRow") }}</button>
+      <button type="button" role="menuitem" @click="copyColumnFromMenu"><Icon name="columns" />{{ t("grid.menu.copyColumn") }}</button>
+      <button type="button" role="menuitem" @click="copyWhereFromMenu"><Icon name="filter" />{{ t("grid.menu.copyWhere") }}</button>
       <button type="button" role="menuitem" @click="copySqlValueSelected(); menu = null"><Icon name="code" />{{ t("grid.value.copySqlValue") }}</button>
+      <span class="cell-menu-sep" role="separator"></span>
       <button type="button" role="menuitem" @click="editFromMenu"><Icon name="pencil" />{{ t("common.edit") }}</button>
       <button type="button" role="menuitem" @click="setNullFromMenu"><Icon name="x" />{{ t("grid.editor.setNull") }}</button>
+      <button v-if="editSession" type="button" role="menuitem" @click="toggleDeleteFromMenu">
+        <Icon :name="editSession.deletes.includes(menu.row) ? 'refresh' : 'trash'" />
+        {{ editSession.deletes.includes(menu.row) ? t("grid.menu.unmarkDelete") : t("grid.menu.markDelete") }}
+      </button>
       <p v-if="menuError" class="menu-error" role="alert">{{ menuError }}</p>
     </div>
     <div v-if="commitOpen && editSession" class="overlay" role="presentation">

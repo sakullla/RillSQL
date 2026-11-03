@@ -153,6 +153,157 @@ describe("query editing", () => {
     expect(qualifierFor("o.status", objects).kind).toBe("unknown");
   });
 
+  it("opens an editor context menu with run, clipboard and clear actions", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    replaceCatalog(catalogFixture());
+    invoke.mockImplementation(async (command: string, args?: { request?: { sql: string } }) => {
+      if (command === "query_release") return true;
+      return runDto({
+        status: "done",
+        statements: [{ sql: args?.request?.sql ?? "", status: "ok", message: "", columns: [], rows: [], truncated: false, affected: 0 }],
+      });
+    });
+    const wrapper = mount(QueryTab, {
+      global: { stubs: { teleport: true } },
+      props: {
+        tabId: "query-editor-menu",
+        draft: "SELECT 1;\nSELECT 2;",
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement);
+    expect(view).toBeTruthy();
+
+    await wrapper.get(".cm-content").trigger("contextmenu", { clientX: 40, clientY: 40 });
+    const menu = wrapper.get(".menu[role='menu']");
+    expect(menu.text()).toContain("执行");
+    expect(menu.text()).toContain("执行脚本");
+    expect(menu.text()).toContain("格式化");
+    expect(menu.text()).toContain("执行计划");
+    expect(menu.text()).toContain("全选");
+    expect(menu.text()).toContain("清空编辑器");
+    /* 无选中时复制不可用。 */
+    const copyItem = menu.findAll("button").find((button) => button.text() === "复制")!;
+    expect(copyItem.attributes("disabled")).toBeDefined();
+
+    await menu.findAll("button").find((button) => button.text() === "全选")!.trigger("click");
+    await nextTick();
+    expect(view!.state.selection.main.from).toBe(0);
+    expect(view!.state.selection.main.to).toBe(view!.state.doc.length);
+
+    await wrapper.get(".cm-content").trigger("contextmenu", { clientX: 40, clientY: 40 });
+    await wrapper.get(".menu[role='menu']").findAll("button").find((button) => button.text() === "复制")!.trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenLastCalledWith("SELECT 1;\nSELECT 2;");
+
+    await wrapper.get(".cm-content").trigger("contextmenu", { clientX: 40, clientY: 40 });
+    await wrapper.get(".menu[role='menu']").findAll("button").find((button) => button.text() === "清空编辑器")!.trigger("click");
+    await nextTick();
+    expect(view!.state.doc.toString()).toBe("");
+    wrapper.unmount();
+  });
+
+  it("runs and copies one statement from the outline context menu", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    replaceCatalog(catalogFixture());
+    const calls: { command: string; sql?: string }[] = [];
+    invoke.mockImplementation(async (command: string, args?: { request?: { sql: string } }) => {
+      if (command === "query_release") return true;
+      calls.push({ command, sql: args?.request?.sql });
+      return runDto({
+        status: "done",
+        statements: [{ sql: args?.request?.sql ?? "", status: "ok", message: "", columns: [], rows: [], truncated: false, affected: 0 }],
+      });
+    });
+    const wrapper = mount(QueryTab, {
+      global: { stubs: { teleport: true } },
+      props: {
+        tabId: "query-outline-menu",
+        draft: "SELECT 1;\nSELECT 2;",
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    /* 多语句脚本自动展开大纲。 */
+    expect(wrapper.findAll(".outline-item")).toHaveLength(2);
+
+    await wrapper.findAll(".outline-item")[0]!.trigger("contextmenu", { clientX: 900, clientY: 200 });
+    const menu = wrapper.get(".menu[role='menu']");
+    expect(menu.text()).toContain("执行此语句");
+    expect(menu.text()).toContain("复制语句");
+    await menu.findAll("button").find((button) => button.text() === "复制语句")!.trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenLastCalledWith("SELECT 1;");
+
+    /* 右键执行第二条：光标不动，只发送那一条。 */
+    await wrapper.findAll(".outline-item")[1]!.trigger("contextmenu", { clientX: 900, clientY: 220 });
+    await wrapper.get(".menu[role='menu']").findAll("button").find((button) => button.text() === "执行此语句")!.trigger("click");
+    await flushPromises();
+    expect(calls.filter((call) => call.command === "query_start").at(-1)).toMatchObject({ sql: "SELECT 2;" });
+    expect(wrapper.get(".editor-position").text()).toContain("语句 1/2");
+    wrapper.unmount();
+  });
+
+  it("hides the results pane for fullscreen sql and restores it, also on a new run", async () => {
+    replaceCatalog(catalogFixture());
+    invoke.mockImplementation(async (command: string, args?: { request?: { sql: string } }) => {
+      if (command === "query_release") return true;
+      return runDto({
+        status: "done",
+        statements: [{ sql: args?.request?.sql ?? "", status: "ok", message: "", columns: ["v"], rows: [["1"]], truncated: false, affected: null }],
+      });
+    });
+    const wrapper = mount(QueryTab, {
+      global: { stubs: { teleport: true } },
+      props: {
+        tabId: "query-toggle-results",
+        draft: "SELECT 1;",
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    const pane = wrapper.get("section.query-pane");
+    expect(pane.attributes("data-results-hidden")).toBeUndefined();
+    /* 编辑器右键菜单里也有隐藏结果入口。 */
+    await wrapper.get(".cm-content").trigger("contextmenu", { clientX: 40, clientY: 40 });
+    expect(wrapper.get(".menu[role='menu']").text()).toContain("隐藏结果");
+    await wrapper.get(".menu[role='menu']").findAll("button").find((button) => button.text().includes("隐藏结果"))!.trigger("click");
+    await nextTick();
+    expect(wrapper.get("section.query-pane").attributes("data-results-hidden")).toBe("true");
+    expect(wrapper.find("[data-action='show-results']").exists()).toBe(true);
+
+    /* 隐藏状态下执行，结果区自动回来。 */
+    await wrapper.get("[data-action='run']").trigger("click");
+    await flushPromises();
+    expect(wrapper.get("section.query-pane").attributes("data-results-hidden")).toBeUndefined();
+    /* 再次隐藏后用折叠条恢复，编辑/结果比例不变。 */
+    await wrapper.get("[data-action='hide-results']").trigger("click");
+    await nextTick();
+    expect(wrapper.get("section.query-pane").attributes("data-results-hidden")).toBe("true");
+    await wrapper.get("[data-action='show-results']").trigger("click");
+    await nextTick();
+    expect(wrapper.get("section.query-pane").attributes("data-results-hidden")).toBeUndefined();
+    wrapper.unmount();
+  });
+
   it("shows the connection and database, and sends only the chosen sql", async () => {
     replaceCatalog(catalogFixture());
     const calls: { command: string; sql?: string }[] = [];

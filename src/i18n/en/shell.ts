@@ -81,6 +81,7 @@ export const shell = {
     requestCancel: "Request cancellation",
     autocomplete: "Autocomplete",
     toggleComment: "Comment / uncomment",
+    toggleResults: "Show / hide the query results pane",
     format: "Format selected SQL; with nothing selected, format everything",
     explain: "Show the execution plan of the current statement",
     leaveEditor: "Leave the editor (no indentation inserted)",

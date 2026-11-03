@@ -26,6 +26,7 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
   { id: "request-cancel", group: "editor", chord: "Mod+.", label: "shell.shortcuts.requestCancel" },
   { id: "autocomplete", group: "editor", chord: "Ctrl+Space", label: "shell.shortcuts.autocomplete" },
   { id: "toggle-comment", group: "editor", chord: "Mod+/", label: "shell.shortcuts.toggleComment" },
+  { id: "toggle-results", group: "editor", chord: "Mod+J", label: "shell.shortcuts.toggleResults" },
   { id: "format", group: "editor", chord: "Mod+Shift+F", label: "shell.shortcuts.format" },
   { id: "explain", group: "editor", chord: "Mod+Shift+E", label: "shell.shortcuts.explain" },
   { id: "leave-editor", group: "editor", chord: "Tab", label: "shell.shortcuts.leaveEditor" },

@@ -148,6 +148,11 @@ export const grid = {
     filterByValue: "Filter by this value",
     copiedCells: "Copied {n} cells",
     copy: "Copy",
+    copyRow: "Copy entire row",
+    copyColumn: "Copy entire column",
+    copyWhere: "Copy as WHERE condition",
+    markDelete: "Mark row for deletion",
+    unmarkDelete: "Undo delete mark",
     jumpReference: "View referencing rows → {label}",
   },
   cell: {

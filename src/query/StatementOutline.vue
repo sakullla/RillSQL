@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { tr as t } from "../i18n";
 import Icon from "../shell/Icon.vue";
+import ContextMenu from "../ui/ContextMenu.vue";
+import type { MenuItem } from "../ui/types";
 import type { OutlineStatement } from "./outline";
 
 const props = defineProps<{
@@ -10,9 +12,13 @@ const props = defineProps<{
 }>();
 const emit = defineEmits<{
   jump: [statement: OutlineStatement];
+  run: [statement: OutlineStatement];
+  copy: [statement: OutlineStatement];
 }>();
 
 const listEl = ref<HTMLElement | null>(null);
+/* 右键菜单锚点与目标语句；null 表示关闭。 */
+const outlineMenu = ref<{ x: number; y: number; statement: OutlineStatement } | null>(null);
 
 /* 光标移动/滚动时让当前语句保持可见，但不强制滚到列表中间。 */
 watch(
@@ -24,6 +30,27 @@ watch(
     if (item instanceof HTMLElement && typeof item.scrollIntoView === "function") item.scrollIntoView({ block: "nearest" });
   },
 );
+
+const outlineMenuItems = computed<MenuItem[]>(() => [
+  { kind: "item", id: "run", label: t("query.outline.menu.runStatement") },
+  { kind: "item", id: "copy", label: t("query.outline.menu.copyStatement") },
+  { kind: "sep" },
+  { kind: "item", id: "jump", label: t("query.outline.menu.jump") },
+]);
+
+function openMenu(statement: OutlineStatement, event: MouseEvent): void {
+  event.preventDefault();
+  outlineMenu.value = { x: event.clientX, y: event.clientY, statement };
+}
+
+function onMenuSelect(id: string): void {
+  const target = outlineMenu.value?.statement;
+  outlineMenu.value = null;
+  if (!target) return;
+  if (id === "run") emit("run", target);
+  else if (id === "copy") emit("copy", target);
+  else emit("jump", target);
+}
 
 function statusLabel(status: OutlineStatement["status"]): string {
   const labels: Record<OutlineStatement["status"], string> = {
@@ -58,6 +85,7 @@ function statusLabel(status: OutlineStatement["status"]): string {
           :title="statement.preview"
           type="button"
           @click="emit('jump', statement)"
+          @contextmenu.prevent="openMenu(statement, $event)"
         >
           <span class="outline-status" :data-status="statement.status" :title="statusLabel(statement.status)">
             <Icon v-if="statement.status === 'ok'" name="check" class="i" />
@@ -72,6 +100,15 @@ function statusLabel(status: OutlineStatement["status"]): string {
         </button>
       </li>
     </ol>
+    <ContextMenu
+      :open="outlineMenu !== null"
+      :x="outlineMenu?.x ?? 0"
+      :y="outlineMenu?.y ?? 0"
+      :items="outlineMenuItems"
+      :label="t('query.outline.heading')"
+      @close="outlineMenu = null"
+      @select="onMenuSelect"
+    />
   </aside>
 </template>
 
