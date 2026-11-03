@@ -622,7 +622,7 @@ watch(
 .admin-card { display: flex; flex-direction: column; gap: 4px; padding: var(--sp-2); border: 1px dashed var(--line); border-radius: var(--r-sm); }
 .admin-card header { display: flex; align-items: center; gap: var(--sp-2); }
 .admin-card p { margin: 0; font-size: 12px; color: var(--text-3); }
-.admin-alert { margin: 0; padding: var(--sp-2); border-radius: var(--r-sm); background: color-mix(in srgb, var(--danger, #c0392b) 12%, transparent); color: var(--danger-text, var(--text)); font-size: 12px; }
+.admin-alert { margin: 0; padding: var(--sp-2); border-radius: var(--r-sm); background: color-mix(in srgb, var(--err) 12%, transparent); color: var(--danger-text, var(--text)); font-size: 12px; }
 .admin-loading { margin: 0; font-size: 12px; color: var(--text-3); }
 .admin-event-acts { display: flex; gap: var(--sp-1, 4px); flex-wrap: wrap; }
 .admin-ddl {

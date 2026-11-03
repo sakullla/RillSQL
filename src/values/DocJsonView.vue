@@ -32,7 +32,7 @@ const valid = computed(() => {
 
 <style scoped>
 .doc-json { min-height: 0; overflow: auto; }
-.dj-invalid { color: var(--danger, #c0392b); font-size: 12px; }
+.dj-invalid { color: var(--err); font-size: 12px; }
 .dj-body {
   margin: 0;
   padding: var(--sp-2);

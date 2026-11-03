@@ -357,6 +357,15 @@ describe("design tokens", () => {
 
 describe("token contrast (WCAG relative luminance)", () => {
   for (const [theme, scope] of [["light", THEME_SCOPES.light()], ["dark", THEME_SCOPES.dark()]] as const) {
+    it(`keeps secondary text at >= 4.5:1 on panel, sunken, and app in the ${theme} theme`, () => {
+      for (const fgName of ["--text-2", "--text-3"]) {
+        for (const bgName of ["--surface-panel", "--surface-sunken", "--surface-app"]) {
+          const ratio = contrast(hexValue(scope, fgName), hexValue(scope, bgName));
+          expect(ratio, `${theme} ${fgName} on ${bgName}`).toBeGreaterThanOrEqual(4.5);
+        }
+      }
+    });
+
     it(`keeps text tokens at >= 4.5:1 in the ${theme} theme`, () => {
       const panel = hexValue(scope, "--surface-panel");
       const textPairs: Array<[string, string, string]> = [

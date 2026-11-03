@@ -894,7 +894,7 @@ watch(
               <pre>{{ report.algorithm }}  {{ report.fingerprint }}</pre>
               <div class="fp-actions">
                 <button class="btn sm" type="button" @click="rejectHostKey">{{ t("connections.editor.test.reject") }}</button>
-                <button class="btn sm primary" type="button" @click="trustHostKey">{{ t("connections.editor.test.trust") }}</button>
+                <button class="btn sm" type="button" @click="trustHostKey">{{ t("connections.editor.test.trust") }}</button>
               </div>
             </div>
           </template>

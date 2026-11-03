@@ -362,7 +362,7 @@ watch(
 .mg-map-arrow { color: var(--text-3); }
 .mg-map-row :deep(.listbox) { width: 100%; }
 .mg-map-row :deep(.listbox-trigger) { width: 100%; justify-content: space-between; }
-.mg-hint { margin: 0; font-size: var(--fs-xs); color: var(--warn, #8a6d1a); line-height: var(--lh); }
+.mg-hint { margin: 0; font-size: var(--fs-xs); color: var(--warn); line-height: var(--lh); }
 .mg-hint.ok { color: var(--text-3); }
 .mg-check { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); color: var(--text); }
 .mg-note { margin: 0; font-size: var(--fs-xs); color: var(--text-2); line-height: var(--lh); }

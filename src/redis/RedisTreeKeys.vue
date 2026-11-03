@@ -72,7 +72,7 @@ onMounted(loadMore);
 
 <style scoped>
 .rtk { display: contents; }
-.rtk-error { color: var(--danger, #c0392b); font-size: 12px; margin: 0; padding: var(--sp-1) var(--sp-2); }
+.rtk-error { color: var(--err); font-size: 12px; margin: 0; padding: var(--sp-1) var(--sp-2); }
 .rtk-badge { font-size: 10px; padding: 0 4px; border-radius: var(--r-sm); background: var(--sunken); color: var(--text-3); white-space: nowrap; }
 .rtk-more { color: var(--text-3); }
 .mono { font-family: var(--mono, ui-monospace, monospace); }

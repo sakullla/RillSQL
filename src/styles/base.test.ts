@@ -49,6 +49,9 @@ describe("desktop control base styles", () => {
     expect(icon).toContain("height: var(--control-h)");
     expect(css).toContain(".icon-btn.sm { width: var(--control-h-sm); height: var(--control-h-sm); }");
     expect(css).toContain(".icon-btn:active:not(:disabled)");
+    const iconDisabled = block(".icon-btn:disabled {");
+    expect(iconDisabled).toContain("color: var(--disabled-fg)");
+    expect(iconDisabled).toContain("cursor: not-allowed");
   });
 
   it("keeps visible focus rings and routes overlays through the z tokens", () => {

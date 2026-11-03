@@ -348,6 +348,32 @@ describe("connections page", () => {
     wrapper.unmount();
   });
 
+  it("等待信任时底栏保存并连接是编辑器里唯一的实心主按钮", async () => {
+    const waiting: TestReport = {
+      status: "wait",
+      fingerprint: "SHA256:aa",
+      algorithm: "ssh-ed25519",
+      stages: [{ kind: "ssh", label: "核对跳板机身份", status: "wait", message: "等待确认主机指纹" }],
+    };
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api: pageApi(() => waiting) } });
+    await flushPromises();
+    await wrapper.get("[data-action=conn-new]").trigger("click");
+    await wrapper.get("[data-field=host]").setValue("db.example.test");
+    await wrapper.get("[data-field=username]").setValue("app_user");
+    await wrapper.get("[data-action=cf-test]").trigger("click");
+    await flushPromises();
+
+    const editor = wrapper.get("dialog.modal-lg");
+    const trust = editor.findAll("button").find((button) => button.text().includes("指纹一致，信任并继续"));
+    expect(trust).toBeTruthy();
+    expect(trust?.classes()).not.toContain("primary");
+    const primaries = editor.findAll("button.primary");
+    expect(primaries).toHaveLength(1);
+    expect(primaries[0].text()).toContain("保存并连接");
+    expect(primaries[0].classes()).toContain("primary");
+    wrapper.unmount();
+  });
+
   it("新建时粘贴连接串一键填充，切换引擎且密码仅本次使用", async () => {
     replacePaletteConnections([]);
     const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api: pageApi(() => ({ status: "ok", stages: [] })) } });
