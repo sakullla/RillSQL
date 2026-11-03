@@ -2057,25 +2057,24 @@ onBeforeUnmount(() => {
 /* ---------- 工具条：chrome 层实体控件带 ---------- */
 .q-toolbar { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: nowrap; min-width: 0; padding: var(--sp-1) var(--sp-2); min-height: var(--toolbar-h); border-bottom: 1px solid var(--line); background: var(--surface-panel); }
 .q-toolbar .conn-state { flex-shrink: 0; }
-.q-more-tools { display: none; flex-shrink: 0; }
 .q-toolbar .icon-btn { width: 28px; height: 28px; }
 /* 大纲开关按下态：与未按下区分，一眼可知当前有没有大纲。 */
 .q-toolbar .icon-btn[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent-text); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent); }
 .q-toolbar .btn :deep(.i) { width: 14px; height: 14px; color: var(--text-3); }
-.q-target { position: relative; min-width: 0; }
-.target-btn { display: flex; align-items: center; gap: var(--sp-2); height: var(--control-h); max-width: 420px; min-width: 0; padding: 0 var(--sp-2) 0 var(--sp-1); border: 1px solid transparent; border-radius: var(--r); background: transparent; font-size: var(--fs-sm); transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease); }
+.q-target { position: relative; display: flex; min-width: 0; flex: 0 1 auto; max-width: min(420px, 100%); }
+.target-btn { display: flex; align-items: center; gap: var(--sp-2); height: var(--control-h); width: 100%; max-width: 100%; min-width: 0; overflow: hidden; padding: 0 var(--sp-2) 0 var(--sp-1); border: 1px solid transparent; border-radius: var(--r); background: transparent; font-size: var(--fs-sm); transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease); }
 .target-btn:hover:not(:disabled) { border-color: var(--stroke-strong); background: var(--hover); }
 .target-btn:active:not(:disabled) { background: var(--active); box-shadow: inset 0 1px 2px var(--press); }
 .target-btn.on { border-color: var(--accent); box-shadow: 0 0 0 2px var(--ring); }
 .target-btn.none { border: 1px dashed var(--line-2); color: var(--text-2); padding-left: var(--sp-2); }
 .target-btn:disabled { opacity: 0.7; cursor: not-allowed; }
 /* 长连接名不参与撑宽（R4）：超出部分省略，完整名称仍在 title 与 aria-label 里。 */
-.tg-name { font-weight: 600; white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.tg-name { flex: 0 1 auto; font-weight: 600; white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 /* 工具条文字一律不换行：按钮文案在「执行 / 执行选中」之间切换时不会把工具条撑成两行，编辑区高度不跳。 */
 .q-toolbar .btn { white-space: nowrap; }
-.tg-db { display: inline-flex; align-items: center; gap: var(--sp-1); min-width: 0; color: var(--text-2); }
-.tg-db span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tg-sep { color: var(--text-3); }
+.tg-db { display: inline-flex; align-items: center; gap: var(--sp-1); min-width: 0; overflow: hidden; color: var(--text-2); }
+.tg-db span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tg-sep { flex-shrink: 0; color: var(--text-3); }
 .tg-caret { width: 14px; height: 14px; margin-left: auto; color: var(--text-3); fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
 .target-btn :deep(.i) { width: 14px; height: 14px; color: var(--text-3); }
 .eng { --engc: var(--text-2); display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: var(--r-sm); font: 700 var(--fs-xs)/1 var(--font); color: var(--engc); background: color-mix(in srgb, var(--engc) 14%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--engc) 24%, transparent); flex-shrink: 0; }
@@ -2115,6 +2114,8 @@ onBeforeUnmount(() => {
 
 /* ---------- 历史 / 保存浮出：overlay 表面 ---------- */
 .q-pop { position: relative; display: inline-flex; }
+/* .q-pop 写在后面且同为单类，必须用更高特异性压住，宽容器才不会把「更多」重新显示出来。 */
+.q-toolbar .q-pop.q-more-tools { display: none; flex-shrink: 0; }
 .hidden-file-input { display: none; }
 .pop-menu { position: absolute; z-index: var(--z-menu); top: calc(100% + var(--sp-1)); right: 0; min-width: 300px; max-width: 440px; max-height: 360px; overflow: auto; padding: var(--sp-1); background: var(--surface-overlay); border: 1px solid var(--stroke-strong); border-radius: var(--r-md); box-shadow: var(--shadow); animation: pop-in var(--dur-fast) var(--ease-out); }
 .pop-item { display: flex; align-items: flex-start; gap: var(--sp-2); width: 100%; padding: var(--sp-2); border-radius: var(--r); text-align: left; }
@@ -2369,9 +2370,7 @@ onBeforeUnmount(() => {
   .q-tool-rare,
   .q-toolbar > .toolbar-sep,
   .q-rare-pop:not(:has(.pop-menu)) { display: none; }
-  .q-more-tools { display: inline-flex; }
-  .q-target { flex: 1 1 auto; min-width: 0; }
-  .q-target .target-btn { max-width: 100%; }
+  .q-toolbar .q-pop.q-more-tools { display: inline-flex; }
 }
-@media (max-width: 800px) { .run-main :deep(.kbd) { display: none; } .target-btn { max-width: 290px; } .editor-position > span:first-child { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; } }
+@media (max-width: 800px) { .run-main :deep(.kbd) { display: none; } .target-btn { max-width: min(290px, 100%); } .editor-position > span:first-child { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; } }
 </style>

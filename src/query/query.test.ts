@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { currentCompletions, startCompletion } from "@codemirror/autocomplete";
 import { redo, undo } from "@codemirror/commands";
 import { EditorState } from "@codemirror/state";
@@ -1651,6 +1654,26 @@ describe("query editing", () => {
     await nextTick();
     expect(badge.attributes("title")).toBe("按 id 定位行，查询结果不能新增行");
     wrapper.unmount();
+  });
+
+  it("hides more tools in a wide pane and clips the target before the connection status", () => {
+    const style = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "QueryTab.vue"), "utf8");
+    const popAt = style.indexOf(".q-pop { position: relative; display: inline-flex; }");
+    const hideAt = style.indexOf(".q-toolbar .q-pop.q-more-tools { display: none; flex-shrink: 0; }");
+    const containerAt = style.indexOf("@container query-pane (max-width: 720px)");
+    expect(popAt).toBeGreaterThan(0);
+    expect(hideAt).toBeGreaterThan(popAt);
+    expect(containerAt).toBeGreaterThan(hideAt);
+    const containerBlock = style.slice(containerAt, style.indexOf("@media (max-width: 800px)", containerAt));
+    expect(containerBlock).toContain(".q-toolbar .q-pop.q-more-tools { display: inline-flex; }");
+    const targetBtn = style.slice(style.indexOf(".target-btn {"), style.indexOf("}", style.indexOf(".target-btn {")));
+    expect(style.indexOf(".target-btn {")).toBeLessThan(containerAt);
+    expect(targetBtn).toContain("overflow: hidden");
+    expect(targetBtn).toContain("max-width: 100%");
+    expect(targetBtn).toContain("min-width: 0");
+    expect(style).toContain(".q-toolbar { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: nowrap;");
+    expect(style).toContain(".q-toolbar .conn-state { flex-shrink: 0; }");
+    expect(style).not.toContain(".q-toolbar .conn-state { display: none; }");
   });
 });
 
