@@ -3,9 +3,10 @@ import { resolve } from "node:path";
 import { flushPromises, mount } from "@vue/test-utils";
 import { crc32 } from "node:zlib";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { nextTick } from "vue";
+import { defineComponent, nextTick, ref } from "vue";
 import * as XLSX from "@e965/xlsx";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
+import DragImportDialog from "./DragImportDialog.vue";
 import ImportDialog from "./ImportDialog.vue";
 import { parseImportCsv } from "./import";
 import { parseImportXlsx } from "./xlsx";
@@ -484,6 +485,77 @@ describe("xlsx import", () => {
     expect(wrapper.emitted("close")).toHaveLength(1);
     await nextTick();
     expect(document.activeElement).toBe(opener);
+    wrapper.unmount();
+    opener.remove();
+  });
+
+  it("closes from a document Escape while focus started outside and restores that trigger", async () => {
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    opener.focus();
+    const wrapper = mount(ImportDialog, {
+      attachTo: document.body,
+      props: { open: true, target, schema, tables: [{ schema: "public", table: "customers" }] },
+    });
+    await nextTick();
+    expect(document.activeElement).toBe(wrapper.get(".ex-sheet").element);
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    expect(wrapper.emitted("close")).toHaveLength(1);
+    await nextTick();
+    expect(document.activeElement).toBe(opener);
+    expect(opener.isConnected).toBe(true);
+    wrapper.unmount();
+    opener.remove();
+  });
+
+  it("returns focus to the outside trigger when the nested import closes", async () => {
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    opener.focus();
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "grid_describe") {
+        return { engine: "postgres", schema: "public", name: "customers", kind: "table", columns: schema.columns, key: ["id"] };
+      }
+      throw new Error(`unexpected ${command}`);
+    });
+    replaceCatalog([{
+      id: "shop",
+      name: "Shop",
+      engine: "postgres",
+      env: "none",
+      envLabel: "",
+      envTone: "none",
+      status: "connected",
+      defaultDatabase: "app",
+      foreignKeys: null,
+      error: null,
+      databases: [{
+        name: "app",
+        error: null,
+        schemas: [{ name: "public", objects: [{ name: "customers", kind: "table", estimatedRows: 3, stale: false }], total: 1, error: null }],
+      }],
+    }]);
+    const open = ref(true);
+    const seed = { format: "csv" as const, text: "name,email\r\n甲,a@example.com", fileName: "rows.csv" };
+    const Parent = defineComponent({
+      components: { DragImportDialog },
+      setup() {
+        return { open, seed };
+      },
+      template: `<DragImportDialog v-if="open" :seed="seed" @close="open = false" />`,
+    });
+    const wrapper = mount(Parent, { attachTo: document.body });
+    await wrapper.get("[role='combobox'][aria-label='导入的表']").trigger("click");
+    const option = wrapper.findAll("[role='option']").find((node) => node.text() === "customers");
+    expect(option).toBeTruthy();
+    await option!.trigger("click");
+    await flushPromises();
+    const cancel = wrapper.get("[data-action=import-cancel]");
+    await cancel.trigger("click");
+    await nextTick();
+    expect(open.value).toBe(false);
+    expect(document.activeElement).toBe(opener);
+    expect(opener.isConnected).toBe(true);
     wrapper.unmount();
     opener.remove();
   });

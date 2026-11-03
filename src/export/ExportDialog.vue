@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { tr as t } from "../i18n";
 import type { ListboxOption } from "../ui/types";
 import Listbox from "../ui/Listbox.vue";
@@ -59,6 +59,7 @@ const choosing = ref(false);
 const error = ref("");
 /** 打开时记住触发元素，关闭后若仍在文档中则还焦。 */
 const returnFocus = ref<HTMLElement | null>(null);
+const sheet = ref<HTMLElement | null>(null);
 
 function rememberFocus() {
   const active = document.activeElement;
@@ -73,17 +74,28 @@ function closeDialog() {
   });
 }
 
-function onDialogEscape(event: KeyboardEvent) {
-  if (event.defaultPrevented) return;
+/** 冒泡阶段听 document，内层 Listbox 可先 preventDefault。 */
+function onDocumentEscape(event: KeyboardEvent) {
+  if (event.key !== "Escape" || event.defaultPrevented) return;
   event.preventDefault();
   closeDialog();
+}
+
+function disarmDialog() {
+  document.removeEventListener("keydown", onDocumentEscape);
 }
 
 watch(
   () => props.open,
   (open) => {
-    if (!open) return;
+    if (!open) {
+      disarmDialog();
+      return;
+    }
     rememberFocus();
+    disarmDialog();
+    document.addEventListener("keydown", onDocumentEscape);
+    void nextTick(() => sheet.value?.focus());
     scope.value = "loaded";
     format.value = "csv";
     acknowledged.value = false;
@@ -93,6 +105,8 @@ watch(
   },
   { immediate: true },
 );
+
+onBeforeUnmount(disarmDialog);
 
 function formatExtension(next: ExportFormat): string {
   if (next === "json") return "json";
@@ -180,7 +194,7 @@ async function start() {
 
 <template>
   <div v-if="open" class="ex-overlay" role="presentation">
-    <div class="ex-sheet" role="dialog" aria-modal="true" :aria-label="title" @keydown.escape="onDialogEscape">
+    <div ref="sheet" class="ex-sheet" role="dialog" tabindex="-1" aria-modal="true" :aria-label="title" @keydown.escape="onDocumentEscape">
       <header class="ex-head">
         <div class="ex-titles">
           <h2>{{ title }}</h2>

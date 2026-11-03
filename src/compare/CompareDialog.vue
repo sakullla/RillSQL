@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, reactive, ref, watch, type Ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch, type Ref } from "vue";
 import { tr as t } from "../i18n";
 import { catalogConnections } from "../catalog/store";
 import type { CatalogConnection } from "../catalog/types";
@@ -13,6 +13,7 @@ const emit = defineEmits<{ close: []; place: [sql: string, target: ScriptTarget]
 
 /** 打开时记住触发元素，关闭后若仍在文档中则还焦。 */
 const returnFocus = ref<HTMLElement | null>(document.activeElement instanceof HTMLElement ? document.activeElement : null);
+const sheet = ref<HTMLElement | null>(null);
 
 function closeDialog() {
   const target = returnFocus.value;
@@ -22,11 +23,20 @@ function closeDialog() {
   });
 }
 
-function onDialogEscape(event: KeyboardEvent) {
-  if (event.defaultPrevented) return;
+/** 冒泡阶段听 document，内层 Listbox 可先 preventDefault。 */
+function onDocumentEscape(event: KeyboardEvent) {
+  if (event.key !== "Escape" || event.defaultPrevented) return;
   event.preventDefault();
   closeDialog();
 }
+
+onMounted(() => {
+  document.addEventListener("keydown", onDocumentEscape);
+  sheet.value?.focus();
+});
+onBeforeUnmount(() => {
+  document.removeEventListener("keydown", onDocumentEscape);
+});
 
 const baselineId = ref<string | null>(null);
 const targetId = ref<string | null>(null);
@@ -255,7 +265,7 @@ function place(sql: string) {
 
 <template>
   <div class="cmp-overlay" role="presentation" @click.self="closeDialog">
-    <div class="cmp-sheet" role="dialog" aria-modal="true" :aria-label="t('compare.dialog.title')" data-compare @keydown.escape="onDialogEscape">
+    <div ref="sheet" class="cmp-sheet" role="dialog" tabindex="-1" aria-modal="true" :aria-label="t('compare.dialog.title')" data-compare @keydown.escape="onDocumentEscape">
       <header class="cmp-head">
         <div class="cmp-titles">
           <h2>{{ t("compare.dialog.title") }}</h2>

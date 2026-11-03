@@ -28,6 +28,8 @@ const props = defineProps<{
   schema: TableSchema;
   tables?: { schema: string; table: string }[];
   seed?: ImportSeed | null;
+  /** 父级传入的关闭还焦目标；提供时优先于打开瞬间的 activeElement。 */
+  focusReturn?: HTMLElement | null;
 }>();
 
 const emit = defineEmits<{
@@ -57,6 +59,7 @@ const fileInput = ref<HTMLInputElement | null>(null);
 const chosenName = ref("");
 /** 打开时记住触发元素，关闭后若仍在文档中则还焦。 */
 const returnFocus = ref<HTMLElement | null>(null);
+const sheet = ref<HTMLElement | null>(null);
 
 function rememberFocus() {
   const active = document.activeElement;
@@ -64,17 +67,28 @@ function rememberFocus() {
 }
 
 function closeDialog() {
-  const target = returnFocus.value;
+  const target = props.focusReturn !== undefined ? props.focusReturn : returnFocus.value;
   emit("close");
   void nextTick(() => {
     if (target?.isConnected) target.focus();
   });
 }
 
-function onDialogEscape(event: KeyboardEvent) {
-  if (event.defaultPrevented) return;
+/** 冒泡阶段听 document，内层 Listbox 可先 preventDefault。 */
+function onDocumentEscape(event: KeyboardEvent) {
+  if (event.key !== "Escape" || event.defaultPrevented) return;
   event.preventDefault();
   closeDialog();
+}
+
+function armDialog() {
+  rememberFocus();
+  document.addEventListener("keydown", onDocumentEscape);
+  void nextTick(() => sheet.value?.focus());
+}
+
+function disarmDialog() {
+  document.removeEventListener("keydown", onDocumentEscape);
 }
 
 const choices = computed(() => {
@@ -133,9 +147,12 @@ function resetForOpen(): void {
 
 watch(() => props.open, (open) => {
   if (open) {
-    rememberFocus();
+    armDialog();
     resetForOpen();
-  } else releaseImportData();
+  } else {
+    disarmDialog();
+    releaseImportData();
+  }
 });
 
 function releaseImportData() {
@@ -145,7 +162,10 @@ function releaseImportData() {
   lastText.value = "";
   lastBytes.value = null;
 }
-onBeforeUnmount(releaseImportData);
+onBeforeUnmount(() => {
+  disarmDialog();
+  releaseImportData();
+});
 
 watch(format, (next) => {
   parseVersion += 1;
@@ -306,13 +326,13 @@ async function confirm() {
 }
 
 // 初次挂载即按 open 状态复位（原先由 immediate watch 承担，移到声明之后以便 seed 能用同一套 computed）。
-if (props.open) rememberFocus();
+if (props.open) armDialog();
 resetForOpen();
 </script>
 
 <template>
   <div v-if="open" class="ex-overlay" role="presentation">
-    <div class="ex-sheet" role="dialog" aria-modal="true" :aria-label="t('export.importDialog.dialogLabel')" @keydown.escape="onDialogEscape">
+    <div ref="sheet" class="ex-sheet" role="dialog" tabindex="-1" aria-modal="true" :aria-label="t('export.importDialog.dialogLabel')" @keydown.escape="onDocumentEscape">
       <header class="ex-head">
         <div class="ex-titles">
           <h2>{{ t("export.importDialog.title") }}</h2>

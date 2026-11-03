@@ -752,6 +752,34 @@ describe("xlsx export", () => {
     opener.remove();
   });
 
+  it("closes from a document Escape and restores the outside trigger", async () => {
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    opener.focus();
+    const wrapper = mount(ExportDialog, {
+      attachTo: document.body,
+      props: {
+        open: true,
+        origin: "table",
+        truncated: false,
+        fileStem: "customers",
+        loadedCount: 1,
+        pending: 0,
+        columns,
+        previewRows: [{ id: "1", note: null }],
+      },
+    });
+    await nextTick();
+    expect(document.activeElement).toBe(wrapper.get(".ex-sheet").element);
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    expect(wrapper.emitted("close")).toHaveLength(1);
+    await nextTick();
+    expect(document.activeElement).toBe(opener);
+    expect(opener.isConnected).toBe(true);
+    wrapper.unmount();
+    opener.remove();
+  });
+
   it("asks the open connection to write a full xlsx instead of refusing first", async () => {
     invoke.mockReset();
     invoke.mockImplementation(async (command: string, args: { request?: { path?: string } }) => {

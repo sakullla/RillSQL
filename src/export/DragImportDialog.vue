@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { tr as t } from "../i18n";
-import { computed, nextTick, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import Listbox from "../ui/Listbox.vue";
 import type { ListboxOption } from "../ui/types";
 import { gridDescribe } from "../grid/api";
@@ -34,6 +34,7 @@ const loading = ref(false);
 const error = ref("");
 /** 打开时记住触发元素，关闭后若仍在文档中则还焦。 */
 const returnFocus = ref<HTMLElement | null>(document.activeElement instanceof HTMLElement ? document.activeElement : null);
+const sheet = ref<HTMLElement | null>(null);
 
 function closeDialog() {
   const target = returnFocus.value;
@@ -43,11 +44,20 @@ function closeDialog() {
   });
 }
 
-function onDialogEscape(event: KeyboardEvent) {
-  if (event.defaultPrevented) return;
+/** 冒泡阶段听 document，内层 Listbox 可先 preventDefault。 */
+function onDocumentEscape(event: KeyboardEvent) {
+  if (event.key !== "Escape" || event.defaultPrevented) return;
   event.preventDefault();
   closeDialog();
 }
+
+onMounted(() => {
+  document.addEventListener("keydown", onDocumentEscape);
+  sheet.value?.focus();
+});
+onBeforeUnmount(() => {
+  document.removeEventListener("keydown", onDocumentEscape);
+});
 
 const connection = computed<DumpConnection | null>(() => connections.value.find((item) => item.id === connectionId.value) ?? null);
 
@@ -143,7 +153,7 @@ resetConnection(connections.value[0]?.id ?? "");
 
 <template>
   <div class="di-overlay" role="presentation">
-    <div class="di-sheet" role="dialog" aria-modal="true" :aria-label="t('export.dragImport.dialogLabel')" @keydown.escape="onDialogEscape">
+    <div ref="sheet" class="di-sheet" role="dialog" tabindex="-1" aria-modal="true" :aria-label="t('export.dragImport.dialogLabel')" @keydown.escape="onDocumentEscape">
       <header class="di-head">
         <div class="di-titles">
           <h2>{{ t("export.dragImport.title") }}</h2>
@@ -188,7 +198,8 @@ resetConnection(connections.value[0]?.id ?? "");
     :schema="described"
     :tables="tables"
     :seed="seed"
-    @close="emit('close')"
+    :focus-return="returnFocus"
+    @close="closeDialog"
     @done="() => {}"
   />
 </template>

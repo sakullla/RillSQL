@@ -422,4 +422,22 @@ describe("compare", () => {
     opener.remove();
     resetCatalog();
   });
+
+  it("closes from a document Escape and restores the outside trigger", async () => {
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    opener.focus();
+    replaceCatalog([]);
+    const wrapper = mount(CompareDialog, { attachTo: document.body });
+    await nextTick();
+    expect(document.activeElement).toBe(wrapper.get(".cmp-sheet").element);
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    expect(wrapper.emitted("close")).toHaveLength(1);
+    await nextTick();
+    expect(document.activeElement).toBe(opener);
+    expect(opener.isConnected).toBe(true);
+    wrapper.unmount();
+    opener.remove();
+    resetCatalog();
+  });
 });
