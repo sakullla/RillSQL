@@ -2,11 +2,11 @@
 import { autocompletion, startCompletion, type CompletionContext } from "@codemirror/autocomplete";
 import { toggleComment } from "@codemirror/commands";
 import { sql } from "@codemirror/lang-sql";
-import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
+import { foldService, HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { linter } from "@codemirror/lint";
 import { tags } from "@lezer/highlight";
-import { Compartment, EditorState, Prec, StateEffect, StateField } from "@codemirror/state";
-import { Decoration, type DecorationSet, EditorView, keymap } from "@codemirror/view";
+import { Compartment, EditorState, Prec, StateEffect, StateField, type Text } from "@codemirror/state";
+import { Decoration, type DecorationSet, EditorView, keymap, placeholder } from "@codemirror/view";
 import { basicSetup } from "codemirror";
 import ChordKeys from "../shell/ChordKeys.vue";
 import { computed, nextTick, onBeforeUnmount, onMounted, provide, ref, shallowRef, watch } from "vue";
@@ -22,6 +22,7 @@ import { tabHasPending } from "../shell/close-guard";
 import { buildInsertText, registerEditor, setEditorFocus, unregisterEditor, type InsertReference, type QueryEditorApi } from "../shell/query-editor";
 import { loadSettings, onSettingsSaved, type EditorTheme } from "../shell/settings";
 import { connectionStatusText, type ConnectionStatus } from "../shell/status-text";
+import { detectMac, formatChord } from "../shell/shortcuts";
 import type { QueryTarget } from "../shell/session";
 import { ambiguousFieldNote, iterateCachedColumns, fieldFailureNote, loadFields, loadForeignKeys, qualifierFor, unknownFieldNote } from "./columns";
 import { tr as t } from "../i18n";
@@ -32,6 +33,8 @@ import { parseScope, type ScopeTable } from "./completion/scope";
 import { locateForCompletion } from "./completion/scan";
 import { resolveEditor } from "./editor";
 import { consumeExecuteRequest } from "./execute-request";
+import { mergeRunStatus, outlineStatements, statementIndexAt, type OutlineStatement } from "./outline";
+import StatementOutline from "./StatementOutline.vue";
 import { fileOpenPlan, readSqlFile, saveSqlFile, sqlFileProblem, sqlSaveName, SQL_FILE_ACCEPT } from "./file-io";
 import { formatDocument } from "./format";
 import { sqlLintDiagnostics } from "./lint";
@@ -39,7 +42,7 @@ import { analyzeSql, explainSql, hierarchicalSql, planStatement, presentPlan } f
 import { gridModel } from "./rows";
 import { continueTabRun, requestCancel, startTabRun, tabRun, whenSettled } from "./runtime";
 import { QUERY_EDITOR_KEYS, rowLimit, sqlToRun } from "./scope";
-import { inspectSql, locateStatement, openDelimiter } from "./split";
+import { inspectSql, locateStatement, openDelimiter, splitSql, type Piece } from "./split";
 import { findVariables, substituteVariables, type VariableInput } from "./variables";
 
 const props = defineProps<{
@@ -61,6 +64,7 @@ const emit = defineEmits<{
 
 const editorPercent = ref(42);
 const cursor = ref({ line: 1, column: 1 });
+const selChars = ref(0);
 let stopResize: (() => void) | null = null;
 function resizeEditor(event: PointerEvent) {
   event.preventDefault();
@@ -118,6 +122,25 @@ const saveFileError = ref("");
 let view: EditorView | undefined;
 let alive = true;
 
+/* 语句大纲（workbook 导航）：docText 跟随编辑器草稿；大纲按引擎切分，防抖刷新渲染，
+   光标/滚动定位走同步缓存，大文件下不会每次按键都全文重扫。 */
+const docText = ref(props.draft);
+const outline = shallowRef<OutlineStatement[]>([]);
+const outlineOpen = ref(false);
+const cursorIndex = ref(-1);
+const topIndex = ref(-1);
+const topHeadVisible = ref(true);
+let outlineTimer: ReturnType<typeof setTimeout> | undefined;
+let outlineTouched = false;
+let piecesCache: { text: string; engine: string; list: OutlineStatement[] } | null = null;
+/* 编辑器聚焦态：well 容器获得/失去焦点时切换聚焦环。 */
+const editorFocused = ref(false);
+/* 运行中实时计时：run.elapsedMs 只在轮询时刷新，这里用本地计时让状态条平滑走动。 */
+const runStartedAt = ref(0);
+const runTick = ref(0);
+let runTimer: ReturnType<typeof setInterval> | undefined;
+const macPlatform = detectMac();
+
 const run = computed(() => tabRun(props.tabId));
 /* 本地词频（R3）：只按成功执行的语句累计标识符，不含整条 SQL；参与同分候选排序。 */
 const frequency = shallowRef<FrequencyMap>(loadFrequency());
@@ -149,6 +172,21 @@ const hint = computed(() => {
 const activeStatement = computed(() => run.value?.statements[resultIndex.value] ?? null);
 const grid = computed(() => (activeStatement.value && activeStatement.value.columns.length ? gridModel(activeStatement.value) : null));
 const gridEngine = computed(() => asEngine(run.value?.engine));
+
+/* 大纲渲染列表：语句切分结果与最近一次运行的逐句状态合并。 */
+const outlineItems = computed(() => mergeRunStatus(outline.value, run.value));
+const cursorStatement = computed(() => outlineItems.value[cursorIndex.value] ?? null);
+const topStatement = computed(() => outlineItems.value[topIndex.value] ?? null);
+/* 粘性语句条：只有脚本里有两条以上语句、且视口顶部的语句首行已经滚出可见区时才出现。 */
+const stickyVisible = computed(() => outlineItems.value.length >= 2 && topIndex.value >= 0 && !topHeadVisible.value);
+const statementPosition = computed(() => {
+  const total = outlineItems.value.length;
+  if (!total) return "";
+  const at = cursorIndex.value < 0 ? 1 : Math.min(total, cursorIndex.value + 1);
+  return t("query.editor.statementPosition", { n: at, total });
+});
+/* 状态条左侧提示：只在有选中时出现，平时保持安静。 */
+const operationGuide = computed(() => (hasSelection.value ? t("query.editor.selectionCount", { n: selChars.value }) : ""));
 
 /* 一句话摘要（R4）：默认结果区只读这一句话，细节收进「详情」。 */
 const summary = computed(() => {
@@ -201,7 +239,16 @@ const detailsCaption = computed(() => {
   const current = run.value;
   return current ? t("query.run.detailCaption", { n: current.statements.length }) : "";
 });
-const operationGuide = computed(() => t("query.editor.guide"));
+/* 工具栏状态条：运行中用本地计时平滑走动，结束后落到后端 elapsedMs。 */
+const runChip = computed(() => {
+  const current = run.value;
+  if (!current) return "";
+  if (running.value) {
+    void runTick.value;
+    return t("query.run.runningElapsed", { s: ((Date.now() - runStartedAt.value) / 1000).toFixed(1) });
+  }
+  return `${runStatusLine.value} · ${current.elapsedMs} ms`;
+});
 const planCaption = computed(() => t(planKind.value === "analyze" ? "query.plan.captionAnalyze" : "query.plan.caption"));
 const planView = computed(() => {
   const statement = activeStatement.value;
@@ -209,6 +256,16 @@ const planView = computed(() => {
   return presentPlan(statement.columns, statement.rows);
 });
 const canContinue = computed(() => Boolean(running.value && activeStatement.value && activeStatement.value.rows.length > 0 && !activeStatement.value.truncated));
+/* 结果头状态点：把运行的细粒度状态归到五档展示色。 */
+const summaryStatus = computed(() => {
+  const current = run.value;
+  if (!current) return "none";
+  if (current.status === "running" || current.status === "cancel-requested") return "running";
+  if (current.status === "error") return "error";
+  if (current.status === "cancelled") return "cancelled";
+  if (current.status === "unknown") return "unknown";
+  return "ok";
+});
 /* 没有目标、未连接、尚未读到对象时不另起说明；字段说明和含「失败」的原因仍显示。 */
 const hintVisible = computed(() => Boolean(fieldNote.value) || hint.value.failure);
 
@@ -256,6 +313,118 @@ function preferredIndex(statements: { columns: string[] }[]): number {
     if (statements[index]!.columns.length) return index;
   }
   return statements.length - 1;
+}
+
+/* ---------- 语句大纲：切分、缓存、跳转 ---------- */
+
+function currentEngine(): string {
+  return props.engine ?? "postgres";
+}
+
+/** 同步取大纲：同一份文档与引擎只切一次，光标移动、滚动、跳转共享这份缓存。 */
+function syncOutline(): OutlineStatement[] {
+  const text = docText.value;
+  const engine = currentEngine();
+  if (!piecesCache || piecesCache.text !== text || piecesCache.engine !== engine) {
+    piecesCache = { text, engine, list: outlineStatements(text, engine) };
+  }
+  return piecesCache.list;
+}
+
+/** 渲染用大纲：输入停顿 120ms 后刷新，特大脚本里连续按键不会逐次重扫全文。 */
+function refreshOutline(immediate = false): void {
+  if (outlineTimer) clearTimeout(outlineTimer);
+  if (immediate) {
+    outline.value = syncOutline();
+    return;
+  }
+  outlineTimer = setTimeout(() => {
+    outline.value = syncOutline();
+  }, 120);
+}
+
+/** 大纲首次发现多语句脚本时自动展开（窄屏不抢宽度）；用户手动开关后不再替他决定。 */
+watch(
+  () => outline.value.length,
+  (count) => {
+    if (!outlineTouched && count >= 2 && window.innerWidth >= 900) outlineOpen.value = true;
+  },
+);
+
+function updateCursorIndex(): void {
+  const editor = view;
+  if (!editor) return;
+  cursorIndex.value = statementIndexAt(syncOutline(), editor.state.selection.main.head);
+}
+
+/** 视口顶部落在哪条语句里、语句首行是否仍可见：决定粘性上下文条与大纲高亮。 */
+function updateTopIndex(): void {
+  const editor = view;
+  if (!editor) return;
+  const list = syncOutline();
+  if (list.length < 2) {
+    topIndex.value = -1;
+    topHeadVisible.value = true;
+    return;
+  }
+  const index = statementIndexAt(list, editor.elementAtHeight(editor.scrollDOM.scrollTop + 2).from);
+  topIndex.value = index;
+  const statement = list[index];
+  topHeadVisible.value = statement ? editor.lineBlockAt(statement.start).top >= editor.scrollDOM.scrollTop - 1 : true;
+}
+
+function onEditorScroll(): void {
+  updateTopIndex();
+}
+
+/* 运行开始的瞬间启动本地计时，结束即停；让工具栏状态平滑走动。 */
+watch(running, (isRunning) => {
+  if (isRunning) {
+    runStartedAt.value = Date.now();
+    runTick.value += 1;
+    runTimer = setInterval(() => {
+      runTick.value += 1;
+    }, 200);
+    return;
+  }
+  if (runTimer) {
+    clearInterval(runTimer);
+    runTimer = undefined;
+  }
+});
+
+function jumpToStatement(statement: OutlineStatement): void {
+  const editor = view;
+  if (!editor) return;
+  editor.dispatch({
+    selection: { anchor: statement.start },
+    effects: EditorView.scrollIntoView(statement.start, { y: "start", yMargin: 6 }),
+  });
+  editor.focus();
+}
+
+function stepStatement(delta: -1 | 1): void {
+  const list = syncOutline();
+  if (!list.length) return;
+  const base = cursorIndex.value < 0 ? (delta > 0 ? -1 : list.length) : cursorIndex.value;
+  const next = Math.min(list.length - 1, Math.max(0, base + delta));
+  jumpToStatement(list[next]!);
+}
+
+function toggleOutline(): void {
+  outlineTouched = true;
+  outlineOpen.value = !outlineOpen.value;
+}
+
+/** 语句级折叠：按 splitSql 的语句边界给 gutter 提供折叠范围，跨行语句才能折。 */
+const statementFoldCache = new WeakMap<Text, Piece[]>();
+function statementPieces(doc: Text): Piece[] {
+  let pieces = statementFoldCache.get(doc);
+  if (!pieces) {
+    pieces = splitSql(doc.toString(), currentEngine());
+    statementFoldCache.set(doc, pieces);
+  }
+  return pieces;
 }
 
 /** jsdom 的 Range 没有 getClientRects，选区测量不能变成未处理异常。 */
@@ -512,12 +681,25 @@ async function loadOnConditions(
    由容器上的 data-editor-theme 决定用 tokens.css 的哪套变量组，auto 不设属性即沿用全局主题默认配色。
    切换只重配样式，不重建编辑器，草稿与执行结果不动。 */
 const highlightCompartment = new Compartment();
+/* 空编辑器占位提示跟随目标状态换文案：选目标前/后各一句。 */
+const placeholderCompartment = new Compartment();
 const editorTheme = ref<EditorTheme>(loadSettings().editorTheme);
 let detachSettings: (() => void) | null = null;
 
 watch(editorTheme, () => {
   view?.dispatch({ effects: highlightCompartment.reconfigure(editorHighlight()) });
 });
+
+watch(
+  () => props.connectionName,
+  () => {
+    view?.dispatch({ effects: placeholderCompartment.reconfigure(editorPlaceholder()) });
+  },
+);
+
+function editorPlaceholder() {
+  return placeholder(props.connectionName ? t("query.editor.placeholderReady") : t("query.editor.placeholderNoTarget"));
+}
 
 function editorHighlight() {
   return syntaxHighlighting(HighlightStyle.define([
@@ -537,7 +719,21 @@ function editorExtensions() {
     basicSetup,
     sendRangeField,
     sql(),
+    foldService.of((state, lineStart, lineEnd) => {
+      const pieces = statementPieces(state.doc);
+      for (const piece of pieces) {
+        if (piece.start > lineEnd) break;
+        if (piece.start < lineStart) continue;
+        const firstLine = state.doc.lineAt(piece.start);
+        if (state.doc.lineAt(piece.end).number > firstLine.number) {
+          return { from: firstLine.to, to: piece.end };
+        }
+        return null;
+      }
+      return null;
+    }),
     highlightCompartment.of(editorHighlight()),
+    placeholderCompartment.of(editorPlaceholder()),
     shellTheme,
     Prec.high(
       keymap.of([
@@ -556,16 +752,28 @@ function editorExtensions() {
     EditorView.updateListener.of((update) => {
       if (!alive) return;
       /* 目录树单击插入靠这份焦点标记判断「查询编辑器持有焦点」（R4）。 */
-      if (update.focusChanged) setEditorFocus(props.tabId, update.view.hasFocus);
+      if (update.focusChanged) {
+        setEditorFocus(props.tabId, update.view.hasFocus);
+        editorFocused.value = update.view.hasFocus;
+      }
       if (update.selectionSet || update.docChanged) {
         const range = update.state.selection.main;
         hasSelection.value = range.from !== range.to;
+        selChars.value = Math.abs(range.to - range.from);
         const line = update.state.doc.lineAt(range.head);
         cursor.value = { line: line.number, column: range.head - line.from + 1 };
+        updateCursorIndex();
+      }
+      if (update.docChanged) {
+        updateTopIndex();
       }
       if (!update.docChanged) return;
       const draft = update.state.doc.toString();
-      if (draft !== props.draft) emit("update:draft", props.tabId, draft);
+      if (draft !== props.draft) {
+        docText.value = draft;
+        refreshOutline();
+        emit("update:draft", props.tabId, draft);
+      }
     }),
   ];
 }
@@ -585,7 +793,14 @@ function mountEditor() {
     parent,
     state: EditorState.create({ doc: props.draft, extensions: editorExtensions() }),
   }));
-  if (view) registerEditor(props.tabId, editorRegistryApi);
+  if (!view) return;
+  registerEditor(props.tabId, editorRegistryApi);
+  /* 同一监听函数重复 addEventListener 不叠加，热更新复用编辑器时也是安全的。 */
+  view.scrollDOM.addEventListener("scroll", onEditorScroll, { passive: true });
+  docText.value = view.state.doc.toString();
+  refreshOutline(true);
+  updateCursorIndex();
+  updateTopIndex();
 }
 
 /**
@@ -998,6 +1213,14 @@ function locateInEditor(sqlText: string) {
   editor.focus();
 }
 
+/** 结果摘要点击：失败时跳到第一条失败语句的结果页。 */
+function jumpToFailedStatement() {
+  const current = run.value;
+  if (!current || current.status !== "error") return;
+  const failedIndex = current.statements.findIndex((statement) => statement.status === "error");
+  if (failedIndex >= 0) resultIndex.value = failedIndex;
+}
+
 function toggleMenu() {
   if (running.value || submitting.value) return;
   menuOpen.value = !menuOpen.value;
@@ -1297,6 +1520,17 @@ watch(
   },
 );
 
+/* 引擎切换会改变语句切分规则（DELIMITER、GO），大纲与折叠缓存都要重建。 */
+watch(
+  () => props.engine,
+  () => {
+    piecesCache = null;
+    refreshOutline(true);
+    updateCursorIndex();
+    updateTopIndex();
+  },
+);
+
 onMounted(() => {
   document.addEventListener("pointerdown", onPointerDown);
   // 设置保存即通知：QueryTab 不接收 settings 属性，借此即时跟随编辑器配色切换。
@@ -1312,6 +1546,9 @@ onBeforeUnmount(() => {
   detachSettings?.();
   document.removeEventListener("pointerdown", onPointerDown);
   unregisterEditor(props.tabId);
+  if (outlineTimer) clearTimeout(outlineTimer);
+  if (runTimer) clearInterval(runTimer);
+  view?.scrollDOM.removeEventListener("scroll", onEditorScroll);
   view?.destroy();
 });
 </script>
@@ -1335,12 +1572,11 @@ onBeforeUnmount(() => {
         </button>
         <div v-if="runMenuOpen" class="run-menu" role="menu" :aria-label="t('query.run.menu')" @keydown="onRunMenuKey">
           <button class="run-item" type="button" role="menuitem" data-action="run-current" @click="execute('current')">
-            <span>{{ t("query.run.current") }}</span>
-            <small>{{ t("query.run.currentHint") }}</small>
+            <span class="run-item-copy"><span>{{ t("query.run.current") }}</span><small>{{ t("query.run.currentHint") }}</small></span>
+            <ChordKeys chord="Mod+Shift+Enter" />
           </button>
           <button class="run-item" type="button" role="menuitem" data-action="run-script" @click="execute('script')">
-            <span>{{ t("query.run.script") }}</span>
-            <small>{{ t("query.run.scriptHint") }}</small>
+            <span class="run-item-copy"><span>{{ t("query.run.script") }}</span><small>{{ t("query.run.scriptHint") }}</small></span>
           </button>
         </div>
       </div>
@@ -1395,9 +1631,10 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <span v-if="connectionStatus" class="conn-state" :class="`st-${connectionStatus}`"><i></i>{{ connectionStatusText(connectionStatus) }}</span>
-      <span v-if="run" class="q-note" role="status" :title="`${runStatusLine} · ${run.elapsedMs} ms`">{{ runStatusLine }} · {{ run.elapsedMs }} ms</span>
+      <span v-if="run" class="q-note" role="status" :title="runChip">{{ runChip }}</span>
       <span class="grow"></span>
-      <button class="icon-btn" type="button" data-action="format" :aria-label="t('query.toolbar.format')" :title="t('query.toolbar.formatTitle')" @click="formatEditor"><Icon name="format" /></button>
+      <button class="icon-btn" type="button" data-action="format" :aria-label="t('query.toolbar.format')" :title="`${t('query.toolbar.formatTitle')} (${formatChord('Mod+Shift+F', macPlatform)})`" @click="formatEditor"><Icon name="format" /></button>
+      <button class="icon-btn" type="button" data-action="outline" :aria-label="t('query.outline.toggle')" :title="t('query.outline.toggleTitle')" :aria-pressed="outlineOpen" @click="toggleOutline"><Icon name="list" /></button>
       <button class="icon-btn" type="button" data-action="open-file" :aria-label="t('query.toolbar.open')" :title="t('query.toolbar.openTitle')" :disabled="running || submitting" @click="pickSqlFile"><Icon name="file" /></button>
       <input ref="openFileInput" class="hidden-file-input" type="file" data-action="open-file-input" :accept="SQL_FILE_ACCEPT" :aria-label="t('query.toolbar.openLabel')" @change="onSqlFile" />
       <span class="toolbar-sep" aria-hidden="true"></span>
@@ -1450,7 +1687,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <span class="toolbar-sep" aria-hidden="true"></span>
-      <button class="icon-btn" type="button" data-action="plan" :aria-label="t('query.toolbar.plan')" :title="t('query.toolbar.planTitle')" :disabled="running || submitting" @click="requestPlan"><Icon name="plan" /></button>
+      <button class="icon-btn" type="button" data-action="plan" :aria-label="t('query.toolbar.plan')" :title="`${t('query.toolbar.planTitle')} (${formatChord('Mod+Shift+E', macPlatform)})`" :disabled="running || submitting" @click="requestPlan"><Icon name="plan" /></button>
       <button class="icon-btn" type="button" data-action="analyze" :aria-label="t('query.toolbar.analyze')" :title="t('query.toolbar.analyzeTitle')" :disabled="running || submitting" @click="requestAnalyze"><Icon name="clock" /></button>
     </div>
     <div v-if="running" class="q-progress" role="presentation"></div>
@@ -1485,19 +1722,82 @@ onBeforeUnmount(() => {
     <p v-if="notice" class="q-banner is-notice">{{ notice }}</p>
     <p v-if="actionError" class="q-banner is-error" role="alert"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18M15 9l-6 6M9 9l6 6" /></svg>{{ actionError }}</p>
     <p v-if="hintVisible" class="q-hint" :data-keywords-only="hint.keywordsOnly" :title="hint.note">{{ hint.note }}</p>
-    <div ref="host" class="cm-host"></div>
-    <div class="editor-position"><span class="q-guide">{{ operationGuide }}</span><span class="mono">Ln {{ cursor.line }}, Col {{ cursor.column }}</span></div>
+    <div class="editor-row" :data-focused="editorFocused ? 'true' : undefined">
+      <div class="editor-main">
+        <button
+          v-if="stickyVisible && topStatement"
+          class="stmt-sticky"
+          type="button"
+          :title="t('query.outline.stickyTitle')"
+          :aria-label="t('query.outline.itemTitle', { n: topStatement.index, line: topStatement.line })"
+          @click="jumpToStatement(topStatement)"
+        >
+          <span class="sticky-no">{{ topStatement.index }}</span>
+          <span class="sticky-preview">{{ topStatement.preview }}</span>
+          <Icon name="chevron-up" class="i" />
+        </button>
+        <div ref="host" class="cm-host"></div>
+      </div>
+      <StatementOutline v-if="outlineOpen" :statements="outlineItems" :active-index="cursorIndex" @jump="jumpToStatement" />
+    </div>
+    <div class="editor-position">
+      <span class="q-guide" :title="hasSelection ? t('query.editor.selectionCountTitle', { n: selChars }) : ''">{{ operationGuide }}</span>
+      <span class="editor-nav">
+        <template v-if="outlineItems.length">
+          <button v-if="outlineItems.length > 1" class="icon-btn xs" type="button" :aria-label="t('query.editor.prevStatement')" :title="t('query.editor.prevStatement')" :disabled="cursorIndex <= 0" @click="stepStatement(-1)"><Icon name="chevron-up" /></button>
+          <span class="stmt-pos mono" :title="cursorStatement ? cursorStatement.preview : statementPosition">{{ statementPosition }}</span>
+          <button v-if="outlineItems.length > 1" class="icon-btn xs" type="button" :aria-label="t('query.editor.nextStatement')" :title="t('query.editor.nextStatement')" :disabled="cursorIndex >= outlineItems.length - 1" @click="stepStatement(1)"><Icon name="chevron-down" /></button>
+        </template>
+        <span class="mono">Ln {{ cursor.line }}, Col {{ cursor.column }}</span>
+      </span>
+    </div>
     <div class="query-splitter" role="separator" tabindex="0" :aria-label="t('query.editor.splitter')" aria-orientation="horizontal" :aria-valuenow="editorPercent" :aria-valuemin="20" :aria-valuemax="70" @pointerdown="resizeEditor" @keydown.up.prevent="editorPercent = Math.max(20, editorPercent - 5)" @keydown.down.prevent="editorPercent = Math.min(70, editorPercent + 5)"><span></span></div>
     <section class="q-results" :aria-label="t('query.results.area')">
-      <div class="results-heading"><span><Icon name="table" />{{ t("query.results.heading") }}</span><span v-if="run" class="q-summary" :data-status="run.status">{{ summary }}</span><span v-else class="muted">{{ t("query.results.waiting") }}</span><span ref="resultTools" class="results-tools"></span><span class="badge">{{ t("query.results.readonly") }}</span></div>
+      <div class="results-heading">
+        <span class="rh-title"><Icon name="table" />{{ t("query.results.heading") }}</span>
+        <span
+          v-if="run"
+          class="q-summary"
+          :data-status="run.status"
+          :class="{ link: run.status === 'error' }"
+          :title="run.status === 'error' ? t('query.run.statementFailed', { n: run.statements.findIndex((statement) => statement.status === 'error') + 1 }) : summary"
+          @click="jumpToFailedStatement"
+        ><i class="rh-dot" :data-status="summaryStatus" aria-hidden="true"></i>{{ summary }}</span>
+        <span v-else class="muted">{{ t("query.results.waiting") }}</span>
+        <span class="grow"></span>
+        <button v-if="canContinue" class="btn sm" type="button" data-action="continue-read" @click="continueRead">{{ t("query.run.continueRead") }}</button>
+        <span ref="resultTools" class="results-tools"></span>
+        <span class="badge">{{ t("query.results.readonly") }}</span>
+      </div>
       <div v-if="!run" class="q-empty" data-query-empty>
         <span class="action-icon"><Icon :name="connectionName ? 'play' : 'database'" /></span>
         <b>{{ connectionName ? t("query.results.emptyReady") : t("query.results.emptyNoTarget") }}</b>
         <p v-if="connectionName">{{ t("query.results.emptyReadyHint") }} <ChordKeys chord="Mod+Enter" /></p>
-        <p v-else>{{ t("query.results.emptyNoTargetHint") }}</p>
+        <template v-else>
+          <p>{{ t("query.results.emptyNoTargetHint") }}</p>
+          <button class="btn sm" type="button" data-action="pick-target" @click="toggleMenu">{{ t("query.results.emptyPickTarget") }}</button>
+        </template>
       </div>
       <template v-if="run">
-        <div v-if="run.statements.length > 1" class="result-tabs" role="tablist" :aria-label="t('query.results.statementTabs')"><button v-for="(statement, index) in run.statements" :key="index" role="tab" :aria-selected="resultIndex === index" @click="resultIndex = index">{{ t("query.run.statementTab", { n: index + 1 }) }} <span>{{ statement.columns.length ? t("query.run.statementRows", { n: statement.rows.length }) : statusLabel(statement.status) }}</span></button></div>
+        <div v-if="run.statements.length > 1" class="result-tabs" role="tablist" :aria-label="t('query.results.statementTabs')">
+          <button
+            v-for="(statement, index) in run.statements"
+            :key="index"
+            role="tab"
+            class="result-tab"
+            :class="`st-${statement.status}`"
+            :aria-selected="resultIndex === index"
+            :data-result-index="index"
+            type="button"
+            :title="statement.status === 'error' ? `${t('query.run.locate')} · ${t('query.run.statementTab', { n: index + 1 })}` : undefined"
+            @click="resultIndex = index"
+            @dblclick="locateInEditor(statement.sql)"
+          >
+            <span class="rt-dot" :data-status="statement.status" aria-hidden="true"></span>
+            <span class="rt-label">{{ t("query.run.statementTab", { n: index + 1 }) }}</span>
+            <span class="rt-meta">{{ statement.columns.length ? t("query.run.statementRows", { n: statement.rows.length }) : statusLabel(statement.status) }}</span>
+          </button>
+        </div>
         <p v-if="run.pollError" class="q-note" role="alert">{{ t("query.run.pollErrorNote", { error: run.pollError }) }}</p>
         <p v-else-if="run.cancel === 'requested'" class="q-note" role="status">{{ t("query.run.cancelingNote") }}</p>
         <p v-else-if="run.cancel === 'confirmed' || run.status === 'cancelled'" class="q-note" role="status">{{ t("query.run.cancelledNote") }}</p>
@@ -1506,7 +1806,6 @@ onBeforeUnmount(() => {
           <p v-if="activeStatement.status === 'unknown'" class="q-note">{{ t("query.run.unknownNote") }}</p>
           <p v-else-if="activeStatement.status === 'skipped'" class="q-note">{{ t("query.run.skippedNote") }}</p>
           <p v-else-if="activeStatement.status === 'ok' && activeStatement.message" class="q-note">{{ activeStatement.message }}</p>
-          <p v-if="canContinue" class="q-note"><button class="btn sm" type="button" data-action="continue-read" @click="continueRead">{{ t("query.run.continueRead") }}</button></p>
           <div v-if="planMode && planView" class="plan-view" data-result="plan">
             <p class="plan-caption">{{ planCaption }}</p>
             <ol v-if="planView.kind === 'tree'" class="plan-tree">
@@ -1579,6 +1878,8 @@ onBeforeUnmount(() => {
 /* ---------- 工具条：chrome 层实体控件带 ---------- */
 .q-toolbar { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; padding: var(--sp-1) var(--sp-2); min-height: var(--toolbar-h); border-bottom: 1px solid var(--line); background: var(--surface-panel); }
 .q-toolbar .icon-btn { width: 28px; height: 28px; }
+/* 大纲开关按下态：与未按下区分，一眼可知当前有没有大纲。 */
+.q-toolbar .icon-btn[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent-text); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent); }
 .q-toolbar .btn :deep(.i) { width: 14px; height: 14px; color: var(--text-3); }
 .q-target { position: relative; min-width: 0; }
 .target-btn { display: flex; align-items: center; gap: var(--sp-2); height: var(--control-h); max-width: 420px; min-width: 0; padding: 0 var(--sp-2) 0 var(--sp-1); border: 1px solid transparent; border-radius: var(--r); background: transparent; font-size: var(--fs-sm); transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease); }
@@ -1624,8 +1925,9 @@ onBeforeUnmount(() => {
 .run-group .run-more:disabled { background: var(--disabled-bg); color: var(--disabled-fg); border-color: var(--line); box-shadow: none; }
 .run-group .run-more .tg-caret { margin-left: 0; color: var(--on-accent); }
 .q-toolbar .run-main :deep(.run-glyph) { width: 13px; height: 13px; color: inherit; fill: currentColor; }
-.run-menu { min-width: 220px; }
-.run-item { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; padding: var(--sp-2); border-radius: var(--r); text-align: left; font-size: var(--fs-sm); }
+.run-menu { min-width: 240px; }
+.run-item { display: flex; align-items: center; gap: var(--sp-2); width: 100%; padding: var(--sp-2); border-radius: var(--r); text-align: left; font-size: var(--fs-sm); }
+.run-item-copy { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; flex: 1; min-width: 0; }
 .run-item:hover { background: var(--hover); }
 .run-item:active { box-shadow: inset 0 1px 2px var(--press); }
 .run-item small { font-size: var(--fs-xs); color: var(--text-3); }
@@ -1655,7 +1957,7 @@ onBeforeUnmount(() => {
 /* ---------- 提示条 / 横幅 ---------- */
 .q-note, .q-hint, .q-banner { margin: 0; font-size: var(--fs-xs); color: var(--text-2); }
 /* 运行状态也参与收缩：窄窗口下先省略状态文字，不把右侧高频入口挤出去。 */
-.q-toolbar .q-note { color: var(--text-3); white-space: nowrap; min-width: 0; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+.q-toolbar .q-note { color: var(--text-3); white-space: nowrap; min-width: 0; max-width: 220px; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
 .q-results .q-note { padding: var(--sp-1) var(--sp-3); }
 .q-hint, .q-banner { padding: var(--sp-1) var(--sp-3); }
 .q-toolbar { position: relative; }
@@ -1667,16 +1969,77 @@ onBeforeUnmount(() => {
 .q-empty .action-icon { margin-bottom: var(--sp-2); }
 .q-empty b { font-size: var(--fs-md); font-weight: 600; color: var(--text); }
 .q-empty p { display: inline-flex; align-items: center; gap: var(--sp-2); margin: 0; font-size: var(--fs-sm); }
+.q-empty > .btn { margin-top: var(--sp-2); }
 .q-banner { display: flex; align-items: center; gap: var(--sp-2); color: var(--text); background: var(--surface-sunken); box-shadow: inset 2px 0 0 var(--line-2); }
 .q-banner .i { width: 14px; height: 14px; flex-shrink: 0; }
 /* 错误横幅与全局 err 模式一致：软底卡 + 同色 3px 左缘 + 语义图标 */
 .q-banner.is-error { color: var(--err); background: var(--err-soft); box-shadow: inset 3px 0 0 var(--err); }
 
 /* ---------- 编辑器：sunken 下沉井 ---------- */
-.query-pane .cm-host { flex: 0 1 var(--editor-share); min-height: 90px; overflow: hidden; background: var(--surface-panel); }
+.editor-row {
+  flex: 0 1 var(--editor-share);
+  min-height: 90px;
+  display: flex;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--surface-panel);
+  margin: var(--sp-2) var(--sp-2) 0;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-md);
+  transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
+}
+/* 焦点进入编辑器时 well 亮起一圈光环，焦点离开即收回。 */
+.editor-row[data-focused="true"] { border-color: color-mix(in srgb, var(--accent) 42%, var(--stroke)); box-shadow: 0 0 0 2px var(--ring); }
+.editor-main { position: relative; flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.query-pane .editor-row .editor-main .cm-host { flex: 1 1 auto; min-height: 0; min-width: 0; overflow: hidden; background: var(--surface-panel); }
 .query-pane :deep(.cm-content) { padding-top: var(--sp-2); line-height: 1.7; }
 .query-pane :deep(.cm-line) { padding-left: var(--sp-3); }
 .query-pane :deep(.cm-gutters) { min-width: 40px; }
+/* 空编辑器占位提示：比正文浅一档，不抢视线。 */
+.query-pane :deep(.cm-placeholder) { color: var(--text-3); }
+/* 粘性语句上下文条：贴在编辑器视口顶部，告诉用户当前滚进了哪条语句；点击跳回句首。 */
+.stmt-sticky {
+  position: absolute;
+  z-index: var(--z-sticky);
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 24px;
+  padding: 0 var(--sp-3) 0 40px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-chrome);
+  color: var(--text-2);
+  font-size: var(--fs-xs);
+  text-align: left;
+  box-shadow: var(--shadow-sm);
+}
+.stmt-sticky:hover { background: var(--hover); color: var(--text); }
+.stmt-sticky:active { box-shadow: inset 0 1px 2px var(--press); }
+.sticky-no {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 16px;
+  padding: 0 3px;
+  border-radius: var(--r-sm);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: var(--fs-2xs);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.sticky-preview { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-family: var(--mono); }
+.stmt-sticky .i { width: 12px; height: 12px; color: var(--text-3); flex-shrink: 0; }
+/* 状态条右侧：语句位置 + 上一条/下一条 + 光标行列。 */
+.editor-nav { display: inline-flex; align-items: center; gap: var(--sp-1); min-width: 0; }
+.stmt-pos { color: var(--text-3); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.icon-btn.xs { width: 20px; height: 20px; border-radius: var(--r-sm); }
+.icon-btn.xs :deep(.i) { width: 12px; height: 12px; }
+.icon-btn.xs:disabled { opacity: 0.45; }
 /* 编辑器四层反馈各用一枚令牌（R1、R2）：当前行 < 执行范围 < 失焦选区 < 聚焦选区。
    选区不再聚焦/失焦同色：失焦仍可辨认，又与聚焦态区分；光标提到 2px 中性高对比色，不被选区底吞没。
    选区只由 drawSelection 的 .cm-selectionBackground 单层绘制：CodeMirror 已把原生 ::selection 置为透明，
@@ -1707,23 +2070,55 @@ onBeforeUnmount(() => {
 /* ---------- 结果区：panel 层 ---------- */
 .query-pane .q-results { flex: 1; min-height: 130px; padding: 0; gap: 0; border: 0; background: var(--surface-panel); }
 .q-results { min-height: 120px; overflow: auto; border-top: 1px solid var(--line); padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); }
-.results-heading { display: flex; align-items: center; gap: var(--sp-3); min-height: 36px; padding: 0 var(--sp-3); border-bottom: 1px solid var(--line); font-size: var(--fs-xs); flex-shrink: 0; background: var(--surface-panel); color: var(--text-2); }
-.results-heading > span:first-child { display: inline-flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); font-weight: 600; color: var(--text); }
-.results-heading > span:first-child :deep(.i) { width: 14px; height: 14px; color: var(--text-3); }
-.q-summary { margin: 0; font-size: var(--fs-md); font-weight: 600; color: var(--text); }
+.results-heading { display: flex; align-items: center; gap: var(--sp-2); min-height: 36px; padding: 0 var(--sp-3); border-bottom: 1px solid var(--line); font-size: var(--fs-xs); flex-shrink: 0; background: var(--surface-panel); color: var(--text-2); }
+.rh-title { display: inline-flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); font-weight: 600; color: var(--text); flex-shrink: 0; }
+.rh-title :deep(.i) { width: 14px; height: 14px; color: var(--text-3); }
+.results-heading .grow { flex: 1; min-width: var(--sp-3); }
+.rh-dot { display: inline-block; width: 7px; height: 7px; border-radius: var(--r-full); margin-right: 6px; background: var(--text-3); flex-shrink: 0; }
+.rh-dot[data-status="ok"] { background: var(--ok); }
+.rh-dot[data-status="error"] { background: var(--err); }
+.rh-dot[data-status="running"] { background: var(--accent); animation: q-pulse 1s var(--ease) infinite; }
+.rh-dot[data-status="cancelled"], .rh-dot[data-status="unknown"] { background: var(--warn); }
+@keyframes q-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.q-summary { display: inline-flex; align-items: center; margin: 0; font-size: var(--fs-md); font-weight: 600; color: var(--text); min-width: 0; }
 .q-summary[data-status="error"] { color: var(--err); }
-.results-heading .q-summary { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40%; }
+.results-heading .q-summary { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 46%; font-size: var(--fs-xs); font-weight: 500; color: var(--text-2); }
 .q-summary[data-status="unknown"] { color: var(--warn); }
-.results-heading .q-summary { font-size: var(--fs-xs); font-weight: 500; color: var(--text-2); }
 .results-heading .q-summary[data-status="error"] { color: var(--err); }
 .results-heading .q-summary[data-status="unknown"] { color: var(--warn); }
+/* 执行失败时摘要可点击：跳到第一条失败语句的结果。 */
+.q-summary.link { cursor: pointer; border-radius: var(--r-sm); }
+.q-summary.link:hover { text-decoration: underline; text-underline-offset: 2px; }
+.results-tools { display: inline-flex; align-items: center; gap: var(--sp-2); min-width: 0; }
+.results-heading > .badge { flex-shrink: 0; }
 
-/* 语句结果页签：下缘指示条与结果区上缘连成一体 */
-.result-tabs { display: flex; flex-shrink: 0; gap: 2px; padding: 0 var(--sp-2); border-bottom: 1px solid var(--line); overflow: auto; background: var(--surface-panel); }
-.result-tabs button { padding: var(--sp-2) var(--sp-3); font-size: var(--fs-xs); color: var(--text-2); white-space: nowrap; border-bottom: 2px solid transparent; border-radius: var(--r-sm) var(--r-sm) 0 0; transition: color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease); }
-.result-tabs button:hover { color: var(--text); border-bottom-color: var(--line-2); background: var(--hover); }
-.result-tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); background: var(--surface-panel); box-shadow: 0 1px 0 0 var(--surface-panel); }
-.result-tabs span { font-size: var(--fs-xs); color: var(--text-3); margin-left: var(--sp-1); }
+/* 语句结果页签：芯片式，状态点 + 序号 + 行数/状态，激活项用强调浅底。 */
+.result-tabs { display: flex; flex-shrink: 0; gap: var(--sp-1); padding: var(--sp-1) var(--sp-2); border-bottom: 1px solid var(--line); overflow: auto; background: var(--surface-panel); }
+.result-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+  white-space: nowrap;
+  border: 1px solid transparent;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+}
+.result-tab:hover { background: var(--hover); color: var(--text); }
+.result-tab:active { box-shadow: inset 0 1px 2px var(--press); }
+.result-tab[aria-selected="true"] { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 30%, transparent); color: var(--accent-text); font-weight: 600; }
+.rt-dot { width: 6px; height: 6px; border-radius: var(--r-full); background: var(--text-3); flex-shrink: 0; }
+.rt-dot[data-status="ok"] { background: var(--ok); }
+.rt-dot[data-status="error"] { background: var(--err); }
+.rt-dot[data-status="running"], .rt-dot[data-status="pending"] { background: var(--accent); animation: q-pulse 1s var(--ease) infinite; }
+.rt-dot[data-status="skipped"] { background: var(--text-3); opacity: 0.6; }
+.rt-dot[data-status="cancelled"], .rt-dot[data-status="unknown"] { background: var(--warn); }
+.rt-label { font-weight: 600; }
+.rt-meta { color: var(--text-3); font-variant-numeric: tabular-nums; }
+.result-tab[aria-selected="true"] .rt-meta { color: var(--accent-text); opacity: 0.8; }
 
 /* 执行计划视图 */
 .plan-view { padding: var(--sp-3) var(--sp-4); overflow: auto; }

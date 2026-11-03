@@ -181,7 +181,9 @@ describe("query editing", () => {
     expect(wrapper.text()).not.toContain("查询的答案，会出现在这里。");
     expect(wrapper.text()).not.toContain("执行全部");
     expect(wrapper.findAll(".q-guide")).toHaveLength(1);
-    expect(wrapper.get(".q-guide").text()).toBe("选择执行目标，编写 SQL，然后执行。有选中时只运行选中部分，无选中时执行光标所在语句。");
+    /* 常态下状态条保持安静；选中 SQL 时才出现提示。 */
+    expect(wrapper.get(".q-guide").text()).toBe("");
+    expect(wrapper.get(".editor-position").text()).toContain("语句 1/2");
     expect(wrapper.get(".editor-position").text()).toContain("Ln ");
     expect(wrapper.text()).not.toContain("SQL 编辑器");
     expect(wrapper.text()).not.toContain("选择执行目标，编写 SQL，然后点击执行");
@@ -200,6 +202,8 @@ describe("query editing", () => {
     const from = sql.indexOf("SELECT 2;");
     view!.dispatch({ selection: { anchor: from, head: from + "SELECT 2;".length } });
     await nextTick();
+    /* 选中 SQL 时状态条出现「执行选中」提示。 */
+    expect(wrapper.get(".q-guide").text()).toContain("执行选中");
     await wrapper.get("[data-action='run']").trigger("click");
     await flushPromises();
     const started = () => calls.filter((call) => call.command === "query_start");
@@ -215,7 +219,7 @@ describe("query editing", () => {
 
     view!.dispatch({ selection: { anchor: from + 2, head: from + 2 } });
     await nextTick();
-    expect(wrapper.get(".editor-position").text()).toContain("光标所在语句");
+    expect(wrapper.get(".editor-position").text()).toContain("语句 2/2");
     await wrapper.get("[data-action='run']").trigger("click");
     await flushPromises();
     expect(started().at(-1)).toMatchObject({ command: "query_start", sql: "SELECT 2;" });
@@ -341,8 +345,9 @@ describe("query editing", () => {
       },
     });
     await nextTick();
-    expect(wrapper.find(".cm-placeholder").exists()).toBe(false);
-    expect(wrapper.get(".q-guide").text()).toContain("无选中时执行光标所在语句");
+    /* 空草稿 + 已选目标：编辑器内出现占位提示，状态条保持安静。 */
+    expect(wrapper.find(".cm-placeholder").exists()).toBe(true);
+    expect(wrapper.get(".q-guide").text()).toBe("");
     expect(wrapper.text()).not.toContain("执行全部");
     expect(wrapper.text()).not.toContain("查询的答案，会出现在这里。");
     await wrapper.get("[data-action='target']").trigger("click");

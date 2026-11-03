@@ -429,4 +429,6 @@
 .results-tools { flex: 1 1 auto; min-width: 0; }
 .results-tools .result-toolbar { min-height: 0; padding: 0; border: 0; flex-wrap: nowrap; }
 .results-tools .result-toolbar input { flex: 0 1 200px; width: 200px; height: var(--control-h-sm); }
+/* 结果头内的可编辑性说明收紧，超长省略；完整原因留在 title。 */
+.results-tools .toolbar-hint { max-width: 240px; }
 .q-results .grid-foot.quiet { display: none; }
