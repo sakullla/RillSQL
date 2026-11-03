@@ -15,7 +15,9 @@ export const compare = {
     compareStructure: "对比结构",
     comparing: "正在对比…",
     structureScript: "结构脚本",
+    structureDisclosure: "结构脚本，可放入新查询",
     placeToQuery: "放入新查询",
+    diffSummary: "仅基准 {baseline}，仅对照 {target}，列差异 {changed}",
     noTables: "没有可对比的表。",
     onlyBaseline: "仅基准拥有 {kind} {name}",
     onlyTarget: "仅对照拥有 {kind} {name}",
@@ -27,6 +29,7 @@ export const compare = {
     dataScriptIncomplete: "数据脚本不完整",
     key: "键",
     dataScript: "数据脚本",
+    dataDisclosure: "数据脚本，可放入新查询",
   },
   gates: {
     schemaStillLoading: "PostgreSQL 的 schema 还在读取，选定前不生成脚本。",

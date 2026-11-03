@@ -1,5 +1,6 @@
 import { flushPromises, mount, type DOMWrapper } from "@vue/test-utils";
 import { describe, expect, it, vi } from "vitest";
+import { nextTick } from "vue";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
 import type { CatalogConnection } from "../catalog/types";
 import { createSession } from "../shell/session";
@@ -360,6 +361,65 @@ describe("compare", () => {
     expect(wrapper.get("[data-compare-refused]").text()).toContain("schema");
     expect(invoke.mock.calls.map((call) => call[0])).not.toContain("compare_structure");
     wrapper.unmount();
+    resetCatalog();
+  });
+
+  it("summarizes counts, folds scripts, and restores focus on escape", async () => {
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    opener.focus();
+    invoke.mockReset();
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "compare_structure") {
+        return {
+          refused: null,
+          script: "CREATE TABLE orders (id integer);\n",
+          incomplete: false,
+          notes: [],
+          onlyBaseline: [{ kind: "表", name: "orders", detail: "仅基准拥有" }],
+          onlyTarget: [{ kind: "表", name: "legacy", detail: "仅对照拥有" }],
+          changed: [{ kind: "列", name: "orders.note", detail: "类型不同" }],
+          tables: [{ name: "orders", onBoth: true, needsKeyChoice: false, keys: [] }],
+        };
+      }
+      if (command === "compare_data") {
+        return { refused: null, script: "INSERT INTO orders (id) VALUES (1);\n", incomplete: false, notes: [], diffs: [] };
+      }
+      return [];
+    });
+    replaceCatalog([connection("mysql", "left", "基准"), connection("mysql", "right", "对照")]);
+    const wrapper = mount(CompareDialog, { attachTo: document.body });
+    await pick(wrapper.get("[data-side=baseline][data-field=connection]"), "left");
+    await pick(wrapper.get("[data-side=target][data-field=connection]"), "right");
+    await pick(wrapper.get("[data-side=baseline][data-field=database]"), "app");
+    await pick(wrapper.get("[data-side=target][data-field=database]"), "app");
+    await wrapper.get("[data-action=compare-structure]").trigger("click");
+    await flushPromises();
+    const summary = wrapper.get("[data-compare-summary]");
+    expect(summary.text()).toContain("仅基准 1");
+    expect(summary.text()).toContain("仅对照 1");
+    expect(summary.text()).toContain("列差异 1");
+    const list = wrapper.get("[data-compare-diffs]").element;
+    expect(summary.element.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const structureDetails = wrapper.get("[data-compare-script]").element.closest("details") as HTMLDetailsElement;
+    expect(structureDetails.open).toBe(false);
+    expect(structureDetails.textContent).toContain("结构脚本，可放入新查询");
+    expect(structureDetails.contains(wrapper.get("[data-action=place-structure]").element)).toBe(true);
+    expect(wrapper.get(".cmp-foot").element.contains(wrapper.get("[data-action=compare-structure]").element)).toBe(true);
+    expect(wrapper.get(".cmp-body").element.contains(wrapper.get("[data-action=compare-structure]").element)).toBe(false);
+    expect(wrapper.get("[data-action=compare-close]").classes()).not.toContain("primary");
+    await wrapper.get("[data-action=compare-data]").trigger("click");
+    await flushPromises();
+    const dataDetails = wrapper.get("[data-data-script]").element.closest("details") as HTMLDetailsElement;
+    expect(dataDetails.open).toBe(false);
+    expect(dataDetails.textContent).toContain("数据脚本，可放入新查询");
+    expect(dataDetails.contains(wrapper.get("[data-action=place-data]").element)).toBe(true);
+    await wrapper.get(".cmp-sheet").trigger("keydown", { key: "Escape" });
+    expect(wrapper.emitted("close")).toHaveLength(1);
+    await nextTick();
+    expect(document.activeElement).toBe(opener);
+    wrapper.unmount();
+    opener.remove();
     resetCatalog();
   });
 });

@@ -1,6 +1,9 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { flushPromises, mount } from "@vue/test-utils";
 import { crc32 } from "node:zlib";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { nextTick } from "vue";
 import * as XLSX from "@e965/xlsx";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
 import ImportDialog from "./ImportDialog.vue";
@@ -451,6 +454,38 @@ describe("xlsx import", () => {
     expect(text).toContain("不是全部成功");
     expect(text).not.toContain("已写入 2 行");
     wrapper.unmount();
+  });
+
+  it("shows only the selected format hint and restores focus on escape", async () => {
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    opener.focus();
+    const wrapper = dialog();
+    const source = readFileSync(resolve("src/export/ImportDialog.vue"), "utf8");
+    expect(source).toContain(".ex-choice small { display: none; }");
+    expect(source).toContain(".ex-choice.on small { display: block;");
+    expect(source).toContain(".ex-file-input { display: none; }");
+    expect(source).toContain(".map-table td small.req { margin-inline-start: var(--sp-2); }");
+    expect(wrapper.get("[data-action=pick-import-file]").exists()).toBe(true);
+    expect(wrapper.get(".ex-choice.on small").text()).toContain("第一行是列名");
+    const hidden = wrapper.findAll(".ex-choice:not(.on)");
+    expect(hidden).toHaveLength(2);
+    for (const choice of hidden) {
+      expect(choice.classes()).not.toContain("on");
+      expect(choice.find("small").exists()).toBe(true);
+    }
+    await chooseFile(wrapper, "rows.csv", "name,email\r\n甲,a@example.com");
+    const mark = wrapper.findAll(".map-table td small.req");
+    expect(mark.length).toBeGreaterThan(0);
+    expect(mark[0]?.text()).toBe("必填");
+    await wrapper.get("input[value='json']").setValue(true);
+    expect(wrapper.get(".ex-choice.on small").text()).toContain("对象数组");
+    await wrapper.get(".ex-sheet").trigger("keydown", { key: "Escape" });
+    expect(wrapper.emitted("close")).toHaveLength(1);
+    await nextTick();
+    expect(document.activeElement).toBe(opener);
+    wrapper.unmount();
+    opener.remove();
   });
 
   it("reads an empty cell as null and keeps a literal backslash-N token", () => {

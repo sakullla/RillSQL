@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { tr as t } from "../i18n";
-import { computed, onBeforeUnmount, ref, shallowRef, watch, type ComponentPublicInstance } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch, type ComponentPublicInstance } from "vue";
 import type { ListboxOption } from "../ui/types";
 import Listbox from "../ui/Listbox.vue";
 import { catalogConnections } from "../catalog/store";
@@ -55,6 +55,27 @@ const droppedName = ref("");
 /** 应用内文件按钮（R4）：隐藏原生 input，由按钮触发，并展示已选文件名。 */
 const fileInput = ref<HTMLInputElement | null>(null);
 const chosenName = ref("");
+/** 打开时记住触发元素，关闭后若仍在文档中则还焦。 */
+const returnFocus = ref<HTMLElement | null>(null);
+
+function rememberFocus() {
+  const active = document.activeElement;
+  returnFocus.value = active instanceof HTMLElement ? active : null;
+}
+
+function closeDialog() {
+  const target = returnFocus.value;
+  emit("close");
+  void nextTick(() => {
+    if (target?.isConnected) target.focus();
+  });
+}
+
+function onDialogEscape(event: KeyboardEvent) {
+  if (event.defaultPrevented) return;
+  event.preventDefault();
+  closeDialog();
+}
 
 const choices = computed(() => {
   const list = [...(props.tables ?? [])];
@@ -111,8 +132,10 @@ function resetForOpen(): void {
 }
 
 watch(() => props.open, (open) => {
-  if (open) resetForOpen();
-  else releaseImportData();
+  if (open) {
+    rememberFocus();
+    resetForOpen();
+  } else releaseImportData();
 });
 
 function releaseImportData() {
@@ -283,18 +306,19 @@ async function confirm() {
 }
 
 // 初次挂载即按 open 状态复位（原先由 immediate watch 承担，移到声明之后以便 seed 能用同一套 computed）。
+if (props.open) rememberFocus();
 resetForOpen();
 </script>
 
 <template>
   <div v-if="open" class="ex-overlay" role="presentation">
-    <div class="ex-sheet" role="dialog" aria-modal="true" :aria-label="t('export.importDialog.dialogLabel')">
+    <div class="ex-sheet" role="dialog" aria-modal="true" :aria-label="t('export.importDialog.dialogLabel')" @keydown.escape="onDialogEscape">
       <header class="ex-head">
         <div class="ex-titles">
           <h2>{{ t("export.importDialog.title") }}</h2>
           <p>{{ t("export.importDialog.subtitle") }}</p>
         </div>
-        <button class="icon-btn" type="button" :aria-label="t('common.close')" @click="emit('close')">
+        <button class="icon-btn" type="button" :aria-label="t('common.close')" @click="closeDialog">
           <svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
         </button>
       </header>
@@ -333,7 +357,7 @@ resetForOpen();
           <thead><tr><th>{{ t("export.importDialog.columnTableField") }}</th><th>{{ t("export.importDialog.columnFileField") }}</th></tr></thead>
           <tbody>
             <tr v-for="column in activeSchema.columns" :key="column.name">
-              <td>{{ column.name }}<small v-if="!column.nullable && !column.auto"> {{ t("export.importDialog.required") }}</small></td>
+              <td>{{ column.name }}<small v-if="!column.nullable && !column.auto" class="req">{{ t("export.importDialog.required") }}</small></td>
               <td>
                 <Listbox :model-value="mapping[column.name] ?? ''" :options="columnOptions" :aria-label="t('export.importDialog.columnMapAria', { column: column.name })" :disabled="writing" @update:model-value="onColumn(column.name, $event)" />
               </td>
@@ -357,7 +381,7 @@ resetForOpen();
       <footer class="ex-foot">
         <span class="muted sm">{{ describing ? t("export.importDialog.describing") : writing ? t("export.importDialog.writing") : t("export.importDialog.confirmFirst") }}</span>
         <span class="grow"></span>
-        <button class="btn" type="button" data-action="import-cancel" :disabled="writing" @click="emit('close')">{{ t("common.cancel") }}</button>
+        <button class="btn" type="button" data-action="import-cancel" :disabled="writing" @click="closeDialog">{{ t("common.cancel") }}</button>
         <button class="btn primary" type="button" data-action="import-confirm" :disabled="!canWrite" @click="confirm">{{ t("export.importDialog.importButton") }}</button>
       </footer>
     </div>
@@ -368,12 +392,12 @@ resetForOpen();
 /* 对话框：与 base.css 的 dialog.modal 同一套 overlay 表面体系。 */
 .ex-overlay { position: fixed; inset: 0; background: var(--overlay); backdrop-filter: blur(3px); display: grid; place-items: center; z-index: var(--z-dialog); padding: var(--sp-4); }
 .ex-sheet { width: min(720px, 100%); max-height: min(88vh, 880px); display: flex; flex-direction: column; background: var(--surface-overlay); color: var(--text); border-radius: var(--r-xl); border: 1px solid var(--stroke-strong); box-shadow: var(--shadow-lg); animation: modal-in var(--dur) var(--ease-out); }
-.ex-head { display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line-2); }
+.ex-head { flex-shrink: 0; display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line-2); }
 .ex-titles { flex: 1; min-width: 0; }
 .ex-titles h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.01em; }
 .ex-titles p { margin: var(--sp-1) 0 0; font-size: var(--fs-sm); color: var(--text-2); }
 .ex-body { padding: var(--sp-4) var(--sp-5); overflow: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
-.ex-foot { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-5); border-top: 1px solid var(--line-2); background: color-mix(in srgb, var(--surface-overlay) 94%, var(--text) 6%); border-radius: 0 0 var(--r-xl) var(--r-xl); }
+.ex-foot { flex-shrink: 0; display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-5); border-top: 1px solid var(--line-2); background: color-mix(in srgb, var(--surface-overlay) 94%, var(--text) 6%); border-radius: 0 0 var(--r-xl) var(--r-xl); }
 .ex-note { margin: 0; font-size: var(--fs-sm); color: var(--text-2); line-height: var(--lh); }
 /* 错误卡：与全局 err 模式一致（软底卡 + 同色 3px 左缘 + 语义图标） */
 .ex-alert { display: flex; align-items: flex-start; gap: var(--sp-2); margin: 0; padding: var(--sp-2) var(--sp-3); background: var(--err-soft); color: var(--err); border: 1px solid var(--err-line); border-radius: var(--r); box-shadow: inset 3px 0 0 var(--err); font-size: var(--fs-sm); line-height: var(--lh); }
@@ -399,7 +423,8 @@ resetForOpen();
 .ex-choice:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
 .ex-choice input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
 .ex-choice b { font-size: var(--fs-sm); font-weight: 600; }
-.ex-choice small { display: block; color: var(--text-2); font-size: var(--fs-xs); line-height: var(--lh); margin-top: 2px; }
+.ex-choice small { display: none; }
+.ex-choice.on small { display: block; color: var(--text-2); font-size: var(--fs-xs); line-height: var(--lh); margin-top: 2px; }
 .ex-path { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-sm); color: var(--text-2); }
 /* 应用内文件选择（R4）：隐藏原生 input，用按钮触发并展示已选文件名 */
 .ex-file-input { display: none; }
@@ -414,6 +439,7 @@ resetForOpen();
 .map-table td { padding: var(--sp-1) var(--sp-2); border-bottom: 1px solid var(--line); text-align: left; }
 .map-table td:first-child { font-family: var(--mono); font-size: var(--fs-xs); }
 .map-table td small { color: var(--err); font-size: var(--fs-xs); }
+.map-table td small.req { margin-inline-start: var(--sp-2); }
 .preview-scroll { max-height: 180px; overflow: auto; padding: var(--sp-1) var(--sp-2); border: 1px solid var(--stroke); border-radius: var(--r); background: var(--surface-sunken); box-shadow: inset 0 1px 2px color-mix(in srgb, var(--press) 30%, transparent); }
 .preview-scroll .map-table td, .preview-scroll .map-table th { border-bottom-color: var(--line); }
 .grow { flex: 1; }

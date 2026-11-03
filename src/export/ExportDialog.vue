@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { tr as t } from "../i18n";
 import type { ListboxOption } from "../ui/types";
 import Listbox from "../ui/Listbox.vue";
@@ -57,11 +57,33 @@ const path = ref("");
 const acknowledged = ref(false);
 const choosing = ref(false);
 const error = ref("");
+/** 打开时记住触发元素，关闭后若仍在文档中则还焦。 */
+const returnFocus = ref<HTMLElement | null>(null);
+
+function rememberFocus() {
+  const active = document.activeElement;
+  returnFocus.value = active instanceof HTMLElement ? active : null;
+}
+
+function closeDialog() {
+  const target = returnFocus.value;
+  emit("close");
+  void nextTick(() => {
+    if (target?.isConnected) target.focus();
+  });
+}
+
+function onDialogEscape(event: KeyboardEvent) {
+  if (event.defaultPrevented) return;
+  event.preventDefault();
+  closeDialog();
+}
 
 watch(
   () => props.open,
   (open) => {
     if (!open) return;
+    rememberFocus();
     scope.value = "loaded";
     format.value = "csv";
     acknowledged.value = false;
@@ -158,13 +180,13 @@ async function start() {
 
 <template>
   <div v-if="open" class="ex-overlay" role="presentation">
-    <div class="ex-sheet" role="dialog" aria-modal="true" :aria-label="title">
+    <div class="ex-sheet" role="dialog" aria-modal="true" :aria-label="title" @keydown.escape="onDialogEscape">
       <header class="ex-head">
         <div class="ex-titles">
           <h2>{{ title }}</h2>
           <p>{{ t("export.dialog.notBackup") }}</p>
         </div>
-        <button class="icon-btn" type="button" :aria-label="t('common.close')" @click="emit('close')">
+        <button class="icon-btn" type="button" :aria-label="t('common.close')" @click="closeDialog">
           <svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
         </button>
       </header>
@@ -229,12 +251,15 @@ async function start() {
           <input v-model="path" :aria-label="t('export.common.exportPath')" spellcheck="false" />
         </label>
 
-        <div class="ex-preview-wrap">
-          <p v-if="format === 'csv'" class="ex-note">{{ t("export.dialog.csvPreviewNote", { token: nullToken === "" ? t("export.dialog.csvPreviewEmpty") : nullToken }) }}</p>
-          <p v-else-if="format === 'xlsx'" class="ex-note">{{ t("export.dialog.xlsxPreviewNote") }}</p>
-          <p v-else class="ex-note">{{ t("export.dialog.otherPreviewNote") }}</p>
-          <pre class="ex-preview">{{ preview }}</pre>
-        </div>
+        <details class="disclosure ex-preview-details">
+          <summary>{{ t("export.dialog.previewSummary") }}</summary>
+          <div class="disclosure-body ex-preview-wrap">
+            <p v-if="format === 'csv'" class="ex-note">{{ t("export.dialog.csvPreviewNote", { token: nullToken === "" ? t("export.dialog.csvPreviewEmpty") : nullToken }) }}</p>
+            <p v-else-if="format === 'xlsx'" class="ex-note">{{ t("export.dialog.xlsxPreviewNote") }}</p>
+            <p v-else class="ex-note">{{ t("export.dialog.otherPreviewNote") }}</p>
+            <pre class="ex-preview">{{ preview }}</pre>
+          </div>
+        </details>
 
         <details v-if="format === 'csv'" class="disclosure">
           <summary>{{ t("export.dialog.advanced") }} <span class="muted">{{ t("export.dialog.advancedHint") }}</span></summary>
@@ -260,7 +285,7 @@ async function start() {
       <footer class="ex-foot">
         <span class="muted sm">{{ plan.label }}{{ plan.partial ? t("export.dialog.partialSuffix") : "" }}</span>
         <span class="grow"></span>
-        <button class="btn" type="button" @click="emit('close')">{{ t("common.cancel") }}</button>
+        <button class="btn" type="button" @click="closeDialog">{{ t("common.cancel") }}</button>
         <button class="btn primary" type="button" :disabled="!canStart || choosing" @click="start">{{ choosing ? t("export.common.chooseSaveLocation") : t("export.dialog.exportButton") }}</button>
       </footer>
     </div>
@@ -271,12 +296,12 @@ async function start() {
 /* 对话框：与 base.css 的 dialog.modal 同一套 overlay 表面体系。 */
 .ex-overlay { position: fixed; inset: 0; background: var(--overlay); backdrop-filter: blur(3px); display: grid; place-items: center; z-index: var(--z-dialog); padding: var(--sp-4); }
 .ex-sheet { width: min(720px, 100%); max-height: min(88vh, 880px); display: flex; flex-direction: column; background: var(--surface-overlay); color: var(--text); border-radius: var(--r-xl); border: 1px solid var(--stroke-strong); box-shadow: var(--shadow-lg); animation: modal-in var(--dur) var(--ease-out); }
-.ex-head { display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line-2); }
+.ex-head { flex-shrink: 0; display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line-2); }
 .ex-titles { flex: 1; min-width: 0; }
 .ex-titles h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.01em; }
 .ex-titles p { margin: var(--sp-1) 0 0; font-size: var(--fs-sm); color: var(--text-2); }
 .ex-body { padding: var(--sp-4) var(--sp-5); overflow: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
-.ex-foot { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-5); border-top: 1px solid var(--line-2); background: color-mix(in srgb, var(--surface-overlay) 94%, var(--text) 6%); border-radius: 0 0 var(--r-xl) var(--r-xl); }
+.ex-foot { flex-shrink: 0; display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-5); border-top: 1px solid var(--line-2); background: color-mix(in srgb, var(--surface-overlay) 94%, var(--text) 6%); border-radius: 0 0 var(--r-xl) var(--r-xl); }
 .ex-options { margin: 0; padding: 0; border: 0; min-width: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
 .ex-advanced :deep(.listbox) { width: 100%; }
 .ex-advanced :deep(.listbox-trigger) { width: 100%; justify-content: space-between; }
@@ -297,7 +322,8 @@ async function start() {
 .ex-choice:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
 .ex-choice input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
 .ex-choice b { font-size: var(--fs-sm); font-weight: 600; }
-.ex-choice small { display: block; color: var(--text-2); font-size: var(--fs-xs); line-height: var(--lh); margin-top: 2px; }
+.ex-choice small { display: none; }
+.ex-choice.on small { display: block; color: var(--text-2); font-size: var(--fs-xs); line-height: var(--lh); margin-top: 2px; }
 .ex-choice .num { color: var(--text); }
 
 /* 重执行确认：警告软底卡 */

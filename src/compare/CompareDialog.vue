@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch, type Ref } from "vue";
+import { computed, nextTick, reactive, ref, watch, type Ref } from "vue";
 import { tr as t } from "../i18n";
 import { catalogConnections } from "../catalog/store";
 import type { CatalogConnection } from "../catalog/types";
@@ -10,6 +10,23 @@ import type { ScriptTarget } from "./place";
 import type { CompareSide, DataReport, StructureReport } from "./types";
 
 const emit = defineEmits<{ close: []; place: [sql: string, target: ScriptTarget] }>();
+
+/** 打开时记住触发元素，关闭后若仍在文档中则还焦。 */
+const returnFocus = ref<HTMLElement | null>(document.activeElement instanceof HTMLElement ? document.activeElement : null);
+
+function closeDialog() {
+  const target = returnFocus.value;
+  emit("close");
+  void nextTick(() => {
+    if (target?.isConnected) target.focus();
+  });
+}
+
+function onDialogEscape(event: KeyboardEvent) {
+  if (event.defaultPrevented) return;
+  event.preventDefault();
+  closeDialog();
+}
 
 const baselineId = ref<string | null>(null);
 const targetId = ref<string | null>(null);
@@ -237,14 +254,14 @@ function place(sql: string) {
 </script>
 
 <template>
-  <div class="cmp-overlay" role="presentation" @click.self="emit('close')">
-    <div class="cmp-sheet" role="dialog" aria-modal="true" :aria-label="t('compare.dialog.title')" data-compare>
+  <div class="cmp-overlay" role="presentation" @click.self="closeDialog">
+    <div class="cmp-sheet" role="dialog" aria-modal="true" :aria-label="t('compare.dialog.title')" data-compare @keydown.escape="onDialogEscape">
       <header class="cmp-head">
         <div class="cmp-titles">
           <h2>{{ t("compare.dialog.title") }}</h2>
           <p class="cmp-sub">{{ t("compare.dialog.subtitle") }}</p>
         </div>
-        <button class="icon-btn" type="button" :aria-label="t('common.close')" @click="emit('close')">
+        <button class="icon-btn" type="button" :aria-label="t('common.close')" @click="closeDialog">
           <svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
         </button>
       </header>
@@ -283,23 +300,22 @@ function place(sql: string) {
             <p v-if="schemaHint(targetId, targetDatabase)" class="muted" data-side="target" data-schema-hint>{{ schemaHint(targetId, targetDatabase) }}</p>
           </fieldset>
         </div>
-        <div class="compare-actions">
-          <button class="btn primary" type="button" data-action="compare-structure" :disabled="busy || schemaPending" @click="runStructure">{{ t("compare.dialog.compareStructure") }}</button>
-          <button class="btn" type="button" data-action="compare-cancel" :disabled="!busy" @click="cancelRun">{{ t("common.cancel") }}</button>
-          <span v-if="busy" class="cmp-hint">{{ t("compare.dialog.comparing") }}</span>
-        </div>
         <p v-if="errorText" class="cmp-alert" role="alert">{{ errorText }}</p>
         <p v-if="structure?.refused" class="cmp-alert" role="alert" data-compare-refused>{{ structure.refused }}</p>
         <p v-if="structure?.incomplete" class="badge warn" data-compare-incomplete>{{ t("compare.dialog.scriptIncomplete") }}</p>
+        <p v-if="structure && !structure.refused" class="compare-summary" data-compare-summary>{{ t("compare.dialog.diffSummary", { baseline: structure.onlyBaseline.length, target: structure.onlyTarget.length, changed: structure.changed.length }) }}</p>
         <ul v-if="structure && !structure.refused" class="compare-list" data-compare-diffs>
           <li v-for="item in structure.onlyBaseline" :key="`b-${item.kind}-${item.name}`">{{ t("compare.dialog.onlyBaseline", { kind: item.kind, name: item.name }) }}</li>
           <li v-for="item in structure.onlyTarget" :key="`t-${item.kind}-${item.name}`">{{ t("compare.dialog.onlyTarget", { kind: item.kind, name: item.name }) }}</li>
           <li v-for="item in structure.changed" :key="`c-${item.kind}-${item.name}`">{{ item.kind }} {{ item.name }}：{{ item.detail }}</li>
         </ul>
-        <template v-if="structure && !structure.refused">
-          <label class="compare-script">{{ t("compare.dialog.structureScript") }}<textarea readonly :value="structure.script" data-compare-script></textarea></label>
-          <button class="btn" type="button" data-action="place-structure" :disabled="!structure.script.trim()" @click="place(structure.script)">{{ t("compare.dialog.placeToQuery") }}</button>
-        </template>
+        <details v-if="structure && !structure.refused" class="disclosure">
+          <summary>{{ t("compare.dialog.structureDisclosure") }}</summary>
+          <div class="disclosure-body compare-script-block">
+            <label class="compare-script">{{ t("compare.dialog.structureScript") }}<textarea readonly :value="structure.script" data-compare-script></textarea></label>
+            <button class="btn" type="button" data-action="place-structure" :disabled="!structure.script.trim()" @click="place(structure.script)">{{ t("compare.dialog.placeToQuery") }}</button>
+          </div>
+        </details>
         <section v-if="structure && !structure.refused" class="compare-data">
           <h3>{{ t("compare.dialog.dataTitle") }}</h3>
           <p v-if="!structure.tables.length" class="muted">{{ t("compare.dialog.noTables") }}</p>
@@ -317,11 +333,23 @@ function place(sql: string) {
             <li v-for="(note, index) in dataReport.notes" :key="`n-${index}`">{{ note }}</li>
           </ul>
           <template v-if="dataReport && !dataReport.refused">
-            <label class="compare-script">{{ t("compare.dialog.dataScript") }}<textarea readonly :value="dataReport.script" data-data-script></textarea></label>
-            <button class="btn" type="button" data-action="place-data" :disabled="!dataReport.script.trim()" @click="place(dataReport.script)">{{ t("compare.dialog.placeToQuery") }}</button>
+            <details class="disclosure">
+              <summary>{{ t("compare.dialog.dataDisclosure") }}</summary>
+              <div class="disclosure-body compare-script-block">
+                <label class="compare-script">{{ t("compare.dialog.dataScript") }}<textarea readonly :value="dataReport.script" data-data-script></textarea></label>
+                <button class="btn" type="button" data-action="place-data" :disabled="!dataReport.script.trim()" @click="place(dataReport.script)">{{ t("compare.dialog.placeToQuery") }}</button>
+              </div>
+            </details>
           </template>
         </section>
       </div>
+      <footer class="cmp-foot">
+        <span v-if="busy" class="cmp-hint">{{ t("compare.dialog.comparing") }}</span>
+        <span class="grow"></span>
+        <button class="btn" type="button" data-action="compare-cancel" :disabled="!busy" @click="cancelRun">{{ t("common.cancel") }}</button>
+        <button class="btn" type="button" data-action="compare-close" @click="closeDialog">{{ t("common.close") }}</button>
+        <button class="btn primary" type="button" data-action="compare-structure" :disabled="busy || schemaPending" @click="runStructure">{{ t("compare.dialog.compareStructure") }}</button>
+      </footer>
     </div>
   </div>
 </template>
@@ -331,11 +359,13 @@ function place(sql: string) {
    （--surface-overlay + --stroke-strong + --shadow-lg + --r-xl）。 */
 .cmp-overlay { position: fixed; inset: 0; background: var(--overlay); backdrop-filter: blur(3px); display: grid; place-items: center; z-index: var(--z-dialog); padding: var(--sp-4); }
 .cmp-sheet { width: min(880px, calc(100vw - 48px)); max-height: calc(100vh - 48px); display: flex; flex-direction: column; background: var(--surface-overlay); color: var(--text); border: 1px solid var(--stroke-strong); border-radius: var(--r-xl); box-shadow: var(--shadow-lg); animation: modal-in var(--dur) var(--ease-out); }
-.cmp-head { display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line-2); }
+.cmp-head { flex-shrink: 0; display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line-2); }
 .cmp-titles { flex: 1; min-width: 0; }
 .cmp-titles h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.01em; }
 .cmp-sub { margin: var(--sp-1) 0 0; font-size: var(--fs-sm); color: var(--text-2); }
 .cmp-body { flex: 1; min-height: 0; overflow: auto; padding: var(--sp-4) var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-3); }
+.cmp-foot { flex-shrink: 0; display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-5); border-top: 1px solid var(--line-2); background: color-mix(in srgb, var(--surface-overlay) 94%, var(--text) 6%); border-radius: 0 0 var(--r-xl) var(--r-xl); }
+.grow { flex: 1; }
 
 /* 基准 / 对照两侧：panel 表面实体卡 */
 .compare-sides { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-3); }
@@ -345,9 +375,10 @@ function place(sql: string) {
 .compare-sides input, .compare-sides select { width: 100%; }
 .compare-sides .muted[data-schema-hint] { margin: 0; font-size: var(--fs-xs); line-height: var(--lh); }
 
-/* 操作行与提示 */
-.compare-actions { display: flex; align-items: center; gap: var(--sp-2); }
+/* 差异计数与提示 */
+.compare-summary { margin: 0; font-size: var(--fs-sm); color: var(--text); line-height: var(--lh); font-variant-numeric: tabular-nums; }
 .cmp-hint { font-size: var(--fs-sm); color: var(--text-3); }
+.compare-script-block { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-2); }
 .cmp-alert { margin: 0; padding: var(--sp-2) var(--sp-3); border: 1px solid var(--err-line); border-radius: var(--r); background: var(--err-soft); color: var(--err); font-size: var(--fs-sm); line-height: var(--lh); }
 
 /* 差异清单与脚本 */

@@ -712,6 +712,46 @@ describe("xlsx export", () => {
     tableDialog.unmount();
   });
 
+  it("keeps preview closed, shows only the selected hint, and restores focus on escape", async () => {
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    opener.focus();
+    const wrapper = mount(ExportDialog, {
+      attachTo: document.body,
+      props: {
+        open: true,
+        origin: "table",
+        truncated: false,
+        fileStem: "customers",
+        loadedCount: 2,
+        pending: 0,
+        columns,
+        previewRows: [{ id: "1", note: null }],
+      },
+    });
+    const source = readFileSync(resolve("src/export/ExportDialog.vue"), "utf8");
+    expect(source).toContain(".ex-choice small { display: none; }");
+    expect(source).toContain(".ex-choice.on small { display: block;");
+    const details = wrapper.get(".ex-preview-details").element as HTMLDetailsElement;
+    expect(details.open).toBe(false);
+    expect(details.contains(wrapper.get(".ex-preview").element)).toBe(true);
+    expect(wrapper.get("input[aria-label='导出路径']").element.closest("details")).toBeNull();
+    expect(wrapper.get("input[aria-label='导出路径']").element.closest(".ex-foot")).toBeNull();
+    expect(wrapper.get(".ex-choice.on small").text()).toContain("表格文本");
+    expect(wrapper.findAll(".ex-choice:not(.on) small").length).toBeGreaterThan(0);
+    const scope = wrapper.findAll(".ex-scope")[1];
+    expect(scope?.get(".ex-choice.on small").text()).toContain("全部行");
+    expect(scope?.findAll(".ex-choice:not(.on)")).toHaveLength(1);
+    expect(wrapper.get(".ex-foot").element.contains(wrapper.get(".btn.primary").element)).toBe(true);
+    expect(wrapper.get(".ex-body").element.contains(wrapper.get(".btn.primary").element)).toBe(false);
+    await wrapper.get(".ex-sheet").trigger("keydown", { key: "Escape" });
+    expect(wrapper.emitted("close")).toHaveLength(1);
+    await nextTick();
+    expect(document.activeElement).toBe(opener);
+    wrapper.unmount();
+    opener.remove();
+  });
+
   it("asks the open connection to write a full xlsx instead of refusing first", async () => {
     invoke.mockReset();
     invoke.mockImplementation(async (command: string, args: { request?: { path?: string } }) => {

@@ -15,7 +15,9 @@ export const compare = {
     compareStructure: "Compare structure",
     comparing: "Comparing…",
     structureScript: "Structure script",
+    structureDisclosure: "Structure script, place into a new query",
     placeToQuery: "Place into a new query",
+    diffSummary: "Only baseline {baseline}, only target {target}, column diffs {changed}",
     noTables: "No tables to compare.",
     onlyBaseline: "Only the baseline has {kind} {name}",
     onlyTarget: "Only the target has {kind} {name}",
@@ -27,6 +29,7 @@ export const compare = {
     dataScriptIncomplete: "Data script incomplete",
     key: "Key",
     dataScript: "Data script",
+    dataDisclosure: "Data script, place into a new query",
   },
   gates: {
     schemaStillLoading: "PostgreSQL schemas are still loading; no script is generated until one is picked.",

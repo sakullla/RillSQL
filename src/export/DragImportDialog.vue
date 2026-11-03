@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { tr as t } from "../i18n";
-import { computed, ref } from "vue";
+import { computed, nextTick, ref } from "vue";
 import Listbox from "../ui/Listbox.vue";
 import type { ListboxOption } from "../ui/types";
 import { gridDescribe } from "../grid/api";
@@ -32,6 +32,22 @@ const tableOptions = ref<ListboxOption[]>([]);
 const described = ref<TableSchema | null>(null);
 const loading = ref(false);
 const error = ref("");
+/** 打开时记住触发元素，关闭后若仍在文档中则还焦。 */
+const returnFocus = ref<HTMLElement | null>(document.activeElement instanceof HTMLElement ? document.activeElement : null);
+
+function closeDialog() {
+  const target = returnFocus.value;
+  emit("close");
+  void nextTick(() => {
+    if (target?.isConnected) target.focus();
+  });
+}
+
+function onDialogEscape(event: KeyboardEvent) {
+  if (event.defaultPrevented) return;
+  event.preventDefault();
+  closeDialog();
+}
 
 const connection = computed<DumpConnection | null>(() => connections.value.find((item) => item.id === connectionId.value) ?? null);
 
@@ -127,13 +143,13 @@ resetConnection(connections.value[0]?.id ?? "");
 
 <template>
   <div class="di-overlay" role="presentation">
-    <div class="di-sheet" role="dialog" aria-modal="true" :aria-label="t('export.dragImport.dialogLabel')">
+    <div class="di-sheet" role="dialog" aria-modal="true" :aria-label="t('export.dragImport.dialogLabel')" @keydown.escape="onDialogEscape">
       <header class="di-head">
         <div class="di-titles">
           <h2>{{ t("export.dragImport.title") }}</h2>
           <p>{{ t("export.dragImport.pickTable", { file: seed.fileName ?? t("export.dragImport.fileWord") }) }}</p>
         </div>
-        <button class="icon-btn" type="button" :aria-label="t('common.close')" @click="emit('close')">
+        <button class="icon-btn" type="button" :aria-label="t('common.close')" @click="closeDialog">
           <svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
         </button>
       </header>
@@ -160,7 +176,7 @@ resetConnection(connections.value[0]?.id ?? "");
       <footer class="di-foot">
         <span class="muted sm">{{ t("export.dragImport.cancelNoWrite") }}</span>
         <span class="grow"></span>
-        <button class="btn" type="button" @click="emit('close')">{{ t("common.cancel") }}</button>
+        <button class="btn" type="button" @click="closeDialog">{{ t("common.cancel") }}</button>
       </footer>
     </div>
   </div>
@@ -181,13 +197,13 @@ resetConnection(connections.value[0]?.id ?? "");
 /* 与导入/迁移对话框同一套 overlay 表面体系。 */
 .di-overlay { position: fixed; inset: 0; background: var(--overlay); backdrop-filter: blur(3px); display: grid; place-items: center; z-index: var(--z-dialog); padding: var(--sp-4); }
 .di-sheet { width: min(560px, 100%); max-height: min(88vh, 640px); display: flex; flex-direction: column; background: var(--surface-overlay); color: var(--text); border-radius: var(--r-xl); border: 1px solid var(--stroke-strong); box-shadow: var(--shadow-lg); animation: modal-in var(--dur) var(--ease-out); }
-.di-head { display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line-2); }
+.di-head { flex-shrink: 0; display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line-2); }
 .di-titles { flex: 1; min-width: 0; }
 .di-titles h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; letter-spacing: -0.01em; }
 .di-titles p { margin: var(--sp-1) 0 0; font-size: var(--fs-sm); color: var(--text-2); line-height: var(--lh); }
 .di-titles .mono { font-size: var(--fs-xs); }
 .di-body { padding: var(--sp-4) var(--sp-5); overflow: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
-.di-foot { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-5); border-top: 1px solid var(--line-2); background: color-mix(in srgb, var(--surface-overlay) 94%, var(--text) 6%); border-radius: 0 0 var(--r-xl) var(--r-xl); }
+.di-foot { flex-shrink: 0; display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-5); border-top: 1px solid var(--line-2); background: color-mix(in srgb, var(--surface-overlay) 94%, var(--text) 6%); border-radius: 0 0 var(--r-xl) var(--r-xl); }
 .di-picker { margin: 0; padding: var(--sp-3); border: 1px solid var(--line); border-radius: var(--r); display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
 .di-picker legend { padding: 0; margin-bottom: var(--sp-1); font-size: var(--fs-xs); font-weight: 600; color: var(--text-3); }
 .di-field { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-xs); color: var(--text-2); min-width: 0; }

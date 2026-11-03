@@ -123,6 +123,7 @@ export const exportDict = {
     csvPreviewEmpty: "empty field",
     xlsxPreviewNote: "Preview (first 4 rows). Empty cells are nulls and empty strings stay empty. Uncommitted edits never enter the file.",
     otherPreviewNote: "Preview (first 4 rows). Nulls stay null. Uncommitted edits never enter the file.",
+    previewSummary: "Preview (first 4 rows)",
     advanced: "Advanced",
     advancedHint: "delimiter, NULL style, encoding, header row",
     delimiter: "Delimiter",

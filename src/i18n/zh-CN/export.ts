@@ -123,6 +123,7 @@ export const exportDict = {
     csvPreviewEmpty: "空字段",
     xlsxPreviewNote: "预览（前 4 行）。空单元格是空值，空字符串也留空。未提交的修改不会进入文件。",
     otherPreviewNote: "预览（前 4 行）。空值保持为空值。未提交的修改不会进入文件。",
+    previewSummary: "预览（前 4 行）",
     advanced: "高级选项",
     advancedHint: "分隔符、NULL 写法、编码、列名行",
     delimiter: "分隔符",
