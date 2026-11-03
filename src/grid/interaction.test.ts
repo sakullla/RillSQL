@@ -531,6 +531,23 @@ describe("grid column width, clipboard and paging", () => {
     wrapper.unmount();
   });
 
+  it("keeps known type suffixes and leaves unknown types off the column header", () => {
+    const columns = [column("id", ""), column("customer", "text"), column("status", "类型未知"), column("total", "numeric")];
+    const rows: Row[] = [{ id: "r0", cells: { id: "1", customer: "甲", status: "open", total: "3" }, located: false, locator: null }];
+    const wrapper = mount(QueryResultGrid, {
+      props: { tabId: "col-types", statement: "SELECT id, customer, status, total FROM orders", columns, rows, truncated: false },
+    });
+    const headers = wrapper.findAll("thead th").filter((cell) => !cell.classes().includes("row-number"));
+    expect(headers.map((cell) => cell.attributes("data-type"))).toEqual(["类型未知", "text", "类型未知", "numeric"]);
+    expect(headers[0]?.text()).not.toContain("类型未知");
+    expect(headers[0]?.find(".col-type").exists()).toBe(false);
+    expect(headers[2]?.find(".col-type").exists()).toBe(false);
+    expect(headers[1]?.get(".col-type").text()).toBe("text");
+    expect(headers[3]?.get(".col-type").text()).toBe("numeric");
+    expect(headers.map((cell) => cell.get(".th-name").text())).toEqual(["id", "customer", "status", "total"]);
+    wrapper.unmount();
+  });
+
   it("opens a protocol-shaped query value as the retrieved text", async () => {
     const synthetic = `\u0001t:3000:${"b".repeat(1024)}`;
     const wrapper = mount(QueryResultGrid, {

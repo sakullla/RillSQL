@@ -141,6 +141,7 @@ describe("structure pane", () => {
     expect(wrapper.text()).toContain("来自连接「c1」的「main」");
     expect(wrapper.text()).not.toContain("TABLE DESIGNER");
     expect(wrapper.text()).toContain("直接改下面的字段");
+    expect(wrapper.get(".struct-table").findAll("thead th").map((cell) => cell.text()).slice(0, 4)).toEqual(["字段", "类型", "可空", "默认值"]);
     await buttonNamed(wrapper, "新增字段").trigger("click");
     await wrapper.get("[aria-label='字段名 3']").setValue("email");
     expect(wrapper.text()).toContain("新增字段 email，类型 TEXT");

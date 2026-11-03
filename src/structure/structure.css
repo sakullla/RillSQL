@@ -27,7 +27,10 @@
   background: var(--sunken);
 }
 .table-workspace:has(.grid-toolbar) > .pane-switch { position: absolute; top: 0; left: 0; z-index: 1; }
-.table-workspace:has(.grid-toolbar) .grid-toolbar { padding-left: 176px; }
+/* 占位跟分段控件走：左右外边距、分段内边距、两枚按钮的图标与内边距，再加上「Structure」文案。固定 176px 在英文下会压住筛选。 */
+.table-workspace:has(.grid-toolbar) .grid-toolbar {
+  padding-left: calc(var(--sp-2) * 2 + 4px + 2px + (13px + 5px + var(--sp-2) * 2) * 2 + 15ch);
+}
 .pane-switch button {
   display: inline-flex;
   align-items: center;
@@ -212,6 +215,15 @@
   border-bottom-color: var(--line-2);
   white-space: nowrap;
 }
+/* 四列都有最小宽度，窄窗里由 .struct-editor 横向滚到默认值，不改成卡片。 */
+.struct-editor .struct-table th:nth-child(1),
+.struct-editor .struct-table td:nth-child(1) { min-width: 180px; }
+.struct-editor .struct-table th:nth-child(2),
+.struct-editor .struct-table td:nth-child(2) { min-width: 120px; }
+.struct-editor .struct-table th:nth-child(3),
+.struct-editor .struct-table td:nth-child(3) { min-width: 72px; }
+.struct-editor .struct-table th:nth-child(4),
+.struct-editor .struct-table td:nth-child(4) { min-width: 140px; }
 .struct-editor .struct-table td { padding: var(--sp-1) var(--sp-2); }
 .struct-editor .struct-table input[type="text"] {
   height: calc(var(--control-h-sm) + 2px);

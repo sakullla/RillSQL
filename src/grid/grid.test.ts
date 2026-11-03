@@ -1,7 +1,8 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { flushPromises, mount } from "@vue/test-utils";
+import { flushPromises, mount as mountComponent, type MountingOptions } from "@vue/test-utils";
+import { ref } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
 import { anyPending, resetCloseGuard, tabHasPending } from "../shell/close-guard";
@@ -20,6 +21,23 @@ import type { TableTarget } from "./target";
 import { setLocale } from "../i18n";
 import { toasts } from "../ui/toast";
 import { COMMIT_RULE, FILTER_OPS, opLabel, opNeedsValue, type Column, type TableSchema } from "./types";
+
+/** 查询结果把编辑原因写进查询页提供的 ref，测试从这里读，而不是从工具栏正文读。 */
+const resultEditReason = ref("");
+
+function mount(component: Parameters<typeof mountComponent>[0], options?: MountingOptions<never>) {
+  if (component === QueryResultGrid) {
+    resultEditReason.value = "";
+    return mountComponent(component, {
+      ...options,
+      global: {
+        ...options?.global,
+        provide: { resultEditReason, ...options?.global?.provide },
+      },
+    });
+  }
+  return mountComponent(component, options);
+}
 
 const invoke = vi.hoisted(() => vi.fn());
 
@@ -455,7 +473,8 @@ describe("grid views", () => {
     expect(remove!.attributes("disabled")).toBeDefined();
     await wrapper.get("[data-cell='o:0:0:label']").trigger("dblclick");
     expect(wrapper.find("input[aria-label='编辑 label']").exists()).toBe(false);
-    expect(wrapper.text()).toContain("这张表没有主键，无法唯一确定已有行，所以不能修改或删除它们。");
+    expect(wrapper.get(".key-hint").attributes("title")).toContain("这张表没有主键，无法唯一确定已有行，所以不能修改或删除它们。");
+    expect(wrapper.text()).not.toContain("这张表没有主键，无法唯一确定已有行，所以不能修改或删除它们。");
     expect(wrapper.text()).not.toContain("按 label 定位行");
     expect(wrapper.find(".key-chip").exists()).toBe(false);
     expect(invoke.mock.calls.some((call) => call[0] === "grid_describe")).toBe(true);
@@ -850,7 +869,9 @@ describe("grid views", () => {
     });
     const wrapper = mount(DataGrid, { props: { tabId: "table:view", draft: "select 1", pageSize: 10, target: { ...customersTarget, table: "customer_view" } } });
     await flushPromises();
-    expect(wrapper.text()).toContain("视图是只读的");
+    expect(wrapper.get(".key-hint").attributes("title")).toContain("视图是只读的");
+    expect(wrapper.get(".key-hint").text()).toBe("只读");
+    expect(wrapper.text()).not.toContain("视图是只读的，不能新增、修改或删除数据。");
     expect(wrapper.get("[data-empty='table']").text()).toContain("这个视图没有行");
     expect(wrapper.get("[data-empty='table']").find("button").exists()).toBe(false);
     const add = wrapper.findAll("button").find((button) => button.text() === "新增行");
@@ -1202,7 +1223,12 @@ describe("query result edits", () => {
     });
     await flushPromises();
     expect(wrapper.attributes("data-editable")).toBe("true");
-    expect(wrapper.text()).toContain("查询结果不能新增行");
+    expect(resultEditReason.value).toContain("按 id 定位行");
+    expect(resultEditReason.value).toContain("查询结果不能新增行");
+    const toolbar = wrapper.get(".result-toolbar").text();
+    expect(toolbar).not.toContain("按 id 定位行");
+    expect(toolbar).not.toContain("查询结果不能新增行");
+    expect(wrapper.get(".find-toggle").attributes("aria-label")).toBe("查找");
     expect(wrapper.findAll("button").some((button) => button.text() === "新增行")).toBe(false);
     await wrapper.get("[data-cell='r0:name']").trigger("dblclick");
     await wrapper.get("input[aria-label='编辑 name']").setValue("新名字");
@@ -1349,7 +1375,8 @@ describe("query result edits", () => {
     const join = mount(QueryResultGrid, {
       props: { tabId: "join", statement: "SELECT * FROM orders JOIN items ON items.id = orders.id", columns: [], rows: [], truncated: false, connectionId: "shop", engine: "postgres", database: "app" },
     });
-    expect(join.text()).toContain("JOIN");
+    expect(resultEditReason.value).toContain("JOIN");
+    expect(join.get(".result-toolbar").text()).not.toContain("JOIN");
     expect(join.attributes("data-editable")).toBe("false");
     expect(invoke).not.toHaveBeenCalled();
     join.unmount();
@@ -1371,7 +1398,8 @@ describe("query result edits", () => {
       },
     });
     await flushPromises();
-    expect(view.text()).toContain("视图是只读的");
+    expect(resultEditReason.value).toContain("视图是只读的");
+    expect(view.get(".result-toolbar").text()).not.toContain("视图是只读的");
     expect(view.attributes("data-editable")).toBe("false");
     view.unmount();
 
@@ -1384,7 +1412,8 @@ describe("query result edits", () => {
       props: { tabId: "nokey", statement: "SELECT id, name FROM public.notes", columns: bare.columns, rows: bare.rows, truncated: false, connectionId: "shop", engine: "postgres", database: "app" },
     });
     await flushPromises();
-    expect(nokey.text()).toContain("没有主键");
+    expect(resultEditReason.value).toContain("没有主键");
+    expect(nokey.get(".result-toolbar").text()).not.toContain("没有主键");
     await nokey.get("[data-cell='r0:name']").trigger("dblclick");
     expect(nokey.find("input[aria-label='编辑 name']").exists()).toBe(false);
     nokey.unmount();
@@ -1496,7 +1525,8 @@ describe("query result edits", () => {
     await wrapper.setProps({ statement: "SELECT id, name FROM orders JOIN items ON items.id = orders.id" });
     await flushPromises();
     expect(wrapper.attributes("data-editable")).toBe("false");
-    expect(wrapper.text()).toContain("JOIN");
+    expect(resultEditReason.value).toContain("JOIN");
+    expect(wrapper.get(".result-toolbar").text()).not.toContain("JOIN");
     expect(wrapper.get("pre.ex-preview").text()).not.toContain("INSERT INTO");
     expect(wrapper.findAll("button").filter((button) => button.text() === "导出").at(-1)!.attributes("disabled")).toBeDefined();
     wrapper.unmount();
@@ -1522,7 +1552,8 @@ describe("query result edits", () => {
     await flushPromises();
     expect(invoke.mock.calls.some((call) => call[0] === "grid_describe")).toBe(false);
     expect(ambiguous.attributes("data-editable")).toBe("false");
-    expect(ambiguous.text()).toContain("多个模式");
+    expect(resultEditReason.value).toContain("多个模式");
+    expect(ambiguous.get(".result-toolbar").text()).not.toContain("多个模式");
     await ambiguous.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
     await ambiguous.get("input[value='insert']").setValue(true);
     expect(ambiguous.get("pre.ex-preview").text()).not.toContain("INSERT");
@@ -1553,7 +1584,8 @@ describe("query result edits", () => {
     await flushPromises();
     expect(invoke).not.toHaveBeenCalled();
     expect(folded.attributes("data-editable")).toBe("false");
-    expect(folded.text()).toContain("大小写");
+    expect(resultEditReason.value).toContain("大小写");
+    expect(folded.get(".result-toolbar").text()).not.toContain("大小写");
     folded.unmount();
 
     const only = mount(QueryResultGrid, {
@@ -1571,7 +1603,8 @@ describe("query result edits", () => {
     await flushPromises();
     expect(invoke).not.toHaveBeenCalled();
     expect(only.attributes("data-editable")).toBe("false");
-    expect(only.text()).toContain("不能确定");
+    expect(resultEditReason.value).toContain("不能确定");
+    expect(only.get(".result-toolbar").text()).not.toContain("不能确定");
     only.unmount();
   });
 
@@ -1600,7 +1633,8 @@ describe("query result edits", () => {
       await flushPromises();
       expect(invoke).not.toHaveBeenCalled();
       expect(wrapper.attributes("data-editable")).toBe("false");
-      expect(wrapper.text()).toContain("限定名");
+      expect(resultEditReason.value).toContain("限定名");
+      expect(wrapper.get(".result-toolbar").text()).not.toContain("限定名");
       await wrapper.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
       await wrapper.get("input[value='insert']").setValue(true);
       expect(wrapper.get("pre.ex-preview").text()).not.toContain("INSERT");
@@ -1629,7 +1663,8 @@ describe("query result edits", () => {
     await flushPromises();
     expect(invoke).not.toHaveBeenCalled();
     expect(attached.attributes("data-editable")).toBe("false");
-    expect(attached.text()).toContain("限定名");
+    expect(resultEditReason.value).toContain("限定名");
+    expect(attached.get(".result-toolbar").text()).not.toContain("限定名");
     attached.unmount();
 
     invoke.mockReset();
@@ -1692,7 +1727,8 @@ describe("query result edits", () => {
         if (!item.editable) {
           expect(described).toBeUndefined();
           expect(wrapper.attributes("data-editable")).toBe("false");
-          expect(wrapper.text()).toContain("限定名");
+          expect(resultEditReason.value).toContain("限定名");
+          expect(wrapper.get(".result-toolbar").text()).not.toContain("限定名");
           await wrapper.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
           await wrapper.get("input[value='insert']").setValue(true);
           expect(wrapper.get("pre.ex-preview").text()).not.toContain("INSERT");
@@ -1736,7 +1772,8 @@ describe("query result edits", () => {
     await flushPromises();
     expect(invoke).not.toHaveBeenCalled();
     expect(triple.attributes("data-editable")).toBe("false");
-    expect(triple.text()).toContain("两部分");
+    expect(resultEditReason.value).toContain("两部分");
+    expect(triple.get(".result-toolbar").text()).not.toContain("两部分");
     await triple.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
     await triple.get("input[value='insert']").setValue(true);
     expect(triple.get("pre.ex-preview").text()).not.toContain("INSERT");
@@ -1760,7 +1797,8 @@ describe("query result edits", () => {
     });
     await flushPromises();
     expect(failed.attributes("data-editable")).toBe("false");
-    expect(failed.text()).toContain("找不到表");
+    expect(resultEditReason.value).toContain("找不到表");
+    expect(failed.get(".result-toolbar").text()).not.toContain("找不到表");
     await failed.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
     await failed.get("input[value='insert']").setValue(true);
     expect(failed.get("pre.ex-preview").text()).not.toContain("INSERT");
@@ -1817,7 +1855,8 @@ describe("query result edits", () => {
       await flushPromises();
       expect(invoke).not.toHaveBeenCalled();
       expect(wrapper.attributes("data-editable")).toBe("false");
-      expect(wrapper.text()).toContain("两部分");
+      expect(resultEditReason.value).toContain("两部分");
+      expect(wrapper.get(".result-toolbar").text()).not.toContain("两部分");
       await wrapper.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
       await wrapper.get("input[value='insert']").setValue(true);
       expect(wrapper.get("pre.ex-preview").text()).not.toContain("INSERT");
@@ -1864,7 +1903,8 @@ describe("query result edits", () => {
       await flushPromises();
       expect(invoke).not.toHaveBeenCalled();
       expect(foreign.attributes("data-editable")).toBe("false");
-      expect(foreign.text()).toContain("限定名");
+      expect(resultEditReason.value).toContain("限定名");
+      expect(foreign.get(".result-toolbar").text()).not.toContain("限定名");
       await foreign.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
       await foreign.get("input[value='insert']").setValue(true);
       expect(foreign.get("pre.ex-preview").text()).not.toContain("INSERT");
@@ -1944,7 +1984,8 @@ describe("query result edits", () => {
       await flushPromises();
       expect(invoke).not.toHaveBeenCalled();
       expect(wrapper.attributes("data-editable")).toBe("false");
-      expect(wrapper.text()).toContain("不能确定");
+      expect(resultEditReason.value).toContain("不能确定");
+      expect(wrapper.get(".result-toolbar").text()).not.toContain("不能确定");
       await wrapper.findAll("button").find((button) => button.text() === "导出")!.trigger("click");
       await wrapper.get("input[value='insert']").setValue(true);
       expect(wrapper.get("pre.ex-preview").text()).not.toContain("INSERT");

@@ -28,10 +28,13 @@
   border-bottom: 1px solid var(--line);
   flex-wrap: wrap;
 }
+.grid-toolbar { container-type: inline-size; container-name: grid-toolbar; }
 .result-toolbar { min-height: 36px; padding-block: 2px; }
 .filter-form { display: flex; flex: 1 1 320px; align-items: center; gap: var(--sp-1); flex-wrap: wrap; min-width: 0; max-width: 100%; }
+.filter-group { display: flex; flex: 1 1 auto; align-items: center; gap: var(--sp-1); flex-wrap: wrap; min-width: 0; max-width: 100%; }
+.filter-search { flex: 1 1 220px; }
 .filter-form input { flex: 0 1 130px; width: 130px; min-width: 72px; }
-.filter-form input[type="search"] { flex: 0 1 190px; width: 190px; min-width: 96px; margin-left: var(--sp-2); }
+.filter-form input[type="search"] { flex: 0 1 190px; width: 190px; min-width: 96px; }
 .grid-toolbar .filter-form .listbox-trigger { height: var(--control-h-sm); box-shadow: none; }
 .grid-toolbar .icon-btn { width: 28px; height: 28px; }
 .filter-form input,
@@ -427,9 +430,22 @@
 }
 
 /* 查询页：查找与导出并入结果标题栏；全部读完时底栏无新信息，不占行 */
-.results-tools { flex: 1 1 auto; min-width: 0; }
+.results-tools { flex: 1 1 auto; min-width: 0; container-type: inline-size; container-name: results-tools; }
 .results-tools .result-toolbar { min-height: 0; padding: 0; border: 0; flex-wrap: nowrap; }
 .results-tools .result-toolbar input { flex: 0 1 200px; width: 200px; height: var(--control-h-sm); }
-/* 结果头内的可编辑性说明收紧，超长省略；完整原因留在 title。 */
-.results-tools .toolbar-hint { max-width: 240px; }
+.results-tools .result-toolbar .btn,
+.results-tools .result-toolbar .find-toggle { flex-shrink: 0; }
+.result-toolbar .find-toggle { display: none; }
+/* 窄结果标题：查找收成图标，展开后仍是原输入框；导出留在同一行。 */
+@container results-tools (max-width: 320px) {
+  .result-toolbar .find-toggle { display: inline-grid; }
+  .result-toolbar:not(.find-open) > input { display: none; }
+  .result-toolbar.find-open > input { flex: 1 1 0; width: auto; min-width: 0; max-width: none; }
+}
+/* 窄数据网格：筛选与整表搜索各占一行，留在文档流里，不盖住行号或底栏。 */
+@container grid-toolbar (max-width: 720px) {
+  .filter-form,
+  .filter-group { flex-basis: 100%; }
+  .filter-form input[type="search"] { margin-left: 0; }
+}
 .q-results .grid-foot.quiet { display: none; }

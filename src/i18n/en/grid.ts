@@ -71,6 +71,8 @@ export const grid = {
     wholeTable: "Filters and sorting apply to the whole table",
     loadingSchema: "Reading table schema",
     readonlyView: "read-only view",
+    readonlyBadge: "Read-only",
+    noKeyBadge: "No key",
     noKeyInsertOnly: "This table has no primary key; inserts only",
     locateByKey: "Rows located by {key}",
     loadedOnly: "Applies only to the {n} rows already read",
@@ -160,6 +162,7 @@ export const grid = {
     rowNumber: "Row number",
   },
   find: {
+    toggle: "Find",
     label: "Find in loaded rows",
     hint: "Find and sort within the {n} loaded rows",
     hintTitle: "Finding and sorting{note} never queries the database.",

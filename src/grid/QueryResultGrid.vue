@@ -49,6 +49,12 @@ const copyMessage = ref("");
 const toolsHost = inject<Ref<HTMLElement | null> | null>("resultTools", null);
 const toolsTarget = computed(() => toolsHost?.value ?? null);
 const reason = ref(t("grid.resultEdit.readonly"));
+const findOpen = ref(false);
+/** 查询页「只读结果」徽标读这个字符串；结果工具栏不再铺开长句。 */
+const resultEditReason = inject<Ref<string> | null>("resultEditReason", null);
+watch(reason, (value) => {
+  if (resultEditReason) resultEditReason.value = value;
+}, { immediate: true });
 const insertTarget = ref<InsertTarget | null>(null);
 const editSession = ref<ResultEditSession | null>(null);
 const editing = ref<{ id: string; column: string; draft: string; isNull: boolean } | null>(null);
@@ -981,11 +987,11 @@ watch(() => props.rows, (rows) => {
   <div ref="rootEl" class="data-grid" :aria-label="t('grid.queryArea')" :data-tab-id="tabId" data-scope="loaded" :data-editable="editSession ? 'true' : 'false'">
     <div class="grid-main">
     <Teleport :to="toolsTarget" :disabled="!toolsTarget">
-    <div class="result-toolbar">
+    <div class="result-toolbar" :class="{ 'find-open': findOpen }">
+      <button class="icon-btn sm find-toggle" type="button" :aria-expanded="findOpen" :aria-label="t('grid.find.toggle')" @click="findOpen = !findOpen"><Icon name="search" /></button>
       <input v-model="find" :aria-label="t('grid.find.label')" :placeholder="t('grid.find.label')" :title="t('grid.find.hintTitle', { note: view.note })" />
       <span class="sr">{{ t("grid.find.hint", { n: rows.length }) }}</span>
       <span class="grow"></span>
-      <span class="toolbar-hint key-hint" :title="reason">{{ reason }}</span>
       <button v-if="editSession" class="btn sm" type="button" :disabled="!selected || !editSession.canDeleteRow(selected.row)" @click="deleteSelected">{{ t("grid.toolbar.deleteRow") }}</button>
       <button class="btn sm" type="button" @click="exportOpen = true"><Icon name="download" />{{ t("grid.toolbar.export") }}</button>
     </div>

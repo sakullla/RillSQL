@@ -232,6 +232,10 @@ const noKeyHint = computed(() => {
   if (!session.store.schema.key.length) return t("grid.errors.noKeyEdit");
   return "";
 });
+const noKeyBadge = computed(() => {
+  if (!session || !noKeyHint.value) return "";
+  return session.store.schema.kind === "view" ? t("grid.scope.readonlyBadge") : t("grid.scope.noKeyBadge");
+});
 
 async function applyFilter() {
   if (!session) return;
@@ -1013,14 +1017,18 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
     <div class="grid-toolbar">
       <span v-if="environmentLabel" class="env xs" data-env :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span>
       <form class="filter-form" @submit.prevent="applyFilter">
-        <Listbox v-model="filterColumn" :options="columnOptions" filterable :aria-label="t('grid.filter.column')" />
-        <Listbox :model-value="filterOp" :options="opOptions" :aria-label="t('grid.filter.condition')" @update:model-value="filterOp = $event as FilterOp" />
-        <input v-if="opNeedsValue(filterOp)" v-model="filterValue" :aria-label="t('grid.filter.value')" :placeholder="filterOp === 'between' ? t('grid.filter.lowerBound') : undefined" />
-        <input v-if="filterOp === 'between'" v-model="filterSecond" :aria-label="t('grid.filter.secondValue')" :placeholder="t('grid.filter.upperBound')" />
-        <input v-if="filterOp === 'in'" v-model="filterValues" :aria-label="t('grid.filter.valueList')" :placeholder="t('grid.filter.valueListHint')" />
-        <button class="btn sm" type="submit">{{ t("grid.filter.apply") }}</button>
-        <input v-model="searchDraft" type="search" :aria-label="t('grid.filter.searchKeyword')" :placeholder="t('grid.filter.searchPlaceholder')" :title="`${session.scopeLabel}${t('grid.filter.hintWholeTable')}`" @keydown.enter="onSearchEnter" />
-        <button class="btn sm" type="button" @click="applySearch">{{ t("grid.filter.search") }}</button>
+        <div class="filter-group">
+          <Listbox v-model="filterColumn" :options="columnOptions" filterable :aria-label="t('grid.filter.column')" />
+          <Listbox :model-value="filterOp" :options="opOptions" :aria-label="t('grid.filter.condition')" @update:model-value="filterOp = $event as FilterOp" />
+          <input v-if="opNeedsValue(filterOp)" v-model="filterValue" :aria-label="t('grid.filter.value')" :placeholder="filterOp === 'between' ? t('grid.filter.lowerBound') : undefined" />
+          <input v-if="filterOp === 'between'" v-model="filterSecond" :aria-label="t('grid.filter.secondValue')" :placeholder="t('grid.filter.upperBound')" />
+          <input v-if="filterOp === 'in'" v-model="filterValues" :aria-label="t('grid.filter.valueList')" :placeholder="t('grid.filter.valueListHint')" />
+          <button class="btn sm" type="submit">{{ t("grid.filter.apply") }}</button>
+        </div>
+        <div class="filter-group filter-search">
+          <input v-model="searchDraft" type="search" :aria-label="t('grid.filter.searchKeyword')" :placeholder="t('grid.filter.searchPlaceholder')" :title="`${session.scopeLabel}${t('grid.filter.hintWholeTable')}`" @keydown.enter="onSearchEnter" />
+          <button class="btn sm" type="button" @click="applySearch">{{ t("grid.filter.search") }}</button>
+        </div>
       </form>
       <span v-for="(filter, index) in session.filters" :key="`${filter.column}-${index}`" class="chip">
         <b>{{ filter.column }}</b> {{ opLabel(filter.op) }}
@@ -1034,7 +1042,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
       </span>
       <p class="sr">{{ session.scopeLabel }}{{ t("grid.filter.hintWholeTable") }}</p>
       <span class="grow"></span>
-      <p v-if="noKeyHint" class="toolbar-hint key-hint">{{ noKeyHint }}</p>
+      <span v-if="noKeyHint" class="badge warn key-hint" :title="noKeyHint">{{ noKeyBadge }}</span>
       <button class="btn sm" type="button" :disabled="!session.canInsert" @click="session.addRow()"><Icon name="plus" />{{ t("grid.toolbar.addRow") }}</button>
       <button
         class="btn sm"

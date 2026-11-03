@@ -71,6 +71,8 @@ export const grid = {
     wholeTable: "筛选和排序作用于整张表",
     loadingSchema: "正在读取表结构",
     readonlyView: "只读视图",
+    readonlyBadge: "只读",
+    noKeyBadge: "无主键",
     noKeyInsertOnly: "这张表没有主键，只能新增",
     locateByKey: "按 {key} 定位行",
     loadedOnly: "仅作用于已读取的 {n} 行",
@@ -160,6 +162,7 @@ export const grid = {
     rowNumber: "行号",
   },
   find: {
+    toggle: "查找",
     label: "在已读取行中查找",
     hint: "在已读取的 {n} 行中查找和排序",
     hintTitle: "查找和排序{note}，不会查询数据库。",
