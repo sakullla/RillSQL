@@ -280,6 +280,28 @@ function applyConnectionUrl() {
     return;
   }
   const parts: string[] = [];
+  if (parsed.engine === "sqlite") {
+    if (draft.value.id && draft.value.engine !== "sqlite") {
+      /* 编辑非 SQLite 连接时不换引擎：文件路径与主机形态不同，只提示差异。 */
+      parts.push(t("connections.parse.engineMismatch", { engine: engineMeta(parsed.engine).label }));
+    } else {
+      if (draft.value.engine === parsed.engine) parts.push(t("connections.parse.filled"));
+      else {
+        switchEngine(parsed.engine);
+        parts.push(t("connections.parse.engineSwitched", { engine: engineMeta(parsed.engine).label }));
+      }
+      draft.value.filePath = parsed.filePath ?? "";
+      draft.value.host = "";
+      draft.value.port = "";
+      draft.value.database = "";
+      draft.value.username = "";
+    }
+    /* 解析成功即消费：清空输入框，避免下次粘贴拼在旧串后面。 */
+    pasteText.value = "";
+    pasteFailed.value = false;
+    pasteNote.value = parts.join("");
+    return;
+  }
   if (parsed.engine === draft.value.engine) {
     parts.push(t("connections.parse.filled"));
   } else if (draft.value.id) {
@@ -299,8 +321,22 @@ function applyConnectionUrl() {
     draft.value.savePassword = false;
     parts.push(t("connections.parse.passwordFilled"));
   }
+  /* 解析成功即消费：清空输入框，避免下次粘贴拼在旧串后面。 */
+  pasteText.value = "";
   pasteFailed.value = false;
   pasteNote.value = parts.join("");
+}
+
+/** 粘贴即解析：新建连接时剪贴板里是合法连接串就直接填充，省一次按钮点击；
+ * 解析不了的不拦截，留在框里手动点「解析并填充」看原因；编辑已保存连接时保持手动。
+ * 自动填充成功时阻止默认粘贴：串已被消费，框里不留残句。 */
+function onPasteUrl(event: ClipboardEvent) {
+  if (draft.value.id) return;
+  const text = event.clipboardData?.getData("text") ?? "";
+  if (!text.trim() || !parseConnectionUrl(text).ok) return;
+  event.preventDefault();
+  pasteText.value = text.trim();
+  applyConnectionUrl();
 }
 
 function syncAdvanced(event: Event) {
@@ -741,12 +777,12 @@ watch(
           </label>
         </div>
 
-        <details v-if="draft.engine !== 'sqlite'" class="disclosure" data-section="paste-url">
-          <summary>{{ t("connections.editor.pasteTitle") }} <span class="muted">postgres://user:pass@host:5432/db</span></summary>
+        <details class="disclosure" data-section="paste-url">
+          <summary>{{ t("connections.editor.pasteTitle") }} <span class="muted">{{ t("connections.editor.pasteSchemes") }}</span></summary>
           <div class="disclosure-body">
             <label class="field full">
               <span>{{ t("connections.editor.pasteLabel") }}</span>
-              <textarea v-model="pasteText" class="mono" data-field="url-paste" rows="2"  :placeholder="t('connections.editor.pastePlaceholder')" :aria-label="t('connections.editor.pasteLabel')"></textarea>
+              <textarea v-model="pasteText" class="mono" data-field="url-paste" rows="2" :placeholder="t('connections.editor.pastePlaceholder')" :aria-label="t('connections.editor.pasteLabel')" @paste="onPasteUrl"></textarea>
             </label>
             <div class="input-row">
               <button class="btn" type="button" data-action="cf-parse-url" @click="applyConnectionUrl">{{ t("connections.editor.parseFill") }}</button>
@@ -771,7 +807,7 @@ watch(
           <label class="field full"><span>{{ t("connections.editor.nameLabel") }}</span><input v-model="draft.name" :placeholder="t('connections.editor.namePlaceholder')" /></label>
           <label class="field"><span>{{ t("connections.editor.hostLabel") }}<em class="req">*</em></span><input v-model="draft.host" class="mono" data-field="host" :placeholder="draft.engine === 'mongodb' ? t('connections.editor.hostPlaceholderMongodb') : t('connections.editor.hostPlaceholder')" :aria-invalid="Boolean(fieldErrors.host)" /><small v-if="fieldErrors.host" class="field-err">{{ fieldErrors.host }}</small><small v-else-if="draft.engine === 'mongodb'">{{ t("connections.editor.mongoHostHint") }}</small></label>
           <label class="field"><span>{{ t("connections.editor.portLabel") }}<em v-if="draft.engine !== 'mongodb' || !isMongoUri(draft.host)" class="req">*</em></span><input v-model="draft.port" class="mono" data-field="port" :aria-invalid="Boolean(fieldErrors.port)" /><small v-if="fieldErrors.port" class="field-err">{{ fieldErrors.port }}</small><small v-else-if="draft.engine === 'mongodb' && isMongoUri(draft.host)">{{ t("connections.editor.portMongoUriHint") }}</small></label>
-          <label class="field"><span>{{ draft.engine === "redis" ? t("connections.editor.dbLabelRedis") : draft.engine === "mongodb" ? t("connections.editor.dbLabelMongo") : t("connections.editor.dbLabel") }}</span><input v-model="draft.database" class="mono" :placeholder="draft.engine === 'redis' ? t('connections.editor.dbPlaceholderRedis') : draft.engine === 'mongodb' ? t('connections.editor.dbPlaceholderMongo') : draft.engine === 'postgres' ? t('connections.editor.dbPlaceholderPostgres') : t('connections.editor.dbPlaceholderOptional')" :aria-invalid="Boolean(fieldErrors.database)" /><small v-if="fieldErrors.database" class="field-err">{{ fieldErrors.database }}</small><small v-else-if="draft.engine === 'redis'">{{ t("connections.editor.dbHintRedis") }}</small><small v-else-if="draft.engine === 'mongodb'">{{ t("connections.editor.dbHintMongo") }}</small></label>
+          <label class="field"><span>{{ draft.engine === "redis" ? t("connections.editor.dbLabelRedis") : draft.engine === "mongodb" ? t("connections.editor.dbLabelMongo") : t("connections.editor.dbLabel") }}</span><input v-model="draft.database" class="mono" data-field="database" :placeholder="draft.engine === 'redis' ? t('connections.editor.dbPlaceholderRedis') : draft.engine === 'mongodb' ? t('connections.editor.dbPlaceholderMongo') : draft.engine === 'postgres' ? t('connections.editor.dbPlaceholderPostgres') : t('connections.editor.dbPlaceholderOptional')" :aria-invalid="Boolean(fieldErrors.database)" /><small v-if="fieldErrors.database" class="field-err">{{ fieldErrors.database }}</small><small v-else-if="draft.engine === 'redis'">{{ t("connections.editor.dbHintRedis") }}</small><small v-else-if="draft.engine === 'mongodb'">{{ t("connections.editor.dbHintMongo") }}</small></label>
           <label v-if="draft.engine === 'mongodb'" class="field"><span>{{ t("connections.editor.replicaSet") }}</span><input v-model="draft.replicaSet" class="mono" data-field="replicaSet" placeholder="rs0" /><small>{{ t("connections.editor.replicaSetHint") }}</small></label>
           <label class="field"><span>{{ t("connections.editor.userLabel") }}<em v-if="draft.engine !== 'redis' && draft.engine !== 'mongodb'" class="req">*</em></span><input v-model="draft.username" class="mono" data-field="username" :aria-invalid="Boolean(fieldErrors.username)" /><small v-if="fieldErrors.username" class="field-err">{{ fieldErrors.username }}</small><small v-else-if="draft.engine === 'redis'">{{ t("connections.editor.userHintRedis") }}</small><small v-else-if="draft.engine === 'mongodb'">{{ t("connections.editor.userHintMongo") }}</small></label>
           <label class="field full"><span>{{ t("connections.editor.passwordLabel") }}</span><input v-model="secrets.password" type="password" data-field="password" autocomplete="new-password" /><small>{{ t("connections.editor.passwordHint") }}</small></label>

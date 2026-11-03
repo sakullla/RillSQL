@@ -63,6 +63,7 @@ export const connections = {
     pasteTitle: "Paste from connection URL",
     pasteLabel: "Connection URL",
     pastePlaceholder: "postgres://user:password{'@'}db.example.internal:5432/app?sslmode=require",
+    pasteSchemes: "postgres:// · mysql:// · sqlserver:// · sqlite: · mongodb:// · jdbc:",
     parseFill: "Parse and fill",
     nameLabel: "Connection name",
     namePlaceholderSqlite: "e.g. local notes",
@@ -237,9 +238,9 @@ export const connections = {
     skipped: "Not run",
   },
   url: {
-    unsupported: "Only connection URLs starting with postgres://, postgresql://, mysql://, mariadb://, sqlserver://, redis://, rediss://, mongodb:// or mongodb+srv:// are supported.",
+    unsupported: "Only connection URLs starting with postgres(ql)://, mysql://, mariadb://, sqlserver://, sqlite:, redis://, mongodb(±srv):// or a jdbc: prefix are supported.",
     parseFailed: "The connection URL could not be parsed; check the host and port.",
-    noHost: "The connection URL has no host address.",
+    noHost: "The connection URL has no host address or file path.",
   },
   parse: {
     filled: "Host, port, database and username were filled from the URL.",

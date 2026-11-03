@@ -63,6 +63,7 @@ export const connections = {
     pasteTitle: "从连接串粘贴",
     pasteLabel: "连接串",
     pastePlaceholder: "postgres://user:password{'@'}db.example.internal:5432/app?sslmode=require",
+    pasteSchemes: "postgres:// · mysql:// · sqlserver:// · sqlite: · mongodb:// · jdbc:",
     parseFill: "解析并填充",
     nameLabel: "连接名称",
     namePlaceholderSqlite: "例如 本地笔记",
@@ -237,9 +238,9 @@ export const connections = {
     skipped: "未执行",
   },
   url: {
-    unsupported: "只支持 postgres://、postgresql://、mysql://、mariadb://、sqlserver://、redis://、rediss://、mongodb:// 或 mongodb+srv:// 开头的连接串。",
+    unsupported: "只支持 postgres(ql)://、mysql://、mariadb://、sqlserver://、sqlite:、redis://、mongodb(±srv):// 或带 jdbc: 前缀的连接串。",
     parseFailed: "连接串格式无法解析，请检查主机和端口的写法。",
-    noHost: "连接串里没有主机地址。",
+    noHost: "连接串里没有主机地址或文件路径。",
   },
   parse: {
     filled: "已按连接串填好主机、端口、数据库和用户名。",

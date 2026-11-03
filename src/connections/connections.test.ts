@@ -134,15 +134,50 @@ describe("parseConnectionUrl", () => {
     const verify = parseConnectionUrl("postgres://u@h/db?sslmode=verify-full");
     expect(verify.ok && verify.tlsMode).toBe("verify");
     const verifyCa = parseConnectionUrl("postgres://u@h/db?sslmode=verify-ca");
-    expect(verifyCa.ok && verifyCa.tlsMode).toBe("verify");
-    const absent = parseConnectionUrl("mysql://u@h/db?ssl-mode=REQUIRED");
-    expect(absent.ok && absent.tlsMode).toBe(null);
+    expect(verifyCa).toMatchObject({ ok: true, tlsMode: "verify" });
     const plain = parseConnectionUrl("postgres://u@h/db");
     expect(plain.ok && plain.tlsMode).toBe(null);
   });
 
-  it("不支持的前缀与残缺串给出中文原因", () => {
-    for (const text of ["sqlite:C:/data/notes.db", "jdbc:postgresql://h/db", "postgres:h", "   "]) {
+  it("MySQL/MariaDB 认 ssl-mode 与 useSSL，MongoDB/Redis 认 tls/ssl 开关", () => {
+    const required = parseConnectionUrl("mysql://u@h/db?ssl-mode=REQUIRED");
+    expect(required.ok && required.tlsMode).toBe("require");
+    const verifyIdentity = parseConnectionUrl("mysql://u@h/db?sslMode=VERIFY_IDENTITY");
+    expect(verifyIdentity.ok && verifyIdentity.tlsMode).toBe("verify");
+    const useSslOff = parseConnectionUrl("mariadb://u@h/db?useSSL=false");
+    expect(useSslOff.ok && useSslOff.tlsMode).toBe("off");
+    const mongoTls = parseConnectionUrl("mongodb://u:p@h:27017/app?tls=true");
+    expect(mongoTls.ok && mongoTls.tlsMode).toBe("require");
+    const redisSsl = parseConnectionUrl("redis://h:6379?ssl=false");
+    expect(redisSsl.ok && redisSsl.tlsMode).toBe("off");
+  });
+
+  it("识别 jdbc: 前缀与 SQL Server 分号属性串（DBeaver / DataGrip 导出）", () => {
+    const pg = parseConnectionUrl("jdbc:postgresql://u:p@db.internal:5432/app?sslmode=verify-full");
+    expect(pg).toMatchObject({ ok: true, engine: "postgres", host: "db.internal", port: "5432", database: "app", username: "u", password: "p", tlsMode: "verify" });
+    const my = parseConnectionUrl("jdbc:mysql://root@127.0.0.1:3307/inventory");
+    expect(my).toMatchObject({ ok: true, engine: "mysql", host: "127.0.0.1", port: "3307", database: "inventory" });
+    const maria = parseConnectionUrl("jdbc:mariadb://u@h/db");
+    expect(maria).toMatchObject({ ok: true, engine: "mariadb" });
+    const mssql = parseConnectionUrl("jdbc:sqlserver://sql.internal:1433;databaseName=rillsql;user=sa;password=secret;encrypt=true;trustServerCertificate=true");
+    expect(mssql).toMatchObject({ ok: true, engine: "sqlserver", host: "sql.internal", port: "1433", database: "rillsql", username: "sa", password: "secret", tlsMode: "require" });
+    const mssqlVerify = parseConnectionUrl("sqlserver://sql.internal;databaseName=rillsql;user=sa;encrypt=true");
+    expect(mssqlVerify.ok && mssqlVerify.tlsMode).toBe("verify");
+  });
+
+  it("SQLite 连接串给出文件路径而不是主机", () => {
+    const abs = parseConnectionUrl("sqlite:///C:/data/notes.db");
+    expect(abs).toMatchObject({ ok: true, engine: "sqlite", filePath: "C:/data/notes.db", host: "" });
+    const jdbc = parseConnectionUrl("jdbc:sqlite:C:/data/notes.db");
+    expect(jdbc).toMatchObject({ ok: true, engine: "sqlite", filePath: "C:/data/notes.db" });
+    const rel = parseConnectionUrl("sqlite:data/app.db");
+    expect(rel).toMatchObject({ ok: true, engine: "sqlite", filePath: "data/app.db" });
+    const empty = parseConnectionUrl("sqlite://");
+    expect(empty.ok).toBe(false);
+  });
+
+  it("不支持的前缀给出中文原因，残缺串给出格式原因", () => {
+    for (const text of ["oracle://u@h/db", "http://example.com", "   "]) {
       expect(parseConnectionUrl(text)).toEqual({ ok: false, reason: expect.stringContaining("只支持") });
     }
     const noHost = parseConnectionUrl("postgres://");
@@ -151,6 +186,9 @@ describe("parseConnectionUrl", () => {
     const badPort = parseConnectionUrl("postgres://h:notaport/db");
     expect(badPort.ok).toBe(false);
     expect(!badPort.ok && badPort.reason).toContain("格式");
+    const noSlashes = parseConnectionUrl("postgres:h");
+    expect(noSlashes.ok).toBe(false);
+    expect(!noSlashes.ok && noSlashes.reason).toContain("格式");
   });
 });
 
@@ -337,10 +375,63 @@ describe("connections page", () => {
     expect(note.text()).toContain("密码已填入，仅本次使用；勾选保存才会写入系统凭据库");
     expect(note.classes()).not.toContain("field-err");
 
+    // 切换到 SQLite 后粘贴入口仍然可用：SQLite 连接串（sqlite:、jdbc:sqlite:）也能一键填充
     await wrapper.get('input[value="sqlite"]').trigger("change");
-    expect(wrapper.find('details[data-section="paste-url"]').exists()).toBe(false);
+    expect(wrapper.find('details[data-section="paste-url"]').exists()).toBe(true);
     wrapper.unmount();
     replacePaletteConnections([]);
+  });
+
+  it("粘贴 SQLite 连接串切换引擎并填入文件路径", async () => {
+    replacePaletteConnections([]);
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api: pageApi(() => ({ status: "ok", stages: [] })) } });
+    await flushPromises();
+    await wrapper.get("[data-action=conn-new]").trigger("click");
+
+    await wrapper.get("[data-field=url-paste]").setValue("jdbc:sqlite:C:/data/notes.db");
+    await wrapper.get("[data-action=cf-parse-url]").trigger("click");
+
+    expect((wrapper.get('input[value="sqlite"]').element as HTMLInputElement).checked).toBe(true);
+    expect((wrapper.get("[data-field=filePath]").element as HTMLInputElement).value).toBe("C:/data/notes.db");
+    expect(wrapper.get(".paste-note").text()).toContain("已把引擎切换为 SQLite");
+    wrapper.unmount();
+    replacePaletteConnections([]);
+  });
+
+  it("新建连接时粘贴合法连接串自动填充，无需点按钮", async () => {
+    replacePaletteConnections([]);
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api: pageApi(() => ({ status: "ok", stages: [] })) } });
+    await flushPromises();
+    await wrapper.get("[data-action=conn-new]").trigger("click");
+
+    await wrapper.get("[data-field=url-paste]").trigger("paste", {
+      clipboardData: { getData: () => "jdbc:sqlserver://sql.internal:1433;databaseName=rillsql;user=sa;password=secret;trustServerCertificate=true" },
+    });
+    await flushPromises();
+
+    expect((wrapper.get('input[value="sqlserver"]').element as HTMLInputElement).checked).toBe(true);
+    expect((wrapper.get("[data-field=host]").element as HTMLInputElement).value).toBe("sql.internal");
+    expect((wrapper.get("[data-field=port]").element as HTMLInputElement).value).toBe("1433");
+    expect((wrapper.get("[data-field=username]").element as HTMLInputElement).value).toBe("sa");
+    expect((wrapper.get("[data-field=password]").element as HTMLInputElement).value).toBe("secret");
+    expect((wrapper.get("[data-field=database]").element as HTMLInputElement).value).toBe("rillsql");
+    wrapper.unmount();
+    replacePaletteConnections([]);
+  });
+
+  it("编辑已保存连接时粘贴不自动填充，只留在输入框里", async () => {
+    const wrapper = mount(ConnectionsPage, { props: { sqlitePrompt: 0, api: pageApi(() => ({ status: "ok", stages: [] })) } });
+    await flushPromises();
+    await wrapper.get("[data-action=conn-menu]").trigger("click");
+    await wrapper.get("[data-action=conn-edit]").trigger("click");
+
+    await wrapper.get("[data-field=url-paste]").trigger("paste", {
+      clipboardData: { getData: () => "postgres://pg_user@pg.example.test:5432/analytics" },
+    });
+    await flushPromises();
+    /* 不自动填充：主机保持原值，需手动点「解析并填充」。 */
+    expect((wrapper.get("[data-field=host]").element as HTMLInputElement).value).not.toBe("pg.example.test");
+    wrapper.unmount();
   });
 
   it("编辑已保存连接时粘贴不同引擎的连接串只填字段不换引擎", async () => {
@@ -365,12 +456,12 @@ describe("connections page", () => {
     await flushPromises();
     await wrapper.get("[data-action=conn-new]").trigger("click");
 
-    await wrapper.get("[data-field=url-paste]").setValue("sqlite:C:/data/notes.db");
+    await wrapper.get("[data-field=url-paste]").setValue("oracle://u@h/db");
     await wrapper.get("[data-action=cf-parse-url]").trigger("click");
 
     const note = wrapper.get(".paste-note");
     expect(note.classes()).toContain("field-err");
-    expect(note.text()).toContain("只支持 postgres://、postgresql://、mysql://、mariadb://、sqlserver://、redis://、rediss://、mongodb:// 或 mongodb+srv:// 开头的连接串");
+    expect(note.text()).toContain("只支持 postgres(ql)://、mysql://、mariadb://、sqlserver://、sqlite:、redis://、mongodb(±srv):// 或带 jdbc: 前缀的连接串");
     wrapper.unmount();
   });
 
