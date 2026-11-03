@@ -4,7 +4,7 @@ import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { nextTick } from "vue";
+import { nextTick, type Ref } from "vue";
 import { catalogFixture } from "../catalog/fixtures";
 import { replaceCatalog, resetCatalog } from "../catalog/store";
 import { registerPending, resetCloseGuard } from "../shell/close-guard";
@@ -1601,6 +1601,55 @@ describe("query editing", () => {
     expect(wrapper.emitted("update:draft")?.at(-1)).toEqual(["query-save", "SELECT * FROM orders WHERE week = 42;"]);
     expect(wrapper.emitted("target")?.[0]?.[0]).toMatchObject({ connectionId: "atlas", database: "atlas_dev", status: "connected" });
     expect(invoke.mock.calls.some((call) => call[0] === "query_start")).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("keeps run visible and lists rare toolbar actions as text in the more menu", async () => {
+    replaceCatalog(catalogFixture());
+    const wrapper = mount(QueryTab, {
+      props: {
+        tabId: "query-more-tools",
+        draft: "select  1",
+        connectionId: "shop",
+        connectionName: "Shop",
+        database: "shop_staging",
+        engine: "mysql",
+        connectionStatus: "connected",
+        notice: null,
+      },
+    });
+    await nextTick();
+    expect(wrapper.get("[data-action='run']").text()).toContain("执行");
+    expect(wrapper.get("[data-action='run-menu']").exists()).toBe(true);
+    expect(wrapper.get(".q-toolbar .conn-state").text().length).toBeGreaterThan(0);
+    expect(wrapper.find("[data-menu='more-tools']").exists()).toBe(false);
+    await wrapper.get("[data-action='more-tools']").trigger("click");
+    const menu = wrapper.get("[data-menu='more-tools']");
+    expect(menu.findAll("[role='menuitem']").map((item) => item.text().trim())).toEqual([
+      "格式化",
+      "大纲",
+      "打开",
+      "历史",
+      "保存",
+      "执行计划",
+      "实际执行并分析",
+    ]);
+    expect(menu.find("[data-action='run']").exists()).toBe(false);
+    expect(wrapper.get(".run-group [data-action='run']").exists()).toBe(true);
+    await menu.get("[data-action='outline']").trigger("click");
+    expect(wrapper.find("[data-menu='more-tools']").exists()).toBe(false);
+    expect(wrapper.get("[data-action='outline']").attributes("aria-pressed")).toBe("true");
+    await wrapper.get("[data-action='more-tools']").trigger("click");
+    const view = EditorView.findFromDOM(wrapper.get(".cm-content").element as HTMLElement)!;
+    await wrapper.get("[data-menu='more-tools'] [data-action='format']").trigger("click");
+    expect(view.state.doc.toString()).not.toBe("select  1");
+    expect(wrapper.get("[data-action='run']").exists()).toBe(true);
+    const badge = wrapper.get(".results-heading > .badge");
+    expect(badge.text()).toContain("只读结果");
+    const reason = wrapper.getCurrentComponent().provides.resultEditReason as Ref<string>;
+    reason.value = "按 id 定位行，查询结果不能新增行";
+    await nextTick();
+    expect(badge.attributes("title")).toBe("按 id 定位行，查询结果不能新增行");
     wrapper.unmount();
   });
 });

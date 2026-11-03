@@ -9,6 +9,7 @@ import { Compartment, EditorState, Prec, StateEffect, StateField, type Text } fr
 import { Decoration, type DecorationSet, EditorView, keymap, placeholder } from "@codemirror/view";
 import { basicSetup } from "codemirror";
 import ChordKeys from "../shell/ChordKeys.vue";
+import type { Ref } from "vue";
 import { computed, nextTick, onBeforeUnmount, onMounted, provide, ref, shallowRef, watch } from "vue";
 import { catalogConnections } from "../catalog/store";
 import { engineMeta } from "../connections/model";
@@ -106,8 +107,10 @@ const resultIndex = ref(0);
 const detailsOpen = ref(false);
 const historyRoot = ref<HTMLElement | null>(null);
 const savedRoot = ref<HTMLElement | null>(null);
+const moreToolsRoot = ref<HTMLElement | null>(null);
 const historyOpen = ref(false);
 const savedOpen = ref(false);
+const moreToolsOpen = ref(false);
 const historyEntries = shallowRef<HistoryEntry[]>([]);
 const historyLoading = ref(false);
 const historyError = ref("");
@@ -156,6 +159,8 @@ const bumpableRuns = new Set<string>();
 const countedRuns = new Set<string>();
 const resultTools = ref<HTMLElement | null>(null);
 provide("resultTools", resultTools);
+const resultEditReason: Ref<string> = ref("");
+provide("resultEditReason", resultEditReason);
 const running = computed(() => run.value?.status === "running" || run.value?.status === "cancel-requested");
 const options = computed(() => targetOptions(catalogConnections()));
 const knownIds = computed(() => new Set(catalogConnections().map((item) => item.id)));
@@ -1588,6 +1593,26 @@ function onSavedKey(event: KeyboardEvent) {
   savedOpen.value = false;
 }
 
+function toggleMoreTools() {
+  moreToolsOpen.value = !moreToolsOpen.value;
+  if (!moreToolsOpen.value) return;
+  menuOpen.value = false;
+  runMenuOpen.value = false;
+  historyOpen.value = false;
+  savedOpen.value = false;
+}
+
+function onMoreTool(action: () => void | Promise<void>) {
+  moreToolsOpen.value = false;
+  void action();
+}
+
+function onMoreToolsKey(event: KeyboardEvent) {
+  if (event.key !== "Escape") return;
+  event.preventDefault();
+  moreToolsOpen.value = false;
+}
+
 function onPointerDown(event: PointerEvent) {
   if (menuOpen.value) {
     const root = targetRoot.value;
@@ -1605,6 +1630,10 @@ function onPointerDown(event: PointerEvent) {
     const root = savedRoot.value;
     if (!root || !(event.target instanceof Node) || !root.contains(event.target)) savedOpen.value = false;
   }
+  if (moreToolsOpen.value) {
+    const root = moreToolsRoot.value;
+    if (!root || !(event.target instanceof Node) || !root.contains(event.target)) moreToolsOpen.value = false;
+  }
 }
 
 watch(running, (value) => {
@@ -1613,6 +1642,7 @@ watch(running, (value) => {
   runMenuOpen.value = false;
   historyOpen.value = false;
   savedOpen.value = false;
+  moreToolsOpen.value = false;
   editorMenu.value = null;
 });
 
@@ -1753,13 +1783,13 @@ onBeforeUnmount(() => {
       <span v-if="connectionStatus" class="conn-state" :class="`st-${connectionStatus}`"><i></i>{{ connectionStatusText(connectionStatus) }}</span>
       <span v-if="run" class="q-note" role="status" :title="runChip">{{ runChip }}</span>
       <span class="grow"></span>
-      <button class="icon-btn" type="button" data-action="format" :aria-label="t('query.toolbar.format')" :title="`${t('query.toolbar.formatTitle')} (${formatChord('Mod+Shift+F', macPlatform)})`" @click="formatEditor"><Icon name="format" /></button>
-      <button class="icon-btn" type="button" data-action="outline" :aria-label="t('query.outline.toggle')" :title="t('query.outline.toggleTitle')" :aria-pressed="outlineOpen" @click="toggleOutline"><Icon name="list" /></button>
-      <button class="icon-btn" type="button" data-action="open-file" :aria-label="t('query.toolbar.open')" :title="t('query.toolbar.openTitle')" :disabled="running || submitting" @click="pickSqlFile"><Icon name="file" /></button>
+      <button class="icon-btn q-tool-rare" type="button" data-action="format" :aria-label="t('query.toolbar.format')" :title="`${t('query.toolbar.formatTitle')} (${formatChord('Mod+Shift+F', macPlatform)})`" @click="formatEditor"><Icon name="format" /></button>
+      <button class="icon-btn q-tool-rare" type="button" data-action="outline" :aria-label="t('query.outline.toggle')" :title="t('query.outline.toggleTitle')" :aria-pressed="outlineOpen" @click="toggleOutline"><Icon name="list" /></button>
+      <button class="icon-btn q-tool-rare" type="button" data-action="open-file" :aria-label="t('query.toolbar.open')" :title="t('query.toolbar.openTitle')" :disabled="running || submitting" @click="pickSqlFile"><Icon name="file" /></button>
       <input ref="openFileInput" class="hidden-file-input" type="file" data-action="open-file-input" :accept="SQL_FILE_ACCEPT" :aria-label="t('query.toolbar.openLabel')" @change="onSqlFile" />
       <span class="toolbar-sep" aria-hidden="true"></span>
-      <div ref="historyRoot" class="q-pop">
-        <button class="icon-btn" type="button" data-action="history" :aria-label="t('query.toolbar.history')" :title="t('query.toolbar.historyTitle')" :disabled="running || submitting" @click="toggleHistoryPanel"><Icon name="history" /></button>
+      <div ref="historyRoot" class="q-pop q-rare-pop">
+        <button class="icon-btn q-tool-rare" type="button" data-action="history" :aria-label="t('query.toolbar.history')" :title="t('query.toolbar.historyTitle')" :disabled="running || submitting" @click="toggleHistoryPanel"><Icon name="history" /></button>
         <div v-if="historyOpen" class="pop-menu history-menu" role="menu" :aria-label="t('query.history.menu')" @keydown="onHistoryKey">
           <div class="menu-head">{{ t("query.history.head") }}</div>
           <p v-if="historyError" class="pop-error" role="alert">{{ t("query.history.failed", { error: historyError }) }}<button class="btn sm" type="button" data-action="retry-history" @click="loadHistory">{{ t("query.history.retry") }}</button></p>
@@ -1777,8 +1807,8 @@ onBeforeUnmount(() => {
           </template>
         </div>
       </div>
-      <div ref="savedRoot" class="q-pop">
-        <button class="icon-btn" type="button" data-action="saved" :aria-label="t('query.toolbar.save')" :title="t('query.toolbar.saveTitle')" :disabled="running || submitting" @click="toggleSavedPanel"><Icon name="save" /></button>
+      <div ref="savedRoot" class="q-pop q-rare-pop">
+        <button class="icon-btn q-tool-rare" type="button" data-action="saved" :aria-label="t('query.toolbar.save')" :title="t('query.toolbar.saveTitle')" :disabled="running || submitting" @click="toggleSavedPanel"><Icon name="save" /></button>
         <div v-if="savedOpen" class="pop-menu saved-menu" role="menu" :aria-label="t('query.saved.menu')" @keydown="onSavedKey">
           <form class="pop-form" @submit.prevent="saveNamedQuery">
             <label>{{ t("query.saved.saveAs") }}<input v-model="savedNameValue" type="text" :aria-label="t('query.saved.nameLabel')" data-action="saved-name" :placeholder="t('query.saved.namePlaceholder')" /></label>
@@ -1807,8 +1837,20 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <span class="toolbar-sep" aria-hidden="true"></span>
-      <button class="icon-btn" type="button" data-action="plan" :aria-label="t('query.toolbar.plan')" :title="`${t('query.toolbar.planTitle')} (${formatChord('Mod+Shift+E', macPlatform)})`" :disabled="running || submitting" @click="requestPlan"><Icon name="plan" /></button>
-      <button class="icon-btn" type="button" data-action="analyze" :aria-label="t('query.toolbar.analyze')" :title="t('query.toolbar.analyzeTitle')" :disabled="running || submitting" @click="requestAnalyze"><Icon name="clock" /></button>
+      <button class="icon-btn q-tool-rare" type="button" data-action="plan" :aria-label="t('query.toolbar.plan')" :title="`${t('query.toolbar.planTitle')} (${formatChord('Mod+Shift+E', macPlatform)})`" :disabled="running || submitting" @click="requestPlan"><Icon name="plan" /></button>
+      <button class="icon-btn q-tool-rare" type="button" data-action="analyze" :aria-label="t('query.toolbar.analyze')" :title="t('query.toolbar.analyzeTitle')" :disabled="running || submitting" @click="requestAnalyze"><Icon name="clock" /></button>
+      <div ref="moreToolsRoot" class="q-pop q-more-tools">
+        <button class="btn sm" type="button" data-action="more-tools" aria-haspopup="menu" :aria-expanded="moreToolsOpen" @click="toggleMoreTools">{{ t("query.toolbar.moreTools") }}</button>
+        <div v-if="moreToolsOpen" class="pop-menu more-tools-menu" role="menu" data-menu="more-tools" :aria-label="t('query.toolbar.moreTools')" @keydown="onMoreToolsKey">
+          <button class="more-tool" type="button" role="menuitem" data-action="format" :title="`${t('query.toolbar.formatTitle')} (${formatChord('Mod+Shift+F', macPlatform)})`" @click="onMoreTool(formatEditor)"><span>{{ t("query.toolbar.format") }}</span></button>
+          <button class="more-tool" type="button" role="menuitem" data-action="outline" :title="t('query.outline.toggleTitle')" :aria-pressed="outlineOpen" @click="onMoreTool(toggleOutline)"><span>{{ t("query.outline.toggle") }}</span></button>
+          <button class="more-tool" type="button" role="menuitem" data-action="open-file" :title="t('query.toolbar.openTitle')" :disabled="running || submitting" @click="onMoreTool(pickSqlFile)"><span>{{ t("query.toolbar.open") }}</span></button>
+          <button class="more-tool" type="button" role="menuitem" data-action="history" :title="t('query.toolbar.historyTitle')" :disabled="running || submitting" @click="onMoreTool(toggleHistoryPanel)"><span>{{ t("query.toolbar.history") }}</span></button>
+          <button class="more-tool" type="button" role="menuitem" data-action="saved" :title="t('query.toolbar.saveTitle')" :disabled="running || submitting" @click="onMoreTool(toggleSavedPanel)"><span>{{ t("query.toolbar.save") }}</span></button>
+          <button class="more-tool" type="button" role="menuitem" data-action="plan" :title="`${t('query.toolbar.planTitle')} (${formatChord('Mod+Shift+E', macPlatform)})`" :disabled="running || submitting" @click="onMoreTool(requestPlan)"><span>{{ t("query.toolbar.plan") }}</span></button>
+          <button class="more-tool" type="button" role="menuitem" data-action="analyze" :title="t('query.toolbar.analyzeTitle')" :disabled="running || submitting" @click="onMoreTool(requestAnalyze)"><span>{{ t("query.toolbar.analyze") }}</span></button>
+        </div>
+      </div>
     </div>
     <div v-if="running" class="q-progress" role="presentation"></div>
     <div v-if="analyzePrompt" class="analyze-dialog" role="dialog" aria-modal="true" :aria-label="t('query.analyze.dialog')">
@@ -1895,7 +1937,7 @@ onBeforeUnmount(() => {
         <button v-if="canContinue" class="btn sm" type="button" data-action="continue-read" @click="continueRead">{{ t("query.run.continueRead") }}</button>
         <button class="icon-btn" type="button" data-action="hide-results" :aria-label="t('query.results.hide')" :title="`${t('query.results.hideTitle')} (${formatChord('Mod+J', macPlatform)})`" @click="resultsHidden = true"><Icon name="chevron-down" /></button>
         <span ref="resultTools" class="results-tools"></span>
-        <span class="badge">{{ t("query.results.readonly") }}</span>
+        <span class="badge" :title="resultEditReason">{{ t("query.results.readonly") }}</span>
       </div>
       <div v-if="!run" class="q-empty" data-query-empty>
         <span class="action-icon"><Icon :name="connectionName ? 'play' : 'database'" /></span>
@@ -2010,10 +2052,12 @@ onBeforeUnmount(() => {
 <style scoped>
 /* 查询页 chrome（R1）：四层空间层级——工具条 chrome / 编辑器 sunken 井 / 结果区 panel / 浮层 overlay。
    一律引用 tokens.css 令牌；控件描边走 --stroke/--stroke-strong，按压走 --press-*。 */
-.query-pane { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.query-pane { display: flex; flex-direction: column; flex: 1; min-height: 0; container-type: inline-size; container-name: query-pane; }
 
 /* ---------- 工具条：chrome 层实体控件带 ---------- */
-.q-toolbar { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap; padding: var(--sp-1) var(--sp-2); min-height: var(--toolbar-h); border-bottom: 1px solid var(--line); background: var(--surface-panel); }
+.q-toolbar { display: flex; gap: var(--sp-2); align-items: center; flex-wrap: nowrap; min-width: 0; padding: var(--sp-1) var(--sp-2); min-height: var(--toolbar-h); border-bottom: 1px solid var(--line); background: var(--surface-panel); }
+.q-toolbar .conn-state { flex-shrink: 0; }
+.q-more-tools { display: none; flex-shrink: 0; }
 .q-toolbar .icon-btn { width: 28px; height: 28px; }
 /* 大纲开关按下态：与未按下区分，一眼可知当前有没有大纲。 */
 .q-toolbar .icon-btn[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent-text); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent); }
@@ -2090,6 +2134,11 @@ onBeforeUnmount(() => {
 .pop-form label { display: flex; flex-direction: column; gap: var(--sp-1); font-size: var(--fs-xs); color: var(--text-2); }
 .pop-form p { margin: 0; font-size: var(--fs-xs); }
 .pop-form .btn { align-self: flex-start; }
+.more-tools-menu { min-width: 220px; }
+.more-tool { display: flex; align-items: center; width: 100%; min-height: var(--control-h-sm); padding: var(--sp-1) var(--sp-2); border-radius: var(--r); text-align: left; font-size: var(--fs-sm); color: var(--text); white-space: nowrap; }
+.more-tool:hover:not(:disabled) { background: var(--hover); }
+.more-tool:active:not(:disabled) { box-shadow: inset 0 1px 2px var(--press); }
+.more-tool:disabled { color: var(--disabled-fg); cursor: not-allowed; }
 
 /* ---------- 提示条 / 横幅 ---------- */
 .q-note, .q-hint, .q-banner { margin: 0; font-size: var(--fs-xs); color: var(--text-2); }
@@ -2231,7 +2280,7 @@ onBeforeUnmount(() => {
 .results-collapsed .grow { flex: 1; }
 .results-collapsed :deep(kbd) { opacity: 0.7; }
 .q-results { min-height: 120px; overflow: auto; border-top: 1px solid var(--line); padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); }
-.results-heading { display: flex; align-items: center; gap: var(--sp-2); min-height: 36px; padding: 0 var(--sp-3); border-bottom: 1px solid var(--line); font-size: var(--fs-xs); flex-shrink: 0; background: var(--surface-panel); color: var(--text-2); }
+.results-heading { display: flex; align-items: center; flex-wrap: nowrap; min-width: 0; gap: var(--sp-2); min-height: 36px; padding: 0 var(--sp-3); border-bottom: 1px solid var(--line); font-size: var(--fs-xs); flex-shrink: 0; background: var(--surface-panel); color: var(--text-2); }
 .rh-title { display: inline-flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); font-weight: 600; color: var(--text); flex-shrink: 0; }
 .rh-title :deep(.i) { width: 14px; height: 14px; color: var(--text-3); }
 .results-heading .grow { flex: 1; min-width: var(--sp-3); }
@@ -2316,5 +2365,13 @@ onBeforeUnmount(() => {
 
 .run-main :deep(kbd) { background: transparent; color: inherit; opacity: .7; border-color: currentColor; box-shadow: none; }
 .q-details > summary { padding: var(--sp-1) var(--sp-3); font-size: var(--fs-xs); }
-@media (max-width: 800px) { .run-main :deep(.kbd) { display: none; } .target-btn { max-width: 290px; } .q-toolbar .conn-state { display: none; } .editor-position > span:first-child { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; } }
+@container query-pane (max-width: 720px) {
+  .q-tool-rare,
+  .q-toolbar > .toolbar-sep,
+  .q-rare-pop:not(:has(.pop-menu)) { display: none; }
+  .q-more-tools { display: inline-flex; }
+  .q-target { flex: 1 1 auto; min-width: 0; }
+  .q-target .target-btn { max-width: 100%; }
+}
+@media (max-width: 800px) { .run-main :deep(.kbd) { display: none; } .target-btn { max-width: 290px; } .editor-position > span:first-child { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; } }
 </style>

@@ -231,14 +231,15 @@ function showIndexes(object: CatalogObject): boolean {
         </div>
         <div
           v-else-if="objectsOf(kind).length === 0 && groupTotal(kind, 0) === 0"
-          class="tree-note"
+          class="tree-note one-line"
           :style="depthStyle(depth + 1)"
           data-kind-empty
           :data-kind-group="kind"
           :data-schema="schema.name"
           :data-database="database"
+          :title="t('catalog.schema.noneOfKind', { kind: kindLabel(kind) })"
         >
-          <span>{{ t("catalog.schema.noneOfKind", { kind: kindLabel(kind) }) }}</span>
+          <span class="one-line">{{ t("catalog.schema.noneOfKind", { kind: kindLabel(kind) }) }}</span>
         </div>
         <template v-for="object in objectsOf(kind)" :key="objectKey(object)">
           <div
@@ -352,7 +353,7 @@ function showIndexes(object: CatalogObject): boolean {
         </template>
       </template>
     </template>
-    <button v-if="hiddenEmptyCount()" class="tree-show-empty" type="button" data-action="tree-show-empty" :aria-expanded="showEmpty" :style="depthStyle(depth)" @click.stop="showEmpty = !showEmpty">
+    <button v-if="hiddenEmptyCount()" class="tree-show-empty" type="button" data-action="tree-show-empty" :aria-expanded="showEmpty" :style="depthStyle(depth)" :title="showEmpty ? t('catalog.schema.hideEmpty') : t('catalog.schema.showEmpty', { n: hiddenEmptyCount() })" @click.stop="showEmpty = !showEmpty">
       {{ showEmpty ? t("catalog.schema.hideEmpty") : t("catalog.schema.showEmpty", { n: hiddenEmptyCount() }) }}
     </button>
     <div v-if="needsMore() && !schema.error" class="tree-note more" :style="depthStyle(depth)" data-more>

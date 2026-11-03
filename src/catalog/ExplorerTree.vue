@@ -734,16 +734,14 @@ onBeforeUnmount(() => {
           </span>
         </div>
         <template v-if="open(`c:${connection.id}`)">
-          <div v-if="!isConnected(connection.status)" class="tree-note" :class="{ warn: connection.status === 'lost' }" :style="depthStyle(1)" data-disconnected>
+          <div v-if="!isConnected(connection.status)" class="tree-note one-line" :class="{ warn: connection.status === 'lost' }" :style="depthStyle(1)" data-disconnected :title="connection.status === 'lost' ? lostNote(connection) : t('catalog.tree.disconnectedNote')">
             <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="connection.status === 'lost' ? ICONS.warn : ICONS.info" /></svg>
-            <div>
-              <span>{{ connection.status === "lost" ? lostNote(connection) : t("catalog.tree.disconnectedNote") }}</span>
-              <form v-if="passwordFor === connection.id" class="tree-connect" @submit.prevent="connectSession(connection, typedPassword)">
-                <input v-model="typedPassword" type="password" autocomplete="current-password" :aria-label="t('catalog.tree.passwordLabel')" />
-                <button class="btn sm primary" type="submit" data-action="tree-connect" :data-connection="connection.id" :disabled="connecting === connection.id">{{ t("catalog.tree.connect") }}</button>
-              </form>
-              <span v-if="connectError && connectTarget === connection.id" class="tree-inline-err" data-connect-error>{{ connectError }}</span>
-            </div>
+            <span class="one-line">{{ connection.status === "lost" ? lostNote(connection) : t("catalog.tree.disconnectedNote") }}</span>
+            <form v-if="passwordFor === connection.id" class="tree-connect" @submit.prevent="connectSession(connection, typedPassword)">
+              <input v-model="typedPassword" type="password" autocomplete="current-password" :aria-label="t('catalog.tree.passwordLabel')" />
+              <button class="btn sm primary" type="submit" data-action="tree-connect" :data-connection="connection.id" :disabled="connecting === connection.id">{{ t("catalog.tree.connect") }}</button>
+            </form>
+            <span v-if="connectError && connectTarget === connection.id" class="tree-inline-err" data-connect-error>{{ connectError }}</span>
           </div>
           <template v-else>
           <div v-if="connection.error" class="tree-note err one-line" data-connection-error :style="depthStyle(1)" :title="loadFailedTitle(connection.error)">
@@ -757,9 +755,9 @@ onBeforeUnmount(() => {
           <!-- MongoDB（document 引擎）：库 → 集合（estimatedDocumentCount 计数），双击集合开文档标签；没有 SQL/结构/关系图入口（ADR-2/ADR-4）。 -->
           <MongoTreeCollections v-else-if="connection.engine === 'mongodb'" :connection="connection" @open-collection="(target, database, collection) => emit('open-docs', target, database, collection)" />
           <template v-else-if="!engineShape(connection.engine).databases">
-            <div v-if="connection.foreignKeys === false" class="tree-note subtle one-line" :style="depthStyle(1)" data-foreign-keys-off>
+            <div v-if="connection.foreignKeys === false" class="tree-note subtle one-line" :style="depthStyle(1)" data-foreign-keys-off :title="fkLine(connection)">
               <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path :d="ICONS.warn" /></svg>
-              <span>{{ fkLine(connection) }}</span>
+              <span class="one-line">{{ fkLine(connection) }}</span>
             </div>
             <div class="tree-entries">
               <template v-for="database in connection.databases" :key="database.name">

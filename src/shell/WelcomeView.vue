@@ -74,9 +74,9 @@ function reopenSaved(item: SavedQuery) {
           <button class="btn primary" type="button" :aria-label="t('common.newQuery')" @click="emit('new-query')"><Icon name="plus" />{{ t("common.newQuery") }}<ChordKeys chord="Mod+T" /></button>
         </header>
         <div class="welcome-quick">
-          <button class="btn resume-action" type="button" @click="emit('connections')"><span class="action-icon"><Icon name="database" /></span><span><b>{{ t("common.newConnection") }}</b><small>{{ t("shell.welcome.newConnectionHint") }}</small></span></button>
-          <button class="btn resume-action" type="button" @click="emit('sqlite')"><span class="action-icon"><Icon name="file" /></span><span><b>{{ t("common.openSqlite") }}</b><small>{{ t("shell.welcome.openSqliteHint") }}</small></span></button>
-          <button class="btn resume-action" type="button" @click="emit('compare')"><span class="action-icon"><Icon name="columns" /></span><span><b>{{ t("shell.welcome.compare") }}</b><small>{{ t("shell.welcome.compareHint") }}</small></span></button>
+          <button class="btn resume-action" type="button" :title="t('shell.welcome.newConnectionHint')" @click="emit('connections')"><span class="action-icon"><Icon name="database" /></span><span><b>{{ t("common.newConnection") }}</b><small>{{ t("shell.welcome.newConnectionHint") }}</small></span></button>
+          <button class="btn resume-action" type="button" :title="t('shell.welcome.openSqliteHint')" @click="emit('sqlite')"><span class="action-icon"><Icon name="file" /></span><span><b>{{ t("common.openSqlite") }}</b><small>{{ t("shell.welcome.openSqliteHint") }}</small></span></button>
+          <button class="btn resume-action" type="button" :title="t('shell.welcome.compareHint')" @click="emit('compare')"><span class="action-icon"><Icon name="columns" /></span><span><b>{{ t("shell.welcome.compare") }}</b><small>{{ t("shell.welcome.compareHint") }}</small></span></button>
         </div>
         <div class="desk-columns">
           <section :aria-label="t('shell.welcome.recent')">
@@ -134,8 +134,8 @@ function reopenSaved(item: SavedQuery) {
           </div>
         </header>
         <div class="desk-actions">
-          <button class="btn primary desk-action" type="button" @click="emit('connections')"><span class="action-icon"><Icon name="database" /></span><span><b>{{ t("common.newConnection") }}</b><small>{{ t("shell.welcome.newConnectionHint") }}</small></span></button>
-          <button class="btn desk-action" type="button" @click="emit('sqlite')"><span class="action-icon"><Icon name="file" /></span><span><b>{{ t("common.openSqlite") }}</b><small>{{ t("shell.welcome.openSqliteHint") }}</small></span></button>
+          <button class="btn primary desk-action" type="button" :title="t('shell.welcome.newConnectionHint')" @click="emit('connections')"><span class="action-icon"><Icon name="database" /></span><span><b>{{ t("common.newConnection") }}</b><small>{{ t("shell.welcome.newConnectionHint") }}</small></span></button>
+          <button class="btn desk-action" type="button" :title="t('shell.welcome.openSqliteHint')" @click="emit('sqlite')"><span class="action-icon"><Icon name="file" /></span><span><b>{{ t("common.openSqlite") }}</b><small>{{ t("shell.welcome.openSqliteHint") }}</small></span></button>
         </div>
         <ul class="hero-facts">
           <li><Icon name="check" />{{ t("shell.welcome.factLocal") }}</li>
@@ -163,7 +163,8 @@ function reopenSaved(item: SavedQuery) {
 }
 .resume-action.btn:hover:not(:disabled) { background: var(--surface-panel); border-color: color-mix(in srgb, var(--accent) 50%, var(--line-2)); box-shadow: var(--shadow); }
 .resume-action b { display: block; font-size: var(--fs-md); font-weight: 600; margin-bottom: 2px; }
-.resume-action small { display: block; color: var(--text-2); font-size: var(--fs-xs); font-weight: 400; }
+.resume-action > span:last-child { min-width: 0; overflow: hidden; }
+.resume-action small { display: block; color: var(--text-2); font-size: var(--fs-xs); font-weight: 400; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .desk-action.primary .action-icon { background: color-mix(in srgb, var(--on-accent) 18%, transparent); color: var(--on-accent); }
 .desk-action.primary b, .desk-action.primary small { color: var(--on-accent); }
 .desk-heading .btn :deep(kbd) { background: transparent; color: inherit; border-color: currentColor; opacity: .7; box-shadow: none; }

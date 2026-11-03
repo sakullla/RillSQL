@@ -111,6 +111,8 @@ describe("explorer tree", () => {
     expect(notice.element.closest(".tree-entries")).toBeNull();
     expect(sqlite.find(".tree-entries [data-level=diagram]").exists()).toBe(true);
     expect(notice.classes()).toContain("one-line");
+    expect(notice.attributes("title")).toContain("foreign_keys = OFF");
+    expect(notice.get("span").classes()).toContain("one-line");
     expect(notice.findAll("div")).toHaveLength(0);
     expect(names(sqlite, "[data-level=object]")).toEqual(["notes", "v_note_summary"]);
     expect(sqlite.find("[data-kind-group=function]").exists()).toBe(false);
@@ -218,6 +220,32 @@ describe("explorer tree", () => {
 
     await wrapper.setProps({ filter: "zzz" });
     expect(wrapper.text()).toContain("已连接的数据库里没有名称包含“zzz”的表或视图");
+    wrapper.unmount();
+  });
+
+  it("exposes disconnected, foreign-key, and empty-category notes as one line with a title", async () => {
+    replaceCatalog(catalogFixture().filter((item) => item.id === "analytics" || item.engine === "sqlite"));
+    const wrapper = mount(ExplorerTree, { props: { filter: "" } });
+    await wrapper.get("[data-connection=analytics] .tw").trigger("click");
+    const disconnected = wrapper.get("[data-disconnected]");
+    expect(disconnected.classes()).toContain("one-line");
+    expect(disconnected.attributes("title")).toContain("连接后才会读取这里的表");
+    expect(disconnected.get("span").classes()).toContain("one-line");
+    expect(disconnected.get("span").text()).toBe(disconnected.attributes("title"));
+    const fk = wrapper.get("[data-engine=sqlite] [data-foreign-keys-off]");
+    expect(fk.classes()).toContain("one-line");
+    expect(fk.attributes("title")).toContain("foreign_keys = OFF");
+    expect(fk.get("span").classes()).toContain("one-line");
+    expect(fk.get("span").text()).toBe(fk.attributes("title"));
+    for (const toggle of wrapper.findAll("[data-action=tree-show-empty]")) {
+      if (toggle.attributes("aria-expanded") === "false") await toggle.trigger("click");
+    }
+    const empty = wrapper.get("[data-kind-empty]");
+    expect(empty.classes()).toContain("one-line");
+    expect(empty.get("span").classes()).toContain("one-line");
+    const title = empty.attributes("title") ?? "";
+    expect(title.length).toBeGreaterThan(0);
+    expect(empty.text()).toContain(title);
     wrapper.unmount();
   });
 

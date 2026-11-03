@@ -24,6 +24,7 @@ export const query = {
     planTitle: "Show the execution plan of one statement, without ANALYZE",
     analyze: "Execute & analyze",
     analyzeTitle: "Actually execute and analyze this one statement on the server",
+    moreTools: "More",
   },
   run: {
     run: "Run",

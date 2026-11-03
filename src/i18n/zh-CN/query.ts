@@ -24,6 +24,7 @@ export const query = {
     planTitle: "查看一条语句的执行计划，不使用 ANALYZE",
     analyze: "实际执行并分析",
     analyzeTitle: "在服务器上实际执行并分析这一条语句",
+    moreTools: "更多",
   },
   run: {
     run: "执行",
