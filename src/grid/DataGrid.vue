@@ -1015,6 +1015,7 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
     <template v-else>
     <div class="grid-main">
     <div class="grid-toolbar">
+      <slot name="leading" />
       <span v-if="environmentLabel" class="env xs" data-env :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span>
       <form class="filter-form" @submit.prevent="applyFilter">
         <div class="filter-group">
@@ -1025,35 +1026,36 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
           <input v-if="filterOp === 'in'" v-model="filterValues" :aria-label="t('grid.filter.valueList')" :placeholder="t('grid.filter.valueListHint')" />
           <button class="btn sm" type="submit">{{ t("grid.filter.apply") }}</button>
         </div>
+        <span v-for="(filter, index) in session.filters" :key="`${filter.column}-${index}`" class="chip">
+          <b>{{ filter.column }}</b> {{ opLabel(filter.op) }}
+          <code v-if="filter.op === 'between'">{{ filter.value }} ~ {{ filter.second }}</code>
+          <code v-else-if="filter.op === 'in'">{{ (filter.values ?? []).join(", ") }}</code>
+          <code v-else-if="opNeedsValue(filter.op)">{{ filter.value }}</code>
+          <button class="chip-x" type="button" :aria-label="t('grid.filter.removeCondition', { n: index + 1 })" @click="session.removeFilter(index)">×</button>
+        </span>
+        <span v-if="session.sort" class="chip">{{ session.sort.column }} {{ session.sort.direction === "asc" ? t("grid.filter.asc") : t("grid.filter.desc") }}
+          <button class="chip-x" type="button" :aria-label="t('grid.filter.clearSort')" @click="session.clearSort()">×</button>
+        </span>
+        <p class="sr">{{ session.scopeLabel }}{{ t("grid.filter.hintWholeTable") }}</p>
         <div class="filter-group filter-search">
           <input v-model="searchDraft" type="search" :aria-label="t('grid.filter.searchKeyword')" :placeholder="t('grid.filter.searchPlaceholder')" :title="`${session.scopeLabel}${t('grid.filter.hintWholeTable')}`" @keydown.enter="onSearchEnter" />
           <button class="btn sm" type="button" @click="applySearch">{{ t("grid.filter.search") }}</button>
         </div>
       </form>
-      <span v-for="(filter, index) in session.filters" :key="`${filter.column}-${index}`" class="chip">
-        <b>{{ filter.column }}</b> {{ opLabel(filter.op) }}
-        <code v-if="filter.op === 'between'">{{ filter.value }} ~ {{ filter.second }}</code>
-        <code v-else-if="filter.op === 'in'">{{ (filter.values ?? []).join(", ") }}</code>
-        <code v-else-if="opNeedsValue(filter.op)">{{ filter.value }}</code>
-        <button class="chip-x" type="button" :aria-label="t('grid.filter.removeCondition', { n: index + 1 })" @click="session.removeFilter(index)">×</button>
-      </span>
-      <span v-if="session.sort" class="chip">{{ session.sort.column }} {{ session.sort.direction === "asc" ? t("grid.filter.asc") : t("grid.filter.desc") }}
-        <button class="chip-x" type="button" :aria-label="t('grid.filter.clearSort')" @click="session.clearSort()">×</button>
-      </span>
-      <p class="sr">{{ session.scopeLabel }}{{ t("grid.filter.hintWholeTable") }}</p>
-      <span class="grow"></span>
-      <span v-if="noKeyHint" class="badge warn key-hint" :title="noKeyHint">{{ noKeyBadge }}</span>
-      <button class="btn sm" type="button" :disabled="!session.canInsert" @click="session.addRow()"><Icon name="plus" />{{ t("grid.toolbar.addRow") }}</button>
-      <button
-        class="btn sm"
-        type="button"
-        :disabled="!session.canDeleteSelection()"
-        :title="session.store.schema.key.length ? t('grid.toolbar.deleteRowTitle') : t('grid.toolbar.noKeyDeleteTitle')"
-        @click="session.deleteSelected()"
-      ><Icon name="trash" />{{ t("grid.toolbar.deleteRow") }}</button>
-      <span class="toolbar-sep" aria-hidden="true"></span>
-      <button class="icon-btn" type="button" :aria-label="t('grid.toolbar.import')" :title="t('grid.toolbar.import')" :disabled="session.store.schema.kind !== 'table'" @click="importOpen = true"><Icon name="upload" /></button>
-      <button class="icon-btn" type="button" :aria-label="t('grid.toolbar.export')" :title="t('grid.toolbar.export')" @click="exportOpen = true"><Icon name="download" /></button>
+      <div class="gt-actions">
+        <span v-if="noKeyHint" class="badge warn key-hint" :title="noKeyHint">{{ noKeyBadge }}</span>
+        <button class="btn sm" type="button" :disabled="!session.canInsert" @click="session.addRow()"><Icon name="plus" />{{ t("grid.toolbar.addRow") }}</button>
+        <button
+          class="btn sm"
+          type="button"
+          :disabled="!session.canDeleteSelection()"
+          :title="session.store.schema.key.length ? t('grid.toolbar.deleteRowTitle') : t('grid.toolbar.noKeyDeleteTitle')"
+          @click="session.deleteSelected()"
+        ><Icon name="trash" />{{ t("grid.toolbar.deleteRow") }}</button>
+        <span class="toolbar-sep" aria-hidden="true"></span>
+        <button class="icon-btn" type="button" :aria-label="t('grid.toolbar.import')" :title="t('grid.toolbar.import')" :disabled="session.store.schema.kind !== 'table'" @click="importOpen = true"><Icon name="upload" /></button>
+        <button class="icon-btn" type="button" :aria-label="t('grid.toolbar.export')" :title="t('grid.toolbar.export')" @click="exportOpen = true"><Icon name="download" /></button>
+      </div>
     </div>
     <details v-if="(session.filters.length || session.sort || session.search) && session.sql" class="disclosure grid-sql">
       <summary>{{ t("grid.toolbar.viewSql") }}</summary>

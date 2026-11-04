@@ -16,7 +16,8 @@
 }
 .table-workspace { overflow: hidden; }
 .table-workspace { position: relative; }
-/* 数据/结构分段控件：表数据页与筛选工具条同排，省掉一整行 */
+/* 数据/结构分段控件：数据页由 WorkspaceView 通过网格工具条的 leading 插槽放进来，
+   与筛选工具条同一行，省掉一整行；结构页仍单独占一行。 */
 .pane-switch {
   display: inline-flex;
   align-self: flex-start;
@@ -26,11 +27,8 @@
   border-radius: var(--r);
   background: var(--sunken);
 }
-.table-workspace:has(.grid-toolbar) > .pane-switch { position: absolute; top: 0; left: 0; z-index: 1; }
-/* 占位跟分段控件走：左右外边距、分段内边距、两枚按钮的图标与内边距，再加上「Structure」文案。固定 176px 在英文下会压住筛选。 */
-.table-workspace:has(.grid-toolbar) .grid-toolbar {
-  padding-left: calc(var(--sp-2) * 2 + 4px + 2px + (13px + 5px + var(--sp-2) * 2) * 2 + 15ch);
-}
+/* 放进网格工具条时贴着左端，不再需要叠层占位。 */
+.grid-toolbar > .pane-switch { align-self: center; margin: 0 var(--sp-1) 0 0; }
 .pane-switch button {
   display: inline-flex;
   align-items: center;
@@ -46,10 +44,6 @@
 .pane-switch button .i { width: 13px; height: 13px; }
 .pane-switch button:hover { color: var(--text); }
 .pane-switch button[aria-selected="true"] { background: var(--surface-panel); color: var(--text); font-weight: 600; box-shadow: var(--shadow-sm); }
-@media (max-width: 720px) {
-  .table-workspace:has(.grid-toolbar) > .pane-switch { position: static; }
-  .table-workspace:has(.grid-toolbar) .grid-toolbar { padding-left: var(--sp-2); }
-}
 .struct-nav {
   display: flex;
   align-items: center;

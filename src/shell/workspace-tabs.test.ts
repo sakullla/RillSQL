@@ -126,6 +126,44 @@ describe("workspace tab identity", () => {
     wrapper.unmount();
   });
 
+  it("keeps tabs inside a scrollable strip with the new-query button pinned outside it", async () => {
+    const wrapper = mount(AppShell);
+    await openCommand(wrapper, "新建查询");
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    await wrapper.get(".tab-new").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
+
+    const strip = wrapper.get(".tabstrip");
+    expect(strip.findAll("[role=tab]")).toHaveLength(2);
+    // 新建按钮不参与标签滚动：标签再多也不会被滚出可视区。
+    expect(strip.find(".tab-new").exists()).toBe(false);
+    expect(wrapper.find(".tabbar > .tab-new").exists()).toBe(true);
+    const activeTab = strip.find("[role=tab][aria-selected=true]");
+    expect(activeTab.exists()).toBe(true);
+    expect(activeTab.attributes("data-tab-id")).toBe("query-2");
+    wrapper.unmount();
+  });
+
+  it("closes a tab with a middle click", async () => {
+    const wrapper = mount(AppShell);
+    await openCommand(wrapper, "新建查询");
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    await wrapper.get(".tab-new").trigger("click");
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    expect(wrapper.findAll(".tab")).toHaveLength(2);
+
+    await wrapper.findAll(".tab")[1]!.trigger("auxclick", { button: 1 });
+    await nextTick();
+    await vi.dynamicImportSettled();
+    await flushPromises();
+    expect(wrapper.findAll(".tab")).toHaveLength(1);
+    wrapper.unmount();
+  });
+
   it("marks production tabs with an always-visible stripe and a tab dot", async () => {
     replaceCatalog([{ ...postgresCatalog(), env: "prod", envLabel: "生产", envTone: "prod" }]);
     const session = createSession("", null);

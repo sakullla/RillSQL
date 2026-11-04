@@ -30,9 +30,13 @@
 }
 .grid-toolbar { container-type: inline-size; container-name: grid-toolbar; }
 .result-toolbar { min-height: 36px; padding-block: 2px; }
-.filter-form { display: flex; flex: 1 1 320px; align-items: center; gap: var(--sp-1); flex-wrap: wrap; min-width: 0; max-width: 100%; }
-.filter-group { display: flex; flex: 1 1 auto; align-items: center; gap: var(--sp-1); flex-wrap: wrap; min-width: 0; max-width: 100%; }
-.filter-search { flex: 1 1 220px; }
+/* 筛选组与搜索组是工具条里各自独立、可整组换行的单元（display:contents 让表单不生成盒子，
+   两组直接参与工具条的换行），避免窄窗里「输入框被拉满一整行、按钮掉到下一行」的碎行。 */
+.filter-form { display: contents; }
+.filter-group { display: flex; flex: 0 0 auto; align-items: center; gap: var(--sp-1); flex-wrap: wrap; min-width: 0; max-width: 100%; }
+.filter-search { flex: 1 1 240px; min-width: 240px; max-width: 300px; }
+/* 数据网格右侧操作整组：换行时仍贴右，不和筛选控件抢同一行宽度。 */
+.gt-actions { display: flex; flex: 0 0 auto; align-items: center; gap: var(--sp-1); margin-left: auto; min-width: 0; }
 .filter-form input { flex: 0 1 130px; width: 130px; min-width: 72px; }
 .filter-form input[type="search"] { flex: 0 1 190px; width: 190px; min-width: 96px; }
 .grid-toolbar .filter-form .listbox-trigger { height: var(--control-h-sm); box-shadow: none; }
@@ -442,10 +446,9 @@
   .result-toolbar:not(.find-open) > input { display: none; }
   .result-toolbar.find-open > input { flex: 1 1 0; width: auto; min-width: 0; max-width: none; }
 }
-/* 窄数据网格：筛选与整表搜索各占一行，留在文档流里，不盖住行号或底栏。 */
-@container grid-toolbar (max-width: 720px) {
-  .filter-form,
-  .filter-group { flex-basis: 100%; }
-  .filter-form input[type="search"] { margin-left: 0; }
+/* 很窄的数据网格：整表搜索独占一行并拉满，避免输入框被挤到只剩图标宽。 */
+@container grid-toolbar (max-width: 460px) {
+  .filter-search { flex: 1 1 100%; max-width: none; }
+  .filter-search input { flex: 1 1 auto; }
 }
 .q-results .grid-foot.quiet { display: none; }

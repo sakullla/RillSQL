@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import DefinitionView from "../catalog/DefinitionView.vue";
 import DiagramView from "../diagram/DiagramView.vue";
 import { catalogConnections, catalogLoaded } from "../catalog/store";
@@ -11,6 +11,7 @@ import { tr as t } from "../i18n";
 import { targetDetail, targetKey, targetOptions, type TargetOption } from "../query/complete";
 import "../structure/structure.css";
 import Icon from "./Icon.vue";
+import PaneSwitch from "./PaneSwitch.vue";
 import { tabTitle, type QueryTarget, type ShellTab } from "./session";
 import { loadSettings } from "./settings";
 import WelcomeView from "./WelcomeView.vue";
@@ -154,6 +155,20 @@ function onTabKey(event: KeyboardEvent, id: string) {
   (event.currentTarget as HTMLElement).parentElement?.querySelectorAll<HTMLElement>('[role="tab"]')[next]?.focus();
 }
 
+/** 标签被截断时用悬停提示补全：标题 + 完整目标路径。 */
+function tabTooltip(tab: ShellTab): string {
+  const title = tabTitle(tab);
+  const target = tab.targetText || tab.path;
+  return target ? `${title} · ${target}` : title;
+}
+
+/** 中键点击标签即关闭（浏览器与多数编辑器的一致习惯）；有未执行的草稿时仍走原来的挽留。 */
+function onTabAuxClick(event: MouseEvent, id: string) {
+  if (event.button !== 1) return;
+  event.preventDefault();
+  emit("close", id);
+}
+
 function onTabBarContext(event: MouseEvent) {
   event.preventDefault();
   const node = event.target;
@@ -219,14 +234,60 @@ function onWindowKey(event: KeyboardEvent) {
   if (event.key === "Escape") menu.value = null;
 }
 
+/**
+ * 标签条溢出时保住可发现性：新建按钮固定在滚动区外，当前标签自动滚进可视区，
+ * 首尾两侧只在真的被截断时渐隐，避免「半个标签」看起来像坏掉。
+ */
+const tabStrip = ref<HTMLDivElement | null>(null);
+const tabEdges = ref({ left: false, right: false });
+let tabStripObserver: ResizeObserver | null = null;
+
+function syncTabEdges() {
+  const strip = tabStrip.value;
+  if (!strip) return;
+  const max = strip.scrollWidth - strip.clientWidth;
+  tabEdges.value = { left: strip.scrollLeft > 1, right: max > 1 && strip.scrollLeft < max - 1 };
+}
+
+function revealActiveTab() {
+  const strip = tabStrip.value;
+  if (!strip) return;
+  const target = [...strip.querySelectorAll<HTMLElement>("[data-tab-id]")].find((node) => node.dataset.tabId === props.activeId);
+  if (target) {
+    const view = strip.getBoundingClientRect();
+    const box = target.getBoundingClientRect();
+    if (box.left < view.left) strip.scrollLeft -= view.left - box.left;
+    else if (box.right > view.right) strip.scrollLeft += box.right - view.right;
+  }
+  syncTabEdges();
+}
+
+watch(
+  () => [props.activeId, props.tabs.length],
+  async () => {
+    await nextTick();
+    revealActiveTab();
+  },
+  { immediate: true },
+);
+
 onMounted(() => {
   window.addEventListener("mousedown", onWindowPointer);
   window.addEventListener("keydown", onWindowKey);
+  window.addEventListener("resize", syncTabEdges);
+  if (typeof ResizeObserver !== "undefined" && tabStrip.value) {
+    tabStripObserver = new ResizeObserver(syncTabEdges);
+    tabStripObserver.observe(tabStrip.value);
+  }
+  revealActiveTab();
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener("mousedown", onWindowPointer);
   window.removeEventListener("keydown", onWindowKey);
+  window.removeEventListener("resize", syncTabEdges);
+  tabStripObserver?.disconnect();
+  tabStripObserver = null;
 });
 </script>
 
@@ -234,18 +295,29 @@ onBeforeUnmount(() => {
   <div class="workspace-view">
   <div v-if="tabs.length" class="tabbar" role="tablist" :aria-label="t('shell.tabs.tablist')" @contextmenu="onTabBarContext" @dblclick.self="emit('new-query')">
     <div
+      ref="tabStrip"
+      class="tabstrip"
+      role="presentation"
+      :data-left="tabEdges.left ? 'true' : undefined"
+      :data-right="tabEdges.right ? 'true' : undefined"
+      @scroll.passive="syncTabEdges"
+      @dblclick.self="emit('new-query')"
+    >
+    <div
       v-for="tab in tabs"
       :key="tab.id"
       class="tab"
       :class="{ active: tab.id === activeId }"
       role="tab"
       :data-tab-id="tab.id"
+      :title="tabTooltip(tab)"
       :aria-selected="tab.id === activeId"
       :tabindex="tab.id === activeId ? 0 : -1"
       @click="emit('activate', tab.id)"
       @keydown.enter.prevent="emit('activate', tab.id)"
       @keydown.space.prevent="emit('activate', tab.id)"
       @keydown="onTabKey($event, tab.id)"
+      @auxclick="onTabAuxClick($event, tab.id)"
     >
       <Icon :name="tab.kind === 'query' ? 'code' : tab.kind === 'diagram' ? 'link' : tab.kind === 'keys' ? 'key' : tab.kind === 'docs' ? 'columns' : tab.kind === 'database' ? 'database' : 'table'" />
       <span v-if="tabEnvTone(tab)" class="tab-env" :class="`env-${tabEnvTone(tab)}`" aria-hidden="true"></span>
@@ -258,6 +330,7 @@ onBeforeUnmount(() => {
       <button class="tab-x" type="button" :aria-label="t('shell.tabs.closeAria', { title: tabTitle(tab) })" :title="t('common.close')" @click.stop="emit('close', tab.id)">
         <Icon name="x" />
       </button>
+    </div>
     </div>
     <button class="icon-btn sm tab-new" type="button" :aria-label="t('common.newQuery')" :title="t('common.newQuery')" @click="emit('new-query')">
       <Icon name="plus" />
@@ -289,10 +362,12 @@ onBeforeUnmount(() => {
       </div>
     </div>
     <div v-else-if="active && active.kind === 'table'" class="table-workspace">
-      <div class="pane-switch" role="tablist" :aria-label="t('shell.tabs.paneLabel')">
-        <button type="button" role="tab" :aria-selected="paneOf(active) === 'data'" @click="showPane(active.id, 'data')"><Icon name="grid" />{{ t("common.data") }}</button>
-        <button type="button" role="tab" :aria-selected="paneOf(active) === 'structure'" @click="showPane(active.id, 'structure')"><Icon name="columns" />{{ t("common.structure") }}</button>
-      </div>
+      <!-- 数据页把分段控件交给网格工具条（同一行）；结构页和未绑定目标的空态仍单独占一行。 -->
+      <PaneSwitch
+        v-if="paneOf(active) === 'structure' || !tableTarget(active.id)"
+        :pane="paneOf(active)"
+        @select="showPane(active.id, $event)"
+      />
       <DataGrid
         v-if="paneOf(active) === 'data'"
         :key="active.id"
@@ -301,7 +376,11 @@ onBeforeUnmount(() => {
         :page-size="pageSize"
         :target="tableTarget(active.id)"
         @jump-reference="onJumpReference"
-      />
+      >
+        <template v-if="tableTarget(active.id)" #leading>
+          <PaneSwitch :pane="'data'" @select="showPane(active.id, $event)" />
+        </template>
+      </DataGrid>
       <StructurePane
         v-else
         :key="`${active.id}:structure`"

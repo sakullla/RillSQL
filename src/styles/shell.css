@@ -192,11 +192,25 @@
   border-bottom: 1px solid var(--line);
   padding: 0 var(--sp-1);
   gap: 0;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+/* 标签可横向滚动，新建按钮留在滚动区外：标签放得下时紧跟最后一个标签，
+   放不下时留在右端不被滚走。首尾渐隐只在真的还有被截断的标签时出现。 */
+.tabstrip {
+  display: flex;
+  align-items: stretch;
+  flex: 0 1 auto;
+  max-width: 100%;
+  min-width: 0;
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
-  flex-shrink: 0;
 }
+.tabstrip::-webkit-scrollbar { display: none; }
+.tabstrip[data-left] { mask-image: linear-gradient(to right, transparent 0, #000 16px); }
+.tabstrip[data-right] { mask-image: linear-gradient(to left, transparent 0, #000 16px); }
+.tabstrip[data-left][data-right] { mask-image: linear-gradient(to right, transparent 0, #000 16px, #000 calc(100% - 16px), transparent 100%); }
 .tab {
   position: relative;
   display: flex;
@@ -228,7 +242,7 @@
 .tab:hover .tab-x, .tab.active .tab-x, .tab-x:focus-visible { opacity: 1; }
 .tab-x .i { width: 12px; height: 12px; }
 .tab-x:hover { background: var(--active); color: var(--text); }
-.tab-new { margin: 0 var(--sp-1); align-self: center; }
+.tab-new { margin: 0 var(--sp-1); align-self: center; flex-shrink: 0; }
 .tab-menu { min-width: 220px; max-height: min(440px, 70vh); overflow: auto; }
 .tab-menu .menu-sep { height: 1px; margin: var(--sp-1) var(--sp-2); background: var(--line); }
 .tab-menu .target-empty { margin: 0; padding: var(--sp-1) var(--sp-2) var(--sp-2); color: var(--text-3); font-size: var(--fs-sm); }
