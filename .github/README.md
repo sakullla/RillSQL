@@ -16,6 +16,8 @@ Run the release guard tests locally with `node --test .github/scripts/release.te
 
 The persistent identity is `RillSQL Code Signing`, stored in repository secrets `APPLE_CERTIFICATE` (base64 PKCS#12), `APPLE_CERTIFICATE_PASSWORD`, and `APPLE_SIGNING_IDENTITY`. These were configured with `gh secret set`; preserve the protected backup outside the repository at `~/.config/rillsql/signing/`. Reuse this certificate across releases; do not generate a new key in CI. It is independent of the existing Tauri updater signing key. Do not modify an archive after generating its updater signature.
 
+The signing script registers its temporary keychain in the user search list and as the default, resolves the imported certificate's SHA-1 identity, and confirms that its private key is available before signing. It restores the previous keychain settings on exit. Main CI runs a native signing smoke test on the same macOS runner image as releases, including all three bundle copies, resource-tampering rejection, and keychain restoration. This catches signing environment failures before a release tag is pushed. The v0.2.10 draft stopped at `codesign: no identity found`; its tag is preserved and the fix uses a new patch version.
+
 The fixed self-signed certificate seals the bundle and preserves signing identity across releases, but does not identify an Apple-trusted developer or provide notarization. Browser downloads can still be blocked by Gatekeeper. After moving RillSQL.app to Applications, try opening it and use System Settings → Privacy & Security → Open Anyway when available. If macOS reports “damaged” without that option, users who trust the download from this repository's Release can remove only this app's quarantine attribute:
 
 ```sh

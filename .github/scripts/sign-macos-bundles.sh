@@ -7,13 +7,20 @@ version="${2:?Version is required}"
 : "${APPLE_CERTIFICATE:?A stable signing certificate is required}"
 : "${APPLE_CERTIFICATE_PASSWORD:?Certificate password is required}"
 : "${APPLE_SIGNING_IDENTITY:?Signing identity is required}"
-work_dir=$(mktemp -d)
+work_dir=$(cd "$(mktemp -d)" && pwd -P)
 keychain="$work_dir/signing.keychain-db"
+original_keychains=()
+while IFS= read -r saved_keychain; do
+  original_keychains+=("$saved_keychain")
+done < <(security list-keychains -d user | sed -E 's/^[[:space:]]*"(.*)"$/\1/')
+original_default=$(security default-keychain -d user | sed -E 's/^[[:space:]]*"(.*)"$/\1/')
 mounted=false
 cleanup() {
   if [[ "$mounted" == true ]]; then
     hdiutil detach "$work_dir/dmg" -quiet || true
   fi
+  security default-keychain -d user -s "$original_default" >/dev/null 2>&1 || true
+  security list-keychains -d user -s "${original_keychains[@]}" >/dev/null 2>&1 || true
   security delete-keychain "$keychain" >/dev/null 2>&1 || true
   rm -rf "$work_dir"
 }
@@ -23,6 +30,10 @@ keychain_password=$(openssl rand -hex 32)
 security create-keychain -p "$keychain_password" "$keychain"
 security set-keychain-settings -lut 21600 "$keychain"
 security unlock-keychain -p "$keychain_password" "$keychain"
+# Match the working Cliora setup: codesign must discover the imported identity
+# through the user search list and default keychain on a clean hosted runner.
+security list-keychains -d user -s "$keychain" "${original_keychains[@]}"
+security default-keychain -d user -s "$keychain"
 printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$work_dir/certificate.p12"
 security import "$work_dir/certificate.p12" -k "$keychain" \
   -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
@@ -30,12 +41,23 @@ security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
   -k "$keychain_password" "$keychain" >/dev/null
 rm "$work_dir/certificate.p12"
 
+# Resolve the actual imported certificate instead of relying on name lookup.
+# Self-signed certificates are not Apple-trusted, so do not use find-identity -v.
+identity_hash=$(security find-certificate -c "$APPLE_SIGNING_IDENTITY" -Z "$keychain" \
+  | awk '/^SHA-1 hash:/ { print $3 }')
+if [[ ! "$identity_hash" =~ ^[0-9A-Fa-f]{40}$ ]] || \
+  ! security find-identity -p codesigning "$keychain" | grep -Fq "$identity_hash"; then
+  echo "The imported certificate has no matching code-signing private key." >&2
+  security find-identity -p codesigning "$keychain" >&2
+  exit 1
+fi
+
 app="$bundle_dir/macos/RillSQL.app"
 # RillSQL has one native executable and no embedded frameworks or sidecars.
 codesign --force --options runtime --timestamp=none --keychain "$keychain" \
-  --sign "$APPLE_SIGNING_IDENTITY" "$app/Contents/MacOS/rillsql"
+  --sign "$identity_hash" "$app/Contents/MacOS/rillsql"
 codesign --force --options runtime --timestamp=none --keychain "$keychain" \
-  --sign "$APPLE_SIGNING_IDENTITY" "$app"
+  --sign "$identity_hash" "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
 
 # Preserve Tauri's Finder layout, replacing only the app inside the disk image.
