@@ -150,13 +150,12 @@ jobs:
             exit 1
           fi
       - name: Build and upload to draft release
+        if: runner.os != 'macOS'
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # CI=true makes Tauri skip the Finder layout step of the DMG.
-          TAURI_BUNDLER_DMG_IGNORE_CI: ${{ runner.os == 'macOS' }}
         with:
           releaseId: ${{ needs.prepare.outputs.release-id }}
           tagName: ${{ github.ref_name }}
@@ -166,6 +165,37 @@ jobs:
           uploadUpdaterJson: false
           uploadUpdaterSignatures: true
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
+      - name: Build and sign macOS bundles with the stable certificate
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # CI=true makes Tauri skip the Finder layout step of the DMG.
+          TAURI_BUNDLER_DMG_IGNORE_CI: "true"
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          : "${APPLE_CERTIFICATE:?Stable macOS certificate is required}"
+          : "${APPLE_CERTIFICATE_PASSWORD:?Certificate password is required}"
+          : "${APPLE_SIGNING_IDENTITY:?Signing identity is required}"
+          env -u APPLE_CERTIFICATE -u APPLE_CERTIFICATE_PASSWORD -u APPLE_SIGNING_IDENTITY \
+            npm run tauri -- build --target "$TARGET" --bundles app,dmg --no-sign -- --locked
+          version=$(node -p "require('./package.json').version")
+          bundle="src-tauri/target/$TARGET/release/bundle"
+          bash .github/scripts/sign-macos-bundles.sh "$bundle" "$version"
+          bash .github/scripts/verify-macos-bundles.sh "$bundle" "$version"
+          updater="$bundle/macos/RillSQL_${version}_aarch64.app.tar.gz"
+          mv "$bundle/macos/RillSQL.app.tar.gz" "$updater"
+          npm run tauri -- signer sign "$updater" --app-version "$version"
+          test -s "$updater.sig"
+          gh release upload "$RELEASE_TAG" \
+            "$bundle/dmg/RillSQL_${version}_aarch64.dmg" "$updater" "$updater.sig" --clobber
 
   publish:
     name: Verify assets and publish

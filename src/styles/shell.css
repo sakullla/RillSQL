@@ -68,10 +68,8 @@
 .tb-brand { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
 .tb-brand strong { font-size: var(--fs-md); letter-spacing: -0.01em; font-weight: 650; }
 .brand-mark { display: inline-grid; flex-shrink: 0; }
-.brand-mark svg { width: 22px; height: 22px; }
-.brand-mark rect { fill: var(--accent); }
-.brand-mark path { fill: none; stroke: var(--on-accent); stroke-width: 2.1; stroke-linecap: round; }
-.brand-mark.lg svg { width: 52px; height: 52px; }
+.brand-mark img { display: block; width: 22px; height: 22px; object-fit: contain; }
+.brand-mark.lg img { width: 52px; height: 52px; }
 
 /* 命令入口：标题栏的主角，平时是一块安静的浅井 */
 .cmd-trigger {

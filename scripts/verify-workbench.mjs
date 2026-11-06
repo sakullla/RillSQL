@@ -255,9 +255,9 @@ try {
   expect(await page.locator(".cm-content").evaluate(el => el === window.__editorBeforeNavigation)).toBe(true);
   await expect(page.locator(".cm-content")).toContainText("SELECT * FROM orders;");
   await page.locator(".cm-content").click();
-  await page.keyboard.press("Control+z");
+  await page.keyboard.press("ControlOrMeta+z");
   await expect(page.locator(".cm-content")).not.toContainText("SELECT * FROM orders;");
-  await page.keyboard.press("Control+y");
+  await page.keyboard.press("ControlOrMeta+Shift+z");
   await expect(page.locator(".cm-content")).toContainText("SELECT * FROM orders;");
   report.checks.push("Navigation preserves the editor instance and draft; undo and redo still work after returning");
   await page.keyboard.press("Control+p");
@@ -340,7 +340,7 @@ try {
   report.checks.push("SQL Server: top-level BEGIN...END block is sent as one statement in current-statement mode");
 
   // 执行计划：SET SHOWPLAN_ALL 批次 + 行集按层次呈现。
-  await page.keyboard.press("Control+z");
+  await page.keyboard.press("ControlOrMeta+z");
   await page.keyboard.insertText("SELECT * FROM [dbo].[orders];");
   await page.getByRole("button", { name: "执行计划", exact: true }).click();
   const planRun = await page.evaluate(() => window.__uiCalls.filter(call => call.command === "query_start").at(-1).args.request);

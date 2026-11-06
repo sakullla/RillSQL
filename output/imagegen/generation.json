@@ -1,0 +1,9 @@
+{
+  "mode": "provider Responses image_generation API, using the user-referenced Rillight helper",
+  "requestedImageModel": "gpt-image-2.6",
+  "quality": "high",
+  "prompt": "rillsql-icon-prompt.txt",
+  "original": "rillsql-icon-2.6.png",
+  "processed": "rillsql-icon.png",
+  "processing": "Remove only edge-connected white background; resize to 1024px RGBA. UI variant crops outer padding and resizes to 256px."
+}

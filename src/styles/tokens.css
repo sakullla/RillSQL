@@ -1,4 +1,4 @@
-/* RillSQL 设计令牌「澄水」：品牌色取自应用图标的水色青绿，中性色带一丝青调。
+/* RillSQL 设计令牌：钴蓝品牌色，搭配冷灰白与深海军蓝表面。
    所有视觉值只从这里取。窗框融入 app 画布，工作面（panel）是唯一的悬浮层级。 */
 :root {
   /* 字体：Inter Variable + JetBrains Mono 自托管（@font-face 见 fonts.css），CJK 回退栈不变 */
@@ -79,47 +79,47 @@
   --control-h-sm: 34px;
 }
 
-/* ---------- 浅色主题（默认）：雾白画布 + 纯白工作面 + 深水青强调 ---------- */
+/* ---------- 浅色主题（默认）：冷灰白画布 + 纯白工作面 + 钴蓝强调 ---------- */
 :root,
 :root[data-theme="light"] {
   color-scheme: light;
 
   /* 表面五层语义：app（画布，窗框同面）/ chrome（工具条）/ panel（工作面）/ sunken（下沉井）/ overlay-surface（浮层） */
-  --surface-app: #e9eeee;
-  --surface-chrome: #f6f8f8;
+  --surface-app: #edf0f6;
+  --surface-chrome: #f7f8fc;
   --surface-panel: #ffffff;
-  --surface-sunken: #f1f4f4;
+  --surface-sunken: #f1f3f8;
   --surface-overlay: #ffffff;
   --bg: var(--surface-app);
   --chrome: var(--surface-chrome);
   --panel: var(--surface-panel);
-  --panel-2: #f6f8f8;
+  --panel-2: #f7f8fc;
   --sunken: var(--surface-sunken);
-  --hover: #e6ecec;
-  --active: #dbe3e3;
+  --hover: #e5eaf4;
+  --active: #dbe2ef;
 
   /* 文本三级 */
-  --text: #162322;
-  --text-2: #4d5e5c;
-  --text-3: #5a6b69;
+  --text: #1b2438;
+  --text-2: #505e76;
+  --text-3: #606d83;
 
   /* 分隔线与内描边 */
-  --line: #e2e8e8;
-  --line-2: #cfd9d8;
-  --stroke: #d8e0e0;
-  --stroke-strong: #c6d1d0;
+  --line: #e1e6f0;
+  --line-2: #cfd7e6;
+  --stroke: #d8dfec;
+  --stroke-strong: #c4cedf;
 
   /* 强调：与应用图标同色系 */
-  --accent: #0b7a70;
-  --accent-hover: #09685f;
-  --accent-active: #075850;
-  --accent-soft: #dff3ef;
-  --accent-text: #08665d;
+  --accent: #315fdb;
+  --accent-hover: #254fc2;
+  --accent-active: #2043a4;
+  --accent-soft: #e8eeff;
+  --accent-text: #294fb8;
   --on-accent: #ffffff;
 
   /* 状态 */
-  --ok: #18794e;
-  --ok-soft: #dff3e6;
+  --ok: #3862ad;
+  --ok-soft: #e9f0ff;
   --warn: #925400;
   --warn-soft: #fff1cf;
   --warn-line: #efcf85;
@@ -130,50 +130,50 @@
   --info-soft: #e3f0fd;
 
   /* 选中 */
-  --sel: rgba(11, 122, 112, 0.09);
-  --sel-strong: rgba(11, 122, 112, 0.17);
+  --sel: rgba(49, 95, 219, 0.09);
+  --sel-strong: rgba(49, 95, 219, 0.17);
 
   /* SQL 编辑器分层（R1、R2）：当前行 < 执行范围 < 失焦选区 < 聚焦选区，视觉强度依次递增，
      四个层次都能同时看见。光标用不受选区色影响的高对比中性色；匹配高亮取暖色，
-     与选区的水青拉开色相，避免「选区、当前行、匹配、执行范围」糊成一片。 */
-  --caret: #10201f;
-  --editor-active-line: rgba(18, 38, 36, 0.045);
-  --editor-send-range: rgba(11, 122, 112, 0.08);
-  --editor-selection-blur: rgba(11, 122, 112, 0.14);
-  --editor-selection: rgba(11, 122, 112, 0.26);
+     与选区的蓝色拉开色相，避免「选区、当前行、匹配、执行范围」糊成一片。 */
+  --caret: #162139;
+  --editor-active-line: rgba(24, 35, 60, 0.045);
+  --editor-send-range: rgba(49, 95, 219, 0.08);
+  --editor-selection-blur: rgba(49, 95, 219, 0.14);
+  --editor-selection: rgba(49, 95, 219, 0.26);
   --editor-match: rgba(214, 158, 12, 0.26);
   --editor-match-active: rgba(214, 158, 12, 0.46);
 
   /* 焦点环与禁用态 */
-  --ring: rgba(11, 122, 112, 0.28);
-  --disabled-fg: #8b9a98;
-  --disabled-bg: #eff3f3;
+  --ring: rgba(49, 95, 219, 0.28);
+  --disabled-fg: #8c98ae;
+  --disabled-bg: #eff2f8;
 
   /* 阴影：工作面极浅，浮层柔和 */
-  --shadow-panel: 0 1px 2px rgba(18, 38, 36, 0.05), 0 0 0 1px rgba(18, 38, 36, 0.05);
-  --shadow-sm: 0 1px 2px rgba(18, 38, 36, 0.06);
-  --shadow: 0 10px 28px rgba(18, 38, 36, 0.13), 0 2px 6px rgba(18, 38, 36, 0.06);
-  --shadow-lg: 0 24px 64px rgba(18, 38, 36, 0.22), 0 6px 16px rgba(18, 38, 36, 0.08);
+  --shadow-panel: 0 1px 2px rgba(24, 35, 60, 0.05), 0 0 0 1px rgba(24, 35, 60, 0.05);
+  --shadow-sm: 0 1px 2px rgba(24, 35, 60, 0.06);
+  --shadow: 0 10px 28px rgba(24, 35, 60, 0.13), 0 2px 6px rgba(24, 35, 60, 0.06);
+  --shadow-lg: 0 24px 64px rgba(24, 35, 60, 0.22), 0 6px 16px rgba(24, 35, 60, 0.08);
 
   /* 按压态内阴影：中性 / 强调 / 危险。组件里不许硬编码颜色。 */
-  --press: rgba(18, 38, 36, 0.12);
-  --press-accent: rgba(4, 40, 36, 0.32);
+  --press: rgba(24, 35, 60, 0.12);
+  --press-accent: rgba(15, 32, 80, 0.32);
   --press-danger: rgba(205, 43, 49, 0.16);
 
   /* 语法高亮（编辑器底为 --panel） */
   --tk-kw: #6b3fc4;
   --tk-str: #a14a00;
   --tk-num: #0b68cb;
-  --tk-com: #5f706e;
-  --tk-fn: #08706b;
-  --tk-id: #162322;
+  --tk-com: #637086;
+  --tk-fn: #3856a6;
+  --tk-id: #1b2438;
 
   /* 环境标签色 */
-  --env-dev: #18794e;
+  --env-dev: #3862ad;
   --env-test: #0b68cb;
   --env-prod: #cd2b31;
   --env-local: #6b3fc4;
-  --env-none: #4d5e5c;
+  --env-none: #505e76;
 
   /* 引擎色 */
   --eng-postgres: #336791;
@@ -182,57 +182,57 @@
   --eng-sqlite: #0b68cb;
   --eng-sqlserver: #b3261e;
   --eng-redis: #c5281c;
-  --eng-mongodb: #13794b;
+  --eng-mongodb: #7652aa;
 
   /* 活动栏与页面遮罩：两套主题各自改写，组件里不再写死。 */
-  --nav-bg: #e9eeee;
-  --nav-fg: #4d5e5c;
-  --nav-active: #08665d;
-  --nav-hover: rgba(18, 38, 36, 0.06);
+  --nav-bg: #edf0f6;
+  --nav-fg: #505e76;
+  --nav-active: #294fb8;
+  --nav-hover: rgba(24, 35, 60, 0.06);
   --nav-active-bg: #ffffff;
-  --overlay: rgba(16, 28, 27, 0.34);
+  --overlay: rgba(17, 26, 47, 0.34);
 }
 
-/* ---------- 深色主题：深潭底 + 亮水青强调（独立设计，不是机械反色） ---------- */
+/* ---------- 深色主题：海军蓝底 + 浅钴蓝强调（独立设计，不是机械反色） ---------- */
 :root[data-theme="dark"] {
   color-scheme: dark;
 
   /* 工作面最亮、画布最深，浮层再升一档 */
-  --surface-app: #0b1011;
-  --surface-chrome: #141b1c;
-  --surface-panel: #111718;
-  --surface-sunken: #0d1314;
-  --surface-overlay: #1b2425;
+  --surface-app: #0c101b;
+  --surface-chrome: #151c2c;
+  --surface-panel: #121928;
+  --surface-sunken: #0e1422;
+  --surface-overlay: #1e283b;
   --bg: var(--surface-app);
   --chrome: var(--surface-chrome);
   --panel: var(--surface-panel);
-  --panel-2: #161e1f;
+  --panel-2: #192234;
   --sunken: var(--surface-sunken);
-  --hover: #1f2a2b;
-  --active: #283536;
+  --hover: #232f45;
+  --active: #2c3a53;
 
   /* 文本三级 */
-  --text: #e6eeed;
-  --text-2: #a4b4b2;
-  --text-3: #7e8f8d;
+  --text: #e8edf8;
+  --text-2: #aab8d0;
+  --text-3: #8999b4;
 
   /* 分隔线与内描边 */
-  --line: #212c2d;
-  --line-2: #314040;
-  --stroke: #2a3738;
-  --stroke-strong: #394a4a;
+  --line: #263249;
+  --line-2: #35445e;
+  --stroke: #2d3b54;
+  --stroke-strong: #40516e;
 
-  /* 强调：实体底是亮水青，配深字 */
-  --accent: #2fcfba;
-  --accent-hover: #5adfcd;
-  --accent-active: #22b3a1;
-  --accent-soft: #0f2f2c;
-  --accent-text: #62e3d1;
-  --on-accent: #04211e;
+  /* 强调：实体底是浅钴蓝，配深蓝字 */
+  --accent: #8aa9ff;
+  --accent-hover: #a6bdff;
+  --accent-active: #7395f0;
+  --accent-soft: #1c2c50;
+  --accent-text: #abc1ff;
+  --on-accent: #102043;
 
   /* 状态 */
-  --ok: #5fd38d;
-  --ok-soft: #12291c;
+  --ok: #9ab9ff;
+  --ok-soft: #1b2a47;
   --warn: #f5c04e;
   --warn-soft: #2e2208;
   --warn-line: #5c4412;
@@ -243,25 +243,25 @@
   --info-soft: #10263f;
 
   /* 选中 */
-  --sel: rgba(47, 207, 186, 0.11);
-  --sel-strong: rgba(47, 207, 186, 0.21);
+  --sel: rgba(138, 169, 255, 0.11);
+  --sel-strong: rgba(138, 169, 255, 0.21);
 
   /* SQL 编辑器分层：与浅色同一套职责，深底上整体提亮一档，保证失焦选区仍可辨认。 */
-  --caret: #f2fbfa;
-  --editor-active-line: rgba(230, 238, 237, 0.05);
-  --editor-send-range: rgba(47, 207, 186, 0.10);
-  --editor-selection-blur: rgba(47, 207, 186, 0.16);
-  --editor-selection: rgba(47, 207, 186, 0.32);
+  --caret: #f2f5ff;
+  --editor-active-line: rgba(232, 237, 248, 0.05);
+  --editor-send-range: rgba(138, 169, 255, 0.10);
+  --editor-selection-blur: rgba(138, 169, 255, 0.16);
+  --editor-selection: rgba(138, 169, 255, 0.32);
   --editor-match: rgba(245, 192, 78, 0.24);
   --editor-match-active: rgba(245, 192, 78, 0.44);
 
   /* 焦点环与禁用态 */
-  --ring: rgba(47, 207, 186, 0.36);
-  --disabled-fg: #5f6f6e;
-  --disabled-bg: #182021;
+  --ring: rgba(138, 169, 255, 0.36);
+  --disabled-fg: #65738e;
+  --disabled-bg: #1b2436;
 
   /* 阴影 */
-  --shadow-panel: 0 0 0 1px #1c2627;
+  --shadow-panel: 0 0 0 1px #27334a;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow: 0 12px 32px rgba(0, 0, 0, 0.52), 0 2px 8px rgba(0, 0, 0, 0.34);
   --shadow-lg: 0 24px 64px rgba(0, 0, 0, 0.62), 0 6px 16px rgba(0, 0, 0, 0.4);
@@ -275,16 +275,16 @@
   --tk-kw: #b9a5ff;
   --tk-str: #f5b071;
   --tk-num: #72b8ff;
-  --tk-com: #84958f;
-  --tk-fn: #5adfcd;
-  --tk-id: #e6eeed;
+  --tk-com: #8c9db7;
+  --tk-fn: #a6bdff;
+  --tk-id: #e8edf8;
 
   /* 环境标签色 */
-  --env-dev: #5fd38d;
+  --env-dev: #9ab9ff;
   --env-test: #72b8ff;
   --env-prod: #ff8f8c;
   --env-local: #b9a5ff;
-  --env-none: #a4b4b2;
+  --env-none: #aab8d0;
 
   /* 引擎色 */
   --eng-postgres: #8bb3dc;
@@ -293,20 +293,20 @@
   --eng-sqlite: #74b8ea;
   --eng-sqlserver: #f28b82;
   --eng-redis: #ff8a7a;
-  --eng-mongodb: #6fd39a;
+  --eng-mongodb: #c2a4ed;
 
   /* 活动栏与页面遮罩 */
-  --nav-bg: #0b1011;
-  --nav-fg: #8d9e9c;
-  --nav-active: #62e3d1;
-  --nav-hover: rgba(230, 238, 237, 0.06);
-  --nav-active-bg: #182223;
-  --overlay: rgba(2, 6, 6, 0.6);
+  --nav-bg: #0c101b;
+  --nav-fg: #95a6c2;
+  --nav-active: #abc1ff;
+  --nav-hover: rgba(232, 237, 248, 0.06);
+  --nav-active-bg: #1d2940;
+  --overlay: rgba(3, 7, 18, 0.6);
 }
 
 /* ---------- SQL 编辑器命名配色（R5）：auto 不设 data-editor-theme，直接继承上方全局默认（浅/深各一套）。
    命名主题只改写 --tk-* 变量组，属性挂在查询页容器（QueryTab 根节点）上，不影响界面主题与其它区域；
-   每个命名主题按浅/深全局主题各给一套值（编辑器底为 --surface-panel：浅 #ffffff / 深 #111718），
+   每个命名主题按浅/深全局主题各给一套值（编辑器底为 --surface-panel：浅 #ffffff / 深 #121928），
    关键字/字符串/数字/注释四类令牌在两套底色下均拉开色相或明度差。 ---------- */
 [data-editor-theme="contrast"] {
   /* 高对比·浅：深靛蓝/深琥珀/深洋红/深青 + 近黑标识符，色相间距最大化 */
@@ -329,29 +329,29 @@
 }
 
 [data-editor-theme="warm"] {
-  /* 暖色·浅：铁锈红/暗金/暖李紫/橄榄 + 暖灰，同处暖色家族内拉开明度 */
+  /* 暖色·浅：铁锈红/暗金/暖李紫/赭石 + 暖灰，同处暖色家族内拉开明度 */
   --tk-kw: #a03d12;
   --tk-str: #91700a;
   --tk-num: #8d4c6e;
   --tk-com: #7a7168;
-  --tk-fn: #6f7f1a;
+  --tk-fn: #97613b;
   --tk-id: #2b2018;
 }
 
 :root[data-theme="dark"] [data-editor-theme="warm"] {
-  /* 暖色·深：鲑橙/金/暖粉/浅橄榄 + 暖白 */
+  /* 暖色·深：鲑橙/金/暖粉/浅赭石 + 暖白 */
   --tk-kw: #ff9d70;
   --tk-str: #f2c94c;
   --tk-num: #e395bd;
   --tk-com: #b0a699;
-  --tk-fn: #cdd96e;
+  --tk-fn: #edbd93;
   --tk-id: #f8f1e7;
 }
 
 [data-editor-theme="cool"] {
-  /* 冷色·浅：深蔚蓝/墨绿/长春花紫/青 + 冷灰 */
+  /* 冷色·浅：深蔚蓝/葡萄紫/长春花紫/天蓝 + 冷灰 */
   --tk-kw: #114faf;
-  --tk-str: #0d7862;
+  --tk-str: #7253a7;
   --tk-num: #5a55d6;
   --tk-com: #5f6875;
   --tk-fn: #0b7ea0;
@@ -359,9 +359,9 @@
 }
 
 :root[data-theme="dark"] [data-editor-theme="cool"] {
-  /* 冷色·深：浅蔚蓝/亮墨绿/浅紫/亮青 + 冷白 */
+  /* 冷色·深：浅蔚蓝/浅葡萄紫/浅紫/亮天蓝 + 冷白 */
   --tk-kw: #82b1ff;
-  --tk-str: #57d6bd;
+  --tk-str: #c0a5ee;
   --tk-num: #b3a8ff;
   --tk-com: #9aa5b5;
   --tk-fn: #58c7e8;

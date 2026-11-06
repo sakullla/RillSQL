@@ -89,7 +89,19 @@ export function formatNotes(subjects, previous) {
   lines.push("---", "",
     "Windows x64：NSIS EXE；macOS Apple Silicon：DMG；Linux x64：DEB / AppImage。",
     "",
-    "安装包未做平台签名：Windows 可能出现 SmartScreen 提示；macOS 首次打开需在“隐私与安全性”中允许。", "");
+    "Windows 安装包未做平台签名，可能出现 SmartScreen 提示。macOS 使用固定自签证书，未做 Apple Developer ID 签名和公证，首次打开仍可能被系统拦截。",
+    "",
+    "### macOS 首次打开",
+    "",
+    "将 RillSQL.app 拖入“应用程序”后打开；如被拦截，可在“系统设置 → 隐私与安全性”中点击“仍要打开”。",
+    "如果提示“已损坏”且没有“仍要打开”，仅在确认安装包来自本仓库 Release 且信任该来源后，在终端执行：",
+    "",
+    "```sh",
+    'xattr -dr com.apple.quarantine "/Applications/RillSQL.app"',
+    'open "/Applications/RillSQL.app"',
+    "```",
+    "",
+    "以上命令仅移除 RillSQL 的下载隔离标记，不会关闭系统 Gatekeeper。若应用安装在其他目录，请替换路径。", "");
   return lines.join("\n");
 }
 

@@ -192,14 +192,14 @@ describe("design tokens", () => {
     }
   });
 
-  it("anchors the accent on the teal of the app icon, tuned per theme", () => {
-    expect(hexValue(THEME_SCOPES.light(), "--accent")).toBe("#0b7a70");
-    expect(hexValue(THEME_SCOPES.dark(), "--accent")).toBe("#2fcfba");
+  it("uses a cobalt accent tuned for light and dark surfaces", () => {
+    expect(hexValue(THEME_SCOPES.light(), "--accent")).toBe("#315fdb");
+    expect(hexValue(THEME_SCOPES.dark(), "--accent")).toBe("#8aa9ff");
   });
 
-  it("keeps the legacy indigo family fully removed", () => {
-    expect(css.toLowerCase()).not.toContain("#4f46e5");
-    expect(css.toLowerCase()).not.toContain("#8b7ff7");
+  it("keeps the previous green accent family removed", () => {
+    expect(css.toLowerCase()).not.toContain("#0b7a70");
+    expect(css.toLowerCase()).not.toContain("#2fcfba");
   });
 
   it("keeps activity rail colors out of the theme-invariant root", () => {
@@ -313,8 +313,8 @@ describe("design tokens", () => {
       const selection = rgbaValue(scope, "--editor-selection");
       const match = rgbaValue(scope, "--editor-match");
       const activeMatch = rgbaValue(scope, "--editor-match-active");
-      // 选区是水青（绿多于红），匹配是暖色（红远多于蓝）：既不撞色相也不撞强度。
-      expect(selection.g - selection.r, theme).toBeGreaterThan(60);
+      // 选区是钴蓝（蓝远多于红），匹配是暖色（红远多于蓝）：既不撞色相也不撞强度。
+      expect(selection.b - selection.r, theme).toBeGreaterThan(60);
       expect(match.r - match.b, theme).toBeGreaterThan(60);
       expect(activeMatch.a, theme).toBeGreaterThan(match.a);
     }
