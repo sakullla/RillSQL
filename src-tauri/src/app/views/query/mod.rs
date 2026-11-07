@@ -5,12 +5,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableState};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, MouseButton,
-    ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 
+use crate::app::views::grid::{GridPane, GridTarget};
 use crate::application::AppServices;
 use crate::i18n::{self, Locale};
 use crate::query::assist::{self, LintFinding, RunScope, TreeObject};
@@ -55,7 +55,7 @@ pub struct QueryPane {
     services: Arc<AppServices>,
     editors: HashMap<String, Entity<SqlEditor>>,
     links: HashMap<String, DraftLink>,
-    grid: Entity<TableState<ResultDelegate>>,
+    grid: Entity<GridPane>,
     locale: Locale,
     pending_text: Option<String>,
     opens: Vec<OpenRequest>,
@@ -80,13 +80,7 @@ pub struct QueryPane {
 
 impl QueryPane {
     pub fn new(services: Arc<AppServices>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let grid = cx.new(|cx| {
-            TableState::new(ResultDelegate::default(), window, cx)
-                .cell_selectable(true)
-                .row_selectable(true)
-                .col_resizable(true)
-                .row_header(true)
-        });
+        let grid = cx.new(|cx| GridPane::new(Arc::clone(&services), window, cx));
         Self {
             desk: Desk::new(),
             services,
@@ -170,7 +164,15 @@ impl QueryPane {
     }
 
     pub fn cell(&self, row: usize, col: usize, cx: &App) -> String {
-        self.grid.read(cx).delegate().cell(row, col)
+        self.grid.read(cx).cell(row, col)
+    }
+
+    pub fn grid_uncommitted(&self, cx: &App) -> bool {
+        self.grid.read(cx).uncommitted()
+    }
+
+    pub fn grid_writable(&self, cx: &App) -> bool {
+        self.grid.read(cx).writable()
     }
 
     pub fn command(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -703,28 +705,38 @@ impl QueryPane {
         let results = self.desk.results();
         let index = if results.is_empty() { 0 } else { self.desk.statement().min(results.len() - 1) };
         let Some(sheet) = results.get(index) else {
-            self.grid.update(cx, |state, cx| {
-                state.delegate_mut().columns.clear();
-                state.delegate_mut().rows.clear();
-                state.refresh(cx);
-            });
+            self.grid.update(cx, |grid, cx| grid.clear_sheet(cx));
             return;
         };
         let columns = if sheet.columns.is_empty() { vec!["status".to_owned()] } else { sheet.columns.clone() };
         let rows = if sheet.columns.is_empty() {
-            vec![vec![sheet.message.clone()]]
+            vec![vec![Some(sheet.message.clone())]]
         } else {
-            sheet
-                .rows
-                .iter()
-                .map(|row| row.iter().map(|cell| cell.clone().unwrap_or_else(|| "NULL".to_owned())).collect())
-                .collect()
+            sheet.rows.clone()
         };
-        self.grid.update(cx, |state, cx| {
-            state.delegate_mut().columns = columns;
-            state.delegate_mut().rows = rows;
-            state.refresh(cx);
+        let target = self.grid_target();
+        let sql = sheet.sql.clone();
+        let engine = target.engine.clone();
+        self.grid.update(cx, |grid, cx| {
+            let mut target = target;
+            target.engine = engine;
+            grid.show_query(target, &sql, columns, rows, cx);
         });
+    }
+
+    fn grid_target(&self) -> GridTarget {
+        let Some(target) = self.desk.target() else {
+            return GridTarget::default();
+        };
+        GridTarget {
+            connection_id: target.connection_id,
+            connection_name: target.connection_name,
+            database: target.database,
+            schema: target.schema,
+            table: String::new(),
+            engine: target.engine,
+            environment: "none".to_owned(),
+        }
     }
 
     fn apply_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -951,12 +963,7 @@ impl Render for QueryPane {
         if results.is_empty() {
             column = column.child(label("query.status.empty"));
         } else {
-            column = column.child(
-                div()
-                    .id("query-results")
-                    .h(px(220.))
-                    .child(DataTable::new(&grid).accessibility_label("query-results")),
-            );
+            column = column.child(div().id("query-results").h(px(220.)).child(grid));
         }
         column
     }
@@ -1049,54 +1056,6 @@ fn target_of(tab: &TabSnap) -> Option<Target> {
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("query runtime"))
-}
-
-struct ResultDelegate {
-    columns: Vec<String>,
-    rows: Vec<Vec<String>>,
-}
-
-impl Default for ResultDelegate {
-    fn default() -> Self {
-        Self { columns: Vec::new(), rows: Vec::new() }
-    }
-}
-
-impl ResultDelegate {
-    fn cell(&self, row: usize, col: usize) -> String {
-        self.rows.get(row).and_then(|line| line.get(col)).cloned().unwrap_or_default()
-    }
-}
-
-impl TableDelegate for ResultDelegate {
-    fn columns_count(&self, _: &App) -> usize {
-        self.columns.len().max(1)
-    }
-
-    fn rows_count(&self, _: &App) -> usize {
-        self.rows.len()
-    }
-
-    fn column(&self, col_ix: usize, _: &App) -> Column {
-        let name = self.columns.get(col_ix).cloned().unwrap_or_else(|| " ".to_owned());
-        Column::new(format!("c{col_ix}"), name).width(px(120.)).resizable(true)
-    }
-
-    fn render_td(&mut self, row_ix: usize, col_ix: usize, _: &mut Window, _: &mut Context<TableState<Self>>) -> impl IntoElement {
-        div().child(SharedString::from(self.cell(row_ix, col_ix)))
-    }
-
-    fn cell_text(&self, row_ix: usize, col_ix: usize, _: &App) -> String {
-        self.cell(row_ix, col_ix)
-    }
-
-    fn cell_label(&self, row_ix: usize, col_ix: usize, _: &App) -> Option<SharedString> {
-        Some(SharedString::from(self.cell(row_ix, col_ix)))
-    }
-
-    fn fit_column(&mut self, _: usize, _: &mut Window, _: &mut Context<TableState<Self>>) -> Option<Pixels> {
-        Some(px(160.))
-    }
 }
 
 #[cfg(test)]

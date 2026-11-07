@@ -269,6 +269,41 @@ dict! {
     "query.status.running" => "正在执行", "Running";
     "query.status.noObjects" => "没有对象", "No objects";
     "query.results.statement" => "结果", "Result";
+    "grid.range.loaded" => "已读取", "Loaded";
+    "grid.range.subset" => "已读取子集", "Loaded subset";
+    "grid.range.unknownFull" => "全量未知", "Full count unknown";
+    "grid.value.unsetLabel" => "未设置", "Unset";
+    "grid.value.emptyLabel" => "空字符串", "Empty string";
+    "grid.value.null" => "空值", "Null value";
+    "grid.value.binaryLabel" => "二进制", "Binary";
+    "grid.value.largeLabel" => "大值", "Large value";
+    "grid.status.readonly" => "只读", "Read-only";
+    "grid.status.writable" => "可编辑", "Editable";
+    "grid.status.unlocated" => "无法定位这一行", "This row cannot be located";
+    "grid.status.validation" => "校验失败", "Validation failed";
+    "grid.status.execution" => "执行失败", "Execution failed";
+    "grid.status.rejectedKept" => "被拒绝的修改仍保留", "Rejected edits are kept";
+    "grid.preview.title" => "变更预览", "Change preview";
+    "grid.preview.confirm" => "确认写入", "Confirm write";
+    "grid.preview.cancel" => "取消预览", "Cancel preview";
+    "grid.commit.needPreview" => "先打开预览并确认后才会写入。", "Open the preview and confirm before anything is written.";
+    "structure.section.columns" => "字段", "Columns";
+    "structure.section.indexes" => "索引", "Indexes";
+    "structure.section.foreign" => "外键", "Foreign keys";
+    "structure.section.view" => "视图", "View";
+    "structure.section.danger" => "危险操作", "Dangerous operation";
+    "structure.preview.title" => "结构预览", "Structure preview";
+    "structure.preview.need" => "先预览 SQL，确认后才执行。", "Preview the SQL first. It runs only after confirmation.";
+    "structure.preview.done" => "已按预览执行。", "The preview was executed.";
+    "structure.action.preview" => "预览 SQL", "Preview SQL";
+    "structure.action.confirm" => "确认执行", "Confirm";
+    "structure.action.cancel" => "取消", "Cancel";
+    "admin.section.none" => "这个引擎没有数据库级管理操作。", "This engine has no database-level admin actions.";
+    "admin.action.vacuum" => "整理数据库", "Vacuum";
+    "admin.action.pragma" => "设置 user_version", "Set user_version";
+    "admin.action.sequence" => "修改序列", "Alter sequence";
+    "admin.action.event" => "启停事件", "Enable or disable event";
+    "admin.preview.unconnected" => "没有连接到这个引擎，预览不会执行。", "This engine is not connected, so the preview will not run.";
 }
 
 #[cfg(test)]

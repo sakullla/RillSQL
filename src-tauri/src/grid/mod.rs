@@ -11,7 +11,49 @@ pub(crate) use live::{
     ExportMode, ExportSpec, ForeignKey, Mutation, MutationKind,
 };
 pub(crate) use sql::{delete_sql, insert_sql, qualified_name, quote_ident, reject_literal, select_list, sql_cell, update_sql, value_family, ValueFamily};
-pub(crate) use store::{Cell, Column, Engine, Filter, FilterOp, Sort, TableSchema};
+pub(crate) use store::{refresh_located, Cell, Column, Engine, Filter, FilterOp, Sort, TableSchema};
+
+/// 用现有定位规则判断结果行。调用方只提供列名和单元格，不复制主键比较。
+pub(crate) fn locate_sheet(schema: &TableSchema, columns: &[String], rows: &[Vec<Option<String>>]) -> Vec<LocatedSheetRow> {
+    let mut stored = rows
+        .iter()
+        .enumerate()
+        .map(|(index, values)| {
+            let mut cells = std::collections::BTreeMap::new();
+            for (name, value) in columns.iter().zip(values.iter()) {
+                let cell = match value {
+                    Some(text) => Cell::Text(text.clone()),
+                    None => Cell::Null,
+                };
+                cells.insert(name.clone(), cell);
+            }
+            store::Row { id: index.to_string(), cells, locator: None, located: false }
+        })
+        .collect::<Vec<_>>();
+    refresh_located(schema, &mut stored);
+    stored
+        .into_iter()
+        .map(|row| LocatedSheetRow {
+            located: row.located,
+            locator: row
+                .locator
+                .map(|locator| locator.columns.into_iter().zip(locator.values).map(|(name, cell)| (name, cell_text(cell))).collect())
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+fn cell_text(cell: Cell) -> Option<String> {
+    match cell {
+        Cell::Null => None,
+        Cell::Text(text) => Some(text),
+    }
+}
+
+pub(crate) struct LocatedSheetRow {
+    pub located: bool,
+    pub locator: Vec<(String, Option<String>)>,
+}
 
 pub fn module_id() -> &'static str {
     let _linked = (

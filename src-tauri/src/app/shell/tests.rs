@@ -14,7 +14,7 @@ use crate::i18n;
 use crate::query::SaveRequest;
 use crate::state::{AppState, SessionState, ShellSettings};
 
-use super::model::{DraftField, PendingJob, WorkbenchModel};
+use super::model::{DraftField, PendingJob, WorkTool, WorkbenchModel};
 use crate::app::Shell;
 use gpui_kit::AppContext as _;
 use gpui_kit::test::TestWindowExt;
@@ -104,6 +104,20 @@ fn six_menus_keyboard_and_close_guard_stay_on_one_command_layer() {
     model.tabs[0].uncommitted_cells = true;
     assert!(model.request_update_install().unwrap_err().contains("pending"));
     model.tabs[0].uncommitted_cells = false;
+    model.grid_dirty = true;
+    assert!(!model.allow_system_close());
+    let saved = serde_json::to_string(&model.snapshot()).unwrap();
+    assert!(!saved.contains("uncommittedChanges"), "{saved}");
+    model.close_prompt = None;
+    model.grid_dirty = false;
+    assert!(model.dispatch("open-table:notes|笔记|main||customers|sqlite|dev").is_some());
+    assert_eq!(model.tool, WorkTool::Table);
+    assert_eq!(model.shell.page, AppPage::Workspace);
+    assert!(model.dispatch("open-structure-for:notes|笔记|main||customers|sqlite|dev").is_some());
+    assert_eq!(model.tool, WorkTool::Structure);
+    assert_eq!(model.shell.page, AppPage::Structure);
+    assert!(model.dispatch("open-admin").is_some());
+    assert_eq!(model.tool, WorkTool::Admin);
     model.tabs[0].running = true;
     assert_eq!(model.request_update_install().unwrap_err(), "shell.update.busy");
     assert!(!model.allow_system_close());
@@ -659,6 +673,62 @@ fn file_commands_call_gpui_dialogs(cx: &mut gpui_kit::TestAppContext) {
             assert_eq!(view.model.shell.page, AppPage::Connections);
             assert_eq!(view.model.shell.opened_path.as_deref(), Some(sqlite_opened.as_path()));
         });
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui_kit::test]
+fn grid_edits_block_close_and_structure_admin_bind_the_target(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-grid-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench(cx, services, false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.mark_table_dirty(cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        view.update(cx, |view, _cx| {
+            assert!(view.model.grid_dirty);
+            assert!(!view.model.allow_system_close());
+            let saved = serde_json::to_string(&view.model.snapshot()).unwrap();
+            assert!(!saved.contains("uncommittedChanges"), "{saved}");
+            assert!(!saved.contains('乙'), "{saved}");
+            view.model.close_prompt = None;
+            view.model.grid_dirty = false;
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("open-structure-for:notes|笔记|main||customers|sqlite|dev", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let banner = view.read(cx).structure_banner(cx);
+        assert!(banner.contains("笔记") && banner.contains("dev") && banner.contains("customers") && banner.contains("sqlite"), "{banner}");
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("open-admin", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let banner = view.read(cx).admin_banner(cx);
+        assert!(banner.contains("笔记") && banner.contains("dev") && banner.contains("customers") && banner.contains("sqlite"), "{banner}");
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("open-table:notes|笔记|main||customers|sqlite|dev", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let banner = view.read(cx).table_banner(cx);
+        assert!(banner.contains("笔记") && banner.contains("dev") && banner.contains("customers") && banner.contains("sqlite"), "{banner}");
+        assert_eq!(view.read(cx).model.tool, WorkTool::Table);
     });
     let _ = std::fs::remove_dir_all(&dir);
 }

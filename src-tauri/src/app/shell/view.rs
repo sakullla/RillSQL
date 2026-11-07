@@ -10,8 +10,11 @@ use gpui_kit::{
     px,
 };
 
+use crate::app::views::admin::AdminPane;
 use crate::app::views::connections::{blank_draft, engines};
+use crate::app::views::grid::{GridPane, GridTarget};
 use crate::app::views::query::{QueryPane, SyncEffect, TabSnap};
+use crate::app::views::structure::StructurePane;
 use crate::app::{AppPage, Effect, FocusTarget};
 use crate::connections::model::Engine;
 use crate::state::Platform;
@@ -20,13 +23,17 @@ use crate::ui::Foundation;
 
 use super::jobs::{self, apply_done, job_request};
 use super::menus::NavKey;
-use super::model::{DraftField, PendingJob, WorkbenchModel};
+use super::model::{DraftField, PendingJob, WorkTool, WorkbenchModel};
 use crate::app::Shell;
 
 pub struct Workbench {
     pub model: WorkbenchModel,
     foundation: Entity<Foundation>,
     query: Entity<QueryPane>,
+    table: Entity<GridPane>,
+    structure: Entity<StructurePane>,
+    admin: Entity<AdminPane>,
+    applied_tool: Option<String>,
     services: Arc<AppServices>,
     focus: FocusHandle,
     field_focus: FocusHandle,
@@ -49,6 +56,9 @@ impl Workbench {
     pub fn with_services(window: &mut Window, cx: &mut Context<Self>, services: Arc<AppServices>, boot: bool) -> Self {
         let foundation = cx.new(|cx| Foundation::new(window, cx));
         let query = cx.new(|cx| QueryPane::new(Arc::clone(&services), window, cx));
+        let table = cx.new(|cx| GridPane::new(Arc::clone(&services), window, cx));
+        let structure = cx.new(|_| StructurePane::new(Arc::clone(&services)));
+        let admin = cx.new(|_| AdminPane::new(Arc::clone(&services)));
         let mut model = WorkbenchModel::new(Shell::default());
         let _ = model.shell.set_prefers_dark(matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark));
         let shell = model.shell.clone();
@@ -60,6 +70,10 @@ impl Workbench {
             model,
             foundation,
             query,
+            table,
+            structure,
+            admin,
+            applied_tool: None,
             services,
             focus: cx.focus_handle(),
             field_focus: cx.focus_handle(),
@@ -205,6 +219,72 @@ impl Workbench {
         for tab in &mut self.model.tabs {
             tab.running = effect.running.iter().any(|id| id == &tab.id);
         }
+    }
+
+    fn sync_grid_flags(&mut self, cx: &mut Context<Self>) {
+        let dirty = self.table.read(cx).uncommitted() || self.query.read(cx).grid_uncommitted(cx);
+        let writable = self.table.read(cx).writable() || self.query.read(cx).grid_writable(cx);
+        self.model.grid_dirty = dirty;
+        self.model.grid_writable = writable;
+        if dirty {
+            if let Some(id) = self.model.active_tab.clone() {
+                if let Some(tab) = self.model.tabs.iter_mut().find(|tab| tab.id == id) {
+                    tab.uncommitted_cells = true;
+                }
+            }
+        } else {
+            for tab in &mut self.model.tabs {
+                tab.uncommitted_cells = false;
+            }
+        }
+    }
+
+    fn ensure_tool(&mut self, cx: &mut Context<Self>) {
+        let spec = self.model.table_spec.clone().unwrap_or_default();
+        let key = format!("{:?}:{spec}", self.model.tool);
+        if self.applied_tool.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        self.applied_tool = Some(key);
+        let Some(target) = parse_target(&spec) else {
+            return;
+        };
+        let locale = self.model.locale();
+        match self.model.tool {
+            WorkTool::Table => self.table.update(cx, |pane, cx| {
+                pane.set_locale(locale);
+                pane.open_table(target, 100, cx);
+            }),
+            WorkTool::Structure => self.structure.update(cx, |pane, _| {
+                pane.set_locale(locale);
+                pane.bind(target);
+            }),
+            WorkTool::Admin => self.admin.update(cx, |pane, _| {
+                pane.set_locale(locale);
+                pane.bind(target);
+            }),
+            WorkTool::Query => {}
+        }
+    }
+
+    #[cfg(test)]
+    pub fn structure_banner(&self, cx: &App) -> String {
+        self.structure.read(cx).session.banner()
+    }
+
+    #[cfg(test)]
+    pub fn admin_banner(&self, cx: &App) -> String {
+        self.admin.read(cx).session.banner()
+    }
+
+    #[cfg(test)]
+    pub fn table_banner(&self, cx: &App) -> String {
+        self.table.read(cx).banner()
+    }
+
+    #[cfg(test)]
+    pub fn mark_table_dirty(&mut self, cx: &mut Context<Self>) {
+        self.table.update(cx, |pane, _| pane.stage_sample_edit());
     }
 
     #[cfg(test)]
@@ -571,12 +651,15 @@ impl Render for Workbench {
         self.boot_state(cx);
         self.pump_jobs(cx);
         self.sync_query(window, cx);
+        self.ensure_tool(cx);
+        self.sync_grid_flags(cx);
         let frame = self.model.painted();
         let pad = px(frame.pad as f32);
         let entity = cx.entity();
         let focus = self.field_focus.clone();
         let page = self.model.shell.page;
-        let welcome = self.model.show_welcome();
+        let table_view = page == AppPage::Workspace && self.model.tool == WorkTool::Table;
+        let welcome = self.model.show_welcome() && !table_view;
         let palette = self.model.shell.palette_open;
         let help = self.model.shell.help_open;
         let menu_open = self.model.menu.is_some();
@@ -628,7 +711,19 @@ impl Render for Workbench {
                             .when(page == AppPage::History, |this| this.child(history_page(entity.clone(), focus.clone(), &self.model)))
                             .when(page == AppPage::Settings, |this| this.child(settings_page(entity.clone(), &self.model)))
                             .when(welcome, |this| this.child(welcome_page(entity.clone(), &self.model)))
-                            .when(page == AppPage::Workspace && !welcome, |this| {
+                            .when(page == AppPage::Structure && self.model.tool == WorkTool::Admin, |this| this.child(self.admin.clone()))
+                            .when(page == AppPage::Structure && self.model.tool != WorkTool::Admin, |this| this.child(self.structure.clone()))
+                            .when(table_view, |this| {
+                                this.child(
+                                    div()
+                                        .id("table-host")
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .child(self.table.clone()),
+                                )
+                            })
+                            .when(page == AppPage::Workspace && !welcome && !table_view, |this| {
                                 this.child(
                                     div()
                                         .id("editor-host")
@@ -667,6 +762,22 @@ impl Render for Workbench {
             .when(confirm_delete, |this| this.child(delete_layer(entity, &self.model)))
             .p(pad)
     }
+}
+
+fn parse_target(spec: &str) -> Option<GridTarget> {
+    let parts: Vec<&str> = spec.split('|').collect();
+    if parts.len() < 7 || parts[0].is_empty() || parts[4].is_empty() {
+        return None;
+    }
+    Some(GridTarget {
+        connection_id: parts[0].to_owned(),
+        connection_name: parts[1].to_owned(),
+        database: parts[2].to_owned(),
+        schema: parts[3].to_owned(),
+        table: parts[4].to_owned(),
+        engine: parts[5].to_owned(),
+        environment: parts[6].to_owned(),
+    })
 }
 
 fn query_command(id: &str) -> bool {

@@ -1,5 +1,8 @@
+pub mod admin;
 pub mod connections;
+pub mod grid;
 pub mod history;
 pub mod query;
 pub mod settings;
+pub mod structure;
 pub mod welcome;

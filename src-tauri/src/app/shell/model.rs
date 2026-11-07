@@ -18,6 +18,14 @@ use super::close::{draft_pending, evaluate, message_key, update_block_key, Close
 use super::layout::{layout_for, painted_frame, unbreakable_px, ChromeLayout, PaintedFrame};
 use super::menus::{MenuPlace, MenuTarget, NavKey, OpenMenu};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkTool {
+    Query,
+    Table,
+    Structure,
+    Admin,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryTab {
     pub id: String,
@@ -116,7 +124,11 @@ pub struct WorkbenchModel {
     pub bundle_passphrase: String,
     pub import_notes: Vec<String>,
     pub grid_writable: bool,
+    /// 网格暂存不进 app-state.json，但窗口关闭仍要看见它。
+    pub grid_dirty: bool,
     pub startup_warning: Option<String>,
+    pub tool: WorkTool,
+    pub table_spec: Option<String>,
 }
 
 impl WorkbenchModel {
@@ -153,7 +165,10 @@ impl WorkbenchModel {
             bundle_passphrase: String::new(),
             import_notes: Vec::new(),
             grid_writable: false,
+            grid_dirty: false,
             startup_warning: None,
+            tool: WorkTool::Query,
+            table_spec: None,
         }
     }
 
@@ -226,11 +241,25 @@ impl WorkbenchModel {
             }
             "help" | "shortcut-help" => self.menu = None,
             "theme-light" | "theme-dark" | "theme-system" => self.settings.capture_shell(&self.shell),
+            "open-structure" => self.tool = WorkTool::Structure,
             _ => {}
         }
     }
 
     fn local(&mut self, id: &str) -> bool {
+        if let Some(spec) = id.strip_prefix("open-table:") {
+            self.tool = WorkTool::Table;
+            self.shell.page = AppPage::Workspace;
+            self.shell.focus = FocusTarget::Grid;
+            self.table_spec = Some(spec.to_owned());
+            return true;
+        }
+        if let Some(spec) = id.strip_prefix("open-structure-for:") {
+            self.tool = WorkTool::Structure;
+            self.shell.page = AppPage::Structure;
+            self.table_spec = Some(spec.to_owned());
+            return true;
+        }
         if let Some(connection_id) = id.strip_prefix("connection:") {
             self.connections.selected = Some(connection_id.to_owned());
             self.shell.page = AppPage::Connections;
@@ -362,6 +391,10 @@ impl WorkbenchModel {
             "page-size-up" => self.settings.page_size = (self.settings.page_size + 50).clamp(1, 10_000),
             "preview-up" => self.settings.preview_kb = (self.settings.preview_kb + 1).clamp(1, 64),
             "tree-open-data" | "tree-copy-name" | "tree-select-sql" => self.tree_action(id),
+            "open-admin" => {
+                self.tool = WorkTool::Admin;
+                self.shell.page = AppPage::Structure;
+            }
             "grid-copy-row" | "grid-copy-column" | "grid-filter-value" => {
                 self.copied = id.to_owned();
                 self.shell.focus = FocusTarget::Grid;
@@ -642,7 +675,7 @@ impl WorkbenchModel {
 
     pub fn facts(&self) -> CloseFacts {
         let running = self.running_jobs > 0 || self.tabs.iter().any(|tab| tab.running);
-        let uncommitted = self.tabs.iter().any(|tab| tab.uncommitted_cells);
+        let uncommitted = self.grid_dirty || self.tabs.iter().any(|tab| tab.uncommitted_cells);
         let draft = self.tabs.iter().any(|tab| draft_pending(&tab.kind, &tab.draft, tab.last_executed_sql.as_deref()));
         CloseFacts { running, uncommitted, draft }
     }
