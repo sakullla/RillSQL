@@ -1253,14 +1253,9 @@ mod tests {
             view.update(cx, |view, cx| view.perform("refresh-tree", cx));
         })
         .unwrap();
-        let mut saw_item = false;
-        for _ in 0..40 {
-            cx.run_until_parked();
-            saw_item = cx.update(|cx| view.read(cx).query_has_object("item", cx));
-            if saw_item {
-                break;
-            }
-        }
+        let saw_item = wait_for_tokio(cx, window, std::time::Duration::from_secs(30), |cx| {
+            cx.update(|cx| view.read(cx).query_has_object("item", cx))
+        });
         assert!(saw_item, "对象树没有列出 item：{}", cx.update(|cx| view.read(cx).query_note(cx)));
         cx.update_window(window, |_, window, cx| {
             view.update(cx, |view, cx| view.perform("object:notes:item", cx));
@@ -1277,17 +1272,10 @@ mod tests {
             });
         })
         .unwrap();
-        let mut landed = false;
-        let mut note = String::new();
-        for _ in 0..50 {
-            cx.run_until_parked();
-            cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
-            landed = cx.update(|cx| view.read(cx).query_cell(0, 1, cx) == "真实");
-            note = cx.update(|cx| view.read(cx).query_note(cx));
-            if landed {
-                break;
-            }
-        }
+        let landed = wait_for_tokio(cx, window, std::time::Duration::from_secs(30), |cx| {
+            cx.update(|cx| view.read(cx).query_cell(0, 1, cx) == "真实")
+        });
+        let note = cx.update(|cx| view.read(cx).query_note(cx));
         assert!(landed, "真实 SELECT 没有回到结果表：{note}");
         let runs = cx.update(|cx| view.read(cx).query_runs(cx));
         cx.update_window(window, |_, window, cx| {
@@ -1301,6 +1289,28 @@ mod tests {
         })
         .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 目录和查询结果在 tokio 上完成，再从工作线程排回这个测试调度器。
+    /// 固定次数的 `run_until_parked` 会在队列仍空时返回。
+    fn wait_for_tokio(
+        cx: &mut TestAppContext,
+        window: gpui_kit::AnyWindowHandle,
+        timeout: std::time::Duration,
+        mut ready: impl FnMut(&mut TestAppContext) -> bool,
+    ) -> bool {
+        let started = std::time::Instant::now();
+        loop {
+            cx.run_until_parked();
+            cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+            if ready(cx) {
+                return true;
+            }
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::park_timeout(std::time::Duration::from_millis(25));
+        }
     }
 
     fn bound(id: &str, draft: &str) -> TabSnap {

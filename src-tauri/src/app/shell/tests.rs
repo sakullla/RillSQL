@@ -616,6 +616,8 @@ fn open_workbench(cx: &mut gpui_kit::TestAppContext, services: Arc<AppServices>,
 
 #[gpui_kit::test]
 fn boot_refreshes_finish_and_close_is_not_blocked(cx: &mut gpui_kit::TestAppContext) {
+    // 启动刷新在 tokio 上完成，工作线程会唤醒本调度器。不放行这次停车会被记成非确定性。
+    cx.executor().allow_parking();
     let dir = std::env::temp_dir().join(format!("rillsql-shell-boot-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -652,8 +654,9 @@ fn boot_refreshes_finish_and_close_is_not_blocked(cx: &mut gpui_kit::TestAppCont
     });
     rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
     let (window, view) = open_workbench(cx, Arc::clone(&services), true);
+    let started = std::time::Instant::now();
     let mut ready = false;
-    for _ in 0..12 {
+    while started.elapsed() < std::time::Duration::from_secs(30) {
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
         })
@@ -666,6 +669,7 @@ fn boot_refreshes_finish_and_close_is_not_blocked(cx: &mut gpui_kit::TestAppCont
         if ready {
             break;
         }
+        std::thread::park_timeout(std::time::Duration::from_millis(25));
     }
     assert!(ready, "boot refreshes did not both finish");
     cx.update(|cx| {
