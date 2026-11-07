@@ -27,6 +27,7 @@ pub struct Target {
     pub database: String,
     pub engine: String,
     pub schema: String,
+    pub environment: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +77,7 @@ pub struct OpenLink {
     pub name: String,
     pub engine: String,
     pub databases: Vec<String>,
+    pub environment: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +102,7 @@ pub struct Desk {
     columns: HashMap<String, Vec<String>>,
     databases: Vec<String>,
     links: Vec<OpenLink>,
+    environments: HashMap<String, String>,
     executions: u32,
     loads: u32,
     view_gen: u64,
@@ -117,6 +120,7 @@ impl Desk {
             columns: HashMap::new(),
             databases: Vec::new(),
             links: Vec::new(),
+            environments: HashMap::new(),
             executions: 0,
             loads: 0,
             view_gen: 0,
@@ -296,6 +300,7 @@ impl Desk {
     }
 
     pub fn open_database(&mut self, connection_id: &str, connection_name: &str, engine: &str, database: &str) -> String {
+        let environment = self.environment_of(connection_id);
         self.push(
             String::new(),
             Some(Target {
@@ -304,6 +309,7 @@ impl Desk {
                 database: database.to_owned(),
                 engine: engine.to_owned(),
                 schema: String::new(),
+                environment,
             }),
             false,
         )
@@ -311,6 +317,7 @@ impl Desk {
 
     pub fn open_object(&mut self, object: &TreeObject) -> String {
         let sql = assist::browse_sql(&object.engine, &object.schema, &object.name);
+        let environment = self.environment_of(&object.connection_id);
         self.push(
             sql,
             Some(Target {
@@ -319,6 +326,7 @@ impl Desk {
                 database: object.database.clone(),
                 engine: object.engine.clone(),
                 schema: object.schema.clone(),
+                environment,
             }),
             false,
         )
@@ -360,7 +368,29 @@ impl Desk {
     }
 
     pub fn set_links(&mut self, links: Vec<OpenLink>) {
+        for link in &links {
+            if !link.environment.is_empty() {
+                self.environments.insert(link.id.clone(), link.environment.clone());
+            }
+        }
         self.links = links;
+    }
+
+    pub fn remember_environments(&mut self, pairs: impl IntoIterator<Item = (String, String)>) {
+        for (id, environment) in pairs {
+            if !id.is_empty() && !environment.is_empty() {
+                self.environments.insert(id, environment);
+            }
+        }
+    }
+
+    pub fn environment_of(&self, connection_id: &str) -> String {
+        if let Some(link) = self.links.iter().find(|link| link.id == connection_id) {
+            if !link.environment.is_empty() {
+                return link.environment.clone();
+            }
+        }
+        self.environments.get(connection_id).cloned().filter(|value| !value.is_empty()).unwrap_or_else(|| "none".to_owned())
     }
 
     pub fn links(&self) -> &[OpenLink] {
@@ -486,6 +516,7 @@ impl Desk {
     }
 
     fn bind_link(&mut self, link: &OpenLink, database: &str) -> bool {
+        let environment = if link.environment.is_empty() { self.environment_of(&link.id) } else { link.environment.clone() };
         let Some(tab) = self.active_mut() else {
             return false;
         };
@@ -495,6 +526,7 @@ impl Desk {
             database: database.to_owned(),
             engine: link.engine.clone(),
             schema: String::new(),
+            environment,
         });
         self.remember_database(database);
         true
@@ -1089,6 +1121,7 @@ pub async fn load_tree(service: &Arc<Service>) -> Result<TreeLoad, String> {
             name: record.saved.name.clone(),
             engine,
             databases: db_names,
+            environment: record.saved.env.clone(),
         });
     }
     Ok(TreeLoad { objects, databases, columns, links, failures })
@@ -1458,12 +1491,14 @@ mod tests {
             name: "笔记".to_owned(),
             engine: "sqlite".to_owned(),
             databases: vec!["main".to_owned()],
+            environment: "dev".to_owned(),
         }]);
         assert!(desk.select_database("main"));
         let target = desk.target().expect("bound");
         assert_eq!(target.connection_id, "notes");
         assert_eq!(target.database, "main");
         assert_eq!(target.engine, "sqlite");
+        assert_eq!(target.environment, "dev");
         desk.set_draft("SELECT 1");
         match desk.begin_run(&tasks, RunScope::Script, None) {
             BeginRun::Ready(prepared) => {

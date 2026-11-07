@@ -48,9 +48,47 @@ pub enum AdminOp {
     AlterSequence { sequence: String, increment: Option<i64> },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminInventory {
+    pub connected: bool,
+    pub probed: bool,
+    pub source: String,
+    pub sequences: Vec<String>,
+    pub events: Vec<String>,
+    pub extensions: Vec<String>,
+    pub partitions: Vec<String>,
+    pub attached: Vec<String>,
+}
+
+impl AdminInventory {
+    pub fn offline(target: &GridTarget) -> Self {
+        Self {
+            connected: false,
+            probed: false,
+            source: format!("{} · {} · {}", target.engine, target.database, i18n::text(Locale::ZhCn, "admin.preview.unconnected")),
+            sequences: Vec::new(),
+            events: Vec::new(),
+            extensions: Vec::new(),
+            partitions: Vec::new(),
+            attached: Vec::new(),
+        }
+    }
+}
+
 pub struct AdminSession {
     pub target: GridTarget,
     pub operation: AdminOp,
+    pub reindex_target: String,
+    pub attach_path: String,
+    pub attach_name: String,
+    pub foreign_keys: bool,
+    pub pragma_name: String,
+    pub pragma_value: String,
+    pub sequence_name: String,
+    pub sequence_step: String,
+    pub event_name: String,
+    pub event_enabled: bool,
+    pub inventory: AdminInventory,
     preview: Option<Plan>,
     live: bool,
     open: bool,
@@ -60,15 +98,45 @@ pub struct AdminSession {
 
 impl AdminSession {
     pub fn new(target: GridTarget) -> Self {
+        let inventory = AdminInventory::offline(&target);
         Self {
             target,
             operation: AdminOp::Vacuum,
+            reindex_target: String::new(),
+            attach_path: String::new(),
+            attach_name: String::new(),
+            foreign_keys: true,
+            pragma_name: "user_version".to_owned(),
+            pragma_value: String::new(),
+            sequence_name: String::new(),
+            sequence_step: String::new(),
+            event_name: String::new(),
+            event_enabled: false,
+            inventory,
             preview: None,
             live: false,
             open: false,
             locale: Locale::ZhCn,
             note: String::new(),
         }
+    }
+
+    pub fn apply_draft(&mut self, kind: &str) {
+        let fallback = self.operation.clone();
+        self.operation = match kind {
+            "vacuum" => AdminOp::Vacuum,
+            "reindex" => AdminOp::Reindex { target: if self.reindex_target.is_empty() { None } else { Some(self.reindex_target.clone()) } },
+            "foreign" => AdminOp::SetForeignKeys { enabled: self.foreign_keys },
+            "pragma" => AdminOp::SetPragma { pragma: self.pragma_name.clone(), value: self.pragma_value.clone() },
+            "attach" => AdminOp::Attach { path: self.attach_path.clone(), name: self.attach_name.clone() },
+            "sequence" => AdminOp::AlterSequence {
+                sequence: self.sequence_name.clone(),
+                increment: self.sequence_step.parse().ok(),
+            },
+            "event" => AdminOp::SetEvent { event: self.event_name.clone(), enabled: self.event_enabled },
+            _ => fallback,
+        };
+        self.cancel();
     }
 
     pub fn sections(&self) -> AdminSections {
@@ -155,7 +223,61 @@ impl AdminPane {
     }
 
     pub fn bind(&mut self, target: GridTarget) {
+        self.session.inventory = AdminInventory::offline(&target);
         self.session.target = target;
+    }
+
+    pub fn type_into(&mut self, field: &str, text: &str) {
+        let slot = match field {
+            "reindex" => &mut self.session.reindex_target,
+            "attach_path" => &mut self.session.attach_path,
+            "attach_name" => &mut self.session.attach_name,
+            "pragma_value" => &mut self.session.pragma_value,
+            "sequence" => &mut self.session.sequence_name,
+            "sequence_step" => &mut self.session.sequence_step,
+            "event" => &mut self.session.event_name,
+            _ => return,
+        };
+        if text == "backspace" {
+            slot.pop();
+        } else {
+            slot.push_str(text);
+        }
+        self.session.cancel();
+    }
+
+    pub fn choose(&mut self, kind: &str) {
+        if kind == "foreign" {
+            self.session.foreign_keys = !self.session.foreign_keys;
+        }
+        self.session.apply_draft(kind);
+    }
+
+    pub fn refresh_inventory(&mut self, cx: &mut Context<Self>) {
+        let services = Arc::clone(&self.services);
+        let target = self.session.target.clone();
+        let view = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            crate::app::views::grid::runtime_for_views().spawn(async move {
+                let inventory = read_inventory(&services.connections, &target).await;
+                let _ = tx.send(inventory);
+            });
+            if let Ok(inventory) = rx.await {
+                let _ = cx.update(|cx| {
+                    if let Some(view) = view.upgrade() {
+                        view.update(cx, |this, cx| {
+                            this.session.inventory = inventory;
+                            if !this.session.inventory.connected {
+                                this.session.note = this.session.inventory.source.clone();
+                            }
+                            cx.notify();
+                        });
+                    }
+                });
+            }
+        })
+        .detach();
     }
 
     pub fn set_locale(&mut self, locale: Locale) {
@@ -253,44 +375,74 @@ impl AdminSections {
 
 impl Render for AdminPane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.session.inventory.probed && !self.session.target.connection_id.is_empty() {
+            self.session.inventory.probed = true;
+            self.refresh_inventory(cx);
+        }
         let locale = self.session.locale;
         let sections = self.session.sections();
         let entity = cx.entity();
+        let inventory = self.session.inventory.clone();
         let mut column = div()
             .id("admin-pane")
             .flex()
             .flex_col()
             .gap(px(4.))
-            .child(div().id("admin-banner").child(SharedString::from(self.session.banner())));
+            .child(div().id("admin-banner").child(SharedString::from(self.session.banner())))
+            .child(div().id("admin-source").child(SharedString::from(inventory.source.clone())));
         if sections.maintenance {
-            column = column.child(op_button("admin-vacuum", "admin.action.vacuum", AdminOp::Vacuum, entity.clone(), locale));
+            column = column
+                .child(kind_button("admin-vacuum", "admin.action.vacuum", "vacuum", entity.clone(), locale))
+                .child(admin_box("reindex", "admin.action.reindex", &self.session.reindex_target, entity.clone(), locale))
+                .child(kind_button("admin-reindex", "admin.action.reindex", "reindex", entity.clone(), locale));
         }
         if sections.pragma {
-            column = column.child(op_button(
-                "admin-pragma",
-                "admin.action.pragma",
-                AdminOp::SetPragma { pragma: "user_version".into(), value: "7".into() },
-                entity.clone(),
-                locale,
-            ));
+            column = column
+                .child(admin_box("pragma_value", "admin.action.pragma", &self.session.pragma_value, entity.clone(), locale))
+                .child(kind_button("admin-pragma", "admin.action.pragma", "pragma", entity.clone(), locale))
+                .child(kind_button("admin-foreign", "admin.action.foreignKeys", "foreign", entity.clone(), locale));
+        }
+        if sections.attached {
+            column = column
+                .child(admin_box("attach_path", "admin.action.attach", &self.session.attach_path, entity.clone(), locale))
+                .child(admin_box("attach_name", "admin.action.attach", &self.session.attach_name, entity.clone(), locale))
+                .child(kind_button("admin-attach", "admin.action.attach", "attach", entity.clone(), locale));
+            for name in &inventory.attached {
+                column = column.child(SharedString::from(format!("attached {name}")));
+            }
         }
         if sections.sequences {
-            column = column.child(op_button(
-                "admin-sequence",
-                "admin.action.sequence",
-                AdminOp::AlterSequence { sequence: "ids".into(), increment: Some(2) },
-                entity.clone(),
-                locale,
-            ));
+            column = column
+                .child(admin_box("sequence", "admin.action.sequence", &self.session.sequence_name, entity.clone(), locale))
+                .child(admin_box("sequence_step", "admin.action.sequence", &self.session.sequence_step, entity.clone(), locale))
+                .child(kind_button("admin-sequence", "admin.action.sequence", "sequence", entity.clone(), locale));
+            for name in &inventory.sequences {
+                column = column.child(SharedString::from(format!("sequence {name}")));
+            }
         }
         if sections.events {
-            column = column.child(op_button(
-                "admin-event",
-                "admin.action.event",
-                AdminOp::SetEvent { event: "sweep".into(), enabled: false },
-                entity.clone(),
-                locale,
-            ));
+            column = column
+                .child(admin_box("event", "admin.action.event", &self.session.event_name, entity.clone(), locale))
+                .child(kind_button("admin-event", "admin.action.event", "event", entity.clone(), locale));
+            for name in &inventory.events {
+                column = column.child(SharedString::from(format!("event {name}")));
+            }
+        }
+        if sections.extensions {
+            if inventory.extensions.is_empty() {
+                column = column.child(SharedString::from(format!("extensions {}", inventory.source)));
+            }
+            for name in &inventory.extensions {
+                column = column.child(SharedString::from(format!("extension {name}")));
+            }
+        }
+        if sections.partitions {
+            if inventory.partitions.is_empty() {
+                column = column.child(SharedString::from(format!("partitions {}", inventory.source)));
+            }
+            for name in &inventory.partitions {
+                column = column.child(SharedString::from(format!("partition {name}")));
+            }
         }
         if !sections.pragma && !sections.maintenance && !sections.sequences && !sections.events && !sections.extensions && !sections.partitions && !sections.attached {
             column = column.child(SharedString::from(i18n::text(locale, "admin.section.none")));
@@ -316,7 +468,7 @@ impl Render for AdminPane {
     }
 }
 
-fn op_button(id: &'static str, key: &'static str, operation: AdminOp, entity: Entity<AdminPane>, locale: Locale) -> impl IntoElement {
+fn kind_button(id: &'static str, key: &'static str, kind: &'static str, entity: Entity<AdminPane>, locale: Locale) -> impl IntoElement {
     let label = SharedString::from(i18n::text(locale, key));
     div()
         .id(id)
@@ -324,13 +476,72 @@ fn op_button(id: &'static str, key: &'static str, operation: AdminOp, entity: En
         .aria_label(label.clone())
         .child(label)
         .on_click(move |_, _, cx| {
-            let operation = operation.clone();
             entity.update(cx, |pane, cx| {
-                pane.session.operation = operation;
-                pane.session.cancel();
+                pane.choose(kind);
                 cx.notify();
             });
         })
+}
+
+fn admin_box(field: &'static str, key: &'static str, value: &str, entity: Entity<AdminPane>, locale: Locale) -> impl IntoElement {
+    let label = SharedString::from(format!("{} {}", i18n::text(locale, key), value));
+    div()
+        .id(SharedString::from(format!("admin-field-{field}")))
+        .role(gpui_kit::Role::TextInput)
+        .aria_label(label.clone())
+        .child(label)
+        .on_key_down(move |event: &gpui_kit::KeyDownEvent, _, cx| {
+            let Some(text) = admin_typed(event) else { return };
+            entity.update(cx, |pane, cx| {
+                pane.type_into(field, &text);
+                cx.notify();
+            });
+        })
+}
+
+fn admin_typed(event: &gpui_kit::KeyDownEvent) -> Option<String> {
+    if event.keystroke.modifiers.control || event.keystroke.modifiers.platform || event.keystroke.modifiers.alt {
+        return None;
+    }
+    match event.keystroke.key.as_str() {
+        "backspace" => Some("backspace".into()),
+        "escape" | "enter" | "tab" | "up" | "down" | "left" | "right" => None,
+        _ => event.keystroke.key_char.clone().filter(|text| !text.is_empty()),
+    }
+}
+
+async fn read_inventory(service: &crate::connections::Service, target: &GridTarget) -> AdminInventory {
+    let Some(session) = service.catalog_session(&target.connection_id) else {
+        let mut inventory = AdminInventory::offline(target);
+        inventory.probed = true;
+        return inventory;
+    };
+    match session {
+        crate::connections::CatalogSession::Sqlite { pool, .. } => {
+            let listed: Result<Vec<(i64, String, String)>, sqlx::Error> = sqlx::query_as("PRAGMA database_list").fetch_all(&pool).await;
+            let attached = listed.map(|rows| rows.into_iter().map(|(_, name, _)| name).collect()).unwrap_or_default();
+            AdminInventory {
+                connected: true,
+                probed: true,
+                source: format!("sqlite · {}", target.database),
+                sequences: Vec::new(),
+                events: Vec::new(),
+                extensions: Vec::new(),
+                partitions: Vec::new(),
+                attached,
+            }
+        }
+        _ => AdminInventory {
+            connected: false,
+            probed: true,
+            source: format!("{} · {} · 目录会话没有列出序列或事件，拒绝把夹具当成已连接", target.engine, target.database),
+            sequences: Vec::new(),
+            events: Vec::new(),
+            extensions: Vec::new(),
+            partitions: Vec::new(),
+            attached: Vec::new(),
+        },
+    }
 }
 
 fn plain_button(id: &'static str, key: &'static str, entity: Entity<AdminPane>, locale: Locale) -> impl IntoElement {
@@ -396,6 +607,75 @@ mod tests {
             assert!(sql.contains("EVENT") && sql.contains("DISABLE"), "{engine} {sql}");
             assert!(session.confirm_sql().is_err(), "{engine}");
         }
+    }
+
+    #[test]
+    fn admin_inputs_preview_the_requested_operation_and_unconnected_sources_refuse() {
+        let dir = std::env::temp_dir().join(format!("rillsql-admin-draft-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        let mut pane = AdminPane::new(services);
+        pane.bind(target("postgres"));
+        assert!(!pane.session.inventory.connected);
+        assert!(pane.session.inventory.source.contains("postgres"), "{}", pane.session.inventory.source);
+        pane.type_into("reindex", "orders");
+        pane.choose("reindex");
+        match &pane.session.operation {
+            AdminOp::Reindex { target } => assert_eq!(target.as_deref(), Some("orders")),
+            other => panic!("{other:?}"),
+        }
+        pane.type_into("attach_path", "/tmp/other.sqlite");
+        pane.type_into("attach_name", "other");
+        pane.choose("attach");
+        assert!(matches!(pane.session.operation, AdminOp::Attach { .. }));
+        pane.choose("foreign");
+        assert!(matches!(pane.session.operation, AdminOp::SetForeignKeys { enabled: false }));
+        let mut snapshot = Snapshot::bare(DdlEngine::Postgres, "app", "public", "orders");
+        pane.session.operation = AdminOp::Reindex { target: Some("orders".into()) };
+        pane.session.arm_fixture(&snapshot);
+        assert!(pane.session.confirm_sql().unwrap_err().contains("没有连接"));
+        snapshot.name = "orders".into();
+        pane.session.inventory.sequences.clear();
+        assert!(pane.session.inventory.sequences.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sqlite_inventory_reads_attached_databases_and_remote_engines_stay_offline() {
+        let dir = std::env::temp_dir().join(format!("rillsql-admin-inventory-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("notes.sqlite");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+            .await
+            .unwrap();
+        pool.close().await;
+        let service = std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")));
+        service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+        let inventory = read_inventory(
+            &service,
+            &GridTarget {
+                connection_id: "notes".into(),
+                connection_name: "笔记".into(),
+                database: "main".into(),
+                schema: String::new(),
+                table: "customers".into(),
+                engine: "sqlite".into(),
+                environment: "dev".into(),
+            },
+        )
+        .await;
+        assert!(inventory.connected);
+        assert!(inventory.attached.iter().any(|name| name == "main"), "{:?}", inventory.attached);
+        let mut remote_target = target("postgres");
+        remote_target.connection_id = "missing-postgres".into();
+        let remote = read_inventory(&service, &remote_target).await;
+        assert!(!remote.connected);
+        assert!(remote.source.contains("postgres"), "{}", remote.source);
+        assert!(remote.sequences.is_empty());
+        assert!(remote.events.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

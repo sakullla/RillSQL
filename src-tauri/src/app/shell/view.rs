@@ -140,6 +140,20 @@ impl Workbench {
             cx.notify();
             return;
         }
+        if grid_surface_command(id) {
+            if self.model.close_prompt.is_some() {
+                let _ = self.model.dispatch(id);
+                cx.notify();
+                return;
+            }
+            let _ = self.model.dispatch(id);
+            if let Some(text) = self.route_shared_grid(id, cx) {
+                self.model.copied = text;
+            }
+            self.persist_if_needed();
+            cx.notify();
+            return;
+        }
         let Some(effect) = self.model.dispatch(id) else {
             if query_command(id) {
                 self.forward_query(id, cx);
@@ -159,6 +173,28 @@ impl Workbench {
         }
         self.persist_if_needed();
         cx.notify();
+    }
+
+    fn route_shared_grid(&mut self, id: &str, cx: &mut Context<Self>) -> Option<String> {
+        let table = self.model.shell.page == crate::app::AppPage::Workspace && self.model.tool == WorkTool::Table;
+        if table {
+            self.table.update(cx, |pane, cx| pane.command(id, cx))
+        } else if self.model.shell.page == crate::app::AppPage::Workspace {
+            self.query.update(cx, |pane, cx| pane.grid_command(id, cx))
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    pub fn plant_object_tree(&mut self, cx: &mut Context<Self>) {
+        self.query.update(cx, |pane, _| pane.plant_customers());
+    }
+
+    #[cfg(test)]
+    pub fn table_preview(&self, cx: &App) -> (bool, String) {
+        let pane = self.table.read(cx);
+        (pane.preview_open(), pane.preview_text())
     }
 
     fn query_snaps(&self) -> Vec<TabSnap> {
@@ -195,7 +231,15 @@ impl Workbench {
         let active = self.model.active_tab.clone();
         let locale = self.model.locale();
         let timeout = self.model.settings.query_timeout_sec;
+        let environments = self
+            .model
+            .connections
+            .rows
+            .iter()
+            .map(|row| (row.saved.id.clone(), row.saved.env.clone()))
+            .collect::<Vec<_>>();
         let effect = self.query.update(cx, |pane, cx| {
+            pane.remember_environments(environments);
             pane.set_query_timeout_sec(timeout);
             let effect = pane.prepare(&snaps, active.as_deref(), locale, cx);
             pane.ensure_editors(window, cx);
@@ -215,6 +259,9 @@ impl Workbench {
         }
         for target in effect.targets {
             self.model.set_query_target(&target.id, target.connection_id, target.connection_name, target.database, target.engine);
+        }
+        if let Some(spec) = effect.selected_object {
+            self.model.object_spec = Some(spec);
         }
         for tab in &mut self.model.tabs {
             tab.running = effect.running.iter().any(|id| id == &tab.id);
@@ -778,6 +825,29 @@ fn parse_target(spec: &str) -> Option<GridTarget> {
         engine: parts[5].to_owned(),
         environment: parts[6].to_owned(),
     })
+}
+
+fn grid_surface_command(id: &str) -> bool {
+    matches!(
+        id,
+        "edit-cell"
+            | "cancel-edit"
+            | "mark-delete"
+            | "commit"
+            | "copy-region"
+            | "copy-sql-value"
+            | "grid-copy-row"
+            | "grid-copy-column"
+            | "grid-filter-value"
+            | "select-all-cells"
+            | "grid-preview"
+            | "grid-insert"
+            | "grid-search"
+            | "grid-sort"
+            | "grid-filter"
+            | "grid-page-next"
+            | "grid-page-prev"
+    )
 }
 
 fn query_command(id: &str) -> bool {

@@ -48,6 +48,7 @@ pub struct SyncEffect {
     pub running: Vec<String>,
     pub opens: Vec<OpenRequest>,
     pub targets: Vec<TargetRequest>,
+    pub selected_object: Option<String>,
 }
 
 pub struct QueryPane {
@@ -76,6 +77,7 @@ pub struct QueryPane {
     fold_key: Option<(String, String)>,
     fold_wait: Option<(String, String)>,
     painted: Option<(Option<String>, u64, usize)>,
+    selected_object: Option<String>,
 }
 
 impl QueryPane {
@@ -107,7 +109,12 @@ impl QueryPane {
             fold_key: None,
             fold_wait: None,
             painted: None,
+            selected_object: None,
         }
+    }
+
+    pub fn remember_environments(&mut self, pairs: Vec<(String, String)>) {
+        self.desk.remember_environments(pairs);
     }
 
     pub fn set_query_timeout_sec(&mut self, seconds: i64) {
@@ -175,6 +182,38 @@ impl QueryPane {
         self.grid.read(cx).writable()
     }
 
+    pub fn grid_command(&mut self, id: &str, cx: &mut Context<Self>) -> Option<String> {
+        self.grid.update(cx, |grid, cx| grid.command(id, cx))
+    }
+
+    pub fn grid_banner(&self, cx: &App) -> String {
+        self.grid.read(cx).banner()
+    }
+
+    #[cfg(test)]
+    pub fn plant_customers(&mut self) {
+        use crate::query::desk::OpenLink;
+        self.desk.set_links(vec![OpenLink {
+            id: "notes".to_owned(),
+            name: "笔记".to_owned(),
+            engine: "sqlite".to_owned(),
+            databases: vec!["main".to_owned()],
+            environment: "dev".to_owned(),
+        }]);
+        self.desk.set_objects(
+            vec![TreeObject {
+                connection_id: "notes".to_owned(),
+                connection_name: "笔记".to_owned(),
+                engine: "sqlite".to_owned(),
+                database: "main".to_owned(),
+                schema: String::new(),
+                name: "customers".to_owned(),
+                kind: "table".to_owned(),
+            }],
+            vec!["main".to_owned()],
+        );
+    }
+
     pub fn command(&mut self, id: &str, cx: &mut Context<Self>) {
         if let Some(connection) = id.strip_prefix("bind-connection:") {
             self.queue_connection(connection);
@@ -194,6 +233,8 @@ impl QueryPane {
                 .find(|object| format!("{}:{}", object.connection_id, object.name) == rest)
                 .cloned()
             {
+                let spec = object_spec(&object, &self.desk.environment_of(&object.connection_id));
+                self.selected_object = Some(spec);
                 self.queue_object(&object);
             }
             cx.notify();
@@ -306,6 +347,7 @@ impl QueryPane {
             running: self.desk.running_ids(),
             opens: std::mem::take(&mut self.opens),
             targets: std::mem::take(&mut self.targets),
+            selected_object: self.selected_object.take(),
         }
     }
 
@@ -728,6 +770,7 @@ impl QueryPane {
         let Some(target) = self.desk.target() else {
             return GridTarget::default();
         };
+        let environment = if target.environment.is_empty() { self.desk.environment_of(&target.connection_id) } else { target.environment };
         GridTarget {
             connection_id: target.connection_id,
             connection_name: target.connection_name,
@@ -735,7 +778,7 @@ impl QueryPane {
             schema: target.schema,
             table: String::new(),
             engine: target.engine,
-            environment: "none".to_owned(),
+            environment,
         }
     }
 
@@ -1032,6 +1075,8 @@ fn action_button(id: &str, label: SharedString, cx: &mut Context<QueryPane>) -> 
                 }
                 if let Some(rest) = command.strip_prefix("object:") {
                     if let Some(object) = pane.desk.objects().iter().find(|object| format!("{}:{}", object.connection_id, object.name) == rest).cloned() {
+                        let spec = object_spec(&object, &pane.desk.environment_of(&object.connection_id));
+                        pane.selected_object = Some(spec);
                         pane.queue_object(&object);
                         cx.notify();
                     }
@@ -1042,6 +1087,13 @@ fn action_button(id: &str, label: SharedString, cx: &mut Context<QueryPane>) -> 
         })
 }
 
+fn object_spec(object: &TreeObject, environment: &str) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        object.connection_id, object.connection_name, object.database, object.schema, object.name, object.engine, environment
+    )
+}
+
 fn target_of(tab: &TabSnap) -> Option<Target> {
     let connection_id = tab.connection_id.clone()?;
     Some(Target {
@@ -1050,6 +1102,7 @@ fn target_of(tab: &TabSnap) -> Option<Target> {
         database: tab.database.clone().unwrap_or_default(),
         engine: tab.engine.clone().unwrap_or_default(),
         schema: String::new(),
+        environment: String::new(),
     })
 }
 
@@ -1132,6 +1185,32 @@ mod tests {
         .unwrap();
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
+            assert_eq!(pane.read(cx).cell(0, 0, cx), "真实");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn query_result_keeps_the_connection_environment(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            let snap = TabSnap {
+                id: "q".to_owned(),
+                draft: "select 1".to_owned(),
+                connection_id: Some("notes".to_owned()),
+                connection_name: Some("笔记".to_owned()),
+                database: Some("main".to_owned()),
+                engine: Some("sqlite".to_owned()),
+            };
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&snap), Some("q"), Locale::ZhCn, window, cx);
+                pane.remember_environments(vec![("notes".to_owned(), "dev".to_owned())]);
+                pane.show_sheet(vec!["label".to_owned()], vec![vec!["真实".to_owned()]], cx);
+            });
+            window.render_frame(cx);
+            let banner = pane.read(cx).grid_banner(cx);
+            assert!(banner.contains("dev"), "{banner}");
+            assert!(banner.contains("笔记"), "{banner}");
             assert_eq!(pane.read(cx).cell(0, 0, cx), "真实");
         })
         .unwrap();

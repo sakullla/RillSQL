@@ -304,6 +304,20 @@ dict! {
     "admin.action.sequence" => "修改序列", "Alter sequence";
     "admin.action.event" => "启停事件", "Enable or disable event";
     "admin.preview.unconnected" => "没有连接到这个引擎，预览不会执行。", "This engine is not connected, so the preview will not run.";
+    "grid.action.search" => "查找", "Search";
+    "grid.action.sort" => "排序", "Sort";
+    "grid.action.filter" => "筛选", "Filter";
+    "grid.action.pageNext" => "下一页", "Next page";
+    "grid.action.pagePrev" => "上一页", "Previous page";
+    "grid.action.insert" => "插入行", "Insert row";
+    "grid.action.preview" => "预览变更", "Preview changes";
+    "admin.action.reindex" => "重建索引", "Reindex";
+    "admin.action.attach" => "附加数据库", "Attach database";
+    "admin.action.foreignKeys" => "外键开关", "Foreign keys";
+    "structure.field.column" => "字段名", "Column name";
+    "structure.field.type" => "类型", "Type";
+    "structure.field.index" => "索引名", "Index name";
+    "structure.field.view" => "视图 SQL", "View SQL";
 }
 
 #[cfg(test)]

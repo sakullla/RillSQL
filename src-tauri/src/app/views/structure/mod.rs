@@ -77,10 +77,10 @@ impl StructureSession {
     pub fn action(&self) -> Action {
         let table = self.target.table.clone();
         match self.section {
-            Section::Columns => Action::AlterColumns {
-                table,
-                columns: if self.kept_columns.is_empty() {
-                    vec![ColumnDraft {
+            Section::Columns => {
+                let mut columns = self.kept_columns.clone();
+                if !self.column_name.is_empty() && columns.iter().all(|column| column.name != self.column_name) {
+                    columns.push(ColumnDraft {
                         original: None,
                         name: self.column_name.clone(),
                         type_name: self.column_type.clone(),
@@ -89,11 +89,22 @@ impl StructureSession {
                         primary: false,
                         auto: false,
                         dropped: false,
-                    }]
-                } else {
-                    self.kept_columns.clone()
-                },
-            },
+                    });
+                }
+                if columns.is_empty() {
+                    columns.push(ColumnDraft {
+                        original: None,
+                        name: self.column_name.clone(),
+                        type_name: self.column_type.clone(),
+                        nullable: true,
+                        default_sql: String::new(),
+                        primary: false,
+                        auto: false,
+                        dropped: false,
+                    });
+                }
+                Action::AlterColumns { table, columns }
+            }
             Section::Indexes => Action::CreateIndex {
                 table,
                 name: self.index_name.clone(),
@@ -181,6 +192,31 @@ impl StructurePane {
         self.session.locale = locale;
     }
 
+    pub fn type_into(&mut self, field: &str, text: &str) {
+        let slot = match field {
+            "column_name" => &mut self.session.column_name,
+            "column_type" => &mut self.session.column_type,
+            "index_name" => &mut self.session.index_name,
+            "index_column" => &mut self.session.index_column,
+            "fk_name" => &mut self.session.fk_name,
+            "fk_column" => &mut self.session.fk_column,
+            "fk_ref_schema" => &mut self.session.fk_ref_schema,
+            "fk_ref_table" => &mut self.session.fk_ref_table,
+            "fk_ref_column" => &mut self.session.fk_ref_column,
+            "view_sql" => &mut self.session.view_sql,
+            _ => return,
+        };
+        if text == "backspace" {
+            slot.pop();
+        } else if field == "column_type" && slot.as_str() == "TEXT" {
+            slot.clear();
+            slot.push_str(text);
+        } else {
+            slot.push_str(text);
+        }
+        self.session.cancel();
+    }
+
     pub fn preview(&mut self, cx: &mut Context<Self>) {
         let Ok(request) = self.session.request() else {
             self.session.note = i18n::text(self.session.locale, "structure.preview.need");
@@ -250,6 +286,63 @@ impl StructurePane {
     }
 }
 
+impl StructurePane {
+    fn draft_inputs(&self, entity: Entity<Self>, locale: Locale) -> impl IntoElement {
+        let mut row = div().id("structure-draft").flex().gap(px(4.));
+        match self.session.section {
+            Section::Columns => {
+                row = row
+                    .child(draft_box("column_name", "structure.field.column", &self.session.column_name, entity.clone(), locale))
+                    .child(draft_box("column_type", "structure.field.type", &self.session.column_type, entity, locale));
+            }
+            Section::Indexes => {
+                row = row
+                    .child(draft_box("index_name", "structure.field.index", &self.session.index_name, entity.clone(), locale))
+                    .child(draft_box("index_column", "structure.section.columns", &self.session.index_column, entity, locale));
+            }
+            Section::ForeignKeys => {
+                row = row
+                    .child(draft_box("fk_name", "structure.section.foreign", &self.session.fk_name, entity.clone(), locale))
+                    .child(draft_box("fk_column", "structure.field.column", &self.session.fk_column, entity.clone(), locale))
+                    .child(draft_box("fk_ref_table", "structure.section.foreign", &self.session.fk_ref_table, entity.clone(), locale))
+                    .child(draft_box("fk_ref_column", "structure.field.column", &self.session.fk_ref_column, entity, locale));
+            }
+            Section::View => {
+                row = row.child(draft_box("view_sql", "structure.field.view", &self.session.view_sql, entity, locale));
+            }
+            Section::Danger => {}
+        }
+        row
+    }
+}
+
+fn draft_box(field: &'static str, key: &'static str, value: &str, entity: Entity<StructurePane>, locale: Locale) -> impl IntoElement {
+    let label = SharedString::from(format!("{} {}", i18n::text(locale, key), value));
+    div()
+        .id(SharedString::from(format!("structure-field-{field}")))
+        .role(gpui_kit::Role::TextInput)
+        .aria_label(label.clone())
+        .child(label)
+        .on_key_down(move |event: &gpui_kit::KeyDownEvent, _, cx| {
+            let Some(text) = typed_text(event) else { return };
+            entity.update(cx, |pane, cx| {
+                pane.type_into(field, &text);
+                cx.notify();
+            });
+        })
+}
+
+fn typed_text(event: &gpui_kit::KeyDownEvent) -> Option<String> {
+    if event.keystroke.modifiers.control || event.keystroke.modifiers.platform || event.keystroke.modifiers.alt {
+        return None;
+    }
+    match event.keystroke.key.as_str() {
+        "backspace" => Some("backspace".into()),
+        "escape" | "enter" | "tab" | "up" | "down" | "left" | "right" => None,
+        _ => event.keystroke.key_char.clone().filter(|text| !text.is_empty()),
+    }
+}
+
 impl Render for StructurePane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let locale = self.session.locale;
@@ -266,6 +359,7 @@ impl Render for StructurePane {
             .child(section_button(Section::ForeignKeys, "structure.section.foreign", entity.clone(), locale))
             .child(section_button(Section::View, "structure.section.view", entity.clone(), locale))
             .child(section_button(Section::Danger, "structure.section.danger", entity.clone(), locale))
+            .child(self.draft_inputs(entity.clone(), locale))
             .child(action_button("structure-preview", "structure.action.preview", entity.clone(), locale));
         if !self.session.note.is_empty() {
             column = column.child(SharedString::from(self.session.note.clone()));
@@ -404,6 +498,50 @@ mod tests {
         assert!(session.preview_sql().iter().any(|sql| sql.to_ascii_uppercase().contains("DROP")), "{:?}", session.preview_sql());
         session.cancel();
         assert!(session.confirm_sql().is_err());
+    }
+
+    #[test]
+    fn typed_structure_fields_are_the_preview_draft() {
+        let dir = std::env::temp_dir().join(format!("rillsql-structure-draft-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        let mut pane = StructurePane::new(services);
+        pane.bind(target("sqlite", "customers"));
+        pane.type_into("column_name", "nickname");
+        match pane.session.action() {
+            crate::ddl::Action::AlterColumns { columns, .. } => assert_eq!(columns[0].name, "nickname"),
+            other => panic!("{other:?}"),
+        }
+        pane.session.section = Section::Indexes;
+        pane.type_into("index_name", "ix_nick");
+        pane.type_into("index_column", "nickname");
+        match pane.session.action() {
+            crate::ddl::Action::CreateIndex { name, columns, .. } => {
+                assert_eq!(name, "ix_nick");
+                assert_eq!(columns[0].name, "nickname");
+            }
+            other => panic!("{other:?}"),
+        }
+        pane.session.section = Section::ForeignKeys;
+        pane.type_into("fk_name", "fk_parent");
+        pane.type_into("fk_column", "parent_id");
+        pane.type_into("fk_ref_table", "parents");
+        pane.type_into("fk_ref_column", "id");
+        match pane.session.action() {
+            crate::ddl::Action::CreateForeignKey { foreign_key, .. } => {
+                assert_eq!(foreign_key.name, "fk_parent");
+                assert_eq!(foreign_key.columns, vec!["parent_id".to_owned()]);
+                assert_eq!(foreign_key.ref_table, "parents");
+            }
+            other => panic!("{other:?}"),
+        }
+        pane.session.section = Section::View;
+        pane.type_into("view_sql", "select 1");
+        match pane.session.action() {
+            crate::ddl::Action::ReplaceView { definition, .. } => assert_eq!(definition, "select 1"),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

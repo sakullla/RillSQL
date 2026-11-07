@@ -8,7 +8,7 @@ pub use session::{operation_banner, prove_single_table, GridMode, GridTarget, Sh
 
 use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableEvent, TableState};
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    App, AppContext as _, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 
 use crate::application::AppServices;
@@ -23,6 +23,11 @@ pub struct GridPane {
     table: Entity<TableState<SheetDelegate>>,
     locale: Locale,
     scheduled: u64,
+    search_text: String,
+    editing: bool,
+    edit_buffer: String,
+    loading_more: bool,
+    sort_desc: bool,
     _subscription: gpui_kit::Subscription,
 }
 
@@ -36,17 +41,24 @@ impl GridPane {
                 .row_header(true)
         });
         let subscription = cx.subscribe(&table, |this, _, event: &TableEvent, cx| {
-            if let TableEvent::ColumnWidthsChanged(widths) = event {
-                for (index, width) in widths.iter().enumerate() {
-                    if index == 0 {
-                        continue;
-                    }
-                    this.session.set_column_width(index - 1, f32::from(*width));
-                }
-                cx.notify();
-            }
+            this.apply_table_event(event);
+            cx.notify();
         });
-        Self { session: SharedGrid::new(), services, table, locale: Locale::ZhCn, scheduled: 0, _subscription: subscription }
+        let owner = cx.entity().downgrade();
+        table.update(cx, |state, _| state.delegate_mut().owner = Some(owner));
+        Self {
+            session: SharedGrid::new(),
+            services,
+            table,
+            locale: Locale::ZhCn,
+            scheduled: 0,
+            search_text: String::new(),
+            editing: false,
+            edit_buffer: String::new(),
+            loading_more: false,
+            sort_desc: false,
+            _subscription: subscription,
+        }
     }
 
     pub fn set_locale(&mut self, locale: Locale) {
@@ -94,6 +106,10 @@ impl GridPane {
         self.session.preview_open()
     }
 
+    pub fn preview_text(&self) -> String {
+        self.session.preview_sql().join("\n")
+    }
+
     pub fn with_session<R>(&mut self, body: impl FnOnce(&mut SharedGrid) -> R) -> R {
         body(&mut self.session)
     }
@@ -108,47 +124,162 @@ impl GridPane {
 
     pub fn open_table(&mut self, target: GridTarget, limit: u64, cx: &mut Context<Self>) {
         self.session.mode = GridMode::Table;
-        self.session.target = target.clone();
+        self.session.target = target;
         self.session.locale = self.locale;
         self.session.set_page(0, limit);
-        self.session.token = self.session.token.saturating_add(1);
-        let token = self.session.token;
-        self.scheduled = token;
-        let services = Arc::clone(&self.services);
-        let request = self.session.page_request();
-        let offset = request.offset;
-        let view = cx.entity().downgrade();
-        cx.spawn(async move |_, cx| {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            runtime().spawn(async move {
-                let described = crate::application::grid::describe(&services.connections, &request.table).await;
-                let counted = crate::application::grid::count(&services.connections, &count_of(&request)).await;
-                let paged = crate::application::grid::page(&services.connections, &request).await;
-                let _ = tx.send((described, paged, counted));
-            });
-            if let Ok((described, paged, counted)) = rx.await {
-                let _ = cx.update(|cx| {
-                    if let Some(view) = view.upgrade() {
-                        view.update(cx, |this, cx| {
-                            if this.session.token != token {
-                                return;
-                            }
-                            if let (Ok(schema_dto), Ok(page)) = (described, paged) {
-                                if let Ok(schema) = schema_from_dto(&schema_dto) {
-                                    let columns = columns_from_schema(&schema, true);
-                                    let full = counted.ok().map(|item| item.matched);
-                                    let truncated = page.truncated;
-                                    let rows = rows_from_page(&columns, &page);
-                                    this.session.replace_fetched(columns, rows, offset, full, truncated, Some(schema));
-                                    this.sync_table(cx);
-                                }
-                            }
-                        });
-                    }
-                });
+        self.fetch_current(true, cx);
+    }
+
+    pub fn command(&mut self, id: &str, cx: &mut Context<Self>) -> Option<String> {
+        let copied = match id {
+            "edit-cell" => {
+                self.editing = true;
+                self.edit_buffer = self.session.focus_cell().map(|(row, column)| self.session.cell_label(row, column)).unwrap_or_default();
+                if !self.session.focus_cell().is_some() {
+                    self.session.select(0, 0, false);
+                    self.edit_buffer = self.session.focus_cell().map(|(row, column)| self.session.cell_label(row, column)).unwrap_or_default();
+                }
+                None
             }
-        })
-        .detach();
+            "cancel-edit" => {
+                self.editing = false;
+                self.edit_buffer.clear();
+                None
+            }
+            "commit" => {
+                if self.editing {
+                    let value = if self.edit_buffer == "NULL" { None } else { Some(self.edit_buffer.clone()) };
+                    let _ = self.edit_focus(value, cx);
+                    self.editing = false;
+                }
+                if self.session.preview_open() {
+                    self.confirm(cx);
+                } else {
+                    let _ = self.preview(cx);
+                }
+                None
+            }
+            "mark-delete" => {
+                if self.session.focus_cell().is_none() {
+                    self.session.select(0, 0, false);
+                }
+                if let Some((row, _)) = self.session.focus_cell() {
+                    let _ = self.session.stage_delete(row);
+                }
+                None
+            }
+            "copy-region" | "copy-sql-value" => {
+                if !self.session.focus_cell().is_some() {
+                    self.session.select_all_loaded();
+                }
+                Some(self.session.tsv())
+            }
+            "grid-copy-row" => {
+                if self.session.focus_cell().is_none() {
+                    self.session.select(0, 0, false);
+                }
+                Some(self.session.copy_row())
+            }
+            "grid-copy-column" => {
+                if self.session.focus_cell().is_none() {
+                    self.session.select(0, 0, false);
+                }
+                Some(self.session.copy_column())
+            }
+            "grid-filter-value" => {
+                self.session.filter_focused_value();
+                None
+            }
+            "select-all-cells" => {
+                self.session.select_all_loaded();
+                None
+            }
+            "grid-search" => {
+                self.session.set_search(&self.search_text);
+                None
+            }
+            "grid-sort" => {
+                self.sort_desc = !self.sort_desc;
+                if let Some(name) = self.session.column_names().first().cloned() {
+                    self.session.set_sort(&name, self.sort_desc);
+                }
+                None
+            }
+            "grid-filter" => {
+                if let Some(name) = self.session.column_names().get(1).cloned().or_else(|| self.session.column_names().first().cloned()) {
+                    if self.search_text.is_empty() {
+                        self.session.clear_filters();
+                    } else {
+                        self.session.set_filter(&name, "contains", &self.search_text);
+                    }
+                }
+                None
+            }
+            "grid-page-next" => {
+                let limit = self.session.page_limit().max(1);
+                let offset = self.session.page_offset().saturating_add(limit);
+                self.session.set_page(offset, limit);
+                self.fetch_current(true, cx);
+                None
+            }
+            "grid-page-prev" => {
+                let limit = self.session.page_limit().max(1);
+                let offset = self.session.page_offset().saturating_sub(limit);
+                self.session.set_page(offset, limit);
+                self.fetch_current(true, cx);
+                None
+            }
+            "grid-insert" => {
+                let _ = self.session.stage_insert();
+                None
+            }
+            "grid-preview" => {
+                let _ = self.preview(cx);
+                None
+            }
+            _ => None,
+        };
+        if let Some(text) = copied.clone() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        if !matches!(id, "grid-page-next" | "grid-page-prev" | "commit") {
+            self.sync_table(cx);
+        }
+        if let Some((row, _)) = self.session.focus_cell() {
+            self.table.update(cx, |state, cx| state.scroll_to_row(row, cx));
+        }
+        copied
+    }
+
+    fn apply_table_event(&mut self, event: &TableEvent) {
+        match event {
+            TableEvent::ColumnWidthsChanged(widths) => {
+                for (index, width) in widths.iter().enumerate() {
+                    if index == 0 {
+                        continue;
+                    }
+                    self.session.set_column_width(index - 1, f32::from(*width));
+                }
+            }
+            TableEvent::SelectCell(row, col) | TableEvent::RightClickedCell(row, col) => {
+                self.session.select(*row, col.saturating_sub(1), false);
+            }
+            TableEvent::DoubleClickedCell(row, col) => {
+                let column = col.saturating_sub(1);
+                self.session.select(*row, column, false);
+                self.session.open_value(*row, column);
+                self.editing = true;
+                self.edit_buffer = self.session.cell_label(*row, column);
+            }
+            TableEvent::SelectRow(row) | TableEvent::DoubleClickedRow(row) => {
+                self.session.select(*row, 0, false);
+                if matches!(event, TableEvent::DoubleClickedRow(_)) {
+                    self.session.open_value(*row, 0);
+                }
+            }
+            TableEvent::ClearSelection => self.session.clear_selection(),
+            _ => {}
+        }
     }
 
     pub fn edit_focus(&mut self, value: Option<String>, cx: &mut Context<Self>) -> Gate {
@@ -202,6 +333,69 @@ impl GridPane {
         .detach();
     }
 
+    fn fetch_current(&mut self, replace: bool, cx: &mut Context<Self>) {
+        self.fetch_at(self.session.page_offset(), replace, cx);
+    }
+
+    fn fetch_at(&mut self, offset: u64, replace: bool, cx: &mut Context<Self>) {
+        self.session.token = self.session.token.saturating_add(1);
+        let token = self.session.token;
+        self.scheduled = token;
+        let services = Arc::clone(&self.services);
+        let mut request = self.session.page_request();
+        request.offset = offset;
+        let view = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            runtime().spawn(async move {
+                let described = crate::application::grid::describe(&services.connections, &request.table).await;
+                let counted = crate::application::grid::count(&services.connections, &count_of(&request)).await;
+                let paged = crate::application::grid::page(&services.connections, &request).await;
+                let _ = tx.send((described, paged, counted));
+            });
+            if let Ok((described, paged, counted)) = rx.await {
+                let _ = cx.update(|cx| {
+                    if let Some(view) = view.upgrade() {
+                        view.update(cx, |this, cx| {
+                            if this.session.token != token {
+                                this.loading_more = false;
+                                return;
+                            }
+                            if let (Ok(schema_dto), Ok(page)) = (described, paged) {
+                                if let Ok(schema) = schema_from_dto(&schema_dto) {
+                                    let columns = columns_from_schema(&schema, true);
+                                    let full = counted.ok().map(|item| item.matched);
+                                    let truncated = page.truncated;
+                                    let rows = rows_from_page(&columns, &page);
+                                    if replace {
+                                        this.session.replace_fetched(columns, rows, offset, full, truncated, Some(schema));
+                                    } else {
+                                        this.session.append_page(rows, full, truncated);
+                                    }
+                                    this.loading_more = false;
+                                    this.sync_table(cx);
+                                }
+                            } else {
+                                this.loading_more = false;
+                                this.sync_table(cx);
+                            }
+                        });
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn load_next_page(&mut self, cx: &mut Context<Self>) {
+        if self.loading_more || !self.session.has_more_rows() || self.session.mode != GridMode::Table || self.session.target.connection_id.is_empty() {
+            return;
+        }
+        self.loading_more = true;
+        let offset = self.session.page_offset() + self.session.source_len() as u64;
+        self.fetch_at(offset, false, cx);
+    }
+
     fn schedule_locate(&mut self, token: u64, cx: &mut Context<Self>) {
         if self.scheduled == token || self.session.target.connection_id.is_empty() {
             return;
@@ -246,12 +440,15 @@ impl GridPane {
     fn sync_table(&mut self, cx: &mut App) {
         let names = self.session.column_names();
         let widths = self.session.widths();
-        let rows = self.session.rendered_labels();
+        let rows = self.session.sheet_labels();
+        let has_more = self.session.has_more_rows();
         self.table.update(cx, |state, cx| {
             state.delegate_mut().columns = std::iter::once(("#".to_owned(), 56.0, true))
                 .chain(names.into_iter().zip(widths).map(|(name, width)| (name, width, false)))
                 .collect();
             state.delegate_mut().rows = rows;
+            state.delegate_mut().has_more = has_more;
+            state.delegate_mut().loading = false;
             state.refresh(cx);
         });
     }
@@ -284,6 +481,10 @@ fn count_of(request: &PageRequest) -> CountRequest {
 
 impl Render for GridPane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let start = self.table.read(cx).delegate().visible_start;
+        if self.table.read(cx).delegate().visible_seen {
+            self.session.scroll_to(start);
+        }
         let locale = self.locale;
         let range = SharedString::from(self.session.range_text());
         let banner = SharedString::from(self.session.banner());
@@ -295,15 +496,85 @@ impl Render for GridPane {
         let table = self.table.clone();
         let preview = self.session.preview_open();
         let sql = self.session.preview_sql().join("\n");
+        let entity = cx.entity();
+        let search = SharedString::from(if self.search_text.is_empty() { i18n::text(locale, "grid.action.search") } else { self.search_text.clone() });
         let mut column = div()
             .id("shared-grid")
             .flex()
             .flex_col()
             .size_full()
             .gap(px(4.))
+            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                if this.editing {
+                    this.type_edit(event, cx);
+                    return;
+                }
+                let key = event.keystroke.key.as_str();
+                let key = match key {
+                    "arrowup" => "up",
+                    "arrowdown" => "down",
+                    "arrowleft" => "left",
+                    "arrowright" => "right",
+                    other => other,
+                };
+                if matches!(key, "up" | "down" | "left" | "right" | "home" | "end") {
+                    this.session.move_key(key, event.keystroke.modifiers.shift);
+                    this.sync_table(cx);
+                    if let Some((row, _)) = this.session.focus_cell() {
+                        this.table.update(cx, |state, cx| state.scroll_to_row(row, cx));
+                    }
+                } else if key == "enter" {
+                    if let Some((row, column)) = this.session.focus_cell() {
+                        this.session.open_value(row, column);
+                    }
+                    cx.notify();
+                }
+            }))
             .child(div().id("grid-range").child(range).child(" ").child(status))
             .child(div().id("grid-banner").child(banner))
+            .child(
+                div()
+                    .id("grid-tools")
+                    .flex()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .id("grid-search")
+                            .role(gpui_kit::Role::TextInput)
+                            .aria_label(search.clone())
+                            .child(search)
+                            .on_key_down({
+                                let entity = entity.clone();
+                                move |event: &gpui_kit::KeyDownEvent, _, cx| {
+                                    let Some(text) = grid_typed(event) else { return };
+                                    entity.update(cx, |pane, cx| {
+                                        pane.type_search(&text);
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                    .child(tool_button("grid-search", i18n::text(locale, "grid.action.search"), entity.clone()))
+                    .child(tool_button("grid-sort", i18n::text(locale, "grid.action.sort"), entity.clone()))
+                    .child(tool_button("grid-filter", i18n::text(locale, "grid.action.filter"), entity.clone()))
+                    .child(tool_button("grid-page-prev", i18n::text(locale, "grid.action.pagePrev"), entity.clone()))
+                    .child(tool_button("grid-page-next", i18n::text(locale, "grid.action.pageNext"), entity.clone()))
+                    .child(tool_button("copy-region", i18n::text(locale, "grid.value.copyValue"), entity.clone()))
+                    .child(tool_button("grid-insert", i18n::text(locale, "grid.action.insert"), entity.clone()))
+                    .child(tool_button("mark-delete", i18n::text(locale, "grid.menu.markDelete"), entity.clone()))
+                    .child(tool_button("grid-preview", i18n::text(locale, "grid.action.preview"), entity.clone())),
+            )
             .child(DataTable::new(&table).accessibility_label("shared-grid"));
+        if self.editing {
+            let buffer = SharedString::from(self.edit_buffer.clone());
+            column = column.child(
+                div()
+                    .id("grid-edit")
+                    .role(gpui_kit::Role::TextInput)
+                    .aria_label(SharedString::from(i18n::text(locale, "shell.shortcuts.editCell")))
+                    .child(buffer),
+            );
+        }
         if let Some(shown) = self.session.viewer() {
             column = column.child(
                 div()
@@ -330,6 +601,66 @@ impl Render for GridPane {
     }
 }
 
+fn tool_button(id: &'static str, label: String, entity: Entity<GridPane>) -> impl IntoElement {
+    let text = SharedString::from(label);
+    div()
+        .id(id)
+        .role(gpui_kit::Role::Button)
+        .aria_label(text.clone())
+        .child(text)
+        .on_click(move |_, _, cx| {
+            entity.update(cx, |pane, cx| {
+                let _ = pane.command(id, cx);
+            });
+        })
+}
+
+fn grid_typed(event: &gpui_kit::KeyDownEvent) -> Option<String> {
+    if event.keystroke.modifiers.control || event.keystroke.modifiers.platform || event.keystroke.modifiers.alt {
+        return None;
+    }
+    match event.keystroke.key.as_str() {
+        "backspace" => Some("backspace".into()),
+        "escape" | "enter" | "tab" | "up" | "down" | "left" | "right" => None,
+        _ => event.keystroke.key_char.clone().filter(|text| !text.is_empty()),
+    }
+}
+
+impl GridPane {
+    fn type_search(&mut self, text: &str) {
+        if text == "backspace" {
+            self.search_text.pop();
+        } else {
+            self.search_text.push_str(text);
+        }
+    }
+
+    fn type_edit(&mut self, event: &gpui_kit::KeyDownEvent, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "backspace" => {
+                self.edit_buffer.pop();
+            }
+            "escape" => {
+                self.editing = false;
+                self.edit_buffer.clear();
+            }
+            "enter" => {
+                let value = if self.edit_buffer == "NULL" { None } else { Some(self.edit_buffer.clone()) };
+                if let Some((row, column)) = self.session.focus_cell() {
+                    let _ = self.session.stage_text(row, column, value);
+                }
+                self.editing = false;
+            }
+            _ => {
+                if let Some(text) = event.keystroke.key_char.clone().filter(|text| !text.is_empty()) {
+                    self.edit_buffer.push_str(&text);
+                }
+            }
+        }
+        self.sync_table(cx);
+    }
+}
+
 fn grid_button(id: &'static str, label: String, entity: Entity<GridPane>) -> impl IntoElement {
     let text = SharedString::from(label);
     div()
@@ -351,11 +682,16 @@ fn grid_button(id: &'static str, label: String, entity: Entity<GridPane>) -> imp
 struct SheetDelegate {
     columns: Vec<(String, f32, bool)>,
     rows: Vec<Vec<String>>,
+    has_more: bool,
+    loading: bool,
+    visible_start: usize,
+    visible_seen: bool,
+    owner: Option<gpui_kit::WeakEntity<GridPane>>,
 }
 
 impl Default for SheetDelegate {
     fn default() -> Self {
-        Self { columns: Vec::new(), rows: Vec::new() }
+        Self { columns: Vec::new(), rows: Vec::new(), has_more: false, loading: false, visible_start: 0, visible_seen: false, owner: None }
     }
 }
 
@@ -384,6 +720,34 @@ impl TableDelegate for SheetDelegate {
 
     fn cell_label(&self, row_ix: usize, col_ix: usize, _: &App) -> Option<SharedString> {
         self.rows.get(row_ix).and_then(|line| line.get(col_ix)).map(|text| SharedString::from(text.clone()))
+    }
+
+    fn has_more(&self, _: &App) -> bool {
+        self.has_more && !self.loading
+    }
+
+    fn load_more(&mut self, _: &mut Window, cx: &mut Context<TableState<Self>>) {
+        if self.loading || !self.has_more {
+            return;
+        }
+        self.loading = true;
+        let Some(owner) = self.owner.clone() else {
+            self.loading = false;
+            return;
+        };
+        cx.spawn(async move |_, cx| {
+            let _ = cx.update(|cx| {
+                if let Some(owner) = owner.upgrade() {
+                    owner.update(cx, |pane, cx| pane.load_next_page(cx));
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn visible_rows_changed(&mut self, visible_range: std::ops::Range<usize>, _: &mut Window, _: &mut Context<TableState<Self>>) {
+        self.visible_start = visible_range.start;
+        self.visible_seen = true;
     }
 }
 

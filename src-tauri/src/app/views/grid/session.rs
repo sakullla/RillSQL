@@ -58,6 +58,8 @@ pub struct GridRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Overlay {
     row: usize,
+    /// 可视行号会随排序和筛选重排，挂回和预览都用这个稳定 id。
+    row_id: String,
     column: usize,
     value: Option<String>,
     gate: Gate,
@@ -438,6 +440,18 @@ impl SharedGrid {
         self.scroll = 0;
     }
 
+    pub fn page_offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn page_limit(&self) -> u64 {
+        self.limit
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected = false;
+    }
+
     pub fn column_width(&self, index: usize) -> f32 {
         self.columns.get(index).map(|column| column.width).unwrap_or(120.0)
     }
@@ -573,10 +587,11 @@ impl SharedGrid {
 
     pub fn stage_text(&mut self, row: usize, column: usize, value: Option<String>) -> Gate {
         if self.rows.get(row).is_some_and(|item| item.inserted) {
-            let gate = if self.validation_message(column, value.as_deref()).is_some() { Gate::Validation } else { Gate::Writable };
+            let row_id = self.rows[row].id.clone();
+            let message = self.validation_message(column, value.as_deref());
+            let gate = if message.is_some() { Gate::Validation } else { Gate::Writable };
             if gate == Gate::Writable {
-                let id = self.rows[row].id.clone();
-                if let Some(origin) = self.source.iter_mut().find(|item| item.id == id) {
+                if let Some(origin) = self.source.iter_mut().find(|item| item.id == row_id) {
                     if let Some(slot) = origin.values.get_mut(column) {
                         *slot = value.clone();
                     }
@@ -584,6 +599,10 @@ impl SharedGrid {
                 if let Some(slot) = self.rows[row].values.get_mut(column) {
                     *slot = value;
                 }
+                self.overlays.retain(|item| !(item.kind == "update" && item.row_id == row_id && item.column == column));
+            } else {
+                self.overlays.retain(|item| !(item.kind == "update" && item.row_id == row_id && item.column == column));
+                self.overlays.push(overlay(row, row_id, column, value, Gate::Validation, message.unwrap_or_else(|| "grid.status.validation".to_owned()), None, "update"));
             }
             self.close_preview();
             return gate;
@@ -598,8 +617,9 @@ impl SharedGrid {
         };
         self.seq += 1;
         let change_id = if gate == Gate::Writable { Some(format!("u:{}", self.seq)) } else { None };
-        self.overlays.retain(|item| !(item.row == row && item.column == column));
-        self.overlays.push(Overlay { row, column, value, gate, message, change_id, kind: "update" });
+        let row_id = self.rows.get(row).map(|item| item.id.clone()).unwrap_or_default();
+        self.overlays.retain(|item| !(item.kind == "update" && item.row_id == row_id && item.column == column));
+        self.overlays.push(overlay(row, row_id, column, value, gate, message, change_id, "update"));
         self.close_preview();
         gate
     }
@@ -615,15 +635,8 @@ impl SharedGrid {
         self.source.push(GridRow { id: id.clone(), values, located: false, locator: Vec::new(), inserted: true });
         self.recompute();
         let row = self.rows.iter().position(|item| item.id == id).unwrap_or(self.rows.len().saturating_sub(1));
-        self.overlays.push(Overlay {
-            row,
-            column: 0,
-            value: None,
-            gate: Gate::Writable,
-            message: String::new(),
-            change_id: Some(id),
-            kind: "insert",
-        });
+        let row_id = self.rows.get(row).map(|item| item.id.clone()).unwrap_or(id.clone());
+        self.overlays.push(overlay(row, row_id, 0, None, Gate::Writable, String::new(), Some(id), "insert"));
         self.close_preview();
         Gate::Writable
     }
@@ -652,16 +665,18 @@ impl SharedGrid {
             _ => self.readonly_reason.clone(),
         };
         self.seq += 1;
-        self.overlays.retain(|item| !(item.kind == "delete" && item.row == row));
-        self.overlays.push(Overlay {
+        let row_id = self.rows.get(row).map(|item| item.id.clone()).unwrap_or_default();
+        self.overlays.retain(|item| !(item.kind == "delete" && item.row_id == row_id));
+        self.overlays.push(overlay(
             row,
-            column: 0,
-            value: None,
+            row_id,
+            0,
+            None,
             gate,
             message,
-            change_id: if gate == Gate::Writable { Some(format!("d:{}", self.seq)) } else { None },
-            kind: "delete",
-        });
+            if gate == Gate::Writable { Some(format!("d:{}", self.seq)) } else { None },
+            "delete",
+        ));
         self.close_preview();
         gate
     }
@@ -681,12 +696,12 @@ impl SharedGrid {
 
     pub fn open_preview(&mut self) -> Result<Vec<String>, String> {
         let schema = self.schema.clone().ok_or_else(|| i18n::text(self.locale, "grid.status.readonly"))?;
-        let planned = self
-            .overlays
+        let staged = self.overlays.clone();
+        let planned = staged
             .iter()
             .filter(|item| item.gate == Gate::Writable && item.change_id.is_some())
             .filter_map(|overlay| {
-                let row = self.rows.get(overlay.row)?;
+                let row = self.row_for(overlay)?;
                 Some((overlay.kind, overlay.change_id.clone().unwrap_or_default(), overlay.column, overlay.value.clone(), row.id.clone(), row.locator.clone(), row.values.clone()))
             })
             .collect::<Vec<_>>();
@@ -777,15 +792,7 @@ impl SharedGrid {
                 overlay.gate = Gate::Execution;
                 overlay.message = failed.message.clone();
             } else {
-                self.overlays.push(Overlay {
-                    row: 0,
-                    column: 0,
-                    value: None,
-                    gate: Gate::Execution,
-                    message: failed.message.clone(),
-                    change_id: Some(failed.id.clone()),
-                    kind: "update",
-                });
+                self.overlays.push(overlay(0, String::new(), 0, None, Gate::Execution, failed.message.clone(), Some(failed.id.clone()), "update"));
             }
         }
         self.close_preview();
@@ -799,13 +806,84 @@ impl SharedGrid {
 
     pub fn rendered_labels(&self) -> Vec<Vec<String>> {
         let (start, end) = self.visible_bounds();
-        (start..end)
-            .map(|row| {
-                let mut line = vec![self.row_number(row)];
-                line.extend((0..self.columns.len()).map(|column| self.cell_label(row, column)));
-                line
-            })
-            .collect()
+        (start..end).map(|row| self.sheet_line(row)).collect()
+    }
+
+    /// DataTable 自己虚拟化。这里交出全部已加载行，行号仍按页偏移计算。
+    pub fn sheet_labels(&self) -> Vec<Vec<String>> {
+        (0..self.rows.len()).map(|row| self.sheet_line(row)).collect()
+    }
+
+    pub fn source_len(&self) -> usize {
+        self.source.len()
+    }
+
+    pub fn has_more_rows(&self) -> bool {
+        if let Some(count) = self.full_count {
+            (self.offset as i64) + (self.source.len() as i64) < count
+        } else {
+            self.truncated
+        }
+    }
+
+    pub fn append_page(&mut self, rows: Vec<GridRow>, full_count: Option<i64>, truncated: bool) {
+        self.source.extend(rows);
+        if full_count.is_some() {
+            self.full_count = full_count;
+        }
+        self.truncated = truncated;
+        let scroll = self.scroll;
+        let selected = self.selected;
+        let anchor = self.anchor;
+        let focus = self.focus;
+        self.recompute();
+        self.scroll = scroll;
+        self.selected = selected;
+        self.anchor = anchor;
+        self.focus = focus;
+        self.clamp_scroll();
+    }
+
+    pub fn copy_row(&mut self) -> String {
+        let Some((row, _)) = self.focus_cell() else {
+            return String::new();
+        };
+        let last = self.columns.len().saturating_sub(1);
+        self.select(row, 0, false);
+        self.select(row, last, true);
+        self.tsv()
+    }
+
+    pub fn copy_column(&mut self) -> String {
+        let Some((_, column)) = self.focus_cell() else {
+            return String::new();
+        };
+        if self.rows.is_empty() {
+            return String::new();
+        }
+        self.select(0, column, false);
+        self.select(self.rows.len() - 1, column, true);
+        self.tsv()
+    }
+
+    pub fn filter_focused_value(&mut self) {
+        let Some((row, column)) = self.focus_cell() else {
+            return;
+        };
+        let Some(name) = self.columns.get(column).map(|item| item.name.clone()) else {
+            return;
+        };
+        match self.rows.get(row).and_then(|item| item.values.get(column)).cloned().unwrap_or(None) {
+            None => self.set_filter(&name, "null", ""),
+            Some(text) if text.is_empty() => self.set_filter(&name, "empty", ""),
+            Some(text) => self.set_filter(&name, "eq", &text),
+        }
+    }
+
+    fn sheet_line(&self, row: usize) -> Vec<String> {
+        let mut line = vec![self.row_number(row)];
+        line.extend((0..self.columns.len()).map(|column| self.cell_label(row, column)));
+        line
     }
 
     pub fn row_number(&self, row: usize) -> String {
@@ -817,7 +895,19 @@ impl SharedGrid {
     }
 
     fn reattach_overlays(&mut self) {
-        // 重新计算后行号可能变化。按 change id 无法定位时保留原行，测试只用单页。
+        for item in &mut self.overlays {
+            if item.row_id.is_empty() {
+                continue;
+            }
+            item.row = self.rows.iter().position(|row| row.id == item.row_id).unwrap_or(usize::MAX);
+        }
+    }
+
+    fn row_for(&self, overlay: &Overlay) -> Option<&GridRow> {
+        self.rows
+            .iter()
+            .find(|row| row.id == overlay.row_id)
+            .or_else(|| self.source.iter().find(|row| row.id == overlay.row_id))
     }
 
     fn recompute(&mut self) {
@@ -851,6 +941,7 @@ impl SharedGrid {
         self.selected = false;
         self.scroll = 0;
         self.clamp_scroll();
+        self.reattach_overlays();
     }
 
     fn clamp_scroll(&mut self) {
@@ -925,12 +1016,13 @@ impl SharedGrid {
 
     fn committable(&self) -> Vec<ChangeArg> {
         let mut changes = Vec::new();
-        for overlay in &self.overlays {
+        let staged = self.overlays.clone();
+        for overlay in &staged {
             if overlay.gate != Gate::Writable {
                 continue;
             }
             let Some(id) = overlay.change_id.clone() else { continue };
-            let Some(row) = self.rows.get(overlay.row) else { continue };
+            let Some(row) = self.row_for(overlay).cloned() else { continue };
             match overlay.kind {
                 "delete" => changes.push(ChangeArg {
                     id,
@@ -949,7 +1041,7 @@ impl SharedGrid {
                         .iter()
                         .enumerate()
                         .filter_map(|(index, column)| {
-                            let value = self.overlay_value(overlay.row, index).or_else(|| row.values.get(index).cloned())?;
+                            let value = self.writable_overlay(&row.id, index).or_else(|| row.values.get(index).cloned())?;
                             if value.is_none() && column.auto {
                                 return None;
                             }
@@ -989,8 +1081,14 @@ impl SharedGrid {
     }
 
     fn overlay_on(&self, row: &GridRow, column: usize) -> Option<Option<String>> {
-        let position = self.rows.iter().position(|item| item.id == row.id)?;
-        self.overlay_value(position, column)
+        self.writable_overlay(&row.id, column)
+    }
+
+    fn writable_overlay(&self, row_id: &str, column: usize) -> Option<Option<String>> {
+        self.overlays
+            .iter()
+            .find(|item| item.row_id == row_id && item.column == column && item.kind == "update" && item.gate == Gate::Writable)
+            .map(|item| item.value.clone())
     }
 
     fn table_ref(&self) -> TableRef {
@@ -1226,6 +1324,10 @@ fn quote_tsv(value: &str) -> String {
     }
 }
 
+fn overlay(row: usize, row_id: String, column: usize, value: Option<String>, gate: Gate, message: String, change_id: Option<String>, kind: &'static str) -> Overlay {
+    Overlay { row, row_id, column, value, gate, message, change_id, kind }
+}
+
 fn cell_of(value: Option<String>) -> Cell {
     match value {
         Some(text) => Cell::Text(text),
@@ -1280,6 +1382,7 @@ mod tests {
         grid.set_viewport(8);
         grid.scroll_to(40);
         assert_eq!(grid.rendered_len(), 8);
+        assert_eq!(grid.sheet_labels().len(), 100);
         assert_eq!(grid.loaded_len(), 100);
         assert_eq!(grid.full_count(), Some(1000));
         assert!(grid.range_text().contains("40-48/100"));
@@ -1398,6 +1501,73 @@ mod tests {
         assert_eq!(bad.cell_label(0, 1), "zz");
         assert_eq!(bad.gate_at(0, 1), Some(Gate::Validation));
         assert!(bad.confirm_request().is_err());
+    }
+
+    #[test]
+    fn staged_edit_keeps_the_original_key_after_sort_or_filter() {
+        let mut grid = SharedGrid::new();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some("甲")], true), row("2", vec![Some("2"), Some("乙")], true)],
+            Some(2),
+            Some(schema()),
+        );
+        assert_eq!(grid.stage_text(0, 1, Some("改".into())), Gate::Writable);
+        grid.set_sort("id", true);
+        assert_eq!(grid.cell_label(0, 0), "2");
+        assert_eq!(grid.cell_label(1, 1), "改");
+        let sql = grid.open_preview().unwrap();
+        assert!(sql[0].contains("改"), "{sql:?}");
+        assert!(sql[0].contains("\"id\" = 1"), "{sql:?}");
+        assert!(!sql[0].contains("\"id\" = 2"), "{sql:?}");
+        let request = grid.confirm_request().unwrap();
+        assert_eq!(request.changes[0].locator[0].value.as_deref(), Some("1"));
+
+        let mut filtered = SharedGrid::new();
+        filtered.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some("甲")], true), row("2", vec![Some("2"), Some("乙")], true)],
+            Some(2),
+            Some(schema()),
+        );
+        assert_eq!(filtered.stage_text(0, 1, Some("改".into())), Gate::Writable);
+        filtered.set_filter("name", "eq", "乙");
+        assert_eq!(filtered.cell_label(0, 0), "2");
+        let sql = filtered.open_preview().unwrap();
+        assert!(sql[0].contains("\"id\" = 1"), "{sql:?}");
+        assert!(!sql[0].contains("\"id\" = 2"), "{sql:?}");
+        assert_eq!(filtered.confirm_request().unwrap().changes[0].locator[0].value.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn rejected_insert_keeps_the_typed_value_without_writing_it() {
+        let blob = schema_from_parts("sqlite", "", "files", "table", vec![column_of("id", "integer", true), column_of("payload", "blob", false)], vec!["id".to_owned()]).unwrap();
+        let mut grid = SharedGrid::new();
+        grid.load_local(
+            vec![
+                text_column("id"),
+                GridColumn { name: "payload".into(), type_name: "blob".into(), nullable: true, primary: false, unique: false, auto: false, width: 80.0, editable: true },
+            ],
+            vec![row("1", vec![Some("1"), Some("abcd")], true)],
+            Some(1),
+            Some(blob),
+        );
+        assert_eq!(grid.stage_insert(), Gate::Writable);
+        let inserted = grid.loaded_len() - 1;
+        assert_eq!(grid.stage_text(inserted, 1, Some("zz".into())), Gate::Validation);
+        assert_eq!(grid.cell_label(inserted, 1), "zz");
+        assert_eq!(grid.gate_at(inserted, 1), Some(Gate::Validation));
+        assert!(grid.rejected_visible());
+        assert!(!grid.overlay_message(inserted, 1).is_empty());
+        match grid.open_preview() {
+            Ok(sql) => assert!(sql.iter().all(|item| !item.contains("zz")), "{sql:?}"),
+            Err(_) => {}
+        }
+        if let Ok(request) = grid.confirm_request() {
+            assert!(request.changes.iter().all(|change| {
+                change.sets.iter().all(|item| item.value.as_deref() != Some("zz")) && change.values.iter().all(|item| item.value.as_deref() != Some("zz"))
+            }));
+        }
     }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {

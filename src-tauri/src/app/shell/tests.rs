@@ -732,3 +732,56 @@ fn grid_edits_block_close_and_structure_admin_bind_the_target(cx: &mut gpui_kit:
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[gpui_kit::test]
+fn object_tree_opens_the_table_and_structure_and_commits_through_the_shared_grid(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-tree-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench(cx, services, false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.plant_object_tree(cx);
+            view.perform("object:notes:customers", cx);
+            view.perform("tree-open-data", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let banner = view.read(cx).table_banner(cx);
+        assert!(banner.contains("笔记") && banner.contains("dev") && banner.contains("customers") && banner.contains("sqlite"), "{banner}");
+        assert_eq!(view.read(cx).model.tool, WorkTool::Table);
+        assert_eq!(view.read(cx).model.shell.page, AppPage::Workspace);
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("open-structure", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let banner = view.read(cx).structure_banner(cx);
+        assert!(banner.contains("笔记") && banner.contains("dev") && banner.contains("customers") && banner.contains("sqlite"), "{banner}");
+        assert_eq!(view.read(cx).model.shell.page, AppPage::Structure);
+        assert_eq!(view.read(cx).model.tool, WorkTool::Structure);
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("tree-open-data", cx);
+            view.mark_table_dirty(cx);
+            view.perform("commit", cx);
+            view.perform("grid-copy-row", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let (open, sql) = view.read(cx).table_preview(cx);
+        assert!(open, "确认前应先打开共享网格预览");
+        assert!(sql.contains("乙"), "{sql}");
+        assert_ne!(view.read(cx).model.copied, "grid-copy-row");
+        assert!(view.read(cx).model.copied.contains('乙') || view.read(cx).model.copied.contains('甲'), "{}", view.read(cx).model.copied);
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}

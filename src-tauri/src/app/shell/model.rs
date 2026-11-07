@@ -129,6 +129,8 @@ pub struct WorkbenchModel {
     pub startup_warning: Option<String>,
     pub tool: WorkTool,
     pub table_spec: Option<String>,
+    /// 对象树当前选中的 `id|name|database|schema|table|engine|env`。
+    pub object_spec: Option<String>,
 }
 
 impl WorkbenchModel {
@@ -169,6 +171,7 @@ impl WorkbenchModel {
             startup_warning: None,
             tool: WorkTool::Query,
             table_spec: None,
+            object_spec: None,
         }
     }
 
@@ -241,7 +244,12 @@ impl WorkbenchModel {
             }
             "help" | "shortcut-help" => self.menu = None,
             "theme-light" | "theme-dark" | "theme-system" => self.settings.capture_shell(&self.shell),
-            "open-structure" => self.tool = WorkTool::Structure,
+            "open-structure" => {
+                self.tool = WorkTool::Structure;
+                if let Some(spec) = self.object_spec.clone() {
+                    self.table_spec = Some(spec);
+                }
+            }
             _ => {}
         }
     }
@@ -472,6 +480,10 @@ impl WorkbenchModel {
                 self.shell.page = AppPage::Workspace;
                 self.shell.focus = FocusTarget::Grid;
                 self.notice_key = Some("catalog.tree.openData");
+                if let Some(spec) = self.object_spec.clone() {
+                    self.tool = WorkTool::Table;
+                    self.table_spec = Some(spec);
+                }
             }
             _ => {}
         }
