@@ -53,6 +53,8 @@ pub struct ImportReport {
     pub success: bool,
     pub applied: usize,
     pub message: String,
+    /// 取消优先于迟到成功。调用方不能把这种结果再写成全部成功或运行中。
+    pub cancelled: bool,
 }
 
 pub async fn open_import(path: &str, entry: ImportEntry) -> Result<ImportPreview, String> {
@@ -72,12 +74,36 @@ pub async fn commit_import(
     mapping: &BTreeMap<String, String>,
     confirmed: bool,
 ) -> Result<ImportReport, String> {
+    write_import(service, table, preview, mapping, confirmed, None).await
+}
+
+/// 每一行写入前都看任务代次。取消后不再写后面的行。
+pub async fn commit_import_guarded(
+    service: &Service,
+    tasks: &TaskBoard,
+    token: TaskToken,
+    table: &TableRef,
+    preview: &ParsedTable,
+    mapping: &BTreeMap<String, String>,
+    confirmed: bool,
+) -> Result<ImportReport, String> {
+    write_import(service, table, preview, mapping, confirmed, Some((tasks, token))).await
+}
+
+async fn write_import(
+    service: &Service,
+    table: &TableRef,
+    preview: &ParsedTable,
+    mapping: &BTreeMap<String, String>,
+    confirmed: bool,
+    stop: Option<(&TaskBoard, TaskToken)>,
+) -> Result<ImportReport, String> {
     if !confirmed {
-        return Ok(ImportReport { wrote: false, success: false, applied: 0, message: "未确认，没有写入目标表。".to_owned() });
+        return Ok(ImportReport { wrote: false, success: false, applied: 0, cancelled: false, message: "未确认，没有写入目标表。".to_owned() });
     }
     let schema = crate::application::grid::describe(service, table).await?;
     if schema.kind != "table" {
-        return Ok(ImportReport { wrote: false, success: false, applied: 0, message: "只有数据表可以导入，不能写入视图。".to_owned() });
+        return Ok(ImportReport { wrote: false, success: false, applied: 0, cancelled: false, message: "只有数据表可以导入，不能写入视图。".to_owned() });
     }
     let fields = schema
         .columns
@@ -90,32 +116,48 @@ pub async fn commit_import(
             wrote: false,
             success: false,
             applied: 0,
+            cancelled: false,
             message: format!("必填字段 {} 没有对应列，不能开始写入。", gaps.join("、")),
         });
     }
     let changes = import_changes(preview, mapping, &fields);
-    let request = CommitRequest {
-        table: TableRef {
-            connection_id: table.connection_id.clone(),
-            database: table.database.clone(),
-            schema: table.schema.clone(),
-            table: table.table.clone(),
-            engine: table.engine.clone(),
-            include_foreign_keys: table.include_foreign_keys,
-        },
-        changes,
-    };
-    let report = crate::application::grid::commit(service, &request, true).await?;
-    let applied = report.applied.len();
-    if let Some(failed) = report.failed {
-        let row = failed.id.trim_start_matches("import-");
-        let waiting = report.pending_ids.iter().filter(|id| *id != &failed.id).count();
-        return Ok(ImportReport {
-            wrote: applied > 0,
-            success: false,
-            applied,
-            message: format!("第 {row} 行失败：{}。已写入 {applied} 行，还有 {waiting} 行没有写入。导入不是全部成功。", failed.message),
-        });
+    let mut applied = 0usize;
+    for change in &changes {
+        if let Some((tasks, token)) = stop {
+            if matches!(tasks.accept("import", token, ()), TaskOutcome::Cancelled { .. }) {
+                return Ok(ImportReport {
+                    wrote: applied > 0,
+                    success: false,
+                    applied,
+                    cancelled: true,
+                    message: format!("已取消。实际完成范围 {applied} 行。不是全部成功，也不是仍在运行。"),
+                });
+            }
+        }
+        let request = CommitRequest {
+            table: TableRef {
+                connection_id: table.connection_id.clone(),
+                database: table.database.clone(),
+                schema: table.schema.clone(),
+                table: table.table.clone(),
+                engine: table.engine.clone(),
+                include_foreign_keys: table.include_foreign_keys,
+            },
+            changes: vec![change.clone()],
+        };
+        let report = crate::application::grid::commit(service, &request, true).await?;
+        applied += report.applied.len();
+        if let Some(failed) = report.failed {
+            let row = failed.id.trim_start_matches("import-");
+            let waiting = changes.iter().filter(|item| item.id != failed.id).count().saturating_sub(applied);
+            return Ok(ImportReport {
+                wrote: applied > 0,
+                success: false,
+                applied,
+                cancelled: false,
+                message: format!("第 {row} 行失败：{}。已写入 {applied} 行，还有 {waiting} 行没有写入。导入不是全部成功。", failed.message),
+            });
+        }
     }
     let success = applied == preview.rows.len();
     let message = if success {
@@ -123,7 +165,7 @@ pub async fn commit_import(
     } else {
         format!("已写入 {applied} 行，但不是全部 {} 行。导入不是全部成功。", preview.rows.len())
     };
-    Ok(ImportReport { wrote: applied > 0, success, applied, message })
+    Ok(ImportReport { wrote: applied > 0, success, applied, cancelled: false, message })
 }
 
 pub fn mapping_for(schema_fields: &[TableField], preview: &ParsedTable) -> BTreeMap<String, String> {

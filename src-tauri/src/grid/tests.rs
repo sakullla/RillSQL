@@ -1113,6 +1113,8 @@ async fn xlsx_full_export_writes_select_and_table_rows_and_skips_updates() {
     };
 
     let table_path = dir.join("items.xlsx");
+    let _workbook = crate::export::workbook_test_lock();
+    let before = crate::export::workbook_initializations();
     let table = live::run_export(&session, &spec("xlsx-table", ExportMode::TableFull, table_path.display().to_string())).await;
     assert!(table.success, "{}", table.message);
     assert_eq!(table.written_rows, 4);
@@ -1120,11 +1122,10 @@ async fn xlsx_full_export_writes_select_and_table_rows_and_skips_updates() {
     let table_file = PathBuf::from(table.path.unwrap());
     assert_eq!(table_file, table_path);
     assert!(!PathBuf::from(format!("{}.partial", table_path.display())).exists());
-    let table_sheet = String::from_utf8_lossy(&fs::read(&table_file).unwrap()).to_string();
-    assert!(table_sheet.contains("<worksheet"));
-    assert!(!table_sheet.contains("r=\"B2\""));
-    assert!(!table_sheet.contains("r=\"B3\""));
-    assert!(table_sheet.contains("r=\"B4\""));
+    let raw = fs::read(&table_file).unwrap();
+    assert!(raw.starts_with(b"PK"), "xlsx 应以 zip 包写出");
+    assert!(!String::from_utf8_lossy(&raw).contains("<worksheet"), "全量 xlsx 不再用手写未压缩包");
+    assert!(crate::export::workbook_initializations() > before, "全量 xlsx 应初始化 rust_xlsxwriter");
     assert_eq!(read_xlsx_like_import(&table_file), expected);
 
     let mut filtered = spec("xlsx-filter", ExportMode::TableFull, dir.join("filtered.xlsx").display().to_string());

@@ -6,10 +6,11 @@ mod tasks;
 mod write;
 mod xlsx;
 
-pub use desk::{commit_import, export_full, export_loaded, open_import, watch_dump, watch_migrate, CancelPoint, ImportEntry, ImportPreview};
+pub use desk::{commit_import_guarded, export_full, export_loaded, open_import, watch_dump, watch_migrate, CancelPoint, ImportEntry, ImportPreview};
 pub use parse::{suggest_mapping, TableField};
-pub use tasks::{Phase, TaskLog, TaskView};
+pub use tasks::{prefer_cancel, Phase, TaskLog, TaskView};
 pub use write::LoadedExport;
+pub use xlsx::{read_xlsx, workbook_initializations, workbook_test_lock, write_xlsx};
 
 #[cfg(test)]
 mod tests;

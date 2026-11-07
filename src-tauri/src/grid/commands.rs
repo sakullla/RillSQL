@@ -61,7 +61,7 @@ pub struct CountRequest {
     pub search: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ValueArg {
     pub column: String,
@@ -70,7 +70,7 @@ pub struct ValueArg {
     pub resolved: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChangeArg {
     pub id: String,

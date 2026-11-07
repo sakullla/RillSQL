@@ -114,6 +114,10 @@ impl GridPane {
         body(&mut self.session)
     }
 
+    pub fn exchange_sheet(&self) -> (Option<TableRef>, Vec<String>, Vec<Vec<Option<String>>>, bool) {
+        self.session.exchange_sheet()
+    }
+
     pub fn show_query(&mut self, target: GridTarget, sql: &str, columns: Vec<String>, rows: Vec<Vec<Option<String>>>, cx: &mut Context<Self>) {
         self.session.target = target;
         self.session.locale = self.locale;
@@ -809,6 +813,40 @@ impl GridPane {
             Some(schema),
         );
         let _ = self.session.stage_text(0, 1, Some("乙".into()));
+    }
+
+    pub fn plant_loaded(&mut self, target: GridTarget, columns: Vec<String>, rows: Vec<Vec<Option<String>>>, cx: &mut Context<Self>) {
+        use session::{GridColumn, GridRow};
+        self.session.mode = GridMode::Table;
+        self.session.target = target;
+        self.session.locale = self.locale;
+        let grid_columns = columns
+            .iter()
+            .map(|name| GridColumn {
+                name: name.clone(),
+                type_name: "TEXT".to_owned(),
+                nullable: true,
+                primary: false,
+                unique: false,
+                auto: false,
+                width: 120.0,
+                editable: true,
+            })
+            .collect();
+        let grid_rows = rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, values)| GridRow {
+                id: index.to_string(),
+                values,
+                located: true,
+                locator: Vec::new(),
+                inserted: false,
+            })
+            .collect::<Vec<_>>();
+        let count = grid_rows.len() as i64;
+        self.session.load_local(grid_columns, grid_rows, Some(count), None);
+        self.sync_table(cx);
     }
 }
 

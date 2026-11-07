@@ -897,3 +897,280 @@ fn customer_names(path: &std::path::Path) -> Vec<(i64, String)> {
             .unwrap()
     })
 }
+
+fn people_count(path: &std::path::Path) -> i64 {
+    let path = path.to_path_buf();
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                runtime.block_on(async move {
+                    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                        .max_connections(1)
+                        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path).read_only(true))
+                        .await
+                        .unwrap();
+                    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM people").fetch_one(&pool).await.unwrap();
+                    pool.close().await;
+                    count
+                })
+            })
+            .join()
+            .unwrap()
+    })
+}
+
+fn pump_exchange(
+    cx: &mut gpui_kit::TestAppContext,
+    window: gpui_kit::AnyWindowHandle,
+    view: &gpui_kit::Entity<super::view::Workbench>,
+    mut ready: impl FnMut(&super::view::Workbench, &gpui_kit::App) -> bool,
+) {
+    for _ in 0..48 {
+        let done = cx.update(|app| ready(view.read(app), app));
+        if done {
+            return;
+        }
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+#[gpui_kit::test]
+fn exchange_commands_prompt_map_cancel_and_fail_from_the_workbench(cx: &mut gpui_kit::TestAppContext) {
+    use crate::app::shell::close::{evaluate, CloseKind};
+    use crate::export::Phase;
+
+    cx.executor().allow_parking();
+    let _workbook = crate::export::workbook_test_lock();
+    let dir = std::env::temp_dir().join(format!("rillsql-exchange-product-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("source.sqlite");
+    let target = dir.join("target.sqlite");
+    let csv = dir.join("people.csv");
+    std::fs::write(&csv, "name\n乙\n丙\n").unwrap();
+    let services = std::thread::scope(|scope| {
+        let source = source.clone();
+        let target = target.clone();
+        let dir = dir.clone();
+        scope
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                runtime.block_on(async move {
+                    for (path, seed) in [(&source, true), (&target, false)] {
+                        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                            .max_connections(1)
+                            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(path).create_if_missing(true))
+                            .await
+                            .unwrap();
+                        sqlx::query("CREATE TABLE people (name TEXT NOT NULL)").execute(&pool).await.unwrap();
+                        if seed {
+                            sqlx::query("INSERT INTO people (name) VALUES ('甲')").execute(&pool).await.unwrap();
+                        }
+                        pool.close().await;
+                    }
+                    let services = Arc::new(AppServices::new(Arc::new(Service::new_for_test(dir.join("connections.sqlite")))));
+                    services.connections.open_sqlite_for_test("notes", "笔记", &source).await.unwrap();
+                    services
+                })
+            })
+            .join()
+            .unwrap()
+    });
+    let (window, view) = open_workbench(cx, services, false);
+    let csv_opened = csv.canonicalize().unwrap();
+    let target_opened = target.canonicalize().unwrap();
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("open-exchange", cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("exchange-dump", cx));
+    })
+    .unwrap();
+    assert!(cx.did_prompt_for_new_path(), "全库导出应打开保存对话框");
+    let dump_path = dir.join("missing.sql");
+    cx.simulate_new_path_selection(|_| Some(dump_path.clone()));
+    pump_exchange(cx, window, &view, |view, app| {
+        let text = view.exchange_text(app);
+        !view.exchange_running_now(app) && text.contains("没有当前连接")
+    });
+    cx.update(|app| {
+        let text = view.read(app).exchange_text(app);
+        assert!(text.contains("没有当前连接"), "{text}");
+        assert!(!text.contains("开始全库导出"), "{text}");
+        assert!(!text.contains("进行中"), "{text}");
+        assert!(!view.read(app).exchange_running_now(app));
+        let tasks = view.read(app).exchange_tasks(app);
+        assert!(tasks.iter().any(|task| task.phase == Phase::Failed && !task.success), "{tasks:?}");
+        assert!(tasks.iter().all(|task| task.phase != Phase::Running), "{tasks:?}");
+    });
+    assert!(!dump_path.exists());
+    assert_eq!(people_count(&source), 1);
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            view.plant_exchange_sheet("notes|笔记|main||people|sqlite|local", vec!["name".to_owned()], vec![vec![Some("甲".to_owned())]], cx);
+        });
+    })
+    .unwrap();
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("exchange-export-loaded", cx));
+    })
+    .unwrap();
+    assert!(cx.did_prompt_for_new_path(), "已读取导出应打开保存对话框");
+    let loaded_path = dir.join("loaded.csv");
+    cx.simulate_new_path_selection(|_| Some(loaded_path.clone()));
+    pump_exchange(cx, window, &view, |_, _| loaded_path.exists());
+    let loaded = String::from_utf8_lossy(&std::fs::read(&loaded_path).unwrap()).into_owned();
+    assert!(loaded_path.is_absolute());
+    assert!(loaded.contains('甲'), "{loaded}");
+    assert!(!view_has_partial(&dir), "已读取导出不应留下 .partial");
+    cx.update(|app| {
+        assert!(!view.read(app).exchange_running_now(app));
+        let text = view.read(app).exchange_text(app);
+        assert!(text.contains("目标 people"), "{text}");
+        assert!(!text.contains("进行中"), "{text}");
+    });
+
+    let before_books = crate::export::workbook_initializations();
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("exchange-format:xlsx", cx);
+            view.perform("exchange-export-full", cx);
+        });
+    })
+    .unwrap();
+    assert!(cx.did_prompt_for_new_path(), "全量导出应打开保存对话框");
+    let full_path = dir.join("full.xlsx");
+    cx.simulate_new_path_selection(|_| Some(full_path.clone()));
+    pump_exchange(cx, window, &view, |view, app| full_path.exists() && !view.exchange_running_now(app));
+    let raw = std::fs::read(&full_path).expect("全量 xlsx");
+    assert!(full_path.is_absolute());
+    assert!(raw.starts_with(b"PK"), "全量 xlsx 应是 zip 包");
+    assert!(crate::export::workbook_initializations() > before_books, "全量 xlsx 应走 rust_xlsxwriter");
+    let sheet = crate::export::read_xlsx(&raw).expect("读取全量 xlsx");
+    assert!(sheet.rows.iter().any(|row| row.iter().any(|cell| cell.as_deref() == Some("甲"))), "{sheet:?}");
+    assert!(!view_has_partial(&dir));
+    cx.update(|app| {
+        let text = view.read(app).exchange_text(app);
+        assert!(!view.read(app).exchange_running_now(app), "{text}");
+        assert!(!text.contains("进行中"), "{text}");
+        assert!(view.read(app).exchange_tasks(app).iter().any(|task| task.phase == Phase::Done && task.success), "{text}");
+    });
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("exchange-pick", cx));
+    })
+    .unwrap();
+    assert!(cx.did_prompt_for_paths(), "导入应打开文件对话框");
+    cx.simulate_path_prompt_response(|_| Some(vec![csv_opened.clone()]));
+    pump_exchange(cx, window, &view, |view, app| view.exchange_text(app).contains("映射 name=name"));
+    cx.update(|app| {
+        let text = view.read(app).exchange_text(app);
+        assert!(text.contains("映射 name=name"), "{text}");
+        assert!(text.contains("预览阶段不写入"), "{text}");
+    });
+    assert_eq!(people_count(&source), 1, "确认前不得写库");
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("exchange-map:name=", cx);
+            view.perform("exchange-confirm", cx);
+        });
+    })
+    .unwrap();
+    pump_exchange(cx, window, &view, |view, app| {
+        view.exchange_tasks(app).iter().any(|task| task.kind == "import" && task.phase != Phase::Running)
+    });
+    cx.update(|app| {
+        let text = view.read(app).exchange_text(app);
+        let tasks = view.read(app).exchange_tasks(app);
+        let import = tasks.iter().find(|task| task.kind == "import").expect(&text);
+        assert_eq!(import.phase, Phase::Blocked, "{text}");
+        assert!(!import.success, "{text}");
+        assert!(import.detail.contains("必填"), "{text}");
+        assert!(!text.contains("进行中"), "{text}");
+        assert!(!view.read(app).exchange_running_now(app));
+    });
+    assert_eq!(people_count(&source), 1, "缺映射时确认也不得写库");
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("exchange-map:name=name", cx);
+            view.perform("exchange-confirm", cx);
+            view.sync_exchange_running(cx);
+            assert!(view.model.exchange_running, "{}", view.exchange_text(cx));
+            assert_eq!(evaluate(view.model.facts()), CloseKind::BlockedRunning);
+            assert!(!view.model.allow_system_close());
+            assert!(view.model.close_prompt.is_none());
+            view.perform("exchange-task-cancel", cx);
+        });
+    })
+    .unwrap();
+    pump_exchange(cx, window, &view, |view, app| !view.exchange_running_now(app));
+    cx.run_until_parked();
+    cx.update(|app| {
+        let text = view.read(app).exchange_text(app);
+        let tasks = view.read(app).exchange_tasks(app);
+        let import = tasks.iter().rev().find(|task| task.kind == "import").expect(&text);
+        assert_eq!(import.phase, Phase::Cancelled, "{text}");
+        assert!(!import.success, "{text}");
+        assert!(import.detail.contains("已取消"), "{text}");
+        assert!(!import.detail.contains("进行中"), "{text}");
+        assert!(!text.contains("进行中"), "{text}");
+        assert!(tasks.iter().all(|task| task.phase != Phase::Running), "{text}");
+        assert!(!view.read(app).exchange_running_now(app));
+    });
+    assert_eq!(people_count(&source), 1, "取消后不得继续写入");
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("exchange-migrate", cx));
+    })
+    .unwrap();
+    assert!(cx.did_prompt_for_paths(), "跨库迁移应打开目标库");
+    cx.simulate_path_prompt_response(|_| Some(vec![target_opened.clone()]));
+    pump_exchange(cx, window, &view, |view, app| {
+        view.exchange_tasks(app).iter().any(|task| task.kind == "migrate" && task.phase != Phase::Running)
+    });
+    cx.update(|app| {
+        let text = view.read(app).exchange_text(app);
+        let tasks = view.read(app).exchange_tasks(app);
+        let migrated = tasks.iter().rev().find(|task| task.kind == "migrate").expect(&text);
+        assert_ne!(migrated.phase, Phase::Running, "{text}");
+        assert!(matches!(migrated.phase, Phase::Done | Phase::Partial | Phase::Cancelled), "{text}");
+        assert!(!text.contains("进行中"), "{text}");
+        if migrated.phase == Phase::Done {
+            assert!(migrated.success, "{text}");
+        } else {
+            assert!(!migrated.success, "{text}");
+        }
+    });
+    assert_eq!(people_count(&target), 1, "迁移应只写入实际读到的行");
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.sync_exchange_running(cx);
+            assert!(!view.model.exchange_running);
+            view.mark_table_dirty(cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|app| {
+        view.update(app, |view, _| {
+            assert!(!view.model.exchange_running);
+            assert_eq!(evaluate(view.model.facts()), CloseKind::Confirm { uncommitted: true, draft: false });
+        });
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn view_has_partial(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).unwrap().flatten().any(|entry| entry.file_name().to_string_lossy().contains(".partial"))
+}

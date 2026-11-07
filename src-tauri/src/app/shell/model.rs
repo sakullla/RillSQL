@@ -278,6 +278,9 @@ impl WorkbenchModel {
             self.shell.page = AppPage::Connections;
             return true;
         }
+        if id.starts_with("exchange-") {
+            return true;
+        }
         if let Some(engine) = id.strip_prefix("conn-engine:") {
             if let Ok(engine) = Engine::parse(engine) {
                 self.connections.select_engine(engine);
@@ -407,15 +410,6 @@ impl WorkbenchModel {
             "open-exchange" => {
                 self.exchange_open = !self.exchange_open;
             }
-            "exchange-confirm"
-            | "exchange-cancel-import"
-            | "exchange-pick"
-            | "exchange-export-loaded"
-            | "exchange-export-full"
-            | "exchange-dump"
-            | "exchange-migrate"
-            | "exchange-task-cancel"
-            | "exchange-clear" => {}
             "open-admin" => {
                 self.tool = WorkTool::Admin;
                 self.shell.page = AppPage::Structure;

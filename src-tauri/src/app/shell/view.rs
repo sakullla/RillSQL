@@ -154,9 +154,12 @@ impl Workbench {
             let _ = self.model.dispatch(id);
             let locale = self.model.locale();
             let open = self.model.exchange_open;
+            let source = self.exchange_source(cx);
             self.exchange.update(cx, |pane, cx| {
                 pane.set_locale(locale);
                 pane.open = open;
+                pane.bind_source(source.0, source.1, source.2, source.3);
+                pane.ensure_mapping(cx);
                 if id != "open-exchange" {
                     pane.command(id, cx);
                 } else {
@@ -355,6 +358,32 @@ impl Workbench {
     #[cfg(test)]
     pub fn structure_banner(&self, cx: &App) -> String {
         self.structure.read(cx).session.banner()
+    }
+
+    #[cfg(test)]
+    pub fn plant_exchange_sheet(&mut self, spec: &str, columns: Vec<String>, rows: Vec<Vec<Option<String>>>, cx: &mut Context<Self>) {
+        let target = parse_target(spec).expect("exchange table");
+        self.table.update(cx, |pane, cx| pane.plant_loaded(target, columns, rows, cx));
+    }
+
+    #[cfg(test)]
+    pub fn exchange_text(&self, cx: &App) -> String {
+        self.exchange.read(cx).lines().join("\n")
+    }
+
+    #[cfg(test)]
+    pub fn exchange_running_now(&self, cx: &App) -> bool {
+        self.exchange.read(cx).running()
+    }
+
+    #[cfg(test)]
+    pub fn exchange_tasks(&self, cx: &App) -> Vec<crate::export::TaskView> {
+        self.exchange.read(cx).tasks().to_vec()
+    }
+
+    #[cfg(test)]
+    pub fn sync_exchange_running(&mut self, cx: &mut Context<Self>) {
+        self.refresh_exchange(cx);
     }
 
     #[cfg(test)]
@@ -711,7 +740,31 @@ impl Workbench {
     }
 
     fn refresh_exchange(&mut self, cx: &mut Context<Self>) {
+        let source = self.exchange_source(cx);
+        self.exchange.update(cx, |pane, cx| {
+            pane.bind_source(source.0, source.1, source.2, source.3);
+            pane.ensure_mapping(cx);
+        });
         self.model.exchange_running = self.exchange.read(cx).running();
+    }
+
+    fn exchange_source(&self, cx: &App) -> (Option<crate::grid::commands::TableRef>, Vec<String>, Vec<Vec<Option<String>>>, bool) {
+        let (mut table, columns, rows, truncated) = self.table.read(cx).exchange_sheet();
+        if table.is_none() {
+            if let Some(target) = self.model.table_spec.as_deref().and_then(parse_target) {
+                if !target.connection_id.is_empty() && !target.table.is_empty() {
+                    table = Some(crate::grid::commands::TableRef {
+                        connection_id: target.connection_id,
+                        database: target.database,
+                        schema: target.schema,
+                        table: target.table,
+                        engine: target.engine,
+                        include_foreign_keys: false,
+                    });
+                }
+            }
+        }
+        (table, columns, rows, truncated)
     }
 
     fn accept_exchange_drop(&mut self, paths: &gpui_kit::ExternalPaths, cx: &mut Context<Self>) {

@@ -804,6 +804,13 @@ impl SharedGrid {
         self.columns.iter().map(|column| column.name.clone()).collect()
     }
 
+    /// 当前已读取的表、列和行。没有连接或表名时不给出导入目标。
+    pub fn exchange_sheet(&self) -> (Option<TableRef>, Vec<String>, Vec<Vec<Option<String>>>, bool) {
+        let table = if self.target.connection_id.is_empty() || self.target.table.is_empty() { None } else { Some(self.table_ref()) };
+        let rows = self.source.iter().map(|row| row.values.clone()).collect();
+        (table, self.column_names(), rows, self.has_more_rows())
+    }
+
     pub fn rendered_labels(&self) -> Vec<Vec<String>> {
         let (start, end) = self.visible_bounds();
         (start..end).map(|row| self.sheet_line(row)).collect()

@@ -334,6 +334,9 @@ dict! {
     "export.export.loaded" => "导出已读取的行", "Export loaded rows";
     "export.export.full" => "导出全部结果", "Export the full result";
     "export.export.partialMark" => "这不是完整结果。", "This is not the full result.";
+    "export.export.xlsx" => "导出为 xlsx", "Export as xlsx";
+    "export.map.title" => "列映射", "Column mapping";
+    "export.map.empty" => "还没有列映射", "No column mapping yet";
     "export.dump.start" => "开始全库导出", "Start full database export";
     "export.migrate.start" => "开始跨库迁移", "Start cross-database migration";
     "export.task.title" => "后台任务", "Background tasks";
