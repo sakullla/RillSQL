@@ -1,8 +1,10 @@
 //! 查询与历史：在已打开的会话上执行、取消，并只在用户发起执行时写入本机历史。
 //! 按名称保存的查询单独落库，读取、保存、重命名和删除都不执行 SQL。
 
+pub(crate) mod assist;
 mod cancel;
 pub mod commands;
+pub(crate) mod desk;
 mod exec;
 mod history;
 mod saved;

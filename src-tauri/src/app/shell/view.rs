@@ -11,6 +11,7 @@ use gpui_kit::{
 };
 
 use crate::app::views::connections::{blank_draft, engines};
+use crate::app::views::query::{QueryPane, SyncEffect, TabSnap};
 use crate::app::{AppPage, Effect, FocusTarget};
 use crate::connections::model::Engine;
 use crate::state::Platform;
@@ -25,6 +26,7 @@ use crate::app::Shell;
 pub struct Workbench {
     pub model: WorkbenchModel,
     foundation: Entity<Foundation>,
+    query: Entity<QueryPane>,
     services: Arc<AppServices>,
     focus: FocusHandle,
     field_focus: FocusHandle,
@@ -46,6 +48,7 @@ impl Workbench {
 
     pub fn with_services(window: &mut Window, cx: &mut Context<Self>, services: Arc<AppServices>, boot: bool) -> Self {
         let foundation = cx.new(|cx| Foundation::new(window, cx));
+        let query = cx.new(|cx| QueryPane::new(Arc::clone(&services), window, cx));
         let mut model = WorkbenchModel::new(Shell::default());
         let _ = model.shell.set_prefers_dark(matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark));
         let shell = model.shell.clone();
@@ -56,6 +59,7 @@ impl Workbench {
         Self {
             model,
             foundation,
+            query,
             services,
             focus: cx.focus_handle(),
             field_focus: cx.focus_handle(),
@@ -95,6 +99,19 @@ impl Workbench {
             }
             return;
         }
+        if id == "save-query" {
+            if self.model.close_prompt.is_some() {
+                let _ = self.model.dispatch(id);
+                cx.notify();
+                return;
+            }
+            let _ = self.model.dispatch(id);
+            self.adopt_shell(Effect::None, cx);
+            self.forward_query("save-sql-file", cx);
+            self.persist_if_needed();
+            cx.notify();
+            return;
+        }
         if id == "open-sqlite" {
             let Some(effect) = self.model.dispatch(id) else {
                 return;
@@ -110,11 +127,107 @@ impl Workbench {
             return;
         }
         let Some(effect) = self.model.dispatch(id) else {
+            if query_command(id) {
+                self.forward_query(id, cx);
+                self.persist_if_needed();
+                cx.notify();
+            }
             return;
         };
-        self.apply_effect(effect, cx);
+        if query_command(id) {
+            self.adopt_shell(Effect::None, cx);
+            self.forward_query(id, cx);
+        } else {
+            self.apply_effect(effect, cx);
+        }
         self.persist_if_needed();
         cx.notify();
+    }
+
+    fn query_snaps(&self) -> Vec<TabSnap> {
+        self.model
+            .tabs
+            .iter()
+            .map(|tab| TabSnap {
+                id: tab.id.clone(),
+                draft: tab.draft.clone(),
+                connection_id: tab.connection_id.clone(),
+                connection_name: tab.connection_name.clone(),
+                database: tab.database.clone(),
+                engine: tab.engine.clone(),
+            })
+            .collect()
+    }
+
+    fn forward_query(&mut self, id: &str, cx: &mut Context<Self>) {
+        let snaps = self.query_snaps();
+        let active = self.model.active_tab.clone();
+        let locale = self.model.locale();
+        let effect = self.query.update(cx, |pane, cx| {
+            let _ = pane.prepare(&snaps, active.as_deref(), locale, cx);
+            pane.command(id, cx);
+            pane.prepare(&snaps, active.as_deref(), locale, cx)
+        });
+        self.apply_query_effect(effect);
+    }
+
+    fn sync_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let snaps = self.query_snaps();
+        let active = self.model.active_tab.clone();
+        let locale = self.model.locale();
+        let effect = self.query.update(cx, |pane, cx| {
+            let effect = pane.prepare(&snaps, active.as_deref(), locale, cx);
+            pane.ensure_editors(window, cx);
+            effect
+        });
+        self.apply_query_effect(effect);
+    }
+
+    fn apply_query_effect(&mut self, effect: SyncEffect) {
+        for (id, draft) in effect.drafts {
+            if let Some(tab) = self.model.tabs.iter_mut().find(|tab| tab.id == id) {
+                tab.draft = draft;
+            }
+        }
+        for open in effect.opens {
+            self.model.open_bound_query(open.draft, open.connection_id, open.connection_name, open.database, open.engine);
+        }
+        for target in effect.targets {
+            self.model.set_query_target(&target.id, target.connection_id, target.connection_name, target.database, target.engine);
+        }
+        for tab in &mut self.model.tabs {
+            tab.running = effect.running.iter().any(|id| id == &tab.id);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn query_cell(&self, row: usize, col: usize, cx: &App) -> String {
+        self.query.read(cx).cell(row, col, cx)
+    }
+
+    #[cfg(test)]
+    pub fn query_note(&self, cx: &App) -> String {
+        self.query.read(cx).note().to_owned()
+    }
+
+    #[cfg(test)]
+    pub fn query_executed(&self, cx: &App) -> bool {
+        self.query.read(cx).executed()
+    }
+
+    #[cfg(test)]
+    pub fn query_has_object(&self, name: &str, cx: &App) -> bool {
+        self.query.read(cx).has_object(name)
+    }
+
+    #[cfg(test)]
+    pub fn query_runs(&self, cx: &App) -> u32 {
+        self.query.read(cx).run_count()
+    }
+
+    #[cfg(test)]
+    pub fn query_draft(&self, cx: &App) -> String {
+        self.query.read(cx).draft()
     }
 
     fn adopt_shell(&mut self, effect: Effect, cx: &mut Context<Self>) {
@@ -445,6 +558,7 @@ impl Render for Workbench {
         self.measure(window);
         self.boot_state(cx);
         self.pump_jobs(cx);
+        self.sync_query(window, cx);
         let frame = self.model.painted();
         let pad = px(frame.pad as f32);
         let entity = cx.entity();
@@ -456,7 +570,6 @@ impl Render for Workbench {
         let menu_open = self.model.menu.is_some();
         let prompt = self.model.close_prompt.is_some();
         let confirm_delete = self.model.connections.confirm_delete;
-        let foundation = self.foundation.clone();
         let bar = self.bar;
         let dark = matches!(self.model.shell.resolved_theme(), crate::app::ResolvedTheme::Dark);
         div()
@@ -518,7 +631,7 @@ impl Render for Workbench {
                                         })
                                         .child(command_button("menu-editor", "query.editor.area", entity.clone(), &self.model))
                                         .child(command_button("menu-grid", "grid.menu.copy", entity.clone(), &self.model))
-                                        .child(foundation),
+                                        .child(self.query.clone()),
                                 )
                             }),
                     )
@@ -542,6 +655,29 @@ impl Render for Workbench {
             .when(confirm_delete, |this| this.child(delete_layer(entity, &self.model)))
             .p(pad)
     }
+}
+
+fn query_command(id: &str) -> bool {
+    matches!(
+        id,
+        "execute-query"
+            | "run-selection"
+            | "run-current"
+            | "run-script"
+            | "request-cancel"
+            | "format"
+            | "autocomplete"
+            | "explain"
+            | "expand-star"
+            | "toggle-outline"
+            | "refresh-tree"
+            | "confirm-variables"
+            | "cancel-variables"
+            | "open-sql-file"
+            | "save-sql-file"
+    ) || id.starts_with("object:")
+        || id.starts_with("database:")
+        || id.starts_with("statement:")
 }
 
 fn nav_key(key: &str) -> Option<NavKey> {

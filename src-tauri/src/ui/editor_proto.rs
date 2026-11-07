@@ -3,7 +3,7 @@
 //! Dialect rules stay out of this gate; the prototype checks IME, long text,
 //! selection, completion, lint, folding and undo against the real control.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -22,6 +22,7 @@ use crate::app::accept_versioned;
 pub struct SqlEditor {
     state: Entity<EditorState>,
     version: Rc<Cell<u64>>,
+    extra: Rc<RefCell<Vec<String>>>,
     stale_lint: u32,
     stale_completion: u32,
     folded_lines: u32,
@@ -30,11 +31,13 @@ pub struct SqlEditor {
 
 struct SqlSuggest {
     version: Rc<Cell<u64>>,
+    extra: Rc<RefCell<Vec<String>>>,
 }
 
 impl SqlEditor {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let version = Rc::new(Cell::new(1));
+        let extra = Rc::new(RefCell::new(Vec::new()));
         let state = cx.new(|cx| {
             let mut state = EditorState::new(window, cx)
                 .language("sql")
@@ -43,6 +46,7 @@ impl SqlEditor {
                 .default_value("select 1;\n");
             state.lsp_mut().completion_provider = Some(Rc::new(SqlSuggest {
                 version: version.clone(),
+                extra: extra.clone(),
             }));
             state
         });
@@ -55,6 +59,7 @@ impl SqlEditor {
         Self {
             state,
             version,
+            extra,
             stale_lint: 0,
             stale_completion: 0,
             folded_lines: 0,
@@ -88,6 +93,10 @@ impl SqlEditor {
             state.set_value(sql, window, cx);
         });
         version.set(version.get().wrapping_add(1));
+    }
+
+    pub fn selected_range(&self, cx: &App) -> Range<usize> {
+        self.state.read(cx).selected_range()
     }
 
     pub fn select_range(&self, range: Range<usize>, cx: &mut App) {
@@ -168,6 +177,36 @@ impl SqlEditor {
         true
     }
 
+    /// Extra labels come from the dialect module. The editor still only displays them.
+    pub fn set_extra_suggestions(&self, labels: Vec<String>) {
+        *self.extra.borrow_mut() = labels;
+    }
+
+    pub fn apply_folds(&mut self, ranges: &[(usize, usize)], cx: &mut Context<Self>) -> bool {
+        if ranges.is_empty() {
+            return false;
+        }
+        let folded = ranges.iter().copied().map(|(start, end)| FoldRange::new(start, end)).collect();
+        self.state.update(cx, |state, cx| {
+            state.apply_highlighter_fold_candidates(folded, cx);
+        });
+        true
+    }
+
+    pub fn clear_lint(&mut self, response_version: u64, cx: &mut Context<Self>) -> bool {
+        if !accept_versioned(self.version.get(), response_version) {
+            self.stale_lint += 1;
+            return false;
+        }
+        self.state.update(cx, |state, _| {
+            let text = state.text().clone();
+            if let Some(set) = state.diagnostics_mut() {
+                set.reset(&text);
+            }
+        });
+        true
+    }
+
     pub fn fold_first_block(&mut self, cx: &mut Context<Self>) -> bool {
         let folded = self.state.update(cx, |state, cx| {
             state.apply_highlighter_fold_candidates(vec![FoldRange::new(0, 3)], cx);
@@ -203,13 +242,21 @@ impl Render for SqlEditor {
 }
 
 impl SqlSuggest {
-    fn items(text: &Rope, offset: usize) -> Vec<CompletionItem> {
+    fn items(&self, text: &Rope, offset: usize) -> Vec<CompletionItem> {
         let word = word_before(text, offset);
         let mut items = Vec::new();
         for keyword in ["SELECT", "FROM", "WHERE", "INSERT", "UPDATE"] {
             if word.is_empty() || keyword.to_ascii_lowercase().starts_with(&word.to_ascii_lowercase())
             {
                 items.push(completion_item(keyword));
+            }
+        }
+        for label in self.extra.borrow().iter() {
+            if items.iter().any(|item| item.label == *label) {
+                continue;
+            }
+            if word.is_empty() || label.to_ascii_lowercase().starts_with(&word.to_ascii_lowercase()) {
+                items.push(completion_item(label));
             }
         }
         items
@@ -226,7 +273,7 @@ impl CompletionProvider for SqlSuggest {
         _cx: &mut App,
     ) -> Task<gpui_kit::Result<CompletionResponse>> {
         let started = self.version.get();
-        let items = Self::items(text, offset);
+        let items = self.items(text, offset);
         let version = self.version.clone();
         Task::ready(Ok(CompletionResponse::Array(
             if accept_versioned(version.get(), started) {
@@ -423,7 +470,8 @@ mod tests {
     #[test]
     fn suggest_matches_a_prefix_without_a_window() {
         let rope = Rope::from("sel");
-        let labels: Vec<_> = SqlSuggest::items(&rope, 3)
+        let suggest = SqlSuggest { version: Rc::new(Cell::new(1)), extra: Rc::new(RefCell::new(Vec::new())) };
+        let labels: Vec<_> = suggest.items(&rope, 3)
             .into_iter()
             .map(|item| item.label)
             .collect();

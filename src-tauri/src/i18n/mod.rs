@@ -233,6 +233,42 @@ dict! {
     "grid.menu.markDelete" => "标记删除行", "Mark row for deletion";
     "grid.value.copyValue" => "复制值", "Copy value";
     "grid.errors.viewReadonly" => "视图是只读的，不能新增、修改或删除数据。", "Views are read-only; data cannot be inserted, modified or deleted.";
+    "query.run.runScript" => "执行脚本", "Run script";
+    "query.run.cancel" => "取消", "Cancel";
+    "query.outline.heading" => "语句大纲", "Statement outline";
+    "query.fileIo.open" => "打开 SQL 文件", "Open SQL file";
+    "query.fileIo.save" => "保存到文件", "Save to file";
+    "query.complete.expandStar" => "展开为列清单", "Expand to columns";
+    "query.variables.title" => "填写变量", "Fill variables";
+    "query.variables.proceed" => "继续", "Continue";
+    "query.variables.cancel" => "取消", "Cancel";
+    "query.errors.needTarget" => "请选择执行目标（连接和数据库）。", "Choose an execution target (connection and database).";
+    "query.errors.blankOnly" => "只有空白或注释，没有发送。", "Only whitespace or comments; nothing was sent.";
+    "query.errors.unknownDialect" => "未知方言，没有改写 SQL。", "Unknown dialect; the SQL was left unchanged.";
+    "query.errors.noProvider" => "没有补全提供者，没有改写 SQL。", "No completion provider; the SQL was left unchanged.";
+    "query.format.quote" => "无法格式化：引号未闭合。", "Cannot format: a quote is unclosed.";
+    "query.format.comment" => "无法格式化：注释未闭合。", "Cannot format: a comment is unclosed.";
+    "query.format.dollar" => "无法格式化：dollar-quote 未闭合。", "Cannot format: a dollar quote is unclosed.";
+    "query.format.adjacent" => "无法格式化：会把原本相连的字符拆开。", "Cannot format: that would split characters that were adjacent.";
+    "query.format.commentBreak" => "无法格式化：会把行注释断开，后面的文本会变成 SQL。", "Cannot format: that would break a line comment and turn the rest into SQL.";
+    "query.format.edgeGlue" => "无法格式化：会去掉选区边缘的空白，使两边的字符粘在一起。", "Cannot format: that would remove whitespace at the selection edge and glue the sides together.";
+    "query.plan.empty" => "没有可查看计划的语句。", "There is no statement to explain.";
+    "query.plan.multiple" => "一次只能查看一条语句的执行计划。", "Only one statement can be explained at a time.";
+    "query.plan.noAnalyze" => "计划不使用 ANALYZE，没有发送这条语句。", "Plans do not use ANALYZE; the statement was not sent.";
+    "query.plan.sqliteAnalyze" => "SQLite 不支持实际执行并分析，没有发送会修改数据的语句。", "SQLite cannot analyze by executing; no statement that could change data was sent.";
+    "query.plan.sqlserverAnalyze" => "SQL Server 的计划不实际执行语句，没有发送会修改数据的语句。", "SQL Server plans do not execute the statement; no statement that could change data was sent.";
+    "query.split.quoteUnclosed" => "引号没有闭合。", "A quote is unclosed.";
+    "query.split.blockCommentUnclosed" => "块注释没有闭合。", "A block comment is unclosed.";
+    "query.split.dollarUnclosed" => "dollar-quote 没有闭合。", "A dollar quote is unclosed.";
+    "query.split.parenUnclosed" => "括号没有闭合。", "Parentheses are unclosed.";
+    "query.fileIo.tooLarge" => "文件超过 2 MB 上限，没有载入。", "The file is over the 2 MB limit and was not loaded.";
+    "query.fileIo.saved" => "已保存 SQL 文件。", "The SQL file was saved.";
+    "query.tree.refresh" => "刷新对象树", "Refresh object tree";
+    "query.database.label" => "数据库", "Database";
+    "query.status.empty" => "空结果", "Empty result";
+    "query.status.running" => "正在执行", "Running";
+    "query.status.noObjects" => "没有对象", "No objects";
+    "query.results.statement" => "结果", "Result";
 }
 
 #[cfg(test)]

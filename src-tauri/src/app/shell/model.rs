@@ -813,6 +813,29 @@ impl WorkbenchModel {
         self.open_query_draft(String::new(), true);
     }
 
+    /// 对象树或文件打开查询：写入草稿和目标，不执行。
+    pub fn open_bound_query(&mut self, draft: String, connection_id: Option<String>, connection_name: Option<String>, database: Option<String>, engine: Option<String>) {
+        self.open_query_draft(draft, false);
+        if let Some(tab) = self.active_mut() {
+            tab.connection_id = connection_id;
+            tab.connection_name = connection_name;
+            tab.database = database;
+            tab.engine = engine;
+            tab.last_executed_sql = None;
+            tab.running = false;
+        }
+        self.shell.focus = FocusTarget::Editor;
+    }
+
+    pub fn set_query_target(&mut self, id: &str, connection_id: Option<String>, connection_name: Option<String>, database: Option<String>, engine: Option<String>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            tab.connection_id = connection_id;
+            tab.connection_name = connection_name;
+            tab.database = database;
+            tab.engine = engine;
+        }
+    }
+
     fn open_query_draft(&mut self, draft: String, keep_page: bool) {
         let id = format!("query-{}", self.tabs.len() + 1);
         let title_n = self.tabs.iter().filter(|tab| tab.kind == "query").count() + 1;
