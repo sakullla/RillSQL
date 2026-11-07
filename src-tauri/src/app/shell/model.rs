@@ -131,6 +131,9 @@ pub struct WorkbenchModel {
     pub table_spec: Option<String>,
     /// 对象树当前选中的 `id|name|database|schema|table|engine|env`。
     pub object_spec: Option<String>,
+    pub exchange_open: bool,
+    /// 导入、导出、dump 或 migrate 仍在跑。关闭守卫把它和网格暂存、查询草稿分开。
+    pub exchange_running: bool,
 }
 
 impl WorkbenchModel {
@@ -172,6 +175,8 @@ impl WorkbenchModel {
             tool: WorkTool::Query,
             table_spec: None,
             object_spec: None,
+            exchange_open: false,
+            exchange_running: false,
         }
     }
 
@@ -399,6 +404,18 @@ impl WorkbenchModel {
             "page-size-up" => self.settings.page_size = (self.settings.page_size + 50).clamp(1, 10_000),
             "preview-up" => self.settings.preview_kb = (self.settings.preview_kb + 1).clamp(1, 64),
             "tree-open-data" | "tree-copy-name" | "tree-select-sql" => self.tree_action(id),
+            "open-exchange" => {
+                self.exchange_open = !self.exchange_open;
+            }
+            "exchange-confirm"
+            | "exchange-cancel-import"
+            | "exchange-pick"
+            | "exchange-export-loaded"
+            | "exchange-export-full"
+            | "exchange-dump"
+            | "exchange-migrate"
+            | "exchange-task-cancel"
+            | "exchange-clear" => {}
             "open-admin" => {
                 self.tool = WorkTool::Admin;
                 self.shell.page = AppPage::Structure;
@@ -686,7 +703,7 @@ impl WorkbenchModel {
     }
 
     pub fn facts(&self) -> CloseFacts {
-        let running = self.running_jobs > 0 || self.tabs.iter().any(|tab| tab.running);
+        let running = self.running_jobs > 0 || self.exchange_running || self.tabs.iter().any(|tab| tab.running);
         let uncommitted = self.grid_dirty || self.tabs.iter().any(|tab| tab.uncommitted_cells);
         let draft = self.tabs.iter().any(|tab| draft_pending(&tab.kind, &tab.draft, tab.last_executed_sql.as_deref()));
         CloseFacts { running, uncommitted, draft }
@@ -986,6 +1003,7 @@ impl WorkbenchModel {
             node("menu-bar", "MenuBar", "shell.menu.file", "expanded", "menu"),
             node("toolbar", "Toolbar", "shell.command.newQuery", "enabled", "toolbar"),
             node("activity", "Navigation", "shell.nav.main", "current", "navigate"),
+            node("open-exchange", "Button", "export.open", if self.exchange_open { "expanded" } else { "enabled" }, "open-exchange"),
             node("sidebar", "Navigation", "shell.sidebar.explorer", if self.shell.sidebar_open { "expanded" } else { "collapsed" }, "navigate"),
             node("tabs", "TabList", "shell.tabs.tablist", "selected", "select"),
             node("status", "Status", "shell.statusbar.noTarget", "live", "status"),
@@ -1024,6 +1042,7 @@ impl WorkbenchModel {
             "shell.nav.connections",
             "shell.nav.history",
             "shell.nav.settings",
+            "export.open",
             "shell.sidebar.explorer",
             "shell.command.newQuery",
             "shell.command.execute",

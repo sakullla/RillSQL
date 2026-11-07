@@ -318,6 +318,35 @@ dict! {
     "structure.field.type" => "类型", "Type";
     "structure.field.index" => "索引名", "Index name";
     "structure.field.view" => "视图 SQL", "View SQL";
+    "export.open" => "导入、导出和任务", "Import, export, and tasks";
+    "export.preview.title" => "拖放文件预览", "Dropped file preview";
+    "export.preview.truncated" => "预览已按 2 MB 上限截断，确认后也只写入已读取的行。", "The preview stopped at the 2 MB limit. Confirming writes only the rows already read.";
+    "export.preview.noWrite" => "预览阶段不写入任何数据", "Nothing is written during preview";
+    "export.import.confirm" => "确认导入", "Confirm import";
+    "export.import.cancel" => "取消导入", "Cancel import";
+    "export.import.unconfirmed" => "未确认，没有写入目标表。", "Not confirmed, so the target table was not written.";
+    "export.import.onlyTable" => "只有数据表可以导入，不能写入视图。", "Only tables can be imported. Views are not written.";
+    "export.import.gaps" => "必填字段没有对应列，不能开始写入。", "Required columns are unmapped, so nothing will be written.";
+    "export.import.partial" => "导入没有全部成功。", "The import was not fully successful.";
+    "export.import.done" => "已写入全部已读取的行。", "Every read row was written.";
+    "export.import.xls" => ".xls 不能从拖放预览进入，导入对话框只读取 .xlsx。", ".xls is not a drag-preview format. The import dialog only reads .xlsx.";
+    "export.import.choose" => "选择文件", "Choose file";
+    "export.export.loaded" => "导出已读取的行", "Export loaded rows";
+    "export.export.full" => "导出全部结果", "Export the full result";
+    "export.export.partialMark" => "这不是完整结果。", "This is not the full result.";
+    "export.dump.start" => "开始全库导出", "Start full database export";
+    "export.migrate.start" => "开始跨库迁移", "Start cross-database migration";
+    "export.task.title" => "后台任务", "Background tasks";
+    "export.task.cancel" => "取消任务", "Cancel task";
+    "export.task.cancelled" => "已取消", "Cancelled";
+    "export.task.running" => "进行中", "Running";
+    "export.task.done" => "已完成", "Finished";
+    "export.task.failed" => "失败", "Failed";
+    "export.task.partial" => "部分完成", "Partly complete";
+    "export.task.blocked" => "未开始", "Not started";
+    "export.task.empty" => "没有后台任务。", "No background tasks.";
+    "export.task.clear" => "清除已结束的", "Clear finished";
+    "export.task.range" => "实际完成范围", "Actual completed range";
 }
 
 #[cfg(test)]

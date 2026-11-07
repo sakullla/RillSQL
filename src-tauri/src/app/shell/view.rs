@@ -12,6 +12,7 @@ use gpui_kit::{
 
 use crate::app::views::admin::AdminPane;
 use crate::app::views::connections::{blank_draft, engines};
+use crate::app::views::export::ExchangePane;
 use crate::app::views::grid::{GridPane, GridTarget};
 use crate::app::views::query::{QueryPane, SyncEffect, TabSnap};
 use crate::app::views::structure::StructurePane;
@@ -33,6 +34,7 @@ pub struct Workbench {
     table: Entity<GridPane>,
     structure: Entity<StructurePane>,
     admin: Entity<AdminPane>,
+    exchange: Entity<ExchangePane>,
     applied_tool: Option<String>,
     services: Arc<AppServices>,
     focus: FocusHandle,
@@ -59,6 +61,7 @@ impl Workbench {
         let table = cx.new(|cx| GridPane::new(Arc::clone(&services), window, cx));
         let structure = cx.new(|_| StructurePane::new(Arc::clone(&services)));
         let admin = cx.new(|_| AdminPane::new(Arc::clone(&services)));
+        let exchange = cx.new(|_| ExchangePane::new(Arc::clone(&services)));
         let mut model = WorkbenchModel::new(Shell::default());
         let _ = model.shell.set_prefers_dark(matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark));
         let shell = model.shell.clone();
@@ -73,6 +76,7 @@ impl Workbench {
             table,
             structure,
             admin,
+            exchange,
             applied_tool: None,
             services,
             focus: cx.focus_handle(),
@@ -93,6 +97,7 @@ impl Workbench {
     }
 
     pub fn perform(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.refresh_exchange(cx);
         if id == "quit-window" {
             if self.model.allow_system_close() {
                 cx.quit();
@@ -136,6 +141,29 @@ impl Workbench {
             } else {
                 self.apply_effect(effect, cx);
             }
+            self.persist_if_needed();
+            cx.notify();
+            return;
+        }
+        if id == "open-exchange" || id.starts_with("exchange-") {
+            if self.model.close_prompt.is_some() {
+                let _ = self.model.dispatch(id);
+                cx.notify();
+                return;
+            }
+            let _ = self.model.dispatch(id);
+            let locale = self.model.locale();
+            let open = self.model.exchange_open;
+            self.exchange.update(cx, |pane, cx| {
+                pane.set_locale(locale);
+                pane.open = open;
+                if id != "open-exchange" {
+                    pane.command(id, cx);
+                } else {
+                    cx.notify();
+                }
+            });
+            self.refresh_exchange(cx);
             self.persist_if_needed();
             cx.notify();
             return;
@@ -404,6 +432,7 @@ impl Workbench {
             let slot = allow.clone();
             if let Some(view) = view.upgrade() {
                 view.update(cx, |this, cx| {
+                    this.refresh_exchange(cx);
                     slot.set(this.model.allow_system_close());
                     cx.notify();
                 });
@@ -681,6 +710,28 @@ impl Workbench {
         cx.notify();
     }
 
+    fn refresh_exchange(&mut self, cx: &mut Context<Self>) {
+        self.model.exchange_running = self.exchange.read(cx).running();
+    }
+
+    fn accept_exchange_drop(&mut self, paths: &gpui_kit::ExternalPaths, cx: &mut Context<Self>) {
+        let mut opened = false;
+        for path in paths.paths() {
+            if let Ok(path) = crate::app::accept_drop_path(path) {
+                opened = true;
+                self.exchange.update(cx, |pane, cx| {
+                    pane.open = true;
+                    pane.preview_file(path, crate::export::ImportEntry::Drop, cx);
+                });
+            }
+        }
+        if opened {
+            self.model.exchange_open = true;
+        }
+        self.refresh_exchange(cx);
+        cx.notify();
+    }
+
     fn apply_sqlite_path(&mut self, path: std::path::PathBuf) {
         self.model.shell.note_opened(path.clone());
         let mut draft = blank_draft(Engine::Sqlite);
@@ -710,6 +761,7 @@ impl Render for Workbench {
         self.sync_query(window, cx);
         self.ensure_tool(cx);
         self.sync_grid_flags(cx);
+        self.refresh_exchange(cx);
         let frame = self.model.painted();
         let pad = px(frame.pad as f32);
         let entity = cx.entity();
@@ -731,6 +783,12 @@ impl Render for Workbench {
             .flex_col()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .on_drop({
+                let entity = entity.clone();
+                move |paths: &gpui_kit::ExternalPaths, _, cx| {
+                    entity.update(cx, |this, cx| this.accept_exchange_drop(paths, cx));
+                }
+            })
             .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" && this.model.connections.confirm_delete && this.model.menu.is_none() && this.model.close_prompt.is_none() {
                     this.perform("conn-delete-cancel", cx);
@@ -816,7 +874,8 @@ impl Render for Workbench {
             .when(palette || help, |this| this.child(palette_layer(entity.clone(), focus.clone(), &self.model)))
             .when(menu_open, |this| this.child(context_layer(entity.clone(), &self.model)))
             .when(prompt, |this| this.child(close_layer(entity.clone(), &self.model)))
-            .when(confirm_delete, |this| this.child(delete_layer(entity, &self.model)))
+            .when(confirm_delete, |this| this.child(delete_layer(entity.clone(), &self.model)))
+            .child(self.exchange.clone())
             .p(pad)
     }
 }
@@ -937,7 +996,7 @@ fn menu_bar(entity: Entity<Workbench>, open: Option<&str>, model: &WorkbenchMode
         ("shell.menu.edit", &["format", "autocomplete"][..]),
         ("shell.menu.view", &["sidebar", "theme-light", "theme-dark", "theme-system", "settings", "help"][..]),
         ("shell.menu.query", &["execute-query", "run-current", "history", "saved-queries"][..]),
-        ("shell.menu.tools", &["connections", "new-connection", "compare", "open-structure"][..]),
+        ("shell.menu.tools", &["connections", "new-connection", "compare", "open-structure", "open-exchange"][..]),
         ("shell.menu.window", &["sidebar", "close-tab", "next-tab"][..]),
         ("shell.menu.help", &["help", "settings"][..]),
     ];
@@ -991,6 +1050,7 @@ fn label_key_for(id: &str) -> &'static str {
         "close-tab" => "common.close",
         "next-tab" => "shell.shortcuts.nextTab",
         "quit" => "shell.command.quit",
+        "open-exchange" => "export.open",
         _ => "shell.menu.file",
     })
 }
@@ -1027,7 +1087,8 @@ fn activity(entity: Entity<Workbench>, model: &WorkbenchModel) -> impl IntoEleme
         .child(command_button("activity-workspace", "shell.nav.workspace", entity.clone(), model))
         .child(command_button("activity-connections", "shell.nav.connections", entity.clone(), model))
         .child(command_button("activity-history", "shell.nav.history", entity.clone(), model))
-        .child(command_button("activity-settings", "shell.nav.settings", entity, model))
+        .child(command_button("activity-settings", "shell.nav.settings", entity.clone(), model))
+        .child(command_button("open-exchange", "export.open", entity, model))
 }
 
 fn sidebar_pane(entity: Entity<Workbench>, model: &WorkbenchModel) -> impl IntoElement {

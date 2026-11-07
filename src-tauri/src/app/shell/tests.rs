@@ -124,6 +124,30 @@ fn six_menus_keyboard_and_close_guard_stay_on_one_command_layer() {
     assert!(model.close_prompt.is_none());
 }
 
+#[test]
+fn exchange_running_blocks_before_uncommitted_grid_or_query_draft() {
+    use crate::app::shell::close::{evaluate, CloseKind};
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert!(model.dispatch("open-exchange").is_some());
+    assert!(model.exchange_open);
+    model.exchange_running = true;
+    model.grid_dirty = true;
+    assert_eq!(evaluate(model.facts()), CloseKind::BlockedRunning);
+    assert!(!model.allow_system_close());
+    assert!(model.close_prompt.is_none());
+    model.exchange_running = false;
+    model.grid_dirty = true;
+    model.close_prompt = None;
+    assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: true, draft: false });
+    model.grid_dirty = false;
+    model.close_prompt = None;
+    assert!(model.dispatch("new-query").is_some());
+    model.tabs[0].draft = "select 1".into();
+    model.tabs[0].last_executed_sql = None;
+    model.tabs[0].uncommitted_cells = false;
+    assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: false, draft: true });
+}
+
 #[tokio::test]
 async fn seven_engines_round_trip_without_remote_sockets_and_history_does_not_run() {
     let dir = std::env::temp_dir().join(format!("rillsql-shell-{}", std::process::id()));

@@ -7,6 +7,7 @@ mod ddl;
 mod diagram;
 mod dropped;
 mod dump;
+mod export;
 mod grid;
 mod migrate;
 mod mongo;
