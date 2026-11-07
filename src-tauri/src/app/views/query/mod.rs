@@ -2,6 +2,7 @@
 //! 方言规则在 query::assist / query::desk；这里只提交任务和显示。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableState};
@@ -56,8 +57,6 @@ pub struct QueryPane {
     links: HashMap<String, DraftLink>,
     grid: Entity<TableState<ResultDelegate>>,
     locale: Locale,
-    note: String,
-    statement: usize,
     pending_text: Option<String>,
     opens: Vec<OpenRequest>,
     targets: Vec<TargetRequest>,
@@ -68,6 +67,15 @@ pub struct QueryPane {
     pending_completion: bool,
     pending_lint: Option<Vec<LintFinding>>,
     lint_seen: Option<(String, u64)>,
+    timeout_ms: Option<u64>,
+    polls: Arc<AtomicU32>,
+    #[cfg(test)]
+    last_timeout: Option<u64>,
+    focus_editor: bool,
+    seen_active: Option<String>,
+    fold_key: Option<(String, String)>,
+    fold_wait: Option<(String, String)>,
+    painted: Option<(Option<String>, u64, usize)>,
 }
 
 impl QueryPane {
@@ -86,8 +94,6 @@ impl QueryPane {
             links: HashMap::new(),
             grid,
             locale: Locale::ZhCn,
-            note: String::new(),
-            statement: 0,
             pending_text: None,
             opens: Vec::new(),
             targets: Vec::new(),
@@ -98,7 +104,24 @@ impl QueryPane {
             pending_completion: false,
             pending_lint: None,
             lint_seen: None,
+            timeout_ms: None,
+            polls: Arc::new(AtomicU32::new(0)),
+            #[cfg(test)]
+            last_timeout: None,
+            focus_editor: false,
+            seen_active: None,
+            fold_key: None,
+            fold_wait: None,
+            painted: None,
         }
+    }
+
+    pub fn set_query_timeout_sec(&mut self, seconds: i64) {
+        self.timeout_ms = if seconds > 0 { Some(seconds as u64 * 1000) } else { None };
+    }
+
+    pub fn request_focus(&mut self) {
+        self.focus_editor = true;
     }
 
     #[cfg(test)]
@@ -115,8 +138,31 @@ impl QueryPane {
         self.desk.executed()
     }
 
-    pub fn note(&self) -> &str {
-        &self.note
+    pub fn note(&self) -> String {
+        self.desk.active_note()
+    }
+
+    #[cfg(test)]
+    pub fn editor_focused(&self, window: &Window, cx: &App) -> bool {
+        let Some(id) = self.desk.active_id() else {
+            return false;
+        };
+        self.editors.get(id).is_some_and(|editor| editor.read(cx).is_focused(window, cx))
+    }
+
+    #[cfg(test)]
+    pub fn polls(&self) -> u32 {
+        self.polls.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn last_timeout(&self) -> Option<u64> {
+        self.last_timeout
+    }
+
+    #[cfg(test)]
+    pub fn running(&self) -> bool {
+        self.desk.active_id().is_some_and(|id| self.desk.running_ids().iter().any(|running| running == id))
     }
 
     pub fn draft(&self) -> String {
@@ -128,6 +174,11 @@ impl QueryPane {
     }
 
     pub fn command(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(connection) = id.strip_prefix("bind-connection:") {
+            self.queue_connection(connection);
+            cx.notify();
+            return;
+        }
         if let Some(database) = id.strip_prefix("database:") {
             self.queue_database(database);
             cx.notify();
@@ -148,8 +199,8 @@ impl QueryPane {
         }
         if let Some(index) = id.strip_prefix("statement:") {
             if let Ok(index) = index.parse::<usize>() {
-                self.statement = index;
-                self.refresh_grid(cx);
+                self.desk.set_statement(index);
+                self.rebind_grid(cx);
             }
             cx.notify();
             return;
@@ -190,6 +241,13 @@ impl QueryPane {
     /// 把外壳标签和编辑器草稿对齐。不创建编辑器，所以命令层没有 Window 也能调用。
     pub fn prepare(&mut self, tabs: &[TabSnap], active: Option<&str>, locale: Locale, cx: &App) -> SyncEffect {
         self.locale = locale;
+        let next = active.map(str::to_owned);
+        if next != self.seen_active {
+            self.seen_active = next;
+            if self.seen_active.is_some() {
+                self.focus_editor = true;
+            }
+        }
         let ids: Vec<String> = tabs.iter().map(|tab| tab.id.clone()).collect();
         for tab in tabs {
             self.desk.import_tab(&tab.id, &tab.draft, target_of(tab));
@@ -263,11 +321,9 @@ impl QueryPane {
     }
 
     pub fn show_sheet(&mut self, columns: Vec<String>, rows: Vec<Vec<String>>, cx: &mut App) {
-        self.grid.update(cx, |state, cx| {
-            state.delegate_mut().columns = columns;
-            state.delegate_mut().rows = rows;
-            state.refresh(cx);
-        });
+        let rows = rows.into_iter().map(|row| row.into_iter().map(Some).collect()).collect();
+        self.desk.set_active_sheet(columns, rows);
+        self.rebind_grid(cx);
     }
 
     fn capture(&mut self, cx: &App) {
@@ -328,11 +384,11 @@ impl QueryPane {
                 for field in fields {
                     self.variable_values.insert(field.key, String::new());
                 }
-                self.note = i18n::text(self.locale, "query.variables.title");
+                self.desk.set_active_note(&i18n::text(self.locale, "query.variables.title"));
                 cx.notify();
             }
             BeginRun::Rejected(reason) => {
-                self.note = reason;
+                self.desk.set_active_note(&reason);
                 cx.notify();
             }
         }
@@ -341,6 +397,13 @@ impl QueryPane {
     fn spawn_run(&mut self, prepared: PreparedRun, cx: &mut Context<Self>) {
         let ticket = Ticket { tab_id: prepared.tab_id.clone(), token: prepared.token, version: prepared.version };
         let services = Arc::clone(&self.services);
+        let timeout_ms = self.timeout_ms;
+        #[cfg(test)]
+        {
+            self.last_timeout = timeout_ms;
+        }
+        self.polls.store(0, Ordering::Relaxed);
+        let polls = Arc::clone(&self.polls);
         let (id_tx, id_rx) = tokio::sync::oneshot::channel();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         runtime().spawn(async move {
@@ -354,7 +417,7 @@ impl QueryPane {
                     engine: prepared.engine.clone(),
                     sql: prepared.sql.clone(),
                     limit: prepared.limit,
-                    timeout_ms: None,
+                    timeout_ms,
                 },
             )
             .await
@@ -366,20 +429,24 @@ impl QueryPane {
                 }
             };
             let _ = id_tx.send(started.id.clone());
-            for _ in 0..400 {
+            loop {
                 match crate::query::commands::poll_run(&services.query, &started.id, false).await {
                     Ok(snap) if !matches!(snap.status.as_str(), "running" | "cancel-requested") => {
+                        polls.fetch_add(1, Ordering::Relaxed);
                         let _ = done_tx.send(Ok(snap));
                         return;
                     }
-                    Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+                    Ok(_) => {
+                        polls.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
                     Err(error) => {
+                        polls.fetch_add(1, Ordering::Relaxed);
                         let _ = done_tx.send(Err(error));
                         return;
                     }
                 }
             }
-            let _ = done_tx.send(Err("执行没有结束".to_owned()));
         });
         let tab_id = ticket.tab_id.clone();
         let view = cx.entity().downgrade();
@@ -401,13 +468,16 @@ impl QueryPane {
                         view.update(cx, |pane, cx| {
                             match result {
                                 Ok(run) => {
-                                    if !pane.desk.accept_run(&pane.services.tasks, &ticket, run) && pane.note.is_empty() {
-                                        pane.note = i18n::text(pane.locale, "query.run.cancel");
+                                    let accepted = pane.desk.accept_run(&pane.services.tasks, &ticket, run);
+                                    if accepted {
+                                        pane.desk.set_note(&ticket.tab_id, "");
+                                    } else if pane.desk.note_of(&ticket.tab_id).is_empty() {
+                                        pane.desk.set_note(&ticket.tab_id, &i18n::text(pane.locale, "query.run.cancel"));
                                     }
                                 }
-                                Err(error) => pane.note = error,
+                                Err(error) => pane.desk.stop_run(&ticket.tab_id, &error),
                             }
-                            pane.refresh_grid(cx);
+                            pane.rebind_grid(cx);
                             cx.notify();
                         });
                     }
@@ -415,7 +485,7 @@ impl QueryPane {
             }
         })
         .detach();
-        self.note = i18n::text(self.locale, "query.status.running");
+        self.desk.set_active_note(&i18n::text(self.locale, "query.status.running"));
         cx.notify();
     }
 
@@ -431,7 +501,7 @@ impl QueryPane {
         if let Some(run_id) = run_id {
             self.spawn_cancel(run_id, cx);
         }
-        self.note = i18n::text(self.locale, "query.run.cancel");
+        self.desk.set_active_note(&i18n::text(self.locale, "query.run.cancel"));
         cx.notify();
     }
 
@@ -447,9 +517,9 @@ impl QueryPane {
         let formatted = self.desk.format_active();
         if formatted.ok {
             self.pending_text = Some(formatted.sql);
-            self.note.clear();
+            self.desk.set_active_note("");
         } else if let Some(key) = formatted.reason_key {
-            self.note = i18n::text(self.locale, key);
+            self.desk.set_active_note(&i18n::text(self.locale, key));
         }
         cx.notify();
     }
@@ -459,7 +529,7 @@ impl QueryPane {
         if expanded.ok {
             self.pending_text = Some(expanded.sql);
         } else if let Some(key) = expanded.reason_key {
-            self.note = i18n::text(self.locale, key);
+            self.desk.set_active_note(&i18n::text(self.locale, key));
         }
         cx.notify();
     }
@@ -468,7 +538,7 @@ impl QueryPane {
         match self.desk.explain_active() {
             Ok(sql) => self.start(RunScope::Script, Some(sql), cx),
             Err(reason) => {
-                self.note = reason;
+                self.desk.set_active_note(&reason);
                 cx.notify();
             }
         }
@@ -478,13 +548,14 @@ impl QueryPane {
         let Some(id) = self.desk.active_id().map(str::to_owned) else {
             return;
         };
-        let items = self.desk.completion_for("");
-        let labels: Vec<String> = items.iter().map(|item| item.label.clone()).collect();
+        let prefix = self.editors.get(&id).map(|editor| editor.read(cx).completion_prefix(cx)).unwrap_or_default();
+        let items = self.desk.completion_for(&prefix);
+        let pairs: Vec<(String, String)> = items.iter().map(|item| (item.label.clone(), item.insert.clone())).collect();
         if let Some(ticket) = self.desk.issue(&self.services.tasks) {
             let _ = self.desk.accept_completion(&self.services.tasks, &ticket, items);
         }
         if let Some(editor) = self.editors.get(&id) {
-            editor.update(cx, |editor, _| editor.set_extra_suggestions(labels));
+            editor.update(cx, |editor, _| editor.set_extra_suggestions(pairs));
         }
         self.pending_completion = true;
         cx.notify();
@@ -509,18 +580,19 @@ impl QueryPane {
                 let _ = cx.update(|cx| {
                     this.update(cx, |pane, cx| {
                         match loaded {
-                            Ok((objects, databases, columns)) => {
-                                pane.desk.set_objects(objects, databases);
-                                for (key, cols) in columns {
+                            Ok(loaded) => {
+                                pane.desk.set_objects(loaded.objects, loaded.databases);
+                                pane.desk.set_links(loaded.links);
+                                for (key, cols) in loaded.columns {
                                     let mut parts = key.split('\u{1}');
                                     let connection = parts.next().unwrap_or("");
                                     let database = parts.next().unwrap_or("");
                                     let table = parts.next().unwrap_or("");
                                     pane.desk.remember_columns(connection, database, table, cols);
                                 }
-                                pane.note.clear();
+                                pane.desk.set_active_note("");
                             }
-                            Err(error) => pane.note = error,
+                            Err(error) => pane.desk.set_active_note(&error),
                         }
                         cx.notify();
                     })
@@ -540,10 +612,16 @@ impl QueryPane {
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = receiver.await {
                 if let Some(path) = paths.into_iter().next() {
-                    let loaded = assist::read_sql_file(&path);
-                    let _ = cx.update(|cx| {
-                        let _ = this.update(cx, |pane, cx| pane.finish_open(loaded, cx));
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    runtime().spawn(async move {
+                        let loaded = crate::application::run_blocking(move || assist::read_sql_file(&path)).await;
+                        let _ = tx.send(loaded);
                     });
+                    if let Ok(loaded) = rx.await {
+                        let _ = cx.update(|cx| {
+                            let _ = this.update(cx, |pane, cx| pane.finish_open(loaded, cx));
+                        });
+                    }
                 }
             }
         })
@@ -554,7 +632,7 @@ impl QueryPane {
         match loaded {
             Ok(file) => {
                 if file.execute {
-                    self.note = i18n::text(self.locale, "history.page.loadOnlySql");
+                    self.desk.set_active_note(&i18n::text(self.locale, "history.page.loadOnlySql"));
                     return;
                 }
                 let Some(id) = self.desk.active_id().map(str::to_owned) else {
@@ -575,9 +653,9 @@ impl QueryPane {
                     link.applied = link.editor.clone();
                     link.dirty = true;
                 }
-                self.note = i18n::text(self.locale, "history.page.loadOnlySql");
+                self.desk.set_active_note(&i18n::text(self.locale, "history.page.loadOnlySql"));
             }
-            Err(error) => self.note = error,
+            Err(error) => self.desk.set_active_note(&error),
         }
         cx.notify();
     }
@@ -590,25 +668,44 @@ impl QueryPane {
         let receiver = cx.prompt_for_new_path(&directory, Some(&name));
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(path))) = receiver.await {
-                let wrote = assist::write_sql_file(&path, &sql);
-                let _ = cx.update(|cx| {
-                    this.update(cx, |pane, cx| {
-                        pane.note = match wrote {
-                            Ok(()) => i18n::text(pane.locale, "query.fileIo.saved"),
-                            Err(error) => error,
-                        };
-                        cx.notify();
-                    })
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                runtime().spawn(async move {
+                    let wrote = crate::application::run_blocking(move || assist::write_sql_file(&path, &sql)).await;
+                    let _ = tx.send(wrote);
                 });
+                if let Ok(wrote) = rx.await {
+                    let _ = cx.update(|cx| {
+                        this.update(cx, |pane, cx| {
+                            pane.desk.set_active_note(&match wrote {
+                                Ok(()) => i18n::text(pane.locale, "query.fileIo.saved"),
+                                Err(error) => error,
+                            });
+                            cx.notify();
+                        })
+                    });
+                }
             }
         })
         .detach();
     }
 
+    fn rebind_grid(&mut self, cx: &mut App) {
+        self.refresh_grid(cx);
+        self.painted = Some((self.desk.active_id().map(str::to_owned), self.desk.view_gen(), self.desk.statement()));
+    }
+
+    fn sync_grid(&mut self, cx: &mut App) {
+        let key = (self.desk.active_id().map(str::to_owned), self.desk.view_gen(), self.desk.statement());
+        if self.painted.as_ref() == Some(&key) {
+            return;
+        }
+        self.rebind_grid(cx);
+    }
+
     fn refresh_grid(&mut self, cx: &mut App) {
         let results = self.desk.results();
-        self.statement = self.statement.min(results.len().saturating_sub(1));
-        let Some(sheet) = results.get(self.statement) else {
+        let index = if results.is_empty() { 0 } else { self.desk.statement().min(results.len() - 1) };
+        let Some(sheet) = results.get(index) else {
             self.grid.update(cx, |state, cx| {
                 state.delegate_mut().columns.clear();
                 state.delegate_mut().rows.clear();
@@ -646,12 +743,6 @@ impl QueryPane {
                     link.dirty = false;
                 }
                 self.desk.refresh_outline();
-                if let Some(editor) = self.editors.get(id).cloned() {
-                    let ranges = assist::fold_line_ranges(&sql, self.desk.target().map(|target| target.engine).as_deref().unwrap_or("sqlite"));
-                    editor.update(cx, |editor, cx| {
-                        let _ = editor.apply_folds(&ranges, cx);
-                    });
-                }
             }
         }
         if self.pending_completion {
@@ -680,6 +771,43 @@ impl QueryPane {
         }
     }
 
+    /// 高亮会在消化文本改动的那一帧覆盖折叠候选，所以等到下一帧再安装。
+    fn refresh_folds(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.desk.active_id().map(str::to_owned) else {
+            return;
+        };
+        let Some(editor) = self.editors.get(&id).cloned() else {
+            return;
+        };
+        let sql = editor.read(cx).value(cx);
+        let key = (id, sql.clone());
+        if self.fold_key.as_ref() == Some(&key) {
+            return;
+        }
+        if self.fold_wait.as_ref() != Some(&key) {
+            self.fold_wait = Some(key);
+            return;
+        }
+        self.fold_key = Some(key);
+        self.fold_wait = None;
+        let engine = self.desk.target().map(|target| target.engine).filter(|engine| !engine.is_empty()).unwrap_or_else(|| "sqlite".to_owned());
+        let ranges = assist::fold_line_ranges(&sql, &engine);
+        editor.update(cx, |editor, cx| {
+            let _ = editor.apply_folds(&ranges, cx);
+        });
+    }
+
+    fn take_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus_editor {
+            return;
+        }
+        let Some(editor) = self.desk.active_id().and_then(|id| self.editors.get(id)).cloned() else {
+            return;
+        };
+        self.focus_editor = false;
+        editor.update(cx, |editor, cx| editor.focus(window, cx));
+    }
+
     fn queue_object(&mut self, object: &TreeObject) {
         self.opens.push(OpenRequest {
             draft: assist::browse_sql(&object.engine, &object.schema, &object.name),
@@ -706,19 +834,40 @@ impl QueryPane {
             }
         }
     }
+
+    fn queue_connection(&mut self, id: &str) {
+        let Some(tab_id) = self.desk.active_id().map(str::to_owned) else {
+            return;
+        };
+        if self.desk.select_connection(id) {
+            if let Some(target) = self.desk.target() {
+                self.targets.push(TargetRequest {
+                    id: tab_id,
+                    connection_id: Some(target.connection_id),
+                    connection_name: Some(target.connection_name),
+                    database: Some(target.database),
+                    engine: Some(target.engine),
+                });
+            }
+        }
+    }
 }
 
 impl Render for QueryPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.apply_pending(window, cx);
+        self.refresh_folds(cx);
+        self.sync_grid(cx);
+        self.take_focus(window, cx);
         let locale = self.locale;
         let label = |key| SharedString::from(i18n::text(locale, key));
         let objects = self.desk.objects().to_vec();
+        let links = self.desk.links().to_vec();
         let databases = self.desk.databases().to_vec();
         let outline = self.desk.outline();
         let results = self.desk.results();
         let variables = self.desk.variables();
-        let note = self.note.clone();
+        let note = self.desk.active_note();
         let editor = self.desk.active_id().and_then(|id| self.editors.get(id)).cloned();
         let grid = self.grid.clone();
         let mut column = div().id("query-pane").flex().flex_col().size_full().gap(px(4.));
@@ -738,6 +887,15 @@ impl Render for QueryPane {
                 .child(action_button("save-sql-file", label("query.fileIo.save"), cx))
                 .child(action_button("refresh-tree", label("query.tree.refresh"), cx)),
         );
+        if !links.is_empty() {
+            let mut row = div().id("query-connections").flex().gap(px(4.));
+            for link in links {
+                let id = link.id.clone();
+                let name = if link.name.is_empty() { id.clone() } else { link.name.clone() };
+                row = row.child(action_button(&format!("bind-connection:{id}"), SharedString::from(name), cx));
+            }
+            column = column.child(row);
+        }
         if !databases.is_empty() {
             let mut row = div().id("query-databases").flex().gap(px(4.));
             for database in databases {
@@ -1104,6 +1262,229 @@ mod tests {
             });
         })
         .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn bound(id: &str, draft: &str) -> TabSnap {
+        TabSnap {
+            id: id.to_owned(),
+            draft: draft.to_owned(),
+            connection_id: Some("notes".to_owned()),
+            connection_name: Some("笔记".to_owned()),
+            database: Some("main".to_owned()),
+            engine: Some("sqlite".to_owned()),
+        }
+    }
+
+    #[gpui_kit::test]
+    fn switching_tabs_keeps_each_result(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let a = bound("a", "select a");
+        let b = bound("b", "select b");
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&a), Some("a"), Locale::ZhCn, window, cx);
+                pane.show_sheet(vec!["label".to_owned()], vec![vec!["真实".to_owned()]], cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).cell(0, 0, cx), "真实");
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(&[a.clone(), b.clone()], Some("b"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            assert_ne!(pane.read(cx).cell(0, 0, cx), "真实");
+            pane.update(cx, |pane, _| pane.desk.set_note("a", "迟到失败"));
+            window.render_frame(cx);
+            assert_ne!(pane.read(cx).note(), "迟到失败");
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(&[a.clone(), b.clone()], Some("a"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).cell(0, 0, cx), "真实");
+            assert_eq!(pane.read(cx).note(), "迟到失败");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn draft_installs_fold_candidates(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let snap = bound("fold", "select 1\nfrom item;\n");
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&snap), Some("fold"), Locale::ZhCn, window, cx);
+                assert!(pane.pending_text.is_none());
+            });
+            window.render_frame(cx);
+            window.render_frame(cx);
+            let folded = pane.update(cx, |pane, cx| pane.editors.get("fold").unwrap().read(cx).fold_candidate(0, cx));
+            assert!(folded, "草稿应用到编辑器后没有折叠候选");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn completion_inserts_snippet_text_and_lists_object_names(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let snap = bound("q", "ord");
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&snap), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.set_objects(
+                    vec![TreeObject {
+                        connection_id: "notes".to_owned(),
+                        connection_name: "笔记".to_owned(),
+                        engine: "sqlite".to_owned(),
+                        database: "main".to_owned(),
+                        schema: String::new(),
+                        name: "orders".to_owned(),
+                        kind: "table".to_owned(),
+                    }],
+                    vec!["main".to_owned()],
+                );
+                let editor = pane.editors.get("q").unwrap().clone();
+                editor.update(cx, |editor, cx| editor.select_range(3..3, cx));
+                pane.command("autocomplete", cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            let (labels, insert) = pane.update(cx, |pane, cx| {
+                let editor = pane.editors.get("q").unwrap().clone();
+                (editor.read(cx).completion_labels(cx), editor.read(cx).completion_insert("orders", cx))
+            });
+            assert!(labels.iter().any(|label| label == "orders"), "{labels:?}");
+            assert_eq!(insert.as_deref(), Some("orders"));
+            pane.update(cx, |pane, cx| {
+                let editor = pane.editors.get("q").unwrap().clone();
+                editor.update(cx, |editor, cx| {
+                    editor.set_sql("select", window, cx);
+                    editor.select_range(6..6, cx);
+                });
+                pane.command("autocomplete", cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let editor = pane.editors.get("q").unwrap().clone();
+                assert_eq!(editor.read(cx).completion_insert("select-from", cx).as_deref(), Some("SELECT  FROM "));
+                let version = editor.read(cx).version();
+                editor.update(cx, |editor, cx| {
+                    assert!(editor.apply_completion_insert(version, "select-from", "SELECT  FROM ", window, cx));
+                });
+                let text = editor.read(cx).value(cx);
+                assert!(text.contains("SELECT  FROM "), "{text}");
+                assert!(!text.contains("select-from"), "{text}");
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn opening_or_activating_a_query_focuses_its_editor(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("rillsql-focus-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        cx.update(gpui_kit::init);
+        let (window, view) = cx.update(|cx| {
+            let bounds = gpui_kit::Bounds { origin: Point::default(), size: size(px(1100.), px(720.)) };
+            let (window, view) = gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |window, cx| cx.new(|cx| crate::app::shell::Workbench::with_services(window, cx, services, false)),
+            )
+            .expect("workbench");
+            (window.into(), view)
+        });
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| view.perform("new-query", cx));
+            window.render_frame(cx);
+            view.update(cx, |view, cx| assert!(view.query_editor_focused(window, cx), "新建查询没有把焦点交给编辑器"));
+            let first = view.read(cx).model.active_tab.clone().unwrap();
+            view.update(cx, |view, cx| view.perform("new-query", cx));
+            window.render_frame(cx);
+            view.update(cx, |view, cx| {
+                assert_ne!(view.model.active_tab.as_deref(), Some(first.as_str()));
+                assert!(view.query_editor_focused(window, cx), "新标签的编辑器没有获得焦点");
+                view.model.active_tab = Some(first);
+            });
+            window.render_frame(cx);
+            view.update(cx, |view, cx| assert!(view.query_editor_focused(window, cx), "切回的查询编辑器没有获得焦点"));
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    fn long_select_keeps_polling_past_ten_seconds(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("rillsql-slow-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("slow.sqlite");
+        let config_dir = dir.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime().spawn(async move {
+            let setup = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE item (id INTEGER PRIMARY KEY)").execute(&setup).await.unwrap();
+            setup.close().await;
+            let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(config_dir.join("connections.sqlite")))));
+            services.connections.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+            let _ = tx.send(services);
+        });
+        let services = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite setup");
+        cx.update(gpui_kit::init);
+        let (window, pane) = cx.update(|cx| {
+            let bounds = gpui_kit::Bounds { origin: Point::default(), size: size(px(1100.), px(720.)) };
+            let (window, pane) = gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |window, cx| cx.new(|cx| QueryPane::new(services, window, cx)),
+            )
+            .expect("query pane");
+            (window.into(), pane)
+        });
+        let sql = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 36000) SELECT count(*) FROM c a, c b";
+        let snap = bound("slow", sql);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.set_query_timeout_sec(15);
+                let _ = pane.sync(std::slice::from_ref(&snap), Some("slow"), Locale::ZhCn, window, cx);
+                pane.command("execute-query", cx);
+                assert_eq!(pane.last_timeout(), Some(15_000));
+                assert!(pane.running());
+            });
+        })
+        .unwrap();
+        let started = std::time::Instant::now();
+        let mut landed = false;
+        let mut note = String::new();
+        let mut polls = 0u32;
+        while started.elapsed() < std::time::Duration::from_secs(60) {
+            cx.run_until_parked();
+            let _ = cx.update_window(window, |_, window, cx| window.render_frame(cx));
+            landed = cx.update(|cx| pane.read(cx).cell(0, 0, cx) == "1296000000");
+            note = cx.update(|cx| pane.read(cx).note());
+            polls = cx.update(|cx| pane.read(cx).polls());
+            if landed {
+                break;
+            }
+            if note == "执行没有结束" {
+                break;
+            }
+        }
+        assert_ne!(note, "执行没有结束");
+        assert!(landed, "超过 10 秒的 SELECT 没有回到结果：{note} polls={polls}");
+        assert!(polls > 400, "轮询次数 {polls} 没有越过原来的 400 次上限");
+        assert!(!cx.update(|cx| pane.read(cx).running()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

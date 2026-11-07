@@ -12,7 +12,7 @@ use gpui_kit::component::input::{
     CompletionProvider, Editor, EditorState, FoldRange, InputEvent, Rope,
 };
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EntityInputHandler as _, InteractiveElement as _,
+    App, AppContext as _, Context, Entity, EntityInputHandler as _, Focusable as _, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, Styled as _, Task, Window, div, px,
 };
 use lsp_types::{CompletionContext, CompletionItem, CompletionResponse};
@@ -22,7 +22,7 @@ use crate::app::accept_versioned;
 pub struct SqlEditor {
     state: Entity<EditorState>,
     version: Rc<Cell<u64>>,
-    extra: Rc<RefCell<Vec<String>>>,
+    extra: Rc<RefCell<Vec<(String, String)>>>,
     stale_lint: u32,
     stale_completion: u32,
     folded_lines: u32,
@@ -31,7 +31,7 @@ pub struct SqlEditor {
 
 struct SqlSuggest {
     version: Rc<Cell<u64>>,
-    extra: Rc<RefCell<Vec<String>>>,
+    extra: Rc<RefCell<Vec<(String, String)>>>,
 }
 
 impl SqlEditor {
@@ -77,6 +77,27 @@ impl SqlEditor {
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
         self.state.update(cx, |state, cx| state.focus(window, cx));
+    }
+
+    pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.state.read(cx).focus_handle(cx).is_focused(window)
+    }
+
+    /// 光标前连续的标识符，作为补全前缀。
+    pub fn completion_prefix(&self, cx: &App) -> String {
+        let value = self.value(cx);
+        let mut end = self.selected_range(cx).end.min(value.len());
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value[..end]
+            .chars()
+            .rev()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect()
     }
 
     pub fn value(&self, cx: &App) -> String {
@@ -162,6 +183,7 @@ impl SqlEditor {
         &mut self,
         response_version: u64,
         label: &str,
+        insert: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -169,7 +191,7 @@ impl SqlEditor {
             self.stale_completion += 1;
             return false;
         }
-        let item = completion_item(label);
+        let item = completion_item(label, insert);
         self.state.update(cx, |state, cx| {
             let range = state.selected_range();
             state.insert_completion(&item, range, window, cx);
@@ -177,20 +199,21 @@ impl SqlEditor {
         true
     }
 
-    /// Extra labels come from the dialect module. The editor still only displays them.
-    pub fn set_extra_suggestions(&self, labels: Vec<String>) {
-        *self.extra.borrow_mut() = labels;
+    pub fn completion_insert(&self, label: &str, cx: &App) -> Option<String> {
+        self.state.read(cx).completion_menu_state().items.iter().find(|item| item.label == label).and_then(|item| item.insert_text.clone())
+    }
+
+    /// 方言模块给出的 (显示名, 插入文本)。编辑器按插入文本写入。
+    pub fn set_extra_suggestions(&self, items: Vec<(String, String)>) {
+        *self.extra.borrow_mut() = items;
     }
 
     pub fn apply_folds(&mut self, ranges: &[(usize, usize)], cx: &mut Context<Self>) -> bool {
-        if ranges.is_empty() {
-            return false;
-        }
         let folded = ranges.iter().copied().map(|(start, end)| FoldRange::new(start, end)).collect();
         self.state.update(cx, |state, cx| {
             state.apply_highlighter_fold_candidates(folded, cx);
         });
-        true
+        !ranges.is_empty()
     }
 
     pub fn clear_lint(&mut self, response_version: u64, cx: &mut Context<Self>) -> bool {
@@ -248,15 +271,15 @@ impl SqlSuggest {
         for keyword in ["SELECT", "FROM", "WHERE", "INSERT", "UPDATE"] {
             if word.is_empty() || keyword.to_ascii_lowercase().starts_with(&word.to_ascii_lowercase())
             {
-                items.push(completion_item(keyword));
+                items.push(completion_item(keyword, keyword));
             }
         }
-        for label in self.extra.borrow().iter() {
+        for (label, insert) in self.extra.borrow().iter() {
             if items.iter().any(|item| item.label == *label) {
                 continue;
             }
             if word.is_empty() || label.to_ascii_lowercase().starts_with(&word.to_ascii_lowercase()) {
-                items.push(completion_item(label));
+                items.push(completion_item(label, insert));
             }
         }
         items
@@ -291,10 +314,10 @@ impl CompletionProvider for SqlSuggest {
     }
 }
 
-fn completion_item(label: &str) -> CompletionItem {
+fn completion_item(label: &str, insert: &str) -> CompletionItem {
     CompletionItem {
         label: label.to_string(),
-        insert_text: Some(label.to_string()),
+        insert_text: Some(insert.to_string()),
         ..CompletionItem::default()
     }
 }
@@ -417,11 +440,11 @@ mod tests {
             );
             let current = editor.read(cx).version();
             assert!(editor.update(cx, |editor, cx| {
-                editor.apply_completion_insert(current, "SELECT", window, cx)
+                editor.apply_completion_insert(current, "SELECT", "SELECT", window, cx)
             }));
             assert!(editor.read(cx).value(cx).contains("SELECT"));
             assert!(!editor.update(cx, |editor, cx| {
-                editor.apply_completion_insert(current.saturating_sub(1), "STALE_WORD", window, cx)
+                editor.apply_completion_insert(current.saturating_sub(1), "STALE_WORD", "STALE_WORD", window, cx)
             }));
             assert!(!editor.read(cx).value(cx).contains("STALE_WORD"));
             assert_eq!(editor.read(cx).stale_completion, 1);
@@ -476,5 +499,12 @@ mod tests {
             .map(|item| item.label)
             .collect();
         assert_eq!(labels, vec!["SELECT".to_string()]);
+        let snippet = Rope::from("select");
+        let suggest = SqlSuggest {
+            version: Rc::new(Cell::new(1)),
+            extra: Rc::new(RefCell::new(vec![("select-from".to_owned(), "SELECT  FROM ".to_owned())])),
+        };
+        let item = suggest.items(&snippet, 6).into_iter().find(|item| item.label == "select-from").expect("snippet");
+        assert_eq!(item.insert_text.as_deref(), Some("SELECT  FROM "));
     }
 }

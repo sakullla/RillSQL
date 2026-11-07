@@ -5,6 +5,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::application::tasks::{TaskBoard, TaskOutcome, TaskToken};
+use crate::catalog::{read_catalog_session, ConnectionBody, ObjectKind};
+use crate::connections::model::Engine;
 use crate::connections::{CatalogSession, Service};
 
 use super::assist::{self, CatalogObject, CompletionEntry, CompletionSource, LintFinding, OutlineItem, RunPick, RunScope, TextResult, TreeObject, VariableInput};
@@ -64,6 +66,16 @@ struct TabState {
     outline: Vec<OutlineItem>,
     pending: Option<PendingSend>,
     provider: bool,
+    note: String,
+    statement: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenLink {
+    pub id: String,
+    pub name: String,
+    pub engine: String,
+    pub databases: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,8 +99,11 @@ pub struct Desk {
     objects: Vec<TreeObject>,
     columns: HashMap<String, Vec<String>>,
     databases: Vec<String>,
+    links: Vec<OpenLink>,
     executions: u32,
     loads: u32,
+    view_gen: u64,
+    idle_note: String,
 }
 
 impl Desk {
@@ -100,8 +115,11 @@ impl Desk {
             objects: Vec::new(),
             columns: HashMap::new(),
             databases: Vec::new(),
+            links: Vec::new(),
             executions: 0,
             loads: 0,
+            view_gen: 0,
+            idle_note: String::new(),
         }
     }
 
@@ -209,6 +227,8 @@ impl Desk {
             outline: Vec::new(),
             pending: None,
             provider: true,
+            note: String::new(),
+            statement: 0,
         });
         if self.active.is_none() {
             self.active = Some(id.to_owned());
@@ -241,11 +261,14 @@ impl Desk {
         tab.running = false;
         tab.cancelled = false;
         tab.results.clear();
+        tab.note.clear();
+        tab.statement = 0;
         tab.token = None;
         tab.run_id = None;
         tab.pending = None;
         tab.status.clear();
         self.loads += 1;
+        self.view_gen = self.view_gen.saturating_add(1);
     }
 
     pub fn set_tab_draft(&mut self, id: &str, sql: &str) {
@@ -300,16 +323,148 @@ impl Desk {
     }
 
     pub fn select_database(&mut self, database: &str) -> bool {
+        if database.is_empty() || self.active.is_none() {
+            return false;
+        }
+        let bound = self.active_tab().and_then(|tab| tab.target.as_ref()).is_some_and(|target| !target.connection_id.is_empty());
+        if bound {
+            if let Some(target) = self.active_mut().and_then(|tab| tab.target.as_mut()) {
+                target.database = database.to_owned();
+            }
+            self.remember_database(database);
+            return true;
+        }
+        let Some(link) = self.link_for_database(database) else {
+            return false;
+        };
+        self.bind_link(&link, database)
+    }
+
+    /// 给还没有目标的活动查询选一条已打开的连接。
+    pub fn select_connection(&mut self, id: &str) -> bool {
+        let Some(link) = self.links.iter().find(|link| link.id == id).cloned() else {
+            return false;
+        };
+        let database = link
+            .databases
+            .iter()
+            .find(|name| !name.is_empty())
+            .cloned()
+            .unwrap_or_else(|| if link.engine == "sqlite" { "main".to_owned() } else { String::new() });
+        if database.is_empty() {
+            return false;
+        }
+        self.bind_link(&link, &database)
+    }
+
+    pub fn set_links(&mut self, links: Vec<OpenLink>) {
+        self.links = links;
+    }
+
+    pub fn links(&self) -> &[OpenLink] {
+        &self.links
+    }
+
+    pub fn view_gen(&self) -> u64 {
+        self.view_gen
+    }
+
+    pub fn active_note(&self) -> String {
+        self.active_tab().map(|tab| tab.note.clone()).unwrap_or_else(|| self.idle_note.clone())
+    }
+
+    pub fn note_of(&self, id: &str) -> String {
+        self.tabs.iter().find(|tab| tab.id == id).map(|tab| tab.note.clone()).unwrap_or_default()
+    }
+
+    pub fn set_note(&mut self, id: &str, text: &str) {
+        let found = self.tabs.iter_mut().find(|tab| tab.id == id).map(|tab| {
+            tab.note = text.to_owned();
+        });
+        if found.is_some() {
+            self.view_gen = self.view_gen.saturating_add(1);
+        }
+    }
+
+    pub fn set_active_note(&mut self, text: &str) {
+        if let Some(id) = self.active.clone() {
+            self.set_note(&id, text);
+        } else {
+            self.idle_note = text.to_owned();
+        }
+    }
+
+    pub fn statement(&self) -> usize {
+        self.active_tab().map(|tab| tab.statement).unwrap_or(0)
+    }
+
+    pub fn set_statement(&mut self, index: usize) {
+        if self.active_mut().is_some_and(|tab| {
+            tab.statement = index;
+            true
+        }) {
+            self.view_gen = self.view_gen.saturating_add(1);
+        }
+    }
+
+    /// 测试或外部结果直接写到活动标签，不记成已执行。
+    pub fn set_active_sheet(&mut self, columns: Vec<String>, rows: Vec<Vec<Option<String>>>) {
+        let wrote = self.active_mut().map(|tab| {
+            tab.results = vec![StatementView {
+                sql: String::new(),
+                status: "ok".to_owned(),
+                message: String::new(),
+                columns,
+                rows,
+                affected: None,
+            }];
+            tab.statement = 0;
+        });
+        if wrote.is_some() {
+            self.view_gen = self.view_gen.saturating_add(1);
+        }
+    }
+
+    pub fn stop_run(&mut self, id: &str, note: &str) {
+        let found = self.tab_mut(id).map(|tab| {
+            tab.running = false;
+            tab.status = "error".to_owned();
+            tab.note = note.to_owned();
+        });
+        if found.is_some() {
+            self.view_gen = self.view_gen.saturating_add(1);
+        }
+    }
+
+    fn remember_database(&mut self, database: &str) {
+        if !database.is_empty() && !self.databases.iter().any(|name| name == database) {
+            self.databases.push(database.to_owned());
+        }
+    }
+
+    fn link_for_database(&self, database: &str) -> Option<OpenLink> {
+        let matches: Vec<&OpenLink> = self.links.iter().filter(|link| link.databases.iter().any(|name| name == database)).collect();
+        if matches.len() == 1 {
+            return Some(matches[0].clone());
+        }
+        if self.links.len() == 1 {
+            return Some(self.links[0].clone());
+        }
+        None
+    }
+
+    fn bind_link(&mut self, link: &OpenLink, database: &str) -> bool {
         let Some(tab) = self.active_mut() else {
             return false;
         };
-        let Some(target) = tab.target.as_mut() else {
-            return false;
-        };
-        target.database = database.to_owned();
-        if !self.databases.iter().any(|name| name == database) {
-            self.databases.push(database.to_owned());
-        }
+        tab.target = Some(Target {
+            connection_id: link.id.clone(),
+            connection_name: link.name.clone(),
+            database: database.to_owned(),
+            engine: link.engine.clone(),
+            schema: String::new(),
+        });
+        self.remember_database(database);
         true
     }
 
@@ -372,6 +527,8 @@ impl Desk {
         tab.token = None;
         tab.run_id = None;
         tab.results.clear();
+        tab.note.clear();
+        tab.statement = 0;
         tab.pending = None;
         tab.status = String::new();
         tab.lint.clear();
@@ -380,6 +537,7 @@ impl Desk {
             tab.target = target;
         }
         self.loads += 1;
+        self.view_gen = self.view_gen.saturating_add(1);
         self.refresh_outline();
         true
     }
@@ -487,25 +645,29 @@ impl Desk {
         let Some(tab) = self.tab_mut(&ticket.tab_id) else {
             return false;
         };
-        if tab.cancelled {
+        let accepted = if tab.cancelled {
             tab.running = false;
             tab.status = "cancelled".to_owned();
-            return false;
-        }
-        match outcome {
-            TaskOutcome::Current { .. } => {
-                tab.running = false;
-                tab.executed = true;
-                tab.status = run.status.clone();
-                tab.results = run.statements.into_iter().map(statement_view).collect();
-                tab.run_id = Some(run.id);
-                true
+            false
+        } else {
+            match outcome {
+                TaskOutcome::Current { .. } => {
+                    tab.running = false;
+                    tab.executed = true;
+                    tab.status = run.status.clone();
+                    tab.results = run.statements.into_iter().map(statement_view).collect();
+                    tab.run_id = Some(run.id);
+                    tab.statement = 0;
+                    true
+                }
+                TaskOutcome::Cancelled { .. } | TaskOutcome::Stale { .. } => {
+                    tab.running = false;
+                    false
+                }
             }
-            TaskOutcome::Cancelled { .. } | TaskOutcome::Stale { .. } => {
-                tab.running = false;
-                false
-            }
-        }
+        };
+        self.view_gen = self.view_gen.saturating_add(1);
+        accepted
     }
 
     pub fn cancel(&mut self, tasks: &TaskBoard) -> Option<String> {
@@ -677,6 +839,8 @@ impl Desk {
             outline: Vec::new(),
             pending: None,
             provider: keep_provider,
+            note: String::new(),
+            statement: 0,
         });
         self.active = Some(id.clone());
         self.refresh_outline();
@@ -751,48 +915,110 @@ pub async fn cancel_run(service: &Arc<Service>, query: &commands::QueryState, ru
     commands::request_cancel(service, query, run_id).await
 }
 
-pub async fn load_tree(service: &Arc<Service>) -> Result<(Vec<TreeObject>, Vec<String>, HashMap<String, Vec<String>>), String> {
+pub struct TreeLoad {
+    pub objects: Vec<TreeObject>,
+    pub databases: Vec<String>,
+    pub columns: HashMap<String, Vec<String>>,
+    pub links: Vec<OpenLink>,
+}
+
+/// 把已有 catalog 结果收成查询树。只保留表和视图，并带上连接、库和引擎。
+pub fn objects_from_catalog(connection_id: &str, connection_name: &str, engine: &str, body: &ConnectionBody) -> (Vec<TreeObject>, Vec<String>) {
+    let mut objects = Vec::new();
+    let mut databases = Vec::new();
+    for database in &body.databases {
+        if !database.name.is_empty() && !databases.iter().any(|name| name == &database.name) {
+            databases.push(database.name.clone());
+        }
+        for schema in &database.schemas {
+            for object in &schema.objects {
+                let kind = match object.kind {
+                    ObjectKind::Table => "table",
+                    ObjectKind::View => "view",
+                    _ => continue,
+                };
+                objects.push(TreeObject {
+                    connection_id: connection_id.to_owned(),
+                    connection_name: connection_name.to_owned(),
+                    engine: engine.to_owned(),
+                    database: database.name.clone(),
+                    schema: schema.name.clone(),
+                    name: object.name.clone(),
+                    kind: kind.to_owned(),
+                });
+            }
+        }
+    }
+    (objects, databases)
+}
+
+pub async fn load_tree(service: &Arc<Service>) -> Result<TreeLoad, String> {
     let records = service.list().await?;
     let mut objects = Vec::new();
     let mut databases = Vec::new();
     let mut columns = HashMap::new();
+    let mut links = Vec::new();
     for record in records {
         let Some(session) = service.catalog_session(&record.saved.id) else {
             continue;
         };
-        let engine = record.saved.engine.as_str();
+        let engine = record.saved.engine.as_str().to_owned();
+        let mut db_names = Vec::new();
+        if let Some(name) = record.saved.database.clone().filter(|name| !name.is_empty()) {
+            db_names.push(name);
+        }
         if engine != "sqlite" {
-            databases.push(record.saved.database.clone().unwrap_or_default());
-            continue;
-        }
-        let transport = service.cancel_transport(&record.saved.id).unwrap_or(crate::connections::CancelTransport::None);
-        let driver = LiveDriver::attach(session, engine, "main", transport, None).await?;
-        let flag = Arc::new(AtomicBool::new(false));
-        let listed = driver.run("SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name", 500, &flag).await.map_err(|err| err.to_string())?;
-        let _ = driver.finish().await;
-        if !databases.iter().any(|name| name == "main") {
-            databases.push("main".to_owned());
-        }
-        for row in listed.rows {
-            let Some(name) = row.first().and_then(|cell| cell.clone()) else {
-                continue;
-            };
-            let kind = row.get(1).and_then(|cell| cell.clone()).unwrap_or_else(|| "table".to_owned());
-            objects.push(TreeObject {
-                connection_id: record.saved.id.clone(),
-                connection_name: record.saved.name.clone(),
-                engine: engine.to_owned(),
-                database: "main".to_owned(),
-                schema: String::new(),
-                name: name.clone(),
-                kind,
-            });
-            if let Ok(info) = read_columns(service, &record.saved.id, &name).await {
-                columns.insert(column_key(&record.saved.id, "main", &name), info);
+            if let Ok(parsed) = Engine::parse(&engine) {
+                let body = read_catalog_session(parsed, &session, 200, &[]).await;
+                let (found, names) = objects_from_catalog(&record.saved.id, &record.saved.name, &engine, &body);
+                objects.extend(found);
+                for name in names {
+                    if !name.is_empty() && !db_names.iter().any(|have| have == &name) {
+                        db_names.push(name);
+                    }
+                }
+            }
+        } else {
+            if !db_names.iter().any(|name| name == "main") {
+                db_names.push("main".to_owned());
+            }
+            let transport = service.cancel_transport(&record.saved.id).unwrap_or(crate::connections::CancelTransport::None);
+            let driver = LiveDriver::attach(session, &engine, "main", transport, None).await?;
+            let flag = Arc::new(AtomicBool::new(false));
+            let listed = driver.run("SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name", 500, &flag).await.map_err(|err| err.to_string())?;
+            let _ = driver.finish().await;
+            for row in listed.rows {
+                let Some(name) = row.first().and_then(|cell| cell.clone()) else {
+                    continue;
+                };
+                let kind = row.get(1).and_then(|cell| cell.clone()).unwrap_or_else(|| "table".to_owned());
+                objects.push(TreeObject {
+                    connection_id: record.saved.id.clone(),
+                    connection_name: record.saved.name.clone(),
+                    engine: engine.clone(),
+                    database: "main".to_owned(),
+                    schema: String::new(),
+                    name: name.clone(),
+                    kind,
+                });
+                if let Ok(info) = read_columns(service, &record.saved.id, &name).await {
+                    columns.insert(column_key(&record.saved.id, "main", &name), info);
+                }
             }
         }
+        for name in &db_names {
+            if !name.is_empty() && !databases.iter().any(|have| have == name) {
+                databases.push(name.clone());
+            }
+        }
+        links.push(OpenLink {
+            id: record.saved.id.clone(),
+            name: record.saved.name.clone(),
+            engine,
+            databases: db_names,
+        });
     }
-    Ok((objects, databases, columns))
+    Ok(TreeLoad { objects, databases, columns, links })
 }
 
 async fn read_columns(service: &Arc<Service>, connection_id: &str, table: &str) -> Result<Vec<String>, String> {
@@ -988,9 +1214,13 @@ mod tests {
         let service = Arc::new(Service::new_for_test(dir.join("connections.sqlite")));
         service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
         let query = commands::QueryState::new(dir.join("query-history.sqlite"));
-        let (objects, databases, columns) = load_tree(&service).await.unwrap();
+        let loaded = load_tree(&service).await.unwrap();
+        let objects = loaded.objects.clone();
+        let databases = loaded.databases.clone();
+        let columns = loaded.columns.clone();
         assert!(objects.iter().any(|object| object.name == "item"), "{objects:?}");
         assert!(databases.iter().any(|name| name == "main"));
+        assert!(loaded.links.iter().any(|link| link.id == "notes" && link.engine == "sqlite"));
 
         let tasks = TaskBoard::new();
         let mut desk = Desk::new();
@@ -1141,5 +1371,68 @@ mod tests {
         let blocked = desk.format_active();
         assert!(!blocked.ok);
         assert_eq!(desk.draft(), "select 1");
+    }
+
+    #[test]
+    fn new_query_picks_a_connection_and_reaches_start_run() {
+        let tasks = TaskBoard::new();
+        let mut desk = Desk::new();
+        desk.new_query();
+        assert!(desk.target().is_none());
+        assert!(matches!(desk.begin_run(&tasks, RunScope::Script, None), BeginRun::Rejected(_)));
+        desk.set_links(vec![OpenLink {
+            id: "notes".to_owned(),
+            name: "笔记".to_owned(),
+            engine: "sqlite".to_owned(),
+            databases: vec!["main".to_owned()],
+        }]);
+        assert!(desk.select_database("main"));
+        let target = desk.target().expect("bound");
+        assert_eq!(target.connection_id, "notes");
+        assert_eq!(target.database, "main");
+        assert_eq!(target.engine, "sqlite");
+        desk.set_draft("SELECT 1");
+        match desk.begin_run(&tasks, RunScope::Script, None) {
+            BeginRun::Ready(prepared) => {
+                assert_eq!(prepared.sql, "SELECT 1");
+                assert_eq!(prepared.connection_id, "notes");
+                assert_eq!(prepared.database, "main");
+            }
+            BeginRun::Rejected(reason) => panic!("{reason}"),
+            BeginRun::Variables(_) => panic!("variables"),
+        }
+    }
+
+    #[test]
+    fn catalog_body_lists_tables_for_remote_engines() {
+        // 没有连接 PostgreSQL、MySQL、MariaDB 或 SQL Server。这里只用 catalog 结构证明对象会进树。
+        for (engine, schema) in [("postgres", "public"), ("mysql", ""), ("mariadb", ""), ("sqlserver", "dbo")] {
+            let body = crate::catalog::ConnectionBody {
+                error: None,
+                foreign_keys: None,
+                databases: vec![crate::catalog::DatabaseNode {
+                    name: "app".to_owned(),
+                    schemas: vec![crate::catalog::SchemaNode {
+                        name: schema.to_owned(),
+                        objects: vec![crate::catalog::ObjectRow::table("orders", None), crate::catalog::ObjectRow::view("orders_v")],
+                        total: 2,
+                        error: None,
+                        kind_reports: Vec::new(),
+                    }],
+                    error: None,
+                }],
+            };
+            let (objects, databases) = objects_from_catalog("c1", "应用", engine, &body);
+            assert_eq!(databases, vec!["app".to_owned()]);
+            let table = objects.iter().find(|object| object.name == "orders").expect(engine);
+            assert_eq!(table.kind, "table");
+            assert_eq!(table.engine, engine);
+            assert_eq!(table.database, "app");
+            assert_eq!(table.connection_id, "c1");
+            assert_eq!(table.schema, schema);
+            let view = objects.iter().find(|object| object.name == "orders_v").expect(engine);
+            assert_eq!(view.kind, "view");
+            assert_eq!(view.connection_name, "应用");
+        }
     }
 }

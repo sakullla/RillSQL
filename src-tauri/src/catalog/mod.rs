@@ -10,9 +10,9 @@ mod tree;
 pub use model::{
     kind_sql, metadata_sql, schema_status, Engine, SchemaNode, SchemaStatus, DEFAULT_OBJECT_PAGE,
 };
-pub(crate) use model::{ObjectKind, ObjectRow};
+pub(crate) use model::{DatabaseNode, ObjectKind, ObjectRow};
 pub use objects::{read_extras, ExtrasBody, ExtrasScope};
-pub(crate) use read::{read_definition, read_object_page};
+pub(crate) use read::{read_catalog_session, read_definition, read_object_page, ConnectionBody};
 pub use sqlite::{read_sqlite_file, read_sqlite_pool};
 pub use commands::{catalog_definition, catalog_page, catalog_refresh, catalog_sessions};
 pub use tree::{

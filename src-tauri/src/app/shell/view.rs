@@ -134,7 +134,10 @@ impl Workbench {
             }
             return;
         };
-        if query_command(id) {
+        if matches!(effect, Effect::FocusEditor) {
+            self.adopt_shell(Effect::None, cx);
+            self.query.update(cx, |pane, _| pane.request_focus());
+        } else if query_command(id) {
             self.adopt_shell(Effect::None, cx);
             self.forward_query(id, cx);
         } else {
@@ -163,7 +166,9 @@ impl Workbench {
         let snaps = self.query_snaps();
         let active = self.model.active_tab.clone();
         let locale = self.model.locale();
+        let timeout = self.model.settings.query_timeout_sec;
         let effect = self.query.update(cx, |pane, cx| {
+            pane.set_query_timeout_sec(timeout);
             let _ = pane.prepare(&snaps, active.as_deref(), locale, cx);
             pane.command(id, cx);
             pane.prepare(&snaps, active.as_deref(), locale, cx)
@@ -175,7 +180,9 @@ impl Workbench {
         let snaps = self.query_snaps();
         let active = self.model.active_tab.clone();
         let locale = self.model.locale();
+        let timeout = self.model.settings.query_timeout_sec;
         let effect = self.query.update(cx, |pane, cx| {
+            pane.set_query_timeout_sec(timeout);
             let effect = pane.prepare(&snaps, active.as_deref(), locale, cx);
             pane.ensure_editors(window, cx);
             effect
@@ -207,7 +214,12 @@ impl Workbench {
 
     #[cfg(test)]
     pub fn query_note(&self, cx: &App) -> String {
-        self.query.read(cx).note().to_owned()
+        self.query.read(cx).note()
+    }
+
+    #[cfg(test)]
+    pub fn query_editor_focused(&self, window: &Window, cx: &App) -> bool {
+        self.query.read(cx).editor_focused(window, cx)
     }
 
     #[cfg(test)]
@@ -677,6 +689,7 @@ fn query_command(id: &str) -> bool {
             | "save-sql-file"
     ) || id.starts_with("object:")
         || id.starts_with("database:")
+        || id.starts_with("bind-connection:")
         || id.starts_with("statement:")
 }
 
