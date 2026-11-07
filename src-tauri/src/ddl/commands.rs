@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use crate::connections::commands::ConnectionsState;
 
 use super::exec::{self, Receipt};
-use super::introspect::load;
 use super::model::{Action, Engine, Plan, Request, Snapshot, Step, StepStatus};
 use super::plan::display_sql;
 
@@ -260,9 +259,7 @@ fn receipt_dto(receipt: Receipt) -> ReceiptDto {
 
 #[tauri::command]
 pub async fn ddl_describe(state: tauri::State<'_, ConnectionsState>, request: DescribeBody) -> Result<DescribeDto, String> {
-    let session = require_session(&state, &request.connection_id)?;
-    let loaded = request_from(request.database, request.schema, &request.engine, Action::DropTable { table: request.table.clone() })?;
-    let snapshot = load(&session, &loaded, &request.table).await?;
+    let snapshot = crate::application::ddl::describe_saved(&state.service, &request.connection_id, request.database, request.schema, &request.engine, &request.table).await?;
     Ok(describe_dto(&snapshot))
 }
 

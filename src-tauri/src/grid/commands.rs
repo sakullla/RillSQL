@@ -4,9 +4,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::connections::commands::ConnectionsState;
 
-use super::live::{self, ExportMode, ExportSpec};
-use super::store::{Cell, Filter, FilterOp, Sort};
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableRef {
@@ -214,153 +211,19 @@ pub struct ExportDto {
     pub partial: bool,
 }
 
-fn cell_dto(cell: &Cell) -> Option<String> {
-    match cell {
-        Cell::Null => None,
-        Cell::Text(text) => Some(text.clone()),
-    }
-}
-
-fn filters_of(filters: &[FilterArg]) -> Result<Vec<Filter>, String> {
-    filters
-        .iter()
-        .map(|filter| {
-            Ok(Filter {
-                column: filter.column.clone(),
-                op: parse_op(&filter.op)?,
-                value: filter.value.clone(),
-                second: filter.second.clone(),
-                values: filter.values.clone(),
-            })
-        })
-        .collect()
-}
-
-fn parse_op(op: &str) -> Result<FilterOp, String> {
-    Ok(match op {
-        "eq" => FilterOp::Eq,
-        "ne" => FilterOp::Ne,
-        "contains" => FilterOp::Contains,
-        "starts" => FilterOp::Starts,
-        "gt" => FilterOp::Gt,
-        "lt" => FilterOp::Lt,
-        "between" => FilterOp::Between,
-        "in" => FilterOp::In,
-        "null" => FilterOp::Null,
-        "notnull" => FilterOp::NotNull,
-        "empty" => FilterOp::Empty,
-        other => return Err(format!("未知筛选 {other}")),
-    })
-}
-
-fn sort_of(sort: Option<&SortArg>) -> Option<Sort> {
-    sort.map(|sort| Sort { column: sort.column.clone(), descending: sort.direction == "desc" })
-}
-
-fn engine_name(engine: super::store::Engine) -> &'static str {
-    match engine {
-        super::store::Engine::Postgres => "postgres",
-        super::store::Engine::Mysql => "mysql",
-        super::store::Engine::Mariadb => "mariadb",
-        super::store::Engine::Sqlite => "sqlite",
-        super::store::Engine::Sqlserver => "sqlserver",
-        super::store::Engine::Redis => "redis",
-        super::store::Engine::Mongodb => "mongodb",
-    }
-}
-
-fn schema_dto(schema: &super::store::TableSchema, database: &str, foreign_keys: Option<Vec<super::live::ForeignKey>>) -> SchemaDto {
-    SchemaDto {
-        engine: engine_name(schema.engine).to_owned(),
-        database: database.to_owned(),
-        schema: schema.schema.clone(),
-        name: schema.name.clone(),
-        kind: schema.kind.to_owned(),
-        key: schema.key.clone(),
-        foreign_keys: foreign_keys.map(|list| {
-            list.into_iter()
-                .map(|item| ForeignKeyDto {
-                    name: item.name,
-                    columns: item.columns,
-                    ref_schema: item.ref_schema,
-                    ref_table: item.ref_table,
-                    ref_columns: item.ref_columns,
-                })
-                .collect()
-        }),
-        columns: schema
-            .columns
-            .iter()
-            .map(|column| ColumnDto {
-                name: column.name.clone(),
-                type_name: column.type_name.clone(),
-                nullable: column.nullable,
-                primary: column.primary,
-                unique: column.unique,
-                auto: column.auto,
-            })
-            .collect(),
-    }
-}
-
-fn require_session(state: &ConnectionsState, id: &str) -> Result<crate::connections::CatalogSession, String> {
-    state.service.catalog_session(id).ok_or_else(|| "这条连接还没有打开，没有另开新的连接。".to_owned())
-}
-
 #[tauri::command]
 pub async fn grid_describe(state: tauri::State<'_, ConnectionsState>, request: TableRef) -> Result<SchemaDto, String> {
-    let session = require_session(&state, &request.connection_id)?;
-    let schema = live::describe(&session, &request.database, &request.schema, &request.table, &request.engine).await?;
-    let foreign_keys = if request.include_foreign_keys {
-        // 外键失败只让这一项为空，不影响表结构本身。
-        Some(live::foreign_keys(&session, &request.database, &request.schema, &request.table, &request.engine).await.unwrap_or_default())
-    } else {
-        None
-    };
-    Ok(schema_dto(&schema, &request.database, foreign_keys))
+    crate::application::grid::describe(&state.service, &request).await
 }
 
 #[tauri::command]
 pub async fn grid_page(state: tauri::State<'_, ConnectionsState>, request: PageRequest) -> Result<PageDto, String> {
-    let session = require_session(&state, &request.table.connection_id)?;
-    let filters = filters_of(&request.filters)?;
-    let sort = sort_of(request.sort.as_ref());
-    let page = live::query_page_search(
-        &session,
-        &request.table.database,
-        &request.table.schema,
-        &request.table.table,
-        &request.table.engine,
-        &filters,
-        sort.as_ref(),
-        request.search.as_deref(),
-        request.offset,
-        request.limit,
-    )
-    .await?;
-    Ok(PageDto {
-        truncated: page.truncated,
-        sql: page.sql,
-        rows: page
-            .rows
-            .into_iter()
-            .map(|row| RowDto {
-                id: row.id,
-                cells: row.cells.iter().map(|(name, cell)| (name.clone(), cell_dto(cell))).collect(),
-                located: row.located,
-                locator_columns: row.locator.iter().map(|(name, _)| name.clone()).collect(),
-                locator_values: row.locator.iter().map(|(_, cell)| cell_dto(cell)).collect(),
-            })
-            .collect(),
-    })
+    crate::application::grid::page(&state.service, &request).await
 }
 
 #[tauri::command]
 pub async fn grid_count(state: tauri::State<'_, ConnectionsState>, request: CountRequest) -> Result<CountDto, String> {
-    let session = require_session(&state, &request.table.connection_id)?;
-    let filters = filters_of(&request.filters)?;
-    let matched = live::count_rows_search(&session, &request.table.database, &request.table.schema, &request.table.table, &request.table.engine, &filters, request.search.as_deref()).await?;
-    Ok(CountDto { matched })
+    crate::application::grid::count(&state.service, &request).await
 }
 
 #[tauri::command]
@@ -371,50 +234,11 @@ pub async fn grid_commit(state: tauri::State<'_, ConnectionsState>, request: Com
 
 #[tauri::command]
 pub async fn grid_export(state: tauri::State<'_, ConnectionsState>, request: ExportRequest) -> Result<ExportDto, String> {
-    let session = require_session(&state, &request.table.connection_id)?;
-    let mode = match request.mode.as_str() {
-        "table-loaded" => ExportMode::TableLoaded,
-        "table-full" => ExportMode::TableFull,
-        "query" => ExportMode::Query,
-        other => return Err(format!("未知导出范围 {other}")),
-    };
-    let spec = ExportSpec {
-        id: request.id,
-        mode,
-        database: request.table.database,
-        schema: request.table.schema,
-        table: request.table.table,
-        engine_hint: request.table.engine,
-        filters: filters_of(&request.filters)?,
-        sort: sort_of(request.sort.as_ref()),
-        search: request.search.clone(),
-        limit: request.limit,
-        truncated: request.truncated,
-        statement: request.statement,
-        acknowledged: request.acknowledged,
-        path: request.path,
-        delimiter: request.delimiter,
-        null_token: request.null_token,
-        bom: request.bom,
-        header: request.header,
-        format: request.format,
-        fail_after_rows: None,
-        cancel_after_rows: None,
-    };
-    let outcome = live::run_export(&session, &spec).await;
-    Ok(ExportDto {
-        status: outcome.status.to_owned(),
-        success: outcome.success,
-        written_rows: outcome.written_rows,
-        path: outcome.path,
-        residual_path: outcome.residual_path,
-        message: outcome.message,
-        partial: outcome.partial,
-    })
+    crate::application::grid::export(&state.service, &request).await
 }
 
 #[tauri::command]
 pub async fn grid_export_cancel(id: String) -> Result<(), String> {
-    live::request_cancel(&id);
+    super::request_grid_export_cancel(&id);
     Ok(())
 }

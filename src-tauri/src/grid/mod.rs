@@ -6,9 +6,12 @@ mod live;
 mod sql;
 mod store;
 
-pub(crate) use live::{commit as commit_mutations, describe, fetch_cells, insert_line, request_cancel as request_grid_export_cancel, sqlserver_rows, Mutation, MutationKind};
+pub(crate) use live::{
+    commit as commit_mutations, count_rows_search, describe, fetch_cells, foreign_keys, insert_line, query_page_search, request_cancel as request_grid_export_cancel, run_export, sqlserver_rows,
+    ExportMode, ExportSpec, ForeignKey, Mutation, MutationKind,
+};
 pub(crate) use sql::{delete_sql, insert_sql, qualified_name, quote_ident, reject_literal, select_list, sql_cell, update_sql, value_family, ValueFamily};
-pub(crate) use store::{Cell, Column, Engine, TableSchema};
+pub(crate) use store::{Cell, Column, Engine, Filter, FilterOp, Sort, TableSchema};
 
 pub fn module_id() -> &'static str {
     let _linked = (

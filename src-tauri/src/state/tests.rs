@@ -103,12 +103,14 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
 fn write_windows(root: &Path, session: &str, shell: &str) {
     let dir = root.join("EBWebView").join("Default").join("Local Storage").join("leveldb");
     fs::create_dir_all(&dir).unwrap();
-    let mut bytes = b"\x00leveldb\x01".to_vec();
-    bytes.extend(b"_https://tauri.localhost\x00\x01rillsql.session\x00");
-    bytes.extend(encode_utf16_le(session));
-    bytes.extend(b"\xff\x00rillsql.shell");
-    bytes.extend(encode_utf16_le(shell));
-    fs::write(dir.join("000003.log"), bytes).unwrap();
+    let log = super::leveldb::encode_log(&[super::leveldb::LogBatch {
+        sequence: 1,
+        puts: vec![
+            (super::leveldb::local_storage_key("rillsql.session"), super::leveldb::encode_utf16_value(session)),
+            (super::leveldb::local_storage_key("rillsql.shell"), super::leveldb::encode_utf16_value(shell)),
+        ],
+    }]);
+    fs::write(dir.join("000003.log"), log).unwrap();
 }
 
 async fn write_webkit(path: &Path, session: &[u8], shell: &[u8]) {
@@ -129,8 +131,8 @@ async fn write_webkit(path: &Path, session: &[u8], shell: &[u8]) {
     pool.close().await;
 }
 
-fn assert_imported(store: &StateStore) {
-    let state = store.load().unwrap();
+async fn assert_imported(store: &StateStore) {
+    let state = store.load().await.unwrap();
     assert_eq!(state.version, APP_STATE_VERSION);
     assert_eq!(state.shell.theme, "dark");
     assert_eq!(state.shell.density, "relaxed");
@@ -192,7 +194,7 @@ async fn three_platform_fixtures_import_without_touching_sources() {
         let report = store.import_legacy(&legacy, platform).await;
         assert!(report.imported, "{platform:?} {}", report.warning.unwrap_or_default());
         assert!(report.wrote_state);
-        assert_imported(&store);
+        assert_imported(&store).await;
         assert_eq!(fingerprint(&legacy), before, "{platform:?} 旧文件被改写");
         let _ = fs::remove_dir_all(&legacy);
         let _ = fs::remove_dir_all(&data);
@@ -411,4 +413,96 @@ async fn history_row_count_matches_inserted_legacy_row() {
     assert_eq!(count, 1);
     assert_eq!(listed.len(), 1);
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn load_reads_off_the_caller_thread() {
+    let dir = temp_dir("load-thread");
+    let store = StateStore::new(&dir);
+    store.save(&super::document::AppState::new(super::document::ShellSettings::default(), super::document::SessionState::default())).await.unwrap();
+    let caller = std::thread::current().id();
+    let (state, reader) = super::load_on_pool(store.path().to_path_buf()).await.unwrap();
+    assert_eq!(state.version, APP_STATE_VERSION);
+    assert_ne!(caller, reader);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn newer_leveldb_value_wins_when_shell_is_not_the_first_json() {
+    let (session, shell) = legacy_json();
+    let stale_session = json!({
+        "tabs": [{"id": "old", "title": "旧", "kind": "query", "draft": "STALE-DRAFT"}],
+        "activeId": "old"
+    });
+    let legacy = temp_dir("leveldb-newer");
+    let dir = legacy.join("EBWebView").join("Default").join("Local Storage").join("leveldb");
+    fs::create_dir_all(&dir).unwrap();
+    let session_key = super::leveldb::local_storage_key("rillsql.session");
+    let shell_key = super::leveldb::local_storage_key("rillsql.shell");
+    let mut log = super::leveldb::encode_log(&[
+        super::leveldb::LogBatch {
+            sequence: 1,
+            puts: vec![(session_key.clone(), super::leveldb::encode_latin1_value(&stale_session.to_string()))],
+        },
+        super::leveldb::LogBatch {
+            sequence: 2,
+            puts: vec![(shell_key.clone(), super::leveldb::encode_latin1_value(r#"{"theme":"system"}"#))],
+        },
+        super::leveldb::LogBatch {
+            sequence: 5,
+            puts: vec![(session_key, super::leveldb::encode_utf16_value(&session.to_string()))],
+        },
+    ]);
+    log.extend(br#"rillsql.shell{"theme":"paper"}"#);
+    fs::write(dir.join("000010.log"), &log).unwrap();
+    let table = super::leveldb::encode_sst(&[(shell_key, super::leveldb::encode_utf16_value(&shell.to_string()), 9)]);
+    fs::write(dir.join("000011.ldb"), table).unwrap();
+    let before = fingerprint(&legacy);
+    let data = temp_dir("leveldb-newer-data");
+    let store = StateStore::new(&data);
+    let report = store.import_legacy(&legacy, Platform::Windows).await;
+    assert!(report.imported, "{}", report.warning.unwrap_or_default());
+    assert_imported(&store).await;
+    let state = store.load().await.unwrap();
+    assert!(!state.session.tabs[0].draft.contains("STALE-DRAFT"));
+    assert_ne!(state.shell.theme, "system");
+    assert_ne!(state.shell.theme, "paper");
+    assert_eq!(fingerprint(&legacy), before);
+
+    let snapshot = fs::read(store.path()).unwrap();
+    let again = store.import_legacy(&legacy, Platform::Windows).await;
+    assert!(!again.imported);
+    assert!(!again.wrote_state);
+    assert_eq!(fs::read(store.path()).unwrap(), snapshot);
+    assert_eq!(fingerprint(&legacy), before);
+    let _ = fs::remove_dir_all(&legacy);
+    let _ = fs::remove_dir_all(&data);
+}
+
+#[tokio::test]
+async fn installed_webview_store_is_readable_when_the_root_is_provided() {
+    let Ok(root) = std::env::var("RILLSQL_WEBVIEW_ROOT") else {
+        return;
+    };
+    let data = temp_dir("installed-webview");
+    let store = StateStore::new(&data);
+    let report = store.import_legacy(Path::new(&root), Platform::Windows).await;
+    let imported = report.imported;
+    if !imported {
+        let warning = report.warning.unwrap_or_default();
+        let _ = fs::remove_dir_all(&data);
+        panic!("已安装的 WebView 存储没有同时导入 session 和 shell：{warning}");
+    }
+    let state = match store.load().await {
+        Ok(state) => state,
+        Err(_) => {
+            let _ = fs::remove_dir_all(&data);
+            panic!("导入后的状态结构不完整");
+        }
+    };
+    let session_ok = !state.session.tabs.is_empty() && state.session.tabs.iter().all(|tab| !tab.id.is_empty() && !tab.title.is_empty());
+    let shell_ok = !state.shell.theme.is_empty() && !state.shell.locale.is_empty() && !state.shell.density.is_empty();
+    let _ = fs::remove_dir_all(&data);
+    assert!(session_ok, "session 键缺少标签结构");
+    assert!(shell_ok, "shell 键缺少主题结构");
 }

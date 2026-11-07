@@ -53,12 +53,14 @@ async fn saved_engine(service: &Service, connection_id: &str) -> Result<Engine, 
     saved.into_iter().find(|item| item.saved.id == connection_id).map(|item| item.saved.engine).ok_or_else(|| "找不到这条连接".to_owned())
 }
 
-pub async fn compare_structure(service: &Service, request: &StructureRequest) -> StructureReport {
-    read_structure(service, request).await
+pub async fn compare_structure(service: &Service, tasks: &TaskBoard, owner: &str, token: TaskToken, request: &StructureRequest) -> TaskOutcome<StructureReport> {
+    let report = read_structure(service, request).await;
+    tasks.accept(owner, token, report)
 }
 
-pub async fn compare_data(service: &Service, request: &DataRequest) -> DataReport {
-    read_data(service, request).await
+pub async fn compare_data(service: &Service, tasks: &TaskBoard, owner: &str, token: TaskToken, request: &DataRequest) -> TaskOutcome<DataReport> {
+    let report = read_data(service, request).await;
+    tasks.accept(owner, token, report)
 }
 
 pub async fn compare_schemas(service: &Service, connection_id: &str, database: &str) -> Result<Vec<String>, String> {
@@ -80,9 +82,22 @@ pub async fn read_diagram(service: &Service, connection_id: &str, database: &str
     read_diagram_session(engine, &session, database, schema).await
 }
 
-pub async fn dump_database(service: &Service, request: &DumpRequest, progress: &(dyn Fn(DumpProgress) + Send + Sync)) -> Result<DumpDto, String> {
+pub async fn dump_database(
+    service: &Service,
+    tasks: &TaskBoard,
+    owner: &str,
+    token: TaskToken,
+    request: &DumpRequest,
+    progress: &(dyn Fn(DumpProgress) + Send + Sync),
+) -> Result<TaskOutcome<DumpDto>, String> {
     let session = service.catalog_session(&request.connection_id).ok_or_else(|| "这条连接还没有打开，没有另开新的连接。".to_owned())?;
-    Ok(dump::run_dump(&session, request, progress).await)
+    let dto = dump::run_dump(&session, request, &|event| {
+        if matches!(tasks.accept(owner, token, ()), TaskOutcome::Current { .. }) {
+            progress(event);
+        }
+    })
+    .await;
+    Ok(tasks.accept(owner, token, dto))
 }
 
 pub fn cancel_dump(tasks: &TaskBoard, owner: &str, id: &str) {
@@ -90,10 +105,23 @@ pub fn cancel_dump(tasks: &TaskBoard, owner: &str, id: &str) {
     dump::request_cancel(id);
 }
 
-pub async fn migrate_data(service: &Service, request: &MigrateRequest, progress: &(dyn Fn(MigrateProgress) + Send + Sync)) -> Result<MigrateDto, String> {
+pub async fn migrate_data(
+    service: &Service,
+    tasks: &TaskBoard,
+    owner: &str,
+    token: TaskToken,
+    request: &MigrateRequest,
+    progress: &(dyn Fn(MigrateProgress) + Send + Sync),
+) -> Result<TaskOutcome<MigrateDto>, String> {
     let source = service.catalog_session(&request.source.connection_id).ok_or_else(|| "源连接还没有打开，没有另开新的连接。".to_owned())?;
     let target = service.catalog_session(&request.target.connection_id).ok_or_else(|| "目标连接还没有打开，没有另开新的连接。".to_owned())?;
-    Ok(migrate::run_migrate(&source, &target, request, progress).await)
+    let dto = migrate::run_migrate(&source, &target, request, &|event| {
+        if matches!(tasks.accept(owner, token, ()), TaskOutcome::Current { .. }) {
+            progress(event);
+        }
+    })
+    .await;
+    Ok(tasks.accept(owner, token, dto))
 }
 
 pub fn cancel_migrate(tasks: &TaskBoard, owner: &str, id: &str) {
@@ -118,9 +146,10 @@ pub fn release_query(query: &QueryState, tasks: &TaskBoard, owner: &str, run_id:
 }
 
 pub async fn cancel_query(service: &Arc<Service>, query: &QueryState, tasks: &TaskBoard, owner: &str, token: TaskToken, run_id: &str) -> Result<TaskOutcome<RunDto>, String> {
-    tasks.cancel(owner, token.id);
     let run = query_commands::request_cancel(service, query, run_id).await?;
-    Ok(tasks.accept(owner, token, run))
+    let outcome = tasks.accept(owner, token, run);
+    tasks.cancel(owner, token.id);
+    Ok(outcome)
 }
 
 pub async fn list_history(query: &QueryState) -> Result<Vec<crate::query::HistoryEntry>, String> {

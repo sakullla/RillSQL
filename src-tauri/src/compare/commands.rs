@@ -1,15 +1,20 @@
+use crate::application::tasks::{take_current, TaskBoard};
 use crate::connections::commands::ConnectionsState;
 
 use super::model::{DataReport, DataRequest, SchemaListRequest, StructureReport, StructureRequest};
 
 #[tauri::command]
 pub async fn compare_structure(state: tauri::State<'_, ConnectionsState>, request: StructureRequest) -> Result<StructureReport, String> {
-    Ok(crate::application::work::compare_structure(&state.service, &request).await)
+    let tasks = TaskBoard::new();
+    let token = tasks.begin("compare");
+    take_current(crate::application::work::compare_structure(&state.service, &tasks, "compare", token, &request).await)
 }
 
 #[tauri::command]
 pub async fn compare_data(state: tauri::State<'_, ConnectionsState>, request: DataRequest) -> Result<DataReport, String> {
-    Ok(crate::application::work::compare_data(&state.service, &request).await)
+    let tasks = TaskBoard::new();
+    let token = tasks.begin("compare");
+    take_current(crate::application::work::compare_data(&state.service, &tasks, "compare", token, &request).await)
 }
 
 #[tauri::command]

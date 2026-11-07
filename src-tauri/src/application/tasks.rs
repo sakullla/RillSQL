@@ -12,7 +12,7 @@ pub struct TaskToken {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum TaskOutcome<T> {
-    Current(T),
+    Current { token: TaskToken, value: T },
     Stale { id: u64, generation: u64 },
     Cancelled { id: u64 },
 }
@@ -84,7 +84,15 @@ impl TaskBoard {
         if slot.generation != token.generation {
             return TaskOutcome::Stale { id: token.id, generation: token.generation };
         }
-        TaskOutcome::Current(value)
+        TaskOutcome::Current { token, value }
+    }
+}
+
+pub fn take_current<T>(outcome: TaskOutcome<T>) -> Result<T, String> {
+    match outcome {
+        TaskOutcome::Current { value, .. } => Ok(value),
+        TaskOutcome::Stale { .. } => Err("这次结果已经过期，没有写回界面。".to_owned()),
+        TaskOutcome::Cancelled { .. } => Err("这次操作已取消，没有写回界面。".to_owned()),
     }
 }
 

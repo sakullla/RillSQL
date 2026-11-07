@@ -2,7 +2,7 @@
 
 use crate::connections::model::Engine;
 use crate::connections::Service;
-use crate::ddl::{preview, Action, Plan, Receipt, Request};
+use crate::ddl::{preview, Action, Plan, Receipt, Request, Snapshot};
 
 pub fn require_execute(confirmed: bool) -> Result<(), String> {
     if !confirmed {
@@ -13,6 +13,12 @@ pub fn require_execute(confirmed: bool) -> Result<(), String> {
 
 fn open_session(service: &Service, connection_id: &str) -> Result<crate::connections::CatalogSession, String> {
     service.catalog_session(connection_id).ok_or_else(|| "这条连接还没有打开，没有另开新的连接。".to_owned())
+}
+
+pub async fn describe_saved(service: &Service, connection_id: &str, database: String, schema: String, engine: &str, table: &str) -> Result<Snapshot, String> {
+    let request = request(database, schema, engine, Action::DropTable { table: table.to_owned() })?;
+    let session = open_session(service, connection_id)?;
+    crate::ddl::load(&session, &request, table).await
 }
 
 pub async fn preview_request(service: &Service, connection_id: &str, request: &Request) -> Result<Plan, String> {

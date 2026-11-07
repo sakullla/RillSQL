@@ -13,7 +13,7 @@ use crate::migrate::migrate::{MigrateRequest, MigrateTableRef};
 use crate::query::commands::StartRequest;
 use crate::query::{RenameRequest, SaveRequest};
 use crate::state::{AppState, Platform, SessionState, ShellSettings};
-use crate::grid::commands::{ChangeArg, CommitRequest, TableRef, ValueArg};
+use crate::grid::commands::{ChangeArg, CommitRequest, CountRequest, ExportRequest, FilterArg, PageRequest, TableRef, ValueArg};
 use crate::mongo::docs;
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -57,7 +57,7 @@ fn late_results_do_not_replace_a_newer_generation_and_cancel_wins() {
     assert!(matches!(tasks.accept("query-tab", first, "旧结果"), TaskOutcome::Stale { .. }));
     assert!(matches!(tasks.accept("query-tab", second, "旧结果"), TaskOutcome::Stale { .. }));
     let current = tasks.begin("query-tab");
-    assert!(matches!(tasks.accept("query-tab", current, "新结果"), TaskOutcome::Current("新结果")));
+    assert!(matches!(tasks.accept("query-tab", current, "新结果"), TaskOutcome::Current { value: "新结果", .. }));
 
     let running = tasks.begin("export");
     assert!(tasks.cancel("export", running.id));
@@ -105,7 +105,77 @@ async fn redis_mongo_and_grid_confirmation_rejects_before_a_session() {
         Ok(_) => panic!("未知变更应当被拒绝"),
     };
     assert!(unknown.contains("未知变更"), "{unknown}");
+
+    let filtered = err_text(crate::application::grid::page(&service, &page_request("merge")).await);
+    assert!(filtered.contains("未知筛选"), "{filtered}");
+    assert!(!filtered.contains("还没有打开"), "{filtered}");
+    let counted = err_text(crate::application::grid::count(&service, &count_request("merge")).await);
+    assert!(counted.contains("未知筛选"), "{counted}");
+    let exported = err_text(crate::application::grid::export(&service, &export_request("sideways", "eq")).await);
+    assert!(exported.contains("未知导出范围"), "{exported}");
+    assert!(!exported.contains("还没有打开"), "{exported}");
+    let described = err_text(crate::application::grid::describe(&service, &table_ref("missing")).await);
+    assert!(described.contains("还没有打开"), "{described}");
+    let engine = err_text(crate::application::ddl::describe_saved(&service, "missing", "main".to_owned(), String::new(), "other", "customers").await);
+    assert!(engine.contains("不支持的数据库"), "{engine}");
+    assert!(!engine.contains("还没有打开"), "{engine}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn select_request() -> StartRequest {
+    StartRequest {
+        connection_id: "notes".to_owned(),
+        connection_name: "笔记".to_owned(),
+        database: "main".to_owned(),
+        engine: "sqlite".to_owned(),
+        sql: "SELECT 1".to_owned(),
+        limit: 10,
+        timeout_ms: None,
+    }
+}
+
+fn table_ref(id: &str) -> TableRef {
+    TableRef {
+        connection_id: id.to_owned(),
+        database: "main".to_owned(),
+        schema: String::new(),
+        table: "customers".to_owned(),
+        engine: "sqlite".to_owned(),
+        include_foreign_keys: false,
+    }
+}
+
+fn filter_arg(op: &str) -> FilterArg {
+    FilterArg { column: "name".to_owned(), op: op.to_owned(), value: Some("甲".to_owned()), second: None, values: Vec::new() }
+}
+
+fn page_request(op: &str) -> PageRequest {
+    PageRequest { table: table_ref("missing"), filters: vec![filter_arg(op)], sort: None, offset: 0, limit: 10, search: None }
+}
+
+fn count_request(op: &str) -> CountRequest {
+    CountRequest { table: table_ref("missing"), filters: vec![filter_arg(op)], search: None }
+}
+
+fn export_request(mode: &str, op: &str) -> ExportRequest {
+    ExportRequest {
+        id: "export-1".to_owned(),
+        mode: mode.to_owned(),
+        table: table_ref("missing"),
+        filters: vec![filter_arg(op)],
+        sort: None,
+        search: None,
+        limit: 10,
+        truncated: false,
+        statement: String::new(),
+        acknowledged: false,
+        path: "notes.csv".to_owned(),
+        delimiter: ",".to_owned(),
+        null_token: "NULL".to_owned(),
+        bom: false,
+        header: true,
+        format: "csv".to_owned(),
+    }
 }
 
 #[tokio::test]
@@ -220,14 +290,28 @@ async fn typed_service_reaches_connections_catalog_query_files_and_state() {
     assert!(err_text(super::work::catalog_definition(&service, "missing", "main", "", "customers", "table", "", "").await).contains("还没有打开"));
 
     let side = SideRequest { connection_id: "missing".to_owned(), database: "main".to_owned(), schema: String::new(), engine: "sqlite".to_owned() };
-    let structure = super::work::compare_structure(
+    let tasks = super::TaskBoard::new();
+    let token = tasks.begin("compare");
+    let structure = match super::work::compare_structure(
         &service,
+        &tasks,
+        "compare",
+        token,
         &StructureRequest { id: "cmp".to_owned(), baseline: side.clone(), target: side.clone() },
     )
-    .await;
+    .await
+    {
+        TaskOutcome::Current { value, .. } => value,
+        TaskOutcome::Stale { .. } => panic!("当前代次的结构比较被当成过期"),
+        TaskOutcome::Cancelled { .. } => panic!("当前代次的结构比较被当成取消"),
+    };
     assert_eq!(structure.refused.as_deref(), Some("有一侧还没有打开，不生成脚本。"));
-    let data = super::work::compare_data(
+    let token = tasks.begin("compare");
+    let data = match super::work::compare_data(
         &service,
+        &tasks,
+        "compare",
+        token,
         &DataRequest {
             id: "data".to_owned(),
             baseline: side.clone(),
@@ -235,13 +319,23 @@ async fn typed_service_reaches_connections_catalog_query_files_and_state() {
             tables: vec![DataTableRequest { name: "customers".to_owned(), key: None }],
         },
     )
-    .await;
+    .await
+    {
+        TaskOutcome::Current { value, .. } => value,
+        TaskOutcome::Stale { .. } => panic!("当前代次的数据比较被当成过期"),
+        TaskOutcome::Cancelled { .. } => panic!("当前代次的数据比较被当成取消"),
+    };
     assert_eq!(data.refused.as_deref(), Some("这一侧还没有打开 不生成脚本。"));
     assert!(err_text(super::work::compare_schemas(&service, "missing", "main").await).contains("还没有打开"));
     assert!(err_text(super::work::read_diagram(&service, "missing", "main", "").await).contains("还没有打开"));
+    let dump_tasks = super::TaskBoard::new();
+    let dump_token = dump_tasks.begin("dump");
     assert!(err_text(
         super::work::dump_database(
             &service,
+            &dump_tasks,
+            "dump",
+            dump_token,
             &DumpRequest {
                 id: "dump".to_owned(),
                 connection_id: "missing".to_owned(),
@@ -264,9 +358,14 @@ async fn typed_service_reaches_connections_catalog_query_files_and_state() {
         schema: String::new(),
         table: "customers".to_owned(),
     };
+    let migrate_tasks = super::TaskBoard::new();
+    let migrate_token = migrate_tasks.begin("migrate");
     assert!(err_text(
         super::work::migrate_data(
             &service,
+            &migrate_tasks,
+            "migrate",
+            migrate_token,
             &MigrateRequest { id: "move".to_owned(), source: table.clone(), target: table, mapping: Vec::new(), options: None },
             &|_| {},
         )
@@ -326,15 +425,189 @@ async fn typed_service_reaches_connections_catalog_query_files_and_state() {
     assert_eq!(preview.format, "csv");
     assert!(preview.text.contains("林夏😀"));
 
-    assert!(app.load_state().is_err());
+    assert!(app.load_state().await.is_err());
     let skipped = app.import_legacy(&dir.join("no-legacy"), Platform::Windows).await;
     assert!(!skipped.imported && !skipped.wrote_state);
     assert!(!app.state.path().exists());
     app.save_state(&AppState::new(ShellSettings::default(), SessionState::default())).await.expect("save state");
-    assert_eq!(app.load_state().expect("load").version, 1);
+    assert_eq!(app.load_state().await.expect("load").version, 1);
     let bytes = std::fs::read(app.state.path()).expect("state file");
     let text = String::from_utf8(bytes).expect("utf8");
     assert!(!text.contains("password"));
     assert!(!text.contains("passphrase"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn query_token_survives_its_own_cancel_and_a_switch_drops_the_old_result() {
+    let dir = temp_dir("query-token");
+    let database = dir.join("notes.sqlite");
+    let setup = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)").execute(&setup).await.unwrap();
+    setup.close().await;
+    let service = Arc::new(Service::new_for_test(dir.join("connections.sqlite")));
+    service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+    let app = AppServices::new(Arc::clone(&service));
+    let started = super::work::start_query(&service, &app.query, &app.tasks, "query-tab", select_request()).await.expect("start");
+    let (token, mut run) = match started {
+        TaskOutcome::Current { token, value } => (token, value),
+        TaskOutcome::Stale { .. } => panic!("开始查询没有把代次交回调用方"),
+        TaskOutcome::Cancelled { .. } => panic!("开始查询被自己的取消标记丢掉"),
+    };
+    assert!(run.statements.iter().any(|item| item.sql.contains("SELECT 1")));
+    for _ in 0..50 {
+        let polled = super::work::poll_query(&app.query, &app.tasks, "query-tab", token, &run.id, false).await.expect("poll");
+        run = match polled {
+            TaskOutcome::Current { value, .. } => value,
+            TaskOutcome::Stale { .. } => panic!("同一次查询的轮询被当成过期"),
+            TaskOutcome::Cancelled { .. } => panic!("同一次查询的轮询被当成取消"),
+        };
+        if run.status != "running" && run.status != "cancel-requested" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(run.status, "done");
+    assert!(run.statements.iter().any(|item| item.sql.contains("SELECT 1") && !item.rows.is_empty()));
+    app.tasks.supersede("query-tab");
+    match super::work::poll_query(&app.query, &app.tasks, "query-tab", token, &run.id, false).await.expect("stale poll") {
+        TaskOutcome::Stale { .. } => {}
+        TaskOutcome::Current { .. } => panic!("切换后代次仍拿到了完整旧结果"),
+        TaskOutcome::Cancelled { .. } => panic!("切换被记成取消"),
+    }
+
+    while app.query.is_connection_busy("notes") {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let started = super::work::start_query(&service, &app.query, &app.tasks, "query-cancel", select_request()).await.expect("start cancel");
+    let (token, mut run) = match started {
+        TaskOutcome::Current { token, value } => (token, value),
+        TaskOutcome::Stale { .. } => panic!("第二次开始没有交回代次"),
+        TaskOutcome::Cancelled { .. } => panic!("第二次开始被取消"),
+    };
+    for _ in 0..50 {
+        if run.status != "running" && run.status != "cancel-requested" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let polled = super::work::poll_query(&app.query, &app.tasks, "query-cancel", token, &run.id, false).await.expect("poll");
+        run = match polled {
+            TaskOutcome::Current { value, .. } => value,
+            TaskOutcome::Stale { .. } => panic!("取消前的轮询过期"),
+            TaskOutcome::Cancelled { .. } => panic!("取消前的轮询被丢掉"),
+        };
+    }
+    let cancelled = super::work::cancel_query(&service, &app.query, &app.tasks, "query-cancel", token, &run.id).await.expect("cancel");
+    match cancelled {
+        TaskOutcome::Current { value, .. } => {
+            assert!(value.statements.iter().any(|item| item.sql.contains("SELECT 1")));
+            assert!(value.statements.iter().any(|item| !item.rows.is_empty()), "取消应答丢掉了已完成的行");
+        }
+        TaskOutcome::Cancelled { .. } => panic!("取消应答被这次取消标记丢掉"),
+        TaskOutcome::Stale { .. } => panic!("取消应答被当成过期"),
+    }
+    match super::work::poll_query(&app.query, &app.tasks, "query-cancel", token, &run.id, false).await.expect("later poll") {
+        TaskOutcome::Cancelled { .. } => {}
+        TaskOutcome::Current { .. } => panic!("取消后的轮询仍拿到结果"),
+        TaskOutcome::Stale { .. } => panic!("取消后的轮询被当成过期"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn superseded_compare_dump_and_migrate_drop_the_result_and_its_progress() {
+    let dir = temp_dir("late-work");
+    let database = dir.join("notes.sqlite");
+    let setup = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)").execute(&setup).await.unwrap();
+    setup.close().await;
+    let service = Arc::new(Service::new_for_test(dir.join("connections.sqlite")));
+    service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+    let tasks = super::TaskBoard::new();
+    let side = SideRequest { connection_id: "notes".to_owned(), database: "main".to_owned(), schema: String::new(), engine: "sqlite".to_owned() };
+    let token = tasks.begin("compare");
+    tasks.supersede("compare");
+    match super::work::compare_structure(&service, &tasks, "compare", token, &StructureRequest { id: "cmp".to_owned(), baseline: side.clone(), target: side }).await {
+        TaskOutcome::Stale { .. } => {}
+        TaskOutcome::Current { .. } => panic!("切换后仍拿到了完整比较结果"),
+        TaskOutcome::Cancelled { .. } => panic!("比较被当成取消"),
+    }
+
+    let progress = std::sync::atomic::AtomicUsize::new(0);
+    let token = tasks.begin("dump");
+    tasks.supersede("dump");
+    let dumped = super::work::dump_database(
+        &service,
+        &tasks,
+        "dump",
+        token,
+        &DumpRequest {
+            id: "dump".to_owned(),
+            connection_id: "notes".to_owned(),
+            engine: "sqlite".to_owned(),
+            database: "main".to_owned(),
+            schemas: Vec::new(),
+            tables: Vec::new(),
+            include_data: false,
+            path: dir.join("dump.sql").to_string_lossy().to_string(),
+        },
+        &|_| {
+            progress.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        },
+    )
+    .await
+    .expect("dump");
+    match dumped {
+        TaskOutcome::Stale { .. } => {}
+        TaskOutcome::Current { .. } => panic!("切换后仍拿到了完整导出结果"),
+        TaskOutcome::Cancelled { .. } => panic!("导出被当成取消"),
+    }
+    assert_eq!(progress.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let target = dir.join("copy.sqlite");
+    let setup = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&target).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)").execute(&setup).await.unwrap();
+    setup.close().await;
+    service.open_sqlite_for_test("copy", "副本", &target).await.unwrap();
+    let table = |id: &str| MigrateTableRef {
+        connection_id: id.to_owned(),
+        engine: "sqlite".to_owned(),
+        database: "main".to_owned(),
+        schema: String::new(),
+        table: "customers".to_owned(),
+    };
+    let moved = std::sync::atomic::AtomicUsize::new(0);
+    let token = tasks.begin("migrate");
+    tasks.supersede("migrate");
+    let migrated = super::work::migrate_data(
+        &service,
+        &tasks,
+        "migrate",
+        token,
+        &MigrateRequest { id: "move".to_owned(), source: table("notes"), target: table("copy"), mapping: Vec::new(), options: None },
+        &|_| {
+            moved.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        },
+    )
+    .await
+    .expect("migrate");
+    match migrated {
+        TaskOutcome::Stale { .. } => {}
+        TaskOutcome::Current { .. } => panic!("切换后仍拿到了完整迁移结果"),
+        TaskOutcome::Cancelled { .. } => panic!("迁移被当成取消"),
+    }
+    assert_eq!(moved.load(std::sync::atomic::Ordering::SeqCst), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }

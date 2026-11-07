@@ -151,8 +151,8 @@ impl AppServices {
         self.state.save(state).await
     }
 
-    pub fn load_state(&self) -> Result<crate::state::AppState, crate::state::StateError> {
-        self.state.load()
+    pub async fn load_state(&self) -> Result<crate::state::AppState, crate::state::StateError> {
+        self.state.load().await
     }
 }
 

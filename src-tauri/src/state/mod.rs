@@ -4,6 +4,7 @@ mod atomic;
 mod compat;
 mod document;
 mod legacy;
+mod leveldb;
 
 use atomic::write_atomic_off_ui;
 pub use compat::{
@@ -29,9 +30,8 @@ impl StateStore {
         &self.path
     }
 
-    pub fn load(&self) -> Result<AppState, StateError> {
-        let bytes = std::fs::read(&self.path).map_err(|_| StateError::Malformed)?;
-        parse_stored(&bytes)
+    pub async fn load(&self) -> Result<AppState, StateError> {
+        load_on_pool(self.path.clone()).await.map(|(state, _)| state)
     }
 
     pub async fn save(&self, state: &AppState) -> Result<(), String> {
@@ -42,6 +42,16 @@ impl StateStore {
     pub async fn import_legacy(&self, legacy_root: &Path, platform: Platform) -> ImportReport {
         import_legacy(&self.path, legacy_root, platform).await
     }
+}
+
+pub(crate) async fn load_on_pool(path: PathBuf) -> Result<(AppState, std::thread::ThreadId), StateError> {
+    tokio::task::spawn_blocking(move || {
+        let reader = std::thread::current().id();
+        let bytes = std::fs::read(&path).map_err(|_| StateError::Malformed)?;
+        parse_stored(&bytes).map(|state| (state, reader))
+    })
+    .await
+    .map_err(|_| StateError::Malformed)?
 }
 
 #[cfg(test)]
