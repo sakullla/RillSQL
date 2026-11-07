@@ -7,6 +7,7 @@ mod menus;
 mod model;
 mod view;
 
+pub use close::{update_block_key, CloseFacts};
 pub use model::WorkbenchModel;
 pub use view::Workbench;
 

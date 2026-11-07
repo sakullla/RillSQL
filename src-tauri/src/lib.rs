@@ -15,6 +15,7 @@ mod native_export;
 mod i18n;
 mod product;
 mod query;
+pub mod release;
 mod redis;
 mod state;
 mod ui;

@@ -14,6 +14,7 @@ Run commands from the repository root:
 - `npm run tauri -- build`: build and bundle the desktop application.
 - `npm test`: run the frontend test suite once.
 - `cargo test --manifest-path src-tauri/Cargo.toml`: run Rust tests; run `npm run build` first because `tauri::generate_context!` embeds `dist/`.
+- `cargo build --release --locked --manifest-path src-tauri/Cargo.toml --bin rillsql` then `cargo run --manifest-path src-tauri/Cargo.toml --bin rillsql-package --features packager --locked -- --formats nsis`: package with cargo-packager 0.11.8. Do not start the second command until the first exits; it must not call cargo while the target directory lock is held. Windows can produce NSIS. macOS app/DMG and Linux DEB/AppImage are configured, but a release is complete only when all four installers and the signed updater manifest exist. This does not remove the Vue/Tauri commands above.
 - `docker compose -f docker/compose.yaml up -d`: start local PostgreSQL, MySQL, and MariaDB fixtures.
 
 ## Coding Style & Naming Conventions

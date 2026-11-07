@@ -1,0 +1,62 @@
+name: Rust packager
+
+# Node-free packaging path. It does not replace frontend CI and it does not
+# publish a GitHub release. --require-complete fails unless every platform
+# installer and updater signature is present.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: cargo-packager ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: Windows x64
+            formats: nsis
+          - os: macos-latest
+            platform: macOS ARM64
+            formats: app,dmg
+          - os: ubuntu-22.04
+            platform: Linux x64
+            formats: deb,appimage
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: bash .github/scripts/install-linux-deps.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the release binary
+        run: cargo build --release --locked --manifest-path src-tauri/Cargo.toml --bin rillsql
+      - name: Package with cargo-packager 0.11.8
+        run: cargo run --release --manifest-path src-tauri/Cargo.toml --bin rillsql-package --features packager --locked -- --formats ${{ matrix.formats }} --out src-tauri/target/packager
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packager-${{ matrix.platform }}
+          path: src-tauri/target/packager
+          if-no-files-found: error
+
+  complete:
+    name: Refuse an incomplete release
+    needs: package
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: packager-*
+          path: packager-artifacts
+          merge-multiple: true
+      - name: Require Windows, macOS and Linux assets
+        run: cargo run --manifest-path src-tauri/Cargo.toml --bin rillsql-package --locked -- --check-dir packager-artifacts --require-complete

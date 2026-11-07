@@ -38,6 +38,10 @@ open "/Applications/RillSQL.app"
 
 This repair is specific to the verified v0.2.9 packaging defect; do not use re-signing to conceal unexplained integrity failures in other downloads. Published assets and tags stay unchanged; the build fix ships in a new version.
 
+## cargo-packager
+
+`.github/workflows/package-rust.yml` is a manual, Node-free packaging path for cargo-packager 0.11.8. It is not part of `ci.yml` and it does not publish a GitHub Release. The Windows job can build NSIS; macOS builds app/DMG and Linux builds DEB/AppImage only when that workflow is run on those runners. The following job runs `rillsql-package --require-complete` and fails unless the Windows NSIS, macOS DMG, Linux DEB, AppImage, macOS updater archive and `.sig` files are all nonempty and use the existing `RillSQL_<version>_<arch>` names. Missing any of them means the version is not complete. The tag workflow in `release.yml` is unchanged and still refuses to publish without those assets.
+
 ## In-app updates
 
 Starting with v0.2.4, Settings → App updates supports manual checks, an optional startup check (enabled by default), download progress, and explicit installation/restart. Startup checks only notify; they never install automatically. Installation refuses active queries, export/import work and unsaved table/structure edits, then checkpoints SQL drafts and the active tab before the installer can exit the application. The same checks run again after download. Older versions without the updater must install v0.2.4 manually once.

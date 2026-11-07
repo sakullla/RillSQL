@@ -56,10 +56,47 @@ gpui = { package = "gpui-pre", version = "=0.3.11" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 gpui_macros = { package = "gpui-pre-macros", version = "=0.3.11" }
 lsp-types = { version = "=0.97.0", features = ["proposed"] }
+# 客户端验签与 Tauri updater 相同的 minisign 文本；版本绑定在本 crate 内完成。
+minisign-verify = "0.3"
+base64 = "0.22"
+# 安装阶段复用 cargo-packager-updater，但清单仍是现有 latest.json，不要求 format 字段。
+cargo-packager-updater = "=0.2.3"
+cargo-packager = { version = "=0.11.8", optional = true }
+minisign = { version = "0.7", optional = true }
+toml = { version = "0.9", optional = true }
 
 [dev-dependencies]
 gpui-kit = { version = "=0.9.0", features = ["test-support", "tree-sitter-sql"] }
+minisign = "0.7"
 
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# 只给 rillsql-package 使用。不要放进 default，避免产品二进制去编打包器。
+packager = ["dep:cargo-packager", "dep:minisign", "dep:toml"]
+
+[package.metadata.packager]
+product-name = "RillSQL"
+identifier = "app.rillsql.desktop"
+description = "RillSQL"
+homepage = "https://github.com/sakullla/RillSQL"
+publisher = "RillSQL"
+license-file = "../LICENSE"
+icons = [
+  "icons/32x32.png",
+  "icons/128x128.png",
+  "icons/128x128@2x.png",
+  "icons/icon.icns",
+  "icons/icon.ico",
+]
+# 非当前主机的格式由 cargo-packager 忽略。发布仍要四个安装包都在。
+formats = ["nsis", "app", "dmg", "deb", "appimage"]
+
+[[package.metadata.packager.binaries]]
+path = "RillSQL"
+main = true
+
+[package.metadata.packager.nsis]
+installer-icon = "icons/icon.ico"
+languages = ["SimpChinese", "English"]
+installer-mode = "currentUser"
