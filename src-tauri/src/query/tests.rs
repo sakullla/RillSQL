@@ -330,32 +330,20 @@ fn cancel_code_does_not_reuse_the_executing_stream() {
 #[test]
 fn query_commands_are_appended_without_dropping_catalog_or_grid() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let capability: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("capabilities/default.json")).unwrap()).unwrap();
-    let permissions = capability["permissions"].as_array().unwrap();
-    let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
-    let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
-    let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
-    let wire = wire.split("pub fn run").next().unwrap_or("");
-    for command in [
-        "query_start",
-        "query_poll",
-        "query_cancel",
-        "query_history",
-        "query_history_clear",
-        "query_history_delete",
-        "query_saved_list",
-        "query_saved_save",
-        "query_saved_rename",
-        "query_saved_delete",
-    ] {
-        let allow = format!("allow-{}", command.replace('_', "-"));
-        assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
-        assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
-        assert!(wire.contains(&format!("query::commands::{command}")), "{command}");
+    let query = std::fs::read_to_string(root.join("src/app/views/query/mod.rs")).unwrap();
+    for name in ["query::commands::start_run(", "query::commands::poll_run(", "query::commands::request_cancel("] {
+        assert!(query.contains(name), "{name}");
     }
-    for command in ["catalog_sessions", "catalog_refresh", "catalog_page", "grid_describe", "grid_page", "grid_count", "grid_commit", "grid_export", "grid_export_cancel"] {
-        assert!(wire.contains(command), "{command}");
+    let history = std::fs::read_to_string(root.join("src/app/views/history/mod.rs")).unwrap();
+    for name in ["fn load_runs(", "fn load_saved(", "fn save_named(", "fn rename_saved(", "fn delete_saved(", "fn delete_run(", "fn clear_runs("] {
+        assert!(history.contains(name), "{name}");
     }
+    let grid = std::fs::read_to_string(root.join("src/app/views/grid/mod.rs")).unwrap();
+    for name in ["application::grid::describe(", "application::grid::page(", "application::grid::count(", "application::grid::commit("] {
+        assert!(grid.contains(name), "{name}");
+    }
+    let compare = std::fs::read_to_string(root.join("src/app/views/compare/mod.rs")).unwrap();
+    assert!(compare.contains("application::work::catalog_refresh("));
 }
 
 #[tokio::test]

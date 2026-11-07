@@ -176,53 +176,6 @@ fn fixed_dependency_markers() -> usize {
 mod tests {
     use super::product;
 
-    const CONNECTION_COMMANDS: &[&str] = &[
-        "connections_list",
-        "connections_save",
-        "connections_delete",
-        "connections_test",
-        "connections_open",
-        "connections_focus_database",
-        "connections_disconnect",
-        "connections_confirm_host_key",
-        "connections_forget_host_key",
-        "connections_export",
-        "connections_import_file",
-        "env_tags_list",
-        "env_tags_save",
-        "env_tags_delete",
-    ];
-
-    /// 全库导出（R7）的命令也要三件套齐备：lib.rs 注册、权限清单、能力文件。
-    const DUMP_COMMANDS: &[&str] = &["database_dump", "database_dump_cancel"];
-
-    /// 跨库迁移（R8）的命令同样要三件套齐备：lib.rs 注册、权限清单、能力文件。
-    const MIGRATE_COMMANDS: &[&str] = &["migrate_data", "migrate_cancel"];
-
-    /// 拖放预览（R9）的命令同样要三件套齐备：lib.rs 注册、权限清单、能力文件。
-    const DROPPED_COMMANDS: &[&str] = &["read_dropped_preview"];
-
-    /// Redis 键浏览器（R11）的命令同样要三件套齐备：lib.rs 注册、权限清单、能力文件。
-    const REDIS_COMMANDS: &[&str] = &[
-        "redis_scan_keys",
-        "redis_read_key",
-        "redis_set_ttl",
-        "redis_delete_keys",
-        "redis_rename_key",
-        "redis_exec",
-    ];
-
-    /// MongoDB 集合文档浏览器（R12）的命令同样要三件套齐备：lib.rs 注册、权限清单、能力文件。
-    const MONGO_COMMANDS: &[&str] = &[
-        "mongo_list_databases",
-        "mongo_list_collections",
-        "mongo_find_documents",
-        "mongo_read_document",
-        "mongo_replace_document",
-        "mongo_insert_document",
-        "mongo_delete_document",
-    ];
-
     #[test]
     fn title_names_the_product() {
         assert_eq!(product::TITLE, "RillSQL");
@@ -245,112 +198,74 @@ mod tests {
         assert!(!super::local_data_dir().is_empty());
     }
 
-    #[test]
-    fn main_window_registers_dump_commands() {
+    fn source(relative: &str) -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
+        std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    }
+
+    fn tauri_ipc_manifests_are_absent() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let capability: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("capabilities/default.json")).unwrap()).unwrap();
-        let permissions = capability["permissions"].as_array().unwrap();
-        let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
-        let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
-        let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
-        let wire = wire.split("pub fn run").next().unwrap_or("");
-        for command in DUMP_COMMANDS {
-            let allow = format!("allow-{}", command.replace('_', "-"));
-            assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
-            assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
-            assert!(wire.contains(&format!("dump::commands::{command}")), "{command}");
+        for relative in [
+            "capabilities/default.json",
+            "permissions/app-commands.toml",
+            "gen/schemas/acl-manifests.json",
+            "gen/schemas/capabilities.json",
+            "gen/schemas/desktop-schema.json",
+            "gen/schemas/windows-schema.json",
+        ] {
+            assert!(!root.join(relative).exists(), "{relative}");
         }
     }
 
     #[test]
-    fn main_window_registers_migrate_commands() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let capability: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("capabilities/default.json")).unwrap()).unwrap();
-        let permissions = capability["permissions"].as_array().unwrap();
-        let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
-        let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
-        let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
-        let wire = wire.split("pub fn run").next().unwrap_or("");
-        for command in MIGRATE_COMMANDS {
-            let allow = format!("allow-{}", command.replace('_', "-"));
-            assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
-            assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
-            assert!(wire.contains(&format!("migrate::commands::{command}")), "{command}");
-        }
+    fn gpui_export_calls_dump_and_migrate() {
+        tauri_ipc_manifests_are_absent();
+        let view = source("src/app/views/export/mod.rs");
+        let desk = source("src/export/desk.rs");
+        assert!(view.contains("watch_dump("));
+        assert!(view.contains("watch_migrate("));
+        assert!(desk.contains("dump_database("));
+        assert!(desk.contains("migrate_data("));
     }
 
     #[test]
-    fn main_window_registers_dropped_commands() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let capability: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("capabilities/default.json")).unwrap()).unwrap();
-        let permissions = capability["permissions"].as_array().unwrap();
-        let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
-        let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
-        let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
-        let wire = wire.split("pub fn run").next().unwrap_or("");
-        for command in DROPPED_COMMANDS {
-            let allow = format!("allow-{}", command.replace('_', "-"));
-            assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
-            assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
-            assert!(wire.contains(&format!("dropped::{command}")), "{command}");
-        }
+    fn gpui_drop_reads_a_preview_without_ipc_manifests() {
+        tauri_ipc_manifests_are_absent();
+        assert!(source("src/export/desk.rs").contains("read_dropped_preview("));
+        assert!(source("src/app/shell/view.rs").contains("accept_drop_path("));
     }
 
     #[test]
-    fn main_window_registers_mongo_commands() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let capability: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("capabilities/default.json")).unwrap()).unwrap();
-        let permissions = capability["permissions"].as_array().unwrap();
-        let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
-        let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
-        let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
-        let wire = wire.split("pub fn run").next().unwrap_or("");
-        for command in MONGO_COMMANDS {
-            let allow = format!("allow-{}", command.replace('_', "-"));
-            assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
-            assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
-            assert!(wire.contains(&format!("mongo::commands::{command}")), "{command}");
+    fn gpui_mongo_calls_document_commands() {
+        tauri_ipc_manifests_are_absent();
+        let view = source("src/app/views/mongo/mod.rs");
+        for name in ["list_databases", "list_collections", "find_documents", "replace_document", "insert_document", "delete_document"] {
+            assert!(view.contains(&format!("application::mongo::{name}(")), "{name}");
         }
         assert_eq!(super::mongo::module_id(), "mongo");
     }
 
     #[test]
-    fn main_window_registers_redis_commands() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let capability: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("capabilities/default.json")).unwrap()).unwrap();
-        let permissions = capability["permissions"].as_array().unwrap();
-        let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
-        let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
-        let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
-        let wire = wire.split("pub fn run").next().unwrap_or("");
-        for command in REDIS_COMMANDS {
-            let allow = format!("allow-{}", command.replace('_', "-"));
-            assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
-            assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
-            assert!(wire.contains(&format!("redis::commands::{command}")), "{command}");
+    fn gpui_redis_calls_key_commands() {
+        tauri_ipc_manifests_are_absent();
+        let view = source("src/app/views/redis/mod.rs");
+        for name in ["scan_keys", "read_key", "set_ttl", "delete_keys", "rename_key", "exec"] {
+            assert!(view.contains(&format!("application::redis::{name}(")), "{name}");
         }
         assert_eq!(super::redis::module_id(), "redis");
     }
 
     #[test]
-    fn main_window_registers_connection_commands() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let capability: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("capabilities/default.json")).unwrap()).unwrap();
-        let permissions = capability["permissions"].as_array().unwrap();
-        assert_eq!(capability["windows"][0], "main");
-        let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
-        let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
-        let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
-        let wire = wire.split("pub fn run").next().unwrap_or("");
+    fn gpui_connections_call_the_service_and_do_not_start_tauri() {
+        tauri_ipc_manifests_are_absent();
+        let view = source("src/app/views/connections/mod.rs");
+        for name in ["fn list_rows(", "fn save_draft(", "fn delete_row(", "fn test_row(", "fn open_row(", "fn disconnect_row("] {
+            assert!(view.contains(name), "{name}");
+        }
+        let registration = source("src/lib.rs");
         assert!(registration.contains("app::run()"));
         let tauri_path = format!("{}{}", "tauri", "::");
         assert!(!registration.contains(&tauri_path));
-        for command in CONNECTION_COMMANDS {
-            let allow = format!("allow-{}", command.replace('_', "-"));
-            assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
-            assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
-            assert!(wire.contains(&format!("connections::commands::{command}")), "{command}");
-        }
         let _keep_public = (
             super::connections::commands::connections_list,
             super::connections::commands::connections_save,

@@ -464,47 +464,15 @@ fn mysql_and_postgres_alters_are_not_wrapped_in_a_transaction() {
 #[test]
 fn ddl_commands_stay_registered_beside_existing_commands() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let capability: serde_json::Value = serde_json::from_str(&fs::read_to_string(root.join("capabilities/default.json")).unwrap()).unwrap();
-    let permissions = capability["permissions"].as_array().unwrap();
-    let acl = fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
-    let registration = fs::read_to_string(root.join("src/lib.rs")).unwrap();
-    let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
-    let wire = wire.split("pub fn run").next().unwrap_or("");
-    let expected = [
-        ("app_info", "app_info"),
-        ("connections_list", "connections::commands::connections_list"),
-        ("connections_save", "connections::commands::connections_save"),
-        ("connections_delete", "connections::commands::connections_delete"),
-        ("connections_test", "connections::commands::connections_test"),
-        ("connections_open", "connections::commands::connections_open"),
-        ("connections_focus_database", "connections::commands::connections_focus_database"),
-        ("connections_disconnect", "connections::commands::connections_disconnect"),
-        ("connections_confirm_host_key", "connections::commands::connections_confirm_host_key"),
-        ("connections_forget_host_key", "connections::commands::connections_forget_host_key"),
-        ("catalog_sessions", "catalog::commands::catalog_sessions"),
-        ("catalog_refresh", "catalog::commands::catalog_refresh"),
-        ("catalog_page", "catalog::commands::catalog_page"),
-        ("grid_describe", "grid::commands::grid_describe"),
-        ("grid_page", "grid::commands::grid_page"),
-        ("grid_count", "grid::commands::grid_count"),
-        ("grid_commit", "grid::commands::grid_commit"),
-        ("grid_export", "grid::commands::grid_export"),
-        ("grid_export_cancel", "grid::commands::grid_export_cancel"),
-        ("ddl_describe", "ddl::commands::ddl_describe"),
-        ("ddl_preview", "ddl::commands::ddl_preview"),
-        ("ddl_execute", "ddl::commands::ddl_execute"),
-        ("query_start", "query::commands::query_start"),
-        ("query_poll", "query::commands::query_poll"),
-        ("query_cancel", "query::commands::query_cancel"),
-        ("query_history", "query::commands::query_history"),
-        ("query_history_clear", "query::commands::query_history_clear"),
-    ];
-    for (command, wire_name) in expected {
-        let allow = format!("allow-{}", command.replace('_', "-"));
-        assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
-        assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
-        assert!(wire.contains(wire_name), "{wire_name}");
-    }
+    let structure = fs::read_to_string(root.join("src/app/views/structure/mod.rs")).unwrap();
+    assert!(structure.contains("application::ddl::preview_request("));
+    assert!(structure.contains("application::ddl::execute_request("));
+    let query = fs::read_to_string(root.join("src/app/views/query/mod.rs")).unwrap();
+    assert!(query.contains("query::commands::start_run("));
+    assert!(query.contains("query::commands::poll_run("));
+    assert!(query.contains("query::commands::request_cancel("));
+    let grid = fs::read_to_string(root.join("src/app/views/grid/mod.rs")).unwrap();
+    assert!(grid.contains("application::grid::commit("));
     let mut sources = String::new();
     for name in ["sql.rs", "model.rs", "plan.rs", "introspect.rs", "exec.rs", "commands.rs", "mod.rs"] {
         sources.push_str(&fs::read_to_string(root.join("src/ddl").join(name)).unwrap());

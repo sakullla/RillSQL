@@ -173,20 +173,9 @@ use std::path::PathBuf;
 #[test]
 fn grid_commands_are_registered_beside_catalog() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let capability: serde_json::Value = serde_json::from_str(&fs::read_to_string(root.join("capabilities/default.json")).unwrap()).unwrap();
-    let permissions = capability["permissions"].as_array().unwrap();
-    let acl = fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
-    let registration = fs::read_to_string(root.join("src/lib.rs")).unwrap();
-    let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
-    let wire = wire.split("pub fn run").next().unwrap_or("");
-    for command in ["grid_describe", "grid_page", "grid_count", "grid_commit", "grid_export", "grid_export_cancel"] {
-        let allow = format!("allow-{}", command.replace('_', "-"));
-        assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
-        assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
-        assert!(wire.contains(&format!("grid::commands::{command}")), "{command}");
-    }
-    for command in ["catalog_sessions", "catalog_refresh", "catalog_page"] {
-        assert!(wire.contains(&format!("catalog::commands::{command}")), "{command}");
+    let view = fs::read_to_string(root.join("src/app/views/grid/mod.rs")).unwrap();
+    for name in ["application::grid::describe(", "application::grid::page(", "application::grid::count(", "application::grid::commit("] {
+        assert!(view.contains(name), "{name}");
     }
     let drivers = fs::read_to_string(root.join("src/connections/drivers.rs")).unwrap();
     let open = drivers.split("pub async fn open_sqlite").nth(1).unwrap();

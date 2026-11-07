@@ -997,17 +997,9 @@ fn postgres_other_database_needs_an_ephemeral_session() {
 #[test]
 fn compare_commands_are_registered_and_do_not_focus_or_execute() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let capability: serde_json::Value = serde_json::from_str(&fs::read_to_string(root.join("capabilities/default.json")).unwrap()).unwrap();
-    let permissions = capability["permissions"].as_array().unwrap();
-    let acl = fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
-    let registration = fs::read_to_string(root.join("src/lib.rs")).unwrap();
-    let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
-    let wire = wire.split("pub fn run").next().unwrap_or("");
-    for command in ["compare_structure", "compare_data", "compare_cancel", "compare_schemas"] {
-        let allow = format!("allow-{}", command.replace('_', "-"));
-        assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
-        assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
-        assert!(wire.contains(&format!("compare::commands::{command}")), "{command}");
+    let view = fs::read_to_string(root.join("src/app/views/compare/mod.rs")).unwrap();
+    for name in ["application::work::compare_structure(", "application::work::compare_data(", "application::work::compare_schemas(", "cancel_compare"] {
+        assert!(view.contains(name), "{name}");
     }
     let reader = include_str!("read.rs");
     let commands = include_str!("commands.rs");

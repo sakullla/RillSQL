@@ -384,20 +384,8 @@ fn refresh_keeps_the_loaded_window_and_a_failed_list_is_not_empty() {
 #[test]
 fn catalog_commands_use_the_open_session_reader() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let capability: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(root.join("capabilities/default.json")).unwrap()).unwrap();
-    let permissions = capability["permissions"].as_array().unwrap();
-    let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
-    let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
-    let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
-    let wire = wire.split("pub fn run").next().unwrap_or("");
-    for command in ["catalog_sessions", "catalog_refresh", "catalog_page", "catalog_definition"] {
-        let allow = format!("allow-{}", command.replace('_', "-"));
-        assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");
-        assert!(acl.contains(&format!("commands.allow = [\"{command}\"]")), "{command}");
-        assert!(wire.contains(&format!("catalog::commands::{command}")), "{command}");
-    }
-    assert!(wire.contains("connections::commands::connections_open"));
+    let compare = std::fs::read_to_string(root.join("src/app/views/compare/mod.rs")).unwrap();
+    assert!(compare.contains("application::work::catalog_refresh("));
     let reader = std::fs::read_to_string(root.join("src/catalog/read.rs")).unwrap();
     assert!(reader.contains("metadata_sql"));
     assert!(!reader.contains("PRAGMA foreign_keys"));
