@@ -6,5 +6,11 @@ src-tauri/target/
 *.log
 .DS_Store
 docs/*
+# Re-include only the GPUI foundation evidence. docs/* hides the parent, so
+# verification is opened and then closed again except for this directory.
+!docs/verification/
+docs/verification/*
+!docs/verification/gpui-foundation/
+!docs/verification/gpui-foundation/**
 .compose/
 plans/

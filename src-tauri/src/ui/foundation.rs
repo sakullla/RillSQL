@@ -160,11 +160,9 @@ impl Foundation {
             prompt: Some(SharedString::from(self.shell.text("shell.command.openSqlite"))),
         });
         cx.spawn(async move |this, cx| {
-            let chosen = receiver.await.ok().and_then(|result| result.ok()).flatten();
+            let message = receiver.await;
             cx.update(|cx| {
-                let _ = this.update(cx, |view, cx| {
-                    view.finish_open(chosen.unwrap_or_default(), cx);
-                });
+                let _ = this.update(cx, |view, cx| view.on_open_prompt(message, cx));
             });
         })
         .detach();
@@ -178,16 +176,44 @@ impl Foundation {
         let directory = std::env::temp_dir();
         let receiver = cx.prompt_for_new_path(&directory, Some(&suggested));
         cx.spawn(async move |this, cx| {
-            let chosen = receiver.await.ok().and_then(|result| result.ok()).flatten();
+            let message = receiver.await;
             cx.update(|cx| {
-                let _ = this.update(cx, |view, cx| {
-                    if let Some(path) = chosen {
-                        view.finish_save(path, cx);
-                    }
-                });
+                let _ = this.update(cx, |view, cx| view.on_save_prompt(message, cx));
             });
         })
         .detach();
+    }
+
+    /// `Ok(None)` is cancel. A closed channel or a platform `Err` is a visible failure.
+    fn on_open_prompt<E: std::fmt::Display>(
+        &mut self,
+        message: Result<Result<Option<Vec<std::path::PathBuf>>, E>, futures::channel::oneshot::Canceled>,
+        cx: &mut Context<Self>,
+    ) {
+        match message {
+            Ok(Ok(Some(paths))) => self.finish_open(paths, cx),
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => self.fail_prompt(error.to_string(), cx),
+            Err(error) => self.fail_prompt(error.to_string(), cx),
+        }
+    }
+
+    fn on_save_prompt<E: std::fmt::Display>(
+        &mut self,
+        message: Result<Result<Option<std::path::PathBuf>, E>, futures::channel::oneshot::Canceled>,
+        cx: &mut Context<Self>,
+    ) {
+        match message {
+            Ok(Ok(Some(path))) => self.finish_save(path, cx),
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => self.fail_prompt(error.to_string(), cx),
+            Err(error) => self.fail_prompt(error.to_string(), cx),
+        }
+    }
+
+    fn fail_prompt(&mut self, error: String, cx: &mut Context<Self>) {
+        self.status = SharedString::from(error);
+        cx.notify();
     }
 
     pub fn finish_open(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
@@ -473,5 +499,67 @@ mod tests {
             assert_eq!(dropped, vec![opened]);
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    fn prompt_cancel_is_quiet_and_dialog_errors_are_visible(cx: &mut TestAppContext) {
+        let (window, view) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |view, cx| view.perform("open-sqlite", cx));
+        })
+        .unwrap();
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|_| None);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(view.read(cx).shell().opened_path.is_none());
+            assert_eq!(view.read(cx).status.as_ref(), "GPUI");
+        });
+
+        let (sender, mut receiver) = futures::channel::oneshot::channel();
+        sender
+            .send(Err(std::io::Error::other("open picker failed")))
+            .unwrap();
+        let message = receiver.try_recv().unwrap().expect("open result");
+        cx.update(|cx| {
+            view.update(cx, |view, cx| view.on_open_prompt(Ok(message), cx));
+            assert!(view.read(cx).status.as_ref().contains("open picker failed"));
+            assert!(view.read(cx).shell().opened_path.is_none());
+        });
+
+        let (sender, mut receiver) = futures::channel::oneshot::channel::<
+            Result<Option<Vec<std::path::PathBuf>>, std::io::Error>,
+        >();
+        drop(sender);
+        let canceled = receiver.try_recv().expect_err("dropped sender cancels");
+        cx.update(|cx| {
+            view.update(cx, |view, cx| view.on_open_prompt::<std::io::Error>(Err(canceled), cx));
+            assert!(view.read(cx).status.as_ref().contains("canceled"));
+            assert!(view.read(cx).shell().opened_path.is_none());
+        });
+
+        cx.update_window(window, |_, _, cx| {
+            view.update(cx, |view, cx| view.perform("save-query", cx));
+        })
+        .unwrap();
+        assert!(cx.did_prompt_for_new_path());
+        cx.simulate_new_path_selection(|_| None);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(view.read(cx).shell().saved_path.is_none());
+            assert!(view.read(cx).status.as_ref().contains("canceled"));
+        });
+
+        let (sender, mut receiver) = futures::channel::oneshot::channel();
+        sender
+            .send(Err(std::io::Error::other("save picker failed")))
+            .unwrap();
+        let message = receiver.try_recv().unwrap().expect("save result");
+        cx.update(|cx| {
+            view.update(cx, |view, cx| view.on_save_prompt(Ok(message), cx));
+            assert!(view.read(cx).status.as_ref().contains("save picker failed"));
+            assert!(view.read(cx).shell().saved_path.is_none());
+        });
     }
 }

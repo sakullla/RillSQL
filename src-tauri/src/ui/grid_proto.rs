@@ -80,6 +80,15 @@ impl GridPrototype {
     }
 
     pub fn copy_tsv(&mut self, cx: &mut App) -> String {
+        // Clicks and arrow keys update TableState's cell only. The copy rectangle
+        // stays at the delegate anchor until that cell is adopted.
+        self.table.update(cx, |state, _cx| {
+            if let Some((row, col)) = state.selected_cell() {
+                if state.delegate().focus != (row, col) {
+                    state.delegate_mut().select(row, col, false);
+                }
+            }
+        });
         let tsv = self.table.read(cx).delegate().tsv();
         cx.write_to_clipboard(ClipboardItem::new_string(tsv.clone()));
         tsv
@@ -410,6 +419,33 @@ mod tests {
             window.render_frame(cx);
             let visible = grid.read(cx).visible_rows(cx);
             assert!(visible.len() < EDITABLE_ROWS, "{visible:?}");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn copy_follows_a_cell_click_or_arrow_without_manual_select(cx: &mut TestAppContext) {
+        use gpui_kit::Focusable as _;
+
+        let (window, grid) = open(cx, GridFixture::ReadOnly);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("table-cell-0:1", cx);
+            assert_eq!(grid.read(cx).selected_cell(cx), Some((0, 1)));
+            let tsv = grid.update(cx, |grid, cx| grid.copy_tsv(cx));
+            assert_eq!(tsv, "r0c1", "click must not copy the default (0, 0) cell");
+            grid.update(cx, |grid, cx| {
+                let handle = grid.table.read(cx).focus_handle(cx);
+                handle.focus(window, cx);
+            });
+            window.press("right", cx);
+            assert_eq!(grid.read(cx).selected_cell(cx), Some((0, 2)));
+            let tsv = grid.update(cx, |grid, cx| grid.copy_tsv(cx));
+            assert_eq!(tsv, "r0c2");
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()).as_deref(),
+                Some("r0c2")
+            );
         })
         .unwrap();
     }
