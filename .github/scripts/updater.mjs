@@ -59,9 +59,11 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   try {
     const [releasePath, tag, sha, directory, repo] = process.argv.slice(2);
     if (!sha || !/^[a-f0-9]{40}$/.test(sha) || !directory) throw new Error("Usage: updater.mjs <release.json> <tag> <sha> <signatures-dir> <owner/repo>");
-    const config = JSON.parse(readFileSync(new URL("../../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
+    const source = readFileSync(new URL("../../src-tauri/src/release/mod.rs", import.meta.url), "utf8");
+    const pubkey = source.match(/pub const UPDATER_PUBKEY: &str = "([^"]+)";/)?.[1];
+    if (!pubkey) throw new Error("UPDATER_PUBKEY missing from src-tauri/src/release/mod.rs");
     const manifest = buildUpdaterManifest(JSON.parse(readFileSync(releasePath, "utf8")), tag, sha, repo,
-      (name) => readFileSync(resolve(directory, name), "utf8"), config.plugins.updater.pubkey);
+      (name) => readFileSync(resolve(directory, name), "utf8"), pubkey);
     process.stdout.write(`${JSON.stringify(manifest, null, 2)}\n`);
   } catch (error) {
     console.error(error.message);

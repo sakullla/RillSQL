@@ -389,7 +389,7 @@ fn catalog_commands_use_the_open_session_reader() {
     let permissions = capability["permissions"].as_array().unwrap();
     let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
     let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
-    let wire = registration.split("fn wire").nth(1).unwrap_or("");
+    let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
     let wire = wire.split("pub fn run").next().unwrap_or("");
     for command in ["catalog_sessions", "catalog_refresh", "catalog_page", "catalog_definition"] {
         let allow = format!("allow-{}", command.replace('_', "-"));

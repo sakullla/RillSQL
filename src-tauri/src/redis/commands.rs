@@ -5,9 +5,8 @@ use crate::application::redis::{self, DeleteOutcome, ExecOutcome, RenameOutcome,
 use crate::connections::commands::ConnectionsState;
 use crate::redis::keys::RedisKeyDetail;
 
-#[tauri::command]
 pub async fn redis_scan_keys(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     connection_id: String,
     cursor: Option<u64>,
     pattern: Option<String>,
@@ -16,14 +15,12 @@ pub async fn redis_scan_keys(
     redis::scan_keys(&state.service, &connection_id, cursor, pattern, count).await
 }
 
-#[tauri::command]
-pub async fn redis_read_key(state: tauri::State<'_, ConnectionsState>, connection_id: String, key: String) -> Result<RedisKeyDetail, String> {
+pub async fn redis_read_key(state: &ConnectionsState, connection_id: String, key: String) -> Result<RedisKeyDetail, String> {
     redis::read_key(&state.service, &connection_id, key).await
 }
 
-#[tauri::command]
 pub async fn redis_set_ttl(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     connection_id: String,
     key: String,
     seconds: Option<i64>,
@@ -31,9 +28,8 @@ pub async fn redis_set_ttl(
     redis::set_ttl(&state.service, &connection_id, key, seconds).await
 }
 
-#[tauri::command]
 pub async fn redis_delete_keys(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     connection_id: String,
     keys: Vec<String>,
     confirmed: Option<bool>,
@@ -41,9 +37,8 @@ pub async fn redis_delete_keys(
     redis::delete_keys(&state.service, &connection_id, keys, confirmed.unwrap_or(false)).await
 }
 
-#[tauri::command]
 pub async fn redis_rename_key(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     connection_id: String,
     from: String,
     to: String,
@@ -52,9 +47,8 @@ pub async fn redis_rename_key(
     redis::rename_key(&state.service, &connection_id, from, to, confirmed.unwrap_or(false)).await
 }
 
-#[tauri::command]
 pub async fn redis_exec(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     connection_id: String,
     command: String,
     args: Vec<String>,

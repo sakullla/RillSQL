@@ -64,14 +64,12 @@ fn secrets_from(password: Option<String>, ssh_password: Option<String>, ssh_pass
     }
 }
 
-#[tauri::command]
-pub async fn env_tags_list(state: tauri::State<'_, ConnectionsState>) -> Result<Vec<EnvTag>, CommandError> {
+pub async fn env_tags_list(state: &ConnectionsState) -> Result<Vec<EnvTag>, CommandError> {
     state.service.list_tags().await.map_err(CommandError::from)
 }
 
-#[tauri::command]
 pub async fn env_tags_save(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     id: Option<String>,
     label: String,
     tone: String,
@@ -79,19 +77,16 @@ pub async fn env_tags_save(
     state.service.save_tag(id, label, tone).await.map_err(CommandError::from)
 }
 
-#[tauri::command]
-pub async fn env_tags_delete(state: tauri::State<'_, ConnectionsState>, id: String) -> Result<(), CommandError> {
+pub async fn env_tags_delete(state: &ConnectionsState, id: String) -> Result<(), CommandError> {
     state.service.delete_tag(&id).await.map_err(CommandError::from)
 }
 
-#[tauri::command]
-pub async fn connections_list(state: tauri::State<'_, ConnectionsState>) -> Result<Vec<ConnectionRecord>, CommandError> {
+pub async fn connections_list(state: &ConnectionsState) -> Result<Vec<ConnectionRecord>, CommandError> {
     state.service.list().await.map_err(CommandError::from)
 }
 
-#[tauri::command]
 pub async fn connections_save(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     draft: ConnectionDraft,
     password: Option<String>,
     ssh_password: Option<String>,
@@ -105,14 +100,12 @@ pub async fn connections_save(
         .map_err(CommandError::from)
 }
 
-#[tauri::command]
-pub async fn connections_delete(state: tauri::State<'_, ConnectionsState>, id: String) -> Result<DeleteOutcome, CommandError> {
+pub async fn connections_delete(state: &ConnectionsState, id: String) -> Result<DeleteOutcome, CommandError> {
     state.service.delete(&id).await.map_err(CommandError::from)
 }
 
-#[tauri::command]
 pub async fn connections_test(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     id: String,
     password: Option<String>,
     ssh_password: Option<String>,
@@ -125,9 +118,8 @@ pub async fn connections_test(
         .map_err(CommandError::from)
 }
 
-#[tauri::command]
 pub async fn connections_open(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     id: String,
     password: Option<String>,
     ssh_password: Option<String>,
@@ -140,28 +132,24 @@ pub async fn connections_open(
         .map_err(CommandError::from)
 }
 
-#[tauri::command]
-pub async fn connections_disconnect(state: tauri::State<'_, ConnectionsState>, id: String) -> Result<(), CommandError> {
+pub async fn connections_disconnect(state: &ConnectionsState, id: String) -> Result<(), CommandError> {
     state.service.disconnect(&id);
     Ok(())
 }
 
-#[tauri::command]
-pub async fn connections_focus_database(state: tauri::State<'_, ConnectionsState>, id: String, database: String) -> Result<(), CommandError> {
+pub async fn connections_focus_database(state: &ConnectionsState, id: String, database: String) -> Result<(), CommandError> {
     state.service.focus_database(&id, &database).await.map_err(CommandError::from)
 }
 
-#[tauri::command]
 pub async fn connections_confirm_host_key(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     id: String,
     fingerprint: String,
 ) -> Result<(), CommandError> {
     state.service.confirm_host_key(&id, &fingerprint).await.map_err(CommandError::from)
 }
 
-#[tauri::command]
-pub async fn connections_forget_host_key(state: tauri::State<'_, ConnectionsState>, id: String) -> Result<(), CommandError> {
+pub async fn connections_forget_host_key(state: &ConnectionsState, id: String) -> Result<(), CommandError> {
     state.service.forget_host_key(&id).await.map_err(CommandError::from)
 }
 
@@ -173,9 +161,8 @@ pub struct ExportOutcome {
 
 /// 导出全部（ids 为 None）或选中连接。passphrase 留空导出明文 JSON；填写则整体加密。
 /// 文件路径来自前端的原生保存对话框，后端只写这一个文件。
-#[tauri::command]
 pub async fn connections_export(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     ids: Option<Vec<String>>,
     passphrase: Option<String>,
     path: String,
@@ -189,9 +176,8 @@ pub async fn connections_export(
 }
 
 /// 导入 RillSQL 导出文件：识别 RILLSQLCX1 加密头则要求口令；格式不符或口令错误整体拒绝。
-#[tauri::command]
 pub async fn connections_import_file(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     path: String,
     passphrase: Option<String>,
 ) -> Result<ParsedImport, CommandError> {

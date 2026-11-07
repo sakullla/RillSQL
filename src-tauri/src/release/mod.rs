@@ -18,7 +18,7 @@ pub const PACKAGER_VERSION: &str = "0.11.8";
 pub const PACKAGER_UPDATER_VERSION: &str = "0.2.3";
 pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const UPDATER_ENDPOINT: &str = "https://github.com/sakullla/RillSQL/releases/latest/download/latest.json";
-/// 与 `src-tauri/tauri.conf.json` 的 updater 公钥相同，不能另换一把钥匙。
+/// 与既有发布钥匙相同的 updater 公钥，不能另换一把钥匙。
 pub const UPDATER_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVDMUFGMEEzQjI1REM2RDQKUldUVXhsMnlvL0FhWFBuNHFJRUcrZ2xWYVBmaU5yaHFMUklmVTRRRExlTnJDbmk5eFNSSXRIV0gK";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -631,28 +631,27 @@ mod tests {
         assert!(cargo.contains("identifier = \"app.rillsql.desktop\""));
         assert!(cargo.contains("product-name = \"RillSQL\""));
         assert!(cargo.contains("installer-mode = \"currentUser\""));
-        let config: Value = serde_json::from_str(&fs::read_to_string(root.join("src-tauri/tauri.conf.json")).unwrap()).unwrap();
-        assert_eq!(config["plugins"]["updater"]["pubkey"].as_str(), Some(UPDATER_PUBKEY));
-        assert_eq!(config["plugins"]["updater"]["endpoints"][0].as_str(), Some(UPDATER_ENDPOINT));
-        assert_eq!(config["version"].as_str(), Some(PRODUCT_VERSION));
-        assert_eq!(config["bundle"]["createUpdaterArtifacts"], true);
-        let package_json: Value = serde_json::from_str(&fs::read_to_string(root.join("package.json")).unwrap()).unwrap();
-        let lock: Value = serde_json::from_str(&fs::read_to_string(root.join("package-lock.json")).unwrap()).unwrap();
-        let product = fs::read_to_string(root.join("src/shell/product.ts")).unwrap();
+        assert!(!cargo.contains("tauri"));
         let cargo_lock = fs::read_to_string(root.join("src-tauri/Cargo.lock")).unwrap();
-        assert_eq!(package_json["version"].as_str(), Some(PRODUCT_VERSION));
-        assert_eq!(lock["version"].as_str(), Some(PRODUCT_VERSION));
-        assert_eq!(lock["packages"][""]["version"].as_str(), Some(PRODUCT_VERSION));
-        assert!(product.contains(&format!("PRODUCT_VERSION = \"{PRODUCT_VERSION}\"")));
         assert_eq!(rillsql_lock_version(&cargo_lock).as_deref(), Some(PRODUCT_VERSION));
         assert!(cargo.contains(&format!("version = \"{PRODUCT_VERSION}\"")));
+        assert_eq!(UPDATER_ENDPOINT, "https://github.com/sakullla/RillSQL/releases/latest/download/latest.json");
+        assert!(UPDATER_PUBKEY.starts_with("dW50cnVzdGVkIGNvbW1lbnQ6"));
         let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
-        assert!(ci.contains("npm test"));
-        assert!(ci.contains("npm run build"));
+        assert!(ci.contains("cargo test --locked --manifest-path src-tauri/Cargo.toml"));
+        assert!(!ci.contains("npm "));
+        assert!(!ci.contains("tauri-action"));
+        assert!(!ci.contains("frontend-dist"));
+        let release_ci = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+        assert!(release_ci.contains("rillsql-package"));
+        assert!(!release_ci.contains("tauri-action"));
+        assert!(!release_ci.contains("npm "));
+        assert!(release_ci.contains("release.mjs verify"));
         let package_ci = fs::read_to_string(root.join(".github/workflows/package-rust.yml")).unwrap();
         assert!(package_ci.contains("workflow_dispatch"));
         assert!(!package_ci.contains("npm "));
         assert!(package_ci.contains("--require-complete"));
+        assert!(package_ci.contains("install-linux-deps.sh"));
     }
 
     #[test]

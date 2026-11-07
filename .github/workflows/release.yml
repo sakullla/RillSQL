@@ -126,10 +126,6 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 10
         run: bash .github/scripts/install-linux-deps.sh
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: npm
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -139,7 +135,6 @@ jobs:
           shared-key: release-v1-${{ matrix.target }}
           cache-bin: false
           save-if: false
-      - run: npm ci --prefer-offline --no-audit --no-fund
       - name: Require updater signing key
         shell: bash
         env:
@@ -149,53 +144,35 @@ jobs:
             echo "::error::TAURI_SIGNING_PRIVATE_KEY is required for signed app updates."
             exit 1
           fi
-      - name: Build and upload to draft release
-        if: runner.os != 'macOS'
-        uses: tauri-apps/tauri-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          releaseId: ${{ needs.prepare.outputs.release-id }}
-          tagName: ${{ github.ref_name }}
-          releaseDraft: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          retryAttempts: 2
-          uploadUpdaterJson: false
-          uploadUpdaterSignatures: true
-          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
-      - name: Build and sign macOS bundles with the stable certificate
-        if: runner.os == 'macOS'
+      - name: Build the GPUI binary
+        run: cargo build --release --locked --manifest-path src-tauri/Cargo.toml --bin rillsql --target ${{ matrix.target }}
+      - name: Package with cargo-packager
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ github.ref_name }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # CI=true makes Tauri skip the Finder layout step of the DMG.
-          TAURI_BUNDLER_DMG_IGNORE_CI: "true"
-          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          : "${APPLE_CERTIFICATE:?Stable macOS certificate is required}"
-          : "${APPLE_CERTIFICATE_PASSWORD:?Certificate password is required}"
-          : "${APPLE_SIGNING_IDENTITY:?Signing identity is required}"
-          env -u APPLE_CERTIFICATE -u APPLE_CERTIFICATE_PASSWORD -u APPLE_SIGNING_IDENTITY \
-            npm run tauri -- build --target "$TARGET" --bundles app,dmg --no-sign -- --locked
-          version=$(node -p "require('./package.json').version")
-          bundle="src-tauri/target/$TARGET/release/bundle"
-          bash .github/scripts/sign-macos-bundles.sh "$bundle" "$version"
-          bash .github/scripts/verify-macos-bundles.sh "$bundle" "$version"
-          updater="$bundle/macos/RillSQL_${version}_aarch64.app.tar.gz"
-          mv "$bundle/macos/RillSQL.app.tar.gz" "$updater"
-          npm run tauri -- signer sign "$updater" --app-version "$version"
-          test -s "$updater.sig"
-          gh release upload "$RELEASE_TAG" \
-            "$bundle/dmg/RillSQL_${version}_aarch64.dmg" "$updater" "$updater.sig" --clobber
+          cargo run --release --manifest-path src-tauri/Cargo.toml --bin rillsql-package --features packager --locked --target ${{ matrix.target }} -- --formats "${{ matrix.bundles }}" --out src-tauri/target/packager
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)
+          case "$RUNNER_OS" in
+            Windows) names=("RillSQL_${version}_x64-setup.exe") ;;
+            macOS) names=("RillSQL_${version}_aarch64.dmg" "RillSQL_${version}_aarch64.app.tar.gz") ;;
+            Linux) names=("RillSQL_${version}_amd64.deb" "RillSQL_${version}_amd64.AppImage") ;;
+            *) echo "::error::unsupported runner $RUNNER_OS"; exit 1 ;;
+          esac
+          files=()
+          for name in "${names[@]}"; do
+            path="src-tauri/target/packager/$name"
+            if [[ ! -s "$path" || ! -s "$path.sig" ]]; then
+              echo "::error::missing or empty $name or its signature"
+              exit 1
+            fi
+            files+=("$path" "$path.sig")
+          done
+          gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
 
   publish:
     name: Verify assets and publish

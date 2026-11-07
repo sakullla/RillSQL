@@ -1,6 +1,6 @@
 # CI and releases
 
-CI builds the frontend once, then shares `frontend-dist` with the production-browser checks and the three native Rust test/Clippy jobs. Browser checks use synthetic IPC; they do not replace native database verification.
+CI runs Rust tests and Clippy on Windows, macOS, and Linux. It does not build a Vue frontend or a WebView. Browser synthetic IPC is not part of this pipeline and does not replace native database verification.
 
 On a main push, three cache jobs prepare release-profile Rust dependencies when their cache is missing. Their `release-v1-${target}` shared keys and workspace configuration match the release workflow. Tags read main's caches and do not save tag-scoped copies. The first main run after a toolchain or dependency change can take longer; subsequent releases reuse those compiled dependencies. Application crates are rebuilt for each release.
 
@@ -12,9 +12,9 @@ Run the release guard tests locally with `node --test .github/scripts/release.te
 
 ## macOS signing and first launch
 
-`bundle.macOS.signingIdentity` is `"-"` for local ad-hoc builds. Release builds follow Cliora’s fixed self-signed certificate approach: Tauri builds with `--no-sign`, then `sign-macos-bundles.sh` imports the certificate into a temporary keychain, signs the executable and complete app, replaces the app inside the DMG while preserving its Finder layout, and recreates the updater archive. `verify-macos-bundles.sh` checks all three copies with `codesign --verify --deep --strict` and requires the configured certificate authority. Only then is the updater archive signed and uploaded. A missing certificate, ad-hoc signature or wrong identity fails the release; there is no unsigned fallback. Temporary keychain and certificate files are removed on exit.
+`release.yml` packages macOS with cargo-packager and does not call `sign-macos-bundles.sh` or `verify-macos-bundles.sh`. Those scripts target the old Tauri bundle layout. Main CI still runs `test-macos-signing.sh` against that script's fixtures; the smoke test is not a DMG built from the GPUI binary. The fixed self-signed certificate secrets remain in the repository, but this workflow does not apply them to the cargo-packager app or DMG.
 
-The persistent identity is `RillSQL Code Signing`, stored in repository secrets `APPLE_CERTIFICATE` (base64 PKCS#12), `APPLE_CERTIFICATE_PASSWORD`, and `APPLE_SIGNING_IDENTITY`. These were configured with `gh secret set`; preserve the protected backup outside the repository at `~/.config/rillsql/signing/`. Reuse this certificate across releases; do not generate a new key in CI. It is independent of the existing Tauri updater signing key. Do not modify an archive after generating its updater signature.
+The persistent identity is `RillSQL Code Signing`, stored in repository secrets `APPLE_CERTIFICATE` (base64 PKCS#12), `APPLE_CERTIFICATE_PASSWORD`, and `APPLE_SIGNING_IDENTITY`. These were configured with `gh secret set`; preserve the protected backup outside the repository at `~/.config/rillsql/signing/`. Reuse this certificate across releases; do not generate a new key in CI. It is independent of the minisign updater key. Do not modify an archive after generating its updater signature.
 
 The signing script registers its temporary keychain in the user search list and as the default, resolves the imported certificate's SHA-1 identity, and confirms that its private key is available before signing. It restores the previous keychain settings on exit. Main CI runs a native signing smoke test on the same macOS runner image as releases, including all three bundle copies, resource-tampering rejection, and keychain restoration. This catches signing environment failures before a release tag is pushed. The v0.2.10 draft stopped at `codesign: no identity found`; its tag is preserved and the fix uses a new patch version.
 
@@ -25,7 +25,7 @@ xattr -dr com.apple.quarantine "/Applications/RillSQL.app"
 open "/Applications/RillSQL.app"
 ```
 
-Replace the path if installed elsewhere. Do not disable Gatekeeper globally. See [Tauri's signing guide](https://v2.tauri.app/distribute/sign/macos/) for the distinction between ad-hoc signing and Developer ID signing/notarization.
+Replace the path if installed elsewhere. Do not disable Gatekeeper globally. Ad-hoc signing is not Apple Developer ID signing or notarization.
 
 The v0.2.9 DMG was verified against its GitHub asset SHA-256 but failed bundle signature verification: its executable had only a linker-generated signature, with no sealed resources or bound Info.plist. Existing v0.2.9 installations from that trusted release also need a one-time bundle signature repair before opening:
 
@@ -40,16 +40,16 @@ This repair is specific to the verified v0.2.9 packaging defect; do not use re-s
 
 ## cargo-packager
 
-`.github/workflows/package-rust.yml` is a manual, Node-free packaging path for cargo-packager 0.11.8. It is not part of `ci.yml` and it does not publish a GitHub Release. The Windows job can build NSIS; macOS builds app/DMG and Linux builds DEB/AppImage only when that workflow is run on those runners. The following job runs `rillsql-package --require-complete` and fails unless the Windows NSIS, macOS DMG, Linux DEB, AppImage, macOS updater archive and `.sig` files are all nonempty and use the existing `RillSQL_<version>_<arch>` names. Missing any of them means the version is not complete. The tag workflow in `release.yml` is unchanged and still refuses to publish without those assets.
+`.github/workflows/package-rust.yml` is a manual packaging check for cargo-packager 0.11.8. It is not part of `ci.yml` and it does not publish a GitHub Release. The Windows job can build NSIS; macOS builds app/DMG and Linux builds DEB/AppImage only when that workflow is run on those runners. Its complete job installs Linux dependencies, then runs `rillsql-package --require-complete` and fails unless the Windows NSIS, macOS DMG, Linux DEB, AppImage, macOS updater archive and `.sig` files are all nonempty and use the existing `RillSQL_<version>_<arch>` names. Missing any of them means the version is not complete. `release.yml` publishes with the same packager and still refuses to publish without those assets.
 
 ## In-app updates
 
 Starting with v0.2.4, Settings → App updates supports manual checks, an optional startup check (enabled by default), download progress, and explicit installation/restart. Startup checks only notify; they never install automatically. Installation refuses active queries, export/import work and unsaved table/structure edits, then checkpoints SQL drafts and the active tab before the installer can exit the application. The same checks run again after download. Older versions without the updater must install v0.2.4 manually once.
 
-Tauri verifies package signatures with the public key in `src-tauri/tauri.conf.json` and requires the signed version to match the announced release. The independent RillSQL signing key and password are configured as `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` repository secrets; keep their secure backup outside the repository. Preserve this key for future releases so installed clients continue to trust updates. These updater signatures are separate from Windows/macOS platform code signing.
+The GPUI client verifies package signatures with `UPDATER_PUBKEY` in `src-tauri/src/release/mod.rs` and requires the signed version to match the announced release. The independent RillSQL signing key and password are configured as `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` repository secrets; keep their secure backup outside the repository. Preserve this key for future releases so installed clients continue to trust updates. These updater signatures are separate from Windows/macOS platform code signing. `latest.json` has no `format` field.
 
 Matrix jobs upload installers, the macOS `.app.tar.gz` update archive, and their `.sig` files. They do not upload competing partial manifests. The single publish job checks all four update packages and signature metadata (key ID and bound version), generates all seven platform/package aliases with immutable tag URLs, and uploads `latest.json` before publishing. Cryptographic package verification is performed by the client updater. Linux DEB and AppImage installations receive their corresponding format; macOS supports ARM64 and Windows supports x64. Stable clients follow the latest stable GitHub release.
 
 Browser verification uses synthetic IPC and cannot prove native installation/relaunch. A full upgrade smoke test requires two signed native versions; do not treat mocked install tests as that evidence.
 
-The macOS matrix must request `--bundles app,dmg`: requesting only `dmg` creates an intermediate `.app` but removes it after packaging. RillSQL retains the app for fixed-certificate signing and, like Cliora, constructs and signs the final updater archive after app signing. The unpublished v0.2.3 draft records the initial missing-archive failure; its tag is preserved.
+The macOS release job requests cargo-packager formats `app,dmg` so the updater archive can be built from the app. The unpublished v0.2.3 draft records the initial missing-archive failure; its tag is preserved.

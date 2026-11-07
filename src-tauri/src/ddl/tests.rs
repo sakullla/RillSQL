@@ -468,7 +468,7 @@ fn ddl_commands_stay_registered_beside_existing_commands() {
     let permissions = capability["permissions"].as_array().unwrap();
     let acl = fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
     let registration = fs::read_to_string(root.join("src/lib.rs")).unwrap();
-    let wire = registration.split("fn wire").nth(1).unwrap_or("");
+    let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
     let wire = wire.split("pub fn run").next().unwrap_or("");
     let expected = [
         ("app_info", "app_info"),

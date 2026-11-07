@@ -16,25 +16,18 @@ function field(section, name) {
 }
 
 export function readVersions(root = ROOT) {
-  const pkg = json(resolve(root, "package.json"));
-  const lock = json(resolve(root, "package-lock.json"));
   const cargo = readFileSync(resolve(root, "src-tauri/Cargo.toml"), "utf8")
     .split(/^\[/m).find((section) => section.startsWith("package]"));
   const cargoLock = readFileSync(resolve(root, "src-tauri/Cargo.lock"), "utf8")
     .split(/^\[\[package\]\]/m).find((section) => field(section, "name") === "rillsql");
   return {
-    "package.json": pkg.version,
-    "package-lock.json": lock.version,
-    "package-lock.json packages[root]": lock.packages?.[""]?.version,
     "src-tauri/Cargo.toml": field(cargo, "version"),
     "src-tauri/Cargo.lock rillsql": field(cargoLock, "version"),
-    "src-tauri/tauri.conf.json": json(resolve(root, "src-tauri/tauri.conf.json")).version,
-    "src/shell/product.ts": readFileSync(resolve(root, "src/shell/product.ts"), "utf8").match(/PRODUCT_VERSION = "([^"]+)"/)?.[1],
   };
 }
 
 export function validateVersions(versions, tag) {
-  const expected = versions["package.json"];
+  const expected = versions["package.json"] ?? versions["src-tauri/Cargo.toml"];
   if (typeof expected !== "string" || !SEMVER.test(expected)) {
     throw new Error("Use a SemVer version such as 0.1.0 or 0.1.0-rc.1 (without build metadata).");
   }
@@ -47,27 +40,11 @@ export function validateVersions(versions, tag) {
   return expected;
 }
 
-export function checkTauriVersions(root = ROOT) {
-  const lock = json(resolve(root, "package-lock.json"));
-  const api = lock.packages?.["node_modules/@tauri-apps/api"]?.version;
-  const crates = readFileSync(resolve(root, "src-tauri/Cargo.lock"), "utf8")
-    .split(/^\[\[package\]\]/m).filter((section) => field(section, "name") === "tauri");
-  const tauri = crates.length === 1 ? field(crates[0], "version") : undefined;
-  if (!api || !tauri || !SEMVER.test(api) || !SEMVER.test(tauri)) {
-    throw new Error("Lockfiles must contain one tauri crate and @tauri-apps/api with valid versions.");
-  }
-  // Tauri's build command requires the Rust crate and JS API to share major/minor.
-  if (tauri.split(".").slice(0, 2).join(".") !== api.split(".").slice(0, 2).join(".")) {
-    throw new Error(`Tauri version mismatch: tauri ${tauri} (Cargo.lock) vs @tauri-apps/api ${api} (package-lock.json).`);
-  }
-}
-
 export function checkProject(tag, root = ROOT) {
   const version = validateVersions(readVersions(root), tag);
-  checkTauriVersions(root);
-  const config = json(resolve(root, "src-tauri/tauri.conf.json"));
-  if (config.productName !== "RillSQL") {
-    throw new Error("Keep productName as RillSQL: it is used in installation paths and bundle names.");
+  const cargo = readFileSync(resolve(root, "src-tauri/Cargo.toml"), "utf8");
+  if (!cargo.includes('product-name = "RillSQL"')) {
+    throw new Error("Keep product-name as RillSQL: it is used in installation paths and bundle names.");
   }
   return version;
 }

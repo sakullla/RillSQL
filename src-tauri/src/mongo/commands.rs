@@ -4,19 +4,16 @@ use super::docs::{CollectionSummary, DatabaseSummary, DocumentsPage};
 use crate::application::mongo::{self, DeleteOutcome, InsertOutcome, ReadOutcome, ReplaceOutcome};
 use crate::connections::commands::ConnectionsState;
 
-#[tauri::command]
-pub async fn mongo_list_databases(state: tauri::State<'_, ConnectionsState>, connection_id: String) -> Result<Vec<DatabaseSummary>, String> {
+pub async fn mongo_list_databases(state: &ConnectionsState, connection_id: String) -> Result<Vec<DatabaseSummary>, String> {
     mongo::list_databases(&state.service, &connection_id).await
 }
 
-#[tauri::command]
-pub async fn mongo_list_collections(state: tauri::State<'_, ConnectionsState>, connection_id: String, database: String) -> Result<Vec<CollectionSummary>, String> {
+pub async fn mongo_list_collections(state: &ConnectionsState, connection_id: String, database: String) -> Result<Vec<CollectionSummary>, String> {
     mongo::list_collections(&state.service, &connection_id, &database).await
 }
 
-#[tauri::command]
 pub async fn mongo_find_documents(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     connection_id: String,
     database: String,
     collection: String,
@@ -27,9 +24,8 @@ pub async fn mongo_find_documents(
     mongo::find_documents(&state.service, &connection_id, &database, &collection, skip, limit, filter_json).await
 }
 
-#[tauri::command]
 pub async fn mongo_read_document(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     connection_id: String,
     database: String,
     collection: String,
@@ -38,9 +34,8 @@ pub async fn mongo_read_document(
     mongo::read_document(&state.service, &connection_id, &database, &collection, &id_json).await
 }
 
-#[tauri::command]
 pub async fn mongo_replace_document(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     connection_id: String,
     database: String,
     collection: String,
@@ -50,9 +45,8 @@ pub async fn mongo_replace_document(
     mongo::replace_document(&state.service, &connection_id, &database, &collection, &id_json, &json).await
 }
 
-#[tauri::command]
 pub async fn mongo_insert_document(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     connection_id: String,
     database: String,
     collection: String,
@@ -61,9 +55,8 @@ pub async fn mongo_insert_document(
     mongo::insert_document(&state.service, &connection_id, &database, &collection, &json).await
 }
 
-#[tauri::command]
 pub async fn mongo_delete_document(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     connection_id: String,
     database: String,
     collection: String,

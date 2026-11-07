@@ -177,7 +177,7 @@ fn grid_commands_are_registered_beside_catalog() {
     let permissions = capability["permissions"].as_array().unwrap();
     let acl = fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
     let registration = fs::read_to_string(root.join("src/lib.rs")).unwrap();
-    let wire = registration.split("fn wire").nth(1).unwrap_or("");
+    let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
     let wire = wire.split("pub fn run").next().unwrap_or("");
     for command in ["grid_describe", "grid_page", "grid_count", "grid_commit", "grid_export", "grid_export_cancel"] {
         let allow = format!("allow-{}", command.replace('_', "-"));

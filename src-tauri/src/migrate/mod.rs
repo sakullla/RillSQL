@@ -8,7 +8,7 @@ pub(crate) mod migrate;
 
 pub fn module_id() -> &'static str {
     let _linked = (
-        std::any::type_name_of_val(&commands::migrate_data::<tauri::Wry>),
+        std::any::type_name_of_val(&commands::migrate_data),
         std::any::type_name_of_val(&commands::migrate_cancel),
         std::any::type_name_of_val(&migrate::run_migrate),
         std::any::type_name::<migrate::MigrateRequest>(),

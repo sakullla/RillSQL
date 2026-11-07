@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-/// 拖放预览一次读取的硬上限：与前端载入 SQL 文件的 2 MB 同一档（src/query/file-io.ts 先例）。
+/// 拖放预览一次读取的硬上限：2 MB。
 pub const PREVIEW_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
 
 /// read_dropped_preview 的返回：text 是按行边界截断后的文本；truncated 表示文件还有未读内容。
@@ -15,7 +15,6 @@ pub struct DroppedPreview {
 }
 
 /// 读取拖放文件的前段文本用于预览：只读、限量（调用方上限与 2 MB 硬上限取小）、超限按行截断并标记。
-#[tauri::command]
 pub async fn read_dropped_preview(path: String, limit: Option<u64>) -> Result<DroppedPreview, String> {
     crate::application::files::read_dropped_preview(path, limit).await
 }

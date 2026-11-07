@@ -1,8 +1,8 @@
 name: Rust packager
 
-# Node-free packaging path. It does not replace frontend CI and it does not
-# publish a GitHub release. --require-complete fails unless every platform
-# installer and updater signature is present.
+# Manual cargo-packager check. It does not publish a GitHub release.
+# release.yml is the publisher and still requires every platform installer.
+# --require-complete fails unless every platform installer and updater signature is present.
 on:
   workflow_dispatch:
 

@@ -334,7 +334,7 @@ fn query_commands_are_appended_without_dropping_catalog_or_grid() {
     let permissions = capability["permissions"].as_array().unwrap();
     let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
     let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
-    let wire = registration.split("fn wire").nth(1).unwrap_or("");
+    let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
     let wire = wire.split("pub fn run").next().unwrap_or("");
     for command in [
         "query_start",

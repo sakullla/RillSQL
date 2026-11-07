@@ -281,14 +281,12 @@ pub(crate) async fn page_for_session(session: Option<&CatalogSession>, engine: E
     }
 }
 
-#[tauri::command]
-pub async fn catalog_sessions(state: tauri::State<'_, ConnectionsState>) -> Result<Vec<SessionStatus>, String> {
+pub async fn catalog_sessions(state: &ConnectionsState) -> Result<Vec<SessionStatus>, String> {
     Ok(std::sync::Arc::clone(&state.service).session_statuses().await)
 }
 
-#[tauri::command]
 pub async fn catalog_refresh(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     limits: Vec<ObjectLimit>,
     page: Option<usize>,
     connection_id: Option<String>,
@@ -312,10 +310,9 @@ pub async fn catalog_refresh(
     }
 }
 
-#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn catalog_definition(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     connection_id: String,
     database: String,
     schema: String,
@@ -328,7 +325,7 @@ pub async fn catalog_definition(
         .service
         .catalog_session(&connection_id)
         .ok_or_else(|| "这条连接还没有打开，无法读取定义".to_owned())?;
-    let engine = saved_engine(&state, &connection_id).await?;
+    let engine = saved_engine(state, &connection_id).await?;
     read::read_definition(
         &session,
         engine,
@@ -342,9 +339,8 @@ pub async fn catalog_definition(
     .await
 }
 
-#[tauri::command]
 pub async fn catalog_page(
-    state: tauri::State<'_, ConnectionsState>,
+    state: &ConnectionsState,
     connection_id: String,
     database: String,
     schema: String,
@@ -352,7 +348,7 @@ pub async fn catalog_page(
     limit: usize,
 ) -> Result<PageDto, String> {
     let session = state.service.catalog_session(&connection_id);
-    let engine = saved_engine(&state, &connection_id).await?;
+    let engine = saved_engine(state, &connection_id).await?;
     Ok(page_for_session(session.as_ref(), engine, &database, &schema, offset, limit).await)
 }
 

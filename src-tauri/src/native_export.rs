@@ -1,5 +1,4 @@
 /// Save the loaded snapshot without issuing another database query.
-#[tauri::command]
 pub async fn export_write_loaded(path: String, contents: String) -> Result<(), String> {
     crate::application::files::write_loaded(path, contents).await
 }

@@ -30,7 +30,6 @@ struct AppInfo {
     data_dir: String,
 }
 
-#[tauri::command]
 fn app_info() -> AppInfo {
     AppInfo {
         title: product::TITLE,
@@ -46,85 +45,80 @@ fn local_data_dir() -> String {
         .unwrap_or_else(|| "RillSQL".to_owned())
 }
 
-fn wire<R: tauri::Runtime>(builder: tauri::Builder<R>, state: connections::commands::ConnectionsState) -> tauri::Builder<R> {
-    let query_state = query::QueryState::from_config_path(state.service.config_path());
-    builder.manage(state).manage(query_state).invoke_handler(tauri::generate_handler![
-        app_info,
-        native_export::export_write_loaded,
-        dropped::read_dropped_preview,
-        connections::commands::connections_list,
-        connections::commands::connections_save,
-        connections::commands::connections_delete,
-        connections::commands::connections_test,
-        connections::commands::connections_open,
-        connections::commands::connections_focus_database,
-        connections::commands::connections_disconnect,
-        connections::commands::connections_confirm_host_key,
-        connections::commands::connections_forget_host_key,
-        connections::commands::connections_export,
-        connections::commands::connections_import_file,
-        connections::commands::env_tags_list,
-        connections::commands::env_tags_save,
-        connections::commands::env_tags_delete,
-        catalog::commands::catalog_sessions,
-        catalog::commands::catalog_refresh,
-        catalog::commands::catalog_page,
-        catalog::commands::catalog_definition,
-        compare::commands::compare_structure,
-        compare::commands::compare_data,
-        compare::commands::compare_cancel,
-        compare::commands::compare_schemas,
-        grid::commands::grid_describe,
-        grid::commands::grid_page,
-        grid::commands::grid_count,
-        grid::commands::grid_commit,
-        grid::commands::grid_export,
-        grid::commands::grid_export_cancel,
-        dump::commands::database_dump,
-        dump::commands::database_dump_cancel,
-        migrate::commands::migrate_data,
-        migrate::commands::migrate_cancel,
-        redis::commands::redis_scan_keys,
-        redis::commands::redis_read_key,
-        redis::commands::redis_set_ttl,
-        redis::commands::redis_delete_keys,
-        redis::commands::redis_rename_key,
-        redis::commands::redis_exec,
-        mongo::commands::mongo_list_databases,
-        mongo::commands::mongo_list_collections,
-        mongo::commands::mongo_find_documents,
-        mongo::commands::mongo_read_document,
-        mongo::commands::mongo_replace_document,
-        mongo::commands::mongo_insert_document,
-        mongo::commands::mongo_delete_document,
-        ddl::commands::ddl_describe,
-        ddl::commands::ddl_preview,
-        ddl::commands::ddl_execute,
-        diagram::commands::diagram_read,
-        query::commands::query_start,
-        query::commands::query_poll,
-        query::commands::query_release,
-        query::commands::query_cancel,
-        query::commands::query_history,
-        query::commands::query_history_clear,
-        query::commands::query_history_delete,
-        query::commands::query_saved_list,
-        query::commands::query_saved_save,
-        query::commands::query_saved_rename,
-        query::commands::query_saved_delete,
-    ])
+fn command_surface() -> usize {
+    let linked = (
+        std::any::type_name_of_val(&app_info),
+        std::any::type_name_of_val(&native_export::export_write_loaded),
+        std::any::type_name_of_val(&dropped::read_dropped_preview),
+        std::any::type_name_of_val(&connections::commands::connections_list),
+        std::any::type_name_of_val(&connections::commands::connections_save),
+        std::any::type_name_of_val(&connections::commands::connections_delete),
+        std::any::type_name_of_val(&connections::commands::connections_test),
+        std::any::type_name_of_val(&connections::commands::connections_open),
+        std::any::type_name_of_val(&connections::commands::connections_focus_database),
+        std::any::type_name_of_val(&connections::commands::connections_disconnect),
+        std::any::type_name_of_val(&connections::commands::connections_confirm_host_key),
+        std::any::type_name_of_val(&connections::commands::connections_forget_host_key),
+        std::any::type_name_of_val(&connections::commands::connections_export),
+        std::any::type_name_of_val(&connections::commands::connections_import_file),
+        std::any::type_name_of_val(&connections::commands::env_tags_list),
+        std::any::type_name_of_val(&connections::commands::env_tags_save),
+        std::any::type_name_of_val(&connections::commands::env_tags_delete),
+        std::any::type_name_of_val(&catalog::commands::catalog_sessions),
+        std::any::type_name_of_val(&catalog::commands::catalog_refresh),
+        std::any::type_name_of_val(&catalog::commands::catalog_page),
+        std::any::type_name_of_val(&catalog::commands::catalog_definition),
+        std::any::type_name_of_val(&compare::commands::compare_structure),
+        std::any::type_name_of_val(&compare::commands::compare_data),
+        std::any::type_name_of_val(&compare::commands::compare_cancel),
+        std::any::type_name_of_val(&compare::commands::compare_schemas),
+        std::any::type_name_of_val(&grid::commands::grid_describe),
+        std::any::type_name_of_val(&grid::commands::grid_page),
+        std::any::type_name_of_val(&grid::commands::grid_count),
+        std::any::type_name_of_val(&grid::commands::grid_commit),
+        std::any::type_name_of_val(&grid::commands::grid_export),
+        std::any::type_name_of_val(&grid::commands::grid_export_cancel),
+        std::any::type_name_of_val(&dump::commands::database_dump),
+        std::any::type_name_of_val(&dump::commands::database_dump_cancel),
+        std::any::type_name_of_val(&migrate::commands::migrate_data),
+        std::any::type_name_of_val(&migrate::commands::migrate_cancel),
+        std::any::type_name_of_val(&redis::commands::redis_scan_keys),
+        std::any::type_name_of_val(&redis::commands::redis_read_key),
+        std::any::type_name_of_val(&redis::commands::redis_set_ttl),
+        std::any::type_name_of_val(&redis::commands::redis_delete_keys),
+        std::any::type_name_of_val(&redis::commands::redis_rename_key),
+        std::any::type_name_of_val(&redis::commands::redis_exec),
+        std::any::type_name_of_val(&mongo::commands::mongo_list_databases),
+        std::any::type_name_of_val(&mongo::commands::mongo_list_collections),
+        std::any::type_name_of_val(&mongo::commands::mongo_find_documents),
+        std::any::type_name_of_val(&mongo::commands::mongo_read_document),
+        std::any::type_name_of_val(&mongo::commands::mongo_replace_document),
+        std::any::type_name_of_val(&mongo::commands::mongo_insert_document),
+        std::any::type_name_of_val(&mongo::commands::mongo_delete_document),
+        std::any::type_name_of_val(&ddl::commands::ddl_describe),
+        std::any::type_name_of_val(&ddl::commands::ddl_preview),
+        std::any::type_name_of_val(&ddl::commands::ddl_execute),
+        std::any::type_name_of_val(&diagram::commands::diagram_read),
+        std::any::type_name_of_val(&query::commands::query_start),
+        std::any::type_name_of_val(&query::commands::query_poll),
+        std::any::type_name_of_val(&query::commands::query_release),
+        std::any::type_name_of_val(&query::commands::query_cancel),
+        std::any::type_name_of_val(&query::commands::query_history),
+        std::any::type_name_of_val(&query::commands::query_history_clear),
+        std::any::type_name_of_val(&query::commands::query_history_delete),
+        std::any::type_name_of_val(&query::commands::query_saved_list),
+        std::any::type_name_of_val(&query::commands::query_saved_save),
+        std::any::type_name_of_val(&query::commands::query_saved_rename),
+        std::any::type_name_of_val(&query::commands::query_saved_delete),
+    );
+    std::mem::size_of_val(&linked)
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let _ = fixed_dependency_markers();
-    wire(tauri::Builder::default(), connections::commands::ConnectionsState::new())
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
-        .run(tauri::generate_context!())
-        .expect("启动 RillSQL 失败");
+    let _ = command_surface();
+    app::run();
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -258,7 +252,7 @@ mod tests {
         let permissions = capability["permissions"].as_array().unwrap();
         let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
         let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
-        let wire = registration.split("fn wire").nth(1).unwrap_or("");
+        let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
         let wire = wire.split("pub fn run").next().unwrap_or("");
         for command in DUMP_COMMANDS {
             let allow = format!("allow-{}", command.replace('_', "-"));
@@ -275,7 +269,7 @@ mod tests {
         let permissions = capability["permissions"].as_array().unwrap();
         let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
         let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
-        let wire = registration.split("fn wire").nth(1).unwrap_or("");
+        let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
         let wire = wire.split("pub fn run").next().unwrap_or("");
         for command in MIGRATE_COMMANDS {
             let allow = format!("allow-{}", command.replace('_', "-"));
@@ -292,7 +286,7 @@ mod tests {
         let permissions = capability["permissions"].as_array().unwrap();
         let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
         let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
-        let wire = registration.split("fn wire").nth(1).unwrap_or("");
+        let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
         let wire = wire.split("pub fn run").next().unwrap_or("");
         for command in DROPPED_COMMANDS {
             let allow = format!("allow-{}", command.replace('_', "-"));
@@ -309,7 +303,7 @@ mod tests {
         let permissions = capability["permissions"].as_array().unwrap();
         let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
         let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
-        let wire = registration.split("fn wire").nth(1).unwrap_or("");
+        let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
         let wire = wire.split("pub fn run").next().unwrap_or("");
         for command in MONGO_COMMANDS {
             let allow = format!("allow-{}", command.replace('_', "-"));
@@ -327,7 +321,7 @@ mod tests {
         let permissions = capability["permissions"].as_array().unwrap();
         let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
         let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
-        let wire = registration.split("fn wire").nth(1).unwrap_or("");
+        let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
         let wire = wire.split("pub fn run").next().unwrap_or("");
         for command in REDIS_COMMANDS {
             let allow = format!("allow-{}", command.replace('_', "-"));
@@ -346,10 +340,11 @@ mod tests {
         assert_eq!(capability["windows"][0], "main");
         let acl = std::fs::read_to_string(root.join("permissions/app-commands.toml")).unwrap();
         let registration = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
-        let wire = registration.split("fn wire").nth(1).unwrap_or("");
+        let wire = registration.split("fn command_surface").nth(1).unwrap_or("");
         let wire = wire.split("pub fn run").next().unwrap_or("");
-        assert!(wire.contains(".manage(state)"));
-        assert!(registration.contains("wire(tauri::Builder::default(), connections::commands::ConnectionsState::new())"));
+        assert!(registration.contains("app::run()"));
+        let tauri_path = format!("{}{}", "tauri", "::");
+        assert!(!registration.contains(&tauri_path));
         for command in CONNECTION_COMMANDS {
             let allow = format!("allow-{}", command.replace('_', "-"));
             assert!(permissions.iter().any(|item| item.as_str() == Some(allow.as_str())), "{allow}");

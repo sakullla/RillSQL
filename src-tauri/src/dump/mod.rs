@@ -8,7 +8,7 @@ pub(crate) mod order;
 
 pub fn module_id() -> &'static str {
     let _linked = (
-        std::any::type_name_of_val(&commands::database_dump::<tauri::Wry>),
+        std::any::type_name_of_val(&commands::database_dump),
         std::any::type_name_of_val(&commands::database_dump_cancel),
         std::any::type_name_of_val(&dump::run_dump),
         std::any::type_name::<dump::DumpRequest>(),

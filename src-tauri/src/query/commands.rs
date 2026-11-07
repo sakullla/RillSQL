@@ -434,58 +434,47 @@ pub fn release_run(state: &QueryState, run_id: &str) -> bool {
     finished
 }
 
-#[tauri::command]
-pub fn query_release(query: tauri::State<'_, QueryState>, run_id: String) -> bool {
-    release_run(&query, &run_id)
+pub fn query_release(query: &QueryState, run_id: String) -> bool {
+    release_run(query, &run_id)
 }
 
-#[tauri::command]
-pub async fn query_start(connections: tauri::State<'_, ConnectionsState>, query: tauri::State<'_, QueryState>, request: StartRequest) -> Result<RunDto, String> {
-    start_run(&connections.service, &query, request).await
+pub async fn query_start(connections: &ConnectionsState, query: &QueryState, request: StartRequest) -> Result<RunDto, String> {
+    start_run(&connections.service, query, request).await
 }
 
-#[tauri::command]
-pub async fn query_poll(query: tauri::State<'_, QueryState>, run_id: String, continue_read: Option<bool>) -> Result<RunDto, String> {
-    poll_run(&query, &run_id, continue_read.unwrap_or(false)).await
+pub async fn query_poll(query: &QueryState, run_id: String, continue_read: Option<bool>) -> Result<RunDto, String> {
+    poll_run(query, &run_id, continue_read.unwrap_or(false)).await
 }
 
-#[tauri::command]
-pub async fn query_cancel(connections: tauri::State<'_, ConnectionsState>, query: tauri::State<'_, QueryState>, run_id: String) -> Result<RunDto, String> {
-    request_cancel(&connections.service, &query, &run_id).await
+pub async fn query_cancel(connections: &ConnectionsState, query: &QueryState, run_id: String) -> Result<RunDto, String> {
+    request_cancel(&connections.service, query, &run_id).await
 }
 
-#[tauri::command]
-pub async fn query_history(query: tauri::State<'_, QueryState>) -> Result<Vec<HistoryEntry>, String> {
+pub async fn query_history(query: &QueryState) -> Result<Vec<HistoryEntry>, String> {
     query.history().await?.list().await
 }
 
-#[tauri::command]
-pub async fn query_history_clear(query: tauri::State<'_, QueryState>) -> Result<(), String> {
+pub async fn query_history_clear(query: &QueryState) -> Result<(), String> {
     query.history().await?.clear().await
 }
 
-#[tauri::command]
-pub async fn query_history_delete(query: tauri::State<'_, QueryState>, id: String) -> Result<(), String> {
+pub async fn query_history_delete(query: &QueryState, id: String) -> Result<(), String> {
     query.history().await?.delete(&id).await
 }
 
-#[tauri::command]
-pub async fn query_saved_list(query: tauri::State<'_, QueryState>) -> Result<Vec<SavedQuery>, String> {
+pub async fn query_saved_list(query: &QueryState) -> Result<Vec<SavedQuery>, String> {
     query.history().await?.list_saved().await
 }
 
-#[tauri::command]
-pub async fn query_saved_save(query: tauri::State<'_, QueryState>, request: SaveRequest) -> Result<SavedWrite, String> {
+pub async fn query_saved_save(query: &QueryState, request: SaveRequest) -> Result<SavedWrite, String> {
     query.history().await?.save_named(&request).await
 }
 
-#[tauri::command]
-pub async fn query_saved_rename(query: tauri::State<'_, QueryState>, request: RenameRequest) -> Result<SavedQuery, String> {
+pub async fn query_saved_rename(query: &QueryState, request: RenameRequest) -> Result<SavedQuery, String> {
     query.history().await?.rename_saved(&request).await
 }
 
-#[tauri::command]
-pub async fn query_saved_delete(query: tauri::State<'_, QueryState>, id: String) -> Result<(), String> {
+pub async fn query_saved_delete(query: &QueryState, id: String) -> Result<(), String> {
     query.history().await?.delete_saved(&id).await
 }
 

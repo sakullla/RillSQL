@@ -211,33 +211,27 @@ pub struct ExportDto {
     pub partial: bool,
 }
 
-#[tauri::command]
-pub async fn grid_describe(state: tauri::State<'_, ConnectionsState>, request: TableRef) -> Result<SchemaDto, String> {
+pub async fn grid_describe(state: &ConnectionsState, request: TableRef) -> Result<SchemaDto, String> {
     crate::application::grid::describe(&state.service, &request).await
 }
 
-#[tauri::command]
-pub async fn grid_page(state: tauri::State<'_, ConnectionsState>, request: PageRequest) -> Result<PageDto, String> {
+pub async fn grid_page(state: &ConnectionsState, request: PageRequest) -> Result<PageDto, String> {
     crate::application::grid::page(&state.service, &request).await
 }
 
-#[tauri::command]
-pub async fn grid_count(state: tauri::State<'_, ConnectionsState>, request: CountRequest) -> Result<CountDto, String> {
+pub async fn grid_count(state: &ConnectionsState, request: CountRequest) -> Result<CountDto, String> {
     crate::application::grid::count(&state.service, &request).await
 }
 
-#[tauri::command]
-pub async fn grid_commit(state: tauri::State<'_, ConnectionsState>, request: CommitRequest) -> Result<CommitDto, String> {
+pub async fn grid_commit(state: &ConnectionsState, request: CommitRequest) -> Result<CommitDto, String> {
     // 现有界面只在预览确认后才调用这条 command。新调用方走应用服务并显式传 confirmed。
     crate::application::grid::commit(&state.service, &request, true).await
 }
 
-#[tauri::command]
-pub async fn grid_export(state: tauri::State<'_, ConnectionsState>, request: ExportRequest) -> Result<ExportDto, String> {
+pub async fn grid_export(state: &ConnectionsState, request: ExportRequest) -> Result<ExportDto, String> {
     crate::application::grid::export(&state.service, &request).await
 }
 
-#[tauri::command]
 pub async fn grid_export_cancel(id: String) -> Result<(), String> {
     super::request_grid_export_cancel(&id);
     Ok(())

@@ -257,15 +257,13 @@ fn receipt_dto(receipt: Receipt) -> ReceiptDto {
     }
 }
 
-#[tauri::command]
-pub async fn ddl_describe(state: tauri::State<'_, ConnectionsState>, request: DescribeBody) -> Result<DescribeDto, String> {
+pub async fn ddl_describe(state: &ConnectionsState, request: DescribeBody) -> Result<DescribeDto, String> {
     let snapshot = crate::application::ddl::describe_saved(&state.service, &request.connection_id, request.database, request.schema, &request.engine, &request.table).await?;
     Ok(describe_dto(&snapshot))
 }
 
-#[tauri::command]
-pub async fn ddl_preview(state: tauri::State<'_, ConnectionsState>, request: PreviewBody) -> Result<PlanDto, String> {
-    let session = require_session(&state, &request.connection_id)?;
+pub async fn ddl_preview(state: &ConnectionsState, request: PreviewBody) -> Result<PlanDto, String> {
+    let session = require_session(state, &request.connection_id)?;
     let loaded = request_from(request.database, request.schema, &request.engine, request.action)?;
     Ok(plan_dto(exec::preview(&session, &loaded).await?))
 }
@@ -284,8 +282,7 @@ pub(crate) async fn execute_saved(
     Ok(receipt)
 }
 
-#[tauri::command]
-pub async fn ddl_execute(state: tauri::State<'_, ConnectionsState>, request: ExecuteBody) -> Result<ReceiptDto, String> {
+pub async fn ddl_execute(state: &ConnectionsState, request: ExecuteBody) -> Result<ReceiptDto, String> {
     let loaded = request_from(request.database, request.schema, &request.engine, request.action)?;
     let receipt = crate::application::ddl::execute_request(&state.service, &request.connection_id, &loaded, &request.confirmed_sql, true).await?;
     Ok(receipt_dto(receipt))
