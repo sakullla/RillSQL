@@ -149,6 +149,42 @@ fn exchange_running_blocks_before_uncommitted_grid_or_query_draft() {
 }
 
 #[test]
+fn redis_and_mongo_running_block_before_uncommitted_grid_or_query_draft() {
+    use crate::app::shell::close::{evaluate, CloseKind};
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert!(model.dispatch("open-redis:cache|缓存|0").is_some());
+    assert_eq!(model.tool, WorkTool::Redis);
+    assert_eq!(model.shell.page, AppPage::Workspace);
+    assert_eq!(model.redis_spec.as_deref(), Some("cache|缓存|0"));
+    model.redis_running = true;
+    model.grid_dirty = true;
+    assert!(model.dispatch("new-query").is_some());
+    model.tabs[0].draft = "select 1".into();
+    model.tabs[0].last_executed_sql = None;
+    model.tabs[0].uncommitted_cells = false;
+    assert_eq!(evaluate(model.facts()), CloseKind::BlockedRunning);
+    assert!(!model.allow_system_close());
+    assert!(model.close_prompt.is_none());
+    model.redis_running = false;
+    model.mongo_running = true;
+    assert!(model.dispatch("open-mongo:docs|文档").is_some());
+    assert_eq!(model.tool, WorkTool::Mongo);
+    assert_eq!(model.mongo_spec.as_deref(), Some("docs|文档"));
+    model.close_prompt = None;
+    assert_eq!(evaluate(model.facts()), CloseKind::BlockedRunning);
+    model.mongo_running = false;
+    model.close_prompt = None;
+    assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: true, draft: true });
+    model.grid_dirty = false;
+    model.tabs[0].uncommitted_cells = false;
+    model.close_prompt = None;
+    assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: false, draft: true });
+    model.tabs[0].draft.clear();
+    model.close_prompt = None;
+    assert_eq!(evaluate(model.facts()), CloseKind::Allow);
+}
+
+#[test]
 fn compare_running_blocks_before_uncommitted_grid_or_query_draft() {
     use crate::app::shell::close::{evaluate, CloseKind};
     let mut model = WorkbenchModel::new(Shell::default());

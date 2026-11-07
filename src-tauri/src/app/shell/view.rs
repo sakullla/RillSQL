@@ -6,7 +6,7 @@ use std::sync::Arc;
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton,
-    ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _, Window, WindowAppearance, div, prelude::*,
+    ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _, TestSupportExt as _, Window, WindowAppearance, div, prelude::*,
     px,
 };
 
@@ -16,7 +16,9 @@ use crate::app::views::connections::{blank_draft, engines};
 use crate::app::views::diagram::DiagramPane;
 use crate::app::views::export::ExchangePane;
 use crate::app::views::grid::{GridPane, GridTarget};
+use crate::app::views::mongo::MongoPane;
 use crate::app::views::query::{QueryPane, SyncEffect, TabSnap};
+use crate::app::views::redis::RedisPane;
 use crate::app::views::structure::StructurePane;
 use crate::app::{AppPage, Effect, FocusTarget};
 use crate::connections::model::Engine;
@@ -39,8 +41,12 @@ pub struct Workbench {
     exchange: Entity<ExchangePane>,
     compare: Entity<ComparePane>,
     diagram: Entity<DiagramPane>,
+    redis: Entity<RedisPane>,
+    mongo: Entity<MongoPane>,
     applied_tool: Option<String>,
     applied_diagram: Option<String>,
+    applied_redis: Option<String>,
+    applied_mongo: Option<String>,
     services: Arc<AppServices>,
     focus: FocusHandle,
     field_focus: FocusHandle,
@@ -69,6 +75,8 @@ impl Workbench {
         let exchange = cx.new(|_| ExchangePane::new(Arc::clone(&services)));
         let compare = cx.new(|_| ComparePane::new(Arc::clone(&services)));
         let diagram = cx.new(|_| DiagramPane::new(Arc::clone(&services)));
+        let redis = cx.new(|_| RedisPane::new(Arc::clone(&services)));
+        let mongo = cx.new(|_| MongoPane::new(Arc::clone(&services)));
         let mut model = WorkbenchModel::new(Shell::default());
         let _ = model.shell.set_prefers_dark(matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark));
         let shell = model.shell.clone();
@@ -86,8 +94,12 @@ impl Workbench {
             exchange,
             compare,
             diagram,
+            redis,
+            mongo,
             applied_tool: None,
             applied_diagram: None,
+            applied_redis: None,
+            applied_mongo: None,
             services,
             focus: cx.focus_handle(),
             field_focus: cx.focus_handle(),
@@ -235,6 +247,18 @@ impl Workbench {
             return;
         }
         let Some(effect) = self.model.dispatch(id) else {
+            if id.starts_with("redis-") {
+                self.redis.update(cx, |pane, cx| pane.command(id, cx));
+                self.model.redis_running = self.redis.read(cx).running();
+                cx.notify();
+                return;
+            }
+            if id.starts_with("mongo-") {
+                self.mongo.update(cx, |pane, cx| pane.command(id, cx));
+                self.model.mongo_running = self.mongo.read(cx).running();
+                cx.notify();
+                return;
+            }
             if query_command(id) {
                 self.forward_query(id, cx);
                 self.persist_if_needed();
@@ -400,8 +424,36 @@ impl Workbench {
                 pane.set_locale(locale);
                 pane.bind(target);
             }),
-            WorkTool::Query => {}
+            WorkTool::Query | WorkTool::Redis | WorkTool::Mongo => {}
         }
+    }
+
+    fn ensure_redis(&mut self, cx: &mut Context<Self>) {
+        if self.model.tool != WorkTool::Redis {
+            return;
+        }
+        let locale = self.model.locale();
+        self.redis.update(cx, |pane, _| pane.set_locale(locale));
+        let spec = self.model.redis_spec.clone().unwrap_or_default();
+        if self.applied_redis.as_deref() == Some(spec.as_str()) {
+            return;
+        }
+        self.applied_redis = Some(spec.clone());
+        self.redis.update(cx, |pane, cx| pane.open_spec(&spec, cx));
+    }
+
+    fn ensure_mongo(&mut self, cx: &mut Context<Self>) {
+        if self.model.tool != WorkTool::Mongo {
+            return;
+        }
+        let locale = self.model.locale();
+        self.mongo.update(cx, |pane, _| pane.set_locale(locale));
+        let spec = self.model.mongo_spec.clone().unwrap_or_default();
+        if self.applied_mongo.as_deref() == Some(spec.as_str()) {
+            return;
+        }
+        self.applied_mongo = Some(spec.clone());
+        self.mongo.update(cx, |pane, cx| pane.open_spec(&spec, cx));
     }
 
     #[cfg(test)]
@@ -923,6 +975,10 @@ impl Render for Workbench {
         self.pump_jobs(cx);
         self.sync_query(window, cx);
         self.ensure_tool(cx);
+        self.ensure_redis(cx);
+        self.ensure_mongo(cx);
+        self.model.redis_running = self.redis.read(cx).running();
+        self.model.mongo_running = self.mongo.read(cx).running();
         self.ensure_diagram(cx);
         self.sync_grid_flags(cx);
         self.refresh_exchange(cx);
@@ -933,7 +989,9 @@ impl Render for Workbench {
         let focus = self.field_focus.clone();
         let page = self.model.shell.page;
         let table_view = page == AppPage::Workspace && self.model.tool == WorkTool::Table;
-        let welcome = self.model.show_welcome() && !table_view;
+        let redis_view = page == AppPage::Workspace && self.model.tool == WorkTool::Redis;
+        let mongo_view = page == AppPage::Workspace && self.model.tool == WorkTool::Mongo;
+        let welcome = self.model.show_welcome() && !table_view && !redis_view && !mongo_view;
         let palette = self.model.shell.palette_open;
         let help = self.model.shell.help_open;
         let menu_open = self.model.menu.is_some();
@@ -995,6 +1053,8 @@ impl Render for Workbench {
                             .when(page == AppPage::Structure && self.model.tool != WorkTool::Admin, |this| this.child(self.structure.clone()))
                             .when(page == AppPage::Compare, |this| this.child(self.compare.clone()))
                             .when(page == AppPage::Diagram, |this| this.child(self.diagram.clone()))
+                            .when(redis_view, |this| this.child(self.redis.clone()))
+                            .when(mongo_view, |this| this.child(self.mongo.clone()))
                             .when(table_view, |this| {
                                 this.child(
                                     div()
@@ -1005,7 +1065,7 @@ impl Render for Workbench {
                                         .child(self.table.clone()),
                                 )
                             })
-                            .when(page == AppPage::Workspace && !welcome && !table_view, |this| {
+                            .when(page == AppPage::Workspace && !welcome && !table_view && !redis_view && !mongo_view, |this| {
                                 this.child(
                                     div()
                                         .id("editor-host")
@@ -1300,8 +1360,38 @@ fn sidebar_pane(entity: Entity<Workbench>, model: &WorkbenchModel) -> impl IntoE
                     }
                 }),
         );
+        column = column.child(engine_open_button(entity.clone(), row, model));
     }
     column
+}
+
+fn engine_open_button(entity: Entity<Workbench>, row: &crate::connections::ConnectionRecord, model: &WorkbenchModel) -> gpui_kit::AnyElement {
+    let (command, label_key, element_id) = match row.saved.engine {
+        Engine::Redis => {
+            let database = row.saved.database.clone().unwrap_or_else(|| "0".into());
+            let name = row.saved.name.replace('|', " ");
+            (format!("open-redis:{}|{name}|{database}", row.saved.id), "redis.open", format!("side-open-redis-{}", row.saved.id))
+        }
+        Engine::Mongodb => {
+            let name = row.saved.name.replace('|', " ");
+            (format!("open-mongo:{}|{name}", row.saved.id), "mongo.open", format!("side-open-mongo-{}", row.saved.id))
+        }
+        _ => {
+            return div().id(SharedString::from(format!("side-open-skip-{}", row.saved.id))).into_any_element();
+        }
+    };
+    let label = SharedString::from(format!("{} {}", model.text(label_key), row.saved.name));
+    div()
+        .id(SharedString::from(element_id))
+        .test_support()
+        .role(gpui_kit::Role::Button)
+        .aria_label(label.clone())
+        .child(label)
+        .on_click(move |_, _, cx| {
+            let command = command.clone();
+            entity.update(cx, |this, cx| this.perform(&command, cx));
+        })
+        .into_any_element()
 }
 
 fn tab_strip(entity: Entity<Workbench>, model: &WorkbenchModel) -> impl IntoElement {

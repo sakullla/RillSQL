@@ -14,6 +14,14 @@ pub fn text(locale: Locale, key: &str) -> String {
     value.unwrap_or(key).to_owned()
 }
 
+pub fn fill(template: &str, pairs: &[(&str, &str)]) -> String {
+    let mut text = template.to_owned();
+    for (key, value) in pairs {
+        text = text.replace(&format!("{{{key}}}"), value);
+    }
+    text
+}
+
 macro_rules! dict {
     ($($key:literal => $zh:literal, $en:literal;)*) => {
         fn zh(key: &str) -> Option<&'static str> {
@@ -403,6 +411,83 @@ dict! {
     "diagram.needTarget" => "先选择已连接的库或 schema，再打开关系图。", "Choose a connected database or schema before opening the diagram.";
     "diagram.unsupported" => "这个引擎没有关系图。", "This engine has no relationship diagram.";
     "diagram.empty" => "当前范围没有表", "No tables in the current scope";
+    "redis.open" => "键空间", "Keyspace";
+    "redis.tab.filter" => "过滤", "Filter";
+    "redis.tab.refresh" => "刷新", "Refresh";
+    "redis.tab.loadMore" => "再读取一批（SCAN）", "Read another SCAN page";
+    "redis.tab.scanDone" => "本轮流读完成", "This SCAN pass is complete";
+    "redis.tab.emptyList" => "没有读到键。", "No keys were read.";
+    "redis.tab.patternLabel" => "键模式过滤", "Key pattern";
+    "redis.tab.ttlLabel" => "TTL 秒数", "TTL seconds";
+    "redis.tab.setTtl" => "设置 TTL", "Set TTL";
+    "redis.tab.rename" => "重命名", "Rename";
+    "redis.tab.remove" => "删除", "Delete";
+    "redis.tab.commandLabel" => "Redis 命令", "Redis command";
+    "redis.tab.execute" => "执行", "Execute";
+    "redis.tab.pickKey" => "选择一个键查看内容。", "Choose a key to view its value.";
+    "redis.tab.confirmExecute" => "确认执行", "Confirm";
+    "redis.tab.keysRefused" => "已禁用 KEYS：全量扫描会阻塞 Redis，键空间浏览请用模式过滤（SCAN）。", "KEYS is disabled: a full scan blocks Redis. Browse the keyspace with a pattern (SCAN).";
+    "redis.tab.executed" => "已执行。", "Executed.";
+    "redis.tab.deletedCount" => "已删除 {n} 个键。", "Deleted {n} keys.";
+    "redis.tab.renamedNote" => "已重命名为 {target}。", "Renamed to {target}.";
+    "redis.tab.ttlSet" => "已设置 {n} 秒过期。", "Expiration set to {n} seconds.";
+    "redis.tab.ttlRemoved" => "已移除过期。", "Expiration removed.";
+    "redis.tab.ttlMissed" => "没有作用到键（键可能已不存在）。", "The TTL did not apply (the key may be gone).";
+    "redis.tab.ttlInvalid" => "TTL 秒数应为非负整数（留空表示永不过期）。", "TTL seconds must be a non-negative integer (empty means no expiration).";
+    "redis.tab.deletePrompt" => "将删除键 {key}，删除后不可恢复。确认删除？", "Delete key {key}? This cannot be undone.";
+    "redis.tab.renamePrompt" => "将把键 {key} 重命名为 {target}。目标键已存在时会被覆盖。确认执行？", "Rename {key} to {target}? An existing target key is overwritten.";
+    "redis.tab.renameNeedName" => "重命名需要新键名。", "Rename needs a new key name.";
+    "redis.tab.needConnection" => "先从侧栏打开一个 Redis 连接。", "Open a Redis connection from the sidebar first.";
+    "redis.tab.needKey" => "先选择一个键。", "Choose a key first.";
+    "redis.tab.busy" => "上一次读取还没结束。", "The previous read is still running.";
+    "redis.tab.emptyCommand" => "请输入要执行的命令。", "Enter a command to execute.";
+    "redis.keys.neverExpire" => "永不过期", "No expiration";
+    "redis.keys.missing" => "键已不存在", "Key is gone";
+    "redis.value.none" => "键不存在或类型暂不支持结构化渲染。", "The key is missing or its type has no structured view.";
+    "redis.value.empty" => "这个键没有内容。", "This key has no content.";
+    "redis.value.field" => "字段", "Field";
+    "redis.value.value" => "值", "Value";
+    "redis.value.member" => "成员", "Member";
+    "redis.value.score" => "分值", "Score";
+    "redis.danger.flushdb" => "FLUSHDB 会清空当前库的全部键，且不可撤销。确认执行？", "FLUSHDB deletes every key in the current database and cannot be undone. Continue?";
+    "redis.danger.flushall" => "FLUSHALL 会清空这台服务器的全部库，且不可撤销。确认执行？", "FLUSHALL deletes every database on this server and cannot be undone. Continue?";
+    "redis.danger.shutdown" => "SHUTDOWN 会直接关闭 Redis 服务器。确认执行？", "SHUTDOWN stops the Redis server. Continue?";
+    "redis.danger.generic" => "{word} 属于写删类命令，可能修改或删除数据。确认执行？", "{word} is a write or delete command and may change data. Continue?";
+    "mongo.open" => "集合文档", "Documents";
+    "mongo.tab.filterLabel" => "JSON 过滤", "JSON filter";
+    "mongo.tab.apply" => "过滤", "Filter";
+    "mongo.tab.clearFilter" => "清除过滤", "Clear filter";
+    "mongo.tab.refresh" => "刷新", "Refresh";
+    "mongo.tab.prevPage" => "上一页", "Previous page";
+    "mongo.tab.nextPage" => "下一页", "Next page";
+    "mongo.tab.insert" => "新增文档", "Insert document";
+    "mongo.tab.view" => "查看", "View";
+    "mongo.tab.edit" => "编辑", "Edit";
+    "mongo.tab.copy" => "复制 JSON", "Copy JSON";
+    "mongo.tab.remove" => "删除", "Delete";
+    "mongo.tab.close" => "关闭", "Close";
+    "mongo.tab.saveReplace" => "校验并覆盖保存", "Validate and replace";
+    "mongo.tab.saveInsert" => "校验并新增", "Validate and insert";
+    "mongo.tab.confirmDelete" => "确认删除", "Confirm delete";
+    "mongo.tab.needConnection" => "先从侧栏打开一个 MongoDB 连接。", "Open a MongoDB connection from the sidebar first.";
+    "mongo.tab.needCollection" => "先选择数据库和集合。", "Choose a database and a collection first.";
+    "mongo.tab.emptyCollection" => "这个集合没有文档。", "This collection has no documents.";
+    "mongo.tab.emptyFiltered" => "没有匹配过滤条件的文档。", "No documents match the filter.";
+    "mongo.tab.loading" => "读取中…", "Loading…";
+    "mongo.tab.databases" => "数据库", "Databases";
+    "mongo.tab.collections" => "集合", "Collections";
+    "mongo.tab.editorLabel" => "文档 JSON", "Document JSON";
+    "mongo.tab.viewLabel" => "文档 JSON", "Document JSON";
+    "mongo.docs.required" => "请输入 JSON 文档。", "Enter a JSON document.";
+    "mongo.docs.mustBeObject" => "文档应为 JSON 对象，不是数组或标量。", "The document must be a JSON object, not an array or scalar.";
+    "mongo.docs.syntaxError" => "JSON 语法错误：{message}", "JSON syntax error: {message}";
+    "mongo.docs.copiedJson" => "已复制文档 JSON。", "Document JSON copied.";
+    "mongo.docs.notMatched" => "没有匹配到这篇文档，本次没有改动任何数据。", "No document matched, so nothing was changed.";
+    "mongo.docs.replacedNote" => "已整体覆盖保存。", "The document was replaced.";
+    "mongo.docs.insertedNote" => "已新增文档，_id = {id}。", "Inserted a document, _id = {id}.";
+    "mongo.docs.deletedNote" => "已删除 {n} 篇文档。", "Deleted {n} documents.";
+    "mongo.docs.deletePrompt" => "将删除这篇文档（_id {id}），删除后不可恢复。确认删除？", "Delete the document (_id {id})? This cannot be undone.";
+    "mongo.docJson.invalid" => "这份文档不是合法 JSON：", "This document is not valid JSON:";
 }
 
 #[cfg(test)]

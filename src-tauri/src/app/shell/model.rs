@@ -24,6 +24,8 @@ pub enum WorkTool {
     Table,
     Structure,
     Admin,
+    Redis,
+    Mongo,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,6 +140,14 @@ pub struct WorkbenchModel {
     pub compare_running: bool,
     /// `connection|database|schema|label`。关系图只读打开这一范围。
     pub diagram_spec: Option<String>,
+    /// `connection|name|database`。键浏览只对已打开的 Redis 会话发 SCAN。
+    pub redis_spec: Option<String>,
+    /// `connection|name|database|collection`。文档浏览只对已打开的 MongoDB 会话发命令。
+    pub mongo_spec: Option<String>,
+    /// Redis 键浏览或命令还在跑。关闭守卫把它和网格暂存、查询草稿分开。
+    pub redis_running: bool,
+    /// MongoDB 文档读取或写入还在跑。关闭守卫把它和网格暂存、查询草稿分开。
+    pub mongo_running: bool,
 }
 
 impl WorkbenchModel {
@@ -183,6 +193,10 @@ impl WorkbenchModel {
             exchange_running: false,
             compare_running: false,
             diagram_spec: None,
+            redis_spec: None,
+            mongo_spec: None,
+            redis_running: false,
+            mongo_running: false,
         }
     }
 
@@ -277,6 +291,20 @@ impl WorkbenchModel {
             self.tool = WorkTool::Structure;
             self.shell.page = AppPage::Structure;
             self.table_spec = Some(spec.to_owned());
+            return true;
+        }
+        if let Some(spec) = id.strip_prefix("open-redis:") {
+            self.tool = WorkTool::Redis;
+            self.shell.page = AppPage::Workspace;
+            self.shell.focus = FocusTarget::Sidebar;
+            self.redis_spec = Some(spec.to_owned());
+            return true;
+        }
+        if let Some(spec) = id.strip_prefix("open-mongo:") {
+            self.tool = WorkTool::Mongo;
+            self.shell.page = AppPage::Workspace;
+            self.shell.focus = FocusTarget::Sidebar;
+            self.mongo_spec = Some(spec.to_owned());
             return true;
         }
         if let Some(connection_id) = id.strip_prefix("connection:") {
@@ -738,7 +766,7 @@ impl WorkbenchModel {
     }
 
     pub fn facts(&self) -> CloseFacts {
-        let running = self.running_jobs > 0 || self.exchange_running || self.compare_running || self.tabs.iter().any(|tab| tab.running);
+        let running = self.running_jobs > 0 || self.exchange_running || self.compare_running || self.redis_running || self.mongo_running || self.tabs.iter().any(|tab| tab.running);
         let uncommitted = self.grid_dirty || self.tabs.iter().any(|tab| tab.uncommitted_cells);
         let draft = self.tabs.iter().any(|tab| draft_pending(&tab.kind, &tab.draft, tab.last_executed_sql.as_deref()));
         CloseFacts { running, uncommitted, draft }
