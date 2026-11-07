@@ -785,3 +785,91 @@ fn object_tree_opens_the_table_and_structure_and_commits_through_the_shared_grid
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[gpui_kit::test]
+fn second_workbench_commit_stays_on_preview_without_writing(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-commit-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("notes.sqlite");
+    let services = std::thread::scope(|scope| {
+        let database = database.clone();
+        let dir = dir.clone();
+        scope
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                runtime.block_on(async move {
+                    let setup = sqlx::sqlite::SqlitePoolOptions::new()
+                        .max_connections(1)
+                        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+                        .await
+                        .unwrap();
+                    sqlx::query("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)").execute(&setup).await.unwrap();
+                    sqlx::query("INSERT INTO customers (id, name) VALUES (1, '甲')").execute(&setup).await.unwrap();
+                    setup.close().await;
+                    let services = Arc::new(AppServices::new(Arc::new(Service::new_for_test(dir.join("connections.sqlite")))));
+                    services.connections.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+                    services
+                })
+            })
+            .join()
+            .unwrap()
+    });
+    let (window, view) = open_workbench(cx, services, false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.model.shell.page = AppPage::Workspace;
+            view.model.tool = WorkTool::Table;
+            view.mark_table_dirty(cx);
+            view.perform("commit", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let (open, sql) = view.read(cx).table_preview(cx);
+        assert!(open, "第一次 commit 只打开预览");
+        assert!(sql.contains("乙"), "{sql}");
+        assert_eq!(view.read(cx).table_cell(0, 1, cx), "乙");
+        assert!(view.read(cx).table_uncommitted(cx));
+    });
+    assert_eq!(customer_names(&database), vec![(1, "甲".to_owned())]);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("commit", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let (open, sql) = view.read(cx).table_preview(cx);
+        assert!(open, "预览已打开时再发工作台 commit 仍只停留在预览");
+        assert!(sql.contains("乙"), "{sql}");
+        assert_eq!(view.read(cx).table_cell(0, 1, cx), "乙");
+        assert!(view.read(cx).table_uncommitted(cx));
+    });
+    assert_eq!(customer_names(&database), vec![(1, "甲".to_owned())]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn customer_names(path: &std::path::Path) -> Vec<(i64, String)> {
+    let path = path.to_path_buf();
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                runtime.block_on(async move {
+                    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                        .max_connections(1)
+                        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(path).read_only(true))
+                        .await
+                        .unwrap();
+                    let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, name FROM customers ORDER BY id").fetch_all(&pool).await.unwrap();
+                    pool.close().await;
+                    rows
+                })
+            })
+            .join()
+            .unwrap()
+    })
+}

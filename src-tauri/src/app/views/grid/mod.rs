@@ -152,11 +152,8 @@ impl GridPane {
                     let _ = self.edit_focus(value, cx);
                     self.editing = false;
                 }
-                if self.session.preview_open() {
-                    self.confirm(cx);
-                } else {
-                    let _ = self.preview(cx);
-                }
+                // 工作台 commit 只打开预览。写库只来自预览对话框的 confirm。
+                let _ = self.preview(cx);
                 None
             }
             "mark-delete" => {

@@ -197,6 +197,16 @@ impl Workbench {
         (pane.preview_open(), pane.preview_text())
     }
 
+    #[cfg(test)]
+    pub fn table_cell(&self, row: usize, column: usize, cx: &App) -> String {
+        self.table.read(cx).cell(row, column)
+    }
+
+    #[cfg(test)]
+    pub fn table_uncommitted(&self, cx: &App) -> bool {
+        self.table.read(cx).uncommitted()
+    }
+
     fn query_snaps(&self) -> Vec<TabSnap> {
         self.model
             .tabs
