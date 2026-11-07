@@ -7,12 +7,13 @@ use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
 use crate::diagram::assemble::{assemble_diagram, group_key_parts};
 use crate::diagram::model::{
-    empty_mysql_database, empty_postgres_schema, other_postgres_database, Diagram, KeyPart, OutgoingKey, RangeScope, TableAttempt,
+    empty_mysql_database, empty_postgres_schema, empty_sqlserver_schema, other_postgres_database, Diagram, KeyPart, OutgoingKey, RangeScope, TableAttempt,
 };
 use crate::diagram::sql::{
     MYSQL_COLUMNS, MYSQL_FOREIGN_KEYS, MYSQL_TABLES, POSTGRES_COLUMNS, POSTGRES_CURRENT_DATABASE, POSTGRES_FOREIGN_KEYS, POSTGRES_TABLES,
-    SQLITE_COLUMNS, SQLITE_FOREIGN_KEYS, SQLITE_TABLES,
+    SQLITE_COLUMNS, SQLITE_FOREIGN_KEYS, SQLITE_TABLES, SQLSERVER_COLUMNS, SQLSERVER_FOREIGN_KEYS, SQLSERVER_TABLES,
 };
+use crate::grid::{sqlserver_rows, Cell};
 
 pub(crate) async fn read_diagram(engine: Engine, session: &CatalogSession, database: &str, schema: &str) -> Result<Diagram, String> {
     if engine == Engine::Postgres {
@@ -25,10 +26,16 @@ pub(crate) async fn read_diagram(engine: Engine, session: &CatalogSession, datab
             return Err(message);
         }
     }
+    if engine == Engine::Sqlserver {
+        if let Some(message) = empty_sqlserver_schema(schema) {
+            return Err(message);
+        }
+    }
     match (engine, session) {
         (Engine::Postgres, CatalogSession::Postgres(client)) => read_postgres(client, database, schema).await,
         (Engine::Mysql | Engine::Mariadb, CatalogSession::Mysql(pool)) => read_mysql(pool, database).await,
         (Engine::Sqlite, CatalogSession::Sqlite { pool, .. }) => read_sqlite(pool).await,
+        (Engine::Sqlserver, CatalogSession::Sqlserver(client)) => read_sqlserver(client, database, schema).await,
         (_, CatalogSession::Scripted) => Err("这个连接没有连着可查询的数据库".to_owned()),
         _ => Err("连接类型和引擎不一致".to_owned()),
     }
@@ -199,6 +206,78 @@ fn mysql_i64(row: &mysql_async::Row, index: usize) -> Option<i64> {
         mysql_async::Value::Bytes(bytes) => std::str::from_utf8(bytes).ok().and_then(|text| text.parse().ok()),
         _ => None,
     }
+}
+
+async fn read_sqlserver(client: &std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>, database: &str, schema: &str) -> Result<Diagram, String> {
+    let (_names, rows) = sqlserver_rows(client, "SELECT DB_NAME()").await.map_err(failure)?;
+    let current = cell_string(rows.first().and_then(|row| row.first()));
+    if current != database {
+        return Err(format!("当前会话连在 {current}，没有另开连接读取 {database}"));
+    }
+    let schema = schema.trim();
+    let names = sqlserver_names(client, schema).await?;
+    let mut attempts = Vec::with_capacity(names.len());
+    for name in names {
+        attempts.push(sqlserver_table(client, schema, name).await);
+    }
+    Ok(assemble_diagram(
+        &RangeScope {
+            database: database.to_owned(),
+            schema: schema.to_owned(),
+            fold_names: true,
+        },
+        attempts,
+    ))
+}
+
+async fn sqlserver_names(client: &std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>, schema: &str) -> Result<Vec<String>, String> {
+    let sql = SQLSERVER_TABLES.replace("{schema}", &tsql_literal(schema));
+    let (_names, rows) = sqlserver_rows(client, &sql).await.map_err(failure)?;
+    Ok(rows.iter().map(|row| cell_string(row.first())).filter(|name| !name.is_empty()).collect())
+}
+
+async fn sqlserver_table(client: &std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>, schema: &str, name: String) -> TableAttempt {
+    let columns_sql = SQLSERVER_COLUMNS.replace("{schema}", &tsql_literal(schema)).replace("{table}", &tsql_literal(&name));
+    let columns = match sqlserver_rows(client, &columns_sql).await {
+        Ok((_names, rows)) => Ok(rows.iter().map(|row| cell_string(row.first())).filter(|item| !item.is_empty()).collect()),
+        Err(err) => Err(err),
+    };
+    if columns.is_err() {
+        return TableAttempt { name, columns, foreign_keys: Ok(Vec::new()) };
+    }
+    let keys_sql = SQLSERVER_FOREIGN_KEYS.replace("{schema}", &tsql_literal(schema)).replace("{table}", &tsql_literal(&name));
+    let foreign_keys = match sqlserver_rows(client, &keys_sql).await {
+        Ok((_names, rows)) => sqlserver_keys(&rows),
+        Err(err) => Err(err),
+    };
+    TableAttempt { name, columns, foreign_keys }
+}
+
+fn sqlserver_keys(rows: &[Vec<Cell>]) -> Result<Vec<OutgoingKey>, String> {
+    let mut parts = Vec::with_capacity(rows.len());
+    for row in rows {
+        let ordinal = cell_string(row.get(5)).parse::<i64>().unwrap_or(0);
+        parts.push(KeyPart {
+            name: cell_string(row.first()),
+            column: cell_string(row.get(1)),
+            ref_schema: cell_string(row.get(2)),
+            ref_table: cell_string(row.get(3)),
+            ref_column: cell_string(row.get(4)),
+            ordinal,
+        });
+    }
+    Ok(group_key_parts(parts))
+}
+
+fn cell_string(cell: Option<&Cell>) -> String {
+    match cell {
+        Some(Cell::Text(text)) => text.clone(),
+        _ => String::new(),
+    }
+}
+
+fn tsql_literal(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 async fn read_sqlite(pool: &sqlx::SqlitePool) -> Result<Diagram, String> {

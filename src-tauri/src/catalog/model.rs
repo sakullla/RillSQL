@@ -462,9 +462,10 @@ fn mysql_kind_sql(engine: Engine, kind: ObjectKind) -> KindSql {
             count: "SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema = ?",
             list: "SELECT trigger_name, 'trigger', NULL, '', event_object_table FROM information_schema.triggers WHERE trigger_schema = ? ORDER BY trigger_name, event_object_table LIMIT ?",
         },
+        // MariaDB 11.4 没有 information_schema.SEQUENCES。序列从 10.3 起记在 TABLES，类型是 SEQUENCE。
         ObjectKind::Sequence if engine == Engine::Mariadb => KindSql {
-            count: "SELECT COUNT(*) FROM information_schema.SEQUENCES WHERE SEQUENCE_SCHEMA = ?",
-            list: "SELECT SEQUENCE_NAME, 'sequence', NULL, '', '' FROM information_schema.SEQUENCES WHERE SEQUENCE_SCHEMA = ? ORDER BY SEQUENCE_NAME LIMIT ?",
+            count: "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'SEQUENCE'",
+            list: "SELECT TABLE_NAME, 'sequence', NULL, '', '' FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'SEQUENCE' ORDER BY TABLE_NAME LIMIT ?",
         },
         // 事件跟着库走：EVENT_SCHEMA 就是 database 参数。STATUS 放在 signature 列，树上直接读状态。
         ObjectKind::Event => KindSql {

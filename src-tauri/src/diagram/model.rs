@@ -78,6 +78,14 @@ pub(crate) fn empty_postgres_schema(schema: &str) -> Option<String> {
     }
 }
 
+pub(crate) fn empty_sqlserver_schema(schema: &str) -> Option<String> {
+    if schema.trim().is_empty() {
+        Some("SQL Server 关系图需要一个 schema。".to_owned())
+    } else {
+        None
+    }
+}
+
 pub(crate) fn other_postgres_database(current: &str, database: &str) -> Option<String> {
     if database == current {
         None

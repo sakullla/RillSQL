@@ -75,6 +75,35 @@ SELECT id, seq, \"from\", \"table\", \"to\"
 FROM pragma_foreign_key_list(?1)
 ORDER BY id, seq";
 
+/// SQL Server 只读基表。`{schema}` / `{table}` 在执行前换成已转义的字面量，不拼接标识符。
+pub(crate) const SQLSERVER_TABLES: &str = "\
+SELECT t.name
+FROM sys.tables t
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+WHERE s.name = N'{schema}'
+ORDER BY t.name";
+
+pub(crate) const SQLSERVER_COLUMNS: &str = "\
+SELECT c.name
+FROM sys.columns c
+JOIN sys.tables t ON t.object_id = c.object_id
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+WHERE s.name = N'{schema}' AND t.name = N'{table}'
+ORDER BY c.column_id";
+
+pub(crate) const SQLSERVER_FOREIGN_KEYS: &str = "\
+SELECT fk.name, pc.name, rs.name, rt.name, rc.name, fkc.constraint_column_id
+FROM sys.foreign_keys fk
+JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
+JOIN sys.tables pt ON pt.object_id = fk.parent_object_id
+JOIN sys.schemas ps ON ps.schema_id = pt.schema_id
+JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id
+JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id
+JOIN sys.schemas rs ON rs.schema_id = rt.schema_id
+JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id
+WHERE ps.name = N'{schema}' AND pt.name = N'{table}'
+ORDER BY fk.name, fkc.constraint_column_id";
+
 pub(crate) fn diagram_statements() -> &'static [&'static str] {
     &[
         POSTGRES_CURRENT_DATABASE,
@@ -87,5 +116,8 @@ pub(crate) fn diagram_statements() -> &'static [&'static str] {
         SQLITE_TABLES,
         SQLITE_COLUMNS,
         SQLITE_FOREIGN_KEYS,
+        SQLSERVER_TABLES,
+        SQLSERVER_COLUMNS,
+        SQLSERVER_FOREIGN_KEYS,
     ]
 }

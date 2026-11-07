@@ -1,5 +1,7 @@
 pub mod admin;
+pub mod compare;
 pub mod connections;
+pub mod diagram;
 pub mod export;
 pub mod grid;
 pub mod history;

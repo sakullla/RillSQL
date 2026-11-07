@@ -11,7 +11,9 @@ use gpui_kit::{
 };
 
 use crate::app::views::admin::AdminPane;
+use crate::app::views::compare::ComparePane;
 use crate::app::views::connections::{blank_draft, engines};
+use crate::app::views::diagram::DiagramPane;
 use crate::app::views::export::ExchangePane;
 use crate::app::views::grid::{GridPane, GridTarget};
 use crate::app::views::query::{QueryPane, SyncEffect, TabSnap};
@@ -35,7 +37,10 @@ pub struct Workbench {
     structure: Entity<StructurePane>,
     admin: Entity<AdminPane>,
     exchange: Entity<ExchangePane>,
+    compare: Entity<ComparePane>,
+    diagram: Entity<DiagramPane>,
     applied_tool: Option<String>,
+    applied_diagram: Option<String>,
     services: Arc<AppServices>,
     focus: FocusHandle,
     field_focus: FocusHandle,
@@ -62,6 +67,8 @@ impl Workbench {
         let structure = cx.new(|_| StructurePane::new(Arc::clone(&services)));
         let admin = cx.new(|_| AdminPane::new(Arc::clone(&services)));
         let exchange = cx.new(|_| ExchangePane::new(Arc::clone(&services)));
+        let compare = cx.new(|_| ComparePane::new(Arc::clone(&services)));
+        let diagram = cx.new(|_| DiagramPane::new(Arc::clone(&services)));
         let mut model = WorkbenchModel::new(Shell::default());
         let _ = model.shell.set_prefers_dark(matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark));
         let shell = model.shell.clone();
@@ -77,7 +84,10 @@ impl Workbench {
             structure,
             admin,
             exchange,
+            compare,
+            diagram,
             applied_tool: None,
+            applied_diagram: None,
             services,
             focus: cx.focus_handle(),
             field_focus: cx.focus_handle(),
@@ -167,6 +177,45 @@ impl Workbench {
                 }
             });
             self.refresh_exchange(cx);
+            self.persist_if_needed();
+            cx.notify();
+            return;
+        }
+        if id == "compare" || id.starts_with("compare-") {
+            if self.model.close_prompt.is_some() {
+                let _ = self.model.dispatch(id);
+                cx.notify();
+                return;
+            }
+            let _ = self.model.dispatch(id);
+            let locale = self.model.locale();
+            self.compare.update(cx, |pane, cx| {
+                pane.set_locale(locale);
+                pane.command(id, cx);
+            });
+            self.refresh_compare(cx);
+            self.persist_if_needed();
+            cx.notify();
+            return;
+        }
+        if id == "open-diagram" || id.starts_with("open-diagram:") || id.starts_with("diagram-") {
+            if self.model.close_prompt.is_some() {
+                let _ = self.model.dispatch(id);
+                cx.notify();
+                return;
+            }
+            let _ = self.model.dispatch(id);
+            let locale = self.model.locale();
+            if id.starts_with("diagram-") {
+                self.diagram.update(cx, |pane, cx| {
+                    pane.set_locale(locale);
+                    pane.command(id, cx);
+                });
+            } else {
+                self.applied_diagram = None;
+                self.diagram.update(cx, |pane, _| pane.set_locale(locale));
+                self.ensure_diagram(cx);
+            }
             self.persist_if_needed();
             cx.notify();
             return;
@@ -384,6 +433,46 @@ impl Workbench {
     #[cfg(test)]
     pub fn sync_exchange_running(&mut self, cx: &mut Context<Self>) {
         self.refresh_exchange(cx);
+    }
+
+    #[cfg(test)]
+    pub fn compare_text(&self, cx: &App) -> String {
+        self.compare.read(cx).lines().join("\n")
+    }
+
+    #[cfg(test)]
+    pub fn compare_running_now(&self, cx: &App) -> bool {
+        self.compare.read(cx).running()
+    }
+
+    #[cfg(test)]
+    pub fn compare_structure_ready(&self, cx: &App) -> bool {
+        self.compare.read(cx).structure_ready()
+    }
+
+    #[cfg(test)]
+    pub fn compare_data_ready(&self, cx: &App) -> bool {
+        self.compare.read(cx).data_ready()
+    }
+
+    #[cfg(test)]
+    pub fn arm_compare_pause(&mut self, cx: &mut Context<Self>) {
+        self.compare.update(cx, |pane, _| pane.arm_pause());
+    }
+
+    #[cfg(test)]
+    pub fn release_compare_pause(&mut self, cx: &mut Context<Self>) {
+        self.compare.update(cx, |pane, _| pane.release_pause());
+    }
+
+    #[cfg(test)]
+    pub fn diagram_text(&self, cx: &App) -> String {
+        self.diagram.read(cx).lines().join("\n")
+    }
+
+    #[cfg(test)]
+    pub fn diagram_column(&self, name: &str, cx: &App) -> Option<usize> {
+        self.diagram.read(cx).column_of(name)
     }
 
     #[cfg(test)]
@@ -739,6 +828,27 @@ impl Workbench {
         cx.notify();
     }
 
+    fn refresh_compare(&mut self, cx: &mut Context<Self>) {
+        let place = self.compare.update(cx, |pane, _| pane.take_place());
+        self.model.compare_running = self.compare.read(cx).running();
+        if let Some(place) = place {
+            self.model.open_bound_query(place.sql, place.connection_id, place.connection_name, place.database, place.engine);
+        }
+    }
+
+    fn ensure_diagram(&mut self, cx: &mut Context<Self>) {
+        let spec = self.model.diagram_spec.clone().unwrap_or_default();
+        if self.applied_diagram.as_deref() == Some(spec.as_str()) {
+            return;
+        }
+        self.applied_diagram = Some(spec.clone());
+        let locale = self.model.locale();
+        self.diagram.update(cx, |pane, cx| {
+            pane.set_locale(locale);
+            pane.open_spec(&spec, cx);
+        });
+    }
+
     fn refresh_exchange(&mut self, cx: &mut Context<Self>) {
         let source = self.exchange_source(cx);
         self.exchange.update(cx, |pane, cx| {
@@ -813,8 +923,10 @@ impl Render for Workbench {
         self.pump_jobs(cx);
         self.sync_query(window, cx);
         self.ensure_tool(cx);
+        self.ensure_diagram(cx);
         self.sync_grid_flags(cx);
         self.refresh_exchange(cx);
+        self.refresh_compare(cx);
         let frame = self.model.painted();
         let pad = px(frame.pad as f32);
         let entity = cx.entity();
@@ -881,6 +993,8 @@ impl Render for Workbench {
                             .when(welcome, |this| this.child(welcome_page(entity.clone(), &self.model)))
                             .when(page == AppPage::Structure && self.model.tool == WorkTool::Admin, |this| this.child(self.admin.clone()))
                             .when(page == AppPage::Structure && self.model.tool != WorkTool::Admin, |this| this.child(self.structure.clone()))
+                            .when(page == AppPage::Compare, |this| this.child(self.compare.clone()))
+                            .when(page == AppPage::Diagram, |this| this.child(self.diagram.clone()))
                             .when(table_view, |this| {
                                 this.child(
                                     div()

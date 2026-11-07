@@ -65,6 +65,7 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
             let mut items = vec![
                 item("tree-open-data", "catalog.tree.openData"),
                 item("open-structure", "catalog.tree.viewStructure"),
+                item("open-diagram", "catalog.tree.diagram"),
                 item("new-query", "catalog.tree.newQueryHere"),
                 item("tree-copy-name", "catalog.tree.copyFullName"),
                 item("tree-select-sql", "catalog.tree.copyToQuery"),

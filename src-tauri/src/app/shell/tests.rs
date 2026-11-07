@@ -148,6 +148,32 @@ fn exchange_running_blocks_before_uncommitted_grid_or_query_draft() {
     assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: false, draft: true });
 }
 
+#[test]
+fn compare_running_blocks_before_uncommitted_grid_or_query_draft() {
+    use crate::app::shell::close::{evaluate, CloseKind};
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert!(model.dispatch("compare").is_some());
+    assert_eq!(model.shell.page, AppPage::Compare);
+    model.compare_running = true;
+    model.grid_dirty = true;
+    assert!(model.dispatch("new-query").is_some());
+    model.tabs[0].draft = "select 1".into();
+    model.tabs[0].last_executed_sql = None;
+    assert_eq!(evaluate(model.facts()), CloseKind::BlockedRunning);
+    assert!(!model.allow_system_close());
+    assert!(model.close_prompt.is_none());
+    model.compare_running = false;
+    model.close_prompt = None;
+    assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: true, draft: true });
+    model.grid_dirty = false;
+    model.tabs[0].uncommitted_cells = false;
+    model.close_prompt = None;
+    assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: false, draft: true });
+    model.tabs[0].draft.clear();
+    model.close_prompt = None;
+    assert_eq!(evaluate(model.facts()), CloseKind::Allow);
+}
+
 #[tokio::test]
 async fn seven_engines_round_trip_without_remote_sockets_and_history_does_not_run() {
     let dir = std::env::temp_dir().join(format!("rillsql-shell-{}", std::process::id()));

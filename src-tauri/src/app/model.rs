@@ -75,6 +75,7 @@ pub enum AppPage {
     Settings,
     Structure,
     Compare,
+    Diagram,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

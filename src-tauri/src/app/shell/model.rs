@@ -134,6 +134,10 @@ pub struct WorkbenchModel {
     pub exchange_open: bool,
     /// 导入、导出、dump 或 migrate 仍在跑。关闭守卫把它和网格暂存、查询草稿分开。
     pub exchange_running: bool,
+    /// 结构或数据比较仍在跑。关闭守卫把它和网格暂存、查询草稿分开。
+    pub compare_running: bool,
+    /// `connection|database|schema|label`。关系图只读打开这一范围。
+    pub diagram_spec: Option<String>,
 }
 
 impl WorkbenchModel {
@@ -177,6 +181,8 @@ impl WorkbenchModel {
             object_spec: None,
             exchange_open: false,
             exchange_running: false,
+            compare_running: false,
+            diagram_spec: None,
         }
     }
 
@@ -279,6 +285,23 @@ impl WorkbenchModel {
             return true;
         }
         if id.starts_with("exchange-") {
+            return true;
+        }
+        if id.starts_with("compare-") {
+            self.shell.page = AppPage::Compare;
+            return true;
+        }
+        if id == "open-diagram" {
+            self.open_diagram_from_object();
+            return true;
+        }
+        if let Some(spec) = id.strip_prefix("open-diagram:") {
+            self.diagram_spec = Some(spec.to_owned());
+            self.shell.page = AppPage::Diagram;
+            return true;
+        }
+        if id.starts_with("diagram-") {
+            self.shell.page = AppPage::Diagram;
             return true;
         }
         if let Some(engine) = id.strip_prefix("conn-engine:") {
@@ -500,6 +523,24 @@ impl WorkbenchModel {
         }
     }
 
+    fn open_diagram_from_object(&mut self) {
+        let Some(spec) = self.object_spec.clone() else {
+            self.shell.page = AppPage::Diagram;
+            self.diagram_spec = None;
+            return;
+        };
+        let parts: Vec<&str> = spec.split('|').collect();
+        if parts.len() >= 6 && (parts[5] == "redis" || parts[5] == "mongodb") {
+            self.notice_key = Some("diagram.unsupported");
+            self.notice_detail.clear();
+            return;
+        }
+        if let Some(spec) = crate::app::views::diagram::spec_from_object(&spec) {
+            self.diagram_spec = Some(spec);
+            self.shell.page = AppPage::Diagram;
+        }
+    }
+
     fn enqueue(&mut self, job: PendingJob) {
         self.running_jobs = self.running_jobs.saturating_add(1);
         self.pending.push_back(job);
@@ -697,7 +738,7 @@ impl WorkbenchModel {
     }
 
     pub fn facts(&self) -> CloseFacts {
-        let running = self.running_jobs > 0 || self.exchange_running || self.tabs.iter().any(|tab| tab.running);
+        let running = self.running_jobs > 0 || self.exchange_running || self.compare_running || self.tabs.iter().any(|tab| tab.running);
         let uncommitted = self.grid_dirty || self.tabs.iter().any(|tab| tab.uncommitted_cells);
         let draft = self.tabs.iter().any(|tab| draft_pending(&tab.kind, &tab.draft, tab.last_executed_sql.as_deref()));
         CloseFacts { running, uncommitted, draft }
@@ -1099,6 +1140,14 @@ impl WorkbenchModel {
                 "connections.deleteDialog.willKeepDb",
             ],
             AppPage::History => vec!["history.page.runs", "history.page.saved", "history.page.loadToEditor", "history.savedPanel.save"],
+            AppPage::Compare => vec![
+                "compare.dialog.title",
+                "compare.dialog.subtitle",
+                "compare.dialog.compareStructure",
+                "compare.dialog.compareData",
+                "common.cancel",
+            ],
+            AppPage::Diagram => vec!["diagram.readonly", "diagram.foreignKeys", "catalog.tree.diagram", "diagram.loading"],
             AppPage::Settings => vec![
                 "shell.settings.theme",
                 "shell.settings.editorThemeAuto",

@@ -383,6 +383,7 @@ fn page_name(page: AppPage) -> &'static str {
         AppPage::Settings => "settings",
         AppPage::Structure => "structure",
         AppPage::Compare => "compare",
+        AppPage::Diagram => "diagram",
     }
 }
 

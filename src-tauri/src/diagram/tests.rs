@@ -5,10 +5,10 @@ use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
 use crate::diagram::assemble::assemble_diagram;
 use crate::diagram::model::{
-    empty_mysql_database, empty_postgres_schema, other_postgres_database, OutgoingKey, RangeScope, TableAttempt,
+    empty_mysql_database, empty_postgres_schema, empty_sqlserver_schema, other_postgres_database, OutgoingKey, RangeScope, TableAttempt,
 };
 use crate::diagram::read::read_diagram;
-use crate::diagram::sql::{diagram_statements, MYSQL_TABLES, POSTGRES_TABLES, SQLITE_TABLES};
+use crate::diagram::sql::{diagram_statements, MYSQL_TABLES, POSTGRES_TABLES, SQLITE_TABLES, SQLSERVER_TABLES};
 
 fn key(name: &str, columns: &[&str], ref_schema: &str, ref_table: &str, ref_columns: &[&str]) -> OutgoingKey {
     OutgoingKey {
@@ -131,6 +131,8 @@ fn diagram_range_refuses_an_empty_postgres_schema_and_another_database() {
     assert!(other_postgres_database("bookstore", "bookstore").is_none());
     assert!(empty_mysql_database("").is_some());
     assert!(empty_mysql_database("shop").is_none());
+    assert_eq!(empty_sqlserver_schema("").as_deref(), Some("SQL Server 关系图需要一个 schema。"));
+    assert!(empty_sqlserver_schema("dbo").is_none());
 }
 
 #[test]
@@ -157,8 +159,12 @@ fn diagram_statements_are_a_dedicated_read_of_base_tables() {
     assert!(!MYSQL_TABLES.contains("VIEW"));
     assert!(SQLITE_TABLES.contains("type = 'table'"));
     assert!(!SQLITE_TABLES.contains("'view'") && !SQLITE_TABLES.contains("'trigger'"));
+    assert!(SQLSERVER_TABLES.contains("sys.tables"));
+    assert!(!SQLSERVER_TABLES.to_ascii_lowercase().contains("sys.views"));
+    assert!(!SQLSERVER_TABLES.to_ascii_lowercase().contains("sys.procedures"));
+    assert!(!SQLSERVER_TABLES.to_ascii_lowercase().contains("sys.sequences"));
 
-    for engine in [CatalogEngine::Postgres, CatalogEngine::Mysql, CatalogEngine::Mariadb, CatalogEngine::Sqlite] {
+    for engine in [CatalogEngine::Postgres, CatalogEngine::Mysql, CatalogEngine::Mariadb, CatalogEngine::Sqlite, CatalogEngine::Sqlserver] {
         let meta = metadata_sql(engine);
         for statement in statements {
             assert_ne!(*statement, meta.databases);

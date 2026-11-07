@@ -88,7 +88,7 @@ fn engines_keep_their_own_levels() {
     let domain_sql = super::kind_sql(Engine::Postgres, super::model::ObjectKind::Domain);
     assert!(domain_sql.list.contains("typtype = 'd'"));
     let maria_sequence = super::kind_sql(Engine::Mariadb, super::model::ObjectKind::Sequence);
-    assert!(maria_sequence.list.contains("information_schema.SEQUENCES"));
+    assert!(maria_sequence.list.contains("TABLE_TYPE = 'SEQUENCE'"));
     assert!(super::kind_sql(Engine::Mysql, super::model::ObjectKind::Sequence).list.contains("WHERE 0"));
     // 扩展（PG）与事件（MySQL/MariaDB）是树上的独立分类：安装扩展、建事件之后要能看见。
     assert!(super::model::listed_kinds(Engine::Postgres).contains(&super::model::ObjectKind::Extension));
