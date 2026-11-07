@@ -1,0 +1,22 @@
+{
+  "format": "rillsql-connections",
+  "version": 1,
+  "connections": [
+    {
+      "id": "lite-legacy",
+      "name": "本地笔记😀",
+      "engine": "sqlite",
+      "env": "local",
+      "host": null,
+      "port": null,
+      "database": null,
+      "username": null,
+      "filePath": "C:/data/笔记.sqlite",
+      "replicaSet": null,
+      "tls": null,
+      "ssh": null,
+      "passwordSaved": false,
+      "sshPasswordSaved": false
+    }
+  ]
+}

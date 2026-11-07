@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::connections::commands::ConnectionsState;
 
-use super::live::{self, ExportMode, ExportSpec, Mutation, MutationKind};
+use super::live::{self, ExportMode, ExportSpec};
 use super::store::{Cell, Filter, FilterOp, Sort};
 
 #[derive(Debug, Deserialize)]
@@ -214,13 +214,6 @@ pub struct ExportDto {
     pub partial: bool,
 }
 
-fn cell_of(value: Option<String>) -> Cell {
-    match value {
-        Some(text) => Cell::Text(text),
-        None => Cell::Null,
-    }
-}
-
 fn cell_dto(cell: &Cell) -> Option<String> {
     match cell {
         Cell::Null => None,
@@ -372,54 +365,8 @@ pub async fn grid_count(state: tauri::State<'_, ConnectionsState>, request: Coun
 
 #[tauri::command]
 pub async fn grid_commit(state: tauri::State<'_, ConnectionsState>, request: CommitRequest) -> Result<CommitDto, String> {
-    let session = require_session(&state, &request.table.connection_id)?;
-    let changes = request
-        .changes
-        .iter()
-        .map(|change| {
-            let kind = match change.kind.as_str() {
-                "update" => MutationKind::Update,
-                "insert" => MutationKind::Insert,
-                "delete" => MutationKind::Delete,
-                other => return Err(format!("未知变更 {other}")),
-            };
-            Ok(Mutation {
-                id: change.id.clone(),
-                kind,
-                sets: change.sets.iter().map(|item| (item.column.clone(), cell_of(item.value.clone()))).collect(),
-                locator: change.locator.iter().map(|item| (item.column.clone(), cell_of(item.value.clone()))).collect(),
-                values: change.values.iter().map(|item| (item.column.clone(), cell_of(item.value.clone()))).collect(),
-                resolved: change.sets.iter().map(|item| item.resolved).collect(),
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let report = live::commit(&session, &request.table.database, &request.table.schema, &request.table.table, &request.table.engine, &changes).await?;
-    Ok(CommitDto {
-        applied: report
-            .applied
-            .into_iter()
-            .map(|step| StepDto { label: step_label(&step.id), id: step.id, sql: step.sql })
-            .collect(),
-        failed: report.failed.map(|step| FailedDto {
-            label: step_label(&step.id),
-            id: step.id,
-            sql: step.sql,
-            message: step.message,
-        }),
-        pending_ids: report.pending_ids,
-        rolled_back: report.rolled_back,
-        rule: "按顺序逐条提交，遇到错误即停止；已成功的语句不会自动撤销。".to_owned(),
-    })
-}
-
-fn step_label(id: &str) -> String {
-    if id.starts_with("u:") {
-        format!("修改 {}", &id[2..])
-    } else if id.starts_with("d:") {
-        format!("删除 {}", &id[2..])
-    } else {
-        "新增 1 行".to_owned()
-    }
+    // 现有界面只在预览确认后才调用这条 command。新调用方走应用服务并显式传 confirmed。
+    crate::application::grid::commit(&state.service, &request, true).await
 }
 
 #[tauri::command]

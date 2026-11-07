@@ -290,5 +290,6 @@ pub(crate) async fn execute_saved(
 #[tauri::command]
 pub async fn ddl_execute(state: tauri::State<'_, ConnectionsState>, request: ExecuteBody) -> Result<ReceiptDto, String> {
     let loaded = request_from(request.database, request.schema, &request.engine, request.action)?;
-    Ok(receipt_dto(execute_saved(&state.service, &request.connection_id, &loaded, &request.confirmed_sql).await?))
+    let receipt = crate::application::ddl::execute_request(&state.service, &request.connection_id, &loaded, &request.confirmed_sql, true).await?;
+    Ok(receipt_dto(receipt))
 }

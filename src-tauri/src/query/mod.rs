@@ -11,6 +11,8 @@ mod split;
 pub use commands::{
     query_cancel, query_history, query_history_clear, query_poll, query_saved_delete, query_saved_list, query_saved_rename, query_saved_save, query_start, QueryState,
 };
+pub(crate) use history::{HistoryEntry, HistoryStore};
+pub(crate) use saved::{RenameRequest, SaveRequest, SavedQuery, SavedWrite};
 pub use split::split_sql;
 
 pub fn module_id() -> &'static str {

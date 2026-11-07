@@ -1,5 +1,5 @@
 //! 键空间读取与键操作：SCAN 分页（MATCH+游标+COUNT）、TYPE/PTTL、按类型读值、TTL 修改、删除/重命名。
-//! 本模块不做前端确认——confirmed 标记的语义在 commands 层强制；这里只提供命令组装与执行。
+//! 本模块只组装 Redis 命令。确认语义在 `require_delete` / `require_rename` 与应用服务里强制，不能只留在 Tauri command。
 
 use serde::Serialize;
 
@@ -259,7 +259,36 @@ pub async fn set_ttl(
     cmd.query_async(conn).await
 }
 
-/// 删除键（DEL）。确认语义由 commands 层强制。
+pub fn require_delete(keys: &[String], confirmed: bool) -> Result<(), String> {
+    if keys.is_empty() {
+        return Err("没有选择要删除的键。".to_owned());
+    }
+    if !confirmed {
+        return Err(format!("删除 {} 个键属于写删操作，需要先在界面确认。", keys.len()));
+    }
+    Ok(())
+}
+
+pub fn require_rename(from: &str, to: &str, confirmed: bool) -> Result<(), String> {
+    if from.is_empty() || to.is_empty() {
+        return Err("重命名需要源键名和新键名。".to_owned());
+    }
+    if !confirmed {
+        return Err("重命名键属于写删操作，需要先在界面确认。".to_owned());
+    }
+    Ok(())
+}
+
+pub fn require_ttl(seconds: Option<i64>) -> Result<(), String> {
+    if let Some(seconds) = seconds {
+        if seconds < 0 {
+            return Err("TTL 秒数应为非负整数；要移除过期请用“永不过期”。".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// 删除键（DEL）。调用方必须先通过 `require_delete`。
 pub async fn delete_keys(conn: &mut redis::aio::MultiplexedConnection, keys: &[String]) -> Result<i64, redis::RedisError> {
     let mut cmd = redis::cmd("DEL");
     for key in keys {
@@ -268,7 +297,7 @@ pub async fn delete_keys(conn: &mut redis::aio::MultiplexedConnection, keys: &[S
     cmd.query_async(conn).await
 }
 
-/// 重命名键（RENAME）。确认语义由 commands 层强制。
+/// 重命名键（RENAME）。调用方必须先通过 `require_rename`。
 pub async fn rename_key(conn: &mut redis::aio::MultiplexedConnection, from: &str, to: &str) -> Result<(), redis::RedisError> {
     redis::cmd("RENAME").arg(from).arg(to).query_async(conn).await
 }

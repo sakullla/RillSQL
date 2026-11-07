@@ -1,3 +1,4 @@
+mod application;
 mod catalog;
 mod compare;
 mod connections;
@@ -12,6 +13,7 @@ mod native_export;
 mod product;
 mod query;
 mod redis;
+mod state;
 
 use serde::Serialize;
 

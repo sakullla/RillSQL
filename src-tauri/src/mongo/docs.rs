@@ -77,6 +77,14 @@ fn json_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
+/// 删除文档前的确认。未确认时不得发出 delete。
+pub fn require_delete(confirmed: bool) -> Result<(), String> {
+    if !confirmed {
+        return Err("删除文档属于写删操作，需要先在界面确认。".to_owned());
+    }
+    Ok(())
+}
+
 /// 按 _id 定位的过滤文档。
 pub fn id_filter(id: Bson) -> Document {
     mongodb::bson::doc! { "_id": id }

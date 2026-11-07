@@ -6,7 +6,7 @@ mod live;
 mod sql;
 mod store;
 
-pub(crate) use live::{describe, fetch_cells, insert_line, sqlserver_rows};
+pub(crate) use live::{commit as commit_mutations, describe, fetch_cells, insert_line, request_cancel as request_grid_export_cancel, sqlserver_rows, Mutation, MutationKind};
 pub(crate) use sql::{delete_sql, insert_sql, qualified_name, quote_ident, reject_literal, select_list, sql_cell, update_sql, value_family, ValueFamily};
 pub(crate) use store::{Cell, Column, Engine, TableSchema};
 

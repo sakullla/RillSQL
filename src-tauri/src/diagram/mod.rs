@@ -6,6 +6,7 @@ mod sql;
 
 pub use commands::diagram_read;
 pub use model::Diagram;
+pub(crate) use read::read_diagram;
 
 pub fn module_id() -> &'static str {
     let _linked = (

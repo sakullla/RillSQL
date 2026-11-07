@@ -1,26 +1,7 @@
-use std::path::Path;
-use tokio::io::AsyncWriteExt;
-
 /// Save the loaded snapshot without issuing another database query.
 #[tauri::command]
 pub async fn export_write_loaded(path: String, contents: String) -> Result<(), String> {
-    let target = Path::new(&path);
-    if !target.is_absolute() || target.file_name().is_none() {
-        return Err("请选择完整的文件保存路径".to_owned());
-    }
-    let staging = target.with_file_name(format!(".rillsql-{}.partial", uuid::Uuid::new_v4()));
-    let result = async {
-        let mut file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&staging).await?;
-        file.write_all(contents.as_bytes()).await?;
-        file.sync_all().await?;
-        drop(file);
-        tokio::fs::rename(&staging, target).await
-    }.await;
-    if let Err(error) = result {
-        let _ = tokio::fs::remove_file(&staging).await;
-        return Err(format!("无法保存文件：{error}。目标文件未被替换。"));
-    }
-    Ok(())
+    crate::application::files::write_loaded(path, contents).await
 }
 
 #[cfg(test)]

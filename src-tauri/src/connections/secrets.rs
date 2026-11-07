@@ -15,15 +15,19 @@ pub trait SecretStore: Send + Sync {
     fn delete(&self, account: &str) -> Result<(), SecretError>;
 }
 
+pub const KEYRING_SERVICE: &str = "app.rillsql.desktop";
+
 pub struct KeyringStore {
     service: &'static str,
 }
 
 impl KeyringStore {
     pub fn new() -> Self {
-        Self {
-            service: "app.rillsql.desktop",
-        }
+        Self { service: KEYRING_SERVICE }
+    }
+
+    pub fn service_name(&self) -> &'static str {
+        self.service
     }
 }
 

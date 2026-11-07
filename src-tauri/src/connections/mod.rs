@@ -8,13 +8,14 @@ pub(crate) mod forward;
 mod hostkey;
 pub(crate) mod model;
 pub(crate) mod route;
-mod secrets;
+pub(crate) mod secrets;
 mod service;
 pub(crate) mod stages;
-mod store;
+pub(crate) mod store;
 mod verify;
 
 pub use service::{CancelTransport, CatalogSession, EphemeralRead, Service, SessionCondition, SessionHealth, SessionStatus};
+pub(crate) use service::{ConnectionRecord, DeleteOutcome, OpenOutcome, SaveOutcome, ServiceError};
 
 pub fn module_id() -> &'static str {
     let _linked = (

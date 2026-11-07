@@ -7,8 +7,9 @@ mod model;
 mod plan;
 pub(crate) mod sql;
 
+pub(crate) use exec::{preview, Receipt};
 pub(crate) use introspect::{load, load_partial};
-pub(crate) use model::{Action, Engine as DdlEngine, Request, Snapshot};
+pub(crate) use model::{Action, Engine as DdlEngine, Plan, Request, Snapshot, StepStatus};
 
 pub fn module_id() -> &'static str {
     let _linked = (
