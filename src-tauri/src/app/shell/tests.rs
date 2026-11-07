@@ -1174,3 +1174,220 @@ fn exchange_commands_prompt_map_cancel_and_fail_from_the_workbench(cx: &mut gpui
 fn view_has_partial(dir: &std::path::Path) -> bool {
     std::fs::read_dir(dir).unwrap().flatten().any(|entry| entry.file_name().to_string_lossy().contains(".partial"))
 }
+
+struct SqliteLock {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for SqliteLock {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn lock_sqlite(path: &std::path::Path) -> SqliteLock {
+    let path = path.to_path_buf();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async move {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path).busy_timeout(std::time::Duration::from_secs(2)))
+                .await
+                .unwrap();
+            let mut conn = pool.acquire().await.unwrap();
+            sqlx::query("BEGIN EXCLUSIVE").execute(&mut *conn).await.unwrap();
+            let _ = ready_tx.send(());
+            let _ = release_rx.recv();
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            drop(conn);
+            pool.close().await;
+        });
+    });
+    ready_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("exclusive lock");
+    SqliteLock { release: Some(release_tx), thread: Some(thread) }
+}
+
+fn pump_for(
+    cx: &mut gpui_kit::TestAppContext,
+    window: gpui_kit::AnyWindowHandle,
+    view: &gpui_kit::Entity<super::view::Workbench>,
+    limit: std::time::Duration,
+    mut ready: impl FnMut(&super::view::Workbench, &gpui_kit::App) -> bool,
+) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        let done = cx.update(|app| ready(view.read(app), app));
+        if done {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[gpui_kit::test]
+fn exchange_blocks_empty_mapping_stops_the_earlier_import_and_fails_only_that_task(cx: &mut gpui_kit::TestAppContext) {
+    use crate::export::Phase;
+
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-exchange-guard-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("source.sqlite");
+    let target = dir.join("target.sqlite");
+    let csv = dir.join("people.csv");
+    std::fs::write(&csv, "name\n乙\n丙\n丁\n戊\n").unwrap();
+    let services = std::thread::scope(|scope| {
+        let source = source.clone();
+        let target = target.clone();
+        let dir = dir.clone();
+        scope
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                runtime.block_on(async move {
+                    for (path, seed) in [(&source, true), (&target, false)] {
+                        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                            .max_connections(1)
+                            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(path).create_if_missing(true))
+                            .await
+                            .unwrap();
+                        sqlx::query("CREATE TABLE people (name TEXT)").execute(&pool).await.unwrap();
+                        if seed {
+                            sqlx::query("INSERT INTO people (name) VALUES ('甲')").execute(&pool).await.unwrap();
+                        }
+                        pool.close().await;
+                    }
+                    let services = Arc::new(AppServices::new(Arc::new(Service::new_for_test(dir.join("connections.sqlite")))));
+                    services.connections.open_sqlite_for_test("notes", "笔记", &source).await.unwrap();
+                    services
+                })
+            })
+            .join()
+            .unwrap()
+    });
+    let (window, view) = open_workbench(cx, services, false);
+    let csv_opened = csv.canonicalize().unwrap();
+    let target_opened = target.canonicalize().unwrap();
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            view.plant_exchange_sheet("notes|笔记|main||people|sqlite|local", vec!["name".into()], vec![vec![Some("甲".into())]], cx);
+            view.perform("open-exchange", cx);
+        });
+    })
+    .unwrap();
+
+    let source_lock = lock_sqlite(&source);
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("exchange-pick", cx));
+    })
+    .unwrap();
+    assert!(cx.did_prompt_for_paths());
+    cx.simulate_path_prompt_response(|_| Some(vec![csv_opened]));
+    pump_exchange(cx, window, &view, |view, app| view.exchange_text(app).contains("还没有列映射"));
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("exchange-confirm", cx));
+    })
+    .unwrap();
+    cx.update(|app| {
+        let text = view.read(app).exchange_text(app);
+        let import = view.read(app).exchange_tasks(app).into_iter().find(|task| task.kind == "import").expect(&text);
+        assert_eq!(import.phase, Phase::Blocked, "{text}");
+        assert!(!import.success, "{text}");
+        assert!(import.detail.contains("还没有列映射"), "{text}");
+        assert!(!text.contains("进行中"), "{text}");
+    });
+    drop(source_lock);
+    assert_eq!(people_count(&source), 1, "空映射确认不得写库");
+    pump_exchange(cx, window, &view, |view, app| view.exchange_text(app).contains("映射 name=name"));
+    assert_eq!(people_count(&source), 1, "映射生成后仍不得自动写库");
+
+    let source_lock = lock_sqlite(&source);
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("exchange-confirm", cx));
+    })
+    .unwrap();
+    pump_exchange(cx, window, &view, |view, app| view.exchange_running_now(app));
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("exchange-confirm", cx);
+            assert!(view.exchange_text(cx).contains("不能再次确认"), "{}", view.exchange_text(cx));
+            view.perform("exchange-task-cancel", cx);
+        });
+    })
+    .unwrap();
+    drop(source_lock);
+    pump_exchange(cx, window, &view, |view, app| {
+        view.exchange_tasks(app).iter().any(|task| task.kind == "import" && task.detail.contains("也不是仍在运行"))
+    });
+    let settled = people_count(&source);
+    assert!(settled < 5, "第一次确认还在写时取消，不得继续写入后续行，实际 {settled}");
+    cx.run_until_parked();
+    assert_eq!(people_count(&source), settled, "取消之后行数不得再增加");
+    cx.update(|app| {
+        let text = view.read(app).exchange_text(app);
+        let import = view.read(app).exchange_tasks(app).into_iter().rev().find(|task| task.kind == "import").expect(&text);
+        assert_eq!(import.phase, Phase::Cancelled, "{text}");
+        assert!(!import.success, "{text}");
+        assert!(import.detail.contains("已取消"), "{text}");
+        assert!(!view.read(app).exchange_running_now(app), "{text}");
+    });
+
+    let target_lock = lock_sqlite(&target);
+    let source_lock = lock_sqlite(&source);
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("exchange-migrate", cx));
+    })
+    .unwrap();
+    assert!(cx.did_prompt_for_paths());
+    cx.simulate_path_prompt_response(|_| Some(vec![target_opened]));
+    assert!(
+        pump_for(cx, window, &view, std::time::Duration::from_secs(3), |view, app| {
+            view.exchange_tasks(app).iter().any(|task| task.kind == "migrate" && task.phase == Phase::Running)
+        }),
+        "迁移应先进入进行中"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("exchange-confirm", cx));
+    })
+    .unwrap();
+    assert!(
+        pump_for(cx, window, &view, std::time::Duration::from_secs(8), |view, app| {
+            view.exchange_tasks(app).iter().any(|task| task.kind == "migrate" && task.phase == Phase::Failed)
+        }),
+        "锁定的目标库应让这次迁移失败"
+    );
+    cx.update(|app| {
+        let text = view.read(app).exchange_text(app);
+        let tasks = view.read(app).exchange_tasks(app);
+        let migrated = tasks.iter().rev().find(|task| task.kind == "migrate").expect(&text);
+        let import = tasks.iter().rev().find(|task| task.kind == "import").expect(&text);
+        assert_eq!(migrated.phase, Phase::Failed, "{text}");
+        assert!(!migrated.success, "{text}");
+        assert_eq!(import.phase, Phase::Running, "{text}");
+        assert!(migrated.id.starts_with("migrate-"), "{text}");
+    });
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("exchange-task-cancel", cx));
+    })
+    .unwrap();
+    drop(target_lock);
+    drop(source_lock);
+    pump_for(cx, window, &view, std::time::Duration::from_secs(8), |view, app| !view.exchange_running_now(app));
+    let _ = std::fs::remove_dir_all(&dir);
+}

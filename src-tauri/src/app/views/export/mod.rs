@@ -9,7 +9,6 @@ use gpui_kit::{
 };
 
 use crate::application::AppServices;
-use crate::application::tasks::TaskToken;
 use crate::export::{
     commit_import_guarded, export_full, export_loaded, open_import, prefer_cancel, watch_dump, watch_migrate, CancelPoint, ImportEntry, ImportPreview, LoadedExport, Phase, TaskLog,
     TaskView,
@@ -34,7 +33,6 @@ pub struct ExchangePane {
     loaded_rows: Vec<Vec<Option<String>>>,
     loaded_truncated: bool,
     format_name: String,
-    import_token: Option<TaskToken>,
     export_request: Option<ExportRequest>,
     loaded: Option<crate::export::LoadedExport>,
     dump_request: Option<DumpRequest>,
@@ -59,7 +57,6 @@ impl ExchangePane {
             loaded_rows: Vec::new(),
             loaded_truncated: false,
             format_name: "csv".to_owned(),
-            import_token: None,
             export_request: None,
             loaded: None,
             dump_request: None,
@@ -239,9 +236,7 @@ impl ExchangePane {
 
     fn cancel_import(&mut self) {
         self.confirmed = false;
-        if let Some(token) = self.import_token {
-            self.services.tasks.cancel("import", token.id);
-        }
+        self.services.tasks.cancel_owner_tasks("import");
         self.notice = i18n::text(self.locale, "export.import.unconfirmed");
         self.mark_cancelled("import");
     }
@@ -283,13 +278,22 @@ impl ExchangePane {
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
+        if self.log.tasks.iter().any(|task| task.kind == "import" && task.running_now()) {
+            self.notice = "导入还在进行，不能再次确认。".to_owned();
+            return;
+        }
         let (Some(preview), Some(table)) = (self.preview.clone(), self.table.as_ref().map(copy_table)) else {
             self.notice = i18n::text(self.locale, "export.import.unconfirmed");
             return;
         };
+        if let Some(message) = block_unmapped(self.mapping_edited, &self.mapping) {
+            self.confirmed = false;
+            self.notice = message.clone();
+            self.log.push(TaskView::finish("import", "import", Phase::Blocked, 0, message, None));
+            return;
+        }
         self.confirmed = true;
         let token = self.services.tasks.begin("import");
-        self.import_token = Some(token);
         let mapping = self.mapping.clone();
         let services = Arc::clone(&self.services);
         let view = cx.entity().downgrade();
@@ -375,19 +379,22 @@ impl ExchangePane {
             Ok(Ok(Some(path))) => match crate::app::accept_save_path(&path) {
                 Ok(path) => path,
                 Err(error) => {
-                    self.fail_open(error);
+                    let (id, kind) = save_slot(kind);
+                    self.fail_open(id, kind, error);
                     cx.notify();
                     return;
                 }
             },
             Ok(Ok(None)) => return,
             Ok(Err(error)) => {
-                self.fail_open(error.to_string());
+                let (id, kind) = save_slot(kind);
+                self.fail_open(id, kind, error.to_string());
                 cx.notify();
                 return;
             }
             Err(error) => {
-                self.fail_open(error.to_string());
+                let (id, kind) = save_slot(kind);
+                self.fail_open(id, kind, error.to_string());
                 cx.notify();
                 return;
             }
@@ -402,7 +409,7 @@ impl ExchangePane {
 
     fn start_loaded(&mut self, path: PathBuf) {
         if self.loaded_columns.is_empty() {
-            self.fail_open("没有已读取的行，不能导出。".to_owned());
+            self.fail_open("loaded", "export", "没有已读取的行，不能导出。".to_owned());
             return;
         }
         let table_name = self.table.as_ref().map(|table| table.table.clone()).unwrap_or_default();
@@ -429,7 +436,7 @@ impl ExchangePane {
 
     fn start_full(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let Some(table) = self.table.as_ref().map(copy_table) else {
-            self.fail_open("没有当前表，不能全量导出。".to_owned());
+            self.fail_open("full", "export", "没有当前表，不能全量导出。".to_owned());
             return;
         };
         let request = ExportRequest {
@@ -457,7 +464,7 @@ impl ExchangePane {
         let services = Arc::clone(&self.services);
         let view = cx.entity().downgrade();
         let id = request.id.clone();
-        self.log.push(TaskView::running(id, "export", i18n::text(self.locale, "export.task.running")));
+        self.log.push(TaskView::running(id.clone(), "export", i18n::text(self.locale, "export.task.running")));
         cx.spawn(async move |_, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             crate::app::views::grid::runtime_for_views().spawn(async move {
@@ -469,8 +476,8 @@ impl ExchangePane {
                 if let Some(view) = view.upgrade() {
                     view.update(cx, |this, cx| {
                         match settled {
-                            Ok(result) => this.store_task(result, cx),
-                            Err(_) => this.fail_open("后台任务没有返回结果。".to_owned()),
+                            Ok(result) => this.store_task(&id, "export", result, cx),
+                            Err(_) => this.fail_open(&id, "export", "后台任务没有返回结果。".to_owned()),
                         }
                         cx.notify();
                     });
@@ -482,7 +489,7 @@ impl ExchangePane {
 
     fn start_dump(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let Some(table) = self.table.as_ref().map(copy_table) else {
-            self.fail_open("没有当前连接，不能全库导出。".to_owned());
+            self.fail_open("dump", "dump", "没有当前连接，不能全库导出。".to_owned());
             return;
         };
         let request = DumpRequest {
@@ -527,12 +534,12 @@ impl ExchangePane {
             Ok(Ok(Some(paths))) => paths.into_iter().next(),
             Ok(Ok(None)) => None,
             Ok(Err(error)) => {
-                self.fail_open(error.to_string());
+                self.fail_open("migrate", "migrate", error.to_string());
                 cx.notify();
                 return;
             }
             Err(error) => {
-                self.fail_open(error.to_string());
+                self.fail_open("migrate", "migrate", error.to_string());
                 cx.notify();
                 return;
             }
@@ -544,13 +551,13 @@ impl ExchangePane {
         let path = match crate::app::accept_open_path(&path) {
             Ok(path) => path,
             Err(error) => {
-                self.fail_open(error);
+                self.fail_open("migrate", "migrate", error);
                 cx.notify();
                 return;
             }
         };
         let Some(source) = self.table.as_ref().map(copy_table) else {
-            self.fail_open("没有当前表，不能跨库迁移。".to_owned());
+            self.fail_open("migrate", "migrate", "没有当前表，不能跨库迁移。".to_owned());
             cx.notify();
             return;
         };
@@ -562,6 +569,7 @@ impl ExchangePane {
         let view = cx.entity().downgrade();
         let id = format!("migrate-{}", uuid::Uuid::new_v4());
         self.log.push(TaskView::running(id.clone(), "migrate", i18n::text(self.locale, "export.task.running")));
+        let fail_id = id.clone();
         cx.spawn(async move |_, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             crate::app::views::grid::runtime_for_views().spawn(async move {
@@ -595,8 +603,8 @@ impl ExchangePane {
                 if let Some(view) = view.upgrade() {
                     view.update(cx, |this, cx| {
                         match settled {
-                            Ok(result) => this.store_task(result, cx),
-                            Err(_) => this.fail_open("后台任务没有返回结果。".to_owned()),
+                            Ok(result) => this.store_task(&fail_id, "migrate", result, cx),
+                            Err(_) => this.fail_open(&fail_id, "migrate", "后台任务没有返回结果。".to_owned()),
                         }
                         cx.notify();
                     });
@@ -609,7 +617,8 @@ impl ExchangePane {
     fn spawn_dump(&mut self, request: DumpRequest, stop: CancelPoint, cx: &mut Context<Self>) {
         let services = Arc::clone(&self.services);
         let view = cx.entity().downgrade();
-        self.log.push(TaskView::running(request.id.clone(), "dump", i18n::text(self.locale, "export.task.running")));
+        let id = request.id.clone();
+        self.log.push(TaskView::running(id.clone(), "dump", i18n::text(self.locale, "export.task.running")));
         cx.spawn(async move |_, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             crate::app::views::grid::runtime_for_views().spawn(async move {
@@ -621,8 +630,8 @@ impl ExchangePane {
                 if let Some(view) = view.upgrade() {
                     view.update(cx, |this, cx| {
                         match settled {
-                            Ok(result) => this.store_task(result, cx),
-                            Err(_) => this.fail_open("后台任务没有返回结果。".to_owned()),
+                            Ok(result) => this.store_task(&id, "dump", result, cx),
+                            Err(_) => this.fail_open(&id, "dump", "后台任务没有返回结果。".to_owned()),
                         }
                         cx.notify();
                     });
@@ -635,7 +644,8 @@ impl ExchangePane {
     fn spawn_migrate(&mut self, request: MigrateRequest, stop: CancelPoint, cx: &mut Context<Self>) {
         let services = Arc::clone(&self.services);
         let view = cx.entity().downgrade();
-        self.log.push(TaskView::running(request.id.clone(), "migrate", i18n::text(self.locale, "export.task.running")));
+        let id = request.id.clone();
+        self.log.push(TaskView::running(id.clone(), "migrate", i18n::text(self.locale, "export.task.running")));
         cx.spawn(async move |_, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             crate::app::views::grid::runtime_for_views().spawn(async move {
@@ -647,8 +657,8 @@ impl ExchangePane {
                 if let Some(view) = view.upgrade() {
                     view.update(cx, |this, cx| {
                         match settled {
-                            Ok(result) => this.store_task(result, cx),
-                            Err(_) => this.fail_open("后台任务没有返回结果。".to_owned()),
+                            Ok(result) => this.store_task(&id, "migrate", result, cx),
+                            Err(_) => this.fail_open(&id, "migrate", "后台任务没有返回结果。".to_owned()),
                         }
                         cx.notify();
                     });
@@ -658,7 +668,7 @@ impl ExchangePane {
         .detach();
     }
 
-    fn store_task(&mut self, result: Result<TaskView, String>, cx: &mut Context<Self>) {
+    fn store_task(&mut self, id: &str, kind: &'static str, result: Result<TaskView, String>, cx: &mut Context<Self>) {
         match result {
             Ok(task) => {
                 let cancelled = self.log.tasks.iter().any(|item| item.id == task.id && item.phase == Phase::Cancelled);
@@ -666,19 +676,20 @@ impl ExchangePane {
                 self.notice = task.detail.clone();
                 self.log.push(task);
             }
-            Err(message) => self.fail_open(message),
+            Err(message) => self.fail_open(id, kind, message),
         }
         cx.notify();
     }
 
-    fn fail_open(&mut self, message: String) {
-        if let Some(task) = self.log.tasks.iter_mut().rev().find(|task| task.running_now()) {
-            let id = task.id.clone();
-            let kind = task.kind;
-            let done = task.done_rows;
-            *task = TaskView::finish(id, kind, Phase::Failed, done, message.clone(), None);
+    fn fail_open(&mut self, id: &str, kind: &'static str, message: String) {
+        if let Some(task) = self.log.tasks.iter_mut().find(|task| task.id == id) {
+            if task.phase != Phase::Cancelled {
+                let done = task.done_rows;
+                let task_kind = task.kind;
+                *task = TaskView::finish(id.to_owned(), task_kind, Phase::Failed, done, message.clone(), None);
+            }
         } else {
-            self.log.push(TaskView::finish("exchange", "export", Phase::Failed, 0, message.clone(), None));
+            self.log.push(TaskView::finish(id.to_owned(), kind, Phase::Failed, 0, message.clone(), None));
         }
         self.notice = message;
     }
@@ -708,13 +719,7 @@ impl ExchangePane {
                     crate::grid::request_grid_export_cancel(&id);
                     self.services.tasks.cancel_owner_tasks("export");
                 }
-                "import" => {
-                    if let Some(token) = self.import_token {
-                        self.services.tasks.cancel("import", token.id);
-                    } else {
-                        self.services.tasks.cancel_owner_tasks("import");
-                    }
-                }
+                "import" => self.services.tasks.cancel_owner_tasks("import"),
                 _ => self.services.tasks.cancel_owner_tasks(kind),
             }
             self.notice = task.detail.clone();
@@ -809,6 +814,25 @@ enum SaveKind {
     Loaded,
     Full,
     Dump,
+}
+
+fn block_unmapped(edited: bool, mapping: &BTreeMap<String, String>) -> Option<String> {
+    if mapping.values().any(|source| !source.is_empty()) {
+        return None;
+    }
+    if edited {
+        Some("必填字段没有对应列，不能开始写入。".to_owned())
+    } else {
+        Some("还没有列映射，不能开始写入。".to_owned())
+    }
+}
+
+fn save_slot(kind: SaveKind) -> (&'static str, &'static str) {
+    match kind {
+        SaveKind::Loaded => ("loaded", "export"),
+        SaveKind::Full => ("full", "export"),
+        SaveKind::Dump => ("dump", "dump"),
+    }
 }
 
 fn extension_of(format: &str) -> &'static str {

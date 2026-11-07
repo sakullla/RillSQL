@@ -120,6 +120,15 @@ async fn write_import(
             message: format!("必填字段 {} 没有对应列，不能开始写入。", gaps.join("、")),
         });
     }
+    if !mapping.values().any(|source| !source.is_empty()) {
+        return Ok(ImportReport {
+            wrote: false,
+            success: false,
+            applied: 0,
+            cancelled: false,
+            message: "还没有列映射，不能开始写入。".to_owned(),
+        });
+    }
     let changes = import_changes(preview, mapping, &fields);
     let mut applied = 0usize;
     for change in &changes {
