@@ -58,5 +58,8 @@ jobs:
           pattern: packager-*
           path: packager-artifacts
           merge-multiple: true
+      - name: Install Linux dependencies
+        timeout-minutes: 10
+        run: bash .github/scripts/install-linux-deps.sh
       - name: Require Windows, macOS and Linux assets
         run: cargo run --manifest-path src-tauri/Cargo.toml --bin rillsql-package --locked -- --check-dir packager-artifacts --require-complete
