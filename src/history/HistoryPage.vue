@@ -273,7 +273,7 @@ onMounted(() => {
       </div>
 
       <div v-if="visible.length" class="history-layout"><div class="history-records">
-      <div class="history-count"><b>{{ visible.length }}</b> {{ t("history.page.records", { n: visible.length }) }}<span>{{ t("history.page.localOnly") }}</span></div>
+      <div class="history-count"><b>{{ t("history.page.records", { n: visible.length }) }}</b><span>{{ t("history.page.localOnly") }}</span></div>
       <section v-for="group in groups" :key="group.key" class="hist-day">
         <h2>{{ group.label }}</h2>
         <ul class="hist-list">
@@ -416,7 +416,7 @@ onMounted(() => {
 .history-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 340px); gap: var(--sp-5); align-items: start; }
 .history-records { min-width: 0; border: 1px solid var(--stroke); border-radius: var(--r-lg); background: var(--surface-panel); box-shadow: var(--shadow-sm); }
 .history-count { display: flex; align-items: baseline; gap: var(--sp-1); padding: var(--sp-2) var(--sp-4); font-size: var(--fs-xs); color: var(--text-2); background: var(--panel-2); border-bottom: 1px solid var(--line); border-radius: var(--r-lg) var(--r-lg) 0 0; }
-.history-count b { font: 600 var(--fs-sm) var(--mono); font-variant-numeric: tabular-nums; color: var(--text); }
+.history-count b { font-weight: 600; font-variant-numeric: tabular-nums; color: var(--text); }
 .history-count span { margin-left: auto; color: var(--text-3); }
 .hist-day h2 { margin: 0; padding: var(--sp-2) var(--sp-4); font-size: var(--fs-xs); font-weight: 600; letter-spacing: .04em; color: var(--text-3); border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--panel-2) 55%, var(--surface-panel)); }
 .hist-list { list-style: none; padding: 0; margin: 0; }

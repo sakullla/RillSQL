@@ -22,6 +22,7 @@ export const grid = {
     valueListHint: "Separate values with commas; empty parts are ignored",
     apply: "Filter",
     searchKeyword: "Search keyword",
+    searchShort: "Search whole table…",
     searchPlaceholder: "Whole-table search: % and _ match literally",
     search: "Search",
     removeCondition: "Remove condition {n}",

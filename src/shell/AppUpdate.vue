@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { tr as t } from "../i18n";
+import { currentLocale, tr as t } from "../i18n";
 import { appUpdater } from "./app-update";
 import { PRODUCT_VERSION } from "./product";
 import Icon from "./Icon.vue";
@@ -27,7 +27,7 @@ function prepare() {
       <div class="set-text">
         <h4>{{ t("shell.update.current", { version: PRODUCT_VERSION }) }}</h4>
         <p role="status" aria-live="polite">{{ status }}</p>
-        <p v-if="state.checkedAt" class="update-meta">{{ t("shell.update.checkedAt", { time: new Date(state.checkedAt).toLocaleString() }) }}</p>
+        <p v-if="state.checkedAt" class="update-meta">{{ t("shell.update.checkedAt", { time: new Date(state.checkedAt).toLocaleString(currentLocale()) }) }}</p>
       </div>
       <div class="update-actions">
         <button v-if="state.stage === 'available'" class="btn primary" type="button" @click="appUpdater.install(prepare)">{{ t("shell.update.install") }}</button>

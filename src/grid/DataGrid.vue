@@ -1016,12 +1016,11 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
     <div class="grid-main">
     <div class="grid-toolbar">
       <slot name="leading" />
-      <span v-if="environmentLabel" class="env xs" data-env :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span>
       <form class="filter-form" @submit.prevent="applyFilter">
         <div class="filter-group">
           <Listbox v-model="filterColumn" :options="columnOptions" filterable :aria-label="t('grid.filter.column')" />
           <Listbox :model-value="filterOp" :options="opOptions" :aria-label="t('grid.filter.condition')" @update:model-value="filterOp = $event as FilterOp" />
-          <input v-if="opNeedsValue(filterOp)" v-model="filterValue" :aria-label="t('grid.filter.value')" :placeholder="filterOp === 'between' ? t('grid.filter.lowerBound') : undefined" />
+          <input v-if="opNeedsValue(filterOp)" v-model="filterValue" :aria-label="t('grid.filter.value')" :placeholder="filterOp === 'between' ? t('grid.filter.lowerBound') : t('grid.filter.value')" />
           <input v-if="filterOp === 'between'" v-model="filterSecond" :aria-label="t('grid.filter.secondValue')" :placeholder="t('grid.filter.upperBound')" />
           <input v-if="filterOp === 'in'" v-model="filterValues" :aria-label="t('grid.filter.valueList')" :placeholder="t('grid.filter.valueListHint')" />
           <button class="btn sm" type="submit">{{ t("grid.filter.apply") }}</button>
@@ -1038,11 +1037,12 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
         </span>
         <p class="sr">{{ session.scopeLabel }}{{ t("grid.filter.hintWholeTable") }}</p>
         <div class="filter-group filter-search">
-          <input v-model="searchDraft" type="search" :aria-label="t('grid.filter.searchKeyword')" :placeholder="t('grid.filter.searchPlaceholder')" :title="`${session.scopeLabel}${t('grid.filter.hintWholeTable')}`" @keydown.enter="onSearchEnter" />
+          <input v-model="searchDraft" type="search" :aria-label="t('grid.filter.searchKeyword')" :placeholder="t('grid.filter.searchShort')" :title="`${t('grid.filter.searchPlaceholder')} · ${session.scopeLabel}${t('grid.filter.hintWholeTable')}`" @keydown.enter="onSearchEnter" />
           <button class="btn sm" type="button" @click="applySearch">{{ t("grid.filter.search") }}</button>
         </div>
       </form>
       <div class="gt-actions">
+        <span v-if="environmentLabel" class="env xs" data-env :class="environmentTone !== 'none' ? `env-${environmentTone}` : undefined">{{ environmentLabel }}</span>
         <span v-if="noKeyHint" class="badge warn key-hint" :title="noKeyHint">{{ noKeyBadge }}</span>
         <button class="btn sm" type="button" :disabled="!session.canInsert" @click="session.addRow()"><Icon name="plus" />{{ t("grid.toolbar.addRow") }}</button>
         <button
@@ -1115,9 +1115,8 @@ async function startExport(payload: { scope: ExportScope; acknowledged: boolean;
       </template>
       <span v-else-if="session.loaded.length">{{ t("grid.read.allMatched", { n: session.loaded.length }) }}</span>
       <span class="grow"></span>
-      <button class="btn sm" type="button" @click="session.count()">{{ t("grid.read.countMatches") }}</button>
       <span v-if="session.counted !== null" role="status">{{ t("grid.read.matchedCount", { n: session.counted }) }}</span>
-      <span v-else class="muted">{{ t("grid.read.countPending") }}</span>
+      <button v-else-if="session.truncated" class="btn sm" type="button" :title="t('grid.read.countPending')" @click="session.count()">{{ t("grid.read.countMatches") }}</button>
       <span v-if="calcStats" class="calc-stat" role="status">{{ t("grid.read.stats", { cells: calcStats.cells, numeric: calcStats.numeric }) }}<template v-if="calcStats.numeric > 0">{{ t("grid.read.statsNumeric", { sum: calcStats.sum, avg: calcStats.avg, min: calcStats.min, max: calcStats.max }) }}</template></span>
     </footer>
     <div v-if="pendingVisible" class="pending-bar" role="region" :aria-label="t('grid.commit.region')">

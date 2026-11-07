@@ -42,7 +42,7 @@ onMounted(loadMore);
 <!-- 树里的 Redis 键空间（R11/ADR-4）：连接节点下直接展开 SCAN 分页列表；双击键开键浏览器标签。 -->
 <template>
   <div class="rtk" :data-connection="connection.id" data-redis-tree>
-    <div class="tree-row rtk-head" :style="{ '--d': 1 }">
+    <div class="tree-row rtk-head" :style="{ '--d': 1 }" :title="t('redis.tab.keyspaceTreeHint')">
       <span class="tw"></span>
       <span class="tr-name">{{ t("redis.tab.keyspaceTree", { n: keys.length }) }}</span>
     </div>
@@ -58,6 +58,7 @@ onMounted(loadMore);
       :style="{ '--d': 2 }"
       :title="`${item.name} · ${keyTypeBadge(item.keyType)} · ${describeTtl(item.ttlMs)}`"
       @dblclick="openKey(item)"
+      @keydown.enter.prevent="openKey(item)"
     >
       <span class="tw"></span>
       <span class="rtk-badge" :data-type="keyTypeBadge(item.keyType)">{{ keyTypeBadge(item.keyType) }}</span>
@@ -75,5 +76,7 @@ onMounted(loadMore);
 .rtk-error { color: var(--err); font-size: 12px; margin: 0; padding: var(--sp-1) var(--sp-2); }
 .rtk-badge { font-size: 10px; padding: 0 4px; border-radius: var(--r-sm); background: var(--sunken); color: var(--text-3); white-space: nowrap; }
 .rtk-more { color: var(--text-3); }
+.rtk-more:hover:not(:disabled) { color: var(--accent); }
+.rtk-head { color: var(--text-2); }
 .mono { font-family: var(--mono, ui-monospace, monospace); }
 </style>

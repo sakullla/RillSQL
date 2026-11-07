@@ -94,6 +94,7 @@ export const query = {
     area: "Execution results",
     heading: "Results",
     waiting: "Waiting to run",
+    editable: "Editable results",
     readonly: "Read-only results",
     statementTabs: "Statement results",
     hide: "Hide results",

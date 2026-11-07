@@ -22,6 +22,7 @@ export const grid = {
     valueListHint: "多个值用逗号分隔，空段忽略",
     apply: "筛选",
     searchKeyword: "搜索关键字",
+    searchShort: "搜索整表…",
     searchPlaceholder: "整表搜索：% 和 _ 按字面匹配",
     search: "搜索",
     removeCondition: "移除条件 {n}",

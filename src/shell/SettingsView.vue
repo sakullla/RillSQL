@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import type { ListboxOption } from "../ui/types";
 import { tr as t } from "../i18n";
 import Listbox from "../ui/Listbox.vue";
@@ -24,7 +24,32 @@ const themes: { id: ThemePreference; label: string; icon: "sun" | "moon" | "moni
   { id: "system", label: "shell.theme.system", icon: "monitor" },
 ];
 
-function scrollSection(id: string) { document.getElementById(id)?.scrollIntoView({ block: "start" }); }
+const navItems = [
+  { id: "app-update", label: () => t("shell.update.title") },
+  { id: "appearance", label: () => t("shell.settings.navAppearance") },
+  { id: "reading", label: () => t("shell.settings.navReading") },
+  { id: "behavior", label: () => t("shell.settings.navBehavior") },
+  { id: "local", label: () => t("shell.settings.navLocal") },
+];
+/** 侧栏高亮当前读到的分区：点击即时切换，滚动时由 IntersectionObserver 跟随。 */
+const activeSection = ref(navItems[0].id);
+function scrollSection(id: string) {
+  activeSection.value = id;
+  document.getElementById(id)?.scrollIntoView({ block: "start" });
+}
+let spy: IntersectionObserver | null = null;
+onMounted(() => {
+  if (typeof IntersectionObserver === "undefined") return;
+  spy = new IntersectionObserver((entries) => {
+    const hit = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)[0];
+    if (hit) activeSection.value = hit.target.id;
+  }, { rootMargin: "0px 0px -65% 0px" });
+  for (const item of navItems) {
+    const el = document.getElementById(item.id);
+    if (el) spy.observe(el);
+  }
+});
+onBeforeUnmount(() => spy?.disconnect());
 
 function setTheme(theme: ThemePreference) {
   emit("change", { theme });
@@ -80,7 +105,7 @@ function onLocale(value: string) {
           <p>{{ t("shell.settings.subtitle") }}</p>
         </div>
       </div>
-      <nav class="settings-nav" :aria-label="t('shell.settings.navLabel')"><button class="btn sm" @click="scrollSection('app-update')">{{ t("shell.update.title") }}</button><button class="btn sm" @click="scrollSection('appearance')">{{ t("shell.settings.navAppearance") }}</button><button class="btn sm" @click="scrollSection('reading')">{{ t("shell.settings.navReading") }}</button><button class="btn sm" @click="scrollSection('behavior')">{{ t("shell.settings.navBehavior") }}</button><button class="btn sm" @click="scrollSection('local')">{{ t("shell.settings.navLocal") }}</button></nav>
+      <nav class="settings-nav" :aria-label="t('shell.settings.navLabel')"><button v-for="item in navItems" :key="item.id" class="btn sm" type="button" :class="{ on: activeSection === item.id }" :aria-current="activeSection === item.id ? 'true' : undefined" @click="scrollSection(item.id)">{{ item.label() }}</button></nav>
       <div class="settings-body">
       <AppUpdate :auto-check="settings.autoCheckUpdates" :prepare="prepareUpdate" @auto-check="emit('change', { autoCheckUpdates: $event })" />
       <section id="appearance" class="set-sec">
@@ -243,6 +268,7 @@ function onLocale(value: string) {
 .settings-nav { position: sticky; top: 0; display: flex; flex-direction: column; gap: 2px; margin: 0; }
 .settings-nav .btn { justify-content: flex-start; width: 100%; height: var(--control-h); background: transparent; border-color: transparent; box-shadow: none; color: var(--text-2); font-size: var(--fs-sm); }
 .settings-nav .btn:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.settings-nav .btn.on { background: var(--accent-soft); color: var(--accent); font-weight: 550; }
 .settings-body { min-width: 0; }
 section.set-sec { margin-bottom: var(--sp-6); }
 section.set-sec :deep(.set-text h4) { font-weight: 550; }

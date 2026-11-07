@@ -27,7 +27,8 @@
 }
 .titlebar.custom-chrome {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(120px, 460px) minmax(0, 1fr);
+  /* 两侧列至少容纳品牌/侧栏开关与操作按钮/窗口控制，窄窗时只让搜索框收缩，不互相覆盖 */
+  grid-template-columns: minmax(max-content, 1fr) minmax(120px, 460px) minmax(max-content, 1fr);
   gap: var(--sp-3);
   padding: 0;
   user-select: none;

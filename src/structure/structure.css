@@ -231,6 +231,11 @@
 .struct-editor .struct-table tr:last-child td { border-bottom: 0; }
 .struct-editor .cell-act .btn { border-color: transparent; background: transparent; box-shadow: none; }
 .struct-editor .cell-act .btn:hover:not(:disabled) { border-color: var(--stroke-strong); background: var(--hover); }
+/* 每行都有删除：静止时降为次要文字，指到行或聚焦时才显红，避免整列红字抢视线 */
+.struct-editor .cell-act .btn.danger { color: var(--text-3); }
+.struct-editor .struct-table tbody tr:hover .cell-act .btn.danger,
+.struct-editor .cell-act .btn.danger:focus-visible { color: var(--err); }
+.struct-editor .cell-act .btn.danger:hover:not(:disabled) { background: var(--err-soft); border-color: var(--err-line); }
 .struct-editor .struct-table tbody tr:hover > td { background: var(--hover); }
 .struct-table input[type="checkbox"] { accent-color: var(--accent); }
 

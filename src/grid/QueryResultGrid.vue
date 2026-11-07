@@ -57,6 +57,14 @@ watch(reason, (value) => {
 }, { immediate: true });
 const insertTarget = ref<InsertTarget | null>(null);
 const editSession = ref<ResultEditSession | null>(null);
+/** 徽标按真实可编辑状态切换文案，避免可编辑结果仍标「只读」。 */
+const resultEditable = inject<Ref<boolean> | null>("resultEditable", null);
+watch(() => editSession.value !== null, (value) => {
+  if (resultEditable) resultEditable.value = value;
+}, { immediate: true });
+onBeforeUnmount(() => {
+  if (resultEditable) resultEditable.value = false;
+});
 const editing = ref<{ id: string; column: string; draft: string; isNull: boolean } | null>(null);
 const editError = ref("");
 const commitOpen = ref(false);

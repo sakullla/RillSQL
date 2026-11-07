@@ -94,6 +94,7 @@ export const query = {
     area: "执行结果",
     heading: "结果",
     waiting: "等待执行",
+    editable: "可编辑结果",
     readonly: "只读结果",
     statementTabs: "语句结果",
     hide: "隐藏结果",

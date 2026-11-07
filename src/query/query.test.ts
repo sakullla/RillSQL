@@ -1647,12 +1647,19 @@ describe("query editing", () => {
     await wrapper.get("[data-menu='more-tools'] [data-action='format']").trigger("click");
     expect(view.state.doc.toString()).not.toBe("select  1");
     expect(wrapper.find("[data-action='run']").exists()).toBe(true);
-    const badge = wrapper.get(".results-heading > .badge");
+    // 还没有结果时不挂「只读/可编辑」徽标：没有结果就谈不上能否编辑。
+    expect(wrapper.find("[data-result-edit]").exists()).toBe(false);
+    adoptRun("query-more-tools", runDto({ statements: [{ sql: "select 1", status: "ok", message: "", columns: [], rows: [], truncated: false, affected: null }] }));
+    await flushPromises();
+    const badge = wrapper.get("[data-result-edit]");
     expect(badge.text()).toContain("只读结果");
-    const reason = (wrapper.getCurrentComponent() as unknown as { provides: { resultEditReason: Ref<string> } }).provides.resultEditReason;
-    reason.value = "按 id 定位行，查询结果不能新增行";
+    const provides = (wrapper.getCurrentComponent() as unknown as { provides: { resultEditReason: Ref<string>; resultEditable: Ref<boolean> } }).provides;
+    provides.resultEditReason.value = "按 id 定位行，查询结果不能新增行";
+    provides.resultEditable.value = true;
     await nextTick();
     expect(badge.attributes("title")).toBe("按 id 定位行，查询结果不能新增行");
+    expect(badge.text()).toContain("可编辑结果");
+    expect(badge.classes()).toContain("ok");
     wrapper.unmount();
   });
 

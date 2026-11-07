@@ -161,6 +161,8 @@ const resultTools = ref<HTMLElement | null>(null);
 provide("resultTools", resultTools);
 const resultEditReason: Ref<string> = ref("");
 provide("resultEditReason", resultEditReason);
+const resultEditable = ref(false);
+provide("resultEditable", resultEditable);
 const running = computed(() => run.value?.status === "running" || run.value?.status === "cancel-requested");
 const options = computed(() => targetOptions(catalogConnections()));
 const knownIds = computed(() => new Set(catalogConnections().map((item) => item.id)));
@@ -1935,9 +1937,9 @@ onBeforeUnmount(() => {
         <span v-else class="muted">{{ t("query.results.waiting") }}</span>
         <span class="grow"></span>
         <button v-if="canContinue" class="btn sm" type="button" data-action="continue-read" @click="continueRead">{{ t("query.run.continueRead") }}</button>
-        <button class="icon-btn" type="button" data-action="hide-results" :aria-label="t('query.results.hide')" :title="`${t('query.results.hideTitle')} (${formatChord('Mod+J', macPlatform)})`" @click="resultsHidden = true"><Icon name="chevron-down" /></button>
         <span ref="resultTools" class="results-tools"></span>
-        <span class="badge" :title="resultEditReason">{{ t("query.results.readonly") }}</span>
+        <span v-if="run" class="badge" :class="{ ok: resultEditable }" data-result-edit :title="resultEditReason">{{ resultEditable ? t("query.results.editable") : t("query.results.readonly") }}</span>
+        <button class="icon-btn" type="button" data-action="hide-results" :aria-label="t('query.results.hide')" :title="`${t('query.results.hideTitle')} (${formatChord('Mod+J', macPlatform)})`" @click="resultsHidden = true"><Icon name="chevron-down" /></button>
       </div>
       <div v-if="!run" class="q-empty" data-query-empty>
         <span class="action-icon"><Icon :name="connectionName ? 'play' : 'database'" /></span>
@@ -2224,6 +2226,7 @@ onBeforeUnmount(() => {
 /* 状态条右侧：语句位置 + 上一条/下一条 + 光标行列。 */
 .editor-nav { display: inline-flex; align-items: center; gap: var(--sp-1); min-width: 0; }
 .stmt-pos { color: var(--text-3); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.editor-nav > .mono:last-child:not(:first-child) { margin-left: var(--sp-1); padding-left: var(--sp-2); border-left: 1px solid var(--line); line-height: 1.1; }
 .icon-btn.xs { width: 20px; height: 20px; border-radius: var(--r-sm); }
 .icon-btn.xs :deep(.i) { width: 12px; height: 12px; }
 .icon-btn.xs:disabled { opacity: 0.45; }
@@ -2369,7 +2372,8 @@ onBeforeUnmount(() => {
 @container query-pane (max-width: 720px) {
   .q-tool-rare,
   .q-toolbar > .toolbar-sep,
-  .q-rare-pop:not(:has(.pop-menu)) { display: none; }
+  .q-rare-pop:not(:has(.pop-menu)),
+  .results-heading > [data-result-edit] { display: none; }
   .q-toolbar .q-pop.q-more-tools { display: inline-flex; }
 }
 @media (max-width: 800px) { .run-main :deep(.kbd) { display: none; } .target-btn { max-width: min(290px, 100%); } .editor-position > span:first-child { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; } }

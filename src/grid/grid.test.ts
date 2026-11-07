@@ -727,8 +727,10 @@ describe("grid views", () => {
       if (command === "grid_describe") return customerSchema();
       if (command === "grid_page") {
         const filters = args.request?.filters ?? [];
-        if (filters.length > 0) return { rows: [], truncated: false, sql: "SELECT WHERE filter" };
         const search = args.request?.search ?? null;
+        // 筛选叠加关键字时还有未读行：页脚才提供「统计匹配行数」
+        if (filters.length > 0 && search !== null) return { rows: [customerRow(3)], truncated: true, sql: "SELECT WHERE filter AND search" };
+        if (filters.length > 0) return { rows: [], truncated: false, sql: "SELECT WHERE filter" };
         if (search === null) return { rows: [customerRow(1), customerRow(2)], truncated: false, sql: "SELECT customers" };
         return { rows: [], truncated: false, sql: `SELECT customers WHERE ${search}` };
       }
@@ -738,6 +740,8 @@ describe("grid views", () => {
     const wrapper = mount(DataGrid, { props: { tabId: "table:search", draft: "", pageSize: 10, target: customersTarget } });
     await flushPromises();
     expect(wrapper.text()).toContain("客户1");
+    // 已读完全部匹配行时页脚已给出行数，不再挂多余的统计按钮
+    expect(wrapper.findAll("button").some((button) => button.text() === "统计匹配行数")).toBe(false);
     await wrapper.get("input[aria-label='搜索关键字']").setValue("50%");
     await wrapper.findAll("button").find((button) => button.text() === "搜索")!.trigger("click");
     await flushPromises();
@@ -767,7 +771,8 @@ describe("grid views", () => {
     expect(invoke.mock.calls.filter((call) => call[0] === "grid_count").at(-1)?.[1]).toMatchObject({
       request: { search: "小河", filters: [{ column: "name", op: "eq", value: "a" }] },
     });
-    await wrapper.findAll("button").find((button) => button.text() === "清除关键字")!.trigger("click");
+    await wrapper.get("input[aria-label='搜索关键字']").setValue("");
+    await wrapper.findAll("button").find((button) => button.text() === "搜索")!.trigger("click");
     await flushPromises();
     expect(wrapper.text()).toContain("清除筛选");
     await wrapper.get("[data-empty='filter'] button").trigger("click");

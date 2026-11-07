@@ -47,8 +47,9 @@ export const redis = {
     proceed: "继续",
     confirmAria: "写操作确认",
     confirmExecute: "确认执行",
-    keyspaceTree: "键空间 · 已读 {n} 个（双击键打开）",
-    showMoreTree: "再显示",
+    keyspaceTree: "键空间 · 已读 {n} 个",
+    showMoreTree: "继续读取键…",
+    keyspaceTreeHint: "双击键在新标签中打开",
   },
   danger: {
     flushdb: "FLUSHDB 会清空当前库的全部键，且不可撤销。确认执行？",

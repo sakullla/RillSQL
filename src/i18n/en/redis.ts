@@ -47,8 +47,9 @@ export const redis = {
     proceed: "Continue",
     confirmAria: "Write confirmation",
     confirmExecute: "Confirm",
-    keyspaceTree: "Keyspace · {n} read (double-click a key to open)",
-    showMoreTree: "Show more",
+    keyspaceTree: "Keyspace · {n} read",
+    showMoreTree: "Load more keys…",
+    keyspaceTreeHint: "Double-click a key to open it in a new tab",
   },
   danger: {
     flushdb: "FLUSHDB clears every key in the current database and cannot be undone. Run it?",
