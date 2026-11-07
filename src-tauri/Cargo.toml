@@ -46,6 +46,17 @@ argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
 chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
 tauri-plugin-updater = "2.14.1"
 tauri-plugin-process = "2.4.0"
+# gpui-kit 0.9.0 与 gpui-pre / gpui-pre-platform / gpui-pre-macros 0.3.11 一起锁定。
+# 禁止只升其中一个。x11+wayland 给 Linux，font-kit/runtime_shaders 给 macOS；
+# Windows 由 gpui-pre-platform 选择 Win32/DirectWrite。不要启用 gpui-fast。
+gpui-kit = { version = "=0.9.0", features = ["tree-sitter-sql"] }
+gpui = { package = "gpui-pre", version = "=0.3.11" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+gpui_macros = { package = "gpui-pre-macros", version = "=0.3.11" }
+lsp-types = { version = "=0.97.0", features = ["proposed"] }
+
+[dev-dependencies]
+gpui-kit = { version = "=0.9.0", features = ["test-support", "tree-sitter-sql"] }
 
 [features]
 default = ["custom-protocol"]

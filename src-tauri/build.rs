@@ -8,5 +8,10 @@ fn main() {
         )
         .expect("write dist placeholder");
     }
-    tauri_build::build()
+    // GPUI's Win32 snapshot already embeds an application manifest. Tauri's
+    // default manifest is a second RT_MANIFEST and the Windows linker rejects
+    // the duplicate. Icons, version info and generate_context! still run.
+    let attributes = tauri_build::Attributes::new()
+        .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest());
+    tauri_build::try_build(attributes).expect("tauri build");
 }
