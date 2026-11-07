@@ -10,7 +10,7 @@ use atomic::write_atomic_off_ui;
 pub use compat::{
     keyring_service, password_account_for, read_connection_export, read_connections, read_env_tags, read_history, read_secret, ssh_password_account_for,
 };
-pub use document::{parse_stored, to_bytes, AppState, SessionState, ShellSettings, StateError, APP_STATE_FILE};
+pub use document::{parse_stored, to_bytes, AppState, SessionState, SessionTab, ShellSettings, StateError, APP_STATE_FILE};
 use legacy::import_legacy;
 pub use legacy::{ImportReport, Platform};
 

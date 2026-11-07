@@ -21,6 +21,8 @@ pub struct Foundation {
     read_only_grid: Entity<GridPrototype>,
     editable_grid: Entity<GridPrototype>,
     show_readonly_grid: bool,
+    /// 独立窗口保留原型工具条。外壳嵌入时关掉，避免两套工具条。
+    pub show_chrome: bool,
     status: SharedString,
     pending: Option<Effect>,
 }
@@ -40,9 +42,16 @@ impl Foundation {
             read_only_grid: cx.new(|cx| GridPrototype::new(GridFixture::ReadOnly, window, cx)),
             editable_grid: cx.new(|cx| GridPrototype::new(GridFixture::Editable, window, cx)),
             show_readonly_grid: false,
+            show_chrome: true,
             status: SharedString::from("GPUI"),
             pending: None,
         }
+    }
+
+    /// 外壳持有命令状态。这里只接收已经分发过的效果，不再次 dispatch。
+    pub fn adopt(&mut self, shell: Shell, effect: Effect, cx: &mut Context<Self>) {
+        self.shell = shell;
+        self.queue(effect, cx);
     }
 
     pub fn shell(&self) -> &Shell {
@@ -283,6 +292,7 @@ impl Render for Foundation {
                 .unwrap_or_default(),
             if has_editor_control { self.status.as_ref() } else { "" }
         );
+        let chrome = self.show_chrome;
         let sidebar = self.shell.sidebar_open;
         let sidebar_label = self.shell.text("shell.command.toggleSidebar");
         let palette = self.shell.palette_open;
@@ -310,28 +320,30 @@ impl Render for Foundation {
                     view.update(cx, |this, cx| this.accept_drop(paths, cx));
                 }
             })
-            .child(
-                div()
-                    .id("toolbar")
-                    .flex()
-                    .gap(pad)
-                    .child(action_button("new-query", new_query))
-                    .child(action_button("open-sqlite", open_label))
-                    .child(action_button("save-query", save_label))
-                    .child(action_button("theme-dark", self.shell.text("shell.theme.dark")))
-                    .child(action_button("theme-light", self.shell.text("shell.theme.light")))
-                    .child(action_button(
-                        "command-palette",
-                        self.shell.text("shell.shortcuts.commandPalette"),
-                    )),
-            )
-            .when(sidebar, |this| this.child(text_line(sidebar_label)))
+            .when(chrome, |this| {
+                this.child(
+                    div()
+                        .id("toolbar")
+                        .flex()
+                        .gap(pad)
+                        .child(action_button("new-query", new_query))
+                        .child(action_button("open-sqlite", open_label))
+                        .child(action_button("save-query", save_label))
+                        .child(action_button("theme-dark", self.shell.text("shell.theme.dark")))
+                        .child(action_button("theme-light", self.shell.text("shell.theme.light")))
+                        .child(action_button(
+                            "command-palette",
+                            self.shell.text("shell.shortcuts.commandPalette"),
+                        )),
+                )
+            })
+            .when(chrome && sidebar, |this| this.child(text_line(sidebar_label)))
             .child(editor)
             .child(grid)
-            .when(palette || help, |this| {
+            .when(chrome && (palette || help), |this| {
                 this.child(div().id("palette").key_context("Palette").child(text_line(overlay)))
             })
-            .child(div().id("status").child(SharedString::from(summary)))
+            .when(chrome, |this| this.child(div().id("status").child(SharedString::from(summary))))
     }
 }
 

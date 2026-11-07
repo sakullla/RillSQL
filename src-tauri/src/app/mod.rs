@@ -1,5 +1,7 @@
 mod files;
 mod model;
+pub mod shell;
+pub mod views;
 
 use gpui_kit::{
     App, AppContext as _, Bounds, Menu, MenuItem, Point, SharedString, TitlebarOptions,
@@ -10,9 +12,10 @@ use crate::ui::Foundation;
 
 pub use files::{accept_drop_path, accept_open_path, accept_save_path};
 pub use model::{
-    accept_versioned, shared_controls, AppPage, Density, Effect, FilePrompt, FocusTarget, Locale,
-    ResolvedTheme, Shell, ThemePreference,
+    accept_versioned, dictionary_keys, shared_controls, translate, AppPage, CommandSpec, Density, Effect, FilePrompt, FocusTarget, Locale,
+    ResolvedTheme, Shell, ThemePreference, COMMANDS,
 };
+pub use shell::Workbench;
 
 pub const GPUI_KIT_VERSION: &str = "0.9.0";
 pub const GPUI_PRE_VERSION: &str = "0.3.11";
@@ -73,11 +76,11 @@ pub fn run() {
         gpui_kit::init(cx);
         bind_keys(cx);
         let (_window, root) = gpui_kit::open_window(window_options(), cx, |window, cx| {
-            cx.new(|cx| Foundation::new(window, cx))
+            cx.new(|cx| Workbench::new(window, cx))
         })
         .expect("open GPUI window");
         let shell = root.read(cx).shell().clone();
-        install_actions(cx, &root);
+        install_workbench_actions(cx, &root);
         install_menus(cx, &shell);
         if dialog {
             root.update(cx, |view, cx| view.perform("open-sqlite", cx));
@@ -200,6 +203,66 @@ pub fn install_actions(cx: &mut App, root: &gpui_kit::Entity<Foundation>) {
     }
     cx.on_action(|_: &Quit, cx: &mut App| {
         cx.quit();
+    });
+}
+
+pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench>) {
+    macro_rules! bind {
+        ($action:ty, $id:expr) => {{
+            let root = root.clone();
+            cx.on_action(move |_: &$action, cx: &mut App| {
+                root.update(cx, |view, cx| view.perform($id, cx));
+            });
+        }};
+    }
+    bind!(CommandPalette, "command-palette");
+    bind!(QuickOpen, "quick-open");
+    bind!(NewQuery, "new-query");
+    bind!(ExecuteQuery, "execute-query");
+    bind!(ExecuteCurrent, "run-current");
+    bind!(OpenStructure, "open-structure");
+    bind!(CompareDatabases, "compare");
+    bind!(NewConnection, "new-connection");
+    bind!(OpenSqlite, "open-sqlite");
+    bind!(ShowHistory, "history");
+    bind!(SaveQuery, "save-query");
+    bind!(SavedQueries, "saved-queries");
+    bind!(ShowConnections, "connections");
+    bind!(OpenSettings, "settings");
+    bind!(ToggleSidebar, "sidebar");
+    bind!(ThemeLight, "theme-light");
+    bind!(ThemeDark, "theme-dark");
+    bind!(ThemeSystem, "theme-system");
+    bind!(ShowHelp, "help");
+    bind!(CloseTab, "close-tab");
+    bind!(NextTab, "next-tab");
+    bind!(RequestCancel, "request-cancel");
+    bind!(ShowAutocomplete, "autocomplete");
+    bind!(ToggleComment, "toggle-comment");
+    bind!(ToggleResults, "toggle-results");
+    bind!(FormatSql, "format");
+    bind!(ExplainSql, "explain");
+    bind!(LeaveEditor, "leave-editor");
+    bind!(SelectAllCells, "select-all-cells");
+    bind!(EditCell, "edit-cell");
+    bind!(CancelEdit, "cancel-edit");
+    bind!(MarkDelete, "mark-delete");
+    bind!(CommitEdit, "commit");
+    bind!(CopyRegion, "copy-region");
+    bind!(CopySqlValue, "copy-sql-value");
+    {
+        let root = root.clone();
+        cx.on_action(move |_: &Dismiss, cx: &mut App| {
+            root.update(cx, |view, cx| {
+                let effect = view.model.dismiss();
+                view.apply_effect(effect, cx);
+                cx.notify();
+            });
+        });
+    }
+    let root = root.clone();
+    cx.on_action(move |_: &Quit, cx: &mut App| {
+        root.update(cx, |view, cx| view.perform("quit-window", cx));
     });
 }
 

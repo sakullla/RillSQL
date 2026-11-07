@@ -1,3 +1,4 @@
+pub mod app;
 mod application;
 mod catalog;
 mod compare;
@@ -10,10 +11,12 @@ mod grid;
 mod migrate;
 mod mongo;
 mod native_export;
+mod i18n;
 mod product;
 mod query;
 mod redis;
 mod state;
+mod ui;
 
 use serde::Serialize;
 

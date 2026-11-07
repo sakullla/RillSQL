@@ -1,0 +1,237 @@
+//! zh-CN / en 字典。键与 Vue 文案一致；两边都有的句子保持同一写法。
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Locale {
+    ZhCn,
+    En,
+}
+
+pub fn text(locale: Locale, key: &str) -> String {
+    let value = match locale {
+        Locale::ZhCn => zh(key),
+        Locale::En => en(key),
+    };
+    value.unwrap_or(key).to_owned()
+}
+
+macro_rules! dict {
+    ($($key:literal => $zh:literal, $en:literal;)*) => {
+        fn zh(key: &str) -> Option<&'static str> {
+            Some(match key {
+                $($key => $zh,)*
+                _ => return None,
+            })
+        }
+        fn en(key: &str) -> Option<&'static str> {
+            Some(match key {
+                $($key => $en,)*
+                _ => return None,
+            })
+        }
+        pub fn catalog_keys() -> &'static [&'static str] {
+            &[$($key),*]
+        }
+    };
+}
+
+dict! {
+    "shell.command.newQuery" => "新建查询", "New query";
+    "shell.command.execute" => "执行", "Execute";
+    "shell.command.newStructure" => "新建表结构", "New table structure";
+    "shell.command.compare" => "对比库", "Compare databases";
+    "shell.command.newConnection" => "新建连接", "New connection";
+    "shell.command.openSqlite" => "打开 SQLite 文件", "Open SQLite file";
+    "shell.command.history" => "查询历史", "Query history";
+    "shell.command.saveQuery" => "保存当前查询", "Save current query";
+    "shell.command.savedQueries" => "保存的查询", "Saved queries";
+    "shell.command.connections" => "连接管理", "Manage connections";
+    "shell.command.settings" => "设置", "Settings";
+    "shell.command.toggleSidebar" => "显示 / 隐藏资源管理器", "Show / hide the explorer";
+    "shell.command.themeLight" => "切换到浅色主题", "Switch to light theme";
+    "shell.command.themeDark" => "切换到深色主题", "Switch to dark theme";
+    "shell.command.themeSystem" => "主题跟随系统", "Theme follows system";
+    "shell.command.help" => "键盘快捷键", "Keyboard shortcuts";
+    "shell.command.quit" => "退出", "Quit";
+    "shell.menu.file" => "文件", "File";
+    "shell.menu.edit" => "编辑", "Edit";
+    "shell.menu.view" => "视图", "View";
+    "shell.menu.query" => "查询", "Query";
+    "shell.menu.tools" => "工具", "Tools";
+    "shell.menu.window" => "窗口", "Window";
+    "shell.menu.help" => "帮助", "Help";
+    "shell.theme.light" => "浅色", "Light";
+    "shell.theme.dark" => "深色", "Dark";
+    "shell.theme.system" => "跟随系统", "Follow system";
+    "shell.settings.title" => "设置", "Settings";
+    "shell.settings.density" => "界面密度", "UI density";
+    "shell.settings.densityCompact" => "紧凑", "Compact";
+    "shell.settings.densityStandard" => "标准", "Standard";
+    "shell.settings.densityRelaxed" => "宽松", "Relaxed";
+    "shell.settings.editorFont" => "编辑器字号", "Editor font size";
+    "shell.settings.editorTheme" => "编辑器配色", "Editor colors";
+    "shell.settings.language" => "界面语言", "Language";
+    "shell.settings.theme" => "主题", "Theme";
+    "shell.settings.editorThemeAuto" => "跟随主题", "Follow theme";
+    "shell.settings.editorThemeContrast" => "高对比", "High contrast";
+    "shell.settings.editorThemeWarm" => "暖色", "Warm";
+    "shell.settings.editorThemeCool" => "冷色", "Cool";
+    "shell.settings.editorThemeMono" => "弱化灰阶", "Muted grayscale";
+    "shell.settings.rowsPerPage" => "每次读取的行数", "Rows per read";
+    "shell.settings.previewLimit" => "大字段预览上限", "Large value preview limit";
+    "shell.settings.nullCopy" => "复制 NULL 时写入", "Text written for NULL when copying";
+    "shell.settings.timeout" => "语句执行超时", "Statement timeout";
+    "shell.shortcuts.groupGrid" => "表格", "Grid";
+    "shell.shortcuts.commandPalette" => "命令面板（表、连接、命令）", "Command palette (tables, connections, commands)";
+    "shell.shortcuts.quickOpen" => "快速打开表", "Quick open table";
+    "shell.shortcuts.newQuery" => "新建查询", "New query";
+    "shell.shortcuts.closeTab" => "关闭当前标签", "Close current tab";
+    "shell.shortcuts.toggleSidebar" => "显示 / 隐藏资源管理器", "Show / hide the explorer";
+    "shell.shortcuts.nextTab" => "切换到下一个标签", "Switch to next tab";
+    "shell.shortcuts.nthTab" => "切换到第 N 个标签", "Switch to tab N";
+    "shell.shortcuts.openSettings" => "设置", "Settings";
+    "shell.shortcuts.shortcutHelp" => "快捷键帮助", "Shortcut help";
+    "shell.shortcuts.runSelection" => "执行选中内容；无选中时执行光标所在语句", "Run selection; with nothing selected, run the statement at the cursor";
+    "shell.shortcuts.runCurrent" => "只执行光标所在语句", "Run only the statement at the cursor";
+    "shell.shortcuts.requestCancel" => "请求取消执行", "Request cancellation";
+    "shell.shortcuts.autocomplete" => "补全", "Autocomplete";
+    "shell.shortcuts.toggleComment" => "注释 / 取消注释", "Comment / uncomment";
+    "shell.shortcuts.toggleResults" => "显示 / 隐藏查询结果区", "Show / hide the query results pane";
+    "shell.shortcuts.format" => "格式化选中的 SQL；无选中时格式化全部", "Format selected SQL; with nothing selected, format everything";
+    "shell.shortcuts.explain" => "查看当前语句的执行计划", "Show the execution plan of the current statement";
+    "shell.shortcuts.leaveEditor" => "离开编辑器（不会插入缩进）", "Leave the editor (no indentation inserted)";
+    "shell.shortcuts.moveCells" => "移动单元格；按住 Shift 扩展选择", "Move between cells; hold Shift to extend the selection";
+    "shell.shortcuts.selectAllCells" => "选中已读取的全部单元格", "Select every loaded cell";
+    "shell.shortcuts.editCell" => "编辑单元格", "Edit cell";
+    "shell.shortcuts.cancelEdit" => "取消编辑；未编辑时离开表格", "Cancel editing; leave the grid when not editing";
+    "shell.shortcuts.markDelete" => "标记删除选中的行（暂存）", "Mark selected rows for deletion (staged)";
+    "shell.shortcuts.commit" => "预览并提交变更", "Preview and commit changes";
+    "shell.shortcuts.copyRegion" => "复制选中区域（TSV）", "Copy the selection (TSV)";
+    "shell.shortcuts.copySqlValue" => "复制为 SQL 值（区分 NULL）", "Copy as SQL values (NULL-aware)";
+    "common.save" => "保存", "Save";
+    "common.cancel" => "取消", "Cancel";
+    "common.close" => "关闭", "Close";
+    "common.copy" => "复制", "Copy";
+    "common.localeZh" => "中文（简体）", "中文（简体）";
+    "common.localeEn" => "English", "English";
+    "common.newConnection" => "新建连接", "New connection";
+    "common.openSqlite" => "打开 SQLite 文件", "Open SQLite file";
+    "shell.nav.main" => "主导航", "Main navigation";
+    "shell.nav.workspace" => "工作台", "Workbench";
+    "shell.nav.connections" => "连接", "Connections";
+    "shell.nav.history" => "查询历史", "Query history";
+    "shell.nav.settings" => "设置", "Settings";
+    "shell.sidebar.explorer" => "资源管理器", "Explorer";
+    "shell.palette.title" => "命令面板", "Command palette";
+    "shell.paletteGroup.connection" => "连接", "Connections";
+    "shell.welcome.title" => "RillSQL", "RillSQL";
+    "shell.welcome.factEngines" => "支持 PostgreSQL、MySQL、MariaDB、SQL Server、SQLite、Redis、MongoDB", "Supports PostgreSQL, MySQL, MariaDB, SQL Server, SQLite, Redis and MongoDB";
+    "shell.welcome.resumeTitle" => "继续工作", "Continue working";
+    "shell.welcome.recent" => "最近执行", "Recent runs";
+    "shell.welcome.saved" => "保存的查询", "Saved queries";
+    "shell.statusbar.noTarget" => "此查询还未选择执行目标——在查询里选一个连接和库", "This query has no execution target yet — pick a connection and database in the query";
+    "shell.tabs.tablist" => "打开的标签", "Open tabs";
+    "shell.tabs.closeOthers" => "关闭其他", "Close others";
+    "shell.tabs.closeRight" => "关闭右侧", "Close to the right";
+    "shell.tabs.closeAll" => "关闭全部", "Close all";
+    "shell.closeGuard.closeWindow" => "关闭窗口？", "Close the window?";
+    "shell.closeGuard.closeTab" => "关闭这个标签？", "Close this tab?";
+    "shell.closeGuard.stay" => "留下", "Stay";
+    "shell.closeGuard.leave" => "离开", "Leave";
+    "shell.closeGuard.windowCells" => "有标签含未提交的单元格修改。留下则窗口和修改都还在；离开会丢掉这些修改，不会写入数据库。", "A tab has uncommitted cell changes. Staying keeps the window and the changes; leaving discards them. Nothing is written to the database.";
+    "shell.closeGuard.windowDraft" => "有标签的 SQL 草稿尚未执行。留下则窗口和草稿都还在；离开会丢掉这些草稿。", "A tab has an unexecuted SQL draft. Staying keeps the window and the draft; leaving discards it.";
+    "shell.closeGuard.windowBoth" => "有标签含未提交的单元格修改和未执行的 SQL 草稿。留下则窗口和内容都还在；离开会丢掉这些修改与草稿，不会写入数据库。", "A tab has uncommitted cell changes and an unexecuted SQL draft. Staying keeps the window and the content; leaving discards the changes and drafts. Nothing is written to the database.";
+    "shell.closeGuard.tabCells" => "这个标签有未提交的单元格修改。留下则标签和修改都还在；离开会丢掉这些修改，不会写入数据库。", "This tab has uncommitted cell changes. Staying keeps the tab and the changes; leaving discards them. Nothing is written to the database.";
+    "shell.closeGuard.tabDraft" => "这个标签的 SQL 草稿尚未执行。留下则标签和草稿都还在；离开会丢掉这份草稿。", "This tab has an unexecuted SQL draft. Staying keeps the tab and the draft; leaving discards it.";
+    "shell.closeGuard.tabBoth" => "这个标签有未提交的单元格修改和未执行的 SQL 草稿。留下则标签和内容都还在；离开会丢掉这些修改与草稿，不会写入数据库。", "This tab has uncommitted cell changes and an unexecuted SQL draft. Staying keeps the tab and the content; leaving discards the changes and the draft. Nothing is written to the database.";
+    "shell.update.busy" => "请先等待查询、导出、迁移等任务完成，并关闭正在操作的对话框。", "Wait for queries, exports and migrations to finish, and close active dialogs first.";
+    "shell.update.pending" => "请先提交或放弃表格、结构等未提交修改，再安装更新。", "Commit or discard pending grid and structure changes before installing the update.";
+    "shell.update.autoCheck" => "启动时自动检查更新", "Check for updates on startup";
+    "shell.state.unknown" => "不支持的应用状态版本，原文件未改动。", "This app-state version is not supported; the file was left unchanged.";
+    "shell.state.forbidden" => "应用状态不能保存密码或未提交修改。", "App state cannot store passwords or uncommitted changes.";
+    "shell.state.malformed" => "应用状态无法识别，原文件未改动。", "App state could not be read; the file was left unchanged.";
+    "connections.page.title" => "连接管理", "Connections";
+    "connections.page.emptyFirstHint" => "支持 PostgreSQL、MySQL、MariaDB、SQL Server、SQLite、Redis 和 MongoDB。", "Supports PostgreSQL, MySQL, MariaDB, SQL Server, SQLite, Redis and MongoDB.";
+    "connections.page.note" => "连接配置只保存在本机。密码保存在操作系统凭据库；删除连接不会删除数据库或 SQLite 文件。", "Connection settings stay on this machine. Passwords live in the OS credential store; deleting a connection never deletes the database or the SQLite file.";
+    "connections.page.importRillSql" => "导入 RillSQL 文件", "Import RillSQL file";
+    "connections.page.exportButton" => "导出连接", "Export connections";
+    "connections.page.localFile" => "本地文件", "Local file";
+    "connections.page.tlsVerify" => "TLS · 核对证书", "TLS · verified";
+    "connections.page.tlsRequire" => "TLS · 不核对证书", "TLS · unverified";
+    "connections.page.tlsOff" => "不加密", "Unencrypted";
+    "connections.page.connect" => "连接", "Connect";
+    "connections.page.moreActions" => "{name} 的更多操作", "More actions for {name}";
+    "connections.page.menuEdit" => "编辑配置…", "Edit settings…";
+    "connections.page.menuDisconnect" => "断开连接", "Disconnect";
+    "connections.page.menuDelete" => "删除配置…", "Delete configuration…";
+    "connections.editor.newTitle" => "新建连接", "New connection";
+    "connections.editor.tls.title" => "TLS 加密", "TLS";
+    "connections.editor.ssh.title" => "SSH 跳板机", "SSH jump host";
+    "connections.editor.test.button" => "测试连接", "Test connection";
+    "connections.editor.test.ok" => "连接成功", "Connection succeeded";
+    "connections.editor.test.wait" => "第一次连接这台 SSH 跳板机，需要先确认它的身份", "First connection to this SSH jump host; confirm its identity first";
+    "connections.editor.test.failed" => "连接失败", "Connection failed";
+    "connections.status.connected" => "已连接", "Connected";
+    "connections.status.error" => "连接失败", "Connection failed";
+    "connections.deleteDialog.title" => "删除这条连接配置？", "Delete this connection configuration?";
+    "connections.validate.chooseFile" => "请选择数据库文件", "Choose a database file";
+    "connections.validate.hostRequired" => "请填写主机", "Enter a host";
+    "connections.validate.portRange" => "端口应为 1–65535", "Port must be 1–65535";
+    "connections.validate.userRequired" => "请填写用户名", "Enter a username";
+    "connections.validate.redisDbIndex" => "Redis 库索引应为 0 起的非负整数", "The Redis database index must be a non-negative integer";
+    "connections.validate.mongoUriSsh" => "整串 URI 暂不支持 SSH 隧道，请改用 host/port 表单", "A full URI does not support an SSH tunnel yet; use the host/port form";
+    "connections.validate.sshHostRequired" => "请填写跳板机主机", "Enter the jump host";
+    "connections.validate.sshUserRequired" => "请填写 SSH 用户", "Enter the SSH user";
+    "connections.validate.caFileRequired" => "请填写 CA 证书文件", "Enter the CA certificate file";
+    "connections.url.unsupported" => "只支持 postgres(ql)://、mysql://、mariadb://、sqlserver://、sqlite:、redis://、mongodb 或带 jdbc: 前缀的连接串。", "Only connection URLs starting with postgres, mysql, mariadb, sqlserver, sqlite, redis, mongodb or a jdbc prefix are supported.";
+    "connections.url.parseFailed" => "连接串格式无法解析，请检查主机和端口的写法。", "The connection URL could not be parsed; check the host and port.";
+    "connections.url.noHost" => "连接串里没有主机地址或文件路径。", "The connection URL has no host address or file path.";
+    "history.page.titleRuns" => "查询历史", "Query history";
+    "history.page.runs" => "执行历史", "Run history";
+    "history.page.saved" => "保存的查询", "Saved queries";
+    "history.page.tabsLabel" => "历史与保存的查询", "History and saved queries";
+    "history.page.loadToEditor" => "载入编辑器 ↗", "Load into editor ↗";
+    "history.page.loadOnlySql" => "只载入 SQL，不会执行。", "Loads the SQL only; nothing is executed.";
+    "history.page.sqlPreview" => "SQL 预览", "SQL preview";
+    "history.page.filterConnection" => "按连接筛选", "Filter by connection";
+    "history.page.clearConfirm" => "清空本机的全部查询历史？此操作无法撤销。", "Clear the entire local query history? This cannot be undone.";
+    "history.savedPanel.openNote" => "打开只载入 SQL，不会执行。", "Opening loads the SQL only; nothing is executed.";
+    "history.savedPanel.save" => "保存", "Save";
+    "history.savedPanel.needTab" => "先打开一个查询标签，再保存其中的 SQL。", "Open a query tab first, then save its SQL.";
+    "history.plan.deletedNotice" => "需要重新选择执行目标。原来的连接已删除，这次只载入 SQL，不会执行。", "An execution target must be chosen again. The original connection was deleted; this loads the SQL only and never executes.";
+    "query.editor.area" => "查询", "Query";
+    "query.editor.menu.run" => "执行", "Run";
+    "query.editor.menu.runCurrent" => "执行当前语句", "Run current statement";
+    "query.editor.menu.format" => "格式化", "Format";
+    "query.editor.menu.plan" => "执行计划", "Execution plan";
+    "query.editor.menu.copy" => "复制", "Copy";
+    "query.editor.menu.clear" => "清空编辑器", "Clear editor";
+    "catalog.tree.menuLabel" => "对象操作", "Object actions";
+    "catalog.tree.openData" => "打开数据", "Open data";
+    "catalog.tree.viewStructure" => "查看结构", "View structure";
+    "catalog.tree.newQueryHere" => "在此新建查询", "New query here";
+    "catalog.tree.copyToQuery" => "复制到新查询", "Copy to a new query";
+    "catalog.tree.copyFullName" => "复制完整名称", "Copy full name";
+    "grid.menu.copy" => "复制", "Copy";
+    "grid.menu.copyRow" => "复制整行", "Copy entire row";
+    "grid.menu.copyColumn" => "复制整列", "Copy entire column";
+    "grid.menu.filterByValue" => "按此值筛选", "Filter by this value";
+    "grid.menu.markDelete" => "标记删除行", "Mark row for deletion";
+    "grid.value.copyValue" => "复制值", "Copy value";
+    "grid.errors.viewReadonly" => "视图是只读的，不能新增、修改或删除数据。", "Views are read-only; data cannot be inserted, modified or deleted.";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn both_locales_translate_every_catalog_key() {
+        for key in catalog_keys() {
+            for locale in [Locale::ZhCn, Locale::En] {
+                let value = text(locale, key);
+                assert_ne!(value, *key, "{key:?} {locale:?}");
+                assert!(!value.is_empty(), "{key}");
+            }
+        }
+    }
+}
