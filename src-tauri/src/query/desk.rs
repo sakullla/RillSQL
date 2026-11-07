@@ -104,6 +104,7 @@ pub struct Desk {
     loads: u32,
     view_gen: u64,
     idle_note: String,
+    tree_error: String,
 }
 
 impl Desk {
@@ -120,6 +121,7 @@ impl Desk {
             loads: 0,
             view_gen: 0,
             idle_note: String::new(),
+            tree_error: String::new(),
         }
     }
 
@@ -425,14 +427,44 @@ impl Desk {
         }
     }
 
-    pub fn stop_run(&mut self, id: &str, note: &str) {
-        let found = self.tab_mut(id).map(|tab| {
+    pub fn has_token(&self, id: &str, token: TaskToken) -> bool {
+        self.tabs.iter().any(|tab| tab.id == id && tab.token == Some(token))
+    }
+
+    /// 只结束仍持有该 token 的那次执行。更新的 begin 不受旧错误影响。
+    pub fn stop_run(&mut self, id: &str, token: TaskToken, note: &str) -> bool {
+        let applied = self.tab_mut(id).is_some_and(|tab| {
+            if tab.token != Some(token) {
+                return false;
+            }
             tab.running = false;
             tab.status = "error".to_owned();
             tab.note = note.to_owned();
+            true
         });
-        if found.is_some() {
+        if applied {
             self.view_gen = self.view_gen.saturating_add(1);
+        }
+        applied
+    }
+
+    /// 轮询的终态。旧票的成功、取消和错误都不改写更新 token 的运行状态、说明或结果。
+    pub fn finish_polled(&mut self, tasks: &TaskBoard, ticket: &Ticket, result: Result<RunDto, String>, cancel_text: &str) {
+        match result {
+            Ok(run) => {
+                let accepted = self.accept_run(tasks, ticket, run);
+                if !self.has_token(&ticket.tab_id, ticket.token) {
+                    return;
+                }
+                if accepted {
+                    self.set_note(&ticket.tab_id, "");
+                } else if self.note_of(&ticket.tab_id).is_empty() {
+                    self.set_note(&ticket.tab_id, cancel_text);
+                }
+            }
+            Err(error) => {
+                let _ = self.stop_run(&ticket.tab_id, ticket.token, &error);
+            }
         }
     }
 
@@ -621,10 +653,13 @@ impl Desk {
 
     pub fn issue(&mut self, tasks: &TaskBoard) -> Option<Ticket> {
         let tab = self.active_tab()?;
+        let running = tab.running;
         let token = tasks.begin(&owner(&tab.id));
         let ticket = Ticket { tab_id: tab.id.clone(), token, version: tab.version };
-        if let Some(tab) = self.active_mut() {
-            tab.token = Some(ticket.token);
+        if !running {
+            if let Some(tab) = self.active_mut() {
+                tab.token = Some(ticket.token);
+            }
         }
         Some(ticket)
     }
@@ -645,6 +680,9 @@ impl Desk {
         let Some(tab) = self.tab_mut(&ticket.tab_id) else {
             return false;
         };
+        if tab.token != Some(ticket.token) {
+            return false;
+        }
         let accepted = if tab.cancelled {
             tab.running = false;
             tab.status = "cancelled".to_owned();
@@ -760,6 +798,19 @@ impl Desk {
     pub fn set_objects(&mut self, objects: Vec<TreeObject>, databases: Vec<String>) {
         self.databases = databases;
         self.objects = objects;
+    }
+
+    pub fn set_tree_error(&mut self, error: &str) {
+        self.tree_error = error.to_owned();
+    }
+
+    pub fn tree_error(&self) -> &str {
+        &self.tree_error
+    }
+
+    /// 没有任何对象，并且读取本身没有失败。
+    pub fn tree_is_empty(&self) -> bool {
+        self.objects.is_empty() && self.tree_error.is_empty()
     }
 
     fn sources_for(&self, target: Option<&Target>) -> Vec<CompletionSource> {
@@ -920,17 +971,37 @@ pub struct TreeLoad {
     pub databases: Vec<String>,
     pub columns: HashMap<String, Vec<String>>,
     pub links: Vec<OpenLink>,
+    pub failures: Vec<String>,
+}
+
+pub struct CatalogListing {
+    pub objects: Vec<TreeObject>,
+    pub databases: Vec<String>,
+    pub failures: Vec<String>,
 }
 
 /// 把已有 catalog 结果收成查询树。只保留表和视图，并带上连接、库和引擎。
-pub fn objects_from_catalog(connection_id: &str, connection_name: &str, engine: &str, body: &ConnectionBody) -> (Vec<TreeObject>, Vec<String>) {
+/// 连接、库或 schema 的 error 记成失败，不用空列表表示没读到。
+pub fn objects_from_catalog(connection_id: &str, connection_name: &str, engine: &str, body: &ConnectionBody) -> CatalogListing {
     let mut objects = Vec::new();
     let mut databases = Vec::new();
+    let mut failures = Vec::new();
+    if let Some(error) = body.error.as_ref().filter(|error| !error.is_empty()) {
+        failures.push(error.clone());
+    }
     for database in &body.databases {
         if !database.name.is_empty() && !databases.iter().any(|name| name == &database.name) {
             databases.push(database.name.clone());
         }
+        if let Some(error) = database.error.as_ref().filter(|error| !error.is_empty()) {
+            let scope = if database.name.is_empty() { "database".to_owned() } else { database.name.clone() };
+            failures.push(format!("{scope}: {error}"));
+        }
         for schema in &database.schemas {
+            if let Some(error) = schema.error.as_ref().filter(|error| !error.is_empty()) {
+                let scope = if schema.name.is_empty() { database.name.clone() } else { format!("{}.{}", database.name, schema.name) };
+                failures.push(format!("{scope}: {error}"));
+            }
             for object in &schema.objects {
                 let kind = match object.kind {
                     ObjectKind::Table => "table",
@@ -949,7 +1020,7 @@ pub fn objects_from_catalog(connection_id: &str, connection_name: &str, engine: 
             }
         }
     }
-    (objects, databases)
+    CatalogListing { objects, databases, failures }
 }
 
 pub async fn load_tree(service: &Arc<Service>) -> Result<TreeLoad, String> {
@@ -958,6 +1029,7 @@ pub async fn load_tree(service: &Arc<Service>) -> Result<TreeLoad, String> {
     let mut databases = Vec::new();
     let mut columns = HashMap::new();
     let mut links = Vec::new();
+    let mut failures = Vec::new();
     for record in records {
         let Some(session) = service.catalog_session(&record.saved.id) else {
             continue;
@@ -970,9 +1042,10 @@ pub async fn load_tree(service: &Arc<Service>) -> Result<TreeLoad, String> {
         if engine != "sqlite" {
             if let Ok(parsed) = Engine::parse(&engine) {
                 let body = read_catalog_session(parsed, &session, 200, &[]).await;
-                let (found, names) = objects_from_catalog(&record.saved.id, &record.saved.name, &engine, &body);
-                objects.extend(found);
-                for name in names {
+                let listing = objects_from_catalog(&record.saved.id, &record.saved.name, &engine, &body);
+                objects.extend(listing.objects);
+                failures.extend(listing.failures);
+                for name in listing.databases {
                     if !name.is_empty() && !db_names.iter().any(|have| have == &name) {
                         db_names.push(name);
                     }
@@ -1018,7 +1091,7 @@ pub async fn load_tree(service: &Arc<Service>) -> Result<TreeLoad, String> {
             databases: db_names,
         });
     }
-    Ok(TreeLoad { objects, databases, columns, links })
+    Ok(TreeLoad { objects, databases, columns, links, failures })
 }
 
 async fn read_columns(service: &Arc<Service>, connection_id: &str, table: &str) -> Result<Vec<String>, String> {
@@ -1422,17 +1495,128 @@ mod tests {
                     error: None,
                 }],
             };
-            let (objects, databases) = objects_from_catalog("c1", "应用", engine, &body);
-            assert_eq!(databases, vec!["app".to_owned()]);
-            let table = objects.iter().find(|object| object.name == "orders").expect(engine);
+            let listing = objects_from_catalog("c1", "应用", engine, &body);
+            assert!(listing.failures.is_empty(), "{engine}");
+            assert_eq!(listing.databases, vec!["app".to_owned()]);
+            let table = listing.objects.iter().find(|object| object.name == "orders").expect(engine);
             assert_eq!(table.kind, "table");
             assert_eq!(table.engine, engine);
             assert_eq!(table.database, "app");
             assert_eq!(table.connection_id, "c1");
             assert_eq!(table.schema, schema);
-            let view = objects.iter().find(|object| object.name == "orders_v").expect(engine);
+            let view = listing.objects.iter().find(|object| object.name == "orders_v").expect(engine);
             assert_eq!(view.kind, "view");
             assert_eq!(view.connection_name, "应用");
         }
+    }
+
+    fn ready_ticket(desk: &mut Desk, tasks: &TaskBoard, sql: &str) -> Ticket {
+        desk.set_draft(sql);
+        match desk.begin_run(tasks, RunScope::Script, None) {
+            BeginRun::Ready(prepared) => Ticket { tab_id: prepared.tab_id, token: prepared.token, version: prepared.version },
+            BeginRun::Rejected(reason) => panic!("{reason}"),
+            BeginRun::Variables(_) => panic!("variables"),
+        }
+    }
+
+    #[test]
+    fn a_restarted_run_ignores_the_previous_ticket() {
+        let tasks = TaskBoard::new();
+        let mut desk = Desk::new();
+        desk.open_database("notes", "笔记", "sqlite", "main");
+        let old = ready_ticket(&mut desk, &tasks, "SELECT 1");
+        assert!(desk.cancel(&tasks).is_none());
+        assert_eq!(desk.status(), "cancelled");
+        assert!(desk.running_ids().is_empty());
+        let restarted = ready_ticket(&mut desk, &tasks, "SELECT 2");
+        assert!(desk.running_ids().contains(&restarted.tab_id));
+        desk.finish_polled(&tasks, &old, Ok(empty_run("old-ok")), "已取消");
+        assert!(desk.running_ids().contains(&restarted.tab_id), "旧取消终态清掉了新的 running");
+        assert_eq!(desk.status(), "running");
+        assert!(desk.results().is_empty());
+        assert!(desk.note_of(&restarted.tab_id).is_empty());
+        desk.finish_polled(&tasks, &old, Err("旧错误".to_owned()), "已取消");
+        assert!(desk.running_ids().contains(&restarted.tab_id));
+        assert_ne!(desk.status(), "error");
+        assert!(desk.accept_run(&tasks, &restarted, empty_run("new-ok")));
+        desk.set_note(&restarted.tab_id, "");
+        assert_eq!(desk.results().len(), 1);
+        desk.finish_polled(&tasks, &old, Ok(empty_run("old-after")), "已取消");
+        desk.finish_polled(&tasks, &old, Err("旧错误".to_owned()), "已取消");
+        assert!(desk.note_of(&restarted.tab_id).is_empty(), "旧终态补上了取消文案或旧错误");
+        assert_eq!(desk.results().len(), 1);
+        assert_eq!(desk.status(), "ok");
+        assert!(!desk.running_ids().contains(&restarted.tab_id));
+
+        let superseded = ready_ticket(&mut desk, &tasks, "SELECT 3");
+        assert!(desk.load_draft("SELECT loaded", None, &tasks));
+        assert!(!desk.executed());
+        assert!(desk.results().is_empty());
+        assert_eq!(desk.draft(), "SELECT loaded");
+        let again = ready_ticket(&mut desk, &tasks, "SELECT 4");
+        desk.finish_polled(&tasks, &superseded, Ok(empty_run("stale-ok")), "已取消");
+        desk.finish_polled(&tasks, &superseded, Err("过期错误".to_owned()), "已取消");
+        assert!(desk.running_ids().contains(&again.tab_id), "load_draft 之后的旧终态清掉了新的 running");
+        assert!(desk.results().is_empty());
+        assert!(desk.accept_run(&tasks, &again, empty_run("again-ok")));
+        desk.set_note(&again.tab_id, "");
+        desk.finish_polled(&tasks, &superseded, Err("过期错误".to_owned()), "已取消");
+        assert!(desk.note_of(&again.tab_id).is_empty());
+        assert_eq!(desk.results().len(), 1);
+        assert_eq!(desk.status(), "ok");
+    }
+
+    #[test]
+    fn catalog_errors_are_not_reported_as_no_objects() {
+        // 没有连接远程引擎。失败体只证明 error 不会被当成空对象树。
+        let connection = crate::catalog::ConnectionBody {
+            error: Some("读取库表失败：连接中断".to_owned()),
+            foreign_keys: None,
+            databases: Vec::new(),
+        };
+        let failed = objects_from_catalog("c1", "应用", "postgres", &connection);
+        assert!(failed.objects.is_empty());
+        assert!(failed.databases.is_empty());
+        assert!(failed.failures.iter().any(|item| item.contains("连接中断")));
+
+        let database = crate::catalog::ConnectionBody {
+            error: None,
+            foreign_keys: None,
+            databases: vec![crate::catalog::DatabaseNode {
+                name: "app".to_owned(),
+                schemas: Vec::new(),
+                error: Some("库不可用".to_owned()),
+            }],
+        };
+        let failed_database = objects_from_catalog("c1", "应用", "mysql", &database);
+        assert!(failed_database.failures.iter().any(|item| item.contains("库不可用")));
+        assert_eq!(failed_database.databases, vec!["app".to_owned()]);
+
+        let schema = crate::catalog::ConnectionBody {
+            error: None,
+            foreign_keys: None,
+            databases: vec![crate::catalog::DatabaseNode {
+                name: "app".to_owned(),
+                error: None,
+                schemas: vec![crate::catalog::SchemaNode {
+                    name: "public".to_owned(),
+                    objects: Vec::new(),
+                    total: 0,
+                    error: Some("schema 读取失败".to_owned()),
+                    kind_reports: Vec::new(),
+                }],
+            }],
+        };
+        let failed_schema = objects_from_catalog("c1", "应用", "sqlserver", &schema);
+        assert!(failed_schema.objects.is_empty());
+        assert!(failed_schema.failures.iter().any(|item| item.contains("schema 读取失败")));
+
+        let mut desk = Desk::new();
+        desk.set_objects(failed.objects, failed.databases);
+        desk.set_tree_error(&failed.failures.join("\n"));
+        assert!(desk.objects().is_empty());
+        assert!(!desk.tree_is_empty(), "读取失败不能显示成没有对象");
+        desk.set_tree_error("");
+        assert!(desk.tree_is_empty());
     }
 }

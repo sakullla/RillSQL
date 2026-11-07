@@ -466,17 +466,8 @@ impl QueryPane {
                 let _ = cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |pane, cx| {
-                            match result {
-                                Ok(run) => {
-                                    let accepted = pane.desk.accept_run(&pane.services.tasks, &ticket, run);
-                                    if accepted {
-                                        pane.desk.set_note(&ticket.tab_id, "");
-                                    } else if pane.desk.note_of(&ticket.tab_id).is_empty() {
-                                        pane.desk.set_note(&ticket.tab_id, &i18n::text(pane.locale, "query.run.cancel"));
-                                    }
-                                }
-                                Err(error) => pane.desk.stop_run(&ticket.tab_id, &error),
-                            }
+                            let cancel_text = i18n::text(pane.locale, "query.run.cancel");
+                            pane.desk.finish_polled(&pane.services.tasks, &ticket, result, &cancel_text);
                             pane.rebind_grid(cx);
                             cx.notify();
                         });
@@ -583,6 +574,8 @@ impl QueryPane {
                             Ok(loaded) => {
                                 pane.desk.set_objects(loaded.objects, loaded.databases);
                                 pane.desk.set_links(loaded.links);
+                                let failure = loaded.failures.join("\n");
+                                pane.desk.set_tree_error(&failure);
                                 for (key, cols) in loaded.columns {
                                     let mut parts = key.split('\u{1}');
                                     let connection = parts.next().unwrap_or("");
@@ -590,7 +583,11 @@ impl QueryPane {
                                     let table = parts.next().unwrap_or("");
                                     pane.desk.remember_columns(connection, database, table, cols);
                                 }
-                                pane.desk.set_active_note("");
+                                if failure.is_empty() {
+                                    pane.desk.set_active_note("");
+                                } else {
+                                    pane.desk.set_active_note(&failure);
+                                }
                             }
                             Err(error) => pane.desk.set_active_note(&error),
                         }
@@ -906,7 +903,10 @@ impl Render for QueryPane {
         }
         let mut body = div().id("query-body").flex().flex_1().gap(px(4.));
         let mut tree = div().id("query-tree").flex().flex_col().w(px(180.));
-        if objects.is_empty() {
+        let tree_error = self.desk.tree_error().to_owned();
+        if !tree_error.is_empty() {
+            tree = tree.child(SharedString::from(tree_error));
+        } else if objects.is_empty() {
             tree = tree.child(label("query.status.noObjects"));
         }
         for object in &objects {
