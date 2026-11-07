@@ -6,12 +6,14 @@ use std::sync::Arc;
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton,
-    ParentElement as _, Render, SharedString, Styled as _, Window, WindowAppearance, div, prelude::*,
+    ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _, Window, WindowAppearance, div, prelude::*,
     px,
 };
 
-use crate::app::views::connections::engines;
+use crate::app::views::connections::{blank_draft, engines};
 use crate::app::{AppPage, Effect, FocusTarget};
+use crate::connections::model::Engine;
+use crate::state::Platform;
 use crate::application::AppServices;
 use crate::ui::Foundation;
 
@@ -80,6 +82,33 @@ impl Workbench {
             cx.notify();
             return;
         }
+        if id == "conn-import" || id == "conn-export" {
+            if self.model.close_prompt.is_some() {
+                let _ = self.model.dispatch(id);
+                cx.notify();
+                return;
+            }
+            if id == "conn-import" {
+                self.prompt_import(cx);
+            } else {
+                self.prompt_export(cx);
+            }
+            return;
+        }
+        if id == "open-sqlite" {
+            let Some(effect) = self.model.dispatch(id) else {
+                return;
+            };
+            if matches!(effect, Effect::PromptOpen) {
+                self.adopt_shell(Effect::None, cx);
+                self.prompt_sqlite(cx);
+            } else {
+                self.apply_effect(effect, cx);
+            }
+            self.persist_if_needed();
+            cx.notify();
+            return;
+        }
         let Some(effect) = self.model.dispatch(id) else {
             return;
         };
@@ -88,9 +117,13 @@ impl Workbench {
         cx.notify();
     }
 
-    pub(crate) fn apply_effect(&mut self, effect: Effect, cx: &mut Context<Self>) {
+    fn adopt_shell(&mut self, effect: Effect, cx: &mut Context<Self>) {
         let shell = self.model.shell.clone();
         self.foundation.update(cx, |view, cx| view.adopt(shell, effect, cx));
+    }
+
+    pub(crate) fn apply_effect(&mut self, effect: Effect, cx: &mut Context<Self>) {
+        self.adopt_shell(effect, cx);
         if matches!(self.model.shell.resolved_theme(), crate::app::ResolvedTheme::Dark) {
             Theme::change(ThemeMode::Dark, None, cx);
         } else if self.model.shell.theme != crate::app::ThemePreference::System {
@@ -142,10 +175,11 @@ impl Workbench {
         self.booted = true;
         let services = Arc::clone(&self.services);
         let legacy = legacy_webview_root();
+        let platform = host_platform();
         let view = cx.entity().downgrade();
         let (tx, rx) = tokio::sync::oneshot::channel();
         jobs::runtime().spawn(async move {
-            let startup = super::model::load_startup(&services, legacy.as_deref()).await;
+            let startup = super::model::load_startup(&services, legacy.as_deref(), platform).await;
             let _ = tx.send(startup);
         });
         cx.spawn(async move |_, cx| {
@@ -176,9 +210,13 @@ impl Workbench {
     }
 
     fn pump_jobs(&mut self, cx: &mut Context<Self>) {
-        let Some(job) = self.model.take_pending() else {
-            return;
-        };
+        let jobs = self.model.drain_pending();
+        for job in jobs {
+            self.spawn_job(job, cx);
+        }
+    }
+
+    fn spawn_job(&mut self, job: PendingJob, cx: &mut Context<Self>) {
         let owner: &'static str = match job {
             PendingJob::RefreshHistory | PendingJob::SaveNamed | PendingJob::ClearHistory | PendingJob::DeleteRun | PendingJob::DeleteSaved => "history",
             _ => "connections",
@@ -227,6 +265,172 @@ impl Workbench {
         });
     }
 
+    fn prompt_dir(&self) -> std::path::PathBuf {
+        self.services
+            .state
+            .path()
+            .parent()
+            .map(|path| path.to_path_buf())
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(std::env::temp_dir)
+    }
+
+    fn prompt_import(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(SharedString::from(self.model.text("connections.page.importRillSql"))),
+        });
+        cx.spawn(async move |this, cx| {
+            let message = receiver.await;
+            cx.update(|cx| {
+                let _ = this.update(cx, |view, cx| view.finish_import_prompt(message, cx));
+            });
+        })
+        .detach();
+    }
+
+    fn prompt_export(&mut self, cx: &mut Context<Self>) {
+        let suggested = if self.model.bundle_passphrase.trim().is_empty() {
+            "rillsql-connections.json".to_owned()
+        } else {
+            "rillsql-connections.rillsqlcx".to_owned()
+        };
+        let directory = self.prompt_dir();
+        let receiver = cx.prompt_for_new_path(&directory, Some(&suggested));
+        cx.spawn(async move |this, cx| {
+            let message = receiver.await;
+            cx.update(|cx| {
+                let _ = this.update(cx, |view, cx| view.finish_export_prompt(message, cx));
+            });
+        })
+        .detach();
+    }
+
+    fn prompt_sqlite(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(SharedString::from(self.model.text("shell.command.openSqlite"))),
+        });
+        cx.spawn(async move |this, cx| {
+            let message = receiver.await;
+            cx.update(|cx| {
+                let _ = this.update(cx, |view, cx| view.finish_sqlite_prompt(message, cx));
+            });
+        })
+        .detach();
+    }
+
+    fn finish_import_prompt<E: std::fmt::Display>(
+        &mut self,
+        message: Result<Result<Option<Vec<std::path::PathBuf>>, E>, futures::channel::oneshot::Canceled>,
+        cx: &mut Context<Self>,
+    ) {
+        match message {
+            Ok(Ok(Some(paths))) => {
+                if let Some(path) = paths.into_iter().next() {
+                    match crate::app::accept_open_path(&path) {
+                        Ok(path) => {
+                            self.model.import_path = Some(path.display().to_string());
+                            let _ = self.model.dispatch("conn-import");
+                        }
+                        Err(error) => {
+                            self.model.notice_key = Some("connections.page.importRillSql");
+                            self.model.notice_detail = error;
+                        }
+                    }
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                self.model.notice_key = Some("connections.page.importRillSql");
+                self.model.notice_detail = error.to_string();
+            }
+            Err(error) => {
+                self.model.notice_key = Some("connections.page.importRillSql");
+                self.model.notice_detail = error.to_string();
+            }
+        }
+        self.persist_if_needed();
+        cx.notify();
+    }
+
+    fn finish_export_prompt<E: std::fmt::Display>(
+        &mut self,
+        message: Result<Result<Option<std::path::PathBuf>, E>, futures::channel::oneshot::Canceled>,
+        cx: &mut Context<Self>,
+    ) {
+        match message {
+            Ok(Ok(Some(path))) => match crate::app::accept_save_path(&path) {
+                Ok(path) => {
+                    self.model.export_path = Some(path.display().to_string());
+                    let _ = self.model.dispatch("conn-export");
+                }
+                Err(error) => {
+                    self.model.notice_key = Some("connections.page.exportButton");
+                    self.model.notice_detail = error;
+                }
+            },
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                self.model.notice_key = Some("connections.page.exportButton");
+                self.model.notice_detail = error.to_string();
+            }
+            Err(error) => {
+                self.model.notice_key = Some("connections.page.exportButton");
+                self.model.notice_detail = error.to_string();
+            }
+        }
+        self.persist_if_needed();
+        cx.notify();
+    }
+
+    fn finish_sqlite_prompt<E: std::fmt::Display>(
+        &mut self,
+        message: Result<Result<Option<Vec<std::path::PathBuf>>, E>, futures::channel::oneshot::Canceled>,
+        cx: &mut Context<Self>,
+    ) {
+        match message {
+            Ok(Ok(Some(paths))) => {
+                if let Some(path) = paths.into_iter().next() {
+                    match crate::app::accept_open_path(&path) {
+                        Ok(path) => self.apply_sqlite_path(path),
+                        Err(error) => {
+                            self.model.notice_key = Some("connections.validate.chooseFile");
+                            self.model.notice_detail = error;
+                        }
+                    }
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                self.model.notice_key = Some("connections.validate.chooseFile");
+                self.model.notice_detail = error.to_string();
+            }
+            Err(error) => {
+                self.model.notice_key = Some("connections.validate.chooseFile");
+                self.model.notice_detail = error.to_string();
+            }
+        }
+        self.persist_if_needed();
+        cx.notify();
+    }
+
+    fn apply_sqlite_path(&mut self, path: std::path::PathBuf) {
+        self.model.shell.note_opened(path.clone());
+        let mut draft = blank_draft(Engine::Sqlite);
+        draft.file_path = path.display().to_string();
+        draft.name = path.file_stem().and_then(|name| name.to_str()).unwrap_or("sqlite").to_owned();
+        self.model.connections.editor = Some(draft);
+        self.model.connections.issues.clear();
+        self.model.shell.page = AppPage::Connections;
+        self.model.focused_field = Some(DraftField::File);
+        let _ = self.model.dispatch("conn-save");
+    }
+
 }
 
 impl Focusable for Workbench {
@@ -241,17 +445,17 @@ impl Render for Workbench {
         self.measure(window);
         self.boot_state(cx);
         self.pump_jobs(cx);
-        let pad = px(self.model.shell.density.control_padding() as f32);
-        let layout = self.model.layout();
+        let frame = self.model.painted();
+        let pad = px(frame.pad as f32);
         let entity = cx.entity();
         let focus = self.field_focus.clone();
         let page = self.model.shell.page;
         let welcome = self.model.show_welcome();
-        let sidebar = self.model.shell.sidebar_open;
         let palette = self.model.shell.palette_open;
         let help = self.model.shell.help_open;
         let menu_open = self.model.menu.is_some();
         let prompt = self.model.close_prompt.is_some();
+        let confirm_delete = self.model.connections.confirm_delete;
         let foundation = self.foundation.clone();
         let bar = self.bar;
         let dark = matches!(self.model.shell.resolved_theme(), crate::app::ResolvedTheme::Dark);
@@ -263,6 +467,10 @@ impl Render for Workbench {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && this.model.connections.confirm_delete && this.model.menu.is_none() && this.model.close_prompt.is_none() {
+                    this.perform("conn-delete-cancel", cx);
+                    return;
+                }
                 if let Some(nav) = nav_key(&event.keystroke.key) {
                     if this.model.menu.is_some() || this.model.close_prompt.is_some() || this.model.shell.palette_open {
                         let _ = this.model.key(nav);
@@ -275,18 +483,20 @@ impl Render for Workbench {
             .child(
                 div()
                     .id("workbench-body")
+                    .relative()
                     .flex()
                     .flex_1()
-                    .w(px(layout.width as f32))
+                    .w(px(frame.body_width as f32))
+                    .overflow_hidden()
                     .child(activity(entity.clone(), &self.model))
-                    .when(sidebar, |this| this.child(sidebar_pane(entity.clone(), &self.model)))
+                    .when(frame.sidebar_in_flex, |this| this.child(sidebar_pane(entity.clone(), &self.model)))
                     .child(
                         div()
                             .id("workbench-content")
                             .flex()
                             .flex_col()
                             .flex_1()
-                            .w(px(layout.content_width as f32))
+                            .w(px(frame.content_width as f32))
                             .overflow_hidden()
                             .child(tab_strip(entity.clone(), &self.model))
                             .when(page == AppPage::Connections, |this| this.child(connections_page(entity.clone(), focus.clone(), &self.model)))
@@ -311,12 +521,25 @@ impl Render for Workbench {
                                         .child(foundation),
                                 )
                             }),
-                    ),
+                    )
+                    .when(frame.sidebar_overlay, |this| {
+                        this.child(
+                            div()
+                                .id("sidebar-overlay")
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left(px(frame.activity_width as f32))
+                                .w(px(frame.sidebar_width as f32))
+                                .child(sidebar_pane(entity.clone(), &self.model)),
+                        )
+                    }),
             )
             .child(status_bar(&self.model, dark))
             .when(palette || help, |this| this.child(palette_layer(entity.clone(), focus.clone(), &self.model)))
             .when(menu_open, |this| this.child(context_layer(entity.clone(), &self.model)))
-            .when(prompt, |this| this.child(close_layer(entity, &self.model)))
+            .when(prompt, |this| this.child(close_layer(entity.clone(), &self.model)))
+            .when(confirm_delete, |this| this.child(delete_layer(entity, &self.model)))
             .p(pad)
     }
 }
@@ -433,11 +656,14 @@ fn label_key_for(id: &str) -> &'static str {
 }
 
 fn toolbar(entity: Entity<Workbench>, model: &WorkbenchModel) -> impl IntoElement {
+    let frame = model.painted();
     div()
         .id("toolbar")
         .role(gpui_kit::Role::Toolbar)
         .aria_label(SharedString::from(model.text("shell.command.newQuery")))
         .flex()
+        .w(px(frame.body_width as f32))
+        .when(frame.toolbar_wrap, |this| this.flex_wrap())
         .gap(px(8.))
         .child(command_button("new-query", "shell.command.newQuery", entity.clone(), model))
         .child(command_button("execute-query", "shell.command.execute", entity.clone(), model))
@@ -551,7 +777,11 @@ fn tab_strip(entity: Entity<Workbench>, model: &WorkbenchModel) -> impl IntoElem
 }
 
 fn status_bar(model: &WorkbenchModel, dark: bool) -> impl IntoElement {
-    let notice = model.notice_key.map(|key| model.text(key)).unwrap_or_else(|| model.text("shell.statusbar.noTarget"));
+    let notice = match model.notice_key {
+        Some(key) if !model.notice_detail.is_empty() => format!("{} {}", model.text(key), model.notice_detail),
+        Some(key) => model.text(key),
+        None => model.text("shell.statusbar.noTarget"),
+    };
     let summary = format!("{} {} {}", model.shell.locale.code(), if dark { "dark" } else { "light" }, notice);
     div()
         .id("status")
@@ -657,6 +887,19 @@ fn close_layer(entity: Entity<Workbench>, model: &WorkbenchModel) -> impl IntoEl
         .child(leave_button(entity, model))
 }
 
+fn delete_layer(entity: Entity<Workbench>, model: &WorkbenchModel) -> impl IntoElement {
+    div()
+        .id("delete-connection")
+        .role(gpui_kit::Role::Dialog)
+        .aria_label(SharedString::from(model.text("connections.deleteDialog.title")))
+        .flex()
+        .flex_col()
+        .child(SharedString::from(model.text("connections.deleteDialog.title")))
+        .child(SharedString::from(model.text("connections.deleteDialog.willKeepDb")))
+        .child(command_button("conn-delete-cancel", "common.cancel", entity.clone(), model))
+        .child(command_button("conn-delete-confirm", "connections.deleteDialog.confirm", entity, model))
+}
+
 fn leave_button(entity: Entity<Workbench>, model: &WorkbenchModel) -> impl IntoElement {
     let label = SharedString::from(model.text("shell.closeGuard.leave"));
     div()
@@ -693,7 +936,11 @@ fn connections_page(entity: Entity<Workbench>, focus: FocusHandle, model: &Workb
         .child(field_box(entity.clone(), focus.clone(), DraftField::Url, model.text("connections.editor.newTitle"), model.url_buffer.clone(), false))
         .child(command_button("conn-apply-url", "connections.editor.newTitle", entity.clone(), model))
         .child(command_button("conn-import", "connections.page.importRillSql", entity.clone(), model))
-        .child(command_button("conn-export", "connections.page.exportButton", entity.clone(), model));
+        .child(command_button("conn-export", "connections.page.exportButton", entity.clone(), model))
+        .child(field_box(entity.clone(), focus.clone(), DraftField::BundlePassphrase, model.text("connections.exportDialog.passphrase"), model.bundle_passphrase.clone(), true));
+    for note in &model.import_notes {
+        page = page.child(SharedString::from(format!("{} {}", model.text("connections.importReport.skippedTitle"), note)));
+    }
     for engine in engines() {
         let id = format!("conn-engine:{}", engine.as_str());
         page = page.child(command_button(&id, "connections.editor.newTitle", entity.clone(), model));
@@ -748,12 +995,33 @@ fn connections_page(entity: Entity<Workbench>, focus: FocusHandle, model: &Workb
             .child(field_box(entity.clone(), focus.clone(), DraftField::Password, model.text("connections.page.note"), String::new(), true))
             .child(command_button("conn-tls-cycle", "connections.editor.tls.title", entity.clone(), model))
             .child(command_button("conn-ssh-toggle", "connections.editor.ssh.title", entity.clone(), model))
+            .child(command_button("conn-ca-mode", "connections.editor.tls.caLabel", entity.clone(), model))
+            .child(SharedString::from(model.text(if draft.ca_mode == crate::connections::model::CaMode::File {
+                "connections.editor.tls.caFile"
+            } else {
+                "connections.editor.tls.caSystem"
+            })))
             .child(field_box(entity.clone(), focus.clone(), DraftField::CaFile, model.text("connections.validate.caFileRequired"), draft.ca_file.clone(), false))
+            .child(field_box(entity.clone(), focus.clone(), DraftField::ClientCert, model.text("connections.editor.tls.clientCert"), draft.client_cert.clone(), false))
+            .child(field_box(entity.clone(), focus.clone(), DraftField::ClientKey, model.text("connections.editor.tls.clientKey"), draft.client_key.clone(), false))
+            .child(field_box(entity.clone(), focus.clone(), DraftField::Replica, model.text("connections.editor.replicaSet"), draft.replica_set.clone(), false))
+            .child(command_button("conn-ssh-auth", "connections.editor.ssh.authLabel", entity.clone(), model))
+            .child(SharedString::from(model.text(if draft.ssh_auth == crate::connections::model::SshAuthKind::Password {
+                "connections.editor.ssh.authPassword"
+            } else {
+                "connections.editor.ssh.authKey"
+            })))
             .child(field_box(entity.clone(), focus.clone(), DraftField::SshHost, model.text("connections.validate.sshHostRequired"), draft.ssh_host.clone(), false))
+            .child(field_box(entity.clone(), focus.clone(), DraftField::SshPort, model.text("connections.editor.ssh.port"), draft.ssh_port.clone(), false))
             .child(field_box(entity.clone(), focus.clone(), DraftField::SshUser, model.text("connections.validate.sshUserRequired"), draft.ssh_user.clone(), false))
-            .child(field_box(entity.clone(), focus.clone(), DraftField::SshPassword, model.text("connections.editor.ssh.title"), String::new(), true))
-            .child(field_box(entity.clone(), focus, DraftField::Passphrase, model.text("connections.editor.ssh.title"), String::new(), true))
-            .child(command_button("conn-env-cycle", "connections.page.note", entity.clone(), model))
+            .child(field_box(entity.clone(), focus.clone(), DraftField::SshKey, model.text("connections.editor.ssh.keyFile"), draft.ssh_key.clone(), false))
+            .child(field_box(entity.clone(), focus.clone(), DraftField::SshPassword, model.text("connections.editor.ssh.authPassword"), model.connections.secrets.ssh_password.clone(), true))
+            .child(field_box(entity.clone(), focus, DraftField::Passphrase, model.text("connections.editor.ssh.title"), model.connections.secrets.ssh_passphrase.clone(), true))
+            .child(command_button("conn-env-cycle", "connections.page.note", entity.clone(), model));
+        for issue in &model.connections.issues {
+            page = page.child(SharedString::from(model.text(issue.key)));
+        }
+        page = page
             .child(command_button("conn-save", "common.save", entity.clone(), model))
             .child(command_button("conn-test", "connections.editor.test.button", entity.clone(), model))
             .child(command_button("conn-connect", "connections.page.connect", entity.clone(), model))
@@ -909,6 +1177,31 @@ fn welcome_page(entity: Entity<Workbench>, model: &WorkbenchModel) -> impl IntoE
                 }),
         );
     }
+    for item in model.welcome.saved(&model.history.saved) {
+        let saved = item.clone();
+        let label = SharedString::from(item.name.clone());
+        let entity_click = entity.clone();
+        page = page.child(
+            div()
+                .id(SharedString::from(format!("welcome-saved-{}", saved.id)))
+                .role(gpui_kit::Role::Button)
+                .aria_label(label.clone())
+                .child(label)
+                .on_click(move |_, _, cx| {
+                    let saved = saved.clone();
+                    entity_click
+                        .update(cx, |this, cx| {
+                            let known = this.model.known_ids();
+                            let plan = this.model.welcome.open_saved(&saved, &known);
+                            this.model.history.section = crate::app::views::history::HistorySection::Saved;
+                            this.model.history.selected_saved = Some(saved.id.clone());
+                            this.model.apply_load(plan);
+                            cx.notify();
+                        })
+                        ;
+                }),
+        );
+    }
     page
 }
 
@@ -967,16 +1260,63 @@ fn typed_text(event: &gpui_kit::KeyDownEvent) -> Option<String> {
     }
 }
 
-pub fn legacy_webview_root() -> Option<std::path::PathBuf> {
+pub fn host_platform() -> Platform {
+    if cfg!(target_os = "macos") {
+        Platform::Macos
+    } else if cfg!(target_os = "linux") {
+        Platform::Linux
+    } else {
+        Platform::Windows
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LegacyRoots {
+    pub platform: Platform,
+    pub home: std::path::PathBuf,
+    pub local_app_data: Option<std::path::PathBuf>,
+    pub roaming_app_data: Option<std::path::PathBuf>,
+    pub xdg_data_home: Option<std::path::PathBuf>,
+}
+
+pub fn legacy_webview_root_from(roots: &LegacyRoots) -> Option<std::path::PathBuf> {
     let id = "app.rillsql.desktop";
-    let mut bases = Vec::new();
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        bases.push(std::path::PathBuf::from(local));
+    match roots.platform {
+        Platform::Windows => {
+            let mut bases = Vec::new();
+            if let Some(local) = &roots.local_app_data {
+                bases.push(local.clone());
+            }
+            if let Some(roaming) = &roots.roaming_app_data {
+                bases.push(roaming.clone());
+            }
+            bases.into_iter().map(|base| base.join(id)).find(|path| path.is_dir())
+        }
+        Platform::Macos => {
+            let root = roots.home.join("Library").join("WebKit").join(id);
+            root.is_dir().then_some(root)
+        }
+        Platform::Linux => {
+            let base = roots.xdg_data_home.clone().unwrap_or_else(|| roots.home.join(".local").join("share"));
+            let webkit = base.join("webkitgtk").join(id);
+            let app = base.join(id);
+            [webkit, app].into_iter().find(|path| path.is_dir())
+        }
     }
-    if let Some(roaming) = std::env::var_os("APPDATA") {
-        bases.push(std::path::PathBuf::from(roaming));
-    }
-    bases.into_iter().map(|base| base.join(id)).find(|path| path.is_dir())
+}
+
+pub fn legacy_webview_root() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    legacy_webview_root_from(&LegacyRoots {
+        platform: host_platform(),
+        home,
+        local_app_data: std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from),
+        roaming_app_data: std::env::var_os("APPDATA").map(std::path::PathBuf::from),
+        xdg_data_home: std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from),
+    })
 }
 
 #[allow(dead_code)]

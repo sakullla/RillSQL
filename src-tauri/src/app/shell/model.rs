@@ -1,6 +1,6 @@
 //! 外壳状态。命令、菜单、快捷键和页面动作都从 `dispatch` 进入。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
 
 use crate::app::views::connections::{blank_draft, ConnectionPage, Secrets};
@@ -10,12 +10,12 @@ use crate::app::views::welcome::WelcomePage;
 use crate::app::{AppPage, CommandSpec, Density, Effect, FocusTarget, Locale, Shell, ThemePreference, COMMANDS};
 use crate::application::tasks::TaskToken;
 use crate::application::{AppServices, TaskBoard};
-use crate::connections::model::Engine;
+use crate::connections::model::{CaMode, Engine, SshAuthKind};
 use crate::i18n;
-use crate::state::{AppState, SessionState, SessionTab, ShellSettings, StateError};
+use crate::state::{AppState, Platform, SessionState, SessionTab, ShellSettings, StateError};
 
 use super::close::{draft_pending, evaluate, message_key, update_block_key, CloseFacts, CloseKind, CloseScope};
-use super::layout::{layout_for, unbreakable_px, ChromeLayout};
+use super::layout::{layout_for, painted_frame, unbreakable_px, ChromeLayout, PaintedFrame};
 use super::menus::{MenuPlace, MenuTarget, NavKey, OpenMenu};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +58,7 @@ pub enum DraftField {
     HistorySearch,
     SaveName,
     PaletteQuery,
+    BundlePassphrase,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,11 +108,13 @@ pub struct WorkbenchModel {
     pub executions: u32,
     pub loads: u32,
     pub commands: Vec<String>,
-    pub pending: Option<PendingJob>,
+    pub pending: VecDeque<PendingJob>,
     pub focused_field: Option<DraftField>,
     pub url_buffer: String,
     pub export_path: Option<String>,
     pub import_path: Option<String>,
+    pub bundle_passphrase: String,
+    pub import_notes: Vec<String>,
     pub grid_writable: bool,
     pub startup_warning: Option<String>,
 }
@@ -142,11 +145,13 @@ impl WorkbenchModel {
             executions: 0,
             loads: 0,
             commands: Vec::new(),
-            pending: None,
+            pending: VecDeque::new(),
             focused_field: None,
             url_buffer: String::new(),
             export_path: None,
             import_path: None,
+            bundle_passphrase: String::new(),
+            import_notes: Vec::new(),
             grid_writable: false,
             startup_warning: None,
         }
@@ -170,6 +175,10 @@ impl WorkbenchModel {
 
     pub fn layout(&self) -> ChromeLayout {
         layout_for(self.viewport_width, self.shell.sidebar_open)
+    }
+
+    pub fn painted(&self) -> PaintedFrame {
+        painted_frame(self.viewport_width, self.shell.sidebar_open, self.shell.density.control_padding())
     }
 
     pub fn set_width(&mut self, width: i32) {
@@ -257,9 +266,21 @@ impl WorkbenchModel {
             "conn-edit" => self.connections.edit_selected(),
             "conn-duplicate" => self.connections.duplicate_selected(),
             "conn-delete" => {
-                if self.connections.request_delete() {
+                if self.connections.arm_delete() {
+                    self.notice_key = Some("connections.deleteDialog.title");
+                    self.notice_detail.clear();
+                }
+            }
+            "conn-delete-confirm" => {
+                self.connections.confirm_delete = false;
+                if self.connections.selected.is_some() {
                     self.enqueue(PendingJob::DeleteConnection);
                 }
+            }
+            "conn-delete-cancel" => {
+                self.connections.confirm_delete = false;
+                self.notice_key = Some("common.cancel");
+                self.notice_detail.clear();
             }
             "conn-test" => {
                 if self.connections.selected.is_some() {
@@ -280,13 +301,28 @@ impl WorkbenchModel {
                 self.connections.issues = self.connections.validate();
                 if self.connections.editor.is_some() && self.connections.issues.is_empty() {
                     self.enqueue(PendingJob::SaveConnection);
+                } else if let Some(issue) = self.connections.issues.first() {
+                    self.notice_key = Some(issue.key);
+                    self.notice_detail = issue.field.clone();
                 } else {
-                    self.notice_key = Some("connections.validate.hostRequired");
+                    self.notice_key = Some("connections.editor.newTitle");
                 }
             }
             "conn-refresh" => self.enqueue(PendingJob::RefreshConnections),
-            "conn-export" => self.enqueue(PendingJob::ExportConnections),
-            "conn-import" => self.enqueue(PendingJob::ImportConnections),
+            "conn-export" => {
+                if self.export_path.is_some() {
+                    self.enqueue(PendingJob::ExportConnections);
+                } else {
+                    self.notice_key = Some("connections.page.exportButton");
+                }
+            }
+            "conn-import" => {
+                if self.import_path.is_some() {
+                    self.enqueue(PendingJob::ImportConnections);
+                } else {
+                    self.notice_key = Some("connections.page.importRillSql");
+                }
+            }
             "conn-apply-url" => {
                 if let Err(key) = self.connections.apply_url(&self.url_buffer) {
                     self.notice_key = Some(key);
@@ -295,6 +331,8 @@ impl WorkbenchModel {
             "conn-filter-engine" => self.connections.cycle_engine_filter(),
             "conn-tls-cycle" => self.connections.cycle_tls(),
             "conn-ssh-toggle" => self.connections.toggle_ssh(),
+            "conn-ssh-auth" => self.connections.cycle_ssh_auth(),
+            "conn-ca-mode" => self.connections.cycle_ca_mode(),
             "conn-env-cycle" => self.connections.cycle_env(),
             "menu-object" => self.open_tree_menu(false),
             "menu-object-item" => self.open_tree_menu(true),
@@ -408,11 +446,19 @@ impl WorkbenchModel {
 
     fn enqueue(&mut self, job: PendingJob) {
         self.running_jobs = self.running_jobs.saturating_add(1);
-        self.pending = Some(job);
+        self.pending.push_back(job);
     }
 
     pub fn take_pending(&mut self) -> Option<PendingJob> {
-        self.pending.take()
+        self.pending.pop_front()
+    }
+
+    pub fn drain_pending(&mut self) -> Vec<PendingJob> {
+        self.pending.drain(..).collect()
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
     }
 
     pub fn finish_job(&mut self) {
@@ -812,8 +858,16 @@ impl WorkbenchModel {
         self.focused_field = Some(field);
         match field {
             DraftField::Password => self.connections.secrets.password = value,
-            DraftField::SshPassword => self.connections.secrets.ssh_password = value,
+            DraftField::SshPassword => {
+                self.connections.secrets.ssh_password = value.clone();
+                if !value.trim().is_empty() {
+                    if let Some(draft) = self.connections.editor.as_mut() {
+                        draft.ssh_auth = SshAuthKind::Password;
+                    }
+                }
+            }
             DraftField::Passphrase => self.connections.secrets.ssh_passphrase = value,
+            DraftField::BundlePassphrase => self.bundle_passphrase = value,
             DraftField::Url => self.url_buffer = value,
             DraftField::Filter => self.connections.filter_text = value,
             DraftField::HistorySearch => self.history.filter_text = value,
@@ -821,8 +875,10 @@ impl WorkbenchModel {
             DraftField::PaletteQuery => self.palette_query = value,
             other => {
                 if let Some(draft) = self.connections.editor.as_mut() {
-                    let slot = field_slot(draft, other);
-                    *slot = value;
+                    *field_slot(draft, other) = value;
+                    if other == DraftField::CaFile && !draft.ca_file.trim().is_empty() {
+                        draft.ca_mode = CaMode::File;
+                    }
                 }
             }
         }
@@ -847,6 +903,7 @@ impl WorkbenchModel {
             DraftField::Password => self.connections.secrets.password.clone(),
             DraftField::SshPassword => self.connections.secrets.ssh_password.clone(),
             DraftField::Passphrase => self.connections.secrets.ssh_passphrase.clone(),
+            DraftField::BundlePassphrase => self.bundle_passphrase.clone(),
             DraftField::Url => self.url_buffer.clone(),
             DraftField::Filter => self.connections.filter_text.clone(),
             DraftField::HistorySearch => self.history.filter_text.clone(),
@@ -936,7 +993,30 @@ impl WorkbenchModel {
 
     fn page_keys(&self) -> Vec<&'static str> {
         match self.shell.page {
-            AppPage::Connections => vec!["connections.editor.newTitle", "connections.editor.tls.title", "connections.editor.ssh.title", "connections.editor.test.button", "connections.page.importRillSql", "connections.page.exportButton"],
+            AppPage::Connections => vec![
+                "connections.editor.newTitle",
+                "connections.editor.tls.title",
+                "connections.editor.ssh.title",
+                "connections.editor.test.button",
+                "connections.page.importRillSql",
+                "connections.page.exportButton",
+                "connections.editor.ssh.authLabel",
+                "connections.editor.ssh.authKey",
+                "connections.editor.ssh.authPassword",
+                "connections.editor.ssh.keyFile",
+                "connections.editor.ssh.port",
+                "connections.editor.tls.caLabel",
+                "connections.editor.tls.caSystem",
+                "connections.editor.tls.caFile",
+                "connections.editor.tls.clientCert",
+                "connections.editor.tls.clientKey",
+                "connections.editor.replicaSet",
+                "connections.exportDialog.passphrase",
+                "connections.importReport.skippedTitle",
+                "connections.deleteDialog.title",
+                "connections.deleteDialog.confirm",
+                "connections.deleteDialog.willKeepDb",
+            ],
             AppPage::History => vec!["history.page.runs", "history.page.saved", "history.page.loadToEditor", "history.savedPanel.save"],
             AppPage::Settings => vec![
                 "shell.settings.theme",
@@ -1166,7 +1246,7 @@ pub struct Startup {
     pub warning_detail: String,
 }
 
-pub async fn load_startup(services: &AppServices, legacy: Option<&Path>) -> Startup {
+pub async fn load_startup(services: &AppServices, legacy: Option<&Path>, platform: Platform) -> Startup {
     let path = services.state.path();
     if path.exists() {
         return match services.load_state().await {
@@ -1179,13 +1259,6 @@ pub async fn load_startup(services: &AppServices, legacy: Option<&Path>) -> Star
         };
     }
     if let Some(root) = legacy {
-        let platform = if cfg!(target_os = "macos") {
-            crate::state::Platform::Macos
-        } else if cfg!(target_os = "linux") {
-            crate::state::Platform::Linux
-        } else {
-            crate::state::Platform::Windows
-        };
         let report = services.import_legacy(root, platform).await;
         if report.wrote_state {
             if let Ok(state) = services.load_state().await {

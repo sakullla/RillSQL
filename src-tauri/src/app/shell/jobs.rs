@@ -24,6 +24,7 @@ pub struct JobRequest {
     pub selected: Option<String>,
     pub export_path: Option<String>,
     pub import_path: Option<String>,
+    pub bundle_passphrase: Option<String>,
     pub save: Option<SaveRequest>,
     pub run_id: Option<String>,
     pub saved_id: Option<String>,
@@ -35,6 +36,7 @@ pub enum JobDone {
     Open(TaskToken, Result<crate::connections::OpenOutcome, String>),
     Disconnect(TaskToken, String),
     Notice(TaskToken, Result<String, String>),
+    Imported(TaskToken, Result<(Vec<crate::connections::ConnectionRecord>, usize, Vec<String>), String>),
     History(TaskToken, Result<(Vec<HistoryEntry>, Vec<SavedQuery>), String>),
 }
 
@@ -56,6 +58,10 @@ pub fn job_request(model: &WorkbenchModel, job: PendingJob, token: TaskToken) ->
         selected: model.connections.selected.clone(),
         export_path: model.export_path.clone(),
         import_path: model.import_path.clone(),
+        bundle_passphrase: {
+            let trimmed = model.bundle_passphrase.trim();
+            if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) }
+        },
         save,
         run_id: model.history.selected_run.clone(),
         saved_id: model.history.selected_saved.clone(),
@@ -132,7 +138,7 @@ pub async fn execute_job(services: &AppServices, request: JobRequest) -> JobDone
             let Some(path) = request.export_path else {
                 return JobDone::Notice(token, Err("connections.page.exportButton".into()));
             };
-            match connections::export_rows(services, None, None, PathBuf::from(path).as_path()).await {
+            match connections::export_rows(services, None, request.bundle_passphrase.as_deref(), PathBuf::from(path).as_path()).await {
                 Ok(count) => JobDone::Notice(token, Ok(count.to_string())),
                 Err(err) => JobDone::Notice(token, Err(err)),
             }
@@ -141,12 +147,9 @@ pub async fn execute_job(services: &AppServices, request: JobRequest) -> JobDone
             let Some(path) = request.import_path else {
                 return JobDone::Notice(token, Err("connections.page.importRillSql".into()));
             };
-            match connections::import_rows(services, PathBuf::from(path).as_path(), None).await {
+            match connections::import_rows(services, PathBuf::from(path).as_path(), request.bundle_passphrase.as_deref()).await {
                 Ok((count, skipped)) => match connections::list_rows(services).await {
-                    Ok(rows) => {
-                        let _ = (count, skipped);
-                        JobDone::Rows(token, Ok(rows))
-                    }
+                    Ok(rows) => JobDone::Imported(token, Ok((rows, count, skipped))),
                     Err(err) => JobDone::Notice(token, Err(err)),
                 },
                 Err(err) => JobDone::Notice(token, Err(err)),
@@ -214,6 +217,25 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
             if accepted(services, owner, token) {
                 model.notice_detail = detail;
                 model.notice_key = Some("common.save");
+            }
+        }
+        JobDone::Imported(token, Ok((rows, count, skipped))) => {
+            if owner == "connections" && model.connections.accept_list(&services.tasks, token, rows) {
+                model.welcome.has_connections = !model.connections.rows.is_empty();
+                model.import_notes = skipped.clone();
+                if skipped.is_empty() {
+                    model.notice_key = Some("connections.page.importRillSql");
+                    model.notice_detail = count.to_string();
+                } else {
+                    model.notice_key = Some("connections.importReport.skippedTitle");
+                    model.notice_detail = skipped.join("\n");
+                }
+            }
+        }
+        JobDone::Imported(token, Err(detail)) => {
+            if owner == "connections" && model.connections.accept_notice(&services.tasks, token, detail.clone()) {
+                model.notice_key = Some(static_notice(&detail));
+                model.notice_detail = model.connections.message_detail.clone();
             }
         }
         JobDone::Test(token, report) => {

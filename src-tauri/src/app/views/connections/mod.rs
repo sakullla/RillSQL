@@ -192,15 +192,13 @@ impl ConnectionPage {
         self.issues.clear();
     }
 
-    pub fn request_delete(&mut self) -> bool {
+    /// 只打开确认，不因为再次调用就放行删除。
+    pub fn arm_delete(&mut self) -> bool {
         if self.selected.is_none() {
             return false;
         }
-        if !self.confirm_delete {
-            self.confirm_delete = true;
-            self.message_key = Some("connections.deleteDialog.title");
-            return false;
-        }
+        self.confirm_delete = true;
+        self.message_key = Some("connections.deleteDialog.title");
         true
     }
 
@@ -248,6 +246,22 @@ impl ConnectionPage {
         if let Some(draft) = self.editor.as_mut() {
             draft.ssh_on = !draft.ssh_on;
         }
+    }
+
+    pub fn cycle_ssh_auth(&mut self) {
+        let Some(draft) = self.editor.as_mut() else { return };
+        draft.ssh_auth = match draft.ssh_auth {
+            SshAuthKind::Key => SshAuthKind::Password,
+            SshAuthKind::Password => SshAuthKind::Key,
+        };
+    }
+
+    pub fn cycle_ca_mode(&mut self) {
+        let Some(draft) = self.editor.as_mut() else { return };
+        draft.ca_mode = match draft.ca_mode {
+            CaMode::System => CaMode::File,
+            CaMode::File => CaMode::System,
+        };
     }
 
     pub fn cycle_env(&mut self) {
