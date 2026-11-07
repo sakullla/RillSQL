@@ -314,6 +314,164 @@ fn live_redis_scans_filters_reads_ttl_rename_delete_and_confirms(cx: &mut TestAp
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[gpui_kit::test]
+fn confirm_keeps_the_target_opened_with(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-redis-snap-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+    let prefix = format!("rillsql:t8:snap-{}", uuid::Uuid::new_v4().simple());
+    let key_a = format!("{prefix}-a");
+    let key_b = format!("{prefix}-b");
+    let key_c = format!("{prefix}-c");
+    let key_d = format!("{prefix}-d");
+    let key_e = format!("{prefix}-e");
+    let _cleanup = RedisCleanup {
+        services: Arc::clone(&services),
+        id: "live-redis-snap".into(),
+        keys: vec![key_a.clone(), key_b.clone(), key_c.clone(), key_d.clone(), key_e.clone()],
+    };
+    if let Err(err) = block(open_redis(Arc::clone(&services), "live-redis-snap")) {
+        panic!("Redis 夹具没有连上：{err}");
+    }
+    if let Err(err) = block({
+        let services = Arc::clone(&services);
+        let pairs = vec![(key_a.clone(), "va".into()), (key_b.clone(), "vb".into()), (key_c.clone(), "vc".into()), (key_e.clone(), "ve".into())];
+        async move {
+            for (key, value) in pairs {
+                crate::application::redis::exec(services.connections.as_ref(), "live-redis-snap", "SET".into(), vec![key, value], true).await?;
+            }
+            Ok::<(), String>(())
+        }
+    }) {
+        panic!("临时键没有写入：{err}");
+    }
+    let (window, view) = open_pane(cx, Arc::clone(&services));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |pane, cx| pane.open_spec("live-redis-snap|快照|0", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(pump(cx, window, &view, |pane| !pane.running() && (pane.scan_done() || !pane.keys().is_empty() || !pane.error().is_empty())), "SCAN 没有返回");
+    assert_quiet(cx, &view);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |pane, _| pane.set_pattern(&format!("{prefix}*")));
+        window.render_frame(cx);
+        window.click("redis-filter", cx);
+    })
+    .unwrap();
+    assert!(pump_until_done(cx, window, &view), "临时键 SCAN 没有读完");
+    assert_quiet(cx, &view);
+
+    read_key(cx, window, &view, &key_c, "vc");
+    cx.update_window(window, |_, window, cx| {
+        window.click("redis-delete", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|app| {
+        let pane = view.read(app);
+        assert!(pane.confirm_open());
+        assert!(pane.confirm_prompt().contains(&key_c), "{}", pane.confirm_prompt());
+    });
+    cx.update_window(window, |_, window, cx| window.click("redis-cancel", cx)).unwrap();
+    cx.update(|app| assert!(!view.read(app).confirm_open()));
+    assert_eq!(redis_get(&services, &key_c).0, "bulk");
+
+    read_key(cx, window, &view, &key_a, "va");
+    cx.update_window(window, |_, window, cx| {
+        window.click("redis-delete", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let delete_prompt = cx.update(|app| view.read(app).confirm_prompt().to_owned());
+    assert!(delete_prompt.contains(&key_a), "{delete_prompt}");
+    click_listed(cx, window, &view, &key_b);
+    cx.update(|app| {
+        let pane = view.read(app);
+        assert_eq!(pane.selected(), key_a);
+        assert_eq!(pane.confirm_prompt(), delete_prompt);
+        assert!(pane.confirm_open());
+    });
+    cx.update_window(window, |_, window, cx| window.click("redis-confirm", cx)).unwrap();
+    assert!(pump(cx, window, &view, |pane| !pane.running() && (pane.note().contains("删除") || !pane.error().is_empty())), "删除确认没有返回");
+    assert_quiet(cx, &view);
+    assert_eq!(redis_get(&services, &key_a).0, "nil", "确认删成了别的键");
+    assert_eq!(redis_get(&services, &key_b).1.as_deref(), Some("vb"), "改选的键被删了");
+
+    let cancel_command = format!("DEL {key_e}");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |pane, _| pane.set_command(&cancel_command));
+        window.render_frame(cx);
+        window.click("redis-exec", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|app| {
+        let pane = view.read(app);
+        assert!(pane.confirm_open(), "{}", pane.status_line());
+        assert!(pane.confirm_prompt().contains("DEL"), "{}", pane.confirm_prompt());
+        assert!(pane.note().is_empty(), "{}", pane.note());
+    });
+    cx.update_window(window, |_, window, cx| window.click("redis-cancel", cx)).unwrap();
+    cx.update(|app| {
+        let pane = view.read(app);
+        assert!(!pane.confirm_open());
+        assert_eq!(pane.command_input(), cancel_command);
+    });
+    assert_eq!(redis_get(&services, &key_e).1.as_deref(), Some("ve"), "取消的 DEL 写进了 Redis");
+
+    let original = format!("SET {key_d} snapped");
+    let rewritten = format!("DEL {key_e}");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |pane, _| pane.set_command(&original));
+        window.render_frame(cx);
+        window.click("redis-exec", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let exec_prompt = cx.update(|app| {
+        let pane = view.read(app);
+        assert!(pane.confirm_open(), "{}", pane.status_line());
+        assert!(pane.confirm_prompt().contains("SET"), "{}", pane.confirm_prompt());
+        pane.confirm_prompt().to_owned()
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.click("redis-command", cx);
+        for _ in 0..original.chars().count() {
+            window.press("backspace", cx);
+        }
+        window.input(&rewritten, cx);
+    })
+    .unwrap();
+    cx.update(|app| {
+        let pane = view.read(app);
+        assert_eq!(pane.command_input(), original, "确认期间命令被改成了另一条");
+        assert_eq!(pane.confirm_prompt(), exec_prompt);
+        assert!(pane.confirm_open());
+    });
+    cx.update_window(window, |_, window, cx| window.click("redis-confirm", cx)).unwrap();
+    assert!(pump(cx, window, &view, |pane| !pane.running() && (pane.note().contains("已执行") || !pane.error().is_empty())), "命令确认没有返回");
+    assert_quiet(cx, &view);
+    assert_eq!(redis_get(&services, &key_d).1.as_deref(), Some("snapped"), "确认没有执行打开时的 SET");
+    assert_eq!(redis_get(&services, &key_e).1.as_deref(), Some("ve"), "确认执行了后改的 DEL");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn click_listed(cx: &mut TestAppContext, window: gpui_kit::AnyWindowHandle, view: &gpui_kit::Entity<RedisPane>, name: &str) {
+    let index = cx.update(|app| view.read(app).keys().iter().position(|key| key.name == name).unwrap_or(usize::MAX));
+    assert!(index < usize::MAX, "列表里没有 {name}");
+    let id = format!("redis-select:{index}");
+    cx.update_window(window, |_, window, cx| window.click(id, cx)).unwrap();
+}
+
+fn redis_get(services: &Arc<AppServices>, key: &str) -> (String, Option<String>) {
+    let services = Arc::clone(services);
+    let key = key.to_owned();
+    let outcome = block(async move { crate::application::redis::exec(services.connections.as_ref(), "live-redis-snap", "GET".into(), vec![key], false).await }).expect("GET");
+    (outcome.reply.kind.to_owned(), outcome.reply.text)
+}
+
 fn read_key(cx: &mut TestAppContext, window: gpui_kit::AnyWindowHandle, view: &gpui_kit::Entity<RedisPane>, name: &str, needle: &str) {
     let index = cx.update(|app| view.read(app).keys().iter().position(|key| key.name == name).unwrap_or(usize::MAX));
     assert!(index < usize::MAX, "列表里没有 {name}");
@@ -432,7 +590,7 @@ fn status_label(cx: &mut TestAppContext, window: gpui_kit::AnyWindowHandle) -> S
 fn open_pane(cx: &mut TestAppContext, services: Arc<AppServices>) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<RedisPane>) {
     cx.update(gpui_kit::init);
     cx.update(|cx| {
-        let bounds = gpui_kit::Bounds { origin: Point::default(), size: size(px(1200.), px(900.)) };
+        let bounds = gpui_kit::Bounds { origin: Point::default(), size: size(px(1200.), px(2400.)) };
         let (window, view) = gpui_kit::open_window(
             WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
             cx,

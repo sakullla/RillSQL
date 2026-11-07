@@ -21,11 +21,11 @@ enum Field {
     Command,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Confirm {
-    Delete,
-    Rename,
-    Exec,
+    Delete { key: String },
+    Rename { from: String, to: String },
+    Exec { command: String, args: Vec<String> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +54,7 @@ pub struct RedisPane {
     error: String,
     confirm: Option<Confirm>,
     confirm_prompt: String,
+    rename_landed: String,
     busy: bool,
     generation: u64,
     copied: String,
@@ -90,6 +91,7 @@ impl RedisPane {
             error: String::new(),
             confirm: None,
             confirm_prompt: String::new(),
+            rename_landed: String::new(),
             busy: false,
             generation: 0,
             copied: String::new(),
@@ -195,6 +197,10 @@ impl RedisPane {
         self.confirm.is_some()
     }
 
+    pub fn confirm_prompt(&self) -> &str {
+        &self.confirm_prompt
+    }
+
     pub fn detail_text(&self) -> String {
         self.detail.as_ref().map(|detail| format!("{} {}", detail.key_type, format_value(&detail.value, self.locale))).unwrap_or_default()
     }
@@ -237,10 +243,13 @@ impl RedisPane {
                 self.load_keys(cx);
             }
         } else if let Some(index) = id.strip_prefix("redis-select:") {
-            if let Ok(index) = index.parse::<usize>() {
-                if let Some(key) = self.keys.get(index) {
-                    let name = key.name.clone();
-                    self.select_key(name, cx);
+            // 确认已经钉住打开时的键，改选只留在列表上，不换这次删除或重命名的目标。
+            if self.confirm.is_none() {
+                if let Ok(index) = index.parse::<usize>() {
+                    if let Some(key) = self.keys.get(index) {
+                        let name = key.name.clone();
+                        self.select_key(name, cx);
+                    }
                 }
             }
         } else if id == "redis-ttl" {
@@ -384,8 +393,9 @@ impl RedisPane {
             self.show_error(self.text("redis.tab.needKey"));
             return;
         }
-        self.confirm = Some(Confirm::Delete);
-        self.confirm_prompt = i18n::fill(&self.text("redis.tab.deletePrompt"), &[("key", &self.selected)]);
+        let key = self.selected.clone();
+        self.confirm_prompt = i18n::fill(&self.text("redis.tab.deletePrompt"), &[("key", &key)]);
+        self.confirm = Some(Confirm::Delete { key });
         self.note.clear();
         self.error.clear();
     }
@@ -395,19 +405,20 @@ impl RedisPane {
             self.show_error(self.text("redis.tab.needKey"));
             return;
         }
-        let target = self.rename_to.trim().to_owned();
-        if target.is_empty() {
+        let from = self.selected.clone();
+        let to = self.rename_to.trim().to_owned();
+        if to.is_empty() {
             self.show_error(self.text("redis.tab.renameNeedName"));
             return;
         }
-        self.confirm = Some(Confirm::Rename);
-        self.confirm_prompt = i18n::fill(&self.text("redis.tab.renamePrompt"), &[("key", &self.selected), ("target", &target)]);
+        self.confirm_prompt = i18n::fill(&self.text("redis.tab.renamePrompt"), &[("key", &from), ("target", &to)]);
+        self.confirm = Some(Confirm::Rename { from, to });
         self.note.clear();
         self.error.clear();
     }
 
     fn ask_exec(&mut self, cx: &mut Context<Self>) {
-        let (command, _) = split_commandline(&self.command_input);
+        let (command, args) = split_commandline(&self.command_input);
         if command.is_empty() {
             self.show_error(self.text("redis.tab.emptyCommand"));
             return;
@@ -415,12 +426,12 @@ impl RedisPane {
         match exec::command_risk(&command) {
             CommandRisk::Blocked => self.show_error(self.text("redis.tab.keysRefused")),
             CommandRisk::Dangerous => {
-                self.confirm = Some(Confirm::Exec);
                 self.confirm_prompt = danger_prompt(self.locale, &command);
+                self.confirm = Some(Confirm::Exec { command, args });
                 self.note.clear();
                 self.error.clear();
             }
-            CommandRisk::Readonly => self.run_exec(false, cx),
+            CommandRisk::Readonly => self.exec_command(command, args, false, cx),
         }
     }
 
@@ -428,15 +439,14 @@ impl RedisPane {
         let action = self.confirm.take();
         self.confirm_prompt.clear();
         match action {
-            Some(Confirm::Delete) => self.run_delete(cx),
-            Some(Confirm::Rename) => self.run_rename(cx),
-            Some(Confirm::Exec) => self.run_exec(true, cx),
+            Some(Confirm::Delete { key }) => self.run_delete(key, cx),
+            Some(Confirm::Rename { from, to }) => self.run_rename(from, to, cx),
+            Some(Confirm::Exec { command, args }) => self.exec_command(command, args, true, cx),
             None => {}
         }
     }
 
-    fn run_delete(&mut self, cx: &mut Context<Self>) {
-        let key = self.selected.clone();
+    fn run_delete(&mut self, key: String, cx: &mut Context<Self>) {
         if key.is_empty() {
             self.show_error(self.text("redis.tab.needKey"));
             return;
@@ -467,13 +477,12 @@ impl RedisPane {
         }
     }
 
-    fn run_rename(&mut self, cx: &mut Context<Self>) {
-        let from = self.selected.clone();
-        let to = self.rename_to.trim().to_owned();
+    fn run_rename(&mut self, from: String, to: String, cx: &mut Context<Self>) {
         if from.is_empty() || to.is_empty() {
             self.show_error(self.text("redis.tab.renameNeedName"));
             return;
         }
+        self.rename_landed = to.clone();
         let connections = Arc::clone(&self.services.connections);
         let connection_id = self.connection_id.clone();
         self.spawn(
@@ -487,7 +496,7 @@ impl RedisPane {
     fn finish_rename(&mut self, result: Result<RenameOutcome, String>, cx: &mut Context<Self>) {
         match result {
             Ok(_) => {
-                let target = self.rename_to.trim().to_owned();
+                let target = std::mem::take(&mut self.rename_landed);
                 self.note = i18n::fill(&self.text("redis.tab.renamedNote"), &[("target", &target)]);
                 self.error.clear();
                 self.selected = target;
@@ -498,12 +507,14 @@ impl RedisPane {
                 self.follow = Follow::Read;
                 self.load_keys(cx);
             }
-            Err(message) => self.show_error(message),
+            Err(message) => {
+                self.rename_landed.clear();
+                self.show_error(message);
+            }
         }
     }
 
-    fn run_exec(&mut self, confirmed: bool, cx: &mut Context<Self>) {
-        let (command, args) = split_commandline(&self.command_input);
+    fn exec_command(&mut self, command: String, args: Vec<String>, confirmed: bool, cx: &mut Context<Self>) {
         if command.is_empty() {
             self.show_error(self.text("redis.tab.emptyCommand"));
             return;
@@ -634,6 +645,10 @@ impl RedisPane {
 
     fn apply_key(&mut self, field: Field, action: KeyAction, cx: &mut Context<Self>) {
         if self.focused != Some(field) {
+            return;
+        }
+        // 确认期间重命名框和命令框保持打开时的文本，避免确认落到后改的目标上。
+        if self.confirm.is_some() && matches!(field, Field::Rename | Field::Command) {
             return;
         }
         let slot = match field {
