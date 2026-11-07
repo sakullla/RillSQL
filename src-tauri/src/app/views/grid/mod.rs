@@ -114,6 +114,7 @@ impl GridPane {
         body(&mut self.session)
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn exchange_sheet(&self) -> (Option<TableRef>, Vec<String>, Vec<Vec<Option<String>>>, bool) {
         self.session.exchange_sheet()
     }
@@ -318,7 +319,7 @@ impl GridPane {
                 let _ = tx.send(result);
             });
             if let Ok(result) = rx.await {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             match result {
@@ -355,7 +356,7 @@ impl GridPane {
                 let _ = tx.send((described, paged, counted));
             });
             if let Ok((described, paged, counted)) = rx.await {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             if this.session.token != token {
@@ -401,7 +402,7 @@ impl GridPane {
         if self.scheduled == token || self.session.target.connection_id.is_empty() {
             return;
         }
-        let Ok(proof) = prove_single_table(&self.session.target.engine, &self.session.sql_text()) else {
+        let Ok(proof) = prove_single_table(&self.session.target.engine, self.session.sql_text()) else {
             return;
         };
         self.scheduled = token;
@@ -422,7 +423,7 @@ impl GridPane {
                 let _ = tx.send(result);
             });
             if let Ok(Ok(dto)) = rx.await {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             if let Ok(schema) = schema_from_dto(&dto) {
@@ -680,6 +681,7 @@ fn grid_button(id: &'static str, label: String, entity: Entity<GridPane>) -> imp
         })
 }
 
+#[derive(Default)]
 struct SheetDelegate {
     columns: Vec<(String, f32, bool)>,
     rows: Vec<Vec<String>>,
@@ -690,11 +692,6 @@ struct SheetDelegate {
     owner: Option<gpui_kit::WeakEntity<GridPane>>,
 }
 
-impl Default for SheetDelegate {
-    fn default() -> Self {
-        Self { columns: Vec::new(), rows: Vec::new(), has_more: false, loading: false, visible_start: 0, visible_seen: false, owner: None }
-    }
-}
 
 impl TableDelegate for SheetDelegate {
     fn columns_count(&self, _: &App) -> usize {
@@ -737,7 +734,7 @@ impl TableDelegate for SheetDelegate {
             return;
         };
         cx.spawn(async move |_, cx| {
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(owner) = owner.upgrade() {
                     owner.update(cx, |pane, cx| pane.load_next_page(cx));
                 }

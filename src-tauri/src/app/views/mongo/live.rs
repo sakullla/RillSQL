@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::{Point, TestAppContext, WindowBounds, WindowOptions, px, size};
 use gpui_kit::test::TestWindowExt;
+use gpui_kit::AppContext as _;
 
 use super::*;
 use crate::application::AppServices;
@@ -385,7 +386,7 @@ fn open_pane(cx: &mut TestAppContext, services: Arc<AppServices>) -> (gpui_kit::
             |_, cx| cx.new(|_| MongoPane::new(services)),
         )
         .expect("mongo pane");
-        (window.into(), view)
+        (window, view)
     })
 }
 
@@ -399,7 +400,7 @@ fn open_workbench(cx: &mut TestAppContext, services: Arc<AppServices>) -> (gpui_
             |window, cx| cx.new(|cx| crate::app::shell::Workbench::with_services(window, cx, services, false)),
         )
         .expect("workbench");
-        (window.into(), view)
+        (window, view)
     })
 }
 

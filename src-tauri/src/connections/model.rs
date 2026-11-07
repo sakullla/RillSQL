@@ -274,6 +274,7 @@ impl fmt::Debug for Secret {
 }
 
 #[derive(Clone)]
+#[derive(Default)]
 pub struct SecretInput {
     pub password: Option<Secret>,
     pub ssh_password: Option<Secret>,
@@ -292,16 +293,6 @@ impl fmt::Debug for SecretInput {
     }
 }
 
-impl Default for SecretInput {
-    fn default() -> Self {
-        Self {
-            password: None,
-            ssh_password: None,
-            ssh_passphrase: None,
-            save_password: false,
-        }
-    }
-}
 
 /// 界面草稿。密码不在这个结构里，避免和普通配置一起序列化。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

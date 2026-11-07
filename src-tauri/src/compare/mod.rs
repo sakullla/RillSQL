@@ -8,6 +8,7 @@ mod structure;
 
 pub use data::diff_data;
 pub use structure::diff_structure;
+#[allow(unused_imports)]
 pub(crate) use model::{DataReport, DataRequest, DataTableRequest, KeyChoice, SideRequest, StructureReport, StructureRequest, TableChoice};
 pub(crate) use read::{is_cancelled as compare_is_cancelled, list_schemas, read_data, read_structure, request_cancel as request_compare_cancel};
 

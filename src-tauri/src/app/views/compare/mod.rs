@@ -251,7 +251,7 @@ impl ComparePane {
                 let _ = tx.send(result);
             });
             if let Ok(result) = rx.await {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |pane, cx| {
                             pane.finish_schemas(&key, result);
@@ -317,7 +317,7 @@ impl ComparePane {
                 let _ = tx.send(choices);
             });
             if let Ok(choices) = rx.await {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |pane, cx| {
                             match choices {
@@ -492,7 +492,7 @@ impl ComparePane {
                 let _ = tx.send(outcome);
             });
             let outcome = rx.await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(view) = view.upgrade() {
                     view.update(cx, |pane, cx| {
                         match outcome {
@@ -523,7 +523,7 @@ impl ComparePane {
                 let _ = tx.send(outcome);
             });
             let outcome = rx.await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(view) = view.upgrade() {
                     view.update(cx, |pane, cx| {
                         match outcome {
@@ -1234,7 +1234,7 @@ mod workbench {
                 |window, cx| cx.new(|cx| crate::app::shell::Workbench::with_services(window, cx, services, false)),
             )
             .expect("workbench");
-            (window.into(), view)
+            (window, view)
         });
         cx.update_window(window, |_, _, cx| {
             view.update(cx, |view, cx| view.perform("compare", cx));
@@ -1402,7 +1402,7 @@ mod workbench {
                 },
             )
             .expect("compare pane");
-            (window.into(), view)
+            (window, view)
         });
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);

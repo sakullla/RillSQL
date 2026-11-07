@@ -313,6 +313,7 @@ pub async fn catalog_refresh(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn catalog_definition(
     state: tauri::State<'_, ConnectionsState>,
     connection_id: String,
@@ -375,6 +376,7 @@ fn describe_env(tags: &[EnvTag], id: &str) -> (String, String) {
 }
 
 trait StatusText {
+    #[allow(clippy::wrong_self_convention)]
     fn as_api(self) -> &'static str;
 }
 

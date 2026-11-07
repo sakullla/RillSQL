@@ -36,6 +36,7 @@ macro_rules! dict {
                 _ => return None,
             })
         }
+        #[allow(dead_code)]
         pub fn catalog_keys() -> &'static [&'static str] {
             &[$($key),*]
         }

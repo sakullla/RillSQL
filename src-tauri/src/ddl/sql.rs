@@ -19,8 +19,8 @@ pub fn quote_ident(engine: Engine, name: &str) -> String {
 pub fn qualified_table(engine: Engine, database: &str, schema: &str, table: &str) -> Result<String, String> {
     match engine {
         // Redis 没有结构编辑（capability 门控）。
-        Engine::Redis => return Err("Redis 没有结构编辑。".to_owned()),
-        Engine::Mongodb => return Err("MongoDB 没有结构编辑。".to_owned()),
+        Engine::Redis => Err("Redis 没有结构编辑。".to_owned()),
+        Engine::Mongodb => Err("MongoDB 没有结构编辑。".to_owned()),
         Engine::Sqlite => {
             if !database.is_empty() && database != "main" {
                 return Err(format!("当前连接打开的是 main，没有另开连接修改 {database}"));
@@ -145,9 +145,9 @@ pub fn valid_type(engine: Engine, raw: &str) -> bool {
     let base = lower.split('(').next().unwrap_or("").trim();
     match engine {
         Engine::Sqlite => !base.is_empty() && base.chars().next().is_some_and(|ch| ch.is_ascii_alphabetic()),
-        Engine::Postgres => POSTGRES_TYPES.iter().any(|item| *item == base),
-        Engine::Mysql | Engine::Mariadb => MYSQL_TYPES.iter().any(|item| *item == base),
-        Engine::Sqlserver => SQLSERVER_TYPES.iter().any(|item| *item == base),
+        Engine::Postgres => POSTGRES_TYPES.contains(&base),
+        Engine::Mysql | Engine::Mariadb => MYSQL_TYPES.contains(&base),
+        Engine::Sqlserver => SQLSERVER_TYPES.contains(&base),
         // Redis 没有列类型（不进结构编辑）。
         Engine::Redis | Engine::Mongodb => false,
     }
@@ -211,11 +211,10 @@ fn is_quoted(value: &str) -> bool {
     let inner = &value[1..value.len() - 1];
     let mut chars = inner.chars().peekable();
     while let Some(ch) = chars.next() {
-        if ch == '\'' {
-            if chars.next() != Some('\'') {
+        if ch == '\''
+            && chars.next() != Some('\'') {
                 return false;
             }
-        }
     }
     true
 }

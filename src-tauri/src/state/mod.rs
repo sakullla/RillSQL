@@ -7,6 +7,7 @@ mod legacy;
 mod leveldb;
 
 use atomic::write_atomic_off_ui;
+#[allow(unused_imports)]
 pub use compat::{
     keyring_service, password_account_for, read_connection_export, read_connections, read_env_tags, read_history, read_secret, ssh_password_account_for,
 };

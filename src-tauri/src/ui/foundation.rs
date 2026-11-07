@@ -432,7 +432,7 @@ mod tests {
             let shell = view.read(cx).shell().clone();
             crate::app::install_actions(cx, &view);
             crate::app::install_menus(cx, &shell);
-            (window.into(), view)
+            (window, view)
         })
     }
 

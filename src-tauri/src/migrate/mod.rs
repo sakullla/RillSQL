@@ -3,6 +3,7 @@
 //! 进度走 `migrate_progress` 事件，取消用 AtomicBool 注册表（dump/grid 同一模式）。
 
 pub mod commands;
+#[allow(clippy::module_inception)]
 pub(crate) mod migrate;
 
 pub fn module_id() -> &'static str {

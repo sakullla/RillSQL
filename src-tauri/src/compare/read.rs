@@ -182,6 +182,7 @@ async fn load_side(service: &Service, request: &SideRequest, cancel_id: &str) ->
     side
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn load_data_table(
     service: &Service,
     baseline_request: &SideRequest,
@@ -624,13 +625,13 @@ fn catalog_engine(value: &str) -> Result<CatalogEngine, String> {
 }
 
 fn session_matches(session: &CatalogSession, engine: &str) -> bool {
-    match (session, engine) {
-        (CatalogSession::Sqlite { .. }, "sqlite") => true,
-        (CatalogSession::Mysql(_), "mysql" | "mariadb") => true,
-        (CatalogSession::Postgres(_), "postgres") => true,
-        (CatalogSession::Sqlserver(_), "sqlserver") => true,
-        _ => false,
-    }
+    matches!(
+        (session, engine),
+        (CatalogSession::Sqlite { .. }, "sqlite")
+            | (CatalogSession::Mysql(_), "mysql" | "mariadb")
+            | (CatalogSession::Postgres(_), "postgres")
+            | (CatalogSession::Sqlserver(_), "sqlserver")
+    )
 }
 
 async fn hold_session(service: &Service, existing: &CatalogSession, request: &SideRequest, database: &str) -> Result<Held, String> {

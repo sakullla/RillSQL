@@ -10,41 +10,50 @@ use crate::connections::secrets::{SecretStore, KEYRING_SERVICE};
 use crate::connections::store::Store;
 use crate::query::{HistoryEntry, HistoryStore};
 
+#[allow(dead_code)]
 pub fn keyring_service() -> &'static str {
     KEYRING_SERVICE
 }
 
+#[allow(dead_code)]
 pub fn password_account_for(id: &str) -> String {
     password_account(id)
 }
 
+#[allow(dead_code)]
 pub fn ssh_password_account_for(id: &str) -> String {
     ssh_password_account(id)
 }
 
+#[allow(dead_code)]
 pub fn read_secret(store: &dyn SecretStore, account: &str) -> Result<Option<String>, String> {
     store.get(account).map_err(|err| err.to_string())
 }
 
+#[allow(dead_code)]
 pub async fn read_connections(path: &Path) -> Result<Vec<SavedConnection>, String> {
     let store = Store::open(path).await.map_err(|err| format!("打不开连接库：{err}"))?;
     store.list().await.map_err(|err| format!("读不了连接库：{err}"))
 }
 
+#[allow(dead_code)]
 pub async fn read_env_tags(path: &Path) -> Result<Vec<crate::connections::model::EnvTag>, String> {
     let store = Store::open(path).await.map_err(|err| format!("打不开连接库：{err}"))?;
     store.list_tags().await.map_err(|err| format!("读不了环境标签：{err}"))
 }
 
+#[allow(dead_code)]
 pub async fn read_history(path: &Path) -> Result<Vec<HistoryEntry>, String> {
     let store = HistoryStore::open(path).await?;
     store.list().await
 }
 
+#[allow(dead_code)]
 pub fn read_connection_export(bytes: &[u8], passphrase: Option<&str>) -> Result<ParsedImport, String> {
     export::parse_import(bytes, passphrase)
 }
 
+#[allow(dead_code)]
 pub fn keyring_store() -> Arc<dyn SecretStore> {
     Arc::new(crate::connections::secrets::KeyringStore::new())
 }

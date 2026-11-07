@@ -128,16 +128,12 @@ pub struct SessionTab {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub struct SessionState {
     pub tabs: Vec<SessionTab>,
     pub active_id: Option<String>,
 }
 
-impl Default for SessionState {
-    fn default() -> Self {
-        Self { tabs: Vec::new(), active_id: None }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

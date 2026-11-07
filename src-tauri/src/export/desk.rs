@@ -26,6 +26,7 @@ pub enum ImportEntry {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum CancelPoint {
     No,
     /// 只取消任务代次，让已经跑完的结果不能显示为成功。
@@ -37,6 +38,7 @@ pub enum CancelPoint {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct ImportPreview {
     pub path: String,
     pub format: String,
@@ -67,6 +69,7 @@ pub async fn open_import(path: &str, entry: ImportEntry) -> Result<ImportPreview
     }
 }
 
+#[allow(dead_code)]
 pub async fn commit_import(
     service: &Service,
     table: &TableRef,
@@ -177,6 +180,7 @@ async fn write_import(
     Ok(ImportReport { wrote: applied > 0, success, applied, cancelled: false, message })
 }
 
+#[allow(dead_code)]
 pub fn mapping_for(schema_fields: &[TableField], preview: &ParsedTable) -> BTreeMap<String, String> {
     suggest_mapping(schema_fields, &preview.columns)
 }
@@ -428,6 +432,7 @@ fn extension_of(path: &str) -> String {
     Path::new(path).extension().and_then(|raw| raw.to_str()).unwrap_or("").to_ascii_lowercase()
 }
 
+#[allow(dead_code)]
 pub fn stage_loaded(id: &str, format: &str, path: &Path, columns: Vec<String>, rows: Vec<Vec<Option<String>>>, truncated: bool, table: &str) -> LoadedExport {
     LoadedExport {
         id: id.to_owned(),

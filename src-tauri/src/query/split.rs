@@ -260,11 +260,10 @@ pub fn statement_at(engine: &str, sql: &str, cursor: usize) -> Option<Piece> {
     if let Some(found) = report.pieces.iter().find(|piece| cursor >= piece.start && cursor <= piece.end) {
         return Some(found.clone());
     }
-    if report.refusal.is_some() {
-        if report.refusal_from.is_some_and(|from| cursor >= from) {
+    if report.refusal.is_some()
+        && report.refusal_from.is_some_and(|from| cursor >= from) {
             return None;
         }
-    }
     if let Some(previous) = report.pieces.iter().rev().find(|piece| piece.end <= cursor) {
         return Some(previous.clone());
     }
@@ -416,10 +415,7 @@ fn scan_statement(sql: &str, start: usize, delimiter: &str, hash: bool, tsql_blo
             if upper == "CATCH" {
                 catch_pending = false;
             }
-            if upper == "BEGIN" && block_keyword {
-                opened_block = true;
-                begin_depth += 1;
-            } else if upper == "CASE" && tsql_blocks {
+            if (upper == "BEGIN" && block_keyword) || (upper == "CASE" && tsql_blocks) {
                 opened_block = true;
                 begin_depth += 1;
             } else if upper == "END" && block_keyword && begin_depth > 0 {
@@ -634,7 +630,7 @@ fn end_of_peeked_word(sql: &str, from: usize, hash: bool) -> usize {
 /// GO 批次分隔的判定：GO 独占一行（行内剩余只允许空白或纯数字的批次计数），行中出现的 GO 不算。
 fn is_go_line(sql: &str, word_start: usize) -> bool {
     let bytes = sql.as_bytes();
-    if read_word(sql, word_start).0.to_ascii_uppercase() != "GO" {
+    if !read_word(sql, word_start).0.eq_ignore_ascii_case("GO") {
         return false;
     }
     let mut back = word_start;

@@ -399,6 +399,7 @@ pub fn merge_outline(list: Vec<OutlineItem>, statements: &[(String, String, usiz
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn statement_index_at(list: &[OutlineItem], offset: usize) -> isize {
     if list.is_empty() {
         return -1;
@@ -1073,9 +1074,7 @@ fn holds(prev: &Tok, tok: &Tok) -> bool {
 }
 
 fn break_kind(tok: &Tok, prev: Option<&Tok>) -> Option<&'static str> {
-    let Some(upper) = tok.upper.as_deref() else {
-        return None;
-    };
+    let upper = tok.upper.as_deref()?;
     if tok.kind != TokKind::Word {
         return None;
     }

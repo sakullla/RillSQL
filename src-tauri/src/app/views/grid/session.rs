@@ -805,6 +805,7 @@ impl SharedGrid {
     }
 
     /// 当前已读取的表、列和行。没有连接或表名时不给出导入目标。
+    #[allow(clippy::type_complexity)]
     pub fn exchange_sheet(&self) -> (Option<TableRef>, Vec<String>, Vec<Vec<Option<String>>>, bool) {
         let table = if self.target.connection_id.is_empty() || self.target.table.is_empty() { None } else { Some(self.table_ref()) };
         let rows = self.source.iter().map(|row| row.values.clone()).collect();
@@ -1230,6 +1231,7 @@ pub fn rows_from_page(columns: &[GridColumn], page: &PageDto) -> Vec<GridRow> {
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn column_of(name: &str, type_name: &str, primary: bool) -> Column {
     Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable: !primary, primary, unique: primary, auto: primary }
 }
@@ -1331,6 +1333,7 @@ fn quote_tsv(value: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn overlay(row: usize, row_id: String, column: usize, value: Option<String>, gate: Gate, message: String, change_id: Option<String>, kind: &'static str) -> Overlay {
     Overlay { row, row_id, column, value, gate, message, change_id, kind }
 }
@@ -1452,7 +1455,7 @@ mod tests {
         let stale = grid.show_query_sheet("select * from customers", vec!["id".into(), "name".into()], vec![vec![Some("1".into()), Some("甲".into())]]);
         assert!(!grid.writable());
         grid.show_query_sheet("select count(*)", vec!["n".into()], vec![vec![Some("1".into())]]);
-        assert!(grid.finish_locate(stale, schema()) == false || !grid.writable());
+        assert!(!grid.finish_locate(stale, schema()) || !grid.writable());
         let current = grid.show_query_sheet("select id, name from customers", vec!["id".into(), "name".into()], vec![vec![Some("1".into()), Some("甲".into())]]);
         assert!(grid.finish_locate(current, schema()));
         assert!(grid.writable());
@@ -1566,10 +1569,7 @@ mod tests {
         assert_eq!(grid.gate_at(inserted, 1), Some(Gate::Validation));
         assert!(grid.rejected_visible());
         assert!(!grid.overlay_message(inserted, 1).is_empty());
-        match grid.open_preview() {
-            Ok(sql) => assert!(sql.iter().all(|item| !item.contains("zz")), "{sql:?}"),
-            Err(_) => {}
-        }
+        if let Ok(sql) = grid.open_preview() { assert!(sql.iter().all(|item| !item.contains("zz")), "{sql:?}") }
         if let Ok(request) = grid.confirm_request() {
             assert!(request.changes.iter().all(|change| {
                 change.sets.iter().all(|item| item.value.as_deref() != Some("zz")) && change.values.iter().all(|item| item.value.as_deref() != Some("zz"))

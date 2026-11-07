@@ -26,8 +26,8 @@ pub async fn load_partial(session: &CatalogSession, request: &Request, table: &s
     };
     match session {
         // Redis 没有结构编辑（capability 门控）；误入时明确拒绝。
-        CatalogSession::Redis(_) => return Err("Redis 没有结构编辑。".to_owned()),
-        CatalogSession::Mongo(_) => return Err("MongoDB 没有结构编辑。".to_owned()),
+        CatalogSession::Redis(_) => Err("Redis 没有结构编辑。".to_owned()),
+        CatalogSession::Mongo(_) => Err("MongoDB 没有结构编辑。".to_owned()),
         CatalogSession::Scripted => Err("这个连接没有连着可查询的数据库。".to_owned()),
         CatalogSession::Sqlite { pool, .. } => load_sqlite(pool, &request.database, table, recorded).await,
         CatalogSession::Mysql(pool) => load_mysql(pool, request.engine, &request.database, table).await,

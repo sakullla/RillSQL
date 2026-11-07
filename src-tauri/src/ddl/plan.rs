@@ -909,11 +909,10 @@ fn rebuild_blocker(snapshot: &Snapshot, drafts: &[ColumnDraft]) -> Option<String
         if (index.partial || index.expression) && !dropped && index.sql.as_deref().unwrap_or("").trim().is_empty() {
             return Some(format!("读不到索引 {} 的原始语句，不能可靠保留。", index.name));
         }
-        if index.expression && index.columns.is_empty() && !dropped {
-            if renamed_any(drafts) {
+        if index.expression && index.columns.is_empty() && !dropped
+            && renamed_any(drafts) {
                 return Some(format!("表达式索引 {} 在列重命名后无法可靠改写。", index.name));
             }
-        }
     }
     None
 }
@@ -1371,6 +1370,7 @@ fn compatible_type(left: &str, right: &str) -> bool {
     INTS.contains(&left.as_str()) && INTS.contains(&right.as_str())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_statement(
     engine: Engine,
     database: &str,
@@ -2143,7 +2143,7 @@ fn read_quoted(sql: &str, start: usize) -> (TokKind, usize) {
         let len = ch.len_utf8();
         if ch == closer {
             let next = index + len;
-            let escaped = sql[next..].chars().next() == Some(closer);
+            let escaped = sql[next..].starts_with(closer);
             if escaped {
                 text.push(closer);
                 index = next + closer.len_utf8();

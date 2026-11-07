@@ -645,7 +645,7 @@ impl Workbench {
         });
         cx.spawn(async move |_, cx| {
             if let Ok(startup) = rx.await {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             this.model.apply_settings(&startup.state.shell);
@@ -693,7 +693,7 @@ impl Workbench {
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let done = rx.await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(view) = view.upgrade() {
                     view.update(cx, |this, cx| {
                         if let Ok(done) = done {
@@ -910,6 +910,7 @@ impl Workbench {
         self.model.exchange_running = self.exchange.read(cx).running();
     }
 
+    #[allow(clippy::type_complexity)]
     fn exchange_source(&self, cx: &App) -> (Option<crate::grid::commands::TableRef>, Vec<String>, Vec<Vec<Option<String>>>, bool) {
         let (mut table, columns, rows, truncated) = self.table.read(cx).exchange_sheet();
         if table.is_none() {

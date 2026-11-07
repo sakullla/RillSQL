@@ -383,7 +383,7 @@ mod tests {
                 |window, cx| cx.new(|cx| SqlEditor::new(window, cx)),
             )
             .expect("editor window");
-            (window.into(), editor)
+            (window, editor)
         })
     }
 

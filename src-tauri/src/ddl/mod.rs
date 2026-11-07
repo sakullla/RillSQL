@@ -9,6 +9,7 @@ pub(crate) mod sql;
 
 pub(crate) use exec::{preview, Receipt};
 pub(crate) use introspect::{load, load_partial};
+#[allow(unused_imports)]
 pub(crate) use model::{Action, Column, ColumnDraft, Engine as DdlEngine, ForeignKeyDraft, IndexColumnDraft, Plan, Request, SequenceState, Snapshot, StepStatus};
 pub(crate) use plan::plan as preview_plan;
 

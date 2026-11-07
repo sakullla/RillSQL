@@ -51,7 +51,7 @@ fn failed_read_is_not_an_empty_match() {
     let mut store = customers_fixture(4);
     store.read_error = Some("连接已断开".to_owned());
     let error = query_page(&store, &[filt("id", FilterOp::Eq, Some("1"))], None, 0, 10).unwrap_err();
-    assert_eq!(error.1, false);
+    assert!(!error.1);
     assert!(error.0.contains("连接已断开"));
 }
 
@@ -1055,6 +1055,7 @@ process.stdout.write(JSON.stringify({ sheets: book.SheetNames.length, columns, r
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn xlsx_full_export_writes_select_and_table_rows_and_skips_updates() {
     use super::live::{self, ExportMode, ExportSpec};
     use crate::connections::Service;

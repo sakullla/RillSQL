@@ -154,7 +154,7 @@ impl ExchangePane {
                 let _ = tx.send(result);
             });
             if let Ok(result) = rx.await {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             match result {
@@ -192,7 +192,7 @@ impl ExchangePane {
         });
         cx.spawn(async move |this, cx| {
             let message = receiver.await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 let _ = this.update(cx, |pane, cx| pane.finish_pick(message, cx));
             });
         })
@@ -252,7 +252,7 @@ impl ExchangePane {
                 let _ = tx.send(result);
             });
             if let Ok(result) = rx.await {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             match result {
@@ -305,7 +305,7 @@ impl ExchangePane {
                 let _ = tx.send(result);
             });
             let settled = rx.await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(view) = view.upgrade() {
                     view.update(cx, |this, cx| {
                         let task = match settled {
@@ -362,7 +362,7 @@ impl ExchangePane {
         let receiver = cx.prompt_for_new_path(&directory, Some(&suggested));
         cx.spawn(async move |this, cx| {
             let message = receiver.await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 let _ = this.update(cx, |pane, cx| pane.finish_save(kind, message, cx));
             });
         })
@@ -472,7 +472,7 @@ impl ExchangePane {
                 let _ = tx.send(result);
             });
             let settled = rx.await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(view) = view.upgrade() {
                     view.update(cx, |this, cx| {
                         match settled {
@@ -518,7 +518,7 @@ impl ExchangePane {
         });
         cx.spawn(async move |this, cx| {
             let message = receiver.await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 let _ = this.update(cx, |pane, cx| pane.finish_migrate_pick(message, cx));
             });
         })
@@ -599,7 +599,7 @@ impl ExchangePane {
                 let _ = tx.send(result);
             });
             let settled = rx.await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(view) = view.upgrade() {
                     view.update(cx, |this, cx| {
                         match settled {
@@ -626,7 +626,7 @@ impl ExchangePane {
                 let _ = tx.send(result);
             });
             let settled = rx.await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(view) = view.upgrade() {
                     view.update(cx, |this, cx| {
                         match settled {
@@ -653,7 +653,7 @@ impl ExchangePane {
                 let _ = tx.send(result);
             });
             let settled = rx.await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 if let Some(view) = view.upgrade() {
                     view.update(cx, |this, cx| {
                         match settled {

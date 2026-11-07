@@ -476,7 +476,7 @@ fn headless_workbench_renders_on_windows_widths(cx: &mut gpui_kit::TestAppContex
         crate::app::install_menus(cx, &shell);
         (window, view)
     });
-    cx.update_window(window.into(), |_, window, cx| {
+    cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
     })
     .unwrap();
@@ -609,7 +609,7 @@ fn open_workbench(cx: &mut gpui_kit::TestAppContext, services: Arc<AppServices>,
         let shell = view.read(cx).shell().clone();
         crate::app::install_workbench_actions(cx, &view);
         crate::app::install_menus(cx, &shell);
-        (window.into(), view)
+        (window, view)
     });
     (window, view)
 }

@@ -95,13 +95,9 @@ pub async fn deliver_cancel(transport: &CancelTransport) -> Result<bool, String>
             kill_mysql(connection_id, opts, *via_ssh).await?;
             Ok(true)
         }
-        CancelTransport::Postgres { token, tls, via_ssh, .. } => {
+        CancelTransport::Postgres { token, tls, .. } => {
             cancel_postgres(token, tls.as_ref()).await?;
-            if *via_ssh {
-                Ok(true)
-            } else {
-                Ok(true)
-            }
+            Ok(true)
         }
         CancelTransport::Sqlserver { spid, config, via_ssh, .. } => {
             kill_sqlserver(spid, config, *via_ssh).await?;

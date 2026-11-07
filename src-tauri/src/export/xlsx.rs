@@ -10,11 +10,13 @@ use super::parse::ParsedTable;
 
 static WORKBOOK_INITS: AtomicU64 = AtomicU64::new(0);
 
+#[allow(dead_code)]
 pub fn workbook_initializations() -> u64 {
     WORKBOOK_INITS.load(Ordering::SeqCst)
 }
 
 /// 工作簿计数是进程级的。涉及它的测试必须串行，避免并行用例互相改计数。
+#[allow(dead_code)]
 pub fn workbook_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -25,6 +27,7 @@ fn touch_workbook() {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub enum TypedCell {
     Text(String),
     Number(f64),
@@ -49,10 +52,12 @@ pub fn write_xlsx(columns: &[String], rows: &[Vec<Option<String>>]) -> Result<Ve
     write_book(&[("First", &header, &typed)])
 }
 
+#[allow(dead_code)]
 pub fn write_typed(header: &[TypedCell], rows: &[Vec<TypedCell>]) -> Result<Vec<u8>, String> {
     write_book(&[("First", header, rows)])
 }
 
+#[allow(clippy::type_complexity)]
 fn write_book(sheets: &[(&str, &[TypedCell], &[Vec<TypedCell>])]) -> Result<Vec<u8>, String> {
     touch_workbook();
     let mut workbook = Workbook::new();
@@ -176,6 +181,7 @@ fn first_sheet_is_chart(bytes: &[u8]) -> bool {
     text.contains("spreadsheetml.chartsheet") || text.contains("relationships/chartsheet")
 }
 
+#[allow(dead_code)]
 pub fn second_sheet_fixture() -> Result<Vec<u8>, String> {
     touch_workbook();
     let mut workbook = Workbook::new();
@@ -191,6 +197,7 @@ pub fn second_sheet_fixture() -> Result<Vec<u8>, String> {
 }
 
 /// 测试用的未压缩 ZIP。图表页放在第一张，后面的工作表不能被当成导入来源。
+#[allow(dead_code)]
 pub fn chart_first_zip() -> Vec<u8> {
     stored_zip(&[
         (
@@ -214,6 +221,7 @@ pub fn chart_first_zip() -> Vec<u8> {
     ])
 }
 
+#[allow(dead_code)]
 fn stored_zip(files: &[(&str, &str)]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut central = Vec::new();
@@ -272,6 +280,7 @@ fn stored_zip(files: &[(&str, &str)]) -> Vec<u8> {
     out
 }
 
+#[allow(dead_code)]
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xffff_ffffu32;
     for &byte in data {

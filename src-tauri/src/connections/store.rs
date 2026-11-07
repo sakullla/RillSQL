@@ -238,7 +238,7 @@ impl Store {
             .bind(i64::from(port))
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|row| row.try_get(0)).transpose()?)
+        row.map(|row| row.try_get(0)).transpose()
     }
 
     pub async fn save_host_key(&self, host: &str, port: u16, algorithm: &str, fingerprint: &str) -> Result<(), sqlx::Error> {

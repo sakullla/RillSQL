@@ -191,6 +191,7 @@ pub struct SchemaNode {
     pub kind_reports: Vec<KindReport>,
 }
 
+#[allow(dead_code)]
 impl SchemaNode {
     pub fn empty(name: impl Into<String>) -> Self {
         Self {
@@ -304,6 +305,7 @@ pub fn metadata_sql(engine: Engine) -> MetadataSql {
     }
 }
 
+#[allow(dead_code)]
 pub fn object_count_sql(engine: Engine) -> &'static str {
     match engine {
         // Redis 没有对象计数 SQL；键计数经 DBSIZE/SCAN 专项通路。

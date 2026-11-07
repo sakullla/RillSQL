@@ -12,11 +12,13 @@ const MAGIC: u64 = 0xdb47_7524_8b80_fb57;
 const SCAN_LIMIT: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub(crate) struct LogBatch {
     pub sequence: u64,
     pub puts: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+#[allow(dead_code)]
 pub(crate) fn local_storage_key(name: &str) -> Vec<u8> {
     let mut key = b"_http://tauri.localhost".to_vec();
     key.push(0);
@@ -25,18 +27,21 @@ pub(crate) fn local_storage_key(name: &str) -> Vec<u8> {
     key
 }
 
+#[allow(dead_code)]
 pub(crate) fn encode_utf16_value(text: &str) -> Vec<u8> {
     let mut value = vec![0];
     value.extend(text.encode_utf16().flat_map(|unit| unit.to_le_bytes()));
     value
 }
 
+#[allow(dead_code)]
 pub(crate) fn encode_latin1_value(text: &str) -> Vec<u8> {
     let mut value = vec![1];
     value.extend(text.bytes());
     value
 }
 
+#[allow(dead_code)]
 pub(crate) fn encode_log(batches: &[LogBatch]) -> Vec<u8> {
     let mut out = Vec::new();
     for batch in batches {
@@ -53,6 +58,7 @@ pub(crate) fn encode_log(batches: &[LogBatch]) -> Vec<u8> {
 }
 
 /// 一个数据块，Snappy 压缩。索引放在数据后面，所以键出现时值的 JSON 已经在前面的压缩块里。
+#[allow(dead_code)]
 pub(crate) fn encode_sst(entries: &[(Vec<u8>, Vec<u8>, u64)]) -> Vec<u8> {
     let mut block = Vec::new();
     let mut restarts = Vec::new();
@@ -153,6 +159,7 @@ fn is_leveldb_table(path: &Path) -> bool {
     stem.chars().all(|ch| ch.is_ascii_digit()) && (ext.eq_ignore_ascii_case("log") || ext.eq_ignore_ascii_case("ldb") || ext.eq_ignore_ascii_case("sst"))
 }
 
+#[allow(clippy::type_complexity)]
 fn records_in(path: &Path, bytes: &[u8]) -> Vec<(u64, u8, Vec<u8>, Option<Vec<u8>>)> {
     let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
     if ext.eq_ignore_ascii_case("log") {
@@ -169,6 +176,7 @@ fn read_capped(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+#[allow(dead_code)]
 fn batch_payload(batch: &LogBatch) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend(batch.sequence.to_le_bytes());
@@ -183,6 +191,7 @@ fn batch_payload(batch: &LogBatch) -> Vec<u8> {
     payload
 }
 
+#[allow(clippy::type_complexity)]
 fn read_log(bytes: &[u8]) -> Vec<(u64, u8, Vec<u8>, Option<Vec<u8>>)> {
     let mut out = Vec::new();
     let mut logical = Vec::new();
@@ -230,6 +239,7 @@ fn read_log(bytes: &[u8]) -> Vec<(u64, u8, Vec<u8>, Option<Vec<u8>>)> {
     out
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_batch(payload: &[u8]) -> Vec<(u64, u8, Vec<u8>, Option<Vec<u8>>)> {
     if payload.len() < 12 {
         return Vec::new();
@@ -277,6 +287,7 @@ fn parse_batch(payload: &[u8]) -> Vec<(u64, u8, Vec<u8>, Option<Vec<u8>>)> {
     out
 }
 
+#[allow(clippy::type_complexity)]
 fn read_sst(bytes: &[u8]) -> Vec<(u64, u8, Vec<u8>, Option<Vec<u8>>)> {
     if bytes.len() < 48 || u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap()) != MAGIC {
         return Vec::new();
@@ -399,10 +410,10 @@ fn decode_storage_value(bytes: &[u8]) -> Option<String> {
     match bytes.first().copied() {
         Some(0) => {
             let rest = &bytes[1..];
-            if rest.len() % 2 != 0 {
+            if !rest.len().is_multiple_of(2) {
                 return None;
             }
-            let units: Vec<u16> = rest.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+            let units: Vec<u16> = rest.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
             String::from_utf16(&units).ok()
         }
         Some(1) => Some(bytes[1..].iter().copied().map(char::from).collect()),
@@ -410,6 +421,7 @@ fn decode_storage_value(bytes: &[u8]) -> Option<String> {
     }
 }
 
+#[allow(dead_code)]
 fn snappy_literals(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     push_varint(&mut out, data.len() as u64);
@@ -498,6 +510,7 @@ fn copy_from(out: &mut Vec<u8>, offset: usize, length: usize) -> Result<(), ()> 
     Ok(())
 }
 
+#[allow(dead_code)]
 fn push_varint(out: &mut Vec<u8>, mut value: u64) {
     loop {
         let mut byte = (value & 0x7f) as u8;
@@ -539,6 +552,7 @@ fn crc32c(data: &[u8]) -> u32 {
     !crc
 }
 
+#[allow(dead_code)]
 fn mask_crc(crc: u32) -> u32 {
     crc.rotate_right(15).wrapping_add(0xa282_ead8)
 }

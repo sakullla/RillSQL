@@ -350,7 +350,7 @@ mod tests {
                 |window, cx| cx.new(|cx| GridPrototype::new(fixture, window, cx)),
             )
             .expect("grid window");
-            (window.into(), grid)
+            (window, grid)
         })
     }
 

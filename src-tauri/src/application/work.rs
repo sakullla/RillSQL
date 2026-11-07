@@ -19,6 +19,7 @@ use crate::query::QueryState;
 
 use super::tasks::{TaskBoard, TaskOutcome, TaskToken};
 
+#[allow(dead_code)]
 pub async fn catalog_sessions(service: &Arc<Service>) -> Vec<SessionStatus> {
     Arc::clone(service).session_statuses().await
 }
@@ -27,12 +28,14 @@ pub async fn catalog_refresh(service: &Service, limits: &[ObjectLimit], page: Op
     catalog_commands::load_catalog(service, page.unwrap_or(0), limits, connection_id, outline).await
 }
 
+#[allow(dead_code)]
 pub async fn catalog_page(service: &Service, connection_id: &str, database: &str, schema: &str, offset: usize, limit: usize) -> Result<PageDto, String> {
     let session = service.catalog_session(connection_id);
     let engine = saved_engine(service, connection_id).await?;
     Ok(catalog_commands::page_for_session(session.as_ref(), engine, database, schema, offset, limit).await)
 }
 
+#[allow(clippy::too_many_arguments, dead_code)]
 pub async fn catalog_definition(
     service: &Service,
     connection_id: &str,
@@ -129,22 +132,26 @@ pub fn cancel_migrate(tasks: &TaskBoard, owner: &str, id: &str) {
     migrate::request_cancel(id);
 }
 
+#[allow(dead_code)]
 pub async fn start_query(service: &Arc<Service>, query: &QueryState, tasks: &TaskBoard, owner: &str, request: StartRequest) -> Result<TaskOutcome<RunDto>, String> {
     let token = tasks.begin(owner);
     let run = query_commands::start_run(service, query, request).await?;
     Ok(tasks.accept(owner, token, run))
 }
 
+#[allow(dead_code)]
 pub async fn poll_query(query: &QueryState, tasks: &TaskBoard, owner: &str, token: TaskToken, run_id: &str, continue_read: bool) -> Result<TaskOutcome<RunDto>, String> {
     let run = query_commands::poll_run(query, run_id, continue_read).await?;
     Ok(tasks.accept(owner, token, run))
 }
 
+#[allow(dead_code)]
 pub fn release_query(query: &QueryState, tasks: &TaskBoard, owner: &str, run_id: &str) -> bool {
     tasks.supersede(owner);
     query_commands::release_run(query, run_id)
 }
 
+#[allow(dead_code)]
 pub async fn cancel_query(service: &Arc<Service>, query: &QueryState, tasks: &TaskBoard, owner: &str, token: TaskToken, run_id: &str) -> Result<TaskOutcome<RunDto>, String> {
     let run = query_commands::request_cancel(service, query, run_id).await?;
     let outcome = tasks.accept(owner, token, run);
@@ -152,30 +159,37 @@ pub async fn cancel_query(service: &Arc<Service>, query: &QueryState, tasks: &Ta
     Ok(outcome)
 }
 
+#[allow(dead_code)]
 pub async fn list_history(query: &QueryState) -> Result<Vec<crate::query::HistoryEntry>, String> {
     query.history().await?.list().await
 }
 
+#[allow(dead_code)]
 pub async fn clear_history(query: &QueryState) -> Result<(), String> {
     query.history().await?.clear().await
 }
 
+#[allow(dead_code)]
 pub async fn delete_history(query: &QueryState, id: &str) -> Result<(), String> {
     query.history().await?.delete(id).await
 }
 
+#[allow(dead_code)]
 pub async fn list_saved(query: &QueryState) -> Result<Vec<SavedQuery>, String> {
     query.history().await?.list_saved().await
 }
 
+#[allow(dead_code)]
 pub async fn save_saved(query: &QueryState, request: &SaveRequest) -> Result<SavedWrite, String> {
     query.history().await?.save_named(request).await
 }
 
+#[allow(dead_code)]
 pub async fn rename_saved(query: &QueryState, request: &RenameRequest) -> Result<SavedQuery, String> {
     query.history().await?.rename_saved(request).await
 }
 
+#[allow(dead_code)]
 pub async fn delete_saved(query: &QueryState, id: &str) -> Result<(), String> {
     query.history().await?.delete_saved(id).await
 }

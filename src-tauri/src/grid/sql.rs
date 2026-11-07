@@ -298,6 +298,7 @@ pub fn select_export_gate_for(engine: &str, sql: &str) -> Result<String, String>
 }
 
 /// 网格不再保留自己的词法，只转发 query::split_sql。
+#[allow(dead_code)]
 pub fn split_sql(engine: &str, sql: &str) -> Vec<String> {
     crate::query::split_sql(engine, sql)
         .pieces
@@ -551,6 +552,7 @@ fn binary_literal(engine: Engine, hex: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 pub(crate) mod value_family_test {
     use super::value_family;
 

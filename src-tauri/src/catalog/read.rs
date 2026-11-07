@@ -241,6 +241,7 @@ pub async fn read_object_page(session: &CatalogSession, engine: Engine, database
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn read_definition(
     session: &CatalogSession,
     engine: Engine,
@@ -293,6 +294,7 @@ pub(crate) fn assemble_postgres(names: &[String], current: &str, schemas: Result
         .collect()
 }
 
+#[allow(clippy::type_complexity)]
 fn finish_kinds(parts: Vec<(ObjectKind, Result<(usize, Vec<ObjectRow>), String>)>, offset: usize, limit: usize) -> (Vec<ObjectRow>, usize, Vec<KindReport>) {
     let mut reports = Vec::new();
     let mut rows = Vec::new();
@@ -728,6 +730,7 @@ fn mysql_create_sql(row: &mysql_async::Row, index: usize) -> Result<String, Stri
 
 /// SHOW CREATE FUNCTION、PROCEDURE、TRIGGER 的语句都在索引 2。
 /// 索引 0 是对象名，名称里的 CREATE 不是定义。
+#[allow(dead_code)]
 fn mysql_show_create_statement(columns: &[Option<&str>]) -> Result<String, String> {
     mysql_show_create_at(columns, 2)
 }
@@ -871,7 +874,7 @@ async fn read_postgres_definition(
                 return Err(definition_failure("有多个同名函数，需要用参数类型区分"));
             }
             let row = rows.first().ok_or_else(|| definition_failure("没有读到定义"))?;
-            let text = pg_string(row, 0).map_err(|err| definition_failure(err))?;
+            let text = pg_string(row, 0).map_err(definition_failure)?;
             if text.trim().is_empty() {
                 return Err(definition_failure("没有读到定义"));
             }
@@ -905,7 +908,7 @@ async fn read_postgres_definition(
                 return Err(definition_failure("有多个同名触发器，需要所属的表才能区分"));
             }
             let row = rows.first().ok_or_else(|| definition_failure("没有读到定义"))?;
-            let text = pg_string(row, 0).map_err(|err| definition_failure(err))?;
+            let text = pg_string(row, 0).map_err(definition_failure)?;
             if text.trim().is_empty() {
                 return Err(definition_failure("没有读到定义"));
             }
@@ -918,7 +921,7 @@ async fn read_postgres_definition(
 async fn read_postgres_text(client: &tokio_postgres::Client, sql: &str, schema: &str, name: &str) -> Result<String, String> {
     let rows = client.query(sql, &[&schema, &name]).await.map_err(definition_failure)?;
     let row = rows.first().ok_or_else(|| definition_failure("没有读到定义"))?;
-    let text = pg_string(row, 0).map_err(|err| definition_failure(err))?;
+    let text = pg_string(row, 0).map_err(definition_failure)?;
     if text.trim().is_empty() {
         Err(definition_failure("没有读到定义"))
     } else {
@@ -997,6 +1000,7 @@ fn mysql_text(row: &mysql_async::Row, index: usize) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod definition_column_tests {
     use super::mysql_show_create_statement;
 

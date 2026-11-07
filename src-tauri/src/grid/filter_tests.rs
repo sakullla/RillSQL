@@ -89,7 +89,7 @@ fn between_and_in_reject_missing_values() {
     let schema = schema_of(Engine::Postgres);
     assert_eq!(compile_where(&schema, &[between("id", "", "7")]).unwrap_err(), "between 需要两个值");
     let missing_second = Filter { column: "id".to_owned(), op: FilterOp::Between, value: Some("5".to_owned()), second: None, values: Vec::new() };
-    assert_eq!(compile_where(&schema, &[missing_second.clone()]).unwrap_err(), "between 需要两个值");
+    assert_eq!(compile_where(&schema, std::slice::from_ref(&missing_second)).unwrap_err(), "between 需要两个值");
     assert_eq!(compile_where(&schema, &[one_of("id", &[])]).unwrap_err(), "IN 筛选至少要一个值");
     let store = customers_fixture(4);
     let error = query_page(&store, &[missing_second], None, 0, 10).unwrap_err();
@@ -148,7 +148,7 @@ fn search_clause_combines_with_filters_sort_and_paging() {
     let schema = schema_of(Engine::Mysql);
     let clause = search_clause(Engine::Mysql, &schema.columns, "小河").unwrap();
     let filter = Filter { column: "id".to_owned(), op: FilterOp::Gt, value: Some("10".to_owned()), second: None, values: Vec::new() };
-    assert_eq!(compile_where_with_search(&schema, &[filter.clone()], Some("小河")).unwrap(), format!("`id` > 10 AND {clause}"));
+    assert_eq!(compile_where_with_search(&schema, std::slice::from_ref(&filter), Some("小河")).unwrap(), format!("`id` > 10 AND {clause}"));
     assert_eq!(compile_where_with_search(&schema, &[], Some("  ")).unwrap(), "");
     assert_eq!(compile_where_with_search(&schema, &[], None).unwrap(), "");
     assert_eq!(compile_where_with_search(&schema, &[one_of("id", &[])], Some("小河")).unwrap_err(), "IN 筛选至少要一个值");

@@ -67,9 +67,7 @@ pub fn database_gate(engine: &str, current: &str, requested: &str) -> DatabaseGa
         "mysql" | "mariadb" => DatabaseGate::Switch,
         "postgres" | "sqlserver" => DatabaseGate::Refuse,
         "sqlite" => {
-            if requested == "main" || current == "main" && requested == "main" {
-                DatabaseGate::Ready
-            } else if current.is_empty() && requested == "main" {
+            if requested == "main" {
                 DatabaseGate::Ready
             } else {
                 DatabaseGate::Refuse
@@ -376,6 +374,7 @@ fn chunk_rows(limit: usize) -> usize {
     if limit <= 8 { limit.max(1) } else { (limit / 2).max(1) }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reveal_rows(
     sink: &dyn RowSink,
     index: usize,
@@ -692,7 +691,7 @@ async fn sqlserver_run(
 
 /// SHOWPLAN 批次判定：以 SET SHOWPLAN_ALL 开头的语句即使整批到达也按收行路径执行。
 pub fn is_showplan_statement(sql: &str) -> bool {
-    let mut words = sql.trim_start().split_whitespace();
+    let mut words = sql.split_whitespace();
     matches!(
         (words.next(), words.next()),
         (Some(first), Some(second)) if first.eq_ignore_ascii_case("SET") && second.eq_ignore_ascii_case("SHOWPLAN_ALL")
@@ -769,10 +768,8 @@ fn tds_string_cell(row: &tiberius::Row, index: usize) -> Option<String> {
         return Some(tds_uuid_text(value));
     }
     // xml（文档原文）：XmlData 只实现 FromSqlOwned，经 cells() 按 ColumnData 直接取。
-    if let Some((_, data)) = row.cells().nth(index) {
-        if let tiberius::ColumnData::Xml(Some(xml)) = data {
-            return Some(xml.to_string());
-        }
+    if let Some((_, tiberius::ColumnData::Xml(Some(xml)))) = row.cells().nth(index) {
+        return Some(xml.to_string());
     }
     // datetime / datetime2 / smalldatetime → 本地日期时间文本。
     if let Ok(Some(value)) = row.try_get::<chrono::NaiveDateTime, _>(index) {
@@ -1015,6 +1012,7 @@ fn to_hex(bytes: Vec<u8>) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn mysql_run(
     conn: &mut mysql_async::Conn,
     transport: &CancelTransport,
@@ -1225,6 +1223,7 @@ fn mysql_cell(value: &mysql_async::Value, kind: mysql_async::consts::ColumnType,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mysql_date_text(kind: mysql_async::consts::ColumnType, year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8, micros: u32) -> String {
     use mysql_async::consts::ColumnType::*;
     let date = format!("{year:04}-{month:02}-{day:02}");

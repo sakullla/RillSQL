@@ -114,7 +114,7 @@ impl DiagramPane {
                 let _ = tx.send(outcome);
             });
             if let Ok(outcome) = rx.await {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |pane, cx| {
                             pane.finish(token, outcome);
@@ -283,6 +283,7 @@ fn edge_hot(hovered: Option<&str>, edge: &DiagramEdge) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use gpui_kit::test::TestWindowExt;
@@ -338,7 +339,7 @@ mod tests {
                 |window, cx| cx.new(|cx| crate::app::shell::Workbench::with_services(window, cx, services, false)),
             )
             .expect("workbench");
-            (window.into(), view)
+            (window, view)
         });
         cx.update_window(window, |_, _, cx| {
             view.update(cx, |view, cx| {

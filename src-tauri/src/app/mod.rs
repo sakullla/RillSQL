@@ -269,18 +269,18 @@ pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench
 pub fn install_menus(cx: &mut App, shell: &Shell) {
     let label = |key: &'static str| shell.text(key).to_string();
     cx.set_menus([
-        Menu::new(&label("shell.menu.file")).items([
+        Menu::new(label("shell.menu.file")).items([
             MenuItem::action(label("shell.command.newQuery"), NewQuery),
             MenuItem::action(label("shell.command.openSqlite"), OpenSqlite),
             MenuItem::action(label("shell.command.saveQuery"), SaveQuery),
             MenuItem::separator(),
             MenuItem::action(label("shell.command.quit"), Quit),
         ]),
-        Menu::new(&label("shell.menu.edit")).items([
+        Menu::new(label("shell.menu.edit")).items([
             MenuItem::action(label("shell.shortcuts.format"), FormatSql),
             MenuItem::action(label("shell.shortcuts.autocomplete"), ShowAutocomplete),
         ]),
-        Menu::new(&label("shell.menu.view")).items([
+        Menu::new(label("shell.menu.view")).items([
             MenuItem::action(label("shell.command.toggleSidebar"), ToggleSidebar),
             MenuItem::action(label("shell.command.themeLight"), ThemeLight),
             MenuItem::action(label("shell.command.themeDark"), ThemeDark),
@@ -288,7 +288,7 @@ pub fn install_menus(cx: &mut App, shell: &Shell) {
             MenuItem::action(label("shell.command.settings"), OpenSettings),
             MenuItem::action(label("shell.command.help"), ShowHelp),
         ]),
-        Menu::new(&label("shell.menu.query")).items([
+        Menu::new(label("shell.menu.query")).items([
             MenuItem::action(label("shell.command.execute"), ExecuteQuery),
             MenuItem::action(label("shell.shortcuts.runCurrent"), ExecuteCurrent),
             MenuItem::action(label("shell.shortcuts.requestCancel"), RequestCancel),

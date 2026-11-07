@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use gpui_kit::{
-    AppContext as _, ClipboardItem, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    ClipboardItem, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
 };
 
@@ -584,7 +584,7 @@ impl RedisPane {
                 let _ = tx.send(work.await);
             });
             if let Ok(result) = rx.await {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |pane, cx| {
                             if pane.generation != generation {
@@ -700,6 +700,7 @@ pub fn split_commandline(line: &str) -> (String, Vec<String>) {
     (iter.next().unwrap_or_default(), iter.collect())
 }
 
+#[allow(clippy::result_unit_err)]
 pub fn parse_ttl(input: &str) -> Result<Option<i64>, ()> {
     let trimmed = input.trim();
     if trimmed.is_empty() {

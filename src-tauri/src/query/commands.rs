@@ -193,7 +193,7 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
         Ok(history) => history,
         Err(err) => return Err(err),
     };
-    if let Err(err) = history
+    history
         .insert(&HistoryDraft {
             id: id.clone(),
             sql: request.sql.clone(),
@@ -204,10 +204,7 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
             started_at: started_at.clone(),
             summary: "执行中".to_owned(),
         })
-        .await
-    {
-        return Err(err);
-    }
+        .await?;
     let limit = exec::clamp_limit(request.limit);
     let slot = Arc::clone(&reservation.slot);
     reservation.active = false;
@@ -219,7 +216,7 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
         // 目录连接是共享会话，整批结束后把语句超时设置复位，不泄漏到这一批之外。
         let _ = driver.finish().await;
         let summary = summary_of(&batch);
-        let status = history_status(&batch.status);
+        let status = history_status(batch.status);
         finish_run(&slot, batch, &notices);
         if let Ok(store) = history_state.history().await {
             let _ = store

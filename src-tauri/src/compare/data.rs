@@ -279,6 +279,7 @@ fn push_delete(schema: &TableSchema, table: &DataTable, key: &[String], row: &BT
     diffs.push(DataDiff { table: table.name.clone(), action: "delete".to_owned(), key: label, detail: "只在对照".to_owned() });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_update(
     schema: &TableSchema,
     table: &DataTable,

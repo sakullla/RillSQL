@@ -179,13 +179,14 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+#[allow(dead_code)]
 pub fn encode_utf16_le(text: &str) -> Vec<u8> {
     text.encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect()
 }
 
 pub fn decode_storage_blob(bytes: &[u8]) -> String {
-    if bytes.len() >= 2 && bytes.len() % 2 == 0 {
-        let units: Vec<u16> = bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+    if bytes.len() >= 2 && bytes.len().is_multiple_of(2) {
+        let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
         if let Ok(text) = String::from_utf16(&units) {
             let trimmed = text.trim_matches('\u{0}').trim();
             if trimmed.starts_with('{') || trimmed.starts_with('[') {

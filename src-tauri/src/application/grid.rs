@@ -268,10 +268,10 @@ fn cell_of(value: Option<String>) -> Cell {
 }
 
 fn step_label(id: &str) -> String {
-    if id.starts_with("u:") {
-        format!("修改 {}", &id[2..])
-    } else if id.starts_with("d:") {
-        format!("删除 {}", &id[2..])
+    if let Some(rest) = id.strip_prefix("u:") {
+        format!("修改 {rest}")
+    } else if let Some(rest) = id.strip_prefix("d:") {
+        format!("删除 {rest}")
     } else {
         "新增 1 行".to_owned()
     }

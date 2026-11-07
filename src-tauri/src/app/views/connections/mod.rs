@@ -18,17 +18,13 @@ pub use url::{default_port, parse_connection_url, ParsedUrl};
 const OWNER: &str = "connections";
 
 #[derive(Clone)]
+#[derive(Default)]
 pub struct Secrets {
     pub password: String,
     pub ssh_password: String,
     pub ssh_passphrase: String,
 }
 
-impl Default for Secrets {
-    fn default() -> Self {
-        Self { password: String::new(), ssh_password: String::new(), ssh_passphrase: String::new() }
-    }
-}
 
 impl std::fmt::Debug for Secrets {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -51,6 +47,7 @@ pub struct FieldIssue {
 }
 
 #[derive(Clone, Debug)]
+#[derive(Default)]
 pub struct ConnectionPage {
     pub rows: Vec<ConnectionRecord>,
     pub filter_text: String,
@@ -67,25 +64,6 @@ pub struct ConnectionPage {
     pub executed_sql: bool,
 }
 
-impl Default for ConnectionPage {
-    fn default() -> Self {
-        Self {
-            rows: Vec::new(),
-            filter_text: String::new(),
-            filter_engine: None,
-            filter_env: String::new(),
-            selected: None,
-            editor: None,
-            secrets: Secrets::default(),
-            issues: Vec::new(),
-            status: BTreeMap::new(),
-            message_key: None,
-            message_detail: String::new(),
-            confirm_delete: false,
-            executed_sql: false,
-        }
-    }
-}
 
 impl ConnectionPage {
     pub fn begin(&mut self, tasks: &TaskBoard) -> TaskToken {
@@ -164,11 +142,10 @@ impl ConnectionPage {
         if let Some(mode) = parsed.tls_mode {
             draft.tls_mode = mode;
         }
-        if parsed.engine == Engine::Sqlite || parsed.engine == Engine::Redis || parsed.engine == Engine::Mongodb {
-            if draft.env == "dev" {
+        if (parsed.engine == Engine::Sqlite || parsed.engine == Engine::Redis || parsed.engine == Engine::Mongodb)
+            && draft.env == "dev" {
                 draft.env = "local".into();
             }
-        }
         self.secrets.password = parsed.password;
         self.editor = Some(draft);
         self.issues = self.validate();

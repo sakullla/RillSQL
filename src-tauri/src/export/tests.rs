@@ -73,6 +73,7 @@ fn people_table(id: &str, table: &str) -> TableRef {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn export_request(id: &str, mode: &str, path: &Path, format: &str, limit: u64, truncated: bool, statement: &str, acknowledged: bool) -> ExportRequest {
     ExportRequest {
         id: id.to_owned(),
@@ -192,6 +193,7 @@ fn xlsx_codec_covers_header_first_sheet_nulls_chart_and_corrupt_zip() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn drop_and_dialog_keep_xls_xlsx_and_two_megabyte_preview_limits() {
     let _guard = workbook_test_lock();
     let dir = temp_dir("preview");
@@ -301,6 +303,7 @@ async fn confirmed_import_writes_sqlite_and_unconfirmed_or_invalid_targets_do_no
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn loaded_and_full_exports_write_real_files_and_keep_partial_rename() {
     let _guard = workbook_test_lock();
     let dir = temp_dir("export");
@@ -323,7 +326,7 @@ async fn loaded_and_full_exports_write_real_files_and_keep_partial_rename() {
         assert!(written.is_absolute(), "{format}");
         assert!(written.display().to_string().contains("（部分）"), "{format} {}", written.display());
         assert!(written.is_file(), "{format}");
-        assert!(!dir.join(format!(".rillsql-missing.partial")).exists());
+        assert!(!dir.join(".rillsql-missing.partial").exists());
         assert!(fs::read_dir(&dir).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".partial")));
         if format == "xlsx" {
             let table = read_xlsx(&fs::read(&written).unwrap()).unwrap();
@@ -419,7 +422,7 @@ async fn sqlite_dump_and_migrate_report_real_ranges_and_do_not_call_cancel_succe
     assert!(sql.contains("CREATE TABLE"), "{sql}");
     assert!(sql.contains("甲"), "{sql}");
     assert!(dump_path.is_absolute());
-    assert!(!dump_path.with_file_name(format!(".rillsql-x.partial")).exists());
+    assert!(!dump_path.with_file_name(".rillsql-x.partial").exists());
 
     let moved = watch_migrate(&service, &tasks, &migrate_request("move-ok", "notes", "copy"), CancelPoint::No).await.unwrap();
     assert_eq!(moved.phase, Phase::Done, "{}", moved.detail);

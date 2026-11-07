@@ -102,6 +102,7 @@ fn derive_key(passphrase: &str, salt: &[u8]) -> Result<[u8; KEY_LEN], String> {
     Ok(key)
 }
 
+#[allow(deprecated)] // XNonce 仍来自 generic-array 0.14，24 字节 nonce 和密文格式不变。
 fn seal(plain: &[u8], passphrase: &str) -> Result<Vec<u8>, String> {
     let seed = random_seed();
     let (salt, nonce) = seed.split_at(SALT_LEN);
@@ -126,6 +127,7 @@ fn encrypt(envelope: &ExportEnvelope, passphrase: &str) -> Result<Vec<u8>, Strin
 }
 
 /// 口令不正确、文件被改动或截断都走同一拒绝：AEAD 校验失败无法区分，整体不导入。
+#[allow(deprecated)] // 与 seal 同一套 XNonce，解密必须读回原来的 24 字节 nonce。
 fn open(file: &[u8], passphrase: &str) -> Result<Vec<u8>, String> {
     let body = &file[MAGIC.len()..];
     if body.len() < SALT_LEN + NONCE_LEN + TAG_LEN {

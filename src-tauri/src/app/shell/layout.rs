@@ -108,6 +108,7 @@ pub fn painted_frame(viewport: i32, sidebar_open: bool, pad: i32) -> PaintedFram
 }
 
 /// 旧视图把打开的侧栏一律放进 flex，body 又用整段视口宽，再加上根 padding。
+#[allow(dead_code)]
 pub fn flex_sidebar_row_width(viewport: i32, sidebar_open: bool, pad: i32) -> i32 {
     let layout = layout_for(viewport, sidebar_open);
     let sidebar = if sidebar_open { layout.sidebar_width } else { 0 };

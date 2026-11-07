@@ -496,7 +496,7 @@ impl QueryPane {
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             if let Ok(run_id) = id_rx.await {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |pane, cx| pane.note_started(&tab_id, &run_id, cx));
                     }
@@ -507,7 +507,7 @@ impl QueryPane {
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             if let Ok(result) = done_rx.await {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |pane, cx| {
                             let cancel_text = i18n::text(pane.locale, "query.run.cancel");
@@ -659,7 +659,7 @@ impl QueryPane {
                         let _ = tx.send(loaded);
                     });
                     if let Ok(loaded) = rx.await {
-                        let _ = cx.update(|cx| {
+                        cx.update(|cx| {
                             let _ = this.update(cx, |pane, cx| pane.finish_open(loaded, cx));
                         });
                     }
@@ -1136,7 +1136,7 @@ mod tests {
                 |window, cx| cx.new(|cx| QueryPane::new(services, window, cx)),
             )
             .expect("query pane");
-            (window.into(), pane)
+            (window, pane)
         })
     }
 
@@ -1247,7 +1247,7 @@ mod tests {
                 |window, cx| cx.new(|cx| crate::app::shell::Workbench::with_services(window, cx, services, false)),
             )
             .expect("workbench");
-            (window.into(), view)
+            (window, view)
         });
         cx.update_window(window, |_, _, cx| {
             view.update(cx, |view, cx| view.perform("refresh-tree", cx));
@@ -1437,7 +1437,7 @@ mod tests {
                 |window, cx| cx.new(|cx| crate::app::shell::Workbench::with_services(window, cx, services, false)),
             )
             .expect("workbench");
-            (window.into(), view)
+            (window, view)
         });
         cx.update_window(window, |_, window, cx| {
             view.update(cx, |view, cx| view.perform("new-query", cx));
@@ -1488,7 +1488,7 @@ mod tests {
                 |window, cx| cx.new(|cx| QueryPane::new(services, window, cx)),
             )
             .expect("query pane");
-            (window.into(), pane)
+            (window, pane)
         });
         let sql = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 36000) SELECT count(*) FROM c a, c b";
         let snap = bound("slow", sql);

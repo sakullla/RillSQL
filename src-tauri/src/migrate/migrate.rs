@@ -661,7 +661,7 @@ async fn migrate_body(
                     }
                 }
                 since_progress += 1;
-                if since_progress % 50 == 0 {
+                if since_progress.is_multiple_of(50) {
                     report(&tally);
                 }
             }

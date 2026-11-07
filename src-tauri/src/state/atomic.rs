@@ -33,6 +33,7 @@ pub(crate) fn stage(path: &Path, bytes: &[u8]) -> Result<Staged, String> {
     Ok(Staged { tmp, dest: path.to_path_buf() })
 }
 
+#[allow(dead_code)]
 impl Staged {
     pub(crate) fn commit(self) -> Result<(), String> {
         match fs::rename(&self.tmp, &self.dest) {

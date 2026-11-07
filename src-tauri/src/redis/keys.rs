@@ -83,6 +83,7 @@ pub fn scan_args(cursor: u64, pattern: Option<&str>, count: usize) -> Vec<String
 
 /// 值读取的命令形态（纯函数，供测试断言；执行在 read_value）。
 /// zset 带 WITHSCORES、stream 用 XRANGE - + 全量；list 用 LRANGE 0 -1。
+#[allow(dead_code)]
 pub fn value_read_plan(key_type: &str) -> &'static [&'static str] {
     match key_type {
         "string" => &["GET"],

@@ -322,8 +322,8 @@ async fn current_postgres_database(session: &CatalogSession) -> Result<String, S
 async fn resolve_scope(engine: Engine, session: &CatalogSession, database: &str, schemas: &[String]) -> Result<(String, Vec<String>), String> {
     match engine {
         // Redis 不在全库导出面（capability 门控）。
-        Engine::Redis => return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_ENGINE_UNSUPPORTED, "Redis 没有整库导出；键空间经键浏览器访问。")),
-        Engine::Mongodb => return Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_ENGINE_UNSUPPORTED, "MongoDB 没有整库导出；集合文档经文档浏览器访问。")),
+        Engine::Redis => Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_ENGINE_UNSUPPORTED, "Redis 没有整库导出；键空间经键浏览器访问。")),
+        Engine::Mongodb => Err(crate::connections::error_codes::coded_string(crate::connections::error_codes::DUMP_ENGINE_UNSUPPORTED, "MongoDB 没有整库导出；集合文档经文档浏览器访问。")),
         Engine::Sqlite => {
             if !database.is_empty() && database != "main" {
                 return Err(crate::connections::error_codes::coded_string_params(
@@ -864,6 +864,7 @@ pub(crate) fn data_order_clause(schema: &grid::TableSchema) -> String {
     String::new()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_table_data(
     out: &mut BufWriter<File>,
     session: &CatalogSession,

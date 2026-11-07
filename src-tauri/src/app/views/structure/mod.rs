@@ -233,7 +233,7 @@ impl StructurePane {
                 let _ = tx.send(result);
             });
             if let Ok(result) = rx.await {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             match result {
@@ -267,7 +267,7 @@ impl StructurePane {
                 let _ = tx.send(result);
             });
             if let Ok(result) = rx.await {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             this.session.open = false;

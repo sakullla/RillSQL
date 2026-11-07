@@ -209,6 +209,7 @@ fn blocked(baseline: &Side, target: &Side, category: Category) -> bool {
     baseline.category_errors.iter().chain(target.category_errors.iter()).any(|(item, _)| *item == category)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_create(
     engine: Engine,
     target: &Side,
@@ -258,6 +259,7 @@ fn push_drop(engine: Engine, target: &Side, object: &ObjectDef, objects: &mut Ve
     objects.push(plan_drop(engine, target, object));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compare_pair(
     engine: Engine,
     target: &Side,
@@ -398,6 +400,7 @@ fn foreign_keys_differ(left: &TableShape, right: &TableShape) -> bool {
     normalize(&left.foreign_keys) != normalize(&right.foreign_keys)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compare_indexes(
     engine: Engine,
     target: &Side,
@@ -646,6 +649,7 @@ fn referenced_tables(engine: Engine, side: &Side, object: &ObjectDef) -> Vec<Str
 
 /// 触发器先于它所在的视图和表。视图按真实引用先删依赖方。表按外键先删引用方。
 /// 枚举、域、序列和函数不在这里：列还在用它们时不能先删，新建又必须赶在 ALTER 或 CREATE TABLE 之前。
+#[allow(clippy::too_many_arguments)]
 fn assemble_statements(
     engine: Engine,
     target: &Side,
@@ -1484,7 +1488,7 @@ fn default_references_sequence(default_sql: &str, sequence: &str) -> bool {
     string_literals(default_sql).into_iter().any(|literal| {
         literal
             .split('.')
-            .last()
+            .next_back()
             .unwrap_or(literal.as_str())
             .trim_matches('"')
             .eq_ignore_ascii_case(sequence)
@@ -1704,6 +1708,7 @@ fn ensure_or_replace(sql: &str) -> String {
 }
 
 /// 仍被列引用的枚举、域和序列不先 DROP。视图、函数和触发器如果还指向即将删除的对象，先摘掉再按原定义建回。
+#[allow(clippy::too_many_arguments)]
 fn preserve_dependents(
     engine: Engine,
     baseline: &Side,
@@ -1723,6 +1728,7 @@ fn preserve_dependents(
     cover_dependents(engine, baseline, target, drops, creates, alters, detach);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rewrite_kept_types(
     engine: Engine,
     target: &Side,
@@ -1780,6 +1786,7 @@ fn rewrite_kept_types(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rewrite_kept_sequences(
     engine: Engine,
     target: &Side,
@@ -2161,7 +2168,7 @@ fn type_mentions(type_name: &str, object_name: &str) -> bool {
     if let Some(end) = bare.find('(') {
         bare = bare[..end].trim();
     }
-    let last = bare.rsplit(|ch: char| ch == '.' || ch == '"' || ch == '`').find(|part| !part.is_empty()).unwrap_or(bare);
+    let last = bare.rsplit(['.', '"', '`']).find(|part| !part.is_empty()).unwrap_or(bare);
     last.eq_ignore_ascii_case(object_name)
 }
 
@@ -2601,6 +2608,7 @@ fn create_definition(engine: Engine, side: &Side, object: &ObjectDef) -> Option<
     Some(sql)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn alter_table(
     engine: Engine,
     side: &Side,
@@ -2678,11 +2686,11 @@ fn tsql_default_change(engine: Engine, table: &str, table_name: &str, wanted: &C
     statements
 }
 
-fn tsql_drop_default(engine: Engine, table: &str, column: &str, constraint: &str) -> String {
+fn tsql_drop_default(_engine: Engine, table: &str, column: &str, constraint: &str) -> String {
     crate::ddl::sql::sqlserver_drop_default_sql(table, column, constraint)
 }
 
-fn tsql_add_default(engine: Engine, table: &str, table_name: &str, column: &str, expression: &str) -> String {
+fn tsql_add_default(_engine: Engine, table: &str, table_name: &str, column: &str, expression: &str) -> String {
     crate::ddl::sql::sqlserver_add_default_sql(table, table_name, column, expression)
 }
 

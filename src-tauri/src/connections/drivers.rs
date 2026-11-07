@@ -71,14 +71,13 @@ pub struct MysqlOpen {
 
 pub async fn open_mysql(config: &SavedConnection, route: &Route, password: &str) -> Result<MysqlOpen, StageError> {
     let plan = route::mysql_tls_plan(route);
-    if plan.skip_domain_validation || plan.accept_invalid_certs {
-        if route.tls_mode != TlsMode::Require {
+    if (plan.skip_domain_validation || plan.accept_invalid_certs)
+        && route.tls_mode != TlsMode::Require {
             return Err(stages::fail_code(crate::connections::error_codes::CONN_TLS_NOT_CONFIGURED,
                 "加密连接设置前后不一致",
                 "只有用户选择“加密但不验证”时才跳过证书校验。",
             ));
         }
-    }
     let mut builder = OptsBuilder::default()
         .ip_or_hostname(plan.tcp_host.clone())
         .tcp_port(plan.tcp_port)
@@ -392,17 +391,17 @@ fn build_redis_client(info: redis::ConnectionInfo, config: &SavedConnection) -> 
     }
     let root_cert = match ca_file {
         Some(path) => Some(std::fs::read(&path).map_err(|_| {
-            redis::RedisError::from((redis::ErrorKind::InvalidClientConfig, "读不到 CA 证书", format!("{path}")))
+            redis::RedisError::from((redis::ErrorKind::InvalidClientConfig, "读不到 CA 证书", path.to_string()))
         })?),
         None => None,
     };
     let client_tls = match (client_cert, client_key) {
         (Some(cert), Some(key)) => {
             let cert = std::fs::read(&cert).map_err(|_| {
-                redis::RedisError::from((redis::ErrorKind::InvalidClientConfig, "读不到客户端证书", format!("{cert}")))
+                redis::RedisError::from((redis::ErrorKind::InvalidClientConfig, "读不到客户端证书", cert.to_string()))
             })?;
             let key = std::fs::read(&key).map_err(|_| {
-                redis::RedisError::from((redis::ErrorKind::InvalidClientConfig, "读不到客户端私钥", format!("{key}")))
+                redis::RedisError::from((redis::ErrorKind::InvalidClientConfig, "读不到客户端私钥", key.to_string()))
             })?;
             Some(redis::ClientTlsConfig { client_cert: cert, client_key: key })
         }

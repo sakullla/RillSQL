@@ -2,6 +2,7 @@
 //! order 是与 compare 共享的排序核心；dump 生成单个 `.sql` 文件，进度走 `dump_progress` 事件，可取消。
 
 pub mod commands;
+#[allow(clippy::module_inception)]
 pub(crate) mod dump;
 pub(crate) mod order;
 

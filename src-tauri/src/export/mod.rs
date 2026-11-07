@@ -10,6 +10,7 @@ pub use desk::{commit_import_guarded, export_full, export_loaded, open_import, w
 pub use parse::{suggest_mapping, TableField};
 pub use tasks::{prefer_cancel, Phase, TaskLog, TaskView};
 pub use write::LoadedExport;
+#[allow(unused_imports)]
 pub use xlsx::{read_xlsx, workbook_initializations, workbook_test_lock, write_xlsx};
 
 #[cfg(test)]

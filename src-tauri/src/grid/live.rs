@@ -151,6 +151,7 @@ pub async fn describe(session: &CatalogSession, database: &str, schema: &str, ta
     }
 }
 
+#[allow(clippy::too_many_arguments, dead_code)]
 pub async fn query_page(
     session: &CatalogSession,
     database: &str,
@@ -166,6 +167,7 @@ pub async fn query_page(
 }
 
 /// query_page 的整表关键字形态（R3）：搜索子句与筛选在 WHERE 里 AND 组合。
+#[allow(clippy::too_many_arguments)]
 pub async fn query_page_search(
     session: &CatalogSession,
     database: &str,
@@ -204,6 +206,7 @@ pub async fn query_page_search(
     Ok(LivePage { rows, truncated, sql: display })
 }
 
+#[allow(dead_code)]
 pub async fn count_rows(
     session: &CatalogSession,
     database: &str,
@@ -251,7 +254,7 @@ pub async fn commit(
                     return Ok(fail(applied, &change.id, String::new(), message, pending));
                 }
                 let sql = match located_sql(&schema, &change.locator, true) {
-                    Ok(locator) => sql::update_sql(&schema, &change.sets, &locator),
+                    Ok(locator) => sql::update_sql(&schema, &change.sets, locator),
                     Err(message) => return Ok(fail(applied, &change.id, String::new(), message, pending)),
                 };
                 if change.sets.is_empty() {
@@ -270,7 +273,7 @@ pub async fn commit(
             }
             MutationKind::Delete => {
                 let sql = match located_sql(&schema, &change.locator, false) {
-                    Ok(locator) => sql::delete_sql(&schema, &locator),
+                    Ok(locator) => sql::delete_sql(&schema, locator),
                     Err(message) => return Ok(fail(applied, &change.id, String::new(), message, pending)),
                 };
                 if let Err(message) = expect_one(session, &schema, &change.locator).await {
@@ -475,6 +478,7 @@ fn plain_columns(names: &[String], known: &[Column]) -> Vec<Column> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_statement(
     session: &CatalogSession,
     sql: &str,
@@ -909,7 +913,7 @@ impl CsvFile {
     }
 
     fn write_xlsx_package(&mut self) -> io::Result<()> {
-        let bytes = crate::export::write_xlsx(&self.names, &self.xlsx_rows).map_err(|err| io::Error::other(err))?;
+        let bytes = crate::export::write_xlsx(&self.names, &self.xlsx_rows).map_err(io::Error::other)?;
         let file = self.file.as_mut().ok_or_else(|| io::Error::other("文件已关闭"))?;
         file.write_all(&bytes)?;
         file.flush()?;

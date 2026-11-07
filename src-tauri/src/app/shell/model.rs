@@ -672,7 +672,7 @@ impl WorkbenchModel {
     }
 
     fn menu_key(&mut self, key: NavKey) -> Option<String> {
-        let Some(menu) = self.menu.as_mut() else { return None };
+        let menu = self.menu.as_mut()?;
         match key {
             NavKey::Escape => {
                 let _ = menu;

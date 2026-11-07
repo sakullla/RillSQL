@@ -41,12 +41,14 @@ pub struct StatementView {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct PendingSend {
     sql: String,
     pick: RunPick,
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct TabState {
     id: String,
     title: String,
@@ -94,6 +96,7 @@ pub enum DraftSync {
     Same,
 }
 
+#[allow(dead_code)]
 pub struct Desk {
     tabs: Vec<TabState>,
     active: Option<String>,
@@ -110,6 +113,7 @@ pub struct Desk {
     tree_error: String,
 }
 
+#[allow(dead_code)]
 impl Desk {
     pub fn new() -> Self {
         Self {
@@ -969,6 +973,7 @@ pub struct PreparedRun {
     pub limit: u64,
 }
 
+#[allow(dead_code)]
 pub async fn execute_prepared(service: &Arc<Service>, query: &commands::QueryState, prepared: &PreparedRun) -> Result<RunDto, String> {
     let started = commands::start_run(
         service,
@@ -994,6 +999,7 @@ pub async fn execute_prepared(service: &Arc<Service>, query: &commands::QuerySta
     Err("执行没有结束".to_owned())
 }
 
+#[allow(dead_code)]
 pub async fn cancel_run(service: &Arc<Service>, query: &commands::QueryState, run_id: &str) -> Result<RunDto, String> {
     commands::request_cancel(service, query, run_id).await
 }

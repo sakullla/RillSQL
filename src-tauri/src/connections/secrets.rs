@@ -21,6 +21,7 @@ pub struct KeyringStore {
     service: &'static str,
 }
 
+#[allow(dead_code)]
 impl KeyringStore {
     pub fn new() -> Self {
         Self { service: KEYRING_SERVICE }
