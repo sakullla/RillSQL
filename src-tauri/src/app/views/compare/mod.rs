@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use gpui_kit::{
-    Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    TestSupportExt as _, Window, div, px,
 };
 
 use crate::application::tasks::{TaskOutcome, TaskToken};
@@ -47,6 +48,7 @@ struct Choice {
     name: String,
     engine: String,
     databases: Vec<String>,
+    catalog_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +86,10 @@ pub struct ComparePane {
     run_kind: Option<RunKind>,
     cancel_flag: Arc<AtomicBool>,
     placed: Option<PlacedScript>,
+    schema_draft: BTreeMap<String, String>,
+    schema_focus_side: Option<String>,
+    baseline_schema_focus: Option<FocusHandle>,
+    target_schema_focus: Option<FocusHandle>,
     #[cfg(test)]
     armed_pause: bool,
     #[cfg(test)]
@@ -112,6 +118,10 @@ impl ComparePane {
             run_kind: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             placed: None,
+            schema_draft: BTreeMap::new(),
+            schema_focus_side: None,
+            baseline_schema_focus: None,
+            target_schema_focus: None,
             #[cfg(test)]
             armed_pause: false,
             #[cfg(test)]
@@ -276,19 +286,32 @@ impl ComparePane {
             crate::app::views::grid::runtime_for_views().spawn(async move {
                 let result = services.list_connections().await;
                 let choices = match result {
-                    Ok(rows) => Ok(rows
-                        .into_iter()
-                        .filter(|row| row.saved.engine.is_relational() && services.connections.catalog_session(&row.saved.id).is_some())
-                        .map(|row| {
-                            let engine = row.saved.engine.as_str().to_owned();
-                            let databases = if row.saved.engine == Engine::Sqlite {
-                                vec!["main".to_owned()]
-                            } else {
-                                row.saved.database.into_iter().filter(|name| !name.trim().is_empty()).collect()
-                            };
-                            Choice { id: row.saved.id, name: row.saved.name, engine, databases }
-                        })
-                        .collect()),
+                    Ok(rows) => match crate::application::work::catalog_refresh(services.connections.as_ref(), &[], None, None, true).await {
+                        Ok(catalogs) => {
+                            let mut listed = BTreeMap::new();
+                            for catalog in catalogs {
+                                let mut databases: Vec<String> = catalog
+                                    .databases
+                                    .into_iter()
+                                    .map(|database| database.name)
+                                    .filter(|name| !name.trim().is_empty())
+                                    .collect();
+                                databases.sort();
+                                databases.dedup();
+                                listed.insert(catalog.id, (databases, catalog.error));
+                            }
+                            Ok(rows
+                                .into_iter()
+                                .filter(|row| row.saved.engine.is_relational() && services.connections.catalog_session(&row.saved.id).is_some())
+                                .map(|row| {
+                                    let engine = row.saved.engine.as_str().to_owned();
+                                    let (databases, catalog_error) = listed.remove(&row.saved.id).unwrap_or_else(|| (Vec::new(), None));
+                                    Choice { id: row.saved.id, name: row.saved.name, engine, databases, catalog_error }
+                                })
+                                .collect())
+                        }
+                        Err(message) => Err(message),
+                    },
                     Err(message) => Err(message),
                 };
                 let _ = tx.send(choices);
@@ -674,6 +697,45 @@ impl ComparePane {
         i18n::text(self.locale, key)
     }
 
+    fn push_side(&self, lines: &mut Vec<String>, baseline: bool) {
+        let side = if baseline { &self.baseline } else { &self.target };
+        if side.connection_id.is_empty() {
+            return;
+        }
+        let title = self.text(if baseline { "compare.dialog.baseline" } else { "compare.dialog.target" });
+        let name = self.choices.iter().find(|choice| choice.id == side.connection_id).map(|choice| choice.name.as_str()).unwrap_or(side.connection_id.as_str());
+        lines.push(format!("{title} {name}"));
+        if !side.database.is_empty() {
+            lines.push(format!("{} {}", self.text("compare.dialog.database"), side.database));
+        }
+        let Some(engine) = self.engine_of(&side.connection_id) else {
+            return;
+        };
+        if engine != "postgres" && engine != "sqlserver" {
+            return;
+        }
+        match self.schemas.get(&schema_key(&side.connection_id, &side.database)) {
+            Some(SchemaState::Loading) | None => lines.push(self.text("compare.dialog.schemaLoading")),
+            Some(SchemaState::Ready(names)) => {
+                lines.push(self.text("compare.dialog.chooseSchema"));
+                for name in names {
+                    let mark = if side.schema == *name { "schema-on" } else { "schema" };
+                    lines.push(format!("{mark} {name}"));
+                }
+            }
+            Some(SchemaState::Manual(reason)) => {
+                if reason.is_empty() {
+                    lines.push(self.text("compare.gates.schemaNotInCatalog"));
+                } else {
+                    lines.push(reason.clone());
+                }
+                if !side.schema.is_empty() {
+                    lines.push(format!("schema-manual {}", side.schema));
+                }
+            }
+        }
+    }
+
     pub fn lines(&self) -> Vec<String> {
         let mut lines = vec![self.text("compare.dialog.title"), self.text("compare.dialog.subtitle")];
         if self.choices.is_empty() {
@@ -681,7 +743,15 @@ impl ComparePane {
         }
         for choice in &self.choices {
             lines.push(format!("{} {}", choice.name, choice.engine));
+            for database in &choice.databases {
+                lines.push(format!("database {} {database}", choice.id));
+            }
+            if let Some(error) = &choice.catalog_error {
+                lines.push(format!("{} {error}", choice.name));
+            }
         }
+        self.push_side(&mut lines, true);
+        self.push_side(&mut lines, false);
         if self.running {
             lines.push(self.text("compare.dialog.comparing"));
         }
@@ -729,6 +799,9 @@ impl ComparePane {
                         for key in &table.keys {
                             lines.push(format!("{} {}", key.name, key.columns.join(", ")));
                         }
+                    }
+                    if let Some(key) = self.chosen_key.get(&table.name) {
+                        lines.push(format!("chosen {} {key}", table.name));
                     }
                 }
                 if self.structure_status != Status::Cancelled && !report.script.trim().is_empty() {
@@ -801,16 +874,120 @@ impl Render for ComparePane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let locale = self.locale;
         let entity = cx.entity();
-        let mut column = div().id("compare-pane").flex().flex_col().gap(px(4.)).child(SharedString::from(self.lines().join("\n")));
+        if self.baseline_schema_focus.is_none() {
+            self.baseline_schema_focus = Some(cx.focus_handle());
+        }
+        if self.target_schema_focus.is_none() {
+            self.target_schema_focus = Some(cx.focus_handle());
+        }
+        let summary = SharedString::from(self.lines().join("\n"));
+        let controls = self.scope_controls();
+        let baseline_manual = self.manual_reason(true);
+        let target_manual = self.manual_reason(false);
+        let baseline_focus = self.baseline_schema_focus.clone().unwrap();
+        let target_focus = self.target_schema_focus.clone().unwrap();
+        let baseline_draft = self.schema_draft.get("baseline").cloned().unwrap_or_default();
+        let target_draft = self.schema_draft.get("target").cloned().unwrap_or_default();
+        let mut column = div().id("compare-pane").flex().flex_col().gap(px(4.));
         column = column.child(button("compare-structure", "compare.dialog.compareStructure", entity.clone(), locale));
         column = column.child(button("compare-data", "compare.dialog.compareData", entity.clone(), locale));
         column = column.child(button("compare-cancel", "common.cancel", entity.clone(), locale));
         column = column.child(button("compare-place:structure", "compare.dialog.placeToQuery", entity.clone(), locale));
-        column = column.child(button("compare-place:data", "compare.dialog.dataDisclosure", entity, locale));
-        for choice in &self.choices {
-            column = column.child(SharedString::from(format!("{} {}", choice.id, choice.engine)));
+        column = column.child(button("compare-place:data", "compare.dialog.dataDisclosure", entity.clone(), locale));
+        for control in controls {
+            column = column.child(command_button(control.0, control.1, entity.clone()));
         }
-        column
+        if let Some(reason) = baseline_manual {
+            column = column.child(schema_box("baseline", &baseline_draft, &reason, baseline_focus, entity.clone(), locale));
+        }
+        if let Some(reason) = target_manual {
+            column = column.child(schema_box("target", &target_draft, &reason, target_focus, entity.clone(), locale));
+        }
+        column.child(summary)
+    }
+}
+
+impl ComparePane {
+    fn scope_controls(&self) -> Vec<(SharedString, SharedString)> {
+        let mut controls = Vec::new();
+        for choice in &self.choices {
+            controls.push((
+                format!("compare-baseline:{}", choice.id).into(),
+                format!("{} {}", self.text("compare.dialog.baseline"), choice.name).into(),
+            ));
+            controls.push((
+                format!("compare-target:{}", choice.id).into(),
+                format!("{} {}", self.text("compare.dialog.target"), choice.name).into(),
+            ));
+        }
+        self.push_database_controls(&mut controls, true);
+        self.push_database_controls(&mut controls, false);
+        self.push_schema_controls(&mut controls, true);
+        self.push_schema_controls(&mut controls, false);
+        if let Some(report) = &self.structure {
+            if report.refused.is_none() {
+                for table in &report.tables {
+                    let on = self.selected.get(&table.name).copied().unwrap_or(false);
+                    let mark = if on { "on" } else { "off" };
+                    controls.push((format!("compare-toggle:{}", table.name).into(), format!("{mark} {}", table.name).into()));
+                    if table.needs_key_choice {
+                        for key in &table.keys {
+                            let chosen = self.chosen_key.get(&table.name).is_some_and(|name| name == &key.name);
+                            let mark = if chosen { "chosen" } else { "key" };
+                            controls.push((
+                                format!("compare-key:{}|{}", table.name, key.name).into(),
+                                format!("{mark} {} {}", table.name, key.name).into(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        controls
+    }
+
+    fn push_database_controls(&self, controls: &mut Vec<(SharedString, SharedString)>, baseline: bool) {
+        let side = if baseline { &self.baseline } else { &self.target };
+        let Some(choice) = self.choices.iter().find(|choice| choice.id == side.connection_id) else {
+            return;
+        };
+        let which = if baseline { "baseline" } else { "target" };
+        let title = self.text(if baseline { "compare.dialog.baseline" } else { "compare.dialog.target" });
+        let database = self.text("compare.dialog.database");
+        for name in &choice.databases {
+            controls.push((format!("compare-database:{which}:{name}").into(), format!("{title} {database} {name}").into()));
+        }
+    }
+
+    fn push_schema_controls(&self, controls: &mut Vec<(SharedString, SharedString)>, baseline: bool) {
+        let side = if baseline { &self.baseline } else { &self.target };
+        let Some(engine) = self.engine_of(&side.connection_id) else {
+            return;
+        };
+        if engine != "postgres" && engine != "sqlserver" {
+            return;
+        }
+        let Some(SchemaState::Ready(names)) = self.schemas.get(&schema_key(&side.connection_id, &side.database)) else {
+            return;
+        };
+        let which = if baseline { "baseline" } else { "target" };
+        let title = self.text(if baseline { "compare.dialog.baseline" } else { "compare.dialog.target" });
+        let schema = self.text("compare.dialog.chooseSchema");
+        for name in names {
+            controls.push((format!("compare-schema:{which}:{name}").into(), format!("{title} {schema} {name}").into()));
+        }
+    }
+
+    fn manual_reason(&self, baseline: bool) -> Option<String> {
+        let side = if baseline { &self.baseline } else { &self.target };
+        let engine = self.engine_of(&side.connection_id)?;
+        if engine != "postgres" && engine != "sqlserver" {
+            return None;
+        }
+        match self.schemas.get(&schema_key(&side.connection_id, &side.database)) {
+            Some(SchemaState::Manual(reason)) => Some(reason.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -818,12 +995,98 @@ fn button(id: &'static str, key: &'static str, entity: Entity<ComparePane>, loca
     let label = SharedString::from(i18n::text(locale, key));
     div()
         .id(id)
+        .test_support()
         .role(gpui_kit::Role::Button)
         .aria_label(label.clone())
         .child(label)
         .on_click(move |_, _, cx| {
             entity.update(cx, |pane, cx| pane.command(id, cx));
         })
+}
+
+fn command_button(id: SharedString, label: SharedString, entity: Entity<ComparePane>) -> impl IntoElement {
+    let command = id.clone();
+    div()
+        .id(id)
+        .test_support()
+        .role(gpui_kit::Role::Button)
+        .aria_label(label.clone())
+        .child(label)
+        .on_click(move |_, _, cx| {
+            let command = command.clone();
+            entity.update(cx, |pane, cx| pane.command(&command, cx));
+        })
+}
+
+fn schema_box(side: &'static str, value: &str, reason: &str, focus: FocusHandle, entity: Entity<ComparePane>, locale: Locale) -> impl IntoElement {
+    let placeholder = i18n::text(locale, "compare.dialog.schemaManualPlaceholder");
+    let label = if reason.is_empty() {
+        SharedString::from(format!("{placeholder} {value}"))
+    } else {
+        SharedString::from(format!("{reason} {placeholder} {value}"))
+    };
+    div()
+        .id(SharedString::from(format!("compare-schema-input:{side}")))
+        .test_support()
+        .track_focus(&focus)
+        .min_h(px(28.))
+        .w(px(280.))
+        .role(gpui_kit::Role::TextInput)
+        .aria_label(label.clone())
+        .child(label)
+        .on_mouse_down(gpui_kit::MouseButton::Left, {
+            let entity = entity.clone();
+            let focus = focus.clone();
+            move |_, window, cx| {
+                window.focus(&focus, cx);
+                entity.update(cx, |pane, cx| {
+                    pane.schema_focus_side = Some(side.to_owned());
+                    cx.notify();
+                });
+            }
+        })
+        .on_key_down(move |event: &gpui_kit::KeyDownEvent, _, cx| {
+            let action = schema_key_action(event);
+            entity.update(cx, |pane, cx| {
+                if pane.schema_focus_side.as_deref() != Some(side) {
+                    return;
+                }
+                match action {
+                    SchemaKey::Ignore => {}
+                    SchemaKey::Backspace => {
+                        pane.schema_draft.entry(side.to_owned()).or_default().pop();
+                        cx.notify();
+                    }
+                    SchemaKey::Type(text) => {
+                        pane.schema_draft.entry(side.to_owned()).or_default().push_str(&text);
+                        cx.notify();
+                    }
+                    SchemaKey::Commit => {
+                        let name = pane.schema_draft.get(side).cloned().unwrap_or_default();
+                        pane.command(&format!("compare-schema:{side}:{name}"), cx);
+                    }
+                }
+            });
+        })
+}
+
+enum SchemaKey {
+    Ignore,
+    Backspace,
+    Type(String),
+    Commit,
+}
+
+fn schema_key_action(event: &gpui_kit::KeyDownEvent) -> SchemaKey {
+    if event.keystroke.modifiers.control || event.keystroke.modifiers.platform || event.keystroke.modifiers.alt {
+        return SchemaKey::Ignore;
+    }
+    match event.keystroke.key.as_str() {
+        "backspace" => SchemaKey::Backspace,
+        "enter" => SchemaKey::Commit,
+        "escape" | "tab" | "up" | "down" | "left" | "right" => SchemaKey::Ignore,
+        _ => event.keystroke.key_char.clone().filter(|text| !text.is_empty()).map(SchemaKey::Type).unwrap_or(SchemaKey::Ignore),
+    }
 }
 
 #[cfg(test)]
@@ -837,8 +1100,8 @@ mod tests {
         assert_eq!(engine_gate("sqlite", "sqlite"), None);
         let mut pane = temp_pane();
         pane.choices = vec![
-            Choice { id: "mysql".into(), name: "甲".into(), engine: "mysql".into(), databases: vec!["app".into()] },
-            Choice { id: "maria".into(), name: "乙".into(), engine: "mariadb".into(), databases: vec!["app".into()] },
+            Choice { id: "mysql".into(), name: "甲".into(), engine: "mysql".into(), databases: vec!["app".into()], catalog_error: None },
+            Choice { id: "maria".into(), name: "乙".into(), engine: "mariadb".into(), databases: vec!["app".into()], catalog_error: None },
         ];
         pane.baseline = SidePick { connection_id: "mysql".into(), database: "app".into(), schema: String::new() };
         pane.target = SidePick { connection_id: "maria".into(), database: "app".into(), schema: String::new() };
@@ -849,8 +1112,8 @@ mod tests {
         assert!(!pane.structure_ready());
 
         pane.choices = vec![
-            Choice { id: "cache".into(), name: "缓存".into(), engine: "redis".into(), databases: Vec::new() },
-            Choice { id: "cache-b".into(), name: "缓存二".into(), engine: "redis".into(), databases: Vec::new() },
+            Choice { id: "cache".into(), name: "缓存".into(), engine: "redis".into(), databases: Vec::new(), catalog_error: None },
+            Choice { id: "cache-b".into(), name: "缓存二".into(), engine: "redis".into(), databases: Vec::new(), catalog_error: None },
         ];
         pane.baseline.connection_id = "cache".into();
         pane.target.connection_id = "cache-b".into();
@@ -858,7 +1121,7 @@ mod tests {
         assert!(message.contains("不生成脚本"), "{message}");
         assert!(!message.contains("CREATE"));
 
-        pane.choices = vec![Choice { id: "base".into(), name: "基准".into(), engine: "sqlite".into(), databases: vec!["main".into()] }];
+        pane.choices = vec![Choice { id: "base".into(), name: "基准".into(), engine: "sqlite".into(), databases: vec!["main".into()], catalog_error: None }];
         pane.baseline.connection_id = "base".into();
         pane.target.connection_id.clear();
         let message = pane.refuse_local().expect("对照还没选");
@@ -870,8 +1133,8 @@ mod tests {
     fn schema_still_loading_blocks_the_script() {
         let mut pane = temp_pane();
         pane.choices = vec![
-            Choice { id: "left".into(), name: "左".into(), engine: "postgres".into(), databases: vec!["app".into()] },
-            Choice { id: "right".into(), name: "右".into(), engine: "postgres".into(), databases: vec!["app".into()] },
+            Choice { id: "left".into(), name: "左".into(), engine: "postgres".into(), databases: vec!["app".into()], catalog_error: None },
+            Choice { id: "right".into(), name: "右".into(), engine: "postgres".into(), databases: vec!["app".into()], catalog_error: None },
         ];
         pane.baseline = SidePick { connection_id: "left".into(), database: "app".into(), schema: String::new() };
         pane.target = SidePick { connection_id: "right".into(), database: "app".into(), schema: "public".into() };
@@ -880,6 +1143,14 @@ mod tests {
         let message = pane.refuse_local().expect("schema 还在读");
         assert!(message.contains("不生成脚本"), "{message}");
         assert!(!pane.running());
+        let text = pane.lines().join("\n");
+        assert!(text.contains("schema 还在读取"), "{text}");
+        assert!(text.contains("schema-on public"), "{text}");
+        pane.schemas.insert(schema_key("left", "app"), SchemaState::Manual("读取 schema 失败：权限不足".into()));
+        let text = pane.lines().join("\n");
+        assert!(text.contains("读取 schema 失败：权限不足"), "{text}");
+        let message = pane.refuse_local().expect("失败后还没填写 schema");
+        assert!(message.contains("不生成脚本"), "{message}");
     }
 
     fn engine_gate(left: &str, right: &str) -> Option<&'static str> {
@@ -939,6 +1210,18 @@ mod workbench {
             let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(config.join("connections.sqlite")))));
             services.connections.open_sqlite_for_test("base", "基准", &baseline_file).await.unwrap();
             services.connections.open_sqlite_for_test("other", "对照", &target_file).await.unwrap();
+            let extra = config.join("extra.sqlite");
+            let extra_pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&extra).create_if_missing(true))
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE extra_marker (id INTEGER PRIMARY KEY)").execute(&extra_pool).await.unwrap();
+            extra_pool.close().await;
+            let attached = extra.display().to_string().replace('\'', "''").replace('\\', "\\\\");
+            if let crate::connections::CatalogSession::Sqlite { pool, .. } = services.connections.catalog_session("base").expect("base session") {
+                sqlx::query(sqlx::AssertSqlSafe(format!("ATTACH DATABASE '{attached}' AS extra"))).execute(&pool).await.unwrap();
+            }
             let _ = tx.send((services, target_file));
         });
         let (services, target_file) = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite compare setup");
@@ -958,28 +1241,53 @@ mod workbench {
         })
         .unwrap();
         assert!(
-            pump(cx, window, &view, |view, app| view.compare_text(app).contains("基准 sqlite") && view.compare_text(app).contains("对照 sqlite")),
-            "没有列出已连接的 SQLite"
+            pump(cx, window, &view, |view, app| {
+                let text = view.compare_text(app);
+                text.contains("基准 sqlite") && text.contains("对照 sqlite") && text.contains("database base extra") && text.contains("database base main")
+            }),
+            "没有列出已连接的 SQLite 或目录里的库"
         );
-        cx.update_window(window, |_, _, cx| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("compare-baseline:base").label(), Some("基准 基准"));
+            assert_eq!(window.find("compare-target:other").label(), Some("对照 对照"));
+            window.click("compare-structure", cx);
             view.update(cx, |view, cx| {
-                view.perform("compare-structure", cx);
                 let text = view.compare_text(cx);
                 assert!(text.contains("请选择已打开的基准和对照"), "{text}");
                 assert!(!text.contains("CREATE TABLE"), "{text}");
                 assert!(!view.compare_structure_ready(cx), "{text}");
-                view.perform("compare-baseline:base", cx);
-                view.perform("compare-target:other", cx);
-                view.perform("compare-structure", cx);
             });
+            window.click("compare-baseline:base", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("compare-database:baseline:main").label(), Some("基准 数据库 main"));
+            assert_eq!(window.find("compare-database:baseline:extra").label(), Some("基准 数据库 extra"));
+            window.click("compare-database:baseline:main", cx);
+            window.click("compare-target:other", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("compare-database:target:main").label(), Some("对照 数据库 main"));
+            window.click("compare-database:target:main", cx);
+            view.update(cx, |view, cx| {
+                let text = view.compare_text(cx);
+                assert!(text.contains("数据库 main"), "{text}");
+                assert!(text.contains("基准 基准") && text.contains("对照 对照"), "{text}");
+            });
+            window.click("compare-structure", cx);
         })
         .unwrap();
         assert!(
             pump(cx, window, &view, |view, app| view.compare_structure_ready(app) && view.compare_text(app).contains("customers") && view.compare_text(app).contains("orders")),
             "结构差异没有出现在对比页"
         );
-        cx.update_window(window, |_, _, cx| {
-            view.update(cx, |view, cx| view.perform("compare-data", cx));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("compare-toggle:orders").label(), Some("on orders"));
+            assert!(window.try_find("compare-toggle:customers").is_some());
+            window.click("compare-toggle:orders", cx);
+            view.update(cx, |view, cx| assert!(view.compare_text(cx).contains("off orders"), "{}", view.compare_text(cx)));
+            window.click("compare-toggle:orders", cx);
+            view.update(cx, |view, cx| assert!(view.compare_text(cx).contains("on orders"), "{}", view.compare_text(cx)));
+            window.click("compare-data", cx);
         })
         .unwrap();
         assert!(pump(cx, window, &view, |view, app| {
@@ -987,16 +1295,16 @@ mod workbench {
             view.compare_data_ready(app) && text.contains("INSERT") && text.contains("DELETE") && text.contains("UPDATE")
         }), "数据差异没有出现在对比页");
         assert_db_unchanged(&target_file);
-        cx.update_window(window, |_, _, cx| {
+        cx.update_window(window, |_, window, cx| {
+            view.update(cx, |view, cx| view.arm_compare_pause(cx));
+            window.click("compare-structure", cx);
             view.update(cx, |view, cx| {
-                view.arm_compare_pause(cx);
-                view.perform("compare-structure", cx);
                 assert!(view.compare_running_now(cx));
                 assert!(!view.model.allow_system_close());
                 assert!(view.model.close_prompt.is_none());
-                view.perform("compare-cancel", cx);
-                view.release_compare_pause(cx);
             });
+            window.click("compare-cancel", cx);
+            view.update(cx, |view, cx| view.release_compare_pause(cx));
         })
         .unwrap();
         assert!(pump(cx, window, &view, |view, app| !view.compare_running_now(app)), "取消后仍在运行");
@@ -1011,13 +1319,13 @@ mod workbench {
                 assert!(!view.model.compare_running);
                 view.model.close_prompt = None;
                 assert!(view.model.allow_system_close(), "{:?}", view.model.facts());
-                view.perform("compare-structure", cx);
             });
+            window.click("compare-structure", cx);
         })
         .unwrap();
         assert!(pump(cx, window, &view, |view, app| view.compare_structure_ready(app)), "取消后的下一次结构比较没有完成");
         cx.update_window(window, |_, window, cx| {
-            view.update(cx, |view, cx| view.perform("compare-place:structure", cx));
+            window.click("compare-place:structure", cx);
             window.render_frame(cx);
             view.update(cx, |view, cx| {
                 let draft = view.model.active_tab().expect("query").draft.clone();
@@ -1031,6 +1339,119 @@ mod workbench {
         })
         .unwrap();
         assert_db_unchanged(&target_file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    fn rendered_controls_pick_database_schema_table_and_compare_key(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("rillsql-compare-scope-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        cx.update(gpui_kit::init);
+        let (window, view) = cx.update(|cx| {
+            let bounds = gpui_kit::Bounds { origin: Point::default(), size: size(px(1200.), px(900.)) };
+            let (window, view) = gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |_, cx| {
+                    cx.new(|_| {
+                        let mut pane = ComparePane::new(Arc::clone(&services));
+                        pane.choices = vec![
+                            Choice {
+                                id: "left".into(),
+                                name: "左".into(),
+                                engine: "postgres".into(),
+                                databases: vec!["app".into(), "warehouse".into()],
+                                catalog_error: None,
+                            },
+                            Choice {
+                                id: "right".into(),
+                                name: "右".into(),
+                                engine: "postgres".into(),
+                                databases: vec!["app".into(), "warehouse".into()],
+                                catalog_error: None,
+                            },
+                        ];
+                        pane.baseline = SidePick { connection_id: "left".into(), database: "app".into(), schema: String::new() };
+                        pane.target = SidePick { connection_id: "right".into(), database: "app".into(), schema: String::new() };
+                        pane.schemas.insert(schema_key("left", "app"), SchemaState::Ready(vec!["public".into(), "analytics".into()]));
+                        pane.schemas.insert(schema_key("right", "app"), SchemaState::Manual("读取 schema 失败：权限不足".into()));
+                        pane.structure = Some(StructureReport {
+                            refused: None,
+                            script: String::new(),
+                            incomplete: true,
+                            notes: Vec::new(),
+                            only_baseline: Vec::new(),
+                            only_target: Vec::new(),
+                            changed: Vec::new(),
+                            tables: vec![crate::compare::TableChoice {
+                                name: "orders".into(),
+                                on_both: true,
+                                needs_key_choice: true,
+                                keys: vec![
+                                    crate::compare::KeyChoice { name: "uk_code".into(), columns: vec!["code".into()], primary: false },
+                                    crate::compare::KeyChoice { name: "uk_email".into(), columns: vec!["email".into()], primary: false },
+                                ],
+                            }],
+                        });
+                        pane.structure_status = Status::Incomplete;
+                        pane.selected.insert("orders".into(), true);
+                        pane
+                    })
+                },
+            )
+            .expect("compare pane");
+            (window.into(), view)
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("compare-baseline:left").label(), Some("基准 左"));
+            assert_eq!(window.find("compare-target:right").label(), Some("对照 右"));
+            assert_eq!(window.find("compare-database:baseline:warehouse").label(), Some("基准 数据库 warehouse"));
+            assert_eq!(window.find("compare-schema:baseline:public").label(), Some("基准 选择 schema public"));
+            assert_eq!(window.find("compare-schema:baseline:analytics").label(), Some("基准 选择 schema analytics"));
+            let manual = window.find("compare-schema-input:target");
+            assert_eq!(manual.role(), Some(gpui_kit::Role::TextInput));
+            assert!(manual.label().unwrap_or("").contains("读取 schema 失败：权限不足"), "{:?}", manual.label());
+            assert_eq!(window.find("compare-toggle:orders").label(), Some("on orders"));
+            assert_eq!(window.find("compare-key:orders|uk_code").label(), Some("key orders uk_code"));
+            assert_eq!(window.find("compare-key:orders|uk_email").label(), Some("key orders uk_email"));
+            view.update(cx, |pane, _| {
+                let text = pane.lines().join("\n");
+                assert!(text.contains("读取 schema 失败：权限不足"), "{text}");
+                assert!(text.contains("schema public"), "{text}");
+                assert!(pane.refuse_local().is_some_and(|message| message.contains("不生成脚本")), "{text}");
+                assert!(!pane.structure_ready());
+            });
+            window.click("compare-baseline:left", cx);
+            window.click("compare-target:right", cx);
+            window.click("compare-schema:baseline:public", cx);
+            window.click("compare-schema-input:target", cx);
+            window.input("dbo", cx);
+            window.press("enter", cx);
+            window.click("compare-key:orders|uk_email", cx);
+            window.click("compare-toggle:orders", cx);
+            view.update(cx, |pane, _| {
+                let text = pane.lines().join("\n");
+                assert!(text.contains("schema-on public"), "{text}");
+                assert!(text.contains("schema-manual dbo"), "{text}");
+                assert!(text.contains("chosen orders uk_email"), "{text}");
+                assert!(text.contains("off orders"), "{text}");
+                assert!(pane.refuse_local().is_none(), "{text} {:?}", pane.refuse_local());
+                assert!(!pane.structure_ready());
+                assert!(pane.structure.as_ref().is_some_and(|report| report.script.is_empty()));
+            });
+            window.click("compare-toggle:orders", cx);
+            window.click("compare-database:baseline:warehouse", cx);
+            view.update(cx, |pane, _| {
+                let text = pane.lines().join("\n");
+                assert!(text.contains("on orders"), "{text}");
+                assert!(text.contains("数据库 warehouse"), "{text}");
+                assert!(pane.refuse_local().is_some_and(|message| message.contains("不生成脚本")), "{text}");
+            });
+        })
+        .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

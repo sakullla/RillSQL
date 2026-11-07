@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use gpui_kit::{Context, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _, Window, div, px};
+use gpui_kit::{
+    Context, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _,
+    Window, div, px,
+};
 
 use crate::application::tasks::{TaskOutcome, TaskToken};
 use crate::application::AppServices;
@@ -353,20 +356,35 @@ mod tests {
         }), "关系图没有显示表、连线或范围外的外键");
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
+            assert!(window.try_find("diagram-card:orders").is_some(), "订单表没有可悬停卡片");
+            assert!(window.try_find("diagram-card:customers").is_some(), "客户表没有可悬停卡片");
+            assert_eq!(window.find("diagram-card:orders").label(), Some("card orders"));
             view.update(cx, |view, cx| {
                 let text = view.diagram_text(cx);
                 assert!(text.contains("只读"), "{text}");
                 assert!(text.contains("customers.id") || text.contains("fk orders.customer_id") || text.contains("orders.customer_id"), "{text}");
                 assert!(text.contains("->") && text.contains("customers"), "{text}");
                 assert!(text.contains("outside") && text.contains("missing_customers"), "{text}");
+                assert!(text.contains("omitted") || text.contains("没有读到的表") || text.contains("missing_customers"), "{text}");
                 assert!(view.diagram_column("customers", cx).unwrap() < view.diagram_column("orders", cx).unwrap(), "{text}");
-                view.perform("diagram-hover:orders", cx);
+            });
+            window.hover("diagram-card:orders", cx);
+            view.update(cx, |view, cx| {
                 let hot = view.diagram_text(cx);
                 assert!(hot.contains("hot orders"), "{hot}");
+                assert!(hot.contains("linked customers"), "{hot}");
                 assert!(hot.contains("hot-wire"), "{hot}");
                 assert!(hot.contains("dim notes"), "{hot}");
-                view.perform("open-diagram:missing|main||缺", cx);
             });
+            window.hover("diagram-pad", cx);
+            view.update(cx, |view, cx| {
+                let text = view.diagram_text(cx);
+                assert!(text.contains("card orders"), "{text}");
+                assert!(!text.contains("hot orders"), "{text}");
+                assert!(!text.contains("hot-wire"), "{text}");
+                assert!(text.contains("wire") && text.contains("missing_customers"), "{text}");
+            });
+            view.update(cx, |view, cx| view.perform("open-diagram:missing|main||缺", cx));
         })
         .unwrap();
         assert!(pump(cx, window, &view, |view, app| {
@@ -417,7 +435,59 @@ mod tests {
 }
 
 impl Render for DiagramPane {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().id("diagram-pane").flex().flex_col().gap(px(4.)).child(SharedString::from(self.lines().join("\n")))
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
+        let summary = SharedString::from(self.lines().join("\n"));
+        let diagram = self.diagram.clone();
+        let hovered = self.hovered.clone();
+        let mut column = div().id("diagram-pane").w(px(480.)).flex().flex_col().gap(px(4.));
+        column = column.child(div().id("diagram-pad").test_support().w(px(220.)).h(px(28.)));
+        if let Some(diagram) = diagram.as_ref() {
+            for table in &diagram.tables {
+                let name = table.name.clone();
+                let mark = hover_mark(hovered.as_deref(), &name, diagram);
+                let label = SharedString::from(format!("{mark} {}", table.name));
+                let hovered_name = name.clone();
+                let card_entity = entity.clone();
+                column = column.child(
+                    div()
+                        .id(SharedString::from(format!("diagram-card:{name}")))
+                        .test_support()
+                        .w(px(220.))
+                        .min_h(px(36.))
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(label.clone())
+                        .child(label)
+                        .on_hover(move |inside, _, cx| {
+                            let hovered_name = hovered_name.clone();
+                            card_entity.update(cx, |pane, cx| {
+                                if *inside {
+                                    pane.hovered = Some(hovered_name);
+                                } else if pane.hovered.as_deref() == Some(hovered_name.as_str()) {
+                                    pane.hovered = None;
+                                }
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+            for edge in &diagram.edges {
+                let mark = if edge_hot(hovered.as_deref(), edge) { "hot-wire" } else if hovered.is_some() { "dim-wire" } else { "wire" };
+                let label = SharedString::from(format!(
+                    "{mark} {}.{} -> {}.{}",
+                    edge.from_table,
+                    edge.from_columns.join(", "),
+                    edge.to_table,
+                    edge.to_columns.join(", ")
+                ));
+                column = column.child(
+                    div()
+                        .id(SharedString::from(format!("diagram-wire:{}:{}:{}", edge.name, edge.from_table, edge.to_table)))
+                        .aria_label(label.clone())
+                        .child(label),
+                );
+            }
+        }
+        column.child(div().id("diagram-summary").child(summary))
     }
 }
