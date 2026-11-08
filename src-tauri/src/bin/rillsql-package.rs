@@ -116,6 +116,21 @@ fn check_directory(directory: &Path, require_complete: bool) -> Result<(), Strin
     Ok(())
 }
 
+fn resolve_out_dir(base: &Path, out: &Path) -> Result<PathBuf, String> {
+    let absolute = if out.is_absolute() { out.to_path_buf() } else { base.join(out) };
+    fs::create_dir_all(&absolute).map_err(|err| format!("create {}: {err}", absolute.display()))?;
+    let canonical = fs::canonicalize(&absolute).map_err(|err| format!("output directory {}: {err}", absolute.display()))?;
+    Ok(strip_verbatim_prefix(&canonical))
+}
+
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(stripped) => PathBuf::from(stripped),
+        None => path.to_path_buf(),
+    }
+}
+
 fn find_named(directory: &Path, name: &str) -> Result<Option<PathBuf>, String> {
     let mut found = None;
     visit(directory, &mut |path| {
@@ -157,22 +172,25 @@ fn package(args: &Args) -> Result<(), String> {
         fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).map_err(|err| err.to_string())?;
     }
 
+    let base = env::current_dir().map_err(|err| err.to_string())?;
+    // `--out` 在工作流里是相对路径。cargo-packager 会按切换后的当前目录解析它，
+    // 于是文件落到 src-tauri/src-tauri/target/packager，随后的 rename 找不到目录。
+    let out = resolve_out_dir(&base, &args.out)?;
     let mut config = load_config(&manifest_dir)?;
     config.version = PRODUCT_VERSION.to_owned();
     config.binaries_dir = Some(stage);
-    config.out_dir = args.out.clone();
+    config.out_dir = out.clone();
     config.log_level = Some(LogLevel::Info);
     config.formats = Some(parse_formats(&args.formats)?);
-    fs::create_dir_all(&config.out_dir).map_err(|err| err.to_string())?;
     env::set_current_dir(&manifest_dir).map_err(|err| err.to_string())?;
 
     let outputs = cargo_packager::package(&config).map_err(|err| format!("cargo-packager {}: {err}", rillsql_lib::release::PACKAGER_VERSION))?;
-    normalize_outputs(&args.out, &outputs)?;
-    sign_outputs(&args.out)?;
-    check_directory(&args.out, args.require_complete)?;
-    if let Some(nsis) = find_named(&args.out, &windows_nsis_name(PRODUCT_VERSION))? {
+    normalize_outputs(&out, &outputs)?;
+    sign_outputs(&out)?;
+    check_directory(&out, args.require_complete)?;
+    if let Some(nsis) = find_named(&out, &windows_nsis_name(PRODUCT_VERSION))? {
         let inspection = inspect_windows_nsis(&nsis, PRODUCT_VERSION)?;
-        let report = args.out.join("windows-nsis.txt");
+        let report = out.join("windows-nsis.txt");
         let mut file = fs::File::create(&report).map_err(|err| err.to_string())?;
         writeln!(file, "name={}", inspection.name).map_err(|err| err.to_string())?;
         writeln!(file, "size={}", inspection.size).map_err(|err| err.to_string())?;
@@ -304,6 +322,29 @@ fn write_signature(secret: &minisign::SecretKey, path: &Path) -> Result<(), Stri
     output.write_all(encoded.as_bytes()).map_err(|err| err.to_string())?;
     println!("signed {}", sig_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod out_dir_tests {
+    use super::{resolve_out_dir, strip_verbatim_prefix};
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn relative_output_dir_is_anchored_before_the_manifest_directory_becomes_current() {
+        let root = std::env::temp_dir().join(format!("rillsql-packager-out-{}", uuid::Uuid::new_v4()));
+        let relative = PathBuf::from("src-tauri").join("target").join("packager");
+        let resolved = resolve_out_dir(&root, &relative).unwrap();
+        let expected = strip_verbatim_prefix(&fs::canonicalize(root.join(&relative)).unwrap());
+        assert_eq!(resolved, expected);
+        let parts: Vec<String> = resolved.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect();
+        assert!(parts.windows(3).any(|window| window == ["src-tauri", "target", "packager"]), "{parts:?}");
+        assert!(
+            !parts.windows(4).any(|window| window == ["src-tauri", "src-tauri", "target", "packager"]),
+            "{parts:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(all(test, feature = "packager"))]
