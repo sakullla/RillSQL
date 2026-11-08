@@ -583,8 +583,10 @@ impl GridPane {
     }
 
     fn fetch_at(&mut self, offset: u64, replace: bool, cx: &mut Context<Self>) {
-        // 分页追加不阻塞交换来源：已读取的窗口仍然完整。
-        self.fetching = replace;
+        // 分页追加不阻塞交换来源：已读取的窗口仍然完整；替换读取开始后不能被追加清掉。
+        if replace {
+            self.fetching = true;
+        }
         self.session.token = self.session.token.saturating_add(1);
         let token = self.session.token;
         self.scheduled = token;
@@ -609,6 +611,10 @@ impl GridPane {
                                 this.loading_more = false;
                                 return;
                             }
+                            let failure = match (&described, &paged) {
+                                (Err(error), _) | (_, Err(error)) => error.clone(),
+                                _ => "表格读取失败，已清空未能确认的旧数据。".to_owned(),
+                            };
                             if let (Ok(schema_dto), Ok(page)) = (described, paged) {
                                 if let Ok(schema) = schema_from_dto(&schema_dto) {
                                     let columns = columns_from_schema(&schema, true);
@@ -624,12 +630,14 @@ impl GridPane {
                                     this.fetching = false;
                                     this.sync_table(cx);
                                 } else {
+                                    this.notice = "表格结构无法识别，已清空未能确认的旧数据。".to_owned();
                                     if replace { this.session.drop_stale_sheet(); }
                                     this.loading_more = false;
                                     this.fetching = false;
                                     this.sync_table(cx);
                                 }
                             } else {
+                                this.notice = failure;
                                 if replace { this.session.drop_stale_sheet(); }
                                 this.loading_more = false;
                                 this.fetching = false;
@@ -644,7 +652,7 @@ impl GridPane {
     }
 
     fn load_next_page(&mut self, cx: &mut Context<Self>) {
-        if self.loading_more || !self.session.has_more_rows() || self.session.mode != GridMode::Table || self.session.target.connection_id.is_empty() {
+        if self.loading_more || self.fetching || !self.session.has_more_rows() || self.session.mode != GridMode::Table || self.session.target.connection_id.is_empty() {
             return;
         }
         self.loading_more = true;

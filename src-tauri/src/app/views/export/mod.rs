@@ -865,6 +865,7 @@ impl ExchangePane {
         match self.source.kind {
             ExchangeSourceKind::Query if self.source.running => "查询正在执行，结果尚未就绪。",
             ExchangeSourceKind::Query => "当前查询还没有结果；先执行一次查询，再导出或交换。",
+            ExchangeSourceKind::Table if self.source.running => "表数据正在读取，当前行数尚未完整。",
             ExchangeSourceKind::Table => "当前没有表数据；先在对象树里打开一张表。",
         }
     }
@@ -1062,6 +1063,18 @@ impl Render for ExchangePane {
                     );
                 }
             }
+        }
+        if self.source.running && !self.source.kind.is_query() {
+            source_body = source_body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_size(px(12.))
+                    .text_color(p.text_muted)
+                    .child(Spinner::new().xsmall().color(p.accent))
+                    .child(SharedString::from("表数据正在读取，当前行数尚未完整。")),
+            );
         }
         if self.source.has_columns() && !self.source.running {
             let partial = if self.source.truncated { "（仅已读取部分）" } else { "" };

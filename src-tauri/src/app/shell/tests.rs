@@ -1704,6 +1704,35 @@ fn exchange_source_buttons_route_through_the_shell(cx: &mut gpui_kit::TestAppCon
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn spec_matches_table_compares_connection_database_table_and_schema() {
+    use crate::app::shell::view::spec_matches_table;
+    use crate::grid::commands::TableRef;
+
+    fn table(connection: &str, database: &str, schema: &str, name: &str) -> TableRef {
+        TableRef {
+            connection_id: connection.to_owned(),
+            database: database.to_owned(),
+            schema: schema.to_owned(),
+            table: name.to_owned(),
+            engine: "mysql".to_owned(),
+            include_foreign_keys: false,
+        }
+    }
+
+    // MySQL 规格的 schema 段为空：只比较连接、库和表名。
+    let mysql = "c1|应用|shop||orders|mysql|dev";
+    assert!(spec_matches_table(mysql, &table("c1", "shop", "shop", "orders")));
+    assert!(!spec_matches_table(mysql, &table("c1", "shop", "shop", "items")), "表名不同不能匹配");
+    assert!(!spec_matches_table(mysql, &table("c2", "shop", "shop", "orders")), "连接不同不能匹配");
+    assert!(!spec_matches_table(mysql, &table("c1", "warehouse", "shop", "orders")), "库不同不能匹配");
+
+    // 规格写出 schema 时，schema 不同就是不匹配。
+    let postgres = "c1|应用|shop|public|orders|postgres|dev";
+    assert!(spec_matches_table(postgres, &table("c1", "shop", "public", "orders")));
+    assert!(!spec_matches_table(postgres, &table("c1", "shop", "sales", "orders")), "schema 不同不能匹配");
+}
+
 #[gpui_kit::test]
 fn exchange_source_follows_the_active_item_and_query_source_blocks_full_export(cx: &mut gpui_kit::TestAppContext) {
     cx.executor().allow_parking();

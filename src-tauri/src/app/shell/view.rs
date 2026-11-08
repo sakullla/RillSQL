@@ -1085,13 +1085,7 @@ impl Workbench {
                     None => true,
                     Some(item) if item.kind == WorkItemKind::Query => false,
                     Some(item) => match (item.spec.as_deref(), table.as_ref()) {
-                        (Some(spec), Some(table)) => {
-                            let parts: Vec<&str> = spec.split('|').collect();
-                            parts.first() == Some(&table.connection_id.as_str())
-                                && parts.get(2) == Some(&table.database.as_str())
-                                && parts.get(3) == Some(&table.schema.as_str())
-                                && parts.get(4) == Some(&table.table.as_str())
-                        }
+                        (Some(spec), Some(table)) => spec_matches_table(spec, table),
                         _ => false,
                     },
                 };
@@ -1195,6 +1189,18 @@ impl Render for Workbench {
         self.refresh_tree_on_connect(cx);
         self.render_root(window, cx)
     }
+}
+
+/// 当前工作项规格是否指向网格里的同一张表。MySQL 的对象没有 schema，
+/// describe 会回填库名，所以只在两侧都非空时比较 schema。
+pub(crate) fn spec_matches_table(spec: &str, table: &crate::grid::commands::TableRef) -> bool {
+    let parts: Vec<&str> = spec.split('|').collect();
+    parts.first() == Some(&table.connection_id.as_str())
+        && parts.get(2) == Some(&table.database.as_str())
+        && parts
+            .get(3)
+            .is_none_or(|schema| schema.is_empty() || Some(*schema) == Some(table.schema.as_str()))
+        && parts.get(4) == Some(&table.table.as_str())
 }
 
 fn parse_target(spec: &str) -> Option<GridTarget> {
