@@ -11,7 +11,10 @@ use crate::app::{AppPage, CommandSpec, Density, Effect, FocusTarget, Locale, She
 use crate::application::tasks::TaskToken;
 use crate::application::{AppServices, TaskBoard};
 use crate::connections::model::{CaMode, Engine, SshAuthKind};
+use crate::app::views::connections::LinkStatus;
+use crate::app::views::query::object_spec;
 use crate::i18n;
+use crate::query::assist::TreeObject;
 use crate::state::{AppState, Platform, SessionState, SessionTab, ShellSettings, StateError};
 
 use super::close::{draft_pending, evaluate, message_key, update_block_key, CloseFacts, CloseKind, CloseScope};
@@ -146,6 +149,8 @@ pub enum DraftField {
     Passphrase,
     Replica,
     Filter,
+    /// 资源管理器里的对象名筛选；与连接列表的 `Filter` 分开，互不覆盖。
+    ObjectFilter,
     HistorySearch,
     SaveName,
     PaletteQuery,
@@ -216,6 +221,12 @@ pub struct WorkbenchModel {
     pub table_spec: Option<String>,
     /// 对象树当前选中的 `id|name|database|schema|table|engine|env`。
     pub object_spec: Option<String>,
+    /// 资源管理器对象区的筛选词。只匹配对象名，不动连接列表的 `Filter`。
+    pub object_filter: String,
+    /// 最近一次从查询页同步的对象索引；资源管理器、对象筛选和快速打开共用这一份。
+    pub catalog: Vec<TreeObject>,
+    /// 最近一次对象读取的错误；与空目录、筛选无命中分开呈现。
+    pub catalog_error: String,
     pub exchange_open: bool,
     /// 导入、导出、dump 或 migrate 仍在跑。关闭守卫把它和网格暂存、查询草稿分开。
     pub exchange_running: bool,
@@ -273,6 +284,9 @@ impl WorkbenchModel {
             tool: WorkTool::Query,
             table_spec: None,
             object_spec: None,
+            object_filter: String::new(),
+            catalog: Vec::new(),
+            catalog_error: String::new(),
             exchange_open: false,
             exchange_running: false,
             compare_running: false,
@@ -845,6 +859,7 @@ impl WorkbenchModel {
                 group: "command",
                 label_key: command.label_key,
                 label: self.text(command.label_key),
+                detail: String::new(),
             });
         }
         for row in &self.connections.rows {
@@ -853,9 +868,106 @@ impl WorkbenchModel {
                 group: "connection",
                 label_key: "shell.paletteGroup.connection",
                 label: row.saved.name.clone(),
+                detail: String::new(),
             });
         }
+        entries.extend(self.catalog_entries());
         filter_palette(&entries, &self.palette_query, self.shell.palette_tables_only)
+    }
+
+    /// 记录一次对象读取结果。内容没变就不重新分配，渲染每帧同步也不会抖动。
+    /// 返回 true 表示索引确实变了。
+    pub fn set_catalog(&mut self, objects: &[TreeObject], error: &str) -> bool {
+        if self.catalog.as_slice() == objects && self.catalog_error == error {
+            return false;
+        }
+        self.catalog = objects.to_vec();
+        self.catalog_error = error.to_owned();
+        true
+    }
+
+    /// 快速打开里的真实表 / 视图。label 用对象名，保证搜索匹配的是对象；
+    /// 库、模式与连接放在 detail 里，不干扰排序。
+    pub fn catalog_entries(&self) -> Vec<PaletteEntry> {
+        self.catalog
+            .iter()
+            // 断开或连接失败的旧对象不再冒充“当前可打开”；状态未知时保留（测试与离线读取）。
+            .filter(|object| {
+                self.connections
+                    .status
+                    .get(&object.connection_id)
+                    .is_none_or(|status| *status == LinkStatus::Connected)
+            })
+            .filter(|object| is_table_object(object))
+            .map(|object| {
+                let environment = self
+                    .connections
+                    .rows
+                    .iter()
+                    .find(|row| row.saved.id == object.connection_id)
+                    .map(|row| row.saved.env.clone())
+                    .unwrap_or_default();
+                PaletteEntry {
+                    id: format!("open-table:{}", object_spec(object, &environment)),
+                    group: "table",
+                    label_key: "shell.paletteGroup.table",
+                    label: object.name.clone(),
+                    detail: object_detail(object),
+                }
+            })
+            .collect()
+    }
+
+    /// 某一连接下已读取的对象，按对象名做不区分大小写的包含匹配。
+    /// 对象树保留全部关系型对象（表、视图、触发器、函数等）；只有快速打开
+    /// 才用 is_table_object 收窄到表与视图。Redis、MongoDB 不进入关系型索引。
+    pub fn catalog_for(&self, connection_id: &str, filter: &str) -> Vec<&TreeObject> {
+        let needle = filter.trim().to_lowercase();
+        self.catalog
+            .iter()
+            .filter(|object| object.connection_id == connection_id)
+            .filter(|object| relational_engine(&object.engine))
+            .filter(|object| needle.is_empty() || object.name.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    /// 连接是否有任何已读取的对象（不受对象筛选影响），用来区分空目录与筛选无命中。
+    pub fn has_objects(&self, connection_id: &str) -> bool {
+        !self.catalog_for(connection_id, "").is_empty()
+    }
+
+    /// 资源管理器按真实元数据分组；筛选词来自独立的 object_filter。
+    pub fn object_groups(&self, connection_id: &str) -> Vec<ObjectGroup> {
+        let objects = self.catalog_for(connection_id, &self.object_filter);
+        group_objects(&objects)
+    }
+
+    /// 对象区空态文案：读取失败、目录为空、筛选无命中必须能分辨。
+    pub fn object_notice(&self, connection_id: &str) -> Option<&'static str> {
+        if !self.object_groups(connection_id).is_empty() {
+            return None;
+        }
+        if !self.catalog_error.is_empty() {
+            return Some("ui.explorer.error");
+        }
+        if !self.has_objects(connection_id) {
+            return Some("ui.explorer.noObjects");
+        }
+        Some("ui.explorer.noMatch")
+    }
+
+    /// 快速打开的空态文案；只在筛选结果为空时调用。
+    pub fn palette_empty_key(&self) -> &'static str {
+        if !self.catalog_error.is_empty() {
+            return "ui.palette.error";
+        }
+        if self.shell.palette_tables_only {
+            if self.catalog_entries().is_empty() {
+                return "ui.palette.noObjects";
+            }
+            return "ui.explorer.noMatch";
+        }
+        "ui.palette.empty"
     }
 
     pub fn facts(&self) -> CloseFacts {
@@ -1357,6 +1469,7 @@ impl WorkbenchModel {
             DraftField::BundlePassphrase => self.bundle_passphrase = value,
             DraftField::Url => self.url_buffer = value,
             DraftField::Filter => self.connections.filter_text = value,
+            DraftField::ObjectFilter => self.object_filter = value,
             DraftField::HistorySearch => self.history.filter_text = value,
             DraftField::SaveName => self.history.save_name = value,
             DraftField::PaletteQuery => self.palette_query = value,
@@ -1393,6 +1506,7 @@ impl WorkbenchModel {
             DraftField::BundlePassphrase => self.bundle_passphrase.clone(),
             DraftField::Url => self.url_buffer.clone(),
             DraftField::Filter => self.connections.filter_text.clone(),
+            DraftField::ObjectFilter => self.object_filter.clone(),
             DraftField::HistorySearch => self.history.filter_text.clone(),
             DraftField::SaveName => self.history.save_name.clone(),
             DraftField::PaletteQuery => self.palette_query.clone(),
@@ -1679,7 +1793,81 @@ pub struct PaletteEntry {
     pub id: String,
     pub group: &'static str,
     pub label_key: &'static str,
+    /// 搜索与显示都用它；对象条目是对象名，命令和连接是各自的文案。
     pub label: String,
+    /// 补充说明，例如对象的“库.模式 · 连接”；没有时为空。
+    pub detail: String,
+}
+
+/// 资源管理器里的一个层级组：同一连接下相同的 (database, schema)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectGroup {
+    pub database: String,
+    pub schema: String,
+    pub objects: Vec<TreeObject>,
+}
+
+impl ObjectGroup {
+    /// 组标题按真实元数据生成：数据库一行，模式非空再一行。
+    /// 本地库和专用引擎没有模式时不制造空标题。
+    pub fn headings(&self) -> Vec<String> {
+        let mut headings = Vec::new();
+        if !self.database.is_empty() {
+            headings.push(self.database.clone());
+        }
+        if !self.schema.is_empty() {
+            headings.push(self.schema.clone());
+        }
+        headings
+    }
+}
+
+/// Redis / MongoDB 的对象不是关系型表，不能参与表层级或“打开表”。
+pub fn relational_engine(engine: &str) -> bool {
+    !matches!(engine.to_ascii_lowercase().as_str(), "redis" | "mongodb" | "mongo")
+}
+
+/// 只有真实表 / 视图才进入对象索引。
+pub fn is_table_object(object: &TreeObject) -> bool {
+    relational_engine(&object.engine) && matches!(object.kind.as_str(), "table" | "view")
+}
+
+/// 按 (database, schema) 分组，保持对象原有顺序；非关系型对象不产生层级。
+pub fn group_objects(objects: &[&TreeObject]) -> Vec<ObjectGroup> {
+    let mut groups: Vec<ObjectGroup> = Vec::new();
+    for object in objects {
+        if !is_table_object(object) {
+            continue;
+        }
+        match groups
+            .iter_mut()
+            .find(|group| group.database == object.database && group.schema == object.schema)
+        {
+            Some(group) => group.objects.push((*object).clone()),
+            None => groups.push(ObjectGroup {
+                database: object.database.clone(),
+                schema: object.schema.clone(),
+                objects: vec![(*object).clone()],
+            }),
+        }
+    }
+    groups
+}
+
+/// 对象条目的补充说明：“库.模式 · 连接”；缺哪段就少哪段。
+pub fn object_detail(object: &TreeObject) -> String {
+    let mut scope = object.database.clone();
+    if !object.schema.is_empty() {
+        if !scope.is_empty() {
+            scope.push('.');
+        }
+        scope.push_str(&object.schema);
+    }
+    match (scope.is_empty(), object.connection_name.is_empty()) {
+        (true, _) => object.connection_name.clone(),
+        (false, true) => scope,
+        (false, false) => format!("{scope} · {}", object.connection_name),
+    }
 }
 
 pub fn filter_palette(entries: &[PaletteEntry], query: &str, tables_only: bool) -> Vec<PaletteEntry> {

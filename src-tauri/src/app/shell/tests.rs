@@ -1845,3 +1845,267 @@ fn command_shift_f_formats_sql_in_the_editor(cx: &mut gpui_kit::TestAppContext) 
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 构造一条已读取对象，字段顺序与 TreeObject 一致。
+fn tree_object(connection_id: &str, connection_name: &str, engine: &str, database: &str, schema: &str, name: &str, kind: &str) -> crate::query::assist::TreeObject {
+    crate::query::assist::TreeObject {
+        connection_id: connection_id.to_owned(),
+        connection_name: connection_name.to_owned(),
+        engine: engine.to_owned(),
+        database: database.to_owned(),
+        schema: schema.to_owned(),
+        name: name.to_owned(),
+        kind: kind.to_owned(),
+    }
+}
+
+#[test]
+fn quick_open_lists_loaded_tables_and_views_and_opens_the_matching_target() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    let orders = tree_object("pg", "销售库", "postgres", "shop", "public", "orders", "table");
+    let report = tree_object("pg", "销售库", "postgres", "shop", "public", "order_view", "view");
+    // Redis 的键不是关系型表，不能出现在快速打开里。
+    let session = tree_object("redis", "缓存", "redis", "0", "", "session", "table");
+    assert!(model.set_catalog(&[orders.clone(), report, session], ""));
+    model.shell.palette_tables_only = true;
+
+    let entries = model.palette_entries();
+    let labels: Vec<&str> = entries.iter().map(|entry| entry.label.as_str()).collect();
+    assert_eq!(labels, vec!["orders", "order_view"], "快速打开只列真实表 / 视图");
+    assert!(entries.iter().all(|entry| entry.group == "table"), "命令和连接不应混入快速打开");
+    // 断开连接后旧索引不再冒充可打开对象；重新连上才恢复。
+    model
+        .connections
+        .status
+        .insert("pg".into(), crate::app::views::connections::LinkStatus::Disconnected);
+    assert!(model.palette_entries().is_empty(), "断开连接后不列旧对象");
+    model
+        .connections
+        .status
+        .insert("pg".into(), crate::app::views::connections::LinkStatus::Connected);
+    assert_eq!(model.palette_entries().len(), 2);
+
+    let target = crate::app::views::query::object_spec(&orders, "");
+    let wanted = format!("open-table:{target}");
+    assert_eq!(entries[0].id, wanted);
+    assert_eq!(entries[0].detail, "shop.public · 销售库");
+
+    let effect = model.dispatch(&entries[0].id);
+    assert!(matches!(effect, Some(crate::app::Effect::None)));
+    assert_eq!(model.tabs.len(), 1);
+    assert_eq!(model.tabs[0].kind, WorkItemKind::Table);
+    assert_eq!(model.tabs[0].spec.as_deref(), Some(target.as_str()), "选中后打开的就是这个目标");
+    assert_eq!(model.executions, 0, "快速打开不执行 SQL");
+    assert!(model.pending.is_empty(), "快速打开不应排队其他任务");
+
+    // 普通命令面板仍组合命令、连接和对象。
+    model.shell.palette_tables_only = false;
+    let all = model.palette_entries();
+    assert!(all.iter().any(|entry| entry.group == "command"));
+    assert!(all.iter().any(|entry| entry.group == "table" && entry.label == "orders"));
+    assert_eq!(all.iter().filter(|entry| entry.group == "table").count(), 2);
+}
+
+#[test]
+fn explorer_keeps_non_table_objects_but_quick_open_does_not() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    let orders = tree_object("pg", "销售库", "postgres", "shop", "public", "orders", "table");
+    let trigger = tree_object("pg", "销售库", "postgres", "shop", "public", "orders_touch", "trigger");
+    assert!(model.set_catalog(&[orders, trigger], ""));
+
+    let objects = model.catalog_for("pg", "");
+    let explorer: Vec<&str> = objects.iter().map(|object| object.name.as_str()).collect();
+    assert_eq!(explorer, vec!["orders", "orders_touch"], "对象树保留触发器等其他关系型对象");
+
+    model.shell.palette_tables_only = true;
+    let entries = model.palette_entries();
+    let palette: Vec<&str> = entries.iter().map(|entry| entry.label.as_str()).collect();
+    assert_eq!(palette, vec!["orders"], "快速打开只列可打开的表 / 视图");
+}
+
+#[test]
+fn object_filter_matches_names_and_keeps_empty_no_match_and_error_apart() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    let orders = tree_object("pg", "销售库", "postgres", "shop", "public", "orders", "table");
+    let people = tree_object("pg", "销售库", "postgres", "shop", "public", "people", "table");
+    let access = tree_object("pg", "销售库", "postgres", "shop", "analytics", "access_log", "view");
+    assert!(model.set_catalog(&[orders, people, access], ""));
+
+    model.object_filter = "ORD".into();
+    let groups = model.object_groups("pg");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].objects.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(), vec!["orders"]);
+    assert_eq!(model.object_notice("pg"), None, "有命中时没有空态");
+
+    model.object_filter = "missing".into();
+    assert!(model.object_groups("pg").is_empty());
+    assert_eq!(model.object_notice("pg"), Some("ui.explorer.noMatch"));
+
+    model.object_filter.clear();
+    assert_eq!(model.object_groups("pg").len(), 2, "清除对象筛选后目录恢复");
+
+    let empty = WorkbenchModel::new(Shell::default());
+    assert_eq!(empty.object_notice("pg"), Some("ui.explorer.noObjects"));
+
+    model.object_filter = "missing".into();
+    assert!(model.set_catalog(&[tree_object("pg", "销售库", "postgres", "shop", "public", "orders", "table")], "连接超时"));
+    assert_eq!(model.object_notice("pg"), Some("ui.explorer.error"), "读取失败优先于筛选无命中");
+    let texts = [
+        model.text("ui.explorer.noObjects"),
+        model.text("ui.explorer.noMatch"),
+        model.text("ui.explorer.error"),
+    ];
+    assert_ne!(texts[0], texts[1]);
+    assert_ne!(texts[1], texts[2]);
+    assert_ne!(texts[0], texts[2]);
+}
+
+#[test]
+fn connection_filter_and_object_filter_stay_independent() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    let orders = tree_object("pg", "销售库", "postgres", "shop", "public", "orders", "table");
+    let people = tree_object("pg", "销售库", "postgres", "shop", "public", "people", "table");
+    assert!(model.set_catalog(&[orders, people], ""));
+
+    model.object_filter = "orders".into();
+    model.connections.filter_text = "no-such-connection".into();
+    assert_eq!(model.object_groups("pg").len(), 1, "连接筛选不改变对象区结果");
+    assert_eq!(model.catalog_for("pg", &model.object_filter).len(), 1);
+
+    model.set_field(DraftField::Filter, "pg".into());
+    assert_eq!(model.object_filter, "orders", "连接筛选不覆盖对象筛选");
+    model.set_field(DraftField::ObjectFilter, "people".into());
+    assert_eq!(model.connections.filter_text, "pg", "对象筛选不覆盖连接筛选");
+    assert_eq!(model.field_value(DraftField::ObjectFilter), "people");
+    assert_eq!(model.catalog_for("pg", &model.object_filter)[0].name, "people");
+}
+
+#[test]
+fn hierarchy_follows_real_database_and_schema_and_skips_document_engines() {
+    let a = tree_object("pg", "销售库", "postgres", "shop", "public", "orders", "table");
+    let b = tree_object("pg", "销售库", "postgres", "shop", "analytics", "events", "view");
+    let local = tree_object("lite", "本地", "sqlite", "main", "", "notes", "table");
+    let redis = tree_object("redis", "缓存", "redis", "0", "", "session", "table");
+    let mongo = tree_object("mongo", "文档", "mongodb", "app", "", "users", "table");
+    let groups = super::model::group_objects(&[&a, &b, &local, &redis, &mongo]);
+
+    assert_eq!(groups.len(), 3);
+    assert_eq!(groups[0].headings(), vec!["shop".to_owned(), "public".to_owned()]);
+    assert_eq!(groups[1].headings(), vec!["shop".to_owned(), "analytics".to_owned()]);
+    assert_eq!(groups[2].headings(), vec!["main".to_owned()], "SQLite 没有模式，不制造空层级");
+    assert!(groups.iter().all(|group| group.objects.iter().all(|object| object.name != "session" && object.name != "users")));
+    assert!(!super::model::is_table_object(&redis));
+    assert!(!super::model::relational_engine("MongoDB"));
+}
+
+#[test]
+fn refreshed_catalog_feeds_palette_and_explorer_from_one_snapshot() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    let orders = tree_object("pg", "销售库", "postgres", "shop", "public", "orders", "table");
+    let people = tree_object("pg", "销售库", "postgres", "shop", "public", "people", "table");
+    assert!(model.set_catalog(&[orders.clone(), people.clone()], ""));
+    assert!(!model.set_catalog(&[orders, people], ""), "内容不变时不再重新分配");
+
+    let explorer: Vec<String> = model.catalog_for("pg", "").iter().map(|object| object.name.clone()).collect();
+    let palette: Vec<String> = model.catalog_entries().iter().map(|entry| entry.label.clone()).collect();
+    assert_eq!(explorer, palette, "对象树与快速打开读同一份索引");
+
+    assert!(model.set_catalog(&[], ""), "目录刷新为空时同一索引一起变空");
+    assert!(model.catalog_entries().is_empty());
+    assert!(model.object_groups("pg").is_empty());
+}
+
+#[test]
+fn tree_retry_starts_only_the_refresh_task() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert!(model.set_catalog(&[], "连接超时"));
+    assert_eq!(model.palette_empty_key(), "ui.palette.error");
+    assert_eq!(model.object_notice("pg"), Some("ui.explorer.error"));
+
+    let tabs = model.tabs.len();
+    assert!(model.dispatch("refresh-tree").is_none(), "刷新没有额外外壳副作用");
+    assert_eq!(model.tabs.len(), tabs);
+    assert_eq!(model.executions, 0);
+    assert!(model.pending.is_empty(), "重试只发起对象读取");
+    assert!(model.commands.is_empty(), "刷新不应顺带记录其他命令");
+
+    let mut empty = WorkbenchModel::new(Shell::default());
+    empty.shell.palette_tables_only = true;
+    assert_eq!(empty.palette_empty_key(), "ui.palette.noObjects");
+    assert!(empty.set_catalog(&[tree_object("pg", "销售库", "postgres", "shop", "public", "orders", "table")], ""));
+    empty.palette_query = "missing".into();
+    assert_eq!(empty.palette_entries().len(), 0);
+    assert_eq!(empty.palette_empty_key(), "ui.explorer.noMatch");
+}
+
+fn wait_for_tree(
+    cx: &mut gpui_kit::TestAppContext,
+    window: gpui_kit::AnyWindowHandle,
+    view: &gpui_kit::Entity<super::view::Workbench>,
+) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(30) {
+        cx.run_until_parked();
+        let _ = cx.update_window(window, |_, window, cx| window.render_frame(cx));
+        if cx.update(|cx| view.read(cx).model.catalog.iter().any(|object| object.name == "item")) {
+            return true;
+        }
+        std::thread::park_timeout(std::time::Duration::from_millis(25));
+    }
+    false
+}
+
+#[gpui_kit::test]
+fn quick_open_lists_the_loaded_tree_and_opens_without_running_sql(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-tree-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("items.sqlite");
+    let config_dir = dir.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async move {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT)").execute(&pool).await.unwrap();
+            sqlx::query("CREATE VIEW item_view AS SELECT id, label FROM item").execute(&pool).await.unwrap();
+            pool.close().await;
+            let services = Arc::new(AppServices::new(Arc::new(Service::new_for_test(config_dir.join("connections.sqlite")))));
+            services.connections.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+            let _ = tx.send(services);
+        });
+    });
+    let services = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite setup");
+    let (window, view) = open_workbench(cx, services, false);
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("refresh-tree", cx));
+    })
+    .unwrap();
+    assert!(wait_for_tree(cx, window, &view), "对象索引没有同步");
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("quick-open", cx);
+            let entries = view.model.palette_entries();
+            let item = entries.iter().find(|entry| entry.label == "item").expect("快速打开没有 item");
+            assert_eq!(item.group, "table");
+            let report = entries.iter().find(|entry| entry.label == "item_view").expect("快速打开没有视图");
+            assert_eq!(report.group, "table");
+            assert!(entries.iter().all(|entry| entry.group == "table"), "快速打开只含表 / 视图");
+            let id = item.id.clone();
+            let spec = id.strip_prefix("open-table:").expect("open-table 目标").to_owned();
+            view.perform(&id, cx);
+            let tab = view.model.active_tab().expect("打开的表工作项");
+            assert_eq!(tab.kind, WorkItemKind::Table);
+            assert_eq!(tab.spec.as_deref(), Some(spec.as_str()));
+            assert!(!view.query_executed(cx), "快速打开不应执行 SQL");
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -372,6 +372,12 @@ impl Workbench {
         self.apply_query_effect(effect);
     }
 
+    /// 对象索引只在渲染时从查询页同步一次；资源管理器、对象筛选和快速打开都读这份快照。
+    fn sync_catalog(&mut self, cx: &mut Context<Self>) {
+        let pane = self.query.read(cx);
+        self.model.set_catalog(pane.tree_objects(), pane.tree_error());
+    }
+
     fn apply_query_effect(&mut self, effect: SyncEffect) {
         for (id, draft) in effect.drafts {
             if let Some(tab) = self.model.tabs.iter_mut().find(|tab| tab.id == id) {
@@ -1044,6 +1050,7 @@ impl Render for Workbench {
         self.boot_state(cx);
         self.pump_jobs(cx);
         self.sync_query(window, cx);
+        self.sync_catalog(cx);
         self.ensure_tool(cx);
         self.ensure_redis(cx);
         self.ensure_mongo(cx);

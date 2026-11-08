@@ -330,16 +330,44 @@ impl Workbench {
     fn explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let width = self.model.layout().sidebar_width.max(220) as f32;
-        let filter = self.input_for(DraftField::Filter, &self.model.text("ui.explorer.filter"), false, window, cx);
-        let objects = self.query.read(cx).tree_objects().to_vec();
-        let tree_error = self.query.read(cx).tree_error().to_owned();
-        let rows: Vec<_> = self.model.connections.filtered().into_iter().cloned().collect();
+        let filter = self.input_for(DraftField::ObjectFilter, &self.model.text("ui.explorer.filterObjects"), false, window, cx);
+        // 对象索引来自模型里的同一份快照；连接列表保持完整，连接筛选只属于连接页。
+        let rows: Vec<_> = self.model.connections.rows.clone();
         let mut list = div().id("explorer-list").flex().flex_col().flex_1().min_h(px(0.)).overflow_y_scroll().px(px(6.)).pb(px(8.));
         if rows.is_empty() {
             list = list.child(
                 kit::empty_state(IconName::Database, self.t("ui.explorer.empty"), self.t("ui.explorer.emptyHint"), &p)
                     .child(kit::primary_button("explorer-new", Some(IconName::Plus), self.t("common.newConnection"), act("new-connection", cx)))
                     .child(kit::tool_button("explorer-sqlite", Some(IconName::FolderOpen), self.t("common.openSqlite"), act("open-sqlite", cx))),
+            );
+        }
+        // 读取失败只留一条带原因的提示和重试入口，不在每个连接下重复。
+        if !self.model.catalog_error.is_empty() {
+            let error = self.model.catalog_error.clone();
+            list = list.child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .mb(px(4.))
+                    .rounded(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(p.danger)
+                            .child(SharedString::from(format!("{}: {}", self.model.text("ui.explorer.error"), error))),
+                    )
+                    .child(kit::tool_button(
+                        "explorer-tree-retry",
+                        Some(IconName::RefreshCw),
+                        self.t("common.retry"),
+                        act("refresh-tree", cx),
+                    )),
             );
         }
         for row in rows {
@@ -354,14 +382,42 @@ impl Workbench {
             match row.saved.engine {
                 Engine::Redis | Engine::Mongodb => {}
                 _ => {
-                    let mine: Vec<_> = objects.iter().filter(|object| object.connection_id == id).cloned().collect();
-                    if mine.is_empty() {
-                        let note = if tree_error.is_empty() { self.t("query.status.noObjects") } else { SharedString::from(tree_error.clone()) };
-                        list = list.child(div().pl(px(42.)).py(px(4.)).text_size(px(12.)).text_color(p.text_faint).child(note));
+                    let groups = self.model.object_groups(&id);
+                    if groups.is_empty() {
+                        // 空目录与筛选无命中各有文案；读取失败由上方提示条负责。
+                        if let Some(key) = self.model.object_notice(&id) {
+                            if key != "ui.explorer.error" {
+                                list = list.child(div().pl(px(42.)).py(px(4.)).text_size(px(12.)).text_color(p.text_faint).child(self.t(key)));
+                            }
+                        }
                     }
                     let environment = row.saved.env.clone();
-                    for object in mine {
-                        list = list.child(self.object_row(&object, &environment, &p, cx));
+                    for group in groups {
+                        // 数据库 / 模式按已读取的元数据分层；空段不制造标题。
+                        if !group.database.is_empty() {
+                            list = list.child(
+                                div()
+                                    .pl(px(30.))
+                                    .pt(px(6.))
+                                    .pb(px(2.))
+                                    .text_size(px(11.))
+                                    .text_color(p.text_muted)
+                                    .child(SharedString::from(group.database.clone())),
+                            );
+                        }
+                        if !group.schema.is_empty() {
+                            list = list.child(
+                                div()
+                                    .pl(px(38.))
+                                    .pb(px(2.))
+                                    .text_size(px(11.))
+                                    .text_color(p.text_faint)
+                                    .child(SharedString::from(group.schema.clone())),
+                            );
+                        }
+                        for object in &group.objects {
+                            list = list.child(self.object_row(object, &environment, &p, cx));
+                        }
                     }
                 }
             }
@@ -1814,14 +1870,40 @@ impl Workbench {
             let entries = self.model.palette_entries();
             let mut list = div().id("palette-list").flex().flex_col().overflow_y_scroll().p(px(6.)).max_h(px(380.));
             if entries.is_empty() {
-                list = list.child(div().p(px(16.)).text_color(p.text_faint).child(self.t("ui.palette.empty")));
+                let error = self.model.catalog_error.clone();
+                let mut empty = div()
+                    .p(px(16.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .text_color(p.text_faint)
+                    .child(self.t(self.model.palette_empty_key()));
+                if self.model.shell.palette_tables_only && !error.is_empty() {
+                    empty = empty
+                        .child(div().text_size(px(11.5)).truncate().child(SharedString::from(error)))
+                        .child(kit::tool_button(
+                            "palette-tree-retry",
+                            Some(IconName::RefreshCw),
+                            self.t("common.retry"),
+                            cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.model.shell.close_overlay();
+                                this.perform("refresh-tree", cx);
+                            }),
+                        ));
+                }
+                list = list.child(empty);
             }
             for (index, entry) in entries.into_iter().take(40).enumerate() {
                 let selected = index == self.model.palette_index;
                 let id = entry.id.clone();
                 let chord = crate::app::COMMANDS.iter().find(|command| command.id == entry.id).and_then(|command| command.chord);
                 let icon = palette_icon(&entry.id);
-                let group = if entry.group == "connection" { self.t("shell.paletteGroup.connection") } else { SharedString::from("") };
+                let group = match entry.group {
+                    "connection" => self.t("shell.paletteGroup.connection"),
+                    "table" => self.t("shell.paletteGroup.table"),
+                    _ => SharedString::from(""),
+                };
+                let detail = entry.detail.clone();
                 list = list.child(
                     div()
                         .id(SharedString::from(format!("pal-{index}")))
@@ -1839,6 +1921,7 @@ impl Workbench {
                         .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
                         .child(kit::icon(icon, 15., if selected { p.accent_text } else { p.text_muted }))
                         .child(div().flex_1().truncate().child(SharedString::from(entry.label)))
+                        .when(!detail.is_empty(), |this| this.child(div().max_w(px(160.)).truncate().text_size(px(11.)).text_color(p.text_faint).child(SharedString::from(detail))))
                         .when(!group.is_empty(), |this| this.child(div().text_size(px(11.)).text_color(p.text_faint).child(group)))
                         .when_some(chord, |this, chord| this.child(kit::kbd(kit::shortcut(&chord.replace("Mod+", "Ctrl+")), &p)))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -2267,6 +2350,9 @@ fn backdrop(id: &'static str, dim: f32, cx: &mut Context<Workbench>) -> gpui_kit
 fn palette_icon(id: &str) -> IconName {
     if id.starts_with("connection:") {
         return IconName::Database;
+    }
+    if id.starts_with("open-table:") {
+        return IconName::Table;
     }
     match id {
         "new-query" | "saved-queries" => IconName::SquareTerminal,

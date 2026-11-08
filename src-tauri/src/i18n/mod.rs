@@ -135,6 +135,7 @@ dict! {
     "common.localeEn" => "English", "English";
     "common.newConnection" => "新建连接", "New connection";
     "common.openSqlite" => "打开 SQLite 文件", "Open SQLite file";
+    "common.retry" => "重试", "Retry";
     "shell.nav.main" => "主导航", "Main navigation";
     "shell.nav.workspace" => "工作台", "Workbench";
     "shell.nav.connections" => "连接", "Connections";
@@ -143,6 +144,7 @@ dict! {
     "shell.sidebar.explorer" => "资源管理器", "Explorer";
     "shell.palette.title" => "命令面板", "Command palette";
     "shell.paletteGroup.connection" => "连接", "Connections";
+    "shell.paletteGroup.table" => "表 / 视图", "Tables & views";
     "shell.welcome.title" => "RillSQL", "RillSQL";
     "shell.welcome.factEngines" => "支持 PostgreSQL、MySQL、MariaDB、SQL Server、SQLite、Redis、MongoDB", "Supports PostgreSQL, MySQL, MariaDB, SQL Server, SQLite, Redis and MongoDB";
     "shell.welcome.resumeTitle" => "继续工作", "Continue working";
@@ -511,6 +513,10 @@ dict! {
     "mongo.docJson.invalid" => "这份文档不是合法 JSON：", "This document is not valid JSON:";
     "ui.search.placeholder" => "搜索命令、连接…", "Search commands, connections…";
     "ui.explorer.filter" => "筛选连接", "Filter connections";
+    "ui.explorer.filterObjects" => "筛选对象", "Filter objects";
+    "ui.explorer.noObjects" => "尚未读取对象", "No objects loaded yet";
+    "ui.explorer.noMatch" => "没有匹配的对象", "No matching objects";
+    "ui.explorer.error" => "读取对象失败", "Could not load objects";
     "ui.explorer.empty" => "还没有连接", "No connections yet";
     "ui.explorer.emptyHint" => "新建一个连接，或直接打开本机的 SQLite 文件。", "Create a connection, or open a local SQLite file.";
     "ui.status.ready" => "就绪", "Ready";
@@ -583,8 +589,10 @@ dict! {
     "ui.settings.nullWord" => "NULL", "NULL";
     "ui.settings.nullEmpty" => "空字符串", "Empty";
     "ui.settings.nullN" => "\\N", "\\N";
-    "ui.palette.placeholder" => "输入命令或连接名…", "Type a command or connection…";
-    "ui.palette.empty" => "没有匹配的命令", "No matching commands";
+    "ui.palette.placeholder" => "搜索命令、连接或对象…", "Search commands, connections, or objects…";
+    "ui.palette.empty" => "没有匹配项", "No matches";
+    "ui.palette.noObjects" => "先连接并读取对象", "Connect and load objects first";
+    "ui.palette.error" => "读取对象失败，刷新对象树后重试", "Could not load objects; refresh the object tree and retry";
     "ui.help.global" => "全局", "Global";
     "ui.help.editor" => "编辑器", "Editor";
     "ui.help.table" => "表格", "Table";
