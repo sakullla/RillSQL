@@ -36,6 +36,8 @@ pub struct GridPane {
     edit_input: Entity<InputState>,
     /// 正在编辑的格子用稳定行 id 记住，排序或翻页后仍写回同一行。
     edit_target: Option<EditTarget>,
+    /// 编辑框处理完 Enter 后，同一次按键还会冒泡到网格；这里消费掉那一次回声。
+    suppress_enter: bool,
     /// 编辑栏要等下一次绘制才能拿到 Window，先把请求记下来。
     pending_edit: Option<PendingEdit>,
     notice: String,
@@ -86,6 +88,7 @@ impl GridPane {
         // 只有 Enter 结束编辑。失焦可能来自我们自己的重绘或切换焦点，贸然取消会丢掉正在输入的值。
         let edit_subscription = cx.subscribe(&edit_input, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
+                this.suppress_enter = true;
                 this.finish_edit(cx);
             }
         });
@@ -98,6 +101,7 @@ impl GridPane {
             search_text: String::new(),
             edit_input,
             edit_target: None,
+            suppress_enter: false,
             pending_edit: None,
             notice: String::new(),
             grid_focus: cx.focus_handle().tab_stop(true),
@@ -839,6 +843,13 @@ impl Render for GridPane {
                     "arrowright" => "right",
                     other => other,
                 };
+                if this.suppress_enter {
+                    this.suppress_enter = false;
+                    if key == "enter" {
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
                 // 文本输入接管字符、光标、选区、粘贴和撤销，这里只处理取消编辑。
                 if this.edit_target.is_some() {
                     if key == "escape" {
@@ -1551,6 +1562,7 @@ mod pane_tests {
         settle(cx);
         cx.update(|cx| {
             assert!(!pane.read(cx).editing(), "Enter 应结束编辑");
+            assert!(pane.read(cx).session.viewer().is_none(), "Enter 暂存后不应顺带打开完整值面板");
             assert_eq!(pane.read(cx).cell(0, 1), "乙");
             assert!(pane.read(cx).session.uncommitted(), "Enter 只暂存");
         });

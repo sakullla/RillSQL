@@ -838,9 +838,10 @@ impl SharedGrid {
         let values = vec![None; self.columns.len()];
         self.source.push(GridRow { id: id.clone(), values, located: false, locator: Vec::new(), inserted: true });
         self.recompute();
-        let row = self.rows.iter().position(|item| item.id == id).unwrap_or(self.rows.len().saturating_sub(1));
-        let row_id = self.rows.get(row).map(|item| item.id.clone()).unwrap_or(id.clone());
-        self.overlays.push(overlay(row, row_id, 0, String::new(), None, Gate::Writable, String::new(), Some(id), "insert"));
+        // 新增行在筛选/查找下可能不在显示快照里，身份必须始终用新行自己的 id，
+        // 不能退化成最后一行，否则预览会把别人的行当成新增内容。
+        let row = self.rows.iter().position(|item| item.id == id).unwrap_or(self.rows.len());
+        self.overlays.push(overlay(row, id.clone(), 0, String::new(), None, Gate::Writable, String::new(), Some(id), "insert"));
         self.close_preview();
         Gate::Writable
     }
@@ -1039,13 +1040,14 @@ impl SharedGrid {
         (0..self.rows.len()).map(|row| self.sheet_line(row)).collect()
     }
 
+    /// 已读取的服务器行数；未提交的新增行不计入分页偏移。
     pub fn source_len(&self) -> usize {
-        self.source.len()
+        self.source.iter().filter(|row| !row.inserted).count()
     }
 
     pub fn has_more_rows(&self) -> bool {
         if let Some(count) = self.full_count {
-            (self.offset as i64) + (self.source.len() as i64) < count
+            (self.offset as i64) + (self.source_len() as i64) < count
         } else {
             self.truncated
         }
@@ -2082,6 +2084,27 @@ mod tests {
         assert!(sql[0].contains("\"id\" = 1"), "{sql:?}");
         assert!(!sql[0].contains("\"id\" = 2"), "{sql:?}");
         assert_eq!(filtered.confirm_request().unwrap().changes[0].locator[0].value.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn insert_stays_bound_to_its_own_row_when_filter_hides_it() {
+        let mut grid = SharedGrid::new();
+        grid.target.connection_id = "notes".into();
+        grid.target.table = "customers".into();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some("甲")], true), row("2", vec![Some("2"), Some("乙")], true)],
+            Some(2),
+            Some(schema()),
+        );
+        grid.set_filter("name", "eq", "甲");
+        assert_eq!(grid.loaded_len(), 1, "筛选后只剩一行可见");
+        assert_eq!(grid.stage_insert(), Gate::Writable);
+        assert_eq!(grid.loaded_len(), 1, "新增行被筛选隐藏，不能顶替可见行");
+
+        let sql = grid.open_preview().expect("新增行应能预览");
+        assert!(sql[0].to_uppercase().starts_with("INSERT"), "{sql:?}");
+        assert!(!sql[0].contains("甲") && !sql[0].contains("乙"), "不得复制可见行作为新增内容：{sql:?}");
     }
 
     #[test]
