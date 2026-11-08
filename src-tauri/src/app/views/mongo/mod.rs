@@ -243,6 +243,12 @@ impl MongoPane {
         self.columns = columns_of(&self.documents);
     }
 
+    fn clear_confirm(&mut self) {
+        self.confirm_id = None;
+        self.confirm_write = None;
+        self.confirm_prompt.clear();
+    }
+
     fn reset_target_state(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.busy = false;
@@ -360,6 +366,7 @@ impl MongoPane {
         let Some(database) = self.databases.get(index) else { return };
         self.database = database.name.clone();
         self.collection.clear();
+        self.clear_confirm();
         self.documents.clear();
         self.columns.clear();
         self.total = 0;
@@ -370,6 +377,7 @@ impl MongoPane {
         let Ok(index) = index.parse::<usize>() else { return };
         let Some(collection) = self.collections.get(index) else { return };
         self.collection = collection.name.clone();
+        self.clear_confirm();
         self.skip = 0;
         self.applied_filter.clear();
         self.filter_input.clear();

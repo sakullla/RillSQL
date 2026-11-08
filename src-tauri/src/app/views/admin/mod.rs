@@ -288,6 +288,7 @@ impl AdminPane {
     pub fn refresh_inventory(&mut self, cx: &mut Context<Self>) {
         let services = Arc::clone(&self.services);
         let target = self.session.target.clone();
+        let expected = target.clone();
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -299,6 +300,9 @@ impl AdminPane {
                 cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
+                            if this.session.target != expected {
+                                return;
+                            }
                             this.session.inventory = inventory;
                             if !this.session.inventory.connected {
                                 this.session.note = this.session.inventory.source.clone();
@@ -326,6 +330,7 @@ impl AdminPane {
             return;
         }
         let services = Arc::clone(&self.services);
+        let target = self.session.target.clone();
         let connection = self.session.target.connection_id.clone();
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
@@ -338,6 +343,11 @@ impl AdminPane {
                 cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
+                            if this.session.target != target {
+                                this.session.note = "目标已切换，本次预览结果已丢弃。".to_owned();
+                                cx.notify();
+                                return;
+                            }
                             match result {
                                 Ok(plan) => this.session.arm_live(plan),
                                 Err(message) => this.session.note = message,
@@ -364,6 +374,7 @@ impl AdminPane {
             return;
         };
         let services = Arc::clone(&self.services);
+        let target = self.session.target.clone();
         let connection = self.session.target.connection_id.clone();
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
@@ -381,6 +392,11 @@ impl AdminPane {
                 cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
+                            if this.session.target != target {
+                                this.session.note = "目标已切换，本次执行结果已丢弃。".to_owned();
+                                cx.notify();
+                                return;
+                            }
                             this.session.note = match result {
                                 Ok(receipt) if receipt.blocked.is_empty() => {
                                     this.session.open = false;
