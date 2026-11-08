@@ -93,6 +93,8 @@ pub struct ExchangePane {
     /// 来源版本；迟到映射结果只在版本一致时写回。
     source_generation: u64,
     format_name: String,
+    /// 已读取行的导出上限；None 表示整个已读取范围。
+    row_limit: Option<usize>,
     export_request: Option<ExportRequest>,
     loaded: Option<crate::export::LoadedExport>,
     dump_request: Option<DumpRequest>,
@@ -133,6 +135,7 @@ impl ExchangePane {
             source: ExchangeSource::default(),
             source_generation: 0,
             format_name: "csv".to_owned(),
+            row_limit: None,
             export_request: None,
             loaded: None,
             dump_request: None,
@@ -187,6 +190,7 @@ impl ExchangePane {
             self.mapping_edited = false;
             self.mapping_attempted = false;
             self.confirmed = false;
+            self.row_limit = None;
         }
         self.source = source;
     }
@@ -226,10 +230,30 @@ impl ExchangePane {
             other if other.starts_with("exchange-format:") => {
                 self.format_name = other.trim_start_matches("exchange-format:").to_owned();
             }
+            other if other.starts_with("exchange-range:") => {
+                self.apply_range(other.trim_start_matches("exchange-range:"));
+            }
             other if other.starts_with("exchange-map:") => self.edit_mapping(other),
             _ => {}
         }
         cx.notify();
+    }
+
+    fn apply_range(&mut self, text: &str) {
+        self.row_limit = match text {
+            "all" => None,
+            value => value.parse::<usize>().ok().filter(|limit| *limit > 0),
+        };
+    }
+
+    /// 已读取行的导出范围。上限小于当前行数时标记为截断，任务和文件都只写这段。
+    fn rows_for_export(&self) -> (Vec<Vec<Option<String>>>, bool) {
+        let mut rows = self.source.rows.clone();
+        let limited = self.row_limit.is_some_and(|limit| limit < rows.len());
+        if let Some(limit) = self.row_limit {
+            rows.truncate(limit);
+        }
+        (rows, limited)
     }
 
     pub fn preview_file(&mut self, path: PathBuf, entry: ImportEntry, cx: &mut Context<Self>) {
@@ -549,13 +573,14 @@ impl ExchangePane {
         }
         let table_name = self.source.table.as_ref().map(|table| table.table.clone()).unwrap_or_else(|| "查询结果".to_owned());
         let schema = self.source.table.as_ref().map(|table| table.schema.clone()).unwrap_or_default();
+        let (rows, limited) = self.rows_for_export();
         let spec = LoadedExport {
             id: format!("loaded-{}", uuid::Uuid::new_v4()),
             format: self.format_name.clone(),
             path,
             columns: self.source.columns.clone(),
-            rows: self.source.rows.clone(),
-            truncated: self.source.truncated,
+            rows,
+            truncated: self.source.truncated || limited,
             delimiter: ',',
             null_token: "NULL".to_owned(),
             bom: self.format_name != "json",
@@ -933,6 +958,10 @@ impl ExchangePane {
             lines.push(self.empty_reason().to_owned());
         }
         lines.push(format!("格式 {}", self.format_name));
+        lines.push(match self.row_limit {
+            Some(limit) => format!("范围 前 {limit} 行"),
+            None => "范围 全部已读取行".to_owned(),
+        });
         if self.mapping.is_empty() {
             if self.preview.is_some() && self.source.table.is_some() {
                 lines.push(i18n::text(self.locale, "export.map.empty"));
@@ -1107,6 +1136,21 @@ impl Render for ExchangePane {
                 }),
             ));
         }
+        let mut ranges = Vec::new();
+        for (id, label, limit) in [("all", "全部已读取", None), ("100", "前 100 行", Some(100)), ("1000", "前 1000 行", Some(1000))] {
+            let entity = entity.clone();
+            let command = format!("exchange-range:{id}");
+            ranges.push((
+                SharedString::from(format!("exchange-exchange-range:{id}")),
+                SharedString::from(label),
+                self.row_limit == limit,
+                kit::click(move |_, _, cx| {
+                    let command = command.clone();
+                    entity.update(cx, |pane, cx| pane.command(&command, cx));
+                }),
+            ));
+        }
+        let range_enabled = self.source.kind == ExchangeSourceKind::Query || self.source.rows.len() > 100;
         panel = panel.child(section(
             t("ui.exchange.source"),
             kit::card(&p)
@@ -1116,7 +1160,14 @@ impl Render for ExchangePane {
                 .gap(px(12.))
                 .child(kit::segmented(kinds, &p))
                 .child(source_body)
-                .child(kit::form_row(t("ui.exchange.format"), kit::segmented(formats, &p), &p)),
+                .child(kit::form_row(t("ui.exchange.format"), kit::segmented(formats, &p), &p))
+                .when(range_enabled, |this| {
+                    this.child(kit::form_row(
+                        SharedString::from(if locale == Locale::En { "Export range" } else { "导出范围" }),
+                        kit::segmented(ranges, &p),
+                        &p,
+                    ))
+                }),
         ));
 
         // 导出：不可用的能力直接说明原因，而不是留一个点了没反应的入口。
@@ -1513,6 +1564,28 @@ mod tests {
         let text = pane.lines().join("\n");
         assert!(text.contains("全量导出不可用"), "{text}");
         assert!(!text.contains("查询正在执行"), "{text}");
+    }
+
+    #[test]
+    fn export_range_limits_loaded_rows_and_resets_with_the_source() {
+        let mut pane = exchange_pane();
+        let mut source = table_source("customers", &["id", "name"]);
+        source.rows = (0..150).map(|index| vec![Some(index.to_string()), Some("甲".to_owned())]).collect();
+        pane.bind_source(source);
+        pane.apply_range("100");
+        let (rows, limited) = pane.rows_for_export();
+        assert_eq!(rows.len(), 100);
+        assert!(limited, "超过上限的已读取行必须标记截断");
+        let text = pane.lines().join("\n");
+        assert!(text.contains("范围 前 100 行"), "{text}");
+        pane.apply_range("all");
+        let (rows, limited) = pane.rows_for_export();
+        assert_eq!(rows.len(), 150);
+        assert!(!limited);
+        pane.apply_range("1000");
+        assert_eq!(pane.row_limit, Some(1000));
+        pane.bind_source(table_source("orders", &["id"]));
+        assert_eq!(pane.row_limit, None, "换来源后范围不能沿用");
     }
 
     #[test]

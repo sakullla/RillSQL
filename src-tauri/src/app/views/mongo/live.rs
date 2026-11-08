@@ -232,8 +232,15 @@ fn live_mongo_pages_filters_inserts_replaces_and_deletes(cx: &mut TestAppContext
         view.update(cx, |pane, _| pane.set_editor(&insert));
         window.render_frame(cx);
         window.click("mongo-save", cx);
+        window.render_frame(cx);
     })
     .unwrap();
+    cx.update(|app| {
+        let pane = view.read(app);
+        assert!(pane.confirm_open(), "新增文档必须先预览确认：{}", pane.status_line());
+        assert!(pane.confirm_prompt().contains("新增"), "{}", pane.confirm_prompt());
+    });
+    cx.update_window(window, |_, window, cx| window.click("mongo-confirm", cx)).unwrap();
     assert!(pump(cx, window, &view, |pane| !pane.running() && (pane.note().contains("新增") || !pane.error().is_empty())), "新增没有返回");
     assert_quiet(cx, &view);
     let filter = format!(r#"{{"t8mark":"{mark}"}}"#);
@@ -256,8 +263,15 @@ fn live_mongo_pages_filters_inserts_replaces_and_deletes(cx: &mut TestAppContext
         view.update(cx, |pane, _| pane.set_editor(&replaced));
         window.render_frame(cx);
         window.click("mongo-save", cx);
+        window.render_frame(cx);
     })
     .unwrap();
+    cx.update(|app| {
+        let pane = view.read(app);
+        assert!(pane.confirm_open(), "覆盖文档必须先预览确认：{}", pane.status_line());
+        assert!(pane.confirm_prompt().contains("覆盖"), "{}", pane.confirm_prompt());
+    });
+    cx.update_window(window, |_, window, cx| window.click("mongo-confirm", cx)).unwrap();
     assert!(pump(cx, window, &view, |pane| !pane.running() && (pane.note().contains("覆盖") || !pane.error().is_empty())), "替换没有返回");
     assert_quiet(cx, &view);
     cx.update_window(window, |_, window, cx| window.click("mongo-refresh", cx)).unwrap();
@@ -309,8 +323,10 @@ fn live_mongo_pages_filters_inserts_replaces_and_deletes(cx: &mut TestAppContext
         view.update(cx, |pane, _| pane.set_editor(&failed));
         window.render_frame(cx);
         window.click("mongo-save", cx);
+        window.render_frame(cx);
     })
     .unwrap();
+    cx.update_window(window, |_, window, cx| window.click("mongo-confirm", cx)).unwrap();
     assert!(pump(cx, window, &view, |pane| !pane.running() && !pane.error().is_empty()), "断线写入没有失败");
     cx.update(|app| {
         let pane = view.read(app);

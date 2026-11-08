@@ -93,6 +93,9 @@ pub struct ComparePane {
     run_kind: Option<RunKind>,
     cancel_flag: Arc<AtomicBool>,
     placed: Option<PlacedScript>,
+    /// 把对比生成的写脚本放进查询编辑器前，再确认一次。
+    pending_place: Option<RunKind>,
+    place_prompt: String,
     schema_draft: BTreeMap<String, String>,
     schema_inputs: BTreeMap<&'static str, (Entity<InputState>, gpui_kit::Subscription)>,
     #[cfg(test)]
@@ -123,6 +126,8 @@ impl ComparePane {
             run_kind: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             placed: None,
+            pending_place: None,
+            place_prompt: String::new(),
             schema_draft: BTreeMap::new(),
             schema_inputs: BTreeMap::new(),
             #[cfg(test)]
@@ -196,9 +201,14 @@ impl ComparePane {
         } else if id == "compare-cancel" {
             self.cancel();
         } else if id == "compare-place:structure" {
-            self.place_structure();
+            self.ask_place(RunKind::Structure);
         } else if id == "compare-place:data" {
-            self.place_data();
+            self.ask_place(RunKind::Data);
+        } else if id == "compare-place-confirm" {
+            self.confirm_place();
+        } else if id == "compare-place-cancel" {
+            self.pending_place = None;
+            self.place_prompt.clear();
         }
         cx.notify();
     }
@@ -214,17 +224,48 @@ impl ComparePane {
             choice.databases.first().cloned().unwrap_or_default()
         };
         let slot = if baseline { &mut self.baseline } else { &mut self.target };
+        let changed = slot.connection_id != choice.id || slot.database != database;
         slot.connection_id = choice.id;
         slot.database = database;
         slot.schema.clear();
+        if changed {
+            self.invalidate_results();
+        }
         self.ensure_schemas(baseline, cx);
     }
 
     fn set_database(&mut self, baseline: bool, name: &str, cx: &mut Context<Self>) {
         let slot = if baseline { &mut self.baseline } else { &mut self.target };
+        let changed = slot.database != name;
         slot.database = name.to_owned();
         slot.schema.clear();
+        if changed {
+            self.invalidate_results();
+        }
         self.ensure_schemas(baseline, cx);
+    }
+
+    /// 目标连接/库/schema 变化后，旧报告、选择和待放入脚本都不再属于新目标。
+    /// 仍在跑的请求用代次和取消标记失效，迟到结果不会写回。
+    fn invalidate_results(&mut self) {
+        if self.running {
+            self.cancel_flag.store(true, Ordering::SeqCst);
+            if !self.run_id.is_empty() {
+                cancel_compare(&self.services.tasks, OWNER, &self.run_id);
+            }
+            self.token = None;
+            self.running = false;
+        }
+        self.structure = None;
+        self.data = None;
+        self.structure_status = Status::Idle;
+        self.data_status = Status::Idle;
+        self.selected.clear();
+        self.chosen_key.clear();
+        self.placed = None;
+        self.pending_place = None;
+        self.place_prompt.clear();
+        self.error.clear();
     }
 
     fn ensure_schemas(&mut self, baseline: bool, cx: &mut Context<Self>) {
@@ -650,6 +691,35 @@ impl ComparePane {
         self.data = Some(report);
     }
 
+    fn ask_place(&mut self, kind: RunKind) {
+        let report = match kind {
+            RunKind::Structure => self.structure.as_ref().map(|report| (report.script.clone(), report.refused.is_some(), self.structure_status)),
+            RunKind::Data => self.data.as_ref().map(|report| (report.script.clone(), report.refused.is_some(), self.data_status)),
+        };
+        let Some((script, refused, status)) = report else {
+            return;
+        };
+        if refused || status == Status::Cancelled || script.trim().is_empty() {
+            return;
+        }
+        let lines = script.lines().count();
+        self.place_prompt = if self.locale == Locale::En {
+            format!("Put a {lines}-line write script into the query editor? It is not executed.")
+        } else {
+            format!("将把 {lines} 行写操作脚本放入查询编辑器，不会执行。确认放入？")
+        };
+        self.pending_place = Some(kind);
+    }
+
+    fn confirm_place(&mut self) {
+        match self.pending_place.take() {
+            Some(RunKind::Structure) => self.place_structure(),
+            Some(RunKind::Data) => self.place_data(),
+            None => {}
+        }
+        self.place_prompt.clear();
+    }
+
     fn place_structure(&mut self) {
         let Some(report) = &self.structure else {
             return;
@@ -760,6 +830,9 @@ impl ComparePane {
         }
         if !self.error.is_empty() {
             lines.push(self.error.clone());
+        }
+        if self.pending_place.is_some() {
+            lines.push(self.place_prompt.clone());
         }
         if let Some(report) = &self.structure {
             if let Some(refused) = &report.refused {
@@ -911,6 +984,29 @@ impl Render for ComparePane {
         }
         if self.structure_status == Status::Cancelled || self.data_status == Status::Cancelled {
             body = body.child(note_banner(IconName::Info, self.text("compare.status.cancelled"), p.warn, p.warn_soft));
+        }
+        if self.pending_place.is_some() {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(12.))
+                    .py(px(10.))
+                    .rounded(px(8.))
+                    .bg(p.warn_soft)
+                    .text_color(p.warn)
+                    .child(kit::icon(IconName::TriangleAlert, 15., p.warn))
+                    .child(div().flex_1().min_w(px(180.)).text_size(px(12.5)).child(SharedString::from(self.place_prompt.clone())))
+                    .child(kit::secondary_button("compare-place-cancel", None, t(self, "common.cancel"), compare_act("compare-place-cancel", &entity)))
+                    .child(kit::primary_button(
+                        "compare-place-confirm",
+                        Some(IconName::Check),
+                        SharedString::from(if self.locale == Locale::En { "Confirm" } else { "确认放入" }),
+                        compare_act("compare-place-confirm", &entity),
+                    )),
+            );
         }
 
         if let Some(report) = self.structure.clone() {
@@ -1331,6 +1427,26 @@ mod tests {
         assert!(message.contains("不生成脚本"), "{message}");
     }
 
+    #[test]
+    fn place_waits_for_confirmation_and_target_change_drops_it() {
+        let mut pane = temp_pane();
+        pane.choices = vec![Choice { id: "base".into(), name: "基准".into(), engine: "sqlite".into(), databases: vec!["main".into()], catalog_error: None }];
+        pane.baseline = SidePick { connection_id: "base".into(), database: "main".into(), schema: String::new() };
+        pane.target = SidePick { connection_id: "base".into(), database: "main".into(), schema: String::new() };
+        let mut report = empty_structure(None);
+        report.script = "CREATE TABLE copied (id INTEGER PRIMARY KEY);".into();
+        pane.structure = Some(report);
+        pane.structure_status = Status::Ready;
+        pane.ask_place(RunKind::Structure);
+        assert!(pane.pending_place.is_some(), "写脚本必须先确认");
+        assert!(pane.placed.is_none(), "确认前不能放入查询");
+        assert!(pane.place_prompt.contains("不会执行"), "{}", pane.place_prompt);
+        pane.invalidate_results();
+        assert!(pane.pending_place.is_none());
+        assert!(pane.placed.is_none());
+        assert!(pane.structure.is_none());
+    }
+
     fn engine_gate(left: &str, right: &str) -> Option<&'static str> {
         let left_engine = Engine::parse(left).ok();
         let right_engine = Engine::parse(right).ok();
@@ -1506,6 +1622,11 @@ mod workbench {
             window.click("compare-place:structure", cx);
             window.render_frame(cx);
             view.update(cx, |view, cx| {
+                assert!(view.compare_text(cx).contains("不会执行"), "{}", view.compare_text(cx));
+            });
+            window.click("compare-place-confirm", cx);
+            window.render_frame(cx);
+            view.update(cx, |view, cx| {
                 let draft = view.model.active_tab().expect("query").draft.clone();
                 assert!(draft.contains("customers") && draft.to_ascii_uppercase().contains("CREATE"), "{draft}");
                 assert!(view.model.active_tab().unwrap().last_executed_sql.is_none());
@@ -1624,8 +1745,9 @@ mod workbench {
             window.click("compare-database:baseline:warehouse", cx);
             view.update(cx, |pane, _| {
                 let text = pane.lines().join("\n");
-                assert!(text.contains("on orders"), "{text}");
                 assert!(text.contains("数据库 warehouse"), "{text}");
+                assert!(!text.contains("on orders"), "换库后旧对比结果必须清掉：{text}");
+                assert!(pane.structure.is_none(), "{text}");
                 assert!(pane.refuse_local().is_some_and(|message| message.contains("不生成脚本")), "{text}");
             });
         })

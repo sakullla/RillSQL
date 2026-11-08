@@ -88,6 +88,9 @@ impl DiagramPane {
             self.hovered = Some(name.to_owned());
         } else if id == "diagram-hover-clear" {
             self.hovered = None;
+        } else if id == "diagram-retry" && !self.connection_id.is_empty() {
+            self.error.clear();
+            self.read(cx);
         }
         cx.notify();
     }
@@ -145,7 +148,15 @@ impl DiagramPane {
             }
             TaskOutcome::Current { value: Err(message), .. } => {
                 self.diagram = None;
-                self.error = if message.is_empty() { i18n::text(self.locale, "diagram.failed") } else { message };
+                let reason = if message.is_empty() { i18n::text(self.locale, "diagram.failed") } else { message };
+                // 错误必须带目标，否则用户无法判断是哪张库/模式读取失败。
+                self.error = if self.label.is_empty() {
+                    reason
+                } else if self.locale == Locale::En {
+                    format!("{}: {reason}", self.label)
+                } else {
+                    format!("{}：{reason}", self.label)
+                };
             }
             TaskOutcome::Stale { .. } | TaskOutcome::Cancelled { .. } => {}
         }
@@ -294,6 +305,24 @@ mod tests {
     use super::*;
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AppContext as _, Point, TestAppContext, WindowBounds, WindowOptions, px, size};
+
+    #[test]
+    fn failure_text_names_the_target_and_retry_stays_available() {
+        let dir = std::env::temp_dir().join(format!("rillsql-diagram-error-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        let mut pane = DiagramPane::new(services);
+        pane.connection_id = "notes".into();
+        pane.label = "笔记 / main".into();
+        pane.error = "笔记 / main：读取失败：权限不足".into();
+        let text = pane.lines().join("\n");
+        assert!(text.contains("笔记 / main"), "{text}");
+        assert!(text.contains("读取失败：权限不足"), "{text}");
+        pane.clear_target();
+        assert!(pane.connection_id.is_empty());
+        assert!(pane.label.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn object_spec_skips_non_relational_engines() {
@@ -491,7 +520,23 @@ impl Render for DiagramPane {
         if self.loading {
             body = body.child(div().size_full().flex().items_center().justify_center().gap(px(8.)).text_color(p.text_muted).child(Spinner::new().small()).child(t("diagram.loading")));
         } else if !self.error.is_empty() {
-            body = body.child(div().size_full().flex().items_center().justify_center().child(kit::empty_state(IconName::CircleAlert, t("diagram.failed"), SharedString::from(self.error.clone()), &p)));
+            let retry = {
+                let entity = entity.clone();
+                kit::secondary_button("diagram-retry", Some(IconName::RefreshCw), t("common.retry"), move |_, _, cx| {
+                    entity.update(cx, |pane, cx| pane.command("diagram-retry", cx))
+                })
+            };
+            body = body.child(
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(10.))
+                    .child(kit::empty_state(IconName::CircleAlert, t("diagram.failed"), SharedString::from(self.error.clone()), &p))
+                    .when(!self.connection_id.is_empty(), |this| this.child(retry)),
+            );
         } else if let Some(diagram) = diagram.as_ref() {
             if diagram.tables.is_empty() {
                 body = body.child(div().size_full().flex().items_center().justify_center().child(kit::empty_state(IconName::Workflow, t("diagram.empty"), SharedString::from(diagram.notice.clone().unwrap_or_default()), &p)));

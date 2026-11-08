@@ -409,6 +409,130 @@ fn switching_between_table_items_keeps_each_spec_and_tool() {
     assert_eq!(model.tabs.iter().find(|tab| tab.id == customers_id).unwrap().spec.as_deref(), Some(customers));
 }
 
+#[gpui_kit::test]
+fn switching_work_items_drops_structure_admin_redis_and_mongo_state(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-tool-state-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    let customers = "notes|笔记|main||customers|sqlite|dev";
+    let orders = "notes|笔记|main||orders|sqlite|dev";
+    let snapshot = crate::ddl::Snapshot::bare(crate::ddl::DdlEngine::Sqlite, "main", "", "customers");
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform(&format!("open-structure-for:{customers}"), cx));
+        window.render_frame(cx);
+        view.update(cx, |view, cx| {
+            view.structure.update(cx, |pane, _| {
+                pane.type_into("column_name", "leak");
+                pane.session.section = crate::app::views::structure::Section::Indexes;
+                pane.session.arm_fixture(&snapshot);
+            });
+            view.perform(&format!("open-structure-for:{orders}"), cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let pane = view.read(cx).structure.read(cx);
+        assert_eq!(pane.session.target.table, "orders");
+        assert!(pane.session.column_name.is_empty(), "换表不能带走上一张表的列名");
+        assert_eq!(pane.session.section, crate::app::views::structure::Section::Columns);
+        assert!(!pane.session.preview_open(), "换表不能带走预览");
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform(&format!("open-table:{customers}"), cx);
+            view.perform("open-admin", cx);
+        });
+        window.render_frame(cx);
+        view.update(cx, |view, cx| {
+            view.admin.update(cx, |pane, _| {
+                pane.type_into("reindex", "customers");
+                pane.choose("reindex");
+                pane.session.arm_fixture(&snapshot);
+            });
+            view.perform(&format!("open-table:{orders}"), cx);
+            view.perform("open-admin", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let pane = view.read(cx).admin.read(cx);
+        assert_eq!(pane.session.target.table, "orders");
+        assert!(matches!(pane.session.operation, crate::app::views::admin::AdminOp::Vacuum), "换表不能沿用上一个索引操作");
+        assert!(!pane.session.preview_open(), "换表不能沿用管理预览");
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("open-redis:cache|缓存|0", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.redis.update(cx, |pane, _| {
+                pane.plant_key("leak-key");
+                pane.set_command("DEL leak-key");
+            });
+            view.perform("open-redis:cache|缓存|1", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let pane = view.read(cx).redis.read(cx);
+        assert!(!pane.confirm_open(), "换 Redis 目标不能保留旧确认");
+        assert!(pane.selected().is_empty());
+        assert!(pane.command_input().is_empty());
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("open-mongo:docs|文档|app|users", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.mongo.update(cx, |pane, _| {
+                pane.set_editor(r#"{"name":"临时"}"#);
+            });
+            view.perform("open-mongo:docs|文档|app|orders", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let pane = view.read(cx).mongo.read(cx);
+        assert!(!pane.confirm_open(), "换集合不能保留旧写入预览");
+        assert!(!pane.editor_open());
+        assert!(pane.editor_text().is_empty());
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("open-diagram:notes|main||图A", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("open-diagram:notes|main||图B", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let text = view.read(cx).diagram_text(cx);
+        assert!(text.contains("图B"), "{text}");
+        assert!(!text.contains("图A"), "关系图目标切换后不能还显示旧范围：{text}");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn staged_cells_block_switching_to_another_table() {
     let mut model = WorkbenchModel::new(Shell::default());
@@ -2022,6 +2146,21 @@ fn exchange_source_follows_the_active_item_and_query_source_blocks_full_export(c
         assert!(text.contains("已读取 1 行"), "{text}");
         assert!(text.contains("全量导出不可用"), "{text}");
         view.exchange_generation(cx)
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("exchange-format:json", cx);
+            view.perform("exchange-range:100", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        let text = view.exchange_text(cx);
+        assert!(text.contains("格式 json"), "{text}");
+        assert!(text.contains("范围 前 100 行"), "{text}");
     });
 
     cx.update_window(window, |_, window, cx| {

@@ -44,6 +44,8 @@ pub struct StructureSession {
     preview: Option<Plan>,
     live: bool,
     open: bool,
+    /// 危险计划先进入待确认，第二次确认才执行。
+    armed: bool,
     pub locale: Locale,
     pub note: String,
 }
@@ -67,6 +69,7 @@ impl StructureSession {
             preview: None,
             live: false,
             open: false,
+            armed: false,
             locale: Locale::ZhCn,
             note: String::new(),
         }
@@ -139,6 +142,7 @@ impl StructureSession {
         self.preview = Some(plan);
         self.live = true;
         self.open = true;
+        self.armed = false;
     }
 
     pub fn arm_fixture(&mut self, snapshot: &Snapshot) {
@@ -147,10 +151,32 @@ impl StructureSession {
         self.preview = Some(plan);
         self.live = false;
         self.open = true;
+        self.armed = false;
     }
 
     pub fn preview_open(&self) -> bool {
         self.open
+    }
+
+    /// 危险计划在真正执行前还要再确认一次；预览关闭、重做或取消都会重置这个状态。
+    pub fn requires_second_confirm(&self) -> bool {
+        self.open
+            && !self.armed
+            && self
+                .preview
+                .as_ref()
+                .is_some_and(|plan| plan.risks.iter().any(|risk| risk.level == "danger"))
+    }
+
+    pub fn arm_confirm(&mut self) {
+        if self.requires_second_confirm() {
+            self.armed = true;
+            self.note = second_confirm_text(self.locale).to_owned();
+        }
+    }
+
+    pub fn armed(&self) -> bool {
+        self.armed
     }
 
     pub fn blocked(&self) -> Vec<String> {
@@ -161,8 +187,24 @@ impl StructureSession {
         self.preview.as_ref().map(|plan| plan.steps.iter().map(|step| step.sql.clone()).collect()).unwrap_or_default()
     }
 
+    pub fn preview_risks(&self) -> Vec<(String, String)> {
+        self.preview
+            .as_ref()
+            .map(|plan| plan.risks.iter().map(|risk| (risk.level.clone(), risk.text.clone())).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn preview_rule(&self) -> String {
+        self.preview.as_ref().map(|plan| plan.rule.clone()).unwrap_or_default()
+    }
+
+    pub fn preview_target(&self) -> String {
+        self.preview.as_ref().map(|plan| plan.target.clone()).unwrap_or_default()
+    }
+
     pub fn cancel(&mut self) {
         self.open = false;
+        self.armed = false;
     }
 
     pub fn confirm_sql(&self) -> Result<Vec<String>, String> {
@@ -204,7 +246,19 @@ impl StructurePane {
     }
 
     pub fn bind(&mut self, target: GridTarget) {
-        self.session.target = target;
+        if self.session.target == target {
+            return;
+        }
+        // 结构页只有一份草稿；切到另一张表时必须丢弃上一张表的字段、预览和错误，
+        // 否则用户会把 A 表的列名或 DROP 预览带到 B 表。
+        let locale = self.session.locale;
+        self.session = StructureSession::new(target);
+        self.session.locale = locale;
+        self.fields = Fields::default();
+        self.snapshot = None;
+        self.loaded_for.clear();
+        self.load_error.clear();
+        self.loading = false;
     }
 
     pub fn set_locale(&mut self, locale: Locale) {
@@ -269,9 +323,18 @@ impl StructurePane {
     }
 
     pub fn confirm(&mut self, cx: &mut Context<Self>) {
-        let Ok(sql) = self.session.confirm_sql() else {
+        if self.session.requires_second_confirm() {
+            self.session.arm_confirm();
             cx.notify();
             return;
+        }
+        let sql = match self.session.confirm_sql() {
+            Ok(sql) => sql,
+            Err(message) => {
+                self.session.note = message;
+                cx.notify();
+                return;
+            }
         };
         let Ok(request) = self.session.request() else {
             return;
@@ -289,11 +352,21 @@ impl StructurePane {
                 cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
-                            this.session.open = false;
                             this.session.note = match result {
-                                Ok(receipt) if receipt.blocked.is_empty() => i18n::text(this.session.locale, "structure.preview.done"),
-                                Ok(receipt) => receipt.blocked.join(" "),
-                                Err(message) => message,
+                                Ok(receipt) if receipt.blocked.is_empty() => {
+                                    this.session.open = false;
+                                    this.session.armed = false;
+                                    i18n::text(this.session.locale, "structure.preview.done")
+                                }
+                                Ok(receipt) => {
+                                    this.session.armed = false;
+                                    receipt.blocked.join(" ")
+                                }
+                                Err(message) => {
+                                    // 执行失败留在预览里，原因和可重试的脚本都还在。
+                                    this.session.armed = false;
+                                    message
+                                }
                             };
                             cx.notify();
                         });
@@ -507,6 +580,20 @@ fn cell_text(text: String, p: &Palette) -> AnyElement {
     div().text_color(p.text_muted).child(SharedString::from(text)).into_any_element()
 }
 
+fn second_confirm_text(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhCn => "这是危险操作。再次点击确认执行，或取消返回。",
+        Locale::En => "This is a dangerous operation. Confirm again to execute, or cancel.",
+    }
+}
+
+fn confirm_again_text(locale: Locale) -> &'static str {
+    match locale {
+        Locale::ZhCn => "再次确认执行",
+        Locale::En => "Confirm again",
+    }
+}
+
 impl Render for StructurePane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_snapshot(cx);
@@ -674,6 +761,16 @@ impl Render for StructurePane {
                                 .text_size(px(12.5))
                                 .child(SharedString::from(self.session.preview_sql().join("\n"))),
                         )
+                        .child(kit::muted(SharedString::from(self.session.preview_target()), &p))
+                        .when(!self.session.preview_risks().is_empty(), |this| {
+                            let mut risks = div().flex().flex_col().gap(px(4.));
+                            for (level, text) in self.session.preview_risks() {
+                                let (fg, bg) = if level == "danger" { (p.danger, p.danger_soft) } else if level == "warn" { (p.warn, p.warn_soft) } else { (p.text_muted, p.hover) };
+                                risks = risks.child(div().px(px(10.)).py(px(6.)).rounded(px(6.)).bg(bg).text_color(fg).text_size(px(12.)).child(SharedString::from(text)));
+                            }
+                            this.child(risks)
+                        })
+                        .when(!self.session.preview_rule().is_empty(), |this| this.child(kit::muted(SharedString::from(self.session.preview_rule()), &p)))
                         .when(!blocked.is_empty(), |this| {
                             this.child(div().px(px(12.)).py(px(8.)).rounded(px(8.)).bg(p.danger_soft).text_color(p.danger).text_size(px(12.5)).child(SharedString::from(blocked.join(" "))))
                         })
@@ -684,8 +781,9 @@ impl Render for StructurePane {
                                 .justify_end()
                                 .gap(px(8.))
                                 .child(kit::secondary_button("structure-cancel", None, t("structure.action.cancel"), cancel))
-                                .child(if section == Section::Danger {
-                                    kit::danger_button("structure-confirm", Some(IconName::Check), t("structure.action.confirm"), confirm).into_any_element()
+                                .child(if section == Section::Danger || self.session.armed() {
+                                    let label = if self.session.armed() { SharedString::from(confirm_again_text(locale)) } else { t("structure.action.confirm") };
+                                    kit::danger_button("structure-confirm", Some(IconName::Check), label, confirm).into_any_element()
                                 } else {
                                     kit::primary_button("structure-confirm", Some(IconName::Check), t("structure.action.confirm"), confirm).into_any_element()
                                 }),
@@ -779,6 +877,42 @@ mod tests {
         assert!(session.preview_sql().iter().any(|sql| sql.to_ascii_uppercase().contains("DROP")), "{:?}", session.preview_sql());
         session.cancel();
         assert!(session.confirm_sql().is_err());
+    }
+
+    #[test]
+    fn dangerous_ddl_needs_a_second_confirm_and_target_change_drops_the_draft() {
+        let mut session = StructureSession::new(target("sqlite", "customers"));
+        session.target.database = "main".into();
+        session.target.schema.clear();
+        session.section = Section::Danger;
+        let snapshot = Snapshot::bare(DdlEngine::Sqlite, "main", "", "customers");
+        session.arm_fixture(&snapshot);
+        assert!(session.requires_second_confirm(), "DROP 必须进入二次确认");
+        assert!(session.preview_risks().iter().any(|(level, _)| level == "danger"));
+        assert!(session.preview_rule().contains("逐条执行"));
+        assert!(session.preview_target().contains("customers"), "{}", session.preview_target());
+        session.arm_confirm();
+        assert!(session.armed());
+        assert!(!session.requires_second_confirm(), "第二次确认后不再拦");
+        session.cancel();
+        assert!(!session.armed(), "取消后必须重置二次确认");
+
+        let dir = std::env::temp_dir().join(format!("rillsql-structure-reset-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        let mut pane = StructurePane::new(services);
+        pane.bind(target("sqlite", "customers"));
+        pane.type_into("column_name", "nickname");
+        pane.session.section = Section::Indexes;
+        pane.session.arm_fixture(&snapshot);
+        assert!(pane.session.preview_open());
+        pane.bind(target("sqlite", "orders"));
+        assert_eq!(pane.session.target.table, "orders");
+        assert!(pane.session.column_name.is_empty(), "换表不能带走上一张表的列名");
+        assert_eq!(pane.session.section, Section::Columns);
+        assert!(!pane.session.preview_open(), "换表不能带走上一张表的预览");
+        assert!(pane.session.note.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -204,25 +204,47 @@ impl RedisPane {
         self.detail.as_ref().map(|detail| format!("{} {}", detail.key_type, format_value(&detail.value, self.locale))).unwrap_or_default()
     }
 
+    fn reset_target_state(&mut self) {
+        // 切换 Redis 工作项时丢弃上一目标的键、命令、确认和回复；
+        // 迟到响应靠代次失效，不能把旧库的结果写进新库。
+        self.generation = self.generation.wrapping_add(1);
+        self.busy = false;
+        self.connection_id.clear();
+        self.connection_name.clear();
+        self.database = "0".to_owned();
+        self.pattern.clear();
+        self.keys.clear();
+        self.cursor = 0;
+        self.done = false;
+        self.selected.clear();
+        self.detail = None;
+        self.ttl_input.clear();
+        self.rename_to.clear();
+        self.command_input.clear();
+        self.reply.clear();
+        self.copied.clear();
+        self.note.clear();
+        self.error.clear();
+        self.confirm = None;
+        self.confirm_prompt.clear();
+        self.rename_landed.clear();
+        self.pending_ttl = None;
+        self.ttl_was_persist = false;
+        self.scan_reset = true;
+        self.follow = Follow::None;
+        self.fields = Fields::default();
+    }
+
     pub fn open_spec(&mut self, spec: &str, cx: &mut Context<Self>) {
+        self.reset_target_state();
         let Some((id, name, database)) = parse_spec(spec) else {
-            self.connection_id.clear();
             self.error = self.text("redis.tab.needConnection");
-            self.note.clear();
             cx.notify();
             return;
         };
         self.connection_id = id;
         self.connection_name = name;
         self.database = database;
-        self.keys.clear();
-        self.cursor = 0;
-        self.done = false;
-        self.selected.clear();
-        self.detail = None;
-        self.confirm = None;
-        self.note.clear();
-        self.error.clear();
         self.scan_from_start(cx);
     }
 
@@ -1084,6 +1106,40 @@ mod tests {
         let prompt = danger_prompt(Locale::ZhCn, "flushall");
         assert!(prompt.contains("FLUSHALL"), "{prompt}");
         assert_ne!(i18n::text(Locale::En, "redis.tab.keysRefused"), "redis.tab.keysRefused");
+    }
+
+    #[gpui_kit::test]
+    fn switching_redis_target_clears_key_command_and_confirmation(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let dir = std::env::temp_dir().join(format!("rillsql-redis-reset-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        let pane = cx.update(|cx| cx.new(|_| RedisPane::new(services)));
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.plant_key("old-key");
+                pane.set_command("DEL old-key");
+                pane.set_ttl("60");
+                pane.set_rename("renamed");
+                pane.command("redis-delete", cx);
+                assert!(pane.confirm_open());
+                pane.reset_target_state();
+                pane.connection_id = "cache".into();
+                pane.connection_name = "缓存".into();
+                pane.database = "0".into();
+            });
+        });
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert!(!pane.confirm_open(), "换 Redis 目标不能保留旧删除确认");
+            assert!(pane.selected().is_empty());
+            assert!(pane.command_input().is_empty());
+            assert!(pane.ttl_input().is_empty());
+            assert!(pane.rename_to().is_empty());
+            assert!(pane.reply().is_empty());
+            assert!(!pane.status_line().contains("old-key"), "{}", pane.status_line());
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

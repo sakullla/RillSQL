@@ -190,8 +190,27 @@ impl AdminSession {
         self.note = i18n::text(self.locale, "admin.preview.unconnected");
     }
 
+    pub fn preview_open(&self) -> bool {
+        self.open
+    }
+
     pub fn preview_sql(&self) -> Vec<String> {
         self.preview.as_ref().map(|plan| plan.steps.iter().map(|step| step.sql.clone()).collect()).unwrap_or_default()
+    }
+
+    pub fn preview_risks(&self) -> Vec<(String, String)> {
+        self.preview
+            .as_ref()
+            .map(|plan| plan.risks.iter().map(|risk| (risk.level.clone(), risk.text.clone())).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn preview_rule(&self) -> String {
+        self.preview.as_ref().map(|plan| plan.rule.clone()).unwrap_or_default()
+    }
+
+    pub fn preview_target(&self) -> String {
+        self.preview.as_ref().map(|plan| plan.target.clone()).unwrap_or_default()
     }
 
     pub fn blocked(&self) -> Vec<String> {
@@ -229,8 +248,15 @@ impl AdminPane {
     }
 
     pub fn bind(&mut self, target: GridTarget) {
-        self.session.inventory = AdminInventory::offline(&target);
-        self.session.target = target;
+        if self.session.target == target {
+            return;
+        }
+        // 管理页只有一份操作草稿；切到另一个库或表时不能把上一个目标的
+        // PRAGMA、ATTACH 或预览继续带过去。
+        let locale = self.session.locale;
+        self.session = AdminSession::new(target);
+        self.session.locale = locale;
+        self.fields = Fields::default();
     }
 
     pub fn type_into(&mut self, field: &str, text: &str) {
@@ -326,9 +352,13 @@ impl AdminPane {
     }
 
     pub fn confirm(&mut self, cx: &mut Context<Self>) {
-        let Ok(sql) = self.session.confirm_sql() else {
-            cx.notify();
-            return;
+        let sql = match self.session.confirm_sql() {
+            Ok(sql) => sql,
+            Err(message) => {
+                self.session.note = message;
+                cx.notify();
+                return;
+            }
         };
         let Ok(request) = self.session.request() else {
             return;
@@ -351,9 +381,11 @@ impl AdminPane {
                 cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
-                            this.session.open = false;
                             this.session.note = match result {
-                                Ok(receipt) if receipt.blocked.is_empty() => i18n::text(this.session.locale, "structure.preview.done"),
+                                Ok(receipt) if receipt.blocked.is_empty() => {
+                                    this.session.open = false;
+                                    i18n::text(this.session.locale, "structure.preview.done")
+                                }
                                 Ok(receipt) => receipt.blocked.join(" "),
                                 Err(message) => message,
                             };
@@ -583,6 +615,16 @@ impl Render for AdminPane {
                                 .text_size(px(12.5))
                                 .child(SharedString::from(self.session.preview_sql().join("\n"))),
                         )
+                        .child(kit::muted(SharedString::from(self.session.preview_target()), &p))
+                        .when(!self.session.preview_risks().is_empty(), |this| {
+                            let mut risks = div().flex().flex_col().gap(px(4.));
+                            for (level, text) in self.session.preview_risks() {
+                                let (fg, bg) = if level == "danger" { (p.danger, p.danger_soft) } else if level == "warn" { (p.warn, p.warn_soft) } else { (p.text_muted, p.hover) };
+                                risks = risks.child(div().px(px(10.)).py(px(6.)).rounded(px(6.)).bg(bg).text_color(fg).text_size(px(12.)).child(SharedString::from(text)));
+                            }
+                            this.child(risks)
+                        })
+                        .when(!self.session.preview_rule().is_empty(), |this| this.child(kit::muted(SharedString::from(self.session.preview_rule()), &p)))
                         .when(!blocked.is_empty(), |this| this.child(div().px(px(12.)).py(px(8.)).rounded(px(8.)).bg(p.danger_soft).text_color(p.danger).text_size(px(12.5)).child(SharedString::from(blocked.join(" ")))))
                         .child(
                             div()
@@ -726,6 +768,55 @@ mod tests {
         snapshot.name = "orders".into();
         pane.session.inventory.sequences.clear();
         assert!(pane.session.inventory.sequences.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    fn failed_admin_confirm_keeps_the_preview_and_names_the_reason(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let dir = std::env::temp_dir().join(format!("rillsql-admin-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        let pane = cx.update(|cx| cx.new(|_| AdminPane::new(services)));
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.bind(target("sqlite"));
+                let mut snapshot = Snapshot::bare(DdlEngine::Sqlite, "app", "", "customers");
+                snapshot.name = "customers".into();
+                pane.session.operation = AdminOp::Vacuum;
+                pane.session.arm_fixture(&snapshot);
+                assert!(pane.session.preview_open());
+                pane.confirm(cx);
+                assert!(pane.session.preview_open(), "失败后预览应保留，方便查看原因和重试");
+                assert!(pane.session.note.contains("没有连接"), "{}", pane.session.note);
+            });
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn admin_target_change_drops_the_previous_operation_and_preview() {
+        let dir = std::env::temp_dir().join(format!("rillsql-admin-reset-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        let mut pane = AdminPane::new(services);
+        pane.bind(target("postgres"));
+        pane.type_into("reindex", "orders");
+        pane.choose("reindex");
+        let mut snapshot = Snapshot::bare(DdlEngine::Postgres, "app", "public", "orders");
+        snapshot.name = "orders".into();
+        pane.session.arm_fixture(&snapshot);
+        assert!(pane.session.open);
+        assert!(matches!(pane.session.operation, AdminOp::Reindex { .. }));
+
+        let mut other = target("postgres");
+        other.table = "customers_archive".into();
+        pane.bind(other);
+        assert_eq!(pane.session.target.table, "customers_archive");
+        assert!(matches!(pane.session.operation, AdminOp::Vacuum), "换表后不能沿用上一个索引操作");
+        assert!(pane.session.reindex_target.is_empty());
+        assert!(!pane.session.open, "换表后不能沿用上一个预览");
+        assert!(pane.session.note.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

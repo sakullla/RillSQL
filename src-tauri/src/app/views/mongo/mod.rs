@@ -39,6 +39,13 @@ enum AfterFind {
     ApplyFilter,
 }
 
+/// 文档写入也先进入待确认；确认条展示目标库、集合和要写入的 JSON。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingWrite {
+    Insert { json: String },
+    Replace { id_json: String, json: String },
+}
+
 pub struct MongoPane {
     services: Arc<AppServices>,
     locale: Locale,
@@ -64,6 +71,7 @@ pub struct MongoPane {
     editor_id: String,
     editor_error: String,
     confirm_id: Option<String>,
+    confirm_write: Option<PendingWrite>,
     confirm_prompt: String,
     note: String,
     error: String,
@@ -103,6 +111,7 @@ impl MongoPane {
             editor_id: String::new(),
             editor_error: String::new(),
             confirm_id: None,
+            confirm_write: None,
             confirm_prompt: String::new(),
             note: String::new(),
             error: String::new(),
@@ -202,7 +211,25 @@ impl MongoPane {
     }
 
     pub fn confirm_open(&self) -> bool {
+        self.confirm_id.is_some() || self.confirm_write.is_some()
+    }
+
+    pub fn confirm_prompt(&self) -> &str {
+        &self.confirm_prompt
+    }
+
+    fn confirm_is_delete(&self) -> bool {
         self.confirm_id.is_some()
+    }
+
+    fn confirm_action_text(&self) -> String {
+        if self.confirm_is_delete() {
+            self.text("mongo.tab.confirmDelete")
+        } else if self.locale == Locale::En {
+            "Confirm write".to_owned()
+        } else {
+            "确认写入".to_owned()
+        }
     }
 
     #[cfg(test)]
@@ -216,9 +243,44 @@ impl MongoPane {
         self.columns = columns_of(&self.documents);
     }
 
+    fn reset_target_state(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.busy = false;
+        self.connection_id.clear();
+        self.connection_name.clear();
+        self.databases.clear();
+        self.database.clear();
+        self.collections.clear();
+        self.collection.clear();
+        self.filter_input.clear();
+        self.applied_filter.clear();
+        self.pending_filter.clear();
+        self.after_find = AfterFind::Stay;
+        self.skip = 0;
+        self.documents.clear();
+        self.total = 0;
+        self.columns.clear();
+        self.view_open = false;
+        self.view_json.clear();
+        self.editor_open = false;
+        self.editor_mode = EditorMode::Insert;
+        self.editor_text.clear();
+        self.editor_id.clear();
+        self.editor_error.clear();
+        self.confirm_id = None;
+        self.confirm_write = None;
+        self.confirm_prompt.clear();
+        self.note.clear();
+        self.error.clear();
+        self.filter_error.clear();
+        self.copied.clear();
+        self.fields = Fields::default();
+        self.editor_state = None;
+    }
+
     pub fn open_spec(&mut self, spec: &str, cx: &mut Context<Self>) {
+        self.reset_target_state();
         let Some((id, name, database, collection)) = parse_spec(spec) else {
-            self.connection_id.clear();
             self.show_error(self.text("mongo.tab.needConnection"));
             cx.notify();
             return;
@@ -227,9 +289,6 @@ impl MongoPane {
         self.connection_name = name;
         self.database = database;
         self.collection = collection;
-        self.documents.clear();
-        self.note.clear();
-        self.error.clear();
         self.refresh_databases(cx);
     }
 
@@ -283,13 +342,14 @@ impl MongoPane {
             self.note.clear();
             self.error.clear();
         } else if id == "mongo-save" {
-            self.save_editor(cx);
+            self.ask_save();
         } else if let Some(index) = id.strip_prefix("mongo-delete:") {
             self.ask_delete(index);
         } else if id == "mongo-confirm" {
-            self.run_delete(cx);
+            self.run_confirm(cx);
         } else if id == "mongo-cancel" {
             self.confirm_id = None;
+            self.confirm_write = None;
             self.confirm_prompt.clear();
         }
         cx.notify();
@@ -446,7 +506,8 @@ impl MongoPane {
         self.error.clear();
     }
 
-    fn save_editor(&mut self, cx: &mut Context<Self>) {
+    /// 保存按钮只生成待确认写入，不直接落库。确认条上带目标库、集合和 JSON。
+    fn ask_save(&mut self) {
         if let Some(message) = quick_validate(&self.editor_text, self.locale) {
             self.editor_error = message.clone();
             self.show_error(message);
@@ -457,31 +518,64 @@ impl MongoPane {
             self.show_error(self.text("mongo.tab.needCollection"));
             return;
         }
-        let connections = Arc::clone(&self.services.connections);
-        let connection_id = self.connection_id.clone();
-        let database = self.database.clone();
-        let collection = self.collection.clone();
+        let target = format!("{}.{}", self.database, self.collection);
         let json = self.editor_text.clone();
+        let preview = json.replace('\n', " ");
+        self.confirm_id = None;
         match self.editor_mode {
-            EditorMode::Insert => self.spawn(
-                cx,
-                false,
-                async move { crate::application::mongo::insert_document(connections.as_ref(), &connection_id, &database, &collection, &json).await },
-                Self::finish_insert,
-            ),
+            EditorMode::Insert => {
+                self.confirm_prompt = if self.locale == Locale::En {
+                    format!("Insert into {target}: {preview}. Confirm write?")
+                } else {
+                    format!("将向 {target} 新增文档：{preview}。确认写入？")
+                };
+                self.confirm_write = Some(PendingWrite::Insert { json });
+            }
             EditorMode::Replace => {
                 let id_json = self.editor_id.clone();
                 if id_json.is_empty() {
                     self.show_error(self.text("mongo.docs.notMatched"));
                     return;
                 }
-                self.spawn(
-                    cx,
-                    false,
-                    async move { crate::application::mongo::replace_document(connections.as_ref(), &connection_id, &database, &collection, &id_json, &json).await },
-                    Self::finish_replace,
-                )
+                self.confirm_prompt = if self.locale == Locale::En {
+                    format!("Replace _id={id_json} in {target}: {preview}. Confirm write?")
+                } else {
+                    format!("将覆盖 {target} 中 _id={id_json} 的文档：{preview}。确认写入？")
+                };
+                self.confirm_write = Some(PendingWrite::Replace { id_json, json });
             }
+        }
+        self.note.clear();
+        self.error.clear();
+    }
+
+    fn run_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.confirm_id.is_some() {
+            self.run_delete(cx);
+        } else if let Some(write) = self.confirm_write.take() {
+            self.confirm_prompt.clear();
+            self.run_write(write, cx);
+        }
+    }
+
+    fn run_write(&mut self, write: PendingWrite, cx: &mut Context<Self>) {
+        let connections = Arc::clone(&self.services.connections);
+        let connection_id = self.connection_id.clone();
+        let database = self.database.clone();
+        let collection = self.collection.clone();
+        match write {
+            PendingWrite::Insert { json } => self.spawn(
+                cx,
+                false,
+                async move { crate::application::mongo::insert_document(connections.as_ref(), &connection_id, &database, &collection, &json).await },
+                Self::finish_insert,
+            ),
+            PendingWrite::Replace { id_json, json } => self.spawn(
+                cx,
+                false,
+                async move { crate::application::mongo::replace_document(connections.as_ref(), &connection_id, &database, &collection, &id_json, &json).await },
+                Self::finish_replace,
+            ),
         }
     }
 
@@ -528,6 +622,7 @@ impl MongoPane {
         let id_json = doc.id_json.clone();
         self.confirm_prompt = i18n::fill(&self.text("mongo.docs.deletePrompt"), &[("id", &id_json)]);
         self.confirm_id = Some(id_json);
+        self.confirm_write = None;
         self.note.clear();
         self.error.clear();
     }
@@ -535,6 +630,7 @@ impl MongoPane {
     fn run_delete(&mut self, cx: &mut Context<Self>) {
         let Some(id_json) = self.confirm_id.clone() else { return };
         self.confirm_id = None;
+        self.confirm_write = None;
         self.confirm_prompt.clear();
         let connections = Arc::clone(&self.services.connections);
         let connection_id = self.connection_id.clone();
@@ -923,7 +1019,8 @@ impl Render for MongoPane {
             }
             right = right.child(drawer);
         }
-        if self.confirm_id.is_some() {
+        if self.confirm_open() {
+            let delete = self.confirm_is_delete();
             right = right.child(
                 div()
                     .flex_none()
@@ -935,12 +1032,18 @@ impl Render for MongoPane {
                     .items_center()
                     .gap(px(10.))
                     .rounded(px(8.))
-                    .bg(p.danger_soft)
-                    .text_color(p.danger)
-                    .child(kit::icon(IconName::TriangleAlert, 15., p.danger))
+                    .bg(if delete { p.danger_soft } else { p.warn_soft })
+                    .text_color(if delete { p.danger } else { p.warn })
+                    .child(kit::icon(IconName::TriangleAlert, 15., if delete { p.danger } else { p.warn }))
                     .child(div().flex_1().min_w(px(0.)).text_size(px(12.5)).child(SharedString::from(self.confirm_prompt.clone())))
                     .child(mongo_button("mongo-cancel", None, &i18n::text(self.locale, "common.cancel"), Kind::Secondary, &entity))
-                    .child(mongo_button("mongo-confirm", Some(IconName::Trash), &self.text("mongo.tab.confirmDelete"), Kind::Danger, &entity)),
+                    .child(mongo_button(
+                        "mongo-confirm",
+                        Some(if delete { IconName::Trash } else { IconName::Check }),
+                        &self.confirm_action_text(),
+                        if delete { Kind::Danger } else { Kind::Primary },
+                        &entity,
+                    )),
             );
         }
         let status = if self.error.is_empty() { self.note.clone() } else { self.error.clone() };
@@ -1074,6 +1177,37 @@ mod tests {
         assert_eq!(next_skip(0, 20, 1), 20);
         assert!(pretty_json(r#"{"a":1}"#).contains('\n'));
         assert_ne!(i18n::text(Locale::En, "mongo.tab.insert"), "mongo.tab.insert");
+    }
+
+    #[gpui_kit::test]
+    fn mongo_write_is_previewed_and_target_switch_drops_it(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let dir = std::env::temp_dir().join(format!("rillsql-mongo-reset-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        let pane = cx.update(|cx| cx.new(|_| MongoPane::new(services)));
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.connection_id = "docs".into();
+                pane.connection_name = "文档".into();
+                pane.database = "app".into();
+                pane.collection = "users".into();
+                pane.command("mongo-insert", cx);
+                pane.set_editor(r#"{"name":"临时"}"#);
+                pane.command("mongo-save", cx);
+                assert!(pane.confirm_open(), "新增文档必须先预览确认");
+                assert!(pane.confirm_prompt().contains("app.users"), "{}", pane.confirm_prompt());
+                assert!(pane.confirm_prompt().contains("临时"), "{}", pane.confirm_prompt());
+                pane.reset_target_state();
+                pane.database = "app".into();
+                pane.collection = "orders".into();
+                assert!(!pane.confirm_open(), "换集合不能保留旧写入预览");
+                assert!(!pane.editor_open());
+                assert!(pane.editor_text().is_empty());
+                assert!(pane.documents().is_empty());
+            });
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

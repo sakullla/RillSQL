@@ -429,6 +429,18 @@ impl Workbench {
     }
 
     fn sync_grid_flags(&mut self, cx: &mut Context<Self>) {
+        // 工作项关闭后，专用页面缓存的目标也不能继续复用；下次打开同一目标时
+        // 必须重新 bind/open_spec，清掉上一个已关闭工作项的草稿和结果。
+        let has_structure_item = self.model.tabs.iter().any(|tab| matches!(tab.kind, WorkItemKind::Structure | WorkItemKind::Admin));
+        if !has_structure_item && self.applied_tool.as_deref().is_some_and(|key| key.starts_with("Structure:") || key.starts_with("Admin:")) {
+            self.applied_tool = None;
+        }
+        if !self.model.tabs.iter().any(|tab| tab.kind == WorkItemKind::Redis) {
+            self.applied_redis = None;
+        }
+        if !self.model.tabs.iter().any(|tab| tab.kind == WorkItemKind::Mongo) {
+            self.applied_mongo = None;
+        }
         // 表格项全部关闭后，共享网格里的暂存与旧数据都不再有归属；清掉它，
         // 避免窗口关闭被幽灵暂存阻塞，也避免重开同一张表时沿用陈旧快照。
         let has_table_item = self.model.tabs.iter().any(|tab| tab.kind == WorkItemKind::Table);
