@@ -258,6 +258,70 @@ fn switching_between_table_items_keeps_each_spec_and_tool() {
 }
 
 #[test]
+fn staged_cells_block_switching_to_another_table() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    let customers = "notes|笔记|main||customers|sqlite|dev";
+    let orders = "notes|笔记|main||orders|sqlite|dev";
+    assert!(model.dispatch(&format!("open-table:{customers}")).is_some());
+    let customers_id = model.active_tab.clone().expect("customers");
+    model.tabs[0].uncommitted_cells = true;
+
+    assert!(model.dispatch(&format!("open-table:{orders}")).is_some());
+    assert_eq!(model.tabs.len(), 1, "有暂存修改时不得打开另一张表并清空网格");
+    assert_eq!(model.active_tab.as_deref(), Some(customers_id.as_str()));
+    assert_eq!(model.notice_key, Some("shell.tabs.pendingCells"));
+
+    // 同一张表的结构页共享同一网格，可以切换。
+    assert!(model.dispatch(&format!("open-structure-for:{customers}")).is_some());
+    assert_eq!(model.tool, WorkTool::Structure);
+    assert_eq!(model.shell.page, AppPage::Structure);
+
+    // 提交或撤销暂存后恢复切换。
+    model.tabs.iter_mut().find(|tab| tab.id == customers_id).unwrap().uncommitted_cells = false;
+    assert!(model.dispatch(&format!("open-table:{orders}")).is_some());
+    assert_eq!(model.tabs.len(), 3);
+    assert_eq!(model.table_spec.as_deref(), Some(orders));
+}
+
+#[test]
+fn tab_context_menu_targets_the_activated_item() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    let customers = "notes|笔记|main||customers|sqlite|dev";
+    assert!(model.dispatch(&format!("open-table:{customers}")).is_some());
+    let table_id = model.active_tab.clone().expect("table");
+    assert!(model.dispatch(&format!("open-structure-for:{customers}")).is_some());
+    assert_eq!(model.tool, WorkTool::Structure);
+
+    assert!(model.tab_menu_for(&table_id));
+    assert_eq!(model.active_tab.as_deref(), Some(table_id.as_str()));
+    assert_eq!(model.tool, WorkTool::Table);
+    assert_eq!(model.shell.page, AppPage::Workspace);
+    assert_eq!(model.table_spec.as_deref(), Some(customers));
+    assert!(model.menu.is_some(), "右键应打开以当前项为基准的标签菜单");
+}
+
+#[test]
+fn keyboard_tab_cycling_reaches_every_work_item() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert!(model.dispatch("new-query").is_some());
+    let first = model.active_tab.clone().expect("query");
+    assert!(model.dispatch("open-table:notes|笔记|main||customers|sqlite|dev").is_some());
+    let second = model.active_tab.clone().expect("table");
+    assert!(model.dispatch("open-structure-for:notes|笔记|main||customers|sqlite|dev").is_some());
+    let third = model.active_tab.clone().expect("structure");
+
+    assert!(model.dispatch("next-tab").is_some());
+    assert_eq!(model.active_tab.as_deref(), Some(first.as_str()));
+    assert_eq!(model.tool, WorkTool::Query);
+    assert!(model.dispatch("prev-tab").is_some());
+    assert_eq!(model.active_tab.as_deref(), Some(third.as_str()));
+    assert_eq!(model.tool, WorkTool::Structure);
+    assert!(model.dispatch("prev-tab").is_some());
+    assert_eq!(model.active_tab.as_deref(), Some(second.as_str()));
+    assert_eq!(model.table_spec.as_deref(), Some("notes|笔记|main||customers|sqlite|dev"));
+}
+
+#[test]
 fn closing_the_active_item_reactivates_a_neighbour_and_follows_its_tool() {
     let mut model = WorkbenchModel::new(Shell::default());
     let customers = "notes|笔记|main||customers|sqlite|dev";

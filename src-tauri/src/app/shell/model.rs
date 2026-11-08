@@ -707,6 +707,15 @@ impl WorkbenchModel {
         self.open_menu(MenuPlace::TabBar, MenuTarget::QueryTab);
     }
 
+    /// 标签右键：先激活目标项，再打开菜单；视图、目标与菜单基准保持一致。
+    pub fn tab_menu_for(&mut self, id: &str) -> bool {
+        if !self.activate_item(id) {
+            return false;
+        }
+        self.open_tab_menu();
+        true
+    }
+
     pub fn open_grid_menu(&mut self) {
         let target = if self.grid_writable { MenuTarget::WritableGrid } else { MenuTarget::ReadonlyGrid };
         self.open_menu(MenuPlace::Grid, target);
@@ -932,33 +941,77 @@ impl WorkbenchModel {
 
     fn remove_tab(&mut self, id: &str) {
         let index = self.tabs.iter().position(|tab| tab.id == id);
+        let removed = self.tabs.iter().find(|tab| tab.id == id).cloned();
         self.tabs.retain(|tab| tab.id != id);
-        let has_target_item = self
-            .tabs
-            .iter()
-            .any(|tab| matches!(tab.kind, WorkItemKind::Table | WorkItemKind::Structure | WorkItemKind::Admin));
-        if !has_target_item {
-            // 所有目标页都已关闭，暂存不再属于任何可恢复工作项；窗口关闭不再被它阻塞。
-            self.grid_dirty = false;
-        }
         if self.active_tab.as_deref() != Some(id) {
+            // 关闭的不是当前项：只有它正好被当前工具显示时才重新绑定视图。
+            if let Some(removed) = removed {
+                if self.view_shows(&removed) {
+                    self.rebind_to_active();
+                }
+            }
             return;
         }
         // 桌面习惯：优先激活右侧邻居，没有则退回左侧。
         let next = index
             .and_then(|index| self.tabs.get(index).or_else(|| self.tabs.get(index.saturating_sub(1))))
-            .map(|tab| tab.id.clone());
+            .map(|tab| (tab.id.clone(), tab.kind, tab.spec.clone()));
         self.active_tab = None;
+        let page = self.shell.page;
         match next {
-            Some(next) if matches!(self.shell.page, AppPage::Workspace | AppPage::Structure) => self.activate_item(&next),
-            Some(next) => self.active_tab = Some(next),
+            Some((next, kind, spec)) => {
+                self.show_item(&next, kind, spec);
+                // 用户可能正停在设置/历史/对比页，只在工作页上跟随标签切换。
+                if !matches!(page, AppPage::Workspace | AppPage::Structure) {
+                    self.shell.page = page;
+                }
+            }
             None => {
-                self.tool = WorkTool::Query;
-                if self.shell.page == AppPage::Structure {
+                self.reset_work_view();
+                if page == AppPage::Structure {
                     self.shell.page = AppPage::Workspace;
                 }
             }
         }
+    }
+
+    fn view_shows(&self, item: &WorkItem) -> bool {
+        if self.tool != item.kind.tool() {
+            return false;
+        }
+        match item.kind {
+            WorkItemKind::Table | WorkItemKind::Structure | WorkItemKind::Admin => {
+                self.table_spec.is_some() && self.table_spec == item.spec
+            }
+            WorkItemKind::Redis => self.redis_spec.is_some() && self.redis_spec == item.spec,
+            WorkItemKind::Mongo => self.mongo_spec.is_some() && self.mongo_spec == item.spec,
+            WorkItemKind::Query => false,
+        }
+    }
+
+    fn rebind_to_active(&mut self) {
+        let active = self.active_tab.clone();
+        match active {
+            Some(id) => {
+                let target = self
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .map(|tab| (tab.id.clone(), tab.kind, tab.spec.clone()));
+                if let Some((id, kind, spec)) = target {
+                    self.show_item(&id, kind, spec);
+                }
+            }
+            None => self.reset_work_view(),
+        }
+    }
+
+    fn reset_work_view(&mut self) {
+        self.tool = WorkTool::Query;
+        self.table_spec = None;
+        self.redis_spec = None;
+        self.mongo_spec = None;
+        self.shell.focus = FocusTarget::Editor;
     }
 
     fn close_others(&mut self) {
@@ -1013,14 +1066,19 @@ impl WorkbenchModel {
             .find(|item| item.kind == kind && item.spec.as_deref() == Some(spec.as_str()))
         {
             let id = existing.id.clone();
-            self.activate_item(&id);
+            let _ = self.activate_item(&id);
+            return;
+        }
+        if self.switch_blocked(kind, Some(spec.as_str())) {
+            self.notice_key = Some("shell.tabs.pendingCells");
+            self.notice_detail.clear();
             return;
         }
         let title = self.item_title(kind, &spec);
         let id = self.next_item_id(kind);
         // 目标规格开头几段就是连接、库和引擎；把它一并带进工作项，状态栏与关闭保护看到同一目标。
         let parts: Vec<&str> = spec.split('|').collect();
-        let mut part = |index: usize| {
+        let part = |index: usize| {
             parts
                 .get(index)
                 .map(|text| text.trim().to_owned())
@@ -1042,19 +1100,48 @@ impl WorkbenchModel {
             database,
             engine,
         });
-        self.activate_item(&id);
+        let _ = self.activate_item(&id);
+    }
+
+    /// 当前表格尚有暂存单元格时，切到另一个表格类工作项会清空共享网格，
+    /// 因此先要求提交或撤销，避免静默丢修改。
+    fn switch_blocked(&self, kind: WorkItemKind, spec: Option<&str>) -> bool {
+        let Some(staged) = self
+            .tabs
+            .iter()
+            .find(|item| item.kind == WorkItemKind::Table && item.uncommitted_cells)
+            .and_then(|item| item.spec.clone())
+        else {
+            return false;
+        };
+        let target_touches_grid = matches!(
+            kind,
+            WorkItemKind::Table | WorkItemKind::Structure | WorkItemKind::Admin
+        );
+        target_touches_grid && spec != Some(staged.as_str())
     }
 
     /// 激活工作项并把视图、工具与目标一起切到该工作项。
-    pub fn activate_item(&mut self, id: &str) {
+    /// 返回 false 表示被未提交的表格暂存拦下，调用方不应再改变标签选择。
+    pub fn activate_item(&mut self, id: &str) -> bool {
         let Some((kind, spec)) = self
             .tabs
             .iter()
             .find(|item| item.id == id)
             .map(|item| (item.kind, item.spec.clone()))
         else {
-            return;
+            return false;
         };
+        if self.active_tab.as_deref() != Some(id) && self.switch_blocked(kind, spec.as_deref()) {
+            self.notice_key = Some("shell.tabs.pendingCells");
+            self.notice_detail.clear();
+            return false;
+        }
+        self.show_item(id, kind, spec);
+        true
+    }
+
+    fn show_item(&mut self, id: &str, kind: WorkItemKind, spec: Option<String>) {
         self.active_tab = Some(id.to_owned());
         self.tool = kind.tool();
         self.shell.page = kind.page();
@@ -1068,7 +1155,12 @@ impl WorkbenchModel {
             WorkItemKind::Table | WorkItemKind::Structure | WorkItemKind::Admin => self.table_spec = spec,
             WorkItemKind::Redis => self.redis_spec = spec,
             WorkItemKind::Mongo => self.mongo_spec = spec,
-            WorkItemKind::Query => {}
+            WorkItemKind::Query => {
+                // 查询项不继承上一个表/专用页面的目标，避免 open-admin、导出等消费者取到旧目标。
+                self.table_spec = None;
+                self.redis_spec = None;
+                self.mongo_spec = None;
+            }
         }
     }
 
@@ -1084,7 +1176,7 @@ impl WorkbenchModel {
         let len = self.tabs.len() as isize;
         let next = (index as isize + delta).rem_euclid(len) as usize;
         let id = self.tabs[next].id.clone();
-        self.activate_item(&id);
+        let _ = self.activate_item(&id);
     }
 
     fn next_item_id(&self, kind: WorkItemKind) -> String {

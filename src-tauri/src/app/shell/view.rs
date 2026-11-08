@@ -26,7 +26,7 @@ use crate::ui::Foundation;
 
 use super::jobs::{self, apply_done, job_request};
 use super::menus::NavKey;
-use super::model::{DraftField, PendingJob, WorkTool, WorkbenchModel};
+use super::model::{DraftField, PendingJob, WorkItemKind, WorkTool, WorkbenchModel};
 use crate::app::Shell;
 
 pub struct Workbench {
@@ -42,6 +42,8 @@ pub struct Workbench {
     pub(super) redis: Entity<RedisPane>,
     pub(super) mongo: Entity<MongoPane>,
     applied_tool: Option<String>,
+    /// 共享表格网格当前展示的表规格；暂存必须归属到这张表对应的工作项。
+    table_view_spec: Option<String>,
     applied_diagram: Option<String>,
     applied_redis: Option<String>,
     applied_mongo: Option<String>,
@@ -99,6 +101,7 @@ impl Workbench {
             redis,
             mongo,
             applied_tool: None,
+            table_view_spec: None,
             applied_diagram: None,
             applied_redis: None,
             applied_mongo: None,
@@ -395,22 +398,45 @@ impl Workbench {
     }
 
     fn sync_grid_flags(&mut self, cx: &mut Context<Self>) {
-        let dirty = self.table.read(cx).uncommitted() || self.query.read(cx).grid_uncommitted(cx);
-        let writable = self.table.read(cx).writable() || self.query.read(cx).grid_writable(cx);
-        self.model.grid_dirty = dirty;
-        self.model.grid_writable = writable;
-        if dirty {
-            let table_item = self.model.tool == WorkTool::Table;
-            if let Some(id) = self.model.active_tab.clone() {
-                if let Some(tab) = self.model.tabs.iter_mut().find(|tab| tab.id == id) {
-                    if table_item == (tab.kind == crate::app::shell::model::WorkItemKind::Table) {
-                        tab.uncommitted_cells = true;
+        let table_dirty = self.table.read(cx).uncommitted();
+        // 表格项全部关闭后，共享网格里的暂存已没有归属；清掉它，避免窗口关闭被幽灵暂存永久阻塞。
+        if table_dirty {
+            let owned = self.table_view_spec.as_deref().is_some_and(|spec| {
+                self.model
+                    .tabs
+                    .iter()
+                    .any(|tab| tab.kind == WorkItemKind::Table && tab.spec.as_deref() == Some(spec))
+            });
+            if !owned && self.table_view_spec.is_some() {
+                self.table.update(cx, |pane, cx| pane.clear_sheet(cx));
+                self.applied_tool = None;
+                self.table_view_spec = None;
+            }
+        }
+        let table_dirty = self.table.read(cx).uncommitted();
+        let query_dirty = self.query.read(cx).grid_uncommitted(cx);
+        self.model.grid_dirty = table_dirty || query_dirty;
+        self.model.grid_writable = self.table.read(cx).writable() || self.query.read(cx).grid_writable(cx);
+        let active = self.model.active_tab.clone();
+        let table_spec = self.table_view_spec.clone();
+        for tab in &mut self.model.tabs {
+            match tab.kind {
+                WorkItemKind::Table => {
+                    tab.uncommitted_cells = table_dirty
+                        && table_spec
+                            .as_deref()
+                            .is_some_and(|spec| tab.spec.as_deref() == Some(spec));
+                }
+                WorkItemKind::Query => {
+                    if query_dirty {
+                        if active.as_deref() == Some(tab.id.as_str()) {
+                            tab.uncommitted_cells = true;
+                        }
+                    } else {
+                        tab.uncommitted_cells = false;
                     }
                 }
-            }
-        } else {
-            for tab in &mut self.model.tabs {
-                tab.uncommitted_cells = false;
+                _ => {}
             }
         }
     }
@@ -427,10 +453,13 @@ impl Workbench {
         };
         let locale = self.model.locale();
         match self.model.tool {
-            WorkTool::Table => self.table.update(cx, |pane, cx| {
-                pane.set_locale(locale);
-                pane.open_table(target, 100, cx);
-            }),
+            WorkTool::Table => {
+                self.table_view_spec = Some(spec.clone());
+                self.table.update(cx, |pane, cx| {
+                    pane.set_locale(locale);
+                    pane.open_table(target, 100, cx);
+                });
+            }
             WorkTool::Structure => self.structure.update(cx, |pane, _| {
                 pane.set_locale(locale);
                 pane.bind(target);

@@ -606,7 +606,7 @@ impl Workbench {
 
     fn tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
-        // 标签列表独立滚动，新建与当前标签入口始终留在右侧，不被溢出的标签挤走。
+        // 标签列表独立滚动，新建入口固定在右侧；当前标签可通过横向滚动或 Ctrl+Tab 到达。
         let mut list = div()
             .id("tab-list")
             .flex()
@@ -640,9 +640,11 @@ impl Workbench {
                 .xsmall(),
             )
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                this.menu_at = event.position;
-                this.model.active_tab = Some(menu_id.clone());
-                this.perform("menu-tab", cx);
+                // 右键先真正激活该工作项，菜单动作与随后的视图目标才指向同一项。
+                if this.model.tab_menu_for(&menu_id) {
+                    this.menu_at = event.position;
+                }
+                cx.notify();
             }))
             .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                 this.model.request_close_tab(&middle_id);
@@ -650,7 +652,7 @@ impl Workbench {
                 cx.notify();
             }))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.model.activate_item(&id);
+                let _ = this.model.activate_item(&id);
                 if this.model.tool == WorkTool::Query {
                     this.query.update(cx, |pane, _| pane.request_focus());
                 }
