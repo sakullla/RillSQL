@@ -1873,7 +1873,7 @@ fn quick_open_lists_loaded_tables_and_views_and_opens_the_matching_target() {
     let labels: Vec<&str> = entries.iter().map(|entry| entry.label.as_str()).collect();
     assert_eq!(labels, vec!["orders", "order_view"], "快速打开只列真实表 / 视图");
     assert!(entries.iter().all(|entry| entry.group == "table"), "命令和连接不应混入快速打开");
-    // 断开连接后旧索引不再冒充可打开对象；重新连上才恢复。
+    // 断开连接后旧索引不再冒充可打开对象；已删除连接即使状态还停在 Connected 也不能列出。
     model
         .connections
         .status
@@ -1883,7 +1883,9 @@ fn quick_open_lists_loaded_tables_and_views_and_opens_the_matching_target() {
         .connections
         .status
         .insert("pg".into(), crate::app::views::connections::LinkStatus::Connected);
-    assert_eq!(model.palette_entries().len(), 2);
+    assert!(model.palette_entries().is_empty(), "连接记录已删除时不得列旧对象");
+    model.connections.status.remove("pg");
+    assert_eq!(model.palette_entries().len(), 2, "状态未知时保留已读取索引");
 
     let target = crate::app::views::query::object_spec(&orders, "");
     let wanted = format!("open-table:{target}");
@@ -1916,6 +1918,12 @@ fn explorer_keeps_non_table_objects_but_quick_open_does_not() {
     let objects = model.catalog_for("pg", "");
     let explorer: Vec<&str> = objects.iter().map(|object| object.name.as_str()).collect();
     assert_eq!(explorer, vec!["orders", "orders_touch"], "对象树保留触发器等其他关系型对象");
+    let grouped: Vec<String> = model
+        .object_groups("pg")
+        .iter()
+        .flat_map(|group| group.objects.iter().map(|object| object.name.clone()))
+        .collect();
+    assert_eq!(grouped, vec!["orders", "orders_touch"], "分组后仍保留触发器");
 
     model.shell.palette_tables_only = true;
     let entries = model.palette_entries();

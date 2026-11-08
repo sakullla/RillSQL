@@ -650,7 +650,11 @@ impl QueryPane {
                                     pane.desk.set_active_note(&failure);
                                 }
                             }
-                            Err(error) => pane.desk.set_active_note(&error),
+                            Err(error) => {
+                                // 整次读取失败也要进入对象区错误态，而不是显示成“尚未读取对象”。
+                                pane.desk.set_tree_error(&error);
+                                pane.desk.set_active_note(&error);
+                            }
                         }
                         cx.notify();
                     })

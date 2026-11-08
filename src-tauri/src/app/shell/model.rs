@@ -891,12 +891,19 @@ impl WorkbenchModel {
     pub fn catalog_entries(&self) -> Vec<PaletteEntry> {
         self.catalog
             .iter()
-            // 断开或连接失败的旧对象不再冒充“当前可打开”；状态未知时保留（测试与离线读取）。
+            // 断开、删除或连接失败的旧对象不再冒充“当前可打开”；
+            // 状态未知时保留（离线读取与测试），状态为已连接时仍要求连接记录存在。
             .filter(|object| {
-                self.connections
-                    .status
-                    .get(&object.connection_id)
-                    .is_none_or(|status| *status == LinkStatus::Connected)
+                let known = self
+                    .connections
+                    .rows
+                    .iter()
+                    .any(|row| row.saved.id == object.connection_id);
+                match self.connections.status.get(&object.connection_id).copied() {
+                    Some(LinkStatus::Connected) => known,
+                    Some(_) => false,
+                    None => true,
+                }
             })
             .filter(|object| is_table_object(object))
             .map(|object| {
@@ -1836,7 +1843,8 @@ pub fn is_table_object(object: &TreeObject) -> bool {
 pub fn group_objects(objects: &[&TreeObject]) -> Vec<ObjectGroup> {
     let mut groups: Vec<ObjectGroup> = Vec::new();
     for object in objects {
-        if !is_table_object(object) {
+        // 资源管理器保留全部关系型对象；表 / 视图的收窄只发生在快速打开。
+        if !relational_engine(&object.engine) {
             continue;
         }
         match groups

@@ -392,9 +392,11 @@ impl Workbench {
                         }
                     }
                     let environment = row.saved.env.clone();
+                    // 同一库下的多个模式只打印一次库名。
+                    let mut databases = std::collections::BTreeSet::new();
                     for group in groups {
                         // 数据库 / 模式按已读取的元数据分层；空段不制造标题。
-                        if !group.database.is_empty() {
+                        if !group.database.is_empty() && databases.insert(group.database.clone()) {
                             list = list.child(
                                 div()
                                     .pl(px(30.))
