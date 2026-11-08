@@ -151,6 +151,10 @@ pub struct SharedGrid {
     preview_sql: Vec<String>,
     preview_ids: Vec<String>,
     preview_open: bool,
+    /// 大字段预览的截断上限（字节）；来自设置 preview_kb。
+    preview_bytes: usize,
+    /// TSV 里数据库 NULL 的显示文本；SQL 字面量始终是 NULL。
+    null_copy: String,
     readonly_reason: String,
     seq: u64,
     pub token: u64,
@@ -195,6 +199,8 @@ impl SharedGrid {
             preview_sql: Vec::new(),
             preview_ids: Vec::new(),
             preview_open: false,
+            preview_bytes: 1024,
+            null_copy: "NULL".to_owned(),
             readonly_reason: String::new(),
             seq: 0,
             token: 0,
@@ -502,6 +508,7 @@ impl SharedGrid {
             }),
             offset: self.offset,
             limit: self.limit,
+            preview_bytes: self.preview_bytes as u64,
             search: if self.search.is_empty() { None } else { Some(self.search.clone()) },
         }
     }
@@ -520,6 +527,24 @@ impl SharedGrid {
 
     pub fn page_limit(&self) -> u64 {
         self.limit
+    }
+
+    /// 大字段预览的截断上限（字节）；默认 1024，由设置 preview_kb 下发。
+    pub fn preview_bytes(&self) -> usize {
+        self.preview_bytes
+    }
+
+    pub fn set_preview_bytes(&mut self, bytes: usize) {
+        self.preview_bytes = bytes.max(1);
+    }
+
+    /// TSV 里数据库 NULL 的显示文本。
+    pub fn null_copy(&self) -> &str {
+        &self.null_copy
+    }
+
+    pub fn set_null_copy(&mut self, token: &str) {
+        self.null_copy = token.to_owned();
     }
 
     pub fn clear_selection(&mut self) {
@@ -694,7 +719,7 @@ impl SharedGrid {
 
     pub fn show_cell(&self, row: usize, column: usize, opened: bool) -> ShownCell {
         let type_name = self.columns.get(column).map(|item| item.type_name.as_str()).unwrap_or("");
-        classify(self.locale, self.value_at(row, column), type_name, opened)
+        classify_with_limit(self.locale, self.value_at(row, column), type_name, opened, self.preview_bytes)
     }
 
     pub fn cell_label(&self, row: usize, column: usize) -> String {
@@ -1298,7 +1323,8 @@ impl SharedGrid {
         match self.value_at(row, column) {
             Some(Some(text)) if text == "NULL" => quote_tsv(&text, true),
             Some(Some(text)) => quote_tsv(&text, false),
-            _ => "NULL".to_owned(),
+            // 数据库 NULL 的显示文本来自设置；字符串 "NULL" 仍然强制加引号。
+            _ => self.null_copy.clone(),
         }
     }
 
@@ -1551,7 +1577,19 @@ pub fn column_of(name: &str, type_name: &str, primary: bool) -> Column {
     Column { name: name.to_owned(), type_name: type_name.to_owned(), nullable: !primary, primary, unique: primary, auto: primary }
 }
 
+#[allow(dead_code)]
 pub fn classify(locale: Locale, value: Option<Option<String>>, type_name: &str, opened: bool) -> ShownCell {
+    classify_with_limit(locale, value, type_name, opened, 1024)
+}
+
+/// 与 classify 相同，但用设置里的预览上限判断“大字段”；默认仍是 1024 字节。
+pub fn classify_with_limit(
+    locale: Locale,
+    value: Option<Option<String>>,
+    type_name: &str,
+    opened: bool,
+    preview_bytes: usize,
+) -> ShownCell {
     let Some(value) = value else {
         return ShownCell { kind: CellKind::Unset, label: i18n::text(locale, "grid.value.unsetLabel"), body: String::new() };
     };
@@ -1582,7 +1620,7 @@ pub fn classify(locale: Locale, value: Option<Option<String>>, type_name: &str, 
             body: if opened { text } else { String::new() },
         };
     }
-    if text.len() > 1024 && !opened {
+    if text.len() > preview_bytes.max(1) && !opened {
         return ShownCell {
             kind: CellKind::Large,
             label: format!("{} {}", i18n::text(locale, "grid.value.largeLabel"), text.len()),
@@ -1760,6 +1798,23 @@ mod tests {
         grid.select_all_loaded();
         assert_eq!(grid.selection_count(), 0);
         assert_eq!(grid.full_count(), Some(1000));
+    }
+
+    #[test]
+    fn preview_limit_follows_the_setting_and_changes_the_label() {
+        let long = "a".repeat(2048);
+        let mut grid = SharedGrid::new();
+        grid.load_local(
+            vec![text_column("id"), text_column("note")],
+            vec![row("1", vec![Some("1"), Some(long.as_str())], true)],
+            Some(1),
+            Some(schema()),
+        );
+        let large = format!("{} 2048", i18n::text(Locale::ZhCn, "grid.value.largeLabel"));
+        assert_eq!(grid.cell_label(0, 1), large, "默认 1 KB 上限下显示大字段");
+        grid.set_preview_bytes(4 * 1024);
+        assert_eq!(grid.cell_label(0, 1), long, "4 KB 上限下同一值直接显示");
+        assert_eq!(grid.page_request().preview_bytes, 4096);
     }
 
     #[test]
@@ -2211,7 +2266,7 @@ mod tests {
         let schema = schema_from_dto(&crate::application::grid::describe(&service, &table).await.unwrap()).unwrap();
         let page = crate::application::grid::page(
             &service,
-            &crate::grid::commands::PageRequest { table, filters: Vec::new(), sort: None, offset: 0, limit: 24, search: None },
+            &crate::grid::commands::PageRequest { table, filters: Vec::new(), sort: None, offset: 0, limit: 24, preview_bytes: 1024, search: None },
         )
         .await
         .unwrap();
@@ -2283,7 +2338,7 @@ mod tests {
         let loose_schema = schema_from_dto(&crate::application::grid::describe(&service, &loose_ref).await.unwrap()).unwrap();
         let loose_page = crate::application::grid::page(
             &service,
-            &crate::grid::commands::PageRequest { table: loose_ref, filters: Vec::new(), sort: None, offset: 0, limit: 10, search: None },
+            &crate::grid::commands::PageRequest { table: loose_ref, filters: Vec::new(), sort: None, offset: 0, limit: 10, preview_bytes: 1024, search: None },
         )
         .await
         .unwrap();
@@ -2321,6 +2376,7 @@ mod tests {
                 sort: None,
                 offset: 0,
                 limit: 10,
+                preview_bytes: 1024,
                 search: None,
             },
         )
@@ -2391,7 +2447,7 @@ mod tests {
         let schema = schema_from_dto(&crate::application::grid::describe(&service, &table).await.unwrap()).unwrap();
         let page = crate::application::grid::page(
             &service,
-            &crate::grid::commands::PageRequest { table, filters: Vec::new(), sort: None, offset: 0, limit: 10, search: None },
+            &crate::grid::commands::PageRequest { table, filters: Vec::new(), sort: None, offset: 0, limit: 10, preview_bytes: 1024, search: None },
         )
         .await
         .unwrap();
@@ -2460,7 +2516,7 @@ mod tests {
         let schema = schema_from_dto(&crate::application::grid::describe(&service, &table).await.unwrap()).unwrap();
         let page = crate::application::grid::page(
             &service,
-            &crate::grid::commands::PageRequest { table, filters: Vec::new(), sort: None, offset: 0, limit: 10, search: None },
+            &crate::grid::commands::PageRequest { table, filters: Vec::new(), sort: None, offset: 0, limit: 10, preview_bytes: 1024, search: None },
         )
         .await
         .unwrap();
@@ -2518,6 +2574,7 @@ mod tests {
                 sort: None,
                 offset: 0,
                 limit: 10,
+                preview_bytes: 1024,
                 search: None,
             },
         )

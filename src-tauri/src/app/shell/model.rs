@@ -247,6 +247,8 @@ pub struct WorkbenchModel {
     pub redis_running: bool,
     /// MongoDB 文档读取或写入还在跑。关闭守卫把它和网格暂存、查询草稿分开。
     pub mongo_running: bool,
+    /// 已经发起的更新检查次数；关闭自动检查时不增加，也不启动任何网络任务。
+    pub update_checks: u32,
 }
 
 impl WorkbenchModel {
@@ -300,6 +302,7 @@ impl WorkbenchModel {
             mongo_spec: None,
             redis_running: false,
             mongo_running: false,
+            update_checks: 0,
         }
     }
 
@@ -689,6 +692,9 @@ impl WorkbenchModel {
             "font-down" => self.settings.step_editor_font(-1),
             "editor-theme-prev" => self.settings.cycle_editor_theme_step(-1),
             "toggle-updates" => self.settings.toggle_updates(),
+            "check-updates" => {
+                self.begin_update_check();
+            }
             "close-stay" => self.choose_stay(),
             "close-leave" => self.choose_leave(),
             "welcome-connections" => {
@@ -1109,6 +1115,16 @@ impl WorkbenchModel {
                 false
             }
         }
+    }
+
+    /// 更新检查的唯一入口。关闭自动检查时直接返回 false，不发起网络检查；
+    /// 开启时只在这里记账，真正的检查任务由调用方在返回 true 后启动。
+    pub fn begin_update_check(&mut self) -> bool {
+        if !self.settings.auto_check_updates {
+            return false;
+        }
+        self.update_checks = self.update_checks.saturating_add(1);
+        true
     }
 
     pub fn request_update_install(&mut self) -> Result<(), &'static str> {

@@ -36,6 +36,10 @@ pub struct SortArg {
     pub direction: String,
 }
 
+fn default_preview_bytes() -> u64 {
+    1024
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PageRequest {
@@ -45,6 +49,9 @@ pub struct PageRequest {
     pub sort: Option<SortArg>,
     pub offset: u64,
     pub limit: u64,
+    /// 大字段预览的截断上限（字节）；缺省 1024，来自设置 preview_kb。
+    #[serde(default = "default_preview_bytes")]
+    pub preview_bytes: u64,
     /// 整表关键字搜索（R3），与筛选 AND 组合；空表示没有搜索。
     #[serde(default)]
     pub search: Option<String>,

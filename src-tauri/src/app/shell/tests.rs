@@ -3311,3 +3311,60 @@ fn history_and_settings_pages_render_and_apply_their_controls(cx: &mut gpui_kit:
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn auto_update_check_is_skipped_when_the_setting_is_off() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.settings.auto_check_updates = false;
+    assert!(!model.begin_update_check(), "关闭时不发起检查");
+    assert_eq!(model.update_checks, 0);
+    assert!(model.dispatch("check-updates").is_some());
+    assert_eq!(model.update_checks, 0, "命令入口也必须读取开关");
+    model.settings.auto_check_updates = true;
+    assert!(model.begin_update_check());
+    assert_eq!(model.update_checks, 1);
+    assert!(model.dispatch("check-updates").is_some());
+    assert_eq!(model.update_checks, 2);
+}
+
+#[gpui_kit::test]
+fn public_settings_reach_the_query_pane_without_a_restart(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-settings-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench(cx, Arc::clone(&services), false);
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.perform("settings", cx);
+            view.perform("font-up", cx);
+            view.perform("editor-theme-next", cx);
+            view.perform("page-size-up", cx);
+            view.perform("preview-up", cx);
+            view.perform("object-page-up", cx);
+            view.perform("null-N", cx);
+        });
+    });
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.update(|cx| {
+        let query = view.read(cx).query.read(cx);
+        assert_eq!(query.editor_font(), 14, "font-up 应下发到 QueryPane");
+        assert_eq!(query.editor_theme(), "contrast");
+        assert_eq!(query.page_size(), 150);
+        assert_eq!(query.preview_kb(), 2);
+        assert_eq!(query.object_page(), 150);
+        assert_eq!(query.null_copy(), "\\N");
+        assert_eq!(query.run_limit(), 150, "查询读取行数跟随 page_size");
+    });
+
+    // 关掉自动检查后，启动路径和命令入口都不再发起检查。
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.model.settings.auto_check_updates = false;
+            view.perform("check-updates", cx);
+        });
+    });
+    cx.update(|cx| assert_eq!(view.read(cx).model.update_checks, 0));
+    let _ = std::fs::remove_dir_all(&dir);
+}

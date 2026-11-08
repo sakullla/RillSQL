@@ -91,6 +91,13 @@ pub struct QueryPane {
     selected_object: Option<String>,
     variable_inputs: HashMap<String, (Entity<InputState>, String, gpui_kit::Subscription)>,
     grid_menu_requested: bool,
+    /// 公开设置：编辑器字号/配色、查询读取行数、预览上限、对象上限、空值文本。
+    editor_font: i64,
+    editor_theme: String,
+    page_size: u64,
+    preview_kb: u64,
+    object_page: usize,
+    null_copy: String,
 }
 
 impl QueryPane {
@@ -124,6 +131,12 @@ impl QueryPane {
             selected_object: None,
             variable_inputs: HashMap::new(),
             grid_menu_requested: false,
+            editor_font: 13,
+            editor_theme: "auto".to_owned(),
+            page_size: 100,
+            preview_kb: 1,
+            object_page: 100,
+            null_copy: "NULL".to_owned(),
         }
     }
 
@@ -141,6 +154,70 @@ impl QueryPane {
 
     pub fn set_query_timeout_sec(&mut self, seconds: i64) {
         self.timeout_ms = if seconds > 0 { Some(seconds as u64 * 1000) } else { None };
+    }
+
+    /// 把公开设置下发给编辑器和结果网格；无需重启，下一次绘制就生效。
+    pub fn apply_public_settings(&mut self, settings: &crate::state::ShellSettings, cx: &mut Context<Self>) {
+        let form = crate::app::views::settings::SettingsForm::from_settings(settings);
+        self.editor_font = form.editor_font;
+        self.editor_theme = form.editor_theme;
+        self.page_size = u64::try_from(form.page_size.max(1)).unwrap_or(1);
+        self.preview_kb = u64::try_from(form.preview_kb.max(1)).unwrap_or(1);
+        self.object_page = usize::try_from(form.object_page.max(1)).unwrap_or(1);
+        self.null_copy = crate::app::views::settings::null_display(&form.null_copy).to_owned();
+        self.desk.set_page_size(self.page_size);
+        let font = self.editor_font;
+        let theme = self.editor_theme.clone();
+        for editor in self.editors.values() {
+            // 每帧都会下发一次；值没变时不要 notify，否则编辑器会持续重绘。
+            let unchanged = {
+                let current = editor.read(cx);
+                current.font_size() == font && current.theme() == theme
+            };
+            if unchanged {
+                continue;
+            }
+            editor.update(cx, |editor, cx| {
+                editor.set_font_size(font);
+                editor.set_theme(&theme);
+                cx.notify();
+            });
+        }
+        let preview_kb = self.preview_kb;
+        let null_copy = self.null_copy.clone();
+        self.grid.update(cx, |grid, _| {
+            grid.set_preview_kb(preview_kb);
+            grid.set_null_copy(&null_copy);
+        });
+    }
+
+    pub fn editor_font(&self) -> i64 {
+        self.editor_font
+    }
+
+    pub fn editor_theme(&self) -> &str {
+        &self.editor_theme
+    }
+
+    pub fn page_size(&self) -> u64 {
+        self.page_size
+    }
+
+    /// 下一次查询执行真正会用的读取行数上限（Desk 的当前值）。
+    pub fn run_limit(&self) -> u64 {
+        self.desk.page_size()
+    }
+
+    pub fn preview_kb(&self) -> u64 {
+        self.preview_kb
+    }
+
+    pub fn object_page(&self) -> usize {
+        self.object_page
+    }
+
+    pub fn null_copy(&self) -> &str {
+        &self.null_copy
     }
 
     pub fn request_focus(&mut self) {
@@ -424,8 +501,14 @@ impl QueryPane {
                 continue;
             }
             let sql = self.desk.tab_draft(&id).unwrap_or_default();
+            let font = self.editor_font;
+            let theme = self.editor_theme.clone();
             let editor = cx.new(|cx| SqlEditor::new(window, cx));
-            editor.update(cx, |editor, cx| editor.set_sql(&sql, window, cx));
+            editor.update(cx, |editor, cx| {
+                editor.set_font_size(font);
+                editor.set_theme(&theme);
+                editor.set_sql(&sql, window, cx);
+            });
             self.editors.insert(id.clone(), editor);
             self.links.insert(id, DraftLink { applied: sql.clone(), editor: sql, dirty: false });
         }
@@ -667,9 +750,10 @@ impl QueryPane {
 
     fn refresh_tree(&mut self, cx: &mut Context<Self>) {
         let services = Arc::clone(&self.services);
+        let page = self.object_page;
         let (tx, rx) = tokio::sync::oneshot::channel();
         runtime().spawn(async move {
-            let _ = tx.send(desk::load_tree(&services.connections).await);
+            let _ = tx.send(desk::load_tree(&services.connections, page).await);
         });
         cx.spawn(async move |this, cx| {
             if let Ok(loaded) = rx.await {
@@ -1865,5 +1949,52 @@ mod tests {
         assert!(polls > 400, "轮询次数 {polls} 没有越过原来的 400 次上限");
         assert!(!cx.update(|cx| pane.read(cx).running()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    fn public_settings_reach_the_editor_results_and_object_tree(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let snap = TabSnap {
+            id: "query-1".to_owned(),
+            draft: "select 1".to_owned(),
+            connection_id: Some("notes".to_owned()),
+            connection_name: Some("笔记".to_owned()),
+            database: Some("main".to_owned()),
+            engine: Some("sqlite".to_owned()),
+        };
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&snap), Some("query-1"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        let settings = crate::state::ShellSettings {
+            editor_font: 18,
+            editor_theme: "warm".to_owned(),
+            page_size: 250,
+            preview_kb: 4,
+            object_page: 50,
+            null_copy: "N".to_owned(),
+            ..Default::default()
+        };
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| pane.apply_public_settings(&settings, cx));
+        });
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.editor_font(), 18);
+            assert_eq!(pane.editor_theme(), "warm");
+            assert_eq!(pane.page_size(), 250);
+            assert_eq!(pane.desk.page_size(), 250, "查询读取行数必须来自 page_size");
+            assert_eq!(pane.preview_kb(), 4);
+            assert_eq!(pane.object_page(), 50);
+            assert_eq!(pane.null_copy(), "\\N");
+            let editor = pane.editors.get("query-1").expect("已建编辑器").read(cx);
+            assert_eq!(editor.font_size(), 18, "已有编辑器立即改字号");
+            assert_eq!(editor.theme(), "warm", "已有编辑器立即改配色");
+        });
     }
 }

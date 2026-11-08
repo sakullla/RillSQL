@@ -12,7 +12,7 @@ use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableEvent, T
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _};
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
     relative,
 };
 
@@ -45,6 +45,8 @@ pub struct GridPane {
     /// 编辑栏关闭后把键盘焦点还回网格，Esc 之后方向键和 F2 仍然可用。
     refocus: bool,
     loading_more: bool,
+    /// 左键按下的格子；拖拽期间用它作为起点，松开或下一次按下时重置。
+    press: Option<(usize, usize)>,
     /// 首屏或替换读取尚未返回；交换面板据此禁止把旧快照当成当前表。
     fetching: bool,
     sort_desc: bool,
@@ -109,6 +111,7 @@ impl GridPane {
             grid_focus: cx.focus_handle().tab_stop(true),
             refocus: false,
             loading_more: false,
+            press: None,
             fetching: false,
             sort_desc: false,
             search: None,
@@ -124,14 +127,41 @@ impl GridPane {
         self.session.locale = locale;
     }
 
+    /// 大字段预览上限来自设置 preview_kb；下一次读取和完整值查看都用它。
+    pub fn set_preview_kb(&mut self, kb: u64) {
+        self.session.set_preview_bytes(usize::try_from(kb.max(1).saturating_mul(1024)).unwrap_or(usize::MAX));
+    }
+
+    /// TSV 里数据库 NULL 的显示文本来自设置；SQL 字面量不受影响。
+    pub fn set_null_copy(&mut self, value: &str) {
+        self.session.set_null_copy(crate::app::views::settings::null_display(value));
+    }
+
+    /// 页大小来自设置；改变后从第一页重读，翻页和查询结果沿用同一上限。
+    pub fn set_page_limit(&mut self, limit: u64, cx: &mut Context<Self>) {
+        let limit = limit.max(1);
+        if self.session.page_limit() == limit {
+            return;
+        }
+        self.session.set_page(0, limit);
+        if self.session.mode == GridMode::Table && !self.session.target.connection_id.is_empty() {
+            self.fetch_current(true, cx);
+        }
+    }
+
     pub fn clear_sheet(&mut self, cx: &mut Context<Self>) {
         let locale = self.locale;
+        let preview_bytes = self.session.preview_bytes();
+        let null_copy = self.session.null_copy().to_owned();
         self.fetching = false;
         self.session = SharedGrid::new();
         self.session.locale = locale;
+        self.session.set_preview_bytes(preview_bytes);
+        self.session.set_null_copy(&null_copy);
         self.scheduled = 0;
         self.edit_target = None;
         self.pending_edit = None;
+        self.press = None;
         self.notice.clear();
         self.sync_table(cx);
     }
@@ -207,6 +237,7 @@ impl GridPane {
         // 新的结果集意味着旧的编辑目标不再存在，先结束编辑。
         self.edit_target = None;
         self.pending_edit = None;
+        self.press = None;
         let token = self.session.show_query_sheet(sql, columns, rows);
         self.sync_table(cx);
         self.schedule_locate(token, cx);
@@ -219,6 +250,7 @@ impl GridPane {
         self.session.set_page(0, limit);
         self.edit_target = None;
         self.pending_edit = None;
+        self.press = None;
         self.search_text.clear();
         self.clear_search = true;
         self.fetch_current(true, cx);
@@ -364,6 +396,37 @@ impl GridPane {
         if self.session.focus_cell().is_none() {
             self.session.select(0, 0, false);
         }
+    }
+
+    /// 左键按下格子。普通按下把选择收拢到这一格；Ctrl/Cmd 或 Shift 按下时保留既有锚点，
+    /// 于是单击落在矩形另一角时得到“已有选择 + 该格”的矩形，而不是替换选择。
+    pub(crate) fn cell_press(&mut self, row: usize, column: usize, extend: bool, cx: &mut Context<Self>) {
+        self.press = Some((row, column));
+        if extend && self.session.focus_cell() == Some((row, column)) {
+            return;
+        }
+        self.session.select(row, column, extend);
+        // 上一次禁写/校验提示属于旧格子，移动目标后不再显示。
+        self.notice.clear();
+        self.sync_table(cx);
+        cx.notify();
+    }
+
+    /// 按住左键拖过另一格：从按下时的选择锚点扩展到当前格。没有按下时不改变选择，
+    /// 松开后再移动指针也不会扩展。
+    pub(crate) fn cell_drag(&mut self, row: usize, column: usize, cx: &mut Context<Self>) {
+        if self.press.is_none() || self.session.focus_cell() == Some((row, column)) {
+            return;
+        }
+        self.session.select(row, column, true);
+        self.notice.clear();
+        self.sync_table(cx);
+        cx.notify();
+    }
+
+    /// 松开左键：结束拖拽。下一个鼠标移动不会继续改选择，直到重新按下。
+    pub(crate) fn cell_release(&mut self) {
+        self.press = None;
     }
 
     /// 开始编辑：可写的格子走正式文本输入，只读的格子改为查看值并说明原因。
@@ -1256,10 +1319,43 @@ impl TableDelegate for SheetDelegate {
         let text = self.rows.get(row_ix).and_then(|line| line.get(col_ix)).cloned().unwrap_or_default();
         let null = text == "NULL" || text == i18n::text(Locale::ZhCn, "grid.value.null") || text == i18n::text(Locale::En, "grid.value.null");
         let p = Palette::of(cx);
+        // 表格的 SelectCell 不带修饰键和拖拽阶段，直接在格子上取鼠标事件：该格里按下、
+        // 拖到另一格、松开都带着真实行列，不需要按像素反推行号。
+        let owner = self.owner.clone();
+        let column = col_ix.saturating_sub(1);
         div()
+            .id(gpui_kit::ElementId::named_usize(format!("grid-cell-{row_ix}"), col_ix))
+            // 测试按住真实坐标点击/拖拽时用它找到格子；只在测试/debug+test-support 记录。
+            .debug_selector(move || format!("grid-cell-{row_ix}-{col_ix}"))
+            .size_full()
             .truncate()
             .when(null, |this| this.text_color(p.text_faint).italic())
             .child(SharedString::from(text))
+            .when_some(owner, move |this, owner| {
+                let drag = owner.clone();
+                let release = owner.clone();
+                this.on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
+                    // Ctrl/Cmd 单击加选；Shift 单击同样按扩展处理，与键盘 Shift 一致。
+                    let extend = event.modifiers.secondary(cx) || event.modifiers.shift;
+                    if let Some(pane) = owner.upgrade() {
+                        pane.update(cx, |pane, cx| pane.cell_press(row_ix, column, extend, cx));
+                    }
+                })
+                .on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
+                    // 只在左键仍按着时扩展；松开后单纯悬停不改选择。
+                    if event.pressed_button != Some(MouseButton::Left) {
+                        return;
+                    }
+                    if let Some(pane) = drag.upgrade() {
+                        pane.update(cx, |pane, cx| pane.cell_drag(row_ix, column, cx));
+                    }
+                })
+                .on_mouse_up(MouseButton::Left, move |_, _, cx| {
+                    if let Some(pane) = release.upgrade() {
+                        pane.update(cx, |pane, _| pane.cell_release());
+                    }
+                })
+            })
     }
 
     fn render_th(&mut self, col_ix: usize, _: &mut Window, _: &mut Context<TableState<Self>>) -> impl IntoElement {
@@ -1496,7 +1592,7 @@ mod pane_tests {
     use super::session::CellKind;
     use super::*;
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{AnyWindowHandle, Bounds, Point, TestAppContext, WindowBounds, WindowOptions, size};
+    use gpui_kit::{AnyWindowHandle, Bounds, Modifiers, Point, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, size};
 
     fn target() -> GridTarget {
         GridTarget {
@@ -1643,6 +1739,115 @@ mod pane_tests {
     }
 
     #[gpui_kit::test]
+    fn modifier_click_extends_the_existing_selection_into_a_rectangle(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        // 第一次普通单击建立锚点；表格补发的同格 SelectCell 在真实事件循环里随后送达。
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(0, 0, false, cx)));
+        settle(cx);
+        // 两次 Ctrl/Cmd 单击分别向下、向右扩展，锚点始终留在 (0, 0)。
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(1, 0, true, cx)));
+        settle(cx);
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(1, 1, true, cx)));
+        settle(cx);
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.focus_cell(), Some((1, 1)), "加选只移动焦点，不动锚点");
+            assert_eq!(pane.session.selection_count(), 4, "两次加选应形成 2x2 矩形");
+            assert_eq!(pane.session.tsv(), "1\t甲\n2\t乙");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn dragging_across_cells_selects_the_rectangle_and_release_ends_it(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        // 按下第一格，拖到右下角；每一步之间让表格补发的 SelectCell 回声送达。
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(0, 0, false, cx)));
+        settle(cx);
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_drag(1, 1, cx)));
+        settle(cx);
+        cx.update(|cx| pane.update(cx, |pane, _| pane.cell_release()));
+        // 松开后继续移动不应再扩展。
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_drag(0, 1, cx)));
+        settle(cx);
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.selection_count(), 4, "拖拽应选中按下格到当前格的矩形");
+            assert_eq!(pane.session.tsv(), "1\t甲\n2\t乙");
+            assert_eq!(pane.session.focus_cell(), Some((1, 1)), "松开后焦点停在拖到的格子");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn real_mouse_events_reach_the_cell_gesture_handlers(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let mut visual = VisualTestContext::from_window(window, cx);
+        let first = visual.debug_bounds("grid-cell-0-1").expect("首行 id 格");
+        let second = visual.debug_bounds("grid-cell-1-2").expect("次行 name 格");
+        let secondary = visual.update(|_, cx| Modifiers::secondary_key(cx));
+
+        // 普通单击第一格，再 Ctrl/Cmd 单击第二格：真实鼠标事件经格子监听器进入加选。
+        visual.simulate_mouse_down(first.center(), MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_up(first.center(), MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_down(second.center(), MouseButton::Left, secondary);
+        visual.simulate_mouse_up(second.center(), MouseButton::Left, secondary);
+        visual.update(|_, cx| {
+            assert_eq!(pane.read(cx).session.selection_count(), 4, "Ctrl/Cmd 单击应扩展为矩形");
+        });
+
+        // 普通单击替换矩形，再按住从第一格拖到第二格。
+        visual.simulate_mouse_down(first.center(), MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_up(first.center(), MouseButton::Left, Modifiers::default());
+        visual.update(|_, cx| assert_eq!(pane.read(cx).session.selection_count(), 1, "普通单击应替换选择"));
+        visual.simulate_mouse_down(first.center(), MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(second.center(), MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_up(second.center(), MouseButton::Left, Modifiers::default());
+        visual.update(|_, cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.selection_count(), 4, "拖拽应选中按下格到当前格的矩形");
+            assert_eq!(pane.session.tsv(), "1\t甲\n2\t乙");
+            assert_eq!(pane.session.focus_cell(), Some((1, 1)));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn plain_click_replaces_an_existing_rectangle(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(0, 0, false, cx)));
+        settle(cx);
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_drag(1, 1, cx)));
+        settle(cx);
+        // 普通单击另一格替换整个矩形，而不是继续扩展。
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(1, 1, false, cx)));
+        settle(cx);
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.selection_count(), 1, "普通单击只保留一格");
+            assert_eq!(pane.session.tsv(), "乙");
+            assert_eq!(pane.session.focus_cell(), Some((1, 1)));
+        });
+    }
+
+    #[gpui_kit::test]
     fn explicit_null_is_a_separate_action_from_typing_the_text_null(cx: &mut TestAppContext) {
         let (window, pane) = open(cx);
         cx.update_window(window, |_, window, cx| {
@@ -1728,5 +1933,58 @@ mod pane_tests {
                 assert!(!sql[0].contains("\"id\" = 1"), "{sql:?}");
             });
         });
+    }
+
+    #[gpui_kit::test]
+    fn public_settings_change_page_request_preview_and_null_copy(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.set_page_limit(250, cx);
+                pane.set_preview_kb(4);
+                plant_writable(pane, cx);
+                pane.session.select(0, 1, false);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            let request = pane.session.page_request();
+            assert_eq!(request.limit, 250, "page_size 应改变读取行数");
+            assert_eq!(request.preview_bytes, 4096, "preview_kb 应改变预览截断上限");
+        });
+
+        // 数据库 NULL 的 TSV 文本随设置变化，SQL 字面量仍是 NULL。
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.plant_writable(
+                    target(),
+                    vec![("id", "integer"), ("name", "text")],
+                    vec![vec![Some("1"), None]],
+                    "id",
+                    cx,
+                );
+                pane.session.select(0, 1, false);
+                pane.set_null_copy("N");
+            });
+        });
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.tsv(), "\\N");
+            assert_eq!(pane.session.sql_values(), "NULL");
+        });
+        cx.update(|cx| pane.update(cx, |pane, _| pane.set_null_copy("NULL")));
+        cx.update(|cx| assert_eq!(pane.read(cx).session.tsv(), "NULL"));
+    }
+
+    fn plant_writable(pane: &mut GridPane, cx: &mut Context<GridPane>) {
+        pane.plant_writable(
+            target(),
+            vec![("id", "integer"), ("name", "text")],
+            vec![vec![Some("1"), Some("甲")], vec![Some("2"), Some("乙")]],
+            "id",
+            cx,
+        );
     }
 }

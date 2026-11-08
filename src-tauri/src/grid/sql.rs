@@ -113,7 +113,9 @@ fn is_synthetic_text_preview(value: &str) -> bool {
     let Ok(bytes) = count.parse::<u64>() else {
         return false;
     };
-    bytes > 1024 && preview.chars().count() <= 1024 && value.len() > 1024
+    // 预览信封至少由 1 KB 以上、且预览内容短于整段的值产生；上限随设置变化，
+    // 所以这里不再把 1024 当作预览长度的硬界限。
+    bytes > 1024 && (preview.len() as u64) < bytes && value.len() > 1024
 }
 
 /// 与前端预览协议一致：U+0001 开头的 t:字节数:预览 或 b:字节数。
@@ -352,10 +354,15 @@ pub fn reads_full_values(schema: &TableSchema, filters: &[Filter]) -> bool {
 
 /// 能定位的表行只对非主键的长文本和二进制投影预览。主键始终是完整文本或完整十六进制。
 pub fn select_list(schema: &TableSchema, full: bool) -> String {
-    schema.columns.iter().map(|column| project_column(schema, column, full)).collect::<Vec<_>>().join(", ")
+    select_list_preview(schema, full, 1024)
 }
 
-fn project_column(schema: &TableSchema, column: &Column, full: bool) -> String {
+/// 与 select_list 相同，但预览截断上限来自设置；缺省调用仍按 1024 字节。
+pub fn select_list_preview(schema: &TableSchema, full: bool, preview_bytes: usize) -> String {
+    schema.columns.iter().map(|column| project_column(schema, column, full, preview_bytes)).collect::<Vec<_>>().join(", ")
+}
+
+fn project_column(schema: &TableSchema, column: &Column, full: bool, preview_bytes: usize) -> String {
     let ident = quote_ident(schema.engine, &column.name);
     let plain = plain_cast(schema.engine, &ident);
     let key_column = schema.key.iter().any(|name| name == &column.name);
@@ -367,7 +374,8 @@ fn project_column(schema: &TableSchema, column: &Column, full: bool) -> String {
         }
         ValueFamily::Text if !full && !schema.key.is_empty() && !key_column => {
             let guard = null_key_guard(schema);
-            format!("CASE WHEN {guard} THEN {plain} ELSE {} END", text_preview(schema.engine, &plain))
+            let preview = text_preview(schema.engine, &plain, preview_bytes.max(1));
+            format!("CASE WHEN {guard} THEN {plain} ELSE {preview} END")
         }
         _ => plain,
     }
@@ -389,13 +397,14 @@ fn plain_cast(engine: Engine, ident: &str) -> String {
     }
 }
 
-fn text_preview(engine: Engine, plain: &str) -> String {
+fn text_preview(engine: Engine, plain: &str, preview_bytes: usize) -> String {
+    let cap = preview_bytes.max(1);
     match engine {
-        Engine::Postgres => format!("CASE WHEN octet_length({plain}) > 1024 THEN chr(1) || 't:' || octet_length({plain})::text || ':' || left({plain}, 1024) ELSE {plain} END"),
-        Engine::Mysql | Engine::Mariadb => format!("CASE WHEN LENGTH({plain}) > 1024 THEN CONCAT(CHAR(1), 't:', LENGTH({plain}), ':', LEFT({plain}, 1024)) ELSE {plain} END"),
-        Engine::Sqlite => format!("CASE WHEN length(CAST({plain} AS BLOB)) > 1024 THEN char(1) || 't:' || length(CAST({plain} AS BLOB)) || ':' || substr({plain}, 1, 1024) ELSE {plain} END"),
-        // LEN 按字符计；预览协议的字节数对文本形态按字符数呈现，超长截断仍以 1024 字符为界。
-        Engine::Sqlserver => format!("CASE WHEN LEN({plain}) > 1024 THEN CHAR(1) + N't:' + CAST(LEN({plain}) AS NVARCHAR(20)) + N':' + LEFT({plain}, 1024) ELSE {plain} END"),
+        Engine::Postgres => format!("CASE WHEN octet_length({plain}) > {cap} THEN chr(1) || 't:' || octet_length({plain})::text || ':' || left({plain}, {cap}) ELSE {plain} END"),
+        Engine::Mysql | Engine::Mariadb => format!("CASE WHEN LENGTH({plain}) > {cap} THEN CONCAT(CHAR(1), 't:', LENGTH({plain}), ':', LEFT({plain}, {cap})) ELSE {plain} END"),
+        Engine::Sqlite => format!("CASE WHEN length(CAST({plain} AS BLOB)) > {cap} THEN char(1) || 't:' || length(CAST({plain} AS BLOB)) || ':' || substr({plain}, 1, {cap}) ELSE {plain} END"),
+        // LEN 按字符计；预览协议的字节数对文本形态按字符数呈现，超长截断按设置的字符数。
+        Engine::Sqlserver => format!("CASE WHEN LEN({plain}) > {cap} THEN CHAR(1) + N't:' + CAST(LEN({plain}) AS NVARCHAR(20)) + N':' + LEFT({plain}, {cap}) ELSE {plain} END"),
         // Redis 不会进入 SQL 编译（live::describe 已拒绝），占位保持穷尽。
         Engine::Redis | Engine::Mongodb => plain.to_owned(),
     }

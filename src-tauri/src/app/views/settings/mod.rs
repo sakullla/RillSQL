@@ -254,6 +254,32 @@ pub fn editor_theme_key(theme: &str) -> &'static str {
     }
 }
 
+/// 编辑器配色映射：背景与前景。auto 跟随工作区底色，其余档位是稳定可断言的
+/// 代码配色，深色主题下再取一组更暗的底和更亮的字。
+pub fn editor_theme_colors(theme: &str, dark: bool) -> (u32, u32) {
+    match (normalize_editor_theme(theme), dark) {
+        ("contrast", false) => (0xffffff, 0x000000),
+        ("contrast", true) => (0x000000, 0xffffff),
+        ("warm", false) => (0xfdf6e3, 0x3f3a34),
+        ("warm", true) => (0x241f1a, 0xe8dfcf),
+        ("cool", false) => (0xeef4fb, 0x1f2d3d),
+        ("cool", true) => (0x131b24, 0xd7e3ef),
+        ("mono", false) => (0xf4f4f4, 0x202020),
+        ("mono", true) => (0x1e1e1e, 0xe6e6e6),
+        (_, false) => (0xffffff, 0x16191f),
+        (_, true) => (0x171a1f, 0xe8ebf0),
+    }
+}
+
+/// TSV 里数据库 NULL 的显示文本；SQL 字面量仍由 sql_values 固定写成 NULL。
+pub fn null_display(value: &str) -> &'static str {
+    match normalize_null(value) {
+        "empty" => "",
+        "N" => "\\N",
+        _ => "NULL",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +395,18 @@ mod tests {
         assert_eq!(normalized.null_copy, "NULL");
         assert_eq!(normalized.page_size, 1);
         assert_eq!(saved.to_settings().preview_kb, 1);
+    }
+
+    #[test]
+    fn public_settings_map_to_observable_editor_colors_and_tsv_nulls() {
+        assert_eq!(null_display("NULL"), "NULL");
+        assert_eq!(null_display("empty"), "");
+        assert_eq!(null_display("N"), "\\N");
+        assert_eq!(null_display("bogus"), "NULL");
+        let auto = editor_theme_colors("auto", false);
+        assert_ne!(auto, editor_theme_colors("warm", false));
+        assert_ne!(auto, editor_theme_colors("contrast", true));
+        assert_eq!(editor_theme_colors("NEON", false), auto, "未知档位归一为 auto");
+        assert_ne!(editor_theme_colors("warm", false), editor_theme_colors("warm", true));
     }
 }

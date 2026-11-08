@@ -150,7 +150,7 @@ fn filter_arg(op: &str) -> FilterArg {
 }
 
 fn page_request(op: &str) -> PageRequest {
-    PageRequest { table: table_ref("missing"), filters: vec![filter_arg(op)], sort: None, offset: 0, limit: 10, search: None }
+    PageRequest { table: table_ref("missing"), filters: vec![filter_arg(op)], sort: None, offset: 0, limit: 10, preview_bytes: 1024, search: None }
 }
 
 fn count_request(op: &str) -> CountRequest {

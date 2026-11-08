@@ -372,6 +372,20 @@ impl Workbench {
         self.apply_query_effect(effect);
     }
 
+    /// 公开设置只在这里下发；每个工作项打开或新建时沿用当前值，不需要重启。
+    fn sync_view_settings(&mut self, cx: &mut Context<Self>) {
+        let settings = self.model.settings.to_settings();
+        self.query.update(cx, |pane, cx| pane.apply_public_settings(&settings, cx));
+        let page_size = u64::try_from(settings.page_size.max(1)).unwrap_or(1);
+        let preview_kb = u64::try_from(settings.preview_kb.max(1)).unwrap_or(1);
+        let null_copy = settings.null_copy.clone();
+        self.table.update(cx, |pane, cx| {
+            pane.set_page_limit(page_size, cx);
+            pane.set_preview_kb(preview_kb);
+            pane.set_null_copy(&null_copy);
+        });
+    }
+
     fn sync_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let snaps = self.query_snaps();
         let active = self.model.active_tab.clone();
@@ -498,9 +512,10 @@ impl Workbench {
                 // 同一张表在结构/查询间来回切换时不要重新拉取：重开会清空尚未提交的暂存。
                 if self.table_view_spec.as_deref() != Some(spec.as_str()) {
                     self.table_view_spec = Some(spec.clone());
+                    let page_size = u64::try_from(self.model.settings.page_size.max(1)).unwrap_or(1);
                     self.table.update(cx, |pane, cx| {
                         pane.set_locale(locale);
-                        pane.open_table(target, 100, cx);
+                        pane.open_table(target, page_size, cx);
                     });
                 }
             }
@@ -789,6 +804,8 @@ impl Workbench {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             this.model.apply_settings(&startup.state.shell);
+                            // 启动时的自动更新检查只走这个开关；关闭时不发起检查。
+                            this.model.begin_update_check();
                             this.model.restore_session(&startup.state.session);
                             if let Some(key) = startup.warning_key {
                                 this.model.notice_key = Some(key);
@@ -1195,6 +1212,7 @@ impl Render for Workbench {
         self.measure(window);
         self.boot_state(cx);
         self.pump_jobs(cx);
+        self.sync_view_settings(cx);
         self.sync_query(window, cx);
         self.sync_catalog(cx);
         let owner = cx.entity().downgrade();

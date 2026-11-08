@@ -113,6 +113,8 @@ pub struct Desk {
     view_gen: u64,
     idle_note: String,
     tree_error: String,
+    /// 每次执行读取的行数上限；来自设置 page_size，默认 100。
+    page_size: u64,
 }
 
 #[allow(dead_code)]
@@ -132,7 +134,17 @@ impl Desk {
             view_gen: 0,
             idle_note: String::new(),
             tree_error: String::new(),
+            page_size: 100,
         }
+    }
+
+    /// 查询结果读取的行数上限；设置 page_size 下发到这里。
+    pub fn page_size(&self) -> u64 {
+        self.page_size
+    }
+
+    pub fn set_page_size(&mut self, size: u64) {
+        self.page_size = size.max(1);
     }
 
     pub fn executions(&self) -> u32 {
@@ -813,7 +825,7 @@ impl Desk {
             connection_name: target.connection_name,
             database: target.database,
             engine: target.engine,
-            limit: 100,
+            limit: self.page_size.max(1),
         })
     }
 
@@ -1073,7 +1085,9 @@ pub fn objects_from_catalog(connection_id: &str, connection_name: &str, engine: 
     CatalogListing { objects, databases, failures }
 }
 
-pub async fn load_tree(service: &Arc<Service>) -> Result<TreeLoad, String> {
+/// 对象树读取上限来自设置 object_page；默认 100，不把所有对象一次读进来。
+pub async fn load_tree(service: &Arc<Service>, page: usize) -> Result<TreeLoad, String> {
+    let page = page.max(1);
     let records = service.list().await?;
     let mut objects = Vec::new();
     let mut databases = Vec::new();
@@ -1091,7 +1105,7 @@ pub async fn load_tree(service: &Arc<Service>) -> Result<TreeLoad, String> {
         }
         if engine != "sqlite" {
             if let Ok(parsed) = Engine::parse(&engine) {
-                let body = read_catalog_session(parsed, &session, 200, &[]).await;
+                let body = read_catalog_session(parsed, &session, page, &[]).await;
                 let listing = objects_from_catalog(&record.saved.id, &record.saved.name, &engine, &body);
                 objects.extend(listing.objects);
                 failures.extend(listing.failures);
@@ -1108,7 +1122,14 @@ pub async fn load_tree(service: &Arc<Service>) -> Result<TreeLoad, String> {
             let transport = service.cancel_transport(&record.saved.id).unwrap_or(crate::connections::CancelTransport::None);
             let driver = LiveDriver::attach(session, &engine, "main", transport, None).await?;
             let flag = Arc::new(AtomicBool::new(false));
-            let listed = driver.run("SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name", 500, &flag).await.map_err(|err| err.to_string())?;
+            let listed = driver
+                .run(
+                    "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                    page,
+                    &flag,
+                )
+                .await
+                .map_err(|err| err.to_string())?;
             let _ = driver.finish().await;
             for row in listed.rows {
                 let Some(name) = row.first().and_then(|cell| cell.clone()) else {
@@ -1316,6 +1337,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_page_limits_how_many_tree_objects_are_read() {
+        let dir = std::env::temp_dir().join(format!("rillsql-desk-page-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("many.sqlite");
+        let setup = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+            .await
+            .unwrap();
+        for statement in [
+            "CREATE TABLE alpha (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE beta (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE gamma (id INTEGER PRIMARY KEY)",
+        ] {
+            sqlx::query(statement).execute(&setup).await.unwrap();
+        }
+        setup.close().await;
+
+        let service = Arc::new(Service::new_for_test(dir.join("connections.sqlite")));
+        service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+        let limited = load_tree(&service, 2).await.unwrap();
+        assert_eq!(limited.objects.len(), 2, "object_page 应限制对象读取数量");
+        let all = load_tree(&service, 100).await.unwrap();
+        assert_eq!(all.objects.len(), 3);
+    }
+
+    #[tokio::test]
     async fn tree_open_runs_a_real_select_and_cancel_does_not_replay() {
         let dir = std::env::temp_dir().join(format!("rillsql-desk-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1338,7 +1386,7 @@ mod tests {
         let service = Arc::new(Service::new_for_test(dir.join("connections.sqlite")));
         service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
         let query = commands::QueryState::new(dir.join("query-history.sqlite"));
-        let loaded = load_tree(&service).await.unwrap();
+        let loaded = load_tree(&service, 100).await.unwrap();
         let objects = loaded.objects.clone();
         let databases = loaded.databases.clone();
         let columns = loaded.columns.clone();

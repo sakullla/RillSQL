@@ -11,13 +11,15 @@ use gpui_kit::base::input::{Diagnostic, DiagnosticSeverity};
 use gpui_kit::component::input::{
     CompletionProvider, Editor, EditorState, FoldRange, InputEvent, Rope,
 };
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EntityInputHandler as _, Focusable as _, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, Styled as _, Task, Window, div,
+    IntoElement, ParentElement as _, Render, Styled as _, Task, Window, div, px, rgb,
 };
 use lsp_types::{CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit, TextEdit};
 
 use crate::app::accept_versioned;
+use crate::app::views::settings;
 use crate::query::assist::CompletionScope;
 
 pub struct SqlEditor {
@@ -28,6 +30,9 @@ pub struct SqlEditor {
     stale_lint: u32,
     stale_completion: u32,
     folded_lines: u32,
+    /// 设置里的编辑器字号与配色；渲染时直接作用到 Editor 的文本样式。
+    font_size: f32,
+    theme: String,
     _subscription: gpui_kit::Subscription,
 }
 
@@ -69,8 +74,33 @@ impl SqlEditor {
             stale_lint: 0,
             stale_completion: 0,
             folded_lines: 0,
+            font_size: 13.0,
+            theme: "auto".to_owned(),
             _subscription: subscription,
         }
+    }
+
+    /// 设置里的查询编辑器字号；渲染时作为 Editor 的文本尺寸。
+    pub fn font_size(&self) -> i64 {
+        self.font_size.round() as i64
+    }
+
+    pub fn set_font_size(&mut self, size: i64) {
+        self.font_size = size.clamp(settings::FONT_RANGE.0, settings::FONT_RANGE.1) as f32;
+    }
+
+    /// 当前编辑器配色档位（auto / contrast / warm / cool / mono）。
+    pub fn theme(&self) -> &str {
+        &self.theme
+    }
+
+    pub fn set_theme(&mut self, theme: &str) {
+        self.theme = settings::normalize_editor_theme(theme).to_owned();
+    }
+
+    /// 当前档位在给定明暗下的背景和前景，与渲染使用的是同一份映射。
+    pub fn theme_colors(&self, dark: bool) -> (u32, u32) {
+        settings::editor_theme_colors(&self.theme, dark)
     }
 
     pub fn version(&self) -> u64 {
@@ -273,11 +303,22 @@ impl SqlEditor {
 }
 
 impl Render for SqlEditor {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (background, foreground) = self.theme_colors(cx.theme().is_dark());
         div()
             .id("sql-editor")
             .size_full()
-            .child(Editor::new(&self.state).h(gpui_kit::relative(1.)).bordered(false).aria_label("SQL"))
+            .text_size(px(self.font_size))
+            .text_color(rgb(foreground))
+            .child(
+                Editor::new(&self.state)
+                    .h(gpui_kit::relative(1.))
+                    .bordered(false)
+                    .aria_label("SQL")
+                    .text_size(px(self.font_size))
+                    .bg(rgb(background))
+                    .text_color(rgb(foreground)),
+            )
     }
 }
 
@@ -595,5 +636,29 @@ mod tests {
             assert_eq!(editor.read(cx).value(cx), "SELECT");
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn font_size_and_theme_follow_settings(cx: &mut TestAppContext) {
+        let (window, editor) = open(cx);
+        cx.update(|cx| {
+            assert_eq!(editor.read(cx).font_size(), 13);
+            assert_eq!(editor.read(cx).theme(), "auto");
+            editor.update(cx, |editor, _| {
+                editor.set_font_size(20);
+                editor.set_theme("warm");
+            });
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert_eq!(editor.read(cx).font_size(), 20, "渲染帧后字号仍是设置值");
+            assert_eq!(editor.read(cx).theme(), "warm");
+            assert_ne!(editor.read(cx).theme_colors(false), settings::editor_theme_colors("auto", false));
+            editor.update(cx, |editor, _| editor.set_font_size(999));
+            assert_eq!(editor.read(cx).font_size(), 24, "字号按设置范围归一");
+        });
     }
 }

@@ -6,8 +6,8 @@ use crate::grid::commands::{
     TableRef,
 };
 use crate::grid::{
-    commit_mutations, count_rows_search, describe as describe_table, foreign_keys, query_page_search, run_export, Cell, Engine, ExportMode, ExportSpec, Filter, FilterOp, ForeignKey, Mutation,
-    MutationKind, Sort, TableSchema,
+    commit_mutations, count_rows_search, describe as describe_table, foreign_keys, query_page_search_preview, run_export, Cell, Engine, ExportMode, ExportSpec, Filter, FilterOp, ForeignKey,
+    Mutation, MutationKind, Sort, TableSchema,
 };
 
 pub fn require_commit(confirmed: bool) -> Result<(), String> {
@@ -36,7 +36,7 @@ pub async fn page(service: &Service, request: &PageRequest) -> Result<PageDto, S
     let filters = filters_of(&request.filters)?;
     let sort = sort_of(request.sort.as_ref());
     let session = session_of(service, &request.table.connection_id)?;
-    let page = query_page_search(
+    let page = query_page_search_preview(
         &session,
         &request.table.database,
         &request.table.schema,
@@ -47,6 +47,7 @@ pub async fn page(service: &Service, request: &PageRequest) -> Result<PageDto, S
         request.search.as_deref(),
         request.offset,
         request.limit,
+        usize::try_from(request.preview_bytes).unwrap_or(1024).max(1),
     )
     .await?;
     Ok(PageDto {
