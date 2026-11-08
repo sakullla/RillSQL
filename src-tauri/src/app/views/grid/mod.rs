@@ -12,7 +12,8 @@ use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableEvent, T
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _};
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, relative,
+    App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    relative,
 };
 
 use crate::ui::kit::{self, Palette};
@@ -31,13 +32,38 @@ pub struct GridPane {
     locale: Locale,
     scheduled: u64,
     search_text: String,
-    editing: bool,
-    edit_buffer: String,
+    /// 编辑栏使用正式文本输入：光标、选区、粘贴、撤销和输入法都由它处理。
+    edit_input: Entity<InputState>,
+    /// 正在编辑的格子用稳定行 id 记住，排序或翻页后仍写回同一行。
+    edit_target: Option<EditTarget>,
+    /// 编辑栏要等下一次绘制才能拿到 Window，先把请求记下来。
+    pending_edit: Option<PendingEdit>,
+    notice: String,
+    grid_focus: FocusHandle,
+    /// 编辑栏关闭后把键盘焦点还回网格，Esc 之后方向键和 F2 仍然可用。
+    refocus: bool,
     loading_more: bool,
     sort_desc: bool,
     search: Option<Entity<InputState>>,
+    /// 换表后清掉查找框里的旧文字，避免输入框和实际筛选条件不一致。
+    clear_search: bool,
     search_subscription: Option<gpui_kit::Subscription>,
     _subscription: gpui_kit::Subscription,
+    _edit_subscription: gpui_kit::Subscription,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EditTarget {
+    row_id: String,
+    column: usize,
+    original: Option<Option<String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingEdit {
+    row: usize,
+    column: usize,
+    select_all: bool,
 }
 
 impl GridPane {
@@ -49,12 +75,20 @@ impl GridPane {
                 .col_resizable(true)
                 .row_header(true)
         });
+        // 表格事件与我们的会话状态互相回声，apply_table_event 只接受真正改变了目标的事件。
         let subscription = cx.subscribe(&table, |this, _, event: &TableEvent, cx| {
             this.apply_table_event(event);
             cx.notify();
         });
         let owner = cx.entity().downgrade();
         table.update(cx, |state, _| state.delegate_mut().owner = Some(owner));
+        let edit_input = cx.new(|cx| InputState::new(window, cx));
+        // 只有 Enter 结束编辑。失焦可能来自我们自己的重绘或切换焦点，贸然取消会丢掉正在输入的值。
+        let edit_subscription = cx.subscribe(&edit_input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.finish_edit(cx);
+            }
+        });
         Self {
             session: SharedGrid::new(),
             services,
@@ -62,13 +96,19 @@ impl GridPane {
             locale: Locale::ZhCn,
             scheduled: 0,
             search_text: String::new(),
-            editing: false,
-            edit_buffer: String::new(),
+            edit_input,
+            edit_target: None,
+            pending_edit: None,
+            notice: String::new(),
+            grid_focus: cx.focus_handle().tab_stop(true),
+            refocus: false,
             loading_more: false,
             sort_desc: false,
             search: None,
+            clear_search: false,
             search_subscription: None,
             _subscription: subscription,
+            _edit_subscription: edit_subscription,
         }
     }
 
@@ -82,7 +122,25 @@ impl GridPane {
         self.session = SharedGrid::new();
         self.session.locale = locale;
         self.scheduled = 0;
+        self.edit_target = None;
+        self.pending_edit = None;
+        self.notice.clear();
         self.sync_table(cx);
+    }
+
+    #[cfg(test)]
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.grid_focus.clone()
+    }
+
+    #[cfg(test)]
+    pub fn editing(&self) -> bool {
+        self.edit_target.is_some()
+    }
+
+    #[cfg(test)]
+    pub fn edit_value(&self, cx: &App) -> String {
+        self.edit_input.read(cx).value().to_string()
     }
 
     pub fn uncommitted(&self) -> bool {
@@ -133,6 +191,9 @@ impl GridPane {
     pub fn show_query(&mut self, target: GridTarget, sql: &str, columns: Vec<String>, rows: Vec<Vec<Option<String>>>, cx: &mut Context<Self>) {
         self.session.target = target;
         self.session.locale = self.locale;
+        // 新的结果集意味着旧的编辑目标不再存在，先结束编辑。
+        self.edit_target = None;
+        self.pending_edit = None;
         let token = self.session.show_query_sheet(sql, columns, rows);
         self.sync_table(cx);
         self.schedule_locate(token, cx);
@@ -140,52 +201,64 @@ impl GridPane {
 
     pub fn open_table(&mut self, target: GridTarget, limit: u64, cx: &mut Context<Self>) {
         self.session.mode = GridMode::Table;
-        self.session.target = target;
+        self.session.switch_target(target);
         self.session.locale = self.locale;
         self.session.set_page(0, limit);
+        self.edit_target = None;
+        self.pending_edit = None;
+        self.search_text.clear();
+        self.clear_search = true;
         self.fetch_current(true, cx);
     }
 
     pub fn command(&mut self, id: &str, cx: &mut Context<Self>) -> Option<String> {
         let copied = match id {
             "edit-cell" => {
-                self.editing = true;
-                self.edit_buffer = self.session.focus_cell().map(|(row, column)| self.session.cell_label(row, column)).unwrap_or_default();
-                if !self.session.focus_cell().is_some() {
-                    self.session.select(0, 0, false);
-                    self.edit_buffer = self.session.focus_cell().map(|(row, column)| self.session.cell_label(row, column)).unwrap_or_default();
-                }
+                self.select_first_if_needed();
+                self.request_edit(false);
                 None
             }
             "cancel-edit" => {
-                self.editing = false;
-                self.edit_buffer.clear();
+                self.cancel_edit();
+                None
+            }
+            "grid-set-null" => {
+                self.select_first_if_needed();
+                if let Some((row, column)) = self.session.focus_cell() {
+                    // 显式 NULL：不经过任何特殊文本，直接写数据库 NULL。
+                    let gate = self.session.stage_text(row, column, None);
+                    self.notice = self.session.gate_text(gate);
+                    self.abandon_edit();
+                }
                 None
             }
             "commit" => {
-                if self.editing {
-                    let value = if self.edit_buffer == "NULL" { None } else { Some(self.edit_buffer.clone()) };
-                    let _ = self.edit_focus(value, cx);
-                    self.editing = false;
+                if self.edit_target.is_some() {
+                    self.finish_edit(cx);
                 }
                 // 工作台 commit 只打开预览。写库只来自预览对话框的 confirm。
                 let _ = self.preview(cx);
                 None
             }
             "mark-delete" => {
-                if self.session.focus_cell().is_none() {
-                    self.session.select(0, 0, false);
-                }
+                self.select_first_if_needed();
                 if let Some((row, _)) = self.session.focus_cell() {
-                    let _ = self.session.stage_delete(row);
+                    let gate = self.session.stage_delete(row);
+                    self.notice = self.session.gate_text(gate);
                 }
                 None
             }
-            "copy-region" | "copy-sql-value" => {
-                if !self.session.focus_cell().is_some() {
+            "copy-region" => {
+                if self.session.focus_cell().is_none() {
                     self.session.select_all_loaded();
                 }
                 Some(self.session.tsv())
+            }
+            "copy-sql-value" => {
+                if self.session.focus_cell().is_none() {
+                    self.session.select_all_loaded();
+                }
+                Some(self.session.sql_values())
             }
             "grid-copy-row" => {
                 if self.session.focus_cell().is_none() {
@@ -209,6 +282,7 @@ impl GridPane {
             }
             "grid-undo" => {
                 let _ = self.session.undo_last_stage();
+                self.notice.clear();
                 None
             }
             "grid-search" => {
@@ -233,6 +307,8 @@ impl GridPane {
                 None
             }
             "grid-page-next" => {
+                // 编辑目标所在的行要离开窗口了，先结束编辑，避免 Enter 落到不存在的位置。
+                self.abandon_edit();
                 let limit = self.session.page_limit().max(1);
                 let offset = self.session.page_offset().saturating_add(limit);
                 self.session.set_page(offset, limit);
@@ -240,6 +316,7 @@ impl GridPane {
                 None
             }
             "grid-page-prev" => {
+                self.abandon_edit();
                 let limit = self.session.page_limit().max(1);
                 let offset = self.session.page_offset().saturating_sub(limit);
                 self.session.set_page(offset, limit);
@@ -247,7 +324,8 @@ impl GridPane {
                 None
             }
             "grid-insert" => {
-                let _ = self.session.stage_insert();
+                let gate = self.session.stage_insert();
+                self.notice = self.session.gate_text(gate);
                 None
             }
             "grid-preview" => {
@@ -265,7 +343,94 @@ impl GridPane {
         if let Some((row, _)) = self.session.focus_cell() {
             self.table.update(cx, |state, cx| state.scroll_to_row(row, cx));
         }
+        cx.notify();
         copied
+    }
+
+    fn select_first_if_needed(&mut self) {
+        if self.session.focus_cell().is_none() {
+            self.session.select(0, 0, false);
+        }
+    }
+
+    /// 开始编辑：可写的格子走正式文本输入，只读的格子改为查看值并说明原因。
+    fn request_edit(&mut self, select_all: bool) {
+        let Some((row, column)) = self.session.focus_cell() else {
+            return;
+        };
+        let reason = self.session.write_reason(row, column);
+        if !reason.is_empty() {
+            self.notice = reason;
+            self.session.open_value(row, column);
+            self.edit_target = None;
+            self.pending_edit = None;
+            self.refocus = true;
+            return;
+        }
+        self.notice.clear();
+        self.pending_edit = Some(PendingEdit { row, column, select_all });
+    }
+
+    /// 绘制阶段才能拿到 Window：在这里填充并聚焦编辑输入，选区/光标由输入本身维护。
+    fn begin_edit(&mut self, pending: PendingEdit, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row_id) = self.session.row_id(pending.row).map(str::to_owned) else {
+            return;
+        };
+        // 切换到另一格前先把正在输入的内容暂存，避免双击别处时悄悄丢掉已输入文本。
+        if let Some(previous) = self.edit_target.take() {
+            let text = self.edit_input.read(cx).value().to_string();
+            let value = match (&previous.original, text.is_empty()) {
+                (Some(None), true) => None,
+                _ => Some(text),
+            };
+            let gate = self.session.stage_text_by_id(&previous.row_id, previous.column, value);
+            self.notice = self.session.gate_text(gate);
+        }
+        let original = self.session.raw_value(pending.row, pending.column);
+        let text = self.session.edit_text(pending.row, pending.column);
+        self.edit_target = Some(EditTarget { row_id, column: pending.column, original });
+        self.edit_input.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+            if pending.select_all {
+                state.select_all(window, cx);
+            }
+        });
+        let handle = self.edit_input.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        self.notice.clear();
+        cx.notify();
+    }
+
+    /// 提交编辑栏：把输入原样暂存，不把 "NULL" 之类的文本当成数据库 NULL。
+    pub fn finish_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.edit_target.take() else {
+            return;
+        };
+        let text = self.edit_input.read(cx).value().to_string();
+        // 原来就是 NULL 且没有输入任何文字时保持 NULL；输入空字符串才是空字符串。
+        let value = match (&target.original, text.is_empty()) {
+            (Some(None), true) => None,
+            _ => Some(text),
+        };
+        let gate = self.session.stage_text_by_id(&target.row_id, target.column, value);
+        self.notice = self.session.gate_text(gate);
+        self.pending_edit = None;
+        self.refocus = true;
+        self.sync_table(cx);
+        cx.notify();
+    }
+
+    fn cancel_edit(&mut self) {
+        self.edit_target = None;
+        self.pending_edit = None;
+        self.notice.clear();
+        self.refocus = true;
+    }
+
+    fn abandon_edit(&mut self) {
+        self.edit_target = None;
+        self.pending_edit = None;
+        self.refocus = true;
     }
 
     /// 表头右键菜单的命令。`column` 是数据列序号（不含行号列）。
@@ -319,22 +484,31 @@ impl GridPane {
                 }
             }
             TableEvent::SelectCell(row, col) | TableEvent::RightClickedCell(row, col) => {
-                self.session.select(*row, col.saturating_sub(1), false);
+                let column = col.saturating_sub(1);
+                // sync_table 会把会话焦点写回表格，表格随后又发回同一条事件；已经一致时不再改写选择。
+                if self.session.focus_cell() != Some((*row, column)) {
+                    self.session.select(*row, column, false);
+                    // 上一次禁写/校验提示属于旧格子，移动目标后不再显示。
+                    self.notice.clear();
+                }
             }
             TableEvent::DoubleClickedCell(row, col) => {
+                // 双击与 F2 都进入同一条编辑路径；只读时退化为查看值并说明原因。
                 let column = col.saturating_sub(1);
                 self.session.select(*row, column, false);
-                self.session.open_value(*row, column);
-                self.editing = true;
-                self.edit_buffer = self.session.cell_label(*row, column);
+                self.request_edit(true);
             }
             TableEvent::SelectRow(row) | TableEvent::DoubleClickedRow(row) => {
-                self.session.select(*row, 0, false);
+                if self.session.focus_cell() != Some((*row, 0)) {
+                    self.session.select(*row, 0, false);
+                }
                 if matches!(event, TableEvent::DoubleClickedRow(_)) {
                     self.session.open_value(*row, 0);
                 }
             }
-            TableEvent::ClearSelection => self.session.clear_selection(),
+            // 表格清空高亮常常只是 sync_table 的回声（事件异步送达）；选择身份由会话自己维护，
+            // 真正的取消在按键与命令路径里处理，这里不能清掉用户刚选中的行。
+            TableEvent::ClearSelection => {}
             _ => {}
         }
     }
@@ -345,6 +519,7 @@ impl GridPane {
         } else {
             Gate::Readonly
         };
+        self.notice = self.session.gate_text(gate);
         self.sync_table(cx);
         gate
     }
@@ -502,6 +677,9 @@ impl GridPane {
         let locale = self.locale;
         let writable = self.session.writable();
         let dirty = self.session.uncommitted();
+        // 表格自己的高亮也要跟着稳定身份走：重排后按会话焦点重新指到同一行。
+        // 事件是异步送达的，靠 apply_table_event 的相等判断避免回声改写选择。
+        let focus = self.session.focus_cell().map(|(row, column)| (row, column + 1));
         self.table.update(cx, |state, cx| {
             state.delegate_mut().locale = locale;
             state.delegate_mut().writable = writable;
@@ -513,6 +691,11 @@ impl GridPane {
             state.delegate_mut().has_more = has_more;
             state.delegate_mut().loading = false;
             state.refresh(cx);
+            match focus {
+                Some((row, column)) if state.selected_cell() != Some((row, column)) => state.set_selected_cell(row, column, cx),
+                None if state.selected_cell().is_some() => state.clear_selection(cx),
+                _ => {}
+            }
         });
     }
 }
@@ -544,6 +727,12 @@ fn count_of(request: &PageRequest) -> CountRequest {
 
 impl Render for GridPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 编辑请求在绘制阶段落地，才能创建输入状态、写入文本并把焦点交给它。
+        if let Some(pending) = self.pending_edit.take() {
+            self.begin_edit(pending, window, cx);
+        } else if self.edit_target.is_none() && std::mem::take(&mut self.refocus) {
+            window.focus(&self.grid_focus, cx);
+        }
         let start = self.table.read(cx).delegate().visible_start;
         if self.table.read(cx).delegate().visible_seen {
             self.session.scroll_to(start);
@@ -553,6 +742,9 @@ impl Render for GridPane {
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let entity = cx.entity();
         let search = self.search_input(window, cx);
+        if std::mem::take(&mut self.clear_search) {
+            search.update(cx, |state, cx| state.set_value("", window, cx));
+        }
         let writable = self.session.writable();
         let dirty = self.session.uncommitted();
         let table_mode = self.session.mode == GridMode::Table;
@@ -596,6 +788,18 @@ impl Render for GridPane {
             if writable { p.ok } else { p.text_muted },
             if writable { p.ok_soft } else { p.hover },
         ));
+        // 只读不是一句状态词：把具体原因放在旁边，用户知道为什么写不进去。
+        let readonly_reason = self.session.readonly_reason().to_owned();
+        if !writable && !readonly_reason.is_empty() && readonly_reason != "grid.status.readonly" {
+            tools = tools.child(
+                div().px(px(2.)).max_w(px(360.)).truncate().text_size(px(12.)).text_color(p.text_muted).child(t(&readonly_reason)),
+            );
+        }
+        if !self.notice.is_empty() {
+            tools = tools.child(
+                div().px(px(6.)).max_w(px(360.)).truncate().text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(self.notice.clone())),
+            );
+        }
         tools = tools.child(grid_icon("copy-region", IconName::Copy, t("grid.value.copyValue"), entity.clone()));
         if writable {
             tools = tools
@@ -625,11 +829,8 @@ impl Render for GridPane {
             .flex_col()
             .size_full()
             .bg(p.surface)
-            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
-                if this.editing {
-                    this.type_edit(event, cx);
-                    return;
-                }
+            .track_focus(&self.grid_focus)
+            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
                 let key = match key {
                     "arrowup" => "up",
@@ -638,7 +839,34 @@ impl Render for GridPane {
                     "arrowright" => "right",
                     other => other,
                 };
+                // 文本输入接管字符、光标、选区、粘贴和撤销，这里只处理取消编辑。
+                if this.edit_target.is_some() {
+                    if key == "escape" {
+                        cx.stop_propagation();
+                        this.cancel_edit();
+                        cx.notify();
+                    }
+                    return;
+                }
+                if key == "escape" {
+                    if this.session.preview_open() {
+                        this.cancel_preview(cx);
+                    } else if this.session.viewer().is_some() {
+                        this.session.close_value();
+                        cx.notify();
+                    } else {
+                        this.session.clear_selection();
+                        this.sync_table(cx);
+                        this.table.update(cx, |state, cx| state.clear_selection(cx));
+                    }
+                    return;
+                }
+                let table_focused = this.table.read(cx).focus_handle(cx).is_focused(window);
                 if matches!(key, "up" | "down" | "left" | "right" | "home" | "end") {
+                    // 表格自身已移动过一次时不要再移动；Shift 没有绑定，由这里扩展选区。
+                    if table_focused && !event.keystroke.modifiers.shift {
+                        return;
+                    }
                     this.session.move_key(key, event.keystroke.modifiers.shift);
                     this.sync_table(cx);
                     if let Some((row, _)) = this.session.focus_cell() {
@@ -659,17 +887,32 @@ impl Render for GridPane {
             .child(div().id("grid-range").hidden().child(range))
             .child(div().id("grid-banner").hidden().child(banner));
         if has_columns {
-            column = column.child(div().flex_1().min_h(px(0.)).child(DataTable::new(&table).small().stripe(true).accessibility_label("shared-grid")));
+            column = column.child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .on_mouse_down(gpui_kit::MouseButton::Left, cx.listener(|this, _, window, cx| {
+                        // 点中格子时把键盘交给网格本身，之后的方向键、Enter 和 F2 才有效。
+                        window.focus(&this.grid_focus, cx);
+                    }))
+                    .child(DataTable::new(&table).small().stripe(true).accessibility_label("shared-grid")),
+            );
         } else {
             column = column.child(div().flex_1().flex().items_center().justify_center().child(kit::empty_state(IconName::Table, t("ui.grid.empty"), SharedString::from(""), &p)));
         }
-        if self.editing {
-            let buffer = SharedString::from(if self.edit_buffer.is_empty() { " ".to_owned() } else { self.edit_buffer.clone() });
+        if self.edit_target.is_some() {
+            let input = self.edit_input.clone();
+            let set_null = {
+                let entity = entity.clone();
+                move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                    entity.update(cx, |pane, cx| {
+                        let _ = pane.command("grid-set-null", cx);
+                    });
+                }
+            };
             column = column.child(
                 div()
                     .id("grid-edit")
-                    .role(gpui_kit::Role::TextInput)
-                    .aria_label(t("shell.shortcuts.editCell"))
                     .flex_none()
                     .px(px(12.))
                     .py(px(8.))
@@ -680,18 +923,8 @@ impl Render for GridPane {
                     .border_t_1()
                     .border_color(p.accent)
                     .child(kit::icon(IconName::Pencil, 14., p.accent_text))
-                    .child(
-                        div()
-                            .flex_1()
-                            .px(px(8.))
-                            .py(px(4.))
-                            .rounded(px(6.))
-                            .bg(p.surface)
-                            .border_1()
-                            .border_color(p.accent)
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .child(buffer),
-                    )
+                    .child(div().flex_1().child(kit::text_input("grid-edit-input", &input, t("shell.shortcuts.editCell")).small()))
+                    .child(kit::tool_button("grid-set-null", None, t("grid.value.null"), set_null))
                     .child(kit::kbd("Enter", &p))
                     .child(kit::kbd("Esc", &p)),
             );
@@ -717,6 +950,20 @@ impl Render for GridPane {
                     .child(kit::eyebrow(SharedString::from(format!("{:?}", shown.kind)), &p))
                     .child(div().font_family(cx.theme().mono_font_family.clone()).text_size(px(12.5)).child(SharedString::from(body))),
             );
+            let reason = self.session.viewer_reason();
+            if !reason.is_empty() {
+                column = column.child(
+                    div()
+                        .id("grid-value-reason")
+                        .flex_none()
+                        .px(px(14.))
+                        .pb(px(8.))
+                        .bg(p.chrome)
+                        .text_size(px(12.))
+                        .text_color(p.text_muted)
+                        .child(SharedString::from(reason)),
+                );
+            }
         }
         if self.session.preview_open() {
             let sql = self.session.preview_sql().join("\n");
@@ -804,33 +1051,6 @@ fn grid_icon(id: &'static str, icon: IconName, label: SharedString, entity: Enti
     })
 }
 
-impl GridPane {
-    fn type_edit(&mut self, event: &gpui_kit::KeyDownEvent, cx: &mut Context<Self>) {
-        match event.keystroke.key.as_str() {
-            "backspace" => {
-                self.edit_buffer.pop();
-            }
-            "escape" => {
-                self.editing = false;
-                self.edit_buffer.clear();
-            }
-            "enter" => {
-                let value = if self.edit_buffer == "NULL" { None } else { Some(self.edit_buffer.clone()) };
-                if let Some((row, column)) = self.session.focus_cell() {
-                    let _ = self.session.stage_text(row, column, value);
-                }
-                self.editing = false;
-            }
-            _ => {
-                if let Some(text) = event.keystroke.key_char.clone().filter(|text| !text.is_empty()) {
-                    self.edit_buffer.push_str(&text);
-                }
-            }
-        }
-        self.sync_table(cx);
-    }
-}
-
 fn grid_button(id: &'static str, primary: bool, label: SharedString, entity: Entity<GridPane>) -> impl IntoElement {
     let click = move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
         entity.update(cx, |pane, cx| {
@@ -886,6 +1106,7 @@ const CELL_MENU: &[(&str, &str, bool, bool)] = &[
     ("select-all-cells", "grid.menu.selectAll", false, false),
     ("", "", false, false),
     ("edit-cell", "shell.shortcuts.editCell", true, false),
+    ("grid-set-null", "grid.value.null", true, false),
     ("grid-insert", "grid.action.insert", true, false),
     ("mark-delete", "grid.menu.markDelete", true, true),
 ];
@@ -1112,7 +1333,46 @@ impl GridPane {
             Some(1),
             Some(schema),
         );
+        // 指向 name 列，后续的显式 NULL、复制和预览都作用在这一格。
+        self.session.select(0, 1, false);
         let _ = self.session.stage_text(0, 1, Some("乙".into()));
+    }
+
+    /// 装一张真正可写的表：用于键盘编辑、显式 NULL 与预览的行为测试。
+    #[cfg(test)]
+    pub fn plant_writable(&mut self, target: GridTarget, columns: Vec<(&str, &str)>, rows: Vec<Vec<Option<&str>>>, key: &str, cx: &mut Context<Self>) {
+        use session::{schema_from_parts, GridRow};
+        let schema: crate::grid::TableSchema = schema_from_parts(
+            &target.engine,
+            &target.schema,
+            &target.table,
+            "table",
+            columns.iter().map(|(name, type_name)| session::column_of(name, type_name, *name == key)).collect(),
+            vec![key.to_owned()],
+        )
+        .expect("schema");
+        let grid_columns = columns_from_schema(&schema, true);
+        let key_index = columns.iter().position(|(name, _)| *name == key).unwrap_or(0);
+        let grid_rows = rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, values)| {
+                let locator = vec![(key.to_owned(), values.get(key_index).cloned().flatten().map(str::to_owned))];
+                GridRow {
+                    id: (index + 1).to_string(),
+                    locator,
+                    values: values.into_iter().map(|value| value.map(str::to_owned)).collect(),
+                    located: true,
+                    inserted: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        let count = grid_rows.len() as i64;
+        self.session.mode = GridMode::Table;
+        self.session.switch_target(target);
+        self.session.locale = self.locale;
+        self.session.load_local(grid_columns, grid_rows, Some(count), Some(schema));
+        self.sync_table(cx);
     }
 
     pub fn plant_loaded(&mut self, target: GridTarget, columns: Vec<String>, rows: Vec<Vec<Option<String>>>, cx: &mut Context<Self>) {
@@ -1188,5 +1448,245 @@ mod shortcut_tests {
                 assert_ne!(i18n::text(locale, key), *key, "{key}");
             }
         }
+    }
+}
+
+
+#[cfg(test)]
+mod pane_tests {
+    use super::session::CellKind;
+    use super::*;
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{AnyWindowHandle, Bounds, Point, TestAppContext, WindowBounds, WindowOptions, size};
+
+    fn target() -> GridTarget {
+        GridTarget {
+            connection_id: "notes".to_owned(),
+            connection_name: "笔记".to_owned(),
+            database: "main".to_owned(),
+            schema: String::new(),
+            table: "customers".to_owned(),
+            engine: "sqlite".to_owned(),
+            environment: "dev".to_owned(),
+        }
+    }
+
+    fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<GridPane>) {
+        let dir = std::env::temp_dir().join(format!("rillsql-grid-pane-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(1100.), px(720.)) };
+            gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |window, cx| cx.new(|cx| GridPane::new(services, window, cx)),
+            )
+            .expect("grid pane")
+        })
+    }
+
+    fn plant(pane: &Entity<GridPane>, cx: &mut App) {
+        pane.update(cx, |pane, cx| {
+            pane.plant_writable(
+                target(),
+                vec![("id", "integer"), ("name", "text")],
+                vec![vec![Some("1"), Some("甲")], vec![Some("2"), Some("乙")]],
+                "id",
+                cx,
+            );
+        });
+    }
+
+    /// 编辑器事件由应用队列异步送达，断言前先清空队列。
+    fn settle(cx: &mut TestAppContext) {
+        cx.run_until_parked();
+    }
+
+
+    #[gpui_kit::test]
+    fn keyboard_editing_uses_a_real_text_input_and_commits_or_cancels(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            let handle = pane.read(cx).focus_handle();
+            window.focus(&handle, cx);
+            window.press("right", cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update(|cx| assert_eq!(pane.read(cx).session.focus_cell(), Some((0, 1)), "方向键应选中 name 列"));
+
+        // F2 打开编辑栏，原值直接进入正式文本输入。
+        cx.update_window(window, |_, window, cx| window.press("f2", cx)).unwrap();
+        settle(cx);
+        cx.update(|cx| {
+            assert!(pane.read(cx).editing(), "F2 应打开编辑栏");
+            assert_eq!(pane.read(cx).edit_value(cx), "甲", "编辑栏应带出原值");
+        });
+
+        // 选区 + 输入替换；撤销只回退输入文本，不产生暂存。
+        cx.update_window(window, |_, window, cx| {
+            window.press("secondary-a", cx);
+            window.input("乙", cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update(|cx| assert_eq!(pane.read(cx).edit_value(cx), "乙", "全选后输入应替换原值"));
+        cx.update_window(window, |_, window, cx| window.press("secondary-z", cx)).unwrap();
+        settle(cx);
+        cx.update(|cx| {
+            assert_eq!(pane.read(cx).edit_value(cx), "甲", "编辑栏撤销应恢复原文本");
+            assert!(!pane.read(cx).session.uncommitted(), "输入阶段不应进入暂存");
+        });
+
+        // Enter 提交到暂存（不写库）。
+        cx.update_window(window, |_, window, cx| {
+            window.press("secondary-a", cx);
+            window.input("乙", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update(|cx| {
+            assert!(!pane.read(cx).editing(), "Enter 应结束编辑");
+            assert_eq!(pane.read(cx).cell(0, 1), "乙");
+            assert!(pane.read(cx).session.uncommitted(), "Enter 只暂存");
+        });
+
+        // Esc 取消输入，不改动已有暂存。
+        cx.update_window(window, |_, window, cx| window.press("f2", cx)).unwrap();
+        settle(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.input("丙", cx);
+            window.press("escape", cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update(|cx| {
+            assert!(!pane.read(cx).editing(), "Esc 应关闭编辑栏");
+            assert_eq!(pane.read(cx).cell(0, 1), "乙", "Esc 不应写入输入内容");
+        });
+
+        // 粘贴由文本输入自身处理。
+        cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("粘贴".to_owned())));
+        cx.update_window(window, |_, window, cx| window.press("f2", cx)).unwrap();
+        settle(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.press("secondary-a", cx);
+            window.press("secondary-v", cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update(|cx| assert_eq!(pane.read(cx).edit_value(cx), "粘贴", "粘贴应替换选中的文本"));
+        cx.update_window(window, |_, window, cx| window.press("enter", cx)).unwrap();
+        settle(cx);
+        cx.update(|cx| assert_eq!(pane.read(cx).cell(0, 1), "粘贴"));
+    }
+
+    #[gpui_kit::test]
+    fn double_click_starts_the_same_edit_as_f2(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            // DataTable 事件带行号列偏移；双击等同于选中后 F2，而不是同时打开查看值。
+            pane.update(cx, |pane, _| pane.apply_table_event(&TableEvent::DoubleClickedCell(0, 2)));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert!(pane.read(cx).editing(), "双击应进入编辑");
+            assert_eq!(pane.read(cx).edit_value(cx), "甲");
+            assert_eq!(pane.read(cx).session.focus_cell(), Some((0, 1)));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn explicit_null_is_a_separate_action_from_typing_the_text_null(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            pane.update(cx, |pane, cx| {
+                pane.session.select(0, 1, false);
+                let _ = pane.command("grid-set-null", cx);
+                pane.session.select(1, 1, false);
+                let _ = pane.command("edit-cell", cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.press("secondary-a", cx);
+            window.input("NULL", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update(|cx| {
+            assert_eq!(pane.read(cx).session.show_cell(0, 1, false).kind, CellKind::Null);
+            assert_eq!(pane.read(cx).session.show_cell(1, 1, false).kind, CellKind::Text);
+            let sql = pane.update(cx, |pane, cx| pane.preview(cx)).unwrap();
+            assert!(sql.iter().any(|item| item.contains("= NULL") && !item.contains("'NULL'")), "{sql:?}");
+            assert!(sql.iter().any(|item| item.contains("= 'NULL'")), "{sql:?}");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn readonly_results_keep_copy_and_explain_the_reason(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.show_query(target(), "select * from customers join people", vec!["name".to_owned()], vec![vec![Some("乙".to_owned())]], cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                assert!(!pane.writable());
+                pane.session.select(0, 0, false);
+                assert_eq!(pane.command("copy-region", cx).as_deref(), Some("乙"), "只读也要能复制");
+                let _ = pane.command("edit-cell", cx);
+                assert!(!pane.editing(), "只读格子不应进入编辑");
+                assert!(!pane.notice.is_empty(), "应说明禁写原因");
+                assert!(!pane.session.uncommitted());
+                let _ = pane.command("grid-set-null", cx);
+                assert!(!pane.session.uncommitted(), "只读的显式 NULL 也不能假装暂存");
+                assert!(pane.session.viewer().is_some(), "只读仍可查看完整值");
+                assert_eq!(pane.command("commit", cx), None);
+                assert!(!pane.session.preview_open(), "只读不能打开写入预览");
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn staged_edit_previews_keep_the_row_after_sorting(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            pane.update(cx, |pane, cx| {
+                pane.session.select(1, 1, false);
+                let _ = pane.command("edit-cell", cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.press("secondary-a", cx);
+            window.input("改", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.column_command(0, "column-sort-desc", cx);
+                assert_eq!(pane.cell(0, 1), "改", "排序后暂存值跟着行 identity 移动");
+                let sql = pane.preview(cx).unwrap();
+                assert!(sql[0].contains("\"id\" = 2"), "{sql:?}");
+                assert!(!sql[0].contains("\"id\" = 1"), "{sql:?}");
+            });
+        });
     }
 }

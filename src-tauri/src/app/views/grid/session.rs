@@ -4,7 +4,7 @@
 use std::cmp::Ordering;
 
 use crate::grid::commands::{ChangeArg, ColumnDto, CommitDto, PageDto, PageRequest, SchemaDto, SortArg, TableRef, ValueArg};
-use crate::grid::{delete_sql, insert_sql, locate_sheet, update_sql, value_family, Cell, Column, Engine, TableSchema, ValueFamily};
+use crate::grid::{delete_sql, insert_sql, locate_sheet, sql_cell, update_sql, value_family, Cell, Column, Engine, TableSchema, ValueFamily};
 use crate::i18n::{self, Locale};
 use crate::query::split_sql;
 
@@ -57,10 +57,14 @@ pub struct GridRow {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Overlay {
+    /// 当前显示行号，只用于把暂存值画回格子；重排后由 reattach_overlays 更新。
     row: usize,
     /// 可视行号会随排序和筛选重排，挂回和预览都用这个稳定 id。
     row_id: String,
+    /// 当前显示列号，同样只用于绘制。
     column: usize,
+    /// 列顺序变化时按名字重新定位暂存目标。
+    column_name: String,
     value: Option<String>,
     gate: Gate,
     message: String,
@@ -133,9 +137,17 @@ pub struct SharedGrid {
     viewport: usize,
     anchor: (usize, usize),
     focus: (usize, usize),
+    /// 选择的锚点与焦点用稳定行 id 记住，重排后按 id 找回显示行号。
+    anchor_id: String,
+    focus_id: String,
     selected: bool,
-    viewer: Option<(usize, usize)>,
+    /// 完整值查看同样记住行 id，滚动或重排后仍指向原来那一行。
+    viewer: Option<(String, usize)>,
     overlays: Vec<Overlay>,
+    /// 已经离开当前读取窗口、但仍被暂存引用的行；翻页后预览和提交仍用它们。
+    retained: Vec<GridRow>,
+    /// 没有对应暂存的失败（例如提交报告给出未知 id）单独记账，不伪造格子。
+    failures: Vec<(String, String)>,
     preview_sql: Vec<String>,
     preview_ids: Vec<String>,
     preview_open: bool,
@@ -173,9 +185,13 @@ impl SharedGrid {
             viewport: 24,
             anchor: (0, 0),
             focus: (0, 0),
+            anchor_id: String::new(),
+            focus_id: String::new(),
             selected: false,
             viewer: None,
             overlays: Vec::new(),
+            retained: Vec::new(),
+            failures: Vec::new(),
             preview_sql: Vec::new(),
             preview_ids: Vec::new(),
             preview_open: false,
@@ -188,28 +204,36 @@ impl SharedGrid {
 
     pub fn load_local(&mut self, columns: Vec<GridColumn>, rows: Vec<GridRow>, full_count: Option<i64>, schema: Option<TableSchema>) {
         self.mode = GridMode::Table;
-        self.columns = columns;
+        self.columns = merge_widths(&self.columns, columns);
         self.source = rows;
         self.schema = schema;
         self.full_count = full_count;
         self.truncated = full_count.is_some_and(|count| count > self.source.len() as i64);
         self.scope = RangeScope::Fetched;
         self.overlays.clear();
+        self.retained.clear();
+        self.failures.clear();
+        self.selected = false;
+        self.viewer = None;
         self.close_preview();
-        self.readonly_reason.clear();
+        self.refresh_readonly_reason();
         self.recompute();
     }
 
+    /// 同一张表翻页或刷新时替换已读取窗口：暂存仍按行 id 挂回，列宽按列名保留。
     pub fn replace_fetched(&mut self, columns: Vec<GridColumn>, rows: Vec<GridRow>, offset: u64, full_count: Option<i64>, truncated: bool, schema: Option<TableSchema>) {
-        self.columns = columns;
+        self.retain_staged_rows();
+        self.columns = merge_widths(&self.columns, columns);
         self.source = rows;
         self.schema = schema;
         self.offset = offset;
         self.full_count = full_count;
         self.truncated = truncated;
         self.scope = RangeScope::Fetched;
-        self.overlays.clear();
+        self.selected = false;
+        self.viewer = None;
         self.close_preview();
+        self.refresh_readonly_reason();
         self.recompute();
     }
 
@@ -218,10 +242,11 @@ impl SharedGrid {
         self.sql = sql.to_owned();
         self.token = self.token.saturating_add(1);
         self.schema = None;
-        self.readonly_reason = prove_single_table(&self.target.engine, sql).err().unwrap_or("grid.status.readonly").to_owned();
-        if prove_single_table(&self.target.engine, sql).is_ok() {
-            self.readonly_reason = "grid.status.readonly".to_owned();
-        }
+        // 单表 SELECT 只在结构证明成功后短暂只读；联接、聚合或多语句从一开始就说明原因。
+        self.readonly_reason = match prove_single_table(&self.target.engine, sql) {
+            Ok(_) => "grid.status.readonly".to_owned(),
+            Err(reason) => reason.to_owned(),
+        };
         self.columns = columns
             .iter()
             .map(|name| GridColumn {
@@ -250,6 +275,10 @@ impl SharedGrid {
         self.truncated = false;
         self.scope = RangeScope::Fetched;
         self.overlays.clear();
+        self.retained.clear();
+        self.failures.clear();
+        self.selected = false;
+        self.viewer = None;
         self.close_preview();
         self.recompute();
         self.token
@@ -325,8 +354,52 @@ impl SharedGrid {
         self.readonly_reason.is_empty() && self.schema.as_ref().is_some_and(|schema| schema.kind == "table" && !schema.key.is_empty())
     }
 
+    /// 只读时给出的具体原因；可写时为空。界面用它解释禁写，而不是只画一个“只读”。
+    pub fn readonly_reason(&self) -> &str {
+        &self.readonly_reason
+    }
+
     pub fn uncommitted(&self) -> bool {
         !self.overlays.is_empty()
+    }
+
+    pub fn failures(&self) -> &[(String, String)] {
+        &self.failures
+    }
+
+    /// 换到另一张表时清掉旧表的筛选、排序、选择和暂存；同一张表翻页不算换表。
+    pub fn switch_target(&mut self, target: GridTarget) {
+        let same = self.mode == GridMode::Table
+            && self.target.connection_id == target.connection_id
+            && self.target.database == target.database
+            && self.target.schema == target.schema
+            && self.target.table == target.table;
+        if !same {
+            self.overlays.clear();
+            self.retained.clear();
+            self.failures.clear();
+            self.search.clear();
+            self.filters.clear();
+            self.sort = None;
+            self.selected = false;
+            self.viewer = None;
+            self.anchor_id.clear();
+            self.focus_id.clear();
+            self.close_preview();
+        }
+        self.target = target;
+    }
+
+    /// 表模式下只读原因由结构决定：视图、无唯一键或不可写都由这里统一给出。
+    fn refresh_readonly_reason(&mut self) {
+        if self.mode == GridMode::Query {
+            return;
+        }
+        self.readonly_reason = match &self.schema {
+            Some(schema) if schema.kind != "table" => "grid.errors.viewReadonly".to_owned(),
+            Some(schema) if schema.key.is_empty() => "grid.status.unlocated".to_owned(),
+            _ => String::new(),
+        };
     }
 
     pub fn set_viewport(&mut self, rows: usize) {
@@ -436,7 +509,8 @@ impl SharedGrid {
     pub fn set_page(&mut self, offset: u64, limit: u64) {
         self.offset = offset;
         self.limit = limit.max(1);
-        self.selected = false;
+        self.clear_selection();
+        self.viewer = None;
         self.scroll = 0;
     }
 
@@ -450,6 +524,8 @@ impl SharedGrid {
 
     pub fn clear_selection(&mut self) {
         self.selected = false;
+        self.anchor_id.clear();
+        self.focus_id.clear();
     }
 
     pub fn column_width(&self, index: usize) -> f32 {
@@ -468,26 +544,47 @@ impl SharedGrid {
 
     pub fn select(&mut self, row: usize, column: usize, extend: bool) {
         if self.rows.is_empty() || self.columns.is_empty() {
-            self.selected = false;
+            self.clear_selection();
             return;
         }
         let row = row.min(self.rows.len() - 1);
         let column = column.min(self.columns.len() - 1);
         if !extend || !self.selected {
             self.anchor = (row, column);
+            self.anchor_id = self.rows[row].id.clone();
         }
         self.focus = (row, column);
+        self.focus_id = self.rows[row].id.clone();
         self.selected = true;
     }
 
     pub fn select_all_loaded(&mut self) {
         if self.rows.is_empty() || self.columns.is_empty() {
-            self.selected = false;
+            self.clear_selection();
             return;
         }
         self.anchor = (0, 0);
+        self.anchor_id = self.rows[0].id.clone();
         self.focus = (self.rows.len() - 1, self.columns.len() - 1);
+        self.focus_id = self.rows[self.rows.len() - 1].id.clone();
         self.selected = true;
+    }
+
+    /// 当前选择焦点对应的稳定行 id。排序、筛选和翻页后它就是“同一行”的判据。
+    pub fn focused_row_id(&self) -> Option<&str> {
+        if self.selected && !self.focus_id.is_empty() {
+            Some(self.focus_id.as_str())
+        } else {
+            None
+        }
+    }
+
+    pub fn row_id(&self, row: usize) -> Option<&str> {
+        self.rows.get(row).map(|item| item.id.as_str())
+    }
+
+    fn row_index(&self, row_id: &str) -> Option<usize> {
+        self.rows.iter().position(|row| row.id == row_id)
     }
 
     pub fn selection_count(&self) -> usize {
@@ -523,6 +620,8 @@ impl SharedGrid {
         }
     }
 
+    /// TSV 复制：数据库 NULL 写成不带引号的 NULL，字符串 "NULL" 写成带引号的 "NULL"，
+    /// 空字符串保持空字段；制表符、换行和引号按 TSV 规则转义。
     pub fn tsv(&self) -> String {
         let points = self.selection();
         if points.is_empty() {
@@ -535,19 +634,38 @@ impl SharedGrid {
                 lines.push(Vec::new());
                 current = row;
             }
-            let text = self.copy_text(row, column);
-            lines.last_mut().expect("line").push(text);
+            lines.last_mut().expect("line").push(self.tsv_field(row, column));
         }
-        lines
-            .into_iter()
-            .map(|line| line.into_iter().map(|field| quote_tsv(&field)).collect::<Vec<_>>().join("\t"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        lines.into_iter().map(|line| line.join("\t")).collect::<Vec<_>>().join("\n")
+    }
+
+    /// SQL 值复制：按目标引擎写成字面量，NULL 与 'NULL' 在文本上也可区分。
+    pub fn sql_values(&self) -> String {
+        let points = self.selection();
+        if points.is_empty() {
+            return String::new();
+        }
+        let engine = Engine::parse(&self.target.engine).unwrap_or(Engine::Sqlite);
+        let mut lines: Vec<Vec<String>> = Vec::new();
+        let mut current = usize::MAX;
+        for (row, column) in points {
+            if row != current {
+                lines.push(Vec::new());
+                current = row;
+            }
+            let cell = match self.value_at(row, column) {
+                Some(Some(text)) => Cell::Text(text),
+                _ => Cell::Null,
+            };
+            let origin = self.columns.get(column).map(domain_column);
+            lines.last_mut().expect("line").push(sql_cell(engine, origin.as_ref(), &cell));
+        }
+        lines.into_iter().map(|line| line.join(", ")).collect::<Vec<_>>().join("\n")
     }
 
     pub fn open_value(&mut self, row: usize, column: usize) {
         if row < self.rows.len() && column < self.columns.len() {
-            self.viewer = Some((row, column));
+            self.viewer = Some((self.rows[row].id.clone(), column));
         }
     }
 
@@ -556,18 +674,31 @@ impl SharedGrid {
     }
 
     pub fn viewer(&self) -> Option<ShownCell> {
-        let (row, column) = self.viewer?;
+        let (row, column) = self.viewer_cell()?;
         Some(self.show_cell(row, column, true))
+    }
+
+    /// 完整值查看当前落在哪一格；行已不在当前快照时返回 None，而不是指向别的行。
+    pub fn viewer_cell(&self) -> Option<(usize, usize)> {
+        let (row_id, column) = self.viewer.as_ref()?;
+        let row = self.row_index(row_id)?;
+        (*column < self.columns.len()).then_some((row, *column))
+    }
+
+    pub fn viewer_reason(&self) -> String {
+        match self.viewer_cell() {
+            Some((row, column)) => self.write_reason(row, column),
+            None => String::new(),
+        }
     }
 
     pub fn show_cell(&self, row: usize, column: usize, opened: bool) -> ShownCell {
         let type_name = self.columns.get(column).map(|item| item.type_name.as_str()).unwrap_or("");
-        let value = self.overlay_value(row, column).or_else(|| self.rows.get(row).and_then(|item| item.values.get(column)).cloned());
-        classify(self.locale, value, type_name, opened)
+        classify(self.locale, self.value_at(row, column), type_name, opened)
     }
 
     pub fn cell_label(&self, row: usize, column: usize) -> String {
-        if let Some(overlay) = self.overlays.iter().find(|item| item.row == row && item.column == column && item.kind == "update" && item.gate != Gate::Writable) {
+        if let Some(overlay) = self.overlay_at(row, column).filter(|item| item.kind == "update" && item.gate != Gate::Writable) {
             return match &overlay.value {
                 Some(text) if text.is_empty() => i18n::text(self.locale, "grid.value.emptyLabel"),
                 Some(text) => text.clone(),
@@ -577,37 +708,88 @@ impl SharedGrid {
         self.show_cell(row, column, false).label
     }
 
+    /// 当前格子的原始值，供编辑栏判断“NULL 未改动”和抽取文本。
+    pub fn raw_value(&self, row: usize, column: usize) -> Option<Option<String>> {
+        self.value_at(row, column)
+    }
+
+    /// 进入文本编辑时使用的原值：数据库 NULL 与空字符串保持不同。
+    pub fn edit_text(&self, row: usize, column: usize) -> String {
+        match self.value_at(row, column) {
+            Some(Some(text)) => text,
+            _ => String::new(),
+        }
+    }
+
+    /// 当前格子是否真的可写；不可写时给出具体原因。只看结构，不看已存值。
+    pub fn write_reason(&self, row: usize, column: usize) -> String {
+        self.gate_text(self.structural_gate(Some(row), column))
+    }
+
+    /// 把 Gate 翻成界面文案；可写时为空。
+    pub fn gate_text(&self, gate: Gate) -> String {
+        let key = match gate {
+            Gate::Writable => return String::new(),
+            Gate::Readonly => {
+                if self.readonly_reason.is_empty() {
+                    "grid.status.readonly"
+                } else {
+                    self.readonly_reason.as_str()
+                }
+            }
+            Gate::Unlocated => "grid.status.unlocated",
+            Gate::Validation => "grid.status.validation",
+            Gate::Execution => "grid.status.execution",
+        };
+        i18n::text(self.locale, key)
+    }
+
     pub fn row_unlocated(&self, row: usize) -> bool {
         self.rows.get(row).is_some_and(|item| !item.inserted && !item.located)
     }
 
     pub fn gate_at(&self, row: usize, column: usize) -> Option<Gate> {
-        self.overlays.iter().find(|item| item.row == row && item.column == column).map(|item| item.gate)
+        self.overlay_at(row, column).map(|item| item.gate)
     }
 
+    /// 按当前显示位置暂存一次编辑。位置先解析成稳定行 id，再交给 stage_text_by_id。
     pub fn stage_text(&mut self, row: usize, column: usize, value: Option<String>) -> Gate {
-        if self.rows.get(row).is_some_and(|item| item.inserted) {
-            let row_id = self.rows[row].id.clone();
+        let Some(row_id) = self.rows.get(row).map(|item| item.id.clone()) else {
+            return Gate::Readonly;
+        };
+        self.stage_text_by_id(&row_id, column, value)
+    }
+
+    /// 按稳定行 id 暂存编辑：排序、筛选或翻页改变显示行号后仍落在同一行。
+    pub fn stage_text_by_id(&mut self, row_id: &str, column: usize, value: Option<String>) -> Gate {
+        let display = self.row_index(row_id);
+        let Some(column_name) = self.columns.get(column).map(|item| item.name.clone()) else {
+            return Gate::Readonly;
+        };
+        let Some(row) = self.any_row(row_id).cloned() else {
+            return Gate::Readonly;
+        };
+        let draw_row = display.unwrap_or(usize::MAX);
+        if row.inserted {
             let message = self.validation_message(column, value.as_deref());
             let gate = if message.is_some() { Gate::Validation } else { Gate::Writable };
+            self.overlays.retain(|item| !(item.kind == "update" && item.row_id == row_id && item.column_name == column_name));
             if gate == Gate::Writable {
                 if let Some(origin) = self.source.iter_mut().find(|item| item.id == row_id) {
                     if let Some(slot) = origin.values.get_mut(column) {
                         *slot = value.clone();
                     }
                 }
-                if let Some(slot) = self.rows[row].values.get_mut(column) {
+                if let Some(slot) = display.and_then(|row| self.rows.get_mut(row)).and_then(|item| item.values.get_mut(column)) {
                     *slot = value;
                 }
-                self.overlays.retain(|item| !(item.kind == "update" && item.row_id == row_id && item.column == column));
             } else {
-                self.overlays.retain(|item| !(item.kind == "update" && item.row_id == row_id && item.column == column));
-                self.overlays.push(overlay(row, row_id, column, value, Gate::Validation, message.unwrap_or_else(|| "grid.status.validation".to_owned()), None, "update"));
+                self.overlays.push(overlay(draw_row, row_id.to_owned(), column, column_name, value, Gate::Validation, message.unwrap_or_else(|| "grid.status.validation".to_owned()), None, "update"));
             }
             self.close_preview();
             return gate;
         }
-        let gate = self.gate_for_edit(row, column, value.as_deref());
+        let gate = self.gate_for_edit(display, column, value.as_deref());
         let message = match gate {
             Gate::Readonly => self.readonly_reason.clone(),
             Gate::Unlocated => "grid.status.unlocated".to_owned(),
@@ -615,11 +797,14 @@ impl SharedGrid {
             Gate::Writable => String::new(),
             Gate::Execution => "grid.status.execution".to_owned(),
         };
+        // 只读或无法定位的格子不制造“看起来已修改”的暂存；界面用 gate_text 解释原因。
+        if !matches!(gate, Gate::Writable | Gate::Validation) {
+            return gate;
+        }
         self.seq += 1;
         let change_id = if gate == Gate::Writable { Some(format!("u:{}", self.seq)) } else { None };
-        let row_id = self.rows.get(row).map(|item| item.id.clone()).unwrap_or_default();
-        self.overlays.retain(|item| !(item.kind == "update" && item.row_id == row_id && item.column == column));
-        self.overlays.push(overlay(row, row_id, column, value, gate, message, change_id, "update"));
+        self.overlays.retain(|item| !(item.kind == "update" && item.row_id == row_id && item.column_name == column_name));
+        self.overlays.push(overlay(draw_row, row_id.to_owned(), column, column_name, value, gate, message, change_id, "update"));
         self.close_preview();
         gate
     }
@@ -632,16 +817,20 @@ impl SharedGrid {
         if last.kind == "insert" {
             if let Some(id) = last.change_id.as_deref() {
                 self.source.retain(|item| item.id != id);
+                self.overlays.retain(|item| item.row_id != last.row_id);
                 self.recompute();
             }
         }
+        self.prune_retained();
         self.close_preview();
         true
     }
 
     pub fn stage_insert(&mut self) -> Gate {
         if self.mode == GridMode::Query || !self.writable() {
-            self.readonly_reason = if self.readonly_reason.is_empty() { "grid.status.readonly".to_owned() } else { self.readonly_reason.clone() };
+            if self.readonly_reason.is_empty() {
+                self.readonly_reason = "grid.status.readonly".to_owned();
+            }
             return Gate::Readonly;
         }
         let id = format!("i:{}", self.seq + 1);
@@ -651,7 +840,7 @@ impl SharedGrid {
         self.recompute();
         let row = self.rows.iter().position(|item| item.id == id).unwrap_or(self.rows.len().saturating_sub(1));
         let row_id = self.rows.get(row).map(|item| item.id.clone()).unwrap_or(id.clone());
-        self.overlays.push(overlay(row, row_id, 0, None, Gate::Writable, String::new(), Some(id), "insert"));
+        self.overlays.push(overlay(row, row_id, 0, String::new(), None, Gate::Writable, String::new(), Some(id), "insert"));
         self.close_preview();
         Gate::Writable
     }
@@ -665,6 +854,7 @@ impl SharedGrid {
             self.close_preview();
             return Gate::Writable;
         }
+        // 删除针对整行，只需要判断行是否可定位，与具体列无关。
         let gate = if self.schema.as_ref().is_some_and(|schema| schema.kind != "table") || (self.mode == GridMode::Query && !self.writable()) {
             Gate::Readonly
         } else if self.row_unlocated(row) || self.schema.as_ref().is_some_and(|schema| schema.key.is_empty()) {
@@ -674,24 +864,14 @@ impl SharedGrid {
         } else {
             Gate::Writable
         };
-        let message = match gate {
-            Gate::Writable => String::new(),
-            Gate::Unlocated => "grid.status.unlocated".to_owned(),
-            _ => self.readonly_reason.clone(),
-        };
+        // 只读或无法定位的行不接受删除暂存，也不该把网格标成未提交。
+        if gate != Gate::Writable {
+            return gate;
+        }
         self.seq += 1;
         let row_id = self.rows.get(row).map(|item| item.id.clone()).unwrap_or_default();
         self.overlays.retain(|item| !(item.kind == "delete" && item.row_id == row_id));
-        self.overlays.push(overlay(
-            row,
-            row_id,
-            0,
-            None,
-            gate,
-            message,
-            if gate == Gate::Writable { Some(format!("d:{}", self.seq)) } else { None },
-            "delete",
-        ));
+        self.overlays.push(overlay(row, row_id, 0, String::new(), None, Gate::Writable, String::new(), Some(format!("d:{}", self.seq)), "delete"));
         self.close_preview();
         gate
     }
@@ -705,8 +885,7 @@ impl SharedGrid {
     }
 
     pub fn rejected_visible(&self) -> bool {
-        self.overlays.iter().any(|item| item.gate != Gate::Writable && item.gate != Gate::Execution || (item.gate == Gate::Execution))
-            && self.overlays.iter().any(|item| item.gate != Gate::Writable)
+        self.overlays.iter().any(|item| item.gate != Gate::Writable) || !self.failures.is_empty()
     }
 
     pub fn open_preview(&mut self) -> Result<Vec<String>, String> {
@@ -717,22 +896,27 @@ impl SharedGrid {
             .filter(|item| item.gate == Gate::Writable && item.change_id.is_some())
             .filter_map(|overlay| {
                 let row = self.row_for(overlay)?;
-                Some((overlay.kind, overlay.change_id.clone().unwrap_or_default(), overlay.column, overlay.value.clone(), row.id.clone(), row.locator.clone(), row.values.clone()))
+                Some((
+                    overlay.kind,
+                    overlay.change_id.clone().unwrap_or_default(),
+                    overlay.column_name.clone(),
+                    overlay.value.clone(),
+                    row.id.clone(),
+                    row.locator.clone(),
+                    row.values.clone(),
+                ))
             })
             .collect::<Vec<_>>();
         let mut sql = Vec::new();
         let mut ids = Vec::new();
-        for (kind, id, column, value, row_id, locator, values) in planned {
+        for (kind, id, column_name, value, row_id, locator, values) in planned {
             let statement = match kind {
                 "delete" => delete_sql(&schema, &pairs(&locator)),
                 "insert" => {
                     let row = GridRow { id: row_id, values, located: false, locator: locator.clone(), inserted: true };
                     insert_sql(&schema, &self.insert_values(&row))
                 }
-                _ => {
-                    let name = self.columns.get(column).map(|item| item.name.clone()).unwrap_or_default();
-                    update_sql(&schema, &[(name, cell_of(value))], &pairs(&locator))
-                }
+                _ => update_sql(&schema, &[(column_name, cell_of(value))], &pairs(&locator)),
             };
             ids.push(id);
             sql.push(statement);
@@ -798,21 +982,38 @@ impl SharedGrid {
         Ok(crate::grid::commands::CommitRequest { table: self.table_ref(), changes })
     }
 
+    /// 把提交结果如实落回显示：成功项写回已读取行，失败项保留在原来的格子上并写明原因。
     pub fn apply_commit(&mut self, report: &CommitDto) {
-        let applied = report.applied.iter().map(|step| step.id.clone()).collect::<Vec<_>>();
-        self.overlays.retain(|item| item.change_id.as_ref().is_none_or(|id| !applied.contains(id)));
-        self.source.retain(|row| !applied.iter().any(|id| id == &row.id && row.inserted));
+        for step in &report.applied {
+            let Some(index) = self.overlays.iter().position(|item| item.change_id.as_deref() == Some(step.id.as_str())) else {
+                continue;
+            };
+            let applied = self.overlays.remove(index);
+            match applied.kind {
+                "insert" => {
+                    self.source.retain(|row| row.id != applied.row_id);
+                    self.retained.retain(|row| row.id != applied.row_id);
+                }
+                "delete" => {
+                    self.source.retain(|row| row.id != applied.row_id);
+                    self.rows.retain(|row| row.id != applied.row_id);
+                    self.retained.retain(|row| row.id != applied.row_id);
+                }
+                _ => self.set_row_value(&applied.row_id, &applied.column_name, applied.value.clone()),
+            }
+        }
         if let Some(failed) = &report.failed {
             if let Some(overlay) = self.overlays.iter_mut().find(|item| item.change_id.as_deref() == Some(failed.id.as_str())) {
                 overlay.gate = Gate::Execution;
                 overlay.message = failed.message.clone();
             } else {
-                self.overlays.push(overlay(0, String::new(), 0, None, Gate::Execution, failed.message.clone(), Some(failed.id.clone()), "update"));
+                // 未知 id 没有对应格子，只记录失败本身，不在首格伪造一个值。
+                self.failures.push((failed.id.clone(), failed.message.clone()));
             }
         }
+        self.prune_retained();
         self.close_preview();
         self.recompute();
-        self.reattach_overlays();
     }
 
     pub fn column_names(&self) -> Vec<String> {
@@ -823,7 +1024,8 @@ impl SharedGrid {
     #[allow(clippy::type_complexity)]
     pub fn exchange_sheet(&self) -> (Option<TableRef>, Vec<String>, Vec<Vec<Option<String>>>, bool) {
         let table = if self.target.connection_id.is_empty() || self.target.table.is_empty() { None } else { Some(self.table_ref()) };
-        let rows = self.source.iter().map(|row| row.values.clone()).collect();
+        // 暂存的新增行还没写进数据库，交换与导出都不能把它们当成已读取内容。
+        let rows = self.source.iter().filter(|row| !row.inserted).map(|row| row.values.clone()).collect();
         (table, self.column_names(), rows, self.has_more_rows())
     }
 
@@ -856,14 +1058,9 @@ impl SharedGrid {
         }
         self.truncated = truncated;
         let scroll = self.scroll;
-        let selected = self.selected;
-        let anchor = self.anchor;
-        let focus = self.focus;
+        // 选择按行 id 重新挂回，不按刚才的显示行号硬塞回去。
         self.recompute();
         self.scroll = scroll;
-        self.selected = selected;
-        self.anchor = anchor;
-        self.focus = focus;
         self.clamp_scroll();
     }
 
@@ -896,7 +1093,7 @@ impl SharedGrid {
         let Some(name) = self.columns.get(column).map(|item| item.name.clone()) else {
             return;
         };
-        match self.rows.get(row).and_then(|item| item.values.get(column)).cloned().unwrap_or(None) {
+        match self.value_at(row, column).unwrap_or(None) {
             None => self.set_filter(&name, "null", ""),
             Some(text) if text.is_empty() => self.set_filter(&name, "empty", ""),
             Some(text) => self.set_filter(&name, "eq", &text),
@@ -917,20 +1114,65 @@ impl SharedGrid {
         }
     }
 
+    /// 暂存只认稳定身份：行按 id、列按列名挂回当前显示位置。
     fn reattach_overlays(&mut self) {
+        let column_names: Vec<String> = self.columns.iter().map(|column| column.name.clone()).collect();
+        let row_ids: Vec<String> = self.rows.iter().map(|row| row.id.clone()).collect();
         for item in &mut self.overlays {
-            if item.row_id.is_empty() {
-                continue;
+            if !item.column_name.is_empty() {
+                if let Some(index) = column_names.iter().position(|name| name == &item.column_name) {
+                    item.column = index;
+                }
             }
-            item.row = self.rows.iter().position(|row| row.id == item.row_id).unwrap_or(usize::MAX);
+            item.row = if item.row_id.is_empty() { usize::MAX } else { row_ids.iter().position(|id| id == &item.row_id).unwrap_or(usize::MAX) };
         }
     }
 
-    fn row_for(&self, overlay: &Overlay) -> Option<&GridRow> {
+    fn any_row(&self, row_id: &str) -> Option<&GridRow> {
         self.rows
             .iter()
-            .find(|row| row.id == overlay.row_id)
-            .or_else(|| self.source.iter().find(|row| row.id == overlay.row_id))
+            .find(|row| row.id == row_id)
+            .or_else(|| self.source.iter().find(|row| row.id == row_id))
+            .or_else(|| self.retained.iter().find(|row| row.id == row_id))
+    }
+
+    fn row_for(&self, overlay: &Overlay) -> Option<&GridRow> {
+        self.any_row(&overlay.row_id)
+    }
+
+    /// 行离开当前读取窗口时，把仍被暂存引用的行留在 retained，预览和提交仍能定位它。
+    fn retain_staged_rows(&mut self) {
+        let mut keep = Vec::new();
+        for overlay in &self.overlays {
+            if overlay.change_id.is_none() {
+                continue;
+            }
+            if let Some(row) = self.any_row(&overlay.row_id) {
+                if !keep.iter().any(|item: &GridRow| item.id == row.id) {
+                    keep.push(row.clone());
+                }
+            }
+        }
+        self.retained = keep;
+    }
+
+    fn prune_retained(&mut self) {
+        self.retained.retain(|row| self.overlays.iter().any(|overlay| overlay.row_id == row.id));
+    }
+
+    /// 提交成功后把新值写回三个行来源，界面不再显示提交前的旧值。
+    fn set_row_value(&mut self, row_id: &str, column_name: &str, value: Option<String>) {
+        let Some(column) = self.columns.iter().position(|item| item.name == column_name) else {
+            return;
+        };
+        for row in self.source.iter_mut().chain(self.rows.iter_mut()).chain(self.retained.iter_mut()).filter(|row| row.id == row_id) {
+            if let Some(slot) = row.values.get_mut(column) {
+                *slot = value.clone();
+            }
+            if let Some(slot) = row.locator.iter_mut().find(|(name, _)| name == column_name) {
+                slot.1 = value.clone();
+            }
+        }
     }
 
     fn recompute(&mut self) {
@@ -961,10 +1203,45 @@ impl SharedGrid {
         }
         self.rows = rows;
         self.scope = if filtering { RangeScope::LoadedSubset } else { RangeScope::Fetched };
-        self.selected = false;
         self.scroll = 0;
-        self.clamp_scroll();
         self.reattach_overlays();
+        self.reattach_selection();
+        // 重排后让焦点行仍在可见范围内；选择被筛掉时退回顶部。
+        if let Some((focus, _)) = self.focus_cell() {
+            let (start, end) = self.visible_bounds();
+            if focus < start || focus >= end {
+                self.scroll = focus;
+            }
+        }
+        self.clamp_scroll();
+    }
+
+    /// 选择的锚点和焦点按行 id 找回；原来那一行真的消失时才清空选择。
+    fn reattach_selection(&mut self) {
+        if !self.selected {
+            self.anchor_id.clear();
+            self.focus_id.clear();
+            return;
+        }
+        let anchor = self.row_index(&self.anchor_id);
+        let focus = self.row_index(&self.focus_id);
+        match (anchor, focus) {
+            (Some(anchor), Some(focus)) => {
+                self.anchor.0 = anchor;
+                self.focus.0 = focus;
+            }
+            (None, Some(focus)) => {
+                self.anchor = (focus, self.anchor.1);
+                self.focus.0 = focus;
+            }
+            (Some(_), None) | (None, None) => {
+                self.clear_selection();
+                return;
+            }
+        }
+        let last_column = self.columns.len().saturating_sub(1);
+        self.anchor.1 = self.anchor.1.min(last_column);
+        self.focus.1 = self.focus.1.min(last_column);
     }
 
     fn clamp_scroll(&mut self) {
@@ -996,38 +1273,52 @@ impl SharedGrid {
         points
     }
 
-    fn copy_text(&self, row: usize, column: usize) -> String {
-        match self.overlay_value(row, column).or_else(|| self.rows.get(row).and_then(|item| item.values.get(column)).cloned()) {
-            Some(Some(text)) => text,
-            Some(None) | None => "NULL".to_owned(),
+    /// 行内当前值（含暂存修改），按显示位置读取；越界返回 None。
+    fn value_at(&self, row: usize, column: usize) -> Option<Option<String>> {
+        if let Some(overlay) = self.overlay_at(row, column).filter(|item| item.kind == "update") {
+            return Some(overlay.value.clone());
+        }
+        self.rows.get(row).and_then(|item| item.values.get(column).cloned())
+    }
+
+    fn tsv_field(&self, row: usize, column: usize) -> String {
+        match self.value_at(row, column) {
+            Some(Some(text)) if text == "NULL" => quote_tsv(&text, true),
+            Some(Some(text)) => quote_tsv(&text, false),
+            _ => "NULL".to_owned(),
         }
     }
 
-    fn overlay_value(&self, row: usize, column: usize) -> Option<Option<String>> {
-        self.overlays.iter().find(|item| item.row == row && item.column == column && item.kind == "update").map(|item| item.value.clone())
+    fn overlay_at(&self, row: usize, column: usize) -> Option<&Overlay> {
+        self.overlays.iter().find(|item| item.row == row && item.column == column && item.kind == "update")
     }
 
-    fn gate_for_edit(&self, row: usize, column: usize, value: Option<&str>) -> Gate {
-        if self.rows.get(row).is_some_and(|item| item.inserted) {
-            return if self.validation_message(column, value).is_some() { Gate::Validation } else { Gate::Writable };
+    /// 结构上是否允许写这一格：不看已存值，所以预览信封里的旧值仍可被替换。
+    fn structural_gate(&self, row: Option<usize>, column: usize) -> Gate {
+        if row.is_some_and(|row| self.rows.get(row).is_some_and(|item| item.inserted)) {
+            return Gate::Writable;
         }
         let query_waiting = self.mode == GridMode::Query && !self.writable() && self.readonly_reason != "grid.status.unlocated";
         if query_waiting || self.schema.as_ref().is_some_and(|schema| schema.kind != "table") {
             return Gate::Readonly;
         }
-        if self.row_unlocated(row) || self.schema.as_ref().is_some_and(|schema| schema.key.is_empty()) {
+        if row.is_some_and(|row| self.row_unlocated(row)) || self.schema.as_ref().is_some_and(|schema| schema.key.is_empty()) {
             return Gate::Unlocated;
         }
-        if !self.writable() || self.columns.get(column).is_some_and(|item| !item.editable && self.mode == GridMode::Query) {
+        if !self.writable() || self.columns.get(column).is_none() {
             return Gate::Readonly;
         }
-        if self.columns.get(column).is_none() {
+        if self.mode == GridMode::Query && self.columns.get(column).is_some_and(|item| !item.editable) {
             return Gate::Readonly;
-        }
-        if self.validation_message(column, value).is_some() {
-            return Gate::Validation;
         }
         Gate::Writable
+    }
+
+    fn gate_for_edit(&self, row: Option<usize>, column: usize, value: Option<&str>) -> Gate {
+        match self.structural_gate(row, column) {
+            Gate::Writable if self.validation_message(column, value).is_some() => Gate::Validation,
+            other => other,
+        }
     }
 
     fn validation_message(&self, column: usize, value: Option<&str>) -> Option<String> {
@@ -1064,7 +1355,7 @@ impl SharedGrid {
                         .iter()
                         .enumerate()
                         .filter_map(|(index, column)| {
-                            let value = self.writable_overlay(&row.id, index).or_else(|| row.values.get(index).cloned())?;
+                            let value = self.writable_overlay(&row.id, &column.name).or_else(|| row.values.get(index).cloned())?;
                             if value.is_none() && column.auto {
                                 return None;
                             }
@@ -1073,13 +1364,13 @@ impl SharedGrid {
                         .collect(),
                 }),
                 _ => {
-                    let Some(column) = self.columns.get(overlay.column).map(|column| column.name.clone()) else {
+                    if overlay.column_name.is_empty() {
                         continue;
-                    };
+                    }
                     changes.push(ChangeArg {
                         id,
                         kind: "update".to_owned(),
-                        sets: vec![ValueArg { column, value: overlay.value.clone(), resolved: false }],
+                        sets: vec![ValueArg { column: overlay.column_name.clone(), value: overlay.value.clone(), resolved: false }],
                         locator: value_args(&row.locator),
                         values: Vec::new(),
                     });
@@ -1094,7 +1385,7 @@ impl SharedGrid {
             .iter()
             .enumerate()
             .filter_map(|(index, column)| {
-                let value = self.overlay_on(row, index).or_else(|| row.values.get(index).cloned())?;
+                let value = self.writable_overlay(&row.id, &column.name).or_else(|| row.values.get(index).cloned())?;
                 if value.is_none() && column.auto {
                     return None;
                 }
@@ -1103,14 +1394,10 @@ impl SharedGrid {
             .collect()
     }
 
-    fn overlay_on(&self, row: &GridRow, column: usize) -> Option<Option<String>> {
-        self.writable_overlay(&row.id, column)
-    }
-
-    fn writable_overlay(&self, row_id: &str, column: usize) -> Option<Option<String>> {
+    fn writable_overlay(&self, row_id: &str, column_name: &str) -> Option<Option<String>> {
         self.overlays
             .iter()
-            .find(|item| item.row_id == row_id && item.column == column && item.kind == "update" && item.gate == Gate::Writable)
+            .find(|item| item.row_id == row_id && item.column_name == column_name && item.kind == "update" && item.gate == Gate::Writable)
             .map(|item| item.value.clone())
     }
 
@@ -1340,17 +1627,48 @@ fn compare_cell(left: Option<&str>, right: Option<&str>, numeric: bool) -> Order
     }
 }
 
-fn quote_tsv(value: &str) -> String {
-    if value.contains('\t') || value.contains('\n') || value.contains('\r') || value.contains('"') {
+fn quote_tsv(value: &str, force: bool) -> String {
+    if force || value.contains('\t') || value.contains('\n') || value.contains('\r') || value.contains('"') {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         value.to_owned()
     }
 }
 
+/// 列宽跟着列名保留，翻页或重新读取时不会回到默认宽度。
+fn merge_widths(previous: &[GridColumn], mut columns: Vec<GridColumn>) -> Vec<GridColumn> {
+    for column in &mut columns {
+        if let Some(width) = previous.iter().find(|item| item.name == column.name).map(|item| item.width) {
+            column.width = width;
+        }
+    }
+    columns
+}
+
+fn domain_column(column: &GridColumn) -> Column {
+    Column {
+        name: column.name.clone(),
+        type_name: column.type_name.clone(),
+        nullable: column.nullable,
+        primary: column.primary,
+        unique: column.unique,
+        auto: column.auto,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn overlay(row: usize, row_id: String, column: usize, value: Option<String>, gate: Gate, message: String, change_id: Option<String>, kind: &'static str) -> Overlay {
-    Overlay { row, row_id, column, value, gate, message, change_id, kind }
+fn overlay(
+    row: usize,
+    row_id: String,
+    column: usize,
+    column_name: String,
+    value: Option<String>,
+    gate: Gate,
+    message: String,
+    change_id: Option<String>,
+    kind: &'static str,
+) -> Overlay {
+    Overlay { row, row_id, column, column_name, value, gate, message, change_id, kind }
 }
 
 fn cell_of(value: Option<String>) -> Cell {
@@ -1454,10 +1772,16 @@ mod tests {
             Some(schema_from_parts("sqlite", "", "notes", "table", vec![column_of("label", "text", false), column_of("note", "text", false)], Vec::new()).unwrap()),
         );
         assert!(grid.row_unlocated(0));
+        // 语义变化：无法定位的行不再把输入值画成“已修改”，而是拒绝暂存并给出原因。
         assert_eq!(grid.stage_text(0, 1, Some("改".into())), Gate::Unlocated);
-        assert_eq!(grid.cell_label(0, 1), "改");
-        assert!(grid.rejected_visible());
+        assert_eq!(grid.cell_label(0, 1), "NULL");
+        assert!(!grid.uncommitted(), "无法定位的编辑不应把网格标成未提交");
+        assert_eq!(grid.gate_text(Gate::Unlocated), i18n::text(Locale::ZhCn, "grid.status.unlocated"));
+        assert!(!grid.gate_text(Gate::Unlocated).is_empty());
         assert!(grid.confirm_request().is_err());
+        // 复制仍然可用，且拿到的是数据库里的真实值。
+        grid.select(0, 1, false);
+        assert_eq!(grid.tsv(), "NULL");
     }
 
     #[test]
@@ -1526,6 +1850,179 @@ mod tests {
         assert_eq!(bad.cell_label(0, 1), "zz");
         assert_eq!(bad.gate_at(0, 1), Some(Gate::Validation));
         assert!(bad.confirm_request().is_err());
+    }
+
+    #[test]
+    fn display_targets_follow_row_ids_across_sort_filter_page_and_append() {
+        let mut grid = SharedGrid::new();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("10", vec![Some("10"), Some("甲")], true), row("11", vec![Some("11"), Some("乙")], true), row("12", vec![Some("12"), Some("丙")], true)],
+            Some(3),
+            Some(schema()),
+        );
+        grid.set_viewport(2);
+        grid.select(1, 1, false);
+        assert_eq!(grid.focused_row_id(), Some("11"));
+
+        // 排序后焦点行号变了，但身份和查看目标不变。
+        grid.set_sort("id", true);
+        assert_eq!(grid.cell_label(0, 0), "12");
+        assert_eq!(grid.focused_row_id(), Some("11"));
+        let (display_row, column) = grid.focus_cell().expect("focus");
+        assert_eq!(grid.row_id(display_row), Some("11"));
+        assert_eq!(grid.cell_label(display_row, column), "乙");
+
+        // 编辑目标由显示行号解析成行 id：降序显示第 0 行是 id 12，不是旧的焦点行。
+        assert_eq!(grid.stage_text(0, 1, Some("改".into())), Gate::Writable);
+        let sql = grid.open_preview().unwrap();
+        assert!(sql[0].contains("\"id\" = 12"), "{sql:?}");
+        assert!(!sql[0].contains("\"id\" = 11"), "{sql:?}");
+        assert_eq!(grid.confirm_request().unwrap().changes[0].locator[0].value.as_deref(), Some("12"));
+
+        // 完整值查看同样按行 id，重新排序后仍读同一行。
+        grid.open_value(display_row, column);
+        grid.set_sort("id", false);
+        assert_eq!(grid.viewer().map(|shown| shown.label), Some("乙".to_owned()), "完整值查看应跟随行 id");
+
+        // 筛选把焦点行排除后选择清空，而不是落到另一行。
+        let mut filtered = SharedGrid::new();
+        filtered.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("10", vec![Some("10"), Some("甲")], true), row("11", vec![Some("11"), Some("乙")], true)],
+            Some(2),
+            Some(schema()),
+        );
+        filtered.select(1, 1, false);
+        filtered.set_filter("name", "eq", "甲");
+        assert_eq!(filtered.loaded_len(), 1);
+        assert!(filtered.focused_row_id().is_none());
+        assert!(filtered.focus_cell().is_none());
+        filtered.clear_filters();
+        assert_eq!(filtered.loaded_len(), 2);
+        filtered.select(1, 1, false);
+        filtered.set_filter("name", "eq", "乙");
+        assert_eq!(filtered.focused_row_id(), Some("11"), "筛掉其他行后焦点仍指向同一行");
+        assert_eq!(filtered.focus_cell().map(|(row, _)| row), Some(0));
+
+        // 追加读取不动选择，翻页替换窗口后暂存仍按原行 id 预览和提交。
+        let mut paged = SharedGrid::new();
+        paged.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("20", vec![Some("20"), Some("甲")], true), row("21", vec![Some("21"), Some("乙")], true)],
+            Some(4),
+            Some(schema()),
+        );
+        paged.set_viewport(2);
+        paged.set_column_width(1, 320.0);
+        paged.select(0, 1, false);
+        assert_eq!(paged.stage_text(0, 1, Some("改".into())), Gate::Writable);
+        let columns = vec![text_column("id"), text_column("name")];
+        paged.append_page(
+            vec![row("30", vec![Some("30"), Some("丙")], true), row("31", vec![Some("31"), Some("丁")], true)],
+            Some(4),
+            false,
+        );
+        assert_eq!(paged.loaded_len(), 4);
+        assert_eq!(paged.focused_row_id(), Some("20"), "追加读取后选择仍指向原来那一行");
+        paged.replace_fetched(
+            columns,
+            vec![row("40", vec![Some("40"), Some("戊")], true), row("41", vec![Some("41"), Some("己")], true)],
+            2,
+            Some(4),
+            true,
+            Some(schema()),
+        );
+        assert_eq!(paged.cell_label(0, 0), "40");
+        assert!(paged.uncommitted(), "翻页不应丢掉上一页的暂存");
+        assert_eq!(paged.column_width(1), 320.0, "列宽按列名在翻页后保留");
+        let sql = paged.open_preview().unwrap();
+        assert!(sql[0].contains("\"id\" = 20"), "{sql:?}");
+        assert_eq!(paged.confirm_request().unwrap().changes[0].locator[0].value.as_deref(), Some("20"));
+    }
+
+    #[test]
+    fn explicit_null_and_text_null_stay_apart_in_preview_and_copy() {
+        let mut grid = SharedGrid::new();
+        grid.target.engine = "sqlite".into();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some("NULL")], true), row("2", vec![Some("2"), None], true)],
+            Some(2),
+            Some(schema()),
+        );
+        // 字符串 "NULL" 改成数据库 NULL；数据库 NULL 改成字符串 "NULL"。
+        assert_eq!(grid.stage_text(0, 1, None), Gate::Writable);
+        assert_eq!(grid.stage_text(1, 1, Some("NULL".into())), Gate::Writable);
+        let sql = grid.open_preview().unwrap();
+        assert_eq!(sql.len(), 2);
+        assert!(sql[0].contains("= NULL"), "{sql:?}");
+        assert!(!sql[0].contains("'NULL'"), "{sql:?}");
+        assert!(sql[1].contains("'NULL'"), "{sql:?}");
+        assert!(!sql[1].contains("= NULL"), "{sql:?}");
+        assert_eq!(grid.cell_label(0, 1), "NULL");
+        assert_eq!(grid.show_cell(0, 1, false).kind, CellKind::Null);
+        assert_eq!(grid.show_cell(1, 1, false).kind, CellKind::Text);
+
+        // 复制时 NULL、字符串 "NULL" 和空字符串三种写法可区分。
+        let mut copy = SharedGrid::new();
+        copy.target.engine = "sqlite".into();
+        copy.load_local(
+            vec![text_column("name")],
+            vec![
+                GridRow { id: "a".into(), values: vec![Some("NULL".into())], located: false, locator: Vec::new(), inserted: false },
+                GridRow { id: "b".into(), values: vec![None], located: false, locator: Vec::new(), inserted: false },
+                GridRow { id: "c".into(), values: vec![Some(String::new())], located: false, locator: Vec::new(), inserted: false },
+            ],
+            Some(3),
+            None,
+        );
+        copy.select_all_loaded();
+        // split 保留末尾空字段，证明空字符串和 NULL 不会在最后一行被混同。
+        assert_eq!(copy.tsv().split('\n').collect::<Vec<_>>(), vec!["\"NULL\"", "NULL", ""]);
+        assert_eq!(copy.sql_values().split('\n').collect::<Vec<_>>(), vec!["'NULL'", "NULL", "''"]);
+    }
+
+    #[test]
+    fn exchange_and_export_never_see_staged_rows_or_values() {
+        let mut grid = SharedGrid::new();
+        grid.target.connection_id = "notes".into();
+        grid.target.table = "customers".into();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some("甲")], true)],
+            Some(1),
+            Some(schema()),
+        );
+        assert_eq!(grid.stage_text(0, 1, Some("改".into())), Gate::Writable);
+        assert_eq!(grid.stage_insert(), Gate::Writable);
+        let (table, columns, rows, _) = grid.exchange_sheet();
+        assert!(table.is_some());
+        assert_eq!(columns, vec!["id".to_owned(), "name".to_owned()]);
+        assert_eq!(rows.len(), 1, "未提交的新增行不能进入交换或导出");
+        assert_eq!(rows[0][1].as_deref(), Some("甲"), "未提交的修改不能进入交换或导出");
+    }
+
+    #[test]
+    fn multi_cell_selection_copies_the_same_rectangle_after_scrolling() {
+        let mut grid = SharedGrid::new();
+        let rows = (0..50)
+            .map(|index| row(&index.to_string(), vec![Some(&index.to_string()), Some(if index % 2 == 0 { "偶" } else { "奇" })], true))
+            .collect();
+        grid.load_local(vec![text_column("id"), text_column("name")], rows, Some(50), Some(schema()));
+        grid.set_viewport(5);
+        grid.select(2, 0, false);
+        grid.move_key("down", true);
+        grid.move_key("right", true);
+        assert_eq!(grid.selection_count(), 4);
+        let before = grid.tsv();
+        assert_eq!(before.lines().count(), 2);
+        assert!(before.lines().all(|line| line.split('\t').count() == 2));
+        grid.scroll_to(40);
+        assert_eq!(grid.tsv(), before, "虚拟滚动只改变呈现，不改变选择");
+        grid.set_column_width(0, 260.0);
+        grid.scroll_to(0);
+        assert_eq!(grid.column_width(0), 260.0);
     }
 
     #[test]
@@ -1703,15 +2200,25 @@ mod tests {
         assert!(committed.failed.is_none(), "{}", committed.failed.as_ref().map(|item| item.message.clone()).unwrap_or_default());
         grid.apply_commit(&committed);
         assert!(!grid.uncommitted());
+        // 提交成功后显示的是新值，而不是暂存移除后回退到旧值。
+        assert_eq!(grid.cell_label(0, 1), "乙");
         assert_eq!(names(&database).await, vec![(1, "乙".into())]);
 
         let mut query = SharedGrid::new();
         query.target.engine = "sqlite".into();
         query.target.connection_id = "notes".into();
         query.show_query_sheet("select * from customers join people", vec!["name".into()], vec![vec![Some("乙".into())]]);
+        // 语义变化：只读结果的写尝试被拒绝并说明原因，格子继续显示数据库里的原值。
         assert_eq!(query.stage_text(0, 0, Some("改".into())), Gate::Readonly);
-        assert_eq!(query.cell_label(0, 0), "改");
+        assert_eq!(query.cell_label(0, 0), "乙");
+        assert!(!query.uncommitted());
+        assert_eq!(query.gate_text(Gate::Readonly), i18n::text(Locale::ZhCn, "grid.status.readonly"));
         assert!(query.confirm_request().is_err());
+        // 只读时仍可选择、复制和查看完整值。
+        query.select(0, 0, false);
+        assert_eq!(query.tsv(), "乙");
+        query.open_value(0, 0);
+        assert_eq!(query.viewer().map(|shown| shown.label), Some("乙".to_owned()));
         assert_eq!(names(&database).await, vec![(1, "乙".into())]);
 
         let loose_ref = crate::grid::commands::TableRef {
@@ -1734,7 +2241,9 @@ mod tests {
         loose.target.table = "loose".into();
         loose.replace_fetched(columns_from_schema(&loose_schema, true), rows_from_page(&columns_from_schema(&loose_schema, true), &loose_page), 0, Some(1), false, Some(loose_schema));
         assert_eq!(loose.stage_text(0, 0, Some("改".into())), Gate::Unlocated);
-        assert_eq!(loose.cell_label(0, 0), "改");
+        assert_eq!(loose.cell_label(0, 0), "原");
+        assert!(!loose.uncommitted());
+        assert_eq!(loose.gate_text(Gate::Unlocated), i18n::text(Locale::ZhCn, "grid.status.unlocated"));
         assert!(loose.confirm_request().is_err());
 
         let people = crate::grid::commands::TableRef {
@@ -1803,6 +2312,73 @@ mod tests {
         pool.close().await;
         assert_eq!(email, "b@x");
         let _ = before;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sqlite_writes_database_null_and_the_text_null_separately() {
+        let dir = temp_dir("marks");
+        let database = dir.join("marks.sqlite");
+        let setup = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE marks (id INTEGER PRIMARY KEY, note TEXT)").execute(&setup).await.unwrap();
+        sqlx::query("INSERT INTO marks (id, note) VALUES (1, 'NULL'), (2, NULL)").execute(&setup).await.unwrap();
+        setup.close().await;
+        let service = std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")));
+        service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+        let table = crate::grid::commands::TableRef {
+            connection_id: "notes".into(),
+            database: "main".into(),
+            schema: String::new(),
+            table: "marks".into(),
+            engine: "sqlite".into(),
+            include_foreign_keys: false,
+        };
+        let schema = schema_from_dto(&crate::application::grid::describe(&service, &table).await.unwrap()).unwrap();
+        let page = crate::application::grid::page(
+            &service,
+            &crate::grid::commands::PageRequest { table, filters: Vec::new(), sort: None, offset: 0, limit: 10, search: None },
+        )
+        .await
+        .unwrap();
+        let columns = columns_from_schema(&schema, true);
+        let mut grid = SharedGrid::new();
+        grid.target = GridTarget {
+            connection_id: "notes".into(),
+            connection_name: "笔记".into(),
+            database: "main".into(),
+            schema: String::new(),
+            table: "marks".into(),
+            engine: "sqlite".into(),
+            environment: "dev".into(),
+        };
+        grid.load_local(columns_from_schema(&schema, true), rows_from_page(&columns, &page), Some(2), Some(schema));
+        let first = grid.rows.iter().position(|row| row.values.first().and_then(|value| value.as_deref()) == Some("1")).expect("row 1");
+        let second = grid.rows.iter().position(|row| row.values.first().and_then(|value| value.as_deref()) == Some("2")).expect("row 2");
+        // 字符串 "NULL" 显式改成数据库 NULL；数据库 NULL 改成同样的字符串 "NULL"。
+        assert_eq!(grid.stage_text(first, 1, None), Gate::Writable);
+        assert_eq!(grid.stage_text(second, 1, Some("NULL".into())), Gate::Writable);
+        let sql = grid.open_preview().unwrap();
+        assert!(sql.iter().any(|item| item.contains("= NULL") && !item.contains("'NULL'")), "{sql:?}");
+        assert!(sql.iter().any(|item| item.contains("= 'NULL'")), "{sql:?}");
+        let report = crate::application::grid::commit(&service, &grid.confirm_request().unwrap(), true).await.unwrap();
+        assert!(report.failed.is_none(), "{}", report.failed.as_ref().map(|item| item.message.clone()).unwrap_or_default());
+        grid.apply_commit(&report);
+        assert_eq!(grid.show_cell(first, 1, false).kind, CellKind::Null);
+        assert_eq!(grid.show_cell(second, 1, false).kind, CellKind::Text);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).read_only(true))
+            .await
+            .unwrap();
+        let first_is_null: i64 = sqlx::query_scalar("SELECT note IS NULL FROM marks WHERE id = 1").fetch_one(&pool).await.unwrap();
+        let second_value: Option<String> = sqlx::query_scalar("SELECT note FROM marks WHERE id = 2").fetch_one(&pool).await.unwrap();
+        pool.close().await;
+        assert_eq!(first_is_null, 1, "第一行应写入数据库 NULL");
+        assert_eq!(second_value.as_deref(), Some("NULL"), "第二行应写入字符串 NULL");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

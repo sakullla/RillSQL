@@ -1086,6 +1086,7 @@ fn grid_surface_command(id: &str) -> bool {
         id,
         "edit-cell"
             | "cancel-edit"
+            | "grid-set-null"
             | "mark-delete"
             | "commit"
             | "copy-region"

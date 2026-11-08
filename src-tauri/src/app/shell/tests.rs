@@ -1122,6 +1122,45 @@ fn object_tree_opens_the_table_and_structure_and_commits_through_the_shared_grid
 }
 
 #[gpui_kit::test]
+fn explicit_null_and_copy_go_through_the_shared_shell_grid(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-null-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update_window(window, |_, window, cx| {
+        // 先让表项完成一次绑定，随后的 sample 暂存才不会被重新打开表时清掉。
+        view.update(cx, |view, cx| view.perform("open-table:notes|笔记|main||customers|sqlite|dev", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.mark_table_dirty(cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.model.tool, WorkTool::Table);
+            assert_eq!(view.table_cell(0, 1, cx), "乙");
+            view.perform("copy-region", cx);
+            assert_eq!(view.model.copied, "乙");
+            // 显式 NULL 不走特殊文本：命令直接把这一格 stage 成数据库 NULL。
+            view.perform("grid-set-null", cx);
+            assert_eq!(view.table_cell(0, 1, cx), "NULL");
+            assert!(view.table_uncommitted(cx));
+            view.perform("copy-region", cx);
+            assert_eq!(view.model.copied, "NULL");
+            view.perform("commit", cx);
+            let (open, sql) = view.table_preview(cx);
+            assert!(open, "显式 NULL 也要经过预览");
+            assert!(sql.contains("= NULL"), "{sql}");
+            assert!(!sql.contains("'NULL'"), "字符串 NULL 才能写成 'NULL'：{sql}");
+        });
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui_kit::test]
 fn staged_table_survives_switching_to_structure_and_back(cx: &mut gpui_kit::TestAppContext) {
     cx.executor().allow_parking();
     let dir = std::env::temp_dir().join(format!("rillsql-shell-stage-{}", uuid::Uuid::new_v4()));
