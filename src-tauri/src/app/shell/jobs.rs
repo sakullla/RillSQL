@@ -71,7 +71,7 @@ pub fn job_request(model: &WorkbenchModel, job: PendingJob, token: TaskToken) ->
 }
 
 fn save_request(model: &WorkbenchModel) -> Option<SaveRequest> {
-    let tab = model.active_tab()?;
+    let tab = model.active_tab().filter(|tab| tab.kind.is_query())?;
     let name = model.history.save_name.trim();
     if name.is_empty() || tab.draft.trim().is_empty() {
         return None;

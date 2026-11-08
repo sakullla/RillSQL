@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 
 use super::atomic::{stage, write_atomic_thread};
-use super::document::{shell_from_legacy, APP_STATE_VERSION};
+use super::document::{parse_stored, shell_from_legacy, to_bytes, AppState, SessionState, SessionTab, ShellSettings, APP_STATE_VERSION};
 use super::legacy::{encode_utf16_le, Platform};
 use super::{read_connection_export, read_connections, read_env_tags, read_history, read_secret, StateStore};
 use crate::connections::model::{password_account, ssh_password_account};
@@ -254,6 +254,51 @@ async fn atomic_write_uses_another_thread_and_abort_keeps_the_old_file() {
     let names: Vec<_> = fs::read_dir(&dir).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect();
     assert!(names.iter().all(|name| !name.contains(".tmp")), "{names:?}");
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_work_item_spec_round_trips_and_old_state_without_it_still_parses() {
+    let spec = "notes|笔记|main||customers|sqlite|dev";
+    let mut state = AppState::new(ShellSettings::default(), SessionState::default());
+    state.session.active_id = Some("table-1".into());
+    state.session.tabs.push(SessionTab {
+        id: "table-1".into(),
+        title: "customers".into(),
+        kind: "table".into(),
+        spec: Some(spec.into()),
+        draft: String::new(),
+        connection_id: Some("notes".into()),
+        connection_name: Some("笔记".into()),
+        database: Some("main".into()),
+        engine: Some("sqlite".into()),
+        connection_status: None,
+        target_text: None,
+        target_notice: None,
+        path: None,
+        last_executed_sql: None,
+        table_pane: None,
+        structure_section: None,
+        definition: None,
+        diagram_schema: None,
+        redis_key: None,
+        doc_database: None,
+        doc_collection: None,
+        admin_schema: None,
+        title_key: None,
+    });
+    let bytes = to_bytes(&state).unwrap();
+    let parsed = parse_stored(&bytes).unwrap();
+    assert_eq!(parsed.session.tabs[0].spec.as_deref(), Some(spec));
+
+    // 旧版本写出的 app-state.json 没有 spec 字段，仍应按无目标读取而不是判为损坏。
+    let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+    for tab in value["session"]["tabs"].as_array_mut().unwrap() {
+        tab.as_object_mut().unwrap().remove("spec");
+    }
+    let old = serde_json::to_vec(&value).unwrap();
+    let parsed = parse_stored(&old).unwrap();
+    assert_eq!(parsed.session.tabs[0].spec, None);
+    assert_eq!(parsed.session.tabs[0].kind, "table");
 }
 
 #[test]

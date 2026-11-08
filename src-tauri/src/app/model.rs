@@ -147,6 +147,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     Shortcut { id: "close-tab", group: "global", chord: "Mod+W", label_key: "shell.shortcuts.closeTab" },
     Shortcut { id: "toggle-sidebar", group: "global", chord: "Mod+B", label_key: "shell.shortcuts.toggleSidebar" },
     Shortcut { id: "next-tab", group: "global", chord: "Ctrl+Tab", label_key: "shell.shortcuts.nextTab" },
+    Shortcut { id: "prev-tab", group: "global", chord: "Ctrl+Shift+Tab", label_key: "shell.shortcuts.prevTab" },
     Shortcut { id: "nth-tab", group: "global", chord: "Alt+1…9", label_key: "shell.shortcuts.nthTab" },
     Shortcut { id: "open-settings", group: "global", chord: "Mod+,", label_key: "shell.shortcuts.openSettings" },
     Shortcut { id: "shortcut-help", group: "global", chord: "?", label_key: "shell.shortcuts.shortcutHelp" },
@@ -400,6 +401,7 @@ impl Shell {
                 self.tab_index = self.tab_index.wrapping_add(1);
                 Effect::None
             }
+            "prev-tab" => Effect::None,
             "nth-tab" => Effect::None,
             "request-cancel" => {
                 self.cancel_requests += 1;
@@ -522,6 +524,7 @@ fn zh(key: &str) -> Option<&'static str> {
         "shell.shortcuts.closeTab" => "关闭当前标签",
         "shell.shortcuts.toggleSidebar" => "显示 / 隐藏资源管理器",
         "shell.shortcuts.nextTab" => "切换到下一个标签",
+        "shell.shortcuts.prevTab" => "切换到上一个标签",
         "shell.shortcuts.nthTab" => "切换到第 N 个标签",
         "shell.shortcuts.openSettings" => "设置",
         "shell.shortcuts.shortcutHelp" => "快捷键帮助",
@@ -593,6 +596,7 @@ fn en(key: &str) -> Option<&'static str> {
         "shell.shortcuts.closeTab" => "Close current tab",
         "shell.shortcuts.toggleSidebar" => "Show / hide the explorer",
         "shell.shortcuts.nextTab" => "Switch to next tab",
+        "shell.shortcuts.prevTab" => "Switch to previous tab",
         "shell.shortcuts.nthTab" => "Switch to tab N",
         "shell.shortcuts.openSettings" => "Settings",
         "shell.shortcuts.shortcutHelp" => "Shortcut help",

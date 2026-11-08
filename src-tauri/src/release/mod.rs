@@ -421,7 +421,7 @@ fn contains_text(haystack: &[u8], text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::shell::WorkbenchModel;
+    use crate::app::shell::{WorkItemKind, WorkbenchModel};
     use crate::app::Shell;
     use base64::Engine;
     use std::io::Cursor;
@@ -548,7 +548,7 @@ mod tests {
         assert!(model.dispatch("new-query").is_some());
         model.tabs[0].draft = "select 1".into();
         model.tabs[0].last_executed_sql = None;
-        model.tabs[0].kind = "query".into();
+        model.tabs[0].kind = WorkItemKind::Query;
         let error = apply_verified_update(&mut app, model.facts(), &keys.public_b64, &manifest, "windows-x86_64", bytes, |_| Ok(())).unwrap_err();
         assert!(matches!(error, UpdateError::Blocked(_)), "{error}");
         assert_eq!(app.version, PRODUCT_VERSION);

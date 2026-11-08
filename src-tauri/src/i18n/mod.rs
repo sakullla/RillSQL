@@ -97,6 +97,7 @@ dict! {
     "shell.shortcuts.closeTab" => "关闭当前标签", "Close current tab";
     "shell.shortcuts.toggleSidebar" => "显示 / 隐藏资源管理器", "Show / hide the explorer";
     "shell.shortcuts.nextTab" => "切换到下一个标签", "Switch to next tab";
+    "shell.shortcuts.prevTab" => "切换到上一个标签", "Switch to previous tab";
     "shell.shortcuts.nthTab" => "切换到第 N 个标签", "Switch to tab N";
     "shell.shortcuts.openSettings" => "设置", "Settings";
     "shell.shortcuts.shortcutHelp" => "快捷键帮助", "Shortcut help";

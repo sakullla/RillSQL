@@ -19,7 +19,7 @@ use crate::connections::model::{CaMode, Engine, SshAuthKind, TlsMode};
 use crate::i18n;
 use crate::ui::kit::{self, FieldSpec, Palette, Tip as _};
 
-use super::model::{DraftField, WorkTool};
+use super::model::{DraftField, WorkItemKind, WorkTool};
 use super::view::Workbench;
 
 const TOPBAR_H: f32 = 44.;
@@ -599,29 +599,67 @@ impl Workbench {
             .flex()
             .flex_col()
             .size_full()
-            .when(!welcome || !self.model.tabs.is_empty(), |this| this.child(self.tab_strip(tool_view, cx)))
+            .when(!welcome || !self.model.tabs.is_empty(), |this| this.child(self.tab_strip(cx)))
             .child(div().flex_1().min_h(px(0.)).flex().flex_col().child(body))
             .into_any_element()
     }
 
-    fn tool_title(&self) -> (IconName, String) {
-        let page = self.model.shell.page;
-        let spec_name = |spec: &Option<String>, index: usize| spec.as_deref().and_then(|spec| spec.split('|').nth(index)).unwrap_or("").to_owned();
-        match (page, self.model.tool) {
-            (AppPage::Compare, _) => (IconName::GitCompare, self.model.text("shell.command.compare")),
-            (AppPage::Diagram, _) => (IconName::Workflow, self.model.text("catalog.tree.diagram")),
-            (AppPage::Structure, WorkTool::Admin) => (IconName::Gauge, self.model.text("ui.tool.admin")),
-            (AppPage::Structure, _) => (IconName::Columns3, spec_name(&self.model.table_spec, 4)),
-            (_, WorkTool::Table) => (IconName::Table, spec_name(&self.model.table_spec, 4)),
-            (_, WorkTool::Redis) => (IconName::Key, spec_name(&self.model.redis_spec, 1)),
-            (_, WorkTool::Mongo) => (IconName::Braces, spec_name(&self.model.mongo_spec, 1)),
-            _ => (IconName::Code, String::new()),
-        }
-    }
-
-    fn tab_strip(&mut self, tool_view: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
-        let mut row = div()
+        // 标签列表独立滚动，新建与当前标签入口始终留在右侧，不被溢出的标签挤走。
+        let mut list = div()
+            .id("tab-list")
+            .flex()
+            .items_end()
+            .flex_1()
+            .min_w(px(0.))
+            .overflow_x_scroll();
+        for tab in self.model.tabs.clone() {
+            let active = self.model.active_tab.as_deref() == Some(tab.id.as_str());
+            let dirty = tab.uncommitted_cells;
+            let title = SharedString::from(tab.title.clone());
+            let id = tab.id.clone();
+            let close_id = tab.id.clone();
+            let menu_id = tab.id.clone();
+            let middle_id = tab.id.clone();
+            let chip = tab_chip(
+                SharedString::from(format!("tab-{id}")),
+                item_icon(tab.kind),
+                title,
+                active,
+                dirty,
+                tab.running,
+                &p,
+            )
+            .child(
+                kit::icon_button(SharedString::from(format!("tab-close-{id}")), IconName::X, self.t("common.close"), cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.model.request_close_tab(&close_id);
+                    this.persist_if_needed();
+                    cx.notify();
+                }))
+                .xsmall(),
+            )
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.menu_at = event.position;
+                this.model.active_tab = Some(menu_id.clone());
+                this.perform("menu-tab", cx);
+            }))
+            .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                this.model.request_close_tab(&middle_id);
+                this.persist_if_needed();
+                cx.notify();
+            }))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.model.activate_item(&id);
+                if this.model.tool == WorkTool::Query {
+                    this.query.update(cx, |pane, _| pane.request_focus());
+                }
+                this.persist_if_needed();
+                cx.notify();
+            }));
+            list = list.child(chip);
+        }
+        div()
             .id("tabs")
             .role(gpui_kit::Role::TabList)
             .aria_label(self.t("shell.tabs.tablist"))
@@ -632,57 +670,17 @@ impl Workbench {
             .bg(p.chrome)
             .border_b_1()
             .border_color(p.line)
-            .overflow_x_scroll();
-        if tool_view {
-            let (icon, title) = self.tool_title();
-            row = row.child(tab_chip("tab-tool", icon, SharedString::from(title), true, false, false, &p).child(
-                kit::icon_button("tab-tool-close", IconName::X, self.t("common.close"), cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.model.tool = WorkTool::Query;
-                    this.model.shell.page = AppPage::Workspace;
-                    cx.notify();
-                }))
-                .xsmall(),
-            ));
-        }
-        for tab in self.model.tabs.clone() {
-            let active = !tool_view && self.model.active_tab.as_deref() == Some(tab.id.as_str());
-            let dirty = tab.uncommitted_cells;
-            let title = SharedString::from(tab.title.clone());
-            let id = tab.id.clone();
-            let close_id = tab.id.clone();
-            let menu_id = tab.id.clone();
-            let chip = tab_chip(SharedString::from(format!("tab-{id}")), IconName::Code, title, active, dirty, tab.running, &p)
-                .child(
-                    kit::icon_button(SharedString::from(format!("tab-close-{id}")), IconName::X, self.t("common.close"), cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.model.request_close_tab(&close_id);
-                        this.persist_if_needed();
-                        cx.notify();
-                    }))
-                    .xsmall(),
-                )
-                .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.menu_at = event.position;
-                    this.model.active_tab = Some(menu_id.clone());
-                    this.perform("menu-tab", cx);
-                }))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.model.active_tab = Some(id.clone());
-                    this.model.tool = WorkTool::Query;
-                    this.model.shell.page = AppPage::Workspace;
-                    this.query.update(cx, |pane, _| pane.request_focus());
-                    cx.notify();
-                }));
-            row = row.child(chip);
-        }
-        row = row.child(
-            div()
-                .h_full()
-                .flex()
-                .items_center()
-                .px(px(6.))
-                .child(kit::icon_button("tab-new", IconName::Plus, self.t("shell.command.newQuery"), act("new-query", cx)).xsmall()),
-        );
-        row.into_any_element()
+            .child(list)
+            .child(
+                div()
+                    .h_full()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .px(px(6.))
+                    .child(kit::icon_button("tab-new", IconName::Plus, self.t("shell.command.newQuery"), act("new-query", cx)).xsmall()),
+            )
+            .into_any_element()
     }
 
     // ------------------------------------------------------------ 状态栏
@@ -1545,7 +1543,7 @@ impl Workbench {
             }
         }
 
-        let can_save = self.model.active_tab().is_some();
+        let can_save = self.model.active_tab().is_some_and(|tab| tab.kind.is_query());
         let toolbar = div()
             .flex()
             .flex_wrap()
@@ -2073,6 +2071,17 @@ fn rail_item(id: &'static str, icon: IconName, label: SharedString, active: bool
         .when(active, |this| this.child(div().absolute().left(px(-7.)).top(px(9.)).w(px(3.)).h(px(20.)).rounded(px(2.)).bg(accent)))
         .on_click(act(id, cx))
         .into_any_element()
+}
+
+fn item_icon(kind: WorkItemKind) -> IconName {
+    match kind {
+        WorkItemKind::Query => IconName::Code,
+        WorkItemKind::Table => IconName::Table,
+        WorkItemKind::Structure => IconName::Columns3,
+        WorkItemKind::Admin => IconName::Gauge,
+        WorkItemKind::Redis => IconName::Key,
+        WorkItemKind::Mongo => IconName::Braces,
+    }
 }
 
 fn tab_chip(id: impl Into<SharedString>, icon: IconName, title: SharedString, active: bool, dirty: bool, running: bool, p: &Palette) -> gpui_kit::Stateful<gpui_kit::Div> {

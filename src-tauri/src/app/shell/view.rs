@@ -321,6 +321,7 @@ impl Workbench {
         self.model
             .tabs
             .iter()
+            .filter(|tab| tab.kind.is_query())
             .map(|tab| TabSnap {
                 id: tab.id.clone(),
                 draft: tab.draft.clone(),
@@ -399,9 +400,12 @@ impl Workbench {
         self.model.grid_dirty = dirty;
         self.model.grid_writable = writable;
         if dirty {
+            let table_item = self.model.tool == WorkTool::Table;
             if let Some(id) = self.model.active_tab.clone() {
                 if let Some(tab) = self.model.tabs.iter_mut().find(|tab| tab.id == id) {
-                    tab.uncommitted_cells = true;
+                    if table_item == (tab.kind == crate::app::shell::model::WorkItemKind::Table) {
+                        tab.uncommitted_cells = true;
+                    }
                 }
             }
         } else {

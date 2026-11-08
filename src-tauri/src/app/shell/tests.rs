@@ -14,7 +14,7 @@ use crate::i18n;
 use crate::query::SaveRequest;
 use crate::state::{AppState, SessionState, ShellSettings};
 
-use super::model::{DraftField, PendingJob, WorkTool, WorkbenchModel};
+use super::model::{DraftField, PendingJob, WorkItemKind, WorkTool, WorkbenchModel};
 use crate::app::Shell;
 use gpui_kit::AppContext as _;
 use gpui_kit::test::TestWindowExt;
@@ -26,6 +26,11 @@ fn services_at(dir: &std::path::Path) -> Arc<AppServices> {
 fn request_of(model: &mut WorkbenchModel, token: crate::application::tasks::TaskToken) -> jobs::JobRequest {
     let job = model.take_pending().expect("pending");
     job_request(model, job, token)
+}
+
+/// 表 / 结构 / 专用页面也会占用工作项，查询项不一定在索引 0。
+fn query_item(model: &mut WorkbenchModel) -> &mut super::model::WorkItem {
+    model.tabs.iter_mut().find(|tab| tab.kind.is_query()).expect("query item")
 }
 
 #[test]
@@ -159,9 +164,10 @@ fn redis_and_mongo_running_block_before_uncommitted_grid_or_query_draft() {
     model.redis_running = true;
     model.grid_dirty = true;
     assert!(model.dispatch("new-query").is_some());
-    model.tabs[0].draft = "select 1".into();
-    model.tabs[0].last_executed_sql = None;
-    model.tabs[0].uncommitted_cells = false;
+    let query = query_item(&mut model);
+    query.draft = "select 1".into();
+    query.last_executed_sql = None;
+    query.uncommitted_cells = false;
     assert_eq!(evaluate(model.facts()), CloseKind::BlockedRunning);
     assert!(!model.allow_system_close());
     assert!(model.close_prompt.is_none());
@@ -176,10 +182,10 @@ fn redis_and_mongo_running_block_before_uncommitted_grid_or_query_draft() {
     model.close_prompt = None;
     assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: true, draft: true });
     model.grid_dirty = false;
-    model.tabs[0].uncommitted_cells = false;
+    query_item(&mut model).uncommitted_cells = false;
     model.close_prompt = None;
     assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: false, draft: true });
-    model.tabs[0].draft.clear();
+    query_item(&mut model).draft.clear();
     model.close_prompt = None;
     assert_eq!(evaluate(model.facts()), CloseKind::Allow);
 }
@@ -193,8 +199,9 @@ fn compare_running_blocks_before_uncommitted_grid_or_query_draft() {
     model.compare_running = true;
     model.grid_dirty = true;
     assert!(model.dispatch("new-query").is_some());
-    model.tabs[0].draft = "select 1".into();
-    model.tabs[0].last_executed_sql = None;
+    let query = query_item(&mut model);
+    query.draft = "select 1".into();
+    query.last_executed_sql = None;
     assert_eq!(evaluate(model.facts()), CloseKind::BlockedRunning);
     assert!(!model.allow_system_close());
     assert!(model.close_prompt.is_none());
@@ -202,12 +209,172 @@ fn compare_running_blocks_before_uncommitted_grid_or_query_draft() {
     model.close_prompt = None;
     assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: true, draft: true });
     model.grid_dirty = false;
-    model.tabs[0].uncommitted_cells = false;
+    query_item(&mut model).uncommitted_cells = false;
     model.close_prompt = None;
     assert_eq!(evaluate(model.facts()), CloseKind::Confirm { uncommitted: false, draft: true });
-    model.tabs[0].draft.clear();
+    query_item(&mut model).draft.clear();
     model.close_prompt = None;
     assert_eq!(evaluate(model.facts()), CloseKind::Allow);
+}
+
+#[test]
+fn opening_the_same_target_reuses_one_work_item() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    let customers = "notes|笔记|main||customers|sqlite|dev";
+    assert!(model.dispatch(&format!("open-table:{customers}")).is_some());
+    let first = model.active_tab.clone().expect("table item");
+    assert!(model.dispatch(&format!("open-table:{customers}")).is_some());
+    assert_eq!(model.tabs.len(), 1, "同一张表重复打开不应复制工作项");
+    assert_eq!(model.active_tab.as_deref(), Some(first.as_str()));
+    assert_eq!(model.tabs[0].kind, WorkItemKind::Table);
+    assert_eq!(model.tabs[0].spec.as_deref(), Some(customers));
+
+    assert!(model.dispatch("open-table:notes|笔记|main||orders|sqlite|dev").is_some());
+    assert_eq!(model.tabs.len(), 2, "不同目标应各自保留一个工作项");
+    assert_ne!(model.active_tab.as_deref(), Some(first.as_str()));
+}
+
+#[test]
+fn switching_between_table_items_keeps_each_spec_and_tool() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    let customers = "notes|笔记|main||customers|sqlite|dev";
+    let orders = "notes|笔记|main||orders|sqlite|dev";
+    assert!(model.dispatch(&format!("open-table:{customers}")).is_some());
+    let customers_id = model.active_tab.clone().expect("customers");
+    assert!(model.dispatch(&format!("open-table:{orders}")).is_some());
+    let orders_id = model.active_tab.clone().expect("orders");
+    assert_eq!(model.table_spec.as_deref(), Some(orders));
+
+    model.activate_item(&customers_id);
+    assert_eq!(model.tool, WorkTool::Table);
+    assert_eq!(model.shell.page, AppPage::Workspace);
+    assert_eq!(model.table_spec.as_deref(), Some(customers));
+    assert_eq!(model.active_tab.as_deref(), Some(customers_id.as_str()));
+    assert_eq!(model.tabs.iter().find(|tab| tab.id == orders_id).unwrap().spec.as_deref(), Some(orders));
+
+    model.activate_item(&orders_id);
+    assert_eq!(model.table_spec.as_deref(), Some(orders));
+    assert_eq!(model.tabs.iter().find(|tab| tab.id == customers_id).unwrap().spec.as_deref(), Some(customers));
+}
+
+#[test]
+fn closing_the_active_item_reactivates_a_neighbour_and_follows_its_tool() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    let customers = "notes|笔记|main||customers|sqlite|dev";
+    assert!(model.dispatch(&format!("open-table:{customers}")).is_some());
+    let table_id = model.active_tab.clone().expect("table");
+    assert!(model.dispatch(&format!("open-structure-for:{customers}")).is_some());
+    let structure_id = model.active_tab.clone().expect("structure");
+    assert_eq!(model.tool, WorkTool::Structure);
+    assert_eq!(model.shell.page, AppPage::Structure);
+
+    model.request_close_tab(&structure_id);
+    assert!(model.close_prompt.is_none(), "没有未提交内容时应直接关闭");
+    assert_eq!(model.tabs.len(), 1);
+    assert_eq!(model.active_tab.as_deref(), Some(table_id.as_str()));
+    assert_eq!(model.tool, WorkTool::Table);
+    assert_eq!(model.shell.page, AppPage::Workspace);
+    assert_eq!(model.table_spec.as_deref(), Some(customers));
+}
+
+#[test]
+fn batch_close_stops_at_an_uncommitted_item_then_resumes_or_cancels() {
+    use crate::app::shell::close::{CloseKind, CloseScope};
+    let mut model = WorkbenchModel::new(Shell::default());
+    let customers = "notes|笔记|main||customers|sqlite|dev";
+    let orders = "notes|笔记|main||orders|sqlite|dev";
+    assert!(model.dispatch("new-query").is_some());
+    let keep = model.active_tab.clone().expect("query");
+    assert!(model.dispatch(&format!("open-table:{customers}")).is_some());
+    let uncommitted = model.active_tab.clone().expect("customers");
+    assert!(model.dispatch(&format!("open-table:{orders}")).is_some());
+    model.tabs.iter_mut().find(|tab| tab.id == uncommitted).unwrap().uncommitted_cells = true;
+    model.activate_item(&keep);
+
+    assert!(model.dispatch("tab-close-others").is_some());
+    assert_eq!(model.tabs.len(), 3, "确认前不得关闭任何工作项");
+    let prompt = model.close_prompt.as_ref().expect("未提交项需要确认");
+    assert_eq!(prompt.scope, CloseScope::Tab);
+    assert!(matches!(prompt.kind, CloseKind::Confirm { uncommitted: true, draft: false }));
+    assert_eq!(prompt.tab_id.as_deref(), Some(uncommitted.as_str()));
+    assert_eq!(model.close_batch.len(), 2, "确认后还要继续关闭剩余项");
+
+    assert!(model.dispatch("close-stay").is_some());
+    assert!(model.close_prompt.is_none());
+    assert!(model.close_batch.is_empty(), "取消后不得残留待关闭队列");
+    assert_eq!(model.tabs.len(), 3, "取消后其余工作项必须保留");
+
+    assert!(model.dispatch("tab-close-others").is_some());
+    assert!(model.dispatch("close-leave").is_some());
+    assert!(model.close_prompt.is_none());
+    assert_eq!(model.tabs.len(), 1);
+    assert_eq!(model.active_tab.as_deref(), Some(keep.as_str()));
+    assert_eq!(model.tool, WorkTool::Query);
+}
+
+#[test]
+fn middle_click_close_goes_through_the_close_guard() {
+    use crate::app::shell::close::CloseKind;
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert!(model.dispatch("open-table:notes|笔记|main||customers|sqlite|dev").is_some());
+    let id = model.active_tab.clone().expect("table");
+    model.tabs[0].uncommitted_cells = true;
+    model.request_close_tab(&id);
+    assert_eq!(model.tabs.len(), 1, "有未提交修改时不得直接关闭");
+    let prompt = model.close_prompt.as_ref().expect("需要确认");
+    assert_eq!(prompt.tab_id.as_deref(), Some(id.as_str()));
+    assert!(matches!(prompt.kind, CloseKind::Confirm { uncommitted: true, draft: false }));
+    assert!(model.dispatch("close-leave").is_some());
+    assert!(model.tabs.is_empty());
+    assert!(model.close_prompt.is_none());
+    assert_eq!(model.tool, WorkTool::Query);
+}
+
+#[test]
+fn snapshot_restores_table_and_structure_items_without_running_or_uncommitted_state() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    let customers = "notes|笔记|main||customers|sqlite|dev";
+    assert!(model.dispatch(&format!("open-table:{customers}")).is_some());
+    assert!(model.dispatch(&format!("open-structure-for:{customers}")).is_some());
+    let structure_id = model.active_tab.clone().expect("structure");
+    for tab in &mut model.tabs {
+        tab.running = true;
+        tab.uncommitted_cells = true;
+    }
+    let state = model.snapshot();
+    let saved = serde_json::to_string(&state).unwrap();
+    assert!(saved.contains(&format!("\"spec\":\"{customers}\"")), "{saved}");
+    assert!(state.session.tabs.iter().any(|tab| tab.kind == "table" && tab.spec.as_deref() == Some(customers)));
+    assert!(state.session.tabs.iter().any(|tab| tab.kind == "structure" && tab.spec.as_deref() == Some(customers)));
+
+    let mut restored = WorkbenchModel::new(Shell::default());
+    restored.restore_session(&state.session);
+    assert_eq!(restored.tabs.len(), 2);
+    assert!(restored.tabs.iter().all(|tab| !tab.running && !tab.uncommitted_cells));
+    let table = restored.tabs.iter().find(|tab| tab.kind == WorkItemKind::Table).expect("table");
+    let structure = restored.tabs.iter().find(|tab| tab.kind == WorkItemKind::Structure).expect("structure");
+    assert_eq!(table.spec.as_deref(), Some(customers));
+    assert_eq!(structure.spec.as_deref(), Some(customers));
+    assert_eq!(restored.active_tab.as_deref(), Some(structure_id.as_str()));
+    assert_eq!(restored.tool, WorkTool::Structure);
+    assert_eq!(restored.shell.page, AppPage::Structure);
+    assert_eq!(restored.table_spec.as_deref(), Some(customers));
+}
+
+#[test]
+fn legacy_structure_tabs_without_a_target_are_not_restored_as_empty_items() {
+    let session: SessionState = serde_json::from_str(
+        r#"{"activeId":"definition-1","tabs":[
+            {"id":"query-1","title":"查询","kind":"query","draft":"select 1"},
+            {"id":"definition-1","title":"结构","kind":"definition","draft":""}
+        ]}"#,
+    )
+    .unwrap();
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.restore_session(&session);
+    assert_eq!(model.tabs.len(), 1, "没有目标规格的结构标签不应恢复成空壳工作项");
+    assert_eq!(model.tabs[0].kind, WorkItemKind::Query);
+    assert_eq!(model.active_tab.as_deref(), Some("query-1"));
 }
 
 #[tokio::test]

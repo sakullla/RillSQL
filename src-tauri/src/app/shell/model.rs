@@ -28,11 +28,72 @@ pub enum WorkTool {
     Mongo,
 }
 
+/// 一个可切换、可关闭、可恢复的工作项类型。持久化字符串沿用旧标签 kind，
+/// 保证已有 app-state.json 仍可读取。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WorkItemKind {
+    Query,
+    Table,
+    Structure,
+    Admin,
+    Redis,
+    Mongo,
+}
+
+impl WorkItemKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::Table => "table",
+            Self::Structure => "structure",
+            Self::Admin => "database",
+            Self::Redis => "keys",
+            Self::Mongo => "docs",
+        }
+    }
+
+    pub fn stored(text: &str) -> Option<Self> {
+        match text {
+            "query" => Some(Self::Query),
+            "table" => Some(Self::Table),
+            "structure" | "definition" => Some(Self::Structure),
+            "database" => Some(Self::Admin),
+            "keys" | "redis" => Some(Self::Redis),
+            "docs" | "mongo" => Some(Self::Mongo),
+            _ => None,
+        }
+    }
+
+    pub fn tool(self) -> WorkTool {
+        match self {
+            Self::Query => WorkTool::Query,
+            Self::Table => WorkTool::Table,
+            Self::Structure => WorkTool::Structure,
+            Self::Admin => WorkTool::Admin,
+            Self::Redis => WorkTool::Redis,
+            Self::Mongo => WorkTool::Mongo,
+        }
+    }
+
+    pub fn page(self) -> AppPage {
+        match self {
+            Self::Structure | Self::Admin => AppPage::Structure,
+            Self::Query | Self::Table | Self::Redis | Self::Mongo => AppPage::Workspace,
+        }
+    }
+
+    pub fn is_query(self) -> bool {
+        matches!(self, Self::Query)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct QueryTab {
+pub struct WorkItem {
     pub id: String,
     pub title: String,
-    pub kind: String,
+    pub kind: WorkItemKind,
+    /// 表 / 结构 / Redis / MongoDB 的目标规格；查询项为空。
+    pub spec: Option<String>,
     pub draft: String,
     pub last_executed_sql: Option<String>,
     pub uncommitted_cells: bool,
@@ -42,6 +103,26 @@ pub struct QueryTab {
     pub connection_name: Option<String>,
     pub database: Option<String>,
     pub engine: Option<String>,
+}
+
+impl WorkItem {
+    fn query(id: String, title: String, draft: String) -> Self {
+        Self {
+            id,
+            title,
+            kind: WorkItemKind::Query,
+            spec: None,
+            draft,
+            last_executed_sql: None,
+            uncommitted_cells: false,
+            cell_note: String::new(),
+            running: false,
+            connection_id: None,
+            connection_name: None,
+            database: None,
+            engine: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -99,7 +180,7 @@ pub struct ClosePrompt {
 pub struct WorkbenchModel {
     pub shell: Shell,
     pub settings: SettingsForm,
-    pub tabs: Vec<QueryTab>,
+    pub tabs: Vec<WorkItem>,
     pub active_tab: Option<String>,
     pub connections: ConnectionPage,
     pub history: HistoryPage,
@@ -107,6 +188,8 @@ pub struct WorkbenchModel {
     pub menu: Option<OpenMenu>,
     pub menu_return: FocusTarget,
     pub close_prompt: Option<ClosePrompt>,
+    /// 批量关闭（其他/右侧/全部）待处理的工作项；确认后继续，取消即停止。
+    pub close_batch: Vec<String>,
     pub release_close: bool,
     pub running_jobs: u32,
     pub viewport_width: i32,
@@ -165,6 +248,7 @@ impl WorkbenchModel {
             menu: None,
             menu_return: FocusTarget::Editor,
             close_prompt: None,
+            close_batch: Vec::new(),
             release_close: false,
             running_jobs: 0,
             viewport_width: 1360,
@@ -261,6 +345,8 @@ impl WorkbenchModel {
                 self.shell.page = AppPage::History;
             }
             "close-tab" => self.request_close_active(),
+            "next-tab" => self.cycle_item(1),
+            "prev-tab" => self.cycle_item(-1),
             "execute-query" | "run-current" | "run-selection" => self.executions += 1,
             "command-palette" | "quick-open" => {
                 self.palette_query.clear();
@@ -270,9 +356,11 @@ impl WorkbenchModel {
             "help" | "shortcut-help" => self.menu = None,
             "theme-light" | "theme-dark" | "theme-system" => self.settings.capture_shell(&self.shell),
             "open-structure" => {
-                self.tool = WorkTool::Structure;
                 if let Some(spec) = self.object_spec.clone() {
-                    self.table_spec = Some(spec);
+                    self.open_item(WorkItemKind::Structure, spec);
+                } else {
+                    self.tool = WorkTool::Structure;
+                    self.shell.page = AppPage::Structure;
                 }
             }
             _ => {}
@@ -281,30 +369,19 @@ impl WorkbenchModel {
 
     fn local(&mut self, id: &str) -> bool {
         if let Some(spec) = id.strip_prefix("open-table:") {
-            self.tool = WorkTool::Table;
-            self.shell.page = AppPage::Workspace;
-            self.shell.focus = FocusTarget::Grid;
-            self.table_spec = Some(spec.to_owned());
+            self.open_item(WorkItemKind::Table, spec.to_owned());
             return true;
         }
         if let Some(spec) = id.strip_prefix("open-structure-for:") {
-            self.tool = WorkTool::Structure;
-            self.shell.page = AppPage::Structure;
-            self.table_spec = Some(spec.to_owned());
+            self.open_item(WorkItemKind::Structure, spec.to_owned());
             return true;
         }
         if let Some(spec) = id.strip_prefix("open-redis:") {
-            self.tool = WorkTool::Redis;
-            self.shell.page = AppPage::Workspace;
-            self.shell.focus = FocusTarget::Sidebar;
-            self.redis_spec = Some(spec.to_owned());
+            self.open_item(WorkItemKind::Redis, spec.to_owned());
             return true;
         }
         if let Some(spec) = id.strip_prefix("open-mongo:") {
-            self.tool = WorkTool::Mongo;
-            self.shell.page = AppPage::Workspace;
-            self.shell.focus = FocusTarget::Sidebar;
-            self.mongo_spec = Some(spec.to_owned());
+            self.open_item(WorkItemKind::Mongo, spec.to_owned());
             return true;
         }
         if let Some(connection_id) = id.strip_prefix("connection:") {
@@ -466,8 +543,12 @@ impl WorkbenchModel {
                 self.exchange_open = !self.exchange_open;
             }
             "open-admin" => {
-                self.tool = WorkTool::Admin;
-                self.shell.page = AppPage::Structure;
+                if let Some(spec) = self.table_spec.clone().or_else(|| self.object_spec.clone()) {
+                    self.open_item(WorkItemKind::Admin, spec);
+                } else {
+                    self.tool = WorkTool::Admin;
+                    self.shell.page = AppPage::Structure;
+                }
             }
             "grid-copy-row" | "grid-copy-column" | "grid-filter-value" => {
                 self.copied = id.to_owned();
@@ -543,12 +624,9 @@ impl WorkbenchModel {
                 self.open_query_draft(sql, false);
             }
             "tree-open-data" => {
-                self.shell.page = AppPage::Workspace;
-                self.shell.focus = FocusTarget::Grid;
                 self.notice_key = Some("catalog.tree.openData");
                 if let Some(spec) = self.object_spec.clone() {
-                    self.tool = WorkTool::Table;
-                    self.table_spec = Some(spec);
+                    self.open_item(WorkItemKind::Table, spec);
                 }
             }
             _ => {}
@@ -772,7 +850,7 @@ impl WorkbenchModel {
     pub fn facts(&self) -> CloseFacts {
         let running = self.running_jobs > 0 || self.exchange_running || self.compare_running || self.redis_running || self.mongo_running || self.tabs.iter().any(|tab| tab.running);
         let uncommitted = self.grid_dirty || self.tabs.iter().any(|tab| tab.uncommitted_cells);
-        let draft = self.tabs.iter().any(|tab| draft_pending(&tab.kind, &tab.draft, tab.last_executed_sql.as_deref()));
+        let draft = self.tabs.iter().any(|tab| draft_pending(tab.kind.as_str(), &tab.draft, tab.last_executed_sql.as_deref()));
         CloseFacts { running, uncommitted, draft }
     }
 
@@ -783,7 +861,7 @@ impl WorkbenchModel {
         CloseFacts {
             running: tab.running,
             uncommitted: tab.uncommitted_cells,
-            draft: draft_pending(&tab.kind, &tab.draft, tab.last_executed_sql.as_deref()),
+            draft: draft_pending(tab.kind.as_str(), &tab.draft, tab.last_executed_sql.as_deref()),
         }
     }
 
@@ -835,6 +913,7 @@ impl WorkbenchModel {
 
     fn choose_stay(&mut self) {
         self.close_prompt = None;
+        self.close_batch.clear();
     }
 
     fn choose_leave(&mut self) {
@@ -843,6 +922,8 @@ impl WorkbenchModel {
             CloseScope::Tab => {
                 if let Some(id) = prompt.tab_id {
                     self.remove_tab(&id);
+                    self.close_batch.retain(|queued| queued != &id);
+                    self.close_next_queued();
                 }
             }
             CloseScope::Window => self.release_close = true,
@@ -850,42 +931,187 @@ impl WorkbenchModel {
     }
 
     fn remove_tab(&mut self, id: &str) {
+        let index = self.tabs.iter().position(|tab| tab.id == id);
         self.tabs.retain(|tab| tab.id != id);
-        if self.active_tab.as_deref() == Some(id) {
-            self.active_tab = self.tabs.last().map(|tab| tab.id.clone());
+        let has_target_item = self
+            .tabs
+            .iter()
+            .any(|tab| matches!(tab.kind, WorkItemKind::Table | WorkItemKind::Structure | WorkItemKind::Admin));
+        if !has_target_item {
+            // 所有目标页都已关闭，暂存不再属于任何可恢复工作项；窗口关闭不再被它阻塞。
+            self.grid_dirty = false;
+        }
+        if self.active_tab.as_deref() != Some(id) {
+            return;
+        }
+        // 桌面习惯：优先激活右侧邻居，没有则退回左侧。
+        let next = index
+            .and_then(|index| self.tabs.get(index).or_else(|| self.tabs.get(index.saturating_sub(1))))
+            .map(|tab| tab.id.clone());
+        self.active_tab = None;
+        match next {
+            Some(next) if matches!(self.shell.page, AppPage::Workspace | AppPage::Structure) => self.activate_item(&next),
+            Some(next) => self.active_tab = Some(next),
+            None => {
+                self.tool = WorkTool::Query;
+                if self.shell.page == AppPage::Structure {
+                    self.shell.page = AppPage::Workspace;
+                }
+            }
         }
     }
 
     fn close_others(&mut self) {
         let Some(id) = self.active_tab.clone() else { return };
         let others: Vec<String> = self.tabs.iter().filter(|tab| tab.id != id).map(|tab| tab.id.clone()).collect();
-        for other in others {
-            self.request_close_tab(&other);
-            if self.close_prompt.is_some() {
-                return;
-            }
-        }
+        self.close_sequence(others);
     }
 
     fn close_right(&mut self) {
         let Some(id) = self.active_tab.clone() else { return };
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else { return };
         let right: Vec<String> = self.tabs.iter().skip(index + 1).map(|tab| tab.id.clone()).collect();
-        for id in right {
-            self.request_close_tab(&id);
-            if self.close_prompt.is_some() {
-                return;
-            }
-        }
+        self.close_sequence(right);
     }
 
     fn request_close_all(&mut self) {
         let ids: Vec<String> = self.tabs.iter().map(|tab| tab.id.clone()).collect();
-        for id in ids {
-            self.request_close_tab(&id);
-            if self.close_prompt.is_some() {
-                return;
+        self.close_sequence(ids);
+    }
+
+    /// 逐项关闭：需要确认时停下；确认后从断点继续，运行中的项保留在原位。
+    fn close_sequence(&mut self, ids: Vec<String>) {
+        self.close_batch = ids;
+        self.close_next_queued();
+    }
+
+    fn close_next_queued(&mut self) {
+        while let Some(id) = self.close_batch.first().cloned() {
+            match evaluate(self.tab_facts(&id)) {
+                CloseKind::Allow => {
+                    self.close_batch.remove(0);
+                    self.remove_tab(&id);
+                }
+                CloseKind::BlockedRunning => {
+                    self.close_batch.remove(0);
+                    self.notice_key = message_key(CloseScope::Tab, CloseKind::BlockedRunning);
+                }
+                kind => {
+                    self.notice_key = message_key(CloseScope::Tab, kind);
+                    self.close_prompt = Some(ClosePrompt { scope: CloseScope::Tab, tab_id: Some(id), kind });
+                    return;
+                }
             }
+        }
+    }
+
+    /// 打开或聚焦一个异构工作项；同一目标重复打开只激活已有项，不复制状态。
+    pub fn open_item(&mut self, kind: WorkItemKind, spec: String) {
+        if let Some(existing) = self
+            .tabs
+            .iter()
+            .find(|item| item.kind == kind && item.spec.as_deref() == Some(spec.as_str()))
+        {
+            let id = existing.id.clone();
+            self.activate_item(&id);
+            return;
+        }
+        let title = self.item_title(kind, &spec);
+        let id = self.next_item_id(kind);
+        // 目标规格开头几段就是连接、库和引擎；把它一并带进工作项，状态栏与关闭保护看到同一目标。
+        let parts: Vec<&str> = spec.split('|').collect();
+        let mut part = |index: usize| {
+            parts
+                .get(index)
+                .map(|text| text.trim().to_owned())
+                .filter(|text| !text.is_empty())
+        };
+        let (connection_id, connection_name, database, engine) = (part(0), part(1), part(2), part(5));
+        self.tabs.push(WorkItem {
+            id: id.clone(),
+            title,
+            kind,
+            spec: Some(spec),
+            draft: String::new(),
+            last_executed_sql: None,
+            uncommitted_cells: false,
+            cell_note: String::new(),
+            running: false,
+            connection_id,
+            connection_name,
+            database,
+            engine,
+        });
+        self.activate_item(&id);
+    }
+
+    /// 激活工作项并把视图、工具与目标一起切到该工作项。
+    pub fn activate_item(&mut self, id: &str) {
+        let Some((kind, spec)) = self
+            .tabs
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| (item.kind, item.spec.clone()))
+        else {
+            return;
+        };
+        self.active_tab = Some(id.to_owned());
+        self.tool = kind.tool();
+        self.shell.page = kind.page();
+        self.shell.focus = match kind {
+            WorkItemKind::Query => FocusTarget::Editor,
+            WorkItemKind::Table => FocusTarget::Grid,
+            WorkItemKind::Structure | WorkItemKind::Admin => FocusTarget::Editor,
+            WorkItemKind::Redis | WorkItemKind::Mongo => FocusTarget::Sidebar,
+        };
+        match kind {
+            WorkItemKind::Table | WorkItemKind::Structure | WorkItemKind::Admin => self.table_spec = spec,
+            WorkItemKind::Redis => self.redis_spec = spec,
+            WorkItemKind::Mongo => self.mongo_spec = spec,
+            WorkItemKind::Query => {}
+        }
+    }
+
+    fn cycle_item(&mut self, delta: isize) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let index = self
+            .active_tab
+            .as_deref()
+            .and_then(|id| self.tabs.iter().position(|tab| tab.id == id))
+            .unwrap_or(0);
+        let len = self.tabs.len() as isize;
+        let next = (index as isize + delta).rem_euclid(len) as usize;
+        let id = self.tabs[next].id.clone();
+        self.activate_item(&id);
+    }
+
+    fn next_item_id(&self, kind: WorkItemKind) -> String {
+        let mut serial = self.tabs.len() + 1;
+        loop {
+            let id = format!("{}-{serial}", kind.as_str());
+            if !self.tabs.iter().any(|item| item.id == id) {
+                return id;
+            }
+            serial += 1;
+        }
+    }
+
+    fn item_title(&self, kind: WorkItemKind, spec: &str) -> String {
+        let field = |index: usize| spec.split('|').nth(index).unwrap_or("").trim().to_owned();
+        match kind {
+            WorkItemKind::Query => String::new(),
+            WorkItemKind::Table | WorkItemKind::Structure => {
+                let name = field(4);
+                if name.is_empty() {
+                    field(1)
+                } else {
+                    name
+                }
+            }
+            WorkItemKind::Admin => self.text("ui.tool.admin"),
+            WorkItemKind::Redis | WorkItemKind::Mongo => field(1),
         }
     }
 
@@ -966,34 +1192,21 @@ impl WorkbenchModel {
     }
 
     fn open_query_draft(&mut self, draft: String, keep_page: bool) {
-        let id = format!("query-{}", self.tabs.len() + 1);
-        let title_n = self.tabs.iter().filter(|tab| tab.kind == "query").count() + 1;
-        self.tabs.push(QueryTab {
-            id: id.clone(),
-            title: format!("query {title_n}"),
-            kind: "query".into(),
-            draft,
-            last_executed_sql: None,
-            uncommitted_cells: false,
-            cell_note: String::new(),
-            running: false,
-            connection_id: None,
-            connection_name: None,
-            database: None,
-            engine: None,
-        });
-        self.active_tab = Some(id);
+        let title_n = self.tabs.iter().filter(|tab| tab.kind.is_query()).count() + 1;
+        let id = self.next_item_id(WorkItemKind::Query);
+        self.tabs.push(WorkItem::query(id.clone(), format!("query {title_n}"), draft));
+        self.activate_item(&id);
         if !keep_page {
             self.shell.page = AppPage::Workspace;
         }
     }
 
-    pub fn active_tab(&self) -> Option<&QueryTab> {
+    pub fn active_tab(&self) -> Option<&WorkItem> {
         let id = self.active_tab.as_deref()?;
         self.tabs.iter().find(|tab| tab.id == id)
     }
 
-    fn active_mut(&mut self) -> Option<&mut QueryTab> {
+    fn active_mut(&mut self) -> Option<&mut WorkItem> {
         let id = self.active_tab.clone()?;
         self.tabs.iter_mut().find(|tab| tab.id == id)
     }
@@ -1226,8 +1439,20 @@ impl WorkbenchModel {
     }
 
     pub fn restore_session(&mut self, session: &SessionState) {
-        self.tabs = session.tabs.iter().map(session_to_tab).collect();
-        self.active_tab = session.active_id.clone().or_else(|| self.tabs.first().map(|tab| tab.id.clone()));
+        self.tabs = session.tabs.iter().filter_map(session_to_item).collect();
+        self.tool = WorkTool::Query;
+        self.table_spec = None;
+        self.redis_spec = None;
+        self.mongo_spec = None;
+        let active = session
+            .active_id
+            .clone()
+            .filter(|id| self.tabs.iter().any(|tab| &tab.id == id))
+            .or_else(|| self.tabs.first().map(|tab| tab.id.clone()));
+        self.active_tab = None;
+        if let Some(id) = active {
+            self.activate_item(&id);
+        }
     }
 
     pub fn secrets(&self) -> &Secrets {
@@ -1235,11 +1460,12 @@ impl WorkbenchModel {
     }
 }
 
-fn tab_to_session(tab: &QueryTab) -> SessionTab {
+fn tab_to_session(tab: &WorkItem) -> SessionTab {
     SessionTab {
         id: tab.id.clone(),
         title: tab.title.clone(),
-        kind: tab.kind.clone(),
+        kind: tab.kind.as_str().to_owned(),
+        spec: tab.spec.clone(),
         draft: tab.draft.clone(),
         connection_id: tab.connection_id.clone(),
         connection_name: tab.connection_name.clone(),
@@ -1262,11 +1488,18 @@ fn tab_to_session(tab: &QueryTab) -> SessionTab {
     }
 }
 
-fn session_to_tab(tab: &SessionTab) -> QueryTab {
-    QueryTab {
+fn session_to_item(tab: &SessionTab) -> Option<WorkItem> {
+    let kind = WorkItemKind::stored(&tab.kind)?;
+    let spec = tab.spec.clone().filter(|spec| !spec.trim().is_empty());
+    // 没有目标规格的表、结构或专用页面无法安全恢复；宁可少恢复，也不显示空壳工作项。
+    if !kind.is_query() && spec.is_none() {
+        return None;
+    }
+    Some(WorkItem {
         id: tab.id.clone(),
         title: tab.title.clone(),
-        kind: tab.kind.clone(),
+        kind,
+        spec,
         draft: tab.draft.clone(),
         last_executed_sql: tab.last_executed_sql.clone(),
         uncommitted_cells: false,
@@ -1276,7 +1509,7 @@ fn session_to_tab(tab: &SessionTab) -> QueryTab {
         connection_name: tab.connection_name.clone(),
         database: tab.database.clone(),
         engine: tab.engine.clone(),
-    }
+    })
 }
 
 fn field_slot(draft: &mut crate::connections::model::ConnectionDraft, field: DraftField) -> &mut String {

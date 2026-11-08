@@ -47,6 +47,7 @@ actions!(
         ShowHelp,
         CloseTab,
         NextTab,
+        PrevTab,
         RequestCancel,
         ShowAutocomplete,
         ToggleComment,
@@ -141,6 +142,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
         gpui_kit::KeyBinding::new(chord!("w"), CloseTab, None),
         gpui_kit::KeyBinding::new(chord!("b"), ToggleSidebar, None),
         gpui_kit::KeyBinding::new("ctrl-tab", NextTab, None),
+        gpui_kit::KeyBinding::new("ctrl-shift-tab", PrevTab, None),
         gpui_kit::KeyBinding::new(chord!(","), OpenSettings, None),
         gpui_kit::KeyBinding::new(chord!("enter"), ExecuteQuery, None),
         gpui_kit::KeyBinding::new(chord!(shift "enter"), ExecuteCurrent, None),
@@ -201,6 +203,7 @@ pub fn install_actions(cx: &mut App, root: &gpui_kit::Entity<Foundation>) {
     bind!(ShowHelp, "help");
     bind!(CloseTab, "close-tab");
     bind!(NextTab, "next-tab");
+    bind!(PrevTab, "prev-tab");
     bind!(RequestCancel, "request-cancel");
     bind!(ShowAutocomplete, "autocomplete");
     bind!(ToggleComment, "toggle-comment");
@@ -259,6 +262,7 @@ pub fn install_workbench_actions(cx: &mut App, root: &gpui_kit::Entity<Workbench
     bind!(ShowHelp, "help");
     bind!(CloseTab, "close-tab");
     bind!(NextTab, "next-tab");
+    bind!(PrevTab, "prev-tab");
     bind!(RequestCancel, "request-cancel");
     bind!(ShowAutocomplete, "autocomplete");
     bind!(ToggleComment, "toggle-comment");

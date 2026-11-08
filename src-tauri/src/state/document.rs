@@ -96,6 +96,9 @@ pub struct SessionTab {
     pub id: String,
     pub title: String,
     pub kind: String,
+    /// 表 / 结构 / 专用页面的目标规格；旧状态没有该字段时按无目标处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<String>,
     pub draft: String,
     pub connection_id: Option<String>,
     pub connection_name: Option<String>,
@@ -284,6 +287,7 @@ fn tab_from_legacy(value: &Value) -> Result<SessionTab, String> {
         id,
         title,
         kind,
+        spec: optional_text(tab, "spec")?,
         draft,
         connection_id: optional_text(tab, "connectionId")?,
         connection_name: optional_text(tab, "connectionName")?,

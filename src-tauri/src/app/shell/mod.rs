@@ -9,7 +9,7 @@ mod model;
 mod view;
 
 pub use close::{update_block_key, CloseFacts};
-pub use model::WorkbenchModel;
+pub use model::{WorkItemKind, WorkbenchModel};
 pub use view::Workbench;
 
 #[cfg(test)]
