@@ -240,16 +240,26 @@ pub struct AdminPane {
     pub session: AdminSession,
     services: Arc<AppServices>,
     fields: Fields<&'static str>,
+    /// 当前绑定到的工作项 id；关闭后重开会拿到新 id，必须重置草稿。
+    item_id: String,
 }
 
 impl AdminPane {
     pub fn new(services: Arc<AppServices>) -> Self {
-        Self { session: AdminSession::new(GridTarget::default()), services, fields: Fields::default() }
+        Self { session: AdminSession::new(GridTarget::default()), services, fields: Fields::default(), item_id: String::new() }
     }
 
+    /// 兼容调用：不区分工作项实例，只按目标绑定。
     pub fn bind(&mut self, target: GridTarget) {
-        // 管理页只有一份操作草稿；重新打开同一目标也要丢弃上一工作项的
-        // PRAGMA、ATTACH 或预览继续带过去。
+        self.bind_item(target, "");
+    }
+
+    /// 同一工作项切工具不丢草稿；关闭后重开（新 item id）或换目标才重建。
+    pub fn bind_item(&mut self, target: GridTarget, item: &str) {
+        if self.session.target == target && self.item_id == item {
+            return;
+        }
+        self.item_id = item.to_owned();
         let locale = self.session.locale;
         self.session = AdminSession::new(target);
         self.session.locale = locale;

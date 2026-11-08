@@ -479,6 +479,7 @@ impl Workbench {
 
     fn ensure_tool(&mut self, cx: &mut Context<Self>) {
         let spec = self.model.table_spec.clone().unwrap_or_default();
+        let item = self.model.active_tab.clone().unwrap_or_default();
         let key = format!("{:?}:{spec}", self.model.tool);
         if self.applied_tool.as_deref() == Some(key.as_str()) {
             return;
@@ -501,11 +502,11 @@ impl Workbench {
             }
             WorkTool::Structure => self.structure.update(cx, |pane, _| {
                 pane.set_locale(locale);
-                pane.bind(target);
+                pane.bind_item(target, &item);
             }),
             WorkTool::Admin => self.admin.update(cx, |pane, _| {
                 pane.set_locale(locale);
-                pane.bind(target);
+                pane.bind_item(target, &item);
             }),
             WorkTool::Query | WorkTool::Redis | WorkTool::Mongo => {}
         }

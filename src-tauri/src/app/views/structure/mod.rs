@@ -230,6 +230,8 @@ pub struct StructurePane {
     loaded_for: String,
     loading: bool,
     load_error: String,
+    /// 当前绑定到的工作项 id；关闭后重开会拿到新 id，必须重置草稿。
+    item_id: String,
 }
 
 impl StructurePane {
@@ -242,13 +244,21 @@ impl StructurePane {
             loaded_for: String::new(),
             loading: false,
             load_error: String::new(),
+            item_id: String::new(),
         }
     }
 
+    /// 兼容调用：不区分工作项实例，只按目标绑定。
     pub fn bind(&mut self, target: GridTarget) {
-        // 结构页只有一份草稿；重新打开同一张表也必须丢弃上一工作项的字段、预览和
-        // 已 armed 的确认，否则一次点击会执行上次留下的危险操作。
-        // 否则用户会把 A 表的列名或 DROP 预览带到 B 表。
+        self.bind_item(target, "");
+    }
+
+    /// 同一工作项切工具不丢草稿；关闭后重开（新 item id）或换目标才重建。
+    pub fn bind_item(&mut self, target: GridTarget, item: &str) {
+        if self.session.target == target && self.item_id == item {
+            return;
+        }
+        self.item_id = item.to_owned();
         let locale = self.session.locale;
         self.session = StructureSession::new(target);
         self.session.locale = locale;
