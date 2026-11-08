@@ -1899,20 +1899,28 @@ impl Workbench {
         let known = self.model.known_ids();
         // 窄窗口把预览放到列表上方；并排会挤压卡片操作，长错误/元数据会互相覆盖。
         let narrow = history_stacks_preview(self.model.layout().content_width as f32);
-        let preview = if preview_open {
+        let has_preview = preview_open && self.model.history.preview_plan(&known).is_some();
+        let preview = if has_preview {
             self.history_preview(&known, &p, narrow, cx)
         } else {
             div().into_any_element()
         };
         let body = if narrow {
-            div()
-                .flex()
-                .flex_1()
-                .min_w(px(0.))
-                .min_h(px(0.))
-                .flex_col()
-                .child(div().h(px(300.)).flex_none().flex().flex_col().min_h(px(0.)).overflow_hidden().child(preview))
-                .child(list)
+            let mut column = div().flex().flex_1().min_w(px(0.)).min_h(px(0.)).flex_col();
+            if has_preview {
+                // 与列表分享剩余高度，最高 300；空预览不占位，矮窗口列表不会被压没。
+                column = column.child(
+                    div()
+                        .flex_1()
+                        .max_h(px(300.))
+                        .min_h(px(0.))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .child(preview),
+                );
+            }
+            column.child(list)
         } else {
             div().flex().flex_1().min_w(px(0.)).min_h(px(0.)).child(list).child(preview)
         };
