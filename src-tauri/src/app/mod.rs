@@ -153,9 +153,22 @@ pub(crate) fn bind_keys(cx: &mut App) {
         gpui_kit::KeyBinding::new(chord!("s"), CommitEdit, None),
         gpui_kit::KeyBinding::new("escape", Dismiss, Some("Palette")),
     ]);
+    #[cfg(target_os = "macos")]
+    cx.bind_keys(editor_format_bindings());
     // gpui-base 只给 Windows/Linux 绑了 Ctrl+Y 重做；补上常见的 Ctrl+Shift+Z。
     #[cfg(not(target_os = "macos"))]
     cx.bind_keys([gpui_kit::KeyBinding::new("ctrl-shift-z", input::Redo, Some("Input"))]);
+}
+
+/// gpui-base 在 macOS 编辑器里把 ⌘⇧F 绑成“替换”，盖住了格式化 SQL。
+/// 同一上下文里后注册的绑定优先，这里把 ⌘⇧F 还给格式化，替换改用 ⌥⌘F。
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn editor_format_bindings() -> Vec<gpui_kit::KeyBinding> {
+    const EDITOR: &str = "Input && mode == editor";
+    vec![
+        gpui_kit::KeyBinding::new("cmd-shift-f", FormatSql, Some(EDITOR)),
+        gpui_kit::KeyBinding::new("cmd-alt-f", input::Replace, Some(EDITOR)),
+    ]
 }
 
 pub fn install_actions(cx: &mut App, root: &gpui_kit::Entity<Foundation>) {

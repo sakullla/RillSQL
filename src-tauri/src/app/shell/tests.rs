@@ -1492,3 +1492,31 @@ fn editor_keeps_undo_and_select_all_shortcuts_inside_the_workbench(cx: &mut gpui
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[gpui_kit::test]
+fn command_shift_f_formats_sql_in_the_editor(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::component::input;
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-format-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    // 在任何平台上复现 macOS：gpui-base 把 ⌘⇧F 绑成替换，之后才是应用自己的绑定。
+    cx.update(|cx| cx.bind_keys([gpui_kit::KeyBinding::new("cmd-shift-f", input::Replace, Some("Input"))]));
+    cx.update(crate::app::bind_keys);
+    cx.update(|cx| cx.bind_keys(crate::app::editor_format_bindings()));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("new-query", cx));
+        window.render_frame(cx);
+        assert!(view.read(cx).query_editor_focused(window, cx));
+        fn resolve(key: &'static str, window: &gpui_kit::Window, cx: &gpui_kit::App) -> Option<Box<dyn gpui_kit::Action>> {
+            let keystroke = gpui_kit::Keystroke::parse(key).unwrap();
+            let (bindings, _) = cx.key_bindings().borrow().bindings_for_input(&[keystroke], &window.context_stack());
+            bindings.first().map(|binding| binding.action().boxed_clone())
+        }
+        let format = resolve("cmd-shift-f", window, cx).expect("⌘⇧F 没有绑定");
+        assert!(format.partial_eq(&crate::app::FormatSql), "⌘⇧F 解析成了 {}", format.name());
+        let replace = resolve("cmd-alt-f", window, cx).expect("⌥⌘F 没有绑定");
+        assert!(replace.partial_eq(&input::Replace), "⌥⌘F 解析成了 {}", replace.name());
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

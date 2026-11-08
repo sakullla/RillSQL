@@ -156,6 +156,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     Shortcut { id: "undo", group: "editor", chord: "Mod+Z", label_key: "shell.shortcuts.undo" },
     Shortcut { id: "redo", group: "editor", chord: if cfg!(target_os = "macos") { "Mod+Shift+Z" } else { "Ctrl+Y / Ctrl+Shift+Z" }, label_key: "shell.shortcuts.redo" },
     Shortcut { id: "find", group: "editor", chord: "Mod+F", label_key: "shell.shortcuts.find" },
+    Shortcut { id: "replace", group: "editor", chord: if cfg!(target_os = "macos") { "Mod+Alt+F" } else { "Ctrl+H" }, label_key: "shell.shortcuts.replace" },
     Shortcut { id: "autocomplete", group: "editor", chord: "Ctrl+Space", label_key: "shell.shortcuts.autocomplete" },
     Shortcut { id: "toggle-comment", group: "editor", chord: "Mod+/", label_key: "shell.shortcuts.toggleComment" },
     Shortcut { id: "toggle-results", group: "editor", chord: "Mod+J", label_key: "shell.shortcuts.toggleResults" },
