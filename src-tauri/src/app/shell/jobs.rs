@@ -10,7 +10,7 @@ use crate::app::views::history::{self, HistoryPage};
 use crate::application::tasks::TaskToken;
 use crate::application::{AppServices, TaskOutcome};
 use crate::connections::model::ConnectionDraft;
-use crate::query::{HistoryEntry, SaveRequest, SavedQuery};
+use crate::query::{HistoryEntry, RenameRequest, SaveRequest, SavedQuery};
 use crate::state::AppState;
 
 use super::model::{PendingJob, WorkbenchModel};
@@ -26,6 +26,7 @@ pub struct JobRequest {
     pub import_path: Option<String>,
     pub bundle_passphrase: Option<String>,
     pub save: Option<SaveRequest>,
+    pub rename: Option<RenameRequest>,
     pub run_id: Option<String>,
     pub saved_id: Option<String>,
 }
@@ -52,6 +53,10 @@ pub fn job_request(model: &WorkbenchModel, job: PendingJob, token: TaskToken) ->
         PendingJob::SaveNamed => save_request(model),
         _ => None,
     };
+    let rename = match job {
+        PendingJob::RenameSaved => model.history.rename_request(),
+        _ => None,
+    };
     JobRequest {
         job,
         token,
@@ -65,6 +70,7 @@ pub fn job_request(model: &WorkbenchModel, job: PendingJob, token: TaskToken) ->
             if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) }
         },
         save,
+        rename,
         run_id: model.history.selected_run.clone(),
         saved_id: model.history.selected_saved.clone(),
     }
@@ -189,6 +195,15 @@ pub async fn execute_job(services: &AppServices, request: JobRequest) -> JobDone
                 Err(err) => JobDone::Notice(token, Err(err)),
             }
         }
+        PendingJob::RenameSaved => {
+            let Some(rename) = request.rename else {
+                return JobDone::Notice(token, Err("history.page.needName".into()));
+            };
+            match history::rename_saved(services, &rename).await {
+                Ok(()) => JobDone::History(token, load_history(services).await),
+                Err(err) => JobDone::Notice(token, Err(err)),
+            }
+        }
     }
 }
 
@@ -223,7 +238,13 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
                 model.notice_key = Some(static_notice(&detail));
                 model.notice_detail = model.connections.message_detail.clone();
             } else if accepted(services, owner, token) {
-                model.notice_key = Some(static_notice(&detail));
+                if owner == "history" {
+                    // 失败只记在页面上，原列表保持不变，不静默移除条目。
+                    model.history.mark_failure(detail.clone());
+                    model.notice_key = Some("history.page.failed");
+                } else {
+                    model.notice_key = Some(static_notice(&detail));
+                }
                 model.notice_detail = detail;
             }
         }
@@ -269,15 +290,17 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
         }
         JobDone::History(token, Ok((runs, saved))) => {
             if let TaskOutcome::Current { value, .. } = services.tasks.accept(owner, token, (runs, saved)) {
-                model.history.runs = value.0;
-                model.history.saved = value.1;
+                model.history.apply_list(value.0, value.1);
+                model.history.rename_open = false;
+                model.history.rename_text.clear();
                 model.history.message_key = Some("history.page.loadOnlySql");
             }
         }
         JobDone::History(token, Err(detail)) => {
             if accepted(services, owner, token) {
+                model.history.mark_failure(detail.clone());
                 model.notice_detail = detail;
-                model.notice_key = Some("history.page.titleRuns");
+                model.notice_key = Some("history.page.failed");
             }
         }
     }

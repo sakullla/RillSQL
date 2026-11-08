@@ -153,6 +153,7 @@ pub enum DraftField {
     ObjectFilter,
     HistorySearch,
     SaveName,
+    RenameName,
     PaletteQuery,
     BundlePassphrase,
 }
@@ -172,6 +173,7 @@ pub enum PendingJob {
     ClearHistory,
     DeleteRun,
     DeleteSaved,
+    RenameSaved,
 }
 
 #[derive(Clone, Debug)]
@@ -354,9 +356,16 @@ impl WorkbenchModel {
                 self.focused_field = Some(DraftField::Name);
             }
             "connections" => self.welcome.has_connections = !self.connections.rows.is_empty(),
-            "history" => self.history.section = HistorySection::Runs,
+            "history" => {
+                self.history.section = HistorySection::Runs;
+                self.history.cancel_rename();
+                self.history.confirm_delete = false;
+            }
             "saved-queries" => {
                 self.history.section = HistorySection::Saved;
+                self.history.filter_status.clear();
+                self.history.cancel_rename();
+                self.history.confirm_delete = false;
                 self.shell.page = AppPage::History;
             }
             "close-tab" => self.request_close_active(),
@@ -533,27 +542,20 @@ impl WorkbenchModel {
             "update-install" => {
                 let _ = self.request_update_install();
             }
-            "null-next" => {
-                self.settings.null_copy = match self.settings.null_copy.as_str() {
-                    "NULL" => "empty",
-                    "empty" => "N",
-                    _ => "NULL",
-                }
-                .to_owned();
-            }
-            "timeout-cycle" => {
-                self.settings.query_timeout_sec = match self.settings.query_timeout_sec {
-                    0 => 15,
-                    15 => 60,
-                    _ => 0,
-                };
-            }
+            "null-next" => self.settings.cycle_null(),
+            "null-prev" => self.settings.cycle_null_step(-1),
+            "timeout-cycle" => self.settings.cycle_timeout(),
+            "timeout-prev" => self.settings.cycle_timeout_step(-1),
             "timeout-0" => self.settings.query_timeout_sec = 0,
             "timeout-15" => self.settings.query_timeout_sec = 15,
             "timeout-60" => self.settings.query_timeout_sec = 60,
             "null-NULL" | "null-empty" | "null-N" => self.settings.null_copy = id.trim_start_matches("null-").to_owned(),
-            "page-size-up" => self.settings.page_size = (self.settings.page_size + 50).clamp(1, 10_000),
-            "preview-up" => self.settings.preview_kb = (self.settings.preview_kb + 1).clamp(1, 64),
+            "page-size-up" => self.settings.step_page_size(50),
+            "page-size-down" => self.settings.step_page_size(-50),
+            "preview-up" => self.settings.step_preview_kb(1),
+            "preview-down" => self.settings.step_preview_kb(-1),
+            "object-page-up" => self.settings.step_object_page(50),
+            "object-page-down" => self.settings.step_object_page(-50),
             "tree-open-data" | "tree-copy-name" | "tree-select-sql" => self.tree_action(id),
             "open-exchange" => {
                 self.exchange_open = !self.exchange_open;
@@ -576,21 +578,93 @@ impl WorkbenchModel {
             "editor-clear" => self.clear_editor(),
             "history-load" => self.load_selected_history(),
             "history-copy" => self.copy_selected_sql(),
-            "history-detail" => self.notice_key = Some("history.page.sqlPreview"),
+            "history-detail" => self.history.preview_open = true,
+            "history-preview-close" => self.history.preview_open = false,
             "history-filter-connection" => self.history.filter_selected_connection(),
+            "history-filter-reset" => self.history.reset_filters(),
+            "history-status-all" => self.history.set_status_filter("all"),
+            "history-status-ok" => self.history.set_status_filter("ok"),
+            "history-status-failed" => self.history.set_status_filter("failed"),
             "history-refresh" => self.enqueue(PendingJob::RefreshHistory),
-            "history-save-named" => self.enqueue(PendingJob::SaveNamed),
+            "history-save-named" => {
+                if self.history.save_name.trim().is_empty() {
+                    self.notice_key = Some("history.page.needName");
+                    self.notice_detail.clear();
+                } else if self.active_tab().is_some_and(|tab| tab.kind.is_query()) {
+                    self.enqueue(PendingJob::SaveNamed);
+                } else {
+                    self.notice_key = Some("history.savedPanel.needTab");
+                    self.notice_detail.clear();
+                }
+            }
             "history-clear" => {
-                if !self.history.confirm_clear {
+                if self.history.runs.is_empty() {
+                    self.history.confirm_clear = false;
+                    self.notice_key = Some("ui.history.empty");
+                    self.notice_detail.clear();
+                } else if !self.history.confirm_clear {
                     self.history.confirm_clear = true;
                     self.notice_key = Some("history.page.clearConfirm");
+                    self.notice_detail.clear();
                 } else {
                     self.history.confirm_clear = false;
                     self.enqueue(PendingJob::ClearHistory);
                 }
             }
-            "history-delete" => self.enqueue(PendingJob::DeleteRun),
-            "saved-delete" => self.enqueue(PendingJob::DeleteSaved),
+            "history-delete" => {
+                if self.history.selected_run.is_some() {
+                    self.enqueue(PendingJob::DeleteRun);
+                } else {
+                    self.notice_key = Some("ui.history.delete");
+                    self.notice_detail.clear();
+                }
+            }
+            "saved-delete" => {
+                if self.history.selected_saved.is_none() {
+                    self.notice_key = Some("ui.history.delete");
+                    self.notice_detail.clear();
+                } else if !self.history.confirm_delete {
+                    self.history.confirm_delete = true;
+                    self.notice_key = Some("history.page.deleteSavedConfirm");
+                    self.notice_detail.clear();
+                } else {
+                    self.history.confirm_delete = false;
+                    self.enqueue(PendingJob::DeleteSaved);
+                }
+            }
+            "history-clear-cancel" => {
+                self.history.confirm_clear = false;
+                self.notice_key = None;
+                self.notice_detail.clear();
+            }
+            "saved-delete-cancel" => {
+                self.history.confirm_delete = false;
+                self.notice_key = None;
+                self.notice_detail.clear();
+            }
+            "history-rename" => {
+                if self.history.begin_rename() {
+                    self.focused_field = Some(DraftField::RenameName);
+                    self.notice_key = None;
+                    self.notice_detail.clear();
+                } else {
+                    self.notice_key = Some("history.savedPanel.openNote");
+                    self.notice_detail.clear();
+                }
+            }
+            "history-rename-confirm" => {
+                if self.history.rename_request().is_some() {
+                    self.enqueue(PendingJob::RenameSaved);
+                } else {
+                    self.notice_key = Some("history.page.needName");
+                    self.notice_detail.clear();
+                }
+            }
+            "history-rename-cancel" => {
+                self.history.cancel_rename();
+                self.notice_key = None;
+                self.notice_detail.clear();
+            }
             "density-compact" | "density-standard" | "density-relaxed" => {
                 self.settings.density = id.trim_start_matches("density-").to_owned();
                 self.settings.apply_shell(&mut self.shell);
@@ -606,9 +680,10 @@ impl WorkbenchModel {
                 self.settings.locale = "en".into();
                 self.settings.apply_shell(&mut self.shell);
             }
-            "font-up" => self.settings.set_editor_font(self.settings.editor_font + 1),
-            "font-down" => self.settings.set_editor_font(self.settings.editor_font - 1),
-            "toggle-updates" => self.settings.auto_check_updates = !self.settings.auto_check_updates,
+            "font-up" => self.settings.step_editor_font(1),
+            "font-down" => self.settings.step_editor_font(-1),
+            "editor-theme-prev" => self.settings.cycle_editor_theme_step(-1),
+            "toggle-updates" => self.settings.toggle_updates(),
             "close-stay" => self.choose_stay(),
             "close-leave" => self.choose_leave(),
             "welcome-connections" => {
@@ -1479,6 +1554,7 @@ impl WorkbenchModel {
             DraftField::ObjectFilter => self.object_filter = value,
             DraftField::HistorySearch => self.history.filter_text = value,
             DraftField::SaveName => self.history.save_name = value,
+            DraftField::RenameName => self.history.rename_text = value,
             DraftField::PaletteQuery => self.palette_query = value,
             other => {
                 if let Some(draft) = self.connections.editor.as_mut() {
@@ -1516,6 +1592,7 @@ impl WorkbenchModel {
             DraftField::ObjectFilter => self.object_filter.clone(),
             DraftField::HistorySearch => self.history.filter_text.clone(),
             DraftField::SaveName => self.history.save_name.clone(),
+            DraftField::RenameName => self.history.rename_text.clone(),
             DraftField::PaletteQuery => self.palette_query.clone(),
             other => self.connections.editor.as_ref().map(|draft| field_slot_ref(draft, other).to_owned()).unwrap_or_default(),
         }
@@ -1627,7 +1704,20 @@ impl WorkbenchModel {
                 "connections.deleteDialog.confirm",
                 "connections.deleteDialog.willKeepDb",
             ],
-            AppPage::History => vec!["history.page.runs", "history.page.saved", "history.page.loadToEditor", "history.savedPanel.save"],
+            AppPage::History => vec![
+                "history.page.runs",
+                "history.page.saved",
+                "history.page.loadToEditor",
+                "history.savedPanel.save",
+                "history.page.noMatch",
+                "history.page.noMatchSaved",
+                "history.page.rename",
+                "history.page.needName",
+                "history.status.ok",
+                "history.status.failed",
+                "history.filter.all",
+                "history.filter.reset",
+            ],
             AppPage::Compare => vec![
                 "compare.dialog.title",
                 "compare.dialog.subtitle",
@@ -1646,6 +1736,7 @@ impl WorkbenchModel {
                 "common.localeZh",
                 "common.localeEn",
                 "shell.settings.rowsPerPage",
+                "shell.settings.objectPage",
                 "shell.settings.nullCopy",
                 "shell.settings.timeout",
                 "shell.update.autoCheck",

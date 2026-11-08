@@ -5,13 +5,13 @@ use std::sync::Arc;
 use crate::app::shell::jobs::{self, apply_done, job_request};
 use crate::app::shell::menus::{menu_items, MenuPlace, MenuTarget, NavKey};
 use crate::app::views::connections::{sample_draft, with_tls_ssh, Secrets};
-use crate::app::views::history::HistorySection;
+use crate::app::views::history::{HistorySection, ListPhase};
 use crate::app::{dictionary_keys, translate, AppPage, Locale, ThemePreference};
 use crate::application::AppServices;
 use crate::connections::model::{CaMode, Engine, SshAuthKind};
 use crate::connections::Service;
 use crate::i18n;
-use crate::query::SaveRequest;
+use crate::query::{HistoryEntry, SaveRequest};
 use crate::state::{AppState, SessionState, ShellSettings};
 
 use super::model::{DraftField, PendingJob, WorkItemKind, WorkTool, WorkbenchModel};
@@ -2423,6 +2423,455 @@ fn quick_open_lists_the_loaded_tree_and_opens_without_running_sql(cx: &mut gpui_
             assert!(!view.query_executed(cx), "快速打开不应执行 SQL");
         });
         window.render_frame(cx);
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn history_run(id: &str, sql: &str, connection: &str, status: &str) -> HistoryEntry {
+    HistoryEntry {
+        id: id.into(),
+        sql: sql.into(),
+        connection_id: connection.into(),
+        connection_name: format!("conn-{connection}"),
+        database_name: "app".into(),
+        engine: "postgres".into(),
+        started_at: "2026-11-07T08:00:00Z".into(),
+        finished_at: None,
+        status: status.into(),
+        elapsed_ms: Some(12),
+        summary: "1 行".into(),
+    }
+}
+
+#[test]
+fn history_search_filter_preview_copy_delete_and_clear_are_reversible() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.shell.page = AppPage::History;
+    model.history.runs = vec![
+        history_run("a", "select 1", "live", "ok"),
+        history_run("b", "select 2", "live", "error"),
+        history_run("c", "delete from t", "other", "ok"),
+    ];
+    assert_eq!(model.history.runs_phase(), ListPhase::Rows);
+
+    model.set_field(DraftField::HistorySearch, "select".into());
+    assert_eq!(model.history.filtered_runs().len(), 2);
+    model.set_field(DraftField::HistorySearch, "missing".into());
+    assert_eq!(model.history.runs_phase(), ListPhase::NoMatch);
+    let _ = model.dispatch("history-filter-reset");
+    assert!(model.history.filter_text.is_empty());
+    assert_eq!(model.history.runs_phase(), ListPhase::Rows);
+
+    let _ = model.dispatch("history-status-failed");
+    assert_eq!(model.history.filter_status, "failed");
+    assert_eq!(model.history.filtered_runs().len(), 1);
+    let _ = model.dispatch("history-status-ok");
+    assert_eq!(model.history.filtered_runs().len(), 2);
+    let _ = model.dispatch("history-status-all");
+    assert!(model.history.filter_status.is_empty());
+
+    model.history.selected_run = Some("c".into());
+    let _ = model.dispatch("history-filter-connection");
+    assert_eq!(model.history.filter_connection, "other");
+    assert_eq!(model.history.filtered_runs().len(), 1);
+    let _ = model.dispatch("history-filter-reset");
+    assert_eq!(model.history.filtered_runs().len(), 3);
+
+    model.history.selected_run = Some("a".into());
+    model.history.preview_open = false;
+    let _ = model.dispatch("history-detail");
+    assert!(model.history.preview_open);
+    let plan = model.history.preview_plan(&model.known_ids()).expect("preview");
+    assert_eq!(plan.sql, "select 1");
+    assert!(!plan.execute);
+    let _ = model.dispatch("history-preview-close");
+    assert!(!model.history.preview_open);
+
+    let _ = model.dispatch("history-copy");
+    assert_eq!(model.copied, "select 1");
+
+    let _ = model.dispatch("history-clear");
+    assert!(model.history.confirm_clear);
+    assert_eq!(model.notice_key, Some("history.page.clearConfirm"));
+    assert_eq!(model.pending_len(), 0);
+    let _ = model.dispatch("history-clear-cancel");
+    assert!(!model.history.confirm_clear);
+    let _ = model.dispatch("history-clear");
+    let _ = model.dispatch("history-clear");
+    assert!(!model.history.confirm_clear);
+    assert_eq!(model.take_pending(), Some(PendingJob::ClearHistory));
+
+    model.history.runs.clear();
+    let _ = model.dispatch("history-clear");
+    assert_eq!(model.notice_key, Some("ui.history.empty"));
+    assert_eq!(model.pending_len(), 0);
+
+    model.history.runs = vec![history_run("gone", "select 42", "deleted", "ok")];
+    model.history.selected_run = Some("gone".into());
+    let loads = model.loads;
+    let _ = model.dispatch("history-load");
+    assert_eq!(model.loads, loads + 1);
+    let tab = model.active_tab().expect("loaded query");
+    assert_eq!(tab.draft, "select 42");
+    assert_eq!(tab.connection_id, None);
+    assert_eq!(model.notice_key, Some("history.plan.deletedNotice"));
+    assert_eq!(model.history.selected_run.as_deref(), Some("gone"));
+
+    model.history.selected_run = None;
+    let _ = model.dispatch("history-delete");
+    assert_eq!(model.notice_key, Some("ui.history.delete"));
+    assert_eq!(model.pending_len(), 0);
+}
+
+#[tokio::test]
+async fn saved_query_rename_delete_cancel_and_deleted_connection_keep_sql() {
+    let dir = std::env::temp_dir().join(format!("rillsql-history-saved-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = WorkbenchModel::new(Shell::default());
+    let _ = model.dispatch("new-query");
+    query_item(&mut model).draft = "select 1".into();
+    model.history.save_name = "   ".into();
+    let _ = model.dispatch("history-save-named");
+    assert_eq!(model.notice_key, Some("history.page.needName"));
+    assert_eq!(model.pending_len(), 0);
+    model.history.save_name = "计数".into();
+    let _ = model.dispatch("history-save-named");
+    let token = model.begin_owner(&services.tasks, "history");
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "history", done);
+    assert_eq!(model.history.saved.len(), 1);
+    assert!(model.history.failure_key.is_none());
+    let first = model.history.saved[0].id.clone();
+
+    model.history.section = HistorySection::Saved;
+    model.history.selected_saved = Some(first.clone());
+    let _ = model.dispatch("history-rename");
+    assert!(model.history.rename_open);
+    assert_eq!(model.history.rename_text, "计数");
+    model.set_field(DraftField::RenameName, "   ".into());
+    let _ = model.dispatch("history-rename-confirm");
+    assert_eq!(model.notice_key, Some("history.page.needName"));
+    assert_eq!(model.pending_len(), 0);
+    assert_eq!(model.history.saved[0].name, "计数");
+
+    model.set_field(DraftField::RenameName, "新名字".into());
+    let _ = model.dispatch("history-rename-confirm");
+    let token = model.begin_owner(&services.tasks, "history");
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "history", done);
+    assert_eq!(model.history.saved[0].name, "新名字");
+    assert!(!model.history.rename_open);
+    assert!(model.history.failure_key.is_none());
+
+    query_item(&mut model).draft = "select 2".into();
+    model.history.save_name = "第二个".into();
+    let _ = model.dispatch("history-save-named");
+    let token = model.begin_owner(&services.tasks, "history");
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "history", done);
+    assert_eq!(model.history.saved.len(), 2);
+    let first = model.history.saved.iter().find(|item| item.name == "新名字").expect("first").id.clone();
+    model.history.selected_saved = Some(first);
+    let _ = model.dispatch("history-rename");
+    model.set_field(DraftField::RenameName, "第二个".into());
+    let _ = model.dispatch("history-rename-confirm");
+    let token = model.begin_owner(&services.tasks, "history");
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "history", done);
+    assert_eq!(model.notice_key, Some("history.page.failed"));
+    assert_eq!(model.history.failure_key, Some("history.page.failed"));
+    assert!(!model.history.failure_detail.is_empty());
+    assert!(model.history.saved.iter().any(|item| item.name == "新名字"));
+    assert_eq!(model.history.saved.len(), 2);
+
+    let remove = model.history.saved.iter().find(|item| item.name == "第二个").expect("second").id.clone();
+    model.history.selected_saved = Some(remove);
+    let _ = model.dispatch("saved-delete");
+    assert!(model.history.confirm_delete);
+    assert_eq!(model.pending_len(), 0);
+    assert_eq!(model.history.saved.len(), 2);
+    let _ = model.dispatch("saved-delete-cancel");
+    assert!(!model.history.confirm_delete);
+    assert_eq!(model.history.saved.len(), 2);
+    let _ = model.dispatch("saved-delete");
+    let _ = model.dispatch("saved-delete");
+    assert!(!model.history.confirm_delete);
+    let token = model.begin_owner(&services.tasks, "history");
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "history", done);
+    assert_eq!(model.history.saved.len(), 1);
+    assert!(model.history.failure_key.is_none());
+
+    model.history.selected_saved = Some(model.history.saved[0].id.clone());
+    let sql = model.history.saved[0].sql.clone();
+    let _ = model.dispatch("history-load");
+    let tab = model.active_tab().expect("loaded saved query");
+    assert_eq!(tab.draft, sql);
+    assert_eq!(tab.draft, "select 1");
+    assert_eq!(tab.connection_id, None);
+    assert_eq!(model.notice_key, Some("history.plan.deletedNotice"));
+    assert_eq!(model.history.saved[0].sql, "select 1");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn empty_no_match_and_failure_states_stay_apart_and_keep_entries() {
+    let dir = std::env::temp_dir().join(format!("rillsql-history-states-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert_eq!(model.history.runs_phase(), ListPhase::Empty);
+    assert_eq!(model.history.saved_phase(), ListPhase::Empty);
+
+    model.history.runs = vec![history_run("a", "select 1", "live", "ok")];
+    model.history.filter_text = "nothing".into();
+    assert_eq!(model.history.runs_phase(), ListPhase::NoMatch);
+    model.history.filter_text.clear();
+
+    let token = model.begin_owner(&services.tasks, "history");
+    apply_done(&mut model, &services, "history", jobs::JobDone::Notice(token, Err("磁盘只读".into())));
+    assert_eq!(model.history.runs_phase(), ListPhase::Failed);
+    assert_eq!(model.history.runs.len(), 1);
+    assert_eq!(model.notice_key, Some("history.page.failed"));
+    assert_eq!(model.notice_detail, "磁盘只读");
+
+    let kept = model.history.runs.clone();
+    let token = model.begin_owner(&services.tasks, "history");
+    apply_done(&mut model, &services, "history", jobs::JobDone::History(token, Ok((kept, Vec::new()))));
+    assert!(model.history.failure_key.is_none());
+    assert_eq!(model.history.runs_phase(), ListPhase::Rows);
+    assert_eq!(model.history.saved_phase(), ListPhase::Empty);
+
+    model.history.saved = vec![crate::query::SavedQuery {
+        id: "s1".into(),
+        name: "计数".into(),
+        sql: "select 1".into(),
+        connection_id: "live".into(),
+        connection_name: "conn-live".into(),
+        database_name: "app".into(),
+        engine: "postgres".into(),
+        updated_at: "2026-11-07T00:00:00Z".into(),
+    }];
+    model.history.filter_text = "nothing".into();
+    assert_eq!(model.history.saved_phase(), ListPhase::NoMatch);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn every_public_setting_moves_both_ways_applies_immediately_and_persists() {
+    let dir = std::env::temp_dir().join(format!("rillsql-settings-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = WorkbenchModel::new(Shell::default());
+    let illegal = ShellSettings {
+        theme: "neon".into(),
+        density: "comfy".into(),
+        editor_font: 999,
+        editor_theme: "neon".into(),
+        locale: "fr".into(),
+        page_size: 0,
+        preview_kb: 999,
+        object_page: -1,
+        null_copy: "bogus".into(),
+        query_timeout_sec: -5,
+        auto_check_updates: true,
+    };
+    model.apply_settings(&illegal);
+    assert_eq!(model.settings.theme, "system");
+    assert_eq!(model.settings.density, "compact");
+    assert_eq!(model.settings.editor_font, 24);
+    assert_eq!(model.settings.editor_theme, "auto");
+    assert_eq!(model.settings.locale, "zh-CN");
+    assert_eq!(model.settings.page_size, 1);
+    assert_eq!(model.settings.preview_kb, 64);
+    assert_eq!(model.settings.object_page, 1);
+    assert_eq!(model.settings.null_copy, "NULL");
+    assert_eq!(model.settings.query_timeout_sec, 0);
+    assert_eq!(model.shell.theme, ThemePreference::System);
+    assert_eq!(model.shell.density, crate::app::Density::Compact);
+
+    let _ = model.dispatch("theme-light");
+    assert_eq!(model.shell.theme, ThemePreference::Light);
+    assert_eq!(model.settings.theme, "light");
+    let _ = model.dispatch("theme-dark");
+    assert_eq!(model.shell.theme, ThemePreference::Dark);
+    let _ = model.dispatch("theme-system");
+    assert_eq!(model.shell.theme, ThemePreference::System);
+
+    let _ = model.dispatch("density-standard");
+    assert_eq!(model.shell.density, crate::app::Density::Standard);
+    let _ = model.dispatch("density-relaxed");
+    assert_eq!(model.shell.density, crate::app::Density::Relaxed);
+    let _ = model.dispatch("locale-en");
+    assert_eq!(model.shell.locale, Locale::En);
+    let _ = model.dispatch("locale-zh");
+    assert_eq!(model.shell.locale, Locale::ZhCn);
+
+    model.settings.set_editor_font(10);
+    let _ = model.dispatch("font-down");
+    assert_eq!(model.settings.editor_font, 10);
+    let _ = model.dispatch("font-up");
+    assert_eq!(model.settings.editor_font, 11);
+
+    model.settings.editor_theme = "auto".into();
+    let _ = model.dispatch("editor-theme-prev");
+    assert_eq!(model.settings.editor_theme, "mono");
+    let _ = model.dispatch("editor-theme-next");
+    assert_eq!(model.settings.editor_theme, "auto");
+
+    model.settings.set_page_size(1);
+    let _ = model.dispatch("page-size-down");
+    assert_eq!(model.settings.page_size, 1);
+    let _ = model.dispatch("page-size-up");
+    assert_eq!(model.settings.page_size, 51);
+    let _ = model.dispatch("page-size-down");
+    assert_eq!(model.settings.page_size, 1);
+
+    model.settings.set_preview_kb(1);
+    let _ = model.dispatch("preview-down");
+    assert_eq!(model.settings.preview_kb, 1);
+    let _ = model.dispatch("preview-up");
+    assert_eq!(model.settings.preview_kb, 2);
+
+    model.settings.set_object_page(1);
+    let _ = model.dispatch("object-page-down");
+    assert_eq!(model.settings.object_page, 1);
+    let _ = model.dispatch("object-page-up");
+    assert_eq!(model.settings.object_page, 51);
+
+    model.settings.null_copy = "NULL".into();
+    let _ = model.dispatch("null-prev");
+    assert_eq!(model.settings.null_copy, "N");
+    let _ = model.dispatch("null-next");
+    assert_eq!(model.settings.null_copy, "NULL");
+    model.settings.query_timeout_sec = 0;
+    let _ = model.dispatch("timeout-prev");
+    assert_eq!(model.settings.query_timeout_sec, 60);
+    let _ = model.dispatch("timeout-cycle");
+    assert_eq!(model.settings.query_timeout_sec, 0);
+    let _ = model.dispatch("timeout-15");
+    assert_eq!(model.settings.query_timeout_sec, 15);
+
+    assert!(model.settings.auto_check_updates);
+    let _ = model.dispatch("toggle-updates");
+    assert!(!model.settings.auto_check_updates);
+    let _ = model.dispatch("toggle-updates");
+    assert!(model.settings.auto_check_updates);
+
+    let state = model.snapshot();
+    assert_eq!(state.shell, model.settings.to_settings());
+    super::model::persist_state(&services, &state).await.unwrap();
+    let loaded = services.load_state().await.unwrap();
+    let mut restored = WorkbenchModel::new(Shell::default());
+    restored.apply_settings(&loaded.shell);
+    restored.restore_session(&loaded.session);
+    assert_eq!(restored.settings, model.settings);
+    assert_eq!(restored.shell.theme, ThemePreference::System);
+    assert_eq!(restored.shell.density, crate::app::Density::Relaxed);
+    assert_eq!(restored.shell.locale, Locale::ZhCn);
+
+    let stored = AppState::new(illegal, SessionState::default());
+    std::fs::write(services.state.path(), crate::state::to_bytes(&stored).unwrap()).unwrap();
+    let loaded = services.load_state().await.unwrap();
+    assert_eq!(loaded.shell.theme, "neon");
+    let mut normalized = WorkbenchModel::new(Shell::default());
+    normalized.apply_settings(&loaded.shell);
+    assert_eq!(normalized.settings.theme, "system");
+    assert_eq!(normalized.settings.density, "compact");
+    assert_eq!(normalized.settings.editor_font, 24);
+    assert_eq!(normalized.settings.editor_theme, "auto");
+    assert_eq!(normalized.settings.locale, "zh-CN");
+    assert_eq!(normalized.settings.page_size, 1);
+    assert_eq!(normalized.settings.preview_kb, 64);
+    assert_eq!(normalized.settings.object_page, 1);
+    assert_eq!(normalized.settings.null_copy, "NULL");
+    assert_eq!(normalized.settings.query_timeout_sec, 0);
+    assert_eq!(normalized.settings.to_settings(), ShellSettings {
+        theme: "system".into(),
+        density: "compact".into(),
+        editor_font: 24,
+        editor_theme: "auto".into(),
+        locale: "zh-CN".into(),
+        page_size: 1,
+        preview_kb: 64,
+        object_page: 1,
+        null_copy: "NULL".into(),
+        query_timeout_sec: 0,
+        auto_check_updates: true,
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui_kit::test]
+fn history_and_settings_pages_render_and_apply_their_controls(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-history-render-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench(cx, Arc::clone(&services), false);
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.model.shell.page = AppPage::History;
+            view.model.history.runs = vec![
+                history_run("a", "select 1", "live", "ok"),
+                history_run("b", "select 2", "live", "error"),
+            ];
+            view.model.history.selected_run = Some("a".into());
+            view.model.history.preview_open = true;
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        view.update(cx, |view, cx| view.perform("history-status-failed", cx));
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).model.history.filter_status, "failed");
+        assert_eq!(view.read(cx).model.history.filtered_runs().len(), 1);
+        window.click("history-preview-close", cx);
+        window.render_frame(cx);
+        assert!(!view.read(cx).model.history.preview_open);
+        window.click("history-filter-reset", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).model.history.filter_status.is_empty());
+        view.update(cx, |view, cx| {
+            view.perform("saved-queries", cx);
+            view.model.history.saved = vec![crate::query::SavedQuery {
+                id: "s1".into(),
+                name: "计数".into(),
+                sql: "select 1".into(),
+                connection_id: "live".into(),
+                connection_name: "conn-live".into(),
+                database_name: "app".into(),
+                engine: "postgres".into(),
+                updated_at: "2026-11-07T00:00:00Z".into(),
+            }];
+            view.model.history.selected_saved = Some("s1".into());
+            view.perform("history-rename", cx);
+        });
+        window.render_frame(cx);
+        assert!(view.read(cx).model.history.rename_open);
+        window.click("history-rename-cancel", cx);
+        window.render_frame(cx);
+        assert!(!view.read(cx).model.history.rename_open);
+        view.update(cx, |view, cx| view.perform("saved-delete", cx));
+        window.render_frame(cx);
+        assert!(view.read(cx).model.history.confirm_delete);
+        window.click("cmd-saved-delete-cancel", cx);
+        window.render_frame(cx);
+        assert!(!view.read(cx).model.history.confirm_delete);
+        view.update(cx, |view, cx| view.perform("settings", cx));
+        window.render_frame(cx);
+        let before = view.read(cx).model.settings.object_page;
+        window.click("object-page-up", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).model.settings.object_page > before);
+        window.click("object-page-down", cx);
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).model.settings.object_page, before);
     })
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);

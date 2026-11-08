@@ -155,6 +155,9 @@ impl Workbench {
         if self.model.history.confirm_clear {
             root = root.child(self.clear_history_layer(cx));
         }
+        if self.model.history.confirm_delete {
+            root = root.child(self.delete_saved_layer(cx));
+        }
         root.into_any_element()
     }
 
@@ -163,6 +166,14 @@ impl Workbench {
         let key = event.keystroke.key.as_str();
         if key == "escape" && self.model.connections.confirm_delete && self.model.menu.is_none() && self.model.close_prompt.is_none() {
             self.perform("conn-delete-cancel", cx);
+            return;
+        }
+        if key == "escape" && self.model.history.confirm_clear && self.model.menu.is_none() && self.model.close_prompt.is_none() {
+            self.perform("history-clear-cancel", cx);
+            return;
+        }
+        if key == "escape" && self.model.history.confirm_delete && self.model.menu.is_none() && self.model.close_prompt.is_none() {
+            self.perform("saved-delete-cancel", cx);
             return;
         }
         if key == "escape" && self.model.exchange_open && self.model.menu.is_none() && !self.model.shell.palette_open {
@@ -1444,6 +1455,7 @@ impl Workbench {
         let section = self.model.history.section;
         let search = self.input_for(DraftField::HistorySearch, &self.model.text("ui.history.search"), false, window, cx);
         let save_name = self.input_for(DraftField::SaveName, &self.model.text("ui.history.saveAs"), false, window, cx);
+        let rename_input = self.input_for(DraftField::RenameName, &self.model.text("history.page.rename"), false, window, cx);
         let tabs = kit::segmented(
             vec![
                 (
@@ -1461,12 +1473,79 @@ impl Workbench {
             ],
             &p,
         );
+        let filter_status = self.model.history.filter_status.clone();
+        let status_seg = kit::segmented(
+            vec![
+                (
+                    SharedString::from("history-status-all"),
+                    self.t("history.filter.all"),
+                    filter_status.is_empty(),
+                    kit::click(act("history-status-all", cx)),
+                ),
+                (
+                    SharedString::from("history-status-ok"),
+                    self.t("history.status.ok"),
+                    filter_status == "ok",
+                    kit::click(act("history-status-ok", cx)),
+                ),
+                (
+                    SharedString::from("history-status-failed"),
+                    self.t("history.status.failed"),
+                    filter_status == "failed",
+                    kit::click(act("history-status-failed", cx)),
+                ),
+            ],
+            &p,
+        );
+        let filter_connection = self.model.history.filter_connection.clone();
+        let connection_label = if filter_connection.is_empty() {
+            self.t("history.page.filterConnection")
+        } else {
+            self.model
+                .connections
+                .rows
+                .iter()
+                .find(|row| row.saved.id == filter_connection)
+                .map(|row| SharedString::from(row.saved.name.clone()))
+                .unwrap_or_else(|| SharedString::from(filter_connection.clone()))
+        };
+        let has_filters = self.model.history.has_filters();
         let mono = cx.theme().mono_font_family.clone();
         let mut list = div().id("history-list").flex().flex_col().gap(px(6.)).flex_1().min_h(px(0.)).overflow_y_scroll().px(px(24.)).pb(px(24.));
+        if let Some(key) = self.model.history.failure_key {
+            let detail = self.model.history.failure_detail.clone();
+            list = list.child(
+                div()
+                    .id("history-failure")
+                    .role(gpui_kit::Role::Status)
+                    .px(px(12.))
+                    .py(px(10.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(p.danger)
+                    .bg(p.danger_soft)
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(kit::icon(IconName::CircleAlert, 14., p.danger))
+                            .child(div().font_weight(FontWeight::MEDIUM).text_color(p.danger).child(self.t(key))),
+                    )
+                    .when(!detail.is_empty(), |this| this.child(div().text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(detail)))),
+            );
+        }
         if section == HistorySection::Runs {
             let runs: Vec<_> = self.model.history.filtered_runs().into_iter().take(200).cloned().collect();
             if runs.is_empty() {
-                list = list.child(kit::empty_state(IconName::Clock, self.t("ui.history.empty"), self.t("history.page.loadOnlySql"), &p));
+                if self.model.history.runs.is_empty() {
+                    list = list.child(kit::empty_state(IconName::Clock, self.t("ui.history.empty"), self.t("history.page.loadOnlySql"), &p));
+                } else {
+                    list = list.child(kit::empty_state(IconName::Search, self.t("history.page.noMatch"), self.t("history.filter.reset"), &p));
+                }
             }
             for entry in runs {
                 let id = entry.id.clone();
@@ -1477,6 +1556,7 @@ impl Workbench {
                 let select = id.clone();
                 let menu = id.clone();
                 let load = id.clone();
+                let delete = id.clone();
                 list = list.child(
                     div()
                         .id(SharedString::from(format!("run-{id}")))
@@ -1526,6 +1606,10 @@ impl Workbench {
                                                 this.perform("history-copy", cx);
                                             }
                                         })).xsmall())
+                                        .child(kit::tool_button(SharedString::from(format!("run-del-{id}")), Some(IconName::Trash), self.t("ui.history.delete"), cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            this.model.history.selected_run = Some(delete.clone());
+                                            this.perform("history-delete", cx);
+                                        })).xsmall())
                                         .child(kit::secondary_button(SharedString::from(format!("run-load-{id}")), Some(IconName::SquarePen), self.t("ui.history.load"), cx.listener(move |this, _: &ClickEvent, _, cx| {
                                             this.model.history.selected_run = Some(load.clone());
                                             this.perform("history-load", cx);
@@ -1539,6 +1623,7 @@ impl Workbench {
                         }))
                         .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                             this.model.history.selected_run = Some(select.clone());
+                            this.model.history.preview_open = true;
                             if event.click_count() >= 2 {
                                 this.perform("history-load", cx);
                             }
@@ -1549,12 +1634,19 @@ impl Workbench {
         } else {
             let saved: Vec<_> = self.model.history.filtered_saved().into_iter().take(200).cloned().collect();
             if saved.is_empty() {
-                list = list.child(kit::empty_state(IconName::Bookmark, self.t("ui.history.emptySaved"), self.t("history.savedPanel.openNote"), &p));
+                if self.model.history.saved.is_empty() {
+                    list = list.child(kit::empty_state(IconName::Bookmark, self.t("ui.history.emptySaved"), self.t("history.savedPanel.openNote"), &p));
+                } else {
+                    list = list.child(kit::empty_state(IconName::Search, self.t("history.page.noMatchSaved"), self.t("history.filter.reset"), &p));
+                }
             }
             for item in saved {
                 let id = item.id.clone();
                 let selected = self.model.history.selected_saved.as_deref() == Some(id.as_str());
                 let select = id.clone();
+                let copy = id.clone();
+                let load = id.clone();
+                let rename = id.clone();
                 let delete = id.clone();
                 list = list.child(
                     div()
@@ -1586,6 +1678,21 @@ impl Workbench {
                                         .flex()
                                         .gap(px(4.))
                                         .when(!selected, |this| this.invisible().group_hover("saved-row", |style| style.visible()))
+                                        .child(kit::tool_button(SharedString::from(format!("saved-copy-{id}")), Some(IconName::Copy), self.t("common.copy"), cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            this.model.history.section = HistorySection::Saved;
+                                            this.model.history.selected_saved = Some(copy.clone());
+                                            this.perform("history-copy", cx);
+                                        })).xsmall())
+                                        .child(kit::tool_button(SharedString::from(format!("saved-load-{id}")), Some(IconName::SquarePen), self.t("ui.history.load"), cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            this.model.history.section = HistorySection::Saved;
+                                            this.model.history.selected_saved = Some(load.clone());
+                                            this.perform("history-load", cx);
+                                        })).xsmall())
+                                        .child(kit::tool_button(SharedString::from(format!("saved-rename-{id}")), Some(IconName::Pencil), self.t("history.page.rename"), cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            this.model.history.section = HistorySection::Saved;
+                                            this.model.history.selected_saved = Some(rename.clone());
+                                            this.perform("history-rename", cx);
+                                        })).xsmall())
                                         .child(kit::icon_button(SharedString::from(format!("saved-del-{id}")), IconName::Trash, self.t("ui.history.delete"), cx.listener(move |this, _: &ClickEvent, _, cx| {
                                             this.model.history.section = HistorySection::Saved;
                                             this.model.history.selected_saved = Some(delete.clone());
@@ -1597,6 +1704,7 @@ impl Workbench {
                         .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                             this.model.history.section = HistorySection::Saved;
                             this.model.history.selected_saved = Some(select.clone());
+                            this.model.history.preview_open = true;
                             if event.click_count() >= 2 {
                                 this.perform("history-load", cx);
                             }
@@ -1607,6 +1715,12 @@ impl Workbench {
         }
 
         let can_save = self.model.active_tab().is_some_and(|tab| tab.kind.is_query());
+        let selected_any = if section == HistorySection::Saved {
+            self.model.history.selected_saved.is_some()
+        } else {
+            self.model.history.selected_run.is_some()
+        };
+        let preview_open = self.model.history.preview_open;
         let toolbar = div()
             .flex()
             .flex_wrap()
@@ -1614,6 +1728,10 @@ impl Workbench {
             .gap(px(10.))
             .child(tabs)
             .child(div().w(px(260.)).child(search.prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)))
+            .when(section == HistorySection::Runs, |this| this.child(status_seg))
+            .child(kit::tool_button("history-filter-connection", Some(IconName::Funnel), connection_label, act("history-filter-connection", cx)))
+            .when(has_filters, |this| this.child(kit::tool_button("history-filter-reset", Some(IconName::X), self.t("history.filter.reset"), act("history-filter-reset", cx))))
+            .when(selected_any && !preview_open, |this| this.child(kit::tool_button("history-preview-open", Some(IconName::Eye), self.t("history.page.sqlPreview"), act("history-detail", cx))))
             .child(div().flex_1())
             .when(section == HistorySection::Runs, |this| {
                 this.child(kit::tool_button("history-clear", Some(IconName::Trash), self.t("ui.history.clear"), act("history-clear", cx)))
@@ -1622,7 +1740,27 @@ impl Workbench {
             .when(section == HistorySection::Saved && can_save, |this| {
                 this.child(div().w(px(220.)).child(save_name)).child(kit::primary_button("history-save-named", Some(IconName::Save), self.t("history.savedPanel.save"), act("history-save-named", cx)))
             });
+        let rename_bar = if section == HistorySection::Saved && self.model.history.rename_open {
+            div()
+                .px(px(24.))
+                .pb(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(div().w(px(260.)).child(rename_input))
+                .child(kit::primary_button("history-rename-confirm", Some(IconName::Check), self.t("history.page.renameSave"), act("history-rename-confirm", cx)))
+                .child(kit::secondary_button("history-rename-cancel", Some(IconName::X), self.t("common.cancel"), act("history-rename-cancel", cx)))
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
 
+        let known = self.model.known_ids();
+        let preview = if preview_open {
+            self.history_preview(&known, &p, cx)
+        } else {
+            div().into_any_element()
+        };
         div()
             .id("history-page")
             .role(gpui_kit::Role::Group)
@@ -1641,7 +1779,88 @@ impl Workbench {
                     .child(div().flex().flex_col().gap(px(2.)).child(kit::title(self.t("history.page.titleRuns"), 17., &p)).child(kit::muted(self.t("history.page.loadOnlySql"), &p)))
                     .child(toolbar),
             )
-            .child(list)
+            .child(rename_bar)
+            .child(div().flex().flex_1().min_h(px(0.)).child(list).child(preview))
+            .into_any_element()
+    }
+
+    fn history_preview(&self, known: &std::collections::BTreeSet<String>, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(plan) = self.model.history.preview_plan(known) else {
+            return div().into_any_element();
+        };
+        let mono = cx.theme().mono_font_family.clone();
+        let status = if self.model.history.section == HistorySection::Runs {
+            self.model.history.selected_run_entry().map(|entry| entry.status.clone())
+        } else {
+            None
+        };
+        let target = if plan.needs_target {
+            self.model.text("history.plan.deletedNotice")
+        } else if plan.database.as_deref().is_some_and(|database| !database.is_empty()) {
+            format!("{} / {}", plan.connection_name, plan.database.unwrap_or_default())
+        } else {
+            plan.connection_name.clone()
+        };
+        let status_label = status.map(|status| {
+            let ok = status == "ok" || status == "success" || status == "done";
+            (if ok { self.t("history.status.ok") } else { self.t("history.status.failed") }, ok)
+        });
+        div()
+            .id("history-preview")
+            .role(gpui_kit::Role::Group)
+            .flex_none()
+            .w(px(380.))
+            .min_h(px(0.))
+            .border_l_1()
+            .border_color(p.line)
+            .p(px(18.))
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(kit::title(self.t("history.page.sqlPreview"), 13., p))
+                    .child(div().flex_1())
+                    .child(kit::icon_button("history-preview-close", IconName::X, self.t("history.page.previewClose"), act("history-preview-close", cx))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(kit::engine_badge(&plan.engine, 14.))
+                    .child(div().text_size(px(11.5)).text_color(if plan.needs_target { p.warn } else { p.text_muted }).child(SharedString::from(target))),
+            )
+            .when_some(status_label, |this, (label, ok)| {
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .text_size(px(11.5))
+                        .text_color(if ok { p.ok } else { p.danger })
+                        .child(kit::status_dot(if ok { p.ok } else { p.danger }))
+                        .child(label),
+                )
+            })
+            .child(
+                div()
+                    .id("history-preview-sql")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .rounded(px(8.))
+                    .bg(p.chrome)
+                    .p(px(12.))
+                    .font_family(mono)
+                    .text_size(px(12.5))
+                    .text_color(p.text)
+                    .child(SharedString::from(plan.sql)),
+            )
+            .child(div().text_size(px(11.5)).text_color(p.text_faint).child(self.t("history.page.loadOnlySql")))
             .into_any_element()
     }
 
@@ -1707,17 +1926,20 @@ impl Workbench {
             .items_center()
             .gap(px(8.))
             .child(div().font_weight(FontWeight::MEDIUM).child(self.t(crate::app::views::settings::editor_theme_key(&s.editor_theme))))
-            .child(kit::secondary_button("editor-theme-next", Some(IconName::RefreshCw), self.t("ui.settings.change"), act("editor-theme-next", cx)));
+            .child(kit::icon_button("editor-theme-prev", IconName::ChevronLeft, self.t("ui.settings.change"), act("editor-theme-prev", cx)).outline())
+            .child(kit::icon_button("editor-theme-next", IconName::ChevronRight, self.t("ui.settings.change"), act("editor-theme-next", cx)).outline());
         let stepper = |this: &Self, id: &'static str, value: String, cx: &mut Context<Self>| {
             div()
                 .flex()
                 .items_center()
-                .gap(px(8.))
-                .child(div().font_weight(FontWeight::MEDIUM).child(SharedString::from(value)))
-                .child(kit::secondary_button(id, Some(IconName::Plus), this.t("ui.settings.increase"), act(id, cx)))
+                .gap(px(6.))
+                .child(kit::icon_button(SharedString::from(format!("{id}-down")), IconName::Minus, this.t("ui.settings.smaller"), act(format!("{id}-down"), cx)).outline())
+                .child(div().min_w(px(56.)).text_center().font_weight(FontWeight::MEDIUM).child(SharedString::from(value)))
+                .child(kit::icon_button(SharedString::from(format!("{id}-up")), IconName::Plus, this.t("ui.settings.increase"), act(format!("{id}-up"), cx)).outline())
         };
-        let page_size = stepper(self, "page-size-up", s.page_size.to_string(), cx);
-        let preview = stepper(self, "preview-up", format!("{} KB", s.preview_kb), cx);
+        let page_size = stepper(self, "page-size", s.page_size.to_string(), cx);
+        let preview = stepper(self, "preview", format!("{} KB", s.preview_kb), cx);
+        let object_page = stepper(self, "object-page", s.object_page.to_string(), cx);
         let updates = div()
             .id("toggle-updates")
             .role(gpui_kit::Role::Switch)
@@ -1793,6 +2015,7 @@ impl Workbench {
                         vec![
                             (self.t("shell.settings.rowsPerPage"), None, page_size.into_any_element()),
                             (self.t("shell.settings.previewLimit"), None, preview.into_any_element()),
+                            (self.t("shell.settings.objectPage"), None, object_page.into_any_element()),
                             (self.t("shell.settings.nullCopy"), None, null_seg),
                             (self.t("shell.settings.timeout"), None, timeout_seg),
                         ],
@@ -2078,6 +2301,19 @@ impl Workbench {
         backdrop("clear-backdrop", 0.32, cx).flex().items_center().justify_center().child(dialog).into_any_element()
     }
 
+    fn delete_saved_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let dialog = dialog_card("delete-saved", IconName::Trash, p.danger, self.t("history.page.saved"), self.t("history.page.deleteSavedConfirm"), &p).child(
+            div()
+                .flex()
+                .justify_end()
+                .gap(px(8.))
+                .child(kit::secondary_button("cmd-saved-delete-cancel", None, self.t("common.cancel"), act("saved-delete-cancel", cx)))
+                .child(kit::danger_button("cmd-saved-delete-confirm", Some(IconName::Trash), self.t("ui.history.delete"), act("saved-delete", cx))),
+        );
+        backdrop("delete-saved-backdrop", 0.32, cx).flex().items_center().justify_center().child(dialog).into_any_element()
+    }
+
     fn exchange_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let panel = div()
@@ -2342,6 +2578,7 @@ fn backdrop(id: &'static str, dim: f32, cx: &mut Context<Workbench>) -> gpui_kit
             entity.update(cx, |this, cx| {
                 let effect = this.model.dismiss();
                 this.model.history.confirm_clear = false;
+                this.model.history.confirm_delete = false;
                 this.apply_effect(effect, cx);
                 cx.notify();
             });

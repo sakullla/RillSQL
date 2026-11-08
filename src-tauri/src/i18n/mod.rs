@@ -88,6 +88,7 @@ dict! {
     "shell.settings.editorThemeMono" => "弱化灰阶", "Muted grayscale";
     "shell.settings.rowsPerPage" => "每次读取的行数", "Rows per read";
     "shell.settings.previewLimit" => "大字段预览上限", "Large value preview limit";
+    "shell.settings.objectPage" => "对象树每次读取", "Objects per read";
     "shell.settings.nullCopy" => "复制 NULL 时写入", "Text written for NULL when copying";
     "shell.settings.timeout" => "语句执行超时", "Statement timeout";
     "shell.shortcuts.groupGrid" => "表格", "Grid";
@@ -237,6 +238,18 @@ dict! {
     "history.savedPanel.save" => "保存", "Save";
     "history.savedPanel.needTab" => "先打开一个查询标签，再保存其中的 SQL。", "Open a query tab first, then save its SQL.";
     "history.plan.deletedNotice" => "需要重新选择执行目标。原来的连接已删除，这次只载入 SQL，不会执行。", "An execution target must be chosen again. The original connection was deleted; this loads the SQL only and never executes.";
+    "history.page.noMatch" => "没有匹配的历史记录", "No matching history";
+    "history.page.noMatchSaved" => "没有匹配的保存查询", "No matching saved queries";
+    "history.page.failed" => "历史操作失败，原条目已保留。", "The history action failed; existing entries were kept.";
+    "history.page.deleteSavedConfirm" => "删除这条保存的查询？此操作无法撤销。", "Delete this saved query? This cannot be undone.";
+    "history.page.rename" => "重命名", "Rename";
+    "history.page.renameSave" => "保存新名称", "Save name";
+    "history.page.needName" => "请填写名称", "Enter a name";
+    "history.page.previewClose" => "关闭预览", "Close preview";
+    "history.status.ok" => "成功", "Succeeded";
+    "history.status.failed" => "失败", "Failed";
+    "history.filter.all" => "全部", "All";
+    "history.filter.reset" => "清除筛选", "Clear filters";
     "query.editor.area" => "查询", "Query";
     "query.editor.menu.run" => "执行", "Run";
     "query.editor.menu.runCurrent" => "执行当前语句", "Run current statement";
