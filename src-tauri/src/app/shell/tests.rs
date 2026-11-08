@@ -534,6 +534,20 @@ fn switching_work_items_drops_structure_admin_redis_and_mongo_state(cx: &mut gpu
 }
 
 #[test]
+fn reopening_the_same_item_gets_a_new_epoch_even_when_the_id_is_reused() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    let spec = "notes|笔记|main||customers|sqlite|dev";
+    assert!(model.dispatch(&format!("open-structure-for:{spec}")).is_some());
+    let first = model.active_tab().expect("structure").clone();
+    model.request_close_tab(&first.id);
+    assert!(model.tabs.is_empty());
+    assert!(model.dispatch(&format!("open-structure-for:{spec}")).is_some());
+    let second = model.active_tab().expect("structure").clone();
+    assert_eq!(first.id, second.id, "标签 id 可能被回收");
+    assert_ne!(first.epoch, second.epoch, "重开必须得到新的工作项实例");
+}
+
+#[test]
 fn staged_cells_block_switching_to_another_table() {
     let mut model = WorkbenchModel::new(Shell::default());
     let customers = "notes|笔记|main||customers|sqlite|dev";

@@ -479,7 +479,11 @@ impl Workbench {
 
     fn ensure_tool(&mut self, cx: &mut Context<Self>) {
         let spec = self.model.table_spec.clone().unwrap_or_default();
-        let item = self.model.active_tab.clone().unwrap_or_default();
+        let item = self
+            .model
+            .active_tab()
+            .map(|tab| format!("{}#{}", tab.id, tab.epoch))
+            .unwrap_or_default();
         let key = format!("{:?}:{spec}", self.model.tool);
         if self.applied_tool.as_deref() == Some(key.as_str()) {
             return;
