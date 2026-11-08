@@ -990,19 +990,13 @@ fn pump_exchange(
     cx: &mut gpui_kit::TestAppContext,
     window: gpui_kit::AnyWindowHandle,
     view: &gpui_kit::Entity<super::view::Workbench>,
-    mut ready: impl FnMut(&super::view::Workbench, &gpui_kit::App) -> bool,
+    ready: impl FnMut(&super::view::Workbench, &gpui_kit::App) -> bool,
 ) {
-    for _ in 0..48 {
-        let done = cx.update(|app| ready(view.read(app), app));
-        if done {
-            return;
-        }
-        cx.update_window(window, |_, window, cx| {
-            window.render_frame(cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
+    if pump_for(cx, window, view, std::time::Duration::from_secs(30), ready) {
+        return;
     }
+    let text = cx.update(|app| view.read(app).exchange_text(app));
+    panic!("导入导出没有在 30 秒内结束：\n{text}");
 }
 
 #[gpui_kit::test]
@@ -1202,7 +1196,11 @@ fn exchange_commands_prompt_map_cancel_and_fail_from_the_workbench(cx: &mut gpui
     assert!(cx.did_prompt_for_paths(), "跨库迁移应打开目标库");
     cx.simulate_path_prompt_response(|_| Some(vec![target_opened.clone()]));
     pump_exchange(cx, window, &view, |view, app| {
-        view.exchange_tasks(app).iter().any(|task| task.kind == "migrate" && task.phase != Phase::Running)
+        view.exchange_tasks(app)
+            .iter()
+            .rev()
+            .find(|task| task.kind == "migrate")
+            .is_some_and(|task| task.phase != Phase::Running)
     });
     cx.update(|app| {
         let text = view.read(app).exchange_text(app);
