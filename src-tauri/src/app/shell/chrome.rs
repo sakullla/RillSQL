@@ -5,7 +5,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, TitleBar};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, ClickEvent, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
@@ -207,20 +207,24 @@ impl Workbench {
         let dark = matches!(self.model.shell.resolved_theme(), crate::app::ResolvedTheme::Dark);
         let theme_next = if dark { "theme-light" } else { "theme-dark" };
         let narrow = self.model.viewport_width <= 760;
-        div()
+        let entity = cx.entity();
+        // 顶栏就是窗口标题栏：空白处拖动窗口、双击最大化，Windows/Linux 在右侧画最小化/最大化/关闭。
+        // 按钮包在 occlude 里，命中测试才不会把点击当成拖动标题栏。
+        let controls = |child: AnyElement| div().flex().items_center().gap(px(8.)).occlude().child(child);
+        let row = div()
             .id("toolbar")
             .role(gpui_kit::Role::Toolbar)
             .aria_label(self.t("shell.command.newQuery"))
-            .flex_none()
-            .h(px(TOPBAR_H))
-            .px(px(10.))
+            .h_full()
+            .flex_1()
+            .min_w(px(0.))
+            .pr(px(10.))
             .flex()
             .items_center()
             .gap(px(8.))
-            .bg(p.chrome)
-            .border_b_1()
-            .border_color(p.line)
-            .child(kit::icon_button("top-sidebar", IconName::PanelLeft, self.t("shell.command.toggleSidebar"), act("sidebar", cx)))
+            .child(controls(
+                kit::icon_button("top-sidebar", IconName::PanelLeft, self.t("shell.command.toggleSidebar"), act("sidebar", cx)).into_any_element(),
+            ))
             .child(
                 div()
                     .flex()
@@ -230,7 +234,7 @@ impl Workbench {
                     .when(!narrow, |this| this.child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child("RillSQL"))),
             )
             .child(div().flex_1())
-            .child(
+            .child(controls(
                 div()
                     .id("top-search")
                     .role(gpui_kit::Role::Button)
@@ -250,21 +254,34 @@ impl Workbench {
                     .child(kit::icon(IconName::Search, 14., p.text_faint))
                     .child(div().flex_1().truncate().text_size(px(12.5)).text_color(p.text_faint).child(self.t("ui.search.placeholder")))
                     .child(kit::kbd(kit::shortcut("Ctrl+K"), &p))
-                    .on_click(act("command-palette", cx)),
-            )
-            .child(div().flex_1())
-            .child(kit::icon_button("top-sqlite", IconName::FolderOpen, self.t("shell.command.openSqlite"), act("open-sqlite", cx)))
-            .child(kit::icon_button(
-                "top-theme",
-                if dark { IconName::Sun } else { IconName::Moon },
-                self.t(if dark { "shell.command.themeLight" } else { "shell.command.themeDark" }),
-                act(theme_next, cx),
+                    .on_click(act("command-palette", cx))
+                    .into_any_element(),
             ))
-            .child(if narrow {
-                kit::icon_button("top-new-query", IconName::Plus, self.t("shell.command.newQuery"), act("new-query", cx)).primary().into_any_element()
-            } else {
-                kit::primary_button("top-new-query", Some(IconName::Plus), self.t("shell.command.newQuery"), act("new-query", cx)).into_any_element()
+            .child(div().flex_1())
+            .child(
+                controls(kit::icon_button("top-sqlite", IconName::FolderOpen, self.t("shell.command.openSqlite"), act("open-sqlite", cx)).into_any_element())
+                    .child(kit::icon_button(
+                        "top-theme",
+                        if dark { IconName::Sun } else { IconName::Moon },
+                        self.t(if dark { "shell.command.themeLight" } else { "shell.command.themeDark" }),
+                        act(theme_next, cx),
+                    ))
+                    .child(if narrow {
+                        kit::icon_button("top-new-query", IconName::Plus, self.t("shell.command.newQuery"), act("new-query", cx)).primary().into_any_element()
+                    } else {
+                        kit::primary_button("top-new-query", Some(IconName::Plus), self.t("shell.command.newQuery"), act("new-query", cx)).into_any_element()
+                    }),
+            );
+        TitleBar::new()
+            .h(px(TOPBAR_H))
+            .when(!cfg!(target_os = "macos"), |this| this.pl(px(10.)))
+            .bg(p.chrome)
+            .border_color(p.line)
+            // Linux 自绘的关闭按钮走与系统关闭相同的未保存守卫。
+            .on_close_window(move |_, _, cx| {
+                entity.update(cx, |this, cx| this.perform("quit-window", cx));
             })
+            .child(row)
             .into_any_element()
     }
 

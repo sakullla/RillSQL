@@ -9,6 +9,7 @@ pub use session::{operation_banner, prove_single_table, GridMode, GridTarget, Sh
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableEvent, TableState};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _};
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, relative,
@@ -206,6 +207,10 @@ impl GridPane {
                 self.session.select_all_loaded();
                 None
             }
+            "grid-undo" => {
+                let _ = self.session.undo_last_stage();
+                None
+            }
             "grid-search" => {
                 self.session.set_search(&self.search_text);
                 None
@@ -261,6 +266,46 @@ impl GridPane {
             self.table.update(cx, |state, cx| state.scroll_to_row(row, cx));
         }
         copied
+    }
+
+    /// 表头右键菜单的命令。`column` 是数据列序号（不含行号列）。
+    pub fn column_command(&mut self, column: usize, id: &str, cx: &mut Context<Self>) {
+        let Some(name) = self.session.column_names().get(column).cloned() else {
+            return;
+        };
+        let copied = match id {
+            "column-sort-asc" => {
+                self.sort_desc = false;
+                self.session.set_sort(&name, false);
+                None
+            }
+            "column-sort-desc" => {
+                self.sort_desc = true;
+                self.session.set_sort(&name, true);
+                None
+            }
+            "column-clear-sort" => {
+                self.session.clear_sort();
+                None
+            }
+            "column-clear-filters" => {
+                self.search_text.clear();
+                self.session.clear_filters();
+                None
+            }
+            "column-copy-name" => Some(name),
+            "column-copy" => {
+                let row = self.session.focus_cell().map(|(row, _)| row).unwrap_or(0);
+                self.session.select(row, column, false);
+                Some(self.session.copy_column())
+            }
+            _ => None,
+        };
+        if let Some(text) = copied {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        self.sync_table(cx);
+        cx.notify();
     }
 
     fn apply_table_event(&mut self, event: &TableEvent) {
@@ -454,7 +499,13 @@ impl GridPane {
         let widths = self.session.widths();
         let rows = self.session.sheet_labels();
         let has_more = self.session.has_more_rows();
+        let locale = self.locale;
+        let writable = self.session.writable();
+        let dirty = self.session.uncommitted();
         self.table.update(cx, |state, cx| {
+            state.delegate_mut().locale = locale;
+            state.delegate_mut().writable = writable;
+            state.delegate_mut().dirty = dirty;
             state.delegate_mut().columns = std::iter::once(("#".to_owned(), 56.0, true))
                 .chain(names.into_iter().zip(widths).map(|(name, width)| (name, width, false)))
                 .collect();
@@ -597,6 +648,10 @@ impl Render for GridPane {
                     if let Some((row, column)) = this.session.focus_cell() {
                         this.session.open_value(row, column);
                     }
+                    cx.notify();
+                } else if let Some(id) = grid_shortcut(key, event.keystroke.modifiers.secondary(cx), event.keystroke.modifiers.shift) {
+                    cx.stop_propagation();
+                    let _ = this.command(id, cx);
                     cx.notify();
                 }
             }))
@@ -802,6 +857,120 @@ struct SheetDelegate {
     visible_start: usize,
     visible_seen: bool,
     owner: Option<gpui_kit::WeakEntity<GridPane>>,
+    locale: Locale,
+    writable: bool,
+    dirty: bool,
+}
+
+/// 表格获得焦点时的快捷键。与快捷键帮助里登记的组合一致。
+fn grid_shortcut(key: &str, secondary: bool, shift: bool) -> Option<&'static str> {
+    match (key, secondary, shift) {
+        ("c", true, true) => Some("copy-sql-value"),
+        ("c", true, false) => Some("copy-region"),
+        ("a", true, false) => Some("select-all-cells"),
+        ("z", true, false) => Some("grid-undo"),
+        ("delete", false, _) => Some("mark-delete"),
+        ("f2", false, _) => Some("edit-cell"),
+        _ => None,
+    }
+}
+
+/// 单元格右键菜单：(命令, 文案, 需要可写, 危险)。
+const CELL_MENU: &[(&str, &str, bool, bool)] = &[
+    ("copy-region", "grid.value.copyValue", false, false),
+    ("copy-sql-value", "shell.shortcuts.copySqlValue", false, false),
+    ("grid-copy-row", "grid.menu.copyRow", false, false),
+    ("grid-copy-column", "grid.menu.copyColumn", false, false),
+    ("", "", false, false),
+    ("grid-filter-value", "grid.menu.filterByValue", false, false),
+    ("select-all-cells", "grid.menu.selectAll", false, false),
+    ("", "", false, false),
+    ("edit-cell", "shell.shortcuts.editCell", true, false),
+    ("grid-insert", "grid.action.insert", true, false),
+    ("mark-delete", "grid.menu.markDelete", true, true),
+];
+
+/// 表头右键菜单。
+const COLUMN_MENU: &[(&str, &str)] = &[
+    ("column-sort-asc", "grid.menu.sortAsc"),
+    ("column-sort-desc", "grid.menu.sortDesc"),
+    ("column-clear-sort", "grid.menu.clearSort"),
+    ("", ""),
+    ("column-copy", "grid.menu.copyColumn"),
+    ("column-copy-name", "grid.menu.copyColumnName"),
+    ("", ""),
+    ("column-clear-filters", "grid.menu.clearFilters"),
+];
+
+fn shortcut_hint(id: &str) -> Option<&'static str> {
+    let mac = cfg!(target_os = "macos");
+    Some(match id {
+        "copy-region" => if mac { "⌘C" } else { "Ctrl+C" },
+        "copy-sql-value" => if mac { "⇧⌘C" } else { "Ctrl+Shift+C" },
+        "select-all-cells" => if mac { "⌘A" } else { "Ctrl+A" },
+        "grid-undo" => if mac { "⌘Z" } else { "Ctrl+Z" },
+        "edit-cell" => "F2",
+        "mark-delete" => "Delete",
+        _ => return None,
+    })
+}
+
+fn menu_label(locale: Locale, key: &str, id: &str) -> SharedString {
+    let text = i18n::text(locale, key);
+    match shortcut_hint(id) {
+        Some(hint) => SharedString::from(format!("{text}    {hint}")),
+        None => SharedString::from(text),
+    }
+}
+
+pub(crate) fn cell_menu(menu: PopupMenu, owner: Option<gpui_kit::WeakEntity<GridPane>>, locale: Locale, writable: bool, dirty: bool) -> PopupMenu {
+    let mut menu = menu;
+    for (id, key, needs_write, _danger) in CELL_MENU.iter().copied() {
+        if id.is_empty() {
+            menu = menu.separator();
+            continue;
+        }
+        let owner = owner.clone();
+        menu = menu.item(
+            PopupMenuItem::new(menu_label(locale, key, id)).disabled(needs_write && !writable).on_click(move |_, _, cx| {
+                if let Some(owner) = owner.as_ref().and_then(|owner| owner.upgrade()) {
+                    owner.update(cx, |pane, cx| {
+                        let _ = pane.command(id, cx);
+                        cx.notify();
+                    });
+                }
+            }),
+        );
+    }
+    if dirty {
+        let owner = owner.clone();
+        menu = menu.separator().item(PopupMenuItem::new(menu_label(locale, "grid.menu.undo", "grid-undo")).on_click(move |_, _, cx| {
+            if let Some(owner) = owner.as_ref().and_then(|owner| owner.upgrade()) {
+                owner.update(cx, |pane, cx| {
+                    let _ = pane.command("grid-undo", cx);
+                    cx.notify();
+                });
+            }
+        }));
+    }
+    menu
+}
+
+fn column_menu(menu: PopupMenu, owner: Option<gpui_kit::WeakEntity<GridPane>>, locale: Locale, column: usize) -> PopupMenu {
+    let mut menu = menu;
+    for (id, key) in COLUMN_MENU.iter().copied() {
+        if id.is_empty() {
+            menu = menu.separator();
+            continue;
+        }
+        let owner = owner.clone();
+        menu = menu.item(PopupMenuItem::new(menu_label(locale, key, id)).on_click(move |_, _, cx| {
+            if let Some(owner) = owner.as_ref().and_then(|owner| owner.upgrade()) {
+                owner.update(cx, |pane, cx| pane.column_command(column, id, cx));
+            }
+        }));
+    }
+    menu
 }
 
 
@@ -831,6 +1000,23 @@ impl TableDelegate for SheetDelegate {
             .truncate()
             .when(null, |this| this.text_color(p.text_faint).italic())
             .child(SharedString::from(text))
+    }
+
+    fn render_th(&mut self, col_ix: usize, _: &mut Window, _: &mut Context<TableState<Self>>) -> impl IntoElement {
+        let name = self.columns.get(col_ix).map(|column| column.0.clone()).unwrap_or_default();
+        let header = div().id(("grid-th", col_ix)).size_full().flex().items_center().truncate().child(SharedString::from(name));
+        if col_ix == 0 {
+            return header.into_any_element();
+        }
+        let owner = self.owner.clone();
+        let locale = self.locale;
+        header
+            .context_menu(move |menu, _, _| column_menu(menu, owner.clone(), locale, col_ix - 1))
+            .into_any_element()
+    }
+
+    fn context_menu(&mut self, _row_ix: usize, menu: PopupMenu, _: &mut Window, _: &mut Context<TableState<Self>>) -> PopupMenu {
+        cell_menu(menu, self.owner.clone(), self.locale, self.writable, self.dirty)
     }
 
     fn cell_label(&self, row_ix: usize, col_ix: usize, _: &App) -> Option<SharedString> {
@@ -967,4 +1153,40 @@ impl GridPane {
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("grid runtime"))
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+
+    #[test]
+    fn grid_shortcuts_follow_the_help_table() {
+        assert_eq!(grid_shortcut("c", true, false), Some("copy-region"));
+        assert_eq!(grid_shortcut("c", true, true), Some("copy-sql-value"));
+        assert_eq!(grid_shortcut("a", true, false), Some("select-all-cells"));
+        assert_eq!(grid_shortcut("z", true, false), Some("grid-undo"));
+        assert_eq!(grid_shortcut("delete", false, false), Some("mark-delete"));
+        assert_eq!(grid_shortcut("f2", false, false), Some("edit-cell"));
+        assert_eq!(grid_shortcut("c", false, false), None);
+    }
+
+    #[test]
+    fn every_menu_label_is_translated() {
+        for (id, key, _, _) in CELL_MENU.iter().chain([("grid-undo", "grid.menu.undo", false, false)].iter()) {
+            if id.is_empty() {
+                continue;
+            }
+            for locale in [Locale::ZhCn, Locale::En] {
+                assert_ne!(i18n::text(locale, key), *key, "{key}");
+            }
+        }
+        for (id, key) in COLUMN_MENU {
+            if id.is_empty() {
+                continue;
+            }
+            for locale in [Locale::ZhCn, Locale::En] {
+                assert_ne!(i18n::text(locale, key), *key, "{key}");
+            }
+        }
+    }
 }

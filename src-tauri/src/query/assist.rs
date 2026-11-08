@@ -463,6 +463,21 @@ pub fn expand_star(engine: &str, sql: &str, sources: &[CompletionSource], provid
     TextResult { ok: true, sql: rewritten, reason_key: None }
 }
 
+/// 编辑器打字补全用的上下文快照：方言、当前库的对象与列。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CompletionScope {
+    pub engine: String,
+    pub objects: Vec<CatalogObject>,
+    pub sources: Vec<CompletionSource>,
+    pub provider: bool,
+}
+
+impl CompletionScope {
+    pub fn complete(&self, prefix: &str) -> Vec<CompletionEntry> {
+        complete(&self.engine, prefix, &self.objects, &self.sources, self.provider)
+    }
+}
+
 pub fn complete(engine: &str, prefix: &str, objects: &[CatalogObject], sources: &[CompletionSource], provider: bool) -> Vec<CompletionEntry> {
     if !provider || !known_engine(engine) {
         return Vec::new();

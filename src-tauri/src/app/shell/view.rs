@@ -564,6 +564,11 @@ impl Workbench {
     }
 
     #[cfg(test)]
+    pub fn query_editor_text(&self, cx: &App) -> String {
+        self.query.read(cx).editor_text(cx)
+    }
+
+    #[cfg(test)]
     pub fn query_editor_focused(&self, window: &Window, cx: &App) -> bool {
         self.query.read(cx).editor_focused(window, cx)
     }

@@ -5,8 +5,10 @@ pub mod views;
 
 use gpui_kit::{
     App, AppContext as _, Bounds, Menu, MenuItem, Point, SharedString, TitlebarOptions,
-    WindowBounds, WindowOptions, actions, px, size,
+    WindowBounds, WindowDecorations, WindowOptions, actions, point, px, size,
 };
+
+use gpui_kit::component::input;
 
 use crate::ui::Foundation;
 
@@ -101,16 +103,21 @@ fn window_options() -> WindowOptions {
             origin: Point::default(),
             size: size(px(1280.), px(820.)),
         })),
+        // 顶栏自己画成标题栏：macOS 透明标题栏保留红绿灯，Windows 去掉系统标题栏，
+        // Linux 用客户端装饰（GNOME Wayland 不提供服务端标题栏）。
         titlebar: Some(TitlebarOptions {
             title: Some(SharedString::from("RillSQL")),
-            appears_transparent: false,
-            traffic_light_position: None,
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(14.), px(15.))),
         }),
+        app_owns_titlebar_drag: true,
+        window_decorations: Some(WindowDecorations::Client),
+        window_min_size: Some(size(px(640.), px(420.))),
         ..Default::default()
     }
 }
 
-fn bind_keys(cx: &mut App) {
+pub(crate) fn bind_keys(cx: &mut App) {
     macro_rules! chord {
         ($key:literal) => {
             if cfg!(target_os = "macos") {
@@ -146,6 +153,9 @@ fn bind_keys(cx: &mut App) {
         gpui_kit::KeyBinding::new(chord!("s"), CommitEdit, None),
         gpui_kit::KeyBinding::new("escape", Dismiss, Some("Palette")),
     ]);
+    // gpui-base 只给 Windows/Linux 绑了 Ctrl+Y 重做；补上常见的 Ctrl+Shift+Z。
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([gpui_kit::KeyBinding::new("ctrl-shift-z", input::Redo, Some("Input"))]);
 }
 
 pub fn install_actions(cx: &mut App, root: &gpui_kit::Entity<Foundation>) {
@@ -277,6 +287,17 @@ pub fn install_menus(cx: &mut App, shell: &Shell) {
             MenuItem::action(label("shell.command.quit"), Quit),
         ]),
         Menu::new(label("shell.menu.edit")).items([
+            MenuItem::action(label("shell.shortcuts.undo"), input::Undo),
+            MenuItem::action(label("shell.shortcuts.redo"), input::Redo),
+            MenuItem::separator(),
+            MenuItem::action(label("shell.command.cut"), input::Cut),
+            MenuItem::action(label("shell.command.copy"), input::Copy),
+            MenuItem::action(label("shell.command.paste"), input::Paste),
+            MenuItem::action(label("shell.command.selectAll"), input::SelectAll),
+            MenuItem::separator(),
+            MenuItem::action(label("shell.shortcuts.find"), input::Search),
+            MenuItem::action(label("shell.shortcuts.replace"), input::Replace),
+            MenuItem::separator(),
             MenuItem::action(label("shell.shortcuts.format"), FormatSql),
             MenuItem::action(label("shell.shortcuts.autocomplete"), ShowAutocomplete),
         ]),

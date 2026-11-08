@@ -1455,3 +1455,40 @@ fn exchange_blocks_empty_mapping_stops_the_earlier_import_and_fails_only_that_ta
     pump_for(cx, window, &view, std::time::Duration::from_secs(8), |view, app| !view.exchange_running_now(app));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[gpui_kit::test]
+fn editor_keeps_undo_and_select_all_shortcuts_inside_the_workbench(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-undo-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update(crate::app::bind_keys);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("new-query", cx));
+        window.render_frame(cx);
+        assert!(view.read(cx).query_editor_focused(window, cx));
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.press("secondary-a", cx);
+        window.input("select 42", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        assert_eq!(view.read(cx).query_editor_text(cx), "select 42", "Ctrl+A 后输入应替换全文");
+        window.press("secondary-z", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        let undone = view.read(cx).query_editor_text(cx);
+        assert_ne!(undone, "select 42", "Ctrl+Z 没有撤销");
+        window.press(if cfg!(target_os = "macos") { "cmd-shift-z" } else { "ctrl-y" }, cx);
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).query_editor_text(cx), "select 42", "重做没有恢复");
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

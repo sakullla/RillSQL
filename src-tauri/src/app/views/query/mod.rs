@@ -163,6 +163,11 @@ impl QueryPane {
     }
 
     #[cfg(test)]
+    pub fn editor_text(&self, cx: &App) -> String {
+        self.desk.active_id().and_then(|id| self.editors.get(id)).map(|editor| editor.read(cx).value(cx)).unwrap_or_default()
+    }
+
+    #[cfg(test)]
     pub fn editor_focused(&self, window: &Window, cx: &App) -> bool {
         let Some(id) = self.desk.active_id() else {
             return false;
@@ -796,6 +801,10 @@ impl QueryPane {
 
     fn apply_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.desk.active_id().map(str::to_owned);
+        if let Some(editor) = id.as_deref().and_then(|id| self.editors.get(id)) {
+            let scope = self.desk.completion_scope();
+            editor.read(cx).set_completion_scope(scope);
+        }
         if let Some(sql) = self.pending_text.take() {
             if let Some(id) = id.as_deref() {
                 if let Some(editor) = self.editors.get(id).cloned() {

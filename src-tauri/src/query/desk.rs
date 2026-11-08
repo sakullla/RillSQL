@@ -873,17 +873,20 @@ impl Desk {
     }
 
     pub fn completion_for(&self, prefix: &str) -> Vec<CompletionEntry> {
-        let Some(tab) = self.active_tab() else {
-            return Vec::new();
-        };
-        let engine = tab.target.as_ref().map(|target| target.engine.as_str()).unwrap_or("");
+        self.completion_scope().map(|scope| scope.complete(prefix)).unwrap_or_default()
+    }
+
+    /// 当前标签的补全上下文。编辑器打字时据此给出与 Ctrl+Space 相同的候选。
+    pub fn completion_scope(&self) -> Option<assist::CompletionScope> {
+        let tab = self.active_tab()?;
+        let engine = tab.target.as_ref().map(|target| target.engine.clone()).unwrap_or_default();
         let objects = self
             .objects
             .iter()
             .filter(|object| tab.target.as_ref().is_some_and(|target| target.connection_id == object.connection_id && target.database == object.database))
             .map(|object| CatalogObject { name: object.name.clone(), schema: object.schema.clone(), kind: object.kind.clone() })
             .collect::<Vec<_>>();
-        assist::complete(engine, prefix, &objects, &self.sources_for(tab.target.as_ref()), tab.provider)
+        Some(assist::CompletionScope { engine, objects, sources: self.sources_for(tab.target.as_ref()), provider: tab.provider })
     }
 
     fn accept_assist(&mut self, tasks: &TaskBoard, ticket: &Ticket, apply: impl FnOnce(&mut TabState)) -> bool {

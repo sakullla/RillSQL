@@ -624,6 +624,21 @@ impl SharedGrid {
         gate
     }
 
+    /// 撤销最近一次暂存的修改（更新、插入或删除）。没有可撤销的内容时返回 false。
+    pub fn undo_last_stage(&mut self) -> bool {
+        let Some(last) = self.overlays.pop() else {
+            return false;
+        };
+        if last.kind == "insert" {
+            if let Some(id) = last.change_id.as_deref() {
+                self.source.retain(|item| item.id != id);
+                self.recompute();
+            }
+        }
+        self.close_preview();
+        true
+    }
+
     pub fn stage_insert(&mut self) -> Gate {
         if self.mode == GridMode::Query || !self.writable() {
             self.readonly_reason = if self.readonly_reason.is_empty() { "grid.status.readonly".to_owned() } else { self.readonly_reason.clone() };
@@ -1511,6 +1526,29 @@ mod tests {
         assert_eq!(bad.cell_label(0, 1), "zz");
         assert_eq!(bad.gate_at(0, 1), Some(Gate::Validation));
         assert!(bad.confirm_request().is_err());
+    }
+
+    #[test]
+    fn undo_drops_the_last_staged_change() {
+        let mut grid = SharedGrid::new();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some("甲")], true), row("2", vec![Some("2"), Some("乙")], true)],
+            Some(2),
+            Some(schema()),
+        );
+        assert!(!grid.undo_last_stage());
+        assert_eq!(grid.stage_text(0, 1, Some("改".into())), Gate::Writable);
+        assert_eq!(grid.cell_label(0, 1), "改");
+        assert!(grid.undo_last_stage());
+        assert_eq!(grid.cell_label(0, 1), "甲");
+        assert!(!grid.uncommitted());
+        let before = grid.rendered_len();
+        assert_eq!(grid.stage_insert(), Gate::Writable);
+        assert_eq!(grid.rendered_len(), before + 1);
+        assert!(grid.undo_last_stage());
+        assert_eq!(grid.rendered_len(), before);
+        assert!(!grid.uncommitted());
     }
 
     #[test]

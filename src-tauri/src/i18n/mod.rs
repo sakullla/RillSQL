@@ -1,7 +1,8 @@
 //! zh-CN / en 字典。键与 Vue 文案一致；两边都有的句子保持同一写法。
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Locale {
+    #[default]
     ZhCn,
     En,
 }
@@ -115,6 +116,15 @@ dict! {
     "shell.shortcuts.markDelete" => "标记删除选中的行（暂存）", "Mark selected rows for deletion (staged)";
     "shell.shortcuts.commit" => "预览并提交变更", "Preview and commit changes";
     "shell.shortcuts.copyRegion" => "复制选中区域（TSV）", "Copy the selection (TSV)";
+    "shell.shortcuts.undoStage" => "撤销最近一次暂存的修改", "Undo the last staged change";
+    "shell.shortcuts.undo" => "撤销", "Undo";
+    "shell.shortcuts.redo" => "重做", "Redo";
+    "shell.shortcuts.find" => "查找", "Find";
+    "shell.shortcuts.replace" => "替换", "Replace";
+    "shell.command.cut" => "剪切", "Cut";
+    "shell.command.copy" => "复制", "Copy";
+    "shell.command.paste" => "粘贴", "Paste";
+    "shell.command.selectAll" => "全选", "Select all";
     "shell.shortcuts.copySqlValue" => "复制为 SQL 值（区分 NULL）", "Copy as SQL values (NULL-aware)";
     "common.save" => "保存", "Save";
     "common.cancel" => "取消", "Cancel";
@@ -240,6 +250,13 @@ dict! {
     "grid.menu.copyColumn" => "复制整列", "Copy entire column";
     "grid.menu.filterByValue" => "按此值筛选", "Filter by this value";
     "grid.menu.markDelete" => "标记删除行", "Mark row for deletion";
+    "grid.menu.sortAsc" => "升序排序", "Sort ascending";
+    "grid.menu.sortDesc" => "降序排序", "Sort descending";
+    "grid.menu.clearSort" => "取消排序", "Clear sort";
+    "grid.menu.clearFilters" => "清除筛选", "Clear filters";
+    "grid.menu.copyColumnName" => "复制列名", "Copy column name";
+    "grid.menu.undo" => "撤销暂存的修改", "Undo staged change";
+    "grid.menu.selectAll" => "全选", "Select all";
     "grid.value.copyValue" => "复制值", "Copy value";
     "grid.errors.viewReadonly" => "视图是只读的，不能新增、修改或删除数据。", "Views are read-only; data cannot be inserted, modified or deleted.";
     "query.run.runScript" => "执行脚本", "Run script";
