@@ -43,6 +43,8 @@ pub struct HistoryPage {
     pub save_name: String,
     pub preview_open: bool,
     pub rename_open: bool,
+    /// 重命名开始时钉住的条目；之后点选别的行不能改变目标。
+    pub rename_target: Option<String>,
     pub rename_text: String,
     pub message_key: Option<&'static str>,
     pub failure_key: Option<&'static str>,
@@ -67,6 +69,7 @@ impl Default for HistoryPage {
             save_name: String::new(),
             preview_open: true,
             rename_open: false,
+            rename_target: None,
             rename_text: String::new(),
             message_key: None,
             failure_key: None,
@@ -207,16 +210,21 @@ impl HistoryPage {
     }
 
     pub fn begin_rename(&mut self) -> bool {
-        let Some(item) = self.selected_saved_item() else {
+        let Some((id, name)) = self
+            .selected_saved_item()
+            .map(|item| (item.id.clone(), item.name.clone()))
+        else {
             return false;
         };
-        self.rename_text = item.name.clone();
+        self.rename_text = name;
+        self.rename_target = Some(id);
         self.rename_open = true;
         true
     }
 
     pub fn cancel_rename(&mut self) {
         self.rename_open = false;
+        self.rename_target = None;
         self.rename_text.clear();
     }
 
@@ -225,7 +233,7 @@ impl HistoryPage {
         if !self.rename_open {
             return None;
         }
-        let id = self.selected_saved.clone()?;
+        let id = self.rename_target.clone()?;
         let name = self.rename_text.trim();
         if name.is_empty() {
             return None;
@@ -246,17 +254,23 @@ impl HistoryPage {
     pub fn apply_list(&mut self, runs: Vec<HistoryEntry>, saved: Vec<SavedQuery>) {
         self.runs = runs;
         self.saved = saved;
+        // 选区回退必须落在当前筛选后仍可见的第一条，不能预览到列表里不存在的记录。
+        let first_run = self.filtered_runs().first().map(|entry| entry.id.clone());
+        let first_saved = self.filtered_saved().first().map(|item| item.id.clone());
         if self.selected_run.as_ref().is_some_and(|id| !self.runs.iter().any(|entry| &entry.id == id)) {
-            self.selected_run = self.runs.first().map(|entry| entry.id.clone());
+            self.selected_run = first_run.clone();
         }
         if self.selected_saved.as_ref().is_some_and(|id| !self.saved.iter().any(|item| &item.id == id)) {
-            self.selected_saved = self.saved.first().map(|item| item.id.clone());
+            self.selected_saved = first_saved.clone();
         }
         if self.selected_run.is_none() {
-            self.selected_run = self.runs.first().map(|entry| entry.id.clone());
+            self.selected_run = first_run;
         }
         if self.selected_saved.is_none() {
-            self.selected_saved = self.saved.first().map(|item| item.id.clone());
+            self.selected_saved = first_saved;
+        }
+        if self.rename_target.as_ref().is_some_and(|id| !self.saved.iter().any(|item| &item.id == id)) {
+            self.cancel_rename();
         }
         self.clear_failure();
     }
@@ -422,6 +436,10 @@ mod tests {
         page.selected_saved = Some("s1".into());
         assert!(page.begin_rename());
         assert_eq!(page.rename_text, "计数");
+        // 重命名栏非模态：点选另一条不能改变正在改名的目标。
+        page.selected_saved = Some("s2".into());
+        assert_eq!(page.rename_request().map(|request| request.id).as_deref(), Some("s1"));
+        page.selected_saved = Some("s1".into());
         page.rename_text = "   ".into();
         assert!(page.rename_request().is_none());
         assert_eq!(page.saved[0].name, "计数");

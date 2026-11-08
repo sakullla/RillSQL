@@ -802,7 +802,12 @@ impl Workbench {
 
     fn spawn_job(&mut self, job: PendingJob, cx: &mut Context<Self>) {
         let owner: &'static str = match job {
-            PendingJob::RefreshHistory | PendingJob::SaveNamed | PendingJob::ClearHistory | PendingJob::DeleteRun | PendingJob::DeleteSaved => "history",
+            PendingJob::RefreshHistory
+            | PendingJob::SaveNamed
+            | PendingJob::RenameSaved
+            | PendingJob::ClearHistory
+            | PendingJob::DeleteRun
+            | PendingJob::DeleteSaved => "history",
             _ => "connections",
         };
         let token = if owner == "history" {
