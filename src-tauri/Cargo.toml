@@ -1,6 +1,6 @@
 [package]
 name = "rillsql"
-version = "0.2.12"
+version = "0.2.13"
 description = "RillSQL"
 authors = ["RillSQL"]
 edition = "2021"
