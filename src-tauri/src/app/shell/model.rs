@@ -947,15 +947,17 @@ impl WorkbenchModel {
             // 关闭的不是当前项：只有它正好被当前工具显示时才重新绑定视图。
             if let Some(removed) = removed {
                 if self.view_shows(&removed) {
+                    let page = self.shell.page;
                     self.rebind_to_active();
+                    if !matches!(page, AppPage::Workspace | AppPage::Structure) {
+                        self.shell.page = page;
+                    }
                 }
             }
             return;
         }
-        // 桌面习惯：优先激活右侧邻居，没有则退回左侧。
-        let next = index
-            .and_then(|index| self.tabs.get(index).or_else(|| self.tabs.get(index.saturating_sub(1))))
-            .map(|tab| (tab.id.clone(), tab.kind, tab.spec.clone()));
+        // 桌面习惯：优先激活右侧邻居，其次左侧；都带未提交暂存时先不切换。
+        let next = self.pick_neighbour(index);
         self.active_tab = None;
         let page = self.shell.page;
         match next {
@@ -971,8 +973,37 @@ impl WorkbenchModel {
                 if page == AppPage::Structure {
                     self.shell.page = AppPage::Workspace;
                 }
+                if !self.tabs.is_empty() {
+                    self.notice_key = Some("shell.tabs.pendingCells");
+                }
             }
         }
+    }
+
+    /// 关闭当前项后选一个不会清空暂存网格的邻居；优先右邻居，其次左邻居，
+    /// 都不安全时退回仍持有暂存的那张表，避免用一次关闭操作丢掉未提交修改。
+    fn pick_neighbour(&self, index: Option<usize>) -> Option<(String, WorkItemKind, Option<String>)> {
+        let Some(index) = index else { return None };
+        let candidate = |index: usize| {
+            self.tabs
+                .get(index)
+                .map(|tab| (tab.id.clone(), tab.kind, tab.spec.clone()))
+        };
+        let mut candidates = Vec::new();
+        for offset in [index, index.saturating_sub(1)] {
+            if let Some(item) = candidate(offset) {
+                candidates.push(item);
+            }
+        }
+        for (id, kind, spec) in candidates {
+            if !self.switch_blocked(kind, spec.as_deref()) {
+                return Some((id, kind, spec));
+            }
+        }
+        self.tabs
+            .iter()
+            .find(|tab| tab.kind == WorkItemKind::Table && tab.uncommitted_cells)
+            .map(|tab| (tab.id.clone(), tab.kind, tab.spec.clone()))
     }
 
     fn view_shows(&self, item: &WorkItem) -> bool {

@@ -454,11 +454,14 @@ impl Workbench {
         let locale = self.model.locale();
         match self.model.tool {
             WorkTool::Table => {
-                self.table_view_spec = Some(spec.clone());
-                self.table.update(cx, |pane, cx| {
-                    pane.set_locale(locale);
-                    pane.open_table(target, 100, cx);
-                });
+                // 同一张表在结构/查询间来回切换时不要重新拉取：重开会清空尚未提交的暂存。
+                if self.table_view_spec.as_deref() != Some(spec.as_str()) {
+                    self.table_view_spec = Some(spec.clone());
+                    self.table.update(cx, |pane, cx| {
+                        pane.set_locale(locale);
+                        pane.open_table(target, 100, cx);
+                    });
+                }
             }
             WorkTool::Structure => self.structure.update(cx, |pane, _| {
                 pane.set_locale(locale);

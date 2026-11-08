@@ -1108,6 +1108,86 @@ fn object_tree_opens_the_table_and_structure_and_commits_through_the_shared_grid
 }
 
 #[gpui_kit::test]
+fn staged_table_survives_switching_to_structure_and_back(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-stage-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    let spec = "notes|笔记|main||customers|sqlite|dev";
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform(&format!("open-table:{spec}"), cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.mark_table_dirty(cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert!(view.read(cx).table_uncommitted(cx), "先有暂存");
+        let table = view.read(cx).model.tabs.iter().find(|tab| tab.kind == WorkItemKind::Table).cloned().expect("table item");
+        assert!(table.uncommitted_cells, "暂存应归到当前表项");
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform(&format!("open-structure-for:{spec}"), cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform(&format!("open-table:{spec}"), cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert!(view.read(cx).table_uncommitted(cx), "同表切到结构再回来，暂存必须仍在");
+        let table = view.read(cx).model.tabs.iter().find(|tab| tab.kind == WorkItemKind::Table).cloned().expect("table item");
+        assert!(table.uncommitted_cells, "切回后标签仍应标记未提交");
+    });
+
+    // 用户明确关闭带暂存的表项后，网格暂存随项清理，窗口关闭不再被它阻塞。
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            let id = view.model.tabs.iter().find(|tab| tab.kind == WorkItemKind::Table).map(|tab| tab.id.clone()).expect("table item");
+            view.model.request_close_tab(&id);
+            view.perform("close-leave", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(view.model.tabs.iter().all(|tab| tab.kind != WorkItemKind::Table));
+        assert!(!view.table_uncommitted(cx), "关闭表项后不应留下孤儿暂存");
+        assert!(!view.model.grid_dirty);
+        use crate::app::shell::close::{evaluate, CloseKind};
+        assert_eq!(evaluate(view.model.facts()), CloseKind::Allow, "孤儿暂存不得永久阻塞关闭");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn batch_close_skips_running_items_without_closing_them() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert!(model.dispatch("new-query").is_some());
+    let keep = model.active_tab.clone().expect("query");
+    assert!(model.dispatch("open-table:notes|笔记|main||customers|sqlite|dev").is_some());
+    let running = model.active_tab.clone().expect("table");
+    assert!(model.dispatch("open-table:notes|笔记|main||orders|sqlite|dev").is_some());
+    model.tabs.iter_mut().find(|tab| tab.id == running).unwrap().running = true;
+    model.activate_item(&keep);
+
+    assert!(model.dispatch("tab-close-others").is_some());
+    assert!(model.tabs.iter().any(|tab| tab.id == running), "运行中的项不得被批量关闭");
+    assert_eq!(model.notice_key, Some("shell.update.busy"));
+    assert_eq!(model.tabs.len(), 2, "另一项应继续关闭，只留下查询与运行中的表");
+    assert_eq!(model.active_tab.as_deref(), Some(keep.as_str()));
+}
+
+#[gpui_kit::test]
 fn second_workbench_commit_stays_on_preview_without_writing(cx: &mut gpui_kit::TestAppContext) {
     cx.executor().allow_parking();
     let dir = std::env::temp_dir().join(format!("rillsql-shell-commit-{}", uuid::Uuid::new_v4()));

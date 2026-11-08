@@ -614,8 +614,10 @@ impl Workbench {
             .flex_1()
             .min_w(px(0.))
             .overflow_x_scroll();
+        let work_page = matches!(self.model.shell.page, AppPage::Workspace | AppPage::Structure);
         for tab in self.model.tabs.clone() {
-            let active = self.model.active_tab.as_deref() == Some(tab.id.as_str());
+            // 只有工作页才把标签显示为选中；设置、对比、关系图页不伪装成某个工作项。
+            let active = work_page && self.model.active_tab.as_deref() == Some(tab.id.as_str());
             let dirty = tab.uncommitted_cells;
             let title = SharedString::from(tab.title.clone());
             let id = tab.id.clone();
@@ -643,6 +645,7 @@ impl Workbench {
                 // 右键先真正激活该工作项，菜单动作与随后的视图目标才指向同一项。
                 if this.model.tab_menu_for(&menu_id) {
                     this.menu_at = event.position;
+                    this.persist_if_needed();
                 }
                 cx.notify();
             }))
