@@ -276,11 +276,25 @@ fn staged_cells_block_switching_to_another_table() {
     assert_eq!(model.tool, WorkTool::Structure);
     assert_eq!(model.shell.page, AppPage::Structure);
 
+    // 别的表的结构页不碰共享网格，也不需要先提交暂存。
+    assert!(model.dispatch(&format!("open-structure-for:{orders}")).is_some());
+    assert_eq!(model.tabs.len(), 3);
+    assert_eq!(model.table_spec.as_deref(), Some(orders));
+
     // 提交或撤销暂存后恢复切换。
     model.tabs.iter_mut().find(|tab| tab.id == customers_id).unwrap().uncommitted_cells = false;
     assert!(model.dispatch(&format!("open-table:{orders}")).is_some());
-    assert_eq!(model.tabs.len(), 3);
+    assert_eq!(model.tabs.len(), 4);
     assert_eq!(model.table_spec.as_deref(), Some(orders));
+}
+
+#[test]
+fn targetless_structure_command_explains_instead_of_showing_stale_page() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert!(model.dispatch("open-structure").is_some());
+    assert_eq!(model.notice_key, Some("shell.tabs.needObject"));
+    assert_eq!(model.shell.page, AppPage::Workspace);
+    assert!(model.tabs.is_empty());
 }
 
 #[test]

@@ -388,7 +388,9 @@ impl Workbench {
             self.model.object_spec = Some(spec);
         }
         for tab in &mut self.model.tabs {
-            tab.running = effect.running.iter().any(|id| id == &tab.id);
+            if tab.kind.is_query() {
+                tab.running = effect.running.iter().any(|id| id == &tab.id);
+            }
         }
         for (id, sql) in effect.executed {
             if let Some(tab) = self.model.tabs.iter_mut().find(|tab| tab.id == id) {
@@ -398,20 +400,13 @@ impl Workbench {
     }
 
     fn sync_grid_flags(&mut self, cx: &mut Context<Self>) {
-        let table_dirty = self.table.read(cx).uncommitted();
-        // 表格项全部关闭后，共享网格里的暂存已没有归属；清掉它，避免窗口关闭被幽灵暂存永久阻塞。
-        if table_dirty {
-            let owned = self.table_view_spec.as_deref().is_some_and(|spec| {
-                self.model
-                    .tabs
-                    .iter()
-                    .any(|tab| tab.kind == WorkItemKind::Table && tab.spec.as_deref() == Some(spec))
-            });
-            if !owned && self.table_view_spec.is_some() {
-                self.table.update(cx, |pane, cx| pane.clear_sheet(cx));
-                self.applied_tool = None;
-                self.table_view_spec = None;
-            }
+        // 表格项全部关闭后，共享网格里的暂存与旧数据都不再有归属；清掉它，
+        // 避免窗口关闭被幽灵暂存阻塞，也避免重开同一张表时沿用陈旧快照。
+        let has_table_item = self.model.tabs.iter().any(|tab| tab.kind == WorkItemKind::Table);
+        if !has_table_item && self.table_view_spec.is_some() {
+            self.table.update(cx, |pane, cx| pane.clear_sheet(cx));
+            self.applied_tool = None;
+            self.table_view_spec = None;
         }
         let table_dirty = self.table.read(cx).uncommitted();
         let query_dirty = self.query.read(cx).grid_uncommitted(cx);

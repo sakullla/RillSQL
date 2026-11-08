@@ -320,8 +320,9 @@ impl WorkbenchModel {
         if self.close_prompt.is_some() && !matches!(id, "close-stay" | "close-leave") {
             return Some(Effect::None);
         }
+        let page_before = self.shell.page;
         if let Some(effect) = self.shell.dispatch(id) {
-            self.after_shell(id);
+            self.after_shell(id, page_before);
             return Some(effect);
         }
         if self.local(id) {
@@ -331,7 +332,7 @@ impl WorkbenchModel {
         None
     }
 
-    fn after_shell(&mut self, id: &str) {
+    fn after_shell(&mut self, id: &str, page_before: AppPage) {
         match id {
             "new-query" => self.open_blank_query(),
             "new-connection" => {
@@ -359,8 +360,9 @@ impl WorkbenchModel {
                 if let Some(spec) = self.object_spec.clone() {
                     self.open_item(WorkItemKind::Structure, spec);
                 } else {
-                    self.tool = WorkTool::Structure;
-                    self.shell.page = AppPage::Structure;
+                    self.notice_key = Some("shell.tabs.needObject");
+                    self.notice_detail.clear();
+                    self.shell.page = page_before;
                 }
             }
             _ => {}
@@ -546,8 +548,8 @@ impl WorkbenchModel {
                 if let Some(spec) = self.table_spec.clone().or_else(|| self.object_spec.clone()) {
                     self.open_item(WorkItemKind::Admin, spec);
                 } else {
-                    self.tool = WorkTool::Admin;
-                    self.shell.page = AppPage::Structure;
+                    self.notice_key = Some("shell.tabs.needObject");
+                    self.notice_detail.clear();
                 }
             }
             "grid-copy-row" | "grid-copy-column" | "grid-filter-value" => {
@@ -983,7 +985,7 @@ impl WorkbenchModel {
     /// 关闭当前项后选一个不会清空暂存网格的邻居；优先右邻居，其次左邻居，
     /// 都不安全时退回仍持有暂存的那张表，避免用一次关闭操作丢掉未提交修改。
     fn pick_neighbour(&self, index: Option<usize>) -> Option<(String, WorkItemKind, Option<String>)> {
-        let Some(index) = index else { return None };
+        let index = index?;
         let candidate = |index: usize| {
             self.tabs
                 .get(index)
@@ -1145,11 +1147,8 @@ impl WorkbenchModel {
         else {
             return false;
         };
-        let target_touches_grid = matches!(
-            kind,
-            WorkItemKind::Table | WorkItemKind::Structure | WorkItemKind::Admin
-        );
-        target_touches_grid && spec != Some(staged.as_str())
+        // 只有打开另一张表会重新加载共享网格；结构/管理页不碰网格数据。
+        kind == WorkItemKind::Table && spec != Some(staged.as_str())
     }
 
     /// 激活工作项并把视图、工具与目标一起切到该工作项。

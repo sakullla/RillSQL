@@ -154,6 +154,7 @@ dict! {
     "shell.tabs.closeRight" => "关闭右侧", "Close to the right";
     "shell.tabs.closeAll" => "关闭全部", "Close all";
     "shell.tabs.pendingCells" => "先提交或撤销当前表格的暂存修改", "Commit or discard the staged grid changes first";
+    "shell.tabs.needObject" => "先在对象树里选择表或视图。", "Choose a table or view in the object tree first.";
     "shell.closeGuard.closeWindow" => "关闭窗口？", "Close the window?";
     "shell.closeGuard.closeTab" => "关闭这个标签？", "Close this tab?";
     "shell.closeGuard.stay" => "留下", "Stay";
