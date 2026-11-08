@@ -6,10 +6,10 @@ use crate::app::shell::jobs::{self, apply_done, job_request};
 use crate::app::shell::menus::{menu_items, MenuPlace, MenuTarget, NavKey};
 use crate::app::views::connections::{sample_draft, with_tls_ssh, Secrets};
 use crate::app::views::history::{HistorySection, ListPhase};
-use crate::app::{dictionary_keys, translate, AppPage, Locale, ThemePreference};
+use crate::app::{dictionary_keys, translate, AppPage, Density, Locale, ThemePreference};
 use crate::application::AppServices;
-use crate::connections::model::{CaMode, Engine, SshAuthKind};
-use crate::connections::Service;
+use crate::connections::model::{CaMode, Engine, SavedConnection, SshAuthKind};
+use crate::connections::{ConnectionRecord, Service};
 use crate::i18n;
 use crate::query::{HistoryEntry, SaveRequest};
 use crate::state::{AppState, SessionState, ShellSettings};
@@ -42,41 +42,193 @@ fn dictionaries_match_the_existing_shell_keys() {
 }
 
 #[test]
-fn copy_fits_every_width_theme_and_locale() {
+fn copy_fits_every_width_density_theme_and_locale() {
     let themes = [ThemePreference::Light, ThemePreference::Dark];
     let locales = [i18n::Locale::ZhCn, i18n::Locale::En];
     let pages = [AppPage::Workspace, AppPage::Connections, AppPage::History, AppPage::Settings];
-    for width in [1360, 900, 640] {
+    let densities = [Density::Compact, Density::Standard, Density::Relaxed];
+    for width in [1360, 1024, 900, 760, 640] {
         for sidebar in [true, false] {
             for theme in themes {
                 for locale in locales {
-                    for page in pages {
-                        let mut model = WorkbenchModel::new(Shell::default());
-                        model.set_width(width);
-                        model.shell.sidebar_open = sidebar;
-                        model.shell.theme = theme;
-                        model.shell.page = page;
-                        if locale == i18n::Locale::En {
-                            model.shell.locale = Locale::En;
-                        }
-                        if page == AppPage::Workspace {
-                            model.tabs.clear();
-                        }
-                        assert!(model.missing_copy(locale).is_empty(), "{:?} {:?}", page, model.missing_copy(locale));
-                        assert_eq!(model.copy_overflow(locale), 0, "{width} {page:?} {locale:?}");
-                        assert!(model.layout().content_width >= 160 || width < 160);
-                        for node in model.access_nodes() {
-                            assert!(!node.id.is_empty());
-                            assert!(!node.role.is_empty());
-                            assert_ne!(model.text(node.label_key), node.label_key);
-                            assert!(!node.state.is_empty());
-                            assert!(!node.action.is_empty());
+                    for density in densities {
+                        for page in pages {
+                            let mut model = WorkbenchModel::new(Shell::default());
+                            model.set_width(width);
+                            model.shell.sidebar_open = sidebar;
+                            model.shell.theme = theme;
+                            model.shell.page = page;
+                            model.shell.density = density;
+                            if locale == i18n::Locale::En {
+                                model.shell.locale = Locale::En;
+                            }
+                            if page == AppPage::Workspace {
+                                model.tabs.clear();
+                            }
+                            assert!(model.missing_copy(locale).is_empty(), "{:?} {:?}", page, model.missing_copy(locale));
+                            assert_eq!(model.copy_overflow(locale), 0, "{width} {page:?} {locale:?} {density:?}");
+                            assert!(model.layout().content_width >= 160 || width < 160);
+                            // 密度不仅是设置里的文案：同一宽度下根 padding 必须跟着变。
+                            assert_eq!(model.painted().pad, density.metrics().pad as i32);
+                            for node in model.access_nodes() {
+                                assert!(!node.id.is_empty());
+                                assert!(!node.role.is_empty());
+                                assert_ne!(model.text(node.label_key), node.label_key);
+                                assert!(!node.state.is_empty());
+                                assert!(!node.action.is_empty());
+                            }
                         }
                     }
                 }
             }
         }
     }
+}
+
+#[test]
+fn english_copy_has_no_chinese_and_query_titles_follow_locale() {
+    for key in i18n::catalog_keys() {
+        // 语言选择器里“中文（简体）”本来就用中文书写，其余英文界面不得残留中文。
+        if *key == "common.localeZh" {
+            continue;
+        }
+        let en = i18n::text(i18n::Locale::En, key);
+        assert!(!en.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)), "{key}: {en}");
+    }
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert!(model.dispatch("new-query").is_some());
+    assert!(model.dispatch("new-query").is_some());
+    let query_titles = |model: &WorkbenchModel| {
+        model.tabs.iter().filter(|tab| tab.kind.is_query()).map(|tab| tab.title.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(query_titles(&model), ["查询 1", "查询 2"]);
+    assert!(model.dispatch("locale-en").is_some());
+    assert_eq!(query_titles(&model), ["Query 1", "Query 2"]);
+    assert!(model.dispatch("locale-zh").is_some());
+    assert_eq!(query_titles(&model), ["查询 1", "查询 2"]);
+    let template = i18n::text(i18n::Locale::En, "ui.query.tabTitle");
+    assert_eq!(i18n::fill(&template, &[("n", "7")]), "Query 7");
+}
+
+#[gpui_kit::test]
+fn density_theme_and_language_reach_the_rendered_chrome(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::component::ActiveTheme as _;
+
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-scale-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench_sized(cx, Arc::clone(&services), false, 640., 900.);
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.perform("settings", cx);
+            view.perform("density-compact", cx);
+            view.perform("theme-dark", cx);
+            view.perform("locale-en", cx);
+        });
+    });
+    let (compact, english, dark) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let height = f32::from(window.find("density-compact").bounds().size.height);
+            let label = window.find("settings-page").label().map(str::to_owned);
+            (height, label, cx.theme().is_dark())
+        })
+        .unwrap();
+    assert!(dark, "theme-dark 必须落到实际绘制主题");
+    assert_eq!(english.as_deref(), Some("Settings"));
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("density-relaxed", cx)));
+    let (relaxed, relaxed_selected) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let height = f32::from(window.find("density-relaxed").bounds().size.height);
+            (height, window.find("density-relaxed").selected())
+        })
+        .unwrap();
+    assert!(relaxed > compact, "密度切换必须改变实际控件高度：{compact} -> {relaxed}");
+    assert_eq!(relaxed_selected, Some(true));
+    eprintln!("compact density control height={compact}, relaxed={relaxed}, locale={english:?}, dark={dark}");
+
+    // 紧凑窗口：主要区域仍在视口内，状态栏、设置控件和语言入口不被裁掉。
+    assert_eq!(cx.update(|cx| view.read(cx).model.viewport_width), 640);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let width = f32::from(window.find("workbench").bounds().size.width);
+        assert!((width - 640.).abs() < 1., "workbench {width}");
+        for id in ["toolbar", "status", "settings-page", "density-compact", "density-standard", "density-relaxed", "locale-en", "locale-zh"] {
+            let bounds = window.find(id).bounds();
+            assert!(window.find(id).visible(), "{id} 应可见");
+            assert!(f32::from(bounds.origin.x) >= 0., "{id} 左侧越界");
+            assert!(f32::from(bounds.origin.x + bounds.size.width) <= width + 0.5, "{id} 右侧越界");
+            assert!(f32::from(bounds.origin.y + bounds.size.height) <= 901., "{id} 下方越界");
+        }
+        assert!(f32::from(window.find("settings-page").bounds().size.width) >= 160.);
+    })
+    .unwrap();
+
+    // 紧凑宽度下每个主要页面的首要操作都要真正可见、可点。
+    for (command, action) in [("connections", "conn-new"), ("history", "history-empty-query")] {
+        cx.update(|cx| view.update(cx, |view, cx| view.perform(command, cx)));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let width = f32::from(window.find("workbench").bounds().size.width);
+            let button = window.find(action);
+            assert!(button.visible(), "{action} 应可见");
+            assert!(f32::from(button.bounds().origin.x + button.bounds().size.width) <= width + 0.5);
+            assert!(f32::from(button.bounds().origin.y + button.bounds().size.height) <= 901.);
+        })
+        .unwrap();
+    }
+
+    // 连接表单在 640 宽度下也要能看到并点到测试/保存。
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("new-connection", cx)));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let width = f32::from(window.find("workbench").bounds().size.width);
+        for id in ["conn-test", "conn-save"] {
+            let button = window.find(id);
+            assert!(button.visible(), "{id} 应可见");
+            assert!(f32::from(button.bounds().origin.x + button.bounds().size.width) <= width + 0.5);
+            assert!(f32::from(button.bounds().origin.y + button.bounds().size.height) <= 901.);
+        }
+    })
+    .unwrap();
+
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.perform("settings", cx);
+            view.perform("locale-zh", cx);
+        });
+    });
+    let chinese = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("settings-page").label().map(str::to_owned)
+        })
+        .unwrap();
+    assert_eq!(chinese.as_deref(), Some("设置"));
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("theme-light", cx)));
+    let light = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            cx.theme().is_dark()
+        })
+        .unwrap();
+    assert!(!light, "theme-light 必须切回浅色绘制");
+
+    // 命令面板在紧凑宽度下完整落在视口内。
+    cx.update_window(window, |_, window, cx| {
+        window.click("top-search", cx);
+        window.render_frame(cx);
+        let width = f32::from(window.find("workbench").bounds().size.width);
+        let palette = window.find("palette").bounds();
+        assert!(f32::from(palette.origin.x) >= 0.);
+        assert!(f32::from(palette.origin.x + palette.size.width) <= width + 0.5);
+        assert!(f32::from(palette.size.width) <= 560.);
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -696,6 +848,91 @@ async fn seven_engines_round_trip_without_remote_sockets_and_history_does_not_ru
 }
 
 #[gpui_kit::test]
+fn long_copy_is_truncated_but_fully_available_and_never_holds_neighbours(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-long-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench_sized(cx, Arc::clone(&services), false, 640., 900.);
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+
+    let long_name = "客户订单归档与结算连接的完整名称-".repeat(4);
+    let long_host = "very-long-internal-hostname-for-the-archive-cluster.example.test".to_owned();
+    let long_title = "一个非常长的查询标签标题，用来确认截断之后仍然能读到完整名称".repeat(3);
+
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.model.connections.rows.push(ConnectionRecord {
+                saved: SavedConnection {
+                    id: "long".into(),
+                    name: long_name.clone(),
+                    engine: Engine::Postgres,
+                    env: "dev".into(),
+                    host: Some(long_host),
+                    port: Some(5432),
+                    database: Some("archive_and_settlement_reporting".into()),
+                    username: Some("reporting_operator".into()),
+                    file_path: None,
+                    replica_set: None,
+                    tls: None,
+                    ssh: None,
+                    password_saved: false,
+                    ssh_password_saved: false,
+                },
+                ssh_host_key: None,
+            });
+            view.perform("connections", cx);
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let width = f32::from(window.find("workbench").bounds().size.width);
+        let row = window.find("conn-row-long");
+        assert!(row.visible());
+        assert!(f32::from(row.bounds().origin.x + row.bounds().size.width) <= width + 0.5);
+        let label = row.label().expect("连接行的无障碍名称").to_owned();
+        assert!(label.contains(&long_name), "完整名称仍要可读：{label}");
+    })
+    .unwrap();
+
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.perform("activity-workspace", cx);
+            view.perform("new-query", cx);
+            let tab = view.model.tabs.last_mut().expect("query tab");
+            tab.title = long_title.clone();
+            tab.connection_id = Some("long".into());
+            tab.connection_name = Some(long_name.clone());
+            tab.database = Some("archive_and_settlement_reporting".into());
+            view.model.shell.sidebar_open = true;
+        });
+    });
+    let tab_id = cx.update(|cx| format!("tab-{}", view.read(cx).model.tabs.last().unwrap().id));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let width = f32::from(window.find("workbench").bounds().size.width);
+        let tab = window.find(gpui_kit::SharedString::from(tab_id));
+        assert!(tab.visible());
+        assert!(f32::from(tab.bounds().size.width) <= 220.5, "标签宽度 {}", f32::from(tab.bounds().size.width));
+        eprintln!(
+            "long copy at 640: tab width={}, status target width={}, strip={}",
+            f32::from(tab.bounds().size.width),
+            f32::from(window.find("status-target").bounds().size.width),
+            f32::from(window.find("tabs").bounds().size.width)
+        );
+        assert_eq!(tab.label(), Some(long_title.as_str()), "截断后仍要能读完整标题");
+        let target = window.find("status-target").bounds();
+        assert!(f32::from(target.origin.x + target.size.width) <= width + 0.5);
+        assert!(f32::from(target.size.width) <= width * 0.45 + 1.);
+        let sidebar = window.find("sidebar").bounds();
+        assert!(f32::from(sidebar.origin.x + sidebar.size.width) <= width + 0.5);
+        assert!(f32::from(sidebar.size.width) <= 234.);
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui_kit::test]
 fn headless_workbench_renders_on_windows_widths(cx: &mut gpui_kit::TestAppContext) {
     let dir = std::env::temp_dir().join(format!("rillsql-shell-ui-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -836,11 +1073,22 @@ async fn write_legacy_store(path: &std::path::Path, session: &str, shell: &str) 
 }
 
 fn open_workbench(cx: &mut gpui_kit::TestAppContext, services: Arc<AppServices>, boot: bool) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<super::view::Workbench>) {
+    open_workbench_sized(cx, services, boot, 1360., 800.)
+}
+
+/// 同一套工作台，按指定窗口尺寸打开；紧凑窗口要测真实绘制几何，不能只改模型宽度。
+fn open_workbench_sized(
+    cx: &mut gpui_kit::TestAppContext,
+    services: Arc<AppServices>,
+    boot: bool,
+    width: f32,
+    height: f32,
+) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<super::view::Workbench>) {
     cx.update(gpui_kit::init);
     let (window, view) = cx.update(|cx| {
         let bounds = gpui_kit::Bounds {
             origin: gpui_kit::Point::default(),
-            size: gpui_kit::size(gpui_kit::px(1360.), gpui_kit::px(800.)),
+            size: gpui_kit::size(gpui_kit::px(width), gpui_kit::px(height)),
         };
         let (window, view) = gpui_kit::open_window(
             gpui_kit::WindowOptions {

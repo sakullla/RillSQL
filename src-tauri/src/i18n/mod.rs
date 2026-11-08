@@ -251,6 +251,7 @@ dict! {
     "history.filter.all" => "全部", "All";
     "history.filter.reset" => "清除筛选", "Clear filters";
     "query.editor.area" => "查询", "Query";
+    "ui.query.tabTitle" => "查询 {n}", "Query {n}";
     "query.editor.menu.run" => "执行", "Run";
     "query.editor.menu.runCurrent" => "执行当前语句", "Run current statement";
     "query.editor.menu.format" => "格式化", "Format";

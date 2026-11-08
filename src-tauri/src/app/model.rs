@@ -41,20 +41,21 @@ pub enum Density {
 }
 
 impl Density {
-    pub fn row_height(self) -> i32 {
+    /// 三档密度的唯一尺寸来源：模型布局与实际绘制都读这一份。
+    pub fn metrics(self) -> crate::ui::kit::Metrics {
         match self {
-            Self::Compact => 24,
-            Self::Standard => 32,
-            Self::Relaxed => 40,
+            Self::Compact => crate::ui::kit::Metrics::compact(),
+            Self::Standard => crate::ui::kit::Metrics::standard(),
+            Self::Relaxed => crate::ui::kit::Metrics::relaxed(),
         }
     }
 
+    pub fn row_height(self) -> i32 {
+        self.metrics().row_h as i32
+    }
+
     pub fn control_padding(self) -> i32 {
-        match self {
-            Self::Compact => 4,
-            Self::Standard => 8,
-            Self::Relaxed => 12,
-        }
+        self.metrics().pad as i32
     }
 }
 

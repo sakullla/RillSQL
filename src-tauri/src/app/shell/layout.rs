@@ -1,4 +1,7 @@
 //! 1360 / 900 / 640 的外壳几何。侧栏在窄窗口改为覆盖，避免把内容挤出视口。
+//! 高度取自共享密度指标，不再和绘制各留一套常量。
+
+use crate::ui::kit::Metrics;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidebarMode {
@@ -47,6 +50,7 @@ pub fn layout_for(width: i32, sidebar_open: bool) -> ChromeLayout {
     if toolbar > width {
         overflow += toolbar - width;
     }
+    let metrics = Metrics::standard();
     ChromeLayout {
         width,
         activity_width,
@@ -54,9 +58,9 @@ pub fn layout_for(width: i32, sidebar_open: bool) -> ChromeLayout {
         sidebar_mode,
         content_width: content_width.max(0),
         menu_height: 26,
-        toolbar_height: 36,
-        tab_height: 30,
-        status_height: 24,
+        toolbar_height: metrics.topbar_h as i32,
+        tab_height: metrics.tabs_h as i32,
+        status_height: metrics.status_h as i32,
         overflow,
     }
 }

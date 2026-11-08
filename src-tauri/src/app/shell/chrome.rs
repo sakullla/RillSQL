@@ -9,7 +9,7 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, TitleBar};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, ClickEvent, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
 };
 
 use crate::app::views::connections::{engines, LinkStatus};
@@ -22,10 +22,7 @@ use crate::ui::kit::{self, FieldSpec, Palette, Tip as _};
 use super::model::{DraftField, WorkItemKind, WorkTool};
 use super::view::Workbench;
 
-const TOPBAR_H: f32 = 44.;
 const RAIL_W: f32 = 52.;
-const TABS_H: f32 = 36.;
-const STATUS_H: f32 = 26.;
 
 /// 点击后执行一条外壳命令。
 fn act<S: Into<String>>(id: S, cx: &mut Context<Workbench>) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static + use<S> {
@@ -45,6 +42,11 @@ fn field_changed(this: &mut Workbench, field: DraftField, value: String, _cx: &m
 impl Workbench {
     fn t(&self, key: &str) -> SharedString {
         SharedString::from(self.model.text(key))
+    }
+
+    /// 当前密度的尺寸指标；绘制只读这一处。
+    fn metrics(&self) -> kit::Metrics {
+        self.model.shell.density.metrics()
     }
 
     /// 绑定一个真实文本框到模型字段。
@@ -82,6 +84,7 @@ impl Workbench {
 
         let mut root = div()
             .id("workbench")
+            .test_support()
             .key_context("Workbench")
             .size_full()
             .flex()
@@ -111,6 +114,7 @@ impl Workbench {
                     .child(
                         div()
                             .id("workbench-content")
+                            .test_support()
                             .flex()
                             .flex_col()
                             .flex_1()
@@ -215,6 +219,7 @@ impl Workbench {
 
     fn topbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
+        let m = self.metrics();
         let dark = matches!(self.model.shell.resolved_theme(), crate::app::ResolvedTheme::Dark);
         let theme_next = if dark { "theme-light" } else { "theme-dark" };
         let narrow = self.model.viewport_width <= 760;
@@ -224,6 +229,7 @@ impl Workbench {
         let controls = |child: AnyElement| div().flex().items_center().gap(px(8.)).occlude().child(child);
         let row = div()
             .id("toolbar")
+            .test_support()
             .role(gpui_kit::Role::Toolbar)
             .aria_label(self.t("shell.command.newQuery"))
             .h_full()
@@ -248,6 +254,7 @@ impl Workbench {
             .child(controls(
                 div()
                     .id("top-search")
+                    .test_support()
                     .role(gpui_kit::Role::Button)
                     .aria_label(self.t("shell.palette.title"))
                     .w(px(if narrow { 180. } else { 360. }))
@@ -284,7 +291,7 @@ impl Workbench {
                     }),
             );
         TitleBar::new()
-            .h(px(TOPBAR_H))
+            .h(px(m.topbar_h))
             .when(!cfg!(target_os = "macos"), |this| this.pl(px(10.)))
             .bg(p.chrome)
             .border_color(p.line)
@@ -340,6 +347,7 @@ impl Workbench {
 
     fn explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
+        let m = self.metrics();
         let width = self.model.layout().sidebar_width.max(220) as f32;
         let filter = self.input_for(DraftField::ObjectFilter, &self.model.text("ui.explorer.filterObjects"), false, window, cx);
         // 对象索引来自模型里的同一份快照；连接列表保持完整，连接筛选只属于连接页。
@@ -355,6 +363,7 @@ impl Workbench {
         // 读取失败只留一条带原因的提示和重试入口，不在每个连接下重复。
         if !self.model.catalog_error.is_empty() {
             let error = self.model.catalog_error.clone();
+            let full_error = format!("{}: {}", self.model.text("ui.explorer.error"), error);
             list = list.child(
                 div()
                     .px(px(8.))
@@ -366,12 +375,15 @@ impl Workbench {
                     .gap(px(6.))
                     .child(
                         div()
+                            .id("explorer-error")
+                            .test_support()
                             .flex_1()
                             .min_w(px(0.))
                             .truncate()
+                            .tooltip_text(SharedString::from(full_error.clone()))
                             .text_size(px(12.))
                             .text_color(p.danger)
-                            .child(SharedString::from(format!("{}: {}", self.model.text("ui.explorer.error"), error))),
+                            .child(SharedString::from(full_error)),
                     )
                     .child(kit::tool_button(
                         "explorer-tree-retry",
@@ -437,6 +449,7 @@ impl Workbench {
         }
         div()
             .id("sidebar")
+            .test_support()
             .role(gpui_kit::Role::Navigation)
             .aria_label(self.t("shell.sidebar.explorer"))
             .aria_expanded(self.model.shell.sidebar_open)
@@ -453,7 +466,7 @@ impl Workbench {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .h(px(TABS_H))
+                    .h(px(m.tabs_h))
                     .pl(px(14.))
                     .pr(px(6.))
                     .child(kit::eyebrow(self.t("shell.sidebar.explorer"), &p))
@@ -471,8 +484,15 @@ impl Workbench {
     }
 
     fn connection_row(&self, row: &crate::connections::ConnectionRecord, status: LinkStatus, expanded: bool, selected: bool, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let m = self.metrics();
         let id = row.saved.id.clone();
         let name = SharedString::from(row.saved.name.clone());
+        let detail = connection_detail(row);
+        let full_name = if detail.is_empty() {
+            name.clone()
+        } else {
+            SharedString::from(format!("{} · {}", row.saved.name, detail))
+        };
         let (dot, state_key) = match status {
             LinkStatus::Connected => (p.ok, "connections.status.connected"),
             LinkStatus::Connecting => (p.warn, "ui.conn.connecting"),
@@ -488,7 +508,8 @@ impl Workbench {
             .aria_label(name.clone())
             .aria_selected(selected)
             .aria_expanded(expanded)
-            .h(px(30.))
+            .tooltip_text(full_name)
+            .h(px(m.row_h))
             .px(px(6.))
             .flex()
             .items_center()
@@ -550,6 +571,7 @@ impl Workbench {
     }
 
     fn object_row(&self, object: &crate::query::assist::TreeObject, environment: &str, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let m = self.metrics();
         let spec = crate::app::views::query::object_spec(object, environment);
         let key = format!("{}:{}", object.connection_id, object.name);
         let selected = self.model.object_spec.as_deref() == Some(spec.as_str());
@@ -571,7 +593,8 @@ impl Workbench {
             .role(gpui_kit::Role::TreeItem)
             .aria_label(label.clone())
             .aria_selected(selected)
-            .h(px(26.))
+            .tooltip_text(label.clone())
+            .h(px(m.tree_row_h))
             .pl(px(30.))
             .pr(px(4.))
             .flex()
@@ -675,6 +698,7 @@ impl Workbench {
 
     fn tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
+        let m = self.metrics();
         // 标签列表独立滚动，新建入口固定在右侧；当前标签可通过横向滚动或 Ctrl+Tab 到达。
         let mut list = div()
             .id("tab-list")
@@ -735,10 +759,11 @@ impl Workbench {
         }
         div()
             .id("tabs")
+            .test_support()
             .role(gpui_kit::Role::TabList)
             .aria_label(self.t("shell.tabs.tablist"))
             .flex_none()
-            .h(px(TABS_H))
+            .h(px(m.tabs_h))
             .flex()
             .items_end()
             .bg(p.chrome)
@@ -761,6 +786,9 @@ impl Workbench {
 
     fn status_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
+        let m = self.metrics();
+        // 目标名可能很长；只压缩这一段，状态提示与语言开关保持在位。
+        let target_max = (self.model.viewport_width as f32 * 0.42).max(120.);
         let target: AnyElement = match self.model.active_tab() {
             Some(tab) if tab.connection_id.is_some() => {
                 let engine = tab.engine.clone().unwrap_or_default();
@@ -775,11 +803,15 @@ impl Workbench {
                 let name = tab.connection_name.clone().unwrap_or_default();
                 let database = tab.database.clone().unwrap_or_default();
                 div()
+                    .id("status-target")
+                    .test_support()
                     .flex()
                     .items_center()
                     .gap(px(6.))
+                    .min_w(px(0.))
+                    .max_w(px(target_max))
                     .child(kit::engine_badge(&engine, 14.))
-                    .child(SharedString::from(if database.is_empty() { name } else { format!("{name} / {database}") }))
+                    .child(div().min_w(px(0.)).truncate().child(SharedString::from(if database.is_empty() { name } else { format!("{name} / {database}") })))
                     .when(!env.is_empty(), |this| this.child(kit::env_tag(&env, self.t(&format!("ui.conn.env.{env}")), &p)))
                     .into_any_element()
             }
@@ -795,10 +827,11 @@ impl Workbench {
         let locale_label = if self.model.shell.locale == crate::app::Locale::En { "EN" } else { "中" };
         div()
             .id("status")
+            .test_support()
             .role(gpui_kit::Role::Status)
             .aria_label(SharedString::from(notice.clone()))
             .flex_none()
-            .h(px(STATUS_H))
+            .h(px(m.status_h))
             .px(px(12.))
             .flex()
             .items_center()
@@ -830,6 +863,7 @@ impl Workbench {
 
     fn welcome_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
+        let m = self.metrics();
         let actions = div()
             .flex()
             .flex_wrap()
@@ -844,7 +878,7 @@ impl Workbench {
             let id = row.saved.id.clone();
             let detail = connection_detail(row);
             connections = connections.child(
-                list_row(SharedString::from(format!("welcome-conn-{id}")), &p)
+                list_row(SharedString::from(format!("welcome-conn-{id}")), &p, m.row_pad_y)
                     .child(kit::engine_badge(row.saved.engine.as_str(), 22.))
                     .child(
                         div()
@@ -871,10 +905,20 @@ impl Workbench {
         for entry in runs.iter().take(6) {
             let id = entry.id.clone();
             recent = recent.child(
-                list_row(SharedString::from(format!("welcome-run-{id}")), &p)
+                list_row(SharedString::from(format!("welcome-run-{id}")), &p, m.row_pad_y)
                     .child(kit::icon(IconName::Clock, 14., p.text_faint))
                     .child(div().flex_1().min_w(px(0.)).truncate().font_family(cx.theme().mono_font_family.clone()).text_size(px(12.)).child(SharedString::from(one_line(&entry.sql))))
-                    .child(div().flex_none().text_size(px(11.)).text_color(p.text_faint).child(SharedString::from(entry.connection_name.clone())))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("welcome-run-client-{id}")))
+                            .flex_none()
+                            .max_w(px(160.))
+                            .truncate()
+                            .tooltip_text(SharedString::from(entry.connection_name.clone()))
+                            .text_size(px(11.))
+                            .text_color(p.text_faint)
+                            .child(SharedString::from(entry.connection_name.clone())),
+                    )
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.model.history.selected_run = Some(id.clone());
                         this.model.history.section = HistorySection::Runs;
@@ -886,7 +930,7 @@ impl Workbench {
         for item in saved.iter().take(4) {
             let saved = item.clone();
             recent = recent.child(
-                list_row(SharedString::from(format!("welcome-saved-{}", item.id)), &p)
+                list_row(SharedString::from(format!("welcome-saved-{}", item.id)), &p, m.row_pad_y)
                     .child(kit::icon(IconName::Bookmark, 14., p.accent))
                     .child(div().flex_1().min_w(px(0.)).truncate().child(SharedString::from(item.name.clone())))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -914,11 +958,11 @@ impl Workbench {
                 div()
                     .mx_auto()
                     .max_w(px(880.))
-                    .px(px(32.))
-                    .py(px(48.))
+                    .px(px(m.page_pad + 4.))
+                    .py(px(m.page_pad_y + 20.))
                     .flex()
                     .flex_col()
-                    .gap(px(28.))
+                    .gap(px(m.page_pad))
                     .child(
                         div()
                             .flex()
@@ -946,7 +990,7 @@ impl Workbench {
                                     .flex_1()
                                     .flex_basis(px(0.))
                                     .min_w(px(0.))
-                                    .p(px(14.))
+                                    .p(px(m.page_pad / 2.))
                                     .flex()
                                     .flex_col()
                                     .gap(px(8.))
@@ -958,7 +1002,7 @@ impl Workbench {
                                     .flex_1()
                                     .flex_basis(px(0.))
                                     .min_w(px(0.))
-                                    .p(px(14.))
+                                    .p(px(m.page_pad / 2.))
                                     .flex()
                                     .flex_col()
                                     .gap(px(8.))
@@ -975,6 +1019,7 @@ impl Workbench {
 
     fn connections_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
+        let m = self.metrics();
         let filter = self.input_for(DraftField::Filter, &self.model.text("ui.conn.search"), false, window, cx);
         let narrow = self.model.viewport_width <= 900;
         let rows: Vec<_> = self.model.connections.filtered().into_iter().cloned().collect();
@@ -995,11 +1040,12 @@ impl Workbench {
             list = list.child(
                 div()
                     .id(SharedString::from(format!("conn-row-{id}")))
+                    .test_support()
                     .role(gpui_kit::Role::ListItem)
                     .aria_label(SharedString::from(label))
                     .aria_selected(selected)
                     .px(px(8.))
-                    .py(px(7.))
+                    .py(px(m.row_pad_y))
                     .flex()
                     .items_center()
                     .gap(px(10.))
@@ -1035,7 +1081,17 @@ impl Workbench {
             );
         }
         if rows.is_empty() {
-            list = list.child(div().p(px(16.)).text_size(px(12.)).text_color(p.text_faint).child(self.t("ui.explorer.empty")));
+            // 空列表给下一步，而不是只留一句“没有连接”。
+            list = list.child(
+                div()
+                    .p(px(16.))
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .gap(px(10.))
+                    .child(div().text_size(px(12.)).text_color(p.text_faint).child(self.t("ui.explorer.empty")))
+                    .child(kit::tool_button("conn-empty-new", Some(IconName::Plus), self.t("common.newConnection"), act("new-connection", cx))),
+            );
         }
 
         let new_button = Button::new("conn-new")
@@ -1109,6 +1165,8 @@ impl Workbench {
 
     fn connection_form(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
+        let m = self.metrics();
+        let narrow = self.model.viewport_width <= 900;
         let Some(draft) = self.model.connections.editor.clone() else {
             return div().into_any_element();
         };
@@ -1178,26 +1236,29 @@ impl Workbench {
         general = general.child(
             div()
                 .flex()
+                .flex_wrap()
                 .gap(px(8.))
                 .items_end()
-                .child(div().flex_1().child(kit::form_row(self.t("ui.conn.url"), url, &p)))
+                .child(div().flex_1().min_w(px(180.)).child(kit::form_row(self.t("ui.conn.url"), url, &p)))
                 .child(kit::secondary_button("conn-apply-url", Some(IconName::WandSparkles), self.t("ui.conn.parse"), act("conn-apply-url", cx))),
         );
         general = general.child(
             div()
                 .flex()
+                .flex_wrap()
                 .gap(px(12.))
-                .child(div().flex_1().child(kit::form_row(self.t("ui.conn.name"), name, &p)))
-                .child(kit::form_row(self.t("ui.conn.env"), kit::segmented(env_items, &p), &p)),
+                .child(div().flex_1().min_w(px(180.)).child(kit::form_row(self.t("ui.conn.name"), name, &p)))
+                .child(kit::form_row(self.t("ui.conn.env"), kit::segmented_sized(env_items, &p, m.control_h), &p)),
         );
         if file_based {
             let file = self.input_for(DraftField::File, &t(self, "connections.validate.chooseFile"), false, window, cx);
             general = general.child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .gap(px(8.))
                     .items_end()
-                    .child(div().flex_1().child(kit::form_row(self.t("ui.conn.file"), file, &p)))
+                    .child(div().flex_1().min_w(px(180.)).child(kit::form_row(self.t("ui.conn.file"), file, &p)))
                     .child(kit::secondary_button("conn-browse", Some(IconName::FolderOpen), self.t("ui.conn.browse"), cx.listener(|this, _: &ClickEvent, _, cx| this.prompt_draft_file(cx)))),
             );
         } else {
@@ -1210,16 +1271,18 @@ impl Workbench {
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .gap(px(12.))
-                        .child(div().flex_1().child(kit::form_row(self.t("ui.conn.host"), host, &p)))
+                        .child(div().flex_1().min_w(px(180.)).child(kit::form_row(self.t("ui.conn.host"), host, &p)))
                         .child(div().w(px(110.)).child(kit::form_row(self.t("ui.conn.port"), port, &p))),
                 )
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .gap(px(12.))
-                        .child(div().flex_1().child(kit::form_row(self.t("ui.conn.user"), user, &p)))
-                        .child(div().flex_1().child(kit::form_row(self.t("ui.conn.password"), password.mask_toggle(), &p))),
+                        .child(div().flex_1().min_w(px(160.)).child(kit::form_row(self.t("ui.conn.user"), user, &p)))
+                        .child(div().flex_1().min_w(px(160.)).child(kit::form_row(self.t("ui.conn.password"), password.mask_toggle(), &p))),
                 )
                 .child(kit::form_row(self.t("ui.conn.database"), database, &p));
             if engine == Engine::Mongodb {
@@ -1271,9 +1334,10 @@ impl Workbench {
                 security = security.child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .gap(px(12.))
-                        .child(div().flex_1().child(kit::form_row(self.t("connections.editor.tls.clientCert"), cert, &p)))
-                        .child(div().flex_1().child(kit::form_row(self.t("connections.editor.tls.clientKey"), key, &p))),
+                        .child(div().flex_1().min_w(px(160.)).child(kit::form_row(self.t("connections.editor.tls.clientCert"), cert, &p)))
+                        .child(div().flex_1().min_w(px(160.)).child(kit::form_row(self.t("connections.editor.tls.clientKey"), key, &p))),
                 );
             }
             let ssh_on = draft.ssh_on;
@@ -1313,21 +1377,23 @@ impl Workbench {
                     .flex()
                     .flex_col()
                     .gap(px(12.))
-                    .pl(px(46.))
+                    .when(!narrow, |this| this.pl(px(46.)))
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap(px(12.))
-                            .child(div().flex_1().child(kit::form_row(self.t("ui.conn.sshHost"), ssh_host, &p)))
+                            .child(div().flex_1().min_w(px(160.)).child(kit::form_row(self.t("ui.conn.sshHost"), ssh_host, &p)))
                             .child(div().w(px(90.)).child(kit::form_row(self.t("connections.editor.ssh.port"), ssh_port, &p))),
                     )
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap(px(12.))
                             .items_end()
-                            .child(div().flex_1().child(kit::form_row(self.t("ui.conn.sshUser"), ssh_user, &p)))
-                            .child(kit::form_row(self.t("connections.editor.ssh.authLabel"), kit::segmented(auth_items, &p), &p)),
+                            .child(div().flex_1().min_w(px(160.)).child(kit::form_row(self.t("ui.conn.sshUser"), ssh_user, &p)))
+                            .child(kit::form_row(self.t("connections.editor.ssh.authLabel"), kit::segmented_sized(auth_items, &p, m.control_h), &p)),
                     );
                 if draft.ssh_auth == SshAuthKind::Key {
                     let ssh_key = self.input_for(DraftField::SshKey, "~/.ssh/id_ed25519", false, window, cx);
@@ -1335,9 +1401,10 @@ impl Workbench {
                     ssh = ssh.child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .gap(px(12.))
-                            .child(div().flex_1().child(kit::form_row(self.t("connections.editor.ssh.keyFile"), ssh_key, &p)))
-                            .child(div().flex_1().child(kit::form_row(self.t("ui.conn.passphrase"), passphrase, &p))),
+                            .child(div().flex_1().min_w(px(160.)).child(kit::form_row(self.t("connections.editor.ssh.keyFile"), ssh_key, &p)))
+                            .child(div().flex_1().min_w(px(160.)).child(kit::form_row(self.t("ui.conn.passphrase"), passphrase, &p))),
                     );
                 } else {
                     let ssh_password = self.input_for(DraftField::SshPassword, "", true, window, cx);
@@ -1367,7 +1434,8 @@ impl Workbench {
         }
 
         let status = draft.id.as_ref().and_then(|id| self.model.connections.status.get(id)).copied().unwrap_or(LinkStatus::Disconnected);
-        let mut footer = div().flex().items_center().gap(px(8.)).pt(px(4.));
+        // 窄窗口里操作换行而不是被右侧裁掉；主要动作仍在末尾、优先可达。
+        let mut footer = div().flex().flex_wrap().items_center().gap(px(8.)).pt(px(4.));
         if existing {
             footer = footer
                 .child(kit::tool_button("conn-delete", Some(IconName::Trash), self.t("connections.page.menuDelete"), act("conn-delete", cx)))
@@ -1389,32 +1457,59 @@ impl Workbench {
         }
 
         let heading = if existing { SharedString::from(draft.name.clone()) } else { self.t("connections.editor.newTitle") };
+        let form_pad = if narrow { 16. } else { m.page_pad };
+        // 表单可滚动，但测试 / 保存 / 连接固定在底部，高度不足时也不用先滚到底。
         div()
-            .id("conn-form-scroll")
+            .id("conn-form")
             .size_full()
-            .overflow_y_scroll()
+            .flex()
+            .flex_col()
             .child(
                 div()
-                    .max_w(px(720.))
-                    .mx_auto()
-                    .px(px(28.))
-                    .py(px(24.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(18.))
+                    .id("conn-form-scroll")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
                     .child(
                         div()
+                            .max_w(px(720.))
+                            .min_w(px(0.))
+                            .mx_auto()
+                            .px(px(form_pad))
+                            .py(px(m.page_pad_y))
                             .flex()
-                            .items_center()
-                            .gap(px(12.))
-                            .child(kit::engine_badge(engine.as_str(), 36.))
-                            .child(div().flex().flex_col().child(kit::title(heading, 17., &p)).child(kit::muted(SharedString::from(kit::engine_label(engine.as_str())), &p))),
-                    )
-                    .child(form_section(self.t("ui.conn.pickEngine"), engine_row, &p))
-                    .child(form_section(self.t("ui.conn.general"), general, &p))
-                    .when(!file_based, |this| this.child(form_section(self.t("ui.conn.security"), security, &p)))
-                    .child(notes)
-                    .child(footer),
+                            .flex_col()
+                            .gap(px(18.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(12.))
+                                    .child(kit::engine_badge(engine.as_str(), 36.))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .min_w(px(0.))
+                                            .child(div().id("conn-form-title").truncate().tooltip_text(heading.clone()).text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(heading))
+                                            .child(kit::muted(SharedString::from(kit::engine_label(engine.as_str())), &p)),
+                                    ),
+                            )
+                            .child(form_section(self.t("ui.conn.pickEngine"), engine_row, &p))
+                            .child(form_section(self.t("ui.conn.general"), general, &p))
+                            .when(!file_based, |this| this.child(form_section(self.t("ui.conn.security"), security, &p)))
+                            .child(notes),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(form_pad))
+                    .py(px(8.))
+                    .border_t_1()
+                    .border_color(p.line)
+                    .bg(p.surface)
+                    .child(div().max_w(px(720.)).min_w(px(0.)).mx_auto().child(footer)),
             )
             .into_any_element()
     }
@@ -1452,6 +1547,7 @@ impl Workbench {
 
     fn history_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
+        let m = self.metrics();
         let section = self.model.history.section;
         let search = self.input_for(DraftField::HistorySearch, &self.model.text("ui.history.search"), false, window, cx);
         let save_name = self.input_for(DraftField::SaveName, &self.model.text("ui.history.saveAs"), false, window, cx);
@@ -1511,7 +1607,17 @@ impl Workbench {
         };
         let has_filters = self.model.history.has_filters();
         let mono = cx.theme().mono_font_family.clone();
-        let mut list = div().id("history-list").flex().flex_col().gap(px(6.)).flex_1().min_h(px(0.)).overflow_y_scroll().px(px(24.)).pb(px(24.));
+        let mut list = div()
+            .id("history-list")
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .flex_1()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .px(px(m.page_pad))
+            .pb(px(m.page_pad_y));
         if let Some(key) = self.model.history.failure_key {
             let detail = self.model.history.failure_detail.clone();
             list = list.child(
@@ -1542,9 +1648,16 @@ impl Workbench {
             let runs: Vec<_> = self.model.history.filtered_runs().into_iter().take(200).cloned().collect();
             if runs.is_empty() {
                 if self.model.history.runs.is_empty() {
-                    list = list.child(kit::empty_state(IconName::Clock, self.t("ui.history.empty"), self.t("history.page.loadOnlySql"), &p));
+                    // 第一次为空：直接给出能产生历史记录的动作。
+                    list = list.child(
+                        kit::empty_state(IconName::Clock, self.t("ui.history.empty"), self.t("history.page.loadOnlySql"), &p)
+                            .child(kit::primary_button("history-empty-query", Some(IconName::SquareTerminal), self.t("shell.command.newQuery"), act("new-query", cx))),
+                    );
                 } else {
-                    list = list.child(kit::empty_state(IconName::Search, self.t("history.page.noMatch"), self.t("history.filter.reset"), &p));
+                    list = list.child(
+                        kit::empty_state(IconName::Search, self.t("history.page.noMatch"), self.t("history.filter.reset"), &p)
+                            .child(kit::secondary_button("history-empty-reset", Some(IconName::X), self.t("history.filter.reset"), act("history-filter-reset", cx))),
+                    );
                 }
             }
             for entry in runs {
@@ -1564,7 +1677,8 @@ impl Workbench {
                         .role(gpui_kit::Role::ListItem)
                         .aria_label(SharedString::from(entry.sql.clone()))
                         .aria_selected(selected)
-                        .p(px(12.))
+                        .p(px(m.row_pad_y + 5.))
+                        .min_w(px(0.))
                         .flex()
                         .flex_col()
                         .gap(px(8.))
@@ -1575,10 +1689,12 @@ impl Workbench {
                         .when(!selected, |this| this.border_color(p.line).hover(|style| style.border_color(p.line_strong)))
                         .child(
                             div()
+                                .min_w(px(0.))
                                 .font_family(mono.clone())
                                 .text_size(px(12.5))
                                 .text_color(p.text)
-                                .when(!selected, |this| this.max_h(px(40.)).overflow_hidden())
+                                .when(!selected, |this| this.max_h(px(40.)).truncate())
+                                .when(selected, |this| this.max_h(px(120.)).overflow_hidden())
                                 .child(SharedString::from(if selected { entry.sql.clone() } else { clip(&entry.sql, 240) })),
                         )
                         .child(
@@ -1590,7 +1706,14 @@ impl Workbench {
                                 .text_color(p.text_faint)
                                 .child(kit::status_dot(if ok { p.ok } else { p.danger }))
                                 .child(kit::engine_badge(&entry.engine, 14.))
-                                .child(SharedString::from(if entry.database_name.is_empty() { entry.connection_name.clone() } else { format!("{} / {}", entry.connection_name, entry.database_name) }))
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("run-target-{id}")))
+                                        .max_w(px(240.))
+                                        .truncate()
+                                        .tooltip_text(SharedString::from(if entry.database_name.is_empty() { entry.connection_name.clone() } else { format!("{} / {}", entry.connection_name, entry.database_name) }))
+                                        .child(SharedString::from(if entry.database_name.is_empty() { entry.connection_name.clone() } else { format!("{} / {}", entry.connection_name, entry.database_name) })),
+                                )
                                 .child(SharedString::from(when))
                                 .when(!elapsed.is_empty(), |this| this.child(SharedString::from(elapsed)))
                                 .child(div().flex_1())
@@ -1635,9 +1758,15 @@ impl Workbench {
             let saved: Vec<_> = self.model.history.filtered_saved().into_iter().take(200).cloned().collect();
             if saved.is_empty() {
                 if self.model.history.saved.is_empty() {
-                    list = list.child(kit::empty_state(IconName::Bookmark, self.t("ui.history.emptySaved"), self.t("history.savedPanel.openNote"), &p));
+                    list = list.child(
+                        kit::empty_state(IconName::Bookmark, self.t("ui.history.emptySaved"), self.t("history.savedPanel.openNote"), &p)
+                            .child(kit::primary_button("history-empty-saved-query", Some(IconName::SquareTerminal), self.t("shell.command.newQuery"), act("new-query", cx))),
+                    );
                 } else {
-                    list = list.child(kit::empty_state(IconName::Search, self.t("history.page.noMatchSaved"), self.t("history.filter.reset"), &p));
+                    list = list.child(
+                        kit::empty_state(IconName::Search, self.t("history.page.noMatchSaved"), self.t("history.filter.reset"), &p)
+                            .child(kit::secondary_button("history-empty-saved-reset", Some(IconName::X), self.t("history.filter.reset"), act("history-filter-reset", cx))),
+                    );
                 }
             }
             for item in saved {
@@ -1655,7 +1784,8 @@ impl Workbench {
                         .role(gpui_kit::Role::ListItem)
                         .aria_label(SharedString::from(item.name.clone()))
                         .aria_selected(selected)
-                        .p(px(12.))
+                        .p(px(m.row_pad_y + 5.))
+                        .min_w(px(0.))
                         .flex()
                         .flex_col()
                         .gap(px(6.))
@@ -1670,9 +1800,18 @@ impl Workbench {
                                 .items_center()
                                 .gap(px(8.))
                                 .child(kit::icon(IconName::Bookmark, 14., p.accent))
-                                .child(div().flex_1().truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(item.name.clone())))
+                                .child(div().id(SharedString::from(format!("saved-name-{id}"))).flex_1().min_w(px(0.)).truncate().tooltip_text(SharedString::from(item.name.clone())).font_weight(FontWeight::MEDIUM).child(SharedString::from(item.name.clone())))
                                 .child(kit::engine_badge(&item.engine, 14.))
-                                .child(div().text_size(px(11.5)).text_color(p.text_faint).child(SharedString::from(item.connection_name.clone())))
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("saved-client-{id}")))
+                                        .max_w(px(180.))
+                                        .truncate()
+                                        .tooltip_text(SharedString::from(item.connection_name.clone()))
+                                        .text_size(px(11.5))
+                                        .text_color(p.text_faint)
+                                        .child(SharedString::from(item.connection_name.clone())),
+                                )
                                 .child(
                                     div()
                                         .flex()
@@ -1700,7 +1839,7 @@ impl Workbench {
                                         })).xsmall()),
                                 ),
                         )
-                        .child(div().font_family(mono.clone()).text_size(px(12.)).text_color(p.text_muted).max_h(px(36.)).overflow_hidden().child(SharedString::from(clip(&item.sql, 200))))
+                        .child(div().min_w(px(0.)).font_family(mono.clone()).text_size(px(12.)).text_color(p.text_muted).max_h(px(36.)).truncate().child(SharedString::from(clip(&item.sql, 200))))
                         .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                             this.model.history.section = HistorySection::Saved;
                             this.model.history.selected_saved = Some(select.clone());
@@ -1742,7 +1881,7 @@ impl Workbench {
             });
         let rename_bar = if section == HistorySection::Saved && self.model.history.rename_open {
             div()
-                .px(px(24.))
+                .px(px(m.page_pad))
                 .pb(px(10.))
                 .flex()
                 .items_center()
@@ -1770,7 +1909,7 @@ impl Workbench {
             .flex_col()
             .child(
                 div()
-                    .px(px(24.))
+                    .px(px(m.page_pad))
                     .pt(px(20.))
                     .pb(px(14.))
                     .flex()
@@ -1780,7 +1919,7 @@ impl Workbench {
                     .child(toolbar),
             )
             .child(rename_bar)
-            .child(div().flex().flex_1().min_h(px(0.)).child(list).child(preview))
+            .child(div().flex().flex_1().min_w(px(0.)).min_h(px(0.)).child(list).child(preview))
             .into_any_element()
     }
 
@@ -1801,6 +1940,9 @@ impl Workbench {
         } else {
             plan.connection_name.clone()
         };
+        // 预览给列表留出至少一列卡片的空间，窄窗口不再把 SQL 挤出去。
+        let content = self.model.layout().content_width as f32;
+        let preview_width = (content - 220.).clamp(260., 380.);
         let status_label = status.map(|status| {
             let ok = status == "ok" || status == "success" || status == "done";
             (if ok { self.t("history.status.ok") } else { self.t("history.status.failed") }, ok)
@@ -1809,7 +1951,8 @@ impl Workbench {
             .id("history-preview")
             .role(gpui_kit::Role::Group)
             .flex_none()
-            .w(px(380.))
+            .w(px(preview_width))
+            .min_w(px(0.))
             .min_h(px(0.))
             .border_l_1()
             .border_color(p.line)
@@ -1868,6 +2011,7 @@ impl Workbench {
 
     fn settings_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
+        let m = self.metrics();
         let s = self.model.settings.clone();
         let theme = self.model.shell.theme;
         let seg = |this: &mut Self, items: &[(&str, &str, bool)], cx: &mut Context<Self>| {
@@ -1875,7 +2019,7 @@ impl Workbench {
                 .iter()
                 .map(|(id, key, selected)| (SharedString::from(id.to_string()), this.t(key), *selected, kit::click(act(id.to_string(), cx))))
                 .collect::<Vec<_>>();
-            kit::segmented(built, &Palette::of(cx))
+            kit::segmented_sized(built, &Palette::of(cx), m.control_h)
         };
         let theme_seg = seg(
             self,
@@ -1956,15 +2100,16 @@ impl Workbench {
                 card = card.child(
                     div()
                         .px(px(16.))
-                        .py(px(12.))
+                        .py(px(m.row_pad_y + 5.))
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .gap(px(16.))
                         .when(index + 1 < count, |this| this.border_b_1().border_color(p.line_soft))
                         .child(
                             div()
                                 .flex_1()
-                                .min_w(px(0.))
+                                .min_w(px(180.))
                                 .flex()
                                 .flex_col()
                                 .gap(px(2.))
@@ -1979,6 +2124,7 @@ impl Workbench {
 
         div()
             .id("settings-page")
+            .test_support()
             .role(gpui_kit::Role::Group)
             .aria_label(self.t("shell.settings.title"))
             .size_full()
@@ -1986,12 +2132,13 @@ impl Workbench {
             .child(
                 div()
                     .max_w(px(760.))
+                    .min_w(px(0.))
                     .mx_auto()
-                    .px(px(28.))
-                    .py(px(28.))
+                    .px(px(m.page_pad))
+                    .py(px(m.page_pad_y))
                     .flex()
                     .flex_col()
-                    .gap(px(24.))
+                    .gap(px(m.page_pad - 4.))
                     .child(kit::title(self.t("shell.settings.title"), 20., &p))
                     .child(group(
                         self.t("ui.settings.appearance"),
@@ -2031,15 +2178,18 @@ impl Workbench {
 
     fn palette_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
+        let m = self.metrics();
         let help = self.model.shell.help_open && !self.model.shell.palette_open;
         let mut panel = div()
             .id("palette")
+            .test_support()
             .role(gpui_kit::Role::Dialog)
             .aria_label(self.t(if help { "shell.command.help" } else { "shell.palette.title" }))
             .aria_expanded(self.model.shell.palette_open)
             .key_context("Palette")
             .occlude()
-            .w(px(560.))
+            .w_full()
+            .max_w(px(560.))
             .max_h(px(460.))
             .flex()
             .flex_col()
@@ -2061,7 +2211,7 @@ impl Workbench {
                 list = list.child(
                     div()
                         .px(px(8.))
-                        .h(px(30.))
+                        .h(px(m.menu_row_h))
                         .flex()
                         .items_center()
                         .gap(px(12.))
@@ -2105,7 +2255,7 @@ impl Workbench {
                     .child(self.t(self.model.palette_empty_key()));
                 if self.model.shell.palette_tables_only && !error.is_empty() {
                     empty = empty
-                        .child(div().text_size(px(11.5)).truncate().child(SharedString::from(error)))
+                        .child(div().id("palette-error").text_size(px(11.5)).truncate().tooltip_text(SharedString::from(error.clone())).child(SharedString::from(error)))
                         .child(kit::tool_button(
                             "palette-tree-retry",
                             Some(IconName::RefreshCw),
@@ -2116,6 +2266,16 @@ impl Workbench {
                             }),
                         ));
                 }
+                // 面板为空时给一个能立刻继续的动作，而不是只留解释。
+                empty = empty.child(kit::tool_button(
+                    "palette-new-query",
+                    Some(IconName::SquareTerminal),
+                    self.t("shell.command.newQuery"),
+                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.model.shell.close_overlay();
+                        this.perform("new-query", cx);
+                    }),
+                ));
                 list = list.child(empty);
             }
             for (index, entry) in entries.into_iter().take(40).enumerate() {
@@ -2135,7 +2295,7 @@ impl Workbench {
                         .role(gpui_kit::Role::MenuItem)
                         .aria_label(SharedString::from(entry.label.clone()))
                         .aria_selected(selected)
-                        .h(px(34.))
+                        .h(px(m.row_h + 2.))
                         .px(px(10.))
                         .flex()
                         .items_center()
@@ -2163,6 +2323,7 @@ impl Workbench {
             .flex()
             .flex_col()
             .items_center()
+            .px(px(16.))
             .pt(px(72.))
             .child(panel)
             .into_any_element()
@@ -2170,6 +2331,7 @@ impl Workbench {
 
     fn context_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
+        let m = self.metrics();
         let Some(menu) = self.model.menu.clone() else {
             return div().into_any_element();
         };
@@ -2221,7 +2383,7 @@ impl Workbench {
                     .aria_label(label.clone())
                     .aria_selected(selected)
                     .aria_description(SharedString::from(format!("{state} {}", item.reason_key.unwrap_or(item.id))))
-                    .h(px(28.))
+                    .h(px(m.menu_row_h))
                     .px(px(10.))
                     .flex()
                     .items_center()
@@ -2268,7 +2430,7 @@ impl Workbench {
                     .child(kit::danger_button("cmd-close-leave", None, self.t("shell.closeGuard.leave"), leave))
                     .child(kit::primary_button("cmd-close-stay", None, self.t("shell.closeGuard.stay"), act("close-stay", cx))),
             );
-        backdrop("close-backdrop", 0.32, cx).flex().items_center().justify_center().child(dialog).into_any_element()
+        backdrop("close-backdrop", 0.32, cx).flex().items_center().justify_center().px(px(20.)).child(dialog).into_any_element()
     }
 
     fn delete_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -2281,7 +2443,7 @@ impl Workbench {
                 .child(kit::secondary_button("cmd-conn-delete-cancel", None, self.t("common.cancel"), act("conn-delete-cancel", cx)))
                 .child(kit::danger_button("cmd-conn-delete-confirm", Some(IconName::Trash), self.t("connections.deleteDialog.confirm"), act("conn-delete-confirm", cx))),
         );
-        backdrop("delete-backdrop", 0.32, cx).flex().items_center().justify_center().child(dialog).into_any_element()
+        backdrop("delete-backdrop", 0.32, cx).flex().items_center().justify_center().px(px(20.)).child(dialog).into_any_element()
     }
 
     fn clear_history_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -2298,7 +2460,7 @@ impl Workbench {
                 })))
                 .child(kit::danger_button("cmd-history-clear-confirm", Some(IconName::Trash), self.t("ui.history.clear"), act("history-clear", cx))),
         );
-        backdrop("clear-backdrop", 0.32, cx).flex().items_center().justify_center().child(dialog).into_any_element()
+        backdrop("clear-backdrop", 0.32, cx).flex().items_center().justify_center().px(px(20.)).child(dialog).into_any_element()
     }
 
     fn delete_saved_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -2311,17 +2473,18 @@ impl Workbench {
                 .child(kit::secondary_button("cmd-saved-delete-cancel", None, self.t("common.cancel"), act("saved-delete-cancel", cx)))
                 .child(kit::danger_button("cmd-saved-delete-confirm", Some(IconName::Trash), self.t("ui.history.delete"), act("saved-delete", cx))),
         );
-        backdrop("delete-saved-backdrop", 0.32, cx).flex().items_center().justify_center().child(dialog).into_any_element()
+        backdrop("delete-saved-backdrop", 0.32, cx).flex().items_center().justify_center().px(px(20.)).child(dialog).into_any_element()
     }
 
     fn exchange_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
+        let m = self.metrics();
         let panel = div()
             .id("exchange-drawer")
             .occlude()
             .absolute()
-            .top(px(TOPBAR_H))
-            .bottom(px(STATUS_H))
+            .top(px(m.topbar_h))
+            .bottom(px(m.status_h))
             .right_0()
             .w(px(520.0_f32.min(self.model.viewport_width as f32 - 60.)))
             .flex()
@@ -2334,7 +2497,7 @@ impl Workbench {
             .child(
                 div()
                     .flex_none()
-                    .h(px(TABS_H + 8.))
+                    .h(px(m.tabs_h + 8.))
                     .px(px(16.))
                     .flex()
                     .items_center()
@@ -2410,12 +2573,23 @@ fn item_icon(kind: WorkItemKind) -> IconName {
     }
 }
 
-fn tab_chip(id: impl Into<SharedString>, icon: IconName, title: SharedString, active: bool, dirty: bool, running: bool, p: &Palette) -> gpui_kit::Stateful<gpui_kit::Div> {
+fn tab_chip(
+    id: impl Into<SharedString>,
+    icon: IconName,
+    title: SharedString,
+    active: bool,
+    dirty: bool,
+    running: bool,
+    p: &Palette,
+) -> impl IntoElement + gpui_kit::ParentElement + gpui_kit::StatefulInteractiveElement {
     let accent = p.accent;
+    let full_title = title.clone();
     div()
         .id(gpui_kit::ElementId::Name(id.into()))
+        .test_support()
         .role(gpui_kit::Role::Tab)
         .aria_label(title.clone())
+        .tooltip_text(full_title)
         .aria_selected(active)
         .group("tab")
         .relative()
@@ -2440,14 +2614,15 @@ fn tab_chip(id: impl Into<SharedString>, icon: IconName, title: SharedString, ac
         })
         .child(div().truncate().text_size(px(12.5)).child(title))
         .when(dirty, |this| this.child(div().flex_none().size(px(6.)).rounded_full().bg(p.text_faint)))
+        .test_support()
 }
 
-fn list_row(id: SharedString, p: &Palette) -> gpui_kit::Stateful<gpui_kit::Div> {
+fn list_row(id: SharedString, p: &Palette, pad_y: f32) -> gpui_kit::Stateful<gpui_kit::Div> {
     div()
         .id(id)
         .role(gpui_kit::Role::Button)
         .px(px(8.))
-        .py(px(6.))
+        .py(px(pad_y))
         .flex()
         .items_center()
         .gap(px(10.))
@@ -2545,7 +2720,9 @@ fn dialog_card(id: &'static str, icon: IconName, tone: gpui_kit::Hsla, title: Sh
         .role(gpui_kit::Role::Dialog)
         .aria_label(title.clone())
         .occlude()
-        .w(px(440.))
+        .w_full()
+        .max_w(px(440.))
+        .min_w(px(0.))
         .p(px(20.))
         .flex()
         .flex_col()

@@ -675,10 +675,12 @@ impl WorkbenchModel {
             "locale-zh" => {
                 self.settings.locale = "zh-CN".into();
                 self.settings.apply_shell(&mut self.shell);
+                self.relabel_query_tabs();
             }
             "locale-en" => {
                 self.settings.locale = "en".into();
                 self.settings.apply_shell(&mut self.shell);
+                self.relabel_query_tabs();
             }
             "font-up" => self.settings.step_editor_font(1),
             "font-down" => self.settings.step_editor_font(-1),
@@ -1139,6 +1141,7 @@ impl WorkbenchModel {
         let index = self.tabs.iter().position(|tab| tab.id == id);
         let removed = self.tabs.iter().find(|tab| tab.id == id).cloned();
         self.tabs.retain(|tab| tab.id != id);
+        self.relabel_query_tabs();
         if self.active_tab.as_deref() != Some(id) {
             // 关闭的不是当前项：只有它正好被当前工具显示时才重新绑定视图。
             if let Some(removed) = removed {
@@ -1508,12 +1511,25 @@ impl WorkbenchModel {
     }
 
     fn open_query_draft(&mut self, draft: String, keep_page: bool) {
-        let title_n = self.tabs.iter().filter(|tab| tab.kind.is_query()).count() + 1;
         let id = self.next_item_id(WorkItemKind::Query);
-        self.tabs.push(WorkItem::query(id.clone(), format!("query {title_n}"), draft));
+        // 标签标题是界面文案，不是用户数据；按当前语言生成并在语言切换时重排。
+        self.tabs.push(WorkItem::query(id.clone(), String::new(), draft));
+        self.relabel_query_tabs();
         self.activate_item(&id);
         if !keep_page {
             self.shell.page = AppPage::Workspace;
+        }
+    }
+
+    /// 查询标签按当前语言的“查询 N / Query N”重新编号；表、结构等项保留对象名。
+    fn relabel_query_tabs(&mut self) {
+        let template = i18n::text(self.locale(), "ui.query.tabTitle");
+        let mut ordinal = 0;
+        for tab in &mut self.tabs {
+            if tab.kind.is_query() {
+                ordinal += 1;
+                tab.title = i18n::fill(&template, &[("n", &ordinal.to_string())]);
+            }
         }
     }
 
@@ -1671,6 +1687,7 @@ impl WorkbenchModel {
             "shell.closeGuard.windowBoth",
             "shell.update.busy",
             "shell.update.pending",
+            "ui.query.tabTitle",
         ];
         keys.extend(self.page_keys());
         keys.sort_unstable();
@@ -1750,10 +1767,12 @@ impl WorkbenchModel {
         self.visible_keys().into_iter().filter(|key| i18n::text(locale, key) == *key || i18n::text(locale, key).is_empty()).collect()
     }
 
+    /// 文案按实际内容宽度衡量：侧栏停靠时页面只有 `content_width` 可用，
+    /// 不能拿整窗宽度代替内容区，否则窄窗口里的溢出会被放过。
     pub fn copy_overflow(&self, locale: i18n::Locale) -> i32 {
         let layout = self.layout();
         let mut overflow = layout.overflow;
-        let limit = layout.width.max(1);
+        let limit = layout.content_width.max(160);
         for key in self.visible_keys() {
             let text = i18n::text(locale, key);
             let width = unbreakable_px(&text);
@@ -1774,6 +1793,7 @@ impl WorkbenchModel {
 
     pub fn restore_session(&mut self, session: &SessionState) {
         self.tabs = session.tabs.iter().filter_map(session_to_item).collect();
+        self.relabel_query_tabs();
         self.tool = WorkTool::Query;
         self.table_spec = None;
         self.redis_spec = None;

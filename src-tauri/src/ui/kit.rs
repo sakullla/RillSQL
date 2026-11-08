@@ -13,8 +13,8 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Theme, ThemeMode};
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
-    hsla, px, rgb,
+    IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window,
+    div, hsla, px, rgb,
 };
 
 /// 一套色板。字段名按用途取，不按色相取。
@@ -77,7 +77,8 @@ impl Palette {
             line_strong: hex(0xd0d5dd),
             text: hex(0x16191f),
             text_muted: hex(0x5d6675),
-            text_faint: hex(0x8d95a3),
+            // 弱文用于 11–12px 的提示与分区标题；保持在白底和 chrome 底上都过 4.5:1。
+            text_faint: hex(0x667085),
             accent: hex(0x4f5bd5),
             accent_hover: hex(0x4350c4),
             accent_active: hex(0x3a45ad),
@@ -85,10 +86,11 @@ impl Palette {
             accent_text: hex(0x3a45ad),
             selection: alpha(0x4f5bd5, 0.14),
             zebra: hex(0xfafbfc),
-            ok: hex(0x13925d),
-            warn: hex(0xb7791f),
-            danger: hex(0xd23f3f),
-            info: hex(0x2f7dd1),
+            // 状态色同时作为小号文字使用，压深到 soft 底也过 4.5:1。
+            ok: hex(0x0f7a4d),
+            warn: hex(0x8f5e14),
+            danger: hex(0xb42f2f),
+            info: hex(0x2568b0),
             ok_soft: hex(0xe6f6ee),
             warn_soft: hex(0xfdf3e1),
             danger_soft: hex(0xfdecec),
@@ -109,7 +111,7 @@ impl Palette {
             line_strong: hex(0x3b3f48),
             text: hex(0xe9ebef),
             text_muted: hex(0xa1a7b3),
-            text_faint: hex(0x6f7682),
+            text_faint: hex(0x8b929f),
             accent: hex(0x7c86f5),
             accent_hover: hex(0x949cf8),
             accent_active: hex(0x6670e6),
@@ -219,6 +221,83 @@ fn brand(theme: &mut Theme, p: &Palette, white: Hsla, clear: Hsla) {
     c.link = p.accent_text;
     c.link_hover = p.accent;
     c.link_active = p.accent_active;
+}
+
+// ---------------------------------------------------------------- 尺寸指标
+
+/// 外壳与页面的尺寸指标。只由密度决定，绘制与模型布局共用这一份值，
+/// 不再让页面各自保留一套高度常量。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Metrics {
+    /// 树、列表、标签行高度。
+    pub row_h: f32,
+    /// 对象树行高度。
+    pub tree_row_h: f32,
+    /// 上下文菜单 / 浮层行高度。
+    pub menu_row_h: f32,
+    /// 分段控件与紧凑按钮高度。
+    pub control_h: f32,
+    pub topbar_h: f32,
+    pub tabs_h: f32,
+    pub status_h: f32,
+    /// 根节点内边距，与 `WorkbenchModel::painted` 共用。
+    pub pad: f32,
+    /// 页面内容左右内边距。
+    pub page_pad: f32,
+    /// 页面内容上下内边距。
+    pub page_pad_y: f32,
+    /// 列表行的上下内边距。
+    pub row_pad_y: f32,
+}
+
+impl Metrics {
+    pub fn compact() -> Self {
+        Self {
+            row_h: 24.,
+            tree_row_h: 22.,
+            menu_row_h: 24.,
+            control_h: 22.,
+            topbar_h: 40.,
+            tabs_h: 32.,
+            status_h: 24.,
+            pad: 4.,
+            page_pad: 22.,
+            page_pad_y: 20.,
+            row_pad_y: 5.,
+        }
+    }
+
+    pub fn standard() -> Self {
+        Self {
+            row_h: 32.,
+            tree_row_h: 28.,
+            menu_row_h: 28.,
+            control_h: 24.,
+            topbar_h: 44.,
+            tabs_h: 36.,
+            status_h: 26.,
+            pad: 8.,
+            page_pad: 28.,
+            page_pad_y: 28.,
+            row_pad_y: 7.,
+        }
+    }
+
+    pub fn relaxed() -> Self {
+        Self {
+            row_h: 40.,
+            tree_row_h: 36.,
+            menu_row_h: 34.,
+            control_h: 28.,
+            topbar_h: 48.,
+            tabs_h: 40.,
+            status_h: 28.,
+            pad: 12.,
+            page_pad: 34.,
+            page_pad_y: 36.,
+            row_pad_y: 9.,
+        }
+    }
 }
 
 // ---------------------------------------------------------------- 引擎与环境
@@ -447,16 +526,22 @@ pub fn danger_button(id: impl Into<ElementId>, name: Option<IconName>, label: im
 
 /// 分段选择：一组互斥选项，选中项高亮。
 pub fn segmented(items: Vec<(SharedString, SharedString, bool, Click)>, p: &Palette) -> AnyElement {
+    segmented_sized(items, p, Metrics::standard().control_h)
+}
+
+/// 同 `segmented`，高度跟随密度。
+pub fn segmented_sized(items: Vec<(SharedString, SharedString, bool, Click)>, p: &Palette, height: f32) -> AnyElement {
     let mut row = div().flex().flex_none().p(px(2.)).gap(px(2.)).rounded(px(8.)).bg(p.hover);
     for (id, label, selected, on_click) in items {
         row = row.child(
             div()
                 .id(ElementId::Name(id))
+                .test_support()
                 .role(gpui_kit::Role::Button)
                 .aria_label(label.clone())
                 .aria_selected(selected)
                 .px(px(10.))
-                .h(px(24.))
+                .h(px(height))
                 .flex()
                 .items_center()
                 .rounded(px(6.))
@@ -616,6 +701,64 @@ pub fn form_row(label: impl Into<SharedString>, control: impl IntoElement, p: &P
 }
 
 use gpui_kit::prelude::FluentBuilder as _;
+
+#[cfg(test)]
+mod palette_tests {
+    use super::*;
+
+    fn luminance(color: Hsla) -> f32 {
+        let rgba: gpui_kit::Rgba = color.into();
+        let channel = |value: f32| {
+            if value <= 0.03928 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(rgba.r) + 0.7152 * channel(rgba.g) + 0.0722 * channel(rgba.b)
+    }
+
+    fn contrast(foreground: Hsla, background: Hsla) -> f32 {
+        let (a, b) = (luminance(foreground), luminance(background));
+        let (light, dark) = if a >= b { (a, b) } else { (b, a) };
+        (light + 0.05) / (dark + 0.05)
+    }
+
+    /// 正文、提示与状态文字在两种主题里都达到 WCAG AA 的 4.5:1。
+    #[test]
+    fn every_theme_keeps_text_readable() {
+        for p in [Palette::light(), Palette::dark()] {
+            for (name, fg) in [("text", p.text), ("muted", p.text_muted), ("faint", p.text_faint)] {
+                for (surface_name, bg) in [("surface", p.surface), ("chrome", p.chrome), ("raised", p.raised)] {
+                    let ratio = contrast(fg, bg);
+                    assert!(ratio >= 4.5, "{name} on {surface_name}: {ratio:.2} ({})", p.dark);
+                }
+            }
+            for (name, fg, bg) in [
+                ("ok", p.ok, p.ok_soft),
+                ("warn", p.warn, p.warn_soft),
+                ("danger", p.danger, p.danger_soft),
+                ("accent", p.accent_text, p.accent_soft),
+            ] {
+                let ratio = contrast(fg, bg);
+                assert!(ratio >= 4.5, "{name} on soft: {ratio:.2} ({})", p.dark);
+            }
+            for (name, color) in [("ok", p.ok), ("warn", p.warn), ("danger", p.danger), ("info", p.info)] {
+                let ratio = contrast(color, p.surface);
+                assert!(ratio >= 4.5, "{name} on surface: {ratio:.2} ({})", p.dark);
+            }
+        }
+    }
+
+    /// 三档密度必须真的拉开行高与控制高度，否则切换只是文案变化。
+    #[test]
+    fn density_metrics_are_distinct_and_ordered() {
+        let (compact, standard, relaxed) = (Metrics::compact(), Metrics::standard(), Metrics::relaxed());
+        assert!(compact.row_h < standard.row_h && standard.row_h < relaxed.row_h);
+        assert!(compact.control_h < standard.control_h && standard.control_h < relaxed.control_h);
+        assert!(compact.pad < standard.pad && standard.pad < relaxed.pad);
+    }
+}
 
 #[cfg(test)]
 mod field_tests {
