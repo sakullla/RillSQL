@@ -1308,7 +1308,7 @@ impl Workbench {
                     })),
                 ));
             }
-            security = security.child(kit::form_row(self.t("connections.editor.tls.title"), kit::segmented(tls_items, &p), &p));
+            security = security.child(kit::form_row(self.t("connections.editor.tls.title"), kit::segmented_sized(tls_items, &p, self.metrics().control_h), &p));
             if draft.tls_mode == TlsMode::Verify {
                 let mut ca_items = Vec::new();
                 for (mode, key) in [(CaMode::System, "connections.editor.tls.caSystem"), (CaMode::File, "connections.editor.tls.caFile")] {
@@ -1324,7 +1324,7 @@ impl Workbench {
                         })),
                     ));
                 }
-                security = security.child(kit::form_row(self.t("connections.editor.tls.caLabel"), kit::segmented(ca_items, &p), &p));
+                security = security.child(kit::form_row(self.t("connections.editor.tls.caLabel"), kit::segmented_sized(ca_items, &p, self.metrics().control_h), &p));
                 if draft.ca_mode == CaMode::File {
                     let ca = self.input_for(DraftField::CaFile, "ca.pem", false, window, cx);
                     security = security.child(kit::form_row(self.t("connections.editor.tls.caFile"), ca, &p));
@@ -1552,7 +1552,7 @@ impl Workbench {
         let search = self.input_for(DraftField::HistorySearch, &self.model.text("ui.history.search"), false, window, cx);
         let save_name = self.input_for(DraftField::SaveName, &self.model.text("ui.history.saveAs"), false, window, cx);
         let rename_input = self.input_for(DraftField::RenameName, &self.model.text("history.page.rename"), false, window, cx);
-        let tabs = kit::segmented(
+        let tabs = kit::segmented_sized(
             vec![
                 (
                     SharedString::from("history-runs"),
@@ -1568,9 +1568,10 @@ impl Workbench {
                 ),
             ],
             &p,
+            self.metrics().control_h,
         );
         let filter_status = self.model.history.filter_status.clone();
-        let status_seg = kit::segmented(
+        let status_seg = kit::segmented_sized(
             vec![
                 (
                     SharedString::from("history-status-all"),
@@ -1592,6 +1593,7 @@ impl Workbench {
                 ),
             ],
             &p,
+            self.metrics().control_h,
         );
         let filter_connection = self.model.history.filter_connection.clone();
         let connection_label = if filter_connection.is_empty() {
@@ -1895,10 +1897,24 @@ impl Workbench {
         };
 
         let known = self.model.known_ids();
+        // 窄窗口把预览放到列表上方；并排会挤压卡片操作，长错误/元数据会互相覆盖。
+        let narrow = history_stacks_preview(self.model.layout().content_width as f32);
         let preview = if preview_open {
-            self.history_preview(&known, &p, cx)
+            self.history_preview(&known, &p, narrow, cx)
         } else {
             div().into_any_element()
+        };
+        let body = if narrow {
+            div()
+                .flex()
+                .flex_1()
+                .min_w(px(0.))
+                .min_h(px(0.))
+                .flex_col()
+                .child(div().max_h(px(300.)).flex_none().child(preview))
+                .child(list)
+        } else {
+            div().flex().flex_1().min_w(px(0.)).min_h(px(0.)).child(list).child(preview)
         };
         div()
             .id("history-page")
@@ -1919,11 +1935,11 @@ impl Workbench {
                     .child(toolbar),
             )
             .child(rename_bar)
-            .child(div().flex().flex_1().min_w(px(0.)).min_h(px(0.)).child(list).child(preview))
+            .child(body)
             .into_any_element()
     }
 
-    fn history_preview(&self, known: &std::collections::BTreeSet<String>, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+    fn history_preview(&self, known: &std::collections::BTreeSet<String>, p: &Palette, narrow: bool, cx: &mut Context<Self>) -> AnyElement {
         let Some(plan) = self.model.history.preview_plan(known) else {
             return div().into_any_element();
         };
@@ -1951,12 +1967,12 @@ impl Workbench {
             .id("history-preview")
             .role(gpui_kit::Role::Group)
             .flex_none()
-            .w(px(preview_width))
             .min_w(px(0.))
             .min_h(px(0.))
-            .border_l_1()
+            .when(narrow, |this| this.w_full().border_t_1())
+            .when(!narrow, |this| this.w(px(preview_width)).border_l_1())
             .border_color(p.line)
-            .p(px(18.))
+            .p(px(if narrow { 12. } else { 18. }))
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -2761,6 +2777,11 @@ fn backdrop(id: &'static str, dim: f32, cx: &mut Context<Workbench>) -> gpui_kit
             });
         })
         .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+}
+
+/// 历史预览在窄内容区改为上下堆叠，避免挤压列表卡片。
+pub(super) fn history_stacks_preview(content_width: f32) -> bool {
+    content_width < 820.
 }
 
 fn palette_icon(id: &str) -> IconName {

@@ -78,7 +78,8 @@ impl Palette {
             text: hex(0x16191f),
             text_muted: hex(0x5d6675),
             // 弱文用于 11–12px 的提示与分区标题；保持在白底和 chrome 底上都过 4.5:1。
-            text_faint: hex(0x667085),
+            // 选中/悬停底（active、accent_soft、hover）上也要过 4.5:1。
+            text_faint: hex(0x5b6573),
             accent: hex(0x4f5bd5),
             accent_hover: hex(0x4350c4),
             accent_active: hex(0x3a45ad),
@@ -111,7 +112,8 @@ impl Palette {
             line_strong: hex(0x3b3f48),
             text: hex(0xe9ebef),
             text_muted: hex(0xa1a7b3),
-            text_faint: hex(0x8b929f),
+            // 深色主题的选中/悬停底同样按 4.5:1 校准。
+            text_faint: hex(0x98a0ac),
             accent: hex(0x7c86f5),
             accent_hover: hex(0x949cf8),
             accent_active: hex(0x6670e6),
@@ -722,6 +724,27 @@ mod palette_tests {
         let (a, b) = (luminance(foreground), luminance(background));
         let (light, dark) = if a >= b { (a, b) } else { (b, a) };
         (light + 0.05) / (dark + 0.05)
+    }
+
+    /// 正文、提示与状态文字在选中/悬停底上也达到 WCAG AA 的 4.5:1。
+    #[test]
+    fn every_theme_keeps_faint_text_readable_on_selected_backgrounds() {
+        for p in [Palette::light(), Palette::dark()] {
+            for background in [p.active, p.accent_soft, p.hover] {
+                assert!(
+                    contrast(p.text_faint, background) >= 4.5,
+                    "faint on selected background: {:.2}",
+                    contrast(p.text_faint, background)
+                );
+            }
+            for (color, background) in [(p.ok, p.ok_soft), (p.warn, p.warn_soft), (p.danger, p.danger_soft), (p.info, p.accent_soft)] {
+                assert!(
+                    contrast(color, background) >= 4.5,
+                    "status on soft background: {:.2}",
+                    contrast(color, background)
+                );
+            }
+        }
     }
 
     /// 正文、提示与状态文字在两种主题里都达到 WCAG AA 的 4.5:1。

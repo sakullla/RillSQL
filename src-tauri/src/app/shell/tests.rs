@@ -3056,6 +3056,40 @@ async fn every_public_setting_moves_both_ways_applies_immediately_and_persists()
 }
 
 #[gpui_kit::test]
+fn history_preview_uses_stacked_layout_when_content_is_narrow(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-history-compact-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.model.shell.page = AppPage::History;
+            view.model.history.runs = vec![
+                history_run("a", "select 1", "live", "ok"),
+                history_run("b", "select 2", "live", "error"),
+            ];
+            view.model.history.selected_run = Some("a".into());
+            view.model.history.preview_open = true;
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let view = view.read(cx);
+        assert!(super::chrome::history_stacks_preview(600.), "600 应走窄布局");
+        assert!(!super::chrome::history_stacks_preview(900.), "900 仍并排");
+        assert!(view.model.history.preview_open);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.click("history-preview-close", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| assert!(!view.read(cx).model.history.preview_open));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui_kit::test]
 fn history_and_settings_pages_render_and_apply_their_controls(cx: &mut gpui_kit::TestAppContext) {
     let dir = std::env::temp_dir().join(format!("rillsql-history-render-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
