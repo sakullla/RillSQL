@@ -1077,6 +1077,36 @@ impl Workbench {
             }
             ExchangeSourceKind::Table => {
                 let (table, columns, rows, truncated) = self.table.read(cx).exchange_sheet();
+                let running = self.table.read(cx).fetching();
+                // 只有当前工作项的目标与网格实际表一致时才能把网格当来源；
+                // 结构页、刚切换的表和隐藏的旧表都不能混用列与行。
+                let consistent = match self.model.active_tab() {
+                    // 没有工作项的旧表格界面（测试/手动工具）仍以当前网格为准。
+                    None => true,
+                    Some(item) if item.kind == WorkItemKind::Query => false,
+                    Some(item) => match (item.spec.as_deref(), table.as_ref()) {
+                        (Some(spec), Some(table)) => {
+                            let parts: Vec<&str> = spec.split('|').collect();
+                            parts.first() == Some(&table.connection_id.as_str())
+                                && parts.get(2) == Some(&table.database.as_str())
+                                && parts.get(4) == Some(&table.table.as_str())
+                        }
+                        _ => false,
+                    },
+                };
+                if !consistent {
+                    return ExchangeSource {
+                        kind: ExchangeSourceKind::Table,
+                        item: self.exchange_item.clone(),
+                        table: None,
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                        truncated: false,
+                        running,
+                        label: String::new(),
+                        context: String::new(),
+                    };
+                }
                 let label = table.as_ref().map(|table| table.table.clone()).unwrap_or_default();
                 let context = table
                     .as_ref()
@@ -1096,7 +1126,7 @@ impl Workbench {
                     columns,
                     rows,
                     truncated,
-                    running: false,
+                    running,
                     label,
                     context,
                 }
@@ -1150,6 +1180,8 @@ impl Render for Workbench {
         self.pump_jobs(cx);
         self.sync_query(window, cx);
         self.sync_catalog(cx);
+        let owner = cx.entity().downgrade();
+        self.exchange.update(cx, |pane, _| pane.attach_owner(owner));
         self.ensure_tool(cx);
         self.ensure_redis(cx);
         self.ensure_mongo(cx);

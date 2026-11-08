@@ -45,6 +45,8 @@ pub struct GridPane {
     /// 编辑栏关闭后把键盘焦点还回网格，Esc 之后方向键和 F2 仍然可用。
     refocus: bool,
     loading_more: bool,
+    /// 首屏或替换读取尚未返回；交换面板据此禁止把旧快照当成当前表。
+    fetching: bool,
     sort_desc: bool,
     search: Option<Entity<InputState>>,
     /// 换表后清掉查找框里的旧文字，避免输入框和实际筛选条件不一致。
@@ -107,6 +109,7 @@ impl GridPane {
             grid_focus: cx.focus_handle().tab_stop(true),
             refocus: false,
             loading_more: false,
+            fetching: false,
             sort_desc: false,
             search: None,
             clear_search: false,
@@ -123,6 +126,7 @@ impl GridPane {
 
     pub fn clear_sheet(&mut self, cx: &mut Context<Self>) {
         let locale = self.locale;
+        self.fetching = false;
         self.session = SharedGrid::new();
         self.session.locale = locale;
         self.scheduled = 0;
@@ -149,6 +153,11 @@ impl GridPane {
 
     pub fn uncommitted(&self) -> bool {
         self.session.uncommitted()
+    }
+
+    /// 首屏或替换读取仍在进行；旧快照不能当成本表的数据源。
+    pub fn fetching(&self) -> bool {
+        self.fetching
     }
 
     pub fn writable(&self) -> bool {
@@ -574,6 +583,7 @@ impl GridPane {
     }
 
     fn fetch_at(&mut self, offset: u64, replace: bool, cx: &mut Context<Self>) {
+        self.fetching = true;
         self.session.token = self.session.token.saturating_add(1);
         let token = self.session.token;
         self.scheduled = token;
@@ -594,6 +604,7 @@ impl GridPane {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             if this.session.token != token {
+                                // 更新的请求持有 fetching，旧结果不能替它清加载态。
                                 this.loading_more = false;
                                 return;
                             }
@@ -609,10 +620,16 @@ impl GridPane {
                                         this.session.append_page(rows, full, truncated);
                                     }
                                     this.loading_more = false;
+                                    this.fetching = false;
+                                    this.sync_table(cx);
+                                } else {
+                                    this.loading_more = false;
+                                    this.fetching = false;
                                     this.sync_table(cx);
                                 }
                             } else {
                                 this.loading_more = false;
+                                this.fetching = false;
                                 this.sync_table(cx);
                             }
                         });

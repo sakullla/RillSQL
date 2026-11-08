@@ -1665,6 +1665,46 @@ fn query_commands_refuse_a_hidden_query_while_a_table_item_is_active(cx: &mut gp
 }
 
 #[gpui_kit::test]
+fn exchange_source_buttons_route_through_the_shell(cx: &mut gpui_kit::TestAppContext) {
+    use crate::app::views::export::ExchangeSourceKind;
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-exchange-buttons-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("new-query", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            let query = view.model.active_tab.clone().expect("query");
+            view.model.set_query_target(&query, Some("notes".to_owned()), Some("笔记".to_owned()), Some("main".to_owned()), Some("sqlite".to_owned()));
+            view.plant_query_result(vec!["label".to_owned()], vec![vec!["真实".to_owned()]], cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    let exchange = cx.update(|cx| view.read(cx).exchange.clone());
+    // 面板按钮的真实路径：request_source → Workbench::perform，而不是只改面板自己。
+    cx.update(|cx| exchange.update(cx, |pane, cx| pane.request_source("exchange-source:query", cx)));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).exchange_kind(cx), ExchangeSourceKind::Query);
+        assert_eq!(view.read(cx).exchange_columns(cx), vec!["label".to_owned()]);
+    });
+
+    cx.update(|cx| exchange.update(cx, |pane, cx| pane.request_source("exchange-source:table", cx)));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).exchange_kind(cx), ExchangeSourceKind::Table);
+        assert!(view.read(cx).exchange_columns(cx).is_empty(), "查询项下显式选表数据不得借用上一张表的列");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui_kit::test]
 fn exchange_source_follows_the_active_item_and_query_source_blocks_full_export(cx: &mut gpui_kit::TestAppContext) {
     cx.executor().allow_parking();
     use crate::app::views::export::ExchangeSourceKind;

@@ -98,9 +98,27 @@ pub struct ExchangePane {
     dump_request: Option<DumpRequest>,
     migrate_request: Option<MigrateRequest>,
     pub notice: String,
+    /// 来源切换由外壳决定工作项与来源，面板只把请求交回 Workbench。
+    owner: Option<gpui_kit::WeakEntity<crate::app::shell::Workbench>>,
 }
 
 impl ExchangePane {
+    pub(crate) fn attach_owner(&mut self, owner: gpui_kit::WeakEntity<crate::app::shell::Workbench>) {
+        self.owner = Some(owner);
+    }
+
+    /// 面板按钮的唯一样本来回外壳：切换来源必须走 Workbench::perform。
+    pub(crate) fn request_source(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(owner) = self.owner.clone() else { return };
+        let id = id.to_owned();
+        // 面板正在更新时不能同步回头更新外壳（会重入面板）；defer 到本轮结束再切换来源。
+        cx.defer(move |cx| {
+            if let Some(owner) = owner.upgrade() {
+                owner.update(cx, |view, cx| view.perform(&id, cx));
+            }
+        });
+    }
+
     pub fn new(services: Arc<AppServices>) -> Self {
         Self {
             services,
@@ -120,6 +138,7 @@ impl ExchangePane {
             dump_request: None,
             migrate_request: None,
             notice: String::new(),
+            owner: None,
         }
     }
 
@@ -982,7 +1001,7 @@ impl Render for ExchangePane {
                 self.source.kind == kind,
                 kit::click(move |_, _, cx| {
                     let id = id.to_owned();
-                    entity.update(cx, |pane, cx| pane.command(&id, cx));
+                    entity.update(cx, |pane, cx| pane.request_source(&id, cx));
                 }),
             ));
         }
