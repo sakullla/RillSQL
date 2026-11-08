@@ -1909,7 +1909,7 @@ fn quick_open_lists_loaded_tables_and_views_and_opens_the_matching_target() {
 }
 
 #[test]
-fn explorer_keeps_non_table_objects_but_quick_open_does_not() {
+fn catalog_index_tolerates_future_object_kinds_without_quick_open_leak() {
     let mut model = WorkbenchModel::new(Shell::default());
     let orders = tree_object("pg", "销售库", "postgres", "shop", "public", "orders", "table");
     let trigger = tree_object("pg", "销售库", "postgres", "shop", "public", "orders_touch", "trigger");
@@ -1998,9 +1998,9 @@ fn hierarchy_follows_real_database_and_schema_and_skips_document_engines() {
     let groups = super::model::group_objects(&[&a, &b, &local, &redis, &mongo]);
 
     assert_eq!(groups.len(), 3);
-    assert_eq!(groups[0].headings(), vec!["shop".to_owned(), "public".to_owned()]);
-    assert_eq!(groups[1].headings(), vec!["shop".to_owned(), "analytics".to_owned()]);
-    assert_eq!(groups[2].headings(), vec!["main".to_owned()], "SQLite 没有模式，不制造空层级");
+    assert_eq!((groups[0].database.as_str(), groups[0].schema.as_str()), ("shop", "public"));
+    assert_eq!((groups[1].database.as_str(), groups[1].schema.as_str()), ("shop", "analytics"));
+    assert_eq!((groups[2].database.as_str(), groups[2].schema.as_str()), ("main", ""), "SQLite 没有模式");
     assert!(groups.iter().all(|group| group.objects.iter().all(|object| object.name != "session" && object.name != "users")));
     assert!(!super::model::is_table_object(&redis));
     assert!(!super::model::relational_engine("MongoDB"));

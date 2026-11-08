@@ -926,8 +926,8 @@ impl WorkbenchModel {
     }
 
     /// 某一连接下已读取的对象，按对象名做不区分大小写的包含匹配。
-    /// 对象树保留全部关系型对象（表、视图、触发器、函数等）；只有快速打开
-    /// 才用 is_table_object 收窄到表与视图。Redis、MongoDB 不进入关系型索引。
+    /// 对象树展示索引里的全部关系型对象；当前目录读取只产出表与视图，索引层
+    /// 不丢弃其他 kind，留给后续结构工具接入。快速打开再收窄到表与视图。
     pub fn catalog_for(&self, connection_id: &str, filter: &str) -> Vec<&TreeObject> {
         let needle = filter.trim().to_lowercase();
         self.catalog
@@ -1814,21 +1814,6 @@ pub struct ObjectGroup {
     pub objects: Vec<TreeObject>,
 }
 
-impl ObjectGroup {
-    /// 组标题按真实元数据生成：数据库一行，模式非空再一行。
-    /// 本地库和专用引擎没有模式时不制造空标题。
-    pub fn headings(&self) -> Vec<String> {
-        let mut headings = Vec::new();
-        if !self.database.is_empty() {
-            headings.push(self.database.clone());
-        }
-        if !self.schema.is_empty() {
-            headings.push(self.schema.clone());
-        }
-        headings
-    }
-}
-
 /// Redis / MongoDB 的对象不是关系型表，不能参与表层级或“打开表”。
 pub fn relational_engine(engine: &str) -> bool {
     !matches!(engine.to_ascii_lowercase().as_str(), "redis" | "mongodb" | "mongo")
@@ -1840,6 +1825,7 @@ pub fn is_table_object(object: &TreeObject) -> bool {
 }
 
 /// 按 (database, schema) 分组，保持对象原有顺序；非关系型对象不产生层级。
+/// 渲染时同一 database 只显示一次标题，分组本身仍按模式拆分。
 pub fn group_objects(objects: &[&TreeObject]) -> Vec<ObjectGroup> {
     let mut groups: Vec<ObjectGroup> = Vec::new();
     for object in objects {
