@@ -12,10 +12,10 @@ use crate::app::views::admin::AdminPane;
 use crate::app::views::compare::ComparePane;
 use crate::app::views::connections::blank_draft;
 use crate::app::views::diagram::DiagramPane;
-use crate::app::views::export::ExchangePane;
+use crate::app::views::export::{ExchangePane, ExchangeSource, ExchangeSourceKind};
 use crate::app::views::grid::{GridPane, GridTarget};
 use crate::app::views::mongo::MongoPane;
-use crate::app::views::query::{QueryPane, SyncEffect, TabSnap};
+use crate::app::views::query::{requires_active_query, QueryPane, SyncEffect, TabSnap};
 use crate::app::views::redis::RedisPane;
 use crate::app::views::structure::StructurePane;
 use crate::app::{AppPage, Effect};
@@ -44,6 +44,9 @@ pub struct Workbench {
     applied_tool: Option<String>,
     /// 共享表格网格当前展示的表规格；暂存必须归属到这张表对应的工作项。
     table_view_spec: Option<String>,
+    /// 交换面板显式选择的来源；切换工作项后按新工作项重建。
+    exchange_kind: ExchangeSourceKind,
+    exchange_item: Option<String>,
     applied_diagram: Option<String>,
     applied_redis: Option<String>,
     applied_mongo: Option<String>,
@@ -102,6 +105,8 @@ impl Workbench {
             mongo,
             applied_tool: None,
             table_view_spec: None,
+            exchange_kind: ExchangeSourceKind::Table,
+            exchange_item: None,
             applied_diagram: None,
             applied_redis: None,
             applied_mongo: None,
@@ -129,6 +134,14 @@ impl Workbench {
 
     pub fn perform(&mut self, id: &str, cx: &mut Context<Self>) {
         self.refresh_exchange(cx);
+        // 查询命令只在查询工作项处于活动状态时生效；表格/结构等页面不能操作隐藏查询。
+        if requires_active_query(id) && !self.active_query_context() {
+            self.model.notice_key = Some("query.errors.needTarget");
+            self.model.notice_detail = crate::app::views::query::NOT_ACTIVE_QUERY.to_owned();
+            self.persist_if_needed();
+            cx.notify();
+            return;
+        }
         if id == "quit-window" {
             if self.model.allow_system_close() {
                 cx.quit();
@@ -185,11 +198,19 @@ impl Workbench {
             let _ = self.model.dispatch(id);
             let locale = self.model.locale();
             let open = self.model.exchange_open;
+            // 显式切换来源时固定到当前工作项，后续渲染不再按默认来源覆盖它。
+            if let Some(kind) = id.strip_prefix("exchange-source:") {
+                self.exchange_kind = match kind {
+                    "query" => ExchangeSourceKind::Query,
+                    _ => ExchangeSourceKind::Table,
+                };
+                self.exchange_item = self.model.active_tab.clone();
+            }
             let source = self.exchange_source(cx);
             self.exchange.update(cx, |pane, cx| {
                 pane.set_locale(locale);
                 pane.open = open;
-                pane.bind_source(source.0, source.1, source.2, source.3);
+                pane.bind_source(source);
                 pane.ensure_mapping(cx);
                 if id != "open-exchange" {
                     pane.command(id, cx);
@@ -341,11 +362,12 @@ impl Workbench {
         let active = self.model.active_tab.clone();
         let locale = self.model.locale();
         let timeout = self.model.settings.query_timeout_sec;
+        let context = self.active_query_context();
         let effect = self.query.update(cx, |pane, cx| {
             pane.set_query_timeout_sec(timeout);
-            let _ = pane.prepare(&snaps, active.as_deref(), locale, cx);
+            let _ = pane.prepare(&snaps, active.as_deref(), locale, context, cx);
             pane.command(id, cx);
-            pane.prepare(&snaps, active.as_deref(), locale, cx)
+            pane.prepare(&snaps, active.as_deref(), locale, context, cx)
         });
         self.apply_query_effect(effect);
     }
@@ -362,10 +384,11 @@ impl Workbench {
             .iter()
             .map(|row| (row.saved.id.clone(), row.saved.env.clone()))
             .collect::<Vec<_>>();
+        let context = self.active_query_context();
         let effect = self.query.update(cx, |pane, cx| {
             pane.remember_environments(environments);
             pane.set_query_timeout_sec(timeout);
-            let effect = pane.prepare(&snaps, active.as_deref(), locale, cx);
+            let effect = pane.prepare(&snaps, active.as_deref(), locale, context, cx);
             pane.ensure_editors(window, cx);
             effect
         });
@@ -518,6 +541,31 @@ impl Workbench {
     #[cfg(test)]
     pub fn exchange_text(&self, cx: &App) -> String {
         self.exchange.read(cx).lines().join("\n")
+    }
+
+    #[cfg(test)]
+    pub fn plant_query_result(&mut self, columns: Vec<String>, rows: Vec<Vec<String>>, cx: &mut Context<Self>) {
+        self.query.update(cx, |pane, cx| pane.show_sheet(columns, rows, cx));
+    }
+
+    #[cfg(test)]
+    pub fn exchange_kind(&self, cx: &App) -> ExchangeSourceKind {
+        self.exchange.read(cx).source().kind
+    }
+
+    #[cfg(test)]
+    pub fn exchange_columns(&self, cx: &App) -> Vec<String> {
+        self.exchange.read(cx).source().columns.clone()
+    }
+
+    #[cfg(test)]
+    pub fn exchange_generation(&self, cx: &App) -> u64 {
+        self.exchange.read(cx).source_generation()
+    }
+
+    #[cfg(test)]
+    pub fn apply_exchange_mapping(&mut self, generation: u64, mapping: std::collections::BTreeMap<String, String>, cx: &mut Context<Self>) -> bool {
+        self.exchange.update(cx, |pane, _| pane.apply_mapping_for(generation, mapping))
     }
 
     #[cfg(test)]
@@ -977,32 +1025,83 @@ impl Workbench {
     }
 
     fn refresh_exchange(&mut self, cx: &mut Context<Self>) {
+        self.sync_exchange_selection();
         let source = self.exchange_source(cx);
         self.exchange.update(cx, |pane, cx| {
-            pane.bind_source(source.0, source.1, source.2, source.3);
+            pane.bind_source(source);
             pane.ensure_mapping(cx);
         });
         self.model.exchange_running = self.exchange.read(cx).running();
     }
 
-    #[allow(clippy::type_complexity)]
-    fn exchange_source(&self, cx: &App) -> (Option<crate::grid::commands::TableRef>, Vec<String>, Vec<Vec<Option<String>>>, bool) {
-        let (mut table, columns, rows, truncated) = self.table.read(cx).exchange_sheet();
-        if table.is_none() {
-            if let Some(target) = self.model.table_spec.as_deref().and_then(parse_target) {
-                if !target.connection_id.is_empty() && !target.table.is_empty() {
-                    table = Some(crate::grid::commands::TableRef {
-                        connection_id: target.connection_id,
-                        database: target.database,
-                        schema: target.schema,
-                        table: target.table,
-                        engine: target.engine,
-                        include_foreign_keys: false,
-                    });
+    /// 工作项变化时，交换来源回到该项的默认来源（查询项→查询结果，其余→表数据）。
+    /// 同一工作项内的显式选择保持不变。
+    fn sync_exchange_selection(&mut self) {
+        let active = self.model.active_tab.clone();
+        if active == self.exchange_item {
+            return;
+        }
+        let kind = self.model.active_tab().map(|tab| tab.kind);
+        self.exchange_item = active;
+        self.exchange_kind = match kind {
+            Some(WorkItemKind::Query) => ExchangeSourceKind::Query,
+            Some(WorkItemKind::Table) => ExchangeSourceKind::Table,
+            Some(_) if self.model.table_spec.is_some() => ExchangeSourceKind::Table,
+            Some(_) => self.exchange_kind,
+            None => ExchangeSourceKind::Table,
+        };
+    }
+
+    fn active_query_context(&self) -> bool {
+        self.model.shell.page == AppPage::Workspace && self.model.active_tab().is_some_and(|tab| tab.kind == WorkItemKind::Query)
+    }
+
+    /// 来源只取所选工作项的数据：查询来自 QueryPane 的当前语句结果，表来自共享网格。
+    /// 不再用 shell 的 table_spec 兜底，查询页不会拿到上一张表的目标。
+    fn exchange_source(&self, cx: &App) -> ExchangeSource {
+        match self.exchange_kind {
+            ExchangeSourceKind::Query => {
+                let pane = self.query.read(cx);
+                let (columns, rows, _) = pane.exchange_result();
+                ExchangeSource {
+                    kind: ExchangeSourceKind::Query,
+                    item: self.exchange_item.clone(),
+                    table: None,
+                    columns,
+                    rows,
+                    truncated: false,
+                    running: pane.busy(),
+                    label: "查询结果".to_owned(),
+                    context: pane.exchange_context(),
+                }
+            }
+            ExchangeSourceKind::Table => {
+                let (table, columns, rows, truncated) = self.table.read(cx).exchange_sheet();
+                let label = table.as_ref().map(|table| table.table.clone()).unwrap_or_default();
+                let context = table
+                    .as_ref()
+                    .map(|table| {
+                        let name = if table.connection_id.is_empty() { table.engine.clone() } else { table.connection_id.clone() };
+                        if table.database.is_empty() {
+                            name
+                        } else {
+                            format!("{name} / {}", table.database)
+                        }
+                    })
+                    .unwrap_or_default();
+                ExchangeSource {
+                    kind: ExchangeSourceKind::Table,
+                    item: self.exchange_item.clone(),
+                    table,
+                    columns,
+                    rows,
+                    truncated,
+                    running: false,
+                    label,
+                    context,
                 }
             }
         }
-        (table, columns, rows, truncated)
     }
 
     pub(super) fn accept_exchange_drop(&mut self, paths: &gpui_kit::ExternalPaths, cx: &mut Context<Self>) {

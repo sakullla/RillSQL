@@ -458,6 +458,39 @@ async fn sqlite_dump_and_migrate_report_real_ranges_and_do_not_call_cancel_succe
 }
 
 #[test]
+fn exchange_source_capabilities_follow_the_selected_source() {
+    use crate::app::views::export::{ExchangeSource, ExchangeSourceKind};
+
+    let table = ExchangeSource {
+        kind: ExchangeSourceKind::Table,
+        item: Some("table-1".to_owned()),
+        table: Some(people_table("items", "items")),
+        columns: vec!["id".to_owned()],
+        rows: vec![vec![Some("1".to_owned())]],
+        truncated: true,
+        running: false,
+        label: "items".to_owned(),
+        context: "items / main".to_owned(),
+    };
+    assert!(table.full_available(), "表数据可以重新读取全量");
+    assert!(table.has_columns());
+
+    let query = ExchangeSource {
+        kind: ExchangeSourceKind::Query,
+        item: Some("query-1".to_owned()),
+        table: None,
+        columns: vec!["id".to_owned()],
+        rows: vec![vec![Some("1".to_owned())]],
+        truncated: true,
+        running: false,
+        label: "查询结果".to_owned(),
+        context: "items / main".to_owned(),
+    };
+    assert!(!query.full_available(), "查询结果只有已读取的行，不能声称全量能力");
+    assert!(query.has_columns(), "已读取的列仍可导出");
+}
+
+#[test]
 fn both_locales_have_exchange_labels() {
     for key in [
         "export.open",

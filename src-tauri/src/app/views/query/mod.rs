@@ -81,6 +81,8 @@ pub struct QueryPane {
     polls: Arc<AtomicU32>,
     #[cfg(test)]
     last_timeout: Option<u64>,
+    /// 外壳当前活动工作项是否是查询；为 false 时执行类命令只能拒绝。
+    context_active: bool,
     focus_editor: bool,
     seen_active: Option<String>,
     fold_key: Option<(String, String)>,
@@ -113,6 +115,7 @@ impl QueryPane {
             polls: Arc::new(AtomicU32::new(0)),
             #[cfg(test)]
             last_timeout: None,
+            context_active: false,
             focus_editor: false,
             seen_active: None,
             fold_key: None,
@@ -160,6 +163,34 @@ impl QueryPane {
 
     pub fn note(&self) -> String {
         self.desk.active_note()
+    }
+
+    /// 当前查询是否仍在执行；交换面板据此显示“结果尚未就绪”。
+    pub fn busy(&self) -> bool {
+        self.desk.active_id().is_some_and(|id| self.desk.running_ids().iter().any(|running| running == id))
+    }
+
+    /// 当前查询项的当前语句结果（列、已读取行、是否有表头）。
+    /// 直接读 Desk 的结果，避免交换面板取到上一帧的网格快照。
+    #[allow(clippy::type_complexity)]
+    pub fn exchange_result(&self) -> (Vec<String>, Vec<Vec<Option<String>>>, bool) {
+        let results = self.desk.results();
+        let Some(sheet) = results.get(self.desk.statement().min(results.len().saturating_sub(1))) else {
+            return (Vec::new(), Vec::new(), false);
+        };
+        (sheet.columns.clone(), sheet.rows.clone(), !sheet.columns.is_empty())
+    }
+
+    /// 当前查询目标的连接 / 库，用于交换面板标明来源。
+    pub fn exchange_context(&self) -> String {
+        self.desk.target().map(|target| {
+            let name = if target.connection_name.is_empty() { target.connection_id } else { target.connection_name };
+            if target.database.is_empty() {
+                name
+            } else {
+                format!("{name} / {}", target.database)
+            }
+        }).unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -239,6 +270,13 @@ impl QueryPane {
     }
 
     pub fn command(&mut self, id: &str, cx: &mut Context<Self>) {
+        // 表/结构等非查询工作项激活时，补全、格式化、执行、计划、变量、取消和语句选择
+        // 都不能落在隐藏的查询标签上。
+        if requires_active_query(id) && !self.context_active {
+            self.desk.set_active_note(NOT_ACTIVE_QUERY);
+            cx.notify();
+            return;
+        }
         if let Some(connection) = id.strip_prefix("bind-connection:") {
             self.queue_connection(connection);
             cx.notify();
@@ -300,13 +338,15 @@ impl QueryPane {
     }
 
     pub fn sync(&mut self, tabs: &[TabSnap], active: Option<&str>, locale: Locale, window: &mut Window, cx: &mut Context<Self>) -> SyncEffect {
-        let effect = self.prepare(tabs, active, locale, cx);
+        let context = active.is_some_and(|id| tabs.iter().any(|tab| tab.id == id));
+        let effect = self.prepare(tabs, active, locale, context, cx);
         self.ensure_editors(window, cx);
         effect
     }
 
     /// 把外壳标签和编辑器草稿对齐。不创建编辑器，所以命令层没有 Window 也能调用。
-    pub fn prepare(&mut self, tabs: &[TabSnap], active: Option<&str>, locale: Locale, cx: &App) -> SyncEffect {
+    /// context 由外壳给出：只有查询工作项处于活动状态且在工作区时才是 true。
+    pub fn prepare(&mut self, tabs: &[TabSnap], active: Option<&str>, locale: Locale, context: bool, cx: &App) -> SyncEffect {
         self.locale = locale;
         let next = active.map(str::to_owned);
         if next != self.seen_active {
@@ -346,6 +386,7 @@ impl QueryPane {
             }
         }
         self.desk.focus_tab(active);
+        self.context_active = context && active.is_some_and(|id| self.desk.has_tab(id));
         self.desk.retain_tabs(&ids, &self.services.tasks);
         self.editors.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.links.retain(|id, _| ids.iter().any(|keep| keep == id));
@@ -415,6 +456,9 @@ impl QueryPane {
     }
 
     fn note_lint(&mut self) {
+        if !self.context_active {
+            return;
+        }
         let Some(id) = self.desk.active_id().map(str::to_owned) else {
             return;
         };
@@ -1302,6 +1346,33 @@ impl QueryPane {
     }
 }
 
+/// 非查询工作项激活时的统一说明。
+pub const NOT_ACTIVE_QUERY: &str = "当前工作项不是查询标签；切回查询标签后再执行、格式化或取消。";
+
+/// 补全、格式化、执行范围、计划、变量、取消和多语句结果都只作用于当前查询工作项。
+/// 外壳和查询页共用这份清单，避免只挡住其中一层。
+pub fn requires_active_query(id: &str) -> bool {
+    matches!(
+        id,
+        "execute-query"
+            | "run-selection"
+            | "run-current"
+            | "run-script"
+            | "request-cancel"
+            | "format"
+            | "autocomplete"
+            | "explain"
+            | "expand-star"
+            | "confirm-variables"
+            | "cancel-variables"
+            | "open-sql-file"
+            | "save-sql-file"
+            | "save-query"
+    ) || id.starts_with("statement:")
+        || id.starts_with("database:")
+        || id.starts_with("bind-connection:")
+}
+
 pub fn object_spec(object: &TreeObject, environment: &str) -> String {
     format!(
         "{}|{}|{}|{}|{}|{}|{}",
@@ -1574,6 +1645,42 @@ mod tests {
             window.render_frame(cx);
             assert_eq!(pane.read(cx).cell(0, 0, cx), "真实");
             assert_eq!(pane.read(cx).note(), "迟到失败");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn execution_and_format_refuse_when_another_work_item_is_active(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let snap = bound("q", "select   1");
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&snap), Some("table-1"), Locale::ZhCn, window, cx);
+                assert!(!pane.context_active, "表工作项激活时查询上下文必须关闭");
+                pane.command("execute-query", cx);
+                assert_eq!(pane.run_count(), 0, "不得在隐藏查询上执行");
+                assert!(!pane.running());
+                assert!(pane.note().contains("不是查询"), "{}", pane.note());
+                pane.command("format", cx);
+                assert_eq!(pane.desk.draft(), "select   1", "不得格式化隐藏查询");
+                pane.command("run-current", cx);
+                assert_eq!(pane.run_count(), 0);
+                pane.command("request-cancel", cx);
+                assert_eq!(pane.desk.status(), "");
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).editor_text(cx), "select   1");
+        })
+        .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&snap), Some("q"), Locale::ZhCn, window, cx);
+                assert!(pane.context_active);
+                pane.command("format", cx);
+                assert!(pane.desk.draft().starts_with("SELECT"), "{}", pane.desk.draft());
+            });
+            window.render_frame(cx);
         })
         .unwrap();
     }

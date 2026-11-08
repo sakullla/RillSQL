@@ -328,6 +328,66 @@ fn cancel_code_does_not_reuse_the_executing_stream() {
 }
 
 #[test]
+fn a_late_result_stays_on_its_own_tab_instead_of_the_active_one() {
+    use crate::application::tasks::TaskBoard;
+    use crate::query::assist::RunScope;
+    use crate::query::commands::{RunDto, StatementDto};
+    use crate::query::desk::{BeginRun, Desk, Target, Ticket};
+
+    let tasks = TaskBoard::new();
+    let mut desk = Desk::new();
+    let target = Target {
+        connection_id: "notes".to_owned(),
+        connection_name: "笔记".to_owned(),
+        database: "main".to_owned(),
+        engine: "sqlite".to_owned(),
+        schema: String::new(),
+        environment: String::new(),
+    };
+    desk.import_tab("a", "select 1", Some(target.clone()));
+    desk.import_tab("b", "select 2", Some(target));
+    desk.focus_tab(Some("a"));
+    let BeginRun::Ready(prepared) = desk.begin_run(&tasks, RunScope::Script, None) else {
+        panic!("应开始执行 select 1");
+    };
+    let ticket = Ticket { tab_id: prepared.tab_id.clone(), token: prepared.token, version: prepared.version };
+    desk.focus_tab(Some("b"));
+
+    let run = RunDto {
+        id: "run-a".to_owned(),
+        connection_id: "notes".to_owned(),
+        connection_name: "笔记".to_owned(),
+        database: "main".to_owned(),
+        engine: "sqlite".to_owned(),
+        status: "done".to_owned(),
+        cancel: String::new(),
+        cancel_message: String::new(),
+        via_ssh: false,
+        fresh_channel: false,
+        statements: vec![StatementDto {
+            sql: "select 1".to_owned(),
+            status: "ok".to_owned(),
+            message: String::new(),
+            columns: vec!["one".to_owned()],
+            column_types: vec!["integer".to_owned()],
+            rows: vec![vec![Some("1".to_owned())]],
+            truncated: false,
+            affected: None,
+        }],
+        started_at: String::new(),
+        elapsed_ms: 1,
+    };
+    desk.finish_polled(&tasks, &ticket, Ok(run), "已取消");
+
+    assert_eq!(desk.active_id(), Some("b"));
+    assert!(desk.results().is_empty(), "活动查询的结果不能被另一个标签的迟到结果覆盖");
+    desk.focus_tab(Some("a"));
+    let results = desk.results();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].rows[0][0].as_deref(), Some("1"));
+}
+
+#[test]
 fn query_commands_are_appended_without_dropping_catalog_or_grid() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let query = std::fs::read_to_string(root.join("src/app/views/query/mod.rs")).unwrap();

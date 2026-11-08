@@ -1599,6 +1599,208 @@ fn exchange_commands_prompt_map_cancel_and_fail_from_the_workbench(cx: &mut gpui
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[gpui_kit::test]
+fn query_commands_refuse_a_hidden_query_while_a_table_item_is_active(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-query-focus-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench(cx, services, false);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("new-query", cx);
+            let query = view.model.active_tab.clone().expect("query item");
+            view.model.set_query_target(&query, Some("notes".to_owned()), Some("笔记".to_owned()), Some("main".to_owned()), Some("sqlite".to_owned()));
+            view.model.tabs.iter_mut().find(|tab| tab.id == query).unwrap().draft = "select   1".to_owned();
+        });
+        window.render_frame(cx);
+        view.update(cx, |view, cx| assert_eq!(view.query_draft(cx), "select   1"));
+    })
+    .unwrap();
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("open-table:notes|笔记|main||customers|sqlite|dev", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let (query, runs) = cx.update(|cx| {
+        let view = view.read(cx);
+        (view.model.tabs.iter().find(|tab| tab.kind.is_query()).unwrap().id.clone(), view.query_runs(cx))
+    });
+    assert_eq!(runs, 0);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            assert_eq!(view.model.tool, WorkTool::Table);
+            view.perform("execute-query", cx);
+            assert_eq!(view.query_runs(cx), runs, "表格工作项不能执行隐藏查询");
+            assert!(view.model.notice_detail.contains("不是查询"), "{}", view.model.notice_detail);
+            view.perform("format", cx);
+            assert_eq!(view.query_draft(cx), "select   1", "表格工作项不能格式化隐藏查询");
+            view.perform("run-current", cx);
+            assert_eq!(view.query_runs(cx), runs);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| {
+            assert!(view.model.activate_item(&query));
+            assert_eq!(view.model.tool, WorkTool::Query);
+        });
+        window.render_frame(cx);
+        view.update(cx, |view, cx| {
+            view.perform("format", cx);
+            assert!(view.query_draft(cx).starts_with("SELECT"), "{}", view.query_draft(cx));
+            view.perform("execute-query", cx);
+            assert_eq!(view.query_runs(cx), runs + 1, "回到查询工作项后应能执行");
+        });
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui_kit::test]
+fn exchange_source_follows_the_active_item_and_query_source_blocks_full_export(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    use crate::app::views::export::ExchangeSourceKind;
+    use crate::export::Phase;
+
+    let dir = std::env::temp_dir().join(format!("rillsql-exchange-source-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench(cx, services, false);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("new-query", cx);
+            let query = view.model.active_tab.clone().expect("query item");
+            view.model.set_query_target(&query, Some("notes".to_owned()), Some("笔记".to_owned()), Some("main".to_owned()), Some("sqlite".to_owned()));
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            // 先让查询工作项进入面板，再把结果写进其结果标签，模拟一次真实执行后的状态。
+            view.plant_query_result(vec!["label".to_owned()], vec![vec!["真实".to_owned()]], cx);
+            view.perform("open-exchange", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    let query_generation = cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.exchange_kind(cx), ExchangeSourceKind::Query);
+        assert_eq!(view.exchange_columns(cx), vec!["label".to_owned()]);
+        let text = view.exchange_text(cx);
+        assert!(text.contains("来源 当前查询结果"), "{text}");
+        assert!(text.contains("目标 查询结果"), "{text}");
+        assert!(text.contains("已读取 1 行"), "{text}");
+        assert!(text.contains("全量导出不可用"), "{text}");
+        view.exchange_generation(cx)
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("exchange-export-full", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(!cx.did_prompt_for_new_path(), "查询结果不应打开全量导出对话框");
+    cx.update(|cx| {
+        let view = view.read(cx);
+        let tasks = view.exchange_tasks(cx);
+        let task = tasks.last().expect("blocked task");
+        assert_eq!(task.phase, Phase::Blocked, "{tasks:?}");
+        assert!(!task.success, "{tasks:?}");
+        assert!(task.detail.contains("查询结果"), "{tasks:?}");
+        assert!(tasks.iter().all(|task| task.phase != Phase::Running), "{tasks:?}");
+    });
+
+    // 切到表工作项：来源、列与映射版本一起重建。
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("open-table:notes|笔记|main||customers|sqlite|dev", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.exchange_kind(cx), ExchangeSourceKind::Table);
+        assert!(view.exchange_columns(cx).is_empty());
+        let text = view.exchange_text(cx);
+        assert!(text.contains("来源 当前表数据"), "{text}");
+        assert!(text.contains("目标 customers"), "{text}");
+        assert!(!text.contains("目标 查询结果"), "{text}");
+        assert!(view.exchange_generation(cx) > query_generation, "切换来源必须推进版本");
+    });
+    cx.update(|cx| {
+        let stale: std::collections::BTreeMap<String, String> = [("name".to_owned(), "old".to_owned())].into_iter().collect();
+        let accepted = view.update(cx, |view, cx| view.apply_exchange_mapping(query_generation, stale, cx));
+        assert!(!accepted, "旧来源映射不能写回新来源");
+    });
+
+    // 回到查询工作项，来源自动回到查询结果。
+    let query = cx.update(|cx| view.read(cx).model.tabs.iter().find(|tab| tab.kind.is_query()).unwrap().id.clone());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| {
+            assert!(view.model.activate_item(&query));
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.exchange_kind(cx), ExchangeSourceKind::Query);
+        let text = view.exchange_text(cx);
+        assert!(text.contains("来源 当前查询结果"), "{text}");
+        assert!(text.contains("已读取 1 行"), "{text}");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui_kit::test]
+fn exchange_loaded_export_omits_uncommitted_cells(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-exchange-staged-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let (window, view) = open_workbench(cx, services, false);
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.mark_table_dirty(cx);
+            view.perform("open-exchange", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let text = view.read(cx).exchange_text(cx);
+        assert!(text.contains("来源 当前表数据"), "{text}");
+        assert!(text.contains("目标 customers"), "{text}");
+        assert!(text.contains("已读取 1 行"), "{text}");
+        assert!(view.read(cx).table_uncommitted(cx));
+    });
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("exchange-export-loaded", cx));
+    })
+    .unwrap();
+    assert!(cx.did_prompt_for_new_path(), "已读取导出应打开保存对话框");
+    let path = dir.join("loaded.csv");
+    cx.simulate_new_path_selection(|_| Some(path.clone()));
+    pump_exchange(cx, window, &view, |_, _| path.exists());
+    let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+    assert!(text.contains('甲'), "导出应包含已提交值：{text}");
+    assert!(!text.contains('乙'), "导出不能包含未提交暂存：{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn view_has_partial(dir: &std::path::Path) -> bool {
     std::fs::read_dir(dir).unwrap().flatten().any(|entry| entry.file_name().to_string_lossy().contains(".partial"))
 }

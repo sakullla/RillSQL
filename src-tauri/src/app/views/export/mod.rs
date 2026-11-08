@@ -24,6 +24,61 @@ use crate::i18n::{self, Locale};
 use crate::dump::dump::DumpRequest;
 use crate::migrate::migrate::{ColumnPair, MigrateRequest, MigrateTableRef};
 
+/// 交换面板的两种数据来源。表数据可以重新读取全量，查询结果只有本次已读取的行，
+/// 两者的目标、列和能力不能混用。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExchangeSourceKind {
+    #[default]
+    Table,
+    Query,
+}
+
+impl ExchangeSourceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Table => "当前表数据",
+            Self::Query => "当前查询结果",
+        }
+    }
+
+    pub fn is_query(self) -> bool {
+        matches!(self, Self::Query)
+    }
+}
+
+/// 面板当前展示的来源快照。列、已读取行、目标与全量能力全部随它切换，
+/// 不再从 shell 的 table_spec 兜底，避免查询页拿到上一张表的目标。
+#[derive(Debug, Default)]
+pub struct ExchangeSource {
+    pub kind: ExchangeSourceKind,
+    /// 来源工作项 id；切换工作项时用它判断是否要重建映射。
+    pub item: Option<String>,
+    pub table: Option<TableRef>,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+    pub truncated: bool,
+    /// 来源仍在该工作项上执行（例如查询尚未结束）。
+    pub running: bool,
+    pub label: String,
+    pub context: String,
+}
+
+impl ExchangeSource {
+    pub fn full_available(&self) -> bool {
+        self.kind == ExchangeSourceKind::Table && self.table.is_some() && !self.running
+    }
+
+    pub fn has_columns(&self) -> bool {
+        !self.columns.is_empty()
+    }
+
+    fn table_key(table: &Option<TableRef>) -> Option<(&str, &str, &str, &str)> {
+        table
+            .as_ref()
+            .map(|table| (table.connection_id.as_str(), table.database.as_str(), table.schema.as_str(), table.table.as_str()))
+    }
+}
+
 pub struct ExchangePane {
     services: Arc<AppServices>,
     locale: Locale,
@@ -34,10 +89,9 @@ pub struct ExchangePane {
     mapping_edited: bool,
     mapping_attempted: bool,
     confirmed: bool,
-    table: Option<TableRef>,
-    loaded_columns: Vec<String>,
-    loaded_rows: Vec<Vec<Option<String>>>,
-    loaded_truncated: bool,
+    source: ExchangeSource,
+    /// 来源版本；迟到映射结果只在版本一致时写回。
+    source_generation: u64,
     format_name: String,
     export_request: Option<ExportRequest>,
     loaded: Option<crate::export::LoadedExport>,
@@ -58,10 +112,8 @@ impl ExchangePane {
             mapping_edited: false,
             mapping_attempted: false,
             confirmed: false,
-            table: None,
-            loaded_columns: Vec::new(),
-            loaded_rows: Vec::new(),
-            loaded_truncated: false,
+            source: ExchangeSource::default(),
+            source_generation: 0,
             format_name: "csv".to_owned(),
             export_request: None,
             loaded: None,
@@ -84,7 +136,7 @@ impl ExchangePane {
     }
 
     pub fn stage_table(&mut self, table: TableRef) {
-        self.table = Some(table);
+        self.source.table = Some(table);
     }
 
     pub fn stage_export(&mut self, request: ExportRequest) {
@@ -103,27 +155,39 @@ impl ExchangePane {
         self.migrate_request = Some(request);
     }
 
-    /// 当前网格或已连接目标。每次工作台命令都按它重绑，空目标会清掉旧表。
-    pub fn bind_source(&mut self, table: Option<TableRef>, columns: Vec<String>, rows: Vec<Vec<Option<String>>>, truncated: bool) {
-        let changed = match (&self.table, &table) {
-            (Some(old), Some(new)) => {
-                old.connection_id != new.connection_id || old.database != new.database || old.schema != new.schema || old.table != new.table
-            }
-            (None, None) => false,
-            _ => true,
-        };
-        if changed && !self.mapping_edited {
+    /// 把面板绑定到当前来源。来源类型、工作项、目标表或列发生变化时重建映射，
+    /// 旧来源的映射绝不沿用到新来源。
+    pub fn bind_source(&mut self, source: ExchangeSource) {
+        let changed = self.source.kind != source.kind
+            || self.source.item != source.item
+            || ExchangeSource::table_key(&self.source.table) != ExchangeSource::table_key(&source.table)
+            || self.source.columns != source.columns;
+        if changed {
+            self.source_generation = self.source_generation.wrapping_add(1);
             self.mapping.clear();
+            self.mapping_edited = false;
             self.mapping_attempted = false;
+            self.confirmed = false;
         }
-        self.table = table;
-        self.loaded_columns = columns;
-        self.loaded_rows = rows;
-        self.loaded_truncated = truncated;
+        self.source = source;
+    }
+
+    pub fn source(&self) -> &ExchangeSource {
+        &self.source
+    }
+
+    pub fn source_generation(&self) -> u64 {
+        self.source_generation
     }
 
     pub fn ensure_mapping(&mut self, cx: &mut Context<Self>) {
-        if self.preview.is_some() && self.table.is_some() && self.mapping.is_empty() && !self.mapping_edited && !self.mapping_attempted {
+        if self.preview.is_some()
+            && self.source.kind == ExchangeSourceKind::Table
+            && self.source.table.is_some()
+            && self.mapping.is_empty()
+            && !self.mapping_edited
+            && !self.mapping_attempted
+        {
             self.mapping_attempted = true;
             self.queue_mapping(cx);
         }
@@ -248,7 +312,8 @@ impl ExchangePane {
     }
 
     fn queue_mapping(&mut self, cx: &mut Context<Self>) {
-        let (Some(preview), Some(table)) = (self.preview.clone(), self.table.as_ref().map(copy_table)) else { return };
+        let (Some(preview), Some(table)) = (self.preview.clone(), self.source.table.as_ref().map(copy_table)) else { return };
+        let generation = self.source_generation;
         let services = Arc::clone(&self.services);
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
@@ -261,6 +326,10 @@ impl ExchangePane {
                 cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
+                            // 来源已经切换：旧目标的映射不能写回新来源。
+                            if generation != this.source_generation {
+                                return;
+                            }
                             match result {
                                 Ok(schema) => {
                                     let fields = schema
@@ -268,9 +337,8 @@ impl ExchangePane {
                                         .iter()
                                         .map(|column| crate::export::TableField { name: column.name.clone(), nullable: column.nullable, auto: column.auto })
                                         .collect::<Vec<_>>();
-                                    if !this.mapping_edited {
-                                        this.mapping = crate::export::suggest_mapping(&fields, &preview.table.columns);
-                                    }
+                                    let mapped = crate::export::suggest_mapping(&fields, &preview.table.columns);
+                                    let _ = this.apply_mapping(generation, mapped);
                                 }
                                 Err(message) => this.notice = message,
                             }
@@ -283,12 +351,31 @@ impl ExchangePane {
         .detach();
     }
 
+    /// 迟到的映射结果只有在来源版本仍一致时才应用。
+    fn apply_mapping(&mut self, generation: u64, mapping: BTreeMap<String, String>) -> bool {
+        if generation != self.source_generation || self.mapping_edited {
+            return false;
+        }
+        self.mapping = mapping;
+        true
+    }
+
+    #[cfg(test)]
+    pub fn apply_mapping_for(&mut self, generation: u64, mapping: BTreeMap<String, String>) -> bool {
+        self.apply_mapping(generation, mapping)
+    }
+
+    #[cfg(test)]
+    pub fn mapping(&self) -> &BTreeMap<String, String> {
+        &self.mapping
+    }
+
     fn confirm(&mut self, cx: &mut Context<Self>) {
         if self.log.tasks.iter().any(|task| task.kind == "import" && task.running_now()) {
             self.notice = "导入还在进行，不能再次确认。".to_owned();
             return;
         }
-        let (Some(preview), Some(table)) = (self.preview.clone(), self.table.as_ref().map(copy_table)) else {
+        let (Some(preview), Some(table)) = (self.preview.clone(), self.source.table.as_ref().map(copy_table)) else {
             self.notice = i18n::text(self.locale, "export.import.unconfirmed");
             return;
         };
@@ -339,6 +426,25 @@ impl ExchangePane {
     }
 
     fn prompt_save(&mut self, kind: SaveKind, cx: &mut Context<Self>) {
+        // 先挡住来源本身不能导出的情况，避免先弹出保存对话框再报失败。
+        if self.source.kind.is_query() {
+            match kind {
+                SaveKind::Full => {
+                    self.block("full", "export", "当前来源是查询结果，不能全量导出；只能导出已读取的行。".to_owned());
+                    return;
+                }
+                SaveKind::Dump => {
+                    self.block("dump", "dump", "当前来源是查询结果，不能全库导出；先切换到当前表数据。".to_owned());
+                    return;
+                }
+                SaveKind::Loaded => {}
+            }
+        }
+        if self.source.running {
+            let (id, owner) = save_slot(kind);
+            self.block(id, owner, "来源正在执行，结果尚未就绪，不能导出。".to_owned());
+            return;
+        }
         if let Some(loaded) = self.loaded.clone() {
             if matches!(kind, SaveKind::Loaded) {
                 let task = export_loaded(&loaded);
@@ -414,19 +520,23 @@ impl ExchangePane {
     }
 
     fn start_loaded(&mut self, path: PathBuf) {
-        if self.loaded_columns.is_empty() {
-            self.fail_open("loaded", "export", "没有已读取的行，不能导出。".to_owned());
+        if self.source.running {
+            self.block("loaded", "export", "查询正在执行，结果尚未就绪，不能导出。".to_owned());
             return;
         }
-        let table_name = self.table.as_ref().map(|table| table.table.clone()).unwrap_or_default();
-        let schema = self.table.as_ref().map(|table| table.schema.clone()).unwrap_or_default();
+        if !self.source.has_columns() {
+            self.block("loaded", "export", self.empty_reason().to_owned());
+            return;
+        }
+        let table_name = self.source.table.as_ref().map(|table| table.table.clone()).unwrap_or_else(|| "查询结果".to_owned());
+        let schema = self.source.table.as_ref().map(|table| table.schema.clone()).unwrap_or_default();
         let spec = LoadedExport {
             id: format!("loaded-{}", uuid::Uuid::new_v4()),
             format: self.format_name.clone(),
             path,
-            columns: self.loaded_columns.clone(),
-            rows: self.loaded_rows.clone(),
-            truncated: self.loaded_truncated,
+            columns: self.source.columns.clone(),
+            rows: self.source.rows.clone(),
+            truncated: self.source.truncated,
             delimiter: ',',
             null_token: "NULL".to_owned(),
             bom: self.format_name != "json",
@@ -441,7 +551,15 @@ impl ExchangePane {
     }
 
     fn start_full(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let Some(table) = self.table.as_ref().map(copy_table) else {
+        if self.source.kind.is_query() {
+            self.block("full", "export", "当前来源是查询结果，不能全量导出；只能导出已读取的行。".to_owned());
+            return;
+        }
+        if self.source.running {
+            self.block("full", "export", "来源正在执行，结果尚未就绪，不能全量导出。".to_owned());
+            return;
+        }
+        let Some(table) = self.source.table.as_ref().map(copy_table) else {
             self.fail_open("full", "export", "没有当前表，不能全量导出。".to_owned());
             return;
         };
@@ -494,7 +612,11 @@ impl ExchangePane {
     }
 
     fn start_dump(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let Some(table) = self.table.as_ref().map(copy_table) else {
+        if self.source.kind.is_query() {
+            self.block("dump", "dump", "当前来源是查询结果，不能全库导出；先切换到当前表数据。".to_owned());
+            return;
+        }
+        let Some(table) = self.source.table.as_ref().map(copy_table) else {
             self.fail_open("dump", "dump", "没有当前连接，不能全库导出。".to_owned());
             return;
         };
@@ -512,6 +634,14 @@ impl ExchangePane {
     }
 
     fn prompt_migrate(&mut self, cx: &mut Context<Self>) {
+        if self.source.kind.is_query() {
+            self.block("migrate", "migrate", "当前来源是查询结果，不能跨库迁移；先切换到当前表数据。".to_owned());
+            return;
+        }
+        if self.source.running {
+            self.block("migrate", "migrate", "来源正在执行，结果尚未就绪，不能迁移。".to_owned());
+            return;
+        }
         if let Some(request) = self.migrate_request.take() {
             self.spawn_migrate(request, CancelPoint::No, cx);
             return;
@@ -562,7 +692,7 @@ impl ExchangePane {
                 return;
             }
         };
-        let Some(source) = self.table.as_ref().map(copy_table) else {
+        let Some(source) = self.source.table.as_ref().map(copy_table) else {
             self.fail_open("migrate", "migrate", "没有当前表，不能跨库迁移。".to_owned());
             cx.notify();
             return;
@@ -700,6 +830,26 @@ impl ExchangePane {
         self.notice = message;
     }
 
+    /// 来源本身不满足导出条件时记一条“未开始”的结果，不冒充失败或成功。
+    fn block(&mut self, id: &str, kind: &'static str, message: String) {
+        if let Some(task) = self.log.tasks.iter_mut().find(|task| task.id == id && task.running_now()) {
+            let done = task.done_rows;
+            let task_kind = task.kind;
+            *task = TaskView::finish(id.to_owned(), task_kind, Phase::Blocked, done, message.clone(), None);
+        } else {
+            self.log.push(TaskView::finish(id.to_owned(), kind, Phase::Blocked, 0, message.clone(), None));
+        }
+        self.notice = message;
+    }
+
+    fn empty_reason(&self) -> &'static str {
+        match self.source.kind {
+            ExchangeSourceKind::Query if self.source.running => "查询正在执行，结果尚未就绪。",
+            ExchangeSourceKind::Query => "当前查询还没有结果；先执行一次查询，再导出或交换。",
+            ExchangeSourceKind::Table => "当前没有表数据；先在对象树里打开一张表。",
+        }
+    }
+
     fn mark_cancelled(&mut self, kind: &str) {
         if let Some(task) = self.log.tasks.iter_mut().rev().find(|task| task.running_now() && task.kind == kind) {
             let done = task.done_rows;
@@ -734,12 +884,37 @@ impl ExchangePane {
 
     pub fn lines(&self) -> Vec<String> {
         let mut lines = vec![i18n::text(self.locale, "export.task.title"), self.notice.clone()];
-        if let Some(table) = &self.table {
-            lines.push(format!("目标 {}", table.table));
+        lines.push(format!("来源 {}", self.source.kind.label()));
+        match (&self.source.kind, &self.source.table) {
+            (ExchangeSourceKind::Table, Some(table)) => {
+                lines.push(format!("目标 {}", table.table));
+                if !self.source.context.is_empty() {
+                    lines.push(format!("连接 {}", self.source.context));
+                }
+            }
+            (ExchangeSourceKind::Table, None) => lines.push("目标 未选择表".to_owned()),
+            (ExchangeSourceKind::Query, _) => {
+                lines.push("目标 查询结果".to_owned());
+                if !self.source.context.is_empty() {
+                    lines.push(format!("连接 {}", self.source.context));
+                }
+            }
+        }
+        lines.push(format!("已读取 {} 行", self.source.rows.len()));
+        if self.source.truncated {
+            lines.push("仅已读取部分".to_owned());
+        }
+        if self.source.kind.is_query() && !self.source.full_available() {
+            lines.push("全量导出不可用：查询结果只有已读取的行".to_owned());
+        }
+        if self.source.running {
+            lines.push("查询正在执行，结果尚未就绪。".to_owned());
+        } else if !self.source.has_columns() {
+            lines.push(self.empty_reason().to_owned());
         }
         lines.push(format!("格式 {}", self.format_name));
         if self.mapping.is_empty() {
-            if self.preview.is_some() && self.table.is_some() {
+            if self.preview.is_some() && self.source.table.is_some() {
                 lines.push(i18n::text(self.locale, "export.map.empty"));
             }
         } else {
@@ -794,17 +969,94 @@ impl Render for ExchangePane {
             panel = panel.child(div().px(px(12.)).py(px(8.)).rounded(px(8.)).bg(p.hover).text_size(px(12.5)).child(SharedString::from(self.notice.clone())));
         }
 
-        // 来源表与格式
-        let source = match &self.table {
-            Some(table) => div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .child(kit::engine_badge(&table.engine, 18.))
-                .child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(SharedString::from(table.table.clone())))
-                .child(kit::muted(SharedString::from(table.database.clone()), &p)),
-            None => div().text_size(px(12.5)).text_color(p.text_faint).child(t("ui.exchange.noTable")),
-        };
+        // 来源选择：当前表数据或当前查询结果，两种来源的列、行与能力互不混用。
+        let mut kinds = Vec::new();
+        for (kind, id, label) in [
+            (ExchangeSourceKind::Table, "exchange-source:table", "当前表数据"),
+            (ExchangeSourceKind::Query, "exchange-source:query", "当前查询结果"),
+        ] {
+            let entity = entity.clone();
+            kinds.push((
+                SharedString::from(format!("exchange-{id}")),
+                SharedString::from(label),
+                self.source.kind == kind,
+                kit::click(move |_, _, cx| {
+                    let id = id.to_owned();
+                    entity.update(cx, |pane, cx| pane.command(&id, cx));
+                }),
+            ));
+        }
+        let mut source_body = div().flex().flex_col().gap(px(6.));
+        match self.source.kind {
+            ExchangeSourceKind::Table => match &self.source.table {
+                Some(table) => {
+                    source_body = source_body.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(kit::engine_badge(&table.engine, 18.))
+                            .child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(SharedString::from(table.table.clone())))
+                            .child(kit::muted(SharedString::from(table.database.clone()), &p)),
+                    );
+                }
+                None => {
+                    source_body = source_body.child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(p.text_faint)
+                            .child(SharedString::from("当前没有表数据；先在对象树里打开一张表。")),
+                    );
+                }
+            },
+            ExchangeSourceKind::Query => {
+                source_body = source_body.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(kit::icon(IconName::SquareTerminal, 15., p.accent))
+                        .child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(SharedString::from("查询结果")))
+                        .child(kit::muted(SharedString::from(self.source.context.clone()), &p)),
+                );
+                if self.source.running {
+                    source_body = source_body.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_size(px(12.))
+                            .text_color(p.text_muted)
+                            .child(Spinner::new().xsmall().color(p.accent))
+                            .child(SharedString::from("查询正在执行，结果尚未就绪。")),
+                    );
+                } else if !self.source.has_columns() {
+                    source_body = source_body.child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(p.text_faint)
+                            .child(SharedString::from("当前查询还没有结果；先执行一次查询。")),
+                    );
+                }
+            }
+        }
+        if self.source.has_columns() {
+            let partial = if self.source.truncated { "（仅已读取部分）" } else { "" };
+            source_body = source_body.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(p.text_muted)
+                    .child(SharedString::from(format!("已读取 {} 行{partial}", self.source.rows.len()))),
+            );
+        }
+        if self.source.kind.is_query() {
+            source_body = source_body.child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(p.text_faint)
+                    .child(SharedString::from("查询结果只有已读取的行；全量导出不可用。")),
+            );
+        }
         let mut formats = Vec::new();
         for (format, label) in [("csv", "CSV"), ("xlsx", "Excel"), ("json", "JSON"), ("insert", "SQL"), ("markdown", "Markdown")] {
             let entity = entity.clone();
@@ -821,22 +1073,79 @@ impl Render for ExchangePane {
         }
         panel = panel.child(section(
             t("ui.exchange.source"),
-            kit::card(&p).p(px(14.)).flex().flex_col().gap(px(12.)).child(source).child(kit::form_row(t("ui.exchange.format"), kit::segmented(formats, &p), &p)),
+            kit::card(&p)
+                .p(px(14.))
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(kit::segmented(kinds, &p))
+                .child(source_body)
+                .child(kit::form_row(t("ui.exchange.format"), kit::segmented(formats, &p), &p)),
         ));
 
-        // 导出
-        let export = div()
-            .flex()
-            .flex_col()
-            .gap(px(6.))
-            .child(action_row("exchange-exchange-export-loaded", IconName::FileDown, t("export.export.loaded"), t("ui.exchange.loadedHint"), &p, act("exchange-export-loaded")))
-            .child(action_row("exchange-exchange-export-full", IconName::Download, t("export.export.full"), t("ui.exchange.fullHint"), &p, act("exchange-export-full")))
-            .child(action_row("exchange-exchange-dump", IconName::DatabaseBackup, t("export.dump.start"), t("ui.exchange.dumpHint"), &p, act("exchange-dump")))
-            .child(action_row("exchange-exchange-migrate", IconName::ArrowRightLeft, t("export.migrate.start"), t("ui.exchange.migrateHint"), &p, act("exchange-migrate")));
+        // 导出：不可用的能力直接说明原因，而不是留一个点了没反应的入口。
+        let loaded_ready = self.source.has_columns() && !self.source.running;
+        let mut export = div().flex().flex_col().gap(px(6.));
+        if loaded_ready {
+            export = export.child(action_row(
+                "exchange-exchange-export-loaded",
+                IconName::FileDown,
+                t("export.export.loaded"),
+                SharedString::from(format!("只导出当前来源已读取的 {} 行", self.source.rows.len())),
+                &p,
+                act("exchange-export-loaded"),
+            ));
+        } else {
+            export = export.child(blocked_row(
+                "exchange-exchange-export-loaded",
+                IconName::FileDown,
+                t("export.export.loaded"),
+                self.empty_reason(),
+                &p,
+            ));
+        }
+        if self.source.full_available() {
+            export = export.child(action_row(
+                "exchange-exchange-export-full",
+                IconName::Download,
+                t("export.export.full"),
+                t("ui.exchange.fullHint"),
+                &p,
+                act("exchange-export-full"),
+            ));
+        } else {
+            export = export.child(blocked_row(
+                "exchange-exchange-export-full",
+                IconName::Download,
+                t("export.export.full"),
+                "当前来源不支持全量导出；请切换到当前表数据。",
+                &p,
+            ));
+        }
+        if self.source.kind.is_query() {
+            export = export
+                .child(blocked_row("exchange-exchange-dump", IconName::DatabaseBackup, t("export.dump.start"), "查询结果不能全库导出。", &p))
+                .child(blocked_row("exchange-exchange-migrate", IconName::ArrowRightLeft, t("export.migrate.start"), "查询结果不能跨库迁移。", &p));
+        } else {
+            export = export
+                .child(action_row("exchange-exchange-dump", IconName::DatabaseBackup, t("export.dump.start"), t("ui.exchange.dumpHint"), &p, act("exchange-dump")))
+                .child(action_row("exchange-exchange-migrate", IconName::ArrowRightLeft, t("export.migrate.start"), t("ui.exchange.migrateHint"), &p, act("exchange-migrate")));
+        }
         panel = panel.child(section(t("ui.exchange.export"), export));
 
-        // 导入
+        // 导入：写入目标必须来自当前表来源。
         let mut import = kit::card(&p).p(px(14.)).flex().flex_col().gap(px(12.));
+        if self.source.kind.is_query() {
+            import = import.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .py(px(10.))
+                    .child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(SharedString::from("导入需要当前表数据")))
+                    .child(kit::muted(SharedString::from("切换到“当前表数据”并打开一张表后，才能选择文件并确认写入。"), &p)),
+            );
+        } else {
         match &self.preview {
             None => {
                 import = import.child(
@@ -900,6 +1209,7 @@ impl Render for ExchangePane {
                     );
             }
         }
+        }
         panel = panel.child(section(t("ui.exchange.import"), import));
 
         // 任务
@@ -956,6 +1266,33 @@ impl Render for ExchangePane {
         ));
         panel
     }
+}
+
+/// 来源不支持的操作：保留说明，不提供可点击但无效的入口。
+fn blocked_row(id: &'static str, icon: IconName, title: SharedString, detail: &str, p: &Palette) -> gpui_kit::AnyElement {
+    div()
+        .id(id)
+        .role(gpui_kit::Role::Button)
+        .aria_label(title.clone())
+        .p(px(10.))
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .rounded(px(9.))
+        .border_1()
+        .border_color(p.line)
+        .opacity(0.55)
+        .child(div().flex_none().size(px(30.)).rounded(px(8.)).bg(p.hover).flex().items_center().justify_center().child(kit::icon(icon, 15., p.text_faint)))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .flex_col()
+                .child(div().text_color(p.text_muted).child(title))
+                .child(div().text_size(px(11.5)).text_color(p.text_faint).child(SharedString::from(detail.to_owned()))),
+        )
+        .into_any_element()
 }
 
 fn action_row(id: &'static str, icon: IconName, title: SharedString, detail: SharedString, p: &Palette, on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static) -> gpui_kit::AnyElement {
@@ -1062,6 +1399,85 @@ pub fn migrate_request(id: &str, source: MigrateTableRef, target: MigrateTableRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn exchange_pane() -> ExchangePane {
+        ExchangePane::new(Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(std::env::temp_dir().join(format!(
+            "rillsql-exchange-source-{}",
+            uuid::Uuid::new_v4()
+        )))))))
+    }
+
+    fn table_source(table: &str, columns: &[&str]) -> ExchangeSource {
+        ExchangeSource {
+            kind: ExchangeSourceKind::Table,
+            item: Some("table-1".to_owned()),
+            table: Some(TableRef {
+                connection_id: "notes".to_owned(),
+                database: "main".to_owned(),
+                schema: String::new(),
+                table: table.to_owned(),
+                engine: "sqlite".to_owned(),
+                include_foreign_keys: false,
+            }),
+            columns: columns.iter().map(|name| (*name).to_owned()).collect(),
+            rows: vec![vec![Some("甲".to_owned())]],
+            truncated: false,
+            running: false,
+            label: table.to_owned(),
+            context: "笔记 / main".to_owned(),
+        }
+    }
+
+    #[test]
+    fn switching_sources_clears_the_mapping_and_drops_late_results() {
+        let mut pane = exchange_pane();
+        pane.bind_source(table_source("customers", &["id", "name"]));
+        let old = pane.source_generation();
+        pane.bind_source(table_source("orders", &["id", "total"]));
+        let current = pane.source_generation();
+        assert!(current > old, "切换目标必须推进来源版本");
+        assert!(pane.mapping().is_empty(), "旧来源映射不能保留");
+
+        let stale: BTreeMap<String, String> = [("id".to_owned(), "id".to_owned())].into_iter().collect();
+        assert!(!pane.apply_mapping_for(old, stale.clone()), "迟到的旧来源映射不能写回");
+        assert!(pane.mapping().is_empty());
+
+        let fresh: BTreeMap<String, String> = [("total".to_owned(), "total".to_owned())].into_iter().collect();
+        assert!(pane.apply_mapping_for(current, fresh.clone()));
+        assert_eq!(pane.mapping(), &fresh);
+    }
+
+    fn query_source(running: bool) -> ExchangeSource {
+        ExchangeSource {
+            kind: ExchangeSourceKind::Query,
+            item: Some("query-1".to_owned()),
+            table: None,
+            columns: vec!["label".to_owned()],
+            rows: vec![vec![Some("真实".to_owned())]],
+            truncated: false,
+            running,
+            label: "查询结果".to_owned(),
+            context: "笔记 / main".to_owned(),
+        }
+    }
+
+    #[test]
+    fn query_source_has_no_full_capability_and_reports_running_not_success() {
+        let mut pane = exchange_pane();
+        pane.bind_source(query_source(true));
+        assert!(!pane.source().full_available(), "查询结果没有全量导出能力");
+        let text = pane.lines().join("\n");
+        assert!(text.contains("来源 当前查询结果"), "{text}");
+        assert!(text.contains("目标 查询结果"), "{text}");
+        assert!(text.contains("已读取 1 行"), "{text}");
+        assert!(text.contains("查询正在执行"), "{text}");
+        assert!(!text.contains("已完成"), "{text}");
+
+        pane.bind_source(query_source(false));
+        let text = pane.lines().join("\n");
+        assert!(text.contains("全量导出不可用"), "{text}");
+        assert!(!text.contains("查询正在执行"), "{text}");
+    }
 
     #[test]
     fn cancelled_task_copy_is_not_the_running_label() {
