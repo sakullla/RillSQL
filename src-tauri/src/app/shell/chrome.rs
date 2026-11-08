@@ -1911,7 +1911,7 @@ impl Workbench {
                 .min_w(px(0.))
                 .min_h(px(0.))
                 .flex_col()
-                .child(div().max_h(px(300.)).flex_none().child(preview))
+                .child(div().h(px(300.)).flex_none().flex().flex_col().min_h(px(0.)).overflow_hidden().child(preview))
                 .child(list)
         } else {
             div().flex().flex_1().min_w(px(0.)).min_h(px(0.)).child(list).child(preview)
@@ -1969,7 +1969,7 @@ impl Workbench {
             .flex_none()
             .min_w(px(0.))
             .min_h(px(0.))
-            .when(narrow, |this| this.w_full().border_t_1())
+            .when(narrow, |this| this.h_full().w_full().border_t_1())
             .when(!narrow, |this| this.w(px(preview_width)).border_l_1())
             .border_color(p.line)
             .p(px(if narrow { 12. } else { 18. }))

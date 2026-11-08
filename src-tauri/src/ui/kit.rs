@@ -76,7 +76,8 @@ impl Palette {
             line_soft: hex(0xf0f2f5),
             line_strong: hex(0xd0d5dd),
             text: hex(0x16191f),
-            text_muted: hex(0x5d6675),
+            // 次级文字必须比 faint 更强一档，避免 token 层级倒置。
+            text_muted: hex(0x4f5a68),
             // 弱文用于 11–12px 的提示与分区标题；保持在白底和 chrome 底上都过 4.5:1。
             // 选中/悬停底（active、accent_soft、hover）上也要过 4.5:1。
             text_faint: hex(0x5b6573),
