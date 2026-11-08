@@ -93,6 +93,8 @@ impl WorkItemKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkItem {
     pub id: String,
+    /// 单调递增的工作项实例编号；标签 id 可回收，但它不会。
+    pub epoch: u64,
     pub title: String,
     pub kind: WorkItemKind,
     /// 表 / 结构 / Redis / MongoDB 的目标规格；查询项为空。
@@ -112,6 +114,7 @@ impl WorkItem {
     fn query(id: String, title: String, draft: String) -> Self {
         Self {
             id,
+            epoch: next_epoch(),
             title,
             kind: WorkItemKind::Query,
             spec: None,
@@ -1306,6 +1309,7 @@ impl WorkbenchModel {
         }
         let title = self.item_title(kind, &spec);
         let id = self.next_item_id(kind);
+        let epoch = next_epoch();
         // 目标规格开头几段就是连接、库和引擎；把它一并带进工作项，状态栏与关闭保护看到同一目标。
         let parts: Vec<&str> = spec.split('|').collect();
         let part = |index: usize| {
@@ -1317,6 +1321,7 @@ impl WorkbenchModel {
         let (connection_id, connection_name, database, engine) = (part(0), part(1), part(2), part(5));
         self.tabs.push(WorkItem {
             id: id.clone(),
+            epoch,
             title,
             kind,
             spec: Some(spec),
@@ -1851,6 +1856,7 @@ fn session_to_item(tab: &SessionTab) -> Option<WorkItem> {
     }
     Some(WorkItem {
         id: tab.id.clone(),
+        epoch: next_epoch(),
         title: tab.title.clone(),
         kind,
         spec,
@@ -1975,7 +1981,12 @@ pub fn object_detail(object: &TreeObject) -> String {
     }
 }
 
-pub fn filter_palette(entries: &[PaletteEntry], query: &str, tables_only: bool) -> Vec<PaletteEntry> {
+pub fn next_epoch() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn filter_palette(entries: &[PaletteEntry], query: &str, tables_only: bool) -> Vec<PaletteEntry> {
     let trimmed = query.trim().to_lowercase();
     if tables_only {
         let tables: Vec<_> = entries.iter().filter(|entry| entry.group == "table").cloned().collect();
