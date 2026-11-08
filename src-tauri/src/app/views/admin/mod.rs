@@ -248,10 +248,7 @@ impl AdminPane {
     }
 
     pub fn bind(&mut self, target: GridTarget) {
-        if self.session.target == target {
-            return;
-        }
-        // 管理页只有一份操作草稿；切到另一个库或表时不能把上一个目标的
+        // 管理页只有一份操作草稿；重新打开同一目标也要丢弃上一工作项的
         // PRAGMA、ATTACH 或预览继续带过去。
         let locale = self.session.locale;
         self.session = AdminSession::new(target);

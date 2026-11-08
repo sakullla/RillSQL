@@ -246,10 +246,8 @@ impl StructurePane {
     }
 
     pub fn bind(&mut self, target: GridTarget) {
-        if self.session.target == target {
-            return;
-        }
-        // 结构页只有一份草稿；切到另一张表时必须丢弃上一张表的字段、预览和错误，
+        // 结构页只有一份草稿；重新打开同一张表也必须丢弃上一工作项的字段、预览和
+        // 已 armed 的确认，否则一次点击会执行上次留下的危险操作。
         // 否则用户会把 A 表的列名或 DROP 预览带到 B 表。
         let locale = self.session.locale;
         self.session = StructureSession::new(target);

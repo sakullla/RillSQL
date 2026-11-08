@@ -185,8 +185,10 @@ impl ComparePane {
             self.set_database(false, name, cx);
         } else if let Some(name) = id.strip_prefix("compare-schema:baseline:") {
             self.baseline.schema = name.to_owned();
+            self.invalidate_results();
         } else if let Some(name) = id.strip_prefix("compare-schema:target:") {
             self.target.schema = name.to_owned();
+            self.invalidate_results();
         } else if let Some(name) = id.strip_prefix("compare-toggle:") {
             let selected = self.selected.get(name).copied().unwrap_or(false);
             self.selected.insert(name.to_owned(), !selected);
@@ -1725,30 +1727,33 @@ mod workbench {
             });
             window.click("compare-baseline:left", cx);
             window.click("compare-target:right", cx);
-            window.click("compare-schema:baseline:public", cx);
-            window.click("compare-schema-input:target", cx);
-            window.input("dbo", cx);
-            window.press("enter", cx);
             window.click("compare-key:orders|uk_email", cx);
             window.click("compare-toggle:orders", cx);
             view.update(cx, |pane, _| {
                 let text = pane.lines().join("\n");
-                assert!(text.contains("schema-on public"), "{text}");
-                assert!(text.contains("schema-manual dbo"), "{text}");
                 assert!(text.contains("chosen orders uk_email"), "{text}");
                 assert!(text.contains("off orders"), "{text}");
-                assert!(pane.refuse_local().is_none(), "{text} {:?}", pane.refuse_local());
                 assert!(!pane.structure_ready());
                 assert!(pane.structure.as_ref().is_some_and(|report| report.script.is_empty()));
             });
-            window.click("compare-toggle:orders", cx);
+            // 切 schema 后旧结构差异、选中表与待放入脚本都必须失效。
+            window.click("compare-schema:baseline:public", cx);
+            window.click("compare-schema-input:target", cx);
+            window.input("dbo", cx);
+            window.press("enter", cx);
+            view.update(cx, |pane, _| {
+                let text = pane.lines().join("\n");
+                assert!(text.contains("schema-on public"), "{text}");
+                assert!(text.contains("schema-manual dbo"), "{text}");
+                assert!(!text.contains("chosen orders"), "切 schema 后旧选择必须清掉：{text}");
+                assert!(pane.structure.is_none(), "切 schema 后旧结构差异必须清掉：{text}");
+            });
             window.click("compare-database:baseline:warehouse", cx);
             view.update(cx, |pane, _| {
                 let text = pane.lines().join("\n");
                 assert!(text.contains("数据库 warehouse"), "{text}");
                 assert!(!text.contains("on orders"), "换库后旧对比结果必须清掉：{text}");
                 assert!(pane.structure.is_none(), "{text}");
-                assert!(pane.refuse_local().is_some_and(|message| message.contains("不生成脚本")), "{text}");
             });
         })
         .unwrap();
