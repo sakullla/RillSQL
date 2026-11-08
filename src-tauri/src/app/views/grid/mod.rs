@@ -583,7 +583,8 @@ impl GridPane {
     }
 
     fn fetch_at(&mut self, offset: u64, replace: bool, cx: &mut Context<Self>) {
-        self.fetching = true;
+        // 分页追加不阻塞交换来源：已读取的窗口仍然完整。
+        self.fetching = replace;
         self.session.token = self.session.token.saturating_add(1);
         let token = self.session.token;
         self.scheduled = token;
@@ -623,11 +624,13 @@ impl GridPane {
                                     this.fetching = false;
                                     this.sync_table(cx);
                                 } else {
+                                    if replace { this.session.drop_stale_sheet(); }
                                     this.loading_more = false;
                                     this.fetching = false;
                                     this.sync_table(cx);
                                 }
                             } else {
+                                if replace { this.session.drop_stale_sheet(); }
                                 this.loading_more = false;
                                 this.fetching = false;
                                 this.sync_table(cx);

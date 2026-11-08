@@ -1040,6 +1040,17 @@ impl SharedGrid {
         (0..self.rows.len()).map(|row| self.sheet_line(row)).collect()
     }
 
+    /// 替换读取失败时丢弃上一张表的快照，避免旧行被当成新表的数据导出。
+    pub fn drop_stale_sheet(&mut self) {
+        self.columns.clear();
+        self.source.clear();
+        self.rows.clear();
+        self.schema = None;
+        self.full_count = None;
+        self.truncated = false;
+        self.close_preview();
+    }
+
     /// 已读取的服务器行数；未提交的新增行不计入分页偏移。
     pub fn source_len(&self) -> usize {
         self.source.iter().filter(|row| !row.inserted).count()
@@ -2084,6 +2095,23 @@ mod tests {
         assert!(sql[0].contains("\"id\" = 1"), "{sql:?}");
         assert!(!sql[0].contains("\"id\" = 2"), "{sql:?}");
         assert_eq!(filtered.confirm_request().unwrap().changes[0].locator[0].value.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn failed_replace_drops_the_previous_sheet() {
+        let mut grid = SharedGrid::new();
+        grid.target.connection_id = "notes".into();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some("甲")], true)],
+            Some(1),
+            Some(schema()),
+        );
+        assert_eq!(grid.loaded_len(), 1);
+        grid.drop_stale_sheet();
+        assert_eq!(grid.loaded_len(), 0, "失败的新表不能继续展示旧表行");
+        assert_eq!(grid.exchange_sheet().1.len(), 0, "旧列不能进入交换来源");
+        assert!(!grid.has_more_rows());
     }
 
     #[test]

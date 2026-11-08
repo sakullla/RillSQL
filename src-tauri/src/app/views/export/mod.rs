@@ -1047,7 +1047,11 @@ impl Render for ExchangePane {
                             .text_size(px(12.))
                             .text_color(p.text_muted)
                             .child(Spinner::new().xsmall().color(p.accent))
-                            .child(SharedString::from("查询正在执行，结果尚未就绪。")),
+                            .child(SharedString::from(if self.source.kind.is_query() {
+                                "查询正在执行，结果尚未就绪。"
+                            } else {
+                                "表数据正在读取，当前行数尚未完整。"
+                            })),
                     );
                 } else if !self.source.has_columns() {
                     source_body = source_body.child(
@@ -1059,7 +1063,7 @@ impl Render for ExchangePane {
                 }
             }
         }
-        if self.source.has_columns() {
+        if self.source.has_columns() && !self.source.running {
             let partial = if self.source.truncated { "（仅已读取部分）" } else { "" };
             source_body = source_body.child(
                 div()

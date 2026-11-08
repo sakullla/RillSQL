@@ -1089,6 +1089,7 @@ impl Workbench {
                             let parts: Vec<&str> = spec.split('|').collect();
                             parts.first() == Some(&table.connection_id.as_str())
                                 && parts.get(2) == Some(&table.database.as_str())
+                                && parts.get(3) == Some(&table.schema.as_str())
                                 && parts.get(4) == Some(&table.table.as_str())
                         }
                         _ => false,
