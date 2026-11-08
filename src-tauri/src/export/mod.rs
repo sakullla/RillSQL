@@ -8,6 +8,8 @@ mod xlsx;
 
 pub use desk::{commit_import_guarded, export_full, export_loaded, open_import, watch_dump, watch_migrate, CancelPoint, ImportEntry, ImportPreview};
 pub use parse::{suggest_mapping, TableField};
+#[cfg(test)]
+pub use parse::ParsedTable;
 pub use tasks::{prefer_cancel, Phase, TaskLog, TaskView};
 pub use write::LoadedExport;
 #[allow(unused_imports)]

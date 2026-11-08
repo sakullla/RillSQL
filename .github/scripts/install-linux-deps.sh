@@ -63,6 +63,10 @@ PACKAGES=(
   libgtk-3-dev
   libayatana-appindicator3-dev
   librsvg2-dev
+  libwayland-dev
+  libxkbcommon-dev
+  libxkbcommon-x11-dev
+  libvulkan-dev
   patchelf
   xdg-utils
 )

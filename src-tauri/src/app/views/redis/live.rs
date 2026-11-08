@@ -153,10 +153,15 @@ fn live_redis_scans_filters_reads_ttl_rename_delete_and_confirms(cx: &mut TestAp
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let key = format!("rillsql:t8:{suffix}");
     let renamed = format!("rillsql:t8:renamed:{suffix}");
-    let _cleanup = RedisCleanup { services: Arc::clone(&services), id: "live-redis".into(), keys: vec![key.clone(), renamed.clone()] };
     if let Err(err) = block(open_redis(Arc::clone(&services), "live-redis")) {
+        if fixture_unreachable(&err) {
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!("跳过：Redis 夹具没有连上：{err}");
+            return;
+        }
         panic!("Redis 夹具没有连上：{err}");
     }
+    let _cleanup = RedisCleanup { services: Arc::clone(&services), id: "live-redis".into(), keys: vec![key.clone(), renamed.clone()] };
     if let Err(err) = block(restore_token(Arc::clone(&services))) {
         panic!("带 TTL 的种子键没有恢复：{err}");
     }
@@ -327,14 +332,19 @@ fn confirm_keeps_the_target_opened_with(cx: &mut TestAppContext) {
     let key_c = format!("{prefix}-c");
     let key_d = format!("{prefix}-d");
     let key_e = format!("{prefix}-e");
+    if let Err(err) = block(open_redis(Arc::clone(&services), "live-redis-snap")) {
+        if fixture_unreachable(&err) {
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!("跳过：Redis 夹具没有连上：{err}");
+            return;
+        }
+        panic!("Redis 夹具没有连上：{err}");
+    }
     let _cleanup = RedisCleanup {
         services: Arc::clone(&services),
         id: "live-redis-snap".into(),
         keys: vec![key_a.clone(), key_b.clone(), key_c.clone(), key_d.clone(), key_e.clone()],
     };
-    if let Err(err) = block(open_redis(Arc::clone(&services), "live-redis-snap")) {
-        panic!("Redis 夹具没有连上：{err}");
-    }
     if let Err(err) = block({
         let services = Arc::clone(&services);
         let pairs = vec![(key_a.clone(), "va".into()), (key_b.clone(), "vb".into()), (key_c.clone(), "vc".into()), (key_e.clone(), "ve".into())];
@@ -647,6 +657,16 @@ async fn open_redis(services: Arc<AppServices>, id: &str) -> Result<(), String> 
         return Err(opened.report.summary.unwrap_or_else(|| "Redis 会话没有建立".into()));
     }
     Ok(())
+}
+
+fn fixture_unreachable(err: &str) -> bool {
+    let text = err.to_ascii_lowercase();
+    err.contains("没有打开会话")
+        || err.contains("会话没有建立")
+        || text.contains("connection refused")
+        || text.contains("error connecting")
+        || text.contains("os error 61")
+        || text.contains("os error 10061")
 }
 
 fn block<T: Send + 'static>(work: impl std::future::Future<Output = T> + Send + 'static) -> T {

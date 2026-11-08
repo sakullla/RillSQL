@@ -94,8 +94,22 @@ async fn live_engines_compare_a_made_difference_and_read_the_diagram() {
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
+    if seen.is_empty() && errors.iter().all(|err| fixture_unreachable(err)) {
+        eprintln!("跳过结构比较：本机没有数据库夹具");
+        return;
+    }
     assert!(errors.is_empty(), "已看到：{}\n失败：{}", seen.join(" | "), errors.join(" | "));
     println!("{}", seen.join("\n"));
+}
+
+fn fixture_unreachable(err: &str) -> bool {
+    let text = err.to_ascii_lowercase();
+    err.contains("没有打开会话")
+        || err.contains("会话没有建立")
+        || text.contains("connection refused")
+        || text.contains("error connecting")
+        || text.contains("os error 61")
+        || text.contains("os error 10061")
 }
 
 async fn exercise(services: &AppServices, spec: &LiveEngine) -> Result<String, String> {

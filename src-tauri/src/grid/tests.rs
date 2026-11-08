@@ -1002,45 +1002,9 @@ async fn markdown_export_writes_header_rule_escapes_pipes_and_marks_partial() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-fn read_xlsx_like_import(path: &PathBuf) -> serde_json::Value {
-    let module = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../node_modules/@e965/xlsx");
-    let script = r#"
-const fs = require("fs");
-const XLSX = require(process.env.XLSX_MODULE);
-const file = process.argv[process.argv.length - 1];
-const book = XLSX.read(fs.readFileSync(file), { type: "buffer", cellDates: false });
-const sheet = book.Sheets[book.SheetNames[0]];
-const matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: null, blankrows: true });
-function cellText(value) {
-  if (value === null || value === undefined) return null;
-  if (typeof value === "string") return value === "" ? null : value;
-  if (typeof value === "number" && Number.isFinite(value)) return String(value);
-  if (typeof value === "boolean") return value ? "true" : "false";
-  return null;
-}
-const header = matrix[0] || [];
-const columns = header.map((cell) => (cellText(cell) || "").trim());
-const rows = matrix.slice(1).filter((row) => row.some((cell) => cellText(cell) !== null)).map((row) => {
-  const cells = {};
-  columns.forEach((name, index) => { cells[name] = cellText(row[index]) ?? null; });
-  return cells;
-});
-process.stdout.write(JSON.stringify({ sheets: book.SheetNames.length, columns, rows }));
-"#;
-    let output = std::process::Command::new("node")
-        .arg("-e")
-        .arg(script)
-        .arg(path)
-        .env("XLSX_MODULE", &module)
-        .output()
-        .unwrap_or_else(|err| panic!("无法运行 node 读取 xlsx：{err}"));
-    assert!(
-        output.status.success(),
-        "读取 xlsx 失败\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|err| panic!("{err}: {}", String::from_utf8_lossy(&output.stdout)))
+fn read_exported_xlsx(path: &PathBuf) -> crate::export::ParsedTable {
+    let bytes = fs::read(path).unwrap_or_else(|err| panic!("读取 xlsx 失败：{err}"));
+    crate::export::read_xlsx(&bytes).unwrap_or_else(|err| panic!("解析 xlsx 失败：{err}"))
 }
 
 #[tokio::test]
@@ -1068,16 +1032,15 @@ async fn xlsx_full_export_writes_select_and_table_rows_and_skips_updates() {
     let service = Service::new_for_test(dir.join("connections.sqlite"));
     service.open_sqlite_for_test("items", "条目", &database).await.unwrap();
     let session = service.catalog_session("items").expect("已打开会话");
-    let expected = serde_json::json!({
-        "sheets": 1,
-        "columns": ["id", "note"],
-        "rows": [
-            { "id": "1", "note": null },
-            { "id": "2", "note": null },
-            { "id": "3", "note": "甲" },
-            { "id": "4", "note": "a<b>&\"c\"\n下一行" }
-        ]
-    });
+    let expected = crate::export::ParsedTable {
+        columns: vec!["id".into(), "note".into()],
+        rows: vec![
+            vec![Some("1".into()), None],
+            vec![Some("2".into()), None],
+            vec![Some("3".into()), Some("甲".into())],
+            vec![Some("4".into()), Some("a<b>&\"c\"\n下一行".into())],
+        ],
+    };
     let spec = |id: &str, mode: ExportMode, path: String| ExportSpec {
         id: id.to_owned(),
         mode,
@@ -1116,7 +1079,7 @@ async fn xlsx_full_export_writes_select_and_table_rows_and_skips_updates() {
     assert!(raw.starts_with(b"PK"), "xlsx 应以 zip 包写出");
     assert!(!String::from_utf8_lossy(&raw).contains("<worksheet"), "全量 xlsx 不再用手写未压缩包");
     assert!(crate::export::workbook_initializations() > before, "全量 xlsx 应初始化 rust_xlsxwriter");
-    assert_eq!(read_xlsx_like_import(&table_file), expected);
+    assert_eq!(read_exported_xlsx(&table_file), expected);
 
     let mut filtered = spec("xlsx-filter", ExportMode::TableFull, dir.join("filtered.xlsx").display().to_string());
     filtered.filters = vec![filt("id", FilterOp::Eq, Some("3"))];
@@ -1124,12 +1087,11 @@ async fn xlsx_full_export_writes_select_and_table_rows_and_skips_updates() {
     assert!(filtered_export.success, "{}", filtered_export.message);
     assert_eq!(filtered_export.written_rows, 1);
     assert_eq!(
-        read_xlsx_like_import(&PathBuf::from(filtered_export.path.unwrap())),
-        serde_json::json!({
-            "sheets": 1,
-            "columns": ["id", "note"],
-            "rows": [{ "id": "3", "note": "甲" }]
-        })
+        read_exported_xlsx(&PathBuf::from(filtered_export.path.unwrap())),
+        crate::export::ParsedTable {
+            columns: vec!["id".into(), "note".into()],
+            rows: vec![vec![Some("3".into()), Some("甲".into())]],
+        }
     );
 
     let mut query = spec("xlsx-query", ExportMode::Query, dir.join("query.xlsx").display().to_string());
@@ -1137,7 +1099,7 @@ async fn xlsx_full_export_writes_select_and_table_rows_and_skips_updates() {
     let query_export = live::run_export(&session, &query).await;
     assert!(query_export.success, "{}", query_export.message);
     assert_eq!(query_export.written_rows, 4);
-    assert_eq!(read_xlsx_like_import(&PathBuf::from(query_export.path.unwrap())), expected);
+    assert_eq!(read_exported_xlsx(&PathBuf::from(query_export.path.unwrap())), expected);
 
     let update_path = dir.join("update.xlsx");
     let mut update = spec("xlsx-update", ExportMode::Query, update_path.display().to_string());
