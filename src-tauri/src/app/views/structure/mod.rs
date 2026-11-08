@@ -2,9 +2,15 @@
 
 use std::sync::Arc;
 
+use gpui_kit::assets::IconName;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::{ActiveTheme as _, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    AnyElement, App, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, relative,
 };
+
+use crate::ui::kit::{self, FieldSpec, Fields, Palette};
 
 use crate::application::AppServices;
 use crate::app::views::grid::{operation_banner, GridTarget};
@@ -177,11 +183,24 @@ impl StructureSession {
 pub struct StructurePane {
     pub session: StructureSession,
     services: Arc<AppServices>,
+    fields: Fields<&'static str>,
+    snapshot: Option<Snapshot>,
+    loaded_for: String,
+    loading: bool,
+    load_error: String,
 }
 
 impl StructurePane {
     pub fn new(services: Arc<AppServices>) -> Self {
-        Self { session: StructureSession::new(GridTarget::default()), services }
+        Self {
+            session: StructureSession::new(GridTarget::default()),
+            services,
+            fields: Fields::default(),
+            snapshot: None,
+            loaded_for: String::new(),
+            loading: false,
+            load_error: String::new(),
+        }
     }
 
     pub fn bind(&mut self, target: GridTarget) {
@@ -287,133 +306,395 @@ impl StructurePane {
 }
 
 impl StructurePane {
-    fn draft_inputs(&self, entity: Entity<Self>, locale: Locale) -> impl IntoElement {
-        let mut row = div().id("structure-draft").flex().gap(px(4.));
+    fn ensure_snapshot(&mut self, cx: &mut Context<Self>) {
+        let target = &self.session.target;
+        if target.connection_id.is_empty() || target.table.is_empty() {
+            return;
+        }
+        let key = format!("{}|{}|{}|{}", target.connection_id, target.database, target.schema, target.table);
+        if self.loaded_for == key {
+            return;
+        }
+        self.loaded_for = key.clone();
+        self.snapshot = None;
+        self.load_error.clear();
+        self.loading = true;
+        let services = Arc::clone(&self.services);
+        let target = target.clone();
+        let view = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            crate::app::views::grid::runtime_for_views().spawn(async move {
+                let result = crate::application::ddl::describe_saved(&services.connections, &target.connection_id, target.database.clone(), target.schema.clone(), &target.engine, &target.table).await;
+                let _ = tx.send(result);
+            });
+            if let Ok(result) = rx.await {
+                cx.update(|cx| {
+                    if let Some(view) = view.upgrade() {
+                        view.update(cx, |this, cx| {
+                            if this.loaded_for != key {
+                                return;
+                            }
+                            this.loading = false;
+                            match result {
+                                Ok(snapshot) => this.snapshot = Some(snapshot),
+                                Err(message) => this.load_error = message,
+                            }
+                            cx.notify();
+                        });
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn set_field(&mut self, field: &'static str, value: String) {
+        let slot = match field {
+            "column_name" => &mut self.session.column_name,
+            "column_type" => &mut self.session.column_type,
+            "index_name" => &mut self.session.index_name,
+            "index_column" => &mut self.session.index_column,
+            "fk_name" => &mut self.session.fk_name,
+            "fk_column" => &mut self.session.fk_column,
+            "fk_ref_schema" => &mut self.session.fk_ref_schema,
+            "fk_ref_table" => &mut self.session.fk_ref_table,
+            "fk_ref_column" => &mut self.session.fk_ref_column,
+            "view_sql" => &mut self.session.view_sql,
+            _ => return,
+        };
+        if *slot != value {
+            *slot = value;
+            self.session.cancel();
+        }
+    }
+
+    fn field_value(&self, field: &'static str) -> String {
+        match field {
+            "column_name" => self.session.column_name.clone(),
+            "column_type" => self.session.column_type.clone(),
+            "index_name" => self.session.index_name.clone(),
+            "index_column" => self.session.index_column.clone(),
+            "fk_name" => self.session.fk_name.clone(),
+            "fk_column" => self.session.fk_column.clone(),
+            "fk_ref_schema" => self.session.fk_ref_schema.clone(),
+            "fk_ref_table" => self.session.fk_ref_table.clone(),
+            "fk_ref_column" => self.session.fk_ref_column.clone(),
+            "view_sql" => self.session.view_sql.clone(),
+            _ => String::new(),
+        }
+    }
+
+    fn field(&mut self, field: &'static str, key: &str, placeholder: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let value = self.field_value(field);
+        let state = self.fields.bind(field, &value, FieldSpec { placeholder, masked: false }, window, cx, |this: &mut Self, field, value, _| this.set_field(field, value));
+        kit::form_row(
+            SharedString::from(i18n::text(self.session.locale, key)),
+            kit::text_input(SharedString::from(format!("structure-field-{field}")), &state, i18n::text(self.session.locale, key)),
+            &p,
+        )
+    }
+
+    fn overview(&self, p: &Palette, cx: &App) -> AnyElement {
+        let locale = self.session.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        if self.loading {
+            return div().p(px(16.)).flex().items_center().gap(px(8.)).text_color(p.text_muted).child(Spinner::new().small()).child(t("ui.structure.loading")).into_any_element();
+        }
+        if !self.load_error.is_empty() {
+            return div().p(px(16.)).text_color(p.danger).child(SharedString::from(self.load_error.clone())).into_any_element();
+        }
+        let Some(snapshot) = &self.snapshot else {
+            return div().p(px(16.)).text_color(p.text_faint).child(t("ui.structure.none")).into_any_element();
+        };
+        let mono = cx.theme().mono_font_family.clone();
         match self.session.section {
             Section::Columns => {
-                row = row
-                    .child(draft_box("column_name", "structure.field.column", &self.session.column_name, entity.clone(), locale))
-                    .child(draft_box("column_type", "structure.field.type", &self.session.column_type, entity, locale));
+                let rows = snapshot
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        vec![
+                            cell_main(column.name.clone(), column.primary.then_some(IconName::Key), p),
+                            cell_mono(column.type_name.clone(), &mono, p),
+                            cell_text(if column.nullable { "✓".into() } else { "—".into() }, p),
+                            cell_mono(column.default_sql.clone().unwrap_or_default(), &mono, p),
+                        ]
+                    })
+                    .collect();
+                grid_table(vec![t("structure.field.column"), t("structure.field.type"), t("ui.structure.nullable"), t("ui.structure.default")], vec![2., 1.4, 0.6, 1.4], rows, p)
             }
             Section::Indexes => {
-                row = row
-                    .child(draft_box("index_name", "structure.field.index", &self.session.index_name, entity.clone(), locale))
-                    .child(draft_box("index_column", "structure.section.columns", &self.session.index_column, entity, locale));
+                let rows = snapshot
+                    .indexes
+                    .iter()
+                    .map(|index| {
+                        vec![
+                            cell_main(index.name.clone(), index.unique.then_some(IconName::Hash), p),
+                            cell_mono(index.columns.iter().map(|column| if column.descending { format!("{} DESC", column.name) } else { column.name.clone() }).collect::<Vec<_>>().join(", "), &mono, p),
+                            cell_text(if index.unique { "✓".into() } else { "—".into() }, p),
+                        ]
+                    })
+                    .collect();
+                grid_table(vec![t("structure.field.index"), t("structure.section.columns"), t("ui.structure.unique")], vec![2., 2., 0.6], rows, p)
             }
             Section::ForeignKeys => {
-                row = row
-                    .child(draft_box("fk_name", "structure.section.foreign", &self.session.fk_name, entity.clone(), locale))
-                    .child(draft_box("fk_column", "structure.field.column", &self.session.fk_column, entity.clone(), locale))
-                    .child(draft_box("fk_ref_table", "structure.section.foreign", &self.session.fk_ref_table, entity.clone(), locale))
-                    .child(draft_box("fk_ref_column", "structure.field.column", &self.session.fk_ref_column, entity, locale));
+                let rows = snapshot
+                    .foreign_keys
+                    .iter()
+                    .map(|key| {
+                        let reference = if key.ref_schema.is_empty() { key.ref_table.clone() } else { format!("{}.{}", key.ref_schema, key.ref_table) };
+                        vec![
+                            cell_main(if key.name.is_empty() { "—".into() } else { key.name.clone() }, None, p),
+                            cell_mono(key.columns.join(", "), &mono, p),
+                            cell_mono(format!("{reference}({})", key.ref_columns.join(", ")), &mono, p),
+                        ]
+                    })
+                    .collect();
+                grid_table(vec![t("structure.section.foreign"), t("structure.section.columns"), t("ui.structure.references")], vec![1.4, 1.4, 2.], rows, p)
             }
-            Section::View => {
-                row = row.child(draft_box("view_sql", "structure.field.view", &self.session.view_sql, entity, locale));
-            }
-            Section::Danger => {}
+            Section::View | Section::Danger => div()
+                .id("structure-ddl")
+                .max_h(px(260.))
+                .overflow_y_scroll()
+                .p(px(14.))
+                .font_family(mono)
+                .text_size(px(12.))
+                .text_color(p.text_muted)
+                .child(SharedString::from(if snapshot.table_sql.is_empty() { i18n::text(locale, "ui.structure.none") } else { snapshot.table_sql.clone() }))
+                .into_any_element(),
         }
-        row
     }
 }
 
-fn draft_box(field: &'static str, key: &'static str, value: &str, entity: Entity<StructurePane>, locale: Locale) -> impl IntoElement {
-    let label = SharedString::from(format!("{} {}", i18n::text(locale, key), value));
+fn grid_table(headers: Vec<SharedString>, weights: Vec<f32>, rows: Vec<Vec<AnyElement>>, p: &Palette) -> AnyElement {
+    let mut head = div().flex().px(px(14.)).h(px(32.)).items_center().bg(p.chrome).border_b_1().border_color(p.line).text_size(px(11.5)).text_color(p.text_faint);
+    for (header, weight) in headers.into_iter().zip(weights.iter()) {
+        head = head.child(div().flex_grow(*weight).flex_shrink(1.).flex_basis(px(0.)).min_w(px(0.)).child(header));
+    }
+    let mut body = div().flex().flex_col();
+    let empty = rows.is_empty();
+    for row in rows {
+        let mut line = div().flex().px(px(14.)).min_h(px(34.)).items_center().border_b_1().border_color(p.line_soft).hover(|style| style.bg(p.hover));
+        for (cell, weight) in row.into_iter().zip(weights.iter()) {
+            line = line.child(div().flex_grow(*weight).flex_shrink(1.).flex_basis(px(0.)).min_w(px(0.)).pr(px(8.)).child(cell));
+        }
+        body = body.child(line);
+    }
+    if empty {
+        body = body.child(div().px(px(14.)).py(px(12.)).text_size(px(12.)).text_color(p.text_faint).child("—"));
+    }
+    div().flex().flex_col().child(head).child(body).into_any_element()
+}
+
+fn cell_main(text: String, icon: Option<IconName>, p: &Palette) -> AnyElement {
     div()
-        .id(SharedString::from(format!("structure-field-{field}")))
-        .role(gpui_kit::Role::TextInput)
-        .aria_label(label.clone())
-        .child(label)
-        .on_key_down(move |event: &gpui_kit::KeyDownEvent, _, cx| {
-            let Some(text) = typed_text(event) else { return };
-            entity.update(cx, |pane, cx| {
-                pane.type_into(field, &text);
-                cx.notify();
-            });
-        })
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .min_w(px(0.))
+        .child(div().truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(text)))
+        .when_some(icon, |this, icon| this.child(kit::icon(icon, 12., p.warn)))
+        .into_any_element()
 }
 
-fn typed_text(event: &gpui_kit::KeyDownEvent) -> Option<String> {
-    if event.keystroke.modifiers.control || event.keystroke.modifiers.platform || event.keystroke.modifiers.alt {
-        return None;
-    }
-    match event.keystroke.key.as_str() {
-        "backspace" => Some("backspace".into()),
-        "escape" | "enter" | "tab" | "up" | "down" | "left" | "right" => None,
-        _ => event.keystroke.key_char.clone().filter(|text| !text.is_empty()),
-    }
+fn cell_mono(text: String, mono: &SharedString, p: &Palette) -> AnyElement {
+    div().truncate().font_family(mono.clone()).text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(text)).into_any_element()
+}
+
+fn cell_text(text: String, p: &Palette) -> AnyElement {
+    div().text_color(p.text_muted).child(SharedString::from(text)).into_any_element()
 }
 
 impl Render for StructurePane {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_snapshot(cx);
+        let p = Palette::of(cx);
         let locale = self.session.locale;
-        let banner = SharedString::from(self.session.banner());
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let section = self.session.section;
         let entity = cx.entity();
+        let mut items = Vec::new();
+        for (id, key, value) in [
+            ("structure.section.columns", "structure.section.columns", Section::Columns),
+            ("structure.section.indexes", "structure.section.indexes", Section::Indexes),
+            ("structure.section.foreign", "structure.section.foreign", Section::ForeignKeys),
+            ("structure.section.view", "structure.section.view", Section::View),
+            ("structure.section.danger", "structure.section.danger", Section::Danger),
+        ] {
+            let entity = entity.clone();
+            items.push((
+                SharedString::from(id),
+                t(key),
+                section == value,
+                kit::click(move |_, _, cx| {
+                    entity.update(cx, |pane, cx| {
+                        pane.session.section = value;
+                        pane.session.cancel();
+                        cx.notify();
+                    });
+                }),
+            ));
+        }
+        let mut form = div().flex().flex_col().gap(px(12.));
+        match section {
+            Section::Columns => {
+                let name = self.field("column_name", "structure.field.column", "new_column", window, cx);
+                let kind = self.field("column_type", "structure.field.type", "TEXT", window, cx);
+                form = form.child(div().flex().gap(px(12.)).child(div().flex_1().child(name)).child(div().w(px(200.)).child(kind)));
+            }
+            Section::Indexes => {
+                let name = self.field("index_name", "structure.field.index", "ix_table_column", window, cx);
+                let column = self.field("index_column", "structure.section.columns", "column", window, cx);
+                form = form.child(div().flex().gap(px(12.)).child(div().flex_1().child(name)).child(div().flex_1().child(column)));
+            }
+            Section::ForeignKeys => {
+                let name = self.field("fk_name", "structure.section.foreign", "fk_name", window, cx);
+                let column = self.field("fk_column", "structure.field.column", "parent_id", window, cx);
+                let table = self.field("fk_ref_table", "ui.structure.refTable", "parents", window, cx);
+                let target = self.field("fk_ref_column", "ui.structure.refColumn", "id", window, cx);
+                form = form
+                    .child(div().flex().gap(px(12.)).child(div().flex_1().child(name)).child(div().flex_1().child(column)))
+                    .child(div().flex().gap(px(12.)).child(div().flex_1().child(table)).child(div().flex_1().child(target)));
+            }
+            Section::View => {
+                let sql = self.field("view_sql", "structure.field.view", "CREATE VIEW … AS SELECT …", window, cx);
+                form = form.child(sql);
+            }
+            Section::Danger => {
+                form = form.child(
+                    div()
+                        .flex()
+                        .gap(px(10.))
+                        .p(px(12.))
+                        .rounded(px(8.))
+                        .bg(p.danger_soft)
+                        .text_color(p.danger)
+                        .child(kit::icon(IconName::TriangleAlert, 16., p.danger))
+                        .child(div().flex().flex_col().gap(px(2.)).child(div().font_weight(FontWeight::SEMIBOLD).child(t("ui.structure.dropTitle"))).child(div().text_size(px(12.)).child(t("ui.structure.dropDetail")))),
+                );
+            }
+        }
+        let preview_click = {
+            let entity = entity.clone();
+            move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| entity.update(cx, |pane, cx| pane.preview(cx))
+        };
+        form = form.child(div().flex().justify_end().child(if section == Section::Danger {
+            kit::danger_button("structure-preview", Some(IconName::Eye), t("structure.action.preview"), preview_click).into_any_element()
+        } else {
+            kit::primary_button("structure-preview", Some(IconName::Eye), t("structure.action.preview"), preview_click).into_any_element()
+        }));
+
+        let title = if self.session.target.table.is_empty() { t("structure.section.columns") } else { SharedString::from(self.session.target.table.clone()) };
         let mut column = div()
             .id("structure-pane")
+            .relative()
+            .size_full()
             .flex()
             .flex_col()
-            .gap(px(4.))
-            .child(div().id("structure-banner").child(banner))
-            .child(section_button(Section::Columns, "structure.section.columns", entity.clone(), locale))
-            .child(section_button(Section::Indexes, "structure.section.indexes", entity.clone(), locale))
-            .child(section_button(Section::ForeignKeys, "structure.section.foreign", entity.clone(), locale))
-            .child(section_button(Section::View, "structure.section.view", entity.clone(), locale))
-            .child(section_button(Section::Danger, "structure.section.danger", entity.clone(), locale))
-            .child(self.draft_inputs(entity.clone(), locale))
-            .child(action_button("structure-preview", "structure.action.preview", entity.clone(), locale));
-        if !self.session.note.is_empty() {
-            column = column.child(SharedString::from(self.session.note.clone()));
-        }
-        if self.session.preview_open() {
-            column = column.child(
+            .child(
                 div()
-                    .id("structure-preview")
-                    .role(gpui_kit::Role::Dialog)
-                    .aria_label(SharedString::from(i18n::text(locale, "structure.preview.title")))
-                    .child(SharedString::from(self.session.banner()))
-                    .child(SharedString::from(self.session.preview_sql().join("\n")))
-                    .child(SharedString::from(self.session.blocked().join(" ")))
-                    .child(action_button("structure-confirm", "structure.action.confirm", entity.clone(), locale))
-                    .child(action_button("structure-cancel", "structure.action.cancel", entity, locale)),
+                    .flex_none()
+                    .px(px(24.))
+                    .pt(px(18.))
+                    .pb(px(14.))
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(14.))
+                    .border_b_1()
+                    .border_color(p.line)
+                    .child(kit::engine_badge(&self.session.target.engine, 30.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(160.))
+                            .flex()
+                            .flex_col()
+                            .child(kit::title(title, 16., &p))
+                            .child(div().id("structure-banner").text_size(px(12.)).text_color(p.text_muted).truncate().child(SharedString::from(self.session.banner()))),
+                    )
+                    .child(kit::segmented(items, &p)),
+            );
+        let mut body = div().id("structure-body").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(24.)).flex().flex_col().gap(px(20.));
+        body = body
+            .child(div().flex().flex_col().gap(px(8.)).child(kit::eyebrow(t("ui.structure.existing"), &p)).child(kit::card(&p).overflow_hidden().child(self.overview(&p, cx))))
+            .child(div().flex().flex_col().gap(px(8.)).child(kit::eyebrow(t(if section == Section::Danger { "structure.section.danger" } else { "ui.structure.add" }), &p)).child(kit::card(&p).p(px(16.)).child(form)));
+        if !self.session.note.is_empty() {
+            body = body.child(div().px(px(12.)).py(px(8.)).rounded(px(8.)).bg(p.hover).text_size(px(12.5)).child(SharedString::from(self.session.note.clone())));
+        }
+        column = column.child(body);
+        if self.session.preview_open() {
+            let blocked = self.session.blocked();
+            let confirm = {
+                let entity = entity.clone();
+                move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| entity.update(cx, |pane, cx| pane.confirm(cx))
+            };
+            let cancel = {
+                let entity = entity.clone();
+                move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                    entity.update(cx, |pane, cx| {
+                        pane.session.cancel();
+                        cx.notify();
+                    })
+                }
+            };
+            column = column.child(
+                div().absolute().inset_0().bg(gpui_kit::hsla(0., 0., 0., 0.25)).flex().items_center().justify_center().child(
+                    div()
+                        .id("structure-preview")
+                        .role(gpui_kit::Role::Dialog)
+                        .aria_label(t("structure.preview.title"))
+                        .occlude()
+                        .w(px(620.))
+                        .max_w(relative(0.92))
+                        .p(px(18.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.))
+                        .bg(p.raised)
+                        .border_1()
+                        .border_color(p.line)
+                        .rounded(px(12.))
+                        .shadow_lg()
+                        .child(kit::title(t("structure.preview.title"), 15., &p))
+                        .child(kit::muted(SharedString::from(self.session.banner()), &p))
+                        .child(
+                            div()
+                                .id("structure-preview-sql")
+                                .max_h(px(280.))
+                                .overflow_y_scroll()
+                                .p(px(12.))
+                                .rounded(px(8.))
+                                .bg(p.chrome)
+                                .border_1()
+                                .border_color(p.line)
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_size(px(12.5))
+                                .child(SharedString::from(self.session.preview_sql().join("\n"))),
+                        )
+                        .when(!blocked.is_empty(), |this| {
+                            this.child(div().px(px(12.)).py(px(8.)).rounded(px(8.)).bg(p.danger_soft).text_color(p.danger).text_size(px(12.5)).child(SharedString::from(blocked.join(" "))))
+                        })
+                        .when(!self.session.note.is_empty(), |this| this.child(kit::muted(SharedString::from(self.session.note.clone()), &p)))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(8.))
+                                .child(kit::secondary_button("structure-cancel", None, t("structure.action.cancel"), cancel))
+                                .child(if section == Section::Danger {
+                                    kit::danger_button("structure-confirm", Some(IconName::Check), t("structure.action.confirm"), confirm).into_any_element()
+                                } else {
+                                    kit::primary_button("structure-confirm", Some(IconName::Check), t("structure.action.confirm"), confirm).into_any_element()
+                                }),
+                        ),
+                ),
             );
         }
         column
     }
-}
-
-fn section_button(section: Section, key: &'static str, entity: Entity<StructurePane>, locale: Locale) -> impl IntoElement {
-    let label = SharedString::from(i18n::text(locale, key));
-    div()
-        .id(key)
-        .role(gpui_kit::Role::Button)
-        .aria_label(label.clone())
-        .child(label)
-        .on_click(move |_, _, cx| {
-            entity.update(cx, |pane, cx| {
-                pane.session.section = section;
-                pane.session.cancel();
-                cx.notify();
-            });
-        })
-}
-
-fn action_button(id: &'static str, key: &'static str, entity: Entity<StructurePane>, locale: Locale) -> impl IntoElement {
-    let label = SharedString::from(i18n::text(locale, key));
-    div()
-        .id(id)
-        .role(gpui_kit::Role::Button)
-        .aria_label(label.clone())
-        .child(label)
-        .on_click(move |_, _, cx| {
-            entity.update(cx, |pane, cx| match id {
-                "structure-preview" => pane.preview(cx),
-                "structure-confirm" => pane.confirm(cx),
-                _ => {
-                    pane.session.cancel();
-                    cx.notify();
-                }
-            });
-        })
 }
 
 #[cfg(test)]

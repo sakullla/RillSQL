@@ -2,9 +2,14 @@
 
 use std::sync::Arc;
 
+use gpui_kit::assets::IconName;
+use gpui_kit::component::{ActiveTheme as _, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    AnyElement, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, relative,
 };
+
+use crate::ui::kit::{self, FieldSpec, Fields, Palette};
 
 use crate::application::AppServices;
 use crate::app::views::grid::{operation_banner, GridTarget};
@@ -215,11 +220,12 @@ impl AdminSession {
 pub struct AdminPane {
     pub session: AdminSession,
     services: Arc<AppServices>,
+    fields: Fields<&'static str>,
 }
 
 impl AdminPane {
     pub fn new(services: Arc<AppServices>) -> Self {
-        Self { session: AdminSession::new(GridTarget::default()), services }
+        Self { session: AdminSession::new(GridTarget::default()), services, fields: Fields::default() }
     }
 
     pub fn bind(&mut self, target: GridTarget) {
@@ -373,140 +379,242 @@ impl AdminSections {
     }
 }
 
+impl AdminPane {
+    fn set_value(&mut self, field: &'static str, value: String) {
+        let slot = match field {
+            "reindex" => &mut self.session.reindex_target,
+            "attach_path" => &mut self.session.attach_path,
+            "attach_name" => &mut self.session.attach_name,
+            "pragma_value" => &mut self.session.pragma_value,
+            "sequence" => &mut self.session.sequence_name,
+            "sequence_step" => &mut self.session.sequence_step,
+            "event" => &mut self.session.event_name,
+            _ => return,
+        };
+        *slot = value;
+    }
+
+    fn value_of(&self, field: &'static str) -> String {
+        match field {
+            "reindex" => self.session.reindex_target.clone(),
+            "attach_path" => self.session.attach_path.clone(),
+            "attach_name" => self.session.attach_name.clone(),
+            "pragma_value" => self.session.pragma_value.clone(),
+            "sequence" => self.session.sequence_name.clone(),
+            "sequence_step" => self.session.sequence_step.clone(),
+            "event" => self.session.event_name.clone(),
+            _ => String::new(),
+        }
+    }
+
+    fn admin_field(&mut self, field: &'static str, placeholder: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let value = self.value_of(field);
+        let state = self.fields.bind(field, &value, FieldSpec { placeholder, masked: false }, window, cx, |this: &mut Self, field, value, _| this.set_value(field, value));
+        div().flex_1().min_w(px(0.)).child(kit::text_input(SharedString::from(format!("admin-field-{field}")), &state, placeholder.to_owned()).small()).into_any_element()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn op_card(id: &'static str, kind: &'static str, icon: IconName, title: SharedString, inputs: Vec<AnyElement>, inventory: Vec<String>, entity: &Entity<AdminPane>, locale: Locale, p: &Palette) -> AnyElement {
+    let entity = entity.clone();
+    let mut row = div().flex().items_center().gap(px(8.));
+    for input in inputs {
+        row = row.child(input);
+    }
+    let preview = kit::secondary_button(id, Some(IconName::Eye), SharedString::from(i18n::text(locale, "structure.action.preview")), move |_, _, cx| {
+        entity.update(cx, |pane, cx| {
+            pane.choose(kind);
+            pane.preview(cx);
+        });
+    })
+    .accessibility_label(title.clone());
+    let mut card = kit::card(p)
+        .p(px(14.))
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .child(div().flex_none().size(px(30.)).rounded(px(8.)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(icon, 15., p.accent_text)))
+                .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child(title))
+                .child(preview),
+        );
+    if row_has_children(&inventory) {
+        let mut list = div().flex().flex_wrap().gap(px(6.));
+        for item in inventory {
+            list = list.child(kit::pill(SharedString::from(item), p.text_muted, p.hover));
+        }
+        card = card.child(list);
+    }
+    card.child(row).into_any_element()
+}
+
+fn row_has_children(items: &[String]) -> bool {
+    !items.is_empty()
+}
+
 impl Render for AdminPane {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.session.inventory.probed && !self.session.target.connection_id.is_empty() {
             self.session.inventory.probed = true;
             self.refresh_inventory(cx);
         }
+        let p = Palette::of(cx);
         let locale = self.session.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let sections = self.session.sections();
         let entity = cx.entity();
         let inventory = self.session.inventory.clone();
-        let mut column = div()
-            .id("admin-pane")
-            .flex()
-            .flex_col()
-            .gap(px(4.))
-            .child(div().id("admin-banner").child(SharedString::from(self.session.banner())))
-            .child(div().id("admin-source").child(SharedString::from(inventory.source.clone())));
+        let mut cards = div().flex().flex_col().gap(px(12.));
         if sections.maintenance {
-            column = column
-                .child(kind_button("admin-vacuum", "admin.action.vacuum", "vacuum", entity.clone(), locale))
-                .child(admin_box("reindex", "admin.action.reindex", &self.session.reindex_target, entity.clone(), locale))
-                .child(kind_button("admin-reindex", "admin.action.reindex", "reindex", entity.clone(), locale));
+            cards = cards.child(op_card("admin-vacuum", "vacuum", IconName::BrushCleaning, t("admin.action.vacuum"), Vec::new(), Vec::new(), &entity, locale, &p));
+            let target = self.admin_field("reindex", &i18n::text(locale, "ui.conn.optional"), window, cx);
+            cards = cards.child(op_card("admin-reindex", "reindex", IconName::ListRestart, t("admin.action.reindex"), vec![target], Vec::new(), &entity, locale, &p));
         }
         if sections.pragma {
-            column = column
-                .child(admin_box("pragma_value", "admin.action.pragma", &self.session.pragma_value, entity.clone(), locale))
-                .child(kind_button("admin-pragma", "admin.action.pragma", "pragma", entity.clone(), locale))
-                .child(kind_button("admin-foreign", "admin.action.foreignKeys", "foreign", entity.clone(), locale));
+            let value = self.admin_field("pragma_value", "user_version", window, cx);
+            cards = cards
+                .child(op_card("admin-pragma", "pragma", IconName::SlidersHorizontal, t("admin.action.pragma"), vec![value], Vec::new(), &entity, locale, &p))
+                .child(op_card(
+                    "admin-foreign",
+                    "foreign",
+                    IconName::Link,
+                    SharedString::from(format!("{} · {}", i18n::text(locale, "admin.action.foreignKeys"), if self.session.foreign_keys { "ON" } else { "OFF" })),
+                    Vec::new(),
+                    Vec::new(),
+                    &entity,
+                    locale,
+                    &p,
+                ));
         }
         if sections.attached {
-            column = column
-                .child(admin_box("attach_path", "admin.action.attach", &self.session.attach_path, entity.clone(), locale))
-                .child(admin_box("attach_name", "admin.action.attach", &self.session.attach_name, entity.clone(), locale))
-                .child(kind_button("admin-attach", "admin.action.attach", "attach", entity.clone(), locale));
-            for name in &inventory.attached {
-                column = column.child(SharedString::from(format!("attached {name}")));
-            }
+            let path = self.admin_field("attach_path", "/path/to/other.sqlite", window, cx);
+            let name = self.admin_field("attach_name", "other", window, cx);
+            cards = cards.child(op_card("admin-attach", "attach", IconName::Paperclip, t("admin.action.attach"), vec![path, name], inventory.attached.clone(), &entity, locale, &p));
         }
         if sections.sequences {
-            column = column
-                .child(admin_box("sequence", "admin.action.sequence", &self.session.sequence_name, entity.clone(), locale))
-                .child(admin_box("sequence_step", "admin.action.sequence", &self.session.sequence_step, entity.clone(), locale))
-                .child(kind_button("admin-sequence", "admin.action.sequence", "sequence", entity.clone(), locale));
-            for name in &inventory.sequences {
-                column = column.child(SharedString::from(format!("sequence {name}")));
-            }
+            let name = self.admin_field("sequence", "orders_id_seq", window, cx);
+            let step = self.admin_field("sequence_step", "1", window, cx);
+            cards = cards.child(op_card("admin-sequence", "sequence", IconName::ListOrdered, t("admin.action.sequence"), vec![name, step], inventory.sequences.clone(), &entity, locale, &p));
         }
         if sections.events {
-            column = column
-                .child(admin_box("event", "admin.action.event", &self.session.event_name, entity.clone(), locale))
-                .child(kind_button("admin-event", "admin.action.event", "event", entity.clone(), locale));
-            for name in &inventory.events {
-                column = column.child(SharedString::from(format!("event {name}")));
-            }
+            let name = self.admin_field("event", "event_name", window, cx);
+            cards = cards.child(op_card("admin-event", "event", IconName::CalendarClock, t("admin.action.event"), vec![name], inventory.events.clone(), &entity, locale, &p));
         }
-        if sections.extensions {
-            if inventory.extensions.is_empty() {
-                column = column.child(SharedString::from(format!("extensions {}", inventory.source)));
+        if sections.extensions || sections.partitions {
+            let mut list = div().flex().flex_wrap().gap(px(6.));
+            for name in inventory.extensions.iter().chain(inventory.partitions.iter()) {
+                list = list.child(kit::pill(SharedString::from(name.clone()), p.text_muted, p.hover));
             }
-            for name in &inventory.extensions {
-                column = column.child(SharedString::from(format!("extension {name}")));
-            }
-        }
-        if sections.partitions {
-            if inventory.partitions.is_empty() {
-                column = column.child(SharedString::from(format!("partitions {}", inventory.source)));
-            }
-            for name in &inventory.partitions {
-                column = column.child(SharedString::from(format!("partition {name}")));
-            }
+            cards = cards.child(kit::card(&p).p(px(14.)).flex().flex_col().gap(px(8.)).child(kit::muted(SharedString::from(inventory.source.clone()), &p)).child(list));
         }
         if !sections.pragma && !sections.maintenance && !sections.sequences && !sections.events && !sections.extensions && !sections.partitions && !sections.attached {
-            column = column.child(SharedString::from(i18n::text(locale, "admin.section.none")));
+            cards = cards.child(kit::empty_state(IconName::Gauge, t("ui.tool.admin"), t("admin.section.none"), &p));
         }
-        column = column.child(plain_button("admin-preview", "structure.action.preview", entity.clone(), locale));
-        if self.session.open {
-            column = column.child(
+        let mut column = div()
+            .id("admin-pane")
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
                 div()
-                    .id("admin-preview-dialog")
-                    .role(gpui_kit::Role::Dialog)
-                    .aria_label(SharedString::from(i18n::text(locale, "structure.preview.title")))
-                    .child(SharedString::from(self.session.banner()))
-                    .child(SharedString::from(self.session.preview_sql().join("\n")))
-                    .child(SharedString::from(self.session.blocked().join(" ")))
-                    .child(plain_button("admin-confirm", "structure.action.confirm", entity.clone(), locale))
-                    .child(plain_button("admin-cancel", "structure.action.cancel", entity, locale)),
+                    .flex_none()
+                    .px(px(24.))
+                    .pt(px(18.))
+                    .pb(px(14.))
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .border_b_1()
+                    .border_color(p.line)
+                    .child(kit::engine_badge(&self.session.target.engine, 30.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(kit::title(t("ui.tool.admin"), 16., &p))
+                            .child(div().id("admin-banner").truncate().text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(self.session.banner()))),
+                    )
+                    .child(div().id("admin-source").text_size(px(11.5)).text_color(p.text_faint).max_w(px(320.)).truncate().child(SharedString::from(inventory.source.clone()))),
+            )
+            .child(div().id("admin-body").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(24.)).child(div().max_w(px(760.)).mx_auto().flex().flex_col().gap(px(12.)).child(cards).when(!self.session.note.is_empty(), |this| {
+                this.child(div().px(px(12.)).py(px(8.)).rounded(px(8.)).bg(p.hover).text_size(px(12.5)).child(SharedString::from(self.session.note.clone())))
+            })))
+            .child(div().hidden().child(admin_button("admin-preview", "structure.action.preview", false, entity.clone(), locale)));
+        if self.session.open {
+            let blocked = self.session.blocked();
+            column = column.child(
+                div().absolute().inset_0().bg(gpui_kit::hsla(0., 0., 0., 0.25)).flex().items_center().justify_center().child(
+                    div()
+                        .id("admin-preview-dialog")
+                        .role(gpui_kit::Role::Dialog)
+                        .aria_label(t("structure.preview.title"))
+                        .occlude()
+                        .w(px(600.))
+                        .max_w(relative(0.92))
+                        .p(px(18.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.))
+                        .bg(p.raised)
+                        .border_1()
+                        .border_color(p.line)
+                        .rounded(px(12.))
+                        .shadow_lg()
+                        .child(kit::title(t("structure.preview.title"), 15., &p))
+                        .child(kit::muted(SharedString::from(self.session.banner()), &p))
+                        .child(
+                            div()
+                                .id("admin-preview-sql")
+                                .max_h(px(260.))
+                                .overflow_y_scroll()
+                                .p(px(12.))
+                                .rounded(px(8.))
+                                .bg(p.chrome)
+                                .border_1()
+                                .border_color(p.line)
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_size(px(12.5))
+                                .child(SharedString::from(self.session.preview_sql().join("\n"))),
+                        )
+                        .when(!blocked.is_empty(), |this| this.child(div().px(px(12.)).py(px(8.)).rounded(px(8.)).bg(p.danger_soft).text_color(p.danger).text_size(px(12.5)).child(SharedString::from(blocked.join(" ")))))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(8.))
+                                .child(admin_button("admin-cancel", "structure.action.cancel", false, entity.clone(), locale))
+                                .child(admin_button("admin-confirm", "structure.action.confirm", true, entity, locale)),
+                        ),
+                ),
             );
-        }
-        if !self.session.note.is_empty() {
-            column = column.child(SharedString::from(self.session.note.clone()));
         }
         column
     }
 }
 
-fn kind_button(id: &'static str, key: &'static str, kind: &'static str, entity: Entity<AdminPane>, locale: Locale) -> impl IntoElement {
+fn admin_button(id: &'static str, key: &'static str, primary: bool, entity: Entity<AdminPane>, locale: Locale) -> gpui_kit::component::button::Button {
+    let click = move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
+        entity.update(cx, |pane, cx| match id {
+            "admin-preview" => pane.preview(cx),
+            "admin-confirm" => pane.confirm(cx),
+            _ => {
+                pane.session.cancel();
+                cx.notify();
+            }
+        });
+    };
     let label = SharedString::from(i18n::text(locale, key));
-    div()
-        .id(id)
-        .role(gpui_kit::Role::Button)
-        .aria_label(label.clone())
-        .child(label)
-        .on_click(move |_, _, cx| {
-            entity.update(cx, |pane, cx| {
-                pane.choose(kind);
-                cx.notify();
-            });
-        })
-}
-
-fn admin_box(field: &'static str, key: &'static str, value: &str, entity: Entity<AdminPane>, locale: Locale) -> impl IntoElement {
-    let label = SharedString::from(format!("{} {}", i18n::text(locale, key), value));
-    div()
-        .id(SharedString::from(format!("admin-field-{field}")))
-        .role(gpui_kit::Role::TextInput)
-        .aria_label(label.clone())
-        .child(label)
-        .on_key_down(move |event: &gpui_kit::KeyDownEvent, _, cx| {
-            let Some(text) = admin_typed(event) else { return };
-            entity.update(cx, |pane, cx| {
-                pane.type_into(field, &text);
-                cx.notify();
-            });
-        })
-}
-
-fn admin_typed(event: &gpui_kit::KeyDownEvent) -> Option<String> {
-    if event.keystroke.modifiers.control || event.keystroke.modifiers.platform || event.keystroke.modifiers.alt {
-        return None;
-    }
-    match event.keystroke.key.as_str() {
-        "backspace" => Some("backspace".into()),
-        "escape" | "enter" | "tab" | "up" | "down" | "left" | "right" => None,
-        _ => event.keystroke.key_char.clone().filter(|text| !text.is_empty()),
+    if primary {
+        kit::primary_button(id, Some(IconName::Check), label, click)
+    } else {
+        kit::secondary_button(id, None, label, click)
     }
 }
 
@@ -542,25 +650,6 @@ async fn read_inventory(service: &crate::connections::Service, target: &GridTarg
             attached: Vec::new(),
         },
     }
-}
-
-fn plain_button(id: &'static str, key: &'static str, entity: Entity<AdminPane>, locale: Locale) -> impl IntoElement {
-    let label = SharedString::from(i18n::text(locale, key));
-    div()
-        .id(id)
-        .role(gpui_kit::Role::Button)
-        .aria_label(label.clone())
-        .child(label)
-        .on_click(move |_, _, cx| {
-            entity.update(cx, |pane, cx| match id {
-                "admin-preview" => pane.preview(cx),
-                "admin-confirm" => pane.confirm(cx),
-                _ => {
-                    pane.session.cancel();
-                    cx.notify();
-                }
-            });
-        })
 }
 
 #[cfg(test)]

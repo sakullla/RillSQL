@@ -4,9 +4,15 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use gpui_kit::assets::IconName;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::Sizable as _;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Context, InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
+
+use crate::ui::kit::{self, Palette};
 
 use crate::application::AppServices;
 use crate::export::{
@@ -766,47 +772,211 @@ impl Render for ExchangePane {
         if !self.open {
             return div().id("exchange-idle");
         }
+        let p = Palette::of(cx);
+        let locale = self.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let entity = cx.entity();
+        let act = |id: &'static str| {
+            let entity = entity.clone();
+            move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| entity.update(cx, |pane, cx| pane.command(id, cx))
+        };
+        let section = |title: SharedString, body: gpui_kit::Div| div().flex().flex_col().gap(px(8.)).child(kit::eyebrow(title, &p)).child(body);
+
         let mut panel = div()
             .id("exchange")
             .role(gpui_kit::Role::Dialog)
-            .aria_label(SharedString::from(i18n::text(self.locale, "export.task.title")))
+            .aria_label(t("export.task.title"))
+            .flex()
+            .flex_col()
+            .gap(px(18.))
+            .p(px(16.));
+        if !self.notice.is_empty() {
+            panel = panel.child(div().px(px(12.)).py(px(8.)).rounded(px(8.)).bg(p.hover).text_size(px(12.5)).child(SharedString::from(self.notice.clone())));
+        }
+
+        // 来源表与格式
+        let source = match &self.table {
+            Some(table) => div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(kit::engine_badge(&table.engine, 18.))
+                .child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(SharedString::from(table.table.clone())))
+                .child(kit::muted(SharedString::from(table.database.clone()), &p)),
+            None => div().text_size(px(12.5)).text_color(p.text_faint).child(t("ui.exchange.noTable")),
+        };
+        let mut formats = Vec::new();
+        for (format, label) in [("csv", "CSV"), ("xlsx", "Excel"), ("json", "JSON"), ("insert", "SQL"), ("markdown", "Markdown")] {
+            let entity = entity.clone();
+            let id = format!("exchange-format:{format}");
+            formats.push((
+                SharedString::from(format!("exchange-exchange-format:{format}")),
+                SharedString::from(label),
+                self.format_name == format,
+                kit::click(move |_, _, cx| {
+                    let id = id.clone();
+                    entity.update(cx, |pane, cx| pane.command(&id, cx));
+                }),
+            ));
+        }
+        panel = panel.child(section(
+            t("ui.exchange.source"),
+            kit::card(&p).p(px(14.)).flex().flex_col().gap(px(12.)).child(source).child(kit::form_row(t("ui.exchange.format"), kit::segmented(formats, &p), &p)),
+        ));
+
+        // 导出
+        let export = div()
             .flex()
             .flex_col()
             .gap(px(6.))
-            .p(px(8.));
-        for line in self.lines() {
-            panel = panel.child(SharedString::from(line));
+            .child(action_row("exchange-exchange-export-loaded", IconName::FileDown, t("export.export.loaded"), t("ui.exchange.loadedHint"), &p, act("exchange-export-loaded")))
+            .child(action_row("exchange-exchange-export-full", IconName::Download, t("export.export.full"), t("ui.exchange.fullHint"), &p, act("exchange-export-full")))
+            .child(action_row("exchange-exchange-dump", IconName::DatabaseBackup, t("export.dump.start"), t("ui.exchange.dumpHint"), &p, act("exchange-dump")))
+            .child(action_row("exchange-exchange-migrate", IconName::ArrowRightLeft, t("export.migrate.start"), t("ui.exchange.migrateHint"), &p, act("exchange-migrate")));
+        panel = panel.child(section(t("ui.exchange.export"), export));
+
+        // 导入
+        let mut import = kit::card(&p).p(px(14.)).flex().flex_col().gap(px(12.));
+        match &self.preview {
+            None => {
+                import = import.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(8.))
+                        .py(px(14.))
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_dashed()
+                        .border_color(p.line_strong)
+                        .child(kit::icon(IconName::FileUp, 22., p.text_faint))
+                        .child(kit::muted(t("ui.exchange.dropHint"), &p))
+                        .child(kit::secondary_button("exchange-exchange-pick", Some(IconName::FolderOpen), t("export.import.choose"), act("exchange-pick"))),
+                );
+            }
+            Some(preview) => {
+                import = import
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(kit::icon(IconName::FileText, 16., p.accent))
+                            .child(div().flex_1().min_w(px(0.)).truncate().font_weight(gpui_kit::FontWeight::MEDIUM).child(SharedString::from(preview.path.clone())))
+                            .child(kit::pill(SharedString::from(format!("{} · {} {}", preview.format, preview.table.rows.len(), i18n::text(locale, "ui.grid.rows"))), p.accent_text, p.accent_soft)),
+                    )
+                    .child(kit::muted(t(if preview.truncated { "export.preview.truncated" } else { "export.preview.noWrite" }), &p));
+                let mut mapping = div().flex().flex_col().gap(px(2.));
+                if self.mapping.is_empty() {
+                    mapping = mapping.child(kit::muted(t("export.map.empty"), &p));
+                }
+                for (field, source) in &self.mapping {
+                    mapping = mapping.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded(px(6.))
+                            .bg(p.chrome)
+                            .text_size(px(12.5))
+                            .child(div().flex_1().min_w(px(0.)).truncate().child(SharedString::from(source.clone())))
+                            .child(kit::icon(IconName::ArrowRight, 12., p.text_faint))
+                            .child(div().flex_1().min_w(px(0.)).truncate().font_weight(gpui_kit::FontWeight::MEDIUM).child(SharedString::from(field.clone()))),
+                    );
+                }
+                import = import
+                    .child(div().flex().flex_col().gap(px(6.)).child(kit::eyebrow(t("export.map.title"), &p)).child(mapping))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(kit::tool_button("exchange-exchange-cancel-import", None, t("export.import.cancel"), act("exchange-cancel-import")))
+                            .child(kit::secondary_button("exchange-exchange-pick", Some(IconName::FolderOpen), t("export.import.choose"), act("exchange-pick")))
+                            .child(kit::primary_button("exchange-exchange-confirm", Some(IconName::Check), t("export.import.confirm"), act("exchange-confirm"))),
+                    );
+            }
         }
-        for (id, key) in [
-            ("exchange-confirm", "export.import.confirm"),
-            ("exchange-pick", "export.import.choose"),
-            ("exchange-cancel-import", "export.import.cancel"),
-            ("exchange-export-loaded", "export.export.loaded"),
-            ("exchange-export-full", "export.export.full"),
-            ("exchange-format:xlsx", "export.export.xlsx"),
-            ("exchange-dump", "export.dump.start"),
-            ("exchange-migrate", "export.migrate.start"),
-            ("exchange-task-cancel", "export.task.cancel"),
-            ("exchange-clear", "export.task.clear"),
-        ] {
-            let label = SharedString::from(i18n::text(self.locale, key));
-            let command = id.to_owned();
-            let entity_click = entity.clone();
-            panel = panel.child(
+        panel = panel.child(section(t("ui.exchange.import"), import));
+
+        // 任务
+        let mut tasks = kit::card(&p).flex().flex_col();
+        if self.log.tasks.is_empty() {
+            tasks = tasks.child(div().p(px(14.)).text_size(px(12.5)).text_color(p.text_faint).child(t("export.task.empty")));
+        }
+        let count = self.log.tasks.len();
+        for (index, task) in self.log.tasks.iter().enumerate() {
+            let (fg, bg) = match task.phase {
+                Phase::Running => (p.accent_text, p.accent_soft),
+                Phase::Done => (p.ok, p.ok_soft),
+                Phase::Failed => (p.danger, p.danger_soft),
+                Phase::Partial | Phase::Blocked => (p.warn, p.warn_soft),
+                Phase::Cancelled => (p.text_muted, p.hover),
+            };
+            tasks = tasks.child(
                 div()
-                    .id(SharedString::from(format!("exchange-{id}")))
-                    .role(gpui_kit::Role::Button)
-                    .aria_label(label.clone())
-                    .child(label)
-                    .on_click(move |_, _, cx| {
-                        let command = command.clone();
-                        entity_click.update(cx, |this, cx| this.command(&command, cx));
-                    }),
+                    .px(px(14.))
+                    .py(px(10.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .when(index + 1 < count, |this| this.border_b_1().border_color(p.line_soft))
+                    .child(if task.running_now() { Spinner::new().xsmall().color(p.accent).into_any_element() } else { kit::status_dot(fg) })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(div().truncate().font_weight(gpui_kit::FontWeight::MEDIUM).child(SharedString::from(task.kind.to_owned())))
+                            .child(div().truncate().text_size(px(11.5)).text_color(p.text_faint).child(SharedString::from(if task.detail.is_empty() { task.path.clone().unwrap_or_default() } else { task.detail.clone() }))),
+                    )
+                    .child(div().text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(format!("{} {}", task.done_rows, i18n::text(locale, "ui.grid.rows")))))
+                    .child(kit::pill(t(task.label_key()), fg, bg)),
             );
         }
+        panel = panel.child(section(
+            t("export.task.title"),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(tasks)
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(6.))
+                        .child(kit::tool_button("exchange-exchange-task-cancel", Some(IconName::CircleStop), t("export.task.cancel"), act("exchange-task-cancel")))
+                        .child(kit::tool_button("exchange-exchange-clear", Some(IconName::BrushCleaning), t("export.task.clear"), act("exchange-clear"))),
+                ),
+        ));
         panel
     }
+}
+
+fn action_row(id: &'static str, icon: IconName, title: SharedString, detail: SharedString, p: &Palette, on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static) -> gpui_kit::AnyElement {
+    div()
+        .id(id)
+        .role(gpui_kit::Role::Button)
+        .aria_label(title.clone())
+        .p(px(10.))
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .rounded(px(9.))
+        .border_1()
+        .border_color(p.line)
+        .cursor_pointer()
+        .hover(|style| style.border_color(p.accent).bg(p.accent_soft))
+        .child(div().flex_none().size(px(30.)).rounded(px(8.)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(icon, 15., p.accent_text)))
+        .child(div().flex_1().min_w(px(0.)).flex().flex_col().child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(title)).child(div().text_size(px(11.5)).text_color(p.text_faint).child(detail)))
+        .child(kit::icon(IconName::ChevronRight, 14., p.text_faint))
+        .on_click(on_click)
+        .into_any_element()
 }
 
 #[derive(Clone, Copy)]

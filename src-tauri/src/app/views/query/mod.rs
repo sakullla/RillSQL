@@ -5,10 +5,19 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::{resizable_panel, v_resizable, ActiveTheme as _, Disableable as _, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, MouseButton,
+    AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
+
+use crate::ui::kit::{self, Palette, Tip as _};
 
 use crate::app::views::grid::{GridPane, GridTarget};
 use crate::application::AppServices;
@@ -46,6 +55,8 @@ pub struct TargetRequest {
 pub struct SyncEffect {
     pub drafts: Vec<(String, String)>,
     pub running: Vec<String>,
+    /// 每个标签最近一次真正执行过的 SQL。
+    pub executed: Vec<(String, String)>,
     pub opens: Vec<OpenRequest>,
     pub targets: Vec<TargetRequest>,
     pub selected_object: Option<String>,
@@ -62,8 +73,6 @@ pub struct QueryPane {
     opens: Vec<OpenRequest>,
     targets: Vec<TargetRequest>,
     variable_values: HashMap<String, String>,
-    variable_focus: Option<String>,
-    focus: FocusHandle,
     outline_open: bool,
     pending_completion: bool,
     pending_lint: Option<Vec<LintFinding>>,
@@ -78,6 +87,8 @@ pub struct QueryPane {
     fold_wait: Option<(String, String)>,
     painted: Option<(Option<String>, u64, usize)>,
     selected_object: Option<String>,
+    variable_inputs: HashMap<String, (Entity<InputState>, String, gpui_kit::Subscription)>,
+    grid_menu_requested: bool,
 }
 
 impl QueryPane {
@@ -94,8 +105,6 @@ impl QueryPane {
             opens: Vec::new(),
             targets: Vec::new(),
             variable_values: HashMap::new(),
-            variable_focus: None,
-            focus: cx.focus_handle(),
             outline_open: true,
             pending_completion: false,
             pending_lint: None,
@@ -110,7 +119,17 @@ impl QueryPane {
             fold_wait: None,
             painted: None,
             selected_object: None,
+            variable_inputs: HashMap::new(),
+            grid_menu_requested: false,
         }
+    }
+
+    pub fn tree_objects(&self) -> &[TreeObject] {
+        self.desk.objects()
+    }
+
+    pub fn tree_error(&self) -> &str {
+        self.desk.tree_error()
     }
 
     pub fn remember_environments(&mut self, pairs: Vec<(String, String)>) {
@@ -342,9 +361,11 @@ impl QueryPane {
             }
             drafts.push((tab.id.clone(), text));
         }
+        let executed = tabs.iter().filter_map(|tab| self.desk.executed_sql(&tab.id).map(|sql| (tab.id.clone(), sql))).collect();
         SyncEffect {
             drafts,
             running: self.desk.running_ids(),
+            executed,
             opens: std::mem::take(&mut self.opens),
             targets: std::mem::take(&mut self.targets),
             selected_object: self.selected_object.take(),
@@ -408,15 +429,6 @@ impl QueryPane {
         if self.desk.accept_lint(&self.services.tasks, &ticket, findings.clone()) {
             self.lint_seen = Some((id, version));
             self.pending_lint = Some(findings);
-        }
-    }
-
-    fn type_variable(&mut self, key: &str, text: &str) {
-        let slot = self.variable_values.entry(key.to_owned()).or_default();
-        if text == "backspace" {
-            slot.pop();
-        } else {
-            slot.push_str(text);
         }
     }
 
@@ -911,183 +923,373 @@ impl Render for QueryPane {
         self.refresh_folds(cx);
         self.sync_grid(cx);
         self.take_focus(window, cx);
+        let p = Palette::of(cx);
         let locale = self.locale;
-        let label = |key| SharedString::from(i18n::text(locale, key));
-        let objects = self.desk.objects().to_vec();
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let links = self.desk.links().to_vec();
         let databases = self.desk.databases().to_vec();
         let outline = self.desk.outline();
         let results = self.desk.results();
         let variables = self.desk.variables();
         let note = self.desk.active_note();
+        let target = self.desk.target();
+        let running = self.desk.active_id().is_some_and(|id| self.desk.running_ids().iter().any(|running| running == id));
         let editor = self.desk.active_id().and_then(|id| self.editors.get(id)).cloned();
         let grid = self.grid.clone();
-        let mut column = div().id("query-pane").flex().flex_col().size_full().gap(px(4.));
-        column = column.child(
-            div()
-                .id("query-toolbar")
-                .flex()
-                .gap(px(4.))
-                .child(action_button("run-script", label("query.run.runScript"), cx))
-                .child(action_button("request-cancel", label("shell.shortcuts.requestCancel"), cx))
-                .child(action_button("format", label("query.editor.menu.format"), cx))
-                .child(action_button("autocomplete", label("shell.shortcuts.autocomplete"), cx))
-                .child(action_button("explain", label("query.editor.menu.plan"), cx))
-                .child(action_button("expand-star", label("query.complete.expandStar"), cx))
-                .child(action_button("toggle-outline", label("query.outline.heading"), cx))
-                .child(action_button("open-sql-file", label("query.fileIo.open"), cx))
-                .child(action_button("save-sql-file", label("query.fileIo.save"), cx))
-                .child(action_button("refresh-tree", label("query.tree.refresh"), cx)),
-        );
-        if !links.is_empty() {
-            let mut row = div().id("query-connections").flex().gap(px(4.));
-            for link in links {
-                let id = link.id.clone();
-                let name = if link.name.is_empty() { id.clone() } else { link.name.clone() };
-                row = row.child(action_button(&format!("bind-connection:{id}"), SharedString::from(name), cx));
-            }
-            column = column.child(row);
-        }
-        if !databases.is_empty() {
-            let mut row = div().id("query-databases").flex().gap(px(4.));
-            for database in databases {
-                let name = database.clone();
-                row = row.child(action_button(&format!("database:{name}"), SharedString::from(name), cx));
-            }
-            column = column.child(row);
-        }
-        let mut body = div().id("query-body").flex().flex_1().gap(px(4.));
-        let mut tree = div().id("query-tree").flex().flex_col().w(px(180.));
-        let tree_error = self.desk.tree_error().to_owned();
-        if !tree_error.is_empty() {
-            tree = tree.child(SharedString::from(tree_error));
-        } else if objects.is_empty() {
-            tree = tree.child(label("query.status.noObjects"));
-        }
-        for object in &objects {
-            let key = format!("object:{}:{}", object.connection_id, object.name);
-            tree = tree.child(action_button(&key, SharedString::from(object.name.clone()), cx));
-        }
-        body = body.child(tree);
-        if let Some(editor) = editor {
-            body = body.child(div().id("query-editor").flex_1().child(editor));
+        let entity = cx.entity();
+
+        // ---- 工具条
+        let run: AnyElement = if running {
+            kit::danger_button("query-act-request-cancel", Some(IconName::Square), t("ui.query.stop"), pane_act("request-cancel", &entity)).into_any_element()
         } else {
-            body = body.child(div().id("query-editor-empty").flex_1().child(label("shell.statusbar.noTarget")));
+            kit::primary_button("query-act-execute-query", Some(IconName::Play), t("ui.query.run"), pane_act("execute-query", &entity))
+                .tooltip(SharedString::from(format!("{} · {}", i18n::text(locale, "shell.shortcuts.runSelection"), kit::shortcut("Ctrl+Enter"))))
+                .into_any_element()
+        };
+        let more_entity = entity.clone();
+        let more = Button::new("query-more")
+            .ghost()
+            .small()
+            .icon(IconName::Ellipsis)
+            .tooltip(t("ui.query.more"))
+            .accessibility_label(t("ui.query.more"))
+            .dropdown_menu(move |menu, _, _| {
+                let item = |id: &'static str, key: &str| {
+                    let entity = more_entity.clone();
+                    PopupMenuItem::new(i18n::text(locale, key)).on_click(move |_, _, cx| {
+                        entity.update(cx, |pane, cx| pane.command(id, cx));
+                    })
+                };
+                menu.item(item("run-current", "query.editor.menu.runCurrent"))
+                    .item(item("run-script", "query.run.runScript"))
+                    .separator()
+                    .item(item("autocomplete", "shell.shortcuts.autocomplete"))
+                    .item(item("expand-star", "query.complete.expandStar"))
+                    .item(item("toggle-outline", "query.outline.heading"))
+                    .separator()
+                    .item(item("open-sql-file", "query.fileIo.open"))
+                    .item(item("save-sql-file", "query.fileIo.save"))
+            });
+
+        let connection_label = target
+            .as_ref()
+            .map(|target| if target.connection_name.is_empty() { target.connection_id.clone() } else { target.connection_name.clone() })
+            .unwrap_or_else(|| i18n::text(locale, "ui.query.chooseConnection"));
+        let engine = target.as_ref().map(|target| target.engine.clone()).unwrap_or_default();
+        let conn_entity = entity.clone();
+        let conn_links = links.clone();
+        let mut conn_button = Button::new("query-connection")
+            .outline()
+            .small()
+            .label(SharedString::from(connection_label))
+            .dropdown_caret(true)
+            .accessibility_label(t("ui.query.chooseConnection"));
+        if target.is_some() {
+            conn_button = conn_button.icon(IconName::Database);
         }
-        if self.outline_open {
-            let mut list = div().id("query-outline").flex().flex_col().w(px(220.)).child(label("query.outline.heading"));
-            for item in outline {
-                list = list.child(SharedString::from(format!("{}. {}", item.index, item.preview)));
+        let connection_picker = conn_button.dropdown_menu(move |mut menu, _, _| {
+            if conn_links.is_empty() {
+                menu = menu.item(PopupMenuItem::new(i18n::text(locale, "ui.query.noConnection")).disabled(true));
             }
-            body = body.child(list);
+            for link in &conn_links {
+                let id = link.id.clone();
+                let entity = conn_entity.clone();
+                let name = if link.name.is_empty() { link.id.clone() } else { link.name.clone() };
+                menu = menu.item(PopupMenuItem::new(format!("{name}  ·  {}", kit::engine_label(&link.engine))).on_click(move |_, _, cx| {
+                    let id = id.clone();
+                    entity.update(cx, |pane, cx| pane.command(&format!("bind-connection:{id}"), cx));
+                }));
+            }
+            menu
+        });
+        let database_label = target.as_ref().map(|target| target.database.clone()).filter(|name| !name.is_empty()).unwrap_or_else(|| i18n::text(locale, "ui.query.chooseDatabase"));
+        let db_entity = entity.clone();
+        let db_list = databases.clone();
+        let database_picker = Button::new("query-database")
+            .outline()
+            .small()
+            .label(SharedString::from(database_label))
+            .dropdown_caret(true)
+            .disabled(databases.is_empty())
+            .accessibility_label(t("query.database.label"))
+            .dropdown_menu(move |mut menu, _, _| {
+                for database in &db_list {
+                    let name = database.clone();
+                    let entity = db_entity.clone();
+                    menu = menu.item(PopupMenuItem::new(name.clone()).on_click(move |_, _, cx| {
+                        let name = name.clone();
+                        entity.update(cx, |pane, cx| pane.command(&format!("database:{name}"), cx));
+                    }));
+                }
+                menu
+            });
+
+        let toolbar = div()
+            .id("query-toolbar")
+            .flex_none()
+            .h(px(42.))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .border_b_1()
+            .border_color(p.line)
+            .child(run)
+            .child(kit::vline(&p))
+            .child(kit::tool_button("query-act-format", Some(IconName::WandSparkles), t("query.editor.menu.format"), pane_act("format", &entity)))
+            .child(kit::tool_button("query-act-explain", Some(IconName::ChartNetwork), t("query.editor.menu.plan"), pane_act("explain", &entity)))
+            .child(more)
+            .child(div().flex_1())
+            .when(!engine.is_empty(), |this| this.child(kit::engine_badge(&engine, 18.)))
+            .child(connection_picker)
+            .child(kit::icon(IconName::ChevronRight, 13., p.text_faint))
+            .child(database_picker);
+
+        // ---- 编辑器 + 大纲
+        let mut editor_row = div().flex().size_full().min_h(px(0.));
+        if let Some(editor) = editor {
+            editor_row = editor_row.child(div().id("query-editor").flex_1().min_w(px(0.)).h_full().child(editor));
+        } else {
+            editor_row = editor_row.child(
+                div()
+                    .id("query-editor-empty")
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(kit::empty_state(IconName::SquareTerminal, t("shell.command.newQuery"), t("shell.statusbar.noTarget"), &p)),
+            );
         }
-        column = column.child(body);
+        if self.outline_open && outline.len() > 1 {
+            let mut list = div()
+                .id("query-outline")
+                .flex_none()
+                .w(px(220.))
+                .h_full()
+                .overflow_y_scroll()
+                .border_l_1()
+                .border_color(p.line)
+                .bg(p.chrome)
+                .p(px(8.))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(div().px(px(6.)).pb(px(6.)).child(kit::eyebrow(t("query.outline.heading"), &p)));
+            for item in outline {
+                let failed = item.status == "error" || item.status == "failed";
+                list = list.child(
+                    div()
+                        .px(px(6.))
+                        .py(px(4.))
+                        .rounded(px(6.))
+                        .flex()
+                        .gap(px(6.))
+                        .text_size(px(12.))
+                        .hover(|style| style.bg(p.hover))
+                        .child(div().flex_none().text_color(p.text_faint).child(SharedString::from(format!("{}", item.index))))
+                        .child(div().flex_1().min_w(px(0.)).truncate().font_family(cx.theme().mono_font_family.clone()).when(failed, |this| this.text_color(p.danger)).child(SharedString::from(item.preview))),
+                );
+            }
+            editor_row = editor_row.child(list);
+        }
+
+        // ---- 结果
+        let mut header = div()
+            .id("query-results-head")
+            .flex_none()
+            .h(px(34.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .bg(p.chrome)
+            .border_b_1()
+            .border_color(p.line);
+        if results.len() > 1 {
+            let current = self.desk.statement();
+            for (index, result) in results.iter().enumerate() {
+                let selected = index == current;
+                let failed = result.status == "error" || result.status == "failed";
+                let id = format!("statement:{index}");
+                let entity = entity.clone();
+                header = header.child(
+                    div()
+                        .id(SharedString::from(format!("query-act-statement-{index}")))
+                        .role(gpui_kit::Role::Tab)
+                        .aria_label(SharedString::from(format!("{} {}", i18n::text(locale, "query.results.statement"), index + 1)))
+                        .aria_selected(selected)
+                        .h(px(26.))
+                        .px(px(10.))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .rounded(px(6.))
+                        .text_size(px(12.))
+                        .cursor_pointer()
+                        .when(selected, |this| this.bg(p.surface).text_color(p.text).shadow_sm())
+                        .when(!selected, |this| this.text_color(p.text_muted).hover(|style| style.bg(p.hover)))
+                        .child(kit::status_dot(if failed { p.danger } else { p.ok }))
+                        .child(SharedString::from(format!("{} {}", i18n::text(locale, "query.results.statement"), index + 1)))
+                        .on_click(move |_, _, cx| {
+                            let id = id.clone();
+                            entity.update(cx, |pane, cx| pane.command(&id, cx));
+                        }),
+                );
+            }
+        } else {
+            header = header.child(div().px(px(6.)).child(kit::eyebrow(t("ui.query.results"), &p)));
+        }
+        let active_result = results.get(self.desk.statement()).or_else(|| results.first()).cloned();
+        let summary = active_result.as_ref().map(|result| {
+            if let Some(affected) = result.affected.filter(|_| result.columns.is_empty()) {
+                format!("{affected} ✓")
+            } else {
+                format!("{} {}", result.rows.len(), i18n::text(locale, "ui.grid.rows"))
+            }
+        });
+        let failed_note = active_result.as_ref().is_some_and(|result| result.status == "error" || result.status == "failed");
+        header = header.child(div().flex_1()).when(running, |this| {
+            this.child(div().flex().items_center().gap(px(6.)).text_size(px(12.)).text_color(p.text_muted).child(Spinner::new().xsmall().color(p.accent)).child(t("query.status.running")))
+        });
+        if !note.is_empty() {
+            header = header.child(
+                div()
+                    .id("query-note")
+                    .max_w(px(520.))
+                    .truncate()
+                    .px(px(6.))
+                    .text_size(px(12.))
+                    .text_color(if failed_note { p.danger } else { p.text_muted })
+                    .tooltip_text(SharedString::from(note.clone()))
+                    .child(SharedString::from(note.clone())),
+            );
+        }
+        if let Some(summary) = summary {
+            header = header.child(div().px(px(6.)).text_size(px(12.)).text_color(p.text_faint).child(SharedString::from(summary)));
+        }
+
+        let mut results_panel = div().id("query-results").flex().flex_col().size_full().bg(p.surface).child(header);
         if !variables.is_empty() {
-            let mut row = div().id("query-variables").flex().gap(px(4.)).child(label("query.variables.title"));
+            let mut row = div()
+                .id("query-variables")
+                .flex_none()
+                .p(px(10.))
+                .flex()
+                .flex_wrap()
+                .items_end()
+                .gap(px(10.))
+                .bg(p.accent_soft)
+                .border_b_1()
+                .border_color(p.line)
+                .child(div().flex().items_center().gap(px(6.)).h(px(30.)).child(kit::icon(IconName::Braces, 14., p.accent_text)).child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(t("query.variables.title"))));
             for field in &variables {
                 let value = self.variable_values.get(&field.key).cloned().unwrap_or_default();
-                row = row.child(variable_box(field.key.clone(), field.label.clone(), value, self.focus.clone(), cx));
+                let input = self.variable_input(&field.key, &value, window, cx);
+                row = row.child(div().w(px(180.)).child(kit::form_row(SharedString::from(field.label.clone()), kit::text_input(SharedString::from(format!("query-var-{}", field.key)), &input, SharedString::from(field.label.clone())).small(), &p)));
             }
-            row = row.child(action_button("confirm-variables", label("query.variables.proceed"), cx));
-            row = row.child(action_button("cancel-variables", label("query.variables.cancel"), cx));
-            column = column.child(row);
+            row = row
+                .child(kit::primary_button("query-act-confirm-variables", Some(IconName::Play), t("query.variables.proceed"), pane_act("confirm-variables", &entity)))
+                .child(kit::secondary_button("query-act-cancel-variables", None, t("query.variables.cancel"), pane_act("cancel-variables", &entity)));
+            results_panel = results_panel.child(row);
         }
-        if results.len() > 1 {
-            let mut row = div().id("query-statements").flex().gap(px(4.));
-            for index in 0..results.len() {
-                let caption = SharedString::from(format!("{} {}", i18n::text(locale, "query.results.statement"), index + 1));
-                row = row.child(action_button(&format!("statement:{index}"), caption, cx));
-            }
-            column = column.child(row);
-        }
-        if !note.is_empty() {
-            column = column.child(SharedString::from(note));
-        }
+        let grid_entity = entity.clone();
         if results.is_empty() {
-            column = column.child(label("query.status.empty"));
+            results_panel = results_panel.child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(kit::empty_state(IconName::Table, t("ui.query.results"), t("ui.query.noResults"), &p).child(div().flex().gap(px(6.)).child(kit::kbd(kit::shortcut("Ctrl+Enter"), &p)))),
+            );
+        } else if active_result.as_ref().is_some_and(|result| result.columns.is_empty()) {
+            let result = active_result.clone().unwrap_or_else(|| results[0].clone());
+            let ok = !(result.status == "error" || result.status == "failed");
+            let message = if result.message.is_empty() { note.clone() } else { result.message.clone() };
+            results_panel = results_panel.child(
+                div()
+                    .flex_1()
+                    .p(px(16.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .text_color(if ok { p.ok } else { p.danger })
+                            .child(kit::icon(if ok { IconName::CircleCheck } else { IconName::CircleAlert }, 16., if ok { p.ok } else { p.danger }))
+                            .child(SharedString::from(if message.is_empty() { result.status.clone() } else { message })),
+                    )
+                    .child(div().font_family(cx.theme().mono_font_family.clone()).text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(result.sql.clone()))),
+            );
         } else {
-            column = column.child(div().id("query-results").h(px(220.)).child(grid));
+            results_panel = results_panel.child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                        grid_entity.update(cx, |pane, _| pane.grid_menu_requested = true);
+                    })
+                    .child(grid),
+            );
         }
-        column
+
+        div()
+            .id("query-pane")
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(toolbar)
+            .child(
+                div().flex_1().min_h(px(0.)).child(
+                    v_resizable("query-split")
+                        .child(resizable_panel().size_range(px(120.)..px(4000.)).child(editor_row))
+                        .child(resizable_panel().size(px(300.)).size_range(px(90.)..px(4000.)).child(results_panel)),
+                ),
+            )
     }
 }
 
-fn variable_box(key: String, name: String, value: String, focus: FocusHandle, cx: &mut Context<QueryPane>) -> impl IntoElement {
-    let label = SharedString::from(format!("{name} {value}"));
-    let entity = cx.entity();
-    let typed = key.clone();
-    div()
-        .id(SharedString::from(format!("query-var-{key}")))
-        .track_focus(&focus)
-        .role(gpui_kit::Role::TextInput)
-        .aria_label(label.clone())
-        .child(label)
-        .on_mouse_down(MouseButton::Left, {
-            let entity = entity.clone();
-            let focus = focus.clone();
-            let key = key.clone();
-            move |_, window, cx| {
-                window.focus(&focus, cx);
-                entity.update(cx, |pane, cx| {
-                    pane.variable_focus = Some(key.clone());
-                    cx.notify();
-                });
+fn pane_act(id: &'static str, entity: &Entity<QueryPane>) -> impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static {
+    let entity = entity.clone();
+    move |_, _, cx| {
+        entity.update(cx, |pane, cx| pane.command(id, cx));
+    }
+}
+
+impl QueryPane {
+    fn variable_input(&mut self, key: &str, value: &str, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        if let Some((state, last, _)) = self.variable_inputs.get_mut(key) {
+            let state = state.clone();
+            kit::sync_text(&state, last, value, window, cx);
+            return state;
+        }
+        let initial = SharedString::from(value.to_owned());
+        let state = cx.new(|cx| InputState::new(window, cx).default_value(initial));
+        let owned = key.to_owned();
+        let subscription = cx.subscribe(&state, move |this, state, event: &InputEvent, cx| {
+            match event {
+                InputEvent::Change => {
+                    let text = state.read(cx).value().to_string();
+                    this.variable_values.insert(owned.clone(), text);
+                }
+                InputEvent::PressEnter { .. } => this.command("confirm-variables", cx),
+                _ => {}
             }
-        })
-        .on_key_down(move |event: &gpui_kit::KeyDownEvent, _, cx| {
-            let Some(text) = typed_text(event) else { return };
-            let typed = typed.clone();
-            entity.update(cx, |pane, cx| {
-                if pane.variable_focus.as_deref() == Some(typed.as_str()) {
-                    pane.type_variable(&typed, &text);
-                    cx.notify();
-                }
-            });
-        })
-}
-
-fn typed_text(event: &gpui_kit::KeyDownEvent) -> Option<String> {
-    if event.keystroke.modifiers.control || event.keystroke.modifiers.platform || event.keystroke.modifiers.alt {
-        return None;
+        });
+        self.variable_inputs.insert(key.to_owned(), (state.clone(), value.to_owned(), subscription));
+        state
     }
-    match event.keystroke.key.as_str() {
-        "backspace" => Some("backspace".into()),
-        "escape" | "enter" | "tab" | "up" | "down" | "left" | "right" => None,
-        _ => event.keystroke.key_char.clone().filter(|text| !text.is_empty()),
+
+    /// 结果表格上的右键：外壳据此打开表格菜单而不是编辑器菜单。
+    pub fn take_grid_menu_request(&mut self) -> bool {
+        std::mem::take(&mut self.grid_menu_requested)
     }
 }
 
-fn action_button(id: &str, label: SharedString, cx: &mut Context<QueryPane>) -> impl IntoElement {
-    let command = id.to_owned();
-    let entity = cx.entity();
-    div()
-        .id(SharedString::from(format!("query-act-{}", id.replace(':', "-"))))
-        .role(gpui_kit::Role::Button)
-        .aria_label(label.clone())
-        .child(label)
-        .on_click(move |_, _, cx| {
-            let command = command.clone();
-            entity.update(cx, |pane, cx| {
-                if let Some(database) = command.strip_prefix("database:") {
-                    pane.queue_database(database);
-                    cx.notify();
-                    return;
-                }
-                if let Some(rest) = command.strip_prefix("object:") {
-                    if let Some(object) = pane.desk.objects().iter().find(|object| format!("{}:{}", object.connection_id, object.name) == rest).cloned() {
-                        let spec = object_spec(&object, &pane.desk.environment_of(&object.connection_id));
-                        pane.selected_object = Some(spec);
-                        pane.queue_object(&object);
-                        cx.notify();
-                    }
-                    return;
-                }
-                pane.command(&command, cx);
-            });
-        })
-}
-
-fn object_spec(object: &TreeObject, environment: &str) -> String {
+pub fn object_spec(object: &TreeObject, environment: &str) -> String {
     format!(
         "{}|{}|{}|{}|{}|{}|{}",
         object.connection_id, object.connection_name, object.database, object.schema, object.name, object.engine, environment
@@ -1277,6 +1479,15 @@ mod tests {
         });
         let note = cx.update(|cx| view.read(cx).query_note(cx));
         assert!(landed, "真实 SELECT 没有回到结果表：{note}");
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |view, _| {
+                let tab = view.model.active_tab().expect("bound query").clone();
+                assert_eq!(tab.last_executed_sql.as_deref(), Some(tab.draft.as_str()), "执行过的 SQL 没有记到标签上");
+                assert!(view.model.allow_system_close(), "执行过的查询仍被当成未执行草稿，关闭按钮会被拦下");
+            });
+        })
+        .unwrap();
         let runs = cx.update(|cx| view.read(cx).query_runs(cx));
         cx.update_window(window, |_, window, cx| {
             view.update(cx, |view, _| view.model.tabs[0].draft = "SELECT 'only-draft'".into());

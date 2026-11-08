@@ -2,8 +2,13 @@
 
 use std::sync::Arc;
 
+use gpui_kit::assets::IconName;
+use gpui_kit::component::input::InputState;
+use gpui_kit::component::{ActiveTheme as _, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
+use crate::ui::kit::{self, FieldSpec, Fields, Palette};
 use gpui_kit::{
-    ClipboardItem, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    ClipboardItem, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
 };
 
@@ -13,7 +18,7 @@ use crate::i18n::{self, Locale};
 use crate::redis::exec::{self, CommandRisk, RespReply};
 use crate::redis::keys::{RedisKeyDetail, RedisKeyInfo, RedisValue, ScanPage};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Field {
     Pattern,
     Ttl,
@@ -63,10 +68,7 @@ pub struct RedisPane {
     pending_ttl: Option<i64>,
     ttl_was_persist: bool,
     focused: Option<Field>,
-    pattern_focus: Option<FocusHandle>,
-    ttl_focus: Option<FocusHandle>,
-    rename_focus: Option<FocusHandle>,
-    command_focus: Option<FocusHandle>,
+    fields: Fields<Field>,
 }
 
 impl RedisPane {
@@ -100,10 +102,7 @@ impl RedisPane {
             pending_ttl: None,
             ttl_was_persist: false,
             focused: None,
-            pattern_focus: None,
-            ttl_focus: None,
-            rename_focus: None,
-            command_focus: None,
+            fields: Fields::default(),
         }
     }
 
@@ -630,50 +629,6 @@ impl RedisPane {
         )
     }
 
-    fn focus_of(&mut self, field: Field, cx: &mut Context<Self>) -> FocusHandle {
-        let slot = match field {
-            Field::Pattern => &mut self.pattern_focus,
-            Field::Ttl => &mut self.ttl_focus,
-            Field::Rename => &mut self.rename_focus,
-            Field::Command => &mut self.command_focus,
-        };
-        if slot.is_none() {
-            *slot = Some(cx.focus_handle());
-        }
-        slot.clone().unwrap()
-    }
-
-    fn apply_key(&mut self, field: Field, action: KeyAction, cx: &mut Context<Self>) {
-        if self.focused != Some(field) {
-            return;
-        }
-        // 确认期间重命名框和命令框保持打开时的文本，避免确认落到后改的目标上。
-        if self.confirm.is_some() && matches!(field, Field::Rename | Field::Command) {
-            return;
-        }
-        let slot = match field {
-            Field::Pattern => &mut self.pattern,
-            Field::Ttl => &mut self.ttl_input,
-            Field::Rename => &mut self.rename_to,
-            Field::Command => &mut self.command_input,
-        };
-        match action {
-            KeyAction::Ignore => {}
-            KeyAction::Backspace => {
-                slot.pop();
-            }
-            KeyAction::Type(text) => slot.push_str(&text),
-            KeyAction::Commit => {
-                let id = match field {
-                    Field::Pattern => "redis-filter",
-                    Field::Ttl => "redis-ttl",
-                    Field::Rename => "redis-rename",
-                    Field::Command => "redis-exec",
-                };
-                self.command(id, cx);
-            }
-        }
-    }
 }
 
 pub fn split_commandline(line: &str) -> (String, Vec<String>) {
@@ -803,128 +758,308 @@ fn describe_ttl(locale: Locale, ttl_ms: Option<i64>) -> String {
     }
 }
 
-enum KeyAction {
-    Ignore,
-    Backspace,
-    Type(String),
-    Commit,
-}
-
-fn key_action(event: &gpui_kit::KeyDownEvent) -> KeyAction {
-    if event.keystroke.modifiers.control || event.keystroke.modifiers.platform || event.keystroke.modifiers.alt {
-        return KeyAction::Ignore;
-    }
-    match event.keystroke.key.as_str() {
-        "backspace" => KeyAction::Backspace,
-        "enter" => KeyAction::Commit,
-        "escape" | "tab" | "up" | "down" | "left" | "right" => KeyAction::Ignore,
-        _ => event.keystroke.key_char.clone().filter(|text| !text.is_empty()).map(KeyAction::Type).unwrap_or(KeyAction::Ignore),
-    }
-}
-
 impl Render for RedisPane {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let entity = cx.entity().clone();
-        let pattern_focus = self.focus_of(Field::Pattern, cx);
-        let ttl_focus = self.focus_of(Field::Ttl, cx);
-        let rename_focus = self.focus_of(Field::Rename, cx);
-        let command_focus = self.focus_of(Field::Command, cx);
-        let mut column = div().id("redis-pane").flex().flex_col();
-        column = column.child(SharedString::from(format!("{} / {}", self.connection_name, self.database)));
-        column = column.child(input_box("redis-pattern", &self.text("redis.tab.patternLabel"), &self.pattern, pattern_focus, Field::Pattern, entity.clone()));
-        column = column.child(button("redis-filter", &self.text("redis.tab.filter"), entity.clone()));
-        column = column.child(button("redis-refresh", &self.text("redis.tab.refresh"), entity.clone()));
-        column = column.child(button("redis-more", &self.text("redis.tab.loadMore"), entity.clone()));
-        if self.done {
-            column = column.child(SharedString::from(self.text("redis.tab.scanDone")));
-        }
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = Palette::of(cx);
+        let entity = cx.entity();
+        let mono = cx.theme().mono_font_family.clone();
+        let pattern = self.redis_input(Field::Pattern, "redis-pattern", "redis.tab.patternLabel", "user:*", window, cx);
+        let ttl = self.redis_input(Field::Ttl, "redis-ttl-field", "redis.tab.ttlLabel", "3600", window, cx);
+        let rename = self.redis_input(Field::Rename, "redis-rename-field", "redis.tab.rename", "new:key", window, cx);
+        let command = self.redis_input(Field::Command, "redis-command", "redis.tab.commandLabel", "GET key", window, cx);
+
+        // ---- 左侧：键列表
+        let mut list = div().id("redis-keys").flex().flex_col().flex_1().min_h(px(0.)).overflow_y_scroll().p(px(6.));
         if self.keys.is_empty() {
-            column = column.child(SharedString::from(self.text("redis.tab.emptyList")));
+            list = list.child(div().p(px(14.)).text_size(px(12.5)).text_color(p.text_faint).child(SharedString::from(self.text("redis.tab.emptyList"))));
         }
-        for (index, key) in self.keys.iter().take(200).enumerate() {
+        for (index, key) in self.keys.iter().take(500).enumerate() {
+            let selected = key.name == self.selected;
+            let id = format!("redis-select:{index}");
             let label = format!("{} {} {}", key.key_type, key.name, describe_ttl(self.locale, key.ttl_ms));
-            column = column.child(button_owned(format!("redis-select:{index}"), label, entity.clone()));
+            let (fg, bg) = type_colors(&key.key_type, &p);
+            let entity = entity.clone();
+            list = list.child(
+                div()
+                    .id(SharedString::from(id.clone()))
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(SharedString::from(label))
+                    .aria_selected(selected)
+                    .h(px(30.))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .when(selected, |this| this.bg(p.selection))
+                    .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
+                    .child(div().flex_none().w(px(44.)).child(kit::pill(SharedString::from(key.key_type.clone()), fg, bg)))
+                    .child(div().flex_1().min_w(px(0.)).truncate().font_family(mono.clone()).text_size(px(12.5)).child(SharedString::from(key.name.clone())))
+                    .when(key.ttl_ms.is_some_and(|ttl| ttl >= 0), |this| this.child(kit::icon(IconName::Timer, 12., p.text_faint)))
+                    .on_click(move |_, _, cx| {
+                        let id = id.clone();
+                        entity.update(cx, |pane, cx| pane.command(&id, cx));
+                    }),
+            );
         }
-        column = column.child(SharedString::from(if self.selected.is_empty() { self.text("redis.tab.pickKey") } else { self.detail_text() }));
-        column = column.child(input_box("redis-ttl-field", &self.text("redis.tab.ttlLabel"), &self.ttl_input, ttl_focus, Field::Ttl, entity.clone()));
-        column = column.child(button("redis-ttl", &self.text("redis.tab.setTtl"), entity.clone()));
-        column = column.child(input_box("redis-rename-field", &self.text("redis.tab.rename"), &self.rename_to, rename_focus, Field::Rename, entity.clone()));
-        column = column.child(button("redis-rename", &self.text("redis.tab.rename"), entity.clone()));
-        column = column.child(button("redis-delete", &self.text("redis.tab.remove"), entity.clone()));
-        column = column.child(button("redis-copy", &self.text("redis.value.value"), entity.clone()));
-        column = column.child(input_box("redis-command", &self.text("redis.tab.commandLabel"), &self.command_input, command_focus, Field::Command, entity.clone()));
-        column = column.child(button("redis-exec", &self.text("redis.tab.execute"), entity.clone()));
+        let left = div()
+            .flex_none()
+            .w(px(320.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(p.chrome)
+            .border_r_1()
+            .border_color(p.line)
+            .child(
+                div()
+                    .p(px(10.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(kit::engine_badge("redis", 20.))
+                            .child(div().flex_1().min_w(px(0.)).truncate().font_weight(FontWeight::SEMIBOLD).child(SharedString::from(self.connection_name.clone())))
+                            .child(kit::pill(SharedString::from(format!("db {}", self.database)), p.text_muted, p.hover)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(4.))
+                            .child(div().flex_1().child(kit::text_input("redis-pattern", &pattern, self.text("redis.tab.patternLabel")).small().prefix(kit::icon(IconName::Search, 13., p.text_faint))))
+                            .child(redis_button("redis-filter", Some(IconName::ListFilter), &self.text("redis.tab.filter"), Kind::Tool, &entity))
+                            .child(redis_icon("redis-refresh", IconName::RefreshCw, &self.text("redis.tab.refresh"), &entity)),
+                    ),
+            )
+            .child(list)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px(px(10.))
+                    .py(px(6.))
+                    .border_t_1()
+                    .border_color(p.line)
+                    .child(div().text_size(px(11.5)).text_color(p.text_faint).child(SharedString::from(if self.done { self.text("redis.tab.scanDone") } else { format!("{} keys", self.keys.len()) })))
+                    .child(redis_button("redis-more", Some(IconName::ChevronsDown), &self.text("redis.tab.loadMore"), Kind::Tool, &entity)),
+            );
+
+        // ---- 右侧：键详情
+        let mut detail = div().flex().flex_col().gap(px(14.)).p(px(18.)).flex_1().min_h(px(0.));
+        if self.selected.is_empty() {
+            detail = detail.child(div().flex_1().flex().items_center().justify_center().child(kit::empty_state(IconName::Key, SharedString::from(self.text("redis.open")), SharedString::from(self.text("redis.tab.pickKey")), &p)));
+        } else {
+            let (type_name, ttl_text) = self
+                .detail
+                .as_ref()
+                .map(|detail| (detail.key_type.clone(), describe_ttl(self.locale, detail.ttl_ms)))
+                .unwrap_or_default();
+            let (fg, bg) = type_colors(&type_name, &p);
+            detail = detail
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(kit::pill(SharedString::from(type_name.clone()), fg, bg))
+                        .child(div().flex_1().min_w(px(0.)).truncate().font_family(mono.clone()).text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(SharedString::from(self.selected.clone())))
+                        .child(div().flex().items_center().gap(px(4.)).text_size(px(12.)).text_color(p.text_muted).child(kit::icon(IconName::Timer, 13., p.text_faint)).child(SharedString::from(ttl_text)))
+                        .child(redis_button("redis-copy", Some(IconName::Copy), &self.text("redis.value.value"), Kind::Tool, &entity))
+                        .child(redis_button("redis-delete", Some(IconName::Trash), &self.text("redis.tab.remove"), Kind::Danger, &entity)),
+                )
+                .child(
+                    div()
+                        .id("redis-value")
+                        .flex_1()
+                        .min_h(px(120.))
+                        .overflow_y_scroll()
+                        .p(px(14.))
+                        .rounded(px(10.))
+                        .bg(p.chrome)
+                        .border_1()
+                        .border_color(p.line)
+                        .font_family(mono.clone())
+                        .text_size(px(12.5))
+                        .child(SharedString::from(self.detail.as_ref().map(|detail| format_value(&detail.value, self.locale)).unwrap_or_default())),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(12.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .items_end()
+                                .gap(px(6.))
+                                .child(div().flex_1().child(kit::form_row(SharedString::from(self.text("redis.tab.ttlLabel")), kit::text_input("redis-ttl-field", &ttl, self.text("redis.tab.ttlLabel")).small(), &p)))
+                                .child(redis_button("redis-ttl", Some(IconName::Timer), &self.text("redis.tab.setTtl"), Kind::Secondary, &entity)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .items_end()
+                                .gap(px(6.))
+                                .child(div().flex_1().child(kit::form_row(SharedString::from(self.text("redis.tab.rename")), kit::text_input("redis-rename-field", &rename, self.text("redis.tab.rename")).small(), &p)))
+                                .child(redis_button("redis-rename", Some(IconName::Pencil), &self.text("redis.tab.rename"), Kind::Secondary, &entity)),
+                        ),
+                );
+        }
+        if self.selected.is_empty() {
+            // 操作按钮常驻，便于键盘与测试定位；没有选中键时它们只给出提示。
+            detail = detail.child(
+                div()
+                    .hidden()
+                    .child(redis_button("redis-copy", None, &self.text("redis.value.value"), Kind::Tool, &entity))
+                    .child(redis_button("redis-delete", None, &self.text("redis.tab.remove"), Kind::Danger, &entity))
+                    .child(redis_button("redis-ttl", None, &self.text("redis.tab.setTtl"), Kind::Secondary, &entity))
+                    .child(redis_button("redis-rename", None, &self.text("redis.tab.rename"), Kind::Secondary, &entity))
+                    .child(kit::text_input("redis-ttl-field", &ttl, self.text("redis.tab.ttlLabel")))
+                    .child(kit::text_input("redis-rename-field", &rename, self.text("redis.tab.rename"))),
+            );
+        }
+
+        // ---- 底部：命令行与状态
+        let mut console = div()
+            .flex_none()
+            .p(px(10.))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .border_t_1()
+            .border_color(p.line)
+            .bg(p.chrome)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(kit::icon(IconName::SquareTerminal, 15., p.text_muted))
+                    .child(div().flex_1().child(kit::text_input("redis-command", &command, self.text("redis.tab.commandLabel")).small()))
+                    .child(redis_button("redis-exec", Some(IconName::Play), &self.text("redis.tab.execute"), Kind::Primary, &entity)),
+            );
         if self.confirm.is_some() {
-            column = column.child(SharedString::from(self.confirm_prompt.clone()));
-            column = column.child(button("redis-confirm", &self.text("redis.tab.confirmExecute"), entity.clone()));
-            column = column.child(button("redis-cancel", &i18n::text(self.locale, "common.cancel"), entity.clone()));
+            console = console.child(
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .rounded(px(8.))
+                    .bg(p.danger_soft)
+                    .text_color(p.danger)
+                    .child(kit::icon(IconName::TriangleAlert, 15., p.danger))
+                    .child(div().flex_1().min_w(px(0.)).text_size(px(12.5)).child(SharedString::from(self.confirm_prompt.clone())))
+                    .child(redis_button("redis-cancel", None, &i18n::text(self.locale, "common.cancel"), Kind::Secondary, &entity))
+                    .child(redis_button("redis-confirm", Some(IconName::Check), &self.text("redis.tab.confirmExecute"), Kind::Danger, &entity)),
+            );
         }
-        column = column.child(
+        let status_text = if self.error.is_empty() { self.note.clone() } else { self.error.clone() };
+        console = console.child(
             div()
                 .id("redis-status")
                 .test_support()
                 .role(gpui_kit::Role::Status)
                 .aria_label(SharedString::from(self.status_line()))
-                .child(SharedString::from(if self.error.is_empty() { self.note.clone() } else { self.error.clone() })),
+                .min_h(px(16.))
+                .text_size(px(12.))
+                .text_color(if self.error.is_empty() { p.text_muted } else { p.danger })
+                .child(SharedString::from(status_text)),
         );
-        column
+
+        div()
+            .id("redis-pane")
+            .size_full()
+            .flex()
+            .child(left)
+            .child(div().flex_1().min_w(px(0.)).h_full().flex().flex_col().child(detail).child(console))
     }
 }
 
-fn button(id: &'static str, label: &str, entity: Entity<RedisPane>) -> impl IntoElement {
+#[derive(Clone, Copy)]
+enum Kind {
+    Primary,
+    Secondary,
+    Tool,
+    Danger,
+}
+
+impl RedisPane {
+    fn redis_input(&mut self, field: Field, _id: &'static str, label_key: &str, placeholder: &str, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        let value = match field {
+            Field::Pattern => self.pattern.clone(),
+            Field::Ttl => self.ttl_input.clone(),
+            Field::Rename => self.rename_to.clone(),
+            Field::Command => self.command_input.clone(),
+        };
+        let _ = label_key;
+        self.fields.bind_enter(
+            field,
+            &value,
+            FieldSpec { placeholder, masked: false },
+            window,
+            cx,
+            |this: &mut Self, field, value, _| {
+                // 确认期间重命名框和命令框保持打开时的文本，避免确认落到后改的目标上。
+                if this.confirm.is_some() && matches!(field, Field::Rename | Field::Command) {
+                    return;
+                }
+                this.focused = Some(field);
+                match field {
+                    Field::Pattern => this.pattern = value,
+                    Field::Ttl => this.ttl_input = value,
+                    Field::Rename => this.rename_to = value,
+                    Field::Command => this.command_input = value,
+                }
+            },
+            Some(|this: &mut Self, field, cx| {
+                let id = match field {
+                    Field::Pattern => "redis-filter",
+                    Field::Ttl => "redis-ttl",
+                    Field::Rename => "redis-rename",
+                    Field::Command => "redis-exec",
+                };
+                this.command(id, cx);
+            }),
+        )
+    }
+}
+
+fn type_colors(kind: &str, p: &Palette) -> (gpui_kit::Hsla, gpui_kit::Hsla) {
+    match kind {
+        "string" => (p.info, p.accent_soft),
+        "hash" => (p.ok, p.ok_soft),
+        "list" => (p.warn, p.warn_soft),
+        "set" => (p.accent_text, p.accent_soft),
+        "zset" => (p.danger, p.danger_soft),
+        _ => (p.text_muted, p.hover),
+    }
+}
+
+fn redis_button(id: &'static str, icon: Option<IconName>, label: &str, kind: Kind, entity: &Entity<RedisPane>) -> gpui_kit::component::button::Button {
+    let entity = entity.clone();
+    let click = move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| entity.update(cx, |pane, cx| pane.command(id, cx));
     let label = SharedString::from(label.to_owned());
-    div()
-        .id(id)
-        .test_support()
-        .role(gpui_kit::Role::Button)
-        .aria_label(label.clone())
-        .child(label)
-        .on_click(move |_, _, cx| {
-            entity.update(cx, |pane, cx| pane.command(id, cx));
-        })
+    match kind {
+        Kind::Primary => kit::primary_button(id, icon, label, click),
+        Kind::Secondary => kit::secondary_button(id, icon, label, click),
+        Kind::Tool => kit::tool_button(id, icon, label, click),
+        Kind::Danger => kit::danger_button(id, icon, label, click),
+    }
 }
 
-fn button_owned(id: String, label: String, entity: Entity<RedisPane>) -> impl IntoElement {
-    let command = SharedString::from(id.clone());
-    let label = SharedString::from(label);
-    div()
-        .id(SharedString::from(id))
-        .test_support()
-        .role(gpui_kit::Role::Button)
-        .aria_label(label.clone())
-        .child(label)
-        .on_click(move |_, _, cx| {
-            let command = command.to_string();
-            entity.update(cx, |pane, cx| pane.command(&command, cx));
-        })
-}
-
-fn input_box(id: &'static str, caption: &str, value: &str, focus: FocusHandle, field: Field, entity: Entity<RedisPane>) -> impl IntoElement {
-    let label = SharedString::from(format!("{caption} {value}"));
-    div()
-        .id(id)
-        .test_support()
-        .track_focus(&focus)
-        .min_h(px(28.))
-        .w(px(360.))
-        .role(gpui_kit::Role::TextInput)
-        .aria_label(label.clone())
-        .child(label)
-        .on_mouse_down(gpui_kit::MouseButton::Left, {
-            let entity = entity.clone();
-            let focus = focus.clone();
-            move |_, window, cx| {
-                window.focus(&focus, cx);
-                entity.update(cx, |pane, cx| {
-                    pane.focused = Some(field);
-                    cx.notify();
-                });
-            }
-        })
-        .on_key_down(move |event: &gpui_kit::KeyDownEvent, _, cx| {
-            let action = key_action(event);
-            entity.update(cx, |pane, cx| pane.apply_key(field, action, cx));
-        })
+fn redis_icon(id: &'static str, icon: IconName, label: &str, entity: &Entity<RedisPane>) -> gpui_kit::component::button::Button {
+    let entity = entity.clone();
+    kit::icon_button(id, icon, SharedString::from(label.to_owned()), move |_, _, cx| entity.update(cx, |pane, cx| pane.command(id, cx)))
 }
 
 #[cfg(test)]

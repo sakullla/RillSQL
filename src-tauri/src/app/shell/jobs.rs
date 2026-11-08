@@ -32,6 +32,8 @@ pub struct JobRequest {
 
 pub enum JobDone {
     Rows(TaskToken, Result<Vec<crate::connections::ConnectionRecord>, String>),
+    /// 保存成功：新列表和刚保存的连接 id，界面据此选中它。
+    Saved(TaskToken, String, Result<Vec<crate::connections::ConnectionRecord>, String>),
     Test(TaskToken, Result<crate::connections::stages::TestReport, String>),
     Open(TaskToken, Result<crate::connections::OpenOutcome, String>),
     Disconnect(TaskToken, String),
@@ -102,7 +104,7 @@ pub async fn execute_job(services: &AppServices, request: JobRequest) -> JobDone
                 return JobDone::Notice(token, Err("connections.editor.newTitle".into()));
             };
             match connections::save_draft(services, draft, &request.secrets).await {
-                Ok(_) => JobDone::Rows(token, connections::list_rows(services).await),
+                Ok(outcome) => JobDone::Saved(token, outcome.connection.id, connections::list_rows(services).await),
                 Err(err) => JobDone::Notice(token, Err(err)),
             }
         }
@@ -204,7 +206,19 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
                 model.welcome.has_connections = !model.connections.rows.is_empty();
             }
         }
-        JobDone::Rows(token, Err(detail)) | JobDone::Notice(token, Err(detail)) => {
+        JobDone::Saved(token, id, Ok(rows)) => {
+            if owner == "connections" && model.connections.accept_list(&services.tasks, token, rows) {
+                model.welcome.has_connections = !model.connections.rows.is_empty();
+                model.connections.selected = Some(id.clone());
+                if let Some(editor) = model.connections.editor.as_mut() {
+                    editor.id = Some(id);
+                }
+                model.connections.message_key = None;
+                model.notice_key = Some("common.save");
+                model.notice_detail.clear();
+            }
+        }
+        JobDone::Rows(token, Err(detail)) | JobDone::Saved(token, _, Err(detail)) | JobDone::Notice(token, Err(detail)) => {
             if owner == "connections" && model.connections.accept_notice(&services.tasks, token, detail.clone()) {
                 model.notice_key = Some(static_notice(&detail));
                 model.notice_detail = model.connections.message_detail.clone();

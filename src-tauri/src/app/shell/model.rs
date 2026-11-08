@@ -44,7 +44,7 @@ pub struct QueryTab {
     pub engine: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DraftField {
     Name,
     Host,
@@ -455,6 +455,10 @@ impl WorkbenchModel {
                     _ => 0,
                 };
             }
+            "timeout-0" => self.settings.query_timeout_sec = 0,
+            "timeout-15" => self.settings.query_timeout_sec = 15,
+            "timeout-60" => self.settings.query_timeout_sec = 60,
+            "null-NULL" | "null-empty" | "null-N" => self.settings.null_copy = id.trim_start_matches("null-").to_owned(),
             "page-size-up" => self.settings.page_size = (self.settings.page_size + 50).clamp(1, 10_000),
             "preview-up" => self.settings.preview_kb = (self.settings.preview_kb + 1).clamp(1, 64),
             "tree-open-data" | "tree-copy-name" | "tree-select-sql" => self.tree_action(id),
@@ -1046,7 +1050,7 @@ impl WorkbenchModel {
         self.set_field(field, current);
     }
 
-    fn field_value(&self, field: DraftField) -> String {
+    pub(crate) fn field_value(&self, field: DraftField) -> String {
         match field {
             DraftField::Password => self.connections.secrets.password.clone(),
             DraftField::SshPassword => self.connections.secrets.ssh_password.clone(),

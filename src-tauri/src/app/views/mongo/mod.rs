@@ -2,10 +2,17 @@
 
 use std::sync::Arc;
 
+use gpui_kit::assets::IconName;
+use gpui_kit::component::input::{Editor, EditorState, InputEvent};
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::{ActiveTheme as _, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    ClipboardItem, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
+    AnyElement, AppContext as _, ClipboardItem, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px, relative,
 };
+
+use crate::ui::kit::{self, FieldSpec, Fields, Palette};
 
 use crate::application::mongo::{DeleteOutcome, InsertOutcome, ReplaceOutcome};
 use crate::application::AppServices;
@@ -14,7 +21,7 @@ use crate::mongo::docs::{CollectionSummary, DatabaseSummary, DocumentsPage, Mong
 
 const PAGE_LIMIT: u64 = 20;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Field {
     Filter,
     Editor,
@@ -65,8 +72,8 @@ pub struct MongoPane {
     generation: u64,
     copied: String,
     focused: Option<Field>,
-    filter_focus: Option<FocusHandle>,
-    editor_focus: Option<FocusHandle>,
+    fields: Fields<Field>,
+    editor_state: Option<(Entity<EditorState>, String, gpui_kit::Subscription)>,
 }
 
 impl MongoPane {
@@ -104,8 +111,8 @@ impl MongoPane {
             generation: 0,
             copied: String::new(),
             focused: None,
-            filter_focus: None,
-            editor_focus: None,
+            fields: Fields::default(),
+            editor_state: None,
         }
     }
 
@@ -636,38 +643,6 @@ impl MongoPane {
             view = self.view_json.replace('\n', " "),
         )
     }
-
-    fn focus_of(&mut self, field: Field, cx: &mut Context<Self>) -> FocusHandle {
-        let slot = match field {
-            Field::Filter => &mut self.filter_focus,
-            Field::Editor => &mut self.editor_focus,
-        };
-        if slot.is_none() {
-            *slot = Some(cx.focus_handle());
-        }
-        slot.clone().unwrap()
-    }
-
-    fn apply_key(&mut self, field: Field, action: KeyAction, cx: &mut Context<Self>) {
-        if self.focused != Some(field) {
-            return;
-        }
-        let slot = match field {
-            Field::Filter => &mut self.filter_input,
-            Field::Editor => &mut self.editor_text,
-        };
-        match action {
-            KeyAction::Ignore => {}
-            KeyAction::Backspace => {
-                slot.pop();
-            }
-            KeyAction::Type(text) => slot.push_str(&text),
-            KeyAction::Commit => {
-                let id = if field == Field::Filter { "mongo-filter" } else { "mongo-save" };
-                self.command(id, cx);
-            }
-        }
-    }
 }
 
 pub fn columns_of(documents: &[MongoDoc]) -> Vec<String> {
@@ -729,147 +704,353 @@ fn parse_spec(spec: &str) -> Option<(String, String, String, String)> {
     Some((id, name, database, collection))
 }
 
-enum KeyAction {
-    Ignore,
-    Backspace,
-    Type(String),
-    Commit,
-}
-
-fn key_action(event: &gpui_kit::KeyDownEvent) -> KeyAction {
-    if event.keystroke.modifiers.control || event.keystroke.modifiers.platform || event.keystroke.modifiers.alt {
-        return KeyAction::Ignore;
-    }
-    match event.keystroke.key.as_str() {
-        "backspace" => KeyAction::Backspace,
-        "enter" => KeyAction::Commit,
-        "escape" | "tab" | "up" | "down" | "left" | "right" => KeyAction::Ignore,
-        _ => event.keystroke.key_char.clone().filter(|text| !text.is_empty()).map(KeyAction::Type).unwrap_or(KeyAction::Ignore),
-    }
-}
-
 impl Render for MongoPane {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let entity = cx.entity().clone();
-        let filter_focus = self.focus_of(Field::Filter, cx);
-        let editor_focus = self.focus_of(Field::Editor, cx);
-        let mut column = div().id("mongo-pane").flex().flex_col();
-        column = column.child(SharedString::from(format!("{} / {} / {}", self.connection_name, self.database, self.collection)));
-        column = column.child(button("mongo-refresh-db", &self.text("mongo.tab.databases"), entity.clone()));
-        for (index, database) in self.databases.iter().take(40).enumerate() {
-            column = column.child(button_owned(format!("mongo-database:{index}"), format!("{} {}", self.text("mongo.tab.databases"), database.name), entity.clone()));
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = Palette::of(cx);
+        let entity = cx.entity();
+        let mono = cx.theme().mono_font_family.clone();
+        let filter = self.fields.bind_enter(
+            Field::Filter,
+            &self.filter_input.clone(),
+            FieldSpec { placeholder: r#"{"status": "active"}"#, masked: false },
+            window,
+            cx,
+            |this: &mut Self, _, value, _| {
+                this.focused = Some(Field::Filter);
+                this.filter_input = value;
+            },
+            Some(|this: &mut Self, _, cx| this.command("mongo-filter", cx)),
+        );
+
+        // ---- 左栏：库与集合
+        let mut nav = div().id("mongo-nav").flex().flex_col().gap(px(1.)).flex_1().min_h(px(0.)).overflow_y_scroll().p(px(6.));
+        nav = nav.child(div().px(px(8.)).pt(px(6.)).pb(px(4.)).child(kit::eyebrow(SharedString::from(self.text("mongo.tab.databases")), &p)));
+        for (index, database) in self.databases.iter().take(60).enumerate() {
+            let selected = database.name == self.database;
+            nav = nav.child(
+                nav_row(
+                    format!("mongo-database:{index}"),
+                    format!("{} {}", self.text("mongo.tab.databases"), database.name),
+                    IconName::Database,
+                    database.name.clone(),
+                    database.collections.to_string(),
+                    selected,
+                    &p,
+                    &entity,
+                ),
+            );
         }
-        for (index, collection) in self.collections.iter().take(80).enumerate() {
+        if !self.collections.is_empty() {
+            nav = nav.child(div().px(px(8.)).pt(px(12.)).pb(px(4.)).child(kit::eyebrow(SharedString::from(self.text("mongo.tab.collections")), &p)));
+        }
+        for (index, collection) in self.collections.iter().take(120).enumerate() {
             let count = collection.estimated_documents.map(|count| count.to_string()).unwrap_or_else(|| "—".into());
-            column = column.child(button_owned(
+            let selected = collection.name == self.collection;
+            nav = nav.child(nav_row(
                 format!("mongo-collection:{index}"),
                 format!("{} {} {count}", self.text("mongo.tab.collections"), collection.name),
-                entity.clone(),
+                IconName::FolderOpen,
+                collection.name.clone(),
+                count,
+                selected,
+                &p,
+                &entity,
             ));
         }
-        column = column.child(input_box("mongo-filter-field", &self.text("mongo.tab.filterLabel"), &self.filter_input, filter_focus, Field::Filter, entity.clone()));
-        column = column.child(button("mongo-filter", &self.text("mongo.tab.apply"), entity.clone()));
-        column = column.child(button("mongo-clear-filter", &self.text("mongo.tab.clearFilter"), entity.clone()));
-        column = column.child(button("mongo-refresh", &self.text("mongo.tab.refresh"), entity.clone()));
-        column = column.child(button("mongo-prev", &self.text("mongo.tab.prevPage"), entity.clone()));
-        column = column.child(button("mongo-next", &self.text("mongo.tab.nextPage"), entity.clone()));
-        column = column.child(button("mongo-insert", &self.text("mongo.tab.insert"), entity.clone()));
-        if self.view_open {
-            let invalid = serde_json::from_str::<serde_json::Value>(&self.view_json).is_err();
-            let body = if invalid { format!("{} {}", self.text("mongo.docJson.invalid"), self.view_json) } else { self.view_json.clone() };
-            column = column.child(SharedString::from(body));
-            column = column.child(button("mongo-view-close", &self.text("mongo.tab.close"), entity.clone()));
+        let left = div()
+            .flex_none()
+            .w(px(250.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(p.chrome)
+            .border_r_1()
+            .border_color(p.line)
+            .child(
+                div()
+                    .h(px(44.))
+                    .px(px(10.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .border_b_1()
+                    .border_color(p.line)
+                    .child(kit::engine_badge("mongodb", 20.))
+                    .child(div().flex_1().min_w(px(0.)).truncate().font_weight(FontWeight::SEMIBOLD).child(SharedString::from(self.connection_name.clone())))
+                    .child(mongo_icon("mongo-refresh-db", IconName::RefreshCw, &self.text("mongo.tab.databases"), &entity)),
+            )
+            .child(nav);
+
+        // ---- 工具条
+        let page_text = if self.total >= 0 {
+            format!("{}–{} / {}", if self.documents.is_empty() { 0 } else { self.skip + 1 }, self.skip + self.documents.len() as u64, self.total)
+        } else {
+            format!("{}–{}", self.skip + 1, self.skip + self.documents.len() as u64)
+        };
+        let toolbar = div()
+            .flex_none()
+            .px(px(10.))
+            .py(px(8.))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.))
+            .border_b_1()
+            .border_color(p.line)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .text_size(px(13.))
+                    .child(div().text_color(p.text_muted).child(SharedString::from(self.database.clone())))
+                    .child(kit::icon(IconName::ChevronRight, 12., p.text_faint))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(SharedString::from(self.collection.clone()))),
+            )
+            .child(div().w(px(8.)))
+            .child(div().flex_1().min_w(px(200.)).child(kit::text_input("mongo-filter-field", &filter, self.text("mongo.tab.filterLabel")).small().prefix(kit::icon(IconName::Funnel, 13., p.text_faint))))
+            .child(mongo_button("mongo-filter", None, &self.text("mongo.tab.apply"), Kind::Secondary, &entity))
+            .child(mongo_button("mongo-clear-filter", None, &self.text("mongo.tab.clearFilter"), Kind::Tool, &entity))
+            .child(kit::vline(&p))
+            .child(mongo_icon("mongo-refresh", IconName::RefreshCw, &self.text("mongo.tab.refresh"), &entity))
+            .child(mongo_icon("mongo-prev", IconName::ChevronLeft, &self.text("mongo.tab.prevPage"), &entity))
+            .child(div().text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(page_text)))
+            .child(mongo_icon("mongo-next", IconName::ChevronRight, &self.text("mongo.tab.nextPage"), &entity))
+            .child(mongo_button("mongo-insert", Some(IconName::Plus), &self.text("mongo.tab.insert"), Kind::Primary, &entity));
+
+        // ---- 文档表
+        let shown: Vec<String> = self.columns.iter().take(7).cloned().collect();
+        let mut table = div().id("mongo-docs").flex().flex_col().flex_1().min_h(px(0.)).overflow_y_scroll();
+        if !self.filter_error.is_empty() {
+            table = table.child(div().mx(px(10.)).mt(px(10.)).px(px(12.)).py(px(8.)).rounded(px(8.)).bg(p.danger_soft).text_color(p.danger).text_size(px(12.5)).child(SharedString::from(self.filter_error.clone())));
         }
-        if self.editor_open {
-            let caption = if self.editor_mode == EditorMode::Insert { self.text("mongo.tab.saveInsert") } else { self.text("mongo.tab.saveReplace") };
-            column = column.child(input_box("mongo-editor", &self.text("mongo.tab.editorLabel"), &self.editor_text, editor_focus, Field::Editor, entity.clone()));
-            column = column.child(button("mongo-save", &caption, entity.clone()));
-        }
-        if self.confirm_id.is_some() {
-            column = column.child(SharedString::from(self.confirm_prompt.clone()));
-            column = column.child(button("mongo-confirm", &self.text("mongo.tab.confirmDelete"), entity.clone()));
-            column = column.child(button("mongo-cancel", &i18n::text(self.locale, "common.cancel"), entity.clone()));
-        }
-        column = column.child(SharedString::from(self.columns.join(" | ")));
         if self.documents.is_empty() {
             let empty = if self.applied_filter.is_empty() { self.text("mongo.tab.emptyCollection") } else { self.text("mongo.tab.emptyFiltered") };
-            column = column.child(SharedString::from(empty));
+            let detail = if self.collection.is_empty() { self.text("mongo.tab.needCollection") } else { String::new() };
+            table = table.child(div().flex_1().flex().items_center().justify_center().child(kit::empty_state(IconName::Braces, SharedString::from(empty), SharedString::from(detail), &p)));
+        } else {
+            let mut head = div().flex().h(px(32.)).px(px(10.)).items_center().bg(p.chrome).border_b_1().border_color(p.line).text_size(px(11.5)).text_color(p.text_faint);
+            for name in &shown {
+                head = head.child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).truncate().pr(px(8.)).child(SharedString::from(name.clone())));
+            }
+            head = head.child(div().flex_none().w(px(124.)));
+            table = table.child(head);
+            for (index, doc) in self.documents.iter().take(PAGE_LIMIT as usize).enumerate() {
+                let mut row = div()
+                    .id(SharedString::from(format!("mongo-row-{index}")))
+                    .group("mongo-row")
+                    .flex()
+                    .min_h(px(34.))
+                    .px(px(10.))
+                    .items_center()
+                    .border_b_1()
+                    .border_color(p.line_soft)
+                    .hover(|style| style.bg(p.hover));
+                for name in &shown {
+                    let text = cell_text(&doc.json, name);
+                    let faint = text == "null" || text.is_empty();
+                    row = row.child(
+                        div()
+                            .flex_1()
+                            .flex_basis(px(0.))
+                            .min_w(px(0.))
+                            .truncate()
+                            .pr(px(8.))
+                            .text_size(px(12.5))
+                            .when(name == "_id", |this| this.font_family(mono.clone()).text_color(p.text_muted))
+                            .when(faint, |this| this.text_color(p.text_faint))
+                            .child(SharedString::from(text)),
+                    );
+                }
+                row = row.child(
+                    div()
+                        .flex_none()
+                        .w(px(124.))
+                        .flex()
+                        .justify_end()
+                        .gap(px(1.))
+                        .child(doc_icon(format!("mongo-view:{index}"), IconName::Eye, format!("{} {index}", self.text("mongo.tab.view")), &entity))
+                        .child(doc_icon(format!("mongo-copy:{index}"), IconName::Copy, format!("{} {index}", self.text("mongo.tab.copy")), &entity))
+                        .child(doc_icon(format!("mongo-edit:{index}"), IconName::Pencil, format!("{} {index}", self.text("mongo.tab.edit")), &entity))
+                        .child(doc_icon(format!("mongo-delete:{index}"), IconName::Trash, format!("{} {index}", self.text("mongo.tab.remove")), &entity)),
+                );
+                table = table.child(row);
+            }
         }
-        for (index, doc) in self.documents.iter().take(PAGE_LIMIT as usize).enumerate() {
-            let cells = self.columns.iter().map(|column| cell_text(&doc.json, column)).collect::<Vec<_>>().join(" | ");
-            column = column.child(SharedString::from(cells));
-            column = column.child(button_owned(format!("mongo-view:{index}"), format!("{} {index}", self.text("mongo.tab.view")), entity.clone()));
-            column = column.child(button_owned(format!("mongo-copy:{index}"), format!("{} {index}", self.text("mongo.tab.copy")), entity.clone()));
-            column = column.child(button_owned(format!("mongo-edit:{index}"), format!("{} {index}", self.text("mongo.tab.edit")), entity.clone()));
-            column = column.child(button_owned(format!("mongo-delete:{index}"), format!("{} {index}", self.text("mongo.tab.remove")), entity.clone()));
+
+        let mut right = div().flex_1().min_w(px(0.)).h_full().flex().flex_col().relative().child(toolbar).child(table);
+
+        // ---- 抽屉：查看 / 编辑
+        if self.view_open || self.editor_open {
+            let mut drawer = div()
+                .flex_none()
+                .max_h(relative(0.55))
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .p(px(12.))
+                .border_t_1()
+                .border_color(p.line)
+                .bg(p.chrome);
+            if self.view_open {
+                let invalid = serde_json::from_str::<serde_json::Value>(&self.view_json).is_err();
+                let body = if invalid { format!("{} {}", self.text("mongo.docJson.invalid"), self.view_json) } else { self.view_json.clone() };
+                drawer = drawer
+                    .child(div().flex().items_center().justify_between().child(kit::eyebrow(SharedString::from(self.text("mongo.tab.viewLabel")), &p)).child(mongo_button("mongo-view-close", Some(IconName::X), &self.text("mongo.tab.close"), Kind::Tool, &entity)))
+                    .child(div().id("mongo-view-json").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(12.)).rounded(px(8.)).bg(p.surface).border_1().border_color(p.line).font_family(mono.clone()).text_size(px(12.5)).child(SharedString::from(body)));
+            }
+            if self.editor_open {
+                let editor = self.json_editor(window, cx);
+                let caption = if self.editor_mode == EditorMode::Insert { self.text("mongo.tab.saveInsert") } else { self.text("mongo.tab.saveReplace") };
+                let close_entity = entity.clone();
+                drawer = drawer
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(kit::eyebrow(SharedString::from(self.text("mongo.tab.editorLabel")), &p))
+                            .child(kit::icon_button("mongo-editor-close", IconName::X, SharedString::from(self.text("mongo.tab.close")), move |_, _, cx| {
+                                close_entity.update(cx, |pane, cx| {
+                                    pane.editor_open = false;
+                                    cx.notify();
+                                })
+                            })),
+                    )
+                    .child(div().id("mongo-editor").h(px(220.)).rounded(px(8.)).border_1().border_color(p.line).bg(p.surface).overflow_hidden().child(Editor::new(&editor).h(relative(1.)).bordered(false).aria_label(SharedString::from(self.text("mongo.tab.editorLabel")))))
+                    .when(!self.editor_error.is_empty(), |this| this.child(div().text_size(px(12.)).text_color(p.danger).child(SharedString::from(self.editor_error.clone()))))
+                    .child(div().flex().justify_end().child(mongo_button("mongo-save", Some(IconName::Check), &caption, Kind::Primary, &entity)));
+            }
+            right = right.child(drawer);
         }
-        column = column.child(
+        if self.confirm_id.is_some() {
+            right = right.child(
+                div()
+                    .flex_none()
+                    .mx(px(10.))
+                    .mb(px(8.))
+                    .px(px(12.))
+                    .py(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .rounded(px(8.))
+                    .bg(p.danger_soft)
+                    .text_color(p.danger)
+                    .child(kit::icon(IconName::TriangleAlert, 15., p.danger))
+                    .child(div().flex_1().min_w(px(0.)).text_size(px(12.5)).child(SharedString::from(self.confirm_prompt.clone())))
+                    .child(mongo_button("mongo-cancel", None, &i18n::text(self.locale, "common.cancel"), Kind::Secondary, &entity))
+                    .child(mongo_button("mongo-confirm", Some(IconName::Trash), &self.text("mongo.tab.confirmDelete"), Kind::Danger, &entity)),
+            );
+        }
+        let status = if self.error.is_empty() { self.note.clone() } else { self.error.clone() };
+        right = right.child(
             div()
                 .id("mongo-status")
                 .test_support()
                 .role(gpui_kit::Role::Status)
                 .aria_label(SharedString::from(self.status_line()))
-                .child(SharedString::from(if self.error.is_empty() { self.note.clone() } else { self.error.clone() })),
+                .flex_none()
+                .h(px(28.))
+                .px(px(12.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .border_t_1()
+                .border_color(p.line)
+                .text_size(px(12.))
+                .text_color(if self.error.is_empty() { p.text_muted } else { p.danger })
+                .when(self.busy, |this| this.child(Spinner::new().xsmall().color(p.accent)))
+                .child(SharedString::from(status)),
         );
-        column
+
+        div().id("mongo-pane").size_full().flex().child(left).child(right)
     }
 }
 
-fn button(id: &'static str, label: &str, entity: Entity<MongoPane>) -> impl IntoElement {
-    let label = SharedString::from(label.to_owned());
-    div()
-        .id(id)
-        .test_support()
-        .role(gpui_kit::Role::Button)
-        .aria_label(label.clone())
-        .child(label)
-        .on_click(move |_, _, cx| {
-            entity.update(cx, |pane, cx| pane.command(id, cx));
-        })
+#[derive(Clone, Copy)]
+enum Kind {
+    Primary,
+    Secondary,
+    Tool,
+    Danger,
 }
 
-fn button_owned(id: String, label: String, entity: Entity<MongoPane>) -> impl IntoElement {
-    let command = SharedString::from(id.clone());
-    let label = SharedString::from(label);
+impl MongoPane {
+    fn json_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<EditorState> {
+        let value = self.editor_text.clone();
+        if let Some((state, last, _)) = self.editor_state.as_mut() {
+            let state = state.clone();
+            kit::sync_editor(&state, last, &value, window, cx);
+            return state;
+        }
+        let state = cx.new(|cx| EditorState::new(window, cx).language("json").line_number(true).default_value(value.clone()));
+        let subscription = cx.subscribe(&state, |this, state, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.focused = Some(Field::Editor);
+                this.editor_text = state.read(cx).value().to_string();
+                cx.notify();
+            }
+        });
+        self.editor_state = Some((state.clone(), value, subscription));
+        state
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nav_row(id: String, label: String, icon: IconName, text: String, count: String, selected: bool, p: &Palette, entity: &Entity<MongoPane>) -> AnyElement {
+    let entity = entity.clone();
+    let command = id.clone();
     div()
         .id(SharedString::from(id))
         .test_support()
         .role(gpui_kit::Role::Button)
-        .aria_label(label.clone())
-        .child(label)
+        .aria_label(SharedString::from(label))
+        .aria_selected(selected)
+        .h(px(28.))
+        .px(px(8.))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .rounded(px(6.))
+        .cursor_pointer()
+        .when(selected, |this| this.bg(p.selection))
+        .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
+        .child(kit::icon(icon, 13., if selected { p.accent } else { p.text_faint }))
+        .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(12.5)).child(SharedString::from(text)))
+        .child(div().text_size(px(11.)).text_color(p.text_faint).child(SharedString::from(count)))
         .on_click(move |_, _, cx| {
-            let command = command.to_string();
+            let command = command.clone();
             entity.update(cx, |pane, cx| pane.command(&command, cx));
         })
+        .into_any_element()
 }
 
-fn input_box(id: &'static str, caption: &str, value: &str, focus: FocusHandle, field: Field, entity: Entity<MongoPane>) -> impl IntoElement {
-    let shown = value.replace('\n', " ");
-    let label = SharedString::from(format!("{caption} {shown}"));
-    div()
-        .id(id)
-        .test_support()
-        .track_focus(&focus)
-        .min_h(px(28.))
-        .w(px(420.))
-        .role(gpui_kit::Role::TextInput)
-        .aria_label(label.clone())
-        .child(label)
-        .on_mouse_down(gpui_kit::MouseButton::Left, {
-            let entity = entity.clone();
-            let focus = focus.clone();
-            move |_, window, cx| {
-                window.focus(&focus, cx);
-                entity.update(cx, |pane, cx| {
-                    pane.focused = Some(field);
-                    cx.notify();
-                });
-            }
-        })
-        .on_key_down(move |event: &gpui_kit::KeyDownEvent, _, cx| {
-            let action = key_action(event);
-            entity.update(cx, |pane, cx| pane.apply_key(field, action, cx));
-        })
+fn mongo_button(id: &'static str, icon: Option<IconName>, label: &str, kind: Kind, entity: &Entity<MongoPane>) -> gpui_kit::component::button::Button {
+    let entity = entity.clone();
+    let click = move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| entity.update(cx, |pane, cx| pane.command(id, cx));
+    let label = SharedString::from(label.to_owned());
+    match kind {
+        Kind::Primary => kit::primary_button(id, icon, label, click),
+        Kind::Secondary => kit::secondary_button(id, icon, label, click),
+        Kind::Tool => kit::tool_button(id, icon, label, click),
+        Kind::Danger => kit::danger_button(id, icon, label, click),
+    }
+}
+
+fn mongo_icon(id: &'static str, icon: IconName, label: &str, entity: &Entity<MongoPane>) -> gpui_kit::component::button::Button {
+    let entity = entity.clone();
+    kit::icon_button(id, icon, SharedString::from(label.to_owned()), move |_, _, cx| entity.update(cx, |pane, cx| pane.command(id, cx)))
+}
+
+fn doc_icon(id: String, icon: IconName, label: String, entity: &Entity<MongoPane>) -> gpui_kit::component::button::Button {
+    let entity = entity.clone();
+    let command = id.clone();
+    kit::icon_button(SharedString::from(id), icon, SharedString::from(label), move |_, _, cx| {
+        let command = command.clone();
+        entity.update(cx, |pane, cx| pane.command(&command, cx));
+    })
+    .xsmall()
 }
 
 #[cfg(test)]

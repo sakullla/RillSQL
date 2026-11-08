@@ -13,7 +13,7 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EntityInputHandler as _, Focusable as _, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, Styled as _, Task, Window, div, px,
+    IntoElement, ParentElement as _, Render, Styled as _, Task, Window, div,
 };
 use lsp_types::{CompletionContext, CompletionItem, CompletionResponse};
 
@@ -258,9 +258,8 @@ impl Render for SqlEditor {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("sql-editor")
-            .h(px(240.))
-            .w_full()
-            .child(Editor::new(&self.state).h(px(240.)).aria_label("SQL"))
+            .size_full()
+            .child(Editor::new(&self.state).h(gpui_kit::relative(1.)).bordered(false).aria_label("SQL"))
     }
 }
 

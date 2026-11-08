@@ -2,10 +2,16 @@
 
 use std::sync::Arc;
 
+use gpui_kit::assets::IconName;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::{ActiveTheme as _, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Context, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _,
-    Window, div, px,
+    canvas, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, PathBuilder, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    TestSupportExt as _, Window, div, px,
 };
+
+use crate::ui::kit::{self, Palette};
 
 use crate::application::tasks::{TaskOutcome, TaskToken};
 use crate::application::AppServices;
@@ -435,60 +441,236 @@ mod tests {
     }
 }
 
+const CARD_W: f32 = 220.;
+const GAP_X: f32 = 90.;
+const GAP_Y: f32 = 24.;
+const HEAD_H: f32 = 34.;
+const ROW_H: f32 = 22.;
+const PAD: f32 = 32.;
+
+fn card_height(table: &DiagramTable) -> f32 {
+    HEAD_H + ROW_H * table.columns.len().max(1) as f32 + 10. + if table.outside.is_empty() { 0. } else { ROW_H }
+}
+
 impl Render for DiagramPane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = Palette::of(cx);
         let entity = cx.entity();
+        let locale = self.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let summary = SharedString::from(self.lines().join("\n"));
         let diagram = self.diagram.clone();
         let hovered = self.hovered.clone();
-        let mut column = div().id("diagram-pane").w(px(480.)).flex().flex_col().gap(px(4.));
-        column = column.child(div().id("diagram-pad").test_support().w(px(220.)).h(px(28.)));
-        if let Some(diagram) = diagram.as_ref() {
-            for table in &diagram.tables {
-                let name = table.name.clone();
-                let mark = hover_mark(hovered.as_deref(), &name, diagram);
-                let label = SharedString::from(format!("{mark} {}", table.name));
-                let hovered_name = name.clone();
-                let card_entity = entity.clone();
-                column = column.child(
-                    div()
-                        .id(SharedString::from(format!("diagram-card:{name}")))
-                        .test_support()
-                        .w(px(220.))
-                        .min_h(px(36.))
-                        .role(gpui_kit::Role::Button)
-                        .aria_label(label.clone())
-                        .child(label)
-                        .on_hover(move |inside, _, cx| {
-                            let hovered_name = hovered_name.clone();
-                            card_entity.update(cx, |pane, cx| {
-                                if *inside {
-                                    pane.hovered = Some(hovered_name);
-                                } else if pane.hovered.as_deref() == Some(hovered_name.as_str()) {
-                                    pane.hovered = None;
+        let mono = cx.theme().mono_font_family.clone();
+
+        let header = div()
+            .flex_none()
+            .px(px(20.))
+            .py(px(12.))
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .border_b_1()
+            .border_color(p.line)
+            .child(div().size(px(30.)).rounded(px(8.)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(IconName::Workflow, 16., p.accent_text)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .child(kit::title(SharedString::from(if self.label.is_empty() { i18n::text(locale, "catalog.tree.diagram") } else { self.label.clone() }), 15., &p))
+                    .child(kit::muted(t("diagram.readonly"), &p)),
+            )
+            .when_some(diagram.as_ref(), |this, diagram| {
+                this.child(kit::pill(SharedString::from(format!("{} · {}", diagram.tables.len(), diagram.edges.len())), p.text_muted, p.hover))
+            })
+            .child(div().id("diagram-pad").test_support().w(px(8.)).h(px(28.)));
+
+        let mut body = div().id("diagram-scroll").flex_1().min_h(px(0.)).overflow_scroll().bg(p.chrome);
+        if self.loading {
+            body = body.child(div().size_full().flex().items_center().justify_center().gap(px(8.)).text_color(p.text_muted).child(Spinner::new().small()).child(t("diagram.loading")));
+        } else if !self.error.is_empty() {
+            body = body.child(div().size_full().flex().items_center().justify_center().child(kit::empty_state(IconName::CircleAlert, t("diagram.failed"), SharedString::from(self.error.clone()), &p)));
+        } else if let Some(diagram) = diagram.as_ref() {
+            if diagram.tables.is_empty() {
+                body = body.child(div().size_full().flex().items_center().justify_center().child(kit::empty_state(IconName::Workflow, t("diagram.empty"), SharedString::from(diagram.notice.clone().unwrap_or_default()), &p)));
+            } else {
+                let columns = layout_columns(&diagram.tables, &diagram.edges);
+                let foreign = foreign_columns(diagram);
+                // 卡片位置：按列从左到右，被引用的表在左。
+                let mut places: std::collections::HashMap<String, (f32, f32, f32)> = std::collections::HashMap::new();
+                let mut width = 0f32;
+                let mut height = 0f32;
+                for (index, column) in columns.iter().enumerate() {
+                    let x = PAD + index as f32 * (CARD_W + GAP_X);
+                    let mut y = PAD;
+                    for table in column {
+                        let h = card_height(table);
+                        places.insert(table.name.clone(), (x, y, h));
+                        y += h + GAP_Y;
+                    }
+                    width = width.max(x + CARD_W + PAD);
+                    height = height.max(y + PAD);
+                }
+                let mut canvas_box = div().relative().w(px(width.max(400.))).h(px(height.max(300.)));
+                // 连线
+                let mut wires: Vec<(gpui_kit::Point<gpui_kit::Pixels>, gpui_kit::Point<gpui_kit::Pixels>, bool)> = Vec::new();
+                for edge in &diagram.edges {
+                    let (Some(from), Some(to)) = (places.get(&edge.from_table), places.get(&edge.to_table)) else { continue };
+                    let from_table = diagram.tables.iter().find(|table| table.name == edge.from_table);
+                    let row = from_table
+                        .and_then(|table| edge.from_columns.first().and_then(|column| table.columns.iter().position(|name| name == column)))
+                        .unwrap_or(0);
+                    let start_y = from.1 + HEAD_H + ROW_H * row as f32 + ROW_H / 2. + 5.;
+                    let end_y = to.1 + HEAD_H / 2.;
+                    let (start_x, end_x) = if from.0 > to.0 { (from.0, to.0 + CARD_W) } else if from.0 < to.0 { (from.0 + CARD_W, to.0) } else { (from.0 + CARD_W, to.0 + CARD_W) };
+                    wires.push((gpui_kit::point(px(start_x), px(start_y)), gpui_kit::point(px(end_x), px(end_y)), edge_hot(hovered.as_deref(), edge)));
+                }
+                let dim = hovered.is_some();
+                let (wire, hot_wire, dim_wire) = (p.line_strong, p.accent, p.line);
+                canvas_box = canvas_box.child(
+                    canvas(
+                        move |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            for (start, end, hot) in &wires {
+                                let start = bounds.origin + *start;
+                                let end = bounds.origin + *end;
+                                let bend = ((end.x - start.x).abs() / 2.).max(px(40.));
+                                let same_side = (start.x - end.x).abs() < px(1.);
+                                let (c1, c2) = if same_side {
+                                    (gpui_kit::point(start.x + px(60.), start.y), gpui_kit::point(end.x + px(60.), end.y))
+                                } else if start.x > end.x {
+                                    (gpui_kit::point(start.x - bend, start.y), gpui_kit::point(end.x + bend, end.y))
+                                } else {
+                                    (gpui_kit::point(start.x + bend, start.y), gpui_kit::point(end.x - bend, end.y))
+                                };
+                                let mut builder = PathBuilder::stroke(px(if *hot { 2. } else { 1.3 }));
+                                builder.move_to(start);
+                                builder.cubic_bezier_to(end, c1, c2);
+                                if let Ok(path) = builder.build() {
+                                    let color = if *hot { hot_wire } else if dim { dim_wire } else { wire };
+                                    window.paint_path(path, color);
                                 }
-                                cx.notify();
-                            });
-                        }),
+                            }
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
                 );
+                for column in &columns {
+                    for table in column {
+                        let Some((x, y, _)) = places.get(&table.name).copied() else { continue };
+                        let name = table.name.clone();
+                        let mark = hover_mark(hovered.as_deref(), &name, diagram);
+                        let label = SharedString::from(format!("{mark} {}", table.name));
+                        let hovered_name = name.clone();
+                        let card_entity = entity.clone();
+                        let (border, head_bg, opacity) = match mark {
+                            "hot" => (p.accent, p.accent_soft, 1.),
+                            "linked" => (p.accent, p.surface, 1.),
+                            "dim" => (p.line, p.surface, 0.45),
+                            _ => (p.line_strong, p.surface, 1.),
+                        };
+                        let mut rows = div().flex().flex_col().py(px(5.));
+                        for column_name in &table.columns {
+                            let fk = foreign.contains(&format!("{}.{}", table.name, column_name));
+                            rows = rows.child(
+                                div()
+                                    .h(px(ROW_H))
+                                    .px(px(12.))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .text_size(px(12.))
+                                    .child(kit::icon(if fk { IconName::Link } else { IconName::Dot }, 11., if fk { p.accent } else { p.text_faint }))
+                                    .child(div().truncate().font_family(mono.clone()).when(fk, |this| this.text_color(p.accent_text)).child(SharedString::from(column_name.clone()))),
+                            );
+                        }
+                        if table.columns.is_empty() {
+                            rows = rows.child(div().h(px(ROW_H)).px(px(12.)).text_size(px(12.)).text_color(p.text_faint).child("—"));
+                        }
+                        for note in &table.outside {
+                            rows = rows.child(div().h(px(ROW_H)).px(px(12.)).flex().items_center().gap(px(6.)).text_size(px(11.5)).text_color(p.warn).child(kit::icon(IconName::ExternalLink, 11., p.warn)).child(div().truncate().child(SharedString::from(note.clone()))));
+                        }
+                        canvas_box = canvas_box.child(
+                            div()
+                                .id(SharedString::from(format!("diagram-card:{name}")))
+                                .test_support()
+                                .role(gpui_kit::Role::Button)
+                                .aria_label(label)
+                                .absolute()
+                                .left(px(x))
+                                .top(px(y))
+                                .w(px(CARD_W))
+                                .opacity(opacity)
+                                .rounded(px(10.))
+                                .border_1()
+                                .border_color(border)
+                                .bg(p.surface)
+                                .shadow_sm()
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .h(px(HEAD_H))
+                                        .px(px(12.))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .bg(head_bg)
+                                        .border_b_1()
+                                        .border_color(p.line)
+                                        .child(kit::icon(IconName::Table, 13., p.accent))
+                                        .child(div().truncate().font_weight(FontWeight::SEMIBOLD).child(SharedString::from(table.name.clone()))),
+                                )
+                                .child(rows)
+                                .on_hover(move |inside, _, cx| {
+                                    let hovered_name = hovered_name.clone();
+                                    card_entity.update(cx, |pane, cx| {
+                                        if *inside {
+                                            pane.hovered = Some(hovered_name);
+                                        } else if pane.hovered.as_deref() == Some(hovered_name.as_str()) {
+                                            pane.hovered = None;
+                                        }
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                }
+                body = body.child(canvas_box);
+            }
+        } else {
+            body = body.child(div().size_full().flex().items_center().justify_center().child(kit::empty_state(IconName::Workflow, t("catalog.tree.diagram"), t("diagram.needTarget"), &p)));
+        }
+
+        let mut footer = div().flex_none().flex().flex_col();
+        if let Some(diagram) = diagram.as_ref() {
+            if !diagram.omitted.is_empty() || diagram.notice.is_some() {
+                let mut notes = div().px(px(20.)).py(px(8.)).flex().flex_col().gap(px(4.)).border_t_1().border_color(p.line).text_size(px(12.)).text_color(p.warn);
+                if let Some(notice) = &diagram.notice {
+                    notes = notes.child(SharedString::from(notice.clone()));
+                }
+                for item in &diagram.omitted {
+                    notes = notes.child(SharedString::from(format!("{} · {} {}", i18n::text(locale, "diagram.omitted"), item.name, item.message)));
+                }
+                footer = footer.child(notes);
             }
             for edge in &diagram.edges {
                 let mark = if edge_hot(hovered.as_deref(), edge) { "hot-wire" } else if hovered.is_some() { "dim-wire" } else { "wire" };
-                let label = SharedString::from(format!(
-                    "{mark} {}.{} -> {}.{}",
-                    edge.from_table,
-                    edge.from_columns.join(", "),
-                    edge.to_table,
-                    edge.to_columns.join(", ")
-                ));
-                column = column.child(
-                    div()
-                        .id(SharedString::from(format!("diagram-wire:{}:{}:{}", edge.name, edge.from_table, edge.to_table)))
-                        .aria_label(label.clone())
-                        .child(label),
-                );
+                let label = SharedString::from(format!("{mark} {}.{} -> {}.{}", edge.from_table, edge.from_columns.join(", "), edge.to_table, edge.to_columns.join(", ")));
+                footer = footer.child(div().id(SharedString::from(format!("diagram-wire:{}:{}:{}", edge.name, edge.from_table, edge.to_table))).hidden().aria_label(label));
             }
         }
-        column.child(div().id("diagram-summary").child(summary))
+
+        div()
+            .id("diagram-pane")
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(body)
+            .child(footer)
+            .child(div().id("diagram-summary").hidden().child(summary))
     }
 }

@@ -60,6 +60,8 @@ struct TabState {
     running: bool,
     cancelled: bool,
     executed: bool,
+    /// 最近一次成功送达的 SQL。关闭守卫据此判断草稿是否“已执行”。
+    executed_sql: Option<String>,
     token: Option<TaskToken>,
     run_id: Option<String>,
     results: Vec<StatementView>,
@@ -228,6 +230,7 @@ impl Desk {
             running: false,
             cancelled: false,
             executed: false,
+            executed_sql: None,
             token: None,
             run_id: None,
             results: Vec::new(),
@@ -289,6 +292,10 @@ impl Desk {
             tab.draft = sql.to_owned();
             tab.version = tab.version.saturating_add(1);
         }
+    }
+
+    pub fn executed_sql(&self, id: &str) -> Option<String> {
+        self.tabs.iter().find(|tab| tab.id == id).and_then(|tab| tab.executed_sql.clone())
     }
 
     pub fn tab_draft(&self, id: &str) -> Option<String> {
@@ -728,6 +735,7 @@ impl Desk {
                 TaskOutcome::Current { .. } => {
                     tab.running = false;
                     tab.executed = true;
+                    tab.executed_sql = Some(tab.draft.clone());
                     tab.status = run.status.clone();
                     tab.results = run.statements.into_iter().map(statement_view).collect();
                     tab.run_id = Some(run.id);
@@ -917,6 +925,7 @@ impl Desk {
             running: false,
             cancelled: false,
             executed: false,
+            executed_sql: None,
             token: None,
             run_id: None,
             results: Vec::new(),

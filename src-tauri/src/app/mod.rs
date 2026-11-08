@@ -72,7 +72,7 @@ pub fn run() {
         std::env::consts::ARCH
     );
     // gpui_platform is the 0.3.11 snapshot (Win32/DirectWrite, X11/Wayland, macOS font-kit).
-    gpui_platform::application().run(move |cx| {
+    gpui_platform::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
         gpui_kit::init(cx);
         bind_keys(cx);
         let (_window, root) = gpui_kit::open_window(window_options(), cx, |window, cx| {
@@ -99,7 +99,7 @@ fn window_options() -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: Point::default(),
-            size: size(px(1200.), px(800.)),
+            size: size(px(1280.), px(820.)),
         })),
         titlebar: Some(TitlebarOptions {
             title: Some(SharedString::from("RillSQL")),

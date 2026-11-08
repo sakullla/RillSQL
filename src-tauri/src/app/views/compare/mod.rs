@@ -4,10 +4,17 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use gpui_kit::assets::IconName;
+use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::{ActiveTheme as _, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
     TestSupportExt as _, Window, div, px,
 };
+
+use crate::ui::kit::{self, Palette};
 
 use crate::application::tasks::{TaskOutcome, TaskToken};
 use crate::application::{AppServices, cancel_compare, compare_cancelled};
@@ -87,9 +94,7 @@ pub struct ComparePane {
     cancel_flag: Arc<AtomicBool>,
     placed: Option<PlacedScript>,
     schema_draft: BTreeMap<String, String>,
-    schema_focus_side: Option<String>,
-    baseline_schema_focus: Option<FocusHandle>,
-    target_schema_focus: Option<FocusHandle>,
+    schema_inputs: BTreeMap<&'static str, (Entity<InputState>, gpui_kit::Subscription)>,
     #[cfg(test)]
     armed_pause: bool,
     #[cfg(test)]
@@ -119,9 +124,7 @@ impl ComparePane {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             placed: None,
             schema_draft: BTreeMap::new(),
-            schema_focus_side: None,
-            baseline_schema_focus: None,
-            target_schema_focus: None,
+            schema_inputs: BTreeMap::new(),
             #[cfg(test)]
             armed_pause: false,
             #[cfg(test)]
@@ -871,222 +874,397 @@ fn empty_data(refused: Option<String>) -> DataReport {
 }
 
 impl Render for ComparePane {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let locale = self.locale;
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = Palette::of(cx);
         let entity = cx.entity();
-        if self.baseline_schema_focus.is_none() {
-            self.baseline_schema_focus = Some(cx.focus_handle());
+        let mono = cx.theme().mono_font_family.clone();
+        let t = |this: &Self, key: &str| SharedString::from(this.text(key));
+
+        let baseline_card = self.side_card(true, window, cx);
+        let target_card = self.side_card(false, window, cx);
+        let sides = div()
+            .flex()
+            .gap(px(14.))
+            .items_start()
+            .child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).child(baseline_card))
+            .child(div().flex_none().pt(px(40.)).child(kit::icon(IconName::ArrowLeft, 18., p.text_faint)))
+            .child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).child(target_card));
+
+        let mut actions = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(8.))
+            .child(kit::primary_button("compare-structure", Some(IconName::Columns3), t(self, "compare.dialog.compareStructure"), compare_act("compare-structure", &entity)))
+            .child(kit::secondary_button("compare-data", Some(IconName::Rows3), t(self, "compare.dialog.compareData"), compare_act("compare-data", &entity)));
+        if self.running {
+            actions = actions
+                .child(kit::tool_button("compare-cancel", Some(IconName::X), t(self, "common.cancel"), compare_act("compare-cancel", &entity)))
+                .child(div().flex().items_center().gap(px(6.)).text_size(px(12.)).text_color(p.text_muted).child(Spinner::new().xsmall().color(p.accent)).child(t(self, "compare.dialog.comparing")));
+        } else {
+            actions = actions.child(div().invisible().child(kit::tool_button("compare-cancel", None, t(self, "common.cancel"), compare_act("compare-cancel", &entity))));
         }
-        if self.target_schema_focus.is_none() {
-            self.target_schema_focus = Some(cx.focus_handle());
+
+        let mut body = div().flex().flex_col().gap(px(18.)).child(sides).child(actions);
+        if !self.error.is_empty() {
+            body = body.child(note_banner(IconName::CircleAlert, self.error.clone(), p.danger, p.danger_soft));
         }
-        let summary = SharedString::from(self.lines().join("\n"));
-        let controls = self.scope_controls();
-        let baseline_manual = self.manual_reason(true);
-        let target_manual = self.manual_reason(false);
-        let baseline_focus = self.baseline_schema_focus.clone().unwrap();
-        let target_focus = self.target_schema_focus.clone().unwrap();
-        let baseline_draft = self.schema_draft.get("baseline").cloned().unwrap_or_default();
-        let target_draft = self.schema_draft.get("target").cloned().unwrap_or_default();
-        let mut column = div().id("compare-pane").flex().flex_col().gap(px(4.));
-        column = column.child(button("compare-structure", "compare.dialog.compareStructure", entity.clone(), locale));
-        column = column.child(button("compare-data", "compare.dialog.compareData", entity.clone(), locale));
-        column = column.child(button("compare-cancel", "common.cancel", entity.clone(), locale));
-        column = column.child(button("compare-place:structure", "compare.dialog.placeToQuery", entity.clone(), locale));
-        column = column.child(button("compare-place:data", "compare.dialog.dataDisclosure", entity.clone(), locale));
-        for control in controls {
-            column = column.child(command_button(control.0, control.1, entity.clone()));
+        if self.structure_status == Status::Cancelled || self.data_status == Status::Cancelled {
+            body = body.child(note_banner(IconName::Info, self.text("compare.status.cancelled"), p.warn, p.warn_soft));
         }
-        if let Some(reason) = baseline_manual {
-            column = column.child(schema_box("baseline", &baseline_draft, &reason, baseline_focus, entity.clone(), locale));
+
+        if let Some(report) = self.structure.clone() {
+            let mut card = kit::card(&p).p(px(16.)).flex().flex_col().gap(px(12.));
+            let can_place = report.refused.is_none() && self.structure_status != Status::Cancelled && !report.script.trim().is_empty();
+            card = card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(kit::title(t(self, "compare.dialog.structureScript"), 14., &p))
+                    .when(can_place, |this| {
+                        this.child(kit::primary_button("compare-place:structure", Some(IconName::SquareTerminal), t(self, "compare.dialog.placeToQuery"), compare_act("compare-place:structure", &entity)))
+                    }),
+            );
+            if let Some(refused) = &report.refused {
+                card = card.child(note_banner(IconName::Ban, refused.clone(), p.warn, p.warn_soft));
+            } else {
+                card = card.child(
+                    div()
+                        .flex()
+                        .gap(px(8.))
+                        .child(stat(self.text("compare.dialog.baseline"), report.only_baseline.len(), p.ok, &p))
+                        .child(stat(self.text("compare.dialog.target"), report.only_target.len(), p.danger, &p))
+                        .child(stat(self.text("ui.compare.changed"), report.changed.len(), p.warn, &p)),
+                );
+                let mut diffs = div().flex().flex_col().gap(px(2.));
+                for item in &report.only_baseline {
+                    diffs = diffs.child(diff_row("+", fill(&self.text("compare.dialog.onlyBaseline"), &[("{kind}", &item.kind), ("{name}", &item.name)]), p.ok, &p));
+                }
+                for item in &report.only_target {
+                    diffs = diffs.child(diff_row("−", fill(&self.text("compare.dialog.onlyTarget"), &[("{kind}", &item.kind), ("{name}", &item.name)]), p.danger, &p));
+                }
+                for item in &report.changed {
+                    diffs = diffs.child(diff_row("~", format!("{} {} · {}", item.kind, item.name, item.detail), p.warn, &p));
+                }
+                card = card.child(diffs);
+                for note in &report.notes {
+                    card = card.child(kit::muted(SharedString::from(note.clone()), &p));
+                }
+                if report.incomplete || self.structure_status == Status::Incomplete {
+                    card = card.child(note_banner(IconName::TriangleAlert, self.text("compare.dialog.scriptIncomplete"), p.warn, p.warn_soft));
+                }
+                if report.tables.is_empty() {
+                    card = card.child(kit::muted(t(self, "compare.dialog.noTables"), &p));
+                } else {
+                    let mut tables = div().flex().flex_wrap().gap(px(6.));
+                    for table in &report.tables {
+                        let on = self.selected.get(&table.name).copied().unwrap_or(false);
+                        let mark = if on { "on" } else { "off" };
+                        tables = tables.child(
+                            chip(SharedString::from(format!("compare-toggle:{}", table.name)), SharedString::from(format!("{mark} {}", table.name)), SharedString::from(table.name.clone()), on, Some(if on { IconName::SquareCheck } else { IconName::Square }), &p)
+                                .on_click(compare_act(format!("compare-toggle:{}", table.name), &entity)),
+                        );
+                    }
+                    card = card.child(div().flex().flex_col().gap(px(6.)).child(kit::eyebrow(t(self, "compare.dialog.dataTitle"), &p)).child(tables));
+                    for table in report.tables.iter().filter(|table| table.needs_key_choice) {
+                        let mut keys = div().flex().flex_wrap().items_center().gap(px(6.)).child(div().text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(format!("{} · {}", table.name, self.text("compare.dialog.chooseKey")))));
+                        for key in &table.keys {
+                            let chosen = self.chosen_key.get(&table.name).is_some_and(|name| name == &key.name);
+                            let mark = if chosen { "chosen" } else { "key" };
+                            let id = format!("compare-key:{}|{}", table.name, key.name);
+                            keys = keys.child(
+                                chip(SharedString::from(id.clone()), SharedString::from(format!("{mark} {} {}", table.name, key.name)), SharedString::from(format!("{} ({})", key.name, key.columns.join(", "))), chosen, Some(IconName::Key), &p)
+                                    .on_click(compare_act(id, &entity)),
+                            );
+                        }
+                        card = card.child(keys);
+                    }
+                }
+                if self.structure_status != Status::Cancelled && !report.script.trim().is_empty() {
+                    card = card.child(script_block("compare-structure-script", report.script.clone(), &mono, &p));
+                }
+            }
+            body = body.child(card);
         }
-        if let Some(reason) = target_manual {
-            column = column.child(schema_box("target", &target_draft, &reason, target_focus, entity.clone(), locale));
+
+        if let Some(report) = self.data.clone() {
+            let can_place = report.refused.is_none() && self.data_status != Status::Cancelled && !report.script.trim().is_empty();
+            let mut card = kit::card(&p).p(px(16.)).flex().flex_col().gap(px(12.)).child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(kit::title(t(self, "compare.dialog.dataTitle"), 14., &p))
+                    .when(can_place, |this| {
+                        this.child(kit::primary_button("compare-place:data", Some(IconName::SquareTerminal), t(self, "compare.dialog.dataDisclosure"), compare_act("compare-place:data", &entity)))
+                    }),
+            );
+            if let Some(refused) = &report.refused {
+                card = card.child(note_banner(IconName::Ban, refused.clone(), p.warn, p.warn_soft));
+            } else {
+                if report.incomplete || self.data_status == Status::Incomplete {
+                    card = card.child(note_banner(IconName::TriangleAlert, self.text("compare.dialog.dataScriptIncomplete"), p.warn, p.warn_soft));
+                }
+                let mut diffs = div().flex().flex_col().gap(px(2.));
+                for diff in &report.diffs {
+                    let key = if diff.key.is_empty() { String::new() } else { format!(" · {} {}", self.text("compare.dialog.key"), diff.key) };
+                    diffs = diffs.child(diff_row("•", format!("{} {}{key}", diff.table, diff.detail), p.info, &p));
+                }
+                card = card.child(diffs);
+                for note in &report.notes {
+                    card = card.child(kit::muted(SharedString::from(note.clone()), &p));
+                }
+                if self.data_status != Status::Cancelled && !report.script.trim().is_empty() {
+                    card = card.child(script_block("compare-data-script", report.script.clone(), &mono, &p));
+                }
+            }
+            body = body.child(card);
+        } else {
+            body = body.child(div().hidden().child(kit::tool_button("compare-place:data", None, t(self, "compare.dialog.dataDisclosure"), compare_act("compare-place:data", &entity))));
         }
-        column.child(summary)
+        if self.structure.is_none() {
+            body = body.child(div().hidden().child(kit::tool_button("compare-place:structure", None, t(self, "compare.dialog.placeToQuery"), compare_act("compare-place:structure", &entity))));
+        }
+
+        div()
+            .id("compare-pane")
+            .size_full()
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .max_w(px(1080.))
+                    .mx_auto()
+                    .px(px(24.))
+                    .py(px(20.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(18.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .child(div().size(px(34.)).rounded(px(9.)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(IconName::GitCompare, 17., p.accent_text)))
+                            .child(div().flex().flex_col().child(kit::title(t(self, "compare.dialog.title"), 16., &p)).child(kit::muted(t(self, "compare.dialog.subtitle"), &p))),
+                    )
+                    .child(body),
+            )
     }
 }
 
 impl ComparePane {
-    fn scope_controls(&self) -> Vec<(SharedString, SharedString)> {
-        let mut controls = Vec::new();
-        for choice in &self.choices {
-            controls.push((
-                format!("compare-baseline:{}", choice.id).into(),
-                format!("{} {}", self.text("compare.dialog.baseline"), choice.name).into(),
-            ));
-            controls.push((
-                format!("compare-target:{}", choice.id).into(),
-                format!("{} {}", self.text("compare.dialog.target"), choice.name).into(),
-            ));
+    fn side_card(&mut self, baseline: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let entity = cx.entity();
+        let which = if baseline { "baseline" } else { "target" };
+        let title = self.text(if baseline { "compare.dialog.baseline" } else { "compare.dialog.target" });
+        let side = if baseline { &self.baseline } else { &self.target };
+        let side_connection = side.connection_id.clone();
+        let side_database = side.database.clone();
+        let side_schema = side.schema.clone();
+        let mut card = kit::card(&p).p(px(14.)).flex().flex_col().gap(px(12.)).child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(kit::pill(SharedString::from(title.clone()), if baseline { p.ok } else { p.info }, if baseline { p.ok_soft } else { p.accent_soft }))
+                .child(kit::muted(SharedString::from(self.text("compare.dialog.connection")), &p)),
+        );
+        let mut connections = div().flex().flex_wrap().gap(px(6.));
+        if self.choices.is_empty() {
+            connections = connections.child(kit::muted(SharedString::from(self.text("compare.dialog.chooseConnection")), &p));
         }
-        self.push_database_controls(&mut controls, true);
-        self.push_database_controls(&mut controls, false);
-        self.push_schema_controls(&mut controls, true);
-        self.push_schema_controls(&mut controls, false);
-        if let Some(report) = &self.structure {
-            if report.refused.is_none() {
-                for table in &report.tables {
-                    let on = self.selected.get(&table.name).copied().unwrap_or(false);
-                    let mark = if on { "on" } else { "off" };
-                    controls.push((format!("compare-toggle:{}", table.name).into(), format!("{mark} {}", table.name).into()));
-                    if table.needs_key_choice {
-                        for key in &table.keys {
-                            let chosen = self.chosen_key.get(&table.name).is_some_and(|name| name == &key.name);
-                            let mark = if chosen { "chosen" } else { "key" };
-                            controls.push((
-                                format!("compare-key:{}|{}", table.name, key.name).into(),
-                                format!("{mark} {} {}", table.name, key.name).into(),
-                            ));
+        for choice in self.choices.clone() {
+            let id = format!("compare-{which}:{}", choice.id);
+            let selected = side_connection == choice.id;
+            connections = connections.child(
+                chip(SharedString::from(id.clone()), SharedString::from(format!("{title} {}", choice.name)), SharedString::from(choice.name.clone()), selected, Some(IconName::Database), &p)
+                    .on_click(compare_act(id, &entity)),
+            );
+            if selected {
+                if let Some(error) = &choice.catalog_error {
+                    card = card.child(note_banner(IconName::CircleAlert, error.clone(), p.danger, p.danger_soft));
+                }
+            }
+        }
+        card = card.child(connections);
+        if let Some(choice) = self.choices.iter().find(|choice| choice.id == side_connection).cloned() {
+            if !choice.databases.is_empty() {
+                let database_label = self.text("compare.dialog.database");
+                let mut list = div().flex().flex_wrap().gap(px(6.));
+                for name in &choice.databases {
+                    let id = format!("compare-database:{which}:{name}");
+                    list = list.child(
+                        chip(SharedString::from(id.clone()), SharedString::from(format!("{title} {database_label} {name}")), SharedString::from(name.clone()), side_database == *name, Some(IconName::Database), &p)
+                            .on_click(compare_act(id, &entity)),
+                    );
+                }
+                card = card.child(div().flex().flex_col().gap(px(6.)).child(kit::eyebrow(SharedString::from(database_label), &p)).child(list));
+            }
+            if choice.engine == "postgres" || choice.engine == "sqlserver" {
+                let schema_label = self.text("compare.dialog.chooseSchema");
+                match self.schemas.get(&schema_key(&side_connection, &side_database)).cloned() {
+                    Some(SchemaState::Ready(names)) => {
+                        let mut list = div().flex().flex_wrap().gap(px(6.));
+                        for name in names {
+                            let id = format!("compare-schema:{which}:{name}");
+                            list = list.child(
+                                chip(SharedString::from(id.clone()), SharedString::from(format!("{title} {schema_label} {name}")), SharedString::from(name.clone()), side_schema == name, Some(IconName::Layers), &p)
+                                    .on_click(compare_act(id, &entity)),
+                            );
                         }
+                        card = card.child(div().flex().flex_col().gap(px(6.)).child(kit::eyebrow(SharedString::from(schema_label), &p)).child(list));
+                    }
+                    Some(SchemaState::Manual(reason)) => {
+                        let input = self.schema_input(which, window, cx);
+                        let placeholder = self.text("compare.dialog.schemaManualPlaceholder");
+                        let value = self.schema_draft.get(which).cloned().unwrap_or_default();
+                        let label = if reason.is_empty() { format!("{placeholder} {value}") } else { format!("{reason} {placeholder} {value}") };
+                        card = card.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.))
+                                .child(kit::eyebrow(SharedString::from(schema_label), &p))
+                                .when(!reason.is_empty(), |this| this.child(div().text_size(px(12.)).text_color(p.warn).child(SharedString::from(reason.clone()))))
+                                .child(
+                                    div()
+                                        .capture_key_down({
+                                            let entity = entity.clone();
+                                            let input = input.clone();
+                                            move |event: &gpui_kit::KeyDownEvent, _, cx| {
+                                                if event.keystroke.key != "enter" {
+                                                    return;
+                                                }
+                                                // 回车当场提交：读文本框现值，不等输入事件排队送达。
+                                                let name = input.read(cx).value().to_string();
+                                                entity.update(cx, |pane, cx| {
+                                                    pane.schema_draft.insert(which.to_owned(), name.clone());
+                                                    pane.command(&format!("compare-schema:{which}:{name}"), cx);
+                                                });
+                                            }
+                                        })
+                                        .child(kit::text_input(SharedString::from(format!("compare-schema-input:{which}")), &input, label)),
+                                ),
+                        );
+                    }
+                    Some(SchemaState::Loading) | None => {
+                        card = card.child(div().flex().items_center().gap(px(6.)).text_size(px(12.)).text_color(p.text_muted).child(Spinner::new().xsmall()).child(SharedString::from(self.text("compare.dialog.schemaLoading"))));
                     }
                 }
             }
         }
-        controls
+        card.into_any_element()
     }
 
-    fn push_database_controls(&self, controls: &mut Vec<(SharedString, SharedString)>, baseline: bool) {
-        let side = if baseline { &self.baseline } else { &self.target };
-        let Some(choice) = self.choices.iter().find(|choice| choice.id == side.connection_id) else {
-            return;
-        };
-        let which = if baseline { "baseline" } else { "target" };
-        let title = self.text(if baseline { "compare.dialog.baseline" } else { "compare.dialog.target" });
-        let database = self.text("compare.dialog.database");
-        for name in &choice.databases {
-            controls.push((format!("compare-database:{which}:{name}").into(), format!("{title} {database} {name}").into()));
+    fn schema_input(&mut self, side: &'static str, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        if let Some((state, _)) = self.schema_inputs.get(side) {
+            return state.clone();
         }
-    }
-
-    fn push_schema_controls(&self, controls: &mut Vec<(SharedString, SharedString)>, baseline: bool) {
-        let side = if baseline { &self.baseline } else { &self.target };
-        let Some(engine) = self.engine_of(&side.connection_id) else {
-            return;
-        };
-        if engine != "postgres" && engine != "sqlserver" {
-            return;
-        }
-        let Some(SchemaState::Ready(names)) = self.schemas.get(&schema_key(&side.connection_id, &side.database)) else {
-            return;
-        };
-        let which = if baseline { "baseline" } else { "target" };
-        let title = self.text(if baseline { "compare.dialog.baseline" } else { "compare.dialog.target" });
-        let schema = self.text("compare.dialog.chooseSchema");
-        for name in names {
-            controls.push((format!("compare-schema:{which}:{name}").into(), format!("{title} {schema} {name}").into()));
-        }
-    }
-
-    fn manual_reason(&self, baseline: bool) -> Option<String> {
-        let side = if baseline { &self.baseline } else { &self.target };
-        let engine = self.engine_of(&side.connection_id)?;
-        if engine != "postgres" && engine != "sqlserver" {
-            return None;
-        }
-        match self.schemas.get(&schema_key(&side.connection_id, &side.database)) {
-            Some(SchemaState::Manual(reason)) => Some(reason.clone()),
-            _ => None,
-        }
-    }
-}
-
-fn button(id: &'static str, key: &'static str, entity: Entity<ComparePane>, locale: Locale) -> impl IntoElement {
-    let label = SharedString::from(i18n::text(locale, key));
-    div()
-        .id(id)
-        .test_support()
-        .role(gpui_kit::Role::Button)
-        .aria_label(label.clone())
-        .child(label)
-        .on_click(move |_, _, cx| {
-            entity.update(cx, |pane, cx| pane.command(id, cx));
-        })
-}
-
-fn command_button(id: SharedString, label: SharedString, entity: Entity<ComparePane>) -> impl IntoElement {
-    let command = id.clone();
-    div()
-        .id(id)
-        .test_support()
-        .role(gpui_kit::Role::Button)
-        .aria_label(label.clone())
-        .child(label)
-        .on_click(move |_, _, cx| {
-            let command = command.clone();
-            entity.update(cx, |pane, cx| pane.command(&command, cx));
-        })
-}
-
-fn schema_box(side: &'static str, value: &str, reason: &str, focus: FocusHandle, entity: Entity<ComparePane>, locale: Locale) -> impl IntoElement {
-    let placeholder = i18n::text(locale, "compare.dialog.schemaManualPlaceholder");
-    let label = if reason.is_empty() {
-        SharedString::from(format!("{placeholder} {value}"))
-    } else {
-        SharedString::from(format!("{reason} {placeholder} {value}"))
-    };
-    div()
-        .id(SharedString::from(format!("compare-schema-input:{side}")))
-        .test_support()
-        .track_focus(&focus)
-        .min_h(px(28.))
-        .w(px(280.))
-        .role(gpui_kit::Role::TextInput)
-        .aria_label(label.clone())
-        .child(label)
-        .on_mouse_down(gpui_kit::MouseButton::Left, {
-            let entity = entity.clone();
-            let focus = focus.clone();
-            move |_, window, cx| {
-                window.focus(&focus, cx);
-                entity.update(cx, |pane, cx| {
-                    pane.schema_focus_side = Some(side.to_owned());
-                    cx.notify();
-                });
+        let placeholder = SharedString::from(self.text("compare.dialog.schemaManualPlaceholder"));
+        let initial = SharedString::from(self.schema_draft.get(side).cloned().unwrap_or_default());
+        let state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(initial));
+        let subscription = cx.subscribe(&state, move |this, state, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                let text = state.read(cx).value().to_string();
+                this.schema_draft.insert(side.to_owned(), text);
+                cx.notify();
             }
-        })
-        .on_key_down(move |event: &gpui_kit::KeyDownEvent, _, cx| {
-            let action = schema_key_action(event);
-            entity.update(cx, |pane, cx| {
-                if pane.schema_focus_side.as_deref() != Some(side) {
-                    return;
-                }
-                match action {
-                    SchemaKey::Ignore => {}
-                    SchemaKey::Backspace => {
-                        pane.schema_draft.entry(side.to_owned()).or_default().pop();
-                        cx.notify();
-                    }
-                    SchemaKey::Type(text) => {
-                        pane.schema_draft.entry(side.to_owned()).or_default().push_str(&text);
-                        cx.notify();
-                    }
-                    SchemaKey::Commit => {
-                        let name = pane.schema_draft.get(side).cloned().unwrap_or_default();
-                        pane.command(&format!("compare-schema:{side}:{name}"), cx);
-                    }
-                }
-            });
-        })
+        });
+        self.schema_inputs.insert(side, (state.clone(), subscription));
+        state
+    }
 }
 
-enum SchemaKey {
-    Ignore,
-    Backspace,
-    Type(String),
-    Commit,
+fn compare_act(id: impl Into<String>, entity: &Entity<ComparePane>) -> impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static {
+    let id = id.into();
+    let entity = entity.clone();
+    move |_, _, cx| {
+        let id = id.clone();
+        entity.update(cx, |pane, cx| pane.command(&id, cx));
+    }
 }
 
-fn schema_key_action(event: &gpui_kit::KeyDownEvent) -> SchemaKey {
-    if event.keystroke.modifiers.control || event.keystroke.modifiers.platform || event.keystroke.modifiers.alt {
-        return SchemaKey::Ignore;
-    }
-    match event.keystroke.key.as_str() {
-        "backspace" => SchemaKey::Backspace,
-        "enter" => SchemaKey::Commit,
-        "escape" | "tab" | "up" | "down" | "left" | "right" => SchemaKey::Ignore,
-        _ => event.keystroke.key_char.clone().filter(|text| !text.is_empty()).map(SchemaKey::Type).unwrap_or(SchemaKey::Ignore),
-    }
+/// 可选中的小块：显示文字与无障碍名称分开，测试按名称找。
+fn chip(id: SharedString, label: SharedString, text: SharedString, selected: bool, icon: Option<IconName>, p: &Palette) -> gpui_kit::base::ObservedElement<gpui_kit::Stateful<gpui_kit::Div>> {
+    div()
+        .id(id)
+        .test_support()
+        .role(gpui_kit::Role::Button)
+        .aria_label(label)
+        .aria_selected(selected)
+        .h(px(28.))
+        .px(px(10.))
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .rounded(px(7.))
+        .border_1()
+        .text_size(px(12.5))
+        .cursor_pointer()
+        .when(selected, |this| this.border_color(p.accent).bg(p.accent_soft).text_color(p.accent_text))
+        .when(!selected, |this| this.border_color(p.line).hover(|style| style.border_color(p.line_strong).bg(p.hover)))
+        .when_some(icon, |this, icon| this.child(kit::icon(icon, 13., if selected { p.accent_text } else { p.text_faint })))
+        .child(text)
+}
+
+fn stat(label: String, value: usize, tone: gpui_kit::Hsla, p: &Palette) -> AnyElement {
+    div()
+        .flex_1()
+        .p(px(10.))
+        .rounded(px(8.))
+        .bg(p.chrome)
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(div().text_size(px(20.)).font_weight(gpui_kit::FontWeight::SEMIBOLD).text_color(tone).child(SharedString::from(value.to_string())))
+        .child(div().text_size(px(11.5)).text_color(p.text_muted).child(SharedString::from(label)))
+        .into_any_element()
+}
+
+fn diff_row(mark: &'static str, text: String, tone: gpui_kit::Hsla, p: &Palette) -> AnyElement {
+    div()
+        .flex()
+        .gap(px(8.))
+        .px(px(8.))
+        .py(px(4.))
+        .rounded(px(6.))
+        .hover(|style| style.bg(p.hover))
+        .child(div().w(px(12.)).font_weight(gpui_kit::FontWeight::BOLD).text_color(tone).child(mark))
+        .child(div().flex_1().min_w(px(0.)).text_size(px(12.5)).child(SharedString::from(text)))
+        .into_any_element()
+}
+
+fn note_banner(icon: IconName, text: String, fg: gpui_kit::Hsla, bg: gpui_kit::Hsla) -> AnyElement {
+    div()
+        .px(px(12.))
+        .py(px(8.))
+        .flex()
+        .gap(px(8.))
+        .rounded(px(8.))
+        .bg(bg)
+        .text_color(fg)
+        .text_size(px(12.5))
+        .child(kit::icon(icon, 15., fg))
+        .child(div().flex_1().min_w(px(0.)).child(SharedString::from(text)))
+        .into_any_element()
+}
+
+fn script_block(id: &'static str, script: String, mono: &SharedString, p: &Palette) -> AnyElement {
+    div()
+        .id(id)
+        .max_h(px(260.))
+        .overflow_y_scroll()
+        .p(px(12.))
+        .rounded(px(8.))
+        .bg(p.chrome)
+        .border_1()
+        .border_color(p.line)
+        .font_family(mono.clone())
+        .text_size(px(12.))
+        .child(SharedString::from(script))
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -1176,7 +1354,7 @@ mod tests {
 #[cfg(test)]
 mod workbench {
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{AppContext as _, Point, TestAppContext, WindowBounds, WindowOptions, px, size};
+    use gpui_kit::{Point, TestAppContext, WindowBounds, WindowOptions, px, size};
 
     use super::*;
 

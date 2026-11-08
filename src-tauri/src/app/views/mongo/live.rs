@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::{Point, TestAppContext, WindowBounds, WindowOptions, px, size};
 use gpui_kit::test::TestWindowExt;
-use gpui_kit::AppContext as _;
 
 use super::*;
 use crate::application::AppServices;

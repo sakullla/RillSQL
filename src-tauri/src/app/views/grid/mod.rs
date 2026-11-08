@@ -6,10 +6,16 @@ use std::sync::{Arc, OnceLock};
 
 pub use session::{operation_banner, prove_single_table, GridMode, GridTarget, SharedGrid};
 
+use gpui_kit::assets::IconName;
+use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableEvent, TableState};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _};
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    App, AppContext as _, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, relative,
 };
+
+use crate::ui::kit::{self, Palette};
+use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::application::AppServices;
 use crate::grid::commands::{CountRequest, FilterArg, PageRequest, TableRef};
@@ -28,6 +34,8 @@ pub struct GridPane {
     edit_buffer: String,
     loading_more: bool,
     sort_desc: bool,
+    search: Option<Entity<InputState>>,
+    search_subscription: Option<gpui_kit::Subscription>,
     _subscription: gpui_kit::Subscription,
 }
 
@@ -57,6 +65,8 @@ impl GridPane {
             edit_buffer: String::new(),
             loading_more: false,
             sort_desc: false,
+            search: None,
+            search_subscription: None,
             _subscription: subscription,
         }
     }
@@ -482,30 +492,88 @@ fn count_of(request: &PageRequest) -> CountRequest {
 }
 
 impl Render for GridPane {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let start = self.table.read(cx).delegate().visible_start;
         if self.table.read(cx).delegate().visible_seen {
             self.session.scroll_to(start);
         }
+        let p = Palette::of(cx);
         let locale = self.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let entity = cx.entity();
+        let search = self.search_input(window, cx);
+        let writable = self.session.writable();
+        let dirty = self.session.uncommitted();
+        let table_mode = self.session.mode == GridMode::Table;
+        let has_columns = !self.session.column_names().is_empty();
         let range = SharedString::from(self.session.range_text());
         let banner = SharedString::from(self.session.banner());
-        let status = SharedString::from(if self.session.writable() {
-            i18n::text(locale, "grid.status.writable")
-        } else {
-            i18n::text(locale, "grid.status.readonly")
-        });
         let table = self.table.clone();
-        let preview = self.session.preview_open();
-        let sql = self.session.preview_sql().join("\n");
-        let entity = cx.entity();
-        let search = SharedString::from(if self.search_text.is_empty() { i18n::text(locale, "grid.action.search") } else { self.search_text.clone() });
+
+        let mut tools = div()
+            .id("grid-tools")
+            .flex_none()
+            .h(px(40.))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .border_b_1()
+            .border_color(p.line)
+            .child(div().w(px(220.)).child(kit::text_input("grid-search", &search, t("grid.action.search")).small().prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)))
+            .child(
+                kit::icon_button("grid-sort", if self.sort_desc { IconName::ArrowDownWideNarrow } else { IconName::ArrowUpNarrowWide }, t("grid.action.sort"), {
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |pane, cx| {
+                            let _ = pane.command("grid-sort", cx);
+                        });
+                    }
+                }),
+            );
+        if table_mode {
+            tools = tools
+                .child(kit::vline(&p))
+                .child(grid_icon("grid-page-prev", IconName::ChevronLeft, t("grid.action.pagePrev"), entity.clone()))
+                .child(div().px(px(4.)).text_size(px(12.)).text_color(p.text_muted).child(range.clone()))
+                .child(grid_icon("grid-page-next", IconName::ChevronRight, t("grid.action.pageNext"), entity.clone()));
+        } else {
+            tools = tools.child(div().px(px(6.)).text_size(px(12.)).text_color(p.text_muted).child(range.clone()));
+        }
+        tools = tools.child(div().flex_1()).child(kit::pill(
+            if writable { t("grid.status.writable") } else { t("grid.status.readonly") },
+            if writable { p.ok } else { p.text_muted },
+            if writable { p.ok_soft } else { p.hover },
+        ));
+        tools = tools.child(grid_icon("copy-region", IconName::Copy, t("grid.value.copyValue"), entity.clone()));
+        if writable {
+            tools = tools
+                .child(grid_icon("grid-insert", IconName::Plus, t("grid.action.insert"), entity.clone()))
+                .child(grid_icon("mark-delete", IconName::Trash, t("grid.menu.markDelete"), entity.clone()));
+        }
+        if writable || dirty {
+            let preview = {
+                let entity = entity.clone();
+                move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                    entity.update(cx, |pane, cx| {
+                        let _ = pane.command("grid-preview", cx);
+                    });
+                }
+            };
+            tools = tools.child(if dirty {
+                kit::primary_button("grid-preview", Some(IconName::Eye), t("grid.action.preview"), preview).into_any_element()
+            } else {
+                kit::tool_button("grid-preview", Some(IconName::Eye), t("grid.action.preview"), preview).into_any_element()
+            });
+        }
+
         let mut column = div()
             .id("shared-grid")
+            .relative()
             .flex()
             .flex_col()
             .size_full()
-            .gap(px(4.))
+            .bg(p.surface)
             .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
                 if this.editing {
                     this.type_edit(event, cx);
@@ -532,111 +600,156 @@ impl Render for GridPane {
                     cx.notify();
                 }
             }))
-            .child(div().id("grid-range").child(range).child(" ").child(status))
-            .child(div().id("grid-banner").child(banner))
-            .child(
-                div()
-                    .id("grid-tools")
-                    .flex()
-                    .gap(px(4.))
-                    .child(
-                        div()
-                            .id("grid-search")
-                            .role(gpui_kit::Role::TextInput)
-                            .aria_label(search.clone())
-                            .child(search)
-                            .on_key_down({
-                                let entity = entity.clone();
-                                move |event: &gpui_kit::KeyDownEvent, _, cx| {
-                                    let Some(text) = grid_typed(event) else { return };
-                                    entity.update(cx, |pane, cx| {
-                                        pane.type_search(&text);
-                                        cx.notify();
-                                    });
-                                }
-                            }),
-                    )
-                    .child(tool_button("grid-search", i18n::text(locale, "grid.action.search"), entity.clone()))
-                    .child(tool_button("grid-sort", i18n::text(locale, "grid.action.sort"), entity.clone()))
-                    .child(tool_button("grid-filter", i18n::text(locale, "grid.action.filter"), entity.clone()))
-                    .child(tool_button("grid-page-prev", i18n::text(locale, "grid.action.pagePrev"), entity.clone()))
-                    .child(tool_button("grid-page-next", i18n::text(locale, "grid.action.pageNext"), entity.clone()))
-                    .child(tool_button("copy-region", i18n::text(locale, "grid.value.copyValue"), entity.clone()))
-                    .child(tool_button("grid-insert", i18n::text(locale, "grid.action.insert"), entity.clone()))
-                    .child(tool_button("mark-delete", i18n::text(locale, "grid.menu.markDelete"), entity.clone()))
-                    .child(tool_button("grid-preview", i18n::text(locale, "grid.action.preview"), entity.clone())),
-            )
-            .child(DataTable::new(&table).accessibility_label("shared-grid"));
+            .child(tools)
+            .child(div().id("grid-range").hidden().child(range))
+            .child(div().id("grid-banner").hidden().child(banner));
+        if has_columns {
+            column = column.child(div().flex_1().min_h(px(0.)).child(DataTable::new(&table).small().stripe(true).accessibility_label("shared-grid")));
+        } else {
+            column = column.child(div().flex_1().flex().items_center().justify_center().child(kit::empty_state(IconName::Table, t("ui.grid.empty"), SharedString::from(""), &p)));
+        }
         if self.editing {
-            let buffer = SharedString::from(self.edit_buffer.clone());
+            let buffer = SharedString::from(if self.edit_buffer.is_empty() { " ".to_owned() } else { self.edit_buffer.clone() });
             column = column.child(
                 div()
                     .id("grid-edit")
                     .role(gpui_kit::Role::TextInput)
-                    .aria_label(SharedString::from(i18n::text(locale, "shell.shortcuts.editCell")))
-                    .child(buffer),
+                    .aria_label(t("shell.shortcuts.editCell"))
+                    .flex_none()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .bg(p.accent_soft)
+                    .border_t_1()
+                    .border_color(p.accent)
+                    .child(kit::icon(IconName::Pencil, 14., p.accent_text))
+                    .child(
+                        div()
+                            .flex_1()
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded(px(6.))
+                            .bg(p.surface)
+                            .border_1()
+                            .border_color(p.accent)
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .child(buffer),
+                    )
+                    .child(kit::kbd("Enter", &p))
+                    .child(kit::kbd("Esc", &p)),
             );
         }
         if let Some(shown) = self.session.viewer() {
+            let body = if shown.body.is_empty() { shown.label } else { shown.body };
             column = column.child(
                 div()
                     .id("grid-value")
                     .role(gpui_kit::Role::Dialog)
-                    .aria_label(SharedString::from(i18n::text(locale, "grid.value.copyValue")))
-                    .child(SharedString::from(format!("{:?} {}", shown.kind, if shown.body.is_empty() { shown.label } else { shown.body }))),
+                    .aria_label(t("grid.value.copyValue"))
+                    .flex_none()
+                    .max_h(px(180.))
+                    .overflow_y_scroll()
+                    .px(px(14.))
+                    .py(px(10.))
+                    .border_t_1()
+                    .border_color(p.line)
+                    .bg(p.chrome)
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(kit::eyebrow(SharedString::from(format!("{:?}", shown.kind)), &p))
+                    .child(div().font_family(cx.theme().mono_font_family.clone()).text_size(px(12.5)).child(SharedString::from(body))),
             );
         }
-        if preview {
-            let entity = cx.entity();
+        if self.session.preview_open() {
+            let sql = self.session.preview_sql().join("\n");
             column = column.child(
                 div()
-                    .id("grid-preview")
-                    .role(gpui_kit::Role::Dialog)
-                    .aria_label(SharedString::from(i18n::text(locale, "grid.preview.title")))
-                    .child(SharedString::from(self.session.banner()))
-                    .child(SharedString::from(sql))
-                    .child(grid_button("grid-preview-confirm", i18n::text(locale, "grid.preview.confirm"), entity.clone()))
-                    .child(grid_button("grid-preview-cancel", i18n::text(locale, "grid.preview.cancel"), entity)),
+                    .absolute()
+                    .inset_0()
+                    .bg(gpui_kit::hsla(0., 0., 0., 0.25))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id("grid-preview")
+                            .role(gpui_kit::Role::Dialog)
+                            .aria_label(t("grid.preview.title"))
+                            .occlude()
+                            .w(px(620.))
+                            .max_w(relative(0.92))
+                            .p(px(18.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.))
+                            .bg(p.raised)
+                            .border_1()
+                            .border_color(p.line)
+                            .rounded(px(12.))
+                            .shadow_lg()
+                            .child(kit::title(t("grid.preview.title"), 15., &p))
+                            .child(kit::muted(SharedString::from(self.session.banner()), &p))
+                            .child(
+                                div()
+                                    .id("grid-preview-sql")
+                                    .max_h(px(280.))
+                                    .overflow_y_scroll()
+                                    .p(px(12.))
+                                    .rounded(px(8.))
+                                    .bg(p.chrome)
+                                    .border_1()
+                                    .border_color(p.line)
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .text_size(px(12.5))
+                                    .child(SharedString::from(sql)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_end()
+                                    .gap(px(8.))
+                                    .child(grid_button("grid-preview-cancel", false, t("grid.preview.cancel"), entity.clone()))
+                                    .child(grid_button("grid-preview-confirm", true, t("grid.preview.confirm"), entity)),
+                            ),
+                    ),
             );
         }
         column
     }
 }
 
-fn tool_button(id: &'static str, label: String, entity: Entity<GridPane>) -> impl IntoElement {
-    let text = SharedString::from(label);
-    div()
-        .id(id)
-        .role(gpui_kit::Role::Button)
-        .aria_label(text.clone())
-        .child(text)
-        .on_click(move |_, _, cx| {
-            entity.update(cx, |pane, cx| {
-                let _ = pane.command(id, cx);
-            });
-        })
+impl GridPane {
+    fn search_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        if let Some(state) = &self.search {
+            return state.clone();
+        }
+        let placeholder = SharedString::from(i18n::text(self.locale, "ui.grid.searchPlaceholder"));
+        let state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        let subscription = cx.subscribe(&state, |this, state, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change | InputEvent::PressEnter { .. }) {
+                this.search_text = state.read(cx).value().to_string();
+                let _ = this.command("grid-search", cx);
+                cx.notify();
+            }
+        });
+        self.search_subscription = Some(subscription);
+        self.search = Some(state.clone());
+        state
+    }
 }
 
-fn grid_typed(event: &gpui_kit::KeyDownEvent) -> Option<String> {
-    if event.keystroke.modifiers.control || event.keystroke.modifiers.platform || event.keystroke.modifiers.alt {
-        return None;
-    }
-    match event.keystroke.key.as_str() {
-        "backspace" => Some("backspace".into()),
-        "escape" | "enter" | "tab" | "up" | "down" | "left" | "right" => None,
-        _ => event.keystroke.key_char.clone().filter(|text| !text.is_empty()),
-    }
+fn grid_icon(id: &'static str, icon: IconName, label: SharedString, entity: Entity<GridPane>) -> gpui_kit::component::button::Button {
+    kit::icon_button(id, icon, label, move |_, _, cx| {
+        entity.update(cx, |pane, cx| {
+            let _ = pane.command(id, cx);
+        });
+    })
 }
 
 impl GridPane {
-    fn type_search(&mut self, text: &str) {
-        if text == "backspace" {
-            self.search_text.pop();
-        } else {
-            self.search_text.push_str(text);
-        }
-    }
-
     fn type_edit(&mut self, event: &gpui_kit::KeyDownEvent, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
             "backspace" => {
@@ -663,22 +776,21 @@ impl GridPane {
     }
 }
 
-fn grid_button(id: &'static str, label: String, entity: Entity<GridPane>) -> impl IntoElement {
-    let text = SharedString::from(label);
-    div()
-        .id(id)
-        .role(gpui_kit::Role::Button)
-        .aria_label(text.clone())
-        .child(text)
-        .on_click(move |_, _, cx| {
-            entity.update(cx, |pane, cx| {
-                if id.ends_with("confirm") {
-                    pane.confirm(cx);
-                } else {
-                    pane.cancel_preview(cx);
-                }
-            });
-        })
+fn grid_button(id: &'static str, primary: bool, label: SharedString, entity: Entity<GridPane>) -> impl IntoElement {
+    let click = move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+        entity.update(cx, |pane, cx| {
+            if id.ends_with("confirm") {
+                pane.confirm(cx);
+            } else {
+                pane.cancel_preview(cx);
+            }
+        });
+    };
+    if primary {
+        kit::primary_button(id, Some(IconName::Check), label, click)
+    } else {
+        kit::secondary_button(id, None, label, click)
+    }
 }
 
 #[derive(Default)]
@@ -711,9 +823,14 @@ impl TableDelegate for SheetDelegate {
         column
     }
 
-    fn render_td(&mut self, row_ix: usize, col_ix: usize, _: &mut Window, _: &mut Context<TableState<Self>>) -> impl IntoElement {
+    fn render_td(&mut self, row_ix: usize, col_ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
         let text = self.rows.get(row_ix).and_then(|line| line.get(col_ix)).cloned().unwrap_or_default();
-        div().child(SharedString::from(text))
+        let null = text == "NULL" || text == i18n::text(Locale::ZhCn, "grid.value.null") || text == i18n::text(Locale::En, "grid.value.null");
+        let p = Palette::of(cx);
+        div()
+            .truncate()
+            .when(null, |this| this.text_color(p.text_faint).italic())
+            .child(SharedString::from(text))
     }
 
     fn cell_label(&self, row_ix: usize, col_ix: usize, _: &App) -> Option<SharedString> {

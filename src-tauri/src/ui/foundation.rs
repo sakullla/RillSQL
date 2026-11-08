@@ -1,7 +1,7 @@
 //! Root GPUI view: shell controls, SQL editor prototype, virtual grid, files.
 #![cfg_attr(not(test), allow(dead_code, unused_imports))]
 
-use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{
     App, AppContext as _, Context, Entity, ExternalPaths, FocusHandle, Focusable, IntoElement,
     ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _, Window,
@@ -388,11 +388,7 @@ fn page_name(page: AppPage) -> &'static str {
 }
 
 fn apply_theme(shell: &Shell, cx: &mut App) {
-    let mode = match shell.resolved_theme() {
-        ResolvedTheme::Light => ThemeMode::Light,
-        ResolvedTheme::Dark => ThemeMode::Dark,
-    };
-    Theme::change(mode, None, cx);
+    crate::ui::kit::apply_theme(matches!(shell.resolved_theme(), ResolvedTheme::Dark), cx);
 }
 
 #[allow(dead_code)]
