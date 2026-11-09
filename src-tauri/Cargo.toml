@@ -1,6 +1,6 @@
 [package]
 name = "rillsql"
-version = "0.2.18"
+version = "0.2.19"
 description = "RillSQL"
 authors = ["RillSQL"]
 edition = "2021"
@@ -57,6 +57,9 @@ cargo-packager-updater = "=0.2.3"
 cargo-packager = { version = "=0.11.8", optional = true }
 minisign = { version = "0.7", optional = true }
 toml = { version = "0.9", optional = true }
+
+[build-dependencies]
+embed-resource = "3.0.12"
 
 [dev-dependencies]
 gpui-kit = { version = "=0.9.0", features = ["test-support", "tree-sitter-sql"] }

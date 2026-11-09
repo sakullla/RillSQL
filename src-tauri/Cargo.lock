@@ -8191,7 +8191,7 @@ dependencies = [
 
 [[package]]
 name = "rillsql"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "argon2 0.5.3",
  "async-trait",
@@ -8203,6 +8203,7 @@ dependencies = [
  "chrono",
  "csv",
  "directories",
+ "embed-resource",
  "futures",
  "gpui-kit",
  "gpui-pre",
