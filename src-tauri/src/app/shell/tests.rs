@@ -3472,9 +3472,9 @@ fn low_frequency_navigation_moves_to_the_palette_with_context() {
     let entry = |model: &WorkbenchModel, id: &str| {
         model.palette_entries().into_iter().find(|entry| entry.id == id).expect(id)
     };
-    // 没有对象时两个入口仍然可发现，并说明缺什么。
+    // 没有对象或结果时两个入口仍然可发现，并说明缺什么。
     assert_eq!(entry(&model, "compare").detail, model.text("compare.context.none"));
-    assert!(entry(&model, "open-exchange").detail.is_empty());
+    assert_eq!(entry(&model, "open-exchange").detail, model.text("shell.palette.exchange.none"));
 
     let orders = tree_object("pg", "销售库", "postgres", "shop", "public", "orders", "table");
     assert!(model.set_catalog(std::slice::from_ref(&orders), ""));
@@ -3482,7 +3482,8 @@ fn low_frequency_navigation_moves_to_the_palette_with_context() {
     model.object_spec = Some(spec.clone());
     let compare = entry(&model, "compare");
     assert!(compare.detail.contains("orders") && compare.detail.contains("销售库"), "{}", compare.detail);
-    assert!(entry(&model, "open-exchange").detail.contains("orders"));
+    // 导入导出按活动工作项说明来源：只有对象树选择时还不能说会导出哪张表。
+    assert_eq!(entry(&model, "open-exchange").detail, model.text("shell.palette.exchange.none"));
 
     // 英文界面同样带上下文，不把键名当文案。
     model.shell.locale = Locale::En;
@@ -3494,6 +3495,7 @@ fn low_frequency_navigation_moves_to_the_palette_with_context() {
     // 对比入口带上当前对象；工作台入口把原工作项与焦点一起带回来。
     assert!(model.dispatch(&format!("open-table:{spec}")).is_some());
     assert_eq!(model.shell.focus, crate::app::FocusTarget::Grid);
+    assert!(entry(&model, "open-exchange").detail.contains("orders"), "表格工作项才是导出来源");
     let active = model.active_tab.clone();
     assert!(model.dispatch("compare").is_some());
     assert_eq!(model.shell.page, AppPage::Compare);
@@ -3657,6 +3659,56 @@ fn compare_and_exchange_return_to_the_same_item_and_keep_staged_cells(cx: &mut g
         assert_eq!(view.model.tool, WorkTool::Table);
         assert_eq!(view.model.shell.focus, crate::app::FocusTarget::Grid);
         assert!(view.table_uncommitted(cx), "返回后暂存仍在");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 网格右键的“对比”必须带正在显示的表：对象树里另一行选择不能顶掉它。
+#[gpui_kit::test]
+fn grid_menu_compare_carries_the_displayed_table_not_the_tree_row(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-grid-compare-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    let shown = "notes|笔记|main||customers|sqlite|dev";
+    let tree_row = "notes|笔记|main||orders|sqlite|dev";
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform(&format!("open-table:{shown}"), cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    // 对象树里单击另一张表：只改选择，不换工作项，网格仍然显示 customers。
+    cx.update(|cx| {
+        view.update(cx, |view, _| view.model.object_spec = Some(tree_row.to_owned()));
+        let view = view.read(cx);
+        assert_eq!(view.model.tool, WorkTool::Table);
+        assert_eq!(view.model.active_tab().and_then(|tab| tab.spec.clone()).as_deref(), Some(shown));
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("menu-grid", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        let menu = view.model.menu.as_ref().expect("网格菜单");
+        let ids: Vec<&str> = menu.items.iter().map(|item| item.id).collect();
+        assert!(ids.contains(&"compare-grid"), "{ids:?}");
+        assert_eq!(menu.place, MenuPlace::Grid);
+        assert!(!ids.contains(&"compare-object"), "网格菜单不能再复用对象树的范围动作：{ids:?}");
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("compare-grid", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.model.shell.page, AppPage::Compare);
+        let (context, note, _baseline, _target) = view.compare_state(cx);
+        assert_eq!(context.as_deref(), Some("main.customers · 笔记"), "网格菜单要带正在显示的表：{note}");
+        assert!(!note.contains("orders"), "树里的另一行不能当当前对象：{note}");
+        assert_eq!(view.model.object_spec.as_deref(), Some(tree_row), "对象树选择保持不变");
     });
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1670,11 +1670,18 @@ impl WorkbenchModel {
         }
     }
 
-    /// 交换/导入导出条目的来源说明：查询项是结果，其余是当前表数据。
+    /// 交换/导入导出条目的来源说明：查询项是结果，表格/结构等项用它的对象；
+    /// 抽屉实际按活动工作项导出，所以这里也只看活动工作项，并说明缺什么。
     pub fn exchange_detail(&self) -> String {
-        match self.active_tab() {
-            Some(tab) if tab.kind.is_query() => self.text("shell.paletteGroup.queryResult"),
-            _ => self.object_target().map(|target| target.path()).unwrap_or_default(),
+        let Some(tab) = self.active_tab() else {
+            return self.text("shell.palette.exchange.none");
+        };
+        if tab.kind.is_query() {
+            return self.text("shell.paletteGroup.queryResult");
+        }
+        match tab.spec.as_deref().and_then(ObjectTarget::parse) {
+            Some(target) => target.path(),
+            None => self.text("shell.palette.exchange.none"),
         }
     }
 

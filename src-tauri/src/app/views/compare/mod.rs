@@ -221,12 +221,13 @@ impl ComparePane {
         match context {
             Some(context) => {
                 self.context = Some(context);
-                self.context_note = self.carried_note();
                 if self.choices.is_empty() {
                     // 首次打开还没有连接清单：读完后再落两侧，期间保留上下文说明。
                     if !self.choices_loading {
                         self.refresh_choices(cx);
                     }
+                    // 清单还没到就还不知道有没有基准侧，先不说“缺连接”。
+                    self.context_note = self.carried_note();
                 } else {
                     self.apply_context(cx);
                 }
@@ -239,18 +240,23 @@ impl ComparePane {
         }
     }
 
+    /// 带入说明只描述真正带入的对象；基准侧是否缺失单独拼在后面，
+    /// 已经找到另一条可比连接时不再声称“还需要一个已打开的连接”。
     fn carried_note(&self) -> String {
-        match self.context.as_ref() {
-            Some(context) => fill(&self.text("compare.context.carried"), &[("{path}", &context.path)]),
-            None => self.text("compare.context.none"),
+        let Some(context) = self.context.as_ref() else {
+            return self.text("compare.context.none");
+        };
+        let mut note = fill(&self.text("compare.context.carried"), &[("{path}", &context.path)]);
+        if self.baseline.connection_id.is_empty() && !self.choices_loading {
+            note.push_str(&self.text("compare.context.baselineMissing"));
         }
+        note
     }
 
     /// 把带入的上下文落到两侧：当前对象放在对照侧，基准侧优先取另一个已打开连接。
-    /// 只有一侧可用时保留说明文字，提示还缺一个已打开的连接。
+    /// 两侧任何一侧变化都算新目标：旧报告、选择和已放入脚本不再属于这次带入的上下文。
     fn apply_context(&mut self, cx: &mut Context<Self>) {
         let Some(context) = self.context.clone() else { return };
-        self.context_note = self.carried_note();
         let Some(choice) = self.choices.iter().find(|choice| choice.id == context.connection_id).cloned() else {
             // 这个连接没有打开或不可比较：保留带入说明，并指出这一侧缺什么，不改两侧选择。
             self.context_note = fill(&self.text("compare.context.sideMissing"), &[("{path}", &context.path)]);
@@ -261,7 +267,9 @@ impl ComparePane {
         } else {
             context.database.clone()
         };
-        let changed = self.target.connection_id != context.connection_id
+        // 变更判定要同时覆盖基准侧：重新带入会把手动选过的基准改回候选连接，
+        // 只看对照侧就会让界面上的两侧与仍显示的报告对不上。
+        let mut changed = self.target.connection_id != context.connection_id
             || self.target.database != database
             || self.target.schema != context.schema;
         self.target = SidePick {
@@ -277,7 +285,8 @@ impl ComparePane {
             .cloned()
         {
             let other_database = other.databases.first().cloned().unwrap_or_default();
-            if self.baseline.connection_id != other.id || self.baseline.database != other_database {
+            if self.baseline.connection_id != other.id || self.baseline.database != other_database || !self.baseline.schema.is_empty() {
+                changed = true;
                 self.baseline = SidePick {
                     connection_id: other.id,
                     database: other_database,
@@ -288,6 +297,8 @@ impl ComparePane {
         if changed {
             self.invalidate_results();
         }
+        // 两侧落定后再生成说明，避免基线已经有了还说缺连接。
+        self.context_note = self.carried_note();
         self.ensure_schemas(true, cx);
         self.ensure_schemas(false, cx);
     }
@@ -310,8 +321,9 @@ impl ComparePane {
             cx.notify();
             return;
         }
-        if id == "compare-object" {
-            // 外壳负责把完整对象目标交给 open_context；这里只刷新连接清单。
+        if id == "compare-object" || id == "compare-grid" {
+            // 外壳负责把完整对象目标交给 open_context；这里只刷新连接清单，
+            // 刚打开的目标连接才会出现在候选里。
             self.refresh_choices(cx);
             cx.notify();
             return;
@@ -372,7 +384,8 @@ impl ComparePane {
             choice.databases.first().cloned().unwrap_or_default()
         };
         let slot = if baseline { &mut self.baseline } else { &mut self.target };
-        let changed = slot.connection_id != choice.id || slot.database != database;
+        // 重新选连接会清掉 schema，这也是新目标。
+        let changed = slot.connection_id != choice.id || slot.database != database || !slot.schema.is_empty();
         slot.connection_id = choice.id;
         slot.database = database;
         slot.schema.clear();
@@ -1669,6 +1682,7 @@ mod tests {
         assert_eq!(target, "right", "当前对象放在对照侧");
         assert_eq!(baseline, "left", "基准侧取另一个已打开连接");
         assert!(note.contains("shop.orders"), "{note}");
+        assert!(!note.contains("还需要一个已打开的连接"), "两侧都齐了就不能再报缺连接：{note}");
         assert_eq!(pane.update(cx, |pane, _| pane.context().cloned()), Some(context.clone()));
 
         // 只剩一侧可用：当前对象仍然带入，并说明另一侧还缺连接。
@@ -1704,6 +1718,64 @@ mod tests {
         pane.update(cx, |pane, cx| pane.command("compare-back", cx));
         assert!(pane.update(cx, |pane, _| pane.take_back()));
         assert!(!pane.update(cx, |pane, _| pane.take_back()));
+    }
+
+    /// 重新带入上下文会把基准侧换回候选连接：旧报告、选择与待放入脚本必须一起失效，
+    /// 否则页面显示的两侧和留在屏幕上的差异不再对应。
+    #[gpui_kit::test]
+    fn reopening_the_context_with_another_baseline_drops_the_old_report(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let pane = cx.update(|cx| {
+            let dir = std::env::temp_dir().join(format!("rillsql-compare-reopen-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+            cx.new(|_| {
+                let mut pane = ComparePane::new(services);
+                pane.choices = vec![context_choice("a", "A"), context_choice("b", "B"), context_choice("c", "C")];
+                pane
+            })
+        });
+        let context = CompareContext {
+            connection_id: "a".into(),
+            connection_name: "A".into(),
+            database: "shop".into(),
+            schema: String::new(),
+            object: "orders".into(),
+            path: "shop.orders · A".into(),
+        };
+        pane.update(cx, |pane, cx| pane.open_context(Some(context.clone()), cx));
+        assert_eq!(pane.update(cx, |pane, _| pane.sides()), ("b".to_owned(), "a".to_owned()), "基准侧自动取另一个已打开连接");
+
+        // 用户手动把基准侧改成 C，并跑出一份 C 对 A 的报告。
+        pane.update(cx, |pane, cx| pane.pick(true, "c", cx));
+        assert_eq!(pane.update(cx, |pane, _| pane.sides()), ("c".to_owned(), "a".to_owned()));
+        pane.update(cx, |pane, _| {
+            pane.structure = Some(empty_structure(None));
+            pane.structure_status = Status::Ready;
+            pane.selected.insert("orders".into(), true);
+            pane.chosen_key.insert("orders".into(), "id".into());
+            pane.placed = Some(PlacedScript {
+                sql: "ALTER TABLE orders ADD COLUMN note TEXT;".into(),
+                connection_id: None,
+                connection_name: None,
+                database: None,
+                engine: None,
+            });
+        });
+
+        // 再次带入同一对象的上下文：基准侧回到 B，C 对 A 的报告不能再留在页面上。
+        pane.update(cx, |pane, cx| pane.open_context(Some(context), cx));
+        let (baseline, target) = pane.update(cx, |pane, _| pane.sides());
+        assert_eq!((baseline.as_str(), target.as_str()), ("b", "a"), "重新带入会替换基准侧");
+        pane.update(cx, |pane, _| {
+            assert!(pane.structure.is_none(), "基准侧变了，旧结构差异不再是新目标的结论");
+            assert!(pane.data.is_none());
+            assert_eq!(pane.structure_status, Status::Idle);
+            assert_eq!(pane.data_status, Status::Idle);
+            assert!(pane.selected.is_empty(), "旧选择属于旧的一对侧");
+            assert!(pane.chosen_key.is_empty());
+            assert!(pane.placed.is_none() && pane.pending_place.is_none(), "待放入脚本也要失效");
+        });
     }
 }
 

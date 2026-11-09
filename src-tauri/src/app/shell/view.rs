@@ -229,20 +229,24 @@ impl Workbench {
                 cx.notify();
                 return;
             }
-            let _ = self.model.dispatch(id);
-            let locale = self.model.locale();
-            // 对比入口带上当前对象/范围：对象菜单用对象树里的选择，
-            // 命令面板与快捷键用当前工作项或对象树选择。
+            // 对比入口按触发面取目标：网格菜单只认正在显示的表格/结果，
+            // 对象树菜单认树里的选择，命令面板与快捷键用当前工作项或对象树选择。
+            // 目标在切换页面前取，避免“打开对比”自己改掉页面的判定。
             let context = match id {
+                // 网格菜单来自表格/结果右键：目标必须与屏幕上显示的数据一致，
+                // 不能拿对象树里的另一行当当前对象。
+                "compare-grid" => self.grid_compare_target(),
                 // 对象菜单以右键/当前对象为准；没有选中对象时退回当前工作项的目标。
                 "compare-object" => self.model.object_target().or_else(|| self.model.compare_target()),
                 "compare" => self.model.compare_target(),
                 _ => None,
             }
             .map(|target| CompareContext::of(&target));
+            let _ = self.model.dispatch(id);
+            let locale = self.model.locale();
             self.compare.update(cx, |pane, cx| {
                 pane.set_locale(locale);
-                if id == "compare" || id == "compare-object" {
+                if id == "compare" || id == "compare-object" || id == "compare-grid" {
                     pane.open_context(context, cx);
                 }
                 pane.command(id, cx);
@@ -319,6 +323,21 @@ impl Workbench {
         }
         self.persist_if_needed();
         cx.notify();
+    }
+
+    /// 网格上下文菜单的当前目标：表格页用正在显示的表，结果页用该工作的连接/库。
+    /// 这里刻意不回退对象树选择，否则右键“对比”会带走树里另一行。
+    fn grid_compare_target(&self) -> Option<crate::app::model::ObjectTarget> {
+        if self.model.shell.page == crate::app::AppPage::Workspace && self.model.tool == WorkTool::Table {
+            if let Some(target) = self.table_view_spec.as_deref().and_then(crate::app::model::ObjectTarget::parse) {
+                return Some(target);
+            }
+        }
+        let tab = self.model.active_tab()?;
+        tab.spec
+            .as_deref()
+            .and_then(crate::app::model::ObjectTarget::parse)
+            .or_else(|| self.model.active_scope())
     }
 
     fn route_shared_grid(&mut self, id: &str, cx: &mut Context<Self>) -> Option<String> {

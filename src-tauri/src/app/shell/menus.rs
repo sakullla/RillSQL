@@ -94,7 +94,8 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
                 item("grid-filter-value", "grid.menu.filterByValue"),
                 item("tree-select-sql", "catalog.tree.copyToQuery"),
                 item("open-exchange", "shell.command.openExchange"),
-                item("compare-object", "shell.command.compare"),
+                // 网格里的对比以正在显示的表格为目标，不复用对象树选择（compare-object）。
+                item("compare-grid", "shell.command.compare"),
                 if write {
                     item("edit-cell", "shell.shortcuts.editCell")
                 } else {
