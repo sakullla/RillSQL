@@ -226,3 +226,92 @@ fn sqlserver_value_family_maps_tsql_type_names() {
     assert_eq!(families.get("nvarchar"), Some(&super::sql::ValueFamily::Text));
     assert_eq!(families.get("varbinary"), Some(&super::sql::ValueFamily::Binary));
 }
+fn cmp(column: &str, op: FilterOp, value: &str) -> Filter {
+    Filter { column: column.to_owned(), op, value: Some(value.to_owned()), second: None, values: Vec::new() }
+}
+
+fn text_of(page: &super::store::Page, row: usize, column: &str) -> Option<String> {
+    match page.rows[row].cells.get(column) {
+        Some(Cell::Text(text)) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+#[test]
+fn arbitrary_column_sort_combines_with_search_filters_and_paging() {
+    let store = customers_fixture(30);
+    let asc = Sort { column: "name".to_owned(), descending: false };
+    let desc = Sort { column: "name".to_owned(), descending: true };
+    let first = browse_sql_with_search(&store.schema, &[], None, Some(&asc), 10, 0).unwrap();
+    assert!(first.contains("ORDER BY \"name\" ASC"), "{first}");
+    assert!(first.ends_with("LIMIT 10"), "{first}");
+    let second = browse_sql_with_search(&store.schema, &[], None, Some(&desc), 10, 10).unwrap();
+    assert!(second.contains("ORDER BY \"name\" DESC"), "{second}");
+    assert!(second.ends_with("LIMIT 10 OFFSET 10"), "{second}");
+    // 取消排序：没有 ORDER BY，分页照旧可用。
+    let plain = browse_sql_with_search(&store.schema, &[], None, None, 10, 20).unwrap();
+    assert!(!plain.contains("ORDER BY"), "{plain}");
+    assert!(plain.ends_with("LIMIT 10 OFFSET 20"), "{plain}");
+
+    // 本地复算同样按任意列排序，翻页窗口取自排好序的结果。
+    let page = query_page(&store, &[], Some(&desc), 0, 5).unwrap();
+    assert_eq!(page.rows.len(), 5);
+    assert!(page.truncated, "还有后续行");
+    let names: Vec<String> = (0..page.rows.len()).filter_map(|row| text_of(&page, row, "name")).collect();
+    assert_eq!(names.len(), 5);
+    assert!(names.windows(2).all(|pair| pair[0] >= pair[1]), "降序：{names:?}");
+    let last = query_page(&store, &[], Some(&desc), 25, 5).unwrap();
+    assert_eq!(last.rows.len(), 5);
+    assert!(!last.truncated, "最后一页是完整而不是截断");
+    // 去掉排序回到原始顺序（稳定身份不变）。
+    let sorted_back = query_page(&store, &[], None, 0, 5).unwrap();
+    assert_eq!(sorted_back.rows[0].cells.get("id"), Some(&Cell::Text("1".to_owned())));
+}
+
+#[test]
+fn combined_filters_search_sort_and_paging_separate_no_match_from_errors() {
+    let store = customers_fixture(20);
+    let filters = [cmp("id", FilterOp::Gt, "5"), between("id", "8", "12")];
+    let sort = Sort { column: "id".to_owned(), descending: true };
+    let page = query_page(&store, &filters, Some(&sort), 0, 3).unwrap();
+    assert_eq!(page.matched, 5);
+    assert_eq!(page.rows.len(), 3);
+    assert!(page.truncated);
+    assert_eq!(text_of(&page, 0, "id").as_deref(), Some("12"));
+    let sql = browse_sql_with_search(&store.schema, &filters, Some("客户"), Some(&sort), 3, 0).unwrap();
+    assert!(sql.contains("> 5"), "{sql}");
+    assert!(sql.contains("BETWEEN 8 AND 12"), "{sql}");
+    assert!(sql.contains("ORDER BY \"id\" DESC"), "{sql}");
+    assert!(sql.contains("LIMIT 3"), "{sql}");
+
+    // 条件合法但没有行是无匹配，不是错误，也不是截断。
+    let none = query_page(&store, &[cmp("id", FilterOp::Eq, "999")], None, 0, 10).unwrap();
+    assert_eq!(none.matched, 0);
+    assert!(none.rows.is_empty());
+    assert!(!none.truncated);
+
+    // 非法条件必须报错，不能悄悄变成"无匹配"。
+    let incomplete = Filter { column: "id".to_owned(), op: FilterOp::Between, value: Some("3".to_owned()), second: None, values: Vec::new() };
+    assert_eq!(query_page(&store, std::slice::from_ref(&incomplete), None, 0, 10).unwrap_err().0, "between 需要两个值");
+    assert_eq!(compile_where(&store.schema, &[incomplete]).unwrap_err(), "between 需要两个值");
+    assert_eq!(query_page(&store, &[one_of("id", &[])], None, 0, 10).unwrap_err().0, "IN 筛选至少要一个值");
+    assert_eq!(query_page(&store, &[cmp("id", FilterOp::Gt, "")], None, 0, 10).unwrap_err().0, "筛选值不能为空");
+}
+
+#[test]
+fn later_pages_keep_conditions_and_shift_only_the_window() {
+    let store = customers_fixture(50);
+    let filters = [cmp("id", FilterOp::Gt, "10")];
+    let sort = Sort { column: "name".to_owned(), descending: false };
+    let first = query_page(&store, &filters, Some(&sort), 0, 10).unwrap();
+    let rest = query_page(&store, &filters, Some(&sort), 10, 10).unwrap();
+    assert_eq!(first.matched, 40);
+    assert_eq!(rest.matched, 40, "追加/翻页不改条件");
+    assert!(!first.rows.iter().any(|row| rest.rows.iter().any(|other| other.id == row.id)), "翻页不重复已读行");
+    let ids: Vec<String> = rest.rows.iter().filter_map(|row| match row.cells.get("id") { Some(Cell::Text(text)) => Some(text.clone()), _ => None }).collect();
+    assert!(ids.iter().all(|id| id.parse::<i64>().unwrap_or(0) > 10));
+    // 关键字与筛选同时存在时，计数与分页对齐。
+    let searched = query_page(&store, &filters, Some(&sort), 0, 50).unwrap();
+    assert_eq!(searched.matched, 40);
+    assert!(!searched.truncated);
+}

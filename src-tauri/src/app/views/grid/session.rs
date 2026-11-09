@@ -111,6 +111,48 @@ pub enum RangeScope {
     LoadedSubset,
 }
 
+/// 查找只覆盖已经读取的行；服务器范围才把关键字下发到数据库。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FindScope {
+    Loaded,
+    Server,
+}
+
+/// 空网格的两种原因：表本来没有行，还是当前条件没有命中。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SheetEmptiness {
+    Rows,
+    TableEmpty,
+    NoMatch,
+}
+
+/// 还能不能继续读。加载中、还有更多、已完整、以及网格不能自己延续的结果要分开。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Continuation {
+    Loading,
+    More,
+    Complete,
+    /// 查询结果不能由网格重新执行来延续；写语句和多语句更不能。
+    Unavailable,
+}
+
+/// 后端已经支持、并且可以出现在筛选条里的条件。
+pub const FILTER_OPS: [&str; 11] = ["eq", "ne", "contains", "starts", "gt", "lt", "between", "in", "null", "notnull", "empty"];
+
+/// 一条筛选条件草稿。文本保留用户的原文，只有"应用"时才编译成请求参数。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilterDraft {
+    pub column: String,
+    pub op: String,
+    pub value: String,
+    /// between 的上界。
+    pub second: String,
+    /// in 的集合输入，逗号或换行分隔。
+    pub values: String,
+    /// 还在编辑、尚未应用的草稿不进请求，也不参与本地筛选。
+    pub dirty: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableProof {
     pub schema: Option<String>,
@@ -126,7 +168,14 @@ pub struct SharedGrid {
     rows: Vec<GridRow>,
     schema: Option<TableSchema>,
     search: String,
-    filters: Vec<(String, String, String)>,
+    find_scope: FindScope,
+    filters: Vec<FilterDraft>,
+    /// 最近一次应用筛选时的非法输入原因；不解成请求，也不改已有结果。
+    filter_error: Option<String>,
+    /// 最近一次替换/追加读取失败的原因；旧行列仍保留，界面据此提示重试。
+    read_failure: Option<String>,
+    /// 换了目标表但还没读到新数据：这时读取失败才丢弃旧表快照。
+    target_changed: bool,
     sort: Option<(String, bool)>,
     offset: u64,
     limit: u64,
@@ -178,7 +227,11 @@ impl SharedGrid {
             rows: Vec::new(),
             schema: None,
             search: String::new(),
+            find_scope: FindScope::Loaded,
             filters: Vec::new(),
+            filter_error: None,
+            read_failure: None,
+            target_changed: false,
             sort: None,
             offset: 0,
             limit: 100,
@@ -221,12 +274,15 @@ impl SharedGrid {
         self.failures.clear();
         self.selected = false;
         self.viewer = None;
+        self.read_failure = None;
+        self.target_changed = false;
         self.close_preview();
         self.refresh_readonly_reason();
         self.recompute();
     }
 
     /// 同一张表翻页或刷新时替换已读取窗口：暂存仍按行 id 挂回，列宽按列名保留。
+    /// 选择和完整值查看也按行 id 重新挂回；只有那一行真的不在新窗口里才消失。
     pub fn replace_fetched(&mut self, columns: Vec<GridColumn>, rows: Vec<GridRow>, offset: u64, full_count: Option<i64>, truncated: bool, schema: Option<TableSchema>) {
         self.retain_staged_rows();
         self.columns = merge_widths(&self.columns, columns);
@@ -236,8 +292,8 @@ impl SharedGrid {
         self.full_count = full_count;
         self.truncated = truncated;
         self.scope = RangeScope::Fetched;
-        self.selected = false;
-        self.viewer = None;
+        self.read_failure = None;
+        self.target_changed = false;
         self.close_preview();
         self.refresh_readonly_reason();
         self.recompute();
@@ -285,6 +341,9 @@ impl SharedGrid {
         self.failures.clear();
         self.selected = false;
         self.viewer = None;
+        self.read_failure = None;
+        self.target_changed = false;
+        self.find_scope = FindScope::Loaded;
         self.close_preview();
         self.recompute();
         self.token
@@ -374,7 +433,8 @@ impl SharedGrid {
     }
 
     /// 换到另一张表时清掉旧表的筛选、排序、选择和暂存；同一张表翻页不算换表。
-    pub fn switch_target(&mut self, target: GridTarget) {
+    /// 返回值表示目标是否真的换了：换了以后读取失败才丢弃旧表快照。
+    pub fn switch_target(&mut self, target: GridTarget) -> bool {
         let same = self.mode == GridMode::Table
             && self.target.connection_id == target.connection_id
             && self.target.database == target.database
@@ -385,7 +445,10 @@ impl SharedGrid {
             self.retained.clear();
             self.failures.clear();
             self.search.clear();
+            self.find_scope = FindScope::Loaded;
             self.filters.clear();
+            self.filter_error = None;
+            self.read_failure = None;
             self.sort = None;
             self.selected = false;
             self.viewer = None;
@@ -393,7 +456,27 @@ impl SharedGrid {
             self.focus_id.clear();
             self.close_preview();
         }
+        self.target_changed = !same;
         self.target = target;
+        !same
+    }
+
+    /// 当前快照是否属于另一个还没读到的目标；读取失败时用它决定丢弃还是保留。
+    pub fn stale_target(&self) -> bool {
+        self.target_changed
+    }
+
+    pub fn read_failure(&self) -> Option<&str> {
+        self.read_failure.as_deref()
+    }
+
+    pub fn clear_read_failure(&mut self) {
+        self.read_failure = None;
+    }
+
+    /// 同目标的刷新、追加、排序、筛选或翻页失败：只记原因，行列、条件、选择、滚动和暂存都保留。
+    pub fn keep_after_failure(&mut self, message: &str) {
+        self.read_failure = Some(message.to_owned());
     }
 
     /// 表模式下只读原因由结构决定：视图、无唯一键或不可写都由这里统一给出。
@@ -459,9 +542,292 @@ impl SharedGrid {
         format!("{scope} {start}-{end}/{loaded} / {full}")
     }
 
+    pub fn find_text(&self) -> &str {
+        &self.search
+    }
+
+    pub fn find_scope(&self) -> FindScope {
+        self.find_scope
+    }
+
+    /// 查找只筛当前已读取的行，不发查询。
     pub fn set_search(&mut self, text: &str) {
         self.search = text.to_owned();
         self.recompute();
+    }
+
+    /// 切到服务器范围表示"在整表里筛选"，调用方需要重新读取；切回来同样重读。
+    pub fn set_find_scope(&mut self, scope: FindScope) {
+        if self.find_scope == scope {
+            return;
+        }
+        self.find_scope = scope;
+        self.recompute();
+    }
+
+    /// 只有服务器范围的非空关键字才作为整表条件下发。
+    pub fn server_search(&self) -> Option<String> {
+        (self.find_scope == FindScope::Server && !self.search.trim().is_empty()).then(|| self.search.clone())
+    }
+
+    pub fn filters(&self) -> &[FilterDraft] {
+        &self.filters
+    }
+
+    pub fn filter_error(&self) -> Option<&str> {
+        self.filter_error.as_deref()
+    }
+
+    /// 这一列适用的条件：数字/日期给范围，文本给包含，二进制只留相等与 NULL。
+    pub fn filter_ops_for(&self, column: &str) -> Vec<&'static str> {
+        let family = self.columns.iter().find(|item| item.name == column).map(|item| value_family(&item.type_name)).unwrap_or(ValueFamily::Unknown);
+        match family {
+            ValueFamily::Integer | ValueFamily::Decimal | ValueFamily::Float | ValueFamily::Date | ValueFamily::Time | ValueFamily::Datetime => {
+                vec!["eq", "ne", "gt", "lt", "between", "in", "null", "notnull"]
+            }
+            ValueFamily::Text => vec!["eq", "ne", "contains", "starts", "in", "null", "notnull", "empty"],
+            _ => vec!["eq", "ne", "null", "notnull"],
+        }
+    }
+
+    pub fn op_label(&self, op: &str) -> String {
+        i18n::text(self.locale, &format!("grid.op.{op}"))
+    }
+
+    fn draft_index(&self, column: &str) -> Option<usize> {
+        self.filters.iter().position(|item| item.column == column)
+    }
+
+    fn filter_values(draft: &FilterDraft) -> Vec<String> {
+        draft.values.split([',', '\n']).map(str::trim).filter(|item| !item.is_empty()).map(str::to_owned).collect()
+    }
+
+    /// 按列替换一条条件并立即应用；保持既有"设了就生效"的用法。
+    pub fn set_filter(&mut self, column: &str, op: &str, value: &str) {
+        self.set_filter_full(column, op, value, "", "");
+    }
+
+    pub fn set_filter_full(&mut self, column: &str, op: &str, value: &str, second: &str, values: &str) {
+        let draft = FilterDraft {
+            column: column.to_owned(),
+            op: op.to_owned(),
+            value: value.to_owned(),
+            second: second.to_owned(),
+            values: values.to_owned(),
+            dirty: false,
+        };
+        match self.draft_index(column) {
+            Some(index) => self.filters[index] = draft,
+            None => self.filters.push(draft),
+        }
+        self.filter_error = None;
+        self.recompute();
+    }
+
+    /// 为一列新增一条待编辑条件；这一列已有条件就改成编辑已有的那条。
+    pub fn add_filter(&mut self, column: &str) -> usize {
+        if let Some(index) = self.draft_index(column) {
+            self.filters[index].dirty = true;
+            return index;
+        }
+        let op = self.filter_ops_for(column).first().copied().unwrap_or("eq").to_owned();
+        self.filters.push(FilterDraft { column: column.to_owned(), op, value: String::new(), second: String::new(), values: String::new(), dirty: true });
+        self.filters.len() - 1
+    }
+
+    pub fn set_filter_column(&mut self, index: usize, column: &str) -> bool {
+        let ops = self.filter_ops_for(column);
+        let Some(draft) = self.filters.get_mut(index) else {
+            return false;
+        };
+        draft.column = column.to_owned();
+        if !ops.iter().any(|op| *op == draft.op) {
+            draft.op = ops.first().copied().unwrap_or("eq").to_owned();
+            draft.second.clear();
+            draft.values.clear();
+        }
+        draft.dirty = true;
+        true
+    }
+
+    pub fn set_filter_op(&mut self, index: usize, op: &str) -> bool {
+        let Some(column) = self.filters.get(index).map(|item| item.column.clone()) else {
+            return false;
+        };
+        if !self.filter_ops_for(&column).contains(&op) {
+            return false;
+        }
+        let Some(draft) = self.filters.get_mut(index) else {
+            return false;
+        };
+        draft.op = op.to_owned();
+        if op != "between" {
+            draft.second.clear();
+        }
+        if op != "in" {
+            draft.values.clear();
+        }
+        draft.dirty = true;
+        true
+    }
+
+    /// 循环到这一列的下一个适用条件，返回新条件。
+    pub fn cycle_filter_op(&mut self, index: usize) -> Option<&'static str> {
+        let column = self.filters.get(index)?.column.clone();
+        let ops = self.filter_ops_for(&column);
+        if ops.is_empty() {
+            return None;
+        }
+        let current = self.filters.get(index)?.op.clone();
+        let position = ops.iter().position(|op| *op == current).unwrap_or(usize::MAX);
+        let next = ops[position.wrapping_add(1) % ops.len()];
+        self.set_filter_op(index, next).then_some(next)
+    }
+
+    pub fn update_filter(&mut self, index: usize, op: &str, value: &str, second: &str, values: &str) -> bool {
+        let Some(draft) = self.filters.get_mut(index) else {
+            return false;
+        };
+        draft.op = op.to_owned();
+        draft.value = value.to_owned();
+        draft.second = second.to_owned();
+        draft.values = values.to_owned();
+        draft.dirty = true;
+        true
+    }
+
+    /// 编辑输入框的逐字更新：只改草稿文本，不应用、不发查询。
+    pub fn update_filter_value(&mut self, index: usize, slot: usize, value: &str) -> bool {
+        let Some(draft) = self.filters.get_mut(index) else {
+            return false;
+        };
+        match slot {
+            0 => draft.value = value.to_owned(),
+            1 => draft.second = value.to_owned(),
+            _ => draft.values = value.to_owned(),
+        }
+        draft.dirty = true;
+        true
+    }
+
+    /// 界面上的取值输入：按当前条件决定这是值、上界还是集合。
+    pub fn update_filter_text(&mut self, index: usize, first: bool, text: &str) -> bool {
+        let Some(draft) = self.filters.get_mut(index) else {
+            return false;
+        };
+        if first {
+            if draft.op == "in" {
+                draft.values = text.to_owned();
+            } else {
+                draft.value = text.to_owned();
+            }
+        } else {
+            draft.second = text.to_owned();
+        }
+        draft.dirty = true;
+        true
+    }
+
+    pub fn remove_filter(&mut self, index: usize) -> bool {
+        if index >= self.filters.len() {
+            return false;
+        }
+        self.filters.remove(index);
+        self.filter_error = None;
+        self.recompute();
+        true
+    }
+
+    /// 全清：条件和查找一起清掉。
+    pub fn clear_filters(&mut self) {
+        self.filters.clear();
+        self.filter_error = None;
+        self.search.clear();
+        self.recompute();
+    }
+
+    fn compile_draft(&self, draft: &FilterDraft) -> Result<crate::grid::commands::FilterArg, String> {
+        let op = draft.op.as_str();
+        if !FILTER_OPS.contains(&op) {
+            return Err(i18n::text(self.locale, "grid.filter.unknownOp"));
+        }
+        let mut value = None;
+        let mut second = None;
+        let mut values = Vec::new();
+        match op {
+            "null" | "notnull" | "empty" => {}
+            "between" => {
+                if draft.value.trim().is_empty() || draft.second.trim().is_empty() {
+                    return Err(i18n::text(self.locale, "grid.filter.needRange"));
+                }
+                value = Some(draft.value.clone());
+                second = Some(draft.second.clone());
+            }
+            "in" => {
+                values = Self::filter_values(draft);
+                if values.is_empty() {
+                    return Err(i18n::text(self.locale, "grid.filter.needList"));
+                }
+            }
+            _ => {
+                if draft.value.trim().is_empty() {
+                    return Err(i18n::text(self.locale, "grid.filter.needValue"));
+                }
+                value = Some(draft.value.clone());
+            }
+        }
+        Ok(crate::grid::commands::FilterArg { column: draft.column.clone(), op: op.to_owned(), value, second, values })
+    }
+
+    /// 已应用条件的请求参数；还在编辑的草稿不进请求。
+    pub fn filter_args(&self) -> Result<Vec<crate::grid::commands::FilterArg>, String> {
+        self.filters.iter().filter(|draft| !draft.dirty).map(|draft| self.compile_draft(draft)).collect()
+    }
+
+    /// 校验全部条件（含正在编辑的），非法时给出原因。
+    pub fn validate_filters(&self) -> Result<(), String> {
+        for draft in &self.filters {
+            self.compile_draft(draft)?;
+        }
+        Ok(())
+    }
+
+    /// 应用全部条件。非法输入只记录原因：不发查询，已有结果和条件输入都保留。
+    pub fn apply_filters(&mut self) -> Result<(), String> {
+        if let Err(error) = self.validate_filters() {
+            self.filter_error = Some(error.clone());
+            return Err(error);
+        }
+        for draft in &mut self.filters {
+            draft.dirty = false;
+        }
+        self.filter_error = None;
+        self.recompute();
+        Ok(())
+    }
+
+    pub fn sort_state(&self) -> Option<(&str, bool)> {
+        self.sort.as_ref().map(|(column, descending)| (column.as_str(), *descending))
+    }
+
+    /// 这一列当前的方向；没有排序时为 None。
+    pub fn sort_for(&self, column: &str) -> Option<bool> {
+        self.sort.as_ref().filter(|(name, _)| name == column).map(|(_, descending)| *descending)
+    }
+
+    /// 任意列升序 → 降序 → 取消排序，返回新的方向。
+    pub fn toggle_sort(&mut self, column: &str) -> Option<bool> {
+        if !self.columns.iter().any(|item| item.name == column) {
+            return None;
+        }
+        let next = match self.sort_for(column) {
+            None => Some(false),
+            Some(false) => Some(true),
+            Some(true) => None,
+        };
+        self.sort = next.map(|descending| (column.to_owned(), descending));
+        self.recompute();
+        next
     }
 
     pub fn set_sort(&mut self, column: &str, descending: bool) {
@@ -476,32 +842,58 @@ impl SharedGrid {
         self.recompute();
     }
 
-    pub fn set_filter(&mut self, column: &str, op: &str, value: &str) {
-        self.filters.retain(|item| item.0 != column);
-        self.filters.push((column.to_owned(), op.to_owned(), value.to_owned()));
-        self.recompute();
+    /// 空网格到底是表为空还是条件没命中。
+    pub fn emptiness(&self) -> SheetEmptiness {
+        if !self.rows.is_empty() {
+            return SheetEmptiness::Rows;
+        }
+        let narrowing = !self.search.trim().is_empty() || self.filters.iter().any(|draft| !draft.dirty);
+        if narrowing {
+            SheetEmptiness::NoMatch
+        } else {
+            SheetEmptiness::TableEmpty
+        }
     }
 
-    pub fn clear_filters(&mut self) {
-        self.filters.clear();
-        self.search.clear();
-        self.recompute();
+    /// 还能不能继续读；查询结果不允许网格用重新执行来延续。
+    pub fn continuation(&self, loading: bool) -> Continuation {
+        if loading {
+            return Continuation::Loading;
+        }
+        if self.mode == GridMode::Query {
+            return if self.truncated { Continuation::Unavailable } else { Continuation::Complete };
+        }
+        if self.has_more_rows() {
+            Continuation::More
+        } else {
+            Continuation::Complete
+        }
     }
 
-    pub fn page_request(&self) -> PageRequest {
-        PageRequest {
+    /// 状态栏一句话：读取失败、无匹配、表为空、加载中、还有更多、已到末尾各自可辨认。
+    pub fn state_text(&self, loading: bool) -> String {
+        if let Some(failure) = &self.read_failure {
+            return failure.clone();
+        }
+        match self.emptiness() {
+            SheetEmptiness::NoMatch => return i18n::text(self.locale, "grid.state.noMatch"),
+            SheetEmptiness::TableEmpty => return i18n::text(self.locale, "grid.state.tableEmpty"),
+            SheetEmptiness::Rows => {}
+        }
+        match self.continuation(loading) {
+            Continuation::Loading => i18n::text(self.locale, "grid.state.loading"),
+            Continuation::More => i18n::text(self.locale, "grid.state.more"),
+            Continuation::Complete => i18n::text(self.locale, "grid.state.complete"),
+            Continuation::Unavailable => i18n::text(self.locale, "grid.state.noContinuation"),
+        }
+    }
+
+    /// 读取请求。条件非法时返回原因：调用方不能发出这条查询，也不能清掉旧结果。
+    pub fn page_request(&self) -> Result<PageRequest, String> {
+        let filters = self.filter_args()?;
+        Ok(PageRequest {
             table: self.table_ref(),
-            filters: self
-                .filters
-                .iter()
-                .map(|(column, op, value)| crate::grid::commands::FilterArg {
-                    column: column.clone(),
-                    op: op.clone(),
-                    value: if matches!(op.as_str(), "null" | "notnull" | "empty") { None } else { Some(value.clone()) },
-                    second: None,
-                    values: Vec::new(),
-                })
-                .collect(),
+            filters,
             sort: self.sort.as_ref().map(|(column, descending)| SortArg {
                 column: column.clone(),
                 direction: if *descending { "desc".to_owned() } else { "asc".to_owned() },
@@ -509,8 +901,14 @@ impl SharedGrid {
             offset: self.offset,
             limit: self.limit,
             preview_bytes: self.preview_bytes as u64,
-            search: if self.search.is_empty() { None } else { Some(self.search.clone()) },
-        }
+            search: self.server_search(),
+        })
+    }
+
+    /// 条件变化后回到第一页，但保留按行 id 记住的选择与完整值查看。
+    pub fn set_page_keep_identity(&mut self, offset: u64, limit: u64) {
+        self.offset = offset;
+        self.limit = limit.max(1);
     }
 
     pub fn set_page(&mut self, offset: u64, limit: u64) {
@@ -1065,7 +1463,8 @@ impl SharedGrid {
         (0..self.rows.len()).map(|row| self.sheet_line(row)).collect()
     }
 
-    /// 替换读取失败时丢弃上一张表的快照，避免旧行被当成新表的数据导出。
+    /// 换了目标表又读失败时丢弃上一张表的快照，避免旧行被当成新表的数据导出。
+    /// 同一张表的刷新/追加失败不走这里，走 keep_after_failure。
     pub fn drop_stale_sheet(&mut self) {
         self.columns.clear();
         self.source.clear();
@@ -1073,6 +1472,17 @@ impl SharedGrid {
         self.schema = None;
         self.full_count = None;
         self.truncated = false;
+        self.filters.clear();
+        self.filter_error = None;
+        self.search.clear();
+        self.find_scope = FindScope::Loaded;
+        self.sort = None;
+        self.selected = false;
+        self.viewer = None;
+        self.scroll = 0;
+        self.retained.clear();
+        self.read_failure = None;
+        self.target_changed = false;
         self.close_preview();
     }
 
@@ -1089,17 +1499,31 @@ impl SharedGrid {
         }
     }
 
-    pub fn append_page(&mut self, rows: Vec<GridRow>, full_count: Option<i64>, truncated: bool) {
-        self.source.extend(rows);
+    /// 追加下一页。只对表数据成立；查询结果延续由查询页自己负责，网格不重新执行 SQL。
+    /// 已经读到的稳定行 id 不再追加第二份，返回真正新增的行数。
+    pub fn append_page(&mut self, rows: Vec<GridRow>, full_count: Option<i64>, truncated: bool) -> usize {
+        if self.mode != GridMode::Table {
+            return 0;
+        }
+        let mut added = 0;
+        for row in rows {
+            if self.source.iter().any(|item| item.id == row.id) {
+                continue;
+            }
+            self.source.push(row);
+            added += 1;
+        }
         if full_count.is_some() {
             self.full_count = full_count;
         }
         self.truncated = truncated;
+        self.read_failure = None;
         let scroll = self.scroll;
         // 选择按行 id 重新挂回，不按刚才的显示行号硬塞回去。
         self.recompute();
         self.scroll = scroll;
         self.clamp_scroll();
+        added
     }
 
     pub fn copy_row(&mut self) -> String {
@@ -1215,19 +1639,31 @@ impl SharedGrid {
 
     fn recompute(&mut self) {
         let mut rows = self.source.clone();
-        let filtering = !self.search.is_empty() || !self.filters.is_empty() || self.sort.is_some();
-        if !self.search.is_empty() {
+        let applied = self.filters.iter().filter(|draft| !draft.dirty).count();
+        let filtering = !self.search.is_empty() || applied > 0 || self.sort.is_some();
+        // 已读取范围的查找在本地筛；服务器范围的行已经是服务器筛过的，不再重复筛。
+        if self.find_scope == FindScope::Loaded && !self.search.is_empty() {
             let needle = self.search.to_lowercase();
             rows.retain(|row| {
                 row.values.iter().any(|value| value.as_deref().unwrap_or("").to_lowercase().contains(&needle))
                     || row.locator.iter().any(|(_, value)| value.as_deref().unwrap_or("").to_lowercase().contains(&needle))
             });
         }
-        for (column, op, value) in &self.filters {
-            let index = self.columns.iter().position(|item| item.name == *column);
-            rows.retain(|row| match index {
-                Some(index) => cell_matches(row.values.get(index).cloned().unwrap_or(None), op, value),
-                None => false,
+        // 还在编辑、没有应用的草稿不改变可见行；非法条件也不改变可见行，
+        // 否则一个漏填的上界会让整张表突然变空。
+        let drafts: Vec<FilterDraft> = self
+            .filters
+            .iter()
+            .filter(|draft| !draft.dirty && self.compile_draft(draft).is_ok())
+            .cloned()
+            .collect();
+        if !drafts.is_empty() {
+            let indices: Vec<Option<usize>> = drafts.iter().map(|draft| self.columns.iter().position(|item| item.name == draft.column)).collect();
+            rows.retain(|row| {
+                drafts.iter().zip(indices.iter()).all(|(draft, index)| match index {
+                    Some(index) => draft_matches(row.values.get(*index).cloned().unwrap_or(None), self.columns.get(*index), draft),
+                    None => false,
+                })
             });
         }
         if let Some((column, descending)) = &self.sort {
@@ -1650,14 +2086,41 @@ fn editable_names(schema: &TableSchema, columns: &[String], proof: &TableProof) 
     columns.iter().filter(|name| schema.columns.iter().any(|column| column.name == name.as_str())).cloned().collect()
 }
 
-fn cell_matches(value: Option<String>, op: &str, expected: &str) -> bool {
-    match op {
+/// 本地在已读取行上复算同一条条件；NULL 不参与相等、范围和集合的命中，与 SQL 语义一致。
+fn draft_matches(value: Option<String>, column: Option<&GridColumn>, draft: &FilterDraft) -> bool {
+    let numeric = column.is_some_and(|item| matches!(value_family(&item.type_name), ValueFamily::Integer | ValueFamily::Decimal | ValueFamily::Float));
+    match draft.op.as_str() {
         "null" => value.is_none(),
         "notnull" => value.is_some(),
         "empty" => value.as_deref() == Some(""),
-        "contains" => value.as_deref().is_some_and(|text| text.to_lowercase().contains(&expected.to_lowercase())),
-        "eq" => value.as_deref() == Some(expected),
-        _ => false,
+        "contains" => value.as_deref().is_some_and(|text| text.to_lowercase().contains(&draft.value.to_lowercase())),
+        "starts" => value.as_deref().is_some_and(|text| text.to_lowercase().starts_with(&draft.value.to_lowercase())),
+        "eq" => value.as_deref() == Some(draft.value.as_str()),
+        // SQL 里 NULL <> 值 不成立，因此 NULL 不算命中"不等于"。
+        "ne" => value.is_some() && value.as_deref() != Some(draft.value.as_str()),
+        "gt" | "lt" => {
+            let Some(text) = value.as_deref() else {
+                return false;
+            };
+            let order = compare_cell(Some(text), Some(draft.value.as_str()), numeric);
+            if draft.op == "gt" {
+                order.is_gt()
+            } else {
+                order.is_lt()
+            }
+        }
+        "between" => {
+            let Some(text) = value.as_deref() else {
+                return false;
+            };
+            compare_cell(Some(text), Some(draft.value.as_str()), numeric).is_ge()
+                && compare_cell(Some(text), Some(draft.second.as_str()), numeric).is_le()
+        }
+        "in" => match value.as_deref() {
+            Some(text) => SharedGrid::filter_values(draft).iter().any(|item| item == text),
+            None => false,
+        },
+        _ => true,
     }
 }
 
@@ -1764,6 +2227,10 @@ mod tests {
         }
     }
 
+    fn int_column(name: &str) -> GridColumn {
+        GridColumn { type_name: "integer".to_owned(), ..text_column(name) }
+    }
+
     fn schema() -> TableSchema {
         schema_from_parts("sqlite", "", "customers", "table", vec![column_of("id", "integer", true), column_of("name", "text", false)], vec!["id".to_owned()]).unwrap()
     }
@@ -1814,7 +2281,7 @@ mod tests {
         assert_eq!(grid.cell_label(0, 1), large, "默认 1 KB 上限下显示大字段");
         grid.set_preview_bytes(4 * 1024);
         assert_eq!(grid.cell_label(0, 1), long, "4 KB 上限下同一值直接显示");
-        assert_eq!(grid.page_request().preview_bytes, 4096);
+        assert_eq!(grid.page_request().unwrap().preview_bytes, 4096);
     }
 
     #[test]
@@ -2153,20 +2620,235 @@ mod tests {
     }
 
     #[test]
-    fn failed_replace_drops_the_previous_sheet() {
+    fn failed_refresh_keeps_rows_conditions_selection_scroll_and_staging() {
         let mut grid = SharedGrid::new();
         grid.target.connection_id = "notes".into();
+        grid.target.table = "customers".into();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some("甲")], true), row("2", vec![Some("2"), Some("乙")], true), row("3", vec![Some("3"), Some("丙")], true)],
+            Some(3),
+            Some(schema()),
+        );
+        grid.set_viewport(2);
+        grid.set_column_width(1, 320.0);
+        assert_eq!(grid.stage_text(0, 1, Some("改".into())), Gate::Writable);
+        // 条件会重排可见行并把滚动拉回顶部，所以选择和滚动在条件之后再定。
+        grid.set_filter("name", "ne", "丁");
+        grid.select(1, 1, false);
+        grid.scroll_to(1);
+        // 同一张表的刷新/翻页失败：行列、条件、选择、滚动和暂存都保留，只多一条失败原因。
+        grid.keep_after_failure("连接已断开");
+        assert_eq!(grid.loaded_len(), 3);
+        assert_eq!(grid.column_names(), vec!["id".to_owned(), "name".to_owned()]);
+        assert_eq!(grid.column_width(1), 320.0);
+        assert!(grid.uncommitted(), "失败不能丢掉暂存");
+        assert_eq!(grid.focused_row_id(), Some("2"));
+        assert_eq!(grid.scroll, 1);
+        assert_eq!(grid.filters().len(), 1);
+        assert_eq!(grid.read_failure(), Some("连接已断开"));
+        assert_eq!(grid.state_text(false), "连接已断开");
+        // 重试成功后失败提示消失，其他内容不动。
+        grid.clear_read_failure();
+        assert!(grid.read_failure().is_none());
+        assert_eq!(grid.loaded_len(), 3);
+        assert!(grid.uncommitted());
+    }
+
+    #[test]
+    fn failed_read_after_switching_target_drops_the_old_sheet() {
+        let mut grid = SharedGrid::new();
+        grid.target.connection_id = "notes".into();
+        grid.target.table = "customers".into();
         grid.load_local(
             vec![text_column("id"), text_column("name")],
             vec![row("1", vec![Some("1"), Some("甲")], true)],
             Some(1),
             Some(schema()),
         );
-        assert_eq!(grid.loaded_len(), 1);
+        let changed = grid.switch_target(GridTarget { connection_id: "notes".into(), table: "people".into(), ..Default::default() });
+        assert!(changed);
+        assert!(grid.stale_target(), "换表后快照属于旧表");
         grid.drop_stale_sheet();
-        assert_eq!(grid.loaded_len(), 0, "失败的新表不能继续展示旧表行");
+        assert_eq!(grid.loaded_len(), 0, "旧表行不能继续展示");
         assert_eq!(grid.exchange_sheet().1.len(), 0, "旧列不能进入交换来源");
         assert!(!grid.has_more_rows());
+        assert!(!grid.stale_target());
+        // 同一张表再次打开不算换表，读取失败就不会丢快照。
+        let mut same = SharedGrid::new();
+        same.target.connection_id = "notes".into();
+        same.target.table = "customers".into();
+        same.load_local(vec![text_column("id")], vec![row("1", vec![Some("1")], true)], Some(1), Some(schema()));
+        assert!(!same.switch_target(same.target.clone()));
+        assert!(!same.stale_target());
+    }
+
+    #[test]
+    fn find_scope_separates_loaded_rows_from_the_server_keyword() {
+        let mut grid = SharedGrid::new();
+        grid.target.connection_id = "notes".into();
+        grid.target.table = "customers".into();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some("甲")], true), row("2", vec![Some("2"), Some("乙")], true)],
+            Some(2),
+            Some(schema()),
+        );
+        // 默认查找只筛已读取行，不下发关键字。
+        grid.set_search("乙");
+        assert_eq!(grid.find_scope(), FindScope::Loaded);
+        assert_eq!(grid.loaded_len(), 1);
+        assert_eq!(grid.scope(), RangeScope::LoadedSubset);
+        assert_eq!(grid.page_request().unwrap().search, None);
+        // 无命中不是表为空。
+        grid.set_search("没有");
+        assert_eq!(grid.emptiness(), SheetEmptiness::NoMatch);
+        assert_eq!(grid.state_text(false), i18n::text(Locale::ZhCn, "grid.state.noMatch"));
+        let mut empty = SharedGrid::new();
+        empty.load_local(vec![text_column("id")], Vec::new(), Some(0), Some(schema()));
+        assert_eq!(empty.emptiness(), SheetEmptiness::TableEmpty);
+        assert_eq!(empty.state_text(false), i18n::text(Locale::ZhCn, "grid.state.tableEmpty"));
+        // 切到整表筛选：关键字随请求下发，本地不再重复筛同一段文本。
+        grid.set_search("乙");
+        grid.set_find_scope(FindScope::Server);
+        assert_eq!(grid.page_request().unwrap().search.as_deref(), Some("乙"));
+        assert_eq!(grid.loaded_len(), 2, "服务器范围的行已经是服务器筛过的");
+        // 切回来又变成本地查找。
+        grid.set_find_scope(FindScope::Loaded);
+        assert_eq!(grid.page_request().unwrap().search, None);
+        assert_eq!(grid.loaded_len(), 1);
+    }
+
+    #[test]
+    fn any_column_sorts_ascending_descending_and_back_to_none() {
+        let mut grid = SharedGrid::new();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some("c")], true), row("2", vec![Some("2"), Some("a")], true), row("3", vec![Some("3"), Some("b")], true)],
+            Some(3),
+            Some(schema()),
+        );
+        let names = |grid: &SharedGrid| (0..grid.loaded_len()).map(|row| grid.cell_label(row, 1)).collect::<Vec<_>>();
+        assert_eq!(grid.sort_state(), None);
+        // 非首列升序 → 降序 → 取消，取消后回到原始顺序而不是停在最后一次视觉位置。
+        assert_eq!(grid.toggle_sort("name"), Some(false));
+        assert_eq!(names(&grid), vec!["a", "b", "c"]);
+        assert_eq!(grid.toggle_sort("name"), Some(true));
+        assert_eq!(names(&grid), vec!["c", "b", "a"]);
+        assert_eq!(grid.toggle_sort("name"), None);
+        assert_eq!(grid.sort_state(), None);
+        assert_eq!(names(&grid), vec!["c", "a", "b"]);
+        // 不存在的列不能排。
+        assert_eq!(grid.toggle_sort("missing"), None);
+        // 请求里的排序列与方向跟着当前列走。
+        grid.set_sort("id", true);
+        let request = grid.page_request().unwrap();
+        assert_eq!(request.sort.map(|sort| (sort.column, sort.direction)), Some(("id".to_owned(), "desc".to_owned())));
+        grid.clear_sort();
+        assert!(grid.page_request().unwrap().sort.is_none());
+    }
+
+    #[test]
+    fn filters_cover_range_set_null_and_keep_invalid_input_out_of_the_query() {
+        let mut grid = SharedGrid::new();
+        grid.target.connection_id = "notes".into();
+        grid.target.table = "customers".into();
+        grid.load_local(
+            vec![int_column("id"), text_column("name")],
+            vec![
+                row("1", vec![Some("1"), Some("甲")], true),
+                row("2", vec![Some("2"), None], true),
+                row("3", vec![Some("3"), Some("丙")], true),
+                row("4", vec![Some("4"), Some("")], true),
+            ],
+            Some(4),
+            Some(schema()),
+        );
+        // 数字列给范围，文本列给包含与空串。
+        assert!(grid.filter_ops_for("id").contains(&"between"));
+        assert!(!grid.filter_ops_for("id").contains(&"contains"));
+        assert!(grid.filter_ops_for("name").contains(&"contains"));
+        assert!(grid.filter_ops_for("name").contains(&"empty"));
+        // 范围。
+        grid.set_filter_full("id", "between", "2", "3", "");
+        assert_eq!(grid.loaded_len(), 2);
+        let request = grid.page_request().unwrap();
+        assert_eq!(request.filters[0].op, "between");
+        assert_eq!(request.filters[0].value.as_deref(), Some("2"));
+        assert_eq!(request.filters[0].second.as_deref(), Some("3"));
+        // 集合。
+        grid.set_filter_full("id", "in", "", "", "1, 4");
+        assert_eq!(grid.loaded_len(), 2);
+        let request = grid.page_request().unwrap();
+        assert_eq!(request.filters[0].values, vec!["1".to_owned(), "4".to_owned()]);
+        // NULL 与非空。
+        grid.clear_filters();
+        grid.set_filter("name", "null", "");
+        assert_eq!(grid.loaded_len(), 1);
+        grid.set_filter("name", "notnull", "");
+        assert_eq!(grid.loaded_len(), 3);
+        grid.set_filter("name", "empty", "");
+        assert_eq!(grid.loaded_len(), 1);
+        // 非法输入：不进请求，不改已有结果，并保留原因。
+        grid.clear_filters();
+        grid.set_filter_full("id", "between", "2", "", "");
+        assert_eq!(grid.loaded_len(), 4, "缺上界的条件不能让表变空");
+        let error = grid.page_request().unwrap_err();
+        assert_eq!(error, i18n::text(Locale::ZhCn, "grid.filter.needRange"));
+        grid.set_filter_full("id", "in", "", "", " , ");
+        assert_eq!(grid.page_request().unwrap_err(), i18n::text(Locale::ZhCn, "grid.filter.needList"));
+        grid.set_filter_full("id", "gt", "  ", "", "");
+        assert_eq!(grid.page_request().unwrap_err(), i18n::text(Locale::ZhCn, "grid.filter.needValue"));
+        // 还在编辑的草稿同样不发查询。
+        grid.clear_filters();
+        let index = grid.add_filter("name");
+        assert!(grid.update_filter_text(index, true, "甲"));
+        assert_eq!(grid.loaded_len(), 4, "未应用的草稿不改变可见行");
+        assert!(grid.page_request().unwrap().filters.is_empty());
+        assert!(grid.apply_filters().is_ok());
+        assert_eq!(grid.loaded_len(), 1);
+        // 应用失败时条件与结果都保留，可以改好再应用。
+        assert!(grid.update_filter_text(index, true, ""));
+        let reason = i18n::text(Locale::ZhCn, "grid.filter.needValue");
+        assert_eq!(grid.apply_filters().unwrap_err(), reason);
+        assert_eq!(grid.filter_error(), Some(reason.as_str()));
+        assert_eq!(grid.loaded_len(), 1);
+        // 单删与全清。
+        assert!(grid.remove_filter(index));
+        assert!(grid.filters().is_empty());
+        assert_eq!(grid.loaded_len(), 4);
+        grid.set_filter("name", "eq", "甲");
+        grid.clear_filters();
+        assert!(grid.filters().is_empty());
+        assert_eq!(grid.loaded_len(), 4);
+    }
+
+    #[test]
+    fn append_skips_rows_already_read_and_query_results_never_replay() {
+        let mut grid = SharedGrid::new();
+        grid.target.connection_id = "notes".into();
+        grid.target.table = "customers".into();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some("甲")], true), row("2", vec![Some("2"), Some("乙")], true)],
+            Some(4),
+            Some(schema()),
+        );
+        assert_eq!(grid.continuation(false), Continuation::More);
+        let added = grid.append_page(vec![row("2", vec![Some("2"), Some("乙")], true), row("3", vec![Some("3"), Some("丙")], true)], Some(4), true);
+        assert_eq!(added, 1, "已读过的稳定行不再追加第二份");
+        assert_eq!(grid.loaded_len(), 3);
+        assert_eq!(grid.continuation(true), Continuation::Loading);
+        assert_eq!(grid.continuation(false), Continuation::More);
+        grid.append_page(vec![row("4", vec![Some("4"), Some("丁")], true)], Some(4), false);
+        assert_eq!(grid.continuation(false), Continuation::Complete);
+        // 查询结果不在这里延续：网格从不重新执行语句。
+        let mut query = SharedGrid::new();
+        query.target.engine = "sqlite".into();
+        query.show_query_sheet("select id from customers", vec!["id".into()], vec![vec![Some("1".into())]]);
+        assert_eq!(query.continuation(false), Continuation::Complete);
+        assert_eq!(query.append_page(vec![row("q9", vec![Some("9")], false)], None, true), 0);
+        assert_eq!(query.loaded_len(), 1);
     }
 
     #[test]

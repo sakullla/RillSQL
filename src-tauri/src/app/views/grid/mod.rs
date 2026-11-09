@@ -23,7 +23,7 @@ use crate::application::AppServices;
 use crate::grid::commands::{CountRequest, FilterArg, PageRequest, TableRef};
 use crate::i18n::{self, Locale};
 
-use session::{columns_from_schema, rows_from_page, schema_from_dto, Gate};
+use session::{columns_from_schema, rows_from_page, schema_from_dto, Continuation, FindScope, Gate};
 
 pub struct GridPane {
     session: SharedGrid,
@@ -49,7 +49,9 @@ pub struct GridPane {
     press: Option<(usize, usize)>,
     /// 首屏或替换读取尚未返回；交换面板据此禁止把旧快照当成当前表。
     fetching: bool,
-    sort_desc: bool,
+    /// 筛选条每一行的取值输入（值、上界/集合）；结构变化时整体重建。
+    filter_inputs: Vec<FilterRowInputs>,
+    filter_subscriptions: Vec<gpui_kit::Subscription>,
     search: Option<Entity<InputState>>,
     /// 换表后清掉查找框里的旧文字，避免输入框和实际筛选条件不一致。
     clear_search: bool,
@@ -63,6 +65,13 @@ struct EditTarget {
     row_id: String,
     column: usize,
     original: Option<Option<String>>,
+}
+
+/// 一条筛选条件的两个取值输入；null/notnull/empty 不用它们。
+#[derive(Clone, Default)]
+struct FilterRowInputs {
+    value: Option<Entity<InputState>>,
+    second: Option<Entity<InputState>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,7 +122,8 @@ impl GridPane {
             loading_more: false,
             press: None,
             fetching: false,
-            sort_desc: false,
+            filter_inputs: Vec::new(),
+            filter_subscriptions: Vec::new(),
             search: None,
             clear_search: false,
             search_subscription: None,
@@ -162,6 +172,7 @@ impl GridPane {
         self.edit_target = None;
         self.pending_edit = None;
         self.press = None;
+        self.filter_input_reset();
         self.notice.clear();
         self.sync_table(cx);
     }
@@ -331,41 +342,50 @@ impl GridPane {
                 None
             }
             "grid-search" => {
-                self.session.set_search(&self.search_text);
+                // 查找默认只筛已读取的行；服务器范围才把关键字下发并重读。
+                let text = self.search_text.clone();
+                self.session.set_search(&text);
+                if self.session.mode == GridMode::Table && self.session.find_scope() == FindScope::Server {
+                    self.session.set_page_keep_identity(0, self.session.page_limit().max(1));
+                    self.fetch_current(true, cx);
+                }
+                None
+            }
+            "grid-find-scope" => {
+                self.toggle_find_scope(cx);
                 None
             }
             "grid-sort" => {
-                self.sort_desc = !self.sort_desc;
-                if let Some(name) = self.session.column_names().first().cloned() {
-                    self.session.set_sort(&name, self.sort_desc);
-                }
+                // 任意列都能排序：工具栏作用于当前列，升序 → 降序 → 取消。
+                let _ = self.cycle_sort_here(cx);
                 None
             }
             "grid-filter" => {
-                if let Some(name) = self.session.column_names().get(1).cloned().or_else(|| self.session.column_names().first().cloned()) {
-                    if self.search_text.is_empty() {
-                        self.session.clear_filters();
+                let _ = self.add_filter_here(cx);
+                None
+            }
+            "grid-filter-apply" => {
+                let _ = self.apply_filters(cx);
+                None
+            }
+            "grid-filter-clear" => {
+                self.clear_filter_panel(cx);
+                None
+            }
+            "grid-page-next" | "grid-page-prev" => {
+                // 查询结果没有"下一页"：网格不重新执行语句，多语句和写语句更不能。
+                if self.session.mode == GridMode::Table {
+                    // 编辑目标所在的行要离开窗口了，先结束编辑，避免 Enter 落到不存在的位置。
+                    self.abandon_edit();
+                    let limit = self.session.page_limit().max(1);
+                    let offset = if id == "grid-page-next" {
+                        self.session.page_offset().saturating_add(limit)
                     } else {
-                        self.session.set_filter(&name, "contains", &self.search_text);
-                    }
+                        self.session.page_offset().saturating_sub(limit)
+                    };
+                    self.session.set_page(offset, limit);
+                    self.fetch_current(true, cx);
                 }
-                None
-            }
-            "grid-page-next" => {
-                // 编辑目标所在的行要离开窗口了，先结束编辑，避免 Enter 落到不存在的位置。
-                self.abandon_edit();
-                let limit = self.session.page_limit().max(1);
-                let offset = self.session.page_offset().saturating_add(limit);
-                self.session.set_page(offset, limit);
-                self.fetch_current(true, cx);
-                None
-            }
-            "grid-page-prev" => {
-                self.abandon_edit();
-                let limit = self.session.page_limit().max(1);
-                let offset = self.session.page_offset().saturating_sub(limit);
-                self.session.set_page(offset, limit);
-                self.fetch_current(true, cx);
                 None
             }
             "grid-insert" => {
@@ -390,6 +410,170 @@ impl GridPane {
         }
         cx.notify();
         copied
+    }
+
+    /// 当前格所在列名；没有选择时退回第一列。
+    fn focused_column_name(&self) -> Option<String> {
+        let column = self.session.focus_cell().map(|(_, column)| column).unwrap_or(0);
+        self.session.column_names().get(column).cloned()
+    }
+
+    /// 目标连接是否真的已经打开。没有打开就不另开连接、也不发读取。
+    fn live_target(&self) -> bool {
+        !self.session.target.connection_id.is_empty() && self.services.connections.catalog_session(&self.session.target.connection_id).is_some()
+    }
+
+    /// 条件、排序或查找范围改变后：表数据从第一页重读，查询结果只在本地重排。
+    fn reload_after_condition_change(&mut self, cx: &mut Context<Self>) {
+        if self.session.mode == GridMode::Table && self.live_target() {
+            let limit = self.session.page_limit().max(1);
+            // 条件变了，旧偏移指向另一组行；选择仍按行 id 重新挂回。
+            self.session.set_page_keep_identity(0, limit);
+            self.abandon_edit();
+            self.fetch_current(true, cx);
+        } else {
+            self.sync_table(cx);
+        }
+        cx.notify();
+    }
+
+    /// 任意列升序 → 降序 → 取消；工具栏和表头菜单共用这条路径。
+    pub fn cycle_sort(&mut self, column: &str, cx: &mut Context<Self>) -> Option<bool> {
+        let next = self.session.toggle_sort(column);
+        self.reload_after_condition_change(cx);
+        next
+    }
+
+    pub fn cycle_sort_here(&mut self, cx: &mut Context<Self>) -> Option<bool> {
+        let name = self.focused_column_name()?;
+        self.cycle_sort(&name, cx)
+    }
+
+    /// 在当前格所在列上加一条条件：NULL、空串或等于当前值。
+    pub fn add_filter_here(&mut self, cx: &mut Context<Self>) -> Option<usize> {
+        let name = self.focused_column_name()?;
+        let row = self.session.focus_cell();
+        let index = self.session.add_filter(&name);
+        match row.and_then(|(row, column)| self.session.raw_value(row, column)) {
+            Some(None) => {
+                self.session.set_filter_op(index, "null");
+            }
+            Some(Some(text)) if text.is_empty() => {
+                self.session.set_filter_op(index, "empty");
+            }
+            Some(Some(text)) => {
+                self.session.set_filter_op(index, "eq");
+                self.session.update_filter_text(index, true, &text);
+            }
+            None => {}
+        }
+        self.filter_input_reset();
+        self.apply_filters(cx).ok()?;
+        Some(index)
+    }
+
+    /// 应用筛选条里的全部条件；非法输入只提示原因，不发查询也不清旧结果。
+    pub fn apply_filters(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        match self.session.apply_filters() {
+            Ok(()) => {
+                self.notice.clear();
+                self.reload_after_condition_change(cx);
+                Ok(())
+            }
+            Err(error) => {
+                // 条件输入和上一次有效结果都保留，只把原因显示出来。
+                self.notice = error.clone();
+                self.sync_table(cx);
+                cx.notify();
+                Err(error)
+            }
+        }
+    }
+
+    pub fn cycle_filter_op(&mut self, index: usize, cx: &mut Context<Self>) -> Option<&'static str> {
+        let op = self.session.cycle_filter_op(index)?;
+        self.filter_input_reset();
+        self.apply_filters(cx).ok();
+        Some(op)
+    }
+
+    pub fn update_filter_text(&mut self, index: usize, first: bool, text: &str) {
+        self.session.update_filter_text(index, first, text);
+    }
+
+    pub fn remove_filter(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.session.remove_filter(index) {
+            self.filter_input_reset();
+            self.apply_filters(cx).ok();
+        }
+    }
+
+    pub fn clear_filter_panel(&mut self, cx: &mut Context<Self>) {
+        self.session.clear_filters();
+        self.search_text.clear();
+        self.clear_search = true;
+        self.filter_input_reset();
+        self.apply_filters(cx).ok();
+    }
+
+    /// 查找范围：已读取行（本地）或整表（服务器筛选，需要重读）。
+    pub fn set_find_scope(&mut self, scope: FindScope, cx: &mut Context<Self>) {
+        if self.session.find_scope() == scope {
+            return;
+        }
+        self.session.set_find_scope(scope);
+        self.reload_after_condition_change(cx);
+    }
+
+    pub fn toggle_find_scope(&mut self, cx: &mut Context<Self>) {
+        let next = if self.session.find_scope() == FindScope::Loaded { FindScope::Server } else { FindScope::Loaded };
+        self.set_find_scope(next, cx);
+    }
+
+    fn filter_input_reset(&mut self) {
+        self.filter_inputs.clear();
+        self.filter_subscriptions.clear();
+    }
+
+    /// 筛选条输入与条件行数对齐；结构变化（增删、换条件）后整体重建，避免下标错位。
+    fn ensure_filter_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let drafts = self.session.filters().to_vec();
+        if self.filter_inputs.len() == drafts.len() {
+            return;
+        }
+        self.filter_input_reset();
+        let locale = self.locale;
+        let mut inputs = Vec::new();
+        let mut subscriptions = Vec::new();
+        for (index, draft) in drafts.iter().enumerate() {
+            let placeholder = SharedString::from(i18n::text(locale, "grid.filter.valuePlaceholder"));
+            let upper = SharedString::from(i18n::text(locale, "grid.filter.upperPlaceholder"));
+            let mut row = FilterRowInputs::default();
+            for (slot, placeholder) in [(0usize, placeholder), (1usize, upper)] {
+                let state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder.clone()));
+                let text = if slot == 0 { draft.value.clone() } else { draft.second.clone() };
+                state.update(cx, |state, cx| state.set_value(text, window, cx));
+                let subscription = cx.subscribe(&state, move |this, state, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        let text = state.read(cx).value().to_string();
+                        this.update_filter_text(index, slot == 0, &text);
+                        cx.notify();
+                    } else if matches!(event, InputEvent::PressEnter { .. }) {
+                        // 只有显式应用才会发查询；非法输入停在这里。
+                        let _ = this.apply_filters(cx);
+                    }
+                });
+                subscriptions.push(subscription);
+                if slot == 0 {
+                    row.value = Some(state);
+                } else {
+                    row.second = Some(state);
+                }
+            }
+            inputs.push(row);
+        }
+        self.filter_inputs = inputs;
+        self.filter_subscriptions = subscriptions;
     }
 
     fn select_first_if_needed(&mut self) {
@@ -516,22 +700,38 @@ impl GridPane {
         };
         let copied = match id {
             "column-sort-asc" => {
-                self.sort_desc = false;
                 self.session.set_sort(&name, false);
+                self.reload_after_condition_change(cx);
                 None
             }
             "column-sort-desc" => {
-                self.sort_desc = true;
                 self.session.set_sort(&name, true);
+                self.reload_after_condition_change(cx);
+                None
+            }
+            "column-sort-cycle" => {
+                let _ = self.cycle_sort(&name, cx);
                 None
             }
             "column-clear-sort" => {
                 self.session.clear_sort();
+                self.reload_after_condition_change(cx);
+                None
+            }
+            "column-filter" => {
+                self.session.add_filter(&name);
+                self.filter_input_reset();
+                None
+            }
+            "column-filter-null" => {
+                self.session.set_filter(&name, "null", "");
+                self.filter_input_reset();
                 None
             }
             "column-clear-filters" => {
                 self.search_text.clear();
                 self.session.clear_filters();
+                self.filter_input_reset();
                 None
             }
             "column-copy-name" => Some(name),
@@ -646,6 +846,18 @@ impl GridPane {
     }
 
     fn fetch_at(&mut self, offset: u64, replace: bool, cx: &mut Context<Self>) {
+        // 条件非法时不发查询：保留上一次有效结果和条件输入，只说明原因。
+        let mut request = match self.session.page_request() {
+            Ok(request) => request,
+            Err(error) => {
+                self.loading_more = false;
+                self.fetching = false;
+                self.notice = error;
+                self.sync_table(cx);
+                return;
+            }
+        };
+        request.offset = offset;
         // 分页追加不阻塞交换来源：已读取的窗口仍然完整；替换读取开始后不能被追加清掉。
         if replace {
             self.fetching = true;
@@ -654,8 +866,6 @@ impl GridPane {
         let token = self.session.token;
         self.scheduled = token;
         let services = Arc::clone(&self.services);
-        let mut request = self.session.page_request();
-        request.offset = offset;
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -674,9 +884,10 @@ impl GridPane {
                                 this.loading_more = false;
                                 return;
                             }
+                            let stale = this.session.stale_target();
                             let failure = match (&described, &paged) {
                                 (Err(error), _) | (_, Err(error)) => error.clone(),
-                                _ => "表格读取失败，已清空未能确认的旧数据。".to_owned(),
+                                _ => i18n::text(this.locale, "grid.state.readFailed"),
                             };
                             if let (Ok(schema_dto), Ok(page)) = (described, paged) {
                                 if let Ok(schema) = schema_from_dto(&schema_dto) {
@@ -689,21 +900,16 @@ impl GridPane {
                                     } else {
                                         this.session.append_page(rows, full, truncated);
                                     }
+                                    this.notice.clear();
                                     this.loading_more = false;
                                     this.fetching = false;
                                     this.sync_table(cx);
                                 } else {
-                                    this.notice = "表格结构无法识别，已清空未能确认的旧数据。".to_owned();
-                                    if replace { this.session.drop_stale_sheet(); }
-                                    this.loading_more = false;
-                                    this.fetching = false;
+                                    this.keep_sheet_after_failure(i18n::text(this.locale, "grid.state.schemaUnknown"), stale);
                                     this.sync_table(cx);
                                 }
                             } else {
-                                this.notice = failure;
-                                if replace { this.session.drop_stale_sheet(); }
-                                this.loading_more = false;
-                                this.fetching = false;
+                                this.keep_sheet_after_failure(failure, stale);
                                 this.sync_table(cx);
                             }
                         });
@@ -714,8 +920,25 @@ impl GridPane {
         .detach();
     }
 
+    /// 读取失败后决定保留还是丢弃：同一目标的刷新/追加/排序/筛选/翻页失败保留上次有效内容；
+    /// 换了表又读失败，旧表快照不能留下来当新表数据。
+    fn keep_sheet_after_failure(&mut self, message: String, stale: bool) {
+        self.loading_more = false;
+        self.fetching = false;
+        self.notice = message.clone();
+        if stale {
+            self.session.drop_stale_sheet();
+        } else {
+            self.session.keep_after_failure(&message);
+        }
+    }
+
     fn load_next_page(&mut self, cx: &mut Context<Self>) {
-        if self.loading_more || self.fetching || !self.session.has_more_rows() || self.session.mode != GridMode::Table || self.session.target.connection_id.is_empty() {
+        if self.loading_more || self.fetching || self.session.mode != GridMode::Table || self.session.target.connection_id.is_empty() {
+            return;
+        }
+        // 查询结果和没有更多行都不在这里继续读；网格从不重新执行 SQL。
+        if self.session.continuation(false) != Continuation::More {
             return;
         }
         self.loading_more = true;
@@ -724,7 +947,7 @@ impl GridPane {
     }
 
     fn schedule_locate(&mut self, token: u64, cx: &mut Context<Self>) {
-        if self.scheduled == token || self.session.target.connection_id.is_empty() {
+        if self.scheduled == token || !self.live_target() {
             return;
         }
         let Ok(proof) = prove_single_table(&self.session.target.engine, self.session.sql_text()) else {
@@ -768,7 +991,8 @@ impl GridPane {
         let names = self.session.column_names();
         let widths = self.session.widths();
         let rows = self.session.sheet_labels();
-        let has_more = self.session.has_more_rows();
+        let loading = self.loading_more || self.fetching;
+        let has_more = self.session.continuation(loading) == Continuation::More;
         let locale = self.locale;
         let writable = self.session.writable();
         let dirty = self.session.uncommitted();
@@ -784,7 +1008,7 @@ impl GridPane {
                 .collect();
             state.delegate_mut().rows = rows;
             state.delegate_mut().has_more = has_more;
-            state.delegate_mut().loading = false;
+            state.delegate_mut().loading = loading;
             state.refresh(cx);
             match focus {
                 Some((row, column)) if state.selected_cell() != Some((row, column)) => state.set_selected_cell(row, column, cx),
@@ -847,6 +1071,17 @@ impl Render for GridPane {
         let range = SharedString::from(self.session.range_text());
         let banner = SharedString::from(self.session.banner());
         let table = self.table.clone();
+        let loading = self.loading_more || self.fetching;
+        // 无匹配、表为空、加载中、还有更多、已到末尾各自有说法，不用同一个空列表。
+        let state_text = SharedString::from(self.session.state_text(loading));
+        let find_scope = self.session.find_scope();
+        let sort_dir = self.focused_column_name().and_then(|name| self.session.sort_for(&name));
+        let sort_icon = if sort_dir == Some(true) { IconName::ArrowDownWideNarrow } else { IconName::ArrowUpNarrowWide };
+        let sort_label = match sort_dir {
+            Some(true) => t("grid.action.sortDesc"),
+            Some(false) => t("grid.action.sortAsc"),
+            None => t("grid.action.sort"),
+        };
 
         let mut tools = div()
             .id("grid-tools")
@@ -858,9 +1093,31 @@ impl Render for GridPane {
             .gap(px(4.))
             .border_b_1()
             .border_color(p.line)
-            .child(div().w(px(220.)).child(kit::text_input("grid-search", &search, t("grid.action.search")).small().prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)))
+            .child(div().w(px(200.)).child(kit::text_input("grid-search", &search, t("grid.action.search")).small().prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)))
+            // 查找范围是一等状态：已读取行（本地）与整表（服务器筛选）不能混为一谈。
+            .child(kit::tool_button(
+                "grid-find-scope",
+                Some(IconName::Funnel),
+                if find_scope == FindScope::Server { t("grid.find.server") } else { t("grid.find.loaded") },
+                {
+                    let entity = entity.clone();
+                    move |_, _, cx| {
+                        entity.update(cx, |pane, cx| {
+                            let _ = pane.command("grid-find-scope", cx);
+                        });
+                    }
+                },
+            ))
+            .child(kit::tool_button("grid-filter-add", Some(IconName::Plus), t("grid.filter.add"), {
+                let entity = entity.clone();
+                move |_, _, cx| {
+                    entity.update(cx, |pane, cx| {
+                        let _ = pane.command("grid-filter", cx);
+                    });
+                }
+            }))
             .child(
-                kit::icon_button("grid-sort", if self.sort_desc { IconName::ArrowDownWideNarrow } else { IconName::ArrowUpNarrowWide }, t("grid.action.sort"), {
+                kit::icon_button("grid-sort", sort_icon, sort_label, {
                     let entity = entity.clone();
                     move |_, _, cx| {
                         entity.update(cx, |pane, cx| {
@@ -874,9 +1131,12 @@ impl Render for GridPane {
                 .child(kit::vline(&p))
                 .child(grid_icon("grid-page-prev", IconName::ChevronLeft, t("grid.action.pagePrev"), entity.clone()))
                 .child(div().px(px(4.)).text_size(px(12.)).text_color(p.text_muted).child(range.clone()))
-                .child(grid_icon("grid-page-next", IconName::ChevronRight, t("grid.action.pageNext"), entity.clone()));
+                .child(grid_icon("grid-page-next", IconName::ChevronRight, t("grid.action.pageNext"), entity.clone()))
+                .child(div().px(px(6.)).max_w(px(260.)).truncate().text_size(px(12.)).text_color(p.text_muted).child(state_text.clone()));
         } else {
-            tools = tools.child(div().px(px(6.)).text_size(px(12.)).text_color(p.text_muted).child(range.clone()));
+            tools = tools
+                .child(div().px(px(6.)).text_size(px(12.)).text_color(p.text_muted).child(range.clone()))
+                .child(div().px(px(6.)).max_w(px(260.)).truncate().text_size(px(12.)).text_color(p.text_muted).child(state_text.clone()));
         }
         tools = tools.child(div().flex_1()).child(kit::pill(
             if writable { t("grid.status.writable") } else { t("grid.status.readonly") },
@@ -915,6 +1175,111 @@ impl Render for GridPane {
             } else {
                 kit::tool_button("grid-preview", Some(IconName::Eye), t("grid.action.preview"), preview).into_any_element()
             });
+        }
+
+        // 筛选条：每条条件可辨认、可换条件、可改值、可单删；非法原因和全清也在这里。
+        let drafts = self.session.filters().to_vec();
+        let filter_error = self.session.filter_error().map(str::to_owned);
+        let mut filters_strip: Option<gpui_kit::AnyElement> = None;
+        if !drafts.is_empty() || filter_error.is_some() {
+            self.ensure_filter_inputs(window, cx);
+            let mut strip = div()
+                .id("grid-filters")
+                .flex_none()
+                .px(px(10.))
+                .py(px(3.))
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.))
+                .border_b_1()
+                .border_color(p.line)
+                .bg(p.chrome)
+                .child(kit::eyebrow(t("grid.filter.title"), &p));
+            for (index, draft) in drafts.iter().enumerate() {
+                let op = SharedString::from(self.session.op_label(&draft.op));
+                let cycle = {
+                    let entity = entity.clone();
+                    move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                        entity.update(cx, |pane, cx| {
+                            pane.cycle_filter_op(index, cx);
+                        });
+                    }
+                };
+                let remove = {
+                    let entity = entity.clone();
+                    move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                        entity.update(cx, |pane, cx| pane.remove_filter(index, cx));
+                    }
+                };
+                let mut row = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(p.line)
+                    .bg(p.raised)
+                    .child(div().text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(draft.column.clone())))
+                    .child(kit::tool_button(SharedString::from(format!("grid-filter-op-{index}")), None, op, cycle));
+                let needs_value = !matches!(draft.op.as_str(), "null" | "notnull" | "empty");
+                if let Some(inputs) = self.filter_inputs.get(index) {
+                    if needs_value {
+                        if let Some(state) = inputs.value.as_ref() {
+                            row = row.child(
+                                div()
+                                    .w(px(120.))
+                                    .child(kit::text_input(SharedString::from(format!("grid-filter-value-{index}")), state, t("grid.filter.value")).small()),
+                            );
+                        }
+                    }
+                    if draft.op == "between" {
+                        if let Some(state) = inputs.second.as_ref() {
+                            row = row.child(
+                                div()
+                                    .w(px(120.))
+                                    .child(kit::text_input(SharedString::from(format!("grid-filter-upper-{index}")), state, t("grid.filter.upper")).small()),
+                            );
+                        }
+                    }
+                }
+                row = row.child(kit::icon_button(SharedString::from(format!("grid-filter-remove-{index}")), IconName::X, t("grid.filter.remove"), remove));
+                strip = strip.child(row);
+            }
+            let apply = {
+                let entity = entity.clone();
+                move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                    entity.update(cx, |pane, cx| {
+                        let _ = pane.command("grid-filter-apply", cx);
+                    });
+                }
+            };
+            let clear = {
+                let entity = entity.clone();
+                move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                    entity.update(cx, |pane, cx| {
+                        let _ = pane.command("grid-filter-clear", cx);
+                    });
+                }
+            };
+            let add = {
+                let entity = entity.clone();
+                move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                    entity.update(cx, |pane, cx| {
+                        let _ = pane.command("grid-filter", cx);
+                    });
+                }
+            };
+            strip = strip
+                .child(kit::icon_button("grid-filter-add-strip", IconName::Plus, t("grid.filter.add"), add))
+                .child(kit::icon_button("grid-filter-apply", IconName::Check, t("grid.filter.apply"), apply))
+                .child(kit::icon_button("grid-filter-clear", IconName::X, t("grid.filter.clearAll"), clear));
+            if let Some(error) = filter_error {
+                strip = strip.child(div().max_w(px(360.)).truncate().text_size(px(12.)).text_color(p.danger).child(SharedString::from(error)));
+            }
+            filters_strip = Some(strip.into_any_element());
         }
 
         let mut column = div()
@@ -986,6 +1351,7 @@ impl Render for GridPane {
                 }
             }))
             .child(tools)
+            .children(filters_strip)
             .child(div().id("grid-range").hidden().child(range))
             .child(div().id("grid-banner").hidden().child(banner));
         if has_columns {
@@ -1217,7 +1583,11 @@ const CELL_MENU: &[(&str, &str, bool, bool)] = &[
 const COLUMN_MENU: &[(&str, &str)] = &[
     ("column-sort-asc", "grid.menu.sortAsc"),
     ("column-sort-desc", "grid.menu.sortDesc"),
+    ("column-sort-cycle", "grid.menu.sortCycle"),
     ("column-clear-sort", "grid.menu.clearSort"),
+    ("", ""),
+    ("column-filter", "grid.menu.filterColumn"),
+    ("column-filter-null", "grid.menu.filterNull"),
     ("", ""),
     ("column-copy", "grid.menu.copyColumn"),
     ("column-copy-name", "grid.menu.copyColumnName"),
@@ -1950,7 +2320,7 @@ mod pane_tests {
         .unwrap();
         cx.update(|cx| {
             let pane = pane.read(cx);
-            let request = pane.session.page_request();
+            let request = pane.session.page_request().expect("条件合法");
             assert_eq!(request.limit, 250, "page_size 应改变读取行数");
             assert_eq!(request.preview_bytes, 4096, "preview_kb 应改变预览截断上限");
         });
@@ -1976,6 +2346,148 @@ mod pane_tests {
         });
         cx.update(|cx| pane.update(cx, |pane, _| pane.set_null_copy("NULL")));
         cx.update(|cx| assert_eq!(pane.read(cx).session.tsv(), "NULL"));
+    }
+
+    #[gpui_kit::test]
+    fn any_column_cycles_sort_and_returns_to_the_original_order(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                // 焦点落在第二列，工具栏排序作用于当前列，而不是固定第一列。
+                pane.session.select(1, 1, false);
+                assert_eq!(pane.cycle_sort_here(cx), Some(false));
+                assert_eq!(pane.session.sort_for("name"), Some(false));
+                // 升序按文本比较，"乙" 排在 "甲" 之前。
+                assert_eq!(pane.cell(0, 1), "乙");
+                assert_eq!(pane.cycle_sort_here(cx), Some(true));
+                assert_eq!(pane.cell(0, 1), "甲");
+                assert_eq!(pane.cycle_sort_here(cx), None);
+                assert!(pane.session.sort_state().is_none(), "第三次点击取消排序");
+                assert_eq!(pane.cell(0, 1), "甲", "取消排序回到原始顺序");
+                assert_eq!(pane.cell(1, 1), "乙");
+                // 表头菜单的直接排序与取消也走同一状态。
+                pane.column_command(0, "column-sort-desc", cx);
+                assert_eq!(pane.session.sort_for("id"), Some(true));
+                pane.column_command(0, "column-clear-sort", cx);
+                assert!(pane.session.sort_state().is_none());
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn find_scope_switch_is_visible_and_separate_from_local_find(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                assert_eq!(pane.session.find_scope(), FindScope::Loaded);
+                pane.session.set_search("乙");
+                assert_eq!(pane.loaded_len(), 1, "已读取行查找在本地生效");
+                // 切到整表筛选后不在本地重复筛，关键字随请求下发。
+                pane.set_find_scope(FindScope::Server, cx);
+                assert_eq!(pane.session.find_scope(), FindScope::Server);
+                assert_eq!(pane.session.server_search().as_deref(), Some("乙"));
+                assert_eq!(pane.loaded_len(), 2);
+                pane.toggle_find_scope(cx);
+                assert_eq!(pane.session.find_scope(), FindScope::Loaded);
+                assert_eq!(pane.session.server_search(), None);
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn filter_panel_adds_rejects_and_clears_conditions(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            pane.update(cx, |pane, _| pane.session.select(0, 1, false));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                // 把当前格的"甲"加成条件，立即生效。
+                assert_eq!(pane.add_filter_here(cx), Some(0));
+                assert_eq!(pane.session.filters().len(), 1);
+                assert_eq!(pane.session.filters()[0].op, "eq");
+                assert_eq!(pane.session.filters()[0].value, "甲");
+                assert_eq!(pane.loaded_len(), 1);
+                // 非法输入（空值）不发查询，保留上一次有效结果并说明原因。
+                pane.session.update_filter_text(0, true, "");
+                let error = pane.apply_filters(cx).unwrap_err();
+                assert!(!error.is_empty());
+                assert_eq!(pane.notice, error, "非法原因要显示出来");
+                assert_eq!(pane.loaded_len(), 1, "非法条件不能清掉旧结果");
+                // 改好后再应用成功。
+                pane.session.update_filter_text(0, true, "乙");
+                assert!(pane.apply_filters(cx).is_ok());
+                assert!(pane.notice.is_empty());
+                assert_eq!(pane.cell(0, 1), "乙");
+                // 全清恢复全部已读取行。
+                pane.clear_filter_panel(cx);
+                assert!(pane.session.filters().is_empty());
+                assert_eq!(pane.loaded_len(), 2);
+                assert!(pane.session.filter_error().is_none());
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn failed_read_keeps_the_sheet_unless_the_target_changed(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            pane.update(cx, |pane, _| pane.session.select(1, 1, false));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            pane.update(cx, |pane, _| {
+                // 同一目标的刷新失败：行、列、条件、选择和暂存都保留。
+                pane.keep_sheet_after_failure("连接已断开".to_owned(), false);
+                assert_eq!(pane.loaded_len(), 2);
+                assert_eq!(pane.session.focused_row_id(), Some("2"));
+                assert!(pane.session.read_failure().is_some());
+                assert_eq!(pane.notice, "连接已断开");
+                // 换了目标又失败：旧表快照不能留下来。
+                pane.keep_sheet_after_failure("表不存在".to_owned(), true);
+                assert_eq!(pane.loaded_len(), 0);
+                assert!(pane.session.read_failure().is_none(), "旧快照不带着失败原因一起留下");
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn query_results_report_completion_and_never_page_by_replay(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.show_query(target(), "select * from customers", vec!["name".to_owned()], vec![vec![Some("乙".to_owned())]], cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                assert_eq!(pane.session.continuation(false), Continuation::Complete);
+                assert_eq!(pane.session.state_text(false), i18n::text(Locale::ZhCn, "grid.state.complete"));
+                // 查询结果没有"下一页"：这里只改窗口状态，从不重发 SQL。
+                let before = pane.session.page_offset();
+                let _ = pane.command("grid-page-next", cx);
+                assert_eq!(pane.session.page_offset(), before);
+                assert!(!pane.fetching(), "查询结果不会发新的读取请求");
+            });
+        });
     }
 
     fn plant_writable(pane: &mut GridPane, cx: &mut Context<GridPane>) {
