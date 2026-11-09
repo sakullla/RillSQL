@@ -12,11 +12,11 @@ use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableEvent, T
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
     relative,
 };
 
-use crate::ui::kit::{self, Palette};
+use crate::ui::kit::{self, Palette, Tip as _};
 use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::application::AppServices;
@@ -93,6 +93,8 @@ impl GridPane {
             TableState::new(SheetDelegate::default(), window, cx)
                 .cell_selectable(true)
                 .row_selectable(true)
+                // 列头也能选：整列同样是一个 anchor/focus 矩形，高亮与复制、统计同源。
+                .col_selectable(true)
                 .col_resizable(true)
                 .row_header(true)
         });
@@ -871,6 +873,16 @@ impl GridPane {
                 self.session.select(*row, column, false);
                 self.request_edit(true);
             }
+            TableEvent::SelectColumn(col) => {
+                // 列头与行头对称：整列就是从首行到末行的矩形，
+                // 高亮、TSV、SQL 值和统计读的是同一段行列。
+                let column = col.saturating_sub(1);
+                let last = self.session.loaded_len().saturating_sub(1);
+                if self.session.selection_bounds() != Some((0, column, last, column)) {
+                    self.session.select(0, column, false);
+                    self.session.select(last, column, true);
+                }
+            }
             TableEvent::SelectRow(row) | TableEvent::DoubleClickedRow(row) => {
                 // 行头选择走同一组 anchor/focus：整行就是一个从首列到末列的矩形，
                 // 高亮、TSV、SQL 值和统计因而和拖选整行得到的结果一致。
@@ -1129,8 +1141,11 @@ impl GridPane {
         // 表格自己的高亮也要跟着稳定身份走：重排后按会话焦点重新指到同一行。
         // 事件是异步送达的，靠 apply_table_event 的相等判断避免回声改写选择。
         let focus = self.session.focus_cell().map(|(row, column)| (row, column + 1));
+        // 高亮的唯一来源是会话矩形：拖选、Shift/Ctrl、键盘扩展和行头选择的每一格都由它画底色。
+        let selected = self.session.selection_bounds();
         self.table.update(cx, |state, cx| {
             state.delegate_mut().locale = locale;
+            state.delegate_mut().selected = selected;
             state.delegate_mut().writable = writable;
             state.delegate_mut().dirty = dirty;
             state.delegate_mut().columns = std::iter::once(("#".to_owned(), 56.0, true))
@@ -1183,6 +1198,12 @@ impl Render for GridPane {
         } else if self.edit_target.is_none() && std::mem::take(&mut self.refocus) {
             window.focus(&self.grid_focus, cx);
         }
+        // 行头/列头选择和表格回声只改会话，不一定走 sync_table；绘制前把矩形推给格子画法，
+        // 否则高亮会落后复制和统计一步。只写字段、不 notify，本帧的表格紧接着就按新值画。
+        let selected = self.session.selection_bounds();
+        if self.table.read(cx).delegate().selected != selected {
+            self.table.update(cx, |state, _| state.delegate_mut().selected = selected);
+        }
         // 切窗口、点别的面板：焦点从网格内移到网格外时结束拖选，已选矩形保留。
         // 表格自己拿焦点也算在网格内，正常点击和方向键不会被误判成失焦。
         let focus_inside = self.grid_focus.is_focused(window) || self.table.read(cx).focus_handle(cx).is_focused(window);
@@ -1234,12 +1255,17 @@ impl Render for GridPane {
         // 已选且已读取值的统计：和复制、高亮用同一个 anchor/focus 矩形。
         // 它浮在表格左下方而不是占一行，出现和消失都不会让行位置跳动。
         let stats: Option<gpui_kit::AnyElement> = self.session.stats_text().map(|text| {
+            let full = SharedString::from(text);
             div()
                 .id("grid-stats")
                 .debug_selector(|| "grid-stats".to_owned())
                 .absolute()
                 .left(px(10.))
                 .bottom(px(6.))
+                // 窄窗口里这行很长：限宽 + 省略号，不让它盖住右边的数据格；
+                // 完整内容放在提示里，被截断的字段仍然读得到。
+                .max_w(px(520.))
+                .truncate()
                 .px(px(8.))
                 .py(px(2.))
                 .rounded(px(4.))
@@ -1248,7 +1274,8 @@ impl Render for GridPane {
                 .border_color(p.line)
                 .text_size(px(11.))
                 .text_color(p.text_muted)
-                .child(SharedString::from(text))
+                .tooltip_text(full.clone())
+                .child(full)
                 .into_any_element()
         });
 
@@ -1781,12 +1808,28 @@ struct SheetDelegate {
     sort: Option<(usize, bool)>,
     has_more: bool,
     loading: bool,
+    /// 会话选择的矩形（行起、列起、行止、列止，数据列下标）。格子据此画高亮，
+    /// 和复制、统计读的是同一个矩形；行号列属于整行。
+    selected: Option<(usize, usize, usize, usize)>,
     visible_start: usize,
     visible_seen: bool,
     owner: Option<gpui_kit::WeakEntity<GridPane>>,
     locale: Locale,
     writable: bool,
     dirty: bool,
+}
+
+/// 一个格子是否落在会话选择的矩形里。列 0 是行号列，按点击时的同一套映射当成第一个数据列：
+/// 于是行头选择（首列到末列）整行都亮，而单格或不含首列的矩形不会多亮一行号。
+fn cell_selected(bounds: Option<(usize, usize, usize, usize)>, row_ix: usize, col_ix: usize) -> bool {
+    let Some((row_start, column_start, row_end, column_end)) = bounds else {
+        return false;
+    };
+    if row_ix < row_start || row_ix > row_end {
+        return false;
+    }
+    let column = col_ix.saturating_sub(1);
+    column >= column_start && column <= column_end
 }
 
 /// 表格获得焦点时的快捷键。与快捷键帮助里登记的组合一致。
@@ -1939,6 +1982,9 @@ impl TableDelegate for SheetDelegate {
         // 拖到另一格、松开都带着真实行列，不需要按像素反推行号。
         let owner = self.owner.clone();
         let column = col_ix.saturating_sub(1);
+        // 选中的每一格自己画底色，不是只让焦点那格亮：矩形里没有画的格子会让高亮和
+        // 复制/统计说的范围对不上。行号列（col 0）属于整行，行在矩形里就一起亮。
+        let selected = cell_selected(self.selected, row_ix, col_ix);
         div()
             .id(gpui_kit::ElementId::named_usize(format!("grid-cell-{row_ix}"), col_ix))
             // 测试按住真实坐标点击/拖拽时用它找到格子；只在测试/debug+test-support 记录。
@@ -1946,6 +1992,8 @@ impl TableDelegate for SheetDelegate {
             .size_full()
             .truncate()
             .when(null, |this| this.text_color(p.text_faint).italic())
+            // 高亮色与表格自己的激活色同源（透明的 selection），文字仍然可读。
+            .when(selected, |this| this.bg(p.selection))
             .child(SharedString::from(text))
             .when_some(owner, move |this, owner| {
                 let drag = owner.clone();
@@ -1979,6 +2027,9 @@ impl TableDelegate for SheetDelegate {
                     }
                 })
             })
+            // 选中状态同时写进这一格的语义，帧级测试按同样的值核对"画出来的高亮"。
+            .aria_selected(selected)
+            .test_support()
     }
 
     fn render_th(&mut self, col_ix: usize, _: &mut Window, _: &mut Context<TableState<Self>>) -> impl IntoElement {
@@ -2223,7 +2274,7 @@ mod pane_tests {
     use super::*;
     use crate::grid::commands::{ColumnDto, RowDto};
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{AnyWindowHandle, Bounds, Modifiers, Point, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, size};
+    use gpui_kit::{AnyWindowHandle, Bounds, Modifiers, Pixels, Point, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, size};
 
     fn target() -> GridTarget {
         GridTarget {
@@ -3322,6 +3373,137 @@ mod pane_tests {
                 assert_eq!(pane.session.selection_bounds(), Some((0, 0, 1, 1)), "拖选和行头用同一个矩形模型");
             });
         });
+    }
+
+    /// 上一帧里每一格画出来的选中状态；格子按与点击相同的稳定 ElementId 定位。
+    fn painted_cells(
+        visual: &mut VisualTestContext,
+        rows: usize,
+        table_columns: usize,
+    ) -> std::collections::HashMap<(usize, usize), (bool, bool, Bounds<Pixels>)> {
+        let snapshots = visual.update(|window, _| gpui_kit::base::test_support::snapshots(window));
+        let mut painted = std::collections::HashMap::new();
+        for row in 0..rows {
+            for col_ix in 0..table_columns {
+                let id = gpui_kit::ElementId::named_usize(format!("grid-cell-{row}"), col_ix);
+                if let Some(snapshot) = snapshots.iter().find(|item| item.path().last() == Some(&id)) {
+                    painted.insert((row, col_ix), (snapshot.selected() == Some(true), snapshot.visible(), snapshot.bounds()));
+                }
+            }
+        }
+        painted
+    }
+
+    /// 帧里每一格的高亮必须与 session 的选区矩形逐格一致：矩形内每格都亮（行号列随整行），
+    /// 矩形外都不亮，都真的画在可见区域里，而且和复制、统计框住的格子数相同。
+    fn assert_paint_matches_selection(cx: &mut TestAppContext, window: AnyWindowHandle, pane: &Entity<GridPane>) {
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        let (bounds, rows, columns, expected_cells) = cx.update(|cx| {
+            let pane = pane.read(cx);
+            let session = &pane.session;
+            (session.selection_bounds(), session.loaded_len(), session.column_names().len(), session.selection_count())
+        });
+        let mut visual = VisualTestContext::from_window(window, cx);
+        // 表头那一列之外，行号列 + 每个数据列都由格子自己画出选中状态。
+        let painted = painted_cells(&mut visual, rows, columns + 1);
+        assert_eq!(painted.len(), rows * (columns + 1), "可见窗口里的每一格都要真的画出来 {:?}", painted.keys());
+        let mut selected = 0;
+        for row in 0..rows {
+            for col_ix in 0..=columns {
+                let expected = bounds.is_some_and(|(row_start, column_start, row_end, column_end)| {
+                    // 列 0 是行号列，按点击时的同一套映射当成第一个数据列。
+                    row >= row_start && row <= row_end && (column_start..=column_end).contains(&col_ix.saturating_sub(1))
+                });
+                let (is_selected, visible, _) = painted[&(row, col_ix)];
+                assert_eq!(is_selected, expected, "({row}, {col_ix}) 格的高亮必须与选区矩形 {bounds:?} 一致");
+                assert!(visible, "({row}, {col_ix}) 格应画在可见区域里");
+                if col_ix > 0 && is_selected {
+                    selected += 1;
+                }
+            }
+        }
+        assert_eq!(selected, expected_cells, "画出来的格子数必须等于复制和统计的范围");
+    }
+
+    /// 拖选、Ctrl/Cmd 加选、Shift 键盘扩展、行头与列头选择都从同一个 anchor/focus 矩形取高亮：
+    /// 每一格都画出选中底色，行头选择画整行而不是最后一格。
+    #[gpui_kit::test]
+    fn every_cell_in_the_selection_rectangle_is_painted_selected(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        // 鼠标拖选 2x2：矩形里的四格都要亮，行号列随整行走。
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(0, 0, false, cx)));
+        settle(cx);
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_drag(1, 1, cx)));
+        settle(cx);
+        cx.update(|cx| pane.update(cx, |pane, _| pane.cell_release()));
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.tsv(), "1\t甲\n2\t乙", "拖选范围就是高亮范围");
+            assert_eq!(pane.session.selection_stats().cells, 4);
+        });
+        assert_paint_matches_selection(cx, window, &pane);
+        // 高亮画在真实的格子元素上：观测到的边界就是点击用的那个格的边界。
+        let mut visual = VisualTestContext::from_window(window, cx);
+        let painted = painted_cells(&mut visual, 2, 3);
+        assert_eq!(
+            painted[&(1, 2)].2,
+            visual.debug_bounds("grid-cell-1-2").expect("name 格"),
+            "高亮与格子是同一个元素"
+        );
+        // 统计条同样限宽：窄窗口里用省略号，不横向盖住右边的数据格；完整文本在提示里。
+        let stats_box = visual.debug_bounds("grid-stats").expect("有选择就显示统计条");
+        assert!(stats_box.size.width <= px(520.), "统计条不能超过限宽：{}", stats_box.size.width);
+
+        // Ctrl/Cmd 单击换角：同一个矩形，同样每格都亮。
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(0, 0, false, cx)));
+        settle(cx);
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(1, 1, true, cx)));
+        settle(cx);
+        assert_paint_matches_selection(cx, window, &pane);
+
+        // 键盘 Shift 扩展：和鼠标落在同一组行列上。
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.session.select(0, 0, false);
+                pane.session.move_key("down", true);
+                pane.session.move_key("right", true);
+                pane.sync_table(cx);
+            })
+        });
+        settle(cx);
+        assert_paint_matches_selection(cx, window, &pane);
+
+        // 行头选择：整行都亮，不是只有最后一格；别的行不亮。
+        cx.update(|cx| pane.update(cx, |pane, _| pane.apply_table_event(&TableEvent::SelectRow(1))));
+        settle(cx);
+        cx.update(|cx| assert_eq!(pane.read(cx).session.selection_bounds(), Some((1, 0, 1, 1))));
+        assert_paint_matches_selection(cx, window, &pane);
+
+        // 列头选择：整列都亮，与整列复制和统计的范围一致。
+        cx.update(|cx| pane.update(cx, |pane, _| pane.apply_table_event(&TableEvent::SelectColumn(2))));
+        settle(cx);
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.selection_bounds(), Some((0, 1, 1, 1)), "列头选择应覆盖整列");
+            assert_eq!(pane.session.selection_stats().cells, 2);
+        });
+        assert_paint_matches_selection(cx, window, &pane);
+
+        // 取消选择后不再有格子亮着，也没有统计条。
+        cx.update(|cx| pane.update(cx, |pane, cx| {
+            pane.session.clear_selection();
+            pane.sync_table(cx);
+        }));
+        settle(cx);
+        assert_paint_matches_selection(cx, window, &pane);
+        let mut visual = VisualTestContext::from_window(window, cx);
+        assert!(visual.debug_bounds("grid-stats").is_none(), "没有选择就不显示统计条");
     }
 
     fn plant_writable(pane: &mut GridPane, cx: &mut Context<GridPane>) {

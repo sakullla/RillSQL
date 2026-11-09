@@ -1186,7 +1186,12 @@ impl SharedGrid {
     }
 
     pub fn selection_count(&self) -> usize {
-        self.selection().len()
+        match self.selection_bounds() {
+            Some((row_start, column_start, row_end, column_end)) => {
+                (row_end - row_start + 1) * (column_end - column_start + 1)
+            }
+            None => 0,
+        }
     }
 
     pub fn selection_within_loaded(&self) -> bool {
@@ -1882,20 +1887,26 @@ impl SharedGrid {
             skipped_text: 0,
             skipped_incomplete: 0,
         };
-        for (row, column) in self.selection() {
-            stats.cells += 1;
-            match self.stat_cell(row, column) {
-                StatCell::Numeric(value) => {
-                    stats.numeric += 1;
-                    stats.sum += value;
-                    stats.min = Some(stats.min.map_or(value, |min: f64| min.min(value)));
-                    stats.max = Some(stats.max.map_or(value, |max: f64| max.max(value)));
+        // 逐格遍历矩形边界，不先铺开整个选区的点集：全选大表时重绘也不再每帧分配一块 Vec。
+        let Some((row_start, column_start, row_end, column_end)) = self.selection_bounds() else {
+            return stats;
+        };
+        for row in row_start..=row_end {
+            for column in column_start..=column_end {
+                stats.cells += 1;
+                match self.stat_cell(row, column) {
+                    StatCell::Numeric(value) => {
+                        stats.numeric += 1;
+                        stats.sum += value;
+                        stats.min = Some(stats.min.map_or(value, |min: f64| min.min(value)));
+                        stats.max = Some(stats.max.map_or(value, |max: f64| max.max(value)));
+                    }
+                    StatCell::Null => stats.skipped_null += 1,
+                    StatCell::Empty => stats.skipped_empty += 1,
+                    StatCell::Binary => stats.skipped_binary += 1,
+                    StatCell::Text => stats.skipped_text += 1,
+                    StatCell::Incomplete => stats.skipped_incomplete += 1,
                 }
-                StatCell::Null => stats.skipped_null += 1,
-                StatCell::Empty => stats.skipped_empty += 1,
-                StatCell::Binary => stats.skipped_binary += 1,
-                StatCell::Text => stats.skipped_text += 1,
-                StatCell::Incomplete => stats.skipped_incomplete += 1,
             }
         }
         if stats.numeric > 0 {
@@ -1904,16 +1915,21 @@ impl SharedGrid {
         stats
     }
 
-    /// 状态栏一句话统计；没有选择时为空。
+    /// 状态栏一句话统计；没有选择时为空。一次遍历得出全部数字，空选区不铺开点集。
     pub fn stats_text(&self) -> Option<String> {
-        if self.selection().is_empty() {
+        let stats = self.selection_stats();
+        if stats.cells == 0 {
             return None;
         }
-        let stats = self.selection_stats();
         let number = |value: Option<f64>| value.map(format_number).unwrap_or_else(|| i18n::text(self.locale, "grid.stats.none"));
         let cells = stats.cells.to_string();
         let numeric = stats.numeric.to_string();
-        let sum = format_number(stats.sum);
+        // 没有数值时合计写 —，和平均/最小/最大一样表示"没有"，不拿 0 冒充零和。
+        let sum = if stats.numeric == 0 {
+            i18n::text(self.locale, "grid.stats.none")
+        } else {
+            format_number(stats.sum)
+        };
         let average = number(stats.average);
         let min = number(stats.min);
         let max = number(stats.max);
@@ -3788,6 +3804,8 @@ mod tests {
         assert_eq!(only_null.skipped_null, 1);
         let text = grid.stats_text().expect("统计");
         assert!(text.contains(i18n::text(Locale::ZhCn, "grid.stats.none").as_str()), "{text}");
+        // 没有数值时合计同样写 —，不拿 0 冒充零和。
+        assert!(text.contains("合计 —"), "无数值选区的合计不能是 0：{text}");
     }
 
     fn identity_grid() -> SharedGrid {
