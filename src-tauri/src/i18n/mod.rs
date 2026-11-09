@@ -294,6 +294,9 @@ dict! {
     "grid.menu.copy" => "复制", "Copy";
     "grid.menu.copyRow" => "复制整行", "Copy entire row";
     "grid.menu.copyColumn" => "复制整列", "Copy entire column";
+    "grid.menu.copyWhere" => "复制当前格 WHERE", "Copy current-cell WHERE";
+    "grid.menu.copyRowWhere" => "复制整行 WHERE", "Copy row WHERE";
+    "grid.menu.copyColumnWhere" => "复制整列 WHERE", "Copy column WHERE";
     "grid.menu.filterByValue" => "按此值筛选", "Filter by this value";
     "grid.menu.markDelete" => "标记删除行", "Mark row for deletion";
     "grid.menu.sortAsc" => "升序排序", "Sort ascending";
@@ -351,6 +354,8 @@ dict! {
     "grid.state.readFailed" => "上一次读取失败，保留了上次有效的结果。", "The last read failed; the previous result was kept.";
     "grid.state.schemaUnknown" => "表格结构无法识别，保留了上次有效的结果。", "The table structure could not be read; the previous result was kept.";
     "grid.value.copyValue" => "复制值", "Copy value";
+    "grid.stats.text" => "已选 {cells} 格 · 数值 {numeric} · 合计 {sum} · 平均 {avg} · 最小 {min} · 最大 {max} · 跳过 NULL {null} / 空串 {empty} / 二进制 {binary} / 非数值 {text} / 未完整 {incomplete}", "Selected {cells} cells · numeric {numeric} · sum {sum} · avg {avg} · min {min} · max {max} · skipped null {null} / empty {empty} / binary {binary} / non-numeric {text} / incomplete {incomplete}";
+    "grid.stats.none" => "—", "—";
     "grid.errors.viewReadonly" => "视图是只读的，不能新增、修改或删除数据。", "Views are read-only; data cannot be inserted, modified or deleted.";
     "query.run.runScript" => "执行脚本", "Run script";
     "query.run.cancel" => "取消", "Cancel";

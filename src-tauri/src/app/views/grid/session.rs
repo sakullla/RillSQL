@@ -4,7 +4,7 @@
 use std::cmp::Ordering;
 
 use crate::grid::commands::{ChangeArg, ColumnDto, CommitDto, PageDto, PageRequest, SchemaDto, SortArg, TableRef, ValueArg};
-use crate::grid::{delete_sql, insert_sql, locate_sheet, sql_cell, update_sql, value_family, Cell, Column, Engine, TableSchema, ValueFamily};
+use crate::grid::{delete_sql, insert_sql, locate_sheet, qualified_name, quote_ident, sql_cell, update_sql, value_family, Cell, Column, Engine, TableSchema, ValueFamily};
 use crate::i18n::{self, Locale};
 use crate::query::split_sql;
 
@@ -138,6 +138,48 @@ pub enum SheetEmptiness {
     /// 查询结果的空结果集：语句成功但没有返回行，与"表为空"不是一回事。
     ResultEmpty,
     NoMatch,
+}
+
+/// 复制范围：当前格、整行、整列。行按稳定 id、列按列名取身份，视觉重排不改变逻辑列。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyScope {
+    Cell,
+    Row,
+    Column,
+}
+
+/// 已选且已读取值的统计。跳过项分别计数：NULL、空串、二进制、非数值和未完整值
+/// 都不混进 sum/avg/min/max，也不用 0 冒充缺失的分母。
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectionStats {
+    pub cells: usize,
+    pub numeric: usize,
+    pub sum: f64,
+    pub average: Option<f64>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub skipped_null: usize,
+    pub skipped_empty: usize,
+    pub skipped_binary: usize,
+    pub skipped_text: usize,
+    pub skipped_incomplete: usize,
+}
+
+impl SelectionStats {
+    pub fn skipped(&self) -> usize {
+        self.skipped_null + self.skipped_empty + self.skipped_binary + self.skipped_text + self.skipped_incomplete
+    }
+}
+
+/// 统计时对单个格子的归类；只有 Numeric 进入数值汇总。
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StatCell {
+    Numeric(f64),
+    Null,
+    Empty,
+    Binary,
+    Text,
+    Incomplete,
 }
 
 /// 还能不能继续读。加载中、还有更多、已完整、以及网格不能自己延续的结果要分开。
@@ -1119,6 +1161,30 @@ impl SharedGrid {
         self.rows.iter().position(|row| row.id == row_id)
     }
 
+    /// 选择的矩形边界（行起、列起、行止、列止）。鼠标、Shift、Ctrl/Cmd、拖选和
+    /// 键盘扩展都写同一组 anchor/focus，因此高亮、复制和统计看到的是同一个矩形。
+    pub fn selection_bounds(&self) -> Option<(usize, usize, usize, usize)> {
+        if !self.selected || self.rows.is_empty() || self.columns.is_empty() {
+            return None;
+        }
+        let (row_a, col_a) = self.anchor;
+        let (row_b, col_b) = self.focus;
+        Some((
+            row_a.min(row_b).min(self.rows.len() - 1),
+            col_a.min(col_b).min(self.columns.len() - 1),
+            row_a.max(row_b).min(self.rows.len() - 1),
+            col_a.max(col_b).min(self.columns.len() - 1),
+        ))
+    }
+
+    /// 选择锚点与焦点各自对应的稳定行 id；滚动、排序、筛选和翻页后仍是同两行。
+    pub fn selection_ids(&self) -> Option<(&str, &str)> {
+        if !self.selected || self.anchor_id.is_empty() || self.focus_id.is_empty() {
+            return None;
+        }
+        Some((self.anchor_id.as_str(), self.focus_id.as_str()))
+    }
+
     pub fn selection_count(&self) -> usize {
         self.selection().len()
     }
@@ -1155,13 +1221,22 @@ impl SharedGrid {
     /// TSV 复制：数据库 NULL 写成不带引号的 NULL，字符串 "NULL" 写成带引号的 "NULL"，
     /// 空字符串保持空字段；制表符、换行和引号按 TSV 规则转义。
     pub fn tsv(&self) -> String {
-        let points = self.selection();
+        self.tsv_grid(&self.selection())
+    }
+
+    /// SQL 值复制：按目标引擎写成字面量，NULL 与 'NULL' 在文本上也可区分。
+    pub fn sql_values(&self) -> String {
+        self.sql_grid(&self.selection())
+    }
+
+    /// 一组单元格（显示行列）拼成多行 TSV；行内顺序就是传入顺序（逻辑列顺序）。
+    fn tsv_grid(&self, points: &[(usize, usize)]) -> String {
         if points.is_empty() {
             return String::new();
         }
         let mut lines: Vec<Vec<String>> = Vec::new();
         let mut current = usize::MAX;
-        for (row, column) in points {
+        for (row, column) in points.iter().copied() {
             if row != current {
                 lines.push(Vec::new());
                 current = row;
@@ -1171,16 +1246,14 @@ impl SharedGrid {
         lines.into_iter().map(|line| line.join("\t")).collect::<Vec<_>>().join("\n")
     }
 
-    /// SQL 值复制：按目标引擎写成字面量，NULL 与 'NULL' 在文本上也可区分。
-    pub fn sql_values(&self) -> String {
-        let points = self.selection();
+    fn sql_grid(&self, points: &[(usize, usize)]) -> String {
         if points.is_empty() {
             return String::new();
         }
         let engine = Engine::parse(&self.target.engine).unwrap_or(Engine::Sqlite);
         let mut lines: Vec<Vec<String>> = Vec::new();
         let mut current = usize::MAX;
-        for (row, column) in points {
+        for (row, column) in points.iter().copied() {
             if row != current {
                 lines.push(Vec::new());
                 current = row;
@@ -1641,26 +1714,256 @@ impl SharedGrid {
         added
     }
 
+    /// 整行复制：按焦点行的稳定 id 找到当前显示行，再按逻辑列顺序取全部列。
+    /// 复制不改变选择，排序、筛选或翻页后仍对应同一行。
     pub fn copy_row(&mut self) -> String {
-        let Some((row, _)) = self.focus_cell() else {
-            return String::new();
-        };
-        let last = self.columns.len().saturating_sub(1);
-        self.select(row, 0, false);
-        self.select(row, last, true);
-        self.tsv()
+        self.copy_scope(CopyScope::Row, false)
     }
 
+    pub fn copy_row_sql(&mut self) -> String {
+        self.copy_scope(CopyScope::Row, true)
+    }
+
+    /// 整列复制：列按列名定位，视觉重排不改变逻辑列顺序。
     pub fn copy_column(&mut self) -> String {
-        let Some((_, column)) = self.focus_cell() else {
+        self.copy_scope(CopyScope::Column, false)
+    }
+
+    pub fn copy_column_sql(&mut self) -> String {
+        self.copy_scope(CopyScope::Column, true)
+    }
+
+    /// 当前格复制：一格 TSV / 一格 SQL 字面量，与矩形选择的输入一致。
+    pub fn copy_cell(&mut self) -> String {
+        self.copy_scope(CopyScope::Cell, false)
+    }
+
+    pub fn copy_cell_sql(&mut self) -> String {
+        self.copy_scope(CopyScope::Cell, true)
+    }
+
+    fn copy_scope(&mut self, scope: CopyScope, sql: bool) -> String {
+        let Some(points) = self.scope_points(scope) else {
             return String::new();
         };
-        if self.rows.is_empty() {
+        if sql {
+            self.sql_grid(&points)
+        } else {
+            self.tsv_grid(&points)
+        }
+    }
+
+    /// 复制范围展开成显示行列：行取全部逻辑列，列取全部已读取行，格只取一格。
+    fn scope_points(&self, scope: CopyScope) -> Option<Vec<(usize, usize)>> {
+        let (row, column) = self.focus_cell()?;
+        let points = match scope {
+            CopyScope::Cell => vec![(row, column)],
+            CopyScope::Row => (0..self.columns.len()).map(|column| (row, column)).collect(),
+            CopyScope::Column => (0..self.rows.len()).map(|row| (row, column)).collect(),
+        };
+        Some(points)
+    }
+
+    /// WHERE 复制：行用稳定定位列（没有定位列时退回全部列），列用该列在选区里的
+    /// 去重值集合；条件里的列名来自列身份，不依赖当前显示位置。
+    pub fn copy_where(&mut self, scope: CopyScope) -> String {
+        self.where_text(scope)
+    }
+
+    pub fn where_text(&self, scope: CopyScope) -> String {
+        let Some((row, column)) = self.focus_cell() else {
+            return String::new();
+        };
+        let conditions = match scope {
+            CopyScope::Cell => self.cell_conditions(row, column),
+            CopyScope::Row => self.row_conditions(row),
+            CopyScope::Column => self.column_conditions(column),
+        };
+        if conditions.is_empty() {
             return String::new();
         }
-        self.select(0, column, false);
-        self.select(self.rows.len() - 1, column, true);
-        self.tsv()
+        format!("WHERE {}", conditions.join(" AND "))
+    }
+
+    fn cell_conditions(&self, row: usize, column: usize) -> Vec<String> {
+        self.condition(row, column).into_iter().collect()
+    }
+
+    fn row_conditions(&self, row: usize) -> Vec<String> {
+        let locator = self.rows.get(row).map(|item| item.locator.clone()).unwrap_or_default();
+        if !locator.is_empty() {
+            let conditions = locator
+                .iter()
+                .filter_map(|(name, value)| {
+                    let column = self.columns.iter().position(|item| item.name == *name)?;
+                    Some(self.condition_with(column, value.clone()))
+                })
+                .collect::<Vec<_>>();
+            if !conditions.is_empty() {
+                return conditions;
+            }
+        }
+        (0..self.columns.len()).filter_map(|column| self.condition(row, column)).collect()
+    }
+
+    fn column_conditions(&self, column: usize) -> Vec<String> {
+        let Some(name) = self.columns.get(column).map(|item| item.name.clone()) else {
+            return Vec::new();
+        };
+        let mut values: Vec<String> = Vec::new();
+        let mut has_null = false;
+        for (row, cell_column) in self.selection() {
+            if cell_column != column {
+                continue;
+            }
+            match self.value_at(row, column) {
+                Some(None) => has_null = true,
+                Some(Some(text)) if !values.contains(&text) => values.push(text),
+                _ => {}
+            }
+        }
+        let ident = self.ident(&name);
+        let origin = self.columns.get(column);
+        let mut clauses = Vec::new();
+        if !values.is_empty() {
+            let literals = values.iter().map(|value| self.literal(origin, Some(value.clone()))).collect::<Vec<_>>();
+            clauses.push(format!("{ident} IN ({})", literals.join(", ")));
+        }
+        if has_null {
+            clauses.push(format!("{ident} IS NULL"));
+        }
+        if clauses.len() > 1 {
+            vec![format!("({})", clauses.join(" OR "))]
+        } else {
+            clauses
+        }
+    }
+
+    fn condition(&self, row: usize, column: usize) -> Option<String> {
+        let value = self.value_at(row, column)?;
+        Some(self.condition_with(column, value))
+    }
+
+    fn condition_with(&self, column: usize, value: Option<String>) -> String {
+        let name = self.columns.get(column).map(|item| item.name.clone()).unwrap_or_default();
+        let ident = self.ident(&name);
+        match value {
+            None => format!("{ident} IS NULL"),
+            Some(text) => format!("{ident} = {}", self.literal(self.columns.get(column), Some(text))),
+        }
+    }
+
+    /// 条件里的列名带表名前缀（有结构证明时），并按目标引擎引用。
+    fn ident(&self, name: &str) -> String {
+        let engine = Engine::parse(&self.target.engine).unwrap_or(Engine::Sqlite);
+        match &self.schema {
+            Some(schema) => format!("{}.{}", qualified_name(schema), quote_ident(engine, name)),
+            None => quote_ident(engine, name),
+        }
+    }
+
+    fn literal(&self, column: Option<&GridColumn>, value: Option<String>) -> String {
+        let engine = Engine::parse(&self.target.engine).unwrap_or(Engine::Sqlite);
+        sql_cell(engine, column.map(domain_column).as_ref(), &cell_of(value))
+    }
+
+    /// 已选且已读取值的统计；未读取或不存在的格子记为未完整值，不参与数值汇总。
+    pub fn selection_stats(&self) -> SelectionStats {
+        let mut stats = SelectionStats {
+            cells: 0,
+            numeric: 0,
+            sum: 0.0,
+            average: None,
+            min: None,
+            max: None,
+            skipped_null: 0,
+            skipped_empty: 0,
+            skipped_binary: 0,
+            skipped_text: 0,
+            skipped_incomplete: 0,
+        };
+        for (row, column) in self.selection() {
+            stats.cells += 1;
+            match self.stat_cell(row, column) {
+                StatCell::Numeric(value) => {
+                    stats.numeric += 1;
+                    stats.sum += value;
+                    stats.min = Some(stats.min.map_or(value, |min: f64| min.min(value)));
+                    stats.max = Some(stats.max.map_or(value, |max: f64| max.max(value)));
+                }
+                StatCell::Null => stats.skipped_null += 1,
+                StatCell::Empty => stats.skipped_empty += 1,
+                StatCell::Binary => stats.skipped_binary += 1,
+                StatCell::Text => stats.skipped_text += 1,
+                StatCell::Incomplete => stats.skipped_incomplete += 1,
+            }
+        }
+        if stats.numeric > 0 {
+            stats.average = Some(stats.sum / stats.numeric as f64);
+        }
+        stats
+    }
+
+    /// 状态栏一句话统计；没有选择时为空。
+    pub fn stats_text(&self) -> Option<String> {
+        if self.selection().is_empty() {
+            return None;
+        }
+        let stats = self.selection_stats();
+        let number = |value: Option<f64>| value.map(format_number).unwrap_or_else(|| i18n::text(self.locale, "grid.stats.none"));
+        let cells = stats.cells.to_string();
+        let numeric = stats.numeric.to_string();
+        let sum = format_number(stats.sum);
+        let average = number(stats.average);
+        let min = number(stats.min);
+        let max = number(stats.max);
+        let null = stats.skipped_null.to_string();
+        let empty = stats.skipped_empty.to_string();
+        let binary = stats.skipped_binary.to_string();
+        let text = stats.skipped_text.to_string();
+        let incomplete = stats.skipped_incomplete.to_string();
+        Some(i18n::fill(
+            &i18n::text(self.locale, "grid.stats.text"),
+            &[
+                ("cells", &cells),
+                ("numeric", &numeric),
+                ("sum", &sum),
+                ("avg", &average),
+                ("min", &min),
+                ("max", &max),
+                ("null", &null),
+                ("empty", &empty),
+                ("binary", &binary),
+                ("text", &text),
+                ("incomplete", &incomplete),
+            ],
+        ))
+    }
+
+    fn stat_cell(&self, row: usize, column: usize) -> StatCell {
+        let Some(slot) = self.value_at(row, column) else {
+            return StatCell::Incomplete;
+        };
+        let Some(text) = slot else {
+            return StatCell::Null;
+        };
+        if text.is_empty() {
+            return StatCell::Empty;
+        }
+        // 预览信封不是原值：大值只读到预览，二进制没有可求和的文本。
+        match envelope(&text) {
+            Some(Envelope::Binary { .. }) => return StatCell::Binary,
+            Some(Envelope::Text { .. }) => return StatCell::Incomplete,
+            None => {}
+        }
+        let type_name = self.columns.get(column).map(|item| item.type_name.as_str()).unwrap_or("");
+        if matches!(value_family(type_name), ValueFamily::Binary) {
+            return StatCell::Binary;
+        }
+        match text.trim().parse::<f64>() {
+            Ok(number) if number.is_finite() => StatCell::Numeric(number),
+            _ => StatCell::Text,
+        }
     }
 
     pub fn filter_focused_value(&mut self) {
@@ -2261,6 +2564,18 @@ fn quote_tsv(value: &str, force: bool) -> String {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         value.to_owned()
+    }
+}
+
+/// 统计数字的文本：整数不带小数点，小数最多保留六位并去掉尾零。
+fn format_number(value: f64) -> String {
+    if !value.is_finite() {
+        return String::new();
+    }
+    if value == value.trunc() && value.abs() < 1e15 {
+        format!("{}", value as i64)
+    } else {
+        format!("{value:.6}").trim_end_matches('0').trim_end_matches('.').to_owned()
     }
 }
 
@@ -3419,5 +3734,137 @@ mod tests {
         pool.close().await;
         assert_eq!(left, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn stats_grid() -> SharedGrid {
+        let mut grid = SharedGrid::new();
+        grid.target.engine = "sqlite".into();
+        let columns = vec![
+            int_column("id"),
+            text_column("name"),
+            GridColumn { type_name: "decimal".into(), ..text_column("amount") },
+            GridColumn { type_name: "blob".into(), ..text_column("blob") },
+        ];
+        let rows = vec![
+            row("1", vec![Some("1"), Some("甲"), Some("10"), Some("\u{1}b:4")], true),
+            row("2", vec![Some("2"), Some(""), Some("2.5"), Some("00ff")], true),
+            row("3", vec![Some("3"), Some("text"), None, Some("\u{1}t:2048:abc")], true),
+            row("4", vec![Some("4"), Some("12"), Some("x"), None], true),
+        ];
+        grid.load_local(columns, rows, Some(4), Some(schema()));
+        grid
+    }
+
+    #[test]
+    fn mixed_value_stats_report_numbers_and_count_each_skipped_kind() {
+        let mut grid = stats_grid();
+        grid.select_all_loaded();
+        let stats = grid.selection_stats();
+        assert_eq!(stats.cells, 16);
+        // 数值来自整数 id、decimal 列和文本列里可解析的数字。
+        assert_eq!(stats.numeric, 7);
+        assert!((stats.sum - 34.5).abs() < 1e-9, "{}", stats.sum);
+        assert!((stats.average.unwrap() - 34.5 / 7.0).abs() < 1e-9);
+        assert_eq!(stats.min, Some(1.0));
+        assert_eq!(stats.max, Some(12.0));
+        assert_eq!(stats.skipped_null, 2);
+        assert_eq!(stats.skipped_empty, 1);
+        assert_eq!(stats.skipped_binary, 2);
+        assert_eq!(stats.skipped_text, 3);
+        // 大值预览信封不是原值，单独算未完整，不参与求和。
+        assert_eq!(stats.skipped_incomplete, 1);
+        assert_eq!(stats.skipped(), 9);
+        let text = grid.stats_text().expect("有选择就有统计");
+        assert!(text.contains("16") && text.contains("7") && text.contains("34.5"), "{text}");
+        assert!(text.contains("跳过 NULL"), "{text}");
+
+        // 只选一个 NULL 格：没有数值，也不能把平均值写成 0。
+        grid.select(2, 2, false);
+        let only_null = grid.selection_stats();
+        assert_eq!(only_null.cells, 1);
+        assert_eq!(only_null.numeric, 0);
+        assert_eq!(only_null.average, None);
+        assert_eq!(only_null.min, None);
+        assert_eq!(only_null.skipped_null, 1);
+        let text = grid.stats_text().expect("统计");
+        assert!(text.contains(i18n::text(Locale::ZhCn, "grid.stats.none").as_str()), "{text}");
+    }
+
+    fn identity_grid() -> SharedGrid {
+        let schema = schema_from_parts(
+            "sqlite",
+            "",
+            "customers",
+            "table",
+            vec![column_of("id", "integer", true), column_of("name", "text", false), column_of("amount", "integer", false)],
+            vec!["id".to_owned()],
+        )
+        .unwrap();
+        let mut grid = SharedGrid::new();
+        grid.target.engine = "sqlite".into();
+        grid.target.table = "customers".into();
+        grid.target.database = "main".into();
+        grid.load_local(
+            vec![int_column("id"), text_column("name"), int_column("amount")],
+            vec![
+                row("1", vec![Some("1"), Some("甲"), Some("10")], true),
+                row("2", vec![Some("2"), Some("乙"), Some("20")], true),
+                row("3", vec![Some("3"), Some("丙"), Some("30")], true),
+            ],
+            Some(3),
+            Some(schema),
+        );
+        grid
+    }
+
+    #[test]
+    fn copies_keep_row_and_column_identity_when_visual_order_changes() {
+        let mut grid = identity_grid();
+        // 视觉顺序改成 3,2,1；焦点行仍是 id=2。
+        grid.set_sort("id", true);
+        assert_eq!(grid.cell_label(0, 0), "3");
+        grid.select(1, 1, false);
+        assert_eq!(grid.focused_row_id(), Some("2"));
+        assert_eq!(grid.copy_row(), "2\t乙\t20");
+        assert_eq!(grid.copy_row_sql(), "2, '乙', 20");
+        assert_eq!(grid.copy_column(), "丙\n乙\n甲");
+        assert_eq!(grid.copy_column_sql(), "'丙'\n'乙'\n'甲'");
+        assert_eq!(grid.copy_cell(), "乙");
+        // 复制不改变选择：下一步的复制仍从同一格出发。
+        assert_eq!(grid.focus_cell(), Some((1, 1)));
+
+        assert_eq!(grid.where_text(CopyScope::Cell), "WHERE \"customers\".\"name\" = '乙'");
+        assert_eq!(grid.where_text(CopyScope::Row), "WHERE \"customers\".\"id\" = 2");
+        assert_eq!(grid.where_text(CopyScope::Column), "WHERE \"customers\".\"name\" IN ('乙')");
+
+        // 筛选后同一行仍被找到，复制内容不漂移；筛掉后选择为空，不复制别行。
+        grid.set_filter("name", "contains", "乙");
+        assert_eq!(grid.focused_row_id(), Some("2"));
+        assert_eq!(grid.copy_row(), "2\t乙\t20");
+        assert_eq!(grid.copy_row_sql(), "2, '乙', 20");
+        assert_eq!(grid.copy_column(), "乙");
+        grid.clear_filters();
+        grid.set_filter("name", "contains", "丙");
+        assert_eq!(grid.focused_row_id(), None);
+        assert_eq!(grid.copy_row(), "");
+        assert_eq!(grid.where_text(CopyScope::Row), "");
+    }
+
+    #[test]
+    fn where_copies_keep_null_and_staged_values_distinguishable() {
+        let mut grid = identity_grid();
+        grid.select(0, 1, false);
+        assert_eq!(grid.where_text(CopyScope::Cell), "WHERE \"customers\".\"name\" = '甲'");
+        assert_eq!(grid.stage_text(0, 1, None), Gate::Writable);
+        assert_eq!(grid.where_text(CopyScope::Cell), "WHERE \"customers\".\"name\" IS NULL");
+        assert_eq!(grid.stage_text(0, 1, Some("乙".into())), Gate::Writable);
+        assert_eq!(grid.where_text(CopyScope::Cell), "WHERE \"customers\".\"name\" = '乙'");
+        // 整列条件按选中行的去重值集合生成，NULL 单独写 IS NULL。
+        grid.select(0, 1, false);
+        grid.select(2, 1, true);
+        let column = grid.where_text(CopyScope::Column);
+        assert!(column.contains("IN (") && column.contains("'乙'") && column.contains("'丙'"), "{column}");
+        assert!(!column.contains("'甲'"), "{column}");
+        assert!(!column.contains("IS NULL"), "{column}");
     }
 }

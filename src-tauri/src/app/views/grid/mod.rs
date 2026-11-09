@@ -23,7 +23,7 @@ use crate::application::AppServices;
 use crate::grid::commands::{CountDto, CountRequest, FilterArg, PageDto, PageRequest, SchemaDto, TableRef};
 use crate::i18n::{self, Locale};
 
-use session::{columns_from_schema, rows_from_page, schema_from_dto, Continuation, FindScope, Gate};
+use session::{columns_from_schema, rows_from_page, schema_from_dto, Continuation, CopyScope, FindScope, Gate};
 
 pub struct GridPane {
     session: SharedGrid,
@@ -45,8 +45,12 @@ pub struct GridPane {
     /// 编辑栏关闭后把键盘焦点还回网格，Esc 之后方向键和 F2 仍然可用。
     refocus: bool,
     loading_more: bool,
-    /// 左键按下的格子；拖拽期间用它作为起点，松开或下一次按下时重置。
+    /// 左键按下的格子；拖拽期间用它作为起点，松开、失焦、调整列宽或滚动时结束。
     press: Option<(usize, usize)>,
+    /// 上一次绘制的可见首行；滚动换行后不能继续把指针下的格子当成同一段拖选。
+    visible_start: usize,
+    /// 上一帧键盘焦点是否在网格里；从"在"变成"不在"才算失焦，程序化拖选不受影响。
+    focus_inside: bool,
     /// 首屏或替换读取尚未返回；交换面板据此禁止把旧快照当成当前表。
     fetching: bool,
     /// 正在请求的翻页偏移。偏移在结果读回来之前不改，失败重试仍是同一页。
@@ -100,6 +104,7 @@ impl GridPane {
         let owner = cx.entity().downgrade();
         table.update(cx, |state, _| state.delegate_mut().owner = Some(owner));
         let edit_input = cx.new(|cx| InputState::new(window, cx));
+        let grid_focus = cx.focus_handle().tab_stop(true);
         // 只有 Enter 结束编辑。失焦可能来自我们自己的重绘或切换焦点，贸然取消会丢掉正在输入的值。
         let edit_subscription = cx.subscribe(&edit_input, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
@@ -119,10 +124,12 @@ impl GridPane {
             suppress_enter: false,
             pending_edit: None,
             notice: String::new(),
-            grid_focus: cx.focus_handle().tab_stop(true),
+            grid_focus,
             refocus: false,
             loading_more: false,
             press: None,
+            visible_start: 0,
+            focus_inside: false,
             fetching: false,
             pending_page: None,
             filter_inputs: Vec::new(),
@@ -339,6 +346,17 @@ impl GridPane {
                     self.session.select(0, 0, false);
                 }
                 Some(self.session.copy_column())
+            }
+            "grid-copy-where" | "grid-copy-row-where" | "grid-copy-column-where" => {
+                self.select_first_if_needed();
+                let scope = match id {
+                    "grid-copy-row-where" => CopyScope::Row,
+                    "grid-copy-column-where" => CopyScope::Column,
+                    _ => CopyScope::Cell,
+                };
+                // 没有可复制的条件时保留剪贴板原内容，不写一个空字符串覆盖它。
+                let text = self.session.copy_where(scope);
+                (!text.is_empty()).then_some(text)
             }
             "grid-filter-value" => {
                 self.session.filter_focused_value();
@@ -668,6 +686,22 @@ impl GridPane {
         self.press = None;
     }
 
+    /// 结束拖拽但不改选择：指针在表外松开、窗口失焦、调整列宽或滚动都走这里。
+    /// 返回刚才是否真的在拖选，界面据此只重绘真正变了的状态。
+    pub(crate) fn cancel_drag(&mut self) -> bool {
+        self.press.take().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dragging(&self) -> bool {
+        self.press.is_some()
+    }
+
+    /// 当前选择的统计文本；没有选择时为空。
+    pub fn stats_text(&self) -> Option<String> {
+        self.session.stats_text()
+    }
+
     /// 开始编辑：可写的格子走正式文本输入，只读的格子改为查看值并说明原因。
     fn request_edit(&mut self, select_all: bool) {
         let Some((row, column)) = self.session.focus_cell() else {
@@ -795,6 +829,12 @@ impl GridPane {
                 self.session.select(row, column, false);
                 Some(self.session.copy_column())
             }
+            "column-copy-where" => {
+                let row = self.session.focus_cell().map(|(row, _)| row).unwrap_or(0);
+                self.session.select(row, column, false);
+                let text = self.session.copy_where(CopyScope::Column);
+                (!text.is_empty()).then_some(text)
+            }
             _ => None,
         };
         if let Some(text) = copied {
@@ -807,6 +847,8 @@ impl GridPane {
     fn apply_table_event(&mut self, event: &TableEvent) {
         match event {
             TableEvent::ColumnWidthsChanged(widths) => {
+                // 拉宽列会让拖动经过的格子换位置；结束拖拽，别把新格子接进旧矩形。
+                self.press = None;
                 for (index, width) in widths.iter().enumerate() {
                     if index == 0 {
                         continue;
@@ -830,8 +872,13 @@ impl GridPane {
                 self.request_edit(true);
             }
             TableEvent::SelectRow(row) | TableEvent::DoubleClickedRow(row) => {
-                if self.session.focus_cell() != Some((*row, 0)) {
+                // 行头选择走同一组 anchor/focus：整行就是一个从首列到末列的矩形，
+                // 高亮、TSV、SQL 值和统计因而和拖选整行得到的结果一致。
+                let last = self.session.column_names().len().saturating_sub(1);
+                let bounds = self.session.selection_bounds();
+                if bounds != Some((*row, 0, *row, last)) {
                     self.session.select(*row, 0, false);
+                    self.session.select(*row, last, true);
                 }
                 if matches!(event, TableEvent::DoubleClickedRow(_)) {
                     self.session.open_value(*row, 0);
@@ -1136,8 +1183,20 @@ impl Render for GridPane {
         } else if self.edit_target.is_none() && std::mem::take(&mut self.refocus) {
             window.focus(&self.grid_focus, cx);
         }
+        // 切窗口、点别的面板：焦点从网格内移到网格外时结束拖选，已选矩形保留。
+        // 表格自己拿焦点也算在网格内，正常点击和方向键不会被误判成失焦。
+        let focus_inside = self.grid_focus.is_focused(window) || self.table.read(cx).focus_handle(cx).is_focused(window);
+        if self.press.is_some() && self.focus_inside && !focus_inside {
+            self.press = None;
+        }
+        self.focus_inside = focus_inside;
         let start = self.table.read(cx).delegate().visible_start;
         if self.table.read(cx).delegate().visible_seen {
+            // 滚动换行后指针下的格子已经不是拖选起点的邻居：结束拖拽，保留已选矩形。
+            if start != self.visible_start {
+                self.visible_start = start;
+                self.press = None;
+            }
             self.session.scroll_to(start);
         }
         let p = Palette::of(cx);
@@ -1172,6 +1231,26 @@ impl Render for GridPane {
             Some(false) => t("grid.action.sortAsc"),
             None => t("grid.action.sort"),
         };
+        // 已选且已读取值的统计：和复制、高亮用同一个 anchor/focus 矩形。
+        // 它浮在表格左下方而不是占一行，出现和消失都不会让行位置跳动。
+        let stats: Option<gpui_kit::AnyElement> = self.session.stats_text().map(|text| {
+            div()
+                .id("grid-stats")
+                .debug_selector(|| "grid-stats".to_owned())
+                .absolute()
+                .left(px(10.))
+                .bottom(px(6.))
+                .px(px(8.))
+                .py(px(2.))
+                .rounded(px(4.))
+                .bg(p.chrome)
+                .border_1()
+                .border_color(p.line)
+                .text_size(px(11.))
+                .text_color(p.text_muted)
+                .child(SharedString::from(text))
+                .into_any_element()
+        });
 
         let mut tools = div()
             .id("grid-tools")
@@ -1480,13 +1559,21 @@ impl Render for GridPane {
         if has_columns {
             column = column.child(
                 div()
+                    .relative()
                     .flex_1()
                     .min_h(px(0.))
                     .on_mouse_down(gpui_kit::MouseButton::Left, cx.listener(|this, _, window, cx| {
                         // 点中格子时把键盘交给网格本身，之后的方向键、Enter 和 F2 才有效。
                         window.focus(&this.grid_focus, cx);
                     }))
-                    .child(DataTable::new(&table).small().stripe(true).accessibility_label("shared-grid")),
+                    // 在表格外松开（拖到表格下方空白）也结束拖选，不持续跟手。
+                    .on_mouse_up_out(gpui_kit::MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        if this.cancel_drag() {
+                            cx.notify();
+                        }
+                    }))
+                    .child(DataTable::new(&table).small().stripe(true).accessibility_label("shared-grid"))
+                    .children(stats),
             );
         } else if loading {
             // 首屏、换表与替换读取还没回来：不画"没有数据"的空表插图，加载优先于空。
@@ -1721,6 +1808,9 @@ const CELL_MENU: &[(&str, &str, bool, bool)] = &[
     ("copy-sql-value", "shell.shortcuts.copySqlValue", false, false),
     ("grid-copy-row", "grid.menu.copyRow", false, false),
     ("grid-copy-column", "grid.menu.copyColumn", false, false),
+    ("grid-copy-where", "grid.menu.copyWhere", false, false),
+    ("grid-copy-row-where", "grid.menu.copyRowWhere", false, false),
+    ("grid-copy-column-where", "grid.menu.copyColumnWhere", false, false),
     ("", "", false, false),
     ("grid-filter-value", "grid.menu.filterByValue", false, false),
     ("select-all-cells", "grid.menu.selectAll", false, false),
@@ -1742,6 +1832,7 @@ const COLUMN_MENU: &[(&str, &str)] = &[
     ("column-filter-null", "grid.menu.filterNull"),
     ("", ""),
     ("column-copy", "grid.menu.copyColumn"),
+    ("column-copy-where", "grid.menu.copyColumnWhere"),
     ("column-copy-name", "grid.menu.copyColumnName"),
     ("", ""),
     ("column-clear-filters", "grid.menu.clearFilters"),
@@ -1859,6 +1950,7 @@ impl TableDelegate for SheetDelegate {
             .when_some(owner, move |this, owner| {
                 let drag = owner.clone();
                 let release = owner.clone();
+                let release_out = owner.clone();
                 this.on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
                     // Ctrl/Cmd 单击加选；Shift 单击同样按扩展处理，与键盘 Shift 一致。
                     let extend = event.modifiers.secondary(cx) || event.modifiers.shift;
@@ -1877,6 +1969,12 @@ impl TableDelegate for SheetDelegate {
                 })
                 .on_mouse_up(MouseButton::Left, move |_, _, cx| {
                     if let Some(pane) = release.upgrade() {
+                        pane.update(cx, |pane, _| pane.cell_release());
+                    }
+                })
+                // 从这一格按下、在别的格子或表外松开：同样结束拖选，不会一直跟着指针。
+                .on_mouse_up_out(MouseButton::Left, move |_, _, cx| {
+                    if let Some(pane) = release_out.upgrade() {
                         pane.update(cx, |pane, _| pane.cell_release());
                     }
                 })
@@ -3031,6 +3129,197 @@ mod pane_tests {
                 assert_eq!(pane.cycle_sort_here(cx), None);
                 assert!(pane.session.sort_text().is_none());
                 assert_eq!(pane.table.read(cx).delegate().sort, None);
+            });
+        });
+    }
+
+    /// 鼠标（普通按下 + Ctrl/Cmd 点）和键盘（Shift 扩展）必须落到同一个 anchor/focus 矩形。
+    #[gpui_kit::test]
+    fn mouse_and_keyboard_produce_the_same_rectangle_and_copies(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        // 两次鼠标动作之间让表格补发的 SelectCell 回声送达，和真实点击顺序一致。
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| pane.cell_press(0, 0, false, cx));
+        });
+        settle(cx);
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| pane.cell_press(1, 1, true, cx));
+        });
+        settle(cx);
+        let mouse = cx.update(|cx| {
+            let session = &pane.read(cx).session;
+            (session.selection_bounds(), session.focused_row_id().map(str::to_owned), session.tsv(), session.sql_values(), session.selection_stats(), session.stats_text())
+        });
+
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.cell_release();
+                pane.session.select(0, 0, false);
+                pane.session.move_key("down", true);
+                pane.session.move_key("right", true);
+                pane.sync_table(cx);
+            });
+        });
+        settle(cx);
+        cx.update(|cx| {
+            let session = &pane.read(cx).session;
+            assert_eq!(session.selection_bounds(), mouse.0, "鼠标与键盘应得到同一矩形");
+            assert_eq!(session.focused_row_id().map(str::to_owned), mouse.1);
+            assert_eq!(session.tsv(), mouse.2);
+            assert_eq!(session.sql_values(), mouse.3);
+            assert_eq!(session.selection_stats(), mouse.4);
+            assert_eq!(session.stats_text(), mouse.5);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn pointer_cancel_column_resize_and_scroll_end_the_drag(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        // 取消拖拽：已选矩形保留，但下一次移动不再扩展。
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.cell_press(0, 0, false, cx);
+                assert!(pane.dragging());
+                assert!(pane.cancel_drag());
+                pane.cell_drag(1, 1, cx);
+            });
+        });
+        settle(cx);
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert!(!pane.dragging());
+            assert_eq!(pane.session.selection_count(), 1, "取消后指针移动不应继续扩展");
+        });
+
+        // 调整列宽结束拖拽：拖到的新格子不会被接进旧矩形。
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.cell_press(0, 0, false, cx);
+                pane.apply_table_event(&TableEvent::ColumnWidthsChanged(vec![px(56.), px(80.), px(140.)]));
+                pane.cell_drag(1, 1, cx);
+            });
+        });
+        settle(cx);
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert!(!pane.dragging(), "调整列宽后应结束拖拽");
+            assert_eq!(pane.session.selection_count(), 1);
+        });
+
+        // 滚动换行结束拖拽，已选矩形仍然保留。
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.session.select(0, 0, false);
+                pane.cell_press(0, 0, false, cx);
+            });
+            pane.update(cx, |pane, cx| {
+                pane.table.update(cx, |state, _| {
+                    state.delegate_mut().visible_start = 1;
+                    state.delegate_mut().visible_seen = true;
+                });
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert!(!pane.dragging(), "滚动后应结束拖拽");
+            assert_eq!(pane.session.selection_count(), 1);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn losing_focus_ends_the_drag_without_moving_the_selection(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            let handle = pane.read(cx).focus_handle();
+            window.focus(&handle, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| pane.cell_press(0, 0, false, cx));
+        });
+        cx.update(|cx| assert!(pane.read(cx).dragging()));
+        cx.update_window(window, |_, window, cx| {
+            // 焦点交给网格外的另一个控件：这是真实会发生的焦点转移。
+            let other = cx.focus_handle();
+            window.focus(&other, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        settle(cx);
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert!(!pane.dragging(), "网格失焦后应结束拖拽");
+            assert_eq!(pane.session.focus_cell(), Some((0, 0)), "失焦不移动选择");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn where_copy_commands_write_stable_conditions_to_the_clipboard(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.session.select(1, 1, false);
+                assert_eq!(pane.command("grid-copy-where", cx).as_deref(), Some("WHERE \"customers\".\"name\" = '乙'"));
+                assert_eq!(pane.command("grid-copy-row-where", cx).as_deref(), Some("WHERE \"customers\".\"id\" = 2"));
+                assert_eq!(pane.command("grid-copy-column-where", cx).as_deref(), Some("WHERE \"customers\".\"name\" IN ('乙')"));
+            });
+        });
+        settle(cx);
+        cx.update(|cx| {
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()).as_deref(),
+                Some("WHERE \"customers\".\"name\" IN ('乙')"),
+                "最后一个 WHERE 复制应进入剪贴板"
+            );
+        });
+    }
+
+    /// 行头选中的是整行矩形，和按住拖过这一行得到的高亮、TSV、SQL 值一致。
+    #[gpui_kit::test]
+    fn row_header_selection_matches_dragging_across_the_row(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.apply_table_event(&TableEvent::SelectRow(1));
+                assert_eq!(pane.session.selection_bounds(), Some((1, 0, 1, 1)), "行头选择应覆盖整行");
+                assert_eq!(pane.session.copy_row(), "2\t乙");
+                assert_eq!(pane.session.sql_values(), "2, '乙'");
+                let stats = pane.session.selection_stats();
+                assert_eq!(stats.cells, 2);
+                assert_eq!(stats.numeric, 1, "只有 id 是数值，name 不是");
+                // 同一格的回声不收起整行；点到别的格子才换成单格选择。
+                pane.apply_table_event(&TableEvent::SelectCell(1, 2));
+                assert_eq!(pane.session.selection_bounds(), Some((1, 0, 1, 1)));
+                pane.apply_table_event(&TableEvent::SelectCell(0, 1));
+                assert_eq!(pane.session.selection_bounds(), Some((0, 0, 0, 0)));
+                pane.cell_press(0, 0, false, cx);
+                pane.cell_drag(1, 1, cx);
+                assert_eq!(pane.session.selection_bounds(), Some((0, 0, 1, 1)), "拖选和行头用同一个矩形模型");
             });
         });
     }
