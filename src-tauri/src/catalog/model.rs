@@ -491,6 +491,15 @@ pub fn sqlite_kind_count_sql(database: &str) -> String {
     )
 }
 
+/// 只读一种对象的一页；种类名来自固定表，不拼用户输入。
+pub fn sqlite_kind_page_sql(database: &str, kind: &str) -> String {
+    format!(
+        "SELECT name, type, '', '' FROM {}.sqlite_master WHERE type = '{}' AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT ?1 OFFSET ?2",
+        quote_sqlite(database),
+        kind
+    )
+}
+
 pub fn sqlite_object_page_sql(database: &str) -> String {
     format!(
         "SELECT name, type, '', '' FROM {}.sqlite_master WHERE type IN ('table', 'view', 'trigger') AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT ?1 OFFSET ?2",

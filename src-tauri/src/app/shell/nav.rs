@@ -100,6 +100,8 @@ pub enum NavRequest {
     Details(String),
     /// 继续读取一个库/模式范围的对象。
     More(String),
+    /// 只重读一个对象种类分组（局部失败后的重试）。
+    Group(String),
 }
 
 #[cfg(test)]

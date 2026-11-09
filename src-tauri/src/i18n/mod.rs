@@ -269,6 +269,11 @@ dict! {
     "catalog.tree.insertColumn" => "插入列名", "Insert column name";
     "catalog.tree.copyColumn" => "复制列名", "Copy column name";
     "catalog.tree.noData" => "这个对象没有行数据", "This object has no row data";
+    "catalog.tree.noStructure" => "这个对象没有 SQL 结构，文档在集合浏览器查看", "This object has no SQL structure; open the collection browser for documents";
+    "catalog.tree.relationalOnly" => "这个动作只适用于关系型表或视图", "This action applies only to relational tables or views";
+    "catalog.tree.actionUnavailable" => "这一行没有这个动作", "This row does not support this action";
+    "catalog.tree.expand" => "展开", "Expand";
+    "catalog.tree.collapse" => "折叠", "Collapse";
     "catalog.tree.loading" => "读取中…", "Loading…";
     "catalog.tree.nodeError" => "这一段读取失败", "This part could not be read";
     "catalog.tree.loadMore" => "读取更多", "Load more";

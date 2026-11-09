@@ -3983,9 +3983,11 @@ fn diagram_and_specialized_engines_use_their_own_scope() {
     assert_eq!(model.executions, 0);
 }
 
-/// 目录树必须从真实会话读出层级，并在展开表时按需读到列和索引。
-#[gpui_kit::test]
-fn explorer_tree_reads_real_levels_and_loads_columns_on_demand(cx: &mut gpui_kit::TestAppContext) {
+/// 一条真实 SQLite 连接（items.sqlite：表 item 与列 id/label）的工作台，供目录树渲染测试共用。
+fn sqlite_notes_workbench(
+    cx: &mut gpui_kit::TestAppContext,
+    boot: bool,
+) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<super::view::Workbench>, std::path::PathBuf) {
     cx.executor().allow_parking();
     let dir = std::env::temp_dir().join(format!("rillsql-shell-nav-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -4012,7 +4014,41 @@ fn explorer_tree_reads_real_levels_and_loads_columns_on_demand(cx: &mut gpui_kit
         });
     });
     let services = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite setup");
-    let (window, view) = open_workbench(cx, services, false);
+    let (window, view) = open_workbench(cx, services, boot);
+    (window, view, dir)
+}
+
+/// 启动后的外壳要同时读到连接列表和目录对象，资源管理器才会真的画出行。
+fn wait_for_shell_ready(
+    cx: &mut gpui_kit::TestAppContext,
+    window: gpui_kit::AnyWindowHandle,
+    view: &gpui_kit::Entity<super::view::Workbench>,
+) {
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(30) {
+        cx.run_until_parked();
+        let _ = cx.update_window(window, |_, window, cx| window.render_frame(cx));
+        let ready = cx.update(|cx| {
+            let view = view.read(cx);
+            !view.model.connections.rows.is_empty()
+                && view
+                    .model
+                    .nav
+                    .nodes()
+                    .any(|node| node.kind == crate::catalog::hierarchy::NavKind::Object && node.name == "item")
+        });
+        if ready {
+            return;
+        }
+        std::thread::park_timeout(std::time::Duration::from_millis(25));
+    }
+    panic!("外壳没有在超时内读到连接与对象");
+}
+
+/// 目录树必须从真实会话读出层级，并在展开表时按需读到列和索引。
+#[gpui_kit::test]
+fn explorer_tree_reads_real_levels_and_loads_columns_on_demand(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = sqlite_notes_workbench(cx, false);
     cx.update_window(window, |_, _, cx| {
         view.update(cx, |view, cx| view.perform("refresh-tree", cx));
     })
@@ -4133,10 +4169,321 @@ fn wait_for_nav_columns(
     false
 }
 
+
+// ------------------------------------------------------------ T2 修复回归
+
+/// 资源管理器的鼠标路径必须真的把树展开：chevron 单击、双击、键盘读同一份状态。
+#[gpui_kit::test]
+fn sidebar_mouse_paths_expand_and_collapse_the_real_tree(cx: &mut gpui_kit::TestAppContext) {
+    use crate::catalog::hierarchy::{connection_node_id, NavKind};
+    use crate::catalog::model::ObjectKind;
+    use gpui_kit::SharedString;
+
+    let (window, view, dir) = sqlite_notes_workbench(cx, true);
+    let connection = connection_node_id("notes");
+    wait_for_shell_ready(cx, window, &view);
+    // 测试用的 SQLite 连接已经打开；列表状态同步由启动任务负责，这里显式对齐。
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.model
+                .connections
+                .status
+                .insert("notes".to_owned(), crate::app::views::connections::LinkStatus::Connected);
+        });
+    });
+    let object_id = cx.update(|cx| {
+        view.read(cx)
+            .model
+            .nav
+            .nodes()
+            .find(|node| node.kind == NavKind::Object && node.name == "item")
+            .map(|node| node.id.clone())
+            .expect("表对象节点")
+    });
+
+    // 先让启动路径的连接刷新跑完，再把连接折叠回去：之后资源管理器不该有任何子行。
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.model.nav.collapse(&connection);
+            assert!(view.model.nav_rows_for("notes").is_empty());
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("side-notes").expanded(), Some(false), "连接行默认折叠");
+        assert!(window.try_find("sidebar").is_some());
+    })
+    .unwrap();
+
+    // chevron 单击＝展开（不触发行点击，也不打开浏览器）。
+    cx.update_window(window, |_, window, cx| {
+        window.click("nav-chevron-notes", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let rows = cx.update(|cx| view.read(cx).model.nav_rows_for("notes"));
+    assert!(!rows.is_empty(), "chevron 单击没有在树上展开连接");
+    assert!(cx.update(|cx| view.read(cx).model.nav_connection_expanded("notes")));
+    let group = rows
+        .iter()
+        .find(|row| row.kind == NavKind::Group && row.object_kind == Some(ObjectKind::Table))
+        .map(|row| row.id.clone())
+        .expect("表分组行");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("side-notes").expanded(), Some(true));
+        // 渲染路径真的画出了连接下的行，不只是模型里有。
+        assert!(window.try_find(SharedString::from(format!("nav-{group}"))).is_some(), "展开后没有渲染分组行");
+    })
+    .unwrap();
+
+    // 键盘左键折叠同一份状态，chevron 再展开回来。
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.model.nav.set_focus(&connection);
+            assert!(view.model.nav_step(false).is_none());
+            assert!(view.model.nav_rows_for("notes").is_empty());
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.click("nav-chevron-notes", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("side-notes").expanded(), Some(true));
+        // 双击连接行折叠，再双击展开。
+        window.double_click("side-notes", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("side-notes").expanded(), Some(false), "双击已展开的连接应折叠");
+        window.double_click("side-notes", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("side-notes").expanded(), Some(true));
+    })
+    .unwrap();
+
+    // 双击对象种类分组展开，表对象行真的出现在渲染结果里。
+    cx.update_window(window, |_, window, cx| {
+        window.double_click(SharedString::from(format!("nav-{group}")), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let rows = cx.update(|cx| view.read(cx).model.nav_rows_for("notes"));
+    assert!(
+        rows.iter().any(|row| row.kind == NavKind::Object && row.name == "item"),
+        "双击分组后应看到表对象：{rows:?}"
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find(SharedString::from(format!("nav-{object_id}"))).is_some(),
+            "对象行只出现在模型里，没有走到渲染路径"
+        );
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 对象菜单的插入入口和导航命令一样，先收回编辑器草稿再追加。
+#[gpui_kit::test]
+fn object_menu_insertions_capture_the_live_editor_draft(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = sqlite_notes_workbench(cx, true);
+    wait_for_shell_ready(cx, window, &view);
+    let object_id = cx.update(|cx| {
+        view.read(cx)
+            .model
+            .nav
+            .nodes()
+            .find(|node| node.kind == crate::catalog::hierarchy::NavKind::Object && node.name == "item")
+            .map(|node| node.id.clone())
+            .expect("表对象节点")
+    });
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("new-query", cx));
+        window.render_frame(cx);
+        assert!(view.read(cx).query_editor_focused(window, cx), "新查询的编辑器应有焦点");
+    })
+    .unwrap();
+    // 刚输入的文字还在编辑器里，模型的草稿仍是旧内容。
+    cx.update_window(window, |_, window, cx| window.input("select 1", cx)).unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            assert!(view.model.open_nav_menu(&object_id), "对象菜单");
+            view.perform("tree-insert-select", cx);
+        });
+    })
+    .unwrap();
+    let draft = cx.update(|cx| view.read(cx).model.active_tab().cloned().expect("查询项").draft);
+    assert!(draft.starts_with("select 1"), "菜单插入覆盖了刚输入的内容：{draft}");
+    assert!(draft.contains("SELECT *"), "{draft}");
+    assert!(!cx.update(|cx| view.read(cx).query_executed(cx)), "插入不执行");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 非对象行（库/模式/分组）的菜单和动作只属于这一行。
+#[test]
+fn non_object_rows_never_borrow_another_object() {
+    use crate::catalog::model::{ObjectKind, ObjectRow};
+    let orders = ObjectRow::table("orders", Some(2));
+    let pg = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", vec![orders.clone()])]);
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.apply_navigation(&[pg], false);
+    let schema = crate::catalog::hierarchy::schema_node_id("pg", "shop", "public");
+    let group = crate::catalog::hierarchy::group_node_id("pg", "shop", "public", ObjectKind::Table);
+    let orders_id = nav_id("pg", "shop", "public", &orders);
+
+    // 先让上一张表成为焦点和 object_spec，再看范围行菜单。
+    let _ = model.dispatch(&format!("nav-focus:{orders_id}"));
+    assert!(model.object_spec.is_some());
+
+    assert!(model.open_nav_menu(&schema));
+    let ids: Vec<&str> = model.menu.as_ref().expect("菜单").items.iter().map(|item| item.id).collect();
+    assert_eq!(ids, vec!["tree-new-query", "tree-copy-name"], "范围行只有自己的动作");
+    let tabs = model.tabs.len();
+    let _ = model.dispatch("tree-open-data");
+    assert_eq!(model.tabs.len(), tabs, "范围行不能打开上一张表");
+    assert_eq!(model.notice_key, Some("catalog.tree.actionUnavailable"));
+    assert_eq!(model.notice_detail, "public");
+
+    // 分组行同样不借对象动作，复制名字也只复制这一行。
+    assert!(model.open_nav_menu(&group));
+    let _ = model.dispatch("tree-insert-select");
+    assert!(!model.active_tab().is_some_and(|tab| tab.kind == WorkItemKind::Query && !tab.draft.is_empty()));
+    assert_eq!(model.notice_key, Some("catalog.tree.actionUnavailable"));
+    assert!(model.open_nav_menu(&schema));
+    let _ = model.dispatch("tree-copy-name");
+    assert_eq!(model.copied, "public");
+
+    // 数据库行给出绑定这一行的空白查询，不写 SQL、不执行。
+    let database = crate::catalog::hierarchy::database_node_id("pg", "shop");
+    assert!(model.open_nav_menu(&database));
+    let _ = model.dispatch("tree-new-query");
+    let tab = model.active_tab().cloned().expect("绑定查询");
+    assert_eq!(tab.kind, WorkItemKind::Query);
+    assert_eq!(tab.database.as_deref(), Some("shop"));
+    assert!(tab.draft.is_empty());
+    assert_eq!(model.executions, 0);
+
+    // 对象行仍然拿到完整的对象菜单。
+    assert!(model.open_nav_menu(&orders_id));
+    assert!(model.menu.as_ref().unwrap().items.iter().any(|item| item.id == "tree-insert-select"));
+    let _ = model.dispatch("tree-copy-name");
+    assert_eq!(model.copied, "public.orders");
+}
+
+/// MongoDB 集合是文档：菜单和打开入口都不走关系型表/结构/关系图。
+#[test]
+fn document_objects_use_documents_not_relational_pages() {
+    use crate::catalog::model::{ConnStatus, DatabaseNode, ObjectKind, ObjectRow, SchemaNode};
+    let users = ObjectRow::fresh("users", ObjectKind::Table);
+    let mut mongo = crate::catalog::NavConnection::new("docs", "文档", Engine::Mongodb, ConnStatus::Connected);
+    mongo.databases = vec![DatabaseNode {
+        name: "app".to_owned(),
+        schemas: vec![SchemaNode {
+            name: String::new(),
+            objects: vec![users.clone()],
+            total: 1,
+            error: None,
+            kind_reports: Vec::new(),
+        }],
+        error: None,
+    }];
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.apply_navigation(&[mongo], false);
+    let collection = crate::catalog::hierarchy::object_node_id("docs", "app", "", &users);
+
+    assert!(model.open_nav_menu(&collection));
+    let items = model.menu.as_ref().expect("菜单").items.clone();
+    let open_data = items.iter().find(|item| item.id == "tree-open-data").expect("数据入口");
+    assert!(open_data.enabled, "集合仍然可以打开文档");
+    let structure = items.iter().find(|item| item.id == "open-structure").expect("结构入口");
+    assert!(!structure.enabled);
+    assert_eq!(structure.reason_key, Some("catalog.tree.noStructure"));
+    let diagram = items.iter().find(|item| item.id == "open-diagram").expect("关系图入口");
+    assert!(!diagram.enabled);
+    assert_eq!(diagram.reason_key, Some("diagram.unsupported"));
+
+    // 打开数据走文档页，规格是集合身份而不是关系型表。
+    let _ = model.dispatch("tree-open-data");
+    let tab = model.active_tab().cloned().expect("MongoDB 工作项");
+    assert_eq!(tab.kind, WorkItemKind::Mongo);
+    assert_eq!(tab.spec.as_deref(), Some("docs|文档|app|users"));
+
+    // 结构命令说明没有 SQL 结构，不开结构页。
+    let structures = model.tabs.iter().filter(|tab| tab.kind == WorkItemKind::Structure).count();
+    let _ = model.dispatch(&format!("nav-open-structure:{collection}"));
+    assert_eq!(model.tabs.iter().filter(|tab| tab.kind == WorkItemKind::Structure).count(), structures);
+    assert_eq!(model.notice_key, Some("catalog.tree.noStructure"));
+
+    // 关系图同样拒绝，不用上一次的表画图。
+    let _ = model.dispatch(&format!("nav-open-diagram:{collection}"));
+    assert_eq!(model.notice_key, Some("diagram.unsupported"));
+    assert_eq!(model.shell.page, AppPage::Workspace);
+
+    // 导入导出与对比只适用于关系型对象。
+    model.exchange_open = false;
+    let _ = model.dispatch("exchange-object");
+    assert!(!model.exchange_open);
+    assert_eq!(model.notice_key, Some("catalog.tree.relationalOnly"));
+}
+
+/// 连接级目录读取失败：原因写在这条连接下面，重试只重读这一条。
+#[gpui_kit::test]
+fn connection_catalog_failure_shows_reason_and_retries_at_that_node(cx: &mut gpui_kit::TestAppContext) {
+    use crate::app::shell::nav::NavRequest;
+    use crate::app::views::connections::LinkStatus;
+    use crate::catalog::model::ConnStatus;
+
+    let (window, view, dir) = sqlite_notes_workbench(cx, true);
+    wait_for_shell_ready(cx, window, &view);
+    let connection = crate::catalog::hierarchy::connection_node_id("notes");
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            let mut failed = crate::catalog::NavConnection::new("notes", "笔记", Engine::Sqlite, ConnStatus::Connected);
+            failed.error = Some("读取库表失败：数据库被锁定".to_owned());
+            view.model.apply_navigation(&[failed], false);
+            view.model.connections.status.insert("notes".to_owned(), LinkStatus::Connected);
+            view.model.expand_nav_connection("notes");
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("nav-conn-error-notes").visible(), "连接级失败没有留下原因行");
+        let text = window
+            .find("nav-conn-error-text-notes")
+            .label()
+            .map(str::to_owned)
+            .unwrap_or_default();
+        assert!(text.contains("数据库被锁定"), "原因没有显示：{text:?}");
+        // 重试入口就在这条连接下面，标签是“重试”。
+        let retry = window.find("nav-retry-conn-notes");
+        assert!(retry.visible(), "连接级失败没有重试入口");
+        assert_eq!(retry.label(), Some("重试"));
+    })
+    .unwrap();
+    // 按钮走的是 act -> perform；这里直接走同一条命令，断言请求只落在这条连接上。
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            assert!(view.model.nav.node(&connection).is_some(), "连接节点还在树上");
+            let _ = view.model.dispatch(&format!("nav-retry:{connection}"));
+            let queued = view.model.nav_requests.back().cloned();
+            assert_eq!(
+                queued,
+                Some(NavRequest::Refresh {
+                    connection: Some("notes".to_owned())
+                }),
+                "重试没有落在这一条连接上"
+            );
+        });
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn continuation_and_retry_resolve_to_the_storage_scope() {
     use crate::app::shell::nav::NavRequest;
-    use crate::catalog::model::{DatabaseNode, ObjectRow, SchemaNode};
+    use crate::catalog::model::{DatabaseNode, ObjectKind, ObjectRow, SchemaNode};
     let objects = vec![ObjectRow::table("a", Some(1))];
     let pg = nav_connection(
         Engine::Postgres,
@@ -4156,12 +4503,31 @@ fn continuation_and_retry_resolve_to_the_storage_scope() {
     );
     let mut model = WorkbenchModel::new(Shell::default());
     model.apply_navigation(&[pg], false);
-    let group = crate::catalog::hierarchy::group_node_id("pg", "shop", "public", crate::catalog::model::ObjectKind::Table);
+    let group = crate::catalog::hierarchy::group_node_id("pg", "shop", "public", ObjectKind::Table);
     let schema = crate::catalog::hierarchy::schema_node_id("pg", "shop", "public");
     // 分组上的“读取更多”按所属模式续读，偏移量才和整页一致。
     let _ = model.dispatch(&format!("nav-more:{group}"));
     assert_eq!(model.take_nav_request(), Some(NavRequest::More(schema.clone())));
-    // 分组读取失败时重试也只作用于那一段。
+
+    // 种类分组读取失败后的重试只重读那一类，加载态也只落在这个分组。
+    model.nav.set_error(&group, "函数读取失败");
     let _ = model.dispatch(&format!("nav-retry:{group}"));
-    assert_eq!(model.take_nav_request(), Some(NavRequest::More(schema)));
+    assert_eq!(model.take_nav_request(), Some(NavRequest::Group(group.clone())));
+    assert!(model.nav.node(&group).unwrap().loading, "重试期间只有这个分组在加载");
+    let _ = schema;
+
+    // 成功回来只清这个分组的错误并补上对象；失败则把原因留在分组上。
+    assert!(model.nav.set_kind_page(&group, &[ObjectRow::table("b", Some(1))], 4, None));
+    let node = model.nav.node(&group).unwrap();
+    assert!(node.error.is_none(), "重试成功后分组不能再留着旧错误");
+    assert!(!node.loading);
+    assert_eq!(node.total, 4);
+    assert!(model.nav.node(&crate::catalog::hierarchy::object_node_id("pg", "shop", "public", &ObjectRow::table("b", Some(1)))).is_some());
+
+    model.nav.begin_group(&group);
+    assert!(!model.nav.set_kind_page(&group, &[], 0, Some("权限不足".to_owned())));
+    let node = model.nav.node(&group).unwrap();
+    assert_eq!(node.error.as_deref(), Some("权限不足"));
+    assert!(!node.loading);
+    assert!(node.children.len() > 1, "重试失败不能清掉已读对象");
 }

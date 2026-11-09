@@ -831,6 +831,14 @@ impl NavTree {
     /// 续读：在已有对象之后追加一页。追加失败保留已有对象，只把原因留在该节点。
     pub fn append_objects(&mut self, scope_id: &str, objects: &[ObjectRow], total: usize, error: Option<String>) -> bool {
         let Some(scope) = self.nodes.get(scope_id).cloned() else { return false };
+        // 没有库/模式层的引擎（SQLite）把对象直接挂在连接下：续读沿用已有分组的
+        // 真实库/模式，否则会另造一套空 database/schema，重复出分组和对象。
+        let (database, schema) = match scope.kind {
+            NavKind::Connection | NavKind::Keyspace => {
+                self.storage_identity_under(scope_id).unwrap_or((scope.database.clone(), scope.schema.clone()))
+            }
+            _ => (scope.database.clone(), scope.schema.clone()),
+        };
         if let Some(message) = error {
             if let Some(node) = self.nodes.get_mut(scope_id) {
                 node.loading = false;
@@ -840,7 +848,7 @@ impl NavTree {
         }
         let mut added = false;
         for object in objects {
-            let group_id = group_node_id(&scope.connection_id, &scope.database, &scope.schema, object.kind);
+            let group_id = group_node_id(&scope.connection_id, &database, &schema, object.kind);
             if !self.nodes.contains_key(&group_id) {
                 let mut group = NavNode::new(NavKind::Group, group_id.clone(), String::new());
                 group.label_key = Some(kind_label_key(object.kind));
@@ -849,19 +857,19 @@ impl NavTree {
                 group.connection_id = scope.connection_id.clone();
                 group.connection_name = scope.connection_name.clone();
                 group.engine = scope.engine;
-                group.database = scope.database.clone();
-                group.schema = scope.schema.clone();
+                group.database = database.clone();
+                group.schema = schema.clone();
                 group.name = kind_name(object.kind).to_owned();
                 group.object_kind = Some(object.kind);
                 group.expandable = true;
                 self.attach(scope_id, group);
             }
-            let object_id = object_node_id(&scope.connection_id, &scope.database, &scope.schema, object);
+            let object_id = object_node_id(&scope.connection_id, &database, &schema, object);
             if self.nodes.contains_key(&object_id) {
                 continue;
             }
             let connection = NavConnection::new(scope.connection_id.clone(), scope.connection_name.clone(), scope.engine, ConnStatus::Connected);
-            let node = self.object_node(&connection, &scope.database, &scope.schema, object, &object_id);
+            let node = self.object_node(&connection, &database, &schema, object, &object_id);
             self.attach(&group_id, node);
             added = true;
         }
@@ -873,6 +881,76 @@ impl NavTree {
             node.has_more = node.loaded < node.total;
         }
         added
+    }
+
+    /// 某一类对象读取失败的局部重试：只更新这个分组，成功就清掉它自己的错误。
+    /// 返回 true 表示这次真的读到了对象。
+    pub fn set_kind_page(&mut self, group_id: &str, objects: &[ObjectRow], total: usize, error: Option<String>) -> bool {
+        let Some(group) = self.nodes.get(group_id).cloned() else { return false };
+        if group.kind != NavKind::Group {
+            return false;
+        }
+        if let Some(message) = error {
+            if let Some(node) = self.nodes.get_mut(group_id) {
+                node.loading = false;
+                node.error = Some(message);
+            }
+            return false;
+        }
+        let Some(kind) = group.object_kind else { return false };
+        let connection = NavConnection::new(
+            group.connection_id.clone(),
+            group.connection_name.clone(),
+            group.engine,
+            ConnStatus::Connected,
+        );
+        let mut added = 0usize;
+        for object in objects.iter().filter(|object| object.kind == kind) {
+            let object_id = object_node_id(&group.connection_id, &group.database, &group.schema, object);
+            if let Some(existing) = self.nodes.get_mut(&object_id) {
+                // 上一轮标记过删除的对象这次又读到了：恢复成可用行，不再另建一条。
+                existing.stale = false;
+                continue;
+            }
+            let node = self.object_node(&connection, &group.database, &group.schema, object, &object_id);
+            self.attach(group_id, node);
+            added += 1;
+        }
+        if let Some(node) = self.nodes.get_mut(group_id) {
+            node.loading = false;
+            node.error = None;
+            node.loaded = node.children.len();
+            node.total = total.max(node.loaded);
+        }
+        added > 0
+    }
+
+    /// 分组重试开始：只在这个分组上显示加载态，兄弟分组不受影响。
+    pub fn begin_group(&mut self, group_id: &str) -> bool {
+        let Some(node) = self.nodes.get_mut(group_id) else { return false };
+        if node.kind != NavKind::Group || node.loading {
+            return false;
+        }
+        node.loading = true;
+        node.error = None;
+        true
+    }
+
+    /// 没有库/模式层的引擎把对象挂在连接下：从已读到的对象分组借回真实库/模式。
+    fn storage_identity_under(&self, scope_id: &str) -> Option<(String, String)> {
+        self.nodes.get(scope_id).and_then(|scope| {
+            scope
+                .children
+                .iter()
+                .filter_map(|id| self.nodes.get(id))
+                .find(|child| child.kind == NavKind::Group)
+                .map(|child| (child.database.clone(), child.schema.clone()))
+        })
+    }
+
+    /// 记录展开意图：节点还没读进树时也保留，下一次 apply 有这条连接就会展开。
+    pub fn expand_reserved(&mut self, id: &str) -> bool {
+        self.expanded.insert(id.to_owned())
     }
 
     /// 续读开始时把加载状态放在这个范围节点上，别处不受影响。
@@ -1063,6 +1141,29 @@ impl NavTree {
                 NavAction::None
             }
         }
+    }
+
+    /// 鼠标双击/回车：容器行在展开与折叠之间切换，其它行照 activate 走。
+    /// 键盘右方向键仍然只展开，不在这里折叠。
+    pub fn activate_or_toggle(&mut self, id: &str) -> NavAction {
+        let Some((kind, expandable)) = self.nodes.get(id).map(|node| (node.kind, node.expandable)) else {
+            return NavAction::None;
+        };
+        let containers = matches!(
+            kind,
+            NavKind::Connection | NavKind::Database | NavKind::Schema | NavKind::Group | NavKind::ColumnGroup | NavKind::IndexGroup
+        );
+        if containers && expandable {
+            if self.expanded.remove(id) {
+                return NavAction::None;
+            }
+            self.expand(id);
+            return match kind {
+                NavKind::ColumnGroup | NavKind::IndexGroup => NavAction::None,
+                _ => NavAction::Load(id.to_owned()),
+            };
+        }
+        self.activate(id)
     }
 
     /// 左方向键：已展开就折叠，否则回到父节点。
@@ -1400,6 +1501,53 @@ mod tests {
         assert_eq!(tree.node(&group).unwrap().error.as_deref(), Some("连接中断"));
         assert_eq!(tree.node(&group).unwrap().children.len(), 3, "追加失败保留已有对象");
         assert!(!tree.node(&group).unwrap().loading, "失败后离开加载态");
+    }
+
+
+    #[test]
+    fn sqlite_continuation_keeps_main_identity_and_never_duplicates_rows() {
+        // SQLite 的对象直接挂在连接下：续读延续已有的 main 身份，不另造空库/空模式。
+        let sqlite = connection(Engine::Sqlite, vec![database("main", vec![schema("", vec![table("a")])])]);
+        let mut tree = NavTree::new();
+        tree.apply(&[sqlite]);
+        let conn = connection_node_id("conn-sqlite");
+        tree.expand(&conn);
+        let group = group_node_id("conn-sqlite", "main", "", ObjectKind::Table);
+        assert!(tree.node(&group).is_some(), "首屏的 main 分组");
+
+        tree.begin_scope(&conn);
+        assert!(tree.append_objects(&conn, &[table("b")], 2, None));
+        let groups: Vec<&NavNode> = tree
+            .nodes()
+            .filter(|node| node.kind == NavKind::Group && node.parent.as_deref() == Some(conn.as_str()))
+            .collect();
+        assert_eq!(groups.len(), 1, "续读不能再造一个空 library 分组");
+        assert_eq!(groups[0].id, group);
+        assert_eq!(groups[0].database, "main");
+
+        let names: Vec<String> = tree
+            .node(&group)
+            .unwrap()
+            .children
+            .iter()
+            .filter_map(|id| tree.node(id))
+            .map(|node| format!("{}:{}", node.database, node.name))
+            .collect();
+        assert_eq!(names, vec!["main:a".to_owned(), "main:b".to_owned()]);
+        // 重复的续读结果不再加行。
+        assert!(!tree.append_objects(&conn, &[table("b")], 2, None));
+        assert_eq!(tree.node(&group).unwrap().children.len(), 2);
+
+        // 分组级重试只补充这一类的对象，并清掉分组自己的错误。
+        let view_group = group_node_id("conn-sqlite", "main", "", ObjectKind::View);
+        assert!(!tree.set_kind_page(&view_group, &[], 0, None), "不存在的分组不假装成功");
+        tree.set_error(&group, "读取失败");
+        assert!(tree.begin_group(&group));
+        assert!(tree.set_kind_page(&group, &[table("c")], 3, None));
+        let node = tree.node(&group).unwrap();
+        assert!(node.error.is_none());
+        assert_eq!(node.total, 3);
+        assert_eq!(node.children.len(), 3);
     }
 
     #[test]

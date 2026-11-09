@@ -17,7 +17,7 @@ pub use model::{
 pub(crate) use model::{DatabaseNode, ObjectKind, ObjectRow};
 #[allow(unused_imports)]
 pub use objects::{read_extras, ExtrasBody, ExtrasScope};
-pub(crate) use read::{read_catalog_session, read_definition, read_object_page, ConnectionBody};
+pub(crate) use read::{read_catalog_session, read_definition, read_object_kind_page, read_object_page, ConnectionBody};
 pub use sqlite::{read_sqlite_file, read_sqlite_pool};
 pub use commands::{catalog_definition, catalog_page, catalog_refresh, catalog_sessions};
 pub use detail::read_object_details;

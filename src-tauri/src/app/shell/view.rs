@@ -62,7 +62,6 @@ pub struct Workbench {
     revision: Arc<AtomicU64>,
     persist_gate: Arc<tokio::sync::Mutex<()>>,
     pub(super) fields: crate::ui::kit::Fields<DraftField>,
-    pub(super) expanded: std::collections::BTreeSet<String>,
     pub(super) menu_at: gpui_kit::Point<gpui_kit::Pixels>,
     pub(super) palette_focused: bool,
     pub(super) pending_browser: Option<String>,
@@ -123,7 +122,6 @@ impl Workbench {
             revision: Arc::new(AtomicU64::new(0)),
             persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             fields: crate::ui::kit::Fields::default(),
-            expanded: std::collections::BTreeSet::new(),
             menu_at: gpui_kit::Point::default(),
             palette_focused: false,
             pending_browser: None,
@@ -141,8 +139,9 @@ impl Workbench {
             // 目录树与查询页的对象索引各自刷新；树保留展开、焦点与已读子节点。
             self.model.request_nav_refresh(None);
         }
-        if id.starts_with("nav-insert-") {
+        if id.starts_with("nav-insert-") || matches!(id, "tree-insert-object" | "tree-insert-select" | "tree-insert-column") {
             // 插入前先把编辑器里的最新文本收回草稿，追加时才不会丢掉刚输入的内容。
+            // 对象树菜单和导航命令走同一条捕获路径。
             self.forward_query("capture", cx);
         }
         // 查询命令只在查询工作项处于活动状态时生效；表格/结构等页面不能操作隐藏查询。
@@ -248,7 +247,18 @@ impl Workbench {
                 // 不能拿对象树里的另一行当当前对象。
                 "compare-grid" => self.grid_compare_target(),
                 // 对象菜单以右键/当前对象为准；没有选中对象时退回当前工作项的目标。
-                "compare-object" => self.model.object_target().or_else(|| self.model.compare_target()),
+                // 文档集合没有关系型比较：说明原因，不换成别的对象。
+                "compare-object" => {
+                    let target = self.model.object_target().or_else(|| self.model.compare_target());
+                    if target.as_ref().is_some_and(|target| !target.is_relational()) {
+                        self.model.notice_key = Some("catalog.tree.relationalOnly");
+                        self.model.notice_detail = target.as_ref().map(|target| target.name.clone()).unwrap_or_default();
+                        self.persist_if_needed();
+                        cx.notify();
+                        return;
+                    }
+                    target
+                }
                 "compare" => self.model.compare_target(),
                 _ => None,
             }
@@ -788,6 +798,7 @@ impl Workbench {
                 super::nav::NavRequest::Refresh { connection } => self.spawn_nav_refresh(connection, cx),
                 super::nav::NavRequest::Details(id) => self.spawn_nav_details(id, cx),
                 super::nav::NavRequest::More(id) => self.spawn_nav_more(id, cx),
+                super::nav::NavRequest::Group(id) => self.spawn_nav_group(id, cx),
             }
         }
     }
@@ -891,6 +902,52 @@ impl Workbench {
         .detach();
     }
 
+    /// 只重读一个对象种类分组：失败的那一类单独重试，兄弟分组不动。
+    fn spawn_nav_group(&mut self, group_id: String, cx: &mut Context<Self>) {
+        let Some(node) = self.model.nav_node(&group_id).cloned() else { return };
+        let Some(kind) = node.object_kind else { return };
+        if node.loading {
+            return;
+        }
+        self.model.nav.begin_group(&group_id);
+        let services = Arc::clone(&self.services);
+        let page = usize::try_from(self.model.settings.object_page.max(1)).unwrap_or(100);
+        let view = cx.entity().downgrade();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        jobs::runtime().spawn(async move {
+            let body = match services.connections.catalog_session(&node.connection_id) {
+                Some(session) => {
+                    crate::catalog::read_object_kind_page(&session, node.engine, &node.database, &node.schema, kind, 0, page).await
+                }
+                None => crate::catalog::read::ObjectPageBody {
+                    objects: Vec::new(),
+                    total: 0,
+                    error: Some("这条连接还没有打开".to_owned()),
+                    kind_reports: Vec::new(),
+                },
+            };
+            let _ = tx.send(body);
+        });
+        cx.spawn(async move |_, cx| {
+            let result = rx.await;
+            cx.update(|cx| {
+                let Some(view) = view.upgrade() else { return };
+                view.update(cx, |this, cx| {
+                    match result {
+                        Ok(body) => {
+                            this.model.nav.set_kind_page(&group_id, &body.objects, body.total, body.error);
+                        }
+                        Err(_) => {
+                            this.model.nav.set_kind_page(&group_id, &[], 0, Some("读取这一类对象失败".to_owned()));
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
     fn refresh_tree_on_connect(&mut self, cx: &mut Context<Self>) {
         let connected: std::collections::BTreeSet<String> = self
             .model
@@ -902,7 +959,8 @@ impl Workbench {
             .collect();
         if connected != self.connected_seen {
             for id in connected.difference(&self.connected_seen) {
-                self.expanded.insert(id.clone());
+                // 展开状态存在树上，连接成功后资源管理器就能看到下一层。
+                self.model.expand_nav_connection(id);
             }
             let browse = self.pending_browser.take_if(|id| connected.contains(id));
             self.connected_seen = connected;

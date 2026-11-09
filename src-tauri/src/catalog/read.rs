@@ -3,10 +3,10 @@
 use mysql_async::prelude::Queryable;
 
 use crate::catalog::model::{
-    kind_sql, known_row_estimate, listed_kinds, metadata_sql, parse_kind, DatabaseNode, Engine, KindReport, ObjectKind,
-    ObjectRow, SchemaNode, DEFAULT_OBJECT_PAGE,
+    kind_name, kind_sql, known_row_estimate, listed_kinds, metadata_sql, parse_kind, DatabaseNode, Engine, KindReport,
+    ObjectKind, ObjectRow, SchemaNode, DEFAULT_OBJECT_PAGE,
 };
-use crate::catalog::model::{quote_sqlite, sqlite_kind_count_sql, sqlite_object_page_sql};
+use crate::catalog::model::{quote_sqlite, sqlite_kind_count_sql, sqlite_kind_page_sql, sqlite_object_page_sql};
 use crate::connections::CatalogSession;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +217,106 @@ pub async fn read_catalog_outline(engine: Engine, session: &CatalogSession) -> C
             foreign_keys: None,
             databases: Vec::new(),
         },
+    }
+}
+
+/// 只重读一种对象：局部失败的分组重试时不碰兄弟类型。
+pub async fn read_object_kind_page(
+    session: &CatalogSession,
+    engine: Engine,
+    database: &str,
+    schema: &str,
+    kind: ObjectKind,
+    offset: usize,
+    limit: usize,
+) -> ObjectPageBody {
+    let limit = read_limit(limit, 0);
+    let window = offset.saturating_add(limit);
+    match session {
+        CatalogSession::Scripted => empty_page(scripted_message()),
+        // SQLite 的 sqlite_master 按库分开，只读这一类的一页就够了。
+        CatalogSession::Sqlite { pool, .. } => {
+            let database = sqlite_database_or_main(database);
+            // 数量仍来自按种类的计数，分组的总数才和真实元数据一致。
+            let counts: Result<Vec<(String, i64)>, String> =
+                sqlx::query_as(sqlx::AssertSqlSafe(sqlite_kind_count_sql(database)))
+                    .fetch_all(pool)
+                    .await
+                    .map_err(read_failure);
+            let total = match counts {
+                Ok(counts) => counts
+                    .iter()
+                    .find(|(name, _)| parse_kind(name) == kind)
+                    .and_then(|(_, count)| usize::try_from(*count).ok())
+                    .unwrap_or(0),
+                Err(message) => return empty_page(message),
+            };
+            let sql = sqlite_kind_page_sql(database, kind_name(kind));
+            let rows: Result<Vec<(String, String, String, String)>, String> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+                .bind(i64::try_from(offset).unwrap_or(i64::MAX))
+                .fetch_all(pool)
+                .await
+                .map_err(read_failure);
+            match rows {
+                Ok(rows) => {
+                    let objects = rows
+                        .into_iter()
+                        .map(|(name, kind, signature, relation)| ObjectRow {
+                            kind: parse_kind(&kind),
+                            name,
+                            estimated_rows: None,
+                            stale: false,
+                            signature,
+                            relation,
+                            materialized: false,
+                        })
+                        .collect();
+                    ObjectPageBody {
+                        objects,
+                        total,
+                        error: None,
+                        kind_reports: Vec::new(),
+                    }
+                }
+                Err(message) => empty_page(message),
+            }
+        }
+        CatalogSession::Mysql(pool) => {
+            let mut conn = match pool.get_conn().await {
+                Ok(conn) => conn,
+                Err(err) => return empty_page(read_failure(err)),
+            };
+            match read_mysql_kind(&mut conn, engine, database, kind, window).await {
+                Ok((total, objects)) => ObjectPageBody {
+                    objects,
+                    total,
+                    error: None,
+                    kind_reports: Vec::new(),
+                },
+                Err(message) => empty_page(message),
+            }
+        }
+        CatalogSession::Postgres(client) => match read_postgres_kind(client, schema, kind, window).await {
+            Ok((total, objects)) => ObjectPageBody {
+                objects,
+                total,
+                error: None,
+                kind_reports: Vec::new(),
+            },
+            Err(message) => empty_page(message),
+        },
+        CatalogSession::Sqlserver(client) => match read_sqlserver_kind(client, schema, kind, window).await {
+            Ok((total, objects)) => ObjectPageBody {
+                objects,
+                total,
+                error: None,
+                kind_reports: Vec::new(),
+            },
+            Err(message) => empty_page(message),
+        },
+        CatalogSession::Redis(_) => empty_page("Redis 键空间经键浏览器分页读取，不走对象分页。"),
+        CatalogSession::Mongo(client) => read_mongo_page(client, database, offset, limit).await,
     }
 }
 

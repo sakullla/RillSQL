@@ -35,6 +35,10 @@ pub enum MenuTarget {
     NonDataObject,
     /// 列或索引行：动作绑定这一列，不代替整张表。
     Column,
+    /// 库/模式/对象种类分组等范围行：只有这一行自己支持的动作。
+    Scope,
+    /// MongoDB 集合：文档语义，没有关系型表/结构/关系图入口。
+    DocumentObject,
     QueryTab,
     ReadonlyGrid,
     WritableGrid,
@@ -70,6 +74,25 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
                 return vec![
                     item("tree-copy-column", "catalog.tree.copyColumn"),
                     item("tree-insert-column", "catalog.tree.insertColumn"),
+                ];
+            }
+            // 范围行（库/模式/种类分组）只绑定自己：开查询、复制名字，别的都没有。
+            if target == MenuTarget::Scope {
+                return vec![
+                    item("tree-new-query", "catalog.tree.newQueryHere"),
+                    item("tree-copy-name", "catalog.tree.copyFullName"),
+                ];
+            }
+            if target == MenuTarget::DocumentObject {
+                // 集合按文档处理：数据入口开集合浏览器，结构与关系图不适用。
+                return vec![
+                    item("tree-open-data", "catalog.tree.openData"),
+                    disabled("open-structure", "catalog.tree.viewStructure", "catalog.tree.noStructure"),
+                    disabled("open-diagram", "catalog.tree.diagram", "diagram.unsupported"),
+                    item("tree-new-query", "catalog.tree.newQueryHere"),
+                    item("tree-copy-name", "catalog.tree.copyFullName"),
+                    disabled("compare-object", "shell.command.compare", "catalog.tree.relationalOnly"),
+                    disabled("exchange-object", "shell.command.openExchange", "catalog.tree.relationalOnly"),
                 ];
             }
             let data = if target == MenuTarget::NonDataObject {

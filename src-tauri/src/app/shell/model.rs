@@ -258,6 +258,8 @@ pub struct WorkbenchModel {
     pub nav_loading: u32,
     /// 最近一次完整读取结果；单条连接重试时用它保住其它连接。
     pub nav_source: Vec<NavConnection>,
+    /// 对象树菜单右键的那一行；菜单动作只认它，绝不回落到别的对象。
+    pub nav_menu_node: Option<String>,
     pub exchange_open: bool,
     /// 导入、导出、dump 或 migrate 仍在跑。关闭守卫把它和网格暂存、查询草稿分开。
     pub exchange_running: bool,
@@ -325,6 +327,7 @@ impl WorkbenchModel {
             nav_requests: VecDeque::new(),
             nav_loading: 0,
             nav_source: Vec::new(),
+            nav_menu_node: None,
             exchange_open: false,
             exchange_running: false,
             compare_running: false,
@@ -465,6 +468,12 @@ impl WorkbenchModel {
                 self.notice_detail.clear();
                 return true;
             };
+            if !target.is_relational() {
+                // 文档集合没有表格导入导出；说明原因，不改当前工作项。
+                self.notice_key = Some("catalog.tree.relationalOnly");
+                self.notice_detail = target.name.clone();
+                return true;
+            }
             let spec = target.spec();
             if self.active_tab().and_then(|tab| tab.spec.clone()).as_deref() != Some(spec.as_str()) {
                 self.open_item(WorkItemKind::Table, spec.clone());
@@ -778,35 +787,24 @@ impl WorkbenchModel {
     }
 
     fn tree_action(&mut self, id: &str) {
-        // 对象动作只认完整目标：连接、库、模式、对象名一起来自同一个对象，
-        // 不用连接 id 或对象名反推目标。树里有焦点时以焦点节点为准，
-        // 这样右键/键盘/菜单绑定的是实际被操作的那一行。
-        if let Some(node_id) = self.tree_focus_node(id).map(str::to_owned) {
-            let mapped = match id {
-                "tree-open-data" => format!("nav-open-data:{node_id}"),
-                "tree-copy-name" => format!("nav-copy-name:{node_id}"),
-                "tree-copy-column" => format!("nav-copy-column:{node_id}"),
-                "tree-insert-object" => format!("nav-insert-object:{node_id}"),
-                "tree-insert-select" => format!("nav-insert-select:{node_id}"),
-                "tree-insert-column" => {
-                    let column = self.nav.node(&node_id).map(|node| node.name.clone()).unwrap_or_default();
-                    let object = self
-                        .nav
-                        .node(&node_id)
-                        .and_then(|node| node.parent.as_deref())
-                        .and_then(|group| self.nav.node(group))
-                        .and_then(|group| group.parent.clone())
-                        .unwrap_or_default();
-                    format!("nav-insert-column:{object}\u{1}{column}")
-                }
-                "tree-select-sql" => format!("nav-select-sql:{node_id}"),
-                "tree-new-query" => format!("nav-new-query:{node_id}"),
-                _ => String::new(),
-            };
-            if !mapped.is_empty() {
-                let _ = self.nav_command(&mapped);
-                return;
+        // 对象动作只认完整目标：连接、库、模式、对象名一起来自同一行。
+        // 右键菜单记住被点的那一行，键盘用焦点行；都不借上一张表。
+        let menu_node = self.nav_menu_node.clone();
+        let candidate = menu_node.clone().or_else(|| self.nav.focus().map(str::to_owned));
+        if let Some(node_id) = candidate.as_deref().and_then(|node| self.tree_action_node(id, node)) {
+            if let Some(command) = self.tree_action_command(id, &node_id) {
+                let _ = self.nav_command(&command);
             }
+            self.nav_menu_node = None;
+            return;
+        }
+        if let Some(node_id) = menu_node {
+            // 右键的那一行不支持这个动作：说明原因，绝不作用到别的对象。
+            let name = self.nav.node(&node_id).map(|node| node.name.clone()).unwrap_or_default();
+            self.nav_menu_node = None;
+            self.notice_key = Some("catalog.tree.actionUnavailable");
+            self.notice_detail = name;
+            return;
         }
         match id {
             "tree-copy-name" => match self.object_target() {
@@ -848,20 +846,45 @@ impl WorkbenchModel {
         }
     }
 
-    /// 当前树上要执行动作的节点：右键选中的对象/列/索引，或键盘焦点。
-    fn tree_focus_node(&self, id: &str) -> Option<&str> {
-        let focused = self.nav.focus();
+    /// 这一行是否支持这个对象动作；不支持就返回 None，绝不借别的目标。
+    fn tree_action_node(&self, id: &str, node_id: &str) -> Option<String> {
+        let node = self.nav.node(node_id)?;
+        let supported = match id {
+            "tree-open-data" | "tree-insert-object" | "tree-insert-select" | "tree-select-sql" => {
+                node.kind.is_object() && !node.stale
+            }
+            "tree-copy-column" | "tree-insert-column" => matches!(node.kind, NavKind::Column | NavKind::Index),
+            "tree-copy-name" => {
+                !node.stale && matches!(node.kind, NavKind::Object | NavKind::Database | NavKind::Schema)
+            }
+            "tree-new-query" => !node.connection_id.is_empty() && !node.stale,
+            _ => false,
+        };
+        supported.then(|| node_id.to_owned())
+    }
+
+    /// 把菜单动作换成绑定这一行的导航命令。
+    fn tree_action_command(&mut self, id: &str, node_id: &str) -> Option<String> {
         match id {
-            "tree-copy-column" | "tree-insert-column" => {
-                let focused = focused?;
-                let node = self.nav.node(focused)?;
-                matches!(node.kind, NavKind::Column | NavKind::Index).then_some(focused)
+            "tree-open-data" => Some(format!("nav-open-data:{node_id}")),
+            "tree-copy-name" => Some(format!("nav-copy-name:{node_id}")),
+            "tree-copy-column" => Some(format!("nav-copy-column:{node_id}")),
+            "tree-insert-object" => Some(format!("nav-insert-object:{node_id}")),
+            "tree-insert-select" => Some(format!("nav-insert-select:{node_id}")),
+            "tree-insert-column" => {
+                let column = self.nav.node(node_id).map(|node| node.name.clone()).unwrap_or_default();
+                let object = self
+                    .nav
+                    .node(node_id)
+                    .and_then(|node| node.parent.as_deref())
+                    .and_then(|group| self.nav.node(group))
+                    .and_then(|group| group.parent.clone())
+                    .unwrap_or_default();
+                Some(format!("nav-insert-column:{object}\u{1}{column}"))
             }
-            _ => {
-                let focused = focused?;
-                let node = self.nav.node(focused)?;
-                node.kind.is_object().then_some(focused)
-            }
+            "tree-select-sql" => Some(format!("nav-select-sql:{node_id}")),
+            "tree-new-query" => Some(format!("nav-new-query:{node_id}")),
+            _ => None,
         }
     }
 
@@ -925,9 +948,22 @@ impl WorkbenchModel {
         if self.shell.palette_open || self.shell.help_open {
             self.shell.close_overlay();
         }
+        // 只有对象树右键会设置 nav_menu_node；其它菜单先清掉上一轮的行。
+        self.nav_menu_node = None;
         self.menu_return = self.shell.focus;
         self.menu = Some(OpenMenu::new(place, target));
         self.shell.focus = FocusTarget::Palette;
+    }
+
+    /// 对象树右键：菜单只属于被点的那一行，动作绑定这一行的身份。
+    pub fn open_nav_menu(&mut self, node_id: &str) -> bool {
+        let Some(node) = self.nav.node(node_id).cloned() else { return false };
+        self.nav.set_focus(node_id);
+        self.sync_object_spec_from_focus();
+        let target = tree_menu_target(&node);
+        self.open_menu(MenuPlace::ObjectTree, target);
+        self.nav_menu_node = Some(node_id.to_owned());
+        true
     }
 
     pub fn open_connection_menu(&mut self) {
@@ -967,6 +1003,8 @@ impl WorkbenchModel {
     }
 
     pub fn dismiss(&mut self) -> Effect {
+        // 菜单关掉就不再持着右键的那一行，之后的动作回到键盘焦点或当前工作项。
+        self.nav_menu_node = None;
         if self.menu.take().is_some() {
             self.shell.focus = self.menu_return;
             return Effect::None;
@@ -1194,6 +1232,37 @@ impl WorkbenchModel {
                 ..row
             })
             .collect()
+    }
+
+    /// 资源管理器连接行的展开状态就存在树上：鼠标、键盘和渲染读同一份。
+    pub fn nav_connection_expanded(&self, connection_id: &str) -> bool {
+        self.nav
+            .is_expanded(&crate::catalog::hierarchy::connection_node_id(connection_id))
+    }
+
+    /// 记下展开意图：节点还没读进树时也保留，下一次读取后直接展开。
+    pub fn expand_nav_connection(&mut self, connection_id: &str) {
+        let id = crate::catalog::hierarchy::connection_node_id(connection_id);
+        self.nav.expand_reserved(&id);
+    }
+
+    /// 鼠标 chevron 或双击连接行：展开与折叠都落在树上。
+    pub fn toggle_nav_connection(&mut self, connection_id: &str) -> bool {
+        let id = crate::catalog::hierarchy::connection_node_id(connection_id);
+        if self.nav.is_expanded(&id) {
+            self.nav.collapse(&id);
+        } else {
+            self.nav.expand_reserved(&id);
+        }
+        self.nav.is_expanded(&id)
+    }
+
+    /// 双击树行：容器展开/折叠，对象打开自己的数据或文档页。
+    pub fn nav_toggle_command(&mut self, node_id: &str) -> Option<String> {
+        let action = self.nav.activate_or_toggle(node_id);
+        let command = self.nav_activation_command(action);
+        self.sync_object_spec_from_focus();
+        command
     }
 
     fn nav_within(&self, parent: &str, root: &str) -> bool {
@@ -1424,10 +1493,19 @@ impl WorkbenchModel {
         }
         if let Some(rest) = id.strip_prefix("nav-retry:") {
             let Some(node) = self.nav.node(rest) else { return true };
-            match node.kind {
-                NavKind::Connection => self.request_nav_refresh(Some(node.connection_id.clone())),
+            let kind = node.kind;
+            let connection_id = node.connection_id.clone();
+            let has_kind = node.object_kind.is_some();
+            match kind {
+                NavKind::Connection => self.request_nav_refresh(Some(connection_id)),
                 NavKind::Object => self.request_nav_details(rest),
-                // 种类分组按父级模式/库续读，别把下一页错挂到分组下面。
+                // 种类分组只在失败的那一类上重试；加载态也只留在这个分组。
+                NavKind::Group if has_kind => {
+                    if self.nav.begin_group(rest) {
+                        self.nav_requests.push_back(NavRequest::Group(rest.to_owned()));
+                    }
+                }
+                // 库/模式整段重试仍按范围续读，别把下一页错挂到分组下面。
                 _ => {
                     let scope = self.nav_storage_scope(rest);
                     self.nav.begin_scope(&scope);
@@ -1470,6 +1548,13 @@ impl WorkbenchModel {
                 self.notice_detail.clear();
                 return true;
             };
+            if node.engine == Engine::Mongodb {
+                // 集合是文档：走集合浏览器，绝不开关系型表格页。
+                let connection_name = self.nav_connection_name(&node.connection_id);
+                let spec = nav::mongo_spec(&node.connection_id, &connection_name, &node.database, &node.name);
+                self.open_item(WorkItemKind::Mongo, spec);
+                return true;
+            }
             if !object.opens_data() {
                 // 例程、触发器、序列等没有行数据，不能误开数据页。
                 self.notice_key = Some("catalog.tree.noData");
@@ -1482,6 +1567,12 @@ impl WorkbenchModel {
             return true;
         }
         if let Some(rest) = id.strip_prefix("nav-open-structure:") {
+            if self.nav.node(rest).is_some_and(|node| node.engine == Engine::Mongodb) {
+                // 集合没有 SQL 结构；文档在集合浏览器里看。
+                self.notice_key = Some("catalog.tree.noStructure");
+                self.notice_detail = self.nav.node(rest).map(|node| node.name.clone()).unwrap_or_default();
+                return true;
+            }
             if let Some(spec) = self.nav_spec(rest) {
                 self.open_item(WorkItemKind::Structure, spec);
             } else {
@@ -1497,8 +1588,14 @@ impl WorkbenchModel {
             return true;
         }
         if let Some(rest) = id.strip_prefix("nav-copy-name:") {
-            match self.nav_target(rest) {
-                Some(object) => self.copied = nav::qualified_name(&object),
+            // 库/模式行复制自己的名字；对象行仍按引擎层级写限定名。
+            let text = match self.nav.node(rest).map(|node| (node.kind, node.name.clone(), node.stale)) {
+                Some((NavKind::Database | NavKind::Schema, name, false)) => Some(name),
+                Some((NavKind::Object, _, false)) => self.nav_target(rest).map(|object| nav::qualified_name(&object)),
+                _ => None,
+            };
+            match text {
+                Some(text) => self.copied = text,
                 None => {
                     self.copied.clear();
                     self.notice_key = Some("catalog.tree.staleObject");
@@ -1576,15 +1673,18 @@ impl WorkbenchModel {
             return true;
         }
         if let Some(rest) = id.strip_prefix("nav-new-query:") {
-            // 空白查询绑定这一行的连接/库；不写 SQL、不执行。
-            match self.nav_target(rest) {
-                Some(object) => {
+            // 空白查询绑定这一行的连接/库；库、模式、分组行也能用，不写 SQL、不执行。
+            let node = self.nav.node(rest).filter(|node| !node.stale).map(|node| {
+                (node.connection_id.clone(), node.connection_name.clone(), node.database.clone(), node.engine)
+            });
+            match node.filter(|(connection_id, ..)| !connection_id.is_empty()) {
+                Some((connection_id, connection_name, database, engine)) => {
                     self.open_bound_query(
                         String::new(),
-                        Some(object.connection_id.clone()),
-                        Some(object.connection_name.clone()),
-                        Some(object.database.clone()),
-                        Some(object.engine.as_str().to_owned()),
+                        Some(connection_id),
+                        Some(connection_name),
+                        Some(database),
+                        Some(engine.as_str().to_owned()),
                     );
                 }
                 None => {
@@ -2692,6 +2792,21 @@ pub struct PaletteEntry {
     pub label: String,
     /// 补充说明，例如对象的“库.模式 · 连接”；没有时为空。
     pub detail: String,
+}
+
+/// 对象树一行的菜单范围：对象按能否开数据页分，列/索引只给自己的动作，
+/// 库/模式/种类分组是范围行，不提供对象动作。
+fn tree_menu_target(node: &NavNode) -> MenuTarget {
+    match node.kind {
+        NavKind::Column | NavKind::Index => MenuTarget::Column,
+        NavKind::Object => match node.object() {
+            Some(object) if object.engine == Engine::Mongodb => MenuTarget::DocumentObject,
+            Some(object) if object.opens_data() => MenuTarget::Object,
+            Some(_) => MenuTarget::NonDataObject,
+            None => MenuTarget::Scope,
+        },
+        _ => MenuTarget::Scope,
+    }
 }
 
 /// 资源管理器里的一个层级组：同一连接下相同的 (database, schema)。

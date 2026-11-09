@@ -21,7 +21,6 @@ use crate::connections::model::{CaMode, Engine, SshAuthKind, TlsMode};
 use crate::i18n;
 use crate::ui::kit::{self, FieldSpec, Palette, Tip as _};
 
-use super::menus::{MenuPlace, MenuTarget};
 use super::model::{DraftField, WorkItemKind, WorkTool};
 use super::view::Workbench;
 
@@ -440,11 +439,16 @@ impl Workbench {
             for row in rows {
                 let id = row.saved.id.clone();
                 let status = self.model.connections.status.get(&id).copied().unwrap_or(LinkStatus::Disconnected);
-                let expanded = self.expanded.contains(&id) && status == LinkStatus::Connected;
+                // 展开状态只有一份：树上的连接节点。鼠标、键盘和渲染都读它。
+                let expanded = self.model.nav_connection_expanded(&id) && status == LinkStatus::Connected;
                 let selected = self.model.connections.selected.as_deref() == Some(id.as_str());
                 list = list.child(self.connection_row(&row, status, expanded, selected, &p, cx));
                 if !expanded {
                     continue;
+                }
+                // 连接级读取失败就把原因和重试放在这条连接下面，不吞掉。
+                if let Some(error) = self.model.nav.node(&crate::catalog::hierarchy::connection_node_id(&id)).and_then(|node| node.error.clone()) {
+                    list = list.child(self.connection_error_row(&id, &error, &p, cx));
                 }
                 let nav_rows = self.model.nav_rows_for(&id);
                 if nav_rows.is_empty() {
@@ -515,8 +519,10 @@ impl Workbench {
         let chevron = if expanded { IconName::ChevronDown } else { IconName::ChevronRight };
         let click_id = id.clone();
         let menu_id = id.clone();
+        let chevron_id = id.clone();
         div()
             .id(SharedString::from(format!("side-{id}")))
+            .test_support()
             .role(gpui_kit::Role::TreeItem)
             .aria_label(name.clone())
             .aria_selected(selected)
@@ -531,7 +537,23 @@ impl Workbench {
             .cursor_pointer()
             .when(selected, |this| this.bg(p.active))
             .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
-            .child(kit::icon(chevron, 13., p.text_faint))
+            .child(
+                div()
+                    .id(SharedString::from(format!("nav-chevron-{id}")))
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(self.t(if expanded { "catalog.tree.collapse" } else { "catalog.tree.expand" }))
+                    .tooltip_text(self.t(if expanded { "catalog.tree.collapse" } else { "catalog.tree.expand" }))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .child(kit::icon(chevron, 13., p.text_faint))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.model.toggle_nav_connection(&chevron_id);
+                        cx.notify();
+                    })),
+            )
             .child(kit::engine_badge(row.saved.engine.as_str(), 18.))
             .child(div().flex_1().min_w(px(0.)).truncate().font_weight(FontWeight::MEDIUM).child(name))
             .when(status == LinkStatus::Connecting, |this| this.child(Spinner::new().xsmall().color(p.text_muted)))
@@ -557,20 +579,66 @@ impl Workbench {
             .into_any_element()
     }
 
+    /// 连接级的读取失败：原因写在连接下面，重试只重读这条连接。
+    fn connection_error_row(&self, id: &str, error: &str, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let node_id = crate::catalog::hierarchy::connection_node_id(id);
+        let full = format!("{}: {error}", self.t("catalog.tree.nodeError"));
+        div()
+            .id(SharedString::from(format!("nav-conn-error-{id}")))
+            .test_support()
+            .pl(px(42.))
+            .pr(px(4.))
+            .py(px(3.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .child(
+                div()
+                    .id(SharedString::from(format!("nav-conn-error-text-{id}")))
+                    .test_support()
+                    .aria_label(SharedString::from(full.clone()))
+                    .tooltip_text(SharedString::from(full.clone()))
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(px(11.))
+                    .text_color(p.danger)
+                    .child(SharedString::from(full)),
+            )
+            .child(
+                kit::icon_button(
+                    SharedString::from(format!("nav-retry-conn-{id}")),
+                    IconName::RefreshCw,
+                    self.t("common.retry"),
+                    act(format!("nav-retry:{node_id}"), cx),
+                )
+                .xsmall(),
+            )
+            .into_any_element()
+    }
+
     fn click_connection(&mut self, id: &str, double: bool, cx: &mut Context<Self>) {
         self.model.connections.selected = Some(id.to_owned());
+        self.model.shell.focus = FocusTarget::Sidebar;
         let status = self.model.connections.status.get(id).copied().unwrap_or(LinkStatus::Disconnected);
         match status {
             LinkStatus::Connected => {
-                // 单击展开层级（Redis 键空间 / MongoDB 库与集合也在树上）；双击才直接打开浏览器。
+                // 单击只选中这一行；双击在树上展开/折叠，Redis/MongoDB 连接双击直接开浏览器。
+                // chevron 单击是展开/折叠的另一条鼠标路径，和双击、键盘右/左键走同一份状态。
                 if double {
-                    if let Some((command, _, _)) = self.model.connections.rows.iter().find(|row| row.saved.id == id).and_then(browser_command) {
-                        self.perform(&command, cx);
-                        return;
+                    let specialized = self
+                        .model
+                        .connections
+                        .rows
+                        .iter()
+                        .any(|row| row.saved.id == id && matches!(row.saved.engine, Engine::Redis | Engine::Mongodb));
+                    if specialized {
+                        if let Some((command, _, _)) = self.model.connections.rows.iter().find(|row| row.saved.id == id).and_then(browser_command) {
+                            self.perform(&command, cx);
+                            return;
+                        }
                     }
-                }
-                if double || !self.expanded.remove(id) {
-                    self.expanded.insert(id.to_owned());
+                    self.model.toggle_nav_connection(id);
                 }
                 cx.notify();
             }
@@ -579,7 +647,8 @@ impl Workbench {
                 if self.model.connections.rows.iter().any(|row| row.saved.id == id && matches!(row.saved.engine, Engine::Redis | Engine::Mongodb)) {
                     self.pending_browser = Some(id.to_owned());
                 }
-                self.expanded.insert(id.to_owned());
+                // 连接成功后 refresh_tree_on_connect 展开这一行。
+                self.model.expand_nav_connection(id);
                 self.model.connections.status.insert(id.to_owned(), LinkStatus::Connecting);
                 self.perform("conn-connect", cx);
             }
@@ -616,10 +685,10 @@ impl Workbench {
         let click_id = id.clone();
         let menu_id = id.clone();
         let focus_id = id.clone();
-        let menu_kind = row.kind;
         let has_error = row.error.is_some();
         div()
             .id(SharedString::from(format!("nav-{id}")))
+            .test_support()
             .role(gpui_kit::Role::TreeItem)
             .aria_label(label.clone())
             .aria_selected(row.focused)
@@ -683,16 +752,8 @@ impl Workbench {
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                 this.menu_at = event.position;
                 this.model.shell.focus = FocusTarget::Sidebar;
-                this.perform(&format!("nav-focus:{menu_id}"), cx);
-                let target = match menu_kind {
-                    NavKind::Column | NavKind::Index => MenuTarget::Column,
-                    NavKind::Object => match this.model.nav_node(&menu_id).and_then(|node| node.object()) {
-                        Some(object) if object.opens_data() => MenuTarget::Object,
-                        _ => MenuTarget::NonDataObject,
-                    },
-                    _ => MenuTarget::Object,
-                };
-                this.model.open_menu(MenuPlace::ObjectTree, target);
+                // 菜单只属于被点的这一行：对象、列/索引或范围行各自一册。
+                this.model.open_nav_menu(&menu_id);
                 cx.notify();
             }))
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
@@ -700,7 +761,8 @@ impl Workbench {
                 window.focus(&this.nav_focus, cx);
                 this.perform(&format!("nav-focus:{click_id}"), cx);
                 if event.click_count() >= 2 {
-                    if let Some(command) = this.model.nav_activate_command(&click_id) {
+                    // 双击容器在树上展开/折叠，对象打开自己的数据或文档页。
+                    if let Some(command) = this.model.nav_toggle_command(&click_id) {
                         this.perform(&command, cx);
                     }
                 }
