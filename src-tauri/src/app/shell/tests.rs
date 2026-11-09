@@ -4531,3 +4531,146 @@ fn continuation_and_retry_resolve_to_the_storage_scope() {
     assert!(!node.loading);
     assert!(node.children.len() > 1, "重试失败不能清掉已读对象");
 }
+
+fn sqlite_exec_on_file(path: &std::path::Path, sql: &'static str) {
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async move {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(
+                    sqlx::sqlite::SqliteConnectOptions::new()
+                        .filename(&path)
+                        .busy_timeout(std::time::Duration::from_secs(10)),
+                )
+                .await
+                .expect("connect");
+            sqlx::query(sql).execute(&pool).await.expect("execute");
+            pool.close().await;
+        });
+    })
+    .join()
+    .expect("sqlite thread");
+}
+
+/// 分组重试必须真的发出一次读取：队列里的 Group 请求经 pump_nav 走到
+/// spawn_nav_group 后读到新对象，并把这个分组的加载态/错误落下，兄弟分组不动。
+#[gpui_kit::test]
+fn queued_group_retry_dispatches_a_read_and_resolves_loading(cx: &mut gpui_kit::TestAppContext) {
+    use crate::catalog::hierarchy::NavKind;
+    use crate::catalog::model::ObjectKind;
+
+    let (window, view, dir) = sqlite_notes_workbench(cx, true);
+    wait_for_shell_ready(cx, window, &view);
+    let database = dir.join("items.sqlite");
+
+    // 启动刷新可能还在路上：先让排队的读取跑完，分组状态才稳定。
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(10) {
+        cx.run_until_parked();
+        let _ = cx.update_window(window, |_, window, cx| window.render_frame(cx));
+        let settled = cx.update(|cx| view.read(cx).model.nav_requests.is_empty());
+        if settled {
+            break;
+        }
+        std::thread::park_timeout(std::time::Duration::from_millis(10));
+    }
+
+    // 表分组：真实 SQLite 连接里的 item 已经在这一类下面。
+    let group = cx.update(|cx| {
+        let tree = &view.read(cx).model.nav;
+        let group = tree
+            .nodes()
+            .find(|node| node.kind == NavKind::Group && node.object_kind == Some(ObjectKind::Table))
+            .map(|node| node.id.clone())
+            .expect("表分组");
+        let node = tree.node(&group).expect("分组节点");
+        assert!(!node.children.is_empty(), "表分组里应有已读对象");
+        assert!(!node.loading);
+        group
+    });
+
+    // 兄弟分组的状态快照：重试只碰目标分组。
+    let siblings: Vec<(String, usize, bool, Option<String>, usize)> = cx.update(|cx| {
+        view.read(cx)
+            .model
+            .nav
+            .nodes()
+            .filter(|node| node.kind == NavKind::Group && node.id != group)
+            .map(|node| (node.id.clone(), node.children.len(), node.loading, node.error.clone(), node.total))
+            .collect()
+    });
+
+    // 数据库里多一张表：只有真的发了读取请求，重试后才能看到它。
+    sqlite_exec_on_file(&database, "CREATE TABLE audit (id INTEGER PRIMARY KEY)");
+
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.model.nav.set_error(&group, "读取表失败");
+            assert_eq!(view.model.nav.node(&group).and_then(|node| node.error.clone()).as_deref(), Some("读取表失败"));
+        });
+    });
+
+    // 走和界面按钮同一条命令：排队 Group 请求，把加载态落在这个分组上。
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform(&format!("nav-retry:{group}"), cx));
+    })
+    .unwrap();
+    let loading = cx.update(|cx| view.read(cx).model.nav.node(&group).expect("分组节点").loading);
+    assert!(loading, "重试开始应只在这个分组上显示加载态");
+
+    // 渲染循环驱动 pump_nav；读取没被发起的话加载态永远不会落下。
+    let started = std::time::Instant::now();
+    let mut resolved = false;
+    while started.elapsed() < std::time::Duration::from_secs(30) {
+        cx.run_until_parked();
+        let _ = cx.update_window(window, |_, window, cx| window.render_frame(cx));
+        resolved = cx.update(|cx| {
+            view.read(cx)
+                .model
+                .nav
+                .node(&group)
+                .map(|node| !node.loading)
+                .unwrap_or(false)
+        });
+        if resolved {
+            break;
+        }
+        std::thread::park_timeout(std::time::Duration::from_millis(20));
+    }
+    assert!(resolved, "排队的 Group 重试没有发出读取请求，分组一直停在加载态");
+
+    cx.update(|cx| {
+        let tree = &view.read(cx).model.nav;
+        let node = tree.node(&group).expect("分组节点");
+        assert!(node.error.is_none(), "重试成功后分组不能留着旧原因：{:?}", node.error);
+        assert!(!node.loading);
+        assert!(
+            node.children
+                .iter()
+                .filter_map(|id| tree.node(id))
+                .any(|child| child.name == "audit"),
+            "重试没有真的读到数据库里的新表"
+        );
+        assert!(
+            node.children
+                .iter()
+                .filter_map(|id| tree.node(id))
+                .any(|child| child.name == "item"),
+            "重试不能清掉已读对象"
+        );
+        for (id, children, loading, error, total) in &siblings {
+            let sibling = tree.node(id).expect("兄弟分组还在树上");
+            assert_eq!(&sibling.children.len(), children, "兄弟分组 {id} 的子节点被动了");
+            assert_eq!(&sibling.loading, loading, "兄弟分组 {id} 的加载态被动了");
+            assert_eq!(&sibling.error, error, "兄弟分组 {id} 的原因被动了");
+            assert_eq!(&sibling.total, total, "兄弟分组 {id} 的总数被动了");
+        }
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

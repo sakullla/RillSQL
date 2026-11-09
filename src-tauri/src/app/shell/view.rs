@@ -903,12 +903,11 @@ impl Workbench {
     }
 
     /// 只重读一个对象种类分组：失败的那一类单独重试，兄弟分组不动。
+    /// 排队的 Group 请求已经由模型标好加载态，这里不能再按 loading 提前返回，
+    /// 否则排队的重试永远不发读取请求、加载态也永远不落。
     fn spawn_nav_group(&mut self, group_id: String, cx: &mut Context<Self>) {
         let Some(node) = self.model.nav_node(&group_id).cloned() else { return };
         let Some(kind) = node.object_kind else { return };
-        if node.loading {
-            return;
-        }
         self.model.nav.begin_group(&group_id);
         let services = Arc::clone(&self.services);
         let page = usize::try_from(self.model.settings.object_page.max(1)).unwrap_or(100);
