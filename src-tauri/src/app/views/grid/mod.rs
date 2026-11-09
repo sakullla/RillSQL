@@ -874,9 +874,13 @@ impl GridPane {
                 self.request_edit(true);
             }
             TableEvent::SelectColumn(col) => {
+                // 列头索引含行号列：点 # 列头不是选择数据列。忽略它，否则会整列选中
+                // 第一列数据，高亮和复制都落到用户没点的列上。
+                let Some(column) = col.checked_sub(1) else {
+                    return;
+                };
                 // 列头与行头对称：整列就是从首行到末行的矩形，
                 // 高亮、TSV、SQL 值和统计读的是同一段行列。
-                let column = col.saturating_sub(1);
                 let last = self.session.loaded_len().saturating_sub(1);
                 if self.session.selection_bounds() != Some((0, column, last, column)) {
                     self.session.select(0, column, false);
@@ -1819,16 +1823,26 @@ struct SheetDelegate {
     dirty: bool,
 }
 
-/// 一个格子是否落在会话选择的矩形里。列 0 是行号列，按点击时的同一套映射当成第一个数据列：
-/// 于是行头选择（首列到末列）整行都亮，而单格或不含首列的矩形不会多亮一行号。
-fn cell_selected(bounds: Option<(usize, usize, usize, usize)>, row_ix: usize, col_ix: usize) -> bool {
+/// 一个格子是否落在会话选择的矩形里。列 0 是行号列，它只表示"整行被选中"：
+/// 只有矩形从首列一直盖到末列（行头选择、横跨整行拖选、全选）才点亮行号，
+/// 单格选择或只覆盖部分列的矩形不会把行号格当成第一个数据列的颜色。
+fn cell_selected(
+    bounds: Option<(usize, usize, usize, usize)>,
+    row_ix: usize,
+    col_ix: usize,
+    data_columns: usize,
+) -> bool {
     let Some((row_start, column_start, row_end, column_end)) = bounds else {
         return false;
     };
     if row_ix < row_start || row_ix > row_end {
         return false;
     }
-    let column = col_ix.saturating_sub(1);
+    if col_ix == 0 {
+        // 整行才亮行号：首列起、末列止，并且数据列非空。
+        return column_start == 0 && data_columns > 0 && column_end + 1 >= data_columns;
+    }
+    let column = col_ix - 1;
     column >= column_start && column <= column_end
 }
 
@@ -1983,8 +1997,8 @@ impl TableDelegate for SheetDelegate {
         let owner = self.owner.clone();
         let column = col_ix.saturating_sub(1);
         // 选中的每一格自己画底色，不是只让焦点那格亮：矩形里没有画的格子会让高亮和
-        // 复制/统计说的范围对不上。行号列（col 0）属于整行，行在矩形里就一起亮。
-        let selected = cell_selected(self.selected, row_ix, col_ix);
+        // 复制/统计说的范围对不上。行号列（col 0）只在整行被选中时亮，单格选择不点亮它。
+        let selected = cell_selected(self.selected, row_ix, col_ix, self.columns.len().saturating_sub(1));
         div()
             .id(gpui_kit::ElementId::named_usize(format!("grid-cell-{row_ix}"), col_ix))
             // 测试按住真实坐标点击/拖拽时用它找到格子；只在测试/debug+test-support 记录。
@@ -2034,7 +2048,16 @@ impl TableDelegate for SheetDelegate {
 
     fn render_th(&mut self, col_ix: usize, _: &mut Window, _: &mut Context<TableState<Self>>) -> impl IntoElement {
         let name = self.columns.get(col_ix).map(|column| column.0.clone()).unwrap_or_default();
-        let header = div().id(("grid-th", col_ix)).size_full().flex().items_center().truncate().child(SharedString::from(name));
+        // 表头也留稳定选择器：测试点击真实表头坐标，区分 # 列头和第一列数据。
+        let header = div()
+            .id(("grid-th", col_ix))
+            .debug_selector(move || format!("grid-th-{col_ix}"))
+            .size_full()
+            .flex()
+            .items_center()
+            .truncate()
+            .child(SharedString::from(name))
+            .test_support();
         if col_ix == 0 {
             return header.into_any_element();
         }
@@ -3411,8 +3434,14 @@ mod pane_tests {
         for row in 0..rows {
             for col_ix in 0..=columns {
                 let expected = bounds.is_some_and(|(row_start, column_start, row_end, column_end)| {
-                    // 列 0 是行号列，按点击时的同一套映射当成第一个数据列。
-                    row >= row_start && row <= row_end && (column_start..=column_end).contains(&col_ix.saturating_sub(1))
+                    if row < row_start || row > row_end {
+                        return false;
+                    }
+                    // 列 0 是行号列，只有整行（首列到末列）被选中时才亮，与 cell_selected 同一套规则。
+                    if col_ix == 0 {
+                        return column_start == 0 && columns > 0 && column_end + 1 >= columns;
+                    }
+                    (column_start..=column_end).contains(&(col_ix - 1))
                 });
                 let (is_selected, visible, _) = painted[&(row, col_ix)];
                 assert_eq!(is_selected, expected, "({row}, {col_ix}) 格的高亮必须与选区矩形 {bounds:?} 一致");
@@ -3479,6 +3508,26 @@ mod pane_tests {
         settle(cx);
         assert_paint_matches_selection(cx, window, &pane);
 
+        // 单格选择第一列数据：行号格不跟着亮。行号只表示整行选中，
+        // 否则选一个数据格会顺手点亮一个没被选中的行号格。
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.session.select(0, 0, false);
+                pane.sync_table(cx);
+            })
+        });
+        settle(cx);
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.selection_bounds(), Some((0, 0, 0, 0)));
+            assert_eq!(pane.session.selection_stats().cells, 1);
+        });
+        assert_paint_matches_selection(cx, window, &pane);
+        let mut visual = VisualTestContext::from_window(window, cx);
+        let painted = painted_cells(&mut visual, 2, 3);
+        assert!(!painted[&(0, 0)].0, "单格选择第一列数据时行号格不该亮");
+        assert!(painted[&(0, 1)].0, "被选中的数据格自己要亮");
+
         // 行头选择：整行都亮，不是只有最后一格；别的行不亮。
         cx.update(|cx| pane.update(cx, |pane, _| pane.apply_table_event(&TableEvent::SelectRow(1))));
         settle(cx);
@@ -3504,6 +3553,45 @@ mod pane_tests {
         assert_paint_matches_selection(cx, window, &pane);
         let mut visual = VisualTestContext::from_window(window, cx);
         assert!(visual.debug_bounds("grid-stats").is_none(), "没有选择就不显示统计条");
+    }
+
+    /// 真实点击表头坐标：# 列头不是数据列，不能把高亮、复制和统计挪到第一列数据上；
+    /// 点第一列数据的列头才是整列选择，并且画出来的高亮格子数与复制、统计一致。
+    #[gpui_kit::test]
+    fn real_header_click_keeps_the_row_number_column_out_of_the_selection(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let mut visual = VisualTestContext::from_window(window, cx);
+        let number_head = visual.debug_bounds("grid-th-0").expect("# 列头");
+        let first_data_head = visual.debug_bounds("grid-th-1").expect("第一列数据的列头");
+        assert!(
+            first_data_head.origin.x >= number_head.origin.x + number_head.size.width,
+            "第一列数据的列头应在行号列头右侧：{number_head:?} / {first_data_head:?}"
+        );
+
+        // 点 # 列头：这不是一次数据列选择，高亮、复制和统计都必须是空的。
+        visual.simulate_click(number_head.center(), Modifiers::default());
+        visual.update(|_, cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.selection_bounds(), None, "# 列头点下去不产生整列选择");
+            assert_eq!(pane.session.tsv(), "", "点 # 列头不该带出第一列数据的复制内容");
+            assert_eq!(pane.session.selection_stats().cells, 0, "统计范围也不能落到第一列数据上");
+        });
+        assert_paint_matches_selection(cx, window, &pane);
+
+        // 点第一列数据的列头：整列矩形，高亮、复制与统计看的是同一段行列。
+        visual.simulate_click(first_data_head.center(), Modifiers::default());
+        visual.update(|_, cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.selection_bounds(), Some((0, 0, 1, 0)), "第一列数据的列头应覆盖整列");
+            assert_eq!(pane.session.tsv(), "1\n2", "整列 TSV 只含这一列数据");
+            assert_eq!(pane.session.selection_stats().cells, 2);
+        });
+        assert_paint_matches_selection(cx, window, &pane);
     }
 
     fn plant_writable(pane: &mut GridPane, cx: &mut Context<GridPane>) {
