@@ -113,9 +113,11 @@ fn is_synthetic_text_preview(value: &str) -> bool {
     let Ok(bytes) = count.parse::<u64>() else {
         return false;
     };
-    // 预览信封至少由 1 KB 以上、且预览内容短于整段的值产生；上限随设置变化，
-    // 所以这里不再把 1024 当作预览长度的硬界限。
-    bytes > 1024 && (preview.len() as u64) < bytes && value.len() > 1024
+    // 信封本身是协议标记：只要前缀、数字字节数和分隔冒号成立就视为预览，
+    // 不再用字节数与字符数比较，避免多字节文本被误判为可写回。
+    let _ = preview;
+    // 小于 1 KB 的 t: 文本可能是用户字面量；协议只在大值上生成信封。
+    bytes > 1024
 }
 
 /// 与前端预览协议一致：U+0001 开头的 t:字节数:预览 或 b:字节数。

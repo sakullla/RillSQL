@@ -3354,7 +3354,7 @@ fn public_settings_reach_the_query_pane_without_a_restart(cx: &mut gpui_kit::Tes
         assert_eq!(query.page_size(), 150);
         assert_eq!(query.preview_kb(), 2);
         assert_eq!(query.object_page(), 150);
-        assert_eq!(query.null_copy(), "\\N");
+        assert_eq!(query.null_copy(), "N", "QueryPane 保留原始设置，由网格转换显示文本");
         assert_eq!(query.run_limit(), 150, "查询读取行数跟随 page_size");
     });
 

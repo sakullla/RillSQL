@@ -164,7 +164,8 @@ impl QueryPane {
         self.page_size = u64::try_from(form.page_size.max(1)).unwrap_or(1);
         self.preview_kb = u64::try_from(form.preview_kb.max(1)).unwrap_or(1);
         self.object_page = usize::try_from(form.object_page.max(1)).unwrap_or(1);
-        self.null_copy = crate::app::views::settings::null_display(&form.null_copy).to_owned();
+        // 保留原始设置；GridPane::set_null_copy 负责转成显示文本，避免二次归一。
+        self.null_copy = form.null_copy.clone();
         self.desk.set_page_size(self.page_size);
         let font = self.editor_font;
         let theme = self.editor_theme.clone();
@@ -1991,7 +1992,7 @@ mod tests {
             assert_eq!(pane.desk.page_size(), 250, "查询读取行数必须来自 page_size");
             assert_eq!(pane.preview_kb(), 4);
             assert_eq!(pane.object_page(), 50);
-            assert_eq!(pane.null_copy(), "\\N");
+            assert_eq!(pane.null_copy(), "N");
             let editor = pane.editors.get("query-1").expect("已建编辑器").read(cx);
             assert_eq!(editor.font_size(), 18, "已有编辑器立即改字号");
             assert_eq!(editor.theme(), "warm", "已有编辑器立即改配色");
