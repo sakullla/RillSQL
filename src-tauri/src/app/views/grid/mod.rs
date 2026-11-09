@@ -8,7 +8,7 @@ pub use session::{operation_banner, prove_single_table, GridMode, GridTarget, Qu
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{InputEvent, InputState};
-use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableEvent, TableState};
+use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableEvent, TableSelection, TableState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
 use gpui_kit::{
@@ -49,6 +49,8 @@ pub struct GridPane {
     press: Option<(usize, usize)>,
     /// 上一次绘制的可见首行；滚动换行后不能继续把指针下的格子当成同一段拖选。
     visible_start: usize,
+    /// 表格为行号列进入了行/列模式：事件回调里不能重入表格，下一帧绘制前把选择拉回会话。
+    table_resync: bool,
     /// 上一帧键盘焦点是否在网格里；从"在"变成"不在"才算失焦，程序化拖选不受影响。
     focus_inside: bool,
     /// 首屏或替换读取尚未返回；交换面板据此禁止把旧快照当成当前表。
@@ -131,6 +133,7 @@ impl GridPane {
             loading_more: false,
             press: None,
             visible_start: 0,
+            table_resync: false,
             focus_inside: false,
             fetching: false,
             pending_page: None,
@@ -846,6 +849,25 @@ impl GridPane {
         cx.notify();
     }
 
+    /// 行号列（表格的第 0 列）不是数据列。表格自己的点击处理会为它进入单元格/行/列模式，
+    /// 底色、键盘模式和会话选区因此不一致；下一帧绘制前统一按会话焦点复位。
+    fn schedule_table_resync(&mut self) {
+        self.table_resync = true;
+    }
+
+    /// 把表格自己的选择状态拉回会话：有焦点就是那一格，没有焦点就彻底清空。
+    /// 表格为行号列留下的列模式、行模式都会消失，键盘回到单元格模式。
+    fn resync_table_selection(&mut self, cx: &mut App) {
+        let focus = self.session.focus_cell().map(|(row, column)| (row, column + 1));
+        self.table.update(cx, |state, cx| match focus {
+            Some((row, column)) if state.selection() != TableSelection::Cell(row, column) => {
+                state.set_selected_cell(row, column, cx);
+            }
+            None if state.selection() != TableSelection::None => state.clear_selection(cx),
+            _ => {}
+        });
+    }
+
     fn apply_table_event(&mut self, event: &TableEvent) {
         match event {
             TableEvent::ColumnWidthsChanged(widths) => {
@@ -859,7 +881,11 @@ impl GridPane {
                 }
             }
             TableEvent::SelectCell(row, col) | TableEvent::RightClickedCell(row, col) => {
-                let column = col.saturating_sub(1);
+                // 行号列不是数据列：点它不能落到第一列数据上，只把表格的选中状态复位。
+                let Some(column) = col.checked_sub(1) else {
+                    self.schedule_table_resync();
+                    return;
+                };
                 // sync_table 会把会话焦点写回表格，表格随后又发回同一条事件；已经一致时不再改写选择。
                 if self.session.focus_cell() != Some((*row, column)) {
                     self.session.select(*row, column, false);
@@ -868,15 +894,23 @@ impl GridPane {
                 }
             }
             TableEvent::DoubleClickedCell(row, col) => {
+                // 双击行号列不会打开第一列数据的编辑器；它与单击一样只复位表格状态。
+                let Some(column) = col.checked_sub(1) else {
+                    self.schedule_table_resync();
+                    return;
+                };
                 // 双击与 F2 都进入同一条编辑路径；只读时退化为查看值并说明原因。
-                let column = col.saturating_sub(1);
                 self.session.select(*row, column, false);
                 self.request_edit(true);
             }
             TableEvent::SelectColumn(col) => {
                 // 列头索引含行号列：点 # 列头不是选择数据列。忽略它，否则会整列选中
                 // 第一列数据，高亮和复制都落到用户没点的列上。
+                // 表格在此之前已经把自己切成列模式（selected_col=0）并给 # 列刷激活底色，
+                // 所以这里必须把表格选择拉回会话焦点：否则 # 整列还亮着，复制和统计却是空的，
+                // 方向键也停在列模式。
                 let Some(column) = col.checked_sub(1) else {
+                    self.schedule_table_resync();
                     return;
                 };
                 // 列头与行头对称：整列就是从首行到末行的矩形，
@@ -1160,9 +1194,11 @@ impl GridPane {
             state.delegate_mut().has_more = has_more;
             state.delegate_mut().loading = loading;
             state.refresh(cx);
+            // 比较整份选择（行/列/单元格）而不只是 selected_cell：表格为行号列留下的列模式
+            // 即使焦点没变也要复位，否则 # 整列会继续画激活底色。
             match focus {
-                Some((row, column)) if state.selected_cell() != Some((row, column)) => state.set_selected_cell(row, column, cx),
-                None if state.selected_cell().is_some() => state.clear_selection(cx),
+                Some((row, column)) if state.selection() != TableSelection::Cell(row, column) => state.set_selected_cell(row, column, cx),
+                None if state.selection() != TableSelection::None => state.clear_selection(cx),
                 _ => {}
             }
         });
@@ -1207,6 +1243,11 @@ impl Render for GridPane {
         let selected = self.session.selection_bounds();
         if self.table.read(cx).delegate().selected != selected {
             self.table.update(cx, |state, _| state.delegate_mut().selected = selected);
+        }
+        // 行号列的事件只把表格切进列/行模式就返回了；事件回调不能重入表格，这里在绘制前
+        // 按会话焦点复位，本帧的 # 列、行头和键盘模式都回到单元格选择。
+        if std::mem::take(&mut self.table_resync) {
+            self.resync_table_selection(cx);
         }
         // 切窗口、点别的面板：焦点从网格内移到网格外时结束拖选，已选矩形保留。
         // 表格自己拿焦点也算在网格内，正常点击和方向键不会被误判成失焦。
@@ -1982,6 +2023,11 @@ impl TableDelegate for SheetDelegate {
     fn column(&self, col_ix: usize, _: &App) -> Column {
         let (name, width, fixed) = self.columns.get(col_ix).cloned().unwrap_or_else(|| (" ".to_owned(), 120.0, false));
         let mut column = Column::new(format!("c{col_ix}"), name).width(px(width)).resizable(!fixed);
+        // 第 0 列是行号列，不是数据列：整列选择在数据列之外没有意义。声明成不可选，
+        // 表头点击就不会把表格切进列模式，也不会给 # 列和它的格子刷激活底色。
+        if col_ix == 0 {
+            column = column.selectable(false);
+        }
         if fixed {
             column = column.fixed_left();
         }
@@ -1994,7 +2040,8 @@ impl TableDelegate for SheetDelegate {
         let p = Palette::of(cx);
         // 表格的 SelectCell 不带修饰键和拖拽阶段，直接在格子上取鼠标事件：该格里按下、
         // 拖到另一格、松开都带着真实行列，不需要按像素反推行号。
-        let owner = self.owner.clone();
+        // 行号格不是数据格：按下、拖动都不改选择，也不会把第一列数据顺手选中。
+        let owner = self.owner.clone().filter(|_| col_ix > 0);
         let column = col_ix.saturating_sub(1);
         // 选中的每一格自己画底色，不是只让焦点那格亮：矩形里没有画的格子会让高亮和
         // 复制/统计说的范围对不上。行号列（col 0）只在整行被选中时亮，单格选择不点亮它。
@@ -3574,12 +3621,81 @@ mod pane_tests {
         );
 
         // 点 # 列头：这不是一次数据列选择，高亮、复制和统计都必须是空的。
+        // 表格自己会先切进列模式（selected_col=0）并给 # 列刷激活底色，处理器早退之后
+        // 必须在同一帧里把表格选择拉回会话，否则会出现"# 整列亮着、复制统计为空"。
         visual.simulate_click(number_head.center(), Modifiers::default());
-        visual.update(|_, cx| {
+        // 固定列头可能被滚动表头的留白盖住，合成点击不一定会打到它；无论点击落在哪里，
+        // 表格为 # 列切列模式这一步都必须被覆盖，所以再走一次表格自己的列选择入口。
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.table.update(cx, |state, cx| state.set_selected_col(0, cx));
+            })
+        });
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.update(|cx| {
             let pane = pane.read(cx);
             assert_eq!(pane.session.selection_bounds(), None, "# 列头点下去不产生整列选择");
             assert_eq!(pane.session.tsv(), "", "点 # 列头不该带出第一列数据的复制内容");
             assert_eq!(pane.session.selection_stats().cells, 0, "统计范围也不能落到第一列数据上");
+            let table = pane.table.read(cx);
+            assert_eq!(table.selected_col(), None, "# 列头点下去表格不能停在列模式");
+            assert!(!matches!(table.selection(), TableSelection::Column(_)), "# 列头不该留下整列选择：{:?}", table.selection());
+        });
+        // 帧级：没有任何格子（含行号格）画成选中。
+        let mut visual = VisualTestContext::from_window(window, cx);
+        let painted = painted_cells(&mut visual, 2, 3);
+        for row in 0..2 {
+            for col_ix in 0..3 {
+                assert!(!painted[&(row, col_ix)].0, "# 列头点下去 ({row}, {col_ix}) 不该有选中底色");
+            }
+        }
+        assert_paint_matches_selection(cx, window, &pane);
+
+        // 键盘不能停在列模式：焦点回到表格后按方向键，选择落在行/单元格上。
+        {
+            let mut visual = VisualTestContext::from_window(window, cx);
+            visual.update(|window, cx| {
+                let handle = pane.read(cx).table.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
+            });
+            visual.simulate_keystrokes("down");
+        }
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert!(
+                !matches!(pane.table.read(cx).selection(), TableSelection::Column(_)),
+                "点过 # 列头之后方向键不能还在列模式：{:?}",
+                pane.table.read(cx).selection()
+            );
+            assert_eq!(pane.session.selection_bounds(), Some((0, 0, 0, 1)), "方向键应选中第一整行");
+            assert_eq!(pane.session.tsv(), "1\t甲");
+        });
+
+        // 已经有单元格选择时点 # 列头：会话选择原样保留，表格回到会话焦点那一格，
+        // # 列和行号格都没有激活底色。
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.session.select(1, 1, false);
+                pane.sync_table(cx);
+            })
+        });
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        {
+            let mut visual = VisualTestContext::from_window(window, cx);
+            visual.simulate_click(number_head.center(), Modifiers::default());
+        }
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.table.update(cx, |state, cx| state.set_selected_col(0, cx));
+            })
+        });
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.selection_bounds(), Some((1, 1, 1, 1)), "# 列头不该改会话选择");
+            assert_eq!(pane.session.tsv(), "乙");
+            assert_eq!(pane.table.read(cx).selection(), TableSelection::Cell(1, 2), "表格要回到会话焦点那一格");
         });
         assert_paint_matches_selection(cx, window, &pane);
 
@@ -3590,6 +3706,61 @@ mod pane_tests {
             assert_eq!(pane.session.selection_bounds(), Some((0, 0, 1, 0)), "第一列数据的列头应覆盖整列");
             assert_eq!(pane.session.tsv(), "1\n2", "整列 TSV 只含这一列数据");
             assert_eq!(pane.session.selection_stats().cells, 2);
+        });
+        assert_paint_matches_selection(cx, window, &pane);
+    }
+
+    /// 行号格（表格第 0 列）不是数据格：点它、右击它都只复位表格状态，不会把第一列数据选中。
+    /// 行选择仍可从 12px 行头和行号列的整行高亮到达，所以这里按"忽略"处理。
+    #[gpui_kit::test]
+    fn row_number_cell_clicks_never_select_the_first_data_column(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let mut visual = VisualTestContext::from_window(window, cx);
+        let number_cell = visual.debug_bounds("grid-cell-0-0").expect("行号格");
+        let first_data_cell = visual.debug_bounds("grid-cell-0-1").expect("第一列数据格");
+        assert!(
+            first_data_cell.origin.x >= number_cell.origin.x + number_cell.size.width,
+            "第一列数据应在行号列右侧：{number_cell:?} / {first_data_cell:?}"
+        );
+
+        // 点行号格：不加选择，也不落到第一列数据上。
+        visual.simulate_click(number_cell.center(), Modifiers::default());
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.selection_bounds(), None, "点行号格不该选中第一列数据");
+            assert_eq!(pane.session.tsv(), "");
+            assert_ne!(pane.table.read(cx).selection(), TableSelection::Cell(0, 1), "表格不能把行号格当成第一列数据");
+        });
+        assert_paint_matches_selection(cx, window, &pane);
+
+        // 右击行号格走同一条表格事件：同样不该把第一列数据选中。
+        cx.update(|cx| {
+            pane.update(cx, |pane, _| pane.apply_table_event(&TableEvent::RightClickedCell(0, 0)));
+        });
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.selection_bounds(), None, "右击行号格不该选中第一列数据");
+            assert_ne!(pane.table.read(cx).selection(), TableSelection::Cell(0, 1));
+        });
+
+        // 数据格本身照常可选，忽略行号格不会削弱正常点击。
+        {
+            let mut visual = VisualTestContext::from_window(window, cx);
+            visual.simulate_click(first_data_cell.center(), Modifiers::default());
+        }
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.selection_bounds(), Some((0, 0, 0, 0)), "点第一列数据格应选中这一格");
+            assert_eq!(pane.session.tsv(), "1");
+            assert_eq!(pane.table.read(cx).selection(), TableSelection::Cell(0, 1));
         });
         assert_paint_matches_selection(cx, window, &pane);
     }
