@@ -6,6 +6,7 @@ mod jobs;
 mod layout;
 mod menus;
 mod model;
+pub(crate) mod nav;
 mod view;
 
 pub use close::{update_block_key, CloseFacts};

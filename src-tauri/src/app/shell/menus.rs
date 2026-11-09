@@ -31,6 +31,10 @@ impl MenuPlace {
 pub enum MenuTarget {
     Connection,
     Object,
+    /// 例程/触发器/序列等没有行数据的对象：数据页入口禁用并说明原因。
+    NonDataObject,
+    /// 列或索引行：动作绑定这一列，不代替整张表。
+    Column,
     QueryTab,
     ReadonlyGrid,
     WritableGrid,
@@ -62,11 +66,26 @@ fn disabled(id: &'static str, label_key: &'static str, reason_key: &'static str)
 pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
     match place {
         MenuPlace::ObjectTree => {
+            if target == MenuTarget::Column {
+                return vec![
+                    item("tree-copy-column", "catalog.tree.copyColumn"),
+                    item("tree-insert-column", "catalog.tree.insertColumn"),
+                ];
+            }
+            let data = if target == MenuTarget::NonDataObject {
+                disabled("tree-open-data", "catalog.tree.openData", "catalog.tree.noData")
+            } else {
+                item("tree-open-data", "catalog.tree.openData")
+            };
             let mut items = vec![
-                item("tree-open-data", "catalog.tree.openData"),
+                data,
                 item("open-structure", "catalog.tree.viewStructure"),
                 item("open-diagram", "catalog.tree.diagram"),
-                item("new-query", "catalog.tree.newQueryHere"),
+                // 对象上下文里的“新建查询”绑定这一行，不是通用空查询。
+                item("tree-new-query", "catalog.tree.newQueryHere"),
+                // 插入只改当前草稿，不执行；复制与生成 SELECT 仍是独立入口。
+                item("tree-insert-object", "catalog.tree.insertObject"),
+                item("tree-insert-select", "catalog.tree.insertSelect"),
                 item("tree-copy-name", "catalog.tree.copyFullName"),
                 item("tree-select-sql", "catalog.tree.copyToQuery"),
                 // 对比与导入导出不再占固定入口，但仍从对象上下文到达，并带上这个对象。
@@ -228,5 +247,17 @@ mod tests {
         assert!(grid.items.iter().any(|item| item.id == "mark-delete" && item.reason_key == Some("grid.errors.viewReadonly")));
         let writable = OpenMenu::new(MenuPlace::Grid, MenuTarget::WritableGrid);
         assert!(writable.items.iter().any(|item| item.id == "edit-cell" && item.enabled));
+
+        // 例程等没有行数据的对象：数据页入口禁用并说明原因。
+        let routine = OpenMenu::new(MenuPlace::ObjectTree, MenuTarget::NonDataObject);
+        let open_data = routine.items.iter().find(|item| item.id == "tree-open-data").expect("open data");
+        assert!(!open_data.enabled);
+        assert_eq!(open_data.reason_key, Some("catalog.tree.noData"));
+        assert!(routine.items.iter().any(|item| item.id == "tree-insert-object"));
+
+        // 列行只提供列自己的动作。
+        let column = OpenMenu::new(MenuPlace::ObjectTree, MenuTarget::Column);
+        let ids: Vec<&str> = column.items.iter().map(|item| item.id).collect();
+        assert_eq!(ids, vec!["tree-copy-column", "tree-insert-column"]);
     }
 }

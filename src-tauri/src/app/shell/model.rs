@@ -14,7 +14,11 @@ use crate::application::{AppServices, TaskBoard};
 use crate::connections::model::{CaMode, Engine, SshAuthKind};
 use crate::app::views::connections::LinkStatus;
 use crate::app::views::query::object_spec;
+use crate::catalog::hierarchy::{NavKind, NavNode, NavRow, NavTree, ObjectKey};
+use crate::catalog::{NavAction, NavConnection};
 use crate::i18n;
+
+use super::nav::{self, NavRequest};
 use crate::query::assist::TreeObject;
 use crate::state::{AppState, Platform, SessionState, SessionTab, ShellSettings, StateError};
 
@@ -244,6 +248,16 @@ pub struct WorkbenchModel {
     pub catalog: Vec<TreeObject>,
     /// 最近一次对象读取的错误；与空目录、筛选无命中分开呈现。
     pub catalog_error: String,
+    /// 真实层级树：库/模式/对象类型/对象/列与索引，带局部失败与续读状态。
+    pub nav: NavTree,
+    /// 整个目录读取失败的原因；单节点失败留在节点自己身上。
+    pub nav_error: String,
+    /// 模型只排队异步读取，由视图发起并回填。
+    pub nav_requests: VecDeque<NavRequest>,
+    /// 正在读取的目录任务数；空目录与“还在读”必须能分辨。
+    pub nav_loading: u32,
+    /// 最近一次完整读取结果；单条连接重试时用它保住其它连接。
+    pub nav_source: Vec<NavConnection>,
     pub exchange_open: bool,
     /// 导入、导出、dump 或 migrate 仍在跑。关闭守卫把它和网格暂存、查询草稿分开。
     pub exchange_running: bool,
@@ -306,6 +320,11 @@ impl WorkbenchModel {
             object_filter: String::new(),
             catalog: Vec::new(),
             catalog_error: String::new(),
+            nav: NavTree::new(),
+            nav_error: String::new(),
+            nav_requests: VecDeque::new(),
+            nav_loading: 0,
+            nav_source: Vec::new(),
             exchange_open: false,
             exchange_running: false,
             compare_running: false,
@@ -414,6 +433,9 @@ impl WorkbenchModel {
     }
 
     fn local(&mut self, id: &str) -> bool {
+        if (id == "nav-refresh" || id.starts_with("nav-")) && self.nav_command(id) {
+            return true;
+        }
         if let Some(spec) = id.strip_prefix("open-table:") {
             self.open_item(WorkItemKind::Table, spec.to_owned());
             return true;
@@ -595,7 +617,14 @@ impl WorkbenchModel {
             "preview-down" => self.settings.step_preview_kb(-1),
             "object-page-up" => self.settings.step_object_page(50),
             "object-page-down" => self.settings.step_object_page(-50),
-            "tree-open-data" | "tree-copy-name" | "tree-select-sql" => self.tree_action(id),
+            "tree-open-data"
+            | "tree-copy-name"
+            | "tree-select-sql"
+            | "tree-insert-object"
+            | "tree-insert-select"
+            | "tree-insert-column"
+            | "tree-copy-column"
+            | "tree-new-query" => self.tree_action(id),
             "open-admin" => {
                 if let Some(spec) = self.table_spec.clone().or_else(|| self.object_spec.clone()) {
                     self.open_item(WorkItemKind::Admin, spec);
@@ -750,7 +779,35 @@ impl WorkbenchModel {
 
     fn tree_action(&mut self, id: &str) {
         // 对象动作只认完整目标：连接、库、模式、对象名一起来自同一个对象，
-        // 不用连接 id 或对象名反推目标。
+        // 不用连接 id 或对象名反推目标。树里有焦点时以焦点节点为准，
+        // 这样右键/键盘/菜单绑定的是实际被操作的那一行。
+        if let Some(node_id) = self.tree_focus_node(id).map(str::to_owned) {
+            let mapped = match id {
+                "tree-open-data" => format!("nav-open-data:{node_id}"),
+                "tree-copy-name" => format!("nav-copy-name:{node_id}"),
+                "tree-copy-column" => format!("nav-copy-column:{node_id}"),
+                "tree-insert-object" => format!("nav-insert-object:{node_id}"),
+                "tree-insert-select" => format!("nav-insert-select:{node_id}"),
+                "tree-insert-column" => {
+                    let column = self.nav.node(&node_id).map(|node| node.name.clone()).unwrap_or_default();
+                    let object = self
+                        .nav
+                        .node(&node_id)
+                        .and_then(|node| node.parent.as_deref())
+                        .and_then(|group| self.nav.node(group))
+                        .and_then(|group| group.parent.clone())
+                        .unwrap_or_default();
+                    format!("nav-insert-column:{object}\u{1}{column}")
+                }
+                "tree-select-sql" => format!("nav-select-sql:{node_id}"),
+                "tree-new-query" => format!("nav-new-query:{node_id}"),
+                _ => String::new(),
+            };
+            if !mapped.is_empty() {
+                let _ = self.nav_command(&mapped);
+                return;
+            }
+        }
         match id {
             "tree-copy-name" => match self.object_target() {
                 Some(target) => self.copied = Self::qualified_name(&target),
@@ -760,6 +817,10 @@ impl WorkbenchModel {
                     self.notice_detail.clear();
                 }
             },
+            "tree-insert-object" | "tree-insert-select" | "tree-insert-column" | "tree-copy-column" => {
+                self.notice_key = Some("shell.tabs.needObject");
+                self.notice_detail.clear();
+            }
             "tree-select-sql" => match self.object_target() {
                 Some(target) => {
                     // 只写草稿并带上该对象的连接/库，不执行任何语句。
@@ -784,6 +845,23 @@ impl WorkbenchModel {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// 当前树上要执行动作的节点：右键选中的对象/列/索引，或键盘焦点。
+    fn tree_focus_node(&self, id: &str) -> Option<&str> {
+        let focused = self.nav.focus();
+        match id {
+            "tree-copy-column" | "tree-insert-column" => {
+                let focused = focused?;
+                let node = self.nav.node(focused)?;
+                matches!(node.kind, NavKind::Column | NavKind::Index).then_some(focused)
+            }
+            _ => {
+                let focused = focused?;
+                let node = self.nav.node(focused)?;
+                node.kind.is_object().then_some(focused)
+            }
         }
     }
 
@@ -1039,6 +1117,541 @@ impl WorkbenchModel {
         self.catalog = objects.to_vec();
         self.catalog_error = error.to_owned();
         true
+    }
+
+
+    /// 把一次目录读取结果并进层级树；展开、焦点和已经读到的列/索引保留。
+    /// partial=true 时只替换同 id 的那条连接，其它连接的已读内容不动。
+    pub fn apply_navigation(&mut self, connections: &[NavConnection], partial: bool) -> bool {
+        self.nav_loading = self.nav_loading.saturating_sub(1);
+        self.nav_error.clear();
+        if partial {
+            for connection in connections {
+                match self.nav_source.iter_mut().find(|item| item.id == connection.id) {
+                    Some(slot) => *slot = connection.clone(),
+                    None => self.nav_source.push(connection.clone()),
+                }
+            }
+        } else {
+            self.nav_source = connections.to_vec();
+        }
+        let snapshot = self.nav_source.clone();
+        let changed = self.nav.apply(&snapshot);
+        self.sync_object_spec_from_focus();
+        if self.nav.focus().is_none() {
+            self.nav.focus_first();
+            self.sync_object_spec_from_focus();
+        }
+        changed
+    }
+
+    /// 整目录读取失败：保留上一份树，只把原因放在顶部提示条。
+    pub fn nav_failed(&mut self, message: impl Into<String>) {
+        self.nav_loading = self.nav_loading.saturating_sub(1);
+        self.nav_error = message.into();
+    }
+
+    pub fn request_nav_refresh(&mut self, connection: Option<String>) {
+        self.nav_loading = self.nav_loading.saturating_add(1);
+        self.nav_requests.push_back(NavRequest::Refresh { connection });
+    }
+
+    pub fn request_nav_details(&mut self, node_id: &str) {
+        if self.nav.begin_details(node_id) {
+            self.nav_requests.push_back(NavRequest::Details(node_id.to_owned()));
+        }
+    }
+
+    pub fn take_nav_request(&mut self) -> Option<NavRequest> {
+        self.nav_requests.pop_front()
+    }
+
+    pub fn nav_node(&self, id: &str) -> Option<&NavNode> {
+        self.nav.node(id)
+    }
+
+    pub fn nav_rows(&self) -> Vec<NavRow> {
+        self.nav.visible()
+    }
+
+    /// 一条连接下面的树行，深度从连接下一层开始，供资源管理器缩进使用。
+    pub fn nav_rows_for(&self, connection_id: &str) -> Vec<NavRow> {
+        let root = crate::catalog::hierarchy::connection_node_id(connection_id);
+        self.nav
+            .visible()
+            .into_iter()
+            .filter(|row| row.depth > 0)
+            .filter(|row| {
+                // 只保留真正挂在这条连接下的行：父链必须经过连接节点。
+                self.nav
+                    .node(&row.id)
+                    .and_then(|node| node.parent.as_deref())
+                    .map(|parent| self.nav_within(parent, &root))
+                    .unwrap_or(false)
+            })
+            .map(|row| NavRow {
+                depth: row.depth.saturating_sub(1),
+                ..row
+            })
+            .collect()
+    }
+
+    fn nav_within(&self, parent: &str, root: &str) -> bool {
+        let mut current = parent.to_owned();
+        loop {
+            if current == root {
+                return true;
+            }
+            let Some(node) = self.nav.node(&current) else { return false };
+            match node.parent.clone() {
+                Some(next) => current = next,
+                None => return false,
+            }
+        }
+    }
+
+    /// 搜索：完整路径 + 高亮由树给出；清除后恢复原来的展开与选择。
+    pub fn nav_search(&mut self, text: &str) -> bool {
+        let changed = self.nav.search(text);
+        if !text.trim().is_empty() {
+            self.sync_object_spec_from_focus();
+        }
+        changed
+    }
+
+    pub fn nav_clear_search(&mut self) -> bool {
+        self.nav.clear_search()
+    }
+
+    fn sync_object_spec_from_focus(&mut self) {
+        let Some(id) = self.nav.focus().map(str::to_owned) else { return };
+        let Some(node) = self.nav.node(&id).cloned() else { return };
+        match node.kind {
+            NavKind::Object | NavKind::Column | NavKind::Index => {
+                let object_node = if node.kind == NavKind::Object {
+                    Some(node.clone())
+                } else {
+                    node.parent
+                        .as_deref()
+                        .and_then(|parent| self.nav.node(parent))
+                        .filter(|parent| parent.kind == NavKind::Object)
+                        .or_else(|| {
+                            node.parent
+                                .as_deref()
+                                .and_then(|group| self.nav.node(group))
+                                .and_then(|group| group.parent.as_deref())
+                                .and_then(|object| self.nav.node(object))
+                        })
+                        .cloned()
+                };
+                if let Some(object_node) = object_node {
+                    let environment = self.nav_environment(&object_node.connection_id);
+                    if let Some(spec) = nav::spec_for(&object_node, &environment) {
+                        self.object_spec = Some(spec);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 单击/回车：树自己处理展开，其余转成外壳命令。
+    pub fn nav_activate_command(&mut self, node_id: &str) -> Option<String> {
+        let action = self.nav.activate(node_id);
+        let command = self.nav_activation_command(action);
+        self.sync_object_spec_from_focus();
+        command
+    }
+
+    /// 资源管理器对象区的空态：读取失败、还在读、目录为空、搜索无命中必须能分辨。
+    pub fn nav_empty_key(&self, connection_id: &str) -> Option<&'static str> {
+        if self.nav.node(&crate::catalog::hierarchy::connection_node_id(connection_id))
+            .and_then(|node| node.error.as_ref())
+            .is_some()
+            || (!self.nav_error.is_empty() && self.nav.roots().is_empty())
+        {
+            return Some("ui.explorer.error");
+        }
+        if self.nav_loading > 0 {
+            return Some("catalog.tree.loading");
+        }
+        if !self.object_filter.trim().is_empty() {
+            return Some("ui.explorer.noMatch");
+        }
+        Some("ui.explorer.noObjects")
+    }
+
+    /// 搜索命中行（完整路径）与普通树行分开渲染。
+    pub fn nav_searching(&self) -> bool {
+        !self.object_filter.trim().is_empty()
+    }
+
+    fn nav_environment(&self, connection_id: &str) -> String {
+        self.connections
+            .rows
+            .iter()
+            .find(|row| row.saved.id == connection_id)
+            .map(|row| row.saved.env.clone())
+            .unwrap_or_default()
+    }
+
+    fn nav_target(&self, node_id: &str) -> Option<ObjectKey> {
+        let node = self.nav.node(node_id)?;
+        if node.stale {
+            return None;
+        }
+        match node.kind {
+            NavKind::Column | NavKind::Index => node
+                .parent
+                .as_deref()
+                .and_then(|parent| self.nav.node(parent))
+                .and_then(|group| group.parent.as_deref())
+                .and_then(|object| self.nav.node(object))
+                .and_then(|object| object.object()),
+            _ => node.object(),
+        }
+    }
+
+    /// 键盘在树上移动与展开；返回需要外壳继续执行的命令。
+    pub fn nav_key(&mut self, key: NavKey) -> Option<String> {
+        let rows = self.nav.visible();
+        if rows.is_empty() {
+            return None;
+        }
+        let action = match key {
+            NavKey::ArrowDown => {
+                self.nav.move_focus(1);
+                None
+            }
+            NavKey::ArrowUp => {
+                self.nav.move_focus(-1);
+                None
+            }
+            NavKey::Home => {
+                self.nav.focus_first();
+                None
+            }
+            NavKey::End => {
+                self.nav.focus_last();
+                None
+            }
+            NavKey::Enter => {
+                let id = self.nav.focus()?.to_owned();
+                let action = self.nav.activate(&id);
+                Some(self.nav_activation_command(action).unwrap_or_else(|| format!("nav-focus:{id}")))
+            }
+            NavKey::Escape => None,
+        };
+        self.sync_object_spec_from_focus();
+        action
+    }
+
+    /// 右方向键展开/打开；左方向键折叠/回到父节点。
+    pub fn nav_step(&mut self, forward: bool) -> Option<String> {
+        let id = self.nav.focus()?.to_owned();
+        let action = if forward { self.nav.activate(&id) } else { self.nav.retreat(&id) };
+        let command = self.nav_activation_command(action);
+        self.sync_object_spec_from_focus();
+        command
+    }
+
+    fn nav_activation_command(&mut self, action: NavAction) -> Option<String> {
+        match action {
+            NavAction::None | NavAction::FocusParent => None,
+            NavAction::Load(id) => {
+                // 展开已经由树自己完成；对象节点这时按需读列/索引，别的层级不额外发命令。
+                if self.nav.node(&id).map(|node| node.kind) == Some(NavKind::Object) {
+                    self.request_nav_details(&id);
+                }
+                None
+            }
+            NavAction::OpenData(id) => Some(format!("nav-open-data:{id}")),
+            NavAction::OpenStructure(id) => Some(format!("nav-open-structure:{id}")),
+            NavAction::OpenKeyspace { connection_id, keyspace } => {
+                Some(format!("nav-open-keyspace:{connection_id}\u{1}{keyspace}"))
+            }
+            NavAction::OpenDocuments(id) => Some(format!("nav-open-docs:{id}")),
+            NavAction::InsertColumn { object_id, column } => {
+                Some(format!("nav-insert-column:{object_id}\u{1}{column}"))
+            }
+        }
+    }
+
+    /// 对象/列/索引动作的规格。菜单、键盘和右键都从这里取同一份身份。
+    fn nav_spec(&self, node_id: &str) -> Option<String> {
+        let node = self.nav.node(node_id)?;
+        let object = match node.kind {
+            NavKind::Column | NavKind::Index => {
+                let group = node.parent.as_deref().and_then(|parent| self.nav.node(parent))?;
+                let object = group.parent.as_deref().and_then(|object| self.nav.node(object))?;
+                object.clone()
+            }
+            _ => node.clone(),
+        };
+        let environment = self.nav_environment(&object.connection_id);
+        nav::spec_for(&object, &environment)
+    }
+
+    /// 把文本并入当前查询草稿。没有查询项时新建一条草稿，照旧不执行。
+    fn insert_into_draft(&mut self, text: String) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        let Some(tab_id) = self
+            .active_tab()
+            .filter(|tab| tab.kind.is_query())
+            .map(|tab| tab.id.clone())
+        else {
+            // 没有活动查询项就开一条带这段文本的草稿；照旧不执行。
+            self.open_query_draft(text, false);
+            self.shell.page = AppPage::Workspace;
+            self.shell.focus = FocusTarget::Editor;
+            return true;
+        };
+        if let Some(tab) = self.tabs.iter_mut().find(|item| item.id == tab_id) {
+            tab.draft = nav::append_text(&tab.draft, &text);
+            self.shell.page = AppPage::Workspace;
+            self.shell.focus = FocusTarget::Editor;
+            return true;
+        }
+        false
+    }
+
+    fn nav_command(&mut self, id: &str) -> bool {
+        if id == "nav-refresh" {
+            self.request_nav_refresh(None);
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-retry:") {
+            let Some(node) = self.nav.node(rest) else { return true };
+            match node.kind {
+                NavKind::Connection => self.request_nav_refresh(Some(node.connection_id.clone())),
+                NavKind::Object => self.request_nav_details(rest),
+                // 种类分组按父级模式/库续读，别把下一页错挂到分组下面。
+                _ => {
+                    let scope = self.nav_storage_scope(rest);
+                    self.nav.begin_scope(&scope);
+                    self.nav_requests.push_back(NavRequest::More(scope));
+                }
+            }
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-more:") {
+            let scope = self.nav_storage_scope(rest);
+            if self.nav.node(&scope).is_some_and(|node| node.loading) {
+                return true;
+            }
+            self.nav.begin_scope(&scope);
+            self.nav_requests.push_back(NavRequest::More(scope));
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-toggle:") {
+            if self.nav.toggle(rest) && self.nav.needs_details(rest) {
+                self.request_nav_details(rest);
+            }
+            self.nav.set_focus(rest);
+            self.sync_object_spec_from_focus();
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-focus:") {
+            self.nav.set_focus(rest);
+            self.sync_object_spec_from_focus();
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-open-data:") {
+            let Some(node) = self.nav.node(rest).cloned() else {
+                // 节点已经不在树上（刷新后删除）：保留选择并说明原因。
+                self.notice_key = Some("catalog.tree.staleObject");
+                self.notice_detail.clear();
+                return true;
+            };
+            let Some(object) = self.nav_target(rest) else {
+                self.notice_key = Some("catalog.tree.staleObject");
+                self.notice_detail.clear();
+                return true;
+            };
+            if !object.opens_data() {
+                // 例程、触发器、序列等没有行数据，不能误开数据页。
+                self.notice_key = Some("catalog.tree.noData");
+                self.notice_detail = node.name.clone();
+                return true;
+            }
+            if let Some(spec) = self.nav_spec(rest) {
+                self.open_item(WorkItemKind::Table, spec);
+            }
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-open-structure:") {
+            if let Some(spec) = self.nav_spec(rest) {
+                self.open_item(WorkItemKind::Structure, spec);
+            } else {
+                self.notice_key = Some("catalog.tree.staleObject");
+                self.notice_detail.clear();
+            }
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-open-diagram:") {
+            self.nav.set_focus(rest);
+            self.sync_object_spec_from_focus();
+            self.open_diagram_from_object();
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-copy-name:") {
+            match self.nav_target(rest) {
+                Some(object) => self.copied = nav::qualified_name(&object),
+                None => {
+                    self.copied.clear();
+                    self.notice_key = Some("catalog.tree.staleObject");
+                    self.notice_detail.clear();
+                }
+            }
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-copy-column:") {
+            match self.nav.node(rest) {
+                Some(node) if !node.stale => self.copied = node.name.clone(),
+                _ => {
+                    self.copied.clear();
+                    self.notice_key = Some("catalog.tree.staleObject");
+                    self.notice_detail.clear();
+                }
+            }
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-insert-object:") {
+            match self.nav_target(rest) {
+                Some(object) => {
+                    self.insert_into_draft(nav::insert_object_text(&object));
+                }
+                None => {
+                    self.notice_key = Some("catalog.tree.staleObject");
+                    self.notice_detail.clear();
+                }
+            }
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-insert-select:") {
+            match self.nav_target(rest) {
+                Some(object) => {
+                    self.insert_into_draft(nav::select_text(&object));
+                }
+                None => {
+                    self.notice_key = Some("catalog.tree.staleObject");
+                    self.notice_detail.clear();
+                }
+            }
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-insert-column:") {
+            // 对象 id 本身含分隔符，列名取最后一段。
+            let (object_id, column) = rest.rsplit_once('\u{1}').unwrap_or((rest, ""));
+            let column = if column.is_empty() {
+                self.nav.node(object_id).map(|node| node.name.clone()).unwrap_or_default()
+            } else {
+                column.to_owned()
+            };
+            if self.nav.node(object_id).is_none() || column.is_empty() {
+                self.notice_key = Some("catalog.tree.staleObject");
+                self.notice_detail.clear();
+                return true;
+            }
+            self.insert_into_draft(nav::insert_column_text(&column));
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-open-keyspace:") {
+            let (connection_id, keyspace) = rest.rsplit_once('\u{1}').unwrap_or((rest, "0"));
+            let name = self.nav_connection_name(connection_id);
+            self.open_item(WorkItemKind::Redis, nav::redis_spec(connection_id, &name, keyspace));
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-open-docs:") {
+            let Some(node) = self.nav.node(rest) else { return true };
+            let connection_name = self.nav_connection_name(&node.connection_id);
+            let database = node.database.clone();
+            let collection = node.name.clone();
+            self.open_item(
+                WorkItemKind::Mongo,
+                nav::mongo_spec(&node.connection_id, &connection_name, &database, &collection),
+            );
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-new-query:") {
+            // 空白查询绑定这一行的连接/库；不写 SQL、不执行。
+            match self.nav_target(rest) {
+                Some(object) => {
+                    self.open_bound_query(
+                        String::new(),
+                        Some(object.connection_id.clone()),
+                        Some(object.connection_name.clone()),
+                        Some(object.database.clone()),
+                        Some(object.engine.as_str().to_owned()),
+                    );
+                }
+                None => {
+                    self.notice_key = Some("catalog.tree.staleObject");
+                    self.notice_detail.clear();
+                }
+            }
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-select-sql:") {
+            match self.nav_target(rest) {
+                Some(object) => {
+                    let sql = nav::select_text(&object);
+                    let target = self.nav.node(rest).and_then(|node| node.object());
+                    let (database, schema) = target
+                        .map(|object| (object.database, object.schema))
+                        .unwrap_or_default();
+                    self.open_bound_query(
+                        sql,
+                        Some(object.connection_id.clone()),
+                        Some(object.connection_name.clone()),
+                        Some(database),
+                        Some(object.engine.as_str().to_owned()),
+                    );
+                    let _ = schema;
+                }
+                None => {
+                    self.notice_key = Some("catalog.tree.staleObject");
+                    self.notice_detail.clear();
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    /// 对象列表真正按页读取的范围：往上找到库/模式/连接节点。
+    fn nav_storage_scope(&self, node_id: &str) -> String {
+        let mut current = node_id.to_owned();
+        loop {
+            let Some(node) = self.nav.node(&current) else { return node_id.to_owned() };
+            match node.kind {
+                NavKind::Group | NavKind::Column | NavKind::ColumnGroup | NavKind::Index | NavKind::IndexGroup => {
+                    match node.parent.clone() {
+                        Some(parent) => current = parent,
+                        None => return node_id.to_owned(),
+                    }
+                }
+                _ => return current,
+            }
+        }
+    }
+
+    fn nav_connection_name(&self, connection_id: &str) -> String {
+        self.connections
+            .rows
+            .iter()
+            .find(|row| row.saved.id == connection_id)
+            .map(|row| row.saved.name.clone())
+            .or_else(|| {
+                // 连接列表还没同步时，用目录快照里这条连接的显示名。
+                self.nav_source
+                    .iter()
+                    .find(|item| item.id == connection_id)
+                    .map(|item| item.name.clone())
+            })
+            .unwrap_or_else(|| connection_id.to_owned())
     }
 
     /// 快速打开里的真实表 / 视图。label 用对象名，保证搜索匹配的是对象；
@@ -1725,7 +2338,12 @@ impl WorkbenchModel {
             DraftField::BundlePassphrase => self.bundle_passphrase = value,
             DraftField::Url => self.url_buffer = value,
             DraftField::Filter => self.connections.filter_text = value,
-            DraftField::ObjectFilter => self.object_filter = value,
+            DraftField::ObjectFilter => {
+                // 资源管理器搜索与对象索引是同一份：显示完整路径并高亮，清除后恢复树。
+                self.object_filter = value;
+                let query = self.object_filter.clone();
+                self.nav_search(&query);
+            }
             DraftField::HistorySearch => self.history.filter_text = value,
             DraftField::SaveName => self.history.save_name = value,
             DraftField::RenameName => self.history.rename_text = value,

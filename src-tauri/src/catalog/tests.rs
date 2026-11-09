@@ -834,3 +834,40 @@ async fn sqlite_attached_database_shows_up_in_the_tree_and_reads_its_own_objects
     drop(service);
     let _ = std::fs::remove_dir_all(dir);
 }
+#[tokio::test]
+async fn sqlite_object_details_read_columns_and_indexes_from_the_open_session() {
+    let path = std::env::temp_dir().join(format!("rillsql-catalog-detail-{}.sqlite", uuid::Uuid::new_v4()));
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path).create_if_missing(true))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, tag TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE UNIQUE INDEX notes_tag ON notes (tag)").execute(&pool).await.unwrap();
+    let session = CatalogSession::Sqlite {
+        pool: pool.clone(),
+        foreign_keys: Some(false),
+    };
+    let (columns, indexes) = super::detail::read_object_details(&session, Engine::Sqlite, "main", "", "notes").await;
+    let columns = columns.expect("列读取");
+    assert_eq!(columns.iter().map(|column| column.name.as_str()).collect::<Vec<_>>(), vec!["id", "body", "tag"]);
+    assert!(columns[0].primary, "PRAGMA table_info 的主键标记要带上");
+    assert!(columns[0].nullable);
+    assert!(!columns[1].nullable, "NOT NULL 列不能标成可空");
+    assert_eq!(columns[0].data_type.to_ascii_uppercase(), "INTEGER");
+
+    let indexes = indexes.expect("索引读取");
+    let unique = indexes.iter().find(|index| index.name == "notes_tag").expect("唯一索引");
+    assert!(unique.unique);
+    assert_eq!(unique.columns, vec!["tag"]);
+
+    // 读一个不存在的对象：空列表而不是清掉别的对象的状态。
+    let (missing_columns, missing_indexes) = super::detail::read_object_details(&session, Engine::Sqlite, "main", "", "missing").await;
+    assert!(missing_columns.unwrap().is_empty());
+    assert!(missing_indexes.unwrap().is_empty());
+    pool.close().await;
+    let _ = std::fs::remove_file(path);
+}

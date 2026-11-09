@@ -52,6 +52,8 @@ pub struct Workbench {
     applied_mongo: Option<String>,
     services: Arc<AppServices>,
     focus: FocusHandle,
+    /// 对象树自己的焦点；点击树行后方向键归树，离开时归还编辑器。
+    pub(super) nav_focus: FocusHandle,
     close_hooked: bool,
     booted: bool,
     boot: bool,
@@ -112,6 +114,7 @@ impl Workbench {
             applied_mongo: None,
             services,
             focus: cx.focus_handle(),
+            nav_focus: cx.focus_handle(),
             close_hooked: false,
             booted: false,
             boot,
@@ -134,6 +137,14 @@ impl Workbench {
 
     pub fn perform(&mut self, id: &str, cx: &mut Context<Self>) {
         self.refresh_exchange(cx);
+        if id == "refresh-tree" {
+            // 目录树与查询页的对象索引各自刷新；树保留展开、焦点与已读子节点。
+            self.model.request_nav_refresh(None);
+        }
+        if id.starts_with("nav-insert-") {
+            // 插入前先把编辑器里的最新文本收回草稿，追加时才不会丢掉刚输入的内容。
+            self.forward_query("capture", cx);
+        }
         // 查询命令只在查询工作项处于活动状态时生效；表格/结构等页面不能操作隐藏查询。
         if requires_active_query(id) && !self.active_query_context() {
             self.model.notice_key = Some("query.errors.needTarget");
@@ -770,6 +781,116 @@ impl Workbench {
     }
 
     /// 连上或断开连接后刷新对象树，资源管理器才看得到表。
+    /// 目录树读取只在视图里发起：模型排队，结果回填到同一份 NavTree。
+    fn pump_nav(&mut self, cx: &mut Context<Self>) {
+        while let Some(request) = self.model.take_nav_request() {
+            match request {
+                super::nav::NavRequest::Refresh { connection } => self.spawn_nav_refresh(connection, cx),
+                super::nav::NavRequest::Details(id) => self.spawn_nav_details(id, cx),
+                super::nav::NavRequest::More(id) => self.spawn_nav_more(id, cx),
+            }
+        }
+    }
+
+    fn spawn_nav_refresh(&mut self, connection: Option<String>, cx: &mut Context<Self>) {
+        let services = Arc::clone(&self.services);
+        let page = usize::try_from(self.model.settings.object_page.max(1)).unwrap_or(100);
+        let view = cx.entity().downgrade();
+        let partial = connection.is_some();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        jobs::runtime().spawn(async move {
+            let result = crate::catalog::read_navigation(&services.connections, page, connection.as_deref()).await;
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |_, cx| {
+            let result = rx.await;
+            cx.update(|cx| {
+                let Some(view) = view.upgrade() else { return };
+                view.update(cx, |this, cx| {
+                    match result {
+                        Ok(Ok(connections)) => {
+                            this.model.apply_navigation(&connections, partial);
+                        }
+                        // 读取失败保留上一份树，只说明原因；不清空已读对象。
+                        Ok(Err(message)) => this.model.nav_failed(message),
+                        Err(_) => this.model.nav_failed("读取对象目录失败"),
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn spawn_nav_details(&mut self, node_id: String, cx: &mut Context<Self>) {
+        let Some(node) = self.model.nav_node(&node_id).cloned() else { return };
+        let services = Arc::clone(&self.services);
+        let view = cx.entity().downgrade();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        jobs::runtime().spawn(async move {
+            let Some(session) = services.connections.catalog_session(&node.connection_id) else {
+                let _ = tx.send((Err("这条连接还没有打开".to_owned()), Err("这条连接还没有打开".to_owned())));
+                return;
+            };
+            let result = crate::catalog::read_object_details(&session, node.engine, &node.database, &node.schema, &node.name).await;
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |_, cx| {
+            let result = rx.await;
+            cx.update(|cx| {
+                let Some(view) = view.upgrade() else { return };
+                view.update(cx, |this, cx| {
+                    let (columns, indexes) = match result {
+                        Ok(pair) => pair,
+                        Err(_) => (Err("读取列表失败".to_owned()), Err("读取列表失败".to_owned())),
+                    };
+                    this.model.nav.set_details(&node_id, columns, indexes);
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn spawn_nav_more(&mut self, node_id: String, cx: &mut Context<Self>) {
+        let Some(node) = self.model.nav_node(&node_id).cloned() else { return };
+        if node.loading {
+            return;
+        }
+        self.model.nav.begin_scope(&node_id);
+        let services = Arc::clone(&self.services);
+        let page = usize::try_from(self.model.settings.object_page.max(1)).unwrap_or(100);
+        let offset = node.loaded;
+        let view = cx.entity().downgrade();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        jobs::runtime().spawn(async move {
+            let Some(session) = services.connections.catalog_session(&node.connection_id) else {
+                let _ = tx.send((Vec::new(), 0, Some("这条连接还没有打开".to_owned())));
+                return;
+            };
+            let body = crate::catalog::read_object_page(&session, node.engine, &node.database, &node.schema, offset, page).await;
+            let _ = tx.send((body.objects, body.total, body.error));
+        });
+        cx.spawn(async move |_, cx| {
+            let result = rx.await;
+            cx.update(|cx| {
+                let Some(view) = view.upgrade() else { return };
+                view.update(cx, |this, cx| {
+                    match result {
+                        Ok((objects, total, error)) => {
+                            this.model.nav.append_objects(&node_id, &objects, total, error);
+                        }
+                        Err(_) => {
+                            this.model.nav.set_error(&node_id, "读取更多对象失败");
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
     fn refresh_tree_on_connect(&mut self, cx: &mut Context<Self>) {
         let connected: std::collections::BTreeSet<String> = self
             .model
@@ -786,6 +907,7 @@ impl Workbench {
             let browse = self.pending_browser.take_if(|id| connected.contains(id));
             self.connected_seen = connected;
             self.forward_query("refresh-tree", cx);
+            self.model.request_nav_refresh(None);
             if let Some(id) = browse {
                 if let Some((command, _, _)) = self.model.connections.rows.iter().find(|row| row.saved.id == id).and_then(super::chrome::browser_command) {
                     self.perform(&command, cx);
@@ -864,6 +986,7 @@ impl Workbench {
                             }
                             let _ = this.model.dispatch("conn-refresh");
                             let _ = this.model.dispatch("history-refresh");
+                            let _ = this.model.dispatch("nav-refresh");
                             this.persist_if_needed();
                             cx.notify();
                         })
@@ -1265,6 +1388,7 @@ impl Render for Workbench {
         self.measure(window);
         self.boot_state(cx);
         self.pump_jobs(cx);
+        self.pump_nav(cx);
         self.sync_view_settings(cx);
         self.sync_query(window, cx);
         self.sync_catalog(cx);

@@ -3753,3 +3753,415 @@ fn narrow_window_keeps_the_four_entry_rail_and_low_frequency_commands(cx: &mut g
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ------------------------------------------------------------ 目录层级（T2）
+
+fn nav_connection(engine: Engine, id: &str, name: &str, databases: Vec<crate::catalog::model::DatabaseNode>) -> crate::catalog::NavConnection {
+    let mut connection = crate::catalog::NavConnection::new(id, name, engine, crate::catalog::model::ConnStatus::Connected);
+    connection.databases = databases;
+    connection
+}
+
+fn nav_database(name: &str, objects: Vec<crate::catalog::model::ObjectRow>) -> crate::catalog::model::DatabaseNode {
+    let total = objects.len();
+    crate::catalog::model::DatabaseNode {
+        name: name.to_owned(),
+        schemas: vec![crate::catalog::model::SchemaNode {
+            name: if name == "shop" { "public".to_owned() } else { String::new() },
+            objects,
+            total,
+            error: None,
+            kind_reports: Vec::new(),
+        }],
+        error: None,
+    }
+}
+
+fn nav_id(connection: &str, database: &str, schema: &str, object: &crate::catalog::model::ObjectRow) -> String {
+    crate::catalog::hierarchy::object_node_id(connection, database, schema, object)
+}
+
+fn expand_all(model: &mut WorkbenchModel, ids: &[String]) {
+    for id in ids {
+        let _ = model.dispatch(&format!("nav-toggle:{id}"));
+    }
+}
+
+#[test]
+fn tree_actions_bind_to_the_row_and_routines_never_open_a_data_page() {
+    use crate::catalog::model::{ObjectKind, ObjectRow};
+    let orders = ObjectRow::table("orders", Some(4));
+    let trigger = ObjectRow::fresh("orders_touch", ObjectKind::Trigger);
+    let pg = nav_connection(
+        Engine::Postgres,
+        "pg",
+        "销售库",
+        vec![nav_database("shop", vec![orders.clone(), trigger.clone()])],
+    );
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert!(model.apply_navigation(&[pg], false));
+
+    let conn = crate::catalog::hierarchy::connection_node_id("pg");
+    let db = crate::catalog::hierarchy::database_node_id("pg", "shop");
+    let schema = crate::catalog::hierarchy::schema_node_id("pg", "shop", "public");
+    let group = crate::catalog::hierarchy::group_node_id("pg", "shop", "public", ObjectKind::Table);
+    let trigger_group = crate::catalog::hierarchy::group_node_id("pg", "shop", "public", ObjectKind::Trigger);
+    expand_all(&mut model, &[conn, db, schema, group, trigger_group]);
+    let names: Vec<String> = model.nav_rows().iter().map(|row| row.name.clone()).collect();
+    assert!(names.contains(&"orders".to_owned()), "{names:?}");
+    assert!(names.contains(&"orders_touch".to_owned()));
+
+    // 复制限定名按引擎层级，不带连接展示名。
+    let orders_id = nav_id("pg", "shop", "public", &orders);
+    let _ = model.dispatch(&format!("nav-focus:{orders_id}"));
+    let _ = model.dispatch("tree-copy-name");
+    assert_eq!(model.copied, "public.orders");
+
+    // 打开数据页用的是这一行的完整目标。
+    let _ = model.dispatch(&format!("nav-open-data:{orders_id}"));
+    let tab = model.active_tab().expect("表工作项");
+    assert_eq!(tab.kind, WorkItemKind::Table);
+    assert!(tab.spec.as_deref().unwrap_or_default().starts_with("pg|销售库|shop|public|orders|postgres"));
+    assert_eq!(model.executions, 0, "打开数据不执行 SQL");
+
+    // 关系图只画这一行的库/模式范围，不用别的同名对象。
+    let _ = model.dispatch(&format!("nav-open-diagram:{orders_id}"));
+    assert_eq!(model.diagram_spec.as_deref(), Some("pg|shop|public|销售库"));
+    assert_eq!(model.shell.page, AppPage::Diagram);
+    model.shell.page = AppPage::Workspace;
+
+    // 对象菜单里的“新建查询”绑定这一行，草稿为空且不执行。
+    let _ = model.dispatch("tree-new-query");
+    let bound = model.active_tab().cloned().expect("绑定查询");
+    assert_eq!(bound.kind, WorkItemKind::Query);
+    assert_eq!(bound.connection_id.as_deref(), Some("pg"));
+    assert_eq!(bound.database.as_deref(), Some("shop"));
+    assert!(bound.draft.is_empty());
+    assert_eq!(model.executions, 0);
+
+    // 触发器没有行数据：不打开表页，说明原因。
+    let trigger_id = nav_id("pg", "shop", "public", &trigger);
+    let tabs = model.tabs.len();
+    let _ = model.dispatch(&format!("nav-open-data:{trigger_id}"));
+    assert_eq!(model.tabs.len(), tabs, "触发器不能误开数据页");
+    assert_eq!(model.notice_key, Some("catalog.tree.noData"));
+}
+
+#[test]
+fn insertions_change_the_draft_only_and_keep_the_selected_target() {
+    use crate::catalog::model::ObjectRow;
+    let orders = ObjectRow::table("orders", Some(1));
+    let pg = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", vec![orders.clone()])]);
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.apply_navigation(&[pg], false);
+    let orders_id = nav_id("pg", "shop", "public", &orders);
+
+    // 没有查询项时插入会开一条带文本的草稿，不执行。
+    let _ = model.dispatch(&format!("nav-insert-object:{orders_id}"));
+    let tab = model.active_tab().cloned().expect("查询草稿");
+    assert_eq!(tab.kind, WorkItemKind::Query);
+    assert_eq!(tab.draft, "\"public\".\"orders\"");
+    assert_eq!(model.executions, 0);
+    assert!(model.pending.is_empty());
+
+    // 已有草稿时追加，不覆盖原内容。
+    let _ = model.dispatch("new-query");
+    let active = model.active_tab.clone().expect("活动查询项");
+    if let Some(tab) = model.tabs.iter_mut().find(|tab| tab.id == active) {
+        tab.draft = "select 1".into();
+    }
+    let tabs = model.tabs.len();
+    let _ = model.dispatch(&format!("nav-insert-select:{orders_id}"));
+    let tab = model.active_tab().cloned().expect("查询项");
+    assert!(tab.draft.starts_with("select 1"), "{}", tab.draft);
+    assert!(tab.draft.contains("FROM \"public\".\"orders\""));
+    assert_eq!(model.tabs.len(), tabs, "插入不新建工作项");
+    assert_eq!(model.executions, 0, "插入不执行");
+}
+
+#[test]
+fn stale_objects_refuse_actions_and_keep_the_selectable_row_message() {
+    use crate::catalog::model::ObjectRow;
+    let orders = ObjectRow::table("orders", Some(1));
+    let pg = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", vec![orders.clone()])]);
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.apply_navigation(&[pg], false);
+    let orders_id = nav_id("pg", "shop", "public", &orders);
+    let tabs = model.tabs.len();
+    // 目录刷新两次后对象被移除；动作要说明目标已不在目录里。
+    let empty = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", Vec::new())]);
+    model.apply_navigation(std::slice::from_ref(&empty), false);
+    model.apply_navigation(&[empty], false);
+    assert!(model.nav_node(&orders_id).is_none());
+    let _ = model.dispatch(&format!("nav-open-data:{orders_id}"));
+    assert_eq!(model.tabs.len(), tabs);
+    assert_eq!(model.notice_key, Some("catalog.tree.staleObject"));
+}
+
+#[test]
+fn object_search_uses_complete_path_and_clearing_restores_the_tree() {
+    use crate::catalog::model::ObjectRow;
+    let orders = ObjectRow::table("orders", Some(1));
+    let people = ObjectRow::table("people", Some(1));
+    let pg = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", vec![orders, people])]);
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.apply_navigation(&[pg], false);
+    let conn = crate::catalog::hierarchy::connection_node_id("pg");
+    let _ = model.dispatch(&format!("nav-toggle:{conn}"));
+    let before = model.nav_rows().len();
+    assert!(before > 1, "展开后有子行");
+
+    model.set_field(DraftField::ObjectFilter, "ord".into());
+    let hits = model.nav_rows();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].label.contains("shop") && hits[0].label.contains("public"), "完整路径：{}", hits[0].label);
+    assert!(hits[0].highlight.is_some(), "命中要高亮");
+    assert_eq!(model.nav_empty_key("pg"), Some("ui.explorer.noMatch"));
+
+    model.set_field(DraftField::ObjectFilter, String::new());
+    assert_eq!(model.nav_rows().len(), before, "清除搜索后目录恢复");
+    assert_eq!(model.nav_rows()[0].kind, crate::catalog::hierarchy::NavKind::Connection);
+    assert_eq!(model.nav_rows()[1].kind, crate::catalog::hierarchy::NavKind::Database);
+}
+
+#[test]
+fn keyboard_navigation_expands_moves_and_collapses_without_running_sql() {
+    use crate::catalog::model::ObjectRow;
+    let orders = ObjectRow::table("orders", Some(1));
+    let pg = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", vec![orders])]);
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.apply_navigation(&[pg], false);
+    model.nav.focus_first();
+    let connection_id = crate::catalog::hierarchy::connection_node_id("pg");
+    assert_eq!(model.nav.focus(), Some(connection_id.as_str()));
+    assert_eq!(model.nav_key(NavKey::ArrowUp), None);
+    assert_eq!(model.nav.focus(), Some(connection_id.as_str()));
+    // 右方向键展开连接，露出下一层且不执行 SQL。
+    assert!(model.nav_step(true).is_none());
+    assert!(model.nav_rows().len() > 1);
+    assert_eq!(model.nav_key(NavKey::ArrowDown), None);
+    assert_eq!(
+        model.nav.focus(),
+        Some(crate::catalog::hierarchy::database_node_id("pg", "shop").as_str())
+    );
+    // 左方向键在已展开连接上折叠。
+    model.nav.set_focus(&connection_id);
+    assert!(model.nav_step(false).is_none());
+    assert_eq!(model.nav_rows().len(), 1);
+    assert_eq!(model.executions, 0);
+}
+
+#[test]
+fn diagram_and_specialized_engines_use_their_own_scope() {
+    use crate::catalog::model::{ObjectKind, ObjectRow};
+    let users = ObjectRow::fresh("users", ObjectKind::Table);
+    let mut mongo = crate::catalog::NavConnection::new("docs", "文档", Engine::Mongodb, crate::catalog::model::ConnStatus::Connected);
+    mongo.databases = vec![crate::catalog::model::DatabaseNode {
+        name: "app".to_owned(),
+        schemas: vec![crate::catalog::model::SchemaNode {
+            name: String::new(),
+            objects: vec![users.clone()],
+            total: 1,
+            error: None,
+            kind_reports: Vec::new(),
+        }],
+        error: None,
+    }];
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.apply_navigation(&[mongo], false);
+    let conn = crate::catalog::hierarchy::connection_node_id("docs");
+    let db = crate::catalog::hierarchy::database_node_id("docs", "app");
+    let _ = model.dispatch(&format!("nav-toggle:{conn}"));
+    let _ = model.dispatch(&format!("nav-toggle:{db}"));
+    let collection = crate::catalog::hierarchy::object_node_id("docs", "app", "", &users);
+    let _ = model.dispatch(&format!("nav-focus:{collection}"));
+    let command = model.nav_activate_command(&collection).expect("文档入口");
+    let _ = model.dispatch(&command);
+    let tab = model.active_tab().expect("MongoDB 工作项");
+    assert_eq!(tab.kind, WorkItemKind::Mongo);
+    assert_eq!(tab.spec.as_deref(), Some("docs|文档|app|users"));
+    assert_eq!(model.executions, 0);
+}
+
+/// 目录树必须从真实会话读出层级，并在展开表时按需读到列和索引。
+#[gpui_kit::test]
+fn explorer_tree_reads_real_levels_and_loads_columns_on_demand(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-nav-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("items.sqlite");
+    let config_dir = dir.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async move {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("CREATE INDEX item_label ON item (label)").execute(&pool).await.unwrap();
+            pool.close().await;
+            let services = Arc::new(AppServices::new(Arc::new(Service::new_for_test(config_dir.join("connections.sqlite")))));
+            services.connections.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+            let _ = tx.send(services);
+        });
+    });
+    let services = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite setup");
+    let (window, view) = open_workbench(cx, services, false);
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform("refresh-tree", cx));
+    })
+    .unwrap();
+
+    let object_id = wait_for_nav_object(cx, window, &view, "item");
+    assert!(!object_id.is_empty(), "目录树没有读到表节点");
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| view.perform(&format!("nav-toggle:{object_id}"), cx));
+    })
+    .unwrap();
+    assert!(wait_for_nav_columns(cx, window, &view, &object_id), "展开表后没有读到列");
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            use crate::catalog::hierarchy::NavKind;
+            let columns: Vec<String> = view
+                .model
+                .nav
+                .nodes()
+                .filter(|node| node.kind == NavKind::Column)
+                .map(|node| node.name.clone())
+                .collect();
+            assert_eq!(columns, vec!["id", "label"], "{columns:?}");
+            let groups: Vec<NavKind> = view
+                .model
+                .nav
+                .nodes()
+                .filter(|node| matches!(node.kind, NavKind::ColumnGroup | NavKind::IndexGroup))
+                .map(|node| node.kind)
+                .collect();
+            assert!(groups.contains(&NavKind::ColumnGroup) && groups.contains(&NavKind::IndexGroup), "{groups:?}");
+            // 表展开后列/索引分组出现在树上，再展开才列出列。
+            let column_group = crate::catalog::hierarchy::column_group_id(&object_id);
+            // 展开对象会连祖先一起展开，列分组才可见。
+            view.model.nav.expand(&object_id);
+            view.perform(&format!("nav-toggle:{column_group}"), cx);
+            assert!(view
+                .model
+                .nav_rows()
+                .iter()
+                .any(|row| row.kind == NavKind::Column && row.name == "label"));
+            // 插入列名只改草稿，不执行 SQL。
+            let column_id = view
+                .model
+                .nav_rows()
+                .into_iter()
+                .find(|row| row.kind == crate::catalog::hierarchy::NavKind::Column && row.name == "label")
+                .map(|row| row.id)
+                .expect("label 列");
+            view.perform(&format!("nav-insert-column:{object_id}\u{1}label"), cx);
+            let _ = column_id;
+            let tab = view.model.active_tab().cloned().expect("查询草稿");
+            assert!(tab.draft.contains("label"), "{}", tab.draft);
+            assert!(!view.query_executed(cx), "插入不执行");
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn wait_for_nav_object(
+    cx: &mut gpui_kit::TestAppContext,
+    window: gpui_kit::AnyWindowHandle,
+    view: &gpui_kit::Entity<super::view::Workbench>,
+    name: &str,
+) -> String {
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(30) {
+        cx.run_until_parked();
+        let _ = cx.update_window(window, |_, window, cx| window.render_frame(cx));
+        let found = cx.update(|cx| {
+            view.read(cx)
+                .model
+                .nav
+                .nodes()
+                .find(|node| node.kind == crate::catalog::hierarchy::NavKind::Object && node.name == name)
+                .map(|node| node.id.clone())
+        });
+        if let Some(id) = found {
+            let _ = cx.update_window(window, |_, _, cx| {
+                view.update(cx, |view, cx| {
+                    let connection = crate::catalog::hierarchy::connection_node_id("notes");
+                    view.perform(&format!("nav-toggle:{connection}"), cx);
+                });
+            });
+            return id;
+        }
+        std::thread::park_timeout(std::time::Duration::from_millis(25));
+    }
+    String::new()
+}
+
+fn wait_for_nav_columns(
+    cx: &mut gpui_kit::TestAppContext,
+    window: gpui_kit::AnyWindowHandle,
+    view: &gpui_kit::Entity<super::view::Workbench>,
+    object_id: &str,
+) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(30) {
+        cx.run_until_parked();
+        let _ = cx.update_window(window, |_, window, cx| window.render_frame(cx));
+        let ready = cx.update(|cx| {
+            view.read(cx)
+                .model
+                .nav
+                .node(object_id)
+                .map(|node| !node.children.is_empty() && !node.loading)
+                .unwrap_or(false)
+        });
+        if ready {
+            return true;
+        }
+        std::thread::park_timeout(std::time::Duration::from_millis(25));
+    }
+    false
+}
+
+#[test]
+fn continuation_and_retry_resolve_to_the_storage_scope() {
+    use crate::app::shell::nav::NavRequest;
+    use crate::catalog::model::{DatabaseNode, ObjectRow, SchemaNode};
+    let objects = vec![ObjectRow::table("a", Some(1))];
+    let pg = nav_connection(
+        Engine::Postgres,
+        "pg",
+        "销售库",
+        vec![DatabaseNode {
+            name: "shop".to_owned(),
+            schemas: vec![SchemaNode {
+                name: "public".to_owned(),
+                total: 3,
+                objects,
+                error: None,
+                kind_reports: Vec::new(),
+            }],
+            error: None,
+        }],
+    );
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.apply_navigation(&[pg], false);
+    let group = crate::catalog::hierarchy::group_node_id("pg", "shop", "public", crate::catalog::model::ObjectKind::Table);
+    let schema = crate::catalog::hierarchy::schema_node_id("pg", "shop", "public");
+    // 分组上的“读取更多”按所属模式续读，偏移量才和整页一致。
+    let _ = model.dispatch(&format!("nav-more:{group}"));
+    assert_eq!(model.take_nav_request(), Some(NavRequest::More(schema.clone())));
+    // 分组读取失败时重试也只作用于那一段。
+    let _ = model.dispatch(&format!("nav-retry:{group}"));
+    assert_eq!(model.take_nav_request(), Some(NavRequest::More(schema)));
+}

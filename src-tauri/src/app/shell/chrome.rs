@@ -14,11 +14,14 @@ use gpui_kit::{
 
 use crate::app::views::connections::{engines, LinkStatus};
 use crate::app::views::history::HistorySection;
-use crate::app::{AppPage, ThemePreference};
+use crate::app::{AppPage, FocusTarget, ThemePreference};
+use crate::catalog::hierarchy::{NavKind, NavRow};
+use crate::catalog::model::ObjectKind;
 use crate::connections::model::{CaMode, Engine, SshAuthKind, TlsMode};
 use crate::i18n;
 use crate::ui::kit::{self, FieldSpec, Palette, Tip as _};
 
+use super::menus::{MenuPlace, MenuTarget};
 use super::model::{DraftField, WorkItemKind, WorkTool};
 use super::view::Workbench;
 
@@ -185,6 +188,31 @@ impl Workbench {
             cx.notify();
             return;
         }
+        // 侧栏有焦点时方向键属于对象树：上下移动、左右展开/折叠、回车打开。
+        if self.model.menu.is_none()
+            && self.model.close_prompt.is_none()
+            && !self.model.shell.palette_open
+            && self.model.shell.focus == FocusTarget::Sidebar
+            && self.model.shell.sidebar_open
+        {
+            {
+                let command = match key {
+                    "up" => self.model.nav_key(super::menus::NavKey::ArrowUp),
+                    "down" => self.model.nav_key(super::menus::NavKey::ArrowDown),
+                    "home" => self.model.nav_key(super::menus::NavKey::Home),
+                    "end" => self.model.nav_key(super::menus::NavKey::End),
+                    "right" => self.model.nav_step(true),
+                    "left" => self.model.nav_step(false),
+                    "enter" => self.model.nav_key(super::menus::NavKey::Enter),
+                    _ => None,
+                };
+                if let Some(command) = command {
+                    self.perform(&command, cx);
+                }
+                cx.notify();
+                return;
+            }
+        }
         let Some(nav) = super::view::nav_key(key) else { return };
         if self.model.menu.is_none() && self.model.close_prompt.is_none() && !self.model.shell.palette_open {
             return;
@@ -347,7 +375,16 @@ impl Workbench {
         let filter = self.input_for(DraftField::ObjectFilter, &self.model.text("ui.explorer.filterObjects"), false, window, cx);
         // 对象索引来自模型里的同一份快照；连接列表保持完整，连接筛选只属于连接页。
         let rows: Vec<_> = self.model.connections.rows.clone();
-        let mut list = div().id("explorer-list").flex().flex_col().flex_1().min_h(px(0.)).overflow_y_scroll().px(px(6.)).pb(px(8.));
+        let mut list = div()
+            .id("explorer-list")
+            .track_focus(&self.nav_focus)
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .px(px(6.))
+            .pb(px(8.));
         if rows.is_empty() {
             list = list.child(
                 kit::empty_state(IconName::Database, self.t("ui.explorer.empty"), self.t("ui.explorer.emptyHint"), &p)
@@ -388,57 +425,38 @@ impl Workbench {
                     )),
             );
         }
-        for row in rows {
-            let id = row.saved.id.clone();
-            let status = self.model.connections.status.get(&id).copied().unwrap_or(LinkStatus::Disconnected);
-            let expanded = self.expanded.contains(&id) && status == LinkStatus::Connected;
-            let selected = self.model.connections.selected.as_deref() == Some(id.as_str());
-            list = list.child(self.connection_row(&row, status, expanded, selected, &p, cx));
-            if !expanded {
-                continue;
+        if self.model.nav_searching() {
+            // 搜索用同一份树索引，行显示完整路径并高亮命中；清除后目录原样回来。
+            let hits = self.model.nav_rows();
+            if hits.is_empty() {
+                if let Some(key) = self.model.nav_empty_key("") {
+                    list = list.child(div().pl(px(30.)).py(px(6.)).text_size(px(12.)).text_color(p.text_faint).child(self.t(key)));
+                }
             }
-            match row.saved.engine {
-                Engine::Redis | Engine::Mongodb => {}
-                _ => {
-                    let groups = self.model.object_groups(&id);
-                    if groups.is_empty() {
-                        // 空目录与筛选无命中各有文案；读取失败由上方提示条负责。
-                        if let Some(key) = self.model.object_notice(&id) {
-                            if key != "ui.explorer.error" {
-                                list = list.child(div().pl(px(42.)).py(px(4.)).text_size(px(12.)).text_color(p.text_faint).child(self.t(key)));
-                            }
+            for row in hits {
+                list = list.child(self.nav_row(&row, true, &p, cx));
+            }
+        } else {
+            for row in rows {
+                let id = row.saved.id.clone();
+                let status = self.model.connections.status.get(&id).copied().unwrap_or(LinkStatus::Disconnected);
+                let expanded = self.expanded.contains(&id) && status == LinkStatus::Connected;
+                let selected = self.model.connections.selected.as_deref() == Some(id.as_str());
+                list = list.child(self.connection_row(&row, status, expanded, selected, &p, cx));
+                if !expanded {
+                    continue;
+                }
+                let nav_rows = self.model.nav_rows_for(&id);
+                if nav_rows.is_empty() {
+                    if let Some(key) = self.model.nav_empty_key(&id) {
+                        if key != "ui.explorer.error" {
+                            list = list.child(div().pl(px(42.)).py(px(4.)).text_size(px(12.)).text_color(p.text_faint).child(self.t(key)));
                         }
                     }
-                    let environment = row.saved.env.clone();
-                    // 同一库下的多个模式只打印一次库名。
-                    let mut databases = std::collections::BTreeSet::new();
-                    for group in groups {
-                        // 数据库 / 模式按已读取的元数据分层；空段不制造标题。
-                        if !group.database.is_empty() && databases.insert(group.database.clone()) {
-                            list = list.child(
-                                div()
-                                    .pl(px(30.))
-                                    .pt(px(6.))
-                                    .pb(px(2.))
-                                    .text_size(px(11.))
-                                    .text_color(p.text_muted)
-                                    .child(SharedString::from(group.database.clone())),
-                            );
-                        }
-                        if !group.schema.is_empty() {
-                            list = list.child(
-                                div()
-                                    .pl(px(38.))
-                                    .pb(px(2.))
-                                    .text_size(px(11.))
-                                    .text_color(p.text_faint)
-                                    .child(SharedString::from(group.schema.clone())),
-                            );
-                        }
-                        for object in &group.objects {
-                            list = list.child(self.object_row(object, &environment, &p, cx));
-                        }
-                    }
+                    continue;
+                }
+                for nav_row in nav_rows {
+                    list = list.child(self.nav_row(&nav_row, false, &p, cx));
                 }
             }
         }
@@ -544,9 +562,12 @@ impl Workbench {
         let status = self.model.connections.status.get(id).copied().unwrap_or(LinkStatus::Disconnected);
         match status {
             LinkStatus::Connected => {
-                if let Some((command, _, _)) = self.model.connections.rows.iter().find(|row| row.saved.id == id).and_then(browser_command) {
-                    self.perform(&command, cx);
-                    return;
+                // 单击展开层级（Redis 键空间 / MongoDB 库与集合也在树上）；双击才直接打开浏览器。
+                if double {
+                    if let Some((command, _, _)) = self.model.connections.rows.iter().find(|row| row.saved.id == id).and_then(browser_command) {
+                        self.perform(&command, cx);
+                        return;
+                    }
                 }
                 if double || !self.expanded.remove(id) {
                     self.expanded.insert(id.to_owned());
@@ -565,62 +586,123 @@ impl Workbench {
         }
     }
 
-    fn object_row(&self, object: &crate::query::assist::TreeObject, environment: &str, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+    /// 树的一行：真实层级、展开状态、局部错误/续读、搜索高亮和绑定到这一行的动作。
+    fn nav_row(&self, row: &NavRow, flat: bool, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let m = self.metrics();
-        let spec = crate::app::views::query::object_spec(object, environment);
-        // 行身份也用完整目标：同名对象在不同连接或不同库里必须是不同的节点。
-        let key = spec.clone();
-        let selected = self.model.object_spec.as_deref() == Some(spec.as_str());
-        let view = object.kind.contains("view");
-        let icon = if view { IconName::Eye } else { IconName::Table };
-        let name = if object.schema.is_empty() || object.schema == "dbo" || object.schema == "public" {
-            object.name.clone()
+        let id = row.id.clone();
+        let label = if let Some(key) = row.label_key {
+            self.t(key)
         } else {
-            format!("{}.{}", object.schema, object.name)
+            SharedString::from(row.label.clone())
         };
-        let label = SharedString::from(name);
-        let click_spec = spec.clone();
-        let menu_spec = spec.clone();
-        // “在这里新建查询”带着完整目标，查询页不再靠 连接:对象名 反查。
-        let query_id = format!("object:{spec}");
-        let structure_id = format!("open-structure-for:{spec}");
+        let depth = if flat { 0 } else { row.depth };
+        let indent = 18. + depth as f32 * 12.;
+        let icon = nav_icon(row.kind, row.object_kind);
+        let chevron = if row.expandable {
+            if row.expanded { IconName::ChevronDown } else { IconName::ChevronRight }
+        } else {
+            IconName::Dot
+        };
+        let tooltip = if row.path.is_empty() {
+            label.clone()
+        } else {
+            SharedString::from(format!("{} / {}", row.path, row.name))
+        };
+        let is_group = matches!(row.kind, NavKind::Group | NavKind::ColumnGroup | NavKind::IndexGroup);
+        let body = match row.highlight {
+            Some((start, end)) if end > start && end <= label.len() => highlight_label(&label, start, end, p),
+            _ => div().flex_1().min_w(px(0.)).truncate().text_size(px(12.5)).child(label.clone()).into_any_element(),
+        };
+        let click_id = id.clone();
+        let menu_id = id.clone();
+        let focus_id = id.clone();
+        let menu_kind = row.kind;
+        let has_error = row.error.is_some();
         div()
-            .id(SharedString::from(format!("obj-{key}")))
-            .group("obj-row")
+            .id(SharedString::from(format!("nav-{id}")))
             .role(gpui_kit::Role::TreeItem)
             .aria_label(label.clone())
-            .aria_selected(selected)
-            .tooltip_text(label.clone())
+            .aria_selected(row.focused)
+            .aria_expanded(row.expanded)
+            .tooltip_text(tooltip)
             .h(px(m.tree_row_h))
-            .pl(px(30.))
+            .pl(px(indent))
             .pr(px(4.))
             .flex()
             .items_center()
-            .gap(px(6.))
+            .gap(px(5.))
             .rounded(px(6.))
             .cursor_pointer()
-            .when(selected, |this| this.bg(p.selection))
-            .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
-            .child(kit::icon(icon, 13., if view { p.info } else { p.text_muted }))
-            .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(12.5)).child(label))
-            .child(
-                div()
-                    .flex()
-                    .gap(px(1.))
-                    .invisible()
-                    .group_hover("obj-row", |style| style.visible())
-                    .child(kit::icon_button(SharedString::from(format!("obj-q-{key}")), IconName::SquareTerminal, self.t("catalog.tree.newQueryHere"), act(query_id, cx)).xsmall())
-                    .child(kit::icon_button(SharedString::from(format!("obj-s-{key}")), IconName::Columns3, self.t("catalog.tree.viewStructure"), act(structure_id, cx)).xsmall()),
-            )
+            .when(row.focused, |this| this.bg(p.selection))
+            .when(!row.focused, |this| this.hover(|style| style.bg(p.hover)))
+            .child(kit::icon(chevron, 12., p.text_faint))
+            .child(kit::icon(icon, 13., nav_tint(row.kind, p)))
+            .child(body)
+            .when(is_group && row.total > 0, |this| {
+                this.child(div().text_size(px(11.)).text_color(p.text_faint).child(SharedString::from(row.total.to_string())))
+            })
+            .when(row.stale, |this| {
+                this.child(div().text_size(px(11.)).text_color(p.warn).child(self.t("catalog.tree.stale")))
+            })
+            .when(row.loading, |this| this.child(Spinner::new().xsmall().color(p.text_muted)))
+            .when_some(row.error.clone(), |this, error| {
+                let full = format!("{}: {error}", self.t("catalog.tree.nodeError"));
+                this.child(
+                    div()
+                        .id(SharedString::from(format!("nav-err-{id}")))
+                        .tooltip_text(SharedString::from(full.clone()))
+                        .truncate()
+                        .max_w(px(120.))
+                        .text_size(px(11.))
+                        .text_color(p.danger)
+                        .child(SharedString::from(full)),
+                )
+            })
+            .when(has_error, |this| {
+                this.child(
+                    kit::icon_button(
+                        SharedString::from(format!("nav-retry-{focus_id}")),
+                        IconName::RefreshCw,
+                        self.t("common.retry"),
+                        act(format!("nav-retry:{focus_id}"), cx),
+                    )
+                    .xsmall(),
+                )
+            })
+            .when(row.has_more, |this| {
+                this.child(
+                    kit::icon_button(
+                        SharedString::from(format!("nav-more-{focus_id}")),
+                        IconName::ChevronsDown,
+                        self.t("catalog.tree.loadMore"),
+                        act(format!("nav-more:{focus_id}"), cx),
+                    )
+                    .xsmall(),
+                )
+            })
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                 this.menu_at = event.position;
-                this.model.object_spec = Some(menu_spec.clone());
-                this.perform("menu-object-item", cx);
+                this.model.shell.focus = FocusTarget::Sidebar;
+                this.perform(&format!("nav-focus:{menu_id}"), cx);
+                let target = match menu_kind {
+                    NavKind::Column | NavKind::Index => MenuTarget::Column,
+                    NavKind::Object => match this.model.nav_node(&menu_id).and_then(|node| node.object()) {
+                        Some(object) if object.opens_data() => MenuTarget::Object,
+                        _ => MenuTarget::NonDataObject,
+                    },
+                    _ => MenuTarget::Object,
+                };
+                this.model.open_menu(MenuPlace::ObjectTree, target);
+                cx.notify();
             }))
-            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                this.model.object_spec = Some(click_spec.clone());
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                this.model.shell.focus = FocusTarget::Sidebar;
+                window.focus(&this.nav_focus, cx);
+                this.perform(&format!("nav-focus:{click_id}"), cx);
                 if event.click_count() >= 2 {
-                    this.perform(&format!("open-table:{click_spec}"), cx);
+                    if let Some(command) = this.model.nav_activate_command(&click_id) {
+                        this.perform(&command, cx);
+                    }
                 }
                 cx.notify();
             }))
@@ -2546,6 +2628,57 @@ impl Workbench {
 }
 
 // ---------------------------------------------------------------- 小部件
+
+/// 搜索命中的一段：前缀与后缀保持普通文本，中间用当前主题的选中底色强调。
+fn highlight_label(label: &SharedString, start: usize, end: usize, p: &Palette) -> AnyElement {
+    let text = label.as_ref();
+    let head = if start > 0 { SharedString::from(text[..start].to_owned()) } else { SharedString::from("") };
+    let hit = SharedString::from(text[start..end].to_owned());
+    let tail = if end < text.len() { SharedString::from(text[end..].to_owned()) } else { SharedString::from("") };
+    div()
+        .flex_1()
+        .min_w(px(0.))
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .text_size(px(12.5))
+        .child(head)
+        .child(div().bg(p.selection).rounded(px(2.)).font_weight(FontWeight::MEDIUM).child(hit))
+        .child(tail)
+        .into_any_element()
+}
+
+fn nav_icon(kind: NavKind, object: Option<ObjectKind>) -> IconName {
+    match kind {
+        NavKind::Connection | NavKind::Database => IconName::Database,
+        NavKind::Schema => IconName::FolderOpen,
+        NavKind::Keyspace => IconName::Key,
+        NavKind::Group => IconName::Layers,
+        NavKind::ColumnGroup => IconName::Columns3,
+        NavKind::Column => IconName::Dot,
+        NavKind::IndexGroup | NavKind::Index => IconName::Key,
+        NavKind::Object => match object.unwrap_or(ObjectKind::Table) {
+            ObjectKind::Table => IconName::Table,
+            ObjectKind::View => IconName::Eye,
+            ObjectKind::Function | ObjectKind::Procedure => IconName::Code,
+            ObjectKind::Trigger => IconName::Zap,
+            ObjectKind::Sequence => IconName::ListOrdered,
+            ObjectKind::Enum => IconName::ListFilter,
+            ObjectKind::Domain => IconName::Hash,
+            ObjectKind::Extension => IconName::Plug,
+            ObjectKind::Event => IconName::Clock,
+        },
+    }
+}
+
+fn nav_tint(kind: NavKind, p: &Palette) -> gpui_kit::Hsla {
+    match kind {
+        NavKind::Object => p.text_muted,
+        NavKind::Column | NavKind::ColumnGroup | NavKind::Index | NavKind::IndexGroup => p.text_faint,
+        NavKind::Group => p.text_muted,
+        _ => p.text_faint,
+    }
+}
 
 fn brand_mark(size: f32, p: &Palette) -> AnyElement {
     div()
