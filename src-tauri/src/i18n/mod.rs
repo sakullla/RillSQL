@@ -310,6 +310,9 @@ dict! {
     "grid.action.sortDesc" => "降序", "Descending";
     "grid.find.loaded" => "查找已读取行", "Find in loaded rows";
     "grid.find.server" => "整表筛选", "Filter whole table";
+    "grid.find.scopeQueryOnly" => "查询结果只能在已读取行内查找，网格不会重新执行语句。", "Query results can only be searched in the loaded rows; the grid will not re-run the statement.";
+    "grid.find.scopeNoTable" => "没有可重新读取的表，整表筛选不可用；查找只作用于已读取行。", "There is no table to re-read, so whole-table filtering is unavailable; find only covers loaded rows.";
+    "grid.filter.unapplied" => "未应用", "Not applied";
     "grid.filter.title" => "筛选条件", "Filters";
     "grid.filter.add" => "添加条件", "Add filter";
     "grid.filter.apply" => "应用条件", "Apply filters";
@@ -336,6 +339,10 @@ dict! {
     "grid.op.empty" => "空字符串", "is empty string";
     "grid.state.noMatch" => "没有符合条件的行", "No rows match";
     "grid.state.tableEmpty" => "表里没有行", "The table has no rows";
+    "grid.state.resultEmpty" => "查询没有返回行", "The query returned no rows";
+    "grid.state.sorted" => "排序：{column} {arrow}", "Sorted: {column} {arrow}";
+    "grid.state.noMorePages" => "已经读到末尾，没有下一页", "Already at the end; there is no next page";
+    "grid.state.firstPage" => "已经是第一页", "Already on the first page";
     "grid.state.loading" => "正在读取…", "Loading…";
     "grid.state.more" => "还有更多未读取", "More rows available";
     "grid.state.complete" => "已读到末尾", "All rows loaded";
@@ -692,6 +699,7 @@ dict! {
     "ui.grid.searchPlaceholder" => "在已读取的行里查找", "Find in loaded rows";
     "ui.grid.refresh" => "刷新", "Refresh";
     "ui.grid.empty" => "没有数据", "No rows";
+    "ui.grid.emptyResult" => "查询没有返回行", "The query returned no rows";
     "ui.grid.pending" => "有未提交的修改", "Unsaved changes";
     "ui.exchange.source" => "当前表", "Current table";
     "ui.exchange.noTable" => "先在资源管理器里打开一张表，再导入或导出。", "Open a table from the explorer first.";

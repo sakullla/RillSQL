@@ -19,7 +19,7 @@ use gpui_kit::{
 
 use crate::ui::kit::{self, Palette, Tip as _};
 
-use crate::app::views::grid::{GridPane, GridTarget};
+use crate::app::views::grid::{GridPane, GridTarget, QuerySheet};
 use crate::app::model::ObjectTarget;
 use crate::application::AppServices;
 use crate::i18n::{self, Locale};
@@ -1013,10 +1013,14 @@ impl QueryPane {
         let target = self.grid_target();
         let sql = sheet.sql.clone();
         let engine = target.engine.clone();
+        // 截断与完整行数原样交给网格：被截断的结果不能被说成"已到末尾"。
+        let truncated = sheet.truncated;
+        let full_count = if truncated { None } else { Some(rows.len() as i64) };
+        let sheet = QuerySheet { sql, columns, rows, truncated, full_count };
         self.grid.update(cx, |grid, cx| {
             let mut target = target;
             target.engine = engine;
-            grid.show_query(target, &sql, columns, rows, cx);
+            grid.show_query(target, sheet, cx);
         });
     }
 

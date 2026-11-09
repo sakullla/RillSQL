@@ -97,6 +97,18 @@ impl Default for GridTarget {
     }
 }
 
+/// 查询页交给网格的结果集：截断与完整行数随结果一起给，网格不能自己猜。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuerySheet {
+    pub sql: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+    /// 语句的读取上限命中了，结果还有没读到的行；网格不会重新执行语句来延续。
+    pub truncated: bool,
+    /// 完整行数：结果未被截断时就是本次返回的行数，被截断时未知。
+    pub full_count: Option<i64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GridMode {
     Table,
@@ -118,11 +130,13 @@ pub enum FindScope {
     Server,
 }
 
-/// 空网格的两种原因：表本来没有行，还是当前条件没有命中。
+/// 空网格的原因：表本来没有行、结果集本来没有行，还是当前条件没有命中。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SheetEmptiness {
     Rows,
     TableEmpty,
+    /// 查询结果的空结果集：语句成功但没有返回行，与"表为空"不是一回事。
+    ResultEmpty,
     NoMatch,
 }
 
@@ -299,7 +313,9 @@ impl SharedGrid {
         self.recompute();
     }
 
-    pub fn show_query_sheet(&mut self, sql: &str, columns: Vec<String>, rows: Vec<Vec<Option<String>>>) -> u64 {
+    /// 查询结果进入网格：截断与完整行数由查询页给出，网格据此区分"已读到末尾"
+    /// 和"这个结果不能由网格继续"，不再把两者都写成完成。
+    pub fn show_query_sheet(&mut self, sql: &str, columns: Vec<String>, rows: Vec<Vec<Option<String>>>, truncated: bool, full_count: Option<i64>) -> u64 {
         self.mode = GridMode::Query;
         self.sql = sql.to_owned();
         self.token = self.token.saturating_add(1);
@@ -333,8 +349,9 @@ impl SharedGrid {
                 inserted: false,
             })
             .collect();
-        self.full_count = None;
-        self.truncated = false;
+        self.full_count = full_count;
+        self.truncated = truncated;
+        self.offset = 0;
         self.scope = RangeScope::Fetched;
         self.overlays.clear();
         self.retained.clear();
@@ -556,13 +573,32 @@ impl SharedGrid {
         self.recompute();
     }
 
+    /// 服务器范围筛选要求这个网格能重新读取某张表才能成立。
+    /// 查询结果已由语句返回、没有目标表，都不该给出一个点了却不发请求的开关。
+    pub fn find_scope_block(&self) -> Option<&'static str> {
+        if self.mode == GridMode::Query {
+            return Some("grid.find.scopeQueryOnly");
+        }
+        if self.target.connection_id.is_empty() || self.target.table.is_empty() {
+            return Some("grid.find.scopeNoTable");
+        }
+        None
+    }
+
     /// 切到服务器范围表示"在整表里筛选"，调用方需要重新读取；切回来同样重读。
-    pub fn set_find_scope(&mut self, scope: FindScope) {
+    /// 不可用时返回原因，范围保持原样，关键字仍只在已读取行里生效。
+    pub fn set_find_scope(&mut self, scope: FindScope) -> Result<(), &'static str> {
         if self.find_scope == scope {
-            return;
+            return Ok(());
+        }
+        if scope == FindScope::Server {
+            if let Some(reason) = self.find_scope_block() {
+                return Err(reason);
+            }
         }
         self.find_scope = scope;
         self.recompute();
+        Ok(())
     }
 
     /// 只有服务器范围的非空关键字才作为整表条件下发。
@@ -810,6 +846,24 @@ impl SharedGrid {
         self.sort.as_ref().map(|(column, descending)| (column.as_str(), *descending))
     }
 
+    /// 还有正在编辑、尚未应用的筛选条件：界面据此标出"未应用"，避免把旧结果当成新条件的结果。
+    pub fn unapplied_filters(&self) -> bool {
+        self.filters.iter().any(|draft| draft.dirty)
+    }
+
+    /// 排序列在数据列里的下标；表头用它标出方向，和焦点无关。
+    pub fn sort_index(&self) -> Option<(usize, bool)> {
+        let (column, descending) = self.sort.as_ref()?;
+        self.columns.iter().position(|item| item.name == *column).map(|index| (index, *descending))
+    }
+
+    /// 当前排序列与方向的文字；没有排序时为空。它不依赖焦点，状态栏因此始终可读。
+    pub fn sort_text(&self) -> Option<String> {
+        let (column, descending) = self.sort.as_ref()?;
+        let arrow = if *descending { "↓" } else { "↑" };
+        Some(i18n::fill(&i18n::text(self.locale, "grid.state.sorted"), &[("column", column), ("arrow", arrow)]))
+    }
+
     /// 这一列当前的方向；没有排序时为 None。
     pub fn sort_for(&self, column: &str) -> Option<bool> {
         self.sort.as_ref().filter(|(name, _)| name == column).map(|(_, descending)| *descending)
@@ -842,14 +896,17 @@ impl SharedGrid {
         self.recompute();
     }
 
-    /// 空网格到底是表为空还是条件没命中。
+    /// 空网格到底是表为空、结果集为空还是条件没命中。
     pub fn emptiness(&self) -> SheetEmptiness {
         if !self.rows.is_empty() {
             return SheetEmptiness::Rows;
         }
         let narrowing = !self.search.trim().is_empty() || self.filters.iter().any(|draft| !draft.dirty);
         if narrowing {
-            SheetEmptiness::NoMatch
+            return SheetEmptiness::NoMatch;
+        }
+        if self.mode == GridMode::Query {
+            SheetEmptiness::ResultEmpty
         } else {
             SheetEmptiness::TableEmpty
         }
@@ -870,14 +927,19 @@ impl SharedGrid {
         }
     }
 
-    /// 状态栏一句话：读取失败、无匹配、表为空、加载中、还有更多、已到末尾各自可辨认。
+    /// 状态栏一句话：读取失败、无匹配、表/结果集为空、加载中、还有更多、已到末尾各自可辨认。
+    /// 加载优先于"空"：首屏、换表和替换读取还没回来时不能说表里没有行。
     pub fn state_text(&self, loading: bool) -> String {
         if let Some(failure) = &self.read_failure {
             return failure.clone();
         }
+        if loading && self.rows.is_empty() {
+            return i18n::text(self.locale, "grid.state.loading");
+        }
         match self.emptiness() {
             SheetEmptiness::NoMatch => return i18n::text(self.locale, "grid.state.noMatch"),
             SheetEmptiness::TableEmpty => return i18n::text(self.locale, "grid.state.tableEmpty"),
+            SheetEmptiness::ResultEmpty => return i18n::text(self.locale, "grid.state.resultEmpty"),
             SheetEmptiness::Rows => {}
         }
         match self.continuation(loading) {
@@ -914,6 +976,26 @@ impl SharedGrid {
     pub fn set_page(&mut self, offset: u64, limit: u64) {
         self.offset = offset;
         self.limit = limit.max(1);
+        self.clear_selection();
+        self.viewer = None;
+        self.scroll = 0;
+    }
+
+    /// 还能不能翻页。查询结果和没有目标表的对象都不能；读取失败后偏移仍停在上次成功的页上，
+    /// 所以重试还是同一页，不会跳过失败页，也不会因为旧页没有更多就报告"已读完"。
+    pub fn can_page(&self, forward: bool) -> bool {
+        if self.mode != GridMode::Table || self.target.connection_id.is_empty() || self.target.table.is_empty() {
+            return false;
+        }
+        if forward {
+            self.has_more_rows()
+        } else {
+            self.offset > 0
+        }
+    }
+
+    /// 新的一页真的读回来了才换窗口：旧页的选择和完整值查看不属于这一页。
+    pub fn reset_page_view(&mut self) {
         self.clear_selection();
         self.viewer = None;
         self.scroll = 0;
@@ -1489,6 +1571,12 @@ impl SharedGrid {
     /// 已读取的服务器行数；未提交的新增行不计入分页偏移。
     pub fn source_len(&self) -> usize {
         self.source.iter().filter(|row| !row.inserted).count()
+    }
+
+    /// 测试用：只改声明的完整行数，模拟服务器上还有没读到的行。
+    #[cfg(test)]
+    pub fn set_total_rows_for_test(&mut self, total: i64) {
+        self.full_count = Some(total);
     }
 
     pub fn has_more_rows(&self) -> bool {
@@ -2326,11 +2414,11 @@ mod tests {
         grid.target.connection_name = "笔记".into();
         grid.target.environment = "dev".into();
         grid.target.database = "main".into();
-        let stale = grid.show_query_sheet("select * from customers", vec!["id".into(), "name".into()], vec![vec![Some("1".into()), Some("甲".into())]]);
+        let stale = grid.show_query_sheet("select * from customers", vec!["id".into(), "name".into()], vec![vec![Some("1".into()), Some("甲".into())]], false, Some(1));
         assert!(!grid.writable());
-        grid.show_query_sheet("select count(*)", vec!["n".into()], vec![vec![Some("1".into())]]);
+        grid.show_query_sheet("select count(*)", vec!["n".into()], vec![vec![Some("1".into())]], false, Some(1));
         assert!(!grid.finish_locate(stale, schema()) || !grid.writable());
-        let current = grid.show_query_sheet("select id, name from customers", vec!["id".into(), "name".into()], vec![vec![Some("1".into()), Some("甲".into())]]);
+        let current = grid.show_query_sheet("select id, name from customers", vec!["id".into(), "name".into()], vec![vec![Some("1".into()), Some("甲".into())]], false, Some(1));
         assert!(grid.finish_locate(current, schema()));
         assert!(grid.writable());
         assert!(grid.banner().contains("笔记"), "{}", grid.banner());
@@ -2710,11 +2798,11 @@ mod tests {
         assert_eq!(empty.state_text(false), i18n::text(Locale::ZhCn, "grid.state.tableEmpty"));
         // 切到整表筛选：关键字随请求下发，本地不再重复筛同一段文本。
         grid.set_search("乙");
-        grid.set_find_scope(FindScope::Server);
+        assert!(grid.set_find_scope(FindScope::Server).is_ok());
         assert_eq!(grid.page_request().unwrap().search.as_deref(), Some("乙"));
         assert_eq!(grid.loaded_len(), 2, "服务器范围的行已经是服务器筛过的");
         // 切回来又变成本地查找。
-        grid.set_find_scope(FindScope::Loaded);
+        assert!(grid.set_find_scope(FindScope::Loaded).is_ok());
         assert_eq!(grid.page_request().unwrap().search, None);
         assert_eq!(grid.loaded_len(), 1);
     }
@@ -2845,7 +2933,7 @@ mod tests {
         // 查询结果不在这里延续：网格从不重新执行语句。
         let mut query = SharedGrid::new();
         query.target.engine = "sqlite".into();
-        query.show_query_sheet("select id from customers", vec!["id".into()], vec![vec![Some("1".into())]]);
+        query.show_query_sheet("select id from customers", vec!["id".into()], vec![vec![Some("1".into())]], false, Some(1));
         assert_eq!(query.continuation(false), Continuation::Complete);
         assert_eq!(query.append_page(vec![row("q9", vec![Some("9")], false)], None, true), 0);
         assert_eq!(query.loaded_len(), 1);
@@ -2995,7 +3083,7 @@ mod tests {
         let mut query = SharedGrid::new();
         query.target.engine = "sqlite".into();
         query.target.connection_id = "notes".into();
-        query.show_query_sheet("select * from customers join people", vec!["name".into()], vec![vec![Some("乙".into())]]);
+        query.show_query_sheet("select * from customers join people", vec!["name".into()], vec![vec![Some("乙".into())]], false, Some(1));
         // 语义变化：只读结果的写尝试被拒绝并说明原因，格子继续显示数据库里的原值。
         assert_eq!(query.stage_text(0, 0, Some("改".into())), Gate::Readonly);
         assert_eq!(query.cell_label(0, 0), "乙");
