@@ -100,6 +100,28 @@ pub struct QueryPane {
     null_copy: String,
 }
 
+/// 只有一条成功、只读且被读取上限截断的语句才允许“加载更多”。
+/// 重新执行会再跑一次语句，写语句不能因为翻页被偷偷重放。
+fn is_pageable(sheet: &desk::StatementView) -> bool {
+    sheet.status == "ok"
+        && !sheet.columns.is_empty()
+        && matches!(
+            crate::query::first_keyword(&sheet.sql).as_str(),
+            "SELECT" | "WITH" | "VALUES" | "TABLE"
+        )
+}
+
+fn load_more_plan(results: &[desk::StatementView], page_size: u64) -> Option<(String, u64)> {
+    if results.len() != 1 {
+        return None;
+    }
+    let sheet = &results[0];
+    if !sheet.truncated || !is_pageable(sheet) {
+        return None;
+    }
+    Some((sheet.sql.clone(), (sheet.rows.len() as u64).saturating_add(page_size.max(1))))
+}
+
 impl QueryPane {
     pub fn new(services: Arc<AppServices>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let grid = cx.new(|cx| GridPane::new(Arc::clone(&services), window, cx));
@@ -394,6 +416,7 @@ impl QueryPane {
             "run-current" => self.start(RunScope::Current, None, cx),
             "run-script" => self.start(RunScope::Script, None, cx),
             "request-cancel" => self.cancel(cx),
+            "query-load-more" => self.load_more(cx),
             "format" => self.format(cx),
             "autocomplete" => self.complete(cx),
             "explain" => self.explain(cx),
@@ -665,8 +688,30 @@ impl QueryPane {
             }
         })
         .detach();
-        self.desk.set_active_note(&i18n::text(self.locale, "query.status.running"));
+        // 运行态由结果标题的 spinner 表达；note 留给错误或提示，避免“正在执行”重复两遍。
+        self.desk.set_active_note("");
         cx.notify();
+    }
+
+    /// 结果被读取上限截断时，再执行一次同一条只读语句并放大窗口。
+    /// 写语句不会因为翻页被自动重放。
+    fn load_more(&mut self, cx: &mut Context<Self>) {
+        if !self.context_active {
+            self.desk.set_active_note(NOT_ACTIVE_QUERY);
+            cx.notify();
+            return;
+        }
+        let Some((sql, limit)) = load_more_plan(&self.desk.results(), self.page_size) else {
+            return;
+        };
+        match self.desk.begin_run_limited(&self.services.tasks, RunScope::Current, Some(sql), limit) {
+            BeginRun::Ready(prepared) => self.spawn_run(prepared, cx),
+            BeginRun::Variables(_) => {}
+            BeginRun::Rejected(reason) => {
+                self.desk.set_active_note(&reason);
+                cx.notify();
+            }
+        }
     }
 
     fn note_started(&mut self, tab_id: &str, run_id: &str, cx: &mut Context<Self>) {
@@ -1309,6 +1354,50 @@ impl Render for QueryPane {
         if let Some(summary) = summary {
             header = header.child(div().px(px(6.)).text_size(px(12.)).text_color(p.text_faint).child(SharedString::from(summary)));
         }
+        if !running && results.len() == 1 && is_pageable(&results[0]) {
+            match load_more_plan(&results, self.page_size) {
+                Some((_, limit)) => {
+                    let loaded = results[0].rows.len() as u64;
+                    let more = entity.clone();
+                    header = header.child(
+                        div()
+                            .id("query-load-more")
+                            .role(gpui_kit::Role::Button)
+                            .aria_label(SharedString::from(i18n::text(locale, "query.results.loadMore")))
+                            .h(px(24.))
+                            .px(px(8.))
+                            .rounded(px(6.))
+                            .text_size(px(12.))
+                            .text_color(p.accent)
+                            .bg(p.accent_soft)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(p.hover))
+                            .child(SharedString::from(format!(
+                                "{} +{}",
+                                i18n::text(locale, "query.results.loadMore"),
+                                limit.saturating_sub(loaded)
+                            )))
+                            .on_click(move |_, _, cx| {
+                                more.update(cx, |pane, cx| pane.load_more(cx));
+                            }),
+                    );
+                }
+                None => {
+                    // 结果没有被截断：明确告诉用户已经读完，而不是看起来没有分页入口。
+                    header = header.child(
+                        div()
+                            .id("query-load-more-done")
+                            .h(px(24.))
+                            .px(px(8.))
+                            .flex()
+                            .items_center()
+                            .text_size(px(12.))
+                            .text_color(p.text_muted)
+                            .child(SharedString::from(i18n::text(locale, "query.results.allLoaded"))),
+                    );
+                }
+            }
+        }
 
         let mut results_panel = div().id("query-results").flex().flex_col().size_full().bg(p.surface).child(header);
         if !variables.is_empty() {
@@ -1486,6 +1575,35 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 mod tests {
     use super::*;
     use gpui_kit::test::TestWindowExt;
+
+    fn sheet(sql: &str, truncated: bool, status: &str) -> desk::StatementView {
+        desk::StatementView {
+            sql: sql.to_owned(),
+            status: status.to_owned(),
+            message: String::new(),
+            columns: vec!["id".to_owned()],
+            rows: vec![vec![Some("1".to_owned())]],
+            truncated,
+            affected: None,
+        }
+    }
+
+    #[test]
+    fn load_more_only_offered_for_a_truncated_single_readonly_statement() {
+        assert_eq!(
+            load_more_plan(&[sheet("SELECT * FROM item", true, "ok")], 100),
+            Some(("SELECT * FROM item".to_owned(), 101)),
+            "被截断的 SELECT 可以继续读"
+        );
+        assert_eq!(load_more_plan(&[sheet("SELECT * FROM item", false, "ok")], 100), None, "没有截断就没有下一页");
+        assert_eq!(load_more_plan(&[sheet("DELETE FROM item", true, "ok")], 100), None, "写语句不能因为加载更多被重放");
+        assert_eq!(
+            load_more_plan(&[sheet("SELECT 1", true, "ok"), sheet("SELECT 2", true, "ok")], 100),
+            None,
+            "多语句结果不提供整批重放"
+        );
+        assert_eq!(load_more_plan(&[sheet("SELECT * FROM item", true, "error")], 100), None, "失败结果不提供加载更多");
+    }
     use gpui_kit::{Point, TestAppContext, WindowBounds, WindowOptions, px, size};
 
     fn open(cx: &mut TestAppContext) -> (gpui_kit::AnyWindowHandle, Entity<QueryPane>) {

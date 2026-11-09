@@ -314,6 +314,8 @@ dict! {
     "query.status.running" => "正在执行", "Running";
     "query.status.noObjects" => "没有对象", "No objects";
     "query.results.statement" => "结果", "Result";
+    "query.results.loadMore" => "加载更多", "Load more";
+    "query.results.allLoaded" => "已全部读取", "All rows loaded";
     "grid.range.loaded" => "已读取", "Loaded";
     "grid.range.subset" => "已读取子集", "Loaded subset";
     "grid.range.unknownFull" => "全量未知", "Full count unknown";

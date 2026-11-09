@@ -37,6 +37,8 @@ pub struct StatementView {
     pub message: String,
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
+    /// 结果因为读取上限被截断；查询结果据此提供“加载更多”。
+    pub truncated: bool,
     pub affected: Option<u64>,
 }
 
@@ -471,6 +473,7 @@ impl Desk {
                 message: String::new(),
                 columns,
                 rows,
+                truncated: false,
                 affected: None,
             }];
             tab.statement = 0;
@@ -776,6 +779,18 @@ impl Desk {
     }
 
     pub fn begin_run(&mut self, tasks: &TaskBoard, scope: RunScope, override_sql: Option<String>) -> BeginRun {
+        let limit = self.page_size.max(1);
+        self.begin_run_limited(tasks, scope, override_sql, limit)
+    }
+
+    /// 与 begin_run 相同，但显式指定本次读取上限；查询结果的“加载更多”用它放大窗口。
+    pub fn begin_run_limited(
+        &mut self,
+        tasks: &TaskBoard,
+        scope: RunScope,
+        override_sql: Option<String>,
+        limit: u64,
+    ) -> BeginRun {
         let Some(tab) = self.active_tab().cloned() else {
             return BeginRun::Rejected(assist_text("query.errors.needTarget"));
         };
@@ -825,7 +840,7 @@ impl Desk {
             connection_name: target.connection_name,
             database: target.database,
             engine: target.engine,
-            limit: self.page_size.max(1),
+            limit: limit.max(1),
         })
     }
 
@@ -1187,6 +1202,7 @@ fn statement_view(statement: commands::StatementDto) -> StatementView {
         message: statement.message,
         columns: statement.columns,
         rows: statement.rows,
+        truncated: statement.truncated,
         affected: statement.affected,
     }
 }
@@ -1609,6 +1625,41 @@ mod tests {
             assert_eq!(view.kind, "view");
             assert_eq!(view.connection_name, "应用");
         }
+    }
+
+    #[test]
+    fn truncated_result_is_kept_for_load_more() {
+        let view = statement_view(commands::StatementDto {
+            sql: "SELECT * FROM item".to_owned(),
+            status: "ok".to_owned(),
+            message: String::new(),
+            columns: vec!["id".to_owned()],
+            column_types: vec!["INTEGER".to_owned()],
+            rows: vec![vec![Some("1".to_owned())]],
+            truncated: true,
+            affected: None,
+        });
+        assert!(view.truncated, "截断标记必须跟到界面，才能提供加载更多");
+    }
+
+    #[test]
+    fn load_more_can_raise_the_read_limit() {
+        let tasks = TaskBoard::new();
+        let mut desk = Desk::new();
+        desk.new_query();
+        desk.open_database("notes", "笔记", "sqlite", "main");
+        desk.set_draft("SELECT * FROM item");
+        let prepared = match desk.begin_run_limited(
+            &tasks,
+            RunScope::Current,
+            Some("SELECT * FROM item".to_owned()),
+            250,
+        ) {
+            BeginRun::Ready(prepared) => prepared,
+            BeginRun::Rejected(reason) => panic!("{reason}"),
+            BeginRun::Variables(_) => panic!("variables"),
+        };
+        assert_eq!(prepared.limit, 250);
     }
 
     fn ready_ticket(desk: &mut Desk, tasks: &TaskBoard, sql: &str) -> Ticket {
