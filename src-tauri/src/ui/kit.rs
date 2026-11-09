@@ -582,12 +582,14 @@ pub struct Fields<K: Copy + Eq + Hash + 'static> {
     /// 上次渲染时模型里的值。只有模型自己变了才回推文本框，
     /// 免得渲染赶在输入事件送达之前，把刚打的字冲掉。
     last: HashMap<K, String>,
+    /// 上次绑定时的占位符；语言切换后要更新已创建输入框的占位符。
+    placeholders: HashMap<K, String>,
     subscriptions: Vec<Subscription>,
 }
 
 impl<K: Copy + Eq + Hash + 'static> Default for Fields<K> {
     fn default() -> Self {
-        Self { inputs: HashMap::new(), last: HashMap::new(), subscriptions: Vec::new() }
+        Self { inputs: HashMap::new(), last: HashMap::new(), placeholders: HashMap::new(), subscriptions: Vec::new() }
     }
 }
 
@@ -647,6 +649,14 @@ impl<K: Copy + Eq + Hash + 'static> Fields<K> {
         on_enter: Option<fn(&mut V, K, &mut Context<V>)>,
     ) -> Entity<InputState> {
         if let Some(state) = self.inputs.get(&key).cloned() {
+            // 语言切换后占位符也要跟随，否则已创建的输入框会保留旧语言文案。
+            let desired = spec.placeholder.to_owned();
+            let stale = self.placeholders.get(&key) != Some(&desired);
+            if stale {
+                let placeholder = SharedString::from(desired.clone());
+                state.update(cx, |state, cx| state.set_placeholder(placeholder, window, cx));
+                self.placeholders.insert(key, desired);
+            }
             let last = self.last.entry(key).or_default();
             sync_text(&state, last, value, window, cx);
             return state;
