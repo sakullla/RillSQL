@@ -7,6 +7,7 @@ use crate::app::views::connections::{blank_draft, ConnectionPage, Secrets};
 use crate::app::views::history::{HistoryPage, HistorySection, LoadPlan};
 use crate::app::views::settings::SettingsForm;
 use crate::app::views::welcome::WelcomePage;
+use crate::app::model::ObjectTarget;
 use crate::app::{AppPage, CommandSpec, Density, Effect, FocusTarget, Locale, Shell, ThemePreference, COMMANDS};
 use crate::application::tasks::TaskToken;
 use crate::application::{AppServices, TaskBoard};
@@ -87,6 +88,17 @@ impl WorkItemKind {
 
     pub fn is_query(self) -> bool {
         matches!(self, Self::Query)
+    }
+
+    /// 每个工作项恢复自身时的焦点位置；返回工作项和关闭浮层都用这一份，
+    /// 不再按页面猜焦点。
+    pub fn focus(self) -> FocusTarget {
+        match self {
+            Self::Query => FocusTarget::Editor,
+            Self::Table => FocusTarget::Grid,
+            Self::Structure | Self::Admin => FocusTarget::Editor,
+            Self::Redis | Self::Mongo => FocusTarget::Sidebar,
+        }
     }
 }
 
@@ -374,6 +386,9 @@ impl WorkbenchModel {
                 self.history.confirm_delete = false;
                 self.shell.page = AppPage::History;
             }
+            "open-exchange" => {
+                self.exchange_open = !self.exchange_open;
+            }
             "close-tab" => self.request_close_active(),
             "next-tab" => self.cycle_item(1),
             "prev-tab" => self.cycle_item(-1),
@@ -420,6 +435,23 @@ impl WorkbenchModel {
             self.shell.page = AppPage::Connections;
             return true;
         }
+        if id == "exchange-object" {
+            // 对象菜单里的导入导出以被选中的对象为准：先把这个对象打开成表数据，
+            // 抽屉只在实际来源与所选对象一致时打开，避免导出别一张表。
+            let Some(target) = self.object_target() else {
+                self.notice_key = Some("shell.tabs.needObject");
+                self.notice_detail.clear();
+                return true;
+            };
+            let spec = target.spec();
+            if self.active_tab().and_then(|tab| tab.spec.clone()).as_deref() != Some(spec.as_str()) {
+                self.open_item(WorkItemKind::Table, spec.clone());
+            }
+            if self.active_tab().and_then(|tab| tab.spec.as_deref()) == Some(spec.as_str()) {
+                self.exchange_open = true;
+            }
+            return true;
+        }
         if id.starts_with("exchange-") {
             return true;
         }
@@ -454,8 +486,9 @@ impl WorkbenchModel {
                     self.shell.sidebar_open = !self.shell.sidebar_open;
                     self.shell.focus = FocusTarget::Sidebar;
                 } else {
-                    self.shell.page = AppPage::Workspace;
-                    self.shell.focus = FocusTarget::Editor;
+                    // 回到工作台就是回到当前工作项：页面、工具与焦点都还原，
+                    // 不重建草稿、暂存、选择与滚动。
+                    self.return_to_work();
                 }
             }
             "activity-connections" => {
@@ -563,9 +596,6 @@ impl WorkbenchModel {
             "object-page-up" => self.settings.step_object_page(50),
             "object-page-down" => self.settings.step_object_page(-50),
             "tree-open-data" | "tree-copy-name" | "tree-select-sql" => self.tree_action(id),
-            "open-exchange" => {
-                self.exchange_open = !self.exchange_open;
-            }
             "open-admin" => {
                 if let Some(spec) = self.table_spec.clone().or_else(|| self.object_spec.clone()) {
                     self.open_item(WorkItemKind::Admin, spec);
@@ -719,12 +749,34 @@ impl WorkbenchModel {
     }
 
     fn tree_action(&mut self, id: &str) {
+        // 对象动作只认完整目标：连接、库、模式、对象名一起来自同一个对象，
+        // 不用连接 id 或对象名反推目标。
         match id {
-            "tree-copy-name" => self.copied = self.connections.selected.clone().unwrap_or_default(),
-            "tree-select-sql" => {
-                let sql = "select * from dual".to_owned();
-                self.open_query_draft(sql, false);
-            }
+            "tree-copy-name" => match self.object_target() {
+                Some(target) => self.copied = Self::qualified_name(&target),
+                None => {
+                    self.copied.clear();
+                    self.notice_key = Some("shell.tabs.needObject");
+                    self.notice_detail.clear();
+                }
+            },
+            "tree-select-sql" => match self.object_target() {
+                Some(target) => {
+                    // 只写草稿并带上该对象的连接/库，不执行任何语句。
+                    let sql = crate::query::assist::browse_sql(&target.engine, &target.schema, &target.name);
+                    self.open_bound_query(
+                        sql,
+                        Some(target.connection_id.clone()),
+                        Some(target.connection_name.clone()),
+                        Some(target.database.clone()),
+                        Some(target.engine.clone()),
+                    );
+                }
+                None => {
+                    self.notice_key = Some("shell.tabs.needObject");
+                    self.notice_detail.clear();
+                }
+            },
             "tree-open-data" => {
                 self.notice_key = Some("catalog.tree.openData");
                 if let Some(spec) = self.object_spec.clone() {
@@ -735,19 +787,27 @@ impl WorkbenchModel {
         }
     }
 
+    /// 复制用的限定名：模式与对象名，忽略展示用的连接名。
+    fn qualified_name(target: &ObjectTarget) -> String {
+        if target.schema.is_empty() {
+            target.name.clone()
+        } else {
+            format!("{}.{}", target.schema, target.name)
+        }
+    }
+
     fn open_diagram_from_object(&mut self) {
-        let Some(spec) = self.object_spec.clone() else {
+        let Some(target) = self.object_target() else {
             self.shell.page = AppPage::Diagram;
             self.diagram_spec = None;
             return;
         };
-        let parts: Vec<&str> = spec.split('|').collect();
-        if parts.len() >= 6 && (parts[5] == "redis" || parts[5] == "mongodb") {
+        if !target.is_relational() {
             self.notice_key = Some("diagram.unsupported");
             self.notice_detail.clear();
             return;
         }
-        if let Some(spec) = crate::app::views::diagram::spec_from_object(&spec) {
+        if let Some(spec) = crate::app::views::diagram::spec_from_object(&target.spec()) {
             self.diagram_spec = Some(spec);
             self.shell.page = AppPage::Diagram;
         }
@@ -945,7 +1005,7 @@ impl WorkbenchModel {
                 group: "command",
                 label_key: command.label_key,
                 label: self.text(command.label_key),
-                detail: String::new(),
+                detail: self.command_detail(command.id),
             });
         }
         for row in &self.connections.rows {
@@ -959,6 +1019,15 @@ impl WorkbenchModel {
         }
         entries.extend(self.catalog_entries());
         filter_palette(&entries, &self.palette_query, self.shell.palette_tables_only)
+    }
+
+    /// 命令面板里“对比”“导入导出”要带上当前对象或结果；没有上下文时这一行说明缺什么。
+    fn command_detail(&self, id: &str) -> String {
+        match id {
+            "compare" => self.compare_detail(),
+            "open-exchange" => self.exchange_detail(),
+            _ => String::new(),
+        }
     }
 
     /// 记录一次对象读取结果。内容没变就不重新分配，渲染每帧同步也不会抖动。
@@ -1393,12 +1462,7 @@ impl WorkbenchModel {
         self.active_tab = Some(id.to_owned());
         self.tool = kind.tool();
         self.shell.page = kind.page();
-        self.shell.focus = match kind {
-            WorkItemKind::Query => FocusTarget::Editor,
-            WorkItemKind::Table => FocusTarget::Grid,
-            WorkItemKind::Structure | WorkItemKind::Admin => FocusTarget::Editor,
-            WorkItemKind::Redis | WorkItemKind::Mongo => FocusTarget::Sidebar,
-        };
+        self.shell.focus = kind.focus();
         match kind {
             WorkItemKind::Table | WorkItemKind::Structure | WorkItemKind::Admin => self.table_spec = spec,
             WorkItemKind::Redis => self.redis_spec = spec,
@@ -1557,6 +1621,72 @@ impl WorkbenchModel {
     pub fn active_tab(&self) -> Option<&WorkItem> {
         let id = self.active_tab.as_deref()?;
         self.tabs.iter().find(|tab| tab.id == id)
+    }
+
+    /// 对象树里选中的对象目标。菜单动作以它为准，避免被活动工作项的旧目标顶掉。
+    pub fn object_target(&self) -> Option<ObjectTarget> {
+        self.object_spec.as_deref().and_then(ObjectTarget::parse)
+    }
+
+    /// 当前对象：优先活动工作项自己的目标，其次对象树里的选择。
+    pub fn current_object(&self) -> Option<ObjectTarget> {
+        self.active_tab()
+            .and_then(|tab| tab.spec.as_deref())
+            .and_then(ObjectTarget::parse)
+            .or_else(|| self.object_target())
+    }
+
+    /// 只有连接/库、没有具体对象时的范围（查询项就是这样）。
+    pub fn active_scope(&self) -> Option<ObjectTarget> {
+        let tab = self.active_tab()?;
+        let connection_id = tab.connection_id.clone()?;
+        if connection_id.is_empty() {
+            return None;
+        }
+        Some(ObjectTarget::new(
+            connection_id,
+            tab.connection_name.clone().unwrap_or_default(),
+            tab.database.clone().unwrap_or_default(),
+            String::new(),
+            String::new(),
+            tab.engine.clone().unwrap_or_default(),
+            String::new(),
+        ))
+    }
+
+    /// 对比入口带入的目标：优先当前对象，其次当前连接/库范围。
+    pub fn compare_target(&self) -> Option<ObjectTarget> {
+        self.current_object().or_else(|| self.active_scope())
+    }
+
+    /// 命令面板“对比”条目要说明的上下文；缺失条件也要说清楚。
+    pub fn compare_detail(&self) -> String {
+        match self.compare_target() {
+            Some(target) if !target.name.is_empty() => {
+                i18n::fill(&self.text("compare.context.carried"), &[("path", &target.path())])
+            }
+            Some(target) => target.path(),
+            None => self.text("compare.context.none"),
+        }
+    }
+
+    /// 交换/导入导出条目的来源说明：查询项是结果，其余是当前表数据。
+    pub fn exchange_detail(&self) -> String {
+        match self.active_tab() {
+            Some(tab) if tab.kind.is_query() => self.text("shell.paletteGroup.queryResult"),
+            _ => self.object_target().map(|target| target.path()).unwrap_or_default(),
+        }
+    }
+
+    /// 从对比、设置等页面回到当前工作项：页面、工具与焦点跟着工作项走，
+    /// 草稿、暂存、选择与滚动都不重建。
+    pub fn return_to_work(&mut self) -> bool {
+        let Some(id) = self.active_tab.clone() else {
+            self.shell.page = AppPage::Workspace;
+            self.shell.focus = FocusTarget::Editor;
+            return false;
+        };
+        self.activate_item(&id)
     }
 
     fn active_mut(&mut self) -> Option<&mut WorkItem> {

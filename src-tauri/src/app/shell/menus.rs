@@ -69,6 +69,9 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
                 item("new-query", "catalog.tree.newQueryHere"),
                 item("tree-copy-name", "catalog.tree.copyFullName"),
                 item("tree-select-sql", "catalog.tree.copyToQuery"),
+                // 对比与导入导出不再占固定入口，但仍从对象上下文到达，并带上这个对象。
+                item("compare-object", "shell.command.compare"),
+                item("exchange-object", "shell.command.openExchange"),
             ];
             if target == MenuTarget::Connection {
                 items.extend([
@@ -90,6 +93,8 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
                 item("grid-copy-column", "grid.menu.copyColumn"),
                 item("grid-filter-value", "grid.menu.filterByValue"),
                 item("tree-select-sql", "catalog.tree.copyToQuery"),
+                item("open-exchange", "shell.command.openExchange"),
+                item("compare-object", "shell.command.compare"),
                 if write {
                     item("edit-cell", "shell.shortcuts.editCell")
                 } else {
@@ -115,6 +120,7 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
             item("format", "query.editor.menu.format"),
             item("explain", "query.editor.menu.plan"),
             item("history-copy", "query.editor.menu.copy"),
+            item("open-exchange", "shell.command.openExchange"),
             item("command-palette", "shell.shortcuts.commandPalette"),
             item("editor-clear", "query.editor.menu.clear"),
         ],

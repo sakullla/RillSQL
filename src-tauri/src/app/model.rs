@@ -79,6 +79,124 @@ pub enum AppPage {
     Diagram,
 }
 
+/// 一个对象的完整目标身份：连接、库、模式、对象名与引擎。
+/// 显示名只用于展示；工作项去重、对象动作以及对比/交换入口都从这一份值取目标，
+/// 同连接同名或跨连接同名对象因此不会串到别处。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObjectTarget {
+    pub connection_id: String,
+    pub connection_name: String,
+    pub database: String,
+    pub schema: String,
+    pub name: String,
+    pub engine: String,
+    pub environment: String,
+}
+
+impl ObjectTarget {
+    pub fn new(
+        connection_id: impl Into<String>,
+        connection_name: impl Into<String>,
+        database: impl Into<String>,
+        schema: impl Into<String>,
+        name: impl Into<String>,
+        engine: impl Into<String>,
+        environment: impl Into<String>,
+    ) -> Self {
+        Self {
+            connection_id: connection_id.into(),
+            connection_name: connection_name.into(),
+            database: database.into(),
+            schema: schema.into(),
+            name: name.into(),
+            engine: engine.into(),
+            environment: environment.into(),
+        }
+    }
+
+    /// 工作项与命令串共用的稳定格式，字段顺序为
+    /// connection | name | database | schema | object | engine | env。
+    pub fn spec(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            self.connection_id,
+            self.connection_name,
+            self.database,
+            self.schema,
+            self.name,
+            self.engine,
+            self.environment
+        )
+    }
+
+    /// 解析规格；连接与对象名缺失时不是有效目标，不能拿来当“当前对象”。
+    pub fn parse(spec: &str) -> Option<Self> {
+        let parts: Vec<&str> = spec.split('|').collect();
+        if parts.len() < 6 {
+            return None;
+        }
+        let part = |index: usize| parts.get(index).map(|text| text.trim()).unwrap_or_default();
+        let connection_id = part(0);
+        let name = part(4);
+        if connection_id.is_empty() || name.is_empty() {
+            return None;
+        }
+        Some(Self {
+            connection_id: connection_id.to_owned(),
+            connection_name: part(1).to_owned(),
+            database: part(2).to_owned(),
+            schema: part(3).to_owned(),
+            name: name.to_owned(),
+            engine: part(5).to_owned(),
+            environment: part(6).to_owned(),
+        })
+    }
+
+    /// 身份段决定“是不是同一个对象”；连接名与环境只用于展示。
+    pub fn same_target(&self, other: &Self) -> bool {
+        self.connection_id == other.connection_id
+            && self.database == other.database
+            && self.schema == other.schema
+            && self.name == other.name
+    }
+
+    /// 目录里的一条对象是否就是这个目标。规格里空的 schema 段视为通配，
+    /// 因为 MySQL/MariaDB 的目标规格不带 schema。
+    pub fn matches_parts(&self, connection_id: &str, database: &str, schema: &str, name: &str) -> bool {
+        self.connection_id == connection_id
+            && self.database == database
+            && self.name == name
+            && (self.schema.is_empty() || schema.is_empty() || self.schema == schema)
+    }
+
+    pub fn is_relational(&self) -> bool {
+        !matches!(self.engine.to_ascii_lowercase().as_str(), "redis" | "mongodb" | "mongo")
+    }
+
+    /// 库.模式.对象 · 连接：菜单、命令面板和对比入口共用同一段展示文本。
+    pub fn path(&self) -> String {
+        let mut scope = self.database.clone();
+        if !self.schema.is_empty() {
+            if !scope.is_empty() {
+                scope.push('.');
+            }
+            scope.push_str(&self.schema);
+        }
+        let mut path = if scope.is_empty() { self.name.clone() } else { format!("{scope}.{}", self.name) };
+        let owner = if self.connection_name.is_empty() { &self.connection_id } else { &self.connection_name };
+        if !owner.is_empty() {
+            path.push_str(" · ");
+            path.push_str(owner);
+        }
+        path
+    }
+}
+
+/// 固定活动栏只保留这三个顶层入口；低频能力走命令面板与上下文菜单。
+pub const RAIL_TOP: [&str; 3] = ["activity-workspace", "activity-connections", "activity-history"];
+/// 底部最多一个设置入口。
+pub const RAIL_BOTTOM: [&str; 1] = ["activity-settings"];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FilePrompt {
     Open,
@@ -127,6 +245,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { id: "execute-query", label_key: "shell.command.execute", icon: "play", chord: Some("Mod+Enter") },
     CommandSpec { id: "open-structure", label_key: "shell.command.newStructure", icon: "table", chord: None },
     CommandSpec { id: "compare", label_key: "shell.command.compare", icon: "table", chord: None },
+    CommandSpec { id: "open-exchange", label_key: "shell.command.openExchange", icon: "arrow-down-up", chord: None },
     CommandSpec { id: "new-connection", label_key: "shell.command.newConnection", icon: "plus", chord: None },
     CommandSpec { id: "open-sqlite", label_key: "shell.command.openSqlite", icon: "file", chord: None },
     CommandSpec { id: "history", label_key: "shell.command.history", icon: "history", chord: None },
@@ -178,7 +297,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
 
 const ICONS: &[&str] = &[
     "code", "play", "table", "plus", "file", "history", "database", "sliders", "sidebar", "sun",
-    "moon", "monitor", "keyboard",
+    "moon", "monitor", "keyboard", "arrow-down-up",
 ];
 
 pub struct ControlSpec {
@@ -495,6 +614,7 @@ fn zh(key: &str) -> Option<&'static str> {
         "shell.command.execute" => "执行",
         "shell.command.newStructure" => "新建表结构",
         "shell.command.compare" => "对比库",
+        "shell.command.openExchange" => "导入 / 导出",
         "shell.command.newConnection" => "新建连接",
         "shell.command.openSqlite" => "打开 SQLite 文件",
         "shell.command.history" => "查询历史",
@@ -567,6 +687,7 @@ fn en(key: &str) -> Option<&'static str> {
         "shell.command.execute" => "Execute",
         "shell.command.newStructure" => "New table structure",
         "shell.command.compare" => "Compare databases",
+        "shell.command.openExchange" => "Import / export",
         "shell.command.newConnection" => "New connection",
         "shell.command.openSqlite" => "Open SQLite file",
         "shell.command.history" => "Query history",
@@ -696,6 +817,7 @@ mod tests {
                 "execute-query",
                 "open-structure",
                 "compare",
+                "open-exchange",
                 "new-connection",
                 "open-sqlite",
                 "history",
@@ -749,6 +871,61 @@ mod tests {
         for control in shared_controls() {
             assert!(!control.role.is_empty());
             assert_ne!(translate(Locale::En, control.label_key), control.label_key);
+        }
+    }
+
+    #[test]
+    fn object_target_round_trips_and_keeps_identity_segments_apart() {
+        let orders = ObjectTarget::new("c1", "销售库", "shop", "public", "orders", "postgres", "dev");
+        let parsed = ObjectTarget::parse(&orders.spec()).expect("规格应能解析回同一目标");
+        assert_eq!(parsed, orders);
+        assert!(parsed.same_target(&orders));
+        assert_eq!(orders.path(), "shop.public.orders · 销售库");
+
+        // 同连接跨库/模式同名，和跨连接同名，都不是同一个目标。
+        let other_database = ObjectTarget::new("c1", "销售库", "warehouse", "public", "orders", "postgres", "dev");
+        let other_schema = ObjectTarget::new("c1", "销售库", "shop", "archive", "orders", "postgres", "dev");
+        let other_connection = ObjectTarget::new("c2", "仓库库", "shop", "public", "orders", "postgres", "prod");
+        assert!(!orders.same_target(&other_database));
+        assert!(!orders.same_target(&other_schema));
+        assert!(!orders.same_target(&other_connection));
+        assert_ne!(orders.spec(), other_database.spec());
+        assert_ne!(orders.spec(), other_schema.spec());
+        assert_ne!(orders.spec(), other_connection.spec());
+
+        // 展示用的连接名与环境不参与身份判断。
+        let renamed = ObjectTarget::new("c1", "新名字", "shop", "public", "orders", "postgres", "prod");
+        assert!(renamed.same_target(&orders));
+
+        // 目录匹配使用完整身份；MySQL 规格的 schema 段为空时按通配处理。
+        assert!(orders.matches_parts("c1", "shop", "public", "orders"));
+        assert!(!orders.matches_parts("c2", "shop", "public", "orders"));
+        assert!(!orders.matches_parts("c1", "warehouse", "public", "orders"));
+        assert!(!orders.matches_parts("c1", "shop", "archive", "orders"));
+        assert!(!orders.matches_parts("c1", "shop", "public", "items"));
+        let mysql = ObjectTarget::new("c1", "应用", "shop", "", "orders", "mysql", "dev");
+        assert!(mysql.matches_parts("c1", "shop", "shop", "orders"));
+        assert!(mysql.matches_parts("c1", "shop", "", "orders"));
+        assert!(!mysql.matches_parts("c1", "shop", "shop", "items"));
+    }
+
+    #[test]
+    fn object_target_parse_rejects_specs_without_a_connection_or_object() {
+        assert!(ObjectTarget::parse("").is_none());
+        assert!(ObjectTarget::parse("c1|名字|shop").is_none(), "缺字段的旧串不是完整身份");
+        assert!(ObjectTarget::parse("|名字|shop||orders|postgres|dev").is_none(), "没有连接不是目标");
+        assert!(ObjectTarget::parse("c1|名字|shop|||postgres|dev").is_none(), "没有对象名不是目标");
+        assert_eq!(ObjectTarget::parse("c1|名字|shop||orders|postgres").unwrap().environment, "");
+    }
+
+    #[test]
+    fn rail_keeps_only_workbench_connections_history_and_one_bottom_settings() {
+        assert_eq!(RAIL_TOP, ["activity-workspace", "activity-connections", "activity-history"]);
+        assert_eq!(RAIL_BOTTOM, ["activity-settings"]);
+        for gone in ["compare", "open-exchange", "help"] {
+            assert!(!RAIL_TOP.contains(&gone), "{gone} 不再是固定入口");
+            assert!(!RAIL_BOTTOM.contains(&gone), "{gone} 不再是固定入口");
+            assert!(Shell::command(gone).is_some(), "{gone} 仍能从命令面板到达");
         }
     }
 

@@ -9,7 +9,7 @@ use gpui_kit::{
 };
 
 use crate::app::views::admin::AdminPane;
-use crate::app::views::compare::ComparePane;
+use crate::app::views::compare::{CompareContext, ComparePane};
 use crate::app::views::connections::blank_draft;
 use crate::app::views::diagram::DiagramPane;
 use crate::app::views::export::{ExchangePane, ExchangeSource, ExchangeSourceKind};
@@ -231,8 +231,20 @@ impl Workbench {
             }
             let _ = self.model.dispatch(id);
             let locale = self.model.locale();
+            // 对比入口带上当前对象/范围：对象菜单用对象树里的选择，
+            // 命令面板与快捷键用当前工作项或对象树选择。
+            let context = match id {
+                // 对象菜单以右键/当前对象为准；没有选中对象时退回当前工作项的目标。
+                "compare-object" => self.model.object_target().or_else(|| self.model.compare_target()),
+                "compare" => self.model.compare_target(),
+                _ => None,
+            }
+            .map(|target| CompareContext::of(&target));
             self.compare.update(cx, |pane, cx| {
                 pane.set_locale(locale);
+                if id == "compare" || id == "compare-object" {
+                    pane.open_context(context, cx);
+                }
                 pane.command(id, cx);
             });
             self.refresh_compare(cx);
@@ -323,6 +335,23 @@ impl Workbench {
     #[cfg(test)]
     pub fn plant_object_tree(&mut self, cx: &mut Context<Self>) {
         self.query.update(cx, |pane, _| pane.plant_customers());
+    }
+
+    #[cfg(test)]
+    pub fn plant_same_name_objects(&mut self, cx: &mut Context<Self>) {
+        self.query.update(cx, |pane, _| pane.plant_same_name_objects());
+    }
+
+    /// 对比页的两侧、带入说明与“返回工作项”在测试里都要能读到。
+    #[cfg(test)]
+    pub fn compare_state(&self, cx: &App) -> (Option<String>, String, String, String) {
+        let pane = self.compare.read(cx);
+        (
+            pane.context().map(|context| context.path.clone()),
+            pane.context_note().to_owned(),
+            pane.sides().0,
+            pane.sides().1,
+        )
     }
 
     #[cfg(test)]
@@ -1044,9 +1073,14 @@ impl Workbench {
 
     fn refresh_compare(&mut self, cx: &mut Context<Self>) {
         let place = self.compare.update(cx, |pane, _| pane.take_place());
+        let back = self.compare.update(cx, |pane, _| pane.take_back());
         self.model.compare_running = self.compare.read(cx).running();
         if let Some(place) = place {
             self.model.open_bound_query(place.sql, place.connection_id, place.connection_name, place.database, place.engine);
+        }
+        if back {
+            // 返回原工作项：对比自己的两侧与结果留在对比页里，不重建成新工作项。
+            self.model.return_to_work();
         }
     }
 
@@ -1231,31 +1265,29 @@ impl Render for Workbench {
     }
 }
 
-/// 当前工作项规格是否指向网格里的同一张表。MySQL 的对象没有 schema，
-/// describe 会回填库名，所以只在两侧都非空时比较 schema。
+/// 网格里的实际表是否就是这条规格指向的对象。MySQL 的对象没有 schema，
+/// describe 会回填库名，所以空的 schema 段按通配处理；解析只有一份，避免各入口各写一套。
 pub(crate) fn spec_matches_table(spec: &str, table: &crate::grid::commands::TableRef) -> bool {
-    let parts: Vec<&str> = spec.split('|').collect();
-    parts.first() == Some(&table.connection_id.as_str())
-        && parts.get(2) == Some(&table.database.as_str())
-        && parts
-            .get(3)
-            .is_none_or(|schema| schema.is_empty() || Some(*schema) == Some(table.schema.as_str()))
-        && parts.get(4) == Some(&table.table.as_str())
+    crate::app::model::ObjectTarget::parse(spec).is_some_and(|target| {
+        target.matches_parts(
+            &table.connection_id,
+            &table.database,
+            &table.schema,
+            &table.table,
+        )
+    })
 }
 
 fn parse_target(spec: &str) -> Option<GridTarget> {
-    let parts: Vec<&str> = spec.split('|').collect();
-    if parts.len() < 7 || parts[0].is_empty() || parts[4].is_empty() {
-        return None;
-    }
+    let target = crate::app::model::ObjectTarget::parse(spec)?;
     Some(GridTarget {
-        connection_id: parts[0].to_owned(),
-        connection_name: parts[1].to_owned(),
-        database: parts[2].to_owned(),
-        schema: parts[3].to_owned(),
-        table: parts[4].to_owned(),
-        engine: parts[5].to_owned(),
-        environment: parts[6].to_owned(),
+        connection_id: target.connection_id,
+        connection_name: target.connection_name,
+        database: target.database,
+        schema: target.schema,
+        table: target.name,
+        engine: target.engine,
+        environment: target.environment,
     })
 }
 

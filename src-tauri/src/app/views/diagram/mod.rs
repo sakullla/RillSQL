@@ -233,17 +233,22 @@ fn parse_spec(spec: &str) -> Option<(String, String, String, String)> {
     Some((parts[0].to_owned(), parts[1].to_owned(), parts[2].to_owned(), parts[3].to_owned()))
 }
 
+/// 关系图只读打开对象的连接/库/模式范围；非关系型引擎没有可画的层级。
+/// 解析走与其它入口一致的一份对象身份，避免 连接/库/模式 各写一套。
 pub fn spec_from_object(spec: &str) -> Option<String> {
-    let parts: Vec<&str> = spec.split('|').collect();
-    if parts.len() < 7 || parts[0].is_empty() {
+    let target = crate::app::model::ObjectTarget::parse(spec)?;
+    if !target.is_relational() {
         return None;
     }
-    let engine = parts[5];
-    if engine == "redis" || engine == "mongodb" {
-        return None;
-    }
-    let label = if parts[1].is_empty() { parts[0] } else { parts[1] };
-    Some(format!("{}|{}|{}|{label}", parts[0], parts[2], parts[3]))
+    let label = if target.connection_name.is_empty() {
+        target.connection_id.clone()
+    } else {
+        target.connection_name.clone()
+    };
+    Some(format!(
+        "{}|{}|{}|{label}",
+        target.connection_id, target.database, target.schema
+    ))
 }
 
 fn layout_columns(tables: &[DiagramTable], edges: &[DiagramEdge]) -> Vec<Vec<DiagramTable>> {

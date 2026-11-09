@@ -20,6 +20,7 @@ use gpui_kit::{
 use crate::ui::kit::{self, Palette, Tip as _};
 
 use crate::app::views::grid::{GridPane, GridTarget};
+use crate::app::model::ObjectTarget;
 use crate::application::AppServices;
 use crate::i18n::{self, Locale};
 use crate::query::assist::{self, LintFinding, RunScope, TreeObject};
@@ -369,6 +370,51 @@ impl QueryPane {
         );
     }
 
+    /// 两个连接里有同名表：对象动作必须按完整目标区分，不能只比对象名。
+    #[cfg(test)]
+    pub fn plant_same_name_objects(&mut self) {
+        use crate::query::desk::OpenLink;
+        self.desk.set_links(vec![
+            OpenLink {
+                id: "pg".to_owned(),
+                name: "销售库".to_owned(),
+                engine: "postgres".to_owned(),
+                databases: vec!["shop".to_owned()],
+                environment: "dev".to_owned(),
+            },
+            OpenLink {
+                id: "pg2".to_owned(),
+                name: "仓库库".to_owned(),
+                engine: "postgres".to_owned(),
+                databases: vec!["shop".to_owned()],
+                environment: "prod".to_owned(),
+            },
+        ]);
+        self.desk.set_objects(
+            vec![
+                TreeObject {
+                    connection_id: "pg".to_owned(),
+                    connection_name: "销售库".to_owned(),
+                    engine: "postgres".to_owned(),
+                    database: "shop".to_owned(),
+                    schema: "public".to_owned(),
+                    name: "orders".to_owned(),
+                    kind: "table".to_owned(),
+                },
+                TreeObject {
+                    connection_id: "pg2".to_owned(),
+                    connection_name: "仓库库".to_owned(),
+                    engine: "postgres".to_owned(),
+                    database: "shop".to_owned(),
+                    schema: "public".to_owned(),
+                    name: "orders".to_owned(),
+                    kind: "table".to_owned(),
+                },
+            ],
+            vec!["shop".to_owned()],
+        );
+    }
+
     pub fn command(&mut self, id: &str, cx: &mut Context<Self>) {
         // 表/结构等非查询工作项激活时，补全、格式化、执行、计划、变量、取消和语句选择
         // 都不能落在隐藏的查询标签上。
@@ -388,16 +434,29 @@ impl QueryPane {
             return;
         }
         if let Some(rest) = id.strip_prefix("object:") {
-            if let Some(object) = self
-                .desk
-                .objects()
-                .iter()
-                .find(|object| format!("{}:{}", object.connection_id, object.name) == rest)
-                .cloned()
-            {
-                let spec = object_spec(&object, &self.desk.environment_of(&object.connection_id));
-                self.selected_object = Some(spec);
-                self.queue_object(&object);
+            // 用完整目标定位对象：同名对象不会因为只比 连接:对象名 而串到一起。
+            if let Some(target) = ObjectTarget::parse(rest) {
+                if let Some(object) = self
+                    .desk
+                    .objects()
+                    .iter()
+                    .find(|object| {
+                        target.matches_parts(
+                            &object.connection_id,
+                            &object.database,
+                            &object.schema,
+                            &object.name,
+                        )
+                    })
+                    .cloned()
+                {
+                    let spec = object_spec(&object, &self.desk.environment_of(&object.connection_id));
+                    self.selected_object = Some(spec);
+                    self.queue_object(&object);
+                } else {
+                    // 目标已不在目录里：保留原选择并说明原因，不静默改用同名对象。
+                    self.desk.set_active_note(&i18n::text(self.locale, "catalog.tree.staleObject"));
+                }
             }
             cx.notify();
             return;
@@ -1547,11 +1606,21 @@ pub fn requires_active_query(id: &str) -> bool {
         || id.starts_with("bind-connection:")
 }
 
-pub fn object_spec(object: &TreeObject, environment: &str) -> String {
-    format!(
-        "{}|{}|{}|{}|{}|{}|{}",
-        object.connection_id, object.connection_name, object.database, object.schema, object.name, object.engine, environment
+/// 目录里一个对象的完整目标；对象动作、工作项和覆盖层都从这里取连接/库/模式/对象。
+pub fn object_target(object: &TreeObject, environment: &str) -> ObjectTarget {
+    ObjectTarget::new(
+        object.connection_id.clone(),
+        object.connection_name.clone(),
+        object.database.clone(),
+        object.schema.clone(),
+        object.name.clone(),
+        object.engine.clone(),
+        environment,
     )
+}
+
+pub fn object_spec(object: &TreeObject, environment: &str) -> String {
+    object_target(object, environment).spec()
 }
 
 fn target_of(tab: &TabSnap) -> Option<Target> {
@@ -1747,7 +1816,7 @@ mod tests {
         });
         assert!(saw_item, "对象树没有列出 item：{}", cx.update(|cx| view.read(cx).query_note(cx)));
         cx.update_window(window, |_, window, cx| {
-            view.update(cx, |view, cx| view.perform("object:notes:item", cx));
+            view.update(cx, |view, cx| view.perform("object:notes|笔记|main||item|sqlite|", cx));
             window.render_frame(cx);
             view.update(cx, |view, cx| {
                 let tab = view.model.active_tab().expect("bound query").clone();

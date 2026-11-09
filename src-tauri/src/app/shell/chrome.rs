@@ -308,25 +308,20 @@ impl Workbench {
     fn rail(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let page = self.model.shell.page;
-        let workspace = matches!(page, AppPage::Workspace | AppPage::Structure | AppPage::Diagram);
-        let items: [(&str, IconName, &str, bool); 5] = [
-            ("activity-workspace", IconName::Database, "shell.nav.workspace", workspace),
-            ("activity-connections", IconName::Plug, "shell.nav.connections", page == AppPage::Connections),
-            ("activity-history", IconName::Clock, "shell.nav.history", page == AppPage::History),
-            ("compare", IconName::GitCompare, "shell.command.compare", page == AppPage::Compare),
-            ("open-exchange", IconName::ArrowDownUp, "export.open", self.model.exchange_open),
-        ];
+        // 固定活动栏只留工作台、连接、历史与底部设置；对比、导入导出和帮助
+        // 走命令面板与对象/结果上下文菜单，不再占固定位置。
         let mut top = div().flex().flex_col().items_center().gap(px(4.));
-        for (id, icon, key, active) in items {
-            top = top.child(rail_item(id, icon, self.t(key), active, &p, cx));
+        for id in crate::app::model::RAIL_TOP {
+            if let Some((icon, key, active)) = rail_entry(id, page) {
+                top = top.child(rail_item(id, icon, self.t(key), active, &p, cx));
+            }
         }
-        let bottom = div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(4.))
-            .child(rail_item("help", IconName::Keyboard, self.t("shell.command.help"), self.model.shell.help_open, &p, cx))
-            .child(rail_item("activity-settings", IconName::Settings, self.t("shell.nav.settings"), page == AppPage::Settings, &p, cx));
+        let mut bottom = div().flex().flex_col().items_center().gap(px(4.));
+        for id in crate::app::model::RAIL_BOTTOM {
+            if let Some((icon, key, active)) = rail_entry(id, page) {
+                bottom = bottom.child(rail_item(id, icon, self.t(key), active, &p, cx));
+            }
+        }
         div()
             .id("activity")
             .role(gpui_kit::Role::Navigation)
@@ -573,7 +568,8 @@ impl Workbench {
     fn object_row(&self, object: &crate::query::assist::TreeObject, environment: &str, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let m = self.metrics();
         let spec = crate::app::views::query::object_spec(object, environment);
-        let key = format!("{}:{}", object.connection_id, object.name);
+        // 行身份也用完整目标：同名对象在不同连接或不同库里必须是不同的节点。
+        let key = spec.clone();
         let selected = self.model.object_spec.as_deref() == Some(spec.as_str());
         let view = object.kind.contains("view");
         let icon = if view { IconName::Eye } else { IconName::Table };
@@ -585,7 +581,8 @@ impl Workbench {
         let label = SharedString::from(name);
         let click_spec = spec.clone();
         let menu_spec = spec.clone();
-        let query_id = format!("object:{key}");
+        // “在这里新建查询”带着完整目标，查询页不再靠 连接:对象名 反查。
+        let query_id = format!("object:{spec}");
         let structure_id = format!("open-structure-for:{spec}");
         div()
             .id(SharedString::from(format!("obj-{key}")))
@@ -2563,10 +2560,26 @@ fn brand_mark(size: f32, p: &Palette) -> AnyElement {
         .into_any_element()
 }
 
+/// 活动栏条目的图标、文案与选中态；固定项之外不再画任何按钮。
+fn rail_entry(id: &'static str, page: AppPage) -> Option<(IconName, &'static str, bool)> {
+    Some(match id {
+        "activity-workspace" => (
+            IconName::Database,
+            "shell.nav.workspace",
+            matches!(page, AppPage::Workspace | AppPage::Structure | AppPage::Diagram),
+        ),
+        "activity-connections" => (IconName::Plug, "shell.nav.connections", page == AppPage::Connections),
+        "activity-history" => (IconName::Clock, "shell.nav.history", page == AppPage::History),
+        "activity-settings" => (IconName::Settings, "shell.nav.settings", page == AppPage::Settings),
+        _ => return None,
+    })
+}
+
 fn rail_item(id: &'static str, icon: IconName, label: SharedString, active: bool, p: &Palette, cx: &mut Context<Workbench>) -> AnyElement {
     let accent = p.accent;
     div()
         .id(SharedString::from(format!("cmd-{id}")))
+        .test_support()
         .role(gpui_kit::Role::Button)
         .aria_label(label.clone())
         .aria_selected(active)
@@ -2804,6 +2817,7 @@ fn palette_icon(id: &str) -> IconName {
         "execute-query" => IconName::Play,
         "open-structure" => IconName::Columns3,
         "compare" => IconName::GitCompare,
+        "open-exchange" => IconName::ArrowDownUp,
         "new-connection" => IconName::Plus,
         "open-sqlite" => IconName::FolderOpen,
         "history" => IconName::Clock,

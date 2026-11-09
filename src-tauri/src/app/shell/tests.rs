@@ -1464,7 +1464,7 @@ fn object_tree_opens_the_table_and_structure_and_commits_through_the_shared_grid
     cx.update_window(window, |_, window, cx| {
         view.update(cx, |view, cx| {
             view.plant_object_tree(cx);
-            view.perform("object:notes:customers", cx);
+            view.perform("object:notes|笔记|main||customers|sqlite|dev", cx);
             view.perform("tree-open-data", cx);
         });
         window.render_frame(cx);
@@ -3366,5 +3366,338 @@ fn public_settings_reach_the_query_pane_without_a_restart(cx: &mut gpui_kit::Tes
         });
     });
     cx.update(|cx| assert_eq!(view.read(cx).model.update_checks, 0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn same_named_objects_in_two_connections_never_cross_targets() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    let left = tree_object("c1", "销售库", "postgres", "shop", "public", "orders", "table");
+    let right = tree_object("c2", "仓库库", "postgres", "shop", "public", "orders", "table");
+    assert!(model.set_catalog(&[left.clone(), right.clone()], ""));
+
+    // 环境只用于展示，不作为身份；这里按目录条目实际生成的规格比较。
+    let left_spec = crate::app::views::query::object_spec(&left, "");
+    let right_spec = crate::app::views::query::object_spec(&right, "");
+    assert_ne!(left_spec, right_spec, "同名表在两个连接下必须是两个目标");
+
+    // 快速打开列出两条，各自携带完整目标。
+    model.shell.palette_tables_only = true;
+    let entries = model.palette_entries();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].id, format!("open-table:{left_spec}"));
+    assert_eq!(entries[1].id, format!("open-table:{right_spec}"));
+    assert!(model.dispatch(&entries[0].id).is_some());
+    assert!(model.dispatch(&entries[1].id).is_some());
+    assert_eq!(model.tabs.len(), 2, "不同目标必须是两个工作项");
+    assert_eq!(model.tabs[0].connection_id.as_deref(), Some("c1"));
+    assert_eq!(model.tabs[1].connection_id.as_deref(), Some("c2"));
+
+    // 对象树的“打开数据”只看选中的那个对象。
+    model.object_spec = Some(right_spec.clone());
+    assert!(model.dispatch("tree-open-data").is_some());
+    assert_eq!(model.active_tab().unwrap().connection_id.as_deref(), Some("c2"), "同名对象不能串到另一个连接");
+    model.object_spec = Some(left_spec.clone());
+    assert!(model.dispatch("tree-open-data").is_some());
+    assert_eq!(model.active_tab().unwrap().connection_id.as_deref(), Some("c1"));
+
+    // 结构项也按完整目标去重：两边各一份，不共用另一边的结构页。
+    assert!(model.dispatch(&format!("open-structure-for:{left_spec}")).is_some());
+    assert!(model.dispatch(&format!("open-structure-for:{right_spec}")).is_some());
+    let structures: Vec<_> = model.tabs.iter().filter(|tab| tab.kind == WorkItemKind::Structure).collect();
+    assert_eq!(structures.len(), 2, "同名对象的结构项必须分开");
+    assert_ne!(structures[0].spec, structures[1].spec);
+
+    // 对象动作不再按“连接:对象名”反查：复制全名给限定名，而不是连接 id。
+    model.object_spec = Some(left_spec);
+    assert!(model.dispatch("tree-copy-name").is_some());
+    assert_eq!(model.copied, "public.orders");
+    // 生成到新查询只写草稿、带上该对象的目标，不执行。
+    model.object_spec = Some(right_spec.clone());
+    assert!(model.dispatch("tree-select-sql").is_some());
+    let tab = model.active_tab().unwrap();
+    assert_eq!(tab.kind, WorkItemKind::Query);
+    assert_eq!(tab.connection_id.as_deref(), Some("c2"));
+    assert_eq!(tab.database.as_deref(), Some("shop"));
+    assert!(tab.draft.to_lowercase().contains("orders"), "{}", tab.draft);
+    assert_eq!(model.executions, 0, "生成查询不执行");
+
+    // 对象菜单的导入导出以所选对象为准：先打开该对象，再打开抽屉。
+    model.exchange_open = false;
+    model.object_spec = Some(right_spec.clone());
+    assert!(model.dispatch("exchange-object").is_some());
+    assert_eq!(model.active_tab().unwrap().kind, WorkItemKind::Table);
+    assert_eq!(model.active_tab().unwrap().spec.as_deref(), Some(right_spec.as_str()));
+    assert_eq!(model.active_tab().unwrap().connection_id.as_deref(), Some("c2"));
+    assert!(model.exchange_open, "来源就是所选对象时才打开抽屉");
+    // 没有对象上下文：说明缺什么，抽屉保持关闭。
+    model.exchange_open = false;
+    model.object_spec = None;
+    assert!(model.dispatch("exchange-object").is_some());
+    assert!(!model.exchange_open);
+    assert_eq!(model.notice_key, Some("shell.tabs.needObject"));
+}
+
+#[test]
+fn same_named_objects_in_one_connection_stay_apart_per_database() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    let shop = tree_object("pg", "销售库", "postgres", "shop", "public", "orders", "table");
+    let archive = tree_object("pg", "销售库", "postgres", "warehouse", "public", "orders", "table");
+    assert!(model.set_catalog(&[shop.clone(), archive.clone()], ""));
+    let shop_spec = crate::app::views::query::object_spec(&shop, "dev");
+    let archive_spec = crate::app::views::query::object_spec(&archive, "dev");
+    assert_ne!(shop_spec, archive_spec, "同连接跨库同名对象必须是两个目标");
+    assert!(model.dispatch(&format!("open-table:{shop_spec}")).is_some());
+    assert!(model.dispatch(&format!("open-table:{archive_spec}")).is_some());
+    assert_eq!(model.tabs.len(), 2);
+    assert_eq!(model.tabs[0].database.as_deref(), Some("shop"));
+    assert_eq!(model.tabs[1].database.as_deref(), Some("warehouse"));
+
+    // 网格与交换来源只认完整目标：库不同就不是同一张表。
+    let table = crate::grid::commands::TableRef {
+        connection_id: "pg".into(),
+        database: "warehouse".into(),
+        schema: "public".into(),
+        table: "orders".into(),
+        engine: "postgres".into(),
+        include_foreign_keys: false,
+    };
+    assert!(!super::view::spec_matches_table(&shop_spec, &table));
+    assert!(super::view::spec_matches_table(&archive_spec, &table));
+}
+
+#[test]
+fn low_frequency_navigation_moves_to_the_palette_with_context() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    let entry = |model: &WorkbenchModel, id: &str| {
+        model.palette_entries().into_iter().find(|entry| entry.id == id).expect(id)
+    };
+    // 没有对象时两个入口仍然可发现，并说明缺什么。
+    assert_eq!(entry(&model, "compare").detail, model.text("compare.context.none"));
+    assert!(entry(&model, "open-exchange").detail.is_empty());
+
+    let orders = tree_object("pg", "销售库", "postgres", "shop", "public", "orders", "table");
+    assert!(model.set_catalog(std::slice::from_ref(&orders), ""));
+    let spec = crate::app::views::query::object_spec(&orders, "dev");
+    model.object_spec = Some(spec.clone());
+    let compare = entry(&model, "compare");
+    assert!(compare.detail.contains("orders") && compare.detail.contains("销售库"), "{}", compare.detail);
+    assert!(entry(&model, "open-exchange").detail.contains("orders"));
+
+    // 英文界面同样带上下文，不把键名当文案。
+    model.shell.locale = Locale::En;
+    let compare = entry(&model, "compare");
+    assert!(compare.detail.contains("orders"), "{}", compare.detail);
+    assert!(!compare.detail.contains("compare.context"), "{}", compare.detail);
+    model.shell.locale = Locale::ZhCn;
+
+    // 对比入口带上当前对象；工作台入口把原工作项与焦点一起带回来。
+    assert!(model.dispatch(&format!("open-table:{spec}")).is_some());
+    assert_eq!(model.shell.focus, crate::app::FocusTarget::Grid);
+    let active = model.active_tab.clone();
+    assert!(model.dispatch("compare").is_some());
+    assert_eq!(model.shell.page, AppPage::Compare);
+    assert_eq!(model.active_tab, active, "对比页不更换工作项");
+    assert_eq!(model.compare_target().map(|target| target.name), Some("orders".to_owned()));
+    assert!(model.dispatch("activity-workspace").is_some());
+    assert_eq!(model.shell.page, AppPage::Workspace);
+    assert_eq!(model.tool, WorkTool::Table);
+    assert_eq!(model.shell.focus, crate::app::FocusTarget::Grid, "返回工作项要回到它自己的焦点");
+    assert_eq!(model.active_tab, active);
+
+    // 固定活动栏只剩四个入口，其余仍然能从命令面板到达。
+    for id in crate::app::model::RAIL_TOP.iter().chain(crate::app::model::RAIL_BOTTOM.iter()) {
+        assert!(model.dispatch(id).is_some(), "{id}");
+    }
+    for id in ["compare", "open-exchange", "help"] {
+        assert!(model.palette_entries().iter().any(|entry| entry.id == id), "{id} 应留在命令面板");
+        assert!(!crate::app::model::RAIL_TOP.contains(&id) && !crate::app::model::RAIL_BOTTOM.contains(&id));
+    }
+}
+
+#[test]
+fn palette_keyboard_reaches_compare_exchange_and_help_and_restores_focus() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.shell.focus = crate::app::FocusTarget::Grid;
+    let pick = |model: &mut WorkbenchModel, id: &str| {
+        assert!(model.dispatch("command-palette").is_some());
+        model.palette_index = model
+            .palette_entries()
+            .iter()
+            .position(|entry| entry.id == id)
+            .unwrap_or_else(|| panic!("{id} 应在命令面板里"));
+        model.key(NavKey::Enter)
+    };
+    assert_eq!(pick(&mut model, "compare").as_deref(), Some("compare"));
+    assert!(!model.shell.palette_open, "回车后面板关闭");
+    assert_eq!(model.shell.page, AppPage::Compare);
+    assert_eq!(model.shell.focus, crate::app::FocusTarget::Grid, "面板关闭后焦点回原处");
+
+    assert_eq!(pick(&mut model, "open-exchange").as_deref(), Some("open-exchange"));
+    assert!(model.exchange_open, "键盘同样能打开交换");
+    assert!(!model.shell.palette_open);
+    assert!(model.dispatch("open-exchange").is_some());
+    assert!(!model.exchange_open, "再按一次关闭交换");
+
+    assert_eq!(pick(&mut model, "help").as_deref(), Some("help"));
+    assert!(model.shell.help_open, "帮助不再占固定入口，但仍能从面板打开");
+    model.shell.close_overlay();
+    assert_eq!(model.shell.focus, crate::app::FocusTarget::Grid);
+}
+
+#[gpui_kit::test]
+fn object_command_binds_the_query_to_the_exact_same_named_object(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-object-target-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.plant_same_name_objects(cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("object:pg|销售库|shop|public|orders|postgres|dev", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let tab = view.read(cx).model.active_tab().expect("绑定查询").clone();
+        assert_eq!(tab.connection_id.as_deref(), Some("pg"));
+        assert_eq!(tab.database.as_deref(), Some("shop"));
+        assert!(tab.draft.to_lowercase().contains("orders"), "{}", tab.draft);
+        assert!(!tab.running, "对象动作只写草稿，不执行");
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("object:pg2|仓库库|shop|public|orders|postgres|prod", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let tab = view.read(cx).model.active_tab().expect("绑定查询").clone();
+        assert_eq!(tab.connection_id.as_deref(), Some("pg2"), "同名对象不能复用另一个连接的目标");
+        assert!(tab.draft.to_lowercase().contains("orders"), "{}", tab.draft);
+    });
+    // 对象已不在目录里：仍然有可读原因，不静默改开另一个同名对象。
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("object:pg|销售库|shop|public|missing|postgres|dev", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let note = view.read(cx).query_note(cx);
+        assert!(note.contains("目录"), "{note}");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui_kit::test]
+fn compare_and_exchange_return_to_the_same_item_and_keep_staged_cells(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-return-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    let spec = "notes|笔记|main||customers|sqlite|dev";
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform(&format!("open-table:{spec}"), cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.mark_table_dirty(cx);
+            // 交换是覆盖在同一个工作项上的抽屉，打开不改变工作项。
+            view.perform("open-exchange", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(view.model.exchange_open);
+        assert_eq!(view.model.active_tab().map(|tab| tab.spec.clone()), Some(Some(spec.to_owned())));
+        assert!(view.table_uncommitted(cx), "打开交换不能丢暂存");
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("open-exchange", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(!view.model.exchange_open, "再按一次关闭交换");
+        assert!(view.table_uncommitted(cx), "关闭交换后暂存仍在");
+        assert_eq!(view.model.shell.page, AppPage::Workspace);
+        assert_eq!(view.model.tool, WorkTool::Table);
+        assert_eq!(view.model.shell.focus, crate::app::FocusTarget::Grid);
+        assert_eq!(view.model.active_tab().map(|tab| tab.spec.clone()), Some(Some(spec.to_owned())));
+    });
+
+    // 对比页同样带当前对象；返回后回到原工作项、焦点和暂存。
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("compare-object", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.model.shell.page, AppPage::Compare);
+        let (context, note, _baseline, _target) = view.compare_state(cx);
+        assert_eq!(context.as_deref(), Some("main.customers · 笔记"), "{note}");
+        assert!(note.contains("customers"), "{note}");
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("compare-back", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.model.shell.page, AppPage::Workspace, "返回后回到原工作项页面");
+        assert_eq!(view.model.tool, WorkTool::Table);
+        assert_eq!(view.model.shell.focus, crate::app::FocusTarget::Grid);
+        assert!(view.table_uncommitted(cx), "返回后暂存仍在");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui_kit::test]
+fn narrow_window_keeps_the_four_entry_rail_and_low_frequency_commands(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-rail-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench_sized(cx, services_at(&dir), false, 640., 900.);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.perform("refresh-tree", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.model.set_width(640);
+            assert_eq!(view.model.painted().activity_width, 40, "窄窗口活动栏更窄");
+            assert!(view.model.painted().occupied_width() <= 640);
+        });
+    });
+    cx.update_window(window, |_, window, _| {
+        let expected: Vec<String> = crate::app::model::RAIL_TOP
+            .iter()
+            .chain(crate::app::model::RAIL_BOTTOM.iter())
+            .map(|id| format!("cmd-{id}"))
+            .collect();
+        assert_eq!(
+            expected,
+            ["cmd-activity-workspace", "cmd-activity-connections", "cmd-activity-history", "cmd-activity-settings"]
+        );
+        for id in ["cmd-activity-workspace", "cmd-activity-connections", "cmd-activity-history", "cmd-activity-settings"] {
+            assert!(window.try_find(id).is_some(), "{id} 在 640×900 仍要可达");
+        }
+        for gone in ["cmd-compare", "cmd-open-exchange", "cmd-help"] {
+            assert!(window.try_find(gone).is_none(), "{gone} 不再是固定入口");
+        }
+    })
+    .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

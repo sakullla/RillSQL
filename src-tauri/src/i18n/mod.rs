@@ -638,6 +638,13 @@ dict! {
     "ui.exchange.migrateHint" => "把这张表复制到另一个库", "Copy this table into another database";
     "ui.exchange.dropHint" => "把 CSV / Excel / JSON 文件拖到窗口里，或选择文件", "Drop a CSV / Excel / JSON file here, or pick one";
     "ui.compare.changed" => "列差异", "Column changes";
+    "shell.command.openExchange" => "导入 / 导出", "Import / export";
+    "shell.paletteGroup.queryResult" => "当前查询结果", "Current query result";
+    "compare.back" => "返回工作项", "Back to the work item";
+    "compare.context.carried" => "已带入当前对象：{path}；对照侧还需要一个已打开的连接。", "Carried the current object: {path}. The other side still needs an open connection.";
+    "compare.context.none" => "当前没有对象上下文；先在对象树里选择表，或打开一个查询再对比。", "No object context yet. Choose a table in the object tree, or open a query first.";
+    "compare.context.sideMissing" => "已带入 {path}，但这个连接还没有打开用于对比；先连接它再比较。", "Carried {path}, but that connection is not open for comparing; connect it first.";
+    "catalog.tree.staleObject" => "这个对象已不在当前目录；刷新对象树后再试。", "This object is no longer in the catalog; refresh the object tree and try again.";
     "ui.structure.existing" => "当前结构", "Current structure";
     "ui.structure.add" => "新增", "Add";
     "ui.structure.nullable" => "可空", "Nullable";

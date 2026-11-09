@@ -73,6 +73,32 @@ struct SidePick {
     schema: String,
 }
 
+/// 打开对比时带进来的当前对象或连接/库范围；只有展示与预选用途，
+/// 真正的对比请求仍由两侧的 SidePick 决定。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompareContext {
+    pub connection_id: String,
+    pub connection_name: String,
+    pub database: String,
+    pub schema: String,
+    pub object: String,
+    /// 完整路径，用于说明“对比带入的是哪个对象”。
+    pub path: String,
+}
+
+impl CompareContext {
+    pub fn of(target: &crate::app::model::ObjectTarget) -> Self {
+        Self {
+            connection_id: target.connection_id.clone(),
+            connection_name: target.connection_name.clone(),
+            database: target.database.clone(),
+            schema: target.schema.clone(),
+            object: target.name.clone(),
+            path: target.path(),
+        }
+    }
+}
+
 pub struct ComparePane {
     services: Arc<AppServices>,
     locale: Locale,
@@ -98,6 +124,14 @@ pub struct ComparePane {
     place_prompt: String,
     schema_draft: BTreeMap<String, String>,
     schema_inputs: BTreeMap<&'static str, (Entity<InputState>, gpui_kit::Subscription)>,
+    /// 打开对比时带进来的当前对象/范围；choices 读完后再落到两侧。
+    context: Option<CompareContext>,
+    /// 上下文说明或缺失条件；渲染在标题下方。
+    context_note: String,
+    /// 用户按了“返回工作项”；由外壳取走并恢复原工作项与焦点。
+    back: bool,
+    /// 连接清单正在读取；带入上下文时不再重复发起同一份读取。
+    choices_loading: bool,
     #[cfg(test)]
     armed_pause: bool,
     #[cfg(test)]
@@ -130,6 +164,10 @@ impl ComparePane {
             place_prompt: String::new(),
             schema_draft: BTreeMap::new(),
             schema_inputs: BTreeMap::new(),
+            context: None,
+            context_note: String::new(),
+            back: false,
+            choices_loading: false,
             #[cfg(test)]
             armed_pause: false,
             #[cfg(test)]
@@ -157,6 +195,103 @@ impl ComparePane {
         self.placed.take()
     }
 
+    pub fn context_note(&self) -> &str {
+        &self.context_note
+    }
+
+    pub fn context(&self) -> Option<&CompareContext> {
+        self.context.as_ref()
+    }
+
+    /// 基准与对照当前的连接 id；测试与状态栏用它确认“带入到哪一侧”。
+    pub fn sides(&self) -> (String, String) {
+        (self.baseline.connection_id.clone(), self.target.connection_id.clone())
+    }
+
+    /// 用户按了“返回工作项”；外壳取走后回到原工作项与焦点。
+    pub fn take_back(&mut self) -> bool {
+        let back = self.back;
+        self.back = false;
+        back
+    }
+
+    /// 打开对比时带入当前对象或连接/库范围；没有上下文时说明缺什么，
+    /// 而不是把某个连接当成“当前目标”。
+    pub fn open_context(&mut self, context: Option<CompareContext>, cx: &mut Context<Self>) {
+        match context {
+            Some(context) => {
+                self.context = Some(context);
+                self.context_note = self.carried_note();
+                if self.choices.is_empty() {
+                    // 首次打开还没有连接清单：读完后再落两侧，期间保留上下文说明。
+                    if !self.choices_loading {
+                        self.refresh_choices(cx);
+                    }
+                } else {
+                    self.apply_context(cx);
+                }
+            }
+            None => {
+                self.context = None;
+                self.context_note = self.text("compare.context.none");
+                cx.notify();
+            }
+        }
+    }
+
+    fn carried_note(&self) -> String {
+        match self.context.as_ref() {
+            Some(context) => fill(&self.text("compare.context.carried"), &[("{path}", &context.path)]),
+            None => self.text("compare.context.none"),
+        }
+    }
+
+    /// 把带入的上下文落到两侧：当前对象放在对照侧，基准侧优先取另一个已打开连接。
+    /// 只有一侧可用时保留说明文字，提示还缺一个已打开的连接。
+    fn apply_context(&mut self, cx: &mut Context<Self>) {
+        let Some(context) = self.context.clone() else { return };
+        self.context_note = self.carried_note();
+        let Some(choice) = self.choices.iter().find(|choice| choice.id == context.connection_id).cloned() else {
+            // 这个连接没有打开或不可比较：保留带入说明，并指出这一侧缺什么，不改两侧选择。
+            self.context_note = fill(&self.text("compare.context.sideMissing"), &[("{path}", &context.path)]);
+            return;
+        };
+        let database = if context.database.is_empty() {
+            choice.databases.first().cloned().unwrap_or_default()
+        } else {
+            context.database.clone()
+        };
+        let changed = self.target.connection_id != context.connection_id
+            || self.target.database != database
+            || self.target.schema != context.schema;
+        self.target = SidePick {
+            connection_id: context.connection_id.clone(),
+            database: database.clone(),
+            schema: context.schema.clone(),
+        };
+        let engine = choice.engine.clone();
+        if let Some(other) = self
+            .choices
+            .iter()
+            .find(|other| other.id != context.connection_id && other.engine == engine)
+            .cloned()
+        {
+            let other_database = other.databases.first().cloned().unwrap_or_default();
+            if self.baseline.connection_id != other.id || self.baseline.database != other_database {
+                self.baseline = SidePick {
+                    connection_id: other.id,
+                    database: other_database,
+                    schema: String::new(),
+                };
+            }
+        }
+        if changed {
+            self.invalidate_results();
+        }
+        self.ensure_schemas(true, cx);
+        self.ensure_schemas(false, cx);
+    }
+
     #[cfg(test)]
     pub fn arm_pause(&mut self) {
         self.armed_pause = true;
@@ -172,6 +307,17 @@ impl ComparePane {
     pub fn command(&mut self, id: &str, cx: &mut Context<Self>) {
         if id == "compare" || id == "compare-refresh" {
             self.refresh_choices(cx);
+            cx.notify();
+            return;
+        }
+        if id == "compare-object" {
+            // 外壳负责把完整对象目标交给 open_context；这里只刷新连接清单。
+            self.refresh_choices(cx);
+            cx.notify();
+            return;
+        }
+        if id == "compare-back" {
+            self.back = true;
             cx.notify();
             return;
         }
@@ -325,6 +471,7 @@ impl ComparePane {
     }
 
     fn refresh_choices(&mut self, cx: &mut Context<Self>) {
+        self.choices_loading = true;
         let services = Arc::clone(&self.services);
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
@@ -370,10 +517,14 @@ impl ComparePane {
                                 Ok(choices) => {
                                     pane.choices = choices;
                                     pane.error.clear();
+                                    pane.choices_loading = false;
+                                    // 连接清单到达后再把带入的上下文落到两侧。
+                                    pane.apply_context(cx);
                                 }
                                 Err(message) => {
                                     pane.choices.clear();
                                     pane.error = message;
+                                    pane.choices_loading = false;
                                 }
                             }
                             cx.notify();
@@ -1124,6 +1275,14 @@ impl Render for ComparePane {
         if self.structure.is_none() {
             body = body.child(div().hidden().child(kit::tool_button("compare-place:structure", None, t(self, "compare.dialog.placeToQuery"), compare_act("compare-place:structure", &entity))));
         }
+        // 带入的上下文或缺失条件：说明这次对比用的是哪个对象，缺的是哪一侧。
+        let context_note = (!self.context_note.is_empty()).then(|| {
+            div()
+                .id("compare-context")
+                .text_size(px(12.5))
+                .text_color(p.text_muted)
+                .child(SharedString::from(self.context_note.clone()))
+        });
 
         div()
             .id("compare-pane")
@@ -1142,10 +1301,20 @@ impl Render for ComparePane {
                         div()
                             .flex()
                             .items_center()
+                            .justify_between()
                             .gap(px(12.))
-                            .child(div().size(px(34.)).rounded(px(9.)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(IconName::GitCompare, 17., p.accent_text)))
-                            .child(div().flex().flex_col().child(kit::title(t(self, "compare.dialog.title"), 16., &p)).child(kit::muted(t(self, "compare.dialog.subtitle"), &p))),
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(12.))
+                                    .child(div().size(px(34.)).rounded(px(9.)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(IconName::GitCompare, 17., p.accent_text)))
+                                    .child(div().flex().flex_col().child(kit::title(t(self, "compare.dialog.title"), 16., &p)).child(kit::muted(t(self, "compare.dialog.subtitle"), &p))),
+                            )
+                            // 对比是独立页面：返回入口把原工作项与焦点一起带回去。
+                            .child(kit::tool_button("compare-back", Some(IconName::ArrowLeft), t(self, "compare.back"), compare_act("compare-back", &entity))),
                     )
+                    .when_some(context_note, |this, note| this.child(note))
                     .child(body),
             )
     }
@@ -1466,6 +1635,75 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
         ComparePane::new(services)
+    }
+
+    fn context_choice(id: &str, name: &str) -> Choice {
+        // MySQL 不需要 schema 读取：这个测试只验证带入的上下文落到哪一侧。
+        Choice { id: id.into(), name: name.into(), engine: "mysql".into(), databases: vec!["shop".into()], catalog_error: None }
+    }
+
+    #[gpui_kit::test]
+    fn context_carries_the_object_side_and_explains_what_is_missing(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let pane = cx.update(|cx| {
+            let dir = std::env::temp_dir().join(format!("rillsql-compare-context-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+            cx.new(|_| {
+                let mut pane = ComparePane::new(services);
+                pane.choices = vec![context_choice("left", "左"), context_choice("right", "右")];
+                pane
+            })
+        });
+        let context = CompareContext {
+            connection_id: "right".into(),
+            connection_name: "右".into(),
+            database: "shop".into(),
+            schema: String::new(),
+            object: "orders".into(),
+            path: "shop.orders · 右".into(),
+        };
+        pane.update(cx, |pane, cx| pane.open_context(Some(context.clone()), cx));
+        let (baseline, target) = pane.update(cx, |pane, _| pane.sides());
+        let note = pane.update(cx, |pane, _| pane.context_note().to_owned());
+        assert_eq!(target, "right", "当前对象放在对照侧");
+        assert_eq!(baseline, "left", "基准侧取另一个已打开连接");
+        assert!(note.contains("shop.orders"), "{note}");
+        assert_eq!(pane.update(cx, |pane, _| pane.context().cloned()), Some(context.clone()));
+
+        // 只剩一侧可用：当前对象仍然带入，并说明另一侧还缺连接。
+        pane.update(cx, |pane, _| {
+            pane.choices.retain(|choice| choice.id == "right");
+            pane.baseline = SidePick { connection_id: String::new(), database: String::new(), schema: String::new() };
+        });
+        pane.update(cx, |pane, cx| pane.open_context(Some(context.clone()), cx));
+        let (baseline, target) = pane.update(cx, |pane, _| pane.sides());
+        let note = pane.update(cx, |pane, _| pane.context_note().to_owned());
+        assert_eq!(target, "right");
+        assert!(baseline.is_empty());
+        assert!(note.contains("对照侧"), "{note}");
+
+        // 连接没打开用于对比：保留带入说明，不改动已选的两侧。
+        let missing = CompareContext { connection_id: "gone".into(), ..context.clone() };
+        pane.update(cx, |pane, cx| pane.open_context(Some(missing), cx));
+        let (baseline_now, target_now) = pane.update(cx, |pane, _| pane.sides());
+        let note = pane.update(cx, |pane, _| pane.context_note().to_owned());
+        assert_eq!(target_now, "right", "缺失的一侧不能顶掉已选目标");
+        assert_eq!(baseline_now, baseline);
+        assert!(note.contains("还没有打开用于对比"), "{note}");
+
+        // 没有上下文：说清缺什么，不假装带了目标。
+        pane.update(cx, |pane, cx| pane.open_context(None, cx));
+        assert!(pane.update(cx, |pane, _| pane.context().is_none()));
+        assert_eq!(
+            pane.update(cx, |pane, _| pane.context_note().to_owned()),
+            pane.update(cx, |pane, _| pane.text("compare.context.none"))
+        );
+
+        // 返回入口只置位一次，由外壳取走后恢复原工作项与焦点。
+        pane.update(cx, |pane, cx| pane.command("compare-back", cx));
+        assert!(pane.update(cx, |pane, _| pane.take_back()));
+        assert!(!pane.update(cx, |pane, _| pane.take_back()));
     }
 }
 
