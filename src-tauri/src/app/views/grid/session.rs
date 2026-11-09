@@ -183,6 +183,8 @@ pub struct SharedGrid {
     schema: Option<TableSchema>,
     search: String,
     find_scope: FindScope,
+    /// 目标表所在连接是否仍然可用（已打开且未失联）；会话自己拿不到服务，由 GridPane 同步。
+    target_live: bool,
     filters: Vec<FilterDraft>,
     /// 最近一次应用筛选时的非法输入原因；不解成请求，也不改已有结果。
     filter_error: Option<String>,
@@ -242,6 +244,7 @@ impl SharedGrid {
             schema: None,
             search: String::new(),
             find_scope: FindScope::Loaded,
+            target_live: true,
             filters: Vec::new(),
             filter_error: None,
             read_failure: None,
@@ -573,8 +576,18 @@ impl SharedGrid {
         self.recompute();
     }
 
+    /// 目标连接是否仍可用：只有它为真时整表筛选才可能重新读表。
+    pub fn target_live(&self) -> bool {
+        self.target_live
+    }
+
+    /// 连接已打开、失联或关闭会随时变化；界面每次操作和每帧都把真实状态同步进来。
+    pub fn set_target_live(&mut self, live: bool) {
+        self.target_live = live;
+    }
+
     /// 服务器范围筛选要求这个网格能重新读取某张表才能成立。
-    /// 查询结果已由语句返回、没有目标表，都不该给出一个点了却不发请求的开关。
+    /// 查询结果已由语句返回、没有目标表、目标连接已关闭或失联，都不该给出一个点了却不发请求的开关。
     pub fn find_scope_block(&self) -> Option<&'static str> {
         if self.mode == GridMode::Query {
             return Some("grid.find.scopeQueryOnly");
@@ -582,7 +595,21 @@ impl SharedGrid {
         if self.target.connection_id.is_empty() || self.target.table.is_empty() {
             return Some("grid.find.scopeNoTable");
         }
+        // 表目标还在，但连接不能重新读取：切到服务器范围只会让关键字静默失效。
+        if !self.target_live {
+            return Some("grid.find.scopeOffline");
+        }
         None
+    }
+
+    /// 整表筛选生效期间连接丢失：退回已读取行，关键字继续在本地筛；返回是否真的退回了。
+    pub fn demote_server_find_scope(&mut self) -> bool {
+        if self.find_scope != FindScope::Server || self.find_scope_block().is_none() {
+            return false;
+        }
+        self.find_scope = FindScope::Loaded;
+        self.recompute();
+        true
     }
 
     /// 切到服务器范围表示"在整表里筛选"，调用方需要重新读取；切回来同样重读。

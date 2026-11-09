@@ -278,6 +278,8 @@ impl GridPane {
     }
 
     pub fn command(&mut self, id: &str, cx: &mut Context<Self>) -> Option<String> {
+        // 先对齐连接状态：连接在整表筛选期间丢失时，这个命令里的查找/翻页都按已读取行处理。
+        self.sync_find_scope();
         let copied = match id {
             "edit-cell" => {
                 self.select_first_if_needed();
@@ -444,8 +446,19 @@ impl GridPane {
         !self.session.target.connection_id.is_empty() && self.services.connections.catalog_session(&self.session.target.connection_id).is_some()
     }
 
+    /// 连接状态在界面外也会变（关闭、失联、重连）。每次操作和每帧都同步一次：
+    /// 整表筛选失去可重新读取的表时退回已读取行，并留下具体原因。
+    fn sync_find_scope(&mut self) -> Option<&'static str> {
+        self.session.set_target_live(self.live_target());
+        if self.session.demote_server_find_scope() {
+            self.notice = i18n::text(self.locale, "grid.find.scopeOffline");
+        }
+        self.session.find_scope_block()
+    }
+
     /// 条件、排序或查找范围改变后：表数据从第一页重读，查询结果只在本地重排。
     fn reload_after_condition_change(&mut self, cx: &mut Context<Self>) {
+        self.sync_find_scope();
         if self.session.mode == GridMode::Table && self.live_target() {
             let limit = self.session.page_limit().max(1);
             // 条件变了，旧偏移指向另一组行；选择仍按行 id 重新挂回。
@@ -538,10 +551,19 @@ impl GridPane {
     }
 
     /// 查找范围：已读取行（本地）或整表（服务器筛选，需要重读）。
-    /// 查询结果和没有目标表时不能切到整表筛选：给出原因，而不是让关键字静默失效。
+    /// 查询结果、没有目标表、连接已关闭或失联时不能切到整表筛选：给出原因，
+    /// 而不是让关键字静默失效；关键字继续作用于已读取行。
     pub fn set_find_scope(&mut self, scope: FindScope, cx: &mut Context<Self>) -> bool {
         if self.session.find_scope() == scope {
             return true;
+        }
+        if scope == FindScope::Server {
+            if let Some(reason) = self.sync_find_scope() {
+                self.notice = i18n::text(self.locale, reason);
+                self.sync_table(cx);
+                cx.notify();
+                return false;
+            }
         }
         match self.session.set_find_scope(scope) {
             Ok(()) => {
@@ -1136,12 +1158,13 @@ impl Render for GridPane {
         let loading = self.loading_more || self.fetching;
         // 无匹配、表为空、加载中、还有更多、已到末尾各自有说法，不用同一个空列表。
         let state_text = SharedString::from(self.session.state_text(loading));
+        // 查询结果、没有目标表、连接已关闭或失联时，整表筛选的开关不该看起来可以用。
+        // 这里同时把失去连接的整表筛选退回已读取行，原因随后一起画出来。
+        let scope_block = self.sync_find_scope();
         let find_scope = self.session.find_scope();
         // 排序状态不依赖焦点：表头有方向标记，状态栏也写出列名和方向。
         let sort_text = self.session.sort_text();
         let unapplied = self.session.unapplied_filters();
-        // 查询结果和没有目标表时，整表筛选的开关不该看起来可以用。
-        let scope_block = self.session.find_scope_block();
         let sort_dir = self.focused_column_name().and_then(|name| self.session.sort_for(&name));
         let sort_icon = if sort_dir == Some(true) { IconName::ArrowDownWideNarrow } else { IconName::ArrowUpNarrowWide };
         let sort_label = match sort_dir {
@@ -2577,17 +2600,17 @@ mod pane_tests {
         cx.update(|cx| {
             pane.update(cx, |pane, cx| {
                 assert_eq!(pane.session.find_scope(), FindScope::Loaded);
-                assert!(pane.session.find_scope_block().is_none(), "有目标表的网格可以整表筛选");
+                // 摆上的快照没有打开的连接：重新读取不可能成功，开关如实说明而不是假装可用。
+                assert_eq!(pane.session.find_scope_block(), Some("grid.find.scopeOffline"));
                 pane.session.set_search("乙");
                 assert_eq!(pane.loaded_len(), 1, "已读取行查找在本地生效");
-                // 切到整表筛选后不在本地重复筛，关键字随请求下发。
-                assert!(pane.set_find_scope(FindScope::Server, cx));
-                assert_eq!(pane.session.find_scope(), FindScope::Server);
-                assert_eq!(pane.session.server_search().as_deref(), Some("乙"));
-                assert_eq!(pane.loaded_len(), 2);
-                assert!(pane.toggle_find_scope(cx));
+                // 连接没打开时切整表筛选没有意义：不发请求，原因写出来，关键字仍在本地生效。
+                assert!(!pane.set_find_scope(FindScope::Server, cx));
                 assert_eq!(pane.session.find_scope(), FindScope::Loaded);
                 assert_eq!(pane.session.server_search(), None);
+                assert_eq!(pane.notice, i18n::text(Locale::ZhCn, "grid.find.scopeOffline"));
+                assert_eq!(pane.loaded_len(), 1, "关键字没有被静默停用");
+                assert!(!pane.toggle_find_scope(cx), "同一个不可用原因也挡住开关");
             });
         });
         // 没有目标表时整表筛选不可用：给出原因，关键字仍只在已读取行里生效。
@@ -2602,6 +2625,91 @@ mod pane_tests {
                 assert_eq!(pane.session.server_search(), None);
             });
         });
+    }
+
+    /// 真实表 + 真实连接：整表筛选只在连接可用时成立。连接关掉后不能切进服务器范围，
+    /// 已经在整表筛选里的关键字退回已读取行继续生效，并写出具体原因。
+    #[gpui_kit::test]
+    fn whole_table_filter_needs_a_live_connection_and_keeps_the_keyword(cx: &mut TestAppContext) {
+        // 真实读取在 tokio 线程上完成，等待它必须允许调度器挂起线程。
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("rillsql-grid-find-scope-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("notes.sqlite");
+        let config = dir.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime_for_views().spawn(async move {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO customers (id, name) VALUES (1, '甲'), (2, '乙')").execute(&pool).await.unwrap();
+            pool.close().await;
+            let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(config.join("connections.sqlite")))));
+            services.connections.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+            let _ = tx.send(services);
+        });
+        let services = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite 夹具");
+        cx.update(gpui_kit::init);
+        let (window, pane) = cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(1100.), px(720.)) };
+            gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |window, cx| cx.new(|cx| GridPane::new(Arc::clone(&services), window, cx)),
+            )
+            .expect("grid pane")
+        });
+        // 打开并读到真实表的两行。
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.open_table(target(), 50, cx)));
+        assert!(wait_for_fetch(cx, window, &pane), "真实读取应在超时前结束");
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.loaded_len(), 2, "真实表读回两行");
+            assert!(pane.session.find_scope_block().is_none(), "连接可用时整表筛选成立");
+        });
+        // 关键字先在已读取行里筛。
+        cx.update(|cx| pane.update(cx, |pane, _| pane.session.set_search("乙")));
+        cx.update(|cx| assert_eq!(pane.read(cx).loaded_len(), 1, "已读取行查找在本地生效"));
+        // 连接还开着：切到整表筛选真的发请求，只剩服务器筛过的一行。
+        cx.update(|cx| assert!(pane.update(cx, |pane, cx| pane.set_find_scope(FindScope::Server, cx)), "连接可用时应能切整表筛选"));
+        assert!(wait_for_fetch(cx, window, &pane), "整表筛选应真的发请求");
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.find_scope(), FindScope::Server);
+            assert_eq!(pane.session.server_search().as_deref(), Some("乙"));
+            assert_eq!(pane.loaded_len(), 1);
+            assert!(pane.session.find_scope_block().is_none(), "连接仍可用");
+        });
+        // 连接被关掉：整表筛选退回已读取行，关键字继续本地生效，并写出原因。
+        services.connections.disconnect("notes");
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.find_scope_block(), Some("grid.find.scopeOffline"), "开关此时应禁用并给原因");
+            assert_eq!(pane.session.find_scope(), FindScope::Loaded, "不能停在一个发不出请求的范围");
+            assert_eq!(pane.notice, i18n::text(Locale::ZhCn, "grid.find.scopeOffline"));
+            assert_eq!(pane.session.server_search(), None);
+            assert_eq!(pane.loaded_len(), 1, "关键字仍在已读取行里生效");
+        });
+        // 再点整表筛选：不发请求、原因照旧，关键字仍能筛本地行。
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.session.set_search("甲");
+                assert_eq!(pane.loaded_len(), 0, "关键字仍在本地筛");
+                pane.session.set_search("乙");
+                assert_eq!(pane.loaded_len(), 1);
+                assert!(!pane.set_find_scope(FindScope::Server, cx), "连接关闭后不能切到整表筛选");
+                assert_eq!(pane.session.find_scope(), FindScope::Loaded);
+                assert_eq!(pane.session.server_search(), None);
+                assert_eq!(pane.notice, i18n::text(Locale::ZhCn, "grid.find.scopeOffline"), "原因要显示出来");
+                assert_eq!(pane.loaded_len(), 1);
+                assert!(!pane.fetching(), "没有发新请求");
+            });
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[gpui_kit::test]

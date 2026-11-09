@@ -311,6 +311,7 @@ dict! {
     "grid.find.loaded" => "查找已读取行", "Find in loaded rows";
     "grid.find.server" => "整表筛选", "Filter whole table";
     "grid.find.scopeQueryOnly" => "查询结果只能在已读取行内查找，网格不会重新执行语句。", "Query results can only be searched in the loaded rows; the grid will not re-run the statement.";
+    "grid.find.scopeOffline" => "目标连接已关闭或已失联，这张表无法重新读取；整表筛选不可用，查找只作用于已读取行。", "The target connection is closed or lost, so this table cannot be re-read; whole-table filtering is unavailable and find only covers loaded rows.";
     "grid.find.scopeNoTable" => "没有可重新读取的表，整表筛选不可用；查找只作用于已读取行。", "There is no table to re-read, so whole-table filtering is unavailable; find only covers loaded rows.";
     "grid.filter.unapplied" => "未应用", "Not applied";
     "grid.filter.title" => "筛选条件", "Filters";
