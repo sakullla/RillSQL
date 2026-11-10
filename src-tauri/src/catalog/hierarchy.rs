@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::catalog::model::{
-    kind_name, listed_kinds, ConnStatus, DatabaseNode, Engine, ObjectKind, ObjectRow, SchemaNode,
+    kind_name, listed_kinds, ConnStatus, DatabaseNode, Engine, KindReport, ObjectKind, ObjectRow, SchemaNode,
 };
 
 /// 节点种类。列和索引是对象的按需子节点，不参与对象种类。
@@ -563,7 +563,7 @@ impl NavTree {
             group.schema = schema.name.clone();
             group.name = kind_name(*kind).to_owned();
             group.object_kind = Some(*kind);
-            group.error = failed;
+            group.error = failed.clone();
             group.expandable = true;
             // 没有按种类细分时，用模式总量判断是否还有下一页。
             let only_kind = schema.objects.iter().all(|object| object.kind == *kind);
@@ -575,6 +575,26 @@ impl NavTree {
             group.has_more = false;
             let _ = index;
             self.attach(parent_id, group);
+            if failed.is_some() {
+                // 这一类本轮读取失败：上一轮已读到的对象原样保留（不标 stale、不移除），
+                // 原因只挂在分组上；下一次读取成功时再按正常规则判断缺失。
+                let kept: Vec<NavNode> = previous
+                    .values()
+                    .filter(|old| old.kind == NavKind::Object && old.parent.as_deref() == Some(group_id.as_str()))
+                    .cloned()
+                    .collect();
+                for mut old in kept {
+                    let object_id = old.id.clone();
+                    old.children = Vec::new();
+                    self.attach(&group_id, old);
+                    self.restore_details(previous, &object_id);
+                }
+                if let Some(group) = self.nodes.get_mut(&group_id) {
+                    group.loaded = group.children.len();
+                    group.total = group.total.max(group.loaded);
+                }
+                continue;
+            }
             for object in &objects {
                 let object_id = object_node_id(&connection.id, database, &schema.name, object);
                 let node = self.object_node(connection, database, &schema.name, object, &object_id);
@@ -1003,7 +1023,16 @@ impl NavTree {
     /// 库/模式的“刷新此节点”：从第一页重新读这个范围的对象。
     /// 失败时保留已有子项，只把原因留在这个节点；成功时补上新对象，
     /// 读完整个范围时把不见的旧对象按整树刷新的规则标 stale/移除。展开状态不动。
-    pub fn reload_scope(&mut self, scope_id: &str, objects: &[ObjectRow], total: usize, error: Option<String>) -> bool {
+    /// `kind_reports` 里读取失败的种类：这一类的已有对象原样保留、不参与缺失判断，
+    /// 原因挂在这一类的分组上（分组不存在时补一个只带错误的分组）。
+    pub fn reload_scope(
+        &mut self,
+        scope_id: &str,
+        objects: &[ObjectRow],
+        total: usize,
+        error: Option<String>,
+        kind_reports: &[KindReport],
+    ) -> bool {
         let Some(scope) = self.nodes.get(scope_id).cloned() else { return false };
         if let Some(message) = error {
             if let Some(node) = self.nodes.get_mut(scope_id) {
@@ -1016,21 +1045,18 @@ impl NavTree {
         let mut read: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let connection = NavConnection::new(scope.connection_id.clone(), scope.connection_name.clone(), scope.engine, ConnStatus::Connected);
         let mut added = false;
+        // 读取失败的种类：分组 id → 原因。
+        let mut failed: BTreeMap<String, String> = BTreeMap::new();
+        for report in kind_reports {
+            if let Some(message) = report.error.clone() {
+                let group_id = self.ensure_scope_group(scope_id, &scope, report.kind);
+                failed.insert(group_id, message);
+            }
+        }
         for object in objects {
-            let group_id = group_node_id(&scope.connection_id, &scope.database, &scope.schema, object.kind);
-            if !self.nodes.contains_key(&group_id) {
-                let mut group = NavNode::new(NavKind::Group, group_id.clone(), String::new());
-                group.label_key = Some(kind_label_key(object.kind));
-                group.path = schema_path(&scope.connection_name, &scope.database, &scope.schema, object.kind);
-                group.connection_id = scope.connection_id.clone();
-                group.connection_name = scope.connection_name.clone();
-                group.engine = scope.engine;
-                group.database = scope.database.clone();
-                group.schema = scope.schema.clone();
-                group.name = kind_name(object.kind).to_owned();
-                group.object_kind = Some(object.kind);
-                group.expandable = true;
-                self.attach(scope_id, group);
+            let group_id = self.ensure_scope_group(scope_id, &scope, object.kind);
+            if failed.contains_key(&group_id) {
+                continue;
             }
             let object_id = object_node_id(&scope.connection_id, &scope.database, &scope.schema, object);
             read.entry(group_id.clone()).or_default().insert(object_id.clone());
@@ -1051,6 +1077,9 @@ impl NavTree {
                 .collect();
             let empty = BTreeSet::new();
             for group in groups {
+                if failed.contains_key(&group) {
+                    continue;
+                }
                 let ids = read.get(&group).unwrap_or(&empty).clone();
                 self.retire_missing(&group, &ids);
             }
@@ -1062,6 +1091,14 @@ impl NavTree {
                 group.error = None;
             }
         }
+        for (group_id, message) in failed {
+            if let Some(group) = self.nodes.get_mut(&group_id) {
+                group.loading = false;
+                group.error = Some(message);
+                group.loaded = group.children.len();
+                group.total = group.total.max(group.loaded);
+            }
+        }
         if let Some(node) = self.nodes.get_mut(scope_id) {
             node.loading = false;
             node.error = None;
@@ -1070,6 +1107,26 @@ impl NavTree {
             node.has_more = node.loaded < node.total;
         }
         added
+    }
+
+    /// 范围节点下某一类对象的分组；还没有时补一个空分组。返回分组 id。
+    fn ensure_scope_group(&mut self, scope_id: &str, scope: &NavNode, kind: ObjectKind) -> String {
+        let group_id = group_node_id(&scope.connection_id, &scope.database, &scope.schema, kind);
+        if !self.nodes.contains_key(&group_id) {
+            let mut group = NavNode::new(NavKind::Group, group_id.clone(), String::new());
+            group.label_key = Some(kind_label_key(kind));
+            group.path = schema_path(&scope.connection_name, &scope.database, &scope.schema, kind);
+            group.connection_id = scope.connection_id.clone();
+            group.connection_name = scope.connection_name.clone();
+            group.engine = scope.engine;
+            group.database = scope.database.clone();
+            group.schema = scope.schema.clone();
+            group.name = kind_name(kind).to_owned();
+            group.object_kind = Some(kind);
+            group.expandable = true;
+            self.attach(scope_id, group);
+        }
+        group_id
     }
 
     /// 对象节点下已经读到的列：(列名, 是否主键)。列还没读过时返回 None。

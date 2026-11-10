@@ -148,6 +148,41 @@ pub fn append_text(draft: &str, text: &str) -> String {
     }
 }
 
+/// 把一段文本插到草稿的字节偏移 `at` 处（越界时按末尾，落在字符中间时退到字符开头）。
+/// 前后有内容时补到正好一个空行作分隔，已有的换行算数；已有文本一个字也不改。
+/// 返回新草稿和插入文本末尾的字节偏移。
+pub fn insert_text_at(draft: &str, at: usize, text: &str) -> (String, usize) {
+    let mut at = at.min(draft.len());
+    while !draft.is_char_boundary(at) {
+        at -= 1;
+    }
+    if text.is_empty() {
+        return (draft.to_owned(), at);
+    }
+    let (before, after) = draft.split_at(at);
+    let trailing = before
+        .trim_end_matches([' ', '\t', '\r'])
+        .chars()
+        .rev()
+        .take_while(|ch| *ch == '\n')
+        .count();
+    let leading = after
+        .trim_start_matches([' ', '\t', '\r'])
+        .chars()
+        .take_while(|ch| *ch == '\n')
+        .count();
+    let lead = if before.trim().is_empty() { 0 } else { 2usize.saturating_sub(trailing) };
+    let tail = if after.trim().is_empty() { 0 } else { 2usize.saturating_sub(leading) };
+    let mut out = String::with_capacity(draft.len() + text.len() + lead + tail);
+    out.push_str(before);
+    out.push_str(&"\n".repeat(lead));
+    out.push_str(text);
+    let end = out.len();
+    out.push_str(&"\n".repeat(tail));
+    out.push_str(after);
+    (out, end)
+}
+
 /// Redis 的键浏览规格：连接|名称|库号。
 pub fn redis_spec(connection_id: &str, connection_name: &str, keyspace: &str) -> String {
     format!("{connection_id}|{connection_name}|{keyspace}")

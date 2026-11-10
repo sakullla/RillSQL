@@ -162,7 +162,7 @@ impl Workbench {
         {
             // 插入前先把编辑器里的最新文本收回草稿，追加时才不会丢掉刚输入的内容。
             // 对象树菜单和导航命令走同一条捕获路径。
-            self.forward_query("capture", cx);
+            self.capture_query(cx);
         }
         // 查询命令只在查询工作项处于活动状态时生效；表格/结构等页面不能操作隐藏查询。
         if requires_active_query(id) && !self.active_query_context() {
@@ -465,6 +465,14 @@ impl Workbench {
                 engine: tab.engine.clone(),
             })
             .collect()
+    }
+
+    /// 把编辑器里的最新文本收回草稿，并把光标/选区交给模型（SQL 模板按它插入）。
+    fn capture_query(&mut self, cx: &mut Context<Self>) {
+        self.forward_query("capture", cx);
+        if let Some((tab_id, from, to)) = self.query.read(cx).captured_selection() {
+            self.model.set_draft_cursor(&tab_id, from, to);
+        }
     }
 
     fn forward_query(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -865,11 +873,12 @@ impl Workbench {
         let (tx, rx) = tokio::sync::oneshot::channel();
         jobs::runtime().spawn(async move {
             let Some(session) = services.connections.catalog_session(&node.connection_id) else {
-                let _ = tx.send((Vec::new(), 0, Some("这条连接还没有打开".to_owned())));
+                let _ = tx.send((Vec::new(), 0, Some("这条连接还没有打开".to_owned()), Vec::new()));
                 return;
             };
             let body = crate::catalog::read_object_page(&session, node.engine, &node.database, &node.schema, 0, page).await;
-            let _ = tx.send((body.objects, body.total, body.error));
+            // 按种类的失败一并带回：失败的种类不能当成“整类都被删了”。
+            let _ = tx.send((body.objects, body.total, body.error, body.kind_reports));
         });
         cx.spawn(async move |_, cx| {
             let result = rx.await;
@@ -877,11 +886,11 @@ impl Workbench {
                 let Some(view) = view.upgrade() else { return };
                 view.update(cx, |this, cx| {
                     match result {
-                        Ok((objects, total, error)) => {
-                            this.model.nav.reload_scope(&node_id, &objects, total, error);
+                        Ok((objects, total, error, kind_reports)) => {
+                            this.model.nav.reload_scope(&node_id, &objects, total, error, &kind_reports);
                         }
                         Err(_) => {
-                            this.model.nav.reload_scope(&node_id, &[], 0, Some("刷新对象失败".to_owned()));
+                            this.model.nav.reload_scope(&node_id, &[], 0, Some("刷新对象失败".to_owned()), &[]);
                         }
                     }
                     cx.notify();
@@ -1050,7 +1059,7 @@ impl Workbench {
                     };
                     if this.model.template_waits_for(&node_id) {
                         // 模板要并入草稿：先把编辑器里的最新文本收回来，追加时才不会丢。
-                        this.forward_query("capture", cx);
+                        this.capture_query(cx);
                     }
                     this.model.nav_details_loaded(&node_id, columns, indexes);
                     cx.notify();

@@ -281,6 +281,11 @@ pub struct WorkbenchModel {
     pub nav_source: Vec<NavConnection>,
     /// 对象树菜单右键的那一行；菜单动作只认它，绝不回落到别的对象。
     pub nav_menu_node: Option<String>,
+    /// “刷新此节点”按整条连接重读时：连接 id → 被点的节点。
+    /// 读取失败时保留原子树并把原因挂在这个节点上，而不是用空结果重建。
+    pub nav_node_refresh: std::collections::BTreeMap<String, String>,
+    /// 最近一次从编辑器收回的光标/选区：(查询项, 起, 止)，字节偏移。SQL 模板按它插入。
+    pub draft_cursor: Option<(String, usize, usize)>,
     pub exchange_open: bool,
     /// 导入、导出、dump 或 migrate 仍在跑。关闭守卫把它和网格暂存、查询草稿分开。
     pub exchange_running: bool,
@@ -357,6 +362,8 @@ impl WorkbenchModel {
             nav_loading: 0,
             nav_source: Vec::new(),
             nav_menu_node: None,
+            nav_node_refresh: std::collections::BTreeMap::new(),
+            draft_cursor: None,
             exchange_open: false,
             exchange_running: false,
             compare_running: false,
@@ -1288,8 +1295,19 @@ impl WorkbenchModel {
     pub fn apply_navigation(&mut self, connections: &[NavConnection], partial: bool) -> bool {
         self.nav_loading = self.nav_loading.saturating_sub(1);
         self.nav_error.clear();
+        // “刷新此节点”触发的整条连接重读如果失败了：不重建这条连接，
+        // 原子树（包括续读、局部刷新补上的对象）原样留着，原因挂在被点的节点上。
+        let mut kept: Vec<(String, String)> = Vec::new();
+        let mut updated = !partial;
         if partial {
             for connection in connections {
+                if let Some(node_id) = self.nav_node_refresh.remove(&connection.id) {
+                    if let Some(message) = self.node_refresh_failure(&node_id, connection) {
+                        kept.push((node_id, message));
+                        continue;
+                    }
+                }
+                updated = true;
                 match self.nav_source.iter_mut().find(|item| item.id == connection.id) {
                     Some(slot) => *slot = connection.clone(),
                     None => self.nav_source.push(connection.clone()),
@@ -1298,8 +1316,15 @@ impl WorkbenchModel {
         } else {
             self.nav_source = connections.to_vec();
         }
-        let snapshot = self.nav_source.clone();
-        let changed = self.nav.apply(&snapshot);
+        let changed = if updated {
+            let snapshot = self.nav_source.clone();
+            self.nav.apply(&snapshot)
+        } else {
+            false
+        };
+        for (node_id, message) in kept {
+            self.nav.set_error(&node_id, message);
+        }
         self.sync_object_spec_from_focus();
         if self.nav.focus().is_none() {
             self.nav.focus_first();
@@ -1312,6 +1337,57 @@ impl WorkbenchModel {
     pub fn nav_failed(&mut self, message: impl Into<String>) {
         self.nav_loading = self.nav_loading.saturating_sub(1);
         self.nav_error = message.into();
+        // 等着整条连接重读的“刷新此节点”：树没动，原因也挂到被点的节点上。
+        let pending = std::mem::take(&mut self.nav_node_refresh);
+        for node_id in pending.into_values() {
+            self.nav.set_error(&node_id, self.nav_error.clone());
+        }
+    }
+
+    /// “刷新此节点”的整条连接重读是否算失败：连接级读取报错；或者被点节点范围内
+    /// 原本有子项、没有错误的库/模式这次读取报错。一直就报错的库（例如 PostgreSQL
+    /// 不在当前会话里的库）不算，否则这条连接永远刷新不了。返回要挂在节点上的原因。
+    fn node_refresh_failure(&self, node_id: &str, incoming: &NavConnection) -> Option<String> {
+        use crate::catalog::hierarchy::{database_node_id, schema_node_id};
+        if let Some(message) = &incoming.error {
+            return Some(message.clone());
+        }
+        let node = self.nav.node(node_id)?;
+        let scope = match node.kind {
+            NavKind::Connection | NavKind::Keyspace => None,
+            _ => Some(node.database.clone()),
+        };
+        // 只看有没有子项：读取报错的库/模式在树上本来就没有子项；上一次刷新失败而保留下来的
+        // 子树虽然带着错误，再失败一次也必须继续保留。
+        let had_children = |id: &str| self.nav.node(id).is_some_and(|node| !node.children.is_empty());
+        for database in &incoming.databases {
+            if scope.as_deref().is_some_and(|name| name != database.name) {
+                continue;
+            }
+            if let Some(message) = &database.error {
+                if had_children(&database_node_id(&incoming.id, &database.name)) {
+                    return Some(message.clone());
+                }
+                continue;
+            }
+            for schema in &database.schemas {
+                let Some(message) = &schema.error else { continue };
+                // 没有模式层的引擎（MySQL/MongoDB/SQLite）对象直接挂在库或连接下面。
+                let schema_id = schema_node_id(&incoming.id, &database.name, &schema.name);
+                let database_id = database_node_id(&incoming.id, &database.name);
+                let container = if self.nav.node(&schema_id).is_some() {
+                    schema_id
+                } else if self.nav.node(&database_id).is_some() {
+                    database_id
+                } else {
+                    crate::catalog::hierarchy::connection_node_id(&incoming.id)
+                };
+                if had_children(&container) {
+                    return Some(message.clone());
+                }
+            }
+        }
+        None
     }
 
     pub fn request_nav_refresh(&mut self, connection: Option<String>) {
@@ -1937,6 +2013,11 @@ impl WorkbenchModel {
         }
     }
 
+    /// 视图把编辑器当前的光标/选区（字节偏移）交给模型；SQL 模板按它插入。
+    pub fn set_draft_cursor(&mut self, tab_id: &str, from: usize, to: usize) {
+        self.draft_cursor = Some((tab_id.to_owned(), from, to));
+    }
+
     /// 视图取走要写进系统剪贴板的文本。
     pub fn take_clipboard(&mut self) -> Option<String> {
         self.clipboard_out.take()
@@ -1958,6 +2039,8 @@ impl WorkbenchModel {
             _ => false,
         };
         if whole_connection {
+            // 结果回来时按这个节点判断失败：失败就保留原子树，原因挂在这里。
+            self.nav_node_refresh.insert(node.connection_id.clone(), node_id.to_owned());
             self.request_nav_refresh(Some(node.connection_id.clone()));
             return;
         }
@@ -2031,8 +2114,23 @@ impl WorkbenchModel {
     /// 模板只写草稿，不执行。当前不是查询项时，新开一个绑定这个对象连接与库的查询。
     fn insert_template(&mut self, kind: TemplateKind, object: &ObjectKey, columns: &[(String, bool)]) {
         let text = nav::template_text(kind, object, columns);
-        if self.active_tab().is_some_and(|tab| tab.kind.is_query()) {
-            self.insert_into_draft(text);
+        let active = self.active_tab().filter(|tab| tab.kind.is_query()).map(|tab| tab.id.clone());
+        if let Some(tab_id) = active {
+            // 插在最近一次收回的光标处；有选区时插在选区开头，不替换、不删除选中的文本。
+            // 还没有这一项的光标时（例如编辑器尚未创建）按末尾追加。
+            let at = self
+                .draft_cursor
+                .as_ref()
+                .filter(|(id, _, _)| *id == tab_id)
+                .map(|(_, from, to)| (*from).min(*to));
+            let Some(tab) = self.tabs.iter_mut().find(|item| item.id == tab_id) else { return };
+            let at = at.unwrap_or(tab.draft.len());
+            let (draft, end) = nav::insert_text_at(&tab.draft, at, &text);
+            tab.draft = draft;
+            // 连续插入时接在刚插入的文本后面。
+            self.draft_cursor = Some((tab_id, end, end));
+            self.shell.page = AppPage::Workspace;
+            self.shell.focus = FocusTarget::Editor;
         } else {
             self.open_bound_query(
                 text,

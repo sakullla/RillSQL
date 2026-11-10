@@ -5178,7 +5178,7 @@ fn refreshing_a_node_keeps_expansion_children_and_marks_removed_objects() {
     assert!(model.nav.node(&schema).unwrap().loading);
     let audit = ObjectRow::table("audit", Some(0));
     let fresh = vec![ObjectRow::table("orders", Some(2)), audit.clone(), ObjectRow::view("recent")];
-    model.nav.reload_scope(&schema, &fresh, 3, None);
+    model.nav.reload_scope(&schema, &fresh, 3, None, &[]);
     assert!(model.nav.is_expanded(&tables) && model.nav.is_expanded(&views), "刷新后展开保持");
     assert!(model.nav.node(&nav_id("pg", "shop", "public", &audit)).is_some());
     assert!(!model.nav.node(&schema).unwrap().loading);
@@ -5187,7 +5187,7 @@ fn refreshing_a_node_keeps_expansion_children_and_marks_removed_objects() {
     let children_before = model.nav.node(&tables).unwrap().children.clone();
     let _ = model.dispatch(&format!("nav-refresh-node:{schema}"));
     assert_eq!(model.take_nav_request(), Some(NavRequest::Reload(schema.clone())));
-    model.nav.reload_scope(&schema, &[], 0, Some("连接中断".into()));
+    model.nav.reload_scope(&schema, &[], 0, Some("连接中断".into()), &[]);
     assert_eq!(model.nav.node(&schema).unwrap().error.as_deref(), Some("连接中断"));
     assert_eq!(model.nav.node(&tables).unwrap().children, children_before, "失败不清空子树");
     assert!(model.nav.is_expanded(&tables) && model.nav.is_expanded(&views));
@@ -5213,6 +5213,232 @@ fn refreshing_a_node_keeps_expansion_children_and_marks_removed_objects() {
     let connection = connection_node_id("pg");
     let _ = model.dispatch(&format!("nav-refresh-node:{connection}"));
     assert_eq!(model.take_nav_request(), Some(NavRequest::Refresh { connection: Some("pg".into()) }));
+}
+
+/// 模板插在草稿光标处，前后补空行分隔；有选区时插在选区开头且不删选中的文本；
+/// 光标不属于当前查询项时追加到末尾；插入对象名仍然追加到末尾，不受光标影响。
+#[test]
+fn sql_templates_insert_at_the_draft_cursor() {
+    let (mut model, orders) = pg_orders_model();
+    model.nav_details_loaded(&orders, Ok(order_columns()), Ok(Vec::new()));
+    let _ = model.dispatch("new-query");
+    let tab_id = model.active_tab().expect("查询项").id.clone();
+    let delete = "DELETE FROM \"public\".\"orders\"\nWHERE \"id\" = ?;";
+    let set_draft = |model: &mut WorkbenchModel, text: &str| {
+        model.tabs.iter_mut().find(|tab| tab.id == tab_id).unwrap().draft = text.to_owned();
+    };
+    let template = |model: &mut WorkbenchModel| {
+        assert!(model.open_nav_menu(&orders));
+        let _ = model.dispatch("tree-template-delete");
+        model.active_tab().unwrap().draft.clone()
+    };
+
+    // 光标在两条语句之间：插在那里，前后各留一个空行。
+    set_draft(&mut model, "SELECT 1;\nSELECT 2;");
+    model.set_draft_cursor(&tab_id, "SELECT 1;\n".len(), "SELECT 1;\n".len());
+    assert_eq!(template(&mut model), format!("SELECT 1;\n\n{delete}\n\nSELECT 2;"));
+    assert_eq!(model.executions, 0, "模板不执行");
+
+    // 选中了 “SELECT 2;”：插在选区开头，选中的文本原样保留。
+    set_draft(&mut model, "SELECT 1;\nSELECT 2;");
+    model.set_draft_cursor(&tab_id, "SELECT 1;\n".len(), "SELECT 1;\nSELECT 2;".len());
+    assert_eq!(template(&mut model), format!("SELECT 1;\n\n{delete}\n\nSELECT 2;"));
+
+    // 光标在开头：前面不加空行；已有的空行算数，不重复补。
+    set_draft(&mut model, "\n\nSELECT 2;");
+    model.set_draft_cursor(&tab_id, 0, 0);
+    assert_eq!(template(&mut model), format!("{delete}\n\nSELECT 2;"));
+
+    // 光标落在多字节字符中间：退到字符开头，不切坏文本。
+    set_draft(&mut model, "-- 订单");
+    model.set_draft_cursor(&tab_id, 4, 4);
+    assert_eq!(template(&mut model), format!("-- \n\n{delete}\n\n订单"));
+
+    // 连续插入：接在上一次插入的文本后面。
+    set_draft(&mut model, "SELECT 1;");
+    model.set_draft_cursor(&tab_id, 0, 0);
+    let _ = template(&mut model);
+    assert_eq!(template(&mut model), format!("{delete}\n\n{delete}\n\nSELECT 1;"));
+
+    // 光标属于别的查询项：不按它插入，追加到当前草稿末尾。
+    set_draft(&mut model, "SELECT 1;");
+    model.set_draft_cursor("another-tab", 0, 0);
+    assert_eq!(template(&mut model), format!("SELECT 1;\n\n{delete}"));
+
+    // 插入对象名保持原来的追加行为，不看光标。
+    set_draft(&mut model, "SELECT 1;");
+    model.set_draft_cursor(&tab_id, 0, 0);
+    assert!(model.open_nav_menu(&orders));
+    let _ = model.dispatch("tree-insert-object");
+    let draft = model.active_tab().unwrap().draft.clone();
+    assert!(draft.starts_with("SELECT 1;"), "{draft}");
+    assert!(draft.contains("orders"), "{draft}");
+}
+
+/// 种类读取失败：那一类已有的对象原样保留（不标 stale、再刷一次也不移除），原因挂在分组上；
+/// 库/模式刷新和整树刷新都一样。
+#[test]
+fn a_failed_object_kind_keeps_its_children_on_scope_and_full_refresh() {
+    use crate::app::shell::nav::NavRequest;
+    use crate::catalog::hierarchy::{connection_node_id, database_node_id, group_node_id, schema_node_id};
+    use crate::catalog::model::{DatabaseNode, KindReport, ObjectKind, ObjectRow, SchemaNode};
+    let (mut model, orders) = pg_orders_model();
+    let schema = schema_node_id("pg", "shop", "public");
+    let tables = group_node_id("pg", "shop", "public", ObjectKind::Table);
+    let views = group_node_id("pg", "shop", "public", ObjectKind::View);
+    let recent = nav_id("pg", "shop", "public", &ObjectRow::view("recent"));
+    expand_all(&mut model, &[connection_node_id("pg"), database_node_id("pg", "shop"), schema.clone(), tables.clone(), views.clone()]);
+    let failed_views = vec![KindReport { kind: ObjectKind::View, total: 0, error: Some("没有权限读取视图".into()) }];
+
+    for round in 0..2 {
+        let _ = model.dispatch(&format!("nav-refresh-node:{schema}"));
+        assert_eq!(model.take_nav_request(), Some(NavRequest::Reload(schema.clone())));
+        // 视图这一类读取失败：行和总数里都没有它，所以“整页读完”也不能判它缺失。
+        model.nav.reload_scope(&schema, &[ObjectRow::table("orders", Some(2))], 1, None, &failed_views);
+        let kept = model.nav.node(&recent).unwrap_or_else(|| panic!("第 {round} 次：失败的种类不移除已有对象"));
+        assert!(!kept.stale, "第 {round} 次：失败的种类不标 stale");
+        assert_eq!(model.nav.node(&views).unwrap().error.as_deref(), Some("没有权限读取视图"));
+        assert!(model.nav.node(&views).unwrap().children.contains(&recent));
+        assert!(model.nav.node(&tables).unwrap().error.is_none());
+        assert!(!model.nav.node(&orders).unwrap().stale);
+        assert!(model.nav.is_expanded(&views) && model.nav.is_expanded(&tables));
+        assert!(!model.nav.node(&schema).unwrap().loading);
+    }
+    // 这一类再读成功：错误清掉。
+    let _ = model.dispatch(&format!("nav-refresh-node:{schema}"));
+    let _ = model.take_nav_request();
+    model.nav.reload_scope(&schema, &[ObjectRow::table("orders", Some(2)), ObjectRow::view("recent")], 2, None, &[]);
+    assert!(model.nav.node(&views).unwrap().error.is_none());
+    assert!(model.nav.node(&recent).is_some_and(|node| !node.stale));
+
+    // 整树刷新里某一类读取失败：同样保留那一类的对象，原因挂在分组上。
+    let pg = nav_connection(
+        Engine::Postgres,
+        "pg",
+        "销售库",
+        vec![DatabaseNode {
+            name: "shop".into(),
+            schemas: vec![SchemaNode {
+                name: "public".into(),
+                objects: vec![ObjectRow::table("orders", Some(2))],
+                total: 1,
+                error: None,
+                kind_reports: failed_views.clone(),
+            }],
+            error: None,
+        }],
+    );
+    for round in 0..2 {
+        model.apply_navigation(std::slice::from_ref(&pg), false);
+        let kept = model.nav.node(&recent).unwrap_or_else(|| panic!("整树第 {round} 次：失败的种类不移除已有对象"));
+        assert!(!kept.stale);
+        assert_eq!(model.nav.node(&views).unwrap().error.as_deref(), Some("没有权限读取视图"));
+        assert!(model.nav.node(&views).unwrap().children.contains(&recent));
+        assert!(model.nav.is_expanded(&views));
+    }
+}
+
+/// 按整条连接重读的“刷新此节点”（连接行、PostgreSQL 库、SQLite 连接、MongoDB 库）：
+/// 读取失败时原子树和展开都留着，原因挂在被点的节点上；成功时照常重建并清掉错误。
+#[test]
+fn a_failed_connection_level_node_refresh_keeps_the_subtree() {
+    use crate::app::shell::nav::NavRequest;
+    use crate::catalog::hierarchy::{connection_node_id, database_node_id, group_node_id, schema_node_id};
+    use crate::catalog::model::{ObjectKind, ObjectRow};
+    let ids = |model: &WorkbenchModel| model.nav_rows().into_iter().map(|row| row.id).collect::<Vec<_>>();
+    let refresh = |model: &mut WorkbenchModel, node: &str, connection: &str| {
+        let _ = model.dispatch(&format!("nav-refresh-node:{node}"));
+        assert_eq!(model.take_nav_request(), Some(NavRequest::Refresh { connection: Some(connection.into()) }));
+    };
+
+    // PostgreSQL 连接行：连接级目录查询失败。
+    let (mut model, orders) = pg_orders_model();
+    let connection = connection_node_id("pg");
+    let database = database_node_id("pg", "shop");
+    let schema = schema_node_id("pg", "shop", "public");
+    let tables = group_node_id("pg", "shop", "public", ObjectKind::Table);
+    expand_all(&mut model, &[connection.clone(), database.clone(), schema.clone(), tables.clone()]);
+    let before = ids(&model);
+    assert!(before.contains(&orders));
+    refresh(&mut model, &connection, "pg");
+    let mut failed = nav_connection(Engine::Postgres, "pg", "销售库", Vec::new());
+    failed.error = Some("读取库表失败：连接被重置".into());
+    model.apply_navigation(&[failed], true);
+    assert_eq!(ids(&model), before, "失败不清空子树，展开保持");
+    assert_eq!(model.nav.node(&connection).unwrap().error.as_deref(), Some("读取库表失败：连接被重置"));
+    assert_eq!(model.nav_loading, 0);
+    assert!(model.nav_error.is_empty(), "原因在节点上，不在全局提示条");
+
+    // PostgreSQL 库行：这个库读取失败；再失败一次也仍保留。
+    for _ in 0..2 {
+        refresh(&mut model, &database, "pg");
+        let mut shop = nav_database("shop", Vec::new());
+        shop.schemas.clear();
+        shop.error = Some("权限不足".into());
+        model.apply_navigation(&[nav_connection(Engine::Postgres, "pg", "销售库", vec![shop])], true);
+        assert_eq!(ids(&model), before);
+        assert_eq!(model.nav.node(&database).unwrap().error.as_deref(), Some("权限不足"));
+    }
+    // 库下的模式读取失败：同样保留，原因挂在被点的库上。
+    refresh(&mut model, &database, "pg");
+    let mut shop = nav_database("shop", Vec::new());
+    shop.schemas[0].error = Some("模式读取失败".into());
+    model.apply_navigation(&[nav_connection(Engine::Postgres, "pg", "销售库", vec![shop])], true);
+    assert_eq!(ids(&model), before);
+    assert_eq!(model.nav.node(&database).unwrap().error.as_deref(), Some("模式读取失败"));
+    // 整个目录读取报错（例如列不出连接）：树不动，原因也挂到被点的节点上。
+    refresh(&mut model, &connection, "pg");
+    model.nav_failed("读取连接列表失败");
+    assert_eq!(ids(&model), before);
+    assert_eq!(model.nav.node(&connection).unwrap().error.as_deref(), Some("读取连接列表失败"));
+    assert!(model.nav_node_refresh.is_empty());
+    // 读取成功：照常重建，新对象出现，错误清掉，展开保持。
+    refresh(&mut model, &database, "pg");
+    let audit = ObjectRow::table("audit", Some(0));
+    let fresh = nav_connection(
+        Engine::Postgres,
+        "pg",
+        "销售库",
+        vec![nav_database("shop", vec![audit.clone(), ObjectRow::table("orders", Some(2)), ObjectRow::view("recent")])],
+    );
+    model.apply_navigation(&[fresh], true);
+    assert!(model.nav.node(&database).unwrap().error.is_none());
+    assert!(model.nav.node(&connection).unwrap().error.is_none());
+    assert!(ids(&model).contains(&nav_id("pg", "shop", "public", &audit)));
+    assert!(model.nav.is_expanded(&tables));
+
+    // SQLite：连接行是种类分组上面唯一的刷新入口。
+    let customers = ObjectRow::table("customers", Some(1));
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.apply_navigation(&[nav_connection(Engine::Sqlite, "lite", "本地", vec![nav_database("main", vec![customers.clone()])])], false);
+    let root = connection_node_id("lite");
+    let customers_id = nav_id("lite", "main", "", &customers);
+    expand_all(&mut model, &[root.clone(), group_node_id("lite", "main", "", ObjectKind::Table)]);
+    let before = ids(&model);
+    assert!(before.contains(&customers_id));
+    refresh(&mut model, &root, "lite");
+    let mut failed = nav_connection(Engine::Sqlite, "lite", "本地", Vec::new());
+    failed.error = Some("database is locked".into());
+    model.apply_navigation(&[failed], true);
+    assert_eq!(ids(&model), before);
+    assert_eq!(model.nav.node(&root).unwrap().error.as_deref(), Some("database is locked"));
+
+    // MongoDB 库行：按整条连接重读，失败时集合都留着。
+    let users = ObjectRow::table("users", None);
+    let mongo = nav_connection(Engine::Mongodb, "mg", "文档库", vec![nav_database("app", vec![users.clone()])]);
+    model.apply_navigation(&[mongo], true);
+    let app = database_node_id("mg", "app");
+    let users_id = nav_id("mg", "app", "", &users);
+    expand_all(&mut model, &[connection_node_id("mg"), app.clone()]);
+    let before = ids(&model);
+    assert!(before.contains(&users_id));
+    refresh(&mut model, &app, "mg");
+    let mut failed = nav_connection(Engine::Mongodb, "mg", "文档库", Vec::new());
+    failed.error = Some("读取库表失败：server selection timeout".into());
+    model.apply_navigation(&[failed], true);
+    assert_eq!(ids(&model), before);
+    assert_eq!(model.nav.node(&app).unwrap().error.as_deref(), Some("读取库表失败：server selection timeout"));
+    assert!(model.nav.node(&customers_id).is_some(), "其它连接不受影响");
 }
 
 /// 危险操作：生产（按 tone，自建标签也算）要输对名字；第一次点执行只待确认；取消不发语句；

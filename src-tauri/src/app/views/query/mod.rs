@@ -100,6 +100,8 @@ pub struct QueryPane {
     preview_kb: u64,
     object_page: usize,
     null_copy: String,
+    /// 最近一次 capture 时活动编辑器的选区：(标签, 起, 止)，字节偏移。外壳插入模板时用。
+    captured: Option<(String, usize, usize)>,
 }
 
 /// 只有一条成功、只读且被读取上限截断的语句才允许“加载更多”。
@@ -161,7 +163,13 @@ impl QueryPane {
             preview_kb: 1,
             object_page: 100,
             null_copy: "NULL".to_owned(),
+            captured: None,
         }
+    }
+
+    /// 最近一次 capture 记下的活动标签选区（字节偏移）。
+    pub fn captured_selection(&self) -> Option<(String, usize, usize)> {
+        self.captured.clone()
     }
 
     pub fn tree_objects(&self) -> &[TreeObject] {
@@ -626,6 +634,7 @@ impl QueryPane {
         self.desk.focus_tab(Some(&id));
         self.desk.set_tab_draft(&id, &text);
         self.desk.set_selection(range.start, range.end, range.end);
+        self.captured = Some((id.clone(), range.start, range.end));
         if let Some(link) = self.links.get_mut(&id) {
             link.editor = text;
             link.dirty = false;
