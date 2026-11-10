@@ -1441,7 +1441,9 @@ impl ComparePane {
     fn schema_input(&mut self, side: &'static str, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
         if let Some((state, _)) = self.schema_inputs.get(side) {
             let hint = SharedString::from(self.text("compare.dialog.schemaManualPlaceholder"));
-            state.update(cx, |state, cx| state.set_placeholder(hint, window, cx));
+            if state.read(cx).presentation().placeholder() != &hint {
+                state.update(cx, |state, cx| state.set_placeholder(hint, window, cx));
+            }
             return state.clone();
         }
         let placeholder = SharedString::from(self.text("compare.dialog.schemaManualPlaceholder"));

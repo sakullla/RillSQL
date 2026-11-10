@@ -108,7 +108,7 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
                 item("open-structure", "catalog.tree.viewStructure")
             };
             let diagram = if target == MenuTarget::NonDataObject {
-                disabled("open-diagram", "catalog.tree.diagram", "diagram.unsupported")
+                disabled("open-diagram", "catalog.tree.diagram", "catalog.tree.noStructure")
             } else {
                 item("open-diagram", "catalog.tree.diagram")
             };

@@ -1567,8 +1567,10 @@ impl WorkbenchModel {
             return true;
         }
         if let Some(rest) = id.strip_prefix("nav-open-structure:") {
-            if self.nav.node(rest).is_some_and(|node| node.engine == Engine::Mongodb) {
-                // 集合没有 SQL 结构；文档在集合浏览器里看。
+            if self.nav.node(rest).is_some_and(|node| {
+                node.engine == Engine::Mongodb || node.object().is_some_and(|object| !object.opens_data())
+            }) {
+                // 集合、触发器、例程、序列等没有表结构页；菜单和双击/Enter 走同一门控。
                 self.notice_key = Some("catalog.tree.noStructure");
                 self.notice_detail = self.nav.node(rest).map(|node| node.name.clone()).unwrap_or_default();
                 return true;
@@ -1582,6 +1584,11 @@ impl WorkbenchModel {
             return true;
         }
         if let Some(rest) = id.strip_prefix("nav-open-diagram:") {
+            if self.nav.node(rest).is_some_and(|node| node.object().is_some_and(|object| !object.opens_data())) {
+                self.notice_key = Some("catalog.tree.noStructure");
+                self.notice_detail = self.nav.node(rest).map(|node| node.name.clone()).unwrap_or_default();
+                return true;
+            }
             self.nav.set_focus(rest);
             self.sync_object_spec_from_focus();
             self.open_diagram_from_object();
