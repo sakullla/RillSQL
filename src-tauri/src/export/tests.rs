@@ -274,7 +274,11 @@ async fn confirmed_import_writes_sqlite_and_unconfirmed_or_invalid_targets_do_no
     assert_eq!(scalar_count(&file, "SELECT COUNT(*) FROM people").await, 0);
     let refused = crate::application::grid::commit(
         &service,
-        &crate::grid::commands::CommitRequest { table: people_table("people", "people"), changes: Vec::new() },
+        &crate::grid::commands::CommitRequest {
+            table: people_table("people", "people"),
+            changes: Vec::new(),
+            preview_bytes: crate::grid::DEFAULT_PREVIEW_BYTES as u64,
+        },
         false,
     )
     .await;
@@ -471,6 +475,7 @@ fn exchange_source_capabilities_follow_the_selected_source() {
         running: false,
         label: "items".to_owned(),
         context: "items / main".to_owned(),
+        preview_bytes: Some(crate::grid::DEFAULT_PREVIEW_BYTES),
     };
     assert!(table.full_available(), "表数据可以重新读取全量");
     assert!(table.has_columns());
@@ -485,6 +490,7 @@ fn exchange_source_capabilities_follow_the_selected_source() {
         running: false,
         label: "查询结果".to_owned(),
         context: "items / main".to_owned(),
+        preview_bytes: None,
     };
     assert!(!query.full_available(), "查询结果只有已读取的行，不能声称全量能力");
     assert!(query.has_columns(), "已读取的列仍可导出");

@@ -25,8 +25,38 @@ use crate::i18n::{self, Locale};
 
 use session::{
     cell_of, columns_from_schema, rows_from_page, schema_from_dto, CellPhase, Continuation, CopyScope, FindScope, ForeignKeyInfo, FullRead, Gate,
-    GridAction,
+    GridAction, Reference,
 };
+
+/// 外键跳转要打开的引用表工作项：目标身份和定位查询一起交给外壳，由它真正打开并定位。
+/// 网格只算出目标，不自己开工作项，也不把这段 SQL 当作"已经跳过去"。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GridNavigation {
+    pub connection_id: String,
+    pub connection_name: String,
+    pub database: String,
+    pub schema: String,
+    pub table: String,
+    pub engine: String,
+    pub sql: String,
+}
+
+/// 外键跳转的出口签名：外壳注入，网格只调用。
+pub type NavigationSink = Arc<dyn Fn(GridNavigation, &mut App)>;
+
+/// 来源状态快照：(选择锚点/焦点, 可见首行, 是否有暂存, 查看目标的 (行 id, 列名))。
+#[cfg(test)]
+pub type GridStateSnapshot = (Option<(String, String)>, usize, bool, Option<(String, String)>);
+
+impl GridNavigation {
+    /// 工作项里的对象规格：连接|连接名|库|模式||表|引擎|环境。
+    pub fn spec(&self, environment: &str) -> String {
+        format!(
+            "{}|{}|{}|{}||{}|{}|{}",
+            self.connection_id, self.connection_name, self.database, self.schema, self.table, self.engine, environment
+        )
+    }
+}
 
 pub struct GridPane {
     session: SharedGrid,
@@ -67,12 +97,22 @@ pub struct GridPane {
     /// 换表后清掉查找框里的旧文字，避免输入框和实际筛选条件不一致。
     clear_search: bool,
     /// 已经发起、等着回填的完整值读取；成功回来后重跑同一条命令，让各入口共用同一个原值。
-    pending_full: Option<String>,
+    /// 除了命令 id 还记住当时的快照代次：目标或行列换了就不再重跑。
+    pending_full: Option<PendingFull>,
+    /// 外键跳转的出口：由外壳（直接消费者）注入，网格只负责生成目标和定位查询。
+    navigation: Option<NavigationSink>,
     /// 行头双击等表格事件里不能重入，绘制前再打开完整值查看。
     pending_viewer: bool,
     search_subscription: Option<gpui_kit::Subscription>,
     _subscription: gpui_kit::Subscription,
     _edit_subscription: gpui_kit::Subscription,
+}
+
+/// 等回填时要重跑的命令，以及发起时的快照代次。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingFull {
+    id: String,
+    token: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,6 +208,7 @@ impl GridPane {
             search: None,
             clear_search: false,
             pending_full: None,
+            navigation: None,
             pending_viewer: false,
             search_subscription: None,
             _subscription: subscription,
@@ -180,9 +221,31 @@ impl GridPane {
         self.session.locale = locale;
     }
 
-    /// 大字段预览上限来自设置 preview_kb；下一次读取和完整值查看都用它。
-    pub fn set_preview_kb(&mut self, kb: u64) {
-        self.session.set_preview_bytes(usize::try_from(kb.max(1).saturating_mul(1024)).unwrap_or(usize::MAX));
+    /// 外键跳转的出口由外壳注入：网格不知道工作项，只把目标和定位查询交出去。
+    pub fn set_navigation_sink(&mut self, sink: NavigationSink) {
+        self.navigation = Some(sink);
+    }
+
+    /// 大字段预览上限来自设置 preview_kb。上限一变，旧行列是按别的上限截断出来的，
+    /// 查看面板和已读原值都不能继续用：表数据重读第一页，查询结果只能重新执行后生效。
+    pub fn set_preview_kb(&mut self, kb: u64, cx: &mut Context<Self>) {
+        let bytes = usize::try_from(kb.max(1).saturating_mul(1024)).unwrap_or(usize::MAX);
+        if !self.session.set_preview_bytes(bytes) {
+            return;
+        }
+        // 正在编辑的格子按旧上限显示：结束编辑并回到网格，读完的原值缓存也已经作废。
+        self.abandon_edit();
+        self.pending_full = None;
+        if self.session.mode == GridMode::Table && !self.session.target.connection_id.is_empty() {
+            // 表数据可以重读：从第一页重新读取，行列与预览都按新上限解释。
+            self.session.set_page_keep_identity(0, self.session.page_limit().max(1));
+            self.fetch_current(true, cx);
+        } else if self.session.loaded_len() > 0 {
+            // 查询结果不能由网格重跑：保留行，但说明新上限要重新执行查询才生效。
+            self.notice = i18n::text(self.locale, "grid.preview.reloadQuery");
+        }
+        self.sync_table(cx);
+        cx.notify();
     }
 
     /// TSV 里数据库 NULL 的显示文本来自设置；SQL 字面量不受影响。
@@ -287,6 +350,11 @@ impl GridPane {
         self.session.exchange_sheet()
     }
 
+    /// 交换/导出看到的这些行是按哪个预览上限读出来的；导出前的信封检查用它，不用设置里的新值。
+    pub fn sheet_preview_bytes(&self) -> usize {
+        self.session.sheet_preview_bytes()
+    }
+
     /// 查询结果进网格。截断与完整行数由查询页给出：网格据此区分"已到末尾"与
     /// "这个结果不能由网格继续"，不会把被截断的结果说成已读完。
     pub fn show_query(&mut self, target: GridTarget, sheet: QuerySheet, cx: &mut Context<Self>) {
@@ -327,6 +395,8 @@ impl GridPane {
                 return None;
             }
         }
+        // 外键跳转的目标先记下来，网格自己的状态更新完再交给外壳打开工作项。
+        let mut navigation: Option<GridNavigation> = None;
         let copied = match id {
             "edit-cell" => {
                 self.select_first_if_needed();
@@ -510,7 +580,8 @@ impl GridPane {
                 self.notice = i18n::text(self.locale, "grid.status.fullValues");
                 None
             }
-            // 外键导航：单列直接定位，复合外键必须列齐；条件不完整时说明原因。
+            // 外键：两件事分开。"跳转到引用行"真的打开引用表的工作项并带上定位查询；
+            // "生成外键查询"只把这段 SELECT 放到剪贴板。条件不完整时两者都说明原因。
             "grid-fk-jump" | "grid-fk-select" => {
                 let target = self.session.focus_cell();
                 let reference = match target {
@@ -525,7 +596,12 @@ impl GridPane {
                             format!("{}.{}.{}", reference.database, reference.schema, reference.table)
                         };
                         self.notice = i18n::fill(&i18n::text(self.locale, "grid.fk.target"), &[("path", &path)]);
-                        Some(reference.sql)
+                        if id == "grid-fk-select" {
+                            Some(reference.sql)
+                        } else {
+                            navigation = Some(self.reference_navigation(reference));
+                            None
+                        }
                     }
                     Err(key) => {
                         self.notice = i18n::text(self.locale, key);
@@ -545,7 +621,33 @@ impl GridPane {
             self.table.update(cx, |state, cx| state.scroll_to_row(row, cx));
         }
         cx.notify();
+        if let Some(navigation) = navigation {
+            self.open_navigation(navigation, cx);
+        }
         copied
+    }
+
+    /// 把外键跳转交给外壳：打开引用表的工作项，选择、滚动、暂存和查看都留在原来那一项上。
+    /// 没有接线时如实说明，而不是只把 SQL 放到剪贴板冒充已跳转。
+    fn reference_navigation(&self, reference: Reference) -> GridNavigation {
+        GridNavigation {
+            connection_id: reference.connection_id,
+            connection_name: self.session.target.connection_name.clone(),
+            database: reference.database,
+            schema: reference.schema,
+            table: reference.table,
+            engine: self.session.target.engine.clone(),
+            sql: reference.sql,
+        }
+    }
+
+    fn open_navigation(&mut self, navigation: GridNavigation, cx: &mut Context<Self>) {
+        let Some(sink) = self.navigation.clone() else {
+            self.notice = i18n::text(self.locale, "grid.fk.noShell");
+            cx.notify();
+            return;
+        };
+        sink(navigation, cx);
     }
 
     /// 需要原值的动作先读同一定位结果。全部读完才返回 true，调用方随后才执行动作。
@@ -557,8 +659,10 @@ impl GridPane {
         let reads = self.session.begin_full_cells(&cells);
         if !reads.is_empty() {
             // 一次读取批次成功后重跑同一个命令，查看、复制、编辑、WHERE 因此共用同一个原值。
-            self.pending_full = Some(id.to_owned());
-            self.start_full_reads(reads, Some(id.to_owned()), cx);
+            // 待重跑的命令带上快照代次：目标或行列一变，回填结果不再触发旧动作。
+            let pending = PendingFull { id: id.to_owned(), token: self.session.sheet_serial() };
+            self.pending_full = Some(pending.clone());
+            self.start_full_reads(reads, Some(pending), cx);
             return false;
         }
         // 没有新请求时还要确认这几格真的拿到了原值：加载中或上次失败都停在这里。
@@ -574,7 +678,7 @@ impl GridPane {
     }
 
     /// 一次按定位读取完整值：读到就缓存，失败保留原因并可重试；两处都不写预览。
-    fn start_full_reads(&mut self, reads: Vec<FullRead>, pending: Option<String>, cx: &mut Context<Self>) {
+    fn start_full_reads(&mut self, reads: Vec<FullRead>, pending: Option<PendingFull>, cx: &mut Context<Self>) {
         if reads.is_empty() {
             return;
         }
@@ -583,7 +687,7 @@ impl GridPane {
         let Some(connection) = session else {
             let reason = i18n::text(self.locale, "grid.value.noConnection");
             for read in &reads {
-                self.session.fail_full(&read.row_id, &read.column_name, &reason);
+                self.session.fail_full(read, &reason);
             }
             self.notice = reason;
             self.pending_full = None;
@@ -618,8 +722,9 @@ impl GridPane {
     }
 
     /// 读取回来后把原值放回缓存；全部成功才重跑同一个命令，各自入口因此共用同一个原值。
-    fn finish_full(&mut self, results: Vec<(FullRead, Result<crate::grid::Cell, String>)>, pending: Option<String>, cx: &mut Context<Self>) {
+    fn finish_full(&mut self, results: Vec<(FullRead, Result<crate::grid::Cell, String>)>, pending: Option<PendingFull>, cx: &mut Context<Self>) {
         let mut failure = None;
+        let mut applied = 0usize;
         for (read, result) in results {
             match result {
                 Ok(cell) => {
@@ -627,16 +732,20 @@ impl GridPane {
                         crate::grid::Cell::Null => None,
                         crate::grid::Cell::Text(text) => Some(text),
                     };
-                    self.session.apply_full(&read.row_id, &read.column_name, value);
+                    // 目标或行列已经换了的迟到结果被丢弃，不写到同一 id 的另一格上。
+                    if self.session.apply_full(&read, value) {
+                        applied += 1;
+                    }
                 }
                 Err(message) => {
-                    self.session.fail_full(&read.row_id, &read.column_name, &message);
-                    failure = Some(message);
+                    if self.session.fail_full(&read, &message) {
+                        failure = Some(message);
+                    }
                 }
             }
         }
         self.sync_table(cx);
-        if self.pending_full.as_deref().is_some() && pending.as_deref() == self.pending_full.as_deref() {
+        if self.pending_full.as_ref() == pending.as_ref() {
             self.pending_full = None;
         }
         match failure {
@@ -646,8 +755,11 @@ impl GridPane {
                 cx.notify();
             }
             None => {
-                if let Some(id) = pending {
-                    let _ = self.command(&id, cx);
+                // 全部过期时没有新原值可重跑，动作停在原处等用户重试。
+                if let Some(pending) = pending.filter(|_| applied > 0) {
+                    if pending.token == self.session.sheet_serial() {
+                        let _ = self.command(&pending.id, cx);
+                    }
                 }
                 cx.notify();
             }
@@ -928,6 +1040,21 @@ impl GridPane {
         let Some(row_id) = self.session.row_id(pending.row).map(str::to_owned) else {
             return;
         };
+        // 预览信封不是原值：双击和 F2 也要先按定位读一次，绝不把信封（或空串）放进编辑框。
+        if self.session.needs_full(pending.row, pending.column) && self.session.full_text_at(pending.row, pending.column).is_none() {
+            let cell = (pending.row, pending.column);
+            let reads = self.session.begin_full_cells(&[cell]);
+            self.pending_edit = None;
+            if reads.is_empty() {
+                self.notice = self.session.cell_block(&[cell]).unwrap_or_else(|| i18n::text(self.locale, "grid.value.noOriginal"));
+                cx.notify();
+                return;
+            }
+            let command = PendingFull { id: "edit-cell".to_owned(), token: self.session.sheet_serial() };
+            self.pending_full = Some(command.clone());
+            self.start_full_reads(reads, Some(command), cx);
+            return;
+        }
         // 切换到另一格前先把正在输入的内容暂存，避免双击别处时悄悄丢掉已输入文本。
         if let Some(previous) = self.edit_target.take() {
             let text = self.edit_input.read(cx).value().to_string();
@@ -1635,10 +1762,19 @@ impl Render for GridPane {
             if writable { p.ok_soft } else { p.hover },
         ));
         // 只读不是一句状态词：把具体原因放在旁边，用户知道为什么写不进去。
+        // 这是唯一显示只读原因的地方，任何原因（包括最笼统的那条）都不能被藏起来。
         let readonly_reason = self.session.readonly_reason().to_owned();
-        if !writable && !readonly_reason.is_empty() && readonly_reason != "grid.status.readonly" {
+        if !writable && !readonly_reason.is_empty() {
             tools = tools.child(
-                div().px(px(2.)).max_w(px(360.)).truncate().text_size(px(12.)).text_color(p.text_muted).child(t(&readonly_reason)),
+                div()
+                    // 只读原因自己也带测试选择器：验收要看它真的画出来了，而不是只存在于会话里。
+                    .debug_selector(|| "grid-readonly-reason".to_owned())
+                    .px(px(2.))
+                    .max_w(px(360.))
+                    .truncate()
+                    .text_size(px(12.))
+                    .text_color(p.text_muted)
+                    .child(t(&readonly_reason)),
             );
         }
         if !self.notice.is_empty() {
@@ -2584,6 +2720,31 @@ impl GridPane {
         self.sync_table(cx);
     }
 
+    /// 测试用：焦点移到某一格，不改锚点以外的状态。
+    pub fn choose_cell(&mut self, row: usize, column: usize) {
+        self.session.select(row, column, false);
+    }
+
+    /// 测试用：在某一格暂存一个修改。
+    pub fn stage_cell(&mut self, row: usize, column: usize, value: &str) -> bool {
+        self.session.stage_text(row, column, Some(value.to_owned())) == Gate::Writable
+    }
+
+    /// 测试用：当前表确实读到了外键，跳转才有目标。
+    pub fn has_reference(&self) -> bool {
+        self.session.has_reference()
+    }
+
+    /// 测试用：一次跳转前后应当完全一致的来源状态（选择、滚动、暂存、查看目标）。
+    pub fn state_snapshot(&self) -> GridStateSnapshot {
+        (
+            self.session.selection_ids().map(|(anchor, focus)| (anchor.to_owned(), focus.to_owned())),
+            self.session.visible_bounds().0,
+            self.session.uncommitted(),
+            self.session.viewer_state().map(|state| (state.row_id.clone(), state.column_name.clone())),
+        )
+    }
+
     pub fn plant_loaded(&mut self, target: GridTarget, columns: Vec<String>, rows: Vec<Vec<Option<String>>>, cx: &mut Context<Self>) {
         use session::{GridColumn, GridRow};
         self.session.mode = GridMode::Table;
@@ -2729,6 +2890,191 @@ mod pane_tests {
             }
             std::thread::park_timeout(std::time::Duration::from_millis(20));
         }
+    }
+
+
+    fn table_target(table: &str) -> GridTarget {
+        GridTarget { table: table.to_owned(), ..target() }
+    }
+
+    fn open_with(cx: &mut TestAppContext, services: Arc<AppServices>) -> (AnyWindowHandle, Entity<GridPane>) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(1100.), px(720.)) };
+            gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |window, cx| cx.new(|cx| GridPane::new(services, window, cx)),
+            )
+            .expect("grid pane")
+        })
+    }
+
+    /// 真实 sqlite 夹具：预览上限的切换必须能在真实读取上复验，而不是只改一个字段。
+    fn sqlite_services(name: &str, statements: &[String]) -> (std::path::PathBuf, Arc<AppServices>) {
+        let dir = std::env::temp_dir().join(format!("rillsql-grid-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("notes.sqlite");
+        let config = dir.clone();
+        let statements = statements.to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime_for_views().spawn(async move {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+                .await
+                .unwrap();
+            for sql in statements {
+                // 语句由测试自己给出，这里只是执行建表/插入，不接收用户输入。
+                sqlx::query(sqlx::AssertSqlSafe(sql.clone())).execute(&pool).await.unwrap();
+            }
+            pool.close().await;
+            let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(config.join("connections.sqlite")))));
+            services.connections.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+            let _ = tx.send(services);
+        });
+        let services = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite 夹具");
+        (dir, services)
+    }
+
+    /// 只读原因必须画在界面上：联接、聚合、多语句、括号和多表各显示各自那句，
+    /// 可写表不显示这一栏。以前最笼统的那条会被藏起来，用户只看到一个"只读"。
+    #[gpui_kit::test]
+    fn readonly_reason_is_painted_for_every_specific_denial(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let mut visual = VisualTestContext::from_window(window, cx);
+        assert!(visual.debug_bounds("grid-readonly-reason").is_none(), "可写时不显示只读原因");
+        for (sql, key) in [
+            ("select * from customers join people on 1 = 1", "grid.readonly.join"),
+            ("select count(*) from customers", "grid.readonly.aggregate"),
+            ("select * from customers; select * from people", "grid.readonly.multiStatement"),
+            ("select * from (select * from customers) as inner_customers", "grid.readonly.parentheses"),
+            ("select * from customers, people", "grid.readonly.multiTable"),
+        ] {
+            let sheet = query_sheet(sql, &["name"], vec![vec![Some("乙")]], false);
+            visual.update(|_, cx| {
+                pane.update(cx, |pane, cx| {
+                    pane.show_query(target(), sheet, cx);
+                });
+            });
+            visual.update(|window, cx| window.render_frame(cx));
+            visual.update(|_, cx| {
+                let pane = pane.read(cx);
+                assert_eq!(pane.session.readonly_reason(), key, "{sql}");
+            });
+            assert!(visual.debug_bounds("grid-readonly-reason").is_some(), "{key} 的只读原因必须画出来");
+        }
+    }
+
+    /// 预览上限 1 KB → 4 KB → 64 KB：旧行列按旧上限解释，改上限会关闭查看面板、清空原值缓存，
+    /// 表数据随即按新上限重读，同一段文本从"预览"变成"原值"。
+    #[gpui_kit::test]
+    fn preview_limit_change_reloads_rows_and_closes_the_viewer(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let long = "a".repeat(3000);
+        let (dir, services) = sqlite_services(
+            "preview-reload",
+            &["CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)".to_owned(), format!("INSERT INTO docs (id, body) VALUES (1, '{long}')")],
+        );
+        let (window, pane) = open_with(cx, services);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| pane.open_table(table_target("docs"), 100, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert!(wait_for_fetch(cx, window, &pane), "首屏读取完成");
+        cx.update(|cx| {
+            pane.update(cx, |pane, _| {
+                assert_eq!(pane.session.sheet_preview_bytes(), 1024, "快照记住读出时的上限");
+                assert!(pane.session.needs_full(0, 1), "3000 字节超过 1 KB 上限");
+                pane.session.open_value(0, 1);
+                assert!(pane.session.viewer().is_some(), "查看面板已打开");
+            });
+        });
+
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| pane.set_preview_kb(4, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert!(pane.session.viewer().is_none(), "改上限后查看面板关闭");
+            assert!(pane.session.full_text_at(0, 1).is_none(), "旧原值缓存不再可用");
+        });
+        assert!(wait_for_fetch(cx, window, &pane), "按新上限重读");
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.sheet_preview_bytes(), 4096);
+            assert!(!pane.session.needs_full(0, 1), "4 KB 上限下 3000 字节是原值");
+            assert_eq!(pane.cell(0, 1), long, "重读后显示整段原值");
+        });
+
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| pane.set_preview_kb(64, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert!(wait_for_fetch(cx, window, &pane), "64 KB 上限重读");
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.session.sheet_preview_bytes(), 64 * 1024);
+            assert!(!pane.session.needs_full(0, 1));
+            assert_eq!(pane.cell(0, 1), long);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 预览信封不是原值：F2、双击和命令三条路径都不能把信封（或空串）放进编辑框。
+    #[gpui_kit::test]
+    fn preview_cell_never_puts_the_envelope_into_the_editor(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.plant_writable(
+                    target(),
+                    vec![("id", "integer"), ("body", "text")],
+                    vec![vec![Some("1"), Some("\u{1}t:3000:片段")]],
+                    "id",
+                    cx,
+                );
+                pane.session.select(0, 1, false);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| assert!(pane.read(cx).session.needs_full(0, 1), "长文本只读到预览"));
+        // 命令路径：读不到原值（连接没打开），编辑不打开，输入框里没有信封。
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.command("edit-cell", cx);
+            });
+        });
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert!(!pane.editing(), "预览值不能直接进编辑");
+            assert!(!pane.edit_value(cx).contains('\u{1}'), "编辑框里不能出现信封");
+            assert!(!pane.notice.is_empty(), "应说明为什么没有打开编辑");
+        });
+        // 双击路径：同样先按定位读取，绝不把信封或空串填进编辑器。
+        cx.update(|cx| {
+            pane.update(cx, |pane, _| {
+                pane.pending_edit = Some(PendingEdit { row: 0, column: 1, select_all: true });
+            });
+        });
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert!(!pane.editing(), "双击预览格不打开编辑器");
+            assert!(!pane.edit_value(cx).contains('\u{1}'), "双击也不能写入信封");
+            assert!(pane.edit_value(cx).is_empty(), "编辑框没有被塞进空串以外的内容");
+        });
     }
 
     fn query_sheet(sql: &str, columns: &[&str], rows: Vec<Vec<Option<&str>>>, truncated: bool) -> QuerySheet {
@@ -3063,7 +3409,7 @@ mod pane_tests {
         cx.update_window(window, |_, window, cx| {
             pane.update(cx, |pane, cx| {
                 pane.set_page_limit(250, cx);
-                pane.set_preview_kb(4);
+                pane.set_preview_kb(4, cx);
                 plant_writable(pane, cx);
                 pane.session.select(0, 1, false);
             });
@@ -4133,7 +4479,8 @@ mod pane_tests {
         cx.update(|cx| {
             pane.update(cx, |pane, cx| {
                 // 定位读取的结果回到会话后，五个入口用的是同一个原值。
-                pane.session.apply_full("1", "body", Some(full.clone()));
+                let read = pane.session.pending_read(0, 1).expect("长文本需要按定位读取");
+                assert!(pane.session.apply_full(&read, Some(full.clone())));
                 assert!(pane.session.begin_full(0, 1).is_none(), "读到原值后不再重复读取");
                 assert_eq!(pane.command("copy-region", cx).as_deref(), Some(full.as_str()));
                 let _ = pane.command("grid-value-open", cx);

@@ -93,6 +93,9 @@ pub struct CommitRequest {
     #[serde(flatten)]
     pub table: TableRef,
     pub changes: Vec<ChangeArg>,
+    /// 这些值读出时的大字段预览上限；写回前的信封判断按它比较，而不是另找一个默认值。
+    #[serde(default = "default_preview_bytes")]
+    pub preview_bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]

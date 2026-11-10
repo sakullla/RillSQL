@@ -7,13 +7,13 @@ mod sql;
 mod store;
 
 pub(crate) use live::{
-    commit as commit_mutations, count_rows_search, describe, fetch_cells, foreign_keys, insert_line, query_page_search_preview,
+    commit_with_preview as commit_mutations_with_preview, count_rows_search, describe, fetch_cells, foreign_keys, insert_line, query_page_search_preview,
     read_full_cell, request_cancel as request_grid_export_cancel, run_export, sqlserver_rows, ExportMode, ExportSpec, ForeignKey, Mutation,
     MutationKind,
 };
 pub(crate) use sql::{
     delete_sql, insert_sql, looks_like_preview, preview_envelope, qualified_name, quote_ident, reject_literal, select_list, sql_cell,
-    update_sql, value_family, PreviewValue, ValueFamily,
+    update_sql, value_family, PreviewValue, ValueFamily, DEFAULT_PREVIEW_BYTES,
 };
 pub(crate) use store::{refresh_located, Cell, Column, Engine, Filter, FilterOp, Sort, TableSchema};
 

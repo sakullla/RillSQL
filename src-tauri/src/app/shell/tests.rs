@@ -1626,6 +1626,137 @@ fn batch_close_skips_running_items_without_closing_them() {
     assert_eq!(model.active_tab.as_deref(), Some(keep.as_str()));
 }
 
+/// 外键跳转与"生成外键查询"是两条不同的路：跳转真的打开引用表的工作项并带上定位查询，
+/// 原来那张表的选择、滚动、暂存和查看目标都留在原处；生成查询只复制 SQL，不开工作项。
+#[gpui_kit::test]
+fn foreign_key_jump_opens_the_referenced_row_and_keeps_the_source_state(cx: &mut gpui_kit::TestAppContext) {
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-fk-jump-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("notes.sqlite");
+    let services = std::thread::scope(|scope| {
+        let database = database.clone();
+        let dir = dir.clone();
+        scope
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                runtime.block_on(async move {
+                    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                        .max_connections(1)
+                        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+                        .await
+                        .unwrap();
+                    for sql in [
+                        "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)",
+                        "CREATE TABLE books (id INTEGER PRIMARY KEY, author_id INTEGER, title TEXT, FOREIGN KEY (author_id) REFERENCES authors(id))",
+                        "INSERT INTO authors VALUES (1, '甲'), (2, '乙')",
+                        "INSERT INTO books VALUES (1, 1, '书'), (2, 2, '册')",
+                    ] {
+                        sqlx::query(sql).execute(&pool).await.unwrap();
+                    }
+                    pool.close().await;
+                    let services = Arc::new(AppServices::new(Arc::new(Service::new_for_test(dir.join("connections.sqlite")))));
+                    services.connections.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+                    services
+                })
+            })
+            .join()
+            .unwrap()
+    });
+    let (window, view) = open_workbench(cx, services, false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("open-table:notes|笔记|main||books|sqlite|dev", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let table = cx.update(|cx| view.read(cx).table.clone());
+    let books = cx.update(|cx| {
+        view.read(cx)
+            .model
+            .tabs
+            .iter()
+            .find(|tab| tab.kind == WorkItemKind::Table)
+            .map(|tab| tab.id.clone())
+            .expect("表工作项")
+    });
+    // 等真实分页读取落地：外键和定位都来自这次读取。
+    let started = std::time::Instant::now();
+    loop {
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        if cx.update(|cx| !table.read(cx).fetching() && table.read(cx).loaded_len() > 0) {
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(30), "分页读取没有落地");
+        std::thread::park_timeout(std::time::Duration::from_millis(20));
+    }
+    cx.update(|cx| {
+        table.update(cx, |pane, cx| {
+            pane.choose_cell(0, 1);
+            assert!(pane.has_reference(), "author_id 是真实外键列，行也定位到了");
+            // 暂存一个修改并打开查看面板：跳转后它们必须还在。
+            assert!(pane.stage_cell(0, 2, "改名"), "标题列可写");
+            let _ = pane.command("grid-value-open", cx);
+            assert!(pane.state_snapshot().3.is_some(), "查看目标已打开");
+        });
+    });
+    let before = cx.update(|cx| table.read(cx).state_snapshot());
+    assert!(before.2, "跳转前有暂存");
+    let runs_before = cx.update(|cx| view.read(cx).query_runs(cx));
+    let tabs_before = cx.update(|cx| view.read(cx).model.tabs.len());
+
+    // 真正的跳转：走网格命令，经外壳打开引用表的工作项。
+    let copied = cx.update(|cx| table.update(cx, |pane, cx| pane.command("grid-fk-jump", cx)));
+    assert!(copied.is_none(), "跳转不是把 SQL 塞进剪贴板");
+    assert_eq!(cx.update(|cx| view.read(cx).model.tabs.len()), tabs_before + 1, "跳转打开了一个工作项");
+
+    let (item, sql, connection, database_name, engine, active_is_query) = cx.update(|cx| {
+        let view = view.read(cx);
+        let item = view.model.tabs.iter().find(|tab| tab.kind.is_query()).cloned().expect("引用表工作项");
+        (
+            item.id.clone(),
+            item.draft.clone(),
+            item.connection_id.clone(),
+            item.database.clone(),
+            item.engine.clone(),
+            view.model.active_tab.as_deref() == Some(item.id.as_str()),
+        )
+    });
+    assert!(active_is_query, "跳转后当前工作项就是引用表的查询");
+    assert_eq!(sql, "SELECT \"id\" FROM \"main\".\"authors\" WHERE \"id\" = 1", "单键定位查询");
+    assert_eq!(connection.as_deref(), Some("notes"), "目标仍是被引用的那条连接");
+    assert_eq!(database_name.as_deref(), Some("main"));
+    assert_eq!(engine.as_deref(), Some("sqlite"));
+    // 连接已打开：定位查询真的执行了，不是只摆在编辑器里。
+    assert_eq!(cx.update(|cx| view.read(cx).query_runs(cx)), runs_before + 1, "定位 SELECT 被执行");
+    // 来源状态一点没动。
+    assert_eq!(cx.update(|cx| table.read(cx).state_snapshot()), before, "选择、滚动、暂存和查看目标都保留");
+
+    // 返回原来的表工作项：还是同一份状态。
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| {
+            assert!(view.model.activate_item(&books), "回到表工作项");
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(cx.update(|cx| table.read(cx).state_snapshot()), before, "返回后状态不变");
+    assert!(cx.update(|cx| table.read(cx).uncommitted()), "暂存仍在");
+
+    // 生成外键查询：只复制 SQL，不开工作项，也不动状态。
+    let tabs_now = cx.update(|cx| view.read(cx).model.tabs.len());
+    let copied = cx.update(|cx| table.update(cx, |pane, cx| pane.command("grid-fk-select", cx)));
+    assert_eq!(
+        copied.as_deref(),
+        Some("SELECT \"id\" FROM \"main\".\"authors\" WHERE \"id\" = 1"),
+        "生成查询复制同一段 SQL"
+    );
+    assert_eq!(cx.update(|cx| view.read(cx).model.tabs.len()), tabs_now, "复制不打开工作项");
+    assert_eq!(cx.update(|cx| table.read(cx).state_snapshot()), before, "复制也不动来源状态");
+    let _ = item;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[gpui_kit::test]
 fn second_workbench_commit_stays_on_preview_without_writing(cx: &mut gpui_kit::TestAppContext) {
     cx.executor().allow_parking();

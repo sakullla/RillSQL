@@ -209,8 +209,9 @@ impl QueryPane {
         }
         let preview_kb = self.preview_kb;
         let null_copy = self.null_copy.clone();
-        self.grid.update(cx, |grid, _| {
-            grid.set_preview_kb(preview_kb);
+        self.grid.update(cx, |grid, cx| {
+            // 预览上限变了：结果网格按新上限重读表数据，或说明查询结果需要重新执行。
+            grid.set_preview_kb(preview_kb, cx);
             grid.set_null_copy(&null_copy);
         });
     }

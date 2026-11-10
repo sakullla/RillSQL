@@ -52,6 +52,9 @@ pub struct FullRead {
     pub row_id: String,
     pub column_name: String,
     pub locator: Vec<(String, Option<String>)>,
+    /// 发起读取时的目标与快照代次：读回来时目标或行列已经换了，这次结果就不能落到当前格子上。
+    pub target: GridTarget,
+    pub token: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,7 +75,8 @@ struct FullEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CellRead {
     Ready(Option<String>),
-    NeedsFull(FullRead),
+    /// 读取请求比普通值大得多，装进 Box 以免整个枚举被撑大。
+    NeedsFull(Box<FullRead>),
     /// 没定位（无唯一键、未定位行或外键缺列），不能读取也不能当原值。
     Unavailable(&'static str),
 }
@@ -355,8 +359,14 @@ pub struct SharedGrid {
     preview_sql: Vec<String>,
     preview_ids: Vec<String>,
     preview_open: bool,
-    /// 大字段预览的截断上限（字节）；来自设置 preview_kb。
+    /// 大字段预览的截断上限（字节）；来自设置 preview_kb，只用于下一次读取。
     preview_bytes: usize,
+    /// 当前这份行列读出来时用的预览上限。判断预览信封、导出和编辑都用它，
+    /// 设置改了也不会把旧快照按新上限重新解释。
+    sheet_preview_bytes: usize,
+    /// 快照代次：每次载入或替换行列都加一。按定位读完整值的批次带着它，
+    /// 目标、行列一变，迟到的读取结果就会被丢弃。
+    sheet_serial: u64,
     /// TSV 里数据库 NULL 的显示文本；SQL 字面量始终是 NULL。
     null_copy: String,
     readonly_reason: String,
@@ -410,7 +420,9 @@ impl SharedGrid {
             preview_sql: Vec::new(),
             preview_ids: Vec::new(),
             preview_open: false,
-            preview_bytes: 1024,
+            preview_bytes: crate::grid::DEFAULT_PREVIEW_BYTES,
+            sheet_preview_bytes: crate::grid::DEFAULT_PREVIEW_BYTES,
+            sheet_serial: 0,
             null_copy: "NULL".to_owned(),
             readonly_reason: String::new(),
             seq: 0,
@@ -431,6 +443,8 @@ impl SharedGrid {
         self.retained.clear();
         self.failures.clear();
         self.selected = false;
+        // 这份行列是这一次读取的结果：预览上限随快照一起记下来，旧原值缓存作废。
+        self.record_sheet_limit();
         self.viewer = None;
         self.full.clear();
         self.keys.clear();
@@ -454,6 +468,7 @@ impl SharedGrid {
         self.scope = RangeScope::Fetched;
         self.read_failure = None;
         self.target_changed = false;
+        self.record_sheet_limit();
         self.close_preview();
         self.refresh_readonly_reason();
         self.recompute();
@@ -468,7 +483,8 @@ impl SharedGrid {
         self.schema = None;
         // 单表 SELECT 只在结构证明成功后短暂只读；联接、聚合或多语句从一开始就说明原因。
         self.readonly_reason = match prove_single_table(&self.target.engine, sql) {
-            Ok(_) => "grid.status.readonly".to_owned(),
+            // 结构上像单表 SELECT，但唯一键还没读到：原因写清楚，而不是一句"只读"。
+            Ok(_) => "grid.readonly.locatePending".to_owned(),
             Err(reason) => reason.to_owned(),
         };
         self.columns = columns
@@ -503,6 +519,7 @@ impl SharedGrid {
         self.retained.clear();
         self.failures.clear();
         self.selected = false;
+        self.record_sheet_limit();
         self.viewer = None;
         self.full.clear();
         self.keys.clear();
@@ -584,6 +601,41 @@ impl SharedGrid {
         self.readonly_reason.is_empty() && self.schema.as_ref().is_some_and(|schema| schema.kind == "table" && !schema.key.is_empty())
     }
 
+    /// 读这份行列时用的预览上限；查看、复制、编辑、WHERE、导出和外键判断都按它比较。
+    pub fn sheet_preview_bytes(&self) -> usize {
+        self.sheet_preview_bytes
+    }
+
+    /// 当前快照代次；按定位读取的批次带着它，目标或行列一变就作废。
+    pub fn sheet_serial(&self) -> u64 {
+        self.sheet_serial
+    }
+
+    fn record_sheet_limit(&mut self) {
+        self.sheet_preview_bytes = self.preview_bytes.max(1);
+        self.sheet_serial = self.sheet_serial.saturating_add(1);
+    }
+
+    /// 预览上限变了：按旧上限得到的原值缓存和查看面板都不再可信。
+    /// 返回 true 表示上限真的变了，调用方应重读行列（不能重读时至少清空派生状态）。
+    pub fn set_preview_bytes(&mut self, bytes: usize) -> bool {
+        let bytes = bytes.max(1);
+        if bytes == self.preview_bytes {
+            return false;
+        }
+        self.preview_bytes = bytes;
+        // 迟到的完整值读取带着旧代次回来，这里换代后一律丢弃。
+        self.invalidate_previews();
+        true
+    }
+
+    /// 清空按定位读取的原值缓存并关闭查看面板；代次加一，在路上读取的结果随之作废。
+    pub fn invalidate_previews(&mut self) {
+        self.full.clear();
+        self.viewer = None;
+        self.sheet_serial = self.sheet_serial.saturating_add(1);
+    }
+
     /// 只读时给出的具体原因；可写时为空。界面用它解释禁写，而不是只画一个“只读”。
     pub fn readonly_reason(&self) -> &str {
         &self.readonly_reason
@@ -616,8 +668,8 @@ impl SharedGrid {
             self.read_failure = None;
             self.sort = None;
             self.selected = false;
-            self.viewer = None;
-            self.full.clear();
+            // 换了目标：查看面板和按定位读到的原值都不属于新表，代次一并换代。
+            self.invalidate_previews();
             self.keys.clear();
             self.anchor_id.clear();
             self.focus_id.clear();
@@ -1183,13 +1235,9 @@ impl SharedGrid {
         self.limit
     }
 
-    /// 大字段预览的截断上限（字节）；默认 1024，由设置 preview_kb 下发。
+    /// 下一次读取要用的大字段预览上限（字节）；由设置 preview_kb 下发。
     pub fn preview_bytes(&self) -> usize {
         self.preview_bytes
-    }
-
-    pub fn set_preview_bytes(&mut self, bytes: usize) {
-        self.preview_bytes = bytes.max(1);
     }
 
     /// TSV 里数据库 NULL 的显示文本。
@@ -1434,9 +1482,9 @@ impl SharedGrid {
         let type_name = self.columns.get(column).map(|item| item.type_name.as_str()).unwrap_or("");
         // 已经读到原值就显示原值；否则显示预览信封里的片段，并把它标成预览。
         if let Some(Some(text)) = self.full_text_at(row, column) {
-            return classify_with_limit(self.locale, Some(Some(text)), type_name, true, self.preview_bytes);
+            return classify_with_limit(self.locale, Some(Some(text)), type_name, true, self.sheet_preview_bytes);
         }
-        let mut shown = classify_with_limit(self.locale, self.value_at(row, column), type_name, opened, self.preview_bytes);
+        let mut shown = classify_with_limit(self.locale, self.value_at(row, column), type_name, opened, self.sheet_preview_bytes);
         shown.preview = self.needs_full(row, column);
         shown
     }
@@ -1466,7 +1514,7 @@ impl SharedGrid {
             return false;
         };
         let type_name = self.columns.get(column).map(|item| item.type_name.as_str()).unwrap_or("");
-        crate::grid::preview_envelope(&text, type_name, self.preview_bytes).is_some()
+        crate::grid::preview_envelope(&text, type_name, self.sheet_preview_bytes).is_some()
     }
 
     /// 已缓存的原值；仍在预览阶段、加载或失败时为空，绝不拿预览充当原值。
@@ -1480,6 +1528,15 @@ impl SharedGrid {
     }
 
     /// 一格值按原值处理还是需要先读取；未定位时明确说明读不了。
+    /// 测试用：这一格现在需要的那次按定位读取。
+    #[cfg(test)]
+    pub fn pending_read(&self, row: usize, column: usize) -> Option<FullRead> {
+        match self.cell_read(row, column) {
+            CellRead::NeedsFull(read) => Some(*read),
+            _ => None,
+        }
+    }
+
     pub fn cell_read(&self, row: usize, column: usize) -> CellRead {
         if self.needs_full(row, column) {
             if let Some(ready) = self.full_text_at(row, column) {
@@ -1495,7 +1552,7 @@ impl SharedGrid {
             let Some(column_name) = self.columns.get(column).map(|item| item.name.clone()) else {
                 return CellRead::Unavailable("grid.value.noLocator");
             };
-            return CellRead::NeedsFull(FullRead { row_id, column_name, locator });
+            return CellRead::NeedsFull(Box::new(FullRead { row_id, column_name, locator, target: self.target.clone(), token: self.sheet_serial }));
         }
         match self.value_at(row, column) {
             Some(value) => CellRead::Ready(value),
@@ -1524,17 +1581,43 @@ impl SharedGrid {
             state.phase = CellPhase::Loading;
             state.message.clear();
         }
-        Some(read)
+        Some(*read)
     }
 
     /// 原值读回来了。查看面板同时从加载状态转到完整状态。
-    pub fn apply_full(&mut self, row_id: &str, column_name: &str, value: Option<String>) {
-        self.store_full(row_id, column_name, FullState::Ready(value), CellPhase::Full, String::new());
+    /// 读取结果只在同一目标、同一快照代次时落到格子上；换了表、翻了页或改了预览上限，
+    /// 迟到的结果直接丢弃，绝不写到同 id 的另一行上。返回值表示是否采纳。
+    pub fn apply_full(&mut self, read: &FullRead, value: Option<String>) -> bool {
+        if !self.accepts_full(read) {
+            return false;
+        }
+        self.store_full(&read.row_id, &read.column_name, FullState::Ready(value), CellPhase::Full, String::new());
+        true
     }
 
-    /// 完整值读取失败：保留预览可见，但标记为错误并给原因，绝不当成原值。
-    pub fn fail_full(&mut self, row_id: &str, column_name: &str, message: &str) {
-        self.store_full(row_id, column_name, FullState::Failed(message.to_owned()), CellPhase::Error, message.to_owned());
+    /// 完整值读取失败：保留预览可见，但标记为错误并给原因，绝不当成原值。过期失败同样丢弃。
+    pub fn fail_full(&mut self, read: &FullRead, message: &str) -> bool {
+        if !self.accepts_full(read) {
+            return false;
+        }
+        self.store_full(&read.row_id, &read.column_name, FullState::Failed(message.to_owned()), CellPhase::Error, message.to_owned());
+        true
+    }
+
+    /// 这次读取是否还属于当前目标与当前行列：代次一致，行和列也还在。
+    fn accepts_full(&self, read: &FullRead) -> bool {
+        if read.token != self.sheet_serial {
+            return false;
+        }
+        if read.target.connection_id != self.target.connection_id
+            || read.target.database != self.target.database
+            || read.target.schema != self.target.schema
+            || read.target.table != self.target.table
+        {
+            return false;
+        }
+        let row_known = self.rows.iter().chain(self.source.iter()).chain(self.retained.iter()).any(|row| row.id == read.row_id);
+        row_known && self.columns.iter().any(|column| column.name == read.column_name)
     }
 
     fn store_full(&mut self, row_id: &str, column_name: &str, state: FullState, phase: CellPhase, message: String) {
@@ -1554,9 +1637,17 @@ impl SharedGrid {
     }
 
     /// 还没有原值的格子：导出前一次性按定位读取，读到的原值随后共享给所有入口。
+    /// 扫描范围与 exchange_sheet 给出的导出行完全一致：只看当前来源行，跳过还没写库的新增行，
+    /// 这样"还有多少预览"永远对应真正会被导出写出的那些格子。
     pub fn unresolved_cells(&self) -> Vec<(usize, usize)> {
+        let scope: Vec<usize> = self
+            .source
+            .iter()
+            .filter(|row| !row.inserted)
+            .filter_map(|row| self.rows.iter().position(|item| item.id == row.id))
+            .collect();
         let mut cells = Vec::new();
-        for row in 0..self.rows.len() {
+        for row in scope {
             for column in 0..self.columns.len() {
                 if self.needs_full(row, column) && self.full_text_at(row, column).is_none() {
                     cells.push((row, column));
@@ -1856,8 +1947,9 @@ impl SharedGrid {
 
     pub fn stage_insert(&mut self) -> Gate {
         if self.mode == GridMode::Query || !self.writable() {
+            // 查询结果本身不能新增行：即使定位成功，也只读。原因要具体，不能退回一句"只读"。
             if self.readonly_reason.is_empty() {
-                self.readonly_reason = "grid.status.readonly".to_owned();
+                self.readonly_reason = "grid.readonly.queryResult".to_owned();
             }
             return Gate::Readonly;
         }
@@ -2008,7 +2100,12 @@ impl SharedGrid {
         if changes.is_empty() {
             return Err(i18n::text(self.locale, "grid.commit.needPreview"));
         }
-        Ok(crate::grid::commands::CommitRequest { table: self.table_ref(), changes })
+        Ok(crate::grid::commands::CommitRequest {
+            table: self.table_ref(),
+            changes,
+            // 写回前的信封判断用读出这些值时的上限，和查看/复制/导出比较的是同一个值。
+            preview_bytes: self.sheet_preview_bytes as u64,
+        })
     }
 
     /// 把提交结果如实落回显示：成功项写回已读取行，失败项保留在原来的格子上并写明原因。
@@ -2041,8 +2138,8 @@ impl SharedGrid {
             }
         }
         self.prune_retained();
-        // 写库成功后原值可能已经变了：缓存的完整值不能再当当前值用。
-        self.full.clear();
+        // 写库成功后原值可能已经变了：缓存的完整值和查看面板显示的状态都不能再用。
+        self.invalidate_previews();
         self.close_preview();
         self.recompute();
     }
@@ -2104,8 +2201,7 @@ impl SharedGrid {
         self.find_scope = FindScope::Loaded;
         self.sort = None;
         self.selected = false;
-        self.viewer = None;
-        self.full.clear();
+        self.invalidate_previews();
         self.keys.clear();
         self.scroll = 0;
         self.retained.clear();
@@ -2419,7 +2515,7 @@ impl SharedGrid {
             return StatCell::Empty;
         }
         let type_name = self.columns.get(column).map(|item| item.type_name.as_str()).unwrap_or("");
-        if let Some(envelope) = crate::grid::preview_envelope(&text, type_name, self.preview_bytes) {
+        if let Some(envelope) = crate::grid::preview_envelope(&text, type_name, self.sheet_preview_bytes) {
             // 预览信封不是原值：读到原值才参与统计，二进制仍是二进制。
             return match (envelope, self.full_text_at(row, column)) {
                 (crate::grid::PreviewValue::Binary { .. }, _) => StatCell::Binary,
@@ -2800,32 +2896,54 @@ pub fn operation_banner(target: &GridTarget) -> String {
     format!("{} · {} · {} · {}", target.connection_name, target.environment, object, target.engine)
 }
 
+/// 单表 SELECT 的结构证明。拒绝时返回具体原因键：联接、聚合、多语句、括号（子查询/派生表）
+/// 和多表各有各的说法，界面直接显示这一条，而不是笼统的"只读"。
 pub fn prove_single_table(engine: &str, sql: &str) -> Result<TableProof, &'static str> {
     let report = split_sql(engine, sql);
     if report.refusal.is_some() {
-        return Err("grid.status.readonly");
+        return Err("grid.readonly.unparsed");
     }
     let pieces = report.pieces.into_iter().map(|piece| piece.text.trim().to_owned()).filter(|text| !text.is_empty()).collect::<Vec<_>>();
     if pieces.len() != 1 {
-        return Err("grid.status.readonly");
+        return Err("grid.readonly.multiStatement");
     }
     let statement = pieces[0].trim().trim_end_matches(';').trim();
     let upper = statement.to_ascii_uppercase();
     if !upper.starts_with("SELECT") {
-        return Err("grid.status.readonly");
+        return Err("grid.readonly.notSelect");
     }
-    for word in [" JOIN ", " UNION ", " INTERSECT ", " EXCEPT ", " DISTINCT ", " GROUP ", " HAVING ", " WINDOW ", " INTO "] {
-        if upper.contains(word) {
-            return Err("grid.status.readonly");
-        }
+    let padded = format!(" {} ", upper);
+    if padded.contains(" JOIN ") {
+        return Err("grid.readonly.join");
+    }
+    if padded.contains(" UNION ") || padded.contains(" INTERSECT ") || padded.contains(" EXCEPT ") {
+        return Err("grid.readonly.setOperation");
+    }
+    // 聚合：显式分组，或结果里直接有聚合函数。括号里只有函数调用，不该被当成子查询。
+    let aggregating = padded.contains(" GROUP ") || padded.contains(" HAVING ") || padded.contains(" WINDOW ") || has_aggregate_call(&upper);
+    if aggregating {
+        return Err("grid.readonly.aggregate");
+    }
+    if padded.contains(" INTO ") {
+        return Err("grid.readonly.notSelect");
     }
     if statement.contains('(') {
-        return Err("grid.status.readonly");
+        return Err("grid.readonly.parentheses");
     }
     let marker = match upper.find(" FROM ") {
         Some(index) => index,
-        None => return Err("grid.status.readonly"),
+        None => return Err("grid.readonly.notSelect"),
     };
+    // FROM 之后、下一个子句之前出现逗号就是多表（隐式联接），不是一张表的定位范围。
+    let tail = &upper[marker + " FROM ".len()..];
+    let cut = [" WHERE ", " GROUP ", " HAVING ", " ORDER ", " LIMIT ", " OFFSET ", " FOR ", " UNION ", " WINDOW "]
+        .iter()
+        .filter_map(|word| tail.find(word))
+        .min()
+        .unwrap_or(tail.len());
+    if tail[..cut].contains(',') {
+        return Err("grid.readonly.multiTable");
+    }
     let after = statement[marker + " FROM ".len()..].trim_start();
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -2850,8 +2968,24 @@ pub fn prove_single_table(engine: &str, sql: &str) -> Result<TableProof, &'stati
     match parts.as_slice() {
         [table] => Ok(TableProof { schema: None, table: table.clone() }),
         [schema, table] => Ok(TableProof { schema: Some(schema.clone()), table: table.clone() }),
-        _ => Err("grid.status.readonly"),
+        _ => Err("grid.readonly.multiTable"),
     }
+}
+
+/// 结果里直接调用聚合函数：COUNT/SUM/AVG/MIN/MAX 后面紧跟括号，且前面不是标识符的一部分。
+fn has_aggregate_call(upper: &str) -> bool {
+    ["COUNT", "SUM", "AVG", "MIN", "MAX"].iter().any(|name| {
+        let mut rest = upper;
+        while let Some(index) = rest.find(name) {
+            let before = rest[..index].chars().next_back();
+            let after = rest[index + name.len()..].trim_start();
+            if !before.is_some_and(|ch| ch.is_alphanumeric() || ch == '_') && after.starts_with('(') {
+                return true;
+            }
+            rest = &rest[index + name.len()..];
+        }
+        false
+    })
 }
 
 pub fn schema_from_parts(engine: &str, schema: &str, name: &str, kind: &str, columns: Vec<Column>, key: Vec<String>) -> Result<TableSchema, String> {
@@ -3180,21 +3314,118 @@ mod tests {
         assert_eq!(grid.full_count(), Some(1000));
     }
 
+    /// 导出扫描和 exchange_sheet 的范围必须一致：还没写库的新增行不在导出行里，
+    /// 它上面的预览形状也就不能算进"还有多少预览要读"。
     #[test]
-    fn preview_limit_follows_the_setting_and_changes_the_label() {
-        let long = "a".repeat(2048);
+    fn unresolved_preview_scan_matches_the_exported_rows() {
+        let envelope = format!("\u{1}t:3000:{}", "a".repeat(16));
         let mut grid = SharedGrid::new();
         grid.load_local(
-            vec![text_column("id"), text_column("note")],
-            vec![row("1", vec![Some("1"), Some(long.as_str())], true)],
+            vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some(envelope.as_str())], true)],
             Some(1),
             Some(schema()),
         );
+        assert!(grid.writable());
+        // 新增行也带一个预览形状的值：它还没写库，导出根本不会写它。
+        // 暂存会拒绝把信封写进编辑（见 preview 校验），这里直接把值放进新增行验证扫描范围。
+        assert_eq!(grid.stage_insert(), Gate::Writable);
+        assert!(grid.rows.iter().any(|item| item.inserted), "新增行");
+        for item in grid.source.iter_mut().filter(|item| item.inserted) {
+            item.values[1] = Some(envelope.clone());
+        }
+        grid.recompute();
+        assert_eq!(grid.unresolved_previews(), 1, "只算真正会被导出的那一格");
+        let (_, _, rows, _) = grid.exchange_sheet();
+        assert_eq!(rows.len(), 1, "导出行里没有未写入的新增行");
+        assert!(rows[0][1].as_deref().is_some_and(|value| value.starts_with('\u{1}')));
+    }
+
+    /// 迟到的完整值读取不能落到换了目标的同一格上：请求带着目标和快照代次回来对账。
+    #[test]
+    fn late_full_reads_are_discarded_after_the_target_changes() {
+        let envelope = format!("\u{1}t:3000:{}", "a".repeat(16));
+        let mut grid = SharedGrid::new();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some(envelope.as_str())], true)],
+            Some(1),
+            Some(schema()),
+        );
+        let read = grid.pending_read(0, 1).expect("预览格需要按定位读取");
+        assert_eq!(read.target.connection_id, grid.target.connection_id);
+        assert_eq!(read.token, grid.sheet_serial());
+
+        // 换到另一张表后再按新快照载入同一行 id：旧的读取批次必须被丢弃。
+        let other = GridTarget { connection_id: "other".to_owned(), table: "docs".to_owned(), ..GridTarget::default() };
+        grid.switch_target(other);
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some(envelope.as_str())], true)],
+            Some(1),
+            Some(schema()),
+        );
+        assert!(!grid.apply_full(&read, Some("旧表的值".to_owned())), "过期读取不采纳");
+        assert!(grid.full_text_at(0, 1).is_none(), "新表这一格没有被写入旧值");
+        assert!(!grid.fail_full(&read, "旧表的失败"), "过期失败也不记到新表上");
+        assert!(grid.cell_read(0, 1) != CellRead::Ready(Some("旧表的值".to_owned())));
+    }
+
+    /// 预览上限从 1 KB 变到 4 KB/64 KB：快照记住读出时的上限，旧行列仍按旧上限解释；
+    /// 改上限会关掉查看面板并清空按定位读到的原值，按新上限重读后同一段文本就是原值。
+    #[test]
+    fn preview_limit_changes_reload_rows_and_close_the_viewer() {
+        // 页查询在超过上限时发出的信封：声明 2048 字节，预览只有一段。
+        let envelope = format!("\u{1}t:2048:{}", "a".repeat(64));
+        let full = "a".repeat(2048);
+        let mut grid = SharedGrid::new();
+        let load = |grid: &mut SharedGrid, value: &str| {
+            grid.load_local(
+                vec![text_column("id"), text_column("note")],
+                vec![row("1", vec![Some("1"), Some(value)], true)],
+                Some(1),
+                Some(schema()),
+            );
+        };
+        load(&mut grid, &envelope);
         let large = format!("{} 2048", i18n::text(Locale::ZhCn, "grid.value.largeLabel"));
+        assert_eq!(grid.sheet_preview_bytes(), 1024, "快照记住读出时的上限");
         assert_eq!(grid.cell_label(0, 1), large, "默认 1 KB 上限下显示大字段");
-        grid.set_preview_bytes(4 * 1024);
-        assert_eq!(grid.cell_label(0, 1), long, "4 KB 上限下同一值直接显示");
-        assert_eq!(grid.page_request().unwrap().preview_bytes, 4096);
+        assert!(grid.needs_full(0, 1), "信封不是原值");
+        // 打开查看面板并读到一个原值，改上限后这些派生状态都要作废。
+        grid.open_value(0, 1);
+        let read = grid.pending_read(0, 1).expect("预览格需要按定位读取");
+        assert!(grid.apply_full(&read, Some(full.clone())));
+        assert_eq!(grid.viewer_state().map(|state| state.phase), Some(CellPhase::Full));
+
+        assert!(grid.set_preview_bytes(4 * 1024), "上限真的变了");
+        assert_eq!(grid.page_request().unwrap().preview_bytes, 4096, "下一次读取用新上限");
+        assert!(grid.viewer().is_none(), "改上限后查看面板关闭");
+        assert!(grid.full_text_at(0, 1).is_none(), "旧原值缓存清空");
+        assert!(grid.needs_full(0, 1), "旧行列仍按 1 KB 上限判断成预览");
+        assert!(grid.pending_read(0, 1).is_some(), "旧信封不会被新上限重新解释");
+
+        // 按新上限重读后，同一段文本不再是信封：查看、复制、编辑都直接用它。
+        load(&mut grid, &full);
+        assert_eq!(grid.sheet_preview_bytes(), 4096);
+        assert!(!grid.needs_full(0, 1), "4 KB 上限下 2048 字节是原值");
+        assert_eq!(grid.cell_label(0, 1), full, "4 KB 上限下同一值直接显示");
+
+        // 64 KB 上限下协议形状但没超过上限的文本仍是原值；超过 4 KB 的在 4 KB 上限下才是信封。
+        let protocol_shaped = format!("\u{1}t:3000:{}", "b".repeat(16));
+        load(&mut grid, &protocol_shaped);
+        assert!(!grid.needs_full(0, 1), "4 KB 上限下 3000 字节没被截断，是原值");
+        grid.select(0, 1, false);
+        assert_eq!(grid.copy_cell(), protocol_shaped, "协议形状的普通文本按原值复制");
+        // WHERE 也按原值生成条件，而不是拿信封当字面量。
+        let where_sql = grid.where_text(CopyScope::Cell);
+        assert!(where_sql.contains(&protocol_shaped), "{where_sql}");
+        assert!(grid.set_preview_bytes(64 * 1024));
+        load(&mut grid, &protocol_shaped);
+        assert_eq!(grid.sheet_preview_bytes(), 64 * 1024);
+        assert!(!grid.needs_full(0, 1), "64 KB 上限下 3000 字节是原值");
+        load(&mut grid, &format!("\u{1}t:70000:{}", "c".repeat(16)));
+        assert!(grid.needs_full(0, 1), "64 KB 上限下 70000 字节仍是信封");
     }
 
     #[test]
@@ -3913,7 +4144,7 @@ mod tests {
         assert_eq!(query.stage_text(0, 0, Some("改".into())), Gate::Readonly);
         assert_eq!(query.cell_label(0, 0), "乙");
         assert!(!query.uncommitted());
-        assert_eq!(query.gate_text(Gate::Readonly), i18n::text(Locale::ZhCn, "grid.status.readonly"));
+        assert_eq!(query.gate_text(Gate::Readonly), i18n::text(Locale::ZhCn, "grid.readonly.join"));
         assert!(query.confirm_request().is_err());
         // 只读时仍可选择、复制和查看完整值。
         query.select(0, 0, false);
@@ -4438,7 +4669,7 @@ mod tests {
             Cell::Null => panic!("完整值不应是 NULL"),
         };
         assert_eq!(full.chars().count(), 600);
-        grid.apply_full(&read.row_id, &read.column_name, Some(full.clone()));
+        grid.apply_full(&read, Some(full.clone()));
 
         // 查看、复制、编辑、导出和 WHERE 共用同一个原值，并且不再读第二次。
         grid.select(0, 1, false);
@@ -4473,7 +4704,7 @@ mod tests {
         let missing = vec![("id".to_owned(), Cell::Text("999".to_owned()))];
         let error = crate::grid::read_full_cell(&session, &schema, &missing, "body").await.unwrap_err();
         assert!(error.contains("找不到"), "{error}");
-        grid.fail_full(&read.row_id, &read.column_name, &error);
+        grid.fail_full(&read, &error);
         grid.select(0, 1, false);
         assert_eq!(grid.copy_cell(), "", "失败时不复制预览");
         assert_eq!(grid.where_text(CopyScope::Cell), "", "失败时不生成 WHERE");
@@ -4490,7 +4721,7 @@ mod tests {
             Cell::Text(text) => text,
             Cell::Null => panic!("完整值不应是 NULL"),
         };
-        grid.apply_full(&retry.row_id, &retry.column_name, Some(full.clone()));
+        grid.apply_full(&retry, Some(full.clone()));
         assert_eq!(grid.viewer_state().map(|state| state.phase), Some(CellPhase::Full));
         assert_eq!(grid.copy_cell(), full);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4520,7 +4751,7 @@ mod tests {
         let session = service.catalog_session("notes").unwrap();
         let schema = grid.schema().cloned().unwrap();
         let cell = crate::grid::read_full_cell(&session, &schema, &locator_of(&read), "blob").await.unwrap();
-        grid.apply_full(&read.row_id, &read.column_name, Some(match cell {
+        grid.apply_full(&read, Some(match cell {
             Cell::Text(text) => text,
             Cell::Null => panic!("二进制不应是 NULL"),
         }));
@@ -4607,7 +4838,7 @@ mod tests {
             Cell::Text(text) => text,
             Cell::Null => panic!("外键值不应是 NULL"),
         };
-        grid.apply_full(&read.row_id, &read.column_name, Some(value.clone()));
+        grid.apply_full(&read, Some(value.clone()));
         let jump = grid.reference(0, 1).expect("读到原值后可以生成条件");
         assert!(jump.sql.contains(&value), "{}", jump.sql);
         assert!(jump.sql.contains("\"vendors\""), "{}", jump.sql);
@@ -4651,18 +4882,35 @@ mod tests {
         assert_eq!(loose.readonly_reason(), "grid.status.unlocated");
         let keyed = load_table(&service, "keyed", 1024).await;
         assert!(keyed.writable());
-        for sql in [
-            "select keyed.name from keyed join plain on 1 = 1",
-            "select count(*) from keyed",
-            "select * from keyed; select * from plain",
+        // 每种只读形态给出各自的原因键，界面把它们原样显示出来。
+        for (sql, reason) in [
+            ("select keyed.name from keyed join plain on 1 = 1", "grid.readonly.join"),
+            ("select count(*) from keyed", "grid.readonly.aggregate"),
+            ("select name, count(*) from keyed group by name", "grid.readonly.aggregate"),
+            ("select * from keyed; select * from plain", "grid.readonly.multiStatement"),
+            ("select * from (select * from keyed) as inner_keyed", "grid.readonly.parentheses"),
+            ("select upper(name) from keyed", "grid.readonly.parentheses"),
+            ("select * from keyed, plain", "grid.readonly.multiTable"),
+            ("select * from keyed union select * from keyed", "grid.readonly.setOperation"),
+            ("delete from keyed where id = 1", "grid.readonly.notSelect"),
         ] {
             let mut grid = SharedGrid::new();
             grid.target.engine = "sqlite".into();
             grid.target.connection_id = "notes".into();
             grid.show_query_sheet(sql, vec!["name".into()], vec![vec![Some("甲".into())]], false, Some(1));
             assert!(!grid.writable(), "{sql} 应当只读");
-            assert_eq!(grid.readonly_reason(), "grid.status.readonly", "{sql}");
+            assert_eq!(grid.readonly_reason(), reason, "{sql}");
+            // 原因不是键本身：两个语言都必须有这句说明。
+            for locale in [Locale::ZhCn, Locale::En] {
+                assert_ne!(i18n::text(locale, reason), reason, "{reason} 缺少文案");
+            }
         }
+        // 单表 SELECT 在确认唯一键前给出专门原因，而不是笼统的"只读"。
+        let mut pending = SharedGrid::new();
+        pending.target.engine = "sqlite".into();
+        pending.target.connection_id = "notes".into();
+        pending.show_query_sheet("select name from keyed", vec!["name".into()], vec![vec![Some("甲".into())]], false, Some(1));
+        assert_eq!(pending.readonly_reason(), "grid.readonly.locatePending");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

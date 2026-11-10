@@ -251,6 +251,8 @@ pub async fn count_rows_search(
     fetch_count(session, &sql).await
 }
 
+/// 不带预览上限的提交：调用方拿不到读出这些值时的上限时才用，写回判断回退到默认上限。
+#[allow(dead_code)]
 pub async fn commit(
     session: &CatalogSession,
     database: &str,
@@ -258,6 +260,19 @@ pub async fn commit(
     table: &str,
     engine_hint: &str,
     changes: &[Mutation],
+) -> Result<CommitReport, String> {
+    commit_with_preview(session, database, schema_name, table, engine_hint, changes, sql::DEFAULT_PREVIEW_BYTES).await
+}
+
+/// 带预览上限的提交：这些值读出时用的上限决定什么算信封，写回前不再另找一个默认值。
+pub async fn commit_with_preview(
+    session: &CatalogSession,
+    database: &str,
+    schema_name: &str,
+    table: &str,
+    engine_hint: &str,
+    changes: &[Mutation],
+    preview_bytes: usize,
 ) -> Result<CommitReport, String> {
     let schema = describe(session, database, schema_name, table, engine_hint).await?;
     let mut applied = Vec::new();
@@ -268,7 +283,7 @@ pub async fn commit(
         }
         match change.kind {
             MutationKind::Update => {
-                if let Some(message) = reject_sets(&schema, &change.sets, &change.resolved) {
+                if let Some(message) = reject_sets(&schema, &change.sets, &change.resolved, preview_bytes) {
                     return Ok(fail(applied, &change.id, String::new(), message, pending));
                 }
                 let sql = match located_sql(&schema, &change.locator, true) {
@@ -306,7 +321,7 @@ pub async fn commit(
                 }
             }
             MutationKind::Insert => {
-                if let Some(message) = reject_sets(&schema, &change.values, &[]) {
+                if let Some(message) = reject_sets(&schema, &change.values, &[], preview_bytes) {
                     return Ok(fail(applied, &change.id, String::new(), message, pending));
                 }
                 let sql = sql::insert_sql(&schema, &change.values);
@@ -331,10 +346,10 @@ fn fail(applied: Vec<Applied>, id: &str, sql: String, message: impl Into<String>
     }
 }
 
-fn reject_sets(schema: &TableSchema, sets: &[(String, Cell)], resolved: &[bool]) -> Option<String> {
+fn reject_sets(schema: &TableSchema, sets: &[(String, Cell)], resolved: &[bool], preview_bytes: usize) -> Option<String> {
     sets.iter().enumerate().find_map(|(index, (name, value))| {
         let column = schema.columns.iter().find(|column| column.name == *name)?;
-        sql::reject_literal_with(column, value, resolved.get(index).copied().unwrap_or(false))
+        sql::reject_literal_with(column, value, resolved.get(index).copied().unwrap_or(false), preview_bytes)
     })
 }
 

@@ -61,6 +61,9 @@ pub struct ExchangeSource {
     pub running: bool,
     pub label: String,
     pub context: String,
+    /// 这些行读出来时的大字段预览上限。导出前的信封检查按它比较；
+    /// None 表示这份行没经过预览截断（例如查询结果），协议形状的普通文本仍是原值。
+    pub preview_bytes: Option<usize>,
 }
 
 impl ExchangeSource {
@@ -572,7 +575,14 @@ impl ExchangePane {
             return;
         }
         // 预览信封不是原值：先在网格里读取完整值，导出写的是同一次定位读到的原值。
-        if self.source.rows.iter().flatten().flatten().any(|value| crate::grid::looks_like_preview(value)) {
+        if self
+            .source
+            .rows
+            .iter()
+            .flatten()
+            .flatten()
+            .any(|value| crate::grid::looks_like_preview(value, self.source.preview_bytes))
+        {
             self.block("loaded", "export", i18n::text(self.locale, "grid.export.needFull").to_owned());
             return;
         }
@@ -1517,6 +1527,7 @@ mod tests {
             running: false,
             label: table.to_owned(),
             context: "笔记 / main".to_owned(),
+            preview_bytes: Some(crate::grid::DEFAULT_PREVIEW_BYTES),
         }
     }
 
@@ -1550,6 +1561,7 @@ mod tests {
             running,
             label: "查询结果".to_owned(),
             context: "笔记 / main".to_owned(),
+            preview_bytes: None,
         }
     }
 
@@ -1634,4 +1646,43 @@ mod tests {
         assert!(!written.contains('\u{1}'), "文件里不能出现预览信封");
         let _ = std::fs::remove_file(&path);
     }
+
+    /// 协议形状的普通文本：是不是信封取决于读出时的上限。1 KB 上限下 3000 字节被截断，
+    /// 4 KB/64 KB 上限下它就是原值，导出必须原样写出；查询结果没有经过截断，同样不挡。
+    #[test]
+    fn loaded_export_compares_protocol_shaped_text_against_the_sheet_limit() {
+        let shaped = format!("\u{1}t:3000:{}", "a".repeat(32));
+        let mut pane = exchange_pane();
+        let mut source = table_source("docs", &["id", "body"]);
+        source.rows = vec![vec![Some("1".to_owned()), Some(shaped.clone())]];
+        source.preview_bytes = Some(1024);
+        pane.bind_source(source);
+        let path = std::env::temp_dir().join(format!("rillsql-loaded-limit-{}.csv", uuid::Uuid::new_v4()));
+        pane.start_loaded(path.clone());
+        let text = pane.lines().join("\n");
+        assert!(text.contains(&i18n::text(Locale::ZhCn, "grid.export.needFull")), "1 KB 上限下是信封：{text}");
+        assert!(!path.exists(), "信封不该写出文件");
+
+        for limit in [4 * 1024, 64 * 1024] {
+            let mut source = table_source("docs", &["id", "body"]);
+            source.rows = vec![vec![Some("1".to_owned()), Some(shaped.clone())]];
+            source.preview_bytes = Some(limit);
+            pane.bind_source(source);
+            pane.start_loaded(path.clone());
+            let written = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(written.contains(&shaped), "{limit} 上限下这段是原值：{written}");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        // 查询结果没有预览截断：协议形状的文本直接导出。
+        let mut source = query_source(false);
+        source.rows = vec![vec![Some(shaped.clone())]];
+        source.columns = vec!["label".to_owned()];
+        pane.bind_source(source);
+        pane.start_loaded(path.clone());
+        let written = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(written.contains(&shaped), "查询结果里的协议形状文本是原值：{written}");
+        let _ = std::fs::remove_file(&path);
+    }
 }
+

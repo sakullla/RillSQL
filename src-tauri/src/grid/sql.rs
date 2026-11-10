@@ -70,12 +70,16 @@ pub fn sql_cell(engine: Engine, column: Option<&Column>, value: &Cell) -> String
     }
 }
 
+/// 没有会话预览上限时的回退值：只给拿不到已读快照的调用方用。
+pub const DEFAULT_PREVIEW_BYTES: usize = 1024;
+
 pub fn reject_literal(column: &Column, value: &Cell) -> Option<String> {
-    reject_literal_with(column, value, false)
+    reject_literal_with(column, value, false, DEFAULT_PREVIEW_BYTES)
 }
 
 /// resolved 为真表示这段文本来自已经完成的主键另读，即使形状像预览也是原值。
-pub fn reject_literal_with(column: &Column, value: &Cell, resolved: bool) -> Option<String> {
+/// preview_bytes 必须是读出这段值的那个上限，不能用当前设置顶替。
+pub fn reject_literal_with(column: &Column, value: &Cell, resolved: bool, preview_bytes: usize) -> Option<String> {
     let family = value_family(&column.type_name);
     match family {
         ValueFamily::Unknown => Some("类型未知，不能编辑".to_owned()),
@@ -83,7 +87,7 @@ pub fn reject_literal_with(column: &Column, value: &Cell, resolved: bool) -> Opt
         ValueFamily::Raw => Some("不能判断写回方式，不能编辑".to_owned()),
         _ => match value {
             Cell::Null => None,
-            Cell::Text(text) if !resolved && blocks_preview(family, text) => Some("预览内容不能写回".to_owned()),
+            Cell::Text(text) if !resolved && blocks_preview(family, text, preview_bytes) => Some("预览内容不能写回".to_owned()),
             Cell::Text(text) if family == ValueFamily::Binary && parse_hex(text).is_none() => Some("这不是十六进制".to_owned()),
             Cell::Text(text) if family == ValueFamily::Bool && bool_literal(text).is_none() => Some("不能写成布尔字面量".to_owned()),
             Cell::Text(_) => None,
@@ -92,15 +96,16 @@ pub fn reject_literal_with(column: &Column, value: &Cell, resolved: bool) -> Opt
 }
 
 /// 二进制预览，或页查询才会发出的长文本预览。短文本碰巧写成协议形状时不是预览。
-fn blocks_preview(family: ValueFamily, value: &str) -> bool {
+fn blocks_preview(family: ValueFamily, value: &str, preview_bytes: usize) -> bool {
     if family == ValueFamily::Binary {
         return is_preview_envelope(value);
     }
-    is_synthetic_text_preview(value)
+    is_synthetic_text_preview(value, preview_bytes)
 }
 
-/// 页查询只在文本超过 1024 字节时包信封，预览最多 1024 个字符，因此整段一定长于 1024 字节。
-fn is_synthetic_text_preview(value: &str) -> bool {
+/// 页查询只在文本超过 preview_bytes 时包信封；声明长度没超过那次读取的上限时，
+/// 形状相同的文本仍是原值。上限必须来自读出这段值的快照，不能写死。
+fn is_synthetic_text_preview(value: &str, preview_bytes: usize) -> bool {
     let Some(rest) = value.strip_prefix('\u{1}') else {
         return false;
     };
@@ -116,8 +121,8 @@ fn is_synthetic_text_preview(value: &str) -> bool {
     // 信封本身是协议标记：只要前缀、数字字节数和分隔冒号成立就视为预览，
     // 不再用字节数与字符数比较，避免多字节文本被误判为可写回。
     let _ = preview;
-    // 小于 1 KB 的 t: 文本可能是用户字面量；协议只在大值上生成信封。
-    bytes > 1024
+    // 没超过那次读取上限的 t: 文本可能是用户字面量；协议只在大值上生成信封。
+    bytes > preview_bytes.max(1) as u64
 }
 
 /// 与前端预览协议一致：U+0001 开头的 t:字节数:预览 或 b:字节数。
@@ -636,15 +641,20 @@ pub fn preview_envelope(value: &str, type_name: &str, preview_bytes: usize) -> O
 }
 
 /// 导出前的结构检查：值还带着预览信封的形状时不能写成文件。
-/// 文本只认页查询真的会截断的形态（声明长度超过 1 KB），
+/// 文本只认那次读取真的会截断的形态（声明长度超过当次上限），
 /// 二进制只认 `b:<字节>`；短小但形状相同的普通文本仍按原值处理。
-pub fn looks_like_preview(value: &str) -> bool {
+/// preview_bytes 为 None 表示这份行根本没有走过预览截断（例如查询结果），
+/// 协议形状的普通文本因此不被当成信封。
+pub fn looks_like_preview(value: &str, preview_bytes: Option<usize>) -> bool {
     let Some(rest) = value.strip_prefix('\u{1}') else {
         return false;
     };
     if let Some(body) = rest.strip_prefix("b:") {
         return !body.is_empty() && body.bytes().all(|byte| byte.is_ascii_digit());
     }
-    is_synthetic_text_preview(value)
+    match preview_bytes {
+        Some(limit) => is_synthetic_text_preview(value, limit),
+        None => false,
+    }
 }
 

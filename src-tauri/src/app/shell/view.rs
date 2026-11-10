@@ -78,6 +78,16 @@ impl Workbench {
         let foundation = cx.new(|cx| Foundation::new(window, cx));
         let query = cx.new(|cx| QueryPane::new(Arc::clone(&services), window, cx));
         let table = cx.new(|cx| GridPane::new(Arc::clone(&services), window, cx));
+        // 外键跳转的出口：网格只算出目标和定位查询，真正打开工作项由外壳负责。
+        // 这条接线就是"跳转"与"只复制 SQL"的区别，所以必须在这里接上，而不是留给网格自己。
+        let nav_owner = cx.entity().downgrade();
+        table.update(cx, |pane, _| {
+            pane.set_navigation_sink(Arc::new(move |navigation: crate::app::views::grid::GridNavigation, cx: &mut App| {
+                if let Some(owner) = nav_owner.upgrade() {
+                    owner.update(cx, |view, cx| view.open_reference(navigation, cx));
+                }
+            }));
+        });
         let structure = cx.new(|_| StructurePane::new(Arc::clone(&services)));
         let admin = cx.new(|_| AdminPane::new(Arc::clone(&services)));
         let exchange = cx.new(|_| ExchangePane::new(Arc::clone(&services)));
@@ -361,6 +371,27 @@ impl Workbench {
             .or_else(|| self.model.active_scope())
     }
 
+    /// 外键跳转：真的打开引用表的工作项，并带上复合/单键的定位查询。
+    /// 打开的是新的查询工作项，所以原来那张表的选择、滚动、暂存和查看目标都还在原处。
+    pub(super) fn open_reference(&mut self, navigation: crate::app::views::grid::GridNavigation, cx: &mut Context<Self>) {
+        self.model.open_bound_query(
+            navigation.sql.clone(),
+            Some(navigation.connection_id.clone()),
+            Some(navigation.connection_name.clone()),
+            Some(navigation.database.clone()),
+            Some(navigation.engine.clone()),
+        );
+        let live = self.services.connections.catalog_session(&navigation.connection_id).is_some();
+        if live {
+            // 只读定位 SELECT：直接执行，界面落到引用行；执行结果走查询页自己的失败说明。
+            self.forward_query("execute-query", cx);
+        } else {
+            // 连接没打开时不假装跳到行：语句留在编辑器里，原因写清楚。
+            self.model.notice_detail = crate::i18n::text(self.model.locale(), "grid.fk.prepared");
+        }
+        cx.notify();
+    }
+
     fn route_shared_grid(&mut self, id: &str, cx: &mut Context<Self>) -> Option<String> {
         let table = self.model.shell.page == crate::app::AppPage::Workspace && self.model.tool == WorkTool::Table;
         if table {
@@ -450,7 +481,8 @@ impl Workbench {
         let null_copy = settings.null_copy.clone();
         self.table.update(cx, |pane, cx| {
             pane.set_page_limit(page_size, cx);
-            pane.set_preview_kb(preview_kb);
+            // 上限变了就重读表数据并关掉查看面板，旧行列不再按新上限解释。
+            pane.set_preview_kb(preview_kb, cx);
             pane.set_null_copy(&null_copy);
         });
     }
@@ -1345,11 +1377,14 @@ impl Workbench {
                     running: pane.busy(),
                     label: "查询结果".to_owned(),
                     context: pane.exchange_context(),
+                    // 查询结果是完整值，没有经过预览截断：协议形状的普通文本照原值导出。
+                    preview_bytes: None,
                 }
             }
             ExchangeSourceKind::Table => {
                 let (table, columns, rows, truncated) = self.table.read(cx).exchange_sheet();
                 let running = self.table.read(cx).fetching();
+                let preview_bytes = self.table.read(cx).sheet_preview_bytes();
                 // 只有当前工作项的目标与网格实际表一致时才能把网格当来源；
                 // 结构页、刚切换的表和隐藏的旧表都不能混用列与行。
                 let consistent = match self.model.active_tab() {
@@ -1372,6 +1407,7 @@ impl Workbench {
                         running,
                         label: String::new(),
                         context: String::new(),
+                        preview_bytes: None,
                     };
                 }
                 let label = table.as_ref().map(|table| table.table.clone()).unwrap_or_default();
@@ -1396,6 +1432,7 @@ impl Workbench {
                     running,
                     label,
                     context,
+                    preview_bytes: Some(preview_bytes),
                 }
             }
         }

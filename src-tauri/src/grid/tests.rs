@@ -263,7 +263,9 @@ fn preview_sql_literals_and_split_follow_the_query_scanner() {
     assert!(sql::reject_literal(&col("note", "text"), &Cell::Text("\u{1}t:11:hello".to_owned())).is_none());
     let synthetic = format!("\u{1}t:3000:{}", "a".repeat(1024));
     assert_eq!(sql::reject_literal(&col("note", "text"), &Cell::Text(synthetic.clone())).as_deref(), Some("预览内容不能写回"));
-    assert!(sql::reject_literal_with(&col("note", "text"), &Cell::Text(synthetic), true).is_none());
+    assert!(sql::reject_literal_with(&col("note", "text"), &Cell::Text(synthetic.clone()), true, 1024).is_none());
+    // 上限来自读出这段值的那次读取：4 KB 上限下 3000 字节的文本已经是原值，不再当预览挡住。
+    assert!(sql::reject_literal_with(&col("note", "text"), &Cell::Text(synthetic), false, 4096).is_none());
     assert_eq!(sql::reject_literal(&col("shape", "geometry"), &Cell::Null).as_deref(), Some("几何类型不能从格子保存"));
     assert!(sql::reject_literal(&col("mystery", ""), &Cell::Text("a".to_owned())).unwrap().contains("类型未知"));
     assert!(sql::reject_literal(&col("weird", "interval"), &Cell::Null).unwrap().contains("不能判断写回方式"));
@@ -1243,8 +1245,14 @@ mod fk_limits {
         assert!(preview_envelope("\u{1}t:4096:abc", "text", 1024).is_some());
         assert!(preview_envelope("\u{1}b:2", "blob", 1024).is_some());
         assert!(preview_envelope("\u{1}b:2", "text", 1024).is_none());
-        assert!(looks_like_preview("\u{1}t:4096:abc"));
-        assert!(!looks_like_preview("\u{1}t:3:abc"));
+        assert!(looks_like_preview("\u{1}t:4096:abc", Some(1024)));
+        assert!(!looks_like_preview("\u{1}t:3:abc", Some(1024)));
+        // 按读出时的上限比较：1 KB 上限下是信封，4 KB/64 KB 上限下就是普通文本。
+        assert!(!looks_like_preview("\u{1}t:3000:abc", Some(4096)));
+        assert!(!looks_like_preview("\u{1}t:3000:abc", Some(64 * 1024)));
+        assert!(looks_like_preview("\u{1}t:3000:abc", Some(1024)));
+        // 查询结果没有经过预览截断，协议形状的普通文本仍是原值。
+        assert!(!looks_like_preview("\u{1}t:3000:abc", None));
         drop(session);
         drop(service);
         let _ = std::fs::remove_dir_all(&dir);

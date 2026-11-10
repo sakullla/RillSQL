@@ -156,6 +156,8 @@ async fn write_import(
                 include_foreign_keys: table.include_foreign_keys,
             },
             changes: vec![change.clone()],
+            // 导入值来自文件，不是从预览截断里读出来的；用默认上限，信封形状按默认标准判断。
+            preview_bytes: crate::grid::DEFAULT_PREVIEW_BYTES as u64,
         };
         let report = crate::application::grid::commit(service, &request, true).await?;
         applied += report.applied.len();

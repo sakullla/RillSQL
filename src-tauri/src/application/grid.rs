@@ -6,7 +6,7 @@ use crate::grid::commands::{
     TableRef,
 };
 use crate::grid::{
-    commit_mutations, count_rows_search, describe as describe_table, foreign_keys, query_page_search_preview, run_export, Cell, Engine, ExportMode, ExportSpec, Filter, FilterOp, ForeignKey,
+    commit_mutations_with_preview, count_rows_search, describe as describe_table, foreign_keys, query_page_search_preview, run_export, Cell, Engine, ExportMode, ExportSpec, Filter, FilterOp, ForeignKey,
     Mutation, MutationKind, Sort, TableSchema,
 };
 
@@ -127,7 +127,16 @@ pub async fn commit(service: &Service, request: &CommitRequest, confirmed: bool)
     require_commit(confirmed)?;
     let changes = map_changes(&request.changes)?;
     let session = session_of(service, &request.table.connection_id)?;
-    let report = commit_mutations(&session, &request.table.database, &request.table.schema, &request.table.table, &request.table.engine, &changes).await?;
+    let report = commit_mutations_with_preview(
+        &session,
+        &request.table.database,
+        &request.table.schema,
+        &request.table.table,
+        &request.table.engine,
+        &changes,
+        usize::try_from(request.preview_bytes).unwrap_or(usize::MAX),
+    )
+    .await?;
     Ok(CommitDto {
         applied: report.applied.into_iter().map(|step| StepDto { label: step_label(&step.id), id: step.id, sql: step.sql }).collect(),
         failed: report.failed.map(|step| FailedDto { label: step_label(&step.id), id: step.id, sql: step.sql, message: step.message }),

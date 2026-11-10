@@ -43,6 +43,7 @@ fn commit_request(connection_id: &str, table: &str) -> CommitRequest {
             locator: vec![value("id", "1")],
             values: Vec::new(),
         }],
+        preview_bytes: crate::grid::DEFAULT_PREVIEW_BYTES as u64,
     }
 }
 
