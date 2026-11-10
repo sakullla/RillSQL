@@ -8,6 +8,7 @@ pub mod commands;
 pub(crate) mod desk;
 mod exec;
 mod history;
+mod meta;
 mod saved;
 mod split;
 

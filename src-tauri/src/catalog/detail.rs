@@ -233,7 +233,8 @@ fn sqlite_row(row: &sqlx::sqlite::SqliteRow, index: usize) -> Option<String> {
 }
 
 /// 在一个已经打开的目录会话上执行一条只读语句，把每格转成文本。
-async fn rows_for(session: &CatalogSession, sql: &str) -> Result<Vec<Vec<Option<String>>>, String> {
+/// 同模块的按需读取和查询补全的外键读取共用它，不再各写一份引擎分支。
+pub(crate) async fn rows_for(session: &CatalogSession, sql: &str) -> Result<Vec<Vec<Option<String>>>, String> {
     match session {
         CatalogSession::Scripted => Err(failure("这个连接没有连着可查询的数据库")),
         CatalogSession::Redis(_) => Err(failure("Redis 没有列或索引")),
@@ -309,6 +310,21 @@ async fn rows_for(session: &CatalogSession, sql: &str) -> Result<Vec<Vec<Option<
             Ok(rows)
         }
     }
+}
+
+/// 只读一个表的列名，供补全的来源列表使用；索引不在这一步读取。
+pub async fn read_column_names(
+    session: &CatalogSession,
+    engine: Engine,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<String>, String> {
+    let Some(sql) = columns_sql(engine, database, schema, table) else {
+        return Err("这个引擎没有列清单".to_owned());
+    };
+    let rows = rows_for(session, &sql).await?;
+    Ok(columns_from_rows(engine, &rows).into_iter().map(|column| column.name).filter(|name| !name.is_empty()).collect())
 }
 
 /// 读一个对象的列与索引。两边分别成败：列失败不影响索引结果；

@@ -108,10 +108,15 @@ pub enum MetadataState {
 }
 
 /// 真实外键：ON 条件只在实际读到外键时标注为外键，否则只给命名推断。
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// 连接、库和两侧模式一起构成身份；同名表在不同库或模式里不能互相匹配。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ForeignKey {
+    pub connection_id: String,
+    pub database: String,
+    pub from_schema: String,
     pub from_table: String,
     pub from_columns: Vec<String>,
+    pub to_schema: String,
     pub to_table: String,
     pub to_columns: Vec<String>,
 }

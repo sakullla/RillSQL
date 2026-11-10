@@ -887,9 +887,11 @@ impl QueryPane {
                                     let mut parts = key.split('\u{1}');
                                     let connection = parts.next().unwrap_or("");
                                     let database = parts.next().unwrap_or("");
+                                    let schema = parts.next().unwrap_or("");
                                     let table = parts.next().unwrap_or("");
-                                    pane.desk.remember_columns(connection, database, table, cols);
+                                    pane.desk.remember_table_columns(connection, database, schema, table, cols);
                                 }
+                                pane.desk.set_foreign_keys(loaded.foreign_keys);
                                 if failure.is_empty() {
                                     pane.desk.set_active_note("");
                                 } else {

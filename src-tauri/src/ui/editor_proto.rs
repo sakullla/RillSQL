@@ -40,6 +40,8 @@ pub struct SqlEditor {
     font_size: f32,
     theme: String,
     _subscription: gpui_kit::Subscription,
+    /// Tab 接受补全：弹层打开时把 Tab 当成 Enter，其它时候仍然缩进。
+    _accept_tab: gpui_kit::Subscription,
 }
 
 struct SqlSuggest {
@@ -81,6 +83,27 @@ impl SqlEditor {
                 cx.notify();
             }
         });
+        // 弹层由编辑器自己画，键盘接受原本只绑了 Enter；Tab 在这里补上。
+        let accept_tab = cx.intercept_keystrokes({
+            let state = state.downgrade();
+            move |event, window, cx| {
+                if event.keystroke.key != "tab" || event.keystroke.modifiers.modified() {
+                    return;
+                }
+                // 只在这个编辑器的弹层打开、并且焦点还在它上面时才改写 Tab。
+                let ours = state
+                    .update(cx, |state, cx| {
+                        state.completion_menu_state().open && state.focus_handle(cx).is_focused(window)
+                    })
+                    .unwrap_or(false);
+                if !ours {
+                    return;
+                }
+                cx.stop_propagation();
+                // 走和 Enter 同一条路径：接受当前选中项并收起弹层。
+                window.dispatch_action(Box::new(gpui_kit::base::input::Enter { secondary: false, shift: false }), cx);
+            }
+        });
         Self {
             state,
             version,
@@ -94,6 +117,7 @@ impl SqlEditor {
             font_size: 13.0,
             theme: "auto".to_owned(),
             _subscription: subscription,
+            _accept_tab: accept_tab,
         }
     }
 
@@ -247,9 +271,10 @@ impl SqlEditor {
         self.state.update(cx, |state, cx| {
             let selected = state.selected_range();
             let text = state.text().clone();
-            // 有选区时替换选区；否则替换光标前已打出的单词。
+            // 有选区时替换选区；否则替换光标所在的整个词（光标停在词中间也不留半截）。
             let start = if selected.is_empty() { selected.end - word_before(&text, selected.end).len() } else { selected.start };
-            let range = offset_to_position(&text, start)..offset_to_position(&text, selected.end);
+            let end = if selected.is_empty() { word_end(&text, selected.end) } else { selected.end };
+            let range = offset_to_position(&text, start)..offset_to_position(&text, end);
             let item = completion_edit(label, insert, None, range, None);
             state.insert_completion(&item, selected, window, cx);
         });
@@ -389,7 +414,7 @@ impl SqlSuggest {
                     }
                 }
                 None => {
-                    let range = offset_to_position(text, offset - word.len())..offset_to_position(text, offset);
+                    let range = offset_to_position(text, offset - word.len())..offset_to_position(text, word_end(text, offset));
                     for keyword in FALLBACK_KEYWORDS {
                         if lower.is_empty() || keyword.to_ascii_lowercase().starts_with(&lower) {
                             items.push(completion_edit(keyword, keyword, Some(CompletionItemKind::KEYWORD), range.clone(), None));
@@ -398,7 +423,7 @@ impl SqlSuggest {
                 }
             }
         }
-        let range = offset_to_position(text, offset - word.len())..offset_to_position(text, offset);
+        let range = offset_to_position(text, offset - word.len())..offset_to_position(text, word_end(text, offset));
         for (label, insert) in self.extra.borrow().iter() {
             if items.iter().any(|item| item.label == *label) {
                 continue;
@@ -488,6 +513,18 @@ fn word_before(text: &Rope, offset: usize) -> String {
         .chars()
         .rev()
         .collect()
+}
+
+/// 光标之后当前词的结尾；替换范围据此覆盖整个词。
+fn word_end(text: &Rope, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    let tail = text.slice(offset..text.len()).to_string();
+    offset
+        + tail
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .map(char::len_utf8)
+            .sum::<usize>()
 }
 
 fn offset_to_position(text: &Rope, offset: usize) -> lsp_types::Position {
@@ -783,6 +820,125 @@ mod tests {
             assert!(!editor.read(cx).completion_open(cx), "Esc 关闭弹层");
             assert!(editor.read(cx).is_focused(window, cx), "Esc 之后焦点回到编辑器");
             assert_eq!(editor.read(cx).value(cx), "select * from ord", "Esc 不改草稿");
+        })
+        .unwrap();
+    }
+
+    fn open_popup(window: gpui_kit::AnyWindowHandle, editor: &Entity<SqlEditor>, sql: &str, cx: &mut TestAppContext) {
+        cx.update_window(window, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_sql(sql, window, cx);
+                editor.focus(window, cx);
+                editor.set_completion_scope(Some(catalog_scope()));
+                let end = sql.len();
+                editor.select_range(end..end, cx);
+                editor.show_completions(window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn tab_and_enter_both_accept_the_selected_completion(cx: &mut TestAppContext) {
+        let (window, editor) = open(cx);
+        open_popup(window, &editor, "select * from ord", cx);
+        cx.update_window(window, |_, window, cx| {
+            assert!(editor.read(cx).completion_open(cx), "弹层应打开");
+            window.press("tab", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, _, cx| {
+            let value = editor.read(cx).value(cx);
+            assert_eq!(value, "select * from orders", "Tab 应接受当前候选");
+            assert!(!editor.read(cx).completion_open(cx), "接受后弹层收起");
+        })
+        .unwrap();
+
+        // Enter 仍然接受，行为没被 Tab 抢走。
+        open_popup(window, &editor, "select * from ord", cx);
+        cx.update_window(window, |_, window, cx| {
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, _, cx| {
+            assert_eq!(editor.read(cx).value(cx), "select * from orders");
+            assert!(!editor.read(cx).completion_open(cx));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn arrows_move_the_selected_completion_and_escape_returns_focus(cx: &mut TestAppContext) {
+        let (window, editor) = open(cx);
+        open_popup(window, &editor, "select * from ord", cx);
+        cx.update_window(window, |_, window, cx| {
+            let labels = editor.read(cx).completion_labels(cx);
+            assert!(labels.len() >= 2, "{labels:?}");
+            // 下移一项再接受：走的必须是选中的那一项，而不是固定第一项。
+            window.press("down", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, _, cx| {
+            assert_eq!(editor.read(cx).value(cx), "select * from ORDER", "方向键要移动选中项");
+        })
+        .unwrap();
+
+        // 上移回来再接受，仍然是第一项；Esc 不改草稿并回到编辑器焦点。
+        open_popup(window, &editor, "select * from ord", cx);
+        cx.update_window(window, |_, window, cx| {
+            window.press("up", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            window.press("escape", cx);
+            assert!(!editor.read(cx).completion_open(cx));
+            assert!(editor.read(cx).is_focused(window, cx), "关闭后焦点回编辑器");
+            assert_eq!(editor.read(cx).value(cx), "select * from ord", "Esc 不改草稿");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn tab_without_a_popup_does_not_insert_a_completion(cx: &mut TestAppContext) {
+        let (window, editor) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_sql("sel", window, cx);
+                editor.focus(window, cx);
+                editor.set_completion_scope(Some(catalog_scope()));
+                editor.select_range(3..3, cx);
+            });
+            window.press("tab", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, _, cx| {
+            assert!(!editor.read(cx).value(cx).contains("SELECT"), "没有弹层时 Tab 不写候选");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn accepting_mid_word_replaces_the_whole_word(cx: &mut TestAppContext) {
+        let (window, editor) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_sql("selec", window, cx);
+                editor.select_range(3..3, cx);
+                let version = editor.version();
+                assert!(editor.apply_completion_insert(version, "SELECT", "SELECT", window, cx));
+            });
+            assert_eq!(editor.read(cx).value(cx), "SELECT", "光标在词中间时整词替换");
         })
         .unwrap();
     }

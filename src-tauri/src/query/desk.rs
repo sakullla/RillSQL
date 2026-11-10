@@ -114,7 +114,10 @@ pub struct Desk {
     active: Option<String>,
     seq: u64,
     objects: Vec<TreeObject>,
+    /// 按连接/库/模式/表记住的列；同一个表名在不同模式里不互相覆盖。
     columns: HashMap<String, Vec<String>>,
+    /// 已读到的真实外键，带连接/库/模式身份。
+    foreign_keys: Vec<assist::ForeignKey>,
     /// 本地标识符词频：只参与同分排序，不保存 SQL 文本。
     frequency: HashMap<String, u32>,
     databases: Vec<String>,
@@ -138,6 +141,7 @@ impl Desk {
             seq: 0,
             objects: Vec::new(),
             columns: HashMap::new(),
+            foreign_keys: Vec::new(),
             frequency: HashMap::new(),
             databases: Vec::new(),
             links: Vec::new(),
@@ -874,8 +878,25 @@ impl Desk {
         }
     }
 
+    pub fn remember_table_columns(
+        &mut self,
+        connection_id: &str,
+        database: &str,
+        schema: &str,
+        table: &str,
+        columns: Vec<String>,
+    ) {
+        self.columns.insert(column_key(connection_id, database, schema, table), columns);
+    }
+
+    /// 只有库和表、没有模式的引擎（SQLite/MySQL）用它。
     pub fn remember_columns(&mut self, connection_id: &str, database: &str, table: &str, columns: Vec<String>) {
-        self.columns.insert(column_key(connection_id, database, table), columns);
+        self.remember_table_columns(connection_id, database, "", table, columns);
+    }
+
+    /// 真实外键随目录一起替换；空集表示还没读到或引擎没有外键。
+    pub fn set_foreign_keys(&mut self, keys: Vec<assist::ForeignKey>) {
+        self.foreign_keys = keys;
     }
 
     pub fn set_objects(&mut self, objects: Vec<TreeObject>, databases: Vec<String>) {
@@ -910,7 +931,11 @@ impl Desk {
                 } else {
                     format!("{}.{}", object.schema, object.name)
                 },
-                columns: self.columns.get(&column_key(&object.connection_id, &object.database, &object.name)).cloned().unwrap_or_default(),
+                columns: self
+                    .columns
+                    .get(&column_key(&object.connection_id, &object.database, &object.schema, &object.name))
+                    .cloned()
+                    .unwrap_or_default(),
             })
             .collect()
     }
@@ -948,17 +973,36 @@ impl Desk {
                 schemas.push(object.schema.clone());
             }
         }
+        // 部分范围失败只说明部分失败：已读到的对象和列继续用；完全没有可用元数据才算失败。
         let state = if tab.target.is_none() {
             MetadataState::NoTarget
         } else if !tab.provider {
             MetadataState::NoProvider
+        } else if !objects.is_empty() {
+            if self.tree_error.is_empty() {
+                MetadataState::Ready
+            } else {
+                MetadataState::Partial(self.tree_error.clone())
+            }
+        } else if !self.objects.is_empty() {
+            // 树里有别的连接/库的对象，但不是当前目标的：状态可能过期。
+            let scope = tab.target.as_ref().map(|target| format!("{}/{}", target.connection_name, target.database)).unwrap_or_default();
+            MetadataState::Stale(scope)
         } else if !self.tree_error.is_empty() {
             MetadataState::Failed(self.tree_error.clone())
-        } else if objects.is_empty() {
-            MetadataState::Empty
         } else {
-            MetadataState::Ready
+            MetadataState::Empty
         };
+        let foreign_keys = self
+            .foreign_keys
+            .iter()
+            .filter(|key| {
+                tab.target
+                    .as_ref()
+                    .is_some_and(|target| key.connection_id == target.connection_id && key.database == target.database)
+            })
+            .cloned()
+            .collect();
         let mut frequency: Vec<(String, u32)> = self.frequency.iter().map(|(name, count)| (name.clone(), *count)).collect();
         frequency.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
         Some(assist::CompletionScope {
@@ -970,7 +1014,7 @@ impl Desk {
             schemas,
             frequency,
             state,
-            foreign_keys: Vec::new(),
+            foreign_keys,
         })
     }
 
@@ -1119,6 +1163,7 @@ pub struct TreeLoad {
     pub objects: Vec<TreeObject>,
     pub databases: Vec<String>,
     pub columns: HashMap<String, Vec<String>>,
+    pub foreign_keys: Vec<assist::ForeignKey>,
     pub links: Vec<OpenLink>,
     pub failures: Vec<String>,
 }
@@ -1179,6 +1224,7 @@ pub async fn load_tree(service: &Arc<Service>, page: usize) -> Result<TreeLoad, 
     let mut objects = Vec::new();
     let mut databases = Vec::new();
     let mut columns = HashMap::new();
+    let mut foreign_keys = Vec::new();
     let mut links = Vec::new();
     let mut failures = Vec::new();
     for record in records {
@@ -1194,6 +1240,32 @@ pub async fn load_tree(service: &Arc<Service>, page: usize) -> Result<TreeLoad, 
             if let Ok(parsed) = Engine::parse(&engine) {
                 let body = read_catalog_session(parsed, &session, page, &[]).await;
                 let listing = objects_from_catalog(&record.saved.id, &record.saved.name, &engine, &body);
+                // 目录只给对象名；列和外键按对象按需再读，单个对象失败只记原因，不清空兄弟节点。
+                for object in &listing.objects {
+                    match crate::catalog::read_column_names(&session, parsed, &object.database, &object.schema, &object.name).await {
+                        Ok(names) if !names.is_empty() => {
+                            columns.insert(
+                                column_key(&object.connection_id, &object.database, &object.schema, &object.name),
+                                names,
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) => failures.push(format!("{}: {error}", object_label(object))),
+                    }
+                }
+                for object in listing.objects.iter().filter(|object| object.kind == "table") {
+                    let Ok(keys) = super::meta::read_table_keys(&session, parsed, &object.database, &object.schema, &object.name).await else {
+                        continue;
+                    };
+                    collect_keys(
+                        &mut foreign_keys,
+                        &object.connection_id,
+                        &object.database,
+                        &object.schema,
+                        &object.name,
+                        keys,
+                    );
+                }
                 objects.extend(listing.objects);
                 failures.extend(listing.failures);
                 for name in listing.databases {
@@ -1207,6 +1279,8 @@ pub async fn load_tree(service: &Arc<Service>, page: usize) -> Result<TreeLoad, 
                 db_names.push("main".to_owned());
             }
             let transport = service.cancel_transport(&record.saved.id).unwrap_or(crate::connections::CancelTransport::None);
+            // 外键读取要另外借用同一个会话，执行器拿走它之前先留一份句柄。
+            let key_session = session.clone();
             let driver = LiveDriver::attach(session, &engine, "main", transport, None).await?;
             let flag = Arc::new(AtomicBool::new(false));
             let listed = driver
@@ -1233,7 +1307,10 @@ pub async fn load_tree(service: &Arc<Service>, page: usize) -> Result<TreeLoad, 
                     kind,
                 });
                 if let Ok(info) = read_columns(service, &record.saved.id, &name).await {
-                    columns.insert(column_key(&record.saved.id, "main", &name), info);
+                    columns.insert(column_key(&record.saved.id, "main", "", &name), info);
+                }
+                if let Ok(keys) = super::meta::read_table_keys(&key_session, Engine::Sqlite, "main", "", &name).await {
+                    collect_keys(&mut foreign_keys, &record.saved.id, "main", "", &name, keys);
                 }
             }
         }
@@ -1250,7 +1327,7 @@ pub async fn load_tree(service: &Arc<Service>, page: usize) -> Result<TreeLoad, 
             environment: record.saved.env.clone(),
         });
     }
-    Ok(TreeLoad { objects, databases, columns, links, failures })
+    Ok(TreeLoad { objects, databases, columns, foreign_keys, links, failures })
 }
 
 async fn read_columns(service: &Arc<Service>, connection_id: &str, table: &str) -> Result<Vec<String>, String> {
@@ -1283,8 +1360,48 @@ fn owner(id: &str) -> String {
     format!("query-tab-{id}")
 }
 
-fn column_key(connection_id: &str, database: &str, table: &str) -> String {
-    format!("{connection_id}\u{1}{database}\u{1}{}", table.to_ascii_lowercase())
+/// 把一次外键读取的结果并进树，身份取这张表所在的连接/库/模式。
+fn collect_keys(
+    into: &mut Vec<assist::ForeignKey>,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+    keys: Vec<super::meta::TableKey>,
+) {
+    for key in keys {
+        into.push(assist::ForeignKey {
+            connection_id: connection_id.to_owned(),
+            database: database.to_owned(),
+            from_schema: schema.to_owned(),
+            from_table: table.to_owned(),
+            from_columns: key.columns,
+            to_schema: key.ref_schema,
+            to_table: key.ref_table,
+            to_columns: key.ref_columns,
+        });
+    }
+}
+
+/// 失败说明里的对象路径：库.模式.对象，空的部分跳过。
+fn object_label(object: &TreeObject) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if !object.database.is_empty() {
+        parts.push(&object.database);
+    }
+    if !object.schema.is_empty() {
+        parts.push(&object.schema);
+    }
+    parts.push(&object.name);
+    parts.join(".")
+}
+
+fn column_key(connection_id: &str, database: &str, schema: &str, table: &str) -> String {
+    format!(
+        "{connection_id}\u{1}{database}\u{1}{}\u{1}{}",
+        schema.to_ascii_lowercase(),
+        table.to_ascii_lowercase()
+    )
 }
 
 fn assist_text(key: &str) -> String {
@@ -1486,8 +1603,12 @@ mod tests {
         let mut desk = Desk::new();
         desk.set_objects(objects.clone(), databases);
         for (key, cols) in &columns {
-            let table = key.split('\u{1}').nth(2).unwrap_or("");
-            desk.remember_columns("notes", "main", table, cols.clone());
+            let mut parts = key.split('\u{1}');
+            let _ = parts.next();
+            let _ = parts.next();
+            let schema = parts.next().unwrap_or("");
+            let table = parts.next().unwrap_or("");
+            desk.remember_table_columns("notes", "main", schema, table, cols.clone());
         }
         let object = objects.iter().find(|object| object.name == "item").unwrap();
         desk.open_object(object);
@@ -1825,11 +1946,20 @@ mod tests {
         assert!(ready.sources.iter().any(|source| source.columns.contains(&"status".to_owned())));
         assert_eq!(ready.databases, vec!["main".to_owned(), "archive".to_owned()]);
 
+        // 一个 schema 失败不等于整体失败：已读到的对象和列继续可用，状态是 Partial。
         desk.set_tree_error("读取库表失败：连接中断");
-        let failed = desk.completion_scope().expect("失败也要有上下文");
-        assert_eq!(failed.state, MetadataState::Failed("读取库表失败：连接中断".to_owned()));
-        assert!(failed.objects.iter().any(|object| object.name == "item"), "失败时已读对象仍然可用");
+        let partial = desk.completion_scope().expect("部分失败也要有上下文");
+        assert_eq!(partial.state, MetadataState::Partial("读取库表失败：连接中断".to_owned()));
+        assert!(partial.objects.iter().any(|object| object.name == "item"), "部分失败时已读对象仍然可用");
+        assert!(partial.sources.iter().any(|source| source.columns.contains(&"status".to_owned())));
         desk.set_tree_error("");
+
+        // 树里有对象但没有当前目标的：说明可能过期，而不是空目录。
+        desk.select_database("archive");
+        let stale = desk.completion_scope().expect("过期也要有上下文");
+        assert!(matches!(stale.state, MetadataState::Stale(_)), "{:?}", stale.state);
+        assert!(stale.objects.is_empty());
+        desk.select_database("main");
 
         desk.record_frequency("SELECT status FROM item WHERE status = 'status' -- status");
         desk.record_frequency("SELECT id FROM item");
@@ -1839,6 +1969,75 @@ mod tests {
         assert_eq!(weight("id"), Some(1));
         assert_eq!(weight("item"), Some(2));
         assert_eq!(weight("select"), None, "关键字不计入词频");
+    }
+
+    #[test]
+    fn schema_aware_columns_and_foreign_keys_follow_the_target() {
+        let mut desk = Desk::new();
+        desk.new_query();
+        desk.open_database("pg", "销售库", "postgres", "shop");
+        desk.set_provider(true);
+        desk.set_objects(
+            vec![
+                TreeObject {
+                    connection_id: "pg".to_owned(),
+                    connection_name: "销售库".to_owned(),
+                    engine: "postgres".to_owned(),
+                    database: "shop".to_owned(),
+                    schema: "public".to_owned(),
+                    name: "orders".to_owned(),
+                    kind: "table".to_owned(),
+                },
+                TreeObject {
+                    connection_id: "pg".to_owned(),
+                    connection_name: "销售库".to_owned(),
+                    engine: "postgres".to_owned(),
+                    database: "shop".to_owned(),
+                    schema: "archive".to_owned(),
+                    name: "orders".to_owned(),
+                    kind: "table".to_owned(),
+                },
+            ],
+            vec!["shop".to_owned()],
+        );
+        // 同名表在不同模式里各记各的列，不互相覆盖。
+        desk.remember_table_columns("pg", "shop", "public", "orders", vec!["id".to_owned(), "customer_id".to_owned()]);
+        desk.remember_table_columns("pg", "shop", "archive", "orders", vec!["id".to_owned(), "archived_at".to_owned()]);
+        desk.set_foreign_keys(vec![
+            assist::ForeignKey {
+                connection_id: "pg".to_owned(),
+                database: "shop".to_owned(),
+                from_schema: "public".to_owned(),
+                from_table: "orders".to_owned(),
+                from_columns: vec!["customer_id".to_owned()],
+                to_schema: "public".to_owned(),
+                to_table: "customers".to_owned(),
+                to_columns: vec!["id".to_owned()],
+            },
+            assist::ForeignKey {
+                connection_id: "other".to_owned(),
+                database: "shop".to_owned(),
+                from_schema: "public".to_owned(),
+                from_table: "orders".to_owned(),
+                from_columns: vec!["id".to_owned()],
+                to_schema: "public".to_owned(),
+                to_table: "customers".to_owned(),
+                to_columns: vec!["id".to_owned()],
+            },
+        ]);
+        let scope = desk.completion_scope().expect("有目标");
+        let public = scope.sources.iter().find(|source| source.label == "public.orders").expect("public.orders");
+        assert_eq!(public.columns, vec!["id".to_owned(), "customer_id".to_owned()]);
+        let archive = scope.sources.iter().find(|source| source.label == "archive.orders").expect("archive.orders");
+        assert_eq!(archive.columns, vec!["id".to_owned(), "archived_at".to_owned()]);
+        assert_eq!(scope.foreign_keys.len(), 1, "只保留当前连接的外键");
+        assert_eq!(scope.foreign_keys[0].from_schema, "public");
+
+        // 别名限定符只给该表自己的列。
+        let planned = desk.completion_for("SELECT * FROM public.orders o WHERE o.", 39, Locale::ZhCn);
+        let labels: Vec<String> = planned.iter().map(|entry| entry.label.clone()).collect();
+        assert!(labels.contains(&"customer_id".to_owned()), "{labels:?}");
+        assert!(!labels.contains(&"archived_at".to_owned()), "{labels:?}");
     }
 
     #[test]

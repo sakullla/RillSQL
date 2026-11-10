@@ -546,6 +546,8 @@ struct Source {
     alias: String,
     label: String,
     name: String,
+    /// 来源所在模式；解析不到时为空。外键匹配按它区分同名表。
+    schema: String,
     columns: Vec<String>,
 }
 
@@ -562,15 +564,28 @@ fn source_columns<'a>(scope: &'a CompletionScope, table: &TableRef) -> Option<&'
     })
 }
 
+fn schema_of(label: &str) -> String {
+    match label.rsplit_once('.') {
+        Some((schema, _)) => schema.to_owned(),
+        None => String::new(),
+    }
+}
+
 fn resolve_sources(scope: &CompletionScope, tables: &[TableRef]) -> Vec<Source> {
     tables
         .iter()
         .map(|table| {
             let found = source_columns(scope, table);
+            let schema = if table.schema.is_empty() {
+                found.map(|source| schema_of(&source.label)).unwrap_or_default()
+            } else {
+                table.schema.clone()
+            };
             Source {
                 alias: table.alias.clone(),
                 label: if table.schema.is_empty() { table.name.clone() } else { format!("{}.{}", table.schema, table.name) },
                 name: table.name.clone(),
+                schema,
                 columns: found.map(|source| source.columns.clone()).unwrap_or_default(),
             }
         })
@@ -627,9 +642,14 @@ fn plain_ident(name: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
 }
 
+/// PostgreSQL 会把没加引号的标识符折叠成小写，CamelCase 名字必须引用才指得回原对象。
+fn folds_case(engine: &str, name: &str) -> bool {
+    engine == "postgres" && name.chars().any(|ch| ch.is_uppercase())
+}
+
 /// 需要引号时才加引号，保留原大小写；引擎决定引号字符。
 pub fn ident(engine: &str, name: &str) -> String {
-    if plain_ident(name) {
+    if plain_ident(name) && !folds_case(engine, name) {
         name.to_owned()
     } else {
         quote_ident(engine, name)
@@ -796,18 +816,18 @@ impl<'a> Gather<'a> {
         i18n::text(self.locale, key)
     }
 
+    /// 这一组是否已经有候选；没有就说明这一组的元数据还没读到。
+    fn has_group(&self, group: u8) -> bool {
+        self.items.iter().any(|(_, item)| item.group == group)
+    }
+
+    /// 一个对象只留一条候选：限定名就是身份，不再同时推裸名占限额。
     fn push_object(&mut self, object: &CatalogObject, with_schema: bool) {
         let detail = i18n::text(self.locale, kind_key(&object.kind));
         let schema = if with_schema { object.schema.as_str() } else { "" };
         let label = if schema.is_empty() { object.name.clone() } else { format!("{}.{}", schema, object.name) };
         let insert = qualified_ident(self.engine, schema, &object.name);
-        let bare = object.name.clone();
-        let bare_insert = ident(self.engine, &object.name);
-        let kind = static_kind(&object.kind);
-        self.push(label, insert, kind, detail.clone(), group::OBJECT, false);
-        if !object.schema.is_empty() {
-            self.push(bare, bare_insert, kind, detail, group::OBJECT, false);
-        }
+        self.push(label, insert, static_kind(&object.kind), detail, group::OBJECT, false);
     }
 
     fn push_columns(&mut self, sources: &[Source]) {
@@ -912,15 +932,16 @@ fn type_rank(kind: &str) -> u8 {
 }
 
 fn finalize(mut gather: Gather<'_>, frequency: &HashMap<String, u32>) -> Vec<Candidate> {
-    let keyword_first = !gather.prefix.is_empty() && gather.prefix.to_uppercase() == gather.prefix;
     let prefix = gather.prefix.to_owned();
     gather.items.sort_by(|left, right| {
+        // 顺序：子句分组 → 匹配精度 → 对象类型 → 本地词频 → 出现顺序。
+        // 词频只在同一分组、同一精度、同一类型之间才起作用。
         let key = |(order, item): &(usize, Candidate)| {
             (
+                item.group,
                 match_kind(&item.label, &prefix),
-                if keyword_first && item.keyword { 0u8 } else { 1u8 },
+                type_rank(item.kind),
                 std::cmp::Reverse(weight(frequency, &item.label)),
-                item.group * 4 + type_rank(item.kind),
                 *order,
             )
         };
@@ -979,6 +1000,20 @@ fn ident_start(text: &str, at: usize) -> usize {
     start
 }
 
+/// 当前词在光标之后的结尾；光标停在词中间时整词替换，不留下半截。
+fn ident_end(text: &str, at: usize) -> usize {
+    let mut end = at.min(text.len());
+    while end < text.len() {
+        let ch = text[end..].chars().next().unwrap_or(' ');
+        if ch.is_alphanumeric() || ch == '_' || ch == '$' {
+            end += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    end
+}
+
 fn qualifier_before(text: &str, word_start: usize) -> Option<(String, usize)> {
     let head = text.get(..word_start)?;
     let trimmed = head.trim_end();
@@ -1011,17 +1046,33 @@ fn inferred_conditions(engine: &str, left: &Source, right: &Source) -> Vec<Strin
     found
 }
 
+/// 外键的两侧是否就是这两个来源。模式已知时按模式比对，避免同名表串到别的模式。
+fn same_table(schema: &str, name: &str, source: &Source) -> bool {
+    if !name.eq_ignore_ascii_case(&source.name) {
+        return false;
+    }
+    schema.is_empty() || source.schema.is_empty() || schema.eq_ignore_ascii_case(&source.schema)
+}
+
+fn fk_pair<'a>(fk: &super::assist::ForeignKey, left: &'a Source, right: &'a Source) -> Option<(&'a Source, &'a Source)> {
+    if same_table(&fk.from_schema, &fk.from_table, left) && same_table(&fk.to_schema, &fk.to_table, right) {
+        return Some((left, right));
+    }
+    if same_table(&fk.from_schema, &fk.from_table, right) && same_table(&fk.to_schema, &fk.to_table, left) {
+        return Some((right, left));
+    }
+    None
+}
+
+/// 这一对来源是否已经有真实外键；有就不再给命名推断。
+fn pair_has_foreign_key(scope: &CompletionScope, left: &Source, right: &Source) -> bool {
+    scope.foreign_keys.iter().any(|fk| fk_pair(fk, left, right).is_some())
+}
+
 fn foreign_key_conditions(scope: &CompletionScope, engine: &str, left: &Source, right: &Source) -> Vec<String> {
     let mut found = Vec::new();
     for fk in &scope.foreign_keys {
-        let pair = if left.name.eq_ignore_ascii_case(&fk.from_table) && right.name.eq_ignore_ascii_case(&fk.to_table) {
-            Some((left, right))
-        } else if right.name.eq_ignore_ascii_case(&fk.from_table) && left.name.eq_ignore_ascii_case(&fk.to_table) {
-            Some((right, left))
-        } else {
-            None
-        };
-        let Some((from, to)) = pair else {
+        let Some((from, to)) = fk_pair(fk, left, right) else {
             continue;
         };
         if fk.from_columns.len() != fk.to_columns.len() {
@@ -1038,6 +1089,25 @@ fn foreign_key_conditions(scope: &CompletionScope, engine: &str, left: &Source, 
         }
     }
     found
+}
+
+fn labels_of(sources: &[Source]) -> String {
+    let names: Vec<String> = sources.iter().map(|source| source.label.clone()).collect();
+    if names.is_empty() {
+        String::new()
+    } else {
+        names.join(", ")
+    }
+}
+
+/// 列拿不到时的回退：仍然给对象、CTE、函数和关键字，不留成功空列表。
+fn fallback_objects(gather: &mut Gather<'_>, scope: &CompletionScope, statement: &StatementScope, metadata_ok: bool) {
+    if metadata_ok {
+        gather.push_objects(scope);
+        gather.push_ctes(statement);
+        gather.push_functions();
+    }
+    gather.push_keywords();
 }
 
 /// 计算一次补全计划。text 是编辑器全文，cursor 是光标字节偏移。
@@ -1057,9 +1127,11 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
     let statement_start = head.last_mark.map(|at| window_start + at + 1).unwrap_or(window_start);
     let local = &text[statement_start..end];
     let word_start = ident_start(local, local.len());
-    let prefix = local[word_start..].to_owned();
+    // 光标可能停在词中间：替换范围和匹配前缀都按整个词算。
+    let word_end = ident_end(&text[statement_start..], end - statement_start);
+    let prefix = text[statement_start + word_start..statement_start + word_end].to_owned();
     let qualifier = qualifier_before(local, word_start);
-    plan.span = Span { start: statement_start + word_start, end };
+    plan.span = Span { start: statement_start + word_start, end: statement_start + word_end };
     if prefix.is_empty() {
         // IME 组合或中文正文：不打断输入，不弹候选。
         if let Some(prev) = local[..word_start].chars().next_back() {
@@ -1117,12 +1189,15 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
     }
 
     let target = statement.target.clone();
+    // 需要列却一列都拿不到时的说明范围；留下的候选退到对象和关键字。
+    let mut missing: Option<String> = None;
     match clause {
         Some(Clause::Use) => gather.push_databases(scope),
         Some(Clause::On) => {
+            let mut scoped: Vec<Source> = Vec::new();
             if metadata_ok {
                 let on_tables: HashSet<String> = statement.on_tables.iter().map(|alias| alias.to_lowercase()).collect();
-                let scoped: Vec<Source> = if on_tables.is_empty() {
+                scoped = if on_tables.is_empty() {
                     sources.clone()
                 } else {
                     sources
@@ -1139,7 +1214,8 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
                         for text in foreign_key_conditions(scope, &scope.engine, left, right) {
                             conditions.push((text, "query.complete.detail.joinCondition"));
                         }
-                        if scope.foreign_keys.is_empty() {
+                        // 只有这一对来源确实没有外键时才做命名推断，无关外键不再关掉全部推断。
+                        if !pair_has_foreign_key(scope, left, right) {
                             for text in inferred_conditions(&scope.engine, left, right) {
                                 conditions.push((text, "query.complete.detail.inferredCondition"));
                             }
@@ -1149,15 +1225,26 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
                 gather.push_conditions(&conditions);
                 gather.push_columns(&scoped);
             }
+            if !gather.has_group(group::COLUMN) {
+                missing = Some(labels_of(&scoped));
+                fallback_objects(&mut gather, scope, &statement, metadata_ok);
+            }
         }
         Some(Clause::Set) | Some(Clause::Values) => {
+            let mut picked: Vec<Source> = Vec::new();
             if metadata_ok {
-                let picked: Vec<Source> = match target {
+                picked = match target {
                     Some(table) => resolve_sources(scope, std::slice::from_ref(&table)),
                     None => sources.clone(),
                 };
-                let picked = if picked.is_empty() { sources.clone() } else { picked };
+                if picked.is_empty() {
+                    picked = sources.clone();
+                }
                 gather.push_columns(&picked);
+            }
+            if !gather.has_group(group::COLUMN) {
+                missing = Some(labels_of(&picked));
+                fallback_objects(&mut gather, scope, &statement, metadata_ok);
             }
         }
         Some(Clause::From) | Some(Clause::Join) => {
@@ -1195,18 +1282,21 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
         }
     }
 
+    plan.candidates = finalize(gather, &frequency);
     let needs_columns = clause.is_some_and(Clause::needs_columns);
-    let columns_missing = needs_columns && !sources.is_empty() && sources.iter().all(|source| source.columns.is_empty());
-    let column_note = if columns_missing {
-        let labels: Vec<String> = sources.iter().map(|source| source.label.clone()).collect();
-        Some(i18n::fill(
-            &i18n::text(locale, "query.complete.state.noColumns"),
-            &[("source", &labels.join(", "))],
-        ))
+    let no_column_candidate = !plan.candidates.iter().any(|item| item.kind == "column");
+    let column_note = if needs_columns && no_column_candidate {
+        let explained = match &missing {
+            Some(labels) => Some(labels.clone()),
+            None if clause.is_some_and(Clause::field_first) && !sources.is_empty() => Some(labels_of(&sources)),
+            None => None,
+        };
+        explained.map(|labels| {
+            i18n::fill(&i18n::text(locale, "query.complete.state.noColumns"), &[("source", &labels)])
+        })
     } else {
         None
     };
-    plan.candidates = finalize(gather, &frequency);
     plan.note = state_note(&scope.state, locale).or(column_note);
     plan
 }
@@ -1324,8 +1414,12 @@ mod tests {
     fn on_offers_both_sides_and_real_foreign_keys_before_naming_inference() {
         let mut exact = scope("postgres");
         exact.foreign_keys = vec![ForeignKey {
+            connection_id: "pg".to_owned(),
+            database: "shop".to_owned(),
+            from_schema: "public".to_owned(),
             from_table: "orders".to_owned(),
             from_columns: vec!["customer_id".to_owned()],
+            to_schema: "public".to_owned(),
             to_table: "customers".to_owned(),
             to_columns: vec!["id".to_owned()],
         }];
@@ -1473,6 +1567,122 @@ mod tests {
         let sql = "SELECT * FROM analytics.";
         let planned = plan(&multi, sql, sql.len(), Locale::ZhCn);
         assert_eq!(labels(&planned), vec!["daily_metrics".to_owned()]);
+    }
+
+    #[test]
+    fn ranking_keeps_group_and_type_before_local_frequency() {
+        // 执行过 SELECT 之后词频很高，也不能把关键字排到列前面。
+        let mut weighted = scope("postgres");
+        weighted.frequency = vec![("select".to_owned(), 99), ("public.orders".to_owned(), 50)];
+        let sql = "SELECT * FROM orders o WHERE st";
+        let planned = plan(&weighted, sql, sql.len(), Locale::ZhCn);
+        let names = labels(&planned);
+        let column = names.iter().position(|name| name == "status").expect("status");
+        let keyword = names.iter().position(|name| name == "SELECT").expect("SELECT");
+        assert!(column < keyword, "分组先于词频：{names:?}");
+
+        // 同分组里表类型先于视图，词频只在同类型之间提权。
+        let mut mixed = scope("postgres");
+        mixed.objects = vec![object("orders", "public", "view"), object("order_items", "public", "table")];
+        mixed.frequency = vec![("public.orders".to_owned(), 9)];
+        let sql = "SELECT * FROM order";
+        let planned = plan(&mixed, sql, sql.len(), Locale::ZhCn);
+        let names = labels(&planned);
+        let table = names.iter().position(|name| name == "public.order_items").expect("table");
+        let view = names.iter().position(|name| name == "public.orders").expect("view");
+        assert!(table < view, "同分组内表先于视图：{names:?}");
+    }
+
+    #[test]
+    fn one_object_is_listed_once_even_with_a_schema() {
+        let planned = at("SELECT * FROM ");
+        let names = labels(&planned);
+        assert!(names.contains(&"public.orders".to_owned()), "{names:?}");
+        assert!(!names.contains(&"orders".to_owned()), "同一对象不再推裸名：{names:?}");
+    }
+
+    #[test]
+    fn foreign_keys_with_another_schema_or_pair_do_not_take_over() {
+        let mut other_schema = scope("postgres");
+        other_schema.foreign_keys = vec![ForeignKey {
+            connection_id: "pg".to_owned(),
+            database: "shop".to_owned(),
+            from_schema: "analytics".to_owned(),
+            from_table: "orders".to_owned(),
+            from_columns: vec!["customer_id".to_owned()],
+            to_schema: "analytics".to_owned(),
+            to_table: "customers".to_owned(),
+            to_columns: vec!["id".to_owned()],
+        }];
+        let sql = "SELECT * FROM orders o JOIN customers c ON ";
+        let planned = plan(&other_schema, sql, sql.len(), Locale::ZhCn);
+        assert!(planned.candidates.iter().all(|item| item.detail != "外键"), "别的模式的外键不能串过来");
+        let inferred = planned.candidates.iter().find(|item| item.kind == "condition").expect("推断条件");
+        assert_eq!(inferred.label, "o.customer_id = c.id");
+        assert!(inferred.detail.contains("推断"), "{}", inferred.detail);
+
+        // 已经有一对外键时，别的表对仍然保留命名推断。
+        let mut mixed = scope("postgres");
+        mixed.sources.push(source("public.order_items", &["id", "order_id"]));
+        mixed.foreign_keys = vec![ForeignKey {
+            connection_id: "pg".to_owned(),
+            database: "shop".to_owned(),
+            from_schema: "public".to_owned(),
+            from_table: "orders".to_owned(),
+            from_columns: vec!["customer_id".to_owned()],
+            to_schema: "public".to_owned(),
+            to_table: "customers".to_owned(),
+            to_columns: vec!["id".to_owned()],
+        }];
+        let sql = "SELECT * FROM orders o JOIN order_items i ON ";
+        let planned = plan(&mixed, sql, sql.len(), Locale::ZhCn);
+        let inferred = planned.candidates.iter().find(|item| item.kind == "condition").expect("这一对没有外键");
+        assert_eq!(inferred.label, "i.order_id = o.id");
+        assert!(inferred.detail.contains("推断"), "{}", inferred.detail);
+    }
+
+    #[test]
+    fn set_and_on_without_columns_fall_back_to_keywords_and_objects() {
+        let mut unknown = scope("postgres");
+        unknown.sources.clear();
+        let set_sql = "UPDATE missing SET ";
+        let set = plan(&unknown, set_sql, set_sql.len(), Locale::ZhCn);
+        assert!(!set.candidates.is_empty(), "缺列时不能给成功空列表");
+        assert!(set.candidates.iter().any(|item| item.kind == "keyword"), "{:?}", labels(&set));
+        assert!(set.candidates.iter().any(|item| item.kind == "table"), "{:?}", labels(&set));
+        assert!(set.note.as_deref().is_some_and(|note| note.contains("missing")), "{:?}", set.note);
+
+        let values_sql = "INSERT INTO missing VALUES (";
+        let values = plan(&unknown, values_sql, values_sql.len(), Locale::ZhCn);
+        assert!(values.candidates.iter().any(|item| item.kind == "keyword"), "{:?}", labels(&values));
+        assert!(values.note.is_some());
+
+        let on_sql = "SELECT * FROM missing m JOIN other o ON ";
+        let on = plan(&unknown, on_sql, on_sql.len(), Locale::ZhCn);
+        assert!(on.candidates.iter().any(|item| item.kind == "keyword"), "{:?}", labels(&on));
+        assert!(on.note.is_some());
+    }
+
+    #[test]
+    fn cursor_inside_a_word_replaces_the_whole_word() {
+        let sql = "SELECT * FROM orders";
+        let planned = plan(&scope("postgres"), sql, 17, Locale::ZhCn);
+        assert_eq!(&sql[planned.span.start..planned.span.end], "orders");
+        let qualified = "SELECT * FROM orders o WHERE o.cust_id";
+        let planned = plan(&scope("postgres"), qualified, 33, Locale::ZhCn);
+        assert_eq!(&qualified[planned.span.start..planned.span.end], "cust_id");
+    }
+
+    #[test]
+    fn postgres_camel_case_names_are_quoted_and_other_engines_are_not() {
+        assert_eq!(ident("postgres", "OrderItems"), "\"OrderItems\"");
+        assert_eq!(ident("postgres", "orders"), "orders");
+        assert_eq!(ident("mysql", "OrderItems"), "OrderItems");
+        let mut camel = scope("postgres");
+        camel.objects = vec![object("OrderItems", "public", "table")];
+        let planned = plan(&camel, "SELECT * FROM order", 18, Locale::ZhCn);
+        let item = planned.candidates.iter().find(|item| item.label == "public.OrderItems").expect("camel object");
+        assert_eq!(item.insert, "public.\"OrderItems\"");
     }
 
     #[test]
