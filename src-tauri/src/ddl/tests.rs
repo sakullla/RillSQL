@@ -1556,6 +1556,86 @@ fn rebuilt_definition_lists_columns_indexes_comments_and_what_it_lacks() {
     assert!(missing.iter().any(|item| item.contains("索引") && item.contains("permission denied")), "{missing:?}");
 }
 
+#[test]
+fn sqlserver_index_sql_keeps_include_columns_out_of_the_key_and_writes_clustering_and_filter() {
+    use super::introspect::{sqlserver_index_sql, SqlserverIndexExtra};
+    let mut covering = index("IX_orders_customer", "customer_id", false, false, None);
+    covering.columns.push(IndexColumn { name: "created_at".to_owned(), descending: true });
+    let extra = SqlserverIndexExtra {
+        name: "IX_orders_customer".to_owned(),
+        type_desc: "NONCLUSTERED".to_owned(),
+        include: vec!["total".to_owned(), "status".to_owned()],
+        filter: Some("([status]<>(0))".to_owned()),
+    };
+    assert_eq!(
+        sqlserver_index_sql("[dbo].[orders]", &covering, &extra),
+        "CREATE NONCLUSTERED INDEX [IX_orders_customer] ON [dbo].[orders] ([customer_id], [created_at] DESC) INCLUDE ([total], [status]) WHERE ([status]<>(0));"
+    );
+
+    let mut clustered = index("CIX_orders_created", "created_at", false, false, None);
+    clustered.unique = true;
+    let extra = SqlserverIndexExtra { name: clustered.name.clone(), type_desc: "CLUSTERED".to_owned(), ..Default::default() };
+    assert_eq!(sqlserver_index_sql("[dbo].[orders]", &clustered, &extra), "CREATE UNIQUE CLUSTERED INDEX [CIX_orders_created] ON [dbo].[orders] ([created_at]);");
+
+    let mut columnstore = index("NCCI_orders", "total", false, false, None);
+    columnstore.columns.clear();
+    let extra = SqlserverIndexExtra { name: columnstore.name.clone(), type_desc: "NONCLUSTERED COLUMNSTORE".to_owned(), include: vec!["total".to_owned(), "status".to_owned()], filter: None };
+    assert_eq!(sqlserver_index_sql("[dbo].[orders]", &columnstore, &extra), "CREATE NONCLUSTERED COLUMNSTORE INDEX [NCCI_orders] ON [dbo].[orders] ([total], [status]);");
+
+    let xml = index("XML_orders_doc", "doc", false, false, None);
+    let extra = SqlserverIndexExtra { name: xml.name.clone(), type_desc: "XML".to_owned(), ..Default::default() };
+    let text = sqlserver_index_sql("[dbo].[orders]", &xml, &extra);
+    assert!(text.starts_with("-- ") && text.contains("XML") && !text.contains("CREATE"), "{text}");
+
+    // 重建的定义原样使用读取时拼好的语句：INCLUDE 列不会混进键列，说明注释也不会被补上分号。
+    let mut sqlserver = table_of_engine(Engine::Sqlserver);
+    sqlserver.columns = vec![column("id", "int", false, true), column("customer_id", "int", true, false), column("doc", "xml", true, false)];
+    let mut covering_with_sql = covering.clone();
+    covering_with_sql.columns.truncate(1);
+    covering_with_sql.sql = Some("CREATE NONCLUSTERED INDEX [IX_orders_customer] ON [dbo].[orders] ([customer_id]) INCLUDE ([total]);".to_owned());
+    let mut xml_with_sql = xml.clone();
+    xml_with_sql.sql = Some(text.clone());
+    sqlserver.indexes = vec![index("PK_orders", "id", true, false, None), covering_with_sql, xml_with_sql];
+    let (rebuilt, missing) = super::plan::rebuilt_definition(&sqlserver);
+    assert!(rebuilt.contains("CREATE NONCLUSTERED INDEX [IX_orders_customer] ON [dbo].[orders] ([customer_id]) INCLUDE ([total]);"), "{rebuilt}");
+    assert!(rebuilt.contains(&text) && !rebuilt.contains(&format!("{text};")), "{rebuilt}");
+    assert!(missing.iter().any(|item| item.contains("CLUSTERED")), "{missing:?}");
+    assert!(missing.iter().any(|item| item.contains("XML")), "{missing:?}");
+}
+
+#[tokio::test]
+async fn sqlite_case_only_rename_is_not_blocked_as_a_taken_name() {
+    let (dir, _service, session) = open_notes(&["CREATE TABLE notes (id INTEGER PRIMARY KEY)", "CREATE TABLE tags (id INTEGER PRIMARY KEY)"]).await;
+    // 表自身不算占用：真实读取得到 name_taken = false。
+    let snapshot = super::introspect::load(&session, &request(Action::DropTable { table: "notes".to_owned() }), "notes").await.unwrap();
+    assert!(!super::introspect::name_taken(&session, &snapshot, "Notes").await.unwrap());
+    assert!(super::introspect::name_taken(&session, &snapshot, "TAGS").await.unwrap());
+
+    // SQLite 会拒绝只改大小写的改名，所以预览给出单独的原因，而不是说名字被其它对象占用。
+    let action = Action::RenameTable { table: "notes".to_owned(), new_name: "Notes".to_owned() };
+    let previewed = exec::preview(&session, &request(action.clone())).await.unwrap();
+    assert!(previewed.steps.is_empty());
+    assert!(previewed.blocked.iter().any(|reason| reason.contains("大小写")), "{:?}", previewed.blocked);
+    assert!(!previewed.blocked.iter().any(|reason| reason.contains("占用")), "{:?}", previewed.blocked);
+    let receipt = exec::execute(&session, &request(action), &[]).await.unwrap();
+    assert!(!receipt.blocked.is_empty() && receipt.steps.is_empty(), "{:?}", receipt.blocked);
+    assert!(table_exists(&session, "notes").await);
+
+    // 其它引擎只改大小写时照常生成语句（PostgreSQL 的名字区分大小写，SQL Server 的 sp_rename 支持）。
+    for engine in [Engine::Postgres, Engine::Sqlserver] {
+        let mut other = table_of_engine(engine);
+        other.name_taken = Some(false);
+        let planned = plan(&other, &Action::RenameTable { table: other.name.clone(), new_name: other.name.to_uppercase() });
+        assert!(planned.blocked.is_empty(), "{engine:?} {:?}", planned.blocked);
+    }
+
+    // 另一个对象只差大小写时仍然算占用。
+    let taken = exec::preview(&session, &request(Action::RenameTable { table: "notes".to_owned(), new_name: "Tags".to_owned() })).await.unwrap();
+    assert!(taken.steps.is_empty());
+    assert!(taken.blocked.iter().any(|reason| reason.contains("占用")), "{:?}", taken.blocked);
+    let _ = fs::remove_dir_all(dir);
+}
+
 async fn notes_rows(session: &CatalogSession) -> i64 {
     let CatalogSession::Sqlite { pool, .. } = session else { panic!("sqlite") };
     sqlx::query_scalar("SELECT COUNT(*) FROM notes").fetch_one(pool).await.unwrap()

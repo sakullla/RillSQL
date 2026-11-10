@@ -118,11 +118,14 @@ pub fn table_of(action: &Action) -> Option<&str> {
 /// 改名前查新名字是否已被同一命名空间里的对象占用。
 /// SQLite 的表、视图、索引、触发器共用名字且不区分大小写；PostgreSQL 的关系（表、视图、索引、序列）共用 schema 里的名字；
 /// MySQL 看同库的表与视图；SQL Server 看同 schema 的 sys.objects。
+/// 被改名的表自身（按原名逐字节相同）不算占用，这样只改大小写的改名不会被当成名字冲突。
 pub async fn name_taken(session: &CatalogSession, snapshot: &Snapshot, name: &str) -> Result<bool, String> {
+    let current = snapshot.name.as_str();
     match session {
         CatalogSession::Sqlite { pool, .. } => {
-            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE lower(name) = lower(?1)")
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE lower(name) = lower(?1) AND name <> ?2")
                 .bind(name)
+                .bind(current)
                 .fetch_one(pool)
                 .await
                 .map_err(|err| err.to_string())?;
@@ -133,8 +136,8 @@ pub async fn name_taken(session: &CatalogSession, snapshot: &Snapshot, name: &st
             let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
             let count: Option<i64> = conn
                 .exec_first(
-                    "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-                    (snapshot.database.as_str(), name),
+                    "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND BINARY TABLE_NAME <> BINARY ?",
+                    (snapshot.database.as_str(), name, current),
                 )
                 .await
                 .map_err(|err| err.to_string())?;
@@ -143,8 +146,8 @@ pub async fn name_taken(session: &CatalogSession, snapshot: &Snapshot, name: &st
         CatalogSession::Postgres(client) => {
             let row = client
                 .query_one(
-                    "SELECT COUNT(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2",
-                    &[&snapshot.schema, &name],
+                    "SELECT COUNT(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2 AND c.relname <> $3",
+                    &[&snapshot.schema, &name, &current],
                 )
                 .await
                 .map_err(|err| err.to_string())?;
@@ -155,9 +158,10 @@ pub async fn name_taken(session: &CatalogSession, snapshot: &Snapshot, name: &st
             let rows = tds_strings(
                 client,
                 &format!(
-                    "SELECT COUNT(*) FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = N'{}' AND o.name = N'{}'",
+                    "SELECT COUNT(*) FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = N'{}' AND o.name = N'{}' AND NOT (o.name = N'{}' COLLATE Latin1_General_BIN2)",
                     tds_escape(&snapshot.schema),
-                    tds_escape(name)
+                    tds_escape(name),
+                    tds_escape(current)
                 ),
             )
             .await?;
@@ -1039,6 +1043,48 @@ async fn tds_strings(client: &TdsHandle, sql: &str) -> Result<Vec<Vec<String>>, 
         .collect())
 }
 
+/// SQL Server 索引里不在共用 Index 模型中的部分：索引类型（sys.indexes.type_desc）、INCLUDE 列与筛选条件。
+#[derive(Clone, Debug, Default)]
+pub(super) struct SqlserverIndexExtra {
+    pub name: String,
+    pub type_desc: String,
+    pub include: Vec<String>,
+    pub filter: Option<String>,
+}
+
+/// 按读到的键列、聚集方式、INCLUDE 列和筛选条件拼出 SQL Server 的 CREATE INDEX 语句。
+/// 聚集方式总是显式写出，避免默认值把聚集索引说成非聚集。列存储索引按各自语法输出；
+/// XML、空间等其它类型读不到足够信息，只输出一行说明没有重建的注释，不编造语句。
+pub(super) fn sqlserver_index_sql(qualified: &str, index: &Index, extra: &SqlserverIndexExtra) -> String {
+    let quote = |name: &str| quote_ident(Engine::Sqlserver, name);
+    let name = quote(&index.name);
+    let kind = extra.type_desc.trim().to_ascii_uppercase();
+    let filter = extra.filter.as_deref().map(|filter| format!(" WHERE {filter}")).unwrap_or_default();
+    match kind.as_str() {
+        "CLUSTERED" | "NONCLUSTERED" => {}
+        "CLUSTERED COLUMNSTORE" => return format!("CREATE CLUSTERED COLUMNSTORE INDEX {name} ON {qualified};"),
+        "NONCLUSTERED COLUMNSTORE" => {
+            let columns = index.columns.iter().map(|column| column.name.as_str()).chain(extra.include.iter().map(String::as_str)).map(quote).collect::<Vec<_>>().join(", ");
+            return format!("CREATE NONCLUSTERED COLUMNSTORE INDEX {name} ON {qualified} ({columns}){filter};");
+        }
+        _ => return format!("-- 索引 {name} 的类型是 {}，没有从元数据重建。", if kind.is_empty() { "未知" } else { kind.as_str() }),
+    }
+    let keys = index
+        .columns
+        .iter()
+        .map(|column| format!("{}{}", quote(&column.name), if column.descending { " DESC" } else { "" }))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sql = format!("CREATE {}{kind} INDEX {name} ON {qualified} ({keys})", if index.unique { "UNIQUE " } else { "" });
+    if !extra.include.is_empty() {
+        let include = extra.include.iter().map(|name| quote_ident(Engine::Sqlserver, name)).collect::<Vec<_>>().join(", ");
+        sql.push_str(&format!(" INCLUDE ({include})"));
+    }
+    sql.push_str(&filter);
+    sql.push(';');
+    sql
+}
+
 fn tds_escape(value: &str) -> String {
     value.replace('\'', "''")
 }
@@ -1099,33 +1145,65 @@ async fn load_sqlserver(client: &TdsHandle, database: &str, schema: &str, table:
         tds_strings(
             client,
             &format!(
-                "SELECT i.name, i.is_primary_key, i.is_unique, ic.is_descending_key, c.name FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = N'{schema_q}' AND o.name = N'{table_q}' AND i.name IS NOT NULL ORDER BY i.name, ic.key_ordinal"
+                "SELECT i.name, i.is_primary_key, i.is_unique, ic.is_descending_key, c.name, ic.is_included_column, i.type_desc, i.has_filter, i.filter_definition FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id JOIN sys.objects o ON o.object_id = i.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = N'{schema_q}' AND o.name = N'{table_q}' AND i.name IS NOT NULL ORDER BY i.name, ic.is_included_column, ic.key_ordinal, ic.index_column_id"
             ),
         )
         .await,
     );
+    // INCLUDE 列的 key_ordinal 是 0，不是键列：单独收集，只用于拼出完整的索引语句。
+    let mut extras: Vec<SqlserverIndexExtra> = Vec::new();
     for row in &indexes {
         let cells: Vec<&String> = row.iter().collect();
         let flag = |index: usize| cells.get(index).map(|value| value.as_str() == "1");
         let text = |index: usize| cells.get(index).map(|value| (*value).clone()).unwrap_or_default();
         let name = text(0);
-        let column = IndexColumn { name: text(4), descending: flag(3).unwrap_or(false) };
-        if let Some(index) = snapshot.indexes.iter_mut().find(|index| index.name == name) {
-            index.columns.push(column);
-        } else {
-            let primary = flag(1).unwrap_or(false);
-            let unique = flag(2).unwrap_or(false);
-            snapshot.indexes.push(Index {
-                name,
-                unique,
-                columns: vec![column],
-                protected: primary,
-                reason: if primary { "由主键约束维护".to_owned() } else { String::new() },
-                partial: false,
-                expression: false,
-                sql: None,
+        let included = flag(5).unwrap_or(false);
+        if !extras.iter().any(|extra| extra.name == name) {
+            let filter = text(8).trim().to_owned();
+            extras.push(SqlserverIndexExtra {
+                name: name.clone(),
+                type_desc: text(6).trim().to_owned(),
+                include: Vec::new(),
+                filter: (flag(7).unwrap_or(false) && !filter.is_empty()).then_some(filter),
             });
         }
+        if included {
+            if let Some(extra) = extras.iter_mut().find(|extra| extra.name == name) {
+                extra.include.push(text(4));
+            }
+        }
+        let index = match snapshot.indexes.iter_mut().position(|index| index.name == name) {
+            Some(position) => &mut snapshot.indexes[position],
+            None => {
+                let primary = flag(1).unwrap_or(false);
+                let unique = flag(2).unwrap_or(false);
+                snapshot.indexes.push(Index {
+                    name,
+                    unique,
+                    columns: Vec::new(),
+                    protected: primary,
+                    reason: if primary { "由主键约束维护".to_owned() } else { String::new() },
+                    partial: false,
+                    expression: false,
+                    sql: None,
+                });
+                snapshot.indexes.last_mut().expect("just pushed")
+            }
+        };
+        if !included {
+            index.columns.push(IndexColumn { name: text(4), descending: flag(3).unwrap_or(false) });
+        }
+    }
+    let qualified = qualified_table(Engine::Sqlserver, database, schema, table)?;
+    for index in &mut snapshot.indexes {
+        if index.protected {
+            continue;
+        }
+        let Some(extra) = extras.iter().find(|extra| extra.name == index.name) else {
+            continue;
+        };
+        index.partial = extra.filter.is_some();
+        index.sql = Some(sqlserver_index_sql(&qualified, index, extra));
     }
     for column in &mut snapshot.columns {
         column.primary = snapshot

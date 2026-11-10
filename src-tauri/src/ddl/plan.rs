@@ -844,6 +844,9 @@ fn plan_rename(snapshot: &Snapshot, table: &str, new_name: &str) -> Plan {
         blocked.push("新表名无效。".to_owned());
     } else if wanted == table {
         blocked.push("新表名和原名相同，没有生成语句。".to_owned());
+    } else if snapshot.engine == Engine::Sqlite && wanted.eq_ignore_ascii_case(table) {
+        // SQLite 的名字不分大小写，只改大小写会被数据库当成重名拒绝；这不是被其它对象占用。
+        blocked.push(format!("SQLite 不能只改表名的大小写（{table} → {wanted}）。可以先改成另一个临时名，再改成 {wanted}。"));
     } else {
         match snapshot.name_taken {
             Some(true) => blocked.push(format!("名字 {wanted} 已经被其它对象占用，不会覆盖它。")),
@@ -897,7 +900,15 @@ pub fn rebuilt_definition(snapshot: &Snapshot) -> (String, Vec<String>) {
     let mut missing = vec!["CHECK 约束".to_owned(), "分区".to_owned()];
     match engine {
         Engine::Postgres => missing.extend(["存储参数与表空间".to_owned(), "权限".to_owned(), "触发器".to_owned()]),
-        Engine::Sqlserver => missing.extend(["计算列表达式".to_owned(), "文件组与压缩选项".to_owned(), "权限".to_owned(), "触发器".to_owned()]),
+        Engine::Sqlserver => missing.extend([
+            "计算列表达式".to_owned(),
+            "文件组与压缩选项".to_owned(),
+            "主键的 CLUSTERED / NONCLUSTERED 选项（按 SQL Server 默认处理）".to_owned(),
+            "索引选项（FILLFACTOR、IGNORE_DUP_KEY 等）".to_owned(),
+            "XML 与空间索引".to_owned(),
+            "权限".to_owned(),
+            "触发器".to_owned(),
+        ]),
         _ => {}
     }
     if snapshot.columns.iter().any(|column| column.auto && !column.generated) {
@@ -1001,6 +1012,10 @@ fn is_primary_index(index: &Index) -> bool {
 fn index_definition(snapshot: &Snapshot, index: &Index, qualified: &str) -> Option<String> {
     let engine = snapshot.engine;
     if let Some(sql) = index.sql.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+        // 以注释开头的是读取时就说明了无法重建的索引，原样保留，不补分号。
+        if sql.starts_with("--") {
+            return Some(sql.to_owned());
+        }
         return Some(ensure_semicolon(sql));
     }
     if index.columns.is_empty() {
