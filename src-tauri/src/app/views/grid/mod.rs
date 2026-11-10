@@ -23,7 +23,10 @@ use crate::application::AppServices;
 use crate::grid::commands::{CountDto, CountRequest, FilterArg, PageDto, PageRequest, SchemaDto, TableRef};
 use crate::i18n::{self, Locale};
 
-use session::{columns_from_schema, rows_from_page, schema_from_dto, Continuation, CopyScope, FindScope, Gate};
+use session::{
+    cell_of, columns_from_schema, rows_from_page, schema_from_dto, CellPhase, Continuation, CopyScope, FindScope, ForeignKeyInfo, FullRead, Gate,
+    GridAction,
+};
 
 pub struct GridPane {
     session: SharedGrid,
@@ -63,6 +66,10 @@ pub struct GridPane {
     search: Option<Entity<InputState>>,
     /// 换表后清掉查找框里的旧文字，避免输入框和实际筛选条件不一致。
     clear_search: bool,
+    /// 已经发起、等着回填的完整值读取；成功回来后重跑同一条命令，让各入口共用同一个原值。
+    pending_full: Option<String>,
+    /// 行头双击等表格事件里不能重入，绘制前再打开完整值查看。
+    pending_viewer: bool,
     search_subscription: Option<gpui_kit::Subscription>,
     _subscription: gpui_kit::Subscription,
     _edit_subscription: gpui_kit::Subscription,
@@ -87,6 +94,25 @@ struct PendingEdit {
     row: usize,
     column: usize,
     select_all: bool,
+}
+
+/// 哪些命令需要原值：它们的每一格都会先走同一条共享读取。
+fn full_action(id: &str) -> Option<GridAction> {
+    Some(match id {
+        "grid-value-copy" => GridAction::CopyCell,
+        "copy-region" => GridAction::CopyRegion,
+        "copy-sql-value" => GridAction::CopySqlValues,
+        "grid-copy-row" => GridAction::CopyRow,
+        "grid-copy-column" => GridAction::CopyColumn,
+        "grid-copy-where" => GridAction::WhereCell,
+        "grid-copy-row-where" => GridAction::WhereRow,
+        "grid-copy-column-where" => GridAction::WhereColumn,
+        "edit-cell" => GridAction::Edit,
+        "grid-filter-value" => GridAction::FilterValue,
+        "grid-fk-jump" | "grid-fk-select" => GridAction::Reference,
+        "grid-full-values" => GridAction::ExportValues,
+        _ => return None,
+    })
 }
 
 impl GridPane {
@@ -141,6 +167,8 @@ impl GridPane {
             filter_subscriptions: Vec::new(),
             search: None,
             clear_search: false,
+            pending_full: None,
+            pending_viewer: false,
             search_subscription: None,
             _subscription: subscription,
             _edit_subscription: edit_subscription,
@@ -292,6 +320,13 @@ impl GridPane {
     pub fn command(&mut self, id: &str, cx: &mut Context<Self>) -> Option<String> {
         // 先对齐连接状态：连接在整表筛选期间丢失时，这个命令里的查找/翻页都按已读取行处理。
         self.sync_find_scope();
+        // 需要原值的动作先读同一定位结果；没读到就不执行，绝不用预览信封顶替。
+        if let Some(action) = full_action(id) {
+            if !self.prepare_full(action, id, cx) {
+                cx.notify();
+                return None;
+            }
+        }
         let copied = match id {
             "edit-cell" => {
                 self.select_first_if_needed();
@@ -443,6 +478,61 @@ impl GridPane {
                 let _ = self.preview(cx);
                 None
             }
+            // 查看完整值：先显示预览，再按定位读原值；普通选择与键盘移动不会打开它。
+            "grid-value-open" => {
+                self.select_first_if_needed();
+                if let Some((row, column)) = self.session.focus_cell() {
+                    self.session.open_value(row, column);
+                    let reads = self.session.begin_full_cells(&[(row, column)]);
+                    self.start_full_reads(reads, None, cx);
+                    self.notice.clear();
+                    self.refocus = true;
+                }
+                None
+            }
+            "grid-value-close" => {
+                self.session.close_value();
+                self.refocus = true;
+                None
+            }
+            "grid-value-retry" => {
+                if let Some((row, column)) = self.session.viewer_cell() {
+                    self.session.open_value(row, column);
+                    let reads = self.session.begin_full_cells(&[(row, column)]);
+                    self.start_full_reads(reads, None, cx);
+                }
+                None
+            }
+            // 查看面板里的复制：走同一条按格复制，和网格里的复制值一致。
+            "grid-value-copy" => Some(self.session.copy_cell()),
+            // 导出前把当前窗口里还是预览的格子一次读成原值，导出与 WHERE 随后共用。
+            "grid-full-values" => {
+                self.notice = i18n::text(self.locale, "grid.status.fullValues");
+                None
+            }
+            // 外键导航：单列直接定位，复合外键必须列齐；条件不完整时说明原因。
+            "grid-fk-jump" | "grid-fk-select" => {
+                let target = self.session.focus_cell();
+                let reference = match target {
+                    Some((row, column)) => self.session.reference(row, column),
+                    None => Err("grid.fk.none"),
+                };
+                match reference {
+                    Ok(reference) => {
+                        let path = if reference.schema.is_empty() {
+                            format!("{}.{}", reference.database, reference.table)
+                        } else {
+                            format!("{}.{}.{}", reference.database, reference.schema, reference.table)
+                        };
+                        self.notice = i18n::fill(&i18n::text(self.locale, "grid.fk.target"), &[("path", &path)]);
+                        Some(reference.sql)
+                    }
+                    Err(key) => {
+                        self.notice = i18n::text(self.locale, key);
+                        None
+                    }
+                }
+            }
             _ => None,
         };
         if let Some(text) = copied.clone() {
@@ -456,6 +546,112 @@ impl GridPane {
         }
         cx.notify();
         copied
+    }
+
+    /// 需要原值的动作先读同一定位结果。全部读完才返回 true，调用方随后才执行动作。
+    fn prepare_full(&mut self, action: GridAction, id: &str, cx: &mut Context<Self>) -> bool {
+        let cells = self.session.action_cells(action);
+        if cells.is_empty() {
+            return true;
+        }
+        let reads = self.session.begin_full_cells(&cells);
+        if !reads.is_empty() {
+            // 一次读取批次成功后重跑同一个命令，查看、复制、编辑、WHERE 因此共用同一个原值。
+            self.pending_full = Some(id.to_owned());
+            self.start_full_reads(reads, Some(id.to_owned()), cx);
+            return false;
+        }
+        // 没有新请求时还要确认这几格真的拿到了原值：加载中或上次失败都停在这里。
+        match self.session.cell_block(&cells) {
+            None => true,
+            Some(reason) => {
+                self.notice = reason;
+                self.sync_table(cx);
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// 一次按定位读取完整值：读到就缓存，失败保留原因并可重试；两处都不写预览。
+    fn start_full_reads(&mut self, reads: Vec<FullRead>, pending: Option<String>, cx: &mut Context<Self>) {
+        if reads.is_empty() {
+            return;
+        }
+        let schema = self.session.schema().cloned();
+        let session = self.services.connections.catalog_session(&self.session.target.connection_id);
+        let Some(connection) = session else {
+            let reason = i18n::text(self.locale, "grid.value.noConnection");
+            for read in &reads {
+                self.session.fail_full(&read.row_id, &read.column_name, &reason);
+            }
+            self.notice = reason;
+            self.pending_full = None;
+            self.sync_table(cx);
+            cx.notify();
+            return;
+        };
+        let view = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            runtime().spawn(async move {
+                let mut results = Vec::new();
+                for read in reads {
+                    let locator = read.locator.iter().map(|(name, value)| (name.clone(), cell_of(value.clone()))).collect::<Vec<_>>();
+                    let result = match &schema {
+                        Some(schema) => crate::grid::read_full_cell(&connection, schema, &locator, &read.column_name).await,
+                        None => Err("没有读到表结构，无法按定位读取完整值".to_owned()),
+                    };
+                    results.push((read, result));
+                }
+                let _ = tx.send(results);
+            });
+            if let Ok(results) = rx.await {
+                cx.update(|cx| {
+                    if let Some(view) = view.upgrade() {
+                        view.update(cx, |this, cx| this.finish_full(results, pending, cx));
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// 读取回来后把原值放回缓存；全部成功才重跑同一个命令，各自入口因此共用同一个原值。
+    fn finish_full(&mut self, results: Vec<(FullRead, Result<crate::grid::Cell, String>)>, pending: Option<String>, cx: &mut Context<Self>) {
+        let mut failure = None;
+        for (read, result) in results {
+            match result {
+                Ok(cell) => {
+                    let value = match cell {
+                        crate::grid::Cell::Null => None,
+                        crate::grid::Cell::Text(text) => Some(text),
+                    };
+                    self.session.apply_full(&read.row_id, &read.column_name, value);
+                }
+                Err(message) => {
+                    self.session.fail_full(&read.row_id, &read.column_name, &message);
+                    failure = Some(message);
+                }
+            }
+        }
+        self.sync_table(cx);
+        if self.pending_full.as_deref().is_some() && pending.as_deref() == self.pending_full.as_deref() {
+            self.pending_full = None;
+        }
+        match failure {
+            Some(message) => {
+                // 读取失败：预览仍然可见，但已经标成错误，不重跑动作也不退回预览。
+                self.notice = message;
+                cx.notify();
+            }
+            None => {
+                if let Some(id) = pending {
+                    let _ = self.command(&id, cx);
+                }
+                cx.notify();
+            }
+        }
     }
 
     /// 当前格所在列名；没有选择时退回第一列。
@@ -715,7 +911,9 @@ impl GridPane {
         let reason = self.session.write_reason(row, column);
         if !reason.is_empty() {
             self.notice = reason;
+            // 只读时退化为查看完整值：统一走查看路径，预览值会先按定位读取原值。
             self.session.open_value(row, column);
+            self.pending_viewer = true;
             self.edit_target = None;
             self.pending_edit = None;
             self.refocus = true;
@@ -931,7 +1129,8 @@ impl GridPane {
                     self.session.select(*row, last, true);
                 }
                 if matches!(event, TableEvent::DoubleClickedRow(_)) {
-                    self.session.open_value(*row, 0);
+                    // 事件回调里不能重入，绘制前再把完整值查看打开。
+                    self.pending_viewer = true;
                 }
             }
             // 表格清空高亮常常只是 sync_table 的回声（事件异步送达）；选择身份由会话自己维护，
@@ -1013,6 +1212,8 @@ impl GridPane {
             }
         };
         request.offset = offset;
+        // 表结构连带真实外键一起读：外键导航用的是连接/库/模式同一次定位的结果。
+        request.table.include_foreign_keys = true;
         // 分页追加不阻塞交换来源：已读取的窗口仍然完整；替换读取开始后不能被追加清掉。
         if replace {
             self.fetching = true;
@@ -1078,6 +1279,8 @@ impl GridPane {
             return;
         };
         let columns = columns_from_schema(&schema, true);
+        // 外键来自这次读取的真实结构；没有读到就清空，不沿用上一张表的键。
+        self.session.set_foreign_keys(foreign_keys_of(&schema_dto));
         let full = counted.ok().map(|item| item.matched);
         let truncated = page.truncated;
         let rows = rows_from_page(&columns, &page);
@@ -1139,7 +1342,7 @@ impl GridPane {
             schema: proof.schema.clone().unwrap_or_else(|| self.session.target.schema.clone()),
             table: proof.table.clone(),
             engine: self.session.target.engine.clone(),
-            include_foreign_keys: false,
+            include_foreign_keys: true,
         };
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
@@ -1152,6 +1355,7 @@ impl GridPane {
                 cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
+                            this.session.set_foreign_keys(foreign_keys_of(&dto));
                             if let Ok(schema) = schema_from_dto(&dto) {
                                 if this.session.finish_locate(token, schema) {
                                     this.sync_table(cx);
@@ -1181,6 +1385,9 @@ impl GridPane {
         let focus = self.session.focus_cell().map(|(row, column)| (row, column + 1));
         // 高亮的唯一来源是会话矩形：拖选、Shift/Ctrl、键盘扩展和行头选择的每一格都由它画底色。
         let selected = self.session.selection_bounds();
+        // 外键入口只在适用行出现；读取完整值的入口只在还有预览值时出现。
+        let fk = self.session.has_reference();
+        let unresolved = self.session.unresolved_previews();
         self.table.update(cx, |state, cx| {
             state.delegate_mut().locale = locale;
             state.delegate_mut().selected = selected;
@@ -1191,6 +1398,8 @@ impl GridPane {
                 .collect();
             state.delegate_mut().rows = rows;
             state.delegate_mut().sort = sort;
+            state.delegate_mut().fk = fk;
+            state.delegate_mut().unresolved = unresolved;
             state.delegate_mut().has_more = has_more;
             state.delegate_mut().loading = loading;
             state.refresh(cx);
@@ -1203,6 +1412,24 @@ impl GridPane {
             }
         });
     }
+}
+
+/// 结构里带回来的真实外键；没有读到时给空表，界面因此不会显示不适用的入口。
+fn foreign_keys_of(dto: &SchemaDto) -> Vec<ForeignKeyInfo> {
+    dto.foreign_keys
+        .as_ref()
+        .map(|keys| {
+            keys.iter()
+                .map(|key| ForeignKeyInfo {
+                    name: key.name.clone(),
+                    columns: key.columns.clone(),
+                    ref_schema: key.ref_schema.clone(),
+                    ref_table: key.ref_table.clone(),
+                    ref_columns: key.ref_columns.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn count_of(request: &PageRequest) -> CountRequest {
@@ -1235,6 +1462,9 @@ impl Render for GridPane {
         // 编辑请求在绘制阶段落地，才能创建输入状态、写入文本并把焦点交给它。
         if let Some(pending) = self.pending_edit.take() {
             self.begin_edit(pending, window, cx);
+        } else if std::mem::take(&mut self.pending_viewer) {
+            // 行头双击等表格事件只记下意图，绘制阶段再打开查看并读取原值。
+            let _ = self.command("grid-value-open", cx);
         } else if self.edit_target.is_none() && std::mem::take(&mut self.refocus) {
             window.focus(&self.grid_focus, cx);
         }
@@ -1614,9 +1844,8 @@ impl Render for GridPane {
                         this.table.update(cx, |state, cx| state.scroll_to_row(row, cx));
                     }
                 } else if key == "enter" {
-                    if let Some((row, column)) = this.session.focus_cell() {
-                        this.session.open_value(row, column);
-                    }
+                    // Enter 是显式查看；普通选择与方向键不会自动打开查看面板。
+                    let _ = this.command("grid-value-open", cx);
                     cx.notify();
                 } else if let Some(id) = grid_shortcut(key, event.keystroke.modifiers.secondary(cx), event.keystroke.modifiers.shift) {
                     cx.stop_propagation();
@@ -1707,26 +1936,79 @@ impl Render for GridPane {
             );
         }
         if let Some(shown) = self.session.viewer() {
-            let body = if shown.body.is_empty() { shown.label } else { shown.body };
-            column = column.child(
-                div()
-                    .id("grid-value")
-                    .role(gpui_kit::Role::Dialog)
-                    .aria_label(t("grid.value.copyValue"))
-                    .flex_none()
-                    .max_h(px(180.))
-                    .overflow_y_scroll()
-                    .px(px(14.))
-                    .py(px(10.))
-                    .border_t_1()
-                    .border_color(p.line)
-                    .bg(p.chrome)
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .child(kit::eyebrow(SharedString::from(format!("{:?}", shown.kind)), &p))
-                    .child(div().font_family(cx.theme().mono_font_family.clone()).text_size(px(12.5)).child(SharedString::from(body))),
-            );
+            let state = self.session.viewer_state().cloned();
+            let phase = state.as_ref().map(|state| state.phase).unwrap_or(CellPhase::Preview);
+            // 预览、加载、完整和错误各有自己的标记：预览绝不被读成原值。
+            let tag = match phase {
+                CellPhase::Preview => t("grid.value.previewTag"),
+                CellPhase::Loading => t("grid.value.loadingTag"),
+                CellPhase::Full => t("grid.value.fullTag"),
+                CellPhase::Error => t("grid.value.errorTag"),
+            };
+            let body = match phase {
+                CellPhase::Loading => t("grid.value.loadingFull"),
+                CellPhase::Error => SharedString::from(state.as_ref().map(|state| state.message.clone()).unwrap_or_default()),
+                _ => SharedString::from(if shown.body.is_empty() { shown.label.clone() } else { shown.body.clone() }),
+            };
+            let title = state
+                .as_ref()
+                .map(|state| SharedString::from(format!("{}.{}", self.session.banner(), state.column_name)))
+                .unwrap_or_else(|| t("grid.value.copyValue"));
+            let copy = {
+                let entity = entity.clone();
+                move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                    entity.update(cx, |pane, cx| {
+                        let _ = pane.command("grid-value-copy", cx);
+                    });
+                }
+            };
+            let close = {
+                let entity = entity.clone();
+                move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                    entity.update(cx, |pane, cx| {
+                        let _ = pane.command("grid-value-close", cx);
+                    });
+                }
+            };
+            let mut panel = div()
+                .id("grid-value")
+                .debug_selector(|| format!("grid-value-{phase:?}").to_lowercase())
+                .role(gpui_kit::Role::Dialog)
+                .aria_label(t("grid.value.copyValue"))
+                .flex_none()
+                .max_h(px(180.))
+                .overflow_y_scroll()
+                .px(px(14.))
+                .py(px(10.))
+                .border_t_1()
+                .border_color(p.line)
+                .bg(p.chrome)
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(kit::eyebrow(tag, &p))
+                        .child(div().flex_1().truncate().text_size(px(11.)).text_color(p.text_muted).child(title))
+                        .child(kit::icon_button("grid-value-copy", IconName::Copy, t("grid.value.copyValue"), copy))
+                        .child(kit::icon_button("grid-value-close", IconName::X, t("grid.value.close"), close)),
+                )
+                .child(div().font_family(cx.theme().mono_font_family.clone()).text_size(px(12.5)).child(body));
+            if phase == CellPhase::Error {
+                let retry = {
+                    let entity = entity.clone();
+                    move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                        entity.update(cx, |pane, cx| {
+                            let _ = pane.command("grid-value-retry", cx);
+                        });
+                    }
+                };
+                panel = panel.child(kit::tool_button("grid-value-retry", None, t("grid.value.retry"), retry));
+            }
+            column = column.child(panel);
             let reason = self.session.viewer_reason();
             if !reason.is_empty() {
                 column = column.child(
@@ -1862,6 +2144,10 @@ struct SheetDelegate {
     locale: Locale,
     writable: bool,
     dirty: bool,
+    /// 焦点格适用外键导航（列有真实外键且行已定位）；菜单项只在适用行出现。
+    fk: bool,
+    /// 当前窗口里还没读到原值的预览格子数：大于零才给"读取完整值"入口。
+    unresolved: usize,
 }
 
 /// 一个格子是否落在会话选择的矩形里。列 0 是行号列，它只表示"整行被选中"：
@@ -1902,6 +2188,7 @@ fn grid_shortcut(key: &str, secondary: bool, shift: bool) -> Option<&'static str
 
 /// 单元格右键菜单：(命令, 文案, 需要可写, 危险)。
 const CELL_MENU: &[(&str, &str, bool, bool)] = &[
+    ("grid-value-open", "grid.value.openFull", false, false),
     ("copy-region", "grid.value.copyValue", false, false),
     ("copy-sql-value", "shell.shortcuts.copySqlValue", false, false),
     ("grid-copy-row", "grid.menu.copyRow", false, false),
@@ -1957,17 +2244,25 @@ fn menu_label(locale: Locale, key: &str, id: &str) -> SharedString {
     }
 }
 
-pub(crate) fn cell_menu(menu: PopupMenu, owner: Option<gpui_kit::WeakEntity<GridPane>>, locale: Locale, writable: bool, dirty: bool) -> PopupMenu {
+pub(crate) fn cell_menu(
+    menu: PopupMenu,
+    owner: Option<gpui_kit::WeakEntity<GridPane>>,
+    locale: Locale,
+    writable: bool,
+    dirty: bool,
+    fk: bool,
+    unresolved: usize,
+) -> PopupMenu {
     let mut menu = menu;
     for (id, key, needs_write, _danger) in CELL_MENU.iter().copied() {
         if id.is_empty() {
             menu = menu.separator();
             continue;
         }
-        let owner = owner.clone();
+        let item_owner = owner.clone();
         menu = menu.item(
             PopupMenuItem::new(menu_label(locale, key, id)).disabled(needs_write && !writable).on_click(move |_, _, cx| {
-                if let Some(owner) = owner.as_ref().and_then(|owner| owner.upgrade()) {
+                if let Some(owner) = item_owner.as_ref().and_then(|owner| owner.upgrade()) {
                     owner.update(cx, |pane, cx| {
                         let _ = pane.command(id, cx);
                         cx.notify();
@@ -1975,6 +2270,34 @@ pub(crate) fn cell_menu(menu: PopupMenu, owner: Option<gpui_kit::WeakEntity<Grid
                 }
             }),
         );
+        // 外键入口只在这一列真的属于外键、并且这一行已定位时出现。
+        if id == "grid-value-open" && fk {
+            for (fk_id, fk_key) in [("grid-fk-jump", "grid.fk.jump"), ("grid-fk-select", "grid.fk.select")] {
+                let owner = owner.clone();
+                menu = menu.item(PopupMenuItem::new(menu_label(locale, fk_key, fk_id)).on_click(move |_, _, cx| {
+                    if let Some(owner) = owner.as_ref().and_then(|owner| owner.upgrade()) {
+                        owner.update(cx, |pane, cx| {
+                            let _ = pane.command(fk_id, cx);
+                            cx.notify();
+                        });
+                    }
+                }));
+            }
+        }
+        // 还有预览值时给"读取完整值"入口：导出和 WHERE 都用读到的同一个原值。
+        if id == "grid-value-open" && unresolved > 0 {
+            let owner = owner.clone();
+            menu = menu.item(PopupMenuItem::new(menu_label(locale, "grid.action.readFull", "grid-full-values")).on_click(
+                move |_, _, cx| {
+                    if let Some(owner) = owner.as_ref().and_then(|owner| owner.upgrade()) {
+                        owner.update(cx, |pane, cx| {
+                            let _ = pane.command("grid-full-values", cx);
+                            cx.notify();
+                        });
+                    }
+                },
+            ));
+        }
     }
     if dirty {
         let owner = owner.clone();
@@ -2123,7 +2446,7 @@ impl TableDelegate for SheetDelegate {
     }
 
     fn context_menu(&mut self, _row_ix: usize, menu: PopupMenu, _: &mut Window, _: &mut Context<TableState<Self>>) -> PopupMenu {
-        cell_menu(menu, self.owner.clone(), self.locale, self.writable, self.dirty)
+        cell_menu(menu, self.owner.clone(), self.locale, self.writable, self.dirty, self.fk, self.unresolved)
     }
 
     fn cell_label(&self, row_ix: usize, col_ix: usize, _: &App) -> Option<SharedString> {
@@ -3763,6 +4086,172 @@ mod pane_tests {
             assert_eq!(pane.table.read(cx).selection(), TableSelection::Cell(0, 1));
         });
         assert_paint_matches_selection(cx, window, &pane);
+    }
+
+    /// 超过默认 1 KB 预览上限的文本：页面读取只会给它截断预览。
+    fn envelope_body() -> String {
+        format!("\u{1}t:4096:{}", "预".repeat(12))
+    }
+
+    fn plant_long(pane: &Entity<GridPane>, cx: &mut App) {
+        let body = envelope_body();
+        pane.update(cx, |pane, cx| {
+            pane.plant_writable(
+                target(),
+                vec![("id", "integer"), ("body", "text")],
+                vec![vec![Some("1"), Some(body.as_str())]],
+                "id",
+                cx,
+            );
+        });
+    }
+
+    fn selection_state(pane: &GridPane) -> (Option<(String, String)>, usize) {
+        (pane.session.selection_ids().map(|(anchor, focus)| (anchor.to_owned(), focus.to_owned())), pane.session.visible_bounds().0)
+    }
+
+    #[gpui_kit::test]
+    fn viewer_shares_one_original_with_copy_edit_where_and_export(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant_long(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                assert!(pane.session.needs_full(0, 1), "长文本只读到了预览");
+                pane.session.select(0, 1, false);
+                // 普通选择不打开查看面板，也不触发读取。
+                assert!(pane.session.viewer().is_none());
+                assert_eq!(pane.command("copy-region", cx), None, "原值没到手前不复制预览");
+                assert!(!pane.notice.is_empty(), "应说明为什么还没有复制");
+                assert!(pane.session.viewer().is_none(), "复制不会顺带打开查看面板");
+            });
+        });
+        let full = format!("正文{}", "甲".repeat(600));
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                // 定位读取的结果回到会话后，五个入口用的是同一个原值。
+                pane.session.apply_full("1", "body", Some(full.clone()));
+                assert!(pane.session.begin_full(0, 1).is_none(), "读到原值后不再重复读取");
+                assert_eq!(pane.command("copy-region", cx).as_deref(), Some(full.as_str()));
+                let _ = pane.command("grid-value-open", cx);
+                assert_eq!(pane.session.viewer_state().map(|state| state.phase), Some(CellPhase::Full));
+                assert_eq!(pane.session.viewer().map(|shown| shown.body), Some(full.clone()));
+                let _ = pane.command("copy-region", cx);
+                assert!(pane.session.begin_full(0, 1).is_none(), "复用同一次读取，不发起第二次");
+                let where_sql = pane.command("grid-copy-where", cx).expect("WHERE 用原值");
+                assert!(where_sql.contains(&full), "{where_sql}");
+                let (_, _, rows, _) = pane.exchange_sheet();
+                assert_eq!(rows[0][1].as_deref(), Some(full.as_str()), "导出拿到同一个原值");
+            });
+        });
+        // 编辑栏里放的是原值，不是预览信封。
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.command("edit-cell", cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert!(pane.editing());
+            assert_eq!(pane.edit_value(cx), full);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn failed_full_value_marks_the_viewer_error_and_retries_without_the_preview(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant_long(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.session.select(0, 1, false);
+                // 这条连接没打开：读取失败，查看面板标成错误并保留预览。
+                let _ = pane.command("grid-value-open", cx);
+                assert_eq!(pane.session.viewer_state().map(|state| state.phase), Some(CellPhase::Error));
+                assert!(pane.session.viewer_state().is_some_and(|state| !state.message.is_empty()));
+                assert!(pane.session.viewer().unwrap().preview);
+                assert_eq!(pane.command("copy-region", cx), None, "失败后仍不复制预览");
+                // 重试仍走同一条定位读取；连接还是没打开，于是继续是错误而不是原值。
+                let _ = pane.command("grid-value-retry", cx);
+                assert_eq!(pane.session.viewer_state().map(|state| state.phase), Some(CellPhase::Error));
+                assert_eq!(pane.command("copy-region", cx), None, "失败后仍拿不到原值");
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn foreign_key_entries_only_apply_to_the_foreign_key_column(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.session.set_foreign_keys(vec![ForeignKeyInfo {
+                    name: "fk_people".to_owned(),
+                    columns: vec!["name".to_owned()],
+                    ref_schema: "main".to_owned(),
+                    ref_table: "people".to_owned(),
+                    ref_columns: vec!["name".to_owned()],
+                }]);
+                pane.session.select(0, 1, false);
+                pane.sync_table(cx);
+                assert!(pane.table.read(cx).delegate().fk, "外键列上给出导航入口");
+                assert_eq!(pane.table.read(cx).delegate().unresolved, 0, "没有预览就不给读取完整值入口");
+                pane.session.select(0, 0, false);
+                pane.sync_table(cx);
+                assert!(!pane.table.read(cx).delegate().fk, "非外键列不给导航入口");
+            });
+        });
+        // 有预览值时"读取完整值"入口出现。
+        cx.update_window(window, |_, window, cx| {
+            plant_long(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.table.read(cx).delegate().unresolved, 1);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn cancelled_edit_and_closed_viewer_keep_selection_scroll_staging_and_viewer(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.session.select(1, 1, false);
+                let before = selection_state(pane);
+                assert_eq!(pane.edit_focus(Some("改".into()), cx), Gate::Writable);
+                let _ = pane.command("grid-value-open", cx);
+                let viewer = pane.session.viewer_state().cloned();
+                assert!(viewer.is_some());
+                // 取消编辑不改选择、滚动、暂存和查看目标。
+                let _ = pane.command("cancel-edit", cx);
+                assert_eq!(selection_state(pane), before);
+                assert!(pane.session.uncommitted(), "取消编辑不影响已暂存的值");
+                assert_eq!(pane.session.viewer_state().cloned(), viewer);
+                // 关闭查看面板后选择仍在同一格。
+                let _ = pane.command("grid-value-close", cx);
+                assert!(pane.session.viewer().is_none());
+                assert_eq!(selection_state(pane), before);
+            });
+        });
     }
 
     fn plant_writable(pane: &mut GridPane, cx: &mut Context<GridPane>) {

@@ -1204,6 +1204,39 @@ pub async fn fetch_cells(session: &CatalogSession, sql: &str, width: usize) -> R
     }
 }
 
+/// 单格完整原值读取：查看、复制、编辑、导出和 WHERE 需要完整值时共用这一次定位读取。
+/// 只按唯一键定位一行；命中不到或不止一行都不猜值，也不把预览信封当原值返回。
+pub async fn read_full_cell(session: &CatalogSession, schema: &TableSchema, locator: &[(String, Cell)], column: &str) -> Result<Cell, String> {
+    if schema.key.is_empty() {
+        return Err("这张表没有唯一键，无法定位到某一行读取完整值".to_owned());
+    }
+    if locator.len() != schema.key.len() || locator.iter().zip(&schema.key).any(|(item, key)| item.0 != *key) {
+        return Err("定位值不完整，没有读取完整值".to_owned());
+    }
+    if locator.iter().any(|(_, value)| matches!(value, Cell::Null)) {
+        return Err("定位值里有空值，无法唯一确定这一行".to_owned());
+    }
+    let index = schema
+        .columns
+        .iter()
+        .position(|item| item.name == column)
+        .ok_or_else(|| format!("列 {column} 不在当前表结构里"))?;
+    // 完整投影：同一行其它列也一起读回，避免下一个格子再定位一次。
+    let list = sql::select_list_preview(schema, true, 1024);
+    let statement = format!(
+        "SELECT {list} FROM {} WHERE {}{}",
+        sql::qualified_name(schema),
+        sql::locator_sql(schema, locator),
+        sql::page_tail(schema.engine, 1, 0, false)
+    );
+    let mut rows = fetch_cells(session, &statement, schema.columns.len()).await?;
+    match rows.len() {
+        1 => Ok(rows.remove(0).into_iter().nth(index).unwrap_or(Cell::Null)),
+        0 => Err("数据库里已经找不到这一行".to_owned()),
+        count => Err(format!("定位命中 {count} 行，没有读取完整值")),
+    }
+}
+
 async fn fetch_count(session: &CatalogSession, sql: &str) -> Result<i64, String> {
     match session {
         CatalogSession::Scripted => Err(no_channel()),

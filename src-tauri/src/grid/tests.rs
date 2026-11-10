@@ -1127,7 +1127,8 @@ async fn xlsx_full_export_writes_select_and_table_rows_and_skips_updates() {
 
 #[cfg(test)]
 mod fk_limits {
-    use super::super::live;
+    use super::super::store::Cell;
+    use super::super::{live, looks_like_preview, preview_envelope};
     use crate::connections::Service;
 
     #[tokio::test]
@@ -1185,6 +1186,65 @@ mod fk_limits {
         assert_eq!(compound.len(), 1);
         assert_eq!(compound[0].columns, vec!["x".to_owned(), "y".to_owned()]);
         assert_eq!(compound[0].ref_columns, vec!["a".to_owned(), "b".to_owned()]);
+        drop(session);
+        drop(service);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 单格完整原值读取：按唯一键命中一行，读到的是原值；定位不到、没有唯一键和值不是原值
+    /// 的请求都不会把预览当数据。
+    #[tokio::test]
+    async fn reads_one_full_cell_by_locator() {
+        let dir = std::env::temp_dir().join(format!("rillsql-full-cell-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("full.sqlite");
+        let setup = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+            .await
+            .unwrap();
+        // 600 字节的长文本与二进制；页读取只会给它们预览。
+        for statement in [
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT, blob BLOB)",
+            "CREATE TABLE loose (label TEXT)",
+            "INSERT INTO docs (id, body, blob) VALUES (1, replace(hex(zeroblob(300)), '0', 'a'), x'00ff')",
+            "INSERT INTO loose (label) VALUES ('原')",
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(statement.to_owned())).execute(&setup).await.unwrap();
+        }
+        setup.close().await;
+        let service = Service::new_for_test(dir.join("connections.sqlite"));
+        service.open_sqlite_for_test("full", "完整值", &database).await.unwrap();
+        let session = service.catalog_session("full").expect("session");
+
+        let schema = live::describe(&session, "main", "", "docs", "sqlite").await.unwrap();
+        let locator = vec![("id".to_owned(), Cell::Text("1".to_owned()))];
+        let body = live::read_full_cell(&session, &schema, &locator, "body").await.unwrap();
+        match body {
+            Cell::Text(text) => assert_eq!(text.chars().count(), 600),
+            Cell::Null => panic!("完整值不应是 NULL"),
+        }
+        let blob = live::read_full_cell(&session, &schema, &locator, "blob").await.unwrap();
+        assert_eq!(blob, Cell::Text("00ff".to_owned()));
+
+        // 命中不到：直接失败，不返回预览，也不猜一行。
+        let missing = vec![("id".to_owned(), Cell::Text("9".to_owned()))];
+        let error = live::read_full_cell(&session, &schema, &missing, "body").await.unwrap_err();
+        assert!(error.contains("找不到"), "{error}");
+        // 定位不完整（缺主键值）：不读取。
+        let empty: Vec<(String, Cell)> = Vec::new();
+        assert!(live::read_full_cell(&session, &schema, &empty, "body").await.is_err());
+        // 没有唯一键的表读不到原值。
+        let loose = live::describe(&session, "main", "", "loose", "sqlite").await.unwrap();
+        let error = live::read_full_cell(&session, &loose, &empty, "label").await.unwrap_err();
+        assert!(error.contains("唯一键"), "{error}");
+        // 预览信封的判定按列类型与上限：短小的同形文本仍是原值，超上限的才是预览。
+        assert!(preview_envelope("\u{1}t:3:abc", "text", 1024).is_none());
+        assert!(preview_envelope("\u{1}t:4096:abc", "text", 1024).is_some());
+        assert!(preview_envelope("\u{1}b:2", "blob", 1024).is_some());
+        assert!(preview_envelope("\u{1}b:2", "text", 1024).is_none());
+        assert!(looks_like_preview("\u{1}t:4096:abc"));
+        assert!(!looks_like_preview("\u{1}t:3:abc"));
         drop(session);
         drop(service);
         let _ = std::fs::remove_dir_all(&dir);

@@ -8,9 +8,13 @@ mod store;
 
 pub(crate) use live::{
     commit as commit_mutations, count_rows_search, describe, fetch_cells, foreign_keys, insert_line, query_page_search_preview,
-    request_cancel as request_grid_export_cancel, run_export, sqlserver_rows, ExportMode, ExportSpec, ForeignKey, Mutation, MutationKind,
+    read_full_cell, request_cancel as request_grid_export_cancel, run_export, sqlserver_rows, ExportMode, ExportSpec, ForeignKey, Mutation,
+    MutationKind,
 };
-pub(crate) use sql::{delete_sql, insert_sql, qualified_name, quote_ident, reject_literal, select_list, sql_cell, update_sql, value_family, ValueFamily};
+pub(crate) use sql::{
+    delete_sql, insert_sql, looks_like_preview, preview_envelope, qualified_name, quote_ident, reject_literal, select_list, sql_cell,
+    update_sql, value_family, PreviewValue, ValueFamily,
+};
 pub(crate) use store::{refresh_located, Cell, Column, Engine, Filter, FilterOp, Sort, TableSchema};
 
 /// 用现有定位规则判断结果行。调用方只提供列名和单元格，不复制主键比较。

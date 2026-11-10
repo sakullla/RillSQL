@@ -571,6 +571,11 @@ impl ExchangePane {
             self.block("loaded", "export", self.empty_reason().to_owned());
             return;
         }
+        // 预览信封不是原值：先在网格里读取完整值，导出写的是同一次定位读到的原值。
+        if self.source.rows.iter().flatten().flatten().any(|value| crate::grid::looks_like_preview(value)) {
+            self.block("loaded", "export", i18n::text(self.locale, "grid.export.needFull").to_owned());
+            return;
+        }
         let table_name = self.source.table.as_ref().map(|table| table.table.clone()).unwrap_or_else(|| "查询结果".to_owned());
         let schema = self.source.table.as_ref().map(|table| table.schema.clone()).unwrap_or_default();
         let (rows, limited) = self.rows_for_export();
@@ -1604,5 +1609,29 @@ mod tests {
         let en = pane.lines().join("\n");
         assert!(en.contains("Cancelled"), "{en}");
         assert!(!en.contains("Running"), "{en}");
+    }
+
+    /// 已读取行里还有预览值时导出会被挡住；读到原值后写的是原值，信封不会落进文件。
+    #[test]
+    fn loaded_export_refuses_previews_and_writes_the_original_after_the_shared_read() {
+        let mut pane = exchange_pane();
+        let mut source = table_source("docs", &["id", "body"]);
+        source.rows = vec![vec![Some("1".to_owned()), Some("\u{1}t:4096:预览".to_owned())]];
+        pane.bind_source(source);
+        let path = std::env::temp_dir().join(format!("rillsql-loaded-{}.csv", uuid::Uuid::new_v4()));
+        pane.start_loaded(path.clone());
+        let text = pane.lines().join("\n");
+        assert!(text.contains(&i18n::text(Locale::ZhCn, "grid.export.needFull")), "{text}");
+        assert!(!path.exists(), "预览值不该写出文件");
+
+        // 网格按定位读到原值后再导出：写的是同一个原值。
+        let mut source = table_source("docs", &["id", "body"]);
+        source.rows = vec![vec![Some("1".to_owned()), Some("完整正文".to_owned())]];
+        pane.bind_source(source);
+        pane.start_loaded(path.clone());
+        let written = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(written.contains("完整正文"), "{written}");
+        assert!(!written.contains('\u{1}'), "文件里不能出现预览信封");
+        let _ = std::fs::remove_file(&path);
     }
 }

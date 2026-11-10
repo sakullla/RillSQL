@@ -436,7 +436,7 @@ fn binary_hex(engine: Engine, ident: &str) -> String {
     format!("CASE WHEN {ident} IS NULL THEN NULL ELSE {hex} END")
 }
 
-fn locator_sql(schema: &TableSchema, locator: &[(String, Cell)]) -> String {
+pub(crate) fn locator_sql(schema: &TableSchema, locator: &[(String, Cell)]) -> String {
     locator
         .iter()
         .map(|(name, value)| {
@@ -603,3 +603,48 @@ fn is_text_name(name: &str) -> bool {
         "text" | "tinytext" | "mediumtext" | "longtext" | "clob" | "nclob" | "varchar" | "nvarchar" | "char" | "nchar" | "character" | "character varying" | "varchar2" | "nvarchar2" | "string" | "json" | "jsonb" | "uuid" | "uniqueidentifier" | "ntext" | "enum" | "set" | "xml" | "citext" | "name" | "bpchar" | "varying"
     ) || name.starts_with("character ")
 }
+
+/// 预览信封：读取大字段时数据库就地截断出来的替身，不是原值。
+/// 查看、复制、编辑、导出和 WHERE 都必须先按定位读取原值，绝不把它当数据。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreviewValue {
+    Binary { bytes: u64 },
+    Text { bytes: u64, preview: String },
+}
+
+/// 权威判断：只有按列类型和预览上限真正会产出信封的形态才算信封。
+/// 声明长度必须真的超过上限；形状相同但没被截断的普通文本仍是原值。
+pub fn preview_envelope(value: &str, type_name: &str, preview_bytes: usize) -> Option<PreviewValue> {
+    let rest = value.strip_prefix('\u{1}')?;
+    if let Some(body) = rest.strip_prefix("b:") {
+        if value_family(type_name) != ValueFamily::Binary {
+            return None;
+        }
+        return Some(PreviewValue::Binary { bytes: body.parse().ok()? });
+    }
+    let body = rest.strip_prefix("t:")?;
+    if value_family(type_name) != ValueFamily::Text {
+        return None;
+    }
+    let (bytes, preview) = body.split_once(':')?;
+    let bytes: u64 = bytes.parse().ok()?;
+    // 投影只在超过上限时套信封；声明长度没超过上限的按原值处理。
+    if bytes <= preview_bytes.max(1) as u64 {
+        return None;
+    }
+    Some(PreviewValue::Text { bytes, preview: preview.to_owned() })
+}
+
+/// 导出前的结构检查：值还带着预览信封的形状时不能写成文件。
+/// 文本只认页查询真的会截断的形态（声明长度超过 1 KB），
+/// 二进制只认 `b:<字节>`；短小但形状相同的普通文本仍按原值处理。
+pub fn looks_like_preview(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix('\u{1}') else {
+        return false;
+    };
+    if let Some(body) = rest.strip_prefix("b:") {
+        return !body.is_empty() && body.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    is_synthetic_text_preview(value)
+}
+

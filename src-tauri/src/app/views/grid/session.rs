@@ -23,6 +23,99 @@ pub struct ShownCell {
     pub kind: CellKind,
     pub label: String,
     pub body: String,
+    /// 这一格显示的只是预览信封里的片段，不是数据库原值。
+    pub preview: bool,
+}
+
+/// 完整值的四种状态。预览、加载、完整和错误必须彼此可分：
+/// 预览不是原值，加载中不能说成已读取，失败也不能退回预览冒充原值。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellPhase {
+    Preview,
+    Loading,
+    Full,
+    Error,
+}
+
+/// 完整值查看的定位：稳定行 id + 列名，重排、翻页和选择移动都不改变它。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewerState {
+    pub row_id: String,
+    pub column_name: String,
+    pub phase: CellPhase,
+    pub message: String,
+}
+
+/// 一次按定位读取完整值的请求；调用方执行后把结果交回 apply_full。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FullRead {
+    pub row_id: String,
+    pub column_name: String,
+    pub locator: Vec<(String, Option<String>)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FullState {
+    Loading,
+    Ready(Option<String>),
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FullEntry {
+    row_id: String,
+    column_name: String,
+    state: FullState,
+}
+
+/// 一格值能不能直接当原值用。需要完整值时先读一次，读不到就明确拒绝。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CellRead {
+    Ready(Option<String>),
+    NeedsFull(FullRead),
+    /// 没定位（无唯一键、未定位行或外键缺列），不能读取也不能当原值。
+    Unavailable(&'static str),
+}
+
+/// 当前表的外键；列、引用模式/表和引用列都来自真实结构。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignKeyInfo {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub ref_schema: String,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+}
+
+/// 外键导航目标：连接、库、模式、表与条件值都在这里一次算清。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reference {
+    pub connection_id: String,
+    pub database: String,
+    pub schema: String,
+    pub table: String,
+    pub columns: Vec<String>,
+    pub values: Vec<Option<String>>,
+    pub sql: String,
+}
+
+/// 会读到原值的动作。查看、复制、编辑、导出和 WHERE 都先按这些格子读完整值。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GridAction {
+    Value,
+    CopyRegion,
+    CopySqlValues,
+    CopyRow,
+    CopyColumn,
+    CopyCell,
+    WhereCell,
+    WhereRow,
+    WhereColumn,
+    Edit,
+    FilterValue,
+    Reference,
+    /// 导出前把当前窗口里所有还是预览的格子读成原值。
+    ExportValues,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,8 +341,12 @@ pub struct SharedGrid {
     anchor_id: String,
     focus_id: String,
     selected: bool,
-    /// 完整值查看同样记住行 id，滚动或重排后仍指向原来那一行。
-    viewer: Option<(String, usize)>,
+    /// 完整值查看同样记住行 id + 列名，滚动、重排或改变列顺序后仍指向原来那一格。
+    viewer: Option<ViewerState>,
+    /// 按 (行 id, 列名) 缓存的完整原值：查看、复制、编辑、导出和 WHERE 共用同一次读取。
+    full: Vec<FullEntry>,
+    /// 当前表的真实外键；只有读到结构时才可能有内容。
+    keys: Vec<ForeignKeyInfo>,
     overlays: Vec<Overlay>,
     /// 已经离开当前读取窗口、但仍被暂存引用的行；翻页后预览和提交仍用它们。
     retained: Vec<GridRow>,
@@ -305,6 +402,8 @@ impl SharedGrid {
             focus_id: String::new(),
             selected: false,
             viewer: None,
+            full: Vec::new(),
+            keys: Vec::new(),
             overlays: Vec::new(),
             retained: Vec::new(),
             failures: Vec::new(),
@@ -333,6 +432,8 @@ impl SharedGrid {
         self.failures.clear();
         self.selected = false;
         self.viewer = None;
+        self.full.clear();
+        self.keys.clear();
         self.read_failure = None;
         self.target_changed = false;
         self.close_preview();
@@ -403,6 +504,8 @@ impl SharedGrid {
         self.failures.clear();
         self.selected = false;
         self.viewer = None;
+        self.full.clear();
+        self.keys.clear();
         self.read_failure = None;
         self.target_changed = false;
         self.find_scope = FindScope::Loaded;
@@ -514,6 +617,8 @@ impl SharedGrid {
             self.sort = None;
             self.selected = false;
             self.viewer = None;
+            self.full.clear();
+            self.keys.clear();
             self.anchor_id.clear();
             self.focus_id.clear();
             self.close_preview();
@@ -1226,12 +1331,20 @@ impl SharedGrid {
     /// TSV 复制：数据库 NULL 写成不带引号的 NULL，字符串 "NULL" 写成带引号的 "NULL"，
     /// 空字符串保持空字段；制表符、换行和引号按 TSV 规则转义。
     pub fn tsv(&self) -> String {
-        self.tsv_grid(&self.selection())
+        let points = self.selection();
+        if self.missing_full(&points) {
+            return String::new();
+        }
+        self.tsv_grid(&points)
     }
 
     /// SQL 值复制：按目标引擎写成字面量，NULL 与 'NULL' 在文本上也可区分。
     pub fn sql_values(&self) -> String {
-        self.sql_grid(&self.selection())
+        let points = self.selection();
+        if self.missing_full(&points) {
+            return String::new();
+        }
+        self.sql_grid(&points)
     }
 
     /// 一组单元格（显示行列）拼成多行 TSV；行内顺序就是传入顺序（逻辑列顺序）。
@@ -1263,7 +1376,7 @@ impl SharedGrid {
                 lines.push(Vec::new());
                 current = row;
             }
-            let cell = match self.value_at(row, column) {
+            let cell = match self.original(row, column) {
                 Some(Some(text)) => Cell::Text(text),
                 _ => Cell::Null,
             };
@@ -1273,14 +1386,28 @@ impl SharedGrid {
         lines.into_iter().map(|line| line.join(", ")).collect::<Vec<_>>().join("\n")
     }
 
+    /// 打开完整值查看：先给预览，再按定位读取原值。普通选择与键盘移动不会走到这里。
     pub fn open_value(&mut self, row: usize, column: usize) {
-        if row < self.rows.len() && column < self.columns.len() {
-            self.viewer = Some((self.rows[row].id.clone(), column));
-        }
+        let (Some(row_id), Some(name)) = (self.rows.get(row).map(|item| item.id.clone()), self.columns.get(column).map(|item| item.name.clone()))
+        else {
+            return;
+        };
+        let (phase, message) = match self.full_state(&row_id, &name) {
+            Some(FullState::Ready(_)) => (CellPhase::Full, String::new()),
+            Some(FullState::Loading) => (CellPhase::Loading, String::new()),
+            Some(FullState::Failed(message)) => (CellPhase::Error, message.clone()),
+            None => (CellPhase::Preview, String::new()),
+        };
+        self.viewer = Some(ViewerState { row_id, column_name: name, phase, message });
     }
 
     pub fn close_value(&mut self) {
         self.viewer = None;
+    }
+
+    /// 查看面板当前的定位与状态；界面据此区分预览、加载、完整和错误。
+    pub fn viewer_state(&self) -> Option<&ViewerState> {
+        self.viewer.as_ref()
     }
 
     pub fn viewer(&self) -> Option<ShownCell> {
@@ -1288,11 +1415,12 @@ impl SharedGrid {
         Some(self.show_cell(row, column, true))
     }
 
-    /// 完整值查看当前落在哪一格；行已不在当前快照时返回 None，而不是指向别的行。
+    /// 完整值查看当前落在哪一格；行或列已不在当前快照时返回 None，而不是指向别的格子。
     pub fn viewer_cell(&self) -> Option<(usize, usize)> {
-        let (row_id, column) = self.viewer.as_ref()?;
-        let row = self.row_index(row_id)?;
-        (*column < self.columns.len()).then_some((row, *column))
+        let state = self.viewer.as_ref()?;
+        let row = self.row_index(&state.row_id)?;
+        let column = self.columns.iter().position(|item| item.name == state.column_name)?;
+        Some((row, column))
     }
 
     pub fn viewer_reason(&self) -> String {
@@ -1304,7 +1432,296 @@ impl SharedGrid {
 
     pub fn show_cell(&self, row: usize, column: usize, opened: bool) -> ShownCell {
         let type_name = self.columns.get(column).map(|item| item.type_name.as_str()).unwrap_or("");
-        classify_with_limit(self.locale, self.value_at(row, column), type_name, opened, self.preview_bytes)
+        // 已经读到原值就显示原值；否则显示预览信封里的片段，并把它标成预览。
+        if let Some(Some(text)) = self.full_text_at(row, column) {
+            return classify_with_limit(self.locale, Some(Some(text)), type_name, true, self.preview_bytes);
+        }
+        let mut shown = classify_with_limit(self.locale, self.value_at(row, column), type_name, opened, self.preview_bytes);
+        shown.preview = self.needs_full(row, column);
+        shown
+    }
+
+    fn full_index(&self, row_id: &str, column_name: &str) -> Option<usize> {
+        self.full.iter().position(|item| item.row_id == row_id && item.column_name == column_name)
+    }
+
+    fn full_state(&self, row_id: &str, column_name: &str) -> Option<&FullState> {
+        self.full_index(row_id, column_name).and_then(|index| self.full.get(index)).map(|item| &item.state)
+    }
+
+    /// 这一格的定位列（唯一键整组）；未定位的行或没有唯一键的表给不出定位。
+    fn cell_locator(&self, row: usize) -> Vec<(String, Option<String>)> {
+        let Some(item) = self.rows.get(row) else {
+            return Vec::new();
+        };
+        if item.inserted || !item.located || item.locator.is_empty() {
+            return Vec::new();
+        }
+        item.locator.clone()
+    }
+
+    /// 这一格显示的是否只是预览信封：长文本被截断或二进制只有长度时成立。
+    pub fn needs_full(&self, row: usize, column: usize) -> bool {
+        let Some(Some(text)) = self.value_at(row, column) else {
+            return false;
+        };
+        let type_name = self.columns.get(column).map(|item| item.type_name.as_str()).unwrap_or("");
+        crate::grid::preview_envelope(&text, type_name, self.preview_bytes).is_some()
+    }
+
+    /// 已缓存的原值；仍在预览阶段、加载或失败时为空，绝不拿预览充当原值。
+    pub fn full_text_at(&self, row: usize, column: usize) -> Option<Option<String>> {
+        let row_id = self.rows.get(row)?.id.clone();
+        let column_name = self.columns.get(column)?.name.clone();
+        match self.full_state(&row_id, &column_name) {
+            Some(FullState::Ready(value)) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    /// 一格值按原值处理还是需要先读取；未定位时明确说明读不了。
+    pub fn cell_read(&self, row: usize, column: usize) -> CellRead {
+        if self.needs_full(row, column) {
+            if let Some(ready) = self.full_text_at(row, column) {
+                return CellRead::Ready(ready);
+            }
+            let locator = self.cell_locator(row);
+            if locator.is_empty() {
+                return CellRead::Unavailable("grid.value.noLocator");
+            }
+            let Some(row_id) = self.rows.get(row).map(|item| item.id.clone()) else {
+                return CellRead::Unavailable("grid.value.noLocator");
+            };
+            let Some(column_name) = self.columns.get(column).map(|item| item.name.clone()) else {
+                return CellRead::Unavailable("grid.value.noLocator");
+            };
+            return CellRead::NeedsFull(FullRead { row_id, column_name, locator });
+        }
+        match self.value_at(row, column) {
+            Some(value) => CellRead::Ready(value),
+            None => CellRead::Unavailable("grid.value.noLocator"),
+        }
+    }
+
+    /// 开始读取这个格子的完整值；已经在读、已经读到或本来就不需要时返回 None。
+    /// 上次失败的读取在这里重新发起，失败原因不留在缓存里冒充结果。
+    pub fn begin_full(&mut self, row: usize, column: usize) -> Option<FullRead> {
+        if !self.needs_full(row, column) {
+            return None;
+        }
+        let CellRead::NeedsFull(read) = self.cell_read(row, column) else {
+            return None;
+        };
+        match self.full_state(&read.row_id, &read.column_name) {
+            Some(FullState::Ready(_)) | Some(FullState::Loading) => return None,
+            _ => {}
+        }
+        match self.full_index(&read.row_id, &read.column_name) {
+            Some(index) => self.full[index].state = FullState::Loading,
+            None => self.full.push(FullEntry { row_id: read.row_id.clone(), column_name: read.column_name.clone(), state: FullState::Loading }),
+        }
+        if let Some(state) = self.viewer.as_mut().filter(|state| state.row_id == read.row_id && state.column_name == read.column_name) {
+            state.phase = CellPhase::Loading;
+            state.message.clear();
+        }
+        Some(read)
+    }
+
+    /// 原值读回来了。查看面板同时从加载状态转到完整状态。
+    pub fn apply_full(&mut self, row_id: &str, column_name: &str, value: Option<String>) {
+        self.store_full(row_id, column_name, FullState::Ready(value), CellPhase::Full, String::new());
+    }
+
+    /// 完整值读取失败：保留预览可见，但标记为错误并给原因，绝不当成原值。
+    pub fn fail_full(&mut self, row_id: &str, column_name: &str, message: &str) {
+        self.store_full(row_id, column_name, FullState::Failed(message.to_owned()), CellPhase::Error, message.to_owned());
+    }
+
+    fn store_full(&mut self, row_id: &str, column_name: &str, state: FullState, phase: CellPhase, message: String) {
+        match self.full_index(row_id, column_name) {
+            Some(index) => self.full[index].state = state,
+            None => self.full.push(FullEntry { row_id: row_id.to_owned(), column_name: column_name.to_owned(), state }),
+        }
+        if let Some(viewer) = self.viewer.as_mut().filter(|viewer| viewer.row_id == row_id && viewer.column_name == column_name) {
+            viewer.phase = phase;
+            viewer.message = message;
+        }
+    }
+
+    /// 当前读取窗口里还没有原值的格子数：导出前用它判断要不要先读完整值。
+    pub fn unresolved_previews(&self) -> usize {
+        self.unresolved_cells().len()
+    }
+
+    /// 还没有原值的格子：导出前一次性按定位读取，读到的原值随后共享给所有入口。
+    pub fn unresolved_cells(&self) -> Vec<(usize, usize)> {
+        let mut cells = Vec::new();
+        for row in 0..self.rows.len() {
+            for column in 0..self.columns.len() {
+                if self.needs_full(row, column) && self.full_text_at(row, column).is_none() {
+                    cells.push((row, column));
+                }
+            }
+        }
+        cells
+    }
+
+    /// 当前焦点格是否适用外键导航：这一列有真实外键，行也定位到具体一行。
+    pub fn has_reference(&self) -> bool {
+        let Some((row, column)) = self.focus_cell() else {
+            return false;
+        };
+        let Some(name) = self.columns.get(column).map(|item| item.name.clone()) else {
+            return false;
+        };
+        self.foreign_key_for(&name).is_some() && !self.cell_locator(row).is_empty() && self.rows.get(row).is_some_and(|item| item.located)
+    }
+
+    /// 一次动作会读到哪些格子：查看、复制、编辑、WHERE、导出和外键导航共用这张表。
+    pub fn action_cells(&self, action: GridAction) -> Vec<(usize, usize)> {
+        match action {
+            GridAction::Value | GridAction::CopyCell | GridAction::WhereCell | GridAction::Edit | GridAction::FilterValue => {
+                self.focus_cell().into_iter().collect()
+            }
+            GridAction::CopyRegion | GridAction::CopySqlValues => self.selection(),
+            GridAction::CopyRow => self.scope_points(CopyScope::Row).unwrap_or_default(),
+            GridAction::CopyColumn => self.scope_points(CopyScope::Column).unwrap_or_default(),
+            GridAction::WhereRow => self.scope_points(CopyScope::Row).unwrap_or_default(),
+            GridAction::WhereColumn => self.scope_points(CopyScope::Column).unwrap_or_default(),
+            GridAction::ExportValues => self.unresolved_cells(),
+            // 外键条件要读齐外键的每一列；单列外键就是当前这一列。
+            GridAction::Reference => match self.focus_cell() {
+                Some((row, column)) => {
+                    let names = self.columns.get(column).and_then(|item| self.foreign_key_for(&item.name)).map(|key| key.columns.clone());
+                    match names {
+                        Some(names) => names.iter().filter_map(|name| self.columns.iter().position(|item| item.name == *name)).map(|index| (row, index)).collect(),
+                        None => vec![(row, column)],
+                    }
+                }
+                None => Vec::new(),
+            },
+        }
+    }
+
+    /// 这些格子里还没拿到原值的读取请求；调用方一次发起，读回来后共用。
+    pub fn begin_full_cells(&mut self, cells: &[(usize, usize)]) -> Vec<FullRead> {
+        let mut reads = Vec::new();
+        for (row, column) in cells.iter().copied() {
+            if let Some(read) = self.begin_full(row, column) {
+                if !reads.iter().any(|item: &FullRead| item.row_id == read.row_id && item.column_name == read.column_name) {
+                    reads.push(read);
+                }
+            }
+        }
+        reads
+    }
+
+    /// 这些格子里还有没有拿不到原值的；有就返回原因，动作必须停在这里。
+    pub fn cell_block(&self, cells: &[(usize, usize)]) -> Option<String> {
+        for (row, column) in cells.iter().copied() {
+            let row_id = self.rows.get(row).map(|item| item.id.clone());
+            let column_name = self.columns.get(column).map(|item| item.name.clone());
+            let (Some(row_id), Some(column_name)) = (row_id, column_name) else {
+                continue;
+            };
+            match self.full_state(&row_id, &column_name) {
+                Some(FullState::Ready(_)) => {}
+                Some(FullState::Failed(message)) => return Some(message.clone()),
+                Some(FullState::Loading) => return Some(i18n::text(self.locale, "grid.value.loadingFull")),
+                _ => {
+                    if self.needs_full(row, column) {
+                        return Some(i18n::text(self.locale, "grid.value.noOriginal"));
+                    }
+                }
+            }
+            if let CellRead::Unavailable(key) = self.cell_read(row, column) {
+                return Some(i18n::text(self.locale, key));
+            }
+        }
+        None
+    }
+
+    /// 缓存只保留当前快照里还有的行；翻页和重新读取后不会留下过期原值。
+    fn prune_full(&mut self) {
+        let ids: Vec<String> = self.rows.iter().chain(self.source.iter()).chain(self.retained.iter()).map(|row| row.id.clone()).collect();
+        self.full.retain(|item| ids.iter().any(|id| id == &item.row_id));
+        if let Some(viewer) = &self.viewer {
+            if !ids.iter().any(|id| id == &viewer.row_id) {
+                self.viewer = None;
+            }
+        }
+    }
+
+    /// 当前表结构（引擎、模式、唯一键）；完整值读取按它定位和引用标识符。
+    pub fn schema(&self) -> Option<&TableSchema> {
+        self.schema.as_ref()
+    }
+
+    pub fn set_foreign_keys(&mut self, keys: Vec<ForeignKeyInfo>) {
+        self.keys = keys;
+    }
+
+    pub fn foreign_keys(&self) -> &[ForeignKeyInfo] {
+        &self.keys
+    }
+
+    /// 这一列属于哪个外键；不是外键列时为空，菜单据此只在适用行出现。
+    pub fn foreign_key_for(&self, column: &str) -> Option<&ForeignKeyInfo> {
+        self.keys.iter().find(|key| key.columns.iter().any(|name| name == column))
+    }
+
+    /// 按外键算出引用目标与条件：复合外键必须列齐，NULL、缺列和预览都拒绝。
+    pub fn reference(&self, row: usize, column: usize) -> Result<Reference, &'static str> {
+        if self.mode != GridMode::Table || self.schema.is_none() {
+            return Err("grid.fk.needTable");
+        }
+        let name = self.columns.get(column).map(|item| item.name.clone()).ok_or("grid.fk.none")?;
+        let key = self.foreign_key_for(&name).ok_or("grid.fk.none")?.clone();
+        let mut values = Vec::new();
+        let mut origins: Vec<Option<&GridColumn>> = Vec::new();
+        for fk_column in &key.columns {
+            let index = self.columns.iter().position(|item| item.name == *fk_column).ok_or("grid.fk.missingColumn")?;
+            match self.cell_read(row, index) {
+                CellRead::Ready(Some(text)) => {
+                    values.push(Some(text));
+                    origins.push(self.columns.get(index));
+                }
+                CellRead::Ready(None) => return Err("grid.fk.null"),
+                CellRead::NeedsFull(_) => return Err("grid.fk.preview"),
+                CellRead::Unavailable(_) => return Err("grid.fk.missingColumn"),
+            }
+        }
+        if key.ref_columns.len() != key.columns.len() || key.ref_table.is_empty() {
+            return Err("grid.fk.missingColumn");
+        }
+        let engine = Engine::parse(&self.target.engine).unwrap_or(Engine::Sqlite);
+        // 与网格读取同样的限定方式：会话已经绑定库，引用部分只带模式（模式为空就只带表）。
+        let table = if key.ref_schema.is_empty() {
+            quote_ident(engine, &key.ref_table)
+        } else {
+            format!("{}.{}", quote_ident(engine, &key.ref_schema), quote_ident(engine, &key.ref_table))
+        };
+        let conditions = key
+            .ref_columns
+            .iter()
+            .zip(values.iter())
+            .zip(origins.iter())
+            .map(|((ref_column, value), origin)| {
+                // 值按本表这一列的类型写成字面量，和复制 WHERE 用的是同一套字面量规则。
+                format!("{} = {}", quote_ident(engine, ref_column), self.literal(*origin, value.clone()))
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let list = key.ref_columns.iter().map(|column| quote_ident(engine, column)).collect::<Vec<_>>().join(", ");
+        Ok(Reference {
+            connection_id: self.target.connection_id.clone(),
+            database: self.target.database.clone(),
+            schema: key.ref_schema.clone(),
+            table: key.ref_table.clone(),
+            columns: key.ref_columns.clone(),
+            values,
+            sql: format!("SELECT {list} FROM {table} WHERE {conditions}"),
+        })
     }
 
     pub fn cell_label(&self, row: usize, column: usize) -> String {
@@ -1319,13 +1736,14 @@ impl SharedGrid {
     }
 
     /// 当前格子的原始值，供编辑栏判断“NULL 未改动”和抽取文本。
+    /// 预览信封不是原值：还没读到完整值时为空，编辑必须先读完整值。
     pub fn raw_value(&self, row: usize, column: usize) -> Option<Option<String>> {
-        self.value_at(row, column)
+        self.original(row, column)
     }
 
     /// 进入文本编辑时使用的原值：数据库 NULL 与空字符串保持不同。
     pub fn edit_text(&self, row: usize, column: usize) -> String {
-        match self.value_at(row, column) {
+        match self.original(row, column) {
             Some(Some(text)) => text,
             _ => String::new(),
         }
@@ -1623,6 +2041,8 @@ impl SharedGrid {
             }
         }
         self.prune_retained();
+        // 写库成功后原值可能已经变了：缓存的完整值不能再当当前值用。
+        self.full.clear();
         self.close_preview();
         self.recompute();
     }
@@ -1636,8 +2056,27 @@ impl SharedGrid {
     pub fn exchange_sheet(&self) -> (Option<TableRef>, Vec<String>, Vec<Vec<Option<String>>>, bool) {
         let table = if self.target.connection_id.is_empty() || self.target.table.is_empty() { None } else { Some(self.table_ref()) };
         // 暂存的新增行还没写进数据库，交换与导出都不能把它们当成已读取内容。
-        let rows = self.source.iter().filter(|row| !row.inserted).map(|row| row.values.clone()).collect();
-        (table, self.column_names(), rows, self.has_more_rows())
+        // 已经读到完整值的格子交原值；仍是预览的格子交给导出前的形状检查挡住。
+        let names = self.column_names();
+        let rows = self
+            .source
+            .iter()
+            .filter(|row| !row.inserted)
+            .map(|row| {
+                row.values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| match names.get(index) {
+                        Some(name) => match self.full_state(&row.id, name) {
+                            Some(FullState::Ready(full)) => full.clone(),
+                            _ => value.clone(),
+                        },
+                        None => value.clone(),
+                    })
+                    .collect()
+            })
+            .collect();
+        (table, names, rows, self.has_more_rows())
     }
 
     pub fn rendered_labels(&self) -> Vec<Vec<String>> {
@@ -1666,6 +2105,8 @@ impl SharedGrid {
         self.sort = None;
         self.selected = false;
         self.viewer = None;
+        self.full.clear();
+        self.keys.clear();
         self.scroll = 0;
         self.retained.clear();
         self.read_failure = None;
@@ -1751,6 +2192,9 @@ impl SharedGrid {
         let Some(points) = self.scope_points(scope) else {
             return String::new();
         };
+        if self.missing_full(&points) {
+            return String::new();
+        }
         if sql {
             self.sql_grid(&points)
         } else {
@@ -1779,6 +2223,14 @@ impl SharedGrid {
         let Some((row, column)) = self.focus_cell() else {
             return String::new();
         };
+        let cells = self.action_cells(match scope {
+            CopyScope::Cell => GridAction::WhereCell,
+            CopyScope::Row => GridAction::WhereRow,
+            CopyScope::Column => GridAction::WhereColumn,
+        });
+        if self.missing_full(&cells) {
+            return String::new();
+        }
         let conditions = match scope {
             CopyScope::Cell => self.cell_conditions(row, column),
             CopyScope::Row => self.row_conditions(row),
@@ -1821,7 +2273,7 @@ impl SharedGrid {
             if cell_column != column {
                 continue;
             }
-            match self.value_at(row, column) {
+            match self.original(row, column) {
                 Some(None) => has_null = true,
                 Some(Some(text)) if !values.contains(&text) => values.push(text),
                 _ => {}
@@ -1845,7 +2297,7 @@ impl SharedGrid {
     }
 
     fn condition(&self, row: usize, column: usize) -> Option<String> {
-        let value = self.value_at(row, column)?;
+        let value = self.original(row, column)?;
         Some(self.condition_with(column, value))
     }
 
@@ -1966,20 +2418,19 @@ impl SharedGrid {
         if text.is_empty() {
             return StatCell::Empty;
         }
-        // 预览信封不是原值：大值只读到预览，二进制没有可求和的文本。
-        match envelope(&text) {
-            Some(Envelope::Binary { .. }) => return StatCell::Binary,
-            Some(Envelope::Text { .. }) => return StatCell::Incomplete,
-            None => {}
-        }
         let type_name = self.columns.get(column).map(|item| item.type_name.as_str()).unwrap_or("");
+        if let Some(envelope) = crate::grid::preview_envelope(&text, type_name, self.preview_bytes) {
+            // 预览信封不是原值：读到原值才参与统计，二进制仍是二进制。
+            return match (envelope, self.full_text_at(row, column)) {
+                (crate::grid::PreviewValue::Binary { .. }, _) => StatCell::Binary,
+                (crate::grid::PreviewValue::Text { .. }, Some(Some(full))) => numeric_or_text(&full),
+                _ => StatCell::Incomplete,
+            };
+        }
         if matches!(value_family(type_name), ValueFamily::Binary) {
             return StatCell::Binary;
         }
-        match text.trim().parse::<f64>() {
-            Ok(number) if number.is_finite() => StatCell::Numeric(number),
-            _ => StatCell::Text,
-        }
+        numeric_or_text(&text)
     }
 
     pub fn filter_focused_value(&mut self) {
@@ -1989,7 +2440,8 @@ impl SharedGrid {
         let Some(name) = self.columns.get(column).map(|item| item.name.clone()) else {
             return;
         };
-        match self.value_at(row, column).unwrap_or(None) {
+        // 按值筛选同样要原值：预览信封不能变成一条针对截断文本的条件。
+        match self.original(row, column).unwrap_or(None) {
             None => self.set_filter(&name, "null", ""),
             Some(text) if text.is_empty() => self.set_filter(&name, "empty", ""),
             Some(text) => self.set_filter(&name, "eq", &text),
@@ -2122,6 +2574,8 @@ impl SharedGrid {
             }
         }
         self.clamp_scroll();
+        // 重排后不再存在的行不能留着它的完整值；查看面板也跟着关闭。
+        self.prune_full();
     }
 
     /// 选择的锚点和焦点按行 id 找回；原来那一行真的消失时才清空选择。
@@ -2189,8 +2643,23 @@ impl SharedGrid {
         self.rows.get(row).and_then(|item| item.values.get(column).cloned())
     }
 
+    /// 复制、导出和 WHERE 用的原值：已读到完整值时用它，预览信封绝不当原值。
+    fn original(&self, row: usize, column: usize) -> Option<Option<String>> {
+        if self.needs_full(row, column) {
+            return self.full_text_at(row, column);
+        }
+        self.value_at(row, column)
+    }
+
+    /// 这些格子里还有只是预览、没有原值的：动作必须停下来先读完整值。
+    fn missing_full(&self, points: &[(usize, usize)]) -> bool {
+        points
+            .iter()
+            .any(|(row, column)| self.needs_full(*row, *column) && self.full_text_at(*row, *column).is_none())
+    }
+
     fn tsv_field(&self, row: usize, column: usize) -> String {
-        match self.value_at(row, column) {
+        match self.original(row, column) {
             Some(Some(text)) if text == "NULL" => quote_tsv(&text, true),
             Some(Some(text)) => quote_tsv(&text, false),
             // 数据库 NULL 的显示文本来自设置；字符串 "NULL" 仍然强制加引号。
@@ -2461,25 +2930,28 @@ pub fn classify_with_limit(
     preview_bytes: usize,
 ) -> ShownCell {
     let Some(value) = value else {
-        return ShownCell { kind: CellKind::Unset, label: i18n::text(locale, "grid.value.unsetLabel"), body: String::new() };
+        return ShownCell { kind: CellKind::Unset, label: i18n::text(locale, "grid.value.unsetLabel"), body: String::new(), preview: false };
     };
     let Some(text) = value else {
-        return ShownCell { kind: CellKind::Null, label: "NULL".to_owned(), body: String::new() };
+        return ShownCell { kind: CellKind::Null, label: "NULL".to_owned(), body: String::new(), preview: false };
     };
     if text.is_empty() {
-        return ShownCell { kind: CellKind::Empty, label: i18n::text(locale, "grid.value.emptyLabel"), body: String::new() };
+        return ShownCell { kind: CellKind::Empty, label: i18n::text(locale, "grid.value.emptyLabel"), body: String::new(), preview: false };
     }
-    if let Some(envelope) = envelope(&text) {
+    // 只有按列类型与预览上限真的会被截断的形态才算信封；形状相同的普通文本仍是原值。
+    if let Some(envelope) = crate::grid::preview_envelope(&text, type_name, preview_bytes) {
         return match envelope {
-            Envelope::Binary { bytes } => ShownCell {
+            crate::grid::PreviewValue::Binary { bytes } => ShownCell {
                 kind: CellKind::Binary,
                 label: format!("{} {bytes}", i18n::text(locale, "grid.value.binaryLabel")),
                 body: String::new(),
+                preview: true,
             },
-            Envelope::Text { bytes, preview } => ShownCell {
+            crate::grid::PreviewValue::Text { bytes, preview } => ShownCell {
                 kind: CellKind::Large,
                 label: format!("{} {bytes}", i18n::text(locale, "grid.value.largeLabel")),
                 body: if opened { preview } else { String::new() },
+                preview: true,
             },
         };
     }
@@ -2488,6 +2960,7 @@ pub fn classify_with_limit(
             kind: CellKind::Binary,
             label: format!("{} {}", i18n::text(locale, "grid.value.binaryLabel"), text.len() / 2),
             body: if opened { text } else { String::new() },
+            preview: false,
         };
     }
     if text.len() > preview_bytes.max(1) && !opened {
@@ -2495,24 +2968,18 @@ pub fn classify_with_limit(
             kind: CellKind::Large,
             label: format!("{} {}", i18n::text(locale, "grid.value.largeLabel"), text.len()),
             body: String::new(),
+            preview: false,
         };
     }
-    ShownCell { kind: CellKind::Text, label: text.clone(), body: text }
+    ShownCell { kind: CellKind::Text, label: text.clone(), body: text, preview: false }
 }
 
-enum Envelope {
-    Binary { bytes: u64 },
-    Text { bytes: u64, preview: String },
-}
-
-fn envelope(value: &str) -> Option<Envelope> {
-    let rest = value.strip_prefix('\u{1}')?;
-    if let Some(body) = rest.strip_prefix("b:") {
-        return Some(Envelope::Binary { bytes: body.parse().ok()? });
+/// 统计里的数值判定：能解析成有限小数就算数值，其余算文本。
+fn numeric_or_text(text: &str) -> StatCell {
+    match text.trim().parse::<f64>() {
+        Ok(number) if number.is_finite() => StatCell::Numeric(number),
+        _ => StatCell::Text,
     }
-    let body = rest.strip_prefix("t:")?;
-    let (len, preview) = body.split_once(':')?;
-    Some(Envelope::Text { bytes: len.parse().ok()?, preview: preview.to_owned() })
 }
 
 fn editable_names(schema: &TableSchema, columns: &[String], proof: &TableProof) -> Vec<String> {
@@ -2631,7 +3098,7 @@ fn overlay(
     Overlay { row, row_id, column, column_name, value, gate, message, change_id, kind }
 }
 
-fn cell_of(value: Option<String>) -> Cell {
+pub(crate) fn cell_of(value: Option<String>) -> Cell {
     match value {
         Some(text) => Cell::Text(text),
         None => Cell::Null,
@@ -3761,13 +4228,15 @@ mod tests {
             GridColumn { type_name: "decimal".into(), ..text_column("amount") },
             GridColumn { type_name: "blob".into(), ..text_column("blob") },
         ];
+        // 信封只出现在投影真的会截断的地方：二进制列的 b: 前缀和文本列的超长 t: 前缀。
         let rows = vec![
             row("1", vec![Some("1"), Some("甲"), Some("10"), Some("\u{1}b:4")], true),
             row("2", vec![Some("2"), Some(""), Some("2.5"), Some("00ff")], true),
-            row("3", vec![Some("3"), Some("text"), None, Some("\u{1}t:2048:abc")], true),
+            row("3", vec![Some("3"), Some("\u{1}t:2048:abc"), None, None], true),
             row("4", vec![Some("4"), Some("12"), Some("x"), None], true),
+            row("5", vec![Some("5"), Some("待定"), Some("7"), None], true),
         ];
-        grid.load_local(columns, rows, Some(4), Some(schema()));
+        grid.load_local(columns, rows, Some(5), Some(schema()));
         grid
     }
 
@@ -3776,22 +4245,22 @@ mod tests {
         let mut grid = stats_grid();
         grid.select_all_loaded();
         let stats = grid.selection_stats();
-        assert_eq!(stats.cells, 16);
+        assert_eq!(stats.cells, 20);
         // 数值来自整数 id、decimal 列和文本列里可解析的数字。
-        assert_eq!(stats.numeric, 7);
-        assert!((stats.sum - 34.5).abs() < 1e-9, "{}", stats.sum);
-        assert!((stats.average.unwrap() - 34.5 / 7.0).abs() < 1e-9);
+        assert_eq!(stats.numeric, 9);
+        assert!((stats.sum - 46.5).abs() < 1e-9, "{}", stats.sum);
+        assert!((stats.average.unwrap() - 46.5 / 9.0).abs() < 1e-9);
         assert_eq!(stats.min, Some(1.0));
         assert_eq!(stats.max, Some(12.0));
-        assert_eq!(stats.skipped_null, 2);
+        assert_eq!(stats.skipped_null, 4);
         assert_eq!(stats.skipped_empty, 1);
         assert_eq!(stats.skipped_binary, 2);
         assert_eq!(stats.skipped_text, 3);
         // 大值预览信封不是原值，单独算未完整，不参与求和。
         assert_eq!(stats.skipped_incomplete, 1);
-        assert_eq!(stats.skipped(), 9);
+        assert_eq!(stats.skipped(), 11);
         let text = grid.stats_text().expect("有选择就有统计");
-        assert!(text.contains("16") && text.contains("7") && text.contains("34.5"), "{text}");
+        assert!(text.contains("20") && text.contains("9") && text.contains("46.5"), "{text}");
         assert!(text.contains("跳过 NULL"), "{text}");
 
         // 只选一个 NULL 格：没有数值，也不能把平均值写成 0。
@@ -3884,5 +4353,351 @@ mod tests {
         assert!(column.contains("IN (") && column.contains("'乙'") && column.contains("'丙'"), "{column}");
         assert!(!column.contains("'甲'"), "{column}");
         assert!(!column.contains("IS NULL"), "{column}");
+    }
+
+    /// 建库并执行建表/插入语句；返回目录与已打开会话的服务。
+    async fn sqlite_fixture(name: &str, statements: &[&str]) -> (std::path::PathBuf, std::sync::Arc<crate::connections::Service>) {
+        let dir = temp_dir(name);
+        let database = dir.join("notes.sqlite");
+        let setup = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+            .await
+            .unwrap();
+        for statement in statements {
+            // 语句由测试自己给出，这里只是执行建表/插入，不接收用户输入。
+            sqlx::query(sqlx::AssertSqlSafe((*statement).to_owned())).execute(&setup).await.unwrap();
+        }
+        setup.close().await;
+        let service = std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")));
+        service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+        (dir, service)
+    }
+
+    /// 按真实结构读一页到网格；外键同样来自这次 describe。
+    async fn load_table(service: &crate::connections::Service, table: &str, preview_bytes: u64) -> SharedGrid {
+        let request = crate::grid::commands::TableRef {
+            connection_id: "notes".into(),
+            database: "main".into(),
+            schema: String::new(),
+            table: table.into(),
+            engine: "sqlite".into(),
+            include_foreign_keys: true,
+        };
+        let dto = crate::application::grid::describe(service, &request).await.unwrap();
+        let schema = schema_from_dto(&dto).unwrap();
+        let page = crate::application::grid::page(
+            service,
+            &crate::grid::commands::PageRequest { table: request, filters: Vec::new(), sort: None, offset: 0, limit: 20, preview_bytes, search: None },
+        )
+        .await
+        .unwrap();
+        let columns = columns_from_schema(&schema, true);
+        let mut grid = SharedGrid::new();
+        grid.target = GridTarget {
+            connection_id: "notes".into(),
+            connection_name: "笔记".into(),
+            database: "main".into(),
+            schema: String::new(),
+            table: table.into(),
+            engine: "sqlite".into(),
+            environment: "dev".into(),
+        };
+        grid.set_preview_bytes(preview_bytes as usize);
+        grid.set_foreign_keys(crate::app::views::grid::foreign_keys_of(&dto));
+        grid.replace_fetched(columns_from_schema(&schema, true), rows_from_page(&columns, &page), 0, Some(1), false, Some(schema));
+        grid
+    }
+
+    fn locator_of(read: &FullRead) -> Vec<(String, Cell)> {
+        read.locator.iter().map(|(name, value)| (name.clone(), cell_of(value.clone()))).collect()
+    }
+
+    #[tokio::test]
+    async fn full_value_is_read_once_and_shared_by_view_copy_edit_export_and_where() {
+        let group = "replace(hex(zeroblob(300)), '0', 'a')";
+        let insert = format!("INSERT INTO docs (id, body) VALUES (1, {group}), (2, '短文本')");
+        let (dir, service) = sqlite_fixture(
+            "full-once",
+            &["CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)", insert.as_str()],
+        )
+        .await;
+        let mut grid = load_table(&service, "docs", 64).await;
+        assert!(grid.needs_full(0, 1), "600 字符的文本按 64 字节读了预览");
+        let read = grid.begin_full(0, 1).expect("需要按定位读取完整值");
+        assert_eq!(read.row_id, "k:1");
+        assert_eq!(read.column_name, "body");
+        // 同一定位只发起一次读取：再要不会产生第二个请求。
+        assert!(grid.begin_full(0, 1).is_none(), "同一定位不能重复读取");
+
+        let session = service.catalog_session("notes").unwrap();
+        let schema = grid.schema().cloned().unwrap();
+        let cell = crate::grid::read_full_cell(&session, &schema, &locator_of(&read), "body").await.unwrap();
+        let full = match cell {
+            Cell::Text(text) => text,
+            Cell::Null => panic!("完整值不应是 NULL"),
+        };
+        assert_eq!(full.chars().count(), 600);
+        grid.apply_full(&read.row_id, &read.column_name, Some(full.clone()));
+
+        // 查看、复制、编辑、导出和 WHERE 共用同一个原值，并且不再读第二次。
+        grid.select(0, 1, false);
+        grid.open_value(0, 1);
+        assert_eq!(grid.viewer_state().map(|state| state.phase), Some(CellPhase::Full));
+        assert_eq!(grid.viewer().map(|shown| shown.body), Some(full.clone()));
+        assert!(!grid.viewer().unwrap().preview, "读到原值后不再标成预览");
+        assert_eq!(grid.copy_cell(), full);
+        assert_eq!(grid.edit_text(0, 1), full);
+        assert!(grid.where_text(CopyScope::Cell).contains(&full), "WHERE 用的是原值");
+        let (_, _, rows, _) = grid.exchange_sheet();
+        assert_eq!(rows[0][1].as_deref(), Some(full.as_str()), "导出拿到的是原值");
+        assert!(grid.begin_full(0, 1).is_none(), "已经读到原值后不再发起读取");
+        assert!(grid.copy_row().contains(&full), "整行复制同样是原值");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn full_value_failure_keeps_the_preview_and_can_be_retried() {
+        let body = "replace(hex(zeroblob(200)), '0', 'b')";
+        let insert = format!("INSERT INTO notes (id, body) VALUES (1, {body})");
+        let (dir, service) = sqlite_fixture(
+            "full-fail",
+            &["CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", insert.as_str()],
+        )
+        .await;
+        let mut grid = load_table(&service, "notes", 32).await;
+        let read = grid.begin_full(0, 1).expect("需要读取完整值");
+        let session = service.catalog_session("notes").unwrap();
+        let schema = grid.schema().cloned().unwrap();
+        // 定位到不存在的行：读取失败，预览仍然可见但不能当原值使用。
+        let missing = vec![("id".to_owned(), Cell::Text("999".to_owned()))];
+        let error = crate::grid::read_full_cell(&session, &schema, &missing, "body").await.unwrap_err();
+        assert!(error.contains("找不到"), "{error}");
+        grid.fail_full(&read.row_id, &read.column_name, &error);
+        grid.select(0, 1, false);
+        assert_eq!(grid.copy_cell(), "", "失败时不复制预览");
+        assert_eq!(grid.where_text(CopyScope::Cell), "", "失败时不生成 WHERE");
+        let (_, _, rows, _) = grid.exchange_sheet();
+        assert!(rows[0][1].as_deref().is_some_and(|value| value.starts_with('\u{1}')), "预览仍是预览");
+        grid.open_value(0, 1);
+        assert_eq!(grid.viewer_state().map(|state| state.phase), Some(CellPhase::Error));
+        assert!(grid.viewer().unwrap().preview, "失败后显示的仍是预览");
+        assert!(grid.viewer_state().is_some_and(|state| !state.message.is_empty()));
+        // 重试：失败过的格子可以再发起一次，读到原值后各入口恢复。
+        let retry = grid.begin_full(0, 1).expect("失败后可以重试");
+        let cell = crate::grid::read_full_cell(&session, &schema, &locator_of(&retry), "body").await.unwrap();
+        let full = match cell {
+            Cell::Text(text) => text,
+            Cell::Null => panic!("完整值不应是 NULL"),
+        };
+        grid.apply_full(&retry.row_id, &retry.column_name, Some(full.clone()));
+        assert_eq!(grid.viewer_state().map(|state| state.phase), Some(CellPhase::Full));
+        assert_eq!(grid.copy_cell(), full);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn binary_null_and_protocol_shaped_text_keep_their_own_values() {
+        let (dir, service) = sqlite_fixture(
+            "value-shapes",
+            &[
+                "CREATE TABLE marks (id INTEGER PRIMARY KEY, note TEXT, blob BLOB)",
+                "INSERT INTO marks (id, note, blob) VALUES (1, char(1) || 't:3:abc', x'00ff'), (2, NULL, NULL)",
+            ],
+        )
+        .await;
+        let mut grid = load_table(&service, "marks", 1024).await;
+        // 协议形状的普通短文本保持原值：不当作预览，也不需要读取。
+        assert!(!grid.needs_full(0, 1));
+        grid.select(0, 1, false);
+        assert_eq!(grid.copy_cell(), "\u{1}t:3:abc");
+        assert_eq!(grid.cell_label(0, 1), "\u{1}t:3:abc");
+        assert!(grid.begin_full(0, 1).is_none(), "普通文本不发起完整值读取");
+        // 二进制只有长度信封：需要按定位读取，读到的是十六进制原值。
+        assert!(grid.needs_full(0, 2));
+        assert_eq!(grid.show_cell(0, 2, false).kind, CellKind::Binary);
+        let read = grid.begin_full(0, 2).expect("二进制需要读取原值");
+        let session = service.catalog_session("notes").unwrap();
+        let schema = grid.schema().cloned().unwrap();
+        let cell = crate::grid::read_full_cell(&session, &schema, &locator_of(&read), "blob").await.unwrap();
+        grid.apply_full(&read.row_id, &read.column_name, Some(match cell {
+            Cell::Text(text) => text,
+            Cell::Null => panic!("二进制不应是 NULL"),
+        }));
+        grid.select(0, 2, false);
+        assert_eq!(grid.copy_cell(), "00ff");
+        // 数据库 NULL 与文本 NULL 仍然分开。
+        grid.select(1, 1, false);
+        assert_eq!(grid.copy_cell(), grid.null_copy().to_owned());
+        assert_eq!(grid.sql_values(), "NULL");
+        grid.select(1, 2, false);
+        assert!(!grid.needs_full(1, 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn real_schema_foreign_keys_navigate_single_and_composite_rows() {
+        let (dir, service) = sqlite_fixture(
+            "foreign-keys",
+            &[
+                "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)",
+                "CREATE TABLE books (id INTEGER PRIMARY KEY, author_id INTEGER, title TEXT, FOREIGN KEY (author_id) REFERENCES authors(id))",
+                "CREATE TABLE regions (country TEXT NOT NULL, city TEXT NOT NULL, PRIMARY KEY (country, city))",
+                "CREATE TABLE shops (id INTEGER PRIMARY KEY, country TEXT, city TEXT, FOREIGN KEY (country, city) REFERENCES regions(country, city))",
+                "INSERT INTO authors VALUES (1, '甲')",
+                "INSERT INTO books VALUES (1, 1, '书')",
+                "INSERT INTO regions VALUES ('CN', '北京')",
+                "INSERT INTO shops VALUES (1, 'CN', '北京'), (2, NULL, '北京')",
+            ],
+        )
+        .await;
+        let mut books = load_table(&service, "books", 1024).await;
+        assert_eq!(books.foreign_keys().len(), 1, "外键来自真实结构");
+        books.select(0, 1, false);
+        assert!(books.has_reference(), "焦点在外键列上时适用导航");
+        let jump = books.reference(0, 1).expect("单列外键可以跳转");
+        assert_eq!(jump.connection_id, "notes");
+        assert_eq!(jump.database, "main");
+        assert_eq!(jump.table, "authors");
+        assert_eq!(jump.columns, vec!["id".to_owned()]);
+        assert_eq!(jump.values, vec![Some("1".to_owned())]);
+        assert_eq!(jump.sql, "SELECT \"id\" FROM \"main\".\"authors\" WHERE \"id\" = 1");
+        // 不是外键列时不给目标。
+        assert!(books.reference(0, 2).is_err());
+
+        let shops = load_table(&service, "shops", 1024).await;
+        let composite = shops.reference(0, 1).expect("复合外键列齐时可以生成条件");
+        assert_eq!(composite.columns, vec!["country".to_owned(), "city".to_owned()]);
+        assert_eq!(composite.values, vec![Some("CN".to_owned()), Some("北京".to_owned())]);
+        assert!(composite.sql.contains("\"country\" = 'CN'"), "{}", composite.sql);
+        assert!(composite.sql.contains("\"city\" = '北京'"), "{}", composite.sql);
+        // 复合外键里有一个 NULL：拒绝生成不完整的条件。
+        assert_eq!(shops.reference(1, 1), Err("grid.fk.null"));
+        // 缺一列同样拒绝。
+        let mut partial = load_table(&service, "shops", 1024).await;
+        partial.columns.retain(|column| column.name != "city");
+        assert_eq!(partial.reference(0, 1), Err("grid.fk.missingColumn"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn foreign_key_previews_and_other_schema_targets_are_not_taken_as_values() {
+        let code = "replace(hex(zeroblob(20)), '0', 'c')";
+        let vendor = format!("INSERT INTO vendors VALUES ({code}, '供应商')");
+        let bill = format!("INSERT INTO bills VALUES (1, {code})");
+        let (dir, service) = sqlite_fixture(
+            "fk-preview",
+            &[
+                "CREATE TABLE vendors (code TEXT PRIMARY KEY, label TEXT)",
+                "CREATE TABLE bills (id INTEGER PRIMARY KEY, vendor TEXT, FOREIGN KEY (vendor) REFERENCES vendors(code))",
+                vendor.as_str(),
+                bill.as_str(),
+            ],
+        )
+        .await;
+        let mut grid = load_table(&service, "bills", 8).await;
+        assert!(grid.needs_full(0, 1), "外键值也走同一套预览");
+        // 预览值不能当外键条件。
+        assert_eq!(grid.reference(0, 1), Err("grid.fk.preview"));
+        let read = grid.begin_full(0, 1).expect("外键值需要读原值");
+        let session = service.catalog_session("notes").unwrap();
+        let schema = grid.schema().cloned().unwrap();
+        let cell = crate::grid::read_full_cell(&session, &schema, &locator_of(&read), "vendor").await.unwrap();
+        let value = match cell {
+            Cell::Text(text) => text,
+            Cell::Null => panic!("外键值不应是 NULL"),
+        };
+        grid.apply_full(&read.row_id, &read.column_name, Some(value.clone()));
+        let jump = grid.reference(0, 1).expect("读到原值后可以生成条件");
+        assert!(jump.sql.contains(&value), "{}", jump.sql);
+        assert!(jump.sql.contains("\"vendors\""), "{}", jump.sql);
+
+        // 同名表在另一个模式里：引用的是外键声明的模式，不是当前表的模式。
+        let mut other = load_table(&service, "bills", 1024).await;
+        other.set_foreign_keys(vec![ForeignKeyInfo {
+            name: "fk_customers".to_owned(),
+            columns: vec!["vendor".to_owned()],
+            ref_schema: "other".to_owned(),
+            ref_table: "bills".to_owned(),
+            ref_columns: vec!["code".to_owned()],
+        }]);
+        let target = other.reference(0, 1).expect("外键目标按声明的模式");
+        assert_eq!(target.schema, "other");
+        assert_eq!(target.table, "bills");
+        assert_eq!(target.connection_id, "notes");
+        assert_eq!(target.database, "main");
+        assert!(target.sql.contains("\"other\".\"bills\""), "{}", target.sql);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn readonly_reasons_explain_views_no_key_joins_aggregates_and_multi_statements() {
+        let (dir, service) = sqlite_fixture(
+            "readonly",
+            &[
+                "CREATE TABLE plain (label TEXT)",
+                "INSERT INTO plain VALUES ('原')",
+                "CREATE VIEW recent AS SELECT label FROM plain",
+                "CREATE TABLE keyed (id INTEGER PRIMARY KEY, name TEXT)",
+                "INSERT INTO keyed VALUES (1, '甲')",
+            ],
+        )
+        .await;
+        let view = load_table(&service, "recent", 1024).await;
+        assert!(!view.writable());
+        assert_eq!(view.readonly_reason(), "grid.errors.viewReadonly");
+        let loose = load_table(&service, "plain", 1024).await;
+        assert!(!loose.writable());
+        assert_eq!(loose.readonly_reason(), "grid.status.unlocated");
+        let keyed = load_table(&service, "keyed", 1024).await;
+        assert!(keyed.writable());
+        for sql in [
+            "select keyed.name from keyed join plain on 1 = 1",
+            "select count(*) from keyed",
+            "select * from keyed; select * from plain",
+        ] {
+            let mut grid = SharedGrid::new();
+            grid.target.engine = "sqlite".into();
+            grid.target.connection_id = "notes".into();
+            grid.show_query_sheet(sql, vec!["name".into()], vec![vec![Some("甲".into())]], false, Some(1));
+            assert!(!grid.writable(), "{sql} 应当只读");
+            assert_eq!(grid.readonly_reason(), "grid.status.readonly", "{sql}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reference_and_cancelled_edit_keep_selection_scroll_staging_and_viewer() {
+        let (dir, service) = sqlite_fixture(
+            "state-keep",
+            &[
+                "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)",
+                "CREATE TABLE books (id INTEGER PRIMARY KEY, author_id INTEGER, title TEXT, FOREIGN KEY (author_id) REFERENCES authors(id))",
+                "INSERT INTO authors VALUES (1, '甲'), (2, '乙')",
+                "INSERT INTO books VALUES (1, 1, '书'), (2, 2, '册')",
+            ],
+        )
+        .await;
+        let mut grid = load_table(&service, "books", 1024).await;
+        grid.select(1, 1, false);
+        let selected = grid.selection_ids().map(|(anchor, focus)| (anchor.to_owned(), focus.to_owned()));
+        assert!(selected.is_some());
+        let scroll = grid.visible_bounds().0;
+        assert_eq!(grid.stage_text(0, 2, Some("改名".into())), Gate::Writable);
+        grid.open_value(1, 1);
+        let viewer = grid.viewer_state().cloned();
+        // 外键导航只读目标，不动选择、滚动、暂存和查看目标。
+        let jump = grid.reference(1, 1).expect("单列外键");
+        assert_eq!(jump.values, vec![Some("2".to_owned())]);
+        assert_eq!(grid.selection_ids().map(|(anchor, focus)| (anchor.to_owned(), focus.to_owned())), selected);
+        assert_eq!(grid.visible_bounds().0, scroll);
+        assert!(grid.uncommitted(), "暂存仍然保留");
+        assert_eq!(grid.viewer_state().cloned(), viewer);
+        // 取消编辑（撤销暂存）同样保留选择与查看目标。
+        assert!(grid.undo_last_stage());
+        assert!(!grid.uncommitted());
+        assert_eq!(grid.selection_ids().map(|(anchor, focus)| (anchor.to_owned(), focus.to_owned())), selected);
+        assert_eq!(grid.viewer_state().cloned(), viewer);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
