@@ -423,7 +423,12 @@ impl WorkbenchModel {
             "help" | "shortcut-help" => self.menu = None,
             "theme-light" | "theme-dark" | "theme-system" => self.settings.capture_shell(&self.shell),
             "open-structure" => {
-                if let Some(spec) = self.object_spec.clone() {
+                let non_table = self.nav.focus_node().and_then(|node| node.object()).is_some_and(|object| !object.opens_data());
+                if non_table {
+                    self.notice_key = Some("catalog.tree.noStructure");
+                    self.notice_detail = self.nav.focus_node().map(|node| node.name.clone()).unwrap_or_default();
+                    self.shell.page = page_before;
+                } else if let Some(spec) = self.object_spec.clone() {
                     self.open_item(WorkItemKind::Structure, spec);
                 } else {
                     self.notice_key = Some("shell.tabs.needObject");
