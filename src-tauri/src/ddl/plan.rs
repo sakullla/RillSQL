@@ -14,6 +14,9 @@ pub fn plan(snapshot: &Snapshot, action: &Action) -> Plan {
         Action::CreateForeignKey { table, foreign_key } => plan_create_fk(snapshot, table, foreign_key),
         Action::DropForeignKey { table, name } => plan_drop_fk(snapshot, table, name),
         Action::DropTable { table } => plan_drop_table(snapshot, table),
+        Action::DropView { view } => plan_drop_view(snapshot, view),
+        Action::TruncateTable { table } => plan_truncate(snapshot, table),
+        Action::RenameTable { table, new_name } => plan_rename(snapshot, table, new_name),
         Action::SetForeignKeys { enabled } => plan_set_fk(snapshot, *enabled),
         Action::ReplaceView { table, definition } => plan_replace_view(snapshot, table, definition),
         Action::AlterSequence { sequence, start, increment, min_value, max_value, cycle } => plan_alter_sequence(
@@ -749,6 +752,306 @@ fn plan_drop_table(snapshot: &Snapshot, table: &str) -> Plan {
         }
         Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
     }
+}
+
+fn plan_drop_view(snapshot: &Snapshot, view: &str) -> Plan {
+    let target = target_label(snapshot.engine, &snapshot.database, &snapshot.schema, view);
+    if let Some(message) = guard_view(snapshot, view) {
+        return finish(snapshot.engine, false, target, vec![message], Vec::new(), Vec::new());
+    }
+    let mut risks = vec![
+        Risk { level: "danger".to_owned(), text: format!("将永久删除视图 {target} 的定义。引用它的查询、视图和程序会失败。") },
+        Risk { level: "info".to_owned(), text: "只删除预览中的这一个视图，不删除底层表的数据，也不加 CASCADE。".to_owned() },
+    ];
+    if snapshot.materialized {
+        risks.push(Risk { level: "warn".to_owned(), text: "这是物化视图，已经物化的数据会一起删除。".to_owned() });
+    }
+    let dependents: Vec<&str> = snapshot.views.iter().map(|item| item.name.as_str()).filter(|name| *name != view).collect();
+    if !dependents.is_empty() {
+        risks.push(Risk {
+            level: "warn".to_owned(),
+            text: format!("这些视图可能引用它：{}。数据库可能拒绝删除，或让它们失效。", dependents.join("、")),
+        });
+    }
+    let keyword = if snapshot.engine == Engine::Postgres && snapshot.materialized { "DROP MATERIALIZED VIEW" } else { "DROP VIEW" };
+    match qualified_table(snapshot.engine, &snapshot.database, &snapshot.schema, view) {
+        Ok(name) => finish(snapshot.engine, false, target, Vec::new(), risks, vec![Step { label: format!("删除视图 {view}"), sql: format!("{keyword} {name};") }]),
+        Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
+    }
+}
+
+fn plan_truncate(snapshot: &Snapshot, table: &str) -> Plan {
+    let target = target_label(snapshot.engine, &snapshot.database, &snapshot.schema, table);
+    if let Some(message) = guard_table(snapshot, table) {
+        return finish(snapshot.engine, false, target, vec![message], Vec::new(), Vec::new());
+    }
+    let rows = snapshot.row_count.map(|count| format!("约 {count} 行")).unwrap_or_else(|| "全部".to_owned());
+    let mut risks = vec![
+        Risk { level: "danger".to_owned(), text: format!("将永久删除 {target} 里的{rows}数据，只保留表结构。这不是备份，也不能撤销。") },
+    ];
+    match snapshot.engine {
+        Engine::Sqlite => risks.push(Risk {
+            level: "info".to_owned(),
+            text: "SQLite 没有 TRUNCATE，这里用 DELETE FROM 逐行删除；AUTOINCREMENT 的计数不会重置，删除触发器会触发。".to_owned(),
+        }),
+        Engine::Mysql | Engine::Mariadb => risks.push(Risk {
+            level: "info".to_owned(),
+            text: "TRUNCATE TABLE 会立即提交并把 AUTO_INCREMENT 重置到初始值，不触发 DELETE 触发器。".to_owned(),
+        }),
+        Engine::Postgres => risks.push(Risk {
+            level: "info".to_owned(),
+            text: "TRUNCATE TABLE 不触发逐行的 DELETE 触发器，不重置关联序列，也不加 CASCADE。".to_owned(),
+        }),
+        Engine::Sqlserver => risks.push(Risk {
+            level: "info".to_owned(),
+            text: "TRUNCATE TABLE 会重置 IDENTITY 计数，不触发 DELETE 触发器。".to_owned(),
+        }),
+        Engine::Redis | Engine::Mongodb => {}
+    }
+    if !snapshot.incoming.is_empty() {
+        let names = snapshot.incoming.iter().map(|item| format!("{}.{}", item.table, item.name)).collect::<Vec<_>>().join("、");
+        let enforcement = if snapshot.engine == Engine::Sqlite {
+            if snapshot.live_foreign_keys == Some(true) {
+                "当前 foreign_keys = ON：引用方还有数据时删除可能被拒绝，或按外键规则级联。"
+            } else {
+                "当前 foreign_keys 未开启：删除会成功，引用方会留下无效引用。"
+            }
+        } else {
+            "被外键引用的表，数据库可能拒绝 TRUNCATE。不会添加 CASCADE。"
+        };
+        risks.push(Risk { level: "warn".to_owned(), text: format!("被这些外键引用：{names}。{enforcement}") });
+    }
+    push_fk_status(snapshot, &mut risks);
+    match qualified_table(snapshot.engine, &snapshot.database, &snapshot.schema, table) {
+        Ok(name) => {
+            let sql = if snapshot.engine == Engine::Sqlite { format!("DELETE FROM {name};") } else { format!("TRUNCATE TABLE {name};") };
+            finish(snapshot.engine, false, target, Vec::new(), risks, vec![Step { label: format!("清空 {table}"), sql }])
+        }
+        Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
+    }
+}
+
+fn plan_rename(snapshot: &Snapshot, table: &str, new_name: &str) -> Plan {
+    let target = target_label(snapshot.engine, &snapshot.database, &snapshot.schema, table);
+    if let Some(message) = guard_table(snapshot, table) {
+        return finish(snapshot.engine, false, target, vec![message], Vec::new(), Vec::new());
+    }
+    let wanted = new_name.trim();
+    let mut blocked = Vec::new();
+    if wanted.is_empty() {
+        blocked.push("新表名不能为空。".to_owned());
+    } else if !valid_name(wanted) {
+        blocked.push("新表名无效。".to_owned());
+    } else if wanted == table {
+        blocked.push("新表名和原名相同，没有生成语句。".to_owned());
+    } else {
+        match snapshot.name_taken {
+            Some(true) => blocked.push(format!("名字 {wanted} 已经被其它对象占用，不会覆盖它。")),
+            Some(false) => {}
+            None => blocked.push(format!("没有确认名字 {wanted} 是否已被占用，没有生成语句。")),
+        }
+    }
+    let mut risks = vec![Risk {
+        level: "danger".to_owned(),
+        text: format!("将把 {target} 改名为 {wanted}。引用旧名的查询、视图、存储过程和应用代码可能失败。"),
+    }];
+    let dependents: Vec<&str> = snapshot.views.iter().map(|item| item.name.as_str()).chain(snapshot.triggers.iter().map(|item| item.name.as_str())).collect();
+    if !dependents.is_empty() {
+        risks.push(Risk {
+            level: "warn".to_owned(),
+            text: format!("这些视图或触发器引用了它：{}。数据库不一定会同步改写它们。", dependents.join("、")),
+        });
+    }
+    if snapshot.engine == Engine::Sqlserver {
+        risks.push(Risk { level: "info".to_owned(), text: "sp_rename 不会改写引用旧名的存储过程、函数和视图。".to_owned() });
+    }
+    if !blocked.is_empty() {
+        return finish(snapshot.engine, false, target, blocked, risks, Vec::new());
+    }
+    match rename_sql(snapshot, table, wanted) {
+        Ok(sql) => finish(snapshot.engine, false, target, Vec::new(), risks, vec![Step { label: format!("把 {table} 改名为 {wanted}"), sql }]),
+        Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
+    }
+}
+
+fn rename_sql(snapshot: &Snapshot, table: &str, new_name: &str) -> Result<String, String> {
+    let engine = snapshot.engine;
+    let current = qualified_table(engine, &snapshot.database, &snapshot.schema, table)?;
+    match engine {
+        Engine::Sqlite | Engine::Postgres => Ok(format!("ALTER TABLE {current} RENAME TO {};", quote_ident(engine, new_name))),
+        Engine::Mysql | Engine::Mariadb => {
+            let renamed = qualified_table(engine, &snapshot.database, &snapshot.schema, new_name)?;
+            Ok(format!("RENAME TABLE {current} TO {renamed};"))
+        }
+        // sp_rename 的新名字是裸名：加上方括号会变成名字的一部分。
+        Engine::Sqlserver => Ok(format!("EXEC sp_rename N'{}', N'{}';", current.replace('\'', "''"), new_name.replace('\'', "''"))),
+        Engine::Redis => Err("Redis 没有结构编辑。".to_owned()),
+        Engine::Mongodb => Err("MongoDB 没有结构编辑。".to_owned()),
+    }
+}
+
+/// PostgreSQL 与 SQL Server 没有保存建表原文：按读到的列、主键、外键、索引和注释重建。
+/// 返回文本与没有包含的内容清单；文本开头的注释也写明它是重建的。列类型按读到的原样输出，不做编辑时的类型校验。
+pub fn rebuilt_definition(snapshot: &Snapshot) -> (String, Vec<String>) {
+    let engine = snapshot.engine;
+    let mut missing = vec!["CHECK 约束".to_owned(), "分区".to_owned()];
+    match engine {
+        Engine::Postgres => missing.extend(["存储参数与表空间".to_owned(), "权限".to_owned(), "触发器".to_owned()]),
+        Engine::Sqlserver => missing.extend(["计算列表达式".to_owned(), "文件组与压缩选项".to_owned(), "权限".to_owned(), "触发器".to_owned()]),
+        _ => {}
+    }
+    if snapshot.columns.iter().any(|column| column.auto && !column.generated) {
+        match engine {
+            Engine::Postgres => missing.push("标识列的 ALWAYS / BY DEFAULT 模式与序列参数（统一写成 BY DEFAULT）".to_owned()),
+            Engine::Sqlserver => missing.push("IDENTITY 的起点与步长（统一写成 1, 1）".to_owned()),
+            _ => {}
+        }
+    }
+    if let Some(message) = &snapshot.index_error {
+        missing.push(format!("索引（读取失败：{message}）"));
+    }
+    if let Some(message) = &snapshot.foreign_key_error {
+        missing.push(format!("外键（读取失败：{message}）"));
+    }
+    if let Some(message) = &snapshot.comment_error {
+        missing.push(format!("注释（读取失败：{message}）"));
+    }
+    let qualified = match engine {
+        Engine::Sqlite => quote_ident(engine, &snapshot.name),
+        _ => qualified_table(engine, &snapshot.database, &snapshot.schema, &snapshot.name).unwrap_or_else(|_| quote_ident(engine, &snapshot.name)),
+    };
+    let mut lines = Vec::new();
+    for column in &snapshot.columns {
+        let mut sql = format!("{} {}", quote_ident(engine, &column.name), column.type_name.trim());
+        let default = column.default_sql.as_deref().map(str::trim).filter(|text| !text.is_empty());
+        if column.generated {
+            if let (Engine::Postgres, Some(expression)) = (engine, default) {
+                sql.push_str(&format!(" GENERATED ALWAYS AS ({expression}) STORED"));
+            }
+        } else if column.auto {
+            match engine {
+                Engine::Postgres => sql.push_str(" GENERATED BY DEFAULT AS IDENTITY"),
+                Engine::Sqlserver => sql.push_str(" IDENTITY(1, 1)"),
+                Engine::Mysql | Engine::Mariadb => sql.push_str(" AUTO_INCREMENT"),
+                _ => {}
+            }
+        }
+        if !column.nullable {
+            sql.push_str(" NOT NULL");
+        }
+        if !column.generated && !column.auto {
+            if let Some(expression) = default {
+                sql.push_str(" DEFAULT ");
+                sql.push_str(expression);
+            }
+        }
+        lines.push(sql);
+    }
+    let primary: Vec<String> = snapshot.columns.iter().filter(|column| column.primary).map(|column| quote_ident(engine, &column.name)).collect();
+    let primary_index = snapshot.indexes.iter().find(|index| is_primary_index(index));
+    if !primary.is_empty() {
+        match primary_index {
+            Some(index) => lines.push(format!("CONSTRAINT {} PRIMARY KEY ({})", quote_ident(engine, &index.name), primary.join(", "))),
+            None => lines.push(format!("PRIMARY KEY ({})", primary.join(", "))),
+        }
+    }
+    for key in &snapshot.foreign_keys {
+        let cols = key.columns.iter().map(|name| quote_ident(engine, name)).collect::<Vec<_>>().join(", ");
+        let refs = key.ref_columns.iter().map(|name| quote_ident(engine, name)).collect::<Vec<_>>().join(", ");
+        let ref_name = if !key.ref_schema.is_empty() {
+            format!("{}.{}", quote_ident(engine, &key.ref_schema), quote_ident(engine, &key.ref_table))
+        } else if engine == Engine::Sqlserver && !snapshot.schema.is_empty() {
+            format!("{}.{}", quote_ident(engine, &snapshot.schema), quote_ident(engine, &key.ref_table))
+        } else {
+            quote_ident(engine, &key.ref_table)
+        };
+        lines.push(format!(
+            "CONSTRAINT {} FOREIGN KEY ({cols}) REFERENCES {ref_name} ({refs}) ON DELETE {} ON UPDATE {}",
+            quote_ident(engine, &key.name),
+            key.on_delete,
+            key.on_update
+        ));
+    }
+    let mut text = format!(
+        "-- 由元数据重建，不是数据库保存的原文。未包含：{}。\nCREATE TABLE {qualified} (\n  {}\n);",
+        missing.join("、"),
+        lines.join(",\n  ")
+    );
+    for index in &snapshot.indexes {
+        if is_primary_index(index) {
+            continue;
+        }
+        if let Some(sql) = index_definition(snapshot, index, &qualified) {
+            text.push('\n');
+            text.push_str(&sql);
+        }
+    }
+    let comments = comment_statements(snapshot, &qualified);
+    if !comments.is_empty() {
+        text.push('\n');
+        text.push_str(&comments.join("\n"));
+    }
+    (text, missing)
+}
+
+fn is_primary_index(index: &Index) -> bool {
+    index.protected && index.reason == "由主键约束维护"
+}
+
+fn index_definition(snapshot: &Snapshot, index: &Index, qualified: &str) -> Option<String> {
+    let engine = snapshot.engine;
+    if let Some(sql) = index.sql.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+        return Some(ensure_semicolon(sql));
+    }
+    if index.columns.is_empty() {
+        return None;
+    }
+    let cols = index
+        .columns
+        .iter()
+        .map(|column| format!("{}{}", quote_ident(engine, &column.name), if column.descending { " DESC" } else { "" }))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("CREATE {}INDEX {} ON {qualified} ({cols});", if index.unique { "UNIQUE " } else { "" }, quote_ident(engine, &index.name)))
+}
+
+fn comment_statements(snapshot: &Snapshot, qualified: &str) -> Vec<String> {
+    let engine = snapshot.engine;
+    let literal = |text: &str| text.replace('\'', "''");
+    let mut statements = Vec::new();
+    match engine {
+        Engine::Postgres => {
+            if let Some(comment) = &snapshot.table_comment {
+                statements.push(format!("COMMENT ON TABLE {qualified} IS '{}';", literal(comment)));
+            }
+            for column in &snapshot.columns {
+                if let Some(comment) = snapshot.column_comments.get(&column.name) {
+                    statements.push(format!("COMMENT ON COLUMN {qualified}.{} IS '{}';", quote_ident(engine, &column.name), literal(comment)));
+                }
+            }
+        }
+        Engine::Sqlserver => {
+            let schema = literal(&snapshot.schema);
+            let table = literal(&snapshot.name);
+            if let Some(comment) = &snapshot.table_comment {
+                statements.push(format!(
+                    "EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'{}', @level0type = N'SCHEMA', @level0name = N'{schema}', @level1type = N'TABLE', @level1name = N'{table}';",
+                    literal(comment)
+                ));
+            }
+            for column in &snapshot.columns {
+                if let Some(comment) = snapshot.column_comments.get(&column.name) {
+                    statements.push(format!(
+                        "EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'{}', @level0type = N'SCHEMA', @level0name = N'{schema}', @level1type = N'TABLE', @level1name = N'{table}', @level2type = N'COLUMN', @level2name = N'{}';",
+                        literal(comment),
+                        literal(&column.name)
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+    statements
 }
 
 fn sqlite_rebuild(snapshot: &Snapshot, drafts: &[ColumnDraft], target: String, mut risks: Vec<Risk>) -> Plan {
@@ -2197,6 +2500,19 @@ fn guard_table(snapshot: &Snapshot, table: &str) -> Option<String> {
     }
     if snapshot.kind != "table" {
         return Some("这是视图。首版只查看视图，不生成结构变更。".to_owned());
+    }
+    None
+}
+
+fn guard_view(snapshot: &Snapshot, view: &str) -> Option<String> {
+    if snapshot.kind == "missing" {
+        return Some(format!("找不到视图 {view}。"));
+    }
+    if snapshot.name != view {
+        return Some("目标视图和已读取的对象不一致，没有生成语句。".to_owned());
+    }
+    if snapshot.kind != "view" {
+        return Some("这是基础表，不是视图，这里不会删除它。".to_owned());
     }
     None
 }

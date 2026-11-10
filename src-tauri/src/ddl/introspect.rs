@@ -49,6 +49,13 @@ fn keep_rows<T>(error: &mut Option<String>, result: Result<Vec<T>, String>) -> V
 }
 
 pub async fn enrich(session: &CatalogSession, snapshot: &mut Snapshot, action: &Action) -> Result<(), String> {
+    if let Action::RenameTable { new_name, .. } = action {
+        let wanted = new_name.trim();
+        if !wanted.is_empty() {
+            snapshot.name_taken = Some(name_taken(session, snapshot, wanted).await?);
+        }
+        return Ok(());
+    }
     let Action::AlterColumns { columns, .. } = action else {
         return Ok(());
     };
@@ -101,8 +108,137 @@ pub fn table_of(action: &Action) -> Option<&str> {
         | Action::CreateForeignKey { table, .. }
         | Action::DropForeignKey { table, .. }
         | Action::DropTable { table }
+        | Action::TruncateTable { table }
+        | Action::RenameTable { table, .. }
         | Action::ReplaceView { table, .. } => Some(table.as_str()),
+        Action::DropView { view } => Some(view.as_str()),
     }
+}
+
+/// 改名前查新名字是否已被同一命名空间里的对象占用。
+/// SQLite 的表、视图、索引、触发器共用名字且不区分大小写；PostgreSQL 的关系（表、视图、索引、序列）共用 schema 里的名字；
+/// MySQL 看同库的表与视图；SQL Server 看同 schema 的 sys.objects。
+pub async fn name_taken(session: &CatalogSession, snapshot: &Snapshot, name: &str) -> Result<bool, String> {
+    match session {
+        CatalogSession::Sqlite { pool, .. } => {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE lower(name) = lower(?1)")
+                .bind(name)
+                .fetch_one(pool)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(count > 0)
+        }
+        CatalogSession::Mysql(pool) => {
+            use mysql_async::prelude::Queryable;
+            let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
+            let count: Option<i64> = conn
+                .exec_first(
+                    "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+                    (snapshot.database.as_str(), name),
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(count.unwrap_or(0) > 0)
+        }
+        CatalogSession::Postgres(client) => {
+            let row = client
+                .query_one(
+                    "SELECT COUNT(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2",
+                    &[&snapshot.schema, &name],
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+            let count: i64 = row.get(0);
+            Ok(count > 0)
+        }
+        CatalogSession::Sqlserver(client) => {
+            let rows = tds_strings(
+                client,
+                &format!(
+                    "SELECT COUNT(*) FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE s.name = N'{}' AND o.name = N'{}'",
+                    tds_escape(&snapshot.schema),
+                    tds_escape(name)
+                ),
+            )
+            .await?;
+            let text = rows.first().and_then(|row| row.first().cloned()).unwrap_or_default();
+            Ok(text.trim().parse::<i64>().unwrap_or(0) > 0)
+        }
+        CatalogSession::Redis(_) => Err("Redis 没有结构编辑。".to_owned()),
+        CatalogSession::Mongo(_) => Err("MongoDB 没有结构编辑。".to_owned()),
+        CatalogSession::Scripted => Err("这个连接没有连着可查询的数据库。".to_owned()),
+    }
+}
+
+/// 读表与列的注释，只给“从元数据重建定义”用。查询失败只记在 comment_error，不让整份定义读取失败。
+pub async fn load_comments(session: &CatalogSession, snapshot: &mut Snapshot) {
+    let result = match session {
+        CatalogSession::Postgres(client) => postgres_comments(client, &snapshot.schema, &snapshot.name).await,
+        CatalogSession::Sqlserver(client) => sqlserver_comments(client, &snapshot.schema, &snapshot.name).await,
+        _ => return,
+    };
+    match result {
+        Ok((table, columns)) => {
+            snapshot.table_comment = table;
+            snapshot.column_comments = columns;
+        }
+        Err(message) => snapshot.comment_error = Some(message),
+    }
+}
+
+type Comments = (Option<String>, BTreeMap<String, String>);
+
+async fn postgres_comments(client: &tokio_postgres::Client, schema: &str, table: &str) -> Result<Comments, String> {
+    let rows = client
+        .query(
+            "SELECT a.attname::text, col_description(c.oid, a.attnum::int), obj_description(c.oid, 'pg_class') FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped WHERE n.nspname = $1 AND c.relname = $2 ORDER BY a.attnum",
+            &[&schema, &table],
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+    let mut table_comment = None;
+    let mut columns = BTreeMap::new();
+    for row in &rows {
+        let column: Option<String> = row.get(0);
+        let comment: Option<String> = row.get(1);
+        let described: Option<String> = row.get(2);
+        if table_comment.is_none() {
+            table_comment = described.filter(|text| !text.is_empty());
+        }
+        if let (Some(column), Some(comment)) = (column, comment) {
+            if !comment.is_empty() {
+                columns.insert(column, comment);
+            }
+        }
+    }
+    Ok((table_comment, columns))
+}
+
+async fn sqlserver_comments(client: &TdsHandle, schema: &str, table: &str) -> Result<Comments, String> {
+    let rows = tds_strings(
+        client,
+        &format!(
+            "SELECT COALESCE(c.name, N''), CAST(ep.value AS NVARCHAR(4000)) FROM sys.extended_properties ep JOIN sys.objects o ON o.object_id = ep.major_id JOIN sys.schemas s ON s.schema_id = o.schema_id LEFT JOIN sys.columns c ON c.object_id = ep.major_id AND c.column_id = ep.minor_id WHERE ep.class = 1 AND ep.name = N'MS_Description' AND s.name = N'{}' AND o.name = N'{}'",
+            tds_escape(schema),
+            tds_escape(table)
+        ),
+    )
+    .await?;
+    let mut table_comment = None;
+    let mut columns = BTreeMap::new();
+    for row in &rows {
+        let column = row.first().cloned().unwrap_or_default();
+        let comment = row.get(1).cloned().unwrap_or_default();
+        if comment.is_empty() {
+            continue;
+        }
+        if column.is_empty() {
+            table_comment = Some(comment);
+        } else {
+            columns.insert(column, comment);
+        }
+    }
+    Ok((table_comment, columns))
 }
 
 pub async fn attach_reference(session: &CatalogSession, request: &Request, snapshot: &mut Snapshot, action: &Action) -> Result<(), String> {

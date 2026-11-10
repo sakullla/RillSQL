@@ -871,3 +871,126 @@ async fn sqlite_object_details_read_columns_and_indexes_from_the_open_session() 
     pool.close().await;
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn ddl_availability_is_decided_per_engine_and_kind() {
+    use super::definition::ddl_available;
+    use super::model::ObjectKind::*;
+    let all = [Table, View, Function, Procedure, Trigger, Sequence, Enum, Domain, Extension, Event];
+    let readable: [(Engine, &[super::model::ObjectKind]); 7] = [
+        (Engine::Sqlite, &[Table, View, Trigger]),
+        (Engine::Mysql, &[Table, View, Function, Procedure, Trigger, Event]),
+        (Engine::Mariadb, &[Table, View, Function, Procedure, Trigger, Sequence, Event]),
+        (Engine::Postgres, &[Table, View, Function, Procedure, Trigger, Sequence, Enum, Domain]),
+        (Engine::Sqlserver, &[Table, View, Function, Procedure, Trigger, Sequence]),
+        (Engine::Redis, &[]),
+        (Engine::Mongodb, &[]),
+    ];
+    for (engine, kinds) in readable {
+        for kind in all {
+            assert_eq!(ddl_available(engine, kind), kinds.contains(&kind), "{engine:?} {kind:?}");
+        }
+    }
+    assert!(!ddl_available(Engine::Postgres, Extension));
+    assert!(!ddl_available(Engine::Sqlite, Sequence));
+    assert!(!ddl_available(Engine::Mongodb, Table));
+    assert!(!ddl_available(Engine::Redis, Table));
+}
+
+fn ddl_key(name: &str, kind: super::model::ObjectKind) -> super::definition::DdlKey {
+    super::definition::DdlKey {
+        database: "main".to_owned(),
+        schema: String::new(),
+        name: name.to_owned(),
+        kind,
+        signature: String::new(),
+        relation: String::new(),
+    }
+}
+
+#[tokio::test]
+async fn sqlite_object_ddl_returns_the_saved_original_text() {
+    use super::definition::object_ddl;
+    use super::model::ObjectKind;
+    let path = std::env::temp_dir().join(format!("rillsql-catalog-ddl-{}.sqlite", uuid::Uuid::new_v4()));
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path).create_if_missing(true))
+        .await
+        .unwrap();
+    for sql in [
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, created_at TEXT)",
+        "CREATE VIEW v_notes AS SELECT id, body FROM notes",
+        "CREATE TRIGGER notes_touch AFTER UPDATE ON notes BEGIN SELECT 1; END",
+    ] {
+        sqlx::query(sql).execute(&pool).await.unwrap();
+    }
+    let session = CatalogSession::Sqlite { pool: pool.clone(), foreign_keys: Some(false) };
+
+    let table = object_ddl(&session, Engine::Sqlite, &ddl_key("notes", ObjectKind::Table)).await.unwrap();
+    assert_eq!(table.text, "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, created_at TEXT)");
+    assert!(!table.rebuilt);
+    assert!(table.missing.is_empty());
+    for column in ["id", "body", "created_at"] {
+        assert!(table.text.contains(column), "{column}");
+    }
+    let view = object_ddl(&session, Engine::Sqlite, &ddl_key("v_notes", ObjectKind::View)).await.unwrap();
+    assert_eq!(view.text, "CREATE VIEW v_notes AS SELECT id, body FROM notes");
+    assert!(!view.rebuilt);
+    let trigger = object_ddl(&session, Engine::Sqlite, &ddl_key("notes_touch", ObjectKind::Trigger)).await.unwrap();
+    assert!(trigger.text.starts_with("CREATE TRIGGER notes_touch"), "{}", trigger.text);
+
+    // 种类不对时不拿别的对象的原文顶替。
+    let wrong_kind = object_ddl(&session, Engine::Sqlite, &ddl_key("notes", ObjectKind::View)).await.unwrap_err();
+    assert!(wrong_kind.contains("没有读到定义"), "{wrong_kind}");
+    let unavailable = object_ddl(&session, Engine::Sqlite, &ddl_key("notes", ObjectKind::Sequence)).await.unwrap_err();
+    assert!(unavailable.contains("没有可读的定义"), "{unavailable}");
+    let missing = object_ddl(&session, Engine::Sqlite, &ddl_key("missing", ObjectKind::Table)).await.unwrap_err();
+    assert!(missing.contains("没有读到定义"), "{missing}");
+    pool.close().await;
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn postgres_and_sqlserver_tables_are_marked_rebuilt_with_every_column() {
+    use super::definition::{rebuilt_from_snapshot, table_is_rebuilt};
+    assert!(table_is_rebuilt(Engine::Postgres));
+    assert!(table_is_rebuilt(Engine::Sqlserver));
+    assert!(!table_is_rebuilt(Engine::Sqlite));
+    assert!(!table_is_rebuilt(Engine::Mysql));
+    assert!(!table_is_rebuilt(Engine::Mariadb));
+    for (engine, schema) in [(Engine::Postgres, "public"), (Engine::Sqlserver, "dbo")] {
+        let mut snapshot = crate::ddl::Snapshot::bare(engine, "app", schema, "orders");
+        for (name, type_name, primary) in [("id", "integer", true), ("customer_id", "integer", false), ("total_amount", "numeric(10,2)", false)] {
+            snapshot.columns.push(crate::ddl::Column {
+                name: name.to_owned(),
+                type_name: type_name.to_owned(),
+                nullable: !primary,
+                default_sql: None,
+                primary,
+                auto: false,
+                generated: false,
+                default_constraint: None,
+            });
+        }
+        let ddl = rebuilt_from_snapshot(&snapshot);
+        assert!(ddl.rebuilt, "{engine:?}");
+        for column in ["id", "customer_id", "total_amount"] {
+            assert!(ddl.text.contains(column), "{engine:?} {column}: {}", ddl.text);
+        }
+        assert!(ddl.missing.iter().any(|item| item.contains("CHECK")), "{:?}", ddl.missing);
+        assert!(ddl.missing.iter().any(|item| item.contains("分区")), "{:?}", ddl.missing);
+    }
+}
+
+#[tokio::test]
+async fn unavailable_engines_report_no_definition_without_a_query() {
+    use super::definition::object_ddl;
+    use super::model::ObjectKind;
+    for engine in [Engine::Redis, Engine::Mongodb] {
+        let error = object_ddl(&CatalogSession::Scripted, engine, &ddl_key("anything", ObjectKind::Table)).await.unwrap_err();
+        assert!(error.contains("没有可读的定义"), "{error}");
+    }
+    let extension = object_ddl(&CatalogSession::Scripted, Engine::Postgres, &ddl_key("pgcrypto", ObjectKind::Extension)).await.unwrap_err();
+    assert!(extension.contains("没有可读的定义"), "{extension}");
+}

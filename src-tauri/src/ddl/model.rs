@@ -132,6 +132,14 @@ pub struct Snapshot {
     pub pragmas: BTreeMap<String, String>,
     /// SQLite 已附加的库（含 main 与 temp）。
     pub attached: Vec<AttachedDatabase>,
+    /// 改名的目标名是否已经被同一命名空间里的对象占用。None 表示没查过：改名计划不会当它没被占用。
+    pub name_taken: Option<bool>,
+    /// 表注释。只有读定义时才去读；None 表示没有注释或没读。
+    pub table_comment: Option<String>,
+    /// 列注释，按列名。只有读定义时才去读。
+    pub column_comments: BTreeMap<String, String>,
+    /// 注释查询失败。定义仍可重建，但要说明注释没读到。
+    pub comment_error: Option<String>,
 }
 
 impl Snapshot {
@@ -172,6 +180,10 @@ impl Snapshot {
             event_enabled: None,
             pragmas: BTreeMap::new(),
             attached: Vec::new(),
+            name_taken: None,
+            table_comment: None,
+            column_comments: BTreeMap::new(),
+            comment_error: None,
         }
     }
 }
@@ -238,6 +250,12 @@ pub enum Action {
     CreateForeignKey { table: String, foreign_key: ForeignKeyDraft },
     DropForeignKey { table: String, name: String },
     DropTable { table: String },
+    /// 删除一个视图（PostgreSQL 物化视图走 DROP MATERIALIZED VIEW）。不删除底层表的数据。
+    DropView { view: String },
+    /// 清空一张表的数据，保留结构。SQLite 没有 TRUNCATE，用 DELETE FROM。
+    TruncateTable { table: String },
+    /// 给一张表改名。新名字为空或已被占用时只给出阻断原因。
+    RenameTable { table: String, new_name: String },
     /// 只改变当前 SQLite 连接的 foreign_keys。不清理数据，也不表示约束已经验证通过。
     SetForeignKeys { enabled: bool },
     /// 替换已有视图的定义。确认前只生成语句，不发送。

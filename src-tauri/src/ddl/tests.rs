@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use super::commands;
 use super::exec::{self, run_steps};
 use super::model::{
-    Action, AttachedDatabase, Column, ColumnDraft, DependentSql, DomainState, Engine, ForeignKey, Index, IndexColumn, IndexColumnDraft, Request, SequenceState,
+    Action, AttachedDatabase, Column, ColumnDraft, DependentSql, DomainState, Engine, ForeignKey, IncomingForeignKey, Index, IndexColumn, IndexColumnDraft, Request, SequenceState,
     Snapshot, Step, StepStatus,
 };
 use super::plan::plan;
@@ -1345,5 +1345,267 @@ async fn sqlite_maintenance_reports_result_and_writes_only_when_executed() {
     )
     .await;
     assert!(mismatched.is_err(), "{mismatched:?}");
+    let _ = fs::remove_dir_all(dir);
+}
+
+fn table_of_engine(engine: Engine) -> Snapshot {
+    let (database, schema) = match engine {
+        Engine::Sqlite => ("main", ""),
+        Engine::Mysql | Engine::Mariadb => ("app", ""),
+        Engine::Postgres => ("app", "public"),
+        _ => ("app", "dbo"),
+    };
+    let mut snapshot = Snapshot::bare(engine, database, schema, "orders");
+    snapshot.columns = vec![column("id", "int", false, true), column("note", "varchar(20)", true, false)];
+    snapshot.row_count = Some(3);
+    snapshot
+}
+
+fn view_snapshot(engine: Engine) -> Snapshot {
+    let mut snapshot = table_of_engine(engine);
+    snapshot.name = "v_orders".to_owned();
+    snapshot.kind = "view".to_owned();
+    snapshot
+}
+
+fn has_danger(planned: &super::model::Plan) -> bool {
+    planned.risks.iter().any(|risk| risk.level == "danger")
+}
+
+#[test]
+fn object_actions_emit_engine_specific_sql_with_a_danger_risk() {
+    let truncate = Action::TruncateTable { table: "orders".to_owned() };
+    let expected_truncate = [
+        (Engine::Sqlite, "DELETE FROM \"orders\";"),
+        (Engine::Mysql, "TRUNCATE TABLE `app`.`orders`;"),
+        (Engine::Mariadb, "TRUNCATE TABLE `app`.`orders`;"),
+        (Engine::Postgres, "TRUNCATE TABLE \"public\".\"orders\";"),
+        (Engine::Sqlserver, "TRUNCATE TABLE [dbo].[orders];"),
+    ];
+    for (engine, sql) in expected_truncate {
+        let planned = plan(&table_of_engine(engine), &truncate);
+        assert!(planned.blocked.is_empty(), "{engine:?} {:?}", planned.blocked);
+        assert_eq!(planned.steps.len(), 1, "{engine:?}");
+        assert_eq!(planned.steps[0].sql, sql, "{engine:?}");
+        assert!(has_danger(&planned), "{engine:?}");
+        assert!(!planned.steps[0].sql.to_ascii_uppercase().contains("CASCADE"));
+    }
+
+    let rename = Action::RenameTable { table: "orders".to_owned(), new_name: "orders_old".to_owned() };
+    let expected_rename = [
+        (Engine::Sqlite, "ALTER TABLE \"orders\" RENAME TO \"orders_old\";"),
+        (Engine::Postgres, "ALTER TABLE \"public\".\"orders\" RENAME TO \"orders_old\";"),
+        (Engine::Mysql, "RENAME TABLE `app`.`orders` TO `app`.`orders_old`;"),
+        (Engine::Mariadb, "RENAME TABLE `app`.`orders` TO `app`.`orders_old`;"),
+        (Engine::Sqlserver, "EXEC sp_rename N'[dbo].[orders]', N'orders_old';"),
+    ];
+    for (engine, sql) in expected_rename {
+        let mut snapshot = table_of_engine(engine);
+        snapshot.name_taken = Some(false);
+        let planned = plan(&snapshot, &rename);
+        assert!(planned.blocked.is_empty(), "{engine:?} {:?}", planned.blocked);
+        assert_eq!(planned.steps.len(), 1, "{engine:?}");
+        assert_eq!(planned.steps[0].sql, sql, "{engine:?}");
+        assert!(has_danger(&planned), "{engine:?}");
+    }
+
+    let drop_view = Action::DropView { view: "v_orders".to_owned() };
+    let expected_drop = [
+        (Engine::Sqlite, "DROP VIEW \"v_orders\";"),
+        (Engine::Postgres, "DROP VIEW \"public\".\"v_orders\";"),
+        (Engine::Mysql, "DROP VIEW `app`.`v_orders`;"),
+        (Engine::Mariadb, "DROP VIEW `app`.`v_orders`;"),
+        (Engine::Sqlserver, "DROP VIEW [dbo].[v_orders];"),
+    ];
+    for (engine, sql) in expected_drop {
+        let planned = plan(&view_snapshot(engine), &drop_view);
+        assert!(planned.blocked.is_empty(), "{engine:?} {:?}", planned.blocked);
+        assert_eq!(planned.steps.len(), 1, "{engine:?}");
+        assert_eq!(planned.steps[0].sql, sql, "{engine:?}");
+        assert!(has_danger(&planned), "{engine:?}");
+    }
+    let mut materialized = view_snapshot(Engine::Postgres);
+    materialized.materialized = true;
+    let planned = plan(&materialized, &drop_view);
+    assert_eq!(planned.steps[0].sql, "DROP MATERIALIZED VIEW \"public\".\"v_orders\";");
+}
+
+#[test]
+fn sqlserver_rename_escapes_quotes_and_keeps_the_new_name_bare() {
+    let mut snapshot = table_of_engine(Engine::Sqlserver);
+    snapshot.name_taken = Some(false);
+    let planned = plan(&snapshot, &Action::RenameTable { table: "orders".to_owned(), new_name: "o'rders]".to_owned() });
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    assert_eq!(planned.steps[0].sql, "EXEC sp_rename N'[dbo].[orders]', N'o''rders]';");
+}
+
+#[test]
+fn object_actions_block_bad_names_and_kind_mismatches_with_a_reason() {
+    let blocked = |snapshot: &Snapshot, action: &Action| {
+        let planned = plan(snapshot, action);
+        assert!(planned.steps.is_empty(), "{action:?} {:?}", planned.steps);
+        assert!(!planned.blocked.is_empty(), "{action:?}");
+        assert!(planned.blocked.iter().all(|reason| !reason.trim().is_empty()));
+        planned.blocked
+    };
+    for engine in [Engine::Sqlite, Engine::Mysql, Engine::Postgres, Engine::Sqlserver] {
+        let mut table = table_of_engine(engine);
+        table.name_taken = Some(false);
+        let reasons = blocked(&table, &Action::RenameTable { table: "orders".to_owned(), new_name: "   ".to_owned() });
+        assert!(reasons[0].contains("不能为空"), "{reasons:?}");
+        let reasons = blocked(&table, &Action::RenameTable { table: "orders".to_owned(), new_name: "orders".to_owned() });
+        assert!(reasons[0].contains("相同"), "{reasons:?}");
+        let mut taken = table.clone();
+        taken.name_taken = Some(true);
+        let reasons = blocked(&taken, &Action::RenameTable { table: "orders".to_owned(), new_name: "customers".to_owned() });
+        assert!(reasons[0].contains("已经被其它对象占用"), "{reasons:?}");
+        let mut unknown = table.clone();
+        unknown.name_taken = None;
+        blocked(&unknown, &Action::RenameTable { table: "orders".to_owned(), new_name: "customers".to_owned() });
+
+        let view = view_snapshot(engine);
+        let reasons = blocked(&view, &Action::TruncateTable { table: "v_orders".to_owned() });
+        assert!(reasons[0].contains("视图"), "{reasons:?}");
+        let mut view_named = view.clone();
+        view_named.name_taken = Some(false);
+        blocked(&view_named, &Action::RenameTable { table: "v_orders".to_owned(), new_name: "v_new".to_owned() });
+        let reasons = blocked(&table, &Action::DropView { view: "orders".to_owned() });
+        assert!(reasons[0].contains("不是视图"), "{reasons:?}");
+        // 名字和读到的对象不一致也不生成语句。
+        blocked(&table, &Action::TruncateTable { table: "other".to_owned() });
+        blocked(&view, &Action::DropView { view: "other".to_owned() });
+    }
+}
+
+#[test]
+fn truncate_warns_when_incoming_foreign_keys_may_reject_it() {
+    for engine in [Engine::Postgres, Engine::Sqlserver] {
+        let mut snapshot = table_of_engine(engine);
+        let quiet = plan(&snapshot, &Action::TruncateTable { table: "orders".to_owned() });
+        assert!(quiet.risks.iter().all(|risk| risk.level != "warn"), "{engine:?} {:?}", quiet.risks);
+        snapshot.incoming.push(IncomingForeignKey {
+            name: "fk_items_order".to_owned(),
+            table: "items".to_owned(),
+            schema: snapshot.schema.clone(),
+            columns: vec!["order_id".to_owned()],
+            ref_columns: vec!["id".to_owned()],
+        });
+        let planned = plan(&snapshot, &Action::TruncateTable { table: "orders".to_owned() });
+        assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+        let warn = planned.risks.iter().find(|risk| risk.level == "warn").expect("incoming FK warn");
+        assert!(warn.text.contains("items.fk_items_order"), "{}", warn.text);
+        assert!(warn.text.contains("拒绝"), "{}", warn.text);
+        assert!(!planned.steps[0].sql.to_ascii_uppercase().contains("CASCADE"));
+    }
+}
+
+fn index(name: &str, column: &str, primary: bool, descending: bool, sql: Option<&str>) -> Index {
+    Index {
+        name: name.to_owned(),
+        unique: primary,
+        columns: vec![IndexColumn { name: column.to_owned(), descending }],
+        protected: primary,
+        reason: if primary { "由主键约束维护".to_owned() } else { String::new() },
+        partial: false,
+        expression: false,
+        sql: sql.map(str::to_owned),
+    }
+}
+
+#[test]
+fn rebuilt_definition_lists_columns_indexes_comments_and_what_it_lacks() {
+    let mut postgres = table_of_engine(Engine::Postgres);
+    postgres.columns = vec![column("id", "integer", false, true), column("customer_note", "character varying(40)", true, false)];
+    postgres.indexes = vec![
+        index("orders_pkey", "id", true, false, Some("CREATE UNIQUE INDEX orders_pkey ON public.orders USING btree (id)")),
+        index("orders_note_idx", "customer_note", false, false, Some("CREATE INDEX orders_note_idx ON public.orders USING btree (customer_note)")),
+    ];
+    postgres.table_comment = Some("订单".to_owned());
+    postgres.column_comments.insert("customer_note".to_owned(), "客户's 备注".to_owned());
+    let (text, missing) = super::plan::rebuilt_definition(&postgres);
+    assert!(text.contains("CREATE TABLE \"public\".\"orders\""), "{text}");
+    assert!(text.contains("\"id\" integer NOT NULL"), "{text}");
+    assert!(text.contains("\"customer_note\" character varying(40)"), "{text}");
+    assert!(text.contains("CONSTRAINT \"orders_pkey\" PRIMARY KEY (\"id\")"), "{text}");
+    assert!(text.contains("CREATE INDEX orders_note_idx ON public.orders USING btree (customer_note);"), "{text}");
+    assert!(!text.contains("CREATE UNIQUE INDEX orders_pkey"), "{text}");
+    assert!(text.contains("COMMENT ON TABLE \"public\".\"orders\" IS '订单';"), "{text}");
+    assert!(text.contains("COMMENT ON COLUMN \"public\".\"orders\".\"customer_note\" IS '客户''s 备注';"), "{text}");
+    assert!(text.starts_with("-- "), "{text}");
+    assert!(missing.iter().any(|item| item.contains("CHECK")), "{missing:?}");
+    assert!(missing.iter().any(|item| item.contains("分区")), "{missing:?}");
+
+    let mut sqlserver = table_of_engine(Engine::Sqlserver);
+    sqlserver.columns = vec![column("id", "int", false, true), column("total", "decimal(10,2)", true, false)];
+    sqlserver.columns[0].auto = true;
+    sqlserver.indexes = vec![index("PK_orders", "id", true, false, None), index("IX_orders_total", "total", false, true, None)];
+    sqlserver.column_comments.insert("total".to_owned(), "金额".to_owned());
+    let (text, missing) = super::plan::rebuilt_definition(&sqlserver);
+    assert!(text.contains("CREATE TABLE [dbo].[orders]"), "{text}");
+    assert!(text.contains("[id] int IDENTITY(1, 1) NOT NULL"), "{text}");
+    assert!(text.contains("[total] decimal(10,2)"), "{text}");
+    assert!(text.contains("CONSTRAINT [PK_orders] PRIMARY KEY ([id])"), "{text}");
+    assert!(text.contains("CREATE INDEX [IX_orders_total] ON [dbo].[orders] ([total] DESC);"), "{text}");
+    assert!(text.contains("@value = N'金额'") && text.contains("@level2name = N'total'"), "{text}");
+    assert!(missing.iter().any(|item| item.contains("CHECK")), "{missing:?}");
+    assert!(missing.iter().any(|item| item.contains("IDENTITY")), "{missing:?}");
+
+    let mut failed = table_of_engine(Engine::Postgres);
+    failed.index_error = Some("permission denied".to_owned());
+    let (_, missing) = super::plan::rebuilt_definition(&failed);
+    assert!(missing.iter().any(|item| item.contains("索引") && item.contains("permission denied")), "{missing:?}");
+}
+
+async fn notes_rows(session: &CatalogSession) -> i64 {
+    let CatalogSession::Sqlite { pool, .. } = session else { panic!("sqlite") };
+    sqlx::query_scalar("SELECT COUNT(*) FROM notes").fetch_one(pool).await.unwrap()
+}
+
+#[tokio::test]
+async fn object_actions_refuse_sql_that_differs_from_the_preview() {
+    let (dir, _service, session) = open_notes(&[
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, note TEXT)",
+        "INSERT INTO notes (id, note) VALUES (1, 'a'), (2, 'b')",
+        "CREATE TABLE tags (id INTEGER PRIMARY KEY)",
+        "CREATE VIEW v_notes AS SELECT id FROM notes",
+    ])
+    .await;
+    let actions = [
+        (Action::DropView { view: "v_notes".to_owned() }, "DROP VIEW \"v_notes\";"),
+        (Action::TruncateTable { table: "notes".to_owned() }, "DELETE FROM \"notes\";"),
+        (Action::RenameTable { table: "notes".to_owned(), new_name: "notes_old".to_owned() }, "ALTER TABLE \"notes\" RENAME TO \"notes_old\";"),
+    ];
+    for (action, sql) in &actions {
+        let previewed = exec::preview(&session, &request(action.clone())).await.unwrap();
+        assert!(previewed.blocked.is_empty(), "{action:?} {:?}", previewed.blocked);
+        assert_eq!(previewed.steps.len(), 1);
+        assert_eq!(previewed.steps[0].sql, *sql);
+        // 预览本身不写入。
+        assert_eq!(notes_rows(&session).await, 2);
+        let tampered = exec::execute(&session, &request(action.clone()), &[format!("{sql} -- changed")]).await;
+        let message = tampered.err().expect("SQL changed since preview");
+        assert!(message.contains("预览已过期"), "{message}");
+        assert!(exec::execute(&session, &request(action.clone()), &[]).await.is_err(), "{action:?}");
+    }
+    assert!(master_sql(&session, "v_notes").await.is_some());
+    assert!(table_exists(&session, "notes").await);
+    assert_eq!(notes_rows(&session).await, 2);
+
+    // 名字已被占用（SQLite 不分大小写）：真实读取后阻断，不生成语句。
+    let taken = exec::preview(&session, &request(Action::RenameTable { table: "notes".to_owned(), new_name: "TAGS".to_owned() })).await.unwrap();
+    assert!(taken.steps.is_empty());
+    assert!(taken.blocked.iter().any(|reason| reason.contains("占用")), "{:?}", taken.blocked);
+
+    for (action, sql) in &actions {
+        let receipt = exec::execute(&session, &request(action.clone()), &[(*sql).to_owned()]).await.unwrap();
+        assert!(receipt.blocked.is_empty(), "{:?}", receipt.blocked);
+        assert!(receipt.steps.iter().all(|step| step.status == StepStatus::Ok), "{:?}", receipt.steps);
+        if matches!(action, Action::TruncateTable { .. }) {
+            assert_eq!(notes_rows(&session).await, 0);
+        }
+    }
+    assert!(master_sql(&session, "v_notes").await.is_none());
+    assert!(!table_exists(&session, "notes").await);
+    assert!(table_exists(&session, "notes_old").await);
     let _ = fs::remove_dir_all(dir);
 }

@@ -2,6 +2,7 @@
 
 use crate::connections::model::Engine;
 use crate::connections::Service;
+use crate::catalog::definition::{object_ddl, DdlKey, ObjectDdl};
 use crate::ddl::{preview, Action, Plan, Receipt, Request, Snapshot};
 
 pub fn require_execute(confirmed: bool) -> Result<(), String> {
@@ -19,6 +20,13 @@ pub async fn describe_saved(service: &Service, connection_id: &str, database: St
     let request = request(database, schema, engine, Action::DropTable { table: table.to_owned() })?;
     let session = open_session(service, connection_id)?;
     crate::ddl::load(&session, &request, table).await
+}
+
+/// 对象树“查看/复制 DDL”的读取入口。只在已打开的会话上读，不另开连接。
+#[allow(dead_code)]
+pub async fn object_definition(service: &Service, connection_id: &str, engine: Engine, key: &DdlKey) -> Result<ObjectDdl, String> {
+    let session = open_session(service, connection_id)?;
+    object_ddl(&session, engine, key).await
 }
 
 pub async fn preview_request(service: &Service, connection_id: &str, request: &Request) -> Result<Plan, String> {

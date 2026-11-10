@@ -567,20 +567,21 @@ async fn read_sqlite_objects(pool: &sqlx::SqlitePool, database: &str, offset: us
 
 async fn read_sqlite_definition(pool: &sqlx::SqlitePool, database: &str, name: &str, kind: &str) -> Result<String, String> {
     let database = sqlite_database_or_main(database);
-    if kind != "trigger" {
+    if !matches!(kind, "trigger" | "table" | "view") {
         return Err(definition_failure(match kind {
             "function" | "procedure" => "SQLite 没有函数或存储过程",
             "sequence" | "enum" | "domain" => "SQLite 没有序列、枚举或域",
-            _ => "只有函数、存储过程和触发器可以读取只读定义",
+            _ => "只有表、视图和触发器可以读取只读定义",
         }));
     }
-    // 附加库的触发器在它自己的 sqlite_master 里，必须带上库名限定。
+    // 附加库的对象在它自己的 sqlite_master 里，必须带上库名限定。表、视图、触发器都是建对象时保存的原文。
     let statement = format!(
-        "SELECT sql FROM {}.sqlite_master WHERE name = ?1 AND type = 'trigger'",
+        "SELECT sql FROM {}.sqlite_master WHERE name = ?1 AND type = ?2",
         quote_sqlite(database)
     );
     let sql: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
         .bind(name)
+        .bind(kind)
         .fetch_optional(pool)
         .await
         .map_err(definition_failure)?;
@@ -688,6 +689,9 @@ async fn read_mysql_definition(pool: &mysql_async::Pool, engine: Engine, databas
         "trigger" => "TRIGGER",
         // 事件的事件体只读：这里只给 SHOW CREATE EVENT 的原文。
         "event" => "EVENT",
+        // 表与视图的 SHOW CREATE 原文在索引 1。
+        "table" => "TABLE",
+        "view" => "VIEW",
         "sequence" if engine == Engine::Mariadb => "SEQUENCE",
         "sequence" | "enum" | "domain" => {
             return Err(definition_failure(if engine == Engine::Mariadb {
@@ -696,7 +700,7 @@ async fn read_mysql_definition(pool: &mysql_async::Pool, engine: Engine, databas
                 "MySQL 没有独立的序列、枚举或域"
             }));
         }
-        _ => return Err(definition_failure("只有函数、存储过程、触发器、事件和视图可以读取只读定义")),
+        _ => return Err(definition_failure("只有表、视图、函数、存储过程、触发器和事件可以读取只读定义")),
     };
     if database.is_empty() {
         return Err(definition_failure("需要数据库名"));
@@ -708,7 +712,7 @@ async fn read_mysql_definition(pool: &mysql_async::Pool, engine: Engine, databas
     // SHOW CREATE SEQUENCE 的语句在索引 1；函数、过程和触发器在索引 2。
     // SHOW CREATE EVENT 的列名是 Create Event（不同版本列序会变），按列名定位，读不到时退回索引 3。
     let column = match statement {
-        "SEQUENCE" => 1,
+        "SEQUENCE" | "TABLE" | "VIEW" => 1,
         "EVENT" => mysql_column_index(&row, "Create Event").unwrap_or(3),
         _ => 2,
     };
@@ -1014,7 +1018,14 @@ async fn read_postgres_definition(
             }
             Ok(text)
         }
-        _ => Err(definition_failure("只有函数、存储过程和触发器可以读取只读定义")),
+        "view" => read_postgres_text(
+            client,
+            "SELECT format(CASE WHEN c.relkind = 'm' THEN E'CREATE MATERIALIZED VIEW %I.%I AS\n%s;' ELSE E'CREATE OR REPLACE VIEW %I.%I AS\n%s;' END, n.nspname, c.relname, rtrim(btrim(pg_get_viewdef(c.oid, true)), ';')) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('v', 'm')",
+            schema,
+            name,
+        )
+        .await,
+        _ => Err(definition_failure("只有视图、函数、存储过程、触发器、序列、枚举和域可以读取只读定义")),
     }
 }
 

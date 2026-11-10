@@ -1,6 +1,7 @@
 //! 按引擎读取库表：PostgreSQL 有 schema，MySQL / MariaDB 只有库，SQLite 直接列对象。
 
 pub mod commands;
+pub mod definition;
 pub mod detail;
 pub mod hierarchy;
 pub mod model;
@@ -57,6 +58,9 @@ pub fn module_id() -> &'static str {
         std::any::type_name_of_val(&hierarchy::object_node_id),
         std::any::type_name_of_val(&read_object_details),
         std::any::type_name_of_val(&read_navigation),
+        std::any::type_name_of_val(&definition::object_ddl),
+        std::any::type_name_of_val(&definition::ddl_available),
+        std::any::type_name_of_val(&definition::rebuilt_from_snapshot),
         std::any::type_name_of_val(&ExtrasScope { connection_id: String::new(), database: String::new(), schema: String::new() }),
     );
     let _ = (
