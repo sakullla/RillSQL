@@ -11,12 +11,12 @@ use crate::connections::model::Engine;
 use crate::connections::{CatalogSession, Service};
 
 use super::assist::{
-    self, CatalogObject, CompletionEntry, CompletionSource, LintFinding, MetadataState, OutlineItem, RunPick, RunScope, TextResult,
+    self, CatalogObject, ColumnMeta, CompletionEntry, CompletionSource, LintFinding, MetadataState, OutlineItem, RunPick, RunScope, TextResult,
     TreeObject, VariableInput,
 };
 use super::complete;
 use super::commands::{self, RunDto, StartRequest};
-use super::exec::{LiveDriver, StatementDriver};
+use super::exec::{ErrorAt, LiveDriver, StatementDriver};
 
 /// 词频表上限；超出时按次数与名称稳定截断。
 const FREQUENCY_LIMIT: usize = 200;
@@ -48,6 +48,33 @@ pub struct StatementView {
     /// 结果因为读取上限被截断；查询结果据此提供“加载更多”。
     pub truncated: bool,
     pub affected: Option<u64>,
+    /// 这一条语句自己的耗时（毫秒）；执行中、被取消或没有执行时为 None。
+    pub elapsed_ms: Option<u64>,
+    /// 驱动报出的错误位置，相对这一条语句。
+    pub error_at: Option<ErrorAt>,
+    /// 这条语句在发起执行时草稿里的字节范围；对不上草稿时为 None，不猜位置。
+    pub range: Option<(usize, usize)>,
+    /// 失败语句在草稿里的错误标记：有驱动位置时给偏移或行，没有时整条语句标错。
+    pub error_mark: Option<ErrorMark>,
+}
+
+/// 失败语句在草稿里的位置。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorMark {
+    /// 草稿里的字节偏移（驱动给的是字符位置，已换算）。
+    Offset(usize),
+    /// 草稿里从 0 开始的行号。
+    Line(usize),
+    /// 驱动没有给位置（如 SQLite）：整条语句的 range 标错。
+    Statement,
+}
+
+/// 发起执行时这批 SQL 在草稿里的位置：from 是 pick 在草稿里的起点，sql 是实际送出的文本。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunOrigin {
+    from: usize,
+    sql: String,
+    engine: String,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +110,8 @@ struct TabState {
     provider: bool,
     note: String,
     statement: usize,
+    /// 最近一次发起执行的位置；结果回来时据此把错误位置换算到草稿。
+    run_origin: Option<RunOrigin>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,8 +143,10 @@ pub struct Desk {
     active: Option<String>,
     seq: u64,
     objects: Vec<TreeObject>,
-    /// 按连接/库/模式/表记住的列；同一个表名在不同模式里不互相覆盖。
-    columns: HashMap<String, Vec<String>>,
+    /// 按连接/库/模式/表记住的列及其元数据；同一个表名在不同模式里不互相覆盖。
+    columns: HashMap<String, Vec<ColumnMeta>>,
+    /// 按连接/库/模式/表记住的对象注释；读不到注释的对象不在表里。
+    comments: HashMap<String, String>,
     /// 已读到的真实外键，带连接/库/模式身份。
     foreign_keys: Vec<assist::ForeignKey>,
     /// 本地标识符词频：只参与同分排序，不保存 SQL 文本。
@@ -141,6 +172,7 @@ impl Desk {
             seq: 0,
             objects: Vec::new(),
             columns: HashMap::new(),
+            comments: HashMap::new(),
             foreign_keys: Vec::new(),
             frequency: HashMap::new(),
             databases: Vec::new(),
@@ -271,6 +303,7 @@ impl Desk {
             provider: true,
             note: String::new(),
             statement: 0,
+            run_origin: None,
         });
         if self.active.is_none() {
             self.active = Some(id.to_owned());
@@ -490,6 +523,10 @@ impl Desk {
                 rows,
                 truncated: false,
                 affected: None,
+                elapsed_ms: None,
+                error_at: None,
+                range: None,
+                error_mark: None,
             }];
             tab.statement = 0;
         });
@@ -768,7 +805,11 @@ impl Desk {
                 TaskOutcome::Current { .. } => {
                     tab.running = pending;
                     tab.status = run.status.clone();
-                    tab.results = run.statements.into_iter().map(statement_view).collect();
+                    let mut results: Vec<StatementView> = run.statements.into_iter().map(statement_view).collect();
+                    if let Some(origin) = tab.run_origin.as_ref() {
+                        place_statements(&tab.draft, origin, &mut results);
+                    }
+                    tab.results = results;
                     tab.run_id = Some(run.id);
                     if !pending {
                         tab.executed = true;
@@ -847,6 +888,7 @@ impl Desk {
             }
         }
         let token = tasks.begin(&owner(&tab.id));
+        let origin = RunOrigin { from: pick.from, sql: pick.sql.clone(), engine: target.engine.clone() };
         if let Some(tab) = self.active_mut() {
             tab.running = true;
             tab.cancelled = false;
@@ -854,6 +896,7 @@ impl Desk {
             tab.status = "running".to_owned();
             tab.pending = None;
             tab.draft = original;
+            tab.run_origin = Some(origin);
         }
         self.executions += 1;
         self.record_frequency(&pick.sql);
@@ -894,14 +937,19 @@ impl Desk {
         database: &str,
         schema: &str,
         table: &str,
-        columns: Vec<String>,
+        columns: Vec<ColumnMeta>,
     ) {
         self.columns.insert(column_key(connection_id, database, schema, table), columns);
     }
 
-    /// 只有库和表、没有模式的引擎（SQLite/MySQL）用它。
+    /// 只有库和表、没有模式的引擎（SQLite/MySQL）用它；只知道列名，类型和注释留空。
     pub fn remember_columns(&mut self, connection_id: &str, database: &str, table: &str, columns: Vec<String>) {
-        self.remember_table_columns(connection_id, database, "", table, columns);
+        self.remember_table_columns(connection_id, database, "", table, columns.into_iter().map(ColumnMeta::named).collect());
+    }
+
+    /// 对象注释随目录一起替换；键与列相同（连接/库/模式/表）。
+    pub fn set_object_comments(&mut self, comments: HashMap<String, String>) {
+        self.comments = comments;
     }
 
     /// 真实外键随目录一起替换；空集表示还没读到或引擎没有外键。
@@ -957,6 +1005,13 @@ impl Desk {
             .unwrap_or_default()
     }
 
+    /// 把全文里的偏移解析成当前目标库里的对象或列（悬停、跳转定义、对象信息共用）。
+    /// 解析不到时为 None。
+    pub fn resolve_at(&self, text: &str, offset: usize) -> Option<complete::Resolution> {
+        let scope = self.completion_scope()?;
+        complete::resolve(&scope, text, offset)
+    }
+
     /// 当前标签的补全上下文。编辑器打字时据此给出与 Ctrl+Space 相同的候选。
     pub fn completion_scope(&self) -> Option<assist::CompletionScope> {
         let tab = self.active_tab()?;
@@ -969,7 +1024,16 @@ impl Desk {
                     .as_ref()
                     .is_some_and(|target| target.connection_id == object.connection_id && target.database == object.database)
             })
-            .map(|object| CatalogObject { name: object.name.clone(), schema: object.schema.clone(), kind: object.kind.clone() })
+            .map(|object| CatalogObject {
+                name: object.name.clone(),
+                schema: object.schema.clone(),
+                kind: object.kind.clone(),
+                comment: self
+                    .comments
+                    .get(&column_key(&object.connection_id, &object.database, &object.schema, &object.name))
+                    .cloned()
+                    .unwrap_or_default(),
+            })
             .collect();
         let databases = tab
             .target
@@ -1100,6 +1164,7 @@ impl Desk {
             provider: keep_provider,
             note: String::new(),
             statement: 0,
+            run_origin: None,
         });
         self.active = Some(id.clone());
         self.refresh_outline();
@@ -1179,7 +1244,9 @@ pub async fn cancel_run(service: &Arc<Service>, query: &commands::QueryState, ru
 pub struct TreeLoad {
     pub objects: Vec<TreeObject>,
     pub databases: Vec<String>,
-    pub columns: HashMap<String, Vec<String>>,
+    pub columns: HashMap<String, Vec<ColumnMeta>>,
+    /// 对象注释，键与 columns 相同；读不到注释时不出现。
+    pub comments: HashMap<String, String>,
     pub foreign_keys: Vec<assist::ForeignKey>,
     pub links: Vec<OpenLink>,
     pub failures: Vec<String>,
@@ -1241,6 +1308,7 @@ pub async fn load_tree(service: &Arc<Service>, page: usize) -> Result<TreeLoad, 
     let mut objects = Vec::new();
     let mut databases = Vec::new();
     let mut columns = HashMap::new();
+    let mut comments = HashMap::new();
     let mut foreign_keys = Vec::new();
     let mut links = Vec::new();
     let mut failures = Vec::new();
@@ -1259,15 +1327,30 @@ pub async fn load_tree(service: &Arc<Service>, page: usize) -> Result<TreeLoad, 
                 let listing = objects_from_catalog(&record.saved.id, &record.saved.name, &engine, &body);
                 // 目录只给对象名；列和外键按对象按需再读，单个对象失败只记原因，不清空兄弟节点。
                 for object in &listing.objects {
-                    match crate::catalog::read_column_names(&session, parsed, &object.database, &object.schema, &object.name).await {
-                        Ok(names) if !names.is_empty() => {
+                    match crate::catalog::detail::read_column_meta(&session, parsed, &object.database, &object.schema, &object.name).await {
+                        Ok(meta) if !meta.is_empty() => {
                             columns.insert(
                                 column_key(&object.connection_id, &object.database, &object.schema, &object.name),
-                                names,
+                                meta,
                             );
                         }
                         Ok(_) => {}
                         Err(error) => failures.push(format!("{}: {error}", object_label(object))),
+                    }
+                }
+                // 对象注释按库/模式读一次；读不到只是没有注释，不记成失败，也不编造。
+                let mut scopes: Vec<(String, String)> = Vec::new();
+                for object in &listing.objects {
+                    let scope = (object.database.clone(), object.schema.clone());
+                    if !scopes.contains(&scope) {
+                        scopes.push(scope);
+                    }
+                }
+                for (database, schema) in &scopes {
+                    if let Ok(found) = crate::catalog::detail::read_table_comments(&session, parsed, database, schema).await {
+                        for (name, comment) in found {
+                            comments.insert(column_key(&record.saved.id, database, schema, &name), comment);
+                        }
                     }
                 }
                 for object in listing.objects.iter().filter(|object| object.kind == "table") {
@@ -1344,21 +1427,36 @@ pub async fn load_tree(service: &Arc<Service>, page: usize) -> Result<TreeLoad, 
             environment: record.saved.env.clone(),
         });
     }
-    Ok(TreeLoad { objects, databases, columns, foreign_keys, links, failures })
+    Ok(TreeLoad { objects, databases, columns, comments, foreign_keys, links, failures })
 }
 
-async fn read_columns(service: &Arc<Service>, connection_id: &str, table: &str) -> Result<Vec<String>, String> {
+async fn read_columns(service: &Arc<Service>, connection_id: &str, table: &str) -> Result<Vec<ColumnMeta>, String> {
     let session = service.catalog_session(connection_id).ok_or_else(|| "连接没有打开".to_owned())?;
     let transport = service.cancel_transport(connection_id).unwrap_or(crate::connections::CancelTransport::None);
     let driver = LiveDriver::attach(session, "sqlite", "main", transport, None).await?;
     let sql = format!("PRAGMA table_info({})", assist::quote_ident("sqlite", table));
     let flag = Arc::new(AtomicBool::new(false));
     let info = driver.run(&sql, 200, &flag).await.map_err(|stop| match stop {
-        super::exec::StatementStop::Error { message } | super::exec::StatementStop::Unknown { message } | super::exec::StatementStop::Cancelled { message } => message,
+        super::exec::StatementStop::Error { message, .. } | super::exec::StatementStop::Unknown { message } | super::exec::StatementStop::Cancelled { message } => message,
     })?;
     let _ = driver.finish().await;
-    let name_at = info.columns.iter().position(|column| column.eq_ignore_ascii_case("name")).unwrap_or(1);
-    Ok(info.rows.into_iter().filter_map(|row| row.get(name_at).and_then(|cell| cell.clone())).collect())
+    Ok(sqlite_column_meta(&info.columns, &info.rows))
+}
+
+/// PRAGMA table_info 的结果按列名取 name / type / notnull；SQLite 没有列注释。
+fn sqlite_column_meta(columns: &[String], rows: &[Vec<Option<String>>]) -> Vec<ColumnMeta> {
+    let find = |name: &str| columns.iter().position(|column| column.eq_ignore_ascii_case(name));
+    let name_at = find("name").unwrap_or(1);
+    let type_at = find("type");
+    let notnull_at = find("notnull");
+    rows.iter()
+        .filter_map(|row| {
+            let name = row.get(name_at).and_then(|cell| cell.clone())?;
+            let type_name = type_at.and_then(|at| row.get(at).cloned().flatten()).unwrap_or_default();
+            let nullable = notnull_at.and_then(|at| row.get(at).cloned().flatten()).map(|flag| flag.trim() != "1");
+            Some(ColumnMeta { name, type_name, nullable, comment: String::new() })
+        })
+        .collect()
 }
 
 /// 快照是否还表示执行中。只有 running / cancel-requested 会继续等下一批行，
@@ -1376,6 +1474,49 @@ fn statement_view(statement: commands::StatementDto) -> StatementView {
         rows: statement.rows,
         truncated: statement.truncated,
         affected: statement.affected,
+        elapsed_ms: statement.elapsed_ms,
+        error_at: statement.error_at,
+        range: None,
+        error_mark: None,
+    }
+}
+
+/// 把这批结果放回草稿：按发起时的切分算出每条语句的范围，再把失败语句的错误位置加上语句起点。
+/// 草稿在这期间改过、或送出的文本和草稿对不上（例如变量已替换）时不给范围，也不给标记。
+fn place_statements(draft: &str, origin: &RunOrigin, results: &mut [StatementView]) {
+    let pieces = super::split::split_sql(&origin.engine, &origin.sql).pieces;
+    for (view, piece) in results.iter_mut().zip(pieces.iter()) {
+        if view.sql != piece.text {
+            continue;
+        }
+        let start = origin.from + piece.start;
+        let end = origin.from + piece.end;
+        if draft.get(start..end) != Some(piece.text.as_str()) {
+            continue;
+        }
+        view.range = Some((start, end));
+        if view.status == "error" {
+            view.error_mark = Some(error_mark(draft, (start, end), view.error_at));
+        }
+    }
+}
+
+/// 语句内的错误位置换算成草稿位置。字符偏移换成字节偏移；行号加上语句起点所在行，
+/// 并且不越过语句最后一行。没有位置时整条语句标错。
+pub fn error_mark(draft: &str, range: (usize, usize), at: Option<ErrorAt>) -> ErrorMark {
+    let (start, end) = range;
+    let statement = draft.get(start..end).unwrap_or("");
+    match at {
+        Some(ErrorAt::Char(offset)) => {
+            let byte = statement.char_indices().nth(offset).map(|(byte, _)| byte).unwrap_or(statement.len());
+            ErrorMark::Offset(start + byte)
+        }
+        Some(ErrorAt::Line(line)) => {
+            let first = draft.get(..start).unwrap_or("").matches('\n').count();
+            let last = first + statement.matches('\n').count();
+            ErrorMark::Line((first + line.saturating_sub(1)).min(last))
+        }
+        None => ErrorMark::Statement,
     }
 }
 
@@ -1459,7 +1600,7 @@ trait StopText {
 impl StopText for super::exec::StatementStop {
     fn to_string(&self) -> String {
         match self {
-            super::exec::StatementStop::Error { message } | super::exec::StatementStop::Unknown { message } | super::exec::StatementStop::Cancelled { message } => message.clone(),
+            super::exec::StatementStop::Error { message, .. } | super::exec::StatementStop::Unknown { message } | super::exec::StatementStop::Cancelled { message } => message.clone(),
         }
     }
 }
@@ -1742,6 +1883,8 @@ mod tests {
                 rows: vec![vec![Some("1".to_owned())]],
                 truncated: false,
                 affected: None,
+                elapsed_ms: None,
+                error_at: None,
             }],
             started_at: String::new(),
             elapsed_ms: 0,
@@ -1854,6 +1997,8 @@ mod tests {
             rows: vec![vec![Some("1".to_owned())]],
             truncated: true,
             affected: None,
+            elapsed_ms: None,
+            error_at: None,
         });
         assert!(view.truncated, "截断标记必须跟到界面，才能提供加载更多");
     }
@@ -2023,7 +2168,7 @@ mod tests {
         let ready = desk.completion_scope().expect("有目标");
         assert_eq!(ready.state, MetadataState::Ready);
         assert!(ready.objects.iter().any(|object| object.name == "item"));
-        assert!(ready.sources.iter().any(|source| source.columns.contains(&"status".to_owned())));
+        assert!(ready.sources.iter().any(|source| source.columns.iter().any(|column| column.name == "status")));
         assert_eq!(ready.databases, vec!["main".to_owned(), "archive".to_owned()]);
 
         // 一个 schema 失败不等于整体失败：已读到的对象和列继续可用，状态是 Partial。
@@ -2031,7 +2176,7 @@ mod tests {
         let partial = desk.completion_scope().expect("部分失败也要有上下文");
         assert_eq!(partial.state, MetadataState::Partial("读取库表失败：连接中断".to_owned()));
         assert!(partial.objects.iter().any(|object| object.name == "item"), "部分失败时已读对象仍然可用");
-        assert!(partial.sources.iter().any(|source| source.columns.contains(&"status".to_owned())));
+        assert!(partial.sources.iter().any(|source| source.columns.iter().any(|column| column.name == "status")));
         desk.set_tree_error("");
 
         // 连接列出的库确实读过了却没有对象：是真空白库，不能报成过期。
@@ -2086,8 +2231,8 @@ mod tests {
             vec!["shop".to_owned()],
         );
         // 同名表在不同模式里各记各的列，不互相覆盖。
-        desk.remember_table_columns("pg", "shop", "public", "orders", vec!["id".to_owned(), "customer_id".to_owned()]);
-        desk.remember_table_columns("pg", "shop", "archive", "orders", vec!["id".to_owned(), "archived_at".to_owned()]);
+        desk.remember_table_columns("pg", "shop", "public", "orders", vec![ColumnMeta::named("id"), ColumnMeta::named("customer_id")]);
+        desk.remember_table_columns("pg", "shop", "archive", "orders", vec![ColumnMeta::named("id"), ColumnMeta::named("archived_at")]);
         desk.set_foreign_keys(vec![
             assist::ForeignKey {
                 connection_id: "pg".to_owned(),
@@ -2112,9 +2257,9 @@ mod tests {
         ]);
         let scope = desk.completion_scope().expect("有目标");
         let public = scope.sources.iter().find(|source| source.label == "public.orders").expect("public.orders");
-        assert_eq!(public.columns, vec!["id".to_owned(), "customer_id".to_owned()]);
+        assert_eq!(public.columns, vec![ColumnMeta::named("id"), ColumnMeta::named("customer_id")]);
         let archive = scope.sources.iter().find(|source| source.label == "archive.orders").expect("archive.orders");
-        assert_eq!(archive.columns, vec!["id".to_owned(), "archived_at".to_owned()]);
+        assert_eq!(archive.columns, vec![ColumnMeta::named("id"), ColumnMeta::named("archived_at")]);
         assert_eq!(scope.foreign_keys.len(), 1, "只保留当前连接的外键");
         assert_eq!(scope.foreign_keys[0].from_schema, "public");
 

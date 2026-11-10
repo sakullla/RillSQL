@@ -77,13 +77,43 @@ pub struct CompletionEntry {
     /// 已翻译的详情（类型、签名或来源）；没有详情时为 None。
     pub detail: Option<String>,
     pub insert: String,
+    /// 结构化的说明数据（列类型/可空/注释、对象类型与模式、函数签名），供详情文档和悬停使用。
+    /// 只放实际读到的元数据；没有时为 None。
+    pub info: Option<EntryInfo>,
+}
+
+/// 一列的元数据。type_name / comment 读不到时为空串，nullable 读不到时为 None，不编造。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColumnMeta {
+    pub name: String,
+    pub type_name: String,
+    pub nullable: Option<bool>,
+    pub comment: String,
+}
+
+impl ColumnMeta {
+    /// 只知道列名时的元数据：类型、可空和注释都留空。
+    pub fn named(name: impl Into<String>) -> Self {
+        Self { name: name.into(), ..Self::default() }
+    }
+}
+
+/// 补全候选与悬停共用的结构化说明。文本由界面按语言排版，这里不放翻译后的句子。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EntryInfo {
+    /// 来源（表或视图，按语句里的写法）里的一列。
+    Column { source: String, column: ColumnMeta },
+    /// 目录对象：模式、名字、类型和注释（读不到时为空）。
+    Object { schema: String, name: String, kind: String, comment: String },
+    /// 内置函数的一行签名。
+    Function { signature: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionSource {
     pub alias: String,
     pub label: String,
-    pub columns: Vec<String>,
+    pub columns: Vec<ColumnMeta>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,6 +121,8 @@ pub struct CatalogObject {
     pub name: String,
     pub schema: String,
     pub kind: String,
+    /// 对象注释；没有读到时为空。
+    pub comment: String,
 }
 
 /// 补全所需的元数据状态。失败、部分失败和空目录都必须能显示出来，
@@ -705,14 +737,18 @@ fn alias_span(sql: &str, star: usize) -> Option<usize> {
 
 fn columns_for(sources: &[CompletionSource], alias: Option<&str>) -> Vec<String> {
     match alias {
-        Some(alias) => sources.iter().find(|source| source.alias.eq_ignore_ascii_case(alias)).map(|source| source.columns.clone()).unwrap_or_default(),
+        Some(alias) => sources
+            .iter()
+            .find(|source| source.alias.eq_ignore_ascii_case(alias))
+            .map(|source| source.columns.iter().map(|column| column.name.clone()).collect())
+            .unwrap_or_default(),
         None => {
             let mut seen = HashSet::new();
             let mut columns = Vec::new();
             for source in sources {
                 for column in &source.columns {
-                    if seen.insert(column.to_ascii_lowercase()) {
-                        columns.push(column.clone());
+                    if seen.insert(column.name.to_ascii_lowercase()) {
+                        columns.push(column.name.clone());
                     }
                 }
             }
@@ -1584,7 +1620,7 @@ mod tests {
         let merged = merge_outline(outline, &[("select 1;".to_owned(), "ok".to_owned(), 1, None)]);
         assert_eq!(merged[0].status, "ok");
         assert_eq!(merged[1].status, "none");
-        let sources = vec![CompletionSource { alias: String::new(), label: "t".to_owned(), columns: vec!["id".to_owned(), "name".to_owned()] }];
+        let sources = vec![CompletionSource { alias: String::new(), label: "t".to_owned(), columns: vec![ColumnMeta::named("id"), ColumnMeta::named("name")] }];
         let expanded = expand_star("sqlite", "SELECT * FROM t", &sources, true);
         assert_eq!(expanded.sql, "SELECT id, name FROM t");
         assert_eq!(expand_star("sqlite", "SELECT *, COUNT(*) FROM t", &sources, true).sql, "SELECT id, name, COUNT(*) FROM t");

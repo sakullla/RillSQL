@@ -60,6 +60,10 @@ pub struct StatementDto {
     pub rows: Vec<Vec<Option<String>>>,
     pub truncated: bool,
     pub affected: Option<u64>,
+    /// 这一条语句自己的耗时（毫秒）。执行中、被取消或没有执行的语句没有耗时。
+    pub elapsed_ms: Option<u64>,
+    /// 失败语句的驱动错误位置，相对这一条语句；驱动没给位置时为 None。
+    pub error_at: Option<exec::ErrorAt>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +169,8 @@ pub async fn start_run(service: &Arc<Service>, state: &QueryState, request: Star
             rows: Vec::new(),
             truncated: false,
             affected: None,
+            elapsed_ms: None,
+            error_at: None,
         })
         .collect::<Vec<_>>();
     let snapshot = RunDto {
@@ -288,6 +294,8 @@ fn statement_dto(statement: StatementReport) -> StatementDto {
         rows: statement.rows,
         truncated: statement.truncated,
         affected: statement.affected,
+        elapsed_ms: statement.elapsed_ms,
+        error_at: statement.error_at,
     }
 }
 
@@ -491,6 +499,7 @@ mod resource_tests {
                 sql: "SELECT value".to_owned(), status: "ok".to_owned(), message: String::new(),
                 columns: vec!["value".to_owned()], column_types: vec!["text".to_owned()],
                 rows: vec![vec![Some("x".repeat(1024))]; 1000], truncated: false, affected: None,
+                elapsed_ms: Some(1), error_at: None,
             }],
             started_at: String::new(), elapsed_ms: 0,
         }

@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::TryStreamExt;
 use mysql_async::prelude::Queryable;
@@ -25,9 +26,20 @@ pub struct StatementValue {
     pub affected: Option<u64>,
 }
 
+/// 驱动报出的错误位置，相对于出错的那一条语句。
+/// Char 是语句内从 0 开始的字符偏移（PostgreSQL 的 position 换算而来）；
+/// Line 是语句内从 1 开始的行号（MySQL 的 "at line N"、SQL Server 的行号）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "value")]
+pub enum ErrorAt {
+    Char(usize),
+    Line(usize),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatementStop {
-    Error { message: String },
+    /// at 只在驱动确实给出位置时才有；没有位置（如 SQLite）就是 None，不推测。
+    Error { message: String, at: Option<ErrorAt> },
     Unknown { message: String },
     Cancelled { message: String },
 }
@@ -42,6 +54,10 @@ pub struct StatementReport {
     pub rows: Vec<Vec<Option<String>>>,
     pub truncated: bool,
     pub affected: Option<u64>,
+    /// 这一条语句自己的耗时（毫秒，向上取整）。被取消或没有执行的语句没有耗时。
+    pub elapsed_ms: Option<u64>,
+    /// 失败语句的驱动错误位置；只有 status 为 error 时可能有值。
+    pub error_at: Option<ErrorAt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +104,7 @@ pub fn classify_failure(sql: &str, message: String, cancel_requested: bool) -> S
     if is_statement_timeout(&message) {
         return StatementStop::Error {
             message: format!("执行超时，语句已停止。{message}"),
+            at: None,
         };
     }
     if is_disconnect(&message) && is_write(sql) {
@@ -95,7 +112,107 @@ pub fn classify_failure(sql: &str, message: String, cancel_requested: bool) -> S
             message: format!("连接中断，无法确认写入是否完成。不会自动重放。{message}"),
         };
     }
-    StatementStop::Error { message }
+    StatementStop::Error { message, at: None }
+}
+
+/// PostgreSQL 的 position 从 1 开始、按字符计数。换成语句内从 0 开始的字符偏移；
+/// 超出语句长度时落在语句末尾（执行时追加的 LIMIT 不在用户文本里）。
+pub fn pg_error_char(position: u32, statement: &str) -> Option<usize> {
+    if position == 0 {
+        return None;
+    }
+    let count = statement.chars().count();
+    Some(((position as usize) - 1).min(count))
+}
+
+/// MySQL / MariaDB 的语法错误写在文本里："... near 'x' at line N"。取最后一处，行号从 1 开始。
+pub fn mysql_error_line(message: &str) -> Option<usize> {
+    let lower = message.to_ascii_lowercase();
+    let at = lower.rfind("at line ")?;
+    let digits: String = lower[at + "at line ".len()..].chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    digits.parse::<usize>().ok().filter(|line| *line > 0)
+}
+
+/// SQL Server 的服务器错误带行号（批次内从 1 开始）；0 表示服务器没给行号。
+pub fn sqlserver_error_line(line: u32) -> Option<usize> {
+    if line == 0 {
+        None
+    } else {
+        Some(line as usize)
+    }
+}
+
+/// 从 tiberius 错误里取行号；不是服务器报错时没有位置。
+fn tds_error_at(err: &tiberius::error::Error) -> Option<ErrorAt> {
+    match err {
+        tiberius::error::Error::Server(token) => sqlserver_error_line(token.line()).map(ErrorAt::Line),
+        _ => None,
+    }
+}
+
+/// 从 tokio-postgres 错误里取位置；只认原语句里的位置，内部生成语句的位置不对应用户文本。
+fn pg_error_at(err: &tokio_postgres::Error, statement: &str) -> Option<ErrorAt> {
+    match err.as_db_error()?.position()? {
+        tokio_postgres::error::ErrorPosition::Original(position) => pg_error_char(*position, statement).map(ErrorAt::Char),
+        tokio_postgres::error::ErrorPosition::Internal { .. } => None,
+    }
+}
+
+fn tds_failure(err: &tiberius::error::Error) -> Failure {
+    Failure { message: err.to_string(), at: tds_error_at(err) }
+}
+
+/// sent 是实际发出的文本（可能加了行数上限），位置先在 sent 里换算，再映射回用户写的 statement。
+fn pg_failure(err: &tokio_postgres::Error, sent: &str, statement: &str) -> Failure {
+    let at = match pg_error_at(err, sent) {
+        Some(ErrorAt::Char(offset)) => Some(ErrorAt::Char(map_rewritten_char(statement, sent, offset))),
+        other => other,
+    };
+    Failure { message: err.to_string(), at }
+}
+
+/// 执行前的改写只在一处插入或替换文本（行数上限）。把改写后文本里的字符偏移映射回原文：
+/// 落在公共前缀里原样保留，落在公共后缀里减去长度差，落在改写片段里就停在改写起点。
+pub fn map_rewritten_char(original: &str, rewritten: &str, offset: usize) -> usize {
+    let source: Vec<char> = original.chars().collect();
+    let sent: Vec<char> = rewritten.chars().collect();
+    let prefix = source.iter().zip(sent.iter()).take_while(|(left, right)| left == right).count();
+    let limit = source.len().min(sent.len()) - prefix;
+    let suffix = source
+        .iter()
+        .rev()
+        .zip(sent.iter().rev())
+        .take(limit)
+        .take_while(|(left, right)| left == right)
+        .count();
+    if offset <= prefix {
+        return offset.min(source.len());
+    }
+    let tail_start = sent.len() - suffix;
+    if offset >= tail_start {
+        return (source.len() - (sent.len() - offset)).min(source.len());
+    }
+    prefix.min(source.len())
+}
+
+/// 驱动一层的失败：文本照旧，另外带上驱动给出的错误位置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    pub message: String,
+    pub at: Option<ErrorAt>,
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self { message, at: None }
+    }
+}
+
+/// 毫秒耗时，向上取整：真实执行过的语句至少记 1 ms，不把亚毫秒的执行写成 0。
+pub fn elapsed_ms(spent: Duration) -> u64 {
+    let micros = spent.as_micros();
+    let millis = micros.div_ceil(1000).max(1);
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 /// 语句超时的报错文案。这些词同样带 timeout / interrupted，必须先于断连判定，否则写入会被误标成结果未知。
@@ -165,6 +282,11 @@ pub fn is_disconnect(message: &str) -> bool {
 #[async_trait::async_trait]
 pub trait StatementDriver: Send + Sync {
     async fn run(&self, sql: &str, limit: usize, cancel: &Arc<AtomicBool>) -> Result<StatementValue, StatementStop>;
+
+    /// 累计等待调用方“继续读取”的时间。语句耗时要扣掉它，不把用户停留算成执行时间。
+    fn paused(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 pub async fn run_batch(parts: &[Piece], limit: usize, cancel_flag: &Arc<AtomicBool>, via_ssh: bool, driver: &dyn StatementDriver) -> BatchReport {
@@ -192,7 +314,11 @@ pub async fn run_batch(parts: &[Piece], limit: usize, cancel_flag: &Arc<AtomicBo
             break;
         }
         calls += 1;
-        match driver.run(&piece.text, limit, cancel_flag).await {
+        let paused_before = driver.paused();
+        let started = Instant::now();
+        let outcome = driver.run(&piece.text, limit, cancel_flag).await;
+        let spent = started.elapsed().saturating_sub(driver.paused().saturating_sub(paused_before));
+        match outcome {
             Ok(value) => {
                 statements.push(StatementReport {
                     sql: piece.text.clone(),
@@ -203,6 +329,8 @@ pub async fn run_batch(parts: &[Piece], limit: usize, cancel_flag: &Arc<AtomicBo
                     rows: value.rows,
                     truncated: value.truncated,
                     affected: value.affected,
+                    elapsed_ms: Some(elapsed_ms(spent)),
+                    error_at: None,
                 });
                 if cancel_flag.load(Ordering::SeqCst) {
                     if cancel.phase == "none" {
@@ -219,10 +347,10 @@ pub async fn run_batch(parts: &[Piece], limit: usize, cancel_flag: &Arc<AtomicBo
                 }
             }
             Err(stop) => {
-                let (statement_status, message) = match stop {
-                    StatementStop::Error { message } => ("error", message),
-                    StatementStop::Unknown { message } => ("unknown", message),
-                    StatementStop::Cancelled { message } => ("cancelled", message),
+                let (statement_status, message, error_at) = match stop {
+                    StatementStop::Error { message, at } => ("error", message, at),
+                    StatementStop::Unknown { message } => ("unknown", message, None),
+                    StatementStop::Cancelled { message } => ("cancelled", message, None),
                 };
                 if statement_status == "cancelled" {
                     cancel::on_statement_end(&mut cancel, "cancelled");
@@ -241,6 +369,9 @@ pub async fn run_batch(parts: &[Piece], limit: usize, cancel_flag: &Arc<AtomicBo
                     rows: Vec::new(),
                     truncated: false,
                     affected: None,
+                    // 被取消的语句只标“已取消”，不报一个不完整的耗时。
+                    elapsed_ms: if statement_status == "cancelled" { None } else { Some(elapsed_ms(spent)) },
+                    error_at,
                 });
                 for rest in &parts[index + 1..] {
                     statements.push(skipped(rest.text.clone(), "未执行"));
@@ -275,6 +406,8 @@ fn skipped(sql: String, message: &str) -> StatementReport {
         rows: Vec::new(),
         truncated: false,
         affected: None,
+        elapsed_ms: None,
+        error_at: None,
     }
 }
 
@@ -286,6 +419,27 @@ pub trait RowSink: Send + Sync {
 }
 
 pub struct NopSink;
+
+/// 把等待“继续读取”的时间记下来（微秒），其余原样转给真正的 sink。
+struct PauseClock<'a> {
+    inner: &'a dyn RowSink,
+    paused: &'a AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl RowSink for PauseClock<'_> {
+    async fn publish(&self, index: usize, value: &StatementValue) {
+        self.inner.publish(index, value).await;
+    }
+
+    async fn pause(&self, cancel: &AtomicBool) -> Result<(), String> {
+        let started = Instant::now();
+        let result = self.inner.pause(cancel).await;
+        let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.paused.fetch_add(micros, Ordering::SeqCst);
+        result
+    }
+}
 
 #[async_trait::async_trait]
 impl RowSink for NopSink {
@@ -445,6 +599,8 @@ pub struct LiveDriver {
     sink: Arc<dyn RowSink>,
     statement_index: AtomicUsize,
     timeout_applied: bool,
+    /// 等待调用方继续读取的累计微秒数；语句耗时扣掉这一段。
+    paused_micros: AtomicU64,
     /// 只为 Drop 语义保留：批处理结束后释放探活忙标记。
     _busy: Option<BusyGuard>,
 }
@@ -523,6 +679,7 @@ impl LiveDriver {
             sink: Arc::new(NopSink),
             statement_index: AtomicUsize::new(0),
             timeout_applied: !setup.is_empty(),
+            paused_micros: AtomicU64::new(0),
             _busy: busy,
         })
     }
@@ -554,24 +711,34 @@ impl StatementDriver for LiveDriver {
     async fn run(&self, sql: &str, limit: usize, cancel: &Arc<AtomicBool>) -> Result<StatementValue, StatementStop> {
         let index = self.statement_index.fetch_add(1, Ordering::SeqCst);
         let mut attached = self.session.lock().await;
-        let result = match &mut *attached {
-            Attached::Scripted => Err("这个连接没有连着可查询的数据库".to_owned()),
-            Attached::Sqlite(pool) => sqlite_run(pool, &self.engine, sql, limit, cancel, self.sink.as_ref(), index).await,
-            Attached::Mysql(conn) => mysql_run(conn, &self.transport, &self.engine, sql, limit, cancel, self.sink.as_ref(), index).await,
-            Attached::Postgres(client) => postgres_run(client, &self.engine, sql, limit, cancel, self.sink.as_ref(), index).await,
-            Attached::Sqlserver(client) => sqlserver_run(client, &self.engine, sql, limit, cancel, self.sink.as_ref(), index).await,
+        let sink = PauseClock { inner: self.sink.as_ref(), paused: &self.paused_micros };
+        let result: Result<StatementValue, Failure> = match &mut *attached {
+            Attached::Scripted => Err(Failure::from("这个连接没有连着可查询的数据库".to_owned())),
+            Attached::Sqlite(pool) => sqlite_run(pool, &self.engine, sql, limit, cancel, &sink, index).await.map_err(Failure::from),
+            Attached::Mysql(conn) => mysql_run(conn, &self.transport, &self.engine, sql, limit, cancel, &sink, index)
+                .await
+                .map_err(|message| Failure { at: mysql_error_line(&message).map(ErrorAt::Line), message }),
+            Attached::Postgres(client) => postgres_run(client, &self.engine, sql, limit, cancel, &sink, index).await,
+            Attached::Sqlserver(client) => sqlserver_run(client, &self.engine, sql, limit, cancel, &sink, index).await,
         };
         // 成功语句刷新空闲计时；断线类错误挂起 suspect 标记，交轮询探活确认（R4）。
         // 语句超时的报错同样带 timeout 字样，不算断线。
         match &result {
             Ok(_) => self.transport.note_activity(),
-            Err(message) => {
-                if is_disconnect(message) && !is_statement_timeout(message) {
+            Err(failure) => {
+                if is_disconnect(&failure.message) && !is_statement_timeout(&failure.message) {
                     self.transport.note_disconnect();
                 }
             }
         }
-        result.map_err(|message| classify_failure(sql, message, cancel.load(Ordering::SeqCst)))
+        result.map_err(|failure| match classify_failure(sql, failure.message, cancel.load(Ordering::SeqCst)) {
+            StatementStop::Error { message, .. } => StatementStop::Error { message, at: failure.at },
+            other => other,
+        })
+    }
+
+    fn paused(&self) -> Duration {
+        Duration::from_micros(self.paused_micros.load(Ordering::SeqCst))
     }
 }
 
@@ -627,11 +794,11 @@ async fn sqlserver_run(
     cancel: &Arc<AtomicBool>,
     sink: &dyn RowSink,
     index: usize,
-) -> Result<StatementValue, String> {
+) -> Result<StatementValue, Failure> {
     let bounded = cap_result_sql(engine, sql, limit);
     let mut locked = client.lock().await;
     if !sqlserver_wants_rows(&bounded) {
-        let done = locked.execute(bounded, &[]).await.map_err(|err| err.to_string())?;
+        let done = locked.execute(bounded, &[]).await.map_err(|err| tds_failure(&err))?;
         let value = StatementValue {
             columns: Vec::new(),
             column_types: Vec::new(),
@@ -642,14 +809,14 @@ async fn sqlserver_run(
         sink.publish(index, &value).await;
         return Ok(value);
     }
-    let mut stream = locked.simple_query(bounded).await.map_err(|err| err.to_string())?;
+    let mut stream = locked.simple_query(bounded).await.map_err(|err| tds_failure(&err))?;
     let mut columns: Vec<String> = Vec::new();
     let mut column_types: Vec<String> = Vec::new();
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
     let mut truncated = false;
     {
         use futures::TryStreamExt;
-        while let Some(item) = stream.try_next().await.map_err(|err| err.to_string())? {
+        while let Some(item) = stream.try_next().await.map_err(|err| tds_failure(&err))? {
             if let Some(meta) = item.as_metadata() {
                 if columns.is_empty() {
                     columns = meta.columns().iter().map(|column| column.name().to_owned()).collect();
@@ -686,7 +853,7 @@ async fn sqlserver_run(
         sink.publish(index, &value).await;
         return Ok(value);
     }
-    reveal_rows(sink, index, columns, column_types, rows, truncated, None, limit, cancel).await
+    reveal_rows(sink, index, columns, column_types, rows, truncated, None, limit, cancel).await.map_err(Failure::from)
 }
 
 /// SHOWPLAN 批次判定：以 SET SHOWPLAN_ALL 开头的语句即使整批到达也按收行路径执行。
@@ -1249,7 +1416,7 @@ async fn postgres_run(
     cancel: &Arc<AtomicBool>,
     sink: &dyn RowSink,
     index: usize,
-) -> Result<StatementValue, String> {
+) -> Result<StatementValue, Failure> {
     let bounded = cap_result_sql(engine, sql, limit);
     let prepared = match client.prepare(&bounded).await {
         Ok(statement) => {
@@ -1260,7 +1427,7 @@ async fn postgres_run(
         }
         Err(_) => None,
     };
-    let messages = client.simple_query(&bounded).await.map_err(|err| err.to_string())?;
+    let messages = client.simple_query(&bounded).await.map_err(|err| pg_failure(&err, &bounded, sql))?;
     let mut columns = prepared.as_ref().map(|item| item.0.clone()).unwrap_or_default();
     let mut types = prepared.as_ref().map(|item| item.1.clone()).unwrap_or_default();
     let mut rows = Vec::new();
@@ -1268,7 +1435,7 @@ async fn postgres_run(
     let mut truncated = false;
     for message in messages {
         if cancel.load(Ordering::SeqCst) {
-            return Err("已取消".to_owned());
+            return Err(Failure::from("已取消".to_owned()));
         }
         match message {
             tokio_postgres::SimpleQueryMessage::RowDescription(description) => {
@@ -1311,7 +1478,7 @@ async fn postgres_run(
     if types.is_empty() {
         types = vec!["类型未知".to_owned(); columns.len()];
     }
-    reveal_rows(sink, index, columns, types, rows, truncated, None, limit, cancel).await
+    reveal_rows(sink, index, columns, types, rows, truncated, None, limit, cancel).await.map_err(Failure::from)
 }
 
 /// SQL Server 的执行计划批次：SET SHOWPLAN_ALL ON 后服务器只编译不执行，读完行集再关掉。

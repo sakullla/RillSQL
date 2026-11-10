@@ -7,7 +7,7 @@ use sqlx::Row as _;
 use crate::catalog::hierarchy::{ColumnInfo, IndexInfo};
 use crate::catalog::model::Engine;
 use crate::connections::CatalogSession;
-use crate::query::assist::quote_ident;
+use crate::query::assist::{quote_ident, ColumnMeta};
 
 /// SQL 字面量：单引号翻倍。目录读取只接受已读到的名字，这里仍然转义，
 /// 避免对象名里的引号跑出语句。
@@ -36,20 +36,46 @@ fn qualified(engine: Engine, database: &str, schema: &str, table: &str) -> Strin
     }
 }
 
-/// 列查询。SQLite 走 PRAGMA，其余引擎走 information_schema 的位置列。
+/// 列查询。SQLite 走 PRAGMA，其余引擎走 information_schema 的位置列：
+/// name, type, nullable, default, comment。注释用左连接读，读不到就是 NULL，不影响列本身。
 pub fn columns_sql(engine: Engine, database: &str, schema: &str, table: &str) -> Option<String> {
     match engine {
         Engine::Redis | Engine::Mongodb => None,
         Engine::Sqlite => Some(format!("PRAGMA table_info({})", quote_ident("sqlite", table))),
-        Engine::Postgres | Engine::Sqlserver => Some(format!(
-            "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = {} AND table_name = {} ORDER BY ordinal_position",
+        Engine::Postgres => Some(format!(
+            "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, d.description FROM information_schema.columns c LEFT JOIN pg_catalog.pg_namespace n ON n.nspname = c.table_schema LEFT JOIN pg_catalog.pg_class t ON t.relnamespace = n.oid AND t.relname = c.table_name LEFT JOIN pg_catalog.pg_description d ON d.objoid = t.oid AND d.classoid = 'pg_catalog.pg_class'::regclass AND d.objsubid = c.ordinal_position::int WHERE c.table_schema = {} AND c.table_name = {} ORDER BY c.ordinal_position",
+            literal(schema),
+            literal(table)
+        )),
+        Engine::Sqlserver => Some(format!(
+            "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, CAST(ep.value AS nvarchar(4000)) FROM information_schema.columns c LEFT JOIN sys.extended_properties ep ON ep.class = 1 AND ep.name = 'MS_Description' AND ep.major_id = OBJECT_ID(QUOTENAME(c.table_schema) + '.' + QUOTENAME(c.table_name)) AND ep.minor_id = COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.table_schema) + '.' + QUOTENAME(c.table_name)), c.column_name, 'ColumnId') WHERE c.table_schema = {} AND c.table_name = {} ORDER BY c.ordinal_position",
             literal(schema),
             literal(table)
         )),
         Engine::Mysql | Engine::Mariadb => Some(format!(
-            "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = {} AND table_name = {} ORDER BY ordinal_position",
+            "SELECT column_name, data_type, is_nullable, column_default, column_comment FROM information_schema.columns WHERE table_schema = {} AND table_name = {} ORDER BY ordinal_position",
             literal(database),
             literal(table)
+        )),
+    }
+}
+
+/// 一个库/模式里表和视图的注释：(name, comment)，只列有注释的对象。SQLite 和非关系引擎没有注释。
+/// MySQL 视图的 table_comment 固定是 VIEW，不是注释，排除掉。
+pub fn table_comments_sql(engine: Engine, database: &str, schema: &str) -> Option<String> {
+    match engine {
+        Engine::Redis | Engine::Mongodb | Engine::Sqlite => None,
+        Engine::Postgres => Some(format!(
+            "SELECT t.relname, d.description FROM pg_catalog.pg_class t JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace JOIN pg_catalog.pg_description d ON d.objoid = t.oid AND d.classoid = 'pg_catalog.pg_class'::regclass AND d.objsubid = 0 WHERE n.nspname = {} AND t.relkind IN ('r', 'p', 'v', 'm', 'f') ORDER BY t.relname",
+            literal(schema)
+        )),
+        Engine::Sqlserver => Some(format!(
+            "SELECT o.name, CAST(ep.value AS nvarchar(4000)) FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id JOIN sys.extended_properties ep ON ep.class = 1 AND ep.major_id = o.object_id AND ep.minor_id = 0 AND ep.name = 'MS_Description' WHERE s.name = {} AND o.type IN ('U', 'V') ORDER BY o.name",
+            literal(schema)
+        )),
+        Engine::Mysql | Engine::Mariadb => Some(format!(
+            "SELECT table_name, table_comment FROM information_schema.tables WHERE table_schema = {} AND table_type <> 'VIEW' AND table_comment <> '' ORDER BY table_name",
+            literal(database)
         )),
     }
 }
@@ -128,6 +154,42 @@ pub fn columns_from_rows(engine: Engine, rows: &[Vec<Option<String>>]) -> Vec<Co
         });
     }
     columns
+}
+
+/// 补全和悬停用的列元数据：在 columns_from_rows 的位置约定上再取注释（第 5 列）。
+/// SQLite 没有列注释；读不到的类型和注释留空，不编造。
+pub fn column_meta_from_rows(engine: Engine, rows: &[Vec<Option<String>>]) -> Vec<ColumnMeta> {
+    let mut columns = Vec::new();
+    for index in 0..rows.len() {
+        let (name, type_name, nullable, comment) = match engine {
+            Engine::Sqlite => {
+                let notnull = cell(rows, index, 3);
+                let nullable = match notnull.trim() {
+                    "" => None,
+                    flag => Some(flag != "1"),
+                };
+                (cell(rows, index, 1), cell(rows, index, 2), nullable, String::new())
+            }
+            _ => {
+                let flag = cell(rows, index, 2);
+                let nullable = if flag.trim().is_empty() { None } else { Some(yes(&flag)) };
+                (cell(rows, index, 0), cell(rows, index, 1), nullable, cell(rows, index, 4))
+            }
+        };
+        if name.is_empty() {
+            continue;
+        }
+        columns.push(ColumnMeta { name, type_name, nullable, comment });
+    }
+    columns
+}
+
+/// (name, comment) 行收成对照表；名字或注释为空的行跳过。
+pub fn comments_from_rows(rows: &[Vec<Option<String>>]) -> Vec<(String, String)> {
+    (0..rows.len())
+        .map(|index| (cell(rows, index, 0), cell(rows, index, 1)))
+        .filter(|(name, comment)| !name.is_empty() && !comment.trim().is_empty())
+        .collect()
 }
 
 pub fn apply_primary_key(columns: &mut [ColumnInfo], rows: &[Vec<Option<String>>]) {
@@ -327,6 +389,30 @@ pub async fn read_column_names(
     Ok(columns_from_rows(engine, &rows).into_iter().map(|column| column.name).filter(|name| !name.is_empty()).collect())
 }
 
+/// 读一个表的列元数据（名字、类型、可空、注释），供补全详情、悬停和对象信息使用。
+pub async fn read_column_meta(
+    session: &CatalogSession,
+    engine: Engine,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<ColumnMeta>, String> {
+    let Some(sql) = columns_sql(engine, database, schema, table) else {
+        return Err("这个引擎没有列清单".to_owned());
+    };
+    let rows = rows_for(session, &sql).await?;
+    Ok(column_meta_from_rows(engine, &rows))
+}
+
+/// 读一个库/模式里对象的注释。没有注释来源的引擎返回空表，不是失败。
+pub async fn read_table_comments(session: &CatalogSession, engine: Engine, database: &str, schema: &str) -> Result<Vec<(String, String)>, String> {
+    let Some(sql) = table_comments_sql(engine, database, schema) else {
+        return Ok(Vec::new());
+    };
+    let rows = rows_for(session, &sql).await?;
+    Ok(comments_from_rows(&rows))
+}
+
 /// 读一个对象的列与索引。两边分别成败：列失败不影响索引结果；
 /// 两者都不碰同级的其它节点。
 pub async fn read_object_details(
@@ -413,6 +499,58 @@ mod tests {
         apply_primary_key(&mut columns, &[vec![Some("id".to_owned())]]);
         assert!(columns[0].primary);
         assert!(!columns[1].primary);
+    }
+
+    #[test]
+    fn column_meta_reads_type_nullability_and_comment_without_inventing_any() {
+        let rows = vec![
+            vec![Some("id".to_owned()), Some("integer".to_owned()), Some("NO".to_owned()), None, Some("主键".to_owned())],
+            vec![Some("note".to_owned()), Some("text".to_owned()), Some("YES".to_owned()), None, None],
+            vec![Some("legacy".to_owned()), None, None, None],
+        ];
+        let meta = column_meta_from_rows(Engine::Postgres, &rows);
+        assert_eq!(meta.len(), 3);
+        assert_eq!(
+            meta[0],
+            ColumnMeta { name: "id".to_owned(), type_name: "integer".to_owned(), nullable: Some(false), comment: "主键".to_owned() }
+        );
+        assert_eq!(meta[1].nullable, Some(true));
+        assert!(meta[1].comment.is_empty(), "没有注释就留空");
+        assert_eq!(meta[2], ColumnMeta::named("legacy"), "读不到的类型和可空不编造");
+
+        let sqlite = vec![vec![
+            Some("0".to_owned()),
+            Some("body".to_owned()),
+            Some("TEXT".to_owned()),
+            Some("1".to_owned()),
+            None,
+            Some("0".to_owned()),
+        ]];
+        let meta = column_meta_from_rows(Engine::Sqlite, &sqlite);
+        assert_eq!(meta[0].type_name, "TEXT");
+        assert_eq!(meta[0].nullable, Some(false));
+        assert!(meta[0].comment.is_empty(), "SQLite 没有列注释");
+    }
+
+    #[test]
+    fn column_and_table_comments_come_from_each_engine_catalog() {
+        let pg = columns_sql(Engine::Postgres, "shop", "public", "orders").unwrap();
+        assert!(pg.contains("pg_description"), "{pg}");
+        assert!(pg.contains("LEFT JOIN"), "注释读不到也要有列：{pg}");
+        let my = columns_sql(Engine::Mysql, "shop", "", "orders").unwrap();
+        assert!(my.contains("column_comment"), "{my}");
+        let ms = columns_sql(Engine::Sqlserver, "shop", "dbo", "orders").unwrap();
+        assert!(ms.contains("MS_Description") && ms.contains("LEFT JOIN"), "{ms}");
+        assert!(table_comments_sql(Engine::Sqlite, "main", "").is_none());
+        assert!(table_comments_sql(Engine::Redis, "0", "").is_none());
+        let tables = table_comments_sql(Engine::Mysql, "sh'op", "").unwrap();
+        assert!(tables.contains("'sh''op'") && tables.contains("table_type <> 'VIEW'"), "{tables}");
+        let rows = vec![
+            vec![Some("orders".to_owned()), Some("订单".to_owned())],
+            vec![Some("blank".to_owned()), Some(" ".to_owned())],
+            vec![None, Some("x".to_owned())],
+        ];
+        assert_eq!(comments_from_rows(&rows), vec![("orders".to_owned(), "订单".to_owned())]);
     }
 
     #[test]

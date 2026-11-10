@@ -232,7 +232,7 @@ fn statement_timeouts_report_as_error_instead_of_unknown() {
     ] {
         let stop = classify_failure("UPDATE t SET n = 1", message.to_owned(), false);
         match stop {
-            StatementStop::Error { message: text } => assert!(text.starts_with("执行超时，语句已停止。"), "{text}"),
+            StatementStop::Error { message: text, .. } => assert!(text.starts_with("执行超时，语句已停止。"), "{text}"),
             other => panic!("语句超时不能落到 {other:?}：{message}"),
         }
     }
@@ -373,6 +373,8 @@ fn a_late_result_stays_on_its_own_tab_instead_of_the_active_one() {
             rows: vec![vec![Some("1".to_owned())]],
             truncated: false,
             affected: None,
+            elapsed_ms: None,
+            error_at: None,
         }],
         started_at: String::new(),
         elapsed_ms: 1,
@@ -1378,4 +1380,189 @@ fn tsql_split_handles_bracket_identifiers_try_catch_and_go_batches() {
     // 语句之间裸 GO 且无分号：GO 前的语句在 GO 行收束。
     let no_semi = split::split_sql("sqlserver", "UPDATE t SET n = 1\nGO\nUPDATE u SET m = 2\nGO");
     assert_eq!(no_semi.pieces.len(), 2, "{no_semi:?}");
+}
+
+struct Pausing {
+    paused: Mutex<Duration>,
+}
+
+#[async_trait::async_trait]
+impl StatementDriver for Pausing {
+    async fn run(&self, _sql: &str, _limit: usize, _cancel: &Arc<AtomicBool>) -> Result<StatementValue, StatementStop> {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        *self.paused.lock().expect("paused") += Duration::from_millis(60);
+        Ok(ok_count())
+    }
+
+    fn paused(&self) -> Duration {
+        *self.paused.lock().expect("paused")
+    }
+}
+
+#[tokio::test]
+async fn each_statement_reports_its_own_elapsed_time_and_error_position() {
+    let driver = Scripted {
+        steps: Mutex::new(vec![
+            Ok(ok_count()),
+            Err(StatementStop::Error { message: "syntax error".to_owned(), at: Some(exec::ErrorAt::Line(2)) }),
+            Ok(ok_count()),
+        ]),
+        calls: Mutex::new(Vec::new()),
+    };
+    let flag = Arc::new(AtomicBool::new(false));
+    let parts = vec![piece("INSERT INTO t VALUES (1)"), piece("SELECT\nnope"), piece("DELETE FROM t")];
+    let report = run_batch(&parts, 100, &flag, false, &driver).await;
+    assert!(report.statements[0].elapsed_ms.is_some_and(|ms| ms >= 1), "执行过的语句至少 1 ms");
+    assert!(report.statements[0].error_at.is_none());
+    assert_eq!(report.statements[1].status, "error");
+    assert!(report.statements[1].elapsed_ms.is_some(), "失败的语句也执行过");
+    assert_eq!(report.statements[1].error_at, Some(exec::ErrorAt::Line(2)));
+    assert_eq!(report.statements[2].status, "skipped");
+    assert_eq!(report.statements[2].elapsed_ms, None, "没有执行的语句没有耗时");
+
+    let cancelled = Scripted {
+        steps: Mutex::new(vec![Err(StatementStop::Cancelled { message: "canceling statement due to user request".to_owned() })]),
+        calls: Mutex::new(Vec::new()),
+    };
+    let report = run_batch(&[piece("SELECT pg_sleep(10)")], 100, &flag, false, &cancelled).await;
+    assert_eq!(report.statements[0].status, "cancelled");
+    assert_eq!(report.statements[0].elapsed_ms, None, "取消的语句只标已取消，不给耗时");
+
+    let waiting = Pausing { paused: Mutex::new(Duration::ZERO) };
+    let report = run_batch(&[piece("SELECT 1")], 100, &flag, false, &waiting).await;
+    let spent = report.statements[0].elapsed_ms.expect("执行过");
+    assert!(spent < 50, "等待继续读取的时间不算进耗时：{spent} ms");
+}
+
+#[test]
+fn error_positions_are_parsed_per_driver() {
+    // PostgreSQL：position 从 1 开始按字符计数，换成语句内的字符偏移；越界停在末尾。
+    assert_eq!(exec::pg_error_char(8, "SELECT nope FROM t"), Some(7));
+    assert_eq!(exec::pg_error_char(1, "SELECT"), Some(0));
+    assert_eq!(exec::pg_error_char(3, "选择 x"), Some(2), "按字符而不是字节");
+    assert_eq!(exec::pg_error_char(99, "SELECT"), Some(6));
+    assert_eq!(exec::pg_error_char(0, "SELECT"), None);
+    // MySQL / MariaDB：从文本里取 "at line N"。
+    let mysql = "ERROR 1064 (42000): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'FORM t' at line 2";
+    assert_eq!(exec::mysql_error_line(mysql), Some(2));
+    assert_eq!(exec::mysql_error_line("Table 'shop.t' doesn't exist"), None);
+    assert_eq!(exec::mysql_error_line("near 'x' at line 0"), None);
+    // SQL Server：服务器错误的行号，0 表示没有。
+    assert_eq!(exec::sqlserver_error_line(3), Some(3));
+    assert_eq!(exec::sqlserver_error_line(0), None);
+    // 执行前追加的 LIMIT 不影响原文里的位置。
+    let original = "SELECT nope FROM t";
+    let sent = "SELECT nope FROM t LIMIT 101";
+    assert_eq!(exec::map_rewritten_char(original, sent, 7), 7);
+    assert_eq!(exec::map_rewritten_char(original, sent, 25), original.chars().count());
+    let original = "SELECT a FROM t LIMIT 5000 OFFSET bad";
+    let sent = "SELECT a FROM t LIMIT 101 OFFSET bad";
+    assert_eq!(exec::map_rewritten_char(original, sent, sent.find("bad").unwrap()), original.find("bad").unwrap());
+}
+
+#[tokio::test]
+async fn real_sqlite_statements_carry_elapsed_time_and_no_error_position() {
+    use super::commands::{request_cancel, start_run, QueryState};
+
+    let dir = std::env::temp_dir().join(format!("rillsql-elapsed-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let service = notes_service(&dir).await;
+    let state = QueryState::new(dir.join("history.sqlite"));
+    let started = start_run(&service, &state, run_request("INSERT INTO t (id, name) VALUES (1, 'a');\nSELECT id, name FROM t;\nSELECT nope FROM t;", "main"))
+        .await
+        .unwrap();
+    assert!(started.statements.iter().all(|statement| statement.elapsed_ms.is_none()), "还没执行时没有耗时");
+    let finished = wait_done(&state, &started.id).await;
+    assert_eq!(finished.statements[1].status, "ok");
+    for statement in &finished.statements {
+        assert!(statement.elapsed_ms.is_some_and(|ms| ms > 0), "{:?}", statement.elapsed_ms);
+    }
+    assert_eq!(finished.statements[2].status, "error");
+    assert_eq!(finished.statements[2].error_at, None, "SQLite 不给位置");
+
+    let slow = start_run(
+        &service,
+        &state,
+        run_request("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 5000000) SELECT sum(x) FROM c", "main"),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    request_cancel(&service, &state, &slow.id).await.unwrap();
+    let ended = wait_done(&state, &slow.id).await;
+    assert_eq!(ended.status, "cancelled");
+    assert_eq!(ended.statements[0].status, "cancelled");
+    assert_eq!(ended.statements[0].elapsed_ms, None, "取消的语句不给耗时");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn desk_maps_statement_errors_to_document_offsets_and_lines() {
+    use crate::application::tasks::TaskBoard;
+    use crate::query::assist::RunScope;
+    use crate::query::commands::{RunDto, StatementDto};
+    use crate::query::desk::{error_mark, BeginRun, Desk, ErrorMark, Target, Ticket};
+
+    // 纯换算：字符偏移 → 字节偏移；行号加上语句起点所在行，且不越过语句最后一行；没有位置就整条语句。
+    let draft = "SELECT 1;\nSELECT 'é', nope\n  FROM t;";
+    let start = draft.find("SELECT 'é'").unwrap();
+    let range = (start, draft.len());
+    assert_eq!(error_mark(draft, range, Some(exec::ErrorAt::Char(12))), ErrorMark::Offset(draft.find("nope").unwrap()));
+    assert_eq!(error_mark(draft, range, Some(exec::ErrorAt::Line(2))), ErrorMark::Line(2));
+    assert_eq!(error_mark(draft, range, Some(exec::ErrorAt::Line(9))), ErrorMark::Line(2), "不越过语句最后一行");
+    assert_eq!(error_mark(draft, range, None), ErrorMark::Statement);
+
+    let tasks = TaskBoard::new();
+    let mut desk = Desk::new();
+    let target = Target {
+        connection_id: "notes".to_owned(),
+        connection_name: "笔记".to_owned(),
+        database: "main".to_owned(),
+        engine: "sqlite".to_owned(),
+        schema: String::new(),
+        environment: String::new(),
+    };
+    desk.import_tab("a", draft, Some(target));
+    desk.focus_tab(Some("a"));
+    let BeginRun::Ready(prepared) = desk.begin_run(&tasks, RunScope::Script, None) else {
+        panic!("应开始执行");
+    };
+    let ticket = Ticket { tab_id: prepared.tab_id.clone(), token: prepared.token, version: prepared.version };
+    let statement = |sql: &str, status: &str, at: Option<exec::ErrorAt>| StatementDto {
+        sql: sql.to_owned(),
+        status: status.to_owned(),
+        message: String::new(),
+        columns: Vec::new(),
+        column_types: Vec::new(),
+        rows: Vec::new(),
+        truncated: false,
+        affected: None,
+        elapsed_ms: Some(3),
+        error_at: at,
+    };
+    let run = RunDto {
+        id: "run".to_owned(),
+        connection_id: "notes".to_owned(),
+        connection_name: "笔记".to_owned(),
+        database: "main".to_owned(),
+        engine: "sqlite".to_owned(),
+        status: "error".to_owned(),
+        cancel: String::new(),
+        cancel_message: String::new(),
+        via_ssh: false,
+        fresh_channel: false,
+        statements: vec![
+            statement("SELECT 1;", "ok", None),
+            statement("SELECT 'é', nope\n  FROM t;", "error", Some(exec::ErrorAt::Line(2))),
+        ],
+        started_at: String::new(),
+        elapsed_ms: 6,
+    };
+    desk.finish_polled(&tasks, &ticket, Ok(run), "已取消");
+    let results = desk.results();
+    assert_eq!(results[0].range, Some((0, "SELECT 1;".len())));
+    assert_eq!(results[0].error_mark, None, "成功的语句没有错误标记");
+    assert_eq!(results[0].elapsed_ms, Some(3));
+    assert_eq!(results[1].range, Some(range));
+    assert_eq!(results[1].error_mark, Some(ErrorMark::Line(2)));
 }

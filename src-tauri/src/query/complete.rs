@@ -9,8 +9,10 @@ use std::collections::{HashMap, HashSet};
 use crate::i18n::{self, Locale};
 
 use super::assist::{
-    dialect_words, known_engine, quote_ident, CatalogObject, CompletionEntry, CompletionScope, CompletionSource, MetadataState,
+    dialect_words, known_engine, quote_ident, CatalogObject, ColumnMeta, CompletionEntry, CompletionScope, CompletionSource, EntryInfo,
+    MetadataState,
 };
+use super::functions;
 
 /// 只回看这么多字节找当前语句；更长的语句用窗口起点兜底，解析仍然可用。
 const WINDOW: usize = 8 * 1024;
@@ -95,6 +97,8 @@ pub struct Candidate {
     /// 分组顺序来自子句场景，见 group 模块。
     pub group: u8,
     pub keyword: bool,
+    /// 结构化说明（列元数据、对象、函数签名）；关键字、片段等没有。
+    pub info: Option<EntryInfo>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -116,6 +120,7 @@ impl Plan {
                 kind: item.kind.to_owned(),
                 detail: Some(item.detail.clone()),
                 insert: item.insert.clone(),
+                info: item.info.clone(),
             })
             .collect()
     }
@@ -134,11 +139,15 @@ mod group {
     pub const SNIPPET: u8 = 8;
 }
 
+/// 词法记号。text 是引用标识符去掉引号后的名字；start/end 是原文里的字节范围（含引号）。
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Tok {
-    text: String,
-    word: bool,
-    start: usize,
+pub(crate) struct Tok {
+    pub(crate) text: String,
+    pub(crate) word: bool,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    /// 带引号（"x"、`x`、[x]）的标识符：不会是关键字或函数名。
+    pub(crate) quoted: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -228,14 +237,14 @@ fn lex(text: &str) -> (Vec<Tok>, Lexed) {
             let raw = &text[at + 1..end - 1];
             let doubled = format!("{quote}{quote}");
             let name = raw.replace(&doubled, &quote.to_string());
-            out.push(Tok { text: name, word: true, start: at });
+            out.push(Tok { text: name, word: true, start: at, end, quoted: true });
             at = end;
             continue;
         }
         if ch == '[' {
             match text[at + 1..].find(']') {
                 Some(found) => {
-                    out.push(Tok { text: text[at + 1..at + 1 + found].to_owned(), word: true, start: at });
+                    out.push(Tok { text: text[at + 1..at + 1 + found].to_owned(), word: true, start: at, end: at + 1 + found + 1, quoted: true });
                     at = at + 1 + found + 1;
                 }
                 None => {
@@ -268,12 +277,12 @@ fn lex(text: &str) -> (Vec<Tok>, Lexed) {
                 }
                 break;
             }
-            out.push(Tok { text: text[at..end].to_owned(), word: true, start: at });
+            out.push(Tok { text: text[at..end].to_owned(), word: true, start: at, end, quoted: false });
             at = end;
             continue;
         }
         if matches!(ch, '.' | ',' | '(' | ')' | ';') {
-            out.push(Tok { text: ch.to_string(), word: false, start: at });
+            out.push(Tok { text: ch.to_string(), word: false, start: at, end: at + 1, quoted: false });
             if ch == ';' {
                 info.last_mark = Some(at);
             }
@@ -345,6 +354,13 @@ fn reserved(word: &str) -> bool {
 
 /// 解析当前语句：子句、FROM/JOIN 来源与别名、WITH 定义的 CTE、UPDATE/INSERT 目标。
 pub fn parse_scope(statement: &str) -> StatementScope {
+    let (mut scope, depth) = scan_scope(statement);
+    scope.tables.retain(|table| table.depth <= depth);
+    scope
+}
+
+/// 与 parse_scope 相同，但保留所有括号层的来源，并返回文本末尾所在的括号深度。
+fn scan_scope(statement: &str) -> (StatementScope, usize) {
     let (tokens, _) = lex(statement);
     let mut scope = StatementScope::default();
     let mut depth = 0usize;
@@ -389,8 +405,54 @@ pub fn parse_scope(statement: &str) -> StatementScope {
         }
         index += 1;
     }
-    scope.tables.retain(|table| table.depth <= depth);
-    scope
+    (scope, depth)
+}
+
+/// 词法记号和“光标落在未闭合的字符串/引用/注释里”标志；签名提示等纯计算复用同一套词法。
+pub(crate) fn tokens(text: &str) -> (Vec<Tok>, bool) {
+    let (tokens, info) = lex(text);
+    (tokens, info.open)
+}
+
+/// 光标所在语句的起点：往回最近一个语句分隔符之后；字符串和注释里的分号不算。
+pub(crate) fn statement_start(text: &str, cursor: usize) -> usize {
+    let end = floor_boundary(text, cursor);
+    let window_start = floor_boundary(text, end.saturating_sub(WINDOW));
+    let (_, head) = lex(&text[window_start..end]);
+    head.last_mark.map(|at| window_start + at + 1).unwrap_or(window_start)
+}
+
+/// 光标所在语句的终点：往后第一个语句分隔符（不含），没有就是窗口末尾或全文末尾。
+fn statement_end(text: &str, from: usize) -> usize {
+    let from = floor_boundary(text, from);
+    let window_end = floor_boundary(text, from.saturating_add(WINDOW));
+    let (tokens, _) = lex(&text[from..window_end]);
+    tokens
+        .iter()
+        .find(|token| !token.word && token.text == ";")
+        .map(|token| from + token.start)
+        .unwrap_or(window_end)
+}
+
+/// 光标之后、同一层括号里的来源（如 `SELECT | FROM orders`）。离开光标所在括号就停下，
+/// 后面并列子查询里的来源不算进来。
+fn tail_tables(tail: &str) -> Vec<TableRef> {
+    let (tokens, _) = lex(tail);
+    let mut depth = 0usize;
+    let mut cut = tail.len();
+    for token in tokens.iter().filter(|token| !token.word) {
+        match token.text.as_str() {
+            "(" => depth += 1,
+            ")" if depth == 0 => {
+                cut = token.start;
+                break;
+            }
+            ")" => depth -= 1,
+            _ => {}
+        }
+    }
+    let (scope, _) = scan_scope(&tail[..cut]);
+    scope.tables.into_iter().filter(|table| table.depth == 0).collect()
 }
 
 fn read_target(tokens: &[Tok], start: usize, depth: usize) -> (Option<TableRef>, usize) {
@@ -548,7 +610,7 @@ struct Source {
     name: String,
     /// 来源所在模式；解析不到时为空。外键匹配按它区分同名表。
     schema: String,
-    columns: Vec<String>,
+    columns: Vec<ColumnMeta>,
 }
 
 fn source_columns<'a>(scope: &'a CompletionScope, table: &TableRef) -> Option<&'a CompletionSource> {
@@ -689,83 +751,6 @@ fn kind_key(kind: &str) -> &'static str {
     }
 }
 
-fn function_signature(name: &str) -> Option<&'static str> {
-    Some(match name.to_ascii_lowercase().as_str() {
-        "count" => "count(expr) → bigint",
-        "sum" => "sum(expr) → numeric",
-        "avg" => "avg(expr) → numeric",
-        "min" => "min(expr) → same",
-        "max" => "max(expr) → same",
-        "coalesce" => "coalesce(v1, v2, …) → value",
-        "nullif" => "nullif(a, b) → value",
-        "concat" => "concat(s1, s2, …) → text",
-        "length" => "length(text) → int",
-        "lower" => "lower(text) → text",
-        "upper" => "upper(text) → text",
-        "substring" => "substring(text, start, len) → text",
-        "trim" => "trim(text) → text",
-        "replace" => "replace(text, from, to) → text",
-        "round" => "round(value, digits) → numeric",
-        "floor" => "floor(value) → numeric",
-        "ceil" => "ceil(value) → numeric",
-        "abs" => "abs(value) → numeric",
-        "now" => "now() → timestamp",
-        "current_date" => "current_date → date",
-        "cast" => "cast(expr as type) → type",
-        "row_number" => "row_number() over (…) → bigint",
-        "rank" => "rank() over (…) → bigint",
-        "lag" => "lag(expr, offset) over (…) → value",
-        "lead" => "lead(expr, offset) over (…) → value",
-        "date_trunc" => "date_trunc(unit, value) → timestamp",
-        "extract" => "extract(field from value) → numeric",
-        "to_char" => "to_char(value, format) → text",
-        "date_part" => "date_part(field, value) → double",
-        "generate_series" => "generate_series(from, to, step) → set",
-        "array_agg" => "array_agg(expr) → array",
-        "string_agg" => "string_agg(expr, sep) → text",
-        "jsonb_build_object" => "jsonb_build_object(key, value, …) → jsonb",
-        "jsonb_agg" => "jsonb_agg(expr) → jsonb",
-        "make_interval" => "make_interval(days, hours, …) → interval",
-        "date_format" => "date_format(value, format) → text",
-        "ifnull" => "ifnull(a, b) → value",
-        "group_concat" => "group_concat(expr, sep) → text",
-        "json_extract" => "json_extract(json, path) → value",
-        "date_add" => "date_add(value, interval) → timestamp",
-        "datediff" => "datediff(a, b) → int",
-        "strftime" => "strftime(format, time, modifier) → text",
-        "datetime" => "datetime(time, modifier) → text",
-        "unixepoch" => "unixepoch(time) → integer",
-        "json_group_array" => "json_group_array(value) → text",
-        _ => return None,
-    })
-}
-
-fn functions(engine: &str) -> Vec<&'static str> {
-    let mut list = vec![
-        "count", "sum", "avg", "min", "max", "coalesce", "nullif", "concat", "length", "lower", "upper", "substring", "trim",
-        "replace", "round", "floor", "ceil", "abs", "now", "current_date", "cast", "row_number", "rank", "lag", "lead",
-    ];
-    match engine {
-        "sqlite" => list.extend(["strftime", "datetime", "unixepoch", "json_extract", "json_group_array"]),
-        "mysql" | "mariadb" => list.extend(["date_format", "ifnull", "group_concat", "json_extract", "date_add", "datediff"]),
-        _ => list.extend([
-            "string_agg",
-            "date_trunc",
-            "extract",
-            "to_char",
-            "date_part",
-            "generate_series",
-            "array_agg",
-            "jsonb_build_object",
-            "jsonb_agg",
-            "make_interval",
-        ]),
-    }
-    list.sort_unstable();
-    list.dedup();
-    list
-}
-
 const SNIPPETS: &[(&str, &str)] = &[
     ("select-from", "SELECT  FROM "),
     ("join-on", "JOIN  ON "),
@@ -796,6 +781,20 @@ impl<'a> Gather<'a> {
     }
 
     fn push(&mut self, label: String, insert: String, kind: &'static str, detail: String, group: u8, keyword: bool) {
+        self.push_info(label, insert, kind, detail, group, keyword, None);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_info(
+        &mut self,
+        label: String,
+        insert: String,
+        kind: &'static str,
+        detail: String,
+        group: u8,
+        keyword: bool,
+        info: Option<EntryInfo>,
+    ) {
         let cap = match group {
             group::CONDITION => 10,
             group::SNIPPET => 6,
@@ -809,7 +808,7 @@ impl<'a> Gather<'a> {
             return;
         }
         self.order += 1;
-        self.items.push((self.order, Candidate { label, insert, kind, detail, group, keyword }));
+        self.items.push((self.order, Candidate { label, insert, kind, detail, group, keyword, info }));
     }
 
     fn note(&self, key: &str) -> String {
@@ -827,19 +826,26 @@ impl<'a> Gather<'a> {
         let schema = if with_schema { object.schema.as_str() } else { "" };
         let label = if schema.is_empty() { object.name.clone() } else { format!("{}.{}", schema, object.name) };
         let insert = qualified_ident(self.engine, schema, &object.name);
-        self.push(label, insert, static_kind(&object.kind), detail, group::OBJECT, false);
+        let info = EntryInfo::Object {
+            schema: object.schema.clone(),
+            name: object.name.clone(),
+            kind: object.kind.clone(),
+            comment: object.comment.clone(),
+        };
+        self.push_info(label, insert, static_kind(&object.kind), detail, group::OBJECT, false, Some(info));
     }
 
     fn push_columns(&mut self, sources: &[Source]) {
         for source in sources {
             for column in &source.columns {
-                self.push(
-                    column.clone(),
-                    ident(self.engine, column),
+                self.push_info(
+                    column.name.clone(),
+                    ident(self.engine, &column.name),
                     "column",
                     source.label.clone(),
                     group::COLUMN,
                     false,
+                    Some(EntryInfo::Column { source: source.label.clone(), column: column.clone() }),
                 );
             }
         }
@@ -871,9 +877,11 @@ impl<'a> Gather<'a> {
     }
 
     fn push_functions(&mut self) {
-        for name in functions(self.engine) {
-            let detail = function_signature(name).map(str::to_owned).unwrap_or_else(|| self.note("query.complete.detail.function"));
-            self.push(name.to_owned(), name.to_owned(), "function", detail, group::FUNCTION, false);
+        for name in functions::names(self.engine) {
+            let signature = functions::lookup(self.engine, name).map(|sig| sig.text());
+            let detail = signature.clone().unwrap_or_else(|| self.note("query.complete.detail.function"));
+            let info = signature.map(|signature| EntryInfo::Function { signature });
+            self.push_info(name.to_owned(), name.to_owned(), "function", detail, group::FUNCTION, false, info);
         }
     }
 
@@ -1029,6 +1037,7 @@ fn inferred_conditions(engine: &str, left: &Source, right: &Source) -> Vec<Strin
     let mut found = Vec::new();
     for (near, far) in [(left, right), (right, left)] {
         for column in &near.columns {
+            let column = &column.name;
             let lower = column.to_ascii_lowercase();
             let Some(stem) = lower.strip_suffix("_id") else {
                 continue;
@@ -1037,7 +1046,7 @@ fn inferred_conditions(engine: &str, left: &Source, right: &Source) -> Vec<Strin
             if stem.is_empty() || !(far.name.eq_ignore_ascii_case(stem) || far.name.eq_ignore_ascii_case(&plural)) {
                 continue;
             }
-            if !far.columns.iter().any(|name| name.eq_ignore_ascii_case("id")) {
+            if !far.columns.iter().any(|column| column.name.eq_ignore_ascii_case("id")) {
                 continue;
             }
             found.push(format!("{}.{} = {}.id", near.alias, ident(engine, column), far.alias));
@@ -1146,7 +1155,17 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
         }
     }
 
-    let statement = parse_scope(local);
+    let mut statement = parse_scope(local);
+    // 光标后面同一语句里的来源也参与列补全：`SELECT | FROM orders` 要能给出 orders 的列。
+    let tail_from = statement_start + word_end;
+    let tail_to = statement_end(text, tail_from);
+    if tail_to > tail_from {
+        for table in tail_tables(&text[tail_from..tail_to]) {
+            if !statement.tables.iter().any(|have| have.alias.eq_ignore_ascii_case(&table.alias)) {
+                statement.tables.push(table);
+            }
+        }
+    }
     plan.clause = statement.clause;
     let clause = statement.clause;
     let sources = resolve_sources(scope, &statement.tables);
@@ -1318,20 +1337,186 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
     plan
 }
 
+/// 光标处标识符解析出的目标。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Resolved {
+    /// 目录对象（表、视图）。columns 是已读到的列；没读到时为空。
+    Object { schema: String, name: String, kind: String, comment: String, columns: Vec<ColumnMeta> },
+    /// 某个来源里的一列。schema/table 是目录里的对象，source 是语句里的写法（含模式限定）。
+    Column { schema: String, table: String, source: String, column: ColumnMeta },
+}
+
+impl Resolved {
+    /// 与补全详情相同的结构化说明；悬停和详情面板用同一份数据。
+    pub fn info(&self) -> EntryInfo {
+        match self {
+            Resolved::Object { schema, name, kind, comment, .. } => EntryInfo::Object {
+                schema: schema.clone(),
+                name: name.clone(),
+                kind: kind.clone(),
+                comment: comment.clone(),
+            },
+            Resolved::Column { source, column, .. } => EntryInfo::Column { source: source.clone(), column: column.clone() },
+        }
+    }
+}
+
+/// 一次解析：目标和被解析的那个名字在全文里的字节范围（含引号）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolution {
+    pub target: Resolved,
+    pub span: Span,
+}
+
+/// 把全文里的一个字节偏移解析成对象或列。别名、表名、`模式.表`、`别名.列`、`模式.表.列` 都认；
+/// 解析依据只有当前语句和已读到的元数据。认不出、有歧义、落在字符串或注释里时返回 None，不猜。
+pub fn resolve(scope: &CompletionScope, text: &str, offset: usize) -> Option<Resolution> {
+    if !known_engine(&scope.engine) {
+        return None;
+    }
+    let offset = floor_boundary(text, offset);
+    let start = statement_start(text, offset);
+    if lex(&text[start..offset]).1.open {
+        return None;
+    }
+    let end = statement_end(text, offset).max(offset);
+    let statement = &text[start..end];
+    let (tokens, _) = lex(statement);
+    let rel = offset - start;
+    let at = tokens
+        .iter()
+        .position(|token| token.word && token.start <= rel && rel < token.end)
+        .or_else(|| tokens.iter().position(|token| token.word && token.end == rel))?;
+    let token = &tokens[at];
+    if !token.quoted && BASE_KEYWORDS.contains(&token.text.to_ascii_uppercase().as_str()) {
+        return None;
+    }
+    let dot = |index: usize| tokens.get(index).is_some_and(|token| !token.word && token.text == ".");
+    let mut first = at;
+    while first >= 2 && dot(first - 1) && tokens[first - 2].word {
+        first -= 2;
+    }
+    let mut last = at;
+    while dot(last + 1) && tokens.get(last + 2).is_some_and(|token| token.word) {
+        last += 2;
+    }
+    let mut parts: Vec<&str> = tokens[first..=last].iter().step_by(2).map(|token| token.text.as_str()).collect();
+    let mut pos = (at - first) / 2;
+    if parts.len() > 3 {
+        let skip = parts.len() - 3;
+        if pos < skip {
+            return None;
+        }
+        parts.drain(..skip);
+        pos -= skip;
+    }
+    let (parsed, _) = scan_scope(statement);
+    let mut refs = parsed.tables;
+    if let Some(target) = parsed.target {
+        refs.push(target);
+    }
+    let target = match (parts.len(), pos) {
+        (1, _) => resolve_bare(scope, &refs, parts[0]),
+        (2, 1) => match find_ref(&refs, parts[0]) {
+            Some(table) => column_of(scope, table, parts[1]),
+            None => object_named(scope, parts[0], parts[1]),
+        },
+        (2, _) => find_ref(&refs, parts[0]).and_then(|table| object_of_ref(scope, table)),
+        (3, 2) => {
+            let table = TableRef { alias: parts[1].to_owned(), schema: parts[0].to_owned(), name: parts[1].to_owned(), depth: 0 };
+            column_of(scope, &table, parts[2]).or_else(|| object_named(scope, parts[1], parts[2]))
+        }
+        (3, 1) => object_named(scope, parts[0], parts[1]),
+        _ => None,
+    }?;
+    Some(Resolution { target, span: Span { start: start + token.start, end: start + token.end } })
+}
+
+/// 语句里按别名（优先）或表名找到的来源。
+fn find_ref<'a>(refs: &'a [TableRef], name: &str) -> Option<&'a TableRef> {
+    refs.iter()
+        .find(|table| table.alias.eq_ignore_ascii_case(name))
+        .or_else(|| refs.iter().find(|table| table.name.eq_ignore_ascii_case(name)))
+}
+
+/// 来源对应的目录对象；CTE、派生表这类目录里没有的来源返回 None。
+fn catalog_object<'a>(scope: &'a CompletionScope, table: &TableRef) -> Option<&'a CatalogObject> {
+    scope.objects.iter().find(|object| {
+        object.name.eq_ignore_ascii_case(&table.name) && (table.schema.is_empty() || object.schema.eq_ignore_ascii_case(&table.schema))
+    })
+}
+
+fn object_of_ref(scope: &CompletionScope, table: &TableRef) -> Option<Resolved> {
+    let object = catalog_object(scope, table)?;
+    let columns = source_columns(scope, table).map(|source| source.columns.clone()).unwrap_or_default();
+    Some(Resolved::Object {
+        schema: object.schema.clone(),
+        name: object.name.clone(),
+        kind: object.kind.clone(),
+        comment: object.comment.clone(),
+        columns,
+    })
+}
+
+fn object_named(scope: &CompletionScope, schema: &str, name: &str) -> Option<Resolved> {
+    let table = TableRef { alias: name.to_owned(), schema: schema.to_owned(), name: name.to_owned(), depth: 0 };
+    object_of_ref(scope, &table)
+}
+
+fn column_of(scope: &CompletionScope, table: &TableRef, name: &str) -> Option<Resolved> {
+    let source = source_columns(scope, table)?;
+    let column = source.columns.iter().find(|column| column.name.eq_ignore_ascii_case(name))?;
+    let object = catalog_object(scope, table);
+    Some(Resolved::Column {
+        schema: object.map(|object| object.schema.clone()).unwrap_or_else(|| schema_of(&source.label)),
+        table: object.map(|object| object.name.clone()).unwrap_or_else(|| table.name.clone()),
+        source: if table.schema.is_empty() { table.name.clone() } else { format!("{}.{}", table.schema, table.name) },
+        column: column.clone(),
+    })
+}
+
+/// 不带限定的名字：先看是不是语句里的别名或表名，再看是不是恰好一个来源里的列，
+/// 最后看是不是目录里唯一的同名对象。多个来源都有这一列时不选。
+fn resolve_bare(scope: &CompletionScope, refs: &[TableRef], name: &str) -> Option<Resolved> {
+    if let Some(table) = find_ref(refs, name) {
+        return object_of_ref(scope, table);
+    }
+    let mut found: Vec<Resolved> = Vec::new();
+    for table in refs {
+        if let Some(column) = column_of(scope, table, name) {
+            if !found.contains(&column) {
+                found.push(column);
+            }
+        }
+    }
+    if found.len() == 1 {
+        return found.pop();
+    }
+    if !found.is_empty() {
+        return None;
+    }
+    let mut objects = scope.objects.iter().filter(|object| object.name.eq_ignore_ascii_case(name));
+    let object = objects.next()?;
+    if objects.next().is_some() {
+        return None;
+    }
+    object_named(scope, &object.schema, &object.name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::query::assist::ForeignKey;
 
     fn object(name: &str, schema: &str, kind: &str) -> CatalogObject {
-        CatalogObject { name: name.to_owned(), schema: schema.to_owned(), kind: kind.to_owned() }
+        CatalogObject { name: name.to_owned(), schema: schema.to_owned(), kind: kind.to_owned(), comment: String::new() }
     }
 
     fn source(label: &str, columns: &[&str]) -> CompletionSource {
         CompletionSource {
             alias: String::new(),
             label: label.to_owned(),
-            columns: columns.iter().map(|name| (*name).to_owned()).collect(),
+            columns: columns.iter().map(|name| ColumnMeta::named(*name)).collect(),
         }
     }
 
@@ -1745,5 +1930,114 @@ mod tests {
         let qualified = "SELECT * FROM orders o WHERE o.cu";
         let planned = at(qualified);
         assert_eq!(&qualified[planned.span.start..planned.span.end], "cu");
+    }
+
+    fn typed_scope() -> CompletionScope {
+        let mut typed = scope("postgres");
+        typed.objects[0].comment = "订单".to_owned();
+        typed.sources[0].columns = vec![
+            ColumnMeta { name: "id".to_owned(), type_name: "integer".to_owned(), nullable: Some(false), comment: String::new() },
+            ColumnMeta { name: "customer_id".to_owned(), type_name: "integer".to_owned(), nullable: Some(true), comment: String::new() },
+            ColumnMeta { name: "status".to_owned(), type_name: "text".to_owned(), nullable: Some(true), comment: "订单状态".to_owned() },
+        ];
+        typed
+    }
+
+    #[test]
+    fn select_before_from_sees_the_tables_after_the_cursor_with_column_metadata() {
+        let sql = "select  from orders";
+        let planned = plan(&typed_scope(), sql, "select ".len(), Locale::ZhCn);
+        let status = planned.candidates.iter().find(|item| item.label == "status").expect("orders 的列");
+        match status.info.as_ref() {
+            Some(EntryInfo::Column { source, column }) => {
+                assert_eq!(source, "orders");
+                assert_eq!(column.type_name, "text");
+                assert_eq!(column.nullable, Some(true));
+                assert_eq!(column.comment, "订单状态");
+            }
+            other => panic!("列候选要带元数据：{other:?}"),
+        }
+        let entry = planned.entries().into_iter().find(|entry| entry.label == "status").unwrap();
+        assert!(matches!(entry.info, Some(EntryInfo::Column { .. })));
+        let orders = planned.candidates.iter().find(|item| item.label == "public.orders").expect("对象候选");
+        assert!(matches!(&orders.info, Some(EntryInfo::Object { comment, .. }) if comment == "订单"));
+
+        // 后面并列子查询里的来源不算进来；下一条语句的来源也不算。
+        let nested = "SELECT * FROM t WHERE x IN (SELECT  FROM customers) AND y IN (SELECT 1 FROM orders)";
+        let cursor = nested.find("SELECT  FROM").unwrap() + "SELECT ".len();
+        let planned = plan(&typed_scope(), nested, cursor, Locale::ZhCn);
+        let names = labels(&planned);
+        assert!(names.contains(&"name".to_owned()), "{names:?}");
+        assert!(!names.contains(&"status".to_owned()), "并列子查询的 orders 不能混进来：{names:?}");
+        let next = "select ;\nselect * from orders";
+        let planned = plan(&typed_scope(), next, "select ".len(), Locale::ZhCn);
+        assert!(!labels(&planned).contains(&"status".to_owned()));
+    }
+
+    #[test]
+    fn function_candidates_use_the_engine_signature_table() {
+        let planned = at("SELECT coal");
+        let item = planned.candidates.iter().find(|item| item.label == "coalesce").expect("coalesce");
+        assert_eq!(item.detail, "coalesce(value, value, …) → same as input");
+        assert!(matches!(&item.info, Some(EntryInfo::Function { signature }) if signature.starts_with("coalesce(")));
+        let sqlserver = plan(&scope("sqlserver"), "SELECT le", 9, Locale::ZhCn);
+        assert!(labels(&sqlserver).contains(&"len".to_owned()), "SQL Server 用 LEN");
+        let postgres = at("SELECT le");
+        assert!(!labels(&postgres).contains(&"len".to_owned()), "PostgreSQL 没有 LEN");
+    }
+
+    fn resolved(sql: &str, needle: &str) -> Option<Resolved> {
+        let offset = sql.find(needle).expect(needle) + 1;
+        resolve(&typed_scope(), sql, offset).map(|found| found.target)
+    }
+
+    #[test]
+    fn resolve_maps_tables_aliases_and_columns_to_metadata() {
+        let sql = "SELECT o.status, name FROM public.orders o JOIN customers c ON c.id = o.customer_id";
+        match resolved(sql, "orders o").expect("表名") {
+            Resolved::Object { schema, name, kind, comment, columns } => {
+                assert_eq!((schema.as_str(), name.as_str(), kind.as_str(), comment.as_str()), ("public", "orders", "table", "订单"));
+                assert_eq!(columns.len(), 3);
+            }
+            other => panic!("{other:?}"),
+        }
+        let alias = sql.find(" o JOIN").unwrap() + 1;
+        assert!(matches!(resolve(&typed_scope(), sql, alias).unwrap().target, Resolved::Object { ref name, .. } if name == "orders"), "别名指回表");
+        assert!(matches!(resolved(sql, "o.status"), Some(Resolved::Object { ref name, .. }) if name == "orders"), "限定符上的别名");
+        match resolved(sql, "status").expect("别名.列") {
+            Resolved::Column { schema, table, source, column } => {
+                assert_eq!((schema.as_str(), table.as_str(), source.as_str()), ("public", "orders", "public.orders"));
+                assert_eq!(column.type_name, "text");
+                assert_eq!(column.comment, "订单状态");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(resolved(sql, "name FROM"), Some(Resolved::Column { ref table, .. }) if table == "customers"), "只有一个来源有这列");
+        assert!(matches!(resolved(sql, "customers c"), Some(Resolved::Object { ref name, .. }) if name == "customers"));
+        assert!(matches!(resolved("SELECT * FROM public.orders", "orders"), Some(Resolved::Object { .. })), "模式.表");
+        assert!(matches!(resolved("SELECT public.orders.status FROM public.orders", "status"), Some(Resolved::Column { .. })), "模式.表.列");
+
+        let found = resolve(&typed_scope(), sql, sql.find("status").unwrap()).unwrap();
+        assert_eq!(&sql[found.span.start..found.span.end], "status");
+        assert!(matches!(found.target.info(), EntryInfo::Column { .. }), "悬停与详情用同一份数据");
+    }
+
+    #[test]
+    fn resolve_returns_none_for_anything_it_cannot_pin_down() {
+        let sql = "SELECT id FROM orders o JOIN customers c ON c.id = o.customer_id";
+        assert!(resolved(sql, "id FROM").is_none(), "两个来源都有 id：有歧义");
+        assert!(resolved("SELECT missing FROM orders", "missing").is_none(), "不存在的列");
+        assert!(resolved("SELECT x.status FROM orders o", "status").is_none(), "未知限定符不回退");
+        assert!(resolved("SELECT o.nope FROM orders o", "nope").is_none());
+        assert!(resolved("SELECT 'orders' FROM customers", "orders").is_none(), "字符串里");
+        assert!(resolved("SELECT 1 -- orders\nFROM customers", "orders").is_none(), "注释里");
+        assert!(resolved("SELECT * FROM orders", "SELECT").is_none(), "关键字");
+        assert!(resolved("WITH recent AS (SELECT 1) SELECT * FROM recent r", "recent r").is_none(), "CTE 不是目录对象");
+        assert!(resolved("SELECT * FROM archive.orders", "orders").is_none(), "别的模式里没有这张表");
+        let mut other = typed_scope();
+        other.engine = "redis".to_owned();
+        assert!(resolve(&other, "SELECT * FROM orders", 16).is_none());
+        let sql = "SELECT * FROM orders";
+        assert!(resolve(&typed_scope(), sql, 7).is_none(), "星号不是名字");
     }
 }
