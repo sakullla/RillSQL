@@ -142,10 +142,19 @@ pub fn sqlserver_error_line(line: u32) -> Option<usize> {
     }
 }
 
+/// SQL Server 服务器错误的位置。错误发生在存储过程/触发器/函数里时（procedure 非空），
+/// 行号属于那个模块的定义，不对应用户写的语句，此时不给位置，由编辑器整条语句标错。
+pub fn sqlserver_error_at(line: u32, procedure: &str) -> Option<ErrorAt> {
+    if !procedure.trim().is_empty() {
+        return None;
+    }
+    sqlserver_error_line(line).map(ErrorAt::Line)
+}
+
 /// 从 tiberius 错误里取行号；不是服务器报错时没有位置。
 fn tds_error_at(err: &tiberius::error::Error) -> Option<ErrorAt> {
     match err {
-        tiberius::error::Error::Server(token) => sqlserver_error_line(token.line()).map(ErrorAt::Line),
+        tiberius::error::Error::Server(token) => sqlserver_error_at(token.line(), token.procedure()),
         _ => None,
     }
 }

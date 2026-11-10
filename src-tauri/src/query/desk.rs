@@ -72,8 +72,11 @@ pub enum ErrorMark {
 /// 发起执行时这批 SQL 在草稿里的位置：from 是 pick 在草稿里的起点，sql 是实际送出的文本。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RunOrigin {
+    /// 草稿里这次执行对应的文本及其起点。
     from: usize,
     sql: String,
+    /// 实际送出的文本；变量替换后与 sql 不同。
+    sent: String,
     engine: String,
 }
 
@@ -82,6 +85,8 @@ struct RunOrigin {
 struct PendingSend {
     sql: String,
     pick: RunPick,
+    /// confirm_variables 替换后的文本；随后按它发起的执行仍对应原来的 pick。
+    confirmed: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -882,13 +887,13 @@ impl Desk {
             let variables = assist::find_variables(&pick.sql);
             if !variables.is_empty() {
                 if let Some(tab) = self.active_mut() {
-                    tab.pending = Some(PendingSend { sql: pick.sql.clone(), pick: pick.clone() });
+                    tab.pending = Some(PendingSend { sql: pick.sql.clone(), pick: pick.clone(), confirmed: None });
                 }
                 return BeginRun::Variables(variables);
             }
         }
         let token = tasks.begin(&owner(&tab.id));
-        let origin = RunOrigin { from: pick.from, sql: pick.sql.clone(), engine: target.engine.clone() };
+        let origin = run_origin(&tab, &pick, override_sql.is_some(), &target.engine);
         if let Some(tab) = self.active_mut() {
             tab.running = true;
             tab.cancelled = false;
@@ -914,8 +919,9 @@ impl Desk {
     }
 
     pub fn confirm_variables(&mut self, values: &HashMap<String, String>) -> Option<String> {
-        let pending = self.active_mut()?.pending.clone()?;
+        let pending = self.active_mut()?.pending.as_mut()?;
         let sql = assist::substitute_variables(&pending.sql, values);
+        pending.confirmed = Some(sql.clone());
         Some(sql)
     }
 
@@ -1481,12 +1487,37 @@ fn statement_view(statement: commands::StatementDto) -> StatementView {
     }
 }
 
-/// 把这批结果放回草稿：按发起时的切分算出每条语句的范围，再把失败语句的错误位置加上语句起点。
-/// 草稿在这期间改过、或送出的文本和草稿对不上（例如变量已替换）时不给范围，也不给标记。
+/// 这次执行对应草稿里的哪段文本。普通执行就是 pick；变量确认后的执行对应替换前的 pick；
+/// “加载更多”重放上一条结果时对应那条结果在草稿里的范围。都对不上时退回送出的文本本身。
+fn run_origin(tab: &TabState, pick: &RunPick, overridden: bool, engine: &str) -> RunOrigin {
+    let sent = pick.sql.clone();
+    let exact = || RunOrigin { from: pick.from, sql: sent.clone(), sent: sent.clone(), engine: engine.to_owned() };
+    if !overridden {
+        return exact();
+    }
+    if let Some(pending) = tab.pending.as_ref().filter(|pending| pending.confirmed.as_deref() == Some(sent.as_str())) {
+        return RunOrigin { from: pending.pick.from, sql: pending.pick.sql.clone(), sent, engine: engine.to_owned() };
+    }
+    let replayed = tab.results.iter().filter(|view| view.sql == sent).find_map(|view| {
+        let (start, end) = view.range?;
+        tab.draft.get(start..end).map(|text| (start, text.to_owned()))
+    });
+    if let Some((from, sql)) = replayed {
+        return RunOrigin { from, sql, sent, engine: engine.to_owned() };
+    }
+    exact()
+}
+
+/// 把这批结果放回草稿：按发起时草稿一侧的切分算出每条语句的范围，再把失败语句的错误位置加上语句起点。
+/// 送出的语句与草稿里那条一致时按驱动给的位置标记；不一致（例如变量已替换）但两边切出的条数相同时，
+/// 按序号对应，位置不再可信，失败语句整条标错。草稿在这期间改过时不给范围，也不给标记。
 fn place_statements(draft: &str, origin: &RunOrigin, results: &mut [StatementView]) {
-    let pieces = super::split::split_sql(&origin.engine, &origin.sql).pieces;
-    for (view, piece) in results.iter_mut().zip(pieces.iter()) {
-        if view.sql != piece.text {
+    let drafted = super::split::split_sql(&origin.engine, &origin.sql).pieces;
+    let aligned = origin.sent != origin.sql
+        && super::split::split_sql(&origin.engine, &origin.sent).pieces.len() == drafted.len();
+    for (view, piece) in results.iter_mut().zip(drafted.iter()) {
+        let exact = view.sql == piece.text;
+        if !exact && !aligned {
             continue;
         }
         let start = origin.from + piece.start;
@@ -1496,7 +1527,8 @@ fn place_statements(draft: &str, origin: &RunOrigin, results: &mut [StatementVie
         }
         view.range = Some((start, end));
         if view.status == "error" {
-            view.error_mark = Some(error_mark(draft, (start, end), view.error_at));
+            let at = if exact { view.error_at } else { None };
+            view.error_mark = Some(error_mark(draft, (start, end), at));
         }
     }
 }

@@ -915,6 +915,7 @@ impl QueryPane {
                                     let table = parts.next().unwrap_or("");
                                     pane.desk.remember_table_columns(connection, database, schema, table, cols);
                                 }
+                                pane.desk.set_object_comments(loaded.comments);
                                 pane.desk.set_foreign_keys(loaded.foreign_keys);
                                 if failure.is_empty() {
                                     pane.desk.set_active_note("");
@@ -1710,6 +1711,10 @@ mod tests {
             rows: vec![vec![Some("1".to_owned())]],
             truncated,
             affected: None,
+            elapsed_ms: None,
+            error_at: None,
+            range: None,
+            error_mark: None,
         }
     }
 
@@ -2329,6 +2334,8 @@ mod tests {
                 rows: rows.iter().map(|value| vec![Some((*value).to_owned())]).collect(),
                 truncated: false,
                 affected: None,
+                elapsed_ms: None,
+                error_at: None,
             }],
             started_at: String::new(),
             elapsed_ms: 0,

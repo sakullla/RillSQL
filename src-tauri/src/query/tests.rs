@@ -1450,6 +1450,11 @@ fn error_positions_are_parsed_per_driver() {
     // SQL Server：服务器错误的行号，0 表示没有。
     assert_eq!(exec::sqlserver_error_line(3), Some(3));
     assert_eq!(exec::sqlserver_error_line(0), None);
+    // 错误发生在存储过程/触发器/函数里时，行号属于模块定义，不给位置，退回整条语句标错。
+    assert_eq!(exec::sqlserver_error_at(3, ""), Some(exec::ErrorAt::Line(3)));
+    assert_eq!(exec::sqlserver_error_at(0, ""), None);
+    assert_eq!(exec::sqlserver_error_at(12, "dbo.audit_orders"), None, "模块内的行号不映射到用户语句");
+    assert_eq!(exec::sqlserver_error_at(1, "trg_orders"), None);
     // 执行前追加的 LIMIT 不影响原文里的位置。
     let original = "SELECT nope FROM t";
     let sent = "SELECT nope FROM t LIMIT 101";
@@ -1565,4 +1570,138 @@ fn desk_maps_statement_errors_to_document_offsets_and_lines() {
     assert_eq!(results[0].elapsed_ms, Some(3));
     assert_eq!(results[1].range, Some(range));
     assert_eq!(results[1].error_mark, Some(ErrorMark::Line(2)));
+}
+
+#[test]
+fn desk_marks_whole_statement_when_sent_sql_differs_from_draft() {
+    use crate::application::tasks::TaskBoard;
+    use crate::query::assist::RunScope;
+    use crate::query::commands::{RunDto, StatementDto};
+    use crate::query::desk::{BeginRun, Desk, ErrorMark, PreparedRun, Target, Ticket};
+    use std::collections::HashMap;
+
+    let statement = |sql: &str, status: &str, at: Option<exec::ErrorAt>, truncated: bool| StatementDto {
+        sql: sql.to_owned(),
+        status: status.to_owned(),
+        message: String::new(),
+        columns: Vec::new(),
+        column_types: Vec::new(),
+        rows: Vec::new(),
+        truncated,
+        affected: None,
+        elapsed_ms: Some(2),
+        error_at: at,
+    };
+    let run = |status: &str, statements: Vec<StatementDto>| RunDto {
+        id: "run".to_owned(),
+        connection_id: "notes".to_owned(),
+        connection_name: "笔记".to_owned(),
+        database: "main".to_owned(),
+        engine: "sqlite".to_owned(),
+        status: status.to_owned(),
+        cancel: String::new(),
+        cancel_message: String::new(),
+        via_ssh: false,
+        fresh_channel: false,
+        statements,
+        started_at: String::new(),
+        elapsed_ms: 4,
+    };
+    let ticket = |prepared: &PreparedRun| Ticket { tab_id: prepared.tab_id.clone(), token: prepared.token, version: prepared.version };
+    let target = Target {
+        connection_id: "notes".to_owned(),
+        connection_name: "笔记".to_owned(),
+        database: "main".to_owned(),
+        engine: "sqlite".to_owned(),
+        schema: String::new(),
+        environment: String::new(),
+    };
+    let tasks = TaskBoard::new();
+    let values: HashMap<String, String> = [("id".to_owned(), "42".to_owned())].into_iter().collect();
+
+    // 变量替换后再执行：送出的文本和草稿不同，但条数一致，按序号对应，失败语句整条标错。
+    let draft = "SELECT 1;\nSELECT *\n  FROM t WHERE id = :id;";
+    let mut desk = Desk::new();
+    desk.import_tab("a", draft, Some(target.clone()));
+    desk.focus_tab(Some("a"));
+    assert!(matches!(desk.begin_run(&tasks, RunScope::Script, None), BeginRun::Variables(_)), "有变量时先确认");
+    let sent = desk.confirm_variables(&values).expect("替换后的文本");
+    assert_ne!(sent, draft);
+    let BeginRun::Ready(prepared) = desk.begin_run(&tasks, RunScope::Script, Some(sent.clone())) else {
+        panic!("确认变量后应开始执行");
+    };
+    let pieces = crate::query::split::split_sql("sqlite", &sent).pieces;
+    assert_eq!(pieces.len(), 2);
+    desk.finish_polled(
+        &tasks,
+        &ticket(&prepared),
+        Ok(run(
+            "error",
+            vec![
+                statement(&pieces[0].text, "ok", None, false),
+                statement(&pieces[1].text, "error", Some(exec::ErrorAt::Line(2)), false),
+            ],
+        )),
+        "已取消",
+    );
+    let results = desk.results();
+    assert_eq!(results[0].range, Some((0, "SELECT 1;".len())), "没被替换的语句照常对上");
+    assert_eq!(results[0].error_mark, None);
+    let second = draft.find("SELECT *").unwrap();
+    assert_eq!(results[1].range, Some((second, draft.len())), "替换过的语句按序号对回草稿");
+    assert_eq!(results[1].error_mark, Some(ErrorMark::Statement), "送出的文本变了，位置不可信，整条语句标错");
+
+    // 加载更多：重放上一条结果的文本，对应它在草稿里的范围；失败时同样整条标错。
+    let draft = "\n\nSELECT *\n  FROM t WHERE id = :id;";
+    let mut desk = Desk::new();
+    desk.import_tab("b", draft, Some(target.clone()));
+    desk.focus_tab(Some("b"));
+    assert!(matches!(desk.begin_run(&tasks, RunScope::Script, None), BeginRun::Variables(_)));
+    let sent = desk.confirm_variables(&values).expect("替换后的文本");
+    let BeginRun::Ready(prepared) = desk.begin_run(&tasks, RunScope::Script, Some(sent.clone())) else {
+        panic!("确认变量后应开始执行");
+    };
+    let piece = crate::query::split::split_sql("sqlite", &sent).pieces.remove(0).text;
+    desk.finish_polled(&tasks, &ticket(&prepared), Ok(run("ok", vec![statement(&piece, "ok", None, true)])), "已取消");
+    let start = draft.find("SELECT").unwrap();
+    assert_eq!(desk.results()[0].range, Some((start, draft.len())));
+    let BeginRun::Ready(prepared) = desk.begin_run_limited(&tasks, RunScope::Current, Some(piece.clone()), 200) else {
+        panic!("加载更多应开始执行");
+    };
+    desk.finish_polled(
+        &tasks,
+        &ticket(&prepared),
+        Ok(run("error", vec![statement(&piece, "error", Some(exec::ErrorAt::Line(2)), false)])),
+        "已取消",
+    );
+    let results = desk.results();
+    assert_eq!(results[0].range, Some((start, draft.len())), "加载更多的结果仍对回草稿");
+    assert_eq!(results[0].error_mark, Some(ErrorMark::Statement));
+
+    // 未替换的加载更多：送出的就是草稿里那条，驱动给的位置照常换算。
+    let draft = "SELECT 1;\nSELECT nope\n  FROM t;";
+    let mut desk = Desk::new();
+    desk.import_tab("c", draft, Some(target));
+    desk.focus_tab(Some("c"));
+    let start = draft.find("SELECT nope").unwrap();
+    desk.set_selection(start, start, start);
+    let BeginRun::Ready(prepared) = desk.begin_run(&tasks, RunScope::Current, None) else {
+        panic!("应开始执行");
+    };
+    let piece = "SELECT nope\n  FROM t;";
+    desk.finish_polled(&tasks, &ticket(&prepared), Ok(run("ok", vec![statement(piece, "ok", None, true)])), "已取消");
+    assert_eq!(desk.results()[0].range, Some((start, draft.len())));
+    desk.set_selection(0, 0, 0);
+    let BeginRun::Ready(prepared) = desk.begin_run_limited(&tasks, RunScope::Current, Some(piece.to_owned()), 200) else {
+        panic!("加载更多应开始执行");
+    };
+    desk.finish_polled(
+        &tasks,
+        &ticket(&prepared),
+        Ok(run("error", vec![statement(piece, "error", Some(exec::ErrorAt::Line(2)), false)])),
+        "已取消",
+    );
+    let results = desk.results();
+    assert_eq!(results[0].range, Some((start, draft.len())), "光标移走后加载更多仍按上次的范围");
+    assert_eq!(results[0].error_mark, Some(ErrorMark::Line(2)), "文本一致时按驱动位置标行");
 }

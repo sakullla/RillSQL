@@ -695,14 +695,14 @@ mod tests {
     }
 
     fn catalog_scope() -> CompletionScope {
-        use crate::query::assist::{CatalogObject, CompletionSource, MetadataState};
+        use crate::query::assist::{CatalogObject, ColumnMeta, CompletionSource, MetadataState};
         CompletionScope {
             engine: "sqlite".to_owned(),
-            objects: vec![CatalogObject { name: "orders".to_owned(), schema: String::new(), kind: "table".to_owned() }],
+            objects: vec![CatalogObject { name: "orders".to_owned(), schema: String::new(), kind: "table".to_owned(), comment: String::new() }],
             sources: vec![CompletionSource {
                 alias: String::new(),
                 label: "orders".to_owned(),
-                columns: vec!["id".to_owned(), "customer".to_owned(), "status".to_owned()],
+                columns: vec![ColumnMeta::named("id"), ColumnMeta::named("customer"), ColumnMeta::named("status")],
             }],
             provider: true,
             databases: vec!["main".to_owned()],
