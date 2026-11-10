@@ -5441,6 +5441,45 @@ fn a_failed_connection_level_node_refresh_keeps_the_subtree() {
     assert!(model.nav.node(&customers_id).is_some(), "其它连接不受影响");
 }
 
+/// SQLite 连接行刷新：库列表读到了、对象读取失败（connection.error 为空，main 带错误）。
+/// SQLite 没有库节点，按连接容器判断：保留子树，原因挂在连接行上；再失败一次仍保留。
+#[test]
+fn a_sqlite_object_read_failure_on_connection_refresh_keeps_the_subtree() {
+    use crate::app::shell::nav::NavRequest;
+    use crate::catalog::hierarchy::{connection_node_id, group_node_id};
+    use crate::catalog::model::{ObjectKind, ObjectRow, SchemaNode};
+    let ids = |model: &WorkbenchModel| model.nav_rows().into_iter().map(|row| row.id).collect::<Vec<_>>();
+    let customers = ObjectRow::table("customers", Some(1));
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.apply_navigation(&[nav_connection(Engine::Sqlite, "lite", "本地", vec![nav_database("main", vec![customers.clone()])])], false);
+    let root = connection_node_id("lite");
+    let customers_id = nav_id("lite", "main", "", &customers);
+    expand_all(&mut model, &[root.clone(), group_node_id("lite", "main", "", ObjectKind::Table)]);
+    let before = ids(&model);
+    assert!(before.contains(&customers_id));
+    for _ in 0..2 {
+        let _ = model.dispatch(&format!("nav-refresh-node:{root}"));
+        assert_eq!(model.take_nav_request(), Some(NavRequest::Refresh { connection: Some("lite".into()) }));
+        let mut main = nav_database("main", Vec::new());
+        main.schemas = vec![SchemaNode::empty("")];
+        main.error = Some("database is locked".into());
+        let failed = nav_connection(Engine::Sqlite, "lite", "本地", vec![main]);
+        assert!(failed.error.is_none());
+        model.apply_navigation(&[failed], true);
+        assert_eq!(ids(&model), before, "失败不清空子树，展开保持");
+        assert_eq!(model.nav.node(&root).unwrap().error.as_deref(), Some("database is locked"));
+        assert!(model.nav_node_refresh.is_empty());
+    }
+    // 读取成功：照常重建，错误清掉。
+    let _ = model.dispatch(&format!("nav-refresh-node:{root}"));
+    assert!(model.take_nav_request().is_some());
+    let orders = ObjectRow::table("orders", Some(0));
+    let fresh = nav_connection(Engine::Sqlite, "lite", "本地", vec![nav_database("main", vec![customers.clone(), orders.clone()])]);
+    model.apply_navigation(&[fresh], true);
+    assert!(model.nav.node(&root).unwrap().error.is_none());
+    assert!(ids(&model).contains(&nav_id("lite", "main", "", &orders)));
+}
+
 /// 危险操作：生产（按 tone，自建标签也算）要输对名字；第一次点执行只待确认；取消不发语句；
 /// 失败保留树并显示原因；迟到的旧结果被丢弃。
 #[test]

@@ -1365,7 +1365,14 @@ impl WorkbenchModel {
                 continue;
             }
             if let Some(message) = &database.error {
-                if had_children(&database_node_id(&incoming.id, &database.name)) {
+                // 没有库层的引擎（SQLite）不建库节点，对象直接挂在连接下面。
+                let database_id = database_node_id(&incoming.id, &database.name);
+                let container = if self.nav.node(&database_id).is_some() {
+                    database_id
+                } else {
+                    crate::catalog::hierarchy::connection_node_id(&incoming.id)
+                };
+                if had_children(&container) {
                     return Some(message.clone());
                 }
                 continue;
