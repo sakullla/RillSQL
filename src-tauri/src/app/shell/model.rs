@@ -18,13 +18,14 @@ use crate::catalog::hierarchy::{NavKind, NavNode, NavRow, NavTree, ObjectKey};
 use crate::catalog::{NavAction, NavConnection};
 use crate::i18n;
 
-use super::nav::{self, NavRequest};
+use super::danger::{DangerKind, DangerPrompt, DangerStep};
+use super::nav::{self, NavRequest, TemplateKind};
 use crate::query::assist::TreeObject;
 use crate::state::{AppState, Platform, SessionState, SessionTab, ShellSettings, StateError};
 
 use super::close::{draft_pending, evaluate, message_key, update_block_key, CloseFacts, CloseKind, CloseScope};
 use super::layout::{layout_for, painted_frame, unbreakable_px, ChromeLayout, PaintedFrame};
-use super::menus::{MenuPlace, MenuTarget, NavKey, OpenMenu};
+use super::menus::{tree_menu_items, MenuPlace, MenuTarget, NavKey, ObjectFacts, OpenMenu};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkTool {
@@ -175,6 +176,26 @@ pub enum DraftField {
     RenameName,
     PaletteQuery,
     BundlePassphrase,
+    /// 危险操作确认层：生产环境要求输入的对象名。
+    DangerConfirm,
+    /// 危险操作确认层：重命名的新名字。
+    DangerNewName,
+}
+
+/// 对象树“查看 / 复制 DDL”的读取状态。`copy_only` 时不显示查看器，读到就写剪贴板。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DdlView {
+    pub epoch: u64,
+    pub node_id: String,
+    pub object: ObjectKey,
+    pub signature: String,
+    pub relation: String,
+    pub copy_only: bool,
+    pub loading: bool,
+    pub text: Option<String>,
+    pub rebuilt: bool,
+    pub missing: Vec<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -277,6 +298,14 @@ pub struct WorkbenchModel {
     pub mongo_running: bool,
     /// 已经发起的更新检查次数；关闭自动检查时不增加，也不启动任何网络任务。
     pub update_checks: u32,
+    /// 对象定义查看器（或一次“复制 DDL”的读取）。
+    pub ddl_view: Option<DdlView>,
+    /// 对象级危险操作的确认层。
+    pub danger: Option<DangerPrompt>,
+    /// 等列读完再插入的 SQL 模板：(对象节点, 种类)。
+    pub pending_template: Option<(String, TemplateKind)>,
+    /// 要写进系统剪贴板的文本；视图取走后写入。
+    pub clipboard_out: Option<String>,
 }
 
 impl WorkbenchModel {
@@ -337,6 +366,10 @@ impl WorkbenchModel {
             redis_running: false,
             mongo_running: false,
             update_checks: 0,
+            ddl_view: None,
+            danger: None,
+            pending_template: None,
+            clipboard_out: None,
         }
     }
 
@@ -638,7 +671,49 @@ impl WorkbenchModel {
             | "tree-insert-select"
             | "tree-insert-column"
             | "tree-copy-column"
-            | "tree-new-query" => self.tree_action(id),
+            | "tree-new-query"
+            | "tree-view-ddl"
+            | "tree-copy-ddl"
+            | "tree-refresh-node"
+            | "tree-template-insert"
+            | "tree-template-update"
+            | "tree-template-delete"
+            | "tree-drop-object"
+            | "tree-truncate-table"
+            | "tree-rename-table" => self.tree_action(id),
+            "ddl-close" => self.ddl_view = None,
+            "ddl-copy" => {
+                let text = self.ddl_view.as_ref().and_then(|view| view.text.clone());
+                match text {
+                    Some(text) => {
+                        self.copied = text.clone();
+                        self.clipboard_out = Some(text);
+                        self.notice_key = Some("catalog.ddl.copied");
+                        self.notice_detail.clear();
+                    }
+                    None => {
+                        self.notice_key = Some("catalog.ddl.failed");
+                        self.notice_detail.clear();
+                    }
+                }
+            }
+            "danger-cancel" => {
+                // 取消或关闭只收起确认层，不发送任何语句。
+                self.danger = None;
+                if matches!(self.focused_field, Some(DraftField::DangerConfirm | DraftField::DangerNewName)) {
+                    self.focused_field = None;
+                }
+            }
+            "danger-preview" => {
+                if let Some(prompt) = self.danger.as_mut().filter(|prompt| !prompt.running) {
+                    prompt.request_preview();
+                }
+            }
+            "danger-execute" => {
+                if let Some(prompt) = self.danger.as_mut() {
+                    prompt.click_execute();
+                }
+            }
             "open-admin" => {
                 if let Some(spec) = self.table_spec.clone().or_else(|| self.object_spec.clone()) {
                     self.open_item(WorkItemKind::Admin, spec);
@@ -812,6 +887,12 @@ impl WorkbenchModel {
             return;
         }
         match id {
+            "tree-view-ddl" | "tree-copy-ddl" | "tree-refresh-node" | "tree-template-insert" | "tree-template-update"
+            | "tree-template-delete" | "tree-drop-object" | "tree-truncate-table" | "tree-rename-table" => {
+                // 这些动作只认树上的一行；没有合适的行就说明，不借当前工作项。
+                self.notice_key = Some("catalog.tree.actionUnavailable");
+                self.notice_detail = self.nav.focus_node().map(|node| node.name.clone()).unwrap_or_default();
+            }
             "tree-copy-name" => match self.object_target() {
                 Some(target) => self.copied = Self::qualified_name(&target),
                 None => {
@@ -863,6 +944,25 @@ impl WorkbenchModel {
                 !node.stale && matches!(node.kind, NavKind::Object | NavKind::Database | NavKind::Schema)
             }
             "tree-new-query" => !node.connection_id.is_empty() && !node.stale,
+            "tree-view-ddl" | "tree-copy-ddl" => node.object().is_some_and(|object| {
+                node.kind == NavKind::Object
+                    && !node.stale
+                    && object.engine.is_relational()
+                    && crate::catalog::definition::ddl_available(object.engine, object.kind)
+            }),
+            "tree-refresh-node" => matches!(
+                node.kind,
+                NavKind::Connection | NavKind::Database | NavKind::Schema | NavKind::Group | NavKind::Keyspace
+            ),
+            "tree-template-insert" | "tree-template-update" | "tree-template-delete" => node.object().is_some_and(|object| {
+                node.kind == NavKind::Object && !node.stale && object.engine.is_relational() && object.opens_data()
+            }),
+            "tree-drop-object" | "tree-truncate-table" | "tree-rename-table" => node.object().is_some_and(|object| {
+                node.kind == NavKind::Object
+                    && !node.stale
+                    && object.engine.is_relational()
+                    && DangerKind::from_menu(id, object.kind).is_some()
+            }),
             _ => false,
         };
         supported.then(|| node_id.to_owned())
@@ -889,6 +989,13 @@ impl WorkbenchModel {
             }
             "tree-select-sql" => Some(format!("nav-select-sql:{node_id}")),
             "tree-new-query" => Some(format!("nav-new-query:{node_id}")),
+            "tree-view-ddl" => Some(format!("nav-view-ddl:{node_id}")),
+            "tree-copy-ddl" => Some(format!("nav-copy-ddl:{node_id}")),
+            "tree-refresh-node" => Some(format!("nav-refresh-node:{node_id}")),
+            "tree-template-insert" => Some(format!("nav-insert-template:insert:{node_id}")),
+            "tree-template-update" => Some(format!("nav-insert-template:update:{node_id}")),
+            "tree-template-delete" => Some(format!("nav-insert-template:delete:{node_id}")),
+            "tree-drop-object" | "tree-truncate-table" | "tree-rename-table" => Some(format!("nav-danger:{id}:{node_id}")),
             _ => None,
         }
     }
@@ -966,7 +1073,12 @@ impl WorkbenchModel {
         self.nav.set_focus(node_id);
         self.sync_object_spec_from_focus();
         let target = tree_menu_target(&node);
+        let facts = node
+            .object()
+            .filter(|_| node.kind == NavKind::Object)
+            .map(|object| ObjectFacts { engine: object.engine, kind: object.kind });
         self.open_menu(MenuPlace::ObjectTree, target);
+        self.menu = Some(OpenMenu::with_items(MenuPlace::ObjectTree, tree_menu_items(target, facts)));
         self.nav_menu_node = Some(node_id.to_owned());
         true
     }
@@ -1016,6 +1128,14 @@ impl WorkbenchModel {
         }
         if self.close_prompt.is_some() {
             self.choose_stay();
+            return Effect::None;
+        }
+        // 确认层与定义查看器：关掉就是取消，不发送任何语句。
+        if self.danger.take().is_some() {
+            return Effect::None;
+        }
+        if self.ddl_view.as_ref().is_some_and(|view| !view.copy_only) {
+            self.ddl_view = None;
             return Effect::None;
         }
         self.shell.close_overlay();
@@ -1706,6 +1826,30 @@ impl WorkbenchModel {
             }
             return true;
         }
+        if let Some(rest) = id.strip_prefix("nav-view-ddl:") {
+            self.open_definition(rest, false);
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-copy-ddl:") {
+            self.open_definition(rest, true);
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-refresh-node:") {
+            self.refresh_nav_node(rest);
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-insert-template:") {
+            let Some((kind, node_id)) = rest.split_once(':').and_then(|(kind, node)| Some((TemplateKind::parse(kind)?, node))) else {
+                return true;
+            };
+            self.begin_template(node_id, kind);
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("nav-danger:") {
+            let Some((menu_id, node_id)) = rest.split_once(':') else { return true };
+            self.open_danger(menu_id, node_id);
+            return true;
+        }
         if let Some(rest) = id.strip_prefix("nav-select-sql:") {
             match self.nav_target(rest) {
                 Some(object) => {
@@ -1731,6 +1875,248 @@ impl WorkbenchModel {
             return true;
         }
         false
+    }
+
+    /// 查看 / 复制 DDL：只对读得到定义的关系型对象发起读取；读不到时说明原因，不打开空查看器。
+    fn open_definition(&mut self, node_id: &str, copy_only: bool) {
+        let Some(node) = self.nav.node(node_id).filter(|node| !node.stale && node.kind == NavKind::Object).cloned() else {
+            self.notice_key = Some("catalog.tree.staleObject");
+            self.notice_detail.clear();
+            return;
+        };
+        let Some(object) = node.object() else { return };
+        if !object.engine.is_relational() || !crate::catalog::definition::ddl_available(object.engine, object.kind) {
+            self.notice_key = Some("catalog.tree.noDefinition");
+            self.notice_detail = node.name.clone();
+            return;
+        }
+        self.ddl_view = Some(DdlView {
+            epoch: next_epoch(),
+            node_id: node_id.to_owned(),
+            object,
+            signature: node.signature.clone(),
+            relation: node.relation.clone(),
+            copy_only,
+            loading: true,
+            text: None,
+            rebuilt: false,
+            missing: Vec::new(),
+            error: None,
+        });
+        self.nav_requests.push_back(NavRequest::Definition(node_id.to_owned()));
+    }
+
+    /// 定义读完。只接受当前这一次读取；“复制 DDL”成功时把同一份文本交给剪贴板。
+    pub fn definition_loaded(&mut self, epoch: u64, result: Result<crate::catalog::definition::ObjectDdl, String>) {
+        let Some(view) = self.ddl_view.as_mut().filter(|view| view.epoch == epoch) else { return };
+        view.loading = false;
+        match result {
+            Ok(ddl) => {
+                view.text = Some(ddl.text.clone());
+                view.rebuilt = ddl.rebuilt;
+                view.missing = ddl.missing;
+                view.error = None;
+                if view.copy_only {
+                    self.ddl_view = None;
+                    self.copied = ddl.text.clone();
+                    self.clipboard_out = Some(ddl.text);
+                    self.notice_key = Some("catalog.ddl.copied");
+                    self.notice_detail.clear();
+                }
+            }
+            Err(message) => {
+                // 失败只说明原因，不提供复制，也不动剪贴板。
+                view.text = None;
+                view.error = Some(message.clone());
+                if view.copy_only {
+                    self.ddl_view = None;
+                    self.notice_key = Some("catalog.ddl.failed");
+                    self.notice_detail = message;
+                }
+            }
+        }
+    }
+
+    /// 视图取走要写进系统剪贴板的文本。
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.clipboard_out.take()
+    }
+
+    /// “刷新此节点”：只重读这一行的子项，展开状态由稳定的节点 id 保留。
+    /// 连接/键空间以及没有对象分组的库（带模式层的引擎、MongoDB）按连接重读；
+    /// 库/模式从第一页重读；种类分组只重读这一类。
+    pub fn refresh_nav_node(&mut self, node_id: &str) {
+        let Some(node) = self.nav.node(node_id).cloned() else {
+            self.notice_key = Some("catalog.tree.staleObject");
+            self.notice_detail.clear();
+            return;
+        };
+        let whole_connection = match node.kind {
+            NavKind::Connection | NavKind::Keyspace => true,
+            NavKind::Database => node.engine.shows_schemas() || !node.engine.is_relational(),
+            NavKind::Schema => !node.engine.is_relational(),
+            _ => false,
+        };
+        if whole_connection {
+            self.request_nav_refresh(Some(node.connection_id.clone()));
+            return;
+        }
+        match node.kind {
+            NavKind::Database | NavKind::Schema => {
+                if node.loading {
+                    return;
+                }
+                self.nav.begin_scope(node_id);
+                self.nav_requests.push_back(NavRequest::Reload(node_id.to_owned()));
+            }
+            NavKind::Group if node.object_kind.is_some() => {
+                if self.nav.begin_group(node_id) {
+                    self.nav_requests.push_back(NavRequest::Group(node_id.to_owned()));
+                }
+            }
+            _ => {
+                self.notice_key = Some("catalog.tree.actionUnavailable");
+                self.notice_detail = node.name.clone();
+            }
+        }
+    }
+
+    /// 生成 SQL 模板。列已经读过就直接插入；否则先按需读列，读完再插入。
+    fn begin_template(&mut self, node_id: &str, kind: TemplateKind) {
+        let Some(object) = self.nav_target(node_id).filter(|object| object.engine.is_relational() && object.opens_data()) else {
+            self.notice_key = Some("catalog.tree.staleObject");
+            self.notice_detail.clear();
+            return;
+        };
+        match self.nav.object_columns(node_id) {
+            Some(columns) if !columns.is_empty() => self.insert_template(kind, &object, &columns),
+            _ => {
+                self.pending_template = Some((node_id.to_owned(), kind));
+                let loading = self.nav.node(node_id).is_some_and(|node| node.loading);
+                if !loading {
+                    self.request_nav_details(node_id);
+                }
+            }
+        }
+    }
+
+    /// 这个节点有没有等列的模板；视图据此先把编辑器里的最新文本收回草稿。
+    pub fn template_waits_for(&self, node_id: &str) -> bool {
+        self.pending_template.as_ref().is_some_and(|(id, _)| id == node_id)
+    }
+
+    /// 列/索引读完：写进树里；若有等着这一行列的模板，用读到的列生成并插入。
+    pub fn nav_details_loaded(
+        &mut self,
+        node_id: &str,
+        columns: Result<Vec<crate::catalog::hierarchy::ColumnInfo>, String>,
+        indexes: Result<Vec<crate::catalog::hierarchy::IndexInfo>, String>,
+    ) {
+        let column_error = columns.as_ref().err().cloned();
+        self.nav.set_details(node_id, columns, indexes);
+        if !self.template_waits_for(node_id) {
+            return;
+        }
+        let Some((_, kind)) = self.pending_template.take() else { return };
+        let columns = self.nav.object_columns(node_id).unwrap_or_default();
+        match self.nav_target(node_id) {
+            Some(object) if !columns.is_empty() => self.insert_template(kind, &object, &columns),
+            _ => {
+                self.notice_key = Some("catalog.tree.templateNoColumns");
+                self.notice_detail = column_error.unwrap_or_default();
+            }
+        }
+    }
+
+    /// 模板只写草稿，不执行。当前不是查询项时，新开一个绑定这个对象连接与库的查询。
+    fn insert_template(&mut self, kind: TemplateKind, object: &ObjectKey, columns: &[(String, bool)]) {
+        let text = nav::template_text(kind, object, columns);
+        if self.active_tab().is_some_and(|tab| tab.kind.is_query()) {
+            self.insert_into_draft(text);
+        } else {
+            self.open_bound_query(
+                text,
+                Some(object.connection_id.clone()),
+                Some(object.connection_name.clone()),
+                Some(object.database.clone()),
+                Some(object.engine.as_str().to_owned()),
+            );
+        }
+    }
+
+    /// 打开危险操作确认层。只接受关系型连接里的表/视图，种类不符时说明原因。
+    fn open_danger(&mut self, menu_id: &str, node_id: &str) {
+        let Some(object) = self.nav_target(node_id) else {
+            self.notice_key = Some("catalog.tree.staleObject");
+            self.notice_detail.clear();
+            return;
+        };
+        if !object.engine.is_relational() {
+            self.notice_key = Some("catalog.tree.relationalOnly");
+            self.notice_detail = object.name.clone();
+            return;
+        }
+        let Some(kind) = DangerKind::from_menu(menu_id, object.kind) else {
+            self.notice_key = Some("catalog.tree.actionUnavailable");
+            self.notice_detail = object.name.clone();
+            return;
+        };
+        let env = self.nav_environment(&object.connection_id);
+        let prompt = DangerPrompt::new(kind, node_id, object, &env);
+        self.focused_field = if kind == DangerKind::Rename {
+            Some(DraftField::DangerNewName)
+        } else if prompt.prod {
+            Some(DraftField::DangerConfirm)
+        } else {
+            None
+        };
+        self.danger = Some(prompt);
+    }
+
+    /// 视图取走确认层要做的一步异步工作。
+    pub fn take_danger_request(&mut self) -> Option<(DangerStep, DangerPrompt)> {
+        let prompt = self.danger.as_mut()?;
+        let step = prompt.take_request()?;
+        Some((step, prompt.clone()))
+    }
+
+    /// 计划与标签表读完。确认层已关闭或换了一次时丢弃。
+    pub fn danger_planned(&mut self, epoch: u64, tags: Option<Vec<crate::connections::model::EnvTag>>, result: Result<crate::ddl::Plan, String>) {
+        let Some(prompt) = self.danger.as_mut().filter(|prompt| prompt.epoch == epoch) else { return };
+        prompt.apply_tags(tags.as_deref());
+        prompt.apply_plan(result);
+    }
+
+    /// 执行结束。成功：收起确认层，把这个对象从树上拿掉并重读所属连接；
+    /// 失败：数据库原因留在确认层里，树保持执行前的样子。
+    pub fn danger_finished(&mut self, epoch: u64, result: Result<crate::ddl::Receipt, String>) -> bool {
+        let Some(prompt) = self.danger.as_mut().filter(|prompt| prompt.epoch == epoch) else { return false };
+        if !prompt.apply_receipt(result) {
+            return false;
+        }
+        let prompt = self.danger.take().expect("prompt");
+        if matches!(prompt.kind, DangerKind::DropTable | DangerKind::DropView | DangerKind::Rename) {
+            self.nav.forget(&prompt.node_id);
+        }
+        self.request_nav_refresh(Some(prompt.object.connection_id.clone()));
+        self.notice_key = Some("catalog.danger.done");
+        self.notice_detail = prompt.object.name.clone();
+        if matches!(self.focused_field, Some(DraftField::DangerConfirm | DraftField::DangerNewName)) {
+            self.focused_field = None;
+        }
+        true
+    }
+
+    /// 结构页删除表成功：这张表立即离开树，再重读所属连接。
+    pub fn table_dropped(&mut self, connection_id: &str, database: &str, schema: &str, table: &str) {
+        let id = self
+            .nav
+            .object_by_key(connection_id, database, schema, table, crate::catalog::model::ObjectKind::Table)
+            .map(|node| node.id.clone());
+        if let Some(id) = id {
+            self.nav.forget(&id);
+        }
+        self.request_nav_refresh(Some(connection_id.to_owned()));
     }
 
     /// 对象列表真正按页读取的范围：往上找到库/模式/连接节点。
@@ -2460,6 +2846,16 @@ impl WorkbenchModel {
             DraftField::SaveName => self.history.save_name = value,
             DraftField::RenameName => self.history.rename_text = value,
             DraftField::PaletteQuery => self.palette_query = value,
+            DraftField::DangerConfirm => {
+                if let Some(prompt) = self.danger.as_mut() {
+                    prompt.set_typed(value);
+                }
+            }
+            DraftField::DangerNewName => {
+                if let Some(prompt) = self.danger.as_mut() {
+                    prompt.set_new_name(value);
+                }
+            }
             other => {
                 if let Some(draft) = self.connections.editor.as_mut() {
                     *field_slot(draft, other) = value;
@@ -2498,6 +2894,8 @@ impl WorkbenchModel {
             DraftField::SaveName => self.history.save_name.clone(),
             DraftField::RenameName => self.history.rename_text.clone(),
             DraftField::PaletteQuery => self.palette_query.clone(),
+            DraftField::DangerConfirm => self.danger.as_ref().map(|prompt| prompt.typed.clone()).unwrap_or_default(),
+            DraftField::DangerNewName => self.danger.as_ref().map(|prompt| prompt.new_name.clone()).unwrap_or_default(),
             other => self.connections.editor.as_ref().map(|draft| field_slot_ref(draft, other).to_owned()).unwrap_or_default(),
         }
     }

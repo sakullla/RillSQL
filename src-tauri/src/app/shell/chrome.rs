@@ -5,7 +5,8 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, TitleBar};
+use gpui_kit::component::input::{Editor, EditorState};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, TitleBar};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, ClickEvent, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
@@ -165,6 +166,12 @@ impl Workbench {
         if self.model.history.confirm_delete {
             root = root.child(self.delete_saved_layer(cx));
         }
+        if self.model.ddl_view.as_ref().is_some_and(|view| !view.copy_only) {
+            root = root.child(self.ddl_layer(window, cx));
+        }
+        if self.model.danger.is_some() {
+            root = root.child(self.danger_layer(window, cx));
+        }
         root.into_any_element()
     }
 
@@ -173,6 +180,17 @@ impl Workbench {
         let key = event.keystroke.key.as_str();
         // 浮层关闭后键盘要回到打开它的地方，而不是留在已经消失的弹层上。
         let overlay_was_open = self.model.menu.is_some() || self.model.shell.palette_open;
+        // 确认层与定义查看器：Esc 就是取消/关闭，不发送任何语句。
+        if key == "escape" && self.model.menu.is_none() && self.model.close_prompt.is_none() {
+            if self.model.danger.is_some() {
+                self.perform("danger-cancel", cx);
+                return;
+            }
+            if self.model.ddl_view.as_ref().is_some_and(|view| !view.copy_only) {
+                self.perform("ddl-close", cx);
+                return;
+            }
+        }
         if key == "escape" && self.model.connections.confirm_delete && self.model.menu.is_none() && self.model.close_prompt.is_none() {
             self.perform("conn-delete-cancel", cx);
             return;
@@ -2578,7 +2596,8 @@ impl Workbench {
             .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
         for (index, item) in menu.items.iter().enumerate() {
-            if index > 0 && item.danger {
+            // 危险项成组：只在第一个危险项前画一条分隔线。
+            if index > 0 && item.danger && !menu.items[index - 1].danger {
                 list = list.child(div().h(px(1.)).my(px(4.)).mx(px(6.)).bg(p.line));
             }
             let id = item.id.to_owned();
@@ -2693,6 +2712,227 @@ impl Workbench {
                 .child(kit::danger_button("cmd-saved-delete-confirm", Some(IconName::Trash), self.t("ui.history.delete"), act("saved-delete", cx))),
         );
         backdrop("delete-saved-backdrop", 0.32, cx).flex().items_center().justify_center().px(px(20.)).child(dialog).into_any_element()
+    }
+
+    /// 对象定义查看器：只读、SQL 高亮。重建的定义标明来源并列出没有包含的内容。
+    fn ddl_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let Some(view) = self.model.ddl_view.clone() else {
+            return div().into_any_element();
+        };
+        let name = super::nav::qualified_name(&view.object);
+        let title = SharedString::from(format!("{} · {name}", self.model.text("catalog.ddl.title")));
+        let body: AnyElement = if view.loading {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .text_color(p.text_muted)
+                .child(Spinner::new().small().color(p.accent))
+                .child(self.t("catalog.ddl.loading"))
+                .into_any_element()
+        } else if let Some(text) = view.text.clone() {
+            let editor = match &self.ddl_editor {
+                Some((epoch, editor)) if *epoch == view.epoch => editor.clone(),
+                _ => {
+                    let editor = gpui_kit::AppContext::new(cx, |cx| EditorState::new(window, cx).language("sql").line_number(true).default_value(text.clone()));
+                    self.ddl_editor = Some((view.epoch, editor.clone()));
+                    editor
+                }
+            };
+            div()
+                .id("ddl-viewer-text")
+                .test_support()
+                .h(px(320.))
+                .rounded(px(6.))
+                .border_1()
+                .border_color(p.line)
+                .bg(p.surface)
+                .overflow_hidden()
+                .child(Editor::new(&editor).readonly(true).h(gpui_kit::relative(1.)).bordered(false).aria_label(title.clone()))
+                .into_any_element()
+        } else {
+            let error = view.error.clone().unwrap_or_default();
+            banner(IconName::TriangleAlert, SharedString::from(format!("{} {error}", self.model.text("catalog.ddl.failed"))), p.danger, p.danger_soft)
+        };
+        let rebuilt = view.rebuilt.then(|| {
+            let mut text = self.model.text("catalog.ddl.rebuilt");
+            if !view.missing.is_empty() {
+                let missing = i18n::fill(&self.model.text("catalog.ddl.missing"), &[("items", &view.missing.join(", "))]);
+                text = format!("{text} {missing}");
+            }
+            div().id("ddl-viewer-rebuilt").test_support().child(banner(IconName::Info, SharedString::from(text), p.warn, p.warn_soft))
+        });
+        let has_text = view.text.is_some();
+        let dialog = div()
+            .id("ddl-viewer")
+            .test_support()
+            .role(gpui_kit::Role::Dialog)
+            .aria_label(title.clone())
+            .occlude()
+            .w_full()
+            .max_w(px(760.))
+            .min_w(px(0.))
+            .p(px(20.))
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .bg(p.raised)
+            .border_1()
+            .border_color(p.line)
+            .rounded(px(12.))
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(kit::icon(IconName::Code, 16., p.accent))
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(kit::title(title, 15., &p))),
+            )
+            .when_some(rebuilt, |this, rebuilt| this.child(rebuilt))
+            .child(body)
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(kit::secondary_button("cmd-ddl-close", None, self.t("common.close"), act("ddl-close", cx)))
+                    .when(has_text, |this| {
+                        this.child(kit::primary_button("cmd-ddl-copy", Some(IconName::Copy), self.t("catalog.tree.copyDdl"), act("ddl-copy", cx)))
+                    }),
+            );
+        backdrop("ddl-backdrop", 0.32, cx).flex().items_center().justify_center().px(px(20.)).child(dialog).into_any_element()
+    }
+
+    /// 对象级危险操作的确认层：目标、环境、将执行的语句与风险；第一次点执行只待确认，
+    /// 生产环境还要输入对象名。
+    fn danger_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let Some(prompt) = self.model.danger.clone() else {
+            return div().into_any_element();
+        };
+        let name = super::nav::qualified_name(&prompt.object);
+        let title = self.t(prompt.kind.title_key());
+        let env = if prompt.env.trim().is_empty() || prompt.env == crate::connections::model::ENV_NONE {
+            "—".to_owned()
+        } else {
+            prompt.env_label.clone()
+        };
+        let facts = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .text_size(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(div().w(px(84.)).flex_none().text_color(p.text_muted).child(self.t("catalog.danger.target")))
+                    .child(div().id("danger-target").min_w(px(0.)).truncate().child(SharedString::from(name.clone()))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(div().w(px(84.)).flex_none().text_color(p.text_muted).child(self.t("catalog.danger.env")))
+                    .child(
+                        div()
+                            .id("danger-env")
+                            .text_color(if prompt.prod { p.danger } else { p.text })
+                            .when(prompt.prod, |this| this.font_weight(FontWeight::SEMIBOLD))
+                            .child(SharedString::from(env)),
+                    ),
+            );
+        let mut content = div().flex().flex_col().gap(px(10.)).child(facts);
+        if prompt.kind == super::danger::DangerKind::Rename {
+            let input = self.input_for(DraftField::DangerNewName, &self.model.text("catalog.danger.newName"), false, window, cx);
+            content = content.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().flex_1().min_w(px(0.)).child(input))
+                    .child(kit::secondary_button("cmd-danger-preview", Some(IconName::Eye), self.t("catalog.danger.preview"), act("danger-preview", cx)).disabled(prompt.running)),
+            );
+        }
+        if prompt.loading {
+            content = content.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_color(p.text_muted)
+                    .child(Spinner::new().small().color(p.accent))
+                    .child(self.t("catalog.danger.loading")),
+            );
+        } else if prompt.plan.is_none() && prompt.error.is_none() && prompt.kind == super::danger::DangerKind::Rename {
+            content = content.child(div().text_size(px(12.)).text_color(p.text_muted).child(self.t("catalog.danger.renameHint")));
+        }
+        if let Some(plan) = prompt.plan.as_ref() {
+            if !plan.sql.is_empty() {
+                let mono = cx.theme().mono_font_family.clone();
+                content = content.child(kit::eyebrow(self.t("catalog.danger.sql"), &p)).child(
+                    div()
+                        .id("danger-sql")
+                        .px(px(10.))
+                        .py(px(8.))
+                        .rounded(px(6.))
+                        .bg(p.surface)
+                        .border_1()
+                        .border_color(p.line)
+                        .font_family(mono)
+                        .text_size(px(12.))
+                        .child(SharedString::from(plan.sql.join("\n"))),
+                );
+            }
+            let mut risks = div().flex().flex_col().gap(px(4.));
+            for (level, text) in &plan.risks {
+                let (fg, bg) = if level == "danger" { (p.danger, p.danger_soft) } else if level == "warn" { (p.warn, p.warn_soft) } else { (p.text_muted, p.hover) };
+                risks = risks.child(div().px(px(10.)).py(px(6.)).rounded(px(6.)).bg(bg).text_color(fg).text_size(px(12.)).child(SharedString::from(text.clone())));
+            }
+            content = content.child(risks);
+            if !plan.blocked.is_empty() {
+                content = content.child(banner(IconName::Ban, SharedString::from(plan.blocked.join(" ")), p.danger, p.danger_soft));
+            }
+        }
+        if let Some(error) = prompt.error.as_ref() {
+            content = content.child(div().id("danger-error").child(banner(IconName::TriangleAlert, SharedString::from(error.clone()), p.danger, p.danger_soft)));
+        }
+        if prompt.prod {
+            let hint = i18n::fill(&self.model.text("catalog.danger.prodHint"), &[("name", &prompt.object.name)]);
+            let input = self.input_for(DraftField::DangerConfirm, &prompt.object.name, false, window, cx);
+            content = content
+                .child(div().text_size(px(12.)).text_color(p.danger).child(SharedString::from(hint)))
+                .child(input);
+        }
+        if prompt.running {
+            content = content.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_color(p.text_muted)
+                    .child(Spinner::new().small().color(p.accent))
+                    .child(self.t("catalog.danger.running")),
+            );
+        }
+        let ready = prompt.execute_ready();
+        let label = if prompt.armed { self.t("catalog.danger.confirmAgain") } else { self.t("catalog.danger.execute") };
+        let dialog = dialog_card("danger-confirm", IconName::TriangleAlert, p.danger, title, SharedString::from(name), &p)
+            .test_support()
+            .max_w(px(560.))
+            .child(div().id("danger-body").max_h(px(420.)).overflow_y_scroll().child(content))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(kit::secondary_button("cmd-danger-cancel", None, self.t("common.cancel"), act("danger-cancel", cx)))
+                    .child(kit::danger_button("cmd-danger-execute", Some(IconName::TriangleAlert), label, act("danger-execute", cx)).disabled(!ready)),
+            );
+        backdrop("danger-backdrop", 0.32, cx).flex().items_center().justify_center().px(px(20.)).child(dialog).into_any_element()
     }
 
     fn exchange_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {

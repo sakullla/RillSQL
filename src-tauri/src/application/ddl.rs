@@ -23,7 +23,6 @@ pub async fn describe_saved(service: &Service, connection_id: &str, database: St
 }
 
 /// 对象树“查看/复制 DDL”的读取入口。只在已打开的会话上读，不另开连接。
-#[allow(dead_code)]
 pub async fn object_definition(service: &Service, connection_id: &str, engine: Engine, key: &DdlKey) -> Result<ObjectDdl, String> {
     let session = open_session(service, connection_id)?;
     object_ddl(&session, engine, key).await

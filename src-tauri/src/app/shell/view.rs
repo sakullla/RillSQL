@@ -67,6 +67,8 @@ pub struct Workbench {
     pub(super) palette_focused: bool,
     pub(super) pending_browser: Option<String>,
     connected_seen: std::collections::BTreeSet<String>,
+    /// 定义查看器的只读编辑器（SQL 高亮），按读取编号填入文本。
+    pub(super) ddl_editor: Option<(u64, Entity<gpui_kit::component::input::EditorState>)>,
 }
 
 impl Workbench {
@@ -138,6 +140,7 @@ impl Workbench {
             palette_focused: false,
             pending_browser: None,
             connected_seen: std::collections::BTreeSet::new(),
+            ddl_editor: None,
         }
     }
 
@@ -151,7 +154,12 @@ impl Workbench {
             // 目录树与查询页的对象索引各自刷新；树保留展开、焦点与已读子节点。
             self.model.request_nav_refresh(None);
         }
-        if id.starts_with("nav-insert-") || matches!(id, "tree-insert-object" | "tree-insert-select" | "tree-insert-column") {
+        if id.starts_with("nav-insert-")
+            || matches!(
+                id,
+                "tree-insert-object" | "tree-insert-select" | "tree-insert-column" | "tree-template-insert" | "tree-template-update" | "tree-template-delete"
+            )
+        {
             // 插入前先把编辑器里的最新文本收回草稿，追加时才不会丢掉刚输入的内容。
             // 对象树菜单和导航命令走同一条捕获路径。
             self.forward_query("capture", cx);
@@ -842,7 +850,149 @@ impl Workbench {
                 super::nav::NavRequest::Details(id) => self.spawn_nav_details(id, cx),
                 super::nav::NavRequest::More(id) => self.spawn_nav_more(id, cx),
                 super::nav::NavRequest::Group(id) => self.spawn_nav_group(id, cx),
+                super::nav::NavRequest::Reload(id) => self.spawn_nav_reload(id, cx),
+                super::nav::NavRequest::Definition(id) => self.spawn_definition(id, cx),
             }
+        }
+    }
+
+    /// 库/模式“刷新此节点”：从第一页重读这个范围。加载态已由模型标好。
+    fn spawn_nav_reload(&mut self, node_id: String, cx: &mut Context<Self>) {
+        let Some(node) = self.model.nav_node(&node_id).cloned() else { return };
+        let services = Arc::clone(&self.services);
+        let page = usize::try_from(self.model.settings.object_page.max(1)).unwrap_or(100);
+        let view = cx.entity().downgrade();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        jobs::runtime().spawn(async move {
+            let Some(session) = services.connections.catalog_session(&node.connection_id) else {
+                let _ = tx.send((Vec::new(), 0, Some("这条连接还没有打开".to_owned())));
+                return;
+            };
+            let body = crate::catalog::read_object_page(&session, node.engine, &node.database, &node.schema, 0, page).await;
+            let _ = tx.send((body.objects, body.total, body.error));
+        });
+        cx.spawn(async move |_, cx| {
+            let result = rx.await;
+            cx.update(|cx| {
+                let Some(view) = view.upgrade() else { return };
+                view.update(cx, |this, cx| {
+                    match result {
+                        Ok((objects, total, error)) => {
+                            this.model.nav.reload_scope(&node_id, &objects, total, error);
+                        }
+                        Err(_) => {
+                            this.model.nav.reload_scope(&node_id, &[], 0, Some("刷新对象失败".to_owned()));
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// 读一个对象的定义（查看/复制 DDL）。只在已打开的会话上读，不另开连接。
+    fn spawn_definition(&mut self, node_id: String, cx: &mut Context<Self>) {
+        let Some(ddl) = self.model.ddl_view.clone().filter(|view| view.node_id == node_id) else { return };
+        let services = Arc::clone(&self.services);
+        let view = cx.entity().downgrade();
+        let epoch = ddl.epoch;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        jobs::runtime().spawn(async move {
+            let key = crate::catalog::definition::DdlKey {
+                database: ddl.object.database.clone(),
+                schema: ddl.object.schema.clone(),
+                name: ddl.object.name.clone(),
+                kind: ddl.object.kind,
+                signature: ddl.signature.clone(),
+                relation: ddl.relation.clone(),
+            };
+            let result = crate::application::ddl::object_definition(&services.connections, &ddl.object.connection_id, ddl.object.engine, &key).await;
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |_, cx| {
+            let result = rx.await;
+            cx.update(|cx| {
+                let Some(view) = view.upgrade() else { return };
+                view.update(cx, |this, cx| {
+                    let result = result.unwrap_or_else(|_| Err("读取定义失败".to_owned()));
+                    this.model.definition_loaded(epoch, result);
+                    this.flush_clipboard(cx);
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// 确认层排队的预览或执行。都只在已打开的会话上走 application::ddl。
+    fn pump_danger(&mut self, cx: &mut Context<Self>) {
+        while let Some((step, prompt)) = self.model.take_danger_request() {
+            let services = Arc::clone(&self.services);
+            let view = cx.entity().downgrade();
+            let epoch = prompt.epoch;
+            let request = crate::application::ddl::request(
+                prompt.object.database.clone(),
+                prompt.object.schema.clone(),
+                prompt.engine().as_str(),
+                prompt.action(),
+            );
+            let connection = prompt.object.connection_id.clone();
+            match step {
+                super::danger::DangerStep::Preview => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    jobs::runtime().spawn(async move {
+                        let tags = services.connections.list_tags().await.ok();
+                        let plan = match request {
+                            Ok(request) => crate::application::ddl::preview_request(&services.connections, &connection, &request).await,
+                            Err(message) => Err(message),
+                        };
+                        let _ = tx.send((tags, plan));
+                    });
+                    cx.spawn(async move |_, cx| {
+                        let result = rx.await;
+                        cx.update(|cx| {
+                            let Some(view) = view.upgrade() else { return };
+                            view.update(cx, |this, cx| {
+                                let (tags, plan) = result.unwrap_or_else(|_| (None, Err("生成计划失败".to_owned())));
+                                this.model.danger_planned(epoch, tags, plan);
+                                cx.notify();
+                            });
+                        });
+                    })
+                    .detach();
+                }
+                super::danger::DangerStep::Execute => {
+                    let sql = prompt.confirmed_sql();
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    jobs::runtime().spawn(async move {
+                        let receipt = match request {
+                            Ok(request) => crate::application::ddl::execute_request(&services.connections, &connection, &request, &sql, true).await,
+                            Err(message) => Err(message),
+                        };
+                        let _ = tx.send(receipt);
+                    });
+                    cx.spawn(async move |_, cx| {
+                        let result = rx.await;
+                        cx.update(|cx| {
+                            let Some(view) = view.upgrade() else { return };
+                            view.update(cx, |this, cx| {
+                                let receipt = result.unwrap_or_else(|_| Err("执行失败".to_owned()));
+                                this.model.danger_finished(epoch, receipt);
+                                cx.notify();
+                            });
+                        });
+                    })
+                    .detach();
+                }
+            }
+        }
+    }
+
+    /// 把模型交出的文本写进系统剪贴板。
+    pub(super) fn flush_clipboard(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.model.take_clipboard() {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
         }
     }
 
@@ -898,7 +1048,11 @@ impl Workbench {
                         Ok(pair) => pair,
                         Err(_) => (Err("读取列表失败".to_owned()), Err("读取列表失败".to_owned())),
                     };
-                    this.model.nav.set_details(&node_id, columns, indexes);
+                    if this.model.template_waits_for(&node_id) {
+                        // 模板要并入草稿：先把编辑器里的最新文本收回来，追加时才不会丢。
+                        this.forward_query("capture", cx);
+                    }
+                    this.model.nav_details_loaded(&node_id, columns, indexes);
                     cx.notify();
                 });
             });
@@ -908,9 +1062,8 @@ impl Workbench {
 
     fn spawn_nav_more(&mut self, node_id: String, cx: &mut Context<Self>) {
         let Some(node) = self.model.nav_node(&node_id).cloned() else { return };
-        if node.loading {
-            return;
-        }
+        // 排队的 More 请求已经由模型标好加载态（并且在那里去重）；这里再按 loading
+        // 提前返回会让“读取更多”永远不发请求、加载态也永远不落。
         self.model.nav.begin_scope(&node_id);
         let services = Arc::clone(&self.services);
         let page = usize::try_from(self.model.settings.object_page.max(1)).unwrap_or(100);
@@ -1494,6 +1647,13 @@ impl Render for Workbench {
         self.boot_state(cx);
         self.pump_jobs(cx);
         self.pump_nav(cx);
+        self.pump_danger(cx);
+        self.flush_clipboard(cx);
+        // 结构页删除表成功后，对象树也要跟着变。
+        if let Some(target) = self.structure.update(cx, |pane, _| pane.take_dropped()) {
+            self.model.table_dropped(&target.connection_id, &target.database, &target.schema, &target.table);
+            self.pump_nav(cx);
+        }
         self.sync_view_settings(cx);
         self.sync_query(window, cx);
         self.sync_catalog(cx);

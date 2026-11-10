@@ -186,6 +186,12 @@ pub struct NavNode {
     pub loading: bool,
     pub stale: bool,
     pub children: Vec<String>,
+    /// PostgreSQL 重载函数的参数签名；读定义时用来定位同名对象。其余为空。
+    pub signature: String,
+    /// 触发器所属的表；读定义时用。其余为空。
+    pub relation: String,
+    /// 列节点是否属于主键；SQL 模板据此写 WHERE。其余为 false。
+    pub primary: bool,
 }
 
 impl NavNode {
@@ -213,6 +219,9 @@ impl NavNode {
             loading: false,
             stale: false,
             children: Vec::new(),
+            signature: String::new(),
+            relation: String::new(),
+            primary: false,
         }
     }
 
@@ -611,6 +620,8 @@ impl NavTree {
         node.name = object.name.clone();
         node.object_kind = Some(object.kind);
         node.stale = object.stale;
+        node.signature = object.signature.clone();
+        node.relation = object.relation.clone();
         node.expandable = matches!(object.kind, ObjectKind::Table | ObjectKind::View);
         node
     }
@@ -749,6 +760,7 @@ impl NavTree {
                     node.schema = object.schema.clone();
                     node.name = item.name.clone();
                     node.label_key = None;
+                    node.primary = item.primary;
                     let detail = if item.data_type.is_empty() { String::new() } else { item.data_type.clone() };
                     let marks = [item.primary.then_some("pk"), (!item.nullable).then_some("not null")]
                         .into_iter()
@@ -905,8 +917,11 @@ impl NavTree {
             ConnStatus::Connected,
         );
         let mut added = 0usize;
-        for object in objects.iter().filter(|object| object.kind == kind) {
+        let mut read_ids = BTreeSet::new();
+        let of_kind: Vec<&ObjectRow> = objects.iter().filter(|object| object.kind == kind).collect();
+        for object in &of_kind {
             let object_id = object_node_id(&group.connection_id, &group.database, &group.schema, object);
+            read_ids.insert(object_id.clone());
             if let Some(existing) = self.nodes.get_mut(&object_id) {
                 // 上一轮标记过删除的对象这次又读到了：恢复成可用行，不再另建一条。
                 existing.stale = false;
@@ -916,6 +931,11 @@ impl NavTree {
             self.attach(group_id, node);
             added += 1;
         }
+        // 这一类整页读完（没有下一页）时，读不到的旧对象就是被删掉的：
+        // 和整树刷新一样先标 stale，下一次刷新仍不在才移除。只读到一页时不判断。
+        if of_kind.len() >= total {
+            self.retire_missing(group_id, &read_ids);
+        }
         if let Some(node) = self.nodes.get_mut(group_id) {
             node.loading = false;
             node.error = None;
@@ -923,6 +943,152 @@ impl NavTree {
             node.total = total.max(node.loaded);
         }
         added > 0
+    }
+
+    /// 一个分组下没有在完整读取里出现的对象：第一次标 stale，已经 stale 的这次移除。
+    fn retire_missing(&mut self, group_id: &str, read_ids: &BTreeSet<String>) {
+        let children = self.nodes.get(group_id).map(|node| node.children.clone()).unwrap_or_default();
+        for child in children {
+            if read_ids.contains(&child) {
+                continue;
+            }
+            let Some(node) = self.nodes.get_mut(&child) else { continue };
+            if node.kind != NavKind::Object {
+                continue;
+            }
+            if node.stale {
+                self.remove_subtree(&child);
+            } else {
+                node.stale = true;
+                node.error = None;
+                node.loading = false;
+            }
+        }
+        if let Some(group) = self.nodes.get_mut(group_id) {
+            group.loaded = group.children.len();
+        }
+    }
+
+    /// 把一个节点连同它的子孙从树上拿掉，父节点、展开和焦点一起收拾。
+    fn remove_subtree(&mut self, id: &str) {
+        let Some(node) = self.nodes.remove(id) else { return };
+        if let Some(parent) = node.parent.as_deref().and_then(|parent| self.nodes.get_mut(parent)) {
+            parent.children.retain(|child| child != id);
+        }
+        self.expanded.remove(id);
+        if self.focus.as_deref() == Some(id) {
+            self.focus = node.parent.clone();
+        }
+        for child in node.children {
+            self.remove_subtree(&child);
+        }
+    }
+
+    /// 已知被删掉或改名的对象（本应用刚执行成功）：直接从树上拿掉，不再经过 stale。
+    pub fn forget(&mut self, id: &str) -> bool {
+        if !self.nodes.contains_key(id) {
+            return false;
+        }
+        let parent = self.nodes.get(id).and_then(|node| node.parent.clone());
+        self.remove_subtree(id);
+        if let Some(group) = parent.as_deref().and_then(|parent| self.nodes.get_mut(parent)) {
+            if group.kind == NavKind::Group {
+                group.loaded = group.children.len();
+                group.total = group.total.saturating_sub(1).max(group.loaded);
+            }
+        }
+        true
+    }
+
+    /// 库/模式的“刷新此节点”：从第一页重新读这个范围的对象。
+    /// 失败时保留已有子项，只把原因留在这个节点；成功时补上新对象，
+    /// 读完整个范围时把不见的旧对象按整树刷新的规则标 stale/移除。展开状态不动。
+    pub fn reload_scope(&mut self, scope_id: &str, objects: &[ObjectRow], total: usize, error: Option<String>) -> bool {
+        let Some(scope) = self.nodes.get(scope_id).cloned() else { return false };
+        if let Some(message) = error {
+            if let Some(node) = self.nodes.get_mut(scope_id) {
+                node.loading = false;
+                node.error = Some(message);
+            }
+            return false;
+        }
+        let full = objects.len() >= total;
+        let mut read: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let connection = NavConnection::new(scope.connection_id.clone(), scope.connection_name.clone(), scope.engine, ConnStatus::Connected);
+        let mut added = false;
+        for object in objects {
+            let group_id = group_node_id(&scope.connection_id, &scope.database, &scope.schema, object.kind);
+            if !self.nodes.contains_key(&group_id) {
+                let mut group = NavNode::new(NavKind::Group, group_id.clone(), String::new());
+                group.label_key = Some(kind_label_key(object.kind));
+                group.path = schema_path(&scope.connection_name, &scope.database, &scope.schema, object.kind);
+                group.connection_id = scope.connection_id.clone();
+                group.connection_name = scope.connection_name.clone();
+                group.engine = scope.engine;
+                group.database = scope.database.clone();
+                group.schema = scope.schema.clone();
+                group.name = kind_name(object.kind).to_owned();
+                group.object_kind = Some(object.kind);
+                group.expandable = true;
+                self.attach(scope_id, group);
+            }
+            let object_id = object_node_id(&scope.connection_id, &scope.database, &scope.schema, object);
+            read.entry(group_id.clone()).or_default().insert(object_id.clone());
+            if let Some(existing) = self.nodes.get_mut(&object_id) {
+                existing.stale = false;
+                continue;
+            }
+            let node = self.object_node(&connection, &scope.database, &scope.schema, object, &object_id);
+            self.attach(&group_id, node);
+            added = true;
+        }
+        if full {
+            let groups: Vec<String> = scope
+                .children
+                .iter()
+                .filter(|id| self.nodes.get(*id).is_some_and(|node| node.kind == NavKind::Group))
+                .cloned()
+                .collect();
+            let empty = BTreeSet::new();
+            for group in groups {
+                let ids = read.get(&group).unwrap_or(&empty).clone();
+                self.retire_missing(&group, &ids);
+            }
+        }
+        for (group_id, ids) in &read {
+            if let Some(group) = self.nodes.get_mut(group_id) {
+                group.loaded = group.children.len();
+                group.total = group.total.max(ids.len());
+                group.error = None;
+            }
+        }
+        if let Some(node) = self.nodes.get_mut(scope_id) {
+            node.loading = false;
+            node.error = None;
+            node.loaded = if full { objects.len() } else { scope.loaded.max(objects.len()) };
+            node.total = total.max(node.loaded);
+            node.has_more = node.loaded < node.total;
+        }
+        added
+    }
+
+    /// 对象节点下已经读到的列：(列名, 是否主键)。列还没读过时返回 None。
+    pub fn object_columns(&self, object_id: &str) -> Option<Vec<(String, bool)>> {
+        let object = self.nodes.get(object_id)?;
+        let group = object
+            .children
+            .iter()
+            .filter_map(|id| self.nodes.get(id))
+            .find(|node| node.kind == NavKind::ColumnGroup)?;
+        Some(
+            group
+                .children
+                .iter()
+                .filter_map(|id| self.nodes.get(id))
+                .filter(|node| node.kind == NavKind::Column)
+                .map(|node| (node.name.clone(), node.primary))
+                .collect(),
+        )
     }
 
     /// 分组重试开始：只在这个分组上显示加载态，兄弟分组不受影响。

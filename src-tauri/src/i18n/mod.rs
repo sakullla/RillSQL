@@ -798,6 +798,36 @@ dict! {
     "ui.structure.none" => "没有可显示的内容", "Nothing to show";
     "ui.structure.dropTitle" => "删除整张表", "Drop the whole table";
     "ui.structure.dropDetail" => "会删除表结构和其中全部数据。预览 SQL 后还需再确认一次才会执行。", "Removes the table and all of its data. You confirm again after previewing the SQL.";
+    "catalog.tree.refreshNode" => "刷新此节点", "Refresh this node";
+    "catalog.tree.viewDdl" => "查看 DDL", "View DDL";
+    "catalog.tree.copyDdl" => "复制 DDL", "Copy DDL";
+    "catalog.tree.noDefinition" => "这个对象读不到定义", "No definition can be read for this object";
+    "catalog.tree.templateInsert" => "生成 INSERT 模板", "Generate INSERT template";
+    "catalog.tree.templateUpdate" => "生成 UPDATE 模板", "Generate UPDATE template";
+    "catalog.tree.templateDelete" => "生成 DELETE 模板", "Generate DELETE template";
+    "catalog.tree.templateNoColumns" => "读不到这个对象的列，没有生成模板。", "Could not read this object's columns, so no template was generated.";
+    "catalog.tree.dropTable" => "删除表", "Drop table";
+    "catalog.tree.dropView" => "删除视图", "Drop view";
+    "catalog.tree.truncateTable" => "清空表", "Empty table";
+    "catalog.tree.renameTable" => "重命名表", "Rename table";
+    "catalog.ddl.title" => "对象定义", "Object definition";
+    "catalog.ddl.loading" => "正在读取定义…", "Reading the definition…";
+    "catalog.ddl.failed" => "读取定义失败。", "Could not read the definition.";
+    "catalog.ddl.copied" => "已复制 DDL", "DDL copied";
+    "catalog.ddl.rebuilt" => "按元数据重建，不是数据库保存的原文。", "Rebuilt from metadata; this is not the text stored by the database.";
+    "catalog.ddl.missing" => "未包含：{items}。", "Not included: {items}.";
+    "catalog.danger.target" => "对象", "Object";
+    "catalog.danger.env" => "环境", "Environment";
+    "catalog.danger.sql" => "将执行的语句", "Statements to run";
+    "catalog.danger.newName" => "新名称", "New name";
+    "catalog.danger.preview" => "生成预览", "Preview";
+    "catalog.danger.renameHint" => "输入新名称后生成预览。", "Enter the new name, then preview.";
+    "catalog.danger.loading" => "正在生成计划…", "Building the plan…";
+    "catalog.danger.running" => "正在执行…", "Running…";
+    "catalog.danger.execute" => "执行", "Execute";
+    "catalog.danger.confirmAgain" => "再次点击以执行", "Click again to execute";
+    "catalog.danger.prodHint" => "这是生产环境。输入对象名 {name} 后才能执行。", "This is a production connection. Type the object name {name} to enable Execute.";
+    "catalog.danger.done" => "已执行", "Done";
 }
 
 #[cfg(test)]

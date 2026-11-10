@@ -4474,7 +4474,7 @@ fn non_object_rows_never_borrow_another_object() {
 
     assert!(model.open_nav_menu(&schema));
     let ids: Vec<&str> = model.menu.as_ref().expect("菜单").items.iter().map(|item| item.id).collect();
-    assert_eq!(ids, vec!["tree-new-query", "tree-copy-name"], "范围行只有自己的动作");
+    assert_eq!(ids, vec!["tree-new-query", "tree-copy-name", "tree-refresh-node"], "范围行只有自己的动作");
     let tabs = model.tabs.len();
     let _ = model.dispatch("tree-open-data");
     assert_eq!(model.tabs.len(), tabs, "范围行不能打开上一张表");
@@ -5063,4 +5063,466 @@ fn background_reads_keep_navigation_usable_and_latest_context_wins() {
         crate::application::tasks::TaskOutcome::Current { .. }
     ));
     assert!(model.tabs.iter().any(|tab| tab.running), "运行态本身不阻塞导航");
+}
+
+
+// ------------------------------------------------------------ 对象树 DDL / 刷新 / 模板 / 危险操作（T2）
+
+fn pg_saved(id: &str, env: &str) -> ConnectionRecord {
+    ConnectionRecord {
+        saved: SavedConnection {
+            id: id.into(),
+            name: "销售库".into(),
+            engine: Engine::Postgres,
+            env: env.into(),
+            host: Some("localhost".into()),
+            port: Some(5432),
+            database: Some("shop".into()),
+            username: Some("reader".into()),
+            file_path: None,
+            replica_set: None,
+            tls: None,
+            ssh: None,
+            password_saved: false,
+            ssh_password_saved: false,
+        },
+        ssh_host_key: None,
+    }
+}
+
+fn pg_orders_model() -> (WorkbenchModel, String) {
+    use crate::catalog::model::ObjectRow;
+    let orders = ObjectRow::table("orders", Some(2));
+    let pg = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", vec![orders.clone(), ObjectRow::view("recent")])]);
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.apply_navigation(&[pg], false);
+    (model, nav_id("pg", "shop", "public", &orders))
+}
+
+fn order_columns() -> Vec<crate::catalog::hierarchy::ColumnInfo> {
+    use crate::catalog::hierarchy::ColumnInfo;
+    vec![
+        ColumnInfo { name: "id".into(), data_type: "integer".into(), nullable: false, primary: true },
+        ColumnInfo { name: "label".into(), data_type: "text".into(), nullable: true, primary: false },
+    ]
+}
+
+/// 模板只写草稿：没有查询项时新开一个绑定这个对象连接/库的查询；列没读过就先读再插。
+#[test]
+fn sql_templates_insert_into_a_bound_draft_and_never_run() {
+    use crate::app::shell::nav::NavRequest;
+    let (mut model, orders) = pg_orders_model();
+    assert!(model.tabs.is_empty());
+
+    // 列还没读：先排队读列，插入等列回来。
+    assert!(model.open_nav_menu(&orders));
+    let _ = model.dispatch("tree-template-update");
+    assert_eq!(model.take_nav_request(), Some(NavRequest::Details(orders.clone())));
+    assert!(model.tabs.is_empty(), "列没回来之前不插入");
+    model.nav_details_loaded(&orders, Ok(order_columns()), Ok(Vec::new()));
+    let tab = model.active_tab().cloned().expect("新开的查询项");
+    assert_eq!(tab.kind, WorkItemKind::Query);
+    assert_eq!(tab.connection_id.as_deref(), Some("pg"));
+    assert_eq!(tab.database.as_deref(), Some("shop"));
+    assert_eq!(tab.draft, "UPDATE \"public\".\"orders\"\nSET \"label\" = ?\nWHERE \"id\" = ?;");
+    assert_eq!(model.executions, 0, "模板不执行");
+    assert!(tab.last_executed_sql.is_none());
+
+    // 已有查询项：列已读，直接追加到草稿，不新开。
+    let tabs = model.tabs.len();
+    assert!(model.open_nav_menu(&orders));
+    let _ = model.dispatch("tree-template-insert");
+    assert!(model.take_nav_request().is_none(), "列已读过不再读");
+    assert_eq!(model.tabs.len(), tabs);
+    let draft = model.active_tab().unwrap().draft.clone();
+    assert!(draft.starts_with("UPDATE"), "{draft}");
+    assert!(draft.ends_with("INSERT INTO \"public\".\"orders\" (\"id\", \"label\")\nVALUES (?, ?);"), "{draft}");
+    assert!(model.open_nav_menu(&orders));
+    let _ = model.dispatch("tree-template-delete");
+    assert!(model.active_tab().unwrap().draft.ends_with("DELETE FROM \"public\".\"orders\"\nWHERE \"id\" = ?;"));
+    assert_eq!(model.executions, 0);
+
+    // 读列失败：说明原因，不插入。
+    let (mut failing, orders) = pg_orders_model();
+    assert!(failing.open_nav_menu(&orders));
+    let _ = failing.dispatch("tree-template-insert");
+    failing.nav_details_loaded(&orders, Err("权限不足".into()), Err("权限不足".into()));
+    assert!(failing.tabs.is_empty());
+    assert_eq!(failing.notice_key, Some("catalog.tree.templateNoColumns"));
+    assert_eq!(failing.notice_detail, "权限不足");
+
+    // 范围行不给模板：作用不到别的对象。
+    let schema = crate::catalog::hierarchy::schema_node_id("pg", "shop", "public");
+    assert!(model.open_nav_menu(&schema));
+    assert!(model.menu.as_ref().unwrap().items.iter().all(|item| !item.id.starts_with("tree-template-")));
+}
+
+/// 刷新此节点：展开保持；读取失败留下原子项并把原因挂在节点上；分组整类读完时缺失对象先 stale 再移除。
+#[test]
+fn refreshing_a_node_keeps_expansion_children_and_marks_removed_objects() {
+    use crate::app::shell::nav::NavRequest;
+    use crate::catalog::hierarchy::{connection_node_id, database_node_id, group_node_id, schema_node_id};
+    use crate::catalog::model::{ObjectKind, ObjectRow};
+    let (mut model, orders) = pg_orders_model();
+    let schema = schema_node_id("pg", "shop", "public");
+    let tables = group_node_id("pg", "shop", "public", ObjectKind::Table);
+    let views = group_node_id("pg", "shop", "public", ObjectKind::View);
+    expand_all(&mut model, &[connection_node_id("pg"), database_node_id("pg", "shop"), schema.clone(), tables.clone(), views.clone()]);
+    assert!(model.nav.is_expanded(&tables) && model.nav.is_expanded(&views));
+
+    // 模式：从第一页重读，成功后两个分组仍展开，新对象补上。
+    assert!(model.open_nav_menu(&schema));
+    assert!(model.menu.as_ref().unwrap().items.iter().any(|item| item.id == "tree-refresh-node"));
+    let _ = model.dispatch("tree-refresh-node");
+    assert_eq!(model.take_nav_request(), Some(NavRequest::Reload(schema.clone())));
+    assert!(model.nav.node(&schema).unwrap().loading);
+    let audit = ObjectRow::table("audit", Some(0));
+    let fresh = vec![ObjectRow::table("orders", Some(2)), audit.clone(), ObjectRow::view("recent")];
+    model.nav.reload_scope(&schema, &fresh, 3, None);
+    assert!(model.nav.is_expanded(&tables) && model.nav.is_expanded(&views), "刷新后展开保持");
+    assert!(model.nav.node(&nav_id("pg", "shop", "public", &audit)).is_some());
+    assert!(!model.nav.node(&schema).unwrap().loading);
+
+    // 读取失败：原子项都在，原因挂在模式节点上。
+    let children_before = model.nav.node(&tables).unwrap().children.clone();
+    let _ = model.dispatch(&format!("nav-refresh-node:{schema}"));
+    assert_eq!(model.take_nav_request(), Some(NavRequest::Reload(schema.clone())));
+    model.nav.reload_scope(&schema, &[], 0, Some("连接中断".into()));
+    assert_eq!(model.nav.node(&schema).unwrap().error.as_deref(), Some("连接中断"));
+    assert_eq!(model.nav.node(&tables).unwrap().children, children_before, "失败不清空子树");
+    assert!(model.nav.is_expanded(&tables) && model.nav.is_expanded(&views));
+
+    // 种类分组：整类读完时没读到的对象先 stale，再刷新一次才移除。
+    assert!(model.open_nav_menu(&tables));
+    let _ = model.dispatch("tree-refresh-node");
+    assert_eq!(model.take_nav_request(), Some(NavRequest::Group(tables.clone())));
+    model.nav.set_kind_page(&tables, std::slice::from_ref(&audit), 1, None);
+    assert!(model.nav.node(&orders).unwrap().stale, "第一次缺失先标 stale");
+    assert!(model.nav.is_expanded(&tables));
+    let _ = model.dispatch(&format!("nav-refresh-node:{tables}"));
+    assert_eq!(model.take_nav_request(), Some(NavRequest::Group(tables.clone())));
+    model.nav.set_kind_page(&tables, std::slice::from_ref(&audit), 1, None);
+    assert!(model.nav.node(&orders).is_none(), "第二次仍缺失就移除");
+    // 只读到一页（总数更大）时不判断删除。
+    let _ = model.dispatch(&format!("nav-refresh-node:{tables}"));
+    let _ = model.take_nav_request();
+    model.nav.set_kind_page(&tables, &[], 5, None);
+    assert!(!model.nav.node(&nav_id("pg", "shop", "public", &audit)).unwrap().stale);
+
+    // 连接行：整条连接重读。
+    let connection = connection_node_id("pg");
+    let _ = model.dispatch(&format!("nav-refresh-node:{connection}"));
+    assert_eq!(model.take_nav_request(), Some(NavRequest::Refresh { connection: Some("pg".into()) }));
+}
+
+/// 危险操作：生产（按 tone，自建标签也算）要输对名字；第一次点执行只待确认；取消不发语句；
+/// 失败保留树并显示原因；迟到的旧结果被丢弃。
+#[test]
+fn danger_confirm_layer_gates_prod_by_tone_and_keeps_the_tree_on_failure() {
+    use crate::app::shell::danger::DangerStep;
+    use crate::connections::model::EnvTag;
+    use crate::ddl::{DdlEngine, Snapshot};
+    let (mut model, orders) = pg_orders_model();
+    model.connections.rows.push(pg_saved("pg", "live"));
+    let tags = vec![EnvTag { id: "live".into(), label: "线上".into(), tone: "prod".into(), position: 9 }];
+    let plan_for = |model: &WorkbenchModel| {
+        let prompt = model.danger.as_ref().unwrap();
+        let mut snapshot = Snapshot::bare(DdlEngine::Postgres, "shop", "public", "orders");
+        snapshot.kind = "table".to_owned();
+        crate::ddl::preview_plan(&snapshot, &prompt.action())
+    };
+
+    // 取消：不发送任何语句。
+    assert!(model.open_nav_menu(&orders));
+    let _ = model.dispatch("tree-drop-object");
+    let (step, _) = model.take_danger_request().expect("打开即预览");
+    assert_eq!(step, DangerStep::Preview);
+    let _ = model.dispatch("danger-cancel");
+    assert!(model.danger.is_none());
+    assert!(model.take_danger_request().is_none());
+
+    assert!(model.open_nav_menu(&orders));
+    let _ = model.dispatch("tree-drop-object");
+    let (_, prompt) = model.take_danger_request().unwrap();
+    let plan = plan_for(&model);
+    model.danger_planned(prompt.epoch, Some(tags.clone()), Ok(plan));
+    let current = model.danger.as_ref().unwrap();
+    assert!(current.prod, "自建标签 tone=prod 也按生产处理");
+    assert_eq!(current.env_label, "线上");
+    assert!(current.confirmed_sql().iter().any(|sql| sql.contains("DROP TABLE")));
+    // 名字不对：执行不可用，点了也不待确认。
+    let _ = model.dispatch("danger-execute");
+    assert!(!model.danger.as_ref().unwrap().armed);
+    model.set_field(DraftField::DangerConfirm, "order".into());
+    let _ = model.dispatch("danger-execute");
+    assert!(!model.danger.as_ref().unwrap().armed);
+    model.set_field(DraftField::DangerConfirm, "orders".into());
+    let _ = model.dispatch("danger-execute");
+    assert!(model.danger.as_ref().unwrap().armed, "第一次只待确认");
+    assert!(model.take_danger_request().is_none(), "第一次不发送语句");
+    let _ = model.dispatch("danger-execute");
+    let (step, prompt) = model.take_danger_request().expect("第二次执行");
+    assert_eq!(step, DangerStep::Execute);
+
+    // 失败：树不变，原因留在确认层，不刷新树。
+    assert!(!model.danger_finished(prompt.epoch, Err("permission denied for table orders".into())));
+    assert!(model.nav.node(&orders).is_some_and(|node| !node.stale), "失败不显示为已删除");
+    assert_eq!(model.danger.as_ref().unwrap().error.as_deref(), Some("permission denied for table orders"));
+    assert!(model.take_nav_request().is_none(), "失败不刷新树");
+
+    // 迟到的旧结果不作用到当前确认层。
+    assert!(!model.danger_finished(prompt.epoch.wrapping_sub(1), Err("旧结果".into())));
+    assert_eq!(model.danger.as_ref().unwrap().error.as_deref(), Some("permission denied for table orders"));
+
+    // 一条语句都没执行的回执不算成功，树不动。
+    let _ = model.dispatch("danger-execute");
+    let _ = model.dispatch("danger-execute");
+    let (_, prompt) = model.take_danger_request().expect("重试执行");
+    let receipt = crate::ddl::Receipt { blocked: Vec::new(), rule: String::new(), steps: Vec::new(), target: String::new(), rebuild: false };
+    assert!(!model.danger_finished(prompt.epoch, Ok(receipt)));
+    assert!(model.nav.node(&orders).is_some());
+
+    // 非生产（dev tone）不需要输入名字；Esc/遮罩关闭等同取消。
+    let (mut dev, orders) = pg_orders_model();
+    dev.connections.rows.push(pg_saved("pg", "dev"));
+    assert!(dev.open_nav_menu(&orders));
+    let _ = dev.dispatch("tree-truncate-table");
+    let (_, prompt) = dev.take_danger_request().unwrap();
+    let plan = plan_for(&dev);
+    dev.danger_planned(prompt.epoch, Some(vec![EnvTag { id: "dev".into(), label: "开发".into(), tone: "dev".into(), position: 0 }]), Ok(plan));
+    assert!(!dev.danger.as_ref().unwrap().prod);
+    assert!(dev.danger.as_ref().unwrap().execute_ready());
+    dev.menu = None;
+    let _ = dev.dismiss();
+    assert!(dev.danger.is_none());
+    assert!(dev.take_danger_request().is_none());
+}
+
+/// 查看 DDL：读不到定义的对象不开查看器；“复制 DDL”只在读到后写剪贴板。
+#[test]
+fn definition_requests_only_for_readable_objects() {
+    use crate::app::shell::nav::NavRequest;
+    use crate::catalog::model::{ObjectKind, ObjectRow};
+    let (mut model, orders) = pg_orders_model();
+    assert!(model.open_nav_menu(&orders));
+    let _ = model.dispatch("tree-view-ddl");
+    assert_eq!(model.take_nav_request(), Some(NavRequest::Definition(orders.clone())));
+    let epoch = model.ddl_view.as_ref().unwrap().epoch;
+    model.definition_loaded(epoch, Ok(crate::catalog::definition::ObjectDdl { text: "CREATE TABLE orders (id int);".into(), rebuilt: true, missing: vec!["CHECK".into()] }));
+    let view = model.ddl_view.clone().unwrap();
+    assert!(view.rebuilt && !view.copy_only);
+    let _ = model.dispatch("ddl-copy");
+    assert_eq!(model.take_clipboard().as_deref(), Some("CREATE TABLE orders (id int);"));
+    let _ = model.dispatch("ddl-close");
+    assert!(model.ddl_view.is_none());
+
+    // 复制 DDL：失败不碰剪贴板。
+    assert!(model.open_nav_menu(&orders));
+    let _ = model.dispatch("tree-copy-ddl");
+    let _ = model.take_nav_request();
+    let epoch = model.ddl_view.as_ref().unwrap().epoch;
+    model.definition_loaded(epoch, Err("读取定义失败：权限不足".into()));
+    assert!(model.ddl_view.is_none());
+    assert!(model.take_clipboard().is_none());
+    assert_eq!(model.notice_key, Some("catalog.ddl.failed"));
+
+    // 扩展读不到定义：菜单项禁用，直接派发也不开查看器。
+    let extension = ObjectRow::fresh("pgcrypto", ObjectKind::Extension);
+    let pg = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", vec![extension.clone()])]);
+    let mut ext = WorkbenchModel::new(Shell::default());
+    ext.apply_navigation(&[pg], false);
+    let id = nav_id("pg", "shop", "public", &extension);
+    assert!(ext.open_nav_menu(&id));
+    let item = ext.menu.as_ref().unwrap().items.iter().find(|item| item.id == "tree-view-ddl").cloned().expect("DDL 项");
+    assert!(!item.enabled);
+    assert_eq!(item.reason_key, Some("catalog.tree.noDefinition"));
+    let _ = ext.dispatch(&format!("nav-view-ddl:{id}"));
+    assert!(ext.ddl_view.is_none());
+    assert!(ext.take_nav_request().is_none());
+    assert_eq!(ext.notice_key, Some("catalog.tree.noDefinition"));
+}
+
+/// 等工作台满足条件；后台读取在 tokio 上完成，渲染循环负责把请求发出去并回填。
+fn pump_until(
+    cx: &mut gpui_kit::TestAppContext,
+    window: gpui_kit::AnyWindowHandle,
+    view: &gpui_kit::Entity<super::view::Workbench>,
+    done: impl Fn(&super::view::Workbench, &gpui_kit::App) -> bool,
+) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(30) {
+        cx.run_until_parked();
+        let _ = cx.update_window(window, |_, window, cx| window.render_frame(cx));
+        if cx.update(|cx| done(view.read(cx), cx)) {
+            return true;
+        }
+        std::thread::park_timeout(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
+/// 真实 SQLite：查看 DDL 的文本含全部列名，复制后剪贴板与查看器一致；
+/// 删除表经确认层两次点击后执行，表从树上消失；结构页删表成功后树也去掉它。
+#[gpui_kit::test]
+fn sqlite_tree_ddl_viewer_and_drop_go_through_the_confirm_layer(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = sqlite_notes_workbench(cx, true);
+    wait_for_shell_ready(cx, window, &view);
+    let database = dir.join("items.sqlite");
+    sqlite_exec_on_file(&database, "CREATE TABLE scratch (id INTEGER PRIMARY KEY, body TEXT)");
+    sqlite_exec_on_file(&database, "CREATE TABLE doomed (id INTEGER PRIMARY KEY)");
+    cx.update_window(window, |_, _, cx| view.update(cx, |view, cx| view.perform("refresh-tree", cx))).unwrap();
+    let item = wait_for_nav_object(cx, window, &view, "item");
+    let scratch = wait_for_nav_object(cx, window, &view, "scratch");
+    let doomed = wait_for_nav_object(cx, window, &view, "doomed");
+
+    // 查看 DDL → 查看器文本含全部列名 → 复制后剪贴板一致。
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            assert!(view.model.open_nav_menu(&item));
+            view.perform("tree-view-ddl", cx);
+        })
+    })
+    .unwrap();
+    assert!(pump_until(cx, window, &view, |view, _| view.model.ddl_view.as_ref().is_some_and(|ddl| !ddl.loading)), "定义没有读回来");
+    let ddl = cx.update(|cx| view.read(cx).model.ddl_view.clone().unwrap());
+    let text = ddl.text.clone().unwrap_or_else(|| panic!("定义文本：{:?}", ddl.error));
+    assert!(text.contains("id") && text.contains("label"), "{text}");
+    assert!(!ddl.rebuilt, "SQLite 给的是原文");
+    let shown = cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.find("ddl-viewer-text").bounds()
+    })
+    .unwrap();
+    assert!(f32::from(shown.size.height) > 0., "查看器没有画出来");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("ddl-copy", cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let clipboard = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+    assert_eq!(clipboard.as_deref(), Some(text.as_str()), "剪贴板与查看器文本不一致");
+    // 原文没有“重建”标注；重建的定义标明来源并列出缺少的内容。
+    let plain = cx.update_window(window, |_, window, _| window.try_find("ddl-viewer-rebuilt").is_some()).unwrap();
+    assert!(!plain, "原文不应标成重建");
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            if let Some(ddl) = view.model.ddl_view.as_mut() {
+                ddl.rebuilt = true;
+                ddl.missing = vec!["CHECK".to_owned()];
+            }
+            cx.notify();
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let rebuilt = cx.update_window(window, |_, window, _| window.find("ddl-viewer-rebuilt").bounds()).unwrap();
+    assert!(f32::from(rebuilt.size.height) > 0., "重建定义要显示来源标注");
+    cx.update_window(window, |_, _, cx| view.update(cx, |view, cx| view.perform("ddl-close", cx))).unwrap();
+
+    // 复制 DDL 直接写剪贴板，内容与查看器同源。
+    cx.update(|cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("旧内容".to_owned())));
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            assert!(view.model.open_nav_menu(&item));
+            view.perform("tree-copy-ddl", cx);
+        })
+    })
+    .unwrap();
+    assert!(pump_until(cx, window, &view, |view, _| view.model.ddl_view.is_none()), "复制 DDL 没有完成");
+    let clipboard = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+    assert_eq!(clipboard.as_deref(), Some(text.as_str()));
+
+    // 删除表：预览是 DROP，第一次点击只待确认，第二次执行，表从树上消失。
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            assert!(view.model.open_nav_menu(&scratch));
+            view.perform("tree-drop-object", cx);
+        })
+    })
+    .unwrap();
+    assert!(
+        pump_until(cx, window, &view, |view, _| view.model.danger.as_ref().is_some_and(|prompt| !prompt.loading)),
+        "没有生成计划"
+    );
+    let prompt = cx.update(|cx| view.read(cx).model.danger.clone().unwrap());
+    assert!(prompt.error.is_none(), "{:?}", prompt.error);
+    assert!(!prompt.prod, "local 标签不是生产");
+    assert!(prompt.confirmed_sql().iter().any(|line| line.contains("DROP TABLE")), "{:?}", prompt.confirmed_sql());
+    let shown = cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.find("danger-confirm").bounds()
+    })
+    .unwrap();
+    assert!(f32::from(shown.size.width) > 0.);
+    cx.update_window(window, |_, _, cx| view.update(cx, |view, cx| view.perform("danger-execute", cx))).unwrap();
+    for _ in 0..5 {
+        cx.run_until_parked();
+        let _ = cx.update_window(window, |_, window, cx| window.render_frame(cx));
+    }
+    assert!(cx.update(|cx| view.read(cx).model.danger.as_ref().is_some_and(|prompt| prompt.armed && !prompt.running)));
+    let tables = sqlite_tables(&database);
+    assert!(tables.contains(&"scratch".to_owned()), "第一次点击不执行：{tables:?}");
+    cx.update_window(window, |_, _, cx| view.update(cx, |view, cx| view.perform("danger-execute", cx))).unwrap();
+    assert!(pump_until(cx, window, &view, |view, _| view.model.danger.as_ref().is_none_or(|prompt| !prompt.running)), "执行没有完成");
+    let leftover = cx.update(|cx| view.read(cx).model.danger.as_ref().and_then(|prompt| prompt.error.clone()));
+    assert!(leftover.is_none(), "执行失败：{leftover:?}");
+    assert!(!sqlite_tables(&database).contains(&"scratch".to_owned()));
+    assert!(pump_until(cx, window, &view, |view, _| view.model.nav_requests.is_empty() && view.model.nav_loading == 0));
+    assert!(cx.update(|cx| view.read(cx).model.nav.node(&scratch).is_none()), "删除后树里不该再有这张表");
+    assert!(cx.update(|cx| view.read(cx).model.nav.node(&item).is_some()));
+
+    // 结构页删表成功后，树里也没有这张表。
+    let spec = cx.update(|cx| {
+        let node = view.read(cx).model.nav.node(&doomed).cloned().unwrap();
+        super::nav::spec_for(&node, "local").unwrap()
+    });
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform(&format!("open-structure-for:{spec}"), cx));
+        window.render_frame(cx);
+        view.update(cx, |view, cx| {
+            view.structure.update(cx, |pane, cx| {
+                pane.session.section = crate::app::views::structure::Section::Danger;
+                pane.preview(cx);
+            });
+        });
+    })
+    .unwrap();
+    assert!(
+        pump_until(cx, window, &view, |view, cx| !view.structure.read(cx).session.preview_sql().is_empty()),
+        "结构页没有生成预览"
+    );
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            view.structure.update(cx, |pane, cx| {
+                pane.confirm(cx);
+                pane.confirm(cx);
+            });
+        })
+    })
+    .unwrap();
+    assert!(pump_until(cx, window, &view, |view, _| view.model.nav.node(&doomed).is_none()), "结构页删表后树里还有这张表");
+    assert!(!sqlite_tables(&database).contains(&"doomed".to_owned()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn sqlite_tables(path: &std::path::Path) -> Vec<String> {
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async move {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path))
+                .await
+                .expect("connect");
+            let names: Vec<String> = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .fetch_all(&pool)
+                .await
+                .expect("tables");
+            pool.close().await;
+            names
+        })
+    })
+    .join()
+    .expect("sqlite thread")
 }

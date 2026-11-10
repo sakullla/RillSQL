@@ -66,6 +66,73 @@ pub fn select_text(object: &ObjectKey) -> String {
     format!("SELECT *\nFROM {name}\nLIMIT 100;")
 }
 
+/// 对象树“生成 INSERT / UPDATE / DELETE 模板”的种类。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemplateKind {
+    Insert,
+    Update,
+    Delete,
+}
+
+impl TemplateKind {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "insert" => Some(Self::Insert),
+            "update" => Some(Self::Update),
+            "delete" => Some(Self::Delete),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Insert => "insert",
+            Self::Update => "update",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+fn quoted_column(engine: Engine, column: &str) -> String {
+    quote_ident(engine.as_str(), column)
+}
+
+/// SQL 模板：表名与列名按引擎引用，值用 `?` 占位。只写草稿，永不执行。
+/// UPDATE/DELETE 按主键写 WHERE；没有主键时留一个条件注释，不替用户猜条件。
+pub fn template_text(kind: TemplateKind, object: &ObjectKey, columns: &[(String, bool)]) -> String {
+    let table = quoted(object.engine, &object.database, &object.schema, &object.name);
+    let names: Vec<String> = columns.iter().map(|(name, _)| quoted_column(object.engine, name)).collect();
+    let keys: Vec<String> = columns
+        .iter()
+        .filter(|(_, primary)| *primary)
+        .map(|(name, _)| quoted_column(object.engine, name))
+        .collect();
+    let condition = if keys.is_empty() {
+        "/* condition */".to_owned()
+    } else {
+        keys.iter().map(|key| format!("{key} = ?")).collect::<Vec<_>>().join("\n  AND ")
+    };
+    match kind {
+        TemplateKind::Insert => {
+            let values = vec!["?"; names.len()].join(", ");
+            format!("INSERT INTO {table} ({})\nVALUES ({values});", names.join(", "))
+        }
+        TemplateKind::Update => {
+            // 主键只进 WHERE；全是主键的表仍给出全部列，模板不能没有 SET。
+            let set: Vec<&String> = names
+                .iter()
+                .zip(columns)
+                .filter(|(_, (_, primary))| !primary)
+                .map(|(name, _)| name)
+                .collect();
+            let set: Vec<&String> = if set.is_empty() { names.iter().collect() } else { set };
+            let assignments = set.iter().map(|name| format!("{name} = ?")).collect::<Vec<_>>().join(",\n    ");
+            format!("UPDATE {table}\nSET {assignments}\nWHERE {condition};")
+        }
+        TemplateKind::Delete => format!("DELETE FROM {table}\nWHERE {condition};"),
+    }
+}
+
 /// 把一段文本并入当前草稿：非空草稿之间留一个换行，不碰已有内容。
 pub fn append_text(draft: &str, text: &str) -> String {
     if text.is_empty() {
@@ -100,8 +167,12 @@ pub enum NavRequest {
     Details(String),
     /// 继续读取一个库/模式范围的对象。
     More(String),
-    /// 只重读一个对象种类分组（局部失败后的重试）。
+    /// 只重读一个对象种类分组（局部失败后的重试，或“刷新此节点”）。
     Group(String),
+    /// 从第一页重新读一个库/模式范围（“刷新此节点”）；展开状态保留。
+    Reload(String),
+    /// 读一个对象的定义（查看/复制 DDL）。
+    Definition(String),
 }
 
 #[cfg(test)]
@@ -148,6 +219,40 @@ mod tests {
         assert_eq!(append_text("select 1\n", "abc"), "select 1\nabc");
         assert_eq!(append_text("select 1  ", "abc"), "select 1  abc");
         assert_eq!(append_text("select 1", ""), "select 1");
+    }
+
+    #[test]
+    fn templates_quote_names_follow_primary_keys_and_never_run() {
+        let columns = vec![("id".to_owned(), true), ("label".to_owned(), false), ("note".to_owned(), false)];
+        let pg = key(Engine::Postgres, "shop", "public", "orders");
+        assert_eq!(
+            template_text(TemplateKind::Insert, &pg, &columns),
+            "INSERT INTO \"public\".\"orders\" (\"id\", \"label\", \"note\")\nVALUES (?, ?, ?);"
+        );
+        assert_eq!(
+            template_text(TemplateKind::Update, &pg, &columns),
+            "UPDATE \"public\".\"orders\"\nSET \"label\" = ?,\n    \"note\" = ?\nWHERE \"id\" = ?;"
+        );
+        assert_eq!(template_text(TemplateKind::Delete, &pg, &columns), "DELETE FROM \"public\".\"orders\"\nWHERE \"id\" = ?;");
+
+        let mysql = key(Engine::Mysql, "shop", "", "orders");
+        let update = template_text(TemplateKind::Update, &mysql, &columns);
+        assert!(update.starts_with("UPDATE `shop`.`orders`"), "{update}");
+        assert!(update.contains("`label` = ?"), "{update}");
+        let mariadb = key(Engine::Mariadb, "shop", "", "orders");
+        assert!(template_text(TemplateKind::Delete, &mariadb, &columns).contains("`id` = ?"));
+
+        // 没有主键：条件留给用户，不替他猜。
+        let loose = vec![("a".to_owned(), false), ("b".to_owned(), false)];
+        let sqlite = key(Engine::Sqlite, "main", "", "notes");
+        assert_eq!(template_text(TemplateKind::Delete, &sqlite, &loose), "DELETE FROM \"notes\"\nWHERE /* condition */;");
+        let update = template_text(TemplateKind::Update, &sqlite, &loose);
+        assert!(update.contains("\"a\" = ?") && update.contains("\"b\" = ?") && update.ends_with("WHERE /* condition */;"), "{update}");
+        let sqlserver = key(Engine::Sqlserver, "shop", "dbo", "orders");
+        assert!(template_text(TemplateKind::Insert, &sqlserver, &columns).starts_with("INSERT INTO [dbo].[orders] ([id], [label], [note])"));
+        assert_eq!(TemplateKind::parse("update"), Some(TemplateKind::Update));
+        assert_eq!(TemplateKind::parse(TemplateKind::Delete.as_str()), Some(TemplateKind::Delete));
+        assert_eq!(TemplateKind::parse("merge"), None);
     }
 
     #[test]

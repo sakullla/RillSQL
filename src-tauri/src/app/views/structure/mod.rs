@@ -232,6 +232,8 @@ pub struct StructurePane {
     load_error: String,
     /// 当前绑定到的工作项 id；关闭后重开会拿到新 id，必须重置草稿。
     item_id: String,
+    /// 刚删除成功的表；外壳取走后让对象树跟着变。
+    dropped: Option<GridTarget>,
 }
 
 impl StructurePane {
@@ -245,7 +247,13 @@ impl StructurePane {
             loading: false,
             load_error: String::new(),
             item_id: String::new(),
+            dropped: None,
         }
+    }
+
+    /// 外壳取走“刚删除成功的表”。
+    pub fn take_dropped(&mut self) -> Option<GridTarget> {
+        self.dropped.take()
     }
 
     /// 兼容调用：不区分工作项实例，只按目标绑定。
@@ -353,6 +361,7 @@ impl StructurePane {
         let Ok(request) = self.session.request() else {
             return;
         };
+        let drops_table = matches!(request.action, Action::DropTable { .. });
         let services = Arc::clone(&self.services);
         let target = self.session.target.clone();
         let connection = self.session.target.connection_id.clone();
@@ -376,6 +385,11 @@ impl StructurePane {
                                 Ok(receipt) if receipt.blocked.is_empty() => {
                                     this.session.open = false;
                                     this.session.armed = false;
+                                    // 删表成功：对象树也要去掉这张表。失败的语句不算成功。
+                                    let all_ok = receipt.steps.iter().all(|step| step.status == crate::ddl::StepStatus::Ok);
+                                    if drops_table && all_ok && !receipt.steps.is_empty() {
+                                        this.dropped = Some(this.session.target.clone());
+                                    }
                                     i18n::text(this.session.locale, "structure.preview.done")
                                 }
                                 Ok(receipt) => {

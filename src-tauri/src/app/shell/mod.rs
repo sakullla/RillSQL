@@ -2,6 +2,7 @@
 
 mod chrome;
 mod close;
+mod danger;
 mod jobs;
 mod layout;
 mod menus;

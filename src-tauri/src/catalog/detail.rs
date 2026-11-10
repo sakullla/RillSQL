@@ -374,21 +374,6 @@ pub(crate) async fn rows_for(session: &CatalogSession, sql: &str) -> Result<Vec<
     }
 }
 
-/// 只读一个表的列名，供补全的来源列表使用；索引不在这一步读取。
-pub async fn read_column_names(
-    session: &CatalogSession,
-    engine: Engine,
-    database: &str,
-    schema: &str,
-    table: &str,
-) -> Result<Vec<String>, String> {
-    let Some(sql) = columns_sql(engine, database, schema, table) else {
-        return Err("这个引擎没有列清单".to_owned());
-    };
-    let rows = rows_for(session, &sql).await?;
-    Ok(columns_from_rows(engine, &rows).into_iter().map(|column| column.name).filter(|name| !name.is_empty()).collect())
-}
-
 /// 读一个表的列元数据（名字、类型、可空、注释），供补全详情、悬停和对象信息使用。
 pub async fn read_column_meta(
     session: &CatalogSession,

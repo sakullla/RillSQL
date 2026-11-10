@@ -1,5 +1,8 @@
 //! 六类右键菜单。条目 id 都进同一个 `WorkbenchModel::dispatch`。
 
+use crate::catalog::definition::ddl_available;
+use crate::catalog::model::{Engine, ObjectKind};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuPlace {
     ObjectTree,
@@ -196,6 +199,61 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
     }
 }
 
+/// 对象树里一个对象行的事实：引擎与种类。DDL、模板与危险项都据此门控。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectFacts {
+    pub engine: Engine,
+    pub kind: ObjectKind,
+}
+
+/// 对象树右键菜单：在六类菜单的对象树条目上，按这一行的引擎与种类补上
+/// “刷新此节点”“查看/复制 DDL”“SQL 模板”与对象级危险操作。
+///
+/// - 范围行（连接/库/模式/种类分组/键空间）只多一个“刷新此节点”。
+/// - DDL 项只给关系型对象行；读不到定义时禁用并说明原因，不打开空查看器。
+/// - 模板与危险项只给关系型引擎的表/视图；清空与重命名只给表。
+///   MongoDB、Redis、例程/触发器/序列等、范围行与列行都没有这些项（R11）。
+pub fn tree_menu_items(target: MenuTarget, facts: Option<ObjectFacts>) -> Vec<MenuItem> {
+    let mut items = menu_items(MenuPlace::ObjectTree, target);
+    if target == MenuTarget::Scope {
+        items.push(item("tree-refresh-node", "catalog.tree.refreshNode"));
+        return items;
+    }
+    let Some(facts) = facts else { return items };
+    if !facts.engine.is_relational() {
+        return items;
+    }
+    if matches!(target, MenuTarget::Object | MenuTarget::NonDataObject) {
+        if ddl_available(facts.engine, facts.kind) {
+            items.push(item("tree-view-ddl", "catalog.tree.viewDdl"));
+            items.push(item("tree-copy-ddl", "catalog.tree.copyDdl"));
+        } else {
+            items.push(disabled("tree-view-ddl", "catalog.tree.viewDdl", "catalog.tree.noDefinition"));
+            items.push(disabled("tree-copy-ddl", "catalog.tree.copyDdl", "catalog.tree.noDefinition"));
+        }
+    }
+    let table = facts.kind == ObjectKind::Table;
+    let view = facts.kind == ObjectKind::View;
+    if target != MenuTarget::Object || !(table || view) {
+        return items;
+    }
+    items.extend([
+        item("tree-template-insert", "catalog.tree.templateInsert"),
+        item("tree-template-update", "catalog.tree.templateUpdate"),
+        item("tree-template-delete", "catalog.tree.templateDelete"),
+    ]);
+    if table {
+        items.extend([
+            danger("tree-drop-object", "catalog.tree.dropTable"),
+            danger("tree-truncate-table", "catalog.tree.truncateTable"),
+            danger("tree-rename-table", "catalog.tree.renameTable"),
+        ]);
+    } else {
+        items.push(danger("tree-drop-object", "catalog.tree.dropView"));
+    }
+    items
+}
+
 #[derive(Clone, Debug)]
 pub struct OpenMenu {
     pub place: MenuPlace,
@@ -205,7 +263,10 @@ pub struct OpenMenu {
 
 impl OpenMenu {
     pub fn new(place: MenuPlace, target: MenuTarget) -> Self {
-        let items = menu_items(place, target);
+        Self::with_items(place, menu_items(place, target))
+    }
+
+    pub fn with_items(place: MenuPlace, items: Vec<MenuItem>) -> Self {
         let index = items.iter().position(|item| item.enabled).unwrap_or(0);
         Self { place, items, index }
     }
@@ -294,5 +355,88 @@ mod tests {
         let column = OpenMenu::new(MenuPlace::ObjectTree, MenuTarget::Column);
         let ids: Vec<&str> = column.items.iter().map(|item| item.id).collect();
         assert_eq!(ids, vec!["tree-copy-column", "tree-insert-column"]);
+    }
+
+    const DANGER: [&str; 3] = ["tree-drop-object", "tree-truncate-table", "tree-rename-table"];
+    const TEMPLATES: [&str; 3] = ["tree-template-insert", "tree-template-update", "tree-template-delete"];
+
+    fn ids(items: &[MenuItem]) -> Vec<&'static str> {
+        items.iter().map(|item| item.id).collect()
+    }
+
+    fn facts(engine: Engine, kind: ObjectKind) -> Option<ObjectFacts> {
+        Some(ObjectFacts { engine, kind })
+    }
+
+    #[test]
+    fn danger_items_only_on_relational_tables_and_views() {
+        for engine in [Engine::Sqlite, Engine::Mysql, Engine::Mariadb, Engine::Postgres, Engine::Sqlserver] {
+            // 表：删除/清空/重命名都在，并且都是危险项。
+            let table = tree_menu_items(MenuTarget::Object, facts(engine, ObjectKind::Table));
+            for id in DANGER {
+                let item = table.iter().find(|item| item.id == id).unwrap_or_else(|| panic!("{engine:?} {id}"));
+                assert!(item.danger && item.enabled, "{engine:?} {id}");
+            }
+            assert!(TEMPLATES.iter().all(|id| ids(&table).contains(id)), "{engine:?}");
+            // 视图：只有删除，清空与重命名只给表。
+            let view = tree_menu_items(MenuTarget::Object, facts(engine, ObjectKind::View));
+            let drop = view.iter().find(|item| item.id == "tree-drop-object").expect("drop view");
+            assert_eq!(drop.label_key, "catalog.tree.dropView");
+            assert!(!ids(&view).contains(&"tree-truncate-table") && !ids(&view).contains(&"tree-rename-table"));
+            assert!(TEMPLATES.iter().all(|id| ids(&view).contains(id)));
+        }
+        // MongoDB 集合、Redis、非数据对象、范围行与列行都没有危险项和模板。
+        let cases = [
+            (MenuTarget::DocumentObject, facts(Engine::Mongodb, ObjectKind::Table)),
+            (MenuTarget::Object, facts(Engine::Mongodb, ObjectKind::Table)),
+            (MenuTarget::Object, facts(Engine::Redis, ObjectKind::Table)),
+            (MenuTarget::Scope, None),
+            (MenuTarget::Column, None),
+            (MenuTarget::NonDataObject, facts(Engine::Postgres, ObjectKind::Sequence)),
+            (MenuTarget::NonDataObject, facts(Engine::Postgres, ObjectKind::Function)),
+            (MenuTarget::NonDataObject, facts(Engine::Mysql, ObjectKind::Procedure)),
+            (MenuTarget::NonDataObject, facts(Engine::Sqlite, ObjectKind::Trigger)),
+            (MenuTarget::NonDataObject, facts(Engine::Postgres, ObjectKind::Extension)),
+            (MenuTarget::NonDataObject, facts(Engine::Mysql, ObjectKind::Event)),
+            (MenuTarget::NonDataObject, facts(Engine::Postgres, ObjectKind::Enum)),
+            (MenuTarget::NonDataObject, facts(Engine::Postgres, ObjectKind::Domain)),
+        ];
+        for (target, facts) in cases {
+            let items = tree_menu_items(target, facts);
+            for id in DANGER.iter().chain(TEMPLATES.iter()) {
+                assert!(!ids(&items).contains(id), "{target:?} {facts:?} {id}");
+            }
+            assert!(items.iter().all(|item| !item.danger), "{target:?} {facts:?}");
+        }
+        // 没有对象事实时（通用对象菜单）不凭空给出危险项。
+        assert!(tree_menu_items(MenuTarget::Object, None).iter().all(|item| !item.danger));
+    }
+
+    #[test]
+    fn ddl_items_follow_definition_availability_and_scope_rows_refresh() {
+        let table = tree_menu_items(MenuTarget::Object, facts(Engine::Postgres, ObjectKind::Table));
+        assert!(table.iter().any(|item| item.id == "tree-view-ddl" && item.enabled));
+        assert!(table.iter().any(|item| item.id == "tree-copy-ddl" && item.enabled));
+        // 扩展读不到定义：两项禁用并说明原因。
+        let extension = tree_menu_items(MenuTarget::NonDataObject, facts(Engine::Postgres, ObjectKind::Extension));
+        for id in ["tree-view-ddl", "tree-copy-ddl"] {
+            let item = extension.iter().find(|item| item.id == id).expect(id);
+            assert!(!item.enabled);
+            assert_eq!(item.reason_key, Some("catalog.tree.noDefinition"));
+        }
+        // 例程有定义：DDL 可用，但仍没有危险项。
+        let routine = tree_menu_items(MenuTarget::NonDataObject, facts(Engine::Postgres, ObjectKind::Function));
+        assert!(routine.iter().any(|item| item.id == "tree-view-ddl" && item.enabled));
+        // SQLite 序列之类没有定义来源。
+        let sqlite = tree_menu_items(MenuTarget::NonDataObject, facts(Engine::Sqlite, ObjectKind::Sequence));
+        assert!(sqlite.iter().any(|item| item.id == "tree-view-ddl" && !item.enabled));
+        // MongoDB 集合没有 DDL 项。
+        let mongo = tree_menu_items(MenuTarget::DocumentObject, facts(Engine::Mongodb, ObjectKind::Table));
+        assert!(!ids(&mongo).contains(&"tree-view-ddl"));
+        // 范围行只多一个刷新。
+        assert_eq!(ids(&tree_menu_items(MenuTarget::Scope, None)), vec!["tree-new-query", "tree-copy-name", "tree-refresh-node"]);
+        // 新增条目都排在原有条目之后，原有顺序不变。
+        let base = ids(&menu_items(MenuPlace::ObjectTree, MenuTarget::Object));
+        assert_eq!(&ids(&table)[..base.len()], base.as_slice());
     }
 }
