@@ -3,6 +3,7 @@
 
 pub(crate) mod assist;
 mod cancel;
+pub(crate) mod complete;
 pub mod commands;
 pub(crate) mod desk;
 mod exec;

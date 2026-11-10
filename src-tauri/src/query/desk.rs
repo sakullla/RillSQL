@@ -5,13 +5,21 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::application::tasks::{TaskBoard, TaskOutcome, TaskToken};
+use crate::i18n::Locale;
 use crate::catalog::{read_catalog_session, ConnectionBody, ObjectKind};
 use crate::connections::model::Engine;
 use crate::connections::{CatalogSession, Service};
 
-use super::assist::{self, CatalogObject, CompletionEntry, CompletionSource, LintFinding, OutlineItem, RunPick, RunScope, TextResult, TreeObject, VariableInput};
+use super::assist::{
+    self, CatalogObject, CompletionEntry, CompletionSource, LintFinding, MetadataState, OutlineItem, RunPick, RunScope, TextResult,
+    TreeObject, VariableInput,
+};
+use super::complete;
 use super::commands::{self, RunDto, StartRequest};
 use super::exec::{LiveDriver, StatementDriver};
+
+/// 词频表上限；超出时按次数与名称稳定截断。
+const FREQUENCY_LIMIT: usize = 200;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ticket {
@@ -107,6 +115,8 @@ pub struct Desk {
     seq: u64,
     objects: Vec<TreeObject>,
     columns: HashMap<String, Vec<String>>,
+    /// 本地标识符词频：只参与同分排序，不保存 SQL 文本。
+    frequency: HashMap<String, u32>,
     databases: Vec<String>,
     links: Vec<OpenLink>,
     environments: HashMap<String, String>,
@@ -128,6 +138,7 @@ impl Desk {
             seq: 0,
             objects: Vec::new(),
             columns: HashMap::new(),
+            frequency: HashMap::new(),
             databases: Vec::new(),
             links: Vec::new(),
             environments: HashMap::new(),
@@ -831,6 +842,7 @@ impl Desk {
             tab.draft = original;
         }
         self.executions += 1;
+        self.record_frequency(&pick.sql);
         BeginRun::Ready(PreparedRun {
             tab_id: tab.id,
             token,
@@ -893,27 +905,87 @@ impl Desk {
             .filter(|object| object.connection_id == target.connection_id && object.database == target.database)
             .map(|object| CompletionSource {
                 alias: String::new(),
-                label: object.name.clone(),
+                label: if object.schema.is_empty() {
+                    object.name.clone()
+                } else {
+                    format!("{}.{}", object.schema, object.name)
+                },
                 columns: self.columns.get(&column_key(&object.connection_id, &object.database, &object.name)).cloned().unwrap_or_default(),
             })
             .collect()
     }
 
-    pub fn completion_for(&self, prefix: &str) -> Vec<CompletionEntry> {
-        self.completion_scope().map(|scope| scope.complete(prefix)).unwrap_or_default()
+    /// 一次补全请求：语句全文和光标由编辑器传入，补全计划只读快照。
+    pub fn completion_for(&self, text: &str, cursor: usize, locale: Locale) -> Vec<CompletionEntry> {
+        self.completion_scope()
+            .map(|scope| complete::plan(&scope, text, cursor, locale).entries())
+            .unwrap_or_default()
     }
 
     /// 当前标签的补全上下文。编辑器打字时据此给出与 Ctrl+Space 相同的候选。
     pub fn completion_scope(&self) -> Option<assist::CompletionScope> {
         let tab = self.active_tab()?;
         let engine = tab.target.as_ref().map(|target| target.engine.clone()).unwrap_or_default();
-        let objects = self
+        let objects: Vec<CatalogObject> = self
             .objects
             .iter()
-            .filter(|object| tab.target.as_ref().is_some_and(|target| target.connection_id == object.connection_id && target.database == object.database))
+            .filter(|object| {
+                tab.target
+                    .as_ref()
+                    .is_some_and(|target| target.connection_id == object.connection_id && target.database == object.database)
+            })
             .map(|object| CatalogObject { name: object.name.clone(), schema: object.schema.clone(), kind: object.kind.clone() })
-            .collect::<Vec<_>>();
-        Some(assist::CompletionScope { engine, objects, sources: self.sources_for(tab.target.as_ref()), provider: tab.provider })
+            .collect();
+        let databases = tab
+            .target
+            .as_ref()
+            .and_then(|target| self.links.iter().find(|link| link.id == target.connection_id))
+            .map(|link| link.databases.clone())
+            .unwrap_or_default();
+        let mut schemas: Vec<String> = Vec::new();
+        for object in &objects {
+            if !object.schema.is_empty() && !schemas.iter().any(|have| have == &object.schema) {
+                schemas.push(object.schema.clone());
+            }
+        }
+        let state = if tab.target.is_none() {
+            MetadataState::NoTarget
+        } else if !tab.provider {
+            MetadataState::NoProvider
+        } else if !self.tree_error.is_empty() {
+            MetadataState::Failed(self.tree_error.clone())
+        } else if objects.is_empty() {
+            MetadataState::Empty
+        } else {
+            MetadataState::Ready
+        };
+        let mut frequency: Vec<(String, u32)> = self.frequency.iter().map(|(name, count)| (name.clone(), *count)).collect();
+        frequency.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        Some(assist::CompletionScope {
+            engine,
+            objects,
+            sources: self.sources_for(tab.target.as_ref()),
+            provider: tab.provider,
+            databases,
+            schemas,
+            frequency,
+            state,
+            foreign_keys: Vec::new(),
+        })
+    }
+
+    /// 记录一次实际执行的语句里的标识符词频；只用于同分排序。
+    pub fn record_frequency(&mut self, sql: &str) {
+        for name in complete::identifiers(sql) {
+            let slot = self.frequency.entry(name).or_insert(0);
+            *slot = slot.saturating_add(1);
+        }
+        if self.frequency.len() > FREQUENCY_LIMIT {
+            let mut entries: Vec<(String, u32)> = self.frequency.iter().map(|(name, count)| (name.clone(), *count)).collect();
+            entries.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+            entries.truncate(FREQUENCY_LIMIT);
+            self.frequency = entries.into_iter().collect();
+        }
     }
 
     fn accept_assist(&mut self, tasks: &TaskBoard, ticket: &Ticket, apply: impl FnOnce(&mut TabState)) -> bool {
@@ -1716,6 +1788,57 @@ mod tests {
         assert!(desk.note_of(&again.tab_id).is_empty());
         assert_eq!(desk.results().len(), 1);
         assert_eq!(desk.status(), "ok");
+    }
+
+    #[test]
+    fn completion_scope_reports_metadata_state_and_keeps_frequency_local() {
+        let mut desk = Desk::new();
+        desk.new_query();
+        let no_target = desk.completion_scope().expect("没有目标也要有上下文");
+        assert_eq!(no_target.state, MetadataState::NoTarget);
+
+        desk.open_database("notes", "笔记", "sqlite", "main");
+        desk.set_provider(true);
+        desk.set_objects(
+            vec![TreeObject {
+                connection_id: "notes".to_owned(),
+                connection_name: "笔记".to_owned(),
+                engine: "sqlite".to_owned(),
+                database: "main".to_owned(),
+                schema: String::new(),
+                name: "item".to_owned(),
+                kind: "table".to_owned(),
+            }],
+            vec!["main".to_owned()],
+        );
+        desk.set_links(vec![OpenLink {
+            id: "notes".to_owned(),
+            name: "笔记".to_owned(),
+            engine: "sqlite".to_owned(),
+            databases: vec!["main".to_owned(), "archive".to_owned()],
+            environment: "dev".to_owned(),
+        }]);
+        desk.remember_columns("notes", "main", "item", vec!["id".to_owned(), "status".to_owned()]);
+        let ready = desk.completion_scope().expect("有目标");
+        assert_eq!(ready.state, MetadataState::Ready);
+        assert!(ready.objects.iter().any(|object| object.name == "item"));
+        assert!(ready.sources.iter().any(|source| source.columns.contains(&"status".to_owned())));
+        assert_eq!(ready.databases, vec!["main".to_owned(), "archive".to_owned()]);
+
+        desk.set_tree_error("读取库表失败：连接中断");
+        let failed = desk.completion_scope().expect("失败也要有上下文");
+        assert_eq!(failed.state, MetadataState::Failed("读取库表失败：连接中断".to_owned()));
+        assert!(failed.objects.iter().any(|object| object.name == "item"), "失败时已读对象仍然可用");
+        desk.set_tree_error("");
+
+        desk.record_frequency("SELECT status FROM item WHERE status = 'status' -- status");
+        desk.record_frequency("SELECT id FROM item");
+        let scope = desk.completion_scope().expect("有目标");
+        let weight = |name: &str| scope.frequency.iter().find(|(key, _)| key == name).map(|(_, count)| *count);
+        assert_eq!(weight("status"), Some(2), "字符串和注释里的词不计数");
+        assert_eq!(weight("id"), Some(1));
+        assert_eq!(weight("item"), Some(2));
+        assert_eq!(weight("select"), None, "关键字不计入词频");
     }
 
     #[test]

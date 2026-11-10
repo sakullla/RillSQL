@@ -74,7 +74,8 @@ pub struct OutlineItem {
 pub struct CompletionEntry {
     pub label: String,
     pub kind: String,
-    pub detail_key: &'static str,
+    /// 已翻译的详情（类型、签名或来源）；没有详情时为 None。
+    pub detail: Option<String>,
     pub insert: String,
 }
 
@@ -90,6 +91,29 @@ pub struct CatalogObject {
     pub name: String,
     pub schema: String,
     pub kind: String,
+}
+
+/// 补全所需的元数据状态。失败、部分失败和空目录都必须能显示出来，
+/// 不能渲染成“补全成功但没有命中”。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum MetadataState {
+    #[default]
+    Ready,
+    NoTarget,
+    NoProvider,
+    Empty,
+    Failed(String),
+    Partial(String),
+    Stale(String),
+}
+
+/// 真实外键：ON 条件只在实际读到外键时标注为外键，否则只给命名推断。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignKey {
+    pub from_table: String,
+    pub from_columns: Vec<String>,
+    pub to_table: String,
+    pub to_columns: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -463,53 +487,31 @@ pub fn expand_star(engine: &str, sql: &str, sources: &[CompletionSource], provid
     TextResult { ok: true, sql: rewritten, reason_key: None }
 }
 
-/// 编辑器打字补全用的上下文快照：方言、当前库的对象与列。
+/// 编辑器补全用的元数据快照：方言、当前库对象与列、库/模式、词频、状态与外键。
+/// 语句文本和光标由编辑器在请求时另外传入，这里不保存草稿。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompletionScope {
     pub engine: String,
     pub objects: Vec<CatalogObject>,
     pub sources: Vec<CompletionSource>,
     pub provider: bool,
+    /// 当前连接的库清单，只在 USE 和通用场景出现。
+    pub databases: Vec<String>,
+    /// 当前库的模式清单。
+    pub schemas: Vec<String>,
+    /// 本地词频（小写标识符 → 次数）；只参与同分排序，不参与筛选。
+    pub frequency: Vec<(String, u32)>,
+    /// 元数据状态；失败和部分失败必须能显示出来。
+    pub state: MetadataState,
+    /// 已读到的真实外键；为空时 ON 条件只做命名推断。
+    pub foreign_keys: Vec<ForeignKey>,
 }
 
 impl CompletionScope {
-    pub fn complete(&self, prefix: &str) -> Vec<CompletionEntry> {
-        complete(&self.engine, prefix, &self.objects, &self.sources, self.provider)
+    /// 没有语句文本时的通用补全；编辑器请求会带上语句和光标。
+    pub fn complete(&self, prefix: &str, locale: crate::i18n::Locale) -> Vec<CompletionEntry> {
+        super::complete::plan(self, prefix, prefix.len(), locale).entries()
     }
-}
-
-pub fn complete(engine: &str, prefix: &str, objects: &[CatalogObject], sources: &[CompletionSource], provider: bool) -> Vec<CompletionEntry> {
-    if !provider || !known_engine(engine) {
-        return Vec::new();
-    }
-    let needle = prefix.to_ascii_lowercase();
-    let mut items = Vec::new();
-    for keyword in SQL_KEYWORDS.iter().copied().chain(dialect_words(engine).iter().copied()) {
-        if needle.is_empty() || keyword.to_ascii_lowercase().starts_with(&needle) {
-            items.push(CompletionEntry { label: keyword.to_owned(), kind: "keyword".to_owned(), detail_key: "query.editor.area", insert: keyword.to_owned() });
-        }
-    }
-    for (label, insert) in snippets() {
-        if needle.is_empty() || label.to_ascii_lowercase().starts_with(&needle) {
-            items.push(CompletionEntry { label: (*label).to_owned(), kind: "snippet".to_owned(), detail_key: "query.editor.area", insert: (*insert).to_owned() });
-        }
-    }
-    for object in objects {
-        let label = if object.schema.is_empty() { object.name.clone() } else { format!("{}.{}", object.schema, object.name) };
-        if needle.is_empty() || label.to_ascii_lowercase().contains(&needle) || object.name.to_ascii_lowercase().starts_with(&needle) {
-            items.push(CompletionEntry { label, kind: object.kind.clone(), detail_key: "catalog.tree.menuLabel", insert: object.name.clone() });
-        }
-    }
-    for source in sources {
-        for column in &source.columns {
-            let label = if source.alias.is_empty() { column.clone() } else { format!("{}.{}", source.alias, column) };
-            if needle.is_empty() || column.to_ascii_lowercase().starts_with(&needle) || label.to_ascii_lowercase().starts_with(&needle) {
-                items.push(CompletionEntry { label, kind: "column".to_owned(), detail_key: "query.complete.expandStar", insert: column.clone() });
-            }
-        }
-    }
-    items.truncate(40);
-    items
 }
 
 pub fn plan_statement(sql: &str, from: usize, to: usize, head: usize, engine: &str) -> Result<(String, usize, usize), String> {
@@ -714,7 +716,7 @@ fn columns_for(sources: &[CompletionSource], alias: Option<&str>) -> Vec<String>
     }
 }
 
-fn dialect_words(engine: &str) -> &'static [&'static str] {
+pub(crate) fn dialect_words(engine: &str) -> &'static [&'static str] {
     match engine {
         "postgres" => &["ILIKE", "RETURNING", "LATERAL", "SIMILAR", "TABLESAMPLE", "STRING_AGG"],
         "mysql" | "mariadb" => &["REGEXP", "STRAIGHT_JOIN", "IFNULL", "GROUP_CONCAT", "UNSIGNED"],
@@ -722,15 +724,6 @@ fn dialect_words(engine: &str) -> &'static [&'static str] {
         "sqlserver" => &["TOP", "NOLOCK", "ISNULL", "OFFSET", "FETCH", "IDENTITY"],
         _ => &[],
     }
-}
-
-fn snippets() -> &'static [(&'static str, &'static str)] {
-    &[
-        ("select-from", "SELECT  FROM "),
-        ("join-on", "JOIN  ON "),
-        ("insert-values", "INSERT INTO  () VALUES ()"),
-        ("update-set", "UPDATE  SET  WHERE "),
-    ]
 }
 
 fn has_analyze(sql: &str, engine: &str) -> bool {
@@ -1569,7 +1562,8 @@ mod tests {
         assert_eq!(format_sql(open).sql, open);
         assert!(prepare_send(open, &sql_to_run(open, 0, 0, 0, RunScope::Script, "sqlite"), "sqlite").is_err());
         assert_eq!(expand_star("nope", "SELECT * FROM t", &[], true).sql, "SELECT * FROM t");
-        assert!(complete("nope", "sel", &[], &[], true).is_empty());
+        let unknown = CompletionScope { engine: "nope".to_owned(), provider: true, ..Default::default() };
+        assert!(unknown.complete("sel", crate::i18n::Locale::ZhCn).is_empty());
     }
 
     #[test]

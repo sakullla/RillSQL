@@ -20,13 +20,19 @@ use lsp_types::{CompletionContext, CompletionItem, CompletionItemKind, Completio
 
 use crate::app::accept_versioned;
 use crate::app::views::settings;
+use crate::i18n::Locale;
 use crate::query::assist::CompletionScope;
+use crate::query::complete;
 
 pub struct SqlEditor {
     state: Entity<EditorState>,
     version: Rc<Cell<u64>>,
     extra: Rc<RefCell<Vec<(String, String)>>>,
     scope: Rc<RefCell<Option<CompletionScope>>>,
+    /// 补全详情与状态说明按当前语言生成；切换语言后新请求立即生效。
+    locale: Rc<Cell<Locale>>,
+    /// 最近一次请求的元数据状态说明；失败、部分失败或空目录时非空。
+    note: Rc<RefCell<Option<String>>>,
     stale_lint: u32,
     stale_completion: u32,
     folded_lines: u32,
@@ -40,6 +46,9 @@ struct SqlSuggest {
     version: Rc<Cell<u64>>,
     extra: Rc<RefCell<Vec<(String, String)>>>,
     scope: Rc<RefCell<Option<CompletionScope>>>,
+    locale: Rc<Cell<Locale>>,
+    note: Rc<RefCell<Option<String>>>,
+    request: Rc<Cell<u64>>,
 }
 
 impl SqlEditor {
@@ -47,6 +56,9 @@ impl SqlEditor {
         let version = Rc::new(Cell::new(1));
         let extra = Rc::new(RefCell::new(Vec::new()));
         let scope = Rc::new(RefCell::new(None));
+        let locale = Rc::new(Cell::new(Locale::ZhCn));
+        let note = Rc::new(RefCell::new(None));
+        let request = Rc::new(Cell::new(0));
         let state = cx.new(|cx| {
             let mut state = EditorState::new(window, cx)
                 .language("sql")
@@ -57,6 +69,9 @@ impl SqlEditor {
                 version: version.clone(),
                 extra: extra.clone(),
                 scope: scope.clone(),
+                locale: locale.clone(),
+                note: note.clone(),
+                request: request.clone(),
             }));
             state
         });
@@ -71,6 +86,8 @@ impl SqlEditor {
             version,
             extra,
             scope,
+            locale,
+            note,
             stale_lint: 0,
             stale_completion: 0,
             folded_lines: 0,
@@ -233,7 +250,7 @@ impl SqlEditor {
             // 有选区时替换选区；否则替换光标前已打出的单词。
             let start = if selected.is_empty() { selected.end - word_before(&text, selected.end).len() } else { selected.start };
             let range = offset_to_position(&text, start)..offset_to_position(&text, selected.end);
-            let item = completion_edit(label, insert, None, range);
+            let item = completion_edit(label, insert, None, range, None);
             state.insert_completion(&item, selected, window, cx);
         });
         true
@@ -246,6 +263,16 @@ impl SqlEditor {
     /// 方言模块给出的 (显示名, 插入文本)。编辑器按插入文本写入。
     pub fn set_extra_suggestions(&self, items: Vec<(String, String)>) {
         *self.extra.borrow_mut() = items;
+    }
+
+    /// 补全详情与状态说明跟随当前语言。
+    pub fn set_locale(&mut self, locale: Locale) {
+        self.locale.set(locale);
+    }
+
+    /// 最近一次补全请求的元数据状态说明；正常且已读时为空。
+    pub fn completion_note(&self) -> Option<String> {
+        self.note.borrow().clone()
     }
 
     /// 打字补全的上下文（方言、对象、列）。与当前快照相同时不替换。
@@ -323,40 +350,74 @@ impl Render for SqlEditor {
 }
 
 impl SqlSuggest {
+    /// 只要候选；测试和单次查询用它，不关心请求代次。
     fn items(&self, text: &Rope, offset: usize) -> Vec<CompletionItem> {
+        let (_, items) = self.respond(text, offset);
+        items
+    }
+
+    /// 一次补全请求：整段语句、光标、编辑器版本和元数据快照都参与计算。
+    /// 返回请求代次，迟到结果用 deliver 丢弃。
+    fn respond(&self, text: &Rope, offset: usize) -> (u64, Vec<CompletionItem>) {
+        let request = self.request.get().wrapping_add(1);
+        self.request.set(request);
         let offset = offset.min(text.len());
         let word = word_before(text, offset);
         let lower = word.to_ascii_lowercase();
-        // 候选替换光标前已经打出的单词，而不是接在它后面。
-        let start = offset - word.len();
-        let range = offset_to_position(text, start)..offset_to_position(text, offset);
+        let locale = self.locale.get();
+        *self.note.borrow_mut() = None;
         let mut items: Vec<CompletionItem> = Vec::new();
-        let scope = self.scope.borrow();
-        match scope.as_ref() {
-            Some(scope) => {
-                for entry in scope.complete(&word) {
-                    items.push(completion_edit(&entry.label, &entry.insert, completion_kind(&entry.kind), range.clone()));
+        {
+            let scope = self.scope.borrow();
+            match scope.as_ref() {
+                Some(scope) => {
+                    let statement = text.slice(0..text.len()).to_string();
+                    let planned = complete::plan(scope, &statement, offset, locale);
+                    *self.note.borrow_mut() = planned.note.clone();
+                    // 只替换当前词；限定符和前后文本保持原样。
+                    let start = planned.span.start.min(offset);
+                    let end = planned.span.end.min(text.len());
+                    let range = offset_to_position(text, start)..offset_to_position(text, end);
+                    for entry in &planned.candidates {
+                        items.push(completion_edit(
+                            &entry.label,
+                            &entry.insert,
+                            completion_kind(entry.kind),
+                            range.clone(),
+                            Some(entry.detail.clone()),
+                        ));
+                    }
                 }
-            }
-            None => {
-                for keyword in FALLBACK_KEYWORDS {
-                    if lower.is_empty() || keyword.to_ascii_lowercase().starts_with(&lower) {
-                        items.push(completion_edit(keyword, keyword, Some(CompletionItemKind::KEYWORD), range.clone()));
+                None => {
+                    let range = offset_to_position(text, offset - word.len())..offset_to_position(text, offset);
+                    for keyword in FALLBACK_KEYWORDS {
+                        if lower.is_empty() || keyword.to_ascii_lowercase().starts_with(&lower) {
+                            items.push(completion_edit(keyword, keyword, Some(CompletionItemKind::KEYWORD), range.clone(), None));
+                        }
                     }
                 }
             }
         }
+        let range = offset_to_position(text, offset - word.len())..offset_to_position(text, offset);
         for (label, insert) in self.extra.borrow().iter() {
             if items.iter().any(|item| item.label == *label) {
                 continue;
             }
             if lower.is_empty() || label.to_ascii_lowercase().starts_with(&lower) || insert.to_ascii_lowercase().starts_with(&lower) {
-                items.push(completion_edit(label, insert, None, range.clone()));
+                items.push(completion_edit(label, insert, None, range.clone(), None));
             }
         }
         // 已经打完整的唯一候选不必再弹出。
         if items.len() == 1 && items[0].insert_text.as_deref().is_some_and(|insert| insert.eq_ignore_ascii_case(&word)) {
             items.clear();
+        }
+        (request, items)
+    }
+
+    /// 只有最新请求且编辑器版本未变时才交付候选；迟到结果一律丢弃。
+    fn deliver(&self, version: u64, request: u64, items: Vec<CompletionItem>) -> Vec<CompletionItem> {
+        if !accept_versioned(self.version.get(), version) || self.request.get() != request {
+            return Vec::new();
         }
         items
     }
@@ -369,16 +430,26 @@ fn completion_kind(kind: &str) -> Option<CompletionItemKind> {
         "keyword" => CompletionItemKind::KEYWORD,
         "snippet" => CompletionItemKind::SNIPPET,
         "column" => CompletionItemKind::FIELD,
+        "condition" => CompletionItemKind::OPERATOR,
+        "cte" => CompletionItemKind::CLASS,
+        "database" | "schema" => CompletionItemKind::MODULE,
         "view" => CompletionItemKind::INTERFACE,
         "function" | "procedure" => CompletionItemKind::FUNCTION,
         _ => CompletionItemKind::STRUCT,
     })
 }
 
-fn completion_edit(label: &str, insert: &str, kind: Option<CompletionItemKind>, range: Range<lsp_types::Position>) -> CompletionItem {
+fn completion_edit(
+    label: &str,
+    insert: &str,
+    kind: Option<CompletionItemKind>,
+    range: Range<lsp_types::Position>,
+    detail: Option<String>,
+) -> CompletionItem {
     CompletionItem {
         label: label.to_string(),
         kind,
+        detail,
         insert_text: Some(insert.to_string()),
         filter_text: Some(insert.to_string()),
         text_edit: Some(CompletionTextEdit::Edit(TextEdit { range: lsp_types::Range { start: range.start, end: range.end }, new_text: insert.to_string() })),
@@ -396,21 +467,14 @@ impl CompletionProvider for SqlSuggest {
         _cx: &mut App,
     ) -> Task<gpui_kit::Result<CompletionResponse>> {
         let started = self.version.get();
-        let items = self.items(text, offset);
-        let version = self.version.clone();
-        Task::ready(Ok(CompletionResponse::Array(
-            if accept_versioned(version.get(), started) {
-                items
-            } else {
-                Vec::new()
-            },
-        )))
+        let (request, items) = self.respond(text, offset);
+        let items = self.deliver(started, request, items);
+        Task::ready(Ok(CompletionResponse::Array(items)))
     }
 
     fn is_completion_trigger(&self, _offset: usize, new_text: &str, _cx: &mut App) -> bool {
-        new_text
-            .chars()
-            .any(|ch| ch.is_ascii_alphabetic() || ch == '.')
+        // IME 组合和中文正文不触发弹层，避免打断输入。
+        new_text.chars().any(|ch| ch.is_ascii_alphabetic() || ch == '.')
     }
 }
 
@@ -582,45 +646,100 @@ mod tests {
         .unwrap();
     }
 
+    fn suggest(scope: Option<CompletionScope>, extra: Vec<(String, String)>) -> SqlSuggest {
+        SqlSuggest {
+            version: Rc::new(Cell::new(1)),
+            extra: Rc::new(RefCell::new(extra)),
+            scope: Rc::new(RefCell::new(scope)),
+            locale: Rc::new(Cell::new(Locale::ZhCn)),
+            note: Rc::new(RefCell::new(None)),
+            request: Rc::new(Cell::new(0)),
+        }
+    }
+
+    fn catalog_scope() -> CompletionScope {
+        use crate::query::assist::{CatalogObject, CompletionSource, MetadataState};
+        CompletionScope {
+            engine: "sqlite".to_owned(),
+            objects: vec![CatalogObject { name: "orders".to_owned(), schema: String::new(), kind: "table".to_owned() }],
+            sources: vec![CompletionSource {
+                alias: String::new(),
+                label: "orders".to_owned(),
+                columns: vec!["id".to_owned(), "customer".to_owned(), "status".to_owned()],
+            }],
+            provider: true,
+            databases: vec!["main".to_owned()],
+            schemas: Vec::new(),
+            frequency: Vec::new(),
+            state: MetadataState::Ready,
+            foreign_keys: Vec::new(),
+        }
+    }
+
     #[test]
     fn suggest_matches_a_prefix_without_a_window() {
         let rope = Rope::from("sel");
-        let suggest = SqlSuggest { version: Rc::new(Cell::new(1)), extra: Rc::new(RefCell::new(Vec::new())), scope: Rc::new(RefCell::new(None)) };
-        let labels: Vec<_> = suggest.items(&rope, 3)
-            .into_iter()
-            .map(|item| item.label)
-            .collect();
+        let plain = suggest(None, Vec::new());
+        let labels: Vec<_> = plain.items(&rope, 3).into_iter().map(|item| item.label).collect();
         assert_eq!(labels, vec!["SELECT".to_string()]);
         let snippet = Rope::from("select");
-        let suggest = SqlSuggest {
-            version: Rc::new(Cell::new(1)),
-            extra: Rc::new(RefCell::new(vec![("select-from".to_owned(), "SELECT  FROM ".to_owned())])),
-            scope: Rc::new(RefCell::new(None)),
-        };
-        let item = suggest.items(&snippet, 6).into_iter().find(|item| item.label == "select-from").expect("snippet");
+        let with_snippet = suggest(None, vec![("select-from".to_owned(), "SELECT  FROM ".to_owned())]);
+        let item = with_snippet.items(&snippet, 6).into_iter().find(|item| item.label == "select-from").expect("snippet");
         assert_eq!(item.insert_text.as_deref(), Some("SELECT  FROM "));
     }
 
     #[test]
     fn typed_completion_uses_the_catalog_and_replaces_the_prefix() {
-        use crate::query::assist::{CatalogObject, CompletionScope};
-        let suggest = SqlSuggest {
-            version: Rc::new(Cell::new(1)),
-            extra: Rc::new(RefCell::new(Vec::new())),
-            scope: Rc::new(RefCell::new(Some(CompletionScope {
-                engine: "sqlite".to_owned(),
-                objects: vec![CatalogObject { name: "orders".to_owned(), schema: String::new(), kind: "table".to_owned() }],
-                sources: Vec::new(),
-                provider: true,
-            }))),
-        };
+        let provider = suggest(Some(catalog_scope()), Vec::new());
         let rope = Rope::from("select * from ord");
-        let items = suggest.items(&rope, rope.len());
+        let items = provider.items(&rope, rope.len());
         let item = items.iter().find(|item| item.label == "orders").expect("打字时应列出当前库的表");
         let Some(CompletionTextEdit::Edit(edit)) = item.text_edit.as_ref() else { panic!("缺少替换范围") };
         assert_eq!(edit.range.start, lsp_types::Position { line: 0, character: 14 });
         assert_eq!(edit.range.end, lsp_types::Position { line: 0, character: 17 });
         assert_eq!(edit.new_text, "orders");
+
+        // 限定符只补列名，替换范围不覆盖别名和点号。
+        let qualified = "select * from orders o where o.st";
+        let rope = Rope::from(qualified);
+        let items = provider.items(&rope, rope.len());
+        let item = items.iter().find(|item| item.label == "status").expect("别名后只给该表的列");
+        let Some(CompletionTextEdit::Edit(edit)) = item.text_edit.as_ref() else { panic!("缺少替换范围") };
+        assert_eq!(edit.range.start, lsp_types::Position { line: 0, character: 31 });
+        assert_eq!(edit.range.end, lsp_types::Position { line: 0, character: 33 });
+    }
+
+    #[test]
+    fn stale_and_ime_requests_never_clobber_candidates() {
+        let provider = suggest(Some(catalog_scope()), Vec::new());
+        let first = Rope::from("select * from ord");
+        let (request, items) = provider.respond(&first, first.len());
+        assert!(!items.is_empty());
+        let second = Rope::from("select * from orde");
+        let _ = provider.respond(&second, second.len());
+        assert!(provider.deliver(1, request, items.clone()).is_empty(), "旧请求的候选必须被丢弃");
+        let (newest_request, newest) = provider.respond(&second, second.len());
+        assert!(!provider.deliver(1, newest_request, newest).is_empty(), "最新请求应正常交付");
+
+        let ime = Rope::from("select 中文");
+        let (_, items) = provider.respond(&ime, ime.len());
+        assert!(items.is_empty(), "IME/中文正文里不弹候选");
+    }
+
+    #[test]
+    fn metadata_failure_keeps_keywords_and_shows_a_readable_note() {
+        use crate::query::assist::MetadataState;
+        let mut broken = catalog_scope();
+        broken.state = MetadataState::Failed("读取库表失败：连接中断".to_owned());
+        broken.objects.clear();
+        broken.sources.clear();
+        let provider = suggest(Some(broken), Vec::new());
+        let rope = Rope::from("select * from ");
+        let (_, items) = provider.respond(&rope, rope.len());
+        assert!(items.iter().any(|item| item.label == "SELECT"), "元数据失败时仍给关键字");
+        assert!(!items.iter().any(|item| item.label == "orders"));
+        let note = provider.note.borrow().clone().expect("失败状态必须说明原因");
+        assert!(note.contains("连接中断"), "{note}");
     }
 
     #[gpui_kit::test]
@@ -634,6 +753,55 @@ mod tests {
                 assert!(editor.apply_completion_insert(version, "SELECT", "SELECT", window, cx));
             });
             assert_eq!(editor.read(cx).value(cx), "SELECT");
+            // 接受补全只替换当前词，撤销回到补全前的那一步。
+            window.press("secondary-z", cx);
+            assert_eq!(editor.read(cx).value(cx), "sel");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn popup_lists_candidates_and_escape_returns_focus(cx: &mut TestAppContext) {
+        let (window, editor) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_sql("select * from ord", window, cx);
+                editor.focus(window, cx);
+                editor.set_completion_scope(Some(catalog_scope()));
+                editor.select_range(17..17, cx);
+                editor.show_completions(window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            assert!(editor.read(cx).completion_open(cx), "有候选时弹层应打开");
+            let labels = editor.read(cx).completion_labels(cx);
+            assert!(labels.iter().any(|label| label == "orders"), "{labels:?}");
+            assert!(editor.read(cx).is_focused(window, cx), "弹层打开时焦点仍在编辑器");
+            window.press("escape", cx);
+            assert!(!editor.read(cx).completion_open(cx), "Esc 关闭弹层");
+            assert!(editor.read(cx).is_focused(window, cx), "Esc 之后焦点回到编辑器");
+            assert_eq!(editor.read(cx).value(cx), "select * from ord", "Esc 不改草稿");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn ime_and_non_ascii_text_do_not_trigger_the_popup(cx: &mut TestAppContext) {
+        let (window, editor) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_sql("select * from ord", window, cx);
+                editor.focus(window, cx);
+                editor.set_completion_scope(Some(catalog_scope()));
+            });
+            let provider = suggest(Some(catalog_scope()), Vec::new());
+            assert!(!provider.is_completion_trigger(0, "中", cx));
+            assert!(!provider.is_completion_trigger(0, " ", cx));
+            assert!(provider.is_completion_trigger(0, "o", cx));
+            assert!(provider.is_completion_trigger(0, ".", cx));
+            window.render_frame(cx);
         })
         .unwrap();
     }

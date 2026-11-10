@@ -832,14 +832,27 @@ impl QueryPane {
         let Some(id) = self.desk.active_id().map(str::to_owned) else {
             return;
         };
-        let prefix = self.editors.get(&id).map(|editor| editor.read(cx).completion_prefix(cx)).unwrap_or_default();
-        let items = self.desk.completion_for(&prefix);
+        // 整段语句和光标一起交给补全：子句、别名和 ON 两侧都从当前语句得出。
+        let (text, cursor) = match self.editors.get(&id) {
+            Some(editor) => {
+                let editor = editor.read(cx);
+                let text = editor.value(cx);
+                let cursor = editor.selected_range(cx).end.min(text.len());
+                (text, cursor)
+            }
+            None => (String::new(), 0),
+        };
+        let locale = self.locale;
+        let items = self.desk.completion_for(&text, cursor, locale);
         let pairs: Vec<(String, String)> = items.iter().map(|item| (item.label.clone(), item.insert.clone())).collect();
         if let Some(ticket) = self.desk.issue(&self.services.tasks) {
             let _ = self.desk.accept_completion(&self.services.tasks, &ticket, items);
         }
         if let Some(editor) = self.editors.get(&id) {
-            editor.update(cx, |editor, _| editor.set_extra_suggestions(pairs));
+            editor.update(cx, |editor, _| {
+                editor.set_locale(locale);
+                editor.set_extra_suggestions(pairs);
+            });
         }
         self.pending_completion = true;
         cx.notify();
@@ -1044,7 +1057,11 @@ impl QueryPane {
         let id = self.desk.active_id().map(str::to_owned);
         if let Some(editor) = id.as_deref().and_then(|id| self.editors.get(id)) {
             let scope = self.desk.completion_scope();
-            editor.read(cx).set_completion_scope(scope);
+            let locale = self.locale;
+            editor.update(cx, |editor, _| {
+                editor.set_locale(locale);
+                editor.set_completion_scope(scope);
+            });
         }
         if let Some(sql) = self.pending_text.take() {
             if let Some(id) = id.as_deref() {
@@ -1063,7 +1080,16 @@ impl QueryPane {
             self.pending_completion = false;
             if let Some(id) = id.as_deref() {
                 if let Some(editor) = self.editors.get(id).cloned() {
-                    editor.update(cx, |editor, cx| editor.show_completions(window, cx));
+                    let locale = self.locale;
+                    let note = editor.update(cx, |editor, cx| {
+                        editor.set_locale(locale);
+                        editor.show_completions(window, cx);
+                        editor.completion_note()
+                    });
+                    // 元数据失败、部分失败或没有列时说明原因，而不是只留一个空列表。
+                    if let Some(note) = note.filter(|note| !note.trim().is_empty()) {
+                        self.desk.set_active_note(&note);
+                    }
                 }
             }
         }
@@ -2036,6 +2062,70 @@ mod tests {
                 assert!(text.contains("SELECT  FROM "), "{text}");
                 assert!(!text.contains("select-from"), "{text}");
             });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn completion_follows_the_current_statement_and_shows_the_metadata_state(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let snap = bound("q", "SELECT * FROM orders o WHERE o.");
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&snap), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.set_objects(
+                    vec![TreeObject {
+                        connection_id: "notes".to_owned(),
+                        connection_name: "笔记".to_owned(),
+                        engine: "sqlite".to_owned(),
+                        database: "main".to_owned(),
+                        schema: String::new(),
+                        name: "orders".to_owned(),
+                        kind: "table".to_owned(),
+                    }],
+                    vec!["main".to_owned()],
+                );
+                pane.desk.remember_columns("notes", "main", "orders", vec!["id".to_owned(), "status".to_owned()]);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let editor = pane.editors.get("q").unwrap().clone();
+                let end = editor.read(cx).value(cx).len();
+                editor.update(cx, |editor, cx| editor.select_range(end..end, cx));
+                pane.command("autocomplete", cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
+            let (labels, note) = pane.update(cx, |pane, cx| {
+                let editor = pane.editors.get("q").unwrap().clone();
+                (editor.read(cx).completion_labels(cx), pane.note())
+            });
+            assert_eq!(labels, vec!["id".to_owned(), "status".to_owned()], "别名后只给该表的列：{labels:?}");
+            assert!(note.is_empty(), "正常元数据下不该有状态说明：{note}");
+
+            pane.update(cx, |pane, cx| {
+                pane.desk.set_tree_error("读取库表失败：连接中断");
+                let editor = pane.editors.get("q").unwrap().clone();
+                editor.update(cx, |editor, cx| {
+                    editor.set_sql("SELECT * FROM ", window, cx);
+                    editor.select_range(14..14, cx);
+                });
+                pane.command("autocomplete", cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, _, cx| {
+            let note = pane.read(cx).note();
+            assert!(note.contains("连接中断"), "元数据失败要说明原因而不是空列表：{note}");
         })
         .unwrap();
     }
