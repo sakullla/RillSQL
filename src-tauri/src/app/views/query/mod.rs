@@ -24,6 +24,7 @@ use crate::app::model::ObjectTarget;
 use crate::application::AppServices;
 use crate::i18n::{self, Locale};
 use crate::query::assist::{self, LintFinding, RunScope, TreeObject};
+use crate::query::commands::RunDto;
 use crate::query::desk::{self, BeginRun, Desk, DraftLink, DraftSync, PreparedRun, Target, Ticket};
 use crate::ui::SqlEditor;
 
@@ -501,8 +502,17 @@ impl QueryPane {
     pub fn sync(&mut self, tabs: &[TabSnap], active: Option<&str>, locale: Locale, window: &mut Window, cx: &mut Context<Self>) -> SyncEffect {
         let context = active.is_some_and(|id| tabs.iter().any(|tab| tab.id == id));
         let effect = self.prepare(tabs, active, locale, context, cx);
+        self.apply_grid_locale(locale, cx);
         self.ensure_editors(window, cx);
         effect
+    }
+
+    /// 网格是独立实体，父页面换语言时必须主动下发并重绘，否则工具栏保留旧语言。
+    pub fn apply_grid_locale(&mut self, locale: Locale, cx: &mut Context<Self>) {
+        self.grid.update(cx, |grid, cx| {
+            grid.set_locale(locale);
+            cx.notify();
+        });
     }
 
     /// 把外壳标签和编辑器草稿对齐。不创建编辑器，所以命令层没有 Window 也能调用。
@@ -676,8 +686,9 @@ impl QueryPane {
         }
         self.polls.store(0, Ordering::Relaxed);
         let polls = Arc::clone(&self.polls);
-        let (id_tx, id_rx) = tokio::sync::oneshot::channel();
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        // 一条执行只开一条有序快照通道：中间批次和终态按产生顺序送达界面。
+        // 只等终态时，分批读取停在“加载更多”的等待上，界面永远停在“正在执行”且没有行。
+        let (snapshots, mut received) = tokio::sync::mpsc::unbounded_channel::<Result<RunDto, String>>();
         runtime().spawn(async move {
             let started = match crate::query::commands::start_run(
                 &services.connections,
@@ -696,61 +707,73 @@ impl QueryPane {
             {
                 Ok(started) => started,
                 Err(error) => {
-                    let _ = done_tx.send(Err(error));
+                    let _ = snapshots.send(Err(error));
                     return;
                 }
             };
-            let _ = id_tx.send(started.id.clone());
-            loop {
-                match crate::query::commands::poll_run(&services.query, &started.id, false).await {
-                    Ok(snap) if !matches!(snap.status.as_str(), "running" | "cancel-requested") => {
+            let run_id = started.id.clone();
+            let mut pending = desk::run_pending(&started.status);
+            if snapshots.send(Ok(started)).is_err() {
+                return;
+            }
+            // 每次带 continue_read 的轮询放行一批行并等到下一批，不忙轮询。
+            while pending {
+                match crate::query::commands::poll_run(&services.query, &run_id, true).await {
+                    Ok(snap) => {
                         polls.fetch_add(1, Ordering::Relaxed);
-                        let _ = done_tx.send(Ok(snap));
-                        return;
-                    }
-                    Ok(_) => {
-                        polls.fetch_add(1, Ordering::Relaxed);
-                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        pending = desk::run_pending(&snap.status);
+                        if snapshots.send(Ok(snap)).is_err() {
+                            return;
+                        }
                     }
                     Err(error) => {
                         polls.fetch_add(1, Ordering::Relaxed);
-                        let _ = done_tx.send(Err(error));
+                        let _ = snapshots.send(Err(error));
                         return;
                     }
                 }
             }
         });
-        let tab_id = ticket.tab_id.clone();
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
-            if let Ok(run_id) = id_rx.await {
-                cx.update(|cx| {
-                    if let Some(view) = view.upgrade() {
-                        view.update(cx, |pane, cx| pane.note_started(&tab_id, &run_id, cx));
-                    }
-                });
-            }
-        })
-        .detach();
-        let view = cx.entity().downgrade();
-        cx.spawn(async move |_, cx| {
-            if let Ok(result) = done_rx.await {
+            while let Some(item) = received.recv().await {
+                let mut keep = false;
                 cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |pane, cx| {
-                            let cancel_text = i18n::text(pane.locale, "query.run.cancel");
-                            pane.desk.finish_polled(&pane.services.tasks, &ticket, result, &cancel_text);
-                            pane.rebind_grid(cx);
-                            cx.notify();
+                            keep = pane.apply_run_snapshot(&ticket, item, cx);
                         });
                     }
                 });
+                if !keep {
+                    break;
+                }
             }
         })
         .detach();
         // 运行态由结果标题的 spinner 表达；note 留给错误或提示，避免“正在执行”重复两遍。
         self.desk.set_active_note("");
         cx.notify();
+    }
+
+    /// 一条执行快照到达界面：中间批次也要立刻落到结果和网格上，
+    /// 否则分批读取的行要等到终态才显示。返回 false 表示这次执行已经结束。
+    fn apply_run_snapshot(&mut self, ticket: &Ticket, result: Result<RunDto, String>, cx: &mut Context<Self>) -> bool {
+        let pending = match &result {
+            Ok(run) => {
+                if !self.desk.run_noted(&ticket.tab_id, &run.id) {
+                    // 运行 id 第一次出现：取消要能定位到它，之后才算“已记录”。
+                    self.note_started(&ticket.tab_id, &run.id, cx);
+                }
+                desk::run_pending(&run.status)
+            }
+            Err(_) => false,
+        };
+        let cancel_text = i18n::text(self.locale, "query.run.cancel");
+        self.desk.finish_polled(&self.services.tasks, ticket, result, &cancel_text);
+        self.rebind_grid(cx);
+        cx.notify();
+        pending
     }
 
     /// 结果被读取上限截断时，再执行一次同一条只读语句并放大窗口。
@@ -2231,7 +2254,9 @@ mod tests {
         }
         assert_ne!(note, "执行没有结束");
         assert!(landed, "超过 10 秒的 SELECT 没有回到结果：{note} polls={polls}");
-        assert!(polls > 400, "轮询次数 {polls} 没有越过原来的 400 次上限");
+        // 快照通道按“下一批已就绪”推进，不再靠 25ms 忙轮询，所以这里只确认执行过程
+        // 经过了轮询并且终态落地，不再用轮询次数当时间刻度的替代。
+        assert!(polls >= 1, "这次执行没有经过轮询：{polls}");
         assert!(!cx.update(|cx| pane.read(cx).running()));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2281,5 +2306,127 @@ mod tests {
             assert_eq!(editor.font_size(), 18, "已有编辑器立即改字号");
             assert_eq!(editor.theme(), "warm", "已有编辑器立即改配色");
         });
+    }
+
+    fn streamed_run(id: &str, status: &str, rows: &[&str]) -> RunDto {
+        RunDto {
+            id: id.to_owned(),
+            connection_id: "notes".to_owned(),
+            connection_name: "笔记".to_owned(),
+            database: "main".to_owned(),
+            engine: "sqlite".to_owned(),
+            status: status.to_owned(),
+            cancel: "none".to_owned(),
+            cancel_message: String::new(),
+            via_ssh: false,
+            fresh_channel: false,
+            statements: vec![crate::query::commands::StatementDto {
+                sql: "SELECT * FROM thread_items".to_owned(),
+                status: if desk::run_pending(status) { "running" } else { "ok" }.to_owned(),
+                message: String::new(),
+                columns: vec!["id".to_owned()],
+                column_types: vec!["integer".to_owned()],
+                rows: rows.iter().map(|value| vec![Some((*value).to_owned())]).collect(),
+                truncated: false,
+                affected: None,
+            }],
+            started_at: String::new(),
+            elapsed_ms: 0,
+        }
+    }
+
+    #[gpui_kit::test]
+    fn intermediate_snapshots_reach_the_grid_before_the_run_ends(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.desk.open_database("notes", "笔记", "sqlite", "main");
+                pane.desk.set_draft("SELECT * FROM thread_items");
+                let prepared = match pane.desk.begin_run(&pane.services.tasks, RunScope::Script, None) {
+                    BeginRun::Ready(prepared) => prepared,
+                    BeginRun::Rejected(reason) => panic!("{reason}"),
+                    BeginRun::Variables(_) => panic!("variables"),
+                };
+                let ticket = Ticket { tab_id: prepared.tab_id.clone(), token: prepared.token, version: prepared.version };
+                // 中间快照：行立刻显示，执行还没结束，也不能再起第二次。
+                assert!(
+                    pane.apply_run_snapshot(&ticket, Ok(streamed_run("run-1", "running", &["1", "2"])), cx),
+                    "中间快照之后还要继续等下一批"
+                );
+                assert!(pane.running(), "中间快照清掉了运行态");
+                assert_eq!(pane.cell(1, 0, cx), "2", "分批到达的行没有显示");
+                assert!(!pane.executed());
+                // 终态：补上剩余行并结束这次执行。
+                assert!(
+                    !pane.apply_run_snapshot(&ticket, Ok(streamed_run("run-1", "ok", &["1", "2", "3"])), cx),
+                    "终态之后不该再等快照"
+                );
+                assert!(!pane.running());
+                assert!(pane.executed());
+                assert_eq!(pane.cell(2, 0, cx), "3");
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+
+    /// 用户报的缺陷回归：行数超过一批时，第一次发布之后执行会停下等下一批。
+    /// 只等终态的实现会一直停在“正在执行”，这里必须自己走到 200 行。
+    #[gpui_kit::test]
+    fn a_chunked_result_finishes_instead_of_staying_running(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("rillsql-chunked-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("thread.sqlite");
+        let config_dir = dir.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime().spawn(async move {
+            let setup = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE thread_items (id INTEGER PRIMARY KEY)").execute(&setup).await.unwrap();
+            for id in 1..=200i64 {
+                sqlx::query("INSERT INTO thread_items (id) VALUES (?)").bind(id).execute(&setup).await.unwrap();
+            }
+            setup.close().await;
+            let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(config_dir.join("connections.sqlite")))));
+            services.connections.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+            let _ = tx.send(services);
+        });
+        let services = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite setup");
+        cx.update(gpui_kit::init);
+        let (window, pane) = cx.update(|cx| {
+            let bounds = gpui_kit::Bounds { origin: Point::default(), size: size(px(1100.), px(720.)) };
+            gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |window, cx| cx.new(|cx| QueryPane::new(services, window, cx)),
+            )
+            .expect("query pane")
+        });
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                // 读取上限 250、结果 200 行：每批 125 行，第二批必须有人放行。
+                pane.desk.set_page_size(250);
+                let snap = bound("q", "SELECT id FROM thread_items ORDER BY id");
+                let _ = pane.sync(std::slice::from_ref(&snap), Some("q"), Locale::ZhCn, window, cx);
+                pane.command("execute-query", cx);
+                assert!(pane.running(), "执行没有标成运行中：{}", pane.note());
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let landed = wait_for_tokio(cx, window, std::time::Duration::from_secs(30), |cx| {
+            cx.update(|cx| {
+                let pane = pane.read(cx);
+                !pane.running() && pane.cell(199, 0, cx) == "200"
+            })
+        });
+        let note = cx.update(|cx| pane.read(cx).note());
+        assert!(landed, "分批读取没有走完：{note}");
+        assert!(cx.update(|cx| pane.read(cx).executed()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

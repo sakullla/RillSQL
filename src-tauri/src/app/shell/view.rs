@@ -466,8 +466,11 @@ impl Workbench {
         let effect = self.query.update(cx, |pane, cx| {
             pane.set_query_timeout_sec(timeout);
             let _ = pane.prepare(&snaps, active.as_deref(), locale, context, cx);
+            pane.apply_grid_locale(locale, cx);
             pane.command(id, cx);
-            pane.prepare(&snaps, active.as_deref(), locale, context, cx)
+            let effect = pane.prepare(&snaps, active.as_deref(), locale, context, cx);
+            pane.apply_grid_locale(locale, cx);
+            effect
         });
         self.apply_query_effect(effect);
     }
@@ -479,7 +482,10 @@ impl Workbench {
         let page_size = u64::try_from(settings.page_size.max(1)).unwrap_or(1);
         let preview_kb = u64::try_from(settings.preview_kb.max(1)).unwrap_or(1);
         let null_copy = settings.null_copy.clone();
+        let locale = self.model.locale();
         self.table.update(cx, |pane, cx| {
+            pane.set_locale(locale);
+            cx.notify();
             pane.set_page_limit(page_size, cx);
             // 上限变了就重读表数据并关掉查看面板，旧行列不再按新上限解释。
             pane.set_preview_kb(preview_kb, cx);
@@ -504,6 +510,7 @@ impl Workbench {
             pane.remember_environments(environments);
             pane.set_query_timeout_sec(timeout);
             let effect = pane.prepare(&snaps, active.as_deref(), locale, context, cx);
+            pane.apply_grid_locale(locale, cx);
             pane.ensure_editors(window, cx);
             effect
         });

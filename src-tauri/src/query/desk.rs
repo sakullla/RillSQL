@@ -745,6 +745,8 @@ impl Desk {
         self.accept_assist(tasks, ticket, |tab| tab.completions = items)
     }
 
+    /// 收到一次执行快照。分批读取时先到的是中间快照，只有终态才算执行结束：
+    /// 中间快照更新结果、状态和 run_id，但不写 executed，也不放开第二次执行。
     pub fn accept_run(&mut self, tasks: &TaskBoard, ticket: &Ticket, run: RunDto) -> bool {
         if !self.tabs.iter().any(|tab| tab.id == ticket.tab_id) {
             return false;
@@ -756,6 +758,7 @@ impl Desk {
         if tab.token != Some(ticket.token) {
             return false;
         }
+        let pending = run_pending(&run.status);
         let accepted = if tab.cancelled {
             tab.running = false;
             tab.status = "cancelled".to_owned();
@@ -763,13 +766,15 @@ impl Desk {
         } else {
             match outcome {
                 TaskOutcome::Current { .. } => {
-                    tab.running = false;
-                    tab.executed = true;
-                    tab.executed_sql = Some(tab.draft.clone());
+                    tab.running = pending;
                     tab.status = run.status.clone();
                     tab.results = run.statements.into_iter().map(statement_view).collect();
                     tab.run_id = Some(run.id);
-                    tab.statement = 0;
+                    if !pending {
+                        tab.executed = true;
+                        tab.executed_sql = Some(tab.draft.clone());
+                        tab.statement = 0;
+                    }
                     true
                 }
                 TaskOutcome::Cancelled { .. } | TaskOutcome::Stale { .. } => {
@@ -780,6 +785,11 @@ impl Desk {
         };
         self.view_gen = self.view_gen.saturating_add(1);
         accepted
+    }
+
+    /// 这次执行是否已经记到标签上；轮询拿到同一批快照时不重复发起取消。
+    pub fn run_noted(&self, id: &str, run_id: &str) -> bool {
+        self.tabs.iter().any(|tab| tab.id == id && tab.run_id.as_deref() == Some(run_id))
     }
 
     pub fn cancel(&mut self, tasks: &TaskBoard) -> Option<String> {
@@ -1351,6 +1361,12 @@ async fn read_columns(service: &Arc<Service>, connection_id: &str, table: &str) 
     Ok(info.rows.into_iter().filter_map(|row| row.get(name_at).and_then(|cell| cell.clone())).collect())
 }
 
+/// 快照是否还表示执行中。只有 running / cancel-requested 会继续等下一批行，
+/// 其余状态都是终态（完成、失败、取消、结果未知）。
+pub fn run_pending(status: &str) -> bool {
+    matches!(status, "running" | "cancel-requested")
+}
+
 fn statement_view(statement: commands::StatementDto) -> StatementView {
     StatementView {
         sql: statement.sql,
@@ -1916,6 +1932,63 @@ mod tests {
         assert!(desk.note_of(&again.tab_id).is_empty());
         assert_eq!(desk.results().len(), 1);
         assert_eq!(desk.status(), "ok");
+    }
+
+    /// 分批读取的一次快照：行数随批次增长，status 描述这一批是否已结束。
+    fn streaming_run(id: &str, status: &str, rows: &[&str]) -> RunDto {
+        let mut run = empty_run(id);
+        run.status = status.to_owned();
+        let statement = &mut run.statements[0];
+        statement.status = if run_pending(status) { "running" } else { "ok" }.to_owned();
+        statement.rows = rows.iter().map(|value| vec![Some((*value).to_owned())]).collect();
+        run
+    }
+
+    #[test]
+    fn intermediate_snapshots_land_without_finishing_the_run() {
+        let tasks = TaskBoard::new();
+        let mut desk = Desk::new();
+        desk.open_database("notes", "笔记", "sqlite", "main");
+        let ticket = ready_ticket(&mut desk, &tasks, "SELECT n FROM item");
+        assert!(desk.running_ids().contains(&ticket.tab_id));
+        assert!(!desk.run_noted(&ticket.tab_id, "run-1"));
+
+        // 第一批行到了：结果可见，但这条 SELECT 还没有结束。
+        assert!(desk.accept_run(&tasks, &ticket, streaming_run("run-1", "running", &["1", "2"])));
+        assert_eq!(desk.results()[0].rows.len(), 2);
+        assert_eq!(desk.status(), "running");
+        assert!(desk.running_ids().contains(&ticket.tab_id), "中间快照清掉了运行态");
+        assert!(!desk.executed(), "只到一半的结果不能算已执行");
+        assert_eq!(desk.executed_sql(&ticket.tab_id), None);
+        assert!(desk.run_noted(&ticket.tab_id, "run-1"));
+        match desk.begin_run(&tasks, RunScope::Script, None) {
+            BeginRun::Rejected(reason) => assert!(reason.contains("正在执行"), "{reason}"),
+            _ => panic!("中间快照之后又允许了一次执行"),
+        }
+
+        // 终态：行合并进最新结果，运行态和“已执行”这时才落定。
+        assert!(desk.accept_run(&tasks, &ticket, streaming_run("run-1", "ok", &["1", "2", "3"])));
+        assert_eq!(desk.results()[0].rows.len(), 3);
+        assert!(!desk.running_ids().contains(&ticket.tab_id));
+        assert_eq!(desk.status(), "ok");
+        assert!(desk.executed());
+        assert_eq!(desk.executed_sql(&ticket.tab_id).as_deref(), Some("SELECT n FROM item"));
+    }
+
+    #[test]
+    fn a_cancel_requested_snapshot_still_counts_as_running() {
+        let tasks = TaskBoard::new();
+        let mut desk = Desk::new();
+        desk.open_database("notes", "笔记", "sqlite", "main");
+        let ticket = ready_ticket(&mut desk, &tasks, "SELECT n FROM item");
+        desk.note_run(&ticket.tab_id, "run-2");
+        assert!(desk.accept_run(&tasks, &ticket, streaming_run("run-2", "cancel-requested", &["1"])));
+        assert!(desk.running_ids().contains(&ticket.tab_id), "取消请求还没落地，仍要等终态");
+        assert_eq!(desk.status(), "cancel-requested");
+        assert!(!desk.executed());
+        assert!(desk.accept_run(&tasks, &ticket, streaming_run("run-2", "cancelled", &["1"])));
+        assert!(!desk.running_ids().contains(&ticket.tab_id));
+        assert_eq!(desk.status(), "cancelled");
     }
 
     #[test]
