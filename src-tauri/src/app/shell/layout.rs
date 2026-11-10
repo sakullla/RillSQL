@@ -3,6 +3,10 @@
 
 use crate::ui::kit::Metrics;
 
+/// 活动栏的固定宽度。绘制（chrome 模块的 rail）与几何（这里）共用一个值；
+/// 38px 图标加两侧留白与选中标记，52 才不会挤掉内容列。
+pub const RAIL_WIDTH: i32 = 52;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidebarMode {
     Docked,
@@ -25,7 +29,8 @@ pub struct ChromeLayout {
 }
 
 pub fn layout_for(width: i32, sidebar_open: bool) -> ChromeLayout {
-    let activity_width = if width <= 640 { 40 } else { 44 };
+    // 活动栏宽度不随窗口变化：变窄会让图标和选中标记被裁掉，反而挤压内容列。
+    let activity_width = RAIL_WIDTH;
     let (sidebar_width, sidebar_mode) = if width <= 640 {
         if sidebar_open { (234, SidebarMode::Overlay) } else { (0, SidebarMode::Hidden) }
     } else if sidebar_open {
@@ -95,7 +100,8 @@ pub fn painted_frame(viewport: i32, sidebar_open: bool, pad: i32) -> PaintedFram
     let docked = if sidebar_in_flex { layout.sidebar_width } else { 0 };
     let content_width = (body_width - layout.activity_width - docked).max(0);
     let row_width = layout.activity_width + docked + content_width;
-    let toolbar_wrap = viewport <= 900;
+    // 顶栏是单行：窄窗口把文字按钮换成图标、收窄搜索框，不换行也不加高。
+    let toolbar_wrap = false;
     PaintedFrame {
         viewport,
         pad,
@@ -106,7 +112,7 @@ pub fn painted_frame(viewport: i32, sidebar_open: bool, pad: i32) -> PaintedFram
         sidebar_in_flex,
         sidebar_overlay: layout.sidebar_mode == SidebarMode::Overlay,
         toolbar_wrap,
-        toolbar_height: if toolbar_wrap { 72 } else { layout.toolbar_height },
+        toolbar_height: layout.toolbar_height,
         row_width,
     }
 }
@@ -176,9 +182,32 @@ mod tests {
         let narrow = painted_frame(640, true, 8);
         assert!(narrow.sidebar_overlay);
         assert!(!narrow.sidebar_in_flex);
-        assert!(narrow.toolbar_wrap);
-        assert!(painted_frame(900, false, 4).toolbar_wrap);
-        assert!(!painted_frame(1360, true, 8).toolbar_wrap);
+        // 顶栏不换行：任何宽度都只占一个顶栏高度，避免和内容或状态栏重叠。
+        for width in [1360, 900, 640] {
+            let frame = painted_frame(width, false, 8);
+            assert!(!frame.toolbar_wrap, "{width}");
+            assert_eq!(frame.toolbar_height, Metrics::standard().topbar_h as i32, "{width}");
+        }
         assert!(painted_frame(1360, true, 8).sidebar_in_flex);
+    }
+
+    #[test]
+    fn rail_width_is_reserved_once_so_the_workspace_is_not_squeezed() {
+        // 绘制用同一个 52px 活动栏；模型里的内容宽必须正好是扣除它之后的宽度。
+        for width in [1360, 900, 640] {
+            for open in [true, false] {
+                for density in [crate::app::Density::Compact, crate::app::Density::Standard, crate::app::Density::Relaxed] {
+                    let pad = density.metrics().pad as i32;
+                    let frame = painted_frame(width, open, pad);
+                    assert_eq!(frame.activity_width, RAIL_WIDTH, "{width} open={open}");
+                    let expected = frame.body_width
+                        - RAIL_WIDTH
+                        - if frame.sidebar_in_flex { frame.sidebar_width } else { 0 };
+                    assert_eq!(frame.content_width, expected.max(0), "{width} {density:?}");
+                    // 行宽加两侧 padding 正好等于视口，没有留白也没有被裁掉的列。
+                    assert_eq!(frame.occupied_width(), width, "{width} open={open} {density:?}");
+                }
+            }
+        }
     }
 }

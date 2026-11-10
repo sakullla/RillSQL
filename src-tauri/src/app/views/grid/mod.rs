@@ -285,6 +285,11 @@ impl GridPane {
         self.sync_table(cx);
     }
 
+    /// 菜单/查看面板关闭后把键盘交回网格；下一帧绘制时真正聚焦。
+    pub fn request_focus(&mut self) {
+        self.refocus = true;
+    }
+
     #[cfg(test)]
     pub fn focus_handle(&self) -> FocusHandle {
         self.grid_focus.clone()
@@ -1964,8 +1969,11 @@ impl Render for GridPane {
                 if key == "escape" {
                     if this.session.preview_open() {
                         this.cancel_preview(cx);
+                        this.refocus = true;
                     } else if this.session.viewer().is_some() {
+                        // 关闭查看面板后键盘回到网格，方向和 Enter 仍然可用。
                         this.session.close_value();
+                        this.refocus = true;
                         cx.notify();
                     } else {
                         this.session.clear_selection();
@@ -4680,6 +4688,25 @@ mod pane_tests {
                 assert_eq!(selection_state(pane), before);
             });
         });
+        // Esc 关闭查看面板后键盘回到网格，不会困在已经消失的弹层里。
+        cx.update_window(window, |_, window, cx| {
+            let handle = pane.read(cx).focus_handle();
+            window.focus(&handle, cx);
+            pane.update(cx, |pane, cx| {
+                pane.session.select(1, 1, false);
+                let _ = pane.command("grid-value-open", cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.simulate_keystrokes(window, "escape");
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(pane.read(cx).session.viewer().is_none(), "Esc 应关闭查看面板");
+            let handle = pane.read(cx).focus_handle();
+            assert!(handle.is_focused(window), "关闭后焦点要回到网格");
+        })
+        .unwrap();
     }
 
     fn plant_writable(pane: &mut GridPane, cx: &mut Context<GridPane>) {

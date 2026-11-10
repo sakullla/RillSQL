@@ -2648,7 +2648,8 @@ impl WorkbenchModel {
     pub fn copy_overflow(&self, locale: i18n::Locale) -> i32 {
         let layout = self.layout();
         let mut overflow = layout.overflow;
-        let limit = layout.content_width.max(160);
+        // 实际可写宽度是扣掉根 padding 之后的内容盒；用未减 padding 的宽度会漏掉窄窗口里的裁切。
+        let limit = self.painted().content_width.max(160);
         for key in self.visible_keys() {
             let text = i18n::text(locale, key);
             let width = unbreakable_px(&text);

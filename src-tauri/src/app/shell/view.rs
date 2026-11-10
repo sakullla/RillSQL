@@ -51,7 +51,7 @@ pub struct Workbench {
     applied_redis: Option<String>,
     applied_mongo: Option<String>,
     services: Arc<AppServices>,
-    focus: FocusHandle,
+    pub(super) focus: FocusHandle,
     /// 对象树自己的焦点；点击树行后方向键归树，离开时归还编辑器。
     pub(super) nav_focus: FocusHandle,
     close_hooked: bool,

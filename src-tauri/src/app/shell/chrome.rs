@@ -24,7 +24,8 @@ use crate::ui::kit::{self, FieldSpec, Palette, Tip as _};
 use super::model::{DraftField, WorkItemKind, WorkTool};
 use super::view::Workbench;
 
-const RAIL_W: f32 = 52.;
+/// 活动栏宽度来自布局模块，绘制与几何只保留一份。
+const RAIL_W: f32 = super::layout::RAIL_WIDTH as f32;
 
 /// 点击后执行一条外壳命令。
 fn act<S: Into<String>>(id: S, cx: &mut Context<Workbench>) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static + use<S> {
@@ -101,7 +102,7 @@ impl Workbench {
                     entity.update(cx, |this, cx| this.accept_exchange_drop(paths, cx));
                 }
             })
-            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| this.overlay_key(event, cx)))
+            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| this.overlay_key(event, window, cx)))
             .child(self.topbar(cx))
             .child(
                 div()
@@ -168,8 +169,10 @@ impl Workbench {
     }
 
     /// 浮层打开时，方向键、回车与 Esc 归浮层。回车经由 `perform` 执行，保证效果完整。
-    fn overlay_key(&mut self, event: &gpui_kit::KeyDownEvent, cx: &mut Context<Self>) {
+    fn overlay_key(&mut self, event: &gpui_kit::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
+        // 浮层关闭后键盘要回到打开它的地方，而不是留在已经消失的弹层上。
+        let overlay_was_open = self.model.menu.is_some() || self.model.shell.palette_open;
         if key == "escape" && self.model.connections.confirm_delete && self.model.menu.is_none() && self.model.close_prompt.is_none() {
             self.perform("conn-delete-cancel", cx);
             return;
@@ -224,6 +227,7 @@ impl Workbench {
                 if let Some(id) = id {
                     self.perform(&id, cx);
                 }
+                self.restore_if_closed(overlay_was_open, window, cx);
                 cx.notify();
                 return;
             }
@@ -234,12 +238,30 @@ impl Workbench {
                 if let Some(id) = id {
                     self.perform(&id, cx);
                 }
+                self.restore_if_closed(overlay_was_open, window, cx);
                 cx.notify();
                 return;
             }
         }
         let _ = self.model.key(nav);
+        self.restore_if_closed(overlay_was_open, window, cx);
         cx.notify();
+    }
+
+    /// 弹层关闭后把真实键盘焦点送回触发区域；模型里的 focus 只是可读状态。
+    fn restore_if_closed(&mut self, was_open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if was_open && self.model.menu.is_none() && !self.model.shell.palette_open {
+            self.restore_focus(window, cx);
+        }
+    }
+
+    fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.model.shell.focus {
+            FocusTarget::Sidebar if self.model.shell.sidebar_open => window.focus(&self.nav_focus, cx),
+            FocusTarget::Grid => self.table.update(cx, |pane, _| pane.request_focus()),
+            FocusTarget::Editor => self.query.update(cx, |pane, _| pane.request_focus()),
+            _ => window.focus(&self.focus, cx),
+        }
     }
 
     // ------------------------------------------------------------ 顶栏
@@ -351,6 +373,7 @@ impl Workbench {
         }
         div()
             .id("activity")
+            .test_support()
             .role(gpui_kit::Role::Navigation)
             .aria_label(self.t("shell.nav.main"))
             .flex_none()
@@ -527,6 +550,8 @@ impl Workbench {
             .aria_label(name.clone())
             .aria_selected(selected)
             .aria_expanded(expanded)
+            // 状态不只靠圆点颜色：无障碍描述和提示都写出同一句状态文案。
+            .aria_description(SharedString::from(format!("{} · {}", full_name, self.t(state_key))))
             .tooltip_text(full_name)
             .h(px(m.row_h))
             .px(px(6.))
@@ -565,6 +590,7 @@ impl Workbench {
             .child(
                 div()
                     .id(SharedString::from(format!("side-state-{id}")))
+                    .aria_label(self.t(state_key))
                     .tooltip_text(self.t(state_key))
                     .child(kit::status_dot(dot)),
             )
@@ -990,6 +1016,7 @@ impl Workbench {
             .child(
                 div()
                     .id("status-locale")
+                    .test_support()
                     .px(px(6.))
                     .rounded(px(4.))
                     .cursor_pointer()
@@ -2395,8 +2422,9 @@ impl Workbench {
                         .border_b_1()
                         .border_color(p.line)
                         .child(kit::title(self.t("shell.command.help"), 14., &p))
-                        .child(kit::icon_button("help-close", IconName::X, self.t("common.close"), cx.listener(|this, _: &ClickEvent, _, cx| {
+                        .child(kit::icon_button("help-close", IconName::X, self.t("common.close"), cx.listener(|this, _: &ClickEvent, window, cx| {
                             this.model.shell.close_overlay();
+                            this.restore_focus(window, cx);
                             cx.notify();
                         }))),
                 )
@@ -2457,6 +2485,7 @@ impl Workbench {
                 list = list.child(
                     div()
                         .id(SharedString::from(format!("pal-{index}")))
+                        .test_support()
                         .role(gpui_kit::Role::MenuItem)
                         .aria_label(SharedString::from(entry.label.clone()))
                         .aria_selected(selected)
@@ -2474,9 +2503,12 @@ impl Workbench {
                         .when(!detail.is_empty(), |this| this.child(div().max_w(px(160.)).truncate().text_size(px(11.)).text_color(p.text_faint).child(SharedString::from(detail))))
                         .when(!group.is_empty(), |this| this.child(div().text_size(px(11.)).text_color(p.text_faint).child(group)))
                         .when_some(chord, |this, chord| this.child(kit::kbd(kit::shortcut(&chord.replace("Mod+", "Ctrl+")), &p)))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             this.model.shell.close_overlay();
                             this.perform(&id, cx);
+                            if !this.model.shell.palette_open && !this.model.shell.help_open {
+                                this.restore_focus(window, cx);
+                            }
                         })),
                 );
             }
@@ -2561,13 +2593,15 @@ impl Workbench {
                     .when_some(item.reason_key.filter(|_| !enabled), |this, reason| {
                         this.tooltip_text(self.t(reason))
                     })
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         if !enabled {
                             return;
                         }
                         this.model.menu = None;
                         this.model.shell.focus = this.model.menu_return;
                         this.perform(&id, cx);
+                        // 菜单项执行后键盘回到原触发区，而不是停在已关闭的菜单上。
+                        this.restore_focus(window, cx);
                     })),
             );
         }

@@ -12,5 +12,6 @@ docs/*
 docs/verification/*
 !docs/verification/gpui-foundation/
 !docs/verification/gpui-foundation/**
+!docs/verification/2026-11-09-GPUI-workbench-navigation-grid-experience.md
 .compose/
 plans/

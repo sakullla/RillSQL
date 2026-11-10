@@ -1113,8 +1113,8 @@ fn headless_workbench_renders_on_windows_widths(cx: &mut gpui_kit::TestAppContex
             let frame = view.model.painted();
             assert!(frame.sidebar_overlay);
             assert!(!frame.sidebar_in_flex);
-            assert!(frame.toolbar_wrap);
-            assert!(frame.occupied_width() <= 640);
+            assert!(!frame.toolbar_wrap, "顶栏单行，不占两行高度");
+            assert_eq!(frame.occupied_width(), 640);
             assert!(super::layout::flex_sidebar_row_width(640, true, frame.pad) > 640);
             assert_eq!(view.model.copy_overflow(i18n::Locale::ZhCn), 0);
             assert_eq!(view.model.copy_overflow(i18n::Locale::En), 0);
@@ -3860,7 +3860,11 @@ fn narrow_window_keeps_the_four_entry_rail_and_low_frequency_commands(cx: &mut g
     cx.update(|cx| {
         view.update(cx, |view, _| {
             view.model.set_width(640);
-            assert_eq!(view.model.painted().activity_width, 40, "窄窗口活动栏更窄");
+            assert_eq!(
+                view.model.painted().activity_width,
+                super::layout::RAIL_WIDTH,
+                "窄窗口活动栏与绘制同宽，不再挤压内容列"
+            );
             assert!(view.model.painted().occupied_width() <= 640);
         });
     });
@@ -4805,3 +4809,258 @@ fn queued_group_retry_dispatches_a_read_and_resolves_loading(cx: &mut gpui_kit::
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+
+// ------------------------------------------------------------ 显示矩阵与焦点（T7）
+
+/// 1360/900/640 x 900：顶栏、活动栏、工作区与状态栏互不重叠，主操作、关闭与返回都在视口内。
+#[gpui_kit::test]
+fn display_matrix_keeps_primary_controls_visible_and_unoverlapped(cx: &mut gpui_kit::TestAppContext) {
+    // 后台读取跑在进程级 tokio runtime 上，上一例的收尾任务可能在渲染期间回写；
+    // 这里和 sqlite_notes_workbench 一样允许真实等待，避免把别人的尾活算成本例的不确定性。
+    cx.executor().allow_parking();
+    for (width, height) in [(1360., 900.), (900., 900.), (640., 900.)] {
+        let dir = std::env::temp_dir().join(format!("rillsql-shell-matrix-{}-{}", std::process::id(), width as i32));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (window, view) = open_workbench_sized(cx, services_at(&dir), false, width, height);
+        let tab_close = cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |view, cx| view.perform("new-query", cx));
+            window.render_frame(cx);
+            let root = window.find("workbench").bounds();
+            assert!((f32::from(root.size.width) - width).abs() < 1., "{width}: workbench {}", f32::from(root.size.width));
+            assert!((f32::from(root.size.height) - height).abs() < 1.);
+
+            let rect = |id: &str| {
+                let el = window.find(gpui_kit::SharedString::from(id.to_owned()));
+                assert!(el.visible(), "{width}: {id} 应可见");
+                el.bounds()
+            };
+            let inside = |label: &str, b: gpui_kit::Bounds<gpui_kit::Pixels>| {
+                let left = f32::from(b.origin.x);
+                let top = f32::from(b.origin.y);
+                let right = left + f32::from(b.size.width);
+                let bottom = top + f32::from(b.size.height);
+                assert!(left >= -0.5 && top >= -0.5, "{width}: {label} 左上越界 {left},{top}");
+                assert!(right <= width + 0.5, "{width}: {label} 右侧越界 {right}");
+                assert!(bottom <= height + 0.5, "{width}: {label} 下方越界 {bottom}");
+            };
+
+            for id in ["toolbar", "activity", "workbench-content", "status", "top-new-query", "status-locale"] {
+                inside(id, rect(id));
+            }
+            let toolbar = rect("toolbar");
+            let activity = rect("activity");
+            let content = rect("workbench-content");
+            let status = rect("status");
+            // 上中下四段只相接不重叠：控件不会被另一段盖住。
+            assert!(f32::from(toolbar.origin.y + toolbar.size.height) <= f32::from(activity.origin.y) + 0.5, "{width}");
+            assert!(f32::from(activity.origin.x + activity.size.width) <= f32::from(content.origin.x) + 0.5, "{width}");
+            assert!(f32::from(content.origin.x + content.size.width) <= width + 0.5, "{width}");
+            assert!(f32::from(content.origin.y + content.size.height) <= f32::from(status.origin.y) + 0.5, "{width}");
+            assert!(f32::from(content.size.width) >= 160., "{width}: 工作区被活动栏/侧栏挤到 {}", f32::from(content.size.width));
+            assert!(f32::from(activity.size.width) >= 52. - 0.5, "{width}: 活动栏保持完整宽度");
+
+            let tab = view.read(cx).model.tabs.last().expect("查询标签").id.clone();
+            format!("tab-close-{tab}")
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let el = window.find(gpui_kit::SharedString::from(tab_close.clone()));
+            assert!(el.visible(), "{width}: 标签关闭按钮应可达");
+            let b = el.bounds();
+            assert!(f32::from(b.origin.x + b.size.width) <= width + 0.5);
+            assert!(f32::from(b.origin.y + b.size.height) <= height + 0.5);
+        })
+        .unwrap();
+
+        // “返回”与浮层关闭按钮同样在各宽度可达。
+        cx.update(|cx| view.update(cx, |view, cx| view.perform("compare", cx)));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let back = window.find("compare-back");
+            assert!(back.visible(), "{width}: 返回按钮应可见");
+            let b = back.bounds();
+            assert!(f32::from(b.origin.x + b.size.width) <= width + 0.5);
+            assert!(f32::from(b.origin.y + b.size.height) <= height + 0.5);
+        })
+        .unwrap();
+        cx.update(|cx| view.update(cx, |view, cx| view.perform("help", cx)));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let panel = window.find("palette").bounds();
+            assert!(f32::from(panel.origin.x) >= 0. && f32::from(panel.origin.x + panel.size.width) <= width + 0.5);
+            let close = window.find("help-close");
+            assert!(close.visible(), "{width}: 关闭按钮应可见");
+            let b = close.bounds();
+            assert!(f32::from(b.origin.x + b.size.width) <= width + 0.5);
+            assert!(f32::from(b.origin.y + b.size.height) <= height + 0.5);
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// 语言、主题和密度切换后，已创建的输入框、对象树和命令面板立即跟着变，不需要重开窗口。
+#[gpui_kit::test]
+fn locale_theme_and_density_refresh_existing_inputs_tree_and_palette(cx: &mut gpui_kit::TestAppContext) {
+    use crate::catalog::hierarchy::{database_node_id, group_node_id, schema_node_id};
+    use crate::catalog::model::{ObjectKind, ObjectRow};
+    use gpui_kit::component::ActiveTheme as _;
+
+    // 同上：进程级 runtime 上的收尾任务不该被当成本例的不确定性。
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-refresh-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench_sized(cx, services_at(&dir), false, 900., 900.);
+    let group = group_node_id("pg", "shop", "public", ObjectKind::Table);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            let orders = ObjectRow::table("orders", Some(1));
+            let connection = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", vec![orders])]);
+            // 对象树只属于工作台页：先切页面，再挂上假连接，免得页面切换把树刷掉。
+            view.perform("activity-workspace", cx);
+            assert!(view.model.shell.sidebar_open, "工作台页要有资源管理器");
+            // 资源管理器只在保存过的连接且连接成功时画树：假连接也要走同一条入口。
+            view.model.connections.rows.push(ConnectionRecord {
+                saved: SavedConnection {
+                    id: "pg".into(),
+                    name: "销售库".into(),
+                    engine: Engine::Postgres,
+                    env: "dev".into(),
+                    host: Some("localhost".into()),
+                    port: Some(5432),
+                    database: Some("shop".into()),
+                    username: Some("reader".into()),
+                    file_path: None,
+                    replica_set: None,
+                    tls: None,
+                    ssh: None,
+                    password_saved: false,
+                    ssh_password_saved: false,
+                },
+                ssh_host_key: None,
+            });
+            view.model.apply_navigation(&[connection], false);
+            view.model
+                .connections
+                .status
+                .insert("pg".to_owned(), crate::app::views::connections::LinkStatus::Connected);
+            // 连接行自己先展开，库/模式按用户点击的同一批命令展开。
+            view.model.expand_nav_connection("pg");
+            for id in [database_node_id("pg", "shop"), schema_node_id("pg", "shop", "public")] {
+                assert!(
+                    view.model.dispatch(&format!("nav-toggle:{id}")).is_some(),
+                    "{id} 没有接受展开命令"
+                );
+            }
+            assert!(view.model.nav.node(&group).is_some(), "种类分组应在树上");
+            cx.notify();
+        });
+    });
+    let (zh_label, zh_placeholder, zh_height) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let row = window.find(gpui_kit::SharedString::from(format!("nav-{group}")));
+            (
+                row.label().map(str::to_owned),
+                window.find("field-ObjectFilter").label().map(str::to_owned),
+                f32::from(row.bounds().size.height),
+            )
+        })
+        .unwrap();
+    assert!(zh_label.as_deref().is_some_and(|text| !text.is_empty() && text != "catalog.kind.table"), "分组标签要显示当前语言：{zh_label:?}");
+    assert!(zh_placeholder.as_deref().is_some_and(|text| !text.is_empty()), "筛选框要有当前语言的可读名称");
+
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("locale-en", cx)));
+    let (en_label, en_placeholder) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (
+                window.find(gpui_kit::SharedString::from(format!("nav-{group}"))).label().map(str::to_owned),
+                window.find("field-ObjectFilter").label().map(str::to_owned),
+            )
+        })
+        .unwrap();
+    assert_ne!(zh_label, en_label, "切换语言后已展开的树标签必须重画");
+    assert_ne!(zh_placeholder, en_placeholder, "已创建输入框的占位文案必须更新");
+    assert!(
+        en_label
+            .as_deref()
+            .is_some_and(|text| !text.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch))),
+        "英文树标签残留中文：{en_label:?}"
+    );
+
+    // 命令面板打开后切语言，已有面板条目也立即换文案。
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("command-palette", cx)));
+    let (palette_en, dark_before) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (window.find("pal-0").label().map(str::to_owned), cx.theme().is_dark())
+        })
+        .unwrap();
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("locale-zh", cx)));
+    let palette_zh = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.find("pal-0").label().map(str::to_owned)
+        })
+        .unwrap();
+    assert_ne!(palette_en, palette_zh, "已打开的命令面板条目要跟着语言更新");
+    assert!(!dark_before);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.model.shell.close_overlay();
+            view.perform("theme-dark", cx);
+        })
+    });
+    let dark = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            cx.theme().is_dark()
+        })
+        .unwrap();
+    assert!(dark, "theme-dark 要立即作用到已渲染界面");
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("density-compact", cx)));
+    let compact_height = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            f32::from(window.find(gpui_kit::SharedString::from(format!("nav-{group}"))).bounds().size.height)
+        })
+        .unwrap();
+    assert!(compact_height < zh_height, "密度切换要改变已有树行高度：{zh_height} -> {compact_height}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 后台读取不挡其他页面：切换页面与输入照常，旧代次结果只被丢弃，最新上下文才写回。
+#[test]
+fn background_reads_keep_navigation_usable_and_latest_context_wins() {
+    let mut model = WorkbenchModel::new(Shell::default());
+    let _ = model.dispatch("new-query");
+    let tab = model.tabs.last_mut().expect("查询项");
+    tab.running = true;
+    let tasks = crate::application::tasks::TaskBoard::new();
+    let first = tasks.begin("query");
+    // 读取还没回来时，用户仍能切页面、改筛选和切工作项。
+    assert!(model.dispatch("settings").is_some());
+    assert_eq!(model.shell.page, AppPage::Settings);
+    model.set_field(DraftField::ObjectFilter, "订单".to_owned());
+    assert_eq!(model.field_value(DraftField::ObjectFilter), "订单");
+    assert!(model.dispatch("history").is_some());
+    assert_eq!(model.shell.page, AppPage::History);
+    // 用户连续切换上下文：前一个读取应过期，只有最新一次允许写回。
+    tasks.supersede("query");
+    let second = tasks.begin("query");
+    assert!(matches!(
+        tasks.accept("query", first, ()),
+        crate::application::tasks::TaskOutcome::Stale { .. }
+    ));
+    assert!(matches!(
+        tasks.accept("query", second, ()),
+        crate::application::tasks::TaskOutcome::Current { .. }
+    ));
+    assert!(model.tabs.iter().any(|tab| tab.running), "运行态本身不阻塞导航");
+}
