@@ -938,6 +938,17 @@ impl GridPane {
     fn ensure_filter_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let drafts = self.session.filters().to_vec();
         if self.filter_inputs.len() == drafts.len() {
+            let locale = self.locale;
+            let value_hint = SharedString::from(i18n::text(locale, "grid.filter.valuePlaceholder"));
+            let upper_hint = SharedString::from(i18n::text(locale, "grid.filter.upperPlaceholder"));
+            for row in &self.filter_inputs {
+                if let Some(state) = &row.value {
+                    state.update(cx, |state, cx| state.set_placeholder(value_hint.clone(), window, cx));
+                }
+                if let Some(state) = &row.second {
+                    state.update(cx, |state, cx| state.set_placeholder(upper_hint.clone(), window, cx));
+                }
+            }
             return;
         }
         self.filter_input_reset();
@@ -2235,6 +2246,8 @@ impl Render for GridPane {
 impl GridPane {
     fn search_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
         if let Some(state) = &self.search {
+            let hint = SharedString::from(i18n::text(self.locale, "ui.grid.searchPlaceholder"));
+            state.update(cx, |state, cx| state.set_placeholder(hint, window, cx));
             return state.clone();
         }
         let placeholder = SharedString::from(i18n::text(self.locale, "ui.grid.searchPlaceholder"));

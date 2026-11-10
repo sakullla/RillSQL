@@ -10,6 +10,7 @@
 | 命令 | 结果 |
 | --- | --- |
 | `cargo test --manifest-path src-tauri/Cargo.toml --locked -- --test-threads=1` | **677 passed / 0 failed / 0 ignored**（139.06s）；`rillsql-package` 1 passed；doc-tests 0 |
+| 网格聚焦回归 `cargo test --lib app::views::grid` | 75 passed / 0 failed |
 | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked` | exit 0；仅 `src/bin/rillsql-package.rs` 两条既有 `dead_code` 警告 |
 | `cargo build --manifest-path src-tauri/Cargo.toml --bin rillsql --locked` | 成功 |
 
@@ -39,7 +40,7 @@
 ## 3. 原生缺陷修复
 
 1. **大表查询中间结果不可见**：`exec::reveal_rows` 分块发布后等待继续读取，但 `QueryPane::spawn_run` 只消费终态，导致 `select * from thread_items`（32764 行）永久显示“正在执行”。改为单一有序 mpsc 通道消费每个 running/terminal 快照；运行态保持 `running=true`，终态才标记 executed。原生 2.2 秒内已显示 100 行。
-2. **网格语言不同步**：`GridPane` 是独立实体，父级 QueryPane 换语言时只更新自身，网格仍为中文。已在 QueryPane 的全部分同步入口下发 locale、在 Workbench 表数据同步中下发 locale，并在网格实体 notify。结构/管理页即使 `applied_tool` 缓存命中也会收到 locale；对比、导入导出和关系图在每次同步时下发 locale。原生深色紧凑英文截图确认网格工具栏为英文。
+2. **网格语言不同步**：`GridPane` 是独立实体，父级 QueryPane 换语言时只更新自身，网格仍为中文。已在 QueryPane 的全部分同步入口下发 locale、在 Workbench 表数据同步中下发 locale，并在网格实体 notify。结构/管理页即使 `applied_tool` 缓存命中也会收到 locale；对比、导入导出和关系图在每次同步时下发 locale。网格查找框和筛选值/上界输入框也在每次渲染时刷新占位文案。原生深色紧凑英文截图确认网格工具栏为英文。
 
 ## 4. 未覆盖边界
 
