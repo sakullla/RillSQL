@@ -600,6 +600,18 @@ impl Workbench {
     }
 
     fn ensure_tool(&mut self, cx: &mut Context<Self>) {
+        let locale = self.model.locale();
+        match self.model.tool {
+            WorkTool::Structure => self.structure.update(cx, |pane, cx| {
+                pane.set_locale(locale);
+                cx.notify();
+            }),
+            WorkTool::Admin => self.admin.update(cx, |pane, cx| {
+                pane.set_locale(locale);
+                cx.notify();
+            }),
+            _ => {}
+        }
         let spec = self.model.table_spec.clone().unwrap_or_default();
         let item = self
             .model
@@ -1310,6 +1322,11 @@ impl Workbench {
     }
 
     fn refresh_compare(&mut self, cx: &mut Context<Self>) {
+        let locale = self.model.locale();
+        self.compare.update(cx, |pane, cx| {
+            pane.set_locale(locale);
+            cx.notify();
+        });
         let place = self.compare.update(cx, |pane, _| pane.take_place());
         let back = self.compare.update(cx, |pane, _| pane.take_back());
         self.model.compare_running = self.compare.read(cx).running();
@@ -1323,6 +1340,11 @@ impl Workbench {
     }
 
     fn ensure_diagram(&mut self, cx: &mut Context<Self>) {
+        let locale = self.model.locale();
+        self.diagram.update(cx, |pane, cx| {
+            pane.set_locale(locale);
+            cx.notify();
+        });
         let spec = self.model.diagram_spec.clone().unwrap_or_default();
         if self.applied_diagram.as_deref() == Some(spec.as_str()) {
             return;
@@ -1336,6 +1358,11 @@ impl Workbench {
     }
 
     fn refresh_exchange(&mut self, cx: &mut Context<Self>) {
+        let locale = self.model.locale();
+        self.exchange.update(cx, |pane, cx| {
+            pane.set_locale(locale);
+            cx.notify();
+        });
         self.sync_exchange_selection();
         let source = self.exchange_source(cx);
         self.exchange.update(cx, |pane, cx| {
