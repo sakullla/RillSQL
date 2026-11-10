@@ -100,10 +100,22 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
             } else {
                 item("tree-open-data", "catalog.tree.openData")
             };
+            // 触发器/例程/序列不是表：结构编辑器会误报“找不到表或视图”，
+            // 关系图也不适用。入口保留但禁用并说明，避免把人带到错误页面。
+            let structure = if target == MenuTarget::NonDataObject {
+                disabled("open-structure", "catalog.tree.viewStructure", "catalog.tree.noStructure")
+            } else {
+                item("open-structure", "catalog.tree.viewStructure")
+            };
+            let diagram = if target == MenuTarget::NonDataObject {
+                disabled("open-diagram", "catalog.tree.diagram", "diagram.unsupported")
+            } else {
+                item("open-diagram", "catalog.tree.diagram")
+            };
             let mut items = vec![
                 data,
-                item("open-structure", "catalog.tree.viewStructure"),
-                item("open-diagram", "catalog.tree.diagram"),
+                structure,
+                diagram,
                 // 对象上下文里的“新建查询”绑定这一行，不是通用空查询。
                 item("tree-new-query", "catalog.tree.newQueryHere"),
                 // 插入只改当前草稿，不执行；复制与生成 SELECT 仍是独立入口。

@@ -4395,9 +4395,9 @@ fn sidebar_mouse_paths_expand_and_collapse_the_real_tree(cx: &mut gpui_kit::Test
     })
     .unwrap();
 
-    // 双击对象种类分组展开，表对象行真的出现在渲染结果里。
+    // 对象种类分组的 chevron 单击就能展开，表对象行真的出现在渲染结果里。
     cx.update_window(window, |_, window, cx| {
-        window.double_click(SharedString::from(format!("nav-{group}")), cx);
+        window.click(SharedString::from(format!("nav-chevron-{group}")), cx);
         window.render_frame(cx);
     })
     .unwrap();

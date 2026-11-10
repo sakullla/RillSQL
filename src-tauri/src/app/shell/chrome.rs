@@ -711,6 +711,7 @@ impl Workbench {
         let click_id = id.clone();
         let menu_id = id.clone();
         let focus_id = id.clone();
+        let toggle_id = id.clone();
         let has_error = row.error.is_some();
         div()
             .id(SharedString::from(format!("nav-{id}")))
@@ -730,7 +731,26 @@ impl Workbench {
             .cursor_pointer()
             .when(row.focused, |this| this.bg(p.selection))
             .when(!row.focused, |this| this.hover(|style| style.bg(p.hover)))
-            .child(kit::icon(chevron, 12., p.text_faint))
+            .child(
+                div()
+                    .id(SharedString::from(format!("nav-chevron-{id}")))
+                    .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(self.t(if row.expanded { "catalog.tree.collapse" } else { "catalog.tree.expand" }))
+                    .tooltip_text(self.t(if row.expanded { "catalog.tree.collapse" } else { "catalog.tree.expand" }))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .when(row.expandable, |this| {
+                        this.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.model.shell.focus = FocusTarget::Sidebar;
+                            this.perform(&format!("nav-toggle:{toggle_id}"), cx);
+                            cx.notify();
+                        }))
+                    })
+                    .child(kit::icon(chevron, 12., p.text_faint)),
+            )
             .child(kit::icon(icon, 13., nav_tint(row.kind, p)))
             .child(body)
             .when(is_group && row.total > 0, |this| {

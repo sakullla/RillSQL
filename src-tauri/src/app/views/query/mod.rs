@@ -509,10 +509,10 @@ impl QueryPane {
 
     /// 网格是独立实体，父页面换语言时必须主动下发并重绘，否则工具栏保留旧语言。
     pub fn apply_grid_locale(&mut self, locale: Locale, cx: &mut Context<Self>) {
-        self.grid.update(cx, |grid, cx| {
-            grid.set_locale(locale);
-            cx.notify();
-        });
+        let changed = self.grid.update(cx, |grid, _| grid.set_locale(locale));
+        if changed {
+            self.grid.update(cx, |_, cx| cx.notify());
+        }
     }
 
     /// 把外壳标签和编辑器草稿对齐。不创建编辑器，所以命令层没有 Window 也能调用。

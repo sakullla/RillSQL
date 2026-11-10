@@ -42,6 +42,7 @@ pub struct Workbench {
     pub(super) redis: Entity<RedisPane>,
     pub(super) mongo: Entity<MongoPane>,
     applied_tool: Option<String>,
+    applied_locale: Option<crate::i18n::Locale>,
     /// 共享表格网格当前展示的表规格；暂存必须归属到这张表对应的工作项。
     table_view_spec: Option<String>,
     /// 交换面板显式选择的来源；切换工作项后按新工作项重建。
@@ -115,6 +116,7 @@ impl Workbench {
             redis,
             mongo,
             applied_tool: None,
+            applied_locale: None,
             table_view_spec: None,
             exchange_kind: ExchangeSourceKind::Table,
             exchange_item: None,
@@ -483,9 +485,11 @@ impl Workbench {
         let preview_kb = u64::try_from(settings.preview_kb.max(1)).unwrap_or(1);
         let null_copy = settings.null_copy.clone();
         let locale = self.model.locale();
+        let locale_changed = self.table.update(cx, |pane, _| pane.set_locale(locale));
         self.table.update(cx, |pane, cx| {
-            pane.set_locale(locale);
-            cx.notify();
+            if locale_changed {
+                cx.notify();
+            }
             pane.set_page_limit(page_size, cx);
             // 上限变了就重读表数据并关掉查看面板，旧行列不再按新上限解释。
             pane.set_preview_kb(preview_kb, cx);
@@ -600,18 +604,6 @@ impl Workbench {
     }
 
     fn ensure_tool(&mut self, cx: &mut Context<Self>) {
-        let locale = self.model.locale();
-        match self.model.tool {
-            WorkTool::Structure => self.structure.update(cx, |pane, cx| {
-                pane.set_locale(locale);
-                cx.notify();
-            }),
-            WorkTool::Admin => self.admin.update(cx, |pane, cx| {
-                pane.set_locale(locale);
-                cx.notify();
-            }),
-            _ => {}
-        }
         let spec = self.model.table_spec.clone().unwrap_or_default();
         let item = self
             .model
@@ -1322,11 +1314,6 @@ impl Workbench {
     }
 
     fn refresh_compare(&mut self, cx: &mut Context<Self>) {
-        let locale = self.model.locale();
-        self.compare.update(cx, |pane, cx| {
-            pane.set_locale(locale);
-            cx.notify();
-        });
         let place = self.compare.update(cx, |pane, _| pane.take_place());
         let back = self.compare.update(cx, |pane, _| pane.take_back());
         self.model.compare_running = self.compare.read(cx).running();
@@ -1340,11 +1327,6 @@ impl Workbench {
     }
 
     fn ensure_diagram(&mut self, cx: &mut Context<Self>) {
-        let locale = self.model.locale();
-        self.diagram.update(cx, |pane, cx| {
-            pane.set_locale(locale);
-            cx.notify();
-        });
         let spec = self.model.diagram_spec.clone().unwrap_or_default();
         if self.applied_diagram.as_deref() == Some(spec.as_str()) {
             return;
@@ -1358,11 +1340,6 @@ impl Workbench {
     }
 
     fn refresh_exchange(&mut self, cx: &mut Context<Self>) {
-        let locale = self.model.locale();
-        self.exchange.update(cx, |pane, cx| {
-            pane.set_locale(locale);
-            cx.notify();
-        });
         self.sync_exchange_selection();
         let source = self.exchange_source(cx);
         self.exchange.update(cx, |pane, cx| {
@@ -1520,6 +1497,30 @@ impl Render for Workbench {
         self.sync_view_settings(cx);
         self.sync_query(window, cx);
         self.sync_catalog(cx);
+        let locale = self.model.locale();
+        if self.applied_locale != Some(locale) {
+            self.applied_locale = Some(locale);
+            self.structure.update(cx, |pane, cx| {
+                pane.set_locale(locale);
+                cx.notify();
+            });
+            self.admin.update(cx, |pane, cx| {
+                pane.set_locale(locale);
+                cx.notify();
+            });
+            self.compare.update(cx, |pane, cx| {
+                pane.set_locale(locale);
+                cx.notify();
+            });
+            self.exchange.update(cx, |pane, cx| {
+                pane.set_locale(locale);
+                cx.notify();
+            });
+            self.diagram.update(cx, |pane, cx| {
+                pane.set_locale(locale);
+                cx.notify();
+            });
+        }
         let owner = cx.entity().downgrade();
         self.exchange.update(cx, |pane, _| pane.attach_owner(owner));
         self.ensure_tool(cx);

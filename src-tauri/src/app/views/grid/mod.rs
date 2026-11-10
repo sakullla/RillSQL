@@ -63,6 +63,8 @@ pub struct GridPane {
     services: Arc<AppServices>,
     table: Entity<TableState<SheetDelegate>>,
     locale: Locale,
+    search_hint_locale: Locale,
+    filter_hint_locale: Locale,
     scheduled: u64,
     search_text: String,
     /// 编辑栏使用正式文本输入：光标、选区、粘贴、撤销和输入法都由它处理。
@@ -187,6 +189,8 @@ impl GridPane {
             services,
             table,
             locale: Locale::ZhCn,
+            search_hint_locale: Locale::ZhCn,
+            filter_hint_locale: Locale::ZhCn,
             scheduled: 0,
             search_text: String::new(),
             edit_input,
@@ -216,9 +220,11 @@ impl GridPane {
         }
     }
 
-    pub fn set_locale(&mut self, locale: Locale) {
+    pub fn set_locale(&mut self, locale: Locale) -> bool {
+        let changed = self.locale != locale;
         self.locale = locale;
         self.session.locale = locale;
+        changed
     }
 
     /// 外键跳转的出口由外壳注入：网格不知道工作项，只把目标和定位查询交出去。
@@ -938,16 +944,19 @@ impl GridPane {
     fn ensure_filter_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let drafts = self.session.filters().to_vec();
         if self.filter_inputs.len() == drafts.len() {
-            let locale = self.locale;
-            let value_hint = SharedString::from(i18n::text(locale, "grid.filter.valuePlaceholder"));
-            let upper_hint = SharedString::from(i18n::text(locale, "grid.filter.upperPlaceholder"));
-            for row in &self.filter_inputs {
-                if let Some(state) = &row.value {
-                    state.update(cx, |state, cx| state.set_placeholder(value_hint.clone(), window, cx));
+            if self.filter_hint_locale != self.locale {
+                let locale = self.locale;
+                let value_hint = SharedString::from(i18n::text(locale, "grid.filter.valuePlaceholder"));
+                let upper_hint = SharedString::from(i18n::text(locale, "grid.filter.upperPlaceholder"));
+                for row in &self.filter_inputs {
+                    if let Some(state) = &row.value {
+                        state.update(cx, |state, cx| state.set_placeholder(value_hint.clone(), window, cx));
+                    }
+                    if let Some(state) = &row.second {
+                        state.update(cx, |state, cx| state.set_placeholder(upper_hint.clone(), window, cx));
+                    }
                 }
-                if let Some(state) = &row.second {
-                    state.update(cx, |state, cx| state.set_placeholder(upper_hint.clone(), window, cx));
-                }
+                self.filter_hint_locale = locale;
             }
             return;
         }
@@ -1683,9 +1692,8 @@ impl Render for GridPane {
             div()
                 .id("grid-stats")
                 .debug_selector(|| "grid-stats".to_owned())
-                .absolute()
-                .left(px(10.))
-                .bottom(px(6.))
+                .flex_none()
+                .h(px(22.))
                 // 窄窗口里这行很长：限宽 + 省略号，不让它盖住右边的数据格；
                 // 完整内容放在提示里，被截断的字段仍然读得到。
                 .max_w(px(520.))
@@ -2022,6 +2030,8 @@ impl Render for GridPane {
             column = column.child(
                 div()
                     .relative()
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .min_h(px(0.))
                     .on_mouse_down(gpui_kit::MouseButton::Left, cx.listener(|this, _, window, cx| {
@@ -2034,7 +2044,12 @@ impl Render for GridPane {
                             cx.notify();
                         }
                     }))
-                    .child(DataTable::new(&table).small().stripe(true).accessibility_label("shared-grid"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .child(DataTable::new(&table).small().stripe(true).accessibility_label("shared-grid")),
+                    )
                     .children(stats),
             );
         } else if loading {
@@ -2246,8 +2261,11 @@ impl Render for GridPane {
 impl GridPane {
     fn search_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
         if let Some(state) = &self.search {
-            let hint = SharedString::from(i18n::text(self.locale, "ui.grid.searchPlaceholder"));
-            state.update(cx, |state, cx| state.set_placeholder(hint, window, cx));
+            if self.search_hint_locale != self.locale {
+                let hint = SharedString::from(i18n::text(self.locale, "ui.grid.searchPlaceholder"));
+                state.update(cx, |state, cx| state.set_placeholder(hint, window, cx));
+                self.search_hint_locale = self.locale;
+            }
             return state.clone();
         }
         let placeholder = SharedString::from(i18n::text(self.locale, "ui.grid.searchPlaceholder"));
