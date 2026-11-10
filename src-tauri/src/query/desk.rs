@@ -973,6 +973,13 @@ impl Desk {
                 schemas.push(object.schema.clone());
             }
         }
+        // 目标范围的目录是否真的枚举过：连接里列出了这个库，说明读取覆盖了它，
+        // 此时没有对象就是真的空库；覆盖不到才按“可能过期”处理。
+        let target_range_known = tab.target.as_ref().is_some_and(|target| {
+            self.links
+                .iter()
+                .any(|link| link.id == target.connection_id && link.databases.iter().any(|name| name == &target.database))
+        });
         // 部分范围失败只说明部分失败：已读到的对象和列继续用；完全没有可用元数据才算失败。
         let state = if tab.target.is_none() {
             MetadataState::NoTarget
@@ -984,8 +991,8 @@ impl Desk {
             } else {
                 MetadataState::Partial(self.tree_error.clone())
             }
-        } else if !self.objects.is_empty() {
-            // 树里有别的连接/库的对象，但不是当前目标的：状态可能过期。
+        } else if !target_range_known && !self.objects.is_empty() {
+            // 树里有别的连接/库的对象，而当前目标范围没有读到过：状态可能过期。
             let scope = tab.target.as_ref().map(|target| format!("{}/{}", target.connection_name, target.database)).unwrap_or_default();
             MetadataState::Stale(scope)
         } else if !self.tree_error.is_empty() {
@@ -1954,8 +1961,13 @@ mod tests {
         assert!(partial.sources.iter().any(|source| source.columns.contains(&"status".to_owned())));
         desk.set_tree_error("");
 
-        // 树里有对象但没有当前目标的：说明可能过期，而不是空目录。
+        // 连接列出的库确实读过了却没有对象：是真空白库，不能报成过期。
         desk.select_database("archive");
+        let blank = desk.completion_scope().expect("空库也要有上下文");
+        assert_eq!(blank.state, MetadataState::Empty, "{:?}", blank.state);
+        assert!(blank.objects.is_empty());
+        // 目标范围不在已读的库里：树里有别的连接/库的对象，状态才可能过期。
+        desk.select_database("shadow");
         let stale = desk.completion_scope().expect("过期也要有上下文");
         assert!(matches!(stale.state, MetadataState::Stale(_)), "{:?}", stale.state);
         assert!(stale.objects.is_empty());

@@ -1100,6 +1100,11 @@ fn labels_of(sources: &[Source]) -> String {
     }
 }
 
+/// 来源里确实读到过列。前缀没命中列不能说明元数据缺失，只有列集合真的为空才算。
+fn any_columns_loaded(sources: &[Source]) -> bool {
+    sources.iter().any(|source| !source.columns.is_empty())
+}
+
 /// 列拿不到时的回退：仍然给对象、CTE、函数和关键字，不留成功空列表。
 fn fallback_objects(gather: &mut Gather<'_>, scope: &CompletionScope, statement: &StatementScope, metadata_ok: bool) {
     if metadata_ok {
@@ -1189,8 +1194,9 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
     }
 
     let target = statement.target.clone();
-    // 需要列却一列都拿不到时的说明范围；留下的候选退到对象和关键字。
-    let mut missing: Option<String> = None;
+    // 需要列的来源确实没有任何列时的说明范围；只由来源本身决定，不看被前缀过滤后的候选。
+    // 回退候选（对象/关键字）不受它限制：前缀没命中列时也要有正常候选。
+    let mut column_gap: Option<String> = None;
     match clause {
         Some(Clause::Use) => gather.push_databases(scope),
         Some(Clause::On) => {
@@ -1226,7 +1232,12 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
                 gather.push_columns(&scoped);
             }
             if !gather.has_group(group::COLUMN) {
-                missing = Some(labels_of(&scoped));
+                if metadata_ok && !any_columns_loaded(&scoped) {
+                    let labels = labels_of(&scoped);
+                    if !labels.is_empty() {
+                        column_gap = Some(labels);
+                    }
+                }
                 fallback_objects(&mut gather, scope, &statement, metadata_ok);
             }
         }
@@ -1243,7 +1254,12 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
                 gather.push_columns(&picked);
             }
             if !gather.has_group(group::COLUMN) {
-                missing = Some(labels_of(&picked));
+                if metadata_ok && !any_columns_loaded(&picked) {
+                    let labels = labels_of(&picked);
+                    if !labels.is_empty() {
+                        column_gap = Some(labels);
+                    }
+                }
                 fallback_objects(&mut gather, scope, &statement, metadata_ok);
             }
         }
@@ -1265,6 +1281,12 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
             gather.push_functions();
             gather.push_keywords();
             gather.push_snippets();
+            if metadata_ok && !sources.is_empty() && !any_columns_loaded(&sources) {
+                let labels = labels_of(&sources);
+                if !labels.is_empty() {
+                    column_gap = Some(labels);
+                }
+            }
         }
         // 其余子句（SELECT/WHERE/GROUP/ORDER/HAVING）已在上面按 field_first 处理。
         Some(_) => {}
@@ -1284,14 +1306,9 @@ pub fn plan(scope: &CompletionScope, text: &str, cursor: usize, locale: Locale) 
 
     plan.candidates = finalize(gather, &frequency);
     let needs_columns = clause.is_some_and(Clause::needs_columns);
-    let no_column_candidate = !plan.candidates.iter().any(|item| item.kind == "column");
-    let column_note = if needs_columns && no_column_candidate {
-        let explained = match &missing {
-            Some(labels) => Some(labels.clone()),
-            None if clause.is_some_and(Clause::field_first) && !sources.is_empty() => Some(labels_of(&sources)),
-            None => None,
-        };
-        explained.map(|labels| {
+    // 说明只在来源列集合确实为空时出现；前缀没命中列是正常无候选，不能报成元数据缺失。
+    let column_note = if needs_columns {
+        column_gap.map(|labels| {
             i18n::fill(&i18n::text(locale, "query.complete.state.noColumns"), &[("source", &labels)])
         })
     } else {
@@ -1558,6 +1575,39 @@ mod tests {
         let planned = plan(&unknown, sql, sql.len(), Locale::ZhCn);
         assert!(!planned.candidates.is_empty());
         assert!(planned.note.as_deref().is_some_and(|note| note.contains("orders")), "{:?}", planned.note);
+    }
+
+    #[test]
+    fn prefixes_that_miss_every_column_do_not_claim_missing_columns() {
+        let loaded = scope("postgres");
+        // WHERE an：列已读到但没命中，说明必须为空，关键字 AND 照常给出。
+        let where_an = "SELECT id FROM customers c WHERE an";
+        let planned = plan(&loaded, where_an, where_an.len(), Locale::ZhCn);
+        assert!(planned.note.is_none(), "{:?}", planned.note);
+        assert!(labels(&planned).contains(&"AND".to_owned()), "{:?}", labels(&planned));
+        assert!(!planned.candidates.iter().any(|item| item.kind == "column"), "{:?}", labels(&planned));
+
+        // WHERE AND：关键字已经打全，只是没有可补的内容，同样不是元数据失败。
+        let where_and = "SELECT id FROM customers c WHERE AND";
+        let planned = plan(&loaded, where_and, where_and.len(), Locale::ZhCn);
+        assert!(planned.note.is_none(), "{:?}", planned.note);
+
+        // VALUES lu：目标列已读到，前缀没命中也不回退成假失败说明。
+        let values = "INSERT INTO customers VALUES lu";
+        let planned = plan(&loaded, values, values.len(), Locale::ZhCn);
+        assert!(planned.note.is_none(), "{:?}", planned.note);
+        assert!(!planned.candidates.iter().any(|item| item.kind == "column"), "{:?}", labels(&planned));
+
+        // ON lu：两侧列都读到了，没命中也不报列缺失。
+        let on = "SELECT * FROM orders o JOIN customers c ON lu";
+        let planned = plan(&loaded, on, on.len(), Locale::ZhCn);
+        assert!(planned.note.is_none(), "{:?}", planned.note);
+
+        // 同一来源真正有列时，命中的前缀照旧给出列。
+        let hit = "SELECT id FROM customers c WHERE na";
+        let planned = plan(&loaded, hit, hit.len(), Locale::ZhCn);
+        assert!(planned.note.is_none(), "{:?}", planned.note);
+        assert!(labels(&planned).contains(&"name".to_owned()), "{:?}", labels(&planned));
     }
 
     #[test]
