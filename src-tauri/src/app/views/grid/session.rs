@@ -1508,23 +1508,46 @@ impl SharedGrid {
         item.locator.clone()
     }
 
-    /// 这一格显示的是否只是预览信封：长文本被截断或二进制只有长度时成立。
-    pub fn needs_full(&self, row: usize, column: usize) -> bool {
-        let Some(Some(text)) = self.value_at(row, column) else {
+    /// 按稳定行 id 读当前值（含暂存修改）：导出扫描会用到被本地查找/筛选隐藏的行，
+    /// 只能靠行 id 找到它们，显示位置在那种行上不存在。
+    fn value_of(&self, row_id: &str, column: usize) -> Option<Option<String>> {
+        let column_name = self.columns.get(column)?.name.as_str();
+        if let Some(item) = self.overlays.iter().find(|item| item.row_id == row_id && item.column_name == column_name && item.kind == "update") {
+            return Some(item.value.clone());
+        }
+        self.any_row(row_id)?.values.get(column).cloned()
+    }
+
+    /// 这一格（按行 id）显示的是否只是预览信封：长文本被截断或二进制只有长度时成立。
+    pub fn needs_full_of(&self, row_id: &str, column: usize) -> bool {
+        let Some(Some(text)) = self.value_of(row_id, column) else {
             return false;
         };
         let type_name = self.columns.get(column).map(|item| item.type_name.as_str()).unwrap_or("");
         crate::grid::preview_envelope(&text, type_name, self.sheet_preview_bytes).is_some()
     }
 
-    /// 已缓存的原值；仍在预览阶段、加载或失败时为空，绝不拿预览充当原值。
-    pub fn full_text_at(&self, row: usize, column: usize) -> Option<Option<String>> {
-        let row_id = self.rows.get(row)?.id.clone();
+    /// 这一格（按行 id）已缓存的原值；仍在预览阶段、加载或失败时为空，绝不拿预览充当原值。
+    pub fn full_text_of(&self, row_id: &str, column: usize) -> Option<Option<String>> {
         let column_name = self.columns.get(column)?.name.clone();
-        match self.full_state(&row_id, &column_name) {
+        match self.full_state(row_id, &column_name) {
             Some(FullState::Ready(value)) => Some(value.clone()),
             _ => None,
         }
+    }
+
+    /// 这一格显示的是否只是预览信封：长文本被截断或二进制只有长度时成立。
+    pub fn needs_full(&self, row: usize, column: usize) -> bool {
+        let Some(row_id) = self.rows.get(row).map(|item| item.id.as_str()) else {
+            return false;
+        };
+        self.needs_full_of(row_id, column)
+    }
+
+    /// 已缓存的原值；仍在预览阶段、加载或失败时为空，绝不拿预览充当原值。
+    pub fn full_text_at(&self, row: usize, column: usize) -> Option<Option<String>> {
+        let row_id = self.rows.get(row)?.id.as_str();
+        self.full_text_of(row_id, column)
     }
 
     /// 一格值按原值处理还是需要先读取；未定位时明确说明读不了。
@@ -1563,25 +1586,44 @@ impl SharedGrid {
     /// 开始读取这个格子的完整值；已经在读、已经读到或本来就不需要时返回 None。
     /// 上次失败的读取在这里重新发起，失败原因不留在缓存里冒充结果。
     pub fn begin_full(&mut self, row: usize, column: usize) -> Option<FullRead> {
-        if !self.needs_full(row, column) {
+        let row_id = self.rows.get(row)?.id.clone();
+        self.begin_full_of(&row_id, column)
+    }
+
+    /// 按稳定行 id 开始读取完整值：导出扫描要读被本地查找/筛选隐藏的行，
+    /// 这些行没有显示位置，只能靠行 id 和它们自己的定位列发起读取。
+    pub fn begin_full_of(&mut self, row_id: &str, column: usize) -> Option<FullRead> {
+        if !self.needs_full_of(row_id, column) {
             return None;
         }
-        let CellRead::NeedsFull(read) = self.cell_read(row, column) else {
-            return None;
-        };
-        match self.full_state(&read.row_id, &read.column_name) {
+        let column_name = self.columns.get(column)?.name.clone();
+        match self.full_state(row_id, &column_name) {
             Some(FullState::Ready(_)) | Some(FullState::Loading) => return None,
             _ => {}
         }
-        match self.full_index(&read.row_id, &read.column_name) {
+        let locator = {
+            let row = self.any_row(row_id)?;
+            if row.inserted || !row.located || row.locator.is_empty() {
+                return None;
+            }
+            row.locator.clone()
+        };
+        let read = FullRead {
+            row_id: row_id.to_owned(),
+            column_name: column_name.clone(),
+            locator,
+            target: self.target.clone(),
+            token: self.sheet_serial,
+        };
+        match self.full_index(row_id, &column_name) {
             Some(index) => self.full[index].state = FullState::Loading,
-            None => self.full.push(FullEntry { row_id: read.row_id.clone(), column_name: read.column_name.clone(), state: FullState::Loading }),
+            None => self.full.push(FullEntry { row_id: row_id.to_owned(), column_name: column_name.clone(), state: FullState::Loading }),
         }
-        if let Some(state) = self.viewer.as_mut().filter(|state| state.row_id == read.row_id && state.column_name == read.column_name) {
+        if let Some(state) = self.viewer.as_mut().filter(|state| state.row_id == row_id && state.column_name == column_name) {
             state.phase = CellPhase::Loading;
             state.message.clear();
         }
-        Some(*read)
+        Some(read)
     }
 
     /// 原值读回来了。查看面板同时从加载状态转到完整状态。
@@ -1631,30 +1673,65 @@ impl SharedGrid {
         }
     }
 
-    /// 当前读取窗口里还没有原值的格子数：导出前用它判断要不要先读完整值。
-    pub fn unresolved_previews(&self) -> usize {
-        self.unresolved_cells().len()
-    }
-
-    /// 还没有原值的格子：导出前一次性按定位读取，读到的原值随后共享给所有入口。
-    /// 扫描范围与 exchange_sheet 给出的导出行完全一致：只看当前来源行，跳过还没写库的新增行，
-    /// 这样"还有多少预览"永远对应真正会被导出写出的那些格子。
-    pub fn unresolved_cells(&self) -> Vec<(usize, usize)> {
-        let scope: Vec<usize> = self
-            .source
-            .iter()
-            .filter(|row| !row.inserted)
-            .filter_map(|row| self.rows.iter().position(|item| item.id == row.id))
-            .collect();
+    /// 还没有原值的格子（行 id + 列序号）：扫描范围与 exchange_sheet 给出的导出行完全一致，
+    /// 只看当前来源行、跳过还没写库的新增行，并且包含被本地查找/筛选隐藏的行。
+    /// 导出会写出隐藏行，所以它们也必须算进"还有多少预览"，否则导出被挡而网格没有读取入口。
+    fn unresolved_source_cells(&self) -> Vec<(String, usize)> {
         let mut cells = Vec::new();
-        for row in scope {
+        for row in self.source.iter().filter(|row| !row.inserted) {
             for column in 0..self.columns.len() {
-                if self.needs_full(row, column) && self.full_text_at(row, column).is_none() {
-                    cells.push((row, column));
+                if self.needs_full_of(&row.id, column) && self.full_text_of(&row.id, column).is_none() {
+                    cells.push((row.id.clone(), column));
                 }
             }
         }
         cells
+    }
+
+    /// 当前读取窗口里还没有原值的格子数：导出前用它判断要不要先读完整值。
+    pub fn unresolved_previews(&self) -> usize {
+        self.unresolved_source_cells().len()
+    }
+
+    /// 当前视图里能看到的未读格子（显示行列）：界面用它说明预览位置。
+    pub fn unresolved_cells(&self) -> Vec<(usize, usize)> {
+        self.unresolved_source_cells()
+            .into_iter()
+            .filter_map(|(row_id, column)| self.rows.iter().position(|row| row.id == row_id).map(|row| (row, column)))
+            .collect()
+    }
+
+    /// 导出前按定位读取所有还没有原值的格子；隐藏行也在这里读到，读回的原值随后共享给所有入口。
+    pub fn begin_unresolved_full(&mut self) -> Vec<FullRead> {
+        let mut reads: Vec<FullRead> = Vec::new();
+        for (row_id, column) in self.unresolved_source_cells() {
+            if let Some(read) = self.begin_full_of(&row_id, column) {
+                if !reads.iter().any(|item| item.row_id == read.row_id && item.column_name == read.column_name) {
+                    reads.push(read);
+                }
+            }
+        }
+        reads
+    }
+
+    /// 这些导出行里还有拿不到原值的格子：没定位、加载中或上次失败都给出原因，动作必须停在这里。
+    pub fn unresolved_block(&self) -> Option<String> {
+        for (row_id, column) in self.unresolved_source_cells() {
+            let Some(column_name) = self.columns.get(column).map(|item| item.name.clone()) else {
+                continue;
+            };
+            match self.full_state(&row_id, &column_name) {
+                Some(FullState::Ready(_)) => {}
+                Some(FullState::Failed(message)) => return Some(message.clone()),
+                Some(FullState::Loading) => return Some(i18n::text(self.locale, "grid.value.loadingFull")),
+                _ => {
+                    // 连读取都没能发起：这一行没有唯一键定位，原因比"没有原值"更具体。
+                    let locatable = self.any_row(&row_id).is_some_and(|row| !row.inserted && row.located && !row.locator.is_empty());
+                    return Some(i18n::text(self.locale, if locatable { "grid.value.noOriginal" } else { "grid.value.noLocator" }));
+                }
+            }
+        }
+        None
     }
 
     /// 当前焦点格是否适用外键导航：这一列有真实外键，行也定位到具体一行。
@@ -2795,11 +2872,13 @@ impl SharedGrid {
         }
     }
 
+    /// 暂存前的写回校验和查看/复制/WHERE/导出/commit 用同一个上限：
+    /// 上限来自读出这份行列时的 preview_kb，协议形状但确实没被截断的文本因此还能保存。
     fn validation_message(&self, column: usize, value: Option<&str>) -> Option<String> {
         let schema = self.schema.as_ref()?;
         let name = self.columns.get(column)?.name.as_str();
         let origin = schema.columns.iter().find(|item| item.name == name)?;
-        crate::grid::reject_literal(origin, &cell_of(value.map(str::to_owned)))
+        crate::grid::reject_literal_with(origin, &cell_of(value.map(str::to_owned)), false, self.sheet_preview_bytes)
     }
 
     fn committable(&self) -> Vec<ChangeArg> {
@@ -3341,6 +3420,38 @@ mod tests {
         assert!(rows[0][1].as_deref().is_some_and(|value| value.starts_with('\u{1}')));
     }
 
+    /// 导出扫描和 exchange_sheet 的来源行一致：被本地查找/筛选隐藏的预览行也要算进未读预览，
+    /// 并且能按它自己的定位读到原值——否则导出被挡，网格却没有能读到那一行的入口。
+    #[test]
+    fn unresolved_previews_cover_rows_hidden_by_local_search_and_filter() {
+        let envelope = format!("\u{1}t:3000:{}", "a".repeat(16));
+        let mut grid = SharedGrid::new();
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![
+                row("1", vec![Some("1"), Some(envelope.as_str())], true),
+                row("2", vec![Some("2"), Some(envelope.as_str())], true),
+            ],
+            Some(2),
+            Some(schema()),
+        );
+        grid.set_search("1");
+        assert_eq!(grid.loaded_len(), 1, "本地查找只显示匹配行");
+        assert_eq!(grid.unresolved_previews(), 2, "被隐藏的 id=2 也会被导出写出");
+        assert_eq!(grid.unresolved_cells(), vec![(0, 1)], "视图里只看得到一行");
+        let reads = grid.begin_unresolved_full();
+        assert_eq!(reads.len(), 2, "隐藏行同样按定位发起读取");
+        assert!(reads.iter().any(|read| read.row_id == "2"), "隐藏行有读取请求");
+        for read in &reads {
+            assert!(grid.apply_full(read, Some("正文".to_owned())), "同一目标同一代次采纳");
+        }
+        assert_eq!(grid.unresolved_previews(), 0);
+        assert!(grid.unresolved_block().is_none(), "读到原值后不再挡导出");
+        let (_, _, rows, _) = grid.exchange_sheet();
+        assert_eq!(rows.len(), 2, "导出行仍包含被查找隐藏的那一行");
+        assert!(rows.iter().all(|row| row[1].as_deref() == Some("正文")), "导出拿到原值而不是信封");
+    }
+
     /// 迟到的完整值读取不能落到换了目标的同一格上：请求带着目标和快照代次回来对账。
     #[test]
     fn late_full_reads_are_discarded_after_the_target_changes() {
@@ -3426,6 +3537,40 @@ mod tests {
         assert!(!grid.needs_full(0, 1), "64 KB 上限下 3000 字节是原值");
         load(&mut grid, &format!("\u{1}t:70000:{}", "c".repeat(16)));
         assert!(grid.needs_full(0, 1), "64 KB 上限下 70000 字节仍是信封");
+    }
+
+    /// 编辑暂存与复制/WHERE/导出/commit 比较同一个上限：4 KB 上限下 3000 字节的协议形状文本
+    /// 没被截断，是原值，能复制也能保存；真的超过上限的信封仍被挡在暂存外，不会写进数据库。
+    #[test]
+    fn staging_edit_compares_protocol_shaped_text_against_the_sheet_limit() {
+        let shaped = format!("\u{1}t:3000:{}", "b".repeat(16));
+        let mut grid = SharedGrid::new();
+        grid.set_preview_bytes(4 * 1024);
+        grid.load_local(
+            vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some(shaped.as_str())], true)],
+            Some(1),
+            Some(schema()),
+        );
+        assert_eq!(grid.sheet_preview_bytes(), 4096, "快照记住读出时的上限");
+        assert!(!grid.needs_full(0, 1), "4 KB 上限下这段文本没被截断");
+        grid.select(0, 1, false);
+        assert_eq!(grid.copy_cell(), shaped, "复制拿到原值");
+        // 暂存用同一个上限判断：这段原值能保存，不会被当成预览挡下。
+        assert_eq!(grid.stage_text(0, 1, Some(shaped.clone())), Gate::Writable, "4 KB 上限下原值可编辑");
+        assert_eq!(grid.overlay_message(0, 1), "");
+        // 提交请求带着读出这份行列时的上限，写回前判断与暂存一致。
+        let sql = grid.open_preview().expect("暂存的修改可以预览");
+        assert!(sql.iter().any(|line| line.contains(&shaped)), "{sql:?}");
+        let request = grid.confirm_request().expect("暂存的修改可以提交");
+        assert_eq!(request.preview_bytes, 4096);
+        assert_eq!(request.changes[0].sets[0].value.as_deref(), Some(shaped.as_str()), "写回的是原值");
+
+        // 真的超过 4 KB 的预览信封仍不能暂存：信封不会写进数据库。
+        let envelope = format!("\u{1}t:5000:{}", "c".repeat(16));
+        assert_eq!(grid.stage_text(0, 1, Some(envelope)), Gate::Validation);
+        assert_eq!(grid.overlay_message(0, 1), "预览内容不能写回");
+        assert!(grid.open_preview().is_err(), "被挡下的信封不进提交预览");
     }
 
     #[test]

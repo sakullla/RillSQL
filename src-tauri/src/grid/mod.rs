@@ -12,8 +12,8 @@ pub(crate) use live::{
     MutationKind,
 };
 pub(crate) use sql::{
-    delete_sql, insert_sql, looks_like_preview, preview_envelope, qualified_name, quote_ident, reject_literal, select_list, sql_cell,
-    update_sql, value_family, PreviewValue, ValueFamily, DEFAULT_PREVIEW_BYTES,
+    delete_sql, insert_sql, looks_like_preview, preview_envelope, qualified_name, quote_ident, reject_literal, reject_literal_with, select_list,
+    sql_cell, update_sql, value_family, PreviewValue, ValueFamily, DEFAULT_PREVIEW_BYTES,
 };
 pub(crate) use store::{refresh_located, Cell, Column, Engine, Filter, FilterOp, Sort, TableSchema};
 

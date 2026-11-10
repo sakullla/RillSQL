@@ -652,11 +652,18 @@ impl GridPane {
 
     /// 需要原值的动作先读同一定位结果。全部读完才返回 true，调用方随后才执行动作。
     fn prepare_full(&mut self, action: GridAction, id: &str, cx: &mut Context<Self>) -> bool {
+        // 导出读的是 exchange_sheet 的整份来源行：被本地查找/筛选隐藏的预览行也在读取范围内，
+        // 否则导出被挡而网格上没有能读到它们的入口。
+        let exported = action == GridAction::ExportValues;
         let cells = self.session.action_cells(action);
-        if cells.is_empty() {
+        if cells.is_empty() && !exported {
             return true;
         }
-        let reads = self.session.begin_full_cells(&cells);
+        let reads = if exported {
+            self.session.begin_unresolved_full()
+        } else {
+            self.session.begin_full_cells(&cells)
+        };
         if !reads.is_empty() {
             // 一次读取批次成功后重跑同一个命令，查看、复制、编辑、WHERE 因此共用同一个原值。
             // 待重跑的命令带上快照代次：目标或行列一变，回填结果不再触发旧动作。
@@ -666,7 +673,8 @@ impl GridPane {
             return false;
         }
         // 没有新请求时还要确认这几格真的拿到了原值：加载中或上次失败都停在这里。
-        match self.session.cell_block(&cells) {
+        let block = if exported { self.session.unresolved_block() } else { self.session.cell_block(&cells) };
+        match block {
             None => true,
             Some(reason) => {
                 self.notice = reason;
@@ -1154,16 +1162,14 @@ impl GridPane {
                 None
             }
             "column-copy-name" => Some(name),
-            "column-copy" => {
+            // 列头的整列复制与整列 WHERE 走单元格菜单同名动作的同一条原值读取：
+            // 有预览就先按定位读取，读不到时说明原因，绝不复制空串或静默无动作。
+            "column-copy" | "column-copy-where" => {
                 let row = self.session.focus_cell().map(|(row, _)| row).unwrap_or(0);
                 self.session.select(row, column, false);
-                Some(self.session.copy_column())
-            }
-            "column-copy-where" => {
-                let row = self.session.focus_cell().map(|(row, _)| row).unwrap_or(0);
-                self.session.select(row, column, false);
-                let text = self.session.copy_where(CopyScope::Column);
-                (!text.is_empty()).then_some(text)
+                let command = if id == "column-copy" { "grid-copy-column" } else { "grid-copy-column-where" };
+                self.command(command, cx);
+                return;
             }
             _ => None,
         };
@@ -4452,6 +4458,24 @@ mod pane_tests {
         });
     }
 
+    /// 两行都只有长文本预览：覆盖整列复制与整列 WHERE 的原值读取。
+    fn plant_long_column(pane: &Entity<GridPane>, cx: &mut App) {
+        let body = envelope_body();
+        pane.update(cx, |pane, cx| {
+            pane.plant_writable(
+                target(),
+                vec![("id", "integer"), ("body", "text")],
+                vec![vec![Some("1"), Some(body.as_str())], vec![Some("2"), Some(body.as_str())]],
+                "id",
+                cx,
+            );
+        });
+    }
+
+    fn long_full(index: usize) -> String {
+        format!("长文{}", "甲".repeat(600 + index))
+    }
+
     fn selection_state(pane: &GridPane) -> (Option<(String, String)>, usize) {
         (pane.session.selection_ids().map(|(anchor, focus)| (anchor.to_owned(), focus.to_owned())), pane.session.visible_bounds().0)
     }
@@ -4531,6 +4555,63 @@ mod pane_tests {
                 assert_eq!(pane.session.viewer_state().map(|state| state.phase), Some(CellPhase::Error));
                 assert_eq!(pane.command("copy-region", cx), None, "失败后仍拿不到原值");
             });
+        });
+    }
+
+    /// 列头菜单的整列复制和整列 WHERE 与单元格菜单同名动作走同一条原值读取：
+    /// 有预览时不复制空串也不静默无动作，读不到说明原因；读到原值后复制的是原值。
+    #[gpui_kit::test]
+    fn column_menu_copy_and_where_use_the_shared_full_read(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant_long_column(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                assert!(pane.session.needs_full(0, 1) && pane.session.needs_full(1, 1), "两行都只读到预览");
+                // 读不到原值时剪贴板保持原内容，绝不写一个空串覆盖它。
+                cx.write_to_clipboard(ClipboardItem::new_string("剪贴板原内容".to_owned()));
+                pane.column_command(1, "column-copy", cx);
+                assert!(!pane.notice.is_empty(), "整列复制读不到原值要说明原因，不能静默无动作");
+                pane.column_command(1, "column-copy-where", cx);
+                assert!(!pane.notice.is_empty(), "整列 WHERE 同样要说明原因");
+                assert_eq!(pane.session.copy_column(), "", "预览不参与复制");
+            });
+        });
+        cx.update(|cx| {
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()).as_deref(),
+                Some("剪贴板原内容"),
+                "没有原值时不能把空串写进剪贴板"
+            );
+        });
+
+        // 按定位读到的原值回到会话后，列头复制与整列 WHERE 都用这两个原值。
+        let full: Vec<String> = (0..2).map(long_full).collect();
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                for (row, value) in full.iter().enumerate() {
+                    let read = pane.session.pending_read(row, 1).expect("预览格需要按定位读取");
+                    assert!(pane.session.apply_full(&read, Some(value.clone())));
+                }
+                pane.column_command(1, "column-copy", cx);
+            });
+        });
+        cx.update(|cx| {
+            let copied = cx.read_from_clipboard().and_then(|item| item.text()).unwrap_or_default();
+            assert_eq!(copied, format!("{}\n{}", full[0], full[1]), "整列复制用原值");
+            assert!(!copied.contains('\u{1}'), "剪贴板里不能出现预览信封");
+        });
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| pane.column_command(1, "column-copy-where", cx));
+        });
+        cx.update(|cx| {
+            let copied = cx.read_from_clipboard().and_then(|item| item.text()).unwrap_or_default();
+            assert!(copied.starts_with("WHERE "), "{copied}");
+            assert!(copied.contains(&full[0]), "整列 WHERE 用原值：{copied}");
+            assert!(!copied.contains('\u{1}'), "条件里不能出现预览信封：{copied}");
         });
     }
 
