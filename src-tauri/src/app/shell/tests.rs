@@ -5276,6 +5276,86 @@ fn query_log_side_panel_and_record_view_follow_locale_theme_and_density(cx: &mut
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Windows 主线程默认只有 1 MB 栈；未优化构建里搭元素树的函数帧很大，查询页（工具条、右侧面板、
+/// 消息页）和结果表格（含记录视图）曾经在调试版启动或打开记录视图时撑爆主线程栈。
+/// 这里在同样 1 MB 的线程上把这些区域都画一遍：任何一处帧重新膨胀，进程就会栈溢出而失败。
+#[test]
+fn query_workspace_renders_within_the_windows_main_thread_stack() {
+    const WINDOWS_MAIN_STACK: usize = 1024 * 1024;
+    let worker = std::thread::Builder::new()
+        .name("query-workspace-stack".to_owned())
+        .stack_size(WINDOWS_MAIN_STACK)
+        .spawn(|| {
+            gpui::run_test_once(
+                0,
+                Box::new(|dispatcher| {
+                    let mut cx = gpui_kit::TestAppContext::build(dispatcher, Some("query_workspace_renders_within_the_windows_main_thread_stack"));
+                    let drawn = query_workspace_scenario(&mut cx);
+                    cx.run_until_parked();
+                    cx.update(|cx| {
+                        cx.background_executor().forbid_parking();
+                        cx.quit();
+                    });
+                    cx.run_until_parked();
+                    drawn
+                }),
+            )
+        })
+        .expect("spawn 1 MB render thread");
+    let drawn = worker.join().expect("查询页在 1 MB 栈上绘制不应失败");
+    assert_eq!(drawn, [true; 6], "工具条、右侧大纲/对象、结果表格、记录视图和消息页都要真正画出来");
+}
+
+/// 打开查询页、放入结果、打开记录视图，再依次画右侧大纲、对象信息和消息页。
+/// 返回各区域是否真正画出：(工具条, 大纲, 对象, 表格, 记录视图, 消息页)。
+fn query_workspace_scenario(cx: &mut gpui_kit::TestAppContext) -> [bool; 6] {
+    use crate::query::desk::StatementView;
+
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-query-stack-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench_sized(cx, services_at(&dir), false, 1360., 900.);
+    let result = StatementView {
+        sql: "SELECT id, label FROM item".to_owned(),
+        status: "ok".to_owned(),
+        message: String::new(),
+        columns: vec!["id".to_owned(), "label".to_owned()],
+        rows: vec![vec![Some("1".to_owned()), Some("a".to_owned())], vec![Some("2".to_owned()), Some("b".to_owned())]],
+        truncated: false,
+        affected: None,
+        elapsed_ms: Some(3),
+        error_at: None,
+        range: None,
+        error_mark: None,
+    };
+    let drawn = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |view, cx| view.perform("new-query", cx));
+            window.render_frame(cx);
+            let query = view.read(cx).query.clone();
+            query.update(cx, |pane, cx| pane.plant_run(vec![result], cx));
+            query.update(cx, |pane, cx| {
+                let _ = pane.grid_command("grid-record-toggle", cx);
+            });
+            window.render_frame(cx);
+            let toolbar = window.find("query-act-execute-query").visible() && window.find("query-connection").visible();
+            let outline = window.find("query-outline").visible();
+            let grid = window.find("query-grid").visible();
+            let record = window.find("grid-record-close").visible();
+            query.update(cx, |pane, cx| pane.command("side-mode:object", cx));
+            window.render_frame(cx);
+            let object = window.find("query-side-object").visible();
+            window.click("query-log-tab", cx);
+            window.render_frame(cx);
+            let log = window.find("query-log").visible();
+            [toolbar, outline, object, grid, record, log]
+        })
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    drawn
+}
+
 /// 后台读取不挡其他页面：切换页面与输入照常，旧代次结果只被丢弃，最新上下文才写回。
 #[test]
 fn background_reads_keep_navigation_usable_and_latest_context_wins() {

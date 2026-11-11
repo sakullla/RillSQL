@@ -22,7 +22,7 @@ use gpui_kit::{
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
 };
 
-use crate::ui::kit::{self, Palette, Tip as _, Radius, TypeScale};
+use crate::ui::kit::{self, Metrics, Palette, Tip as _, Radius, TypeScale};
 
 use crate::app::views::grid::{GridPane, GridTarget, QuerySheet};
 use crate::app::model::ObjectTarget;
@@ -1647,30 +1647,101 @@ impl Render for QueryPane {
         let p = Palette::of(cx);
         let metrics = self.density.metrics();
         let mono = cx.theme().mono_font_family.clone();
-        let locale = self.locale;
-        let t = |key: &str| SharedString::from(i18n::text(locale, key));
-        let links = self.desk.links().to_vec();
-        let databases = self.desk.databases().to_vec();
-        let outline = self.desk.outline();
-        let results = self.desk.results();
-        let variables = self.desk.variables();
-        let note = self.desk.active_note();
-        let target = self.desk.target();
         let running = self.desk.active_id().is_some_and(|id| self.desk.running_ids().iter().any(|running| running == id));
-        let editor = self.desk.active_id().and_then(|id| self.editors.get(id)).cloned();
-        let grid = self.grid.clone();
         let entity = cx.entity();
 
-        // ---- 工具条
+        // 各区域在各自不内联的函数里搭建：未优化构建不复用栈槽，整页写在一个函数里时单帧近 800 KB，
+        // 叠上外壳与布局递归会撑爆 Windows 主线程默认 1 MB 栈（调试版启动即崩）。
+        let toolbar = self.render_toolbar(running, &p, metrics, &entity);
+        let editor_row = self.render_editor_row(&p, metrics, &mono, &entity, cx);
+        let results_panel = self.render_results(running, &p, metrics, &mono, &entity, window, cx);
+
+        div()
+            .id("query-pane")
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(toolbar)
+            .child(
+                div().flex_1().min_h(px(0.)).child(
+                    v_resizable("query-split")
+                        .child(resizable_panel().size_range(px(120.)..px(4000.)).child(editor_row))
+                        .child(resizable_panel().size(px(300.)).size_range(px(90.)..px(4000.)).child(results_panel)),
+                ),
+            )
+    }
+}
+
+/// 结果区页签（固定结果、语句、消息）的共同外观。
+fn result_tab(id: SharedString, label: SharedString, selected: bool, p: &Palette, metrics: Metrics) -> gpui_kit::base::ObservedElement<gpui_kit::Stateful<gpui_kit::Div>> {
+    kit::interactive(div().id(id), p, false)
+        .test_support()
+        .role(gpui_kit::Role::Tab)
+        .aria_label(label)
+        .aria_selected(selected)
+        .flex_none()
+        .h(px(metrics.control_h))
+        .px(px(10.))
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .rounded(px(Radius::CONTROL))
+        .text_size(px(TypeScale::SM))
+        .when(selected, |this| this.bg(p.surface).text_color(p.text).shadow_sm())
+        .when(!selected, |this| this.text_color(p.text_muted))
+}
+
+impl QueryPane {
+    /// 工具条：执行/停止、格式化、计划、更多、连接与数据库选择、右侧面板开关。
+    #[inline(never)]
+    fn render_toolbar(&self, running: bool, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+        let locale = self.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let run: AnyElement = if running {
-            kit::danger_button("query-act-request-cancel", Some(IconName::Square), t("ui.query.stop"), pane_act("request-cancel", &entity)).into_any_element()
+            kit::danger_button("query-act-request-cancel", Some(IconName::Square), t("ui.query.stop"), pane_act("request-cancel", entity)).into_any_element()
         } else {
-            kit::primary_button("query-act-execute-query", Some(IconName::Play), t("ui.query.run"), pane_act("execute-query", &entity))
+            kit::primary_button("query-act-execute-query", Some(IconName::Play), t("ui.query.run"), pane_act("execute-query", entity))
                 .tooltip(SharedString::from(format!("{} · {}", i18n::text(locale, "shell.shortcuts.runSelection"), kit::shortcut("Ctrl+Enter"))))
                 .into_any_element()
         };
+        let more = self.render_more_menu(entity);
+        let pickers = self.render_target_pickers(p, entity);
+        div()
+            .id("query-toolbar")
+            .flex_none()
+            .h(px(metrics.toolbar_h()))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .border_b_1()
+            .border_color(p.line)
+            .child(run)
+            .child(kit::vline(p))
+            .child(kit::tool_button("query-act-format", Some(IconName::WandSparkles), t("query.editor.menu.format"), pane_act("format", entity)))
+            .child(kit::tool_button("query-act-explain", Some(IconName::ChartNetwork), t("query.editor.menu.plan"), pane_act("explain", entity)))
+            .child(more)
+            .child(div().flex_1())
+            .children(pickers)
+            .child(kit::vline(p))
+            .child(
+                Button::new("query-side-toggle")
+                    .ghost()
+                    .small()
+                    .icon(IconName::PanelRight)
+                    .tooltip(t("query.side.toggle"))
+                    .accessibility_label(t("query.side.toggle"))
+                    .on_click(pane_act("toggle-side", entity)),
+            )
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn render_more_menu(&self, entity: &Entity<QueryPane>) -> AnyElement {
+        let locale = self.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let more_entity = entity.clone();
-        let more = Button::new("query-more")
+        Button::new("query-more")
             .ghost()
             .small()
             .icon(IconName::Ellipsis)
@@ -1692,15 +1763,24 @@ impl Render for QueryPane {
                     .separator()
                     .item(item("open-sql-file", "query.fileIo.open"))
                     .item(item("save-sql-file", "query.fileIo.save"))
-            });
+            })
+            .into_any_element()
+    }
 
+    /// 工具条右侧：引擎徽标（有目标时）、连接选择、分隔箭头、数据库选择。
+    #[inline(never)]
+    fn render_target_pickers(&self, p: &Palette, entity: &Entity<QueryPane>) -> Vec<AnyElement> {
+        let locale = self.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let target = self.desk.target();
+        let databases = self.desk.databases().to_vec();
         let connection_label = target
             .as_ref()
             .map(|target| if target.connection_name.is_empty() { target.connection_id.clone() } else { target.connection_name.clone() })
             .unwrap_or_else(|| i18n::text(locale, "ui.query.chooseConnection"));
         let engine = target.as_ref().map(|target| target.engine.clone()).unwrap_or_default();
         let conn_entity = entity.clone();
-        let conn_links = links.clone();
+        let conn_links = self.desk.links().to_vec();
         let mut conn_button = Button::new("query-connection")
             .outline()
             .small()
@@ -1727,16 +1807,16 @@ impl Render for QueryPane {
         });
         let database_label = target.as_ref().map(|target| target.database.clone()).filter(|name| !name.is_empty()).unwrap_or_else(|| i18n::text(locale, "ui.query.chooseDatabase"));
         let db_entity = entity.clone();
-        let db_list = databases.clone();
+        let no_databases = databases.is_empty();
         let database_picker = Button::new("query-database")
             .outline()
             .small()
             .label(SharedString::from(database_label))
             .dropdown_caret(true)
-            .disabled(databases.is_empty())
+            .disabled(no_databases)
             .accessibility_label(t("query.database.label"))
             .dropdown_menu(move |mut menu, _, _| {
-                for database in &db_list {
+                for database in &databases {
                     let name = database.clone();
                     let entity = db_entity.clone();
                     menu = menu.item(PopupMenuItem::new(name.clone()).on_click(move |_, _, cx| {
@@ -1746,39 +1826,22 @@ impl Render for QueryPane {
                 }
                 menu
             });
+        let mut items = Vec::with_capacity(4);
+        if !engine.is_empty() {
+            items.push(kit::engine_badge(&engine, 18.).into_any_element());
+        }
+        items.push(connection_picker.into_any_element());
+        items.push(kit::icon(IconName::ChevronRight, 13., p.text_faint).into_any_element());
+        items.push(database_picker.into_any_element());
+        items
+    }
 
-        let toolbar = div()
-            .id("query-toolbar")
-            .flex_none()
-            .h(px(metrics.toolbar_h()))
-            .px(px(10.))
-            .flex()
-            .items_center()
-            .gap(px(4.))
-            .border_b_1()
-            .border_color(p.line)
-            .child(run)
-            .child(kit::vline(&p))
-            .child(kit::tool_button("query-act-format", Some(IconName::WandSparkles), t("query.editor.menu.format"), pane_act("format", &entity)))
-            .child(kit::tool_button("query-act-explain", Some(IconName::ChartNetwork), t("query.editor.menu.plan"), pane_act("explain", &entity)))
-            .child(more)
-            .child(div().flex_1())
-            .when(!engine.is_empty(), |this| this.child(kit::engine_badge(&engine, 18.)))
-            .child(connection_picker)
-            .child(kit::icon(IconName::ChevronRight, 13., p.text_faint))
-            .child(database_picker)
-            .child(kit::vline(&p))
-            .child(
-                Button::new("query-side-toggle")
-                    .ghost()
-                    .small()
-                    .icon(IconName::PanelRight)
-                    .tooltip(t("query.side.toggle"))
-                    .accessibility_label(t("query.side.toggle"))
-                    .on_click(pane_act("toggle-side", &entity)),
-            );
-
-        // ---- 编辑器 + 右侧面板（大纲 / 对象）
+    /// 编辑器与右侧面板（大纲 / 对象）。
+    #[inline(never)]
+    fn render_editor_row(&mut self, p: &Palette, metrics: Metrics, mono: &SharedString, entity: &Entity<QueryPane>, cx: &mut Context<Self>) -> AnyElement {
+        let locale = self.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let editor = self.desk.active_id().and_then(|id| self.editors.get(id)).cloned();
         let side_state = self.side_state();
         let side_open = side_state.is_open(self.narrow);
         let mut editor_row = div().id("query-editor-row").relative().flex().size_full().min_h(px(0.));
@@ -1799,28 +1862,47 @@ impl Render for QueryPane {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(kit::empty_state(IconName::SquareTerminal, t("shell.command.newQuery"), t("shell.statusbar.noTarget"), &p)),
+                    .child(kit::empty_state(IconName::SquareTerminal, t("shell.command.newQuery"), t("shell.statusbar.noTarget"), p)),
             );
         }
         if side_open && self.desk.active_id().is_some() {
-            let info = cursor_text.and_then(|(text, cursor)| self.desk.object_info_at(&text, cursor));
-            let body = match side_state.mode {
-                SideMode::Outline => side::SideBody::Outline(&outline),
-                SideMode::Object => side::SideBody::Object(info.as_ref()),
-            };
-            let panel = side::SidePanel { mode: side_state.mode, body, locale, metrics, overlay: self.narrow, mono: mono.clone() };
-            editor_row = editor_row.child(panel.render(&p, &entity));
+            editor_row = editor_row.child(self.render_side(side_state, cursor_text, p, metrics, mono, entity));
             #[cfg(test)]
             {
                 self.drawn_colors = Some((p.surface, p.chrome));
             }
         }
+        editor_row.into_any_element()
+    }
 
-        // ---- 结果：页签从左到右是 固定结果… | 当前结果（语句 N） | 消息
-        let result_view = self.desk.result_view();
-        let pinned = self.desk.pinned();
-        let log = self.desk.log();
-        let mut header = div()
+    #[inline(never)]
+    fn render_side(&self, side_state: SideState, cursor_text: Option<(String, usize)>, p: &Palette, metrics: Metrics, mono: &SharedString, entity: &Entity<QueryPane>) -> AnyElement {
+        let outline = self.desk.outline();
+        let info = cursor_text.and_then(|(text, cursor)| self.desk.object_info_at(&text, cursor));
+        let body = match side_state.mode {
+            SideMode::Outline => side::SideBody::Outline(&outline),
+            SideMode::Object => side::SideBody::Object(info.as_ref()),
+        };
+        let panel = side::SidePanel { mode: side_state.mode, body, locale: self.locale, metrics, overlay: self.narrow, mono: mono.clone() };
+        panel.render(p, entity)
+    }
+
+    /// 结果区：页签头、变量输入、当前视图（消息 / 空 / 语句状态 / 表格）。
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn render_results(&mut self, running: bool, p: &Palette, metrics: Metrics, mono: &SharedString, entity: &Entity<QueryPane>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let header = self.render_results_head(running, p, metrics, entity);
+        let mut results_panel = div().id("query-results").flex().flex_col().size_full().bg(p.surface).child(header);
+        if let Some(row) = self.render_variables(p, metrics, entity, window, cx) {
+            results_panel = results_panel.child(row);
+        }
+        results_panel.child(self.render_results_body(p, metrics, mono, entity)).into_any_element()
+    }
+
+    /// 页签头：页签从左到右是 固定结果… | 当前结果（语句 N） | 消息，之后是固定按钮与状态。
+    #[inline(never)]
+    fn render_results_head(&self, running: bool, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+        div()
             .id("query-results-head")
             .flex_none()
             .h(px(metrics.bar_h()))
@@ -1830,24 +1912,20 @@ impl Render for QueryPane {
             .gap(px(2.))
             .bg(p.chrome)
             .border_b_1()
-            .border_color(p.line);
-        let tab = |id: SharedString, label: SharedString, selected: bool| {
-            kit::interactive(div().id(id), &p, false)
-                .test_support()
-                .role(gpui_kit::Role::Tab)
-                .aria_label(label)
-                .aria_selected(selected)
-                .flex_none()
-                .h(px(metrics.control_h))
-                .px(px(10.))
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .rounded(px(Radius::CONTROL))
-                .text_size(px(TypeScale::SM))
-                .when(selected, |this| this.bg(p.surface).text_color(p.text).shadow_sm())
-                .when(!selected, |this| this.text_color(p.text_muted))
-        };
+            .border_color(p.line)
+            .child(self.render_result_tabs(p, metrics, entity))
+            .children(self.render_head_actions(p, metrics, entity))
+            .children(self.render_head_status(running, p, metrics, entity))
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn render_result_tabs(&self, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+        let locale = self.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let result_view = self.desk.result_view();
+        let pinned = self.desk.pinned();
+        let results = self.desk.results();
         let mut strip = div()
             .id("query-result-tabs")
             .role(gpui_kit::Role::TabList)
@@ -1858,49 +1936,11 @@ impl Render for QueryPane {
             .items_center()
             .gap(px(2.));
         for pin in &pinned {
-            let selected = result_view == ResultView::Pinned(pin.id);
-            let label = i18n::fill(
-                &i18n::text(locale, "query.results.pinned"),
-                &[("n", &pin.id.to_string()), ("statement", &(pin.statement + 1).to_string())],
-            );
-            let failed = pin.view.status == "error" || pin.view.status == "failed";
-            let open = entity.clone();
-            let close = entity.clone();
-            let open_id = format!("query-view:pinned:{}", pin.id);
-            let close_id = format!("unpin:{}", pin.id);
-            strip = strip.child(
-                tab(SharedString::from(format!("query-pinned-{}", pin.id)), SharedString::from(label.clone()), selected)
-                    .pr(px(4.))
-                    .child(kit::icon(IconName::Bookmark, 12., if failed { p.danger } else { p.accent }))
-                    .child(SharedString::from(label))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("query-pinned-close-{}", pin.id)))
-                            .test_support()
-                            .role(gpui_kit::Role::Button)
-                            .aria_label(t("query.results.unpin"))
-                            .size(px(18.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(Radius::CONTROL))
-                            .hover(|style| style.bg(p.active))
-                            .child(kit::icon(IconName::X, 12., p.text_faint))
-                            .on_click(move |_, _, cx| {
-                                cx.stop_propagation();
-                                let id = close_id.clone();
-                                close.update(cx, |pane, cx| pane.command(&id, cx));
-                            }),
-                    )
-                    .on_click(move |_, _, cx| {
-                        let id = open_id.clone();
-                        open.update(cx, |pane, cx| pane.command(&id, cx));
-                    }),
-            );
+            strip = strip.child(pinned_tab(pin, result_view == ResultView::Pinned(pin.id), locale, p, metrics, entity));
         }
         // 固定结果与当前结果之间用一道竖线分开；没有固定结果时不加。
         if !pinned.is_empty() {
-            strip = strip.child(kit::vline(&p));
+            strip = strip.child(kit::vline(p));
         }
         if results.len() > 1 {
             let current = self.desk.statement();
@@ -1911,7 +1951,7 @@ impl Render for QueryPane {
                 let entity = entity.clone();
                 let label = SharedString::from(format!("{} {}", i18n::text(locale, "query.results.statement"), index + 1));
                 strip = strip.child(
-                    tab(SharedString::from(format!("query-act-statement-{index}")), label.clone(), selected)
+                    result_tab(SharedString::from(format!("query-act-statement-{index}")), label.clone(), selected, p, metrics)
                         .child(kit::status_dot(if failed { p.danger } else { p.ok }))
                         .child(label)
                         .on_click(move |_, _, cx| {
@@ -1923,13 +1963,20 @@ impl Render for QueryPane {
         } else {
             let entity = entity.clone();
             strip = strip.child(
-                tab(SharedString::from("query-results-tab"), t("ui.query.results"), result_view == ResultView::Current)
+                result_tab(SharedString::from("query-results-tab"), t("ui.query.results"), result_view == ResultView::Current, p, metrics)
                     .child(t("ui.query.results"))
                     .on_click(move |_, _, cx| entity.update(cx, |pane, cx| pane.command("query-view:current", cx))),
             );
         }
-        header = header.child(strip);
-        // 消息页签在页签条之外、紧随其后：页签再多也不会被挤出视口。
+        strip.into_any_element()
+    }
+
+    /// 消息页签（在页签条之外、紧随其后：页签再多也不会被挤出视口）与固定按钮。
+    #[inline(never)]
+    fn render_head_actions(&self, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> [AnyElement; 2] {
+        let locale = self.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let log = self.desk.log();
         let log_failed = log.iter().any(|entry| entry.failed());
         let log_label = if log.is_empty() {
             i18n::text(locale, "query.log.tab")
@@ -1937,24 +1984,30 @@ impl Render for QueryPane {
             format!("{} {}", i18n::text(locale, "query.log.tab"), log.len())
         };
         let log_entity = entity.clone();
-        header = header.child(
-            tab(SharedString::from("query-log-tab"), SharedString::from(log_label.clone()), result_view == ResultView::Messages)
-                .when(log_failed, |this| this.child(kit::status_dot(p.danger)))
-                .child(SharedString::from(log_label))
-                .on_click(move |_, _, cx| log_entity.update(cx, |pane, cx| pane.command("query-view:messages", cx))),
-        );
-        let can_pin = self.desk.can_pin();
+        let log_tab = result_tab(SharedString::from("query-log-tab"), SharedString::from(log_label.clone()), self.desk.result_view() == ResultView::Messages, p, metrics)
+            .when(log_failed, |this| this.child(kit::status_dot(p.danger)))
+            .child(SharedString::from(log_label))
+            .on_click(move |_, _, cx| log_entity.update(cx, |pane, cx| pane.command("query-view:messages", cx)))
+            .into_any_element();
         let pin_entity = entity.clone();
-        header = header.child(
-            Button::new("query-act-pin")
-                .ghost()
-                .xsmall()
-                .icon(IconName::Bookmark)
-                .disabled(!can_pin)
-                .tooltip(t("query.results.pin"))
-                .accessibility_label(t("query.results.pin"))
-                .on_click(move |_, _, cx| pin_entity.update(cx, |pane, cx| pane.command("pin-result", cx))),
-        );
+        let pin = Button::new("query-act-pin")
+            .ghost()
+            .xsmall()
+            .icon(IconName::Bookmark)
+            .disabled(!self.desk.can_pin())
+            .tooltip(t("query.results.pin"))
+            .accessibility_label(t("query.results.pin"))
+            .on_click(move |_, _, cx| pin_entity.update(cx, |pane, cx| pane.command("pin-result", cx)))
+            .into_any_element();
+        [log_tab, pin]
+    }
+
+    /// 页签头右侧：弹性留白、耗时/运行态、说明、行数摘要、加载更多。
+    #[inline(never)]
+    fn render_head_status(&self, running: bool, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> Vec<AnyElement> {
+        let locale = self.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let mut items: Vec<AnyElement> = vec![div().flex_1().into_any_element()];
         let active_result = self.desk.shown_result();
         let summary = active_result.as_ref().map(|result| {
             if let Some(affected) = result.affected.filter(|_| result.columns.is_empty()) {
@@ -1966,19 +2019,25 @@ impl Render for QueryPane {
         let failed_note = active_result.as_ref().is_some_and(|result| result.status == "error" || result.status == "failed");
         // 耗时：执行中显示运行态，取消后显示已取消，完成后显示当前语句自己的耗时。
         let timing = self.result_timing();
-        let cancelled = timing == ResultTiming::Cancelled;
-        let elapsed = match timing {
-            ResultTiming::Elapsed(ms) => Some(ms),
-            _ => None,
-        };
-        header = header.child(div().flex_1()).when(running, |this| {
-            this.child(div().id("query-elapsed-running").flex().items_center().gap(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(Spinner::new().xsmall().color(p.accent)).child(t("query.status.running")))
-        });
-        if cancelled {
-            header = header.child(div().id("query-elapsed-cancelled").px(px(6.)).text_size(px(TypeScale::SM)).text_color(p.warn).child(t("query.status.cancelled")));
+        if running {
+            items.push(
+                div()
+                    .id("query-elapsed-running")
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.text_muted)
+                    .child(Spinner::new().xsmall().color(p.accent))
+                    .child(t("query.status.running"))
+                    .into_any_element(),
+            );
         }
-        if let Some(ms) = elapsed {
-            header = header.child(
+        if timing == ResultTiming::Cancelled {
+            items.push(div().id("query-elapsed-cancelled").px(px(6.)).text_size(px(TypeScale::SM)).text_color(p.warn).child(t("query.status.cancelled")).into_any_element());
+        }
+        if let ResultTiming::Elapsed(ms) = timing {
+            items.push(
                 div()
                     .id("query-elapsed")
                     .px(px(6.))
@@ -1988,11 +2047,13 @@ impl Render for QueryPane {
                     .text_size(px(TypeScale::SM))
                     .text_color(p.text_faint)
                     .child(kit::icon(IconName::Clock, 12., p.text_faint))
-                    .child(SharedString::from(elapsed_label(ms))),
+                    .child(SharedString::from(elapsed_label(ms)))
+                    .into_any_element(),
             );
         }
+        let note = self.desk.active_note();
         if !note.is_empty() {
-            header = header.child(
+            items.push(
                 div()
                     .id("query-note")
                     .min_w(px(0.))
@@ -2002,144 +2063,192 @@ impl Render for QueryPane {
                     .text_size(px(TypeScale::SM))
                     .text_color(if failed_note { p.danger } else { p.text_muted })
                     .tooltip_text(SharedString::from(note.clone()))
-                    .child(SharedString::from(note.clone())),
+                    .child(SharedString::from(note))
+                    .into_any_element(),
             );
         }
         if let Some(summary) = summary {
-            header = header.child(div().px(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(SharedString::from(summary)));
+            items.push(div().px(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(SharedString::from(summary)).into_any_element());
         }
-        if !running && result_view == ResultView::Current && results.len() == 1 && is_pageable(&results[0]) && self.load_more_allowed() {
-            match load_more_plan(&results, self.page_size) {
-                Some((_, limit)) => {
-                    let loaded = results[0].rows.len() as u64;
-                    let more = entity.clone();
-                    header = header.child(
-                        kit::interactive(div().id("query-load-more"), &p, false)
-                            .role(gpui_kit::Role::Button)
-                            .aria_label(SharedString::from(i18n::text(locale, "query.results.loadMore")))
-                            .h(px(metrics.control_h))
-                            .px(px(8.))
-                            .rounded(px(Radius::CONTROL))
-                            .text_size(px(TypeScale::SM))
-                            .text_color(p.accent)
-                            .bg(p.accent_soft)
-                            .child(SharedString::from(format!(
-                                "{} +{}",
-                                i18n::text(locale, "query.results.loadMore"),
-                                limit.saturating_sub(loaded)
-                            )))
-                            .on_click(move |_, _, cx| {
-                                more.update(cx, |pane, cx| pane.load_more(cx));
-                            }),
-                    );
-                }
-                None => {
-                    // 结果没有被截断：明确告诉用户已经读完，而不是看起来没有分页入口。
-                    header = header.child(
-                        div()
-                            .id("query-load-more-done")
-                            .h(px(metrics.control_h))
-                            .px(px(8.))
-                            .flex()
-                            .items_center()
-                            .text_size(px(TypeScale::SM))
-                            .text_color(p.text_muted)
-                            .child(SharedString::from(i18n::text(locale, "query.results.allLoaded"))),
-                    );
-                }
-            }
+        if let Some(more) = self.render_load_more(running, p, metrics, entity) {
+            items.push(more);
         }
+        items
+    }
 
-        let mut results_panel = div().id("query-results").flex().flex_col().size_full().bg(p.surface).child(header);
-        if !variables.is_empty() {
-            let mut row = div()
-                .id("query-variables")
-                .flex_none()
-                .p(px(10.))
-                .flex()
-                .flex_wrap()
-                .items_end()
-                .gap(px(10.))
-                .bg(p.accent_soft)
-                .border_b_1()
-                .border_color(p.line)
-                .child(div().flex().items_center().gap(px(6.)).h(px(metrics.bar_h() - 4.)).child(kit::icon(IconName::Braces, 14., p.accent_text)).child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(t("query.variables.title"))));
-            for field in &variables {
-                let value = self.variable_values.get(&field.key).cloned().unwrap_or_default();
-                let input = self.variable_input(&field.key, &value, window, cx);
-                row = row.child(div().w(px(180.)).child(kit::form_row(SharedString::from(field.label.clone()), kit::text_input(SharedString::from(format!("query-var-{}", field.key)), &input, SharedString::from(field.label.clone())).small(), &p)));
-            }
-            row = row
-                .child(kit::primary_button("query-act-confirm-variables", Some(IconName::Play), t("query.variables.proceed"), pane_act("confirm-variables", &entity)))
-                .child(kit::secondary_button("query-act-cancel-variables", None, t("query.variables.cancel"), pane_act("cancel-variables", &entity)));
-            results_panel = results_panel.child(row);
+    #[inline(never)]
+    fn render_load_more(&self, running: bool, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> Option<AnyElement> {
+        let locale = self.locale;
+        let results = self.desk.results();
+        if running || self.desk.result_view() != ResultView::Current || results.len() != 1 || !is_pageable(&results[0]) || !self.load_more_allowed() {
+            return None;
         }
-        let grid_entity = entity.clone();
-        if result_view == ResultView::Messages {
+        Some(match load_more_plan(&results, self.page_size) {
+            Some((_, limit)) => {
+                let loaded = results[0].rows.len() as u64;
+                let more = entity.clone();
+                kit::interactive(div().id("query-load-more"), p, false)
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(SharedString::from(i18n::text(locale, "query.results.loadMore")))
+                    .h(px(metrics.control_h))
+                    .px(px(8.))
+                    .rounded(px(Radius::CONTROL))
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.accent)
+                    .bg(p.accent_soft)
+                    .child(SharedString::from(format!("{} +{}", i18n::text(locale, "query.results.loadMore"), limit.saturating_sub(loaded))))
+                    .on_click(move |_, _, cx| {
+                        more.update(cx, |pane, cx| pane.load_more(cx));
+                    })
+                    .into_any_element()
+            }
+            // 结果没有被截断：明确告诉用户已经读完，而不是看起来没有分页入口。
+            None => div()
+                .id("query-load-more-done")
+                .h(px(metrics.control_h))
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .text_size(px(TypeScale::SM))
+                .text_color(p.text_muted)
+                .child(SharedString::from(i18n::text(locale, "query.results.allLoaded")))
+                .into_any_element(),
+        })
+    }
+
+    /// 执行前要填的变量；没有变量时不占位置。
+    #[inline(never)]
+    fn render_variables(&mut self, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let variables = self.desk.variables();
+        if variables.is_empty() {
+            return None;
+        }
+        let locale = self.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let mut row = div()
+            .id("query-variables")
+            .flex_none()
+            .p(px(10.))
+            .flex()
+            .flex_wrap()
+            .items_end()
+            .gap(px(10.))
+            .bg(p.accent_soft)
+            .border_b_1()
+            .border_color(p.line)
+            .child(div().flex().items_center().gap(px(6.)).h(px(metrics.bar_h() - 4.)).child(kit::icon(IconName::Braces, 14., p.accent_text)).child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(t("query.variables.title"))));
+        for field in &variables {
+            let value = self.variable_values.get(&field.key).cloned().unwrap_or_default();
+            let input = self.variable_input(&field.key, &value, window, cx);
+            row = row.child(div().w(px(180.)).child(kit::form_row(SharedString::from(field.label.clone()), kit::text_input(SharedString::from(format!("query-var-{}", field.key)), &input, SharedString::from(field.label.clone())).small(), p)));
+        }
+        row = row
+            .child(kit::primary_button("query-act-confirm-variables", Some(IconName::Play), t("query.variables.proceed"), pane_act("confirm-variables", entity)))
+            .child(kit::secondary_button("query-act-cancel-variables", None, t("query.variables.cancel"), pane_act("cancel-variables", entity)));
+        Some(row.into_any_element())
+    }
+
+    /// 结果区主体：消息页、空结果、无列语句的状态，或结果表格。
+    #[inline(never)]
+    fn render_results_body(&mut self, p: &Palette, metrics: Metrics, mono: &SharedString, entity: &Entity<QueryPane>) -> AnyElement {
+        let locale = self.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        if self.desk.result_view() == ResultView::Messages {
+            let log = self.desk.log();
             let panel = log::LogPanel { entries: &log, batch: self.desk.log_batch(), locale, metrics, mono: mono.clone() };
-            results_panel = results_panel.child(panel.render(&p, &entity));
             #[cfg(test)]
             {
                 self.drawn_colors = Some((p.surface, p.chrome));
             }
-        } else if active_result.is_none() {
-            results_panel = results_panel.child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(kit::empty_state(IconName::Table, t("ui.query.results"), t("ui.query.noResults"), &p).child(div().flex().gap(px(6.)).child(kit::kbd(kit::shortcut("Ctrl+Enter"), &p)))),
-            );
-        } else if let Some(result) = active_result.clone().filter(|result| result.columns.is_empty()) {
-            let ok = !(result.status == "error" || result.status == "failed");
-            let message = if result.message.is_empty() { note.clone() } else { statement_message(locale, &result.status, &result.message) };
-            results_panel = results_panel.child(
-                div()
-                    .flex_1()
-                    .p(px(16.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .text_color(if ok { p.ok } else { p.danger })
-                            .child(kit::icon(if ok { IconName::CircleCheck } else { IconName::CircleAlert }, 16., if ok { p.ok } else { p.danger }))
-                            .child(SharedString::from(if message.is_empty() { result.status.clone() } else { message })),
-                    )
-                    .child(div().font_family(mono.clone()).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(result.sql.clone()))),
-            );
-        } else {
-            results_panel = results_panel.child(
-                div()
-                    .id("query-grid")
-                    .test_support()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .on_mouse_down(MouseButton::Right, move |_, _, cx| {
-                        grid_entity.update(cx, |pane, _| pane.grid_menu_requested = true);
-                    })
-                    .child(grid),
-            );
+            return panel.render(p, entity);
         }
-
+        let Some(result) = self.desk.shown_result() else {
+            return div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(kit::empty_state(IconName::Table, t("ui.query.results"), t("ui.query.noResults"), p).child(div().flex().gap(px(6.)).child(kit::kbd(kit::shortcut("Ctrl+Enter"), p))))
+                .into_any_element();
+        };
+        if result.columns.is_empty() {
+            return statement_outcome(&result, &self.desk.active_note(), locale, mono, p);
+        }
+        let grid_entity = entity.clone();
         div()
-            .id("query-pane")
-            .flex()
-            .flex_col()
-            .size_full()
-            .child(toolbar)
-            .child(
-                div().flex_1().min_h(px(0.)).child(
-                    v_resizable("query-split")
-                        .child(resizable_panel().size_range(px(120.)..px(4000.)).child(editor_row))
-                        .child(resizable_panel().size(px(300.)).size_range(px(90.)..px(4000.)).child(results_panel)),
-                ),
-            )
+            .id("query-grid")
+            .test_support()
+            .flex_1()
+            .min_h(px(0.))
+            .on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                grid_entity.update(cx, |pane, _| pane.grid_menu_requested = true);
+            })
+            .child(self.grid.clone())
+            .into_any_element()
     }
+}
+
+/// 一个固定结果的页签：书签图标、标题和关闭按钮。
+#[inline(never)]
+fn pinned_tab(pin: &desk::PinnedResult, selected: bool, locale: Locale, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+    let label = i18n::fill(&i18n::text(locale, "query.results.pinned"), &[("n", &pin.id.to_string()), ("statement", &(pin.statement + 1).to_string())]);
+    let failed = pin.view.status == "error" || pin.view.status == "failed";
+    let open = entity.clone();
+    let close = entity.clone();
+    let open_id = format!("query-view:pinned:{}", pin.id);
+    let close_id = format!("unpin:{}", pin.id);
+    result_tab(SharedString::from(format!("query-pinned-{}", pin.id)), SharedString::from(label.clone()), selected, p, metrics)
+        .pr(px(4.))
+        .child(kit::icon(IconName::Bookmark, 12., if failed { p.danger } else { p.accent }))
+        .child(SharedString::from(label))
+        .child(
+            div()
+                .id(SharedString::from(format!("query-pinned-close-{}", pin.id)))
+                .test_support()
+                .role(gpui_kit::Role::Button)
+                .aria_label(SharedString::from(i18n::text(locale, "query.results.unpin")))
+                .size(px(18.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(Radius::CONTROL))
+                .hover(|style| style.bg(p.active))
+                .child(kit::icon(IconName::X, 12., p.text_faint))
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    let id = close_id.clone();
+                    close.update(cx, |pane, cx| pane.command(&id, cx));
+                }),
+        )
+        .on_click(move |_, _, cx| {
+            let id = open_id.clone();
+            open.update(cx, |pane, cx| pane.command(&id, cx));
+        })
+        .into_any_element()
+}
+
+/// 没有结果列的语句（DDL/DML/失败）：状态图标、说明和语句文本。
+#[inline(never)]
+fn statement_outcome(result: &desk::StatementView, note: &str, locale: Locale, mono: &SharedString, p: &Palette) -> AnyElement {
+    let ok = !(result.status == "error" || result.status == "failed");
+    let message = if result.message.is_empty() { note.to_owned() } else { statement_message(locale, &result.status, &result.message) };
+    div()
+        .flex_1()
+        .p(px(16.))
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .text_color(if ok { p.ok } else { p.danger })
+                .child(kit::icon(if ok { IconName::CircleCheck } else { IconName::CircleAlert }, 16., if ok { p.ok } else { p.danger }))
+                .child(SharedString::from(if message.is_empty() { result.status.clone() } else { message })),
+        )
+        .child(div().font_family(mono.clone()).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(result.sql.clone())))
+        .into_any_element()
 }
 
 fn pane_act(id: &'static str, entity: &Entity<QueryPane>) -> impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static {
