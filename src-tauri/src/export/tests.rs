@@ -514,3 +514,43 @@ fn both_locales_have_exchange_labels() {
     assert_eq!(csv.rows[0], vec![Some("甲".into()), None]);
     assert_eq!(csv.rows[1][0], Some(String::new()));
 }
+
+/// 网格"复制为"复用这里的格式写法：CSV 按 RFC 4180 加引号并用 CRLF，NULL 写 NULL 标记；
+/// JSON 是对象数组、键按列顺序、NULL 写 null；Markdown 的 NULL 写传入的 NULL 文本；
+/// INSERT 按引擎引用标识符，数值列不加引号，NULL 写 NULL。
+#[test]
+fn render_formats_keep_nulls_quotes_and_column_order_byte_for_byte() {
+    use super::write::{render, render_insert_for};
+    use crate::grid::{Column, Engine};
+    let table = super::ParsedTable {
+        columns: vec!["name".into(), "id".into(), "note".into()],
+        rows: vec![
+            vec![Some("甲".into()), Some("1".into()), None],
+            vec![Some("a,\"b\"".into()), Some("2".into()), Some("NULL".into())],
+        ],
+    };
+    let csv = String::from_utf8(render("csv", &table, ',', "NULL", false, "", "").unwrap()).unwrap();
+    assert_eq!(csv, "\"name\",\"id\",\"note\"\r\n\"甲\",\"1\",NULL\r\n\"a,\"\"b\"\"\",\"2\",\"NULL\"");
+    let json = String::from_utf8(render("json", &table, ',', "NULL", false, "", "").unwrap()).unwrap();
+    assert_eq!(json, "[{\"name\":\"甲\",\"id\":\"1\",\"note\":null},{\"name\":\"a,\\\"b\\\"\",\"id\":\"2\",\"note\":\"NULL\"}]");
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(parsed[0]["note"].is_null());
+    let markdown = String::from_utf8(render("markdown", &table, ',', "NULL", false, "", "").unwrap()).unwrap();
+    assert_eq!(markdown, "| name | id | note |\r\n| --- | --- | --- |\r\n| 甲 | 1 | NULL |\r\n| a,\"b\" | 2 | NULL |");
+
+    let columns = vec![
+        Column { name: "name".into(), type_name: "text".into(), nullable: true, primary: false, unique: false, auto: false },
+        Column { name: "id".into(), type_name: "integer".into(), nullable: false, primary: true, unique: true, auto: false },
+        Column { name: "note".into(), type_name: "text".into(), nullable: true, primary: false, unique: false, auto: false },
+    ];
+    let mysql = render_insert_for(Engine::Mysql, "", "people", &columns, &table);
+    assert_eq!(
+        mysql,
+        "INSERT INTO `people` (`name`, `id`, `note`) VALUES ('甲', 1, NULL);\r\nINSERT INTO `people` (`name`, `id`, `note`) VALUES ('a,\"b\"', 2, 'NULL');"
+    );
+    let sqlserver = render_insert_for(Engine::Sqlserver, "dbo", "people", &columns, &table);
+    assert!(sqlserver.starts_with("INSERT INTO [dbo].[people] ([name], [id], [note]) VALUES (N'甲', 1, NULL);"), "{sqlserver}");
+    // 文件导出的 INSERT 仍是原来的 SQLite 写法。
+    let exported = String::from_utf8(render("insert", &table, ',', "NULL", false, "", "people").unwrap()).unwrap();
+    assert!(exported.starts_with("INSERT INTO \"people\" (\"name\", \"id\", \"note\") VALUES ('甲', '1', NULL);"), "{exported}");
+}

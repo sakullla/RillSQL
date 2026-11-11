@@ -167,23 +167,32 @@ fn quote_csv(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+/// 对象数组，键按列顺序写出（serde_json 的 Map 会按字母重排）；同名列以后出现的值为准，位置不变。
 fn render_json(table: &ParsedTable) -> String {
     let rows = table
         .rows
         .iter()
         .map(|row| {
-            let mut object = serde_json::Map::new();
+            let mut fields: Vec<(&str, serde_json::Value)> = Vec::new();
             for (index, name) in table.columns.iter().enumerate() {
                 let value = match row.get(index) {
                     Some(Some(text)) => serde_json::Value::String(text.clone()),
                     _ => serde_json::Value::Null,
                 };
-                object.insert(name.clone(), value);
+                match fields.iter_mut().find(|(key, _)| *key == name.as_str()) {
+                    Some(slot) => slot.1 = value,
+                    None => fields.push((name.as_str(), value)),
+                }
             }
-            serde_json::Value::Object(object)
+            let body = fields
+                .iter()
+                .map(|(key, value)| format!("{}:{}", serde_json::Value::String((*key).to_owned()), value))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{body}}}")
         })
         .collect::<Vec<_>>();
-    serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_owned())
+    format!("[{}]", rows.join(","))
 }
 
 fn render_markdown(table: &ParsedTable, null_token: &str) -> String {
@@ -230,6 +239,12 @@ fn render_insert(table: &ParsedTable, schema: &str, table_name: &str) -> String 
         .iter()
         .map(|name| Column { name: name.clone(), type_name: "TEXT".to_owned(), nullable: true, primary: false, unique: false, auto: false })
         .collect();
+    render_insert_for(Engine::Sqlite, schema, table_name, &columns, table)
+}
+
+/// 按目标引擎写 INSERT：标识符用该引擎的引号，列类型决定字面量（数值不加引号，NULL 写 NULL）。
+/// 文件导出沿用 SQLite 写法；网格"复制为 INSERT"带上真实引擎和列类型。
+pub fn render_insert_for(engine: Engine, schema: &str, table_name: &str, columns: &[Column], table: &ParsedTable) -> String {
     let mut lines = Vec::new();
     for row in &table.rows {
         let cells: Vec<Cell> = table
@@ -241,7 +256,7 @@ fn render_insert(table: &ParsedTable, schema: &str, table_name: &str) -> String 
                 _ => Cell::Null,
             })
             .collect();
-        lines.push(insert_line(Engine::Sqlite, schema, table_name, &columns, &table.columns, &cells));
+        lines.push(insert_line(engine, schema, table_name, columns, &table.columns, &cells));
     }
     lines.join("\r\n")
 }

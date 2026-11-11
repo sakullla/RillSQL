@@ -828,6 +828,42 @@ dict! {
     "catalog.danger.confirmAgain" => "再次点击以执行", "Click again to execute";
     "catalog.danger.prodHint" => "这是生产环境。输入对象名 {name} 后才能执行。", "This is a production connection. Type the object name {name} to enable Execute.";
     "catalog.danger.done" => "已执行", "Done";
+    "grid.copyAs.tsv" => "复制为 TSV（含表头）", "Copy as TSV (with headers)";
+    "grid.copyAs.csv" => "复制为 CSV", "Copy as CSV";
+    "grid.copyAs.json" => "复制为 JSON", "Copy as JSON";
+    "grid.copyAs.markdown" => "复制为 Markdown 表格", "Copy as Markdown table";
+    "grid.copyAs.insert" => "复制为 INSERT 语句", "Copy as INSERT statements";
+    "grid.copyAs.empty" => "没有选中的单元格，剪贴板未改动", "Nothing is selected; the clipboard was not changed";
+    "grid.copyAs.placeholder" => "查询结果没有定位到表，INSERT 使用了占位表名 table_name", "The result is not tied to a table, so the INSERT uses the placeholder name table_name";
+    "grid.column.hide" => "隐藏列", "Hide column";
+    "grid.column.showAll" => "显示全部列", "Show all columns";
+    "grid.column.show" => "显示列 {name}", "Show column {name}";
+    "grid.column.freeze" => "冻结到此列", "Freeze up to this column";
+    "grid.column.unfreeze" => "取消冻结", "Unfreeze columns";
+    "grid.column.fit" => "自适应列宽", "Auto-fit column width";
+    "grid.column.lastVisible" => "至少要保留一个可见列", "At least one column must stay visible";
+    "grid.record.open" => "记录视图", "Record view";
+    "grid.record.title" => "第 {row} 行", "Row {row}";
+    "grid.record.prev" => "上一行", "Previous row";
+    "grid.record.next" => "下一行", "Next row";
+    "grid.record.close" => "关闭记录视图", "Close record view";
+    "grid.record.openValue" => "查看完整值", "Open full value";
+    "grid.record.empty" => "没有可显示的行", "No row to show";
+    "grid.record.hidden" => "（已隐藏）", "(hidden)";
+    "grid.write.clone" => "复制为新行", "Clone as new row";
+    "grid.write.paste" => "粘贴", "Paste";
+    "grid.write.setValue" => "选区设值…", "Set value on selection…";
+    "grid.write.setNull" => "选区设为 NULL", "Set selection to NULL";
+    "grid.write.setValueHint" => "为选中的 {count} 个单元格输入同一个值", "Type one value for the {count} selected cells";
+    "grid.write.staged" => "已暂存 {count} 个修改，预览并确认后才写库", "Staged {count} changes; nothing is written until you preview and confirm";
+    "grid.write.cloned" => "已暂存一条新行，主键和自增列留空", "Staged a new row; primary-key and auto-increment columns are left unassigned";
+    "grid.batch.empty" => "剪贴板为空或不是文本，整次未生效", "The clipboard is empty or not text; nothing was staged";
+    "grid.batch.noFocus" => "先选中要写入的单元格", "Select the cells to write first";
+    "grid.batch.noRow" => "先选中一行", "Select a row first";
+    "grid.batch.outOfRange" => "超出了可见列数或已加载的行数，整次未生效", "The block goes past the visible columns or the loaded rows; nothing was staged";
+    "grid.batch.readonly" => "{reason}，整次未生效", "{reason}; nothing was staged";
+    "grid.batch.keyColumn" => "目标区域包含主键或自增列 {column}，整次未生效", "The target includes the primary-key or auto-increment column {column}; nothing was staged";
+    "grid.batch.blocked" => "列 {column} 不可写：{reason}，整次未生效", "Column {column} can't be written: {reason}; nothing was staged";
 }
 
 #[cfg(test)]

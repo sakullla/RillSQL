@@ -1,5 +1,6 @@
 //! 共享虚拟网格。DataTable 只画可见窗口；选择和已读取/全量范围留在 session。
 
+mod record;
 mod session;
 
 use std::sync::{Arc, OnceLock};
@@ -12,7 +13,7 @@ use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableEvent, T
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
+    App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
     relative,
 };
 
@@ -24,8 +25,8 @@ use crate::grid::commands::{CountDto, CountRequest, FilterArg, PageDto, PageRequ
 use crate::i18n::{self, Locale};
 
 use session::{
-    cell_of, columns_from_schema, rows_from_page, schema_from_dto, CellPhase, Continuation, CopyScope, FindScope, ForeignKeyInfo, FullRead, Gate,
-    GridAction, Reference,
+    cell_of, columns_from_schema, rows_from_page, schema_from_dto, BatchReject, CellPhase, Continuation, CopyBlock, CopyFormat, CopyScope, FindScope,
+    ForeignKeyInfo, FullRead, Gate, GridAction, Reference,
 };
 
 /// 外键跳转要打开的引用表工作项：目标身份和定位查询一起交给外壳，由它真正打开并定位。
@@ -105,6 +106,12 @@ pub struct GridPane {
     navigation: Option<NavigationSink>,
     /// 行头双击等表格事件里不能重入，绘制前再打开完整值查看。
     pending_viewer: bool,
+    /// 右侧纵向记录视图是否打开；它始终显示网格的焦点行。
+    record_open: bool,
+    /// 表头菜单"自适应列宽"要用窗口量字宽，绘制前再执行（逻辑列）。
+    pending_fit: Option<usize>,
+    /// "选区设值"要拿到 Window 才能聚焦输入，绘制时再打开编辑栏。
+    pending_batch: bool,
     search_subscription: Option<gpui_kit::Subscription>,
     _subscription: gpui_kit::Subscription,
     _edit_subscription: gpui_kit::Subscription,
@@ -122,6 +129,8 @@ struct EditTarget {
     row_id: String,
     column: usize,
     original: Option<Option<String>>,
+    /// 非空时是"选区设值"：输入的值作为一批暂存到这些格子（行 id、逻辑列）。
+    cells: Vec<(String, usize)>,
 }
 
 /// 一条筛选条件的两个取值输入；null/notnull/empty 不用它们。
@@ -153,6 +162,9 @@ fn full_action(id: &str) -> Option<GridAction> {
         "grid-filter-value" => GridAction::FilterValue,
         "grid-fk-jump" | "grid-fk-select" => GridAction::Reference,
         "grid-full-values" => GridAction::ExportValues,
+        // 复制为新行要拿到焦点行每一格的原值。
+        "grid-clone-row" => GridAction::CopyRow,
+        other if CopyFormat::from_command(other).is_some() => GridAction::CopyRegion,
         _ => return None,
     })
 }
@@ -214,6 +226,9 @@ impl GridPane {
             pending_full: None,
             navigation: None,
             pending_viewer: false,
+            record_open: false,
+            pending_fit: None,
+            pending_batch: false,
             search_subscription: None,
             _subscription: subscription,
             _edit_subscription: edit_subscription,
@@ -418,6 +433,14 @@ impl GridPane {
                 self.cancel_edit();
                 None
             }
+            // 选区设值的编辑栏里点 NULL：整批设为数据库 NULL，而不是只改焦点格。
+            "grid-set-null" if self.edit_target.as_ref().is_some_and(|target| !target.cells.is_empty()) => {
+                let cells = self.edit_target.take().map(|target| target.cells).unwrap_or_default();
+                let result = self.session.stage_batch(cells.into_iter().map(|(row_id, column)| (row_id, column, None)).collect());
+                self.report_batch(result);
+                self.abandon_edit();
+                None
+            }
             "grid-set-null" => {
                 self.select_first_if_needed();
                 if let Some((row, column)) = self.session.focus_cell() {
@@ -620,6 +643,70 @@ impl GridPane {
                     }
                 }
             }
+            // 多格式复制：原值已在 prepare_full 里读好；读不到或没有选区时剪贴板保持原样。
+            other if CopyFormat::from_command(other).is_some() => {
+                let format = CopyFormat::from_command(other).unwrap_or(CopyFormat::TsvHeader);
+                match self.session.copy_as(format) {
+                    Ok(copied) => {
+                        // 占位表名要说出来：这段 INSERT 不能原样执行。
+                        self.notice = if copied.placeholder { i18n::text(self.locale, "grid.copyAs.placeholder") } else { String::new() };
+                        Some(copied.text)
+                    }
+                    Err(CopyBlock::Empty) => {
+                        self.notice = i18n::text(self.locale, "grid.copyAs.empty");
+                        None
+                    }
+                    Err(CopyBlock::Missing) => {
+                        let cells = self.session.action_cells(GridAction::CopyRegion);
+                        self.notice = self.session.cell_block(&cells).unwrap_or_else(|| i18n::text(self.locale, "grid.value.noOriginal"));
+                        None
+                    }
+                }
+            }
+            "grid-clone-row" => {
+                self.select_first_if_needed();
+                self.notice = match self.session.stage_clone() {
+                    Ok(()) => i18n::text(self.locale, "grid.write.cloned"),
+                    Err(reason) => reason,
+                };
+                None
+            }
+            "grid-paste" => {
+                // 只认剪贴板里的文本（TSV）；为空或不是文本时整次拒绝。
+                let text = cx.read_from_clipboard().and_then(|item| item.text());
+                let result = self.session.paste_tsv(text.as_deref());
+                self.report_batch(result);
+                None
+            }
+            "grid-selection-null" => {
+                let result = self.session.stage_selection(None);
+                self.report_batch(result);
+                None
+            }
+            "grid-selection-set" => {
+                if !self.session.writable() {
+                    self.notice = BatchReject::Readonly(self.session.gate_text(Gate::Readonly)).message(self.locale);
+                } else if self.session.selection_targets().is_empty() {
+                    self.notice = BatchReject::NoFocus.message(self.locale);
+                } else {
+                    // 编辑栏要在绘制时拿到 Window 才能聚焦。
+                    self.pending_batch = true;
+                }
+                None
+            }
+            "grid-record-toggle" => {
+                self.record_open = !self.record_open;
+                None
+            }
+            "grid-record-close" => {
+                self.record_open = false;
+                self.refocus = true;
+                None
+            }
+            "grid-record-next" | "grid-record-prev" => {
+                let _ = record::record_step(&mut self.session, id == "grid-record-next");
+                None
+            }
             _ => None,
         };
         if let Some(text) = copied.clone() {
@@ -636,6 +723,38 @@ impl GridPane {
             self.open_navigation(navigation, cx);
         }
         copied
+    }
+
+    /// 批量暂存的结果写进提示：成功说暂存了几格，拒绝说具体原因（已有暂存不变）。
+    fn report_batch(&mut self, result: Result<usize, BatchReject>) {
+        self.notice = match result {
+            Ok(count) => i18n::fill(&i18n::text(self.locale, "grid.write.staged"), &[("count", &count.to_string())]),
+            Err(reject) => reject.message(self.locale),
+        };
+    }
+
+    /// 记录视图里点开某一列的完整值：焦点移到那一格，再走网格同一条查看路径。
+    pub fn open_record_value(&mut self, column: usize, cx: &mut Context<Self>) {
+        let Some(row) = record::record_row(&self.session) else {
+            return;
+        };
+        self.session.select(row, column, false);
+        let _ = self.command("grid-value-open", cx);
+    }
+
+    /// 打开"选区设值"的编辑栏：输入一个值，Enter 后作为一批暂存到选区里的每个可见格子。
+    fn begin_batch_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cells = self.session.selection_targets();
+        let Some((row_id, column)) = cells.first().cloned() else {
+            self.notice = BatchReject::NoFocus.message(self.locale);
+            return;
+        };
+        self.edit_target = Some(EditTarget { row_id, column, original: None, cells });
+        self.edit_input.update(cx, |state, cx| state.set_value("", window, cx));
+        let handle = self.edit_input.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        self.notice.clear();
+        cx.notify();
     }
 
     /// 把外键跳转交给外壳：打开引用表的工作项，选择、滚动、暂存和查看都留在原来那一项上。
@@ -1089,7 +1208,8 @@ impl GridPane {
             return;
         }
         // 切换到另一格前先把正在输入的内容暂存，避免双击别处时悄悄丢掉已输入文本。
-        if let Some(previous) = self.edit_target.take() {
+        // 选区设值没按 Enter 就不算数，不能把整批值写到单格上。
+        if let Some(previous) = self.edit_target.take().filter(|target| target.cells.is_empty()) {
             let text = self.edit_input.read(cx).value().to_string();
             let value = match (&previous.original, text.is_empty()) {
                 (Some(None), true) => None,
@@ -1100,7 +1220,7 @@ impl GridPane {
         }
         let original = self.session.raw_value(pending.row, pending.column);
         let text = self.session.edit_text(pending.row, pending.column);
-        self.edit_target = Some(EditTarget { row_id, column: pending.column, original });
+        self.edit_target = Some(EditTarget { row_id, column: pending.column, original, cells: Vec::new() });
         self.edit_input.update(cx, |state, cx| {
             state.set_value(text, window, cx);
             if pending.select_all {
@@ -1119,6 +1239,16 @@ impl GridPane {
             return;
         };
         let text = self.edit_input.read(cx).value().to_string();
+        if !target.cells.is_empty() {
+            // 选区设值：输入原样作为文本，整批预检，任何一格不行就整批不生效。
+            let result = self.session.stage_batch(target.cells.into_iter().map(|(row_id, column)| (row_id, column, Some(text.clone()))).collect());
+            self.report_batch(result);
+            self.pending_edit = None;
+            self.refocus = true;
+            self.sync_table(cx);
+            cx.notify();
+            return;
+        }
         // 原来就是 NULL 且没有输入任何文字时保持 NULL；输入空字符串才是空字符串。
         let value = match (&target.original, text.is_empty()) {
             (Some(None), true) => None,
@@ -1187,6 +1317,34 @@ impl GridPane {
                 None
             }
             "column-copy-name" => Some(name),
+            // 隐藏和冻结只改显示；复制、导出、筛选和排序仍按全部逻辑列。
+            "column-hide" => {
+                if !self.session.hide_column(column) {
+                    self.notice = i18n::text(self.locale, "grid.column.lastVisible");
+                }
+                None
+            }
+            "column-show" => {
+                self.session.show_column(column);
+                None
+            }
+            "column-show-all" => {
+                self.session.show_all_columns();
+                None
+            }
+            "column-freeze" => {
+                self.session.freeze_to(column);
+                None
+            }
+            "column-unfreeze" => {
+                self.session.unfreeze();
+                None
+            }
+            "column-fit" => {
+                // 量字宽要用窗口的文字系统，留到下一次绘制。
+                self.pending_fit = Some(column);
+                None
+            }
             // 列头的整列复制与整列 WHERE 走单元格菜单同名动作的同一条原值读取：
             // 有预览就先按定位读取，读不到时说明原因，绝不复制空串或静默无动作。
             "column-copy" | "column-copy-where" => {
@@ -1214,7 +1372,7 @@ impl GridPane {
     /// 把表格自己的选择状态拉回会话：有焦点就是那一格，没有焦点就彻底清空。
     /// 表格为行号列留下的列模式、行模式都会消失，键盘回到单元格模式。
     fn resync_table_selection(&mut self, cx: &mut App) {
-        let focus = self.session.focus_cell().map(|(row, column)| (row, column + 1));
+        let focus = self.table_focus();
         self.table.update(cx, |state, cx| match focus {
             Some((row, column)) if state.selection() != TableSelection::Cell(row, column) => {
                 state.set_selected_cell(row, column, cx);
@@ -1224,21 +1382,32 @@ impl GridPane {
         });
     }
 
+    /// 会话焦点在表格里的位置（含行号列）；焦点列被隐藏时没有位置。
+    fn table_focus(&self) -> Option<(usize, usize)> {
+        let (row, column) = self.session.focus_cell()?;
+        self.session.logical_to_display(column).map(|display| (row, display + 1))
+    }
+
+    /// 表格列号（含行号列）→ 逻辑数据列。行号列或越界时为空。
+    fn logical_of(&self, col: usize) -> Option<usize> {
+        col.checked_sub(1).and_then(|display| self.session.display_to_logical(display))
+    }
+
     fn apply_table_event(&mut self, event: &TableEvent) {
         match event {
             TableEvent::ColumnWidthsChanged(widths) => {
                 // 拉宽列会让拖动经过的格子换位置；结束拖拽，别把新格子接进旧矩形。
                 self.press = None;
                 for (index, width) in widths.iter().enumerate() {
-                    if index == 0 {
-                        continue;
+                    // 表格只有可见列：按显示位置找回逻辑列再记宽度。
+                    if let Some(logical) = self.logical_of(index) {
+                        self.session.set_column_width(logical, f32::from(*width));
                     }
-                    self.session.set_column_width(index - 1, f32::from(*width));
                 }
             }
             TableEvent::SelectCell(row, col) | TableEvent::RightClickedCell(row, col) => {
                 // 行号列不是数据列：点它不能落到第一列数据上，只把表格的选中状态复位。
-                let Some(column) = col.checked_sub(1) else {
+                let Some(column) = self.logical_of(*col) else {
                     self.schedule_table_resync();
                     return;
                 };
@@ -1251,7 +1420,7 @@ impl GridPane {
             }
             TableEvent::DoubleClickedCell(row, col) => {
                 // 双击行号列不会打开第一列数据的编辑器；它与单击一样只复位表格状态。
-                let Some(column) = col.checked_sub(1) else {
+                let Some(column) = self.logical_of(*col) else {
                     self.schedule_table_resync();
                     return;
                 };
@@ -1265,7 +1434,7 @@ impl GridPane {
                 // 表格在此之前已经把自己切成列模式（selected_col=0）并给 # 列刷激活底色，
                 // 所以这里必须把表格选择拉回会话焦点：否则 # 整列还亮着，复制和统计却是空的，
                 // 方向键也停在列模式。
-                let Some(column) = col.checked_sub(1) else {
+                let Some(column) = self.logical_of(*col) else {
                     self.schedule_table_resync();
                     return;
                 };
@@ -1540,20 +1709,30 @@ impl GridPane {
         let sort = self.session.sort_index();
         // 表格自己的高亮也要跟着稳定身份走：重排后按会话焦点重新指到同一行。
         // 事件是异步送达的，靠 apply_table_event 的相等判断避免回声改写选择。
-        let focus = self.session.focus_cell().map(|(row, column)| (row, column + 1));
+        let focus = self.table_focus();
         // 高亮的唯一来源是会话矩形：拖选、Shift/Ctrl、键盘扩展和行头选择的每一格都由它画底色。
         let selected = self.session.selection_bounds();
         // 外键入口只在适用行出现；读取完整值的入口只在还有预览值时出现。
         let fk = self.session.has_reference();
         let unresolved = self.session.unresolved_previews();
+        // 隐藏列不交给表格画；冻结的前几列和行号列一起固定在左侧。
+        let visible = self.session.visible_columns();
+        let frozen = self.session.frozen_count();
+        let hidden = self.session.hidden_columns();
+        let has_selection = self.session.selection_count() > 0;
+        let logical_count = names.len();
         self.table.update(cx, |state, cx| {
             state.delegate_mut().locale = locale;
             state.delegate_mut().selected = selected;
             state.delegate_mut().writable = writable;
             state.delegate_mut().dirty = dirty;
             state.delegate_mut().columns = std::iter::once(("#".to_owned(), 56.0, true))
-                .chain(names.into_iter().zip(widths).map(|(name, width)| (name, width, false)))
+                .chain(visible.iter().enumerate().map(|(display, logical)| (names[*logical].clone(), widths[*logical], display < frozen)))
                 .collect();
+            state.delegate_mut().visible = visible;
+            state.delegate_mut().logical_count = logical_count;
+            state.delegate_mut().hidden = hidden;
+            state.delegate_mut().has_selection = has_selection;
             state.delegate_mut().rows = rows;
             state.delegate_mut().sort = sort;
             state.delegate_mut().fk = fk;
@@ -1620,6 +1799,8 @@ impl Render for GridPane {
         // 编辑请求在绘制阶段落地，才能创建输入状态、写入文本并把焦点交给它。
         if let Some(pending) = self.pending_edit.take() {
             self.begin_edit(pending, window, cx);
+        } else if std::mem::take(&mut self.pending_batch) {
+            self.begin_batch_edit(window, cx);
         } else if std::mem::take(&mut self.pending_viewer) {
             // 行头双击等表格事件只记下意图，绘制阶段再打开查看并读取原值。
             let _ = self.command("grid-value-open", cx);
@@ -1631,6 +1812,14 @@ impl Render for GridPane {
         let selected = self.session.selection_bounds();
         if self.table.read(cx).delegate().selected != selected {
             self.table.update(cx, |state, _| state.delegate_mut().selected = selected);
+        }
+        // 自适应列宽要用窗口量字宽：表格量完发出列宽事件，会话按逻辑列记下新宽度。
+        if let Some(logical) = self.pending_fit.take() {
+            if let Some(display) = self.session.logical_to_display(logical) {
+                self.table.update(cx, |state, cx| {
+                    let _ = state.fit_col(display + 1, window, cx);
+                });
+            }
         }
         // 行号列的事件只把表格切进列/行模式就返回了；事件回调不能重入表格，这里在绘制前
         // 按会话焦点复位，本帧的 # 列、行头和键盘模式都回到单元格选择。
@@ -1812,7 +2001,9 @@ impl Render for GridPane {
                 div().px(px(6.)).max_w(px(360.)).truncate().text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(self.notice.clone())),
             );
         }
-        tools = tools.child(grid_icon("copy-region", IconName::Copy, t("grid.value.copyValue"), entity.clone()));
+        tools = tools
+            .child(grid_icon("copy-region", IconName::Copy, t("grid.value.copyValue"), entity.clone()))
+            .child(grid_icon("grid-record-toggle", IconName::PanelRight, t("grid.record.open"), entity.clone()));
         if writable {
             tools = tools
                 .child(grid_icon("grid-insert", IconName::Plus, t("grid.action.insert"), entity.clone()))
@@ -2044,12 +2235,17 @@ impl Render for GridPane {
                             cx.notify();
                         }
                     }))
-                    .child(
+                    .child(if self.record_open {
+                        // 纵向记录视图靠右，和网格共用同一个焦点行。
                         div()
                             .flex_1()
                             .min_h(px(0.))
-                            .child(DataTable::new(&table).small().stripe(true).accessibility_label("shared-grid")),
-                    )
+                            .flex()
+                            .child(div().flex_1().min_w(px(0.)).h_full().child(DataTable::new(&table).small().stripe(true).accessibility_label("shared-grid")))
+                            .child(record::render_record(record::record_view(&self.session), locale, &p, cx.theme().mono_font_family.clone(), &entity))
+                    } else {
+                        div().flex_1().min_h(px(0.)).child(DataTable::new(&table).small().stripe(true).accessibility_label("shared-grid"))
+                    })
                     .children(stats),
             );
         } else if loading {
@@ -2082,7 +2278,13 @@ impl Render for GridPane {
                     .child(kit::empty_state(IconName::Table, heading, SharedString::from(""), &p)),
             );
         }
-        if self.edit_target.is_some() {
+        if let Some(target) = self.edit_target.as_ref() {
+            // 选区设值时编辑栏说清会写到几格。
+            let hint = if target.cells.is_empty() {
+                t("shell.shortcuts.editCell")
+            } else {
+                SharedString::from(i18n::fill(&i18n::text(locale, "grid.write.setValueHint"), &[("count", &target.cells.len().to_string())]))
+            };
             let input = self.edit_input.clone();
             let set_null = {
                 let entity = entity.clone();
@@ -2105,7 +2307,7 @@ impl Render for GridPane {
                     .border_t_1()
                     .border_color(p.accent)
                     .child(kit::icon(IconName::Pencil, 14., p.accent_text))
-                    .child(div().flex_1().child(kit::text_input("grid-edit-input", &input, t("shell.shortcuts.editCell")).small()))
+                    .child(div().flex_1().child(kit::text_input("grid-edit-input", &input, hint).small()))
                     .child(kit::tool_button("grid-set-null", None, t("grid.value.null"), set_null))
                     .child(kit::kbd("Enter", &p))
                     .child(kit::kbd("Esc", &p)),
@@ -2329,15 +2531,40 @@ struct SheetDelegate {
     fk: bool,
     /// 当前窗口里还没读到原值的预览格子数：大于零才给"读取完整值"入口。
     unresolved: usize,
+    /// 界面第 n 个数据列对应的逻辑列；隐藏列不在里面。rows 仍按逻辑列存。
+    visible: Vec<usize>,
+    /// 逻辑列总数：选区矩形和"整行点亮行号"都按逻辑列算。
+    logical_count: usize,
+    /// 被隐藏的列（逻辑列号、列名），表头菜单用它给出恢复入口。
+    hidden: Vec<(usize, String)>,
+    /// 有没有选区：空选区时"复制为"禁用。
+    has_selection: bool,
+}
+
+impl SheetDelegate {
+    /// 表格列号（含行号列）→ 逻辑数据列。
+    fn logical(&self, col_ix: usize) -> Option<usize> {
+        col_ix.checked_sub(1).and_then(|display| self.visible.get(display).copied())
+    }
+
+    /// 格子里的文字：rows 的第 0 项是行号，之后按逻辑列。
+    fn text_at(&self, row_ix: usize, col_ix: usize) -> Option<&String> {
+        let line = self.rows.get(row_ix)?;
+        if col_ix == 0 {
+            return line.first();
+        }
+        line.get(self.logical(col_ix)? + 1)
+    }
 }
 
 /// 一个格子是否落在会话选择的矩形里。列 0 是行号列，它只表示"整行被选中"：
 /// 只有矩形从首列一直盖到末列（行头选择、横跨整行拖选、全选）才点亮行号，
 /// 单格选择或只覆盖部分列的矩形不会把行号格当成第一个数据列的颜色。
+/// `column` 是逻辑数据列；None 表示行号列。隐藏列不改变矩形的逻辑范围。
 fn cell_selected(
     bounds: Option<(usize, usize, usize, usize)>,
     row_ix: usize,
-    col_ix: usize,
+    column: Option<usize>,
     data_columns: usize,
 ) -> bool {
     let Some((row_start, column_start, row_end, column_end)) = bounds else {
@@ -2346,11 +2573,10 @@ fn cell_selected(
     if row_ix < row_start || row_ix > row_end {
         return false;
     }
-    if col_ix == 0 {
+    let Some(column) = column else {
         // 整行才亮行号：首列起、末列止，并且数据列非空。
         return column_start == 0 && data_columns > 0 && column_end + 1 >= data_columns;
-    }
-    let column = col_ix - 1;
+    };
     column >= column_start && column <= column_end
 }
 
@@ -2361,6 +2587,8 @@ fn grid_shortcut(key: &str, secondary: bool, shift: bool) -> Option<&'static str
         ("c", true, false) => Some("copy-region"),
         ("a", true, false) => Some("select-all-cells"),
         ("z", true, false) => Some("grid-undo"),
+        // 粘贴只在网格拿到键盘焦点时生效；编辑栏里的 Ctrl/⌘+V 仍由文本输入自己处理。
+        ("v", true, false) => Some("grid-paste"),
         ("delete", false, _) => Some("mark-delete"),
         ("f2", false, _) => Some("edit-cell"),
         _ => None,
@@ -2370,6 +2598,7 @@ fn grid_shortcut(key: &str, secondary: bool, shift: bool) -> Option<&'static str
 /// 单元格右键菜单：(命令, 文案, 需要可写, 危险)。
 const CELL_MENU: &[(&str, &str, bool, bool)] = &[
     ("grid-value-open", "grid.value.openFull", false, false),
+    ("grid-record-toggle", "grid.record.open", false, false),
     ("copy-region", "grid.value.copyValue", false, false),
     ("copy-sql-value", "shell.shortcuts.copySqlValue", false, false),
     ("grid-copy-row", "grid.menu.copyRow", false, false),
@@ -2378,11 +2607,22 @@ const CELL_MENU: &[(&str, &str, bool, bool)] = &[
     ("grid-copy-row-where", "grid.menu.copyRowWhere", false, false),
     ("grid-copy-column-where", "grid.menu.copyColumnWhere", false, false),
     ("", "", false, false),
+    // 复制为各种格式：一组平铺的条目，空选区时禁用。
+    ("grid-copy-as-tsv", "grid.copyAs.tsv", false, false),
+    ("grid-copy-as-csv", "grid.copyAs.csv", false, false),
+    ("grid-copy-as-json", "grid.copyAs.json", false, false),
+    ("grid-copy-as-markdown", "grid.copyAs.markdown", false, false),
+    ("grid-copy-as-insert", "grid.copyAs.insert", false, false),
+    ("", "", false, false),
     ("grid-filter-value", "grid.menu.filterByValue", false, false),
     ("select-all-cells", "grid.menu.selectAll", false, false),
     ("", "", false, false),
     ("edit-cell", "shell.shortcuts.editCell", true, false),
     ("grid-set-null", "grid.value.null", true, false),
+    ("grid-paste", "grid.write.paste", true, false),
+    ("grid-selection-set", "grid.write.setValue", true, false),
+    ("grid-selection-null", "grid.write.setNull", true, false),
+    ("grid-clone-row", "grid.write.clone", true, false),
     ("grid-insert", "grid.action.insert", true, false),
     ("mark-delete", "grid.menu.markDelete", true, true),
 ];
@@ -2401,6 +2641,12 @@ const COLUMN_MENU: &[(&str, &str)] = &[
     ("column-copy-where", "grid.menu.copyColumnWhere"),
     ("column-copy-name", "grid.menu.copyColumnName"),
     ("", ""),
+    ("column-hide", "grid.column.hide"),
+    ("column-show-all", "grid.column.showAll"),
+    ("column-freeze", "grid.column.freeze"),
+    ("column-unfreeze", "grid.column.unfreeze"),
+    ("column-fit", "grid.column.fit"),
+    ("", ""),
     ("column-clear-filters", "grid.menu.clearFilters"),
 ];
 
@@ -2411,6 +2657,7 @@ fn shortcut_hint(id: &str) -> Option<&'static str> {
         "copy-sql-value" => if mac { "⇧⌘C" } else { "Ctrl+Shift+C" },
         "select-all-cells" => if mac { "⌘A" } else { "Ctrl+A" },
         "grid-undo" => if mac { "⌘Z" } else { "Ctrl+Z" },
+        "grid-paste" => if mac { "⌘V" } else { "Ctrl+V" },
         "edit-cell" => "F2",
         "mark-delete" => "Delete",
         _ => return None,
@@ -2425,15 +2672,42 @@ fn menu_label(locale: Locale, key: &str, id: &str) -> SharedString {
     }
 }
 
-pub(crate) fn cell_menu(
-    menu: PopupMenu,
-    owner: Option<gpui_kit::WeakEntity<GridPane>>,
-    locale: Locale,
-    writable: bool,
-    dirty: bool,
-    fk: bool,
-    unresolved: usize,
-) -> PopupMenu {
+/// 单元格菜单需要的网格状态。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CellMenuState {
+    pub writable: bool,
+    pub dirty: bool,
+    pub fk: bool,
+    pub unresolved: usize,
+    pub has_selection: bool,
+}
+
+/// 单元格菜单条目是否禁用：写入类在只读网格上禁用（原因沿用工具栏的只读说明），
+/// "复制为"在空选区时禁用。
+fn cell_item_disabled(id: &str, needs_write: bool, state: CellMenuState) -> bool {
+    (needs_write && !state.writable) || (CopyFormat::from_command(id).is_some() && !state.has_selection)
+}
+
+/// 表头菜单需要的状态：当前排序方向、能不能再藏一列、有没有冻结、哪些列被藏了。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ColumnMenuState {
+    sorted: Option<bool>,
+    can_hide: bool,
+    frozen: bool,
+    hidden: Vec<(usize, String)>,
+}
+
+/// 表头菜单条目是否禁用：只剩一列可见时不能再藏；没有冻结时不能取消；没有隐藏列时不用"显示全部"。
+fn column_item_disabled(id: &str, state: &ColumnMenuState) -> bool {
+    match id {
+        "column-hide" => !state.can_hide,
+        "column-unfreeze" => !state.frozen,
+        "column-show-all" => state.hidden.is_empty(),
+        _ => false,
+    }
+}
+
+pub(crate) fn cell_menu(menu: PopupMenu, owner: Option<gpui_kit::WeakEntity<GridPane>>, locale: Locale, state: CellMenuState) -> PopupMenu {
     let mut menu = menu;
     for (id, key, needs_write, _danger) in CELL_MENU.iter().copied() {
         if id.is_empty() {
@@ -2442,7 +2716,7 @@ pub(crate) fn cell_menu(
         }
         let item_owner = owner.clone();
         menu = menu.item(
-            PopupMenuItem::new(menu_label(locale, key, id)).disabled(needs_write && !writable).on_click(move |_, _, cx| {
+            PopupMenuItem::new(menu_label(locale, key, id)).disabled(cell_item_disabled(id, needs_write, state)).on_click(move |_, _, cx| {
                 if let Some(owner) = item_owner.as_ref().and_then(|owner| owner.upgrade()) {
                     owner.update(cx, |pane, cx| {
                         let _ = pane.command(id, cx);
@@ -2452,7 +2726,7 @@ pub(crate) fn cell_menu(
             }),
         );
         // 外键入口只在这一列真的属于外键、并且这一行已定位时出现。
-        if id == "grid-value-open" && fk {
+        if id == "grid-value-open" && state.fk {
             for (fk_id, fk_key) in [("grid-fk-jump", "grid.fk.jump"), ("grid-fk-select", "grid.fk.select")] {
                 let owner = owner.clone();
                 menu = menu.item(PopupMenuItem::new(menu_label(locale, fk_key, fk_id)).on_click(move |_, _, cx| {
@@ -2466,7 +2740,7 @@ pub(crate) fn cell_menu(
             }
         }
         // 还有预览值时给"读取完整值"入口：导出和 WHERE 都用读到的同一个原值。
-        if id == "grid-value-open" && unresolved > 0 {
+        if id == "grid-value-open" && state.unresolved > 0 {
             let owner = owner.clone();
             menu = menu.item(PopupMenuItem::new(menu_label(locale, "grid.action.readFull", "grid-full-values")).on_click(
                 move |_, _, cx| {
@@ -2480,7 +2754,7 @@ pub(crate) fn cell_menu(
             ));
         }
     }
-    if dirty {
+    if state.dirty {
         let owner = owner.clone();
         menu = menu.separator().item(PopupMenuItem::new(menu_label(locale, "grid.menu.undo", "grid-undo")).on_click(move |_, _, cx| {
             if let Some(owner) = owner.as_ref().and_then(|owner| owner.upgrade()) {
@@ -2494,22 +2768,34 @@ pub(crate) fn cell_menu(
     menu
 }
 
-fn column_menu(menu: PopupMenu, owner: Option<gpui_kit::WeakEntity<GridPane>>, locale: Locale, column: usize, sorted: Option<bool>) -> PopupMenu {
+fn column_menu(menu: PopupMenu, owner: Option<gpui_kit::WeakEntity<GridPane>>, locale: Locale, column: usize, state: &ColumnMenuState) -> PopupMenu {
     let mut menu = menu;
     for (id, key) in COLUMN_MENU.iter().copied() {
         if id.is_empty() {
             menu = menu.separator();
             continue;
         }
-        let owner = owner.clone();
+        let item_owner = owner.clone();
         // 当前排序方向在菜单里也标出来：菜单和表头不能给出两种说法。
-        let current = matches!((id, sorted), ("column-sort-asc", Some(false)) | ("column-sort-desc", Some(true)));
+        let current = matches!((id, state.sorted), ("column-sort-asc", Some(false)) | ("column-sort-desc", Some(true)));
         let label = if current { SharedString::from(format!("✓ {}", i18n::text(locale, key))) } else { menu_label(locale, key, id) };
-        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-            if let Some(owner) = owner.as_ref().and_then(|owner| owner.upgrade()) {
+        menu = menu.item(PopupMenuItem::new(label).disabled(column_item_disabled(id, state)).on_click(move |_, _, cx| {
+            if let Some(owner) = item_owner.as_ref().and_then(|owner| owner.upgrade()) {
                 owner.update(cx, |pane, cx| pane.column_command(column, id, cx));
             }
         }));
+        // 被隐藏的列逐个列出，可以只恢复其中一列。
+        if id == "column-show-all" {
+            for (hidden, name) in state.hidden.iter().cloned() {
+                let owner = owner.clone();
+                let label = i18n::fill(&i18n::text(locale, "grid.column.show"), &[("name", &name)]);
+                menu = menu.item(PopupMenuItem::new(SharedString::from(label)).on_click(move |_, _, cx| {
+                    if let Some(owner) = owner.as_ref().and_then(|owner| owner.upgrade()) {
+                        owner.update(cx, |pane, cx| pane.column_command(hidden, "column-show", cx));
+                    }
+                }));
+            }
+        }
     }
     menu
 }
@@ -2526,7 +2812,8 @@ impl TableDelegate for SheetDelegate {
 
     fn column(&self, col_ix: usize, _: &App) -> Column {
         let (name, width, fixed) = self.columns.get(col_ix).cloned().unwrap_or_else(|| (" ".to_owned(), 120.0, false));
-        let mut column = Column::new(format!("c{col_ix}"), name).width(px(width)).resizable(!fixed);
+        // 行号列不能拉宽；冻结的数据列仍然能拉。宽度上限和会话里记宽度的上限一致。
+        let mut column = Column::new(format!("c{col_ix}"), name).width(px(width)).resizable(col_ix != 0).max_width(px(640.));
         // 第 0 列是行号列，不是数据列：整列选择在数据列之外没有意义。声明成不可选，
         // 表头点击就不会把表格切进列模式，也不会给 # 列和它的格子刷激活底色。
         if col_ix == 0 {
@@ -2539,17 +2826,18 @@ impl TableDelegate for SheetDelegate {
     }
 
     fn render_td(&mut self, row_ix: usize, col_ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
-        let text = self.rows.get(row_ix).and_then(|line| line.get(col_ix)).cloned().unwrap_or_default();
+        let text = self.text_at(row_ix, col_ix).cloned().unwrap_or_default();
         let null = text == "NULL" || text == i18n::text(Locale::ZhCn, "grid.value.null") || text == i18n::text(Locale::En, "grid.value.null");
         let p = Palette::of(cx);
         // 表格的 SelectCell 不带修饰键和拖拽阶段，直接在格子上取鼠标事件：该格里按下、
         // 拖到另一格、松开都带着真实行列，不需要按像素反推行号。
         // 行号格不是数据格：按下、拖动都不改选择，也不会把第一列数据顺手选中。
-        let owner = self.owner.clone().filter(|_| col_ix > 0);
-        let column = col_ix.saturating_sub(1);
+        let logical = self.logical(col_ix);
+        let owner = self.owner.clone().filter(|_| logical.is_some());
+        let column = logical.unwrap_or(0);
         // 选中的每一格自己画底色，不是只让焦点那格亮：矩形里没有画的格子会让高亮和
         // 复制/统计说的范围对不上。行号列（col 0）只在整行被选中时亮，单格选择不点亮它。
-        let selected = cell_selected(self.selected, row_ix, col_ix, self.columns.len().saturating_sub(1));
+        let selected = cell_selected(self.selected, row_ix, logical, self.logical_count);
         div()
             .id(gpui_kit::ElementId::named_usize(format!("grid-cell-{row_ix}"), col_ix))
             // 测试按住真实坐标点击/拖拽时用它找到格子；只在测试/debug+test-support 记录。
@@ -2609,11 +2897,11 @@ impl TableDelegate for SheetDelegate {
             .truncate()
             .child(SharedString::from(name))
             .test_support();
-        if col_ix == 0 {
+        let Some(logical) = self.logical(col_ix) else {
             return header.into_any_element();
-        }
+        };
         // 表头自己带方向标记：焦点移到工具栏或别的格子后，仍然看得出按哪一列、哪个方向排的。
-        let sorted = self.sort.filter(|(index, _)| *index + 1 == col_ix).map(|(_, descending)| descending);
+        let sorted = self.sort.filter(|(index, _)| *index == logical).map(|(_, descending)| descending);
         let header = match sorted {
             Some(descending) => header
                 .child(div().flex_none().px(px(4.)).text_size(px(11.)).child(SharedString::from(if descending { "↓" } else { "↑" }))),
@@ -2621,17 +2909,48 @@ impl TableDelegate for SheetDelegate {
         };
         let owner = self.owner.clone();
         let locale = self.locale;
+        let state = ColumnMenuState {
+            sorted,
+            can_hide: self.visible.len() > 1,
+            frozen: self.columns.iter().skip(1).any(|(_, _, fixed)| *fixed),
+            hidden: self.hidden.clone(),
+        };
         header
-            .context_menu(move |menu, _, _| column_menu(menu, owner.clone(), locale, col_ix - 1, sorted))
+            .context_menu(move |menu, _, _| column_menu(menu, owner.clone(), locale, logical, &state))
             .into_any_element()
     }
 
     fn context_menu(&mut self, _row_ix: usize, menu: PopupMenu, _: &mut Window, _: &mut Context<TableState<Self>>) -> PopupMenu {
-        cell_menu(menu, self.owner.clone(), self.locale, self.writable, self.dirty, self.fk, self.unresolved)
+        let state = CellMenuState { writable: self.writable, dirty: self.dirty, fk: self.fk, unresolved: self.unresolved, has_selection: self.has_selection };
+        cell_menu(menu, self.owner.clone(), self.locale, state)
     }
 
     fn cell_label(&self, row_ix: usize, col_ix: usize, _: &App) -> Option<SharedString> {
-        self.rows.get(row_ix).and_then(|line| line.get(col_ix)).map(|text| SharedString::from(text.clone()))
+        self.text_at(row_ix, col_ix).map(|text| SharedString::from(text.clone()))
+    }
+
+    /// 自适应列宽：用表格正文的字体量已加载行里这一列的文字和列名，取最宽的。
+    /// 表格再加上格子内边距，并夹在列的最大宽度里。
+    fn fit_column(&mut self, col_ix: usize, window: &mut Window, cx: &mut Context<TableState<Self>>) -> Option<Pixels> {
+        let logical = self.logical(col_ix)?;
+        let font = gpui_kit::Font { family: cx.theme().font_family.clone(), ..Default::default() };
+        let size = window.rem_size() * 0.875;
+        let color = cx.theme().foreground;
+        let mut texts: Vec<&str> = self.rows.iter().filter_map(|line| line.get(logical + 1)).map(String::as_str).collect();
+        // 只量字数最多的一批候选，大结果也不会逐行排版。
+        texts.sort_by_key(|text| std::cmp::Reverse(text.chars().count()));
+        texts.truncate(64);
+        let header = self.columns.get(col_ix).map(|column| column.0.clone()).unwrap_or_default();
+        let widest = std::iter::once(header.as_str())
+            .chain(texts)
+            .map(|text| {
+                let line = text.lines().next().unwrap_or("").to_owned();
+                let run = gpui_kit::TextRun { len: line.len(), font: font.clone(), color, background_color: None, underline: None, strikethrough: None };
+                window.text_system().shape_line(SharedString::from(line), size, &[run], None).width
+            })
+            .fold(px(0.), Pixels::max);
+        // 表头还要放排序箭头。
+        Some(widest + px(16.))
     }
 
     fn has_more(&self, _: &App) -> bool {
@@ -4748,5 +5067,390 @@ mod pane_tests {
             "id",
             cx,
         );
+    }
+}
+
+/// 结果复制、列显示、记录视图和批量写入在真实窗口里的行为（R2/R3/R4/R13）。
+#[cfg(test)]
+mod workbench_tests {
+    use super::*;
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{AnyWindowHandle, Bounds, Point, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, size};
+
+    fn target() -> GridTarget {
+        GridTarget {
+            connection_id: "notes".to_owned(),
+            connection_name: "笔记".to_owned(),
+            database: "main".to_owned(),
+            schema: String::new(),
+            table: "people".to_owned(),
+            engine: "sqlite".to_owned(),
+            environment: "dev".to_owned(),
+        }
+    }
+
+    fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<GridPane>) {
+        let dir = std::env::temp_dir().join(format!("rillsql-grid-workbench-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(1100.), px(720.)) };
+            gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |window, cx| cx.new(|cx| GridPane::new(services, window, cx)),
+            )
+            .expect("grid pane")
+        })
+    }
+
+    /// people(id 主键, name, note)：两行，含一个 NULL 和一个带逗号与引号的文本。
+    fn plant(pane: &Entity<GridPane>, cx: &mut App) {
+        pane.update(cx, |pane, cx| {
+            pane.plant_writable(
+                target(),
+                vec![("id", "integer"), ("name", "text"), ("note", "text")],
+                vec![vec![Some("1"), Some("a,\"b\""), None], vec![Some("2"), Some("乙"), Some("x")], vec![Some("3"), Some("丙"), Some("y")]],
+                "id",
+                cx,
+            );
+        });
+    }
+
+    fn clipboard(cx: &mut TestAppContext) -> Option<String> {
+        cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+    }
+
+    fn header_names(pane: &Entity<GridPane>, cx: &mut TestAppContext) -> Vec<String> {
+        cx.update(|cx| pane.read(cx).table.read(cx).delegate().columns.iter().map(|(name, _, _)| name.clone()).collect())
+    }
+
+    #[gpui_kit::test]
+    fn copy_as_writes_each_format_or_keeps_the_clipboard_with_a_reason(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("原内容".to_owned())));
+        // 空选区：剪贴板不动，给出原因；菜单里这些条目是禁用的。
+        let notice = cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                pane.session.clear_selection();
+                assert_eq!(pane.command("grid-copy-as-csv", cx), None);
+                pane.notice.clone()
+            })
+        });
+        assert_eq!(notice, i18n::text(Locale::ZhCn, "grid.copyAs.empty"));
+        assert_eq!(clipboard(cx).as_deref(), Some("原内容"));
+        let empty = CellMenuState { writable: true, has_selection: false, ..CellMenuState::default() };
+        for format in CopyFormat::ALL {
+            assert!(cell_item_disabled(format.command(), false, empty), "{format:?}");
+            assert!(!cell_item_disabled(format.command(), false, CellMenuState { has_selection: true, ..empty }), "{format:?}");
+        }
+        // 2 行 × 3 列：逐格式核对剪贴板文本。
+        let expected = [
+            ("grid-copy-as-tsv", "id\tname\tnote\n1\t\"a,\"\"b\"\"\"\tNULL\n2\t乙\tx"),
+            ("grid-copy-as-csv", "\"id\",\"name\",\"note\"\r\n\"1\",\"a,\"\"b\"\"\",NULL\r\n\"2\",\"乙\",\"x\""),
+            ("grid-copy-as-json", "[{\"id\":\"1\",\"name\":\"a,\\\"b\\\"\",\"note\":null},{\"id\":\"2\",\"name\":\"乙\",\"note\":\"x\"}]"),
+            ("grid-copy-as-markdown", "| id | name | note |\r\n| --- | --- | --- |\r\n| 1 | a,\"b\" | NULL |\r\n| 2 | 乙 | x |"),
+            ("grid-copy-as-insert", "INSERT INTO \"people\" (\"id\", \"name\", \"note\") VALUES (1, 'a,\"b\"', NULL);\r\nINSERT INTO \"people\" (\"id\", \"name\", \"note\") VALUES (2, '乙', 'x');"),
+        ];
+        for (id, text) in expected {
+            cx.update(|cx| {
+                pane.update(cx, |pane, cx| {
+                    pane.session.select(0, 0, false);
+                    pane.session.select(1, 2, true);
+                    assert_eq!(pane.command(id, cx).as_deref(), Some(text), "{id}");
+                })
+            });
+            assert_eq!(clipboard(cx).as_deref(), Some(text), "{id}");
+        }
+        // 未定位的查询结果：INSERT 用占位表名，并告诉用户。
+        let notice = cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                let sheet = QuerySheet { sql: "select name from a join b on a.id = b.id".into(), columns: vec!["name".into()], rows: vec![vec![Some("甲".into())]], truncated: false, full_count: Some(1) };
+                pane.show_query(target(), sheet, cx);
+                pane.session.select(0, 0, false);
+                assert_eq!(pane.command("grid-copy-as-insert", cx).as_deref(), Some("INSERT INTO \"table_name\" (\"name\") VALUES ('甲');"));
+                pane.notice.clone()
+            })
+        });
+        assert_eq!(notice, i18n::text(Locale::ZhCn, "grid.copyAs.placeholder"));
+    }
+
+    #[gpui_kit::test]
+    fn hidden_columns_are_not_drawn_but_stay_in_copies(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert_eq!(header_names(&pane, cx), vec!["#", "id", "name", "note"]);
+        {
+            let mut visual = VisualTestContext::from_window(window, cx);
+            assert!(visual.debug_bounds("grid-th-3").is_some());
+        }
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.column_command(1, "column-hide", cx)));
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        assert_eq!(header_names(&pane, cx), vec!["#", "id", "note"], "隐藏的列不再画出来");
+        {
+            let mut visual = VisualTestContext::from_window(window, cx);
+            assert!(visual.debug_bounds("grid-th-3").is_none());
+            // 第 2 个数据列现在画的是 note 列的值。
+            assert!(visual.debug_bounds("grid-cell-0-2").is_some());
+        }
+        let row = cx.update(|cx| pane.update(cx, |pane, cx| {
+            pane.session.select(1, 0, false);
+            pane.command("grid-copy-row", cx)
+        }));
+        assert_eq!(row.as_deref(), Some("2\t乙\tx"), "复制整行仍包含隐藏列");
+        // 表格上的点击按显示位置换回逻辑列：点第 2 个数据列选中的是 note。
+        cx.update(|cx| pane.update(cx, |pane, _| pane.apply_table_event(&TableEvent::SelectCell(0, 2))));
+        assert_eq!(cx.update(|cx| pane.read(cx).session.focus_cell()), Some((0, 2)));
+        // 只剩一列可见时"隐藏列"禁用。
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.column_command(2, "column-hide", cx)));
+        let state = cx.update(|cx| {
+            let delegate = pane.read(cx).table.read(cx).delegate();
+            ColumnMenuState { sorted: None, can_hide: delegate.visible.len() > 1, frozen: false, hidden: delegate.hidden.clone() }
+        });
+        assert!(column_item_disabled("column-hide", &state));
+        assert!(!column_item_disabled("column-show-all", &state));
+        assert_eq!(state.hidden.len(), 2);
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.column_command(0, "column-show-all", cx)));
+        assert_eq!(header_names(&pane, cx), vec!["#", "id", "name", "note"]);
+    }
+
+    #[gpui_kit::test]
+    fn frozen_columns_stay_visible_while_scrolling_right(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let names: Vec<String> = (0..12).map(|index| format!("c{index}")).collect();
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let columns: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), "text")).collect();
+                let values: Vec<Vec<Option<&str>>> = (0..3).map(|_| names.iter().map(|name| Some(name.as_str())).collect()).collect();
+                pane.plant_writable(target(), columns, values, "c0", cx);
+                pane.column_command(1, "column-freeze", cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let fixed = cx.update(|cx| pane.read(cx).table.read(cx).delegate().columns.iter().map(|(_, _, fixed)| *fixed).collect::<Vec<_>>());
+        assert_eq!(&fixed[..4], &[true, true, true, false], "行号列和前两个数据列固定在左侧");
+        let (first, second) = {
+            let mut visual = VisualTestContext::from_window(window, cx);
+            (visual.debug_bounds("grid-th-1").expect("第 1 列"), visual.debug_bounds("grid-th-2").expect("第 2 列"))
+        };
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.table.update(cx, |state, cx| state.scroll_to_col(12, cx))));
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        let mut visual = VisualTestContext::from_window(window, cx);
+        let last = visual.debug_bounds("grid-th-12").expect("横向滚动到最后一列");
+        assert!(last.origin.x < px(1100.), "{last:?}");
+        assert_eq!(visual.debug_bounds("grid-th-1"), Some(first), "冻结的第 1 列不随横向滚动移动");
+        assert_eq!(visual.debug_bounds("grid-th-2"), Some(second), "冻结的第 2 列不随横向滚动移动");
+        let third = visual.debug_bounds("grid-th-3");
+        assert!(third.is_none_or(|bounds| bounds.origin.x != second.origin.x + second.size.width), "未冻结的列滚走了：{third:?}");
+    }
+
+    #[gpui_kit::test]
+    fn auto_fit_widens_a_long_text_column_within_the_limit(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let long = "很长的一段备注文本，需要把列拉宽才能完整显示".repeat(2);
+        let longest = "超".repeat(200);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.plant_writable(
+                    target(),
+                    vec![("id", "integer"), ("note", "text"), ("huge", "text")],
+                    vec![vec![Some("1"), Some(long.as_str()), Some(longest.as_str())], vec![Some("2"), Some("短"), Some("短")]],
+                    "id",
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let before = cx.update(|cx| pane.read(cx).session.column_width(1));
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.column_command(1, "column-fit", cx)));
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.run_until_parked();
+        let after = cx.update(|cx| pane.read(cx).session.column_width(1));
+        assert!(after > before + 100.0, "长文本列应变宽：{before} -> {after}");
+        assert!(after <= 640.0);
+        let measured = cx.update_window(window, |_, window, cx| {
+            let font = gpui_kit::Font { family: cx.theme().font_family.clone(), ..Default::default() };
+            let run = gpui_kit::TextRun { len: long.len(), font, color: cx.theme().foreground, background_color: None, underline: None, strikethrough: None };
+            f32::from(window.text_system().shape_line(SharedString::from(long.clone()), window.rem_size() * 0.875, &[run], None).width)
+        });
+        assert!(after >= measured.unwrap(), "列宽要放得下已加载行里最长的值");
+        // 超过上限的值只拉到上限。
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.column_command(2, "column-fit", cx)));
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| pane.read(cx).session.column_width(2)), 640.0);
+    }
+
+    #[gpui_kit::test]
+    fn record_view_shows_the_focused_row_and_disables_the_ends(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            pane.update(cx, |pane, cx| {
+                pane.session.select(1, 1, false);
+                let _ = pane.command("grid-record-toggle", cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        {
+            let mut visual = VisualTestContext::from_window(window, cx);
+            assert!(visual.debug_bounds("grid-record").is_some(), "记录视图画在网格右侧");
+            for selector in ["grid-record-field-0", "grid-record-field-1", "grid-record-field-2"] {
+                assert!(visual.debug_bounds(selector).is_some(), "列出每一列：{selector}");
+            }
+        }
+        let view = cx.update(|cx| record::record_view(&pane.read(cx).session).unwrap());
+        assert_eq!(view.fields[1].label, "乙");
+        cx.update(|cx| pane.update(cx, |pane, cx| {
+            let _ = pane.command("grid-record-next", cx);
+        }));
+        let view = cx.update(|cx| record::record_view(&pane.read(cx).session).unwrap());
+        assert_eq!(view.fields[1].label, "丙");
+        assert!(!view.can_next, "最后一行时下一行禁用");
+        // 网格的焦点跟着走：高亮和记录视图是同一行。
+        assert_eq!(cx.update(|cx| pane.read(cx).session.focus_cell()), Some((2, 1)));
+        cx.update(|cx| pane.update(cx, |pane, cx| {
+            let _ = pane.command("grid-record-close", cx);
+        }));
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        let mut visual = VisualTestContext::from_window(window, cx);
+        assert!(visual.debug_bounds("grid-record").is_none());
+    }
+
+    #[gpui_kit::test]
+    fn ctrl_v_pastes_tsv_only_from_the_grid_focus_and_respects_readonly(cx: &mut TestAppContext) {
+        assert_eq!(grid_shortcut("v", true, false), Some("grid-paste"));
+        assert_eq!(grid_shortcut("v", false, false), None);
+        assert_eq!(grid_shortcut("v", true, true), None, "Ctrl+Shift+V 不占用");
+        let (window, pane) = open(cx);
+        cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("甲\t一\n乙\t二".to_owned())));
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            pane.update(cx, |pane, _| pane.session.select(0, 1, false));
+            let handle = pane.read(cx).focus_handle();
+            window.focus(&handle, cx);
+            window.press("secondary-v", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let (staged, notice) = cx.update(|cx| (pane.read(cx).session.staged_count(), pane.read(cx).notice.clone()));
+        assert_eq!(staged, 4, "{notice}");
+        assert!(!pane_preview_open(&pane, cx), "粘贴只暂存，不打开预览、不写库");
+        // 一次 Ctrl+Z 撤销整批。
+        cx.update_window(window, |_, window, cx| window.press("secondary-z", cx)).unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| pane.read(cx).session.staged_count()), 0);
+        // 焦点在最后一列：整次拒绝并说明越界，暂存数量不变。
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, _| pane.session.select(0, 2, false));
+            window.press("secondary-v", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let (staged, notice) = cx.update(|cx| (pane.read(cx).session.staged_count(), pane.read(cx).notice.clone()));
+        assert_eq!(staged, 0);
+        assert_eq!(notice, i18n::text(Locale::ZhCn, "grid.batch.outOfRange"));
+        // 只读结果：沿用只读原因，什么都不暂存；菜单里三项写入都禁用。
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let sheet = QuerySheet { sql: "select count(*) from people".into(), columns: vec!["n".into()], rows: vec![vec![Some("3".into())]], truncated: false, full_count: Some(1) };
+                pane.show_query(target(), sheet, cx);
+                pane.session.select(0, 0, false);
+            });
+            window.press("secondary-v", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let (dirty, notice) = cx.update(|cx| (pane.read(cx).session.uncommitted(), pane.read(cx).notice.clone()));
+        assert!(!dirty);
+        assert!(notice.contains(&i18n::text(Locale::ZhCn, "grid.readonly.aggregate")), "{notice}");
+        let readonly = CellMenuState { writable: false, has_selection: true, ..CellMenuState::default() };
+        for id in ["grid-paste", "grid-clone-row", "grid-selection-set", "grid-selection-null"] {
+            let needs_write = CELL_MENU.iter().find(|item| item.0 == id).map(|item| item.2).unwrap();
+            assert!(cell_item_disabled(id, needs_write, readonly), "{id}");
+        }
+    }
+
+    /// 编辑栏里的 Ctrl/⌘+V 仍由文本输入自己粘贴，网格不接管，也不产生批量暂存。
+    #[gpui_kit::test]
+    fn ctrl_v_inside_the_edit_bar_pastes_into_the_input_not_the_grid(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("粘贴值".to_owned())));
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            pane.update(cx, |pane, _| pane.session.select(0, 1, false));
+            let handle = pane.read(cx).focus_handle();
+            window.focus(&handle, cx);
+            window.press("f2", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        assert!(cx.update(|cx| pane.read(cx).editing()), "F2 打开编辑栏");
+        cx.update_window(window, |_, window, cx| {
+            window.press("secondary-a", cx);
+            window.press("secondary-v", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let (value, staged, dirty) = cx.update(|cx| (pane.read(cx).edit_value(cx), pane.read(cx).session.staged_count(), pane.read(cx).session.uncommitted()));
+        assert_eq!(value, "粘贴值");
+        assert_eq!(staged, 0);
+        assert!(!dirty, "输入阶段不进入暂存");
+    }
+
+    fn pane_preview_open(pane: &Entity<GridPane>, cx: &mut TestAppContext) -> bool {
+        cx.update(|cx| pane.read(cx).preview_open())
+    }
+
+    #[gpui_kit::test]
+    fn set_value_on_selection_stages_one_batch_from_the_edit_bar(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            pane.update(cx, |pane, cx| {
+                pane.session.select(0, 1, false);
+                pane.session.select(2, 2, true);
+                let _ = pane.command("grid-selection-set", cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(cx.update(|cx| pane.read(cx).editing()), "选区设值打开编辑栏");
+        cx.update_window(window, |_, window, cx| {
+            window.input("统一", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let (staged, editing) = cx.update(|cx| (pane.read(cx).session.staged_count(), pane.read(cx).editing()));
+        assert_eq!(staged, 6);
+        assert!(!editing);
+        assert_eq!(cx.update(|cx| pane.read(cx).cell(1, 2)), "统一");
+        // 复制为新行：主键留空的一条 INSERT。
+        cx.update(|cx| pane.update(cx, |pane, cx| {
+            let _ = pane.command("grid-undo", cx);
+            pane.session.select(1, 1, false);
+            let _ = pane.command("grid-clone-row", cx);
+            let sql = pane.preview(cx).unwrap();
+            assert_eq!(sql, vec!["INSERT INTO \"people\" (\"name\", \"note\") VALUES ('乙', 'x')".to_owned()]);
+            pane.cancel_preview(cx);
+        }));
+        assert_eq!(cx.update(|cx| pane.read(cx).notice.clone()), i18n::text(Locale::ZhCn, "grid.write.cloned"));
     }
 }

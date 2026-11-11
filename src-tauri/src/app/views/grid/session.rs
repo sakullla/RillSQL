@@ -2,6 +2,7 @@
 //! 查找、排序、筛选和提交语句复用 grid 领域；这里只区分已读取窗口、选择和暂存。
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 use crate::grid::commands::{ChangeArg, ColumnDto, CommitDto, PageDto, PageRequest, SchemaDto, SortArg, TableRef, ValueArg};
 use crate::grid::{delete_sql, insert_sql, locate_sheet, qualified_name, quote_ident, sql_cell, update_sql, value_family, Cell, Column, Engine, TableSchema, ValueFamily};
@@ -167,6 +168,93 @@ struct Overlay {
     message: String,
     change_id: Option<String>,
     kind: &'static str,
+    /// 同一次批量暂存（粘贴、选区设值）共用的编号；撤销时整批一起回退。
+    batch: Option<u64>,
+}
+
+/// "复制为"支持的格式。除带表头的 TSV 外都复用 export::write 的写法。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyFormat {
+    TsvHeader,
+    Csv,
+    Json,
+    Markdown,
+    Insert,
+}
+
+impl CopyFormat {
+    pub const ALL: [CopyFormat; 5] = [CopyFormat::TsvHeader, CopyFormat::Csv, CopyFormat::Json, CopyFormat::Markdown, CopyFormat::Insert];
+
+    pub fn command(self) -> &'static str {
+        match self {
+            CopyFormat::TsvHeader => "grid-copy-as-tsv",
+            CopyFormat::Csv => "grid-copy-as-csv",
+            CopyFormat::Json => "grid-copy-as-json",
+            CopyFormat::Markdown => "grid-copy-as-markdown",
+            CopyFormat::Insert => "grid-copy-as-insert",
+        }
+    }
+
+    pub fn label_key(self) -> &'static str {
+        match self {
+            CopyFormat::TsvHeader => "grid.copyAs.tsv",
+            CopyFormat::Csv => "grid.copyAs.csv",
+            CopyFormat::Json => "grid.copyAs.json",
+            CopyFormat::Markdown => "grid.copyAs.markdown",
+            CopyFormat::Insert => "grid.copyAs.insert",
+        }
+    }
+
+    pub fn from_command(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|format| format.command() == id)
+    }
+}
+
+/// 复制出来的文本；placeholder 为真表示 INSERT 用了占位表名，界面要告诉用户。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopiedText {
+    pub text: String,
+    pub placeholder: bool,
+}
+
+/// 复制停下的原因：没有选区，或选区里还有只读到预览、拿不到原值的格子。
+/// 两种情况调用方都不写剪贴板。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyBlock {
+    Empty,
+    Missing,
+}
+
+/// 一次批量暂存被整体拒绝的原因。拒绝时不写任何覆盖层，已有暂存保持不变。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatchReject {
+    /// 剪贴板为空或不是文本。
+    Empty,
+    /// 没有焦点格或选区，不知道从哪里开始。
+    NoFocus,
+    /// 超出可见列或已加载行；不会自动新增行。
+    OutOfRange,
+    /// 整个网格只读，原因沿用现有的只读文案。
+    Readonly(String),
+    /// 目标区域含主键或自增列。
+    KeyColumn(String),
+    /// 某一格被现有写入门控拒绝（不可写、未定位或校验失败）。
+    Blocked { column: String, reason: String },
+}
+
+impl BatchReject {
+    pub fn message(&self, locale: Locale) -> String {
+        match self {
+            BatchReject::Empty => i18n::text(locale, "grid.batch.empty"),
+            BatchReject::NoFocus => i18n::text(locale, "grid.batch.noFocus"),
+            BatchReject::OutOfRange => i18n::text(locale, "grid.batch.outOfRange"),
+            BatchReject::Readonly(reason) => i18n::fill(&i18n::text(locale, "grid.batch.readonly"), &[("reason", reason)]),
+            BatchReject::KeyColumn(column) => i18n::fill(&i18n::text(locale, "grid.batch.keyColumn"), &[("column", column)]),
+            BatchReject::Blocked { column, reason } => {
+                i18n::fill(&i18n::text(locale, "grid.batch.blocked"), &[("column", column), ("reason", reason)])
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -373,6 +461,14 @@ pub struct SharedGrid {
     seq: u64,
     pub token: u64,
     sql: String,
+    /// 只影响显示的隐藏列（按列名）；复制、导出、筛选和排序仍按全部逻辑列。
+    hidden: BTreeSet<String>,
+    /// 冻结到哪一列（按列名）；它和它左边的可见列固定在左侧。
+    frozen: Option<String>,
+    /// 批量暂存替换掉的旧覆盖层：撤销整批时把它们放回去。
+    batches: Vec<(u64, Vec<Overlay>)>,
+    /// 由"复制为新行"产生的新增行：它们的主键和自增列留空时不写进 INSERT。
+    cloned: Vec<String>,
 }
 
 impl Default for SharedGrid {
@@ -428,6 +524,10 @@ impl SharedGrid {
             seq: 0,
             token: 0,
             sql: String::new(),
+            hidden: BTreeSet::new(),
+            frozen: None,
+            batches: Vec::new(),
+            cloned: Vec::new(),
         }
     }
 
@@ -440,6 +540,8 @@ impl SharedGrid {
         self.truncated = full_count.is_some_and(|count| count > self.source.len() as i64);
         self.scope = RangeScope::Fetched;
         self.overlays.clear();
+        self.batches.clear();
+        self.cloned.clear();
         self.retained.clear();
         self.failures.clear();
         self.selected = false;
@@ -516,6 +618,8 @@ impl SharedGrid {
         self.offset = 0;
         self.scope = RangeScope::Fetched;
         self.overlays.clear();
+        self.batches.clear();
+        self.cloned.clear();
         self.retained.clear();
         self.failures.clear();
         self.selected = false;
@@ -659,6 +763,11 @@ impl SharedGrid {
             && self.target.table == target.table;
         if !same {
             self.overlays.clear();
+            self.batches.clear();
+            self.cloned.clear();
+            // 换了表：隐藏和冻结属于旧表的列，不带到新表上。
+            self.hidden.clear();
+            self.frozen = None;
             self.retained.clear();
             self.failures.clear();
             self.search.clear();
@@ -1261,7 +1370,7 @@ impl SharedGrid {
 
     pub fn set_column_width(&mut self, index: usize, width: f32) {
         if let Some(column) = self.columns.get_mut(index) {
-            column.width = width.clamp(48.0, 640.0);
+            column.width = width.clamp(COLUMN_MIN_WIDTH, COLUMN_MAX_WIDTH);
         }
     }
 
@@ -1359,13 +1468,17 @@ impl SharedGrid {
             self.select(0, 0, false);
         }
         let (row, column) = self.focus;
+        // 左右和 Home/End 只在可见列之间移动；隐藏列不会接住焦点。
+        let visible = self.visible_columns();
+        let position = visible.iter().position(|item| *item >= column).unwrap_or(visible.len().saturating_sub(1));
+        let at = |index: usize| visible.get(index).copied().unwrap_or(column);
         let next = match key {
             "up" => (row.saturating_sub(1), column),
             "down" => ((row + 1).min(self.rows.len() - 1), column),
-            "left" => (row, column.saturating_sub(1)),
-            "right" => (row, (column + 1).min(self.columns.len() - 1)),
-            "home" => (row, 0),
-            "end" => (row, self.columns.len() - 1),
+            "left" => (row, at(position.saturating_sub(1))),
+            "right" => (row, at((position + 1).min(visible.len().saturating_sub(1)))),
+            "home" => (row, at(0)),
+            "end" => (row, at(visible.len().saturating_sub(1))),
             _ => (row, column),
         };
         self.select(next.0, next.1, extend);
@@ -2010,6 +2123,15 @@ impl SharedGrid {
         let Some(last) = self.overlays.pop() else {
             return false;
         };
+        // 批量暂存整批回退：同批的其它格子一起去掉，被它替换的旧暂存放回来。
+        if let Some(batch) = last.batch {
+            self.overlays.retain(|item| item.batch != Some(batch));
+            if let Some(index) = self.batches.iter().position(|(id, _)| *id == batch) {
+                let (_, replaced) = self.batches.remove(index);
+                self.overlays.extend(replaced);
+            }
+            self.reattach_overlays();
+        }
         if last.kind == "insert" {
             if let Some(id) = last.change_id.as_deref() {
                 self.source.retain(|item| item.id != id);
@@ -2046,7 +2168,9 @@ impl SharedGrid {
     pub fn stage_delete(&mut self, row: usize) -> Gate {
         if self.rows.get(row).is_some_and(|item| item.inserted) {
             let id = self.rows[row].id.clone();
-            self.overlays.retain(|item| item.change_id.as_deref() != Some(id.as_str()));
+            // 新增行上的批量值也挂在这一行上，行没了它们一起去掉。
+            self.overlays.retain(|item| item.change_id.as_deref() != Some(id.as_str()) && item.row_id != id);
+            self.cloned.retain(|item| item != &id);
             self.source.retain(|item| item.id != id);
             self.recompute();
             self.close_preview();
@@ -2196,6 +2320,9 @@ impl SharedGrid {
                 "insert" => {
                     self.source.retain(|row| row.id != applied.row_id);
                     self.retained.retain(|row| row.id != applied.row_id);
+                    // 新增行上没有提交编号的批量值已经随 INSERT 写入，不能留下来冒充未提交。
+                    self.overlays.retain(|item| item.row_id != applied.row_id);
+                    self.cloned.retain(|item| item != &applied.row_id);
                 }
                 "delete" => {
                     self.source.retain(|row| row.id != applied.row_id);
@@ -2215,6 +2342,13 @@ impl SharedGrid {
             }
         }
         self.prune_retained();
+        // 提交之后剩下的暂存逐条撤销：批次里已有一部分写库，不能再按整批放回旧值。
+        if !report.applied.is_empty() {
+            self.batches.clear();
+            for item in &mut self.overlays {
+                item.batch = None;
+            }
+        }
         // 写库成功后原值可能已经变了：缓存的完整值和查看面板显示的状态都不能再用。
         self.invalidate_previews();
         self.close_preview();
@@ -2223,6 +2357,11 @@ impl SharedGrid {
 
     pub fn column_names(&self) -> Vec<String> {
         self.columns.iter().map(|column| column.name.clone()).collect()
+    }
+
+    /// 列的声明类型；记录视图把它写在列名旁边。
+    pub fn column_type(&self, column: usize) -> Option<&str> {
+        self.columns.get(column).map(|item| item.type_name.as_str())
     }
 
     /// 当前已读取的表、列和行。没有连接或表名时不给出导入目标。
@@ -2281,6 +2420,8 @@ impl SharedGrid {
         self.invalidate_previews();
         self.keys.clear();
         self.scroll = 0;
+        self.hidden.clear();
+        self.frozen = None;
         self.retained.clear();
         self.read_failure = None;
         self.target_changed = false;
@@ -2697,6 +2838,7 @@ impl SharedGrid {
     }
 
     fn recompute(&mut self) {
+        self.prune_display();
         let mut rows = self.source.clone();
         let applied = self.filters.iter().filter(|draft| !draft.dirty).count();
         let filtering = !self.search.is_empty() || applied > 0 || self.sort.is_some();
@@ -2909,7 +3051,7 @@ impl SharedGrid {
                         .enumerate()
                         .filter_map(|(index, column)| {
                             let value = self.writable_overlay(&row.id, &column.name).or_else(|| row.values.get(index).cloned())?;
-                            if value.is_none() && column.auto {
+                            if value.is_none() && self.unassigned(&row.id, column) {
                                 return None;
                             }
                             Some(ValueArg { column: column.name.clone(), value, resolved: false })
@@ -2939,12 +3081,18 @@ impl SharedGrid {
             .enumerate()
             .filter_map(|(index, column)| {
                 let value = self.writable_overlay(&row.id, &column.name).or_else(|| row.values.get(index).cloned())?;
-                if value.is_none() && column.auto {
+                if value.is_none() && self.unassigned(&row.id, column) {
                     return None;
                 }
                 Some((column.name.clone(), cell_of(value)))
             })
             .collect()
+    }
+
+    /// 新增行里留空就不写进 INSERT 的列：自增列总是如此；"复制为新行"的主键列也一样，
+    /// 由数据库给值或报错，而不是显式写一个 NULL 主键。
+    fn unassigned(&self, row_id: &str, column: &GridColumn) -> bool {
+        column.auto || (column.primary && self.cloned.iter().any(|item| item == row_id))
     }
 
     fn writable_overlay(&self, row_id: &str, column_name: &str) -> Option<Option<String>> {
@@ -2964,6 +3112,411 @@ impl SharedGrid {
             include_foreign_keys: false,
         }
     }
+}
+
+/// 列显示（隐藏、冻结、自适应）。只改变画哪些列、哪些列固定在左侧；
+/// 复制、导出、筛选和排序一律按逻辑列，数据范围不变。
+impl SharedGrid {
+    /// 可见的逻辑列（按逻辑顺序）。界面的第 n 个数据列就是这里的第 n 项。
+    pub fn visible_columns(&self) -> Vec<usize> {
+        let visible: Vec<usize> = (0..self.columns.len()).filter(|index| !self.hidden.contains(&self.columns[*index].name)).collect();
+        // 至少保留一个可见列；万一列变了导致全部被藏，就全部显示。
+        if visible.is_empty() {
+            (0..self.columns.len()).collect()
+        } else {
+            visible
+        }
+    }
+
+    pub fn column_hidden(&self, column: usize) -> bool {
+        self.columns.get(column).is_some_and(|item| self.hidden.contains(&item.name)) && self.visible_columns().len() < self.columns.len()
+    }
+
+    /// 只剩一列可见时不能再藏。
+    pub fn can_hide(&self, column: usize) -> bool {
+        !self.column_hidden(column) && column < self.columns.len() && self.visible_columns().len() > 1
+    }
+
+    pub fn hide_column(&mut self, column: usize) -> bool {
+        if !self.can_hide(column) {
+            return false;
+        }
+        let name = self.columns[column].name.clone();
+        self.hidden.insert(name.clone());
+        if self.frozen.as_deref() == Some(name.as_str()) {
+            // 冻结边界列被藏起来时，边界退到它左边最近的可见列。
+            self.frozen = self.visible_columns().into_iter().rfind(|index| *index < column).map(|index| self.columns[index].name.clone());
+        }
+        self.keep_selection_visible();
+        true
+    }
+
+    pub fn show_column(&mut self, column: usize) -> bool {
+        let Some(name) = self.columns.get(column).map(|item| item.name.clone()) else {
+            return false;
+        };
+        self.hidden.remove(&name)
+    }
+
+    pub fn show_all_columns(&mut self) -> bool {
+        let changed = !self.hidden.is_empty();
+        self.hidden.clear();
+        changed
+    }
+
+    /// 当前隐藏的列（逻辑列号、列名），表头菜单用它列出可恢复的列。
+    pub fn hidden_columns(&self) -> Vec<(usize, String)> {
+        (0..self.columns.len()).filter(|index| self.column_hidden(*index)).map(|index| (index, self.columns[index].name.clone())).collect()
+    }
+
+    pub fn freeze_to(&mut self, column: usize) -> bool {
+        if self.column_hidden(column) {
+            return false;
+        }
+        let Some(name) = self.columns.get(column).map(|item| item.name.clone()) else {
+            return false;
+        };
+        self.frozen = Some(name);
+        true
+    }
+
+    pub fn unfreeze(&mut self) -> bool {
+        self.frozen.take().is_some()
+    }
+
+    /// 冻结边界的逻辑列。
+    pub fn frozen_column(&self) -> Option<usize> {
+        let name = self.frozen.as_deref()?;
+        self.columns.iter().position(|item| item.name == name)
+    }
+
+    /// 前多少个可见数据列固定在左侧（不含行号列）。
+    pub fn frozen_count(&self) -> usize {
+        match self.frozen_column() {
+            Some(frozen) => self.visible_columns().iter().filter(|index| **index <= frozen).count(),
+            None => 0,
+        }
+    }
+
+    /// 界面第 n 个数据列对应的逻辑列。
+    pub fn display_to_logical(&self, display: usize) -> Option<usize> {
+        self.visible_columns().get(display).copied()
+    }
+
+    /// 逻辑列在界面上是第几个数据列；被藏起来时没有位置。
+    pub fn logical_to_display(&self, logical: usize) -> Option<usize> {
+        self.visible_columns().iter().position(|index| *index == logical)
+    }
+
+    /// 列变了（新结果、列被删）时丢掉不再存在的隐藏和冻结设置。
+    fn prune_display(&mut self) {
+        let names: BTreeSet<String> = self.columns.iter().map(|item| item.name.clone()).collect();
+        self.hidden.retain(|name| names.contains(name));
+        if !self.columns.is_empty() && self.hidden.len() >= names.len() {
+            self.hidden.clear();
+        }
+        if self.frozen.as_ref().is_some_and(|name| !names.contains(name)) {
+            self.frozen = None;
+        }
+    }
+
+    /// 选择的焦点或锚点落在被藏起来的列上时，挪到最近的可见列。
+    fn keep_selection_visible(&mut self) {
+        let visible = self.visible_columns();
+        let nearest = |column: usize| -> usize {
+            visible.iter().copied().find(|index| *index >= column).or_else(|| visible.last().copied()).unwrap_or(column)
+        };
+        if self.column_hidden(self.focus.1) {
+            self.focus.1 = nearest(self.focus.1);
+        }
+        if self.column_hidden(self.anchor.1) {
+            self.anchor.1 = nearest(self.anchor.1);
+        }
+    }
+}
+
+/// 多格式复制。选区按逻辑行列拼成一张表（隐藏列也在内），再交给 export::write 写成各格式；
+/// 和普通复制一样先要原值，预览信封绝不进剪贴板。
+impl SharedGrid {
+    pub fn copy_as(&self, format: CopyFormat) -> Result<CopiedText, CopyBlock> {
+        let Some((row_start, column_start, row_end, column_end)) = self.selection_bounds() else {
+            return Err(CopyBlock::Empty);
+        };
+        let points = self.selection();
+        if points.is_empty() {
+            return Err(CopyBlock::Empty);
+        }
+        if self.missing_full(&points) {
+            return Err(CopyBlock::Missing);
+        }
+        let columns: Vec<usize> = (column_start..=column_end).collect();
+        let names: Vec<String> = columns.iter().map(|index| self.columns[*index].name.clone()).collect();
+        let rows: Vec<Vec<Option<String>>> =
+            (row_start..=row_end).map(|row| columns.iter().map(|column| self.original(row, *column).unwrap_or(None)).collect()).collect();
+        let table = crate::export::ParsedTable { columns: names.clone(), rows };
+        let render = |name: &str, null_token: &str| -> String {
+            crate::export::render(name, &table, ',', null_token, false, "", "").map(|bytes| String::from_utf8_lossy(&bytes).into_owned()).unwrap_or_default()
+        };
+        let mut placeholder = false;
+        let text = match format {
+            CopyFormat::TsvHeader => {
+                let header = names.iter().map(|name| quote_tsv(name, false)).collect::<Vec<_>>().join("\t");
+                format!("{header}\n{}", self.tsv_grid(&points))
+            }
+            CopyFormat::Csv => render("csv", &self.null_copy),
+            CopyFormat::Json => render("json", ""),
+            CopyFormat::Markdown => render("markdown", "NULL"),
+            CopyFormat::Insert => {
+                let engine = Engine::parse(&self.target.engine).unwrap_or(Engine::Sqlite);
+                let (schema, table_name) = match (&self.schema, self.mode) {
+                    (_, GridMode::Table) if !self.target.table.is_empty() => (self.target.schema.clone(), self.target.table.clone()),
+                    // 查询结果只有在证明是单表并读到结构后才用真实表名。
+                    (Some(schema), GridMode::Query) => (schema.schema.clone(), schema.name.clone()),
+                    _ => {
+                        placeholder = true;
+                        (String::new(), PLACEHOLDER_TABLE.to_owned())
+                    }
+                };
+                let origins: Vec<Column> = columns.iter().map(|index| domain_column(&self.columns[*index])).collect();
+                crate::export::render_insert_for(engine, &schema, &table_name, &origins, &table)
+            }
+        };
+        Ok(CopiedText { text, placeholder })
+    }
+}
+
+/// INSERT 复制在查询结果没有定位到表时用的占位表名。
+pub const PLACEHOLDER_TABLE: &str = "table_name";
+
+const COLUMN_MIN_WIDTH: f32 = 48.0;
+const COLUMN_MAX_WIDTH: f32 = 640.0;
+
+/// 批量写入：复制为新行、粘贴 TSV、选区设值。全部只进暂存，写库仍走预览→确认→提交。
+impl SharedGrid {
+    /// 唯一的批量暂存入口：先把整批格子逐一过写入门控和校验，任何一格不行就整批拒绝，
+    /// 不写覆盖层、不动已有暂存；全部通过才逐格暂存，同一批共用一个编号，撤销时整批回退。
+    pub fn stage_batch(&mut self, cells: Vec<(String, usize, Option<String>)>) -> Result<usize, BatchReject> {
+        if cells.is_empty() {
+            return Err(BatchReject::NoFocus);
+        }
+        if !self.writable() {
+            return Err(BatchReject::Readonly(self.gate_text(Gate::Readonly)));
+        }
+        for (row_id, column, value) in &cells {
+            let Some(origin) = self.columns.get(*column) else {
+                return Err(BatchReject::OutOfRange);
+            };
+            let Some(row) = self.any_row(row_id) else {
+                return Err(BatchReject::OutOfRange);
+            };
+            if origin.primary || origin.auto {
+                return Err(BatchReject::KeyColumn(origin.name.clone()));
+            }
+            if !origin.editable {
+                return Err(BatchReject::Blocked { column: origin.name.clone(), reason: self.gate_text(Gate::Readonly) });
+            }
+            if row.inserted {
+                if let Some(message) = self.validation_message(*column, value.as_deref()) {
+                    return Err(BatchReject::Blocked { column: origin.name.clone(), reason: message });
+                }
+                continue;
+            }
+            match self.gate_for_edit(self.row_index(row_id), *column, value.as_deref()) {
+                Gate::Writable => {}
+                Gate::Validation => {
+                    let reason = self.validation_message(*column, value.as_deref()).unwrap_or_else(|| self.gate_text(Gate::Validation));
+                    return Err(BatchReject::Blocked { column: origin.name.clone(), reason });
+                }
+                other => return Err(BatchReject::Blocked { column: origin.name.clone(), reason: self.gate_text(other) }),
+            }
+        }
+        self.seq += 1;
+        let batch = self.seq;
+        let mut replaced = Vec::new();
+        let count = cells.len();
+        for (row_id, column, value) in cells {
+            let column_name = self.columns[column].name.clone();
+            let inserted = self.any_row(&row_id).is_some_and(|row| row.inserted);
+            // 同一格已有的暂存被这批替换；记下来，撤销整批时放回去。
+            let mut index = 0;
+            while index < self.overlays.len() {
+                let item = &self.overlays[index];
+                if item.kind == "update" && item.row_id == row_id && item.column_name == column_name {
+                    replaced.push(self.overlays.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            let draw_row = self.row_index(&row_id).unwrap_or(usize::MAX);
+            // 新增行上的值不单独提交，由那条 INSERT 带上；已有行才各自形成一条 UPDATE。
+            let change_id = if inserted {
+                None
+            } else {
+                self.seq += 1;
+                Some(format!("u:{}", self.seq))
+            };
+            let mut item = overlay(draw_row, row_id, column, column_name, value, Gate::Writable, String::new(), change_id, "update");
+            item.batch = Some(batch);
+            self.overlays.push(item);
+        }
+        self.batches.push((batch, replaced));
+        self.close_preview();
+        Ok(count)
+    }
+
+    /// 从焦点格开始按行列铺开剪贴板里的 TSV。只铺到可见列和已加载行上，越界就整次拒绝，不新增行。
+    pub fn paste_tsv(&mut self, text: Option<&str>) -> Result<usize, BatchReject> {
+        let Some(text) = text.filter(|text| !text.trim_matches(['\r', '\n']).is_empty()) else {
+            return Err(BatchReject::Empty);
+        };
+        if !self.writable() {
+            return Err(BatchReject::Readonly(self.gate_text(Gate::Readonly)));
+        }
+        let Some((anchor_row, anchor_column)) = self.focus_cell() else {
+            return Err(BatchReject::NoFocus);
+        };
+        let block = parse_tsv(text, &self.null_copy);
+        let visible = self.visible_columns();
+        let Some(start) = visible.iter().position(|index| *index == anchor_column) else {
+            return Err(BatchReject::NoFocus);
+        };
+        let mut cells = Vec::new();
+        for (offset, line) in block.into_iter().enumerate() {
+            let Some(row_id) = self.rows.get(anchor_row + offset).map(|row| row.id.clone()) else {
+                return Err(BatchReject::OutOfRange);
+            };
+            for (step, value) in line.into_iter().enumerate() {
+                let Some(column) = visible.get(start + step).copied() else {
+                    return Err(BatchReject::OutOfRange);
+                };
+                cells.push((row_id.clone(), column, value));
+            }
+        }
+        self.stage_batch(cells)
+    }
+
+    /// 选区里的每个可见格子暂存为同一个值（None 是数据库 NULL）。隐藏列不在写入范围里。
+    pub fn stage_selection(&mut self, value: Option<String>) -> Result<usize, BatchReject> {
+        if !self.writable() {
+            return Err(BatchReject::Readonly(self.gate_text(Gate::Readonly)));
+        }
+        let cells = self.selection_targets().into_iter().map(|(row_id, column)| (row_id, column, value.clone())).collect::<Vec<_>>();
+        if cells.is_empty() {
+            return Err(BatchReject::NoFocus);
+        }
+        self.stage_batch(cells)
+    }
+
+    /// 选区里会被设值的格子（稳定行 id、逻辑列）；不含隐藏列。
+    pub fn selection_targets(&self) -> Vec<(String, usize)> {
+        self.selection()
+            .into_iter()
+            .filter(|(_, column)| !self.column_hidden(*column))
+            .filter_map(|(row, column)| self.rows.get(row).map(|item| (item.id.clone(), column)))
+            .collect()
+    }
+
+    /// 按焦点行的值暂存一条新行：主键和自增列留空，INSERT 里不写它们；其余列与原行一致。
+    /// 原行里还是预览的格子要先读到原值，否则返回原因，不暂存。
+    pub fn stage_clone(&mut self) -> Result<(), String> {
+        if !self.writable() {
+            return Err(self.gate_text(Gate::Readonly));
+        }
+        if self.mode == GridMode::Query {
+            // 和“新增行”一致：定位成功的查询结果也不新增行，说明具体原因但不改写只读状态。
+            return Err(i18n::text(self.locale, "grid.readonly.queryResult"));
+        }
+        let Some((row, _)) = self.focus_cell() else {
+            return Err(i18n::text(self.locale, "grid.batch.noRow"));
+        };
+        let mut values = Vec::with_capacity(self.columns.len());
+        for (column, origin) in self.columns.iter().enumerate() {
+            if origin.primary || origin.auto {
+                values.push(None);
+                continue;
+            }
+            match self.original(row, column) {
+                Some(value) => values.push(value),
+                None => return Err(i18n::text(self.locale, "grid.value.noOriginal")),
+            }
+        }
+        self.seq += 1;
+        let id = format!("i:{}", self.seq);
+        self.source.push(GridRow { id: id.clone(), values, located: false, locator: Vec::new(), inserted: true });
+        self.cloned.push(id.clone());
+        self.recompute();
+        let row = self.rows.iter().position(|item| item.id == id).unwrap_or(self.rows.len());
+        self.overlays.push(overlay(row, id.clone(), 0, String::new(), None, Gate::Writable, String::new(), Some(id), "insert"));
+        self.close_preview();
+        Ok(())
+    }
+
+    /// 暂存里有多少条将要进预览的变更（按提交编号计）。
+    pub fn staged_count(&self) -> usize {
+        self.overlays.iter().filter(|item| item.gate == Gate::Writable && item.change_id.is_some()).count()
+    }
+}
+
+/// 把 TSV 文本拆成行列。引号包住的字段可以含制表符和换行，两个引号是一个引号；
+/// 没加引号、正好等于 NULL 复制标记（非空时）的字段是数据库 NULL——和本网格复制出的 TSV 互为逆。
+/// 行尾的 \r 去掉，末尾一个换行不算新的一行。
+fn parse_tsv(text: &str, null_token: &str) -> Vec<Vec<Option<String>>> {
+    let text = text.strip_suffix('\n').map(|rest| rest.strip_suffix('\r').unwrap_or(rest)).unwrap_or(text);
+    let mut lines: Vec<Vec<Option<String>>> = Vec::new();
+    let mut line: Vec<Option<String>> = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        // 一个字段。
+        let mut field = String::new();
+        let quoted = chars.peek() == Some(&'"');
+        if quoted {
+            chars.next();
+            while let Some(ch) = chars.next() {
+                if ch == '"' {
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                        field.push('"');
+                    } else {
+                        break;
+                    }
+                } else {
+                    field.push(ch);
+                }
+            }
+            // 引号后面到分隔符之前的内容原样接上，不丢字。
+            while let Some(ch) = chars.peek().copied() {
+                if ch == '\t' || ch == '\n' {
+                    break;
+                }
+                chars.next();
+                if ch != '\r' {
+                    field.push(ch);
+                }
+            }
+        } else {
+            while let Some(ch) = chars.peek().copied() {
+                if ch == '\t' || ch == '\n' {
+                    break;
+                }
+                chars.next();
+                field.push(ch);
+            }
+            if field.ends_with('\r') {
+                field.pop();
+            }
+        }
+        let value = if !quoted && !null_token.is_empty() && field == null_token { None } else { Some(field) };
+        line.push(value);
+        match chars.next() {
+            Some('\t') => continue,
+            Some('\n') => lines.push(std::mem::take(&mut line)),
+            _ => {
+                lines.push(line);
+                break;
+            }
+        }
+    }
+    lines
 }
 
 pub fn operation_banner(target: &GridTarget) -> String {
@@ -3308,7 +3861,7 @@ fn overlay(
     change_id: Option<String>,
     kind: &'static str,
 ) -> Overlay {
-    Overlay { row, row_id, column, column_name, value, gate, message, change_id, kind }
+    Overlay { row, row_id, column, column_name, value, gate, message, change_id, kind, batch: None }
 }
 
 pub(crate) fn cell_of(value: Option<String>) -> Cell {
@@ -5091,6 +5644,376 @@ mod tests {
         assert!(!grid.uncommitted());
         assert_eq!(grid.selection_ids().map(|(anchor, focus)| (anchor.to_owned(), focus.to_owned())), selected);
         assert_eq!(grid.viewer_state().cloned(), viewer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// 多格式复制、列显示和批量写入（R2/R3/R4）。
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    fn column(name: &str, type_name: &str, primary: bool, auto: bool) -> GridColumn {
+        GridColumn { name: name.to_owned(), type_name: type_name.to_owned(), nullable: !primary, primary, unique: primary, auto, width: 120.0, editable: true }
+    }
+
+    fn people_schema(engine: &str, note_type: &str) -> TableSchema {
+        schema_from_parts(
+            engine,
+            "",
+            "people",
+            "table",
+            vec![column_of("id", "integer", true), column_of("name", "text", false), column_of("note", note_type, false)],
+            vec!["id".to_owned()],
+        )
+        .unwrap()
+    }
+
+    fn people_row(id: &str, name: Option<&str>, note: Option<&str>) -> GridRow {
+        GridRow {
+            id: id.to_owned(),
+            values: vec![Some(id.to_owned()), name.map(str::to_owned), note.map(str::to_owned)],
+            located: true,
+            locator: vec![("id".to_owned(), Some(id.to_owned()))],
+            inserted: false,
+        }
+    }
+
+    fn people_columns(note_type: &str) -> Vec<GridColumn> {
+        vec![column("id", "integer", true, false), column("name", "text", false, false), column("note", note_type, false, false)]
+    }
+
+    fn people_target(engine: &str) -> GridTarget {
+        GridTarget { connection_id: "notes".into(), database: "main".into(), table: "people".into(), engine: engine.into(), ..GridTarget::default() }
+    }
+
+    /// 可写的 people 表：id 是主键（非自增），name/note 是文本。
+    fn people(engine: &str, rows: usize) -> SharedGrid {
+        let mut grid = SharedGrid::new();
+        grid.target = people_target(engine);
+        let rows = (1..=rows).map(|index| people_row(&index.to_string(), Some(&format!("名{index}")), Some("备注"))).collect::<Vec<_>>();
+        let count = rows.len() as i64;
+        grid.load_local(people_columns("text"), rows, Some(count), Some(people_schema(engine, "text")));
+        grid
+    }
+
+    /// 2 行 × 3 列，含一个 NULL 和一个带逗号与引号的文本。
+    fn copy_sheet(engine: &str) -> SharedGrid {
+        let mut grid = SharedGrid::new();
+        grid.target = people_target(engine);
+        grid.load_local(
+            people_columns("text"),
+            vec![people_row("1", Some("a,\"b\""), None), people_row("2", Some("乙"), Some("x"))],
+            Some(2),
+            Some(people_schema(engine, "text")),
+        );
+        grid.select(0, 0, false);
+        grid.select(1, 2, true);
+        grid
+    }
+
+    fn copied(grid: &SharedGrid, format: CopyFormat) -> String {
+        grid.copy_as(format).expect("可以复制").text
+    }
+
+    #[test]
+    fn copy_as_each_format_matches_the_expected_text_byte_for_byte() {
+        let grid = copy_sheet("sqlite");
+        assert_eq!(copied(&grid, CopyFormat::TsvHeader), "id\tname\tnote\n1\t\"a,\"\"b\"\"\"\tNULL\n2\t乙\tx");
+        assert_eq!(copied(&grid, CopyFormat::Csv), "\"id\",\"name\",\"note\"\r\n\"1\",\"a,\"\"b\"\"\",NULL\r\n\"2\",\"乙\",\"x\"");
+        assert_eq!(copied(&grid, CopyFormat::Json), "[{\"id\":\"1\",\"name\":\"a,\\\"b\\\"\",\"note\":null},{\"id\":\"2\",\"name\":\"乙\",\"note\":\"x\"}]");
+        assert_eq!(copied(&grid, CopyFormat::Markdown), "| id | name | note |\r\n| --- | --- | --- |\r\n| 1 | a,\"b\" | NULL |\r\n| 2 | 乙 | x |");
+        // NULL 复制标记来自设置：TSV/CSV 跟着变，JSON 仍是 null。
+        let mut token = copy_sheet("sqlite");
+        token.set_null_copy("(null)");
+        assert_eq!(copied(&token, CopyFormat::TsvHeader).lines().nth(1), Some("1\t\"a,\"\"b\"\"\"\t(null)"));
+        assert!(copied(&token, CopyFormat::Csv).contains(",(null)\r\n"));
+        assert!(copied(&token, CopyFormat::Json).contains("\"note\":null"));
+
+        let mysql = copy_sheet("mysql");
+        let insert = mysql.copy_as(CopyFormat::Insert).unwrap();
+        assert!(!insert.placeholder);
+        assert_eq!(
+            insert.text,
+            "INSERT INTO `people` (`id`, `name`, `note`) VALUES (1, 'a,\"b\"', NULL);\r\nINSERT INTO `people` (`id`, `name`, `note`) VALUES (2, '乙', 'x');"
+        );
+        assert_eq!(insert.text.matches("INSERT INTO").count(), 2);
+        let postgres = copy_sheet("postgres");
+        assert!(copied(&postgres, CopyFormat::Insert).starts_with("INSERT INTO \"people\" (\"id\", \"name\", \"note\") VALUES (1, "));
+    }
+
+    #[test]
+    fn copy_as_insert_uses_a_placeholder_for_unlocated_results_and_blocks_missing_values() {
+        let mut query = SharedGrid::new();
+        query.target.engine = "sqlite".into();
+        query.show_query_sheet("select a.name from a join b on a.id = b.id", vec!["name".into()], vec![vec![Some("甲".into())]], false, Some(1));
+        assert_eq!(query.copy_as(CopyFormat::Insert), Err(CopyBlock::Empty), "空选区不能复制");
+        assert_eq!(query.copy_as(CopyFormat::Csv), Err(CopyBlock::Empty));
+        query.select(0, 0, false);
+        let insert = query.copy_as(CopyFormat::Insert).unwrap();
+        assert!(insert.placeholder, "没有定位到表时要提示占位表名");
+        assert_eq!(insert.text, format!("INSERT INTO \"{PLACEHOLDER_TABLE}\" (\"name\") VALUES ('甲');"));
+
+        // 选区里有只读到预览、还没读到原值的格子：任何格式都停下，不拿预览信封充当原值。
+        let envelope = format!("\u{1}t:3000:{}", "a".repeat(16));
+        let mut grid = SharedGrid::new();
+        grid.target = people_target("sqlite");
+        grid.load_local(people_columns("text"), vec![people_row("1", Some(envelope.as_str()), None)], Some(1), Some(people_schema("sqlite", "text")));
+        grid.select_all_loaded();
+        for format in CopyFormat::ALL {
+            assert_eq!(grid.copy_as(format), Err(CopyBlock::Missing), "{format:?}");
+        }
+    }
+
+    #[test]
+    fn hiding_and_freezing_change_only_the_display() {
+        let mut grid = people("sqlite", 3);
+        assert_eq!(grid.visible_columns(), vec![0, 1, 2]);
+        grid.select(0, 1, false);
+        assert!(grid.hide_column(1));
+        assert_eq!(grid.visible_columns(), vec![0, 2]);
+        assert_eq!(grid.display_to_logical(1), Some(2));
+        assert_eq!(grid.logical_to_display(1), None);
+        assert_eq!(grid.hidden_columns(), vec![(1, "name".to_owned())]);
+        // 焦点不会停在被藏起来的列上。
+        assert_eq!(grid.focus_cell(), Some((0, 2)));
+        // 复制整行仍包含隐藏列；导出看到的列也不变。
+        assert_eq!(grid.copy_row(), "1\t名1\t备注");
+        assert_eq!(grid.exchange_sheet().1, vec!["id".to_owned(), "name".to_owned(), "note".to_owned()]);
+        // 方向键跳过隐藏列。
+        grid.select(0, 0, false);
+        grid.move_key("right", false);
+        assert_eq!(grid.focus_cell(), Some((0, 2)));
+        grid.move_key("left", false);
+        assert_eq!(grid.focus_cell(), Some((0, 0)));
+        // 只剩一列可见时不能再藏。
+        assert!(grid.hide_column(2));
+        assert!(!grid.can_hide(0));
+        assert!(!grid.hide_column(0));
+        assert_eq!(grid.visible_columns(), vec![0]);
+        assert!(grid.show_column(1));
+        assert_eq!(grid.visible_columns(), vec![0, 1]);
+        assert!(grid.show_all_columns());
+        assert_eq!(grid.visible_columns(), vec![0, 1, 2]);
+        // 冻结到第 2 列：前两个可见列固定在左侧；排序不改变它。
+        assert!(grid.freeze_to(1));
+        assert_eq!(grid.frozen_count(), 2);
+        grid.toggle_sort("note");
+        assert_eq!(grid.frozen_count(), 2);
+        assert!(grid.unfreeze());
+        assert_eq!(grid.frozen_count(), 0);
+        // 换到另一张表时隐藏和冻结都不带过去。
+        assert!(grid.hide_column(2));
+        assert!(grid.freeze_to(1));
+        let other = GridTarget { table: "other".into(), ..grid.target.clone() };
+        grid.switch_target(other);
+        assert!(grid.hidden_columns().is_empty());
+        assert_eq!(grid.frozen_column(), None);
+    }
+
+    #[test]
+    fn pasting_two_by_two_tsv_stages_exactly_four_changes() {
+        let mut grid = people("sqlite", 3);
+        grid.select(0, 1, false);
+        assert_eq!(grid.paste_tsv(Some("甲\t一\r\n乙\t二\r\n")), Ok(4));
+        assert_eq!(grid.staged_count(), 4);
+        let sql = grid.open_preview().unwrap();
+        assert_eq!(sql.len(), 4, "{sql:?}");
+        assert_eq!(grid.cell_label(0, 1), "甲");
+        assert_eq!(grid.cell_label(1, 2), "二");
+        // 一次撤销回退整批。
+        grid.cancel_preview();
+        assert!(grid.undo_last_stage());
+        assert_eq!(grid.staged_count(), 0);
+        assert!(!grid.uncommitted());
+        assert_eq!(grid.cell_label(0, 1), "名1");
+    }
+
+    #[test]
+    fn rejected_pastes_leave_staging_and_overlays_untouched() {
+        let mut grid = people("sqlite", 3);
+        assert_eq!(grid.stage_text(2, 2, Some("已有".into())), Gate::Writable);
+        let before = (grid.staged_count(), grid.cell_label(2, 2), grid.cell_label(0, 1));
+        // 焦点在最后一列：第二列越界。
+        grid.select(2, 2, false);
+        assert_eq!(grid.paste_tsv(Some("a\tb")), Err(BatchReject::OutOfRange));
+        // 超出已加载的行，不自动新增行。
+        grid.select(2, 1, false);
+        assert_eq!(grid.paste_tsv(Some("a\nb")), Err(BatchReject::OutOfRange));
+        assert_eq!(grid.loaded_len(), 3);
+        // 目标含主键列。
+        grid.select(0, 0, false);
+        assert_eq!(grid.paste_tsv(Some("9\tx")), Err(BatchReject::KeyColumn("id".into())));
+        // 剪贴板为空或不是文本。
+        grid.select(0, 1, false);
+        assert_eq!(grid.paste_tsv(Some("")), Err(BatchReject::Empty));
+        assert_eq!(grid.paste_tsv(Some("\r\n")), Err(BatchReject::Empty));
+        assert_eq!(grid.paste_tsv(None), Err(BatchReject::Empty));
+        // 隐藏列不算在可铺开的列里。
+        assert!(grid.hide_column(2));
+        grid.select(0, 1, false);
+        assert_eq!(grid.paste_tsv(Some("a\tb")), Err(BatchReject::OutOfRange));
+        assert_eq!((grid.staged_count(), grid.cell_label(2, 2), grid.cell_label(0, 1)), before);
+        for reject in [BatchReject::Empty, BatchReject::OutOfRange, BatchReject::KeyColumn("id".into())] {
+            assert!(!reject.message(Locale::En).is_empty());
+            assert_ne!(reject.message(Locale::ZhCn), reject.message(Locale::En));
+        }
+    }
+
+    #[test]
+    fn readonly_results_reject_every_batch_with_the_existing_reason() {
+        let mut query = SharedGrid::new();
+        query.target.engine = "sqlite".into();
+        query.show_query_sheet("select * from a join b on a.id = b.id", vec!["name".into()], vec![vec![Some("甲".into())]], false, Some(1));
+        query.select(0, 0, false);
+        let reason = query.gate_text(Gate::Readonly);
+        assert_eq!(reason, i18n::text(Locale::ZhCn, "grid.readonly.join"));
+        assert_eq!(query.paste_tsv(Some("x")), Err(BatchReject::Readonly(reason.clone())));
+        assert_eq!(query.stage_selection(None), Err(BatchReject::Readonly(reason.clone())));
+        assert_eq!(query.stage_clone(), Err(reason));
+        assert!(!query.uncommitted());
+    }
+
+    #[test]
+    fn tsv_paste_reads_quotes_and_the_null_copy_token() {
+        assert_eq!(parse_tsv("a\tb\nc\td\n", "NULL"), vec![vec![Some("a".into()), Some("b".into())], vec![Some("c".into()), Some("d".into())]]);
+        assert_eq!(parse_tsv("NULL\t\"NULL\"\t", "NULL"), vec![vec![None, Some("NULL".into()), Some(String::new())]]);
+        assert_eq!(parse_tsv("\"x\ty\"\t\"多\n行\"\t\"a\"\"b\"", "NULL"), vec![vec![Some("x\ty".into()), Some("多\n行".into()), Some("a\"b".into())]]);
+        // NULL 复制标记为空时，空字段是空字符串而不是 NULL。
+        assert_eq!(parse_tsv("\t", ""), vec![vec![Some(String::new()), Some(String::new())]]);
+        // 本网格复制出来的 TSV 粘贴回去得到同样的值。
+        let grid = copy_sheet("sqlite");
+        let tsv = grid.tsv();
+        assert_eq!(
+            parse_tsv(&tsv, grid.null_copy()),
+            vec![vec![Some("1".into()), Some("a,\"b\"".into()), None], vec![Some("2".into()), Some("乙".into()), Some("x".into())]]
+        );
+    }
+
+    #[test]
+    fn setting_selected_cells_to_null_is_one_batch_and_undoes_as_one() {
+        let mut grid = people("sqlite", 3);
+        // 先有一条单独的修改：整批撤销后它要回来。
+        assert_eq!(grid.stage_text(0, 1, Some("先改".into())), Gate::Writable);
+        grid.select(0, 1, false);
+        grid.select(2, 1, true);
+        assert_eq!(grid.stage_selection(None), Ok(3));
+        assert_eq!(grid.staged_count(), 3, "同一格的旧修改被这一批替换");
+        let sql = grid.open_preview().unwrap();
+        assert_eq!(sql.len(), 3);
+        assert!(sql.iter().all(|item| item.contains("= NULL")), "{sql:?}");
+        grid.cancel_preview();
+        assert!(grid.undo_last_stage());
+        assert_eq!(grid.staged_count(), 1, "整批撤销，原来的单独修改放回来");
+        assert_eq!(grid.cell_label(0, 1), "先改");
+        assert_eq!(grid.cell_label(1, 1), "名2");
+        // 选区含主键：整批拒绝，暂存不变。
+        grid.select(0, 0, false);
+        grid.select(1, 1, true);
+        assert_eq!(grid.stage_selection(Some("x".into())), Err(BatchReject::KeyColumn("id".into())));
+        assert_eq!(grid.staged_count(), 1);
+        assert_eq!(grid.cell_label(1, 1), "名2");
+        // 校验失败的格子也让整批不生效。
+        let mut typed = SharedGrid::new();
+        typed.target = people_target("sqlite");
+        typed.load_local(
+            people_columns("geometry"),
+            vec![people_row("1", Some("甲"), None), people_row("2", Some("乙"), None)],
+            Some(2),
+            Some(people_schema("sqlite", "geometry")),
+        );
+        typed.select(0, 1, false);
+        typed.select(1, 2, true);
+        assert!(matches!(typed.stage_selection(Some("v".into())), Err(BatchReject::Blocked { .. })));
+        assert!(!typed.uncommitted());
+    }
+
+    #[test]
+    fn cloning_a_row_leaves_key_columns_unassigned_and_copies_the_rest() {
+        let mut grid = people("sqlite", 2);
+        grid.select(1, 2, false);
+        assert_eq!(grid.stage_clone(), Ok(()));
+        assert_eq!(grid.loaded_len(), 3);
+        let sql = grid.open_preview().unwrap();
+        assert_eq!(sql, vec!["INSERT INTO \"people\" (\"name\", \"note\") VALUES ('名2', '备注')".to_owned()]);
+        let request = grid.confirm_request().unwrap();
+        assert_eq!(request.changes.len(), 1);
+        assert_eq!(request.changes[0].kind, "insert");
+        assert!(request.changes[0].values.iter().all(|value| value.column != "id"));
+        // 撤销一次就去掉这条新行。
+        grid.cancel_preview();
+        assert!(grid.undo_last_stage());
+        assert_eq!(grid.loaded_len(), 2);
+        assert!(!grid.uncommitted());
+        // 新行里再粘贴：值跟着那条 INSERT 走，撤销这一批后回到复制来的值。
+        grid.select(1, 1, false);
+        assert_eq!(grid.stage_clone(), Ok(()));
+        let inserted = grid.rows.iter().position(|row| row.inserted).unwrap();
+        grid.select(inserted, 1, false);
+        assert_eq!(grid.paste_tsv(Some("新名")), Ok(1));
+        let sql = grid.open_preview().unwrap();
+        assert_eq!(sql, vec!["INSERT INTO \"people\" (\"name\", \"note\") VALUES ('新名', '备注')".to_owned()]);
+        grid.cancel_preview();
+        assert!(grid.undo_last_stage());
+        assert_eq!(grid.open_preview().unwrap(), vec!["INSERT INTO \"people\" (\"name\", \"note\") VALUES ('名2', '备注')".to_owned()]);
+    }
+
+    async fn item_rows(path: &std::path::Path) -> Vec<(i64, String, Option<i64>)> {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(path).read_only(true))
+            .await
+            .unwrap();
+        let rows: Vec<(i64, String, Option<i64>)> = sqlx::query_as("SELECT id, name, qty FROM items ORDER BY id").fetch_all(&pool).await.unwrap();
+        pool.close().await;
+        rows
+    }
+
+    /// 真实 SQLite：复制为新行后取消预览，库里不变；确认后多一行，主键由库分配，其余列与原行一致。
+    #[tokio::test]
+    async fn sqlite_clone_cancel_leaves_the_database_and_confirm_inserts_one_row() {
+        let dir = std::env::temp_dir().join(format!("rillsql-grid-clone-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("notes.sqlite");
+        let setup = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)").execute(&setup).await.unwrap();
+        sqlx::query("INSERT INTO items (id, name, qty) VALUES (1, '甲', 3), (2, '乙', NULL)").execute(&setup).await.unwrap();
+        setup.close().await;
+        let service = std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")));
+        service.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+        let table = TableRef { connection_id: "notes".into(), database: "main".into(), schema: String::new(), table: "items".into(), engine: "sqlite".into(), include_foreign_keys: false };
+        let schema = schema_from_dto(&crate::application::grid::describe(&service, &table).await.unwrap()).unwrap();
+        let page = crate::application::grid::page(
+            &service,
+            &PageRequest { table, filters: Vec::new(), sort: None, offset: 0, limit: 10, preview_bytes: 1024, search: None },
+        )
+        .await
+        .unwrap();
+        let mut grid = SharedGrid::new();
+        grid.target = GridTarget { connection_id: "notes".into(), database: "main".into(), table: "items".into(), engine: "sqlite".into(), ..GridTarget::default() };
+        let columns = columns_from_schema(&schema, true);
+        grid.replace_fetched(columns.clone(), rows_from_page(&columns, &page), 0, Some(2), false, Some(schema));
+        assert!(grid.writable());
+        grid.select(0, 1, false);
+        assert_eq!(grid.stage_clone(), Ok(()));
+        let preview = grid.open_preview().unwrap();
+        assert_eq!(preview.len(), 1);
+        assert!(!preview[0].contains("\"id\""), "{preview:?}");
+        grid.cancel_preview();
+        grid.close_preview();
+        let original = vec![(1, "甲".to_owned(), Some(3)), (2, "乙".to_owned(), None)];
+        assert_eq!(item_rows(&database).await, original, "取消预览后库里不变");
+        grid.open_preview().unwrap();
+        let request = grid.confirm_request().unwrap();
+        let report = crate::application::grid::commit(&service, &request, true).await.unwrap();
+        assert!(report.failed.is_none(), "{:?}", report.failed.as_ref().map(|item| item.message.clone()));
+        grid.apply_commit(&report);
+        assert!(!grid.uncommitted());
+        assert_eq!(item_rows(&database).await, vec![(1, "甲".to_owned(), Some(3)), (2, "乙".to_owned(), None), (3, "甲".to_owned(), Some(3))]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
