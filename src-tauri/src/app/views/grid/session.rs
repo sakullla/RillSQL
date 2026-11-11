@@ -465,8 +465,8 @@ pub struct SharedGrid {
     hidden: BTreeSet<String>,
     /// 冻结到哪一列（按列名）；它和它左边的可见列固定在左侧。
     frozen: Option<String>,
-    /// 批量暂存替换掉的旧覆盖层：撤销整批时把它们放回去。
-    batches: Vec<(u64, Vec<Overlay>)>,
+    /// 批量暂存替换掉的旧覆盖层及其移除时的下标：撤销整批时按原位置放回去，保持暂存顺序。
+    batches: Vec<(u64, Vec<(usize, Overlay)>)>,
     /// 由"复制为新行"产生的新增行：它们的主键和自增列留空时不写进 INSERT。
     cloned: Vec<String>,
 }
@@ -2128,7 +2128,11 @@ impl SharedGrid {
             self.overlays.retain(|item| item.batch != Some(batch));
             if let Some(index) = self.batches.iter().position(|(id, _)| *id == batch) {
                 let (_, replaced) = self.batches.remove(index);
-                self.overlays.extend(replaced);
+                // 按移除的逆序插回各自原下标，恢复批量暂存前的顺序，下一次撤销仍按原暂存顺序。
+                for (position, item) in replaced.into_iter().rev() {
+                    let position = position.min(self.overlays.len());
+                    self.overlays.insert(position, item);
+                }
             }
             self.reattach_overlays();
         }
@@ -3342,7 +3346,7 @@ impl SharedGrid {
             while index < self.overlays.len() {
                 let item = &self.overlays[index];
                 if item.kind == "update" && item.row_id == row_id && item.column_name == column_name {
-                    replaced.push(self.overlays.remove(index));
+                    replaced.push((index, self.overlays.remove(index)));
                 } else {
                     index += 1;
                 }
@@ -5888,6 +5892,35 @@ mod batch_tests {
             parse_tsv(&tsv, grid.null_copy()),
             vec![vec![Some("1".into()), Some("a,\"b\"".into()), None], vec![Some("2".into()), Some("乙".into()), Some("x".into())]]
         );
+    }
+
+    #[test]
+    fn undoing_a_batch_restores_replaced_changes_in_original_order() {
+        let mut grid = people("sqlite", 3);
+        // A = (0, name)，B = (0, note)，C = (1, name)。
+        assert_eq!(grid.stage_text(0, 1, Some("改A".into())), Gate::Writable);
+        assert_eq!(grid.stage_text(0, 2, Some("改B".into())), Gate::Writable);
+        grid.select(0, 1, false);
+        grid.select(1, 1, true);
+        assert_eq!(grid.stage_selection(Some("批".into())), Ok(2));
+        assert_eq!(grid.cell_label(0, 1), "批");
+        assert_eq!(grid.cell_label(1, 1), "批");
+        // 撤销整批：A 回到批量前的暂存值，C 回到原值，B 不动。
+        assert!(grid.undo_last_stage());
+        assert_eq!(grid.staged_count(), 2);
+        assert_eq!(grid.cell_label(0, 1), "改A");
+        assert_eq!(grid.cell_label(0, 2), "改B");
+        assert_eq!(grid.cell_label(1, 1), "名2");
+        // 下一次撤销按原暂存顺序先撤 B，A 保持。
+        assert!(grid.undo_last_stage());
+        assert_eq!(grid.staged_count(), 1);
+        assert_eq!(grid.cell_label(0, 1), "改A");
+        assert_eq!(grid.cell_label(0, 2), "备注");
+        // 再撤销才轮到 A。
+        assert!(grid.undo_last_stage());
+        assert_eq!(grid.staged_count(), 0);
+        assert_eq!(grid.cell_label(0, 1), "名1");
+        assert!(!grid.undo_last_stage());
     }
 
     #[test]
