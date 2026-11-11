@@ -55,6 +55,11 @@ impl Workbench {
         SharedString::from(env_label(|key| self.model.text(key), env))
     }
 
+    /// 连接的环境标签小块；没有标签（空或 none）时不画。
+    fn env_pill(&self, env: &str, p: &Palette) -> Option<AnyElement> {
+        env_shown(env).then(|| kit::env_tag(env, self.env_text(env), p))
+    }
+
     /// 当前密度的尺寸指标；绘制只读这一处。
     fn metrics(&self) -> kit::Metrics {
         self.model.shell.density.metrics()
@@ -1041,7 +1046,7 @@ impl Workbench {
                     .max_w(px(target_max))
                     .child(kit::engine_badge(&engine, 14.))
                     .child(div().min_w(px(0.)).truncate().child(SharedString::from(if database.is_empty() { name } else { format!("{name} / {database}") })))
-                    .when(!env.is_empty(), |this| this.child(kit::env_tag(&env, self.env_text(&env), &p)))
+                    .children(self.env_pill(&env, &p))
                     .into_any_element()
             }
             _ => div().flex().items_center().gap(px(6.)).child(kit::status_dot(p.line_strong)).child(self.t("ui.status.noTarget")).into_any_element(),
@@ -1117,7 +1122,7 @@ impl Workbench {
                             .child(div().truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(row.saved.name.clone())))
                             .child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(detail))),
                     )
-                    .child(kit::env_tag(&row.saved.env, self.env_text(&row.saved.env), &p))
+                    .children(self.env_pill(&row.saved.env, &p))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.model.shell.sidebar_open = true;
                         this.click_connection(&id, false, cx);
@@ -1289,7 +1294,7 @@ impl Workbench {
                             .child(div().truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(row.saved.name.clone())))
                             .child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(connection_detail(row)))),
                     )
-                    .child(div().flex().flex_col().items_end().gap(px(4.)).child(kit::env_tag(&row.saved.env, self.env_text(&row.saved.env), &p)).child(kit::status_dot(dot)))
+                    .child(div().flex().flex_col().items_end().gap(px(4.)).children(self.env_pill(&row.saved.env, &p)).child(kit::status_dot(dot)))
                     .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                         this.menu_at = event.position;
                         let _ = this.model.dispatch(&menu);
@@ -2877,6 +2882,8 @@ impl Workbench {
         } else if prompt.plan.is_none() && prompt.error.is_none() && prompt.kind == super::danger::DangerKind::Rename {
             content = content.child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(self.t("catalog.danger.renameHint")));
         }
+        // 计划文字与错误由执行层按中文生成；英文界面按句型表逐条换成英文（数据库原文不动）。
+        let locale = if self.model.shell.locale == crate::app::Locale::En { i18n::Locale::En } else { i18n::Locale::ZhCn };
         if let Some(plan) = prompt.plan.as_ref() {
             if !plan.sql.is_empty() {
                 let mono = cx.theme().mono_font_family.clone();
@@ -2894,8 +2901,6 @@ impl Workbench {
                         .child(SharedString::from(plan.sql.join("\n"))),
                 );
             }
-            // 计划文字由执行层按中文生成；英文界面按句型表换成英文（数据库原文不动）。
-            let locale = if self.model.shell.locale == crate::app::Locale::En { i18n::Locale::En } else { i18n::Locale::ZhCn };
             let mut risks = div().id("danger-risks").flex().flex_col().gap(px(4.));
             for (index, (level, text)) in plan.risks.iter().enumerate() {
                 let (fg, bg) = if level == "danger" { (p.danger, p.danger_soft) } else if level == "warn" { (p.warn, p.warn_soft) } else { (p.text_muted, p.hover) };
@@ -2921,8 +2926,14 @@ impl Workbench {
             }
         }
         if let Some(error) = prompt.error.as_ref() {
-            let error = if self.model.shell.locale == crate::app::Locale::En { crate::ddl::english::english(error) } else { error.clone() };
-            content = content.child(div().id("danger-error").child(banner(IconName::TriangleAlert, SharedString::from(error), p.danger, p.danger_soft)));
+            let error = prompt.error_text(locale).unwrap_or_else(|| error.clone());
+            content = content.child(
+                div()
+                    .id("danger-error")
+                    .test_support()
+                    .aria_label(SharedString::from(error.clone()))
+                    .child(banner(IconName::TriangleAlert, SharedString::from(error), p.danger, p.danger_soft)),
+            );
         }
         if prompt.prod {
             let hint = i18n::fill(&self.model.text("catalog.danger.prodHint"), &[("name", &prompt.object.name)]);
@@ -3390,6 +3401,12 @@ fn _locale_name(locale: i18n::Locale) -> &'static str {
         i18n::Locale::ZhCn => "zh",
         i18n::Locale::En => "en",
     }
+}
+
+/// 是否画环境标签：未打标签（空或 `none`）的连接不显示标签小块。
+pub(super) fn env_shown(env: &str) -> bool {
+    let env = env.trim();
+    !env.is_empty() && env != crate::connections::model::ENV_NONE
 }
 
 /// 内置环境（dev/test/prod/local）走字典；字典里没有的自定义标签原样显示。

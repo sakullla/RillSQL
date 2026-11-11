@@ -18,21 +18,18 @@ const PATTERNS: &[(&str, &str)] = &[
     ("目标视图和已读取的对象不一致，没有生成语句。", "The target view doesn't match the object that was read, so no statement was generated."),
     ("这是基础表，不是视图，这里不会删除它。", "This is a base table, not a view, so it won't be dropped here."),
     (
-        "当前连接 foreign_keys = {}。不会为了让这次操作看起来成功而静默打开或关闭它。",
+        "当前连接 foreign_keys = {p}。不会为了让这次操作看起来成功而静默打开或关闭它。",
         "This connection has foreign_keys = {0}. It is never switched on or off silently to make this operation look successful.",
     ),
-    ("未知", "unknown"),
     ("Redis 没有结构编辑。", "Redis has no structure editing."),
     ("MongoDB 没有结构编辑。", "MongoDB has no structure editing."),
     ("当前连接打开的是 main，没有另开连接修改 {}", "This connection has main open; no other connection was opened to change {0}"),
     ("需要数据库名，没有另开连接。", "A database name is required; no other connection was opened."),
     ("PostgreSQL 需要指定 schema（表所在的分组名），没有另开连接。", "PostgreSQL needs a schema (the group the table is in); no other connection was opened."),
     ("SQL Server 需要指定 schema（表所在的分组名），没有另开连接。", "SQL Server needs a schema (the group the table is in); no other connection was opened."),
-    ("被这些外键引用：{}。{}", "Referenced by these foreign keys: {0}. {1}"),
-    ("约 {} 行", "about {0} rows"),
+    ("被这些外键引用：{l}。{p}", "Referenced by these foreign keys: {0}. {1}"),
     // 删除表
-    ("现有数据", "its existing data"),
-    ("将永久删除 {} 的结构和{}。这不是备份。", "This permanently deletes the structure of {0} and {1}. This is not a backup."),
+    ("将永久删除 {} 的结构和{p}。这不是备份。", "This permanently deletes the structure of {0} and {1}. This is not a backup."),
     ("只删除预览中的这一张表，不隐式级联删除其他业务对象。", "Only this previewed table is dropped; no other object is removed by an implicit cascade."),
     (
         "不会添加 CASCADE。当前 foreign_keys = OFF 时 SQLite 仍可能删除这张表，引用方会留下无效引用。",
@@ -48,11 +45,10 @@ const PATTERNS: &[(&str, &str)] = &[
         "Only this previewed view is dropped; the data in the underlying tables stays and CASCADE is not added.",
     ),
     ("这是物化视图，已经物化的数据会一起删除。", "This is a materialized view; its materialized data is deleted with it."),
-    ("这些视图可能引用它：{}。数据库可能拒绝删除，或让它们失效。", "These views may reference it: {0}. The database may refuse the drop or leave them invalid."),
+    ("这些视图可能引用它：{l}。数据库可能拒绝删除，或让它们失效。", "These views may reference it: {0}. The database may refuse the drop or leave them invalid."),
     // 清空表
-    ("全部", "all"),
     (
-        "将永久删除 {} 里的{}数据，只保留表结构。这不是备份，也不能撤销。",
+        "将永久删除 {} 里的{p}数据，只保留表结构。这不是备份，也不能撤销。",
         "This permanently deletes {1} of the data in {0} and keeps only the table structure. This is not a backup and can't be undone.",
     ),
     (
@@ -89,7 +85,7 @@ const PATTERNS: &[(&str, &str)] = &[
         "将把 {} 改名为 {}。引用旧名的查询、视图、存储过程和应用代码可能失败。",
         "This renames {0} to {1}. Queries, views, stored procedures and application code that use the old name may fail.",
     ),
-    ("这些视图或触发器引用了它：{}。数据库不一定会同步改写它们。", "These views or triggers reference it: {0}. The database won't necessarily update them."),
+    ("这些视图或触发器引用了它：{l}。数据库不一定会同步改写它们。", "These views or triggers reference it: {0}. The database won't necessarily update them."),
     ("sp_rename 不会改写引用旧名的存储过程、函数和视图。", "sp_rename doesn't update stored procedures, functions or views that use the old name."),
     ("把 {} 改名为 {}", "Rename {0} to {1}"),
     // 外键开关
@@ -200,17 +196,69 @@ const PATTERNS: &[(&str, &str)] = &[
     ("event_scheduler 关闭时事件仍然不会执行；这里不改调度器状态。", "Events still don't run while event_scheduler is off; the scheduler state is not changed here."),
     ("启用事件 {}", "Enable event {0}"),
     ("停用事件 {}", "Disable event {0}"),
+    // 执行结果与确认层错误（执行层、应用层与界面生成的话；数据库原文不在这里）。
+    (
+        "预览已过期：数据库里的结构或生成的 SQL 和确认时看到的不一致，没有执行。",
+        "The preview is out of date: the structure in the database or the generated SQL no longer matches what you confirmed, so nothing was run.",
+    ),
+    ("前面的语句没有成功，这条没有执行。", "An earlier statement didn't succeed, so this one was not run."),
+    ("这条连接还没有打开，没有另开新的连接。", "This connection isn't open yet; no new connection was opened."),
+    ("结构变更需要先确认预览中的 SQL，未确认不会执行。", "Structure changes need the previewed SQL to be confirmed first; nothing runs without confirmation."),
+    ("这个连接没有连着可查询的数据库。", "This connection isn't connected to a database that can be queried."),
+    ("会话类型和目标数据库不一致，没有另开连接。", "The session type doesn't match the target database; no other connection was opened."),
+    ("foreign_key_check 发现 {} 处违规，不会把这次重建当成成功。", "foreign_key_check found {0} violations, so this rebuild is not treated as a success."),
+    ("不支持的数据库 {}", "Unsupported database {0}"),
+    ("没有执行任何语句", "No statement was run"),
+    ("生成计划失败", "Generating the plan failed"),
+    ("执行失败", "Execution failed"),
 ];
+
+/// 只出现在句型 `{p}` 位置里的短语（行数、“全部”、“未知”）。不参与整句匹配，
+/// 所以名字恰好是“未知”“全部”的对象不会被换成英文词。
+const PHRASES: &[(&str, &str)] = &[("约 {} 行", "about {0} rows"), ("现有数据", "its existing data"), ("全部", "all"), ("未知", "unknown")];
 
 /// 是否含中日韩文字或全角标点。
 pub fn has_cjk(text: &str) -> bool {
     text.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch) || ('\u{3000}'..='\u{303f}').contains(&ch) || ('\u{ff00}'..='\u{ffef}').contains(&ch))
 }
 
+/// 句型里可变部分的种类：`{}` 名字/数值，原样保留；`{l}` 用顿号连起来的名字列表，只把顿号换成逗号；
+/// `{p}` 已知短语或句子（行数、执行规则等），按短语表和句型表换成英文。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Name,
+    List,
+    Phrase,
+}
+
+/// 把句型拆成字面段和可变部分；字面段比可变部分多一段。
+fn split_pattern(pattern: &str) -> (Vec<&str>, Vec<Slot>) {
+    let mut parts = Vec::new();
+    let mut slots = Vec::new();
+    let mut rest = pattern;
+    loop {
+        let next = [("{}", Slot::Name), ("{l}", Slot::List), ("{p}", Slot::Phrase)]
+            .into_iter()
+            .filter_map(|(marker, slot)| rest.find(marker).map(|at| (at, marker.len(), slot)))
+            .min_by_key(|(at, _, _)| *at);
+        match next {
+            Some((at, len, slot)) => {
+                parts.push(&rest[..at]);
+                slots.push(slot);
+                rest = &rest[at + len..];
+            }
+            None => {
+                parts.push(rest);
+                return (parts, slots);
+            }
+        }
+    }
+}
+
 /// 按句型把 `text` 拆成可变部分（可以为空，例如还没填的新名字）；不匹配返回 None。
 /// 中间的可变部分取最短匹配，最后一段吃到结尾。
-fn captures(pattern: &str, text: &str) -> Option<Vec<String>> {
-    let parts: Vec<&str> = pattern.split("{}").collect();
+fn captures(pattern: &str, text: &str) -> Option<Vec<(Slot, String)>> {
+    let (parts, slots) = split_pattern(pattern);
     let mut rest = text.strip_prefix(parts[0])?;
     if parts.len() == 1 {
         return rest.is_empty().then(Vec::new);
@@ -218,36 +266,42 @@ fn captures(pattern: &str, text: &str) -> Option<Vec<String>> {
     let mut values = Vec::new();
     for (index, literal) in parts.iter().enumerate().skip(1) {
         if index == parts.len() - 1 {
-            values.push(rest.strip_suffix(literal)?.to_owned());
+            values.push((slots[index - 1], rest.strip_suffix(literal)?.to_owned()));
         } else {
             if literal.is_empty() {
                 return None;
             }
             let at = rest.find(literal)?;
-            values.push(rest[..at].to_owned());
+            values.push((slots[index - 1], rest[..at].to_owned()));
             rest = &rest[at + literal.len()..];
         }
     }
     Some(values)
 }
 
-/// 可变部分：本身是已知句子就换成英文；名字列表里的顿号换成逗号。
-fn value_in_english(value: &str) -> String {
-    if !has_cjk(value) {
-        return value.to_owned();
+/// 可变部分按种类换成英文：名字原样，列表只换分隔符，短语查短语表和句型表（查不到原样）。
+fn value_in_english(slot: Slot, value: &str) -> String {
+    match slot {
+        Slot::Name => value.to_owned(),
+        Slot::List => value.replace('、', ", "),
+        Slot::Phrase if !has_cjk(value) => value.to_owned(),
+        Slot::Phrase => translate_with(PHRASES, value).or_else(|| translate(value)).unwrap_or_else(|| value.to_owned()),
     }
-    translate(value).unwrap_or_else(|| value.replace('、', ", "))
 }
 
-fn translate(text: &str) -> Option<String> {
-    PATTERNS.iter().find_map(|(zh, en)| {
+fn translate_with(table: &[(&str, &str)], text: &str) -> Option<String> {
+    table.iter().find_map(|(zh, en)| {
         let values = captures(zh, text)?;
         let mut out = (*en).to_owned();
-        for (index, value) in values.iter().enumerate() {
-            out = out.replace(&format!("{{{index}}}"), &value_in_english(value));
+        for (index, (slot, value)) in values.iter().enumerate() {
+            out = out.replace(&format!("{{{index}}}"), &value_in_english(*slot, value));
         }
         Some(out)
     })
+}
+
+fn translate(text: &str) -> Option<String> {
+    translate_with(PATTERNS, text)
 }
 
 /// 计划文字的英文版；不是已知句型时原样返回。
@@ -423,5 +477,63 @@ mod tests {
         assert_eq!(english("no such table: orders"), "no such table: orders", "数据库原文不改");
         assert_eq!(english("一句没有句型的话"), "一句没有句型的话");
         assert_eq!(localize("删除 orders", crate::i18n::Locale::ZhCn), "删除 orders");
+    }
+
+    /// 对象名位置不做整句翻译、不换顿号：名为“未知”“全部”“a、b”的对象在英文句子里原样出现；只有已知短语位置换成英文。
+    #[test]
+    fn object_name_slots_keep_the_name_verbatim() {
+        assert_eq!(english("删除视图 未知"), "Drop view 未知");
+        assert_eq!(english("删除 a、b"), "Drop a、b");
+        assert_eq!(english("清空 全部"), "Empty 全部");
+        assert_eq!(
+            english("将把 未知 改名为 a、b。引用旧名的查询、视图、存储过程和应用代码可能失败。"),
+            "This renames 未知 to a、b. Queries, views, stored procedures and application code that use the old name may fail."
+        );
+        // 短语位置仍然换成英文，名字位置不动。
+        assert_eq!(
+            english("将永久删除 全部 里的全部数据，只保留表结构。这不是备份，也不能撤销。"),
+            "This permanently deletes all of the data in 全部 and keeps only the table structure. This is not a backup and can't be undone."
+        );
+        assert_eq!(
+            english("将永久删除 现有数据 的结构和现有数据。这不是备份。"),
+            "This permanently deletes the structure of 现有数据 and its existing data. This is not a backup."
+        );
+        assert_eq!(
+            english("当前连接 foreign_keys = 未知。不会为了让这次操作看起来成功而静默打开或关闭它。"),
+            "This connection has foreign_keys = unknown. It is never switched on or off silently to make this operation look successful."
+        );
+        // 短语不参与整句匹配。
+        assert_eq!(english("未知"), "未知");
+        // 经过计划生成：视图名“未知”、表名“a、b”在英文风险和步骤里原样。
+        let view = snapshot(Engine::Sqlite, "view", "未知");
+        let dropped = plan(&view, &Action::DropView { view: "未知".into() });
+        assert_eq!(english(&dropped.steps[0].label), "Drop view 未知");
+        let risk = english(&dropped.risks[0].text);
+        assert!(risk.starts_with("This permanently deletes the definition of view ") && risk.contains("未知") && !risk.contains("unknown"), "{risk}");
+        let table = snapshot(Engine::Sqlite, "table", "a、b");
+        let truncated = plan(&table, &Action::TruncateTable { table: "a、b".into() });
+        assert_eq!(english(&truncated.steps[0].label), "Empty a、b");
+        assert!(english(&truncated.risks[0].text).contains("a、b"), "{}", english(&truncated.risks[0].text));
+    }
+
+    /// 确认层会显示的程序自己的错误（预览过期、连接未打开、后续跳过、兜底）都有英文。
+    #[test]
+    fn app_generated_errors_have_an_english_form() {
+        for text in [
+            "预览已过期：数据库里的结构或生成的 SQL 和确认时看到的不一致，没有执行。",
+            "前面的语句没有成功，这条没有执行。",
+            "这条连接还没有打开，没有另开新的连接。",
+            "结构变更需要先确认预览中的 SQL，未确认不会执行。",
+            "这个连接没有连着可查询的数据库。",
+            "会话类型和目标数据库不一致，没有另开连接。",
+            "foreign_key_check 发现 3 处违规，不会把这次重建当成成功。",
+            "不支持的数据库 oracle",
+            "没有执行任何语句",
+            "生成计划失败",
+            "执行失败",
+        ] {
+            let en = english(text);
+            assert!(!has_cjk(&en), "没有英文：{text} -> {en}");
+        }
     }
 }

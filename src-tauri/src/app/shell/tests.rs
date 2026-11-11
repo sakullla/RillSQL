@@ -6118,6 +6118,85 @@ fn sqlite_tables(path: &std::path::Path) -> Vec<String> {
     .expect("sqlite thread")
 }
 
+/// 英文界面：确认层走到“预览过期”和“连接未打开”两条程序自己的错误时，错误横幅是英文。
+/// 错误文字来自真实的执行层与应用层（SQL 和预览不一致、连接 id 不存在），不在测试里手写。
+#[gpui_kit::test]
+fn english_danger_layer_errors_have_no_chinese(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = sqlite_notes_workbench(cx, true);
+    wait_for_shell_ready(cx, window, &view);
+    let database = dir.join("items.sqlite");
+    sqlite_exec_on_file(&database, "CREATE TABLE scratch (id INTEGER PRIMARY KEY)");
+    cx.update_window(window, |_, _, cx| view.update(cx, |view, cx| view.perform("refresh-tree", cx))).unwrap();
+    let scratch = wait_for_nav_object(cx, window, &view, "scratch");
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("locale-en", cx)));
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            assert!(view.model.open_nav_menu(&scratch));
+            view.perform("tree-drop-object", cx);
+        })
+    })
+    .unwrap();
+    assert!(pump_until(cx, window, &view, |view, _| view.model.danger.as_ref().is_some_and(|prompt| prompt.plan.is_some() && !prompt.loading)), "没有生成计划");
+    let error_label = |cx: &mut gpui_kit::TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find("danger-error").map(|banner| banner.label().unwrap_or_default().to_owned())
+        })
+        .unwrap()
+    };
+    assert!(error_label(cx).is_none());
+
+    // 预览过期：确认的 SQL 和执行时重新生成的不一致，执行层拒绝。
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            let plan = view.model.danger.as_mut().and_then(|prompt| prompt.plan.as_mut()).unwrap();
+            plan.sql = vec!["DROP TABLE \"scratch_elsewhere\";".to_owned()];
+        })
+    });
+    for _ in 0..2 {
+        cx.update_window(window, |_, _, cx| view.update(cx, |view, cx| view.perform("danger-execute", cx))).unwrap();
+    }
+    assert!(
+        pump_until(cx, window, &view, |view, _| view.model.danger.as_ref().is_some_and(|prompt| !prompt.running && prompt.error.is_some())),
+        "没有得到过期错误"
+    );
+    let zh = cx.update(|cx| view.read(cx).model.danger.as_ref().and_then(|prompt| prompt.error.clone()).unwrap());
+    assert!(zh.contains("预览已过期"), "执行层给出的是过期错误：{zh}");
+    let shown = error_label(cx).expect("错误横幅");
+    assert!(!crate::ddl::english::has_cjk(&shown), "英文确认层错误残留中文：{shown}");
+    assert!(shown.contains("out of date"), "{shown}");
+    assert!(sqlite_tables(&database).contains(&"scratch".to_owned()), "过期时不执行");
+
+    // 连接没有打开：应用层不另开连接，直接报错。
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.model.danger.as_mut().unwrap().object.connection_id = "t7-closed-connection".to_owned();
+            view.perform("danger-preview", cx);
+        })
+    });
+    assert!(
+        pump_until(cx, window, &view, |view, _| view.model.danger.as_ref().is_some_and(|prompt| !prompt.loading && prompt.error.is_some())),
+        "没有得到连接未打开的错误"
+    );
+    let zh = cx.update(|cx| view.read(cx).model.danger.as_ref().and_then(|prompt| prompt.error.clone()).unwrap());
+    assert!(zh.contains("没有打开"), "应用层给出的是连接未打开：{zh}");
+    let shown = error_label(cx).expect("错误横幅");
+    assert!(!crate::ddl::english::has_cjk(&shown), "英文确认层错误残留中文：{shown}");
+    assert!(shown.contains("isn't open"), "{shown}");
+
+    // 中文界面仍显示原文。
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("locale-zh", cx)));
+    assert_eq!(error_label(cx).as_deref(), Some(zh.as_str()));
+}
+
+#[test]
+fn untagged_connections_show_no_env_pill() {
+    assert!(!super::chrome::env_shown(""));
+    assert!(!super::chrome::env_shown(crate::connections::model::ENV_NONE));
+    assert!(super::chrome::env_shown("prod"));
+    assert!(super::chrome::env_shown("t7-live"));
+}
+
 #[test]
 fn custom_env_tags_never_show_a_dictionary_key() {
     use crate::i18n::{text, Locale};

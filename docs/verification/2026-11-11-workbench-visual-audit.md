@@ -41,7 +41,7 @@
 | 管理 | 已修正（16→15） | 符合 | 已修正（12/8→6） | 符合 | 符合 | 符合 | 符合（英文界面说明与阻断文字走 i18n，`english_admin_copy_has_no_chinese`） | 符合 |
 | MongoDB | 已修正 | 已修正（顶栏、表头、行、导航行随密度） | 已修正 | 符合 | 符合 | 已修正（导航行 `interactive_states`） | 已修正（对象树不再常驻“读取对象失败”：非关系引擎列元数据为空而非失败，`column_meta_of_non_relational_engines_is_empty_not_a_failure`） | 符合 |
 | Redis | 已修正（15 保留为 LG） | 已修正（键列表行随密度） | 已修正（值面板 10→6、行 6→4） | 符合 | 符合 | 已修正（键列表行 `interactive_states`） | 符合 | 符合 |
-| 菜单 / 命令面板 / 确认层 / 定义查看器 / 签名提示 | 已修正（帮助标题 14→15；英文界面确认层风险/阻断/错误文字为英文，对象名保留） | 符合（菜单行 `menu_row_h`） | 已修正（菜单 9→6、项 6→4、对话框 12→6） | 符合 | 符合 | 已修正（菜单项、面板项 `row_states`；禁用项保留 not-allowed 与原因） | 符合（确认层读取/执行用加载态） | 符合 |
+| 菜单 / 命令面板 / 确认层 / 定义查看器 / 签名提示 | 已修正（帮助标题 14→15；英文界面确认层风险/阻断文字与程序自己生成的错误（预览过期、连接未打开、后续跳过、没有执行任何语句、生成计划/执行失败兜底）为英文，多条原因逐条翻译后拼接，`english_danger_layer_errors_have_no_chinese`；对象名原样保留，`object_name_slots_keep_the_name_verbatim`；数据库原始错误原样透出，见 §5.1） | 符合（菜单行 `menu_row_h`） | 已修正（菜单 9→6、项 6→4、对话框 12→6） | 符合 | 符合 | 已修正（菜单项、面板项 `row_states`；禁用项保留 not-allowed 与原因） | 符合（确认层读取/执行用加载态） | 符合 |
 
 ## 3. 改动明细
 
@@ -90,6 +90,9 @@
 - A2：英文界面不再出现中文——导入导出全部提示与来源标签（`ui.exchange.*`，`english_exchange_copy_has_no_chinese`）、管理页说明（`admin.inventory.unlisted`、`admin.note.*`）、确认层风险与管理计划句子（`ddl/english.rs` 句式表，`every_danger_and_admin_plan_sentence_has_an_english_form`）、未执行语句（`statement_message`，`skipped_statements_read_in_the_ui_language`）；壳层测试断言英文确认层风险无 CJK。
 - A2：`compare`/`diagram` 的 `lines()` 与实际渲染一致（不再含已移到悬停提示的副标题/只读说明）。
 - A2：连接页与欢迎页的自定义环境标签显示标签本身，不再漏出字典键 `ui.conn.env.<id>`（`custom_env_tags_never_show_a_dictionary_key`）。
+- A3：英文界面确认层的错误横幅不再残留程序自己生成的中文：句式表补齐预览过期（`ddl/exec.rs`）、连接未打开（`application/ddl.rs`、`ddl/commands.rs`）、后续语句跳过、“没有执行任何语句”、“生成计划失败”“执行失败”等句子；确认层保留执行结果的各条原因，英文逐条翻译后再拼接（`receipt_errors_translate_each_item_before_joining`）。壳层测试用真实 SQLite 把英文确认层分别走到预览过期与连接未打开，断言错误横幅无 CJK（`english_danger_layer_errors_have_no_chinese`）。
+- A3：句式里的可变部分分三类——对象名原样（不做整句翻译、不换顿号）、名字列表只把顿号换成逗号、已知短语位置（“约 N 行”“现有数据”“全部”“未知”与外键执行说明）才换英文；名为“未知”“a、b”的对象在英文风险句中原样显示（`object_name_slots_keep_the_name_verbatim`）。
+- A3：未打标签（空或 `none`）的连接在连接页、欢迎页与状态栏不再显示标签小块（此前显示英文 “none”），`untagged_connections_show_no_env_pill`。现有截图里的连接都带标签，可见文字无变化，未重截。
 
 ## 4. 原生截图
 
@@ -106,10 +109,10 @@
 
 A1 记录的偏离（Mongo/Redis 未截到、英文界面残留中文、640 工具条裁切、快捷键帮助未滚到表格组、紧凑控件高大于标准）在 A2 均已修正并重截，不再列为遗留。仍存在的事实：
 
-1. 确认层与管理计划的英文是显示时按句式表翻译（`ddl/english.rs`），后端计划仍生成中文；句式表外的文本（如数据库原始错误）原样透出。
+1. 确认层与管理计划的英文是显示时按句式表翻译（`ddl/english.rs`），后端计划与错误仍生成中文。确认层会出现的程序自己生成的句子（计划风险/阻断、预览过期、连接未打开、会话类型不一致、后续跳过、兜底失败）都在表里；只有数据库原始错误（本身多为英文，按原文保留）与对象名原样透出。对象名中的顿号在“名字列表”位置与分隔符无法区分，会被换成逗号（只影响引用方列表的显示，不影响对象行与 SQL）。
 2. 管理页：恢复的管理标签在连接建立前探测一次目录会话，之后不再重探，因此截图中即使连接已绿点，仍显示“没有连接到这个引擎，预览不会执行”；界面上也没找到打开管理页的入口（只有恢复的标签与内部 `open-admin`）。非视觉问题，本任务未改。
 3. 键盘 Tab：焦点停在工作台未挂到元素树的根句柄上时（例如 Ctrl+, 进入设置页后），Tab 不移动焦点；从对象树等已挂载的焦点出发正常。焦点环截图从对象树 Tab 出发。
-4. 自定义环境标签在连接页/欢迎页显示标签 id（壳层没有读取 `env_tags` 的显示名），颜色按内置色调规则。
+4. 自定义环境标签在连接页/欢迎页/状态栏显示标签 id（壳层没有读取 `env_tags` 的显示名；连接列表由连接页模块读取，接入 `list_tags` 需要改连接页的读取链路，本次未做），颜色按内置色调规则。确认层已按 `list_tags` 显示自定义标签名。未打标签的连接不再显示 “none”。
 5. 英文网格工具条里搜索框占位与查找范围开关同为 “Find in loaded rows”（`ui.grid.searchPlaceholder` 与 `grid.find.loaded`），措辞重复，非中文残留。
 6. 四态覆盖：自定义可点元素按 `interactive`/`interactive_states`/`row_states` 收敛，测试断言焦点环 2px、浅深色对比 ≥ 3:1、可用元素是 Tab 停靠点、禁用元素不可聚焦、点击不抢焦点；不声称每个元素都逐一有测试。
 7. 调试版 `target/debug/rillsql.exe` 在本机启动即主线程栈溢出（`thread 'main' has overflowed its stack`）；发布版正常，截图全部来自发布版。未验证该问题是否在基线 `a2f2e5e` 已存在。

@@ -75,9 +75,10 @@ impl DangerPlan {
 }
 
 /// 执行结果：被拦下或任何一条语句没有成功都算失败，带上数据库给的原因。
-pub fn receipt_outcome(receipt: &Receipt) -> Result<(), String> {
+/// 原因逐条给出：英文界面先逐条换成英文再拼起来（拼好的整句不在句型表里）。
+pub fn receipt_problems(receipt: &Receipt) -> Result<(), Vec<String>> {
     if !receipt.blocked.is_empty() {
-        return Err(receipt.blocked.join(" "));
+        return Err(receipt.blocked.clone());
     }
     let failed: Vec<String> = receipt
         .steps
@@ -86,12 +87,12 @@ pub fn receipt_outcome(receipt: &Receipt) -> Result<(), String> {
         .map(|step| if step.message.is_empty() { step.sql.clone() } else { step.message.clone() })
         .collect();
     if receipt.steps.is_empty() {
-        return Err("没有执行任何语句".to_owned());
+        return Err(vec!["没有执行任何语句".to_owned()]);
     }
     if failed.is_empty() {
         Ok(())
     } else {
-        Err(failed.join(" "))
+        Err(failed)
     }
 }
 
@@ -123,6 +124,8 @@ pub struct DangerPrompt {
     pub armed: bool,
     pub running: bool,
     pub error: Option<String>,
+    /// `error` 拆开的各条原因（按界面语言逐条显示）。
+    error_parts: Vec<String>,
     request: Option<DangerStep>,
 }
 
@@ -143,6 +146,7 @@ impl DangerPrompt {
             armed: false,
             running: false,
             error: None,
+            error_parts: Vec::new(),
             request: None,
         };
         // 重命名要先有新名字才生成计划；其余打开即生成预览。
@@ -166,6 +170,22 @@ impl DangerPrompt {
         }
     }
 
+    fn set_error(&mut self, parts: Vec<String>) {
+        self.error = Some(parts.join(" "));
+        self.error_parts = parts;
+    }
+
+    fn clear_error(&mut self) {
+        self.error = None;
+        self.error_parts.clear();
+    }
+
+    /// 确认层显示的错误：英文界面逐条换成英文后再拼接；数据库原文不改。
+    pub fn error_text(&self, locale: crate::i18n::Locale) -> Option<String> {
+        self.error.as_ref()?;
+        Some(self.error_parts.iter().map(|part| crate::ddl::english::localize(part, locale)).collect::<Vec<_>>().join(" "))
+    }
+
     pub fn take_request(&mut self) -> Option<DangerStep> {
         self.request.take()
     }
@@ -173,7 +193,7 @@ impl DangerPrompt {
     pub fn request_preview(&mut self) {
         self.plan = None;
         self.armed = false;
-        self.error = None;
+        self.clear_error();
         self.loading = true;
         self.request = Some(DangerStep::Preview);
     }
@@ -192,11 +212,11 @@ impl DangerPrompt {
         match result {
             Ok(plan) => {
                 self.plan = Some(DangerPlan::of(&plan));
-                self.error = None;
+                self.clear_error();
             }
             Err(message) => {
                 self.plan = None;
-                self.error = Some(message);
+                self.set_error(vec![message]);
             }
         }
     }
@@ -213,7 +233,7 @@ impl DangerPrompt {
         self.new_name = text;
         self.plan = None;
         self.armed = false;
-        self.error = None;
+        self.clear_error();
     }
 
     pub fn typed_matches(&self) -> bool {
@@ -237,7 +257,7 @@ impl DangerPrompt {
         }
         self.armed = false;
         self.running = true;
-        self.error = None;
+        self.clear_error();
         self.request = Some(DangerStep::Execute);
         true
     }
@@ -246,10 +266,10 @@ impl DangerPrompt {
     pub fn apply_receipt(&mut self, result: Result<Receipt, String>) -> bool {
         self.running = false;
         self.armed = false;
-        match result.and_then(|receipt| receipt_outcome(&receipt)) {
+        match result.map_err(|message| vec![message]).and_then(|receipt| receipt_problems(&receipt)) {
             Ok(()) => true,
-            Err(message) => {
-                self.error = Some(message);
+            Err(parts) => {
+                self.set_error(parts);
                 false
             }
         }
@@ -342,6 +362,38 @@ mod tests {
         assert!(!prompt.apply_receipt(Err("no such table: orders".to_owned())));
         assert_eq!(prompt.error.as_deref(), Some("no such table: orders"));
         assert!(!prompt.armed && !prompt.running);
+    }
+
+    /// 多条拦下原因先逐条换成英文再拼接（拼好的整句不在句型表里）；数据库原文原样；中文界面是原文。
+    #[test]
+    fn receipt_errors_translate_each_item_before_joining() {
+        use crate::i18n::Locale as L;
+        let receipt = |blocked: &[&str]| Receipt {
+            blocked: blocked.iter().map(|text| (*text).to_owned()).collect(),
+            rule: String::new(),
+            steps: Vec::new(),
+            target: String::new(),
+            rebuild: false,
+        };
+        let mut prompt = DangerPrompt::new(DangerKind::Rename, "n", key(Engine::Sqlite, "orders", ObjectKind::Table), "");
+        assert!(!prompt.apply_receipt(Ok(receipt(&["新表名不能为空。", "名字 a、b 已经被其它对象占用，不会覆盖它。"]))));
+        assert_eq!(prompt.error.as_deref(), Some("新表名不能为空。 名字 a、b 已经被其它对象占用，不会覆盖它。"));
+        assert_eq!(
+            prompt.error_text(L::En).as_deref(),
+            Some("The new table name can't be empty. The name a、b is already used by another object; it won't be overwritten.")
+        );
+        assert_eq!(prompt.error_text(L::ZhCn), prompt.error);
+        assert!(!prompt.apply_receipt(Ok(receipt(&[]))));
+        assert_eq!(prompt.error_text(L::En).as_deref(), Some("No statement was run"));
+        for fallback in ["生成计划失败", "执行失败"] {
+            assert!(!prompt.apply_receipt(Err(fallback.to_owned())));
+            let shown = prompt.error_text(L::En).unwrap();
+            assert!(!crate::ddl::english::has_cjk(&shown), "{shown}");
+        }
+        prompt.apply_plan(Err("no such table: orders".to_owned()));
+        assert_eq!(prompt.error_text(L::En).as_deref(), Some("no such table: orders"));
+        prompt.request_preview();
+        assert!(prompt.error.is_none() && prompt.error_text(L::En).is_none());
     }
 
     #[test]
