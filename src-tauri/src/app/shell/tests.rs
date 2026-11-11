@@ -2159,6 +2159,12 @@ fn query_commands_refuse_a_hidden_query_while_a_table_item_is_active(cx: &mut gp
             assert_eq!(view.query_draft(cx), "select   1", "表格工作项不能格式化隐藏查询");
             view.perform("run-current", cx);
             assert_eq!(view.query_runs(cx), runs);
+            // 结果区与右侧面板的命令同样不得落在隐藏查询上。
+            for id in ["pin-result", "toggle-side", "query-view:messages", "unpin:1", "log:0", "side-mode:object"] {
+                view.model.notice_detail.clear();
+                view.perform(id, cx);
+                assert!(view.model.notice_detail.contains("不是查询"), "{id}: {}", view.model.notice_detail);
+            }
         });
         window.render_frame(cx);
     })

@@ -1406,7 +1406,11 @@ impl QueryPane {
         } else {
             sheet.rows.clone()
         };
-        let target = self.grid_target();
+        // 固定结果按产生它的那次执行的目标绑定：标签之后切了库，也不能拿旧库的行对新库暂存写入。
+        let target = match self.desk.shown_pinned_target() {
+            Some(pinned) => self.pinned_grid_target(pinned),
+            None => self.grid_target(),
+        };
         let sql = sheet.sql.clone();
         let engine = target.engine.clone();
         // 截断与完整行数原样交给网格：被截断的结果不能被说成"已到末尾"。
@@ -1420,8 +1424,35 @@ impl QueryPane {
         });
     }
 
+    /// 固定结果的表格目标。来源无法证明时不给连接：表格不会去定位，结果保持未定位只读。
+    /// 来源连接已经关闭时由表格自己的会话检查拒绝定位，同样是只读。
+    fn pinned_grid_target(&self, pinned: Option<Target>) -> GridTarget {
+        let Some(target) = pinned else {
+            let engine = self.desk.target().map(|target| target.engine).unwrap_or_default();
+            return GridTarget { engine, ..GridTarget::default() };
+        };
+        let environment = if target.environment.is_empty() { self.desk.environment_of(&target.connection_id) } else { target.environment };
+        GridTarget {
+            connection_id: target.connection_id,
+            connection_name: target.connection_name,
+            database: target.database,
+            schema: target.schema,
+            table: String::new(),
+            engine: target.engine,
+            environment,
+        }
+    }
+
+    /// 测试用：结果表格当前绑定的目标与它是否可写。
+    #[cfg(test)]
+    pub fn grid_binding(&self, cx: &mut App) -> (GridTarget, bool) {
+        self.grid.update(cx, |grid, _| grid.with_session(|session| (session.target.clone(), session.writable())))
+    }
+
+    /// 当前结果的表格目标：优先用产生这批结果的那次执行的目标（执行后切库不会把旧结果绑到新库），
+    /// 没有执行来源时按标签当前目标。
     fn grid_target(&self) -> GridTarget {
-        let Some(target) = self.desk.target() else {
+        let Some(target) = self.desk.results_target().or_else(|| self.desk.target()) else {
             return GridTarget::default();
         };
         let environment = if target.environment.is_empty() { self.desk.environment_of(&target.connection_id) } else { target.environment };
@@ -2148,8 +2179,14 @@ pub fn requires_active_query(id: &str) -> bool {
             | "open-sql-file"
             | "save-sql-file"
             | "save-query"
+            | "pin-result"
+            | "toggle-side"
     ) || id.starts_with("statement:")
         || id.starts_with("outline:")
+        || id.starts_with("query-view:")
+        || id.starts_with("unpin:")
+        || id.starts_with("log:")
+        || id.starts_with("side-mode:")
         || id.starts_with("database:")
         || id.starts_with("bind-connection:")
 }
@@ -3284,6 +3321,145 @@ mod tests {
             assert!(window.try_find("query-pinned-1").is_none(), "固定页签可以手动关闭");
             assert!(pane.read(cx).desk.pinned().is_empty());
             assert_eq!(pane.read(cx).cell(0, 0, cx), "c", "关掉正在看的固定结果后回到当前结果");
+        })
+        .unwrap();
+    }
+
+    fn run_in(pane: &mut QueryPane) -> Ticket {
+        let prepared = match pane.desk.begin_run(&pane.services.tasks, RunScope::Script, None) {
+            BeginRun::Ready(prepared) => prepared,
+            BeginRun::Rejected(reason) => panic!("{reason}"),
+            BeginRun::Variables(_) => panic!("variables"),
+        };
+        Ticket { tab_id: prepared.tab_id.clone(), token: prepared.token, version: prepared.version }
+    }
+
+    #[gpui_kit::test]
+    fn a_pinned_result_stays_bound_to_the_database_it_came_from(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "SELECT * FROM thread_items")), Some("q"), Locale::ZhCn, window, cx);
+                // 在库 A（main）上执行并固定。
+                let ticket = run_in(pane);
+                assert!(!pane.apply_run_snapshot(&ticket, Ok(streamed_run("run-1", "ok", &["1"])), cx));
+                pane.command("pin-result", cx);
+                assert_eq!(pane.desk.pinned().len(), 1);
+                assert_eq!(pane.desk.pinned()[0].target.as_ref().map(|target| target.database.as_str()), Some("main"));
+                // 标签切到库 B。
+                pane.command("database:other", cx);
+                assert_eq!(pane.desk.target().map(|target| target.database), Some("other".to_owned()));
+                // 先回当前结果，再点固定页签：表格重新绑定。
+                pane.command("query-view:current", cx);
+            });
+            window.render_frame(cx);
+            let (target, _) = pane.update(cx, |pane, cx| pane.grid_binding(cx));
+            assert_eq!(target.database, "main", "当前结果也仍是产生它的库");
+            pane.update(cx, |pane, cx| pane.command("query-view:pinned:1", cx));
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).desk.result_view(), ResultView::Pinned(1));
+            let (target, writable) = pane.update(cx, |pane, cx| pane.grid_binding(cx));
+            assert_eq!(target.connection_id, "notes");
+            assert_eq!(target.database, "main", "固定结果不能绑到切换后的库 B");
+            assert!(!writable);
+            assert_eq!(pane.read(cx).cell(0, 0, cx), "1");
+
+            // 来源无法证明的结果（外部写入）固定后不带连接：表格不会定位，只读。
+            pane.update(cx, |pane, cx| {
+                let tabs = [bound("q", "SELECT * FROM thread_items"), bound("u", "select 'x'")];
+                let _ = pane.sync(&tabs, Some("u"), Locale::ZhCn, window, cx);
+                pane.show_sheet(vec!["label".to_owned()], vec![vec!["x".to_owned()]], cx);
+                pane.command("pin-result", cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).desk.result_view(), ResultView::Pinned(1));
+            assert!(pane.read(cx).desk.pinned()[0].target.is_none());
+            let (target, writable) = pane.update(cx, |pane, cx| pane.grid_binding(cx));
+            assert!(target.connection_id.is_empty() && target.database.is_empty(), "{target:?}");
+            assert!(!writable);
+            assert_eq!(pane.read(cx).cell(0, 0, cx), "x");
+        })
+        .unwrap();
+    }
+
+    fn two_statement_run(status: &str, second: &str) -> RunDto {
+        let mut run = streamed_run("run-1", status, &["1"]);
+        let mut first = run.statements[0].clone();
+        first.status = "ok".to_owned();
+        first.elapsed_ms = Some(3);
+        let mut next = first.clone();
+        next.sql = "SELECT 2".to_owned();
+        next.status = second.to_owned();
+        next.elapsed_ms = None;
+        run.statements = vec![first, next];
+        run
+    }
+
+    #[gpui_kit::test]
+    fn a_cancelled_or_failed_run_still_logs_the_statements_that_finished(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "SELECT * FROM thread_items; SELECT 2")), Some("q"), Locale::ZhCn, window, cx);
+                // 取消：第一条已完成，第二条还在执行。
+                let ticket = run_in(pane);
+                assert!(pane.apply_run_snapshot(&ticket, Ok(two_statement_run("running", "running")), cx));
+                pane.command("request-cancel", cx);
+                let log = pane.desk.log();
+                assert_eq!(log.len(), 2, "{log:?}");
+                assert_eq!(log[0].statement, Some(0));
+                assert_eq!(log[0].status, "ok");
+                assert_eq!(log[0].elapsed_ms, Some(3));
+                assert_eq!(log[1].statement, None);
+                assert_eq!(log[1].status, "cancelled");
+
+                // 整次失败（连接中断）：同样先记已完成的语句。
+                let ticket = run_in(pane);
+                assert!(pane.desk.log().is_empty(), "新一次执行清空消息");
+                assert!(pane.desk.stop_run("q", ticket.token, "连接中断"), "没有快照时也要结束");
+                let log = pane.desk.log();
+                assert_eq!(log.len(), 1, "本次没有快照时不把上一次的结果记进来：{log:?}");
+                assert_eq!(log[0].statement, None);
+
+                let ticket = run_in(pane);
+                assert!(pane.apply_run_snapshot(&ticket, Ok(two_statement_run("running", "pending")), cx));
+                assert!(pane.desk.stop_run("q", ticket.token, "连接中断"));
+                let log = pane.desk.log();
+                assert_eq!(log.len(), 2, "{log:?}");
+                assert_eq!((log[0].statement, log[0].status.as_str()), (Some(0), "ok"));
+                assert_eq!((log[1].statement, log[1].status.as_str(), log[1].message.as_str()), (None, "error", "连接中断"));
+            });
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn pane_commands_only_act_on_the_active_query() {
+        for id in ["pin-result", "toggle-side", "query-view:current", "query-view:pinned:1", "unpin:1", "log:0", "side-mode:object"] {
+            assert!(requires_active_query(id), "{id}");
+        }
+    }
+
+    #[gpui_kit::test]
+    fn pane_commands_refuse_a_hidden_query(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let snap = bound("q", "select 1");
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&snap), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![result("select 1", "ok", &["v"], &["1"], None, "")]);
+                let _ = pane.sync(std::slice::from_ref(&snap), Some("table-1"), Locale::ZhCn, window, cx);
+                assert!(!pane.context_active);
+                pane.command("pin-result", cx);
+                assert!(pane.desk.pinned().is_empty(), "不得固定隐藏查询的结果");
+                assert!(pane.note().contains("不是查询"), "{}", pane.note());
+                pane.command("query-view:messages", cx);
+                assert_eq!(pane.desk.result_view(), ResultView::Current);
+                let before = pane.side.get("q").copied();
+                pane.command("toggle-side", cx);
+                pane.command("side-mode:object", cx);
+                assert_eq!(pane.side.get("q").copied(), before, "不得改隐藏查询的右侧面板");
+            });
         })
         .unwrap();
     }

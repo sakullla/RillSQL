@@ -111,6 +111,9 @@ pub struct PinnedResult {
     pub run: u64,
     pub statement: usize,
     pub view: StatementView,
+    /// 产生这份结果的那次执行用的目标（连接/库/模式）。显示固定结果时按它绑定表格，
+    /// 不跟着标签之后切换的库走；来源无法证明（外部写入的结果）时为 None，表格按未定位只读处理。
+    pub target: Option<Target>,
 }
 
 /// 结果区当前显示的是哪一页：当前结果、某个固定结果，或消息页。
@@ -187,6 +190,12 @@ struct TabState {
     statement: usize,
     /// 最近一次发起执行的位置；结果回来时据此把错误位置换算到草稿。
     run_origin: Option<RunOrigin>,
+    /// 最近一次发起执行时的目标；结果写进 results 时随之记到 results_target。
+    run_target: Option<Target>,
+    /// 当前 results 来自哪个目标。外部写入或已清空时为 None（来源无法证明）。
+    results_target: Option<Target>,
+    /// results 是否来自最近一次发起的执行；发起时置假，收到它的快照后置真。
+    results_fresh: bool,
     /// 固定的结果；之后的执行不替换，只能手动关闭。
     pinned: Vec<PinnedResult>,
     /// 最近一次执行的消息记录；每次发起执行时清空，只保留当前这一批。
@@ -389,6 +398,9 @@ impl Desk {
             note: String::new(),
             statement: 0,
             run_origin: None,
+            run_target: None,
+            results_target: None,
+            results_fresh: false,
             pinned: Vec::new(),
             log: Vec::new(),
             log_batch: 0,
@@ -427,6 +439,8 @@ impl Desk {
         tab.running = false;
         tab.cancelled = false;
         tab.results.clear();
+        tab.results_target = None;
+        tab.results_fresh = false;
         tab.log.clear();
         if tab.result_view == ResultView::Messages {
             tab.result_view = ResultView::Current;
@@ -623,6 +637,9 @@ impl Desk {
                 range: None,
                 error_mark: None,
             }];
+            // 外部写入的结果说不清来自哪个库：固定后按未定位只读处理。
+            tab.results_target = None;
+            tab.results_fresh = false;
             tab.statement = 0;
         });
         if wrote.is_some() {
@@ -637,6 +654,7 @@ impl Desk {
             tab.log = log_entries(&results);
             tab.log_batch = tab.log_batch.saturating_add(1);
             tab.results = results;
+            tab.results_target = tab.target.clone();
             tab.statement = 0;
             tab.run_seq = tab.run_seq.saturating_add(1);
             tab.result_view = ResultView::Current;
@@ -709,7 +727,8 @@ impl Desk {
         let statement = tab.statement.min(tab.results.len() - 1);
         tab.pin_seq = tab.pin_seq.saturating_add(1);
         let id = tab.pin_seq;
-        tab.pinned.push(PinnedResult { id, run: tab.run_seq, statement, view: tab.results[statement].clone() });
+        let target = tab.results_target.clone();
+        tab.pinned.push(PinnedResult { id, run: tab.run_seq, statement, view: tab.results[statement].clone(), target });
         tab.result_view = ResultView::Pinned(id);
         self.view_gen = self.view_gen.saturating_add(1);
         Some(id)
@@ -744,6 +763,21 @@ impl Desk {
             return None;
         }
         tab.results.get(tab.statement.min(tab.results.len() - 1)).cloned()
+    }
+
+    /// 正在看固定结果时它自己的来源目标：Some(Some) 是产生它的那次执行的目标，Some(None) 是来源无法证明；
+    /// 不在看固定结果时为 None（表格按标签当前目标绑定）。
+    /// 当前结果来自哪个目标；外部写入或尚无执行结果时为 None。
+    pub fn results_target(&self) -> Option<Target> {
+        self.active_tab().and_then(|tab| tab.results_target.clone())
+    }
+
+    pub fn shown_pinned_target(&self) -> Option<Option<Target>> {
+        let tab = self.active_tab()?;
+        let ResultView::Pinned(id) = tab.result_view else {
+            return None;
+        };
+        tab.pinned.iter().find(|pinned| pinned.id == id).map(|pinned| pinned.target.clone())
     }
 
     /// 光标处标识符对应的对象说明（右侧对象面板）。列也解析到它所在的对象，并记下是哪一列。
@@ -790,6 +824,8 @@ impl Desk {
             tab.running = false;
             tab.status = "error".to_owned();
             tab.note = note.to_owned();
+            // 已经流式到达的语句先按顺序记进消息页，再记整次执行的失败。
+            fill_partial_log(tab);
             // 整次执行没有结果就失败（连接中断等）：消息页也要有这一条。
             tab.log.push(LogEntry {
                 statement: None,
@@ -921,6 +957,8 @@ impl Desk {
         tab.token = None;
         tab.run_id = None;
         tab.results.clear();
+        tab.results_target = None;
+        tab.results_fresh = false;
         tab.log.clear();
         if tab.result_view == ResultView::Messages {
             tab.result_view = ResultView::Current;
@@ -1066,6 +1104,8 @@ impl Desk {
                         place_statements(&tab.draft, origin, &mut results);
                     }
                     tab.results = results;
+                    tab.results_target = tab.run_target.clone();
+                    tab.results_fresh = true;
                     tab.run_id = Some(run.id);
                     if !pending {
                         tab.executed = true;
@@ -1101,6 +1141,8 @@ impl Desk {
         tab.running = false;
         tab.status = "cancelled".to_owned();
         if was_running {
+            // 取消前已经完成的语句先按顺序记进消息页，再记整次执行被取消。
+            fill_partial_log(tab);
             tab.log.push(LogEntry {
                 statement: None,
                 sql: tab.run_origin.as_ref().map(|origin| origin.sent.clone()).unwrap_or_default(),
@@ -1167,6 +1209,8 @@ impl Desk {
             tab.pending = None;
             tab.draft = original;
             tab.run_origin = Some(origin);
+            tab.run_target = Some(target.clone());
+            tab.results_fresh = false;
             // 消息页只保留当前这一批；清空时记下批次，消息页据此说明这是第几次执行。
             tab.log.clear();
             tab.log_batch = tab.log_batch.saturating_add(1);
@@ -1442,6 +1486,9 @@ impl Desk {
             note: String::new(),
             statement: 0,
             run_origin: None,
+            run_target: None,
+            results_target: None,
+            results_fresh: false,
             pinned: Vec::new(),
             log: Vec::new(),
             log_batch: 0,
@@ -1762,6 +1809,21 @@ fn statement_view(statement: commands::StatementDto) -> StatementView {
         range: None,
         error_mark: None,
     }
+}
+
+/// 执行被取消或整体失败时：本次执行已经流式到达的语句（不含仍在执行的那条）按顺序补进消息页。
+/// 消息页在发起执行时已清空；已经有逐条记录（终态之后）时不重复补。
+fn fill_partial_log(tab: &mut TabState) {
+    if tab.log.iter().any(|entry| entry.statement.is_some()) {
+        return;
+    }
+    // results 里可能还是上一次执行的结果：只有本次执行的快照写进来过才算数。
+    if !tab.results_fresh {
+        return;
+    }
+    let mut entries = log_entries(&tab.results);
+    entries.retain(|entry| !matches!(entry.status.as_str(), "pending" | "running" | "cancel-requested"));
+    tab.log = entries;
 }
 
 /// 这次执行对应草稿里的哪段文本。普通执行就是 pick；变量确认后的执行对应替换前的 pick；
