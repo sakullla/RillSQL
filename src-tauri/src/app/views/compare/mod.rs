@@ -976,7 +976,8 @@ impl ComparePane {
     }
 
     pub fn lines(&self) -> Vec<String> {
-        let mut lines = vec![self.text("compare.dialog.title"), self.text("compare.dialog.subtitle")];
+        // 只列实际画出来的文字：说明 `compare.dialog.subtitle` 只在标题悬停提示里，不常驻。
+        let mut lines = vec![self.text("compare.dialog.title")];
         if self.choices.is_empty() {
             lines.push(self.text("compare.dialog.chooseConnection"));
         }

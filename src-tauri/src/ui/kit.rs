@@ -242,14 +242,16 @@ impl TypeScale {
     pub const MD: f32 = 13.;
     /// 面板与页面标题。
     pub const LG: f32 = 15.;
-    /// 欢迎区品牌字、统计大数字。
+    /// 统计大数字（对比结果计数）。页面主标题不超过 16px（规范 S8.6），欢迎区品牌字用 `LG`。
     pub const XL: f32 = 18.;
 }
 
-/// 圆角：规范 S4.2 的控件 4px、面板/浮层 6px。取消胶囊与大圆角卡片。
+/// 圆角：规范 S4.2 的控件 4px、面板/浮层 6px、状态标签 3px。取消胶囊与大圆角卡片。
 pub struct Radius;
 
 impl Radius {
+    /// 状态/环境标签（`kit::pill`、`kit::env_tag`），规范 S4.2 / S5.2 `Tag`。
+    pub const TAG: f32 = 3.;
     /// 按钮、列表行、标签、菜单项、分段项、输入类控件。
     pub const CONTROL: f32 = 4.;
     /// 面板、卡片、提示条、浮层、对话框、代码块。
@@ -307,17 +309,27 @@ where
     if !style.focusable {
         return element.cursor_not_allowed();
     }
-    element = element.cursor_pointer().tab_index(0);
+    // 可聚焦的 div 被鼠标按下时会把键盘焦点抢到自己身上。这些元素只为键盘 Tab 可达才设 tab_index，
+    // 鼠标点击不应让网格、编辑器或对象树丢掉焦点：按下时 prevent_default 抑制这次转移（点击照常触发）。
+    element = element
+        .cursor_pointer()
+        .tab_index(0)
+        .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| window.prevent_default());
     if let Some(bg) = style.active_bg {
         element = element.active(move |s| s.bg(bg));
     }
     if let Some(ring) = style.ring {
         let width = style.ring_width;
-        element = element.focus_visible(move |s| {
-            s.shadow(vec![gpui_kit::BoxShadow { color: ring, offset: gpui_kit::point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(width), inset: false }])
-        });
+        element = element.focus_visible(move |s| s.shadow(vec![focus_ring(ring, width)]));
     }
     element
+}
+
+/// 焦点环：元素内侧一圈 `width` 宽的实线（inset 阴影，无模糊）。
+/// 内侧阴影画在背景之上、子元素之下，只着色边缘 `width` 宽的一圈；外侧投影在没有背景的元素上
+/// 会把整块区域涂成强调色（投影本身是一块实心矩形，只靠不透明背景遮住中间），所以不用。
+pub fn focus_ring(color: Hsla, width: f32) -> gpui_kit::BoxShadow {
+    gpui_kit::BoxShadow { color, offset: gpui_kit::point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(width), inset: true }
 }
 
 /// 列表容器管的行（对象树、命令面板、右键菜单、连接/历史列表）：键盘焦点在容器上，
@@ -376,12 +388,13 @@ impl Metrics {
         }
     }
 
+    /// 规范 S9：标准密度为 行 32 / 树 30 / 控件 30。
     pub fn standard() -> Self {
         Self {
             row_h: 32.,
-            tree_row_h: 28.,
+            tree_row_h: 30.,
             menu_row_h: 28.,
-            control_h: 24.,
+            control_h: 30.,
             topbar_h: 44.,
             tabs_h: 36.,
             status_h: 26.,
@@ -393,9 +406,9 @@ impl Metrics {
     }
 
     /// 当前外壳密度。外壳每帧把自己的密度发布到这里，子视图像取色板一样取尺寸，
-    /// 不必逐个实体下发；没发布过（独立测试窗口）时取标准密度。
+    /// 不必逐个实体下发；没发布过（独立测试窗口）时取默认的紧凑密度（规范 S9）。
     pub fn of(cx: &App) -> Self {
-        cx.try_global::<DensityMetrics>().map(|global| global.0).unwrap_or_else(Self::standard)
+        cx.try_global::<DensityMetrics>().map(|global| global.0).unwrap_or_else(Self::compact)
     }
 
     /// 发布密度；变了返回 true，调用方据此通知子视图重绘。
@@ -432,7 +445,7 @@ impl Metrics {
             row_h: 40.,
             tree_row_h: 36.,
             menu_row_h: 34.,
-            control_h: 28.,
+            control_h: 32.,
             topbar_h: 48.,
             tabs_h: 40.,
             status_h: 28.,
@@ -515,7 +528,7 @@ pub fn pill(label: impl Into<SharedString>, fg: Hsla, bg: Hsla) -> AnyElement {
         .flex_none()
         .px(px(6.))
         .h(px(18.))
-        .rounded(px(Radius::CONTROL))
+        .rounded(px(Radius::TAG))
         .bg(bg)
         .text_color(fg)
         .text_size(px(TypeScale::XS))
@@ -709,12 +722,7 @@ pub fn danger_button(id: impl Into<ElementId>, name: Option<IconName>, label: im
     button.on_click(on_click)
 }
 
-/// 分段选择：一组互斥选项，选中项高亮。
-pub fn segmented(items: Vec<(SharedString, SharedString, bool, Click)>, p: &Palette) -> AnyElement {
-    segmented_sized(items, p, Metrics::standard().control_h)
-}
-
-/// 同 `segmented`，高度跟随密度。
+/// 分段选择：一组互斥选项，选中项高亮；高度由调用方按当前密度的控件高传入。
 pub fn segmented_sized(items: Vec<(SharedString, SharedString, bool, Click)>, p: &Palette, height: f32) -> AnyElement {
     let mut row = div().flex().flex_none().p(px(2.)).gap(px(2.)).rounded(px(Radius::CONTROL)).bg(p.hover);
     for (id, label, selected, on_click) in items {
@@ -965,18 +973,18 @@ mod palette_tests {
     }
 
     /// 三档密度必须真的拉开行高，否则切换只是文案变化。
-    /// 紧凑档按规范取 26/23/26（行/树/控件）；标准与宽松保持既有值，只补进规范。
-    /// 控件高度因此不再按密度递增（紧凑 26 > 标准 24），这是 D1 的确认结果。
+    /// 紧凑与标准按规范 S9（紧凑 26/23/26、标准 32/30/30，行/树/控件）；宽松不小于标准。
     #[test]
     fn density_metrics_are_distinct_and_ordered() {
         let (compact, standard, relaxed) = (Metrics::compact(), Metrics::standard(), Metrics::relaxed());
         assert!(compact.row_h < standard.row_h && standard.row_h < relaxed.row_h);
         assert!(compact.tree_row_h < standard.tree_row_h && standard.tree_row_h < relaxed.tree_row_h);
-        assert!(standard.control_h < relaxed.control_h);
+        assert!(compact.control_h < standard.control_h && standard.control_h < relaxed.control_h);
         assert!(compact.pad < standard.pad && standard.pad < relaxed.pad);
-        assert_eq!((compact.row_h, compact.tree_row_h, compact.control_h), (26., 23., 26.), "紧凑密度按规范 S2.2");
-        assert_eq!((standard.row_h, standard.tree_row_h, standard.control_h), (32., 28., 24.), "标准密度保持既有值");
-        assert_eq!((relaxed.row_h, relaxed.tree_row_h, relaxed.control_h), (40., 36., 28.), "宽松密度保持既有值");
+        assert_eq!((compact.row_h, compact.tree_row_h, compact.control_h), (26., 23., 26.), "紧凑密度按规范 S2.2 / S9");
+        assert_eq!((standard.row_h, standard.tree_row_h, standard.control_h), (32., 30., 30.), "标准密度按规范 S9");
+        assert_eq!((relaxed.row_h, relaxed.tree_row_h, relaxed.control_h), (40., 36., 32.), "宽松密度不小于标准");
+        assert_eq!(crate::app::Shell::default().density, crate::app::Density::Compact, "默认密度为紧凑（规范 S9）");
     }
 
     /// 自定义可点元素的四态：可用时有 hover/active 底色与 2px 焦点环，禁用时全部去掉且不可聚焦。
@@ -997,6 +1005,26 @@ mod palette_tests {
             let off = interaction_style(&p, true);
             assert_eq!((off.hover_bg, off.active_bg, off.ring, off.focusable), (None, None, None, false), "禁用去掉反馈且不可聚焦");
             assert!(off.opacity < 1.);
+        }
+    }
+
+    /// 焦点环只描一圈边，不涂满元素：没有背景的活动栏按钮、未选中的标签/分段项/列表行聚焦时，
+    /// 中间的图标与文字底色不变。gpui 的外侧投影是一块实心矩形（只靠不透明背景遮住中间），
+    /// 内侧阴影则挖掉 `bounds.dilate(-spread)` 的洞，只着色边缘。
+    #[test]
+    fn focus_ring_outlines_the_element_without_filling_it() {
+        for p in [Palette::light(), Palette::dark()] {
+            let style = interaction_style(&p, false);
+            let ring = focus_ring(style.ring.unwrap(), style.ring_width);
+            assert!(ring.inset, "内侧环：不会在无背景元素上涂出整块强调色");
+            assert_eq!((ring.blur_radius, ring.spread_radius), (px(0.), px(2.)), "2px 实线，不模糊");
+            assert_eq!(ring.offset, gpui_kit::point(px(0.), px(0.)));
+            // 活动栏按钮、紧凑分段项、结果标签：环内都留出未着色的内容区。
+            for (w, h) in [(40., 40.), (60., 22.), (90., 26.)] {
+                let bounds = gpui_kit::Bounds::new(gpui_kit::point(px(0.), px(0.)), gpui_kit::size(px(w), px(h)));
+                let hole = bounds.dilate(-ring.spread_radius);
+                assert_eq!((hole.size.width, hole.size.height), (px(w - 4.), px(h - 4.)), "中间不着色");
+            }
         }
     }
 }
@@ -1089,6 +1117,54 @@ mod interactive_tests {
     fn disabled_interactive_element_is_skipped_by_tab(cx: &mut TestAppContext) {
         assert!(!focus_after_tab(true, false, cx), "禁用元素不可聚焦");
     }
+
+    /// 网格/编辑器/树一类的焦点容器持有焦点时，鼠标点一下自定义可点元素（标签、分段项、活动栏按钮）：
+    /// 点击照常触发，但键盘焦点留在原容器，既有快捷键不受影响。
+    struct Holder {
+        grid: gpui_kit::FocusHandle,
+        clicks: u32,
+    }
+
+    impl Render for Holder {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let p = Palette::of(cx);
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(div().id("holder-grid").track_focus(&self.grid).w(px(200.)).h(px(100.)).child("grid"))
+                .child(
+                    interactive(div().id("holder-tab"), &p, false)
+                        .test_support()
+                        .w(px(80.))
+                        .h(px(24.))
+                        .child("tab")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.clicks += 1;
+                            cx.notify();
+                        })),
+                )
+        }
+    }
+
+    #[gpui_kit::test]
+    fn clicking_an_interactive_element_keeps_focus_where_it_was(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (window, view) = cx.update(|cx| {
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |_, cx| cx.new(|cx| Holder { grid: cx.focus_handle(), clicks: 0 })).unwrap()
+        });
+        let grid = cx.update(|cx| view.read(cx).grid.clone());
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.focus(&grid, cx);
+            window.render_frame(cx);
+            window.click("holder-tab", cx);
+            window.render_frame(cx);
+            assert!(grid.is_focused(window), "点击后焦点仍在网格上");
+        })
+        .unwrap();
+        assert_eq!(cx.update(|cx| view.read(cx).clicks), 1, "点击照常生效");
+    }
 }
 
 #[cfg(test)]
@@ -1103,7 +1179,7 @@ mod token_tests {
         ("ui/kit.rs", "px(size)", "kit::title 的实现；调用方的 size 参数本身被本测试按 TypeScale 检查"),
         ("ui/editor_proto.rs", "px(self.font_size)", "SQL 编辑器字号来自用户设置（规范 S4.1：编辑器字号由设置控制）"),
         ("app/shell/chrome.rs", "px(size * 0.28)", "品牌标记的圆角随尺寸等比缩放，属于图形"),
-        ("app/shell/chrome.rs", "px(2.)", "活动栏激活指示条只有 3px 宽，是线条而非控件"),
+        ("app/shell/chrome.rs", "px(RAIL_INDICATOR_RADIUS)", "活动栏激活指示条只有 3px 宽，是线条而非控件；只认这一个具名常量"),
     ];
 
     fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -1219,11 +1295,11 @@ mod token_tests {
             .collect()
     }
 
-    /// app/ 与 ui/ 的字号只取五档刻度、圆角只取控件 4 / 面板 6；例外逐条列出理由。
+    /// app/ 与 ui/ 的字号只取五档刻度、圆角只取标签 3 / 控件 4 / 面板 6；例外逐条列出理由。
     #[test]
     fn style_literals_follow_design_tokens() {
         assert_eq!([TypeScale::XS, TypeScale::SM, TypeScale::MD, TypeScale::LG, TypeScale::XL], [11., 12., 13., 15., 18.], "规范 S4.1 五档字号");
-        assert_eq!((Radius::CONTROL, Radius::PANEL), (4., 6.), "规范 S4.2 控件 4 / 面板 6");
+        assert_eq!((Radius::TAG, Radius::CONTROL, Radius::PANEL), (3., 4., 6.), "规范 S4.2 标签 3 / 控件 4 / 面板 6");
         let files = sources();
         assert!(files.len() > 20, "扫描到了 app/ 与 ui/ 的源码");
         let bad = violations(&files);

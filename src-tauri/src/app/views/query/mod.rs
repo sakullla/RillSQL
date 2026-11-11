@@ -189,6 +189,15 @@ pub enum ResultTiming {
 }
 
 /// 结果标题里的耗时：一秒以内按毫秒，再长按秒。
+/// 语句的说明文字。执行层给“没执行到”的语句写的是固定的中文说明，界面按当前语言换成同一个状态词。
+pub fn statement_message(locale: Locale, status: &str, message: &str) -> String {
+    if status == "skipped" {
+        i18n::text(locale, "query.log.skipped")
+    } else {
+        message.to_owned()
+    }
+}
+
 pub fn elapsed_label(ms: u64) -> String {
     if ms >= 1000 {
         format!("{:.2} s", ms as f64 / 1000.)
@@ -249,7 +258,7 @@ impl QueryPane {
             targets: Vec::new(),
             variable_values: HashMap::new(),
             side: HashMap::new(),
-            density: Density::Standard,
+            density: Density::Compact,
             narrow: false,
             #[cfg(test)]
             drawn_colors: None,
@@ -1420,7 +1429,7 @@ impl QueryPane {
         let sheet = &shown;
         let columns = if sheet.columns.is_empty() { vec!["status".to_owned()] } else { sheet.columns.clone() };
         let rows = if sheet.columns.is_empty() {
-            vec![vec![Some(sheet.message.clone())]]
+            vec![vec![Some(statement_message(self.locale, &sheet.status, &sheet.message))]]
         } else {
             sheet.rows.clone()
         };
@@ -2084,7 +2093,7 @@ impl Render for QueryPane {
             );
         } else if let Some(result) = active_result.clone().filter(|result| result.columns.is_empty()) {
             let ok = !(result.status == "error" || result.status == "failed");
-            let message = if result.message.is_empty() { note.clone() } else { result.message.clone() };
+            let message = if result.message.is_empty() { note.clone() } else { statement_message(locale, &result.status, &result.message) };
             results_panel = results_panel.child(
                 div()
                     .flex_1()
@@ -2242,6 +2251,26 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 mod tests {
     use super::*;
     use gpui_kit::test::TestWindowExt;
+
+    /// 没执行到的语句：执行层写的是中文说明，界面按当前语言只显示状态词；其它说明（数据库错误）原样保留。
+    #[test]
+    fn skipped_statements_read_in_the_ui_language() {
+        assert_eq!(statement_message(Locale::En, "skipped", "未执行"), "Skipped");
+        assert_eq!(statement_message(Locale::ZhCn, "skipped", "未执行"), "未执行");
+        assert_eq!(statement_message(Locale::En, "error", "no such table: x"), "no such table: x");
+        let entry = crate::query::desk::LogEntry {
+            statement: Some(2),
+            sql: "select 3".to_owned(),
+            status: "skipped".to_owned(),
+            rows: None,
+            affected: None,
+            elapsed_ms: None,
+            message: "未执行".to_owned(),
+        };
+        let en = log::entry_text(Locale::En, &entry);
+        assert!(!en.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)), "{en}");
+        assert!(en.starts_with("Skipped"), "{en}");
+    }
 
     fn sheet(sql: &str, truncated: bool, status: &str) -> desk::StatementView {
         desk::StatementView {

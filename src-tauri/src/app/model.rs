@@ -359,7 +359,7 @@ impl Default for Shell {
             locale: Locale::ZhCn,
             theme: ThemePreference::System,
             prefers_dark: false,
-            density: Density::Standard,
+            density: Density::Compact,
             focus: FocusTarget::Editor,
             focus_before_overlay: None,
             palette_open: false,

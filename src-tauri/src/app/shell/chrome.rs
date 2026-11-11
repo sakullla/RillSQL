@@ -27,6 +27,8 @@ use super::view::Workbench;
 
 /// 活动栏宽度来自布局模块，绘制与几何只保留一份。
 const RAIL_W: f32 = super::layout::RAIL_WIDTH as f32;
+/// 活动栏激活指示条（3px 宽的竖线）两端的圆角。线条不是控件，不取 `Radius` token；见扫描测试例外清单。
+const RAIL_INDICATOR_RADIUS: f32 = 2.;
 
 /// 点击后执行一条外壳命令。
 fn act<S: Into<String>>(id: S, cx: &mut Context<Workbench>) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static + use<S> {
@@ -46,6 +48,11 @@ fn field_changed(this: &mut Workbench, field: DraftField, value: String, _cx: &m
 impl Workbench {
     fn t(&self, key: &str) -> SharedString {
         SharedString::from(self.model.text(key))
+    }
+
+    /// 连接的环境标签文字；自定义标签没有字典键，显示标签本身而不是漏出键名。
+    fn env_text(&self, env: &str) -> SharedString {
+        SharedString::from(env_label(|key| self.model.text(key), env))
     }
 
     /// 当前密度的尺寸指标；绘制只读这一处。
@@ -1034,7 +1041,7 @@ impl Workbench {
                     .max_w(px(target_max))
                     .child(kit::engine_badge(&engine, 14.))
                     .child(div().min_w(px(0.)).truncate().child(SharedString::from(if database.is_empty() { name } else { format!("{name} / {database}") })))
-                    .when(!env.is_empty(), |this| this.child(kit::env_tag(&env, self.t(&format!("ui.conn.env.{env}")), &p)))
+                    .when(!env.is_empty(), |this| this.child(kit::env_tag(&env, self.env_text(&env), &p)))
                     .into_any_element()
             }
             _ => div().flex().items_center().gap(px(6.)).child(kit::status_dot(p.line_strong)).child(self.t("ui.status.noTarget")).into_any_element(),
@@ -1110,7 +1117,7 @@ impl Workbench {
                             .child(div().truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(row.saved.name.clone())))
                             .child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(detail))),
                     )
-                    .child(kit::env_tag(&row.saved.env, self.t(&format!("ui.conn.env.{}", row.saved.env)), &p))
+                    .child(kit::env_tag(&row.saved.env, self.env_text(&row.saved.env), &p))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.model.shell.sidebar_open = true;
                         this.click_connection(&id, false, cx);
@@ -1195,7 +1202,7 @@ impl Workbench {
                                     .flex()
                                     .flex_col()
                                     .gap(px(2.))
-                                    .child(kit::title("RillSQL", TypeScale::XL, &p)),
+                                    .child(kit::title("RillSQL", TypeScale::LG, &p)),
                             ),
                     )
                     .child(div().flex().flex_col().gap(px(10.)).child(kit::eyebrow(self.t("ui.welcome.start"), &p)).child(actions))
@@ -1282,7 +1289,7 @@ impl Workbench {
                             .child(div().truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(row.saved.name.clone())))
                             .child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(connection_detail(row)))),
                     )
-                    .child(div().flex().flex_col().items_end().gap(px(4.)).child(kit::env_tag(&row.saved.env, self.t(&format!("ui.conn.env.{}", row.saved.env)), &p)).child(kit::status_dot(dot)))
+                    .child(div().flex().flex_col().items_end().gap(px(4.)).child(kit::env_tag(&row.saved.env, self.env_text(&row.saved.env), &p)).child(kit::status_dot(dot)))
                     .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                         this.menu_at = event.position;
                         let _ = this.model.dispatch(&menu);
@@ -2887,18 +2894,35 @@ impl Workbench {
                         .child(SharedString::from(plan.sql.join("\n"))),
                 );
             }
-            let mut risks = div().flex().flex_col().gap(px(4.));
-            for (level, text) in &plan.risks {
+            // 计划文字由执行层按中文生成；英文界面按句型表换成英文（数据库原文不动）。
+            let locale = if self.model.shell.locale == crate::app::Locale::En { i18n::Locale::En } else { i18n::Locale::ZhCn };
+            let mut risks = div().id("danger-risks").flex().flex_col().gap(px(4.));
+            for (index, (level, text)) in plan.risks.iter().enumerate() {
                 let (fg, bg) = if level == "danger" { (p.danger, p.danger_soft) } else if level == "warn" { (p.warn, p.warn_soft) } else { (p.text_muted, p.hover) };
-                risks = risks.child(div().px(px(10.)).py(px(6.)).rounded(px(Radius::PANEL)).bg(bg).text_color(fg).text_size(px(TypeScale::SM)).child(SharedString::from(text.clone())));
+                let text = crate::ddl::english::localize(text, locale);
+                risks = risks.child(
+                    div()
+                        .id(SharedString::from(format!("danger-risk-{index}")))
+                        .test_support()
+                        .aria_label(SharedString::from(text.clone()))
+                        .px(px(10.))
+                        .py(px(6.))
+                        .rounded(px(Radius::PANEL))
+                        .bg(bg)
+                        .text_color(fg)
+                        .text_size(px(TypeScale::SM))
+                        .child(SharedString::from(text)),
+                );
             }
             content = content.child(risks);
             if !plan.blocked.is_empty() {
-                content = content.child(banner(IconName::Ban, SharedString::from(plan.blocked.join(" ")), p.danger, p.danger_soft));
+                let blocked: Vec<String> = plan.blocked.iter().map(|text| crate::ddl::english::localize(text, locale)).collect();
+                content = content.child(banner(IconName::Ban, SharedString::from(blocked.join(" ")), p.danger, p.danger_soft));
             }
         }
         if let Some(error) = prompt.error.as_ref() {
-            content = content.child(div().id("danger-error").child(banner(IconName::TriangleAlert, SharedString::from(error.clone()), p.danger, p.danger_soft)));
+            let error = if self.model.shell.locale == crate::app::Locale::En { crate::ddl::english::english(error) } else { error.clone() };
+            content = content.child(div().id("danger-error").child(banner(IconName::TriangleAlert, SharedString::from(error), p.danger, p.danger_soft)));
         }
         if prompt.prod {
             let hint = i18n::fill(&self.model.text("catalog.danger.prodHint"), &[("name", &prompt.object.name)]);
@@ -3081,7 +3105,7 @@ fn rail_item(id: &'static str, icon: IconName, label: SharedString, active: bool
         .when(active, |this| this.bg(p.accent_soft))
         .when(!active, |this| this.hover(|style| style.bg(p.hover)))
         .child(kit::icon(icon, 18., if active { p.accent_text } else { p.text_muted }))
-        .when(active, |this| this.child(div().absolute().left(px(-7.)).top(px(9.)).w(px(3.)).h(px(20.)).rounded(px(2.)).bg(accent)))
+        .when(active, |this| this.child(div().absolute().left(px(-7.)).top(px(9.)).w(px(3.)).h(px(20.)).rounded(px(RAIL_INDICATOR_RADIUS)).bg(accent)))
         .on_click(act(id, cx))
         .into_any_element()
 }
@@ -3366,4 +3390,11 @@ fn _locale_name(locale: i18n::Locale) -> &'static str {
         i18n::Locale::ZhCn => "zh",
         i18n::Locale::En => "en",
     }
+}
+
+/// 内置环境（dev/test/prod/local）走字典；字典里没有的自定义标签原样显示。
+pub(super) fn env_label(text: impl Fn(&str) -> String, env: &str) -> String {
+    let key = format!("ui.conn.env.{env}");
+    let value = text(&key);
+    if value == key { env.to_owned() } else { value }
 }

@@ -5148,14 +5148,15 @@ fn locale_theme_and_density_refresh_existing_inputs_tree_and_palette(cx: &mut gp
         })
         .unwrap();
     assert!(dark, "theme-dark 要立即作用到已渲染界面");
-    cx.update(|cx| view.update(cx, |view, cx| view.perform("density-compact", cx)));
-    let compact_height = cx
+    // 默认紧凑（规范 S9）；切到标准后已有树行变高（树 23 -> 30）。
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("density-standard", cx)));
+    let standard_height = cx
         .update_window(window, |_, window, cx| {
             window.render_frame(cx);
             f32::from(window.find(gpui_kit::SharedString::from(format!("nav-{group}"))).bounds().size.height)
         })
         .unwrap();
-    assert!(compact_height < zh_height, "密度切换要改变已有树行高度：{zh_height} -> {compact_height}");
+    assert!(standard_height > zh_height, "密度切换要改变已有树行高度：{zh_height} -> {standard_height}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5264,13 +5265,14 @@ fn query_log_side_panel_and_record_view_follow_locale_theme_and_density(cx: &mut
     assert_eq!(dark.colors, Some(dark.palette), "消息页/右侧面板立即换成深色底色");
     assert_eq!(dark.record, en.record, "记录视图在主题切换后仍在");
 
-    cx.update(|cx| view.update(cx, |view, cx| view.perform("density-compact", cx)));
-    let compact = seen(cx);
-    assert!(compact.log_row_h < dark.log_row_h, "密度切换要改变消息行高：{} -> {}", dark.log_row_h, compact.log_row_h);
-    // 紧凑控件按规范是 26px（标准仍是 24px），所以这里只要求高度跟着密度变到紧凑值。
-    assert_ne!(compact.side_mode_h, dark.side_mode_h, "密度切换要改变右侧分段控件高度：{} -> {}", dark.side_mode_h, compact.side_mode_h);
-    assert_eq!(compact.side_mode_h, crate::ui::kit::Metrics::compact().control_h, "分段控件取紧凑控件高");
-    assert_eq!(compact.record, en.record, "记录视图在密度切换后仍在");
+    // 默认是紧凑密度（规范 S9）；切到标准后行高与控件高都变大（标准 行 32 / 控件 30）。
+    assert_eq!(dark.side_mode_h, crate::ui::kit::Metrics::compact().control_h, "默认紧凑：分段控件取紧凑控件高");
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("density-standard", cx)));
+    let standard = seen(cx);
+    assert!(standard.log_row_h > dark.log_row_h, "密度切换要改变消息行高：{} -> {}", dark.log_row_h, standard.log_row_h);
+    assert!(standard.side_mode_h > dark.side_mode_h, "密度切换要改变右侧分段控件高度：{} -> {}", dark.side_mode_h, standard.side_mode_h);
+    assert_eq!(standard.side_mode_h, crate::ui::kit::Metrics::standard().control_h, "分段控件取标准控件高");
+    assert_eq!(standard.record, en.record, "记录视图在密度切换后仍在");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -6022,6 +6024,27 @@ fn sqlite_tree_ddl_viewer_and_drop_go_through_the_confirm_layer(cx: &mut gpui_ki
     })
     .unwrap();
     assert!(f32::from(shown.size.width) > 0.);
+    // 英文界面：确认层的风险文字也是英文（计划按中文生成，显示时按句型换成英文），对象名不变。
+    let risk_labels = |cx: &mut gpui_kit::TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (0..)
+                .map_while(|index| window.try_find(gpui_kit::SharedString::from(format!("danger-risk-{index}"))))
+                .map(|risk| risk.label().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap()
+    };
+    let zh_risks = risk_labels(cx);
+    assert!(!zh_risks.is_empty() && zh_risks.iter().any(|text| crate::ddl::english::has_cjk(text)), "中文界面显示原文：{zh_risks:?}");
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("locale-en", cx)));
+    let en_risks = risk_labels(cx);
+    assert_eq!(en_risks.len(), zh_risks.len());
+    for text in &en_risks {
+        assert!(!crate::ddl::english::has_cjk(text), "英文确认层残留中文：{text}");
+    }
+    assert!(en_risks.iter().any(|text| text.contains("scratch")), "对象名保留：{en_risks:?}");
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("locale-zh", cx)));
     cx.update_window(window, |_, _, cx| view.update(cx, |view, cx| view.perform("danger-execute", cx))).unwrap();
     for _ in 0..5 {
         cx.run_until_parked();
@@ -6093,4 +6116,12 @@ fn sqlite_tables(path: &std::path::Path) -> Vec<String> {
     })
     .join()
     .expect("sqlite thread")
+}
+
+#[test]
+fn custom_env_tags_never_show_a_dictionary_key() {
+    use crate::i18n::{text, Locale};
+    assert_eq!(super::chrome::env_label(|key| text(Locale::En, key), "prod"), "Prod");
+    assert_eq!(super::chrome::env_label(|key| text(Locale::ZhCn, key), "dev"), "开发");
+    assert_eq!(super::chrome::env_label(|key| text(Locale::En, key), "t7-live"), "t7-live");
 }

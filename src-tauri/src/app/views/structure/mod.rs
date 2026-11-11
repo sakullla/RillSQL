@@ -735,7 +735,7 @@ impl Render for StructurePane {
                             .child(kit::title(title, TypeScale::LG, &p))
                             .child(div().id("structure-banner").text_size(px(TypeScale::SM)).text_color(p.text_muted).truncate().child(SharedString::from(self.session.banner()))),
                     )
-                    .child(kit::segmented(items, &p)),
+                    .child(kit::segmented_sized(items, &p, kit::Metrics::of(cx).control_h)),
             );
         let mut body = div().id("structure-body").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(24.)).flex().flex_col().gap(px(20.));
         body = body

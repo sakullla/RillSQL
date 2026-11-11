@@ -34,10 +34,11 @@ pub enum ExchangeSourceKind {
 }
 
 impl ExchangeSourceKind {
-    pub fn label(self) -> &'static str {
+    /// 来源分段与文字清单里的名称（i18n 键）。
+    pub fn label_key(self) -> &'static str {
         match self {
-            Self::Table => "当前表数据",
-            Self::Query => "当前查询结果",
+            Self::Table => "ui.exchange.kind.table",
+            Self::Query => "ui.exchange.kind.query",
         }
     }
 
@@ -418,14 +419,15 @@ impl ExchangePane {
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
         if self.log.tasks.iter().any(|task| task.kind == "import" && task.running_now()) {
-            self.notice = "导入还在进行，不能再次确认。".to_owned();
+            self.notice = i18n::text(self.locale, "ui.exchange.importBusy");
             return;
         }
         let (Some(preview), Some(table)) = (self.preview.clone(), self.source.table.as_ref().map(copy_table)) else {
             self.notice = i18n::text(self.locale, "export.import.unconfirmed");
             return;
         };
-        if let Some(message) = block_unmapped(self.mapping_edited, &self.mapping) {
+        if let Some(key) = block_unmapped(self.mapping_edited, &self.mapping) {
+            let message = i18n::text(self.locale, key);
             self.confirmed = false;
             self.notice = message.clone();
             self.log.push(TaskView::finish("import", "import", Phase::Blocked, 0, message, None));
@@ -457,7 +459,7 @@ impl ExchangePane {
                             }
                             Ok(Ok(report)) => TaskView::finish("import", "import", Phase::Partial, report.applied as u64, report.message, None),
                             Ok(Err(message)) => TaskView::finish("import", "import", Phase::Failed, 0, message, None),
-                            Err(_) => TaskView::finish("import", "import", Phase::Failed, 0, "后台任务没有返回结果。", None),
+                            Err(_) => TaskView::finish("import", "import", Phase::Failed, 0, i18n::text(this.locale, "ui.exchange.noTaskResult"), None),
                         };
                         let cancelled = this.log.tasks.iter().any(|item| item.id == "import" && item.phase == Phase::Cancelled);
                         let task = prefer_cancel(task, cancelled);
@@ -476,11 +478,11 @@ impl ExchangePane {
         if self.source.kind.is_query() {
             match kind {
                 SaveKind::Full => {
-                    self.block("full", "export", "当前来源是查询结果，不能全量导出；只能导出已读取的行。".to_owned());
+                    self.block("full", "export", i18n::text(self.locale, "ui.exchange.fullQueryOnly"));
                     return;
                 }
                 SaveKind::Dump => {
-                    self.block("dump", "dump", "当前来源是查询结果，不能全库导出；先切换到当前表数据。".to_owned());
+                    self.block("dump", "dump", i18n::text(self.locale, "ui.exchange.dumpQueryOnly"));
                     return;
                 }
                 SaveKind::Loaded => {}
@@ -488,7 +490,7 @@ impl ExchangePane {
         }
         if self.source.running {
             let (id, owner) = save_slot(kind);
-            self.block(id, owner, "来源正在执行，结果尚未就绪，不能导出。".to_owned());
+            self.block(id, owner, i18n::text(self.locale, "ui.exchange.sourceRunning"));
             return;
         }
         if let Some(loaded) = self.loaded.clone() {
@@ -567,11 +569,11 @@ impl ExchangePane {
 
     fn start_loaded(&mut self, path: PathBuf) {
         if self.source.running {
-            self.block("loaded", "export", "查询正在执行，结果尚未就绪，不能导出。".to_owned());
+            self.block("loaded", "export", i18n::text(self.locale, "ui.exchange.queryRunningExport"));
             return;
         }
         if !self.source.has_columns() {
-            self.block("loaded", "export", self.empty_reason().to_owned());
+            self.block("loaded", "export", self.empty_reason());
             return;
         }
         // 预览信封不是原值：先在网格里读取完整值，导出写的是同一次定位读到的原值。
@@ -611,15 +613,15 @@ impl ExchangePane {
 
     fn start_full(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.source.kind.is_query() {
-            self.block("full", "export", "当前来源是查询结果，不能全量导出；只能导出已读取的行。".to_owned());
+            self.block("full", "export", i18n::text(self.locale, "ui.exchange.fullQueryOnly"));
             return;
         }
         if self.source.running {
-            self.block("full", "export", "来源正在执行，结果尚未就绪，不能全量导出。".to_owned());
+            self.block("full", "export", i18n::text(self.locale, "ui.exchange.fullSourceRunning"));
             return;
         }
         let Some(table) = self.source.table.as_ref().map(copy_table) else {
-            self.fail_open("full", "export", "没有当前表，不能全量导出。".to_owned());
+            self.fail_open("full", "export", i18n::text(self.locale, "ui.exchange.fullNoTable"));
             return;
         };
         let request = ExportRequest {
@@ -660,7 +662,7 @@ impl ExchangePane {
                     view.update(cx, |this, cx| {
                         match settled {
                             Ok(result) => this.store_task(&id, "export", result, cx),
-                            Err(_) => this.fail_open(&id, "export", "后台任务没有返回结果。".to_owned()),
+                            Err(_) => this.fail_open(&id, "export", i18n::text(this.locale, "ui.exchange.noTaskResult")),
                         }
                         cx.notify();
                     });
@@ -672,11 +674,11 @@ impl ExchangePane {
 
     fn start_dump(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.source.kind.is_query() {
-            self.block("dump", "dump", "当前来源是查询结果，不能全库导出；先切换到当前表数据。".to_owned());
+            self.block("dump", "dump", i18n::text(self.locale, "ui.exchange.dumpQueryOnly"));
             return;
         }
         let Some(table) = self.source.table.as_ref().map(copy_table) else {
-            self.fail_open("dump", "dump", "没有当前连接，不能全库导出。".to_owned());
+            self.fail_open("dump", "dump", i18n::text(self.locale, "ui.exchange.dumpNoConnection"));
             return;
         };
         let request = DumpRequest {
@@ -694,11 +696,11 @@ impl ExchangePane {
 
     fn prompt_migrate(&mut self, cx: &mut Context<Self>) {
         if self.source.kind.is_query() {
-            self.block("migrate", "migrate", "当前来源是查询结果，不能跨库迁移；先切换到当前表数据。".to_owned());
+            self.block("migrate", "migrate", i18n::text(self.locale, "ui.exchange.migrateQueryOnly"));
             return;
         }
         if self.source.running {
-            self.block("migrate", "migrate", "来源正在执行，结果尚未就绪，不能迁移。".to_owned());
+            self.block("migrate", "migrate", i18n::text(self.locale, "ui.exchange.migrateSourceRunning"));
             return;
         }
         if let Some(request) = self.migrate_request.take() {
@@ -752,7 +754,7 @@ impl ExchangePane {
             }
         };
         let Some(source) = self.source.table.as_ref().map(copy_table) else {
-            self.fail_open("migrate", "migrate", "没有当前表，不能跨库迁移。".to_owned());
+            self.fail_open("migrate", "migrate", i18n::text(self.locale, "ui.exchange.migrateNoTable"));
             cx.notify();
             return;
         };
@@ -765,11 +767,12 @@ impl ExchangePane {
         let id = format!("migrate-{}", uuid::Uuid::new_v4());
         self.log.push(TaskView::running(id.clone(), "migrate", i18n::text(self.locale, "export.task.running")));
         let fail_id = id.clone();
+        let locale = self.locale;
         cx.spawn(async move |_, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             crate::app::views::grid::runtime_for_views().spawn(async move {
                 let result = async {
-                    let target_id = open_sqlite_target(&services.connections, &path).await?;
+                    let target_id = open_sqlite_target(&services.connections, &path, locale).await?;
                     let request = MigrateRequest {
                         id: id.clone(),
                         source: migrate_ref(&source.connection_id, &source.table),
@@ -799,7 +802,7 @@ impl ExchangePane {
                     view.update(cx, |this, cx| {
                         match settled {
                             Ok(result) => this.store_task(&fail_id, "migrate", result, cx),
-                            Err(_) => this.fail_open(&fail_id, "migrate", "后台任务没有返回结果。".to_owned()),
+                            Err(_) => this.fail_open(&fail_id, "migrate", i18n::text(this.locale, "ui.exchange.noTaskResult")),
                         }
                         cx.notify();
                     });
@@ -826,7 +829,7 @@ impl ExchangePane {
                     view.update(cx, |this, cx| {
                         match settled {
                             Ok(result) => this.store_task(&id, "dump", result, cx),
-                            Err(_) => this.fail_open(&id, "dump", "后台任务没有返回结果。".to_owned()),
+                            Err(_) => this.fail_open(&id, "dump", i18n::text(this.locale, "ui.exchange.noTaskResult")),
                         }
                         cx.notify();
                     });
@@ -853,7 +856,7 @@ impl ExchangePane {
                     view.update(cx, |this, cx| {
                         match settled {
                             Ok(result) => this.store_task(&id, "migrate", result, cx),
-                            Err(_) => this.fail_open(&id, "migrate", "后台任务没有返回结果。".to_owned()),
+                            Err(_) => this.fail_open(&id, "migrate", i18n::text(this.locale, "ui.exchange.noTaskResult")),
                         }
                         cx.notify();
                     });
@@ -901,13 +904,14 @@ impl ExchangePane {
         self.notice = message;
     }
 
-    fn empty_reason(&self) -> &'static str {
-        match self.source.kind {
-            ExchangeSourceKind::Query if self.source.running => "查询正在执行，结果尚未就绪。",
-            ExchangeSourceKind::Query => "当前查询还没有结果；先执行一次查询，再导出或交换。",
-            ExchangeSourceKind::Table if self.source.running => "表数据正在读取，当前行数尚未完整。",
-            ExchangeSourceKind::Table => "当前没有表数据；先在对象树里打开一张表。",
-        }
+    fn empty_reason(&self) -> String {
+        let key = match self.source.kind {
+            ExchangeSourceKind::Query if self.source.running => "ui.exchange.queryRunning",
+            ExchangeSourceKind::Query => "ui.exchange.queryEmpty",
+            ExchangeSourceKind::Table if self.source.running => "ui.exchange.tableLoading",
+            ExchangeSourceKind::Table => "ui.exchange.noTableData",
+        };
+        i18n::text(self.locale, key)
     }
 
     fn mark_cancelled(&mut self, kind: &str) {
@@ -915,7 +919,7 @@ impl ExchangePane {
             let done = task.done_rows;
             task.phase = Phase::Cancelled;
             task.success = false;
-            task.detail = format!("已取消。实际完成范围 {done} 行。");
+            task.detail = i18n::fill(&i18n::text(self.locale, "ui.exchange.cancelledRange"), &[("done", &done.to_string())]);
             self.notice = task.detail.clone();
         }
     }
@@ -927,7 +931,7 @@ impl ExchangePane {
             let done = task.done_rows;
             task.phase = Phase::Cancelled;
             task.success = false;
-            task.detail = format!("已取消。实际完成范围 {done} 行。");
+            task.detail = i18n::fill(&i18n::text(self.locale, "ui.exchange.cancelledRange"), &[("done", &done.to_string())]);
             match kind {
                 "dump" => crate::application::cancel_dump(&self.services.tasks, "dump", &id),
                 "migrate" => crate::application::cancel_migrate(&self.services.tasks, "migrate", &id),
@@ -944,38 +948,38 @@ impl ExchangePane {
 
     pub fn lines(&self) -> Vec<String> {
         let mut lines = vec![i18n::text(self.locale, "export.task.title"), self.notice.clone()];
-        lines.push(format!("来源 {}", self.source.kind.label()));
+        lines.push(i18n::fill(&i18n::text(self.locale, "ui.exchange.line.source"), &[("kind", &i18n::text(self.locale, self.source.kind.label_key()))]));
         match (&self.source.kind, &self.source.table) {
             (ExchangeSourceKind::Table, Some(table)) => {
-                lines.push(format!("目标 {}", table.table));
+                lines.push(i18n::fill(&i18n::text(self.locale, "ui.exchange.line.target"), &[("target", &table.table)]));
                 if !self.source.context.is_empty() {
-                    lines.push(format!("连接 {}", self.source.context));
+                    lines.push(i18n::fill(&i18n::text(self.locale, "ui.exchange.line.connection"), &[("context", &self.source.context)]));
                 }
             }
-            (ExchangeSourceKind::Table, None) => lines.push("目标 未选择表".to_owned()),
+            (ExchangeSourceKind::Table, None) => lines.push(i18n::text(self.locale, "ui.exchange.line.noTarget")),
             (ExchangeSourceKind::Query, _) => {
-                lines.push("目标 查询结果".to_owned());
+                lines.push(i18n::text(self.locale, "ui.exchange.line.queryTarget"));
                 if !self.source.context.is_empty() {
-                    lines.push(format!("连接 {}", self.source.context));
+                    lines.push(i18n::fill(&i18n::text(self.locale, "ui.exchange.line.connection"), &[("context", &self.source.context)]));
                 }
             }
         }
-        lines.push(format!("已读取 {} 行", self.source.rows.len()));
+        lines.push(i18n::fill(&i18n::text(self.locale, "ui.exchange.loadedRows"), &[("count", &self.source.rows.len().to_string()), ("partial", "")]));
         if self.source.truncated {
-            lines.push("仅已读取部分".to_owned());
+            lines.push(i18n::text(self.locale, "ui.exchange.line.partial"));
         }
         if self.source.kind.is_query() && !self.source.full_available() {
-            lines.push("全量导出不可用：查询结果只有已读取的行".to_owned());
+            lines.push(i18n::text(self.locale, "ui.exchange.line.noFull"));
         }
         if self.source.running {
-            lines.push("查询正在执行，结果尚未就绪。".to_owned());
+            lines.push(i18n::text(self.locale, "ui.exchange.queryRunning"));
         } else if !self.source.has_columns() {
-            lines.push(self.empty_reason().to_owned());
+            lines.push(self.empty_reason());
         }
-        lines.push(format!("格式 {}", self.format_name));
+        lines.push(i18n::fill(&i18n::text(self.locale, "ui.exchange.line.format"), &[("format", &self.format_name)]));
         lines.push(match self.row_limit {
-            Some(limit) => format!("范围 前 {limit} 行"),
-            None => "范围 全部已读取行".to_owned(),
+            Some(limit) => i18n::fill(&i18n::text(self.locale, "ui.exchange.line.rangeFirst"), &[("limit", &limit.to_string())]),
+            None => i18n::text(self.locale, "ui.exchange.line.rangeAll"),
         });
         if self.mapping.is_empty() {
             if self.preview.is_some() && self.source.table.is_some() {
@@ -984,7 +988,7 @@ impl ExchangePane {
         } else {
             lines.push(i18n::text(self.locale, "export.map.title"));
             for (field, source) in &self.mapping {
-                lines.push(format!("映射 {field}={source}"));
+                lines.push(i18n::fill(&i18n::text(self.locale, "ui.exchange.line.mapping"), &[("field", field), ("source", source)]));
             }
         }
         if let Some(preview) = &self.preview {
@@ -1036,13 +1040,13 @@ impl Render for ExchangePane {
         // 来源选择：当前表数据或当前查询结果，两种来源的列、行与能力互不混用。
         let mut kinds = Vec::new();
         for (kind, id, label) in [
-            (ExchangeSourceKind::Table, "exchange-source:table", "当前表数据"),
-            (ExchangeSourceKind::Query, "exchange-source:query", "当前查询结果"),
+            (ExchangeSourceKind::Table, "exchange-source:table", t(ExchangeSourceKind::Table.label_key())),
+            (ExchangeSourceKind::Query, "exchange-source:query", t(ExchangeSourceKind::Query.label_key())),
         ] {
             let entity = entity.clone();
             kinds.push((
                 SharedString::from(format!("exchange-{id}")),
-                SharedString::from(label),
+                label,
                 self.source.kind == kind,
                 kit::click(move |_, _, cx| {
                     let id = id.to_owned();
@@ -1092,11 +1096,7 @@ impl Render for ExchangePane {
                             .text_size(px(TypeScale::SM))
                             .text_color(p.text_muted)
                             .child(Spinner::new().xsmall().color(p.accent))
-                            .child(SharedString::from(if self.source.kind.is_query() {
-                                "查询正在执行，结果尚未就绪。"
-                            } else {
-                                "表数据正在读取，当前行数尚未完整。"
-                            })),
+                            .child(t(if self.source.kind.is_query() { "ui.exchange.queryRunning" } else { "ui.exchange.tableLoading" })),
                     );
                 } else if !self.source.has_columns() {
                     source_body = source_body.child(
@@ -1121,12 +1121,12 @@ impl Render for ExchangePane {
             );
         }
         if self.source.has_columns() && !self.source.running {
-            let partial = if self.source.truncated { "（仅已读取部分）" } else { "" };
+            let partial = if self.source.truncated { i18n::text(locale, "ui.exchange.partialMark") } else { String::new() };
             source_body = source_body.child(
                 div()
                     .text_size(px(TypeScale::SM))
                     .text_color(p.text_muted)
-                    .child(SharedString::from(format!("已读取 {} 行{partial}", self.source.rows.len()))),
+                    .child(SharedString::from(i18n::fill(&i18n::text(locale, "ui.exchange.loadedRows"), &[("count", &self.source.rows.len().to_string()), ("partial", &partial)]))),
             );
         }
         if self.source.kind.is_query() {
@@ -1152,12 +1152,12 @@ impl Render for ExchangePane {
             ));
         }
         let mut ranges = Vec::new();
-        for (id, label, limit) in [("all", "全部已读取", None), ("100", "前 100 行", Some(100)), ("1000", "前 1000 行", Some(1000))] {
+        for (id, label, limit) in [("all", t("ui.exchange.range.all"), None), ("100", t("ui.exchange.range.first100"), Some(100)), ("1000", t("ui.exchange.range.first1000"), Some(1000))] {
             let entity = entity.clone();
             let command = format!("exchange-range:{id}");
             ranges.push((
                 SharedString::from(format!("exchange-exchange-range:{id}")),
-                SharedString::from(label),
+                label,
                 self.row_limit == limit,
                 kit::click(move |_, _, cx| {
                     let command = command.clone();
@@ -1173,13 +1173,13 @@ impl Render for ExchangePane {
                 .flex()
                 .flex_col()
                 .gap(px(12.))
-                .child(kit::segmented(kinds, &p))
+                .child(kit::segmented_sized(kinds, &p, kit::Metrics::of(cx).control_h))
                 .child(source_body)
-                .child(kit::form_row(t("ui.exchange.format"), kit::segmented(formats, &p), &p))
+                .child(kit::form_row(t("ui.exchange.format"), kit::segmented_sized(formats, &p, kit::Metrics::of(cx).control_h), &p))
                 .when(range_enabled, |this| {
                     this.child(kit::form_row(
-                        SharedString::from(if locale == Locale::En { "Export range" } else { "导出范围" }),
-                        kit::segmented(ranges, &p),
+                        t("ui.exchange.range"),
+                        kit::segmented_sized(ranges, &p, kit::Metrics::of(cx).control_h),
                         &p,
                     ))
                 }),
@@ -1193,7 +1193,7 @@ impl Render for ExchangePane {
                 "exchange-exchange-export-loaded",
                 IconName::FileDown,
                 t("export.export.loaded"),
-                SharedString::from(format!("只导出当前来源已读取的 {} 行", self.source.rows.len())),
+                SharedString::from(i18n::fill(&i18n::text(locale, "ui.exchange.loadedOnlyCount"), &[("count", &self.source.rows.len().to_string())])),
                 &p,
                 act("exchange-export-loaded"),
             ));
@@ -1202,7 +1202,7 @@ impl Render for ExchangePane {
                 "exchange-exchange-export-loaded",
                 IconName::FileDown,
                 t("export.export.loaded"),
-                self.empty_reason(),
+                &self.empty_reason(),
                 &p,
             ));
         }
@@ -1220,14 +1220,14 @@ impl Render for ExchangePane {
                 "exchange-exchange-export-full",
                 IconName::Download,
                 t("export.export.full"),
-                "当前来源不支持全量导出；请切换到当前表数据。",
+                &i18n::text(locale, "ui.exchange.fullUnsupported"),
                 &p,
             ));
         }
         if self.source.kind.is_query() {
             export = export
-                .child(blocked_row("exchange-exchange-dump", IconName::DatabaseBackup, t("export.dump.start"), "查询结果不能全库导出。", &p))
-                .child(blocked_row("exchange-exchange-migrate", IconName::ArrowRightLeft, t("export.migrate.start"), "查询结果不能跨库迁移。", &p));
+                .child(blocked_row("exchange-exchange-dump", IconName::DatabaseBackup, t("export.dump.start"), &i18n::text(locale, "ui.exchange.dumpUnsupported"), &p))
+                .child(blocked_row("exchange-exchange-migrate", IconName::ArrowRightLeft, t("export.migrate.start"), &i18n::text(locale, "ui.exchange.migrateUnsupported"), &p));
         } else {
             export = export
                 .child(action_row("exchange-exchange-dump", IconName::DatabaseBackup, t("export.dump.start"), t("ui.exchange.dumpHint"), &p, act("exchange-dump")))
@@ -1423,14 +1423,14 @@ enum SaveKind {
     Dump,
 }
 
-fn block_unmapped(edited: bool, mapping: &BTreeMap<String, String>) -> Option<String> {
+fn block_unmapped(edited: bool, mapping: &BTreeMap<String, String>) -> Option<&'static str> {
     if mapping.values().any(|source| !source.is_empty()) {
         return None;
     }
     if edited {
-        Some("必填字段没有对应列，不能开始写入。".to_owned())
+        Some("export.import.gaps")
     } else {
-        Some("还没有列映射，不能开始写入。".to_owned())
+        Some("ui.exchange.noMapping")
     }
 }
 
@@ -1452,15 +1452,15 @@ fn extension_of(format: &str) -> &'static str {
     }
 }
 
-async fn open_sqlite_target(service: &crate::connections::Service, path: &std::path::Path) -> Result<String, String> {
+async fn open_sqlite_target(service: &crate::connections::Service, path: &std::path::Path, locale: Locale) -> Result<String, String> {
     let mut draft = crate::app::views::connections::blank_draft(crate::connections::model::Engine::Sqlite);
     draft.id = Some("exchange-migrate-target".to_owned());
-    draft.name = "迁移目标".to_owned();
+    draft.name = i18n::text(locale, "ui.exchange.migrateTarget");
     draft.file_path = path.display().to_string();
     let saved = service.save(draft, crate::connections::model::SecretInput::default()).await.map_err(|error| error.message())?;
     let outcome = service.open(&saved.connection.id, crate::connections::model::SecretInput::default()).await?;
     if !outcome.connected {
-        return Err(outcome.report.summary.unwrap_or_else(|| "目标库没有打开".to_owned()));
+        return Err(outcome.report.summary.unwrap_or_else(|| i18n::text(locale, "ui.exchange.migrateTargetClosed")));
     }
     Ok(saved.connection.id)
 }
@@ -1579,6 +1579,50 @@ mod tests {
         let text = pane.lines().join("\n");
         assert!(text.contains("全量导出不可用"), "{text}");
         assert!(!text.contains("查询正在执行"), "{text}");
+    }
+
+    /// 英文界面里导入导出面板的文字（来源分段、文字清单、不可用原因、取消说明）不含中文。
+    #[test]
+    fn english_exchange_copy_has_no_chinese() {
+        let cjk = |text: &str| text.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch) || ('\u{3000}'..='\u{303f}').contains(&ch) || ('\u{ff00}'..='\u{ffef}').contains(&ch));
+        let mut pane = exchange_pane();
+        pane.set_locale(Locale::En);
+        let ascii = |mut source: ExchangeSource| {
+            source.context = "notes / main".to_owned();
+            source.rows = vec![vec![Some("a".to_owned())]];
+            source.label = "result".to_owned();
+            source
+        };
+        let mut empty_table = ascii(table_source("orders", &[]));
+        empty_table.columns.clear();
+        let mut loading = ascii(table_source("orders", &["id"]));
+        loading.running = true;
+        loading.truncated = true;
+        let mut no_table = ascii(table_source("orders", &[]));
+        no_table.table = None;
+        no_table.columns.clear();
+        let mut empty_query = ascii(query_source(false));
+        empty_query.columns.clear();
+        for source in [ascii(table_source("orders", &["id"])), empty_table, loading, no_table, ascii(query_source(true)), ascii(query_source(false)), empty_query] {
+            pane.bind_source(source);
+            for range in ["all", "100"] {
+                pane.apply_range(range);
+                let text = pane.lines().join("\n");
+                assert!(!cjk(&text), "英文清单残留中文：{text}");
+                assert!(!cjk(&pane.empty_reason()), "{}", pane.empty_reason());
+            }
+        }
+        for kind in [ExchangeSourceKind::Table, ExchangeSourceKind::Query] {
+            let label = i18n::text(Locale::En, kind.label_key());
+            assert!(!cjk(&label) && i18n::text(Locale::ZhCn, kind.label_key()).starts_with("当前"), "{label}");
+        }
+        pane.log.push(TaskView::running("dump-1", "dump", "running"));
+        pane.cancel_current();
+        assert!(!cjk(&pane.notice) && pane.notice.starts_with("Cancelled"), "{}", pane.notice);
+        for key in [Some("export.import.gaps"), Some("ui.exchange.noMapping")] {
+            assert!(!cjk(&i18n::text(Locale::En, key.unwrap())));
+        }
+        assert_eq!(block_unmapped(false, &BTreeMap::new()), Some("ui.exchange.noMapping"));
     }
 
     #[test]

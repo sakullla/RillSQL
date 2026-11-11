@@ -1871,12 +1871,16 @@ impl Render for GridPane {
             Some(false) => t("grid.action.sortAsc"),
             None => t("grid.action.sort"),
         };
+        // 窄窗口（640）一行放不下时换行，而不是把右端的“预览变更”等按钮裁掉：
+        // 最小高度仍是 tools_h，右侧动作组整组换到下一行并靠右。
         let mut tools = div()
             .id("grid-tools")
             .flex_none()
-            .h(px(m.tools_h()))
+            .min_h(px(m.tools_h()))
+            .py(px(3.))
             .px(px(10.))
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(4.))
             .border_b_1()
@@ -1939,20 +1943,30 @@ impl Render for GridPane {
         if let Some(sorted) = sort_text {
             tools = tools.child(kit::pill(SharedString::from(sorted), p.accent_text, p.accent_soft));
         }
-        tools = tools.child(div().flex_1()).child(kit::pill(
-            if writable { t("grid.status.writable") } else { t("grid.status.readonly") },
-            if writable { p.ok } else { p.text_muted },
-            if writable { p.ok_soft } else { p.hover },
-        ));
+        // 状态组（可写/只读、只读原因、操作反馈）占住中间的剩余空间并靠右，空间不够时文字截断。
+        let mut status = div()
+            .id("grid-tools-status")
+            .flex_1()
+            .min_w(px(120.))
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(px(4.))
+            .child(kit::pill(
+                if writable { t("grid.status.writable") } else { t("grid.status.readonly") },
+                if writable { p.ok } else { p.text_muted },
+                if writable { p.ok_soft } else { p.hover },
+            ));
         // 只读不是一句状态词：把具体原因放在旁边，用户知道为什么写不进去。
         // 这是唯一显示只读原因的地方，任何原因（包括最笼统的那条）都不能被藏起来。
         let readonly_reason = self.session.readonly_reason().to_owned();
         if !writable && !readonly_reason.is_empty() {
-            tools = tools.child(
+            status = status.child(
                 div()
                     // 只读原因自己也带测试选择器：验收要看它真的画出来了，而不是只存在于会话里。
                     .debug_selector(|| "grid-readonly-reason".to_owned())
                     .px(px(2.))
+                    .min_w(px(0.))
                     .max_w(px(360.))
                     .truncate()
                     .text_size(px(TypeScale::SM))
@@ -1961,15 +1975,23 @@ impl Render for GridPane {
             );
         }
         if !self.notice.is_empty() {
-            tools = tools.child(
-                div().px(px(6.)).max_w(px(360.)).truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(self.notice.clone())),
+            status = status.child(
+                div().px(px(6.)).min_w(px(0.)).max_w(px(360.)).truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(self.notice.clone())),
             );
         }
-        tools = tools
+        tools = tools.child(status);
+        // 动作组不收缩：一行放不下时整组换行，始终完整可点。
+        let mut actions = div()
+            .id("grid-tools-actions")
+            .flex_none()
+            .ml_auto()
+            .flex()
+            .items_center()
+            .gap(px(4.))
             .child(grid_icon("copy-region", IconName::Copy, t("grid.value.copyValue"), entity.clone()))
             .child(grid_icon("grid-record-toggle", IconName::PanelRight, t("grid.record.open"), entity.clone()));
         if writable {
-            tools = tools
+            actions = actions
                 .child(grid_icon("grid-insert", IconName::Plus, t("grid.action.insert"), entity.clone()))
                 .child(grid_icon("mark-delete", IconName::Trash, t("grid.menu.markDelete"), entity.clone()));
         }
@@ -1982,12 +2004,13 @@ impl Render for GridPane {
                     });
                 }
             };
-            tools = tools.child(if dirty {
+            actions = actions.child(if dirty {
                 kit::primary_button("grid-preview", Some(IconName::Eye), t("grid.action.preview"), preview).into_any_element()
             } else {
                 kit::tool_button("grid-preview", Some(IconName::Eye), t("grid.action.preview"), preview).into_any_element()
             });
         }
+        tools = tools.child(actions);
 
         // 筛选条：每条条件可辨认、可换条件、可改值、可单删；非法原因和全清也在这里。
         let drafts = self.session.filters().to_vec();
@@ -3198,6 +3221,42 @@ mod pane_tests {
                 cx,
             );
         });
+    }
+
+    /// 640 宽的窗口里网格只有约 560 宽：工具条换行，“预览变更”等右端动作完整可见、可点，不被裁掉。
+    #[gpui_kit::test]
+    fn narrow_toolbar_wraps_instead_of_clipping_the_preview_button(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        let dir = std::env::temp_dir().join(format!("rillsql-grid-narrow-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        cx.update(gpui_kit::init);
+        let width = 560.;
+        let (window, pane) = cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(width), px(600.)) };
+            gpui_kit::open_window(WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() }, cx, |window, cx| {
+                cx.new(|cx| GridPane::new(services, window, cx))
+            })
+            .expect("grid pane")
+        });
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            window.render_frame(cx);
+            for id in ["grid-preview", "grid-record-toggle", "copy-region", "grid-insert", "mark-delete"] {
+                let el = window.find(id);
+                assert!(el.visible(), "{id} 应可见");
+                let b = el.bounds();
+                let right = f32::from(b.origin.x + b.size.width);
+                assert!(f32::from(b.origin.x) >= -0.5 && right <= width + 0.5, "{id} 被裁切：{b:?}");
+            }
+            // 换行后动作组在搜索框下方：说明是换行而不是被挤出窗口。
+            let search = window.find("grid-search").bounds();
+            let preview = window.find("grid-preview").bounds();
+            assert!(preview.origin.y > search.origin.y, "窄宽度下动作组换到下一行：{search:?} / {preview:?}");
+            window.click("grid-preview", cx);
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 编辑器事件由应用队列异步送达，断言前先清空队列。

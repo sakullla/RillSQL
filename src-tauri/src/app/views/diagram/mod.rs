@@ -167,7 +167,8 @@ impl DiagramPane {
     }
 
     pub fn lines(&self) -> Vec<String> {
-        let mut lines = vec![i18n::text(self.locale, "diagram.readonly")];
+        // 只列实际画出来的文字：只读说明 `diagram.readonly` 只在标题悬停提示里，不常驻。
+        let mut lines = Vec::new();
         if !self.label.is_empty() {
             lines.push(self.label.clone());
         }
@@ -401,7 +402,7 @@ mod tests {
             assert_eq!(window.find("diagram-card:orders").label(), Some("card orders"));
             view.update(cx, |view, cx| {
                 let text = view.diagram_text(cx);
-                assert!(text.contains("只读"), "{text}");
+                assert!(!text.contains(&i18n::text(Locale::ZhCn, "diagram.readonly")), "只读说明只在悬停提示里，文字清单不列：{text}");
                 assert!(text.contains("customers.id") || text.contains("fk orders.customer_id") || text.contains("orders.customer_id"), "{text}");
                 assert!(text.contains("->") && text.contains("customers"), "{text}");
                 assert!(text.contains("outside") && text.contains("missing_customers"), "{text}");

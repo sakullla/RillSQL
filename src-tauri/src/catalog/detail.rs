@@ -382,8 +382,10 @@ pub async fn read_column_meta(
     schema: &str,
     table: &str,
 ) -> Result<Vec<ColumnMeta>, String> {
+    // MongoDB / Redis 没有列清单：只是没有列元数据，不是读取失败（与注释同一处理）。
+    // 当成失败会让对象树顶端常驻“读取对象失败”。
     let Some(sql) = columns_sql(engine, database, schema, table) else {
-        return Err("这个引擎没有列清单".to_owned());
+        return Ok(Vec::new());
     };
     let rows = rows_for(session, &sql).await?;
     Ok(column_meta_from_rows(engine, &rows))
@@ -449,6 +451,16 @@ pub async fn read_object_details(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 没有列清单的引擎（MongoDB / Redis）读列元数据得到空表而不是失败：
+    /// 否则连上 MongoDB 后对象树顶端会常驻“读取对象失败”。
+    #[tokio::test]
+    async fn column_meta_of_non_relational_engines_is_empty_not_a_failure() {
+        for engine in [Engine::Mongodb, Engine::Redis] {
+            let meta = read_column_meta(&CatalogSession::Scripted, engine, "app", "", "users").await;
+            assert_eq!(meta, Ok(Vec::new()), "{engine:?}");
+        }
+    }
 
     #[test]
     fn engine_sql_shapes_quote_names_and_skip_non_relational_engines() {

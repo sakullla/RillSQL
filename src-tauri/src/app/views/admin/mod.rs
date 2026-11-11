@@ -13,6 +13,7 @@ use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, TypeScale};
 
 use crate::application::AppServices;
 use crate::app::views::grid::{operation_banner, GridTarget};
+use crate::ddl::english::localize;
 use crate::ddl::{preview_plan, Action, Plan, Request, Snapshot};
 use crate::i18n::{self, Locale};
 
@@ -57,7 +58,10 @@ pub enum AdminOp {
 pub struct AdminInventory {
     pub connected: bool,
     pub probed: bool,
+    /// 读取来源（引擎 · 库）。
     pub source: String,
+    /// 来源后面追加的一句说明（i18n 键），按当前语言渲染。
+    pub note_key: Option<&'static str>,
     pub sequences: Vec<String>,
     pub events: Vec<String>,
     pub extensions: Vec<String>,
@@ -66,11 +70,20 @@ pub struct AdminInventory {
 }
 
 impl AdminInventory {
+    /// 来源与说明按界面语言拼成一行。
+    pub fn source_text(&self, locale: Locale) -> String {
+        match self.note_key {
+            Some(key) => format!("{} · {}", self.source, i18n::text(locale, key)),
+            None => self.source.clone(),
+        }
+    }
+
     pub fn offline(target: &GridTarget) -> Self {
         Self {
             connected: false,
             probed: false,
-            source: format!("{} · {} · {}", target.engine, target.database, i18n::text(Locale::ZhCn, "admin.preview.unconnected")),
+            source: format!("{} · {}", target.engine, target.database),
+            note_key: Some("admin.preview.unconnected"),
             sequences: Vec::new(),
             events: Vec::new(),
             extensions: Vec::new(),
@@ -201,12 +214,12 @@ impl AdminSession {
     pub fn preview_risks(&self) -> Vec<(String, String)> {
         self.preview
             .as_ref()
-            .map(|plan| plan.risks.iter().map(|risk| (risk.level.clone(), risk.text.clone())).collect())
+            .map(|plan| plan.risks.iter().map(|risk| (risk.level.clone(), localize(&risk.text, self.locale))).collect())
             .unwrap_or_default()
     }
 
     pub fn preview_rule(&self) -> String {
-        self.preview.as_ref().map(|plan| plan.rule.clone()).unwrap_or_default()
+        self.preview.as_ref().map(|plan| localize(&plan.rule, self.locale)).unwrap_or_default()
     }
 
     pub fn preview_target(&self) -> String {
@@ -214,7 +227,7 @@ impl AdminSession {
     }
 
     pub fn blocked(&self) -> Vec<String> {
-        self.preview.as_ref().map(|plan| plan.blocked.clone()).unwrap_or_default()
+        self.preview.as_ref().map(|plan| plan.blocked.iter().map(|text| localize(text, self.locale)).collect()).unwrap_or_default()
     }
 
     pub fn cancel(&mut self) {
@@ -230,7 +243,7 @@ impl AdminSession {
         }
         let plan = self.preview.as_ref().ok_or_else(|| i18n::text(self.locale, "structure.preview.need"))?;
         if !plan.blocked.is_empty() {
-            return Err(plan.blocked.join(" "));
+            return Err(plan.blocked.iter().map(|text| localize(text, self.locale)).collect::<Vec<_>>().join(" "));
         }
         Ok(plan.steps.iter().map(|step| step.sql.clone()).collect())
     }
@@ -312,7 +325,7 @@ impl AdminPane {
                             }
                             this.session.inventory = inventory;
                             if !this.session.inventory.connected {
-                                this.session.note = this.session.inventory.source.clone();
+                                this.session.note = this.session.inventory.source_text(this.session.locale);
                             }
                             cx.notify();
                         });
@@ -351,7 +364,7 @@ impl AdminPane {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             if this.session.target != target {
-                                this.session.note = "目标已切换，本次预览结果已丢弃。".to_owned();
+                                this.session.note = i18n::text(this.session.locale, "admin.note.previewDropped");
                                 cx.notify();
                                 return;
                             }
@@ -384,6 +397,7 @@ impl AdminPane {
         let target = self.session.target.clone();
         let connection = self.session.target.connection_id.clone();
         let view = cx.entity().downgrade();
+        let locale = self.session.locale;
         cx.spawn(async move |_, cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             crate::app::views::grid::runtime_for_views().spawn(async move {
@@ -391,7 +405,7 @@ impl AdminPane {
                 let done = if refused.is_err() {
                     crate::application::ddl::execute_request(&services.connections, &connection, &request, &sql, true).await
                 } else {
-                    Err("未确认的管理操作不应执行".to_owned())
+                    Err(i18n::text(locale, "admin.note.unconfirmed"))
                 };
                 let _ = tx.send(done);
             });
@@ -400,7 +414,7 @@ impl AdminPane {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             if this.session.target != target {
-                                this.session.note = "目标已切换，本次执行结果已丢弃。".to_owned();
+                                this.session.note = i18n::text(this.session.locale, "admin.note.executeDropped");
                                 cx.notify();
                                 return;
                             }
@@ -564,7 +578,7 @@ impl Render for AdminPane {
             for name in inventory.extensions.iter().chain(inventory.partitions.iter()) {
                 list = list.child(kit::pill(SharedString::from(name.clone()), p.text_muted, p.hover));
             }
-            cards = cards.child(kit::card(&p).p(px(14.)).flex().flex_col().gap(px(8.)).child(kit::muted(SharedString::from(inventory.source.clone()), &p)).child(list));
+            cards = cards.child(kit::card(&p).p(px(14.)).flex().flex_col().gap(px(8.)).child(kit::muted(SharedString::from(inventory.source_text(locale)), &p)).child(list));
         }
         if !sections.pragma && !sections.maintenance && !sections.sequences && !sections.events && !sections.extensions && !sections.partitions && !sections.attached {
             cards = cards.child(kit::empty_state(IconName::Gauge, t("ui.tool.admin"), t("admin.section.none"), &p));
@@ -596,7 +610,7 @@ impl Render for AdminPane {
                             .child(kit::title(t("ui.tool.admin"), TypeScale::LG, &p))
                             .child(div().id("admin-banner").truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(self.session.banner()))),
                     )
-                    .child(div().id("admin-source").text_size(px(TypeScale::XS)).text_color(p.text_faint).max_w(px(320.)).truncate().child(SharedString::from(inventory.source.clone()))),
+                    .child(div().id("admin-source").text_size(px(TypeScale::XS)).text_color(p.text_faint).max_w(px(320.)).truncate().child(SharedString::from(inventory.source_text(locale)))),
             )
             .child(div().id("admin-body").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(24.)).child(div().max_w(px(760.)).mx_auto().flex().flex_col().gap(px(12.)).child(cards).when(!self.session.note.is_empty(), |this| {
                 this.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.hover).text_size(px(TypeScale::SM)).child(SharedString::from(self.session.note.clone())))
@@ -697,6 +711,7 @@ async fn read_inventory(service: &crate::connections::Service, target: &GridTarg
                 connected: true,
                 probed: true,
                 source: format!("sqlite · {}", target.database),
+                note_key: None,
                 sequences: Vec::new(),
                 events: Vec::new(),
                 extensions: Vec::new(),
@@ -707,7 +722,8 @@ async fn read_inventory(service: &crate::connections::Service, target: &GridTarg
         _ => AdminInventory {
             connected: false,
             probed: true,
-            source: format!("{} · {} · 目录会话没有列出序列或事件，拒绝把夹具当成已连接", target.engine, target.database),
+            source: format!("{} · {}", target.engine, target.database),
+            note_key: Some("admin.inventory.unlisted"),
             sequences: Vec::new(),
             events: Vec::new(),
             extensions: Vec::new(),
@@ -732,6 +748,44 @@ mod tests {
             engine: engine.into(),
             environment: "dev".into(),
         }
+    }
+
+    /// 英文界面：来源说明、预览风险、规则、阻断原因与提示都不含中文（连接名是用户数据，不在此列）。
+    #[test]
+    fn english_admin_copy_has_no_chinese() {
+        let cjk = crate::ddl::english::has_cjk;
+        let mut sqlite = target("sqlite");
+        sqlite.database = "main".into();
+        for (operation, pragma) in [
+            (AdminOp::Vacuum, None),
+            (AdminOp::Reindex { target: Some("orders".into()) }, None),
+            (AdminOp::SetForeignKeys { enabled: true }, None),
+            (AdminOp::SetPragma { pragma: "journal_mode".into(), value: "wal".into() }, None),
+            (AdminOp::SetPragma { pragma: "user_version".into(), value: "3".into() }, Some("3")),
+            (AdminOp::Attach { path: "/tmp/x.sqlite".into(), name: "main".into() }, None),
+        ] {
+            let mut session = AdminSession::new(sqlite.clone());
+            session.locale = Locale::En;
+            session.operation = operation.clone();
+            let mut snapshot = Snapshot::bare(DdlEngine::Sqlite, "main", "", "main");
+            snapshot.live_foreign_keys = Some(false);
+            if let Some(value) = pragma {
+                snapshot.pragmas.insert("user_version".into(), value.into());
+            }
+            session.arm_fixture(&snapshot);
+            let mut texts: Vec<String> = session.preview_risks().into_iter().map(|(_, text)| text).collect();
+            texts.extend(session.blocked());
+            texts.push(session.preview_rule());
+            texts.push(session.note.clone());
+            texts.push(session.inventory.source_text(Locale::En));
+            texts.push(session.confirm_sql().unwrap_err());
+            for text in texts {
+                assert!(!cjk(&text), "{operation:?}: {text}");
+            }
+        }
+        let offline = AdminInventory::offline(&sqlite);
+        assert!(offline.source_text(Locale::ZhCn).contains("没有连接"), "中文界面仍是中文：{}", offline.source_text(Locale::ZhCn));
+        assert!(offline.source.contains("sqlite"));
     }
 
     #[test]

@@ -42,7 +42,8 @@ pub fn entry_text(locale: Locale, entry: &LogEntry) -> String {
     if let Some(ms) = entry.elapsed_ms {
         parts.push(elapsed_label(ms));
     }
-    if !entry.message.is_empty() {
+    // 没执行到的语句只说状态：执行层写的说明与状态词重复，而且不随界面语言变化。
+    if !entry.message.is_empty() && entry.status != "skipped" {
         parts.push(entry.message.clone());
     }
     parts.join(" · ")
@@ -154,7 +155,7 @@ impl LogPanel<'_> {
                                     .when_some(entry.elapsed_ms, |this, ms| this.child(div().flex_none().text_color(p.text_faint).child(SharedString::from(elapsed_label(ms)))))
                                     .child(div().flex_1().min_w(px(0.)).truncate().font_family(self.mono.clone()).text_color(p.text_faint).child(SharedString::from(sql))),
                             )
-                            .when(!entry.message.is_empty(), |this| {
+                            .when(!entry.message.is_empty() && entry.status != "skipped", |this| {
                                 this.child(
                                     div()
                                         .text_color(if failed { p.danger } else { p.text_muted })

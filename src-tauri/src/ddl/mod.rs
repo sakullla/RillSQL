@@ -1,6 +1,7 @@
 //! 在已经打开的会话上预览并逐条执行结构变更。不新开数据库连接。
 
 pub mod commands;
+pub(crate) mod english;
 mod exec;
 mod introspect;
 mod model;
