@@ -1669,6 +1669,55 @@ impl WorkbenchModel {
         }
     }
 
+    /// 编辑器里 Ctrl/⌘+点击对象：在对象树里展开到它并选中；表和视图同时打开结构页，
+    /// 其它对象（例程、序列、集合……）只定位。树里还没读到这个对象时说明原因，
+    /// 表/视图仍按查询页的目录身份（fallback_spec）打开结构页。返回是否在树上定位到了。
+    pub fn go_to_definition(
+        &mut self,
+        connection_id: &str,
+        database: &str,
+        schema: &str,
+        name: &str,
+        kind: &str,
+        fallback_spec: Option<String>,
+    ) -> bool {
+        let parsed = crate::catalog::model::parse_kind(kind);
+        let found = self
+            .nav
+            .object_by_key(connection_id, database, schema, name, parsed)
+            .or_else(|| {
+                self.nav.nodes().find(|node| {
+                    node.kind == NavKind::Object
+                        && !node.stale
+                        && node.connection_id == connection_id
+                        && node.database == database
+                        && node.schema.eq_ignore_ascii_case(schema)
+                        && node.name.eq_ignore_ascii_case(name)
+                })
+            })
+            .cloned();
+        let Some(node) = found else {
+            self.notice_key = Some("query.definition.notInTree");
+            self.notice_detail = name.to_owned();
+            if matches!(parsed, crate::catalog::model::ObjectKind::Table | crate::catalog::model::ObjectKind::View) {
+                if let Some(spec) = fallback_spec {
+                    self.open_item(WorkItemKind::Structure, spec);
+                }
+            }
+            return false;
+        };
+        if let Some(parent) = node.parent.as_deref() {
+            let _ = self.nav.expand(parent);
+        }
+        self.nav.set_focus(&node.id);
+        self.sync_object_spec_from_focus();
+        let structure = node.engine != Engine::Mongodb && node.object().is_some_and(|object| object.opens_data());
+        if structure {
+            let _ = self.nav_command(&format!("nav-open-structure:{}", node.id));
+        }
+        true
+    }
+
     /// 对象/列/索引动作的规格。菜单、键盘和右键都从这里取同一份身份。
     fn nav_spec(&self, node_id: &str) -> Option<String> {
         let node = self.nav.node(node_id)?;

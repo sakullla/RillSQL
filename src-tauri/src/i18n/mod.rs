@@ -450,6 +450,17 @@ dict! {
     "query.database.label" => "数据库", "Database";
     "query.status.empty" => "空结果", "Empty result";
     "query.status.running" => "正在执行", "Running";
+    "query.status.cancelled" => "已取消", "Cancelled";
+    "query.info.type" => "类型 {type}", "Type {type}";
+    "query.info.typeUnknown" => "类型未读到", "Type not read";
+    "query.info.nullable" => "可为空", "Nullable";
+    "query.info.notNull" => "不可为空", "Not null";
+    "query.info.nullUnknown" => "可空性未读到", "Nullability not read";
+    "query.info.source" => "来源：{source}", "Source: {source}";
+    "query.info.schema" => "模式：{schema}", "Schema: {schema}";
+    "query.info.comment" => "注释：{comment}", "Comment: {comment}";
+    "query.definition.notInTree" => "对象树里还没有读到这个对象，暂时无法定位；刷新或展开对应分组后再试。", "The object tree hasn't loaded this object yet, so it can't be located. Refresh or expand its group and try again.";
+    "query.outline.jump" => "跳到这条语句", "Go to this statement";
     "query.status.noObjects" => "没有对象", "No objects";
     "query.results.statement" => "结果", "Result";
     "query.results.loadMore" => "加载更多", "Load more";

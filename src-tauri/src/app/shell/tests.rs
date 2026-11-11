@@ -3982,6 +3982,45 @@ fn tree_actions_bind_to_the_row_and_routines_never_open_a_data_page() {
     assert_eq!(model.notice_key, Some("catalog.tree.noData"));
 }
 
+/// 编辑器里 Ctrl/⌘+点击对象：树上展开并选中它；表再打开结构页，没有结构页的对象只定位，
+/// 树里没有的名字说明原因、不打开任何东西。
+#[test]
+fn go_to_definition_locates_in_the_tree_and_opens_the_structure_page() {
+    use crate::catalog::model::{ObjectKind, ObjectRow};
+    let orders = ObjectRow::table("orders", Some(4));
+    let sequence = ObjectRow::fresh("orders_seq", ObjectKind::Sequence);
+    let pg = nav_connection(Engine::Postgres, "pg", "销售库", vec![nav_database("shop", vec![orders.clone(), sequence.clone()])]);
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert!(model.apply_navigation(&[pg], false));
+    let orders_id = nav_id("pg", "shop", "public", &orders);
+    let group = crate::catalog::hierarchy::group_node_id("pg", "shop", "public", ObjectKind::Table);
+    assert!(!model.nav.is_expanded(&group), "分组一开始是收起的");
+
+    let structures = |model: &WorkbenchModel| model.tabs.iter().filter(|tab| tab.kind == WorkItemKind::Structure).count();
+    assert!(model.go_to_definition("pg", "shop", "public", "orders", "table", None));
+    assert_eq!(model.nav.focus(), Some(orders_id.as_str()), "树上选中这张表");
+    assert!(model.nav.is_expanded(&group), "展开到它所在的分组");
+    assert!(model.nav_rows().iter().any(|row| row.id == orders_id), "表在可见行里");
+    let tab = model.active_tab().cloned().expect("结构页");
+    assert_eq!(tab.kind, WorkItemKind::Structure);
+    assert!(tab.spec.as_deref().unwrap_or_default().starts_with("pg|销售库|shop|public|orders"), "{:?}", tab.spec);
+    assert_eq!(model.executions, 0, "跳转定义不执行 SQL");
+
+    // 序列没有结构页：只定位。
+    let before = structures(&model);
+    let sequence_id = nav_id("pg", "shop", "public", &sequence);
+    assert!(model.go_to_definition("pg", "shop", "public", "orders_seq", "sequence", None));
+    assert_eq!(model.nav.focus(), Some(sequence_id.as_str()));
+    assert_eq!(structures(&model), before, "没有结构页的对象不开结构页");
+
+    // 树里没有：说明原因，焦点和工作项都不动。
+    let tabs = model.tabs.len();
+    assert!(!model.go_to_definition("pg", "shop", "public", "nosuch", "table", None));
+    assert_eq!(model.notice_key, Some("query.definition.notInTree"));
+    assert_eq!(model.nav.focus(), Some(sequence_id.as_str()));
+    assert_eq!(model.tabs.len(), tabs);
+}
+
 #[test]
 fn insertions_change_the_draft_only_and_keep_the_selected_target() {
     use crate::catalog::model::ObjectRow;

@@ -738,7 +738,8 @@ fn peek_word(sql: &str, index: usize, hash: bool) -> Option<String> {
 
 fn read_word(sql: &str, index: usize) -> (String, usize) {
     let bytes = sql.as_bytes();
-    let mut end = index + 1;
+    // 第一个字符可能是多字节字符（如中文正文），按字符长度跳过，不切在字符中间。
+    let mut end = index + sql[index..].chars().next().map_or(1, char::len_utf8);
     while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
         end += 1;
     }

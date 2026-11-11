@@ -36,11 +36,6 @@ pub fn module_id() -> &'static str {
         std::any::type_name_of_val(&exec::run_batch),
         std::any::type_name_of_val(&exec::showplan_batch),
         std::any::type_name_of_val(&exec::showplan_outline),
-        // 编辑器的签名提示、悬停和跳转定义从这里取数据。
-        std::any::type_name_of_val(&functions::call_context),
-        std::any::type_name_of_val(&functions::call_signature),
-        std::any::type_name_of_val(&functions::FunctionSig::active_param),
-        std::any::type_name_of_val(&complete::Resolved::info),
     );
     let _ = _linked;
     "query"

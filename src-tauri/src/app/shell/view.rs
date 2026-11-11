@@ -91,6 +91,15 @@ impl Workbench {
                 }
             }));
         });
+        // 编辑器里 Ctrl/⌘+点击对象的出口：查询页只解析出对象，树定位和结构页由外壳负责。
+        let definition_owner = cx.entity().downgrade();
+        query.update(cx, |pane, _| {
+            pane.set_definition_sink(std::rc::Rc::new(move |link: crate::ui::ObjectLink, cx: &mut App| {
+                if let Some(owner) = definition_owner.upgrade() {
+                    owner.update(cx, |view, cx| view.go_to_definition(link, cx));
+                }
+            }));
+        });
         let structure = cx.new(|_| StructurePane::new(Arc::clone(&services)));
         let admin = cx.new(|_| AdminPane::new(Arc::clone(&services)));
         let exchange = cx.new(|_| ExchangePane::new(Arc::clone(&services)));
@@ -399,6 +408,14 @@ impl Workbench {
             // 连接没打开时不假装跳到行：语句留在编辑器里，原因写清楚。
             self.model.notice_detail = crate::i18n::text(self.model.locale(), "grid.fk.prepared");
         }
+        cx.notify();
+    }
+
+    /// 跳转定义：在对象树里定位并选中对象，表和视图再打开结构页。
+    pub(super) fn go_to_definition(&mut self, link: crate::ui::ObjectLink, cx: &mut Context<Self>) {
+        let fallback = self.query.read(cx).definition_spec(&link);
+        let _ = self.model.go_to_definition(&link.connection_id, &link.database, &link.schema, &link.name, &link.kind, fallback);
+        self.persist_if_needed();
         cx.notify();
     }
 

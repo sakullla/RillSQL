@@ -9,20 +9,262 @@ use std::rc::Rc;
 
 use gpui_kit::base::input::{Diagnostic, DiagnosticSeverity};
 use gpui_kit::component::input::{
-    CompletionProvider, Editor, EditorState, FoldRange, InputEvent, Rope,
+    CompletionProvider, DefinitionProvider, Editor, EditorState, FoldRange, GutterDecoration, GutterDecorationCollection, HoverProvider,
+    InputEvent, RangeDecoration, RangeDecorationCollection, RangeDecorationStyle, Rope,
 };
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EntityInputHandler as _, Focusable as _, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, Styled as _, Task, Window, div, px, rgb,
+    anchored, deferred, point, Anchor, App, AppContext as _, Context, Entity, EntityInputHandler as _, Focusable as _, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _, Task, Window, div, px, rgb,
 };
-use lsp_types::{CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit, TextEdit};
+use lsp_types::{
+    CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit, Documentation, Hover, HoverContents,
+    LocationLink, MarkupContent, MarkupKind, TextEdit,
+};
 
 use crate::app::accept_versioned;
 use crate::app::views::settings;
-use crate::i18n::Locale;
-use crate::query::assist::CompletionScope;
-use crate::query::complete;
+use crate::i18n::{self, Locale};
+use crate::query::assist::{CompletionScope, EntryInfo};
+use crate::query::complete::{self, Resolved};
+use crate::query::functions;
+use crate::ui::kit::Palette;
+
+/// Ctrl/⌘+点击跳转定义用的自定义 URI 方案：`rillsql-object://<连接>/<库>/<模式>/<对象>?kind=<种类>`。
+pub const OBJECT_SCHEME: &str = "rillsql-object";
+
+/// 跳转定义解析出的目录对象。连接与库来自查询标签的目标，模式、名字和种类来自目录。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectLink {
+    pub connection_id: String,
+    pub database: String,
+    pub schema: String,
+    pub name: String,
+    pub kind: String,
+}
+
+impl ObjectLink {
+    pub fn uri(&self) -> String {
+        format!(
+            "{OBJECT_SCHEME}://{}/{}/{}/{}?kind={}",
+            encode_segment(&self.connection_id),
+            encode_segment(&self.database),
+            encode_segment(&self.schema),
+            encode_segment(&self.name),
+            encode_segment(&self.kind)
+        )
+    }
+
+    /// 只认本方案的 URI；段数不对或编码坏了返回 None。
+    pub fn parse(uri: &str) -> Option<Self> {
+        let rest = uri.strip_prefix(OBJECT_SCHEME)?.strip_prefix("://")?;
+        let (path, kind) = match rest.split_once("?kind=") {
+            Some((path, kind)) => (path, decode_segment(kind)?),
+            None => (rest, String::new()),
+        };
+        let parts: Vec<&str> = path.split('/').collect();
+        let [connection_id, database, schema, name] = parts.as_slice() else {
+            return None;
+        };
+        let name = decode_segment(name)?;
+        if name.is_empty() {
+            return None;
+        }
+        Some(Self {
+            connection_id: decode_segment(connection_id)?,
+            database: decode_segment(database)?,
+            schema: decode_segment(schema)?,
+            name,
+            kind,
+        })
+    }
+}
+
+fn encode_segment(text: &str) -> String {
+    let mut out = String::new();
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn decode_segment(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = text.get(index + 1..index + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// 签名提示的内容：函数名、形参、返回值和当前高亮的形参（超出固定参数时没有高亮）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignatureHint {
+    pub name: String,
+    pub params: Vec<String>,
+    pub variadic: bool,
+    pub returns: String,
+    pub active: Option<usize>,
+    /// 左括号在全文里的字节偏移；Esc 关闭后同一对括号里不再弹出。
+    pub open: usize,
+}
+
+/// 光标所在的已知函数调用的签名提示。光标不在括号里、函数未知或不写括号的函数都没有。
+pub fn signature_at(engine: &str, text: &str, cursor: usize) -> Option<SignatureHint> {
+    let call = functions::call_context(text, cursor)?;
+    let sig = functions::call_signature(engine, &call.name)?;
+    Some(SignatureHint {
+        name: sig.name.to_owned(),
+        params: sig.params.iter().map(|param| (*param).to_owned()).collect(),
+        variadic: sig.variadic,
+        returns: sig.returns.to_owned(),
+        active: sig.active_param(call.argument),
+        open: call.open,
+    })
+}
+
+/// 光标所在语句的范围。光标落在语句之间的空白里、或草稿只有一条语句时没有高亮。
+pub fn statement_at(engine: &str, text: &str, cursor: usize) -> Option<Range<usize>> {
+    // 与大纲同一套切分：未绑定或未知引擎按 postgres 切。
+    let engine = if crate::query::assist::known_engine(engine) { engine } else { "postgres" };
+    let pieces = crate::query::split_sql(engine, text).pieces;
+    if pieces.len() < 2 {
+        return None;
+    }
+    pieces.iter().find(|piece| piece.start <= cursor && cursor <= piece.end).map(|piece| piece.start..piece.end)
+}
+
+/// 补全详情、悬停和对象信息共用的说明文本（Markdown）。只写读到的元数据；读不到的项明说。
+pub fn info_markdown(info: &EntryInfo, locale: Locale) -> String {
+    let t = |key: &str| i18n::text(locale, key);
+    let fill = |key: &str, name: &str, value: &str| i18n::fill(&t(key), &[(name, &escape_markdown(value))]);
+    let mut lines = Vec::new();
+    match info {
+        EntryInfo::Column { source, column } => {
+            let type_text = if column.type_name.trim().is_empty() { t("query.info.typeUnknown") } else { fill("query.info.type", "type", &column.type_name) };
+            let nullable = match column.nullable {
+                Some(true) => t("query.info.nullable"),
+                Some(false) => t("query.info.notNull"),
+                None => t("query.info.nullUnknown"),
+            };
+            lines.push(format!("{} · {type_text} · {nullable}", code_span(&column.name)));
+            if !source.is_empty() {
+                lines.push(fill("query.info.source", "source", source));
+            }
+            if !column.comment.trim().is_empty() {
+                lines.push(fill("query.info.comment", "comment", &column.comment));
+            }
+        }
+        EntryInfo::Object { schema, name, kind, comment } => {
+            let qualified = if schema.is_empty() { name.clone() } else { format!("{schema}.{name}") };
+            let kind_key = match kind.to_ascii_lowercase().as_str() {
+                "table" => "query.complete.kind.table",
+                "view" | "materialized" => "query.complete.kind.view",
+                "function" => "query.complete.kind.function",
+                "procedure" => "query.complete.kind.procedure",
+                "trigger" => "query.complete.kind.trigger",
+                "sequence" => "query.complete.kind.sequence",
+                _ => "query.complete.kind.object",
+            };
+            lines.push(format!("{} · {}", code_span(&qualified), t(kind_key)));
+            if !schema.is_empty() {
+                lines.push(fill("query.info.schema", "schema", schema));
+            }
+            if !comment.trim().is_empty() {
+                lines.push(fill("query.info.comment", "comment", comment));
+            }
+        }
+        EntryInfo::Function { signature } => lines.push(code_span(signature)),
+    }
+    lines.join("\n\n")
+}
+
+fn code_span(text: &str) -> String {
+    format!("`{}`", text.replace('`', "'"))
+}
+
+fn escape_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(ch, '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '#' | '|') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// 悬停内容：先按语句解析对象/列；认不出时，紧跟左括号的已知内置函数给签名。其余没有悬停。
+pub fn hover_info(scope: &CompletionScope, text: &str, offset: usize) -> Option<(Range<usize>, EntryInfo)> {
+    if let Some(found) = complete::resolve(scope, text, offset) {
+        return Some((found.span.start..found.span.end, found.target.info()));
+    }
+    let offset = offset.min(text.len());
+    if !text.is_char_boundary(offset) {
+        return None;
+    }
+    let is_word = |ch: char| ch.is_ascii_alphanumeric() || ch == '_';
+    let start = offset - text[..offset].chars().rev().take_while(|ch| is_word(*ch)).map(char::len_utf8).sum::<usize>();
+    let end = offset + text[offset..].chars().take_while(|ch| is_word(*ch)).map(char::len_utf8).sum::<usize>();
+    if start == end || !text[end..].starts_with('(') {
+        return None;
+    }
+    let sig = functions::call_signature(&scope.engine, &text[start..end])?;
+    Some((start..end, EntryInfo::Function { signature: sig.text() }))
+}
+
+/// 跳转定义的目标：对象本身，或列所在的目录对象。目标连接/库未知、解析不到时为 None。
+pub fn definition_link(scope: &CompletionScope, target: Option<&(String, String)>, text: &str, offset: usize) -> Option<(Range<usize>, ObjectLink)> {
+    let (connection_id, database) = target?;
+    let found = complete::resolve(scope, text, offset)?;
+    let (schema, name, kind) = match found.target {
+        Resolved::Object { schema, name, kind, .. } => (schema, name, kind),
+        Resolved::Column { schema, table, .. } => {
+            let object = scope
+                .objects
+                .iter()
+                .find(|object| object.name.eq_ignore_ascii_case(&table) && object.schema.eq_ignore_ascii_case(&schema))?;
+            (object.schema.clone(), object.name.clone(), object.kind.clone())
+        }
+    };
+    Some((
+        found.span.start..found.span.end,
+        ObjectLink { connection_id: connection_id.clone(), database: database.clone(), schema, name, kind },
+    ))
+}
+
+/// 跳转定义的出口：拿到解析出的对象后交给外壳。
+pub type ObjectHandler = Rc<dyn Fn(ObjectLink, &mut App)>;
+
+type ObjectSink = Rc<RefCell<Option<ObjectHandler>>>;
+
+/// show_document 的处理：本方案的 URI 交给外壳定位；其它 URI 走编辑器默认行为。
+fn follow_uri(sink: &ObjectSink, uri: &str, cx: &mut App) -> bool {
+    if !uri.starts_with(OBJECT_SCHEME) {
+        return false;
+    }
+    // 认不出的本方案 URI 也算处理过：不能退回到“在当前文档里跳到 0 行”。
+    if let Some(link) = ObjectLink::parse(uri) {
+        let handler = sink.borrow().clone();
+        if let Some(handler) = handler {
+            handler(link, cx);
+        }
+    }
+    true
+}
 
 pub struct SqlEditor {
     state: Entity<EditorState>,
@@ -33,6 +275,23 @@ pub struct SqlEditor {
     locale: Rc<Cell<Locale>>,
     /// 最近一次请求的元数据状态说明；失败、部分失败或空目录时非空。
     note: Rc<RefCell<Option<String>>>,
+    /// 跳转定义用的连接与库；查询标签没有目标时为 None，不生成链接。
+    link_target: Rc<RefCell<Option<(String, String)>>>,
+    /// 跳转定义的出口：查询页把它接到外壳的树定位/结构页。
+    object_sink: ObjectSink,
+    /// 当前签名提示；光标离开括号、Esc 或函数未知时为 None。
+    signature: Option<SignatureHint>,
+    /// Esc 关掉的那对括号（左括号偏移）；光标离开或换了调用后失效。
+    dismissed: Option<usize>,
+    /// 光标所在语句的范围（低对比底色）。
+    current_statement: Option<Range<usize>>,
+    /// 上次按光标计算时的 (版本, 光标, 长度, 深色)，同一帧内只算一次。
+    tracked: Option<(u64, usize, usize, bool)>,
+    statement_marks: RangeDecorationCollection,
+    error_marks: RangeDecorationCollection,
+    error_gutter: GutterDecorationCollection,
+    /// 当前错误标记的范围；下一次编辑或重新执行时清除。
+    errors: Vec<Range<usize>>,
     stale_lint: u32,
     stale_completion: u32,
     folded_lines: u32,
@@ -42,6 +301,20 @@ pub struct SqlEditor {
     _subscription: gpui_kit::Subscription,
     /// Tab 接受补全：弹层打开时把 Tab 当成 Enter，其它时候仍然缩进。
     _accept_tab: gpui_kit::Subscription,
+    /// Esc 关闭签名提示。
+    _dismiss_signature: gpui_kit::Subscription,
+    /// 光标移动后重算当前语句高亮和签名提示。
+    _track: gpui_kit::Subscription,
+}
+
+struct SqlHover {
+    scope: Rc<RefCell<Option<CompletionScope>>>,
+    locale: Rc<Cell<Locale>>,
+}
+
+struct SqlDefinition {
+    scope: Rc<RefCell<Option<CompletionScope>>>,
+    target: Rc<RefCell<Option<(String, String)>>>,
 }
 
 struct SqlSuggest {
@@ -61,6 +334,8 @@ impl SqlEditor {
         let locale = Rc::new(Cell::new(Locale::ZhCn));
         let note = Rc::new(RefCell::new(None));
         let request = Rc::new(Cell::new(0));
+        let link_target: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+        let object_sink: ObjectSink = Rc::new(RefCell::new(None));
         let state = cx.new(|cx| {
             let mut state = EditorState::new(window, cx)
                 .language("sql")
@@ -75,12 +350,45 @@ impl SqlEditor {
                 note: note.clone(),
                 request: request.clone(),
             }));
+            state.lsp_mut().hover_provider = Some(Rc::new(SqlHover { scope: scope.clone(), locale: locale.clone() }));
+            state.lsp_mut().definition_provider = Some(Rc::new(SqlDefinition { scope: scope.clone(), target: link_target.clone() }));
+            let sink = object_sink.clone();
+            state.lsp_mut().show_document = Some(Rc::new(move |params, _window, cx| follow_uri(&sink, params.uri.as_str(), cx)));
             state
+        });
+        // 装饰集合一开始就建好：槽位常驻，出现错误标记时文本不会横移。
+        let (statement_marks, error_marks, error_gutter) = state.update(cx, |state, cx| {
+            (
+                state.create_range_decorations_collection(Vec::new(), cx),
+                state.create_range_decorations_collection(Vec::new(), cx),
+                state.create_gutter_decorations_collection(Vec::new(), cx),
+            )
         });
         let subscription = cx.subscribe(&state, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.version.set(this.version.get().wrapping_add(1));
+                // 错误标记属于上一次执行；草稿一改就不再可信。
+                this.clear_errors(cx);
+                let _ = this.track(cx);
                 cx.notify();
+            }
+        });
+        let track = cx.observe(&state, |this, _, cx| {
+            if this.track(cx) {
+                cx.notify();
+            }
+        });
+        let this = cx.weak_entity();
+        let dismiss_signature = cx.intercept_keystrokes({
+            move |event, window, cx| {
+                if event.keystroke.key != "escape" || event.keystroke.modifiers.modified() {
+                    return;
+                }
+                let _ = this.update(cx, |editor, cx| {
+                    if editor.signature.is_some() && editor.is_focused(window, cx) && !editor.completion_open(cx) {
+                        editor.dismiss_signature(cx);
+                    }
+                });
             }
         });
         // 弹层由编辑器自己画，键盘接受原本只绑了 Enter；Tab 在这里补上。
@@ -111,6 +419,16 @@ impl SqlEditor {
             scope,
             locale,
             note,
+            link_target,
+            object_sink,
+            signature: None,
+            dismissed: None,
+            current_statement: None,
+            tracked: None,
+            statement_marks,
+            error_marks,
+            error_gutter,
+            errors: Vec::new(),
             stale_lint: 0,
             stale_completion: 0,
             folded_lines: 0,
@@ -118,7 +436,135 @@ impl SqlEditor {
             theme: "auto".to_owned(),
             _subscription: subscription,
             _accept_tab: accept_tab,
+            _dismiss_signature: dismiss_signature,
+            _track: track,
         }
+    }
+
+    fn engine(&self) -> String {
+        self.scope.borrow().as_ref().map(|scope| scope.engine.clone()).unwrap_or_default()
+    }
+
+    /// 光标移动或文本变化后重算当前语句高亮和签名提示；同一状态只算一次。
+    fn track(&mut self, cx: &mut Context<Self>) -> bool {
+        let (text, cursor) = {
+            let state = self.state.read(cx);
+            (state.text().clone(), state.cursor())
+        };
+        let dark = cx.theme().is_dark();
+        let key = (self.version.get(), cursor, text.len(), dark);
+        let previous = self.tracked;
+        if previous == Some(key) {
+            return false;
+        }
+        self.tracked = Some(key);
+        let value = text.to_string();
+        let engine = self.engine();
+        let current = statement_at(&engine, &value, cursor);
+        if current != self.current_statement || previous.is_some_and(|(_, _, _, was)| was != dark) {
+            self.current_statement = current.clone();
+            let mut color = Palette::of(cx).accent;
+            color.a = if dark { 0.10 } else { 0.06 };
+            let marks = current
+                .map(|range| vec![RangeDecoration::new(range).with_style(RangeDecorationStyle::Fill).with_color(color)])
+                .unwrap_or_default();
+            self.statement_marks.set(marks, cx);
+        }
+        let mut hint = signature_at(&engine, &value, cursor);
+        match (&hint, self.dismissed) {
+            (Some(found), Some(open)) if found.open == open => hint = None,
+            (_, Some(_)) => self.dismissed = None,
+            _ => {}
+        }
+        if hint == self.signature {
+            return false;
+        }
+        self.signature = hint;
+        true
+    }
+
+    /// Esc：关掉这对括号的签名提示，直到光标离开或进入另一个调用。
+    pub fn dismiss_signature(&mut self, cx: &mut Context<Self>) {
+        if let Some(hint) = self.signature.take() {
+            self.dismissed = Some(hint.open);
+            cx.notify();
+        }
+    }
+
+    /// 当前签名提示（测试和外壳读取）。
+    pub fn signature(&self) -> Option<&SignatureHint> {
+        self.signature.as_ref()
+    }
+
+    /// 光标所在语句的高亮范围；随编辑移动，没有高亮时为 None。
+    pub fn statement_highlight(&self, cx: &App) -> Option<Range<usize>> {
+        self.statement_marks.get_ranges(cx).into_iter().next()
+    }
+
+    /// 执行失败的位置：每个范围同时画在行号旁和文本底色上。
+    pub fn mark_errors(&mut self, ranges: Vec<Range<usize>>, cx: &mut Context<Self>) {
+        let palette = Palette::of(cx);
+        let mut fill = palette.danger;
+        fill.a = 0.16;
+        let gutter = ranges.iter().cloned().map(|range| GutterDecoration::new(range).with_color(palette.danger)).collect();
+        let marks = ranges.iter().cloned().map(|range| RangeDecoration::new(range).with_style(RangeDecorationStyle::Fill).with_color(fill)).collect();
+        self.error_gutter.set(gutter, cx);
+        self.error_marks.set(marks, cx);
+        self.errors = ranges;
+        cx.notify();
+    }
+
+    pub fn clear_errors(&mut self, cx: &mut Context<Self>) {
+        if self.errors.is_empty() {
+            return;
+        }
+        self.errors.clear();
+        self.error_gutter.clear(cx);
+        self.error_marks.clear(cx);
+        cx.notify();
+    }
+
+    /// 当前的错误标记范围（随编辑跟踪）。
+    pub fn error_ranges(&self, cx: &App) -> Vec<Range<usize>> {
+        if self.errors.is_empty() {
+            return Vec::new();
+        }
+        self.error_marks.get_ranges(cx)
+    }
+
+    /// 跳转定义生成链接用的连接与库。
+    pub fn set_link_target(&self, target: Option<(String, String)>) {
+        let mut slot = self.link_target.borrow_mut();
+        if *slot != target {
+            *slot = target;
+        }
+    }
+
+    /// Ctrl/⌘+点击对象后的出口。
+    pub fn set_object_sink(&self, sink: ObjectHandler) {
+        *self.object_sink.borrow_mut() = Some(sink);
+    }
+
+    /// 与 Ctrl/⌘+点击同一条路径：按偏移解析链接，再交给 show_document 处理。解析不到时什么也不做。
+    pub fn follow_definition_at(&self, offset: usize, cx: &mut App) -> bool {
+        let text = self.value(cx);
+        let link = {
+            let scope = self.scope.borrow();
+            let target = self.link_target.borrow();
+            scope.as_ref().and_then(|scope| definition_link(scope, target.as_ref(), &text, offset))
+        };
+        match link {
+            Some((_, link)) => follow_uri(&self.object_sink, &link.uri(), cx),
+            None => false,
+        }
+    }
+
+    /// 悬停在偏移处会显示的说明（与悬停提供者同一份数据）；没有时为 None。
+    pub fn hover_text(&self, offset: usize, cx: &App) -> Option<String> {
+        let text = self.value(cx);
+        let scope = self.scope.borrow();
+        let (_, info) = hover_info(scope.as_ref()?, &text, offset)?;
+        Some(info_markdown(&info, self.locale.get()))
     }
 
     /// 设置里的查询编辑器字号；渲染时作为 Editor 的文本尺寸。
@@ -285,6 +731,14 @@ impl SqlEditor {
         self.state.read(cx).completion_menu_state().items.iter().find(|item| item.label == label).and_then(|item| item.insert_text.clone())
     }
 
+    /// 补全项的详情文档（Markdown）；没有元数据的候选为 None。
+    pub fn completion_documentation(&self, label: &str, cx: &App) -> Option<String> {
+        self.state.read(cx).completion_menu_state().items.iter().find(|item| item.label == label).and_then(|item| match item.documentation.as_ref()? {
+            Documentation::String(text) => Some(text.clone()),
+            Documentation::MarkupContent(content) => Some(content.value.clone()),
+        })
+    }
+
     /// 方言模块给出的 (显示名, 插入文本)。编辑器按插入文本写入。
     pub fn set_extra_suggestions(&self, items: Vec<(String, String)>) {
         *self.extra.borrow_mut() = items;
@@ -355,10 +809,14 @@ impl SqlEditor {
 }
 
 impl Render for SqlEditor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _ = self.track(cx);
         let (background, foreground) = self.theme_colors(cx.theme().is_dark());
+        let focused = self.is_focused(window, cx);
+        let popup = self.signature.clone().filter(|_| focused).map(|hint| self.signature_popup(&hint, cx));
         div()
             .id("sql-editor")
+            .relative()
             .size_full()
             .text_size(px(self.font_size))
             .text_color(rgb(foreground))
@@ -371,6 +829,54 @@ impl Render for SqlEditor {
                     .bg(rgb(background))
                     .text_color(rgb(foreground)),
             )
+            .children(popup)
+    }
+}
+
+impl SqlEditor {
+    /// 签名提示浮层：贴在光标上方，不压住下方的补全弹层；还没有光标几何时停在编辑器右上角。
+    fn signature_popup(&self, hint: &SignatureHint, cx: &App) -> gpui_kit::AnyElement {
+        let p = Palette::of(cx);
+        let mut row = div()
+            .id("sql-signature")
+            .flex()
+            .flex_wrap()
+            .max_w(px(520.))
+            .px(px(8.))
+            .py(px(4.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(p.line)
+            .bg(p.raised)
+            .shadow_md()
+            .text_size(px(12.))
+            .text_color(p.text_muted)
+            .font_family(cx.theme().mono_font_family.clone())
+            .child(div().text_color(p.text).child(SharedString::from(format!("{}(", hint.name))));
+        for (index, param) in hint.params.iter().enumerate() {
+            let active = hint.active == Some(index);
+            if index > 0 {
+                row = row.child(SharedString::from(", "));
+            }
+            row = row.child(
+                div()
+                    .id(("sql-signature-param", index))
+                    .when(active, |this| this.text_color(p.accent_text).font_weight(FontWeight::SEMIBOLD).bg(p.accent_soft).rounded(px(4.)))
+                    .child(SharedString::from(param.clone())),
+            );
+        }
+        if hint.variadic {
+            row = row.child(SharedString::from(", …"));
+        }
+        row = row.child(SharedString::from(format!(") → {}", hint.returns)));
+        match self.state.read(cx).prepaint_caret_geometry() {
+            Some(geometry) => {
+                let caret = geometry.cursor_bounds();
+                let at = point(caret.origin.x - px(4.), caret.origin.y + geometry.scroll_offset().y - px(4.));
+                deferred(anchored().position(at).anchor(Anchor::BottomLeft).snap_to_window().child(row)).with_priority(1).into_any_element()
+            }
+            None => div().absolute().top(px(4.)).right(px(8.)).child(row).into_any_element(),
+        }
     }
 }
 
@@ -404,13 +910,18 @@ impl SqlSuggest {
                     let end = planned.span.end.min(text.len());
                     let range = offset_to_position(text, start)..offset_to_position(text, end);
                     for entry in &planned.candidates {
-                        items.push(completion_edit(
+                        let mut item = completion_edit(
                             &entry.label,
                             &entry.insert,
                             completion_kind(entry.kind),
                             range.clone(),
                             Some(entry.detail.clone()),
-                        ));
+                        );
+                        // 详情面板：列的类型/可空/注释、对象的种类与模式、函数签名。
+                        item.documentation = entry.info.as_ref().map(|info| {
+                            Documentation::MarkupContent(MarkupContent { kind: MarkupKind::Markdown, value: info_markdown(info, locale) })
+                        });
+                        items.push(item);
                     }
                 }
                 None => {
@@ -500,6 +1011,45 @@ impl CompletionProvider for SqlSuggest {
     fn is_completion_trigger(&self, _offset: usize, new_text: &str, _cx: &mut App) -> bool {
         // IME 组合和中文正文不触发弹层，避免打断输入。
         new_text.chars().any(|ch| ch.is_ascii_alphabetic() || ch == '.')
+    }
+}
+
+impl HoverProvider for SqlHover {
+    fn hover(&self, text: &Rope, offset: usize, _window: &mut Window, _cx: &mut App) -> Task<gpui_kit::Result<Option<Hover>>> {
+        let scope = self.scope.borrow();
+        let Some(scope) = scope.as_ref() else {
+            return Task::ready(Ok(None));
+        };
+        let value = text.to_string();
+        // 认不出的名字没有悬停，不弹空气泡。
+        let hover = hover_info(scope, &value, offset).map(|(span, info)| Hover {
+            contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value: info_markdown(&info, self.locale.get()) }),
+            range: Some(lsp_types::Range { start: offset_to_position(text, span.start), end: offset_to_position(text, span.end) }),
+        });
+        Task::ready(Ok(hover))
+    }
+}
+
+impl DefinitionProvider for SqlDefinition {
+    fn definitions(&self, text: &Rope, offset: usize, _window: &mut Window, _cx: &mut App) -> Task<gpui_kit::Result<Vec<LocationLink>>> {
+        let scope = self.scope.borrow();
+        let target = self.target.borrow();
+        let value = text.to_string();
+        let links = scope
+            .as_ref()
+            .and_then(|scope| definition_link(scope, target.as_ref(), &value, offset))
+            .and_then(|(span, link)| {
+                let uri = link.uri().parse::<lsp_types::Uri>().ok()?;
+                Some(LocationLink {
+                    origin_selection_range: Some(lsp_types::Range { start: offset_to_position(text, span.start), end: offset_to_position(text, span.end) }),
+                    target_uri: uri,
+                    target_range: lsp_types::Range::default(),
+                    target_selection_range: lsp_types::Range::default(),
+                })
+            })
+            .into_iter()
+            .collect();
+        Task::ready(Ok(links))
     }
 }
 
@@ -984,5 +1534,181 @@ mod tests {
             editor.update(cx, |editor, _| editor.set_font_size(999));
             assert_eq!(editor.read(cx).font_size(), 24, "字号按设置范围归一");
         });
+    }
+
+    /// 带类型、可空和注释的目录：补全详情、悬停和跳转定义都从这里取。
+    fn typed_scope() -> CompletionScope {
+        use crate::query::assist::ColumnMeta;
+        let mut scope = catalog_scope();
+        scope.objects[0].comment = "订单表".to_owned();
+        scope.sources[0].columns = vec![
+            ColumnMeta { name: "id".to_owned(), type_name: "INTEGER".to_owned(), nullable: Some(false), comment: String::new() },
+            ColumnMeta { name: "customer".to_owned(), type_name: "TEXT".to_owned(), nullable: Some(true), comment: "下单客户".to_owned() },
+            ColumnMeta::named("status"),
+        ];
+        scope
+    }
+
+    #[test]
+    fn completion_detail_shows_type_and_nullability() {
+        let provider = suggest(Some(typed_scope()), Vec::new());
+        let text = "select  from orders";
+        let rope = Rope::from(text);
+        let items = provider.items(&rope, 7);
+        let doc = |label: &str| {
+            items
+                .iter()
+                .find(|item| item.label == label)
+                .and_then(|item| match item.documentation.as_ref()? {
+                    Documentation::MarkupContent(content) => Some(content.value.clone()),
+                    Documentation::String(text) => Some(text.clone()),
+                })
+                .unwrap_or_else(|| panic!("{label} 没有详情：{:?}", items.iter().map(|item| &item.label).collect::<Vec<_>>()))
+        };
+        let customer = doc("customer");
+        assert!(customer.contains("TEXT"), "{customer}");
+        assert!(customer.contains(&i18n::text(Locale::ZhCn, "query.info.nullable")), "{customer}");
+        assert!(customer.contains("下单客户"), "{customer}");
+        let id = doc("id");
+        assert!(id.contains("INTEGER") && id.contains(&i18n::text(Locale::ZhCn, "query.info.notNull")), "{id}");
+        // 没读到类型的列明说没读到，不编造类型。
+        let status = doc("status");
+        assert!(status.contains(&i18n::text(Locale::ZhCn, "query.info.typeUnknown")), "{status}");
+        let english = info_markdown(
+            &EntryInfo::Column { source: "orders".to_owned(), column: typed_scope().sources[0].columns[1].clone() },
+            Locale::En,
+        );
+        assert!(english.contains("Nullable") && english.contains("TEXT"), "{english}");
+    }
+
+    #[test]
+    fn hover_resolves_tables_and_columns_and_ignores_unknown_names() {
+        let scope = typed_scope();
+        let text = "select customer from orders where nosuch = 1";
+        let at = |needle: &str| text.find(needle).unwrap() + 1;
+        let (span, info) = hover_info(&scope, text, at("orders")).expect("悬停表名要有说明");
+        assert_eq!(&text[span], "orders");
+        let shown = info_markdown(&info, Locale::ZhCn);
+        assert!(shown.contains("orders") && shown.contains("订单表"), "{shown}");
+        let (_, column) = hover_info(&scope, text, at("customer")).expect("悬停列名要有说明");
+        assert!(info_markdown(&column, Locale::ZhCn).contains("TEXT"));
+        assert!(hover_info(&scope, text, at("nosuch")).is_none(), "认不出的名字没有悬停");
+        assert!(hover_info(&scope, text, at("select")).is_none(), "关键字没有悬停");
+        // 紧跟左括号的已知函数给签名，未知函数没有。
+        let call = "select coalesce(customer, 'x'), mystery(1) from orders";
+        let (_, function) = hover_info(&scope, call, call.find("coalesce").unwrap() + 2).expect("内置函数悬停");
+        assert!(matches!(function, EntryInfo::Function { .. }));
+        assert!(hover_info(&scope, call, call.find("mystery").unwrap() + 2).is_none());
+    }
+
+    #[test]
+    fn definition_links_round_trip_and_skip_unknown_targets() {
+        let scope = typed_scope();
+        let target = ("conn/1".to_owned(), "main db".to_owned());
+        let text = "select o.customer from orders o where nosuch = 1";
+        let (span, link) = definition_link(&scope, Some(&target), text, text.find("orders").unwrap() + 2).expect("表名可以跳转");
+        assert_eq!(&text[span], "orders");
+        assert_eq!(link, ObjectLink { connection_id: "conn/1".into(), database: "main db".into(), schema: String::new(), name: "orders".into(), kind: "table".into() });
+        let uri = link.uri();
+        assert!(uri.parse::<lsp_types::Uri>().is_ok(), "{uri}");
+        assert_eq!(ObjectLink::parse(&uri), Some(link.clone()));
+        // 列跳到它所在的表。
+        let (_, column) = definition_link(&scope, Some(&target), text, text.find("customer").unwrap() + 2).expect("列跳到表");
+        assert_eq!(column.name, "orders");
+        assert!(definition_link(&scope, Some(&target), text, text.find("nosuch").unwrap() + 2).is_none(), "认不出的名字不跳");
+        assert!(definition_link(&scope, None, text, text.find("orders").unwrap() + 2).is_none(), "标签没有目标时不生成链接");
+        assert_eq!(ObjectLink::parse("https://example.com"), None);
+        assert_eq!(ObjectLink::parse("rillsql-object://a/b/c"), None);
+    }
+
+    #[test]
+    fn signature_hint_tracks_the_active_parameter() {
+        let text = "select substr(name, 2, 3) from orders";
+        let open = text.find('(').unwrap();
+        let first = signature_at("sqlite", text, open + 1).expect("括号里给签名");
+        assert_eq!(first.name.to_ascii_lowercase(), "substr");
+        assert_eq!(first.active, Some(0));
+        assert_eq!(first.open, open);
+        assert_eq!(signature_at("sqlite", text, text.find(", 2").unwrap() + 2).unwrap().active, Some(1));
+        assert_eq!(signature_at("sqlite", text, text.find(", 3").unwrap() + 2).unwrap().active, Some(2));
+        assert!(signature_at("sqlite", text, text.find(')').unwrap() + 1).is_none(), "离开括号后关闭");
+        assert!(signature_at("sqlite", "select mystery(1", 16).is_none(), "未知函数没有提示");
+    }
+
+    #[test]
+    fn current_statement_highlight_skips_whitespace_between_statements() {
+        let text = "select 1;\n\nselect 2;\n\nselect 3;";
+        let second = text.find("select 2").unwrap();
+        let range = statement_at("sqlite", text, second + 3).expect("光标在第二条语句里");
+        assert!(text[range.clone()].contains("select 2") && !text[range].contains("select 1"));
+        assert_eq!(statement_at("sqlite", text, text.find("\n\n").unwrap() + 1), None, "语句之间的空白不高亮");
+        assert_eq!(statement_at("sqlite", "select 1", 3), None, "只有一条语句时不高亮");
+        // 中文开头的语句不能切在字符中间。
+        let chinese = "中文;
+select 1;";
+        assert!(statement_at("sqlite", chinese, chinese.len()).is_some());
+    }
+
+    #[gpui_kit::test]
+    fn editor_signature_highlight_errors_and_definition(cx: &mut TestAppContext) {
+        let (window, editor) = open(cx);
+        let followed: Rc<RefCell<Vec<ObjectLink>>> = Rc::new(RefCell::new(Vec::new()));
+        cx.update_window(window, |_, window, cx| {
+            let sink = followed.clone();
+            editor.update(cx, |editor, cx| {
+                editor.set_completion_scope(Some(typed_scope()));
+                editor.set_link_target(Some(("notes".to_owned(), "main".to_owned())));
+                editor.set_object_sink(Rc::new(move |link, _| sink.borrow_mut().push(link)));
+                editor.set_sql("select coalesce(", window, cx);
+                editor.focus(window, cx);
+                editor.select_range(16..16, cx);
+            });
+            window.render_frame(cx);
+            let hint = editor.read(cx).signature().cloned().expect("已知函数后输入左括号要有签名提示");
+            assert_eq!(hint.active, Some(0));
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(editor.read(cx).signature().is_none(), "Esc 关闭签名提示");
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            let text = "select 1;\n\nselect customer from orders;\n\nselect 3;";
+            editor.update(cx, |editor, cx| editor.set_sql(text, window, cx));
+            let inside = text.find("customer").unwrap();
+            editor.update(cx, |editor, cx| editor.select_range(inside..inside, cx));
+            window.render_frame(cx);
+            let highlight = editor.read(cx).statement_highlight(cx).expect("光标所在语句高亮");
+            assert!(text[highlight].starts_with("select customer"));
+            let gap = text.find("\n\n").unwrap() + 1;
+            editor.update(cx, |editor, cx| editor.select_range(gap..gap, cx));
+            window.render_frame(cx);
+            assert_eq!(editor.read(cx).statement_highlight(cx), None, "空白里不高亮");
+
+            // 悬停与跳转定义走同一份解析。
+            let orders = text.find("orders").unwrap() + 1;
+            let hover = editor.read(cx).hover_text(orders, cx).expect("悬停表名");
+            assert!(hover.contains("orders"), "{hover}");
+            assert!(editor.read(cx).hover_text(text.find("select 3").unwrap() + 7, cx).is_none());
+            assert!(editor.update(cx, |editor, cx| editor.follow_definition_at(orders, cx)));
+            assert!(!editor.update(cx, |editor, cx| editor.follow_definition_at(1, cx)), "关键字不跳转");
+            assert_eq!(followed.borrow().len(), 1);
+            assert_eq!(followed.borrow()[0].name, "orders");
+
+            // 错误标记：画上之后，下一次编辑就清掉。
+            let failed = text.find("select customer").unwrap()..text.find("orders;").unwrap() + 6;
+            editor.update(cx, |editor, cx| editor.mark_errors(vec![failed.clone()], cx));
+            window.render_frame(cx);
+            assert_eq!(editor.read(cx).error_ranges(cx), vec![failed]);
+            editor.update(cx, |editor, cx| {
+                editor.state.update(cx, |state, cx| state.replace_text_in_range(Some(0..0), "-- ", window, cx));
+            });
+        })
+        .unwrap();
+        // 编辑事件在这一轮更新结束后才送达订阅者。
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(editor.read(cx).error_ranges(cx).is_empty(), "编辑后错误标记清除");
+        })
+        .unwrap();
     }
 }
