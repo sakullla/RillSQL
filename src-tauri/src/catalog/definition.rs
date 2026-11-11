@@ -81,3 +81,21 @@ pub fn rebuilt_from_snapshot(snapshot: &crate::ddl::Snapshot) -> ObjectDdl {
     let (text, missing) = crate::ddl::rebuilt_definition(snapshot);
     ObjectDdl { text, rebuilt: true, missing }
 }
+
+/// 读取错误里的通用前缀；查看器与状态栏自己已经写明“读取定义失败”，显示时去掉，避免重复。
+const FAILED_PREFIX: &str = "读取定义失败";
+
+/// 查看器与状态栏显示的读取错误：去掉重复的“读取定义失败：”前缀，再按界面语言给出（数据库原文不翻译）。
+/// 只在显示时调用，模型里保留原文，切换语言立即生效。
+pub fn error_text(message: &str, locale: crate::i18n::Locale) -> String {
+    let mut rest = message.trim();
+    while let Some(after) = rest.strip_prefix(FAILED_PREFIX) {
+        rest = after.strip_prefix('：').unwrap_or(after).trim_start();
+    }
+    crate::ddl::english::localize(rest, locale)
+}
+
+/// 重建定义“未包含”清单按界面语言逐项给出；生成 SQL 开头注释里的同一份清单不改。
+pub fn missing_text(missing: &[String], locale: crate::i18n::Locale) -> Vec<String> {
+    missing.iter().map(|item| crate::ddl::english::localize_missing_item(item, locale)).collect()
+}

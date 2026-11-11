@@ -4,7 +4,8 @@
 //! 英文界面在显示时按这里的句型表换成英文。句型里的 `{}` 是对象名、行数等可变部分，
 //! 英文句子用 `{0}`、`{1}` 按位置取回（可变部分本身是已知句型时也一起换）。
 //! 覆盖范围：`ddl/` 与 `application/ddl.rs` 非测试源码里的每一句中文（计划风险/阻断/步骤、读取层与执行层错误、
-//! 执行结果），由源码扫描测试 `every_chinese_literal_in_ddl_sources_has_an_english_form` 守住；只用于匹配的片段与
+//! 执行结果），以及确认层、对象定义查看器（`catalog/definition.rs` 与 `catalog/read.rs` 的定义读取函数）和结构页
+//! 路径上的中文，由源码扫描测试 `every_chinese_literal_on_ddl_paths_has_an_english_form` 守住；只用于匹配的片段与
 //! 写进生成 SQL 注释的文字列在测试白名单里并写明原因。查不到句型的原样返回（数据库原文不翻译）。
 
 /// (中文句型, 英文句型)。同一前缀里更具体的句型排在前面。
@@ -446,6 +447,68 @@ const PATTERNS: &[(&str, &str)] = &[
     ("没有执行任何语句", "No statement was run"),
     ("生成计划失败", "Generating the plan failed"),
     ("执行失败", "Execution failed"),
+    // 对象定义查看器（catalog/definition.rs 与 catalog/read.rs 的定义读取）。查看器显示前先去掉“读取定义失败：”前缀，
+    // 这两条留给没有去前缀的地方。
+    ("读取定义失败：{p}", "Could not read the definition: {0}"),
+    ("读取定义失败", "Could not read the definition"),
+    ("{} 的{}没有可读的定义", "There is no readable definition for a {1} on {0}"),
+    ("{} 不是基础表", "{0} is not a base table"),
+    ("缺少对象名", "The object name is missing"),
+    ("这个连接没有连着可查询的数据库", "This connection isn't connected to a database that can be queried"),
+    ("Redis 没有对象定义", "Redis has no object definitions"),
+    ("MongoDB 集合没有 SQL 定义；文档在集合浏览器查看", "MongoDB collections have no SQL definition; view the documents in the collection browser"),
+    ("SQLite 没有函数或存储过程", "SQLite has no functions or stored procedures"),
+    ("SQLite 没有序列、枚举或域", "SQLite has no sequences, enums or domains"),
+    ("只有表、视图和触发器可以读取只读定义", "Only tables, views and triggers have a read-only definition"),
+    ("没有读到定义", "No definition was returned"),
+    ("MariaDB 没有独立的枚举或域", "MariaDB has no separate enums or domains"),
+    ("MySQL 没有独立的序列、枚举或域", "MySQL has no separate sequences, enums or domains"),
+    (
+        "只有表、视图、函数、存储过程、触发器和事件可以读取只读定义",
+        "Only tables, views, functions, stored procedures, triggers and events have a read-only definition",
+    ),
+    ("需要数据库名", "A database name is required"),
+    ("PostgreSQL 需要 schema", "PostgreSQL needs a schema"),
+    ("有多个同名函数，需要用参数类型区分", "Several functions have this name; their argument types are needed to tell them apart"),
+    ("有多个同名触发器，需要所属的表才能区分", "Several triggers have this name; their table is needed to tell them apart"),
+    (
+        "只有视图、函数、存储过程、触发器、序列、枚举和域可以读取只读定义",
+        "Only views, functions, stored procedures, triggers, sequences, enums and domains have a read-only definition",
+    ),
+    ("SQL Server 需要 schema", "SQL Server needs a schema"),
+    ("有多个同名对象，需要更具体的名称", "Several objects have this name; a more specific name is needed"),
+    ("没有读到序列起点", "The sequence start value was not returned"),
+    ("没有读到序列步长", "The sequence increment was not returned"),
+    ("没有读到序列下限", "The sequence minimum was not returned"),
+    ("没有读到序列上限", "The sequence maximum was not returned"),
+    ("SQL Server 没有独立的枚举或域", "SQL Server has no separate enums or domains"),
+    ("只有函数、存储过程、触发器、视图和序列可以读取只读定义", "Only functions, stored procedures, triggers, views and sequences have a read-only definition"),
+    ("读取库表失败：{p}", "Could not read the catalog: {0}"),
+    ("元数据列缺失", "A metadata column is missing"),
+    ("元数据列是空值", "A metadata column is null"),
+];
+
+/// 重建的建表定义“未包含”清单里的项（`ddl::rebuilt_definition` 返回的 `missing`）。查看器横幅逐项显示；
+/// 同一份清单写进生成 SQL 开头的注释时保持中文。只按整项匹配，不参与整句翻译。
+const MISSING_ITEMS: &[(&str, &str)] = &[
+    ("CHECK 约束", "CHECK constraints"),
+    ("分区", "partitioning"),
+    ("存储参数与表空间", "storage parameters and tablespace"),
+    ("权限", "privileges"),
+    ("触发器", "triggers"),
+    ("计算列表达式", "computed column expressions"),
+    ("文件组与压缩选项", "filegroup and compression options"),
+    ("主键的 CLUSTERED / NONCLUSTERED 选项（按 SQL Server 默认处理）", "the primary key's CLUSTERED / NONCLUSTERED option (SQL Server's default is assumed)"),
+    ("索引选项（FILLFACTOR、IGNORE_DUP_KEY 等）", "index options (FILLFACTOR, IGNORE_DUP_KEY and so on)"),
+    ("XML 与空间索引", "XML and spatial indexes"),
+    (
+        "标识列的 ALWAYS / BY DEFAULT 模式与序列参数（统一写成 BY DEFAULT）",
+        "the identity column's ALWAYS / BY DEFAULT mode and sequence options (written as BY DEFAULT)",
+    ),
+    ("IDENTITY 的起点与步长（统一写成 1, 1）", "the IDENTITY seed and increment (written as 1, 1)"),
+    ("索引（读取失败：{p}）", "indexes (could not be read: {0})"),
+    ("外键（读取失败：{p}）", "foreign keys (could not be read: {0})"),
+    ("注释（读取失败：{p}）", "comments (could not be read: {0})"),
 ];
 
 /// 只出现在句型 `{p}` 位置里的短语（行数、“全部”、“未知”）。不参与整句匹配，
@@ -552,6 +615,14 @@ pub fn localize(text: &str, locale: crate::i18n::Locale) -> String {
     match locale {
         crate::i18n::Locale::En => english(text),
         crate::i18n::Locale::ZhCn => text.to_owned(),
+    }
+}
+
+/// 按界面语言给出重建定义“未包含”清单里的一项；不是已知项时按整句再查一次，仍查不到原样返回。
+pub fn localize_missing_item(item: &str, locale: crate::i18n::Locale) -> String {
+    match locale {
+        crate::i18n::Locale::En if has_cjk(item) => translate_with(MISSING_ITEMS, item).unwrap_or_else(|| english(item)),
+        _ => item.to_owned(),
     }
 }
 
@@ -820,31 +891,58 @@ mod tests {
         ("、", "名字列表的分隔符，英文句型的 {l} 位置把它换成逗号"),
         (
             "-- 由元数据重建，不是数据库保存的原文。未包含：{}。\\nCREATE TABLE {qualified} (\\n  {}\\n);",
-            "重建的建表语句开头的 SQL 注释，属于生成的 SQL 文本，不按界面语言改写",
+            "重建的建表语句开头的 SQL 注释，属于生成的 SQL 文本（查看器编辑区与复制内容），不按界面语言改写；查看器横幅另按 MISSING_ITEMS 逐项英文化",
         ),
-        ("-- 索引 {name} 的类型是 {}，没有从元数据重建。", "重建的建表语句里的 SQL 注释，属于生成的 SQL 文本"),
-        ("CHECK 约束", "重建建表语句 SQL 注释“未包含”清单里的项"),
-        ("分区", "重建建表语句 SQL 注释“未包含”清单里的项"),
-        ("存储参数与表空间", "重建建表语句 SQL 注释“未包含”清单里的项"),
-        ("权限", "重建建表语句 SQL 注释“未包含”清单里的项"),
-        ("触发器", "重建建表语句 SQL 注释“未包含”清单里的项"),
-        ("计算列表达式", "重建建表语句 SQL 注释“未包含”清单里的项"),
-        ("文件组与压缩选项", "重建建表语句 SQL 注释“未包含”清单里的项"),
-        ("主键的 CLUSTERED / NONCLUSTERED 选项（按 SQL Server 默认处理）", "重建建表语句 SQL 注释“未包含”清单里的项"),
-        ("索引选项（FILLFACTOR、IGNORE_DUP_KEY 等）", "重建建表语句 SQL 注释“未包含”清单里的项"),
-        ("XML 与空间索引", "重建建表语句 SQL 注释“未包含”清单里的项"),
-        ("标识列的 ALWAYS / BY DEFAULT 模式与序列参数（统一写成 BY DEFAULT）", "重建建表语句 SQL 注释“未包含”清单里的项"),
-        ("IDENTITY 的起点与步长（统一写成 1, 1）", "重建建表语句 SQL 注释“未包含”清单里的项"),
-        ("索引（读取失败：{message}）", "重建建表语句 SQL 注释“未包含”清单里的项"),
-        ("外键（读取失败：{message}）", "重建建表语句 SQL 注释“未包含”清单里的项"),
-        ("注释（读取失败：{message}）", "重建建表语句 SQL 注释“未包含”清单里的项"),
+        ("-- 索引 {name} 的类型是 {}，没有从元数据重建。", "重建的建表语句里的 SQL 注释，属于生成的 SQL 文本（查看器编辑区与复制内容），不按界面语言改写"),
     ];
 
-    /// 结构读取、执行与应用层源码（不含本文件与测试）里的每个中文字面量都有英文：整句查句型表，
-    /// 只出现在短语位置的片段查短语表；占位按样例值匹配。新加一句中文而没补句型，这个测试就失败。
+    /// 取源码里一个函数（`fn name(` 到与它同一缩进的收尾 `}`）的文本，只扫描确认层/查看器/结构页路径上的函数。
+    /// 工作区可能是 CRLF（Windows 检出），先统一成 LF 再切。
+    fn function_source(source: &str, name: &str) -> String {
+        let source = source.replace("\r\n", "\n");
+        let at = source.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("源码里没有函数 {name}"));
+        let line = source[..at].rfind('\n').map_or(0, |end| end + 1);
+        let indent: String = source[line..at].chars().take_while(|ch| *ch == ' ').collect();
+        let close = format!("\n{indent}}}\n");
+        let end = source[at..].find(&close).unwrap_or_else(|| panic!("函数 {name} 没有找到收尾")) + at + close.len();
+        source[line..end].to_owned()
+    }
+
+    fn non_test(source: &str) -> String {
+        let source = source.replace("\r\n", "\n");
+        source.split("\nmod tests").next().unwrap_or_default().to_owned()
+    }
+
+    /// 一句中文在界面上的英文：整句查句型表、只出现在短语位置的片段查短语表、重建定义“未包含”项查清单表、
+    /// 定义读取错误按查看器的显示方式（去掉“读取定义失败：”前缀）再查。任一种得到不含中文的结果即算有英文。
+    fn has_english_form(sample: &str) -> Result<(), String> {
+        let sentence = english(sample);
+        if !has_cjk(&sentence) {
+            return Ok(());
+        }
+        let candidates = [
+            translate_with(PHRASES, sample),
+            translate_with(MISSING_ITEMS, sample),
+            Some(localize_missing_item(sample, crate::i18n::Locale::En)),
+            Some(crate::catalog::definition::error_text(sample, crate::i18n::Locale::En)),
+        ];
+        if candidates.iter().flatten().any(|en| !has_cjk(en)) {
+            Ok(())
+        } else {
+            Err(sentence)
+        }
+    }
+
+    /// 确认层、对象定义查看器与结构页路径上（不含本文件与测试）的每个中文字面量都有英文：结构读取、执行与应用层
+    /// 整个文件扫描；定义查看器扫描 `catalog/definition.rs` 与 `catalog/read.rs` 里定义读取用到的函数；外壳与结构页
+    /// 扫描确认层/查看器的读取、显示函数与结构页源码。占位按样例值匹配。新加一句中文而没补英文，这个测试就失败。
     #[test]
-    fn every_chinese_literal_in_ddl_sources_has_an_english_form() {
-        const SOURCES: &[(&str, &str)] = &[
+    fn every_chinese_literal_on_ddl_paths_has_an_english_form() {
+        const READ: &str = include_str!("../catalog/read.rs");
+        const VIEW: &str = include_str!("../app/shell/view.rs");
+        const CHROME: &str = include_str!("../app/shell/chrome.rs");
+        const MODEL: &str = include_str!("../app/shell/model.rs");
+        let mut sources: Vec<(String, String)> = [
             ("ddl/commands.rs", include_str!("commands.rs")),
             ("ddl/exec.rs", include_str!("exec.rs")),
             ("ddl/introspect.rs", include_str!("introspect.rs")),
@@ -853,25 +951,60 @@ mod tests {
             ("ddl/plan.rs", include_str!("plan.rs")),
             ("ddl/sql.rs", include_str!("sql.rs")),
             ("application/ddl.rs", include_str!("../application/ddl.rs")),
-        ];
+            ("catalog/definition.rs", include_str!("../catalog/definition.rs")),
+            ("app/shell/danger.rs", include_str!("../app/shell/danger.rs")),
+            ("app/views/structure/mod.rs", include_str!("../app/views/structure/mod.rs")),
+        ]
+        .into_iter()
+        .map(|(file, source)| (file.to_owned(), non_test(source)))
+        .collect();
+        // 定义读取：入口、各引擎的定义读取与它们用到的取值/包装函数。
+        for name in [
+            "read_failure",
+            "definition_failure",
+            "read_definition",
+            "read_sqlite_definition",
+            "read_mysql_definition",
+            "mysql_create_sql",
+            "mysql_show_create_at",
+            "mysql_string",
+            "read_postgres_definition",
+            "read_postgres_text",
+            "pg_string",
+            "tds_query_rows",
+            "read_sqlserver_definition",
+        ] {
+            sources.push((format!("catalog/read.rs::{name}"), function_source(READ, name)));
+        }
+        // 外壳：查看器与确认层的读取回调、状态更新和渲染。
+        for (file, source, name) in [
+            ("app/shell/view.rs", VIEW, "spawn_definition"),
+            ("app/shell/view.rs", VIEW, "pump_danger"),
+            ("app/shell/model.rs", MODEL, "open_definition"),
+            ("app/shell/model.rs", MODEL, "definition_loaded"),
+            ("app/shell/chrome.rs", CHROME, "ddl_layer"),
+            ("app/shell/chrome.rs", CHROME, "danger_layer"),
+        ] {
+            sources.push((format!("{file}::{name}"), function_source(source, name)));
+        }
         let mut seen = Vec::new();
         let mut missing = Vec::new();
-        for (file, source) in SOURCES {
-            let code = source.split("\nmod tests").next().unwrap_or(source);
+        for (file, code) in &sources {
             for literal in chinese_literals(code) {
                 seen.push(literal.clone());
                 if NOT_MESSAGES.iter().any(|(text, _)| *text == literal) {
                     continue;
                 }
-                let sample = fill_placeholders(&literal);
-                let sentence = english(&sample);
-                let phrase = translate_with(PHRASES, &sample);
-                if has_cjk(&sentence) && !phrase.is_some_and(|en| !has_cjk(&en)) {
+                if let Err(sentence) = has_english_form(&fill_placeholders(&literal)) {
                     missing.push(format!("{file}: {literal} -> {sentence}"));
                 }
             }
         }
         assert!(seen.len() > 200, "扫描没有读到源码字面量：{}", seen.len());
+        for file in ["catalog/definition.rs", "catalog/read.rs::read_sqlserver_definition", "app/shell/danger.rs"] {
+            let (_, code) = sources.iter().find(|(name, _)| name == file).unwrap();
+            assert!(!chinese_literals(code).is_empty(), "{file} 没有读到中文字面量，扫描范围可能失效");
+        }
         missing.sort();
         missing.dedup();
         assert!(missing.is_empty(), "{} 句没有英文：\n{}", missing.len(), missing.join("\n"));

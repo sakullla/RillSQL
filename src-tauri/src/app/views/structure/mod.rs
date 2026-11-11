@@ -26,6 +26,37 @@ pub enum Section {
     Danger,
 }
 
+/// 结构页提示。界面文字存 i18n 键，执行层/应用层的原文按条保存；显示时按当前语言给出，切换语言立即生效。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Note {
+    #[default]
+    Empty,
+    Key(&'static str),
+    Raw(Vec<String>),
+}
+
+impl Note {
+    fn raw(message: String) -> Self {
+        Note::Raw(vec![message])
+    }
+
+    pub fn text(&self, locale: Locale) -> String {
+        match self {
+            Note::Empty => String::new(),
+            Note::Key(key) => i18n::text(locale, key),
+            Note::Raw(parts) => parts.iter().map(|part| localize(part, locale)).collect::<Vec<_>>().join(" "),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Note::Empty => true,
+            Note::Key(_) => false,
+            Note::Raw(parts) => parts.iter().all(|part| part.is_empty()),
+        }
+    }
+}
+
 pub struct StructureSession {
     pub target: GridTarget,
     pub section: Section,
@@ -47,7 +78,7 @@ pub struct StructureSession {
     /// 危险计划先进入待确认，第二次确认才执行。
     armed: bool,
     pub locale: Locale,
-    pub note: String,
+    note: Note,
 }
 
 impl StructureSession {
@@ -71,8 +102,13 @@ impl StructureSession {
             open: false,
             armed: false,
             locale: Locale::ZhCn,
-            note: String::new(),
+            note: Note::Empty,
         }
+    }
+
+    /// 当前提示，按界面语言给出。
+    pub fn note(&self) -> String {
+        self.note.text(self.locale)
     }
 
     pub fn banner(&self) -> String {
@@ -138,7 +174,7 @@ impl StructureSession {
     }
 
     pub fn arm_live(&mut self, plan: Plan) {
-        self.note.clear();
+        self.note = Note::Empty;
         self.preview = Some(plan);
         self.live = true;
         self.open = true;
@@ -147,7 +183,7 @@ impl StructureSession {
 
     pub fn arm_fixture(&mut self, snapshot: &Snapshot) {
         let plan = preview_plan(snapshot, &self.action());
-        self.note = i18n::text(self.locale, "admin.preview.unconnected");
+        self.note = Note::Key("admin.preview.unconnected");
         self.preview = Some(plan);
         self.live = false;
         self.open = true;
@@ -171,7 +207,7 @@ impl StructureSession {
     pub fn arm_confirm(&mut self) {
         if self.requires_second_confirm() {
             self.armed = true;
-            self.note = second_confirm_text(self.locale).to_owned();
+            self.note = Note::Key("structure.confirm.second");
         }
     }
 
@@ -208,15 +244,20 @@ impl StructureSession {
     }
 
     pub fn confirm_sql(&self) -> Result<Vec<String>, String> {
+        self.confirm_steps().map_err(|note| note.text(self.locale))
+    }
+
+    /// 确认前的检查；不能执行时给出要显示的提示（保留原文，显示时再本地化）。
+    fn confirm_steps(&self) -> Result<Vec<String>, Note> {
         if !self.open {
-            return Err(i18n::text(self.locale, "structure.preview.need"));
+            return Err(Note::Key("structure.preview.need"));
         }
         if !self.live {
-            return Err(i18n::text(self.locale, "admin.preview.unconnected"));
+            return Err(Note::Key("admin.preview.unconnected"));
         }
-        let plan = self.preview.as_ref().ok_or_else(|| i18n::text(self.locale, "structure.preview.need"))?;
+        let plan = self.preview.as_ref().ok_or(Note::Key("structure.preview.need"))?;
         if !plan.blocked.is_empty() {
-            return Err(plan.blocked.iter().map(|text| localize(text, self.locale)).collect::<Vec<_>>().join(" "));
+            return Err(Note::Raw(plan.blocked.clone()));
         }
         Ok(plan.steps.iter().map(|step| step.sql.clone()).collect())
     }
@@ -281,6 +322,11 @@ impl StructurePane {
         self.session.locale = locale;
     }
 
+    /// 读取结构失败的原因，按当前界面语言给出（模型里留原文）。
+    pub fn load_error_text(&self) -> String {
+        localize(&self.load_error, self.session.locale)
+    }
+
     pub fn type_into(&mut self, field: &str, text: &str) {
         let slot = match field {
             "column_name" => &mut self.session.column_name,
@@ -308,7 +354,7 @@ impl StructurePane {
 
     pub fn preview(&mut self, cx: &mut Context<Self>) {
         let Ok(request) = self.session.request() else {
-            self.session.note = i18n::text(self.session.locale, "structure.preview.need");
+            self.session.note = Note::Key("structure.preview.need");
             cx.notify();
             return;
         };
@@ -327,13 +373,13 @@ impl StructurePane {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             if this.session.target != target {
-                                this.session.note = i18n::text(this.session.locale, "structure.preview.stale");
+                                this.session.note = Note::Key("structure.preview.stale");
                                 cx.notify();
                                 return;
                             }
                             match result {
                                 Ok(plan) => this.session.arm_live(plan),
-                                Err(message) => this.session.note = localize(&message, this.session.locale),
+                                Err(message) => this.session.note = Note::raw(message),
                             }
                             cx.notify();
                         });
@@ -350,10 +396,10 @@ impl StructurePane {
             cx.notify();
             return;
         }
-        let sql = match self.session.confirm_sql() {
+        let sql = match self.session.confirm_steps() {
             Ok(sql) => sql,
-            Err(message) => {
-                self.session.note = message;
+            Err(note) => {
+                self.session.note = note;
                 cx.notify();
                 return;
             }
@@ -377,7 +423,7 @@ impl StructurePane {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             if this.session.target != target {
-                                this.session.note = i18n::text(this.session.locale, "structure.execute.stale");
+                                this.session.note = Note::Key("structure.execute.stale");
                                 cx.notify();
                                 return;
                             }
@@ -390,16 +436,16 @@ impl StructurePane {
                                     if drops_table && all_ok && !receipt.steps.is_empty() {
                                         this.dropped = Some(this.session.target.clone());
                                     }
-                                    i18n::text(this.session.locale, "structure.preview.done")
+                                    Note::Key("structure.preview.done")
                                 }
                                 Ok(receipt) => {
                                     this.session.armed = false;
-                                    receipt.blocked.iter().map(|text| localize(text, this.session.locale)).collect::<Vec<_>>().join(" ")
+                                    Note::Raw(receipt.blocked)
                                 }
                                 Err(message) => {
                                     // 执行失败留在预览里，原因和可重试的脚本都还在。
                                     this.session.armed = false;
-                                    localize(&message, this.session.locale)
+                                    Note::raw(message)
                                 }
                             };
                             cx.notify();
@@ -445,7 +491,8 @@ impl StructurePane {
                             this.loading = false;
                             match result {
                                 Ok(snapshot) => this.snapshot = Some(snapshot),
-                                Err(message) => this.load_error = localize(&message, this.session.locale),
+                                // 留原文，显示时按当前语言给出。
+                                Err(message) => this.load_error = message,
                             }
                             cx.notify();
                         });
@@ -510,7 +557,7 @@ impl StructurePane {
             return kit::loading_state(t("ui.structure.loading"), p).justify_start().into_any_element();
         }
         if !self.load_error.is_empty() {
-            return div().p(px(16.)).text_color(p.danger).child(SharedString::from(self.load_error.clone())).into_any_element();
+            return div().p(px(16.)).text_color(p.danger).child(SharedString::from(self.load_error_text())).into_any_element();
         }
         let Some(snapshot) = &self.snapshot else {
             return div().p(px(16.)).text_color(p.text_faint).child(t("ui.structure.none")).into_any_element();
@@ -614,19 +661,6 @@ fn cell_text(text: String, p: &Palette) -> AnyElement {
     div().text_color(p.text_muted).child(SharedString::from(text)).into_any_element()
 }
 
-fn second_confirm_text(locale: Locale) -> &'static str {
-    match locale {
-        Locale::ZhCn => "这是危险操作。再次点击确认执行，或取消返回。",
-        Locale::En => "This is a dangerous operation. Confirm again to execute, or cancel.",
-    }
-}
-
-fn confirm_again_text(locale: Locale) -> &'static str {
-    match locale {
-        Locale::ZhCn => "再次确认执行",
-        Locale::En => "Confirm again",
-    }
-}
 
 impl Render for StructurePane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -743,7 +777,7 @@ impl Render for StructurePane {
             .child(div().flex().flex_col().gap(px(8.)).child(kit::eyebrow(t("ui.structure.existing"), &p)).child(kit::card(&p).overflow_hidden().child(self.overview(&p, cx))))
             .child(div().flex().flex_col().gap(px(8.)).child(kit::eyebrow(t(if section == Section::Danger { "structure.section.danger" } else { "ui.structure.add" }), &p)).child(kit::card(&p).p(px(16.)).child(form)));
         if !self.session.note.is_empty() {
-            body = body.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.hover).text_size(px(TypeScale::SM)).child(SharedString::from(self.session.note.clone())));
+            body = body.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.hover).text_size(px(TypeScale::SM)).child(SharedString::from(self.session.note())));
         }
         column = column.child(body);
         if self.session.preview_open() {
@@ -808,7 +842,7 @@ impl Render for StructurePane {
                         .when(!blocked.is_empty(), |this| {
                             this.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.danger_soft).text_color(p.danger).text_size(px(TypeScale::SM)).child(SharedString::from(blocked.join(" "))))
                         })
-                        .when(!self.session.note.is_empty(), |this| this.child(kit::muted(SharedString::from(self.session.note.clone()), &p)))
+                        .when(!self.session.note.is_empty(), |this| this.child(kit::muted(SharedString::from(self.session.note()), &p)))
                         .child(
                             div()
                                 .flex()
@@ -816,7 +850,7 @@ impl Render for StructurePane {
                                 .gap(px(8.))
                                 .child(kit::secondary_button("structure-cancel", None, t("structure.action.cancel"), cancel))
                                 .child(if section == Section::Danger || self.session.armed() {
-                                    let label = if self.session.armed() { SharedString::from(confirm_again_text(locale)) } else { t("structure.action.confirm") };
+                                    let label = if self.session.armed() { t("structure.action.confirmAgain") } else { t("structure.action.confirm") };
                                     kit::danger_button("structure-confirm", Some(IconName::Check), label, confirm).into_any_element()
                                 } else {
                                     kit::primary_button("structure-confirm", Some(IconName::Check), t("structure.action.confirm"), confirm).into_any_element()
@@ -945,7 +979,51 @@ mod tests {
         assert!(pane.session.column_name.is_empty(), "换表不能带走上一张表的列名");
         assert_eq!(pane.session.section, Section::Columns);
         assert!(!pane.session.preview_open(), "换表不能带走上一张表的预览");
-        assert!(pane.session.note.is_empty());
+        assert!(pane.session.note().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 提示与读取错误留原文，显示时按当前语言给出：错误出现后再切换语言，文字立即跟着变。
+    #[test]
+    fn notes_and_load_errors_follow_a_later_locale_switch() {
+        let cjk = crate::ddl::english::has_cjk;
+        let mut session = StructureSession::new(target("sqlite", "customers"));
+        session.note = Note::raw("这条连接还没有打开，没有另开新的连接。".to_owned());
+        assert!(session.note().contains("没有打开"), "{}", session.note());
+        session.locale = Locale::En;
+        assert!(session.note().contains("isn't open") && !cjk(&session.note()), "{}", session.note());
+        session.locale = Locale::ZhCn;
+        assert!(session.note().contains("没有打开"), "{}", session.note());
+
+        // 执行结果里的多条阻断逐条翻译后再连起来。
+        session.note = Note::Raw(vec!["生成计划失败".to_owned(), "找不到表或视图 orders".to_owned()]);
+        session.locale = Locale::En;
+        assert_eq!(session.note(), "Generating the plan failed Table or view orders was not found");
+
+        // 二次确认的提示与未连接提示也跟着语言变。
+        session.target.database = "main".into();
+        session.target.schema.clear();
+        session.section = Section::Danger;
+        session.locale = Locale::ZhCn;
+        session.arm_fixture(&Snapshot::bare(DdlEngine::Sqlite, "main", "", "customers"));
+        assert_eq!(session.note(), i18n::text(Locale::ZhCn, "admin.preview.unconnected"));
+        session.arm_confirm();
+        assert!(session.note().contains("再次点击"), "{}", session.note());
+        session.locale = Locale::En;
+        assert!(session.note().contains("Confirm again") && !cjk(&session.note()), "{}", session.note());
+        assert!(!cjk(&session.confirm_sql().unwrap_err()), "未连接的拒绝原因按英文给出");
+
+        let dir = std::env::temp_dir().join(format!("rillsql-structure-locale-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        let mut pane = StructurePane::new(services);
+        pane.bind(target("sqlite", "customers"));
+        pane.load_error = "找不到表或视图 customers".to_owned();
+        assert!(pane.load_error_text().contains("找不到"), "{}", pane.load_error_text());
+        pane.set_locale(Locale::En);
+        assert_eq!(pane.load_error_text(), "Table or view customers was not found");
+        pane.set_locale(Locale::ZhCn);
+        assert!(pane.load_error_text().contains("找不到"), "{}", pane.load_error_text());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

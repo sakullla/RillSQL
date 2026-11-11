@@ -6237,6 +6237,126 @@ fn english_danger_layer_preview_of_dropped_table_has_no_chinese(cx: &mut gpui_ki
     }
 }
 
+/// 英文界面：对象定义查看器的重建标注与读取错误横幅没有中文。重建定义用真实的 rebuilt_definition
+/// （PostgreSQL 与 SQL Server、含标识列和三类读取失败）的 missing 清单；错误来自真实的读取层（表已被别处删掉、
+/// 连接没有可查询的数据库、种类没有定义）。生成 SQL 里的注释保持中文原样。
+#[gpui_kit::test]
+fn english_ddl_viewer_rebuilt_and_error_labels_have_no_chinese(cx: &mut gpui_kit::TestAppContext) {
+    use crate::catalog::definition::{object_ddl, rebuilt_from_snapshot, DdlKey};
+    use crate::catalog::model::ObjectKind;
+    use crate::ddl::{Column, DdlEngine, Snapshot};
+    let cjk = crate::ddl::english::has_cjk;
+    let (window, view, dir) = sqlite_notes_workbench(cx, true);
+    wait_for_shell_ready(cx, window, &view);
+    let database = dir.join("items.sqlite");
+    sqlite_exec_on_file(&database, "CREATE TABLE fading (id INTEGER PRIMARY KEY)");
+    cx.update_window(window, |_, _, cx| view.update(cx, |view, cx| view.perform("refresh-tree", cx))).unwrap();
+    let item = wait_for_nav_object(cx, window, &view, "item");
+    let fading = wait_for_nav_object(cx, window, &view, "fading");
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("locale-en", cx)));
+    let open = |cx: &mut gpui_kit::TestAppContext, node: &str| {
+        cx.update_window(window, |_, _, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.model.open_nav_menu(node));
+                view.perform("tree-view-ddl", cx);
+            })
+        })
+        .unwrap();
+        assert!(pump_until(cx, window, &view, |view, _| view.model.ddl_view.as_ref().is_some_and(|ddl| !ddl.loading)), "定义没有读回来");
+        cx.update(|cx| view.read(cx).model.ddl_view.as_ref().unwrap().epoch)
+    };
+    let label = |cx: &mut gpui_kit::TestAppContext, id: &'static str| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find(id).map(|banner| banner.label().unwrap_or_default().to_owned())
+        })
+        .unwrap()
+    };
+
+    // 重建定义：横幅逐项英文，编辑区里的 SQL 注释不改。
+    let epoch = open(cx, &item);
+    for engine in [DdlEngine::Postgres, DdlEngine::Sqlserver] {
+        let mut snapshot = Snapshot::bare(engine, "shop", "public", "orders");
+        snapshot.columns.push(Column {
+            name: "id".into(),
+            type_name: "integer".into(),
+            nullable: false,
+            default_sql: None,
+            primary: true,
+            auto: true,
+            generated: false,
+            default_constraint: None,
+        });
+        snapshot.index_error = Some("没有读到行数".into());
+        snapshot.foreign_key_error = Some("permission denied for table orders".into());
+        snapshot.comment_error = Some("元数据是空的".into());
+        let ddl = rebuilt_from_snapshot(&snapshot);
+        assert!(ddl.missing.len() >= 8, "{:?}", ddl.missing);
+        assert!(ddl.missing.iter().all(|item| cjk(item)), "清单本身是中文：{:?}", ddl.missing);
+        let sql = ddl.text.clone();
+        cx.update(|cx| view.update(cx, |view, cx| {
+            view.model.definition_loaded(epoch, Ok(ddl));
+            cx.notify();
+        }));
+        let shown = label(cx, "ddl-viewer-rebuilt").expect("重建标注");
+        assert!(!cjk(&shown), "英文查看器重建标注残留中文：{shown}");
+        assert!(shown.contains("Not included: CHECK constraints, partitioning") && shown.contains("privileges") && shown.contains("triggers"), "{shown}");
+        assert!(shown.contains("indexes (could not be read: The row count could not be read)"), "{shown}");
+        assert!(shown.contains("foreign keys (could not be read: permission denied for table orders)"), "数据库原文不翻译：{shown}");
+        let text = cx.update(|cx| view.read(cx).model.ddl_view.as_ref().and_then(|ddl| ddl.text.clone()).unwrap());
+        assert_eq!(text, sql);
+        assert!(text.contains("未包含：CHECK 约束"), "生成 SQL 的注释保持原样：{text}");
+    }
+    cx.update_window(window, |_, _, cx| view.update(cx, |view, cx| view.perform("ddl-close", cx))).unwrap();
+
+    // 读取错误：表已被别处删掉，树还没刷新。
+    sqlite_exec_on_file(&database, "DROP TABLE fading");
+    let epoch = open(cx, &fading);
+    let zh = cx.update(|cx| view.read(cx).model.ddl_view.as_ref().and_then(|ddl| ddl.error.clone()).expect("读取错误"));
+    assert!(zh.starts_with("读取定义失败"), "读取层给出的是读取失败：{zh}");
+    let shown = label(cx, "ddl-viewer-error").expect("错误横幅");
+    assert!(!cjk(&shown), "英文查看器错误残留中文：{shown}");
+    assert_eq!(shown, "Could not read the definition. No definition was returned");
+
+    // 其它真实读取错误：连接没有可查询的数据库（视图与重建的表两条路径）、种类没有定义。
+    let key = |kind| DdlKey { database: "shop".into(), schema: "public".into(), name: "orders".into(), kind, signature: String::new(), relation: String::new() };
+    let session = crate::connections::CatalogSession::Scripted;
+    for (engine, kind) in [(DdlEngine::Postgres, ObjectKind::View), (DdlEngine::Postgres, ObjectKind::Table), (DdlEngine::Postgres, ObjectKind::Extension), (DdlEngine::Sqlite, ObjectKind::Function)] {
+        let result = futures::executor::block_on(object_ddl(&session, engine, &key(kind)));
+        let message = result.clone().err().unwrap_or_else(|| panic!("{engine:?} {kind:?} 应当读不到"));
+        assert!(cjk(&message), "读取层原文是中文：{message}");
+        cx.update(|cx| view.update(cx, |view, cx| {
+            view.model.definition_loaded(epoch, result);
+            cx.notify();
+        }));
+        let shown = label(cx, "ddl-viewer-error").expect("错误横幅");
+        assert!(!cjk(&shown), "英文查看器错误残留中文：{message} -> {shown}");
+        assert_eq!(shown.matches("Could not read the definition").count(), 1, "前缀不重复：{shown}");
+    }
+
+    // 中文界面显示原文，只去掉重复的前缀。
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("locale-zh", cx)));
+    let shown = label(cx, "ddl-viewer-error").expect("错误横幅");
+    assert_eq!(shown.matches("读取定义失败").count(), 1, "{shown}");
+    assert_eq!(shown, "读取定义失败。 sqlite 的function没有可读的定义");
+    cx.update_window(window, |_, _, cx| view.update(cx, |view, cx| view.perform("ddl-close", cx))).unwrap();
+
+    // 复制 DDL 失败：状态栏保留原文，英文界面显示英文且前缀不重复。
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("locale-en", cx)));
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            assert!(view.model.open_nav_menu(&fading));
+            view.perform("tree-copy-ddl", cx);
+        })
+    })
+    .unwrap();
+    assert!(pump_until(cx, window, &view, |view, _| view.model.ddl_view.is_none()), "复制 DDL 没有结束");
+    let detail = cx.update(|cx| view.read(cx).model.notice_detail.clone());
+    assert!(cjk(&detail), "模型里保留原文：{detail}");
+    let status = label(cx, "status").expect("状态栏");
+    assert_eq!(status, "Could not read the definition. No definition was returned");
+}
+
 #[test]
 fn untagged_connections_show_no_env_pill() {
     assert!(!super::chrome::env_shown(""));

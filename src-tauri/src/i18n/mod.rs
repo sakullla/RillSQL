@@ -516,6 +516,8 @@ dict! {
     "structure.execute.stale" => "目标已切换，本次执行结果已丢弃。", "The target changed, so this run result was discarded.";
     "structure.action.preview" => "预览 SQL", "Preview SQL";
     "structure.action.confirm" => "确认执行", "Confirm";
+    "structure.action.confirmAgain" => "再次确认执行", "Confirm again";
+    "structure.confirm.second" => "这是危险操作。再次点击确认执行，或取消返回。", "This is a dangerous operation. Confirm again to execute, or cancel.";
     "structure.action.cancel" => "取消", "Cancel";
     "admin.section.none" => "这个引擎没有数据库级管理操作。", "This engine has no database-level admin actions.";
     "admin.action.vacuum" => "整理数据库", "Vacuum";

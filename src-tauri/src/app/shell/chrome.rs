@@ -1052,6 +1052,11 @@ impl Workbench {
             _ => div().flex().items_center().gap(px(6.)).child(kit::status_dot(p.line_strong)).child(self.t("ui.status.noTarget")).into_any_element(),
         };
         let notice = match self.model.notice_key {
+            // 复制 DDL 失败的原因保留原文，显示时按当前语言给出。
+            Some("catalog.ddl.failed") if !self.model.notice_detail.is_empty() => {
+                let detail = crate::catalog::definition::error_text(&self.model.notice_detail, self.model.locale());
+                format!("{} {detail}", self.model.text("catalog.ddl.failed")).trim_end().to_owned()
+            }
             Some(key) if !self.model.notice_detail.is_empty() => format!("{} {}", self.model.text(key), self.model.notice_detail),
             Some(key) => self.model.text(key),
             None => self.model.text("ui.status.ready"),
@@ -2764,16 +2769,29 @@ impl Workbench {
                 .child(Editor::new(&editor).readonly(true).h(gpui_kit::relative(1.)).bordered(false).aria_label(title.clone()))
                 .into_any_element()
         } else {
-            let error = view.error.clone().unwrap_or_default();
-            banner(IconName::TriangleAlert, SharedString::from(format!("{} {error}", self.model.text("catalog.ddl.failed"))), p.danger, p.danger_soft)
+            // 模型里留原文，显示时去掉重复的“读取定义失败”前缀并按当前语言给出。
+            let error = crate::catalog::definition::error_text(view.error.as_deref().unwrap_or_default(), self.model.locale());
+            let text = format!("{} {error}", self.model.text("catalog.ddl.failed")).trim_end().to_owned();
+            div()
+                .id("ddl-viewer-error")
+                .test_support()
+                .aria_label(SharedString::from(text.clone()))
+                .child(banner(IconName::TriangleAlert, SharedString::from(text), p.danger, p.danger_soft))
+                .into_any_element()
         };
         let rebuilt = view.rebuilt.then(|| {
             let mut text = self.model.text("catalog.ddl.rebuilt");
             if !view.missing.is_empty() {
-                let missing = i18n::fill(&self.model.text("catalog.ddl.missing"), &[("items", &view.missing.join(", "))]);
+                // 横幅逐项英文化；编辑区里重建 SQL 的注释保持生成时的原样。
+                let items = crate::catalog::definition::missing_text(&view.missing, self.model.locale()).join(", ");
+                let missing = i18n::fill(&self.model.text("catalog.ddl.missing"), &[("items", &items)]);
                 text = format!("{text} {missing}");
             }
-            div().id("ddl-viewer-rebuilt").test_support().child(banner(IconName::Info, SharedString::from(text), p.warn, p.warn_soft))
+            div()
+                .id("ddl-viewer-rebuilt")
+                .test_support()
+                .aria_label(SharedString::from(text.clone()))
+                .child(banner(IconName::Info, SharedString::from(text), p.warn, p.warn_soft))
         });
         let has_text = view.text.is_some();
         let dialog = div()
