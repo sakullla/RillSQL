@@ -5480,6 +5480,70 @@ fn a_sqlite_object_read_failure_on_connection_refresh_keeps_the_subtree() {
     assert!(ids(&model).contains(&nav_id("lite", "main", "", &orders)));
 }
 
+/// 连接行刷新成功时，树上还没有节点的库带着错误不算失败：PostgreSQL 新出现的非当前会话库、
+/// SQLite 不显示的附加库读取失败，都照常重建、显示新对象，连接行不挂错误。
+#[test]
+fn a_connection_refresh_ignores_errors_on_databases_the_tree_does_not_show() {
+    use crate::app::shell::nav::NavRequest;
+    use crate::catalog::hierarchy::{connection_node_id, database_node_id, group_node_id, schema_node_id};
+    use crate::catalog::model::{ObjectKind, ObjectRow, SchemaNode};
+    let ids = |model: &WorkbenchModel| model.nav_rows().into_iter().map(|row| row.id).collect::<Vec<_>>();
+
+    // PostgreSQL：shop 读取成功并新增 audit，另有一个新库 newdb（不在当前会话里，带错误、没有模式）。
+    let (mut model, orders) = pg_orders_model();
+    let connection = connection_node_id("pg");
+    let shop = database_node_id("pg", "shop");
+    let tables = group_node_id("pg", "shop", "public", ObjectKind::Table);
+    expand_all(&mut model, &[connection.clone(), shop.clone(), schema_node_id("pg", "shop", "public"), tables.clone()]);
+    assert!(ids(&model).contains(&orders));
+    let audit = ObjectRow::table("audit", Some(0));
+    for round in 0..2 {
+        let _ = model.dispatch(&format!("nav-refresh-node:{connection}"));
+        assert_eq!(model.take_nav_request(), Some(NavRequest::Refresh { connection: Some("pg".into()) }));
+        let mut newdb = nav_database("newdb", Vec::new());
+        newdb.schemas.clear();
+        newdb.error = Some("当前会话连在 shop，没有另开连接读取 newdb".into());
+        let fresh = nav_connection(
+            Engine::Postgres,
+            "pg",
+            "销售库",
+            vec![nav_database("shop", vec![audit.clone(), ObjectRow::table("orders", Some(2)), ObjectRow::view("recent")]), newdb],
+        );
+        model.apply_navigation(&[fresh], true);
+        assert!(model.nav.node(&connection).unwrap().error.is_none(), "第 {round} 次：连接行不挂错误");
+        assert!(model.nav_node_refresh.is_empty());
+        let rows = ids(&model);
+        assert!(rows.contains(&nav_id("pg", "shop", "public", &audit)), "第 {round} 次：新对象出现");
+        assert!(rows.contains(&orders));
+        let newdb_id = database_node_id("pg", "newdb");
+        assert!(model.nav.node(&newdb_id).is_some(), "第 {round} 次：新库出现在树上");
+        assert!(model.nav.is_expanded(&tables));
+    }
+
+    // SQLite：main 读取成功并新增 orders，附加库 aux 读取失败。
+    let customers = ObjectRow::table("customers", Some(1));
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.apply_navigation(&[nav_connection(Engine::Sqlite, "lite", "本地", vec![nav_database("main", vec![customers.clone()])])], false);
+    let root = connection_node_id("lite");
+    expand_all(&mut model, &[root.clone(), group_node_id("lite", "main", "", ObjectKind::Table)]);
+    assert!(ids(&model).contains(&nav_id("lite", "main", "", &customers)));
+    let orders = ObjectRow::table("orders", Some(0));
+    for round in 0..2 {
+        let _ = model.dispatch(&format!("nav-refresh-node:{root}"));
+        assert_eq!(model.take_nav_request(), Some(NavRequest::Refresh { connection: Some("lite".into()) }));
+        let mut aux = nav_database("aux", Vec::new());
+        aux.schemas = vec![SchemaNode::empty("")];
+        aux.error = Some("aux 不可读".into());
+        let fresh = nav_connection(Engine::Sqlite, "lite", "本地", vec![nav_database("main", vec![customers.clone(), orders.clone()]), aux]);
+        model.apply_navigation(&[fresh], true);
+        assert!(model.nav.node(&root).unwrap().error.is_none(), "第 {round} 次：连接行不挂错误");
+        assert!(model.nav_node_refresh.is_empty());
+        let rows = ids(&model);
+        assert!(rows.contains(&nav_id("lite", "main", "", &orders)), "第 {round} 次：新表出现");
+        assert!(rows.contains(&nav_id("lite", "main", "", &customers)));
+    }
+}
+
 /// 危险操作：生产（按 tone，自建标签也算）要输对名字；第一次点执行只待确认；取消不发语句；
 /// 失败保留树并显示原因；迟到的旧结果被丢弃。
 #[test]

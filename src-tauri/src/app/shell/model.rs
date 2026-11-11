@@ -1348,7 +1348,7 @@ impl WorkbenchModel {
     /// 原本有子项、没有错误的库/模式这次读取报错。一直就报错的库（例如 PostgreSQL
     /// 不在当前会话里的库）不算，否则这条连接永远刷新不了。返回要挂在节点上的原因。
     fn node_refresh_failure(&self, node_id: &str, incoming: &NavConnection) -> Option<String> {
-        use crate::catalog::hierarchy::{database_node_id, schema_node_id};
+        use crate::catalog::hierarchy::{connection_node_id, database_node_id, schema_node_id};
         if let Some(message) = &incoming.error {
             return Some(message.clone());
         }
@@ -1359,37 +1359,52 @@ impl WorkbenchModel {
         };
         // 只看有没有子项：读取报错的库/模式在树上本来就没有子项；上一次刷新失败而保留下来的
         // 子树虽然带着错误，再失败一次也必须继续保留。
+        // 容器节点不存在（新出现的库/模式，或 SQLite 不显示的附加库）同样不算失败。
         let had_children = |id: &str| self.nav.node(id).is_some_and(|node| !node.children.is_empty());
+        let engine = incoming.engine;
+        // 没有库层的引擎（SQLite）只把第一个库的第一个模式挂在连接下面，其余库在树上不存在。
+        let first_database = incoming.databases.first().map(|database| database.name.as_str());
         for database in &incoming.databases {
             if scope.as_deref().is_some_and(|name| name != database.name) {
                 continue;
             }
+            let shown_without_database = !engine.shows_databases() && first_database == Some(database.name.as_str());
             if let Some(message) = &database.error {
-                // 没有库层的引擎（SQLite）不建库节点，对象直接挂在连接下面。
-                let database_id = database_node_id(&incoming.id, &database.name);
-                let container = if self.nav.node(&database_id).is_some() {
-                    database_id
+                let container = if engine.shows_databases() {
+                    Some(database_node_id(&incoming.id, &database.name))
+                } else if shown_without_database {
+                    Some(connection_node_id(&incoming.id))
                 } else {
-                    crate::catalog::hierarchy::connection_node_id(&incoming.id)
+                    None
                 };
-                if had_children(&container) {
+                if container.is_some_and(|id| had_children(&id)) {
                     return Some(message.clone());
                 }
                 continue;
             }
+            // 没有模式层的引擎（MySQL/MongoDB/SQLite）只显示一个模式（空名优先，否则第一个），
+            // 对象直接挂在库或连接下面。
+            let shown_schema = database
+                .schemas
+                .iter()
+                .find(|schema| schema.name.is_empty())
+                .or_else(|| database.schemas.first())
+                .map(|schema| schema.name.as_str());
             for schema in &database.schemas {
                 let Some(message) = &schema.error else { continue };
-                // 没有模式层的引擎（MySQL/MongoDB/SQLite）对象直接挂在库或连接下面。
-                let schema_id = schema_node_id(&incoming.id, &database.name, &schema.name);
-                let database_id = database_node_id(&incoming.id, &database.name);
-                let container = if self.nav.node(&schema_id).is_some() {
-                    schema_id
-                } else if self.nav.node(&database_id).is_some() {
-                    database_id
+                let container = if engine.shows_schemas() {
+                    Some(schema_node_id(&incoming.id, &database.name, &schema.name))
+                } else if engine.shows_databases() {
+                    (shown_schema == Some(schema.name.as_str()))
+                        .then(|| database_node_id(&incoming.id, &database.name))
+                } else if shown_without_database
+                    && database.schemas.first().map(|first| first.name.as_str()) == Some(schema.name.as_str())
+                {
+                    Some(connection_node_id(&incoming.id))
                 } else {
-                    crate::catalog::hierarchy::connection_node_id(&incoming.id)
+                    None
                 };
-                if had_children(&container) {
+                if container.is_some_and(|id| had_children(&id)) {
                     return Some(message.clone());
                 }
             }
