@@ -145,7 +145,7 @@ fn plan_create_index(snapshot: &Snapshot, table: &str, name: &str, unique: bool,
     let order = columns.iter().map(|column| format!("{} {}", column.name, if column.descending { "DESC" } else { "ASC" })).collect::<Vec<_>>().join(" → ");
     let mut risks = vec![Risk {
         level: "info".to_owned(),
-        text: format!("按 {order} 的顺序创建{}索引。", if unique { "唯一" } else { "普通" }),
+        text: if unique { format!("按 {order} 的顺序创建唯一索引。") } else { format!("按 {order} 的顺序创建普通索引。") },
     }];
     if unique {
         risks.push(Risk {
@@ -540,7 +540,7 @@ fn plan_set_event_enabled(snapshot: &Snapshot, event: &str, enabled: bool) -> Pl
                 target,
                 Vec::new(),
                 risks,
-                vec![Step { label: format!("{}事件 {event}", if enabled { "启用" } else { "停用" }), sql }],
+                vec![Step { label: if enabled { format!("启用事件 {event}") } else { format!("停用事件 {event}") }, sql }],
             )
         }
         Err(message) => finish(snapshot.engine, false, target, vec![message], risks, Vec::new()),
@@ -1309,7 +1309,7 @@ fn sqlite_direct_alters(snapshot: &Snapshot, table: &str, changes: &[Change]) ->
                             "ALTER TABLE {qualified} ALTER COLUMN {} {verb};",
                             quote_ident(Engine::Sqlite, draft.name.trim())
                         ),
-                        label: format!("{} {}", if draft.nullable { "去掉 NOT NULL" } else { "设置 NOT NULL" }, draft.name.trim()),
+                        label: if draft.nullable { format!("去掉 NOT NULL {}", draft.name.trim()) } else { format!("设置 NOT NULL {}", draft.name.trim()) },
                     });
                 }
             }
@@ -1368,7 +1368,7 @@ fn remote_alters(snapshot: &Snapshot, table: &str, changes: &[Change]) -> Result
                         let verb = if draft.nullable { "DROP NOT NULL" } else { "SET NOT NULL" };
                         steps.push(Step {
                             sql: format!("ALTER TABLE {qualified} ALTER COLUMN {column_name} {verb};"),
-                            label: format!("{} {}", if draft.nullable { "允许 NULL" } else { "设置 NOT NULL" }, draft.name.trim()),
+                            label: if draft.nullable { format!("允许 NULL {}", draft.name.trim()) } else { format!("设置 NOT NULL {}", draft.name.trim()) },
                         });
                     }
                     if normalize_default(&draft.default_sql) != original.default_sql.as_deref().map(str::trim) {

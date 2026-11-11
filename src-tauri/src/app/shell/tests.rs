@@ -6189,6 +6189,54 @@ fn english_danger_layer_errors_have_no_chinese(cx: &mut gpui_kit::TestAppContext
     assert_eq!(error_label(cx).as_deref(), Some(zh.as_str()));
 }
 
+/// 英文界面：确认层打开后表已被别处删掉，再预览时读取层报“找不到表或视图”，横幅是英文。
+/// 错误文字来自真实的读取层，不在测试里手写。
+#[gpui_kit::test]
+fn english_danger_layer_preview_of_dropped_table_has_no_chinese(cx: &mut gpui_kit::TestAppContext) {
+    let (window, view, dir) = sqlite_notes_workbench(cx, true);
+    wait_for_shell_ready(cx, window, &view);
+    let database = dir.join("items.sqlite");
+    sqlite_exec_on_file(&database, "CREATE TABLE vanishing (id INTEGER PRIMARY KEY)");
+    cx.update_window(window, |_, _, cx| view.update(cx, |view, cx| view.perform("refresh-tree", cx))).unwrap();
+    let vanishing = wait_for_nav_object(cx, window, &view, "vanishing");
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("locale-en", cx)));
+    cx.update_window(window, |_, _, cx| {
+        view.update(cx, |view, cx| {
+            assert!(view.model.open_nav_menu(&vanishing));
+            view.perform("tree-drop-object", cx);
+        })
+    })
+    .unwrap();
+    assert!(pump_until(cx, window, &view, |view, _| view.model.danger.as_ref().is_some_and(|prompt| prompt.plan.is_some() && !prompt.loading)), "没有生成计划");
+
+    sqlite_exec_on_file(&database, "DROP TABLE vanishing");
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("danger-preview", cx)));
+    assert!(
+        pump_until(cx, window, &view, |view, _| view.model.danger.as_ref().is_some_and(|prompt| !prompt.loading
+            && (prompt.error.is_some() || prompt.plan.as_ref().is_some_and(|plan| !plan.blocked.is_empty())))),
+        "表删掉后预览没有得到错误或阻断"
+    );
+    let zh = cx.update(|cx| {
+        let prompt = view.read(cx).model.danger.as_ref().unwrap();
+        prompt.error.clone().unwrap_or_else(|| prompt.plan.as_ref().map(|plan| plan.blocked.join(" ")).unwrap_or_default())
+    });
+    assert!(zh.contains("找不到") && zh.contains("vanishing"), "读取层给出的是找不到表：{zh}");
+    let banners = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            ["danger-error", "danger-blocked"]
+                .into_iter()
+                .filter_map(|id| window.try_find(id).map(|banner| banner.label().unwrap_or_default().to_owned()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+    assert!(!banners.is_empty(), "确认层没有显示错误横幅");
+    for shown in &banners {
+        assert!(!crate::ddl::english::has_cjk(shown), "英文确认层横幅残留中文：{shown}");
+        assert!(shown.contains("vanishing") && shown.contains("not found"), "{shown}");
+    }
+}
+
 #[test]
 fn untagged_connections_show_no_env_pill() {
     assert!(!super::chrome::env_shown(""));

@@ -2922,7 +2922,14 @@ impl Workbench {
             content = content.child(risks);
             if !plan.blocked.is_empty() {
                 let blocked: Vec<String> = plan.blocked.iter().map(|text| crate::ddl::english::localize(text, locale)).collect();
-                content = content.child(banner(IconName::Ban, SharedString::from(blocked.join(" ")), p.danger, p.danger_soft));
+                let blocked = blocked.join(" ");
+                content = content.child(
+                    div()
+                        .id("danger-blocked")
+                        .test_support()
+                        .aria_label(SharedString::from(blocked.clone()))
+                        .child(banner(IconName::Ban, SharedString::from(blocked), p.danger, p.danger_soft)),
+                );
             }
         }
         if let Some(error) = prompt.error.as_ref() {

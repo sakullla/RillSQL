@@ -3,8 +3,9 @@
 //! 计划由执行层按中文生成，确认执行时还要和同一份计划逐条比对 SQL，所以不在生成端分语言；
 //! 英文界面在显示时按这里的句型表换成英文。句型里的 `{}` 是对象名、行数等可变部分，
 //! 英文句子用 `{0}`、`{1}` 按位置取回（可变部分本身是已知句型时也一起换）。
-//! 覆盖范围：危险确认层（删除表/视图、清空、改名）与数据库管理页（VACUUM、REINDEX、PRAGMA、
-//! ATTACH、外键开关、序列、事件）会出现的全部句子；查不到句型的原样返回（数据库原文不翻译）。
+//! 覆盖范围：`ddl/` 与 `application/ddl.rs` 非测试源码里的每一句中文（计划风险/阻断/步骤、读取层与执行层错误、
+//! 执行结果），由源码扫描测试 `every_chinese_literal_in_ddl_sources_has_an_english_form` 守住；只用于匹配的片段与
+//! 写进生成 SQL 注释的文字列在测试白名单里并写明原因。查不到句型的原样返回（数据库原文不翻译）。
 
 /// (中文句型, 英文句型)。同一前缀里更具体的句型排在前面。
 const PATTERNS: &[(&str, &str)] = &[
@@ -23,7 +24,7 @@ const PATTERNS: &[(&str, &str)] = &[
     ),
     ("Redis 没有结构编辑。", "Redis has no structure editing."),
     ("MongoDB 没有结构编辑。", "MongoDB has no structure editing."),
-    ("当前连接打开的是 main，没有另开连接修改 {}", "This connection has main open; no other connection was opened to change {0}"),
+    ("当前连接打开的是 {}，没有另开连接修改 {}", "This connection has {0} open; no other connection was opened to change {1}"),
     ("需要数据库名，没有另开连接。", "A database name is required; no other connection was opened."),
     ("PostgreSQL 需要指定 schema（表所在的分组名），没有另开连接。", "PostgreSQL needs a schema (the group the table is in); no other connection was opened."),
     ("SQL Server 需要指定 schema（表所在的分组名），没有另开连接。", "SQL Server needs a schema (the group the table is in); no other connection was opened."),
@@ -112,6 +113,7 @@ const PATTERNS: &[(&str, &str)] = &[
     ("关掉日志后崩溃时无法回滚未完成的事务。", "With the journal off, unfinished transactions can't be rolled back after a crash."),
     ("user_version 只接受 0 到 2147483647 的整数。", "user_version only accepts an integer from 0 to 2147483647."),
     ("这里只改 journal_mode 与 user_version，其它 PRAGMA 不放行。", "Only journal_mode and user_version can be changed here; other PRAGMAs are not allowed."),
+    ("{} 已经是 {} 的值，没有生成语句。", "{0} is already a value of {1}, so no statement was generated."),
     ("{} 已经是 {}，没有生成语句。", "{0} is already {1}, so no statement was generated."),
     ("设置 {} = {}", "Set {0} = {1}"),
     // ATTACH
@@ -196,6 +198,239 @@ const PATTERNS: &[(&str, &str)] = &[
     ("event_scheduler 关闭时事件仍然不会执行；这里不改调度器状态。", "Events still don't run while event_scheduler is off; the scheduler state is not changed here."),
     ("启用事件 {}", "Enable event {0}"),
     ("停用事件 {}", "Disable event {0}"),
+    // 结构读取（introspect）：读不到、找不到对象与读取结果。
+    ("找不到表或视图 {}", "Table or view {0} was not found"),
+    ("表名无效。", "The table name is not valid."),
+    ("没有目标表", "There is no target table"),
+    ("这个动作需要指定表，不是数据库级动作。", "This action needs a table; it is not a database-level action."),
+    ("目标 {} 不是基础表。", "The target {0} is not a base table."),
+    ("读不到序列 {}：{}", "Sequence {0} could not be read: {1}"),
+    ("找不到序列 {}。", "Sequence {0} was not found."),
+    ("读不到类型 {}：{}", "Type {0} could not be read: {1}"),
+    ("找不到类型 {}。", "Type {0} was not found."),
+    ("{} 不是枚举类型，枚举值只能加在枚举上。", "{0} is not an enum type; enum values can only be added to an enum."),
+    ("读不到枚举 {} 的取值：{}", "The values of enum {0} could not be read: {1}"),
+    ("{} 不是域（domain）。", "{0} is not a domain."),
+    ("读不到域 {} 的定义：{}", "The definition of domain {0} could not be read: {1}"),
+    ("找不到域 {}。", "Domain {0} was not found."),
+    ("读不到事件 {}：{}", "Event {0} could not be read: {1}"),
+    ("找不到事件 {}。", "Event {0} was not found."),
+    ("没有读到 NULL 计数", "The NULL count could not be read"),
+    ("没有读到行数", "The row count could not be read"),
+    ("没有读到视图定义", "The view definition could not be read"),
+    ("不是整数 {}", "Not an integer: {0}"),
+    ("元数据是空的", "The metadata is empty"),
+    ("读不到第 {} 列", "Column {0} could not be read"),
+    ("由主键约束维护", "Maintained by the primary key constraint"),
+    ("由唯一约束维护", "Maintained by a unique constraint"),
+    ("由唯一约束 {} 维护", "Maintained by unique constraint {0}"),
+    ("外键 {} 依赖此索引", "Foreign key {0} depends on this index"),
+    ("VACUUM 已完成：数据库现在有 {} 页，其中空闲 {} 页。", "VACUUM finished: the database now has {0} pages, {1} of them free."),
+    ("VACUUM 已完成。", "VACUUM finished."),
+    ("REINDEX 已完成：索引已按当前的表结构重建。", "REINDEX finished: the indexes were rebuilt for the current table structure."),
+    // 结构编辑：建表、字段、索引、外键。
+    ("至少需要一个字段。", "At least one column is needed."),
+    ("表 {} 已经存在。不会覆盖已有表或数据。", "Table {0} already exists. Existing tables and data are not overwritten."),
+    (
+        "创建一张新表。同名对象已存在时数据库会报错，不会覆盖已有表或数据。",
+        "Creates a new table. If an object with the same name exists, the database reports an error; existing tables and data are not overwritten.",
+    ),
+    (
+        "没有主键：之后可以新增行，但不能在表格里修改或删除已有行。",
+        "No primary key: rows can be added later, but existing rows can't be edited or deleted in the grid.",
+    ),
+    ("创建 {}", "Create {0}"),
+    ("没有字段变更。", "There are no column changes."),
+    ("索引名称无效。", "The index name is not valid."),
+    ("索引 {} 已经存在，不会覆盖。", "Index {0} already exists; it won't be overwritten."),
+    ("索引至少需要一列。", "An index needs at least one column."),
+    ("列 {} 不在表 {} 中。", "Column {0} is not in table {1}."),
+    ("列 {} 在索引里重复。", "Column {0} appears twice in the index."),
+    ("按 {} 的顺序创建唯一索引。", "Creates a unique index in the order {0}."),
+    ("按 {} 的顺序创建普通索引。", "Creates a regular index in the order {0}."),
+    ("已有重复值时创建会失败。不会删除或修改任何数据。", "Creation fails if duplicate values exist. No data is deleted or changed."),
+    ("创建索引 {}", "Create index {0}"),
+    ("找不到索引 {}", "Index {0} was not found"),
+    ("索引 {} 由约束维护，不能当作普通索引单独删除。", "Index {0} is maintained by a constraint and can't be dropped on its own like a regular index."),
+    ("索引 {} 不能单独删除：{p}", "Index {0} can't be dropped on its own: {1}"),
+    ("只删除这个索引，不删除表或记录。", "Only this index is dropped; the table and its rows stay."),
+    ("删除索引 {}", "Drop index {0}"),
+    (
+        "表 {} 使用 MyISAM，不支持外键。不会通过关闭检查来假装创建成功。",
+        "Table {0} uses MyISAM, which doesn't support foreign keys. Checks are not turned off to pretend the creation succeeded.",
+    ),
+    (
+        "数据库会检查已有数据。存在无法匹配的值时创建失败。不会关闭约束检查，也不会清理数据。",
+        "The database checks the existing data. Creation fails if values don't match. Constraint checks are not turned off and no data is cleaned up.",
+    ),
+    ("CASCADE 会在父表变更时连带修改或删除本表中引用它的行。", "CASCADE changes or deletes the rows in this table that reference the parent table when the parent changes."),
+    ("SQLite 不能直接 ALTER TABLE 添加外键，需要按官方步骤重建表。", "SQLite can't add a foreign key with ALTER TABLE; the table has to be rebuilt by the official steps."),
+    ("创建外键 {}", "Create foreign key {0}"),
+    ("找不到外键 {}", "Foreign key {0} was not found"),
+    ("只删除这条外键，不删除父表、子表或记录。", "Only this foreign key is dropped; the parent table, child table and rows stay."),
+    ("SQLite 需要重建表才能移除外键。", "SQLite has to rebuild the table to remove a foreign key."),
+    ("删除外键 {}", "Drop foreign key {0}"),
+    ("外键名称无效。", "The foreign key name is not valid."),
+    ("外键 {} 已经存在，不会覆盖。", "Foreign key {0} already exists; it won't be overwritten."),
+    ("外键两侧的列数量必须一致。", "Both sides of the foreign key need the same number of columns."),
+    ("ON DELETE {} 不是 {} 支持的引用动作。", "ON DELETE {0} is not a referential action {1} supports."),
+    ("ON UPDATE {} 不是 {} 支持的引用动作。", "ON UPDATE {0} is not a referential action {1} supports."),
+    ("本表没有列 {}。", "This table has no column {0}."),
+    ("本表列 {} 在外键里重复。", "Column {0} of this table appears twice in the foreign key."),
+    ("目标表和预检查读到的表不一致。", "The target table doesn't match the table read by the pre-check."),
+    ("目标表没有列 {}。", "The target table has no column {0}."),
+    ("类型不匹配：{}（{}）和 {}（{}）。", "Type mismatch: {0} ({1}) and {2} ({3})."),
+    ("目标列必须构成目标表的主键或唯一约束。", "The target columns must form the primary key or a unique constraint of the target table."),
+    ("没有读到目标表，不能确认外键是否有效。", "The target table could not be read, so the foreign key can't be confirmed as valid."),
+    ("类型 {} 无效。", "Type {0} is not valid."),
+    ("默认值 {} 无效。", "Default value {0} is not valid."),
+    ("第 {} 个字段的名称无效。", "The name of column {0} is not valid."),
+    ("字段名 {} 重复。", "Column name {0} is used twice."),
+    ("字段 {} 的类型 {} 不能按 {} 规则生成。", "The type {1} of column {0} can't be generated by the {2} rules."),
+    ("字段 {} 的默认值不是允许的字面量或当前时间函数。", "The default of column {0} is not an allowed literal or current-time function."),
+    ("字段 {} 只有主键才能自增。", "Column {0} can only auto-increment as the primary key."),
+    // 字段变更
+    ("字段 {} 没有出现在变更里，已停止以免漏改。", "Column {0} is missing from the changes; stopped so nothing is changed by mistake."),
+    ("不能删除主键列 {}。", "Primary key column {0} can't be dropped."),
+    ("不能删除生成列 {}。", "Generated column {0} can't be dropped."),
+    ("外键引用列 {}，删除它不能保留该约束。", "A foreign key uses column {0}; dropping it can't keep that constraint."),
+    ("其他表的外键引用列 {}，删除它不能保留该约束。", "A foreign key in another table references column {0}; dropping it can't keep that constraint."),
+    ("不能给已有表追加主键列 {}。", "Primary key column {0} can't be added to an existing table."),
+    ("SQLite 新增非空字段 {} 必须有非 NULL 默认值。", "In SQLite, the new NOT NULL column {0} needs a non-NULL default."),
+    ("新增非空字段 {} 没有默认值，已有行无法满足 NOT NULL。", "The new NOT NULL column {0} has no default, so existing rows can't satisfy NOT NULL."),
+    (
+        "没能确认表 {} 是否已有数据，不能新增没有默认值的非空字段 {}。",
+        "It couldn't be confirmed whether table {0} has data, so the NOT NULL column {1} without a default can't be added.",
+    ),
+    ("生成列 {} 不能这样修改。", "Generated column {0} can't be changed this way."),
+    ("不能在这里修改主键列 {} 的类型。", "The type of primary key column {0} can't be changed here."),
+    ("不能在这里修改主键列 {} 的空值约束。", "The NULL constraint of primary key column {0} can't be changed here."),
+    ("不能把 {} 改成主键。", "{0} can't be made the primary key."),
+    (
+        "列 {} 有 {} 个 NULL，不能设为 NOT NULL。请先改数据，或保留允许 NULL。",
+        "Column {0} has {1} NULLs, so it can't be set to NOT NULL. Change the data first, or keep allowing NULL.",
+    ),
+    ("没能完成列 {} 的 NULL 预检查，没有生成变更。", "The NULL pre-check of column {0} couldn't finish, so no change was generated."),
+    ("不能在这里改变主键组成。", "The primary key columns can't be changed here."),
+    ("删除字段 {} 会永久丢掉该列的数据。", "Dropping column {0} permanently loses the data in that column."),
+    (
+        "字段 {} 的类型由 {} 改为 {}。无法转换的值会使执行失败；RillSQL 不会自动截断或清空数据。",
+        "The type of column {0} changes from {1} to {2}. Values that can't be converted make the run fail; RillSQL never truncates or clears data on its own.",
+    ),
+    ("重命名 {} → {}。仍使用旧列名的查询或应用需要同步修改。", "Rename {0} → {1}. Queries and applications that still use the old column name need to be updated."),
+    ("重命名 {} → {}", "Rename {0} → {1}"),
+    ("新增字段 {}", "Add column {0}"),
+    ("删除字段 {}", "Drop column {0}"),
+    ("修改类型 {}", "Change type of {0}"),
+    ("修改默认值 {}", "Change default of {0}"),
+    ("删除默认值 {}", "Drop default of {0}"),
+    ("删除原默认值 {}", "Drop the old default of {0}"),
+    ("修改字段 {}", "Change column {0}"),
+    ("去掉 NOT NULL {}", "Drop NOT NULL on {0}"),
+    ("设置 NOT NULL {}", "Set NOT NULL on {0}"),
+    ("允许 NULL {}", "Allow NULL on {0}"),
+    // SQLite 重建表
+    (
+        "需要重建表。SQLite 不能直接完成这项修改，将按官方 12 步新建表、复制数据并替换原表。",
+        "The table needs a rebuild. SQLite can't make this change directly, so the official 12 steps create a new table, copy the data and replace the original.",
+    ),
+    ("索引 {} 引用了被删除或无法原样保留的列，重建时不会保留它。", "Index {0} uses a column that is dropped or can't be kept as is, so the rebuild won't keep it."),
+    ("没有可以可靠复制的原有列，因此阻止重建。", "No original column can be copied reliably, so the rebuild is blocked."),
+    ("复制 {} 行", "Copy {0} rows"),
+    ("复制保留列的数据", "Copy the data of the kept columns"),
+    (
+        "不知道本次会话原来的 foreign_keys 设置，不能在重建后恢复，因此没有执行。",
+        "The session's original foreign_keys setting is unknown and couldn't be restored after the rebuild, so nothing was run.",
+    ),
+    ("在事务外关闭外键检查", "Turn off foreign key checks outside the transaction"),
+    ("开始重建事务", "Begin the rebuild transaction"),
+    ("按新定义创建新表", "Create the new table from the new definition"),
+    ("删除旧表", "Drop the old table"),
+    ("新表改回原名", "Rename the new table to the original name"),
+    ("重建索引 {}", "Rebuild index {0}"),
+    ("重建触发器 {}", "Rebuild trigger {0}"),
+    ("检查外键；有违规则停止并回滚这次重建", "Check foreign keys; stop and roll back this rebuild on a violation"),
+    ("提交重建事务", "Commit the rebuild transaction"),
+    ("恢复会话原来的 foreign_keys = {}", "Restore the session's original foreign_keys = {0}"),
+    ("恢复会话原来的 foreign_keys", "Restore the session's original foreign_keys"),
+    (
+        "当前连接 foreign_keys = OFF。重建结束后仍恢复为 OFF，外键定义不会因此变成强制检查。",
+        "This connection has foreign_keys = OFF. It is set back to OFF after the rebuild, so the foreign key definitions are not enforced because of it.",
+    ),
+    (
+        "读不到原来的建表语句，不能确认索引和约束能否保留，因此阻止重建。",
+        "The original CREATE TABLE statement couldn't be read, so it can't be confirmed that indexes and constraints are kept; the rebuild is blocked.",
+    ),
+    ("表含生成列，重建不能可靠保留这些列，因此阻止执行。", "The table has generated columns that a rebuild can't keep reliably, so it is blocked."),
+    ("表含 CHECK 约束，重建不能可靠保留该约束，因此阻止执行。", "The table has a CHECK constraint that a rebuild can't keep reliably, so it is blocked."),
+    ("表含排序规则，重建不能可靠保留该规则，因此阻止执行。", "The table has a collation that a rebuild can't keep reliably, so it is blocked."),
+    (
+        "WITHOUT ROWID 表必须保留主键，重建不能可靠保留行标识，因此阻止执行。",
+        "A WITHOUT ROWID table must keep its primary key and a rebuild can't keep the row identity reliably, so it is blocked.",
+    ),
+    ("触发器 {} 引用了将改变的列，无法可靠改写，因此阻止重建。", "Trigger {0} uses columns that will change and can't be rewritten reliably, so the rebuild is blocked."),
+    ("读不到触发器 {} 的定义，不能可靠重建。", "The definition of trigger {0} couldn't be read, so it can't be rebuilt reliably."),
+    ("视图 {} 引用了将改变的结构，无法可靠改写，因此阻止重建。", "View {0} uses structure that will change and can't be rewritten reliably, so the rebuild is blocked."),
+    ("外键 {} 引用了将改变的列，重建不能可靠保留该约束。", "Foreign key {0} uses columns that will change, so the rebuild can't keep that constraint reliably."),
+    ("索引 {} 含表达式或部分条件，列被重命名后无法可靠改写。", "Index {0} has an expression or partial condition and can't be rewritten reliably after a column rename."),
+    ("读不到索引 {} 的原始语句，不能可靠保留。", "The original statement of index {0} couldn't be read, so it can't be kept reliably."),
+    ("读不到索引 {} 的原始语句。", "The original statement of index {0} couldn't be read."),
+    ("表达式索引 {} 在列重命名后无法可靠改写。", "Expression index {0} can't be rewritten reliably after a column rename."),
+    (
+        "SQLite 按官方步骤重建：先在事务外关闭外键检查，再在一个事务里建新表、复制数据、删除旧表并改回原名，然后做 foreign_key_check（外键完整性检查）。这只属于这次重建，不是所有数据库都能回滚。事务内失败会回滚这次重建；事务外改过的 foreign_keys 会恢复为会话原来的值。",
+        "SQLite rebuilds by the official steps: foreign key checks are turned off outside the transaction, then one transaction creates the new table, copies the data, drops the old table and renames the new one back, followed by foreign_key_check (a foreign key integrity check). This applies to this rebuild only; not every database can roll back. A failure inside the transaction rolls this rebuild back; foreign_keys changed outside the transaction is restored to the session's original value.",
+    ),
+    ("重建事务已回滚，这条语句没有保留。", "The rebuild transaction was rolled back, so this statement was not kept."),
+    ("回滚重建事务失败，结果未知：{}", "Rolling back the rebuild transaction failed, so the result is unknown: {0}"),
+    ("已恢复会话原来的 foreign_keys。", "The session's original foreign_keys was restored."),
+    ("恢复 foreign_keys 失败，结果未知：{}", "Restoring foreign_keys failed, so the result is unknown: {0}"),
+    ("数据库返回：{}", "The database returned: {0}"),
+    // 枚举与域（PostgreSQL）
+    ("枚举值只能追加，不能删除或调整顺序；已有的行不会被改写。", "Enum values can only be appended, not removed or reordered; existing rows are not rewritten."),
+    ("只有 PostgreSQL 有枚举类型，这里不生成语句。", "Only PostgreSQL has enum types, so no statement is generated here."),
+    ("枚举名无效。", "The enum name is not valid."),
+    ("枚举值不能为空。", "The enum value can't be empty."),
+    ("枚举值里不能有控制字符。", "The enum value can't contain control characters."),
+    ("PostgreSQL 的枚举值最长 63 字节。", "PostgreSQL enum values are at most 63 bytes long."),
+    (
+        "没有读到枚举 {} 的现有取值（可能不是枚举或权限不足），没有生成语句。",
+        "The existing values of enum {0} could not be read (it may not be an enum, or a privilege is missing), so no statement was generated.",
+    ),
+    ("找不到枚举值 {}，没有生成语句。", "Enum value {0} was not found, so no statement was generated."),
+    ("不能把新值放在它自己前面。", "The new value can't be placed before itself."),
+    (
+        "新值要在这条语句执行完之后才能被使用；这里单条执行，不把追加值和使用它的语句放进同一个事务。",
+        "The new value can only be used after this statement finishes; it runs on its own and is not put in one transaction with statements that use it.",
+    ),
+    ("给 {} 追加值 {}", "Add value {1} to {0}"),
+    ("域的默认值只影响之后插入的行，不改已有数据。", "A domain default only affects rows inserted later; existing data is not changed."),
+    ("只有 PostgreSQL 有域（domain）对象，这里不生成语句。", "Only PostgreSQL has domain objects, so no statement is generated here."),
+    ("域名无效。", "The domain name is not valid."),
+    ("没有读到域 {} 的定义，没有生成语句。", "The definition of domain {0} could not be read, so no statement was generated."),
+    ("删除域默认值", "Drop the domain default"),
+    ("默认值只接受字面量、TRUE/FALSE、now() 或 CURRENT_TIMESTAMP。", "The default only accepts a literal, TRUE/FALSE, now() or CURRENT_TIMESTAMP."),
+    ("修改域默认值", "Change the domain default"),
+    ("修改域 NOT NULL", "Change the domain NOT NULL"),
+    (
+        "SET NOT NULL 会先检查已有数据，存在空值时数据库会报错；这里不先改写数据。",
+        "SET NOT NULL checks the existing data first and the database reports an error if there are nulls; the data is not rewritten beforehand.",
+    ),
+    ("域 {} 的默认值与 NOT NULL 没有变化。", "The default and NOT NULL of domain {0} have not changed."),
+    // 视图定义替换
+    ("视图 {} 已失效，没有发送。", "View {0} is no longer valid, so nothing was sent."),
+    ("目标视图和已读取的结构不一致，没有生成语句。", "The target view doesn't match the structure that was read, so no statement was generated."),
+    ("只有视图可以替换定义。函数、存储过程和触发器不能从这里保存。", "Only views can have their definition replaced. Functions, stored procedures and triggers can't be saved from here."),
+    ("没有读到可编辑的视图定义：{p}", "No editable view definition could be read: {0}"),
+    ("定义只剩空白和注释，没有发送。", "The definition is only whitespace and comments, so nothing was sent."),
+    ("无法在不丢弃物化数据的情况下替换这个物化视图，因此不发送。", "This materialized view can't be replaced without discarding its materialized data, so nothing is sent."),
+    ("视图被 {l} 依赖，无法在不丢弃这些依赖的情况下替换，因此不发送。", "The view is used by {0} and can't be replaced without discarding them, so nothing is sent."),
+    ("定义没有改动，没有发送。", "The definition hasn't changed, so nothing was sent."),
+    ("定义包含多条语句，无法安全替换，没有发送。", "The definition has more than one statement and can't be replaced safely, so nothing was sent."),
+    ("这条语句创建的不是当前视图，没有发送。", "This statement doesn't create the current view, so nothing was sent."),
+    ("这段定义不能安全地替换当前视图，没有发送。", "This definition can't safely replace the current view, so nothing was sent."),
+    ("将按下面的顺序替换视图定义。取消不会发送任何语句。", "The view definition is replaced in the order below. Canceling sends no statement."),
+    ("创建视图 {}", "Create view {0}"),
+    ("替换视图 {}", "Replace view {0}"),
     // 执行结果与确认层错误（执行层、应用层与界面生成的话；数据库原文不在这里）。
     (
         "预览已过期：数据库里的结构或生成的 SQL 和确认时看到的不一致，没有执行。",
@@ -514,6 +749,142 @@ mod tests {
         let truncated = plan(&table, &Action::TruncateTable { table: "a、b".into() });
         assert_eq!(english(&truncated.steps[0].label), "Empty a、b");
         assert!(english(&truncated.risks[0].text).contains("a、b"), "{}", english(&truncated.risks[0].text));
+    }
+
+    /// 读出源码里非测试部分的字符串字面量（跳过注释与字符字面量），只留含中文的。
+    fn chinese_literals(source: &str) -> Vec<String> {
+        let bytes = source.as_bytes();
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'/' if bytes.get(at + 1) == Some(&b'/') => {
+                    at = source[at..].find('\n').map_or(bytes.len(), |end| at + end);
+                }
+                b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                    at = source[at + 2..].find("*/").map_or(bytes.len(), |end| at + 2 + end + 2);
+                }
+                b'"' => {
+                    let start = at + 1;
+                    at = start;
+                    while bytes[at] != b'"' {
+                        at += if bytes[at] == b'\\' { 2 } else { 1 };
+                    }
+                    let literal = &source[start..at];
+                    if has_cjk(literal) {
+                        out.push(literal.to_owned());
+                    }
+                    at += 1;
+                }
+                b'\'' if bytes.get(at + 1) == Some(&b'\\') => {
+                    at = source[at + 2..].find('\'').map_or(bytes.len(), |end| at + 2 + end + 1);
+                }
+                b'\'' => {
+                    // 字符字面量 'x'（含多字节字符）；否则是生命周期标记。
+                    let width = source[at + 1..].chars().next().map_or(1, char::len_utf8);
+                    at += if bytes.get(at + 1 + width) == Some(&b'\'') { width + 2 } else { 1 };
+                }
+                _ => at += 1,
+            }
+        }
+        out
+    }
+
+    /// 把 format 的占位（`{}`、`{name}`、`{:?}`）换成不同的英文样例值；`{{`/`}}` 还原成花括号。
+    fn fill_placeholders(literal: &str) -> String {
+        let mut out = String::new();
+        let mut rest = literal;
+        let mut index = 0;
+        while let Some(open) = rest.find('{') {
+            out.push_str(&rest[..open]);
+            if rest[open..].starts_with("{{") {
+                out.push('{');
+                rest = &rest[open + 2..];
+                continue;
+            }
+            let close = rest[open..].find('}').map_or(rest.len(), |end| open + end);
+            out.push_str(&format!("v{index}"));
+            index += 1;
+            rest = rest.get(close + 1..).unwrap_or_default();
+        }
+        out.push_str(rest);
+        out.replace("}}", "}")
+    }
+
+    /// 不是给人看的整句：只用来匹配/拼接的片段，或写进生成 SQL 注释里的文字。每条写明原因。
+    const NOT_MESSAGES: &[(&str, &str)] = &[
+        ("找不到表或视图", "exec.rs 用 starts_with 识别读取层“找不到表或视图 {}”错误的前缀，本身不显示"),
+        ("需要", "plan.rs 用 contains 识别 sql.rs 返回的限定名错误，本身不显示"),
+        ("没有另开", "plan.rs 用 contains 识别 sql.rs 返回的限定名错误，本身不显示"),
+        ("主键", "introspect.rs 用 contains 在索引原因里认出主键索引，本身不显示"),
+        ("、", "名字列表的分隔符，英文句型的 {l} 位置把它换成逗号"),
+        (
+            "-- 由元数据重建，不是数据库保存的原文。未包含：{}。\\nCREATE TABLE {qualified} (\\n  {}\\n);",
+            "重建的建表语句开头的 SQL 注释，属于生成的 SQL 文本，不按界面语言改写",
+        ),
+        ("-- 索引 {name} 的类型是 {}，没有从元数据重建。", "重建的建表语句里的 SQL 注释，属于生成的 SQL 文本"),
+        ("CHECK 约束", "重建建表语句 SQL 注释“未包含”清单里的项"),
+        ("分区", "重建建表语句 SQL 注释“未包含”清单里的项"),
+        ("存储参数与表空间", "重建建表语句 SQL 注释“未包含”清单里的项"),
+        ("权限", "重建建表语句 SQL 注释“未包含”清单里的项"),
+        ("触发器", "重建建表语句 SQL 注释“未包含”清单里的项"),
+        ("计算列表达式", "重建建表语句 SQL 注释“未包含”清单里的项"),
+        ("文件组与压缩选项", "重建建表语句 SQL 注释“未包含”清单里的项"),
+        ("主键的 CLUSTERED / NONCLUSTERED 选项（按 SQL Server 默认处理）", "重建建表语句 SQL 注释“未包含”清单里的项"),
+        ("索引选项（FILLFACTOR、IGNORE_DUP_KEY 等）", "重建建表语句 SQL 注释“未包含”清单里的项"),
+        ("XML 与空间索引", "重建建表语句 SQL 注释“未包含”清单里的项"),
+        ("标识列的 ALWAYS / BY DEFAULT 模式与序列参数（统一写成 BY DEFAULT）", "重建建表语句 SQL 注释“未包含”清单里的项"),
+        ("IDENTITY 的起点与步长（统一写成 1, 1）", "重建建表语句 SQL 注释“未包含”清单里的项"),
+        ("索引（读取失败：{message}）", "重建建表语句 SQL 注释“未包含”清单里的项"),
+        ("外键（读取失败：{message}）", "重建建表语句 SQL 注释“未包含”清单里的项"),
+        ("注释（读取失败：{message}）", "重建建表语句 SQL 注释“未包含”清单里的项"),
+    ];
+
+    /// 结构读取、执行与应用层源码（不含本文件与测试）里的每个中文字面量都有英文：整句查句型表，
+    /// 只出现在短语位置的片段查短语表；占位按样例值匹配。新加一句中文而没补句型，这个测试就失败。
+    #[test]
+    fn every_chinese_literal_in_ddl_sources_has_an_english_form() {
+        const SOURCES: &[(&str, &str)] = &[
+            ("ddl/commands.rs", include_str!("commands.rs")),
+            ("ddl/exec.rs", include_str!("exec.rs")),
+            ("ddl/introspect.rs", include_str!("introspect.rs")),
+            ("ddl/mod.rs", include_str!("mod.rs")),
+            ("ddl/model.rs", include_str!("model.rs")),
+            ("ddl/plan.rs", include_str!("plan.rs")),
+            ("ddl/sql.rs", include_str!("sql.rs")),
+            ("application/ddl.rs", include_str!("../application/ddl.rs")),
+        ];
+        let mut seen = Vec::new();
+        let mut missing = Vec::new();
+        for (file, source) in SOURCES {
+            let code = source.split("\nmod tests").next().unwrap_or(source);
+            for literal in chinese_literals(code) {
+                seen.push(literal.clone());
+                if NOT_MESSAGES.iter().any(|(text, _)| *text == literal) {
+                    continue;
+                }
+                let sample = fill_placeholders(&literal);
+                let sentence = english(&sample);
+                let phrase = translate_with(PHRASES, &sample);
+                if has_cjk(&sentence) && !phrase.is_some_and(|en| !has_cjk(&en)) {
+                    missing.push(format!("{file}: {literal} -> {sentence}"));
+                }
+            }
+        }
+        assert!(seen.len() > 200, "扫描没有读到源码字面量：{}", seen.len());
+        missing.sort();
+        missing.dedup();
+        assert!(missing.is_empty(), "{} 句没有英文：\n{}", missing.len(), missing.join("\n"));
+        for (text, reason) in NOT_MESSAGES {
+            assert!(seen.iter().any(|literal| literal == text), "白名单项已不在源码里，应删除：{text}（{reason}）");
+        }
+    }
+
+    #[test]
+    fn literal_scan_skips_comments_and_reads_escapes() {
+        let source = "// 注释 \"不算\"\nlet a = '\"'; let b: &'static str = \"找不到 {name}\\\"x\\\"\"; /* \"块注释\" */ let c = \"plain\";";
+        assert_eq!(chinese_literals(source), vec!["找不到 {name}\\\"x\\\"".to_owned()]);
+        assert_eq!(fill_placeholders("读不到 {name}：{err} {{x}} {:?}"), "读不到 v0：v1 {x} v2");
     }
 
     /// 确认层会显示的程序自己的错误（预览过期、连接未打开、后续跳过、兜底）都有英文。

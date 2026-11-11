@@ -14,6 +14,7 @@ use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, TypeScale};
 use crate::application::AppServices;
 use crate::app::views::grid::{operation_banner, GridTarget};
 use crate::ddl::{preview_plan, Action, ColumnDraft, ForeignKeyDraft, IndexColumnDraft, Plan, Request, Snapshot};
+use crate::ddl::english::localize;
 use crate::i18n::{self, Locale};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,7 +180,7 @@ impl StructureSession {
     }
 
     pub fn blocked(&self) -> Vec<String> {
-        self.preview.as_ref().map(|plan| plan.blocked.clone()).unwrap_or_default()
+        self.preview.as_ref().map(|plan| plan.blocked.iter().map(|text| localize(text, self.locale)).collect()).unwrap_or_default()
     }
 
     pub fn preview_sql(&self) -> Vec<String> {
@@ -189,12 +190,12 @@ impl StructureSession {
     pub fn preview_risks(&self) -> Vec<(String, String)> {
         self.preview
             .as_ref()
-            .map(|plan| plan.risks.iter().map(|risk| (risk.level.clone(), risk.text.clone())).collect())
+            .map(|plan| plan.risks.iter().map(|risk| (risk.level.clone(), localize(&risk.text, self.locale))).collect())
             .unwrap_or_default()
     }
 
     pub fn preview_rule(&self) -> String {
-        self.preview.as_ref().map(|plan| plan.rule.clone()).unwrap_or_default()
+        self.preview.as_ref().map(|plan| localize(&plan.rule, self.locale)).unwrap_or_default()
     }
 
     pub fn preview_target(&self) -> String {
@@ -215,7 +216,7 @@ impl StructureSession {
         }
         let plan = self.preview.as_ref().ok_or_else(|| i18n::text(self.locale, "structure.preview.need"))?;
         if !plan.blocked.is_empty() {
-            return Err(plan.blocked.join(" "));
+            return Err(plan.blocked.iter().map(|text| localize(text, self.locale)).collect::<Vec<_>>().join(" "));
         }
         Ok(plan.steps.iter().map(|step| step.sql.clone()).collect())
     }
@@ -326,13 +327,13 @@ impl StructurePane {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             if this.session.target != target {
-                                this.session.note = "目标已切换，本次预览结果已丢弃。".to_owned();
+                                this.session.note = i18n::text(this.session.locale, "structure.preview.stale");
                                 cx.notify();
                                 return;
                             }
                             match result {
                                 Ok(plan) => this.session.arm_live(plan),
-                                Err(message) => this.session.note = message,
+                                Err(message) => this.session.note = localize(&message, this.session.locale),
                             }
                             cx.notify();
                         });
@@ -376,7 +377,7 @@ impl StructurePane {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             if this.session.target != target {
-                                this.session.note = "目标已切换，本次执行结果已丢弃。".to_owned();
+                                this.session.note = i18n::text(this.session.locale, "structure.execute.stale");
                                 cx.notify();
                                 return;
                             }
@@ -393,12 +394,12 @@ impl StructurePane {
                                 }
                                 Ok(receipt) => {
                                     this.session.armed = false;
-                                    receipt.blocked.join(" ")
+                                    receipt.blocked.iter().map(|text| localize(text, this.session.locale)).collect::<Vec<_>>().join(" ")
                                 }
                                 Err(message) => {
                                     // 执行失败留在预览里，原因和可重试的脚本都还在。
                                     this.session.armed = false;
-                                    message
+                                    localize(&message, this.session.locale)
                                 }
                             };
                             cx.notify();
@@ -444,7 +445,7 @@ impl StructurePane {
                             this.loading = false;
                             match result {
                                 Ok(snapshot) => this.snapshot = Some(snapshot),
-                                Err(message) => this.load_error = message,
+                                Err(message) => this.load_error = localize(&message, this.session.locale),
                             }
                             cx.notify();
                         });

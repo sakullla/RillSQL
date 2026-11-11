@@ -512,6 +512,8 @@ dict! {
     "structure.preview.title" => "结构预览", "Structure preview";
     "structure.preview.need" => "先预览 SQL，确认后才执行。", "Preview the SQL first. It runs only after confirmation.";
     "structure.preview.done" => "已按预览执行。", "The preview was executed.";
+    "structure.preview.stale" => "目标已切换，本次预览结果已丢弃。", "The target changed, so this preview result was discarded.";
+    "structure.execute.stale" => "目标已切换，本次执行结果已丢弃。", "The target changed, so this run result was discarded.";
     "structure.action.preview" => "预览 SQL", "Preview SQL";
     "structure.action.confirm" => "确认执行", "Confirm";
     "structure.action.cancel" => "取消", "Cancel";
