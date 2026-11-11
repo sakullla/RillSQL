@@ -12,7 +12,7 @@ use gpui_kit::{
     Context, InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 
-use crate::ui::kit::{self, Palette};
+use crate::ui::kit::{self, Palette, Radius, TypeScale};
 
 use crate::application::AppServices;
 use crate::export::{
@@ -1030,7 +1030,7 @@ impl Render for ExchangePane {
             .gap(px(18.))
             .p(px(16.));
         if !self.notice.is_empty() {
-            panel = panel.child(div().px(px(12.)).py(px(8.)).rounded(px(8.)).bg(p.hover).text_size(px(12.5)).child(SharedString::from(self.notice.clone())));
+            panel = panel.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.hover).text_size(px(TypeScale::SM)).child(SharedString::from(self.notice.clone())));
         }
 
         // 来源选择：当前表数据或当前查询结果，两种来源的列、行与能力互不混用。
@@ -1067,9 +1067,9 @@ impl Render for ExchangePane {
                 None => {
                     source_body = source_body.child(
                         div()
-                            .text_size(px(12.5))
+                            .text_size(px(TypeScale::SM))
                             .text_color(p.text_faint)
-                            .child(SharedString::from("当前没有表数据；先在对象树里打开一张表。")),
+                            .child(t("ui.exchange.noTableData")),
                     );
                 }
             },
@@ -1080,7 +1080,7 @@ impl Render for ExchangePane {
                         .items_center()
                         .gap(px(8.))
                         .child(kit::icon(IconName::SquareTerminal, 15., p.accent))
-                        .child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(SharedString::from("查询结果")))
+                        .child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(t("ui.exchange.queryResult")))
                         .child(kit::muted(SharedString::from(self.source.context.clone()), &p)),
                 );
                 if self.source.running {
@@ -1089,7 +1089,7 @@ impl Render for ExchangePane {
                             .flex()
                             .items_center()
                             .gap(px(6.))
-                            .text_size(px(12.))
+                            .text_size(px(TypeScale::SM))
                             .text_color(p.text_muted)
                             .child(Spinner::new().xsmall().color(p.accent))
                             .child(SharedString::from(if self.source.kind.is_query() {
@@ -1101,9 +1101,9 @@ impl Render for ExchangePane {
                 } else if !self.source.has_columns() {
                     source_body = source_body.child(
                         div()
-                            .text_size(px(12.5))
+                            .text_size(px(TypeScale::SM))
                             .text_color(p.text_faint)
-                            .child(SharedString::from("当前查询还没有结果；先执行一次查询。")),
+                            .child(t("ui.exchange.noResult")),
                     );
                 }
             }
@@ -1114,17 +1114,17 @@ impl Render for ExchangePane {
                     .flex()
                     .items_center()
                     .gap(px(6.))
-                    .text_size(px(12.))
+                    .text_size(px(TypeScale::SM))
                     .text_color(p.text_muted)
                     .child(Spinner::new().xsmall().color(p.accent))
-                    .child(SharedString::from("表数据正在读取，当前行数尚未完整。")),
+                    .child(t("ui.exchange.tableLoading")),
             );
         }
         if self.source.has_columns() && !self.source.running {
             let partial = if self.source.truncated { "（仅已读取部分）" } else { "" };
             source_body = source_body.child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(TypeScale::SM))
                     .text_color(p.text_muted)
                     .child(SharedString::from(format!("已读取 {} 行{partial}", self.source.rows.len()))),
             );
@@ -1132,9 +1132,9 @@ impl Render for ExchangePane {
         if self.source.kind.is_query() {
             source_body = source_body.child(
                 div()
-                    .text_size(px(11.5))
+                    .text_size(px(TypeScale::XS))
                     .text_color(p.text_faint)
-                    .child(SharedString::from("查询结果只有已读取的行；全量导出不可用。")),
+                    .child(t("ui.exchange.loadedOnly")),
             );
         }
         let mut formats = Vec::new();
@@ -1244,8 +1244,8 @@ impl Render for ExchangePane {
                     .flex_col()
                     .gap(px(4.))
                     .py(px(10.))
-                    .child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(SharedString::from("导入需要当前表数据")))
-                    .child(kit::muted(SharedString::from("切换到“当前表数据”并打开一张表后，才能选择文件并确认写入。"), &p)),
+                    .child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(t("ui.exchange.importNeedsTable")))
+                    .child(kit::muted(t("ui.exchange.importNeedsTableHint"), &p)),
             );
         } else {
         match &self.preview {
@@ -1257,7 +1257,7 @@ impl Render for ExchangePane {
                         .items_center()
                         .gap(px(8.))
                         .py(px(14.))
-                        .rounded(px(8.))
+                        .rounded(px(Radius::PANEL))
                         .border_1()
                         .border_dashed()
                         .border_color(p.line_strong)
@@ -1290,9 +1290,9 @@ impl Render for ExchangePane {
                             .gap(px(8.))
                             .px(px(8.))
                             .py(px(4.))
-                            .rounded(px(6.))
+                            .rounded(px(Radius::CONTROL))
                             .bg(p.chrome)
-                            .text_size(px(12.5))
+                            .text_size(px(TypeScale::SM))
                             .child(div().flex_1().min_w(px(0.)).truncate().child(SharedString::from(source.clone())))
                             .child(kit::icon(IconName::ArrowRight, 12., p.text_faint))
                             .child(div().flex_1().min_w(px(0.)).truncate().font_weight(gpui_kit::FontWeight::MEDIUM).child(SharedString::from(field.clone()))),
@@ -1317,7 +1317,7 @@ impl Render for ExchangePane {
         // 任务
         let mut tasks = kit::card(&p).flex().flex_col();
         if self.log.tasks.is_empty() {
-            tasks = tasks.child(div().p(px(14.)).text_size(px(12.5)).text_color(p.text_faint).child(t("export.task.empty")));
+            tasks = tasks.child(div().p(px(14.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(t("export.task.empty")));
         }
         let count = self.log.tasks.len();
         for (index, task) in self.log.tasks.iter().enumerate() {
@@ -1344,9 +1344,9 @@ impl Render for ExchangePane {
                             .flex()
                             .flex_col()
                             .child(div().truncate().font_weight(gpui_kit::FontWeight::MEDIUM).child(SharedString::from(task.kind.to_owned())))
-                            .child(div().truncate().text_size(px(11.5)).text_color(p.text_faint).child(SharedString::from(if task.detail.is_empty() { task.path.clone().unwrap_or_default() } else { task.detail.clone() }))),
+                            .child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(if task.detail.is_empty() { task.path.clone().unwrap_or_default() } else { task.detail.clone() }))),
                     )
-                    .child(div().text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(format!("{} {}", task.done_rows, i18n::text(locale, "ui.grid.rows")))))
+                    .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(format!("{} {}", task.done_rows, i18n::text(locale, "ui.grid.rows")))))
                     .child(kit::pill(t(task.label_key()), fg, bg)),
             );
         }
@@ -1380,11 +1380,11 @@ fn blocked_row(id: &'static str, icon: IconName, title: SharedString, detail: &s
         .flex()
         .items_center()
         .gap(px(12.))
-        .rounded(px(9.))
+        .rounded(px(Radius::PANEL))
         .border_1()
         .border_color(p.line)
         .opacity(0.55)
-        .child(div().flex_none().size(px(30.)).rounded(px(8.)).bg(p.hover).flex().items_center().justify_center().child(kit::icon(icon, 15., p.text_faint)))
+        .child(div().flex_none().size(px(30.)).rounded(px(Radius::PANEL)).bg(p.hover).flex().items_center().justify_center().child(kit::icon(icon, 15., p.text_faint)))
         .child(
             div()
                 .flex_1()
@@ -1392,27 +1392,25 @@ fn blocked_row(id: &'static str, icon: IconName, title: SharedString, detail: &s
                 .flex()
                 .flex_col()
                 .child(div().text_color(p.text_muted).child(title))
-                .child(div().text_size(px(11.5)).text_color(p.text_faint).child(SharedString::from(detail.to_owned()))),
+                .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(detail.to_owned()))),
         )
         .into_any_element()
 }
 
 fn action_row(id: &'static str, icon: IconName, title: SharedString, detail: SharedString, p: &Palette, on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut gpui_kit::App) + 'static) -> gpui_kit::AnyElement {
-    div()
-        .id(id)
+    kit::interactive_states(div().id(id), p, false)
         .role(gpui_kit::Role::Button)
         .aria_label(title.clone())
         .p(px(10.))
         .flex()
         .items_center()
         .gap(px(12.))
-        .rounded(px(9.))
+        .rounded(px(Radius::PANEL))
         .border_1()
         .border_color(p.line)
-        .cursor_pointer()
         .hover(|style| style.border_color(p.accent).bg(p.accent_soft))
-        .child(div().flex_none().size(px(30.)).rounded(px(8.)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(icon, 15., p.accent_text)))
-        .child(div().flex_1().min_w(px(0.)).flex().flex_col().child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(title)).child(div().text_size(px(11.5)).text_color(p.text_faint).child(detail)))
+        .child(div().flex_none().size(px(30.)).rounded(px(Radius::PANEL)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(icon, 15., p.accent_text)))
+        .child(div().flex_1().min_w(px(0.)).flex().flex_col().child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(title)).child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(detail)))
         .child(kit::icon(IconName::ChevronRight, 14., p.text_faint))
         .on_click(on_click)
         .into_any_element()

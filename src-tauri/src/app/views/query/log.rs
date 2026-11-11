@@ -9,7 +9,7 @@ use gpui_kit::{
 
 use crate::i18n::{self, Locale};
 use crate::query::desk::LogEntry;
-use crate::ui::kit::{self, Metrics, Palette};
+use crate::ui::kit::{self, Metrics, Palette, TypeScale};
 
 use super::{elapsed_label, QueryPane};
 
@@ -86,7 +86,7 @@ impl LogPanel<'_> {
                     .test_support()
                     .px(px(12.))
                     .py(px(8.))
-                    .text_size(px(12.))
+                    .text_size(px(TypeScale::SM))
                     .text_color(p.text_muted)
                     .child(SharedString::from(i18n::text(locale, "query.log.empty"))),
             );
@@ -128,9 +128,9 @@ impl LogPanel<'_> {
                     .gap(px(8.))
                     .border_b_1()
                     .border_color(p.line)
-                    .text_size(px(12.))
+                    .text_size(px(TypeScale::SM))
                     .when(clickable, |this| {
-                        this.cursor_pointer().hover(|style| style.bg(p.hover)).on_click(move |_, _, cx| {
+                        kit::interactive(this, p, false).on_click(move |_, _, cx| {
                             let command = command.clone();
                             open.update(cx, |pane, cx| pane.command(&command, cx));
                         })

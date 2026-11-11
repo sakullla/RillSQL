@@ -3,15 +3,14 @@
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _};
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     canvas, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, PathBuilder, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
     TestSupportExt as _, Window, div, px,
 };
 
-use crate::ui::kit::{self, Palette};
+use crate::ui::kit::{self, Palette, Radius, Tip as _, TypeScale};
 
 use crate::application::tasks::{TaskOutcome, TaskToken};
 use crate::application::AppServices;
@@ -506,15 +505,17 @@ impl Render for DiagramPane {
             .gap(px(12.))
             .border_b_1()
             .border_color(p.line)
-            .child(div().size(px(30.)).rounded(px(8.)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(IconName::Workflow, 16., p.accent_text)))
+            .child(div().size(px(30.)).rounded(px(Radius::PANEL)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(IconName::Workflow, 16., p.accent_text)))
             .child(
+                // 只读说明放进标题的悬停提示，不常驻占一行。
                 div()
+                    .id("diagram-title")
                     .flex_1()
                     .min_w(px(0.))
                     .flex()
                     .flex_col()
-                    .child(kit::title(SharedString::from(if self.label.is_empty() { i18n::text(locale, "catalog.tree.diagram") } else { self.label.clone() }), 15., &p))
-                    .child(kit::muted(t("diagram.readonly"), &p)),
+                    .tooltip_text(t("diagram.readonly"))
+                    .child(kit::title(SharedString::from(if self.label.is_empty() { i18n::text(locale, "catalog.tree.diagram") } else { self.label.clone() }), TypeScale::LG, &p)),
             )
             .when_some(diagram.as_ref(), |this, diagram| {
                 this.child(kit::pill(SharedString::from(format!("{} · {}", diagram.tables.len(), diagram.edges.len())), p.text_muted, p.hover))
@@ -523,7 +524,7 @@ impl Render for DiagramPane {
 
         let mut body = div().id("diagram-scroll").flex_1().min_h(px(0.)).overflow_scroll().bg(p.chrome);
         if self.loading {
-            body = body.child(div().size_full().flex().items_center().justify_center().gap(px(8.)).text_color(p.text_muted).child(Spinner::new().small()).child(t("diagram.loading")));
+            body = body.child(kit::loading_state(t("diagram.loading"), &p).size_full());
         } else if !self.error.is_empty() {
             let retry = {
                 let entity = entity.clone();
@@ -539,7 +540,7 @@ impl Render for DiagramPane {
                     .items_center()
                     .justify_center()
                     .gap(px(10.))
-                    .child(kit::empty_state(IconName::CircleAlert, t("diagram.failed"), SharedString::from(self.error.clone()), &p))
+                    .child(kit::error_state(t("diagram.failed"), SharedString::from(self.error.clone()), &p))
                     .when(!self.connection_id.is_empty(), |this| this.child(retry)),
             );
         } else if let Some(diagram) = diagram.as_ref() {
@@ -632,16 +633,16 @@ impl Render for DiagramPane {
                                     .flex()
                                     .items_center()
                                     .gap(px(6.))
-                                    .text_size(px(12.))
+                                    .text_size(px(TypeScale::SM))
                                     .child(kit::icon(if fk { IconName::Link } else { IconName::Dot }, 11., if fk { p.accent } else { p.text_faint }))
                                     .child(div().truncate().font_family(mono.clone()).when(fk, |this| this.text_color(p.accent_text)).child(SharedString::from(column_name.clone()))),
                             );
                         }
                         if table.columns.is_empty() {
-                            rows = rows.child(div().h(px(ROW_H)).px(px(12.)).text_size(px(12.)).text_color(p.text_faint).child("—"));
+                            rows = rows.child(div().h(px(ROW_H)).px(px(12.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child("—"));
                         }
                         for note in &table.outside {
-                            rows = rows.child(div().h(px(ROW_H)).px(px(12.)).flex().items_center().gap(px(6.)).text_size(px(11.5)).text_color(p.warn).child(kit::icon(IconName::ExternalLink, 11., p.warn)).child(div().truncate().child(SharedString::from(note.clone()))));
+                            rows = rows.child(div().h(px(ROW_H)).px(px(12.)).flex().items_center().gap(px(6.)).text_size(px(TypeScale::XS)).text_color(p.warn).child(kit::icon(IconName::ExternalLink, 11., p.warn)).child(div().truncate().child(SharedString::from(note.clone()))));
                         }
                         canvas_box = canvas_box.child(
                             div()
@@ -654,7 +655,7 @@ impl Render for DiagramPane {
                                 .top(px(y))
                                 .w(px(CARD_W))
                                 .opacity(opacity)
-                                .rounded(px(10.))
+                                .rounded(px(Radius::PANEL))
                                 .border_1()
                                 .border_color(border)
                                 .bg(p.surface)
@@ -697,7 +698,7 @@ impl Render for DiagramPane {
         let mut footer = div().flex_none().flex().flex_col();
         if let Some(diagram) = diagram.as_ref() {
             if !diagram.omitted.is_empty() || diagram.notice.is_some() {
-                let mut notes = div().px(px(20.)).py(px(8.)).flex().flex_col().gap(px(4.)).border_t_1().border_color(p.line).text_size(px(12.)).text_color(p.warn);
+                let mut notes = div().px(px(20.)).py(px(8.)).flex().flex_col().gap(px(4.)).border_t_1().border_color(p.line).text_size(px(TypeScale::SM)).text_color(p.warn);
                 if let Some(notice) = &diagram.notice {
                     notes = notes.child(SharedString::from(notice.clone()));
                 }

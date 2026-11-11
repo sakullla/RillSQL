@@ -292,6 +292,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     Shortcut { id: "commit", group: "table", chord: "Mod+S", label_key: "shell.shortcuts.commit" },
     Shortcut { id: "copy-region", group: "table", chord: "Mod+C", label_key: "shell.shortcuts.copyRegion" },
     Shortcut { id: "copy-sql-value", group: "table", chord: "Mod+Shift+C", label_key: "shell.shortcuts.copySqlValue" },
+    Shortcut { id: "paste-cells", group: "table", chord: "Mod+V", label_key: "shell.shortcuts.pasteCells" },
     Shortcut { id: "grid-undo", group: "table", chord: "Mod+Z", label_key: "shell.shortcuts.undoStage" },
 ];
 
@@ -666,6 +667,7 @@ fn zh(key: &str) -> Option<&'static str> {
         "shell.shortcuts.commit" => "预览并提交变更",
         "shell.shortcuts.copyRegion" => "复制选中区域（TSV）",
         "shell.shortcuts.copySqlValue" => "复制为 SQL 值（区分 NULL）",
+        "shell.shortcuts.pasteCells" => "从焦点格粘贴 TSV（整批暂存，越界或只读整批拒绝）",
         "shell.shortcuts.undo" => "撤销",
         "shell.shortcuts.redo" => "重做",
         "shell.shortcuts.find" => "查找",
@@ -739,6 +741,7 @@ fn en(key: &str) -> Option<&'static str> {
         "shell.shortcuts.commit" => "Preview and commit changes",
         "shell.shortcuts.copyRegion" => "Copy the selection (TSV)",
         "shell.shortcuts.copySqlValue" => "Copy as SQL values (NULL-aware)",
+        "shell.shortcuts.pasteCells" => "Paste TSV from the focused cell (staged as one batch; rejected whole if out of range or read-only)",
         "shell.shortcuts.undo" => "Undo",
         "shell.shortcuts.redo" => "Redo",
         "shell.shortcuts.find" => "Find",
@@ -837,6 +840,41 @@ mod tests {
         }
     }
 
+    /// 快捷键帮助里已有的项含义不变（id、分组、按键、文案键都不动），只新增网格的 Ctrl/⌘+V 粘贴。
+    #[test]
+    fn shortcut_help_keeps_existing_items_and_lists_grid_paste() {
+        let existing = [
+            ("command-palette", "global", "Mod+K"),
+            ("quick-open", "global", "Mod+P"),
+            ("new-query", "global", "Mod+T"),
+            ("close-tab", "global", "Mod+W"),
+            ("toggle-sidebar", "global", "Mod+B"),
+            ("next-tab", "global", "Ctrl+Tab"),
+            ("prev-tab", "global", "Ctrl+Shift+Tab"),
+            ("open-settings", "global", "Mod+,"),
+            ("run-selection", "editor", "Mod+Enter"),
+            ("run-current", "editor", "Mod+Shift+Enter"),
+            ("request-cancel", "editor", "Mod+."),
+            ("format", "editor", "Mod+Shift+F"),
+            ("select-all-cells", "table", "Mod+A"),
+            ("edit-cell", "table", "Enter / F2"),
+            ("mark-delete", "table", "Delete"),
+            ("copy-region", "table", "Mod+C"),
+            ("copy-sql-value", "table", "Mod+Shift+C"),
+            ("grid-undo", "table", "Mod+Z"),
+        ];
+        for (id, group, chord) in existing {
+            let shortcut = Shell::shortcut(id).unwrap_or_else(|| panic!("{id} 仍在快捷键帮助里"));
+            assert_eq!((shortcut.group, shortcut.chord), (group, chord), "{id} 含义不变");
+        }
+        let paste = Shell::shortcut("paste-cells").expect("网格粘贴进入快捷键帮助");
+        assert_eq!((paste.group, paste.chord), ("table", "Mod+V"));
+        assert!(translate(Locale::En, paste.label_key).starts_with("Paste TSV"));
+        assert!(crate::i18n::text(crate::i18n::Locale::ZhCn, paste.label_key).contains("粘贴"));
+        let chords: Vec<_> = SHORTCUTS.iter().filter(|shortcut| shortcut.group == "table").map(|shortcut| shortcut.chord).collect();
+        assert_eq!(chords.iter().filter(|chord| **chord == "Mod+V").count(), 1, "表格组里 Mod+V 只有粘贴一项，不与既有项冲突");
+    }
+
     #[test]
     fn theme_density_focus_and_commands_are_headless() {
         let mut shell = Shell::default();
@@ -846,7 +884,7 @@ mod tests {
         assert_eq!(shell.dispatch("theme-light"), Some(Effect::ApplyTheme));
         assert_eq!(shell.resolved_theme(), ResolvedTheme::Light);
         shell.set_density(Density::Compact);
-        assert_eq!(shell.density.row_height(), 24);
+        assert_eq!(shell.density.row_height(), 26, "紧凑行高按规范 26");
         shell.set_density(Density::Relaxed);
         assert_eq!(shell.density.control_padding(), 12);
         assert_eq!(shell.dispatch("command-palette"), Some(Effect::None));

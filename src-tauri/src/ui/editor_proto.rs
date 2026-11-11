@@ -29,7 +29,7 @@ use crate::i18n::{self, Locale};
 use crate::query::assist::{CompletionScope, EntryInfo};
 use crate::query::complete::{self, Resolved};
 use crate::query::functions;
-use crate::ui::kit::Palette;
+use crate::ui::kit::{Palette, Radius, TypeScale};
 
 /// Ctrl/⌘+点击跳转定义用的自定义 URI 方案：`rillsql-object://<连接>/<库>/<模式>/<对象>?kind=<种类>`。
 pub const OBJECT_SCHEME: &str = "rillsql-object";
@@ -844,12 +844,12 @@ impl SqlEditor {
             .max_w(px(520.))
             .px(px(8.))
             .py(px(4.))
-            .rounded(px(6.))
+            .rounded(px(Radius::PANEL))
             .border_1()
             .border_color(p.line)
             .bg(p.raised)
             .shadow_md()
-            .text_size(px(12.))
+            .text_size(px(TypeScale::SM))
             .text_color(p.text_muted)
             .font_family(cx.theme().mono_font_family.clone())
             .child(div().text_color(p.text).child(SharedString::from(format!("{}(", hint.name))));
@@ -861,7 +861,7 @@ impl SqlEditor {
             row = row.child(
                 div()
                     .id(("sql-signature-param", index))
-                    .when(active, |this| this.text_color(p.accent_text).font_weight(FontWeight::SEMIBOLD).bg(p.accent_soft).rounded(px(4.)))
+                    .when(active, |this| this.text_color(p.accent_text).font_weight(FontWeight::SEMIBOLD).bg(p.accent_soft).rounded(px(Radius::CONTROL)))
                     .child(SharedString::from(param.clone())),
             );
         }

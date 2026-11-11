@@ -3,14 +3,13 @@
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _};
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, relative,
 };
 
-use crate::ui::kit::{self, FieldSpec, Fields, Palette};
+use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, TypeScale};
 
 use crate::application::AppServices;
 use crate::app::views::grid::{operation_banner, GridTarget};
@@ -507,7 +506,7 @@ impl StructurePane {
         let locale = self.session.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         if self.loading {
-            return div().p(px(16.)).flex().items_center().gap(px(8.)).text_color(p.text_muted).child(Spinner::new().small()).child(t("ui.structure.loading")).into_any_element();
+            return kit::loading_state(t("ui.structure.loading"), p).justify_start().into_any_element();
         }
         if !self.load_error.is_empty() {
             return div().p(px(16.)).text_color(p.danger).child(SharedString::from(self.load_error.clone())).into_any_element();
@@ -530,7 +529,7 @@ impl StructurePane {
                         ]
                     })
                     .collect();
-                grid_table(vec![t("structure.field.column"), t("structure.field.type"), t("ui.structure.nullable"), t("ui.structure.default")], vec![2., 1.4, 0.6, 1.4], rows, p)
+                grid_table(vec![t("structure.field.column"), t("structure.field.type"), t("ui.structure.nullable"), t("ui.structure.default")], vec![2., 1.4, 0.6, 1.4], rows, p, kit::Metrics::of(cx))
             }
             Section::Indexes => {
                 let rows = snapshot
@@ -544,7 +543,7 @@ impl StructurePane {
                         ]
                     })
                     .collect();
-                grid_table(vec![t("structure.field.index"), t("structure.section.columns"), t("ui.structure.unique")], vec![2., 2., 0.6], rows, p)
+                grid_table(vec![t("structure.field.index"), t("structure.section.columns"), t("ui.structure.unique")], vec![2., 2., 0.6], rows, p, kit::Metrics::of(cx))
             }
             Section::ForeignKeys => {
                 let rows = snapshot
@@ -559,7 +558,7 @@ impl StructurePane {
                         ]
                     })
                     .collect();
-                grid_table(vec![t("structure.section.foreign"), t("structure.section.columns"), t("ui.structure.references")], vec![1.4, 1.4, 2.], rows, p)
+                grid_table(vec![t("structure.section.foreign"), t("structure.section.columns"), t("ui.structure.references")], vec![1.4, 1.4, 2.], rows, p, kit::Metrics::of(cx))
             }
             Section::View | Section::Danger => div()
                 .id("structure-ddl")
@@ -567,7 +566,7 @@ impl StructurePane {
                 .overflow_y_scroll()
                 .p(px(14.))
                 .font_family(mono)
-                .text_size(px(12.))
+                .text_size(px(TypeScale::SM))
                 .text_color(p.text_muted)
                 .child(SharedString::from(if snapshot.table_sql.is_empty() { i18n::text(locale, "ui.structure.none") } else { snapshot.table_sql.clone() }))
                 .into_any_element(),
@@ -575,22 +574,22 @@ impl StructurePane {
     }
 }
 
-fn grid_table(headers: Vec<SharedString>, weights: Vec<f32>, rows: Vec<Vec<AnyElement>>, p: &Palette) -> AnyElement {
-    let mut head = div().flex().px(px(14.)).h(px(32.)).items_center().bg(p.chrome).border_b_1().border_color(p.line).text_size(px(11.5)).text_color(p.text_faint);
+fn grid_table(headers: Vec<SharedString>, weights: Vec<f32>, rows: Vec<Vec<AnyElement>>, p: &Palette, m: kit::Metrics) -> AnyElement {
+    let mut head = div().flex().px(px(14.)).h(px(m.bar_h() - 2.)).items_center().bg(p.chrome).border_b_1().border_color(p.line).text_size(px(TypeScale::XS)).text_color(p.text_faint);
     for (header, weight) in headers.into_iter().zip(weights.iter()) {
         head = head.child(div().flex_grow(*weight).flex_shrink(1.).flex_basis(px(0.)).min_w(px(0.)).child(header));
     }
     let mut body = div().flex().flex_col();
     let empty = rows.is_empty();
     for row in rows {
-        let mut line = div().flex().px(px(14.)).min_h(px(34.)).items_center().border_b_1().border_color(p.line_soft).hover(|style| style.bg(p.hover));
+        let mut line = div().flex().px(px(14.)).min_h(px(m.row_h + 2.)).items_center().border_b_1().border_color(p.line_soft).hover(|style| style.bg(p.hover));
         for (cell, weight) in row.into_iter().zip(weights.iter()) {
             line = line.child(div().flex_grow(*weight).flex_shrink(1.).flex_basis(px(0.)).min_w(px(0.)).pr(px(8.)).child(cell));
         }
         body = body.child(line);
     }
     if empty {
-        body = body.child(div().px(px(14.)).py(px(12.)).text_size(px(12.)).text_color(p.text_faint).child("—"));
+        body = body.child(div().px(px(14.)).py(px(12.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child("—"));
     }
     div().flex().flex_col().child(head).child(body).into_any_element()
 }
@@ -607,7 +606,7 @@ fn cell_main(text: String, icon: Option<IconName>, p: &Palette) -> AnyElement {
 }
 
 fn cell_mono(text: String, mono: &SharedString, p: &Palette) -> AnyElement {
-    div().truncate().font_family(mono.clone()).text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(text)).into_any_element()
+    div().truncate().font_family(mono.clone()).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(text)).into_any_element()
 }
 
 fn cell_text(text: String, p: &Palette) -> AnyElement {
@@ -689,11 +688,11 @@ impl Render for StructurePane {
                         .flex()
                         .gap(px(10.))
                         .p(px(12.))
-                        .rounded(px(8.))
+                        .rounded(px(Radius::PANEL))
                         .bg(p.danger_soft)
                         .text_color(p.danger)
                         .child(kit::icon(IconName::TriangleAlert, 16., p.danger))
-                        .child(div().flex().flex_col().gap(px(2.)).child(div().font_weight(FontWeight::SEMIBOLD).child(t("ui.structure.dropTitle"))).child(div().text_size(px(12.)).child(t("ui.structure.dropDetail")))),
+                        .child(div().flex().flex_col().gap(px(2.)).child(div().font_weight(FontWeight::SEMIBOLD).child(t("ui.structure.dropTitle"))).child(div().text_size(px(TypeScale::SM)).child(t("ui.structure.dropDetail")))),
                 );
             }
         }
@@ -733,8 +732,8 @@ impl Render for StructurePane {
                             .min_w(px(160.))
                             .flex()
                             .flex_col()
-                            .child(kit::title(title, 16., &p))
-                            .child(div().id("structure-banner").text_size(px(12.)).text_color(p.text_muted).truncate().child(SharedString::from(self.session.banner()))),
+                            .child(kit::title(title, TypeScale::LG, &p))
+                            .child(div().id("structure-banner").text_size(px(TypeScale::SM)).text_color(p.text_muted).truncate().child(SharedString::from(self.session.banner()))),
                     )
                     .child(kit::segmented(items, &p)),
             );
@@ -743,7 +742,7 @@ impl Render for StructurePane {
             .child(div().flex().flex_col().gap(px(8.)).child(kit::eyebrow(t("ui.structure.existing"), &p)).child(kit::card(&p).overflow_hidden().child(self.overview(&p, cx))))
             .child(div().flex().flex_col().gap(px(8.)).child(kit::eyebrow(t(if section == Section::Danger { "structure.section.danger" } else { "ui.structure.add" }), &p)).child(kit::card(&p).p(px(16.)).child(form)));
         if !self.session.note.is_empty() {
-            body = body.child(div().px(px(12.)).py(px(8.)).rounded(px(8.)).bg(p.hover).text_size(px(12.5)).child(SharedString::from(self.session.note.clone())));
+            body = body.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.hover).text_size(px(TypeScale::SM)).child(SharedString::from(self.session.note.clone())));
         }
         column = column.child(body);
         if self.session.preview_open() {
@@ -777,9 +776,9 @@ impl Render for StructurePane {
                         .bg(p.raised)
                         .border_1()
                         .border_color(p.line)
-                        .rounded(px(12.))
+                        .rounded(px(Radius::PANEL))
                         .shadow_lg()
-                        .child(kit::title(t("structure.preview.title"), 15., &p))
+                        .child(kit::title(t("structure.preview.title"), TypeScale::LG, &p))
                         .child(kit::muted(SharedString::from(self.session.banner()), &p))
                         .child(
                             div()
@@ -787,12 +786,12 @@ impl Render for StructurePane {
                                 .max_h(px(280.))
                                 .overflow_y_scroll()
                                 .p(px(12.))
-                                .rounded(px(8.))
+                                .rounded(px(Radius::PANEL))
                                 .bg(p.chrome)
                                 .border_1()
                                 .border_color(p.line)
                                 .font_family(cx.theme().mono_font_family.clone())
-                                .text_size(px(12.5))
+                                .text_size(px(TypeScale::SM))
                                 .child(SharedString::from(self.session.preview_sql().join("\n"))),
                         )
                         .child(kit::muted(SharedString::from(self.session.preview_target()), &p))
@@ -800,13 +799,13 @@ impl Render for StructurePane {
                             let mut risks = div().flex().flex_col().gap(px(4.));
                             for (level, text) in self.session.preview_risks() {
                                 let (fg, bg) = if level == "danger" { (p.danger, p.danger_soft) } else if level == "warn" { (p.warn, p.warn_soft) } else { (p.text_muted, p.hover) };
-                                risks = risks.child(div().px(px(10.)).py(px(6.)).rounded(px(6.)).bg(bg).text_color(fg).text_size(px(12.)).child(SharedString::from(text)));
+                                risks = risks.child(div().px(px(10.)).py(px(6.)).rounded(px(Radius::PANEL)).bg(bg).text_color(fg).text_size(px(TypeScale::SM)).child(SharedString::from(text)));
                             }
                             this.child(risks)
                         })
                         .when(!self.session.preview_rule().is_empty(), |this| this.child(kit::muted(SharedString::from(self.session.preview_rule()), &p)))
                         .when(!blocked.is_empty(), |this| {
-                            this.child(div().px(px(12.)).py(px(8.)).rounded(px(8.)).bg(p.danger_soft).text_color(p.danger).text_size(px(12.5)).child(SharedString::from(blocked.join(" "))))
+                            this.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.danger_soft).text_color(p.danger).text_size(px(TypeScale::SM)).child(SharedString::from(blocked.join(" "))))
                         })
                         .when(!self.session.note.is_empty(), |this| this.child(kit::muted(SharedString::from(self.session.note.clone()), &p)))
                         .child(

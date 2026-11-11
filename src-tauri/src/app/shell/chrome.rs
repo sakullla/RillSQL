@@ -20,7 +20,7 @@ use crate::catalog::hierarchy::{NavKind, NavRow};
 use crate::catalog::model::ObjectKind;
 use crate::connections::model::{CaMode, Engine, SshAuthKind, TlsMode};
 use crate::i18n;
-use crate::ui::kit::{self, FieldSpec, Palette, Tip as _};
+use crate::ui::kit::{self, FieldSpec, Palette, Tip as _, Radius, TypeScale};
 
 use super::model::{DraftField, WorkItemKind, WorkTool};
 use super::view::Workbench;
@@ -95,7 +95,7 @@ impl Workbench {
             .flex_col()
             .bg(p.chrome)
             .text_color(p.text)
-            .text_size(px(13.))
+            .text_size(px(TypeScale::MD))
             .font_family(cx.theme().font_family.clone())
             .on_drop({
                 let entity = entity.clone();
@@ -315,29 +315,27 @@ impl Workbench {
                     .items_center()
                     .gap(px(8.))
                     .child(brand_mark(22., &p))
-                    .when(!narrow, |this| this.child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child("RillSQL"))),
+                    .when(!narrow, |this| this.child(div().text_size(px(TypeScale::MD)).font_weight(FontWeight::SEMIBOLD).child("RillSQL"))),
             )
             .child(div().flex_1())
             .child(controls(
-                div()
-                    .id("top-search")
+                kit::interactive_states(div().id("top-search"), &p, false)
                     .test_support()
                     .role(gpui_kit::Role::Button)
                     .aria_label(self.t("shell.palette.title"))
                     .w(px(if narrow { 180. } else { 360. }))
-                    .h(px(30.))
+                    .h(px(m.control_h + 6.))
                     .px(px(10.))
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .rounded(px(8.))
+                    .rounded(px(Radius::CONTROL))
                     .border_1()
                     .border_color(p.line)
                     .bg(p.surface)
-                    .cursor_pointer()
                     .hover(|style| style.border_color(p.line_strong))
                     .child(kit::icon(IconName::Search, 14., p.text_faint))
-                    .child(div().flex_1().truncate().text_size(px(12.5)).text_color(p.text_faint).child(self.t("ui.search.placeholder")))
+                    .child(div().flex_1().truncate().text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t("ui.search.placeholder")))
                     .child(kit::kbd(kit::shortcut("Ctrl+K"), &p))
                     .on_click(act("command-palette", cx))
                     .into_any_element(),
@@ -418,6 +416,7 @@ impl Workbench {
         let mut list = div()
             .id("explorer-list")
             .track_focus(&self.nav_focus)
+            .track_scroll(&self.explorer_scroll)
             .flex()
             .flex_col()
             .flex_1()
@@ -425,7 +424,11 @@ impl Workbench {
             .overflow_y_scroll()
             .px(px(6.))
             .pb(px(8.));
+        // 列表是平铺的：每个 child 一行。数着下标，跳转定义要滚到的那一行才能定位。
+        let mut children = 0usize;
+        let mut reveal_at: Option<usize> = None;
         if rows.is_empty() {
+            children += 1;
             list = list.child(
                 kit::empty_state(IconName::Database, self.t("ui.explorer.empty"), self.t("ui.explorer.emptyHint"), &p)
                     .child(kit::primary_button("explorer-new", Some(IconName::Plus), self.t("common.newConnection"), act("new-connection", cx)))
@@ -436,12 +439,13 @@ impl Workbench {
         if !self.model.catalog_error.is_empty() {
             let error = self.model.catalog_error.clone();
             let full_error = format!("{}: {}", self.model.text("ui.explorer.error"), error);
+            children += 1;
             list = list.child(
                 div()
                     .px(px(8.))
                     .py(px(6.))
                     .mb(px(4.))
-                    .rounded(px(6.))
+                    .rounded(px(Radius::PANEL))
                     .flex()
                     .items_center()
                     .gap(px(6.))
@@ -453,7 +457,7 @@ impl Workbench {
                             .min_w(px(0.))
                             .truncate()
                             .tooltip_text(SharedString::from(full_error.clone()))
-                            .text_size(px(12.))
+                            .text_size(px(TypeScale::SM))
                             .text_color(p.danger)
                             .child(SharedString::from(full_error)),
                     )
@@ -470,10 +474,15 @@ impl Workbench {
             let hits = self.model.nav_rows();
             if hits.is_empty() {
                 if let Some(key) = self.model.nav_empty_key("") {
-                    list = list.child(div().pl(px(30.)).py(px(6.)).text_size(px(12.)).text_color(p.text_faint).child(self.t(key)));
+                    children += 1;
+                    list = list.child(div().pl(px(30.)).py(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t(key)));
                 }
             }
             for row in hits {
+                if self.model.reveal_node.as_deref() == Some(row.id.as_str()) {
+                    reveal_at = Some(children);
+                }
+                children += 1;
                 list = list.child(self.nav_row(&row, true, &p, cx));
             }
         } else {
@@ -483,27 +492,39 @@ impl Workbench {
                 // 展开状态只有一份：树上的连接节点。鼠标、键盘和渲染都读它。
                 let expanded = self.model.nav_connection_expanded(&id) && status == LinkStatus::Connected;
                 let selected = self.model.connections.selected.as_deref() == Some(id.as_str());
+                children += 1;
                 list = list.child(self.connection_row(&row, status, expanded, selected, &p, cx));
                 if !expanded {
                     continue;
                 }
                 // 连接级读取失败就把原因和重试放在这条连接下面，不吞掉。
                 if let Some(error) = self.model.nav.node(&crate::catalog::hierarchy::connection_node_id(&id)).and_then(|node| node.error.clone()) {
+                    children += 1;
                     list = list.child(self.connection_error_row(&id, &error, &p, cx));
                 }
                 let nav_rows = self.model.nav_rows_for(&id);
                 if nav_rows.is_empty() {
                     if let Some(key) = self.model.nav_empty_key(&id) {
                         if key != "ui.explorer.error" {
-                            list = list.child(div().pl(px(42.)).py(px(4.)).text_size(px(12.)).text_color(p.text_faint).child(self.t(key)));
+                            children += 1;
+                            list = list.child(div().pl(px(42.)).py(px(4.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t(key)));
                         }
                     }
                     continue;
                 }
                 for nav_row in nav_rows {
+                    if self.model.reveal_node.as_deref() == Some(nav_row.id.as_str()) {
+                        reveal_at = Some(children);
+                    }
+                    children += 1;
                     list = list.child(self.nav_row(&nav_row, false, &p, cx));
                 }
             }
+        }
+        // 跳转定义选中的行：滚进可见区（下一次布局生效），只滚一次。
+        if let Some(index) = reveal_at {
+            self.explorer_scroll.scroll_to_item(index);
+            self.model.reveal_node = None;
         }
         div()
             .id("sidebar")
@@ -561,8 +582,7 @@ impl Workbench {
         let click_id = id.clone();
         let menu_id = id.clone();
         let chevron_id = id.clone();
-        div()
-            .id(SharedString::from(format!("side-{id}")))
+        kit::row_states(div().id(SharedString::from(format!("side-{id}"))), p)
             .test_support()
             .role(gpui_kit::Role::TreeItem)
             .aria_label(name.clone())
@@ -576,8 +596,7 @@ impl Workbench {
             .flex()
             .items_center()
             .gap(px(6.))
-            .rounded(px(6.))
-            .cursor_pointer()
+            .rounded(px(Radius::CONTROL))
             .when(selected, |this| this.bg(p.active))
             .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
             .child(
@@ -645,7 +664,7 @@ impl Workbench {
                     .flex_1()
                     .min_w(px(0.))
                     .truncate()
-                    .text_size(px(11.))
+                    .text_size(px(TypeScale::XS))
                     .text_color(p.danger)
                     .child(SharedString::from(full)),
             )
@@ -724,15 +743,14 @@ impl Workbench {
         let is_group = matches!(row.kind, NavKind::Group | NavKind::ColumnGroup | NavKind::IndexGroup);
         let body = match row.highlight {
             Some((start, end)) if end > start && end <= label.len() => highlight_label(&label, start, end, p),
-            _ => div().flex_1().min_w(px(0.)).truncate().text_size(px(12.5)).child(label.clone()).into_any_element(),
+            _ => div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).child(label.clone()).into_any_element(),
         };
         let click_id = id.clone();
         let menu_id = id.clone();
         let focus_id = id.clone();
         let toggle_id = id.clone();
         let has_error = row.error.is_some();
-        div()
-            .id(SharedString::from(format!("nav-{id}")))
+        kit::row_states(div().id(SharedString::from(format!("nav-{id}"))), p)
             .test_support()
             .role(gpui_kit::Role::TreeItem)
             .aria_label(label.clone())
@@ -745,8 +763,7 @@ impl Workbench {
             .flex()
             .items_center()
             .gap(px(5.))
-            .rounded(px(6.))
-            .cursor_pointer()
+            .rounded(px(Radius::CONTROL))
             .when(row.focused, |this| this.bg(p.selection))
             .when(!row.focused, |this| this.hover(|style| style.bg(p.hover)))
             .child(
@@ -772,10 +789,10 @@ impl Workbench {
             .child(kit::icon(icon, 13., nav_tint(row.kind, p)))
             .child(body)
             .when(is_group && row.total > 0, |this| {
-                this.child(div().text_size(px(11.)).text_color(p.text_faint).child(SharedString::from(row.total.to_string())))
+                this.child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(row.total.to_string())))
             })
             .when(row.stale, |this| {
-                this.child(div().text_size(px(11.)).text_color(p.warn).child(self.t("catalog.tree.stale")))
+                this.child(div().text_size(px(TypeScale::XS)).text_color(p.warn).child(self.t("catalog.tree.stale")))
             })
             .when(row.loading, |this| this.child(Spinner::new().xsmall().color(p.text_muted)))
             .when_some(row.error.clone(), |this, error| {
@@ -786,7 +803,7 @@ impl Workbench {
                         .tooltip_text(SharedString::from(full.clone()))
                         .truncate()
                         .max_w(px(120.))
-                        .text_size(px(11.))
+                        .text_size(px(TypeScale::XS))
                         .text_color(p.danger)
                         .child(SharedString::from(full)),
                 )
@@ -1044,7 +1061,7 @@ impl Workbench {
             .bg(p.chrome)
             .border_t_1()
             .border_color(p.line)
-            .text_size(px(11.5))
+            .text_size(px(TypeScale::XS))
             .text_color(p.text_muted)
             .child(target)
             .child(div().flex_1().min_w(px(0.)).truncate().child(SharedString::from(notice)))
@@ -1052,12 +1069,10 @@ impl Workbench {
                 this.child(div().flex().items_center().gap(px(6.)).child(Spinner::new().xsmall().color(p.accent)).child(self.t("query.status.running")))
             })
             .child(
-                div()
-                    .id("status-locale")
+                kit::interactive_states(div().id("status-locale"), &p, false)
                     .test_support()
                     .px(px(6.))
-                    .rounded(px(4.))
-                    .cursor_pointer()
+                    .rounded(px(Radius::CONTROL))
                     .hover(|style| style.bg(p.hover).text_color(p.text))
                     .child(locale_label)
                     .on_click(act(locale_next, cx)),
@@ -1093,7 +1108,7 @@ impl Workbench {
                             .flex()
                             .flex_col()
                             .child(div().truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(row.saved.name.clone())))
-                            .child(div().truncate().text_size(px(11.5)).text_color(p.text_faint).child(SharedString::from(detail))),
+                            .child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(detail))),
                     )
                     .child(kit::env_tag(&row.saved.env, self.t(&format!("ui.conn.env.{}", row.saved.env)), &p))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -1103,7 +1118,7 @@ impl Workbench {
             );
         }
         if rows.is_empty() {
-            connections = connections.child(div().py(px(8.)).text_size(px(12.)).text_color(p.text_faint).child(self.t("ui.explorer.emptyHint")));
+            connections = connections.child(div().py(px(8.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t("ui.explorer.emptyHint")));
         }
 
         let mut recent = div().flex().flex_col().gap(px(2.));
@@ -1113,7 +1128,7 @@ impl Workbench {
             recent = recent.child(
                 list_row(SharedString::from(format!("welcome-run-{id}")), &p, m.row_pad_y)
                     .child(kit::icon(IconName::Clock, 14., p.text_faint))
-                    .child(div().flex_1().min_w(px(0.)).truncate().font_family(cx.theme().mono_font_family.clone()).text_size(px(12.)).child(SharedString::from(one_line(&entry.sql))))
+                    .child(div().flex_1().min_w(px(0.)).truncate().font_family(cx.theme().mono_font_family.clone()).text_size(px(TypeScale::SM)).child(SharedString::from(one_line(&entry.sql))))
                     .child(
                         div()
                             .id(SharedString::from(format!("welcome-run-client-{id}")))
@@ -1121,7 +1136,7 @@ impl Workbench {
                             .max_w(px(160.))
                             .truncate()
                             .tooltip_text(SharedString::from(entry.connection_name.clone()))
-                            .text_size(px(11.))
+                            .text_size(px(TypeScale::XS))
                             .text_color(p.text_faint)
                             .child(SharedString::from(entry.connection_name.clone())),
                     )
@@ -1150,7 +1165,7 @@ impl Workbench {
             );
         }
         if runs.is_empty() && saved.is_empty() {
-            recent = recent.child(div().py(px(8.)).text_size(px(12.)).text_color(p.text_faint).child(self.t("ui.welcome.noRecent")));
+            recent = recent.child(div().py(px(8.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t("ui.welcome.noRecent")));
         }
 
         let two_col = self.model.viewport_width > 980;
@@ -1180,8 +1195,7 @@ impl Workbench {
                                     .flex()
                                     .flex_col()
                                     .gap(px(2.))
-                                    .child(kit::title("RillSQL", 22., &p))
-                                    .child(kit::muted(self.t("ui.welcome.subtitle"), &p)),
+                                    .child(kit::title("RillSQL", TypeScale::XL, &p)),
                             ),
                     )
                     .child(div().flex().flex_col().gap(px(10.)).child(kit::eyebrow(self.t("ui.welcome.start"), &p)).child(actions))
@@ -1216,7 +1230,7 @@ impl Workbench {
                                     .child(recent),
                             ),
                     )
-                    .child(div().text_size(px(11.5)).text_color(p.text_faint).child(self.t("shell.welcome.factEngines"))),
+                    .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(self.t("shell.welcome.factEngines"))),
             )
             .into_any_element()
     }
@@ -1244,8 +1258,7 @@ impl Workbench {
             let menu = select.clone();
             let label = format!("{} {}", row.saved.name, row.saved.engine.as_str());
             list = list.child(
-                div()
-                    .id(SharedString::from(format!("conn-row-{id}")))
+                kit::row_states(div().id(SharedString::from(format!("conn-row-{id}"))), &p)
                     .test_support()
                     .role(gpui_kit::Role::ListItem)
                     .aria_label(SharedString::from(label))
@@ -1255,8 +1268,7 @@ impl Workbench {
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .rounded(px(8.))
-                    .cursor_pointer()
+                    .rounded(px(Radius::CONTROL))
                     .when(selected, |this| this.bg(p.active))
                     .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
                     .child(kit::engine_badge(row.saved.engine.as_str(), 26.))
@@ -1268,7 +1280,7 @@ impl Workbench {
                             .flex_col()
                             .gap(px(1.))
                             .child(div().truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(row.saved.name.clone())))
-                            .child(div().truncate().text_size(px(11.5)).text_color(p.text_faint).child(SharedString::from(connection_detail(row)))),
+                            .child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(connection_detail(row)))),
                     )
                     .child(div().flex().flex_col().items_end().gap(px(4.)).child(kit::env_tag(&row.saved.env, self.t(&format!("ui.conn.env.{}", row.saved.env)), &p)).child(kit::status_dot(dot)))
                     .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -1295,7 +1307,7 @@ impl Workbench {
                     .flex_col()
                     .items_start()
                     .gap(px(10.))
-                    .child(div().text_size(px(12.)).text_color(p.text_faint).child(self.t("ui.explorer.empty")))
+                    .child(div().text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t("ui.explorer.empty")))
                     .child(kit::tool_button("conn-empty-new", Some(IconName::Plus), self.t("common.newConnection"), act("new-connection", cx))),
             );
         }
@@ -1325,7 +1337,7 @@ impl Workbench {
                     .flex()
                     .flex_col()
                     .gap(px(10.))
-                    .child(div().flex().items_center().justify_between().child(kit::title(self.t("connections.page.title"), 15., &p)).child(new_button))
+                    .child(div().flex().items_center().justify_between().child(kit::title(self.t("connections.page.title"), TypeScale::LG, &p)).child(new_button))
                     .child(filter.prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)),
             )
             .child(list)
@@ -1387,23 +1399,21 @@ impl Workbench {
             let selected = candidate == engine;
             let name = candidate.as_str();
             engine_row = engine_row.child(
-                div()
-                    .id(SharedString::from(format!("conn-engine-{name}")))
+                kit::interactive_states(div().id(SharedString::from(format!("conn-engine-{name}"))), &p, false)
                     .role(gpui_kit::Role::Button)
                     .aria_label(SharedString::from(kit::engine_label(name)))
                     .aria_selected(selected)
-                    .h(px(30.))
+                    .h(px(m.control_h + 6.))
                     .px(px(8.))
                     .flex()
                     .items_center()
                     .gap(px(6.))
-                    .rounded(px(7.))
+                    .rounded(px(Radius::CONTROL))
                     .border_1()
-                    .cursor_pointer()
                     .when(selected, |this| this.border_color(p.accent).bg(p.accent_soft).text_color(p.accent_text))
                     .when(!selected, |this| this.border_color(p.line).hover(|style| style.border_color(p.line_strong)))
                     .child(kit::engine_badge(name, 16.))
-                    .child(div().text_size(px(12.)).child(kit::engine_label(name)))
+                    .child(div().text_size(px(TypeScale::SM)).child(kit::engine_label(name)))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         if let Some(editor) = this.model.connections.editor.as_mut() {
                             if editor.engine != candidate {
@@ -1548,17 +1558,16 @@ impl Workbench {
             }
             let ssh_on = draft.ssh_on;
             security = security.child(
-                div()
-                    .id("conn-ssh-toggle")
+                kit::interactive_states(div().id("conn-ssh-toggle"), &p, false)
                     .role(gpui_kit::Role::Switch)
                     .aria_label(self.t("connections.editor.ssh.title"))
                     .aria_selected(ssh_on)
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .cursor_pointer()
                     .child(switch_visual(ssh_on, &p))
-                    .child(div().flex().flex_col().child(div().font_weight(FontWeight::MEDIUM).child(self.t("connections.editor.ssh.title"))).child(kit::muted(self.t("ui.conn.sshHint"), &p)))
+                    .tooltip_text(self.t("ui.conn.sshHint"))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(self.t("connections.editor.ssh.title")))
                     .on_click(act("conn-ssh-toggle", cx)),
             );
             if ssh_on {
@@ -1697,7 +1706,7 @@ impl Workbench {
                                             .flex()
                                             .flex_col()
                                             .min_w(px(0.))
-                                            .child(div().id("conn-form-title").truncate().tooltip_text(heading.clone()).text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(heading))
+                                            .child(div().id("conn-form-title").truncate().tooltip_text(heading.clone()).text_size(px(TypeScale::LG)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(heading))
                                             .child(kit::muted(SharedString::from(kit::engine_label(engine.as_str())), &p)),
                                     ),
                             )
@@ -1834,7 +1843,7 @@ impl Workbench {
                     .role(gpui_kit::Role::Status)
                     .px(px(12.))
                     .py(px(10.))
-                    .rounded(px(8.))
+                    .rounded(px(Radius::PANEL))
                     .border_1()
                     .border_color(p.danger)
                     .bg(p.danger_soft)
@@ -1849,7 +1858,7 @@ impl Workbench {
                             .child(kit::icon(IconName::CircleAlert, 14., p.danger))
                             .child(div().font_weight(FontWeight::MEDIUM).text_color(p.danger).child(self.t(key))),
                     )
-                    .when(!detail.is_empty(), |this| this.child(div().text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(detail)))),
+                    .when(!detail.is_empty(), |this| this.child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(detail)))),
             );
         }
         if section == HistorySection::Runs {
@@ -1879,8 +1888,7 @@ impl Workbench {
                 let load = id.clone();
                 let delete = id.clone();
                 list = list.child(
-                    div()
-                        .id(SharedString::from(format!("run-{id}")))
+                    kit::row_states(div().id(SharedString::from(format!("run-{id}"))), &p)
                         .group("run-row")
                         .role(gpui_kit::Role::ListItem)
                         .aria_label(SharedString::from(entry.sql.clone()))
@@ -1890,16 +1898,15 @@ impl Workbench {
                         .flex()
                         .flex_col()
                         .gap(px(8.))
-                        .rounded(px(10.))
+                        .rounded(px(Radius::PANEL))
                         .border_1()
-                        .cursor_pointer()
                         .when(selected, |this| this.border_color(p.accent).bg(p.accent_soft))
                         .when(!selected, |this| this.border_color(p.line).hover(|style| style.border_color(p.line_strong)))
                         .child(
                             div()
                                 .min_w(px(0.))
                                 .font_family(mono.clone())
-                                .text_size(px(12.5))
+                                .text_size(px(TypeScale::SM))
                                 .text_color(p.text)
                                 .when(!selected, |this| this.max_h(px(40.)).truncate())
                                 .when(selected, |this| this.max_h(px(120.)).overflow_hidden())
@@ -1910,7 +1917,7 @@ impl Workbench {
                                 .flex()
                                 .items_center()
                                 .gap(px(10.))
-                                .text_size(px(11.5))
+                                .text_size(px(TypeScale::XS))
                                 .text_color(p.text_faint)
                                 .child(kit::status_dot(if ok { p.ok } else { p.danger }))
                                 .child(kit::engine_badge(&entry.engine, 14.))
@@ -1986,8 +1993,7 @@ impl Workbench {
                 let rename = id.clone();
                 let delete = id.clone();
                 list = list.child(
-                    div()
-                        .id(SharedString::from(format!("saved-{id}")))
+                    kit::row_states(div().id(SharedString::from(format!("saved-{id}"))), &p)
                         .group("saved-row")
                         .role(gpui_kit::Role::ListItem)
                         .aria_label(SharedString::from(item.name.clone()))
@@ -1997,9 +2003,8 @@ impl Workbench {
                         .flex()
                         .flex_col()
                         .gap(px(6.))
-                        .rounded(px(10.))
+                        .rounded(px(Radius::PANEL))
                         .border_1()
-                        .cursor_pointer()
                         .when(selected, |this| this.border_color(p.accent).bg(p.accent_soft))
                         .when(!selected, |this| this.border_color(p.line).hover(|style| style.border_color(p.line_strong)))
                         .child(
@@ -2016,7 +2021,7 @@ impl Workbench {
                                         .max_w(px(180.))
                                         .truncate()
                                         .tooltip_text(SharedString::from(item.connection_name.clone()))
-                                        .text_size(px(11.5))
+                                        .text_size(px(TypeScale::XS))
                                         .text_color(p.text_faint)
                                         .child(SharedString::from(item.connection_name.clone())),
                                 )
@@ -2047,7 +2052,7 @@ impl Workbench {
                                         })).xsmall()),
                                 ),
                         )
-                        .child(div().min_w(px(0.)).font_family(mono.clone()).text_size(px(12.)).text_color(p.text_muted).max_h(px(36.)).truncate().child(SharedString::from(clip(&item.sql, 200))))
+                        .child(div().min_w(px(0.)).font_family(mono.clone()).text_size(px(TypeScale::SM)).text_color(p.text_muted).max_h(px(36.)).truncate().child(SharedString::from(clip(&item.sql, 200))))
                         .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                             this.model.history.section = HistorySection::Saved;
                             this.model.history.selected_saved = Some(select.clone());
@@ -2145,7 +2150,7 @@ impl Workbench {
                     .flex()
                     .flex_col()
                     .gap(px(14.))
-                    .child(div().flex().flex_col().gap(px(2.)).child(kit::title(self.t("history.page.titleRuns"), 17., &p)).child(kit::muted(self.t("history.page.loadOnlySql"), &p)))
+                    .child(kit::title(self.t("history.page.titleRuns"), TypeScale::LG, &p))
                     .child(toolbar),
             )
             .child(rename_bar)
@@ -2195,7 +2200,7 @@ impl Workbench {
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .child(kit::title(self.t("history.page.sqlPreview"), 13., p))
+                    .child(kit::title(self.t("history.page.sqlPreview"), TypeScale::MD, p))
                     .child(div().flex_1())
                     .child(kit::icon_button("history-preview-close", IconName::X, self.t("history.page.previewClose"), act("history-preview-close", cx))),
             )
@@ -2205,7 +2210,7 @@ impl Workbench {
                     .items_center()
                     .gap(px(6.))
                     .child(kit::engine_badge(&plan.engine, 14.))
-                    .child(div().text_size(px(11.5)).text_color(if plan.needs_target { p.warn } else { p.text_muted }).child(SharedString::from(target))),
+                    .child(div().text_size(px(TypeScale::XS)).text_color(if plan.needs_target { p.warn } else { p.text_muted }).child(SharedString::from(target))),
             )
             .when_some(status_label, |this, (label, ok)| {
                 this.child(
@@ -2213,7 +2218,7 @@ impl Workbench {
                         .flex()
                         .items_center()
                         .gap(px(6.))
-                        .text_size(px(11.5))
+                        .text_size(px(TypeScale::XS))
                         .text_color(if ok { p.ok } else { p.danger })
                         .child(kit::status_dot(if ok { p.ok } else { p.danger }))
                         .child(label),
@@ -2225,15 +2230,14 @@ impl Workbench {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
-                    .rounded(px(8.))
+                    .rounded(px(Radius::PANEL))
                     .bg(p.chrome)
                     .p(px(12.))
                     .font_family(mono)
-                    .text_size(px(12.5))
+                    .text_size(px(TypeScale::SM))
                     .text_color(p.text)
                     .child(SharedString::from(plan.sql)),
             )
-            .child(div().text_size(px(11.5)).text_color(p.text_faint).child(self.t("history.page.loadOnlySql")))
             .into_any_element()
     }
 
@@ -2314,12 +2318,10 @@ impl Workbench {
         let page_size = stepper(self, "page-size", s.page_size.to_string(), cx);
         let preview = stepper(self, "preview", format!("{} KB", s.preview_kb), cx);
         let object_page = stepper(self, "object-page", s.object_page.to_string(), cx);
-        let updates = div()
-            .id("toggle-updates")
+        let updates = kit::interactive_states(div().id("toggle-updates"), &p, false)
             .role(gpui_kit::Role::Switch)
             .aria_label(self.t("shell.update.autoCheck"))
             .aria_selected(s.auto_check_updates)
-            .cursor_pointer()
             .child(switch_visual(s.auto_check_updates, &p))
             .on_click(act("toggle-updates", cx));
 
@@ -2344,7 +2346,7 @@ impl Workbench {
                                 .flex_col()
                                 .gap(px(2.))
                                 .child(div().font_weight(FontWeight::MEDIUM).child(label))
-                                .when_some(hint, |this, hint| this.child(div().text_size(px(12.)).text_color(p.text_faint).child(hint))),
+                                .when_some(hint, |this, hint| this.child(div().text_size(px(TypeScale::SM)).text_color(p.text_faint).child(hint))),
                         )
                         .child(control),
                 );
@@ -2369,7 +2371,7 @@ impl Workbench {
                     .flex()
                     .flex_col()
                     .gap(px(m.page_pad - 4.))
-                    .child(kit::title(self.t("shell.settings.title"), 20., &p))
+                    .child(kit::title(self.t("shell.settings.title"), TypeScale::LG, &p))
                     .child(group(
                         self.t("ui.settings.appearance"),
                         vec![
@@ -2399,7 +2401,7 @@ impl Workbench {
                         &p,
                     ))
                     .child(group(self.t("ui.settings.general"), vec![(self.t("shell.update.autoCheck"), None, updates.into_any_element())], &p))
-                    .child(div().text_size(px(11.5)).text_color(p.text_faint).child(SharedString::from(format!("RillSQL {}", env!("CARGO_PKG_VERSION"))))),
+                    .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(format!("RillSQL {}", env!("CARGO_PKG_VERSION"))))),
             )
             .into_any_element()
     }
@@ -2426,7 +2428,7 @@ impl Workbench {
             .bg(p.raised)
             .border_1()
             .border_color(p.line)
-            .rounded(px(12.))
+            .rounded(px(Radius::PANEL))
             .shadow_lg()
             .overflow_hidden()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
@@ -2453,13 +2455,13 @@ impl Workbench {
                 .child(
                     div()
                         .px(px(16.))
-                        .h(px(48.))
+                        .h(px(m.topbar_h + 4.))
                         .flex()
                         .items_center()
                         .justify_between()
                         .border_b_1()
                         .border_color(p.line)
-                        .child(kit::title(self.t("shell.command.help"), 14., &p))
+                        .child(kit::title(self.t("shell.command.help"), TypeScale::LG, &p))
                         .child(kit::icon_button("help-close", IconName::X, self.t("common.close"), cx.listener(|this, _: &ClickEvent, window, cx| {
                             this.model.shell.close_overlay();
                             this.restore_focus(window, cx);
@@ -2486,7 +2488,7 @@ impl Workbench {
                     .child(self.t(self.model.palette_empty_key()));
                 if self.model.shell.palette_tables_only && !error.is_empty() {
                     empty = empty
-                        .child(div().id("palette-error").text_size(px(11.5)).truncate().tooltip_text(SharedString::from(error.clone())).child(SharedString::from(error)))
+                        .child(div().id("palette-error").text_size(px(TypeScale::XS)).truncate().tooltip_text(SharedString::from(error.clone())).child(SharedString::from(error)))
                         .child(kit::tool_button(
                             "palette-tree-retry",
                             Some(IconName::RefreshCw),
@@ -2521,8 +2523,7 @@ impl Workbench {
                 };
                 let detail = entry.detail.clone();
                 list = list.child(
-                    div()
-                        .id(SharedString::from(format!("pal-{index}")))
+                    kit::row_states(div().id(SharedString::from(format!("pal-{index}"))), &p)
                         .test_support()
                         .role(gpui_kit::Role::MenuItem)
                         .aria_label(SharedString::from(entry.label.clone()))
@@ -2532,14 +2533,13 @@ impl Workbench {
                         .flex()
                         .items_center()
                         .gap(px(10.))
-                        .rounded(px(7.))
-                        .cursor_pointer()
+                        .rounded(px(Radius::CONTROL))
                         .when(selected, |this| this.bg(p.accent_soft).text_color(p.accent_text))
                         .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
                         .child(kit::icon(icon, 15., if selected { p.accent_text } else { p.text_muted }))
                         .child(div().flex_1().truncate().child(SharedString::from(entry.label)))
-                        .when(!detail.is_empty(), |this| this.child(div().max_w(px(160.)).truncate().text_size(px(11.)).text_color(p.text_faint).child(SharedString::from(detail))))
-                        .when(!group.is_empty(), |this| this.child(div().text_size(px(11.)).text_color(p.text_faint).child(group)))
+                        .when(!detail.is_empty(), |this| this.child(div().max_w(px(160.)).truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(detail))))
+                        .when(!group.is_empty(), |this| this.child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(group)))
                         .when_some(chord, |this, chord| this.child(kit::kbd(kit::shortcut(&chord.replace("Mod+", "Ctrl+")), &p)))
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             this.model.shell.close_overlay();
@@ -2592,7 +2592,7 @@ impl Workbench {
             .bg(p.raised)
             .border_1()
             .border_color(p.line)
-            .rounded(px(9.))
+            .rounded(px(Radius::PANEL))
             .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
         for (index, item) in menu.items.iter().enumerate() {
@@ -2623,7 +2623,7 @@ impl Workbench {
                     .px(px(10.))
                     .flex()
                     .items_center()
-                    .rounded(px(6.))
+                    .rounded(px(Radius::CONTROL))
                     .text_color(fg)
                     .when(enabled, |this| this.cursor_pointer())
                     .when(enabled && selected, |this| this.bg(p.hover))
@@ -2744,7 +2744,7 @@ impl Workbench {
                 .id("ddl-viewer-text")
                 .test_support()
                 .h(px(320.))
-                .rounded(px(6.))
+                .rounded(px(Radius::PANEL))
                 .border_1()
                 .border_color(p.line)
                 .bg(p.surface)
@@ -2780,7 +2780,7 @@ impl Workbench {
             .bg(p.raised)
             .border_1()
             .border_color(p.line)
-            .rounded(px(12.))
+            .rounded(px(Radius::PANEL))
             .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
@@ -2789,7 +2789,7 @@ impl Workbench {
                     .items_center()
                     .gap(px(8.))
                     .child(kit::icon(IconName::Code, 16., p.accent))
-                    .child(div().flex_1().min_w(px(0.)).truncate().child(kit::title(title, 15., &p))),
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(kit::title(title, TypeScale::LG, &p))),
             )
             .when_some(rebuilt, |this, rebuilt| this.child(rebuilt))
             .child(body)
@@ -2824,7 +2824,7 @@ impl Workbench {
             .flex()
             .flex_col()
             .gap(px(4.))
-            .text_size(px(12.))
+            .text_size(px(TypeScale::SM))
             .child(
                 div()
                     .flex()
@@ -2868,7 +2868,7 @@ impl Workbench {
                     .child(self.t("catalog.danger.loading")),
             );
         } else if prompt.plan.is_none() && prompt.error.is_none() && prompt.kind == super::danger::DangerKind::Rename {
-            content = content.child(div().text_size(px(12.)).text_color(p.text_muted).child(self.t("catalog.danger.renameHint")));
+            content = content.child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(self.t("catalog.danger.renameHint")));
         }
         if let Some(plan) = prompt.plan.as_ref() {
             if !plan.sql.is_empty() {
@@ -2878,19 +2878,19 @@ impl Workbench {
                         .id("danger-sql")
                         .px(px(10.))
                         .py(px(8.))
-                        .rounded(px(6.))
+                        .rounded(px(Radius::PANEL))
                         .bg(p.surface)
                         .border_1()
                         .border_color(p.line)
                         .font_family(mono)
-                        .text_size(px(12.))
+                        .text_size(px(TypeScale::SM))
                         .child(SharedString::from(plan.sql.join("\n"))),
                 );
             }
             let mut risks = div().flex().flex_col().gap(px(4.));
             for (level, text) in &plan.risks {
                 let (fg, bg) = if level == "danger" { (p.danger, p.danger_soft) } else if level == "warn" { (p.warn, p.warn_soft) } else { (p.text_muted, p.hover) };
-                risks = risks.child(div().px(px(10.)).py(px(6.)).rounded(px(6.)).bg(bg).text_color(fg).text_size(px(12.)).child(SharedString::from(text.clone())));
+                risks = risks.child(div().px(px(10.)).py(px(6.)).rounded(px(Radius::PANEL)).bg(bg).text_color(fg).text_size(px(TypeScale::SM)).child(SharedString::from(text.clone())));
             }
             content = content.child(risks);
             if !plan.blocked.is_empty() {
@@ -2904,7 +2904,7 @@ impl Workbench {
             let hint = i18n::fill(&self.model.text("catalog.danger.prodHint"), &[("name", &prompt.object.name)]);
             let input = self.input_for(DraftField::DangerConfirm, &prompt.object.name, false, window, cx);
             content = content
-                .child(div().text_size(px(12.)).text_color(p.danger).child(SharedString::from(hint)))
+                .child(div().text_size(px(TypeScale::SM)).text_color(p.danger).child(SharedString::from(hint)))
                 .child(input);
         }
         if prompt.running {
@@ -2963,7 +2963,7 @@ impl Workbench {
                     .justify_between()
                     .border_b_1()
                     .border_color(p.line)
-                    .child(div().flex().items_center().gap(px(8.)).child(kit::icon(IconName::ArrowDownUp, 15., p.accent)).child(kit::title(self.t("export.open"), 14., &p)))
+                    .child(div().flex().items_center().gap(px(8.)).child(kit::icon(IconName::ArrowDownUp, 15., p.accent)).child(kit::title(self.t("export.open"), TypeScale::LG, &p)))
                     .child(kit::icon_button("exchange-close", IconName::X, self.t("common.close"), act("open-exchange", cx))),
             )
             .child(div().id("exchange-scroll").flex_1().min_h(px(0.)).overflow_y_scroll().child(self.exchange.clone()));
@@ -2997,9 +2997,9 @@ fn highlight_label(label: &SharedString, start: usize, end: usize, p: &Palette) 
         .flex()
         .items_center()
         .overflow_hidden()
-        .text_size(px(12.5))
+        .text_size(px(TypeScale::SM))
         .child(head)
-        .child(div().bg(p.selection).rounded(px(2.)).font_weight(FontWeight::MEDIUM).child(hit))
+        .child(div().bg(p.selection).rounded(px(Radius::CONTROL)).font_weight(FontWeight::MEDIUM).child(hit))
         .child(tail)
         .into_any_element()
 }
@@ -3066,8 +3066,7 @@ fn rail_entry(id: &'static str, page: AppPage) -> Option<(IconName, &'static str
 
 fn rail_item(id: &'static str, icon: IconName, label: SharedString, active: bool, p: &Palette, cx: &mut Context<Workbench>) -> AnyElement {
     let accent = p.accent;
-    div()
-        .id(SharedString::from(format!("cmd-{id}")))
+    kit::interactive_states(div().id(SharedString::from(format!("cmd-{id}"))), p, false)
         .test_support()
         .role(gpui_kit::Role::Button)
         .aria_label(label.clone())
@@ -3078,8 +3077,7 @@ fn rail_item(id: &'static str, icon: IconName, label: SharedString, active: bool
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(9.))
-        .cursor_pointer()
+        .rounded(px(Radius::CONTROL))
         .when(active, |this| this.bg(p.accent_soft))
         .when(!active, |this| this.hover(|style| style.bg(p.hover)))
         .child(kit::icon(icon, 18., if active { p.accent_text } else { p.text_muted }))
@@ -3110,8 +3108,7 @@ fn tab_chip(
 ) -> impl IntoElement + gpui_kit::ParentElement + gpui_kit::StatefulInteractiveElement {
     let accent = p.accent;
     let full_title = title.clone();
-    div()
-        .id(gpui_kit::ElementId::Name(id.into()))
+    kit::interactive_states(div().id(gpui_kit::ElementId::Name(id.into())), p, false)
         .test_support()
         .role(gpui_kit::Role::Tab)
         .aria_label(title.clone())
@@ -3129,7 +3126,6 @@ fn tab_chip(
         .gap(px(7.))
         .border_r_1()
         .border_color(p.line)
-        .cursor_pointer()
         .when(active, |this| this.bg(p.surface).text_color(p.text))
         .when(!active, |this| this.text_color(p.text_muted).hover(|style| style.bg(p.hover).text_color(p.text)))
         .when(active, |this| this.child(div().absolute().top_0().left_0().right_0().h(px(2.)).bg(accent)))
@@ -3138,22 +3134,20 @@ fn tab_chip(
         } else {
             kit::icon(icon, 13., if active { p.accent } else { p.text_faint }).into_any_element()
         })
-        .child(div().truncate().text_size(px(12.5)).child(title))
+        .child(div().truncate().text_size(px(TypeScale::SM)).child(title))
         .when(dirty, |this| this.child(div().flex_none().size(px(6.)).rounded_full().bg(p.text_faint)))
         .test_support()
 }
 
 fn list_row(id: SharedString, p: &Palette, pad_y: f32) -> gpui_kit::Stateful<gpui_kit::Div> {
-    div()
-        .id(id)
+    kit::interactive_states(div().id(id), p, false)
         .role(gpui_kit::Role::Button)
         .px(px(8.))
         .py(px(pad_y))
         .flex()
         .items_center()
         .gap(px(10.))
-        .rounded(px(7.))
-        .cursor_pointer()
+        .rounded(px(Radius::CONTROL))
         .hover(|style| style.bg(p.hover))
 }
 
@@ -3162,7 +3156,7 @@ fn section_head(title: SharedString, link: Option<(&'static str, SharedString, &
         .flex()
         .items_center()
         .justify_between()
-        .child(kit::title(title, 13., p))
+        .child(kit::title(title, TypeScale::MD, p))
         .when_some(link, |this, (id, label, command)| {
             this.child(Button::new(id).link().small().label(label.clone()).accessibility_label(label).on_click(act(command, cx)))
         })
@@ -3170,8 +3164,7 @@ fn section_head(title: SharedString, link: Option<(&'static str, SharedString, &
 }
 
 fn action_card(id: &'static str, icon: IconName, title: SharedString, detail: SharedString, p: &Palette, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> AnyElement {
-    div()
-        .id(id)
+    kit::interactive_states(div().id(id), p, false)
         .role(gpui_kit::Role::Button)
         .aria_label(title.clone())
         .flex_1()
@@ -3180,13 +3173,12 @@ fn action_card(id: &'static str, icon: IconName, title: SharedString, detail: Sh
         .flex()
         .items_start()
         .gap(px(12.))
-        .rounded(px(10.))
+        .rounded(px(Radius::PANEL))
         .border_1()
         .border_color(p.line)
         .bg(p.surface)
-        .cursor_pointer()
         .hover(|style| style.border_color(p.accent).bg(p.accent_soft))
-        .child(div().flex_none().size(px(34.)).rounded(px(9.)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(icon, 17., p.accent_text)))
+        .child(div().flex_none().size(px(34.)).rounded(px(Radius::PANEL)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(icon, 17., p.accent_text)))
         .child(
             div()
                 .flex()
@@ -3194,7 +3186,7 @@ fn action_card(id: &'static str, icon: IconName, title: SharedString, detail: Sh
                 .gap(px(3.))
                 .min_w(px(0.))
                 .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
-                .child(div().text_size(px(12.)).text_color(p.text_muted).child(detail)),
+                .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(detail)),
         )
         .on_click(on_click)
         .into_any_element()
@@ -3217,10 +3209,10 @@ fn banner(icon: IconName, text: SharedString, fg: gpui_kit::Hsla, bg: gpui_kit::
         .flex()
         .items_start()
         .gap(px(8.))
-        .rounded(px(8.))
+        .rounded(px(Radius::PANEL))
         .bg(bg)
         .text_color(fg)
-        .text_size(px(12.5))
+        .text_size(px(TypeScale::SM))
         .child(kit::icon(icon, 15., fg))
         .child(div().flex_1().min_w(px(0.)).child(text))
         .into_any_element()
@@ -3256,7 +3248,7 @@ fn dialog_card(id: &'static str, icon: IconName, tone: gpui_kit::Hsla, title: Sh
         .bg(p.raised)
         .border_1()
         .border_color(p.line)
-        .rounded(px(12.))
+        .rounded(px(Radius::PANEL))
         .shadow_lg()
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(
@@ -3264,7 +3256,7 @@ fn dialog_card(id: &'static str, icon: IconName, tone: gpui_kit::Hsla, title: Sh
                 .flex()
                 .gap(px(12.))
                 .child(div().flex_none().size(px(34.)).rounded_full().bg(tone.opacity(0.14)).flex().items_center().justify_center().child(kit::icon(icon, 17., tone)))
-                .child(div().flex().flex_col().gap(px(6.)).min_w(px(0.)).child(kit::title(title, 15., p)).child(div().text_size(px(12.5)).text_color(p.text_muted).child(body))),
+                .child(div().flex().flex_col().gap(px(6.)).min_w(px(0.)).child(kit::title(title, TypeScale::LG, p)).child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(body))),
         )
 }
 

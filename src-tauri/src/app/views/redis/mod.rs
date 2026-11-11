@@ -6,7 +6,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
-use crate::ui::kit::{self, FieldSpec, Fields, Palette};
+use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, TypeScale};
 use gpui_kit::{
     ClipboardItem, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
@@ -783,6 +783,7 @@ fn describe_ttl(locale: Locale, ttl_ms: Option<i64>) -> String {
 impl Render for RedisPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
+        let m = kit::Metrics::of(cx);
         let entity = cx.entity();
         let mono = cx.theme().mono_font_family.clone();
         let pattern = self.redis_input(Field::Pattern, "redis-pattern", "redis.tab.patternLabel", "user:*", window, cx);
@@ -793,7 +794,7 @@ impl Render for RedisPane {
         // ---- 左侧：键列表
         let mut list = div().id("redis-keys").flex().flex_col().flex_1().min_h(px(0.)).overflow_y_scroll().p(px(6.));
         if self.keys.is_empty() {
-            list = list.child(div().p(px(14.)).text_size(px(12.5)).text_color(p.text_faint).child(SharedString::from(self.text("redis.tab.emptyList"))));
+            list = list.child(div().p(px(14.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(SharedString::from(self.text("redis.tab.emptyList"))));
         }
         for (index, key) in self.keys.iter().take(500).enumerate() {
             let selected = key.name == self.selected;
@@ -802,23 +803,21 @@ impl Render for RedisPane {
             let (fg, bg) = type_colors(&key.key_type, &p);
             let entity = entity.clone();
             list = list.child(
-                div()
-                    .id(SharedString::from(id.clone()))
+                kit::interactive_states(div().id(SharedString::from(id.clone())), &p, false)
                     .test_support()
                     .role(gpui_kit::Role::Button)
                     .aria_label(SharedString::from(label))
                     .aria_selected(selected)
-                    .h(px(30.))
+                    .h(px(m.tree_row_h + 2.))
                     .px(px(8.))
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .rounded(px(6.))
-                    .cursor_pointer()
+                    .rounded(px(Radius::CONTROL))
                     .when(selected, |this| this.bg(p.selection))
                     .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
                     .child(div().flex_none().w(px(44.)).child(kit::pill(SharedString::from(key.key_type.clone()), fg, bg)))
-                    .child(div().flex_1().min_w(px(0.)).truncate().font_family(mono.clone()).text_size(px(12.5)).child(SharedString::from(key.name.clone())))
+                    .child(div().flex_1().min_w(px(0.)).truncate().font_family(mono.clone()).text_size(px(TypeScale::SM)).child(SharedString::from(key.name.clone())))
                     .when(key.ttl_ms.is_some_and(|ttl| ttl >= 0), |this| this.child(kit::icon(IconName::Timer, 12., p.text_faint)))
                     .on_click(move |_, _, cx| {
                         let id = id.clone();
@@ -869,7 +868,7 @@ impl Render for RedisPane {
                     .py(px(6.))
                     .border_t_1()
                     .border_color(p.line)
-                    .child(div().text_size(px(11.5)).text_color(p.text_faint).child(SharedString::from(if self.done { self.text("redis.tab.scanDone") } else { format!("{} keys", self.keys.len()) })))
+                    .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(if self.done { self.text("redis.tab.scanDone") } else { format!("{} keys", self.keys.len()) })))
                     .child(redis_button("redis-more", Some(IconName::ChevronsDown), &self.text("redis.tab.loadMore"), Kind::Tool, &entity)),
             );
 
@@ -891,8 +890,8 @@ impl Render for RedisPane {
                         .items_center()
                         .gap(px(10.))
                         .child(kit::pill(SharedString::from(type_name.clone()), fg, bg))
-                        .child(div().flex_1().min_w(px(0.)).truncate().font_family(mono.clone()).text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(SharedString::from(self.selected.clone())))
-                        .child(div().flex().items_center().gap(px(4.)).text_size(px(12.)).text_color(p.text_muted).child(kit::icon(IconName::Timer, 13., p.text_faint)).child(SharedString::from(ttl_text)))
+                        .child(div().flex_1().min_w(px(0.)).truncate().font_family(mono.clone()).text_size(px(TypeScale::LG)).font_weight(FontWeight::SEMIBOLD).child(SharedString::from(self.selected.clone())))
+                        .child(div().flex().items_center().gap(px(4.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(kit::icon(IconName::Timer, 13., p.text_faint)).child(SharedString::from(ttl_text)))
                         .child(redis_button("redis-copy", Some(IconName::Copy), &self.text("redis.value.value"), Kind::Tool, &entity))
                         .child(redis_button("redis-delete", Some(IconName::Trash), &self.text("redis.tab.remove"), Kind::Danger, &entity)),
                 )
@@ -903,12 +902,12 @@ impl Render for RedisPane {
                         .min_h(px(120.))
                         .overflow_y_scroll()
                         .p(px(14.))
-                        .rounded(px(10.))
+                        .rounded(px(Radius::PANEL))
                         .bg(p.chrome)
                         .border_1()
                         .border_color(p.line)
                         .font_family(mono.clone())
-                        .text_size(px(12.5))
+                        .text_size(px(TypeScale::SM))
                         .child(SharedString::from(self.detail.as_ref().map(|detail| format_value(&detail.value, self.locale)).unwrap_or_default())),
                 )
                 .child(
@@ -976,11 +975,11 @@ impl Render for RedisPane {
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .rounded(px(8.))
+                    .rounded(px(Radius::PANEL))
                     .bg(p.danger_soft)
                     .text_color(p.danger)
                     .child(kit::icon(IconName::TriangleAlert, 15., p.danger))
-                    .child(div().flex_1().min_w(px(0.)).text_size(px(12.5)).child(SharedString::from(self.confirm_prompt.clone())))
+                    .child(div().flex_1().min_w(px(0.)).text_size(px(TypeScale::SM)).child(SharedString::from(self.confirm_prompt.clone())))
                     .child(redis_button("redis-cancel", None, &i18n::text(self.locale, "common.cancel"), Kind::Secondary, &entity))
                     .child(redis_button("redis-confirm", Some(IconName::Check), &self.text("redis.tab.confirmExecute"), Kind::Danger, &entity)),
             );
@@ -993,7 +992,7 @@ impl Render for RedisPane {
                 .role(gpui_kit::Role::Status)
                 .aria_label(SharedString::from(self.status_line()))
                 .min_h(px(16.))
-                .text_size(px(12.))
+                .text_size(px(TypeScale::SM))
                 .text_color(if self.error.is_empty() { p.text_muted } else { p.danger })
                 .child(SharedString::from(status_text)),
         );

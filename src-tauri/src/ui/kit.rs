@@ -153,10 +153,11 @@ pub fn apply_theme(dark: bool, cx: &mut App) {
 
 fn brand(theme: &mut Theme, p: &Palette, white: Hsla, clear: Hsla) {
     let dark = p.dark;
-    theme.font_size = px(13.);
-    theme.mono_font_size = px(13.);
-    theme.radius = px(6.);
-    theme.radius_lg = px(10.);
+    theme.font_size = px(TypeScale::MD);
+    theme.mono_font_size = px(TypeScale::MD);
+    // 组件库按钮、输入框用 radius（控件 4px），对话框、通知等浮层用 radius_lg（面板 6px）。
+    theme.radius = px(Radius::CONTROL);
+    theme.radius_lg = px(Radius::PANEL);
     let c = &mut theme.colors;
     c.background = p.surface;
     c.foreground = p.text;
@@ -226,6 +227,110 @@ fn brand(theme: &mut Theme, p: &Palette, white: Hsla, clear: Hsla) {
     c.link_active = p.accent_active;
 }
 
+// ---------------------------------------------------------------- 字号与圆角
+
+/// 字号刻度：规范 S4.1 的五档 `11 / 12 / 13 / 15 / 18` px。
+/// 业务视图只用这里的档位，不写裸字号；`style_literals_follow_design_tokens` 扫描源码守住它。
+pub struct TypeScale;
+
+impl TypeScale {
+    /// 分区标签、键帽、徽标、次要元信息。
+    pub const XS: f32 = 11.;
+    /// 默认 UI 字号：列表、表单、按钮、正文。
+    pub const SM: f32 = 12.;
+    /// 强调正文、对话框小标题、空态标题、代码预览。
+    pub const MD: f32 = 13.;
+    /// 面板与页面标题。
+    pub const LG: f32 = 15.;
+    /// 欢迎区品牌字、统计大数字。
+    pub const XL: f32 = 18.;
+}
+
+/// 圆角：规范 S4.2 的控件 4px、面板/浮层 6px。取消胶囊与大圆角卡片。
+pub struct Radius;
+
+impl Radius {
+    /// 按钮、列表行、标签、菜单项、分段项、输入类控件。
+    pub const CONTROL: f32 = 4.;
+    /// 面板、卡片、提示条、浮层、对话框、代码块。
+    pub const PANEL: f32 = 6.;
+}
+
+/// 焦点环宽度：规范 S5.3 的 2px。
+pub const FOCUS_RING_W: f32 = 2.;
+
+// ---------------------------------------------------------------- 四态
+
+/// 自定义可点元素的四态样式。数值只由色板与是否禁用决定，
+/// `interactive` 照此绘制，测试也直接断言这一份值。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InteractionStyle {
+    pub hover_bg: Option<Hsla>,
+    pub active_bg: Option<Hsla>,
+    /// 键盘聚焦时的焦点环颜色；禁用时为 None（不可聚焦）。
+    pub ring: Option<Hsla>,
+    pub ring_width: f32,
+    pub opacity: f32,
+    pub focusable: bool,
+}
+
+pub fn interaction_style(p: &Palette, disabled: bool) -> InteractionStyle {
+    if disabled {
+        InteractionStyle { hover_bg: None, active_bg: None, ring: None, ring_width: 0., opacity: 0.55, focusable: false }
+    } else {
+        InteractionStyle { hover_bg: Some(p.hover), active_bg: Some(p.active), ring: Some(p.accent), ring_width: FOCUS_RING_W, opacity: 1., focusable: true }
+    }
+}
+
+/// 给自定义可点元素统一加 hover / active / focus-visible（2px 焦点环）/ disabled 四态。
+/// 可用时成为 Tab 停靠点，键盘聚焦才出焦点环（鼠标点击不出）；禁用时去掉 hover/active、
+/// 降低不透明度、光标改为 not-allowed，并且不可聚焦。
+pub fn interactive<E>(element: E, p: &Palette, disabled: bool) -> E
+where
+    E: gpui_kit::StatefulInteractiveElement + gpui_kit::Styled,
+{
+    let style = interaction_style(p, disabled);
+    let mut element = interactive_states(element, p, disabled);
+    if let Some(bg) = style.hover_bg {
+        element = element.hover(move |s| s.bg(bg));
+    }
+    element
+}
+
+/// 同 `interactive`，但 hover 由调用方自己定义（例如分段控件里未选项只提亮文字）。
+pub fn interactive_states<E>(element: E, p: &Palette, disabled: bool) -> E
+where
+    E: gpui_kit::StatefulInteractiveElement + gpui_kit::Styled,
+{
+    let style = interaction_style(p, disabled);
+    let mut element = element.opacity(style.opacity);
+    if !style.focusable {
+        return element.cursor_not_allowed();
+    }
+    element = element.cursor_pointer().tab_index(0);
+    if let Some(bg) = style.active_bg {
+        element = element.active(move |s| s.bg(bg));
+    }
+    if let Some(ring) = style.ring {
+        let width = style.ring_width;
+        element = element.focus_visible(move |s| {
+            s.shadow(vec![gpui_kit::BoxShadow { color: ring, offset: gpui_kit::point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(width), inset: false }])
+        });
+    }
+    element
+}
+
+/// 列表容器管的行（对象树、命令面板、右键菜单、连接/历史列表）：键盘焦点在容器上，
+/// 当前行用选中底色表达（规范 S5.2 Listbox 的 activedescendant 做法），行本身不抢焦点。
+/// 这里只补按下反馈与光标；hover 仍由调用方按是否选中决定。
+pub fn row_states<E>(element: E, p: &Palette) -> E
+where
+    E: gpui_kit::StatefulInteractiveElement + gpui_kit::Styled,
+{
+    let active = p.active;
+    element.cursor_pointer().active(move |s| s.bg(active))
+}
+
 // ---------------------------------------------------------------- 尺寸指标
 
 /// 外壳与页面的尺寸指标。只由密度决定，绘制与模型布局共用这一份值，
@@ -254,12 +359,13 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// 规范 S2.2 / S9：紧凑密度为 行 26 / 树 23 / 控件 26。
     pub fn compact() -> Self {
         Self {
-            row_h: 24.,
-            tree_row_h: 22.,
+            row_h: 26.,
+            tree_row_h: 23.,
             menu_row_h: 24.,
-            control_h: 22.,
+            control_h: 26.,
             topbar_h: 40.,
             tabs_h: 32.,
             status_h: 24.,
@@ -286,6 +392,41 @@ impl Metrics {
         }
     }
 
+    /// 当前外壳密度。外壳每帧把自己的密度发布到这里，子视图像取色板一样取尺寸，
+    /// 不必逐个实体下发；没发布过（独立测试窗口）时取标准密度。
+    pub fn of(cx: &App) -> Self {
+        cx.try_global::<DensityMetrics>().map(|global| global.0).unwrap_or_else(Self::standard)
+    }
+
+    /// 发布密度；变了返回 true，调用方据此通知子视图重绘。
+    pub fn publish(self, cx: &mut App) -> bool {
+        if cx.try_global::<DensityMetrics>().is_some_and(|global| global.0 == self) {
+            return false;
+        }
+        cx.set_global(DensityMetrics(self));
+        true
+    }
+
+    /// 页面工具条（查询工具条、Mongo/Redis 顶栏）：标准 42。
+    pub fn toolbar_h(&self) -> f32 {
+        self.topbar_h - 2.
+    }
+
+    /// 区块标题栏（结果头、记录视图头、列表表头）：紧凑 30（规范 S7.2 结果头）、标准 34。
+    pub fn bar_h(&self) -> f32 {
+        self.tabs_h - 2.
+    }
+
+    /// 网格工具条（含查找框）：标准 40。
+    pub fn tools_h(&self) -> f32 {
+        self.topbar_h - 4.
+    }
+
+    /// 细条（选区统计、提示条）：标准 22。
+    pub fn strip_h(&self) -> f32 {
+        self.status_h - 4.
+    }
+
     pub fn relaxed() -> Self {
         Self {
             row_h: 40.,
@@ -302,6 +443,10 @@ impl Metrics {
         }
     }
 }
+
+struct DensityMetrics(Metrics);
+
+impl gpui_kit::Global for DensityMetrics {}
 
 // ---------------------------------------------------------------- 引擎与环境
 
@@ -370,10 +515,10 @@ pub fn pill(label: impl Into<SharedString>, fg: Hsla, bg: Hsla) -> AnyElement {
         .flex_none()
         .px(px(6.))
         .h(px(18.))
-        .rounded(px(4.))
+        .rounded(px(Radius::CONTROL))
         .bg(bg)
         .text_color(fg)
-        .text_size(px(11.))
+        .text_size(px(TypeScale::XS))
         .font_weight(FontWeight::MEDIUM)
         .flex()
         .items_center()
@@ -394,7 +539,7 @@ pub fn icon(name: IconName, size: f32, color: Hsla) -> Icon {
 /// 分区小标题：11px、加粗、弱色。
 pub fn eyebrow(text: impl Into<SharedString>, p: &Palette) -> AnyElement {
     div()
-        .text_size(px(11.))
+        .text_size(px(TypeScale::XS))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(p.text_faint)
         .child(text.into())
@@ -411,12 +556,12 @@ pub fn title(text: impl Into<SharedString>, size: f32, p: &Palette) -> AnyElemen
 }
 
 pub fn muted(text: impl Into<SharedString>, p: &Palette) -> AnyElement {
-    div().text_size(px(12.)).text_color(p.text_muted).child(text.into()).into_any_element()
+    div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(text.into()).into_any_element()
 }
 
 /// 白底圆角卡片，带发丝线边框。
 pub fn card(p: &Palette) -> gpui_kit::Div {
-    div().bg(p.surface).border_1().border_color(p.line).rounded(px(10.))
+    div().bg(p.surface).border_1().border_color(p.line).rounded(px(Radius::PANEL))
 }
 
 /// 空态：图标、标题、说明。按钮由调用方追加。
@@ -431,15 +576,52 @@ pub fn empty_state(icon_name: IconName, heading: impl Into<SharedString>, detail
         .child(
             div()
                 .size(px(44.))
-                .rounded(px(12.))
+                .rounded(px(Radius::PANEL))
                 .bg(p.accent_soft)
                 .flex()
                 .items_center()
                 .justify_center()
                 .child(icon(icon_name, 22., p.accent_text)),
         )
-        .child(title(heading, 14., p))
-        .child(div().max_w(px(360.)).text_center().text_size(px(12.)).text_color(p.text_muted).child(detail.into()))
+        .child(title(heading, TypeScale::MD, p))
+        .child(div().max_w(px(360.)).text_center().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(detail.into()))
+}
+
+/// 加载态：居中的小号转圈 + 一行说明（规范 S8.5 三种状态之一）。加载优先于空态。
+pub fn loading_state(text: impl Into<SharedString>, p: &Palette) -> gpui_kit::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(8.))
+        .p(px(16.))
+        .text_size(px(TypeScale::SM))
+        .text_color(p.text_muted)
+        .child(gpui_kit::component::spinner::Spinner::new().small().color(p.accent))
+        .child(text.into())
+}
+
+/// 错误态：与空态同一排版，图标块换成危险色；重试按钮由调用方追加。
+pub fn error_state(heading: impl Into<SharedString>, detail: impl Into<SharedString>, p: &Palette) -> gpui_kit::Div {
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(10.))
+        .p(px(24.))
+        .child(
+            div()
+                .size(px(44.))
+                .rounded(px(Radius::PANEL))
+                .bg(p.danger_soft)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon(IconName::CircleAlert, 22., p.danger)),
+        )
+        .child(title(heading, TypeScale::MD, p))
+        .child(div().max_w(px(360.)).text_center().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(detail.into()))
 }
 
 /// 键盘提示 kbd。
@@ -448,11 +630,11 @@ pub fn kbd(text: impl Into<SharedString>, p: &Palette) -> AnyElement {
         .flex_none()
         .px(px(5.))
         .h(px(18.))
-        .rounded(px(4.))
+        .rounded(px(Radius::CONTROL))
         .border_1()
         .border_color(p.line_strong)
         .bg(p.surface)
-        .text_size(px(10.5))
+        .text_size(px(TypeScale::XS))
         .text_color(p.text_muted)
         .flex()
         .items_center()
@@ -534,11 +716,10 @@ pub fn segmented(items: Vec<(SharedString, SharedString, bool, Click)>, p: &Pale
 
 /// 同 `segmented`，高度跟随密度。
 pub fn segmented_sized(items: Vec<(SharedString, SharedString, bool, Click)>, p: &Palette, height: f32) -> AnyElement {
-    let mut row = div().flex().flex_none().p(px(2.)).gap(px(2.)).rounded(px(8.)).bg(p.hover);
+    let mut row = div().flex().flex_none().p(px(2.)).gap(px(2.)).rounded(px(Radius::CONTROL)).bg(p.hover);
     for (id, label, selected, on_click) in items {
         row = row.child(
-            div()
-                .id(ElementId::Name(id))
+            interactive_states(div().id(ElementId::Name(id)), p, false)
                 .test_support()
                 .role(gpui_kit::Role::Button)
                 .aria_label(label.clone())
@@ -547,9 +728,8 @@ pub fn segmented_sized(items: Vec<(SharedString, SharedString, bool, Click)>, p:
                 .h(px(height))
                 .flex()
                 .items_center()
-                .rounded(px(6.))
-                .text_size(px(12.))
-                .cursor_pointer()
+                .rounded(px(Radius::CONTROL))
+                .text_size(px(TypeScale::SM))
                 .when(selected, |this| this.bg(p.surface).text_color(p.text).font_weight(FontWeight::MEDIUM).shadow_sm())
                 .when(!selected, |this| this.text_color(p.text_muted).hover(|style| style.text_color(p.text)))
                 .child(label)
@@ -708,7 +888,7 @@ pub fn form_row(label: impl Into<SharedString>, control: impl IntoElement, p: &P
         .flex_col()
         .gap(px(5.))
         .min_w(px(0.))
-        .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(p.text_muted).child(label.into()))
+        .child(div().text_size(px(TypeScale::SM)).font_weight(FontWeight::MEDIUM).text_color(p.text_muted).child(label.into()))
         .child(control)
         .into_any_element()
 }
@@ -784,13 +964,40 @@ mod palette_tests {
         }
     }
 
-    /// 三档密度必须真的拉开行高与控制高度，否则切换只是文案变化。
+    /// 三档密度必须真的拉开行高，否则切换只是文案变化。
+    /// 紧凑档按规范取 26/23/26（行/树/控件）；标准与宽松保持既有值，只补进规范。
+    /// 控件高度因此不再按密度递增（紧凑 26 > 标准 24），这是 D1 的确认结果。
     #[test]
     fn density_metrics_are_distinct_and_ordered() {
         let (compact, standard, relaxed) = (Metrics::compact(), Metrics::standard(), Metrics::relaxed());
         assert!(compact.row_h < standard.row_h && standard.row_h < relaxed.row_h);
-        assert!(compact.control_h < standard.control_h && standard.control_h < relaxed.control_h);
+        assert!(compact.tree_row_h < standard.tree_row_h && standard.tree_row_h < relaxed.tree_row_h);
+        assert!(standard.control_h < relaxed.control_h);
         assert!(compact.pad < standard.pad && standard.pad < relaxed.pad);
+        assert_eq!((compact.row_h, compact.tree_row_h, compact.control_h), (26., 23., 26.), "紧凑密度按规范 S2.2");
+        assert_eq!((standard.row_h, standard.tree_row_h, standard.control_h), (32., 28., 24.), "标准密度保持既有值");
+        assert_eq!((relaxed.row_h, relaxed.tree_row_h, relaxed.control_h), (40., 36., 28.), "宽松密度保持既有值");
+    }
+
+    /// 自定义可点元素的四态：可用时有 hover/active 底色与 2px 焦点环，禁用时全部去掉且不可聚焦。
+    /// 焦点环在浅深色的工作区、外壳、浮层、悬停底上都达到非文字元素的 3:1。
+    #[test]
+    fn interactive_states_have_visible_focus_ring_in_both_themes() {
+        for p in [Palette::light(), Palette::dark()] {
+            let on = interaction_style(&p, false);
+            assert_eq!(on.ring_width, 2., "焦点环 2px");
+            assert!(on.focusable && on.opacity == 1.);
+            assert_ne!(on.hover_bg, None);
+            assert_ne!(on.active_bg, on.hover_bg, "按下与悬停可区分");
+            let ring = on.ring.expect("可用时有焦点环");
+            for (name, bg) in [("surface", p.surface), ("chrome", p.chrome), ("raised", p.raised), ("rail", p.rail), ("hover", p.hover)] {
+                let ratio = contrast(ring, bg);
+                assert!(ratio >= 3., "focus ring on {name}: {ratio:.2} (dark={})", p.dark);
+            }
+            let off = interaction_style(&p, true);
+            assert_eq!((off.hover_bg, off.active_bg, off.ring, off.focusable), (None, None, None, false), "禁用去掉反馈且不可聚焦");
+            assert!(off.opacity < 1.);
+        }
     }
 }
 
@@ -834,3 +1041,220 @@ mod field_tests {
     }
 }
 
+
+#[cfg(test)]
+mod interactive_tests {
+    use super::*;
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{Render, TestAppContext};
+
+    struct Probe {
+        disabled: bool,
+    }
+
+    impl Render for Probe {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let p = Palette::of(cx);
+            div().size_full().child(interactive(div().id("probe-item"), &p, self.disabled).w(px(80.)).h(px(24.)).child("probe"))
+        }
+    }
+
+    fn focus_after_tab(disabled: bool, dark: bool, cx: &mut TestAppContext) -> bool {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            apply_theme(dark, cx);
+        });
+        let (window, _) = cx.update(|cx| gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |_, cx| cx.new(|_| Probe { disabled })).unwrap());
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.focus_next(cx);
+            window.render_frame(cx);
+            window.focused(cx).is_some()
+        })
+        .unwrap()
+    }
+
+    /// 键盘 Tab 能停到可用的自定义可点元素上（焦点环随之出现），禁用的不能。
+    #[gpui_kit::test]
+    fn interactive_element_is_a_tab_stop_unless_disabled_light(cx: &mut TestAppContext) {
+        assert!(focus_after_tab(false, false, cx), "浅色：可用元素是 Tab 停靠点");
+    }
+
+    #[gpui_kit::test]
+    fn interactive_element_is_a_tab_stop_unless_disabled_dark(cx: &mut TestAppContext) {
+        assert!(focus_after_tab(false, true, cx), "深色：可用元素是 Tab 停靠点");
+    }
+
+    #[gpui_kit::test]
+    fn disabled_interactive_element_is_skipped_by_tab(cx: &mut TestAppContext) {
+        assert!(!focus_after_tab(true, false, cx), "禁用元素不可聚焦");
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// 允许不走字号/圆角 token 的表达式。每条都写明理由；其余一律必须是 `TypeScale::*` / `Radius::*`。
+    const EXCEPTIONS: &[(&str, &str, &str)] = &[
+        ("ui/kit.rs", "px((size * 0.42).max(8.))", "引擎徽标里的两字母缩写随徽标尺寸等比缩放，属于图形而非排版"),
+        ("ui/kit.rs", "px((size / 4.).max(3.))", "引擎徽标方块的圆角随徽标尺寸等比缩放，属于图形"),
+        ("ui/kit.rs", "px(size)", "kit::title 的实现；调用方的 size 参数本身被本测试按 TypeScale 检查"),
+        ("ui/editor_proto.rs", "px(self.font_size)", "SQL 编辑器字号来自用户设置（规范 S4.1：编辑器字号由设置控制）"),
+        ("app/shell/chrome.rs", "px(size * 0.28)", "品牌标记的圆角随尺寸等比缩放，属于图形"),
+        ("app/shell/chrome.rs", "px(2.)", "活动栏激活指示条只有 3px 宽，是线条而非控件"),
+    ];
+
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// 取 `open` 之后、与之配对的右括号之前的文本。
+    fn balanced(text: &str, open: usize) -> Option<&str> {
+        let mut depth = 0usize;
+        for (offset, ch) in text[open..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&text[open + 1..open + offset]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// 按顶层逗号切分参数。
+    fn args(text: &str) -> Vec<String> {
+        let (mut out, mut depth, mut current) = (Vec::new(), 0i32, String::new());
+        for ch in text.chars() {
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 0 => {
+                    out.push(current.trim().to_owned());
+                    current.clear();
+                    continue;
+                }
+                _ => {}
+            }
+            current.push(ch);
+        }
+        if !current.trim().is_empty() {
+            out.push(current.trim().to_owned());
+        }
+        out
+    }
+
+    /// 去掉注释行与测试模块，只看产品代码。
+    fn product_source(text: &str) -> String {
+        let mut out = String::new();
+        for line in text.lines() {
+            if line.trim_start().starts_with("mod token_tests") {
+                break;
+            }
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// (文件, 调用, 实参) 中不合规的那些。
+    pub(super) fn violations(files: &[(String, String)]) -> Vec<String> {
+        let mut bad = Vec::new();
+        for (name, text) in files {
+            let source = product_source(text);
+            for (call, token) in [(".text_size(", "px(TypeScale::"), (".rounded(", "px(Radius::")] {
+                for (at, _) in source.match_indices(call) {
+                    let Some(arg) = balanced(&source, at + call.len() - 1) else { continue };
+                    let arg = arg.trim();
+                    let tokenized = arg.starts_with(token) && arg.ends_with(')') && arg[token.len()..arg.len() - 1].chars().all(|c| c.is_ascii_uppercase() || c == '_');
+                    let excepted = EXCEPTIONS.iter().any(|(file, expr, _)| file == name && *expr == arg);
+                    if !tokenized && !excepted {
+                        bad.push(format!("{name}: {call}{arg})"));
+                    }
+                }
+            }
+            for call in ["kit::title(", "(title("] {
+                for (at, _) in source.match_indices(call) {
+                    if call == "(title(" && name != "ui/kit.rs" {
+                        continue;
+                    }
+                    let Some(inner) = balanced(&source, at + call.len() - 1) else { continue };
+                    let parts = args(inner);
+                    if parts.len() == 3 && !parts[1].starts_with("TypeScale::") {
+                        bad.push(format!("{name}: title(.., {}, ..)", parts[1]));
+                    }
+                }
+            }
+        }
+        bad
+    }
+
+    fn sources() -> Vec<(String, String)> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut paths = Vec::new();
+        rust_files(&root.join("app"), &mut paths);
+        rust_files(&root.join("ui"), &mut paths);
+        paths
+            .into_iter()
+            .map(|path| {
+                let name = path.strip_prefix(&root).unwrap().to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+                (name, std::fs::read_to_string(&path).unwrap())
+            })
+            .collect()
+    }
+
+    /// app/ 与 ui/ 的字号只取五档刻度、圆角只取控件 4 / 面板 6；例外逐条列出理由。
+    #[test]
+    fn style_literals_follow_design_tokens() {
+        assert_eq!([TypeScale::XS, TypeScale::SM, TypeScale::MD, TypeScale::LG, TypeScale::XL], [11., 12., 13., 15., 18.], "规范 S4.1 五档字号");
+        assert_eq!((Radius::CONTROL, Radius::PANEL), (4., 6.), "规范 S4.2 控件 4 / 面板 6");
+        let files = sources();
+        assert!(files.len() > 20, "扫描到了 app/ 与 ui/ 的源码");
+        let bad = violations(&files);
+        assert!(bad.is_empty(), "以下样式没有走设计 token：\n{}", bad.join("\n"));
+        for (file, expr, reason) in EXCEPTIONS {
+            assert!(!reason.is_empty());
+            assert!(files.iter().any(|(name, text)| name == file && text.contains(expr)), "例外 {file} {expr} 已不存在，应从清单删除");
+        }
+    }
+
+    /// 回退任何一处替换（裸字号、旧圆角、标题裸字号）都会被扫描抓到。
+    #[test]
+    fn style_scan_rejects_reverted_literals() {
+        for (snippet, hint) in [
+            ("div().text_size(px(12.5))", "12.5"),
+            ("div().text_size(px(12.))", "12."),
+            ("div().rounded(px(8.))", "8."),
+            ("div().rounded(px(6.))", "6."),
+            ("kit::title(text, 16., &p)", "16."),
+            ("div().child(title(heading, 14., p))", "14."),
+            ("div().text_size(px(TypeScale::SM + 1.))", "+ 1."),
+        ] {
+            let file = if snippet.contains("(title(") { "ui/kit.rs" } else { "app/views/probe.rs" };
+            let bad = violations(&[(file.to_owned(), snippet.to_owned())]);
+            assert_eq!(bad.len(), 1, "{snippet} 必须被拒绝");
+            assert!(bad[0].contains(hint));
+        }
+        let ok = violations(&[(
+            "app/views/probe.rs".to_owned(),
+            "div().text_size(px(TypeScale::SM)).rounded(px(Radius::PANEL)).child(kit::title(t, TypeScale::LG, &p))".to_owned(),
+        )]);
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+}

@@ -9,7 +9,7 @@ use gpui_kit::{
     AnyElement, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, relative,
 };
 
-use crate::ui::kit::{self, FieldSpec, Fields, Palette};
+use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, TypeScale};
 
 use crate::application::AppServices;
 use crate::app::views::grid::{operation_banner, GridTarget};
@@ -493,7 +493,7 @@ fn op_card(id: &'static str, kind: &'static str, icon: IconName, title: SharedSt
                 .flex()
                 .items_center()
                 .gap(px(10.))
-                .child(div().flex_none().size(px(30.)).rounded(px(8.)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(icon, 15., p.accent_text)))
+                .child(div().flex_none().size(px(30.)).rounded(px(Radius::PANEL)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(icon, 15., p.accent_text)))
                 .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child(title))
                 .child(preview),
         );
@@ -593,13 +593,13 @@ impl Render for AdminPane {
                             .min_w(px(0.))
                             .flex()
                             .flex_col()
-                            .child(kit::title(t("ui.tool.admin"), 16., &p))
-                            .child(div().id("admin-banner").truncate().text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(self.session.banner()))),
+                            .child(kit::title(t("ui.tool.admin"), TypeScale::LG, &p))
+                            .child(div().id("admin-banner").truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(self.session.banner()))),
                     )
-                    .child(div().id("admin-source").text_size(px(11.5)).text_color(p.text_faint).max_w(px(320.)).truncate().child(SharedString::from(inventory.source.clone()))),
+                    .child(div().id("admin-source").text_size(px(TypeScale::XS)).text_color(p.text_faint).max_w(px(320.)).truncate().child(SharedString::from(inventory.source.clone()))),
             )
             .child(div().id("admin-body").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(24.)).child(div().max_w(px(760.)).mx_auto().flex().flex_col().gap(px(12.)).child(cards).when(!self.session.note.is_empty(), |this| {
-                this.child(div().px(px(12.)).py(px(8.)).rounded(px(8.)).bg(p.hover).text_size(px(12.5)).child(SharedString::from(self.session.note.clone())))
+                this.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.hover).text_size(px(TypeScale::SM)).child(SharedString::from(self.session.note.clone())))
             })))
             .child(div().hidden().child(admin_button("admin-preview", "structure.action.preview", false, entity.clone(), locale)));
         if self.session.open {
@@ -620,9 +620,9 @@ impl Render for AdminPane {
                         .bg(p.raised)
                         .border_1()
                         .border_color(p.line)
-                        .rounded(px(12.))
+                        .rounded(px(Radius::PANEL))
                         .shadow_lg()
-                        .child(kit::title(t("structure.preview.title"), 15., &p))
+                        .child(kit::title(t("structure.preview.title"), TypeScale::LG, &p))
                         .child(kit::muted(SharedString::from(self.session.banner()), &p))
                         .child(
                             div()
@@ -630,12 +630,12 @@ impl Render for AdminPane {
                                 .max_h(px(260.))
                                 .overflow_y_scroll()
                                 .p(px(12.))
-                                .rounded(px(8.))
+                                .rounded(px(Radius::PANEL))
                                 .bg(p.chrome)
                                 .border_1()
                                 .border_color(p.line)
                                 .font_family(cx.theme().mono_font_family.clone())
-                                .text_size(px(12.5))
+                                .text_size(px(TypeScale::SM))
                                 .child(SharedString::from(self.session.preview_sql().join("\n"))),
                         )
                         .child(kit::muted(SharedString::from(self.session.preview_target()), &p))
@@ -643,12 +643,12 @@ impl Render for AdminPane {
                             let mut risks = div().flex().flex_col().gap(px(4.));
                             for (level, text) in self.session.preview_risks() {
                                 let (fg, bg) = if level == "danger" { (p.danger, p.danger_soft) } else if level == "warn" { (p.warn, p.warn_soft) } else { (p.text_muted, p.hover) };
-                                risks = risks.child(div().px(px(10.)).py(px(6.)).rounded(px(6.)).bg(bg).text_color(fg).text_size(px(12.)).child(SharedString::from(text)));
+                                risks = risks.child(div().px(px(10.)).py(px(6.)).rounded(px(Radius::PANEL)).bg(bg).text_color(fg).text_size(px(TypeScale::SM)).child(SharedString::from(text)));
                             }
                             this.child(risks)
                         })
                         .when(!self.session.preview_rule().is_empty(), |this| this.child(kit::muted(SharedString::from(self.session.preview_rule()), &p)))
-                        .when(!blocked.is_empty(), |this| this.child(div().px(px(12.)).py(px(8.)).rounded(px(8.)).bg(p.danger_soft).text_color(p.danger).text_size(px(12.5)).child(SharedString::from(blocked.join(" ")))))
+                        .when(!blocked.is_empty(), |this| this.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.danger_soft).text_color(p.danger).text_size(px(TypeScale::SM)).child(SharedString::from(blocked.join(" ")))))
                         .child(
                             div()
                                 .flex()

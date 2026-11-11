@@ -12,7 +12,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px, relative,
 };
 
-use crate::ui::kit::{self, FieldSpec, Fields, Palette};
+use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, TypeScale};
 
 use crate::application::mongo::{DeleteOutcome, InsertOutcome, ReplaceOutcome};
 use crate::application::AppServices;
@@ -811,6 +811,7 @@ fn parse_spec(spec: &str) -> Option<(String, String, String, String)> {
 impl Render for MongoPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
+        let m = kit::Metrics::of(cx);
         let entity = cx.entity();
         let mono = cx.theme().mono_font_family.clone();
         let filter = self.fields.bind_enter(
@@ -840,6 +841,7 @@ impl Render for MongoPane {
                     database.collections.to_string(),
                     selected,
                     &p,
+                    m,
                     &entity,
                 ),
             );
@@ -858,6 +860,7 @@ impl Render for MongoPane {
                 count,
                 selected,
                 &p,
+                m,
                 &entity,
             ));
         }
@@ -872,7 +875,7 @@ impl Render for MongoPane {
             .border_color(p.line)
             .child(
                 div()
-                    .h(px(44.))
+                    .h(px(m.toolbar_h() + 2.))
                     .px(px(10.))
                     .flex()
                     .items_center()
@@ -906,7 +909,7 @@ impl Render for MongoPane {
                     .flex()
                     .items_center()
                     .gap(px(4.))
-                    .text_size(px(13.))
+                    .text_size(px(TypeScale::MD))
                     .child(div().text_color(p.text_muted).child(SharedString::from(self.database.clone())))
                     .child(kit::icon(IconName::ChevronRight, 12., p.text_faint))
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(SharedString::from(self.collection.clone()))),
@@ -918,7 +921,7 @@ impl Render for MongoPane {
             .child(kit::vline(&p))
             .child(mongo_icon("mongo-refresh", IconName::RefreshCw, &self.text("mongo.tab.refresh"), &entity))
             .child(mongo_icon("mongo-prev", IconName::ChevronLeft, &self.text("mongo.tab.prevPage"), &entity))
-            .child(div().text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(page_text)))
+            .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(page_text)))
             .child(mongo_icon("mongo-next", IconName::ChevronRight, &self.text("mongo.tab.nextPage"), &entity))
             .child(mongo_button("mongo-insert", Some(IconName::Plus), &self.text("mongo.tab.insert"), Kind::Primary, &entity));
 
@@ -926,14 +929,14 @@ impl Render for MongoPane {
         let shown: Vec<String> = self.columns.iter().take(7).cloned().collect();
         let mut table = div().id("mongo-docs").flex().flex_col().flex_1().min_h(px(0.)).overflow_y_scroll();
         if !self.filter_error.is_empty() {
-            table = table.child(div().mx(px(10.)).mt(px(10.)).px(px(12.)).py(px(8.)).rounded(px(8.)).bg(p.danger_soft).text_color(p.danger).text_size(px(12.5)).child(SharedString::from(self.filter_error.clone())));
+            table = table.child(div().mx(px(10.)).mt(px(10.)).px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.danger_soft).text_color(p.danger).text_size(px(TypeScale::SM)).child(SharedString::from(self.filter_error.clone())));
         }
         if self.documents.is_empty() {
             let empty = if self.applied_filter.is_empty() { self.text("mongo.tab.emptyCollection") } else { self.text("mongo.tab.emptyFiltered") };
             let detail = if self.collection.is_empty() { self.text("mongo.tab.needCollection") } else { String::new() };
             table = table.child(div().flex_1().flex().items_center().justify_center().child(kit::empty_state(IconName::Braces, SharedString::from(empty), SharedString::from(detail), &p)));
         } else {
-            let mut head = div().flex().h(px(32.)).px(px(10.)).items_center().bg(p.chrome).border_b_1().border_color(p.line).text_size(px(11.5)).text_color(p.text_faint);
+            let mut head = div().flex().h(px(m.bar_h() - 2.)).px(px(10.)).items_center().bg(p.chrome).border_b_1().border_color(p.line).text_size(px(TypeScale::XS)).text_color(p.text_faint);
             for name in &shown {
                 head = head.child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).truncate().pr(px(8.)).child(SharedString::from(name.clone())));
             }
@@ -944,7 +947,7 @@ impl Render for MongoPane {
                     .id(SharedString::from(format!("mongo-row-{index}")))
                     .group("mongo-row")
                     .flex()
-                    .min_h(px(34.))
+                    .min_h(px(m.row_h + 2.))
                     .px(px(10.))
                     .items_center()
                     .border_b_1()
@@ -960,7 +963,7 @@ impl Render for MongoPane {
                             .min_w(px(0.))
                             .truncate()
                             .pr(px(8.))
-                            .text_size(px(12.5))
+                            .text_size(px(TypeScale::SM))
                             .when(name == "_id", |this| this.font_family(mono.clone()).text_color(p.text_muted))
                             .when(faint, |this| this.text_color(p.text_faint))
                             .child(SharedString::from(text)),
@@ -1001,7 +1004,7 @@ impl Render for MongoPane {
                 let body = if invalid { format!("{} {}", self.text("mongo.docJson.invalid"), self.view_json) } else { self.view_json.clone() };
                 drawer = drawer
                     .child(div().flex().items_center().justify_between().child(kit::eyebrow(SharedString::from(self.text("mongo.tab.viewLabel")), &p)).child(mongo_button("mongo-view-close", Some(IconName::X), &self.text("mongo.tab.close"), Kind::Tool, &entity)))
-                    .child(div().id("mongo-view-json").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(12.)).rounded(px(8.)).bg(p.surface).border_1().border_color(p.line).font_family(mono.clone()).text_size(px(12.5)).child(SharedString::from(body)));
+                    .child(div().id("mongo-view-json").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(12.)).rounded(px(Radius::PANEL)).bg(p.surface).border_1().border_color(p.line).font_family(mono.clone()).text_size(px(TypeScale::SM)).child(SharedString::from(body)));
             }
             if self.editor_open {
                 let editor = self.json_editor(window, cx);
@@ -1021,8 +1024,8 @@ impl Render for MongoPane {
                                 })
                             })),
                     )
-                    .child(div().id("mongo-editor").h(px(220.)).rounded(px(8.)).border_1().border_color(p.line).bg(p.surface).overflow_hidden().child(Editor::new(&editor).h(relative(1.)).bordered(false).aria_label(SharedString::from(self.text("mongo.tab.editorLabel")))))
-                    .when(!self.editor_error.is_empty(), |this| this.child(div().text_size(px(12.)).text_color(p.danger).child(SharedString::from(self.editor_error.clone()))))
+                    .child(div().id("mongo-editor").h(px(220.)).rounded(px(Radius::PANEL)).border_1().border_color(p.line).bg(p.surface).overflow_hidden().child(Editor::new(&editor).h(relative(1.)).bordered(false).aria_label(SharedString::from(self.text("mongo.tab.editorLabel")))))
+                    .when(!self.editor_error.is_empty(), |this| this.child(div().text_size(px(TypeScale::SM)).text_color(p.danger).child(SharedString::from(self.editor_error.clone()))))
                     .child(div().flex().justify_end().child(mongo_button("mongo-save", Some(IconName::Check), &caption, Kind::Primary, &entity)));
             }
             right = right.child(drawer);
@@ -1039,11 +1042,11 @@ impl Render for MongoPane {
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .rounded(px(8.))
+                    .rounded(px(Radius::PANEL))
                     .bg(if delete { p.danger_soft } else { p.warn_soft })
                     .text_color(if delete { p.danger } else { p.warn })
                     .child(kit::icon(IconName::TriangleAlert, 15., if delete { p.danger } else { p.warn }))
-                    .child(div().flex_1().min_w(px(0.)).text_size(px(12.5)).child(SharedString::from(self.confirm_prompt.clone())))
+                    .child(div().flex_1().min_w(px(0.)).text_size(px(TypeScale::SM)).child(SharedString::from(self.confirm_prompt.clone())))
                     .child(mongo_button("mongo-cancel", None, &i18n::text(self.locale, "common.cancel"), Kind::Secondary, &entity))
                     .child(mongo_button(
                         "mongo-confirm",
@@ -1062,14 +1065,14 @@ impl Render for MongoPane {
                 .role(gpui_kit::Role::Status)
                 .aria_label(SharedString::from(self.status_line()))
                 .flex_none()
-                .h(px(28.))
+                .h(px(m.tree_row_h))
                 .px(px(12.))
                 .flex()
                 .items_center()
                 .gap(px(8.))
                 .border_t_1()
                 .border_color(p.line)
-                .text_size(px(12.))
+                .text_size(px(TypeScale::SM))
                 .text_color(if self.error.is_empty() { p.text_muted } else { p.danger })
                 .when(self.busy, |this| this.child(Spinner::new().xsmall().color(p.accent)))
                 .child(SharedString::from(status)),
@@ -1109,27 +1112,25 @@ impl MongoPane {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn nav_row(id: String, label: String, icon: IconName, text: String, count: String, selected: bool, p: &Palette, entity: &Entity<MongoPane>) -> AnyElement {
+fn nav_row(id: String, label: String, icon: IconName, text: String, count: String, selected: bool, p: &Palette, m: kit::Metrics, entity: &Entity<MongoPane>) -> AnyElement {
     let entity = entity.clone();
     let command = id.clone();
-    div()
-        .id(SharedString::from(id))
+    kit::interactive_states(div().id(SharedString::from(id)), p, false)
         .test_support()
         .role(gpui_kit::Role::Button)
         .aria_label(SharedString::from(label))
         .aria_selected(selected)
-        .h(px(28.))
+        .h(px(m.tree_row_h))
         .px(px(8.))
         .flex()
         .items_center()
         .gap(px(8.))
-        .rounded(px(6.))
-        .cursor_pointer()
+        .rounded(px(Radius::CONTROL))
         .when(selected, |this| this.bg(p.selection))
         .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
         .child(kit::icon(icon, 13., if selected { p.accent } else { p.text_faint }))
-        .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(12.5)).child(SharedString::from(text)))
-        .child(div().text_size(px(11.)).text_color(p.text_faint).child(SharedString::from(count)))
+        .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).child(SharedString::from(text)))
+        .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(count)))
         .on_click(move |_, _, cx| {
             let command = command.clone();
             entity.update(cx, |pane, cx| pane.command(&command, cx));

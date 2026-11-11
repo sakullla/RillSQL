@@ -17,7 +17,7 @@ use gpui_kit::{
     relative,
 };
 
-use crate::ui::kit::{self, Palette, Tip as _};
+use crate::ui::kit::{self, Palette, Tip as _, Radius, TypeScale};
 use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::application::AppServices;
@@ -1162,11 +1162,6 @@ impl GridPane {
         self.press.is_some()
     }
 
-    /// 当前选择的统计文本；没有选择时为空。
-    pub fn stats_text(&self) -> Option<String> {
-        self.session.stats_text()
-    }
-
     /// 开始编辑：可写的格子走正式文本输入，只读的格子改为查看值并说明原因。
     fn request_edit(&mut self, select_all: bool) {
         let Some((row, column)) = self.session.focus_cell() else {
@@ -1843,6 +1838,8 @@ impl Render for GridPane {
             self.session.scroll_to(start);
         }
         let p = Palette::of(cx);
+        // 行高、表头与工具条高度跟随外壳密度（规范 S7.2：网格行 紧凑 26 / 标准 32）。
+        let m = kit::Metrics::of(cx);
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let entity = cx.entity();
@@ -1874,36 +1871,10 @@ impl Render for GridPane {
             Some(false) => t("grid.action.sortAsc"),
             None => t("grid.action.sort"),
         };
-        // 已选且已读取值的统计：和复制、高亮用同一个 anchor/focus 矩形。
-        // 它浮在表格左下方而不是占一行，出现和消失都不会让行位置跳动。
-        let stats: Option<gpui_kit::AnyElement> = self.session.stats_text().map(|text| {
-            let full = SharedString::from(text);
-            div()
-                .id("grid-stats")
-                .debug_selector(|| "grid-stats".to_owned())
-                .flex_none()
-                .h(px(22.))
-                // 窄窗口里这行很长：限宽 + 省略号，不让它盖住右边的数据格；
-                // 完整内容放在提示里，被截断的字段仍然读得到。
-                .max_w(px(520.))
-                .truncate()
-                .px(px(8.))
-                .py(px(2.))
-                .rounded(px(4.))
-                .bg(p.chrome)
-                .border_1()
-                .border_color(p.line)
-                .text_size(px(11.))
-                .text_color(p.text_muted)
-                .tooltip_text(full.clone())
-                .child(full)
-                .into_any_element()
-        });
-
         let mut tools = div()
             .id("grid-tools")
             .flex_none()
-            .h(px(40.))
+            .h(px(m.tools_h()))
             .px(px(10.))
             .flex()
             .items_center()
@@ -1912,6 +1883,7 @@ impl Render for GridPane {
             .border_color(p.line)
             .child(div().w(px(200.)).child(kit::text_input("grid-search", &search, t("grid.action.search")).small().prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)))
             // 查找范围是一等状态：已读取行（本地）与整表（服务器筛选）不能混为一谈。
+            // 不可用时按钮禁用，原因只放在悬停提示里，不常驻占一行。
             .child({
                 let button = kit::tool_button(
                     "grid-find-scope",
@@ -1925,21 +1897,13 @@ impl Render for GridPane {
                             });
                         }
                     },
-                );
-                // 不可用时按钮禁用，原因写在旁边；不能让开关看起来生效却什么都不发。
-                button.disabled(scope_block.is_some())
-            })
-            .when_some(scope_block, |this, reason| {
-                this.child(
-                    div()
-                        .id("grid-find-scope-reason")
-                        .px(px(4.))
-                        .max_w(px(300.))
-                        .truncate()
-                        .text_size(px(12.))
-                        .text_color(p.text_muted)
-                        .child(t(reason)),
                 )
+                .disabled(scope_block.is_some());
+                let scope = div().id("grid-find-scope-hint").debug_selector(|| "grid-find-scope-hint".to_owned()).child(button);
+                match scope_block {
+                    Some(reason) => scope.tooltip_text(t(reason)),
+                    None => scope,
+                }
             })
             .child(kit::tool_button("grid-filter-add", Some(IconName::Plus), t("grid.filter.add"), {
                 let entity = entity.clone();
@@ -1963,13 +1927,13 @@ impl Render for GridPane {
             tools = tools
                 .child(kit::vline(&p))
                 .child(grid_icon("grid-page-prev", IconName::ChevronLeft, t("grid.action.pagePrev"), entity.clone()))
-                .child(div().px(px(4.)).text_size(px(12.)).text_color(p.text_muted).child(range.clone()))
+                .child(div().px(px(4.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(range.clone()))
                 .child(grid_icon("grid-page-next", IconName::ChevronRight, t("grid.action.pageNext"), entity.clone()))
-                .child(div().px(px(6.)).max_w(px(260.)).truncate().text_size(px(12.)).text_color(p.text_muted).child(state_text.clone()));
+                .child(div().px(px(6.)).max_w(px(260.)).truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(state_text.clone()));
         } else {
             tools = tools
-                .child(div().px(px(6.)).text_size(px(12.)).text_color(p.text_muted).child(range.clone()))
-                .child(div().px(px(6.)).max_w(px(260.)).truncate().text_size(px(12.)).text_color(p.text_muted).child(state_text.clone()));
+                .child(div().px(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(range.clone()))
+                .child(div().px(px(6.)).max_w(px(260.)).truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(state_text.clone()));
         }
         // 当前排序列和方向写进状态栏：焦点移到别处后仍然看得出结果是按哪一列排的。
         if let Some(sorted) = sort_text {
@@ -1991,14 +1955,14 @@ impl Render for GridPane {
                     .px(px(2.))
                     .max_w(px(360.))
                     .truncate()
-                    .text_size(px(12.))
+                    .text_size(px(TypeScale::SM))
                     .text_color(p.text_muted)
                     .child(t(&readonly_reason)),
             );
         }
         if !self.notice.is_empty() {
             tools = tools.child(
-                div().px(px(6.)).max_w(px(360.)).truncate().text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(self.notice.clone())),
+                div().px(px(6.)).max_w(px(360.)).truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(self.notice.clone())),
             );
         }
         tools = tools
@@ -2066,12 +2030,12 @@ impl Render for GridPane {
                     .gap(px(4.))
                     .px(px(6.))
                     .py(px(2.))
-                    .rounded(px(6.))
+                    .rounded(px(Radius::CONTROL))
                     .border_1()
                     // 正在编辑、尚未应用的条件用强调边框标出来，避免把旧结果当成新条件的结果。
                     .border_color(if draft.dirty { p.accent } else { p.line })
                     .bg(p.raised)
-                    .child(div().text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(draft.column.clone())))
+                    .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(draft.column.clone())))
                     .child(kit::tool_button(SharedString::from(format!("grid-filter-op-{index}")), None, op, cycle));
                 if draft.dirty {
                     row = row.child(
@@ -2138,7 +2102,7 @@ impl Render for GridPane {
                 })
                 .child(kit::icon_button("grid-filter-clear", IconName::X, t("grid.filter.clearAll"), clear));
             if let Some(error) = filter_error {
-                strip = strip.child(div().max_w(px(360.)).truncate().text_size(px(12.)).text_color(p.danger).child(SharedString::from(error)));
+                strip = strip.child(div().max_w(px(360.)).truncate().text_size(px(TypeScale::SM)).text_color(p.danger).child(SharedString::from(error)));
             }
             filters_strip = Some(strip.into_any_element());
         }
@@ -2241,12 +2205,11 @@ impl Render for GridPane {
                             .flex_1()
                             .min_h(px(0.))
                             .flex()
-                            .child(div().flex_1().min_w(px(0.)).h_full().child(DataTable::new(&table).small().stripe(true).accessibility_label("shared-grid")))
-                            .child(record::render_record(record::record_view(&self.session), locale, &p, cx.theme().mono_font_family.clone(), &entity))
+                            .child(div().flex_1().min_w(px(0.)).h_full().child(DataTable::new(&table).with_size(gpui_kit::component::Size::Size(px(m.row_h))).header_row_height(px(m.row_h)).stripe(true).accessibility_label("shared-grid")))
+                            .child(record::render_record(record::record_view(&self.session), locale, &p, m, cx.theme().mono_font_family.clone(), &entity))
                     } else {
-                        div().flex_1().min_h(px(0.)).child(DataTable::new(&table).small().stripe(true).accessibility_label("shared-grid"))
-                    })
-                    .children(stats),
+                        div().flex_1().min_h(px(0.)).child(DataTable::new(&table).with_size(gpui_kit::component::Size::Size(px(m.row_h))).header_row_height(px(m.row_h)).stripe(true).accessibility_label("shared-grid"))
+                    }),
             );
         } else if loading {
             // 首屏、换表与替换读取还没回来：不画"没有数据"的空表插图，加载优先于空。
@@ -2258,9 +2221,7 @@ impl Render for GridPane {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(12.))
-                    .text_color(p.text_muted)
-                    .child(t("grid.state.loading")),
+                    .child(kit::loading_state(t("grid.state.loading"), &p)),
             );
         } else {
             // 查询结果没有行是"结果集为空"，不是"表里没有行"。
@@ -2370,11 +2331,11 @@ impl Render for GridPane {
                         .items_center()
                         .gap(px(8.))
                         .child(kit::eyebrow(tag, &p))
-                        .child(div().flex_1().truncate().text_size(px(11.)).text_color(p.text_muted).child(title))
+                        .child(div().flex_1().truncate().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(title))
                         .child(kit::icon_button("grid-value-copy", IconName::Copy, t("grid.value.copyValue"), copy))
                         .child(kit::icon_button("grid-value-close", IconName::X, t("grid.value.close"), close)),
                 )
-                .child(div().font_family(cx.theme().mono_font_family.clone()).text_size(px(12.5)).child(body));
+                .child(div().font_family(cx.theme().mono_font_family.clone()).text_size(px(TypeScale::SM)).child(body));
             if phase == CellPhase::Error {
                 let retry = {
                     let entity = entity.clone();
@@ -2396,7 +2357,7 @@ impl Render for GridPane {
                         .px(px(14.))
                         .pb(px(8.))
                         .bg(p.chrome)
-                        .text_size(px(12.))
+                        .text_size(px(TypeScale::SM))
                         .text_color(p.text_muted)
                         .child(SharedString::from(reason)),
                 );
@@ -2427,9 +2388,9 @@ impl Render for GridPane {
                             .bg(p.raised)
                             .border_1()
                             .border_color(p.line)
-                            .rounded(px(12.))
+                            .rounded(px(Radius::PANEL))
                             .shadow_lg()
-                            .child(kit::title(t("grid.preview.title"), 15., &p))
+                            .child(kit::title(t("grid.preview.title"), TypeScale::LG, &p))
                             .child(kit::muted(SharedString::from(self.session.banner()), &p))
                             .child(
                                 div()
@@ -2437,12 +2398,12 @@ impl Render for GridPane {
                                     .max_h(px(280.))
                                     .overflow_y_scroll()
                                     .p(px(12.))
-                                    .rounded(px(8.))
+                                    .rounded(px(Radius::PANEL))
                                     .bg(p.chrome)
                                     .border_1()
                                     .border_color(p.line)
                                     .font_family(cx.theme().mono_font_family.clone())
-                                    .text_size(px(12.5))
+                                    .text_size(px(TypeScale::SM))
                                     .child(SharedString::from(sql)),
                             )
                             .child(
@@ -2904,7 +2865,7 @@ impl TableDelegate for SheetDelegate {
         let sorted = self.sort.filter(|(index, _)| *index == logical).map(|(_, descending)| descending);
         let header = match sorted {
             Some(descending) => header
-                .child(div().flex_none().px(px(4.)).text_size(px(11.)).child(SharedString::from(if descending { "↓" } else { "↑" }))),
+                .child(div().flex_none().px(px(4.)).text_size(px(TypeScale::XS)).child(SharedString::from(if descending { "↓" } else { "↑" }))),
             None => header,
         };
         let owner = self.owner.clone();
@@ -3193,6 +3154,11 @@ mod pane_tests {
     use crate::grid::commands::{ColumnDto, RowDto};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AnyWindowHandle, Bounds, Modifiers, Pixels, Point, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, size};
+
+    /// 选区矩形里的格子数。
+    fn selected_cells(session: &SharedGrid) -> usize {
+        session.selection_bounds().map_or(0, |(row_start, column_start, row_end, column_end)| (row_end - row_start + 1) * (column_end - column_start + 1))
+    }
 
     fn target() -> GridTarget {
         GridTarget {
@@ -3847,8 +3813,14 @@ mod pane_tests {
         cx.update_window(window, |_, window, cx| {
             plant(&pane, cx);
             window.render_frame(cx);
+            // 不可用原因只在悬停提示里：开关在，常驻的原因文字行不在。
+            assert!(window.find("grid-find-scope").visible());
         })
         .unwrap();
+        {
+            let mut visual = VisualTestContext::from_window(window, cx);
+            assert!(visual.debug_bounds("grid-find-scope-hint").is_some(), "原因挂在开关的悬停提示上");
+        }
         cx.update(|cx| {
             pane.update(cx, |pane, cx| {
                 assert_eq!(pane.session.find_scope(), FindScope::Loaded);
@@ -4307,7 +4279,7 @@ mod pane_tests {
         settle(cx);
         let mouse = cx.update(|cx| {
             let session = &pane.read(cx).session;
-            (session.selection_bounds(), session.focused_row_id().map(str::to_owned), session.tsv(), session.sql_values(), session.selection_stats(), session.stats_text())
+            (session.selection_bounds(), session.focused_row_id().map(str::to_owned), session.tsv(), session.sql_values())
         });
 
         cx.update(|cx| {
@@ -4326,8 +4298,6 @@ mod pane_tests {
             assert_eq!(session.focused_row_id().map(str::to_owned), mouse.1);
             assert_eq!(session.tsv(), mouse.2);
             assert_eq!(session.sql_values(), mouse.3);
-            assert_eq!(session.selection_stats(), mouse.4);
-            assert_eq!(session.stats_text(), mouse.5);
         });
     }
 
@@ -4463,9 +4433,7 @@ mod pane_tests {
                 assert_eq!(pane.session.selection_bounds(), Some((1, 0, 1, 1)), "行头选择应覆盖整行");
                 assert_eq!(pane.session.copy_row(), "2\t乙");
                 assert_eq!(pane.session.sql_values(), "2, '乙'");
-                let stats = pane.session.selection_stats();
-                assert_eq!(stats.cells, 2);
-                assert_eq!(stats.numeric, 1, "只有 id 是数值，name 不是");
+                assert_eq!(selected_cells(&pane.session), 2);
                 // 同一格的回声不收起整行；点到别的格子才换成单格选择。
                 pane.apply_table_event(&TableEvent::SelectCell(1, 2));
                 assert_eq!(pane.session.selection_bounds(), Some((1, 0, 1, 1)));
@@ -4554,7 +4522,7 @@ mod pane_tests {
         cx.update(|cx| {
             let pane = pane.read(cx);
             assert_eq!(pane.session.tsv(), "1\t甲\n2\t乙", "拖选范围就是高亮范围");
-            assert_eq!(pane.session.selection_stats().cells, 4);
+            assert_eq!(selected_cells(&pane.session), 4);
         });
         assert_paint_matches_selection(cx, window, &pane);
         // 高亮画在真实的格子元素上：观测到的边界就是点击用的那个格的边界。
@@ -4565,9 +4533,8 @@ mod pane_tests {
             visual.debug_bounds("grid-cell-1-2").expect("name 格"),
             "高亮与格子是同一个元素"
         );
-        // 统计条同样限宽：窄窗口里用省略号，不横向盖住右边的数据格；完整文本在提示里。
-        let stats_box = visual.debug_bounds("grid-stats").expect("有选择就显示统计条");
-        assert!(stats_box.size.width <= px(520.), "统计条不能超过限宽：{}", stats_box.size.width);
+        // 选中格子不再常驻统计条：选择本身只靠高亮表达，不额外占位。
+        assert!(visual.debug_bounds("grid-stats").is_none(), "选择时不显示自动统计");
 
         // Ctrl/Cmd 单击换角：同一个矩形，同样每格都亮。
         cx.update(|cx| pane.update(cx, |pane, cx| pane.cell_press(0, 0, false, cx)));
@@ -4600,7 +4567,7 @@ mod pane_tests {
         cx.update(|cx| {
             let pane = pane.read(cx);
             assert_eq!(pane.session.selection_bounds(), Some((0, 0, 0, 0)));
-            assert_eq!(pane.session.selection_stats().cells, 1);
+            assert_eq!(selected_cells(&pane.session), 1);
         });
         assert_paint_matches_selection(cx, window, &pane);
         let mut visual = VisualTestContext::from_window(window, cx);
@@ -4620,7 +4587,7 @@ mod pane_tests {
         cx.update(|cx| {
             let pane = pane.read(cx);
             assert_eq!(pane.session.selection_bounds(), Some((0, 1, 1, 1)), "列头选择应覆盖整列");
-            assert_eq!(pane.session.selection_stats().cells, 2);
+            assert_eq!(selected_cells(&pane.session), 2);
         });
         assert_paint_matches_selection(cx, window, &pane);
 
@@ -4632,7 +4599,7 @@ mod pane_tests {
         settle(cx);
         assert_paint_matches_selection(cx, window, &pane);
         let mut visual = VisualTestContext::from_window(window, cx);
-        assert!(visual.debug_bounds("grid-stats").is_none(), "没有选择就不显示统计条");
+        assert!(visual.debug_bounds("grid-stats").is_none());
     }
 
     /// 真实点击表头坐标：# 列头不是数据列，不能把高亮、复制和统计挪到第一列数据上；
@@ -4669,7 +4636,7 @@ mod pane_tests {
             let pane = pane.read(cx);
             assert_eq!(pane.session.selection_bounds(), None, "# 列头点下去不产生整列选择");
             assert_eq!(pane.session.tsv(), "", "点 # 列头不该带出第一列数据的复制内容");
-            assert_eq!(pane.session.selection_stats().cells, 0, "统计范围也不能落到第一列数据上");
+            assert_eq!(selected_cells(&pane.session), 0, "统计范围也不能落到第一列数据上");
             let table = pane.table.read(cx);
             assert_eq!(table.selected_col(), None, "# 列头点下去表格不能停在列模式");
             assert!(!matches!(table.selection(), TableSelection::Column(_)), "# 列头不该留下整列选择：{:?}", table.selection());
@@ -4738,7 +4705,7 @@ mod pane_tests {
             let pane = pane.read(cx);
             assert_eq!(pane.session.selection_bounds(), Some((0, 0, 1, 0)), "第一列数据的列头应覆盖整列");
             assert_eq!(pane.session.tsv(), "1\n2", "整列 TSV 只含这一列数据");
-            assert_eq!(pane.session.selection_stats().cells, 2);
+            assert_eq!(selected_cells(&pane.session), 2);
         });
         assert_paint_matches_selection(cx, window, &pane);
     }
@@ -5329,6 +5296,31 @@ mod workbench_tests {
         cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
         let mut visual = VisualTestContext::from_window(window, cx);
         assert!(visual.debug_bounds("grid-record").is_none());
+    }
+
+    /// 工具条上的记录视图按钮点一下就打开，再点一下关上（走真实点击，不是直接调命令）。
+    #[gpui_kit::test]
+    fn record_toggle_button_opens_and_closes_the_record_view(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            plant(&pane, cx);
+            pane.update(cx, |pane, _| pane.session.select(1, 1, false));
+            window.render_frame(cx);
+            window.click("grid-record-toggle", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert!(cx.update(|cx| pane.read(cx).record_open), "点按钮打开记录视图");
+        {
+            let mut visual = VisualTestContext::from_window(window, cx);
+            assert!(visual.debug_bounds("grid-record").is_some());
+        }
+        cx.update_window(window, |_, window, cx| {
+            window.click("grid-record-toggle", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert!(!cx.update(|cx| pane.read(cx).record_open), "再点一下关上");
     }
 
     #[gpui_kit::test]

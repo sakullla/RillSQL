@@ -7,7 +7,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{div, px, AnyElement, App, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window};
 
 use crate::i18n::{self, Locale};
-use crate::ui::kit::{self, Palette};
+use crate::ui::kit::{self, Metrics, Palette, TypeScale};
 
 use super::session::{CellKind, SharedGrid};
 use super::GridPane;
@@ -107,7 +107,8 @@ fn pane_command(entity: &Entity<GridPane>, id: &'static str) -> impl Fn(&gpui_ki
 }
 
 /// 右侧面板：标题行（行号、上一行、下一行、关闭）和"列名—值"列表。长值点开完整值查看器。
-pub fn render_record(view: Option<RecordView>, locale: Locale, p: &Palette, mono: SharedString, entity: &Entity<GridPane>) -> AnyElement {
+/// 尺寸跟随外壳密度：标题栏取 `bar_h`，字段行最小高度取 `row_h`，列名栏与面板宽度随行高等比伸缩。
+pub fn render_record(view: Option<RecordView>, locale: Locale, p: &Palette, m: Metrics, mono: SharedString, entity: &Entity<GridPane>) -> AnyElement {
     let t = |key: &str| SharedString::from(i18n::text(locale, key));
     let (title, can_prev, can_next) = match &view {
         Some(view) => (SharedString::from(i18n::fill(&i18n::text(locale, "grid.record.title"), &[("row", &view.row_number)])), view.can_prev, view.can_next),
@@ -115,14 +116,14 @@ pub fn render_record(view: Option<RecordView>, locale: Locale, p: &Palette, mono
     };
     let header = div()
         .flex_none()
-        .h(px(34.))
+        .h(px(m.bar_h()))
         .px(px(8.))
         .flex()
         .items_center()
         .gap(px(4.))
         .border_b_1()
         .border_color(p.line)
-        .child(div().flex_1().truncate().text_size(px(12.)).text_color(p.text).child(title))
+        .child(div().flex_1().truncate().text_size(px(TypeScale::SM)).text_color(p.text).child(title))
         .child(kit::icon_button("grid-record-prev", IconName::ChevronUp, t("grid.record.prev"), pane_command(entity, "grid-record-prev")).disabled(!can_prev))
         .child(kit::icon_button("grid-record-next", IconName::ChevronDown, t("grid.record.next"), pane_command(entity, "grid-record-next")).disabled(!can_next))
         .child(kit::icon_button("grid-record-close", IconName::X, t("grid.record.close"), pane_command(entity, "grid-record-close")));
@@ -143,8 +144,9 @@ pub fn render_record(view: Option<RecordView>, locale: Locale, p: &Palette, mono
                         .id(("grid-record-field", column))
                         .debug_selector(move || format!("grid-record-field-{column}"))
                         .flex_none()
+                        .min_h(px(m.row_h))
                         .px(px(8.))
-                        .py(px(4.))
+                        .py(px(m.row_pad_y - 1.))
                         .flex()
                         .items_start()
                         .gap(px(8.))
@@ -152,19 +154,19 @@ pub fn render_record(view: Option<RecordView>, locale: Locale, p: &Palette, mono
                         .border_color(p.line_soft)
                         .child(
                             div()
-                                .w(px(120.))
+                                .w(px(m.row_h * 4.))
                                 .flex_none()
                                 .flex()
                                 .flex_col()
-                                .child(div().truncate().text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(name)))
-                                .child(div().truncate().text_size(px(11.)).text_color(p.text_faint).child(SharedString::from(field.type_name.clone()))),
+                                .child(div().truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(name)))
+                                .child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(field.type_name.clone()))),
                         )
                         .child(
                             div()
                                 .flex_1()
                                 .min_w(px(0.))
                                 .font_family(mono.clone())
-                                .text_size(px(12.))
+                                .text_size(px(TypeScale::SM))
                                 .when(field.null, |this| this.italic().text_color(p.text_faint))
                                 .when(!field.null, |this| this.text_color(p.text))
                                 .child(SharedString::from(field.label.clone())),
@@ -174,7 +176,7 @@ pub fn render_record(view: Option<RecordView>, locale: Locale, p: &Palette, mono
             }
         }
         None => {
-            body = body.child(div().p(px(12.)).text_size(px(12.)).text_color(p.text_muted).child(t("grid.record.empty")));
+            body = body.child(div().p(px(12.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(t("grid.record.empty")));
         }
     }
     div()
@@ -183,7 +185,7 @@ pub fn render_record(view: Option<RecordView>, locale: Locale, p: &Palette, mono
         .role(gpui_kit::Role::Region)
         .aria_label(t("grid.record.open"))
         .flex_none()
-        .w(px(300.))
+        .w(px(m.row_h * 10.))
         .h_full()
         .flex()
         .flex_col()

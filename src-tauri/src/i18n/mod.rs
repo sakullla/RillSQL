@@ -128,6 +128,7 @@ dict! {
     "shell.command.paste" => "粘贴", "Paste";
     "shell.command.selectAll" => "全选", "Select all";
     "shell.shortcuts.copySqlValue" => "复制为 SQL 值（区分 NULL）", "Copy as SQL values (NULL-aware)";
+    "shell.shortcuts.pasteCells" => "从焦点格粘贴 TSV（整批暂存，越界或只读整批拒绝）", "Paste TSV from the focused cell (staged as one batch; rejected whole if out of range or read-only)";
     "common.save" => "保存", "Save";
     "common.cancel" => "取消", "Cancel";
     "common.close" => "关闭", "Close";
@@ -390,8 +391,6 @@ dict! {
     "grid.readonly.locatePending" => "正在确认唯一键，确认前只读。", "The unique key is still being checked, so the grid is read-only for now.";
     "grid.readonly.queryResult" => "查询结果不能新增行；表数据页才可新增。", "Rows cannot be inserted into a query result; open the table data to insert.";
 
-    "grid.stats.text" => "已选 {cells} 格 · 数值 {numeric} · 合计 {sum} · 平均 {avg} · 最小 {min} · 最大 {max} · 跳过 NULL {null} / 空串 {empty} / 二进制 {binary} / 非数值 {text} / 未完整 {incomplete}", "Selected {cells} cells · numeric {numeric} · sum {sum} · avg {avg} · min {min} · max {max} · skipped null {null} / empty {empty} / binary {binary} / non-numeric {text} / incomplete {incomplete}";
-    "grid.stats.none" => "—", "—";
     "grid.errors.viewReadonly" => "视图是只读的，不能新增、修改或删除数据。", "Views are read-only; data cannot be inserted, modified or deleted.";
     "query.run.runScript" => "执行脚本", "Run script";
     "query.run.cancel" => "取消", "Cancel";
@@ -709,7 +708,6 @@ dict! {
     "ui.status.ready" => "就绪", "Ready";
     "ui.status.noTarget" => "未选择连接", "No connection";
     "ui.tool.admin" => "数据库管理", "Database admin";
-    "ui.welcome.subtitle" => "轻量、快速的桌面数据库工作台", "A fast, focused desktop database workbench";
     "ui.welcome.start" => "开始", "Start";
     "ui.welcome.connectionHint" => "PostgreSQL、MySQL、SQL Server、Redis 等", "PostgreSQL, MySQL, SQL Server, Redis…";
     "ui.welcome.sqliteHint" => "打开本机的 .sqlite / .db 文件", "Open a local .sqlite / .db file";
@@ -808,6 +806,13 @@ dict! {
     "ui.exchange.fullHint" => "重新查询并导出完整结果", "Re-run and export the full result";
     "ui.exchange.dumpHint" => "把整个库导出为 SQL 文件", "Dump the whole database to SQL";
     "ui.exchange.migrateHint" => "把这张表复制到另一个库", "Copy this table into another database";
+    "ui.exchange.importNeedsTable" => "导入需要当前表数据", "Import needs current table data";
+    "ui.exchange.importNeedsTableHint" => "切换到“当前表数据”并打开一张表后，才能选择文件并确认写入。", "Switch to “Current table data” and open a table before choosing a file and confirming the write.";
+    "ui.exchange.noTableData" => "当前没有表数据；先在对象树里打开一张表。", "No table data yet; open a table in the object tree first.";
+    "ui.exchange.queryResult" => "查询结果", "Query result";
+    "ui.exchange.noResult" => "当前查询还没有结果；先执行一次查询。", "The current query has no result yet; run it first.";
+    "ui.exchange.tableLoading" => "表数据正在读取，当前行数尚未完整。", "Table data is still loading; the row count is not final yet.";
+    "ui.exchange.loadedOnly" => "查询结果只有已读取的行；全量导出不可用。", "A query result only has its loaded rows; full export is unavailable.";
     "ui.exchange.dropHint" => "把 CSV / Excel / JSON 文件拖到窗口里，或选择文件", "Drop a CSV / Excel / JSON file here, or pick one";
     "ui.compare.changed" => "列差异", "Column changes";
     "shell.command.openExchange" => "导入 / 导出", "Import / export";

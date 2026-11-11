@@ -14,7 +14,7 @@ use gpui_kit::{
     TestSupportExt as _, Window, div, px,
 };
 
-use crate::ui::kit::{self, Palette};
+use crate::ui::kit::{self, Palette, Radius, Tip as _, TypeScale};
 
 use crate::application::tasks::{TaskOutcome, TaskToken};
 use crate::application::{AppServices, cancel_compare, compare_cancelled};
@@ -1115,6 +1115,7 @@ fn empty_data(refused: Option<String>) -> DataReport {
 impl Render for ComparePane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
+        let m = kit::Metrics::of(cx);
         let entity = cx.entity();
         let mono = cx.theme().mono_font_family.clone();
         let t = |this: &Self, key: &str| SharedString::from(this.text(key));
@@ -1139,7 +1140,7 @@ impl Render for ComparePane {
         if self.running {
             actions = actions
                 .child(kit::tool_button("compare-cancel", Some(IconName::X), t(self, "common.cancel"), compare_act("compare-cancel", &entity)))
-                .child(div().flex().items_center().gap(px(6.)).text_size(px(12.)).text_color(p.text_muted).child(Spinner::new().xsmall().color(p.accent)).child(t(self, "compare.dialog.comparing")));
+                .child(div().flex().items_center().gap(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(Spinner::new().xsmall().color(p.accent)).child(t(self, "compare.dialog.comparing")));
         } else {
             actions = actions.child(div().invisible().child(kit::tool_button("compare-cancel", None, t(self, "common.cancel"), compare_act("compare-cancel", &entity))));
         }
@@ -1160,11 +1161,11 @@ impl Render for ComparePane {
                     .gap(px(8.))
                     .px(px(12.))
                     .py(px(10.))
-                    .rounded(px(8.))
+                    .rounded(px(Radius::PANEL))
                     .bg(p.warn_soft)
                     .text_color(p.warn)
                     .child(kit::icon(IconName::TriangleAlert, 15., p.warn))
-                    .child(div().flex_1().min_w(px(180.)).text_size(px(12.5)).child(SharedString::from(self.place_prompt.clone())))
+                    .child(div().flex_1().min_w(px(180.)).text_size(px(TypeScale::SM)).child(SharedString::from(self.place_prompt.clone())))
                     .child(kit::secondary_button("compare-place-cancel", None, t(self, "common.cancel"), compare_act("compare-place-cancel", &entity)))
                     .child(kit::primary_button(
                         "compare-place-confirm",
@@ -1183,7 +1184,7 @@ impl Render for ComparePane {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(kit::title(t(self, "compare.dialog.structureScript"), 14., &p))
+                    .child(kit::title(t(self, "compare.dialog.structureScript"), TypeScale::LG, &p))
                     .when(can_place, |this| {
                         this.child(kit::primary_button("compare-place:structure", Some(IconName::SquareTerminal), t(self, "compare.dialog.placeToQuery"), compare_act("compare-place:structure", &entity)))
                     }),
@@ -1224,19 +1225,19 @@ impl Render for ComparePane {
                         let on = self.selected.get(&table.name).copied().unwrap_or(false);
                         let mark = if on { "on" } else { "off" };
                         tables = tables.child(
-                            chip(SharedString::from(format!("compare-toggle:{}", table.name)), SharedString::from(format!("{mark} {}", table.name)), SharedString::from(table.name.clone()), on, Some(if on { IconName::SquareCheck } else { IconName::Square }), &p)
+                            chip(SharedString::from(format!("compare-toggle:{}", table.name)), SharedString::from(format!("{mark} {}", table.name)), SharedString::from(table.name.clone()), on, Some(if on { IconName::SquareCheck } else { IconName::Square }), &p, m)
                                 .on_click(compare_act(format!("compare-toggle:{}", table.name), &entity)),
                         );
                     }
                     card = card.child(div().flex().flex_col().gap(px(6.)).child(kit::eyebrow(t(self, "compare.dialog.dataTitle"), &p)).child(tables));
                     for table in report.tables.iter().filter(|table| table.needs_key_choice) {
-                        let mut keys = div().flex().flex_wrap().items_center().gap(px(6.)).child(div().text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(format!("{} · {}", table.name, self.text("compare.dialog.chooseKey")))));
+                        let mut keys = div().flex().flex_wrap().items_center().gap(px(6.)).child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(format!("{} · {}", table.name, self.text("compare.dialog.chooseKey")))));
                         for key in &table.keys {
                             let chosen = self.chosen_key.get(&table.name).is_some_and(|name| name == &key.name);
                             let mark = if chosen { "chosen" } else { "key" };
                             let id = format!("compare-key:{}|{}", table.name, key.name);
                             keys = keys.child(
-                                chip(SharedString::from(id.clone()), SharedString::from(format!("{mark} {} {}", table.name, key.name)), SharedString::from(format!("{} ({})", key.name, key.columns.join(", "))), chosen, Some(IconName::Key), &p)
+                                chip(SharedString::from(id.clone()), SharedString::from(format!("{mark} {} {}", table.name, key.name)), SharedString::from(format!("{} ({})", key.name, key.columns.join(", "))), chosen, Some(IconName::Key), &p, m)
                                     .on_click(compare_act(id, &entity)),
                             );
                         }
@@ -1257,7 +1258,7 @@ impl Render for ComparePane {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(kit::title(t(self, "compare.dialog.dataTitle"), 14., &p))
+                    .child(kit::title(t(self, "compare.dialog.dataTitle"), TypeScale::LG, &p))
                     .when(can_place, |this| {
                         this.child(kit::primary_button("compare-place:data", Some(IconName::SquareTerminal), t(self, "compare.dialog.dataDisclosure"), compare_act("compare-place:data", &entity)))
                     }),
@@ -1292,7 +1293,7 @@ impl Render for ComparePane {
         let context_note = (!self.context_note.is_empty()).then(|| {
             div()
                 .id("compare-context")
-                .text_size(px(12.5))
+                .text_size(px(TypeScale::SM))
                 .text_color(p.text_muted)
                 .child(SharedString::from(self.context_note.clone()))
         });
@@ -1321,8 +1322,8 @@ impl Render for ComparePane {
                                     .flex()
                                     .items_center()
                                     .gap(px(12.))
-                                    .child(div().size(px(34.)).rounded(px(9.)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(IconName::GitCompare, 17., p.accent_text)))
-                                    .child(div().flex().flex_col().child(kit::title(t(self, "compare.dialog.title"), 16., &p)).child(kit::muted(t(self, "compare.dialog.subtitle"), &p))),
+                                    .child(div().size(px(34.)).rounded(px(Radius::PANEL)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(IconName::GitCompare, 17., p.accent_text)))
+                                    .child(div().id("compare-title").flex().flex_col().tooltip_text(t(self, "compare.dialog.subtitle")).child(kit::title(t(self, "compare.dialog.title"), TypeScale::LG, &p))),
                             )
                             // 对比是独立页面：返回入口把原工作项与焦点一起带回去。
                             .child(kit::tool_button("compare-back", Some(IconName::ArrowLeft), t(self, "compare.back"), compare_act("compare-back", &entity))),
@@ -1336,6 +1337,7 @@ impl Render for ComparePane {
 impl ComparePane {
     fn side_card(&mut self, baseline: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
+        let m = kit::Metrics::of(cx);
         let entity = cx.entity();
         let which = if baseline { "baseline" } else { "target" };
         let title = self.text(if baseline { "compare.dialog.baseline" } else { "compare.dialog.target" });
@@ -1359,7 +1361,7 @@ impl ComparePane {
             let id = format!("compare-{which}:{}", choice.id);
             let selected = side_connection == choice.id;
             connections = connections.child(
-                chip(SharedString::from(id.clone()), SharedString::from(format!("{title} {}", choice.name)), SharedString::from(choice.name.clone()), selected, Some(IconName::Database), &p)
+                chip(SharedString::from(id.clone()), SharedString::from(format!("{title} {}", choice.name)), SharedString::from(choice.name.clone()), selected, Some(IconName::Database), &p, m)
                     .on_click(compare_act(id, &entity)),
             );
             if selected {
@@ -1376,7 +1378,7 @@ impl ComparePane {
                 for name in &choice.databases {
                     let id = format!("compare-database:{which}:{name}");
                     list = list.child(
-                        chip(SharedString::from(id.clone()), SharedString::from(format!("{title} {database_label} {name}")), SharedString::from(name.clone()), side_database == *name, Some(IconName::Database), &p)
+                        chip(SharedString::from(id.clone()), SharedString::from(format!("{title} {database_label} {name}")), SharedString::from(name.clone()), side_database == *name, Some(IconName::Database), &p, m)
                             .on_click(compare_act(id, &entity)),
                     );
                 }
@@ -1390,7 +1392,7 @@ impl ComparePane {
                         for name in names {
                             let id = format!("compare-schema:{which}:{name}");
                             list = list.child(
-                                chip(SharedString::from(id.clone()), SharedString::from(format!("{title} {schema_label} {name}")), SharedString::from(name.clone()), side_schema == name, Some(IconName::Layers), &p)
+                                chip(SharedString::from(id.clone()), SharedString::from(format!("{title} {schema_label} {name}")), SharedString::from(name.clone()), side_schema == name, Some(IconName::Layers), &p, m)
                                     .on_click(compare_act(id, &entity)),
                             );
                         }
@@ -1407,7 +1409,7 @@ impl ComparePane {
                                 .flex_col()
                                 .gap(px(6.))
                                 .child(kit::eyebrow(SharedString::from(schema_label), &p))
-                                .when(!reason.is_empty(), |this| this.child(div().text_size(px(12.)).text_color(p.warn).child(SharedString::from(reason.clone()))))
+                                .when(!reason.is_empty(), |this| this.child(div().text_size(px(TypeScale::SM)).text_color(p.warn).child(SharedString::from(reason.clone()))))
                                 .child(
                                     div()
                                         .capture_key_down({
@@ -1430,7 +1432,7 @@ impl ComparePane {
                         );
                     }
                     Some(SchemaState::Loading) | None => {
-                        card = card.child(div().flex().items_center().gap(px(6.)).text_size(px(12.)).text_color(p.text_muted).child(Spinner::new().xsmall()).child(SharedString::from(self.text("compare.dialog.schemaLoading"))));
+                        card = card.child(div().flex().items_center().gap(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(Spinner::new().xsmall()).child(SharedString::from(self.text("compare.dialog.schemaLoading"))));
                     }
                 }
             }
@@ -1471,22 +1473,20 @@ fn compare_act(id: impl Into<String>, entity: &Entity<ComparePane>) -> impl Fn(&
 }
 
 /// 可选中的小块：显示文字与无障碍名称分开，测试按名称找。
-fn chip(id: SharedString, label: SharedString, text: SharedString, selected: bool, icon: Option<IconName>, p: &Palette) -> gpui_kit::base::ObservedElement<gpui_kit::Stateful<gpui_kit::Div>> {
-    div()
-        .id(id)
+fn chip(id: SharedString, label: SharedString, text: SharedString, selected: bool, icon: Option<IconName>, p: &Palette, m: kit::Metrics) -> gpui_kit::base::ObservedElement<gpui_kit::Stateful<gpui_kit::Div>> {
+    kit::interactive_states(div().id(id), p, false)
         .test_support()
         .role(gpui_kit::Role::Button)
         .aria_label(label)
         .aria_selected(selected)
-        .h(px(28.))
+        .h(px(m.tree_row_h))
         .px(px(10.))
         .flex()
         .items_center()
         .gap(px(6.))
-        .rounded(px(7.))
+        .rounded(px(Radius::CONTROL))
         .border_1()
-        .text_size(px(12.5))
-        .cursor_pointer()
+        .text_size(px(TypeScale::SM))
         .when(selected, |this| this.border_color(p.accent).bg(p.accent_soft).text_color(p.accent_text))
         .when(!selected, |this| this.border_color(p.line).hover(|style| style.border_color(p.line_strong).bg(p.hover)))
         .when_some(icon, |this, icon| this.child(kit::icon(icon, 13., if selected { p.accent_text } else { p.text_faint })))
@@ -1497,13 +1497,13 @@ fn stat(label: String, value: usize, tone: gpui_kit::Hsla, p: &Palette) -> AnyEl
     div()
         .flex_1()
         .p(px(10.))
-        .rounded(px(8.))
+        .rounded(px(Radius::PANEL))
         .bg(p.chrome)
         .flex()
         .flex_col()
         .gap(px(2.))
-        .child(div().text_size(px(20.)).font_weight(gpui_kit::FontWeight::SEMIBOLD).text_color(tone).child(SharedString::from(value.to_string())))
-        .child(div().text_size(px(11.5)).text_color(p.text_muted).child(SharedString::from(label)))
+        .child(div().text_size(px(TypeScale::XL)).font_weight(gpui_kit::FontWeight::SEMIBOLD).text_color(tone).child(SharedString::from(value.to_string())))
+        .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(SharedString::from(label)))
         .into_any_element()
 }
 
@@ -1513,10 +1513,10 @@ fn diff_row(mark: &'static str, text: String, tone: gpui_kit::Hsla, p: &Palette)
         .gap(px(8.))
         .px(px(8.))
         .py(px(4.))
-        .rounded(px(6.))
+        .rounded(px(Radius::CONTROL))
         .hover(|style| style.bg(p.hover))
         .child(div().w(px(12.)).font_weight(gpui_kit::FontWeight::BOLD).text_color(tone).child(mark))
-        .child(div().flex_1().min_w(px(0.)).text_size(px(12.5)).child(SharedString::from(text)))
+        .child(div().flex_1().min_w(px(0.)).text_size(px(TypeScale::SM)).child(SharedString::from(text)))
         .into_any_element()
 }
 
@@ -1526,10 +1526,10 @@ fn note_banner(icon: IconName, text: String, fg: gpui_kit::Hsla, bg: gpui_kit::H
         .py(px(8.))
         .flex()
         .gap(px(8.))
-        .rounded(px(8.))
+        .rounded(px(Radius::PANEL))
         .bg(bg)
         .text_color(fg)
-        .text_size(px(12.5))
+        .text_size(px(TypeScale::SM))
         .child(kit::icon(icon, 15., fg))
         .child(div().flex_1().min_w(px(0.)).child(SharedString::from(text)))
         .into_any_element()
@@ -1541,12 +1541,12 @@ fn script_block(id: &'static str, script: String, mono: &SharedString, p: &Palet
         .max_h(px(260.))
         .overflow_y_scroll()
         .p(px(12.))
-        .rounded(px(8.))
+        .rounded(px(Radius::PANEL))
         .bg(p.chrome)
         .border_1()
         .border_color(p.line)
         .font_family(mono.clone())
-        .text_size(px(12.))
+        .text_size(px(TypeScale::SM))
         .child(SharedString::from(script))
         .into_any_element()
 }

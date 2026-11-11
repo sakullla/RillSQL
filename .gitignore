@@ -15,5 +15,8 @@ docs/verification/*
 !docs/verification/2026-11-09-GPUI-workbench-navigation-grid-experience.md
 !docs/verification/gpui-workbench/
 !docs/verification/gpui-workbench/**
+!docs/verification/2026-11-11-workbench-visual-audit.md
+!docs/verification/workbench-2026-11-11/
+!docs/verification/workbench-2026-11-11/**
 .compose/
 plans/

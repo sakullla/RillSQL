@@ -13,7 +13,7 @@ use gpui_kit::{
 use crate::i18n::{self, Locale};
 use crate::query::assist::OutlineItem;
 use crate::query::desk::ObjectInfo;
-use crate::ui::kit::{self, Metrics, Palette};
+use crate::ui::kit::{self, Metrics, Palette, Radius, TypeScale};
 
 use super::QueryPane;
 
@@ -147,7 +147,7 @@ fn outline(items: &[OutlineItem], locale: Locale, metrics: Metrics, mono: &Share
                 .test_support()
                 .px(px(6.))
                 .py(px(4.))
-                .text_size(px(12.))
+                .text_size(px(TypeScale::SM))
                 .text_color(p.text_muted)
                 .child(SharedString::from(i18n::text(locale, "query.side.noStatements"))),
         );
@@ -157,12 +157,10 @@ fn outline(items: &[OutlineItem], locale: Locale, metrics: Metrics, mono: &Share
         let id = format!("outline:{}", item.index);
         let jump = entity.clone();
         list = list.child(
-            div()
-                .id(SharedString::from(format!("query-outline-{}", item.index)))
+            kit::interactive_states(div().id(SharedString::from(format!("query-outline-{}", item.index))), p, false)
                 .test_support()
                 .role(gpui_kit::Role::Button)
                 .aria_label(SharedString::from(format!("{} {}", i18n::text(locale, "query.outline.jump"), item.index)))
-                .cursor_pointer()
                 .on_click(move |_, _, cx| {
                     let id = id.clone();
                     jump.update(cx, |pane, cx| pane.command(&id, cx));
@@ -170,11 +168,11 @@ fn outline(items: &[OutlineItem], locale: Locale, metrics: Metrics, mono: &Share
                 .flex_none()
                 .min_h(px(metrics.tree_row_h))
                 .px(px(6.))
-                .rounded(px(6.))
+                .rounded(px(Radius::CONTROL))
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .text_size(px(12.))
+                .text_size(px(TypeScale::SM))
                 .hover(|style| style.bg(p.hover))
                 .child(div().flex_none().text_color(p.text_faint).child(SharedString::from(format!("{}", item.index))))
                 .child(
@@ -219,7 +217,7 @@ fn object(info: Option<&ObjectInfo>, locale: Locale, metrics: Metrics, mono: &Sh
                 div()
                     .id("query-side-object-none")
                     .test_support()
-                    .text_size(px(12.))
+                    .text_size(px(TypeScale::SM))
                     .text_color(p.text_muted)
                     .child(SharedString::from(i18n::text(locale, "query.side.noObject"))),
             )
@@ -253,15 +251,15 @@ fn object(info: Option<&ObjectInfo>, locale: Locale, metrics: Metrics, mono: &Sh
                         .flex()
                         .items_center()
                         .gap(px(6.))
-                        .child(div().min_w(px(0.)).truncate().font_family(mono.clone()).text_size(px(13.)).text_color(p.text).child(SharedString::from(qualified)))
-                        .child(div().flex_none().text_size(px(11.)).text_color(p.text_faint).child(SharedString::from(kind))),
+                        .child(div().min_w(px(0.)).truncate().font_family(mono.clone()).text_size(px(TypeScale::MD)).text_color(p.text).child(SharedString::from(qualified)))
+                        .child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(kind))),
                 )
                 .when(!info.comment.is_empty(), |this| {
-                    this.child(div().id("query-side-object-comment").test_support().text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(info.comment.clone())))
+                    this.child(div().id("query-side-object-comment").test_support().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(info.comment.clone())))
                 }),
         );
     if info.columns.is_empty() {
-        body = body.child(div().px(px(12.)).text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(i18n::text(locale, "query.side.noColumns"))));
+        body = body.child(div().px(px(12.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(i18n::text(locale, "query.side.noColumns"))));
     }
     for (index, column) in info.columns.iter().enumerate() {
         let focused = info.column.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(&column.name));
@@ -283,7 +281,7 @@ fn object(info: Option<&ObjectInfo>, locale: Locale, metrics: Metrics, mono: &Sh
                 .flex()
                 .flex_col()
                 .justify_center()
-                .text_size(px(12.))
+                .text_size(px(TypeScale::SM))
                 .when(focused, |this| this.bg(p.accent_soft))
                 .child(
                     div()
@@ -293,10 +291,10 @@ fn object(info: Option<&ObjectInfo>, locale: Locale, metrics: Metrics, mono: &Sh
                         .child(div().min_w(px(0.)).truncate().font_family(mono.clone()).text_color(p.text).child(SharedString::from(column.name.clone())))
                         .child(div().flex_1())
                         .child(div().flex_none().text_color(p.text_muted).child(SharedString::from(column.type_name.clone())))
-                        .when(!nullable.is_empty(), |this| this.child(div().flex_none().text_size(px(11.)).text_color(p.text_faint).child(SharedString::from(nullable)))),
+                        .when(!nullable.is_empty(), |this| this.child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(nullable)))),
                 )
                 .when(!column.comment.is_empty(), |this| {
-                    this.child(div().truncate().text_size(px(11.)).text_color(p.text_faint).child(SharedString::from(column.comment.clone())))
+                    this.child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(column.comment.clone())))
                 }),
         );
     }

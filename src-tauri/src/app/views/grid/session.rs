@@ -333,40 +333,6 @@ pub enum CopyScope {
     Column,
 }
 
-/// 已选且已读取值的统计。跳过项分别计数：NULL、空串、二进制、非数值和未完整值
-/// 都不混进 sum/avg/min/max，也不用 0 冒充缺失的分母。
-#[derive(Clone, Debug, PartialEq)]
-pub struct SelectionStats {
-    pub cells: usize,
-    pub numeric: usize,
-    pub sum: f64,
-    pub average: Option<f64>,
-    pub min: Option<f64>,
-    pub max: Option<f64>,
-    pub skipped_null: usize,
-    pub skipped_empty: usize,
-    pub skipped_binary: usize,
-    pub skipped_text: usize,
-    pub skipped_incomplete: usize,
-}
-
-impl SelectionStats {
-    pub fn skipped(&self) -> usize {
-        self.skipped_null + self.skipped_empty + self.skipped_binary + self.skipped_text + self.skipped_incomplete
-    }
-}
-
-/// 统计时对单个格子的归类；只有 Numeric 进入数值汇总。
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum StatCell {
-    Numeric(f64),
-    Null,
-    Empty,
-    Binary,
-    Text,
-    Incomplete,
-}
-
 /// 还能不能继续读。加载中、还有更多、已完整、以及网格不能自己延续的结果要分开。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Continuation {
@@ -2642,115 +2608,6 @@ impl SharedGrid {
         sql_cell(engine, column.map(domain_column).as_ref(), &cell_of(value))
     }
 
-    /// 已选且已读取值的统计；未读取或不存在的格子记为未完整值，不参与数值汇总。
-    pub fn selection_stats(&self) -> SelectionStats {
-        let mut stats = SelectionStats {
-            cells: 0,
-            numeric: 0,
-            sum: 0.0,
-            average: None,
-            min: None,
-            max: None,
-            skipped_null: 0,
-            skipped_empty: 0,
-            skipped_binary: 0,
-            skipped_text: 0,
-            skipped_incomplete: 0,
-        };
-        // 逐格遍历矩形边界，不先铺开整个选区的点集：全选大表时重绘也不再每帧分配一块 Vec。
-        let Some((row_start, column_start, row_end, column_end)) = self.selection_bounds() else {
-            return stats;
-        };
-        for row in row_start..=row_end {
-            for column in column_start..=column_end {
-                stats.cells += 1;
-                match self.stat_cell(row, column) {
-                    StatCell::Numeric(value) => {
-                        stats.numeric += 1;
-                        stats.sum += value;
-                        stats.min = Some(stats.min.map_or(value, |min: f64| min.min(value)));
-                        stats.max = Some(stats.max.map_or(value, |max: f64| max.max(value)));
-                    }
-                    StatCell::Null => stats.skipped_null += 1,
-                    StatCell::Empty => stats.skipped_empty += 1,
-                    StatCell::Binary => stats.skipped_binary += 1,
-                    StatCell::Text => stats.skipped_text += 1,
-                    StatCell::Incomplete => stats.skipped_incomplete += 1,
-                }
-            }
-        }
-        if stats.numeric > 0 {
-            stats.average = Some(stats.sum / stats.numeric as f64);
-        }
-        stats
-    }
-
-    /// 状态栏一句话统计；没有选择时为空。一次遍历得出全部数字，空选区不铺开点集。
-    pub fn stats_text(&self) -> Option<String> {
-        let stats = self.selection_stats();
-        if stats.cells == 0 {
-            return None;
-        }
-        let number = |value: Option<f64>| value.map(format_number).unwrap_or_else(|| i18n::text(self.locale, "grid.stats.none"));
-        let cells = stats.cells.to_string();
-        let numeric = stats.numeric.to_string();
-        // 没有数值时合计写 —，和平均/最小/最大一样表示"没有"，不拿 0 冒充零和。
-        let sum = if stats.numeric == 0 {
-            i18n::text(self.locale, "grid.stats.none")
-        } else {
-            format_number(stats.sum)
-        };
-        let average = number(stats.average);
-        let min = number(stats.min);
-        let max = number(stats.max);
-        let null = stats.skipped_null.to_string();
-        let empty = stats.skipped_empty.to_string();
-        let binary = stats.skipped_binary.to_string();
-        let text = stats.skipped_text.to_string();
-        let incomplete = stats.skipped_incomplete.to_string();
-        Some(i18n::fill(
-            &i18n::text(self.locale, "grid.stats.text"),
-            &[
-                ("cells", &cells),
-                ("numeric", &numeric),
-                ("sum", &sum),
-                ("avg", &average),
-                ("min", &min),
-                ("max", &max),
-                ("null", &null),
-                ("empty", &empty),
-                ("binary", &binary),
-                ("text", &text),
-                ("incomplete", &incomplete),
-            ],
-        ))
-    }
-
-    fn stat_cell(&self, row: usize, column: usize) -> StatCell {
-        let Some(slot) = self.value_at(row, column) else {
-            return StatCell::Incomplete;
-        };
-        let Some(text) = slot else {
-            return StatCell::Null;
-        };
-        if text.is_empty() {
-            return StatCell::Empty;
-        }
-        let type_name = self.columns.get(column).map(|item| item.type_name.as_str()).unwrap_or("");
-        if let Some(envelope) = crate::grid::preview_envelope(&text, type_name, self.sheet_preview_bytes) {
-            // 预览信封不是原值：读到原值才参与统计，二进制仍是二进制。
-            return match (envelope, self.full_text_at(row, column)) {
-                (crate::grid::PreviewValue::Binary { .. }, _) => StatCell::Binary,
-                (crate::grid::PreviewValue::Text { .. }, Some(Some(full))) => numeric_or_text(&full),
-                _ => StatCell::Incomplete,
-            };
-        }
-        if matches!(value_family(type_name), ValueFamily::Binary) {
-            return StatCell::Binary;
-        }
-        numeric_or_text(&text)
-    }
-
     pub fn filter_focused_value(&mut self) {
         let Some((row, column)) = self.focus_cell() else {
             return;
@@ -3744,14 +3601,6 @@ pub fn classify_with_limit(
     ShownCell { kind: CellKind::Text, label: text.clone(), body: text, preview: false }
 }
 
-/// 统计里的数值判定：能解析成有限小数就算数值，其余算文本。
-fn numeric_or_text(text: &str) -> StatCell {
-    match text.trim().parse::<f64>() {
-        Ok(number) if number.is_finite() => StatCell::Numeric(number),
-        _ => StatCell::Text,
-    }
-}
-
 fn editable_names(schema: &TableSchema, columns: &[String], proof: &TableProof) -> Vec<String> {
     let _ = proof;
     columns.iter().filter(|name| schema.columns.iter().any(|column| column.name == name.as_str())).cloned().collect()
@@ -3817,18 +3666,6 @@ fn quote_tsv(value: &str, force: bool) -> String {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         value.to_owned()
-    }
-}
-
-/// 统计数字的文本：整数不带小数点，小数最多保留六位并去掉尾零。
-fn format_number(value: f64) -> String {
-    if !value.is_finite() {
-        return String::new();
-    }
-    if value == value.trunc() && value.abs() < 1e15 {
-        format!("{}", value as i64)
-    } else {
-        format!("{value:.6}").trim_end_matches('0').trim_end_matches('.').to_owned()
     }
 }
 
@@ -5150,64 +4987,6 @@ mod tests {
         pool.close().await;
         assert_eq!(left, 0);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn stats_grid() -> SharedGrid {
-        let mut grid = SharedGrid::new();
-        grid.target.engine = "sqlite".into();
-        let columns = vec![
-            int_column("id"),
-            text_column("name"),
-            GridColumn { type_name: "decimal".into(), ..text_column("amount") },
-            GridColumn { type_name: "blob".into(), ..text_column("blob") },
-        ];
-        // 信封只出现在投影真的会截断的地方：二进制列的 b: 前缀和文本列的超长 t: 前缀。
-        let rows = vec![
-            row("1", vec![Some("1"), Some("甲"), Some("10"), Some("\u{1}b:4")], true),
-            row("2", vec![Some("2"), Some(""), Some("2.5"), Some("00ff")], true),
-            row("3", vec![Some("3"), Some("\u{1}t:2048:abc"), None, None], true),
-            row("4", vec![Some("4"), Some("12"), Some("x"), None], true),
-            row("5", vec![Some("5"), Some("待定"), Some("7"), None], true),
-        ];
-        grid.load_local(columns, rows, Some(5), Some(schema()));
-        grid
-    }
-
-    #[test]
-    fn mixed_value_stats_report_numbers_and_count_each_skipped_kind() {
-        let mut grid = stats_grid();
-        grid.select_all_loaded();
-        let stats = grid.selection_stats();
-        assert_eq!(stats.cells, 20);
-        // 数值来自整数 id、decimal 列和文本列里可解析的数字。
-        assert_eq!(stats.numeric, 9);
-        assert!((stats.sum - 46.5).abs() < 1e-9, "{}", stats.sum);
-        assert!((stats.average.unwrap() - 46.5 / 9.0).abs() < 1e-9);
-        assert_eq!(stats.min, Some(1.0));
-        assert_eq!(stats.max, Some(12.0));
-        assert_eq!(stats.skipped_null, 4);
-        assert_eq!(stats.skipped_empty, 1);
-        assert_eq!(stats.skipped_binary, 2);
-        assert_eq!(stats.skipped_text, 3);
-        // 大值预览信封不是原值，单独算未完整，不参与求和。
-        assert_eq!(stats.skipped_incomplete, 1);
-        assert_eq!(stats.skipped(), 11);
-        let text = grid.stats_text().expect("有选择就有统计");
-        assert!(text.contains("20") && text.contains("9") && text.contains("46.5"), "{text}");
-        assert!(text.contains("跳过 NULL"), "{text}");
-
-        // 只选一个 NULL 格：没有数值，也不能把平均值写成 0。
-        grid.select(2, 2, false);
-        let only_null = grid.selection_stats();
-        assert_eq!(only_null.cells, 1);
-        assert_eq!(only_null.numeric, 0);
-        assert_eq!(only_null.average, None);
-        assert_eq!(only_null.min, None);
-        assert_eq!(only_null.skipped_null, 1);
-        let text = grid.stats_text().expect("统计");
-        assert!(text.contains(i18n::text(Locale::ZhCn, "grid.stats.none").as_str()), "{text}");
-        // 没有数值时合计同样写 —，不拿 0 冒充零和。
-        assert!(text.contains("合计 —"), "无数值选区的合计不能是 0：{text}");
     }
 
     fn identity_grid() -> SharedGrid {

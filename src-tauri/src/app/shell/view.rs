@@ -69,6 +69,8 @@ pub struct Workbench {
     connected_seen: std::collections::BTreeSet<String>,
     /// 定义查看器的只读编辑器（SQL 高亮），按读取编号填入文本。
     pub(super) ddl_editor: Option<(u64, Entity<gpui_kit::component::input::EditorState>)>,
+    /// 对象树列表的滚动；跳转定义后把选中行滚进可见区。
+    pub(super) explorer_scroll: gpui_kit::ScrollHandle,
 }
 
 impl Workbench {
@@ -150,6 +152,7 @@ impl Workbench {
             pending_browser: None,
             connected_seen: std::collections::BTreeSet::new(),
             ddl_editor: None,
+            explorer_scroll: gpui_kit::ScrollHandle::new(),
         }
     }
 
@@ -512,6 +515,23 @@ impl Workbench {
             effect
         });
         self.apply_query_effect(effect);
+    }
+
+    /// 密度发布成全局尺寸：网格、记录视图、结构/Mongo/Redis/对比等子视图都从 `Metrics::of` 取行高与控件高。
+    /// 变了就通知全部子视图重绘，切换密度立即生效。
+    fn sync_density(&mut self, cx: &mut Context<Self>) {
+        if !self.model.shell.density.metrics().publish(cx) {
+            return;
+        }
+        self.query.update(cx, |_, cx| cx.notify());
+        self.table.update(cx, |_, cx| cx.notify());
+        self.structure.update(cx, |_, cx| cx.notify());
+        self.admin.update(cx, |_, cx| cx.notify());
+        self.exchange.update(cx, |_, cx| cx.notify());
+        self.compare.update(cx, |_, cx| cx.notify());
+        self.diagram.update(cx, |_, cx| cx.notify());
+        self.redis.update(cx, |_, cx| cx.notify());
+        self.mongo.update(cx, |_, cx| cx.notify());
     }
 
     /// 公开设置只在这里下发；每个工作项打开或新建时沿用当前值，不需要重启。
@@ -1262,6 +1282,8 @@ impl Workbench {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             this.model.apply_settings(&startup.state.shell);
+                            // 保存的主题（含深色）要在启动时就写进组件库主题，否则重启后仍是浅色色板。
+                            this.apply_effect(Effect::ApplyTheme, cx);
                             // 启动时的自动更新检查只走这个开关；关闭时不发起检查。
                             this.model.begin_update_check();
                             this.model.restore_session(&startup.state.session);
@@ -1690,6 +1712,7 @@ impl Render for Workbench {
             self.pump_nav(cx);
         }
         self.sync_view_settings(cx);
+        self.sync_density(cx);
         self.sync_query(window, cx);
         self.sync_catalog(cx);
         let locale = self.model.locale();

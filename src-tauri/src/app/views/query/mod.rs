@@ -22,7 +22,7 @@ use gpui_kit::{
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
 };
 
-use crate::ui::kit::{self, Palette, Tip as _};
+use crate::ui::kit::{self, Palette, Tip as _, Radius, TypeScale};
 
 use crate::app::views::grid::{GridPane, GridTarget, QuerySheet};
 use crate::app::model::ObjectTarget;
@@ -219,7 +219,22 @@ fn load_more_plan(results: &[desk::StatementView], page_size: u64) -> Option<(St
     Some((sheet.sql.clone(), (sheet.rows.len() as u64).saturating_add(page_size.max(1))))
 }
 
+/// 加载更多会按"结果来自的目标"重跑同一条 SQL；标签当前目标已经换了（换库、换连接）
+/// 就不能在新目标上续读旧结果，入口隐藏。没有结果来源记录时视为同一目标。
+fn load_more_targets_match(results_target: Option<&desk::Target>, current: Option<&desk::Target>) -> bool {
+    match (results_target, current) {
+        (Some(from), Some(now)) => from.connection_id == now.connection_id && from.database == now.database && from.schema == now.schema,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
 impl QueryPane {
+    /// 当前结果能否在标签此刻的目标上续读。
+    fn load_more_allowed(&self) -> bool {
+        load_more_targets_match(self.desk.results_target().as_ref(), self.desk.target().as_ref())
+    }
+
     pub fn new(services: Arc<AppServices>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let grid = cx.new(|cx| GridPane::new(Arc::clone(&services), window, cx));
         Self {
@@ -1140,6 +1155,9 @@ impl QueryPane {
             cx.notify();
             return;
         }
+        if !self.load_more_allowed() {
+            return;
+        }
         let Some((sql, limit)) = load_more_plan(&self.desk.results(), self.page_size) else {
             return;
         };
@@ -1723,7 +1741,7 @@ impl Render for QueryPane {
         let toolbar = div()
             .id("query-toolbar")
             .flex_none()
-            .h(px(42.))
+            .h(px(metrics.toolbar_h()))
             .px(px(10.))
             .flex()
             .items_center()
@@ -1796,7 +1814,7 @@ impl Render for QueryPane {
         let mut header = div()
             .id("query-results-head")
             .flex_none()
-            .h(px(34.))
+            .h(px(metrics.bar_h()))
             .px(px(8.))
             .flex()
             .items_center()
@@ -1805,23 +1823,21 @@ impl Render for QueryPane {
             .border_b_1()
             .border_color(p.line);
         let tab = |id: SharedString, label: SharedString, selected: bool| {
-            div()
-                .id(id)
+            kit::interactive(div().id(id), &p, false)
                 .test_support()
                 .role(gpui_kit::Role::Tab)
                 .aria_label(label)
                 .aria_selected(selected)
                 .flex_none()
-                .h(px(26.))
+                .h(px(metrics.control_h))
                 .px(px(10.))
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .rounded(px(6.))
-                .text_size(px(12.))
-                .cursor_pointer()
+                .rounded(px(Radius::CONTROL))
+                .text_size(px(TypeScale::SM))
                 .when(selected, |this| this.bg(p.surface).text_color(p.text).shadow_sm())
-                .when(!selected, |this| this.text_color(p.text_muted).hover(|style| style.bg(p.hover)))
+                .when(!selected, |this| this.text_color(p.text_muted))
         };
         let mut strip = div()
             .id("query-result-tabs")
@@ -1858,7 +1874,7 @@ impl Render for QueryPane {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(4.))
+                            .rounded(px(Radius::CONTROL))
                             .hover(|style| style.bg(p.active))
                             .child(kit::icon(IconName::X, 12., p.text_faint))
                             .on_click(move |_, _, cx| {
@@ -1947,10 +1963,10 @@ impl Render for QueryPane {
             _ => None,
         };
         header = header.child(div().flex_1()).when(running, |this| {
-            this.child(div().id("query-elapsed-running").flex().items_center().gap(px(6.)).text_size(px(12.)).text_color(p.text_muted).child(Spinner::new().xsmall().color(p.accent)).child(t("query.status.running")))
+            this.child(div().id("query-elapsed-running").flex().items_center().gap(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(Spinner::new().xsmall().color(p.accent)).child(t("query.status.running")))
         });
         if cancelled {
-            header = header.child(div().id("query-elapsed-cancelled").px(px(6.)).text_size(px(12.)).text_color(p.warn).child(t("query.status.cancelled")));
+            header = header.child(div().id("query-elapsed-cancelled").px(px(6.)).text_size(px(TypeScale::SM)).text_color(p.warn).child(t("query.status.cancelled")));
         }
         if let Some(ms) = elapsed {
             header = header.child(
@@ -1960,7 +1976,7 @@ impl Render for QueryPane {
                     .flex()
                     .items_center()
                     .gap(px(4.))
-                    .text_size(px(12.))
+                    .text_size(px(TypeScale::SM))
                     .text_color(p.text_faint)
                     .child(kit::icon(IconName::Clock, 12., p.text_faint))
                     .child(SharedString::from(elapsed_label(ms))),
@@ -1974,33 +1990,30 @@ impl Render for QueryPane {
                     .max_w(px(520.))
                     .truncate()
                     .px(px(6.))
-                    .text_size(px(12.))
+                    .text_size(px(TypeScale::SM))
                     .text_color(if failed_note { p.danger } else { p.text_muted })
                     .tooltip_text(SharedString::from(note.clone()))
                     .child(SharedString::from(note.clone())),
             );
         }
         if let Some(summary) = summary {
-            header = header.child(div().px(px(6.)).text_size(px(12.)).text_color(p.text_faint).child(SharedString::from(summary)));
+            header = header.child(div().px(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(SharedString::from(summary)));
         }
-        if !running && result_view == ResultView::Current && results.len() == 1 && is_pageable(&results[0]) {
+        if !running && result_view == ResultView::Current && results.len() == 1 && is_pageable(&results[0]) && self.load_more_allowed() {
             match load_more_plan(&results, self.page_size) {
                 Some((_, limit)) => {
                     let loaded = results[0].rows.len() as u64;
                     let more = entity.clone();
                     header = header.child(
-                        div()
-                            .id("query-load-more")
+                        kit::interactive(div().id("query-load-more"), &p, false)
                             .role(gpui_kit::Role::Button)
                             .aria_label(SharedString::from(i18n::text(locale, "query.results.loadMore")))
-                            .h(px(24.))
+                            .h(px(metrics.control_h))
                             .px(px(8.))
-                            .rounded(px(6.))
-                            .text_size(px(12.))
+                            .rounded(px(Radius::CONTROL))
+                            .text_size(px(TypeScale::SM))
                             .text_color(p.accent)
                             .bg(p.accent_soft)
-                            .cursor_pointer()
-                            .hover(|style| style.bg(p.hover))
                             .child(SharedString::from(format!(
                                 "{} +{}",
                                 i18n::text(locale, "query.results.loadMore"),
@@ -2016,11 +2029,11 @@ impl Render for QueryPane {
                     header = header.child(
                         div()
                             .id("query-load-more-done")
-                            .h(px(24.))
+                            .h(px(metrics.control_h))
                             .px(px(8.))
                             .flex()
                             .items_center()
-                            .text_size(px(12.))
+                            .text_size(px(TypeScale::SM))
                             .text_color(p.text_muted)
                             .child(SharedString::from(i18n::text(locale, "query.results.allLoaded"))),
                     );
@@ -2041,7 +2054,7 @@ impl Render for QueryPane {
                 .bg(p.accent_soft)
                 .border_b_1()
                 .border_color(p.line)
-                .child(div().flex().items_center().gap(px(6.)).h(px(30.)).child(kit::icon(IconName::Braces, 14., p.accent_text)).child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(t("query.variables.title"))));
+                .child(div().flex().items_center().gap(px(6.)).h(px(metrics.bar_h() - 4.)).child(kit::icon(IconName::Braces, 14., p.accent_text)).child(div().font_weight(gpui_kit::FontWeight::MEDIUM).child(t("query.variables.title"))));
             for field in &variables {
                 let value = self.variable_values.get(&field.key).cloned().unwrap_or_default();
                 let input = self.variable_input(&field.key, &value, window, cx);
@@ -2088,7 +2101,7 @@ impl Render for QueryPane {
                             .child(kit::icon(if ok { IconName::CircleCheck } else { IconName::CircleAlert }, 16., if ok { p.ok } else { p.danger }))
                             .child(SharedString::from(if message.is_empty() { result.status.clone() } else { message })),
                     )
-                    .child(div().font_family(mono.clone()).text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(result.sql.clone()))),
+                    .child(div().font_family(mono.clone()).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(result.sql.clone()))),
             );
         } else {
             results_panel = results_panel.child(
@@ -2261,6 +2274,23 @@ mod tests {
             "多语句结果不提供整批重放"
         );
         assert_eq!(load_more_plan(&[sheet("SELECT * FROM item", true, "error")], 100), None, "失败结果不提供加载更多");
+    }
+
+    #[test]
+    fn load_more_is_only_offered_on_the_target_the_results_came_from() {
+        let target = |connection: &str, database: &str| desk::Target {
+            connection_id: connection.to_owned(),
+            connection_name: connection.to_owned(),
+            database: database.to_owned(),
+            engine: "sqlite".to_owned(),
+            schema: String::new(),
+            environment: String::new(),
+        };
+        assert!(load_more_targets_match(Some(&target("a", "main")), Some(&target("a", "main"))));
+        assert!(!load_more_targets_match(Some(&target("a", "main")), Some(&target("a", "other"))), "换库后不在新库续读旧结果");
+        assert!(!load_more_targets_match(Some(&target("a", "main")), Some(&target("b", "main"))), "换连接后不续读");
+        assert!(!load_more_targets_match(Some(&target("a", "main")), None), "标签已解绑不续读");
+        assert!(load_more_targets_match(None, Some(&target("a", "main"))));
     }
     use gpui_kit::{Point, TestAppContext, WindowBounds, WindowOptions, px, size};
 

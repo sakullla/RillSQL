@@ -244,6 +244,8 @@ pub struct WorkbenchModel {
     pub palette_index: usize,
     pub notice_key: Option<&'static str>,
     pub notice_detail: String,
+    /// 跳转定义选中的树节点：下一帧对象树把它滚进可见区，滚过就清掉。
+    pub reveal_node: Option<String>,
     pub copied: String,
     pub executions: u32,
     pub loads: u32,
@@ -336,6 +338,7 @@ impl WorkbenchModel {
             palette_index: 0,
             notice_key: None,
             notice_detail: String::new(),
+            reveal_node: None,
             copied: String::new(),
             executions: 0,
             loads: 0,
@@ -1711,6 +1714,9 @@ impl WorkbenchModel {
         }
         self.nav.set_focus(&node.id);
         self.sync_object_spec_from_focus();
+        // 定位要看得见：侧栏收起时打开，并让对象树把这一行滚进可见区。
+        self.shell.sidebar_open = true;
+        self.reveal_node = Some(node.id.clone());
         let structure = node.engine != Engine::Mongodb && node.object().is_some_and(|object| object.opens_data());
         if structure {
             let _ = self.nav_command(&format!("nav-open-structure:{}", node.id));

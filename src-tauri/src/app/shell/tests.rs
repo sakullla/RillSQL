@@ -4003,8 +4003,11 @@ fn go_to_definition_locates_in_the_tree_and_opens_the_structure_page() {
     assert!(!model.nav.is_expanded(&group), "分组一开始是收起的");
 
     let structures = |model: &WorkbenchModel| model.tabs.iter().filter(|tab| tab.kind == WorkItemKind::Structure).count();
+    model.shell.sidebar_open = false;
     assert!(model.go_to_definition("pg", "shop", "public", "orders", "table", None));
     assert_eq!(model.nav.focus(), Some(orders_id.as_str()), "树上选中这张表");
+    assert!(model.shell.sidebar_open, "侧栏收起时跳转定义要把它打开");
+    assert_eq!(model.reveal_node.as_deref(), Some(orders_id.as_str()), "对象树下一帧把选中行滚进可见区");
     assert!(model.nav.is_expanded(&group), "展开到它所在的分组");
     assert!(model.nav_rows().iter().any(|row| row.id == orders_id), "表在可见行里");
     let tab = model.active_tab().cloned().expect("结构页");
@@ -5264,7 +5267,9 @@ fn query_log_side_panel_and_record_view_follow_locale_theme_and_density(cx: &mut
     cx.update(|cx| view.update(cx, |view, cx| view.perform("density-compact", cx)));
     let compact = seen(cx);
     assert!(compact.log_row_h < dark.log_row_h, "密度切换要改变消息行高：{} -> {}", dark.log_row_h, compact.log_row_h);
-    assert!(compact.side_mode_h < dark.side_mode_h, "密度切换要改变右侧分段控件高度：{} -> {}", dark.side_mode_h, compact.side_mode_h);
+    // 紧凑控件按规范是 26px（标准仍是 24px），所以这里只要求高度跟着密度变到紧凑值。
+    assert_ne!(compact.side_mode_h, dark.side_mode_h, "密度切换要改变右侧分段控件高度：{} -> {}", dark.side_mode_h, compact.side_mode_h);
+    assert_eq!(compact.side_mode_h, crate::ui::kit::Metrics::compact().control_h, "分段控件取紧凑控件高");
     assert_eq!(compact.record, en.record, "记录视图在密度切换后仍在");
     let _ = std::fs::remove_dir_all(&dir);
 }
