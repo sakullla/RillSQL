@@ -1,6 +1,9 @@
 //! GPUI 查询工作台。编辑器复用 SqlEditor，结果复用 DataTable。
 //! 方言规则在 query::assist / query::desk；这里只提交任务和显示。
 
+mod log;
+mod side;
+
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
@@ -23,11 +26,14 @@ use crate::ui::kit::{self, Palette, Tip as _};
 
 use crate::app::views::grid::{GridPane, GridTarget, QuerySheet};
 use crate::app::model::ObjectTarget;
+use crate::app::Density;
 use crate::application::AppServices;
 use crate::i18n::{self, Locale};
 use crate::query::assist::{self, LintFinding, RunScope, TreeObject};
 use crate::query::commands::RunDto;
-use crate::query::desk::{self, BeginRun, Desk, DraftLink, DraftSync, ErrorMark, PreparedRun, Target, Ticket};
+use crate::query::desk::{self, BeginRun, Desk, DraftLink, DraftSync, ErrorMark, PreparedRun, ResultView, Target, Ticket};
+
+pub use side::{SideMode, SideState};
 use crate::ui::{ObjectHandler, ObjectLink, SqlEditor};
 
 #[derive(Clone)]
@@ -77,7 +83,15 @@ pub struct QueryPane {
     opens: Vec<OpenRequest>,
     targets: Vec<TargetRequest>,
     variable_values: HashMap<String, String>,
-    outline_open: bool,
+    /// 每个查询标签自己的右侧面板状态（开关、大纲/对象）。
+    side: HashMap<String, SideState>,
+    /// 外壳密度；消息页和右侧面板的行高与控件高度跟它走。
+    density: Density,
+    /// 最近一次绘制时视口是否窄；窄窗口里右侧面板默认收起、打开时是浮层。
+    narrow: bool,
+    /// 测试用：消息页/右侧面板最近一次绘制时用的底色 (surface, chrome)。
+    #[cfg(test)]
+    drawn_colors: Option<(gpui_kit::Hsla, gpui_kit::Hsla)>,
     pending_completion: bool,
     pending_lint: Option<Vec<LintFinding>>,
     lint_seen: Option<(String, u64)>,
@@ -112,6 +126,8 @@ pub struct QueryPane {
 
 /// 失败语句在草稿里要标的范围。偏移标到那个词（至少一个字符，不跨行）；行号标整行；
 /// 驱动没给位置时标整条语句。范围对不上草稿的结果不标。
+/// 偏移落在输入末尾或换行上（如 PG “at end of input”）时没有可标的字符，空范围会被编辑器丢掉：
+/// 改标它前面最近的非空白字符；前面全是空白时标偏移所在的整行。
 pub fn error_ranges(draft: &str, results: &[desk::StatementView]) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     for view in results {
@@ -123,8 +139,16 @@ pub fn error_ranges(draft: &str, results: &[desk::StatementView]) -> Vec<Range<u
                 draft.is_char_boundary(offset).then(|| {
                     let rest = &draft[offset..];
                     let word = rest.chars().take_while(|ch| ch.is_alphanumeric() || *ch == '_').map(char::len_utf8).sum::<usize>();
-                    let single = rest.chars().next().filter(|ch| *ch != '\n').map(char::len_utf8).unwrap_or(0);
-                    offset..offset + word.max(single)
+                    let single = rest.chars().next().filter(|ch| *ch != '\n' && *ch != '\r').map(char::len_utf8).unwrap_or(0);
+                    let len = word.max(single);
+                    if len > 0 {
+                        return offset..offset + len;
+                    }
+                    let before = &draft[..offset];
+                    match before.char_indices().rev().find(|(_, ch)| !ch.is_whitespace()) {
+                        Some((at, ch)) => at..at + ch.len_utf8(),
+                        None => line_at(draft, offset),
+                    }
                 })
             }
             ErrorMark::Line(line) => {
@@ -140,11 +164,19 @@ pub fn error_ranges(draft: &str, results: &[desk::StatementView]) -> Vec<Range<u
                 found
             }
         };
-        if let Some(range) = range.filter(|range| range.end <= draft.len()) {
+        if let Some(range) = range.filter(|range| range.end <= draft.len() && range.start < range.end) {
             ranges.push(range);
         }
     }
     ranges
+}
+
+/// 偏移所在的整行（不含换行和行尾 \r）。
+fn line_at(draft: &str, offset: usize) -> Range<usize> {
+    let start = draft[..offset].rfind('\n').map_or(0, |at| at + 1);
+    let end = draft[offset..].find('\n').map_or(draft.len(), |at| offset + at);
+    let end = if draft[start..end].ends_with('\r') { end - 1 } else { end };
+    start..end.max(start)
 }
 
 /// 结果标题里的执行状态。
@@ -201,7 +233,11 @@ impl QueryPane {
             opens: Vec::new(),
             targets: Vec::new(),
             variable_values: HashMap::new(),
-            outline_open: true,
+            side: HashMap::new(),
+            density: Density::Standard,
+            narrow: false,
+            #[cfg(test)]
+            drawn_colors: None,
             pending_completion: false,
             pending_lint: None,
             lint_seen: None,
@@ -261,6 +297,31 @@ impl QueryPane {
 
     pub fn remember_environments(&mut self, pairs: Vec<(String, String)>) {
         self.desk.remember_environments(pairs);
+    }
+
+    /// 外壳密度下发到查询页；变了返回 true，调用方据此重绘。
+    pub fn set_density(&mut self, density: Density) -> bool {
+        let changed = self.density != density;
+        self.density = density;
+        changed
+    }
+
+    /// 活动查询标签的右侧面板状态。
+    pub fn side_state(&self) -> SideState {
+        self.desk.active_id().and_then(|id| self.side.get(id)).copied().unwrap_or_default()
+    }
+
+    /// 活动查询标签的右侧面板此刻是否打开（未动过时按最近一次绘制的宽窄取默认值）。
+    pub fn side_open(&self) -> bool {
+        self.side_state().is_open(self.narrow)
+    }
+
+    fn update_side(&mut self, change: impl FnOnce(&mut SideState, bool)) {
+        let Some(id) = self.desk.active_id().map(str::to_owned) else {
+            return;
+        };
+        let narrow = self.narrow;
+        change(self.side.entry(id).or_default(), narrow);
     }
 
     pub fn set_query_timeout_sec(&mut self, seconds: i64) {
@@ -560,6 +621,55 @@ impl QueryPane {
         if let Some(index) = id.strip_prefix("statement:") {
             if let Ok(index) = index.parse::<usize>() {
                 self.desk.set_statement(index);
+                self.desk.set_result_view(ResultView::Current);
+                self.rebind_grid(cx);
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(view) = id.strip_prefix("query-view:") {
+            let view = match view {
+                "current" => Some(ResultView::Current),
+                "messages" => Some(ResultView::Messages),
+                other => other.strip_prefix("pinned:").and_then(|pin| pin.parse::<u64>().ok()).map(ResultView::Pinned),
+            };
+            // 表格是否需要重新绑定由结果代次决定（sync_grid）：消息页与当前结果之间切换不重绑。
+            if let Some(view) = view {
+                let _ = self.desk.set_result_view(view);
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(pin) = id.strip_prefix("unpin:") {
+            if let Ok(pin) = pin.parse::<u64>() {
+                if self.desk.unpin(pin) {
+                    self.rebind_grid(cx);
+                }
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(index) = id.strip_prefix("log:") {
+            if let Ok(index) = index.parse::<usize>() {
+                self.open_log_entry(index, cx);
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(mode) = id.strip_prefix("side-mode:") {
+            let mode = match mode {
+                "object" => SideMode::Object,
+                _ => SideMode::Outline,
+            };
+            self.update_side(|state, _| {
+                state.mode = mode;
+                state.open = Some(true);
+            });
+            cx.notify();
+            return;
+        }
+        if id == "pin-result" {
+            if self.desk.pin_current().is_some() {
                 self.rebind_grid(cx);
             }
             cx.notify();
@@ -576,8 +686,19 @@ impl QueryPane {
             "autocomplete" => self.complete(cx),
             "explain" => self.explain(cx),
             "expand-star" => self.expand(cx),
+            "toggle-side" => {
+                self.update_side(|state, narrow| state.open = Some(!state.is_open(narrow)));
+                cx.notify();
+            }
+            // 旧入口：“语句大纲”开关。打开时固定在大纲页。
             "toggle-outline" => {
-                self.outline_open = !self.outline_open;
+                self.update_side(|state, narrow| {
+                    let open = !(state.is_open(narrow) && state.mode == SideMode::Outline);
+                    state.open = Some(open);
+                    if open {
+                        state.mode = SideMode::Outline;
+                    }
+                });
                 cx.notify();
             }
             "refresh-tree" => self.refresh_tree(cx),
@@ -655,6 +776,7 @@ impl QueryPane {
         self.desk.retain_tabs(&ids, &self.services.tasks);
         self.editors.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.links.retain(|id, _| ids.iter().any(|keep| keep == id));
+        self.side.retain(|id, _| ids.iter().any(|keep| keep == id));
         self.desk.refresh_outline();
         self.note_lint();
         let mut drafts = Vec::new();
@@ -711,6 +833,19 @@ impl QueryPane {
             self.editors.insert(id.clone(), editor);
             self.links.insert(id, DraftLink { applied: sql.clone(), editor: sql, dirty: false });
         }
+    }
+
+    /// 测试用：把一批结果当作一次完成的执行写到活动标签（含消息记录）。
+    #[cfg(test)]
+    pub fn plant_run(&mut self, results: Vec<desk::StatementView>, cx: &mut App) {
+        self.desk.plant_run(results);
+        self.rebind_grid(cx);
+    }
+
+    /// 测试用：消息页/右侧面板最近一次绘制时用的底色 (surface, chrome)。
+    #[cfg(test)]
+    pub fn drawn_colors(&self) -> Option<(gpui_kit::Hsla, gpui_kit::Hsla)> {
+        self.drawn_colors
     }
 
     pub fn show_sheet(&mut self, columns: Vec<String>, rows: Vec<Vec<String>>, cx: &mut App) {
@@ -772,6 +907,10 @@ impl QueryPane {
         if self.desk.running_ids().iter().any(|running| running == id) {
             return ResultTiming::Running;
         }
+        if let ResultView::Pinned(_) = self.desk.result_view() {
+            // 固定结果显示它自己那次的耗时，不跟当前执行的状态。
+            return self.desk.shown_result().and_then(|result| result.elapsed_ms).map_or(ResultTiming::None, ResultTiming::Elapsed);
+        }
         let results = self.desk.results();
         let active = results.get(self.desk.statement()).or_else(|| results.first());
         if self.desk.cancelled(id) || active.is_some_and(|result| result.status == "cancelled") {
@@ -792,6 +931,54 @@ impl QueryPane {
             return false;
         };
         editor.update(cx, |editor, cx| editor.select_range(item.start..item.end, cx));
+        self.focus_editor = true;
+        true
+    }
+
+    /// 消息页里点一条记录：成功的切到它的结果；失败的跳到编辑器里的错误位置。
+    /// 整次执行的失败/取消记录没有对应的结果，什么也不做。
+    fn open_log_entry(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(entry) = self.desk.log().get(index).cloned() else {
+            return;
+        };
+        let Some(statement) = entry.statement else {
+            return;
+        };
+        if statement >= self.desk.results().len() {
+            return;
+        }
+        self.desk.set_statement(statement);
+        if entry.failed() {
+            if !self.jump_to_error(statement, cx) {
+                self.desk.set_active_note(&i18n::text(self.locale, "query.log.noPosition"));
+            }
+        } else {
+            self.desk.set_result_view(ResultView::Current);
+        }
+        self.rebind_grid(cx);
+    }
+
+    /// 在编辑器里选中第 statement 条结果的错误位置（与错误标记同一份范围）。
+    /// 草稿在执行后改过时位置不再可信，不跳。
+    fn jump_to_error(&mut self, statement: usize, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.desk.active_id().map(str::to_owned) else {
+            return false;
+        };
+        let Some(editor) = self.editors.get(&id).cloned() else {
+            return false;
+        };
+        let results = self.desk.results();
+        let Some(view) = results.get(statement) else {
+            return false;
+        };
+        let text = editor.read(cx).value(cx);
+        if self.desk.executed_sql(&id).as_deref() != Some(text.as_str()) {
+            return false;
+        }
+        let Some(range) = error_ranges(&text, std::slice::from_ref(view)).into_iter().next() else {
+            return false;
+        };
+        editor.update(cx, |editor, cx| editor.select_range(range, cx));
         self.focus_editor = true;
         true
     }
@@ -1207,12 +1394,12 @@ impl QueryPane {
     }
 
     fn refresh_grid(&mut self, cx: &mut App) {
-        let results = self.desk.results();
-        let index = if results.is_empty() { 0 } else { self.desk.statement().min(results.len() - 1) };
-        let Some(sheet) = results.get(index) else {
+        // 看固定结果时表格显示它自己的快照；消息页不动表格，仍绑定当前结果。
+        let Some(shown) = self.desk.shown_result() else {
             self.grid.update(cx, |grid, cx| grid.clear_sheet(cx));
             return;
         };
+        let sheet = &shown;
         let columns = if sheet.columns.is_empty() { vec!["status".to_owned()] } else { sheet.columns.clone() };
         let rows = if sheet.columns.is_empty() {
             vec![vec![Some(sheet.message.clone())]]
@@ -1398,7 +1585,10 @@ impl Render for QueryPane {
         self.refresh_folds(cx);
         self.sync_grid(cx);
         self.take_focus(window, cx);
+        self.narrow = f32::from(window.viewport_size().width) < side::NARROW_WIDTH;
         let p = Palette::of(cx);
+        let metrics = self.density.metrics();
+        let mono = cx.theme().mono_font_family.clone();
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let links = self.desk.links().to_vec();
@@ -1518,12 +1708,31 @@ impl Render for QueryPane {
             .when(!engine.is_empty(), |this| this.child(kit::engine_badge(&engine, 18.)))
             .child(connection_picker)
             .child(kit::icon(IconName::ChevronRight, 13., p.text_faint))
-            .child(database_picker);
+            .child(database_picker)
+            .child(kit::vline(&p))
+            .child(
+                Button::new("query-side-toggle")
+                    .ghost()
+                    .small()
+                    .icon(IconName::PanelRight)
+                    .tooltip(t("query.side.toggle"))
+                    .accessibility_label(t("query.side.toggle"))
+                    .on_click(pane_act("toggle-side", &entity)),
+            );
 
-        // ---- 编辑器 + 大纲
-        let mut editor_row = div().flex().size_full().min_h(px(0.));
+        // ---- 编辑器 + 右侧面板（大纲 / 对象）
+        let side_state = self.side_state();
+        let side_open = side_state.is_open(self.narrow);
+        let mut editor_row = div().id("query-editor-row").relative().flex().size_full().min_h(px(0.));
+        let mut cursor_text: Option<(String, usize)> = None;
         if let Some(editor) = editor {
-            editor_row = editor_row.child(div().id("query-editor").flex_1().min_w(px(0.)).h_full().child(editor));
+            if side_open && side_state.mode == SideMode::Object {
+                let state = editor.read(cx);
+                let text = state.value(cx);
+                let cursor = state.selected_range(cx).end.min(text.len());
+                cursor_text = Some((text, cursor));
+            }
+            editor_row = editor_row.child(div().id("query-editor").test_support().flex_1().min_w(px(0.)).h_full().child(editor));
         } else {
             editor_row = editor_row.child(
                 div()
@@ -1535,51 +1744,24 @@ impl Render for QueryPane {
                     .child(kit::empty_state(IconName::SquareTerminal, t("shell.command.newQuery"), t("shell.statusbar.noTarget"), &p)),
             );
         }
-        if self.outline_open && outline.len() > 1 {
-            let mut list = div()
-                .id("query-outline")
-                .flex_none()
-                .w(px(220.))
-                .h_full()
-                .overflow_y_scroll()
-                .border_l_1()
-                .border_color(p.line)
-                .bg(p.chrome)
-                .p(px(8.))
-                .flex()
-                .flex_col()
-                .gap(px(2.))
-                .child(div().px(px(6.)).pb(px(6.)).child(kit::eyebrow(t("query.outline.heading"), &p)));
-            for item in outline {
-                let failed = item.status == "error" || item.status == "failed";
-                let id = format!("outline:{}", item.index);
-                let jump = entity.clone();
-                list = list.child(
-                    div()
-                        .id(SharedString::from(format!("query-outline-{}", item.index)))
-                        .test_support()
-                        .role(gpui_kit::Role::Button)
-                        .aria_label(SharedString::from(format!("{} {}", i18n::text(locale, "query.outline.jump"), item.index)))
-                        .cursor_pointer()
-                        .on_click(move |_, _, cx| {
-                            let id = id.clone();
-                            jump.update(cx, |pane, cx| pane.command(&id, cx));
-                        })
-                        .px(px(6.))
-                        .py(px(4.))
-                        .rounded(px(6.))
-                        .flex()
-                        .gap(px(6.))
-                        .text_size(px(12.))
-                        .hover(|style| style.bg(p.hover))
-                        .child(div().flex_none().text_color(p.text_faint).child(SharedString::from(format!("{}", item.index))))
-                        .child(div().flex_1().min_w(px(0.)).truncate().font_family(cx.theme().mono_font_family.clone()).when(failed, |this| this.text_color(p.danger)).child(SharedString::from(item.preview))),
-                );
+        if side_open && self.desk.active_id().is_some() {
+            let info = cursor_text.and_then(|(text, cursor)| self.desk.object_info_at(&text, cursor));
+            let body = match side_state.mode {
+                SideMode::Outline => side::SideBody::Outline(&outline),
+                SideMode::Object => side::SideBody::Object(info.as_ref()),
+            };
+            let panel = side::SidePanel { mode: side_state.mode, body, locale, metrics, overlay: self.narrow, mono: mono.clone() };
+            editor_row = editor_row.child(panel.render(&p, &entity));
+            #[cfg(test)]
+            {
+                self.drawn_colors = Some((p.surface, p.chrome));
             }
-            editor_row = editor_row.child(list);
         }
 
-        // ---- 结果
+        // ---- 结果：页签从左到右是 固定结果… | 当前结果（语句 N） | 消息
+        let result_view = self.desk.result_view();
+        let pinned = self.desk.pinned();
+        let log = self.desk.log();
         let mut header = div()
             .id("query-results-head")
             .flex_none()
@@ -1591,31 +1773,91 @@ impl Render for QueryPane {
             .bg(p.chrome)
             .border_b_1()
             .border_color(p.line);
+        let tab = |id: SharedString, label: SharedString, selected: bool| {
+            div()
+                .id(id)
+                .test_support()
+                .role(gpui_kit::Role::Tab)
+                .aria_label(label)
+                .aria_selected(selected)
+                .flex_none()
+                .h(px(26.))
+                .px(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .rounded(px(6.))
+                .text_size(px(12.))
+                .cursor_pointer()
+                .when(selected, |this| this.bg(p.surface).text_color(p.text).shadow_sm())
+                .when(!selected, |this| this.text_color(p.text_muted).hover(|style| style.bg(p.hover)))
+        };
+        let mut strip = div()
+            .id("query-result-tabs")
+            .role(gpui_kit::Role::TabList)
+            .flex_initial()
+            .min_w(px(0.))
+            .overflow_x_scroll()
+            .flex()
+            .items_center()
+            .gap(px(2.));
+        for pin in &pinned {
+            let selected = result_view == ResultView::Pinned(pin.id);
+            let label = i18n::fill(
+                &i18n::text(locale, "query.results.pinned"),
+                &[("n", &pin.id.to_string()), ("statement", &(pin.statement + 1).to_string())],
+            );
+            let failed = pin.view.status == "error" || pin.view.status == "failed";
+            let open = entity.clone();
+            let close = entity.clone();
+            let open_id = format!("query-view:pinned:{}", pin.id);
+            let close_id = format!("unpin:{}", pin.id);
+            strip = strip.child(
+                tab(SharedString::from(format!("query-pinned-{}", pin.id)), SharedString::from(label.clone()), selected)
+                    .pr(px(4.))
+                    .child(kit::icon(IconName::Bookmark, 12., if failed { p.danger } else { p.accent }))
+                    .child(SharedString::from(label))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("query-pinned-close-{}", pin.id)))
+                            .test_support()
+                            .role(gpui_kit::Role::Button)
+                            .aria_label(t("query.results.unpin"))
+                            .size(px(18.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.))
+                            .hover(|style| style.bg(p.active))
+                            .child(kit::icon(IconName::X, 12., p.text_faint))
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                let id = close_id.clone();
+                                close.update(cx, |pane, cx| pane.command(&id, cx));
+                            }),
+                    )
+                    .on_click(move |_, _, cx| {
+                        let id = open_id.clone();
+                        open.update(cx, |pane, cx| pane.command(&id, cx));
+                    }),
+            );
+        }
+        // 固定结果与当前结果之间用一道竖线分开；没有固定结果时不加。
+        if !pinned.is_empty() {
+            strip = strip.child(kit::vline(&p));
+        }
         if results.len() > 1 {
             let current = self.desk.statement();
             for (index, result) in results.iter().enumerate() {
-                let selected = index == current;
+                let selected = result_view == ResultView::Current && index == current;
                 let failed = result.status == "error" || result.status == "failed";
                 let id = format!("statement:{index}");
                 let entity = entity.clone();
-                header = header.child(
-                    div()
-                        .id(SharedString::from(format!("query-act-statement-{index}")))
-                        .role(gpui_kit::Role::Tab)
-                        .aria_label(SharedString::from(format!("{} {}", i18n::text(locale, "query.results.statement"), index + 1)))
-                        .aria_selected(selected)
-                        .h(px(26.))
-                        .px(px(10.))
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .rounded(px(6.))
-                        .text_size(px(12.))
-                        .cursor_pointer()
-                        .when(selected, |this| this.bg(p.surface).text_color(p.text).shadow_sm())
-                        .when(!selected, |this| this.text_color(p.text_muted).hover(|style| style.bg(p.hover)))
+                let label = SharedString::from(format!("{} {}", i18n::text(locale, "query.results.statement"), index + 1));
+                strip = strip.child(
+                    tab(SharedString::from(format!("query-act-statement-{index}")), label.clone(), selected)
                         .child(kit::status_dot(if failed { p.danger } else { p.ok }))
-                        .child(SharedString::from(format!("{} {}", i18n::text(locale, "query.results.statement"), index + 1)))
+                        .child(label)
                         .on_click(move |_, _, cx| {
                             let id = id.clone();
                             entity.update(cx, |pane, cx| pane.command(&id, cx));
@@ -1623,9 +1865,41 @@ impl Render for QueryPane {
                 );
             }
         } else {
-            header = header.child(div().px(px(6.)).child(kit::eyebrow(t("ui.query.results"), &p)));
+            let entity = entity.clone();
+            strip = strip.child(
+                tab(SharedString::from("query-results-tab"), t("ui.query.results"), result_view == ResultView::Current)
+                    .child(t("ui.query.results"))
+                    .on_click(move |_, _, cx| entity.update(cx, |pane, cx| pane.command("query-view:current", cx))),
+            );
         }
-        let active_result = results.get(self.desk.statement()).or_else(|| results.first()).cloned();
+        header = header.child(strip);
+        // 消息页签在页签条之外、紧随其后：页签再多也不会被挤出视口。
+        let log_failed = log.iter().any(|entry| entry.failed());
+        let log_label = if log.is_empty() {
+            i18n::text(locale, "query.log.tab")
+        } else {
+            format!("{} {}", i18n::text(locale, "query.log.tab"), log.len())
+        };
+        let log_entity = entity.clone();
+        header = header.child(
+            tab(SharedString::from("query-log-tab"), SharedString::from(log_label.clone()), result_view == ResultView::Messages)
+                .when(log_failed, |this| this.child(kit::status_dot(p.danger)))
+                .child(SharedString::from(log_label))
+                .on_click(move |_, _, cx| log_entity.update(cx, |pane, cx| pane.command("query-view:messages", cx))),
+        );
+        let can_pin = self.desk.can_pin();
+        let pin_entity = entity.clone();
+        header = header.child(
+            Button::new("query-act-pin")
+                .ghost()
+                .xsmall()
+                .icon(IconName::Bookmark)
+                .disabled(!can_pin)
+                .tooltip(t("query.results.pin"))
+                .accessibility_label(t("query.results.pin"))
+                .on_click(move |_, _, cx| pin_entity.update(cx, |pane, cx| pane.command("pin-result", cx))),
+        );
+        let active_result = self.desk.shown_result();
         let summary = active_result.as_ref().map(|result| {
             if let Some(affected) = result.affected.filter(|_| result.columns.is_empty()) {
                 format!("{affected} ✓")
@@ -1665,6 +1939,7 @@ impl Render for QueryPane {
             header = header.child(
                 div()
                     .id("query-note")
+                    .min_w(px(0.))
                     .max_w(px(520.))
                     .truncate()
                     .px(px(6.))
@@ -1677,7 +1952,7 @@ impl Render for QueryPane {
         if let Some(summary) = summary {
             header = header.child(div().px(px(6.)).text_size(px(12.)).text_color(p.text_faint).child(SharedString::from(summary)));
         }
-        if !running && results.len() == 1 && is_pageable(&results[0]) {
+        if !running && result_view == ResultView::Current && results.len() == 1 && is_pageable(&results[0]) {
             match load_more_plan(&results, self.page_size) {
                 Some((_, limit)) => {
                     let loaded = results[0].rows.len() as u64;
@@ -1747,7 +2022,14 @@ impl Render for QueryPane {
             results_panel = results_panel.child(row);
         }
         let grid_entity = entity.clone();
-        if results.is_empty() {
+        if result_view == ResultView::Messages {
+            let panel = log::LogPanel { entries: &log, batch: self.desk.log_batch(), locale, metrics, mono: mono.clone() };
+            results_panel = results_panel.child(panel.render(&p, &entity));
+            #[cfg(test)]
+            {
+                self.drawn_colors = Some((p.surface, p.chrome));
+            }
+        } else if active_result.is_none() {
             results_panel = results_panel.child(
                 div()
                     .flex_1()
@@ -1756,8 +2038,7 @@ impl Render for QueryPane {
                     .justify_center()
                     .child(kit::empty_state(IconName::Table, t("ui.query.results"), t("ui.query.noResults"), &p).child(div().flex().gap(px(6.)).child(kit::kbd(kit::shortcut("Ctrl+Enter"), &p)))),
             );
-        } else if active_result.as_ref().is_some_and(|result| result.columns.is_empty()) {
-            let result = active_result.clone().unwrap_or_else(|| results[0].clone());
+        } else if let Some(result) = active_result.clone().filter(|result| result.columns.is_empty()) {
             let ok = !(result.status == "error" || result.status == "failed");
             let message = if result.message.is_empty() { note.clone() } else { result.message.clone() };
             results_panel = results_panel.child(
@@ -1776,11 +2057,13 @@ impl Render for QueryPane {
                             .child(kit::icon(if ok { IconName::CircleCheck } else { IconName::CircleAlert }, 16., if ok { p.ok } else { p.danger }))
                             .child(SharedString::from(if message.is_empty() { result.status.clone() } else { message })),
                     )
-                    .child(div().font_family(cx.theme().mono_font_family.clone()).text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(result.sql.clone()))),
+                    .child(div().font_family(mono.clone()).text_size(px(12.)).text_color(p.text_muted).child(SharedString::from(result.sql.clone()))),
             );
         } else {
             results_panel = results_panel.child(
                 div()
+                    .id("query-grid")
+                    .test_support()
                     .flex_1()
                     .min_h(px(0.))
                     .on_mouse_down(MouseButton::Right, move |_, _, cx| {
@@ -2663,6 +2946,25 @@ mod tests {
         assert_eq!(whole, vec![second..end]);
         // 成功的语句没有标记。
         assert!(error_ranges(draft, &[sheet("select 1", false, "ok")]).is_empty());
+        // “at end of input”：偏移在语句末尾（全文末尾或换行上）不能得到空范围，改标前一个非空白字符。
+        let tail = "select 1;\nselect * from";
+        let at_end = |draft: &str, offset| {
+            let view = desk::StatementView { range: Some((0, draft.len())), error_mark: Some(ErrorMark::Offset(offset)), ..sheet("x", false, "error") };
+            error_ranges(draft, &[view])
+        };
+        let end = at_end(tail, tail.len());
+        assert_eq!(end.len(), 1, "末尾位置必须有非空标记：{end:?}");
+        assert!(!end[0].is_empty());
+        assert_eq!(&tail[end[0].clone()], "m", "标到输入最后一个非空白字符");
+        let crlf = "select * from\r\n";
+        let end = at_end(crlf, "select * from".len());
+        assert_eq!(end.iter().map(|range| &crlf[range.clone()]).collect::<Vec<_>>(), vec!["m"], "落在行尾 \\r\\n 上也标前一个字符");
+        let trailing = "select * from  \n";
+        let end = at_end(trailing, trailing.len());
+        assert_eq!(end.iter().map(|range| &trailing[range.clone()]).collect::<Vec<_>>(), vec!["m"], "跳过末尾空白");
+        let blank = "   ";
+        assert_eq!(at_end(blank, blank.len()), vec![0..3], "前面全是空白时标整行");
+        assert!(at_end("", 0).is_empty(), "空草稿没有可标的位置");
         assert_eq!(elapsed_label(12), "12 ms");
         assert_eq!(elapsed_label(1500), "1.50 s");
     }
@@ -2838,5 +3140,230 @@ mod tests {
         assert_eq!(seen[0].0.database, "main");
         assert_eq!(seen[0].0.name, "customers");
         assert!(seen[0].1.as_deref().is_some_and(|spec| spec.contains("customers")), "{:?}", seen[0].1);
+    }
+
+    fn result(sql: &str, status: &str, columns: &[&str], rows: &[&str], affected: Option<u64>, message: &str) -> desk::StatementView {
+        desk::StatementView {
+            sql: sql.to_owned(),
+            status: status.to_owned(),
+            message: message.to_owned(),
+            columns: columns.iter().map(|name| (*name).to_owned()).collect(),
+            rows: rows.iter().map(|value| vec![Some((*value).to_owned())]).collect(),
+            truncated: false,
+            affected,
+            elapsed_ms: Some(5),
+            error_at: None,
+            range: None,
+            error_mark: None,
+        }
+    }
+
+    #[gpui_kit::test]
+    fn messages_tab_lists_each_statement_and_follows_clicks(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("rillsql-log-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("log.sqlite");
+        let config_dir = dir.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime().spawn(async move {
+            let setup = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true))
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE item (id INTEGER PRIMARY KEY, label TEXT)").execute(&setup).await.unwrap();
+            sqlx::query("INSERT INTO item (id, label) VALUES (1, 'a'), (2, 'b')").execute(&setup).await.unwrap();
+            setup.close().await;
+            let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(config_dir.join("connections.sqlite")))));
+            services.connections.open_sqlite_for_test("notes", "笔记", &database).await.unwrap();
+            let _ = tx.send(services);
+        });
+        let services = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite setup");
+        cx.update(gpui_kit::init);
+        let (window, pane) = cx.update(|cx| {
+            let bounds = gpui_kit::Bounds { origin: Point::default(), size: size(px(1100.), px(720.)) };
+            gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |window, cx| cx.new(|cx| QueryPane::new(services, window, cx)),
+            )
+            .expect("query pane")
+        });
+        let draft = "SELECT id FROM item;\nUPDATE item SET label = label;\nSELECT *\nFROM missing_table;";
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", draft)), Some("q"), Locale::En, window, cx);
+            });
+            window.render_frame(cx);
+            pane.update(cx, |pane, cx| pane.command("run-script", cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        let done = wait_for_tokio(cx, window, std::time::Duration::from_secs(30), |cx| {
+            cx.update(|cx| {
+                let pane = pane.read(cx);
+                !pane.running() && pane.desk.log().len() == 3
+            })
+        });
+        assert!(done, "执行没有结束：{} {:?}", cx.update(|cx| pane.read(cx).note()), cx.update(|cx| pane.read(cx).desk.results()));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let tab = window.find("query-log-tab");
+            assert!(tab.visible());
+            assert!(tab.label().is_some_and(|label| label.contains("Messages") && label.contains('3')), "{:?}", tab.label());
+            window.click("query-log-tab", cx);
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).desk.result_view(), ResultView::Messages);
+            let labels: Vec<String> = (0..3).map(|index| window.find(SharedString::from(format!("query-log-{index}"))).label().unwrap_or_default().to_owned()).collect();
+            assert!(labels[0].starts_with("Succeeded") && labels[0].contains("Result 1") && labels[0].contains("2 rows") && labels[0].contains(" ms"), "{labels:?}");
+            assert!(labels[1].starts_with("Succeeded") && labels[1].contains("Result 2") && labels[1].contains("2 affected"), "{labels:?}");
+            assert!(labels[2].starts_with("Failed") && labels[2].contains("Result 3") && labels[2].contains("missing_table"), "失败一条要带错误：{labels:?}");
+            for entry in pane.read(cx).desk.log() {
+                assert!(entry.elapsed_ms.is_some(), "每条都有耗时：{entry:?}");
+            }
+
+            // 点成功的一条：切到它的结果。
+            window.click("query-log-0", cx);
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).desk.result_view(), ResultView::Current);
+            assert_eq!(pane.read(cx).desk.statement(), 0);
+            assert_eq!(pane.read(cx).cell(0, 0, cx), "1", "切到第一条的结果表");
+
+            // 点失败的一条：编辑器选中错误位置（SQLite 没有位置，整条失败语句）。
+            window.click("query-log-tab", cx);
+            window.render_frame(cx);
+            window.click("query-log-2", cx);
+            window.render_frame(cx);
+            let editor = pane.read(cx).editors.get("q").cloned().unwrap();
+            assert_eq!(editor.read(cx).selected_text(cx).trim_end_matches(';'), "SELECT *\nFROM missing_table", "跳到失败语句");
+            assert_eq!(pane.read(cx).desk.result_view(), ResultView::Messages, "跳错误位置时留在消息页");
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    fn a_pinned_result_survives_the_next_run_and_closes_by_hand(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select 'a'")), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![result("select 'a'", "ok", &["v"], &["a"], None, "")]);
+            });
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).cell(0, 0, cx), "a");
+            assert!(window.try_find("query-pinned-1").is_none());
+            window.click("query-act-pin", cx);
+            window.render_frame(cx);
+            assert!(window.find("query-pinned-1").visible(), "固定后多出一个固定页签");
+            assert_eq!(window.find("query-pinned-1").selected(), Some(true));
+            assert_eq!(pane.read(cx).cell(0, 0, cx), "a");
+
+            // 再执行一次：固定页签还在、内容不变，新结果落在当前结果页。
+            pane.update(cx, |pane, _| pane.desk.plant_run(vec![result("select 'b'", "ok", &["v"], &["b"], None, "")]));
+            window.render_frame(cx);
+            assert!(window.find("query-pinned-1").visible(), "固定结果被下一次执行替换掉了");
+            assert_eq!(window.find("query-results-tab").selected(), Some(true), "新结果打开在当前结果页");
+            assert_eq!(pane.read(cx).cell(0, 0, cx), "b");
+            window.click("query-pinned-1", cx);
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).cell(0, 0, cx), "a", "固定结果内容不变");
+
+            // 未固定的结果照旧被替换。
+            pane.update(cx, |pane, _| pane.desk.plant_run(vec![result("select 'c'", "ok", &["v"], &["c"], None, "")]));
+            window.render_frame(cx);
+            assert_eq!(pane.read(cx).cell(0, 0, cx), "c");
+            assert_eq!(pane.read(cx).desk.pinned().len(), 1);
+
+            // 手动关闭固定结果。
+            window.click("query-pinned-1", cx);
+            window.render_frame(cx);
+            window.click("query-pinned-close-1", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("query-pinned-1").is_none(), "固定页签可以手动关闭");
+            assert!(pane.read(cx).desk.pinned().is_empty());
+            assert_eq!(pane.read(cx).cell(0, 0, cx), "c", "关掉正在看的固定结果后回到当前结果");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn the_side_panel_switches_views_and_keeps_its_state_per_tab(cx: &mut TestAppContext) {
+        use crate::query::assist::ColumnMeta;
+        let (window, pane) = open(cx);
+        let draft = "select status from customers";
+        let a = bound("a", draft);
+        let b = bound("b", "select 1;\nselect 2;");
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.plant_customers();
+                pane.desk.remember_table_columns(
+                    "notes",
+                    "main",
+                    "",
+                    "customers",
+                    vec![
+                        ColumnMeta { name: "id".to_owned(), type_name: "INTEGER".to_owned(), nullable: Some(false), comment: String::new() },
+                        ColumnMeta { name: "status".to_owned(), type_name: "TEXT".to_owned(), nullable: Some(true), comment: "订单状态".to_owned() },
+                    ],
+                );
+                let _ = pane.sync(&[a.clone(), b.clone()], Some("a"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            // 宽窗口里默认在编辑器旁边打开，先是大纲。
+            let panel = window.find("query-side-panel").bounds();
+            let editor = window.find("query-editor").bounds();
+            assert!(f32::from(editor.origin.x + editor.size.width) <= f32::from(panel.origin.x) + 0.5, "右侧面板在编辑器旁边，不盖住编辑器");
+            assert!(window.try_find("query-outline").is_some());
+            assert_eq!(window.find("query-side-mode-outline").selected(), Some(true));
+
+            // 切到对象：光标在 customers 上时列出列、类型、可空和注释。
+            window.click("query-side-mode-object", cx);
+            let editor = pane.read(cx).editors.get("a").cloned().unwrap();
+            let at = draft.find("customers").unwrap() + 3;
+            editor.update(cx, |editor, cx| editor.select_range(at..at, cx));
+            window.render_frame(cx);
+            assert!(window.try_find("query-outline").is_none());
+            assert!(window.find("query-side-object-name").label().is_some_and(|label| label.contains("customers")));
+            let columns: Vec<String> = (0..2).map(|index| window.find(SharedString::from(format!("query-side-column-{index}"))).label().unwrap_or_default().to_owned()).collect();
+            assert!(columns[0].contains("id") && columns[0].contains("INTEGER") && columns[0].contains("非空"), "{columns:?}");
+            assert!(columns[1].contains("status") && columns[1].contains("TEXT") && columns[1].contains("订单状态"), "{columns:?}");
+            // 光标落在列上：信息仍是它所在的表，这一列被标出来。
+            let at = draft.find("status").unwrap() + 2;
+            editor.update(cx, |editor, cx| editor.select_range(at..at, cx));
+            window.render_frame(cx);
+            assert_eq!(window.find("query-side-column-1").selected(), Some(true));
+            assert_eq!(window.find("query-side-column-0").selected(), Some(false));
+            // 认不出的位置说明没有对象。
+            editor.update(cx, |editor, cx| editor.select_range(0..0, cx));
+            window.render_frame(cx);
+            assert!(window.try_find("query-side-object-none").is_some());
+
+            // 另一个标签有自己的状态：在 b 里收起，回到 a 仍是打开的对象页。
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(&[a.clone(), b.clone()], Some("b"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("query-outline").is_some(), "b 还是默认的大纲页");
+            window.click("query-side-close", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("query-side-panel").is_none(), "收起后不再画右侧面板");
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(&[a.clone(), b.clone()], Some("a"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("query-side-panel").is_some(), "a 的面板状态不受 b 影响");
+            assert_eq!(window.find("query-side-mode-object").selected(), Some(true));
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(&[a.clone(), b.clone()], Some("b"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("query-side-panel").is_none(), "b 保持收起");
+            window.click("query-side-toggle", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("query-side-panel").is_some(), "工具条按钮重新打开");
+        })
+        .unwrap();
     }
 }

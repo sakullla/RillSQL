@@ -69,6 +69,76 @@ pub enum ErrorMark {
     Statement,
 }
 
+/// 消息页里的一条执行记录：按执行顺序，每条语句一条；整次执行失败或被取消时补一条整体记录。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogEntry {
+    /// 这条记录对应的结果序号（从 0 开始）；整次执行的失败/取消记录为 None。
+    pub statement: Option<usize>,
+    pub sql: String,
+    /// ok / error / skipped / cancelled / unknown，与结果状态同一套写法。
+    pub status: String,
+    /// 有结果集时读取到的行数。
+    pub rows: Option<usize>,
+    pub affected: Option<u64>,
+    pub elapsed_ms: Option<u64>,
+    /// 错误或说明文本；成功语句为空。
+    pub message: String,
+}
+
+impl LogEntry {
+    pub fn failed(&self) -> bool {
+        self.status == "error" || self.status == "failed"
+    }
+}
+
+/// 右侧对象面板的内容：光标处标识符解析出的目录对象及其列。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectInfo {
+    pub schema: String,
+    pub name: String,
+    pub kind: String,
+    pub comment: String,
+    pub columns: Vec<ColumnMeta>,
+    /// 光标落在某一列上时是这一列的名字。
+    pub column: Option<String>,
+}
+
+/// 被固定的结果：自己保留一份结果快照，之后的执行不替换它，只能手动关闭。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinnedResult {
+    pub id: u64,
+    /// 固定时它是第几次执行（标签内从 1 开始）的第几条结果（从 0 开始）。
+    pub run: u64,
+    pub statement: usize,
+    pub view: StatementView,
+}
+
+/// 结果区当前显示的是哪一页：当前结果、某个固定结果，或消息页。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResultView {
+    #[default]
+    Current,
+    Pinned(u64),
+    Messages,
+}
+
+/// 一批最终结果对应的消息记录。
+pub fn log_entries(results: &[StatementView]) -> Vec<LogEntry> {
+    results
+        .iter()
+        .enumerate()
+        .map(|(index, view)| LogEntry {
+            statement: Some(index),
+            sql: view.sql.clone(),
+            status: view.status.clone(),
+            rows: (!view.columns.is_empty()).then_some(view.rows.len()),
+            affected: view.affected,
+            elapsed_ms: view.elapsed_ms,
+            message: view.message.clone(),
+        })
+        .collect()
+}
+
 /// 发起执行时这批 SQL 在草稿里的位置：from 是 pick 在草稿里的起点，sql 是实际送出的文本。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RunOrigin {
@@ -117,6 +187,16 @@ struct TabState {
     statement: usize,
     /// 最近一次发起执行的位置；结果回来时据此把错误位置换算到草稿。
     run_origin: Option<RunOrigin>,
+    /// 固定的结果；之后的执行不替换，只能手动关闭。
+    pinned: Vec<PinnedResult>,
+    /// 最近一次执行的消息记录；每次发起执行时清空，只保留当前这一批。
+    log: Vec<LogEntry>,
+    /// 这一批消息之前清空过几次（即这是第几次执行的记录）。
+    log_batch: u64,
+    result_view: ResultView,
+    /// 已完成的执行次数；固定结果记下自己来自哪一次。
+    run_seq: u64,
+    pin_seq: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -309,6 +389,12 @@ impl Desk {
             note: String::new(),
             statement: 0,
             run_origin: None,
+            pinned: Vec::new(),
+            log: Vec::new(),
+            log_batch: 0,
+            result_view: ResultView::Current,
+            run_seq: 0,
+            pin_seq: 0,
         });
         if self.active.is_none() {
             self.active = Some(id.to_owned());
@@ -341,6 +427,10 @@ impl Desk {
         tab.running = false;
         tab.cancelled = false;
         tab.results.clear();
+        tab.log.clear();
+        if tab.result_view == ResultView::Messages {
+            tab.result_view = ResultView::Current;
+        }
         tab.note.clear();
         tab.statement = 0;
         tab.token = None;
@@ -540,6 +630,153 @@ impl Desk {
         }
     }
 
+    /// 测试用：把一批最终结果当作一次完成的执行写到活动标签（结果、消息、执行次数）。
+    #[cfg(test)]
+    pub fn plant_run(&mut self, results: Vec<StatementView>) {
+        let wrote = self.active_mut().map(|tab| {
+            tab.log = log_entries(&results);
+            tab.log_batch = tab.log_batch.saturating_add(1);
+            tab.results = results;
+            tab.statement = 0;
+            tab.run_seq = tab.run_seq.saturating_add(1);
+            tab.result_view = ResultView::Current;
+        });
+        if wrote.is_some() {
+            self.view_gen = self.view_gen.saturating_add(1);
+        }
+    }
+
+    /// 活动标签最近一次执行的消息记录。
+    pub fn log(&self) -> Vec<LogEntry> {
+        self.active_tab().map(|tab| tab.log.clone()).unwrap_or_default()
+    }
+
+    /// 消息记录是第几次执行的；从未执行过为 0。
+    pub fn log_batch(&self) -> u64 {
+        self.active_tab().map(|tab| tab.log_batch).unwrap_or(0)
+    }
+
+    pub fn pinned(&self) -> Vec<PinnedResult> {
+        self.active_tab().map(|tab| tab.pinned.clone()).unwrap_or_default()
+    }
+
+    pub fn result_view(&self) -> ResultView {
+        self.active_tab().map(|tab| tab.result_view).unwrap_or_default()
+    }
+
+    /// 切换结果区页签。固定结果已经关闭时不切换。
+    /// 消息页与当前结果共用同一份表格内容，它们之间切换不算结果变化（表格里的暂存和选区保留）；
+    /// 只有切到或切离固定结果才让表格重新绑定。
+    pub fn set_result_view(&mut self, view: ResultView) -> bool {
+        let Some(tab) = self.active_mut() else {
+            return false;
+        };
+        if let ResultView::Pinned(id) = view {
+            if !tab.pinned.iter().any(|pinned| pinned.id == id) {
+                return false;
+            }
+        }
+        let shown = |view: ResultView| match view {
+            ResultView::Pinned(id) => Some(id),
+            ResultView::Current | ResultView::Messages => None,
+        };
+        let rebind = shown(tab.result_view) != shown(view);
+        tab.result_view = view;
+        if rebind {
+            self.view_gen = self.view_gen.saturating_add(1);
+        }
+        true
+    }
+
+    /// 当前结果里正在看的那一条能否固定：已经执行完、有结果，且这条还没固定过。
+    pub fn can_pin(&self) -> bool {
+        let Some(tab) = self.active_tab() else {
+            return false;
+        };
+        if tab.running || tab.result_view != ResultView::Current || tab.results.is_empty() {
+            return false;
+        }
+        let statement = tab.statement.min(tab.results.len() - 1);
+        !tab.pinned.iter().any(|pinned| pinned.run == tab.run_seq && pinned.statement == statement)
+    }
+
+    /// 把当前正在看的结果固定成自己的页签（保留一份快照），并切到它。
+    pub fn pin_current(&mut self) -> Option<u64> {
+        if !self.can_pin() {
+            return None;
+        }
+        let tab = self.active_mut()?;
+        let statement = tab.statement.min(tab.results.len() - 1);
+        tab.pin_seq = tab.pin_seq.saturating_add(1);
+        let id = tab.pin_seq;
+        tab.pinned.push(PinnedResult { id, run: tab.run_seq, statement, view: tab.results[statement].clone() });
+        tab.result_view = ResultView::Pinned(id);
+        self.view_gen = self.view_gen.saturating_add(1);
+        Some(id)
+    }
+
+    /// 关掉一个固定结果；正在看它时回到当前结果。
+    pub fn unpin(&mut self, id: u64) -> bool {
+        let Some(tab) = self.active_mut() else {
+            return false;
+        };
+        let before = tab.pinned.len();
+        tab.pinned.retain(|pinned| pinned.id != id);
+        if tab.pinned.len() == before {
+            return false;
+        }
+        if tab.result_view == ResultView::Pinned(id) {
+            tab.result_view = ResultView::Current;
+        }
+        self.view_gen = self.view_gen.saturating_add(1);
+        true
+    }
+
+    /// 结果表格要显示的那一条：看固定结果时是它的快照，否则是当前结果里选中的语句。
+    pub fn shown_result(&self) -> Option<StatementView> {
+        let tab = self.active_tab()?;
+        if let ResultView::Pinned(id) = tab.result_view {
+            if let Some(pinned) = tab.pinned.iter().find(|pinned| pinned.id == id) {
+                return Some(pinned.view.clone());
+            }
+        }
+        if tab.results.is_empty() {
+            return None;
+        }
+        tab.results.get(tab.statement.min(tab.results.len() - 1)).cloned()
+    }
+
+    /// 光标处标识符对应的对象说明（右侧对象面板）。列也解析到它所在的对象，并记下是哪一列。
+    pub fn object_info_at(&self, text: &str, offset: usize) -> Option<ObjectInfo> {
+        let found = self.resolve_at(text, offset)?;
+        let target = self.target()?;
+        let lookup = |schema: &str, name: &str| {
+            self.objects.iter().find(|object| {
+                object.connection_id == target.connection_id
+                    && object.database == target.database
+                    && object.schema.eq_ignore_ascii_case(schema)
+                    && object.name.eq_ignore_ascii_case(name)
+            })
+        };
+        match found.target {
+            complete::Resolved::Object { schema, name, kind, comment, columns } => {
+                Some(ObjectInfo { schema, name, kind, comment, columns, column: None })
+            }
+            complete::Resolved::Column { schema, table, column, .. } => {
+                let object = lookup(&schema, &table)?;
+                let key = column_key(&object.connection_id, &object.database, &object.schema, &object.name);
+                Some(ObjectInfo {
+                    schema: object.schema.clone(),
+                    name: object.name.clone(),
+                    kind: object.kind.clone(),
+                    comment: self.comments.get(&key).cloned().unwrap_or_default(),
+                    columns: self.columns.get(&key).cloned().unwrap_or_default(),
+                    column: Some(column.name),
+                })
+            }
+        }
+    }
+
     pub fn has_token(&self, id: &str, token: TaskToken) -> bool {
         self.tabs.iter().any(|tab| tab.id == id && tab.token == Some(token))
     }
@@ -553,6 +790,16 @@ impl Desk {
             tab.running = false;
             tab.status = "error".to_owned();
             tab.note = note.to_owned();
+            // 整次执行没有结果就失败（连接中断等）：消息页也要有这一条。
+            tab.log.push(LogEntry {
+                statement: None,
+                sql: tab.run_origin.as_ref().map(|origin| origin.sent.clone()).unwrap_or_default(),
+                status: "error".to_owned(),
+                rows: None,
+                affected: None,
+                elapsed_ms: None,
+                message: note.to_owned(),
+            });
             true
         });
         if applied {
@@ -674,6 +921,10 @@ impl Desk {
         tab.token = None;
         tab.run_id = None;
         tab.results.clear();
+        tab.log.clear();
+        if tab.result_view == ResultView::Messages {
+            tab.result_view = ResultView::Current;
+        }
         tab.note.clear();
         tab.statement = 0;
         tab.pending = None;
@@ -820,6 +1071,8 @@ impl Desk {
                         tab.executed = true;
                         tab.executed_sql = Some(tab.draft.clone());
                         tab.statement = 0;
+                        tab.run_seq = tab.run_seq.saturating_add(1);
+                        tab.log = log_entries(&tab.results);
                     }
                     true
                 }
@@ -843,9 +1096,21 @@ impl Desk {
         if let Some(token) = tab.token {
             tasks.cancel(&owner(&tab.id), token.id);
         }
+        let was_running = tab.running;
         tab.cancelled = true;
         tab.running = false;
         tab.status = "cancelled".to_owned();
+        if was_running {
+            tab.log.push(LogEntry {
+                statement: None,
+                sql: tab.run_origin.as_ref().map(|origin| origin.sent.clone()).unwrap_or_default(),
+                status: "cancelled".to_owned(),
+                rows: None,
+                affected: None,
+                elapsed_ms: None,
+                message: String::new(),
+            });
+        }
         tab.run_id.clone()
     }
 
@@ -902,7 +1167,13 @@ impl Desk {
             tab.pending = None;
             tab.draft = original;
             tab.run_origin = Some(origin);
+            // 消息页只保留当前这一批；清空时记下批次，消息页据此说明这是第几次执行。
+            tab.log.clear();
+            tab.log_batch = tab.log_batch.saturating_add(1);
+            // 新结果落在“当前结果”页；固定的结果不动。
+            tab.result_view = ResultView::Current;
         }
+        self.view_gen = self.view_gen.saturating_add(1);
         self.executions += 1;
         self.record_frequency(&pick.sql);
         BeginRun::Ready(PreparedRun {
@@ -1171,6 +1442,12 @@ impl Desk {
             note: String::new(),
             statement: 0,
             run_origin: None,
+            pinned: Vec::new(),
+            log: Vec::new(),
+            log_batch: 0,
+            result_view: ResultView::Current,
+            run_seq: 0,
+            pin_seq: 0,
         });
         self.active = Some(id.clone());
         self.refresh_outline();
@@ -2166,6 +2443,129 @@ mod tests {
         assert!(desk.accept_run(&tasks, &ticket, streaming_run("run-2", "cancelled", &["1"])));
         assert!(!desk.running_ids().contains(&ticket.tab_id));
         assert_eq!(desk.status(), "cancelled");
+    }
+
+    /// 三条语句（第三条失败）的一次执行快照。
+    fn three_statement_run(id: &str, marker: &str) -> RunDto {
+        let mut run = empty_run(id);
+        let ok = run.statements[0].clone();
+        let mut first = ok.clone();
+        first.sql = format!("SELECT '{marker}'");
+        first.columns = vec!["v".to_owned()];
+        first.rows = vec![vec![Some(marker.to_owned())]];
+        first.elapsed_ms = Some(3);
+        let mut second = ok.clone();
+        second.sql = "UPDATE item SET n = 1".to_owned();
+        second.columns = Vec::new();
+        second.rows = Vec::new();
+        second.affected = Some(2);
+        second.elapsed_ms = Some(4);
+        let mut third = ok;
+        third.sql = "SELECT * FROM missing".to_owned();
+        third.status = "error".to_owned();
+        third.message = "no such table: missing".to_owned();
+        third.columns = Vec::new();
+        third.rows = Vec::new();
+        third.elapsed_ms = Some(1);
+        run.status = "error".to_owned();
+        run.statements = vec![first, second, third];
+        run
+    }
+
+    #[test]
+    fn the_log_lists_each_statement_and_is_cleared_per_run() {
+        let tasks = TaskBoard::new();
+        let mut desk = Desk::new();
+        desk.open_database("notes", "笔记", "sqlite", "main");
+        assert!(desk.log().is_empty());
+        assert_eq!(desk.log_batch(), 0);
+        let ticket = ready_ticket(&mut desk, &tasks, "SELECT 'a'; UPDATE item SET n = 1; SELECT * FROM missing");
+        assert_eq!(desk.log_batch(), 1, "发起执行时记下新的一批");
+        // 中间快照不写消息：只有终态才是这一批的记录。
+        assert!(desk.accept_run(&tasks, &ticket, streaming_run("run-1", "running", &["1"])));
+        assert!(desk.log().is_empty());
+        assert!(desk.accept_run(&tasks, &ticket, three_statement_run("run-1", "a")));
+        let log = desk.log();
+        assert_eq!(log.len(), 3, "{log:?}");
+        assert_eq!(log.iter().map(|entry| entry.status.as_str()).collect::<Vec<_>>(), vec!["ok", "ok", "error"]);
+        assert_eq!(log.iter().map(|entry| entry.statement).collect::<Vec<_>>(), vec![Some(0), Some(1), Some(2)]);
+        assert_eq!(log[0].rows, Some(1), "结果集记行数");
+        assert_eq!((log[1].rows, log[1].affected), (None, Some(2)), "写语句记影响行数");
+        assert_eq!(log.iter().map(|entry| entry.elapsed_ms).collect::<Vec<_>>(), vec![Some(3), Some(4), Some(1)]);
+        assert!(log[2].failed() && log[2].message.contains("missing"));
+
+        // 下一次执行开始就清空，只留当前这一批；整次失败也记一条。
+        assert!(desk.set_result_view(ResultView::Messages));
+        let next = ready_ticket(&mut desk, &tasks, "SELECT 2");
+        assert!(desk.log().is_empty(), "新的一次执行清掉上一批消息");
+        assert_eq!(desk.log_batch(), 2);
+        assert_eq!(desk.result_view(), ResultView::Current, "新结果落在当前结果页");
+        desk.finish_polled(&tasks, &next, Err("连接中断".to_owned()), "已取消");
+        let log = desk.log();
+        assert_eq!(log.len(), 1);
+        assert_eq!((log[0].statement, log[0].status.as_str(), log[0].message.as_str()), (None, "error", "连接中断"));
+
+        // 取消运行中的执行也留一条记录。
+        let _ = ready_ticket(&mut desk, &tasks, "SELECT 3");
+        let _ = desk.cancel(&tasks);
+        let log = desk.log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].status, "cancelled");
+    }
+
+    #[test]
+    fn pinned_results_survive_later_runs_until_closed() {
+        let tasks = TaskBoard::new();
+        let mut desk = Desk::new();
+        desk.open_database("notes", "笔记", "sqlite", "main");
+        assert!(!desk.can_pin(), "没有结果时不能固定");
+        let first = ready_ticket(&mut desk, &tasks, "SELECT 'a'");
+        assert!(!desk.can_pin(), "执行中不能固定");
+        assert!(desk.accept_run(&tasks, &first, three_statement_run("run-1", "a")));
+        assert!(desk.can_pin());
+        let pin = desk.pin_current().expect("固定第一条");
+        assert_eq!(desk.result_view(), ResultView::Pinned(pin), "固定后切到它");
+        assert!(!desk.can_pin(), "同一条结果不重复固定");
+        let snapshot = desk.pinned()[0].view.clone();
+        assert_eq!(snapshot.rows, vec![vec![Some("a".to_owned())]]);
+
+        // 再执行一次：新结果进当前页，固定的内容不变。
+        let second = ready_ticket(&mut desk, &tasks, "SELECT 'b'");
+        assert!(desk.accept_run(&tasks, &second, three_statement_run("run-2", "b")));
+        assert_eq!(desk.result_view(), ResultView::Current);
+        assert_eq!(desk.shown_result().unwrap().rows, vec![vec![Some("b".to_owned())]], "当前页是新结果");
+        assert_eq!(desk.pinned().len(), 1);
+        assert_eq!(desk.pinned()[0].view, snapshot, "固定结果没有被新执行替换");
+        assert!(desk.set_result_view(ResultView::Pinned(pin)));
+        assert_eq!(desk.shown_result().unwrap().rows, vec![vec![Some("a".to_owned())]]);
+        assert!(!desk.set_result_view(ResultView::Pinned(pin + 9)), "不存在的固定结果不切换");
+        // 未固定的结果照旧被替换；新一次的同一条语句可以再固定。
+        assert!(desk.set_result_view(ResultView::Current));
+        assert!(desk.can_pin());
+        // 手动关闭：正在看它时回到当前结果。
+        assert!(desk.set_result_view(ResultView::Pinned(pin)));
+        assert!(desk.unpin(pin));
+        assert!(desk.pinned().is_empty());
+        assert_eq!(desk.result_view(), ResultView::Current);
+        assert!(!desk.unpin(pin));
+    }
+
+    #[test]
+    fn switching_between_current_and_messages_keeps_the_grid_binding() {
+        let tasks = TaskBoard::new();
+        let mut desk = Desk::new();
+        desk.open_database("notes", "笔记", "sqlite", "main");
+        let ticket = ready_ticket(&mut desk, &tasks, "SELECT 'a'");
+        assert!(desk.accept_run(&tasks, &ticket, three_statement_run("run-1", "a")));
+        let generation = desk.view_gen();
+        assert!(desk.set_result_view(ResultView::Messages));
+        assert!(desk.set_result_view(ResultView::Current));
+        assert_eq!(desk.view_gen(), generation, "消息页与当前结果共用表格，切换不重绑（暂存不丢）");
+        assert!(desk.pin_current().is_some());
+        assert!(desk.view_gen() > generation, "切到固定结果要重绑表格");
+        let generation = desk.view_gen();
+        assert!(desk.set_result_view(ResultView::Messages));
+        assert!(desk.view_gen() > generation, "从固定结果切走也要重绑");
     }
 
     #[test]

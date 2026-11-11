@@ -498,8 +498,12 @@ impl Workbench {
         let locale = self.model.locale();
         let timeout = self.model.settings.query_timeout_sec;
         let context = self.active_query_context();
+        let density = self.model.shell.density;
         let effect = self.query.update(cx, |pane, cx| {
             pane.set_query_timeout_sec(timeout);
+            if pane.set_density(density) {
+                cx.notify();
+            }
             let _ = pane.prepare(&snaps, active.as_deref(), locale, context, cx);
             pane.apply_grid_locale(locale, cx);
             pane.command(id, cx);
@@ -543,9 +547,14 @@ impl Workbench {
             .map(|row| (row.saved.id.clone(), row.saved.env.clone()))
             .collect::<Vec<_>>();
         let context = self.active_query_context();
+        // 密度和语言一样每帧下发：消息页、右侧面板的行高与控件高度立即跟着变。
+        let density = self.model.shell.density;
         let effect = self.query.update(cx, |pane, cx| {
             pane.remember_environments(environments);
             pane.set_query_timeout_sec(timeout);
+            if pane.set_density(density) {
+                cx.notify();
+            }
             let effect = pane.prepare(&snaps, active.as_deref(), locale, context, cx);
             pane.apply_grid_locale(locale, cx);
             pane.ensure_editors(window, cx);
@@ -1786,6 +1795,8 @@ fn query_command(id: &str) -> bool {
             | "explain"
             | "expand-star"
             | "toggle-outline"
+            | "toggle-side"
+            | "pin-result"
             | "refresh-tree"
             | "confirm-variables"
             | "cancel-variables"
@@ -1795,6 +1806,10 @@ fn query_command(id: &str) -> bool {
         || id.starts_with("database:")
         || id.starts_with("bind-connection:")
         || id.starts_with("statement:")
+        || id.starts_with("query-view:")
+        || id.starts_with("unpin:")
+        || id.starts_with("log:")
+        || id.starts_with("side-mode:")
 }
 
 pub(super) fn nav_key(key: &str) -> Option<NavKey> {

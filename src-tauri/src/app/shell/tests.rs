@@ -4915,6 +4915,82 @@ fn display_matrix_keeps_primary_controls_visible_and_unoverlapped(cx: &mut gpui_
         })
         .unwrap();
 
+        // 查询页：执行、连接选择、结果表格和消息页签在各宽度都可见、不重叠；
+        // 右侧面板在 1360/900 紧靠编辑器，在 640 默认收起，打开再关上后布局回到原样。
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.plant_query_result(vec!["id".to_owned(), "label".to_owned()], vec![vec!["1".to_owned(), "a".to_owned()]], cx);
+            })
+        });
+        type Rect = gpui_kit::Bounds<gpui_kit::Pixels>;
+        let check = |window: &mut gpui_kit::Window, id: &str| -> Rect {
+            let el = window.find(gpui_kit::SharedString::from(id.to_owned()));
+            assert!(el.visible(), "{width}: {id} 应可见");
+            let b = el.bounds();
+            let (left, top) = (f32::from(b.origin.x), f32::from(b.origin.y));
+            let (right, bottom) = (left + f32::from(b.size.width), top + f32::from(b.size.height));
+            assert!(left >= -0.5 && top >= -0.5, "{width}: {id} 左上越界 {left},{top}");
+            assert!(right <= width + 0.5 && bottom <= height + 0.5, "{width}: {id} 越界 {right},{bottom}");
+            b
+        };
+        let apart = |label: &str, a: Rect, b: Rect| {
+            let overlap_x = f32::from(a.origin.x) + 0.5 < f32::from(b.origin.x + b.size.width) && f32::from(b.origin.x) + 0.5 < f32::from(a.origin.x + a.size.width);
+            let overlap_y = f32::from(a.origin.y) + 0.5 < f32::from(b.origin.y + b.size.height) && f32::from(b.origin.y) + 0.5 < f32::from(a.origin.y + a.size.height);
+            assert!(!(overlap_x && overlap_y), "{width}: {label} 重叠 {a:?} / {b:?}");
+        };
+        let narrow = width < 800.;
+        let (editor_before, grid_before) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                let run = check(window, "query-act-execute-query");
+                let picker = check(window, "query-connection");
+                let grid = check(window, "query-grid");
+                let log = check(window, "query-log-tab");
+                let editor = check(window, "query-editor");
+                apart("执行/连接选择", run, picker);
+                apart("执行/结果表格", run, grid);
+                apart("连接选择/结果表格", picker, grid);
+                apart("消息页签/结果表格", log, grid);
+                apart("消息页签/执行", log, run);
+                if narrow {
+                    assert!(window.try_find("query-side-panel").is_none(), "{width}: 窄窗口里右侧面板默认收起");
+                } else {
+                    let side = check(window, "query-side-panel");
+                    apart("右侧面板/编辑器", side, editor);
+                    apart("右侧面板/结果表格", side, grid);
+                    apart("右侧面板/连接选择", side, picker);
+                    assert!(f32::from(side.origin.x) + 0.5 >= f32::from(editor.origin.x + editor.size.width), "{width}: 右侧面板在编辑器右边");
+                }
+                // 消息页签在任何宽度都能点开。
+                window.click("query-log-tab", cx);
+                window.render_frame(cx);
+                check(window, "query-log");
+                window.click("query-results-tab", cx);
+                window.render_frame(cx);
+                check(window, "query-grid");
+                (editor, check(window, "query-grid"))
+            })
+            .unwrap();
+        if narrow {
+            cx.update_window(window, |_, window, cx| {
+                window.click("query-side-toggle", cx);
+                window.render_frame(cx);
+                let side = check(window, "query-side-panel");
+                // 打开时是浮层：编辑器与结果区不被挤开，执行与连接选择仍可见。
+                assert_eq!(check(window, "query-editor"), editor_before, "{width}: 打开浮层不改变编辑器布局");
+                let grid = check(window, "query-grid");
+                apart("右侧浮层/结果表格", side, grid);
+                apart("右侧浮层/执行", side, check(window, "query-act-execute-query"));
+                apart("右侧浮层/连接选择", side, check(window, "query-connection"));
+                window.click("query-side-close", cx);
+                window.render_frame(cx);
+                assert!(window.try_find("query-side-panel").is_none(), "{width}: 关上后收起");
+                assert_eq!(check(window, "query-editor"), editor_before, "{width}: 关上后编辑器回到原布局");
+                assert_eq!(check(window, "query-grid"), grid_before, "{width}: 关上后结果表格回到原布局");
+            })
+            .unwrap();
+        }
+
         // “返回”与浮层关闭按钮同样在各宽度可达。
         cx.update(|cx| view.update(cx, |view, cx| view.perform("compare", cx)));
         cx.update_window(window, |_, window, cx| {
@@ -5071,6 +5147,119 @@ fn locale_theme_and_density_refresh_existing_inputs_tree_and_palette(cx: &mut gp
         })
         .unwrap();
     assert!(compact_height < zh_height, "密度切换要改变已有树行高度：{zh_height} -> {compact_height}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 查询页新增的消息页、右侧面板和结果表格里的记录视图，切换语言、主题和密度后立即跟着变。
+#[gpui_kit::test]
+fn query_log_side_panel_and_record_view_follow_locale_theme_and_density(cx: &mut gpui_kit::TestAppContext) {
+    use crate::query::desk::StatementView;
+    use crate::ui::kit::Palette;
+    use gpui_kit::component::ActiveTheme as _;
+
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-shell-query-refresh-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench_sized(cx, services_at(&dir), false, 1360., 900.);
+    let statement = |sql: &str| StatementView {
+        sql: sql.to_owned(),
+        status: "ok".to_owned(),
+        message: String::new(),
+        columns: vec!["id".to_owned(), "label".to_owned()],
+        rows: vec![vec![Some("1".to_owned()), Some("a".to_owned())], vec![Some("2".to_owned()), Some("b".to_owned())]],
+        truncated: false,
+        affected: None,
+        elapsed_ms: Some(7),
+        error_at: None,
+        range: None,
+        error_mark: None,
+    };
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        view.update(cx, |view, cx| view.perform("new-query", cx));
+        window.render_frame(cx);
+        let query = view.read(cx).query.clone();
+        query.update(cx, |pane, cx| pane.plant_run(vec![statement("SELECT id, label FROM item")], cx));
+        window.render_frame(cx);
+        // 记录视图在结果表格里打开；切到消息页再切回来它还开着。
+        query.update(cx, |pane, cx| {
+            let _ = pane.grid_command("grid-record-toggle", cx);
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    #[derive(Debug, PartialEq)]
+    struct Seen {
+        log: String,
+        log_entry: String,
+        log_row_h: f32,
+        side: String,
+        side_mode: String,
+        side_mode_h: f32,
+        record: String,
+        colors: Option<(gpui_kit::Hsla, gpui_kit::Hsla)>,
+        palette: (gpui_kit::Hsla, gpui_kit::Hsla),
+        dark: bool,
+    }
+    let seen = |cx: &mut gpui_kit::TestAppContext| -> Seen {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("query-log-tab", cx);
+            window.render_frame(cx);
+            let label = |window: &mut gpui_kit::Window, id: &str| {
+                window.find(gpui_kit::SharedString::from(id.to_owned())).label().unwrap_or_default().to_owned()
+            };
+            let log = label(window, "query-log");
+            let log_entry = label(window, "query-log-0");
+            let log_row_h = f32::from(window.find("query-log-0").bounds().size.height);
+            let side = label(window, "query-side-panel");
+            let side_mode = label(window, "query-side-mode-outline");
+            let side_mode_h = f32::from(window.find("query-side-mode-outline").bounds().size.height);
+            window.click("query-results-tab", cx);
+            window.render_frame(cx);
+            // 记录视图自己的按钮（关闭、下一行）带当前语言的可读名称。
+            let record = format!("{} / {}", label(window, "grid-record-close"), label(window, "grid-record-next"));
+            let palette = Palette::of(cx);
+            let colors = view.read(cx).query.read(cx).drawn_colors();
+            Seen { log, log_entry, log_row_h, side, side_mode, side_mode_h, record, colors, palette: (palette.surface, palette.chrome), dark: cx.theme().is_dark() }
+        })
+        .unwrap()
+    };
+    let cjk = |text: &str| text.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch));
+
+    let zh = seen(cx);
+    assert!(cjk(&zh.log) && cjk(&zh.log_entry) && cjk(&zh.side_mode) && cjk(&zh.record), "初始是中文：{zh:?}");
+    assert_eq!(zh.colors, Some(zh.palette), "消息页/右侧面板用当前主题的底色");
+    assert!(!zh.dark);
+
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("locale-en", cx)));
+    let en = seen(cx);
+    for (name, before, after) in [
+        ("消息页", &zh.log, &en.log),
+        ("消息记录", &zh.log_entry, &en.log_entry),
+        ("右侧面板", &zh.side, &en.side),
+        ("右侧分段", &zh.side_mode, &en.side_mode),
+        ("记录视图", &zh.record, &en.record),
+    ] {
+        assert_ne!(before, after, "{name} 切换语言后要立即重画");
+        assert!(!cjk(after), "{name} 英文里残留中文：{after}");
+    }
+    assert!(en.log_entry.contains("Succeeded") && en.log_entry.contains("2 rows"), "{}", en.log_entry);
+
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("theme-dark", cx)));
+    let dark = seen(cx);
+    assert!(dark.dark, "主题要切到深色");
+    assert_ne!(dark.palette, en.palette);
+    assert_eq!(dark.colors, Some(dark.palette), "消息页/右侧面板立即换成深色底色");
+    assert_eq!(dark.record, en.record, "记录视图在主题切换后仍在");
+
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("density-compact", cx)));
+    let compact = seen(cx);
+    assert!(compact.log_row_h < dark.log_row_h, "密度切换要改变消息行高：{} -> {}", dark.log_row_h, compact.log_row_h);
+    assert!(compact.side_mode_h < dark.side_mode_h, "密度切换要改变右侧分段控件高度：{} -> {}", dark.side_mode_h, compact.side_mode_h);
+    assert_eq!(compact.record, en.record, "记录视图在密度切换后仍在");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
