@@ -250,7 +250,7 @@ pub async fn attach_reference(session: &CatalogSession, request: &Request, snaps
         return Ok(());
     };
     let mut target_request = request.clone();
-    if request.engine == Engine::Postgres {
+    if request.engine == Engine::Postgres || (request.engine == Engine::Sqlserver && !foreign_key.ref_schema.is_empty()) {
         target_request.schema = foreign_key.ref_schema.clone();
     }
     let referenced = load(session, &target_request, &foreign_key.ref_table).await?;

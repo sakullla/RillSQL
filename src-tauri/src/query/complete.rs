@@ -1936,9 +1936,9 @@ mod tests {
         let mut typed = scope("postgres");
         typed.objects[0].comment = "订单".to_owned();
         typed.sources[0].columns = vec![
-            ColumnMeta { name: "id".to_owned(), type_name: "integer".to_owned(), nullable: Some(false), comment: String::new() },
-            ColumnMeta { name: "customer_id".to_owned(), type_name: "integer".to_owned(), nullable: Some(true), comment: String::new() },
-            ColumnMeta { name: "status".to_owned(), type_name: "text".to_owned(), nullable: Some(true), comment: "订单状态".to_owned() },
+            ColumnMeta { name: "id".to_owned(), type_name: "integer".to_owned(), nullable: Some(false), comment: String::new(), primary: false, foreign_key: false },
+            ColumnMeta { name: "customer_id".to_owned(), type_name: "integer".to_owned(), nullable: Some(true), comment: String::new(), primary: false, foreign_key: false },
+            ColumnMeta { name: "status".to_owned(), type_name: "text".to_owned(), nullable: Some(true), comment: "订单状态".to_owned(), primary: false, foreign_key: false },
         ];
         typed
     }
