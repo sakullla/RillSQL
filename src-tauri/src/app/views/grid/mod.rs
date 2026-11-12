@@ -3,6 +3,7 @@
 mod record;
 mod session;
 
+use std::ops::DerefMut;
 use std::sync::{Arc, OnceLock};
 
 pub use session::{operation_banner, prove_single_table, GridMode, GridTarget, QuerySheet, SharedGrid};
@@ -14,10 +15,11 @@ use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
-    relative,
+    relative, DragMoveEvent,
 };
 
 use crate::ui::kit::{self, Palette, Tip as _, Radius, TypeScale};
+use crate::ui::{EditMode, FormatViewer, FormatViewerEvent, TruncationState, ViewerSpec};
 use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::application::AppServices;
@@ -48,6 +50,10 @@ pub type NavigationSink = Arc<dyn Fn(GridNavigation, &mut App)>;
 /// 来源状态快照：(选择锚点/焦点, 可见首行, 是否有暂存, 查看目标的 (行 id, 列名))。
 #[cfg(test)]
 pub type GridStateSnapshot = (Option<(String, String)>, usize, bool, Option<(String, String)>);
+
+const RECORD_SIDE_DEFAULT: f32 = 340.;
+const RECORD_SIDE_MIN: f32 = 260.;
+const RECORD_SIDE_MAX: f32 = 640.;
 
 impl GridNavigation {
     /// 工作项里的对象规格：连接|连接名|库|模式||表|引擎|环境。
@@ -108,6 +114,14 @@ pub struct GridPane {
     pending_viewer: bool,
     /// 右侧纵向记录视图是否打开；它始终显示网格的焦点行。
     record_open: bool,
+    /// 记录面板宽度。默认 340，拖拽限制在 260..=640，双击复位。
+    side_width: f32,
+    record_dragging: bool,
+    /// 单元格查看和记录面板共用的格式工作台。预览态不能提交。
+    format_viewer: Option<Entity<FormatViewer>>,
+    format_subscription: Option<gpui_kit::Subscription>,
+    /// 行 id、列名、阶段、语言。阶段没变就不重建，避免清掉编辑草稿。
+    format_stamp: Option<(String, String, CellPhase, Locale)>,
     /// 表头菜单"自适应列宽"要用窗口量字宽，绘制前再执行（逻辑列）。
     pending_fit: Option<usize>,
     /// "选区设值"要拿到 Window 才能聚焦输入，绘制时再打开编辑栏。
@@ -162,6 +176,8 @@ fn full_action(id: &str) -> Option<GridAction> {
         "grid-filter-value" => GridAction::FilterValue,
         "grid-fk-jump" | "grid-fk-select" => GridAction::Reference,
         "grid-full-values" => GridAction::ExportValues,
+        // 生成的 SELECT/UPDATE 用整行 WHERE，预览信封先读成原值。
+        "grid-sql-select" | "grid-sql-update" => GridAction::WhereRow,
         // 复制为新行要拿到焦点行每一格的原值。
         "grid-clone-row" => GridAction::CopyRow,
         other if CopyFormat::from_command(other).is_some() => GridAction::CopyRegion,
@@ -227,6 +243,11 @@ impl GridPane {
             navigation: None,
             pending_viewer: false,
             record_open: false,
+            side_width: RECORD_SIDE_DEFAULT,
+            record_dragging: false,
+            format_viewer: None,
+            format_subscription: None,
+            format_stamp: None,
             pending_fit: None,
             pending_batch: false,
             search_subscription: None,
@@ -707,6 +728,44 @@ impl GridPane {
                 let _ = record::record_step(&mut self.session, id == "grid-record-next");
                 None
             }
+            "grid-undo-cell" => {
+                let target = self.session.focus_cell();
+                if let Some((row, column)) = target {
+                    let row_id = SharedGrid::row_id(&self.session, row).map(str::to_owned);
+                    if let Some(row_id) = row_id {
+                        let _ = self.session.revert_cell(&row_id, column);
+                    }
+                }
+                None
+            }
+            "grid-undo-row" => {
+                let target = self.session.focus_cell();
+                if let Some((row, _)) = target {
+                    let row_id = SharedGrid::row_id(&self.session, row).map(str::to_owned);
+                    if let Some(row_id) = row_id {
+                        let _ = self.session.revert_row(&row_id);
+                    }
+                }
+                None
+            }
+            "grid-discard" => {
+                self.session.discard_all_staged();
+                None
+            }
+            "grid-jump-staged" => {
+                if let Some((row, column)) = self.session.next_staged_cell() {
+                    self.session.select(row, column, false);
+                }
+                None
+            }
+            "grid-sql-select" => {
+                let sql = self.session.select_statement();
+                if sql.is_empty() { None } else { Some(sql) }
+            }
+            "grid-sql-update" => {
+                let sql = self.session.update_statement();
+                if sql.is_empty() { None } else { Some(sql) }
+            }
             _ => None,
         };
         if let Some(text) = copied.clone() {
@@ -1184,7 +1243,7 @@ impl GridPane {
 
     /// 绘制阶段才能拿到 Window：在这里填充并聚焦编辑输入，选区/光标由输入本身维护。
     fn begin_edit(&mut self, pending: PendingEdit, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(row_id) = self.session.row_id(pending.row).map(str::to_owned) else {
+        let Some(row_id) = SharedGrid::row_id(&self.session, pending.row).map(str::to_owned) else {
             return;
         };
         // 预览信封不是原值：双击和 F2 也要先按定位读一次，绝不把信封（或空串）放进编辑框。
@@ -1716,6 +1775,27 @@ impl GridPane {
         let hidden = self.session.hidden_columns();
         let has_selection = self.session.selection_count() > 0;
         let logical_count = names.len();
+        let headers = (0..names.len()).filter_map(|column| self.session.column_header(column)).collect::<Vec<_>>();
+        let cell_marks = (0..self.session.loaded_len())
+            .map(|row| (0..names.len()).map(|column| dirty_mark(self.session.cell_dirty_state(row, column))).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let row_marks = (0..self.session.loaded_len())
+            .map(|row| {
+                let state = self.session.cell_dirty_state(row, 0);
+                if matches!(state, session::CellDirty::Inserted | session::CellDirty::Deleted) { dirty_mark(state) } else { 0 }
+            })
+            .collect::<Vec<_>>();
+        let (cell_dirty, row_dirty) = self
+            .session
+            .focus_cell()
+            .map(|(row, column)| (self.session.cell_dirty_state(row, column) != session::CellDirty::Clean, row_is_dirty(&self.session, row)))
+            .unwrap_or((false, false));
+        let write_reason = if writable {
+            String::new()
+        } else {
+            let key = self.session.readonly_reason();
+            if key.is_empty() { i18n::text(locale, "grid.status.readonly") } else { i18n::text(locale, key) }
+        };
         self.table.update(cx, |state, cx| {
             state.delegate_mut().locale = locale;
             state.delegate_mut().selected = selected;
@@ -1728,6 +1808,12 @@ impl GridPane {
             state.delegate_mut().logical_count = logical_count;
             state.delegate_mut().hidden = hidden;
             state.delegate_mut().has_selection = has_selection;
+            state.delegate_mut().headers = headers;
+            state.delegate_mut().cell_marks = cell_marks;
+            state.delegate_mut().row_marks = row_marks;
+            state.delegate_mut().cell_dirty = cell_dirty;
+            state.delegate_mut().row_dirty = row_dirty;
+            state.delegate_mut().write_reason = write_reason;
             state.delegate_mut().rows = rows;
             state.delegate_mut().sort = sort;
             state.delegate_mut().fk = fk;
@@ -1744,6 +1830,19 @@ impl GridPane {
             }
         });
     }
+}
+
+fn dirty_mark(state: session::CellDirty) -> u8 {
+    match state {
+        session::CellDirty::Clean => 0,
+        session::CellDirty::Inserted => 1,
+        session::CellDirty::Updated => 2,
+        session::CellDirty::Deleted => 3,
+    }
+}
+
+fn row_is_dirty(grid: &SharedGrid, row: usize) -> bool {
+    (0..grid.column_names().len()).any(|column| grid.cell_dirty_state(row, column) != session::CellDirty::Clean)
 }
 
 /// 结构里带回来的真实外键；没有读到时给空表，界面因此不会显示不适用的入口。
@@ -1846,6 +1945,7 @@ impl Render for GridPane {
         let loading = self.loading_more || self.fetching;
         // 各区域在各自不内联的函数里搭建：未优化构建不复用栈槽，整块写在一个函数里时单帧约 700 KB，
         // 网格又画在查询页/表数据页的布局递归深处，叠上记录视图会撑爆 Windows 主线程默认 1 MB 栈。
+        self.sync_format_viewer(window, cx);
         let tools = self.render_tools(loading, &p, m, &entity, window, cx);
         let filters_strip = self.render_filters(&p, &entity, window, cx);
 
@@ -1936,6 +2036,96 @@ impl Render for GridPane {
 }
 
 impl GridPane {
+    /// 把当前查看格交给 FormatViewer。同一格的草稿保留；完整值到达后才替换。
+    #[inline(never)]
+    fn sync_format_viewer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.session.viewer_state().cloned() else {
+            self.format_viewer = None;
+            self.format_subscription = None;
+            self.format_stamp = None;
+            return;
+        };
+        let Some(shown) = self.session.viewer() else {
+            self.format_viewer = None;
+            self.format_subscription = None;
+            self.format_stamp = None;
+            return;
+        };
+        let stamp = (state.row_id.clone(), state.column_name.clone(), state.phase, self.locale);
+        if let (Some(viewer), Some(previous)) = (&self.format_viewer, self.format_stamp.clone()) {
+            if previous.0 == stamp.0 && previous.1 == stamp.1 && previous.2 == stamp.2 && previous.3 == stamp.3 {
+                return;
+            }
+            if previous.0 == stamp.0 && previous.1 == stamp.1 && previous.3 == stamp.3 && stamp.2 == CellPhase::Full && previous.2 != CellPhase::Full {
+                let text = if shown.body.is_empty() { shown.label.clone() } else { shown.body };
+                viewer.update(cx, |view, cx| view.replace_full(text, None, window, cx));
+                self.format_stamp = Some(stamp);
+                return;
+            }
+            if previous.0 == stamp.0 && previous.1 == stamp.1 && previous.2 == stamp.2 && previous.3 != stamp.3 {
+                viewer.update(cx, |view, cx| view.set_locale(self.locale, window, cx));
+                self.format_stamp = Some(stamp);
+                return;
+            }
+        }
+        let spec = self.viewer_spec(&state, &shown);
+        let viewer = cx.new(|cx| FormatViewer::new(spec, window, cx));
+        self.format_subscription = Some(cx.subscribe(&viewer, |this, _, event: &FormatViewerEvent, cx| match event {
+            FormatViewerEvent::LoadFull => {
+                let _ = this.command("grid-value-retry", cx);
+            }
+            FormatViewerEvent::Commit(text) => {
+                let Some((row, column)) = this.session.viewer_cell() else {
+                    return;
+                };
+                // 截断预览和两种信封都不能写回；非法 JSON 由暂存校验拦住，草稿留在查看器里。
+                if this.session.needs_full(row, column) || text.contains('\u{1}') {
+                    return;
+                }
+                let Some(row_id) = SharedGrid::row_id(&this.session, row).map(str::to_owned) else {
+                    return;
+                };
+                let gate = this.session.stage_text_by_id(&row_id, column, Some(text.clone()));
+                this.notice = this.session.gate_text(gate);
+                this.sync_table(cx);
+                cx.notify();
+            }
+        }));
+        self.format_viewer = Some(viewer);
+        self.format_stamp = Some(stamp);
+    }
+
+    fn viewer_spec(&self, state: &session::ViewerState, shown: &session::ShownCell) -> ViewerSpec {
+        let (row, column) = self.session.viewer_cell().unwrap_or((0, 0));
+        let truncation = match state.phase {
+            CellPhase::Full => TruncationState::Full,
+            CellPhase::Loading => TruncationState::Loading,
+            CellPhase::Error => TruncationState::Error(state.message.clone()),
+            CellPhase::Preview => TruncationState::Preview {
+                total_bytes: self.session.preview_total(row, column).unwrap_or(0),
+                can_load_full: self.session.can_reread(row),
+            },
+        };
+        let text = if shown.kind == session::CellKind::Null {
+            String::new()
+        } else if !shown.body.is_empty() {
+            shown.body.clone()
+        } else if state.phase == CellPhase::Full {
+            shown.label.clone()
+        } else {
+            shown.body.clone()
+        };
+        ViewerSpec {
+            text,
+            column_hint: Some(state.column_name.clone()),
+            type_hint: self.session.column_type(column).map(str::to_owned),
+            bytes: None,
+            truncation,
+            mode: if self.session.write_reason(row, column).is_empty() { EditMode::Editable } else { EditMode::ReadOnly },
+            locale: self.locale,
+        }
+    }
+
     /// 工具条：查找、查找范围、筛选、排序、翻页与范围、状态组和动作组。
     #[inline(never)]
     fn render_tools(&mut self, loading: bool, p: &Palette, m: kit::Metrics, entity: &Entity<GridPane>, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
@@ -2034,7 +2224,7 @@ impl GridPane {
         if let Some(sorted) = sort_text {
             tools = tools.child(kit::pill(SharedString::from(sorted), p.accent_text, p.accent_soft));
         }
-        tools.child(self.render_tools_status(p)).child(self.render_tools_actions(entity)).into_any_element()
+        tools.child(self.render_tools_status(p)).child(self.render_tools_actions(p, entity)).into_any_element()
     }
 
     /// 状态组（可写/只读、只读原因、操作反馈）占住中间的剩余空间并靠右，空间不够时文字截断。
@@ -2083,7 +2273,7 @@ impl GridPane {
 
     /// 动作组不收缩：一行放不下时整组换行，始终完整可点。
     #[inline(never)]
-    fn render_tools_actions(&self, entity: &Entity<GridPane>) -> gpui_kit::AnyElement {
+    fn render_tools_actions(&self, p: &Palette, entity: &Entity<GridPane>) -> gpui_kit::AnyElement {
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let writable = self.session.writable();
@@ -2100,7 +2290,19 @@ impl GridPane {
         if writable {
             actions = actions
                 .child(grid_icon("grid-insert", IconName::Plus, t("grid.action.insert"), entity.clone()))
+                .child(grid_icon("grid-clone-row", IconName::Copy, t("grid.write.clone"), entity.clone()))
+                .child(grid_icon("grid-selection-null", IconName::X, t("grid.write.setNull"), entity.clone()))
+                .child(grid_icon("grid-selection-set", IconName::Pencil, t("grid.write.setValue"), entity.clone()))
                 .child(grid_icon("mark-delete", IconName::Trash, t("grid.menu.markDelete"), entity.clone()));
+            let linked = self.session.has_reference();
+            let jump = div().id("grid-fk-jump-hint").debug_selector(|| "grid-fk-jump-hint".to_owned()).child(
+                grid_icon("grid-fk-jump", IconName::Link, t("grid.fk.jump"), entity.clone()).disabled(!linked),
+            );
+            actions = actions.child(if linked { jump } else { jump.tooltip_text(t("grid.fk.none")) });
+        }
+        let summary = self.session.staged_summary();
+        if summary.inserts + summary.updates + summary.deletes > 0 {
+            actions = actions.child(self.render_staged_tools(p, entity));
         }
         if writable || dirty {
             let preview = {
@@ -2118,6 +2320,29 @@ impl GridPane {
             });
         }
         actions.into_any_element()
+    }
+
+    /// 暂存计数和单格/单行撤销。有未提交变更时才出现。
+    #[inline(never)]
+    fn render_staged_tools(&self, p: &Palette, entity: &Entity<GridPane>) -> gpui_kit::AnyElement {
+        let locale = self.locale;
+        let summary = self.session.staged_summary();
+        let count = |key: &str, value: usize| SharedString::from(i18n::fill(&i18n::text(locale, key), &[("count", &value.to_string())]));
+        div()
+            .id("grid-staged-summary")
+            .debug_selector(|| "grid-staged-summary".to_owned())
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .child(kit::pill(count("grid.write.stagedInserts", summary.inserts), p.ok, p.ok_soft))
+            .child(kit::pill(count("grid.write.stagedUpdates", summary.updates), p.warn, p.warn_soft))
+            .child(kit::pill(count("grid.write.stagedDeletes", summary.deletes), p.danger, p.danger_soft))
+            .child(kit::tool_button("grid-jump-staged", Some(IconName::ChevronRight), SharedString::from(i18n::text(locale, "grid.write.jumpStaged")), pane_click(entity, "grid-jump-staged")))
+            .child(kit::tool_button("grid-undo-cell", None, SharedString::from(i18n::text(locale, "grid.write.undoCell")), pane_click(entity, "grid-undo-cell")))
+            .child(kit::tool_button("grid-undo-row", None, SharedString::from(i18n::text(locale, "grid.write.undoRow")), pane_click(entity, "grid-undo-row")))
+            .child(kit::tool_button("grid-discard", None, SharedString::from(i18n::text(locale, "grid.write.discardAll")), pane_click(entity, "grid-discard")))
+            .into_any_element()
     }
 
     /// 筛选条：每条条件可辨认、可换条件、可改值、可单删；非法原因和全清也在这里。
@@ -2260,13 +2485,46 @@ impl GridPane {
             let table = self.table.clone();
             let data_table = DataTable::new(&table).with_size(gpui_kit::component::Size::Size(px(m.row_h))).header_row_height(px(m.row_h)).stripe(true).accessibility_label("shared-grid");
             let content = if self.record_open {
-                // 纵向记录视图靠右，和网格共用同一个焦点行。
+                let width = self.side_width.clamp(RECORD_SIDE_MIN, RECORD_SIDE_MAX);
+                let dragging = self.record_dragging;
+                let reset = entity.clone();
+                // 纵向记录视图靠右，和网格共用同一个焦点行。左缘拖拽调宽，双击回到 340。
                 div()
                     .flex_1()
                     .min_h(px(0.))
                     .flex()
+                    .on_drag_move(cx.listener(|this, event: &DragMoveEvent<kit::ResizeDrag>, _, cx| {
+                        if event.drag(cx).key.as_ref() != "grid-record-resize" {
+                            return;
+                        }
+                        let width = f32::from(event.bounds.right() - event.event.position.x);
+                        this.side_width = width.clamp(RECORD_SIDE_MIN, RECORD_SIDE_MAX);
+                        this.record_dragging = true;
+                        cx.notify();
+                    }))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        if this.record_dragging {
+                            this.record_dragging = false;
+                            cx.notify();
+                        }
+                    }))
                     .child(div().flex_1().min_w(px(0.)).h_full().child(data_table))
-                    .child(record::render_record(record::record_view(&self.session), locale, p, m, cx.theme().mono_font_family.clone(), entity))
+                    .child(kit::resize_handle("grid-record-resize", t("grid.record.open"), dragging, p, move |_, _, cx| {
+                        reset.update(cx, |pane, cx| {
+                            pane.side_width = RECORD_SIDE_DEFAULT;
+                            cx.notify();
+                        });
+                    }))
+                    .child(record::render_record(
+                        record::record_view(&self.session),
+                        locale,
+                        p,
+                        m,
+                        cx.theme().mono_font_family.clone(),
+                        entity,
+                        width,
+                        self.format_viewer.clone(),
+                    ))
             } else {
                 div().flex_1().min_h(px(0.)).child(data_table)
             };
@@ -2399,13 +2657,14 @@ impl GridPane {
                 });
             }
         };
+        let embed = self.format_viewer.clone().filter(|_| !self.record_open);
         let mut panel = div()
             .id("grid-value")
             .debug_selector(|| format!("grid-value-{phase:?}").to_lowercase())
             .role(gpui_kit::Role::Dialog)
             .aria_label(t("grid.value.copyValue"))
             .flex_none()
-            .max_h(px(180.))
+            .max_h(px(if embed.is_some() { 460. } else { 180. }))
             .overflow_y_scroll()
             .px(px(14.))
             .py(px(10.))
@@ -2424,8 +2683,12 @@ impl GridPane {
                     .child(div().flex_1().truncate().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(title))
                     .child(kit::icon_button("grid-value-copy", IconName::Copy, t("grid.value.copyValue"), copy))
                     .child(kit::icon_button("grid-value-close", IconName::X, t("grid.value.close"), close)),
-            )
-            .child(div().font_family(cx.theme().mono_font_family.clone()).text_size(px(TypeScale::SM)).child(body));
+            );
+        if let Some(viewer) = embed {
+            panel = panel.child(div().h(px(280.)).min_h(px(180.)).child(viewer));
+        } else {
+            panel = panel.child(div().font_family(cx.theme().mono_font_family.clone()).text_size(px(TypeScale::SM)).child(body));
+        }
         if phase == CellPhase::Error {
             let retry = {
                 let entity = entity.clone();
@@ -2543,6 +2806,15 @@ impl GridPane {
     }
 }
 
+fn pane_click(entity: &Entity<GridPane>, id: &'static str) -> impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static {
+    let entity = entity.clone();
+    move |_, _, cx| {
+        entity.update(cx, |pane, cx| {
+            let _ = pane.command(id, cx);
+        });
+    }
+}
+
 fn grid_icon(id: &'static str, icon: IconName, label: SharedString, entity: Entity<GridPane>) -> gpui_kit::component::button::Button {
     kit::icon_button(id, icon, label, move |_, _, cx| {
         entity.update(cx, |pane, cx| {
@@ -2597,6 +2869,15 @@ struct SheetDelegate {
     hidden: Vec<(usize, String)>,
     /// 有没有选区：空选区时"复制为"禁用。
     has_selection: bool,
+    /// 与可见数据列对齐的表头：类型缩写、主键、外键。
+    headers: Vec<session::ColumnHeader>,
+    /// 逻辑列上的暂存标记：1 新增、2 修改、3 删除。
+    cell_marks: Vec<Vec<u8>>,
+    row_marks: Vec<u8>,
+    cell_dirty: bool,
+    row_dirty: bool,
+    /// 只读时写操作禁用的原因，悬停时显示。
+    write_reason: String,
 }
 
 impl SheetDelegate {
@@ -2683,6 +2964,13 @@ const CELL_MENU: &[(&str, &str, bool, bool)] = &[
     ("grid-clone-row", "grid.write.clone", true, false),
     ("grid-insert", "grid.action.insert", true, false),
     ("mark-delete", "grid.menu.markDelete", true, true),
+    ("grid-undo-cell", "grid.write.undoCell", false, false),
+    ("grid-undo-row", "grid.write.undoRow", false, false),
+    ("grid-discard", "grid.write.discardAll", false, false),
+    ("grid-jump-staged", "grid.write.jumpStaged", false, false),
+    ("grid-sql-select", "grid.sql.select", false, false),
+    ("grid-sql-update", "grid.sql.update", false, false),
+    ("grid-set-null", "grid.value.null", true, false),
 ];
 
 /// 表头右键菜单。
@@ -2765,97 +3053,249 @@ fn column_item_disabled(id: &str, state: &ColumnMenuState) -> bool {
     }
 }
 
-pub(crate) fn cell_menu(menu: PopupMenu, owner: Option<gpui_kit::WeakEntity<GridPane>>, locale: Locale, state: CellMenuState) -> PopupMenu {
-    let mut menu = menu;
-    for (id, key, needs_write, _danger) in CELL_MENU.iter().copied() {
-        if id.is_empty() {
-            menu = menu.separator();
-            continue;
-        }
-        let item_owner = owner.clone();
-        menu = menu.item(
-            PopupMenuItem::new(menu_label(locale, key, id)).disabled(cell_item_disabled(id, needs_write, state)).on_click(move |_, _, cx| {
-                if let Some(owner) = item_owner.as_ref().and_then(|owner| owner.upgrade()) {
-                    owner.update(cx, |pane, cx| {
-                        let _ = pane.command(id, cx);
-                        cx.notify();
-                    });
-                }
-            }),
-        );
-        // 外键入口只在这一列真的属于外键、并且这一行已定位时出现。
-        if id == "grid-value-open" && state.fk {
-            for (fk_id, fk_key) in [("grid-fk-jump", "grid.fk.jump"), ("grid-fk-select", "grid.fk.select")] {
-                let owner = owner.clone();
-                menu = menu.item(PopupMenuItem::new(menu_label(locale, fk_key, fk_id)).on_click(move |_, _, cx| {
-                    if let Some(owner) = owner.as_ref().and_then(|owner| owner.upgrade()) {
-                        owner.update(cx, |pane, cx| {
-                            let _ = pane.command(fk_id, cx);
-                            cx.notify();
-                        });
-                    }
-                }));
-            }
-        }
-        // 还有预览值时给"读取完整值"入口：导出和 WHERE 都用读到的同一个原值。
-        if id == "grid-value-open" && state.unresolved > 0 {
-            let owner = owner.clone();
-            menu = menu.item(PopupMenuItem::new(menu_label(locale, "grid.action.readFull", "grid-full-values")).on_click(
-                move |_, _, cx| {
-                    if let Some(owner) = owner.as_ref().and_then(|owner| owner.upgrade()) {
-                        owner.update(cx, |pane, cx| {
-                            let _ = pane.command("grid-full-values", cx);
-                            cx.notify();
-                        });
-                    }
-                },
-            ));
+fn grid_click(owner: Option<gpui_kit::WeakEntity<GridPane>>, id: &'static str) -> impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static {
+    move |_, _, cx| {
+        if let Some(owner) = owner.as_ref().and_then(|owner| owner.upgrade()) {
+            owner.update(cx, |pane, cx| {
+                let _ = pane.command(id, cx);
+                cx.notify();
+            });
         }
     }
-    if state.dirty {
-        let owner = owner.clone();
-        menu = menu.separator().item(PopupMenuItem::new(menu_label(locale, "grid.menu.undo", "grid-undo")).on_click(move |_, _, cx| {
-            if let Some(owner) = owner.as_ref().and_then(|owner| owner.upgrade()) {
-                owner.update(cx, |pane, cx| {
-                    let _ = pane.command("grid-undo", cx);
-                    cx.notify();
-                });
-            }
-        }));
-    }
-    menu
 }
 
-fn column_menu(menu: PopupMenu, owner: Option<gpui_kit::WeakEntity<GridPane>>, locale: Locale, column: usize, state: &ColumnMenuState) -> PopupMenu {
-    let mut menu = menu;
-    for (id, key) in COLUMN_MENU.iter().copied() {
-        if id.is_empty() {
-            menu = menu.separator();
-            continue;
+/// 禁用的写入项仍留在菜单里，悬停说明原因。
+fn grid_item(locale: Locale, key: &'static str, id: &'static str, disabled: bool, reason: Option<String>, owner: Option<gpui_kit::WeakEntity<GridPane>>) -> PopupMenuItem {
+    let label = menu_label(locale, key, id);
+    if disabled {
+        let reason = reason.unwrap_or_default();
+        PopupMenuItem::element(move |_, cx| {
+            let p = Palette::of(cx);
+            div()
+                .id(SharedString::from(format!("grid-menu-{id}")))
+                .test_support()
+                .w_full()
+                .px(px(8.))
+                .py(px(4.))
+                .text_size(px(TypeScale::SM))
+                .text_color(p.text_faint)
+                .child(label.clone())
+                .tooltip_text(SharedString::from(reason.clone()))
+        })
+        .disabled(true)
+    } else {
+        PopupMenuItem::new(label).on_click(grid_click(owner, id))
+    }
+}
+
+fn write_reason_for(needs_write: bool, state: CellMenuState, write_reason: &str, locale: Locale, id: &str) -> Option<String> {
+    if cell_item_disabled(id, needs_write, state) && needs_write && !state.writable {
+        let reason = if write_reason.is_empty() { i18n::text(locale, "grid.status.readonly") } else { write_reason.to_owned() };
+        Some(reason)
+    } else if CopyFormat::from_command(id).is_some() && !state.has_selection {
+        Some(i18n::text(locale, "grid.copyAs.empty"))
+    } else {
+        None
+    }
+}
+
+#[inline(never)]
+pub(crate) fn cell_menu(
+    menu: PopupMenu,
+    owner: Option<gpui_kit::WeakEntity<GridPane>>,
+    locale: Locale,
+    state: CellMenuState,
+    write_reason: String,
+    cell_dirty: bool,
+    row_dirty: bool,
+    window: &mut Window,
+    cx: &mut Context<TableState<SheetDelegate>>,
+) -> PopupMenu {
+    let reason_text = write_reason.clone();
+    let reason = move |needs_write: bool, id: &str| write_reason_for(needs_write, state, &reason_text, locale, id);
+    let item = |menu: PopupMenu, key: &'static str, id: &'static str, needs_write: bool| {
+        let disabled = cell_item_disabled(id, needs_write, state);
+        menu.item(grid_item(locale, key, id, disabled, reason(needs_write, id), owner.clone()))
+    };
+    let mut menu = item(menu, "grid.value.openFull", "grid-value-open", false);
+    menu = item(menu, "grid.menu.editCell", "edit-cell", true);
+    menu = item(menu, "grid.value.null", "grid-set-null", true);
+    menu = item(menu, "grid.menu.filterByValue", "grid-filter-value", false);
+    if state.fk {
+        menu = item(menu, "grid.fk.jump", "grid-fk-jump", false);
+        menu = item(menu, "grid.fk.select", "grid-fk-select", false);
+    }
+    if cell_dirty {
+        menu = item(menu, "grid.write.undoCell", "grid-undo-cell", false);
+    }
+    let row_menu = PopupMenu::build(window, cx.deref_mut(), {
+        let owner = owner.clone();
+        let write_reason = write_reason.clone();
+        move |menu, _, _| {
+            let mut menu = menu;
+            for (key, id, needs_write) in [
+                ("grid.action.insert", "grid-insert", true),
+                ("grid.write.clone", "grid-clone-row", true),
+                ("grid.write.setValue", "grid-selection-set", true),
+                ("grid.write.undoRow", "grid-undo-row", false),
+                ("grid.menu.markDelete", "mark-delete", true),
+            ] {
+                let disabled = cell_item_disabled(id, needs_write, state) || (id == "grid-undo-row" && !row_dirty);
+                let why = if id == "grid-undo-row" && !row_dirty {
+                    None
+                } else {
+                    write_reason_for(needs_write, state, &write_reason, locale, id)
+                };
+                menu = menu.item(grid_item(locale, key, id, disabled, why, owner.clone()));
+            }
+            if state.dirty {
+                menu = menu.separator().item(grid_item(locale, "grid.menu.undo", "grid-undo", false, None, owner.clone()));
+            }
+            menu
         }
+    });
+    menu = menu.item(PopupMenuItem::submenu(SharedString::from(i18n::text(locale, "grid.menu.rowOps")), row_menu));
+    let copy_menu = PopupMenu::build(window, cx.deref_mut(), {
+        let owner = owner.clone();
+        let write_reason = write_reason.clone();
+        move |menu, _, _| {
+            let mut menu = menu;
+            for (key, id, needs_write) in [
+                ("grid.copyAs.value", "copy-region", false),
+                ("grid.copyAs.tsv", "grid-copy-as-tsv", false),
+                ("grid.copyAs.csv", "grid-copy-as-csv", false),
+                ("grid.copyAs.json", "grid-copy-as-json", false),
+                ("grid.copyAs.markdown", "grid-copy-as-markdown", false),
+                ("grid.copyAs.sqlLiteral", "copy-sql-value", false),
+                ("grid.copyAs.insert", "grid-copy-as-insert", false),
+            ] {
+                let disabled = cell_item_disabled(id, needs_write, state);
+                menu = menu.item(grid_item(locale, key, id, disabled, write_reason_for(needs_write, state, &write_reason, locale, id), owner.clone()));
+            }
+            menu
+        }
+    });
+    menu = menu.item(PopupMenuItem::submenu(SharedString::from(i18n::text(locale, "grid.menu.copyAs")), copy_menu));
+    let sql_menu = PopupMenu::build(window, cx.deref_mut(), {
+        let owner = owner.clone();
+        move |menu, _, _| {
+            let mut menu = menu;
+            for (key, id) in [
+                ("grid.sql.whereCell", "grid-copy-where"),
+                ("grid.sql.whereRow", "grid-copy-row-where"),
+                ("grid.sql.whereColumn", "grid-copy-column-where"),
+                ("grid.sql.select", "grid-sql-select"),
+                ("grid.sql.update", "grid-sql-update"),
+            ] {
+                menu = menu.item(grid_item(locale, key, id, false, None, owner.clone()));
+            }
+            menu
+        }
+    });
+    menu = menu.item(PopupMenuItem::submenu(SharedString::from(i18n::text(locale, "grid.menu.generateSql")), sql_menu));
+    let tools = PopupMenu::build(window, cx.deref_mut(), {
+        let owner = owner.clone();
+        move |menu, _, _| {
+            let mut menu = menu.item(grid_item(locale, "grid.record.open", "grid-record-toggle", false, None, owner.clone()));
+            if state.unresolved > 0 {
+                menu = menu.item(grid_item(locale, "grid.action.readFull", "grid-full-values", false, None, owner.clone()));
+            }
+            menu
+        }
+    });
+    menu.item(PopupMenuItem::submenu(SharedString::from(i18n::text(locale, "grid.menu.moreTools")), tools))
+}
+
+#[inline(never)]
+fn column_menu(
+    menu: PopupMenu,
+    owner: Option<gpui_kit::WeakEntity<GridPane>>,
+    locale: Locale,
+    column: usize,
+    state: ColumnMenuState,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let mut menu = menu;
+    for (id, key) in [
+        ("column-sort-asc", "grid.menu.sortAsc"),
+        ("column-sort-desc", "grid.menu.sortDesc"),
+        ("column-clear-sort", "grid.menu.clearSort"),
+        ("column-filter", "grid.menu.filterColumn"),
+        ("column-fit", "grid.column.fit"),
+    ] {
         let item_owner = owner.clone();
-        // 当前排序方向在菜单里也标出来：菜单和表头不能给出两种说法。
         let current = matches!((id, state.sorted), ("column-sort-asc", Some(false)) | ("column-sort-desc", Some(true)));
         let label = if current { SharedString::from(format!("✓ {}", i18n::text(locale, key))) } else { menu_label(locale, key, id) };
-        menu = menu.item(PopupMenuItem::new(label).disabled(column_item_disabled(id, state)).on_click(move |_, _, cx| {
+        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
             if let Some(owner) = item_owner.as_ref().and_then(|owner| owner.upgrade()) {
                 owner.update(cx, |pane, cx| pane.column_command(column, id, cx));
             }
         }));
-        // 被隐藏的列逐个列出，可以只恢复其中一列。
-        if id == "column-show-all" {
-            for (hidden, name) in state.hidden.iter().cloned() {
-                let owner = owner.clone();
-                let label = i18n::fill(&i18n::text(locale, "grid.column.show"), &[("name", &name)]);
-                menu = menu.item(PopupMenuItem::new(SharedString::from(label)).on_click(move |_, _, cx| {
-                    if let Some(owner) = owner.as_ref().and_then(|owner| owner.upgrade()) {
-                        owner.update(cx, |pane, cx| pane.column_command(hidden, "column-show", cx));
-                    }
-                }));
-            }
-        }
     }
-    menu
+    let hidden = state.hidden.clone();
+    let can_hide = state.can_hide;
+    let frozen = state.frozen;
+    menu.submenu(SharedString::from(i18n::text(locale, "grid.column.menu")), window, cx, move |menu, _, _| {
+        let mut menu = menu;
+        let owner_freeze = owner.clone();
+        menu = menu.item(PopupMenuItem::new(menu_label(locale, "grid.column.freeze", "column-freeze")).on_click(move |_, _, cx| {
+            if let Some(owner) = owner_freeze.as_ref().and_then(|owner| owner.upgrade()) {
+                owner.update(cx, |pane, cx| pane.column_command(column, "column-freeze", cx));
+            }
+        }));
+        let owner_unfreeze = owner.clone();
+        menu = menu.item(column_disabled_item(locale, "grid.column.unfreeze", "column-unfreeze", !frozen, None, owner_unfreeze, column));
+        let owner_hide = owner.clone();
+        let hide_reason = (!can_hide).then(|| i18n::text(locale, "grid.column.lastVisible"));
+        menu = menu.item(column_disabled_item(locale, "grid.column.hide", "column-hide", !can_hide, hide_reason, owner_hide, column));
+        for (hidden_index, name) in hidden.iter().cloned() {
+            let owner_show = owner.clone();
+            let label = SharedString::from(i18n::fill(&i18n::text(locale, "grid.column.show"), &[("name", &name)]));
+            menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                if let Some(owner) = owner_show.as_ref().and_then(|owner| owner.upgrade()) {
+                    owner.update(cx, |pane, cx| pane.column_command(hidden_index, "column-show", cx));
+                }
+            }));
+        }
+        let owner_all = owner.clone();
+        menu.item(column_disabled_item(locale, "grid.column.showAll", "column-show-all", hidden.is_empty(), None, owner_all, column))
+    })
+}
+
+fn column_disabled_item(
+    locale: Locale,
+    key: &'static str,
+    id: &'static str,
+    disabled: bool,
+    reason: Option<String>,
+    owner: Option<gpui_kit::WeakEntity<GridPane>>,
+    column: usize,
+) -> PopupMenuItem {
+    let label = menu_label(locale, key, id);
+    if disabled {
+        let reason = reason.unwrap_or_default();
+        PopupMenuItem::element(move |_, cx| {
+            let p = Palette::of(cx);
+            div()
+                .id(SharedString::from(format!("grid-col-menu-{id}")))
+                .test_support()
+                .w_full()
+                .px(px(8.))
+                .py(px(4.))
+                .text_size(px(TypeScale::SM))
+                .text_color(p.text_faint)
+                .child(label.clone())
+                .tooltip_text(SharedString::from(reason.clone()))
+        })
+        .disabled(true)
+    } else {
+        PopupMenuItem::new(label).on_click(move |_, _, cx| {
+            if let Some(owner) = owner.as_ref().and_then(|owner| owner.upgrade()) {
+                owner.update(cx, |pane, cx| pane.column_command(column, id, cx));
+            }
+        })
+    }
 }
 
 
@@ -2896,6 +3336,16 @@ impl TableDelegate for SheetDelegate {
         // 选中的每一格自己画底色，不是只让焦点那格亮：矩形里没有画的格子会让高亮和
         // 复制/统计说的范围对不上。行号列（col 0）只在整行被选中时亮，单格选择不点亮它。
         let selected = cell_selected(self.selected, row_ix, logical, self.logical_count);
+        let mark = match logical {
+            Some(column) => self.cell_marks.get(row_ix).and_then(|line| line.get(column)).copied().unwrap_or(0),
+            None => self.row_marks.get(row_ix).copied().unwrap_or(0),
+        };
+        let (tone_bg, tone_line) = match mark {
+            1 => (Some(p.ok_soft), Some(p.ok)),
+            2 => (Some(p.warn_soft), Some(p.warn)),
+            3 => (Some(p.danger_soft), Some(p.danger)),
+            _ => (None, None),
+        };
         div()
             .id(gpui_kit::ElementId::named_usize(format!("grid-cell-{row_ix}"), col_ix))
             // 测试按住真实坐标点击/拖拽时用它找到格子；只在测试/debug+test-support 记录。
@@ -2903,7 +3353,10 @@ impl TableDelegate for SheetDelegate {
             .size_full()
             .truncate()
             .when(null, |this| this.text_color(p.text_faint).italic())
-            // 高亮色与表格自己的激活色同源（透明的 selection），文字仍然可读。
+            .when(mark == 3, |this| this.line_through())
+            .when_some(tone_line, |this, color| this.border_l_1().border_color(color))
+            // 选中时保留选择色；未选中的暂存格用新增/修改/删除底色。
+            .when(!selected, |this| this.when_some(tone_bg, |this, color| this.bg(color)))
             .when(selected, |this| this.bg(p.selection))
             .child(SharedString::from(text))
             .when_some(owner, move |this, owner| {
@@ -2943,7 +3396,8 @@ impl TableDelegate for SheetDelegate {
             .test_support()
     }
 
-    fn render_th(&mut self, col_ix: usize, _: &mut Window, _: &mut Context<TableState<Self>>) -> impl IntoElement {
+    fn render_th(&mut self, col_ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
+        let p = Palette::of(cx);
         let name = self.columns.get(col_ix).map(|column| column.0.clone()).unwrap_or_default();
         // 表头也留稳定选择器：测试点击真实表头坐标，区分 # 列头和第一列数据。
         let header = div()
@@ -2960,11 +3414,42 @@ impl TableDelegate for SheetDelegate {
         };
         // 表头自己带方向标记：焦点移到工具栏或别的格子后，仍然看得出按哪一列、哪个方向排的。
         let sorted = self.sort.filter(|(index, _)| *index == logical).map(|(_, descending)| descending);
-        let header = match sorted {
-            Some(descending) => header
-                .child(div().flex_none().px(px(4.)).text_size(px(TypeScale::XS)).child(SharedString::from(if descending { "↓" } else { "↑" }))),
-            None => header,
-        };
+        let meta = self.headers.get(logical);
+        let primary = meta.is_some_and(|item| item.primary);
+        let foreign = meta.is_some_and(|item| item.foreign);
+        let abbr = meta.map(|item| item.abbr.clone()).unwrap_or_default();
+        let frozen = self.columns.get(col_ix).is_some_and(|(_, _, fixed)| *fixed);
+        let mut header = header;
+        if primary {
+            header = header.child(div().id(("grid-th-pk", col_ix)).debug_selector(move || format!("grid-th-pk-{col_ix}")).flex_none().child(kit::icon(IconName::Key, 12., p.accent)));
+        }
+        if foreign {
+            header = header.child(div().id(("grid-th-fk", col_ix)).debug_selector(move || format!("grid-th-fk-{col_ix}")).flex_none().child(kit::icon(IconName::Link, 12., p.accent)));
+        }
+        if !abbr.is_empty() {
+            header = header.child(
+                div()
+                    .id(("grid-th-type", col_ix))
+                    .debug_selector(move || format!("grid-th-type-{col_ix}"))
+                    .flex_none()
+                    .px(px(4.))
+                    .text_size(px(TypeScale::XS))
+                    .text_color(p.text_faint)
+                    .child(SharedString::from(abbr)),
+            );
+        }
+        if let Some(descending) = sorted {
+            header = header.child(div().flex_none().px(px(4.)).text_size(px(TypeScale::XS)).child(SharedString::from(if descending { "↓" } else { "↑" })));
+        }
+        if frozen {
+            header = header.child(
+                div()
+                    .id(("grid-th-frozen", col_ix))
+                    .debug_selector(move || format!("grid-th-frozen-{col_ix}"))
+                    .flex_none()
+                    .child(kit::icon(IconName::Bookmark, 12., p.text_faint)),
+            );
+        }
         let owner = self.owner.clone();
         let locale = self.locale;
         let state = ColumnMenuState {
@@ -2974,13 +3459,13 @@ impl TableDelegate for SheetDelegate {
             hidden: self.hidden.clone(),
         };
         header
-            .context_menu(move |menu, _, _| column_menu(menu, owner.clone(), locale, logical, &state))
+            .context_menu(move |menu, window, cx| column_menu(menu, owner.clone(), locale, logical, state.clone(), window, cx))
             .into_any_element()
     }
 
-    fn context_menu(&mut self, _row_ix: usize, menu: PopupMenu, _: &mut Window, _: &mut Context<TableState<Self>>) -> PopupMenu {
+    fn context_menu(&mut self, _row_ix: usize, menu: PopupMenu, window: &mut Window, cx: &mut Context<TableState<Self>>) -> PopupMenu {
         let state = CellMenuState { writable: self.writable, dirty: self.dirty, fk: self.fk, unresolved: self.unresolved, has_selection: self.has_selection };
-        cell_menu(menu, self.owner.clone(), self.locale, state)
+        cell_menu(menu, self.owner.clone(), self.locale, state, self.write_reason.clone(), self.cell_dirty, self.row_dirty, window, cx)
     }
 
     fn cell_label(&self, row_ix: usize, col_ix: usize, _: &App) -> Option<SharedString> {
@@ -3238,6 +3723,11 @@ mod shortcut_tests {
             }
             for locale in [Locale::ZhCn, Locale::En] {
                 assert_ne!(i18n::text(locale, key), *key, "{key}");
+            }
+        }
+        for key in ["grid.menu.rowOps", "grid.menu.copyAs", "grid.menu.generateSql", "grid.menu.moreTools", "grid.column.menu", "grid.copyAs.value", "grid.copyAs.sqlLiteral"] {
+            for locale in [Locale::ZhCn, Locale::En] {
+                assert_ne!(i18n::text(locale, key), key, "{key}");
             }
         }
     }

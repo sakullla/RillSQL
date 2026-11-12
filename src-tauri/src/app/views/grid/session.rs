@@ -3316,6 +3316,270 @@ impl SharedGrid {
     pub fn staged_count(&self) -> usize {
         self.overlays.iter().filter(|item| item.gate == Gate::Writable && item.change_id.is_some()).count()
     }
+
+    /// 新增行、修改格、删除行分开计数。只算能进预览的暂存。
+    pub fn staged_summary(&self) -> StagedSummary {
+        let mut inserts = BTreeSet::new();
+        let mut updates = BTreeSet::new();
+        let mut deletes = BTreeSet::new();
+        for item in &self.overlays {
+            if item.gate != Gate::Writable || item.change_id.is_none() {
+                continue;
+            }
+            match item.kind {
+                "insert" => {
+                    inserts.insert(item.row_id.clone());
+                }
+                "delete" => {
+                    deletes.insert(item.row_id.clone());
+                }
+                "update" if !item.column_name.is_empty() => {
+                    updates.insert((item.row_id.clone(), item.column_name.clone()));
+                }
+                _ => {}
+            }
+        }
+        StagedSummary { inserts: inserts.len(), updates: updates.len(), deletes: deletes.len() }
+    }
+
+    /// 这一格相对已读取原值的暂存状态。删除盖过修改，新增行整行都算新增。
+    pub fn cell_dirty_state(&self, row: usize, column: usize) -> CellDirty {
+        let Some(item) = self.rows.get(row) else {
+            return CellDirty::Clean;
+        };
+        if self.overlays.iter().any(|overlay| overlay.kind == "delete" && overlay.row_id == item.id && overlay.gate == Gate::Writable) {
+            return CellDirty::Deleted;
+        }
+        if item.inserted {
+            return CellDirty::Inserted;
+        }
+        if self.overlay_at(row, column).is_some_and(|overlay| overlay.kind == "update" && overlay.gate == Gate::Writable) {
+            return CellDirty::Updated;
+        }
+        CellDirty::Clean
+    }
+
+    /// 去掉这一格的暂存修改。新增行和删除标记不动。
+    pub fn revert_cell(&mut self, row_id: &str, column: usize) -> bool {
+        let Some(name) = self.columns.get(column).map(|item| item.name.clone()) else {
+            return false;
+        };
+        let before = self.overlays.len();
+        self.overlays.retain(|item| !(item.kind == "update" && item.row_id == row_id && item.column_name == name));
+        if self.overlays.len() == before {
+            return false;
+        }
+        self.close_preview();
+        true
+    }
+
+    /// 去掉这一行上的全部暂存。新增行连同行一起丢掉。
+    pub fn revert_row(&mut self, row_id: &str) -> bool {
+        let inserted = self.any_row(row_id).is_some_and(|row| row.inserted) || self.overlays.iter().any(|item| item.kind == "insert" && item.row_id == row_id);
+        let before = self.overlays.len();
+        if inserted {
+            self.source.retain(|item| item.id != row_id);
+            self.overlays.retain(|item| item.row_id != row_id);
+            self.cloned.retain(|item| item != row_id);
+            self.recompute();
+        } else {
+            self.overlays.retain(|item| item.row_id != row_id);
+            if self.overlays.len() == before {
+                return false;
+            }
+        }
+        self.close_preview();
+        true
+    }
+
+    /// 丢掉全部暂存，包括还没写库的新增行。
+    pub fn discard_all_staged(&mut self) {
+        let inserted: Vec<String> = self
+            .overlays
+            .iter()
+            .filter(|item| item.kind == "insert")
+            .map(|item| item.row_id.clone())
+            .chain(self.source.iter().filter(|row| row.inserted).map(|row| row.id.clone()))
+            .collect();
+        self.overlays.clear();
+        self.batches.clear();
+        if !inserted.is_empty() {
+            self.source.retain(|item| !inserted.iter().any(|id| id == &item.id));
+            self.cloned.retain(|item| !inserted.iter().any(|id| id == item));
+            self.recompute();
+        }
+        self.close_preview();
+    }
+
+    /// 焦点之后的下一处暂存格；到末尾则回到第一处。
+    pub fn next_staged_cell(&self) -> Option<(usize, usize)> {
+        let mut cells = Vec::new();
+        for item in &self.overlays {
+            if item.gate != Gate::Writable || item.change_id.is_none() {
+                continue;
+            }
+            let Some(row) = self.rows.iter().position(|row| row.id == item.row_id) else {
+                continue;
+            };
+            let column = if item.kind == "update" {
+                self.columns.iter().position(|column| column.name == item.column_name).unwrap_or(item.column)
+            } else {
+                self.visible_columns().first().copied().unwrap_or(0)
+            };
+            cells.push((row, column));
+        }
+        cells.sort_unstable();
+        cells.dedup();
+        let focus = self.focus_cell();
+        if let Some(focus) = focus {
+            if let Some(next) = cells.iter().copied().find(|cell| *cell > focus) {
+                return Some(next);
+            }
+        }
+        cells.first().copied()
+    }
+
+    /// 按焦点行生成 `SELECT * ... WHERE`。条件不完整或还是预览时为空，不把信封写进语句。
+    pub fn select_statement(&self) -> String {
+        let where_sql = self.where_text(CopyScope::Row);
+        if where_sql.is_empty() || where_sql.contains('\u{1}') {
+            return String::new();
+        }
+        format!("SELECT * FROM {} {where_sql}", self.statement_table())
+    }
+
+    /// 按焦点行生成 `UPDATE ... SET ... WHERE`。有暂存修改时 SET 用暂存值，否则用焦点格当前值。
+    pub fn update_statement(&self) -> String {
+        let Some((row, column)) = self.focus_cell() else {
+            return String::new();
+        };
+        let where_sql = self.where_text(CopyScope::Row);
+        if where_sql.is_empty() || where_sql.contains('\u{1}') {
+            return String::new();
+        }
+        let row_id = self.rows.get(row).map(|item| item.id.clone()).unwrap_or_default();
+        let engine = Engine::parse(&self.target.engine).unwrap_or(Engine::Sqlite);
+        let mut sets = Vec::new();
+        for item in &self.overlays {
+            if item.kind != "update" || item.row_id != row_id || item.gate != Gate::Writable || item.column_name.is_empty() {
+                continue;
+            }
+            if item.value.as_deref().is_some_and(|text| text.contains('\u{1}')) {
+                return String::new();
+            }
+            let index = self.columns.iter().position(|column| column.name == item.column_name);
+            let literal = self.literal(index.and_then(|index| self.columns.get(index)), item.value.clone());
+            sets.push(format!("{} = {literal}", quote_ident(engine, &item.column_name)));
+        }
+        if sets.is_empty() {
+            if self.needs_full(row, column) {
+                return String::new();
+            }
+            let value = self.value_at(row, column).unwrap_or(None);
+            if value.as_deref().is_some_and(|text| text.contains('\u{1}')) {
+                return String::new();
+            }
+            let name = self.columns.get(column).map(|item| item.name.clone()).unwrap_or_default();
+            let literal = self.literal(self.columns.get(column), value);
+            sets.push(format!("{} = {literal}", quote_ident(engine, &name)));
+        }
+        format!("UPDATE {} SET {} {where_sql}", self.statement_table(), sets.join(", "))
+    }
+
+    fn statement_table(&self) -> String {
+        if let Some(schema) = &self.schema {
+            return qualified_name(schema);
+        }
+        let engine = Engine::parse(&self.target.engine).unwrap_or(Engine::Sqlite);
+        if self.target.table.is_empty() {
+            quote_ident(engine, PLACEHOLDER_TABLE)
+        } else if self.target.schema.is_empty() {
+            quote_ident(engine, &self.target.table)
+        } else {
+            format!("{}.{}", quote_ident(engine, &self.target.schema), quote_ident(engine, &self.target.table))
+        }
+    }
+
+    /// 这一格还能不能按主键把预览读成原值。
+    pub fn can_reread(&self, row: usize) -> bool {
+        self.rows.get(row).is_some_and(|item| !item.inserted && item.located && !item.locator.is_empty())
+    }
+
+    /// 预览信封声明的原字节数。不是信封时为空。
+    pub fn preview_total(&self, row: usize, column: usize) -> Option<u64> {
+        let text = self.value_at(row, column).flatten()?;
+        let type_name = self.column_type(column).unwrap_or("");
+        match crate::grid::preview_envelope(&text, type_name, self.sheet_preview_bytes)? {
+            crate::grid::PreviewValue::Binary { bytes } | crate::grid::PreviewValue::Text { bytes, .. } => Some(bytes),
+        }
+    }
+}
+
+/// 新增、修改、删除分开的暂存计数。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StagedSummary {
+    pub inserts: usize,
+    pub updates: usize,
+    pub deletes: usize,
+}
+
+/// 格子相对已读取原值的暂存标记。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellDirty {
+    Clean,
+    Inserted,
+    Updated,
+    Deleted,
+}
+
+/// 表头要画的类型缩写、主键和外键。缩写是固定短码，不进词典。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnHeader {
+    pub abbr: String,
+    pub primary: bool,
+    pub foreign: bool,
+}
+
+impl SharedGrid {
+    pub fn column_header(&self, column: usize) -> Option<ColumnHeader> {
+        let item = self.columns.get(column)?;
+        Some(ColumnHeader {
+            abbr: type_abbr(&item.type_name),
+            primary: item.primary,
+            foreign: self.foreign_key_for(&item.name).is_some(),
+        })
+    }
+}
+
+/// 字段类型缩成表头和记录徽标用的短码。
+pub fn type_abbr(type_name: &str) -> String {
+    let lower = type_name.trim().to_ascii_lowercase();
+    let base = lower.split(['(', ' ']).next().unwrap_or("");
+    match base {
+        "int" | "integer" | "int2" | "int4" | "int8" | "bigint" | "smallint" | "tinyint" | "serial" | "bigserial" | "mediumint" | "smallserial" | "year" => "INT",
+        "json" | "jsonb" => "JSON",
+        "xml" => "XML",
+        "bool" | "boolean" | "bit" => "BOOL",
+        "blob" | "bytea" | "binary" | "varbinary" | "image" | "raw" | "byte" => "BLOB",
+        "timestamp" | "timestamptz" | "datetime" | "datetime2" | "datetimeoffset" | "smalldatetime" => "TS",
+        "date" => "DATE",
+        "time" | "timetz" => "TIME",
+        "text" | "varchar" | "nvarchar" | "char" | "nchar" | "clob" | "string" | "citext" | "tinytext" | "mediumtext" | "longtext" | "varchar2" | "nvarchar2" | "ntext" | "bpchar" | "name" | "uuid" | "uniqueidentifier" => {
+            if base == "uuid" || base == "uniqueidentifier" {
+                "UUID"
+            } else {
+                "TEXT"
+            }
+        }
+        "float" | "float4" | "float8" | "double" | "real" => "FLOAT",
+        "numeric" | "decimal" | "money" | "smallmoney" | "number" => "NUM",
+        "" => "",
+        other => {
+            let short: String = other.chars().filter(|ch| ch.is_ascii_alphanumeric()).take(4).collect();
+            return short.to_ascii_uppercase();
+        }
+    }
+    .to_owned()
 }
 
 /// 把 TSV 文本拆成行列。引号包住的字段可以含制表符和换行，两个引号是一个引号；
@@ -4088,7 +4352,7 @@ mod tests {
         assert_eq!(grid.cell_label(0, 0), "12");
         assert_eq!(grid.focused_row_id(), Some("11"));
         let (display_row, column) = grid.focus_cell().expect("focus");
-        assert_eq!(grid.row_id(display_row), Some("11"));
+        assert_eq!(SharedGrid::row_id(&grid, display_row), Some("11"));
         assert_eq!(grid.cell_label(display_row, column), "乙");
 
         // 编辑目标由显示行号解析成行 id：降序显示第 0 行是 id 12，不是旧的焦点行。
@@ -5827,5 +6091,93 @@ mod batch_tests {
         assert!(!grid.uncommitted());
         assert_eq!(item_rows(&database).await, vec![(1, "甲".to_owned(), Some(3)), (2, "乙".to_owned(), None), (3, "甲".to_owned(), Some(3))]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staged_counts_revert_one_cell_or_row_and_sql_stays_off_previews() {
+        let mut grid = people("sqlite", 2);
+        assert_eq!(grid.stage_text(0, 1, Some("改".into())), Gate::Writable);
+        assert_eq!(grid.stage_insert(), Gate::Writable);
+        assert_eq!(grid.stage_delete(1), Gate::Writable);
+        let summary = grid.staged_summary();
+        assert_eq!((summary.inserts, summary.updates, summary.deletes), (1, 1, 1));
+        assert_eq!(grid.cell_dirty_state(0, 1), CellDirty::Updated);
+        assert_eq!(grid.cell_dirty_state(1, 0), CellDirty::Deleted);
+        let inserted = grid.rows.iter().position(|row| row.inserted).expect("新增行");
+        assert_eq!(grid.cell_dirty_state(inserted, 1), CellDirty::Inserted);
+        let id = SharedGrid::row_id(&grid, 0).unwrap().to_owned();
+        assert!(grid.revert_cell(&id, 1));
+        assert_eq!(grid.cell_label(0, 1), "名1");
+        assert_eq!(grid.staged_summary().updates, 0);
+        assert!(!grid.revert_cell(&id, 1));
+        let next = grid.next_staged_cell().expect("还有暂存");
+        grid.select(next.0, next.1, false);
+        let row_id = SharedGrid::row_id(&grid, next.0).unwrap().to_owned();
+        assert!(grid.revert_row(&row_id));
+        grid.discard_all_staged();
+        assert_eq!(grid.staged_count(), 0);
+        assert!(grid.next_staged_cell().is_none());
+
+        let mut grid = people("sqlite", 1);
+        grid.select(0, 1, false);
+        let select_sql = grid.select_statement();
+        assert!(select_sql.starts_with("SELECT * FROM \"people\" WHERE "), "{select_sql}");
+        assert!(select_sql.contains("\"id\" = 1"), "{select_sql}");
+        let update_sql = grid.update_statement();
+        assert!(update_sql.starts_with("UPDATE \"people\" SET \"name\" = "), "{update_sql}");
+        assert!(update_sql.contains("WHERE "), "{update_sql}");
+        assert!(!select_sql.contains('\u{1}') && !update_sql.contains('\u{1}'));
+        assert_eq!(grid.stage_text(0, 1, Some("改".into())), Gate::Writable);
+        let staged = grid.update_statement();
+        assert!(staged.contains("\"name\" = '改'"), "{staged}");
+
+        let envelope = format!("\u{1}t:5000:{}", "z".repeat(8));
+        let mut wide = SharedGrid::new();
+        wide.load_local(
+            vec![column("id", "integer", true, false), column("body", "text", false, false)],
+            vec![GridRow {
+                id: "1".into(),
+                values: vec![Some("1".into()), Some(envelope.clone())],
+                located: true,
+                locator: vec![("id".into(), Some("1".into()))],
+                inserted: false,
+            }],
+            Some(1),
+            Some(schema_from_parts("sqlite", "", "notes", "table", vec![column_of("id", "integer", true), column_of("body", "text", false)], vec!["id".to_owned()]).unwrap()),
+        );
+        wide.select(0, 1, false);
+        assert!(wide.needs_full(0, 1));
+        assert!(wide.select_statement().is_empty(), "预览不能写进 SELECT");
+        assert!(wide.update_statement().is_empty(), "预览不能写进 UPDATE");
+
+        let mut json_grid = SharedGrid::new();
+        json_grid.load_local(
+            vec![column("id", "integer", true, false), column("payload", "jsonb", false, false)],
+            vec![GridRow {
+                id: "1".into(),
+                values: vec![Some("1".into()), Some("{\"ok\":true}".into())],
+                located: true,
+                locator: vec![("id".into(), Some("1".into()))],
+                inserted: false,
+            }],
+            Some(1),
+            Some(schema_from_parts("sqlite", "", "docs", "table", vec![column_of("id", "integer", true), column_of("payload", "jsonb", false)], vec!["id".to_owned()]).unwrap()),
+        );
+        assert_eq!(json_grid.stage_text(0, 1, Some("{".into())), Gate::Validation);
+        assert_eq!(json_grid.overlay_message(0, 1), "JSON 不合法，不能写回");
+        assert!(json_grid.open_preview().is_err(), "非法 JSON 不进预览");
+        assert_eq!(type_abbr("jsonb"), "JSON");
+        assert_eq!(type_abbr("timestamp"), "TS");
+        assert_eq!(type_abbr("bytea"), "BLOB");
+        json_grid.set_foreign_keys(vec![ForeignKeyInfo {
+            name: "fk".into(),
+            columns: vec!["payload".into()],
+            ref_schema: String::new(),
+            ref_table: "other".into(),
+            ref_columns: vec!["id".into()],
+        }]);
+        let header = json_grid.column_header(1).unwrap();
+        assert!(header.foreign && header.abbr == "JSON");
+        assert!(json_grid.column_header(0).unwrap().primary);
     }
 }

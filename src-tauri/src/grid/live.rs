@@ -1815,6 +1815,53 @@ pub struct ForeignKey {
     pub ref_columns: Vec<String>,
 }
 
+/// SQL Server 出向外键查询。只读 sys 目录，标识符按 N'...' 转义。
+pub(crate) fn sqlserver_foreign_key_sql(schema: &str, table: &str) -> String {
+    let mut sql = String::from(
+        "SELECT fk.name, pc.name, rs.name, rt.name, rc.name \
+         FROM sys.foreign_key_columns fkc \
+         JOIN sys.foreign_keys fk ON fk.object_id = fkc.constraint_object_id \
+         JOIN sys.tables pt ON pt.object_id = fkc.parent_object_id \
+         JOIN sys.schemas ps ON ps.schema_id = pt.schema_id \
+         JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id \
+         JOIN sys.tables rt ON rt.object_id = fkc.referenced_object_id \
+         JOIN sys.schemas rs ON rs.schema_id = rt.schema_id \
+         JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id \
+         WHERE pt.name = ",
+    );
+    sql.push_str(&format!("N'{}'", escape_tds_text(table)));
+    if !schema.is_empty() {
+        sql.push_str(" AND ps.name = ");
+        sql.push_str(&format!("N'{}'", escape_tds_text(schema)));
+    }
+    sql.push_str(" ORDER BY fk.name, fkc.constraint_column_id");
+    sql
+}
+
+/// 把目录行收成表级外键。空名、空列和缺引用目标的行跳过；同名约束按行序合并成复合键。
+pub(crate) fn assemble_foreign_keys(rows: &[Vec<Cell>]) -> Vec<ForeignKey> {
+    let mut list = Vec::new();
+    for row in rows {
+        let cell = |index: usize| match row.get(index) {
+            Some(Cell::Text(text)) => text.clone(),
+            _ => String::new(),
+        };
+        let name = cell(0);
+        let column = cell(1);
+        if name.is_empty() || column.is_empty() {
+            continue;
+        }
+        let ref_schema = cell(2);
+        let ref_table = cell(3);
+        let ref_column = cell(4);
+        if ref_table.is_empty() || ref_column.is_empty() {
+            continue;
+        }
+        push_key(&mut list, &name, &column, &ref_schema, &ref_table, &ref_column);
+    }
+    list
+}
+
 fn push_key(list: &mut Vec<ForeignKey>, name: &str, column: &str, ref_schema: &str, ref_table: &str, ref_column: &str) {
     if let Some(existing) = list.iter_mut().find(|item| item.name == name) {
         existing.columns.push(column.to_owned());
@@ -1946,6 +1993,15 @@ pub async fn foreign_keys(session: &CatalogSession, database: &str, schema_name:
             }
             Ok(list)
         }
-        CatalogSession::Sqlserver(_) => Ok(Vec::new()),
+        CatalogSession::Sqlserver(client) => {
+            if database.is_empty() || table.is_empty() {
+                return Ok(Vec::new());
+            }
+            ensure_sqlserver_database(client, database).await?;
+            // 与查询补全同一条 sys 目录语句，避免网格和外键提示各写一套。
+            let sql = sqlserver_foreign_key_sql(schema_name, table);
+            let (_names, rows) = sqlserver_rows(client, &sql).await?;
+            Ok(assemble_foreign_keys(&rows))
+        }
     }
 }

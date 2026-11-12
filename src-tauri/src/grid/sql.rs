@@ -88,8 +88,13 @@ pub fn reject_literal_with(column: &Column, value: &Cell, resolved: bool, previe
         _ => match value {
             Cell::Null => None,
             Cell::Text(text) if !resolved && blocks_preview(family, text, preview_bytes) => Some("预览内容不能写回".to_owned()),
+            // 二进制信封 `\u{1}b:` 不能写进文本或 JSON 列；文本信封仍按那次读取的上限判断。
+            Cell::Text(text) if !resolved && is_binary_preview(text) => Some("预览内容不能写回".to_owned()),
             Cell::Text(text) if family == ValueFamily::Binary && parse_hex(text).is_none() => Some("这不是十六进制".to_owned()),
             Cell::Text(text) if family == ValueFamily::Bool && bool_literal(text).is_none() => Some("不能写成布尔字面量".to_owned()),
+            Cell::Text(text) if is_json_type(&column.type_name) && serde_json::from_str::<serde_json::Value>(text).is_err() => {
+                Some("JSON 不合法，不能写回".to_owned())
+            }
             Cell::Text(_) => None,
         },
     }
@@ -600,6 +605,15 @@ fn is_integer_name(name: &str) -> bool {
 
 fn is_float_name(name: &str) -> bool {
     matches!(name, "real" | "float" | "float4" | "float8" | "double" | "double precision") || name.starts_with("float ") || name.starts_with("double ")
+}
+
+fn is_binary_preview(value: &str) -> bool {
+    value.strip_prefix('\u{1}').is_some_and(|rest| rest.starts_with("b:")) && is_preview_envelope(value)
+}
+
+fn is_json_type(type_name: &str) -> bool {
+    let name = base_type(type_name);
+    name == "json" || name == "jsonb"
 }
 
 fn is_text_name(name: &str) -> bool {

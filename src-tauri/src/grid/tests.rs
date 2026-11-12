@@ -266,6 +266,10 @@ fn preview_sql_literals_and_split_follow_the_query_scanner() {
     assert!(sql::reject_literal_with(&col("note", "text"), &Cell::Text(synthetic.clone()), true, 1024).is_none());
     // 上限来自读出这段值的那次读取：4 KB 上限下 3000 字节的文本已经是原值，不再当预览挡住。
     assert!(sql::reject_literal_with(&col("note", "text"), &Cell::Text(synthetic), false, 4096).is_none());
+    assert_eq!(sql::reject_literal(&col("payload", "jsonb"), &Cell::Text("{".to_owned())).as_deref(), Some("JSON 不合法，不能写回"));
+    assert!(sql::reject_literal(&col("payload", "json"), &Cell::Text("{\"a\":1}".to_owned())).is_none());
+    assert!(sql::reject_literal(&col("payload", "jsonb"), &Cell::Null).is_none());
+    assert_eq!(sql::reject_literal(&col("note", "text"), &Cell::Text("\u{1}b:12".to_owned())).as_deref(), Some("预览内容不能写回"));
     assert_eq!(sql::reject_literal(&col("shape", "geometry"), &Cell::Null).as_deref(), Some("几何类型不能从格子保存"));
     assert!(sql::reject_literal(&col("mystery", ""), &Cell::Text("a".to_owned())).unwrap().contains("类型未知"));
     assert!(sql::reject_literal(&col("weird", "interval"), &Cell::Null).unwrap().contains("不能判断写回方式"));
@@ -1125,6 +1129,35 @@ async fn xlsx_full_export_writes_select_and_table_rows_and_skips_updates() {
     drop(session);
     drop(service);
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sqlserver_foreign_keys_reuse_the_query_meta_catalog_query() {
+    let sql = super::live::sqlserver_foreign_key_sql("dbo", "orders");
+    assert!(sql.contains("sys.foreign_key_columns"), "{sql}");
+    assert!(sql.contains("pt.name = N'orders'"), "{sql}");
+    assert!(sql.contains("ps.name = N'dbo'"), "{sql}");
+    let quoted = super::live::sqlserver_foreign_key_sql("db'o", "o'rders");
+    assert!(quoted.contains("N'db''o'"), "{quoted}");
+    assert!(quoted.contains("N'o''rders'"), "{quoted}");
+    assert!(!super::live::sqlserver_foreign_key_sql("", "orders").contains("ps.name = "));
+    let rows = vec![
+        vec![text("fk_orders"), text("customer_id"), text("dbo"), text("customers"), text("id")],
+        vec![text("fk_pair"), text("a"), text("dbo"), text("pairs"), text("a")],
+        vec![text("fk_pair"), text("b"), text("dbo"), text("pairs"), text("b")],
+        vec![text(""), text("skip"), text("dbo"), text("customers"), text("id")],
+        vec![text("fk_bad"), text("c"), text("dbo"), text(""), text("id")],
+    ];
+    let keys = super::live::assemble_foreign_keys(&rows);
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0].columns, vec!["customer_id".to_owned()]);
+    assert_eq!(keys[0].ref_table, "customers");
+    assert_eq!(keys[1].columns, vec!["a".to_owned(), "b".to_owned()]);
+    assert_eq!(keys[1].ref_columns, vec!["a".to_owned(), "b".to_owned()]);
+}
+
+fn text(value: &str) -> Cell {
+    Cell::Text(value.to_owned())
 }
 
 #[cfg(test)]

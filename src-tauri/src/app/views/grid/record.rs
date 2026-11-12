@@ -7,9 +7,10 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{div, px, AnyElement, App, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window};
 
 use crate::i18n::{self, Locale};
-use crate::ui::kit::{self, Metrics, Palette, TypeScale};
+use crate::ui::kit::{self, Metrics, Palette, Radius, TypeScale};
+use crate::ui::FormatViewer;
 
-use super::session::{CellKind, SharedGrid};
+use super::session::{type_abbr, CellKind, SharedGrid};
 use super::GridPane;
 
 /// 记录视图里的一格：逻辑列、列名、类型和显示文本（含暂存修改）。
@@ -108,7 +109,16 @@ fn pane_command(entity: &Entity<GridPane>, id: &'static str) -> impl Fn(&gpui_ki
 
 /// 右侧面板：标题行（行号、上一行、下一行、关闭）和"列名—值"列表。长值点开完整值查看器。
 /// 尺寸跟随外壳密度：标题栏取 `bar_h`，字段行最小高度取 `row_h`，列名栏与面板宽度随行高等比伸缩。
-pub fn render_record(view: Option<RecordView>, locale: Locale, p: &Palette, m: Metrics, mono: SharedString, entity: &Entity<GridPane>) -> AnyElement {
+pub fn render_record(
+    view: Option<RecordView>,
+    locale: Locale,
+    p: &Palette,
+    m: Metrics,
+    mono: SharedString,
+    entity: &Entity<GridPane>,
+    width: f32,
+    viewer: Option<Entity<FormatViewer>>,
+) -> AnyElement {
     let t = |key: &str| SharedString::from(i18n::text(locale, key));
     let (title, can_prev, can_next) = match &view {
         Some(view) => (SharedString::from(i18n::fill(&i18n::text(locale, "grid.record.title"), &[("row", &view.row_number)])), view.can_prev, view.can_next),
@@ -139,6 +149,7 @@ pub fn render_record(view: Option<RecordView>, locale: Locale, p: &Palette, m: M
                     }
                 };
                 let name = if field.hidden { format!("{} {}", field.name, i18n::text(locale, "grid.record.hidden")) } else { field.name.clone() };
+                let abbr = type_abbr(&field.type_name);
                 body = body.child(
                     div()
                         .id(("grid-record-field", column))
@@ -158,7 +169,27 @@ pub fn render_record(view: Option<RecordView>, locale: Locale, p: &Palette, m: M
                                 .flex_none()
                                 .flex()
                                 .flex_col()
-                                .child(div().truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(name)))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(4.))
+                                        .child(div().truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(name)))
+                                        .when(!abbr.is_empty(), |this| {
+                                            this.child(
+                                                div()
+                                                    .id(("grid-record-badge", column))
+                                                    .debug_selector(move || format!("grid-record-badge-{column}"))
+                                                    .flex_none()
+                                                    .px(px(4.))
+                                                    .rounded(px(Radius::TAG))
+                                                    .bg(p.hover)
+                                                    .text_size(px(TypeScale::XS))
+                                                    .text_color(p.text_faint)
+                                                    .child(SharedString::from(abbr.clone())),
+                                            )
+                                        }),
+                                )
                                 .child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(field.type_name.clone()))),
                         )
                         .child(
@@ -179,13 +210,13 @@ pub fn render_record(view: Option<RecordView>, locale: Locale, p: &Palette, m: M
             body = body.child(div().p(px(12.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(t("grid.record.empty")));
         }
     }
-    div()
+    let mut panel = div()
         .id("grid-record")
         .debug_selector(|| "grid-record".to_owned())
         .role(gpui_kit::Role::Region)
         .aria_label(t("grid.record.open"))
         .flex_none()
-        .w(px(m.row_h * 10.))
+        .w(px(width))
         .h_full()
         .flex()
         .flex_col()
@@ -193,8 +224,11 @@ pub fn render_record(view: Option<RecordView>, locale: Locale, p: &Palette, m: M
         .border_color(p.line)
         .bg(p.chrome)
         .child(header)
-        .child(body)
-        .into_any_element()
+        .child(body);
+    if let Some(viewer) = viewer {
+        panel = panel.child(div().flex_1().min_h(px(180.)).min_w(px(0.)).border_t_1().border_color(p.line).child(viewer));
+    }
+    panel.into_any_element()
 }
 
 #[cfg(test)]
