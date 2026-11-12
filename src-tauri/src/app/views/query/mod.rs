@@ -13,7 +13,7 @@ use std::sync::{Arc, OnceLock};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, InputState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{resizable_panel, v_resizable, ActiveTheme as _, Disableable as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -122,6 +122,14 @@ pub struct QueryPane {
     definition_sink: Option<ObjectHandler>,
     /// 每个标签最近一次画错误标记时的结果代次；同一批结果只画一次，编辑清掉后不再重画。
     marks_seen: HashMap<String, u64>,
+    /// 正在重命名的固定结果页签。
+    pin_rename: Option<PinRename>,
+}
+
+struct PinRename {
+    id: u64,
+    input: Entity<InputState>,
+    _keep: gpui_kit::Subscription,
 }
 
 /// 失败语句在草稿里要标的范围。偏移标到那个词（至少一个字符，不跨行）；行号标整行；
@@ -129,7 +137,12 @@ pub struct QueryPane {
 /// 偏移落在输入末尾或换行上（如 PG “at end of input”）时没有可标的字符，空范围会被编辑器丢掉：
 /// 改标它前面最近的非空白字符；前面全是空白时标偏移所在的整行。
 pub fn error_ranges(draft: &str, results: &[desk::StatementView]) -> Vec<Range<usize>> {
-    let mut ranges = Vec::new();
+    error_marks(draft, results).into_iter().map(|(range, _)| range).collect()
+}
+
+/// 失败语句在草稿里的范围和错误原文。没有原文时用状态词，悬停和结果头都读这一份。
+pub fn error_marks(draft: &str, results: &[desk::StatementView]) -> Vec<(Range<usize>, String)> {
+    let mut marks = Vec::new();
     for view in results {
         let Some(mark) = view.error_mark else { continue };
         let range = match mark {
@@ -165,10 +178,11 @@ pub fn error_ranges(draft: &str, results: &[desk::StatementView]) -> Vec<Range<u
             }
         };
         if let Some(range) = range.filter(|range| range.end <= draft.len() && range.start < range.end) {
-            ranges.push(range);
+            let message = if view.message.trim().is_empty() { view.status.clone() } else { view.message.clone() };
+            marks.push((range, message));
         }
     }
-    ranges
+    marks
 }
 
 /// 偏移所在的整行（不含换行和行尾 \r）。
@@ -287,6 +301,7 @@ impl QueryPane {
             captured: None,
             definition_sink: None,
             marks_seen: HashMap::new(),
+            pin_rename: None,
         }
     }
 
@@ -635,9 +650,23 @@ impl QueryPane {
             cx.notify();
             return;
         }
+        if let Some(index) = id.strip_prefix("outline-run:") {
+            if let Ok(index) = index.parse::<usize>() {
+                self.run_outline(index, cx);
+            }
+            cx.notify();
+            return;
+        }
         if let Some(index) = id.strip_prefix("outline:") {
             if let Ok(index) = index.parse::<usize>() {
                 let _ = self.jump_to_statement(index, cx);
+            }
+            cx.notify();
+            return;
+        }
+        if id == "jump-error" {
+            if !self.jump_to_failure(cx) {
+                self.desk.set_active_note(&i18n::text(self.locale, "query.log.noPosition"));
             }
             cx.notify();
             return;
@@ -667,6 +696,9 @@ impl QueryPane {
         if let Some(pin) = id.strip_prefix("unpin:") {
             if let Ok(pin) = pin.parse::<u64>() {
                 if self.desk.unpin(pin) {
+                    if self.pin_rename.as_ref().is_some_and(|item| item.id == pin) {
+                        self.pin_rename = None;
+                    }
                     self.rebind_grid(cx);
                 }
             }
@@ -959,6 +991,65 @@ impl QueryPane {
         true
     }
 
+    /// 大纲的运行图标或双击：选中这一条，再按选区执行它，不把后面的语句一起发出去。
+    fn run_outline(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.capture(cx);
+        self.desk.refresh_outline();
+        let Some(item) = self.desk.outline().into_iter().find(|item| item.index == index) else {
+            return;
+        };
+        if let Some(editor) = self.desk.active_id().and_then(|id| self.editors.get(id)).cloned() {
+            editor.update(cx, |editor, cx| editor.select_range(item.start..item.end, cx));
+        }
+        self.capture(cx);
+        self.focus_editor = true;
+        self.start(RunScope::Auto, None, cx);
+    }
+
+    /// 把对象面板点中的标识符插到当前光标或选区，并回到编辑器。
+    pub(crate) fn insert_identifier(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.desk.active_id().and_then(|id| self.editors.get(id)).cloned() else {
+            return;
+        };
+        editor.update(cx, |editor, cx| editor.insert_at_selection(text, window, cx));
+        self.capture(cx);
+        self.desk.refresh_outline();
+        self.focus_editor = true;
+        cx.notify();
+    }
+
+    fn begin_pin_rename(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pin) = self.desk.pinned().into_iter().find(|pin| pin.id == id) else {
+            return;
+        };
+        let initial = SharedString::from(pin.custom_title.clone().filter(|title| !title.trim().is_empty()).unwrap_or_default());
+        let placeholder = SharedString::from(i18n::text(self.locale, "query.results.rename"));
+        let state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(initial));
+        let pane = cx.weak_entity();
+        let subscription = cx.subscribe(&state, move |this, input, event: &InputEvent, cx| match event {
+            InputEvent::Change => {
+                let text = input.read(cx).value().to_string();
+                let _ = this.desk.rename_pin(id, &text);
+            }
+            InputEvent::PressEnter { .. } => {
+                // 回调里不能立刻丢掉订阅，等这一轮结束再收起输入框。
+                let pane = pane.clone();
+                cx.defer(move |cx| {
+                    if let Some(pane) = pane.upgrade() {
+                        pane.update(cx, |this, cx| {
+                            this.pin_rename = None;
+                            cx.notify();
+                        });
+                    }
+                });
+            }
+            _ => {}
+        });
+        state.update(cx, |input, cx| input.focus(window, cx));
+        self.pin_rename = Some(PinRename { id, input: state, _keep: subscription });
+        cx.notify();
+    }
+
     /// 消息页里点一条记录：成功的切到它的结果；失败的跳到编辑器里的错误位置。
     /// 整次执行的失败/取消记录没有对应的结果，什么也不做。
     fn open_log_entry(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1007,6 +1098,46 @@ impl QueryPane {
         true
     }
 
+    /// 结果头和错误面板的定位：优先当前正在看的失败语句，否则这批里第一条失败。
+    fn failure_view(&self) -> Option<desk::StatementView> {
+        match self.desk.result_view() {
+            ResultView::Messages => None,
+            ResultView::Pinned(_) => self.desk.shown_result().filter(statement_failed),
+            ResultView::Current => {
+                let results = self.desk.results();
+                let current = results.get(self.desk.statement()).filter(|view| statement_failed(view)).cloned();
+                current.or_else(|| results.into_iter().find(statement_failed))
+            }
+        }
+    }
+
+    fn jump_to_failure(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(view) = self.failure_view() else {
+            return false;
+        };
+        if self.desk.result_view() == ResultView::Current {
+            if let Some(index) = self.desk.results().iter().position(|item| item.status == view.status && item.sql == view.sql && item.message == view.message) {
+                self.desk.set_statement(index);
+            }
+        }
+        let Some(id) = self.desk.active_id().map(str::to_owned) else {
+            return false;
+        };
+        let Some(editor) = self.editors.get(&id).cloned() else {
+            return false;
+        };
+        let text = editor.read(cx).value(cx);
+        if self.desk.executed_sql(&id).as_deref() != Some(text.as_str()) {
+            return false;
+        }
+        let Some(range) = error_ranges(&text, std::slice::from_ref(&view)).into_iter().next() else {
+            return false;
+        };
+        editor.update(cx, |editor, cx| editor.select_range(range, cx));
+        self.focus_editor = true;
+        true
+    }
+
     /// 把活动标签最近一次执行的失败位置画到编辑器上：驱动给了位置就标那一处/那一行，
     /// 没给就整条语句标错。草稿在执行后改过（与执行时的文本不同）时不画。
     fn sync_error_marks(&mut self, cx: &mut Context<Self>) {
@@ -1028,9 +1159,9 @@ impl QueryPane {
         if self.desk.executed_sql(&id).as_deref() != Some(text.as_str()) {
             return;
         }
-        let ranges = error_ranges(&text, &self.desk.results());
-        if !ranges.is_empty() {
-            editor.update(cx, |editor, cx| editor.mark_errors(ranges, cx));
+        let marked = error_marks(&text, &self.desk.results());
+        if !marked.is_empty() {
+            editor.update(cx, |editor, cx| editor.mark_error_messages(marked, cx));
         }
     }
 
@@ -1542,11 +1673,14 @@ impl QueryPane {
                     let version = editor.read(cx).version();
                     let locale = self.locale;
                     editor.update(cx, |editor, cx| {
-                        if let Some(finding) = findings.first() {
-                            let message = i18n::text(locale, finding.message_key);
-                            let _ = editor.apply_lint(version, &message, finding.start..finding.end, cx);
-                        } else {
+                        if findings.is_empty() {
                             let _ = editor.clear_lint(version, cx);
+                        } else {
+                            let marked: Vec<(Range<usize>, String)> = findings
+                                .iter()
+                                .map(|finding| (finding.start..finding.end, i18n::text(locale, finding.message_key)))
+                                .collect();
+                            let _ = editor.apply_lint_all(version, &marked, cx);
                         }
                     });
                 }
@@ -1883,7 +2017,8 @@ impl QueryPane {
             SideMode::Outline => side::SideBody::Outline(&outline),
             SideMode::Object => side::SideBody::Object(info.as_ref()),
         };
-        let panel = side::SidePanel { mode: side_state.mode, body, locale: self.locale, metrics, overlay: self.narrow, mono: mono.clone() };
+        let engine = self.desk.target().map(|target| target.engine).unwrap_or_default();
+        let panel = side::SidePanel { mode: side_state.mode, body, locale: self.locale, metrics, overlay: self.narrow, mono: mono.clone(), engine: &engine };
         panel.render(p, entity)
     }
 
@@ -1936,7 +2071,8 @@ impl QueryPane {
             .items_center()
             .gap(px(2.));
         for pin in &pinned {
-            strip = strip.child(pinned_tab(pin, result_view == ResultView::Pinned(pin.id), locale, p, metrics, entity));
+            let renaming = self.pin_rename.as_ref().filter(|item| item.id == pin.id).map(|item| item.input.clone());
+            strip = strip.child(pinned_tab(pin, result_view == ResultView::Pinned(pin.id), renaming.as_ref(), locale, p, metrics, entity));
         }
         // 固定结果与当前结果之间用一道竖线分开；没有固定结果时不加。
         if !pinned.is_empty() {
@@ -1947,13 +2083,23 @@ impl QueryPane {
             for (index, result) in results.iter().enumerate() {
                 let selected = result_view == ResultView::Current && index == current;
                 let failed = result.status == "error" || result.status == "failed";
+                let skipped = result.status == "skipped";
                 let id = format!("statement:{index}");
                 let entity = entity.clone();
                 let label = SharedString::from(format!("{} {}", i18n::text(locale, "query.results.statement"), index + 1));
+                let accessible = if skipped {
+                    SharedString::from(format!("{label} {}", i18n::text(locale, "query.log.skipped")))
+                } else {
+                    label.clone()
+                };
+                let dot = if failed { p.danger } else if skipped { p.text_faint } else if result.status == "cancelled" { p.warn } else { p.ok };
                 strip = strip.child(
-                    result_tab(SharedString::from(format!("query-act-statement-{index}")), label.clone(), selected, p, metrics)
-                        .child(kit::status_dot(if failed { p.danger } else { p.ok }))
+                    result_tab(SharedString::from(format!("query-act-statement-{index}")), accessible, selected, p, metrics)
+                        .child(kit::status_dot(dot))
                         .child(label)
+                        .when(skipped, |this| {
+                            this.child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(i18n::text(locale, "query.log.skipped"))))
+                        })
                         .on_click(move |_, _, cx| {
                             let id = id.clone();
                             entity.update(cx, |pane, cx| pane.command(&id, cx));
@@ -2016,7 +2162,7 @@ impl QueryPane {
                 format!("{} {}", result.rows.len(), i18n::text(locale, "ui.grid.rows"))
             }
         });
-        let failed_note = active_result.as_ref().is_some_and(|result| result.status == "error" || result.status == "failed");
+        let failed_note = self.failure_view().is_some();
         // 耗时：执行中显示运行态，取消后显示已取消，完成后显示当前语句自己的耗时。
         let timing = self.result_timing();
         if running {
@@ -2050,6 +2196,9 @@ impl QueryPane {
                     .child(SharedString::from(elapsed_label(ms)))
                     .into_any_element(),
             );
+        }
+        if let Some(failure) = self.failure_view() {
+            items.extend(failure_status(&failure, locale, p, metrics, entity));
         }
         let note = self.desk.active_note();
         if !note.is_empty() {
@@ -2088,6 +2237,8 @@ impl QueryPane {
                 let loaded = results[0].rows.len() as u64;
                 let more = entity.clone();
                 kit::interactive(div().id("query-load-more"), p, false)
+                    .test_support()
+                    .flex_none()
                     .role(gpui_kit::Role::Button)
                     .aria_label(SharedString::from(i18n::text(locale, "query.results.loadMore")))
                     .h(px(metrics.control_h))
@@ -2172,7 +2323,7 @@ impl QueryPane {
                 .into_any_element();
         };
         if result.columns.is_empty() {
-            return statement_outcome(&result, &self.desk.active_note(), locale, mono, p);
+            return statement_outcome(&result, &self.desk.active_note(), locale, mono, p, metrics, entity);
         }
         let grid_entity = entity.clone();
         div()
@@ -2188,22 +2339,68 @@ impl QueryPane {
     }
 }
 
-/// 一个固定结果的页签：书签图标、标题和关闭按钮。
+fn pin_title(pin: &desk::PinnedResult, locale: Locale) -> String {
+    pin.custom_title.clone().filter(|title| !title.trim().is_empty()).unwrap_or_else(|| {
+        i18n::fill(&i18n::text(locale, "query.results.pinned"), &[("n", &pin.id.to_string()), ("statement", &(pin.statement + 1).to_string())])
+    })
+}
+
+/// 一个固定结果的页签：书签图标、标题、关闭，以及双击或右键重命名。
 #[inline(never)]
-fn pinned_tab(pin: &desk::PinnedResult, selected: bool, locale: Locale, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
-    let label = i18n::fill(&i18n::text(locale, "query.results.pinned"), &[("n", &pin.id.to_string()), ("statement", &(pin.statement + 1).to_string())]);
+fn pinned_tab(
+    pin: &desk::PinnedResult,
+    selected: bool,
+    renaming: Option<&Entity<InputState>>,
+    locale: Locale,
+    p: &Palette,
+    metrics: Metrics,
+    entity: &Entity<QueryPane>,
+) -> AnyElement {
+    let label = pin_title(pin, locale);
     let failed = pin.view.status == "error" || pin.view.status == "failed";
     let open = entity.clone();
     let close = entity.clone();
-    let open_id = format!("query-view:pinned:{}", pin.id);
-    let close_id = format!("unpin:{}", pin.id);
-    result_tab(SharedString::from(format!("query-pinned-{}", pin.id)), SharedString::from(label.clone()), selected, p, metrics)
+    let rename = entity.clone();
+    let pin_id = pin.id;
+    let open_id = format!("query-view:pinned:{pin_id}");
+    let close_id = format!("unpin:{pin_id}");
+    let title = if let Some(input) = renaming {
+        div()
+            .w(px(148.))
+            .child(kit::text_input(SharedString::from(format!("query-pinned-rename-{pin_id}")), input, SharedString::from(i18n::text(locale, "query.results.rename"))).small())
+            .into_any_element()
+    } else {
+        div().min_w(px(0.)).truncate().child(SharedString::from(label.clone())).into_any_element()
+    };
+    result_tab(SharedString::from(format!("query-pinned-{pin_id}")), SharedString::from(label), selected, p, metrics)
         .pr(px(4.))
+        .on_click(move |event, window, cx| {
+            if event.click_count() >= 2 {
+                open.update(cx, |pane, cx| pane.begin_pin_rename(pin_id, window, cx));
+            } else {
+                let id = open_id.clone();
+                open.update(cx, |pane, cx| pane.command(&id, cx));
+            }
+        })
+        .context_menu({
+            let rename = rename.clone();
+            let close = close.clone();
+            move |menu, _, _| {
+                let rename = rename.clone();
+                let close = close.clone();
+                menu.item(PopupMenuItem::new(i18n::text(locale, "query.results.rename")).on_click(move |_, window, cx| {
+                    rename.update(cx, |pane, cx| pane.begin_pin_rename(pin_id, window, cx));
+                }))
+                .item(PopupMenuItem::new(i18n::text(locale, "query.results.unpin")).on_click(move |_, _, cx| {
+                    close.update(cx, |pane, cx| pane.command(&format!("unpin:{pin_id}"), cx));
+                }))
+            }
+        })
         .child(kit::icon(IconName::Bookmark, 12., if failed { p.danger } else { p.accent }))
-        .child(SharedString::from(label))
+        .child(title)
         .child(
             div()
-                .id(SharedString::from(format!("query-pinned-close-{}", pin.id)))
+                .id(SharedString::from(format!("query-pinned-close-{pin_id}")))
                 .test_support()
                 .role(gpui_kit::Role::Button)
                 .aria_label(SharedString::from(i18n::text(locale, "query.results.unpin")))
@@ -2220,19 +2417,82 @@ fn pinned_tab(pin: &desk::PinnedResult, selected: bool, locale: Locale, p: &Pale
                     close.update(cx, |pane, cx| pane.command(&id, cx));
                 }),
         )
+        .into_any_element()
+}
+
+#[inline(never)]
+fn failure_status(result: &desk::StatementView, locale: Locale, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> Vec<AnyElement> {
+    let summary = failure_summary(locale, result);
+    let jump = entity.clone();
+    vec![
+        div()
+            .id("query-error-summary")
+            .test_support()
+            .aria_label(SharedString::from(summary.clone()))
+            .min_w(px(0.))
+            .max_w(px(360.))
+            .truncate()
+            .px(px(6.))
+            .text_size(px(TypeScale::SM))
+            .text_color(p.danger)
+            .tooltip_text(SharedString::from(summary.clone()))
+            .child(SharedString::from(summary))
+            .into_any_element(),
+        error_jump_button("query-error-jump", locale, p, metrics, &jump),
+    ]
+}
+
+fn statement_failed(view: &desk::StatementView) -> bool {
+    view.status == "error" || view.status == "failed"
+}
+
+fn failure_summary(locale: Locale, result: &desk::StatementView) -> String {
+    let message = statement_message(locale, &result.status, &result.message);
+    if message.trim().is_empty() { i18n::text(locale, "query.log.error") } else { message }
+}
+
+fn error_jump_button(id: &'static str, locale: Locale, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+    let entity = entity.clone();
+    let label = SharedString::from(i18n::text(locale, "query.errors.locate"));
+    kit::interactive(div().id(id), p, false)
+        .test_support()
+        .flex_none()
+        .role(gpui_kit::Role::Button)
+        .aria_label(label.clone())
+        .h(px(metrics.control_h))
+        .px(px(8.))
+        .rounded(px(Radius::CONTROL))
+        .flex()
+        .items_center()
+        .text_size(px(TypeScale::SM))
+        .text_color(p.danger)
+        .bg(p.danger_soft)
+        .child(label)
         .on_click(move |_, _, cx| {
-            let id = open_id.clone();
-            open.update(cx, |pane, cx| pane.command(&id, cx));
+            entity.update(cx, |pane, cx| pane.command("jump-error", cx));
         })
         .into_any_element()
 }
 
-/// 没有结果列的语句（DDL/DML/失败）：状态图标、说明和语句文本。
+/// 没有结果列的语句（DDL/DML/失败/跳过）：状态图标、说明、语句文本，失败时可以定位。
 #[inline(never)]
-fn statement_outcome(result: &desk::StatementView, note: &str, locale: Locale, mono: &SharedString, p: &Palette) -> AnyElement {
-    let ok = !(result.status == "error" || result.status == "failed");
-    let message = if result.message.is_empty() { note.to_owned() } else { statement_message(locale, &result.status, &result.message) };
+fn statement_outcome(result: &desk::StatementView, note: &str, locale: Locale, mono: &SharedString, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+    let failed = result.status == "error" || result.status == "failed";
+    let skipped = result.status == "skipped";
+    let cancelled = result.status == "cancelled";
+    let color = if failed { p.danger } else if skipped || cancelled { p.warn } else { p.ok };
+    let message = if result.message.is_empty() && !skipped { note.to_owned() } else { statement_message(locale, &result.status, &result.message) };
+    let message = if message.is_empty() { result.status.clone() } else { message };
+    let icon = if failed {
+        kit::icon(IconName::CircleAlert, 16., p.danger).into_any_element()
+    } else if skipped || cancelled {
+        kit::icon(IconName::Ban, 16., p.warn).into_any_element()
+    } else {
+        kit::icon(IconName::CircleCheck, 16., p.ok).into_any_element()
+    };
     div()
+        .id("query-statement-outcome")
+        .test_support()
         .flex_1()
         .p(px(16.))
         .flex()
@@ -2243,10 +2503,12 @@ fn statement_outcome(result: &desk::StatementView, note: &str, locale: Locale, m
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .text_color(if ok { p.ok } else { p.danger })
-                .child(kit::icon(if ok { IconName::CircleCheck } else { IconName::CircleAlert }, 16., if ok { p.ok } else { p.danger }))
-                .child(SharedString::from(if message.is_empty() { result.status.clone() } else { message })),
+                .text_size(px(TypeScale::MD))
+                .text_color(color)
+                .child(icon)
+                .child(SharedString::from(message)),
         )
+        .when(failed, |this| this.child(error_jump_button("query-error-jump-panel", locale, p, metrics, entity)))
         .child(div().font_family(mono.clone()).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(result.sql.clone())))
         .into_any_element()
 }
@@ -2312,6 +2574,7 @@ pub fn requires_active_query(id: &str) -> bool {
             | "save-query"
             | "pin-result"
             | "toggle-side"
+            | "jump-error"
     ) || id.starts_with("statement:")
         || id.starts_with("outline:")
         || id.starts_with("query-view:")
@@ -2379,6 +2642,25 @@ mod tests {
         let en = log::entry_text(Locale::En, &entry);
         assert!(!en.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)), "{en}");
         assert!(en.starts_with("Skipped"), "{en}");
+    }
+
+    #[test]
+    fn column_text_includes_primary_foreign_key_nullability_and_comment() {
+        let mut column = crate::query::assist::ColumnMeta::named("customer_id");
+        column.type_name = "INTEGER".to_owned();
+        column.nullable = Some(true);
+        column.comment = "客户".to_owned();
+        column.foreign_key = true;
+        let text = side::column_text(Locale::ZhCn, &column);
+        assert!(text.contains("customer_id") && text.contains("INTEGER"), "{text}");
+        assert!(text.contains(&i18n::text(Locale::ZhCn, "query.side.foreign")), "{text}");
+        assert!(text.contains(&i18n::text(Locale::ZhCn, "query.side.nullable")), "{text}");
+        assert!(text.contains("客户"), "{text}");
+        column.primary = true;
+        column.foreign_key = false;
+        column.nullable = Some(false);
+        let text = side::column_text(Locale::En, &column);
+        assert!(text.contains("Primary key") && text.contains("not null"), "{text}");
     }
 
     fn sheet(sql: &str, truncated: bool, status: &str) -> desk::StatementView {
@@ -3199,6 +3481,105 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn outline_run_executes_only_that_statement(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let draft = "select 1;\n\nselect 2;\n\nselect 3 from item;";
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", draft)), Some("q"), Locale::ZhCn, window, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("query-outline-run-2").is_some(), "每条大纲都有运行图标");
+            pane.update(cx, |pane, cx| pane.command("outline-run:2", cx));
+            window.render_frame(cx);
+            let editor = pane.read(cx).editors.get("q").cloned().unwrap();
+            assert_eq!(editor.read(cx).selected_text(cx).trim_end_matches(';'), "select 2");
+            assert!(pane.read(cx).running(), "运行图标要发出这一条");
+            assert_eq!(pane.read(cx).desk.draft(), draft);
+            let sent = pane.read(cx).desk.executions();
+            assert_eq!(sent, 1);
+            pane.update(cx, |pane, cx| pane.command("request-cancel", cx));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn load_more_hides_and_refuses_after_the_database_changes(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "SELECT * FROM item")), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![sheet("SELECT * FROM item", true, "ok")]);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("query-load-more").is_some(), "a truncated result on the same target offers load more");
+            let before = pane.read(cx).desk.executions();
+            pane.update(cx, |pane, cx| {
+                pane.command("database:other", cx);
+                pane.command("query-load-more", cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("query-load-more").is_none(), "load more hides after the database changes");
+            assert_eq!(pane.read(cx).desk.executions(), before, "load more is refused after the database changes");
+            assert_eq!(pane.read(cx).desk.target().map(|target| target.database), Some("other".to_owned()));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_failed_statement_can_be_jumped_to_and_later_statements_read_as_skipped(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        let draft = "select 1;\nselect missing;\nselect 3;";
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", draft)), Some("q"), Locale::ZhCn, window, cx);
+                let start = draft.find("select missing").unwrap();
+                let mut failed = result("select missing;", "error", &[], &[], None, "no such table: missing");
+                failed.range = Some((start, start + "select missing;".len()));
+                failed.error_mark = Some(ErrorMark::Statement);
+                let skipped = result("select 3;", "skipped", &[], &[], None, "未执行");
+                pane.desk.plant_run(vec![result("select 1;", "ok", &["n"], &["1"], None, ""), failed, skipped]);
+                pane.desk.remember_executed_draft();
+            });
+            window.render_frame(cx);
+            let skipped = window.find("query-act-statement-2");
+            assert!(skipped.label().is_some_and(|label| label.contains("未执行")), "{:?}", skipped.label());
+            let summary = window.find("query-error-summary");
+            assert!(summary.label().unwrap_or_default().contains("no such table: missing"), "{:?}", summary.label());
+            window.click("query-error-jump", cx);
+            window.render_frame(cx);
+            let editor = pane.read(cx).editors.get("q").cloned().unwrap();
+            assert_eq!(editor.read(cx).selected_text(cx), "select missing;");
+            let hover = editor.read(cx).hover_text(draft.find("missing").unwrap(), cx).expect("悬停错误原文");
+            assert!(hover.contains("no such table: missing"), "{hover}");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_pinned_result_can_be_renamed(cx: &mut TestAppContext) {
+        let (window, pane) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            pane.update(cx, |pane, cx| {
+                let _ = pane.sync(std::slice::from_ref(&bound("q", "select 'a'")), Some("q"), Locale::ZhCn, window, cx);
+                pane.desk.plant_run(vec![result("select 'a'", "ok", &["v"], &["a"], None, "")]);
+                pane.command("pin-result", cx);
+                assert!(pane.desk.rename_pin(1, "订单预览"));
+            });
+            window.render_frame(cx);
+            let tab = window.find("query-pinned-1");
+            assert!(tab.label().is_some_and(|label| label.contains("订单预览")), "{:?}", tab.label());
+            pane.update(cx, |pane, cx| pane.begin_pin_rename(1, window, cx));
+            window.render_frame(cx);
+            assert!(window.try_find("query-pinned-rename-1").is_some(), "双击或菜单打开重命名输入");
+            window.click("query-pinned-close-1", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("query-pinned-1").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn a_failed_statement_is_marked_and_the_header_shows_timing(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         let dir = std::env::temp_dir().join(format!("rillsql-marks-{}", uuid::Uuid::new_v4()));
@@ -3648,8 +4029,8 @@ mod tests {
                     "",
                     "customers",
                     vec![
-                        ColumnMeta { name: "id".to_owned(), type_name: "INTEGER".to_owned(), nullable: Some(false), comment: String::new() },
-                        ColumnMeta { name: "status".to_owned(), type_name: "TEXT".to_owned(), nullable: Some(true), comment: "订单状态".to_owned() },
+                        ColumnMeta { name: "id".to_owned(), type_name: "INTEGER".to_owned(), nullable: Some(false), comment: String::new(), primary: false, foreign_key: false },
+                        ColumnMeta { name: "status".to_owned(), type_name: "TEXT".to_owned(), nullable: Some(true), comment: "订单状态".to_owned(), primary: false, foreign_key: false },
                     ],
                 );
                 let _ = pane.sync(&[a.clone(), b.clone()], Some("a"), Locale::ZhCn, window, cx);

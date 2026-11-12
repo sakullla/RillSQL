@@ -6,14 +6,14 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    AnyElement, ClickEvent, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
     Styled as _, TestSupportExt as _, div, px,
 };
 
 use crate::i18n::{self, Locale};
-use crate::query::assist::OutlineItem;
+use crate::query::assist::{self, OutlineItem};
 use crate::query::desk::ObjectInfo;
-use crate::ui::kit::{self, Metrics, Palette, Radius, TypeScale};
+use crate::ui::kit::{self, Metrics, Palette, Radius, Tip as _, TypeScale};
 
 use super::QueryPane;
 
@@ -53,6 +53,8 @@ pub struct SidePanel<'a> {
     pub metrics: Metrics,
     pub overlay: bool,
     pub mono: SharedString,
+    /// 当前目标的引擎，用来给点选插入的标识符加引号。
+    pub engine: &'a str,
 }
 
 impl SidePanel<'_> {
@@ -107,7 +109,7 @@ impl SidePanel<'_> {
             );
         let body = match self.body {
             SideBody::Outline(items) => outline(items, locale, self.metrics, &self.mono, p, entity),
-            SideBody::Object(info) => object(info, locale, self.metrics, &self.mono, p),
+            SideBody::Object(info) => object(info, locale, self.metrics, &self.mono, p, self.engine, entity),
         };
         div()
             .id("query-side-panel")
@@ -153,47 +155,79 @@ fn outline(items: &[OutlineItem], locale: Locale, metrics: Metrics, mono: &Share
         );
     }
     for item in items {
-        let failed = item.status == "error" || item.status == "failed";
-        let id = format!("outline:{}", item.index);
-        let jump = entity.clone();
-        list = list.child(
-            kit::interactive_states(div().id(SharedString::from(format!("query-outline-{}", item.index))), p, false)
-                .test_support()
-                .role(gpui_kit::Role::Button)
-                .aria_label(SharedString::from(format!("{} {}", i18n::text(locale, "query.outline.jump"), item.index)))
-                .on_click(move |_, _, cx| {
-                    let id = id.clone();
-                    jump.update(cx, |pane, cx| pane.command(&id, cx));
-                })
-                .flex_none()
-                .min_h(px(metrics.tree_row_h))
-                .px(px(6.))
-                .rounded(px(Radius::CONTROL))
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .text_size(px(TypeScale::SM))
-                .hover(|style| style.bg(p.hover))
-                .child(div().flex_none().text_color(p.text_faint).child(SharedString::from(format!("{}", item.index))))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .truncate()
-                        .font_family(mono.clone())
-                        .when(failed, |this| this.text_color(p.danger))
-                        .child(SharedString::from(item.preview.clone())),
-                ),
-        );
+        list = list.child(outline_row(item, locale, metrics, mono, p, entity));
     }
     list.into_any_element()
 }
 
-/// 对象信息里一列的可读说明：名字、类型、可空和注释。
+fn outline_row(item: &OutlineItem, locale: Locale, metrics: Metrics, mono: &SharedString, p: &Palette, entity: &Entity<QueryPane>) -> AnyElement {
+    let failed = item.status == "error" || item.status == "failed";
+    let skipped = item.status == "skipped";
+    let index = item.index;
+    let jump = entity.clone();
+    let run = entity.clone();
+    kit::interactive_states(div().id(SharedString::from(format!("query-outline-{index}"))), p, false)
+        .test_support()
+        .role(gpui_kit::Role::Button)
+        .aria_label(SharedString::from(format!("{} {}", i18n::text(locale, "query.outline.jump"), index)))
+        .on_click(move |event: &ClickEvent, _, cx| {
+            let command = if event.click_count() >= 2 { format!("outline-run:{index}") } else { format!("outline:{index}") };
+            jump.update(cx, |pane, cx| pane.command(&command, cx));
+        })
+        .flex_none()
+        .min_h(px(metrics.tree_row_h))
+        .px(px(6.))
+        .rounded(px(Radius::CONTROL))
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .text_size(px(TypeScale::SM))
+        .hover(|style| style.bg(p.hover))
+        .child(div().flex_none().text_color(p.text_faint).child(SharedString::from(format!("{index}"))))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .font_family(mono.clone())
+                .when(failed, |this| this.text_color(p.danger))
+                .when(skipped, |this| this.text_color(p.text_faint))
+                .child(SharedString::from(item.preview.clone())),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!("query-outline-run-{index}")))
+                .test_support()
+                .role(gpui_kit::Role::Button)
+                .aria_label(SharedString::from(i18n::text(locale, "query.outline.run")))
+                .tooltip_text(SharedString::from(i18n::text(locale, "query.outline.run")))
+                .flex_none()
+                .size(px(18.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(Radius::CONTROL))
+                .hover(|style| style.bg(p.active))
+                .child(kit::icon(IconName::Play, 12., p.accent))
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    run.update(cx, |pane, cx| pane.command(&format!("outline-run:{index}"), cx));
+                }),
+        )
+        .into_any_element()
+}
+
+/// 对象信息里一列的可读说明：名字、类型、主键、外键、可空和注释。
 pub fn column_text(locale: Locale, column: &crate::query::assist::ColumnMeta) -> String {
     let mut parts = vec![column.name.clone()];
     if !column.type_name.is_empty() {
         parts.push(column.type_name.clone());
+    }
+    if column.primary {
+        parts.push(i18n::text(locale, "query.side.primary"));
+    }
+    if column.foreign_key {
+        parts.push(i18n::text(locale, "query.side.foreign"));
     }
     match column.nullable {
         Some(true) => parts.push(i18n::text(locale, "query.side.nullable")),
@@ -206,7 +240,67 @@ pub fn column_text(locale: Locale, column: &crate::query::assist::ColumnMeta) ->
     parts.join(" · ")
 }
 
-fn object(info: Option<&ObjectInfo>, locale: Locale, metrics: Metrics, mono: &SharedString, p: &Palette) -> AnyElement {
+#[allow(clippy::too_many_arguments)]
+fn object_column(
+    index: usize,
+    column: &crate::query::assist::ColumnMeta,
+    focused_name: Option<&str>,
+    locale: Locale,
+    metrics: Metrics,
+    mono: &SharedString,
+    p: &Palette,
+    engine: &str,
+    entity: &Entity<QueryPane>,
+) -> AnyElement {
+    let focused = focused_name.is_some_and(|name| name.eq_ignore_ascii_case(&column.name));
+    let nullable = match column.nullable {
+        Some(true) => i18n::text(locale, "query.side.nullable"),
+        Some(false) => i18n::text(locale, "query.side.notNull"),
+        None => String::new(),
+    };
+    let quoted = assist::quote_ident(engine, &column.name);
+    let insert = entity.clone();
+    div()
+        .id(SharedString::from(format!("query-side-column-{index}")))
+        .test_support()
+        .role(gpui_kit::Role::Button)
+        .aria_label(SharedString::from(column_text(locale, column)))
+        .aria_selected(focused)
+        .flex_none()
+        .min_h(px(metrics.row_h))
+        .px(px(12.))
+        .py(px(3.))
+        .flex()
+        .flex_col()
+        .justify_center()
+        .text_size(px(TypeScale::SM))
+        .cursor_pointer()
+        .rounded(px(Radius::CONTROL))
+        .when(focused, |this| this.bg(p.accent_soft))
+        .hover(|style| style.bg(p.hover))
+        .on_click(move |_, window, cx| {
+            let sql = quoted.clone();
+            insert.update(cx, |pane, cx| pane.insert_identifier(&sql, window, cx));
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .when(column.primary, |this| this.child(kit::icon(IconName::Key, 12., p.warn)))
+                .when(column.foreign_key, |this| this.child(kit::icon(IconName::Link, 12., p.accent)))
+                .child(div().min_w(px(0.)).truncate().font_family(mono.clone()).text_color(p.text).child(SharedString::from(column.name.clone())))
+                .child(div().flex_1())
+                .child(div().flex_none().text_color(p.text_muted).child(SharedString::from(column.type_name.clone())))
+                .when(!nullable.is_empty(), |this| this.child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(nullable)))),
+        )
+        .when(!column.comment.is_empty(), |this| {
+            this.child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(column.comment.clone())))
+        })
+        .into_any_element()
+}
+
+fn object(info: Option<&ObjectInfo>, locale: Locale, metrics: Metrics, mono: &SharedString, p: &Palette, engine: &str, entity: &Entity<QueryPane>) -> AnyElement {
     let Some(info) = info else {
         return div()
             .id("query-side-object")
@@ -223,7 +317,9 @@ fn object(info: Option<&ObjectInfo>, locale: Locale, metrics: Metrics, mono: &Sh
             )
             .into_any_element();
     };
+    let object_sql = assist::qualified_name(engine, &info.schema, &info.name);
     let qualified = if info.schema.is_empty() { info.name.clone() } else { format!("{}.{}", info.schema, info.name) };
+    let insert_object = entity.clone();
     let kind_key = format!("query.complete.kind.{}", info.kind);
     let kind = i18n::text(locale, &kind_key);
     let kind = if kind == kind_key { info.kind.clone() } else { kind };
@@ -247,10 +343,18 @@ fn object(info: Option<&ObjectInfo>, locale: Locale, metrics: Metrics, mono: &Sh
                     div()
                         .id("query-side-object-name")
                         .test_support()
-                        .aria_label(SharedString::from(format!("{qualified} · {kind}")))
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(SharedString::from(format!("{} {}", i18n::text(locale, "catalog.menu.insertEditor"), qualified)))
                         .flex()
                         .items_center()
                         .gap(px(6.))
+                        .rounded(px(Radius::CONTROL))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(p.hover))
+                        .on_click(move |_, window, cx| {
+                            let sql = object_sql.clone();
+                            insert_object.update(cx, |pane, cx| pane.insert_identifier(&sql, window, cx));
+                        })
                         .child(div().min_w(px(0.)).truncate().font_family(mono.clone()).text_size(px(TypeScale::MD)).text_color(p.text).child(SharedString::from(qualified)))
                         .child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(kind))),
                 )
@@ -262,41 +366,7 @@ fn object(info: Option<&ObjectInfo>, locale: Locale, metrics: Metrics, mono: &Sh
         body = body.child(div().px(px(12.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(i18n::text(locale, "query.side.noColumns"))));
     }
     for (index, column) in info.columns.iter().enumerate() {
-        let focused = info.column.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(&column.name));
-        let nullable = match column.nullable {
-            Some(true) => i18n::text(locale, "query.side.nullable"),
-            Some(false) => i18n::text(locale, "query.side.notNull"),
-            None => String::new(),
-        };
-        body = body.child(
-            div()
-                .id(SharedString::from(format!("query-side-column-{index}")))
-                .test_support()
-                .aria_label(SharedString::from(column_text(locale, column)))
-                .aria_selected(focused)
-                .flex_none()
-                .min_h(px(metrics.row_h))
-                .px(px(12.))
-                .py(px(3.))
-                .flex()
-                .flex_col()
-                .justify_center()
-                .text_size(px(TypeScale::SM))
-                .when(focused, |this| this.bg(p.accent_soft))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .child(div().min_w(px(0.)).truncate().font_family(mono.clone()).text_color(p.text).child(SharedString::from(column.name.clone())))
-                        .child(div().flex_1())
-                        .child(div().flex_none().text_color(p.text_muted).child(SharedString::from(column.type_name.clone())))
-                        .when(!nullable.is_empty(), |this| this.child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(nullable)))),
-                )
-                .when(!column.comment.is_empty(), |this| {
-                    this.child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(column.comment.clone())))
-                }),
-        );
+        body = body.child(object_column(index, column, info.column.as_deref(), locale, metrics, mono, p, engine, entity));
     }
     body.into_any_element()
 }

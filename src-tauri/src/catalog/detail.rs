@@ -157,31 +157,49 @@ pub fn columns_from_rows(engine: Engine, rows: &[Vec<Option<String>>]) -> Vec<Co
 }
 
 /// 补全和悬停用的列元数据：在 columns_from_rows 的位置约定上再取注释（第 5 列）。
-/// SQLite 没有列注释；读不到的类型和注释留空，不编造。
+/// SQLite 没有列注释，主键在 PRAGMA 的 pk 列；其它引擎的主键由 apply_primary_to_meta 另查。
+/// 读不到的类型和注释留空，不编造。
 pub fn column_meta_from_rows(engine: Engine, rows: &[Vec<Option<String>>]) -> Vec<ColumnMeta> {
     let mut columns = Vec::new();
     for index in 0..rows.len() {
-        let (name, type_name, nullable, comment) = match engine {
+        let (name, type_name, nullable, comment, primary) = match engine {
             Engine::Sqlite => {
                 let notnull = cell(rows, index, 3);
                 let nullable = match notnull.trim() {
                     "" => None,
                     flag => Some(flag != "1"),
                 };
-                (cell(rows, index, 1), cell(rows, index, 2), nullable, String::new())
+                let pk = cell(rows, index, 5);
+                let primary = !pk.trim().is_empty() && pk.trim() != "0";
+                (cell(rows, index, 1), cell(rows, index, 2), nullable, String::new(), primary)
             }
             _ => {
                 let flag = cell(rows, index, 2);
                 let nullable = if flag.trim().is_empty() { None } else { Some(yes(&flag)) };
-                (cell(rows, index, 0), cell(rows, index, 1), nullable, cell(rows, index, 4))
+                (cell(rows, index, 0), cell(rows, index, 1), nullable, cell(rows, index, 4), false)
             }
         };
         if name.is_empty() {
             continue;
         }
-        columns.push(ColumnMeta { name, type_name, nullable, comment });
+        columns.push(ColumnMeta { name, type_name, nullable, comment, primary, foreign_key: false });
     }
     columns
+}
+
+/// 主键查询的列名行标到已读列上。对不上的名字不编造列。
+pub fn apply_primary_to_meta(columns: &mut [ColumnMeta], rows: &[Vec<Option<String>>]) {
+    for index in 0..rows.len() {
+        let name = cell(rows, index, 0);
+        if name.is_empty() {
+            continue;
+        }
+        for column in columns.iter_mut() {
+            if column.name.eq_ignore_ascii_case(&name) {
+                column.primary = true;
+            }
+        }
+    }
 }
 
 /// (name, comment) 行收成对照表；名字或注释为空的行跳过。
@@ -388,7 +406,14 @@ pub async fn read_column_meta(
         return Ok(Vec::new());
     };
     let rows = rows_for(session, &sql).await?;
-    Ok(column_meta_from_rows(engine, &rows))
+    let mut meta = column_meta_from_rows(engine, &rows);
+    // 主键读不到不算列失败：列已经读到了，只是没有主键标记。SQLite 的 pk 已在 PRAGMA 行里。
+    if let Some(pk_sql) = primary_key_sql(engine, database, schema, table) {
+        if let Ok(pk_rows) = rows_for(session, &pk_sql).await {
+            apply_primary_to_meta(&mut meta, &pk_rows);
+        }
+    }
+    Ok(meta)
 }
 
 /// 读一个库/模式里对象的注释。没有注释来源的引擎返回空表，不是失败。
@@ -505,28 +530,45 @@ mod tests {
             vec![Some("note".to_owned()), Some("text".to_owned()), Some("YES".to_owned()), None, None],
             vec![Some("legacy".to_owned()), None, None, None],
         ];
-        let meta = column_meta_from_rows(Engine::Postgres, &rows);
+        let mut meta = column_meta_from_rows(Engine::Postgres, &rows);
         assert_eq!(meta.len(), 3);
         assert_eq!(
             meta[0],
-            ColumnMeta { name: "id".to_owned(), type_name: "integer".to_owned(), nullable: Some(false), comment: "主键".to_owned() }
+            ColumnMeta { name: "id".to_owned(), type_name: "integer".to_owned(), nullable: Some(false), comment: "主键".to_owned(), primary: false, foreign_key: false }
         );
         assert_eq!(meta[1].nullable, Some(true));
         assert!(meta[1].comment.is_empty(), "没有注释就留空");
+        assert!(!meta[0].primary, "information_schema 行本身不带主键");
         assert_eq!(meta[2], ColumnMeta::named("legacy"), "读不到的类型和可空不编造");
+        apply_primary_to_meta(&mut meta, &[vec![Some("id".to_owned())]]);
+        assert!(meta[0].primary);
+        assert!(!meta[1].primary);
+        assert!(!meta[0].foreign_key, "外键不从列查询编造");
 
-        let sqlite = vec![vec![
-            Some("0".to_owned()),
-            Some("body".to_owned()),
-            Some("TEXT".to_owned()),
-            Some("1".to_owned()),
-            None,
-            Some("0".to_owned()),
-        ]];
+        let sqlite = vec![
+            vec![
+                Some("0".to_owned()),
+                Some("id".to_owned()),
+                Some("INTEGER".to_owned()),
+                Some("1".to_owned()),
+                None,
+                Some("1".to_owned()),
+            ],
+            vec![
+                Some("1".to_owned()),
+                Some("body".to_owned()),
+                Some("TEXT".to_owned()),
+                Some("0".to_owned()),
+                None,
+                Some("0".to_owned()),
+            ],
+        ];
         let meta = column_meta_from_rows(Engine::Sqlite, &sqlite);
-        assert_eq!(meta[0].type_name, "TEXT");
+        assert!(meta[0].primary, "PRAGMA pk 非 0 是主键");
         assert_eq!(meta[0].nullable, Some(false));
         assert!(meta[0].comment.is_empty(), "SQLite 没有列注释");
+        assert!(!meta[1].primary);
+        assert_eq!(meta[1].nullable, Some(true));
     }
 
     #[test]

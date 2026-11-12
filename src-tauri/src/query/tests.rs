@@ -264,6 +264,28 @@ async fn multi_statement_stops_on_failure_and_does_not_replay_unknown() {
 }
 
 #[tokio::test]
+async fn a_statement_error_skips_every_later_statement() {
+    let driver = Scripted {
+        steps: Mutex::new(vec![
+            Ok(ok_count()),
+            Err(StatementStop::Error { message: "no such table: missing".to_owned(), at: None }),
+            Ok(ok_count()),
+        ]),
+        calls: Mutex::new(Vec::new()),
+    };
+    let flag = Arc::new(AtomicBool::new(false));
+    let parts = vec![piece("INSERT INTO t VALUES (1)"), piece("SELECT * FROM missing"), piece("DELETE FROM t")];
+    let report = run_batch(&parts, 100, &flag, false, &driver).await;
+    assert_eq!(report.status, "error");
+    assert_eq!(report.calls, 2, "失败之后不再发送");
+    assert_eq!(report.statements[0].status, "ok");
+    assert_eq!(report.statements[1].status, "error");
+    assert_eq!(report.statements[1].message, "no such table: missing");
+    assert_eq!(report.statements[2].status, "skipped");
+    assert_eq!(driver.calls.lock().expect("calls").len(), 2);
+}
+
+#[tokio::test]
 async fn ssh_cancel_accepts_a_second_direct_tcpip() {
     use crate::connections::forward::{Forwarder, RecordingOpener};
 

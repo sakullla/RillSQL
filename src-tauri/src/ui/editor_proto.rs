@@ -160,7 +160,14 @@ pub fn info_markdown(info: &EntryInfo, locale: Locale) -> String {
                 Some(false) => t("query.info.notNull"),
                 None => t("query.info.nullUnknown"),
             };
-            lines.push(format!("{} · {type_text} · {nullable}", code_span(&column.name)));
+            let mut flags = vec![nullable];
+            if column.primary {
+                flags.push(t("query.side.primary"));
+            }
+            if column.foreign_key {
+                flags.push(t("query.side.foreign"));
+            }
+            lines.push(format!("{} · {type_text} · {}", code_span(&column.name), flags.join(" · ")));
             if !source.is_empty() {
                 lines.push(fill("query.info.source", "source", source));
             }
@@ -292,6 +299,8 @@ pub struct SqlEditor {
     error_gutter: GutterDecorationCollection,
     /// 当前错误标记的范围；下一次编辑或重新执行时清除。
     errors: Vec<Range<usize>>,
+    /// 执行错误和静态 lint 的原文，悬停与诊断共用。
+    facts: Rc<RefCell<HoverFacts>>,
     stale_lint: u32,
     stale_completion: u32,
     folded_lines: u32,
@@ -307,9 +316,37 @@ pub struct SqlEditor {
     _track: gpui_kit::Subscription,
 }
 
+/// 悬停要优先展示的诊断：执行错误和静态 lint，都带着原文。
+#[derive(Default)]
+struct HoverFacts {
+    errors: Vec<(Range<usize>, String)>,
+    lint: Vec<(Range<usize>, String)>,
+}
+
 struct SqlHover {
     scope: Rc<RefCell<Option<CompletionScope>>>,
     locale: Rc<Cell<Locale>>,
+    facts: Rc<RefCell<HoverFacts>>,
+}
+
+fn covers(range: &Range<usize>, offset: usize) -> bool {
+    !range.is_empty() && offset >= range.start && offset < range.end
+}
+
+/// 执行错误优先于静态 lint；同一类里取最短的那一段。
+fn diagnostic_at(facts: &HoverFacts, offset: usize) -> Option<(Range<usize>, String)> {
+    let pick = |items: &[(Range<usize>, String)]| {
+        items
+            .iter()
+            .filter(|(range, message)| !message.is_empty() && covers(range, offset))
+            .min_by_key(|(range, _)| range.end.saturating_sub(range.start))
+            .cloned()
+    };
+    pick(&facts.errors).or_else(|| pick(&facts.lint))
+}
+
+fn diagnostic_markdown(message: &str, locale: Locale) -> String {
+    format!("**{}**\n\n{}", i18n::text(locale, "query.log.error"), escape_markdown(message))
 }
 
 struct SqlDefinition {
@@ -332,6 +369,7 @@ impl SqlEditor {
         let extra = Rc::new(RefCell::new(Vec::new()));
         let scope = Rc::new(RefCell::new(None));
         let locale = Rc::new(Cell::new(Locale::ZhCn));
+        let facts = Rc::new(RefCell::new(HoverFacts::default()));
         let note = Rc::new(RefCell::new(None));
         let request = Rc::new(Cell::new(0));
         let link_target: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
@@ -350,7 +388,7 @@ impl SqlEditor {
                 note: note.clone(),
                 request: request.clone(),
             }));
-            state.lsp_mut().hover_provider = Some(Rc::new(SqlHover { scope: scope.clone(), locale: locale.clone() }));
+            state.lsp_mut().hover_provider = Some(Rc::new(SqlHover { scope: scope.clone(), locale: locale.clone(), facts: facts.clone() }));
             state.lsp_mut().definition_provider = Some(Rc::new(SqlDefinition { scope: scope.clone(), target: link_target.clone() }));
             let sink = object_sink.clone();
             state.lsp_mut().show_document = Some(Rc::new(move |params, _window, cx| follow_uri(&sink, params.uri.as_str(), cx)));
@@ -367,8 +405,9 @@ impl SqlEditor {
         let subscription = cx.subscribe(&state, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.version.set(this.version.get().wrapping_add(1));
-                // 错误标记属于上一次执行；草稿一改就不再可信。
+                // 错误标记属于上一次执行；草稿一改就不再可信。静态诊断的偏移也一起失效。
                 this.clear_errors(cx);
+                this.facts.borrow_mut().lint.clear();
                 let _ = this.track(cx);
                 cx.notify();
             }
@@ -429,6 +468,7 @@ impl SqlEditor {
             error_marks,
             error_gutter,
             errors: Vec::new(),
+            facts,
             stale_lint: 0,
             stale_completion: 0,
             folded_lines: 0,
@@ -502,23 +542,32 @@ impl SqlEditor {
     }
 
     /// 执行失败的位置：每个范围同时画在行号旁和文本底色上。
+    /// 兼容只给范围的调用；悬停没有对应消息时仍显示表/列说明。
     pub fn mark_errors(&mut self, ranges: Vec<Range<usize>>, cx: &mut Context<Self>) {
+        self.mark_error_messages(ranges.into_iter().map(|range| (range, String::new())).collect(), cx);
+    }
+
+    /// 执行失败的位置和错误原文。悬停命中范围时展示这段原文。
+    pub fn mark_error_messages(&mut self, marked: Vec<(Range<usize>, String)>, cx: &mut Context<Self>) {
         let palette = Palette::of(cx);
         let mut fill = palette.danger;
         fill.a = 0.16;
+        let ranges: Vec<Range<usize>> = marked.iter().map(|(range, _)| range.clone()).collect();
         let gutter = ranges.iter().cloned().map(|range| GutterDecoration::new(range).with_color(palette.danger)).collect();
         let marks = ranges.iter().cloned().map(|range| RangeDecoration::new(range).with_style(RangeDecorationStyle::Fill).with_color(fill)).collect();
         self.error_gutter.set(gutter, cx);
         self.error_marks.set(marks, cx);
         self.errors = ranges;
+        self.facts.borrow_mut().errors = marked;
         cx.notify();
     }
 
     pub fn clear_errors(&mut self, cx: &mut Context<Self>) {
-        if self.errors.is_empty() {
+        if self.errors.is_empty() && self.facts.borrow().errors.is_empty() {
             return;
         }
         self.errors.clear();
+        self.facts.borrow_mut().errors.clear();
         self.error_gutter.clear(cx);
         self.error_marks.clear(cx);
         cx.notify();
@@ -560,7 +609,11 @@ impl SqlEditor {
     }
 
     /// 悬停在偏移处会显示的说明（与悬停提供者同一份数据）；没有时为 None。
+    /// 执行错误和静态 lint 优先于表、列、函数文档。
     pub fn hover_text(&self, offset: usize, cx: &App) -> Option<String> {
+        if let Some((_, message)) = diagnostic_at(&self.facts.borrow(), offset) {
+            return Some(diagnostic_markdown(&message, self.locale.get()));
+        }
         let text = self.value(cx);
         let scope = self.scope.borrow();
         let (_, info) = hover_info(scope.as_ref()?, &text, offset)?;
@@ -649,6 +702,14 @@ impl SqlEditor {
         });
     }
 
+    /// 在当前光标或选区插入文本，走编辑器自己的替换，Ctrl+Z 能撤销。
+    pub fn insert_at_selection(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            let range = state.selected_range();
+            state.replace_text_in_range(Some(range), text, window, cx);
+        });
+    }
+
     /// Apply lint only when `response_version` is still the editor's version.
     pub fn apply_lint(
         &mut self,
@@ -657,23 +718,39 @@ impl SqlEditor {
         range: Range<usize>,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.apply_lint_all(response_version, &[(range, message.to_owned())], cx)
+    }
+
+    /// 写入全部静态诊断，不再只保留第一条。版本过期时一条都不写。
+    pub fn apply_lint_all(
+        &mut self,
+        response_version: u64,
+        findings: &[(Range<usize>, String)],
+        cx: &mut Context<Self>,
+    ) -> bool {
         if !accept_versioned(self.version.get(), response_version) {
             self.stale_lint += 1;
             return false;
         }
+        self.facts.borrow_mut().lint = findings.to_vec();
         self.state.update(cx, |state, _| {
             let text = state.text().clone();
             let Some(set) = state.diagnostics_mut() else {
                 return;
             };
             set.reset(&text);
-            let start = offset_to_position(&text, range.start);
-            let end = offset_to_position(&text, range.end.min(text.len()));
-            set.push(
-                Diagnostic::new(start..end, message).with_severity(DiagnosticSeverity::Error),
-            );
+            for (range, message) in findings {
+                let start = offset_to_position(&text, range.start);
+                let end = offset_to_position(&text, range.end.min(text.len()));
+                set.push(Diagnostic::new(start..end, message.clone()).with_severity(DiagnosticSeverity::Error));
+            }
         });
         true
+    }
+
+    /// 当前全部静态诊断原文，按写入顺序。
+    pub fn lint_messages(&self) -> Vec<String> {
+        self.facts.borrow().lint.iter().map(|(_, message)| message.clone()).collect()
     }
 
     pub fn lint_message(&self, cx: &App) -> Option<String> {
@@ -775,6 +852,7 @@ impl SqlEditor {
             self.stale_lint += 1;
             return false;
         }
+        self.facts.borrow_mut().lint.clear();
         self.state.update(cx, |state, _| {
             let text = state.text().clone();
             if let Some(set) = state.diagnostics_mut() {
@@ -1016,6 +1094,13 @@ impl CompletionProvider for SqlSuggest {
 
 impl HoverProvider for SqlHover {
     fn hover(&self, text: &Rope, offset: usize, _window: &mut Window, _cx: &mut App) -> Task<gpui_kit::Result<Option<Hover>>> {
+        let locale = self.locale.get();
+        if let Some((span, message)) = diagnostic_at(&self.facts.borrow(), offset) {
+            return Task::ready(Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value: diagnostic_markdown(&message, locale) }),
+                range: Some(lsp_types::Range { start: offset_to_position(text, span.start), end: offset_to_position(text, span.end) }),
+            })));
+        }
         let scope = self.scope.borrow();
         let Some(scope) = scope.as_ref() else {
             return Task::ready(Ok(None));
@@ -1023,7 +1108,7 @@ impl HoverProvider for SqlHover {
         let value = text.to_string();
         // 认不出的名字没有悬停，不弹空气泡。
         let hover = hover_info(scope, &value, offset).map(|(span, info)| Hover {
-            contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value: info_markdown(&info, self.locale.get()) }),
+            contents: HoverContents::Markup(MarkupContent { kind: MarkupKind::Markdown, value: info_markdown(&info, locale) }),
             range: Some(lsp_types::Range { start: offset_to_position(text, span.start), end: offset_to_position(text, span.end) }),
         });
         Task::ready(Ok(hover))
@@ -1542,8 +1627,8 @@ mod tests {
         let mut scope = catalog_scope();
         scope.objects[0].comment = "订单表".to_owned();
         scope.sources[0].columns = vec![
-            ColumnMeta { name: "id".to_owned(), type_name: "INTEGER".to_owned(), nullable: Some(false), comment: String::new() },
-            ColumnMeta { name: "customer".to_owned(), type_name: "TEXT".to_owned(), nullable: Some(true), comment: "下单客户".to_owned() },
+            ColumnMeta { name: "id".to_owned(), type_name: "INTEGER".to_owned(), nullable: Some(false), comment: String::new(), primary: false, foreign_key: false },
+            ColumnMeta { name: "customer".to_owned(), type_name: "TEXT".to_owned(), nullable: Some(true), comment: "下单客户".to_owned(), primary: false, foreign_key: false },
             ColumnMeta::named("status"),
         ];
         scope
@@ -1708,6 +1793,52 @@ select 1;";
         cx.update_window(window, |_, window, cx| {
             window.render_frame(cx);
             assert!(editor.read(cx).error_ranges(cx).is_empty(), "编辑后错误标记清除");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn hover_shows_every_diagnostic_and_insert_stays_on_the_undo_stack(cx: &mut TestAppContext) {
+        let (window, editor) = open(cx);
+        cx.update_window(window, |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.set_sql("select bad from orders;", window, cx));
+            window.render_frame(cx);
+            let text = editor.read(cx).value(cx);
+            let bad = text.find("bad").unwrap();
+            let orders = text.find("orders").unwrap();
+            editor.update(cx, |editor, cx| {
+                editor.mark_error_messages(vec![(bad..bad + 3, "no such column: bad".to_owned())], cx);
+                let version = editor.version();
+                assert!(editor.apply_lint_all(
+                    version,
+                    &[(0..6, "引号没有闭合。".to_owned()), (orders..orders + "orders".len(), "块注释没有闭合。".to_owned())],
+                    cx,
+                ));
+                assert!(!editor.apply_lint_all(version.saturating_sub(1), &[(0..1, "过期".to_owned())], cx));
+            });
+            let hover = editor.read(cx).hover_text(bad, cx).expect("错误范围要有悬停");
+            assert!(hover.contains("no such column: bad"), "执行错误优先于文档：{hover}");
+            assert!(hover.contains(&i18n::text(Locale::ZhCn, "query.log.error")), "{hover}");
+            let lint = editor.read(cx).hover_text(orders, cx).expect("第二条静态诊断也要能悬停");
+            assert!(lint.contains("块注释没有闭合。"), "{lint}");
+            assert_eq!(editor.read(cx).lint_messages(), vec!["引号没有闭合。".to_owned(), "块注释没有闭合。".to_owned()]);
+            assert_eq!(editor.read(cx).lint_message(cx).as_deref(), Some("引号没有闭合。"));
+            editor.update(cx, |editor, cx| {
+                editor.select_range(0..0, cx);
+                editor.insert_at_selection("/*x*/", window, cx);
+            });
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(editor.read(cx).value(cx).starts_with("/*x*/"), "{}", editor.read(cx).value(cx));
+            window.press("secondary-z", cx);
+        })
+        .unwrap();
+        cx.update_window(window, |_, window, cx| {
+            let value = editor.read(cx).value(cx);
+            assert!(!value.contains("/*x*/"), "插入走编辑器撤销栈：{value}");
+            assert!(value.starts_with("select"), "{value}");
         })
         .unwrap();
     }

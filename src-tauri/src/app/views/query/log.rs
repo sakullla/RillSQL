@@ -150,7 +150,14 @@ impl LogPanel<'_> {
                                     .items_center()
                                     .gap(px(8.))
                                     .child(div().flex_none().text_color(p.text).child(SharedString::from(title)))
-                                    .child(div().flex_none().text_color(color).child(SharedString::from(status_text(locale, entry))))
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("query-log-status-{index}")))
+                                            .test_support()
+                                            .flex_none()
+                                            .text_color(color)
+                                            .child(SharedString::from(status_text(locale, entry))),
+                                    )
                                     .when(!counts.is_empty(), |this| this.child(div().flex_none().text_color(p.text_muted).child(SharedString::from(counts))))
                                     .when_some(entry.elapsed_ms, |this, ms| this.child(div().flex_none().text_color(p.text_faint).child(SharedString::from(elapsed_label(ms)))))
                                     .child(div().flex_1().min_w(px(0.)).truncate().font_family(self.mono.clone()).text_color(p.text_faint).child(SharedString::from(sql))),

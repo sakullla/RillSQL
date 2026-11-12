@@ -114,6 +114,8 @@ pub struct PinnedResult {
     /// 产生这份结果的那次执行用的目标（连接/库/模式）。显示固定结果时按它绑定表格，
     /// 不跟着标签之后切换的库走；来源无法证明（外部写入的结果）时为 None，表格按未定位只读处理。
     pub target: Option<Target>,
+    /// 用户给这个固定页签起的名字；没有时用默认的“固定 n · 结果 m”。
+    pub custom_title: Option<String>,
 }
 
 /// 结果区当前显示的是哪一页：当前结果、某个固定结果，或消息页。
@@ -647,6 +649,14 @@ impl Desk {
         }
     }
 
+    /// 测试用：把当前草稿记成“刚执行过的文本”，错误定位才认这段位置。
+    #[cfg(test)]
+    pub fn remember_executed_draft(&mut self) {
+        if let Some(tab) = self.active_mut() {
+            tab.executed_sql = Some(tab.draft.clone());
+        }
+    }
+
     /// 测试用：把一批最终结果当作一次完成的执行写到活动标签（结果、消息、执行次数）。
     #[cfg(test)]
     pub fn plant_run(&mut self, results: Vec<StatementView>) {
@@ -728,7 +738,7 @@ impl Desk {
         tab.pin_seq = tab.pin_seq.saturating_add(1);
         let id = tab.pin_seq;
         let target = tab.results_target.clone();
-        tab.pinned.push(PinnedResult { id, run: tab.run_seq, statement, view: tab.results[statement].clone(), target });
+        tab.pinned.push(PinnedResult { id, run: tab.run_seq, statement, view: tab.results[statement].clone(), target, custom_title: None });
         tab.result_view = ResultView::Pinned(id);
         self.view_gen = self.view_gen.saturating_add(1);
         Some(id)
@@ -748,6 +758,16 @@ impl Desk {
             tab.result_view = ResultView::Current;
         }
         self.view_gen = self.view_gen.saturating_add(1);
+        true
+    }
+
+    /// 给固定页签一个名字。空白恢复成默认标题。不存在的 id 不改。
+    pub fn rename_pin(&mut self, id: u64, title: &str) -> bool {
+        let Some(pin) = self.active_mut().and_then(|tab| tab.pinned.iter_mut().find(|pin| pin.id == id)) else {
+            return false;
+        };
+        let trimmed = title.trim();
+        pin.custom_title = if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) };
         true
     }
 
@@ -784,31 +804,33 @@ impl Desk {
     pub fn object_info_at(&self, text: &str, offset: usize) -> Option<ObjectInfo> {
         let found = self.resolve_at(text, offset)?;
         let target = self.target()?;
-        let lookup = |schema: &str, name: &str| {
-            self.objects.iter().find(|object| {
-                object.connection_id == target.connection_id
-                    && object.database == target.database
-                    && object.schema.eq_ignore_ascii_case(schema)
-                    && object.name.eq_ignore_ascii_case(name)
-            })
-        };
-        match found.target {
+        let mut info = match found.target {
             complete::Resolved::Object { schema, name, kind, comment, columns } => {
-                Some(ObjectInfo { schema, name, kind, comment, columns, column: None })
+                ObjectInfo { schema, name, kind, comment, columns, column: None }
             }
             complete::Resolved::Column { schema, table, column, .. } => {
-                let object = lookup(&schema, &table)?;
+                let object = self.objects.iter().find(|object| {
+                    object.connection_id == target.connection_id
+                        && object.database == target.database
+                        && object.schema.eq_ignore_ascii_case(&schema)
+                        && object.name.eq_ignore_ascii_case(&table)
+                })?;
                 let key = column_key(&object.connection_id, &object.database, &object.schema, &object.name);
-                Some(ObjectInfo {
+                ObjectInfo {
                     schema: object.schema.clone(),
                     name: object.name.clone(),
                     kind: object.kind.clone(),
                     comment: self.comments.get(&key).cloned().unwrap_or_default(),
                     columns: self.columns.get(&key).cloned().unwrap_or_default(),
                     column: Some(column.name),
-                })
+                }
             }
+        };
+        // 主键留在列元数据里；外键按已读到的清单标到这一张表的列上。
+        for column in &mut info.columns {
+            column.foreign_key = self.column_is_fk(&target.connection_id, &target.database, &info.schema, &info.name, &column.name);
         }
+        Some(info)
     }
 
     pub fn has_token(&self, id: &str, token: TaskToken) -> bool {
@@ -1296,6 +1318,25 @@ impl Desk {
         self.objects.is_empty() && self.tree_error.is_empty()
     }
 
+    /// 已保存的列，外键标记按当前 Desk 的外键清单补上。主键留在列元数据里，不在这里推断。
+    fn marked_columns(&self, connection_id: &str, database: &str, schema: &str, table: &str) -> Vec<ColumnMeta> {
+        let mut columns = self.columns.get(&column_key(connection_id, database, schema, table)).cloned().unwrap_or_default();
+        for column in &mut columns {
+            column.foreign_key = self.column_is_fk(connection_id, database, schema, table, &column.name);
+        }
+        columns
+    }
+
+    fn column_is_fk(&self, connection_id: &str, database: &str, schema: &str, table: &str, column: &str) -> bool {
+        self.foreign_keys.iter().any(|key| {
+            key.connection_id == connection_id
+                && key.database == database
+                && key.from_schema.eq_ignore_ascii_case(schema)
+                && key.from_table.eq_ignore_ascii_case(table)
+                && key.from_columns.iter().any(|name| name.eq_ignore_ascii_case(column))
+        })
+    }
+
     fn sources_for(&self, target: Option<&Target>) -> Vec<CompletionSource> {
         let Some(target) = target else {
             return Vec::new();
@@ -1310,11 +1351,7 @@ impl Desk {
                 } else {
                     format!("{}.{}", object.schema, object.name)
                 },
-                columns: self
-                    .columns
-                    .get(&column_key(&object.connection_id, &object.database, &object.schema, &object.name))
-                    .cloned()
-                    .unwrap_or_default(),
+                columns: self.marked_columns(&object.connection_id, &object.database, &object.schema, &object.name),
             })
             .collect()
     }
@@ -1773,18 +1810,23 @@ async fn read_columns(service: &Arc<Service>, connection_id: &str, table: &str) 
     Ok(sqlite_column_meta(&info.columns, &info.rows))
 }
 
-/// PRAGMA table_info 的结果按列名取 name / type / notnull；SQLite 没有列注释。
+/// PRAGMA table_info 的结果按列名取 name / type / notnull / pk；SQLite 没有列注释。
 fn sqlite_column_meta(columns: &[String], rows: &[Vec<Option<String>>]) -> Vec<ColumnMeta> {
     let find = |name: &str| columns.iter().position(|column| column.eq_ignore_ascii_case(name));
     let name_at = find("name").unwrap_or(1);
     let type_at = find("type");
     let notnull_at = find("notnull");
+    let pk_at = find("pk");
     rows.iter()
         .filter_map(|row| {
             let name = row.get(name_at).and_then(|cell| cell.clone())?;
             let type_name = type_at.and_then(|at| row.get(at).cloned().flatten()).unwrap_or_default();
             let nullable = notnull_at.and_then(|at| row.get(at).cloned().flatten()).map(|flag| flag.trim() != "1");
-            Some(ColumnMeta { name, type_name, nullable, comment: String::new() })
+            let primary = pk_at.and_then(|at| row.get(at).cloned().flatten()).is_some_and(|flag| {
+                let flag = flag.trim();
+                !flag.is_empty() && flag != "0"
+            });
+            Some(ColumnMeta { name, type_name, nullable, comment: String::new(), primary, foreign_key: false })
         })
         .collect()
 }
@@ -2613,6 +2655,38 @@ mod tests {
     }
 
     #[test]
+    fn pinned_results_can_be_renamed_and_a_blank_name_restores_the_default() {
+        let tasks = TaskBoard::new();
+        let mut desk = Desk::new();
+        desk.open_database("notes", "笔记", "sqlite", "main");
+        let ticket = ready_ticket(&mut desk, &tasks, "SELECT 'a'");
+        assert!(desk.accept_run(&tasks, &ticket, three_statement_run("run-1", "a")));
+        let pin = desk.pin_current().expect("固定");
+        assert!(desk.pinned()[0].custom_title.is_none());
+        assert!(desk.rename_pin(pin, "  订单预览  "));
+        assert_eq!(desk.pinned()[0].custom_title.as_deref(), Some("订单预览"));
+        assert!(desk.rename_pin(pin, "   "));
+        assert!(desk.pinned()[0].custom_title.is_none(), "空白标题恢复默认");
+        assert!(!desk.rename_pin(pin + 3, "没有这一页"));
+    }
+
+    #[test]
+    fn sqlite_column_meta_reads_the_primary_key_flag() {
+        let columns = ["cid", "name", "type", "notnull", "dflt_value", "pk"].map(str::to_owned).to_vec();
+        let rows = vec![
+            vec![Some("0".into()), Some("id".into()), Some("INTEGER".into()), Some("1".into()), None, Some("1".into())],
+            vec![Some("1".into()), Some("name".into()), Some("TEXT".into()), Some("0".into()), None, Some("0".into())],
+        ];
+        let meta = sqlite_column_meta(&columns, &rows);
+        assert!(meta[0].primary);
+        assert_eq!(meta[0].nullable, Some(false));
+        assert!(!meta[1].primary);
+        assert_eq!(meta[1].nullable, Some(true));
+        assert!(!meta[0].foreign_key);
+        assert!(meta[0].comment.is_empty());
+    }
+
+    #[test]
     fn switching_between_current_and_messages_keeps_the_grid_binding() {
         let tasks = TaskBoard::new();
         let mut desk = Desk::new();
@@ -2751,7 +2825,9 @@ mod tests {
         ]);
         let scope = desk.completion_scope().expect("有目标");
         let public = scope.sources.iter().find(|source| source.label == "public.orders").expect("public.orders");
-        assert_eq!(public.columns, vec![ColumnMeta::named("id"), ColumnMeta::named("customer_id")]);
+        let mut customer = ColumnMeta::named("customer_id");
+        customer.foreign_key = true;
+        assert_eq!(public.columns, vec![ColumnMeta::named("id"), customer]);
         let archive = scope.sources.iter().find(|source| source.label == "archive.orders").expect("archive.orders");
         assert_eq!(archive.columns, vec![ColumnMeta::named("id"), ColumnMeta::named("archived_at")]);
         assert_eq!(scope.foreign_keys.len(), 1, "只保留当前连接的外键");
@@ -2762,6 +2838,13 @@ mod tests {
         let labels: Vec<String> = planned.iter().map(|entry| entry.label.clone()).collect();
         assert!(labels.contains(&"customer_id".to_owned()), "{labels:?}");
         assert!(!labels.contains(&"archived_at".to_owned()), "{labels:?}");
+
+        let sql = "select customer_id from public.orders";
+        let at = sql.find("public.orders").unwrap() + "public.".len() + 1;
+        let info = desk.object_info_at(sql, at).expect("表名解析到对象");
+        assert_eq!(info.schema, "public");
+        assert!(info.columns.iter().any(|column| column.name == "id" && !column.foreign_key));
+        assert!(info.columns.iter().any(|column| column.name == "customer_id" && column.foreign_key), "{:?}", info.columns);
     }
 
     #[test]

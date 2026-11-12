@@ -83,12 +83,15 @@ pub struct CompletionEntry {
 }
 
 /// 一列的元数据。type_name / comment 读不到时为空串，nullable 读不到时为 None，不编造。
+/// primary / foreign_key 只在目录或外键清单确实标到时为真。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ColumnMeta {
     pub name: String,
     pub type_name: String,
     pub nullable: Option<bool>,
     pub comment: String,
+    pub primary: bool,
+    pub foreign_key: bool,
 }
 
 impl ColumnMeta {
