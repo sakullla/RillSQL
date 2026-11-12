@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use super::commands;
 use super::exec::{self, run_steps};
 use super::model::{
-    fk_actions, Action, AttachedDatabase, Column, ColumnDraft, DependentSql, DomainState, Engine, ForeignKey, IncomingForeignKey, Index, IndexColumn, IndexColumnDraft, Request,
+    fk_actions, Action, AttachedDatabase, Column, ColumnDraft, DependentSql, DomainState, Engine, ForeignKey, ForeignKeyDraft, IncomingForeignKey, Index, IndexColumn, IndexColumnDraft, Request,
     SequenceState, Snapshot, Step, StepStatus,
 };
 use super::plan::plan;
@@ -896,6 +896,33 @@ async fn rebuild_restores_live_foreign_keys_and_enable_updates_the_session() {
 }
 
 #[test]
+#[test]
+fn sqlserver_foreign_key_qualifies_a_non_default_schema() {
+    let mut child = Snapshot::bare(Engine::Sqlserver, "app", "dbo", "orders");
+    child.columns = vec![column("id", "int", false, true), column("customer_id", "int", true, false)];
+    let mut parent = Snapshot::bare(Engine::Sqlserver, "app", "sales", "customers");
+    parent.columns = vec![column("id", "int", false, true)];
+    child.reference = Some(Box::new(parent));
+    let planned = plan(
+        &child,
+        &Action::CreateForeignKey {
+            table: "orders".to_owned(),
+            foreign_key: ForeignKeyDraft {
+                name: "fk_orders_customer".to_owned(),
+                columns: vec!["customer_id".to_owned()],
+                ref_schema: "sales".to_owned(),
+                ref_table: "customers".to_owned(),
+                ref_columns: vec!["id".to_owned()],
+                on_delete: "NO ACTION".to_owned(),
+                on_update: "NO ACTION".to_owned(),
+            },
+        },
+    );
+    assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+    let sql = planned.steps.iter().map(|step| step.sql.as_str()).collect::<Vec<_>>().join("\n");
+    assert!(sql.contains("ALTER TABLE [dbo].[orders] ADD CONSTRAINT [fk_orders_customer] FOREIGN KEY ([customer_id]) REFERENCES [sales].[customers] ([id])"), "{sql}");
+}
+
 fn sqlserver_alters_use_tsql_forms_without_inline_defaults() {
     // 快照带 IDENTITY 主键、有具名默认约束的列。
     let mut snapshot = Snapshot::bare(Engine::Sqlserver, "rillsql", "dbo", "notes");

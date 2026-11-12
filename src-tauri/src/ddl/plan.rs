@@ -1636,7 +1636,7 @@ fn validate_fk(snapshot: &Snapshot, foreign_key: &ForeignKeyDraft) -> Vec<String
         seen.push(name.clone());
     }
     if let Some(target) = snapshot.reference.as_ref() {
-        if target.name != foreign_key.ref_table || (!foreign_key.ref_schema.is_empty() && target.schema != foreign_key.ref_schema && snapshot.engine == Engine::Postgres) {
+        if target.name != foreign_key.ref_table || (!foreign_key.ref_schema.is_empty() && target.schema != foreign_key.ref_schema && matches!(snapshot.engine, Engine::Postgres | Engine::Sqlserver)) {
             blocked.push("目标表和预检查读到的表不一致。".to_owned());
         }
         for (local, remote) in foreign_key.columns.iter().zip(foreign_key.ref_columns.iter()) {
@@ -1723,7 +1723,7 @@ fn create_statement(
     for key in foreign_keys {
         let cols = key.columns.iter().map(|name| quote_ident(engine, name)).collect::<Vec<_>>().join(", ");
         let refs = key.ref_columns.iter().map(|name| quote_ident(engine, name)).collect::<Vec<_>>().join(", ");
-        let ref_name = if engine == Engine::Postgres && !key.ref_schema.is_empty() {
+        let ref_name = if matches!(engine, Engine::Postgres | Engine::Sqlserver) && !key.ref_schema.is_empty() {
             format!("{}.{}", quote_ident(engine, &key.ref_schema), quote_ident(engine, &key.ref_table))
         } else {
             quote_ident(engine, &key.ref_table)
@@ -1812,7 +1812,7 @@ fn add_fk_sql(snapshot: &Snapshot, table: &str, foreign_key: &ForeignKeyDraft) -
     let qualified = qualified_table(snapshot.engine, &snapshot.database, &snapshot.schema, table)?;
     let cols = foreign_key.columns.iter().map(|name| quote_ident(snapshot.engine, name)).collect::<Vec<_>>().join(", ");
     let refs = foreign_key.ref_columns.iter().map(|name| quote_ident(snapshot.engine, name)).collect::<Vec<_>>().join(", ");
-    let ref_table = if snapshot.engine == Engine::Postgres {
+    let ref_table = if snapshot.engine == Engine::Postgres || (snapshot.engine == Engine::Sqlserver && !foreign_key.ref_schema.is_empty()) {
         qualified_table(snapshot.engine, &snapshot.database, &foreign_key.ref_schema, &foreign_key.ref_table)?
     } else if matches!(snapshot.engine, Engine::Mysql | Engine::Mariadb) {
         qualified_table(snapshot.engine, &snapshot.database, "", &foreign_key.ref_table)?
