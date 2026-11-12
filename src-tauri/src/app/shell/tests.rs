@@ -4532,7 +4532,12 @@ fn non_object_rows_never_borrow_another_object() {
 
     assert!(model.open_nav_menu(&schema));
     let ids: Vec<&str> = model.menu.as_ref().expect("菜单").items.iter().map(|item| item.id).collect();
-    assert_eq!(ids, vec!["tree-new-query", "tree-copy-name", "tree-refresh-node"], "范围行只有自己的动作");
+    assert_eq!(
+        ids,
+        vec!["tree-new-query", "tree-copy-name", "tree-refresh-node", "tree-create-table", "open-admin"],
+        "范围行只有自己的动作，外加新建表和管理页"
+    );
+    assert!(!ids.iter().any(|id| matches!(*id, "tree-open-data" | "tree-insert-select" | "tree-drop-object")));
     let tabs = model.tabs.len();
     let _ = model.dispatch("tree-open-data");
     assert_eq!(model.tabs.len(), tabs, "范围行不能打开上一张表");
@@ -4560,7 +4565,7 @@ fn non_object_rows_never_borrow_another_object() {
 
     // 对象行仍然拿到完整的对象菜单。
     assert!(model.open_nav_menu(&orders_id));
-    assert!(model.menu.as_ref().unwrap().items.iter().any(|item| item.id == "tree-insert-select"));
+    assert!(crate::app::shell::menus::flatten_items(&model.menu.as_ref().unwrap().items).iter().any(|item| item.id == "tree-insert-select"));
     let _ = model.dispatch("tree-copy-name");
     assert_eq!(model.copied, "public.orders");
 }
@@ -4587,7 +4592,7 @@ fn document_objects_use_documents_not_relational_pages() {
     let collection = crate::catalog::hierarchy::object_node_id("docs", "app", "", &users);
 
     assert!(model.open_nav_menu(&collection));
-    let items = model.menu.as_ref().expect("菜单").items.clone();
+    let items: Vec<_> = crate::app::shell::menus::flatten_items(&model.menu.as_ref().expect("菜单").items).into_iter().cloned().collect();
     let open_data = items.iter().find(|item| item.id == "tree-open-data").expect("数据入口");
     assert!(open_data.enabled, "集合仍然可以打开文档");
     let structure = items.iter().find(|item| item.id == "open-structure").expect("结构入口");
@@ -6547,4 +6552,59 @@ fn connections_empty_state_wraps_inside_its_panel_at_every_width(cx: &mut gpui_k
         assert!(f32::from(detail.size.width) <= 360.5, "{width}: 说明最宽 360");
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[test]
+fn submenu_escape_returns_to_the_parent_and_widths_stay_in_range() {
+    let (mut model, orders) = pg_orders_model();
+    assert!(model.open_nav_menu(&orders));
+    let sql = model.menu.as_ref().unwrap().items.iter().position(|item| item.id == "submenu-sql").expect("模板子菜单");
+    model.menu.as_mut().unwrap().index = sql;
+    assert!(model.key(NavKey::ArrowRight).is_none());
+    assert!(model.menu.as_ref().unwrap().submenu.is_some());
+    assert_eq!(model.menu.as_ref().unwrap().current().map(|item| item.id), Some("tree-template-insert"));
+    model.menu.as_mut().unwrap().hover(0);
+    assert!(model.menu.as_ref().unwrap().submenu.is_none(), "悬停没有子菜单的项要收起子菜单");
+    model.menu.as_mut().unwrap().index = sql;
+    let _ = model.menu.as_mut().unwrap().open_submenu();
+    assert!(model.key(NavKey::ArrowLeft).is_none());
+    assert!(model.menu.as_ref().unwrap().submenu.is_none());
+    assert!(model.menu.is_some(), "左方向键只收子菜单");
+    let _ = model.menu.as_mut().unwrap().open_submenu();
+    assert!(model.key(NavKey::Escape).is_none());
+    assert!(model.menu.is_some() && model.menu.as_ref().unwrap().submenu.is_none(), "Esc 先收子菜单");
+    assert!(model.key(NavKey::Escape).is_none());
+    assert!(model.menu.is_none(), "子菜单关上之后 Esc 才关整个菜单");
+
+    model.set_sidebar_width(12.);
+    assert_eq!(model.sidebar_width, super::layout::SIDEBAR_MIN);
+    model.set_sidebar_width(900.);
+    assert_eq!(model.sidebar_width, super::layout::SIDEBAR_MAX);
+    model.reset_sidebar_width();
+    assert_eq!(model.sidebar_width, super::layout::SIDEBAR_DEFAULT);
+    model.viewport_width = 1360;
+    model.set_history_preview_width(10.);
+    assert_eq!(model.history_preview_width, super::layout::HISTORY_PREVIEW_MIN);
+    model.set_history_preview_width(900.);
+    assert_eq!(model.history_preview_width, super::layout::HISTORY_PREVIEW_MAX);
+    let narrow = super::layout::clamp_history_preview(400., 900.);
+    assert!(900. - narrow >= super::layout::HISTORY_LIST_MIN - 0.5, "并排时列表至少 240");
+}
+
+#[gpui_kit::test]
+fn switching_to_settings_restores_focus_on_the_workbench_content(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::Focusable as _;
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-focus-restore-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| view.perform("settings", cx));
+        window.render_frame(cx);
+        let handle = view.read(cx).focus_handle(cx);
+        assert!(handle.is_focused(window), "切到设置页后焦点应落在 #workbench-content");
+        assert_eq!(view.read(cx).model.shell.page, AppPage::Settings);
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

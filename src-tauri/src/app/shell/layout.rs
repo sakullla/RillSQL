@@ -7,6 +7,32 @@ use crate::ui::kit::Metrics;
 /// 38px 图标加两侧留白与选中标记，52 才不会挤掉内容列。
 pub const RAIL_WIDTH: i32 = 52;
 
+/// 对象树侧栏宽度。双击拖拽条回到默认值。
+pub const SIDEBAR_DEFAULT: f32 = 234.;
+pub const SIDEBAR_MIN: f32 = 200.;
+pub const SIDEBAR_MAX: f32 = 480.;
+
+/// 历史页并排预览宽度。左侧列表至少留 240；内容区窄于 820 时改为上下堆叠。
+pub const HISTORY_PREVIEW_DEFAULT: f32 = 360.;
+pub const HISTORY_PREVIEW_MIN: f32 = 260.;
+pub const HISTORY_PREVIEW_MAX: f32 = 520.;
+pub const HISTORY_LIST_MIN: f32 = 240.;
+pub const HISTORY_STACK_BELOW: f32 = 820.;
+
+pub fn clamp_sidebar(width: f32) -> f32 {
+    width.clamp(SIDEBAR_MIN, SIDEBAR_MAX)
+}
+
+/// 并排时预览不能把列表挤到 240 以下；堆叠时只把记住的宽度留在 260–520。
+pub fn clamp_history_preview(requested: f32, content_width: f32) -> f32 {
+    let max = if content_width >= HISTORY_STACK_BELOW {
+        (content_width - HISTORY_LIST_MIN).clamp(HISTORY_PREVIEW_MIN, HISTORY_PREVIEW_MAX)
+    } else {
+        HISTORY_PREVIEW_MAX
+    };
+    requested.clamp(HISTORY_PREVIEW_MIN, max)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidebarMode {
     Docked,
@@ -29,12 +55,17 @@ pub struct ChromeLayout {
 }
 
 pub fn layout_for(width: i32, sidebar_open: bool) -> ChromeLayout {
+    layout_with_sidebar(width, sidebar_open, SIDEBAR_DEFAULT as i32)
+}
+
+pub fn layout_with_sidebar(width: i32, sidebar_open: bool, sidebar_width: i32) -> ChromeLayout {
     // 活动栏宽度不随窗口变化：变窄会让图标和选中标记被裁掉，反而挤压内容列。
     let activity_width = RAIL_WIDTH;
+    let sidebar_width = clamp_sidebar(sidebar_width as f32) as i32;
     let (sidebar_width, sidebar_mode) = if width <= 640 {
-        if sidebar_open { (234, SidebarMode::Overlay) } else { (0, SidebarMode::Hidden) }
+        if sidebar_open { (sidebar_width, SidebarMode::Overlay) } else { (0, SidebarMode::Hidden) }
     } else if sidebar_open {
-        (234, SidebarMode::Docked)
+        (sidebar_width, SidebarMode::Docked)
     } else {
         (0, SidebarMode::Hidden)
     };
@@ -93,7 +124,11 @@ impl PaintedFrame {
 }
 
 pub fn painted_frame(viewport: i32, sidebar_open: bool, pad: i32) -> PaintedFrame {
-    let layout = layout_for(viewport, sidebar_open);
+    painted_frame_with_sidebar(viewport, sidebar_open, pad, SIDEBAR_DEFAULT as i32)
+}
+
+pub fn painted_frame_with_sidebar(viewport: i32, sidebar_open: bool, pad: i32, sidebar_width: i32) -> PaintedFrame {
+    let layout = layout_with_sidebar(viewport, sidebar_open, sidebar_width);
     let pad = pad.max(0);
     let body_width = (viewport - pad * 2).max(0);
     let sidebar_in_flex = layout.sidebar_mode == SidebarMode::Docked;
@@ -163,6 +198,17 @@ mod tests {
         assert_eq!(layout_for(640, true).sidebar_mode, SidebarMode::Overlay);
         assert_eq!(layout_for(900, false).sidebar_mode, SidebarMode::Hidden);
         assert_eq!(layout_for(1360, true).sidebar_mode, SidebarMode::Docked);
+        assert_eq!(clamp_sidebar(10.), SIDEBAR_MIN);
+        assert_eq!(clamp_sidebar(900.), SIDEBAR_MAX);
+        assert_eq!(clamp_sidebar(SIDEBAR_DEFAULT), SIDEBAR_DEFAULT);
+        assert_eq!(clamp_history_preview(10., 1360.), HISTORY_PREVIEW_MIN);
+        assert_eq!(clamp_history_preview(900., 1360.), HISTORY_PREVIEW_MAX);
+        // 内容区 500 时并排会把列表挤没，钳制仍把记住的宽度留在上限内。
+        assert_eq!(clamp_history_preview(400., 500.), 400.);
+        let side = layout_with_sidebar(900, true, 480);
+        assert_eq!(side.sidebar_width, 480);
+        assert!(side.content_width >= 160, "{}", side.content_width);
+        assert_eq!(side.overflow, 0);
     }
 
     #[test]

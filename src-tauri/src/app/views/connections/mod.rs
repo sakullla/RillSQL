@@ -195,6 +195,24 @@ impl ConnectionPage {
         }
     }
 
+    pub fn clear_list_filters(&mut self) {
+        self.filter_text.clear();
+        self.filter_engine = None;
+        self.filter_env.clear();
+    }
+
+    /// 环境筛选在“全部”、内置环境和自定义标签之间循环。
+    pub fn cycle_env_filter(&mut self, tags: &[crate::connections::model::EnvTag]) {
+        let mut options = vec![String::new(), "dev".into(), "test".into(), "prod".into(), "local".into()];
+        for tag in tags {
+            if !options.iter().any(|id| id == &tag.id) {
+                options.push(tag.id.clone());
+            }
+        }
+        let index = options.iter().position(|id| id == &self.filter_env).unwrap_or(0);
+        self.filter_env = options[(index + 1) % options.len()].clone();
+    }
+
     pub fn cycle_engine_filter(&mut self) {
         let engines = engines();
         self.filter_engine = match self.filter_engine {

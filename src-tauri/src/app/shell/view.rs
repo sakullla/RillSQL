@@ -18,6 +18,8 @@ use crate::app::views::mongo::MongoPane;
 use crate::app::views::query::{requires_active_query, QueryPane, SyncEffect, TabSnap};
 use crate::app::views::redis::RedisPane;
 use crate::app::views::structure::StructurePane;
+use crate::app::model::ObjectTarget;
+use crate::app::views::diagram::DiagramOpen;
 use crate::app::{AppPage, Effect};
 use crate::connections::model::Engine;
 use crate::state::Platform;
@@ -71,6 +73,12 @@ pub struct Workbench {
     pub(super) ddl_editor: Option<(u64, Entity<gpui_kit::component::input::EditorState>)>,
     /// 对象树列表的滚动；跳转定义后把选中行滚进可见区。
     pub(super) explorer_scroll: gpui_kit::ScrollHandle,
+    /// 切到次级页面后，下一帧把键盘焦点交回工作区根。
+    pub(super) restore_pending: bool,
+    pub(super) seen_page: AppPage,
+    admin_link: Option<(String, bool)>,
+    /// 历史预览的只读 SQL 编辑器，按条目 id 与原文重建。
+    pub(super) history_editor: Option<(String, Entity<gpui_kit::component::input::EditorState>)>,
 }
 
 impl Workbench {
@@ -137,8 +145,8 @@ impl Workbench {
             applied_redis: None,
             applied_mongo: None,
             services,
-            focus: cx.focus_handle(),
-            nav_focus: cx.focus_handle(),
+            focus: cx.focus_handle().tab_stop(true),
+            nav_focus: cx.focus_handle().tab_stop(true),
             close_hooked: false,
             booted: false,
             boot,
@@ -153,6 +161,10 @@ impl Workbench {
             connected_seen: std::collections::BTreeSet::new(),
             ddl_editor: None,
             explorer_scroll: gpui_kit::ScrollHandle::new(),
+            restore_pending: false,
+            seen_page: AppPage::Workspace,
+            admin_link: None,
+            history_editor: None,
         }
     }
 
@@ -697,10 +709,14 @@ impl Workbench {
                 pane.set_locale(locale);
                 pane.bind_item(target, &item);
             }),
-            WorkTool::Admin => self.admin.update(cx, |pane, _| {
-                pane.set_locale(locale);
-                pane.bind_item(target, &item);
-            }),
+            WorkTool::Admin => {
+                // 重新绑定会清掉探测闩；允许本帧按当前连接状态再探一次。
+                self.admin_link = None;
+                self.admin.update(cx, |pane, _| {
+                    pane.set_locale(locale);
+                    pane.bind_item(target, &item);
+                });
+            }
             WorkTool::Query | WorkTool::Redis | WorkTool::Mongo => {}
         }
     }
@@ -1246,6 +1262,8 @@ impl Workbench {
 
     fn measure(&mut self, window: &Window) {
         let width = f32::from(window.viewport_size().width) as i32;
+        let height = f32::from(window.viewport_size().height) as i32;
+        self.model.viewport_height = height.max(0);
         if width <= 0 {
             return;
         }
@@ -1297,6 +1315,7 @@ impl Workbench {
                             let _ = this.model.dispatch("conn-refresh");
                             let _ = this.model.dispatch("history-refresh");
                             let _ = this.model.dispatch("nav-refresh");
+                            this.load_env_tags(cx);
                             this.persist_if_needed();
                             cx.notify();
                         })
@@ -1316,7 +1335,7 @@ impl Workbench {
     }
 
     fn spawn_job(&mut self, job: PendingJob, cx: &mut Context<Self>) {
-        let owner: &'static str = match job {
+        let owner: &'static str = match &job {
             PendingJob::RefreshHistory
             | PendingJob::SaveNamed
             | PendingJob::RenameSaved
@@ -1330,7 +1349,10 @@ impl Workbench {
         } else {
             self.model.prepare_list_token(&self.services.tasks)
         };
-        let request = job_request(&self.model, job, token);
+        let request = job_request(&self.model, job.clone(), token);
+        if matches!(job, PendingJob::SaveNamed) {
+            self.model.preview_save = None;
+        }
         let services = Arc::clone(&self.services);
         let rx = jobs::spawn_job(services, request);
         let view = cx.entity().downgrade();
@@ -1677,6 +1699,83 @@ impl Workbench {
         cx.notify();
     }
 
+    fn load_env_tags(&mut self, cx: &mut Context<Self>) {
+        let services = Arc::clone(&self.services);
+        let view = cx.entity().downgrade();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        jobs::runtime().spawn(async move {
+            let tags = services.connections.list_tags().await.unwrap_or_default();
+            let _ = tx.send(tags);
+        });
+        cx.spawn(async move |_, cx| {
+            if let Ok(tags) = rx.await {
+                cx.update(|cx| {
+                    if let Some(view) = view.upgrade() {
+                        view.update(cx, |this, cx| {
+                            this.model.env_tags = tags;
+                            cx.notify();
+                        });
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn consume_pending_create(&mut self, cx: &mut Context<Self>) {
+        let Some(spec) = self.model.pending_create.take() else { return };
+        let Some(target) = parse_target(&spec) else { return };
+        self.structure.update(cx, |pane, _| pane.begin_create(target));
+    }
+
+    fn adopt_created_table(&mut self, target: GridTarget) {
+        let spec = ObjectTarget::new(
+            target.connection_id.clone(),
+            target.connection_name.clone(),
+            target.database.clone(),
+            target.schema.clone(),
+            target.table.clone(),
+            target.engine.clone(),
+            target.environment.clone(),
+        )
+        .spec();
+        self.model.adopt_created_table(spec);
+        self.applied_tool = None;
+    }
+
+    fn consume_diagram_open(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = self.diagram.update(cx, |pane, _| pane.take_open()) else { return };
+        self.open_diagram_target(open);
+    }
+
+    fn open_diagram_target(&mut self, open: DiagramOpen) {
+        let row = self.model.connections.rows.iter().find(|row| row.saved.id == open.connection_id);
+        let name = row.map(|row| row.saved.name.clone()).unwrap_or_else(|| open.connection_id.clone());
+        let engine = row.map(|row| row.saved.engine.as_str().to_owned()).unwrap_or_else(|| "postgres".into());
+        let env = row.map(|row| row.saved.env.clone()).unwrap_or_default();
+        let spec = ObjectTarget::new(open.connection_id, name, open.database, open.schema, open.table, engine, env).spec();
+        if open.structure {
+            self.model.open_item(WorkItemKind::Structure, spec);
+        } else {
+            self.model.open_item(WorkItemKind::Table, spec);
+        }
+    }
+
+    fn note_admin_link(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.model.active_tab().and_then(|tab| tab.connection_id.clone()).filter(|id| !id.is_empty()) else {
+            return;
+        };
+        if self.model.tool != WorkTool::Admin && self.model.shell.page != AppPage::Structure {
+            return;
+        }
+        let connected = self.model.connections.status.get(&id).copied() == Some(crate::app::views::connections::LinkStatus::Connected);
+        if self.admin_link.as_ref().is_some_and(|(seen, state)| seen == &id && *state == connected) {
+            return;
+        }
+        self.admin_link = Some((id, connected));
+        self.admin.update(cx, |pane, cx| pane.note_connection(connected, cx));
+    }
+
     fn apply_sqlite_path(&mut self, path: std::path::PathBuf) {
         self.model.shell.note_opened(path.clone());
         let mut draft = blank_draft(Engine::Sqlite);
@@ -1709,6 +1808,10 @@ impl Render for Workbench {
         // 结构页删除表成功后，对象树也要跟着变。
         if let Some(target) = self.structure.update(cx, |pane, _| pane.take_dropped()) {
             self.model.table_dropped(&target.connection_id, &target.database, &target.schema, &target.table);
+            self.pump_nav(cx);
+        }
+        if let Some(target) = self.structure.update(cx, |pane, _| pane.take_created()) {
+            self.adopt_created_table(target);
             self.pump_nav(cx);
         }
         self.sync_view_settings(cx);
@@ -1747,10 +1850,13 @@ impl Render for Workbench {
         self.model.redis_running = self.redis.read(cx).running();
         self.model.mongo_running = self.mongo.read(cx).running();
         self.ensure_diagram(cx);
+        self.consume_pending_create(cx);
+        self.consume_diagram_open(cx);
         self.sync_grid_flags(cx);
         self.refresh_exchange(cx);
         self.refresh_compare(cx);
         self.refresh_tree_on_connect(cx);
+        self.note_admin_link(cx);
         self.render_root(window, cx)
     }
 }
@@ -1840,6 +1946,8 @@ pub(super) fn nav_key(key: &str) -> Option<NavKey> {
         "escape" => Some(NavKey::Escape),
         "up" => Some(NavKey::ArrowUp),
         "down" => Some(NavKey::ArrowDown),
+        "left" => Some(NavKey::ArrowLeft),
+        "right" => Some(NavKey::ArrowRight),
         "enter" => Some(NavKey::Enter),
         "home" => Some(NavKey::Home),
         "end" => Some(NavKey::End),

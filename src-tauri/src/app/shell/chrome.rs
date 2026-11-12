@@ -9,7 +9,7 @@ use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, TitleBar};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, ClickEvent, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
+    AnyElement, App, ClickEvent, Context, DragMoveEvent, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
 };
 
@@ -76,6 +76,19 @@ impl Workbench {
     // ------------------------------------------------------------ 根
 
     pub(super) fn render_root(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.seen_page != self.model.shell.page {
+            let page = self.model.shell.page;
+            self.seen_page = page;
+            if matches!(
+                page,
+                AppPage::Settings | AppPage::Connections | AppPage::History | AppPage::Compare | AppPage::Diagram | AppPage::Structure
+            ) {
+                self.restore_pending = true;
+            }
+        }
+        if std::mem::take(&mut self.restore_pending) {
+            self.restore_focus(window, cx);
+        }
         let p = Palette::of(cx);
         let entity = cx.entity();
         let page = self.model.shell.page;
@@ -131,6 +144,7 @@ impl Workbench {
                         div()
                             .id("workbench-content")
                             .test_support()
+                            .track_focus(&self.focus)
                             .flex()
                             .flex_col()
                             .flex_1()
@@ -199,27 +213,33 @@ impl Workbench {
         if key == "escape" && self.model.menu.is_none() && self.model.close_prompt.is_none() {
             if self.model.danger.is_some() {
                 self.perform("danger-cancel", cx);
+                self.restore_focus(window, cx);
                 return;
             }
             if self.model.ddl_view.as_ref().is_some_and(|view| !view.copy_only) {
                 self.perform("ddl-close", cx);
+                self.restore_focus(window, cx);
                 return;
             }
         }
         if key == "escape" && self.model.connections.confirm_delete && self.model.menu.is_none() && self.model.close_prompt.is_none() {
             self.perform("conn-delete-cancel", cx);
+            self.restore_focus(window, cx);
             return;
         }
         if key == "escape" && self.model.history.confirm_clear && self.model.menu.is_none() && self.model.close_prompt.is_none() {
             self.perform("history-clear-cancel", cx);
+            self.restore_focus(window, cx);
             return;
         }
         if key == "escape" && self.model.history.confirm_delete && self.model.menu.is_none() && self.model.close_prompt.is_none() {
             self.perform("saved-delete-cancel", cx);
+            self.restore_focus(window, cx);
             return;
         }
         if key == "escape" && self.model.exchange_open && self.model.menu.is_none() && !self.model.shell.palette_open {
             self.model.exchange_open = false;
+            self.restore_focus(window, cx);
             cx.notify();
             return;
         }
@@ -253,8 +273,16 @@ impl Workbench {
             return;
         }
         if matches!(nav, super::menus::NavKey::Enter) {
-            if let Some(menu) = &self.model.menu {
-                let id = menu.current().map(|item| item.id.to_owned());
+            let opens = self.model.menu.as_ref().is_some_and(|menu| {
+                menu.submenu.is_none() && menu.active_parent().is_some_and(|item| !item.children.is_empty() && item.enabled)
+            });
+            if opens {
+                let _ = self.model.key(nav);
+                cx.notify();
+                return;
+            }
+            if self.model.menu.is_some() {
+                let id = self.model.menu.as_ref().and_then(|menu| menu.current().map(|item| item.id.to_owned()));
                 self.model.menu = None;
                 self.model.shell.focus = self.model.menu_return;
                 if let Some(id) = id {
@@ -291,6 +319,8 @@ impl Workbench {
     fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.model.shell.focus {
             FocusTarget::Sidebar if self.model.shell.sidebar_open => window.focus(&self.nav_focus, cx),
+            // 查询页的结果网格属于 QueryPane。公开焦点入口是编辑器；表格页才回到共享网格。
+            FocusTarget::Grid if self.model.tool == super::model::WorkTool::Query => self.query.update(cx, |pane, _| pane.request_focus()),
             FocusTarget::Grid => self.table.update(cx, |pane, _| pane.request_focus()),
             FocusTarget::Editor => self.query.update(cx, |pane, _| pane.request_focus()),
             _ => window.focus(&self.focus, cx),
@@ -424,7 +454,7 @@ impl Workbench {
     fn explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let m = self.metrics();
-        let width = self.model.layout().sidebar_width.max(220) as f32;
+        let width = self.model.layout().sidebar_width as f32;
         let filter = self.input_for(DraftField::ObjectFilter, &self.model.text("ui.explorer.filterObjects"), false, window, cx);
         // 对象索引来自模型里的同一份快照；连接列表保持完整，连接筛选只属于连接页。
         let rows: Vec<_> = self.model.connections.rows.clone();
@@ -541,6 +571,7 @@ impl Workbench {
             self.explorer_scroll.scroll_to_item(index);
             self.model.reveal_node = None;
         }
+        let dragging = self.model.sidebar_dragging;
         div()
             .id("sidebar")
             .test_support()
@@ -551,29 +582,62 @@ impl Workbench {
             .w(px(width))
             .h_full()
             .flex()
-            .flex_col()
             .bg(p.chrome)
             .border_l_1()
             .border_color(p.line)
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<kit::ResizeDrag>, _, cx| {
+                if event.drag(cx).key.as_ref() != "sidebar-resize" {
+                    return;
+                }
+                let width = f32::from(event.event.position.x - event.bounds.left());
+                this.model.set_sidebar_width(width);
+                this.model.sidebar_dragging = true;
+                cx.notify();
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                if this.model.sidebar_dragging {
+                    this.model.sidebar_dragging = false;
+                    cx.notify();
+                }
+            }))
             .child(
                 div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
                     .flex()
-                    .items_center()
-                    .justify_between()
-                    .h(px(m.tabs_h))
-                    .pl(px(14.))
-                    .pr(px(6.))
-                    .child(kit::eyebrow(self.t("shell.sidebar.explorer"), &p))
+                    .flex_col()
                     .child(
                         div()
                             .flex()
-                            .gap(px(2.))
-                            .child(kit::icon_button("explorer-refresh", IconName::RefreshCw, self.t("query.tree.refresh"), act("refresh-tree", cx)).xsmall())
-                            .child(kit::icon_button("explorer-add", IconName::Plus, self.t("common.newConnection"), act("new-connection", cx)).xsmall()),
-                    ),
+                            .items_center()
+                            .justify_between()
+                            .h(px(m.tabs_h))
+                            .pl(px(14.))
+                            .pr(px(6.))
+                            .child(kit::eyebrow(self.t("shell.sidebar.explorer"), &p))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(2.))
+                                    .child(kit::icon_button("explorer-refresh", IconName::RefreshCw, self.t("query.tree.refresh"), act("refresh-tree", cx)).xsmall())
+                                    .child(kit::icon_button("explorer-add", IconName::Plus, self.t("common.newConnection"), act("new-connection", cx)).xsmall()),
+                            ),
+                    )
+                    .child(div().px(px(10.)).pb(px(8.)).child(filter.prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)))
+                    .child(list),
             )
-            .child(div().px(px(10.)).pb(px(8.)).child(filter.prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)))
-            .child(list)
+            .child({
+                let entity = cx.entity().downgrade();
+                kit::resize_handle("sidebar-resize", self.t("shell.sidebar.explorer"), dragging, &p, move |_, _, cx| {
+                    if let Some(entity) = entity.upgrade() {
+                        entity.update(cx, |this, cx| {
+                            this.model.reset_sidebar_width();
+                            cx.notify();
+                        });
+                    }
+                })
+            })
             .into_any_element()
     }
 
@@ -1039,20 +1103,42 @@ impl Workbench {
                     .unwrap_or_default();
                 let name = tab.connection_name.clone().unwrap_or_default();
                 let database = tab.database.clone().unwrap_or_default();
-                div()
-                    .id("status-target")
+                kit::interactive_states(div().id("status-target"), &p, false)
                     .test_support()
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(self.t("ui.status.noTarget"))
                     .flex()
                     .items_center()
                     .gap(px(6.))
                     .min_w(px(0.))
                     .max_w(px(target_max))
+                    .rounded(px(Radius::CONTROL))
+                    .px(px(4.))
                     .child(kit::engine_badge(&engine, 14.))
                     .child(div().min_w(px(0.)).truncate().child(SharedString::from(if database.is_empty() { name } else { format!("{name} / {database}") })))
                     .children(self.env_pill(&env, &p))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.perform("status-target", cx);
+                    this.restore_focus(window, cx);
+                }))
                     .into_any_element()
             }
-            _ => div().flex().items_center().gap(px(6.)).child(kit::status_dot(p.line_strong)).child(self.t("ui.status.noTarget")).into_any_element(),
+            _ => kit::interactive_states(div().id("status-target"), &p, false)
+                .test_support()
+                .role(gpui_kit::Role::Button)
+                .aria_label(self.t("ui.status.noTarget"))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .rounded(px(Radius::CONTROL))
+                .px(px(4.))
+                .child(kit::status_dot(p.line_strong))
+                .child(self.t("ui.status.noTarget"))
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.perform("status-target", cx);
+                    this.restore_focus(window, cx);
+                }))
+                .into_any_element(),
         };
         let notice = match self.model.notice_key {
             // 复制 DDL 失败的原因保留原文，显示时按当前语言给出。
@@ -1086,7 +1172,20 @@ impl Workbench {
             .child(target)
             .child(div().flex_1().min_w(px(0.)).truncate().child(SharedString::from(notice)))
             .when(running, |this| {
-                this.child(div().flex().items_center().gap(px(6.)).child(Spinner::new().xsmall().color(p.accent)).child(self.t("query.status.running")))
+                this.child(
+                    kit::interactive_states(div().id("status-jobs"), &p, false)
+                        .test_support()
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(self.t("query.status.running"))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .rounded(px(Radius::CONTROL))
+                        .px(px(4.))
+                        .child(Spinner::new().xsmall().color(p.accent))
+                        .child(self.t("query.status.running"))
+                        .on_click(act("status-jobs", cx)),
+                )
             })
             .child(
                 kit::interactive_states(div().id("status-locale"), &p, false)
@@ -1358,7 +1457,8 @@ impl Workbench {
                     .flex_col()
                     .gap(px(10.))
                     .child(div().flex().items_center().justify_between().child(kit::title(self.t("connections.page.title"), TypeScale::LG, &p)).child(new_button))
-                    .child(filter.prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)),
+                    .child(filter.prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true))
+                    .child(self.connection_filters(&p, cx)),
             )
             .child(list)
             .child(
@@ -1451,11 +1551,18 @@ impl Workbench {
         }
 
         let mut env_items = Vec::new();
-        for env in ["dev", "test", "prod", "local"] {
+        let mut env_ids = vec!["dev".to_owned(), "test".to_owned(), "prod".to_owned(), "local".to_owned()];
+        for tag in &self.model.env_tags {
+            if !env_ids.iter().any(|id| id == &tag.id) {
+                env_ids.push(tag.id.clone());
+            }
+        }
+        for env in env_ids {
             let selected = draft.env == env;
+            let label = self.env_text(&env);
             env_items.push((
                 SharedString::from(format!("conn-env-{env}")),
-                self.t(&format!("ui.conn.env.{env}")),
+                label,
                 selected,
                 kit::click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     if let Some(editor) = this.model.connections.editor.as_mut() {
@@ -1563,7 +1670,7 @@ impl Workbench {
                 security = security.child(kit::form_row(self.t("connections.editor.tls.caLabel"), kit::segmented_sized(ca_items, &p, self.metrics().control_h), &p));
                 if draft.ca_mode == CaMode::File {
                     let ca = self.input_for(DraftField::CaFile, "ca.pem", false, window, cx);
-                    security = security.child(kit::form_row(self.t("connections.editor.tls.caFile"), ca, &p));
+                    security = security.child(self.path_field("conn-browse-ca", "connections.editor.tls.caFile", "connections.editor.tls.browseCa", ca, DraftField::CaFile, &p, cx));
                 }
                 let cert = self.input_for(DraftField::ClientCert, "", false, window, cx);
                 let key = self.input_for(DraftField::ClientKey, "", false, window, cx);
@@ -1572,8 +1679,24 @@ impl Workbench {
                         .flex()
                         .flex_wrap()
                         .gap(px(12.))
-                        .child(div().flex_1().min_w(px(160.)).child(kit::form_row(self.t("connections.editor.tls.clientCert"), cert, &p)))
-                        .child(div().flex_1().min_w(px(160.)).child(kit::form_row(self.t("connections.editor.tls.clientKey"), key, &p))),
+                        .child(div().flex_1().min_w(px(160.)).child(self.path_field(
+                            "conn-browse-cert",
+                            "connections.editor.tls.clientCert",
+                            "connections.editor.tls.browseCert",
+                            cert,
+                            DraftField::ClientCert,
+                            &p,
+                            cx,
+                        )))
+                        .child(div().flex_1().min_w(px(160.)).child(self.path_field(
+                            "conn-browse-key",
+                            "connections.editor.tls.clientKey",
+                            "connections.editor.tls.browseKey",
+                            key,
+                            DraftField::ClientKey,
+                            &p,
+                            cx,
+                        ))),
                 );
             }
             let ssh_on = draft.ssh_on;
@@ -1638,7 +1761,15 @@ impl Workbench {
                             .flex()
                             .flex_wrap()
                             .gap(px(12.))
-                            .child(div().flex_1().min_w(px(160.)).child(kit::form_row(self.t("connections.editor.ssh.keyFile"), ssh_key, &p)))
+                            .child(div().flex_1().min_w(px(160.)).child(self.path_field(
+                                "conn-browse-ssh",
+                                "connections.editor.ssh.keyFile",
+                                "connections.editor.ssh.browseKey",
+                                ssh_key,
+                                DraftField::SshKey,
+                                &p,
+                                cx,
+                            )))
                             .child(div().flex_1().min_w(px(160.)).child(kit::form_row(self.t("ui.conn.passphrase"), passphrase, &p))),
                     );
                 } else {
@@ -1747,6 +1878,82 @@ impl Workbench {
                     .child(div().max_w(px(720.)).min_w(px(0.)).mx_auto().child(footer)),
             )
             .into_any_element()
+    }
+
+    fn connection_filters(&mut self, _p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let engine = self
+            .model
+            .connections
+            .filter_engine
+            .map(|engine| kit::engine_label(engine.as_str()).to_owned())
+            .unwrap_or_else(|| self.model.text("connections.filter.engine"));
+        let env = if self.model.connections.filter_env.is_empty() {
+            self.t("connections.filter.env")
+        } else {
+            self.env_text(&self.model.connections.filter_env)
+        };
+        let active = self.model.connections.filter_engine.is_some() || !self.model.connections.filter_env.is_empty() || !self.model.connections.filter_text.trim().is_empty();
+        div()
+            .flex()
+            .flex_wrap()
+            .gap(px(6.))
+            .child(kit::tool_button("conn-filter-engine", Some(IconName::Database), SharedString::from(engine), act("conn-filter-engine", cx)))
+            .child(kit::tool_button("conn-filter-env", Some(IconName::Funnel), env, act("conn-filter-env", cx)))
+            .when(active, |this| this.child(kit::tool_button("conn-filter-clear", Some(IconName::X), self.t("connections.filter.clear"), act("conn-filter-clear", cx))))
+            .into_any_element()
+    }
+
+    fn path_field(
+        &mut self,
+        id: &'static str,
+        label_key: &'static str,
+        browse_key: &'static str,
+        input: impl IntoElement,
+        field: DraftField,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .items_end()
+            .gap(px(6.))
+            .min_w(px(0.))
+            .child(div().flex_1().min_w(px(0.)).child(kit::form_row(self.t(label_key), input, p)))
+            .child(kit::secondary_button(id, Some(IconName::FolderOpen), self.t(browse_key), cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.prompt_field_file(field, cx);
+            })))
+            .into_any_element()
+    }
+
+    /// 浏览证书或私钥。取消保留原路径；打不开的文件只写错误，不改 TLS 校验，也不写入钥匙串。
+    fn prompt_field_file(&mut self, field: DraftField, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(self.t("ui.conn.browse")),
+        });
+        cx.spawn(async move |this, cx| {
+            let chosen = match receiver.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            let Some(path) = chosen else { return };
+            let accepted = crate::app::accept_open_path(&path);
+            cx.update(|cx| {
+                let _ = this.update(cx, |view, cx| {
+                    match accepted {
+                        Ok(path) => view.model.set_field(field, path.display().to_string()),
+                        Err(detail) => {
+                            view.model.notice_key = Some("connections.status.error");
+                            view.model.notice_detail = detail;
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
     }
 
     fn prompt_draft_file(&mut self, cx: &mut Context<Self>) {
@@ -2073,6 +2280,15 @@ impl Workbench {
                                 ),
                         )
                         .child(div().min_w(px(0.)).font_family(mono.clone()).text_size(px(TypeScale::SM)).text_color(p.text_muted).max_h(px(36.)).truncate().child(SharedString::from(clip(&item.sql, 200))))
+                        .on_mouse_down(MouseButton::Right, cx.listener({
+                            let menu = id.clone();
+                            move |this, event: &MouseDownEvent, _, cx| {
+                                this.menu_at = event.position;
+                                this.model.history.section = HistorySection::Saved;
+                                this.model.history.selected_saved = Some(menu.clone());
+                                this.perform("menu-history", cx);
+                            }
+                        }))
                         .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                             this.model.history.section = HistorySection::Saved;
                             this.model.history.selected_saved = Some(select.clone());
@@ -2132,7 +2348,7 @@ impl Workbench {
         let narrow = history_stacks_preview(self.model.layout().content_width as f32);
         let has_preview = preview_open && self.model.history.preview_plan(&known).is_some();
         let preview = if has_preview {
-            self.history_preview(&known, &p, narrow, cx)
+            self.history_preview(window, &known, &p, narrow, cx)
         } else {
             div().into_any_element()
         };
@@ -2178,16 +2394,17 @@ impl Workbench {
             .into_any_element()
     }
 
-    fn history_preview(&self, known: &std::collections::BTreeSet<String>, p: &Palette, narrow: bool, cx: &mut Context<Self>) -> AnyElement {
+    #[inline(never)]
+    fn history_preview(&mut self, window: &mut Window, known: &std::collections::BTreeSet<String>, p: &Palette, narrow: bool, cx: &mut Context<Self>) -> AnyElement {
         let Some(plan) = self.model.history.preview_plan(known) else {
             return div().into_any_element();
         };
-        let mono = cx.theme().mono_font_family.clone();
         let status = if self.model.history.section == HistorySection::Runs {
             self.model.history.selected_run_entry().map(|entry| entry.status.clone())
         } else {
             None
         };
+        let error = self.model.history.preview_error().map(str::to_owned);
         let target = if plan.needs_target {
             self.model.text("history.plan.deletedNotice")
         } else if plan.database.as_deref().is_some_and(|database| !database.is_empty()) {
@@ -2195,14 +2412,30 @@ impl Workbench {
         } else {
             plan.connection_name.clone()
         };
-        // 预览给列表留出至少一列卡片的空间，窄窗口不再把 SQL 挤出去。
-        let content = self.model.layout().content_width as f32;
-        let preview_width = (content - 220.).clamp(260., 380.);
+        let preview_width = self.model.history_preview_px();
+        let editor_key = format!(
+            "{}:{}",
+            self.model.history.selected_run.as_deref().or(self.model.history.selected_saved.as_deref()).unwrap_or(""),
+            plan.sql
+        );
+        let editor = match &self.history_editor {
+            Some((key, editor)) if key == &editor_key => editor.clone(),
+            _ => {
+                let sql = plan.sql.clone();
+                let editor = gpui_kit::AppContext::new(cx, |cx| {
+                    gpui_kit::component::input::EditorState::new(window, cx).language("sql").line_number(true).default_value(sql)
+                });
+                self.history_editor = Some((editor_key, editor.clone()));
+                editor
+            }
+        };
         let status_label = status.map(|status| {
             let ok = status == "ok" || status == "success" || status == "done";
             (if ok { self.t("history.status.ok") } else { self.t("history.status.failed") }, ok)
         });
-        div()
+        let dragging = self.model.history_dragging;
+        let reset = cx.entity().downgrade();
+        let mut panel = div()
             .id("history-preview")
             .role(gpui_kit::Role::Group)
             .flex_none()
@@ -2211,52 +2444,101 @@ impl Workbench {
             .when(narrow, |this| this.h_full().w_full().border_t_1())
             .when(!narrow, |this| this.w(px(preview_width)).border_l_1())
             .border_color(p.line)
-            .p(px(if narrow { 12. } else { 18. }))
             .flex()
-            .flex_col()
-            .gap(px(10.))
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<kit::ResizeDrag>, _, cx| {
+                if event.drag(cx).key.as_ref() != "history-preview-resize" {
+                    return;
+                }
+                let width = f32::from(event.bounds.right() - event.event.position.x);
+                this.model.set_history_preview_width(width);
+                this.model.history_dragging = true;
+                cx.notify();
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                if this.model.history_dragging {
+                    this.model.history_dragging = false;
+                    cx.notify();
+                }
+            }));
+        if !narrow {
+            panel = panel.child(kit::resize_handle("history-preview-resize", self.t("history.page.sqlPreview"), dragging, p, move |_, _, cx| {
+                if let Some(reset) = reset.upgrade() {
+                    reset.update(cx, |this, cx| {
+                        this.model.reset_history_preview_width();
+                        cx.notify();
+                    });
+                }
+            }));
+        }
+        panel
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(kit::title(self.t("history.page.sqlPreview"), TypeScale::MD, p))
-                    .child(div().flex_1())
-                    .child(kit::icon_button("history-preview-close", IconName::X, self.t("history.page.previewClose"), act("history-preview-close", cx))),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .child(kit::engine_badge(&plan.engine, 14.))
-                    .child(div().text_size(px(TypeScale::XS)).text_color(if plan.needs_target { p.warn } else { p.text_muted }).child(SharedString::from(target))),
-            )
-            .when_some(status_label, |this, (label, ok)| {
-                this.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .text_size(px(TypeScale::XS))
-                        .text_color(if ok { p.ok } else { p.danger })
-                        .child(kit::status_dot(if ok { p.ok } else { p.danger }))
-                        .child(label),
-                )
-            })
-            .child(
-                div()
-                    .id("history-preview-sql")
                     .flex_1()
+                    .min_w(px(0.))
                     .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .rounded(px(Radius::PANEL))
-                    .bg(p.chrome)
-                    .p(px(12.))
-                    .font_family(mono)
-                    .text_size(px(TypeScale::SM))
-                    .text_color(p.text)
-                    .child(SharedString::from(plan.sql)),
+                    .p(px(if narrow { 12. } else { 14. }))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(kit::title(self.t("history.page.sqlPreview"), TypeScale::MD, p))
+                            .child(div().flex_1())
+                            .child(kit::primary_button("history-preview-load", Some(IconName::SquarePen), self.t("history.page.loadToEditor"), act("history-load", cx)))
+                            .child(kit::tool_button("history-preview-copy", Some(IconName::Copy), self.t("history.preview.copy"), act("history-copy", cx)))
+                            .child(kit::tool_button("history-preview-save", Some(IconName::Save), self.t("history.preview.saveQuery"), act("history-save-preview", cx)))
+                            .child(kit::icon_button("history-preview-close", IconName::X, self.t("history.page.previewClose"), act("history-preview-close", cx))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(kit::engine_badge(&plan.engine, 14.))
+                            .child(div().text_size(px(TypeScale::XS)).text_color(if plan.needs_target { p.warn } else { p.text_muted }).child(SharedString::from(target))),
+                    )
+                    .when_some(status_label, |this, (label, ok)| {
+                        this.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .text_size(px(TypeScale::XS))
+                                .text_color(if ok { p.ok } else { p.danger })
+                                .child(kit::status_dot(if ok { p.ok } else { p.danger }))
+                                .child(label),
+                        )
+                    })
+                    .when_some(error.filter(|text| !text.trim().is_empty()), |this, error| {
+                        this.child(
+                            div()
+                                .id("history-preview-error")
+                                .test_support()
+                                .px(px(8.))
+                                .py(px(6.))
+                                .rounded(px(Radius::CONTROL))
+                                .bg(p.danger_soft)
+                                .text_size(px(TypeScale::SM))
+                                .text_color(p.danger)
+                                .child(SharedString::from(error)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("history-preview-sql")
+                            .flex_1()
+                            .min_h(px(0.))
+                            .rounded(px(Radius::PANEL))
+                            .border_1()
+                            .border_color(p.line)
+                            .bg(p.surface)
+                            .overflow_hidden()
+                            .child(Editor::new(&editor).readonly(true).h(gpui_kit::relative(1.)).bordered(false).aria_label(self.t("history.page.sqlPreview"))),
+                    ),
             )
             .into_any_element()
     }
@@ -2584,23 +2866,67 @@ impl Workbench {
             .into_any_element()
     }
 
+    #[inline(never)]
     fn context_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let m = self.metrics();
         let Some(menu) = self.model.menu.clone() else {
             return div().into_any_element();
         };
-        let width = 232.;
-        let viewport = self.model.viewport_width as f32;
-        let mut x = f32::from(self.menu_at.x);
-        let y = f32::from(self.menu_at.y);
-        if x + width > viewport - 8. {
-            x = (viewport - width - 8.).max(8.);
+        let width = 248.;
+        let row_h = m.menu_row_h;
+        let height = menu_block_height(&menu.items, row_h);
+        let view_w = self.model.viewport_width as f32;
+        let view_h = self.model.viewport_height.max(1) as f32;
+        let anchor_x = f32::from(self.menu_at.x);
+        let anchor_y = f32::from(self.menu_at.y);
+        let (x, y) = super::menus::place_popup(anchor_x, anchor_y, width, height, view_w, view_h);
+        let list = self.context_menu_box("context-menu", menu.place.label_key(), x, y, width, &menu.items, menu.index, None, &p, cx);
+        let mut layer = backdrop("context-backdrop", 0., cx).child(list);
+        if let Some((parent, child)) = menu.submenu {
+            if let Some(parent_item) = menu.items.get(parent) {
+                if !parent_item.children.is_empty() {
+                    let sub_w = 232.;
+                    let sub_h = menu_block_height(&parent_item.children, row_h);
+                    let parent_y = y + 4. + parent as f32 * (row_h + 2.);
+                    let (sub_x, sub_y) = super::menus::place_submenu(x, parent_y, width, sub_w, sub_h, view_w, view_h);
+                    layer = layer.child(self.context_menu_box(
+                        "context-submenu",
+                        parent_item.label_key,
+                        sub_x,
+                        sub_y,
+                        sub_w,
+                        &parent_item.children,
+                        child,
+                        Some(parent),
+                        &p,
+                        cx,
+                    ));
+                }
+            }
         }
+        layer.into_any_element()
+    }
+
+    #[inline(never)]
+    fn context_menu_box(
+        &mut self,
+        element_id: &'static str,
+        label_key: &'static str,
+        x: f32,
+        y: f32,
+        width: f32,
+        items: &[super::menus::MenuItem],
+        selected_index: usize,
+        parent: Option<usize>,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let m = self.metrics();
         let mut list = div()
-            .id("context-menu")
+            .id(element_id)
             .role(gpui_kit::Role::Menu)
-            .aria_label(self.t(menu.place.label_key()))
+            .aria_label(self.t(label_key))
             .occlude()
             .absolute()
             .left(px(x))
@@ -2615,15 +2941,16 @@ impl Workbench {
             .rounded(px(Radius::PANEL))
             .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-        for (index, item) in menu.items.iter().enumerate() {
-            // 危险项成组：只在第一个危险项前画一条分隔线。
-            if index > 0 && item.danger && !menu.items[index - 1].danger {
+        for (index, item) in items.iter().enumerate() {
+            if item.separator_before || (index > 0 && item.danger && !items[index - 1].danger) {
                 list = list.child(div().h(px(1.)).my(px(4.)).mx(px(6.)).bg(p.line));
             }
             let id = item.id.to_owned();
+            let has_children = !item.children.is_empty();
             let label = self.t(item.label_key);
+            let shortcut = item.shortcut.map(SharedString::from);
             let enabled = item.enabled;
-            let selected = index == menu.index;
+            let selected = index == selected_index;
             let state = if enabled { "enabled" } else { "disabled" };
             let fg = if !enabled {
                 p.text_faint
@@ -2632,39 +2959,59 @@ impl Workbench {
             } else {
                 p.text
             };
+            let element = if parent.is_some() { format!("ctx-sub-{id}") } else { format!("ctx-{id}") };
             list = list.child(
                 div()
-                    .id(SharedString::from(format!("ctx-{id}")))
+                    .id(SharedString::from(element))
                     .role(gpui_kit::Role::MenuItem)
                     .aria_label(label.clone())
                     .aria_selected(selected)
                     .aria_description(SharedString::from(format!("{state} {}", item.reason_key.unwrap_or(item.id))))
                     .h(px(m.menu_row_h))
-                    .px(px(10.))
+                    .px(px(8.))
                     .flex()
                     .items_center()
+                    .gap(px(8.))
                     .rounded(px(Radius::CONTROL))
                     .text_color(fg)
                     .when(enabled, |this| this.cursor_pointer())
                     .when(enabled && selected, |this| this.bg(p.hover))
                     .when(enabled, |this| this.hover(|style| style.bg(if item.danger { p.danger_soft } else { p.hover })))
-                    .child(div().flex_1().truncate().child(label))
-                    .when_some(item.reason_key.filter(|_| !enabled), |this, reason| {
-                        this.tooltip_text(self.t(reason))
-                    })
+                    .when_some(item.icon, |this, icon| this.child(kit::icon(icon, 14., fg)))
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(label))
+                    .when_some(shortcut, |this, shortcut| this.child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(shortcut)))
+                    .when(has_children, |this| this.child(kit::icon(IconName::ChevronRight, 12., p.text_faint)))
+                    .when_some(item.reason_key.filter(|_| !enabled), |this, reason| this.tooltip_text(self.t(reason)))
+                    .on_mouse_move(cx.listener(move |this, _: &gpui_kit::MouseMoveEvent, _, cx| {
+                        let Some(menu) = this.model.menu.as_mut() else { return };
+                        if parent.is_some() {
+                            return;
+                        }
+                        if menu.index != index || menu.submenu.map(|pair| pair.0) != has_children.then_some(index) {
+                            menu.hover(index);
+                            cx.notify();
+                        }
+                    }))
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         if !enabled {
+                            return;
+                        }
+                        if has_children {
+                            if let Some(menu) = this.model.menu.as_mut() {
+                                menu.index = index;
+                                let _ = menu.open_submenu();
+                            }
+                            cx.notify();
                             return;
                         }
                         this.model.menu = None;
                         this.model.shell.focus = this.model.menu_return;
                         this.perform(&id, cx);
-                        // 菜单项执行后键盘回到原触发区，而不是停在已关闭的菜单上。
                         this.restore_focus(window, cx);
                     })),
             );
         }
-        backdrop("context-backdrop", 0., cx).child(list).into_any_element()
+        list.into_any_element()
     }
 
     fn close_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -3332,16 +3679,23 @@ fn backdrop(id: &'static str, dim: f32, cx: &mut Context<Workbench>) -> gpui_kit
         .inset_0()
         .occlude()
         .bg(gpui_kit::hsla(0., 0., 0., dim))
-        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
             entity.update(cx, |this, cx| {
                 let effect = this.model.dismiss();
                 this.model.history.confirm_clear = false;
                 this.model.history.confirm_delete = false;
                 this.apply_effect(effect, cx);
+                this.restore_focus(window, cx);
                 cx.notify();
             });
         })
         .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+}
+
+fn menu_block_height(items: &[super::menus::MenuItem], row_h: f32) -> f32 {
+    let rows = items.len() as f32;
+    let separators = items.iter().filter(|item| item.separator_before || item.danger).count() as f32;
+    8. + rows * (row_h + 2.) + separators * 6.
 }
 
 /// 历史预览在窄内容区改为上下堆叠，避免挤压列表卡片。

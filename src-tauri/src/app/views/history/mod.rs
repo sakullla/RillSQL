@@ -158,6 +158,19 @@ impl HistoryPage {
         }
     }
 
+    /// 失败、未知或取消的记录把原因放在 summary 里。
+    pub fn preview_error(&self) -> Option<&str> {
+        if self.section != HistorySection::Runs {
+            return None;
+        }
+        let entry = self.selected_run_entry()?;
+        if matches!(entry.status.as_str(), "error" | "failed" | "unknown" | "cancelled") {
+            Some(entry.summary.as_str())
+        } else {
+            None
+        }
+    }
+
     pub fn selected_run_entry(&self) -> Option<&HistoryEntry> {
         let id = self.selected_run.as_deref()?;
         self.runs.iter().find(|entry| entry.id == id)

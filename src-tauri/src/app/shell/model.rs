@@ -11,7 +11,7 @@ use crate::app::model::ObjectTarget;
 use crate::app::{AppPage, CommandSpec, Density, Effect, FocusTarget, Locale, Shell, ThemePreference, COMMANDS};
 use crate::application::tasks::TaskToken;
 use crate::application::{AppServices, TaskBoard};
-use crate::connections::model::{CaMode, Engine, SshAuthKind};
+use crate::connections::model::{CaMode, Engine, EnvTag, SshAuthKind};
 use crate::app::views::connections::LinkStatus;
 use crate::app::views::query::object_spec;
 use crate::catalog::hierarchy::{NavKind, NavNode, NavRow, NavTree, ObjectKey};
@@ -24,8 +24,11 @@ use crate::query::assist::TreeObject;
 use crate::state::{AppState, Platform, SessionState, SessionTab, ShellSettings, StateError};
 
 use super::close::{draft_pending, evaluate, message_key, update_block_key, CloseFacts, CloseKind, CloseScope};
-use super::layout::{layout_for, painted_frame, unbreakable_px, ChromeLayout, PaintedFrame};
-use super::menus::{tree_menu_items, MenuPlace, MenuTarget, NavKey, ObjectFacts, OpenMenu};
+use super::layout::{
+    clamp_history_preview, clamp_sidebar, layout_with_sidebar, painted_frame_with_sidebar, unbreakable_px, ChromeLayout, PaintedFrame, HISTORY_PREVIEW_DEFAULT,
+    SIDEBAR_DEFAULT,
+};
+use super::menus::{flatten_items, tree_menu_items, MenuPlace, MenuTarget, NavKey, ObjectFacts, OpenMenu};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkTool {
@@ -313,6 +316,19 @@ pub struct WorkbenchModel {
     pub pending_template: Option<(String, TemplateKind)>,
     /// 要写进系统剪贴板的文本；视图取走后写入。
     pub clipboard_out: Option<String>,
+    /// 对象树侧栏宽度，默认 234，范围 200–480。
+    pub sidebar_width: f32,
+    pub sidebar_dragging: bool,
+    /// 历史预览宽度，默认 360，范围 260–520，并排时列表至少留 240。
+    pub history_preview_width: f32,
+    pub history_dragging: bool,
+    pub viewport_height: i32,
+    /// 自定义环境标签。列表、欢迎页、状态栏和表单按 id 取名称与色调。
+    pub env_tags: Vec<EnvTag>,
+    /// 对象树“新建表”：下一帧交给结构页 `begin_create`。
+    pub pending_create: Option<String>,
+    /// 从历史预览保存时钉住这一条，避免误存当前查询草稿。
+    pub preview_save: Option<crate::query::SaveRequest>,
 }
 
 impl WorkbenchModel {
@@ -380,7 +396,39 @@ impl WorkbenchModel {
             danger: None,
             pending_template: None,
             clipboard_out: None,
+            sidebar_width: SIDEBAR_DEFAULT,
+            sidebar_dragging: false,
+            history_preview_width: HISTORY_PREVIEW_DEFAULT,
+            history_dragging: false,
+            viewport_height: 900,
+            env_tags: Vec::new(),
+            pending_create: None,
+            preview_save: None,
         }
+    }
+
+    pub fn set_sidebar_width(&mut self, width: f32) {
+        self.sidebar_width = clamp_sidebar(width);
+    }
+
+    pub fn reset_sidebar_width(&mut self) {
+        self.sidebar_width = SIDEBAR_DEFAULT;
+        self.sidebar_dragging = false;
+    }
+
+    pub fn set_history_preview_width(&mut self, width: f32) {
+        let content = self.painted().content_width as f32;
+        self.history_preview_width = clamp_history_preview(width, content);
+    }
+
+    pub fn reset_history_preview_width(&mut self) {
+        self.history_preview_width = HISTORY_PREVIEW_DEFAULT;
+        self.history_dragging = false;
+    }
+
+    pub fn history_preview_px(&self) -> f32 {
+        let content = self.painted().content_width as f32;
+        clamp_history_preview(self.history_preview_width, content)
     }
 
     pub fn apply_settings(&mut self, settings: &ShellSettings) {
@@ -400,11 +448,11 @@ impl WorkbenchModel {
     }
 
     pub fn layout(&self) -> ChromeLayout {
-        layout_for(self.viewport_width, self.shell.sidebar_open)
+        layout_with_sidebar(self.viewport_width, self.shell.sidebar_open, self.sidebar_width as i32)
     }
 
     pub fn painted(&self) -> PaintedFrame {
-        painted_frame(self.viewport_width, self.shell.sidebar_open, self.shell.density.control_padding())
+        painted_frame_with_sidebar(self.viewport_width, self.shell.sidebar_open, self.shell.density.control_padding(), self.sidebar_width as i32)
     }
 
     pub fn set_width(&mut self, width: i32) {
@@ -412,6 +460,11 @@ impl WorkbenchModel {
         if width <= 960 && self.shell.sidebar_open && width <= 640 {
             // 640 以下侧栏改为覆盖，仍允许打开。
         }
+    }
+
+    pub fn set_viewport(&mut self, width: i32, height: i32) {
+        self.set_width(width);
+        self.viewport_height = height.max(0);
     }
 
     pub fn dispatch(&mut self, id: &str) -> Option<Effect> {
@@ -465,6 +518,7 @@ impl WorkbenchModel {
             }
             "help" | "shortcut-help" => self.menu = None,
             "theme-light" | "theme-dark" | "theme-system" => self.settings.capture_shell(&self.shell),
+            "open-admin" => self.open_admin(),
             "open-structure" => {
                 let non_table = self.nav.focus_node().and_then(|node| node.object()).is_some_and(|object| !object.opens_data());
                 if non_table {
@@ -647,6 +701,12 @@ impl WorkbenchModel {
             "conn-filter-engine" => self.connections.cycle_engine_filter(),
             "conn-tls-cycle" => self.connections.cycle_tls(),
             "conn-ssh-toggle" => self.connections.toggle_ssh(),
+            "conn-filter-engine" => self.connections.cycle_engine_filter(),
+            "conn-filter-env" => {
+                let tags = self.env_tags.clone();
+                self.connections.cycle_env_filter(&tags);
+            }
+            "conn-filter-clear" => self.connections.clear_list_filters(),
             "conn-ssh-auth" => self.connections.cycle_ssh_auth(),
             "conn-ca-mode" => self.connections.cycle_ca_mode(),
             "conn-env-cycle" => self.connections.cycle_env(),
@@ -724,14 +784,12 @@ impl WorkbenchModel {
                     prompt.click_execute();
                 }
             }
-            "open-admin" => {
-                if let Some(spec) = self.table_spec.clone().or_else(|| self.object_spec.clone()) {
-                    self.open_item(WorkItemKind::Admin, spec);
-                } else {
-                    self.notice_key = Some("shell.tabs.needObject");
-                    self.notice_detail.clear();
-                }
+            "status-target" => self.focus_status_target(),
+            "status-jobs" => {
+                self.exchange_open = true;
             }
+            "tree-create-table" => self.begin_create_table(),
+            "history-save-preview" => self.save_history_preview(),
             "grid-copy-row" | "grid-copy-column" | "grid-filter-value" => {
                 self.copied = id.to_owned();
                 self.shell.focus = FocusTarget::Grid;
@@ -754,7 +812,9 @@ impl WorkbenchModel {
                 if self.history.save_name.trim().is_empty() {
                     self.notice_key = Some("history.page.needName");
                     self.notice_detail.clear();
-                } else if self.active_tab().is_some_and(|tab| tab.kind.is_query()) {
+                } else if self.active_tab().is_some_and(|tab| tab.kind.is_query() && !tab.draft.trim().is_empty())
+                    || self.history.preview_plan(&self.known_ids()).is_some_and(|plan| !plan.sql.trim().is_empty())
+                {
                     self.enqueue(PendingJob::SaveNamed);
                 } else {
                     self.notice_key = Some("history.savedPanel.needTab");
@@ -1083,10 +1143,10 @@ impl WorkbenchModel {
         self.nav.set_focus(node_id);
         self.sync_object_spec_from_focus();
         let target = tree_menu_target(&node);
-        let facts = node
-            .object()
-            .filter(|_| node.kind == NavKind::Object)
-            .map(|object| ObjectFacts { engine: object.engine, kind: object.kind });
+        let facts = Some(ObjectFacts {
+            engine: node.engine,
+            kind: node.object_kind.unwrap_or(crate::catalog::model::ObjectKind::Table),
+        });
         self.open_menu(MenuPlace::ObjectTree, target);
         self.menu = Some(OpenMenu::with_items(MenuPlace::ObjectTree, tree_menu_items(target, facts)));
         self.nav_menu_node = Some(node_id.to_owned());
@@ -1176,31 +1236,64 @@ impl WorkbenchModel {
     }
 
     fn menu_key(&mut self, key: NavKey) -> Option<String> {
-        let menu = self.menu.as_mut()?;
+        if self.menu.is_none() {
+            return None;
+        }
         match key {
-            NavKey::Escape => {
-                let _ = menu;
-                self.dismiss();
+            NavKey::Escape | NavKey::ArrowLeft => {
+                let open = self.menu.as_ref().is_some_and(|menu| menu.submenu.is_some());
+                if open {
+                    if let Some(menu) = self.menu.as_mut() {
+                        menu.close_submenu();
+                    }
+                    return None;
+                }
+                if key == NavKey::Escape {
+                    self.dismiss();
+                }
+                None
+            }
+            NavKey::ArrowRight => {
+                if let Some(menu) = self.menu.as_mut() {
+                    let _ = menu.open_submenu();
+                }
                 None
             }
             NavKey::ArrowDown => {
-                menu.move_by(1);
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.move_by(1);
+                }
                 None
             }
             NavKey::ArrowUp => {
-                menu.move_by(-1);
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.move_by(-1);
+                }
                 None
             }
             NavKey::Home => {
-                menu.home();
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.home();
+                }
                 None
             }
             NavKey::End => {
-                menu.end();
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.end();
+                }
                 None
             }
             NavKey::Enter => {
-                let id = menu.current().map(|item| item.id.to_owned());
+                let opens = self.menu.as_ref().is_some_and(|menu| {
+                    menu.submenu.is_none() && menu.active_parent().is_some_and(|item| !item.children.is_empty() && item.enabled)
+                });
+                if opens {
+                    if let Some(menu) = self.menu.as_mut() {
+                        let _ = menu.open_submenu();
+                    }
+                    return None;
+                }
+                let id = self.menu.as_ref().and_then(|menu| menu.current().map(|item| item.id.to_owned()));
                 self.menu = None;
                 self.shell.focus = self.menu_return;
                 if let Some(id) = id {
@@ -1245,6 +1338,7 @@ impl WorkbenchModel {
                 let _ = self.dispatch(&id);
                 Some(id)
             }
+            NavKey::ArrowLeft | NavKey::ArrowRight => None,
         }
     }
 
@@ -1635,7 +1729,7 @@ impl WorkbenchModel {
                 let action = self.nav.activate(&id);
                 Some(self.nav_activation_command(action).unwrap_or_else(|| format!("nav-focus:{id}")))
             }
-            NavKey::Escape => None,
+            NavKey::Escape | NavKey::ArrowLeft | NavKey::ArrowRight => None,
         };
         self.sync_object_spec_from_focus();
         action
@@ -2283,6 +2377,20 @@ impl WorkbenchModel {
     }
 
     /// 结构页删除表成功：这张表立即离开树，再重读所属连接。
+    pub fn adopt_created_table(&mut self, spec: String) {
+        let connection = spec.split('|').next().unwrap_or("").to_owned();
+        if let Some(tab) = self.active_mut() {
+            if tab.kind == WorkItemKind::Structure {
+                tab.title = spec.split('|').nth(4).unwrap_or("").to_owned();
+                tab.spec = Some(spec.clone());
+            }
+        }
+        self.table_spec = Some(spec);
+        if !connection.is_empty() {
+            self.request_nav_refresh(Some(connection));
+        }
+    }
+
     pub fn table_dropped(&mut self, connection_id: &str, database: &str, schema: &str, table: &str) {
         let id = self
             .nav
@@ -2845,13 +2953,129 @@ impl WorkbenchModel {
     }
 
     fn copy_selected_sql(&mut self) {
-        self.copied = if self.history.section == HistorySection::Saved {
+        let sql = if self.history.section == HistorySection::Saved {
             self.history.plan_saved(&self.known_ids()).map(|plan| plan.sql).unwrap_or_default()
         } else if self.shell.page == AppPage::Workspace {
             self.active_tab().map(|tab| tab.draft.clone()).unwrap_or_default()
         } else {
             self.history.plan_run(&self.known_ids()).map(|plan| plan.sql).unwrap_or_default()
         };
+        self.copied = sql.clone();
+        if !sql.is_empty() {
+            self.clipboard_out = Some(sql);
+        }
+    }
+
+    fn save_history_preview(&mut self) {
+        let Some(plan) = self.history.preview_plan(&self.known_ids()) else {
+            self.notice_key = Some("history.page.noMatch");
+            self.notice_detail.clear();
+            return;
+        };
+        if plan.sql.trim().is_empty() {
+            self.notice_key = Some("history.page.needName");
+            self.notice_detail.clear();
+            return;
+        }
+        if self.history.save_name.trim().is_empty() {
+            let line = plan.sql.lines().find(|line| !line.trim().is_empty()).unwrap_or("query");
+            self.history.save_name = line.chars().take(48).collect();
+        }
+        self.preview_save = Some(crate::query::SaveRequest {
+            name: self.history.save_name.trim().to_owned(),
+            sql: plan.sql,
+            connection_id: plan.connection_id.unwrap_or_default(),
+            connection_name: plan.connection_name,
+            database_name: plan.database.unwrap_or_default(),
+            engine: plan.engine,
+        });
+        self.enqueue(PendingJob::SaveNamed);
+    }
+
+    fn focus_status_target(&mut self) {
+        let on_query = self.shell.page == AppPage::Workspace && self.tool == WorkTool::Query;
+        if on_query && !self.connections.rows.is_empty() {
+            self.shell.focus = FocusTarget::Editor;
+            return;
+        }
+        if let Some(id) = self.active_tab().and_then(|tab| tab.connection_id.clone()) {
+            self.connections.selected = Some(id);
+        }
+        self.shell.page = AppPage::Connections;
+        self.shell.focus = FocusTarget::Settings;
+    }
+
+    fn open_admin(&mut self) {
+        if let Some(spec) = self.admin_scope_spec().or_else(|| self.table_spec.clone()).or_else(|| self.object_spec.clone()) {
+            self.nav_menu_node = None;
+            self.open_item(WorkItemKind::Admin, spec);
+        } else {
+            self.notice_key = Some("shell.tabs.needObject");
+            self.notice_detail.clear();
+        }
+    }
+
+    /// 连接、库或模式节点打开管理页：带上这条连接和默认库，不借用上一张表。
+    fn admin_scope_spec(&self) -> Option<String> {
+        let id = self.nav_menu_node.clone().or_else(|| self.nav.focus().map(str::to_owned))?;
+        let node = self.nav.node(&id)?;
+        if !matches!(node.kind, NavKind::Connection | NavKind::Database | NavKind::Schema) {
+            return None;
+        }
+        self.scope_spec(node)
+    }
+
+    fn begin_create_table(&mut self) {
+        let id = self.nav_menu_node.clone().or_else(|| self.nav.focus().map(str::to_owned));
+        let Some(node) = id.as_deref().and_then(|id| self.nav.node(id)).cloned() else {
+            self.notice_key = Some("catalog.tree.actionUnavailable");
+            self.notice_detail.clear();
+            return;
+        };
+        if !matches!(node.kind, NavKind::Connection | NavKind::Database | NavKind::Schema | NavKind::Group) || !node.engine.is_relational() {
+            self.notice_key = Some("catalog.tree.actionUnavailable");
+            self.notice_detail = node.name.clone();
+            return;
+        }
+        let Some(spec) = self.scope_spec(&node) else {
+            self.notice_key = Some("shell.tabs.needObject");
+            self.notice_detail.clear();
+            return;
+        };
+        self.nav_menu_node = None;
+        self.pending_create = Some(spec.clone());
+        self.open_item(WorkItemKind::Structure, spec);
+    }
+
+    fn scope_spec(&self, node: &NavNode) -> Option<String> {
+        if node.connection_id.is_empty() || !node.engine.is_relational() {
+            return None;
+        }
+        let database = if !node.database.is_empty() {
+            node.database.clone()
+        } else {
+            self.connections
+                .rows
+                .iter()
+                .find(|row| row.saved.id == node.connection_id)
+                .and_then(|row| row.saved.database.clone())
+                .unwrap_or_default()
+        };
+        let name = if database.is_empty() { node.connection_name.clone() } else { database.clone() };
+        if name.is_empty() {
+            return None;
+        }
+        let env = self.nav_environment(&node.connection_id);
+        Some(format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            node.connection_id,
+            node.connection_name,
+            database,
+            node.schema,
+            name,
+            node.engine.as_str(),
+            env
+        ))
     }
 
     fn open_blank_query(&mut self) {
@@ -3093,7 +3317,7 @@ impl WorkbenchModel {
         ];
         if let Some(menu) = &self.menu {
             nodes.push(node("context-menu", "Menu", menu.place.label_key(), "open", "menu"));
-            for item in &menu.items {
+            for item in flatten_items(&menu.items) {
                 nodes.push(A11yNode {
                     id: item.id.to_owned(),
                     role: "MenuItem",

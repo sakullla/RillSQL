@@ -77,18 +77,34 @@ pub fn job_request(model: &WorkbenchModel, job: PendingJob, token: TaskToken) ->
 }
 
 fn save_request(model: &WorkbenchModel) -> Option<SaveRequest> {
-    let tab = model.active_tab().filter(|tab| tab.kind.is_query())?;
+    if let Some(request) = model.preview_save.clone() {
+        return Some(request);
+    }
     let name = model.history.save_name.trim();
-    if name.is_empty() || tab.draft.trim().is_empty() {
+    if name.is_empty() {
+        return None;
+    }
+    if let Some(tab) = model.active_tab().filter(|tab| tab.kind.is_query() && !tab.draft.trim().is_empty()) {
+        return Some(SaveRequest {
+            name: name.to_owned(),
+            sql: tab.draft.clone(),
+            connection_id: tab.connection_id.clone().unwrap_or_default(),
+            connection_name: tab.connection_name.clone().unwrap_or_default(),
+            database_name: tab.database.clone().unwrap_or_default(),
+            engine: tab.engine.clone().unwrap_or_default(),
+        });
+    }
+    let plan = model.history.preview_plan(&model.known_ids())?;
+    if plan.sql.trim().is_empty() {
         return None;
     }
     Some(SaveRequest {
         name: name.to_owned(),
-        sql: tab.draft.clone(),
-        connection_id: tab.connection_id.clone().unwrap_or_default(),
-        connection_name: tab.connection_name.clone().unwrap_or_default(),
-        database_name: tab.database.clone().unwrap_or_default(),
-        engine: tab.engine.clone().unwrap_or_default(),
+        sql: plan.sql,
+        connection_id: plan.connection_id.unwrap_or_default(),
+        connection_name: plan.connection_name,
+        database_name: plan.database.unwrap_or_default(),
+        engine: plan.engine,
     })
 }
 
