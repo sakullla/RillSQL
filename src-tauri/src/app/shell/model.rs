@@ -329,6 +329,14 @@ pub struct WorkbenchModel {
     pub pending_create: Option<String>,
     /// 从历史预览保存时钉住这一条，避免误存当前查询草稿。
     pub preview_save: Option<crate::query::SaveRequest>,
+    /// 连接页引擎/环境筛选下拉。点按钮展开，点选项才改筛选值。
+    pub conn_filter_menu: Option<ConnFilterMenu>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnFilterMenu {
+    Engine,
+    Env,
 }
 
 impl WorkbenchModel {
@@ -404,6 +412,7 @@ impl WorkbenchModel {
             env_tags: Vec::new(),
             pending_create: None,
             preview_save: None,
+            conn_filter_menu: None,
         }
     }
 
@@ -562,6 +571,16 @@ impl WorkbenchModel {
             self.shell.page = AppPage::Connections;
             return true;
         }
+        if let Some(engine) = id.strip_prefix("conn-filter-engine:") {
+            self.connections.filter_engine = if engine.is_empty() { None } else { crate::connections::model::Engine::parse(engine).ok() };
+            self.conn_filter_menu = None;
+            return true;
+        }
+        if let Some(env) = id.strip_prefix("conn-filter-env:") {
+            self.connections.filter_env = env.to_owned();
+            self.conn_filter_menu = None;
+            return true;
+        }
         if id == "exchange-object" {
             // 对象菜单里的导入导出以被选中的对象为准：先把这个对象打开成表数据，
             // 抽屉只在实际来源与所选对象一致时打开，避免导出别一张表。
@@ -698,15 +717,18 @@ impl WorkbenchModel {
                     self.notice_key = Some(key);
                 }
             }
-            "conn-filter-engine" => self.connections.cycle_engine_filter(),
+            "conn-filter-engine" => {
+                self.conn_filter_menu = if self.conn_filter_menu == Some(ConnFilterMenu::Engine) { None } else { Some(ConnFilterMenu::Engine) };
+            }
+            "conn-filter-env" => {
+                self.conn_filter_menu = if self.conn_filter_menu == Some(ConnFilterMenu::Env) { None } else { Some(ConnFilterMenu::Env) };
+            }
+            "conn-filter-clear" => {
+                self.connections.clear_list_filters();
+                self.conn_filter_menu = None;
+            }
             "conn-tls-cycle" => self.connections.cycle_tls(),
             "conn-ssh-toggle" => self.connections.toggle_ssh(),
-            "conn-filter-engine" => self.connections.cycle_engine_filter(),
-            "conn-filter-env" => {
-                let tags = self.env_tags.clone();
-                self.connections.cycle_env_filter(&tags);
-            }
-            "conn-filter-clear" => self.connections.clear_list_filters(),
             "conn-ssh-auth" => self.connections.cycle_ssh_auth(),
             "conn-ca-mode" => self.connections.cycle_ca_mode(),
             "conn-env-cycle" => self.connections.cycle_env(),

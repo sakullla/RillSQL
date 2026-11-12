@@ -65,7 +65,15 @@ pub struct MenuItem {
 }
 
 fn leaf(id: &'static str, label_key: &'static str, danger: bool, enabled: bool, reason_key: Option<&'static str>) -> MenuItem {
-    MenuItem { id, label_key, danger, enabled, reason_key, icon: None, shortcut: None, separator_before: false, children: Vec::new() }
+    MenuItem { id, label_key, danger, enabled, reason_key, icon: None, shortcut: chord_for(id), separator_before: false, children: Vec::new() }
+}
+
+/// 已有命令或快捷键表里的按键。没有登记的动作不编一个新的。
+fn chord_for(id: &'static str) -> Option<&'static str> {
+    if let Some(chord) = crate::app::COMMANDS.iter().find(|command| command.id == id).and_then(|command| command.chord) {
+        return Some(chord);
+    }
+    crate::app::model::SHORTCUTS.iter().find(|shortcut| shortcut.id == id).map(|shortcut| shortcut.chord)
 }
 
 fn item(id: &'static str, label_key: &'static str) -> MenuItem {
@@ -669,6 +677,15 @@ mod tests {
         assert!(ids(&table).contains(&"tree-select-sql"));
         assert!(ids(&table).contains(&"open-admin"));
         assert!(ids(&table).contains(&"open-diagram"));
+    }
+
+    #[test]
+    fn menu_items_keep_chords_that_already_exist() {
+        let editor = menu_items(MenuPlace::Editor, MenuTarget::QueryTab);
+        assert_eq!(editor.iter().find(|item| item.id == "execute-query").and_then(|item| item.shortcut), Some("Mod+Enter"));
+        assert_eq!(editor.iter().find(|item| item.id == "command-palette").and_then(|item| item.shortcut), Some("Mod+K"));
+        let tabs = menu_items(MenuPlace::TabBar, MenuTarget::QueryTab);
+        assert_eq!(tabs.iter().find(|item| item.id == "close-tab").and_then(|item| item.shortcut), Some("Mod+W"));
     }
 
     #[test]

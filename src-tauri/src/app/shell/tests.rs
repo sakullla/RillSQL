@@ -6462,10 +6462,32 @@ fn untagged_connections_show_no_env_pill() {
 
 #[test]
 fn custom_env_tags_never_show_a_dictionary_key() {
+    use crate::connections::model::EnvTag;
     use crate::i18n::{text, Locale};
-    assert_eq!(super::chrome::env_label(|key| text(Locale::En, key), "prod"), "Prod");
-    assert_eq!(super::chrome::env_label(|key| text(Locale::ZhCn, key), "dev"), "开发");
-    assert_eq!(super::chrome::env_label(|key| text(Locale::En, key), "t7-live"), "t7-live");
+    assert_eq!(super::chrome::env_label(|key| text(Locale::En, key), "prod", &[]), "Prod");
+    assert_eq!(super::chrome::env_label(|key| text(Locale::ZhCn, key), "dev", &[]), "开发");
+    assert_eq!(super::chrome::env_label(|key| text(Locale::En, key), "t7-live", &[]), "t7-live");
+    let tags = [EnvTag { id: "t7-live".into(), label: "线上".into(), tone: "prod".into(), position: 1 }];
+    assert_eq!(super::chrome::env_label(|key| text(Locale::En, key), "t7-live", &tags), "线上");
+    assert_eq!(super::chrome::env_tone("t7-live", &tags), "prod");
+}
+
+#[test]
+fn connection_filters_open_a_menu_and_apply_the_chosen_id() {
+    use super::model::ConnFilterMenu;
+    let mut model = WorkbenchModel::new(Shell::default());
+    assert!(model.dispatch("conn-filter-engine").is_some());
+    assert_eq!(model.conn_filter_menu, Some(ConnFilterMenu::Engine));
+    assert!(model.connections.filter_engine.is_none(), "打开下拉不循环筛选值");
+    assert!(model.dispatch("conn-filter-engine:redis").is_some());
+    assert_eq!(model.connections.filter_engine, Some(Engine::Redis));
+    assert!(model.conn_filter_menu.is_none());
+    assert!(model.dispatch("conn-filter-env").is_some());
+    assert_eq!(model.conn_filter_menu, Some(ConnFilterMenu::Env));
+    assert!(model.dispatch("conn-filter-env:t7-live").is_some());
+    assert_eq!(model.connections.filter_env, "t7-live");
+    assert!(model.dispatch("conn-filter-engine:").is_some());
+    assert!(model.connections.filter_engine.is_none());
 }
 
 /// 640 宽时侧栏是盖在工作区上的覆盖层。原生截图发现右键树节点弹出的是下面编辑器的菜单

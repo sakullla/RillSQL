@@ -18,11 +18,11 @@ use crate::app::views::history::HistorySection;
 use crate::app::{AppPage, FocusTarget, ThemePreference};
 use crate::catalog::hierarchy::{NavKind, NavRow};
 use crate::catalog::model::ObjectKind;
-use crate::connections::model::{CaMode, Engine, SshAuthKind, TlsMode};
+use crate::connections::model::{CaMode, Engine, EnvTag, SshAuthKind, TlsMode};
 use crate::i18n;
 use crate::ui::kit::{self, FieldSpec, Palette, Tip as _, Radius, TypeScale};
 
-use super::model::{DraftField, WorkItemKind, WorkTool};
+use super::model::{ConnFilterMenu, DraftField, WorkItemKind, WorkTool};
 use super::view::Workbench;
 
 /// 活动栏宽度来自布局模块，绘制与几何只保留一份。
@@ -50,14 +50,16 @@ impl Workbench {
         SharedString::from(self.model.text(key))
     }
 
-    /// 连接的环境标签文字；自定义标签没有字典键，显示标签本身而不是漏出键名。
+    /// 连接的环境标签文字。存过的标签用它的名称，不用原始 id。
     fn env_text(&self, env: &str) -> SharedString {
-        SharedString::from(env_label(|key| self.model.text(key), env))
+        SharedString::from(env_label(|key| self.model.text(key), env, &self.model.env_tags))
     }
 
-    /// 连接的环境标签小块；没有标签（空或 none）时不画。
+    /// 连接的环境标签小块；没有标签（空或 none）时不画。颜色跟标签色调走。
     fn env_pill(&self, env: &str, p: &Palette) -> Option<AnyElement> {
-        env_shown(env).then(|| kit::env_tag(env, self.env_text(env), p))
+        let tone = env_tone(env, &self.model.env_tags).to_owned();
+        let label = self.env_text(env);
+        env_shown(env).then(|| kit::env_tag(&tone, label, p))
     }
 
     /// 当前密度的尺寸指标；绘制只读这一处。
@@ -1880,7 +1882,7 @@ impl Workbench {
             .into_any_element()
     }
 
-    fn connection_filters(&mut self, _p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+    fn connection_filters(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let engine = self
             .model
             .connections
@@ -1893,13 +1895,130 @@ impl Workbench {
             self.env_text(&self.model.connections.filter_env)
         };
         let active = self.model.connections.filter_engine.is_some() || !self.model.connections.filter_env.is_empty() || !self.model.connections.filter_text.trim().is_empty();
+        let engine_open = self.model.conn_filter_menu == Some(ConnFilterMenu::Engine);
+        let env_open = self.model.conn_filter_menu == Some(ConnFilterMenu::Env);
+        let engine_options = self.engine_filter_options();
+        let env_options = self.env_filter_options();
         div()
             .flex()
             .flex_wrap()
             .gap(px(6.))
-            .child(kit::tool_button("conn-filter-engine", Some(IconName::Database), SharedString::from(engine), act("conn-filter-engine", cx)))
-            .child(kit::tool_button("conn-filter-env", Some(IconName::Funnel), env, act("conn-filter-env", cx)))
+            .child(self.filter_dropdown(
+                "conn-filter-engine",
+                IconName::Database,
+                SharedString::from(engine),
+                "conn-filter-engine",
+                engine_open,
+                engine_options,
+                p,
+                cx,
+            ))
+            .child(self.filter_dropdown(
+                "conn-filter-env",
+                IconName::Funnel,
+                env,
+                "conn-filter-env",
+                env_open,
+                env_options,
+                p,
+                cx,
+            ))
             .when(active, |this| this.child(kit::tool_button("conn-filter-clear", Some(IconName::X), self.t("connections.filter.clear"), act("conn-filter-clear", cx))))
+            .into_any_element()
+    }
+
+    fn engine_filter_options(&self) -> Vec<(String, SharedString, bool, String)> {
+        let current = self.model.connections.filter_engine;
+        let mut options = vec![(
+            "conn-filter-engine-all".to_owned(),
+            self.t("connections.filter.engine"),
+            current.is_none(),
+            "conn-filter-engine:".to_owned(),
+        )];
+        for engine in engines() {
+            options.push((
+                format!("conn-filter-engine-{}", engine.as_str()),
+                SharedString::from(kit::engine_label(engine.as_str())),
+                current == Some(engine),
+                format!("conn-filter-engine:{}", engine.as_str()),
+            ));
+        }
+        options
+    }
+
+    fn env_filter_options(&self) -> Vec<(String, SharedString, bool, String)> {
+        let current = self.model.connections.filter_env.clone();
+        let mut ids = vec!["dev".to_owned(), "test".to_owned(), "prod".to_owned(), "local".to_owned()];
+        for tag in &self.model.env_tags {
+            if !ids.iter().any(|id| id == &tag.id) {
+                ids.push(tag.id.clone());
+            }
+        }
+        let mut options = vec![(
+            "conn-filter-env-all".to_owned(),
+            self.t("connections.filter.env"),
+            current.is_empty(),
+            "conn-filter-env:".to_owned(),
+        )];
+        for id in ids {
+            options.push((
+                format!("conn-filter-env-{id}"),
+                self.env_text(&id),
+                current == id,
+                format!("conn-filter-env:{id}"),
+            ));
+        }
+        options
+    }
+
+    fn filter_dropdown(
+        &mut self,
+        button_id: &'static str,
+        icon: IconName,
+        label: SharedString,
+        command: &'static str,
+        open: bool,
+        options: Vec<(String, SharedString, bool, String)>,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut menu = div()
+            .id(SharedString::from(format!("{button_id}-menu")))
+            .absolute()
+            .top(px(self.metrics().control_h + 4.))
+            .left_0()
+            .occlude()
+            .min_w(px(180.))
+            .p(px(4.))
+            .flex()
+            .flex_col()
+            .bg(p.raised)
+            .border_1()
+            .border_color(p.line)
+            .rounded(px(Radius::PANEL))
+            .shadow_lg();
+        for (id, text, selected, action) in options {
+            menu = menu.child(
+                kit::interactive_states(div().id(SharedString::from(id)), p, false)
+                    .test_support()
+                    .role(gpui_kit::Role::MenuItem)
+                    .aria_label(text.clone())
+                    .aria_selected(selected)
+                    .h(px(self.metrics().menu_row_h))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(Radius::CONTROL))
+                    .text_size(px(TypeScale::SM))
+                    .when(selected, |this| this.bg(p.accent_soft).text_color(p.accent_text))
+                    .child(text)
+                    .on_click(act(action, cx)),
+            );
+        }
+        div()
+            .relative()
+            .child(kit::tool_button(button_id, Some(icon), label, act(command, cx)))
+            .when(open, |this| this.child(menu))
             .into_any_element()
     }
 
@@ -1964,23 +2083,32 @@ impl Workbench {
             prompt: Some(self.t("connections.validate.chooseFile")),
         });
         cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = receiver.await {
-                if let Some(path) = paths.into_iter().next() {
-                    cx.update(|cx| {
-                        let _ = this.update(cx, |view, cx| {
-                            if let Ok(path) = crate::app::accept_open_path(&path) {
-                                if let Some(editor) = view.model.connections.editor.as_mut() {
-                                    if editor.name.trim().is_empty() {
-                                        editor.name = path.file_stem().and_then(|name| name.to_str()).unwrap_or("sqlite").to_owned();
-                                    }
+            let chosen = match receiver.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            // 取消保留原来的文件路径。
+            let Some(path) = chosen else { return };
+            let accepted = crate::app::accept_open_path(&path);
+            cx.update(|cx| {
+                let _ = this.update(cx, |view, cx| {
+                    match accepted {
+                        Ok(path) => {
+                            if let Some(editor) = view.model.connections.editor.as_mut() {
+                                if editor.name.trim().is_empty() {
+                                    editor.name = path.file_stem().and_then(|name| name.to_str()).unwrap_or("sqlite").to_owned();
                                 }
-                                view.model.set_field(DraftField::File, path.display().to_string());
                             }
-                            cx.notify();
-                        });
-                    });
-                }
-            }
+                            view.model.set_field(DraftField::File, path.display().to_string());
+                        }
+                        Err(detail) => {
+                            view.model.notice_key = Some("connections.status.error");
+                            view.model.notice_detail = detail;
+                        }
+                    }
+                    cx.notify();
+                });
+            });
         })
         .detach();
     }
@@ -3791,9 +3919,26 @@ pub(super) fn env_shown(env: &str) -> bool {
     !env.is_empty() && env != crate::connections::model::ENV_NONE
 }
 
-/// 内置环境（dev/test/prod/local）走字典；字典里没有的自定义标签原样显示。
-pub(super) fn env_label(text: impl Fn(&str) -> String, env: &str) -> String {
+/// 存过名称的标签用 `EnvTag.label`。没有记录时，内置环境走字典；字典也没有才显示 id。
+pub(super) fn env_label(text: impl Fn(&str) -> String, env: &str, tags: &[EnvTag]) -> String {
+    if let Some(tag) = tags.iter().find(|tag| tag.id == env) {
+        let label = tag.label.trim();
+        if !label.is_empty() {
+            return label.to_owned();
+        }
+    }
     let key = format!("ui.conn.env.{env}");
     let value = text(&key);
     if value == key { env.to_owned() } else { value }
+}
+
+/// 色块用 `EnvTag.tone`。没有色调时退回环境 id，内置色仍按 dev/test/prod 取。
+pub(super) fn env_tone<'a>(env: &'a str, tags: &'a [EnvTag]) -> &'a str {
+    if let Some(tag) = tags.iter().find(|tag| tag.id == env) {
+        let tone = tag.tone.trim();
+        if !tone.is_empty() {
+            return tone;
+        }
+    }
+    env
 }
