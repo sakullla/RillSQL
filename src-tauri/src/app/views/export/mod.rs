@@ -1016,6 +1016,7 @@ impl Render for ExchangePane {
             return div().id("exchange-idle");
         }
         let p = Palette::of(cx);
+        let metrics = kit::Metrics::of(cx);
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let entity = cx.entity();
@@ -1031,8 +1032,8 @@ impl Render for ExchangePane {
             .aria_label(t("export.task.title"))
             .flex()
             .flex_col()
-            .gap(px(18.))
-            .p(px(16.));
+            .gap(px(metrics.section_gap()))
+            .p(px(metrics.page_pad));
         if !self.notice.is_empty() {
             panel = panel.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.hover).text_size(px(TypeScale::SM)).child(SharedString::from(self.notice.clone())));
         }

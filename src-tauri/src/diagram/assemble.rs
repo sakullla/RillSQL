@@ -51,7 +51,7 @@ pub(crate) fn assemble_diagram(scope: &RangeScope, attempts: Vec<TableAttempt>) 
                 outgoing.push((attempt.name.clone(), keys));
                 tables.push(DiagramTable {
                     name: attempt.name,
-                    columns,
+                    columns: columns.into_inner(),
                     outside: Vec::new(),
                 });
             }

@@ -5,9 +5,10 @@ use std::sync::Arc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::{
-    canvas, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, PathBuilder, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    TestSupportExt as _, Window, div, px,
+    canvas, AppContext as _, ClickEvent, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, PathBuilder,
+    Render, ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
 };
 
 use crate::ui::kit::{self, Palette, Radius, Tip as _, TypeScale};
@@ -17,7 +18,28 @@ use crate::application::AppServices;
 use crate::diagram::{Diagram, DiagramEdge, DiagramTable};
 use crate::i18n::{self, Locale};
 
+const ZOOM_MIN: f32 = 0.4;
+const ZOOM_MAX: f32 = 2.0;
+
 const OWNER: &str = "diagram";
+
+/// 双击或菜单请求打开表。只记下目标，不执行 SQL；外壳稍后取走。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiagramOpen {
+    pub connection_id: String,
+    pub database: String,
+    pub schema: String,
+    pub table: String,
+    pub structure: bool,
+}
+
+struct DragPan {
+    x: f32,
+    y: f32,
+    pan_x: f32,
+    pan_y: f32,
+    moved: bool,
+}
 
 pub struct DiagramPane {
     services: Arc<AppServices>,
@@ -32,6 +54,25 @@ pub struct DiagramPane {
     hovered: Option<String>,
     token: Option<TaskToken>,
     applied: String,
+    zoom: f32,
+    pan_x: f32,
+    pan_y: f32,
+    search: String,
+    highlight: Option<String>,
+    center_pending: bool,
+    navigation: Option<DiagramOpen>,
+    card_menu: Option<String>,
+    back: bool,
+    drag: Option<DragPan>,
+    content_w: f32,
+    content_h: f32,
+    search_input: Option<EntityInput>,
+}
+
+struct EntityInput {
+    state: gpui_kit::Entity<InputState>,
+    sync: String,
+    _sub: gpui_kit::Subscription,
 }
 
 impl DiagramPane {
@@ -49,7 +90,30 @@ impl DiagramPane {
             hovered: None,
             token: None,
             applied: String::new(),
+            zoom: 1.,
+            pan_x: 0.,
+            pan_y: 0.,
+            search: String::new(),
+            highlight: None,
+            center_pending: false,
+            navigation: None,
+            card_menu: None,
+            back: false,
+            drag: None,
+            content_w: 0.,
+            content_h: 0.,
+            search_input: None,
         }
+    }
+
+    pub fn take_back(&mut self) -> bool {
+        let back = self.back;
+        self.back = false;
+        back
+    }
+
+    pub fn take_open(&mut self) -> Option<DiagramOpen> {
+        self.navigation.take()
     }
 
     pub fn set_locale(&mut self, locale: Locale) {
@@ -76,7 +140,7 @@ impl DiagramPane {
         self.database = target.1;
         self.schema = target.2;
         self.label = target.3;
-        self.hovered = None;
+        self.reset_canvas();
         self.diagram = None;
         self.error.clear();
         self.read(cx);
@@ -90,8 +154,39 @@ impl DiagramPane {
         } else if id == "diagram-retry" && !self.connection_id.is_empty() {
             self.error.clear();
             self.read(cx);
+        } else if id == "diagram-back" {
+            self.back = true;
+        } else if id == "diagram-zoom-in" {
+            self.zoom = clamp_zoom(self.zoom + 0.1);
+        } else if id == "diagram-zoom-out" {
+            self.zoom = clamp_zoom(self.zoom - 0.1);
+        } else if id == "diagram-zoom-reset" {
+            self.zoom = 1.;
+            self.pan_x = 0.;
+            self.pan_y = 0.;
+        } else if id == "diagram-menu-close" {
+            self.card_menu = None;
+        } else if let Some(name) = id.strip_prefix("diagram-open-data:") {
+            self.request_open(name, false);
+        } else if let Some(name) = id.strip_prefix("diagram-open-structure:") {
+            self.request_open(name, true);
+        } else if let Some(name) = id.strip_prefix("diagram-menu:") {
+            self.card_menu = Some(name.to_owned());
         }
         cx.notify();
+    }
+
+    fn reset_canvas(&mut self) {
+        self.hovered = None;
+        self.zoom = 1.;
+        self.pan_x = 0.;
+        self.pan_y = 0.;
+        self.search.clear();
+        self.highlight = None;
+        self.center_pending = false;
+        self.navigation = None;
+        self.card_menu = None;
+        self.drag = None;
     }
 
     fn clear_target(&mut self) {
@@ -101,7 +196,73 @@ impl DiagramPane {
         self.label.clear();
         self.diagram = None;
         self.loading = false;
-        self.hovered = None;
+        self.reset_canvas();
+    }
+
+    /// 记下要打开的表。不连接数据库，也不发送 SQL。
+    pub fn request_open(&mut self, table: &str, structure: bool) {
+        let known = self.diagram.as_ref().is_some_and(|diagram| diagram.tables.iter().any(|item| item.name == table));
+        if !known || self.connection_id.is_empty() {
+            return;
+        }
+        self.card_menu = None;
+        self.navigation = Some(DiagramOpen {
+            connection_id: self.connection_id.clone(),
+            database: self.database.clone(),
+            schema: self.schema.clone(),
+            table: table.to_owned(),
+            structure,
+        });
+    }
+
+    fn focus_search(&mut self, query: String) {
+        self.search = query;
+        let needle = self.search.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            self.highlight = None;
+            self.center_pending = false;
+            return;
+        }
+        self.highlight = self.diagram.as_ref().and_then(|diagram| {
+            diagram.tables.iter().find(|table| table.name.to_ascii_lowercase().contains(&needle)).map(|table| table.name.clone())
+        });
+        self.center_pending = self.highlight.is_some();
+    }
+
+    fn fit_view(&mut self, viewport_w: f32, viewport_h: f32) {
+        if self.content_w <= 1. || self.content_h <= 1. {
+            self.zoom = 1.;
+            self.pan_x = 0.;
+            self.pan_y = 0.;
+            return;
+        }
+        let zx = (viewport_w - 24.).max(80.) / self.content_w;
+        let zy = (viewport_h - 24.).max(80.) / self.content_h;
+        self.zoom = clamp_zoom(zx.min(zy));
+        self.pan_x = 12.;
+        self.pan_y = 12.;
+    }
+
+    fn begin_drag(&mut self, x: f32, y: f32) {
+        self.drag = Some(DragPan { x, y, pan_x: self.pan_x, pan_y: self.pan_y, moved: false });
+    }
+
+    fn move_drag(&mut self, x: f32, y: f32) {
+        let Some(drag) = &self.drag else { return };
+        let dx = x - drag.x;
+        let dy = y - drag.y;
+        if !drag.moved && dx.abs() < 3. && dy.abs() < 3. {
+            return;
+        }
+        self.pan_x = drag.pan_x + dx;
+        self.pan_y = drag.pan_y + dy;
+        if let Some(drag) = self.drag.as_mut() {
+            drag.moved = true;
+        }
+    }
+
+    fn end_drag(&mut self) {
+        self.drag = None;
     }
 
     fn read(&mut self, cx: &mut Context<Self>) {
@@ -195,13 +356,27 @@ impl DiagramPane {
         }
         let columns = layout_columns(&diagram.tables, &diagram.edges);
         let foreign = foreign_columns(diagram);
+        lines.push(format!("zoom {}", (self.zoom * 100.).round() as i32));
+        if let Some(name) = &self.highlight {
+            lines.push(format!("highlight {name}"));
+        }
+        if let Some(open) = &self.navigation {
+            let kind = if open.structure { "open-structure" } else { "open-data" };
+            lines.push(format!("{kind} {}", open.table));
+        }
         for (index, column) in columns.iter().enumerate() {
             for table in column {
                 let mark = hover_mark(self.hovered.as_deref(), &table.name, diagram);
                 lines.push(format!("column {index} {mark} {}", table.name));
-                for name in &table.columns {
-                    let fk = if foreign.contains(&format!("{}.{}", table.name, name)) { "fk" } else { "column" };
-                    lines.push(format!("{fk} {}.{}", table.name, name));
+                for column in &table.columns {
+                    let fk = if foreign.contains(&format!("{}.{}", table.name, column.name)) { "fk" } else { "column" };
+                    lines.push(format!("{fk} {}.{}", table.name, column.name));
+                    if column.primary {
+                        lines.push(format!("pk {}.{}", table.name, column.name));
+                    }
+                    if !column.type_name.is_empty() {
+                        lines.push(format!("type {}.{} {}", table.name, column.name, column.type_name));
+                    }
                 }
                 for note in &table.outside {
                     lines.push(format!("outside {}", note));
@@ -214,7 +389,7 @@ impl DiagramPane {
         for edge in &diagram.edges {
             let mark = if edge_hot(self.hovered.as_deref(), edge) { "hot-wire" } else if self.hovered.is_some() { "dim-wire" } else { "wire" };
             lines.push(format!(
-                "{mark} {}.{} -> {}.{}",
+                "{mark} arrow {}.{} -> {}.{}",
                 edge.from_table,
                 edge.from_columns.join(", "),
                 edge.to_table,
@@ -223,6 +398,14 @@ impl DiagramPane {
         }
         lines
     }
+}
+
+fn clamp_zoom(zoom: f32) -> f32 {
+    zoom.clamp(ZOOM_MIN, ZOOM_MAX)
+}
+
+fn column_index(table: &DiagramTable, name: &str) -> Option<usize> {
+    table.columns.iter().position(|column| column.name == name)
 }
 
 fn parse_spec(spec: &str) -> Option<(String, String, String, String)> {
@@ -330,6 +513,51 @@ mod tests {
     }
 
     #[test]
+    fn typed_columns_zoom_and_open_request_do_not_run_sql() {
+        let dir = std::env::temp_dir().join(format!("rillsql-diagram-open-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        let mut pane = DiagramPane::new(services);
+        pane.connection_id = "notes".into();
+        pane.database = "main".into();
+        pane.diagram = Some(Diagram {
+            database: "main".into(),
+            schema: String::new(),
+            tables: vec![DiagramTable {
+                name: "orders".into(),
+                columns: vec![
+                    crate::diagram::DiagramColumn { name: "id".into(), type_name: "INTEGER".into(), primary: true },
+                    crate::diagram::DiagramColumn { name: "customer_id".into(), type_name: "INTEGER".into(), primary: false },
+                ],
+                outside: Vec::new(),
+            }],
+            edges: Vec::new(),
+            omitted: Vec::new(),
+            notice: None,
+        });
+        let text = pane.lines().join("\n");
+        assert!(text.contains("pk orders.id"), "{text}");
+        assert!(text.contains("type orders.id INTEGER"), "{text}");
+        assert!(text.contains("column orders.customer_id"), "{text}");
+        pane.focus_search("ord".into());
+        assert_eq!(pane.highlight.as_deref(), Some("orders"));
+        assert!(pane.center_pending);
+        pane.zoom = 1.;
+        pane.zoom = clamp_zoom(pane.zoom + 5.);
+        assert_eq!(pane.zoom, 2.);
+        pane.zoom = clamp_zoom(pane.zoom - 5.);
+        assert_eq!(pane.zoom, 0.4);
+        pane.request_open("orders", false);
+        let open = pane.take_open().expect("导航请求");
+        assert_eq!(open.table, "orders");
+        assert!(!open.structure);
+        assert!(pane.take_open().is_none());
+        pane.request_open("missing", true);
+        assert!(pane.take_open().is_none(), "不存在的表不能变成打开请求");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn object_spec_skips_non_relational_engines() {
         assert_eq!(spec_from_object("notes|笔记|main||customers|sqlite|dev").as_deref(), Some("notes|main||笔记"));
         assert!(spec_from_object("cache|缓存|0||key|redis|dev").is_none());
@@ -417,6 +645,11 @@ mod tests {
                 assert!(hot.contains("hot-wire"), "{hot}");
                 assert!(hot.contains("dim notes"), "{hot}");
             });
+            window.double_click("diagram-card:orders", cx);
+            view.update(cx, |view, cx| {
+                let text = view.diagram_text(cx);
+                assert!(text.contains("open-data orders"), "{text}");
+            });
             window.hover("diagram-pad", cx);
             view.update(cx, |view, cx| {
                 let text = view.diagram_text(cx);
@@ -486,44 +719,124 @@ fn card_height(table: &DiagramTable) -> f32 {
     HEAD_H + ROW_H * table.columns.len().max(1) as f32 + 10. + if table.outside.is_empty() { 0. } else { ROW_H }
 }
 
+fn paint_arrow(end: gpui_kit::Point<gpui_kit::Pixels>, toward: gpui_kit::Point<gpui_kit::Pixels>, color: gpui_kit::Hsla, window: &mut Window) {
+    let dx = (end.x - toward.x).as_f32();
+    let dy = (end.y - toward.y).as_f32();
+    let len = (dx * dx + dy * dy).sqrt().max(1.);
+    let ux = dx / len;
+    let uy = dy / len;
+    let px_n = -uy;
+    let py_n = ux;
+    let size = 9.;
+    let wing = 4.5;
+    let base_x = end.x.as_f32() - ux * size;
+    let base_y = end.y.as_f32() - uy * size;
+    let mut builder = PathBuilder::fill();
+    builder.move_to(end);
+    builder.line_to(gpui_kit::point(px(base_x + px_n * wing), px(base_y + py_n * wing)));
+    builder.line_to(gpui_kit::point(px(base_x - px_n * wing), px(base_y - py_n * wing)));
+    builder.close();
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
+    }
+}
+
+impl DiagramPane {
+    fn search_field(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::Entity<InputState> {
+        if self.search_input.is_none() {
+            let placeholder = SharedString::from(i18n::text(self.locale, "diagram.search"));
+            let initial = self.search.clone();
+            let state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(initial.clone()));
+            let subscription = cx.subscribe(&state, |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let text = input.read(cx).value().to_string();
+                    if let Some(field) = this.search_input.as_mut() {
+                        field.sync = text.clone();
+                    }
+                    this.focus_search(text);
+                    cx.notify();
+                }
+            });
+            self.search_input = Some(EntityInput { state, sync: self.search.clone(), _sub: subscription });
+        }
+        let wanted = self.search.clone();
+        let field = self.search_input.as_mut().expect("search");
+        if field.sync != wanted {
+            field.sync = wanted.clone();
+            field.state.update(cx, |state, cx| {
+                if state.value().as_ref() != wanted {
+                    state.set_value(wanted, window, cx);
+                }
+            });
+        }
+        field.state.clone()
+    }
+}
+
 impl Render for DiagramPane {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::of(cx);
+        let metrics = kit::Metrics::of(cx);
         let entity = cx.entity();
         let locale = self.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let search = self.search_field(window, cx);
         let summary = SharedString::from(self.lines().join("\n"));
         let diagram = self.diagram.clone();
         let hovered = self.hovered.clone();
+        let highlight = self.highlight.clone();
+        let menu_table = self.card_menu.clone();
+        let zoom = self.zoom;
         let mono = cx.theme().mono_font_family.clone();
-
-        let header = div()
-            .flex_none()
-            .px(px(20.))
-            .py(px(12.))
-            .flex()
-            .items_center()
-            .gap(px(12.))
-            .border_b_1()
-            .border_color(p.line)
-            .child(div().size(px(30.)).rounded(px(Radius::PANEL)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(IconName::Workflow, 16., p.accent_text)))
-            .child(
-                // 只读说明放进标题的悬停提示，不常驻占一行。
-                div()
-                    .id("diagram-title")
-                    .flex_1()
-                    .min_w(px(0.))
-                    .flex()
-                    .flex_col()
-                    .tooltip_text(t("diagram.readonly"))
-                    .child(kit::title(SharedString::from(if self.label.is_empty() { i18n::text(locale, "catalog.tree.diagram") } else { self.label.clone() }), TypeScale::LG, &p)),
-            )
-            .when_some(diagram.as_ref(), |this, diagram| {
-                this.child(kit::pill(SharedString::from(format!("{} · {}", diagram.tables.len(), diagram.edges.len())), p.text_muted, p.hover))
+        let title = SharedString::from(if self.label.is_empty() { i18n::text(locale, "catalog.tree.diagram") } else { self.label.clone() });
+        let zoom_out = {
+            let entity = entity.clone();
+            kit::icon_button("diagram-zoom-out", IconName::Minus, t("diagram.zoom.out"), move |_, _, cx| {
+                entity.update(cx, |pane, cx| pane.command("diagram-zoom-out", cx))
             })
-            .child(div().id("diagram-pad").test_support().w(px(8.)).h(px(28.)));
+        };
+        let zoom_in = {
+            let entity = entity.clone();
+            kit::icon_button("diagram-zoom-in", IconName::Plus, t("diagram.zoom.in"), move |_, _, cx| {
+                entity.update(cx, |pane, cx| pane.command("diagram-zoom-in", cx))
+            })
+        };
+        let zoom_reset = {
+            let entity = entity.clone();
+            kit::tool_button("diagram-zoom-reset", None, t("diagram.zoom.reset"), move |_, _, cx| {
+                entity.update(cx, |pane, cx| pane.command("diagram-zoom-reset", cx))
+            })
+        };
+        let zoom_fit = {
+            let entity = entity.clone();
+            kit::tool_button("diagram-zoom-fit", Some(IconName::Maximize), t("diagram.zoom.fit"), move |_, window, cx| {
+                let size = window.viewport_size();
+                entity.update(cx, |pane, cx| {
+                    pane.fit_view(size.width.as_f32(), size.height.as_f32());
+                    cx.notify();
+                });
+            })
+        };
+        let back = {
+            let entity = entity.clone();
+            kit::tool_button("diagram-back", Some(IconName::ArrowLeft), t("compare.back"), move |_, _, cx| {
+                entity.update(cx, |pane, cx| pane.command("diagram-back", cx))
+            })
+        };
 
-        let mut body = div().id("diagram-scroll").flex_1().min_h(px(0.)).overflow_scroll().bg(p.chrome);
+        // 只读说明放进标题的悬停提示，不常驻占一行。页头高度和左右边距走统一令牌。
+        let header = div().id("diagram-title").tooltip_text(t("diagram.readonly")).child(
+            kit::page_header(title, &[], &metrics, &p)
+                .child(div().w(px(180.)).child(kit::text_input("diagram-search", &search, t("diagram.search"))))
+                .child(zoom_out)
+                .child(zoom_reset)
+                .child(zoom_in)
+                .child(zoom_fit)
+                .child(back)
+                .child(div().id("diagram-pad").test_support().w(px(8.)).h(px(metrics.control_h))),
+        );
+
+        let mut body = div().id("diagram-scroll").flex_1().min_h(px(0.)).overflow_hidden().bg(p.chrome);
         if self.loading {
             body = body.child(kit::loading_state(t("diagram.loading"), &p).size_full());
         } else if !self.error.is_empty() {
@@ -550,7 +863,7 @@ impl Render for DiagramPane {
             } else {
                 let columns = layout_columns(&diagram.tables, &diagram.edges);
                 let foreign = foreign_columns(diagram);
-                // 卡片位置：按列从左到右，被引用的表在左。
+                // 卡片位置：按列从左到右，被引用的表在左。先算未缩放坐标，再平移和缩放。
                 let mut places: std::collections::HashMap<String, (f32, f32, f32)> = std::collections::HashMap::new();
                 let mut width = 0f32;
                 let mut height = 0f32;
@@ -565,18 +878,102 @@ impl Render for DiagramPane {
                     width = width.max(x + CARD_W + PAD);
                     height = height.max(y + PAD);
                 }
-                let mut canvas_box = div().relative().w(px(width.max(400.))).h(px(height.max(300.)));
+                self.content_w = width;
+                self.content_h = height;
+                if self.center_pending {
+                    self.center_pending = false;
+                    if let Some(name) = highlight.clone() {
+                        if let Some(&(x, y, h)) = places.get(&name) {
+                            let view = window.viewport_size();
+                            self.pan_x = view.width.as_f32() * 0.45 - (x + CARD_W * 0.5) * zoom;
+                            self.pan_y = view.height.as_f32() * 0.35 - (y + h * 0.5) * zoom;
+                        }
+                    }
+                }
+                let pan_x = self.pan_x;
+                let pan_y = self.pan_y;
+                for place in places.values_mut() {
+                    place.0 = pan_x + place.0 * zoom;
+                    place.1 = pan_y + place.1 * zoom;
+                    place.2 *= zoom;
+                }
+                let board_w = (pan_x + width * zoom).max(400.);
+                let board_h = (pan_y + height * zoom).max(300.);
+                let card_w = CARD_W * zoom;
+                let head_h = HEAD_H * zoom;
+                let row_h = ROW_H * zoom;
+                let board_entity = entity.clone();
+                let mut canvas_box = div()
+                    .id("diagram-board")
+                    .relative()
+                    .w(px(board_w))
+                    .h(px(board_h))
+                    .on_scroll({
+                        let board_entity = board_entity.clone();
+                        move |event: &ScrollEvent, _, cx| {
+                            let steps = match event.delta {
+                                ScrollDelta::Pixels(point) => point.y.as_f32() / 80.,
+                                ScrollDelta::Lines(point) => point.y,
+                            };
+                            if steps.abs() < 0.01 {
+                                return;
+                            }
+                            board_entity.update(cx, |pane, cx| {
+                                pane.zoom = clamp_zoom(pane.zoom + steps * 0.1);
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .on_mouse_down(MouseButton::Left, {
+                        let board_entity = board_entity.clone();
+                        move |event: &MouseDownEvent, _, cx| {
+                            board_entity.update(cx, |pane, _| pane.begin_drag(event.position.x.as_f32(), event.position.y.as_f32()));
+                        }
+                    })
+                    .on_mouse_down(MouseButton::Middle, {
+                        let board_entity = board_entity.clone();
+                        move |event: &MouseDownEvent, _, cx| {
+                            board_entity.update(cx, |pane, _| pane.begin_drag(event.position.x.as_f32(), event.position.y.as_f32()));
+                        }
+                    })
+                    .on_mouse_move({
+                        let board_entity = board_entity.clone();
+                        move |event: &MouseMoveEvent, _, cx| {
+                            board_entity.update(cx, |pane, cx| {
+                                if pane.drag.is_some() {
+                                    pane.move_drag(event.position.x.as_f32(), event.position.y.as_f32());
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    })
+                    .on_mouse_up(MouseButton::Left, {
+                        let board_entity = board_entity.clone();
+                        move |_: &gpui_kit::MouseUpEvent, _, cx| {
+                            board_entity.update(cx, |pane, cx| {
+                                pane.end_drag();
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .on_mouse_up(MouseButton::Middle, {
+                        let board_entity = board_entity.clone();
+                        move |_: &gpui_kit::MouseUpEvent, _, cx| {
+                            board_entity.update(cx, |pane, cx| {
+                                pane.end_drag();
+                                cx.notify();
+                            });
+                        }
+                    });
                 // 连线
                 let mut wires: Vec<(gpui_kit::Point<gpui_kit::Pixels>, gpui_kit::Point<gpui_kit::Pixels>, bool)> = Vec::new();
                 for edge in &diagram.edges {
                     let (Some(from), Some(to)) = (places.get(&edge.from_table), places.get(&edge.to_table)) else { continue };
                     let from_table = diagram.tables.iter().find(|table| table.name == edge.from_table);
-                    let row = from_table
-                        .and_then(|table| edge.from_columns.first().and_then(|column| table.columns.iter().position(|name| name == column)))
-                        .unwrap_or(0);
-                    let start_y = from.1 + HEAD_H + ROW_H * row as f32 + ROW_H / 2. + 5.;
-                    let end_y = to.1 + HEAD_H / 2.;
-                    let (start_x, end_x) = if from.0 > to.0 { (from.0, to.0 + CARD_W) } else if from.0 < to.0 { (from.0 + CARD_W, to.0) } else { (from.0 + CARD_W, to.0 + CARD_W) };
+                    let row = from_table.and_then(|table| edge.from_columns.first().and_then(|column| column_index(table, column))).unwrap_or(0);
+                    let start_y = from.1 + (HEAD_H + ROW_H * row as f32 + ROW_H / 2. + 5.) * zoom;
+                    let end_y = to.1 + head_h / 2.;
+                    let (start_x, end_x) = if from.0 > to.0 { (from.0, to.0 + card_w) } else if from.0 < to.0 { (from.0 + card_w, to.0) } else { (from.0 + card_w, to.0 + card_w) };
                     wires.push((gpui_kit::point(px(start_x), px(start_y)), gpui_kit::point(px(end_x), px(end_y)), edge_hot(hovered.as_deref(), edge)));
                 }
                 let dim = hovered.is_some();
@@ -603,6 +1000,7 @@ impl Render for DiagramPane {
                                 if let Ok(path) = builder.build() {
                                     let color = if *hot { hot_wire } else if dim { dim_wire } else { wire };
                                     window.paint_path(path, color);
+                                    paint_arrow(end, c2, color, window);
                                 }
                             }
                         },
@@ -618,25 +1016,52 @@ impl Render for DiagramPane {
                         let label = SharedString::from(format!("{mark} {}", table.name));
                         let hovered_name = name.clone();
                         let card_entity = entity.clone();
-                        let (border, head_bg, opacity) = match mark {
+                        let (mut border, head_bg, opacity) = match mark {
                             "hot" => (p.accent, p.accent_soft, 1.),
                             "linked" => (p.accent, p.surface, 1.),
                             "dim" => (p.line, p.surface, 0.45),
                             _ => (p.line_strong, p.surface, 1.),
                         };
-                        let mut rows = div().flex().flex_col().py(px(5.));
-                        for column_name in &table.columns {
-                            let fk = foreign.contains(&format!("{}.{}", table.name, column_name));
+                        if highlight.as_deref() == Some(table.name.as_str()) {
+                            border = p.accent;
+                        }
+                        let mut rows = div().flex().flex_col().py(px(5. * zoom));
+                        for column in &table.columns {
+                            let fk = foreign.contains(&format!("{}.{}", table.name, column.name));
+                            let icon = if column.primary {
+                                IconName::Key
+                            } else if fk {
+                                IconName::Link
+                            } else {
+                                IconName::Dot
+                            };
+                            let icon_color = if column.primary {
+                                p.warn
+                            } else if fk {
+                                p.accent
+                            } else {
+                                p.text_faint
+                            };
                             rows = rows.child(
                                 div()
-                                    .h(px(ROW_H))
+                                    .h(px(row_h))
                                     .px(px(12.))
                                     .flex()
                                     .items_center()
                                     .gap(px(6.))
                                     .text_size(px(TypeScale::SM))
-                                    .child(kit::icon(if fk { IconName::Link } else { IconName::Dot }, 11., if fk { p.accent } else { p.text_faint }))
-                                    .child(div().truncate().font_family(mono.clone()).when(fk, |this| this.text_color(p.accent_text)).child(SharedString::from(column_name.clone()))),
+                                    .child(kit::icon(icon, 11., icon_color))
+                                    .child(div().truncate().font_family(mono.clone()).when(fk, |this| this.text_color(p.accent_text)).child(SharedString::from(column.name.clone())))
+                                    .when(!column.type_name.is_empty(), |this| {
+                                        this.child(
+                                            div()
+                                                .ml_auto()
+                                                .truncate()
+                                                .text_size(px(TypeScale::XS))
+                                                .text_color(p.text_faint)
+                                                .child(SharedString::from(column.type_name.clone())),
+                                        )
+                                    }),
                             );
                         }
                         if table.columns.is_empty() {
@@ -654,7 +1079,7 @@ impl Render for DiagramPane {
                                 .absolute()
                                 .left(px(x))
                                 .top(px(y))
-                                .w(px(CARD_W))
+                                .w(px(card_w))
                                 .opacity(opacity)
                                 .rounded(px(Radius::PANEL))
                                 .border_1()
@@ -664,7 +1089,7 @@ impl Render for DiagramPane {
                                 .overflow_hidden()
                                 .child(
                                     div()
-                                        .h(px(HEAD_H))
+                                        .h(px(head_h))
                                         .px(px(12.))
                                         .flex()
                                         .items_center()
@@ -676,6 +1101,25 @@ impl Render for DiagramPane {
                                         .child(div().truncate().font_weight(FontWeight::SEMIBOLD).child(SharedString::from(table.name.clone()))),
                                 )
                                 .child(rows)
+                                .on_click({
+                                    let name = name.clone();
+                                    let card_entity = card_entity.clone();
+                                    move |event: &ClickEvent, _, cx| {
+                                        let double = matches!(event, ClickEvent::Mouse(mouse) if mouse.down.click_count >= 2 && mouse.down.button == MouseButton::Left);
+                                        let secondary = event.is_secondary();
+                                        if !double && !secondary {
+                                            return;
+                                        }
+                                        card_entity.update(cx, |pane, cx| {
+                                            if double {
+                                                pane.request_open(&name, false);
+                                            } else {
+                                                pane.card_menu = Some(name.clone());
+                                            }
+                                            cx.notify();
+                                        });
+                                    }
+                                })
                                 .on_hover(move |inside, _, cx| {
                                     let hovered_name = hovered_name.clone();
                                     card_entity.update(cx, |pane, cx| {
@@ -691,6 +1135,39 @@ impl Render for DiagramPane {
                     }
                 }
                 body = body.child(canvas_box);
+                if let Some(name) = menu_table.clone() {
+                    let open_data = {
+                        let entity = entity.clone();
+                        let table = name.clone();
+                        kit::tool_button(SharedString::from(format!("diagram-open-data:{table}")), Some(IconName::Table), t("diagram.openData"), move |_, _, cx| {
+                            let table = table.clone();
+                            entity.update(cx, |pane, cx| pane.command(&format!("diagram-open-data:{table}"), cx));
+                        })
+                    };
+                    let open_structure = {
+                        let entity = entity.clone();
+                        let table = name.clone();
+                        kit::tool_button(SharedString::from(format!("diagram-open-structure:{table}")), Some(IconName::Columns3), t("diagram.openStructure"), move |_, _, cx| {
+                            let table = table.clone();
+                            entity.update(cx, |pane, cx| pane.command(&format!("diagram-open-structure:{table}"), cx));
+                        })
+                    };
+                    body = body.child(
+                        div()
+                            .flex_none()
+                            .px(px(metrics.pane_pad()))
+                            .py(px(8.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .bg(p.surface)
+                            .border_t_1()
+                            .border_color(p.line)
+                            .child(div().text_size(px(TypeScale::SM)).child(SharedString::from(name)))
+                            .child(open_data)
+                            .child(open_structure),
+                    );
+                }
             }
         } else {
             body = body.child(div().size_full().flex().items_center().justify_center().child(kit::empty_state(IconName::Workflow, t("catalog.tree.diagram"), t("diagram.needTarget"), &p)));
@@ -699,7 +1176,7 @@ impl Render for DiagramPane {
         let mut footer = div().flex_none().flex().flex_col();
         if let Some(diagram) = diagram.as_ref() {
             if !diagram.omitted.is_empty() || diagram.notice.is_some() {
-                let mut notes = div().px(px(20.)).py(px(8.)).flex().flex_col().gap(px(4.)).border_t_1().border_color(p.line).text_size(px(TypeScale::SM)).text_color(p.warn);
+                let mut notes = div().px(px(metrics.page_pad)).py(px(8.)).flex().flex_col().gap(px(4.)).border_t_1().border_color(p.line).text_size(px(TypeScale::SM)).text_color(p.warn);
                 if let Some(notice) = &diagram.notice {
                     notes = notes.child(SharedString::from(notice.clone()));
                 }

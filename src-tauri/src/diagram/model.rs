@@ -19,11 +19,48 @@ pub(crate) struct OutgoingKey {
     pub ref_columns: Vec<String>,
 }
 
+/// 列名、数据类型和是否主键。只有名字时类型留空、主键为 false，旧测试仍能按名字比较。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagramColumn {
+    pub name: String,
+    pub type_name: String,
+    pub primary: bool,
+}
+
+impl DiagramColumn {
+    pub(crate) fn plain(name: String) -> Self {
+        Self { name, type_name: String::new(), primary: false }
+    }
+}
+
+impl PartialEq<&str> for DiagramColumn {
+    fn eq(&self, other: &&str) -> bool {
+        self.name == *other
+    }
+}
+
+/// 读取到的列。`FromIterator<String>` 让只给列名的测试仍能构造。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadColumns(pub Vec<DiagramColumn>);
+
+impl ReadColumns {
+    pub(crate) fn into_inner(self) -> Vec<DiagramColumn> {
+        self.0
+    }
+}
+
+impl FromIterator<String> for ReadColumns {
+    fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
+        Self(iter.into_iter().map(DiagramColumn::plain).collect())
+    }
+}
+
 /// 一张基表的读取结果。列或外键失败时整张表不进入图。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TableAttempt {
     pub name: String,
-    pub columns: Result<Vec<String>, String>,
+    pub columns: Result<ReadColumns, String>,
     pub foreign_keys: Result<Vec<OutgoingKey>, String>,
 }
 
@@ -38,7 +75,7 @@ pub(crate) struct RangeScope {
 #[serde(rename_all = "camelCase")]
 pub struct DiagramTable {
     pub name: String,
-    pub columns: Vec<String>,
+    pub columns: Vec<DiagramColumn>,
     pub outside: Vec<String>,
 }
 

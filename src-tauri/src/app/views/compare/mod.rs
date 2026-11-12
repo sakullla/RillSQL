@@ -5,13 +5,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::input::{Editor, EditorState, InputEvent, InputState};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _};
+use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    TestSupportExt as _, Window, div, px,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, TestSupportExt as _, Window, div, px, relative,
 };
 
 use crate::ui::kit::{self, Palette, Radius, Tip as _, TypeScale};
@@ -40,6 +40,14 @@ enum Status {
 enum RunKind {
     Structure,
     Data,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiffFilter {
+    All,
+    Baseline,
+    Target,
+    Changed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,6 +140,11 @@ pub struct ComparePane {
     back: bool,
     /// 连接清单正在读取；带入上下文时不再重复发起同一份读取。
     choices_loading: bool,
+    diff_filter: DiffFilter,
+    diff_query: String,
+    schema_reload: bool,
+    filter_input: Option<(Entity<InputState>, gpui_kit::Subscription)>,
+    script_editors: BTreeMap<&'static str, (Entity<EditorState>, String)>,
     #[cfg(test)]
     armed_pause: bool,
     #[cfg(test)]
@@ -168,6 +181,11 @@ impl ComparePane {
             context_note: String::new(),
             back: false,
             choices_loading: false,
+            diff_filter: DiffFilter::All,
+            diff_query: String::new(),
+            schema_reload: false,
+            filter_input: None,
+            script_editors: BTreeMap::new(),
             #[cfg(test)]
             armed_pause: false,
             #[cfg(test)]
@@ -369,8 +387,60 @@ impl ComparePane {
         } else if id == "compare-place-cancel" {
             self.pending_place = None;
             self.place_prompt.clear();
+        } else if id == "compare-swap" {
+            self.swap_sides();
+        } else if id == "compare-select-all" {
+            self.select_all_tables();
+        } else if id == "compare-clear" {
+            self.clear_table_selection();
+        } else if id == "compare-filter:all" {
+            self.diff_filter = DiffFilter::All;
+        } else if id == "compare-filter:baseline" {
+            self.diff_filter = DiffFilter::Baseline;
+        } else if id == "compare-filter:target" {
+            self.diff_filter = DiffFilter::Target;
+        } else if id == "compare-filter:changed" {
+            self.diff_filter = DiffFilter::Changed;
+        } else if id == "compare-copy:structure" {
+            self.copy_script(RunKind::Structure, cx);
+        } else if id == "compare-copy:data" {
+            self.copy_script(RunKind::Data, cx);
         }
         cx.notify();
+    }
+
+    fn swap_sides(&mut self) {
+        std::mem::swap(&mut self.baseline, &mut self.target);
+        let left = self.schema_draft.remove("baseline").unwrap_or_default();
+        let right = self.schema_draft.remove("target").unwrap_or_default();
+        self.schema_draft.insert("baseline".into(), right);
+        self.schema_draft.insert("target".into(), left);
+        self.schema_reload = true;
+        self.invalidate_results();
+    }
+
+    fn select_all_tables(&mut self) {
+        let Some(report) = &self.structure else { return };
+        for table in &report.tables {
+            if table.on_both && name_matches(&table.name, &self.diff_query) {
+                self.selected.insert(table.name.clone(), true);
+            }
+        }
+    }
+
+    fn clear_table_selection(&mut self) {
+        for selected in self.selected.values_mut() {
+            *selected = false;
+        }
+    }
+
+    fn copy_script(&self, kind: RunKind, cx: &mut Context<Self>) {
+        let script = match kind {
+            RunKind::Structure => self.structure.as_ref().map(|report| report.script.clone()),
+            RunKind::Data => self.data.as_ref().map(|report| report.script.clone()),
+        };
+        let Some(script) = script.filter(|script| !script.trim().is_empty()) else { return };
+        cx.write_to_clipboard(ClipboardItem::new_string(script));
     }
 
     fn pick(&mut self, baseline: bool, connection_id: &str, cx: &mut Context<Self>) {
@@ -772,14 +842,31 @@ impl ComparePane {
         }
         self.cancel_flag.store(true, Ordering::SeqCst);
         cancel_compare(&self.services.tasks, OWNER, &self.run_id);
+        // 先记成已取消。迟到的成功结果也不能把这份取消覆盖掉。
+        self.error = self.text("compare.status.cancelled");
+        match self.run_kind {
+            Some(RunKind::Data) => {
+                self.data = None;
+                self.data_status = Status::Cancelled;
+            }
+            _ => {
+                self.structure = None;
+                self.structure_status = Status::Cancelled;
+            }
+        }
     }
 
     fn finish_structure(&mut self, token: TaskToken, flag: &AtomicBool, outcome: TaskOutcome<StructureReport>) {
         if self.token != Some(token) {
             return;
         }
+        let cancelled = self.structure_status == Status::Cancelled
+            || flag.load(Ordering::SeqCst)
+            || matches!(outcome, TaskOutcome::Cancelled { .. })
+            || compare_cancelled(&self.run_id);
         self.running = false;
-        if flag.load(Ordering::SeqCst) || matches!(outcome, TaskOutcome::Cancelled { .. }) || compare_cancelled(&self.run_id) {
+        self.token = None;
+        if cancelled {
             self.structure = None;
             self.structure_status = Status::Cancelled;
             self.error = self.text("compare.status.cancelled");
@@ -798,8 +885,13 @@ impl ComparePane {
         if self.token != Some(token) {
             return;
         }
+        let cancelled = self.data_status == Status::Cancelled
+            || flag.load(Ordering::SeqCst)
+            || matches!(outcome, TaskOutcome::Cancelled { .. })
+            || compare_cancelled(&self.run_id);
         self.running = false;
-        if flag.load(Ordering::SeqCst) || matches!(outcome, TaskOutcome::Cancelled { .. }) || compare_cancelled(&self.run_id) {
+        self.token = None;
+        if cancelled {
             self.data = None;
             self.data_status = Status::Cancelled;
             self.error = self.text("compare.status.cancelled");
@@ -978,6 +1070,9 @@ impl ComparePane {
     pub fn lines(&self) -> Vec<String> {
         // 只列实际画出来的文字：说明 `compare.dialog.subtitle` 只在标题悬停提示里，不常驻。
         let mut lines = vec![self.text("compare.dialog.title")];
+        if self.show_empty_guide() {
+            lines.push(self.text("compare.empty.guide"));
+        }
         if self.choices.is_empty() {
             lines.push(self.text("compare.dialog.chooseConnection"));
         }
@@ -1016,13 +1111,17 @@ impl ComparePane {
                         ("{changed}", &report.changed.len().to_string()),
                     ],
                 ));
-                for item in &report.only_baseline {
+                lines.push(self.text(self.diff_filter.key()));
+                if !self.diff_query.trim().is_empty() {
+                    lines.push(format!("search {}", self.diff_query.trim()));
+                }
+                for item in report.only_baseline.iter().filter(|item| self.shows_diff(DiffFilter::Baseline, &item.name)) {
                     lines.push(fill(&self.text("compare.dialog.onlyBaseline"), &[("{kind}", &item.kind), ("{name}", &item.name)]));
                 }
-                for item in &report.only_target {
+                for item in report.only_target.iter().filter(|item| self.shows_diff(DiffFilter::Target, &item.name)) {
                     lines.push(fill(&self.text("compare.dialog.onlyTarget"), &[("{kind}", &item.kind), ("{name}", &item.name)]));
                 }
-                for item in &report.changed {
+                for item in report.changed.iter().filter(|item| self.shows_diff(DiffFilter::Changed, &item.name)) {
                     lines.push(format!("{} {} {}", item.kind, item.name, item.detail));
                 }
                 for note in &report.notes {
@@ -1031,7 +1130,7 @@ impl ComparePane {
                 if report.tables.is_empty() {
                     lines.push(self.text("compare.dialog.noTables"));
                 }
-                for table in &report.tables {
+                for table in report.tables.iter().filter(|table| name_matches(&table.name, &self.diff_query)) {
                     let mark = if self.selected.get(&table.name).copied().unwrap_or(false) { "on" } else { "off" };
                     lines.push(format!("{mark} {}", table.name));
                     if !table.on_both {
@@ -1049,6 +1148,7 @@ impl ComparePane {
                 }
                 if self.structure_status != Status::Cancelled && !report.script.trim().is_empty() {
                     lines.push(self.text("compare.dialog.structureScript"));
+                    lines.push(self.text("compare.script.copy"));
                     lines.push(report.script.clone());
                 }
             }
@@ -1073,6 +1173,7 @@ impl ComparePane {
                 }
                 if self.data_status != Status::Cancelled && !report.script.trim().is_empty() {
                     lines.push(self.text("compare.dialog.dataScript"));
+                    lines.push(self.text("compare.script.copy"));
                     lines.push(report.script.clone());
                 }
             }
@@ -1082,6 +1183,37 @@ impl ComparePane {
         }
         lines
     }
+}
+
+impl ComparePane {
+    fn show_empty_guide(&self) -> bool {
+        self.structure.is_none()
+            && self.data.is_none()
+            && !self.running
+            && self.structure_status == Status::Idle
+            && self.data_status == Status::Idle
+            && self.error.is_empty()
+    }
+
+    fn shows_diff(&self, kind: DiffFilter, name: &str) -> bool {
+        (self.diff_filter == DiffFilter::All || self.diff_filter == kind) && name_matches(name, &self.diff_query)
+    }
+}
+
+impl DiffFilter {
+    fn key(self) -> &'static str {
+        match self {
+            DiffFilter::All => "compare.filter.all",
+            DiffFilter::Baseline => "compare.filter.baselineOnly",
+            DiffFilter::Target => "compare.filter.targetOnly",
+            DiffFilter::Changed => "compare.filter.changed",
+        }
+    }
+}
+
+fn name_matches(name: &str, query: &str) -> bool {
+    let query = query.trim();
+    query.is_empty() || name.to_ascii_lowercase().contains(&query.to_ascii_lowercase())
 }
 
 fn schema_key(id: &str, database: &str) -> String {
@@ -1118,17 +1250,24 @@ impl Render for ComparePane {
         let p = Palette::of(cx);
         let m = kit::Metrics::of(cx);
         let entity = cx.entity();
-        let mono = cx.theme().mono_font_family.clone();
         let t = |this: &Self, key: &str| SharedString::from(this.text(key));
 
         let baseline_card = self.side_card(true, window, cx);
         let target_card = self.side_card(false, window, cx);
+        self.schema_reload = false;
         let sides = div()
             .flex()
-            .gap(px(14.))
+            .gap(px(m.pane_pad()))
             .items_start()
             .child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).child(baseline_card))
-            .child(div().flex_none().pt(px(40.)).child(kit::icon(IconName::ArrowLeft, 18., p.text_faint)))
+            .child(
+                div().flex_none().pt(px(m.header_h() / 2.)).child(kit::icon_button(
+                    "compare-swap",
+                    IconName::ArrowRightLeft,
+                    t(self, "compare.action.swap"),
+                    compare_act("compare-swap", &entity),
+                )),
+            )
             .child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).child(target_card));
 
         let mut actions = div()
@@ -1146,7 +1285,7 @@ impl Render for ComparePane {
             actions = actions.child(div().invisible().child(kit::tool_button("compare-cancel", None, t(self, "common.cancel"), compare_act("compare-cancel", &entity))));
         }
 
-        let mut body = div().flex().flex_col().gap(px(18.)).child(sides).child(actions);
+        let mut body = div().flex().flex_col().gap(px(m.section_gap())).child(sides).child(actions);
         if !self.error.is_empty() {
             body = body.child(note_banner(IconName::CircleAlert, self.error.clone(), p.danger, p.danger_soft));
         }
@@ -1177,8 +1316,12 @@ impl Render for ComparePane {
             );
         }
 
+        if self.show_empty_guide() {
+            body = body.child(kit::empty_state(IconName::GitCompare, t(self, "compare.empty.guide"), SharedString::from(""), &p));
+        }
+
         if let Some(report) = self.structure.clone() {
-            let mut card = kit::card(&p).p(px(16.)).flex().flex_col().gap(px(12.));
+            let mut card = kit::card(&p).p(px(m.card_pad())).flex().flex_col().gap(px(m.pane_pad()));
             let can_place = report.refused.is_none() && self.structure_status != Status::Cancelled && !report.script.trim().is_empty();
             card = card.child(
                 div()
@@ -1201,14 +1344,15 @@ impl Render for ComparePane {
                         .child(stat(self.text("compare.dialog.target"), report.only_target.len(), p.danger, &p))
                         .child(stat(self.text("ui.compare.changed"), report.changed.len(), p.warn, &p)),
                 );
+                card = card.child(self.diff_toolbar(&report, &entity, &p, &m, window, cx));
                 let mut diffs = div().flex().flex_col().gap(px(2.));
-                for item in &report.only_baseline {
+                for item in report.only_baseline.iter().filter(|item| self.shows_diff(DiffFilter::Baseline, &item.name)) {
                     diffs = diffs.child(diff_row("+", fill(&self.text("compare.dialog.onlyBaseline"), &[("{kind}", &item.kind), ("{name}", &item.name)]), p.ok, &p));
                 }
-                for item in &report.only_target {
+                for item in report.only_target.iter().filter(|item| self.shows_diff(DiffFilter::Target, &item.name)) {
                     diffs = diffs.child(diff_row("−", fill(&self.text("compare.dialog.onlyTarget"), &[("{kind}", &item.kind), ("{name}", &item.name)]), p.danger, &p));
                 }
-                for item in &report.changed {
+                for item in report.changed.iter().filter(|item| self.shows_diff(DiffFilter::Changed, &item.name)) {
                     diffs = diffs.child(diff_row("~", format!("{} {} · {}", item.kind, item.name, item.detail), p.warn, &p));
                 }
                 card = card.child(diffs);
@@ -1221,8 +1365,13 @@ impl Render for ComparePane {
                 if report.tables.is_empty() {
                     card = card.child(kit::muted(t(self, "compare.dialog.noTables"), &p));
                 } else {
-                    let mut tables = div().flex().flex_wrap().gap(px(6.));
-                    for table in &report.tables {
+                    let mut tables = div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(6.))
+                        .child(kit::tool_button("compare-select-all", Some(IconName::SquareCheck), t(self, "compare.action.selectAll"), compare_act("compare-select-all", &entity)))
+                        .child(kit::tool_button("compare-clear", Some(IconName::Square), t(self, "compare.action.clear"), compare_act("compare-clear", &entity)));
+                    for table in report.tables.iter().filter(|table| name_matches(&table.name, &self.diff_query)) {
                         let on = self.selected.get(&table.name).copied().unwrap_or(false);
                         let mark = if on { "on" } else { "off" };
                         tables = tables.child(
@@ -1246,7 +1395,13 @@ impl Render for ComparePane {
                     }
                 }
                 if self.structure_status != Status::Cancelled && !report.script.trim().is_empty() {
-                    card = card.child(script_block("compare-structure-script", report.script.clone(), &mono, &p));
+                    card = card.child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .child(kit::tool_button("compare-copy:structure", Some(IconName::Copy), t(self, "compare.script.copy"), compare_act("compare-copy:structure", &entity))),
+                    );
+                    card = card.child(self.script_view("compare-structure-script", &report.script, window, cx, &p));
                 }
             }
             body = body.child(card);
@@ -1254,7 +1409,7 @@ impl Render for ComparePane {
 
         if let Some(report) = self.data.clone() {
             let can_place = report.refused.is_none() && self.data_status != Status::Cancelled && !report.script.trim().is_empty();
-            let mut card = kit::card(&p).p(px(16.)).flex().flex_col().gap(px(12.)).child(
+            let mut card = kit::card(&p).p(px(m.card_pad())).flex().flex_col().gap(px(m.pane_pad())).child(
                 div()
                     .flex()
                     .items_center()
@@ -1280,7 +1435,10 @@ impl Render for ComparePane {
                     card = card.child(kit::muted(SharedString::from(note.clone()), &p));
                 }
                 if self.data_status != Status::Cancelled && !report.script.trim().is_empty() {
-                    card = card.child(script_block("compare-data-script", report.script.clone(), &mono, &p));
+                    card = card.child(
+                        div().flex().justify_end().child(kit::tool_button("compare-copy:data", Some(IconName::Copy), t(self, "compare.script.copy"), compare_act("compare-copy:data", &entity))),
+                    );
+                    card = card.child(self.script_view("compare-data-script", &report.script, window, cx, &p));
                 }
             }
             body = body.child(card);
@@ -1302,35 +1460,34 @@ impl Render for ComparePane {
         div()
             .id("compare-pane")
             .size_full()
-            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(
+                div().id("compare-title").tooltip_text(t(self, "compare.dialog.subtitle")).child(
+                    kit::page_header(t(self, "compare.dialog.title"), &[], &m, &p)
+                        .child(div().flex_1())
+                        .child(kit::tool_button("compare-back", Some(IconName::ArrowLeft), t(self, "compare.back"), compare_act("compare-back", &entity))),
+                ),
+            )
             .child(
                 div()
-                    .max_w(px(1080.))
-                    .mx_auto()
-                    .px(px(24.))
-                    .py(px(20.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(18.))
+                    .id("compare-scroll")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
                     .child(
                         div()
+                            .max_w(px(1080.))
+                            .mx_auto()
+                            .px(px(m.page_pad))
+                            .py(px(m.page_pad_y))
                             .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(12.))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(12.))
-                                    .child(div().size(px(34.)).rounded(px(Radius::PANEL)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(IconName::GitCompare, 17., p.accent_text)))
-                                    .child(div().id("compare-title").flex().flex_col().tooltip_text(t(self, "compare.dialog.subtitle")).child(kit::title(t(self, "compare.dialog.title"), TypeScale::LG, &p))),
-                            )
-                            // 对比是独立页面：返回入口把原工作项与焦点一起带回去。
-                            .child(kit::tool_button("compare-back", Some(IconName::ArrowLeft), t(self, "compare.back"), compare_act("compare-back", &entity))),
-                    )
-                    .when_some(context_note, |this, note| this.child(note))
-                    .child(body),
+                            .flex_col()
+                            .gap(px(m.section_gap()))
+                            .when_some(context_note, |this, note| this.child(note))
+                            .child(body),
+                    ),
             )
     }
 }
@@ -1346,15 +1503,21 @@ impl ComparePane {
         let side_connection = side.connection_id.clone();
         let side_database = side.database.clone();
         let side_schema = side.schema.clone();
-        let mut card = kit::card(&p).p(px(14.)).flex().flex_col().gap(px(12.)).child(
+        let mut card = kit::card(&p).p(px(m.card_pad())).flex().flex_col().gap(px(m.pane_pad())).child(
             div()
                 .flex()
                 .items_center()
                 .gap(px(8.))
                 .child(kit::pill(SharedString::from(title.clone()), if baseline { p.ok } else { p.info }, if baseline { p.ok_soft } else { p.accent_soft }))
-                .child(kit::muted(SharedString::from(self.text("compare.dialog.connection")), &p)),
+                .child(kit::muted(SharedString::from(self.text("compare.dialog.connection")), &p))
+                .child(div().ml_auto().child(kit::icon(IconName::ChevronDown, 14., p.text_faint))),
         );
-        let mut connections = div().flex().flex_wrap().gap(px(6.));
+        let mut connections = kit::sunken(&p)
+            .id(SharedString::from(format!("compare-connections:{which}")))
+            .flex()
+            .flex_col()
+            .max_h(px(m.control_h * 4.5))
+            .overflow_y_scroll();
         if self.choices.is_empty() {
             connections = connections.child(kit::muted(SharedString::from(self.text("compare.dialog.chooseConnection")), &p));
         }
@@ -1375,7 +1538,12 @@ impl ComparePane {
         if let Some(choice) = self.choices.iter().find(|choice| choice.id == side_connection).cloned() {
             if !choice.databases.is_empty() {
                 let database_label = self.text("compare.dialog.database");
-                let mut list = div().flex().flex_wrap().gap(px(6.));
+                let mut list = kit::sunken(&p)
+                    .id(SharedString::from(format!("compare-databases:{which}")))
+                    .flex()
+                    .flex_col()
+                    .max_h(px(m.control_h * 4.5))
+                    .overflow_y_scroll();
                 for name in &choice.databases {
                     let id = format!("compare-database:{which}:{name}");
                     list = list.child(
@@ -1389,7 +1557,12 @@ impl ComparePane {
                 let schema_label = self.text("compare.dialog.chooseSchema");
                 match self.schemas.get(&schema_key(&side_connection, &side_database)).cloned() {
                     Some(SchemaState::Ready(names)) => {
-                        let mut list = div().flex().flex_wrap().gap(px(6.));
+                        let mut list = kit::sunken(&p)
+                            .id(SharedString::from(format!("compare-schemas:{which}")))
+                            .flex()
+                            .flex_col()
+                            .max_h(px(m.control_h * 4.5))
+                            .overflow_y_scroll();
                         for name in names {
                             let id = format!("compare-schema:{which}:{name}");
                             list = list.child(
@@ -1447,11 +1620,27 @@ impl ComparePane {
             if state.read(cx).presentation().placeholder() != &hint {
                 state.update(cx, |state, cx| state.set_placeholder(hint, window, cx));
             }
+            if self.schema_reload {
+                let wanted = self.schema_draft.get(side).cloned().unwrap_or_default();
+                state.update(cx, |input, cx| {
+                    if input.value().as_ref() != wanted {
+                        input.set_value(wanted, window, cx);
+                    }
+                });
+            }
             return state.clone();
         }
         let placeholder = SharedString::from(self.text("compare.dialog.schemaManualPlaceholder"));
         let initial = SharedString::from(self.schema_draft.get(side).cloned().unwrap_or_default());
         let state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(initial));
+        if self.schema_reload {
+            let wanted = self.schema_draft.get(side).cloned().unwrap_or_default();
+            state.update(cx, |input, cx| {
+                if input.value().as_ref() != wanted {
+                    input.set_value(wanted, window, cx);
+                }
+            });
+        }
         let subscription = cx.subscribe(&state, move |this, state, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 let text = state.read(cx).value().to_string();
@@ -1461,6 +1650,76 @@ impl ComparePane {
         });
         self.schema_inputs.insert(side, (state.clone(), subscription));
         state
+    }
+}
+
+impl ComparePane {
+    fn diff_toolbar(&mut self, _report: &crate::compare::StructureReport, entity: &Entity<Self>, p: &Palette, m: &kit::Metrics, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let search = self.filter_field(window, cx);
+        let filters = [
+            ("compare-filter:all", DiffFilter::All),
+            ("compare-filter:baseline", DiffFilter::Baseline),
+            ("compare-filter:target", DiffFilter::Target),
+            ("compare-filter:changed", DiffFilter::Changed),
+        ]
+        .into_iter()
+        .map(|(id, filter)| {
+            let entity = entity.clone();
+            (
+                SharedString::from(id),
+                SharedString::from(self.text(filter.key())),
+                self.diff_filter == filter,
+                kit::click(move |_, _, cx| {
+                    entity.update(cx, |pane, cx| pane.command(id, cx));
+                }),
+            )
+        })
+        .collect();
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(m.pane_pad()))
+            .child(kit::segmented_sized(filters, p, m.control_h))
+            .child(div().w(px(200.)).child(kit::text_input("compare-filter-search", &search, self.text("compare.filter.search")).small()))
+            .into_any_element()
+    }
+
+    fn filter_field(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        if let Some((state, _)) = &self.filter_input {
+            return state.clone();
+        }
+        let placeholder = SharedString::from(self.text("compare.filter.search"));
+        let state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(self.diff_query.clone()));
+        let subscription = cx.subscribe(&state, |this, input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.diff_query = input.read(cx).value().to_string();
+                cx.notify();
+            }
+        });
+        self.filter_input = Some((state.clone(), subscription));
+        state
+    }
+
+    fn script_view(&mut self, id: &'static str, script: &str, window: &mut Window, cx: &mut Context<Self>, p: &Palette) -> AnyElement {
+        if !self.script_editors.contains_key(id) {
+            let initial = script.to_owned();
+            let state = cx.new(|cx| EditorState::new(window, cx).language("sql").line_number(true).default_value(initial));
+            self.script_editors.insert(id, (state, script.to_owned()));
+        }
+        let entry = self.script_editors.get_mut(id).expect("script editor");
+        kit::sync_editor(&entry.0, &mut entry.1, script, window, cx);
+        let state = entry.0.clone();
+        div()
+            .id(id)
+            .h(px(200.))
+            .overflow_hidden()
+            .child(
+                kit::sunken(p).size_full().overflow_hidden().child(
+                    Editor::new(&state).h(relative(1.)).bordered(false).readonly(true).aria_label(SharedString::from(id)),
+                ),
+            )
+            .into_any_element()
     }
 }
 
@@ -1533,22 +1792,6 @@ fn note_banner(icon: IconName, text: String, fg: gpui_kit::Hsla, bg: gpui_kit::H
         .text_size(px(TypeScale::SM))
         .child(kit::icon(icon, 15., fg))
         .child(div().flex_1().min_w(px(0.)).child(SharedString::from(text)))
-        .into_any_element()
-}
-
-fn script_block(id: &'static str, script: String, mono: &SharedString, p: &Palette) -> AnyElement {
-    div()
-        .id(id)
-        .max_h(px(260.))
-        .overflow_y_scroll()
-        .p(px(12.))
-        .rounded(px(Radius::PANEL))
-        .bg(p.chrome)
-        .border_1()
-        .border_color(p.line)
-        .font_family(mono.clone())
-        .text_size(px(TypeScale::SM))
-        .child(SharedString::from(script))
         .into_any_element()
 }
 
@@ -1634,6 +1877,60 @@ mod tests {
         assert!(pane.pending_place.is_none());
         assert!(pane.placed.is_none());
         assert!(pane.structure.is_none());
+    }
+
+    #[test]
+    fn swap_filter_select_and_a_late_result_keep_cancel() {
+        let mut pane = temp_pane();
+        pane.choices = vec![
+            Choice { id: "left".into(), name: "左".into(), engine: "sqlite".into(), databases: vec!["main".into()], catalog_error: None },
+            Choice { id: "right".into(), name: "右".into(), engine: "sqlite".into(), databases: vec!["main".into()], catalog_error: None },
+        ];
+        pane.baseline = SidePick { connection_id: "left".into(), database: "main".into(), schema: String::new() };
+        pane.target = SidePick { connection_id: "right".into(), database: "main".into(), schema: String::new() };
+        pane.swap_sides();
+        assert_eq!(pane.sides(), ("right".into(), "left".into()));
+
+        let mut report = empty_structure(None);
+        report.tables.push(crate::compare::TableChoice { name: "orders".into(), on_both: true, needs_key_choice: false, keys: Vec::new() });
+        report.tables.push(crate::compare::TableChoice { name: "hidden".into(), on_both: true, needs_key_choice: false, keys: Vec::new() });
+        pane.structure = Some(report);
+        pane.structure_status = Status::Ready;
+        pane.selected.insert("orders".into(), false);
+        pane.selected.insert("hidden".into(), false);
+        pane.diff_filter = DiffFilter::Baseline;
+        pane.diff_query = "ord".into();
+        assert!(pane.shows_diff(DiffFilter::Baseline, "orders"));
+        assert!(!pane.shows_diff(DiffFilter::Baseline, "customers"));
+        assert!(!pane.shows_diff(DiffFilter::Target, "orders"));
+        pane.select_all_tables();
+        assert_eq!(pane.selected.get("orders"), Some(&true));
+        assert_eq!(pane.selected.get("hidden"), Some(&false));
+        pane.clear_table_selection();
+        assert!(pane.selected.values().all(|on| !*on));
+        let text = pane.lines().join("\n");
+        assert!(text.contains("on orders") || text.contains("off orders"), "{text}");
+        assert!(!text.contains("hidden"), "{text}");
+        assert!(text.contains("仅基准") || text.contains("Baseline only"), "{text}");
+
+        let token = pane.services.tasks.begin(OWNER);
+        pane.token = Some(token);
+        pane.running = true;
+        pane.run_kind = Some(RunKind::Structure);
+        pane.run_id = "compare-late".into();
+        pane.structure = None;
+        pane.structure_status = Status::Running;
+        let flag = Arc::clone(&pane.cancel_flag);
+        pane.cancel();
+        assert_eq!(pane.structure_status, Status::Cancelled);
+        let mut late = empty_structure(None);
+        late.script = "CREATE TABLE late (id INTEGER);".into();
+        pane.finish_structure(token, &flag, TaskOutcome::Current { token, value: late });
+        assert_eq!(pane.structure_status, Status::Cancelled);
+        assert!(pane.structure.is_none());
+        let text = pane.lines().join("\n");
+        assert!(text.contains("已取消"), "{text}");
+        assert!(!text.contains("CREATE TABLE"), "{text}");
     }
 
     fn engine_gate(left: &str, right: &str) -> Option<&'static str> {

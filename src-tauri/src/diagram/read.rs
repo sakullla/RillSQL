@@ -7,7 +7,7 @@ use crate::connections::model::Engine;
 use crate::connections::CatalogSession;
 use crate::diagram::assemble::{assemble_diagram, group_key_parts};
 use crate::diagram::model::{
-    empty_mysql_database, empty_postgres_schema, empty_sqlserver_schema, other_postgres_database, Diagram, KeyPart, OutgoingKey, RangeScope, TableAttempt,
+    empty_mysql_database, empty_postgres_schema, empty_sqlserver_schema, other_postgres_database, Diagram, DiagramColumn, KeyPart, OutgoingKey, RangeScope, ReadColumns, TableAttempt,
 };
 use crate::diagram::sql::{
     MYSQL_COLUMNS, MYSQL_FOREIGN_KEYS, MYSQL_TABLES, POSTGRES_COLUMNS, POSTGRES_CURRENT_DATABASE, POSTGRES_FOREIGN_KEYS, POSTGRES_TABLES,
@@ -77,7 +77,7 @@ async fn postgres_names(client: &tokio_postgres::Client, schema: &str) -> Result
 async fn postgres_table(client: &tokio_postgres::Client, schema: &str, name: String) -> TableAttempt {
     let column_params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&schema, &name];
     let columns = match client.query(POSTGRES_COLUMNS, &column_params).await {
-        Ok(rows) => rows_text(&rows, 0),
+        Ok(rows) => postgres_columns(&rows),
         Err(err) => Err(err.to_string()),
     };
     if columns.is_err() {
@@ -91,12 +91,17 @@ async fn postgres_table(client: &tokio_postgres::Client, schema: &str, name: Str
     TableAttempt { name, columns, foreign_keys }
 }
 
-fn rows_text(rows: &[tokio_postgres::Row], index: usize) -> Result<Vec<String>, String> {
-    let mut values = Vec::with_capacity(rows.len());
+fn postgres_columns(rows: &[tokio_postgres::Row]) -> Result<ReadColumns, String> {
+    let mut columns = Vec::with_capacity(rows.len());
     for row in rows {
-        values.push(row.try_get(index).map_err(|err| err.to_string())?);
+        let type_name: Option<String> = row.try_get(1).map_err(|err| err.to_string())?;
+        columns.push(DiagramColumn {
+            name: row.try_get(0).map_err(|err| err.to_string())?,
+            type_name: type_name.unwrap_or_default(),
+            primary: row.try_get(2).map_err(|err| err.to_string())?,
+        });
     }
-    Ok(values)
+    Ok(ReadColumns(columns))
 }
 
 fn postgres_keys(rows: &[tokio_postgres::Row]) -> Result<Vec<OutgoingKey>, String> {
@@ -152,7 +157,7 @@ async fn mysql_table(pool: &mysql_async::Pool, database: &str, name: String) -> 
         }
     };
     let columns = match conn.exec(MYSQL_COLUMNS, (database.to_owned(), name.clone())).await {
-        Ok(rows) => mysql_column_names(&rows),
+        Ok(rows) => mysql_columns(&rows),
         Err(err) => Err(err.to_string()),
     };
     if columns.is_err() {
@@ -165,12 +170,17 @@ async fn mysql_table(pool: &mysql_async::Pool, database: &str, name: String) -> 
     TableAttempt { name, columns, foreign_keys }
 }
 
-fn mysql_column_names(rows: &[mysql_async::Row]) -> Result<Vec<String>, String> {
-    let mut names = Vec::with_capacity(rows.len());
+fn mysql_columns(rows: &[mysql_async::Row]) -> Result<ReadColumns, String> {
+    let mut columns = Vec::with_capacity(rows.len());
     for row in rows {
-        names.push(mysql_string(row, 0)?);
+        let key = mysql_string(row, 2).unwrap_or_default();
+        columns.push(DiagramColumn {
+            name: mysql_string(row, 0)?,
+            type_name: mysql_string(row, 1).unwrap_or_default(),
+            primary: key.eq_ignore_ascii_case("PRI"),
+        });
     }
-    Ok(names)
+    Ok(ReadColumns(columns))
 }
 
 fn mysql_keys(rows: &[mysql_async::Row]) -> Result<Vec<OutgoingKey>, String> {
@@ -239,7 +249,7 @@ async fn sqlserver_names(client: &std::sync::Arc<tokio::sync::Mutex<crate::conne
 async fn sqlserver_table(client: &std::sync::Arc<tokio::sync::Mutex<crate::connections::drivers::TdsClient>>, schema: &str, name: String) -> TableAttempt {
     let columns_sql = SQLSERVER_COLUMNS.replace("{schema}", &tsql_literal(schema)).replace("{table}", &tsql_literal(&name));
     let columns = match sqlserver_rows(client, &columns_sql).await {
-        Ok((_names, rows)) => Ok(rows.iter().map(|row| cell_string(row.first())).filter(|item| !item.is_empty()).collect()),
+        Ok((_names, rows)) => Ok(sqlserver_columns(&rows)),
         Err(err) => Err(err),
     };
     if columns.is_err() {
@@ -267,6 +277,23 @@ fn sqlserver_keys(rows: &[Vec<Cell>]) -> Result<Vec<OutgoingKey>, String> {
         });
     }
     Ok(group_key_parts(parts))
+}
+
+fn sqlserver_columns(rows: &[Vec<Cell>]) -> ReadColumns {
+    let mut columns = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name = cell_string(row.first());
+        if name.is_empty() {
+            continue;
+        }
+        let flag = cell_string(row.get(2));
+        columns.push(DiagramColumn {
+            name,
+            type_name: cell_string(row.get(1)),
+            primary: flag == "1" || flag.eq_ignore_ascii_case("true"),
+        });
+    }
+    ReadColumns(columns)
 }
 
 fn cell_string(cell: Option<&Cell>) -> String {
@@ -297,8 +324,8 @@ async fn read_sqlite(pool: &sqlx::SqlitePool) -> Result<Diagram, String> {
 }
 
 async fn sqlite_table(pool: &sqlx::SqlitePool, name: String) -> TableAttempt {
-    let columns = match sqlx::query_scalar(SQLITE_COLUMNS).bind(&name).fetch_all(pool).await {
-        Ok(columns) => Ok(columns),
+    let columns = match sqlx::query(SQLITE_COLUMNS).bind(&name).fetch_all(pool).await {
+        Ok(rows) => sqlite_columns(&rows),
         Err(err) => Err(err.to_string()),
     };
     if columns.is_err() {
@@ -309,6 +336,28 @@ async fn sqlite_table(pool: &sqlx::SqlitePool, name: String) -> TableAttempt {
         Err(err) => Err(err.to_string()),
     };
     TableAttempt { name, columns, foreign_keys }
+}
+
+fn sqlite_columns(rows: &[sqlx::sqlite::SqliteRow]) -> Result<ReadColumns, String> {
+    let mut columns = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name: String = row.try_get(0).map_err(|err| err.to_string())?;
+        let type_name: String = row.try_get::<Option<String>, _>(1).map_err(|err| err.to_string())?.unwrap_or_default();
+        let primary = sqlite_pk(&row)?;
+        columns.push(DiagramColumn { name, type_name, primary });
+    }
+    Ok(ReadColumns(columns))
+}
+
+fn sqlite_pk(row: &sqlx::sqlite::SqliteRow) -> Result<bool, String> {
+    if let Ok(value) = row.try_get::<i64, _>(2) {
+        return Ok(value > 0);
+    }
+    if let Ok(value) = row.try_get::<i32, _>(2) {
+        return Ok(value > 0);
+    }
+    let text: Option<String> = row.try_get(2).map_err(|err| err.to_string())?;
+    Ok(text.as_deref().is_some_and(|value| value != "0" && !value.is_empty()))
 }
 
 fn sqlite_keys(rows: &[sqlx::sqlite::SqliteRow]) -> Result<Vec<OutgoingKey>, String> {

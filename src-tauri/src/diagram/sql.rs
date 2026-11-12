@@ -9,7 +9,15 @@ WHERE n.nspname = $1
 ORDER BY c.relname";
 
 pub(crate) const POSTGRES_COLUMNS: &str = "\
-SELECT a.attname::text
+SELECT a.attname::text,
+       pg_catalog.format_type(a.atttypid, a.atttypmod)::text,
+       EXISTS (
+         SELECT 1
+         FROM pg_catalog.pg_index i
+         WHERE i.indrelid = c.oid
+           AND i.indisprimary
+           AND a.attnum = ANY (i.indkey)
+       )
 FROM pg_catalog.pg_attribute a
 JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -49,7 +57,7 @@ WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'
 ORDER BY TABLE_NAME";
 
 pub(crate) const MYSQL_COLUMNS: &str = "\
-SELECT COLUMN_NAME
+SELECT COLUMN_NAME, COLUMN_TYPE, COLUMN_KEY
 FROM information_schema.COLUMNS
 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
 ORDER BY ORDINAL_POSITION";
@@ -68,7 +76,7 @@ FROM sqlite_master
 WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
 ORDER BY name";
 
-pub(crate) const SQLITE_COLUMNS: &str = "SELECT name FROM pragma_table_info(?1) ORDER BY cid";
+pub(crate) const SQLITE_COLUMNS: &str = "SELECT name, type, pk FROM pragma_table_info(?1) ORDER BY cid";
 
 pub(crate) const SQLITE_FOREIGN_KEYS: &str = "\
 SELECT id, seq, \"from\", \"table\", \"to\"
@@ -84,7 +92,16 @@ WHERE s.name = N'{schema}'
 ORDER BY t.name";
 
 pub(crate) const SQLSERVER_COLUMNS: &str = "\
-SELECT c.name
+SELECT c.name,
+       TYPE_NAME(c.user_type_id),
+       CASE WHEN EXISTS (
+         SELECT 1
+         FROM sys.index_columns ic
+         JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+         WHERE i.is_primary_key = 1
+           AND ic.object_id = c.object_id
+           AND ic.column_id = c.column_id
+       ) THEN 1 ELSE 0 END
 FROM sys.columns c
 JOIN sys.tables t ON t.object_id = c.object_id
 JOIN sys.schemas s ON s.schema_id = t.schema_id
