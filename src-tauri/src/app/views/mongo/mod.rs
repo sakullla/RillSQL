@@ -20,6 +20,10 @@ use crate::i18n::{self, Locale};
 use crate::mongo::docs::{CollectionSummary, DatabaseSummary, DocumentsPage, MongoDoc};
 
 const PAGE_LIMIT: u64 = 20;
+/// 文档表每列的最小宽度：窄窗口靠横向滚动，不把列压到只剩省略号。
+const DOC_COL_MIN: f32 = 120.;
+/// 行尾查看/复制/编辑/删除四个图标列的宽度。
+const DOC_ACTIONS_W: f32 = 124.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Field {
@@ -927,7 +931,9 @@ impl Render for MongoPane {
 
         // ---- 文档表
         let shown: Vec<String> = self.columns.iter().take(7).cloned().collect();
-        let mut table = div().id("mongo-docs").flex().flex_col().flex_1().min_h(px(0.)).overflow_y_scroll();
+        // 窄窗口下每列至少 120：不够宽就横向滚动，不把七列压成全是省略号。
+        let row_min_w = shown.len() as f32 * DOC_COL_MIN + DOC_ACTIONS_W + 20.;
+        let mut table = div().id("mongo-docs").flex().flex_col().flex_1().min_h(px(0.)).overflow_y_scroll().overflow_x_scroll();
         if !self.filter_error.is_empty() {
             table = table.child(div().mx(px(10.)).mt(px(10.)).px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.danger_soft).text_color(p.danger).text_size(px(TypeScale::SM)).child(SharedString::from(self.filter_error.clone())));
         }
@@ -936,17 +942,19 @@ impl Render for MongoPane {
             let detail = if self.collection.is_empty() { self.text("mongo.tab.needCollection") } else { String::new() };
             table = table.child(div().flex_1().flex().items_center().justify_center().child(kit::empty_state(IconName::Braces, SharedString::from(empty), SharedString::from(detail), &p)));
         } else {
-            let mut head = div().flex().h(px(m.bar_h() - 2.)).px(px(10.)).items_center().bg(p.chrome).border_b_1().border_color(p.line).text_size(px(TypeScale::XS)).text_color(p.text_faint);
+            let mut head = div().flex().min_w(px(row_min_w)).h(px(m.bar_h() - 2.)).px(px(10.)).items_center().bg(p.chrome).border_b_1().border_color(p.line).text_size(px(TypeScale::XS)).text_color(p.text_faint);
             for name in &shown {
                 head = head.child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).truncate().pr(px(8.)).child(SharedString::from(name.clone())));
             }
-            head = head.child(div().flex_none().w(px(124.)));
+            head = head.child(div().flex_none().w(px(DOC_ACTIONS_W)));
             table = table.child(head);
             for (index, doc) in self.documents.iter().take(PAGE_LIMIT as usize).enumerate() {
                 let mut row = div()
                     .id(SharedString::from(format!("mongo-row-{index}")))
+                    .test_support()
                     .group("mongo-row")
                     .flex()
+                    .min_w(px(row_min_w))
                     .min_h(px(m.row_h + 2.))
                     .px(px(10.))
                     .items_center()
@@ -972,7 +980,7 @@ impl Render for MongoPane {
                 row = row.child(
                     div()
                         .flex_none()
-                        .w(px(124.))
+                        .w(px(DOC_ACTIONS_W))
                         .flex()
                         .justify_end()
                         .gap(px(1.))
@@ -1186,6 +1194,58 @@ mod tests {
         assert_eq!(next_skip(0, 20, 1), 20);
         assert!(pretty_json(r#"{"a":1}"#).contains('\n'));
         assert_ne!(i18n::text(Locale::En, "mongo.tab.insert"), "mongo.tab.insert");
+    }
+
+    /// 窄窗口下文档表不能把每列压成省略号：列宽有下限，超出部分横向滚动。
+    #[gpui_kit::test]
+    fn narrow_pane_keeps_document_columns_readable(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        use gpui_kit::AppContext as _;
+        let dir = std::env::temp_dir().join(format!("rillsql-mongo-narrow-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(
+            crate::connections::Service::new_for_test(dir.join("connections.sqlite")),
+        )));
+        cx.update(gpui_kit::init);
+        let (window, pane) = cx.update(|cx| {
+            let bounds = gpui_kit::Bounds {
+                origin: gpui_kit::Point::default(),
+                size: gpui_kit::size(gpui_kit::px(640.), gpui_kit::px(900.)),
+            };
+            let (window, pane) = gpui_kit::open_window(
+                gpui_kit::WindowOptions {
+                    window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                cx,
+                |_window, cx| cx.new(|_| MongoPane::new(services)),
+            )
+            .expect("mongo pane");
+            pane.update(cx, |pane, cx| {
+                pane.connection_id = "docs".into();
+                pane.connection_name = "文档".into();
+                pane.database = "app".into();
+                pane.collection = "orders".into();
+                pane.columns = vec!["_id".into(), "customer".into(), "status".into(), "total".into(), "memo".into(), "created".into(), "note".into()];
+                pane.documents = vec![MongoDoc {
+                    id_json: "\"1\"".into(),
+                    json: r#"{"_id":"1","customer":"c1","status":"active","total":17.5,"memo":null,"created":"2026-11-11","note":null}"#.into(),
+                }];
+                cx.notify();
+            });
+            (window, pane)
+        });
+        let row_w = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                f32::from(window.find("mongo-row-0").bounds().size.width)
+            })
+            .unwrap();
+        let wanted = 7. * DOC_COL_MIN + DOC_ACTIONS_W;
+        assert!(row_w > 640., "窄窗口里一行要比窗口宽，交给横向滚动：{row_w}");
+        assert!(row_w >= wanted, "每列至少 {DOC_COL_MIN}、动作列 {DOC_ACTIONS_W}：{row_w} < {wanted}");
+        let _ = pane;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[gpui_kit::test]

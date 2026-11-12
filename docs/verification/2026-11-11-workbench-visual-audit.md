@@ -21,7 +21,7 @@
 
 ## 2. 逐页核对
 
-“符合”= 核对时已满足；“已修正”= 本任务改动后满足。每格引用的改动见 §3。
+“符合”= 核对时已满足；“已修正”= 本任务改动后满足。每格引用的改动见 §3。每页在 1360 之外又按 900 与 640 各核一遍原生窗口（截图见 §4，窄宽发现与修正见 §3.6）。
 
 | 页面 | A 字号 | B 密度 | C 圆角 | D 发丝线 | E 浅深 | F 四态 | G 三态 | H 图标 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -96,16 +96,26 @@
 - A5：对象定义查看器英文化：重建定义（PostgreSQL/SQL Server 的表）横幅里的“未包含”清单在显示时逐项英文（`ddl/english.rs` 的 `MISSING_ITEMS`，`catalog::definition::missing_text`），读取失败的清单项里的原因再按句式表翻译；生成 SQL 开头的注释仍是中文原样（编辑区与复制内容不按界面语言改写）。读取错误（`catalog/definition.rs`、`catalog/read.rs` 定义读取）在查看器横幅（`ddl-viewer-error`）与复制 DDL 失败的状态栏里去掉重复的“读取定义失败：”前缀，再按界面语言显示（`catalog::definition::error_text`，模型里保留原文）。源码扫描改为 `every_chinese_literal_on_ddl_paths_has_an_english_form`，范围扩到 `catalog/definition.rs`、`catalog/read.rs` 的定义读取函数（入口、各引擎读取与取值/包装函数）、`app/shell/danger.rs`、`app/shell/{view,model,chrome}.rs` 里确认层与查看器的读取/显示函数，以及结构页源码；“未包含”清单项移出白名单。结构页的提示（`Note`：i18n 键或执行层原文）与结构读取错误改为保存原文、渲染时本地化，切换语言立即生效（`notes_and_load_errors_follow_a_later_locale_switch`）；二次确认的两句改为 i18n 键 `structure.confirm.second`、`structure.action.confirmAgain`。
 - A3：未打标签（空或 `none`）的连接在连接页、欢迎页与状态栏不再显示标签小块（此前显示英文 “none”），`untagged_connections_show_no_env_pill`。现有截图里的连接都带标签，可见文字无变化，未重截。
 
+### 3.6 窄宽（900 / 640）原生补拍与修正
+
+用 900 与 640 各补一套原生截图（§4）核对窄宽布局，发现三处偏离，已修并各有回归测试：
+
+- 640 的侧栏是覆盖层：原生右键树节点弹出的是下面编辑器的菜单，左键也会落到编辑器上（点击穿透覆盖层）。修：`app/shell/chrome.rs` 覆盖式侧栏容器加 `.occlude()`；测试 `narrow_overlay_sidebar_keeps_tree_clicks_off_the_editor_beneath`（640 下断言右键只弹对象树菜单、树行确实盖在编辑器上方）。
+- 连接页右侧空态说明在窄面板里不换行，整行撑出面板：左边压到连接列表、右边被窗口裁掉。修：`ui/kit.rs` 的 `empty_state`/`error_state` 加 `min_w(px(0.))` 与 `max_w_full()`，说明行改为 `w_full()` + `max_w(px(360.))`；测试 `connections_empty_state_wraps_inside_its_panel_at_every_width`（1360/900/640 三个宽度断言说明不越过列表、不越出窗口）。
+- Mongo 文档表把最多 7 列等分压到十几像素，每格只剩省略号（900 下 st…、1…）。修：`app/views/mongo/mod.rs` 每列最小宽 `DOC_COL_MIN = 120`、动作列 `DOC_ACTIONS_W = 124`，表头与行都按最小总宽排布，容器横向滚动；测试 `narrow_pane_keeps_document_columns_readable`（640 下断言一行宽于窗口、且不窄于最小总宽）。
+
+其余页面在 900/640 未发现越界或裁切：结构页、关系图、导入导出抽屉（520 宽，内容滚动）、对比、历史（筛选行自动换行）、设置、快捷键帮助、确认层、定义查看器、网格工具条（窄宽换行、“预览变更”完整可见）、记录视图（320 与表格并排仍可读）、欢迎页。640 侧栏覆盖时页面内容按设计被遮住，收起侧栏后完整。
+
 ## 4. 原生截图
 
-方法：`cargo build --release --bin rillsql`，Python `ctypes` 调整真实窗口（150% DPI，客户区逻辑约 1345/885/640 × 893）、模拟点击与按键，Pillow `ImageGrab` 截取窗口。数据：临时 SQLite 演示库（customers 40 行、orders 180 行、products 20 行、1 个视图、1 个触发器）、一个 `prod` 色调自定义标签 `t7-live` 的副本库、Docker MongoDB 8.3（127.0.0.1:27017，`rillsql` 库 customers/orders）与 Redis 7.4（127.0.0.1:6379，已灌种子键）；密码临时写入系统凭据库。截图前备份本机 RillSQL 数据目录，结束后删除临时凭据并原样恢复（md5 与备份一致）。
+方法：`cargo build --release --bin rillsql`，Python `ctypes` 调整真实窗口（150% DPI，客户区逻辑约 1345/885/640 × 893）、模拟点击与按键，Pillow `ImageGrab` 截取窗口。窄宽补拍改为后台采集：`rillsql` 跑在私有桌面上（`CreateDesktop` + `STARTUPINFO.lpDesktop`，当前桌面看不到这个窗口），点击与按键用 `PostMessage` 投递、不抢前台也不移动指针，取图用 `PrintWindow(PW_RENDERFULLCONTENT)`。数据：临时 SQLite 演示库（customers 40 行、orders 180 行、products 20 行、1 个视图、1 个触发器）、一个 `prod` 色调自定义标签 `t7-live` 的副本库、Docker MongoDB 8.3（127.0.0.1:27017，`rillsql` 库 customers/orders）与 Redis 7.4（127.0.0.1:6379，已灌种子键）；密码临时写入系统凭据库。截图前备份本机 RillSQL 数据目录，结束后删除临时凭据并原样恢复（md5 与备份一致）。
 
 | 组合 | 文件（`workbench-2026-11-11/`） |
 | --- | --- |
 | 1360 · 浅 · 标准 · 中 | query、query-object-panel、results-tabs、query-messages、grid-record、query-pinned、menu-tree、ddl-viewer、structure、diagram、export、compare、connections、history、settings、shortcut-help、danger-confirm-prod、admin、mongo（集合浏览器 orders）、redis（键浏览器 hash 键）、welcome、focus-ring（Tab 到“查询 1”标签，内描边焦点环）（后缀 `-1360-light-standard-zh`） |
 | 1360 · 深 · 紧凑 · 英 | 同上 22 张（后缀 `-1360-dark-compact-en`） |
-| 900 · 浅 · 紧凑 · 英 / 900 · 深 · 标准 · 中 | tree-open、query |
-| 640 · 浅 · 标准 · 中 / 640 · 深 · 紧凑 · 英 | tree-open（侧栏覆盖）、query（侧栏收起；网格工具条换行，“预览变更”完整可见） |
+| 900 · 浅 · 标准 · 中 | 每个页面/浮层各一张（后缀 `-900-light-standard-zh`）：query、query-object-panel、results-tabs、query-messages、grid-record、query-pinned、menu-tree、ddl-viewer、structure、diagram、export、compare、connections、history、settings、shortcut-help、danger-confirm-prod、admin、mongo、redis、welcome、tree-open；另沿用 `query-900-light-compact-en`、`query-900-dark-standard-zh`、`tree-open-900-*` |
+| 640 · 浅 · 标准 · 中 | 同上 22 个场景各一张（后缀 `-640-light-standard-zh`）：侧栏覆盖时点树、收起侧栏后看页面；网格工具条换行、“预览变更”完整可见；记录视图 320 与表格并排仍可读；另沿用 `query-640-dark-compact-en`、`tree-open-640-*` |
 
 ## 5. 遗留与未覆盖（如实记录）
 
@@ -117,7 +127,9 @@ A1 记录的偏离（Mongo/Redis 未截到、英文界面残留中文、640 工�
 4. 自定义环境标签在连接页/欢迎页/状态栏显示标签 id（壳层没有读取 `env_tags` 的显示名；连接列表由连接页模块读取，接入 `list_tags` 需要改连接页的读取链路，本次未做），颜色按内置色调规则。确认层已按 `list_tags` 显示自定义标签名。未打标签的连接不再显示 “none”。
 5. 英文网格工具条里搜索框占位与查找范围开关同为 “Find in loaded rows”（`ui.grid.searchPlaceholder` 与 `grid.find.loaded`），措辞重复，非中文残留。
 6. 四态覆盖：自定义可点元素按 `interactive`/`interactive_states`/`row_states` 收敛，测试断言焦点环 2px、浅深色对比 ≥ 3:1、可用元素是 Tab 停靠点、禁用元素不可聚焦、点击不抢焦点；不声称每个元素都逐一有测试。
-7. 调试版 `target/debug/rillsql.exe` 在本机启动即主线程栈溢出（`thread 'main' has overflowed its stack`）；发布版正常，截图全部来自发布版。未验证该问题是否在基线 `a2f2e5e` 已存在。
+7. 调试版在本机启动即主线程栈溢出，已由 T6 修复（`80ab967` 拆分查询页与结果表格的大渲染帧，并加原生 debug 启动检查）；本任务所有截图（含窄宽补拍）都来自发布版。
+
+8. 窄宽截图每个页面/浮层取一套组合（浅色 · 标准 · 中文）；1360 的两套深色 · 紧凑组合没有在窄宽重复。Mongo/Redis 在窄宽只覆盖主视图（集合浏览器、键浏览器），查看/编辑文档与值面板抽屉未单独截图。
 
 ## 6. 复现
 

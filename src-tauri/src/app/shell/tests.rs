@@ -4171,6 +4171,16 @@ fn sqlite_notes_workbench(
     cx: &mut gpui_kit::TestAppContext,
     boot: bool,
 ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<super::view::Workbench>, std::path::PathBuf) {
+    sqlite_notes_workbench_sized(cx, boot, 1360., 800.)
+}
+
+/// 同 `sqlite_notes_workbench`，按指定窗口尺寸打开（窄宽要测真实的覆盖式侧栏）。
+fn sqlite_notes_workbench_sized(
+    cx: &mut gpui_kit::TestAppContext,
+    boot: bool,
+    width: f32,
+    height: f32,
+) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<super::view::Workbench>, std::path::PathBuf) {
     cx.executor().allow_parking();
     let dir = std::env::temp_dir().join(format!("rillsql-shell-nav-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -4197,7 +4207,7 @@ fn sqlite_notes_workbench(
         });
     });
     let services = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("sqlite setup");
-    let (window, view) = open_workbench(cx, services, boot);
+    let (window, view) = open_workbench_sized(cx, services, boot, width, height);
     (window, view, dir)
 }
 
@@ -6451,4 +6461,90 @@ fn custom_env_tags_never_show_a_dictionary_key() {
     assert_eq!(super::chrome::env_label(|key| text(Locale::En, key), "prod"), "Prod");
     assert_eq!(super::chrome::env_label(|key| text(Locale::ZhCn, key), "dev"), "开发");
     assert_eq!(super::chrome::env_label(|key| text(Locale::En, key), "t7-live"), "t7-live");
+}
+
+/// 640 宽时侧栏是盖在工作区上的覆盖层。原生截图发现右键树节点弹出的是下面编辑器的菜单
+/// （点击穿透了覆盖层）。覆盖层必须挡住鼠标：右键、左键都只到树，不到编辑器。
+#[gpui_kit::test]
+fn narrow_overlay_sidebar_keeps_tree_clicks_off_the_editor_beneath(cx: &mut gpui_kit::TestAppContext) {
+    use super::menus::MenuPlace;
+    let (window, view, dir) = sqlite_notes_workbench_sized(cx, true, 640., 900.);
+    wait_for_shell_ready(cx, window, &view);
+    let item = wait_for_nav_object(cx, window, &view, "item");
+    assert!(!item.is_empty(), "目录里没有读到 item");
+    let row = gpui_kit::SharedString::from(format!("nav-{item}"));
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("new-query", cx)));
+    // 让 item 这一行真正画在覆盖式侧栏里：侧栏打开，连接与表分组展开（同 sidebar_mouse_paths 的做法）。
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.model
+                .connections
+                .status
+                .insert("notes".to_owned(), crate::app::views::connections::LinkStatus::Connected);
+            view.model.shell.sidebar_open = true;
+            view.model.nav.expand(&crate::catalog::hierarchy::connection_node_id("notes"));
+            let groups: Vec<String> = view
+                .model
+                .nav_rows_for("notes")
+                .into_iter()
+                .filter(|row| row.kind == crate::catalog::hierarchy::NavKind::Group)
+                .map(|row| row.id)
+                .collect();
+            for group in groups {
+                view.model.nav.expand(&group);
+            }
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+    let shown = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find(row.clone()).is_some_and(|row| row.visible())
+        })
+        .unwrap();
+    assert!(shown, "item 行没有画出来");
+    let (overlay, over_editor) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let row = window.find(row.clone()).bounds();
+            let editor = window.find("query-editor").bounds();
+            let centre = row.center();
+            (view.read(cx).model.painted().sidebar_overlay, editor.contains(&centre))
+        })
+        .unwrap();
+    assert!(overlay, "640 宽侧栏应是覆盖层");
+    assert!(over_editor, "测试前提：树行正好盖在编辑器上方");
+
+    cx.update_window(window, |_, window, cx| window.right_click(row.clone(), cx)).unwrap();
+    let place = cx.update(|cx| view.read(cx).model.menu.as_ref().map(|menu| menu.place));
+    assert_eq!(place, Some(MenuPlace::ObjectTree), "右键树节点要弹出对象树菜单，不能穿透成编辑器菜单");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 原生 640 截图发现连接页右侧空态的说明整行撑出面板，左边压到连接列表、右边被窗口裁掉。
+/// 三种宽度下说明都要在右侧面板里换行：不越过连接列表，也不越出窗口。
+#[gpui_kit::test]
+fn connections_empty_state_wraps_inside_its_panel_at_every_width(cx: &mut gpui_kit::TestAppContext) {
+    for width in [1360., 900., 640.] {
+        let dir = std::env::temp_dir().join(format!("rillsql-shell-conn-empty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (window, view) = open_workbench_sized(cx, services_at(&dir), false, width, 900.);
+        cx.update(|cx| view.update(cx, |view, cx| view.perform("connections", cx)));
+        let (detail, list_right, window_width) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                let details: Vec<_> = window.find_all("empty-state-detail").into_iter().filter(|detail| detail.visible()).collect();
+                assert_eq!(details.len(), 1, "{width}: 连接页应只有右侧一个空态说明");
+                let list = window.find("conn-new").bounds();
+                (details[0].bounds(), f32::from(list.origin.x + list.size.width), f32::from(window.find("workbench").bounds().size.width))
+            })
+            .unwrap();
+        let left = f32::from(detail.origin.x);
+        let right = f32::from(detail.origin.x + detail.size.width);
+        assert!(left >= list_right, "{width}: 空态说明左缘 {left} 压到了连接列表（右缘 {list_right}）");
+        assert!(right <= window_width + 0.5, "{width}: 空态说明右缘 {right} 越出窗口 {window_width}");
+        assert!(f32::from(detail.size.width) <= 360.5, "{width}: 说明最宽 360");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

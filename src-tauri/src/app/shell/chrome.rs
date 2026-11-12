@@ -151,6 +151,9 @@ impl Workbench {
                                 .bottom_0()
                                 .left(px(RAIL_W))
                                 .shadow_lg()
+                                // 覆盖式侧栏盖在工作区上方：鼠标事件只到侧栏，不能穿透到下面的编辑器/表格
+                                // （否则右键树节点会弹出编辑器菜单，点击也会落到编辑器上）。
+                                .occlude()
                                 .child(sidebar),
                         )
                     }),

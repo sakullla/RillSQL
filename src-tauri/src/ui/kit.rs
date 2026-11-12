@@ -586,6 +586,9 @@ pub fn empty_state(icon_name: IconName, heading: impl Into<SharedString>, detail
         .justify_center()
         .gap(px(10.))
         .p(px(24.))
+        // 窄面板里也要能收窄：GPUI 文本的最小内容宽是整行宽，不写 min_w(0) 就会撑出面板。
+        .min_w(px(0.))
+        .max_w_full()
         .child(
             div()
                 .size(px(44.))
@@ -597,7 +600,18 @@ pub fn empty_state(icon_name: IconName, heading: impl Into<SharedString>, detail
                 .child(icon(icon_name, 22., p.accent_text)),
         )
         .child(title(heading, TypeScale::MD, p))
-        .child(div().max_w(px(360.)).text_center().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(detail.into()))
+        .child(
+            // 说明文字按面板宽换行（最多 360），不按整行宽撑开。
+            div()
+                .id("empty-state-detail")
+                .test_support()
+                .w_full()
+                .max_w(px(360.))
+                .text_center()
+                .text_size(px(TypeScale::SM))
+                .text_color(p.text_muted)
+                .child(detail.into()),
+        )
 }
 
 /// 加载态：居中的小号转圈 + 一行说明（规范 S8.5 三种状态之一）。加载优先于空态。
@@ -623,6 +637,9 @@ pub fn error_state(heading: impl Into<SharedString>, detail: impl Into<SharedStr
         .justify_center()
         .gap(px(10.))
         .p(px(24.))
+        // 窄面板里也要能收窄：GPUI 文本的最小内容宽是整行宽，不写 min_w(0) 就会撑出面板。
+        .min_w(px(0.))
+        .max_w_full()
         .child(
             div()
                 .size(px(44.))
@@ -634,7 +651,18 @@ pub fn error_state(heading: impl Into<SharedString>, detail: impl Into<SharedStr
                 .child(icon(IconName::CircleAlert, 22., p.danger)),
         )
         .child(title(heading, TypeScale::MD, p))
-        .child(div().max_w(px(360.)).text_center().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(detail.into()))
+        .child(
+            // 说明文字按面板宽换行（最多 360），不按整行宽撑开。
+            div()
+                .id("error-state-detail")
+                .test_support()
+                .w_full()
+                .max_w(px(360.))
+                .text_center()
+                .text_size(px(TypeScale::SM))
+                .text_color(p.text_muted)
+                .child(detail.into()),
+        )
 }
 
 /// 键盘提示 kbd。
