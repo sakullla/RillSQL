@@ -484,6 +484,7 @@ const PATTERNS: &[(&str, &str)] = &[
     ("SQL Server 没有独立的枚举或域", "SQL Server has no separate enums or domains"),
     ("只有函数、存储过程、触发器、视图和序列可以读取只读定义", "Only functions, stored procedures, triggers, views and sequences have a read-only definition"),
     ("读取库表失败：{p}", "Could not read the catalog: {0}"),
+    ("读取{p}失败：{p}", "Could not read {0}: {1}"),
     ("元数据列缺失", "A metadata column is missing"),
     ("元数据列是空值", "A metadata column is null"),
 ];
@@ -513,7 +514,21 @@ const MISSING_ITEMS: &[(&str, &str)] = &[
 
 /// 只出现在句型 `{p}` 位置里的短语（行数、“全部”、“未知”）。不参与整句匹配，
 /// 所以名字恰好是“未知”“全部”的对象不会被换成英文词。
-const PHRASES: &[(&str, &str)] = &[("约 {} 行", "about {0} rows"), ("现有数据", "its existing data"), ("全部", "all"), ("未知", "unknown")];
+const PHRASES: &[(&str, &str)] = &[
+    ("约 {} 行", "about {0} rows"),
+    ("现有数据", "its existing data"),
+    ("全部", "all"),
+    ("未知", "unknown"),
+    ("事件与分区", "events and partitions"),
+    ("附加库", "attached databases"),
+    ("没有返回值", "no value was returned"),
+    ("扩展", "extensions"),
+    ("序列", "sequences"),
+    ("事件", "events"),
+    ("分区", "partitions"),
+    ("枚举", "enums"),
+    ("域", "domains"),
+];
 
 /// 是否含中日韩文字或全角标点。
 pub fn has_cjk(text: &str) -> bool {
@@ -930,6 +945,24 @@ mod tests {
             Ok(())
         } else {
             Err(sentence)
+        }
+    }
+
+    #[test]
+    fn extras_read_failures_have_an_english_form() {
+        for sample in [
+            "读取扩展失败：permission denied",
+            "读取序列失败：permission denied",
+            "读取事件失败：permission denied",
+            "读取分区失败：permission denied",
+            "读取事件与分区失败：permission denied",
+            "读取附加库失败：permission denied",
+            "读取journal_mode失败：没有返回值",
+            "读取枚举失败：permission denied",
+            "读取域失败：permission denied",
+        ] {
+            let en = english(sample);
+            assert!(!has_cjk(&en), "{sample} -> {en}");
         }
     }
 

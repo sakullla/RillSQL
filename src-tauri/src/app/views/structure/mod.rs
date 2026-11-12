@@ -3,19 +3,90 @@
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Editor, EditorState, InputEvent};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, relative,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Window, div, px, relative,
 };
 
+use crate::ui::{DataFormat, EditMode, FormatViewer, TruncationState, ViewerSpec};
 use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, TypeScale};
 
 use crate::application::AppServices;
 use crate::app::views::grid::{operation_banner, GridTarget};
+use crate::ddl::english::{localize, localize_missing_item};
 use crate::ddl::{preview_plan, Action, ColumnDraft, ForeignKeyDraft, IndexColumnDraft, Plan, Request, Snapshot};
-use crate::ddl::english::localize;
 use crate::i18n::{self, Locale};
+
+/// 与 `ddl::model::fk_actions` 相同的级联动作。该函数在 ddl 私有模块里，结构页按引擎原样列出。
+fn fk_action_choices(engine: &str) -> &'static [&'static str] {
+    match engine {
+        "mysql" | "mariadb" => &["RESTRICT", "CASCADE", "SET NULL", "NO ACTION"],
+        "redis" | "mongodb" => &[],
+        _ => &["RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION"],
+    }
+}
+
+fn type_choices(engine: &str) -> &'static [&'static str] {
+    match engine {
+        "postgres" => &["bigint", "integer", "text", "boolean", "numeric", "timestamp", "jsonb", "uuid"],
+        "mysql" | "mariadb" => &["bigint", "int", "varchar(255)", "text", "datetime", "decimal(10,2)", "json"],
+        "sqlserver" => &["bigint", "int", "nvarchar(255)", "datetime2", "bit", "decimal(18,2)"],
+        _ => &["INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC"],
+    }
+}
+
+fn default_id(engine: &str) -> ColumnDraft {
+    let type_name = match engine {
+        "postgres" | "mysql" | "mariadb" | "sqlserver" => "bigint",
+        _ => "INTEGER",
+    };
+    ColumnDraft {
+        original: None,
+        name: "id".into(),
+        type_name: type_name.into(),
+        nullable: false,
+        default_sql: String::new(),
+        primary: true,
+        auto: true,
+        dropped: false,
+    }
+}
+
+fn column_drafts(snapshot: &Snapshot) -> Vec<ColumnDraft> {
+    snapshot
+        .columns
+        .iter()
+        .map(|column| ColumnDraft {
+            original: Some(column.name.clone()),
+            name: column.name.clone(),
+            type_name: column.type_name.clone(),
+            nullable: column.nullable,
+            default_sql: column.default_sql.clone().unwrap_or_default(),
+            primary: column.primary,
+            auto: column.auto,
+            dropped: false,
+        })
+        .collect()
+}
+
+fn shows_ref_schema(engine: &str) -> bool {
+    matches!(engine, "postgres" | "sqlserver")
+}
+
+fn definition_text(snapshot: &Snapshot) -> (String, Vec<String>) {
+    if snapshot.kind != "table" {
+        return (snapshot.table_sql.clone(), Vec::new());
+    }
+    if !snapshot.table_sql.trim().is_empty() {
+        return (snapshot.table_sql.clone(), Vec::new());
+    }
+    crate::ddl::rebuilt_definition(snapshot)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
@@ -23,7 +94,28 @@ pub enum Section {
     Indexes,
     ForeignKeys,
     View,
+    Ddl,
     Danger,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StructureMode {
+    Existing,
+    Create,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DangerKind {
+    Drop,
+    Truncate,
+    Rename,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EditIntent {
+    Apply,
+    DropIndex { name: String },
+    DropForeignKey { name: String },
 }
 
 /// 结构页提示。界面文字存 i18n 键，执行层/应用层的原文按条保存；显示时按当前语言给出，切换语言立即生效。
@@ -59,19 +151,31 @@ impl Note {
 
 pub struct StructureSession {
     pub target: GridTarget,
+    pub mode: StructureMode,
     pub section: Section,
+    pub object_kind: String,
+    pub table_name: String,
     pub column_name: String,
     pub column_type: String,
-    /// 非空时字段预览使用完整草稿。只带新列会被领域规则拦住，避免漏改已有列。
+    /// 非空时字段预览使用完整草稿。已有列带 original，alter_precheck 才允许改。
     pub kept_columns: Vec<ColumnDraft>,
     pub index_name: String,
     pub index_column: String,
+    pub index_unique: bool,
+    pub index_columns: Vec<IndexColumnDraft>,
     pub fk_name: String,
     pub fk_column: String,
     pub fk_ref_schema: String,
     pub fk_ref_table: String,
     pub fk_ref_column: String,
+    pub fk_on_delete: String,
+    pub fk_on_update: String,
     pub view_sql: String,
+    pub danger: DangerKind,
+    pub rename_to: String,
+    /// 生产环境确认前要输入的对象名。不写入 SQL。
+    pub danger_name: String,
+    pub intent: EditIntent,
     preview: Option<Plan>,
     live: bool,
     open: bool,
@@ -85,18 +189,29 @@ impl StructureSession {
     pub fn new(target: GridTarget) -> Self {
         Self {
             target,
+            mode: StructureMode::Existing,
             section: Section::Columns,
+            object_kind: String::new(),
+            table_name: String::new(),
             column_name: String::new(),
             column_type: "TEXT".to_owned(),
             kept_columns: Vec::new(),
             index_name: String::new(),
             index_column: String::new(),
+            index_unique: false,
+            index_columns: Vec::new(),
             fk_name: String::new(),
             fk_column: String::new(),
             fk_ref_schema: String::new(),
             fk_ref_table: String::new(),
             fk_ref_column: String::new(),
+            fk_on_delete: "NO ACTION".to_owned(),
+            fk_on_update: "NO ACTION".to_owned(),
             view_sql: String::new(),
+            danger: DangerKind::Drop,
+            rename_to: String::new(),
+            danger_name: String::new(),
+            intent: EditIntent::Apply,
             preview: None,
             live: false,
             open: false,
@@ -119,57 +234,99 @@ impl StructureSession {
         crate::application::ddl::request(self.target.database.clone(), self.target.schema.clone(), &self.target.engine, self.action())
     }
 
+    pub fn visible_sections(&self) -> Vec<Section> {
+        if self.mode == StructureMode::Create {
+            return vec![Section::Columns];
+        }
+        if self.object_kind == "view" {
+            return vec![Section::Columns, Section::View, Section::Danger];
+        }
+        vec![Section::Columns, Section::Indexes, Section::ForeignKeys, Section::Ddl, Section::Danger]
+    }
+
+    pub fn production(&self) -> bool {
+        matches!(self.target.environment.as_str(), "prod" | "production")
+    }
+
+    pub fn danger_name_ok(&self) -> bool {
+        !self.production() || self.danger_name.trim() == self.target.table
+    }
+
+    fn column_drafts_for_action(&self) -> Vec<ColumnDraft> {
+        let mut columns = self.kept_columns.clone();
+        if !self.column_name.is_empty() && columns.iter().all(|column| column.name != self.column_name) {
+            columns.push(ColumnDraft {
+                original: None,
+                name: self.column_name.clone(),
+                type_name: self.column_type.clone(),
+                nullable: true,
+                default_sql: String::new(),
+                primary: false,
+                auto: false,
+                dropped: false,
+            });
+        }
+        if columns.is_empty() {
+            columns.push(ColumnDraft {
+                original: None,
+                name: self.column_name.clone(),
+                type_name: self.column_type.clone(),
+                nullable: true,
+                default_sql: String::new(),
+                primary: false,
+                auto: false,
+                dropped: false,
+            });
+        }
+        columns
+    }
+
+    fn index_drafts(&self) -> Vec<IndexColumnDraft> {
+        if !self.index_columns.is_empty() {
+            return self.index_columns.clone();
+        }
+        vec![IndexColumnDraft { name: self.index_column.clone(), descending: false }]
+    }
+
+    fn foreign_key_draft(&self) -> ForeignKeyDraft {
+        let on_delete = if self.fk_on_delete.trim().is_empty() { "NO ACTION".to_owned() } else { self.fk_on_delete.clone() };
+        let on_update = if self.fk_on_update.trim().is_empty() { "NO ACTION".to_owned() } else { self.fk_on_update.clone() };
+        ForeignKeyDraft {
+            name: self.fk_name.clone(),
+            columns: vec![self.fk_column.clone()],
+            ref_schema: self.fk_ref_schema.clone(),
+            ref_table: self.fk_ref_table.clone(),
+            ref_columns: vec![self.fk_ref_column.clone()],
+            on_delete,
+            on_update,
+        }
+    }
+
+    fn danger_action(&self) -> Action {
+        let table = self.target.table.clone();
+        match self.danger {
+            DangerKind::Truncate => Action::TruncateTable { table },
+            DangerKind::Rename => Action::RenameTable { table, new_name: self.rename_to.clone() },
+            DangerKind::Drop if self.object_kind == "view" => Action::DropView { view: table },
+            DangerKind::Drop => Action::DropTable { table },
+        }
+    }
+
     pub fn action(&self) -> Action {
         let table = self.target.table.clone();
         match self.section {
-            Section::Columns => {
-                let mut columns = self.kept_columns.clone();
-                if !self.column_name.is_empty() && columns.iter().all(|column| column.name != self.column_name) {
-                    columns.push(ColumnDraft {
-                        original: None,
-                        name: self.column_name.clone(),
-                        type_name: self.column_type.clone(),
-                        nullable: true,
-                        default_sql: String::new(),
-                        primary: false,
-                        auto: false,
-                        dropped: false,
-                    });
-                }
-                if columns.is_empty() {
-                    columns.push(ColumnDraft {
-                        original: None,
-                        name: self.column_name.clone(),
-                        type_name: self.column_type.clone(),
-                        nullable: true,
-                        default_sql: String::new(),
-                        primary: false,
-                        auto: false,
-                        dropped: false,
-                    });
-                }
-                Action::AlterColumns { table, columns }
-            }
-            Section::Indexes => Action::CreateIndex {
-                table,
-                name: self.index_name.clone(),
-                unique: false,
-                columns: vec![IndexColumnDraft { name: self.index_column.clone(), descending: false }],
+            Section::Columns if self.mode == StructureMode::Create => Action::CreateTable { name: self.table_name.clone(), columns: self.column_drafts_for_action() },
+            Section::Columns | Section::Ddl => Action::AlterColumns { table, columns: self.column_drafts_for_action() },
+            Section::Indexes => match &self.intent {
+                EditIntent::DropIndex { name } => Action::DropIndex { table, name: name.clone() },
+                _ => Action::CreateIndex { table, name: self.index_name.clone(), unique: self.index_unique, columns: self.index_drafts() },
             },
-            Section::ForeignKeys => Action::CreateForeignKey {
-                table,
-                foreign_key: ForeignKeyDraft {
-                    name: self.fk_name.clone(),
-                    columns: vec![self.fk_column.clone()],
-                    ref_schema: self.fk_ref_schema.clone(),
-                    ref_table: self.fk_ref_table.clone(),
-                    ref_columns: vec![self.fk_ref_column.clone()],
-                    on_delete: "NO ACTION".to_owned(),
-                    on_update: "NO ACTION".to_owned(),
-                },
+            Section::ForeignKeys => match &self.intent {
+                EditIntent::DropForeignKey { name } => Action::DropForeignKey { table, name: name.clone() },
+                _ => Action::CreateForeignKey { table, foreign_key: self.foreign_key_draft() },
             },
             Section::View => Action::ReplaceView { table, definition: self.view_sql.clone() },
-            Section::Danger => Action::DropTable { table },
+            Section::Danger => self.danger_action(),
         }
     }
 
@@ -255,6 +412,9 @@ impl StructureSession {
         if !self.live {
             return Err(Note::Key("admin.preview.unconnected"));
         }
+        if self.section == Section::Danger && !self.danger_name_ok() {
+            return Err(Note::Key("structure.danger.typeName"));
+        }
         let plan = self.preview.as_ref().ok_or(Note::Key("structure.preview.need"))?;
         if !plan.blocked.is_empty() {
             return Err(Note::Raw(plan.blocked.clone()));
@@ -267,14 +427,28 @@ pub struct StructurePane {
     pub session: StructureSession,
     services: Arc<AppServices>,
     fields: Fields<&'static str>,
+    draft_fields: Fields<u32>,
     snapshot: Option<Snapshot>,
     loaded_for: String,
+    /// 快照列已经写进 kept_columns。重置前不再覆盖用户草稿。
+    drafts_ready: bool,
     loading: bool,
     load_error: String,
     /// 当前绑定到的工作项 id；关闭后重开会拿到新 id，必须重置草稿。
     item_id: String,
     /// 刚删除成功的表；外壳取走后让对象树跟着变。
     dropped: Option<GridTarget>,
+    /// 建表成功后的新表。外壳取走后刷新对象树并切到这张表。
+    created: Option<GridTarget>,
+    fk_tables: Vec<String>,
+    fk_schemas: Vec<String>,
+    fk_columns: Vec<String>,
+    fk_key: String,
+    ddl_view: Option<gpui_kit::Entity<FormatViewer>>,
+    ddl_text: String,
+    view_editor: Option<gpui_kit::Entity<EditorState>>,
+    view_editor_sync: String,
+    view_sub: Option<Subscription>,
 }
 
 impl StructurePane {
@@ -283,13 +457,47 @@ impl StructurePane {
             session: StructureSession::new(GridTarget::default()),
             services,
             fields: Fields::default(),
+            draft_fields: Fields::default(),
             snapshot: None,
             loaded_for: String::new(),
+            drafts_ready: false,
             loading: false,
             load_error: String::new(),
             item_id: String::new(),
             dropped: None,
+            created: None,
+            fk_tables: Vec::new(),
+            fk_schemas: Vec::new(),
+            fk_columns: Vec::new(),
+            fk_key: String::new(),
+            ddl_view: None,
+            ddl_text: String::new(),
+            view_editor: None,
+            view_editor_sync: String::new(),
+            view_sub: None,
         }
+    }
+
+    /// 外壳取走“刚建好的表”。
+    pub fn take_created(&mut self) -> Option<GridTarget> {
+        self.created.take()
+    }
+
+    /// 对象树“新建表”：表名留空，字段草稿从 id 开始。
+    pub fn begin_create(&mut self, mut target: GridTarget) {
+        target.table.clear();
+        let item = format!("create:{}", target.connection_id);
+        self.bind_item(target, &item);
+        self.enter_create();
+    }
+
+    fn enter_create(&mut self) {
+        self.session.mode = StructureMode::Create;
+        self.session.section = Section::Columns;
+        self.session.object_kind.clear();
+        self.session.table_name.clear();
+        self.session.kept_columns = vec![default_id(&self.session.target.engine)];
+        self.drafts_ready = true;
     }
 
     /// 外壳取走“刚删除成功的表”。
@@ -309,13 +517,27 @@ impl StructurePane {
         }
         self.item_id = item.to_owned();
         let locale = self.session.locale;
-        self.session = StructureSession::new(target);
+        self.session = StructureSession::new(target.clone());
         self.session.locale = locale;
         self.fields = Fields::default();
+        self.draft_fields = Fields::default();
         self.snapshot = None;
         self.loaded_for.clear();
+        self.drafts_ready = false;
         self.load_error.clear();
         self.loading = false;
+        self.fk_tables.clear();
+        self.fk_schemas.clear();
+        self.fk_columns.clear();
+        self.fk_key.clear();
+        self.ddl_view = None;
+        self.ddl_text.clear();
+        self.view_editor = None;
+        self.view_editor_sync.clear();
+        self.view_sub = None;
+        if target.table.is_empty() && !target.connection_id.is_empty() {
+            self.enter_create();
+        }
     }
 
     pub fn set_locale(&mut self, locale: Locale) {
@@ -328,6 +550,7 @@ impl StructurePane {
     }
 
     pub fn type_into(&mut self, field: &str, text: &str) {
+        let keep_preview = field == "danger_name";
         let slot = match field {
             "column_name" => &mut self.session.column_name,
             "column_type" => &mut self.session.column_type,
@@ -339,6 +562,9 @@ impl StructurePane {
             "fk_ref_table" => &mut self.session.fk_ref_table,
             "fk_ref_column" => &mut self.session.fk_ref_column,
             "view_sql" => &mut self.session.view_sql,
+            "table_name" => &mut self.session.table_name,
+            "rename_to" => &mut self.session.rename_to,
+            "danger_name" => &mut self.session.danger_name,
             _ => return,
         };
         if text == "backspace" {
@@ -349,7 +575,12 @@ impl StructurePane {
         } else {
             slot.push_str(text);
         }
-        self.session.cancel();
+        if field == "index_column" {
+            self.session.index_columns.clear();
+        }
+        if !keep_preview {
+            self.session.cancel();
+        }
     }
 
     pub fn preview(&mut self, cx: &mut Context<Self>) {
@@ -391,6 +622,11 @@ impl StructurePane {
     }
 
     pub fn confirm(&mut self, cx: &mut Context<Self>) {
+        if self.session.section == Section::Danger && !self.session.danger_name_ok() {
+            self.session.note = Note::Key("structure.danger.typeName");
+            cx.notify();
+            return;
+        }
         if self.session.requires_second_confirm() {
             self.session.arm_confirm();
             cx.notify();
@@ -408,6 +644,10 @@ impl StructurePane {
             return;
         };
         let drops_table = matches!(request.action, Action::DropTable { .. });
+        let created_name = match &request.action {
+            Action::CreateTable { name, .. } => Some(name.clone()),
+            _ => None,
+        };
         let services = Arc::clone(&self.services);
         let target = self.session.target.clone();
         let connection = self.session.target.connection_id.clone();
@@ -435,6 +675,22 @@ impl StructurePane {
                                     let all_ok = receipt.steps.iter().all(|step| step.status == crate::ddl::StepStatus::Ok);
                                     if drops_table && all_ok && !receipt.steps.is_empty() {
                                         this.dropped = Some(this.session.target.clone());
+                                    }
+                                    if let Some(name) = created_name.clone() {
+                                        if all_ok && !receipt.steps.is_empty() && !name.trim().is_empty() {
+                                            let mut created = this.session.target.clone();
+                                            created.table = name;
+                                            this.created = Some(created.clone());
+                                            this.session.mode = StructureMode::Existing;
+                                            this.session.target = created;
+                                            this.session.object_kind = "table".into();
+                                            this.session.table_name.clear();
+                                            this.drafts_ready = false;
+                                            this.loaded_for.clear();
+                                            this.snapshot = None;
+                                            this.ddl_view = None;
+                                            this.ddl_text.clear();
+                                        }
                                     }
                                     Note::Key("structure.preview.done")
                                 }
@@ -490,7 +746,10 @@ impl StructurePane {
                             }
                             this.loading = false;
                             match result {
-                                Ok(snapshot) => this.snapshot = Some(snapshot),
+                                Ok(snapshot) => {
+                                    this.adopt_snapshot(&snapshot);
+                                    this.snapshot = Some(snapshot);
+                                }
                                 // 留原文，显示时按当前语言给出。
                                 Err(message) => this.load_error = message,
                             }
@@ -503,7 +762,27 @@ impl StructurePane {
         .detach();
     }
 
+    fn adopt_snapshot(&mut self, snapshot: &Snapshot) {
+        self.session.object_kind = snapshot.kind.clone();
+        if self.session.mode == StructureMode::Create {
+            return;
+        }
+        if !self.drafts_ready {
+            self.drafts_ready = true;
+            self.session.kept_columns = column_drafts(snapshot);
+            if self.session.view_sql.is_empty() {
+                self.session.view_sql = snapshot.table_sql.clone();
+            }
+        }
+        let sections = self.session.visible_sections();
+        if !sections.contains(&self.session.section) {
+            self.session.section = Section::Columns;
+            self.session.cancel();
+        }
+    }
+
     fn set_field(&mut self, field: &'static str, value: String) {
+        let keep_preview = field == "danger_name";
         let slot = match field {
             "column_name" => &mut self.session.column_name,
             "column_type" => &mut self.session.column_type,
@@ -515,11 +794,22 @@ impl StructurePane {
             "fk_ref_table" => &mut self.session.fk_ref_table,
             "fk_ref_column" => &mut self.session.fk_ref_column,
             "view_sql" => &mut self.session.view_sql,
+            "table_name" => &mut self.session.table_name,
+            "rename_to" => &mut self.session.rename_to,
+            "danger_name" => &mut self.session.danger_name,
             _ => return,
         };
         if *slot != value {
             *slot = value;
-            self.session.cancel();
+            if field == "index_column" {
+                self.session.index_columns.clear();
+            }
+            if field == "fk_ref_schema" || field == "fk_ref_table" {
+                self.fk_key.clear();
+            }
+            if !keep_preview {
+                self.session.cancel();
+            }
         }
     }
 
@@ -535,8 +825,145 @@ impl StructurePane {
             "fk_ref_table" => self.session.fk_ref_table.clone(),
             "fk_ref_column" => self.session.fk_ref_column.clone(),
             "view_sql" => self.session.view_sql.clone(),
+            "table_name" => self.session.table_name.clone(),
+            "rename_to" => self.session.rename_to.clone(),
+            "danger_name" => self.session.danger_name.clone(),
             _ => String::new(),
         }
+    }
+
+    fn write_draft(&mut self, key: u32, value: String) {
+        let group = key / 10_000;
+        let index = (key % 10_000) as usize;
+        let changed = match group {
+            0 => match key {
+                4 => replace_text(&mut self.session.table_name, value),
+                5 => replace_text(&mut self.session.rename_to, value),
+                6 => replace_text(&mut self.session.danger_name, value),
+                _ => false,
+            },
+            1 => self.edit_column(index, |column| replace_text(&mut column.name, value)),
+            2 => self.edit_column(index, |column| replace_text(&mut column.type_name, value)),
+            3 => self.edit_column(index, |column| replace_text(&mut column.default_sql, value)),
+            _ => false,
+        };
+        if changed && key != 6 {
+            self.session.cancel();
+        }
+    }
+
+    fn edit_column(&mut self, index: usize, edit: impl FnOnce(&mut ColumnDraft) -> bool) -> bool {
+        let Some(column) = self.session.kept_columns.get_mut(index) else {
+            return false;
+        };
+        edit(column)
+    }
+
+    fn toggle_column(&mut self, index: usize, which: &str) {
+        let create = self.session.mode == StructureMode::Create;
+        let changed = self.edit_column(index, |column| match which {
+            "null" => {
+                column.nullable = !column.nullable;
+                true
+            }
+            "primary" if create => {
+                column.primary = !column.primary;
+                if column.primary {
+                    column.nullable = false;
+                }
+                true
+            }
+            "auto" if create => {
+                column.auto = !column.auto;
+                true
+            }
+            "drop" => {
+                column.dropped = !column.dropped;
+                true
+            }
+            _ => false,
+        });
+        if changed {
+            self.session.cancel();
+        }
+    }
+
+    fn move_column(&mut self, index: usize, delta: isize) {
+        if self.session.mode != StructureMode::Create {
+            return;
+        }
+        let next = index as isize + delta;
+        if next < 0 || next >= self.session.kept_columns.len() as isize {
+            return;
+        }
+        self.session.kept_columns.swap(index, next as usize);
+        self.session.cancel();
+    }
+
+    fn add_column(&mut self) {
+        let name = if self.session.column_name.trim().is_empty() {
+            format!("col_{}", self.session.kept_columns.len() + 1)
+        } else {
+            self.session.column_name.trim().to_owned()
+        };
+        if self.session.kept_columns.iter().any(|column| column.name == name) {
+            return;
+        }
+        self.session.kept_columns.push(ColumnDraft {
+            original: None,
+            name,
+            type_name: self.session.column_type.clone(),
+            nullable: true,
+            default_sql: String::new(),
+            primary: false,
+            auto: false,
+            dropped: false,
+        });
+        self.session.column_name.clear();
+        self.session.cancel();
+    }
+
+    fn reset_draft(&mut self) {
+        self.session.cancel();
+        self.session.column_name.clear();
+        self.session.column_type = "TEXT".into();
+        self.session.intent = EditIntent::Apply;
+        self.session.index_unique = false;
+        self.session.index_columns.clear();
+        self.session.index_name.clear();
+        self.session.index_column.clear();
+        if self.session.mode == StructureMode::Create {
+            self.session.table_name.clear();
+            self.session.kept_columns = vec![default_id(&self.session.target.engine)];
+            return;
+        }
+        if let Some(snapshot) = &self.snapshot {
+            self.session.kept_columns = column_drafts(snapshot);
+            self.session.view_sql = snapshot.table_sql.clone();
+        }
+    }
+
+    fn toggle_index_column(&mut self, name: &str) {
+        if let Some(index) = self.session.index_columns.iter().position(|column| column.name == name) {
+            self.session.index_columns.remove(index);
+        } else {
+            self.session.index_columns.push(IndexColumnDraft { name: name.to_owned(), descending: false });
+        }
+        self.session.index_column = self.session.index_columns.first().map(|column| column.name.clone()).unwrap_or_default();
+        self.session.intent = EditIntent::Apply;
+        self.session.cancel();
+    }
+
+    fn toggle_index_order(&mut self, name: &str) {
+        if let Some(column) = self.session.index_columns.iter_mut().find(|column| column.name == name) {
+            column.descending = !column.descending;
+            self.session.intent = EditIntent::Apply;
+            self.session.cancel();
+        }
+    }
+
+    fn choose_fk(&mut self, field: &'static str, value: String) {
+        self.set_field(field, value);
     }
 
     fn field(&mut self, field: &'static str, key: &str, placeholder: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -548,6 +975,105 @@ impl StructurePane {
             kit::text_input(SharedString::from(format!("structure-field-{field}")), &state, i18n::text(self.session.locale, key)),
             &p,
         )
+    }
+
+    fn ensure_references(&mut self, cx: &mut Context<Self>) {
+        if self.session.section != Section::ForeignKeys || self.session.mode == StructureMode::Create {
+            return;
+        }
+        let target = &self.session.target;
+        if target.connection_id.is_empty() {
+            return;
+        }
+        let schema = if self.session.fk_ref_schema.is_empty() { target.schema.clone() } else { self.session.fk_ref_schema.clone() };
+        let key = format!("{}|{}|{}|{}", target.connection_id, target.database, schema, self.session.fk_ref_table);
+        if self.fk_key == key {
+            return;
+        }
+        self.fk_key = key.clone();
+        let services = Arc::clone(&self.services);
+        let target = target.clone();
+        let ref_table = self.session.fk_ref_table.clone();
+        let want_schemas = shows_ref_schema(&target.engine) && self.fk_schemas.is_empty();
+        let view = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            crate::app::views::grid::runtime_for_views().spawn(async move {
+                let loaded = load_fk_choices(&services.connections, &target, &schema, &ref_table, want_schemas).await;
+                let _ = tx.send(loaded);
+            });
+            if let Ok(loaded) = rx.await {
+                cx.update(|cx| {
+                    if let Some(view) = view.upgrade() {
+                        view.update(cx, |this, cx| {
+                            if this.fk_key != key {
+                                return;
+                            }
+                            if let Some(schemas) = loaded.schemas {
+                                this.fk_schemas = schemas;
+                            }
+                            this.fk_tables = loaded.tables;
+                            this.fk_columns = loaded.columns;
+                            cx.notify();
+                        });
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn ddl_viewer(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> gpui_kit::Entity<FormatViewer> {
+        if let Some(view) = self.ddl_view.clone() {
+            if self.ddl_text != text {
+                self.ddl_text = text.to_owned();
+                let locale = self.session.locale;
+                let text = text.to_owned();
+                view.update(cx, |viewer, cx| {
+                    viewer.replace_full(text, None, window, cx);
+                    viewer.set_manual_format(Some(DataFormat::Sql), window, cx);
+                    viewer.set_locale(locale, window, cx);
+                });
+            }
+            return view;
+        }
+        self.ddl_text = text.to_owned();
+        let spec = ViewerSpec {
+            text: text.to_owned(),
+            column_hint: None,
+            type_hint: Some("sql".into()),
+            bytes: None,
+            truncation: TruncationState::Full,
+            mode: EditMode::ReadOnly,
+            locale: self.session.locale,
+        };
+        let view = cx.new(|cx| {
+            let mut viewer = FormatViewer::new(spec, window, cx);
+            viewer.set_manual_format(Some(DataFormat::Sql), window, cx);
+            viewer
+        });
+        self.ddl_view = Some(view.clone());
+        view
+    }
+
+    fn ensure_view_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view_editor.is_some() {
+            return;
+        }
+        let initial = self.session.view_sql.clone();
+        let editor = cx.new(|cx| EditorState::new(window, cx).language("sql").line_number(true).soft_wrap(true).default_value(initial));
+        self.view_editor_sync = self.session.view_sql.clone();
+        self.view_sub = Some(cx.subscribe(&editor, |this, state, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                let text = state.read(cx).value().to_string();
+                if this.session.view_sql != text {
+                    this.session.view_sql = text;
+                    this.session.cancel();
+                    cx.notify();
+                }
+            }
+        }));
+        self.view_editor = Some(editor);
     }
 
     fn overview(&self, p: &Palette, cx: &App) -> AnyElement {
@@ -608,7 +1134,7 @@ impl StructurePane {
                     .collect();
                 grid_table(vec![t("structure.section.foreign"), t("structure.section.columns"), t("ui.structure.references")], vec![1.4, 1.4, 2.], rows, p, kit::Metrics::of(cx))
             }
-            Section::View | Section::Danger => div()
+            Section::View | Section::Ddl | Section::Danger => div()
                 .id("structure-ddl")
                 .max_h(px(260.))
                 .overflow_y_scroll()
@@ -620,6 +1146,60 @@ impl StructurePane {
                 .into_any_element(),
         }
     }
+}
+
+fn selected_button(button: gpui_kit::component::button::Button, selected: bool) -> gpui_kit::component::button::Button {
+    if selected { button.primary() } else { button }
+}
+
+fn replace_text(slot: &mut String, value: String) -> bool {
+    if *slot == value {
+        return false;
+    }
+    *slot = value;
+    true
+}
+
+fn on_draft(this: &mut StructurePane, key: u32, value: String, _: &mut Context<StructurePane>) {
+    this.write_draft(key, value);
+}
+
+struct FkChoices {
+    schemas: Option<Vec<String>>,
+    tables: Vec<String>,
+    columns: Vec<String>,
+}
+
+async fn load_fk_choices(service: &crate::connections::Service, target: &GridTarget, schema: &str, ref_table: &str, want_schemas: bool) -> FkChoices {
+    let Some(session) = service.catalog_session(&target.connection_id) else {
+        return FkChoices { schemas: None, tables: Vec::new(), columns: Vec::new() };
+    };
+    let Ok(engine) = crate::connections::model::Engine::parse(&target.engine) else {
+        return FkChoices { schemas: None, tables: Vec::new(), columns: Vec::new() };
+    };
+    let schemas = if want_schemas {
+        let body = crate::catalog::read::read_catalog_outline(engine, &session).await;
+        let names = body
+            .databases
+            .iter()
+            .find(|database| database.name == target.database)
+            .map(|database| database.schemas.iter().map(|schema| schema.name.clone()).filter(|name| !name.is_empty()).collect())
+            .unwrap_or_default();
+        Some(names)
+    } else {
+        None
+    };
+    let page = crate::catalog::read::read_object_kind_page(&session, engine, &target.database, schema, crate::catalog::model::ObjectKind::Table, 0, 200).await;
+    let mut tables = page.objects.into_iter().map(|row| row.name).collect::<Vec<_>>();
+    tables.sort();
+    tables.dedup();
+    let mut columns = Vec::new();
+    if !ref_table.is_empty() {
+        if let Ok(snapshot) = crate::application::ddl::describe_saved(service, &target.connection_id, target.database.clone(), schema.to_owned(), &target.engine, ref_table).await {
+            columns = snapshot.columns.into_iter().map(|column| column.name).collect();
+        }
+    }
+    FkChoices { schemas, tables, columns }
 }
 
 fn grid_table(headers: Vec<SharedString>, weights: Vec<f32>, rows: Vec<Vec<AnyElement>>, p: &Palette, m: kit::Metrics) -> AnyElement {
@@ -662,86 +1242,564 @@ fn cell_text(text: String, p: &Palette) -> AnyElement {
 }
 
 
-impl Render for StructurePane {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.ensure_snapshot(cx);
+impl StructurePane {
+    fn preview_current(&mut self, cx: &mut Context<Self>) {
+        self.session.intent = EditIntent::Apply;
+        self.preview(cx);
+    }
+
+    fn preview_drop_index(&mut self, name: String, cx: &mut Context<Self>) {
+        self.session.intent = EditIntent::DropIndex { name };
+        self.session.section = Section::Indexes;
+        self.preview(cx);
+    }
+
+    fn preview_drop_fk(&mut self, name: String, cx: &mut Context<Self>) {
+        self.session.intent = EditIntent::DropForeignKey { name };
+        self.session.section = Section::ForeignKeys;
+        self.preview(cx);
+    }
+
+    fn preview_danger(&mut self, kind: DangerKind, cx: &mut Context<Self>) {
+        self.session.danger = kind;
+        self.session.intent = EditIntent::Apply;
+        self.session.section = Section::Danger;
+        self.preview(cx);
+    }
+
+    fn draft_input(&mut self, key: u32, value: &str, placeholder: &str, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let state = self.draft_fields.bind(key, value, FieldSpec { placeholder, masked: false }, window, cx, on_draft);
+        kit::text_input(SharedString::from(format!("structure-draft-{key}")), &state, placeholder.to_owned()).small().into_any_element()
+    }
+
+    fn section_form(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let locale = self.session.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let section = self.session.section;
         let entity = cx.entity();
+        let metrics = kit::Metrics::of(cx);
+        let mut form = div().flex().flex_col().gap(px(metrics.section_gap()));
+        let readonly_view = self.session.object_kind == "view" && self.session.mode != StructureMode::Create;
+        match section {
+            Section::Columns if readonly_view => {
+                form = form.child(kit::muted(t("structure.section.viewDef"), &p));
+            }
+            Section::Columns => {
+                if self.session.mode == StructureMode::Create {
+                    let name = self.draft_input(4, &self.session.table_name.clone(), "table_name", window, cx);
+                    form = form.child(kit::form_row(t("structure.action.createTable"), name, &p));
+                }
+                let columns = self.session.kept_columns.clone();
+                let create = self.session.mode == StructureMode::Create;
+                let engine = self.session.target.engine.clone();
+                for (index, column) in columns.iter().enumerate() {
+                    let name = self.draft_input(10_000 + index as u32, &column.name, "name", window, cx);
+                    let kind = self.draft_input(20_000 + index as u32, &column.type_name, "TEXT", window, cx);
+                    let default_value = self.draft_input(30_000 + index as u32, &column.default_sql, "DEFAULT", window, cx);
+                    let entity = entity.clone();
+                    let types = type_choices(&engine).iter().map(|item| (*item).to_owned()).collect::<Vec<_>>();
+                    let type_menu = {
+                        let entity = entity.clone();
+                        Button::new(SharedString::from(format!("structure-types-{index}")))
+                            .ghost()
+                            .small()
+                            .label(t("structure.field.type"))
+                            .dropdown_menu(move |mut menu, _, _| {
+                                for choice in types.clone() {
+                                    let entity = entity.clone();
+                                    let choice = choice.clone();
+                                    menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
+                                        let choice = choice.clone();
+                                        entity.update(cx, |pane, cx| {
+                                            pane.write_draft(20_000 + index as u32, choice);
+                                            cx.notify();
+                                        });
+                                    }));
+                                }
+                                menu
+                            })
+                            .into_any_element()
+                    };
+                    let null_entity = entity.clone();
+                    let null_on = column.nullable;
+                    let null_button = selected_button(
+                        kit::secondary_button(SharedString::from(format!("structure-null-{index}")), None, t("ui.structure.nullable"), move |_, _, cx| {
+                            null_entity.update(cx, |pane, cx| {
+                                pane.toggle_column(index, "null");
+                                cx.notify();
+                            });
+                        }),
+                        null_on,
+                    );
+                    let mut row = div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .when(column.dropped, |row| row.opacity(0.45))
+                        .child(div().flex_1().min_w(px(120.)).child(name))
+                        .child(div().w(px(140.)).child(kind))
+                        .child(type_menu)
+                        .child(div().w(px(140.)).child(default_value))
+                        .child(null_button);
+                    if create {
+                        let primary_entity = entity.clone();
+                        let primary_on = column.primary;
+                        row = row.child(selected_button(
+                            kit::secondary_button(SharedString::from(format!("structure-pk-{index}")), Some(IconName::Key), t("structure.field.primary"), move |_, _, cx| {
+                                primary_entity.update(cx, |pane, cx| {
+                                    pane.toggle_column(index, "primary");
+                                    cx.notify();
+                                });
+                            }),
+                            primary_on,
+                        ));
+                        let auto_entity = entity.clone();
+                        let auto_on = column.auto;
+                        row = row.child(selected_button(
+                            kit::secondary_button(SharedString::from(format!("structure-auto-{index}")), None, t("structure.field.auto"), move |_, _, cx| {
+                                auto_entity.update(cx, |pane, cx| {
+                                    pane.toggle_column(index, "auto");
+                                    cx.notify();
+                                });
+                            }),
+                            auto_on,
+                        ));
+                        let up_entity = entity.clone();
+                        row = row.child(kit::icon_button(SharedString::from(format!("structure-up-{index}")), IconName::ChevronUp, t("structure.field.moveUp"), move |_, _, cx| {
+                            up_entity.update(cx, |pane, cx| {
+                                pane.move_column(index, -1);
+                                cx.notify();
+                            });
+                        }));
+                        let down_entity = entity.clone();
+                        row = row.child(kit::icon_button(SharedString::from(format!("structure-down-{index}")), IconName::ChevronDown, t("structure.field.moveDown"), move |_, _, cx| {
+                            down_entity.update(cx, |pane, cx| {
+                                pane.move_column(index, 1);
+                                cx.notify();
+                            });
+                        }));
+                    }
+                    let drop_entity = entity.clone();
+                    row = row.child(kit::icon_button(SharedString::from(format!("structure-drop-col-{index}")), IconName::Trash, t("structure.field.delete"), move |_, _, cx| {
+                        drop_entity.update(cx, |pane, cx| {
+                            pane.toggle_column(index, "drop");
+                            cx.notify();
+                        });
+                    }));
+                    form = form.child(row);
+                }
+                let name = self.field("column_name", "structure.field.column", "new_column", window, cx);
+                let kind = self.field("column_type", "structure.field.type", "TEXT", window, cx);
+                let add_entity = entity.clone();
+                let reset_entity = entity.clone();
+                form = form
+                    .child(div().flex().gap(px(8.)).child(div().flex_1().child(name)).child(div().w(px(160.)).child(kind)))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(kit::secondary_button("structure-add-column", Some(IconName::Plus), t("ui.structure.add"), move |_, _, cx| {
+                                add_entity.update(cx, |pane, cx| {
+                                    pane.add_column();
+                                    cx.notify();
+                                });
+                            }))
+                            .child(kit::secondary_button("structure-reset-draft", None, t("structure.field.reset"), move |_, _, cx| {
+                                reset_entity.update(cx, |pane, cx| {
+                                    pane.reset_draft();
+                                    cx.notify();
+                                });
+                            })),
+                    );
+            }
+            Section::Indexes => {
+                let indexes = self.snapshot.as_ref().map(|snapshot| snapshot.indexes.clone()).unwrap_or_default();
+                for (index, index_row) in indexes.iter().enumerate() {
+                    let protected = index_row.protected;
+                    let reason = localize(&index_row.reason, locale);
+                    let name = index_row.name.clone();
+                    let drop_entity = entity.clone();
+                    let button = kit::secondary_button(SharedString::from(format!("structure-drop-index-{index}")), Some(IconName::Trash), t("structure.index.delete"), move |_, _, cx| {
+                        let name = name.clone();
+                        drop_entity.update(cx, |pane, cx| pane.preview_drop_index(name, cx));
+                    })
+                    .disabled(protected);
+                    let button = if protected && !reason.is_empty() { button.tooltip(SharedString::from(reason)).into_any_element() } else { button.into_any_element() };
+                    form = form.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(div().flex_1().truncate().child(SharedString::from(index_row.name.clone())))
+                            .child(button),
+                    );
+                }
+                let names = self.snapshot.as_ref().map(|snapshot| snapshot.columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>()).unwrap_or_else(|| {
+                    self.session.kept_columns.iter().filter(|column| !column.dropped).map(|column| column.name.clone()).collect()
+                });
+                let selected = self.session.index_columns.clone();
+                for name in &names {
+                    let picked = selected.iter().find(|column| column.name == *name);
+                    let on = picked.is_some();
+                    let descending = picked.is_some_and(|column| column.descending);
+                    let pick_entity = entity.clone();
+                    let column_name = name.clone();
+                    let order_entity = entity.clone();
+                    let order_name = name.clone();
+                    form = form.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(selected_button(
+                                kit::secondary_button(SharedString::from(format!("structure-index-col-{name}")), None, SharedString::from(name.clone()), move |_, _, cx| {
+                                    let column_name = column_name.clone();
+                                    pick_entity.update(cx, |pane, cx| {
+                                        pane.toggle_index_column(&column_name);
+                                        cx.notify();
+                                    });
+                                }),
+                                on,
+                            ))
+                            .child(
+                                kit::secondary_button(
+                                    SharedString::from(format!("structure-index-order-{name}")),
+                                    None,
+                                    if descending { t("structure.index.desc") } else { t("structure.index.asc") },
+                                    move |_, _, cx| {
+                                        let order_name = order_name.clone();
+                                        order_entity.update(cx, |pane, cx| {
+                                            pane.toggle_index_order(&order_name);
+                                            cx.notify();
+                                        });
+                                    },
+                                )
+                                .disabled(!on),
+                            ),
+                    );
+                }
+                let unique_entity = entity.clone();
+                let unique = self.session.index_unique;
+                let name = self.field("index_name", "structure.field.index", "ix_table_column", window, cx);
+                form = form.child(name).child(selected_button(
+                    kit::secondary_button("structure-index-unique", None, t("structure.index.unique"), move |_, _, cx| {
+                        unique_entity.update(cx, |pane, cx| {
+                            pane.session.index_unique = !pane.session.index_unique;
+                            pane.session.intent = EditIntent::Apply;
+                            pane.session.cancel();
+                            cx.notify();
+                        });
+                    }),
+                    unique,
+                ));
+            }
+            Section::ForeignKeys => {
+                self.ensure_references(cx);
+                let keys = self.snapshot.as_ref().map(|snapshot| snapshot.foreign_keys.clone()).unwrap_or_default();
+                for (index, key) in keys.iter().enumerate() {
+                    let name = if key.name.is_empty() { format!("fk_{index}") } else { key.name.clone() };
+                    let drop_entity = entity.clone();
+                    let drop_name = name.clone();
+                    form = form.child(
+                        div().flex().items_center().gap(px(8.)).child(div().flex_1().truncate().child(SharedString::from(name))).child(kit::secondary_button(
+                            SharedString::from(format!("structure-drop-fk-{index}")),
+                            Some(IconName::Trash),
+                            t("structure.fk.delete"),
+                            move |_, _, cx| {
+                                let drop_name = drop_name.clone();
+                                drop_entity.update(cx, |pane, cx| pane.preview_drop_fk(drop_name, cx));
+                            },
+                        )),
+                    );
+                }
+                let name = self.field("fk_name", "structure.section.foreign", "fk_name", window, cx);
+                let column = self.field("fk_column", "structure.field.column", "parent_id", window, cx);
+                let table = self.field("fk_ref_table", "ui.structure.refTable", "parents", window, cx);
+                let target = self.field("fk_ref_column", "ui.structure.refColumn", "id", window, cx);
+                form = form.child(div().flex().gap(px(8.)).child(div().flex_1().child(name)).child(div().flex_1().child(column)));
+                if shows_ref_schema(&self.session.target.engine) {
+                    let schema = self.field("fk_ref_schema", "structure.fk.refSchema", "public", window, cx);
+                    let schemas = self.fk_schemas.clone();
+                    let schema_entity = entity.clone();
+                    form = form.child(div().flex().gap(px(8.)).child(div().flex_1().child(schema)).child(
+                        Button::new("structure-fk-schemas")
+                            .ghost()
+                            .small()
+                            .label(t("structure.fk.refSchema"))
+                            .dropdown_menu(move |mut menu, _, _| {
+                                for choice in schemas.clone() {
+                                    let schema_entity = schema_entity.clone();
+                                    let choice = choice.clone();
+                                    menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
+                                        let choice = choice.clone();
+                                        schema_entity.update(cx, |pane, cx| {
+                                            pane.choose_fk("fk_ref_schema", choice);
+                                            cx.notify();
+                                        });
+                                    }));
+                                }
+                                menu
+                            }),
+                    ));
+                }
+                let tables = self.fk_tables.clone();
+                let columns = self.fk_columns.clone();
+                let local = self.snapshot.as_ref().map(|snapshot| snapshot.columns.iter().map(|column| column.name.clone()).collect()).unwrap_or_else(Vec::new);
+                let table_entity = entity.clone();
+                let column_entity = entity.clone();
+                let ref_entity = entity.clone();
+                form = form.child(div().flex().gap(px(8.)).child(div().flex_1().child(table)).child(div().flex_1().child(target))).child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(8.))
+                        .child(
+                            Button::new("structure-fk-local")
+                                .ghost()
+                                .small()
+                                .label(t("structure.field.column"))
+                                .dropdown_menu(move |mut menu, _, _| {
+                                    for choice in local.clone() {
+                                        let column_entity = column_entity.clone();
+                                        let choice = choice.clone();
+                                        menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
+                                            let choice = choice.clone();
+                                            column_entity.update(cx, |pane, cx| {
+                                                pane.choose_fk("fk_column", choice);
+                                                cx.notify();
+                                            });
+                                        }));
+                                    }
+                                    menu
+                                }),
+                        )
+                        .child(
+                            Button::new("structure-fk-tables")
+                                .ghost()
+                                .small()
+                                .label(t("ui.structure.refTable"))
+                                .dropdown_menu(move |mut menu, _, _| {
+                                    for choice in tables.clone() {
+                                        let table_entity = table_entity.clone();
+                                        let choice = choice.clone();
+                                        menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
+                                            let choice = choice.clone();
+                                            table_entity.update(cx, |pane, cx| {
+                                                pane.choose_fk("fk_ref_table", choice);
+                                                cx.notify();
+                                            });
+                                        }));
+                                    }
+                                    menu
+                                }),
+                        )
+                        .child(
+                            Button::new("structure-fk-ref-cols")
+                                .ghost()
+                                .small()
+                                .label(t("ui.structure.refColumn"))
+                                .dropdown_menu(move |mut menu, _, _| {
+                                    for choice in columns.clone() {
+                                        let ref_entity = ref_entity.clone();
+                                        let choice = choice.clone();
+                                        menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
+                                            let choice = choice.clone();
+                                            ref_entity.update(cx, |pane, cx| {
+                                                pane.choose_fk("fk_ref_column", choice);
+                                                cx.notify();
+                                            });
+                                        }));
+                                    }
+                                    menu
+                                }),
+                        ),
+                );
+                let actions = fk_action_choices(&self.session.target.engine);
+                let delete_now = self.session.fk_on_delete.clone();
+                let update_now = self.session.fk_on_update.clone();
+                let delete_entity = entity.clone();
+                let update_entity = entity.clone();
+                form = form.child(
+                    div()
+                        .flex()
+                        .gap(px(8.))
+                        .child(
+                            Button::new("structure-fk-on-delete")
+                                .ghost()
+                                .small()
+                                .label(SharedString::from(format!("{} {delete_now}", i18n::text(locale, "structure.fk.onDelete"))))
+                                .dropdown_menu(move |mut menu, _, _| {
+                                    for choice in actions {
+                                        let delete_entity = delete_entity.clone();
+                                        let choice = (*choice).to_owned();
+                                        menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
+                                            let choice = choice.clone();
+                                            delete_entity.update(cx, |pane, cx| {
+                                                pane.session.fk_on_delete = choice;
+                                                pane.session.intent = EditIntent::Apply;
+                                                pane.session.cancel();
+                                                cx.notify();
+                                            });
+                                        }));
+                                    }
+                                    menu
+                                }),
+                        )
+                        .child(
+                            Button::new("structure-fk-on-update")
+                                .ghost()
+                                .small()
+                                .label(SharedString::from(format!("{} {update_now}", i18n::text(locale, "structure.fk.onUpdate"))))
+                                .dropdown_menu(move |mut menu, _, _| {
+                                    for choice in actions {
+                                        let update_entity = update_entity.clone();
+                                        let choice = (*choice).to_owned();
+                                        menu = menu.item(PopupMenuItem::new(choice.clone()).on_click(move |_, _, cx| {
+                                            let choice = choice.clone();
+                                            update_entity.update(cx, |pane, cx| {
+                                                pane.session.fk_on_update = choice;
+                                                pane.session.intent = EditIntent::Apply;
+                                                pane.session.cancel();
+                                                cx.notify();
+                                            });
+                                        }));
+                                    }
+                                    menu
+                                }),
+                        ),
+                );
+            }
+            Section::View => {
+                self.ensure_view_editor(window, cx);
+                if let Some(editor) = self.view_editor.clone() {
+                    kit::sync_editor(&editor, &mut self.view_editor_sync, &self.session.view_sql, window, cx);
+                    form = form.child(
+                        div().h(px(220.)).child(
+                            Editor::new(&editor).h(relative(1.)).bordered(false).aria_label(t("structure.section.viewDef")),
+                        ),
+                    );
+                }
+            }
+            Section::Ddl => {
+                let (sql, missing) = self.snapshot.as_ref().map(definition_text).unwrap_or_else(|| (String::new(), Vec::new()));
+                let viewer = self.ddl_viewer(&sql, window, cx);
+                let copy_sql = sql.clone();
+                form = form
+                    .child(div().h(px(280.)).child(viewer))
+                    .child(kit::secondary_button("structure-copy-ddl", Some(IconName::Copy), t("common.copy"), move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_sql.clone()));
+                    }));
+                if !missing.is_empty() {
+                    let mut notes = div().flex().flex_col().gap(px(4.));
+                    for item in missing {
+                        notes = notes.child(kit::muted(SharedString::from(localize_missing_item(&item, locale)), &p));
+                    }
+                    form = form.child(notes);
+                }
+            }
+            Section::Danger => {
+                let view = self.session.object_kind == "view";
+                form = form.child(
+                    div()
+                        .flex()
+                        .gap(px(10.))
+                        .p(px(metrics.card_pad()))
+                        .rounded(px(Radius::PANEL))
+                        .bg(p.danger_soft)
+                        .text_color(p.danger)
+                        .child(kit::icon(IconName::TriangleAlert, 16., p.danger))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(div().font_weight(FontWeight::SEMIBOLD).child(if view { t("structure.section.view") } else { t("ui.structure.dropTitle") }))
+                                .child(div().text_size(px(TypeScale::SM)).child(t("ui.structure.dropDetail"))),
+                        ),
+                );
+                if !view {
+                    let rename = self.field("rename_to", "catalog.danger.newName", "new_name", window, cx);
+                    let rename_entity = entity.clone();
+                    let truncate_entity = entity.clone();
+                    form = form.child(rename).child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(8.))
+                            .child(kit::secondary_button("structure-rename", None, t("catalog.tree.renameTable"), move |_, _, cx| {
+                                rename_entity.update(cx, |pane, cx| pane.preview_danger(DangerKind::Rename, cx));
+                            }))
+                            .child(kit::danger_button("structure-truncate", None, t("catalog.tree.truncateTable"), move |_, _, cx| {
+                                truncate_entity.update(cx, |pane, cx| pane.preview_danger(DangerKind::Truncate, cx));
+                            })),
+                    );
+                }
+                if self.session.production() && !self.session.preview_open() {
+                    let typed = self.draft_input(6, &self.session.danger_name.clone(), &self.session.target.table.clone(), window, cx);
+                    form = form.child(kit::form_row(t("structure.danger.typeName"), typed, &p));
+                }
+            }
+        }
+        if !matches!(section, Section::Ddl) && !(section == Section::Columns && readonly_view) {
+            let preview_entity = entity.clone();
+            let preview_click = move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+                preview_entity.update(cx, |pane, cx| pane.preview_current(cx));
+            };
+            form = form.child(div().flex().justify_end().child(if section == Section::Danger {
+                kit::danger_button("structure-preview", Some(IconName::Eye), t("structure.action.preview"), preview_click).into_any_element()
+            } else {
+                kit::primary_button("structure-preview", Some(IconName::Eye), t("structure.action.preview"), preview_click).into_any_element()
+            }));
+        }
+        form.into_any_element()
+    }
+}
+
+impl Render for StructurePane {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_snapshot(cx);
+        let p = Palette::of(cx);
+        let metrics = kit::Metrics::of(cx);
+        let locale = self.session.locale;
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let section = self.session.section;
+        let entity = cx.entity();
         let mut items = Vec::new();
-        for (id, key, value) in [
-            ("structure.section.columns", "structure.section.columns", Section::Columns),
-            ("structure.section.indexes", "structure.section.indexes", Section::Indexes),
-            ("structure.section.foreign", "structure.section.foreign", Section::ForeignKeys),
-            ("structure.section.view", "structure.section.view", Section::View),
-            ("structure.section.danger", "structure.section.danger", Section::Danger),
-        ] {
+        for value in self.session.visible_sections() {
+            let key = match value {
+                Section::Columns => "structure.section.columns",
+                Section::Indexes => "structure.section.indexes",
+                Section::ForeignKeys => "structure.section.foreign",
+                Section::View => "structure.section.viewDef",
+                Section::Ddl => "structure.section.ddl",
+                Section::Danger => "structure.section.danger",
+            };
             let entity = entity.clone();
             items.push((
-                SharedString::from(id),
+                SharedString::from(key),
                 t(key),
                 section == value,
                 kit::click(move |_, _, cx| {
                     entity.update(cx, |pane, cx| {
                         pane.session.section = value;
+                        pane.session.intent = EditIntent::Apply;
                         pane.session.cancel();
                         cx.notify();
                     });
                 }),
             ));
         }
-        let mut form = div().flex().flex_col().gap(px(12.));
-        match section {
-            Section::Columns => {
-                let name = self.field("column_name", "structure.field.column", "new_column", window, cx);
-                let kind = self.field("column_type", "structure.field.type", "TEXT", window, cx);
-                form = form.child(div().flex().gap(px(12.)).child(div().flex_1().child(name)).child(div().w(px(200.)).child(kind)));
-            }
-            Section::Indexes => {
-                let name = self.field("index_name", "structure.field.index", "ix_table_column", window, cx);
-                let column = self.field("index_column", "structure.section.columns", "column", window, cx);
-                form = form.child(div().flex().gap(px(12.)).child(div().flex_1().child(name)).child(div().flex_1().child(column)));
-            }
-            Section::ForeignKeys => {
-                let name = self.field("fk_name", "structure.section.foreign", "fk_name", window, cx);
-                let column = self.field("fk_column", "structure.field.column", "parent_id", window, cx);
-                let table = self.field("fk_ref_table", "ui.structure.refTable", "parents", window, cx);
-                let target = self.field("fk_ref_column", "ui.structure.refColumn", "id", window, cx);
-                form = form
-                    .child(div().flex().gap(px(12.)).child(div().flex_1().child(name)).child(div().flex_1().child(column)))
-                    .child(div().flex().gap(px(12.)).child(div().flex_1().child(table)).child(div().flex_1().child(target)));
-            }
-            Section::View => {
-                let sql = self.field("view_sql", "structure.field.view", "CREATE VIEW … AS SELECT …", window, cx);
-                form = form.child(sql);
-            }
-            Section::Danger => {
-                form = form.child(
-                    div()
-                        .flex()
-                        .gap(px(10.))
-                        .p(px(12.))
-                        .rounded(px(Radius::PANEL))
-                        .bg(p.danger_soft)
-                        .text_color(p.danger)
-                        .child(kit::icon(IconName::TriangleAlert, 16., p.danger))
-                        .child(div().flex().flex_col().gap(px(2.)).child(div().font_weight(FontWeight::SEMIBOLD).child(t("ui.structure.dropTitle"))).child(div().text_size(px(TypeScale::SM)).child(t("ui.structure.dropDetail")))),
-                );
-            }
-        }
-        let preview_click = {
-            let entity = entity.clone();
-            move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| entity.update(cx, |pane, cx| pane.preview(cx))
-        };
-        form = form.child(div().flex().justify_end().child(if section == Section::Danger {
-            kit::danger_button("structure-preview", Some(IconName::Eye), t("structure.action.preview"), preview_click).into_any_element()
+        let form = self.section_form(window, cx);
+        let title = if self.session.mode == StructureMode::Create {
+            t("structure.action.createTable")
+        } else if self.session.target.table.is_empty() {
+            t("structure.section.columns")
         } else {
-            kit::primary_button("structure-preview", Some(IconName::Eye), t("structure.action.preview"), preview_click).into_any_element()
-        }));
-
-        let title = if self.session.target.table.is_empty() { t("structure.section.columns") } else { SharedString::from(self.session.target.table.clone()) };
+            SharedString::from(self.session.target.table.clone())
+        };
         let mut column = div()
             .id("structure-pane")
             .relative()
@@ -751,9 +1809,9 @@ impl Render for StructurePane {
             .child(
                 div()
                     .flex_none()
-                    .px(px(24.))
-                    .pt(px(18.))
-                    .pb(px(14.))
+                    .px(px(metrics.page_pad))
+                    .pt(px(metrics.page_pad_y))
+                    .pb(px(metrics.pane_pad()))
                     .flex()
                     .flex_wrap()
                     .items_center()
@@ -770,17 +1828,26 @@ impl Render for StructurePane {
                             .child(kit::title(title, TypeScale::LG, &p))
                             .child(div().id("structure-banner").text_size(px(TypeScale::SM)).text_color(p.text_muted).truncate().child(SharedString::from(self.session.banner()))),
                     )
-                    .child(kit::segmented_sized(items, &p, kit::Metrics::of(cx).control_h)),
+                    .child(kit::segmented_sized(items, &p, metrics.control_h)),
             );
-        let mut body = div().id("structure-body").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(24.)).flex().flex_col().gap(px(20.));
+        let mut body = div().id("structure-body").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(metrics.page_pad)).flex().flex_col().gap(px(metrics.section_gap()));
         body = body
             .child(div().flex().flex_col().gap(px(8.)).child(kit::eyebrow(t("ui.structure.existing"), &p)).child(kit::card(&p).overflow_hidden().child(self.overview(&p, cx))))
-            .child(div().flex().flex_col().gap(px(8.)).child(kit::eyebrow(t(if section == Section::Danger { "structure.section.danger" } else { "ui.structure.add" }), &p)).child(kit::card(&p).p(px(16.)).child(form)));
+            .child(div().flex().flex_col().gap(px(8.)).child(kit::eyebrow(t(if section == Section::Danger { "structure.section.danger" } else { "ui.structure.add" }), &p)).child(kit::card(&p).p(px(metrics.card_pad())).child(form)));
         if !self.session.note.is_empty() {
             body = body.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.hover).text_size(px(TypeScale::SM)).child(SharedString::from(self.session.note())));
         }
         column = column.child(body);
         if self.session.preview_open() {
+            let danger_field = if section == Section::Danger && self.session.production() {
+                Some(kit::form_row(
+                    t("structure.danger.typeName"),
+                    self.draft_input(6, &self.session.danger_name.clone(), &self.session.target.table.clone(), window, cx),
+                    &p,
+                ))
+            } else {
+                None
+            };
             let blocked = self.session.blocked();
             let confirm = {
                 let entity = entity.clone();
@@ -804,7 +1871,7 @@ impl Render for StructurePane {
                         .occlude()
                         .w(px(620.))
                         .max_w(relative(0.92))
-                        .p(px(18.))
+                        .p(px(metrics.card_pad()))
                         .flex()
                         .flex_col()
                         .gap(px(12.))
@@ -843,6 +1910,7 @@ impl Render for StructurePane {
                             this.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.danger_soft).text_color(p.danger).text_size(px(TypeScale::SM)).child(SharedString::from(blocked.join(" "))))
                         })
                         .when(!self.session.note.is_empty(), |this| this.child(kit::muted(SharedString::from(self.session.note()), &p)))
+                        .when_some(danger_field, |this, field| this.child(field))
                         .child(
                             div()
                                 .flex()
@@ -851,7 +1919,7 @@ impl Render for StructurePane {
                                 .child(kit::secondary_button("structure-cancel", None, t("structure.action.cancel"), cancel))
                                 .child(if section == Section::Danger || self.session.armed() {
                                     let label = if self.session.armed() { t("structure.action.confirmAgain") } else { t("structure.action.confirm") };
-                                    kit::danger_button("structure-confirm", Some(IconName::Check), label, confirm).into_any_element()
+                                    kit::danger_button("structure-confirm", Some(IconName::Check), label, confirm).disabled(section == Section::Danger && !self.session.danger_name_ok()).into_any_element()
                                 } else {
                                     kit::primary_button("structure-confirm", Some(IconName::Check), t("structure.action.confirm"), confirm).into_any_element()
                                 }),
@@ -1194,6 +2262,121 @@ mod tests {
         let present: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name = 'scratch'").fetch_one(&pool).await.unwrap();
         pool.close().await;
         assert_eq!(present, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tabs_follow_the_object_and_original_names_let_alter_precheck_proceed() {
+        let mut session = StructureSession::new(target("postgres", "orders"));
+        assert_eq!(
+            session.visible_sections(),
+            vec![Section::Columns, Section::Indexes, Section::ForeignKeys, Section::Ddl, Section::Danger]
+        );
+        session.object_kind = "view".into();
+        assert_eq!(session.visible_sections(), vec![Section::Columns, Section::View, Section::Danger]);
+        assert!(!session.visible_sections().contains(&Section::Ddl));
+        session.mode = StructureMode::Create;
+        assert_eq!(session.visible_sections(), vec![Section::Columns]);
+
+        let mut snapshot = Snapshot::bare(DdlEngine::Postgres, "app", "public", "orders");
+        snapshot.kind = "table".into();
+        snapshot.columns.push(column("name", "text", false));
+        let mut drafts = column_drafts(&snapshot);
+        assert_eq!(drafts[0].original.as_deref(), Some("name"));
+        drafts[0].name = "title".into();
+        let plan = preview_plan(&snapshot, &Action::AlterColumns { table: "orders".into(), columns: drafts });
+        assert!(!plan.blocked.iter().any(|item| item.contains("没有出现")), "{:?}", plan.blocked);
+
+        let mut created = StructureSession::new(target("sqlite", "ignored"));
+        created.mode = StructureMode::Create;
+        created.table_name = "notes".into();
+        created.kept_columns = vec![default_id("sqlite")];
+        match created.action() {
+            Action::CreateTable { name, columns } => {
+                assert_eq!(name, "notes");
+                assert_eq!(columns[0].name, "id");
+                assert!(columns[0].primary && columns[0].original.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn indexes_and_foreign_keys_preview_drops_unique_order_and_actions() {
+        let mut session = StructureSession::new(target("postgres", "orders"));
+        session.section = Section::Indexes;
+        session.index_name = "ix_note".into();
+        session.index_unique = true;
+        session.index_columns = vec![
+            IndexColumnDraft { name: "note".into(), descending: false },
+            IndexColumnDraft { name: "id".into(), descending: true },
+        ];
+        match session.action() {
+            Action::CreateIndex { unique, columns, .. } => {
+                assert!(unique);
+                assert_eq!(columns.len(), 2);
+                assert!(columns[1].descending);
+            }
+            other => panic!("{other:?}"),
+        }
+        session.intent = EditIntent::DropIndex { name: "orders_pkey".into() };
+        assert!(matches!(session.action(), Action::DropIndex { name, .. } if name == "orders_pkey"));
+
+        session.section = Section::ForeignKeys;
+        session.intent = EditIntent::Apply;
+        session.fk_name = "orders_parent".into();
+        session.fk_column = "parent_id".into();
+        session.fk_ref_schema = "public".into();
+        session.fk_ref_table = "parents".into();
+        session.fk_ref_column = "id".into();
+        session.fk_on_delete = "CASCADE".into();
+        session.fk_on_update = "RESTRICT".into();
+        match session.action() {
+            Action::CreateForeignKey { foreign_key, .. } => {
+                assert_eq!(foreign_key.ref_schema, "public");
+                assert_eq!(foreign_key.on_delete, "CASCADE");
+                assert_eq!(foreign_key.on_update, "RESTRICT");
+            }
+            other => panic!("{other:?}"),
+        }
+        session.intent = EditIntent::DropForeignKey { name: "orders_parent".into() };
+        assert!(matches!(session.action(), Action::DropForeignKey { .. }));
+        assert!(fk_action_choices("postgres").contains(&"SET DEFAULT"));
+        assert!(!fk_action_choices("mysql").contains(&"SET DEFAULT"));
+        assert_eq!(fk_action_choices("mysql"), fk_action_choices("mariadb"));
+    }
+
+    #[test]
+    fn production_danger_needs_the_object_name_and_a_failed_note_keeps_the_draft() {
+        let mut session = StructureSession::new(target("sqlite", "customers"));
+        session.target.environment = "prod".into();
+        session.section = Section::Danger;
+        assert!(!session.danger_name_ok());
+        session.danger_name = "customers".into();
+        assert!(session.danger_name_ok());
+        session.danger_name = "other".into();
+        assert!(!session.danger_name_ok());
+
+        let dir = std::env::temp_dir().join(format!("rillsql-structure-keep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        let mut pane = StructurePane::new(services);
+        pane.begin_create(target("sqlite", "customers"));
+        assert_eq!(pane.session.mode, StructureMode::Create);
+        assert_eq!(pane.session.kept_columns[0].name, "id");
+        pane.type_into("table_name", "notes");
+        pane.type_into("column_name", "nickname");
+        pane.session.note = Note::raw("生成计划失败".into());
+        assert_eq!(pane.session.table_name, "notes");
+        assert_eq!(pane.session.column_name, "nickname");
+        assert_eq!(pane.session.kept_columns[0].name, "id");
+        match pane.session.action() {
+            Action::CreateTable { name, columns } => {
+                assert_eq!(name, "notes");
+                assert!(columns.iter().any(|column| column.name == "nickname"));
+            }
+            other => panic!("{other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

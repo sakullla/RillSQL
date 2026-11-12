@@ -4,11 +4,22 @@ use std::path::PathBuf;
 use super::commands;
 use super::exec::{self, run_steps};
 use super::model::{
-    Action, AttachedDatabase, Column, ColumnDraft, DependentSql, DomainState, Engine, ForeignKey, IncomingForeignKey, Index, IndexColumn, IndexColumnDraft, Request, SequenceState,
-    Snapshot, Step, StepStatus,
+    fk_actions, Action, AttachedDatabase, Column, ColumnDraft, DependentSql, DomainState, Engine, ForeignKey, IncomingForeignKey, Index, IndexColumn, IndexColumnDraft, Request,
+    SequenceState, Snapshot, Step, StepStatus,
 };
 use super::plan::plan;
 use crate::connections::{CatalogSession, Service};
+
+#[test]
+fn foreign_key_actions_follow_the_engine() {
+    assert_eq!(fk_actions(Engine::Mysql), &["RESTRICT", "CASCADE", "SET NULL", "NO ACTION"]);
+    assert_eq!(fk_actions(Engine::Mariadb), fk_actions(Engine::Mysql));
+    assert_eq!(fk_actions(Engine::Postgres), &["RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT", "NO ACTION"]);
+    assert_eq!(fk_actions(Engine::Sqlite), fk_actions(Engine::Postgres));
+    assert_eq!(fk_actions(Engine::Sqlserver), fk_actions(Engine::Postgres));
+    assert!(fk_actions(Engine::Redis).is_empty());
+    assert!(fk_actions(Engine::Mongodb).is_empty());
+}
 
 fn column(name: &str, type_name: &str, nullable: bool, primary: bool) -> Column {
     Column {

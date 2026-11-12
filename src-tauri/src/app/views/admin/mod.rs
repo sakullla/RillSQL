@@ -26,6 +26,8 @@ pub struct AdminSections {
     pub sequences: bool,
     pub events: bool,
     pub partitions: bool,
+    pub enums: bool,
+    pub domains: bool,
 }
 
 pub fn sections_for(engine: &str) -> AdminSections {
@@ -40,6 +42,8 @@ pub fn sections_for(engine: &str) -> AdminSections {
         sequences: postgres,
         events: mysql,
         partitions: mysql,
+        enums: postgres,
+        domains: postgres,
     }
 }
 
@@ -51,7 +55,62 @@ pub enum AdminOp {
     SetPragma { pragma: String, value: String },
     Attach { path: String, name: String },
     SetEvent { event: String, enabled: bool },
-    AlterSequence { sequence: String, increment: Option<i64> },
+    AlterSequence { sequence: String, start: Option<i64>, increment: Option<i64>, min_value: Option<i64>, max_value: Option<i64>, cycle: Option<bool> },
+    AddEnum { enum_name: String, value: String },
+    AlterDomain { domain: String, default_sql: String, not_null: Option<bool> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequenceChoice {
+    pub name: String,
+    pub start: i64,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cycle: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventChoice {
+    pub name: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SectionFault {
+    pub title_key: &'static str,
+    pub message: String,
+}
+
+/// 管理页提示。键和原文分开存，显示时再按当前语言给出。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Note {
+    #[default]
+    Empty,
+    Key(&'static str),
+    Raw(Vec<String>),
+}
+
+impl Note {
+    fn raw(message: String) -> Self {
+        Note::Raw(vec![message])
+    }
+
+    pub fn text(&self, locale: Locale) -> String {
+        match self {
+            Note::Empty => String::new(),
+            Note::Key(key) => i18n::text(locale, key),
+            Note::Raw(parts) => parts.iter().map(|part| localize(part, locale)).collect::<Vec<_>>().join(" "),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Note::Empty => true,
+            Note::Key(_) => false,
+            Note::Raw(parts) => parts.iter().all(|part| part.is_empty()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,10 +122,18 @@ pub struct AdminInventory {
     /// 来源后面追加的一句说明（i18n 键），按当前语言渲染。
     pub note_key: Option<&'static str>,
     pub sequences: Vec<String>,
+    pub sequence_choices: Vec<SequenceChoice>,
     pub events: Vec<String>,
+    pub event_choices: Vec<EventChoice>,
     pub extensions: Vec<String>,
     pub partitions: Vec<String>,
     pub attached: Vec<String>,
+    pub enums: Vec<String>,
+    pub domains: Vec<String>,
+    pub journal_mode: String,
+    pub user_version: String,
+    pub foreign_keys_on: Option<bool>,
+    pub faults: Vec<SectionFault>,
 }
 
 impl AdminInventory {
@@ -85,10 +152,18 @@ impl AdminInventory {
             source: format!("{} · {}", target.engine, target.database),
             note_key: Some("admin.preview.unconnected"),
             sequences: Vec::new(),
+            sequence_choices: Vec::new(),
             events: Vec::new(),
+            event_choices: Vec::new(),
             extensions: Vec::new(),
             partitions: Vec::new(),
             attached: Vec::new(),
+            enums: Vec::new(),
+            domains: Vec::new(),
+            journal_mode: String::new(),
+            user_version: String::new(),
+            foreign_keys_on: None,
+            faults: Vec::new(),
         }
     }
 }
@@ -104,14 +179,24 @@ pub struct AdminSession {
     pub pragma_value: String,
     pub sequence_name: String,
     pub sequence_step: String,
+    pub sequence_start: String,
+    pub sequence_min: String,
+    pub sequence_max: String,
+    pub sequence_cycle: bool,
+    pub sequence_cycle_set: bool,
     pub event_name: String,
     pub event_enabled: bool,
+    pub enum_name: String,
+    pub enum_value: String,
+    pub domain_name: String,
+    pub domain_default: String,
+    pub domain_not_null: Option<bool>,
     pub inventory: AdminInventory,
     preview: Option<Plan>,
     live: bool,
     open: bool,
     pub locale: Locale,
-    pub note: String,
+    pub note: Note,
 }
 
 impl AdminSession {
@@ -128,15 +213,29 @@ impl AdminSession {
             pragma_value: String::new(),
             sequence_name: String::new(),
             sequence_step: String::new(),
+            sequence_start: String::new(),
+            sequence_min: String::new(),
+            sequence_max: String::new(),
+            sequence_cycle: false,
+            sequence_cycle_set: false,
             event_name: String::new(),
             event_enabled: false,
+            enum_name: String::new(),
+            enum_value: String::new(),
+            domain_name: String::new(),
+            domain_default: String::new(),
+            domain_not_null: None,
             inventory,
             preview: None,
             live: false,
             open: false,
             locale: Locale::ZhCn,
-            note: String::new(),
+            note: Note::Empty,
         }
+    }
+
+    pub fn note_text(&self) -> String {
+        self.note.text(self.locale)
     }
 
     pub fn apply_draft(&mut self, kind: &str) {
@@ -149,9 +248,15 @@ impl AdminSession {
             "attach" => AdminOp::Attach { path: self.attach_path.clone(), name: self.attach_name.clone() },
             "sequence" => AdminOp::AlterSequence {
                 sequence: self.sequence_name.clone(),
-                increment: self.sequence_step.parse().ok(),
+                start: parse_i64(&self.sequence_start),
+                increment: parse_i64(&self.sequence_step),
+                min_value: parse_i64(&self.sequence_min),
+                max_value: parse_i64(&self.sequence_max),
+                cycle: self.sequence_cycle_set.then_some(self.sequence_cycle),
             },
             "event" => AdminOp::SetEvent { event: self.event_name.clone(), enabled: self.event_enabled },
+            "enum" => AdminOp::AddEnum { enum_name: self.enum_name.clone(), value: self.enum_value.clone() },
+            "domain" => AdminOp::AlterDomain { domain: self.domain_name.clone(), default_sql: self.domain_default.clone(), not_null: self.domain_not_null },
             _ => fallback,
         };
         self.cancel();
@@ -177,13 +282,19 @@ impl AdminSession {
             AdminOp::SetPragma { pragma, value } => Action::SetPragma { pragma: pragma.clone(), value: value.clone() },
             AdminOp::Attach { path, name } => Action::AttachDatabase { path: path.clone(), name: name.clone() },
             AdminOp::SetEvent { event, enabled } => Action::SetEventEnabled { event: event.clone(), enabled: *enabled },
-            AdminOp::AlterSequence { sequence, increment } => Action::AlterSequence {
+            AdminOp::AlterSequence { sequence, start, increment, min_value, max_value, cycle } => Action::AlterSequence {
                 sequence: sequence.clone(),
-                start: None,
+                start: *start,
                 increment: *increment,
-                min_value: None,
-                max_value: None,
-                cycle: None,
+                min_value: *min_value,
+                max_value: *max_value,
+                cycle: *cycle,
+            },
+            AdminOp::AddEnum { enum_name, value } => Action::AddEnumValue { enum_name: enum_name.clone(), value: value.clone(), before: None },
+            AdminOp::AlterDomain { domain, default_sql, not_null } => Action::AlterDomain {
+                domain: domain.clone(),
+                default_sql: Some(default_sql.clone()),
+                not_null: *not_null,
             },
         }
     }
@@ -192,7 +303,7 @@ impl AdminSession {
         self.preview = Some(plan);
         self.live = true;
         self.open = true;
-        self.note.clear();
+        self.note = Note::Empty;
     }
 
     pub fn arm_fixture(&mut self, snapshot: &Snapshot) {
@@ -200,7 +311,7 @@ impl AdminSession {
         self.preview = Some(plan);
         self.live = false;
         self.open = true;
-        self.note = i18n::text(self.locale, "admin.preview.unconnected");
+        self.note = Note::Key("admin.preview.unconnected");
     }
 
     pub fn preview_open(&self) -> bool {
@@ -235,18 +346,27 @@ impl AdminSession {
     }
 
     pub fn confirm_sql(&self) -> Result<Vec<String>, String> {
+        self.confirm_steps().map_err(|note| note.text(self.locale))
+    }
+
+    fn confirm_steps(&self) -> Result<Vec<String>, Note> {
         if !self.open {
-            return Err(i18n::text(self.locale, "structure.preview.need"));
+            return Err(Note::Key("structure.preview.need"));
         }
         if !self.live {
-            return Err(i18n::text(self.locale, "admin.preview.unconnected"));
+            return Err(Note::Key("admin.preview.unconnected"));
         }
-        let plan = self.preview.as_ref().ok_or_else(|| i18n::text(self.locale, "structure.preview.need"))?;
+        let plan = self.preview.as_ref().ok_or(Note::Key("structure.preview.need"))?;
         if !plan.blocked.is_empty() {
-            return Err(plan.blocked.iter().map(|text| localize(text, self.locale)).collect::<Vec<_>>().join(" "));
+            return Err(Note::Raw(plan.blocked.clone()));
         }
         Ok(plan.steps.iter().map(|step| step.sql.clone()).collect())
     }
+}
+
+fn parse_i64(text: &str) -> Option<i64> {
+    let text = text.trim();
+    if text.is_empty() { None } else { text.parse().ok() }
 }
 
 pub struct AdminPane {
@@ -255,11 +375,25 @@ pub struct AdminPane {
     fields: Fields<&'static str>,
     /// 当前绑定到的工作项 id；关闭后重开会拿到新 id，必须重置草稿。
     item_id: String,
+    probing: bool,
+    probe_gen: u64,
+    link_open: Option<bool>,
+    /// 离线时“立即连接”交给外壳。
+    pub connect_request: Option<String>,
 }
 
 impl AdminPane {
     pub fn new(services: Arc<AppServices>) -> Self {
-        Self { session: AdminSession::new(GridTarget::default()), services, fields: Fields::default(), item_id: String::new() }
+        Self {
+            session: AdminSession::new(GridTarget::default()),
+            services,
+            fields: Fields::default(),
+            item_id: String::new(),
+            probing: false,
+            probe_gen: 0,
+            link_open: None,
+            connect_request: None,
+        }
     }
 
     /// 兼容调用：不区分工作项实例，只按目标绑定。
@@ -277,6 +411,64 @@ impl AdminPane {
         self.session = AdminSession::new(target);
         self.session.locale = locale;
         self.fields = Fields::default();
+        self.probing = false;
+        self.probe_gen = self.probe_gen.wrapping_add(1);
+        self.link_open = None;
+        self.connect_request = None;
+    }
+
+    pub fn take_connect_request(&mut self) -> Option<String> {
+        self.connect_request.take()
+    }
+
+    /// 连接建立或断开后清掉探测闩，下一帧重新读取清单。
+    pub fn note_connection(&mut self, connected: bool, cx: &mut Context<Self>) {
+        if self.link_open == Some(connected) && self.session.inventory.probed {
+            return;
+        }
+        self.link_open = Some(connected);
+        self.refresh(cx);
+    }
+
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.probing = false;
+        self.session.inventory.probed = false;
+        self.request_inventory(cx);
+    }
+
+    fn request_inventory(&mut self, cx: &mut Context<Self>) {
+        if self.session.target.connection_id.is_empty() || self.probing {
+            return;
+        }
+        self.probing = true;
+        self.session.inventory.probed = true;
+        self.probe_gen = self.probe_gen.wrapping_add(1);
+        let generation = self.probe_gen;
+        self.refresh_inventory(generation, cx);
+    }
+
+    fn pick_sequence(&mut self, index: usize) {
+        let Some(choice) = self.session.inventory.sequence_choices.get(index).cloned() else {
+            return;
+        };
+        self.session.sequence_name = choice.name;
+        self.session.sequence_start = choice.start.to_string();
+        self.session.sequence_step = choice.increment.to_string();
+        self.session.sequence_min = choice.min_value.to_string();
+        self.session.sequence_max = choice.max_value.to_string();
+        self.session.sequence_cycle = choice.cycle;
+        self.session.sequence_cycle_set = true;
+        self.session.apply_draft("sequence");
+    }
+
+    fn toggle_event(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(choice) = self.session.inventory.event_choices.get(index).cloned() else {
+            return;
+        };
+        self.session.event_name = choice.name;
+        self.session.event_enabled = !choice.enabled;
+        self.session.apply_draft("event");
+        self.preview(cx);
     }
 
     pub fn type_into(&mut self, field: &str, text: &str) {
@@ -287,7 +479,14 @@ impl AdminPane {
             "pragma_value" => &mut self.session.pragma_value,
             "sequence" => &mut self.session.sequence_name,
             "sequence_step" => &mut self.session.sequence_step,
+            "sequence_start" => &mut self.session.sequence_start,
+            "sequence_min" => &mut self.session.sequence_min,
+            "sequence_max" => &mut self.session.sequence_max,
             "event" => &mut self.session.event_name,
+            "enum" => &mut self.session.enum_name,
+            "enum_value" => &mut self.session.enum_value,
+            "domain" => &mut self.session.domain_name,
+            "domain_default" => &mut self.session.domain_default,
             _ => return,
         };
         if text == "backspace" {
@@ -305,7 +504,7 @@ impl AdminPane {
         self.session.apply_draft(kind);
     }
 
-    pub fn refresh_inventory(&mut self, cx: &mut Context<Self>) {
+    pub fn refresh_inventory(&mut self, generation: u64, cx: &mut Context<Self>) {
         let services = Arc::clone(&self.services);
         let target = self.session.target.clone();
         let expected = target.clone();
@@ -320,12 +519,17 @@ impl AdminPane {
                 cx.update(|cx| {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
-                            if this.session.target != expected {
+                            if this.probe_gen != generation || this.session.target != expected {
                                 return;
                             }
+                            this.probing = false;
+                            this.link_open = Some(inventory.connected);
                             this.session.inventory = inventory;
                             if !this.session.inventory.connected {
-                                this.session.note = this.session.inventory.source_text(this.session.locale);
+                                this.session.note = match this.session.inventory.note_key {
+                                    Some(key) => Note::Key(key),
+                                    None => Note::Empty,
+                                };
                             }
                             cx.notify();
                         });
@@ -345,7 +549,7 @@ impl AdminPane {
             return;
         };
         if !self.session.sections().allows(&self.session.operation) {
-            self.session.note = i18n::text(self.session.locale, "admin.section.none");
+            self.session.note = Note::Key("admin.section.none");
             cx.notify();
             return;
         }
@@ -364,13 +568,13 @@ impl AdminPane {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             if this.session.target != target {
-                                this.session.note = i18n::text(this.session.locale, "admin.note.previewDropped");
+                                this.session.note = Note::Key("admin.note.previewDropped");
                                 cx.notify();
                                 return;
                             }
                             match result {
                                 Ok(plan) => this.session.arm_live(plan),
-                                Err(message) => this.session.note = message,
+                                Err(message) => this.session.note = Note::raw(message),
                             }
                             cx.notify();
                         });
@@ -382,10 +586,10 @@ impl AdminPane {
     }
 
     pub fn confirm(&mut self, cx: &mut Context<Self>) {
-        let sql = match self.session.confirm_sql() {
+        let sql = match self.session.confirm_steps() {
             Ok(sql) => sql,
-            Err(message) => {
-                self.session.note = message;
+            Err(note) => {
+                self.session.note = note;
                 cx.notify();
                 return;
             }
@@ -414,17 +618,21 @@ impl AdminPane {
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |this, cx| {
                             if this.session.target != target {
-                                this.session.note = i18n::text(this.session.locale, "admin.note.executeDropped");
+                                this.session.note = Note::Key("admin.note.executeDropped");
                                 cx.notify();
                                 return;
                             }
                             this.session.note = match result {
                                 Ok(receipt) if receipt.blocked.is_empty() => {
                                     this.session.open = false;
-                                    i18n::text(this.session.locale, "structure.preview.done")
+                                    Note::Key("structure.preview.done")
                                 }
-                                Ok(receipt) => receipt.blocked.join(" "),
-                                Err(message) => message,
+                                Ok(receipt) => Note::Raw(receipt.blocked),
+                                Err(message) => {
+                                    let zh = i18n::text(Locale::ZhCn, "admin.note.unconfirmed");
+                                    let en = i18n::text(Locale::En, "admin.note.unconfirmed");
+                                    if message == zh || message == en { Note::Key("admin.note.unconfirmed") } else { Note::raw(message) }
+                                }
                             };
                             cx.notify();
                         });
@@ -444,6 +652,8 @@ impl AdminSections {
             AdminOp::Attach { .. } => self.attached,
             AdminOp::SetEvent { .. } => self.events,
             AdminOp::AlterSequence { .. } => self.sequences,
+            AdminOp::AddEnum { .. } => self.enums,
+            AdminOp::AlterDomain { .. } => self.domains,
         }
     }
 }
@@ -457,7 +667,14 @@ impl AdminPane {
             "pragma_value" => &mut self.session.pragma_value,
             "sequence" => &mut self.session.sequence_name,
             "sequence_step" => &mut self.session.sequence_step,
+            "sequence_start" => &mut self.session.sequence_start,
+            "sequence_min" => &mut self.session.sequence_min,
+            "sequence_max" => &mut self.session.sequence_max,
             "event" => &mut self.session.event_name,
+            "enum" => &mut self.session.enum_name,
+            "enum_value" => &mut self.session.enum_value,
+            "domain" => &mut self.session.domain_name,
+            "domain_default" => &mut self.session.domain_default,
             _ => return,
         };
         *slot = value;
@@ -471,7 +688,14 @@ impl AdminPane {
             "pragma_value" => self.session.pragma_value.clone(),
             "sequence" => self.session.sequence_name.clone(),
             "sequence_step" => self.session.sequence_step.clone(),
+            "sequence_start" => self.session.sequence_start.clone(),
+            "sequence_min" => self.session.sequence_min.clone(),
+            "sequence_max" => self.session.sequence_max.clone(),
             "event" => self.session.event_name.clone(),
+            "enum" => self.session.enum_name.clone(),
+            "enum_value" => self.session.enum_value.clone(),
+            "domain" => self.session.domain_name.clone(),
+            "domain_default" => self.session.domain_default.clone(),
             _ => String::new(),
         }
     }
@@ -528,10 +752,10 @@ fn row_has_children(items: &[String]) -> bool {
 impl Render for AdminPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.session.inventory.probed && !self.session.target.connection_id.is_empty() {
-            self.session.inventory.probed = true;
-            self.refresh_inventory(cx);
+            self.request_inventory(cx);
         }
         let p = Palette::of(cx);
+        let metrics = kit::Metrics::of(cx);
         let locale = self.session.locale;
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let sections = self.session.sections();
@@ -544,9 +768,19 @@ impl Render for AdminPane {
             cards = cards.child(op_card("admin-reindex", "reindex", IconName::ListRestart, t("admin.action.reindex"), vec![target], Vec::new(), &entity, locale, &p));
         }
         if sections.pragma {
+            let mut pragma_bits = Vec::new();
+            if !inventory.journal_mode.is_empty() {
+                pragma_bits.push(format!("journal_mode {}", inventory.journal_mode));
+            }
+            if !inventory.user_version.is_empty() {
+                pragma_bits.push(format!("user_version {}", inventory.user_version));
+            }
+            if let Some(enabled) = inventory.foreign_keys_on {
+                pragma_bits.push(format!("foreign_keys {}", if enabled { "ON" } else { "OFF" }));
+            }
             let value = self.admin_field("pragma_value", "user_version", window, cx);
             cards = cards
-                .child(op_card("admin-pragma", "pragma", IconName::SlidersHorizontal, t("admin.action.pragma"), vec![value], Vec::new(), &entity, locale, &p))
+                .child(op_card("admin-pragma", "pragma", IconName::SlidersHorizontal, t("admin.action.pragma"), vec![value], pragma_bits, &entity, locale, &p))
                 .child(op_card(
                     "admin-foreign",
                     "foreign",
@@ -566,12 +800,71 @@ impl Render for AdminPane {
         }
         if sections.sequences {
             let name = self.admin_field("sequence", "orders_id_seq", window, cx);
+            let start = self.admin_field("sequence_start", "1", window, cx);
             let step = self.admin_field("sequence_step", "1", window, cx);
-            cards = cards.child(op_card("admin-sequence", "sequence", IconName::ListOrdered, t("admin.action.sequence"), vec![name, step], inventory.sequences.clone(), &entity, locale, &p));
+            let min_value = self.admin_field("sequence_min", "1", window, cx);
+            let max_value = self.admin_field("sequence_max", "1", window, cx);
+            let mut picks = div().flex().flex_wrap().gap(px(6.));
+            for (index, choice) in inventory.sequence_choices.iter().enumerate() {
+                let pick_entity = entity.clone();
+                picks = picks.child(kit::secondary_button(SharedString::from(format!("admin-pick-seq-{index}")), None, SharedString::from(choice.name.clone()), move |_, _, cx| {
+                    pick_entity.update(cx, |pane, cx| {
+                        pane.pick_sequence(index);
+                        cx.notify();
+                    });
+                }));
+            }
+            cards = cards.child(picks).child(op_card(
+                "admin-sequence",
+                "sequence",
+                IconName::ListOrdered,
+                t("admin.action.sequence"),
+                vec![name, start, step, min_value, max_value],
+                inventory.sequences.clone(),
+                &entity,
+                locale,
+                &p,
+            ));
         }
         if sections.events {
             let name = self.admin_field("event", "event_name", window, cx);
-            cards = cards.child(op_card("admin-event", "event", IconName::CalendarClock, t("admin.action.event"), vec![name], inventory.events.clone(), &entity, locale, &p));
+            let mut toggles = div().flex().flex_wrap().gap(px(6.));
+            for (index, choice) in inventory.event_choices.iter().enumerate() {
+                let toggle_entity = entity.clone();
+                let label = SharedString::from(format!("{} · {}", choice.name, if choice.enabled { "ENABLED" } else { "DISABLED" }));
+                toggles = toggles.child(kit::secondary_button(SharedString::from(format!("admin-event-toggle-{index}")), None, label, move |_, _, cx| {
+                    toggle_entity.update(cx, |pane, cx| pane.toggle_event(index, cx));
+                }));
+            }
+            cards = cards.child(toggles).child(op_card("admin-event", "event", IconName::CalendarClock, t("admin.action.event"), vec![name], inventory.events.clone(), &entity, locale, &p));
+        }
+        if sections.enums {
+            let name = self.admin_field("enum", "status", window, cx);
+            let value = self.admin_field("enum_value", "value", window, cx);
+            cards = cards.child(op_card("admin-enum", "enum", IconName::ListOrdered, t("catalog.kind.enum"), vec![name, value], inventory.enums.clone(), &entity, locale, &p));
+        }
+        if sections.domains {
+            let name = self.admin_field("domain", "domain", window, cx);
+            let value = self.admin_field("domain_default", "DEFAULT", window, cx);
+            cards = cards.child(op_card("admin-domain", "domain", IconName::SlidersHorizontal, t("catalog.kind.domain"), vec![name, value], inventory.domains.clone(), &entity, locale, &p));
+        }
+        if !inventory.faults.is_empty() {
+            for (index, fault) in inventory.faults.iter().enumerate() {
+                let retry_entity = entity.clone();
+                let message = localize(&fault.message, locale);
+                cards = cards.child(
+                    kit::card(&p)
+                        .p(px(metrics.card_pad()))
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .child(div().font_weight(FontWeight::SEMIBOLD).text_color(p.danger).child(t(fault.title_key)))
+                        .child(div().text_size(px(TypeScale::SM)).text_color(p.danger).child(SharedString::from(message)))
+                        .child(kit::secondary_button(SharedString::from(format!("admin-retry-{index}")), Some(IconName::RefreshCw), t("admin.action.retry"), move |_, _, cx| {
+                            retry_entity.update(cx, |pane, cx| pane.refresh(cx));
+                        })),
+                );
+            }
         }
         if sections.extensions || sections.partitions {
             let mut list = div().flex().flex_wrap().gap(px(6.));
@@ -580,7 +873,7 @@ impl Render for AdminPane {
             }
             cards = cards.child(kit::card(&p).p(px(14.)).flex().flex_col().gap(px(8.)).child(kit::muted(SharedString::from(inventory.source_text(locale)), &p)).child(list));
         }
-        if !sections.pragma && !sections.maintenance && !sections.sequences && !sections.events && !sections.extensions && !sections.partitions && !sections.attached {
+        if !sections.pragma && !sections.maintenance && !sections.sequences && !sections.events && !sections.extensions && !sections.partitions && !sections.attached && !sections.enums && !sections.domains {
             cards = cards.child(kit::empty_state(IconName::Gauge, t("ui.tool.admin"), t("admin.section.none"), &p));
         }
         let mut column = div()
@@ -592,9 +885,9 @@ impl Render for AdminPane {
             .child(
                 div()
                     .flex_none()
-                    .px(px(24.))
-                    .pt(px(18.))
-                    .pb(px(14.))
+                    .px(px(metrics.page_pad))
+                    .pt(px(metrics.page_pad_y))
+                    .pb(px(metrics.pane_pad()))
                     .flex()
                     .items_center()
                     .gap(px(12.))
@@ -610,10 +903,27 @@ impl Render for AdminPane {
                             .child(kit::title(t("ui.tool.admin"), TypeScale::LG, &p))
                             .child(div().id("admin-banner").truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(self.session.banner()))),
                     )
-                    .child(div().id("admin-source").text_size(px(TypeScale::XS)).text_color(p.text_faint).max_w(px(320.)).truncate().child(SharedString::from(inventory.source_text(locale)))),
-            )
-            .child(div().id("admin-body").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(24.)).child(div().max_w(px(760.)).mx_auto().flex().flex_col().gap(px(12.)).child(cards).when(!self.session.note.is_empty(), |this| {
-                this.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.hover).text_size(px(TypeScale::SM)).child(SharedString::from(self.session.note.clone())))
+                    .child(div().id("admin-source").text_size(px(TypeScale::XS)).text_color(p.text_faint).max_w(px(320.)).truncate().child(SharedString::from(inventory.source_text(locale))))
+                    .child(kit::secondary_button("admin-refresh", Some(IconName::RefreshCw), t("admin.action.refresh"), {
+                        let entity = entity.clone();
+                        move |_, _, cx| entity.update(cx, |pane, cx| pane.refresh(cx))
+                    }))
+                    .when(!inventory.connected, |header| {
+                        let entity = entity.clone();
+                        header.child(kit::primary_button("admin-connect", None, t("admin.action.connect"), move |_, _, cx| {
+                            entity.update(cx, |pane, cx| {
+                                if !pane.session.target.connection_id.is_empty() {
+                                    pane.connect_request = Some(pane.session.target.connection_id.clone());
+                                }
+                                cx.notify();
+                            });
+                        }))
+                    }),
+            );
+        let note = self.session.note.text(locale);
+        column = column
+            .child(div().id("admin-body").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(metrics.page_pad)).child(div().max_w(px(760.)).mx_auto().flex().flex_col().gap(px(metrics.section_gap())).child(cards).when(!note.is_empty(), |this| {
+                this.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.hover).text_size(px(TypeScale::SM)).child(SharedString::from(note)))
             })))
             .child(div().hidden().child(admin_button("admin-preview", "structure.action.preview", false, entity.clone(), locale)));
         if self.session.open {
@@ -627,7 +937,7 @@ impl Render for AdminPane {
                         .occlude()
                         .w(px(600.))
                         .max_w(relative(0.92))
-                        .p(px(18.))
+                        .p(px(metrics.card_pad()))
                         .flex()
                         .flex_col()
                         .gap(px(12.))
@@ -703,33 +1013,92 @@ async fn read_inventory(service: &crate::connections::Service, target: &GridTarg
         inventory.probed = true;
         return inventory;
     };
-    match session {
-        crate::connections::CatalogSession::Sqlite { pool, .. } => {
-            let listed: Result<Vec<(i64, String, String)>, sqlx::Error> = sqlx::query_as("PRAGMA database_list").fetch_all(&pool).await;
-            let attached = listed.map(|rows| rows.into_iter().map(|(_, name, _)| name).collect()).unwrap_or_default();
-            AdminInventory {
-                connected: true,
-                probed: true,
-                source: format!("sqlite · {}", target.database),
-                note_key: None,
-                sequences: Vec::new(),
-                events: Vec::new(),
-                extensions: Vec::new(),
-                partitions: Vec::new(),
-                attached,
-            }
-        }
-        _ => AdminInventory {
-            connected: false,
-            probed: true,
-            source: format!("{} · {}", target.engine, target.database),
-            note_key: Some("admin.inventory.unlisted"),
-            sequences: Vec::new(),
-            events: Vec::new(),
-            extensions: Vec::new(),
-            partitions: Vec::new(),
-            attached: Vec::new(),
-        },
+    if matches!(session, crate::connections::CatalogSession::Scripted) {
+        let mut inventory = AdminInventory::offline(target);
+        inventory.probed = true;
+        return inventory;
+    }
+    let Ok(engine) = crate::connections::model::Engine::parse(&target.engine) else {
+        let mut inventory = AdminInventory::offline(target);
+        inventory.probed = true;
+        return inventory;
+    };
+    let extras = crate::catalog::read_extras(&session, engine, &target.database, &target.schema).await;
+    let mut inventory = inventory_from_extras(target, &extras);
+    if engine == crate::connections::model::Engine::Postgres {
+        load_postgres_types(&session, engine, target, &mut inventory).await;
+    }
+    inventory.connected = true;
+    inventory.probed = true;
+    inventory.note_key = None;
+    inventory
+}
+
+fn inventory_from_extras(target: &GridTarget, extras: &crate::catalog::ExtrasBody) -> AdminInventory {
+    let mut inventory = AdminInventory::offline(target);
+    inventory.connected = true;
+    inventory.probed = true;
+    inventory.note_key = None;
+    inventory.source = format!("{} · {}", target.engine, target.database);
+    if let Some(row) = &extras.pragmas.value {
+        inventory.journal_mode = row.journal_mode.clone().unwrap_or_default();
+        inventory.user_version = row.user_version.map(|value| value.to_string()).unwrap_or_default();
+        inventory.foreign_keys_on = row.foreign_keys;
+    }
+    push_fault(&mut inventory.faults, "admin.action.pragma", &extras.pragmas.error);
+    for row in &extras.extensions.items {
+        let label = match &row.installed_version {
+            Some(version) if !version.is_empty() => format!("{} {version}", row.name),
+            _ => row.name.clone(),
+        };
+        inventory.extensions.push(label);
+    }
+    push_fault(&mut inventory.faults, "catalog.kind.extension", &extras.extensions.error);
+    for row in &extras.sequences.items {
+        inventory.sequences.push(row.name.clone());
+        inventory.sequence_choices.push(SequenceChoice {
+            name: row.name.clone(),
+            start: row.start_value,
+            increment: row.increment,
+            min_value: row.min_value,
+            max_value: row.max_value,
+            cycle: row.cycle,
+        });
+    }
+    push_fault(&mut inventory.faults, "catalog.kind.sequence", &extras.sequences.error);
+    for row in &extras.events.items {
+        let enabled = row.status.eq_ignore_ascii_case("enabled");
+        inventory.events.push(format!("{} · {}", row.name, row.status));
+        inventory.event_choices.push(EventChoice { name: row.name.clone(), enabled });
+    }
+    push_fault(&mut inventory.faults, "catalog.kind.event", &extras.events.error);
+    for row in &extras.partitions.items {
+        inventory.partitions.push(format!("{} {} ({})", row.table, row.method, row.partitions.len()));
+    }
+    push_fault(&mut inventory.faults, "admin.section.partitions", &extras.partitions.error);
+    inventory.attached = extras.attached.items.iter().map(|row| row.name.clone()).collect();
+    push_fault(&mut inventory.faults, "admin.section.attached", &extras.attached.error);
+    inventory
+}
+
+fn push_fault(faults: &mut Vec<SectionFault>, title_key: &'static str, error: &Option<String>) {
+    if let Some(message) = error {
+        faults.push(SectionFault { title_key, message: message.clone() });
+    }
+}
+
+async fn load_postgres_types(session: &crate::connections::CatalogSession, engine: crate::connections::model::Engine, target: &GridTarget, inventory: &mut AdminInventory) {
+    let enums = crate::catalog::read::read_object_kind_page(session, engine, &target.database, &target.schema, crate::catalog::model::ObjectKind::Enum, 0, 200).await;
+    if let Some(message) = enums.error {
+        inventory.faults.push(SectionFault { title_key: "catalog.kind.enum", message });
+    } else {
+        inventory.enums = enums.objects.into_iter().map(|row| row.name).collect();
+    }
+    let domains = crate::catalog::read::read_object_kind_page(session, engine, &target.database, &target.schema, crate::catalog::model::ObjectKind::Domain, 0, 200).await;
+    if let Some(message) = domains.error {
+        inventory.faults.push(SectionFault { title_key: "catalog.kind.domain", message });
+    } else {
+        inventory.domains = domains.objects.into_iter().map(|row| row.name).collect();
     }
 }
 
@@ -776,7 +1145,7 @@ mod tests {
             let mut texts: Vec<String> = session.preview_risks().into_iter().map(|(_, text)| text).collect();
             texts.extend(session.blocked());
             texts.push(session.preview_rule());
-            texts.push(session.note.clone());
+            texts.push(session.note_text());
             texts.push(session.inventory.source_text(Locale::En));
             texts.push(session.confirm_sql().unwrap_err());
             for text in texts {
@@ -794,7 +1163,14 @@ mod tests {
         assert!(!sqlserver.pragma && !sqlserver.maintenance && !sqlserver.sequences && !sqlserver.events && !sqlserver.extensions && !sqlserver.partitions && !sqlserver.attached);
 
         let mut postgres = AdminSession::new(target("postgres"));
-        postgres.operation = AdminOp::AlterSequence { sequence: "ids".into(), increment: Some(2) };
+        postgres.operation = AdminOp::AlterSequence {
+            sequence: "ids".into(),
+            start: None,
+            increment: Some(2),
+            min_value: None,
+            max_value: None,
+            cycle: None,
+        };
         let mut snapshot = Snapshot::bare(DdlEngine::Postgres, "app", "public", "ids");
         snapshot.sequence = Some(SequenceState { increment: Some(1), ..SequenceState::default() });
         postgres.arm_fixture(&snapshot);
@@ -865,7 +1241,7 @@ mod tests {
                 assert!(pane.session.preview_open());
                 pane.confirm(cx);
                 assert!(pane.session.preview_open(), "失败后预览应保留，方便查看原因和重试");
-                assert!(pane.session.note.contains("没有连接"), "{}", pane.session.note);
+                assert!(pane.session.note_text().contains("没有连接"), "{}", pane.session.note_text());
             });
         });
         let _ = std::fs::remove_dir_all(&dir);
@@ -993,5 +1369,21 @@ mod tests {
         pool.close().await;
         assert_eq!(version, 7);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extras_from_a_real_engine_are_connected_and_section_errors_stay_local() {
+        let mut extras = crate::catalog::ExtrasBody::default();
+        extras.extensions.error = Some("读取扩展失败：permission denied".into());
+        extras.partitions.error = Some("读取分区失败：permission denied".into());
+        let inventory = inventory_from_extras(&target("postgres"), &extras);
+        assert!(inventory.connected, "已连接的引擎不能再被写成离线");
+        assert!(inventory.note_key.is_none());
+        assert_eq!(inventory.faults.len(), 2);
+        for fault in &inventory.faults {
+            assert!(!crate::ddl::english::has_cjk(&localize(&fault.message, Locale::En)), "{}", fault.message);
+        }
+        let offline = AdminInventory::offline(&target("postgres"));
+        assert!(!offline.connected);
     }
 }
