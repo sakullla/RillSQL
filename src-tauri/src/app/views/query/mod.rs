@@ -3228,7 +3228,9 @@ mod tests {
             landed = cx.update(|cx| pane.read(cx).cell(0, 0, cx) == "1296000000");
             note = cx.update(|cx| pane.read(cx).note());
             polls = cx.update(|cx| pane.read(cx).polls());
-            if landed {
+            let running = cx.update(|cx| pane.read(cx).running());
+            // 结果格可能比运行标记早一帧出现。等到两者都落地，避免 CI 上误判仍在执行。
+            if landed && !running {
                 break;
             }
             if note == "执行没有结束" {
