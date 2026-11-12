@@ -47,6 +47,17 @@ pub struct GridNavigation {
 /// 外键跳转的出口签名：外壳注入，网格只调用。
 pub type NavigationSink = Arc<dyn Fn(GridNavigation, &mut App)>;
 
+/// 查看阶段里的 Preview 不等于截断。完整原值保持可编辑；真预览在读完原值前锁定。
+fn truncation_for_open_cell(phase: CellPhase, truncated: bool, total_bytes: u64, can_load_full: bool, error: &str) -> TruncationState {
+    match phase {
+        CellPhase::Full => TruncationState::Full,
+        CellPhase::Loading => TruncationState::Loading,
+        CellPhase::Error => TruncationState::Error(error.to_owned()),
+        CellPhase::Preview if truncated => TruncationState::Preview { total_bytes, can_load_full },
+        CellPhase::Preview => TruncationState::Full,
+    }
+}
+
 /// 来源状态快照：(选择锚点/焦点, 可见首行, 是否有暂存, 查看目标的 (行 id, 列名))。
 #[cfg(test)]
 pub type GridStateSnapshot = (Option<(String, String)>, usize, bool, Option<(String, String)>);
@@ -2097,15 +2108,16 @@ impl GridPane {
 
     fn viewer_spec(&self, state: &session::ViewerState, shown: &session::ShownCell) -> ViewerSpec {
         let (row, column) = self.session.viewer_cell().unwrap_or((0, 0));
-        let truncation = match state.phase {
-            CellPhase::Full => TruncationState::Full,
-            CellPhase::Loading => TruncationState::Loading,
-            CellPhase::Error => TruncationState::Error(state.message.clone()),
-            CellPhase::Preview => TruncationState::Preview {
-                total_bytes: self.session.preview_total(row, column).unwrap_or(0),
-                can_load_full: self.session.can_reread(row),
-            },
-        };
+        // open_value 在没有完整值缓存时一律标成 Preview。那只是“还没另读”，
+        // 不是截断。只有真信封（\u{1}t / \u{1}b）才锁住编辑。
+        let truncated = shown.preview || self.session.needs_full(row, column);
+        let truncation = truncation_for_open_cell(
+            state.phase,
+            truncated,
+            self.session.preview_total(row, column).unwrap_or(0),
+            self.session.can_reread(row),
+            &state.message,
+        );
         let text = if shown.kind == session::CellKind::Null {
             String::new()
         } else if !shown.body.is_empty() {
@@ -3730,6 +3742,21 @@ mod shortcut_tests {
                 assert_ne!(i18n::text(locale, key), key, "{key}");
             }
         }
+    }
+
+    #[test]
+    fn complete_cell_preview_phase_stays_editable_until_a_real_envelope() {
+        let complete = super::truncation_for_open_cell(CellPhase::Preview, false, 0, true, "");
+        assert_eq!(complete, TruncationState::Full, "没有信封的格子已经是完整值");
+        assert!(!crate::ui::editing_locked(&complete));
+        let pretty = crate::ui::commit_draft(crate::ui::DataFormat::Json, EditMode::Editable, &complete, "{\n  \"a\": 1\n}");
+        assert!(matches!(pretty, crate::ui::CommitResult::Applied(_)), "美化后的完整 JSON 可以写回");
+
+        let envelope = super::truncation_for_open_cell(CellPhase::Preview, true, 4096, true, "");
+        assert!(matches!(envelope, TruncationState::Preview { total_bytes: 4096, can_load_full: true }));
+        assert!(crate::ui::editing_locked(&envelope));
+        let blocked = crate::ui::commit_draft(crate::ui::DataFormat::Json, EditMode::Editable, &envelope, "{\"a\":1}");
+        assert!(matches!(blocked, crate::ui::CommitResult::Blocked { block: crate::ui::ApplyBlock::Preview, .. }));
     }
 }
 
