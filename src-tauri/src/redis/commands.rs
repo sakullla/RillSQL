@@ -24,8 +24,9 @@ pub async fn redis_set_ttl(
     connection_id: String,
     key: String,
     seconds: Option<i64>,
+    confirmed: Option<bool>,
 ) -> Result<TtlOutcome, String> {
-    redis::set_ttl(&state.service, &connection_id, key, seconds).await
+    redis::set_ttl(&state.service, &connection_id, key, seconds, confirmed.unwrap_or(false)).await
 }
 
 pub async fn redis_delete_keys(

@@ -6,7 +6,7 @@ use crate::connections::{Service, SessionHealth};
 use serde::Serialize;
 
 use crate::redis::exec::{self, RespReply};
-use crate::redis::keys::{self, RedisKeyDetail, ScanPage};
+use crate::redis::keys::{self, RedisKeyDetail, RedisMutation, ScanPage};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,13 +61,22 @@ pub async fn read_key(service: &Service, connection_id: &str, key: String) -> Re
     with_redis(service, connection_id, move |conn, _| async move { keys::read_key(&mut *conn.lock().await, &key).await }).await
 }
 
-pub async fn set_ttl(service: &Service, connection_id: &str, key: String, seconds: Option<i64>) -> Result<TtlOutcome, String> {
-    keys::require_ttl(seconds)?;
-    let applied = with_redis(service, connection_id, move |conn, _| async move {
-        keys::set_ttl(&mut *conn.lock().await, &key, seconds).await
-    })
-    .await?;
+pub async fn set_ttl(service: &Service, connection_id: &str, key: String, seconds: Option<i64>, confirmed: bool) -> Result<TtlOutcome, String> {
+    let applied = mutate(service, connection_id, RedisMutation::SetTtl { key, seconds }, confirmed).await?;
     Ok(TtlOutcome { applied })
+}
+
+/// 类型化写入口。未确认时在取会话之前拒绝，不会向 Redis 发送写命令。
+pub async fn mutate(service: &Service, connection_id: &str, mutation: RedisMutation, confirmed: bool) -> Result<i64, String> {
+    keys::prepare_mutation(&mutation, confirmed)?;
+    let (conn, health) = service.redis_session(connection_id).ok_or_else(|| "这条连接还没有打开，无法浏览键空间。".to_owned())?;
+    let outcome = keys::apply_mutation(&mut *conn.lock().await, &mutation, confirmed).await;
+    if let Err(keys::MutationFault::Io(err)) = &outcome {
+        if matches!(err.kind(), redis::ErrorKind::IoError) {
+            health.note_disconnect();
+        }
+    }
+    outcome.map_err(|err| err.to_string())
 }
 
 pub async fn delete_keys(service: &Service, connection_id: &str, keys: Vec<String>, confirmed: bool) -> Result<DeleteOutcome, String> {
@@ -93,7 +102,7 @@ pub async fn exec(service: &Service, connection_id: &str, command: String, args:
     if word.is_empty() {
         return Err("请输入要执行的命令。".to_owned());
     }
-    exec::guard_command(&word, confirmed)?;
+    exec::guard_invocation(&word, &args, confirmed)?;
     let command_word = word.clone();
     let reply = with_redis(service, connection_id, move |conn, _| async move {
         exec::run_command(&mut *conn.lock().await, &command_word, &args).await

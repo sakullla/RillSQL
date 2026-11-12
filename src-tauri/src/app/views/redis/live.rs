@@ -258,6 +258,8 @@ fn live_redis_scans_filters_reads_ttl_rename_delete_and_confirms(cx: &mut TestAp
         view.update(cx, |pane, _| pane.set_ttl("90"));
         window.render_frame(cx);
         window.click("redis-ttl", cx);
+        window.render_frame(cx);
+        window.click("redis-confirm", cx);
     })
     .unwrap();
     assert!(pump(cx, window, &view, |pane| !pane.running() && pane.detail_ttl().is_some_and(|ttl| ttl > 0 && ttl <= 90_000)), "TTL 没有写成 90 秒");
@@ -266,6 +268,8 @@ fn live_redis_scans_filters_reads_ttl_rename_delete_and_confirms(cx: &mut TestAp
         view.update(cx, |pane, _| pane.set_ttl(""));
         window.render_frame(cx);
         window.click("redis-ttl", cx);
+        window.render_frame(cx);
+        window.click("redis-confirm", cx);
     })
     .unwrap();
     assert!(pump(cx, window, &view, |pane| !pane.running() && pane.detail_ttl() == Some(-1) && pane.note().contains("移除")), "PERSIST 没有去掉过期");

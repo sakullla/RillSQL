@@ -1,8 +1,10 @@
 //! Redis 专项模块的纯逻辑测试：SCAN/值读取/TTL 命令组装、RESP 结构化分类、危险命令确认语义。
 //! 不依赖 docker；真库端到端（含密码认证/SCAN 实际游标推进）由 docker 夹具人工/集成验证。
 
-use super::exec::{classify_reply, command_risk, guard_command, CommandRisk};
-use super::keys::{scan_args, ttl_command, value_read_plan, RedisValue};
+use super::exec::{classify_reply, command_risk, expand_command, guard_command, guard_invocation, invocation_word, CommandRisk};
+use super::keys::{
+    prepare_mutation, scan_args, ttl_command, value_read_plan, RedisInitialValue, RedisMutation, RedisValue,
+};
 
 #[test]
 fn scan_args_builds_cursor_match_count_without_keys() {
@@ -80,9 +82,15 @@ fn command_risk_splits_blocked_dangerous_and_readonly() {
     ] {
         assert_eq!(command_risk(word), CommandRisk::Dangerous, "{word} 应为写删类");
     }
-    for word in ["GET", "HGETALL", "LRANGE", "SMEMBERS", "ZRANGE", "XRANGE", "SCAN", "TYPE", "TTL", "PTTL", "DBSIZE", "INFO", "PING"] {
+    for word in ["GET", "HGETALL", "LRANGE", "SMEMBERS", "ZRANGE", "XRANGE", "SCAN", "TYPE", "TTL", "PTTL", "DBSIZE", "INFO", "PING", "CONFIG"] {
         assert_eq!(command_risk(word), CommandRisk::Readonly, "{word} 应为只读直通");
     }
+    assert_eq!(command_risk("CONFIG SET"), CommandRisk::Dangerous);
+    assert_eq!(command_risk("ACL SETUSER"), CommandRisk::Dangerous);
+    assert_eq!(command_risk("SCRIPT FLUSH"), CommandRisk::Dangerous);
+    assert_eq!(command_risk("CLIENT KILL"), CommandRisk::Dangerous);
+    assert_eq!(invocation_word("CONFIG", &["SET".into(), "save".into()]), "CONFIG SET");
+    assert_eq!(expand_command("CONFIG SET", &["save".into()]).0, "CONFIG");
 }
 
 #[test]
@@ -96,8 +104,65 @@ fn guard_requires_confirmation_for_dangerous_and_blocks_keys() {
     assert!(guard_command("FLUSHDB", true).is_ok());
     assert!(guard_command("DEL", false).is_err());
     assert!(guard_command("del", true).is_ok());
-    // 只读直通不需要确认。
+    // 只读直通不需要确认。CONFIG 单独出现仍是只读；CONFIG SET 即使拆成两个词也要确认。
     assert!(guard_command("GET", false).is_ok());
+    assert!(guard_command("CONFIG", false).is_ok());
+    assert!(guard_invocation("CONFIG", &["SET".into(), "save".into()], false).is_err());
+    assert!(guard_invocation("CONFIG", &["SET".into(), "save".into()], true).is_ok());
+    assert!(guard_command("CONFIG SET", false).is_err());
+    assert!(guard_command("KEYS *", true).is_err());
+}
+
+#[test]
+fn mutation_refuses_unconfirmed_writes_and_preserves_ttl() {
+    let string_set = RedisMutation::SetString { key: "user:1".into(), value: "林夏".into() };
+    let denied = prepare_mutation(&string_set, false).unwrap_err();
+    assert!(denied.contains("确认"), "{denied}");
+    let plan = prepare_mutation(&string_set, true).unwrap();
+    assert!(plan.exists_key.is_none());
+    assert_eq!(plan.steps[0].word, "SET");
+    assert_eq!(plan.steps[0].args, vec!["user:1", "林夏", "KEEPTTL"]);
+    assert!(plan.steps.iter().all(|step| !step.word.eq_ignore_ascii_case("KEYS")));
+
+    let ttl = RedisMutation::SetTtl { key: "user:1".into(), seconds: Some(30) };
+    assert!(prepare_mutation(&ttl, false).is_err());
+    let ttl_plan = prepare_mutation(&ttl, true).unwrap();
+    assert_eq!(ttl_plan.steps[0].word, "EXPIRE");
+    let persist = prepare_mutation(&RedisMutation::SetTtl { key: "user:1".into(), seconds: None }, true).unwrap();
+    assert_eq!(persist.steps[0].word, "PERSIST");
+
+    let created = RedisMutation::CreateKey {
+        key: "rank".into(),
+        ttl_secs: Some(15),
+        overwrite: false,
+        initial: RedisInitialValue::ZSet { score: 1.5, member: "张伟".into() },
+    };
+    let created = prepare_mutation(&created, true).unwrap();
+    assert_eq!(created.exists_key.as_deref(), Some("rank"));
+    assert!(!created.overwrite);
+    assert_eq!(created.steps[0].word, "ZADD");
+    assert_eq!(created.steps[1].word, "EXPIRE");
+    assert!(created.steps.iter().all(|step| !step.word.eq_ignore_ascii_case("KEYS")));
+
+    let bad_score = RedisMutation::ZSetAdd { key: "rank".into(), score: f64::NAN, member: "张伟".into() };
+    assert!(prepare_mutation(&bad_score, true).is_err(), "非法分值即使确认也不能生成写计划");
+    let stream = RedisMutation::StreamAdd { key: "events".into(), id: String::new(), fields: Vec::new() };
+    assert!(prepare_mutation(&stream, true).is_err());
+    for mutation in [
+        RedisMutation::HashSet { key: "h".into(), field: "f".into(), value: "v".into() },
+        RedisMutation::HashDel { key: "h".into(), fields: vec!["f".into()] },
+        RedisMutation::ListPush { key: "l".into(), head: true, value: "a".into() },
+        RedisMutation::ListSet { key: "l".into(), index: 0, value: "a".into() },
+        RedisMutation::ListRem { key: "l".into(), count: 1, value: "a".into() },
+        RedisMutation::SetAdd { key: "s".into(), member: "a".into() },
+        RedisMutation::SetRem { key: "s".into(), member: "a".into() },
+        RedisMutation::ZSetRem { key: "z".into(), member: "a".into() },
+        RedisMutation::StreamDel { key: "e".into(), id: "1-0".into() },
+    ] {
+        assert!(prepare_mutation(&mutation, false).is_err(), "{mutation:?}");
+        let plan = prepare_mutation(&mutation, true).unwrap();
+        assert!(plan.steps.iter().all(|step| !step.word.eq_ignore_ascii_case("KEYS")));
+    }
 }
 
 #[test]

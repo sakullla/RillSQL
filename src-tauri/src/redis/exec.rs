@@ -48,7 +48,8 @@ pub fn command_risk(word: &str) -> CommandRisk {
     if key.is_empty() {
         return CommandRisk::Readonly;
     }
-    if BLOCKED_COMMANDS.contains(&key.as_str()) {
+    let head = key.split('_').next().unwrap_or("");
+    if head == "KEYS" || BLOCKED_COMMANDS.contains(&key.as_str()) {
         return CommandRisk::Blocked;
     }
     if DANGEROUS_COMMANDS.contains(&key.as_str()) {
@@ -116,9 +117,34 @@ pub fn classify_reply(value: &redis::Value) -> RespReply {
     }
 }
 
+/// 第一个参数和第二个词能否组成清单里的危险或禁用命令（CONFIG SET、ACL SETUSER）。
+pub fn is_compound_command(first: &str, second: &str) -> bool {
+    !matches!(command_risk(&format!("{first} {second}")), CommandRisk::Readonly)
+}
+
+/// 风险判断用的命令名。双词危险命令不能只看第一个 token。
+pub fn invocation_word(word: &str, args: &[String]) -> String {
+    let trimmed = word.trim();
+    if trimmed.split_whitespace().nth(1).is_some() {
+        return trimmed.to_owned();
+    }
+    if let Some(second) = args.first() {
+        if is_compound_command(trimmed, second) {
+            return format!("{trimmed} {second}");
+        }
+    }
+    trimmed.to_owned()
+}
+
 /// 执行前置检查：Blocked 无条件拒绝；Dangerous 必须带确认标记。
 pub fn guard_command(word: &str, confirmed: bool) -> Result<(), String> {
-    match command_risk(word) {
+    guard_invocation(word, &[], confirmed)
+}
+
+/// 同 `guard_command`，但会把 `CONFIG` + `SET` 这种拆开的参数重新拼回去再分类。
+pub fn guard_invocation(word: &str, args: &[String], confirmed: bool) -> Result<(), String> {
+    let word = invocation_word(word, args);
+    match command_risk(&word) {
         CommandRisk::Blocked => Err(format!(
             "已禁用 {word}：全量扫描会阻塞 Redis，键空间浏览一律走 SCAN 分页。"
         )),
@@ -127,14 +153,26 @@ pub fn guard_command(word: &str, confirmed: bool) -> Result<(), String> {
     }
 }
 
-/// 执行一条命令并结构化返回。调用方必须先通过 guard_command。
+/// 把 `CONFIG SET` 这种风险名拆回 Redis 实际的命令和参数。单名命令原样返回。
+pub fn expand_command(word: &str, args: &[String]) -> (String, Vec<String>) {
+    let mut parts = word.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+    if parts.is_empty() {
+        return (String::new(), args.to_vec());
+    }
+    let command = parts.remove(0);
+    parts.extend(args.iter().cloned());
+    (command, parts)
+}
+
+/// 执行一条命令并结构化返回。调用方必须先通过 guard_invocation。
 pub async fn run_command(
     conn: &mut redis::aio::MultiplexedConnection,
     word: &str,
     args: &[String],
 ) -> Result<RespReply, redis::RedisError> {
-    let mut cmd = redis::cmd(word);
-    for arg in args {
+    let (command, args) = expand_command(word, args);
+    let mut cmd = redis::cmd(command.as_str());
+    for arg in &args {
         cmd.arg(arg);
     }
     let value: redis::Value = cmd.query_async(conn).await?;

@@ -3,16 +3,16 @@
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{Editor, EditorState, InputEvent};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, ClipboardItem, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px, relative,
+    StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px,
 };
 
 use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, TypeScale};
+use crate::ui::{EditMode, FormatViewer, FormatViewerEvent, TruncationState, ViewerSpec};
 
 use crate::application::mongo::{DeleteOutcome, InsertOutcome, ReplaceOutcome};
 use crate::application::AppServices;
@@ -28,7 +28,6 @@ const DOC_ACTIONS_W: f32 = 124.;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Field {
     Filter,
-    Editor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,7 +84,15 @@ pub struct MongoPane {
     copied: String,
     focused: Option<Field>,
     fields: Fields<Field>,
-    editor_state: Option<(Entity<EditorState>, String, gpui_kit::Subscription)>,
+    /// None 跟随窗口宽度；Some 是用户手动折叠或展开。
+    nav_choice: Option<bool>,
+    doc_tree: bool,
+    crumb_db: bool,
+    crumb_coll: bool,
+    viewer: Option<Entity<FormatViewer>>,
+    viewer_sub: Option<Subscription>,
+    viewer_editable: bool,
+    viewport_w: f32,
 }
 
 impl MongoPane {
@@ -125,7 +132,14 @@ impl MongoPane {
             copied: String::new(),
             focused: None,
             fields: Fields::default(),
-            editor_state: None,
+            nav_choice: None,
+            doc_tree: false,
+            crumb_db: false,
+            crumb_coll: false,
+            viewer: None,
+            viewer_sub: None,
+            viewer_editable: false,
+            viewport_w: 1200.,
         }
     }
 
@@ -285,7 +299,17 @@ impl MongoPane {
         self.filter_error.clear();
         self.copied.clear();
         self.fields = Fields::default();
-        self.editor_state = None;
+        self.nav_choice = None;
+        self.doc_tree = false;
+        self.crumb_db = false;
+        self.crumb_coll = false;
+        self.viewer = None;
+        self.viewer_sub = None;
+        self.viewer_editable = false;
+    }
+
+    fn nav_collapsed(&self, width: f32) -> bool {
+        self.nav_choice.unwrap_or(width < kit::NARROW_PAGE_WIDTH)
     }
 
     pub fn open_spec(&mut self, spec: &str, cx: &mut Context<Self>) {
@@ -303,7 +327,8 @@ impl MongoPane {
     }
 
     pub fn command(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self.busy && !matches!(id, "mongo-cancel") {
+        let local = matches!(id, "mongo-cancel" | "mongo-nav-toggle" | "mongo-view-table" | "mongo-view-tree" | "mongo-crumb-db" | "mongo-crumb-coll");
+        if self.busy && !local {
             self.show_error(self.text("mongo.tab.loading"));
             cx.notify();
             return;
@@ -352,6 +377,11 @@ impl MongoPane {
             self.note.clear();
             self.error.clear();
         } else if id == "mongo-save" {
+            if self.viewer_editable {
+                if let Some(viewer) = &self.viewer {
+                    self.editor_text = viewer.read(cx).draft().to_owned();
+                }
+            }
             self.ask_save();
         } else if let Some(index) = id.strip_prefix("mongo-delete:") {
             self.ask_delete(index);
@@ -361,6 +391,29 @@ impl MongoPane {
             self.confirm_id = None;
             self.confirm_write = None;
             self.confirm_prompt.clear();
+        } else if id == "mongo-nav-toggle" {
+            self.nav_choice = Some(!self.nav_collapsed(self.viewport_w));
+        } else if id == "mongo-view-table" {
+            self.doc_tree = false;
+        } else if id == "mongo-view-tree" {
+            self.doc_tree = true;
+        } else if id == "mongo-crumb-db" {
+            self.crumb_db = !self.crumb_db;
+            self.crumb_coll = false;
+        } else if id == "mongo-crumb-coll" {
+            self.crumb_coll = !self.crumb_coll;
+            self.crumb_db = false;
+        } else if let Some(index) = id.strip_prefix("mongo-crumb-db:") {
+            self.crumb_db = false;
+            self.pick_database(index, cx);
+        } else if let Some(index) = id.strip_prefix("mongo-crumb-coll:") {
+            self.crumb_coll = false;
+            self.pick_collection(index, cx);
+        } else if let Some(rest) = id.strip_prefix("mongo-cell:") {
+            let mut parts = rest.splitn(2, ':');
+            let row = parts.next().unwrap_or("");
+            let column = parts.next().unwrap_or("");
+            self.open_cell(row, column);
         }
         cx.notify();
     }
@@ -488,6 +541,14 @@ impl MongoPane {
                 self.show_error(message);
             }
         }
+    }
+
+    fn open_cell(&mut self, index: &str, column: &str) {
+        let Some(doc) = self.doc_at(index) else { return };
+        let Some(text) = cell_fragment(&doc.json, column) else { return };
+        self.view_json = text;
+        self.view_open = true;
+        self.error.clear();
     }
 
     fn open_view(&mut self, index: &str) {
@@ -767,6 +828,22 @@ pub fn columns_of(documents: &[MongoDoc]) -> Vec<String> {
     columns
 }
 
+/// 嵌套对象和数组用 `{N}` / `[N]` 徽标，标量没有徽标。
+pub fn cell_badge(json: &str, column: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(json).ok()?;
+    match value.get(column)? {
+        serde_json::Value::Object(map) => Some(format!("{{{}}}", map.len())),
+        serde_json::Value::Array(items) => Some(format!("[{}]", items.len())),
+        _ => None,
+    }
+}
+
+pub fn cell_fragment(json: &str, column: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(json).ok()?;
+    let value = value.get(column)?.clone();
+    Some(pretty_json(&serde_json::to_string(&value).unwrap_or_default()))
+}
+
 pub fn cell_text(json: &str, column: &str) -> String {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else { return String::new() };
     let Some(object) = value.as_object() else { return String::new() };
@@ -814,6 +891,8 @@ fn parse_spec(spec: &str) -> Option<(String, String, String, String)> {
 
 impl Render for MongoPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.viewport_w = f32::from(window.viewport_size().width);
+        let collapsed = self.nav_collapsed(self.viewport_w);
         let p = Palette::of(cx);
         let m = kit::Metrics::of(cx);
         let entity = cx.entity();
@@ -868,9 +947,11 @@ impl Render for MongoPane {
                 &entity,
             ));
         }
+        let nav_w = m.header_h() * 4. + m.pane_pad();
         let left = div()
             .flex_none()
-            .w(px(250.))
+            .w(px(if collapsed { 0. } else { nav_w }))
+            .overflow_hidden()
             .h_full()
             .flex()
             .flex_col()
@@ -908,14 +989,19 @@ impl Render for MongoPane {
             .gap(px(6.))
             .border_b_1()
             .border_color(p.line)
+            .child(mongo_icon("mongo-nav-toggle", IconName::PanelLeft, &self.text("mongo.nav.collapse"), &entity))
+            .child(mongo_button("mongo-view-table", None, &self.text("mongo.view.table"), Kind::Tool, &entity))
+            .child(mongo_button("mongo-view-tree", None, &self.text("mongo.view.tree"), Kind::Tool, &entity))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(4.))
                     .text_size(px(TypeScale::MD))
-                    .child(div().text_color(p.text_muted).child(SharedString::from(self.database.clone())))
+                    .child(mongo_button("mongo-crumb-db", None, &self.text("mongo.nav.breadcrumb"), Kind::Tool, &entity))
+                    .child(div().text_color(p.text_muted).child(SharedString::from(if self.database.is_empty() { self.text("mongo.tab.databases") } else { self.database.clone() })))
                     .child(kit::icon(IconName::ChevronRight, 12., p.text_faint))
+                    .child(mongo_button("mongo-crumb-coll", None, &self.text("mongo.tab.collections"), Kind::Tool, &entity))
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(SharedString::from(self.collection.clone()))),
             )
             .child(div().w(px(8.)))
@@ -932,7 +1018,7 @@ impl Render for MongoPane {
         // ---- 文档表
         let shown: Vec<String> = self.columns.iter().take(7).cloned().collect();
         // 窄窗口下每列至少 120：不够宽就横向滚动，不把七列压成全是省略号。
-        let row_min_w = shown.len() as f32 * DOC_COL_MIN + DOC_ACTIONS_W + 20.;
+        let row_min_w = shown.len() as f32 * DOC_COL_MIN + DOC_ACTIONS_W + m.pane_pad();
         let mut table = div().id("mongo-docs").flex().flex_col().flex_1().min_h(px(0.)).overflow_y_scroll().overflow_x_scroll();
         if !self.filter_error.is_empty() {
             table = table.child(div().mx(px(10.)).mt(px(10.)).px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.danger_soft).text_color(p.danger).text_size(px(TypeScale::SM)).child(SharedString::from(self.filter_error.clone())));
@@ -961,20 +1047,34 @@ impl Render for MongoPane {
                     .border_b_1()
                     .border_color(p.line_soft)
                     .hover(|style| style.bg(p.hover));
-                for name in &shown {
+                for (column_index, name) in shown.iter().enumerate() {
                     let text = cell_text(&doc.json, name);
+                    let badge = cell_badge(&doc.json, name);
                     let faint = text == "null" || text.is_empty();
+                    let cell_id = format!("mongo-cell:{index}:{column_index}");
+                    let entity = entity.clone();
                     row = row.child(
                         div()
+                            .id(SharedString::from(cell_id.clone()))
                             .flex_1()
                             .flex_basis(px(0.))
                             .min_w(px(0.))
                             .truncate()
                             .pr(px(8.))
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
                             .text_size(px(TypeScale::SM))
                             .when(name == "_id", |this| this.font_family(mono.clone()).text_color(p.text_muted))
-                            .when(faint, |this| this.text_color(p.text_faint))
-                            .child(SharedString::from(text)),
+                            .when(faint && badge.is_none(), |this| this.text_color(p.text_faint))
+                            .when(badge.is_some(), |this| {
+                                this.child(kit::pill(SharedString::from(badge.clone().unwrap_or_default()), p.accent_text, p.accent_soft))
+                            })
+                            .child(SharedString::from(text))
+                            .on_click(move |_, _, cx| {
+                                let cell_id = cell_id.clone();
+                                entity.update(cx, |pane, cx| pane.command(&cell_id, cx));
+                            }),
                     );
                 }
                 row = row.child(
@@ -993,46 +1093,80 @@ impl Render for MongoPane {
             }
         }
 
-        let mut right = div().flex_1().min_w(px(0.)).h_full().flex().flex_col().relative().child(toolbar).child(table);
+        let mut right = div().flex_1().min_w(px(0.)).h_full().flex().flex_col().relative().child(toolbar);
+        if self.crumb_db || self.crumb_coll {
+            let mut menu = div().id("mongo-crumb-menu").flex().flex_col().max_h(px(m.header_h() * 6.)).overflow_y_scroll().p(px(m.pad)).border_b_1().border_color(p.line).bg(p.chrome);
+            if self.crumb_db {
+                for (index, database) in self.databases.iter().take(60).enumerate() {
+                    menu = menu.child(nav_row(
+                        format!("mongo-crumb-db:{index}"),
+                        format!("{} {}", self.text("mongo.tab.databases"), database.name),
+                        IconName::Database,
+                        database.name.clone(),
+                        database.collections.to_string(),
+                        database.name == self.database,
+                        &p,
+                        m,
+                        &entity,
+                    ));
+                }
+            } else {
+                for (index, collection) in self.collections.iter().take(120).enumerate() {
+                    let count = collection.estimated_documents.map(|count| count.to_string()).unwrap_or_else(|| "—".into());
+                    menu = menu.child(nav_row(
+                        format!("mongo-crumb-coll:{index}"),
+                        format!("{} {}", self.text("mongo.tab.collections"), collection.name),
+                        IconName::FolderOpen,
+                        collection.name.clone(),
+                        count,
+                        collection.name == self.collection,
+                        &p,
+                        m,
+                        &entity,
+                    ));
+                }
+            }
+            right = right.child(menu);
+        }
+        let documents = if self.doc_tree { self.document_tree(&p, &m, &entity) } else { table.into_any_element() };
+        right = right.child(documents);
 
         // ---- 抽屉：查看 / 编辑
         if self.view_open || self.editor_open {
+            let editable = self.editor_open;
+            let source = if editable { self.editor_text.clone() } else { self.view_json.clone() };
+            let viewer = self.ensure_document_viewer(&source, editable, window, cx);
+            let caption = if self.editor_mode == EditorMode::Insert { self.text("mongo.tab.saveInsert") } else { self.text("mongo.tab.saveReplace") };
+            let close_entity = entity.clone();
             let mut drawer = div()
                 .flex_none()
-                .max_h(relative(0.55))
+                .h(px(m.header_h() * 6.))
                 .flex()
                 .flex_col()
-                .gap(px(10.))
-                .p(px(12.))
+                .gap(px(m.pad))
+                .p(px(m.card_pad()))
                 .border_t_1()
                 .border_color(p.line)
-                .bg(p.chrome);
-            if self.view_open {
-                let invalid = serde_json::from_str::<serde_json::Value>(&self.view_json).is_err();
-                let body = if invalid { format!("{} {}", self.text("mongo.docJson.invalid"), self.view_json) } else { self.view_json.clone() };
-                drawer = drawer
-                    .child(div().flex().items_center().justify_between().child(kit::eyebrow(SharedString::from(self.text("mongo.tab.viewLabel")), &p)).child(mongo_button("mongo-view-close", Some(IconName::X), &self.text("mongo.tab.close"), Kind::Tool, &entity)))
-                    .child(div().id("mongo-view-json").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(12.)).rounded(px(Radius::PANEL)).bg(p.surface).border_1().border_color(p.line).font_family(mono.clone()).text_size(px(TypeScale::SM)).child(SharedString::from(body)));
-            }
-            if self.editor_open {
-                let editor = self.json_editor(window, cx);
-                let caption = if self.editor_mode == EditorMode::Insert { self.text("mongo.tab.saveInsert") } else { self.text("mongo.tab.saveReplace") };
-                let close_entity = entity.clone();
-                drawer = drawer
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(kit::eyebrow(SharedString::from(self.text("mongo.tab.editorLabel")), &p))
-                            .child(kit::icon_button("mongo-editor-close", IconName::X, SharedString::from(self.text("mongo.tab.close")), move |_, _, cx| {
+                .bg(p.chrome)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(kit::eyebrow(SharedString::from(self.text(if editable { "mongo.tab.editorLabel" } else { "mongo.tab.viewLabel" })), &p))
+                        .child(mongo_button("mongo-view-close", Some(IconName::X), &self.text("mongo.tab.close"), Kind::Tool, &entity))
+                        .when(editable, |this| {
+                            this.child(kit::icon_button("mongo-editor-close", IconName::X, SharedString::from(self.text("mongo.tab.close")), move |_, _, cx| {
                                 close_entity.update(cx, |pane, cx| {
                                     pane.editor_open = false;
                                     cx.notify();
                                 })
-                            })),
-                    )
-                    .child(div().id("mongo-editor").h(px(220.)).rounded(px(Radius::PANEL)).border_1().border_color(p.line).bg(p.surface).overflow_hidden().child(Editor::new(&editor).h(relative(1.)).bordered(false).aria_label(SharedString::from(self.text("mongo.tab.editorLabel")))))
+                            }))
+                        }),
+                )
+                .child(div().id("mongo-view-json").flex_1().min_h(px(0.)).overflow_hidden().child(viewer));
+            if editable {
+                drawer = drawer
                     .when(!self.editor_error.is_empty(), |this| this.child(div().text_size(px(TypeScale::SM)).text_color(p.danger).child(SharedString::from(self.editor_error.clone()))))
                     .child(div().flex().justify_end().child(mongo_button("mongo-save", Some(IconName::Check), &caption, Kind::Primary, &entity)));
             }
@@ -1099,23 +1233,93 @@ enum Kind {
 }
 
 impl MongoPane {
-    fn json_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<EditorState> {
-        let value = self.editor_text.clone();
-        if let Some((state, last, _)) = self.editor_state.as_mut() {
-            let state = state.clone();
-            kit::sync_editor(&state, last, &value, window, cx);
-            return state;
+    /// 查看用只读 FormatViewer，新增和替换用可编辑的。应用只进入确认，不直接写库。
+    fn ensure_document_viewer(&mut self, text: &str, editable: bool, window: &mut Window, cx: &mut Context<Self>) -> Entity<FormatViewer> {
+        let mode = if editable { EditMode::Editable } else { EditMode::ReadOnly };
+        if self.viewer.is_none() || self.viewer_editable != editable {
+            let spec = ViewerSpec {
+                text: text.to_owned(),
+                column_hint: Some("document".into()),
+                type_hint: Some("json".into()),
+                bytes: None,
+                truncation: TruncationState::Full,
+                mode,
+                locale: self.locale,
+            };
+            let viewer = cx.new(|cx| FormatViewer::new(spec, window, cx));
+            let sub = cx.subscribe(&viewer, |this, _, event, cx| {
+                if let FormatViewerEvent::Commit(body) = event {
+                    if !this.viewer_editable {
+                        return;
+                    }
+                    this.editor_text = body.clone();
+                    this.ask_save();
+                    cx.notify();
+                }
+            });
+            self.viewer_sub = Some(sub);
+            self.viewer = Some(viewer);
+            self.viewer_editable = editable;
         }
-        let state = cx.new(|cx| EditorState::new(window, cx).language("json").line_number(true).default_value(value.clone()));
-        let subscription = cx.subscribe(&state, |this, state, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                this.focused = Some(Field::Editor);
-                this.editor_text = state.read(cx).value().to_string();
-                cx.notify();
+        let viewer = self.viewer.clone().expect("document viewer");
+        let source = viewer.read(cx).source().to_owned();
+        let draft = viewer.read(cx).draft().to_owned();
+        if editable && text == source && draft != text {
+            self.editor_text = draft;
+        } else         if text != source && text != draft {
+            viewer.update(cx, |viewer, cx| viewer.replace_full(text.to_owned(), None, window, cx));
+        }
+        viewer
+    }
+
+    fn document_tree(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>) -> AnyElement {
+        let mut tree = div().id("mongo-docs").flex().flex_col().flex_1().min_h(px(0.)).overflow_y_scroll();
+        if self.documents.is_empty() {
+            let empty = if self.applied_filter.is_empty() { self.text("mongo.tab.emptyCollection") } else { self.text("mongo.tab.emptyFiltered") };
+            return tree.child(div().flex_1().flex().items_center().justify_center().child(kit::empty_state(IconName::Braces, SharedString::from(empty), SharedString::from(self.text("mongo.view.tree")), &p))).into_any_element();
+        }
+        for (index, doc) in self.documents.iter().take(PAGE_LIMIT as usize).enumerate() {
+            let parsed = serde_json::from_str::<serde_json::Value>(&doc.json).ok();
+            let nodes = parsed.as_ref().map(|value| crate::ui::visible_json_nodes(value, &std::collections::BTreeSet::new(), "")).unwrap_or_default();
+            let mut block = div()
+                .id(SharedString::from(format!("mongo-row-{index}")))
+                .test_support()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .px(px(m.pane_pad()))
+                .py(px(m.pad))
+                .border_b_1()
+                .border_color(p.line_soft);
+            block = block.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(div().flex_1().truncate().text_size(px(TypeScale::SM)).child(SharedString::from(cell_text(&doc.json, "_id"))))
+                    .child(doc_icon(format!("mongo-view:{index}"), IconName::Eye, format!("{} {index}", self.text("mongo.tab.view")), entity))
+                    .child(doc_icon(format!("mongo-copy:{index}"), IconName::Copy, format!("{} {index}", self.text("mongo.tab.copy")), entity))
+                    .child(doc_icon(format!("mongo-edit:{index}"), IconName::Pencil, format!("{} {index}", self.text("mongo.tab.edit")), entity))
+                    .child(doc_icon(format!("mongo-delete:{index}"), IconName::Trash, format!("{} {index}", self.text("mongo.tab.remove")), entity)),
+            );
+            for node in nodes.into_iter().take(40) {
+                let badge = node.badge.clone().unwrap_or_default();
+                let label = if node.scalar.as_ref().is_some() {
+                    format!("{} {}", node.key, node.scalar.unwrap_or_default())
+                } else {
+                    format!("{} {badge}", node.key)
+                };
+                block = block.child(
+                    div()
+                        .pl(px(m.pane_pad() * node.depth as f32))
+                        .text_size(px(TypeScale::SM))
+                        .text_color(p.text_muted)
+                        .child(SharedString::from(label)),
+                );
             }
-        });
-        self.editor_state = Some((state.clone(), value, subscription));
-        state
+            tree = tree.child(block);
+        }
+        tree.into_any_element()
     }
 }
 
@@ -1190,6 +1394,11 @@ mod tests {
         assert!(quick_validate("[]", Locale::En).unwrap().to_ascii_lowercase().contains("object"));
         assert!(quick_validate("", Locale::ZhCn).is_some());
         assert!(quick_validate(r#"{"status":"active"}"#, Locale::ZhCn).is_none());
+        let nested = r#"{"_id":"1","地址":{"城市":"杭州","区":"西湖"},"标签":["加急"]}"#;
+        assert_eq!(cell_badge(nested, "地址").as_deref(), Some("{2}"));
+        assert_eq!(cell_badge(nested, "标签").as_deref(), Some("[1]"));
+        assert!(cell_badge(nested, "_id").is_none());
+        assert!(cell_fragment(nested, "地址").unwrap().contains("杭州"));
         assert_eq!(next_skip(20, 20, -1), 0);
         assert_eq!(next_skip(0, 20, 1), 20);
         assert!(pretty_json(r#"{"a":1}"#).contains('\n'));
