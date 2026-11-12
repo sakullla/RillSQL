@@ -1404,6 +1404,14 @@ fn sql_tokens(input: &str) -> Vec<String> {
             tokens.push(chars[start..index].iter().collect());
             continue;
         }
+        if let Some(next) = chars.get(index + 1) {
+            let compound = matches!((ch, *next), ('<', '=') | ('<', '>') | ('>', '=') | ('!', '=') | ('|', '|') | (':', ':'));
+            if compound {
+                tokens.push(format!("{ch}{next}"));
+                index += 2;
+                continue;
+            }
+        }
         tokens.push(ch.to_string());
         index += 1;
     }
@@ -1594,5 +1602,14 @@ mod tests {
         assert!(json_yaml.json_compatible);
         assert!(json_yaml.limitation_key.is_none());
         assert!(json_yaml.text.contains("name"));
+    }
+
+    #[test]
+    fn format_sql_keeps_compound_operators_together() {
+        let sql = format_sql("select a from t where n <= 1 and m <> 2 and p >= 3 and q != 4 and flags || extra and id::text = 'x'");
+        for intact in ["<=", "<>", ">=", "!=", "||", "::"] {
+            assert!(sql.contains(intact), "{sql}");
+        }
+        assert!(!sql.contains("< =") && !sql.contains("| |") && !sql.contains(": :"), "{sql}");
     }
 }
