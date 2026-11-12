@@ -702,11 +702,12 @@ impl SqlEditor {
         });
     }
 
-    /// 在当前光标或选区插入文本，走编辑器自己的替换，Ctrl+Z 能撤销。
+    /// 在当前光标或选区插入文本。`None` 表示用当前选区（字节偏移），
+    /// 由 `EditorState::replace_text_in_range` 记入撤销栈；随后聚焦，Ctrl+Z 才能落到这次插入。
     pub fn insert_at_selection(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
-            let range = state.selected_range();
-            state.replace_text_in_range(Some(range), text, window, cx);
+            state.replace_text_in_range(None, text, window, cx);
+            state.focus(window, cx);
         });
     }
 
