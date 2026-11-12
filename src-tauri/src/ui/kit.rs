@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -12,8 +13,8 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Theme, ThemeMode};
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window,
+    AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity, FontFeatures, FontWeight, Hsla, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window,
     div, hsla, px, rgb,
 };
 
@@ -28,6 +29,8 @@ pub struct Palette {
     pub rail: Hsla,
     /// 浮层与卡片。
     pub raised: Hsla,
+    /// 凹陷表面：比工作区和外壳都收进去一档，用来放代码、预览和嵌套分区。
+    pub sunken: Hsla,
     pub hover: Hsla,
     pub active: Hsla,
     pub line: Hsla,
@@ -70,6 +73,8 @@ impl Palette {
             chrome: hex(0xf6f7f9),
             rail: hex(0xeef0f4),
             raised: hex(0xffffff),
+            // 比外壳再沉一档的冷灰，和白底、外壳、浮层都分开。
+            sunken: hex(0xe8edf5),
             hover: hex(0xeceef3),
             active: hex(0xe2e5ec),
             line: hex(0xe4e7ec),
@@ -106,6 +111,8 @@ impl Palette {
             chrome: hex(0x1d1f24),
             rail: hex(0x15161a),
             raised: hex(0x24262c),
+            // 比工作区更深的底，避免和外壳、浮层挤在同一档明度上。
+            sunken: hex(0x101216),
             hover: hex(0x2a2d34),
             active: hex(0x33363e),
             line: hex(0x2c2f36),
@@ -345,6 +352,9 @@ where
 
 // ---------------------------------------------------------------- 尺寸指标
 
+/// 视口窄于这个宽度时，水平页边距收到紧凑档，避免把内容挤出屏幕。
+pub const NARROW_PAGE_WIDTH: f32 = 760.;
+
 /// 外壳与页面的尺寸指标。只由密度决定，绘制与模型布局共用这一份值，
 /// 不再让页面各自保留一套高度常量。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -382,8 +392,8 @@ impl Metrics {
             tabs_h: 32.,
             status_h: 24.,
             pad: 4.,
-            page_pad: 22.,
-            page_pad_y: 20.,
+            page_pad: 16.,
+            page_pad_y: 14.,
             row_pad_y: 5.,
         }
     }
@@ -399,8 +409,8 @@ impl Metrics {
             tabs_h: 36.,
             status_h: 26.,
             pad: 8.,
-            page_pad: 28.,
-            page_pad_y: 28.,
+            page_pad: 20.,
+            page_pad_y: 18.,
             row_pad_y: 7.,
         }
     }
@@ -450,9 +460,55 @@ impl Metrics {
             tabs_h: 40.,
             status_h: 28.,
             pad: 12.,
-            page_pad: 34.,
-            page_pad_y: 36.,
+            page_pad: 26.,
+            page_pad_y: 24.,
             row_pad_y: 9.,
+        }
+    }
+
+    /// 分栏内边距：紧凑 10 / 标准 12 / 宽松 16。
+    pub fn pane_pad(&self) -> f32 {
+        self.by_density(10., 12., 16.)
+    }
+
+    /// 区块间距：紧凑 12 / 标准 16 / 宽松 20。
+    pub fn section_gap(&self) -> f32 {
+        self.by_density(12., 16., 20.)
+    }
+
+    /// 卡片内边距：紧凑 12 / 标准 14 / 宽松 18。
+    pub fn card_pad(&self) -> f32 {
+        self.by_density(12., 14., 18.)
+    }
+
+    /// 次级页统一页头高度：紧凑 42 / 标准 48 / 宽松 54。
+    pub fn header_h(&self) -> f32 {
+        self.by_density(42., 48., 54.)
+    }
+
+    /// 水平页边距。视口窄于 [`NARROW_PAGE_WIDTH`] 时钳到紧凑档，不改垂直边距。
+    pub fn page_pad_for(&self, viewport_width: f32) -> f32 {
+        if viewport_width < NARROW_PAGE_WIDTH {
+            self.page_pad.min(Self::compact().page_pad)
+        } else {
+            self.page_pad
+        }
+    }
+
+    /// 拷贝一份指标，只把水平页边距按视口钳制。调用方继续读 `page_pad` 即可。
+    pub fn for_viewport(self, viewport_width: f32) -> Self {
+        let mut metrics = self;
+        metrics.page_pad = self.page_pad_for(viewport_width);
+        metrics
+    }
+
+    fn by_density(&self, compact: f32, standard: f32, relaxed: f32) -> f32 {
+        if self.row_h < 32. {
+            compact
+        } else if self.row_h < 40. {
+            standard
+        } else {
+            relaxed
         }
     }
 }
@@ -576,6 +632,120 @@ pub fn muted(text: impl Into<SharedString>, p: &Palette) -> AnyElement {
 pub fn card(p: &Palette) -> gpui_kit::Div {
     div().bg(p.surface).border_1().border_color(p.line).rounded(px(Radius::PANEL))
 }
+
+/// 凹陷表面：圆角面板，底色比工作区、外壳和浮层都收进去一档。
+pub fn sunken(p: &Palette) -> gpui_kit::Div {
+    div().bg(p.sunken).border_1().border_color(p.line).rounded(px(Radius::PANEL))
+}
+
+/// 等宽数字。行号、计数、耗时、分值走这里，避免位数变化时左右跳动。
+pub fn metric_value(text: impl Into<SharedString>, p: &Palette) -> AnyElement {
+    div()
+        .text_size(px(TypeScale::SM))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(p.text)
+        .font_features(tabular_figures())
+        .child(text.into())
+        .into_any_element()
+}
+
+fn tabular_figures() -> FontFeatures {
+    FontFeatures(Arc::new(vec![("tnum".into(), 1)]))
+}
+
+/// 页头上的一个数字指标。标签在上，数字按表格数字对齐。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetricCell {
+    pub label: SharedString,
+    pub value: SharedString,
+}
+
+/// 次级页面的统一页头。高度取 `header_h`，数字列由 [`metric_value`] 对齐。
+/// 返回的是可继续追加操作按钮的容器。
+pub fn page_header(title_text: impl Into<SharedString>, metrics: &[MetricCell], layout: &Metrics, p: &Palette) -> gpui_kit::Div {
+    let mut row = div()
+        .h(px(layout.header_h()))
+        .px(px(layout.page_pad))
+        .flex()
+        .items_center()
+        .gap(px(layout.section_gap()))
+        .border_b_1()
+        .border_color(p.line)
+        .bg(p.surface)
+        .child(title(title_text, TypeScale::LG, p));
+    for cell in metrics {
+        row = row.child(
+            div()
+                .flex()
+                .flex_col()
+                .items_end()
+                .gap(px(1.))
+                .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(cell.label.clone()))
+                .child(metric_value(cell.value.clone(), p)),
+        );
+    }
+    row
+}
+
+/// 拖拽条携带的值。父容器用 `on_drag_move::<ResizeDrag>` 跟随宽度。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResizeDrag {
+    pub key: SharedString,
+}
+
+struct ResizeGhost;
+
+impl Render for ResizeGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size(px(0.))
+    }
+}
+
+/// 约 6px 的纵向拖拽条：列调整光标，悬停或拖拽时画强调色细线，双击调用复位。
+/// 拖拽已经在这条上开始；宽度更新挂在父容器的 `on_drag_move::<ResizeDrag>`。
+pub fn resize_handle(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    dragging: bool,
+    p: &Palette,
+    on_reset: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let key = id.into();
+    let group = key.clone();
+    let accent = p.accent;
+    let line = if dragging { p.accent } else { p.line };
+    div()
+        .group(group.clone())
+        .id(ElementId::Name(key.clone()))
+        .test_support()
+        .flex_none()
+        .w(px(RESIZE_HANDLE_W))
+        .h_full()
+        .cursor_col_resize()
+        .flex()
+        .items_center()
+        .justify_center()
+        .role(gpui_kit::Role::Button)
+        .aria_label(label)
+        .child(div().w(px(2.)).h_full().bg(line).group_hover(group, move |style| style.bg(accent)))
+        .on_drag(ResizeDrag { key }, |_drag, _offset, _window, cx| cx.new(|_| ResizeGhost))
+        .on_click(move |event, window, cx| {
+            if click_count(event) >= 2 {
+                on_reset(event, window, cx);
+            }
+        })
+}
+
+fn click_count(event: &ClickEvent) -> usize {
+    match event {
+        ClickEvent::Mouse(mouse) => mouse.down.click_count.max(mouse.up.click_count),
+        ClickEvent::Touch(touch) => touch.tap_count,
+        ClickEvent::Keyboard(_) => 1,
+    }
+}
+
+/// 纵向分隔条的命中宽度。
+pub const RESIZE_HANDLE_W: f32 = 6.;
 
 /// 空态：图标、标题、说明。按钮由调用方追加。
 pub fn empty_state(icon_name: IconName, heading: impl Into<SharedString>, detail: impl Into<SharedString>, p: &Palette) -> gpui_kit::Div {
@@ -979,7 +1149,7 @@ mod palette_tests {
     fn every_theme_keeps_text_readable() {
         for p in [Palette::light(), Palette::dark()] {
             for (name, fg) in [("text", p.text), ("muted", p.text_muted), ("faint", p.text_faint)] {
-                for (surface_name, bg) in [("surface", p.surface), ("chrome", p.chrome), ("raised", p.raised)] {
+                for (surface_name, bg) in [("surface", p.surface), ("chrome", p.chrome), ("raised", p.raised), ("sunken", p.sunken)] {
                     let ratio = contrast(fg, bg);
                     assert!(ratio >= 4.5, "{name} on {surface_name}: {ratio:.2} ({})", p.dark);
                 }
@@ -997,6 +1167,10 @@ mod palette_tests {
                 let ratio = contrast(color, p.surface);
                 assert!(ratio >= 4.5, "{name} on surface: {ratio:.2} ({})", p.dark);
             }
+            assert_ne!(p.sunken, p.surface, "凹陷面和工作区不是同一色");
+            assert_ne!(p.sunken, p.chrome, "凹陷面和外壳不是同一色");
+            assert_ne!(p.sunken, p.raised, "凹陷面和浮层不是同一色");
+            assert!(luminance(p.sunken) < luminance(p.surface), "凹陷面比工作区更沉");
         }
     }
 
@@ -1009,6 +1183,25 @@ mod palette_tests {
         assert!(compact.tree_row_h < standard.tree_row_h && standard.tree_row_h < relaxed.tree_row_h);
         assert!(compact.control_h < standard.control_h && standard.control_h < relaxed.control_h);
         assert!(compact.pad < standard.pad && standard.pad < relaxed.pad);
+        assert_eq!(relaxed.pad, 12., "宽松档保留锁定的 pad");
+        assert_eq!((compact.page_pad, compact.page_pad_y), (16., 14.));
+        assert_eq!((standard.page_pad, standard.page_pad_y), (20., 18.));
+        assert_eq!((relaxed.page_pad, relaxed.page_pad_y), (26., 24.));
+        assert!(compact.page_pad < standard.page_pad && standard.page_pad < relaxed.page_pad);
+        assert!(compact.page_pad_y < standard.page_pad_y && standard.page_pad_y < relaxed.page_pad_y);
+        assert_eq!((compact.pane_pad(), standard.pane_pad(), relaxed.pane_pad()), (10., 12., 16.));
+        assert_eq!((compact.section_gap(), standard.section_gap(), relaxed.section_gap()), (12., 16., 20.));
+        assert_eq!((compact.card_pad(), standard.card_pad(), relaxed.card_pad()), (12., 14., 18.));
+        assert_eq!((compact.header_h(), standard.header_h(), relaxed.header_h()), (42., 48., 54.));
+        assert!(compact.pane_pad() < standard.pane_pad() && standard.pane_pad() < relaxed.pane_pad());
+        assert!(compact.section_gap() < standard.section_gap() && standard.section_gap() < relaxed.section_gap());
+        assert!(compact.card_pad() < standard.card_pad() && standard.card_pad() < relaxed.card_pad());
+        assert!(compact.header_h() < standard.header_h() && standard.header_h() < relaxed.header_h());
+        assert_eq!(relaxed.page_pad_for(NARROW_PAGE_WIDTH), relaxed.page_pad, "760 不钳制");
+        assert_eq!(relaxed.page_pad_for(NARROW_PAGE_WIDTH - 1.), compact.page_pad, "窄于 760 收到紧凑水平边距");
+        assert_eq!(standard.for_viewport(400.).page_pad, compact.page_pad);
+        assert_eq!(standard.for_viewport(400.).page_pad_y, standard.page_pad_y, "钳制不动垂直边距");
+        assert_eq!(compact.for_viewport(320.).page_pad, compact.page_pad);
         assert_eq!((compact.row_h, compact.tree_row_h, compact.control_h), (26., 23., 26.), "紧凑密度按规范 S2.2 / S9");
         assert_eq!((standard.row_h, standard.tree_row_h, standard.control_h), (32., 30., 30.), "标准密度按规范 S9");
         assert_eq!((relaxed.row_h, relaxed.tree_row_h, relaxed.control_h), (40., 36., 32.), "宽松密度不小于标准");
@@ -1026,7 +1219,7 @@ mod palette_tests {
             assert_ne!(on.hover_bg, None);
             assert_ne!(on.active_bg, on.hover_bg, "按下与悬停可区分");
             let ring = on.ring.expect("可用时有焦点环");
-            for (name, bg) in [("surface", p.surface), ("chrome", p.chrome), ("raised", p.raised), ("rail", p.rail), ("hover", p.hover)] {
+            for (name, bg) in [("surface", p.surface), ("chrome", p.chrome), ("raised", p.raised), ("rail", p.rail), ("hover", p.hover), ("sunken", p.sunken)] {
                 let ratio = contrast(ring, bg);
                 assert!(ratio >= 3., "focus ring on {name}: {ratio:.2} (dark={})", p.dark);
             }
