@@ -8,7 +8,7 @@ use gpui_kit::component::input::InputState;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, TypeScale};
-use crate::ui::{EditMode, FormatViewer, FormatViewerEvent, TruncationState, ViewerSpec};
+use crate::ui::{ApplyBlock, CommitResult, EditMode, FormatViewer, FormatViewerEvent, TruncationState, ViewerSpec};
 use gpui_kit::{
     AnyElement, AppContext as _, ClipboardItem, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render,
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px,
@@ -39,6 +39,8 @@ enum Field {
     StreamId,
     StreamField,
     StreamValue,
+    HashQuery,
+    SetQuery,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -109,6 +111,9 @@ pub struct RedisPane {
     stream_id: String,
     stream_field: String,
     stream_value: String,
+    hash_query: String,
+    set_query: String,
+    stream_focus: Option<usize>,
     string_viewer: Option<Entity<FormatViewer>>,
     string_sub: Option<Subscription>,
     viewer_key: String,
@@ -170,6 +175,9 @@ impl RedisPane {
             stream_id: String::new(),
             stream_field: String::new(),
             stream_value: String::new(),
+            hash_query: String::new(),
+            set_query: String::new(),
+            stream_focus: None,
             string_viewer: None,
             string_sub: None,
             viewer_key: String::new(),
@@ -320,6 +328,9 @@ impl RedisPane {
         self.new_score.clear();
         self.new_overwrite = false;
         self.clear_entry_drafts();
+        self.hash_query.clear();
+        self.set_query.clear();
+        self.stream_focus = None;
         self.string_viewer = None;
         self.string_sub = None;
         self.viewer_key.clear();
@@ -351,10 +362,12 @@ impl RedisPane {
     }
 
     pub fn command(&mut self, id: &str, cx: &mut Context<Self>) {
-        let local = matches!(id, "redis-cancel" | "redis-console" | "redis-view-flat" | "redis-view-tree" | "redis-new-key")
+        let local = matches!(id, "redis-cancel" | "redis-console" | "redis-view-flat" | "redis-view-tree" | "redis-new-key" | "redis-entry-filter")
             || id.starts_with("redis-type-")
             || id.starts_with("redis-history-")
-            || id.starts_with("redis-folder:");
+            || id.starts_with("redis-folder:")
+            || id.starts_with("redis-hash-copy:")
+            || id.starts_with("redis-xopen:");
         if self.busy && !local {
             self.error = self.text("redis.tab.busy");
             self.note.clear();
@@ -427,6 +440,8 @@ impl RedisPane {
             self.ask_hash_set();
         } else if let Some(index) = id.strip_prefix("redis-hash-edit:") {
             self.fill_hash(index);
+        } else if let Some(index) = id.strip_prefix("redis-hash-copy:") {
+            self.copy_hash(index, cx);
         } else if let Some(index) = id.strip_prefix("redis-hash-del:") {
             self.ask_hash_del(index);
         } else if id == "redis-list-lpush" {
@@ -447,6 +462,8 @@ impl RedisPane {
             self.ask_zrem(index);
         } else if id == "redis-xadd" {
             self.ask_xadd();
+        } else if let Some(index) = id.strip_prefix("redis-xopen:") {
+            self.open_stream(index);
         } else if let Some(index) = id.strip_prefix("redis-xdel:") {
             self.ask_xdel(index);
         }
@@ -498,6 +515,7 @@ impl RedisPane {
     fn select_key(&mut self, name: String, cx: &mut Context<Self>) {
         self.selected = name.clone();
         self.detail = None;
+        self.stream_focus = None;
         if self.connection_id.is_empty() {
             self.show_error(self.text("redis.tab.needConnection"));
             return;
@@ -965,8 +983,24 @@ impl RedisPane {
             self.show_error(self.text("redis.tab.needKey"));
             return;
         }
-        let value = self.string_viewer.as_ref().map(|viewer| viewer.read(cx).draft().to_owned()).unwrap_or_default();
-        self.stage_mutation(RedisMutation::SetString { key: self.selected.clone(), value });
+        let Some(viewer) = self.string_viewer.clone() else {
+            self.show_error(self.text("redis.tab.pickKey"));
+            return;
+        };
+        // commit 在 JSON 非法时留下草稿且不发出 Commit，确认条因此不会打开。
+        let result = viewer.update(cx, |viewer, cx| viewer.commit(cx));
+        match result {
+            CommitResult::Applied(value) => {
+                self.stage_mutation(RedisMutation::SetString { key: self.selected.clone(), value });
+            }
+            CommitResult::Blocked { block, .. } => {
+                let message = match block {
+                    ApplyBlock::InvalidJson(error) => i18n::fill(&self.text("mongo.docs.syntaxError"), &[("message", &error.message)]),
+                    _ => self.text("redis.value.none"),
+                };
+                self.show_error(message);
+            }
+        }
     }
 
     fn ask_hash_set(&mut self) {
@@ -1045,6 +1079,22 @@ impl RedisPane {
             return;
         }
         self.stage_mutation(mutation);
+    }
+
+    fn copy_hash(&mut self, index: &str, cx: &mut Context<Self>) {
+        let Ok(index) = index.parse::<usize>() else { return };
+        let Some(RedisKeyDetail { value: RedisValue::Hash { entries }, .. }) = &self.detail else { return };
+        let Some(entry) = entries.get(index) else { return };
+        let text = entry.value.clone();
+        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        self.copied = text;
+        self.error.clear();
+    }
+
+    fn open_stream(&mut self, index: &str) {
+        let Ok(index) = index.parse::<usize>() else { return };
+        self.stream_focus = if self.stream_focus == Some(index) { None } else { Some(index) };
+        self.error.clear();
     }
 
     fn fill_hash(&mut self, index: &str) {
@@ -1747,9 +1797,12 @@ impl RedisPane {
                     .into_any_element()
             }
             RedisValue::Hash { entries } => {
+                let query = self.redis_input(Field::HashQuery, "redis-hash-filter", "redis.value.field", "", window, cx);
                 let field = self.redis_input(Field::EntryField, "redis-hash-field", "redis.value.field", "field", window, cx);
                 let entry_value = self.redis_input(Field::EntryValue, "redis-hash-value", "redis.value.value", "value", window, cx);
+                let needle = self.hash_query.trim().to_ascii_lowercase();
                 let mut body = div().flex().flex_col().gap(px(pad));
+                body = body.child(kit::text_input("redis-hash-filter", &query, self.text("redis.tab.filter")).small().prefix(kit::icon(IconName::Search, 13., p.text_faint)));
                 body = body.child(
                     div()
                         .flex()
@@ -1759,6 +1812,9 @@ impl RedisPane {
                         .child(redis_button("redis-hash-add", Some(IconName::Plus), &self.text("redis.hash.add"), Kind::Primary, entity)),
                 );
                 for (index, entry) in entries.iter().enumerate() {
+                    if !needle.is_empty() && !entry.field.to_ascii_lowercase().contains(&needle) {
+                        continue;
+                    }
                     body = body.child(
                         div()
                             .flex()
@@ -1766,6 +1822,7 @@ impl RedisPane {
                             .gap(px(pad))
                             .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).child(SharedString::from(entry.field.clone())))
                             .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).child(SharedString::from(entry.value.clone())))
+                            .child(row_button(format!("redis-hash-copy:{index}"), IconName::Copy, self.text("common.copy"), entity))
                             .child(row_button(format!("redis-hash-edit:{index}"), IconName::Pencil, self.text("redis.hash.add"), entity))
                             .child(row_button(format!("redis-hash-del:{index}"), IconName::Trash, self.text("redis.hash.delete"), entity)),
                     );
@@ -1797,8 +1854,11 @@ impl RedisPane {
                 body.into_any_element()
             }
             RedisValue::Set { items } => {
+                let query = self.redis_input(Field::SetQuery, "redis-set-filter", "redis.value.member", "", window, cx);
                 let member = self.redis_input(Field::EntryMember, "redis-set-member", "redis.value.member", "member", window, cx);
-                let mut body = div().flex().flex_col().gap(px(pad)).child(
+                let needle = self.set_query.trim().to_ascii_lowercase();
+                let mut body = div().flex().flex_col().gap(px(pad)).child(kit::text_input("redis-set-filter", &query, self.text("redis.tab.filter")).small().prefix(kit::icon(IconName::Search, 13., p.text_faint)));
+                body = body.child(
                     div()
                         .flex()
                         .gap(px(pad))
@@ -1806,6 +1866,9 @@ impl RedisPane {
                         .child(redis_button("redis-set-add", Some(IconName::Plus), &self.text("redis.set.add"), Kind::Primary, entity)),
                 );
                 for (index, item) in items.iter().enumerate() {
+                    if !needle.is_empty() && !item.to_ascii_lowercase().contains(&needle) {
+                        continue;
+                    }
                     body = body.child(
                         div()
                             .flex()
@@ -1854,17 +1917,36 @@ impl RedisPane {
                         .child(div().flex_1().child(kit::text_input("redis-stream-value", &entry_value, self.text("redis.value.value")).small()))
                         .child(redis_button("redis-xadd", Some(IconName::Plus), &self.text("redis.stream.add"), Kind::Primary, entity)),
                 );
+                let focus = self.stream_focus;
                 for (index, message) in messages.iter().enumerate() {
                     let summary = message.fields.iter().map(|field| format!("{}={}", field.field, field.value)).collect::<Vec<_>>().join(" ");
-                    body = body.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(pad))
-                            .child(div().flex_none().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(message.id.clone())))
-                            .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).child(SharedString::from(summary)))
-                            .child(row_button(format!("redis-xdel:{index}"), IconName::Trash, self.text("redis.stream.delete"), entity)),
-                    );
+                    let mut row = div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(pad))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(pad))
+                                .child(div().flex_none().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(message.id.clone())))
+                                .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).child(SharedString::from(summary)))
+                                .child(row_button(format!("redis-xopen:{index}"), IconName::Eye, self.text("mongo.tab.view"), entity))
+                                .child(row_button(format!("redis-xdel:{index}"), IconName::Trash, self.text("redis.stream.delete"), entity)),
+                        );
+                    if focus == Some(index) {
+                        for field in &message.fields {
+                            row = row.child(
+                                div()
+                                    .flex()
+                                    .gap(px(pad))
+                                    .pl(px(pad))
+                                    .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).child(SharedString::from(field.field.clone())))
+                                    .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::SM)).child(SharedString::from(field.value.clone()))),
+                            );
+                        }
+                    }
+                    body = body.child(row);
                 }
                 body.into_any_element()
             }
@@ -1891,6 +1973,8 @@ impl RedisPane {
             Field::StreamId => self.stream_id.clone(),
             Field::StreamField => self.stream_field.clone(),
             Field::StreamValue => self.stream_value.clone(),
+            Field::HashQuery => self.hash_query.clone(),
+            Field::SetQuery => self.set_query.clone(),
         };
         let _ = label_key;
         self.fields.bind_enter(
@@ -1926,6 +2010,8 @@ impl RedisPane {
                     Field::StreamId => this.stream_id = value,
                     Field::StreamField => this.stream_field = value,
                     Field::StreamValue => this.stream_value = value,
+                    Field::HashQuery => this.hash_query = value,
+                    Field::SetQuery => this.set_query = value,
                 }
             },
             Some(|this: &mut Self, field, cx| {
@@ -1951,6 +2037,7 @@ impl RedisPane {
                     }
                     Field::EntryIndex => "redis-list-rpush",
                     Field::StreamId | Field::StreamField | Field::StreamValue => "redis-xadd",
+                    Field::HashQuery | Field::SetQuery => "redis-entry-filter",
                 };
                 this.command(id, cx);
             }),
