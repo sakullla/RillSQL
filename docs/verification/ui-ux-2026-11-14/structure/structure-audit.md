@@ -20,12 +20,21 @@
 
 | # | 本次之前 | 本次改动 | 对应 |
 | --- | --- | --- | --- |
-| 1 | 读取中：`loading_state` 整块转圈 | 首屏读取改用 `kit::skeleton_state(6, …)`：按当前密度排 6 行骨架，读到数据后换真实行；不再用整块转圈盖住卡片 | S12.4 / R4 |
+| 1 | 读取中：`loading_state` 整块转圈，且只对列表页签生效 | 首屏读取改用 `kit::skeleton_state(6, …)`：按当前密度排 6 行骨架，读到数据后换真实行；不再用整块转圈盖住卡片 | S12.4 / R4 |
 | 2 | 读取失败：`div().p(16).text_color(danger)` 一行裸文字，没有下一步 | `kit::error_state_with_action` + `重试` 按钮（`structure-retry`）：重试清掉 `load_error`/`loaded_for` 后重新读取，**不清用户草稿** | S8.5「对象读取失败（带重试）」 |
 | 3 | 没有快照时：`ui.structure.none` 一行弱文字 | 按页签给 `kit::empty_state`：字段/索引/外键各自的"还没有…"与下一步说明；定义类页签给"这个对象没有可显示的 SQL 定义" | S8.5「无行与无命中文案不同」 |
 | 4 | 读取中/失败时仍然渲染新增表单与预览按钮，用户可以先点一个注定失败的操作 | `form_visible()`：加载中或失败时不渲染新增表单，也不渲染主操作栏；先看状态与重试 | R3 四态一致 |
+| 5 | 三态判定一度只落在列表页签里：视图 / DDL / 危险操作页签上读取失败会退化成"这个对象没有可显示的 SQL 定义"（无原因、无重试），读取中还会先闪这句错话 | `overview()` 把 加载 → 失败 → 空 → 内容 的判定提到页签分支之前，由同一个 `list_state` 决定；列表页签的"空"看行数，定义类页签的"空"看 `has_definition()`（DDL 页签用重建定义，所以与 `table_sql` 是否为空不完全一致）。失败态统一由 `load_error_state()` 给原因 + 重试 | R3 / S8.5；回归 `definition_tabs_share_the_loading_and_load_failure_states` |
 
-判定集中在 `list_state(loading, error, rows)`：加载优先于错误，错误优先于空态；`empty_lists_have_no_header_and_loading_wins_over_error` 反向钉住。
+判定集中在 `list_state(loading, error, rows)`：加载优先于错误，错误优先于空态；`empty_lists_have_no_header_and_loading_wins_over_error` 反向钉住，`definition_tabs_share_the_loading_and_load_failure_states` 钉住"所有页签同一套三态"。
+
+### 文案键必须真的存在
+
+`i18n::text` 对未知键原样返回键名，而字典自测只从"键→语言"方向检查，抓不到"用了不存在的键"。
+本页曾经把 `structure.error.retry`（字典里没有）直接显示成"structure.error.retry"，因此：
+读取失败的重试按钮改用既有的 `common.retry`，并新增 `every_structure_copy_key_used_in_the_source_exists_in_the_catalog`
+反向扫描本文件里所有 `structure.* / ui.structure.* / common.* / admin.* / catalog.*` 形式的字符串字面量，逐个要求出现在 `i18n::catalog_keys()` 里。
+该用例在把坏键临时写回源码时会失败（已实测：报 `"structure.error.retry" 被当作文案键使用，但字典里没有它`），恢复后通过。
 
 ## 3. 主操作可达（R6 三档宽度）
 

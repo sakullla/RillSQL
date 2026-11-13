@@ -1,14 +1,16 @@
 # 测试与命令回执（T9）
 
-全部命令在仓库工作区（HEAD `778b98d` + 本任务改动）上于 2026-11-14 实际执行。
+全部命令在仓库工作区（HEAD `c1d0781` + 本任务改动）上于 2026-11-14 实际执行。
+本文件的"修复轮次"记录：第一轮完成初版后，独立审查提出两条 P2（`structure.error.retry` 键不存在、加载/失败态没有覆盖定义类页签），
+已在同一天修复并补了两条防回归用例（见第 2 节最后两行与第 5.1 节）。
 
 ## 1. 正式命令
 
 | 命令 | 结果 |
 | --- | --- |
-| `cargo test --manifest-path src-tauri/Cargo.toml --locked app::views::structure` | 通过：**16 passed / 0 failed**（894 filtered out），含 8 个本任务新增用例 |
-| `cargo test --manifest-path src-tauri/Cargo.toml --locked` | 通过：lib **903 passed / 0 failed / 7 ignored**（23.89s）；main 0；rillsql-package 1 passed |
-| `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked` | 通过（exit 0）：34 条 warning，与 T1 记录的既有 34 条同量；本文件只有 1 条且是既有代码（`mod.rs:1951` 的 `unwrap_or_else(Vec::new)`，HEAD 已存在） |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked app::views::structure` | 通过：**18 passed / 0 failed**（917 filtered out），含 10 个本任务新增用例 |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked`（03:53 复跑） | 完成：**926 passed / 4 failed / 7 ignored**（42.81s，exit 101）。4 条失败全部在本任务范围之外，均在 `app::shell`：`conn_modal::tests::tab_order_stays_inside_the_modal_and_wraps`、`tests::density_theme_and_language_reach_the_rendered_chrome`、`tests::long_copy_is_truncated_but_fully_available_and_never_holds_neighbours`、`tests::sidebar_copy_and_test_remain_usable_while_catalog_is_loading`（连接模态批次在写的工作）。**structure 模块 0 失败** |
+| `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked` | 通过（exit 0）：44 条 warning（T1 基线为 34 条，差额来自本轮其它批次新增的代码）；本文件仍只有 1 条，且是既有代码（`mod.rs` 的 `unwrap_or_else(Vec::new)`，HEAD 已存在） |
 | `git diff --exit-code -- src-tauri/Cargo.toml src-tauri/Cargo.lock` | 通过（exit 0），Cargo 依赖未变 |
 
 按计划，这三条由 Delivery Owner 在集成后的同一 candidate 上重跑；本回执只证明本任务范围内通过。
@@ -25,6 +27,8 @@
 | `row_menu_actions_only_edit_the_draft_and_never_execute` | 字段行菜单项内容（复制名称 / 标记删除）；复制只写剪贴板；标记删除与取消标记只改草稿，不打开预览、不进入可执行状态 | 模型 + 剪贴板 |
 | `empty_index_list_replaces_the_table_with_an_empty_state` | 空索引列表渲染后**没有 `structure-table-head`**、出现 `empty-state` 块、没有占位行——"不再以表头加破折号代替空态"的渲染级证据 | headless 布局级 |
 | `structure_lists_follow_density_in_both_themes` | 浅色/深色 × 紧凑/标准 四种组合下：行高与表头高都等于 `Metrics::row_h`（26/32），主操作仍在位（主题只换配色，几何只随密度变） | headless 布局级（缺像素） |
+| `definition_tabs_share_the_loading_and_load_failure_states` | DDL / 危险操作 / 视图页签：读取中给骨架（不闪"没有可显示的 SQL 定义"）、读取失败给错误态 + 可点重试、重试清掉失败原因；重试按钮的无障碍名是"重试"（翻译过的文案，不是键名） | headless 布局级 |
+| `every_structure_copy_key_used_in_the_source_exists_in_the_catalog` | 反向扫描本文件所有 `structure.* / ui.structure.* / common.* / admin.* / catalog.*` 字符串字面量，要求都存在于 `i18n::catalog_keys()`；把坏的 `structure.error.retry` 写回源码时该用例实测失败 | 源码级（防回归扫描） |
 
 ## 3. 回归相关的既有用例（本文件内，全部通过）
 
@@ -48,6 +52,15 @@
 - **7 个 ignored 用例**：均为既有 fixture/基准用例（与 T1 回执列出的同一批），本轮未运行、环境不要求，不计作通过。
 - **MySQL/PostgreSQL/MariaDB 容器**：本任务不涉及连接行为，未启动。
 - **ContextMenu 弹层的渲染级用例**：headless 测试窗口里库的 `ContextMenu` 不展开（它用 `hitbox.is_hovered` 判定按下是否属于自己，无真实指针时恒为假），因此右键菜单只验证"菜单项 + 动作语义"，行本身的渲染与行高由布局级用例覆盖。
+
+## 5.1 全量回执的当前状态（如实记录）
+
+本任务范围内全绿（`app::views::structure` 18 passed / 0 failed）。crate 级全量**能跑完但当前不是全绿**，失败全部来自并行批次：
+
+- 03:22–03:50 期间 `app::views::diagram::tests::four_states_and_keyboard_hold_at_three_widths_and_both_themes`（T10 新增）在一个只跑它的进程里持续 28 分钟未结束（"挂住"而非"慢"），我的全量跑卡在它上面只能终止（EXIT=143）；该用例后来被 T10 修好（03:53 的全量跑 42.81s 完成，包含它）。
+- 03:53 的完整全量：926 passed / 4 failed / 7 ignored，4 条失败全在 `app::shell`（连接模态批次在写），见第 1 节表格。
+- 早前基线（c1d0781 + 本任务初版）全量是 903 passed / 0 failed，说明本任务改动没有引入全局回归；当前失败来自其它批次正在写的工作。
+- 结论：crate 级全绿回执由 Delivery 在集成 candidate 上重跑；本目录不把它记为通过。
 
 ## 6. 过程中事实（与结论分开记录）
 

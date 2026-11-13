@@ -1180,39 +1180,37 @@ impl StructurePane {
     }
 
     /// “当前结构”卡片：列表走统一的加载/失败/空/有行四态；空列表不再画表头加破折号冒充空态。
+    /// “当前结构”卡片：加载 / 读取失败 / 空 / 有内容四态对**所有页签**同一套判定。
+    /// 列表页签的"空"看行数，定义类页签（视图 / DDL / 危险操作）的"空"看有没有 SQL 定义——
+    /// 读取失败不能退化成"这个对象没有可显示的 SQL 定义"，那样既没原因也没有重试入口。
     fn overview(&self, entity: &Entity<StructurePane>, p: &Palette, cx: &App) -> AnyElement {
         let locale = self.session.locale;
         let metrics = kit::Metrics::of(cx);
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
         let section = self.session.section;
-        if matches!(section, Section::Columns | Section::Indexes | Section::ForeignKeys) {
-            match list_state(self.loading, &self.load_error, self.list_len(section)) {
-                ListState::Loading => return kit::skeleton_state(6, &metrics, p).into_any_element(),
-                ListState::Error => {
-                    let owner = entity.clone();
-                    let retry = kit::secondary_button("structure-retry", None, t("structure.error.retry"), move |_, _, cx| {
-                        owner.update(cx, |pane, cx| pane.retry_load(cx));
-                    })
-                    .into_any_element();
-                    return kit::error_state_with_action(t("structure.error.heading"), SharedString::from(self.load_error_text()), retry, p).into_any_element();
-                }
-                ListState::Empty => {
-                    let (icon, heading, detail) = match section {
-                        Section::Indexes => (IconName::Hash, "structure.empty.indexes", "structure.empty.indexesHint"),
-                        Section::ForeignKeys => (IconName::Key, "structure.empty.foreignKeys", "structure.empty.foreignKeysHint"),
-                        _ => (IconName::Table, "structure.empty.columns", "structure.empty.columnsHint"),
-                    };
-                    return kit::empty_state(icon, t(heading), t(detail), p).into_any_element();
-                }
-                ListState::Rows => {}
+        let list = matches!(section, Section::Columns | Section::Indexes | Section::ForeignKeys);
+        let rows = if list { self.list_len(section) } else { usize::from(self.has_definition()) };
+        match list_state(self.loading, &self.load_error, rows) {
+            ListState::Loading => return kit::skeleton_state(6, &metrics, p).into_any_element(),
+            ListState::Error => return self.load_error_state(entity, p, locale),
+            ListState::Empty if !list => {
+                return kit::empty_state(IconName::Braces, t("ui.structure.none"), t("structure.empty.definition"), p).into_any_element()
             }
+            ListState::Empty => {
+                let (icon, heading, detail) = match section {
+                    Section::Indexes => (IconName::Hash, "structure.empty.indexes", "structure.empty.indexesHint"),
+                    Section::ForeignKeys => (IconName::Key, "structure.empty.foreignKeys", "structure.empty.foreignKeysHint"),
+                    _ => (IconName::Table, "structure.empty.columns", "structure.empty.columnsHint"),
+                };
+                return kit::empty_state(icon, t(heading), t(detail), p).into_any_element();
+            }
+            ListState::Rows => {}
+        }
+        if list {
             return self.list_card(entity, section, p, cx);
         }
         // 视图 / DDL / 危险操作页签：显示对象的 SQL 定义（重建定义与 DDL 页签一致）。
         let (sql, _missing) = self.snapshot.as_ref().map(definition_text).unwrap_or((String::new(), Vec::new()));
-        if sql.trim().is_empty() {
-            return kit::empty_state(IconName::Braces, t("ui.structure.none"), t("structure.empty.definition"), p).into_any_element();
-        }
         div()
             .id("structure-definition")
             .max_h(px(260.))
@@ -1223,6 +1221,27 @@ impl StructurePane {
             .text_color(p.text_muted)
             .child(SharedString::from(sql))
             .into_any_element()
+    }
+
+    /// 读取失败的统一呈现：原因 + 重试（重试不清用户草稿）。所有页签共用同一块。
+    fn load_error_state(&self, entity: &Entity<StructurePane>, p: &Palette, locale: Locale) -> AnyElement {
+        let owner = entity.clone();
+        let retry = kit::secondary_button("structure-retry", None, SharedString::from(i18n::text(locale, "common.retry")), move |_, _, cx| {
+            owner.update(cx, |pane, cx| pane.retry_load(cx));
+        })
+        .into_any_element();
+        kit::error_state_with_action(
+            SharedString::from(i18n::text(locale, "structure.error.heading")),
+            SharedString::from(self.load_error_text()),
+            retry,
+            p,
+        )
+        .into_any_element()
+    }
+
+    /// 定义类页签有没有可显示的定义（DDL 页签会用重建定义，所以与 table_sql 是否为空不完全一致）。
+    fn has_definition(&self) -> bool {
+        self.snapshot.as_ref().map(|snapshot| !definition_text(snapshot).0.trim().is_empty()).unwrap_or(false)
     }
 
     /// 有行时的列表：表头与行共用 TableSpec；行带右键菜单，菜单项仍只改草稿，要预览确认才执行。
@@ -1499,7 +1518,7 @@ async fn load_fk_choices(service: &crate::connections::Service, target: &GridTar
 
 /// 列表一行：单元格、右键菜单与“已标记删除”的淡化状态。
 struct RowSpec {
-    /// 行 id 片段（\`columns-0\` 之类），行的元素 id 是 \`structure-row-{id}\`。
+    /// 行 id 片段（`columns-0` 之类），行的元素 id 是 `structure-row-{id}`。
     id: String,
     dim: bool,
     cells: Vec<AnyElement>,
@@ -1590,7 +1609,7 @@ fn row_menu(entity: &Entity<StructurePane>, entries: &[MenuEntry], mut menu: Pop
     menu
 }
 
-/// 菜单项带稳定 id（\`structure-menu-{id}\`），禁用项留在菜单里并说明原因。
+/// 菜单项带稳定 id（`structure-menu-{id}`），禁用项留在菜单里并说明原因。
 fn menu_entry(entity: &Entity<StructurePane>, entry: &MenuEntry) -> PopupMenuItem {
     let owner = entity.downgrade();
     let element_id = SharedString::from(format!("structure-menu-{}", entry.id));
@@ -3046,7 +3065,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 浅/深色 × 紧凑/标准：行高与表头高随密度取 \`row_h\`，主题只换配色，主操作与空态位置不变（S9 / S12.2）。
+    /// 浅/深色 × 紧凑/标准：行高与表头高随密度取 `row_h`，主题只换配色，主操作与空态位置不变（S9 / S12.2）。
     #[gpui_kit::test]
     fn structure_lists_follow_density_in_both_themes(cx: &mut gpui_kit::TestAppContext) {
         use gpui_kit::test::TestWindowExt;
@@ -3186,6 +3205,137 @@ mod tests {
             f32::from(body.size.height) < f32::from(dialog.size.height),
             "正文与页脚分工：正文滚动，页脚固定"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 源码里出现的每一个结构页文案键都要在字典里。
+    ///
+    /// \`i18n::text\` 对未知键原样返回键名（曾把 \`structure.error.retry\` 这个不存在的键直接显示到两种语言里），
+    /// 而 \`i18n\` 自己的测试只从"键→语言"方向检查，抓不到"用了不存在的键"。这里反向扫描本文件。
+    #[test]
+    fn every_structure_copy_key_used_in_the_source_exists_in_the_catalog() {
+        let catalog = i18n::catalog_keys();
+        let prefixes = ["structure.", "ui.structure.", "common.", "admin.", "catalog."];
+        let mut checked = 0;
+        for literal in string_literals(include_str!("mod.rs")) {
+            if prefixes.contains(&literal.as_str()) || !prefixes.iter().any(|prefix| literal.starts_with(prefix)) {
+                continue;
+            }
+            // 元素 id 用连字符（structure-row-…），键用点号；带占位符或空格的不是文案键。
+            if literal.contains('{') || literal.contains(' ') {
+                continue;
+            }
+            assert!(catalog.contains(&literal.as_str()), "{literal:?} 被当作文案键使用，但字典里没有它");
+            checked += 1;
+        }
+        assert!(checked >= 20, "只扫到 {checked} 个文案键，扫描本身可能失效了");
+    }
+
+    /// 取出源码里的所有双引号字符串字面量（跳过 \`\\"\` 转义）。
+    fn string_literals(source: &str) -> Vec<String> {
+        let mut literals = Vec::new();
+        let mut chars = source.chars();
+        while let Some(ch) = chars.next() {
+            if ch != '"' {
+                continue;
+            }
+            let mut literal = String::new();
+            let mut escaped = false;
+            for inner in chars.by_ref() {
+                if escaped {
+                    escaped = false;
+                    literal.push(inner);
+                    continue;
+                }
+                match inner {
+                    '\\' => escaped = true,
+                    '"' => break,
+                    _ => literal.push(inner),
+                }
+            }
+            literals.push(literal);
+        }
+        literals
+    }
+
+    /// 读取失败与读取中在定义类页签（DDL / 危险操作）也要给原因、重试与骨架，
+    /// 不能退化成"这个对象没有可显示的 SQL 定义"。
+    #[gpui_kit::test]
+    fn definition_tabs_share_the_loading_and_load_failure_states(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        use gpui_kit::AppContext as _;
+        let (services, dir) = offline_services("definition-tabs");
+        cx.update(gpui_kit::init);
+        for section in [Section::Ddl, Section::Danger, Section::View] {
+            // 读取中：骨架，不是空态文案。
+            let (window, _pane) = cx.update(|cx| {
+                let bounds = gpui_kit::Bounds {
+                    origin: gpui_kit::Point::default(),
+                    size: gpui_kit::size(gpui_kit::px(900.), gpui_kit::px(900.)),
+                };
+                gpui_kit::open_window(
+                    gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+                    cx,
+                    |_window, cx| {
+                        cx.new(|_| {
+                            let mut pane = pane_with_snapshot(services.clone(), 2);
+                            pane.session.section = section;
+                            pane.snapshot = None;
+                            pane.loading = true;
+                            pane
+                        })
+                    },
+                )
+                .expect("structure pane")
+            });
+            let (skeleton, empty) = cx
+                .update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    (window.try_find("skeleton-state").map(|block| block.visible()), window.try_find("empty-state").is_some())
+                })
+                .unwrap();
+            assert_eq!(skeleton, Some(true), "{section:?}: 读取中要给骨架");
+            assert!(!empty, "{section:?}: 读取中不能闪「没有可显示的 SQL 定义」");
+
+            // 读取失败：错误态 + 可点的重试，按钮文案是翻译过的（不是键名）。
+            let (window, pane) = cx.update(|cx| {
+                let bounds = gpui_kit::Bounds {
+                    origin: gpui_kit::Point::default(),
+                    size: gpui_kit::size(gpui_kit::px(900.), gpui_kit::px(900.)),
+                };
+                gpui_kit::open_window(
+                    gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+                    cx,
+                    |_window, cx| {
+                        cx.new(|_| {
+                            let mut pane = pane_with_snapshot(services.clone(), 2);
+                            pane.session.section = section;
+                            pane.snapshot = None;
+                            pane.load_error = "找不到表或视图 orders".to_owned();
+                            pane
+                        })
+                    },
+                )
+                .expect("structure pane")
+            });
+            let (error, empty, label, detail) = cx
+                .update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    (
+                        window.try_find("error-state").map(|block| block.visible()),
+                        window.try_find("empty-state").is_some(),
+                        window.find("structure-retry").label().map(str::to_owned),
+                        window.find("error-state-detail").label().map(str::to_owned),
+                    )
+                })
+                .unwrap();
+            assert_eq!(error, Some(true), "{section:?}: 读取失败要给错误态");
+            assert!(!empty, "{section:?}: 读取失败不能退化成「没有可显示的 SQL 定义」");
+            assert_eq!(label.as_deref(), Some("重试"), "{section:?}: 重试按钮文案要翻译过，不能是键名");
+            assert!(detail.is_none() || detail.as_deref() != Some("structure.empty.definition"));
+            cx.update_window(window, |_, window, cx| window.click("structure-retry", cx)).unwrap();
+            assert!(cx.update(|cx| pane.read(cx).load_error_text().is_empty()), "{section:?}: 重试要清掉失败原因");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

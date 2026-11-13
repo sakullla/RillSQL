@@ -642,6 +642,9 @@ dict! {
     "diagram.needTarget" => "先选择已连接的库或 schema，再打开关系图。", "Choose a connected database or schema before opening the diagram.";
     "diagram.unsupported" => "这个引擎没有关系图。", "This engine has no relationship diagram.";
     "diagram.empty" => "当前范围没有表", "No tables in the current scope";
+    "diagram.emptyDetail" => "这个范围里还没有表。新建表后重新读取，卡片会出现在这里。", "No tables in this scope yet. Create a table, then read again to see its card.";
+    "diagram.searchNoMatch" => "没有匹配的表", "No table matches";
+    "diagram.searchClear" => "清除搜索", "Clear search";
     "redis.open" => "键空间", "Keyspace";
     "redis.tab.filter" => "过滤", "Filter";
     "redis.tab.refresh" => "刷新", "Refresh";
