@@ -677,14 +677,30 @@ impl WorkbenchModel {
                 self.notice_detail.clear();
             }
             "conn-test" => {
-                if self.connections.selected.is_some() {
-                    if self.shell.page != AppPage::Connections || self.connections.editor.as_ref().and_then(|draft| draft.id.as_deref()) != self.connections.selected.as_deref() { self.connections.edit_selected(); }
+                // 测试屏幕上的草稿：新建未保存的表单也能测，编辑已有连接时测的是改动后的字段。
+                // 没有打开的表单时先按列表选中行载入，避免菜单/右键点了没反应。
+                if self.connections.editor.is_none() {
+                    self.connections.edit_selected();
+                }
+                if self.connections.editor.is_some() {
                     self.shell.page = AppPage::Connections;
-                    self.connections.message_key = Some("connections.editor.test.running");
                     self.connections.message_detail.clear();
-                    self.notice_key = self.connections.message_key;
                     self.notice_detail.clear();
-                    self.enqueue(PendingJob::TestConnection);
+                    // 字段本身不合法就不发请求：错误落在字段旁，不必等一次必然失败的探测。
+                    self.connections.issues = self.connections.validate();
+                    match self.connections.issues.first() {
+                        Some(issue) => {
+                            self.connections.message_key = None;
+                            self.notice_key = Some(issue.key);
+                        }
+                        None => {
+                            self.connections.message_key = Some("connections.editor.test.running");
+                            self.notice_key = self.connections.message_key;
+                            self.enqueue(PendingJob::TestConnection);
+                        }
+                    }
+                } else {
+                    self.notice_key = Some("connections.editor.test.button");
                 }
             }
             "conn-connect" | "conn-open" => {
@@ -3256,9 +3272,13 @@ impl WorkbenchModel {
     pub fn set_field(&mut self, field: DraftField, value: String) {
         self.focused_field = Some(field);
         match field {
-            DraftField::Password => self.connections.secrets.password = value,
+            DraftField::Password => {
+                self.connections.secrets.password = value;
+                self.connections.clear_issue("password");
+            }
             DraftField::SshPassword => {
                 self.connections.secrets.ssh_password = value.clone();
+                self.connections.clear_issue("ssh_password");
                 if !value.trim().is_empty() {
                     if let Some(draft) = self.connections.editor.as_mut() {
                         draft.ssh_auth = SshAuthKind::Password;
@@ -3295,6 +3315,9 @@ impl WorkbenchModel {
                     if other == DraftField::CaFile && !draft.ca_file.trim().is_empty() {
                         draft.ca_mode = CaMode::File;
                     }
+                }
+                if let Some(name) = issue_field(other) {
+                    self.connections.clear_issue(name);
                 }
             }
         }
@@ -3604,6 +3627,23 @@ fn field_slot(draft: &mut crate::connections::model::ConnectionDraft, field: Dra
         DraftField::SshKey => &mut draft.ssh_key,
         DraftField::Replica => &mut draft.replica_set,
         _ => &mut draft.name,
+    }
+}
+
+/// 草稿字段对应的校验字段名，与 connections::validate_draft 里的 field 字符串一致。
+/// 没有校验规则的字段返回 None：改它不需要清错误。
+fn issue_field(field: DraftField) -> Option<&'static str> {
+    match field {
+        DraftField::Host => Some("host"),
+        DraftField::Port => Some("port"),
+        DraftField::Database => Some("database"),
+        DraftField::Username => Some("username"),
+        DraftField::File => Some("file_path"),
+        DraftField::CaFile => Some("ca_file"),
+        DraftField::SshHost => Some("ssh_host"),
+        DraftField::SshPort => Some("ssh_port"),
+        DraftField::SshUser => Some("ssh_user"),
+        _ => None,
     }
 }
 

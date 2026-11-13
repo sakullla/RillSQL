@@ -866,6 +866,88 @@ impl Service {
             Some(ssh) => store.host_key(&ssh.host, ssh.port).await.map_err(db_err)?,
             None => None,
         };
+        self.run_attempt(ProbeRequest {
+            session_id: id.to_owned(),
+            pending_key: Some(id.to_owned()),
+            config,
+            saved_fingerprint,
+            input,
+            open,
+            epoch,
+        })
+        .await
+    }
+
+    /// 对候选草稿执行测试：不要求先保存，不写连接配置，也不更新最近使用时间。
+    /// 编辑已有连接时测的是屏幕上的字段，而不是这个 id 在配置库里的旧值（R6/ADR-3）。
+    pub async fn test_candidate(&self, draft: ConnectionDraft, input: SecretInput) -> Result<TestReport, String> {
+        let store = self.store().await?;
+        let saved_id = draft.id.clone().filter(|id| !id.trim().is_empty());
+        // 未保存的草稿也需要一个探测用的会话键，但它不会进配置库，也不会进会话表。
+        let scan_id = saved_id.clone().unwrap_or_else(|| format!("draft-{}", uuid::Uuid::new_v4()));
+        let mut config = crate::connections::model::normalize(&draft, scan_id.clone())
+            .map_err(|errors| ServiceError::Fields(errors).message())?;
+        // 复用已保存机密的条件与保存路径一致：只有这个草稿仍要保存密码时才沿用旧机密。
+        if let Some(saved_id) = &saved_id {
+            if let Some(stored) = store.get(saved_id).await.map_err(db_err)? {
+                let keep = draft.save_password;
+                config.password_saved = keep && stored.password_saved;
+                config.ssh_password_saved = keep
+                    && stored.ssh_password_saved
+                    && config.ssh.as_ref().is_some_and(|ssh| ssh.auth == SshAuthKind::Password);
+            }
+        }
+        let saved_fingerprint = match &config.ssh {
+            Some(ssh) => store.host_key(&ssh.host, ssh.port).await.map_err(db_err)?,
+            None => None,
+        };
+        // open=false：不建会话、不改会话表，所以不会写最近使用时间。
+        let outcome = self
+            .run_attempt(ProbeRequest {
+                session_id: scan_id,
+                pending_key: saved_id,
+                config,
+                saved_fingerprint,
+                input,
+                open: false,
+                epoch: None,
+            })
+            .await?;
+        Ok(outcome.report)
+    }
+
+    /// 最近成功打开的连接 id，最新在前。从未打开过的连接不出现，已删除连接的用量按当前列表过滤掉。
+    pub async fn recent_ids(&self, limit: usize) -> Result<Vec<String>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let store = self.store().await?;
+        let existing = store.list().await.map_err(db_err)?;
+        let mut ids = Vec::new();
+        for (id, _) in store.last_used().await.map_err(db_err)? {
+            if existing.iter().any(|row| row.id == id) {
+                ids.push(id);
+            }
+            if ids.len() >= limit {
+                break;
+            }
+        }
+        Ok(ids)
+    }
+
+    /// 走一遍分阶段探测。会话键、待确认主机密钥的归属、候选配置与本次机密都在请求里；
+    /// `open=false`（测试草稿）从不改会话表，也不写最近使用时间。
+    async fn run_attempt(&self, request: ProbeRequest) -> Result<OpenOutcome, String> {
+        let ProbeRequest {
+            session_id,
+            pending_key,
+            config,
+            saved_fingerprint,
+            input,
+            open,
+            epoch,
+        } = request;
+        let session_id = session_id.as_str();
         let password = self.resolve_secret(&password_account(&config.id), input.password.as_ref(), config.password_saved);
         let ssh_password = self.resolve_secret(
             &ssh_password_account(&config.id),
@@ -899,9 +981,11 @@ impl Service {
         };
         let report = stages::execute_stages(&stages, &mut attempt).await;
         if report.status == TestStatus::Wait {
-            if let (Some(ssh), Some(fingerprint), Some(algorithm)) = (&config.ssh, &report.fingerprint, &report.algorithm) {
+            if let (Some(key), Some(ssh), Some(fingerprint), Some(algorithm)) =
+                (pending_key, &config.ssh, &report.fingerprint, &report.algorithm)
+            {
                 self.pending.lock().expect("pending").insert(
-                    id.to_owned(),
+                    key,
                     PendingHostKey {
                         host: ssh.host.clone(),
                         port: ssh.port,
@@ -914,10 +998,11 @@ impl Service {
         self.log(format!("测试 {} 结束", config.name));
         let connected = open && report.status == TestStatus::Ok;
         let foreign_keys = attempt.foreign_keys;
+        let mut opened = false;
         if connected {
             // 提交会话与断开操作使用同一把短锁；迟到握手不能恢复已断开/被更新的会话。
             let epochs = self.operation_epochs.lock().expect("connection epochs");
-            if epochs.get(id).copied() != epoch { return Err("连接请求已过期，没有替换当前会话。".to_owned()); }
+            if epochs.get(session_id).copied() != epoch { return Err("连接请求已过期，没有替换当前会话。".to_owned()); }
             let kind = if let Some(pool) = attempt.sqlite_pool.take() {
                 SessionKind::Sqlite(pool)
             } else if let Some(pool) = attempt.mysql_pool.take() {
@@ -937,7 +1022,7 @@ impl Service {
             let mut cancel = attempt.cancel.clone();
             cancel.attach_health(Arc::clone(&health));
             self.sessions.lock().expect("sessions").insert(
-                id.to_owned(),
+                session_id.to_owned(),
                 Session {
                     kind,
                     shutdown: attempt.shutdown.take(),
@@ -947,7 +1032,19 @@ impl Service {
                 },
             );
             // 新会话（手动打开或自动重连成功）都视为健康，旧的自动重连计划作废。
-            self.reconnects.lock().expect("reconnects").remove(id);
+            self.reconnects.lock().expect("reconnects").remove(session_id);
+            opened = true;
+        }
+        if opened {
+            // 只有真的打开了会话才记最近使用时间：保存连接、测试草稿都不写这一行。
+            match self.store().await {
+                Ok(store) => {
+                    if let Err(err) = store.touch_last_used(session_id, now_millis()).await {
+                        self.log(format!("最近使用时间没有写入：{err}"));
+                    }
+                }
+                Err(err) => self.log(err),
+            }
         }
         Ok(OpenOutcome {
             report,
@@ -1421,6 +1518,14 @@ fn db_err(err: sqlx::Error) -> String {
     format!("连接配置读写失败：{err}")
 }
 
+/// 最近使用时间的唯一取值方式：UTC 毫秒。只用于排序，不呈现成本地时间字符串。
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 fn decision_error(decision: HostKeyDecision) -> StageError {
     match decision {
         HostKeyDecision::Unconfirmed { algorithm, fingerprint } => StageError::WaitHostKey { algorithm, fingerprint },
@@ -1431,6 +1536,18 @@ fn decision_error(decision: HostKeyDecision) -> StageError {
         ),
         HostKeyDecision::Trusted => stages::fail_code(crate::connections::error_codes::CONN_HOST_KEY_INCONSISTENT, "SSH 主机密钥状态不一致", "没有继续认证。"),
     }
+}
+
+/// 一次探测请求。`session_id` 是会话表的键；`pending_key` 只在这份配置确实对应一条已保存
+/// 连接时给出，用来接住“等确认 SSH 主机密钥”的结论。
+struct ProbeRequest {
+    session_id: String,
+    pending_key: Option<String>,
+    config: SavedConnection,
+    saved_fingerprint: Option<String>,
+    input: SecretInput,
+    open: bool,
+    epoch: Option<u64>,
 }
 
 enum Remote {

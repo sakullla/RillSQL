@@ -93,6 +93,16 @@ impl Store {
         )
         .execute(&self.pool)
         .await?;
+        // 最近成功打开时间单独一张表：连接定义（含导出/导入）不因“用过”而改变形状，
+        // 存量库只多一张空表，未使用过的连接保持原排序。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS connection_usage (
+                id TEXT PRIMARY KEY,
+                last_used_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
         self.seed_env_tags().await?;
         Ok(())
     }
@@ -228,8 +238,42 @@ impl Store {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        sqlx::query("DELETE FROM connection_usage WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         self.checkpoint().await?;
         Ok(existing)
+    }
+
+    /// 记一次成功打开。只写使用时间，不碰连接定义；密码等机密仍只在系统凭据库。
+    /// 时间戳严格递增（同一毫秒内的连续打开也能分出先后），排序不依赖 id 或插入顺序。
+    pub async fn touch_last_used(&self, id: &str, at: i64) -> Result<(), sqlx::Error> {
+        let row = sqlx::query("SELECT COALESCE(MAX(last_used_at), 0) FROM connection_usage")
+            .fetch_one(&self.pool)
+            .await?;
+        let highest: i64 = row.try_get(0)?;
+        let at = at.max(highest.saturating_add(1));
+        sqlx::query(
+            "INSERT INTO connection_usage (id, last_used_at) VALUES (?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET last_used_at = excluded.last_used_at",
+        )
+        .bind(id)
+        .bind(at)
+        .execute(&self.pool)
+        .await?;
+        self.checkpoint().await?;
+        Ok(())
+    }
+
+    /// 最近使用时间，最新在前。时间相同的按 id 稳定排序，不靠 SQLite 的行序。
+    pub async fn last_used(&self) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        let rows = sqlx::query("SELECT id, last_used_at FROM connection_usage ORDER BY last_used_at DESC, id")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get::<String, _>(0)?, row.try_get::<i64, _>(1)?)))
+            .collect()
     }
 
     pub async fn host_key(&self, host: &str, port: u16) -> Result<Option<String>, sqlx::Error> {

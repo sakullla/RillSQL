@@ -5194,6 +5194,9 @@ fn query_log_side_panel_and_record_view_follow_locale_theme_and_density(cx: &mut
     let (window, view) = open_workbench_sized(cx, services_at(&dir), false, 1360., 900.);
     let statement = |sql: &str| StatementView {
         sql: sql.to_owned(),
+        sent_sql: None,
+        rewrite: None,
+        rewrite_anchor: None,
         status: "ok".to_owned(),
         message: String::new(),
         columns: vec!["id".to_owned(), "label".to_owned()],
@@ -5337,6 +5340,9 @@ fn query_workspace_scenario(cx: &mut gpui_kit::TestAppContext) -> [bool; 6] {
     let (window, view) = open_workbench_sized(cx, services_at(&dir), false, 1360., 900.);
     let result = StatementView {
         sql: "SELECT id, label FROM item".to_owned(),
+        sent_sql: None,
+        rewrite: None,
+        rewrite_anchor: None,
         status: "ok".to_owned(),
         message: String::new(),
         columns: vec!["id".to_owned(), "label".to_owned()],
@@ -6829,3 +6835,151 @@ fn exchange_rows_are_lazy_cached_and_released_when_hidden(cx: &mut gpui_kit::Tes
     }).unwrap();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// ---- T2：连接测试针对当前草稿 ----
+
+/// 真实的空 SQLite 库：OpenFile 之后还要读 schema，随便写的字节不算一个库。
+async fn sqlite_file(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path).create_if_missing(true))
+        .await
+        .unwrap();
+    pool.close().await;
+    path
+}
+
+/// 新建草稿不保存也能测试；失败保留草稿与本次机密，并把错误落到具体字段。
+#[tokio::test]
+async fn connection_test_runs_on_the_unsaved_draft_and_keeps_it_on_failure() {
+    let dir = std::env::temp_dir().join(format!("rillsql-draft-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = WorkbenchModel::new(Shell::default());
+    let file = sqlite_file(&dir, "draft.sqlite").await;
+    model.connections.start_new(Engine::Sqlite);
+    model.connections.editor.as_mut().unwrap().file_path = file.display().to_string();
+
+    let _ = model.dispatch("conn-test");
+    let token = model.prepare_list_token(&services.tasks);
+    let request = request_of(&mut model, token);
+    assert!(
+        request.draft.as_ref().is_some_and(|draft| draft.id.is_none()),
+        "测试请求应带当前未保存的草稿"
+    );
+    let done = jobs::execute_job(&services, request).await;
+    apply_done(&mut model, &services, "connections", done);
+    assert_eq!(
+        model.connections.message_key,
+        Some("connections.editor.test.ok"),
+        "{}",
+        model.connections.message_detail
+    );
+    assert!(model.connections.editor.is_some(), "测试成功不关闭表单");
+    assert!(model.connections.rows.is_empty(), "测试不保存连接配置");
+    assert!(model.connections.issues.is_empty());
+
+    // 换成打不开的文件：失败要留在表单里，错误落到 file_path 字段旁。
+    let missing = dir.join("missing.sqlite");
+    model.connections.editor.as_mut().unwrap().file_path = missing.display().to_string();
+    model.connections.secrets.password = "typed-only-for-this-test".into();
+    let _ = model.dispatch("conn-test");
+    let token = model.prepare_list_token(&services.tasks);
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "connections", done);
+    assert_eq!(
+        model.connections.message_key,
+        Some("connections.editor.test.failed"),
+        "{}",
+        model.connections.message_detail
+    );
+    assert!(model.connections.editor.is_some(), "失败不清空草稿");
+    assert_eq!(model.connections.secrets.password, "typed-only-for-this-test", "失败不清空本次机密");
+    let issue = model.connections.issues.first().expect("失败应关联到字段");
+    assert_eq!(issue.field, "file_path");
+    assert!(!issue.detail.is_empty(), "字段旁要保留失败原文");
+    assert!(!serde_json::to_string(&model.snapshot()).unwrap().contains("typed-only-for-this-test"));
+    assert!(model.connections.rows.is_empty());
+
+    // 修好字段后，该字段的错误立即消失，可以原地重测。
+    model.set_field(DraftField::File, file.display().to_string());
+    assert!(model.connections.issues.is_empty(), "编辑字段后不再显示该字段的旧错误");
+    let _ = model.dispatch("conn-test");
+    let token = model.prepare_list_token(&services.tasks);
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "connections", done);
+    assert_eq!(model.connections.message_key, Some("connections.editor.test.ok"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 发起测试后继续编辑（或直接关掉表单）：迟到的结果不写回任何状态。
+#[tokio::test]
+async fn stale_connection_test_result_does_not_overwrite_new_edits() {
+    let dir = std::env::temp_dir().join(format!("rillsql-draft-race-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = WorkbenchModel::new(Shell::default());
+    let file = sqlite_file(&dir, "draft.sqlite").await;
+    model.connections.start_new(Engine::Sqlite);
+    model.connections.editor.as_mut().unwrap().file_path = file.display().to_string();
+
+    let _ = model.dispatch("conn-test");
+    let token = model.prepare_list_token(&services.tasks);
+    let request = request_of(&mut model, token);
+    // 请求发出后用户改了主机/文件，这次结果对应的已经是被丢弃的草稿。
+    let missing = dir.join("edited-away.sqlite");
+    model.connections.editor.as_mut().unwrap().file_path = missing.display().to_string();
+    let done = jobs::execute_job(&services, request).await;
+    apply_done(&mut model, &services, "connections", done);
+    assert_ne!(
+        model.connections.message_key,
+        Some("connections.editor.test.ok"),
+        "过期结果不能显示成当前草稿的结论"
+    );
+    assert!(model.connections.message_key.is_none(), "只收起“正在测试”");
+    assert!(model.connections.issues.is_empty());
+
+    // 表单关闭后到达的结果同样丢弃：重新开一份草稿，请求发出后再关掉表单。
+    model.connections.start_new(Engine::Sqlite);
+    model.connections.editor.as_mut().unwrap().file_path = file.display().to_string();
+    let _ = model.dispatch("conn-test");
+    let token = model.prepare_list_token(&services.tasks);
+    let request = request_of(&mut model, token);
+    model.connections.editor = None;
+    let done = jobs::execute_job(&services, request).await;
+    apply_done(&mut model, &services, "connections", done);
+    assert!(model.connections.message_key.is_none());
+    assert!(model.connections.issues.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 保存连接不等于连接建立：保存后最近使用仍为空，成功打开才写入。
+#[tokio::test]
+async fn saving_a_connection_does_not_count_as_a_successful_open() {
+    let dir = std::env::temp_dir().join(format!("rillsql-save-no-open-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = WorkbenchModel::new(Shell::default());
+    let file = sqlite_file(&dir, "notes.sqlite").await;
+    model.connections.start_new(Engine::Sqlite);
+    let draft = model.connections.editor.as_mut().unwrap();
+    draft.name = "笔记".into();
+    draft.file_path = file.display().to_string();
+    let _ = model.dispatch("conn-save");
+    let token = model.prepare_list_token(&services.tasks);
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "connections", done);
+    assert_eq!(model.connections.rows.len(), 1);
+    let id = model.connections.rows[0].saved.id.clone();
+    assert!(services.connections.recent_ids(10).await.unwrap().is_empty(), "保存本身不连接");
+
+    model.connections.selected = Some(id.clone());
+    let _ = model.dispatch("conn-open");
+    let token = model.prepare_list_token(&services.tasks);
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "connections", done);
+    assert_eq!(services.connections.recent_ids(10).await.unwrap(), vec![id]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+

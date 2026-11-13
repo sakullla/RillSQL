@@ -35,7 +35,8 @@ pub enum JobDone {
     Rows(TaskToken, Result<Vec<crate::connections::ConnectionRecord>, String>),
     /// 保存成功：新列表和刚保存的连接 id，界面据此选中它。
     Saved(TaskToken, String, Result<Vec<crate::connections::ConnectionRecord>, String>),
-    Test(TaskToken, Result<crate::connections::stages::TestReport, String>),
+    /// 测试结果带着发起时的草稿指纹：界面据此丢弃对不上当前编辑的迟到结果。
+    Test(TaskToken, u64, Result<crate::connections::stages::TestReport, String>),
     Open(TaskToken, Result<crate::connections::OpenOutcome, String>),
     Disconnect(TaskToken, String),
     Notice(TaskToken, Result<String, String>),
@@ -140,10 +141,12 @@ pub async fn execute_job(services: &AppServices, request: JobRequest) -> JobDone
             }
         }
         PendingJob::TestConnection => {
-            let Some(id) = request.selected else {
+            // 测试的是这份请求里的草稿快照，不是 selected id 在配置库里的旧值。
+            let Some(draft) = request.draft.clone() else {
                 return JobDone::Notice(token, Err("connections.editor.test.button".into()));
             };
-            JobDone::Test(token, connections::test_row(services, &id, &request.secrets).await)
+            let fingerprint = connections::draft_fingerprint(&request.draft, &request.secrets);
+            JobDone::Test(token, fingerprint, connections::test_row(services, draft, &request.secrets).await)
         }
         PendingJob::OpenConnection => {
             let Some(id) = request.selected else {
@@ -289,8 +292,8 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
                 model.notice_detail = model.connections.message_detail.clone();
             }
         }
-        JobDone::Test(token, report) => {
-            let _ = model.connections.note_test(&services.tasks, token, report);
+        JobDone::Test(token, fingerprint, report) => {
+            let _ = model.connections.note_test(&services.tasks, token, fingerprint, report);
             model.notice_key = model.connections.message_key;
             model.notice_detail = model.connections.message_detail.clone();
         }

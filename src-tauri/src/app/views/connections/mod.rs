@@ -8,10 +8,10 @@ use std::path::Path;
 use crate::application::tasks::TaskToken;
 use crate::application::{AppServices, TaskBoard, TaskOutcome};
 use crate::connections::model::{
-    CaMode, ConnectionDraft, Engine, FieldError, Secret, SshAuthKind, TlsMode, TlsSettings, SshSettings,
+    CaMode, ConnectionDraft, Engine, FieldError, Secret, SecretInput, SshAuthKind, TlsMode, TlsSettings, SshSettings,
 };
 use crate::connections::{ConnectionRecord, OpenOutcome, SaveOutcome};
-use crate::connections::stages::TestReport;
+use crate::connections::stages::{StageKind, StageStatus, TestReport, TestStatus};
 
 pub use url::{default_port, parse_connection_url, ParsedUrl};
 
@@ -40,10 +40,23 @@ pub enum LinkStatus {
     Failed,
 }
 
+/// 字段级问题：field 是草稿里的字段名（host / port / ssh_host …），key 是通用文案，
+/// detail 是具体原文（测试失败消息、服务端字段消息），空表示只有通用文案。
 #[derive(Clone, Debug)]
 pub struct FieldIssue {
     pub field: String,
     pub key: &'static str,
+    pub detail: String,
+}
+
+impl FieldIssue {
+    pub fn new(field: impl Into<String>, key: &'static str) -> Self {
+        Self { field: field.into(), key, detail: String::new() }
+    }
+
+    pub fn with_detail(field: impl Into<String>, key: &'static str, detail: impl Into<String>) -> Self {
+        Self { field: field.into(), key, detail: detail.into() }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -270,30 +283,74 @@ impl ConnectionPage {
         .to_owned();
     }
 
-    pub fn note_test(&mut self, tasks: &TaskBoard, token: TaskToken, report: Result<TestReport, String>) -> bool {
+    /// 清掉某个字段的错误。用户开始改这个字段，就不该继续显示上一次的结论。
+    pub fn clear_issue(&mut self, field: &str) {
+        self.issues.retain(|issue| issue.field != field);
+    }
+
+    /// 启动台“最近连接”：recent_ids 已经按持久化的最近成功打开时间排好序，这里只按当前列表取行。
+    /// 不认识的 id 直接跳过，绝不回退成“列表前几条”冒充最近。
+    pub fn recent<'a>(&'a self, recent_ids: &[String], limit: usize) -> Vec<&'a ConnectionRecord> {
+        let mut rows = Vec::new();
+        for id in recent_ids {
+            if rows.len() >= limit {
+                break;
+            }
+            if let Some(row) = self.rows.iter().find(|row| &row.saved.id == id) {
+                rows.push(row);
+            }
+        }
+        rows
+    }
+
+    /// 测试失败落到具体字段。只给一条：第一个失败/等待阶段决定用户下一步该改哪个字段。
+    fn failure_issues(report: &TestReport, draft: Option<&ConnectionDraft>) -> Vec<FieldIssue> {
+        let Some(draft) = draft else { return Vec::new() };
+        field_issue_for_failure(report, draft).into_iter().collect()
+    }
+
+    /// 记录一次测试结果。fingerprint 是发起请求时的草稿指纹：屏幕上的草稿、本次机密或
+    /// “表单是否还开着”已经变了，就丢弃这次结果，不用旧结论覆盖新编辑（R6/ADR-3）。
+    pub fn note_test(&mut self, tasks: &TaskBoard, token: TaskToken, fingerprint: u64, report: Result<TestReport, String>) -> bool {
+        if draft_fingerprint(&self.editor, &self.secrets) != fingerprint {
+            // 过期结果：只收起“正在测试”，不写状态、消息或字段错误。
+            if self.message_key == Some("connections.editor.test.running") {
+                self.message_key = None;
+                self.message_detail.clear();
+            }
+            return false;
+        }
         let report = match tasks.accept(OWNER, token, report) {
             TaskOutcome::Current { value, .. } => value,
             TaskOutcome::Stale { .. } | TaskOutcome::Cancelled { .. } => return false,
         };
+        // 状态按屏幕上的草稿归属，不按列表选中行：新建草稿的测试不该标记到别的连接上。
+        let row_id = self.editor.as_ref().and_then(|draft| draft.id.clone());
         match report {
             Ok(report) => {
-                self.message_detail = report.summary.unwrap_or_default();
+                self.message_detail = report.summary.clone().unwrap_or_default();
                 self.message_key = Some(match report.status {
-                    crate::connections::stages::TestStatus::Ok => "connections.editor.test.ok",
-                    crate::connections::stages::TestStatus::Wait => "connections.editor.test.wait",
-                    crate::connections::stages::TestStatus::Err => "connections.editor.test.failed",
+                    TestStatus::Ok => "connections.editor.test.ok",
+                    TestStatus::Wait => "connections.editor.test.wait",
+                    TestStatus::Err => "connections.editor.test.failed",
                 });
-                if let Some(id) = &self.selected {
-                    if report.status == crate::connections::stages::TestStatus::Err {
-                        self.status.insert(id.clone(), LinkStatus::Failed);
+                match report.status {
+                    // 测试成功只说明这份配置能连上，不等于已经建立会话：不写 Connected。
+                    TestStatus::Ok | TestStatus::Wait => self.issues.clear(),
+                    TestStatus::Err => {
+                        self.issues = Self::failure_issues(&report, self.editor.as_ref());
+                        if let Some(id) = row_id {
+                            self.status.insert(id, LinkStatus::Failed);
+                        }
                     }
                 }
             }
             Err(detail) => {
                 self.message_detail = detail;
                 self.message_key = Some("connections.status.error");
-                if let Some(id) = &self.selected {
-                    self.status.insert(id.clone(), LinkStatus::Failed);
+                self.issues.clear();
+                if let Some(id) = row_id {
+                    self.status.insert(id, LinkStatus::Failed);
                 }
             }
         }
@@ -389,7 +446,7 @@ pub fn draft_from_saved(saved: &crate::connections::model::SavedConnection) -> C
 pub fn validate_draft(draft: &ConnectionDraft) -> Vec<FieldIssue> {
     let mut issues = Vec::new();
     let push = |issues: &mut Vec<FieldIssue>, field: &str, key: &'static str| {
-        issues.push(FieldIssue { field: field.to_owned(), key });
+        issues.push(FieldIssue::new(field, key));
     };
     if draft.engine == Engine::Sqlite {
         if draft.file_path.trim().is_empty() {
@@ -460,10 +517,72 @@ pub async fn delete_row(services: &AppServices, id: &str) -> Result<(), String> 
     services.delete_connection(id).await.map(|_| ())
 }
 
-pub async fn test_row(services: &AppServices, id: &str, secrets: &Secrets) -> Result<TestReport, String> {
-    services
-        .test_connection(id, none_if_empty(&secrets.password), none_if_empty(&secrets.ssh_password), none_if_empty(&secrets.ssh_passphrase))
-        .await
+/// 测试当前屏幕上的草稿：它就是列表里那一行（或还没保存的新行）的编辑结果。
+/// 新建未保存的草稿也能测；编辑已有连接时测的是草稿，而不是该 id 在配置库里的旧值。
+/// 只读配置库/凭据库，不写连接配置，也不更新最近使用时间。
+pub async fn test_row(services: &AppServices, draft: ConnectionDraft, secrets: &Secrets) -> Result<TestReport, String> {
+    services.connections.test_candidate(draft, secret_input(secrets)).await
+}
+
+/// 草稿 + 本次机密的内容指纹：判断一个异步测试结果是否还对应当前屏幕上的编辑。
+/// 只看内容不看时间；表单关闭、换连接或改任意字段都会得到不同的值。
+pub fn draft_fingerprint(editor: &Option<ConnectionDraft>, secrets: &Secrets) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match editor {
+        Some(draft) => {
+            1u8.hash(&mut hasher);
+            // 草稿是普通配置（不含密码），可以直接序列化后参与哈希。
+            serde_json::to_string(draft).unwrap_or_default().hash(&mut hasher);
+        }
+        None => 0u8.hash(&mut hasher),
+    }
+    secrets.password.hash(&mut hasher);
+    secrets.ssh_password.hash(&mut hasher);
+    secrets.ssh_passphrase.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// 失败的第一落点：用户最该先改的那个字段。detail 保留服务端原文，字段旁只显示通用文案。
+pub fn field_issue_for_failure(report: &TestReport, draft: &ConnectionDraft) -> Option<FieldIssue> {
+    use crate::connections::error_codes;
+    let stage = report
+        .stages
+        .iter()
+        .find(|stage| matches!(stage.status, StageStatus::Err | StageStatus::Wait))?;
+    let field = match stage.kind {
+        StageKind::OpenFile | StageKind::ReadSchema | StageKind::ForeignKeys => "file_path",
+        StageKind::SshHostIdentity | StageKind::Tunnel => "ssh_host",
+        StageKind::SshAuthentication => {
+            if draft.ssh_auth == SshAuthKind::Password {
+                "ssh_password"
+            } else {
+                "ssh_host"
+            }
+        }
+        StageKind::Network | StageKind::ServerVersion => "host",
+        StageKind::Tls => {
+            if draft.ca_mode == CaMode::File {
+                "ca_file"
+            } else {
+                "host"
+            }
+        }
+        StageKind::DatabaseAuthentication => match report.code.as_deref() {
+            Some(error_codes::CONN_PASSWORD_REQUIRED) => "password",
+            _ => "username",
+        },
+    };
+    Some(FieldIssue::with_detail(field, "connections.status.error", stage.message.clone()))
+}
+
+fn secret_input(secrets: &Secrets) -> SecretInput {
+    SecretInput {
+        password: none_if_empty(&secrets.password).map(Secret::new),
+        ssh_password: none_if_empty(&secrets.ssh_password).map(Secret::new),
+        ssh_passphrase: none_if_empty(&secrets.ssh_passphrase).map(Secret::new),
+        save_password: false,
+    }
 }
 
 pub async fn open_row(services: &AppServices, id: &str, secrets: &Secrets) -> Result<OpenOutcome, String> {
@@ -643,5 +762,126 @@ mod tests {
         draft.name = name.into();
         let saved = normalize(&draft, id.into()).unwrap();
         ConnectionRecord { saved, ssh_host_key: None }
+    }
+
+    /// 启动台的“最近连接”只按持久化顺序取行：不认识的 id 跳过，绝不用列表前几条冒充。
+    #[test]
+    fn recent_rows_follow_the_persisted_order_and_skip_unknown_ids() {
+        let page = ConnectionPage {
+            rows: vec![
+                record("a", "A", Engine::Postgres),
+                record("b", "B", Engine::Mysql),
+                record("c", "C", Engine::Sqlite),
+            ],
+            ..ConnectionPage::default()
+        };
+        let order = vec!["c".to_owned(), "deleted".to_owned(), "a".to_owned()];
+        let rows = page.recent(&order, 5);
+        assert_eq!(
+            rows.iter().map(|row| row.saved.id.as_str()).collect::<Vec<_>>(),
+            vec!["c", "a"]
+        );
+        assert_eq!(page.recent(&order, 1).len(), 1, "上限只截断，不改顺序");
+        assert!(page.recent(&[], 3).is_empty(), "从未使用过就没有最近连接");
+    }
+
+    fn stage(kind: StageKind, status: StageStatus, message: &str) -> crate::connections::stages::StageView {
+        crate::connections::stages::StageView {
+            kind,
+            label: kind.label_zh().to_owned(),
+            status,
+            message: message.to_owned(),
+            code: None,
+        }
+    }
+
+    fn failed_report(code: Option<&str>, stages: Vec<crate::connections::stages::StageView>) -> TestReport {
+        TestReport {
+            status: TestStatus::Err,
+            fail_stage: None,
+            hint: None,
+            summary: None,
+            fingerprint: None,
+            algorithm: None,
+            stages,
+            code: code.map(str::to_owned),
+        }
+    }
+
+    /// 失败要落到用户下一步该改的字段上，原文留在 detail 里。
+    #[test]
+    fn failure_maps_to_the_field_the_user_should_fix() {
+        let sqlite = sample_draft(Engine::Sqlite);
+        let report = failed_report(
+            Some(crate::connections::error_codes::CONN_SQLITE_FILE_MISSING),
+            vec![stage(StageKind::OpenFile, StageStatus::Err, "打不开数据库文件 /tmp/x")],
+        );
+        let issue = field_issue_for_failure(&report, &sqlite).expect("file_path 错误");
+        assert_eq!(issue.field, "file_path");
+        assert_eq!(issue.key, "connections.status.error");
+        assert!(issue.detail.contains("/tmp/x"));
+
+        let remote = sample_draft(Engine::Postgres);
+        let report = failed_report(
+            Some(crate::connections::error_codes::CONN_NETWORK_FAILED),
+            vec![stage(StageKind::Network, StageStatus::Err, "连不上 db.example.test:5432")],
+        );
+        assert_eq!(field_issue_for_failure(&report, &remote).unwrap().field, "host");
+
+        let mut with_ca = sample_draft(Engine::Postgres);
+        with_ca.ca_mode = CaMode::File;
+        let report = failed_report(
+            Some(crate::connections::error_codes::CONN_TLS_CA_MISSING),
+            vec![stage(StageKind::Tls, StageStatus::Err, "CA 文件不存在")],
+        );
+        assert_eq!(field_issue_for_failure(&report, &with_ca).unwrap().field, "ca_file");
+
+        let report = failed_report(
+            Some(crate::connections::error_codes::CONN_PASSWORD_REQUIRED),
+            vec![stage(StageKind::DatabaseAuthentication, StageStatus::Err, "请填写数据库密码")],
+        );
+        assert_eq!(field_issue_for_failure(&report, &remote).unwrap().field, "password");
+
+        let report = failed_report(
+            Some(crate::connections::error_codes::CONN_AUTH_FAILED),
+            vec![stage(StageKind::DatabaseAuthentication, StageStatus::Err, "Access denied")],
+        );
+        assert_eq!(field_issue_for_failure(&report, &remote).unwrap().field, "username");
+
+        let mut with_ssh = sample_draft(Engine::Postgres);
+        with_ssh.ssh_on = true;
+        with_ssh.ssh_auth = SshAuthKind::Password;
+        let report = failed_report(
+            Some(crate::connections::error_codes::CONN_SSH_AUTH_FAILED),
+            vec![stage(StageKind::SshAuthentication, StageStatus::Err, "SSH 密码被拒绝")],
+        );
+        assert_eq!(field_issue_for_failure(&report, &with_ssh).unwrap().field, "ssh_password");
+
+        let report = TestReport {
+            status: TestStatus::Ok,
+            fail_stage: None,
+            hint: None,
+            summary: Some("连接正常".into()),
+            fingerprint: None,
+            algorithm: None,
+            stages: vec![stage(StageKind::Network, StageStatus::Ok, "已连接")],
+            code: None,
+        };
+        assert!(field_issue_for_failure(&report, &remote).is_none(), "成功没有字段错误");
+    }
+
+    /// 指纹只看内容：改字段、改机密、关表单都会得到不同的值。
+    #[test]
+    fn draft_fingerprint_tracks_edits_and_secrets() {
+        let draft = sample_draft(Engine::Postgres);
+        let secrets = Secrets::default();
+        let base = draft_fingerprint(&Some(draft.clone()), &secrets);
+        assert_eq!(base, draft_fingerprint(&Some(draft.clone()), &secrets));
+        let mut edited = draft.clone();
+        edited.host = "other.example.test".into();
+        assert_ne!(base, draft_fingerprint(&Some(edited), &secrets));
+        let typed = Secrets { password: "s3cret".into(), ..Secrets::default() };
+        assert_ne!(base, draft_fingerprint(&Some(draft.clone()), &typed));
+        assert_ne!(base, draft_fingerprint(&None, &secrets));
     }
 }

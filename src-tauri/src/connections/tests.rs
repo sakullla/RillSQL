@@ -19,6 +19,17 @@ fn temp_workspace() -> PathBuf {
     path
 }
 
+
+/// 真实的空 SQLite 库：随便写的字节会让 OpenFile 之后的 ReadSchema 失败。
+async fn sqlite_fixture(path: &Path) {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(path).create_if_missing(true))
+        .await
+        .unwrap();
+    pool.close().await;
+}
+
 fn remote_draft(engine: Engine) -> ConnectionDraft {
     let mut draft = ConnectionDraft::blank(engine);
     draft.name = format!("{} 仓库", engine.label_zh());
@@ -1215,3 +1226,217 @@ async fn read_activity_guard_defers_health_probes_until_the_read_finishes() {
     assert_eq!(db.auth_calls.load(Ordering::SeqCst), 2, "空闲时恢复正常探活和有限重连");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// ---- T2：草稿测试与最近使用持久化 ----
+
+/// 新建草稿不保存也能测试；测试本身不写配置库，也不算“打开”。
+#[tokio::test]
+async fn candidate_test_needs_no_saved_id_and_writes_nothing() {
+    let dir = temp_workspace();
+    let service = Service::new(dir.join("connections.sqlite"), Arc::new(MemoryStore::default()));
+    let file = dir.join("draft.sqlite");
+    sqlite_fixture(&file).await;
+    let mut draft = ConnectionDraft::blank(Engine::Sqlite);
+    draft.name = "还没保存的草稿".to_owned();
+    draft.file_path = file.display().to_string();
+    let report = service.test_candidate(draft.clone(), SecretInput::default()).await.unwrap();
+    assert_eq!(report.status, TestStatus::Ok, "{:?}", report.hint);
+    assert!(draft.id.is_none(), "测试不改草稿");
+    assert!(service.list().await.unwrap().is_empty(), "测试不保存连接配置");
+    assert!(service.recent_ids(10).await.unwrap().is_empty(), "测试不算打开连接");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 编辑已有连接时，测试用的是屏幕上的草稿，不是该 id 在配置库里的旧值。
+#[tokio::test]
+async fn candidate_test_uses_the_edited_draft_instead_of_the_saved_row() {
+    let dir = temp_workspace();
+    let service = Service::new(dir.join("connections.sqlite"), Arc::new(MemoryStore::default()));
+    let missing = dir.join("missing.sqlite");
+    let present = dir.join("present.sqlite");
+    sqlite_fixture(&present).await;
+    let mut draft = ConnectionDraft::blank(Engine::Sqlite);
+    draft.name = "笔记".to_owned();
+    draft.file_path = missing.display().to_string();
+    let saved = service.save(draft, SecretInput::default()).await.unwrap().connection;
+    let stored = service.test(&saved.id, SecretInput::default()).await.unwrap();
+    assert_eq!(stored.status, TestStatus::Err, "已保存配置指向不存在的文件");
+
+    let mut edited = ConnectionDraft::blank(Engine::Sqlite);
+    edited.id = Some(saved.id.clone());
+    edited.name = saved.name.clone();
+    edited.file_path = present.display().to_string();
+    let report = service.test_candidate(edited, SecretInput::default()).await.unwrap();
+    assert_eq!(report.status, TestStatus::Ok, "{:?}", report.hint);
+    let after = service.list().await.unwrap();
+    assert_eq!(after.len(), 1, "测试不新增连接");
+    assert_eq!(
+        after[0].saved.file_path.as_deref(),
+        missing.to_str(),
+        "测试不写回已保存配置"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 已保存的密码在这个草稿仍要保存密码时才沿用；取消保存密码就必须重新输入。
+#[tokio::test]
+async fn candidate_test_reuses_a_stored_password_only_when_the_draft_still_saves_it() {
+    let dir = temp_workspace();
+    let probe = Arc::new(ScriptDb::new(false));
+    let service = Service::with_probes(
+        dir.join("connections.sqlite"),
+        Arc::new(MemoryStore::default()),
+        Probes {
+            ssh: Some(Arc::new(ScriptSsh::new("SHA256:trusted"))),
+            database: Some(probe.clone()),
+            sqlite: None,
+            health: None,
+        },
+    );
+    let saved = service
+        .save(remote_draft(Engine::Postgres), secrets("stored-pass", "", ""))
+        .await
+        .unwrap()
+        .connection;
+    assert!(saved.password_saved);
+    let mut draft = ConnectionDraft::blank(Engine::Postgres);
+    draft.id = Some(saved.id.clone());
+    draft.name = saved.name.clone();
+    draft.host = saved.host.clone().unwrap_or_default();
+    draft.port = saved.port.map(|port| port.to_string()).unwrap_or_default();
+    draft.database = saved.database.clone().unwrap_or_default();
+    draft.username = saved.username.clone().unwrap_or_default();
+    draft.save_password = true;
+
+    let report = service.test_candidate(draft.clone(), SecretInput::default()).await.unwrap();
+    assert_eq!(report.status, TestStatus::Ok, "{:?}", report.hint);
+    assert_eq!(probe.seen_password.lock().expect("pw").as_deref(), Some("stored-pass"));
+
+    // 改主机不动其它字段：测的仍是这份草稿。
+    let mut moved = draft.clone();
+    moved.host = "db2.example.test".to_owned();
+    let report = service.test_candidate(moved, SecretInput::default()).await.unwrap();
+    assert_eq!(report.status, TestStatus::Ok, "{:?}", report.hint);
+    assert_eq!(
+        probe.seen_transport.lock().expect("transport").as_deref(),
+        Some("db2.example.test"),
+        "探测目标是草稿里的主机"
+    );
+
+    // 不再保存密码且没有重新输入：不接受已保存的密码。
+    let mut locked = draft;
+    locked.save_password = false;
+    let report = service.test_candidate(locked, SecretInput::default()).await.unwrap();
+    assert_eq!(report.status, TestStatus::Err);
+    assert_eq!(
+        report.code.as_deref(),
+        Some(crate::connections::error_codes::CONN_PASSWORD_REQUIRED)
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 测试失败不写配置、不写最近使用时间，并给出可以被界面映射到字段的失败阶段。
+#[tokio::test]
+async fn failed_candidate_test_leaves_no_trace_in_the_store() {
+    let dir = temp_workspace();
+    let service = Service::with_probes(
+        dir.join("connections.sqlite"),
+        Arc::new(MemoryStore::default()),
+        Probes {
+            ssh: Some(Arc::new(ScriptSsh::new("SHA256:unused"))),
+            database: Some(Arc::new(ScriptDb::new(true))),
+            sqlite: None,
+            health: None,
+        },
+    );
+    let report = service
+        .test_candidate(remote_draft(Engine::Postgres), secrets("typed-alpha", "", ""))
+        .await
+        .unwrap();
+    assert_eq!(report.status, TestStatus::Err);
+    assert!(report.stages.iter().any(|stage| stage.status == StageStatus::Err && stage.kind == StageKind::Tls));
+    assert!(service.list().await.unwrap().is_empty());
+    assert!(service.recent_ids(10).await.unwrap().is_empty());
+    let logs = service.logs().join("\n");
+    assert!(!logs.contains("typed-alpha"), "{logs}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 只有成功打开连接才更新最近使用时间；保存不连接，断开不改变顺序，删除连接清掉用量。
+#[tokio::test]
+async fn recent_order_follows_successful_opens_only() {
+    let dir = temp_workspace();
+    let service = Service::new(dir.join("connections.sqlite"), Arc::new(MemoryStore::default()));
+    let mut ids = Vec::new();
+    for name in ["alpha", "beta", "gamma"] {
+        let file = dir.join(format!("{name}.sqlite"));
+        sqlite_fixture(&file).await;
+        let mut draft = ConnectionDraft::blank(Engine::Sqlite);
+        draft.name = name.to_owned();
+        draft.file_path = file.display().to_string();
+        ids.push(service.save(draft, SecretInput::default()).await.unwrap().connection.id);
+    }
+    assert!(service.recent_ids(10).await.unwrap().is_empty(), "保存本身不连接");
+
+    service.open(&ids[0], SecretInput::default()).await.unwrap();
+    service.open(&ids[1], SecretInput::default()).await.unwrap();
+    assert_eq!(service.recent_ids(10).await.unwrap(), vec![ids[1].clone(), ids[0].clone()]);
+    service.open(&ids[0], SecretInput::default()).await.unwrap();
+    assert_eq!(
+        service.recent_ids(10).await.unwrap(),
+        vec![ids[0].clone(), ids[1].clone()],
+        "再次成功打开回到最前"
+    );
+    assert_eq!(service.recent_ids(1).await.unwrap(), vec![ids[0].clone()]);
+    assert!(!service.recent_ids(10).await.unwrap().contains(&ids[2]), "从未打开过的不进最近列表");
+
+    service.disconnect(&ids[0]);
+    assert_eq!(
+        service.recent_ids(10).await.unwrap(),
+        vec![ids[0].clone(), ids[1].clone()],
+        "断开不清除历史使用时间"
+    );
+
+    service.delete(&ids[0]).await.unwrap();
+    assert_eq!(service.recent_ids(10).await.unwrap(), vec![ids[1].clone()], "删除连接同时清掉用量");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 本轮之前的配置库没有 connection_usage 表：迁移只补一张空表，已有连接与排序语义不变。
+#[tokio::test]
+async fn usage_table_migrates_onto_an_existing_config_database() {
+    let dir = temp_workspace();
+    let config_path = dir.join("connections.sqlite");
+    let file = dir.join("notes.sqlite");
+    sqlite_fixture(&file).await;
+    let service = Service::new(config_path.clone(), Arc::new(MemoryStore::default()));
+    let mut draft = ConnectionDraft::blank(Engine::Sqlite);
+    draft.name = "笔记".to_owned();
+    draft.file_path = file.display().to_string();
+    let saved = service.save(draft, SecretInput::default()).await.unwrap().connection;
+    drop(service);
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&config_path))
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE connection_usage").execute(&pool).await.unwrap();
+    pool.close().await;
+
+    let reopened = Service::new(config_path.clone(), Arc::new(MemoryStore::default()));
+    let listed = reopened.list().await.unwrap();
+    assert_eq!(listed.len(), 1, "迁移不能丢已有连接");
+    assert_eq!(listed[0].saved.id, saved.id);
+    assert!(reopened.recent_ids(10).await.unwrap().is_empty(), "从未打开过的连接不冒充最近");
+
+    reopened.open(&saved.id, SecretInput::default()).await.unwrap();
+    assert_eq!(reopened.recent_ids(10).await.unwrap(), vec![saved.id.clone()]);
+
+    // 迁移幂等：再次打开不报错也不重复。
+    drop(reopened);
+    let again = Service::new(config_path, Arc::new(MemoryStore::default()));
+    assert_eq!(again.recent_ids(10).await.unwrap(), vec![saved.id.clone()]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
