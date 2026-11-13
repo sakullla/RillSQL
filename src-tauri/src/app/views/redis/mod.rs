@@ -58,6 +58,46 @@ enum Follow {
     Read,
 }
 
+/// 失败来源。错误块按它落在自己的上下文里，不再把一切错误都塞进底部一行红字。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ErrorSource {
+    /// SCAN 读键列表（含未打开连接）。
+    Scan,
+    /// 读取选中键的内容。
+    Detail,
+    /// 命令行 / 写删命令。
+    Command,
+}
+
+/// 键列表的呈现状态：加载 → 错误 → 无命中 → 无数据 → 有行。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListState {
+    Loading,
+    Error,
+    NoMatch,
+    Empty,
+    Rows,
+}
+
+/// 判定只看四个事实：是否在读、SCAN 是否失败、已读到的键总数、过滤后实际渲染的行数。
+/// 加载优先于错误（迟到错误不盖住正在读的状态），错误优先于空态（不能把失败说成"没有键"），
+/// 无命中优先于无数据（有键但被条件过滤掉时要提示怎么继续）。
+fn list_state(busy: bool, scan_failed: bool, total: usize, visible: usize) -> ListState {
+    if busy && total == 0 {
+        return ListState::Loading;
+    }
+    if scan_failed && total == 0 {
+        return ListState::Error;
+    }
+    if total == 0 {
+        return ListState::Empty;
+    }
+    if visible == 0 {
+        return ListState::NoMatch;
+    }
+    ListState::Rows
+}
+
 pub struct RedisPane {
     services: Arc<AppServices>,
     locale: Locale,
@@ -90,6 +130,13 @@ pub struct RedisPane {
     fields: Fields<Field>,
     type_filter: String,
     tree_view: bool,
+    /// 窄窗口里键列表与值区域交替显示；`None` 表示跟随宽度与是否选中键自动决定。
+    /// 只影响布局，不改任何读取、写入或确认语义。
+    nav_choice: Option<bool>,
+    /// 最近一次渲染的视口宽度。窄窗口判定只看它，不另搞断点常量。
+    viewport_w: f32,
+    /// 最近一次失败的来源，决定错误块出现在键列表、值区域还是命令行。
+    error_source: ErrorSource,
     expanded: BTreeSet<String>,
     console_open: bool,
     history: Vec<String>,
@@ -154,6 +201,9 @@ impl RedisPane {
             fields: Fields::default(),
             type_filter: String::new(),
             tree_view: false,
+            nav_choice: None,
+            viewport_w: 1200.,
+            error_source: ErrorSource::Command,
             expanded: BTreeSet::new(),
             console_open: true,
             history: Vec::new(),
@@ -314,6 +364,8 @@ impl RedisPane {
         self.fields = Fields::default();
         self.type_filter.clear();
         self.tree_view = false;
+        self.nav_choice = None;
+        self.error_source = ErrorSource::Command;
         self.expanded.clear();
         self.console_open = true;
         self.history.clear();
@@ -362,7 +414,10 @@ impl RedisPane {
     }
 
     pub fn command(&mut self, id: &str, cx: &mut Context<Self>) {
-        let local = matches!(id, "redis-cancel" | "redis-console" | "redis-view-flat" | "redis-view-tree" | "redis-new-key" | "redis-entry-filter")
+        let local = matches!(
+            id,
+            "redis-cancel" | "redis-console" | "redis-view-flat" | "redis-view-tree" | "redis-new-key" | "redis-new-key-value" | "redis-entry-filter" | "redis-nav-toggle" | "redis-error-dismiss"
+        )
             || id.starts_with("redis-type-")
             || id.starts_with("redis-history-")
             || id.starts_with("redis-folder:")
@@ -374,8 +429,24 @@ impl RedisPane {
             cx.notify();
             return;
         }
-        if id == "redis-filter" || id == "redis-refresh" {
+        if id == "redis-filter" || id == "redis-refresh" || id == "redis-retry-scan" {
             self.scan_from_start(cx);
+        } else if id == "redis-clear-filter" {
+            // 无命中态的下一步：清掉模式与类型过滤，再从游标 0 重新 SCAN。
+            self.type_filter.clear();
+            self.pattern.clear();
+            self.scan_from_start(cx);
+        } else if id == "redis-retry-read" {
+            if !self.selected.is_empty() {
+                let name = self.selected.clone();
+                self.select_key(name, cx);
+            }
+        } else if id == "redis-error-dismiss" {
+            self.error.clear();
+            self.error_source = ErrorSource::Command;
+        } else if id == "redis-nav-toggle" {
+            // 窄窗口的键列表 / 值区域切换；宽窗口不会渲染这个按钮。
+            self.nav_choice = Some(!self.keys_visible(self.viewport_w));
         } else if id == "redis-more" {
             if !self.done {
                 self.scan_reset = false;
@@ -424,7 +495,9 @@ impl RedisPane {
             self.history_step(true);
         } else if id == "redis-history-newer" {
             self.history_step(false);
-        } else if id == "redis-new-key" {
+        } else if id == "redis-new-key" || id == "redis-new-key-value" {
+            // 窄窗口里"新建键"表单在键列表一侧，先切回键列表，否则点了看不见表单。
+            self.nav_choice = Some(true);
             self.new_open = !self.new_open;
         } else if let Some(kind) = id.strip_prefix("redis-new-type-") {
             self.new_type = kind.to_owned();
@@ -481,8 +554,7 @@ impl RedisPane {
 
     fn load_keys(&mut self, cx: &mut Context<Self>) {
         if self.connection_id.is_empty() {
-            self.error = self.text("redis.tab.needConnection");
-            self.note.clear();
+            self.show_error_from(ErrorSource::Scan, self.text("redis.tab.needConnection"));
             return;
         }
         let connections = Arc::clone(&self.services.connections);
@@ -508,7 +580,7 @@ impl RedisPane {
                     self.select_key(name, cx);
                 }
             }
-            Err(message) => self.show_error(message),
+            Err(message) => self.show_error_from(ErrorSource::Scan, message),
         }
     }
 
@@ -516,8 +588,12 @@ impl RedisPane {
         self.selected = name.clone();
         self.detail = None;
         self.stream_focus = None;
+        // 窄窗口是主从式布局：选中键就把值区域换到前面，不用再手动找。
+        if self.viewport_w < kit::NARROW_PAGE_WIDTH {
+            self.nav_choice = Some(false);
+        }
         if self.connection_id.is_empty() {
-            self.show_error(self.text("redis.tab.needConnection"));
+            self.show_error_from(ErrorSource::Detail, self.text("redis.tab.needConnection"));
             return;
         }
         let connections = Arc::clone(&self.services.connections);
@@ -541,7 +617,7 @@ impl RedisPane {
                 self.reload_viewer = true;
                 self.error.clear();
             }
-            Err(message) => self.show_error(message),
+            Err(message) => self.show_error_from(ErrorSource::Detail, message),
         }
     }
 
@@ -1148,8 +1224,22 @@ impl RedisPane {
     }
 
     fn show_error(&mut self, message: String) {
+        self.show_error_from(ErrorSource::Command, message);
+    }
+
+    fn show_error_from(&mut self, source: ErrorSource, message: String) {
         self.error = message;
+        self.error_source = source;
         self.note.clear();
+    }
+
+    /// 宽窗口里键列表常驻；窄窗口里与值区域交替，默认按"还没选键就先看键列表"。
+    /// 用户显式切换过就听用户的，窗口变宽后键列表无条件回来，不留下"宽屏却看不见键"的状态。
+    fn keys_visible(&self, width: f32) -> bool {
+        if width >= kit::NARROW_PAGE_WIDTH {
+            return true;
+        }
+        self.nav_choice.unwrap_or(self.selected.is_empty())
     }
 
     fn text(&self, key: &str) -> String {
@@ -1384,10 +1474,74 @@ impl Render for RedisPane {
         let type_bar = self.type_filters(&entity);
         let new_form = if self.new_open { Some(self.new_key_form(&p, &entity, window, cx)) } else { None };
 
+        let viewport_w = f32::from(window.viewport_size().width);
+        self.viewport_w = viewport_w;
+        let narrow = viewport_w < kit::NARROW_PAGE_WIDTH;
+        let show_keys = self.keys_visible(viewport_w);
+        let scan_failed = self.error_source == ErrorSource::Scan && !self.error.is_empty();
+        let state = list_state(self.busy, scan_failed, self.keys.len(), indexes.len() + folders.len());
+
         // ---- 左侧：键列表。浏览只渲染 SCAN 结果，不发 KEYS。
-        let mut list = div().id("redis-keys").flex().flex_col().flex_1().min_h(px(0.)).overflow_y_scroll().p(px(m.pad));
-        if indexes.is_empty() && folders.is_empty() {
-            list = list.child(div().p(px(m.pane_pad())).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(SharedString::from(self.text("redis.tab.emptyList"))));
+        // 加载 / 读取失败 / 无命中 / 无数据都走底座三态，各带一个当场能做的下一步；
+        // 有行时只在列表顶部给一行增量读取指示，不用整块转圈盖住已读到的键。
+        let mut list = div().id("redis-keys").test_support().flex().flex_col().flex_1().min_h(px(0.)).overflow_y_scroll().p(px(m.pad));
+        match state {
+            ListState::Loading => list = list.child(kit::skeleton_state(6, &m, &p)),
+            ListState::Error => {
+                let owner = entity.clone();
+                let retry = kit::secondary_button(
+                    "redis-retry-scan",
+                    Some(IconName::RefreshCw),
+                    SharedString::from(self.text("common.retry")),
+                    move |_, _, cx| owner.update(cx, |pane, cx| pane.command("redis-retry-scan", cx)),
+                )
+                .into_any_element();
+                list = list.child(kit::error_state_with_action(
+                    SharedString::from(self.text("redis.error.scan.heading")),
+                    SharedString::from(self.error.clone()),
+                    retry,
+                    &p,
+                ));
+            }
+            ListState::NoMatch => {
+                let owner = entity.clone();
+                let clear = kit::secondary_button(
+                    "redis-clear-filter",
+                    Some(IconName::ListFilter),
+                    SharedString::from(self.text("redis.noMatch.clear")),
+                    move |_, _, cx| owner.update(cx, |pane, cx| pane.command("redis-clear-filter", cx)),
+                )
+                .into_any_element();
+                list = list.child(kit::no_match_state_with_action(
+                    IconName::Search,
+                    SharedString::from(self.text("redis.noMatch.heading")),
+                    SharedString::from(self.text("redis.noMatch.detail")),
+                    clear,
+                    &p,
+                ));
+            }
+            ListState::Empty => {
+                let owner = entity.clone();
+                let create = kit::primary_button(
+                    "redis-new-key",
+                    Some(IconName::Plus),
+                    SharedString::from(self.text("redis.action.newKey")),
+                    move |_, _, cx| owner.update(cx, |pane, cx| pane.command("redis-new-key", cx)),
+                )
+                .into_any_element();
+                list = list.child(kit::empty_state_with_action(
+                    IconName::Key,
+                    SharedString::from(self.text("redis.empty.heading")),
+                    SharedString::from(self.text("redis.empty.detail")),
+                    create,
+                    &p,
+                ));
+            }
+            ListState::Rows => {
+                if self.busy {
+                    list = list.child(kit::inline_loading(SharedString::from(self.text("redis.list.busy")), &m, &p));
+                }
+            }
         }
         for (prefix, depth, open) in folders {
             let id = format!("redis-folder:{prefix}");
@@ -1446,14 +1600,13 @@ impl Render for RedisPane {
         }
         let side_w = m.header_h() * 6. + m.pane_pad();
         let left = div()
-            .flex_none()
-            .w(px(side_w))
             .h_full()
             .flex()
             .flex_col()
             .bg(p.chrome)
-            .border_r_1()
-            .border_color(p.line)
+            // 宽窗口是固定宽的左侧栏；窄窗口整列占满，与值区域交替出现，不再互相挤压。
+            .when(narrow, |this| this.w_full().min_w(px(0.)))
+            .when(!narrow, |this| this.flex_none().w(px(side_w)).border_r_1().border_color(p.line))
             .child(
                 div()
                     .p(px(10.))
@@ -1490,7 +1643,23 @@ impl Render for RedisPane {
                     .children(new_form),
             )
             .child(list)
-            .child(
+            .child(if scan_failed && !self.keys.is_empty() {
+                // 已读到的键还在，只有这一页失败：底部给原因和重试，不清空列表、不动选中键。
+                div()
+                    .id("redis-list-error")
+                    .test_support()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .px(px(10.))
+                    .py(px(6.))
+                    .border_t_1()
+                    .border_color(p.line)
+                    .child(kit::icon(IconName::CircleAlert, 13., p.danger))
+                    .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::XS)).text_color(p.danger).child(SharedString::from(self.error.clone())))
+                    .child(redis_button("redis-retry-scan", Some(IconName::RefreshCw), &self.text("common.retry"), Kind::Tool, &entity))
+                    .into_any_element()
+            } else {
                 div()
                     .flex()
                     .items_center()
@@ -1500,14 +1669,62 @@ impl Render for RedisPane {
                     .border_t_1()
                     .border_color(p.line)
                     .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(if self.done { self.text("redis.tab.scanDone") } else { format!("{} keys", self.keys.len()) })))
-                    .child(redis_button("redis-more", Some(IconName::ChevronsDown), &self.text("redis.tab.loadMore"), Kind::Tool, &entity)),
-            );
+                    .child(redis_button("redis-more", Some(IconName::ChevronsDown), &self.text("redis.tab.loadMore"), Kind::Tool, &entity))
+                    .into_any_element()
+            });
 
-        // ---- 右侧：键详情
-        let value_panel = if self.selected.is_empty() { None } else { Some(self.value_body(&p, &entity, window, cx)) };
-        let mut detail = div().flex().flex_col().gap(px(m.section_gap())).p(px(m.card_pad())).flex_1().min_h(px(0.));
+        // ---- 右侧：键详情。读到了内容才渲染结构化视图，读取中给骨架、失败给错误块。
+        let detail_error = self.error_source == ErrorSource::Detail && !self.error.is_empty();
+        let value_panel = if self.detail.is_some() {
+            Some(self.value_body(&p, &entity, window, cx))
+        } else if detail_error {
+            let owner = entity.clone();
+            let retry = kit::secondary_button(
+                "redis-retry-read",
+                Some(IconName::RefreshCw),
+                SharedString::from(self.text("redis.retry.read")),
+                move |_, _, cx| owner.update(cx, |pane, cx| pane.command("redis-retry-read", cx)),
+            )
+            .into_any_element();
+            Some(
+                kit::error_state_with_action(
+                    SharedString::from(self.text("redis.error.detail.heading")),
+                    SharedString::from(self.error.clone()),
+                    retry,
+                    &p,
+                )
+                .into_any_element(),
+            )
+        } else if self.busy {
+            Some(kit::skeleton_state(4, &m, &p).into_any_element())
+        } else {
+            Some(
+                div()
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.text_muted)
+                    .child(SharedString::from(self.text("redis.tab.pickKey")))
+                    .into_any_element(),
+            )
+        };
+        let mut detail = div().flex().flex_col().gap(px(m.section_gap())).p(px(m.card_pad())).flex_1().min_w(px(0.)).min_h(px(0.));
         if self.selected.is_empty() {
-            detail = detail.child(div().flex_1().flex().items_center().justify_center().child(kit::empty_state(IconName::Key, SharedString::from(self.text("redis.open")), SharedString::from(self.text("redis.tab.pickKey")), &p)));
+            let owner = entity.clone();
+            let create = kit::primary_button(
+                "redis-new-key-value",
+                Some(IconName::Plus),
+                SharedString::from(self.text("redis.action.newKey")),
+                move |_, _, cx| owner.update(cx, |pane, cx| pane.command("redis-new-key-value", cx)),
+            )
+            .into_any_element();
+            detail = detail.child(
+                div().flex_1().min_w(px(0.)).child(kit::empty_state_with_action(
+                    IconName::Key,
+                    SharedString::from(self.text("redis.empty.pick.heading")),
+                    SharedString::from(self.text("redis.tab.pickKey")),
+                    create,
+                    &p,
+                )),
+            );
         } else {
             let (type_name, ttl_text) = self
                 .detail
@@ -1530,6 +1747,7 @@ impl Render for RedisPane {
                 .child(
                     div()
                         .id("redis-value")
+                        .test_support()
                         .flex_1()
                         .min_h(px(120.))
                         .overflow_y_scroll()
@@ -1633,7 +1851,24 @@ impl Render for RedisPane {
                     .child(redis_button("redis-confirm", Some(IconName::Check), &self.text("redis.tab.confirmExecute"), Kind::Danger, &entity)),
             );
         }
-        let status_text = if self.error.is_empty() { self.note.clone() } else { self.error.clone() };
+        // 命令/写删失败：错误块带"关闭提示"，命令原文留在输入框里可直接改；底部状态行只留结果说明，
+        // 同一段错误不在两处重复堆叠。
+        if self.error_source == ErrorSource::Command && !self.error.is_empty() {
+            let owner = entity.clone();
+            let dismiss = kit::secondary_button(
+                "redis-error-dismiss",
+                Some(IconName::X),
+                SharedString::from(self.text("redis.error.dismiss")),
+                move |_, _, cx| owner.update(cx, |pane, cx| pane.command("redis-error-dismiss", cx)),
+            )
+            .into_any_element();
+            console = console.child(kit::error_state_with_action(
+                SharedString::from(self.text("redis.error.command.heading")),
+                SharedString::from(self.error.clone()),
+                dismiss,
+                &p,
+            ));
+        }
         console = console.child(
             div()
                 .id("redis-status")
@@ -1642,12 +1877,13 @@ impl Render for RedisPane {
                 .aria_label(SharedString::from(self.status_line()))
                 .min_h(px(16.))
                 .text_size(px(TypeScale::SM))
-                .text_color(if self.error.is_empty() { p.text_muted } else { p.danger })
-                .child(SharedString::from(status_text)),
+                .text_color(p.text_muted)
+                .child(SharedString::from(self.note.clone())),
         );
 
-        div()
+        let mut root = div()
             .id("redis-pane")
+            .test_support()
             .size_full()
             .flex()
             .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
@@ -1664,9 +1900,51 @@ impl Render for RedisPane {
                     cx.stop_propagation();
                     cx.notify();
                 }
-            }))
-            .child(left)
-            .child(div().flex_1().min_w(px(0.)).h_full().flex().flex_col().child(detail).child(console))
+            }));
+        if narrow {
+            // 窄窗口：键列表与值区域交替占满整列（主从式重排），命令行走廊固定在底部。
+            // 先选键、再切回来，两栏都不被压成看不清的窄条。
+            let (toggle_icon, toggle_label) = if show_keys {
+                (IconName::ChevronRight, self.text("redis.nav.value"))
+            } else {
+                (IconName::ChevronLeft, self.text("redis.nav.keys"))
+            };
+            let strip = div()
+                .id("redis-nav-strip")
+                .test_support()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(m.pad))
+                .px(px(m.pane_pad()))
+                .py(px(4.))
+                .border_b_1()
+                .border_color(p.line)
+                .bg(p.chrome)
+                .child(redis_button("redis-nav-toggle", Some(toggle_icon), &toggle_label, Kind::Tool, &entity))
+                .when(!show_keys, |this| {
+                    this.child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(TypeScale::SM))
+                            .text_color(p.text_muted)
+                            .child(SharedString::from(self.selected.clone())),
+                    )
+                });
+            let content = if show_keys { left.into_any_element() } else { detail.into_any_element() };
+            root = root
+                .flex_col()
+                .child(strip)
+                .child(div().id("redis-narrow-body").flex_1().min_h(px(0.)).flex().child(content))
+                .child(console);
+        } else {
+            root = root
+                .child(left)
+                .child(div().flex_1().min_w(px(0.)).h_full().flex().flex_col().child(detail).child(console));
+        }
+        root
     }
 }
 
@@ -2197,3 +2475,6 @@ mod tests {
 
 #[cfg(test)]
 mod live;
+
+#[cfg(test)]
+mod states;
