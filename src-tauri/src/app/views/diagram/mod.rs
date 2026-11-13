@@ -7,7 +7,7 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::{
-    canvas, AppContext as _, ClickEvent, Context, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, PathBuilder,
+    canvas, AppContext as _, ClickEvent, Context, Focusable as _, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, PathBuilder,
     Render, ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
 };
 
@@ -132,8 +132,8 @@ impl DiagramPane {
             return;
         }
         let Some(target) = parse_spec(spec) else {
+            // 没有目标不是“读取失败”：走无目标空态并给出下一步，不用错误色和重试按钮。
             self.clear_target();
-            self.error = i18n::text(self.locale, "diagram.needTarget");
             self.applied = spec.to_owned();
             cx.notify();
             return;
@@ -167,6 +167,8 @@ impl DiagramPane {
             self.zoom = 1.;
             self.pan_x = 0.;
             self.pan_y = 0.;
+        } else if id == "diagram-search-clear" {
+            self.clear_search();
         } else if id == "diagram-menu-close" {
             self.card_menu = None;
         } else if let Some(name) = id.strip_prefix("diagram-open-data:") {
@@ -199,6 +201,7 @@ impl DiagramPane {
         self.label.clear();
         self.diagram = None;
         self.loading = false;
+        self.error.clear();
         self.reset_canvas();
     }
 
@@ -327,6 +330,91 @@ impl DiagramPane {
         }
     }
 
+    /// 当前这一页该显示哪一种状态。渲染与测试共用这一份判断，不再各写一套三态。
+    fn state(&self) -> PaneState {
+        if self.loading {
+            PaneState::Loading
+        } else if !self.error.is_empty() {
+            PaneState::Error
+        } else if self.connection_id.is_empty() {
+            PaneState::NeedTarget
+        } else if self.diagram.as_ref().is_some_and(|diagram| diagram.tables.is_empty()) {
+            PaneState::Empty
+        } else if self.diagram.is_some() {
+            PaneState::Cards
+        } else {
+            PaneState::NeedTarget
+        }
+    }
+
+    /// 卡片上的键盘等价操作：Enter = 双击（打开数据），Shift+Enter = 看结构，
+    /// 菜单键 / Shift+F10 = 右键菜单，Esc = 收起菜单与悬停。返回是否已处理（决定要不要停冒泡）。
+    fn card_key(&mut self, table: &str, key: &str, shift: bool) -> bool {
+        match key {
+            "enter" => {
+                self.hovered = Some(table.to_owned());
+                self.request_open(table, shift);
+                true
+            }
+            "contextmenu" | "menu" => self.open_card_menu(table),
+            "f10" if shift => self.open_card_menu(table),
+            "escape" => {
+                self.hovered = None;
+                self.card_menu.take().is_some()
+            }
+            _ => false,
+        }
+    }
+
+    fn open_card_menu(&mut self, table: &str) -> bool {
+        let known = self.diagram.as_ref().is_some_and(|diagram| diagram.tables.iter().any(|item| item.name == table));
+        if !known {
+            return false;
+        }
+        self.card_menu = Some(table.to_owned());
+        true
+    }
+
+    /// 页面内的键盘动作（从卡片、菜单按钮冒泡到根）：Esc 收起菜单与悬停，+/- 缩放，0 复位。
+    fn pane_key(&mut self, key: &str) -> bool {
+        match key {
+            "escape" => {
+                let menu = self.card_menu.take().is_some();
+                let hover = self.hovered.take().is_some();
+                menu || hover
+            }
+            "=" | "+" => {
+                self.zoom = clamp_zoom(self.zoom + 0.1);
+                true
+            }
+            "-" => {
+                self.zoom = clamp_zoom(self.zoom - 0.1);
+                true
+            }
+            "0" => {
+                self.zoom = 1.;
+                self.pan_x = 0.;
+                self.pan_y = 0.;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn clear_search(&mut self) {
+        self.search.clear();
+        self.highlight = None;
+        self.center_pending = false;
+        if let Some(field) = self.search_input.as_mut() {
+            field.sync.clear();
+        }
+    }
+
+    /// 搜索框聚焦时自己吃掉字符：页面快捷键（+/-/0、Esc）不能顺手改画布。
+    fn search_focused(&self, window: &Window, cx: &gpui_kit::App) -> bool {
+        self.search_input.as_ref().is_some_and(|field| field.state.read(cx).focus_handle(cx).is_focused(window))
+    }
+
     pub fn column_of(&self, name: &str) -> Option<usize> {
         let diagram = self.diagram.as_ref()?;
         layout_columns(&diagram.tables, &diagram.edges).into_iter().position(|column| column.iter().any(|table| table.name == name))
@@ -368,6 +456,15 @@ impl DiagramPane {
         if let Some(note) = &self.open_note {
             lines.push(note.clone());
         }
+        if let Some(name) = &self.card_menu {
+            lines.push(format!("menu {name}"));
+        }
+        if !self.search.trim().is_empty() {
+            match &self.highlight {
+                Some(name) => lines.push(format!("search-match {name}")),
+                None => lines.push(format!("search-no-match {}", self.search.trim())),
+            }
+        }
         if let Some(open) = &self.navigation {
             let kind = if open.structure { "open-structure" } else { "open-data" };
             lines.push(format!("{kind} {}", open.table));
@@ -406,6 +503,21 @@ impl DiagramPane {
         }
         lines
     }
+}
+
+/// 关系图页的四种状态。每种状态在渲染里都带一条可执行的下一步。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaneState {
+    /// 正在读取：局部加载，读完后卡片逐列出现。
+    Loading,
+    /// 读取失败：错误块 + 重试。
+    Error,
+    /// 没有目标：说明先去选库/模式，并给出打开资源管理器的键位。
+    NeedTarget,
+    /// 这个范围里没有表：说明为什么空，并给出重新读取。
+    Empty,
+    /// 有表：画布。
+    Cards,
 }
 
 fn clamp_zoom(zoom: f32) -> f32 {
@@ -693,6 +805,327 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn sample_diagram() -> Diagram {
+        Diagram {
+            database: "shop".into(),
+            schema: String::new(),
+            tables: vec![
+                DiagramTable {
+                    name: "customers".into(),
+                    columns: vec![crate::diagram::DiagramColumn { name: "id".into(), type_name: "INTEGER".into(), primary: true }],
+                    outside: Vec::new(),
+                },
+                DiagramTable {
+                    name: "orders".into(),
+                    columns: vec![
+                        crate::diagram::DiagramColumn { name: "id".into(), type_name: "INTEGER".into(), primary: true },
+                        crate::diagram::DiagramColumn { name: "customer_id".into(), type_name: "INTEGER".into(), primary: false },
+                    ],
+                    outside: Vec::new(),
+                },
+            ],
+            edges: vec![DiagramEdge {
+                name: "fk_orders_customer".into(),
+                from_table: "orders".into(),
+                from_columns: vec!["customer_id".into()],
+                to_table: "customers".into(),
+                to_columns: vec!["id".into()],
+            }],
+            omitted: Vec::new(),
+            notice: None,
+        }
+    }
+
+    fn sample_pane(tag: &str) -> (DiagramPane, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("rillsql-diagram-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        let mut pane = DiagramPane::new(services);
+        pane.connection_id = "notes".into();
+        pane.database = "shop".into();
+        pane.label = "笔记 / shop".into();
+        pane.diagram = Some(sample_diagram());
+        (pane, dir)
+    }
+
+    /// 卡片的键盘等价操作与鼠标手势一一对应：Enter = 双击打开数据，Shift+Enter = 看结构，
+    /// 菜单键 / Shift+F10 = 右键菜单，Esc 收起；未知表不产生打开请求。
+    #[test]
+    fn card_keyboard_equivalents_match_the_mouse_gestures() {
+        let (mut pane, dir) = sample_pane("card-keys");
+        assert!(pane.card_key("orders", "enter", false), "Enter 由卡片处理");
+        let open = pane.take_open().expect("Enter = 打开表数据");
+        assert_eq!((open.table.as_str(), open.structure), ("orders", false));
+        assert!(pane.card_key("orders", "enter", true), "Shift+Enter 由卡片处理");
+        assert!(pane.take_open().expect("Shift+Enter = 看结构").structure);
+        assert!(pane.card_key("orders", "contextmenu", false), "菜单键 = 右键菜单");
+        assert_eq!(pane.card_menu.as_deref(), Some("orders"));
+        assert!(pane.card_key("orders", "escape", false), "Esc 收起菜单");
+        assert!(pane.card_menu.is_none());
+        assert!(pane.card_key("orders", "f10", true), "Shift+F10 = 右键菜单");
+        assert_eq!(pane.card_menu.as_deref(), Some("orders"));
+        assert!(!pane.card_key("orders", "f10", false), "单独 F10 不抢系统菜单");
+        assert!(pane.card_key("missing", "enter", false));
+        assert!(pane.take_open().is_none(), "不存在的表不能变成打开请求");
+        assert!(!pane.take_back(), "键盘操作不触发返回");
+        // 四态取值来自底座：可点卡片 hover/active 有底色、焦点环 2px 强调色、非禁用时可聚焦。
+        let p = Palette::light();
+        let style = kit::interaction_style(&p, false);
+        assert_eq!(style.hover_bg, Some(p.hover));
+        assert_eq!(style.active_bg, Some(p.active));
+        assert_eq!(style.ring, Some(p.accent));
+        assert_eq!(style.ring_width, kit::FOCUS_RING_W);
+        assert!(style.focusable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 页面级键盘：+/-/0 缩放，Esc 收起菜单与悬停。
+    #[test]
+    fn pane_keys_zoom_and_dismiss_without_touching_the_diagram() {
+        let (mut pane, dir) = sample_pane("pane-keys");
+        assert!(pane.pane_key("="));
+        assert!((pane.zoom - 1.1).abs() < 1e-4, "{}", pane.zoom);
+        assert!(pane.pane_key("-"));
+        assert!((pane.zoom - 1.).abs() < 1e-4, "{}", pane.zoom);
+        pane.pan_x = 40.;
+        pane.pan_y = 24.;
+        assert!(pane.pane_key("0"));
+        assert_eq!((pane.pan_x, pane.pan_y, pane.zoom), (0., 0., 1.));
+        pane.card_menu = Some("orders".into());
+        pane.hovered = Some("orders".into());
+        assert!(pane.pane_key("escape"));
+        assert!(pane.card_menu.is_none() && pane.hovered.is_none());
+        assert!(!pane.pane_key("x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 四种状态各自的下一步与文字：无目标不显示成错误，空图给重新读取，失败给重试。
+    #[test]
+    fn four_states_carry_the_matching_next_step() {
+        let (mut pane, dir) = sample_pane("states");
+        assert_eq!(pane.state(), PaneState::Cards);
+        assert!(pane.lines().iter().any(|line| line == "column 0 card customers"));
+
+        let mut empty = sample_diagram();
+        empty.tables.clear();
+        empty.edges.clear();
+        empty.notice = Some("这个库只有视图。".into());
+        pane.diagram = Some(empty);
+        assert_eq!(pane.state(), PaneState::Empty);
+        let text = pane.lines().join("\n");
+        assert!(text.contains("这个库只有视图。"), "空图要说明为什么空：{text}");
+
+        pane.diagram = None;
+        pane.error = "笔记 / shop：读取失败：权限不足".into();
+        assert_eq!(pane.state(), PaneState::Error);
+        assert!(pane.lines().join("\n").contains("权限不足"));
+
+        pane.error.clear();
+        pane.clear_target();
+        assert_eq!(pane.state(), PaneState::NeedTarget);
+        let text = pane.lines().join("\n");
+        assert!(text.contains(&i18n::text(Locale::ZhCn, "diagram.needTarget")), "{text}");
+        assert!(!text.contains(&i18n::text(Locale::ZhCn, "diagram.failed")), "没有目标不是读取失败：{text}");
+
+        pane.loading = true;
+        assert_eq!(pane.state(), PaneState::Loading);
+        pane.loading = false;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct PaneHost {
+        pane: gpui_kit::Entity<DiagramPane>,
+    }
+
+    impl Render for PaneHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().id("pane-host").size_full().child(self.pane.clone())
+        }
+    }
+
+    /// 打开一个指定宽度的关系图窗口。视口尺寸由窗口本身决定，不靠运行期 resize。
+    fn open_diagram_window(cx: &mut TestAppContext, width: f32) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<DiagramPane>) {
+        let dir = std::env::temp_dir().join(format!("rillsql-diagram-widths-{}-{}", width as i32, uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        cx.update(|cx| {
+            let pane = cx.new(|_| DiagramPane::new(services));
+            let host = cx.new(|_| PaneHost { pane: pane.clone() });
+            let bounds = gpui_kit::Bounds { origin: Point::default(), size: size(px(width), px(900.)) };
+            let (window, _view) = gpui_kit::open_window(
+                WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |_, _cx| host,
+            )
+            .expect("关系图窗口");
+            (window, pane)
+        })
+    }
+
+    /// 把关系图摆到指定状态：四态都不依赖异步读取，测试直接构造现场。
+    fn fill_state(pane: &gpui_kit::Entity<DiagramPane>, state: &str, cx: &mut gpui_kit::App) {
+        pane.update(cx, |pane, cx| {
+            pane.error.clear();
+            pane.loading = false;
+            pane.navigation = None;
+            pane.open_note = None;
+            match state {
+                "cards" => {
+                    pane.connection_id = "notes".into();
+                    pane.database = "shop".into();
+                    pane.label = "笔记 / shop".into();
+                    pane.diagram = Some(sample_diagram());
+                }
+                "empty" => {
+                    pane.connection_id = "notes".into();
+                    pane.database = "shop".into();
+                    pane.label = "笔记 / shop".into();
+                    let mut diagram = sample_diagram();
+                    diagram.tables.clear();
+                    diagram.edges.clear();
+                    pane.diagram = Some(diagram);
+                }
+                "error" => {
+                    pane.diagram = None;
+                    pane.error = "笔记 / shop：读取失败：权限不足".into();
+                }
+                "need-target" => pane.clear_target(),
+                "loading" => {
+                    pane.clear_target();
+                    pane.connection_id = "notes".into();
+                    pane.label = "笔记 / shop".into();
+                    pane.loading = true;
+                }
+                _ => {}
+            }
+            cx.notify();
+        });
+    }
+
+    /// 一个宽度 × 浅/深色 × 紧凑/标准：四态各自的下一步、卡片 Tab 可达与 Enter 等价操作、缩放可达。
+    fn diagram_holds_at(cx: &mut TestAppContext, width: f32) {
+        cx.update(gpui_kit::init);
+        let (window, pane) = open_diagram_window(cx, width);
+        let fill = |cx: &mut TestAppContext, state: &str| cx.update(|cx| fill_state(&pane, state, cx));
+        let narrow = width < kit::NARROW_PAGE_WIDTH;
+        for (dark, density) in [(false, "compact"), (false, "standard"), (true, "compact"), (true, "standard")] {
+            cx.update(|cx| {
+                kit::apply_theme(dark, cx);
+                let metrics = if density == "compact" { kit::Metrics::compact() } else { kit::Metrics::standard() };
+                metrics.publish(cx);
+            });
+            let tag = format!("{width}/{}/{density}", if dark { "dark" } else { "light" });
+            cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+
+            fill(cx, "cards");
+            cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+            assert_eq!(cx.update(|cx| pane.read(cx).state()), PaneState::Cards, "{tag}");
+            cx.update_window(window, |_, window, cx| {
+                assert!(window.try_find("diagram-card:orders").is_some(), "{tag}：缺少订单卡片");
+                assert!(window.try_find("diagram-card:customers").is_some(), "{tag}：缺少客户卡片");
+                assert_eq!(window.try_find("diagram-tools").is_some(), narrow, "{tag}：只在窄宽换第二行工具条");
+                window.click("diagram-zoom-in", cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
+            assert!((cx.update(|cx| pane.read(cx).zoom) - 1.1).abs() < 1e-4, "{tag}：放大按钮在三档宽度都可用");
+
+            // 搜索无命中：提示条 + 清除搜索，画布保持可见（“无命中”与“没有表”不是同一件事）。
+            cx.update(|cx| {
+                pane.update(cx, |pane, cx| {
+                    pane.search = "zzz".into();
+                    pane.highlight = None;
+                    cx.notify();
+                })
+            });
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.try_find("diagram-no-match").is_some(), "{tag}：搜索无命中要有提示条");
+                assert!(window.try_find("diagram-card:orders").is_some(), "{tag}：无命中不隐藏画布");
+                window.click("diagram-search-clear", cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
+            assert!(cx.update(|cx| pane.read(cx).search.is_empty()), "{tag}：清除搜索后恢复现场");
+
+            // 纯键盘：Tab 停在卡片上按 Enter，走与双击相同的“打开表数据”请求。
+            let mut opened = false;
+            for _ in 0..40 {
+                cx.update_window(window, |_, window, cx| {
+                    window.focus_next(cx);
+                    window.render_frame(cx);
+                    window.press("enter", cx);
+                })
+                .unwrap();
+                if cx.update(|cx| pane.read(cx).navigation.is_some()) {
+                    opened = true;
+                    break;
+                }
+            }
+            assert!(opened, "{tag}：Tab 停在卡片后 Enter 必须能打开表");
+            cx.update(|cx| {
+                pane.update(cx, |pane, cx| {
+                    pane.navigation = None;
+                    pane.open_note = None;
+                    cx.notify();
+                })
+            });
+
+            fill(cx, "empty");
+            cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+            assert_eq!(cx.update(|cx| pane.read(cx).state()), PaneState::Empty, "{tag}");
+            cx.update_window(window, |_, window, _cx| {
+                assert!(window.try_find("empty-state").is_some(), "{tag}：空图应有空态");
+                assert!(window.try_find("state-action").is_some(), "{tag}：空图应有下一步");
+                assert!(window.try_find("diagram-read-again").is_some(), "{tag}：空图应能重新读取");
+            })
+            .unwrap();
+
+            fill(cx, "error");
+            cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+            assert_eq!(cx.update(|cx| pane.read(cx).state()), PaneState::Error, "{tag}");
+            cx.update_window(window, |_, window, _cx| {
+                assert!(window.try_find("error-state").is_some(), "{tag}：失败应有错误态");
+                assert!(window.try_find("error-state-detail").is_some(), "{tag}：失败要说明原因");
+                assert!(window.try_find("diagram-retry").is_some(), "{tag}：失败应能重试");
+            })
+            .unwrap();
+
+            fill(cx, "need-target");
+            cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+            assert_eq!(cx.update(|cx| pane.read(cx).state()), PaneState::NeedTarget, "{tag}");
+            cx.update_window(window, |_, window, _cx| {
+                assert!(window.try_find("empty-state").is_some(), "{tag}：无目标是空态");
+                assert!(window.try_find("error-state").is_none(), "{tag}：无目标不能用错误态");
+                assert!(window.try_find("state-action").is_some(), "{tag}：无目标要给下一步");
+            })
+            .unwrap();
+
+            fill(cx, "loading");
+            cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+            assert_eq!(cx.update(|cx| pane.read(cx).state()), PaneState::Loading, "{tag}");
+            cx.update_window(window, |_, window, _cx| {
+                assert!(window.try_find("loading-state").is_some(), "{tag}：读取中应有加载态");
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn diagram_four_states_and_keyboard_hold_at_1360(cx: &mut TestAppContext) {
+        diagram_holds_at(cx, 1360.);
+    }
+
+    #[gpui_kit::test]
+    fn diagram_four_states_and_keyboard_hold_at_900(cx: &mut TestAppContext) {
+        diagram_holds_at(cx, 900.);
+    }
+
+    #[gpui_kit::test]
+    fn diagram_four_states_and_keyboard_hold_at_640(cx: &mut TestAppContext) {
+        diagram_holds_at(cx, 640.);
+    }
+
     fn pump(
         cx: &mut TestAppContext,
         window: gpui_kit::AnyWindowHandle,
@@ -835,24 +1268,103 @@ impl Render for DiagramPane {
         };
 
         // 只读说明放进标题的悬停提示，不常驻占一行。页头高度和左右边距走统一令牌。
-        let header = div().id("diagram-title").tooltip_text(t("diagram.readonly")).child(
-            kit::page_header(title, &[], &metrics, &p)
-                .child(div().w(px(180.)).child(kit::text_input("diagram-search", &search, t("diagram.search"))))
-                .child(zoom_out)
-                .child(zoom_reset)
-                .child(zoom_in)
-                .child(zoom_fit)
-                .child(back)
-                .child(div().id("diagram-pad").test_support().w(px(8.)).h(px(metrics.control_h))),
-        );
+        // 窄窗口把搜索框与缩放/返回换到第二行：页头不撑宽，页面本身不出现横向滚动。
+        let viewport_w = window.viewport_size().width.as_f32();
+        let pad_metrics = metrics.for_viewport(viewport_w);
+        let narrow = viewport_w < kit::NARROW_PAGE_WIDTH;
+        let layout_pad = pad_metrics.page_pad;
+        let search_box = if narrow {
+            div().flex_1().min_w(px(0.)).child(kit::text_input("diagram-search", &search, t("diagram.search")))
+        } else {
+            div().w(px(180.)).child(kit::text_input("diagram-search", &search, t("diagram.search")))
+        };
+        let header = if narrow {
+            div()
+                .id("diagram-header")
+                .flex_none()
+                .flex()
+                .flex_col()
+                .bg(p.surface)
+                .border_b_1()
+                .border_color(p.line)
+                .child(div().id("diagram-title").tooltip_text(t("diagram.readonly")).child(kit::page_header(title, &[], &pad_metrics, &p)))
+                .child(
+                    div()
+                        .id("diagram-tools")
+                        .test_support()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .px(px(layout_pad))
+                        .pb(px(8.))
+                        .child(search_box)
+                        .child(zoom_out)
+                        .child(zoom_reset)
+                        .child(zoom_in)
+                        .child(zoom_fit)
+                        .child(back),
+                )
+        } else {
+            div().id("diagram-header").flex_none().flex().flex_col().child(
+                div().id("diagram-title").tooltip_text(t("diagram.readonly")).child(
+                    kit::page_header(title, &[], &pad_metrics, &p)
+                        .child(search_box)
+                        .child(zoom_out)
+                        .child(zoom_reset)
+                        .child(zoom_in)
+                        .child(zoom_fit)
+                        .child(back),
+                ),
+            )
+        };
 
+        let pane_state = self.state();
+        // 没有目标时的下一步：说明 + 打开资源管理器的键位。不是错误，也不用错误色。
+        let need_target_state = kit::empty_state_with_action(
+            IconName::ChartNetwork,
+            t("catalog.tree.diagram"),
+            t("diagram.needTarget"),
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(kit::kbd(kit::shortcut("Ctrl+B"), &p))
+                .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(t("shell.command.toggleSidebar"))),
+            &p,
+        )
+        .into_any_element();
         let mut body = div().id("diagram-scroll").flex_1().min_h(px(0.)).overflow_hidden().bg(p.chrome);
-        if self.loading {
-            body = body.child(kit::loading_state(t("diagram.loading"), &p).size_full());
-        } else if !self.error.is_empty() {
-            let retry = {
+        if matches!(pane_state, PaneState::Loading) {
+            body = body.child(
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(layout_pad))
+                    .child(kit::loading_state(t("diagram.loading"), &p)),
+            );
+        } else if matches!(pane_state, PaneState::Error) {
+            let detail = SharedString::from(self.error.clone());
+            let block = if self.connection_id.is_empty() {
+                kit::error_state(t("diagram.failed"), detail, &p).into_any_element()
+            } else {
+                let retry = {
+                    let entity = entity.clone();
+                    kit::secondary_button("diagram-retry", Some(IconName::RefreshCw), t("common.retry"), move |_, _, cx| {
+                        entity.update(cx, |pane, cx| pane.command("diagram-retry", cx))
+                    })
+                };
+                // 重试放进状态块的动作位，与标题文字左对齐（38px 缩进），不再另起一行居中追加。
+                kit::error_state_with_action(t("diagram.failed"), detail, retry, &p).into_any_element()
+            };
+            body = body.child(div().size_full().flex().flex_col().items_start().justify_center().px(px(layout_pad)).child(block));
+        } else if matches!(pane_state, PaneState::Empty) {
+            let notice = diagram.as_ref().and_then(|diagram| diagram.notice.clone()).filter(|notice| !notice.is_empty());
+            let detail = SharedString::from(notice.unwrap_or_else(|| i18n::text(locale, "diagram.emptyDetail")));
+            let reread = {
                 let entity = entity.clone();
-                kit::secondary_button("diagram-retry", Some(IconName::RefreshCw), t("common.retry"), move |_, _, cx| {
+                kit::secondary_button("diagram-read-again", Some(IconName::RefreshCw), t("common.retry"), move |_, _, cx| {
                     entity.update(cx, |pane, cx| pane.command("diagram-retry", cx))
                 })
             };
@@ -861,16 +1373,39 @@ impl Render for DiagramPane {
                     .size_full()
                     .flex()
                     .flex_col()
-                    .items_center()
+                    .items_start()
                     .justify_center()
-                    .gap(px(10.))
-                    .child(kit::error_state(t("diagram.failed"), SharedString::from(self.error.clone()), &p))
-                    .when(!self.connection_id.is_empty(), |this| this.child(retry)),
+                    .px(px(layout_pad))
+                    .child(kit::empty_state_with_action(IconName::Workflow, t("diagram.empty"), detail, reread, &p)),
             );
         } else if let Some(diagram) = diagram.as_ref() {
-            if diagram.tables.is_empty() {
-                body = body.child(div().size_full().flex().items_center().justify_center().child(kit::empty_state(IconName::Workflow, t("diagram.empty"), SharedString::from(diagram.notice.clone().unwrap_or_default()), &p)));
-            } else {
+            {
+                // 搜索无命中只加一条提示条：画布保持可见，清空条件即恢复现场。
+                if !self.search.trim().is_empty() && highlight.is_none() {
+                    let clear = {
+                        let entity = entity.clone();
+                        kit::secondary_button("diagram-search-clear", None, t("diagram.searchClear"), move |_, _, cx| {
+                            entity.update(cx, |pane, cx| pane.command("diagram-search-clear", cx))
+                        })
+                    };
+                    body = body.child(
+                        div()
+                            .id("diagram-no-match")
+                            .test_support()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .px(px(layout_pad))
+                            .py(px(6.))
+                            .bg(p.surface)
+                            .border_b_1()
+                            .border_color(p.line)
+                            .child(kit::icon(IconName::SearchX, 13., p.text_muted))
+                            .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(t("diagram.searchNoMatch")))
+                            .child(clear),
+                    );
+                }
                 let columns = layout_columns(&diagram.tables, &diagram.edges);
                 let foreign = foreign_columns(diagram);
                 // 卡片位置：按列从左到右，被引用的表在左。先算未缩放坐标，再平移和缩放。
@@ -1080,8 +1615,7 @@ impl Render for DiagramPane {
                         for note in &table.outside {
                             rows = rows.child(div().h(px(ROW_H)).px(px(12.)).flex().items_center().gap(px(6.)).text_size(px(TypeScale::XS)).text_color(p.warn).child(kit::icon(IconName::ExternalLink, 11., p.warn)).child(div().truncate().child(SharedString::from(note.clone()))));
                         }
-                        canvas_box = canvas_box.child(
-                            div()
+                        let card = div()
                                 .id(SharedString::from(format!("diagram-card:{name}")))
                                 .test_support()
                                 .role(gpui_kit::Role::Button)
@@ -1090,7 +1624,6 @@ impl Render for DiagramPane {
                                 .left(px(x))
                                 .top(px(y))
                                 .w(px(card_w))
-                                .opacity(opacity)
                                 .rounded(px(Radius::PANEL))
                                 .border_1()
                                 .border_color(border)
@@ -1166,8 +1699,29 @@ impl Render for DiagramPane {
                                         }
                                         cx.notify();
                                     });
-                                }),
-                        );
+                                })
+                                .on_key_down({
+                                    // 卡片是 Tab 停靠点：Enter / Shift+Enter 打开，菜单键或 Shift+F10 出菜单，Esc 收起。
+                                    let name = name.clone();
+                                    let key_entity = entity.clone();
+                                    move |event: &gpui_kit::KeyDownEvent, _, cx| {
+                                        let key = event.keystroke.key.as_str();
+                                        let shift = event.keystroke.modifiers.shift;
+                                        let handled = key_entity.update(cx, |pane, cx| {
+                                            let handled = pane.card_key(&name, key, shift);
+                                            if handled {
+                                                cx.notify();
+                                            }
+                                            handled
+                                        });
+                                        if handled {
+                                            cx.stop_propagation();
+                                        }
+                                    }
+                                });
+                        // hover / active / focus-visible / disabled 四态走底座，不再自己拼底色。
+                        // 悬停时其余卡片要按既有 dim 变淡，所以不透明度放在底座之后设置。
+                        canvas_box = canvas_box.child(kit::interactive(card, &p, false).opacity(opacity));
                     }
                 }
                 body = body.child(canvas_box);
@@ -1188,25 +1742,54 @@ impl Render for DiagramPane {
                             entity.update(cx, |pane, cx| pane.command(&format!("diagram-open-structure:{table}"), cx));
                         })
                     };
-                    body = body.child(
-                        div()
-                            .flex_none()
-                            .px(px(metrics.pane_pad()))
-                            .py(px(8.))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .bg(p.surface)
-                            .border_t_1()
-                            .border_color(p.line)
-                            .child(div().text_size(px(TypeScale::SM)).child(SharedString::from(name)))
-                            .child(open_data)
-                            .child(open_structure),
-                    );
+                    let menu_close = {
+                        let entity = entity.clone();
+                        kit::icon_button("diagram-menu-close", IconName::X, t("common.close"), move |_, _, cx| {
+                            entity.update(cx, |pane, cx| pane.command("diagram-menu-close", cx))
+                        })
+                    };
+                    let mut bar = div()
+                        .id("diagram-card-menu")
+                        .test_support()
+                        .flex_none()
+                        .px(px(layout_pad))
+                        .py(px(8.))
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .bg(p.surface)
+                        .border_t_1()
+                        .border_color(p.line)
+                        .child(div().text_size(px(TypeScale::SM)).child(SharedString::from(name)))
+                        .child(open_data)
+                        .child(open_structure)
+                        .child(menu_close);
+                    if !narrow {
+                        // 菜单同时标出键盘等价键位：Enter 打开数据、Shift+Enter 看结构、Esc 收起。
+                        bar = bar.child(
+                            div()
+                                .id("diagram-card-keys")
+                                .ml_auto()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .child(kit::kbd(kit::shortcut("Enter"), &p))
+                                .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(t("diagram.openData")))
+                                .child(div().w(px(8.)))
+                                .child(kit::kbd(kit::shortcut("Shift+Enter"), &p))
+                                .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(t("diagram.openStructure")))
+                                .child(div().w(px(8.)))
+                                .child(kit::kbd("Esc", &p))
+                                .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(t("common.close"))),
+                        );
+                    }
+                    body = body.child(bar);
                 }
             }
         } else {
-            body = body.child(div().size_full().flex().items_center().justify_center().child(kit::empty_state(IconName::Workflow, t("catalog.tree.diagram"), t("diagram.needTarget"), &p)));
+            // 兜底与 NeedTarget 同一份呈现，不再出现第五种状态。
+            body = body.child(div().size_full().flex().flex_col().items_start().justify_center().px(px(layout_pad)).child(need_target_state));
         }
 
         let mut footer = div().flex_none().flex().flex_col();
@@ -1233,6 +1816,22 @@ impl Render for DiagramPane {
             .size_full()
             .flex()
             .flex_col()
+            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                // 键盘事件按“焦点元素 → 祖先”冒泡到这里：卡片自己先处理，菜单按钮、搜索框的也不误伤。
+                let key = event.keystroke.key.as_str();
+                if this.search_focused(window, cx) {
+                    if key == "escape" {
+                        this.clear_search();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                    return;
+                }
+                if this.pane_key(key) {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .child(header)
             .child(body)
             .child(footer)
