@@ -13,7 +13,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 
 | target | 通过 | 失败 | ignored |
 | --- | --- | --- | --- |
-| `rillsql` lib | 930 | 0 | 7 |
+| `rillsql` lib | 931 | 0 | 7 |
 | `src/main.rs` | 0 | 0 | 0 |
 | `rillsql-package` | 1 | 0 | 0 |
 
@@ -65,7 +65,20 @@ menu_row_h`、颜色走 `Palette`。
 | `app::shell::tests::sidebar_copy_and_test_remain_usable_while_catalog_is_loading`（更新） | 先关模态，右键仍可复制配置与测试；测试结果回到 `test.ok` |
 | `app::shell::tests::headless_workbench_renders_on_windows_widths` | 1360/900/640 三档真实绘制（既有，未回退） |
 
-## 5. 三档宽度 × 双主题双密度的源码级证据矩阵
+## 5. Owner 追加的跨范围接线：关系图页头“返回”
+
+T10 的 `DiagramPane::take_back()` 原本没有消费者（页头返回点了没反应）。按 Owner 指示在
+`src-tauri/src/app/shell/view.rs` 消费它，与对比页 `take_back` 同一位置、同一模式：
+
+- `consume_diagram_back(cx)`：`diagram.take_back()` 为 true 时 `model.return_to_work()`；
+  图自己的范围/筛选/滚动留在图上，不重建工作项。
+- 调用点在 `Render::render` 里紧挨 `consume_diagram_open(cx)`，即每帧与对比页的
+  `refresh_compare` 对称地取一次请求。
+- 新用例 `app::shell::tests::diagram_header_back_returns_to_the_previous_work_item`：建一个查询工作项 →
+  打开关系图页面 → 点 `diagram-back` → 断言页面回到 Workspace、查询工作项还在、`diagram_spec` 不变。
+- 未改 T10 的 `views/diagram/`，也没有把按钮删掉。
+
+## 6. 三档宽度 × 双主题双密度的源码级证据矩阵
 
 | 维度 | 用例 | 断言的几何/状态 |
 | --- | --- | --- |
@@ -75,7 +88,7 @@ menu_row_h`、颜色走 `Palette`。
 | 浅色 / 深色 | `density_theme_…`（`theme-dark` → `theme-light` 断言 `cx.theme().is_dark()`） | 主题切换落到实际绘制主题，模态与启动台用同一 `Palette` |
 | 紧凑 / 标准（含宽松） | `density_theme_…`（compact 26 → relaxed 32）、`copy_fits…` | 控件高度跟着 `Metrics` 变，行高/菜单行高同源 |
 
-## 6. 未取得的证据（不冒充）
+## 7. 未取得的证据（不冒充）
 
 - **原生窗口与截图 PNG**：本环境没有可用截屏通道，`docs/verification/ui-ux-2026-11-14/connection-flow/` 下没有
   1360/900/640 或双主题双密度的图片。Delivery Owner 需在集成 candidate 上补。

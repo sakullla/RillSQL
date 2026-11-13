@@ -7230,3 +7230,37 @@ fn filter_popover_flips_inside_the_viewport() {
     assert!(y + 200. <= 600. - 8. + 0.01, "底部碰撞向上翻: {y}");
     assert!(y >= 8.);
 }
+
+/// 关系图页头的"返回"由外壳消费：回到原工作项，而不是留在一个点了没反应的空页上。
+#[gpui_kit::test]
+fn diagram_header_back_returns_to_the_previous_work_item(cx: &mut gpui_kit::TestAppContext) {
+    // 新建查询会写一次会话，后台线程会唤醒调度器；放行这次停车，避免判成非确定性。
+    cx.executor().allow_parking();
+    let dir = std::env::temp_dir().join(format!("rillsql-diagram-back-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench_sized(cx, services_at(&dir), false, 1360., 800.);
+    cx.update(|cx| {
+        view.update(cx, |view, cx| {
+            view.perform("new-query", cx);
+            view.perform("open-diagram:notes|main||图A", cx);
+        });
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| assert_eq!(view.read(cx).model.shell.page, AppPage::Diagram));
+
+    cx.update_window(window, |_, window, cx| {
+        window.click("diagram-back", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let model = &view.read(cx).model;
+        assert_eq!(model.shell.page, AppPage::Workspace, "返回要回到原工作项");
+        assert!(model.tabs.iter().any(|tab| tab.kind.is_query()), "原来的查询工作项还在");
+        assert_eq!(model.diagram_spec.as_deref(), Some("notes|main||图A"), "图自己的范围留在图上");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}

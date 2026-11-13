@@ -15,6 +15,9 @@
 | `behavior-map.md` | T3 六条 outcomes 逐条对应实现入口、行为取舍、回归用例，以及 T2 review 两条 P3 的关闭方式 |
 | `test-receipts.md` | 本轮实际运行的命令、通过/失败计数、环境与限制，含三档宽度/双主题双密度的源码级证据清单 |
 
+范围外但由 Owner 追加：`DiagramPane::take_back()` 在 `app/shell/view.rs` 的消费（关系图页头“返回”此前没有接线），
+见 `test-receipts.md` 第 5 节；没有改动 T10 的 `views/diagram/`。
+
 ## 证据类型（请勿混读）
 
 - **源码级 + Rust/GPUI 测试**：本目录结论来自 `cargo test`、`cargo clippy` 与本轮源码。连接测试使用真实 SQLite 文件与

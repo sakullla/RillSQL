@@ -2033,6 +2033,14 @@ impl Workbench {
         self.applied_tool = None;
     }
 
+    /// 关系图页头的“返回”：与对比页走同一条路径——回到原工作项，
+    /// 图自己的范围、筛选与滚动都留在图上，不重建成新工作项。
+    fn consume_diagram_back(&mut self, cx: &mut Context<Self>) {
+        if self.diagram.update(cx, |pane, _| pane.take_back()) {
+            self.model.return_to_work();
+        }
+    }
+
     fn consume_diagram_open(&mut self, cx: &mut Context<Self>) {
         let Some(open) = self.diagram.update(cx, |pane, _| pane.take_open()) else { return };
         self.open_diagram_target(open);
@@ -2143,6 +2151,7 @@ impl Render for Workbench {
         self.ensure_diagram(cx);
         self.consume_pending_create(cx);
         self.consume_diagram_open(cx);
+        self.consume_diagram_back(cx);
         self.sync_grid_flags(cx);
         self.refresh_exchange(cx);
         self.refresh_compare(cx);
