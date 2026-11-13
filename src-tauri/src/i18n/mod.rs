@@ -1095,6 +1095,8 @@ dict! {
     "connections.editor.tls.browseKey" => "浏览客户端私钥", "Browse client key";
     "connections.editor.ssh.browseKey" => "浏览 SSH 私钥", "Browse SSH private key";
     "connections.editor.saveConnect" => "保存并连接", "Save and connect";
+    "connections.launcher.recent" => "最近连接", "Recent connections";
+    "connections.launcher.all" => "全部连接", "All connections";
     "history.preview.copy" => "复制 SQL", "Copy SQL";
     "history.preview.saveQuery" => "保存为查询", "Save as query";
     "history.preview.failed" => "预览失败，原文仍保留。", "Preview failed; the original text was kept.";
