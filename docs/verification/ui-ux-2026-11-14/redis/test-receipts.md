@@ -8,8 +8,8 @@
 
 | 命令 | 结果 |
 | --- | --- |
-| `cargo test --manifest-path src-tauri/Cargo.toml --locked app::views::redis` | 通过：**14 passed / 0 failed**（958 filtered），含 7 个本任务新增用例与 3 个真实 Redis 夹具用例 |
-| `cargo test --manifest-path src-tauri/Cargo.toml --locked` | 通过：**966 passed / 0 failed / 7 ignored**（42.78s，exit 0） |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked app::views::redis` | 通过（T14-A2 修复后复跑）：**15 passed / 0 failed**（959 filtered），含 8 个本任务新增用例与 3 个真实 Redis 夹具用例 |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked` | 通过：**966 passed / 0 failed / 7 ignored**（42.78s，exit 0）。这是第一轮交付时的回执；T14-A2 修复后按 Owner 要求只复跑本模块，未再跑全量 |
 | `cargo test --manifest-path src-tauri/Cargo.toml --locked style_literals_follow_design_tokens` | 通过：`ui::kit::token_tests::style_literals_follow_design_tokens ... ok`（1 passed） |
 | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked` | 通过（exit 0）。`src/app/views/redis/states.rs` 0 条；`redis/mod.rs` 只剩 HEAD 已有的 `Field` 枚举 `enum_variant_names` 与 `EntryIndex` never constructed，本任务未新增 |
 | `git diff --exit-code -- src-tauri/Cargo.toml src-tauri/Cargo.lock` | 通过（exit 0），Cargo 依赖未变 |
@@ -20,7 +20,8 @@
 
 | 用例 | 覆盖 | 证据类型 |
 | --- | --- | --- |
-| `key_list_state_keeps_busy_error_no_match_and_empty_apart` | 四态判定表的每一行，含「加载优先于错误」「有键但过滤掉是无命中而非无数据」「下一页读取时行还在」 | 源码级 |
+| `key_list_state_keeps_busy_error_no_match_and_empty_apart` | 四态判定表的每一行（六个输入），含「加载优先于错误」「有键但过滤掉是无命中而非无数据」「下一页读取时行还在」「带模式 0 命中是无命中」「没读完不宣布空库」 | 源码级 |
+| `empty_state_needs_a_finished_scan_and_no_pattern` | 带模式扫出 0 个键 → `no-match-state` + `redis-clear-filter`，且没有空态/「新建键」；第一页 0 个键但游标没读完 → 不画空态也不画无命中，页脚 `redis-more` 仍在 | headless 布局级 |
 | `key_list_states_render_with_a_next_step` | 900×900 下：无数据 → `empty-state` + `state-action`；首屏读取 → `skeleton-state` 且键列表没有空态；类型过滤无命中 → `no-match-state`；SCAN 失败 → `error-state` + `redis-retry-scan`；有行再读 → `inline-loading` 且行还在 | headless 布局级 |
 | `narrow_window_swaps_the_key_list_and_the_value_area` | 640×720：选中键后只渲染值区域、切换条与按钮都在窗口内；点切换后键列表占满整列、按钮文案变成「键内容」；选中键自动转值区域；1100 宽时两栏并存且没有切换条 | headless 布局级 |
 | `failures_land_in_the_context_that_produced_them` | 读键内容失败 → 值区域 `error-state` + `redis-retry-read`；命令失败 → 命令行 `error-state` + `redis-error-dismiss`，且状态行仍在 | headless 布局级 |
@@ -64,3 +65,17 @@
 | `key_list_states_render_with_a_next_step` | 未选键时值区域也画空态与 `state-action`，同名 id 歧义；`寻找 empty-state` 还会命中值区域那块 | 断言按 `within("redis-keys")` 作用域取，避免跨区域误判 |
 
 修正后同一批用例一次通过；产品代码的行为在修正前后没有变化（除了为了让无头测试能定位容器而加的 `test_support` 标记，它不影响布局与交互）。
+
+## 7. 第二轮修复（T14-A2，审查意见）
+
+审查提出 1 条阻塞（P2）与 1 条 P3，均已修复：
+
+| 意见 | 事实 | 修法 | 用例 |
+| --- | --- | --- | --- |
+| P2：`list_state` 没有「模式条件成立」与「SCAN 已读完」两个输入 | 模式框里填一个匹配不到的前缀时 SCAN 在服务端就过滤成 0，`total == 0` 被判成 Empty——界面会说「这个库还没有键」并给主操作「新建键」，而真正的下一步「清除筛选」只对类型过滤/收起前缀生效；另外第一页 0 个键但游标没读完也会宣布空库，与页脚「再读取一批」矛盾 | `list_state(busy, scan_failed, total, visible, pattern_active, done)`：`total == 0 && pattern_active` → NoMatch（主操作复用 `redis-clear-filter`，同时清模式与类型过滤）；`total == 0 && !done` → 不画状态块，保留页脚「再读取一批（SCAN）」；只有 `total == 0 && done && !pattern_active` 才是 Empty | `key_list_state_keeps_busy_error_no_match_and_empty_apart`（源码级）、`empty_state_needs_a_finished_scan_and_no_pattern`（渲染级） |
+| P3：`open_spec` 解析失败与忙时拒绝直接写 `self.error`，`error_source` 停在上一轮的值 | 值区域会顶着「读取键内容失败」的标题显示「上一条命令还在执行」 | 两处都改走 `show_error_from`：目标解析失败 → `ErrorSource::Scan`（键列表），忙时拒绝 → `ErrorSource::Command`（命令行）；`self.error` 的直接赋值只留在 `show_error_from` 内部（现在用 `grep "self.error = "` 只能命中那一处） | 既有 `failures_land_in_the_context_that_produced_them` 覆盖三类落点；`state_actions_drive_the_model` 覆盖命令/扫描来源迁移 |
+
+复跑：`cargo test --manifest-path src-tauri/Cargo.toml --locked app::views::redis` → **15 passed / 0 failed**（959 filtered）；
+`cargo clippy --all-targets --locked` → exit 0，`redis/states.rs` 0 条告警。
+按 Owner 要求**未复跑全量**（同期有其它批次在写），全量回执仍是第 1 节第一轮那次 966 passed 的记录。
+

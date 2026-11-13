@@ -4,20 +4,26 @@
 
 ## 1. 四态判定表（`list_state`）
 
-只看四个事实：`busy`（是否在读取）、`scan_failed`（错误来源是 SCAN）、`total`（SCAN 已读到的键总数）、
-`visible`（类型/命名空间过滤后实际渲染的行数，树形视图里含目录行）。
+判定输入六个：`busy`（是否在读取）、`scan_failed`（错误来源是 SCAN）、`total`（SCAN 已读到的键总数）、
+`visible`（类型/命名空间过滤后实际渲染的行数，树形视图里含目录行）、`pattern_active`（模式框是否带条件，
+SCAN 在服务端按它过滤，所以命中 0 时 `total` 也是 0）、`done`（这一轮 SCAN 的游标是否已读完）。
 
-| busy | scan_failed | total | visible | 状态 | 呈现 |
-| --- | --- | --- | --- | --- | --- |
-| 是 | 任意 | 0 | 0 | Loading | `kit::skeleton_state(6, …)` |
-| 否 | 是 | 0 | 0 | Error | `kit::error_state_with_action` + 「重试」 |
-| 否 | 否 | 0 | 0 | Empty | `kit::empty_state_with_action` + 「新建键」 |
-| 否 | 否 | >0 | 0 | NoMatch | `kit::no_match_state_with_action` + 「清除筛选」 |
-| 任意 | 任意 | >0 | >0 | Rows | 行 + （读取中时）`kit::inline_loading` |
+| busy | scan_failed | total | visible | pattern_active | done | 状态 | 呈现 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 是 | 任意 | 0 | 0 | 任意 | 任意 | Loading | `kit::skeleton_state(6, …)` |
+| 否 | 是 | 0 | 0 | 任意 | 任意 | Error | `kit::error_state_with_action` + 「重试」 |
+| 否 | 否 | 0 | 0 | 是 | 任意 | NoMatch | `kit::no_match_state_with_action` + 「清除筛选」 |
+| 否 | 否 | 0 | 0 | 否 | 否 | Rows（空行） | 不画状态块，页脚保留「再读取一批（SCAN）」 |
+| 否 | 否 | 0 | 0 | 否 | 是 | Empty | `kit::empty_state_with_action` + 「新建键」 |
+| 否 | 否 | >0 | 0 | 任意 | 任意 | NoMatch | `kit::no_match_state_with_action` + 「清除筛选」 |
+| 任意 | 任意 | >0 | >0 | 任意 | 任意 | Rows | 行 + （读取中时）`kit::inline_loading` |
 
 优先级：加载 > 错误 > 无命中 > 无数据。理由分别是：迟到的错误不该盖住正在读的状态；
-读取失败不能退化成「这里没有键」；有键但被条件过滤掉要提示怎么继续，而不是说库里没有东西。
-`key_list_state_keeps_busy_error_no_match_and_empty_apart` 钉住整张表。
+读取失败不能退化成「这里没有键」；带条件扫出的 0 个键是「没命中」而不是「库里没有键」——
+说成后者的代价是把空态主操作错配成「新建键」，同时把真正的下一步「清除筛选」藏起来；
+游标没读完就宣布空库，还会和页脚的「再读取一批（SCAN）」自相矛盾。
+`key_list_state_keeps_busy_error_no_match_and_empty_apart` 钉住整张表，
+`empty_state_needs_a_finished_scan_and_no_pattern` 钉住「空态只在读完且无模式条件时出现」这两条渲染级结论。
 
 已读到行、但下一页 SCAN 失败时（`total > 0` 且 `scan_failed`）：行保留，键列表底部换成错误条 + 「重试」（`redis-retry-scan`），
 选中键与命令草稿都不动——失败不伪装成「键没了」。

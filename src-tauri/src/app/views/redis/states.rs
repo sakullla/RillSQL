@@ -43,15 +43,69 @@ fn open_pane_at(
 }
 
 /// 四态判定：加载 → 错误 → 无命中 → 无数据 → 有行，任何两种都不会混成一句话。
+/// 模式条件与"这一轮读完没有"必须参与判定，否则带模式扫出 0 个键会被说成"库里没有键"。
 #[test]
 fn key_list_state_keeps_busy_error_no_match_and_empty_apart() {
-    assert_eq!(list_state(true, false, 0, 0), ListState::Loading, "首屏读取：骨架");
-    assert_eq!(list_state(true, true, 0, 0), ListState::Loading, "加载优先于错误");
-    assert_eq!(list_state(false, true, 0, 0), ListState::Error, "读不到不能退化成空态");
-    assert_eq!(list_state(false, false, 0, 0), ListState::Empty, "键数为 0 才是无数据");
-    assert_eq!(list_state(false, false, 3, 0), ListState::NoMatch, "有键但被条件过滤掉是无命中");
-    assert_eq!(list_state(false, false, 3, 3), ListState::Rows);
-    assert_eq!(list_state(true, false, 3, 3), ListState::Rows, "接着读下一页时已读到的行还在");
+    // (busy, scan_failed, total, visible, pattern_active, done)
+    assert_eq!(list_state(true, false, 0, 0, false, false), ListState::Loading, "首屏读取：骨架");
+    assert_eq!(list_state(true, true, 0, 0, false, true), ListState::Loading, "加载优先于错误");
+    assert_eq!(list_state(false, true, 0, 0, false, true), ListState::Error, "读不到不能退化成空态");
+    assert_eq!(list_state(false, false, 0, 0, false, true), ListState::Empty, "读完且没有模式条件、键数 0 才是无数据");
+    assert_eq!(list_state(false, false, 3, 0, false, true), ListState::NoMatch, "有键但被类型过滤/收起前缀挡住是无命中");
+    assert_eq!(list_state(false, false, 3, 3, false, true), ListState::Rows);
+    assert_eq!(list_state(true, false, 3, 3, false, true), ListState::Rows, "接着读下一页时已读到的行还在");
+    // SCAN 在服务端按模式过滤：命中 0 个键是"没命中"，下一步是清除条件，不是"新建第一个键"。
+    assert_eq!(list_state(false, false, 0, 0, true, true), ListState::NoMatch, "带模式扫出 0 个键是无命中");
+    assert_eq!(list_state(false, false, 0, 0, true, false), ListState::NoMatch, "带模式且没读完也是无命中");
+    // 游标没读完时不能宣布空库，否则和页脚的"再读取一批（SCAN）"自相矛盾。
+    assert_eq!(list_state(false, false, 0, 0, false, false), ListState::Rows, "这一页 0 个键但还没读完：不宣布空库");
+}
+
+/// 空态只在"读完且没有模式条件"时出现；带模式 0 命中画无命中态；没读完什么都不画。
+#[gpui_kit::test]
+fn empty_state_needs_a_finished_scan_and_no_pattern(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt;
+    let (services, dir) = test_services("empty-gate");
+    cx.update(gpui_kit::init);
+
+    // 带模式扫出 0 个键：无命中态 + 清除筛选，不能是"新建键"。
+    let (window, _pane) = open_pane_at(cx, services.clone(), 900., 900., |pane| {
+        pane.set_pattern("user:*");
+        pane.done = true;
+    });
+    let (no_match, create, clear) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (
+                window.within("redis-keys").try_find("no-match-state").is_some(),
+                window.within("redis-keys").try_find("empty-state").is_some(),
+                window.within("redis-keys").try_find("redis-clear-filter").is_some(),
+            )
+        })
+        .unwrap();
+    assert!(no_match, "带模式没命中要给无命中态");
+    assert!(!create, "带模式没命中不能说成\"这个库还没有键\"");
+    assert!(clear, "无命中态的下一步是清除条件");
+
+    // 第一页 0 个键、游标没读完：不画空态，页脚还留着"再读取一批"。
+    let (window, _pane) = open_pane_at(cx, services, 900., 900., |pane| {
+        pane.done = false;
+        pane.busy = false;
+    });
+    let (empty, no_match, more) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (
+                window.within("redis-keys").try_find("empty-state").is_some(),
+                window.within("redis-keys").try_find("no-match-state").is_some(),
+                window.try_find("redis-more").map(|button| button.visible()).unwrap_or(false),
+            )
+        })
+        .unwrap();
+    assert!(!empty, "还没读完不能宣布空库");
+    assert!(!no_match, "没有模式条件就不是无命中");
+    assert!(more, "页脚要继续提供\"再读取一批\"");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 键列表四态都换成底座组件，并各自带一个当场能点的下一步。
@@ -61,7 +115,8 @@ fn key_list_states_render_with_a_next_step(cx: &mut gpui_kit::TestAppContext) {
     let (services, dir) = test_services("states");
     cx.update(gpui_kit::init);
 
-    let (window, _pane) = open_pane_at(cx, services.clone(), 900., 900., |_| {});
+    // 读完了、没有模式条件、键数为 0：这才是"这个库还没有键"。
+    let (window, _pane) = open_pane_at(cx, services.clone(), 900., 900., |pane| pane.done = true);
     let (empty, action, skeleton, error, no_match) = cx
         .update_window(window, |_, window, cx| {
             window.render_frame(cx);

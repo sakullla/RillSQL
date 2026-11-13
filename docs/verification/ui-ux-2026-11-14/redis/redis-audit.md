@@ -7,7 +7,7 @@
 
 | # | 本次之前 | 本次改动 | 验收对应 |
 | --- | --- | --- | --- |
-| 1 | 键列表为空时只有一行弱色文字「没有读到键。」，与「筛选没命中」「读取失败」共用同一句话 | 引入 `list_state(busy, scan_failed, total, visible)`，把 加载 / 读取失败 / 无命中 / 无数据 / 有行 分开判定 | outcome 1；R4 三类空态语义 |
+| 1 | 键列表为空时只有一行弱色文字「没有读到键。」，与「筛选没命中」「读取失败」共用同一句话 | 引入 `list_state(busy, scan_failed, total, visible, pattern_active, done)`，把 加载 / 读取失败 / 无命中 / 无数据 / 有行 分开判定；模式条件与「这一轮读完没有」都参与判定——带模式扫出 0 个键是「没命中」（下一步清除条件），游标没读完则保留页脚「再读取一批」而不宣布空库 | outcome 1；R4 三类空态语义 |
 | 2 | 首屏读取没有本屏 loading 分支，`busy` 只影响命令门禁 | 键数为 0 且正在读 → `kit::skeleton_state(6, …)`；已读到行再读下一页 → `kit::inline_loading`，不清空已读到的键 | outcome 1；R4「加载优先用骨架/增量」 |
 | 3 | 无数据空态没有下一步 | `kit::empty_state_with_action` + 「新建键」（`redis-new-key`，主按钮） | outcome 1；R4「空态以主操作作下一步」 |
 | 4 | 无命中也走同一句空话 | `kit::no_match_state_with_action`：说明「这一轮 SCAN 已读完，但模式与类型过滤都没命中」，主操作「清除筛选」（`redis-clear-filter` 清模式+类型过滤后从游标 0 重扫） | outcome 1；R4 三类语义互不相同 |
@@ -19,6 +19,7 @@
 | --- | --- | --- |
 | 1 | 所有失败共用 `error` 一个字符串，只在底部状态行显示成红字，没有来源区分 | 新增 `ErrorSource { Scan, Detail, Command }`：SCAN 失败进键列表，读键内容失败进值区域，命令/写删失败进命令行；各自的错误块都带下一步 |
 | 2 | 命令失败只能在底部红字里读，错误文本与结果说明挤在同一行 | 命令行给 `kit::error_state_with_action` + 「关闭提示」（`redis-error-dismiss`），命令原文留在输入框可直接改；状态行只留结果说明，同一段错误不再两处堆叠 |
+| 2.1 | `open_spec` 解析失败与「上一次读取还没结束」的忙时拒绝都直接写 `self.error`，`error_source` 停在上一轮的值——值区域可能顶着「读取键内容失败」的标题显示「上一条命令还在执行」 | 两处都改走 `show_error_from`：目标解析失败归 `Scan`（键列表），忙时拒绝归 `Command`（命令行）。`self.error` 的直接赋值只留在 `show_error_from` 内部 |
 | 3 | 未选键右侧是 `kit::empty_state`（无操作）：标题还是「键空间」，没有下一步 | `kit::empty_state_with_action`：标题「还没有选择键」、说明复用 `redis.tab.pickKey`、主操作「新建键」（`redis-new-key-value`，窄窗口里会先切回键列表再打开表单） |
 | 4 | 选中键但内容还没读回来时，值区域显示 `redis.tab.pickKey`（“选择一个键”），与实际状态矛盾 | 读取中 → `kit::skeleton_state(4, …)`；读取失败 → 值区域错误块 + 「重试读取」；只有既无内容又不忙时才给提示文字 |
 
