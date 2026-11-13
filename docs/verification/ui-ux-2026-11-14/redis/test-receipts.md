@@ -79,3 +79,17 @@
 `cargo clippy --all-targets --locked` → exit 0，`redis/states.rs` 0 条告警。
 按 Owner 要求**未复跑全量**（同期有其它批次在写），全量回执仍是第 1 节第一轮那次 966 passed 的记录。
 
+
+## 8. 第三轮修复（T14-A3，审查意见：P2 未真闭合 + P3）
+
+| 意见 | 事实 | 修法 | 用例 |
+| --- | --- | --- | --- |
+| P2：`total == 0` 里 `pattern_active` 排在 `!done` 前面 | SCAN 用服务端 `MATCH` + `COUNT` 分批返回，空页是正常的（`redis::keys::scan_keys`）。带模式、第一页 0 命中、游标还开着时，界面会说「没有符合条件的键 / 这一轮 SCAN 已读完」并给「清除筛选」，页脚却还写着「再读取一批」——把未完成的扫描当结论，还废掉了用户的模式 | 只改顺序不加输入：`total == 0` 里先 `if !done { return Rows; }`，再 `if pattern_active { NoMatch }`，最后 `Empty`。无命中态那句「这一轮已读完」于是才真的成立 | `key_list_state_keeps_busy_error_no_match_and_empty_apart` 里 `(…, pattern=true, done=false)` 改为 **Rows**，并补 `(busy=true, pattern=true, done=false)` 仍是 Loading；`empty_state_needs_a_finished_scan_and_no_pattern` 新增「带模式 + 没读完」窗口：无 `no-match-state`、无 `empty-state`、无 `redis-clear-filter`，`redis-more` 与弱提示都在 |
+| P3：`done` 默认 false，从没开始扫描的面板会渲染「Rows 但一行都没有」的空白列表，只剩页脚 | 一个空得没有解释的列表 | `Rows` 且 `visible == 0` 且不在读取时，键列表顶部给一行弱提示 `redis-keys-blank`（文案复用 `redis.tab.emptyList`），不新增状态块、不给主操作 | 上述两个「没读完」窗口都断言 `redis-keys-blank` 存在，`empty-state` / `no-match-state` 不存在 |
+
+复跑：`cargo test --manifest-path src-tauri/Cargo.toml --locked app::views::redis` → **15 passed / 0 failed**（960 filtered）；
+`cargo clippy --all-targets --locked` → exit 0，`redis/states.rs` 0 条告警。按 Owner 要求**未复跑全量**。
+
+文档同步：`states-and-widths.md` 的判定表拆出「带模式 + 没读完 → Rows」，优先级改为「加载 > 错误 > 是否读完 > 无命中 > 无数据」，
+`redis-audit.md` 第 1 节新增第 6 行（读完与否参与判定 + 弱提示）。
+

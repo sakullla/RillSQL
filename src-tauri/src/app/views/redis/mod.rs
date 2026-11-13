@@ -84,9 +84,13 @@ enum ListState {
 /// 加载优先于错误（迟到错误不盖住正在读的状态），错误优先于空态（不能把失败说成"没有键"），
 /// 无命中优先于无数据（有键但被条件过滤掉时要提示怎么继续）。
 ///
-/// 模式过滤必须参与判定：带着模式扫出 0 个键是"没命中"，不是"库里没有键"——
-/// 后者会把空态主操作错配成"新建键"，还把"清除筛选"这条真正的下一步藏起来。
-/// 同理，游标没读完就宣布空库会和页脚的"再读取一批"自相矛盾，所以只有读完且无模式条件才是无数据。
+/// 顺序就是语义，不能换：
+/// 1) 模式过滤必须参与判定——带着模式扫出 0 个键是"没命中"，不是"库里没有键"；
+///    后者会把空态主操作错配成"新建键"，还把"清除筛选"这条真正的下一步藏起来。
+/// 2) 但"这一轮读完没有"要压过模式判定——SCAN 用服务端 MATCH 分批返回，空页是正常现象
+///    （见 `redis::keys::scan_keys`），游标还开着就说"这一轮已读完 / 没有符合条件的键"，
+///    等于把未完成的扫描当结论，还会把用户的模式连同页脚的"再读取一批"一起废掉。
+/// 所以 `total == 0` 里先看 `!done`，读完才允许下"无命中"或"无数据"的结论。
 fn list_state(busy: bool, scan_failed: bool, total: usize, visible: usize, pattern_active: bool, done: bool) -> ListState {
     if busy && total == 0 {
         return ListState::Loading;
@@ -95,12 +99,12 @@ fn list_state(busy: bool, scan_failed: bool, total: usize, visible: usize, patte
         return ListState::Error;
     }
     if total == 0 {
-        if pattern_active {
-            return ListState::NoMatch;
-        }
-        // 还没读完：保留页脚的"再读取一批（SCAN）"，不宣布空库、也不画一条永远转不完的加载条。
+        // 还没读完：不画状态块、不下结论，把下一步留给页脚的"再读取一批（SCAN）"。
         if !done {
             return ListState::Rows;
+        }
+        if pattern_active {
+            return ListState::NoMatch;
         }
         return ListState::Empty;
     }
@@ -1493,7 +1497,8 @@ impl Render for RedisPane {
         let show_keys = self.keys_visible(viewport_w);
         let scan_failed = self.error_source == ErrorSource::Scan && !self.error.is_empty();
         let pattern_active = !self.pattern.trim().is_empty();
-        let state = list_state(self.busy, scan_failed, self.keys.len(), indexes.len() + folders.len(), pattern_active, self.done);
+        let visible = indexes.len() + folders.len();
+        let state = list_state(self.busy, scan_failed, self.keys.len(), visible, pattern_active, self.done);
 
         // ---- 左侧：键列表。浏览只渲染 SCAN 结果，不发 KEYS。
         // 加载 / 读取失败 / 无命中 / 无数据都走底座三态，各带一个当场能做的下一步；
@@ -1554,6 +1559,19 @@ impl Render for RedisPane {
             ListState::Rows => {
                 if self.busy {
                     list = list.child(kit::inline_loading(SharedString::from(self.text("redis.list.busy")), &m, &p));
+                } else if visible == 0 {
+                    // 这一页 0 个键、游标还开着：不画状态块（结论未成立），只给一行弱提示，
+                    // 下一步仍然是页脚的"再读取一批（SCAN）"。
+                    list = list.child(
+                        div()
+                            .id("redis-keys-blank")
+                            .test_support()
+                            .px(px(m.pane_pad()))
+                            .py(px(4.))
+                            .text_size(px(TypeScale::XS))
+                            .text_color(p.text_faint)
+                            .child(SharedString::from(self.text("redis.tab.emptyList"))),
+                    );
                 }
             }
         }

@@ -54,11 +54,13 @@ fn key_list_state_keeps_busy_error_no_match_and_empty_apart() {
     assert_eq!(list_state(false, false, 3, 0, false, true), ListState::NoMatch, "有键但被类型过滤/收起前缀挡住是无命中");
     assert_eq!(list_state(false, false, 3, 3, false, true), ListState::Rows);
     assert_eq!(list_state(true, false, 3, 3, false, true), ListState::Rows, "接着读下一页时已读到的行还在");
-    // SCAN 在服务端按模式过滤：命中 0 个键是"没命中"，下一步是清除条件，不是"新建第一个键"。
-    assert_eq!(list_state(false, false, 0, 0, true, true), ListState::NoMatch, "带模式扫出 0 个键是无命中");
-    assert_eq!(list_state(false, false, 0, 0, true, false), ListState::NoMatch, "带模式且没读完也是无命中");
-    // 游标没读完时不能宣布空库，否则和页脚的"再读取一批（SCAN）"自相矛盾。
+    // SCAN 在服务端按模式过滤：读完后命中 0 个键是"没命中"，下一步是清除条件，不是"新建第一个键"。
+    assert_eq!(list_state(false, false, 0, 0, true, true), ListState::NoMatch, "带模式读完仍 0 命中：无命中");
+    // 但没读完时不能下这个结论：空页是正常的（服务端 MATCH + COUNT 会返回空页），
+    // 说"这一轮已读完 / 没有符合条件的键"会把未完成的扫描当结论，还把模式与"再读取一批"一起废掉。
+    assert_eq!(list_state(false, false, 0, 0, true, false), ListState::Rows, "带模式但没读完：不下结论，等下一页");
     assert_eq!(list_state(false, false, 0, 0, false, false), ListState::Rows, "这一页 0 个键但还没读完：不宣布空库");
+    assert_eq!(list_state(true, false, 0, 0, true, false), ListState::Loading, "带着模式读下一页：仍是加载");
 }
 
 /// 空态只在"读完且没有模式条件"时出现；带模式 0 命中画无命中态；没读完什么都不画。
@@ -88,23 +90,50 @@ fn empty_state_needs_a_finished_scan_and_no_pattern(cx: &mut gpui_kit::TestAppCo
     assert!(clear, "无命中态的下一步是清除条件");
 
     // 第一页 0 个键、游标没读完：不画空态，页脚还留着"再读取一批"。
-    let (window, _pane) = open_pane_at(cx, services, 900., 900., |pane| {
+    let (window, _pane) = open_pane_at(cx, services.clone(), 900., 900., |pane| {
         pane.done = false;
         pane.busy = false;
     });
-    let (empty, no_match, more) = cx
+    let (empty, no_match, more, blank) = cx
         .update_window(window, |_, window, cx| {
             window.render_frame(cx);
             (
                 window.within("redis-keys").try_find("empty-state").is_some(),
                 window.within("redis-keys").try_find("no-match-state").is_some(),
                 window.try_find("redis-more").map(|button| button.visible()).unwrap_or(false),
+                window.within("redis-keys").try_find("redis-keys-blank").is_some(),
             )
         })
         .unwrap();
     assert!(!empty, "还没读完不能宣布空库");
     assert!(!no_match, "没有模式条件就不是无命中");
     assert!(more, "页脚要继续提供\"再读取一批\"");
+    assert!(blank, "只有页脚的空白列表要有一行弱提示，不能只剩页脚");
+
+    // 带模式 + 没读完：顺序关键——不能因为模式就宣布"没有符合条件的键 / 这一轮已读完"，
+    // 那会把未完成的扫描当结论，还会把模式与页脚的"再读取一批"一起废掉。
+    let (window, _pane) = open_pane_at(cx, services, 900., 900., |pane| {
+        pane.set_pattern("user:*");
+        pane.done = false;
+        pane.busy = false;
+    });
+    let (no_match, empty, clear, more, blank) = cx
+        .update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            (
+                window.within("redis-keys").try_find("no-match-state").is_some(),
+                window.within("redis-keys").try_find("empty-state").is_some(),
+                window.within("redis-keys").try_find("redis-clear-filter").is_some(),
+                window.try_find("redis-more").map(|button| button.visible()).unwrap_or(false),
+                window.within("redis-keys").try_find("redis-keys-blank").is_some(),
+            )
+        })
+        .unwrap();
+    assert!(!no_match, "带模式但没读完：不能宣布无命中");
+    assert!(!empty, "带模式但没读完：更不能宣布空库");
+    assert!(!clear, "结论没成立时不该给清除筛选这条下一步");
+    assert!(more, "没读完时页脚仍是\"再读取一批\"");
+    assert!(blank, "空页要有一行弱提示");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

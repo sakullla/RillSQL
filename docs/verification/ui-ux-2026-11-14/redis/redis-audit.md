@@ -12,6 +12,7 @@
 | 3 | 无数据空态没有下一步 | `kit::empty_state_with_action` + 「新建键」（`redis-new-key`，主按钮） | outcome 1；R4「空态以主操作作下一步」 |
 | 4 | 无命中也走同一句空话 | `kit::no_match_state_with_action`：说明「这一轮 SCAN 已读完，但模式与类型过滤都没命中」，主操作「清除筛选」（`redis-clear-filter` 清模式+类型过滤后从游标 0 重扫） | outcome 1；R4 三类语义互不相同 |
 | 5 | SCAN 失败只落在底部一行红字 | 键数为 0 时 `kit::error_state_with_action` + 「重试」（`redis-retry-scan`）；已读到行时底部换成错误条 + 重试，不清空列表、不动选中键 | outcome 1；S8.5「读取失败带重试」 |
+| 6 | 判定不看「这一轮读完没有」：`done == false` 且这一页 0 个键时，列表区只剩页脚，空得没有一句解释 | `list_state` 收 `pattern_active` / `done`：`total == 0 && !done` 不下任何结论，只画一行弱提示（`redis-keys-blank`，文案复用 `redis.tab.emptyList`），下一步仍是页脚的「再读取一批（SCAN）」；读完才允许出现无命中或空态 | outcome 1；R4 |
 
 ## 2. console 错误与未选键（outcome 1 的后两条）
 
