@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Editor, EditorState, InputEvent, InputState};
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -55,6 +54,37 @@ enum SchemaState {
     Loading,
     Ready(Vec<String>),
     Manual(String),
+}
+
+/// 提示的语义：门禁、取消、过期只是告知，读取失败才要给重试。
+/// 两类排版与动作不同，不再把一切都画成同一条横幅（规范 S8.5 三态 + 主操作）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ErrorKind {
+    None,
+    /// 提示：门禁、取消、过期、上一次还在读；横幅说明原因，不提供重试。
+    Notice,
+    /// 失败：统一错误态 + 重试；`RetryAction` 说明重试会重发哪一步。
+    Failure(RetryAction),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryAction {
+    /// 失败的是连接清单本身：重试只重新读取清单。
+    Choices,
+    Structure,
+    Data,
+}
+
+/// 两侧并排所需的最小视口宽度：每侧卡片留约 340 可用宽，加上分栏间距与 docked 侧栏（234），
+/// 视口窄于它就把基准/对照竖排，不让两列各自压到只剩图标（R6 的 900/640 两档）。
+const SIDES_SIDE_BY_SIDE_MIN_W: f32 = 940.;
+
+/// 阈值必须真的容得下两列：每侧至少 340 可用宽，再加上 docked 侧栏（234）。
+const _: () = assert!(SIDES_SIDE_BY_SIDE_MIN_W as i32 >= 2 * 340 + 234);
+
+/// 两侧是否竖排。渲染与用例共用这一判定，避免测试自己再写一遍阈值。
+fn sides_stacked(viewport_width: f32) -> bool {
+    viewport_width < SIDES_SIDE_BY_SIDE_MIN_W
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +151,8 @@ pub struct ComparePane {
     selected: BTreeMap<String, bool>,
     chosen_key: BTreeMap<String, String>,
     error: String,
+    /// 上面那条提示的语义：决定它是横幅还是统一错误态，以及重试会重发什么。
+    error_kind: ErrorKind,
     running: bool,
     run_id: String,
     token: Option<TaskToken>,
@@ -167,6 +199,7 @@ impl ComparePane {
             selected: BTreeMap::new(),
             chosen_key: BTreeMap::new(),
             error: String::new(),
+            error_kind: ErrorKind::None,
             running: false,
             run_id: String::new(),
             token: None,
@@ -378,6 +411,8 @@ impl ComparePane {
             self.start_data(cx);
         } else if id == "compare-cancel" {
             self.cancel();
+        } else if id == "compare-retry" {
+            self.retry(cx);
         } else if id == "compare-place:structure" {
             self.ask_place(RunKind::Structure);
         } else if id == "compare-place:data" {
@@ -445,7 +480,7 @@ impl ComparePane {
 
     fn pick(&mut self, baseline: bool, connection_id: &str, cx: &mut Context<Self>) {
         let Some(choice) = self.choices.iter().find(|choice| choice.id == connection_id).cloned() else {
-            self.error = self.text("compare.gates.sideNotOpen");
+            self.notify(self.text("compare.gates.sideNotOpen"));
             return;
         };
         let database = if choice.engine == "sqlite" {
@@ -476,6 +511,55 @@ impl ComparePane {
         self.ensure_schemas(baseline, cx);
     }
 
+    /// 清掉提示，连同它的语义与重试入口。
+    fn clear_error(&mut self) {
+        self.error.clear();
+        self.error_kind = ErrorKind::None;
+    }
+
+    /// 门禁、取消、过期一类的提示：横幅说清原因，不提供重试。
+    fn notify(&mut self, message: String) {
+        self.error = message;
+        self.error_kind = ErrorKind::Notice;
+    }
+
+    /// 需要重试的失败：用统一错误态呈现，重试按钮按 `action` 重发那一步。
+    fn fail(&mut self, message: String, action: RetryAction) {
+        self.error = message;
+        self.error_kind = ErrorKind::Failure(action);
+    }
+
+    /// 失败的标题：清单本身读不出时说“选择连接”，比较中途丢了结果时说“比较没有完成”。
+    fn error_heading(&self) -> String {
+        match self.error_kind {
+            ErrorKind::Failure(RetryAction::Choices) => self.text("compare.dialog.chooseConnection"),
+            _ => self.text("compare.status.failed"),
+        }
+    }
+
+    /// 失败的原因：能说清就说清；与标题同文时给可执行的下一步，不留空详情。
+    fn error_detail(&self) -> String {
+        let heading = self.error_heading();
+        if self.error.trim().is_empty() || self.error.trim() == heading.trim() {
+            self.text("compare.gates.chooseBoth")
+        } else {
+            self.error.clone()
+        }
+    }
+
+    /// 重试只重发失败的那一步，不改两侧选择，也不清已选目标。
+    fn retry(&mut self, cx: &mut Context<Self>) {
+        let ErrorKind::Failure(action) = self.error_kind else {
+            return;
+        };
+        self.clear_error();
+        match action {
+            RetryAction::Choices => self.refresh_choices(cx),
+            RetryAction::Structure => self.start_structure(cx),
+            RetryAction::Data => self.start_data(cx),
+        }
+    }
+
     /// 目标连接/库/schema 变化后，旧报告、选择和待放入脚本都不再属于新目标。
     /// 仍在跑的请求用代次和取消标记失效，迟到结果不会写回。
     fn invalidate_results(&mut self) {
@@ -496,7 +580,7 @@ impl ComparePane {
         self.placed = None;
         self.pending_place = None;
         self.place_prompt.clear();
-        self.error.clear();
+        self.clear_error();
     }
 
     fn ensure_schemas(&mut self, baseline: bool, cx: &mut Context<Self>) {
@@ -599,14 +683,14 @@ impl ComparePane {
                             match choices {
                                 Ok(choices) => {
                                     pane.choices = choices;
-                                    pane.error.clear();
+                                    pane.clear_error();
                                     pane.choices_loading = false;
                                     // 连接清单到达后再把带入的上下文落到两侧。
                                     pane.apply_context(cx);
                                 }
                                 Err(message) => {
                                     pane.choices.clear();
-                                    pane.error = message;
+                                    pane.fail(message, RetryAction::Choices);
                                     pane.choices_loading = false;
                                 }
                             }
@@ -621,12 +705,12 @@ impl ComparePane {
 
     fn start_structure(&mut self, cx: &mut Context<Self>) {
         if self.running {
-            self.error = self.text("compare.gates.busy");
+            self.notify(self.text("compare.gates.busy"));
             self.structure = None;
             self.structure_status = Status::Refused;
             return;
         }
-        self.error.clear();
+        self.clear_error();
         self.data = None;
         self.data_status = Status::Idle;
         self.selected.clear();
@@ -646,12 +730,12 @@ impl ComparePane {
 
     fn start_data(&mut self, cx: &mut Context<Self>) {
         if self.running {
-            self.error = self.text("compare.gates.busy");
+            self.notify(self.text("compare.gates.busy"));
             self.data = None;
             self.data_status = Status::Refused;
             return;
         }
-        self.error.clear();
+        self.clear_error();
         self.data = None;
         let Some(request) = self.data_request() else {
             self.data = Some(empty_data(Some(self.text("compare.gates.chooseBoth"))));
@@ -843,7 +927,7 @@ impl ComparePane {
         self.cancel_flag.store(true, Ordering::SeqCst);
         cancel_compare(&self.services.tasks, OWNER, &self.run_id);
         // 先记成已取消。迟到的成功结果也不能把这份取消覆盖掉。
-        self.error = self.text("compare.status.cancelled");
+        self.notify(self.text("compare.status.cancelled"));
         match self.run_kind {
             Some(RunKind::Data) => {
                 self.data = None;
@@ -869,13 +953,13 @@ impl ComparePane {
         if cancelled {
             self.structure = None;
             self.structure_status = Status::Cancelled;
-            self.error = self.text("compare.status.cancelled");
+            self.notify(self.text("compare.status.cancelled"));
             return;
         }
         let TaskOutcome::Current { value, .. } = outcome else {
             self.structure = None;
             self.structure_status = Status::Stale;
-            self.error = self.text("compare.status.stale");
+            self.notify(self.text("compare.status.stale"));
             return;
         };
         self.install_structure(value);
@@ -894,13 +978,13 @@ impl ComparePane {
         if cancelled {
             self.data = None;
             self.data_status = Status::Cancelled;
-            self.error = self.text("compare.status.cancelled");
+            self.notify(self.text("compare.status.cancelled"));
             return;
         }
         let TaskOutcome::Current { value, .. } = outcome else {
             self.data = None;
             self.data_status = Status::Stale;
-            self.error = self.text("compare.status.stale");
+            self.notify(self.text("compare.status.stale"));
             return;
         };
         self.install_data(value);
@@ -911,7 +995,8 @@ impl ComparePane {
             return;
         }
         self.running = false;
-        self.error = self.text("compare.status.failed");
+        // 任务丢了结果拿不回来：这是失败，统一错误态直接给重试。
+        self.fail(self.text("compare.status.failed"), retry_for(self.run_kind));
         match self.run_kind {
             Some(RunKind::Data) => {
                 self.data = None;
@@ -1068,10 +1153,13 @@ impl ComparePane {
     }
 
     pub fn lines(&self) -> Vec<String> {
-        // 只列实际画出来的文字：说明 `compare.dialog.subtitle` 只在标题悬停提示里，不常驻。
+        // 只列实际画出来的文字：`compare.dialog.subtitle` 平时只在标题悬停提示里，初始指导出现时才常驻。
         let mut lines = vec![self.text("compare.dialog.title")];
         if self.show_empty_guide() {
+            // 初始指导现在是一整块状态：标题、说明与主操作都要算进画出来的文字。
             lines.push(self.text("compare.empty.guide"));
+            lines.push(self.text("compare.dialog.subtitle"));
+            lines.push(self.text("compare.dialog.compareStructure"));
         }
         if self.choices.is_empty() {
             lines.push(self.text("compare.dialog.chooseConnection"));
@@ -1090,8 +1178,23 @@ impl ComparePane {
         if self.running {
             lines.push(self.text("compare.dialog.comparing"));
         }
-        if !self.error.is_empty() {
-            lines.push(self.error.clone());
+        match self.error_kind {
+            // 失败：统一错误态里的标题、原因与重试按钮。
+            ErrorKind::Failure(_) => {
+                let heading = self.error_heading();
+                lines.push(heading.clone());
+                let detail = self.error_detail();
+                if detail != heading {
+                    lines.push(detail);
+                }
+                lines.push(self.text("common.retry"));
+            }
+            // 提示：横幅里那句原因。
+            _ => {
+                if !self.error.is_empty() {
+                    lines.push(self.error.clone());
+                }
+            }
         }
         if self.pending_place.is_some() {
             lines.push(self.place_prompt.clone());
@@ -1192,7 +1295,7 @@ impl ComparePane {
             && !self.running
             && self.structure_status == Status::Idle
             && self.data_status == Status::Idle
-            && self.error.is_empty()
+            && self.error_kind == ErrorKind::None
     }
 
     fn shows_diff(&self, kind: DiffFilter, name: &str) -> bool {
@@ -1218,6 +1321,14 @@ fn name_matches(name: &str, query: &str) -> bool {
 
 fn schema_key(id: &str, database: &str) -> String {
     format!("{id}\u{0}{database}")
+}
+
+/// 失败的那次比较属于哪一边：重试就重发同一边，而不是另起一次比较。
+fn retry_for(kind: Option<RunKind>) -> RetryAction {
+    match kind {
+        Some(RunKind::Data) => RetryAction::Data,
+        _ => RetryAction::Structure,
+    }
 }
 
 fn fill(template: &str, pairs: &[(&str, &str)]) -> String {
@@ -1252,23 +1363,31 @@ impl Render for ComparePane {
         let entity = cx.entity();
         let t = |this: &Self, key: &str| SharedString::from(this.text(key));
 
+        let viewport = f32::from(window.viewport_size().width);
+        let stacked = sides_stacked(viewport);
+        let page_pad = m.page_pad_for(viewport);
         let baseline_card = self.side_card(true, window, cx);
         let target_card = self.side_card(false, window, cx);
         self.schema_reload = false;
-        let sides = div()
-            .flex()
-            .gap(px(m.pane_pad()))
-            .items_start()
-            .child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).child(baseline_card))
-            .child(
-                div().flex_none().pt(px(m.header_h() / 2.)).child(kit::icon_button(
-                    "compare-swap",
-                    IconName::ArrowRightLeft,
-                    t(self, "compare.action.swap"),
-                    compare_act("compare-swap", &entity),
-                )),
-            )
-            .child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).child(target_card));
+        let swap = kit::icon_button("compare-swap", IconName::ArrowRightLeft, t(self, "compare.action.swap"), compare_act("compare-swap", &entity));
+        // 窄窗口里两侧竖排：并排会把每侧压到只剩图标；竖排后卡片各占整行，交换按钮居中（R6 900/640）。
+        let sides = if stacked {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(m.pane_pad()))
+                .child(div().w_full().min_w(px(0.)).child(baseline_card))
+                .child(div().flex().justify_center().child(swap))
+                .child(div().w_full().min_w(px(0.)).child(target_card))
+        } else {
+            div()
+                .flex()
+                .gap(px(m.pane_pad()))
+                .items_start()
+                .child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).child(baseline_card))
+                .child(div().flex_none().pt(px(m.header_h() / 2.)).child(swap))
+                .child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).child(target_card))
+        };
 
         let mut actions = div()
             .flex()
@@ -1280,14 +1399,43 @@ impl Render for ComparePane {
         if self.running {
             actions = actions
                 .child(kit::tool_button("compare-cancel", Some(IconName::X), t(self, "common.cancel"), compare_act("compare-cancel", &entity)))
-                .child(div().flex().items_center().gap(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(Spinner::new().xsmall().color(p.accent)).child(t(self, "compare.dialog.comparing")));
+                .child(kit::inline_loading(t(self, "compare.dialog.comparing"), &m, &p));
         } else {
             actions = actions.child(div().invisible().child(kit::tool_button("compare-cancel", None, t(self, "common.cancel"), compare_act("compare-cancel", &entity))));
         }
 
         let mut body = div().flex().flex_col().gap(px(m.section_gap())).child(sides).child(actions);
-        if !self.error.is_empty() {
-            body = body.child(note_banner(IconName::CircleAlert, self.error.clone(), p.danger, p.danger_soft));
+        // 正在比较且还没有报告：给骨架占位与一条局部加载，不让详情区空着。
+        if self.running && self.structure.is_none() && self.data.is_none() {
+            body = body.child(
+                kit::card(&p)
+                    .p(px(m.card_pad()))
+                    .flex()
+                    .flex_col()
+                    .gap(px(m.pane_pad()))
+                    .child(kit::inline_loading(t(self, "compare.dialog.comparing"), &m, &p))
+                    .child(kit::skeleton_state(5, &m, &p)),
+            );
+        }
+        match self.error_kind {
+            // 失败：统一错误态 + 重试，重试只重发失败的那一步。
+            ErrorKind::Failure(_) => {
+                let entity = entity.clone();
+                let retry = kit::secondary_button("compare-retry", Some(IconName::RefreshCw), t(self, "common.retry"), move |_, _, cx| {
+                    entity.update(cx, |pane, cx| pane.command("compare-retry", cx));
+                });
+                body = body.child(kit::error_state_with_action(
+                    SharedString::from(self.error_heading()),
+                    SharedString::from(self.error_detail()),
+                    retry,
+                    &p,
+                ));
+            }
+            // 提示：门禁、取消、过期。横幅说原因，不提供重试。
+            ErrorKind::Notice => {
+                body = body.child(note_banner(IconName::CircleAlert, self.error.clone(), p.danger, p.danger_soft));
+            }
+            ErrorKind::None => {}
         }
         if self.structure_status == Status::Cancelled || self.data_status == Status::Cancelled {
             body = body.child(note_banner(IconName::Info, self.text("compare.status.cancelled"), p.warn, p.warn_soft));
@@ -1317,7 +1465,19 @@ impl Render for ComparePane {
         }
 
         if self.show_empty_guide() {
-            body = body.child(kit::empty_state(IconName::GitCompare, t(self, "compare.empty.guide"), SharedString::from(""), &p));
+            // 初始指导：说清对比产出什么，并把主操作直接放进空态（38px 内缩，与标题对齐）。
+            body = body.child(kit::empty_state_with_action(
+                IconName::GitCompare,
+                t(self, "compare.empty.guide"),
+                t(self, "compare.dialog.subtitle"),
+                kit::primary_button(
+                    "compare-guide-start",
+                    Some(IconName::Columns3),
+                    t(self, "compare.dialog.compareStructure"),
+                    compare_act("compare-structure", &entity),
+                ),
+                &p,
+            ));
         }
 
         if let Some(report) = self.structure.clone() {
@@ -1480,7 +1640,7 @@ impl Render for ComparePane {
                         div()
                             .max_w(px(1080.))
                             .mx_auto()
-                            .px(px(m.page_pad))
+                            .px(px(page_pad))
                             .py(px(m.page_pad_y))
                             .flex()
                             .flex_col()
@@ -1503,7 +1663,14 @@ impl ComparePane {
         let side_connection = side.connection_id.clone();
         let side_database = side.database.clone();
         let side_schema = side.schema.clone();
-        let mut card = kit::card(&p).p(px(m.card_pad())).flex().flex_col().gap(px(m.pane_pad())).child(
+        let mut card = kit::card(&p)
+            .id(SharedString::from(format!("compare-side:{which}")))
+            .test_support()
+            .p(px(m.card_pad()))
+            .flex()
+            .flex_col()
+            .gap(px(m.pane_pad()))
+            .child(
             div()
                 .flex()
                 .items_center()
@@ -1519,7 +1686,12 @@ impl ComparePane {
             .max_h(px(m.control_h * 4.5))
             .overflow_y_scroll();
         if self.choices.is_empty() {
-            connections = connections.child(kit::muted(SharedString::from(self.text("compare.dialog.chooseConnection")), &p));
+            // 清单还在读：骨架占位，不先写一句“选择连接”；读完了还是空才提示选连接。
+            connections = if self.choices_loading {
+                connections.child(kit::skeleton_state(3, &m, &p))
+            } else {
+                connections.child(kit::muted(SharedString::from(self.text("compare.dialog.chooseConnection")), &p))
+            };
         }
         for choice in self.choices.clone() {
             let id = format!("compare-{which}:{}", choice.id);
@@ -1606,7 +1778,8 @@ impl ComparePane {
                         );
                     }
                     Some(SchemaState::Loading) | None => {
-                        card = card.child(div().flex().items_center().gap(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_muted).child(Spinner::new().xsmall()).child(SharedString::from(self.text("compare.dialog.schemaLoading"))));
+                        // 局部加载：一行小号转圈、贴左、单行高，不占整块也不自己拼转圈加文字。
+                        card = card.child(kit::inline_loading(SharedString::from(self.text("compare.dialog.schemaLoading")), &m, &p));
                     }
                 }
             }
@@ -1931,6 +2104,46 @@ mod tests {
         let text = pane.lines().join("\n");
         assert!(text.contains("已取消"), "{text}");
         assert!(!text.contains("CREATE TABLE"), "{text}");
+    }
+
+    /// 三档宽度只决定排法：1360 并排，900/640 竖排；阈值本身有正反两侧。
+    #[test]
+    fn sides_only_stack_below_the_side_by_side_width() {
+        assert!(!sides_stacked(1360.), "1360 并排");
+        assert!(!sides_stacked(SIDES_SIDE_BY_SIDE_MIN_W), "阈值本身仍并排");
+        assert!(sides_stacked(SIDES_SIDE_BY_SIDE_MIN_W - 1.), "阈值下一像素就竖排");
+        assert!(sides_stacked(900.), "900 竖排");
+        assert!(sides_stacked(640.), "640 竖排");
+        // 阈值容得下两列（每侧 340 + docked 侧栏 234）由常量处的编译期断言保证。
+    }
+
+    /// 失败与提示分开：失败带重试动作，取消/门禁只说明原因，都不留空详情。
+    #[test]
+    fn a_lost_compare_fails_with_retry_while_cancel_stays_a_notice() {
+        let mut pane = temp_pane();
+        pane.fail(pane.text("compare.status.failed"), RetryAction::Structure);
+        assert_eq!(pane.error_kind, ErrorKind::Failure(RetryAction::Structure));
+        let text = pane.lines().join("\n");
+        assert!(text.contains("比较没有完成"), "{text}");
+        assert!(text.contains("重试"), "失败要有重试动作：{text}");
+        assert!(!pane.show_empty_guide(), "失败不画初始指导");
+
+        pane.notify(pane.text("compare.status.cancelled"));
+        assert_eq!(pane.error_kind, ErrorKind::Notice);
+        let text = pane.lines().join("\n");
+        assert!(text.contains("已取消"), "{text}");
+        assert!(!text.contains("重试"), "取消不该带重试：{text}");
+
+        // 清单读取失败：标题换成“选择连接”，原因仍是后端那句话。
+        pane.fail("读取连接清单失败：磁盘只读".to_owned(), RetryAction::Choices);
+        let text = pane.lines().join("\n");
+        assert!(text.contains("选择连接"), "{text}");
+        assert!(text.contains("读取连接清单失败：磁盘只读"), "{text}");
+
+        pane.clear_error();
+        assert_eq!(pane.error_kind, ErrorKind::None);
+        assert!(pane.error.is_empty());
+        assert!(pane.show_empty_guide(), "清掉提示后回到初始指导");
     }
 
     fn engine_gate(left: &str, right: &str) -> Option<&'static str> {
@@ -2367,6 +2580,146 @@ mod workbench {
                 assert!(!text.contains("on orders"), "换库后旧对比结果必须清掉：{text}");
                 assert!(pane.structure.is_none(), "{text}");
             });
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 打开一个只带连接清单的对比页窗口，用于三档宽度与状态证据；两侧都还没选。
+    fn open_compare_window(cx: &mut App, dir: &std::path::Path, width: f32) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<ComparePane>) {
+        let services = Arc::new(AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        let bounds = gpui_kit::Bounds { origin: Point::default(), size: size(px(width), px(900.)) };
+        gpui_kit::open_window(WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() }, cx, |_, cx| {
+            cx.new(|_| {
+                let mut pane = ComparePane::new(services);
+                pane.choices = vec![
+                    Choice { id: "left".into(), name: "左库".into(), engine: "mysql".into(), databases: vec!["shop".into()], catalog_error: None },
+                    Choice { id: "right".into(), name: "右库".into(), engine: "mysql".into(), databases: vec!["shop".into()], catalog_error: None },
+                ];
+                pane
+            })
+        })
+        .expect("compare window")
+    }
+
+    /// 三档宽度 × 双主题 × 双密度：1360 两侧并排、900/640 竖排，两张卡片都不越出窗口右边界（R1/R3/R6）。
+    #[gpui_kit::test]
+    fn sides_reflow_at_1360_900_and_640_in_both_themes_and_densities(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("rillsql-compare-widths-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        cx.update(gpui_kit::init);
+        let setups = [
+            ("浅色/紧凑", false, kit::Metrics::compact()),
+            ("浅色/标准", false, kit::Metrics::standard()),
+            ("深色/紧凑", true, kit::Metrics::compact()),
+            ("深色/标准", true, kit::Metrics::standard()),
+        ];
+        for (label, dark, density) in setups {
+            for (width, stacked) in [(1360., false), (900., true), (640., true)] {
+                cx.update(|cx| {
+                    kit::apply_theme(dark, cx);
+                    density.publish(cx);
+                });
+                let (window, _) = cx.update(|cx| open_compare_window(cx, &dir, width));
+                let (baseline, target, base_card, target_card) = cx
+                    .update_window(window, |_, window, cx| {
+                        window.render_frame(cx);
+                        (
+                            // 两侧都取同一个候选连接：同一行，竖向/横向位置才有可比性。
+                            window.find("compare-baseline:left").bounds(),
+                            window.find("compare-target:left").bounds(),
+                            window.find("compare-side:baseline").bounds(),
+                            window.find("compare-side:target").bounds(),
+                        )
+                    })
+                    .unwrap();
+                println!("{label} {width}: 卡片 基准 {base_card:?} 对照 {target_card:?}");
+                assert!(baseline.size.width > px(0.) && target.size.width > px(0.), "{label}/{width}: 两侧都要有可用宽度");
+                assert!(baseline.origin.x + baseline.size.width <= px(width) + px(1.), "{label}/{width}: 基准侧越出右边界");
+                assert!(target.origin.x + target.size.width <= px(width) + px(1.), "{label}/{width}: 对照侧越出右边界");
+                println!("{label} {width}: {} 基准 {:?} 对照 {:?}", if stacked { "竖排" } else { "并排" }, baseline, target);
+                if stacked {
+                    assert_eq!(baseline.origin.x, target.origin.x, "{label}/{width}: 竖排时两侧同列");
+                    assert!(baseline.origin.y + baseline.size.height <= target.origin.y, "{label}/{width}: 窄宽要竖排，实际 基准{:?} / 对照{:?}", baseline, target);
+                    assert!(base_card.origin.y + base_card.size.height <= target_card.origin.y, "{label}/{width}: 两张卡片也要竖排");
+                } else {
+                    assert_eq!(baseline.origin.y, target.origin.y, "{label}/{width}: 并排时两侧同一行");
+                    assert!(baseline.origin.x + baseline.size.width <= target.origin.x, "{label}/{width}: 宽屏要并排，实际 基准{:?} / 对照{:?}", baseline, target);
+                    assert_eq!(base_card.origin.y, target_card.origin.y, "{label}/{width}: 两张卡片顶部对齐");
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 640 窄窗口：初始指导是一整块状态并带主操作；写完两侧后交换仍可点，比较按钮没被裁掉。
+    #[gpui_kit::test]
+    fn narrow_640_keeps_the_guide_its_action_and_the_core_operations_reachable(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("rillsql-compare-narrow-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        cx.update(gpui_kit::init);
+        let (window, view) = cx.update(|cx| open_compare_window(cx, &dir, 640.));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("empty-state").is_some(), "初始指导要是统一空态");
+            let guide = window.find("compare-guide-start");
+            assert_eq!(guide.label(), Some("对比结构"), "空态主操作就在块内");
+            assert!(guide.bounds().origin.x + guide.bounds().size.width <= px(640.) + px(1.), "主操作不能被裁出窗口");
+            // 主操作就是比较入口：没有选两侧时给出门禁原因，而不是空白。
+            window.click("compare-guide-start", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("empty-state").is_none(), "触发比较后不该还画初始指导");
+            view.update(cx, |pane, _| {
+                let text = pane.lines().join("\n");
+                assert!(text.contains("请选择已打开的基准和对照"), "{text}");
+            });
+            // 窄窗口里两侧选择与交换仍可达。
+            window.click("compare-baseline:left", cx);
+            window.click("compare-target:right", cx);
+            view.update(cx, |pane, _| assert_eq!(pane.sides(), ("left".to_owned(), "right".to_owned())));
+            window.click("compare-swap", cx);
+            view.update(cx, |pane, _| assert_eq!(pane.sides(), ("right".to_owned(), "left".to_owned()), "窄窗口交换仍生效"));
+            window.render_frame(cx);
+            let compare = window.find("compare-structure");
+            assert!(compare.bounds().origin.x + compare.bounds().size.width <= px(640.) + px(1.), "比较主按钮不能被裁出窗口");
+        })
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 失败用统一错误态 + 重试；取消只给横幅。重试后清掉错误，回到可继续的状态。
+    #[gpui_kit::test]
+    fn a_failed_compare_shows_the_error_state_and_retry_clears_it(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("rillsql-compare-failed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        cx.update(gpui_kit::init);
+        let (window, view) = cx.update(|cx| open_compare_window(cx, &dir, 900.));
+        view.update(cx, |pane, _| pane.fail(pane.text("compare.status.failed"), RetryAction::Structure));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("error-state").is_some(), "失败要用统一错误态");
+            assert_eq!(window.find("compare-retry").label(), Some("重试"));
+            assert!(window.try_find("empty-state").is_none(), "失败与初始指导互斥");
+            window.click("compare-retry", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("error-state").is_none(), "重试后错误态要收掉");
+        })
+        .unwrap();
+        view.update(cx, |pane, _| {
+            assert_eq!(pane.error_kind, ErrorKind::None);
+            assert!(pane.error.is_empty());
+            let text = pane.lines().join("\n");
+            assert!(text.contains("请选择已打开的基准和对照"), "重试走的是重发比较，门禁照旧：{text}");
+        });
+        // 取消是提示：横幅，不是错误态，也没有重试。
+        view.update(cx, |pane, _| pane.notify(pane.text("compare.status.cancelled")));
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("error-state").is_none(), "取消不该画成错误态");
+            assert!(window.try_find("compare-retry").is_none(), "取消不给重试");
         })
         .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
