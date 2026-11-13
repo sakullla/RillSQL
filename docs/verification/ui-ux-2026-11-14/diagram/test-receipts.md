@@ -1,6 +1,6 @@
 # 测试回执（T10 关系图页）
 
-日期：2026-11-14。命令都在仓库根目录执行（`/Users/yanggeng/github/RillSQL`）。本任务只改 `src-tauri/src/app/views/diagram/mod.rs` 与 `src-tauri/src/i18n/mod.rs`（3 条关系图文案），Cargo 依赖未改。
+日期：2026-11-14。命令都在仓库根目录执行（`/Users/yanggeng/github/RillSQL`）。本任务改动只有 `src-tauri/src/app/views/diagram/mod.rs` 与本目录文档；三条 `diagram.*` 文案随 `3c21298` 进入 `main`，不重复认领 `src-tauri/src/i18n/mod.rs`；Cargo 依赖未改。
 
 ## 1. 关系图自身的用例
 
@@ -17,7 +17,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked --lib app::views::diagr
 | `card_keyboard_equivalents_match_the_mouse_gestures` | Enter / Shift+Enter / 菜单键 / Shift+F10 / Esc 的等价语义；未知表不产生打开请求；四态取值来自 `kit::interaction_style`（hover、active、2px 强调色焦点环、可聚焦） |
 | `pane_keys_zoom_and_dismiss_without_touching_the_diagram` | 页面级 `+`/`-`/`0` 缩放与复位、Esc 收起菜单与悬停、无关键不吞 |
 | `four_states_carry_the_matching_next_step` | `PaneState` 五种判定；空图说明为什么空；失败带原因；无目标不是“读取失败” |
-| `diagram_four_states_and_keyboard_hold_at_1360` | 1360 × 900：卡片、单行页头、缩放按钮、Tab+Enter、搜索无命中提示条与清除、四态 |
+| `diagram_four_states_and_keyboard_hold_at_1360` | 1360 × 900：卡片、单行页头、缩放按钮、Tab+Enter、搜索无命中提示条与清除（含输入控件真实文字）、四态 |
 | `diagram_four_states_and_keyboard_hold_at_900` | 900 × 900：同上 |
 | `diagram_four_states_and_keyboard_hold_at_640` | 640 × 900：`diagram-tools` 第二行、卡片、缩放、Tab+Enter、四态 |
 | `sqlite_diagram_shows_cards_wires_hover_and_does_not_write` | 真实 SQLite 夹具：卡片、连线、悬停关联（hot/linked/dim）、双击打开请求，读取前后 `sqlite_master` 与 `orders` 行数一致 |
@@ -26,6 +26,12 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked --lib app::views::diagr
 | `object_spec_skips_non_relational_engines` | Redis/Mongo 不产生关系图目标 |
 
 三个宽度用例各自在浅·紧凑、浅·标准、深·紧凑、深·标准 四组主题/密度下重跑同一份断言。
+
+### A2：清除搜索要真的清掉输入控件（2026-11-14 追加）
+
+第一次提交的 `clear_search` 把 `field.sync` 也一起清空，导致 `search_field` 的“同步才写回”条件（`field.sync != wanted`）不成立，点“清除搜索”或框内按 Esc 后输入框仍留着旧词。修复后 `clear_search` 只改模型，回写交给既有路径。
+
+用例补强：三个宽度用例都通过 `search_control_text` 读 `InputState` 里的真实文字——条件生效时断言控件显示 `zzz`，点“清除搜索”后断言控件为空串，同时断言提示条消失、画布仍在。只断言 `pane.search` 正是漏掉这个 bug 的原因。没有把旧代码临时塞回共享工作区去“验证用例会红”（其他人正在同一工作区提交），结论按代码路径推理 + 控件值断言给出。
 
 ### 运行时间与“挂住”事故（2026-11-14 04:xx 追加）
 
@@ -91,12 +97,14 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked
 - 第一次全量（T3 的 `conn_modal`/chrome 改动尚未自洽时）：926 passed / 4 failed，失败全部在 `app::shell::conn_modal::tests::tab_order_stays_inside_the_modal_and_wraps`、`app::shell::tests::density_theme_and_language_reach_the_rendered_chrome`、`app::shell::tests::long_copy_is_truncated_but_fully_available_and_never_holds_neighbours`、`app::shell::tests::sidebar_copy_and_test_remain_usable_while_catalog_is_loading`——均属 T3 范围，与关系图无关。
 - 第二次全量（T3 修好后）：930 passed / 0 failed / 7 ignored（`TEST_EXIT=0`）。
 - 第三次全量（修复窗口用例 + 邻接任务再提交后）：931 passed / 0 failed / 7 ignored，wall 41.65 s，EXIT=0。
+- A2 复跑（`clear_search` 修复 + 控件值断言后）：`app::views::diagram` **10 passed / 0 failed**（用例内 1.66 s）；随后一次全量 `cargo test --locked --lib` → **966 passed / 0 failed / 7 ignored**，wall 68.87 s，EXIT=0（数字包含同期 T12/T13/T14/T15 已落盘的新用例）。
+- A2 期间有多次`--lib`编译失败，全部来自邻接任务正在写的 `app/views/export`、`app/views/mongo`、`app/views/admin`、`app/views/redis`（`E0599 test_support/render_frame`、`E0308 if/else` 等），不是关系图代码；等它们自洽后同一命令即绿。
 - Clippy（`--all-targets`）：退出码 0。与关系图相关的两条 warning 都是本轮之前就存在的（`src/diagram/mod.rs` 的 `DiagramColumn` re-export、`app/views/diagram/mod.rs` 测试模块里的 `AppContext` 导入），本轮新增代码没有引入 warning。
 
 ## 6. 基线与归属说明
 
 - 最终复跑在 `3c21298`（结构页文案跟进提交）之上的工作区完成：`cargo test --locked` → **930 passed / 0 failed / 7 ignored**（`EXIT=0`）。
-- 本任务新增的 3 条 `i18n` 文案（`diagram.emptyDetail`、`diagram.searchNoMatch`、`diagram.searchClear`）在提交 `3c21298` 里被一并带入 `main`；关系图实现本身（`src-tauri/src/app/views/diagram/mod.rs`）仍在工作区，等待本任务提交。集成申报时请不要重复认领 `src-tauri/src/i18n/mod.rs`。
+- 界面用的 3 条 `i18n` 文案（`diagram.emptyDetail`、`diagram.searchNoMatch`、`diagram.searchClear`）在提交 `3c21298` 里已经进入 `main`；本任务的提交只有 `src-tauri/src/app/views/diagram/mod.rs` + 本目录文档，集成申报时不要重复认领 `src-tauri/src/i18n/mod.rs`。
 
 ## 未取得项
 

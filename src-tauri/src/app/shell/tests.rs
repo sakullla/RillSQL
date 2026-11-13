@@ -7046,21 +7046,99 @@ fn every_entry_opens_the_same_modal_and_cancel_leaves_no_draft() {
     assert_eq!(model.connections.rows.len(), 1);
 }
 
-/// Tab/Shift+Tab 在模态自己的停靠点里成环，不会落到下面的页面。
-#[test]
-fn modal_tab_order_wraps_inside_and_covers_fields_and_footer() {
-    let mut model = seeded_model(Vec::new());
-    let _ = model.dispatch("conn-new-launcher");
-    let stops = super::conn_modal::ConnectionModal::stops(&model.connections);
-    assert_eq!(stops.first(), Some(&super::conn_modal::ModalStop::Field(DraftField::Url)));
-    assert_eq!(stops.last(), Some(&super::conn_modal::ModalStop::SaveConnect));
-    for _ in 0..stops.len() {
-        let stop = model.step_modal_focus(true).expect("有停靠点");
-        assert!(stops.contains(&stop), "只在模态里循环");
+/// 真实的 Tab/Shift+Tab 属于 GPUI 的 focus trap（面板注册了 focus_trap）：
+/// 按超过停靠点数量的次数也必须留在面板里，并且每个已渲染的控件都要被走到。
+#[gpui_kit::test]
+fn modal_tab_trap_keeps_focus_inside_and_visits_every_control(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-modal-trap-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("conn-engine:sqlite", cx)));
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+
+    let (panel, controls, stops) = cx.update(|cx| {
+        let view = view.read(cx);
+        (
+            view.modal_focus.clone(),
+            view.modal_controls.keys().cloned().collect::<Vec<_>>(),
+            view.model.modal_stops(),
+        )
+    });
+    assert!(!controls.is_empty(), "模态控件应已登记");
+    let expected: Vec<String> = stops.iter().filter_map(|stop| stop.control_id().map(str::to_owned)).collect();
+    assert_eq!(controls.len(), expected.len(), "登记数与停靠点数应一致：{controls:?} vs {expected:?}");
+
+    let mut seen: Vec<String> = Vec::new();
+    for _ in 0..(stops.len() * 2) {
+        cx.simulate_keystrokes(window, "tab");
+        cx.update_window(window, |_, window, cx| {
+            assert!(panel.contains_focused(window, cx), "Tab 逃出了模态面板");
+            if let Some(focused) = window.focused(cx) {
+                if let Some(id) = view.read(cx).modal_controls.iter().find(|(_, handle)| **handle == focused).map(|(id, _)| id.clone()) {
+                    seen.push(id);
+                }
+            }
+        })
+        .unwrap();
     }
-    assert_eq!(model.conn_modal.focus, 0, "一轮之后回到首个字段");
-    let back = model.step_modal_focus(false).expect("反向也有停靠点");
-    assert_eq!(back, stops[stops.len() - 1], "Shift+Tab 从首个字段回到页脚末项");
+    for id in &expected {
+        assert!(seen.contains(id), "Tab 走不到 {id}：{seen:?}");
+    }
+
+    // 反向同样留在面板里。
+    for _ in 0..(stops.len() * 2) {
+        cx.simulate_keystrokes(window, "shift-tab");
+        cx.update_window(window, |_, window, cx| {
+            assert!(panel.contains_focused(window, cx), "Shift+Tab 逃出了模态面板");
+        })
+        .unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 画出来的控件与 Tab 能到的控件是同一份清单：三种表单形状都核对一遍。
+#[gpui_kit::test]
+fn every_rendered_modal_control_is_a_tab_stop(cx: &mut gpui_kit::TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("rillsql-modal-rendered-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (window, view) = open_workbench(cx, services_at(&dir), false);
+    let shapes = [
+        ("postgres", Engine::Postgres),
+        ("sqlite", Engine::Sqlite),
+        ("mssql", Engine::Sqlserver),
+    ];
+    for (label, engine) in shapes {
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.perform(&format!("conn-engine:{}", engine.as_str()), cx);
+            })
+        });
+        if engine == Engine::Sqlserver {
+            // 打开 TLS 校验 + CA 文件 + SSH：控件最多的那种形状。
+            cx.update(|cx| {
+                view.update(cx, |view, _| {
+                    let draft = view.model.connections.editor.as_mut().unwrap();
+                    draft.tls_mode = crate::connections::model::TlsMode::Verify;
+                    draft.ca_mode = crate::connections::model::CaMode::File;
+                    draft.ssh_on = true;
+                    draft.ssh_auth = crate::connections::model::SshAuthKind::Key;
+                })
+            });
+        }
+        let (rendered, stops) = cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            let view = view.read(cx);
+            (view.model.conn_modal.rendered.clone(), view.model.modal_stops())
+        })
+        .unwrap();
+        let expected: Vec<String> = stops.iter().filter_map(|stop| stop.control_id().map(str::to_owned)).collect();
+        for id in &rendered {
+            assert!(expected.contains(id), "{label}: 画出来的 {id} 不在 Tab 序列里");
+        }
+        assert_eq!(rendered.len(), expected.len(), "{label}: 画出来的控件数与停靠点数应一致");
+        assert!(!rendered.is_empty(), "{label}: 模态应登记控件");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 普通保存：关闭模态、不建连、不写最近使用。
@@ -7262,5 +7340,74 @@ fn diagram_header_back_returns_to_the_previous_work_item(cx: &mut gpui_kit::Test
         assert!(model.tabs.iter().any(|tab| tab.kind.is_query()), "原来的查询工作项还在");
         assert_eq!(model.diagram_spec.as_deref(), Some("notes|main||图A"), "图自己的范围留在图上");
     });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 执行查询也要先有连接：未连接时排队一次连接，连上后重放这次执行，已连接直接执行。
+#[test]
+fn running_a_query_on_a_closed_connection_connects_then_replays_the_run() {
+    let mut model = seeded_model(vec![record_for("pg", "Atlas", Engine::Postgres)]);
+    model.open_bound_query(
+        "select 1".into(),
+        Some("pg".into()),
+        Some("Atlas".into()),
+        Some("app".into()),
+        Some("postgres".into()),
+    );
+    assert!(model.gate_on_demand("execute-query"), "连接没打开时先建连");
+    assert_eq!(model.pending_len(), 1, "只排一次打开连接");
+    assert_eq!(model.notice_key, Some("ui.conn.connecting"));
+    assert_eq!(model.take_pending(), Some(PendingJob::OpenConnection));
+
+    model.connections.status.insert("pg".into(), LinkStatus::Connected);
+    let ready = model.take_ready_intents();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].command(), Some("execute-query"), "连上后重放这一次执行");
+    assert_eq!(ready[0].connection_id, "pg");
+
+    assert!(!model.gate_on_demand("execute-query"), "已连接时照常执行，不再建连");
+    assert_eq!(model.pending_len(), 0);
+}
+
+/// 执行当前语句/选区与整条执行走同一条按需连接续接。
+#[test]
+fn every_run_command_shares_the_same_gate() {
+    let mut model = seeded_model(vec![record_for("pg", "Atlas", Engine::Postgres)]);
+    model.open_bound_query(String::new(), Some("pg".into()), Some("Atlas".into()), None, Some("postgres".into()));
+    for command in ["run-current", "run-selection"] {
+        assert!(model.gate_on_demand(command), "{command} 也要先建连");
+        let intent = model.take_ready_intents();
+        assert!(intent.is_empty(), "未连接时先不重放");
+        let queued = model.connect_intents.iter().find(|queued| queued.replay.as_deref() == Some(command));
+        assert!(queued.is_some(), "{command} 应排队等待重放");
+    }
+}
+
+/// 保存并连接要带着刚输入的密码去连接：关闭模态会清空表单机密，不能把空密码交给 OpenConnection。
+#[tokio::test]
+async fn save_and_connect_carries_the_typed_password_into_open() {
+    let dir = std::env::temp_dir().join(format!("rillsql-t3-secrets-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = seeded_model(vec![record_for("pg", "Atlas", Engine::Postgres)]);
+    model.connections.selected = Some("pg".into());
+    let _ = model.dispatch("conn-edit");
+    assert!(model.conn_modal.open);
+    // 这条配置没有保存过密码：本次输入的密码只在表单里。
+    model.connections.editor.as_mut().unwrap().save_password = false;
+    model.connections.secrets.password = "typed-only-here".into();
+
+    let _ = model.dispatch("conn-save-connect");
+    let token = model.prepare_list_token(&services.tasks);
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "connections", done);
+
+    assert!(!model.conn_modal.open, "保存成功关闭模态");
+    assert_eq!(model.pending_len(), 1);
+    let job = model.take_pending().expect("保存并连接应排队一次打开连接");
+    assert_eq!(job, PendingJob::OpenConnection);
+    let request = jobs::job_request(&model, job, token);
+    assert_eq!(request.secrets.password, "typed-only-here", "打开连接要用刚输入的密码");
+    assert_eq!(request.selected.as_deref(), Some("pg"), "重试仍指向同一条连接");
     let _ = std::fs::remove_dir_all(&dir);
 }

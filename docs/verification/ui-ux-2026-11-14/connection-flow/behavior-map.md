@@ -27,7 +27,7 @@
 | 项 | 实现 |
 | --- | --- |
 | 自动聚焦 | `ConnectionModal.focus_first_pending`；模态渲染完把焦点交给首个字段（URL）的 `InputState` 焦点句柄。占位符/掩码由 `Workbench::field_hint` 单一来源提供，渲染与聚焦不会写两套文案。 |
-| 焦点陷阱 | `overlay_key` 在模态打开时截获 `tab`/`shift+tab` → `modal_step` → `ConnectionModal::step`（按引擎与 TLS/SSH 形状算出的停靠序列成环）；字段用输入框句柄，页脚动作各有 `FocusHandle`。停在页脚动作上按回车等于按下它（`modal_enter`）。 |
+| 焦点陷阱 | 面板注册 GPUI 的 `focus_trap`（`FocusTrapElement`）：Root 的 `Tab`/`TabPrev` 动作在容器内成环，走的是真实焦点。**不再自绘 Tab 序列**——那会被 Root 的绑定（`cx.propagate_event=false`）抢先吃掉，实测是死代码（review A2 的 P1）。面板里每个可交互控件都有自己的 `FocusHandle`（`track_focus`）。回车落在已登记的控件上就激活它（`modal_activate_focused`，按焦点句柄反查 id）；落在输入框上时交还输入框。 |
 | Esc/取消 | `conn-cancel` → `close_connection_modal()`：清草稿与本次机密、不动已保存配置，返回 `(来源区域, 触发控件)`；`render_root` 下一帧把焦点还给启动台/侧栏的“新建”按钮，触发控件不在时退回来源区域。行触发按 S12.3 还给列表容器（行本身不是 Tab 停靠）。 |
 | backdrop | `backdrop("conn-modal-backdrop", 0.32, …)` + 面板 `.occlude()`：点击落在遮罩上被吞掉，下方树/编辑器/菜单收不到。 |
 
@@ -110,3 +110,54 @@
 - 连接分组、对象树虚拟化（T4）；快速打开的连接/库/表搜索（T5）；历史与设置页收敛（T8）。
 - 连接模态没有新增“删除/复制”页脚按钮：删除仍走启动台行菜单 + 既有二次确认，复制配置在行菜单里。
 - 没有原生截图与真实输入法/Tab 实机验证（见 `README.md` 的证据类型）。
+
+## 修复轮 A2（review 四条 blocking + 两条 advisory）
+
+### 1. Tab 焦点陷阱：改成 GPUI 的 focus trap，不再是死代码
+
+- `connection_modal_layer` 的面板现在是 `div().focus_trap("conn-modal", &self.modal_focus)`（`gpui_kit::base::FocusTrapElement`），
+  即 Root 的 `Tab`/`TabPrev` 动作在容器内成环。原来自绘的 `overlay_key` tab 分支已删除——Root 在绑定阶段就吃掉了
+  tab，冒泡阶段收不到，删掉后也不再让人误以为已经处理。
+- 真实焦点验证：`modal_tab_trap_keeps_focus_inside_and_visits_every_control` 用 `cx.simulate_keystrokes(window, "tab")`
+  连按 `2 x 停靠点数` 次，每次都断言 `modal_focus.contains_focused(window, cx)`，并收集"当前焦点属于哪个已登记控件"；
+  最后要求每个停靠点 id 都出现过。反向再连按 `2 x 停靠点数` 次 shift-tab，同样断言没有离开面板。
+- 之前只有模型层的 `step_modal_focus` 测试，这正是它误判通过的原因（review 指出的 tests.rs:7043 已删除）。
+
+### 2. 停靠点覆盖全部可交互控件（不再只有字段和页脚）
+
+- 控件 id 集中在 `conn_modal.rs`（`CLOSE`、`APPLY_URL`、`BROWSE_*`、`SSH_TOGGLE`、`engine_control_id`、`env_control_id`、
+  `tls_control_id`、`ca_control_id`、`ssh_auth_control_id`），`ConnectionModal::stops` 与渲染读同一批常量。
+- 渲染侧每个控件都 `track_focus` 并登记到 `ConnectionModal.rendered`；动作登记在 `Workbench.modal_actions`，
+  鼠标点击与回车都走 `activate_modal_control(id)`，不会出现"画了但 Tab 跳过"或"键盘点了没反应"。
+  `kit::segmented_sized` 换成 `modal_segment_item`（同一套视觉，但每项有自己的焦点句柄）。
+- 对账用例：`every_rendered_modal_control_is_a_tab_stop` 对 Postgres / SQLite / SQLServer+TLS(CA 文件)+SSH 三种形状
+  各渲染一帧，断言 `rendered` 与 `stops` 的控件集合完全一致（数量也相等）。
+- `ModalStop::control_id()` 把页脚四个动作也映射到元素 id，测试因此能覆盖页脚。
+
+### 3. 执行查询也走按需连接
+
+- `on_demand_intent` 新增 `execute-query` / `run-current` / `run-selection` / `run-script`：从活动查询工作项取
+  `connection_id`，连接没打开时排 `ConnectAction::Run` + `replay: 原命令`；连上后 `run_connect_intents` 重放同一条命令，
+  不再让查询页回答"这条连接还没有打开"。
+- 用例：`running_a_query_on_a_closed_connection_connects_then_replays_the_run`（未连接 → 排队一次 OpenConnection →
+  标记已连接 → `take_ready_intents` 给出 `execute-query` → 已连接时 `gate_on_demand` 返回 false 直接执行）、
+  `every_run_command_shares_the_same_gate`。
+
+### 4. "保存并连接"带上刚输入的密码
+
+- `apply_done(Saved)` 在关闭模态之前取出 `connections.secrets`，存进
+  `WorkbenchModel.pending_open_secrets: Option<(连接 id, Secrets)>`，再 `queue_connect`。
+- `job_request` 只为 `PendingJob::OpenConnection` 读取它（且要求 id 与 `selected` 一致），因此不保存密码的配置
+  （复制出来的、编辑过的）不会拿空密码去认证；连接成功后才清掉，失败重试仍用同一份。
+- 重新打开/编辑表单会清掉它，避免上一次的密码泄漏到下一次无关的连接。
+- 用例：`save_and_connect_carries_the_typed_password_into_open`（Postgres、`save_password = false`：
+  保存成功后排队的就是 OpenConnection，且 `request.secrets.password == "typed-only-here"`）。
+
+### Advisory 1：credentials 不再挂在用户名那一格
+
+- `field_row` 去掉"username 也接 credentials"的特例；凭据组下方新增独立一行 `credentials_row`
+  （元素 id `conn-issue-credentials`，Group 角色 + 图标 + 文案），仍按 `field_issue_placed` 从底部汇总里排除，只显示一次。
+
+### Advisory 2：原生截图
+
+- 仍然没有。`README.md` 的证据类型说明保持不变（headless 几何 vs 原生截图），不冒充。

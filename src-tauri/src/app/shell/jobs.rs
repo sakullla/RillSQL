@@ -60,12 +60,22 @@ pub fn job_request(model: &WorkbenchModel, job: PendingJob, token: TaskToken) ->
         PendingJob::RenameSaved => model.history.rename_request(),
         _ => None,
     };
+    // 打开连接用的是“这次输入/刚存下的机密”，不是被清空后的表单机密。
+    let secrets = match &job {
+        PendingJob::OpenConnection => model
+            .pending_open_secrets
+            .as_ref()
+            .filter(|(id, _)| model.connections.selected.as_deref() == Some(id.as_str()))
+            .map(|(_, secrets)| secrets.clone())
+            .unwrap_or_else(|| model.connections.secrets.clone()),
+        _ => model.connections.secrets.clone(),
+    };
     JobRequest {
         job,
         token,
         generation: model.connections.test_generation,
         draft: model.connections.editor.clone(),
-        secrets: model.connections.secrets.clone(),
+        secrets,
         selected: model.connections.selected.clone(),
         export_path: model.export_path.clone(),
         import_path: model.import_path.clone(),
@@ -259,11 +269,15 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
                 model.connections.message_key = None;
                 model.notice_detail.clear();
                 let connect_after = model.conn_modal.save_and_connect;
+                // 关闭模态会清掉本次机密；“保存并连接”要带着刚输入的密码去连接，
+                // 否则没保存密码的配置（复制出来的、编辑过的）会在 OpenConnection 时拿空密码去认证。
+                let typed_secrets = model.connections.secrets.clone();
                 // 保存成功就关掉模态：普通保存到此为止，绝不因为保存过一次就去连接。
                 let _ = model.close_connection_modal();
                 model.connections.selected = Some(id.clone());
                 if connect_after {
-                    // 配置已经落盘；连接失败也不该再存一次，重试只重连。
+                    // 用刚才输入/存下的机密去连接，重试也带着它；配置已经落盘，失败不再存一次。
+                    model.pending_open_secrets = Some((id.clone(), typed_secrets));
                     model.queue_connect(super::conn_modal::ConnectIntent::new(
                         id,
                         super::conn_modal::ConnectAction::Expand,
@@ -332,6 +346,14 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
             let _ = model.connections.note_open(&services.tasks, token, outcome);
             model.notice_key = model.connections.message_key;
             model.notice_detail = model.connections.message_detail.clone();
+            // 连上之后那份输入机密就用完了；失败时留着，重试还要用同一份去认证。
+            let used = model
+                .pending_open_secrets
+                .as_ref()
+                .is_some_and(|(id, _)| model.connections.row_status(id) == crate::app::views::connections::LinkStatus::Connected);
+            if used {
+                model.pending_open_secrets = None;
+            }
             model.fail_pending_intents();
         }
         JobDone::Disconnect(token, id) => {

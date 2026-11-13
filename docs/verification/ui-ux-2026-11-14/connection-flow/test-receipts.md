@@ -13,7 +13,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 
 | target | 通过 | 失败 | ignored |
 | --- | --- | --- | --- |
-| `rillsql` lib | 931 | 0 | 7 |
+| `rillsql` lib | 966 | 0 | 7 |
 | `src/main.rs` | 0 | 0 | 0 |
 | `rillsql-package` | 1 | 0 | 0 |
 
@@ -96,3 +96,32 @@ T10 的 `DiagramPane::take_back()` 原本没有消费者（页头返回点了没
   不能证明原生输入法组合键与系统 Tab 焦点环的实际像素表现。
 - **数据库 fixture**：本任务的连接端到端用本地 SQLite 文件；PostgreSQL/MySQL/MariaDB 的真实连接未在本任务内跑
   （ignored 的 fixture 用例不计通过）。
+
+## 8. 修复轮 A2 的回执（review 四条 blocking）
+
+命令与全量结果同上（同一份 candidate）：
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked` | exit 0 — lib 966 passed / 0 failed / 7 ignored；rillsql-package 1 passed |
+| `cargo test --manifest-path src-tauri/Cargo.toml --locked --lib -- app::shell` | exit 0 — 153 passed / 0 failed / 1 ignored |
+| `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked` | exit 0 — 0 error / 31 warning（均在未改动模块，或为既有 too_many_arguments / question_mark） |
+| `git diff --exit-code -- src-tauri/Cargo.toml src-tauri/Cargo.lock` | exit 0 |
+
+新增/改写的用例：
+
+| 用例 | 行为 |
+| --- | --- |
+| `app::shell::tests::modal_tab_trap_keeps_focus_inside_and_visits_every_control` | 真实 `simulate_keystrokes("tab")` 连按 2×停靠点数：每次 `modal_focus.contains_focused` 为真，且 18 个已登记控件全部被走到；shift-tab 连按同样不离开面板 |
+| `app::shell::tests::every_rendered_modal_control_is_a_tab_stop` | Postgres / SQLite / SQLServer+TLS+SSH 三种形状：`rendered` 与 `stops` 的控件集合与数量完全一致 |
+| `app::shell::conn_modal::tests::stops_include_every_interactive_group_not_just_fields` | 引擎、环境、TLS/CA、SSH、解析、浏览、关闭都在停靠点里 |
+| `app::shell::tests::running_a_query_on_a_closed_connection_connects_then_replays_the_run` | 未连接 → 排队一次 OpenConnection → 连上后重放 `execute-query`；已连接直接执行 |
+| `app::shell::tests::every_run_command_shares_the_same_gate` | `run-current` / `run-selection` 与整条执行同一条续接 |
+| `app::shell::tests::save_and_connect_carries_the_typed_password_into_open` | 无持久化密码的 Postgres：保存并连接后 `JobRequest.secrets.password` 就是刚输入的那个 |
+
+删除的用例：`modal_tab_order_wraps_inside_and_covers_fields_and_footer`（只测 `model.step_modal_focus`，
+而真实 Tab 走不到那条路径，属于 review 指出的误判通过）。
+
+一条已知的负载敏感用例：`app::views::query::tests::long_select_keeps_polling_past_ten_seconds`
+（T6 的查询轮询，含真实 >10s 等待）在全量并行跑到 68s 那次因超时失败（`polls=0`），单跑与随后一次全量都通过。
+本任务的改动不涉及查询轮询路径，记录在此以便 Delivery 复跑时核对。

@@ -401,13 +401,13 @@ impl DiagramPane {
         }
     }
 
+    /// 清空搜索条件。只改模型，**不动** `field.sync`：search_field 靠
+    /// `field.sync != wanted` 判断要不要把模型值写回输入控件，这里若把 sync 一起清掉，
+    /// 两者都变成空串，写回就不会发生，控件里留着旧文字（清除按钮和框内 Esc 都会失效）。
     fn clear_search(&mut self) {
         self.search.clear();
         self.highlight = None;
         self.center_pending = false;
-        if let Some(field) = self.search_input.as_mut() {
-            field.sync.clear();
-        }
     }
 
     /// 搜索框聚焦时自己吃掉字符：页面快捷键（+/-/0、Esc）不能顺手改画布。
@@ -962,6 +962,11 @@ mod tests {
         })
     }
 
+    /// 读搜索输入控件里真正的文字（不是模型里的条件），用来钉住模型→控件的回写。
+    fn search_control_text(pane: &gpui_kit::Entity<DiagramPane>, cx: &gpui_kit::App) -> Option<String> {
+        pane.read(cx).search_input.as_ref().map(|field| field.state.read(cx).value().to_string())
+    }
+
     /// 把关系图摆到指定状态：四态都不依赖异步读取，测试直接构造现场。
     fn fill_state(pane: &gpui_kit::Entity<DiagramPane>, state: &str, cx: &mut gpui_kit::App) {
         pane.update(cx, |pane, cx| {
@@ -1042,11 +1047,23 @@ mod tests {
                 window.render_frame(cx);
                 assert!(window.try_find("diagram-no-match").is_some(), "{tag}：搜索无命中要有提示条");
                 assert!(window.try_find("diagram-card:orders").is_some(), "{tag}：无命中不隐藏画布");
-                window.click("diagram-search-clear", cx);
-                window.render_frame(cx);
             })
             .unwrap();
-            assert!(cx.update(|cx| pane.read(cx).search.is_empty()), "{tag}：清除搜索后恢复现场");
+            // 条件要真的显示在输入框里（只看模型值会漏掉“控件没跟着改”的 bug）。
+            assert_eq!(cx.update(|cx| search_control_text(&pane, cx)).as_deref(), Some("zzz"), "{tag}：搜索框要显示当前条件");
+            cx.update_window(window, |_, window, cx| {
+                window.click("diagram-search-clear", cx);
+                window.render_frame(cx);
+                assert!(window.try_find("diagram-no-match").is_none(), "{tag}：清除后不应再有无命中提示条");
+                assert!(window.try_find("diagram-card:orders").is_some(), "{tag}：清除后画布仍在");
+            })
+            .unwrap();
+            assert!(cx.update(|cx| pane.read(cx).search.is_empty()), "{tag}：清除搜索后模型条件为空");
+            assert_eq!(
+                cx.update(|cx| search_control_text(&pane, cx)).as_deref(),
+                Some(""),
+                "{tag}：清除搜索要把输入控件里的文字一起清掉（回写路径）"
+            );
 
             // 纯键盘：Tab 停在卡片上按 Enter，走与双击相同的“打开表数据”请求。
             // 页头最多 6 个停靠点 + 2 张卡片，12 次足够；循环还有 15 秒墙钟上限，

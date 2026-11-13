@@ -24,7 +24,7 @@ use crate::query::assist::TreeObject;
 use crate::state::{AppState, Platform, SessionState, SessionTab, ShellSettings, StateError};
 
 use super::close::{draft_pending, evaluate, message_key, update_block_key, CloseFacts, CloseKind, CloseScope};
-use super::conn_modal::{ConnectAction, ConnectIntent, ConnectionModal, ModalControl, ModalStop};
+use super::conn_modal::{ConnectAction, ConnectIntent, ConnectionModal, ModalControl};
 use super::layout::{
     clamp_history_preview, clamp_sidebar, layout_with_sidebar, painted_frame_with_sidebar, unbreakable_px, ChromeLayout, PaintedFrame, HISTORY_PREVIEW_DEFAULT,
     SIDEBAR_DEFAULT,
@@ -338,6 +338,9 @@ pub struct WorkbenchModel {
     pub connect_intents: Vec<ConnectIntent>,
     /// 上一次连接失败时还挂着的动作：重试按钮重放它，不会丢掉用户想打开的对象。
     pub connect_retry: Option<ConnectIntent>,
+    /// “保存并连接”刚存下的那次输入机密（连接 id + 机密）：紧接着的 OpenConnection
+    /// 用它连接，而不是用被 close_connection_modal 清空后的空机密。连上或重新打开表单即清。
+    pub pending_open_secrets: Option<(String, Secrets)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -423,6 +426,7 @@ impl WorkbenchModel {
             conn_modal: ConnectionModal::default(),
             connect_intents: Vec::new(),
             connect_retry: None,
+            pending_open_secrets: None,
         }
     }
 
@@ -1199,6 +1203,8 @@ impl WorkbenchModel {
     /// 打开新建连接模态。启动台、命令搜索、对象树空态和快捷键都到这一处，
     /// 因此"新建连接"只有一份草稿与一个编辑面。
     pub fn open_connection_modal(&mut self, engine: Option<Engine>, origin: FocusTarget, control: Option<ModalControl>, trigger: &str) {
+        // 重新开表单就是新一次输入：上一次“保存并连接”留下的机密不再复用。
+        self.pending_open_secrets = None;
         self.connections.start_new(engine.unwrap_or(Engine::Postgres));
         self.connections.issues.clear();
         self.focused_field = Some(DraftField::Name);
@@ -1207,6 +1213,7 @@ impl WorkbenchModel {
 
     /// 编辑（或复制）一行配置：草稿来自这一行，屏幕上的改动不影响已保存配置直到保存成功。
     pub fn edit_connection(&mut self, id: &str, duplicate: bool, origin: FocusTarget, control: Option<ModalControl>, trigger: &str) -> bool {
+        self.pending_open_secrets = None;
         self.connections.selected = Some(id.to_owned());
         if duplicate {
             self.connections.duplicate_selected();
@@ -1289,6 +1296,16 @@ impl WorkbenchModel {
                 return Some(ConnectIntent::new(connection, ConnectAction::OpenWorkspace, None));
             }
             return None;
+        }
+        // 执行查询：活动查询项绑定的连接还没打开时，先连上再重放这次执行，
+        // 而不是让查询页回答“这条连接还没有打开”（run-current/选区同一条路）。
+        if matches!(id, "execute-query" | "run-current" | "run-selection" | "run-script") {
+            let tab = self.active_tab().filter(|tab| tab.kind.is_query())?;
+            let connection = tab.connection_id.clone()?;
+            if !self.connections.rows.iter().any(|row| row.saved.id == connection) {
+                return None;
+            }
+            return Some(ConnectIntent::new(connection, ConnectAction::Run, None).with_replay(id));
         }
         let action = match id {
             "tree-open-data" => ConnectAction::OpenData,
@@ -1386,9 +1403,9 @@ impl WorkbenchModel {
         true
     }
 
-    /// 模态里的 Tab：按屏幕上的字段顺序循环，不逃到下面的页面。
-    pub fn step_modal_focus(&mut self, forward: bool) -> Option<ModalStop> {
-        self.conn_modal.step(&self.connections, forward)
+    /// 模态里这一帧应该存在的全部 Tab 停靠点（真实 Tab 由 GPUI 的 focus trap 在容器内成环）。
+    pub fn modal_stops(&self) -> Vec<super::conn_modal::ModalStop> {
+        ConnectionModal::stops(&self.connections, &super::conn_modal::env_ids(&self.env_tags))
     }
 
     pub fn open_menu(&mut self, place: MenuPlace, target: MenuTarget) {

@@ -68,11 +68,12 @@ pub struct Workbench {
     pub(super) conn_launcher_focus: FocusHandle,
     /// 对象树空态"新建连接"按钮：同上。
     pub(super) conn_sidebar_focus: FocusHandle,
-    /// 连接模态页脚按钮的焦点句柄：Tab 序列在模态内闭合，不逃到下面页面。
-    pub(super) modal_close_focus: FocusHandle,
-    pub(super) modal_test_focus: FocusHandle,
-    pub(super) modal_save_focus: FocusHandle,
-    pub(super) modal_save_connect_focus: FocusHandle,
+    /// 连接模态面板自己的焦点：GPUI focus trap 的容器句柄。
+    pub(super) modal_focus: FocusHandle,
+    /// 模态里每个可交互控件的焦点句柄，按渲染 id 存取。
+    pub(super) modal_controls: std::collections::HashMap<String, FocusHandle>,
+    /// 这一帧登记过的控件动作：鼠标点击与回车激活读同一份。
+    pub(super) modal_actions: std::collections::HashMap<String, super::conn_modal::ModalAction>,
     close_hooked: bool,
     booted: bool,
     health_task: Option<gpui_kit::Task<()>>,
@@ -194,10 +195,9 @@ impl Workbench {
             nav_focus: cx.focus_handle().tab_stop(true),
             conn_launcher_focus: cx.focus_handle().tab_stop(true),
             conn_sidebar_focus: cx.focus_handle().tab_stop(true),
-            modal_close_focus: cx.focus_handle().tab_stop(true),
-            modal_test_focus: cx.focus_handle().tab_stop(true),
-            modal_save_focus: cx.focus_handle().tab_stop(true),
-            modal_save_connect_focus: cx.focus_handle().tab_stop(true),
+            modal_focus: cx.focus_handle(),
+            modal_controls: std::collections::HashMap::new(),
+            modal_actions: std::collections::HashMap::new(),
             close_hooked: false,
             booted: false,
             health_task: None,
@@ -1435,10 +1435,10 @@ impl Workbench {
                     }
                     cx.notify();
                 }
-                action => {
-                    let command = super::conn_modal::ConnectIntent { action, ..intent }.command();
+                _ => {
+                    let command = intent.command().map(str::to_owned);
                     if let Some(command) = command {
-                        self.perform(command, cx);
+                        self.perform(&command, cx);
                     }
                 }
             }
