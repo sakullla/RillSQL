@@ -1,16 +1,17 @@
 //! 外壳的画法：顶栏、活动栏、资源管理器、标签条、状态栏、页面与浮层。
 //! 状态与命令都在 `WorkbenchModel`；这里只把它画出来，并把点击交回 `perform`。
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::ButtonVariants as _;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{Editor, EditorState};
+use gpui_kit::component::input::{Editor, EditorState, InputState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, TitleBar};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, ClickEvent, Context, DragMoveEvent, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window, div, px,
+    AnyElement, App, ClickEvent, Context, DragMoveEvent, Entity, FocusHandle, Focusable as _, FontWeight, InteractiveElement as _,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
+    TestSupportExt as _, Window, div, px,
 };
 
 use crate::app::views::connections::{engines, LinkStatus};
@@ -22,6 +23,7 @@ use crate::connections::model::{CaMode, Engine, EnvTag, SshAuthKind, TlsMode};
 use crate::i18n;
 use crate::ui::kit::{self, FieldSpec, Palette, Tip as _, Radius, TypeScale};
 
+use super::conn_modal::ModalStop;
 use super::model::{ConnFilterMenu, DraftField, WorkItemKind, WorkTool};
 use super::view::Workbench;
 
@@ -69,10 +71,23 @@ impl Workbench {
 
     /// 绑定一个真实文本框到模型字段。
     pub(super) fn input_for(&mut self, field: DraftField, placeholder: &str, masked: bool, window: &mut Window, cx: &mut Context<Self>) -> Input {
+        self.field_input(field, placeholder, masked, window, cx).0
+    }
+
+    /// 同 `input_for`，另外把输入框实体交出来：打开模态和 Tab 换位时要用它的焦点句柄。
+    pub(super) fn field_input(
+        &mut self,
+        field: DraftField,
+        placeholder: &str,
+        masked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Input, Entity<InputState>) {
         let value = self.model.field_value(field);
         let state = self.fields.bind(field, &value, FieldSpec { placeholder, masked }, window, cx, field_changed);
         let label = if placeholder.is_empty() { format!("{field:?}") } else { placeholder.to_owned() };
-        kit::text_input(SharedString::from(format!("field-{field:?}")), &state, label)
+        let input = kit::text_input(SharedString::from(format!("field-{field:?}")), &state, label);
+        (input, state)
     }
 
     // ------------------------------------------------------------ 根
@@ -90,6 +105,15 @@ impl Workbench {
         }
         if std::mem::take(&mut self.restore_pending) {
             self.restore_focus(window, cx);
+        }
+        // 模态关闭后把真实焦点还给触发它的控件；触发控件已不在时退回来源区域。
+        if self.model.conn_modal.restore_origin {
+            self.model.conn_modal.restore_origin = false;
+            match self.model.conn_modal.last_control.take() {
+                Some(super::conn_modal::ModalControl::LauncherNew) => window.focus(&self.conn_launcher_focus, cx),
+                Some(super::conn_modal::ModalControl::SidebarNew) => window.focus(&self.conn_sidebar_focus, cx),
+                None => self.restore_focus(window, cx),
+            }
         }
         let p = Palette::of(cx);
         let entity = cx.entity();
@@ -182,8 +206,15 @@ impl Workbench {
         if palette_open || help_open {
             root = root.child(self.palette_layer(window, cx));
         }
+        if self.model.conn_filter_menu.is_some() {
+            root = root.child(self.conn_filter_layer(cx));
+        }
         if self.model.menu.is_some() {
             root = root.child(self.context_layer(cx));
+        }
+        // 连接模态盖在最上层：backdrop 吞掉下面控件的点击，Esc 与 Tab 也归它。
+        if self.model.conn_modal.open {
+            root = root.child(self.connection_modal_layer(window, cx));
         }
         if self.model.close_prompt.is_some() {
             root = root.child(self.close_layer(cx));
@@ -211,6 +242,34 @@ impl Workbench {
         let key = event.keystroke.key.as_str();
         // 浮层关闭后键盘要回到打开它的地方，而不是留在已经消失的弹层上。
         let overlay_was_open = self.model.menu.is_some() || self.model.shell.palette_open;
+        // 连接模态打开时，Esc 关闭、Tab 在模态里循环、回车等于当前页脚动作。
+        if self.model.conn_modal.open && self.model.menu.is_none() && !self.model.shell.palette_open && self.model.danger.is_none() {
+            if key == "escape" {
+                self.perform("conn-cancel", cx);
+                cx.notify();
+                return;
+            }
+            if key == "tab" {
+                // 焦点陷阱：只在模态自己的停靠点序列里循环，绝不逃到下面的页面。
+                self.modal_step(!event.keystroke.modifiers.shift, window, cx);
+                return;
+            }
+            // 焦点停在页脚动作上时回车等于按下它；停在字段上时回车留给输入框。
+            if key == "enter" && self.modal_enter(cx) {
+                cx.notify();
+                return;
+            }
+            if super::view::nav_key(key).is_some() {
+                // 模态打开时方向键/回车不再驱动下面的对象树与页面。
+                return;
+            }
+        }
+        if key == "escape" && self.model.conn_filter_menu.is_some() && self.model.menu.is_none() {
+            self.model.conn_filter_menu = None;
+            self.restore_focus(window, cx);
+            cx.notify();
+            return;
+        }
         // 确认层与定义查看器：Esc 就是取消/关闭，不发送任何语句。
         if key == "escape" && self.model.menu.is_none() && self.model.close_prompt.is_none() {
             if self.model.danger.is_some() {
@@ -316,6 +375,44 @@ impl Workbench {
         if was_open && self.model.menu.is_none() && !self.model.shell.palette_open {
             self.restore_focus(window, cx);
         }
+    }
+
+    /// 模态里按 Tab：焦点在字段与页脚动作之间循环，不逃到下面的页面。
+    fn modal_step(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(stop) = self.model.step_modal_focus(forward) else { return };
+        self.focus_modal_stop(stop, window, cx);
+        cx.notify();
+    }
+
+    /// 把一个模态停靠点变成真实焦点：字段用输入框自己的句柄，动作用自己的句柄。
+    pub(super) fn focus_modal_stop(&mut self, stop: ModalStop, window: &mut Window, cx: &mut Context<Self>) {
+        match stop {
+            ModalStop::Field(field) => {
+                let (placeholder, masked) = self.field_hint(field);
+                let (_, state) = self.field_input(field, &placeholder, masked, window, cx);
+                let handle = state.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
+            }
+            ModalStop::Cancel => window.focus(&self.modal_close_focus, cx),
+            ModalStop::Test => window.focus(&self.modal_test_focus, cx),
+            ModalStop::Save => window.focus(&self.modal_save_focus, cx),
+            ModalStop::SaveConnect => window.focus(&self.modal_save_connect_focus, cx),
+        }
+    }
+
+    /// 焦点停在页脚动作上时回车就是按下它；停在字段上时回车留给输入框。
+    fn modal_enter(&mut self, cx: &mut Context<Self>) -> bool {
+        let stops = super::conn_modal::ConnectionModal::stops(&self.model.connections);
+        let Some(stop) = stops.get(self.model.conn_modal.focus).copied() else { return false };
+        let command = match stop {
+            ModalStop::Cancel => "conn-cancel",
+            ModalStop::Test => "conn-test",
+            ModalStop::Save => "conn-save",
+            ModalStop::SaveConnect => "conn-save-connect",
+            ModalStop::Field(_) => return false,
+        };
+        self.perform(command, cx);
+        true
     }
 
     fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -476,11 +573,32 @@ impl Workbench {
         let mut reveal_at: Option<usize> = None;
         if rows.is_empty() {
             children += 1;
-            list = list.child(
-                kit::empty_state(IconName::Database, self.t("ui.explorer.empty"), self.t("ui.explorer.emptyHint"), &p)
-                    .child(kit::primary_button("explorer-new", Some(IconName::Plus), self.t("common.newConnection"), act("new-connection", cx)))
-                    .child(kit::tool_button("explorer-sqlite", Some(IconName::FolderOpen), self.t("common.openSqlite"), act("open-sqlite", cx))),
-            );
+            list = list.child(kit::empty_state_with_action(
+                IconName::Database,
+                self.t("ui.explorer.empty"),
+                self.t("ui.explorer.emptyHint"),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(self.launcher_action(
+                        "explorer-new",
+                        IconName::Plus,
+                        self.t("common.newConnection"),
+                        Some(&self.conn_sidebar_focus.clone()),
+                        "conn-new-sidebar",
+                        true,
+                        &p,
+                        cx,
+                    ))
+                    .child(kit::tool_button(
+                        "explorer-sqlite",
+                        Some(IconName::FolderOpen),
+                        self.t("common.openSqlite"),
+                        act("open-sqlite", cx),
+                    )),
+                &p,
+            ));
         }
         // 读取失败只留一条带原因的提示和重试入口，不在每个连接下重复。
         let catalog_error = if self.model.nav_error.is_empty() { &self.model.catalog_error } else { &self.model.nav_error };
@@ -699,7 +817,16 @@ impl Workbench {
                     .child(kit::icon(chevron, 13., p.text_faint))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         cx.stop_propagation();
-                        this.model.toggle_nav_connection(&chevron_id);
+                        // 展开一条还没连上的连接先按需连接，连上后自动展开：不再只有点整行才建连。
+                        if this.model.connections.row_status(&chevron_id) == LinkStatus::Connected {
+                            this.model.toggle_nav_connection(&chevron_id);
+                        } else {
+                            this.model.queue_connect(super::conn_modal::ConnectIntent::new(
+                                chevron_id.clone(),
+                                super::conn_modal::ConnectAction::Expand,
+                                None,
+                            ));
+                        }
                         cx.notify();
                     })),
             )
@@ -795,13 +922,14 @@ impl Workbench {
             }
             LinkStatus::Connecting => {}
             LinkStatus::Disconnected | LinkStatus::Failed => {
-                if self.model.connections.rows.iter().any(|row| row.saved.id == id && matches!(row.saved.engine, Engine::Redis | Engine::Mongodb)) {
-                    self.pending_browser = Some(id.to_owned());
-                }
-                // 连接成功后 refresh_tree_on_connect 展开这一行。
+                // 按需连接：连上后展开这一行（Redis/MongoDB 由续接动作打开浏览器），失败保留重试。
                 self.model.expand_nav_connection(id);
-                self.model.connections.status.insert(id.to_owned(), LinkStatus::Connecting);
-                self.perform("conn-connect", cx);
+                self.model.queue_connect(super::conn_modal::ConnectIntent::new(
+                    id.to_owned(),
+                    super::conn_modal::ConnectAction::Expand,
+                    None,
+                ));
+                cx.notify();
             }
         }
     }
@@ -983,7 +1111,7 @@ impl Workbench {
         let tool_view = table_view || redis_view || mongo_view || matches!(page, AppPage::Structure | AppPage::Compare | AppPage::Diagram);
         let welcome = self.model.show_welcome() && !tool_view;
         let body: AnyElement = if welcome {
-            self.welcome_page(cx)
+            self.welcome_page(window, cx)
         } else if page == AppPage::Structure && tool == WorkTool::Admin {
             self.admin.clone().into_any_element()
         } else if page == AppPage::Structure {
@@ -1242,53 +1370,26 @@ impl Workbench {
 
     // ------------------------------------------------------------ 欢迎页
 
-    fn welcome_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn welcome_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let m = self.metrics();
-        let actions = div()
-            .flex()
-            .flex_wrap()
-            .gap(px(12.))
-            .child(action_card("welcome-connections", IconName::Plug, self.t("common.newConnection"), self.t("ui.welcome.connectionHint"), &p, act("new-connection", cx)))
-            .child(action_card("welcome-sqlite", IconName::FolderOpen, self.t("common.openSqlite"), self.t("ui.welcome.sqliteHint"), &p, act("open-sqlite", cx)))
-            .child(action_card("welcome-query", IconName::SquareTerminal, self.t("shell.command.newQuery"), self.t("ui.welcome.queryHint"), &p, act("new-query", cx)));
-
-        let mut connections = div().flex().flex_col().gap(px(2.));
-        let rows: Vec<_> = self.model.connections.rows.iter().take(6).cloned().collect();
-        for row in &rows {
-            let id = row.saved.id.clone();
-            let detail = connection_detail(row);
-            connections = connections.child(
-                list_row(SharedString::from(format!("welcome-conn-{id}")), &p, m.row_pad_y)
-                    .child(kit::engine_badge(row.saved.engine.as_str(), 22.))
+        // 欢迎区与连接页是同一个启动台：同一份最近/全部连接、同一组入口、同一套行操作。
+        let recent_runs: Vec<_> = self.model.welcome.recent(&self.model.history.runs).to_vec();
+        let mut history_rows = div().flex().flex_col().gap(px(2.));
+        for entry in recent_runs.iter() {
+            let id = entry.id.clone();
+            history_rows = history_rows.child(
+                list_row(SharedString::from(format!("welcome-run-{id}")), &p, m.row_pad_y)
+                    .child(kit::icon(IconName::Clock, 14., p.text_faint))
                     .child(
                         div()
                             .flex_1()
                             .min_w(px(0.))
-                            .flex()
-                            .flex_col()
-                            .child(div().truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(row.saved.name.clone())))
-                            .child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(detail))),
+                            .truncate()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(px(TypeScale::SM))
+                            .child(SharedString::from(one_line(&entry.sql))),
                     )
-                    .children(self.env_pill(&row.saved.env, &p))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.model.shell.sidebar_open = true;
-                        this.click_connection(&id, false, cx);
-                    })),
-            );
-        }
-        if rows.is_empty() {
-            connections = connections.child(div().py(px(8.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t("ui.explorer.emptyHint")));
-        }
-
-        let mut recent = div().flex().flex_col().gap(px(2.));
-        let runs: Vec<_> = self.model.welcome.recent(&self.model.history.runs).to_vec();
-        for entry in runs.iter().take(6) {
-            let id = entry.id.clone();
-            recent = recent.child(
-                list_row(SharedString::from(format!("welcome-run-{id}")), &p, m.row_pad_y)
-                    .child(kit::icon(IconName::Clock, 14., p.text_faint))
-                    .child(div().flex_1().min_w(px(0.)).truncate().font_family(cx.theme().mono_font_family.clone()).text_size(px(TypeScale::SM)).child(SharedString::from(one_line(&entry.sql))))
                     .child(
                         div()
                             .id(SharedString::from(format!("welcome-run-client-{id}")))
@@ -1307,252 +1408,452 @@ impl Workbench {
                     })),
             );
         }
-        let saved: Vec<_> = self.model.welcome.saved(&self.model.history.saved).to_vec();
-        for item in saved.iter().take(4) {
-            let saved = item.clone();
-            recent = recent.child(
-                list_row(SharedString::from(format!("welcome-saved-{}", item.id)), &p, m.row_pad_y)
-                    .child(kit::icon(IconName::Bookmark, 14., p.accent))
-                    .child(div().flex_1().min_w(px(0.)).truncate().child(SharedString::from(item.name.clone())))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        let known = this.model.known_ids();
-                        let plan = this.model.welcome.open_saved(&saved, &known);
-                        this.model.history.section = HistorySection::Saved;
-                        this.model.history.selected_saved = Some(saved.id.clone());
-                        this.model.apply_load(plan);
-                        cx.notify();
-                    })),
+        if recent_runs.is_empty() {
+            history_rows = history_rows.child(
+                div()
+                    .py(px(8.))
+                    .text_size(px(TypeScale::SM))
+                    .text_color(p.text_faint)
+                    .child(self.t("ui.welcome.noRecent")),
             );
         }
-        if runs.is_empty() && saved.is_empty() {
-            recent = recent.child(div().py(px(8.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t("ui.welcome.noRecent")));
-        }
 
-        let two_col = self.model.viewport_width > 980;
         div()
             .id("welcome-page")
             .role(gpui_kit::Role::Group)
             .aria_label(self.t("shell.welcome.title"))
+            .test_support()
             .size_full()
-            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
             .child(
                 div()
-                    .mx_auto()
-                    .max_w(px(880.))
-                    .px(px(m.page_pad + 4.))
-                    .py(px(m.page_pad_y + 20.))
+                    .flex_none()
+                    .px(px(m.page_pad))
+                    .pt(px(m.page_pad_y))
+                    .pb(px(4.))
                     .flex()
-                    .flex_col()
-                    .gap(px(m.page_pad))
+                    .items_center()
+                    .gap(px(12.))
+                    .child(brand_mark(36., &p))
+                    // 欢迎区主标题不超过 16px：它标识产品，不做宣传口号（S8.6）。
+                    .child(kit::title("RillSQL", TypeScale::LG, &p))
+                    .child(div().flex_1())
                     .child(
                         div()
+                            .id("welcome-history")
                             .flex()
                             .items_center()
-                            .gap(px(14.))
-                            .child(brand_mark(44., &p))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.))
-                                    .child(kit::title("RillSQL", TypeScale::LG, &p)),
-                            ),
-                    )
-                    .child(div().flex().flex_col().gap(px(10.)).child(kit::eyebrow(self.t("ui.welcome.start"), &p)).child(actions))
-                    .child(
-                        div()
-                            .flex()
-                            .when(two_col, |this| this.flex_row())
-                            .when(!two_col, |this| this.flex_col())
-                            .gap(px(20.))
-                            .child(
-                                kit::card(&p)
-                                    .flex_1()
-                                    .flex_basis(px(0.))
-                                    .min_w(px(0.))
-                                    .p(px(m.page_pad / 2.))
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(8.))
-                                    .child(section_head(self.t("ui.welcome.connections"), Some(("welcome-manage", self.t("ui.welcome.manage"), "connections")), &p, cx))
-                                    .child(connections),
-                            )
-                            .child(
-                                kit::card(&p)
-                                    .flex_1()
-                                    .flex_basis(px(0.))
-                                    .min_w(px(0.))
-                                    .p(px(m.page_pad / 2.))
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(8.))
-                                    .child(section_head(self.t("shell.welcome.resumeTitle"), Some(("welcome-history", self.t("ui.welcome.allHistory"), "history")), &p, cx))
-                                    .child(recent),
-                            ),
-                    )
-                    .child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(self.t("shell.welcome.factEngines"))),
+                            .gap(px(6.))
+                            .text_size(px(TypeScale::XS))
+                            .text_color(p.text_muted)
+                            .child(kit::icon(IconName::Clock, 13., p.text_faint))
+                            .child(self.t("ui.welcome.allHistory"))
+                            .on_click(act("history", cx)),
+                    ),
+            )
+            .child(self.launcher_header(window, cx))
+            .child(self.launcher_body(cx))
+            .child(
+                kit::card(&p)
+                    .flex_none()
+                    .mx(px(m.page_pad))
+                    .mb(px(10.))
+                    .p(px(8.))
+                    .max_h(px(168.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(section_label(self.t("shell.welcome.recent"), &p))
+                    .child(div().id("welcome-recent-runs").flex_1().min_h(px(0.)).overflow_y_scroll().child(history_rows)),
             )
             .into_any_element()
     }
 
-    // ------------------------------------------------------------ 连接管理
 
+    // ------------------------------------------------------------ 启动台
+
+    /// 连接页与欢迎区共用的启动台：最近连接、全部连接、紧凑行与全部入口。
+    /// 新建/编辑不再在页面里开第二块编辑区，而是打开同一个全局模态。
     fn connections_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let m = self.metrics();
-        let filter = self.input_for(DraftField::Filter, &self.model.text("ui.conn.search"), false, window, cx);
-        let narrow = self.model.viewport_width <= 900;
-        let rows: Vec<_> = self.model.connections.filtered().into_iter().cloned().collect();
-        let mut list = div().id("conn-list").flex().flex_col().gap(px(2.)).flex_1().min_h(px(0.)).overflow_y_scroll().px(px(8.)).pb(px(8.));
-        for row in &rows {
-            let id = row.saved.id.clone();
-            let selected = self.model.connections.selected.as_deref() == Some(id.as_str());
-            let status = self.model.connections.status.get(&id).copied().unwrap_or(LinkStatus::Disconnected);
-            let dot = match status {
-                LinkStatus::Connected => p.ok,
-                LinkStatus::Connecting => p.warn,
-                LinkStatus::Failed => p.danger,
-                LinkStatus::Disconnected => p.line_strong,
-            };
-            let select = format!("connection:{id}");
-            let menu = select.clone();
-            let label = format!("{} {}", row.saved.name, row.saved.engine.as_str());
-            list = list.child(
-                kit::row_states(div().id(SharedString::from(format!("conn-row-{id}"))), &p)
-                    .test_support()
-                    .role(gpui_kit::Role::ListItem)
-                    .aria_label(SharedString::from(label))
-                    .aria_selected(selected)
-                    .px(px(8.))
-                    .py(px(m.row_pad_y))
-                    .flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .rounded(px(Radius::CONTROL))
-                    .when(selected, |this| this.bg(p.active))
-                    .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
-                    .child(kit::engine_badge(row.saved.engine.as_str(), 26.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .flex()
-                            .flex_col()
-                            .gap(px(1.))
-                            .child(div().truncate().font_weight(FontWeight::MEDIUM).child(SharedString::from(row.saved.name.clone())))
-                            .child(div().truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(connection_detail(row)))),
-                    )
-                    .child(div().flex().flex_col().items_end().gap(px(4.)).children(self.env_pill(&row.saved.env, &p)).child(kit::status_dot(dot)))
-                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                        this.menu_at = event.position;
-                        let _ = this.model.dispatch(&menu);
-                        this.perform("menu-connection", cx);
-                    }))
-                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        this.perform(&select, cx);
-                        this.model.connections.edit_selected();
-                        if event.click_count() >= 2 {
-                            this.perform("conn-connect", cx);
-                        }
-                        cx.notify();
-                    })),
-            );
-        }
-        if rows.is_empty() {
-            // 空列表给下一步，而不是只留一句“没有连接”。
-            list = list.child(
-                div()
-                    .p(px(16.))
-                    .flex()
-                    .flex_col()
-                    .items_start()
-                    .gap(px(10.))
-                    .child(div().text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t("ui.explorer.empty")))
-                    .child(kit::tool_button("conn-empty-new", Some(IconName::Plus), self.t("common.newConnection"), act("new-connection", cx))),
-            );
-        }
-
-        let new_button = Button::new("conn-new")
-            .primary()
-            .small()
-            .icon(IconName::Plus)
-            .label(self.t("ui.conn.new"))
-            .accessibility_label(self.t("common.newConnection"))
-            .on_click(act("new-connection", cx));
-
-        let left = div()
-            .flex_none()
-            .w(px(if narrow { 260. } else { 320. }))
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(p.chrome)
-            .border_r_1()
-            .border_color(p.line)
-            .child(
-                div()
-                    .px(px(14.))
-                    .pt(px(14.))
-                    .pb(px(10.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.))
-                    .child(div().flex().items_center().justify_between().child(kit::title(self.t("connections.page.title"), TypeScale::LG, &p)).child(new_button))
-                    .child(filter.prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true))
-                    .child(self.connection_filters(&p, cx)),
-            )
-            .child(list)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.))
-                    .px(px(10.))
-                    .py(px(8.))
-                    .border_t_1()
-                    .border_color(p.line)
-                    .child(kit::tool_button("conn-import", Some(IconName::Download), self.t("ui.conn.import"), act("conn-import", cx)))
-                    .child(kit::tool_button("conn-export", Some(IconName::Upload), self.t("ui.conn.export"), act("conn-export", cx))),
-            );
-
-        let right: AnyElement = if self.model.connections.editor.is_some() {
-            self.connection_form(window, cx)
-        } else {
-            div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    kit::empty_state(IconName::Plug, self.t("ui.conn.emptyTitle"), self.t("connections.page.note"), &p)
-                        .child(kit::primary_button("conn-empty-new", Some(IconName::Plus), self.t("common.newConnection"), act("new-connection", cx)))
-                        .child(kit::tool_button("conn-empty-sqlite", Some(IconName::FolderOpen), self.t("common.openSqlite"), act("open-sqlite", cx))),
-                )
-                .into_any_element()
-        };
-
         div()
             .id("connections-page")
             .role(gpui_kit::Role::Group)
             .aria_label(self.t("connections.page.title"))
+            .test_support()
             .size_full()
             .flex()
-            .child(left)
-            .child(div().flex_1().min_w(px(0.)).h_full().child(right))
+            .flex_col()
+            .overflow_hidden()
+            .child(self.launcher_header(window, cx))
+            .child(self.launcher_body(cx))
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(m.page_pad))
+                    .py(px(8.))
+                    .border_t_1()
+                    .border_color(p.line)
+                    .text_size(px(TypeScale::XS))
+                    .text_color(p.text_faint)
+                    .child(self.t("connections.page.note")),
+            )
             .into_any_element()
     }
 
-    fn connection_form(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// 启动台头部：标题、主入口、搜索与筛选。三个入口都只有一条命令。
+    fn launcher_header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = Palette::of(cx);
         let m = self.metrics();
-        let narrow = self.model.viewport_width <= 900;
+        let filter = self.input_for(DraftField::Filter, &self.model.text("ui.conn.search"), false, window, cx);
+        let shown = self.model.connections.filtered().len();
+        let total = self.model.connections.rows.len();
+        div()
+            .flex_none()
+            .px(px(m.page_pad))
+            .pt(px(m.page_pad_y))
+            .pb(px(10.))
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .border_b_1()
+            .border_color(p.line)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(kit::title(self.t("connections.page.title"), TypeScale::LG, &p))
+                    .child(kit::muted(SharedString::from(format!("{shown} / {total}")), &p))
+                    .child(div().flex_1())
+                    .child(self.launcher_action(
+                        "conn-new",
+                        IconName::Plus,
+                        self.t("common.newConnection"),
+                        Some(&self.conn_launcher_focus.clone()),
+                        "conn-new-launcher",
+                        true,
+                        &p,
+                        cx,
+                    ))
+                    .child(self.launcher_action(
+                        "launcher-sqlite",
+                        IconName::FolderOpen,
+                        self.t("common.openSqlite"),
+                        None,
+                        "open-sqlite",
+                        false,
+                        &p,
+                        cx,
+                    ))
+                    .child(self.launcher_action(
+                        "launcher-import",
+                        IconName::Download,
+                        self.t("ui.conn.import"),
+                        None,
+                        "conn-import",
+                        false,
+                        &p,
+                        cx,
+                    ))
+                    .child(self.launcher_action(
+                        "launcher-export",
+                        IconName::Upload,
+                        self.t("ui.conn.export"),
+                        None,
+                        "conn-export",
+                        false,
+                        &p,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().flex_1().min_w(px(160.)).child(filter.prefix(kit::icon(IconName::Search, 13., p.text_faint)).cleanable(true)))
+                    .child(self.connection_filters(&p, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// 启动台主体：最近连接（按持久化用量排序）与全部连接。滚动只发生在这一块。
+    fn launcher_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let m = self.metrics();
+        let all: Vec<crate::connections::ConnectionRecord> = self.model.connections.launcher_all().into_iter().cloned().collect();
+        let recent: Vec<crate::connections::ConnectionRecord> =
+            self.model.connections.launcher_recent(6).into_iter().cloned().collect();
+        let filtering = !self.model.connections.filter_text.trim().is_empty()
+            || self.model.connections.filter_engine.is_some()
+            || !self.model.connections.filter_env.is_empty();
+        let mut body = div()
+            .id("launcher-scroll")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .px(px(m.page_pad))
+            .py(px(10.))
+            .gap(px(2.));
+        if self.model.connections.rows.is_empty() {
+            // 一条连接都没有：空态给下一步，而不是只留一句"没有连接"。
+            body = body.child(
+                kit::empty_state_with_action(
+                    IconName::Database,
+                    self.t("ui.explorer.empty"),
+                    self.t("ui.explorer.emptyHint"),
+                    kit::primary_button(
+                        "launcher-empty-new",
+                        Some(IconName::Plus),
+                        self.t("common.newConnection"),
+                        act("conn-new-launcher", cx),
+                    ),
+                    &p,
+                ),
+            );
+            return body.into_any_element();
+        }
+        // 连接失败的待办动作：原因与重试入口留在启动台上，不把用户想打开的对象丢掉。
+        if let Some(retry) = self.model.connect_retry.clone() {
+            // 用连接名而不是 id：失败说明要能指回用户那一行。
+            let name = self
+                .model
+                .connections
+                .rows
+                .iter()
+                .find(|row| row.saved.id == retry.connection_id)
+                .map(|row| row.saved.name.clone())
+                .unwrap_or_else(|| retry.connection_id.clone());
+            body = body.child(
+                div()
+                    .id("launcher-connect-retry")
+                    .test_support()
+                    .mb(px(6.))
+                    .px(px(8.))
+                    .py(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .rounded(px(Radius::PANEL))
+                    .bg(p.danger_soft)
+                    .child(kit::icon(IconName::CircleAlert, 13., p.danger))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(TypeScale::SM))
+                            .text_color(p.danger)
+                            .child(SharedString::from(format!("{} · {name}", self.model.text("connections.status.error")))),
+                    )
+                    .child(kit::tool_button(
+                        "launcher-connect-retry-action",
+                        Some(IconName::RefreshCw),
+                        self.t("common.retry"),
+                        act("conn-retry", cx),
+                    )),
+            );
+        }
+        if !recent.is_empty() && !filtering {
+            body = body.child(section_label(self.t("connections.launcher.recent"), &p));
+            for row in &recent {
+                body = body.child(self.launcher_row(row, &p, cx, "recent"));
+            }
+        }
+        body = body.child(section_label(self.t("connections.launcher.all"), &p));
+        if all.is_empty() {
+            // 有连接但筛选无命中：与"一条都没有"分开呈现，并给出清除筛选。
+            return body
+                .child(kit::no_match_state_with_action(
+                    IconName::Search,
+                    self.t("ui.explorer.noMatch"),
+                    self.t("ui.conn.search"),
+                    kit::secondary_button("launcher-clear-filter", Some(IconName::X), self.t("connections.filter.clear"), act("conn-filter-clear", cx)),
+                    &p,
+                ))
+                .into_any_element();
+        }
+        for row in &all {
+            body = body.child(self.launcher_row(row, &p, cx, "all"));
+        }
+        body.into_any_element()
+    }
+
+    /// 启动台的一行：徽标 / 名称 + 环境 / 地址与库 / 状态文字 / 操作组。
+    /// 双击走按需连接续接进入工作区；编辑与测试同样作用于这一行。
+    fn launcher_row(
+        &mut self,
+        row: &crate::connections::ConnectionRecord,
+        p: &Palette,
+        cx: &mut Context<Self>,
+        prefix: &'static str,
+    ) -> AnyElement {
+        let m = self.metrics();
+        let id = row.saved.id.clone();
+        let status = self.model.connections.row_status(&id);
+        let (dot, state_key) = status_parts(status, p);
+        let detail = connection_detail(row);
+        let selected = self.model.connections.selected.as_deref() == Some(id.as_str());
+        let label = format!("{} {} {}", row.saved.name, row.saved.engine.as_str(), self.model.text(state_key));
+        let aware = format!("{detail} · {}", self.model.text(state_key));
+        // 全部连接沿用 conn-row-<id> 这个稳定锚点；最近一栏单独加前缀，避免同一行注册两次。
+        let row_id = if prefix == "all" { format!("conn-row-{id}") } else { format!("launcher-{prefix}-{id}") };
+        let select_id = id.clone();
+        let menu_id = id.clone();
+        let edit_id = id.clone();
+        let test_id = id.clone();
+        kit::row_states(div().id(SharedString::from(row_id)), p)
+            .test_support()
+            .role(gpui_kit::Role::ListItem)
+            .aria_label(SharedString::from(label))
+            .aria_selected(selected)
+            .aria_description(SharedString::from(aware.clone()))
+            .tooltip_text(SharedString::from(aware))
+            .h(px(m.row_h))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .rounded(px(Radius::CONTROL))
+            .when(selected, |this| this.bg(p.active))
+            .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
+            .child(kit::engine_badge(row.saved.engine.as_str(), 18.))
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .flex_1()
+                    .truncate()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(SharedString::from(row.saved.name.clone())),
+            )
+            .children(self.env_pill(&row.saved.env, p))
+            .child(
+                div()
+                    .flex_none()
+                    .max_w(px(240.))
+                    .truncate()
+                    .text_size(px(TypeScale::XS))
+                    .text_color(p.text_faint)
+                    .child(SharedString::from(detail)),
+            )
+            // 状态不只靠圆点：文字与 tooltip 说同一句话。
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .child(kit::status_dot(dot))
+                    .child(div().text_size(px(TypeScale::XS)).text_color(p.text_muted).child(self.model.text(state_key))),
+            )
+            .child(
+                kit::icon_button(
+                    SharedString::from(format!("launcher-edit-{id}")),
+                    IconName::Pencil,
+                    self.model.text("connections.page.menuEdit"),
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.model.connections.selected = Some(edit_id.clone());
+                        this.perform("conn-edit", cx);
+                    }),
+                )
+                .xsmall(),
+            )
+            .child(
+                kit::icon_button(
+                    SharedString::from(format!("launcher-test-{id}")),
+                    IconName::Zap,
+                    self.model.text("connections.editor.test.button"),
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.model.connections.selected = Some(test_id.clone());
+                        this.perform("conn-test", cx);
+                    }),
+                )
+                .xsmall(),
+            )
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.menu_at = event.position;
+                this.model.connections.selected = Some(menu_id.clone());
+                this.perform("menu-connection", cx);
+            }))
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                this.model.connections.selected = Some(select_id.clone());
+                if event.click_count() >= 2 {
+                    let command = format!("connection:{}", select_id);
+                    this.perform(&command, cx);
+                } else {
+                    cx.notify();
+                }
+            }))
+            .into_any_element()
+    }
+
+    /// 启动台的入口按钮。带焦点句柄的那些在模态关闭后接回焦点。
+    #[allow(clippy::too_many_arguments)]
+    fn launcher_action(
+        &mut self,
+        id: &'static str,
+        icon: IconName,
+        label: SharedString,
+        handle: Option<&FocusHandle>,
+        command: &'static str,
+        primary: bool,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let height = self.metrics().control_h;
+        let mut element = kit::interactive_states(div().id(id), p, false)
+            .test_support()
+            .role(gpui_kit::Role::Button)
+            .aria_label(label.clone())
+            .h(px(height))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .rounded(px(Radius::CONTROL))
+            .border_1()
+            .text_size(px(TypeScale::SM))
+            .when(primary, |this| this.bg(p.accent).text_color(p.accent_text).border_color(p.accent))
+            .when(!primary, |this| this.border_color(p.line).text_color(p.text).hover(|style| style.border_color(p.line_strong)))
+            .child(kit::icon(icon, 14., if primary { p.accent_text } else { p.text_muted }))
+            .child(label)
+            .on_click(act(command, cx));
+        if let Some(handle) = handle {
+            element = element.track_focus(handle);
+        }
+        element.into_any_element()
+    }
+
+    // ------------------------------------------------------------ 连接模态
+
+    /// 新建/编辑连接的全局模态：头部、仅主体滚动、固定页脚。
+    /// 打开它的入口有启动台、命令搜索、对象树空态与连接行操作，屏幕上也只有一个编辑面。
+    fn connection_modal_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if !self.model.conn_modal.open {
+            return div().into_any_element();
+        }
+        let p = Palette::of(cx);
+        let m = self.metrics();
         let Some(draft) = self.model.connections.editor.clone() else {
             return div().into_any_element();
         };
         let existing = draft.id.is_some();
         let engine = draft.engine;
         let file_based = engine == Engine::Sqlite;
-        let t = |this: &Self, key: &str| this.model.text(key);
+        let narrow = self.model.viewport_width <= 900;
+        let view_w = self.model.viewport_width.max(240) as f32;
+        let view_h = self.model.viewport_height.max(240) as f32;
+        let panel_w = if narrow { (view_w - 40.).max(240.) } else { 640_f32.min(view_w - 80.) };
+        let panel_h = (view_h - 80.).max(200.);
+        let pad = if narrow { 16. } else { m.page_pad };
+        let focus_first = std::mem::take(&mut self.model.conn_modal.focus_first_pending);
 
         // 引擎选择：一排徽标。
         let mut engine_row = div().flex().flex_wrap().gap(px(6.));
@@ -1561,10 +1862,11 @@ impl Workbench {
             let name = candidate.as_str();
             engine_row = engine_row.child(
                 kit::interactive_states(div().id(SharedString::from(format!("conn-engine-{name}"))), &p, false)
+                    .test_support()
                     .role(gpui_kit::Role::Button)
                     .aria_label(SharedString::from(kit::engine_label(name)))
                     .aria_selected(selected)
-                    .h(px(m.control_h + 6.))
+                    .h(px(m.control_h))
                     .px(px(8.))
                     .flex()
                     .items_center()
@@ -1614,8 +1916,9 @@ impl Workbench {
             ));
         }
 
-        let name = self.input_for(DraftField::Name, &t(self, "ui.conn.namePlaceholder"), false, window, cx);
-        let url = self.input_for(DraftField::Url, &t(self, "ui.conn.urlHint"), false, window, cx);
+        // 首个字段就是 URL：打开模态后焦点直接落在它上面。
+        let (url_hint, url_masked) = self.field_hint(DraftField::Url);
+        let (url_input, first_field) = self.field_input(DraftField::Url, &url_hint, url_masked, window, cx);
         let mut general = div().flex().flex_col().gap(px(14.));
         general = general.child(
             div()
@@ -1623,55 +1926,70 @@ impl Workbench {
                 .flex_wrap()
                 .gap(px(8.))
                 .items_end()
-                .child(div().flex_1().min_w(px(180.)).child(kit::form_row(self.t("ui.conn.url"), url, &p)))
+                .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.url"), "url", url_input, &p)))
                 .child(kit::secondary_button("conn-apply-url", Some(IconName::WandSparkles), self.t("ui.conn.parse"), act("conn-apply-url", cx))),
         );
+        let (name_hint, name_masked) = self.field_hint(DraftField::Name);
+        let (name, _) = self.field_input(DraftField::Name, &name_hint, name_masked, window, cx);
         general = general.child(
             div()
                 .flex()
                 .flex_wrap()
                 .gap(px(12.))
-                .child(div().flex_1().min_w(px(180.)).child(kit::form_row(self.t("ui.conn.name"), name, &p)))
+                .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.name"), "name", name, &p)))
                 .child(kit::form_row(self.t("ui.conn.env"), kit::segmented_sized(env_items, &p, m.control_h), &p)),
         );
         if file_based {
-            let file = self.input_for(DraftField::File, &t(self, "connections.validate.chooseFile"), false, window, cx);
+            let (file_hint, file_masked) = self.field_hint(DraftField::File);
+            let (file, _) = self.field_input(DraftField::File, &file_hint, file_masked, window, cx);
             general = general.child(
                 div()
                     .flex()
                     .flex_wrap()
                     .gap(px(8.))
                     .items_end()
-                    .child(div().flex_1().min_w(px(180.)).child(kit::form_row(self.t("ui.conn.file"), file, &p)))
-                    .child(kit::secondary_button("conn-browse", Some(IconName::FolderOpen), self.t("ui.conn.browse"), cx.listener(|this, _: &ClickEvent, _, cx| this.prompt_draft_file(cx)))),
+                    .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.file"), "file_path", file, &p)))
+                    .child(kit::secondary_button(
+                        "conn-browse",
+                        Some(IconName::FolderOpen),
+                        self.t("ui.conn.browse"),
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.prompt_draft_file(cx)),
+                    )),
             );
         } else {
-            let host = self.input_for(DraftField::Host, "localhost", false, window, cx);
-            let port = self.input_for(DraftField::Port, "", false, window, cx);
-            let database = self.input_for(DraftField::Database, &t(self, if engine == Engine::Redis { "ui.conn.redisDb" } else { "ui.conn.optional" }), false, window, cx);
-            let user = self.input_for(DraftField::Username, "", false, window, cx);
-            let password = self.input_for(DraftField::Password, &t(self, if existing { "ui.conn.passwordKeep" } else { "" }), true, window, cx);
+            let (host_hint, host_masked) = self.field_hint(DraftField::Host);
+            let (host, _) = self.field_input(DraftField::Host, &host_hint, host_masked, window, cx);
+            let (port_hint, port_masked) = self.field_hint(DraftField::Port);
+            let (port, _) = self.field_input(DraftField::Port, &port_hint, port_masked, window, cx);
+            let (db_hint, db_masked) = self.field_hint(DraftField::Database);
+            let (database, _) = self.field_input(DraftField::Database, &db_hint, db_masked, window, cx);
+            let (user_hint, user_masked) = self.field_hint(DraftField::Username);
+            let (user, _) = self.field_input(DraftField::Username, &user_hint, user_masked, window, cx);
+            let (password_hint, password_masked) = self.field_hint(DraftField::Password);
+            let (password, _) = self.field_input(DraftField::Password, &password_hint, password_masked, window, cx);
             general = general
                 .child(
                     div()
                         .flex()
                         .flex_wrap()
                         .gap(px(12.))
-                        .child(div().flex_1().min_w(px(180.)).child(kit::form_row(self.t("ui.conn.host"), host, &p)))
-                        .child(div().w(px(110.)).child(kit::form_row(self.t("ui.conn.port"), port, &p))),
+                        .child(div().flex_1().min_w(px(180.)).child(self.field_row(self.t("ui.conn.host"), "host", host, &p)))
+                        .child(div().w(px(110.)).child(self.field_row(self.t("ui.conn.port"), "port", port, &p))),
                 )
                 .child(
                     div()
                         .flex()
                         .flex_wrap()
                         .gap(px(12.))
-                        .child(div().flex_1().min_w(px(160.)).child(kit::form_row(self.t("ui.conn.user"), user, &p)))
-                        .child(div().flex_1().min_w(px(160.)).child(kit::form_row(self.t("ui.conn.password"), password.mask_toggle(), &p))),
+                        // 用户名与密码是一组凭据：服务端拒绝凭据时错误落在这一组上（"credentials"）。
+                        .child(div().flex_1().min_w(px(160.)).child(self.field_row(self.t("ui.conn.user"), "username", user, &p)))
+                        .child(div().flex_1().min_w(px(160.)).child(self.field_row(self.t("ui.conn.password"), "password", password.mask_toggle(), &p))),
                 )
-                .child(kit::form_row(self.t("ui.conn.database"), database, &p));
+                .child(self.field_row(self.t("ui.conn.database"), "database", database, &p));
             if engine == Engine::Mongodb {
-                let replica = self.input_for(DraftField::Replica, "rs0", false, window, cx);
-                general = general.child(kit::form_row(self.t("connections.editor.replicaSet"), replica, &p));
+                let (replica_hint, replica_masked) = self.field_hint(DraftField::Replica);
+                let (replica, _) = self.field_input(DraftField::Replica, &replica_hint, replica_masked, window, cx);
+                general = general.child(self.field_row(self.t("connections.editor.replicaSet"), "replica", replica, &p));
             }
         }
 
@@ -1692,7 +2010,7 @@ impl Workbench {
                     })),
                 ));
             }
-            security = security.child(kit::form_row(self.t("connections.editor.tls.title"), kit::segmented_sized(tls_items, &p, self.metrics().control_h), &p));
+            security = security.child(kit::form_row(self.t("connections.editor.tls.title"), kit::segmented_sized(tls_items, &p, m.control_h), &p));
             if draft.tls_mode == TlsMode::Verify {
                 let mut ca_items = Vec::new();
                 for (mode, key) in [(CaMode::System, "connections.editor.tls.caSystem"), (CaMode::File, "connections.editor.tls.caFile")] {
@@ -1708,33 +2026,47 @@ impl Workbench {
                         })),
                     ));
                 }
-                security = security.child(kit::form_row(self.t("connections.editor.tls.caLabel"), kit::segmented_sized(ca_items, &p, self.metrics().control_h), &p));
+                security = security.child(kit::form_row(self.t("connections.editor.tls.caLabel"), kit::segmented_sized(ca_items, &p, m.control_h), &p));
                 if draft.ca_mode == CaMode::File {
-                    let ca = self.input_for(DraftField::CaFile, "ca.pem", false, window, cx);
-                    security = security.child(self.path_field("conn-browse-ca", "connections.editor.tls.caFile", "connections.editor.tls.browseCa", ca, DraftField::CaFile, &p, cx));
+                    let (ca_hint, ca_masked) = self.field_hint(DraftField::CaFile);
+                    let (ca, _) = self.field_input(DraftField::CaFile, &ca_hint, ca_masked, window, cx);
+                    security = security.child(self.path_row(
+                        "connections.editor.tls.caFile",
+                        "ca_file",
+                        DraftField::CaFile,
+                        ca,
+                        "conn-browse-ca",
+                        "connections.editor.tls.browseCa",
+                        &p,
+                        cx,
+                    ));
                 }
-                let cert = self.input_for(DraftField::ClientCert, "", false, window, cx);
-                let key = self.input_for(DraftField::ClientKey, "", false, window, cx);
+                let (cert_hint, cert_masked) = self.field_hint(DraftField::ClientCert);
+                let (cert, _) = self.field_input(DraftField::ClientCert, &cert_hint, cert_masked, window, cx);
+                let (key_hint, key_masked) = self.field_hint(DraftField::ClientKey);
+                let (key, _) = self.field_input(DraftField::ClientKey, &key_hint, key_masked, window, cx);
                 security = security.child(
                     div()
                         .flex()
                         .flex_wrap()
                         .gap(px(12.))
-                        .child(div().flex_1().min_w(px(160.)).child(self.path_field(
-                            "conn-browse-cert",
+                        .child(div().flex_1().min_w(px(160.)).child(self.path_row(
                             "connections.editor.tls.clientCert",
-                            "connections.editor.tls.browseCert",
-                            cert,
+                            "client_cert",
                             DraftField::ClientCert,
+                            cert,
+                            "conn-browse-cert",
+                            "connections.editor.tls.browseCert",
                             &p,
                             cx,
                         )))
-                        .child(div().flex_1().min_w(px(160.)).child(self.path_field(
-                            "conn-browse-key",
+                        .child(div().flex_1().min_w(px(160.)).child(self.path_row(
                             "connections.editor.tls.clientKey",
-                            "connections.editor.tls.browseKey",
-                            key,
+                            "client_key",
                             DraftField::ClientKey,
+                            key,
+                            "conn-browse-key",
+                            "connections.editor.tls.browseKey",
                             &p,
                             cx,
                         ))),
@@ -1743,6 +2075,7 @@ impl Workbench {
             let ssh_on = draft.ssh_on;
             security = security.child(
                 kit::interactive_states(div().id("conn-ssh-toggle"), &p, false)
+                    .test_support()
                     .role(gpui_kit::Role::Switch)
                     .aria_label(self.t("connections.editor.ssh.title"))
                     .aria_selected(ssh_on)
@@ -1755,9 +2088,12 @@ impl Workbench {
                     .on_click(act("conn-ssh-toggle", cx)),
             );
             if ssh_on {
-                let ssh_host = self.input_for(DraftField::SshHost, "bastion.example.com", false, window, cx);
-                let ssh_port = self.input_for(DraftField::SshPort, "22", false, window, cx);
-                let ssh_user = self.input_for(DraftField::SshUser, "", false, window, cx);
+                let (ssh_host_hint, ssh_host_masked) = self.field_hint(DraftField::SshHost);
+                let (ssh_host, _) = self.field_input(DraftField::SshHost, &ssh_host_hint, ssh_host_masked, window, cx);
+                let (ssh_port_hint, ssh_port_masked) = self.field_hint(DraftField::SshPort);
+                let (ssh_port, _) = self.field_input(DraftField::SshPort, &ssh_port_hint, ssh_port_masked, window, cx);
+                let (ssh_user_hint, ssh_user_masked) = self.field_hint(DraftField::SshUser);
+                let (ssh_user, _) = self.field_input(DraftField::SshUser, &ssh_user_hint, ssh_user_masked, window, cx);
                 let mut auth_items = Vec::new();
                 for (kind, key) in [(SshAuthKind::Key, "connections.editor.ssh.authKey"), (SshAuthKind::Password, "connections.editor.ssh.authPassword")] {
                     auth_items.push((
@@ -1782,8 +2118,8 @@ impl Workbench {
                             .flex()
                             .flex_wrap()
                             .gap(px(12.))
-                            .child(div().flex_1().min_w(px(160.)).child(kit::form_row(self.t("ui.conn.sshHost"), ssh_host, &p)))
-                            .child(div().w(px(90.)).child(kit::form_row(self.t("connections.editor.ssh.port"), ssh_port, &p))),
+                            .child(div().flex_1().min_w(px(160.)).child(self.field_row(self.t("ui.conn.sshHost"), "ssh_host", ssh_host, &p)))
+                            .child(div().w(px(90.)).child(self.field_row(self.t("connections.editor.ssh.port"), "ssh_port", ssh_port, &p))),
                     )
                     .child(
                         div()
@@ -1791,47 +2127,52 @@ impl Workbench {
                             .flex_wrap()
                             .gap(px(12.))
                             .items_end()
-                            .child(div().flex_1().min_w(px(160.)).child(kit::form_row(self.t("ui.conn.sshUser"), ssh_user, &p)))
+                            .child(div().flex_1().min_w(px(160.)).child(self.field_row(self.t("ui.conn.sshUser"), "ssh_user", ssh_user, &p)))
                             .child(kit::form_row(self.t("connections.editor.ssh.authLabel"), kit::segmented_sized(auth_items, &p, m.control_h), &p)),
                     );
                 if draft.ssh_auth == SshAuthKind::Key {
-                    let ssh_key = self.input_for(DraftField::SshKey, "~/.ssh/id_ed25519", false, window, cx);
-                    let passphrase = self.input_for(DraftField::Passphrase, &t(self, "ui.conn.optional"), true, window, cx);
+                    let (ssh_key_hint, ssh_key_masked) = self.field_hint(DraftField::SshKey);
+                    let (ssh_key, _) = self.field_input(DraftField::SshKey, &ssh_key_hint, ssh_key_masked, window, cx);
+                    let (passphrase_hint, passphrase_masked) = self.field_hint(DraftField::Passphrase);
+                    let (passphrase, _) = self.field_input(DraftField::Passphrase, &passphrase_hint, passphrase_masked, window, cx);
                     ssh = ssh.child(
                         div()
                             .flex()
                             .flex_wrap()
                             .gap(px(12.))
-                            .child(div().flex_1().min_w(px(160.)).child(self.path_field(
-                                "conn-browse-ssh",
+                            .child(div().flex_1().min_w(px(160.)).child(self.path_row(
                                 "connections.editor.ssh.keyFile",
-                                "connections.editor.ssh.browseKey",
-                                ssh_key,
+                                "ssh_key",
                                 DraftField::SshKey,
+                                ssh_key,
+                                "conn-browse-ssh",
+                                "connections.editor.ssh.browseKey",
                                 &p,
                                 cx,
                             )))
-                            .child(div().flex_1().min_w(px(160.)).child(kit::form_row(self.t("ui.conn.passphrase"), passphrase, &p))),
+                            .child(div().flex_1().min_w(px(160.)).child(self.field_row(self.t("ui.conn.passphrase"), "passphrase", passphrase.mask_toggle(), &p))),
                     );
                 } else {
-                    let ssh_password = self.input_for(DraftField::SshPassword, "", true, window, cx);
-                    ssh = ssh.child(kit::form_row(self.t("ui.conn.sshPassword"), ssh_password.mask_toggle(), &p));
+                    let (ssh_password_hint, ssh_password_masked) = self.field_hint(DraftField::SshPassword);
+                    let (ssh_password, _) = self.field_input(DraftField::SshPassword, &ssh_password_hint, ssh_password_masked, window, cx);
+                    ssh = ssh.child(self.field_row(self.t("ui.conn.sshPassword"), "ssh_password", ssh_password.mask_toggle(), &p));
                 }
                 security = security.child(ssh);
             }
         }
 
-        // 校验与连接结果。
+        // 测试/打开结果与无处归属的问题：集中在主体末尾，每条只说一次。
         let mut notes = div().flex().flex_col().gap(px(6.));
-        for issue in &self.model.connections.issues {
+        for issue in self.model.connections.issues.iter().filter(|issue| !field_issue_placed(&issue.field)) {
             notes = notes.child(banner(IconName::CircleAlert, self.t(issue.key), p.danger, p.danger_soft));
         }
         if let Some(key) = self.model.connections.message_key {
             let ok = key == "connections.status.connected" || key == "connections.editor.test.ok";
-            let text = if self.model.connections.message_detail.is_empty() {
+            let detail = self.model.connections.message_detail.clone();
+            let text = if detail.is_empty() {
                 self.model.text(key)
             } else {
-                format!("{} · {}", self.model.text(key), self.model.connections.message_detail)
+                format!("{} · {}", self.model.text(key), detail)
             };
             notes = notes.child(if ok {
                 banner(IconName::CircleCheck, SharedString::from(text), p.ok, p.ok_soft)
@@ -1840,88 +2181,255 @@ impl Workbench {
             });
         }
 
-        let status = draft.id.as_ref().and_then(|id| self.model.connections.status.get(id)).copied().unwrap_or(LinkStatus::Disconnected);
-        // 窄窗口里操作换行而不是被右侧裁掉；主要动作仍在末尾、优先可达。
-        let mut footer = div().flex().flex_wrap().items_center().gap(px(8.)).pt(px(4.));
-        if existing {
-            footer = footer
-                .child(kit::tool_button("conn-delete", Some(IconName::Trash), self.t("connections.page.menuDelete"), act("conn-delete", cx)))
-                .child(kit::tool_button("conn-duplicate", Some(IconName::Copy), self.t("common.copy"), act("conn-duplicate", cx)));
-        }
-        footer = footer
-            .child(div().flex_1())
-            .child(kit::secondary_button("conn-test", Some(IconName::Zap), self.t("connections.editor.test.button"), act("conn-test", cx)))
-            .child(kit::secondary_button("conn-save", Some(IconName::Save), self.t("common.save"), act("conn-save", cx)));
-        if existing && status == LinkStatus::Connected {
-            footer = footer
-                .child(kit::secondary_button("conn-disconnect", Some(IconName::Unplug), self.t("connections.page.menuDisconnect"), act("conn-disconnect", cx)))
-                .child(kit::primary_button("conn-open-query", Some(IconName::SquareTerminal), self.t("shell.command.newQuery"), cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.perform("activity-workspace", cx);
-                    this.perform("new-query", cx);
-                })));
-        } else if existing {
-            footer = footer.child(kit::primary_button("conn-connect", Some(IconName::Plug), self.t("connections.page.connect"), act("conn-connect", cx)));
-        }
+        let title = if existing {
+            SharedString::from(draft.name.clone())
+        } else {
+            self.t("connections.editor.newTitle")
+        };
+        let subtitle = SharedString::from(kit::engine_label(engine.as_str()));
+        let running = self.model.connections.test_running();
 
-        let heading = if existing { SharedString::from(draft.name.clone()) } else { self.t("connections.editor.newTitle") };
-        let form_pad = if narrow { 16. } else { m.page_pad };
-        // 表单可滚动，但测试 / 保存 / 连接固定在底部，高度不足时也不用先滚到底。
-        div()
-            .id("conn-form")
-            .test_support()
-            .size_full()
+        let header = div()
+            .flex_none()
             .flex()
-            .flex_col()
+            .items_center()
+            .gap(px(10.))
+            .px(px(pad))
+            .py(px(12.))
+            .border_b_1()
+            .border_color(p.line)
+            .child(kit::engine_badge(engine.as_str(), 28.))
             .child(
                 div()
-                    .id("conn-form-scroll")
-                    .flex_1()
-                    .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .child(
-                        div()
-                            .max_w(px(720.))
-                            .min_w(px(0.))
-                            .mx_auto()
-                            .px(px(form_pad))
-                            .py(px(m.page_pad_y))
-                            .flex()
-                            .flex_col()
-                            .gap(px(18.))
+                    .flex()
+                    .flex_col()
+                    .min_w(px(0.))
+                    .child(div().id("conn-form-title").truncate().tooltip_text(title.clone()).text_size(px(TypeScale::LG)).font_weight(FontWeight::SEMIBOLD).child(title))
+                    .child(kit::muted(subtitle, &p)),
+            )
+            .child(div().flex_1())
+            .child(kit::icon_button("conn-modal-close", IconName::X, self.model.text("common.close"), act("conn-cancel", cx)));
+
+        let body = div()
+            .id("conn-modal-scroll")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .px(px(pad))
+                    .py(px(12.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(18.))
+                    .child(form_section(self.t("ui.conn.pickEngine"), engine_row, &p))
+                    .child(form_section(self.t("ui.conn.general"), general, &p))
+                    .when(!file_based, |this| this.child(form_section(self.t("ui.conn.security"), security, &p)))
+                    .child(notes),
+            );
+
+        // 固定页脚：保存、保存并连接、测试和取消始终在同一位置，不必先滚到底。
+        let footer = div()
+            .flex_none()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(8.))
+            .px(px(pad))
+            .py(px(10.))
+            .border_t_1()
+            .border_color(p.line)
+            .bg(p.surface)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .min_w(px(0.))
+                    .when(running, |this| {
+                        this.child(Spinner::new().xsmall().color(p.accent))
                             .child(
                                 div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(12.))
-                                    .child(kit::engine_badge(engine.as_str(), 36.))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .min_w(px(0.))
-                                            .child(div().id("conn-form-title").truncate().tooltip_text(heading.clone()).text_size(px(TypeScale::LG)).font_weight(FontWeight::SEMIBOLD).text_color(p.text).child(heading))
-                                            .child(kit::muted(SharedString::from(kit::engine_label(engine.as_str())), &p)),
-                                    ),
+                                    .id("conn-test-running")
+                                    .text_size(px(TypeScale::XS))
+                                    .text_color(p.text_muted)
+                                    .child(self.model.text("connections.editor.test.running")),
                             )
-                            .child(form_section(self.t("ui.conn.pickEngine"), engine_row, &p))
-                            .child(form_section(self.t("ui.conn.general"), general, &p))
-                            .when(!file_based, |this| this.child(form_section(self.t("ui.conn.security"), security, &p)))
-                            .child(notes),
-                    ),
+                    }),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .px(px(form_pad))
-                    .py(px(8.))
-                    .border_t_1()
-                    .border_color(p.line)
-                    .bg(p.surface)
-                    .child(div().max_w(px(720.)).min_w(px(0.)).mx_auto().child(footer)),
-            )
+            .child(div().flex_1())
+            .child(self.modal_action("conn-cancel", self.t("common.cancel"), false, &self.modal_close_focus.clone(), "conn-cancel", &p, cx))
+            .child(self.modal_action("conn-test", self.t("connections.editor.test.button"), false, &self.modal_test_focus.clone(), "conn-test", &p, cx))
+            .child(self.modal_action("conn-save", self.t("common.save"), false, &self.modal_save_focus.clone(), "conn-save", &p, cx))
+            .child(self.modal_action(
+                "conn-save-connect",
+                self.t("connections.editor.saveConnect"),
+                true,
+                &self.modal_save_connect_focus.clone(),
+                "conn-save-connect",
+                &p,
+                cx,
+            ));
+
+        let panel = div()
+            // 保留 conn-form 这个 test-support 锚点：它就是"屏幕上那个连接表单"。
+            .id("conn-form")
+            .test_support()
+            .role(gpui_kit::Role::Group)
+            .aria_label(self.t("connections.editor.newTitle"))
+            .occlude()
+            .w(px(panel_w))
+            .max_h(px(panel_h))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(p.surface)
+            .border_1()
+            .border_color(p.line)
+            .rounded(px(Radius::PANEL))
+            .shadow_lg()
+            .child(header)
+            .child(body)
+            .child(footer);
+
+        if focus_first {
+            // 打开就把键盘交给首个字段：不用先点一下才能输入。
+            let handle = first_field.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+
+        backdrop("conn-modal-backdrop", 0.32, cx)
+            .flex()
+            .items_center()
+            .justify_center()
+            .px(px(20.))
+            .py(px(20.))
+            .child(panel)
             .into_any_element()
     }
 
+    /// 页脚动作：既是鼠标目标也是 Tab 停靠点（模态内的焦点不逃到下面页面）。
+    #[allow(clippy::too_many_arguments)]
+    fn modal_action(
+        &mut self,
+        id: &'static str,
+        label: SharedString,
+        primary: bool,
+        handle: &FocusHandle,
+        command: &'static str,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let height = self.metrics().control_h;
+        kit::interactive_states(div().id(id), p, false)
+            .test_support()
+            .role(gpui_kit::Role::Button)
+            .aria_label(label.clone())
+            .track_focus(handle)
+            .h(px(height))
+            .px(px(12.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .rounded(px(Radius::CONTROL))
+            .border_1()
+            .text_size(px(TypeScale::SM))
+            .when(primary, |this| this.bg(p.accent).text_color(p.accent_text).border_color(p.accent))
+            .when(!primary, |this| this.border_color(p.line).text_color(p.text).hover(|style| style.border_color(p.line_strong)))
+            .child(label)
+            .on_click(act(command, cx))
+            .into_any_element()
+    }
+
+    /// 字段旁的错误：同一字段的结论就显示在它旁边，不再汇总到底部。
+    fn field_row(&self, label: SharedString, field: &str, control: impl IntoElement, p: &Palette) -> AnyElement {
+        let issue = self
+            .model
+            .connections
+            .issues
+            .iter()
+            .find(|issue| issue.field == field || (field == "username" && issue.field == "credentials"));
+        let mut row = div().flex().flex_col().gap(px(4.)).min_w(px(0.)).child(kit::form_row(label, control, p));
+        if let Some(issue) = issue {
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("conn-issue-{field}")))
+                    .test_support()
+                    .aria_label(SharedString::from(field_issue_text(issue, &|key| self.model.text(key))))
+                    .text_size(px(TypeScale::XS))
+                    .text_color(p.danger)
+                    .child(SharedString::from(field_issue_text(issue, &|key| self.model.text(key)))),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// 带"浏览"按钮的路径字段：错误同样落在字段旁。
+    #[allow(clippy::too_many_arguments)]
+    fn path_row(
+        &mut self,
+        label_key: &'static str,
+        field: &str,
+        draft_field: DraftField,
+        input: impl IntoElement,
+        browse_id: &'static str,
+        browse_key: &'static str,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut row = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(self.path_field(browse_id, label_key, browse_key, input, draft_field, p, cx));
+        if let Some(issue) = self.model.connections.issues.iter().find(|issue| issue.field == field) {
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("conn-issue-{field}")))
+                    .test_support()
+                    .text_size(px(TypeScale::XS))
+                    .text_color(p.danger)
+                    .child(SharedString::from(field_issue_text(issue, &|key| self.model.text(key)))),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// 每个草稿字段的占位符与掩码：渲染与 Tab 聚焦读同一份，避免两处写不同文案。
+    fn field_hint(&self, field: DraftField) -> (String, bool) {
+        let existing = self.model.connections.editor.as_ref().is_some_and(|draft| draft.id.is_some());
+        let redis = self.model.connections.editor.as_ref().is_some_and(|draft| draft.engine == Engine::Redis);
+        let key = match field {
+            DraftField::Url => "ui.conn.urlHint",
+            DraftField::Name => "ui.conn.namePlaceholder",
+            DraftField::File => "connections.validate.chooseFile",
+            DraftField::Database if redis => "ui.conn.redisDb",
+            DraftField::Database => "ui.conn.optional",
+            DraftField::CaFile => "",
+            DraftField::ClientCert | DraftField::ClientKey => "",
+            DraftField::Passphrase => "ui.conn.optional",
+            _ => "",
+        };
+        let placeholder = match field {
+            DraftField::Host => "localhost".to_owned(),
+            DraftField::Port => String::new(),
+            DraftField::Replica => "rs0".to_owned(),
+            DraftField::SshHost => "bastion.example.com".to_owned(),
+            DraftField::SshPort => "22".to_owned(),
+            DraftField::SshKey => "~/.ssh/id_ed25519".to_owned(),
+            DraftField::CaFile => "ca.pem".to_owned(),
+            DraftField::Password if existing => self.model.text("ui.conn.passwordKeep"),
+            _ if key.is_empty() => String::new(),
+            _ => self.model.text(key),
+        };
+        let masked = matches!(
+            field,
+            DraftField::Password | DraftField::SshPassword | DraftField::Passphrase
+        );
+        (placeholder, masked)
+    }
+
+    /// 引擎/环境筛选的两个按钮。点击记下位置，浮层在根层弹出并自动避开视口边缘。
     fn connection_filters(&mut self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let engine = self
             .model
@@ -1934,36 +2442,65 @@ impl Workbench {
         } else {
             self.env_text(&self.model.connections.filter_env)
         };
-        let active = self.model.connections.filter_engine.is_some() || !self.model.connections.filter_env.is_empty() || !self.model.connections.filter_text.trim().is_empty();
+        let active = self.model.connections.filter_engine.is_some()
+            || !self.model.connections.filter_env.is_empty()
+            || !self.model.connections.filter_text.trim().is_empty();
         let engine_open = self.model.conn_filter_menu == Some(ConnFilterMenu::Engine);
         let env_open = self.model.conn_filter_menu == Some(ConnFilterMenu::Env);
-        let engine_options = self.engine_filter_options();
-        let env_options = self.env_filter_options();
         div()
             .flex()
             .flex_wrap()
+            .items_center()
             .gap(px(6.))
-            .child(self.filter_dropdown(
-                "conn-filter-engine",
-                IconName::Database,
-                SharedString::from(engine),
-                "conn-filter-engine",
-                engine_open,
-                engine_options,
-                p,
-                cx,
-            ))
-            .child(self.filter_dropdown(
-                "conn-filter-env",
-                IconName::Funnel,
-                env,
-                "conn-filter-env",
-                env_open,
-                env_options,
-                p,
-                cx,
-            ))
-            .when(active, |this| this.child(kit::tool_button("conn-filter-clear", Some(IconName::X), self.t("connections.filter.clear"), act("conn-filter-clear", cx))))
+            .child(self.filter_button("conn-filter-engine", IconName::Database, SharedString::from(engine), engine_open, "conn-filter-engine", p, cx))
+            .child(self.filter_button("conn-filter-env", IconName::Funnel, env, env_open, "conn-filter-env", p, cx))
+            .when(active, |this| {
+                this.child(kit::tool_button(
+                    "conn-filter-clear",
+                    Some(IconName::X),
+                    self.t("connections.filter.clear"),
+                    act("conn-filter-clear", cx),
+                ))
+            })
+            .into_any_element()
+    }
+
+    /// 一个筛选按钮：展开时用强调底，点击同时记住锚点位置供浮层定位。
+    #[allow(clippy::too_many_arguments)]
+    fn filter_button(
+        &mut self,
+        id: &'static str,
+        icon: IconName,
+        label: SharedString,
+        open: bool,
+        command: &'static str,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let height = self.metrics().control_h;
+        kit::interactive_states(div().id(id), p, false)
+            .test_support()
+            .role(gpui_kit::Role::Button)
+            .aria_label(label.clone())
+            .aria_expanded(open)
+            .h(px(height))
+            .px(px(9.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .rounded(px(Radius::CONTROL))
+            .border_1()
+            .text_size(px(TypeScale::SM))
+            .when(open, |this| this.border_color(p.accent).bg(p.accent_soft).text_color(p.accent_text))
+            .when(!open, |this| this.border_color(p.line).text_color(p.text).hover(|style| style.border_color(p.line_strong)))
+            .child(kit::icon(IconName::ChevronDown, 12., p.text_faint))
+            .child(kit::icon(icon, 13., p.text_muted))
+            .child(label)
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                // 浮层以按钮的左下角为锚点：位置来自这次真实点击，不靠猜元素坐标。
+                this.conn_filter_at = event.position();
+                this.perform(command, cx);
+            }))
             .into_any_element()
     }
 
@@ -2011,24 +2548,41 @@ impl Workbench {
         options
     }
 
-    fn filter_dropdown(
-        &mut self,
-        button_id: &'static str,
-        icon: IconName,
-        label: SharedString,
-        command: &'static str,
-        open: bool,
-        options: Vec<(String, SharedString, bool, String)>,
-        p: &Palette,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// 筛选浮层：Esc、外点关闭，近右/下边缘自动翻转，过高时自身滚动，绝不压住别的内容。
+    fn conn_filter_layer(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::of(cx);
+        let m = self.metrics();
+        let Some(which) = self.model.conn_filter_menu else {
+            return div().into_any_element();
+        };
+        let options = match which {
+            ConnFilterMenu::Engine => self.engine_filter_options(),
+            ConnFilterMenu::Env => self.env_filter_options(),
+        };
+        let width = 220.;
+        let row_h = m.menu_row_h;
+        let height = options.len() as f32 * (row_h + 2.) + 8.;
+        let view_w = self.model.viewport_width.max(240) as f32;
+        let view_h = self.model.viewport_height.max(240) as f32;
+        let anchor_x = f32::from(self.conn_filter_at.x);
+        let anchor_y = f32::from(self.conn_filter_at.y);
+        let (x, y) = super::menus::place_popup(anchor_x, anchor_y, width, height, view_w, view_h);
+        let label = match which {
+            ConnFilterMenu::Engine => self.t("connections.filter.engine"),
+            ConnFilterMenu::Env => self.t("connections.filter.env"),
+        };
         let mut menu = div()
-            .id(SharedString::from(format!("{button_id}-menu")))
-            .absolute()
-            .top(px(self.metrics().control_h + 4.))
-            .left_0()
+            .id("conn-filter-menu")
+            .test_support()
+            .role(gpui_kit::Role::Menu)
+            .aria_label(label)
             .occlude()
-            .min_w(px(180.))
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(width))
+            .max_h(px(view_h - 24.))
+            .overflow_y_scroll()
             .p(px(4.))
             .flex()
             .flex_col()
@@ -2036,15 +2590,17 @@ impl Workbench {
             .border_1()
             .border_color(p.line)
             .rounded(px(Radius::PANEL))
-            .shadow_lg();
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
         for (id, text, selected, action) in options {
             menu = menu.child(
-                kit::interactive_states(div().id(SharedString::from(id)), p, false)
+                kit::interactive_states(div().id(SharedString::from(id)), &p, false)
                     .test_support()
                     .role(gpui_kit::Role::MenuItem)
                     .aria_label(text.clone())
                     .aria_selected(selected)
-                    .h(px(self.metrics().menu_row_h))
+                    .h(px(row_h))
                     .px(px(8.))
                     .flex()
                     .items_center()
@@ -2055,11 +2611,7 @@ impl Workbench {
                     .on_click(act(action, cx)),
             );
         }
-        div()
-            .relative()
-            .child(kit::tool_button(button_id, Some(icon), label, act(command, cx)))
-            .when(open, |this| this.child(menu))
-            .into_any_element()
+        backdrop("conn-filter-backdrop", 0., cx).child(menu).into_any_element()
     }
 
     fn path_field(
@@ -3815,45 +4367,63 @@ fn list_row(id: SharedString, p: &Palette, pad_y: f32) -> gpui_kit::Stateful<gpu
         .hover(|style| style.bg(p.hover))
 }
 
-fn section_head(title: SharedString, link: Option<(&'static str, SharedString, &'static str)>, p: &Palette, cx: &mut Context<Workbench>) -> AnyElement {
+/// 启动台里的小节标题：11px、粗体、弱色，与 S4.1 的分区标签一致。
+fn section_label(text: SharedString, p: &Palette) -> AnyElement {
     div()
-        .flex()
-        .items_center()
-        .justify_between()
-        .child(kit::title(title, TypeScale::MD, p))
-        .when_some(link, |this, (id, label, command)| {
-            this.child(Button::new(id).link().small().label(label.clone()).accessibility_label(label).on_click(act(command, cx)))
-        })
+        .pt(px(8.))
+        .pb(px(2.))
+        .text_size(px(TypeScale::XS))
+        .font_weight(FontWeight::BOLD)
+        .text_color(p.text_faint)
+        .child(text)
         .into_any_element()
 }
 
-fn action_card(id: &'static str, icon: IconName, title: SharedString, detail: SharedString, p: &Palette, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> AnyElement {
-    kit::interactive_states(div().id(id), p, false)
-        .role(gpui_kit::Role::Button)
-        .aria_label(title.clone())
-        .flex_1()
-        .min_w(px(200.))
-        .p(px(14.))
-        .flex()
-        .items_start()
-        .gap(px(12.))
-        .rounded(px(Radius::PANEL))
-        .border_1()
-        .border_color(p.line)
-        .bg(p.surface)
-        .hover(|style| style.border_color(p.accent).bg(p.accent_soft))
-        .child(div().flex_none().size(px(34.)).rounded(px(Radius::PANEL)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(icon, 17., p.accent_text)))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(3.))
-                .min_w(px(0.))
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
-                .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(detail)),
-        )
-        .on_click(on_click)
-        .into_any_element()
+/// 连接状态的颜色与文案键。颜色不是唯一载体：调用处同时渲染文字。
+fn status_parts(status: LinkStatus, p: &Palette) -> (gpui_kit::Hsla, &'static str) {
+    match status {
+        LinkStatus::Connected => (p.ok, "connections.status.connected"),
+        LinkStatus::Connecting => (p.warn, "ui.conn.connecting"),
+        LinkStatus::Failed => (p.danger, "connections.status.error"),
+        LinkStatus::Disconnected => (p.line_strong, "ui.conn.notConnected"),
+    }
+}
+
+/// 这些字段的错误已经画在字段旁，不再进主体末尾的汇总。
+fn field_issue_placed(field: &str) -> bool {
+    matches!(
+        field,
+        "name"
+            | "url"
+            | "host"
+            | "port"
+            | "database"
+            | "replica"
+            | "username"
+            | "password"
+            | "credentials"
+            | "file_path"
+            | "ca_file"
+            | "client_cert"
+            | "client_key"
+            | "ssh_host"
+            | "ssh_port"
+            | "ssh_user"
+            | "ssh_key"
+            | "ssh_password"
+            | "passphrase"
+    )
+}
+
+/// 字段错误的显示文本：通用文案 + 服务端原文（有就带上）。
+fn field_issue_text(issue: &crate::app::views::connections::FieldIssue, text: &dyn Fn(&str) -> String) -> String {
+    let key = text(issue.key);
+    let detail = issue.detail.trim();
+    if detail.is_empty() {
+        key
+    } else {
+        format!("{key} · {detail}")
+    }
 }
 
 fn form_section(title: SharedString, body: impl IntoElement, p: &Palette) -> AnyElement {

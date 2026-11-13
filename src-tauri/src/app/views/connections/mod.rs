@@ -75,6 +75,12 @@ pub struct ConnectionPage {
     pub message_detail: String,
     pub confirm_delete: bool,
     pub executed_sql: bool,
+    /// 最近一次发起测试的代号；只有这一代（或更新的）结果能动"正在测试"指示。
+    pub test_generation: u64,
+    /// 正在跑的测试代号；None 表示没有在跑的测试。过期结果不能把它清掉。
+    pub test_running_generation: Option<u64>,
+    /// 持久化的最近使用顺序（Store 的 connection_usage）。启动台的"最近连接"只认它。
+    pub recent_ids: Vec<String>,
 }
 
 
@@ -303,18 +309,62 @@ impl ConnectionPage {
         rows
     }
 
+    /// 发起一次测试：记下这一代的代号，并让"正在测试"只属于它。
+    pub fn expect_test(&mut self, generation: u64) {
+        self.test_generation = self.test_generation.max(generation);
+        self.test_running_generation = Some(generation);
+        self.message_key = Some("connections.editor.test.running");
+        self.message_detail.clear();
+    }
+
+    /// 还有一次测试在跑（页脚指示点与禁用重复提交都读它）。
+    pub fn test_running(&self) -> bool {
+        self.test_running_generation.is_some()
+    }
+
+    /// 启动台“最近连接”：顺序只来自持久化用量，不认识的 id 直接跳过。
+    pub fn launcher_recent(&self, limit: usize) -> Vec<&ConnectionRecord> {
+        self.recent(&self.recent_ids, limit)
+    }
+
+    /// 启动台“全部连接”：受搜索与筛选影响，但不受最近使用影响。
+    pub fn launcher_all(&self) -> Vec<&ConnectionRecord> {
+        self.filtered()
+    }
+
+    /// 列表行的状态；不认识的行按未连接。
+    pub fn row_status(&self, id: &str) -> LinkStatus {
+        self.status.get(id).copied().unwrap_or(LinkStatus::Disconnected)
+    }
+
     /// 测试失败落到具体字段。只给一条：第一个失败/等待阶段决定用户下一步该改哪个字段。
     fn failure_issues(report: &TestReport, draft: Option<&ConnectionDraft>) -> Vec<FieldIssue> {
         let Some(draft) = draft else { return Vec::new() };
         field_issue_for_failure(report, draft).into_iter().collect()
     }
 
-    /// 记录一次测试结果。fingerprint 是发起请求时的草稿指纹：屏幕上的草稿、本次机密或
-    /// “表单是否还开着”已经变了，就丢弃这次结果，不用旧结论覆盖新编辑（R6/ADR-3）。
-    pub fn note_test(&mut self, tasks: &TaskBoard, token: TaskToken, fingerprint: u64, report: Result<TestReport, String>) -> bool {
+    /// 记录一次测试结果。fingerprint 是发起请求时的草稿指纹，generation 是发起时的代号：
+    /// 屏幕上的草稿、本次机密或“表单是否还开着”已经变了就丢弃这次结果；代号已经被更新的一次
+    /// 测试取代时，连“正在测试”也不许碰——否则新那一次的指示会被旧结果收走（P3）。
+    pub fn note_test(
+        &mut self,
+        tasks: &TaskBoard,
+        token: TaskToken,
+        generation: u64,
+        fingerprint: u64,
+        report: Result<TestReport, String>,
+    ) -> bool {
+        if generation < self.test_generation {
+            // 更新的一次测试已经发出：旧结果的任何写入（含指示）都不属于当前屏幕。
+            return false;
+        }
+        let running_is_mine = self.test_running_generation == Some(generation);
         if draft_fingerprint(&self.editor, &self.secrets) != fingerprint {
-            // 过期结果：只收起“正在测试”，不写状态、消息或字段错误。
-            if self.message_key == Some("connections.editor.test.running") {
+            // 过期结果：只收起自己那一代的“正在测试”，不写状态、消息或字段错误。
+            if running_is_mine {
+                self.test_running_generation = None;
+            }
+            if running_is_mine && self.message_key == Some("connections.editor.test.running") {
                 self.message_key = None;
                 self.message_detail.clear();
             }
@@ -322,8 +372,16 @@ impl ConnectionPage {
         }
         let report = match tasks.accept(OWNER, token, report) {
             TaskOutcome::Current { value, .. } => value,
-            TaskOutcome::Stale { .. } | TaskOutcome::Cancelled { .. } => return false,
+            TaskOutcome::Stale { .. } | TaskOutcome::Cancelled { .. } => {
+                if running_is_mine {
+                    self.test_running_generation = None;
+                }
+                return false;
+            }
         };
+        if running_is_mine {
+            self.test_running_generation = None;
+        }
         // 状态按屏幕上的草稿归属，不按列表选中行：新建草稿的测试不该标记到别的连接上。
         let row_id = self.editor.as_ref().and_then(|draft| draft.id.clone());
         match report {
@@ -499,8 +557,18 @@ pub fn transport_key(draft: &ConnectionDraft) -> &'static str {
     }
 }
 
-pub async fn list_rows(services: &AppServices) -> Result<Vec<ConnectionRecord>, String> {
-    services.list_connections().await
+/// 一次列表刷新同时带回持久化的最近使用顺序：启动台的"最近连接"不必再猜。
+#[derive(Clone, Debug, Default)]
+pub struct ConnectionSnapshot {
+    pub rows: Vec<ConnectionRecord>,
+    pub recent: Vec<String>,
+}
+
+pub async fn list_rows(services: &AppServices) -> Result<ConnectionSnapshot, String> {
+    let rows = services.list_connections().await?;
+    // 用量表读失败不该挡住连接列表：最近一栏退化为空，而不是整页报错。
+    let recent = services.connections.recent_ids(12).await.unwrap_or_default();
+    Ok(ConnectionSnapshot { rows, recent })
 }
 
 pub async fn save_draft(services: &AppServices, draft: ConnectionDraft, secrets: &Secrets) -> Result<SaveOutcome, String> {
@@ -568,8 +636,10 @@ pub fn field_issue_for_failure(report: &TestReport, draft: &ConnectionDraft) -> 
                 "host"
             }
         }
+        // 凭据被服务端拒绝时分不清是用户名还是密码：落在凭据组上，而不是一律怪用户名。
         StageKind::DatabaseAuthentication => match report.code.as_deref() {
             Some(error_codes::CONN_PASSWORD_REQUIRED) => "password",
+            Some(error_codes::CONN_AUTH_FAILED) | Some(error_codes::CONN_REDIS_AUTH_FAILED) => "credentials",
             _ => "username",
         },
     };
@@ -842,11 +912,17 @@ mod tests {
         );
         assert_eq!(field_issue_for_failure(&report, &remote).unwrap().field, "password");
 
+        // 服务端拒绝凭据时分不清用户名还是密码：落在凭据组，不一律怪用户名（P3）。
         let report = failed_report(
             Some(crate::connections::error_codes::CONN_AUTH_FAILED),
             vec![stage(StageKind::DatabaseAuthentication, StageStatus::Err, "Access denied")],
         );
-        assert_eq!(field_issue_for_failure(&report, &remote).unwrap().field, "username");
+        assert_eq!(field_issue_for_failure(&report, &remote).unwrap().field, "credentials");
+        let report = failed_report(
+            Some(crate::connections::error_codes::CONN_REDIS_AUTH_FAILED),
+            vec![stage(StageKind::DatabaseAuthentication, StageStatus::Err, "WRONGPASS")],
+        );
+        assert_eq!(field_issue_for_failure(&report, &remote).unwrap().field, "credentials");
 
         let mut with_ssh = sample_draft(Engine::Postgres);
         with_ssh.ssh_on = true;
@@ -868,6 +944,63 @@ mod tests {
             code: None,
         };
         assert!(field_issue_for_failure(&report, &remote).is_none(), "成功没有字段错误");
+    }
+
+    fn ok_report() -> TestReport {
+        TestReport {
+            status: TestStatus::Ok,
+            fail_stage: None,
+            hint: None,
+            summary: Some("连接正常".into()),
+            fingerprint: None,
+            algorithm: None,
+            stages: vec![stage(StageKind::Network, StageStatus::Ok, "已连接")],
+            code: None,
+        }
+    }
+
+    fn editing_page(engine: Engine) -> ConnectionPage {
+        let mut page = ConnectionPage::default();
+        page.start_new(engine);
+        let draft = page.editor.as_mut().unwrap();
+        draft.host = "db.example.test".into();
+        draft.username = "app".into();
+        page
+    }
+
+    /// P3：更早一代的测试结果迟到时，连“正在测试”都不许碰——新那一次还在跑。
+    #[test]
+    fn a_late_result_never_clears_the_newer_running_indicator() {
+        let tasks = TaskBoard::new();
+        let mut page = editing_page(Engine::Postgres);
+        let first = page.begin(&tasks);
+        page.expect_test(1);
+        let first_fingerprint = draft_fingerprint(&page.editor, &page.secrets);
+        let second = page.begin(&tasks);
+        page.expect_test(2);
+        assert!(page.test_running());
+        assert!(!page.note_test(&tasks, first, 1, first_fingerprint, Ok(ok_report())));
+        assert!(page.test_running(), "更新的测试还在跑，指示不能被旧结果收走");
+        assert_eq!(page.message_key, Some("connections.editor.test.running"));
+        let second_fingerprint = draft_fingerprint(&page.editor, &page.secrets);
+        assert!(page.note_test(&tasks, second, 2, second_fingerprint, Ok(ok_report())));
+        assert!(!page.test_running());
+        assert_eq!(page.message_key, Some("connections.editor.test.ok"));
+    }
+
+    /// 同一代里草稿已经改了：结果丢弃，指示收起，但不写消息或字段错误。
+    #[test]
+    fn an_edited_draft_drops_its_own_result_and_only_stops_the_indicator() {
+        let tasks = TaskBoard::new();
+        let mut page = editing_page(Engine::Postgres);
+        let token = page.begin(&tasks);
+        page.expect_test(7);
+        let fingerprint = draft_fingerprint(&page.editor, &page.secrets);
+        page.editor.as_mut().unwrap().host = "other.example.test".into();
+        assert!(!page.note_test(&tasks, token, 7, fingerprint, Err("boom".into())));
+        assert!(!page.test_running());
+        assert_eq!(page.message_key, None);
+        assert!(page.issues.is_empty());
     }
 
     /// 指纹只看内容：改字段、改机密、关表单都会得到不同的值。

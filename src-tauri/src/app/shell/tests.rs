@@ -14,7 +14,9 @@ use crate::i18n;
 use crate::query::{HistoryEntry, SaveRequest};
 use crate::state::{AppState, SessionState, ShellSettings};
 
+use super::conn_modal::ModalControl;
 use super::model::{DraftField, PendingJob, WorkItemKind, WorkTool, WorkbenchModel};
+use crate::app::views::connections::LinkStatus;
 use crate::app::Shell;
 use gpui_kit::AppContext as _;
 use gpui_kit::test::TestWindowExt;
@@ -181,12 +183,12 @@ fn density_theme_and_language_reach_the_rendered_chrome(cx: &mut gpui_kit::TestA
         .unwrap();
     }
 
-    // 连接表单在 640 宽度下也要能看到并点到测试/保存。
+    // 连接模态在 640 宽度下也要能看到并点到测试/保存/保存并连接。
     cx.update(|cx| view.update(cx, |view, cx| view.perform("new-connection", cx)));
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         let width = f32::from(window.find("workbench").bounds().size.width);
-        for id in ["conn-test", "conn-save"] {
+        for id in ["conn-test", "conn-save", "conn-save-connect", "conn-cancel"] {
             let button = window.find(id);
             assert!(button.visible(), "{id} 应可见");
             assert!(f32::from(button.bounds().origin.x + button.bounds().size.width) <= width + 0.5);
@@ -194,6 +196,9 @@ fn density_theme_and_language_reach_the_rendered_chrome(cx: &mut gpui_kit::TestA
         }
     })
     .unwrap();
+    // 模态是覆盖层：关上之后才轮到命令面板。
+    cx.update(|cx| view.update(cx, |view, cx| view.perform("conn-cancel", cx)));
+    cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
 
     cx.update(|cx| {
         view.update(cx, |view, cx| {
@@ -6569,18 +6574,19 @@ fn connections_empty_state_wraps_inside_its_panel_at_every_width(cx: &mut gpui_k
         std::fs::create_dir_all(&dir).unwrap();
         let (window, view) = open_workbench_sized(cx, services_at(&dir), false, width, 900.);
         cx.update(|cx| view.update(cx, |view, cx| view.perform("connections", cx)));
-        let (detail, list_right, window_width) = cx
+        let (detail, body_left, window_width) = cx
             .update_window(window, |_, window, cx| {
                 window.render_frame(cx);
                 let details: Vec<_> = window.find_all("empty-state-detail").into_iter().filter(|detail| detail.visible()).collect();
-                assert_eq!(details.len(), 1, "{width}: 连接页应只有右侧一个空态说明");
-                let list = window.find("conn-new").bounds();
-                (details[0].bounds(), f32::from(list.origin.x + list.size.width), f32::from(window.find("workbench").bounds().size.width))
+                assert_eq!(details.len(), 1, "{width}: 启动台应只有一个空态说明");
+                // 启动台是单栏：空态整块落在页面主体里，左缘对齐活动栏右侧。
+                let rail = window.find("activity").bounds();
+                (details[0].bounds(), f32::from(rail.origin.x + rail.size.width), f32::from(window.find("workbench").bounds().size.width))
             })
             .unwrap();
         let left = f32::from(detail.origin.x);
         let right = f32::from(detail.origin.x + detail.size.width);
-        assert!(left >= list_right, "{width}: 空态说明左缘 {left} 压到了连接列表（右缘 {list_right}）");
+        assert!(left >= body_left, "{width}: 空态说明左缘 {left} 压到活动栏（右缘 {body_left}）");
         assert!(right <= window_width + 0.5, "{width}: 空态说明右缘 {right} 越出窗口 {window_width}");
         assert!(f32::from(detail.size.width) <= 360.5, "{width}: 说明最宽 360");
         let _ = std::fs::remove_dir_all(&dir);
@@ -6733,6 +6739,8 @@ fn sidebar_copy_and_test_remain_usable_while_catalog_is_loading(cx: &mut gpui_ki
         let draft = view.read(cx).model.connections.editor.as_ref().unwrap();
         assert!(draft.id.is_none());
         assert!(draft.name.ends_with(" copy"));
+        // 模态是覆盖层：先关掉它，下面对象树的右键才有机会收到点击。
+        view.update(cx, |view, cx| view.perform("conn-cancel", cx));
         view.update(cx, |view, _| view.model.shell.page = AppPage::Workspace);
         window.render_frame(cx);
         window.right_click("side-notes", cx);
@@ -6983,3 +6991,242 @@ async fn saving_a_connection_does_not_count_as_a_successful_open() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+
+// ------------------------------------------------------------ 连接启动台与全局模态（T3）
+
+fn record_for(id: &str, name: &str, engine: Engine) -> ConnectionRecord {
+    let mut draft = sample_draft(engine);
+    draft.name = name.into();
+    ConnectionRecord {
+        saved: crate::connections::model::normalize(&draft, id.into()).unwrap(),
+        ssh_host_key: None,
+    }
+}
+
+fn seeded_model(rows: Vec<ConnectionRecord>) -> WorkbenchModel {
+    let mut model = WorkbenchModel::new(Shell::default());
+    model.connections.rows = rows;
+    model.welcome.has_connections = !model.connections.rows.is_empty();
+    model
+}
+
+/// 启动台、命令搜索、对象树空态和连接行打开的是同一个模态；关闭不保存并还焦来源。
+#[test]
+fn every_entry_opens_the_same_modal_and_cancel_leaves_no_draft() {
+    let mut model = seeded_model(vec![record_for("pg", "Atlas", Engine::Postgres)]);
+
+    // 命令搜索/菜单/快捷键：一条命令就是一份草稿、一个编辑面。
+    let _ = model.dispatch("new-connection");
+    assert!(model.conn_modal.open);
+    assert_eq!(model.conn_modal.trigger.as_deref(), Some("new-connection"));
+    assert!(model.connections.editor.as_ref().is_some_and(|draft| draft.id.is_none()));
+    let restored = model.close_connection_modal().expect("开着才会关");
+    assert_eq!(restored.0, crate::app::FocusTarget::Connections);
+    assert!(!model.conn_modal.open);
+    assert!(model.connections.editor.is_none(), "取消不保存也不留草稿");
+    assert_eq!(model.connections.rows.len(), 1, "取消不动已保存配置");
+
+    // 启动台主入口：记住触发控件，关闭后焦点回到这个按钮。
+    let _ = model.dispatch("conn-new-launcher");
+    assert_eq!(model.conn_modal.control, Some(ModalControl::LauncherNew));
+    let _ = model.dispatch("conn-cancel");
+    assert!(!model.conn_modal.open);
+    assert_eq!(model.conn_modal.last_control, Some(ModalControl::LauncherNew));
+    assert!(model.conn_modal.restore_origin, "视图下一帧把焦点还给触发按钮");
+
+    // 连接行操作：草稿来自这一行，不先保存也不改已保存配置。
+    model.connections.selected = Some("pg".into());
+    let _ = model.dispatch("conn-edit");
+    assert!(model.conn_modal.open);
+    assert_eq!(model.connections.editor.as_ref().unwrap().id.as_deref(), Some("pg"));
+
+    // 复制配置：草稿没有 id，保存时才会新建一条。
+    let _ = model.dispatch("conn-duplicate");
+    assert!(model.connections.editor.as_ref().unwrap().id.is_none());
+    assert_eq!(model.connections.rows.len(), 1);
+}
+
+/// Tab/Shift+Tab 在模态自己的停靠点里成环，不会落到下面的页面。
+#[test]
+fn modal_tab_order_wraps_inside_and_covers_fields_and_footer() {
+    let mut model = seeded_model(Vec::new());
+    let _ = model.dispatch("conn-new-launcher");
+    let stops = super::conn_modal::ConnectionModal::stops(&model.connections);
+    assert_eq!(stops.first(), Some(&super::conn_modal::ModalStop::Field(DraftField::Url)));
+    assert_eq!(stops.last(), Some(&super::conn_modal::ModalStop::SaveConnect));
+    for _ in 0..stops.len() {
+        let stop = model.step_modal_focus(true).expect("有停靠点");
+        assert!(stops.contains(&stop), "只在模态里循环");
+    }
+    assert_eq!(model.conn_modal.focus, 0, "一轮之后回到首个字段");
+    let back = model.step_modal_focus(false).expect("反向也有停靠点");
+    assert_eq!(back, stops[stops.len() - 1], "Shift+Tab 从首个字段回到页脚末项");
+}
+
+/// 普通保存：关闭模态、不建连、不写最近使用。
+#[tokio::test]
+async fn plain_save_closes_the_modal_without_connecting() {
+    let dir = std::env::temp_dir().join(format!("rillsql-t3-save-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = seeded_model(Vec::new());
+    let file = sqlite_file(&dir, "notes.sqlite").await;
+    let _ = model.dispatch("conn-engine:sqlite");
+    assert!(model.conn_modal.open, "选引擎也是打开同一个模态");
+    let draft = model.connections.editor.as_mut().unwrap();
+    draft.name = "笔记".into();
+    draft.file_path = file.display().to_string();
+
+    let _ = model.dispatch("conn-save");
+    assert!(!model.conn_modal.save_and_connect, "普通保存不连");
+    let token = model.prepare_list_token(&services.tasks);
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "connections", done);
+
+    assert!(!model.conn_modal.open, "保存成功关闭模态");
+    assert_eq!(model.pending_len(), 0, "普通保存不排队连接");
+    assert_eq!(model.notice_key, Some("common.save"));
+    assert_eq!(model.connections.rows.len(), 1);
+    assert!(services.connections.recent_ids(10).await.unwrap().is_empty(), "保存不算使用");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 保存并连接：保存成功后只排一次连接；连接失败保留动作供重试，不重复建连接。
+#[tokio::test]
+async fn save_and_connect_queues_one_open_and_keeps_the_action_for_retry() {
+    let dir = std::env::temp_dir().join(format!("rillsql-t3-save-connect-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = seeded_model(Vec::new());
+    let file = sqlite_file(&dir, "notes.sqlite").await;
+    let _ = model.dispatch("conn-engine:sqlite");
+    let draft = model.connections.editor.as_mut().unwrap();
+    draft.name = "笔记".into();
+    draft.file_path = file.display().to_string();
+
+    let _ = model.dispatch("conn-save-connect");
+    assert!(model.conn_modal.save_and_connect);
+    let token = model.prepare_list_token(&services.tasks);
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "connections", done);
+
+    assert!(!model.conn_modal.open);
+    assert_eq!(model.connections.rows.len(), 1, "保存本身只写一条配置");
+    assert_eq!(model.pending_len(), 1, "保存成功后只排一次连接");
+    assert_eq!(model.take_pending(), Some(PendingJob::OpenConnection));
+    let id = model.connections.rows[0].saved.id.clone();
+    assert_eq!(model.connections.status.get(&id), Some(&LinkStatus::Connecting));
+    assert_eq!(model.notice_key, Some("ui.conn.connecting"));
+
+    // 连接失败：动作留到重试里，重试仍指向这条已保存的连接。
+    model.connections.status.insert(id.clone(), LinkStatus::Failed);
+    model.fail_pending_intents();
+    assert!(model.connect_retry.is_some(), "失败不丢用户想做的事");
+    assert!(model.retry_pending_connect());
+    assert_eq!(model.connections.selected.as_deref(), Some(id.as_str()));
+    assert_eq!(model.pending_len(), 1);
+    assert_eq!(model.connections.rows.len(), 1, "重试不重复创建连接");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 测试失败：草稿与本次机密保留，错误落在字段旁，模态不关。
+#[tokio::test]
+async fn a_failed_test_keeps_the_draft_and_marks_the_field() {
+    let dir = std::env::temp_dir().join(format!("rillsql-t3-test-fail-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = seeded_model(Vec::new());
+    let _ = model.dispatch("conn-engine:sqlite");
+    let missing = dir.join("missing.sqlite");
+    model.connections.editor.as_mut().unwrap().file_path = missing.display().to_string();
+    model.connections.secrets.password = "typed-only-here".into();
+
+    let _ = model.dispatch("conn-test");
+    let token = model.prepare_list_token(&services.tasks);
+    let done = jobs::execute_job(&services, request_of(&mut model, token)).await;
+    apply_done(&mut model, &services, "connections", done);
+
+    assert!(model.conn_modal.open, "测试失败不关闭模态");
+    assert!(model.connections.editor.is_some(), "失败保留草稿");
+    assert_eq!(model.connections.secrets.password, "typed-only-here", "失败保留本次机密");
+    assert!(!model.conn_modal.test_running, "失败收起“正在测试”");
+    let issue = model.connections.issues.first().expect("失败关联字段");
+    assert_eq!(issue.field, "file_path");
+    assert!(!issue.detail.is_empty(), "字段旁保留原文");
+    assert!(model.connections.rows.is_empty(), "测试不写配置");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 更早一次测试的迟到结果不能收走新一次仍在跑的指示。
+#[tokio::test]
+async fn an_older_test_result_cannot_clear_the_newer_running_indicator() {
+    let dir = std::env::temp_dir().join(format!("rillsql-t3-test-race-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = services_at(&dir);
+    let mut model = seeded_model(Vec::new());
+    let file = sqlite_file(&dir, "draft.sqlite").await;
+    let _ = model.dispatch("conn-engine:sqlite");
+    model.connections.editor.as_mut().unwrap().file_path = file.display().to_string();
+
+    let _ = model.dispatch("conn-test");
+    let first_token = model.prepare_list_token(&services.tasks);
+    let first = request_of(&mut model, first_token);
+    // 第二次测试取代第一次：它才是当前这一次。
+    let _ = model.dispatch("conn-test");
+    let second_token = model.prepare_list_token(&services.tasks);
+    let second = request_of(&mut model, second_token);
+    assert!(model.conn_modal.test_running && model.connections.test_running());
+
+    let done = jobs::execute_job(&services, first).await;
+    apply_done(&mut model, &services, "connections", done);
+    assert!(model.conn_modal.test_running, "旧结果不能收走新一次的指示");
+    assert!(model.connections.test_running());
+    assert_ne!(model.connections.message_key, Some("connections.editor.test.ok"));
+
+    let done = jobs::execute_job(&services, second).await;
+    apply_done(&mut model, &services, "connections", done);
+    assert!(!model.conn_modal.test_running);
+    assert!(!model.connections.test_running());
+    assert_eq!(model.connections.message_key, Some("connections.editor.test.ok"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 打开数据/结构、树展开和连接行双击都先按需连接，连上后动作只重放一次。
+#[test]
+fn on_demand_connect_queues_the_action_and_replays_it_once() {
+    let mut model = seeded_model(vec![record_for("pg", "Atlas", Engine::Postgres)]);
+    model.object_spec = Some("pg|Atlas|app|public|users|postgres|dev".into());
+    model.connections.selected = Some("pg".into());
+
+    assert!(model.gate_on_demand("tree-open-data"), "未连接时先建连");
+    assert_eq!(model.pending_len(), 1, "一次只排一个打开连接");
+    assert_eq!(model.connections.status.get("pg"), Some(&LinkStatus::Connecting));
+    assert_eq!(model.notice_key, Some("ui.conn.connecting"), "状态文字与指示点同时出现");
+    assert_eq!(model.notice_detail, "Atlas");
+    assert!(model.gate_on_demand("open-structure"), "在途连接复用在途操作而不是再开一次");
+    assert_eq!(model.pending_len(), 1);
+    assert_eq!(model.take_pending(), Some(PendingJob::OpenConnection));
+
+    // 连上之后两条动作按顺序重放一次，之后就清空。
+    model.connections.status.insert("pg".into(), LinkStatus::Connected);
+    let ready = model.take_ready_intents();
+    assert_eq!(ready.len(), 2);
+    assert_eq!(ready[0].command(), Some("tree-open-data"));
+    assert_eq!(ready[1].command(), Some("open-structure"));
+    assert!(model.take_ready_intents().is_empty(), "只重放一次");
+
+    // 已连接的入口直接执行，不再建连。
+    assert!(!model.gate_on_demand("tree-open-data"));
+    assert_eq!(model.pending_len(), 0, "已连接不再排队");
+}
+
+/// 启动台的筛选浮层靠近视口边缘时向内翻转，不会画出窗口。
+#[test]
+fn filter_popover_flips_inside_the_viewport() {
+    let (x, _) = super::menus::place_popup(880., 300., 220., 200., 900., 600.);
+    assert!(x + 220. <= 900. - 8. + 0.01, "右侧碰撞向左翻: {x}");
+    assert!(x >= 8.);
+    let (_, y) = super::menus::place_popup(100., 560., 220., 200., 900., 600.);
+    assert!(y + 200. <= 600. - 8. + 0.01, "底部碰撞向上翻: {y}");
+    assert!(y >= 8.);
+}

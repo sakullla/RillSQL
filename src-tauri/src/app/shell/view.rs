@@ -64,6 +64,15 @@ pub struct Workbench {
     pub(super) focus: FocusHandle,
     /// 对象树自己的焦点；点击树行后方向键归树，离开时归还编辑器。
     pub(super) nav_focus: FocusHandle,
+    /// 启动台"新建连接"按钮：模态关闭后焦点回到触发它的这个控件。
+    pub(super) conn_launcher_focus: FocusHandle,
+    /// 对象树空态"新建连接"按钮：同上。
+    pub(super) conn_sidebar_focus: FocusHandle,
+    /// 连接模态页脚按钮的焦点句柄：Tab 序列在模态内闭合，不逃到下面页面。
+    pub(super) modal_close_focus: FocusHandle,
+    pub(super) modal_test_focus: FocusHandle,
+    pub(super) modal_save_focus: FocusHandle,
+    pub(super) modal_save_connect_focus: FocusHandle,
     close_hooked: bool,
     booted: bool,
     health_task: Option<gpui_kit::Task<()>>,
@@ -74,6 +83,8 @@ pub struct Workbench {
     persist_gate: Arc<tokio::sync::Mutex<()>>,
     pub(super) fields: crate::ui::kit::Fields<DraftField>,
     pub(super) menu_at: gpui_kit::Point<gpui_kit::Pixels>,
+    /// 启动台筛选浮层的锚点：来自按钮上这一次真实点击。
+    pub(super) conn_filter_at: gpui_kit::Point<gpui_kit::Pixels>,
     pub(super) palette_focused: bool,
     pub(super) pending_browser: Option<String>,
     connected_seen: std::collections::BTreeSet<String>,
@@ -181,6 +192,12 @@ impl Workbench {
             services,
             focus: cx.focus_handle().tab_stop(true),
             nav_focus: cx.focus_handle().tab_stop(true),
+            conn_launcher_focus: cx.focus_handle().tab_stop(true),
+            conn_sidebar_focus: cx.focus_handle().tab_stop(true),
+            modal_close_focus: cx.focus_handle().tab_stop(true),
+            modal_test_focus: cx.focus_handle().tab_stop(true),
+            modal_save_focus: cx.focus_handle().tab_stop(true),
+            modal_save_connect_focus: cx.focus_handle().tab_stop(true),
             close_hooked: false,
             booted: false,
             health_task: None,
@@ -191,6 +208,7 @@ impl Workbench {
             persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             fields: crate::ui::kit::Fields::default(),
             menu_at: gpui_kit::Point::default(),
+            conn_filter_at: gpui_kit::Point::default(),
             palette_focused: false,
             pending_browser: None,
             connected_seen: std::collections::BTreeSet::new(),
@@ -215,6 +233,13 @@ impl Workbench {
     }
 
     pub fn perform(&mut self, id: &str, cx: &mut Context<Self>) {
+        // 统一按需连接：树展开、连接行双击、打开数据/结构、新建查询到此对象都先到这里。
+        // 已连接时返回 false，命令照常执行；否则连接在后台建立，动作排队等一次续接。
+        if self.model.gate_on_demand(id) {
+            self.persist_if_needed();
+            cx.notify();
+            return;
+        }
         self.refresh_exchange_data(cx, self.model.exchange_open || id == "exchange-export-loaded");
         if id == "refresh-tree" {
             // 目录树与查询页的对象索引各自刷新；树保留展开、焦点与已读子节点。
@@ -1388,6 +1413,39 @@ impl Workbench {
         }).detach();
     }
 
+    /// 连接成功的续接动作执行一次；连接失败的留在重试入口里，不丢用户想打开的对象。
+    fn run_connect_intents(&mut self, cx: &mut Context<Self>) {
+        for intent in self.model.take_ready_intents() {
+            if let Some(spec) = intent.spec.clone() {
+                // 按排队时的对象重放，不重新读当前焦点。
+                self.model.object_spec = Some(spec);
+            }
+            self.model.connections.selected = Some(intent.connection_id.clone());
+            match intent.action {
+                super::conn_modal::ConnectAction::Expand => {
+                    self.model.expand_nav_connection(&intent.connection_id);
+                    if self
+                        .model
+                        .connections
+                        .rows
+                        .iter()
+                        .any(|row| row.saved.id == intent.connection_id && matches!(row.saved.engine, Engine::Redis | Engine::Mongodb))
+                    {
+                        self.pending_browser = Some(intent.connection_id.clone());
+                    }
+                    cx.notify();
+                }
+                action => {
+                    let command = super::conn_modal::ConnectIntent { action, ..intent }.command();
+                    if let Some(command) = command {
+                        self.perform(command, cx);
+                    }
+                }
+            }
+        }
+        self.model.fail_pending_intents();
+    }
+
     fn refresh_tree_on_connect(&mut self, cx: &mut Context<Self>) {
         let connected: std::collections::BTreeSet<String> = self
             .model
@@ -2089,6 +2147,7 @@ impl Render for Workbench {
         self.refresh_exchange(cx);
         self.refresh_compare(cx);
         self.refresh_tree_on_connect(cx);
+        self.run_connect_intents(cx);
         self.note_admin_link(cx);
         self.render_root(window, cx)
     }

@@ -206,7 +206,8 @@ pub fn menu_items(place: MenuPlace, target: MenuTarget) -> Vec<MenuItem> {
             item("conn-edit", "connections.page.menuEdit"),
             item("conn-test", "connections.editor.test.button"),
             item("conn-duplicate", "common.copy"),
-            item("new-query", "shell.command.newQuery"),
+            // 新建查询到此连接：先按需连接再打开编辑器，和对象树里的同名入口走同一条续接。
+            item("conn-new-query", "shell.command.newQuery"),
             danger("conn-delete", "connections.page.menuDelete"),
         ],
         MenuPlace::HistoryEntry => {

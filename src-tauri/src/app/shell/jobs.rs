@@ -19,6 +19,8 @@ use super::model::{PendingJob, WorkbenchModel};
 pub struct JobRequest {
     pub job: PendingJob,
     pub token: TaskToken,
+    /// 发起这次连接测试的代号：过期结果不能收回更新一次的"正在测试"。
+    pub generation: u64,
     pub draft: Option<ConnectionDraft>,
     pub secrets: Secrets,
     pub selected: Option<String>,
@@ -32,15 +34,15 @@ pub struct JobRequest {
 }
 
 pub enum JobDone {
-    Rows(TaskToken, Result<Vec<crate::connections::ConnectionRecord>, String>),
+    Rows(TaskToken, Result<connections::ConnectionSnapshot, String>),
     /// 保存成功：新列表和刚保存的连接 id，界面据此选中它。
-    Saved(TaskToken, String, Result<Vec<crate::connections::ConnectionRecord>, String>),
-    /// 测试结果带着发起时的草稿指纹：界面据此丢弃对不上当前编辑的迟到结果。
-    Test(TaskToken, u64, Result<crate::connections::stages::TestReport, String>),
+    Saved(TaskToken, String, Result<connections::ConnectionSnapshot, String>),
+    /// 测试结果带着发起时的代号与草稿指纹：界面据此丢弃对不上当前编辑的迟到结果。
+    Test(TaskToken, u64, u64, Result<crate::connections::stages::TestReport, String>),
     Open(TaskToken, Result<crate::connections::OpenOutcome, String>),
     Disconnect(TaskToken, String),
     Notice(TaskToken, Result<String, String>),
-    Imported(TaskToken, Result<(Vec<crate::connections::ConnectionRecord>, usize, Vec<String>), String>),
+    Imported(TaskToken, Result<(connections::ConnectionSnapshot, usize, Vec<String>), String>),
     History(TaskToken, Result<(Vec<HistoryEntry>, Vec<SavedQuery>), String>),
 }
 
@@ -61,6 +63,7 @@ pub fn job_request(model: &WorkbenchModel, job: PendingJob, token: TaskToken) ->
     JobRequest {
         job,
         token,
+        generation: model.connections.test_generation,
         draft: model.connections.editor.clone(),
         secrets: model.connections.secrets.clone(),
         selected: model.connections.selected.clone(),
@@ -146,7 +149,12 @@ pub async fn execute_job(services: &AppServices, request: JobRequest) -> JobDone
                 return JobDone::Notice(token, Err("connections.editor.test.button".into()));
             };
             let fingerprint = connections::draft_fingerprint(&request.draft, &request.secrets);
-            JobDone::Test(token, fingerprint, connections::test_row(services, draft, &request.secrets).await)
+            JobDone::Test(
+                token,
+                request.generation,
+                fingerprint,
+                connections::test_row(services, draft, &request.secrets).await,
+            )
         }
         PendingJob::OpenConnection => {
             let Some(id) = request.selected else {
@@ -234,22 +242,36 @@ async fn load_history(services: &AppServices) -> Result<(Vec<HistoryEntry>, Vec<
 
 pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &str, done: JobDone) {
     match done {
-        JobDone::Rows(token, Ok(rows)) => {
-            if owner == "connections" {
-                let _ = model.connections.accept_list(&services.tasks, token, rows);
+        JobDone::Rows(token, Ok(snapshot)) => {
+            if owner == "connections" && model.connections.accept_list(&services.tasks, token, snapshot.rows) {
+                model.connections.recent_ids = snapshot.recent;
                 model.welcome.has_connections = !model.connections.rows.is_empty();
             }
         }
-        JobDone::Saved(token, id, Ok(rows)) => {
-            if owner == "connections" && model.connections.accept_list(&services.tasks, token, rows) {
+        JobDone::Saved(token, id, Ok(snapshot)) => {
+            if owner == "connections" && model.connections.accept_list(&services.tasks, token, snapshot.rows) {
+                model.connections.recent_ids = snapshot.recent;
                 model.welcome.has_connections = !model.connections.rows.is_empty();
                 model.connections.selected = Some(id.clone());
                 if let Some(editor) = model.connections.editor.as_mut() {
-                    editor.id = Some(id);
+                    editor.id = Some(id.clone());
                 }
                 model.connections.message_key = None;
-                model.notice_key = Some("common.save");
                 model.notice_detail.clear();
+                let connect_after = model.conn_modal.save_and_connect;
+                // 保存成功就关掉模态：普通保存到此为止，绝不因为保存过一次就去连接。
+                let _ = model.close_connection_modal();
+                model.connections.selected = Some(id.clone());
+                if connect_after {
+                    // 配置已经落盘；连接失败也不该再存一次，重试只重连。
+                    model.queue_connect(super::conn_modal::ConnectIntent::new(
+                        id,
+                        super::conn_modal::ConnectAction::Expand,
+                        None,
+                    ));
+                } else {
+                    model.notice_key = Some("common.save");
+                }
             }
         }
         JobDone::Rows(token, Err(detail)) | JobDone::Saved(token, _, Err(detail)) | JobDone::Notice(token, Err(detail)) => {
@@ -273,8 +295,9 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
                 model.notice_key = Some("common.save");
             }
         }
-        JobDone::Imported(token, Ok((rows, count, skipped))) => {
-            if owner == "connections" && model.connections.accept_list(&services.tasks, token, rows) {
+        JobDone::Imported(token, Ok((snapshot, count, skipped))) => {
+            if owner == "connections" && model.connections.accept_list(&services.tasks, token, snapshot.rows) {
+                model.connections.recent_ids = snapshot.recent;
                 model.welcome.has_connections = !model.connections.rows.is_empty();
                 model.import_notes = skipped.clone();
                 if skipped.is_empty() {
@@ -292,15 +315,24 @@ pub fn apply_done(model: &mut WorkbenchModel, services: &AppServices, owner: &st
                 model.notice_detail = model.connections.message_detail.clone();
             }
         }
-        JobDone::Test(token, fingerprint, report) => {
-            let _ = model.connections.note_test(&services.tasks, token, fingerprint, report);
-            model.notice_key = model.connections.message_key;
-            model.notice_detail = model.connections.message_detail.clone();
+        JobDone::Test(token, generation, fingerprint, report) => {
+            let current = model.conn_modal.is_current_test(generation);
+            let accepted = model.connections.note_test(&services.tasks, token, generation, fingerprint, report);
+            if current {
+                // 只有自己那一代能收回"正在测试"；更新的一次仍在跑时指示保持原样。
+                model.conn_modal.end_test(generation);
+            }
+            if accepted {
+                // 测试失败保留草稿与机密：只补一条字段错误与说明，模态不关。
+                model.notice_key = model.connections.message_key;
+                model.notice_detail = model.connections.message_detail.clone();
+            }
         }
         JobDone::Open(token, outcome) => {
             let _ = model.connections.note_open(&services.tasks, token, outcome);
             model.notice_key = model.connections.message_key;
             model.notice_detail = model.connections.message_detail.clone();
+            model.fail_pending_intents();
         }
         JobDone::Disconnect(token, id) => {
             if accepted(services, owner, token) {

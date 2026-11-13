@@ -2,6 +2,7 @@
 
 mod chrome;
 mod close;
+mod conn_modal;
 mod danger;
 mod jobs;
 mod layout;

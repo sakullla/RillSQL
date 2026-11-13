@@ -24,6 +24,7 @@ use crate::query::assist::TreeObject;
 use crate::state::{AppState, Platform, SessionState, SessionTab, ShellSettings, StateError};
 
 use super::close::{draft_pending, evaluate, message_key, update_block_key, CloseFacts, CloseKind, CloseScope};
+use super::conn_modal::{ConnectAction, ConnectIntent, ConnectionModal, ModalControl, ModalStop};
 use super::layout::{
     clamp_history_preview, clamp_sidebar, layout_with_sidebar, painted_frame_with_sidebar, unbreakable_px, ChromeLayout, PaintedFrame, HISTORY_PREVIEW_DEFAULT,
     SIDEBAR_DEFAULT,
@@ -331,6 +332,12 @@ pub struct WorkbenchModel {
     pub preview_save: Option<crate::query::SaveRequest>,
     /// 连接页引擎/环境筛选下拉。点按钮展开，点选项才改筛选值。
     pub conn_filter_menu: Option<ConnFilterMenu>,
+    /// 新建/编辑连接的全局模态：启动台、命令搜索、对象树空态与连接行操作共用这一个生命周期。
+    pub conn_modal: ConnectionModal,
+    /// 等待连接成功的续接动作。连接只在真正需要时才建立，连上后按顺序重放一次。
+    pub connect_intents: Vec<ConnectIntent>,
+    /// 上一次连接失败时还挂着的动作：重试按钮重放它，不会丢掉用户想打开的对象。
+    pub connect_retry: Option<ConnectIntent>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -413,6 +420,9 @@ impl WorkbenchModel {
             pending_create: None,
             preview_save: None,
             conn_filter_menu: None,
+            conn_modal: ConnectionModal::default(),
+            connect_intents: Vec::new(),
+            connect_retry: None,
         }
     }
 
@@ -497,8 +507,8 @@ impl WorkbenchModel {
         match id {
             "new-query" => self.open_blank_query(),
             "new-connection" => {
-                self.connections.start_new(Engine::Postgres);
-                self.focused_field = Some(DraftField::Name);
+                // 命令搜索、菜单和快捷键都到这里：打开同一个全局模态，不导航到另一个编辑页。
+                self.open_connection_modal(Some(Engine::Postgres), FocusTarget::Connections, None, "new-connection");
             }
             "connections" => self.welcome.has_connections = !self.connections.rows.is_empty(),
             "history" => {
@@ -626,9 +636,8 @@ impl WorkbenchModel {
         }
         if let Some(engine) = id.strip_prefix("conn-engine:") {
             if let Ok(engine) = Engine::parse(engine) {
-                self.connections.select_engine(engine);
                 self.shell.page = AppPage::Connections;
-                self.focused_field = Some(DraftField::Name);
+                self.open_connection_modal(Some(engine), FocusTarget::Connections, None, id);
             }
             return true;
         }
@@ -652,12 +661,9 @@ impl WorkbenchModel {
             "activity-settings" => {
                 let _ = self.shell.dispatch("settings");
             }
-            "conn-edit" | "conn-duplicate" => {
-                if id == "conn-edit" { self.connections.edit_selected(); } else { self.connections.duplicate_selected(); }
-                if self.connections.editor.is_some() {
-                    self.shell.page = AppPage::Connections;
-                    self.focused_field = Some(DraftField::Name);
-                }
+            "conn-edit" | "conn-duplicate" | "conn-new-launcher" | "conn-new-sidebar" | "conn-modal-close" | "conn-cancel"
+            | "conn-retry" | "conn-new-query" => {
+                self.conn_command(id);
             },
             "conn-delete" => {
                 if self.connections.arm_delete() {
@@ -678,9 +684,12 @@ impl WorkbenchModel {
             }
             "conn-test" => {
                 // 测试屏幕上的草稿：新建未保存的表单也能测，编辑已有连接时测的是改动后的字段。
-                // 没有打开的表单时先按列表选中行载入，避免菜单/右键点了没反应。
-                if self.connections.editor.is_none() {
-                    self.connections.edit_selected();
+                // 右键行"测试连接"时先把这一行载入同一个模态，绝不测配置库里的旧值。
+                if self.connections.editor.is_none() || !self.conn_modal.open {
+                    if let Some(selected) = self.connections.selected.clone() {
+                        self.shell.page = AppPage::Connections;
+                        self.edit_connection(&selected, false, FocusTarget::Connections, None, "conn-test");
+                    }
                 }
                 if self.connections.editor.is_some() {
                     self.shell.page = AppPage::Connections;
@@ -694,7 +703,9 @@ impl WorkbenchModel {
                             self.notice_key = Some(issue.key);
                         }
                         None => {
-                            self.connections.message_key = Some("connections.editor.test.running");
+                            // 每次都拿到新代号：只有这一代的结果能收回指示，晚到的旧结果不行。
+                            let generation = self.conn_modal.begin_test();
+                            self.connections.expect_test(generation);
                             self.notice_key = self.connections.message_key;
                             self.enqueue(PendingJob::TestConnection);
                         }
@@ -713,9 +724,13 @@ impl WorkbenchModel {
                     self.enqueue(PendingJob::Disconnect);
                 }
             }
-            "conn-save" => {
+            "conn-save" | "conn-save-connect" => {
+                // 普通保存只保存；"保存并连接"保存成功后再走一次按需连接。
+                self.conn_modal.save_and_connect = id == "conn-save-connect";
                 self.connections.issues = self.connections.validate();
                 if self.connections.editor.is_some() && self.connections.issues.is_empty() {
+                    self.notice_key = None;
+                    self.notice_detail.clear();
                     self.enqueue(PendingJob::SaveConnection);
                 } else if let Some(issue) = self.connections.issues.first() {
                     self.notice_key = Some(issue.key);
@@ -1175,6 +1190,207 @@ impl WorkbenchModel {
         tasks.begin(owner)
     }
 
+    // ------------------------------------------------------------ 连接模态与按需连接
+
+    pub fn connection_modal_open(&self) -> bool {
+        self.conn_modal.open
+    }
+
+    /// 打开新建连接模态。启动台、命令搜索、对象树空态和快捷键都到这一处，
+    /// 因此"新建连接"只有一份草稿与一个编辑面。
+    pub fn open_connection_modal(&mut self, engine: Option<Engine>, origin: FocusTarget, control: Option<ModalControl>, trigger: &str) {
+        self.connections.start_new(engine.unwrap_or(Engine::Postgres));
+        self.connections.issues.clear();
+        self.focused_field = Some(DraftField::Name);
+        self.conn_modal.open_from(origin, control, trigger);
+    }
+
+    /// 编辑（或复制）一行配置：草稿来自这一行，屏幕上的改动不影响已保存配置直到保存成功。
+    pub fn edit_connection(&mut self, id: &str, duplicate: bool, origin: FocusTarget, control: Option<ModalControl>, trigger: &str) -> bool {
+        self.connections.selected = Some(id.to_owned());
+        if duplicate {
+            self.connections.duplicate_selected();
+        } else {
+            self.connections.edit_selected();
+        }
+        if self.connections.editor.is_none() {
+            return false;
+        }
+        self.connections.issues = self.connections.validate();
+        self.connections.message_key = None;
+        self.connections.message_detail.clear();
+        self.focused_field = Some(DraftField::Name);
+        self.conn_modal.open_from(origin, control, trigger);
+        true
+    }
+
+    /// 关闭模态：不保存、不改已保存配置，草稿与本次机密一起丢掉。返回还焦目标。
+    pub fn close_connection_modal(&mut self) -> Option<(FocusTarget, Option<ModalControl>)> {
+        let restored = self.conn_modal.close()?;
+        self.connections.editor = None;
+        self.connections.secrets = Secrets::default();
+        self.connections.issues.clear();
+        self.connections.message_key = None;
+        self.connections.message_detail.clear();
+        self.connections.confirm_delete = false;
+        self.shell.focus = restored.0;
+        Some(restored)
+    }
+
+    fn conn_command(&mut self, id: &str) {
+        match id {
+            "conn-edit" | "conn-duplicate" => {
+                let duplicate = id == "conn-duplicate";
+                let origin = if self.shell.page == AppPage::Connections { FocusTarget::Connections } else { FocusTarget::Sidebar };
+                if let Some(selected) = self.connections.selected.clone() {
+                    self.shell.page = AppPage::Connections;
+                    self.edit_connection(&selected, duplicate, origin, None, id);
+                }
+            }
+            "conn-new-launcher" => {
+                self.shell.page = AppPage::Connections;
+                self.open_connection_modal(Some(Engine::Postgres), FocusTarget::Connections, Some(ModalControl::LauncherNew), id);
+            }
+            "conn-new-sidebar" => {
+                self.open_connection_modal(Some(Engine::Postgres), FocusTarget::Sidebar, Some(ModalControl::SidebarNew), id);
+            }
+            "conn-cancel" | "conn-modal-close" => {
+                let _ = self.close_connection_modal();
+            }
+            "conn-retry" => {
+                let _ = self.retry_pending_connect();
+            }
+            "conn-new-query" => {
+                let Some(id) = self.connections.selected.clone() else { return };
+                if let Some(row) = self.connections.rows.iter().find(|row| row.saved.id == id) {
+                    let name = row.saved.name.clone();
+                    let engine = row.saved.engine.as_str().to_owned();
+                    let database = row.saved.database.clone();
+                    self.open_bound_query(String::new(), Some(id.clone()), Some(name), database, Some(engine));
+                }
+                // 查询草稿马上就能写；连接在后台建立，失败时重试仍回到这条连接。
+                self.queue_connect(ConnectIntent::new(id, ConnectAction::Expand, None));
+            }
+            _ => {}
+        }
+    }
+
+    /// 左侧对象的焦点/选中换成规格，供连接成功后重放动作。
+    fn intent_spec(&self) -> Option<String> {
+        self.object_spec.clone().or_else(|| self.active_scope().map(|target| target.spec()))
+    }
+
+    /// 这条命令是否要"先有连接"。返回待续接动作；None 表示照常执行。
+    pub fn on_demand_intent(&self, id: &str) -> Option<ConnectIntent> {
+        if let Some(rest) = id.strip_prefix("connection:") {
+            let connection = rest.split('|').next().unwrap_or(rest);
+            if self.connections.rows.iter().any(|row| row.saved.id == connection) {
+                // 连接行双击/命令搜索选中：连上后进入工作区，而不是停在启动台。
+                return Some(ConnectIntent::new(connection, ConnectAction::OpenWorkspace, None));
+            }
+            return None;
+        }
+        let action = match id {
+            "tree-open-data" => ConnectAction::OpenData,
+            "open-structure" => ConnectAction::OpenStructure,
+            "tree-new-query" => ConnectAction::NewQuery,
+            _ => return None,
+        };
+        let spec = self.intent_spec()?;
+        let target = ObjectTarget::parse(&spec)?;
+        Some(ConnectIntent::new(target.connection_id, action, Some(spec)))
+    }
+
+    /// 按需连接的统一入口：已连接返回 false（调用方直接执行），否则排队并返回 true。
+    pub fn gate_on_demand(&mut self, id: &str) -> bool {
+        let Some(intent) = self.on_demand_intent(id) else { return false };
+        if self.connections.row_status(&intent.connection_id) == LinkStatus::Connected {
+            return false;
+        }
+        // 没有载入这条连接时不知道它的真实状态：按原样执行，不凭空发一次连接。
+        if !self.connections.rows.iter().any(|row| row.saved.id == intent.connection_id) {
+            return false;
+        }
+        self.queue_connect(intent);
+        true
+    }
+
+    /// 确保这条连接可用；连上后执行一次排队的动作。重复点击复用在途连接，不重复打开。
+    pub fn queue_connect(&mut self, intent: ConnectIntent) {
+        let id = intent.connection_id.clone();
+        if !self.connect_intents.iter().any(|queued| queued == &intent) {
+            self.connect_intents.push(intent);
+        }
+        self.connect_retry = None;
+        self.connections.selected = Some(id.clone());
+        let name = self
+            .connections
+            .rows
+            .iter()
+            .find(|row| row.saved.id == id)
+            .map(|row| row.saved.name.clone())
+            .unwrap_or_default();
+        match self.connections.row_status(&id) {
+            LinkStatus::Connected => return,
+            LinkStatus::Connecting => {}
+            _ => {
+                self.connections.status.insert(id.clone(), LinkStatus::Connecting);
+                if !self.pending.iter().any(|job| matches!(job, PendingJob::OpenConnection)) {
+                    self.enqueue(PendingJob::OpenConnection);
+                }
+            }
+        }
+        // 状态文字与指示点同时出现：颜色不是唯一的信息载体。
+        self.notice_key = Some("ui.conn.connecting");
+        self.notice_detail = name;
+    }
+
+    /// 已连上的那些动作：调用方按顺序执行一次，并从队列里移除。
+    pub fn take_ready_intents(&mut self) -> Vec<ConnectIntent> {
+        let ready: Vec<ConnectIntent> = self
+            .connect_intents
+            .iter()
+            .filter(|intent| self.connections.row_status(&intent.connection_id) == LinkStatus::Connected)
+            .cloned()
+            .collect();
+        self.connect_intents.retain(|intent| self.connections.row_status(&intent.connection_id) != LinkStatus::Connected);
+        ready
+    }
+
+    /// 连接失败：动作留到重试里，不丢用户想打开的对象。
+    pub fn fail_pending_intents(&mut self) {
+        let failed: Vec<ConnectIntent> = self
+            .connect_intents
+            .iter()
+            .filter(|intent| self.connections.row_status(&intent.connection_id) == LinkStatus::Failed)
+            .cloned()
+            .collect();
+        self.connect_intents.retain(|intent| self.connections.row_status(&intent.connection_id) != LinkStatus::Failed);
+        if let Some(intent) = failed.into_iter().next() {
+            self.notice_key = Some("connections.status.error");
+            self.notice_detail = self
+                .connections
+                .rows
+                .iter()
+                .find(|row| row.saved.id == intent.connection_id)
+                .map(|row| row.saved.name.clone())
+                .unwrap_or_default();
+            self.connect_retry = Some(intent);
+        }
+    }
+
+    /// 重试上一次失败的续接动作。
+    pub fn retry_pending_connect(&mut self) -> bool {
+        let Some(intent) = self.connect_retry.take() else { return false };
+        self.queue_connect(intent);
+        true
+    }
+
+    /// 模态里的 Tab：按屏幕上的字段顺序循环，不逃到下面的页面。
+    pub fn step_modal_focus(&mut self, forward: bool) -> Option<ModalStop> {
+        self.conn_modal.step(&self.connections, forward)
+    }
+
     pub fn open_menu(&mut self, place: MenuPlace, target: MenuTarget) {
         if self.shell.palette_open || self.shell.help_open {
             self.shell.close_overlay();
@@ -1239,6 +1455,8 @@ impl WorkbenchModel {
     }
 
     pub fn dismiss(&mut self) -> Effect {
+        // 筛选浮层也归外点/Esc 关闭，不留一个悬着的下拉。
+        self.conn_filter_menu = None;
         // 菜单关掉就不再持着右键的那一行，之后的动作回到键盘焦点或当前工作项。
         self.nav_menu_node = None;
         if self.menu.take().is_some() {

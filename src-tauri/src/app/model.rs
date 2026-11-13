@@ -66,6 +66,8 @@ pub enum FocusTarget {
     Palette,
     Sidebar,
     Settings,
+    /// 连接启动台（连接页）自己的区域：模态关闭后无处可还时落在这里。
+    Connections,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -469,6 +471,7 @@ impl Shell {
             }
             "new-connection" | "connections" => {
                 self.page = AppPage::Connections;
+                self.focus = FocusTarget::Connections;
                 Effect::None
             }
             "open-sqlite" => {
