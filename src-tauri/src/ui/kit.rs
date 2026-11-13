@@ -747,46 +747,139 @@ fn click_count(event: &ClickEvent) -> usize {
 /// 纵向分隔条的命中宽度。
 pub const RESIZE_HANDLE_W: f32 = 6.;
 
-/// 空态：图标、标题、说明。按钮由调用方追加。
-pub fn empty_state(icon_name: IconName, heading: impl Into<SharedString>, detail: impl Into<SharedString>, p: &Palette) -> gpui_kit::Div {
-    div()
+/// 三态语义（需求 R4 / 规范 S8.5 / S12.4）：同一份排版，只换语义、图标色调与文案。
+/// 页面按场景选语义，不再各自发明另一套三态；三类文案必须不同 ——
+/// 无数据说明这里将出现什么，无命中说明怎么调整条件，错误说明问题与纠正动作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateKind {
+    /// 无数据：这里还没有数据；主操作是添加入口。
+    NoData,
+    /// 用户操作无命中（筛选、搜索、目录过滤）；主操作是清除条件。
+    NoMatch,
+    /// 错误：读取或执行失败；主操作是重试。
+    Error,
+}
+
+impl StateKind {
+    /// 图标块的（前景, 底色）。三类靠色调区分，尺寸与位置完全一致。
+    pub fn icon_colors(self, p: &Palette) -> (Hsla, Hsla) {
+        match self {
+            StateKind::NoData => (p.accent_text, p.accent_soft),
+            StateKind::NoMatch => (p.text_muted, p.hover),
+            StateKind::Error => (p.danger, p.danger_soft),
+        }
+    }
+
+    fn block_id(self) -> &'static str {
+        match self {
+            StateKind::NoData => "empty-state",
+            StateKind::NoMatch => "no-match-state",
+            StateKind::Error => "error-state",
+        }
+    }
+
+    fn detail_id(self) -> &'static str {
+        match self {
+            StateKind::Error => "error-state-detail",
+            _ => "empty-state-detail",
+        }
+    }
+}
+
+/// 图标块的边长：规范 S8.5 的 16px 图标放在方形浅底里。
+const STATE_ICON_BOX: f32 = 30.;
+/// 主操作与标题文字左对齐时的左边距：图标块 30 + 间距 8。
+pub const STATE_ACTION_INSET: f32 = 38.;
+/// 说明文字的最大宽度：窄面板里按面板宽换行，宽页面里不拉成一整行。
+pub const STATE_DETAIL_MAX_W: f32 = 360.;
+
+/// 三态共用排版：左对齐成块（图标块 + 标题 + 说明 + 可选主操作），不居中、不保留内容区的表头骨架。
+fn state_block(kind: StateKind, icon_name: IconName, heading: impl Into<SharedString>, detail: impl Into<SharedString>, p: &Palette, action: Option<AnyElement>) -> impl gpui_kit::ParentElement + gpui_kit::Styled + IntoElement {
+    let (fg, bg) = kind.icon_colors(p);
+    let mut block = div()
+        .id(kind.block_id())
+        .test_support()
         .flex()
         .flex_col()
-        .items_center()
-        .justify_center()
-        .gap(px(10.))
-        .p(px(24.))
+        .items_start()
+        .gap(px(8.))
+        .px(px(12.))
+        .py(px(14.))
         // 窄面板里也要能收窄：GPUI 文本的最小内容宽是整行宽，不写 min_w(0) 就会撑出面板。
         .min_w(px(0.))
         .max_w_full()
         .child(
             div()
-                .size(px(44.))
-                .rounded(px(Radius::PANEL))
-                .bg(p.accent_soft)
+                .flex_none()
+                .size(px(STATE_ICON_BOX))
+                .rounded(px(Radius::CONTROL))
+                .bg(bg)
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(icon(icon_name, 22., p.accent_text)),
+                .child(icon(icon_name, 16., fg)),
         )
         .child(title(heading, TypeScale::MD, p))
         .child(
-            // 说明文字按面板宽换行（最多 360），不按整行宽撑开。
             div()
-                .id("empty-state-detail")
+                .id(kind.detail_id())
                 .test_support()
                 .w_full()
-                .max_w(px(360.))
-                .text_center()
+                .max_w(px(STATE_DETAIL_MAX_W))
                 .text_size(px(TypeScale::SM))
                 .text_color(p.text_muted)
                 .child(detail.into()),
-        )
+        );
+    if let Some(action) = action {
+        block = block.child(div().id("state-action").test_support().w_full().pl(px(STATE_ACTION_INSET)).child(action));
+    }
+    block
 }
 
-/// 加载态：居中的小号转圈 + 一行说明（规范 S8.5 三种状态之一）。加载优先于空态。
-pub fn loading_state(text: impl Into<SharedString>, p: &Palette) -> gpui_kit::Div {
+/// 空态（无数据）：左对齐成块，图标、标题、说明；主操作用 `empty_state_with_action`。
+pub fn empty_state(icon_name: IconName, heading: impl Into<SharedString>, detail: impl Into<SharedString>, p: &Palette) -> impl gpui_kit::ParentElement + gpui_kit::Styled + IntoElement {
+    state_block(StateKind::NoData, icon_name, heading, detail, p, None)
+}
+
+/// 无数据空态 + 上下文主操作（新建、添加、打开…）。空态替换内容区，不保留表头骨架。
+// 底座入口：本任务只提供语义，调用方在 T2–T15 逐屏接入。
+#[allow(dead_code)]
+pub fn empty_state_with_action(icon_name: IconName, heading: impl Into<SharedString>, detail: impl Into<SharedString>, action: impl IntoElement, p: &Palette) -> impl gpui_kit::ParentElement + gpui_kit::Styled + IntoElement {
+    state_block(StateKind::NoData, icon_name, heading, detail, p, Some(action.into_any_element()))
+}
+
+/// 无命中空态（筛选、搜索）：说明怎么调整条件，主操作通常是清除筛选。
+// 底座入口：本任务只提供语义，调用方在 T2–T15 逐屏接入。
+#[allow(dead_code)]
+pub fn no_match_state(icon_name: IconName, heading: impl Into<SharedString>, detail: impl Into<SharedString>, p: &Palette) -> impl gpui_kit::ParentElement + gpui_kit::Styled + IntoElement {
+    state_block(StateKind::NoMatch, icon_name, heading, detail, p, None)
+}
+
+/// 无命中空态 + 清除条件一类的下一步。
+// 底座入口：本任务只提供语义，调用方在 T2–T15 逐屏接入。
+#[allow(dead_code)]
+pub fn no_match_state_with_action(icon_name: IconName, heading: impl Into<SharedString>, detail: impl Into<SharedString>, action: impl IntoElement, p: &Palette) -> impl gpui_kit::ParentElement + gpui_kit::Styled + IntoElement {
+    state_block(StateKind::NoMatch, icon_name, heading, detail, p, Some(action.into_any_element()))
+}
+
+/// 错误态：与空态同一排版，图标块换危险色。
+pub fn error_state(heading: impl Into<SharedString>, detail: impl Into<SharedString>, p: &Palette) -> impl gpui_kit::ParentElement + gpui_kit::Styled + IntoElement {
+    state_block(StateKind::Error, IconName::CircleAlert, heading, detail, p, None)
+}
+
+/// 错误态 + 重试一类的纠正动作。
+// 底座入口：本任务只提供语义，调用方在 T2–T15 逐屏接入。
+#[allow(dead_code)]
+pub fn error_state_with_action(heading: impl Into<SharedString>, detail: impl Into<SharedString>, action: impl IntoElement, p: &Palette) -> impl gpui_kit::ParentElement + gpui_kit::Styled + IntoElement {
+    state_block(StateKind::Error, IconName::CircleAlert, heading, detail, p, Some(action.into_any_element()))
+}
+
+/// 首屏加载（整块）：居中的小号转圈 + 一行说明（规范 S8.5 三种状态之一）。加载优先于空态。
+/// 能预估内容行结构时优先用 `skeleton_state`（骨架 + 增量内容），只有一次性整块读取才回落到这里。
+pub fn loading_state(text: impl Into<SharedString>, p: &Palette) -> impl gpui_kit::ParentElement + gpui_kit::Styled + IntoElement {
     div()
+        .id("loading-state")
+        .test_support()
         .flex()
         .items_center()
         .justify_center()
@@ -798,41 +891,56 @@ pub fn loading_state(text: impl Into<SharedString>, p: &Palette) -> gpui_kit::Di
         .child(text.into())
 }
 
-/// 错误态：与空态同一排版，图标块换成危险色；重试按钮由调用方追加。
-pub fn error_state(heading: impl Into<SharedString>, detail: impl Into<SharedString>, p: &Palette) -> gpui_kit::Div {
+/// 局部加载（行、节点、字段旁）：一行小号转圈，贴左、单行高，不占整块。
+/// 局部刷新不整块换成 `loading_state`，页面也不用自己拼转圈加文字。
+// 底座入口：本任务只提供语义，调用方在 T2–T15 逐屏接入。
+#[allow(dead_code)]
+pub fn inline_loading(text: impl Into<SharedString>, layout: &Metrics, p: &Palette) -> impl gpui_kit::ParentElement + gpui_kit::Styled + IntoElement {
     div()
+        .id("inline-loading")
+        .test_support()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .min_h(px(layout.strip_h()))
+        .text_size(px(TypeScale::XS))
+        .text_color(p.text_muted)
+        .child(gpui_kit::component::spinner::Spinner::new().small().color(p.accent))
+        .child(text.into())
+}
+
+/// 首屏骨架：按当前密度排出的占位行，读到数据后逐行换成真实内容（增量），
+/// 不用全屏转圈盖住整个工作台。占位块是静态色块，没有位移动画，减少动效时同样成立。
+// 底座入口：本任务只提供语义，调用方在 T2–T15 逐屏接入。
+#[allow(dead_code)]
+pub fn skeleton_state(rows: usize, layout: &Metrics, p: &Palette) -> impl gpui_kit::ParentElement + gpui_kit::Styled + IntoElement {
+    const WIDTHS: [f32; 6] = [0.62, 0.78, 0.45, 0.70, 0.58, 0.86];
+    let rows = rows.max(1);
+    let bar_h = (layout.row_h - 10.).max(8.);
+    let mut block = div()
+        .id("skeleton-state")
+        .test_support()
         .flex()
         .flex_col()
-        .items_center()
-        .justify_center()
-        .gap(px(10.))
-        .p(px(24.))
-        // 窄面板里也要能收窄：GPUI 文本的最小内容宽是整行宽，不写 min_w(0) 就会撑出面板。
+        .gap(px(6.))
+        .px(px(12.))
+        .py(px(10.))
+        // 窄面板里也要能收窄：占位行按容器宽排，不撑出面板。
         .min_w(px(0.))
-        .max_w_full()
-        .child(
+        .max_w_full();
+    for (index, ratio) in WIDTHS.iter().copied().cycle().take(rows).enumerate() {
+        block = block.child(
             div()
-                .size(px(44.))
-                .rounded(px(Radius::PANEL))
-                .bg(p.danger_soft)
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(icon(IconName::CircleAlert, 22., p.danger)),
-        )
-        .child(title(heading, TypeScale::MD, p))
-        .child(
-            // 说明文字按面板宽换行（最多 360），不按整行宽撑开。
-            div()
-                .id("error-state-detail")
+                .id(("skeleton-row", index))
                 .test_support()
                 .w_full()
-                .max_w(px(360.))
-                .text_center()
-                .text_size(px(TypeScale::SM))
-                .text_color(p.text_muted)
-                .child(detail.into()),
-        )
+                .h(px(layout.row_h))
+                .flex()
+                .items_center()
+                .child(div().flex_none().h(px(bar_h)).w(gpui_kit::relative(ratio)).rounded(px(Radius::CONTROL)).bg(p.line_soft)),
+        );
+    }
+    block
 }
 
 /// 键盘提示 kbd。
@@ -1553,5 +1661,359 @@ mod token_tests {
             "div().text_size(px(TypeScale::SM)).rounded(px(Radius::PANEL)).child(kit::title(t, TypeScale::LG, &p))".to_owned(),
         )]);
         assert!(ok.is_empty(), "{ok:?}");
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{Bounds, Point, Render, TestAppContext, WindowBounds, WindowOptions};
+
+    const HEADING: &str = "还没有表";
+    const DETAIL: &str = "连接数据库后这里会列出表，也可以用 Ctrl+N 新建查询。";
+
+    struct Probe {
+        kind: StateKind,
+        action: bool,
+        clicks: u32,
+    }
+
+    impl Render for Probe {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let p = Palette::of(cx);
+            let action = self.action.then(|| {
+                primary_button("state-action-button", None, "重试", cx.listener(|this: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                    this.clicks += 1;
+                    cx.notify();
+                }))
+                .into_any_element()
+            });
+            let block = match (self.kind, action) {
+                (StateKind::NoData, None) => empty_state(IconName::Database, HEADING, DETAIL, &p).into_any_element(),
+                (StateKind::NoData, Some(action)) => empty_state_with_action(IconName::Database, HEADING, DETAIL, action, &p).into_any_element(),
+                (StateKind::NoMatch, None) => no_match_state(IconName::Search, HEADING, DETAIL, &p).into_any_element(),
+                (StateKind::NoMatch, Some(action)) => no_match_state_with_action(IconName::Search, HEADING, DETAIL, action, &p).into_any_element(),
+                (StateKind::Error, None) => error_state(HEADING, DETAIL, &p).into_any_element(),
+                (StateKind::Error, Some(action)) => error_state_with_action(HEADING, DETAIL, action, &p).into_any_element(),
+            };
+            div().id("state-host").test_support().size_full().child(block)
+        }
+    }
+
+    fn open(cx: &mut TestAppContext, width: f32, height: f32, kind: StateKind, action: bool) -> (gpui_kit::AnyWindowHandle, Entity<Probe>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            apply_theme(false, cx);
+        });
+        let bounds = Bounds { origin: Point::default(), size: gpui_kit::size(px(width), px(height)) };
+        cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() }, cx, |_, cx| {
+                cx.new(|_| Probe { kind, action, clicks: 0 })
+            })
+            .expect("state window")
+        })
+    }
+
+    /// 空/错误态左对齐成块（规范 S8.5、需求 R4）：图标、标题、说明、主操作都贴左侧文字列，
+    /// 不是整块居中；说明最宽 360 并在 1360/900/640 都不越出视口。主操作真的可点。
+    #[gpui_kit::test]
+    fn states_are_left_aligned_with_their_action_at_every_width(cx: &mut TestAppContext) {
+        for width in [1360., 900., 640.] {
+            let (window, view) = open(cx, width, 900., StateKind::NoData, true);
+            let (host, detail, action, button) = cx
+                .update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    (
+                        window.find("state-host").bounds(),
+                        window.find("empty-state-detail").bounds(),
+                        window.find("state-action").bounds(),
+                        window.find("state-action-button").bounds(),
+                    )
+                })
+                .unwrap();
+            let inset = f32::from(detail.origin.x - host.origin.x);
+            assert!((inset - 12.).abs() < 0.5, "{width}: 说明贴左侧内边距，不是居中（实际 {inset}）");
+            assert!((f32::from(action.origin.x - detail.origin.x)).abs() < 0.5, "{width}: 主操作与说明同一列");
+            let button_inset = f32::from(button.origin.x - detail.origin.x);
+            assert!((button_inset - STATE_ACTION_INSET).abs() < 0.5, "{width}: 主操作与标题文字左对齐（实际 {button_inset}）");
+            assert!(f32::from(detail.size.width) <= STATE_DETAIL_MAX_W + 0.5, "{width}: 说明最宽 {STATE_DETAIL_MAX_W}");
+            let right = f32::from(detail.origin.x + detail.size.width);
+            assert!(right <= f32::from(host.origin.x + host.size.width) + 0.5, "{width}: 说明右缘 {right} 越出视口");
+            cx.update_window(window, |_, window, cx| window.click("state-action-button", cx)).unwrap();
+            assert_eq!(cx.update(|cx| view.read(cx).clicks), 1, "{width}: 主操作可点");
+        }
+    }
+
+    /// 三类语义共用一份排版与几何，只换图标色调：无数据 / 无命中 / 错误不能各画一套。
+    #[gpui_kit::test]
+    fn empty_no_match_and_error_share_one_layout_with_distinct_tones(cx: &mut TestAppContext) {
+        for p in [Palette::light(), Palette::dark()] {
+            let data = StateKind::NoData.icon_colors(&p);
+            let no_match = StateKind::NoMatch.icon_colors(&p);
+            let error = StateKind::Error.icon_colors(&p);
+            assert_eq!(data, (p.accent_text, p.accent_soft), "无数据用强调浅底");
+            assert_eq!(no_match, (p.text_muted, p.hover), "无命中用中性底，不报警");
+            assert_eq!(error, (p.danger, p.danger_soft), "错误用危险色");
+            assert_ne!(data.1, no_match.1, "无数据与无命中底色不同");
+            assert_ne!(no_match.1, error.1, "无命中与错误底色不同");
+        }
+        let mut geometry = Vec::new();
+        for (kind, block_id, detail_id) in [
+            (StateKind::NoData, "empty-state", "empty-state-detail"),
+            (StateKind::NoMatch, "no-match-state", "empty-state-detail"),
+            (StateKind::Error, "error-state", "error-state-detail"),
+        ] {
+            let (window, _) = open(cx, 900., 600., kind, false);
+            let (block, detail) = cx
+                .update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    (window.find(block_id).bounds(), window.find(detail_id).bounds())
+                })
+                .unwrap();
+            let inset = f32::from(detail.origin.x - block.origin.x);
+            assert!((inset - 12.).abs() < 0.5, "{block_id}: 三种语义的说明都在同一列（实际 {inset}）");
+            geometry.push((f32::from(detail.origin.y - block.origin.y), f32::from(block.size.height), f32::from(detail.size.width)));
+        }
+        assert_eq!(geometry[0], geometry[1], "无数据与无命中共用同一几何");
+        assert_eq!(geometry[1], geometry[2], "无命中与错误共用同一几何");
+    }
+
+    struct LoadingProbe {
+        layout: Metrics,
+        inline: bool,
+    }
+
+    impl Render for LoadingProbe {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let p = Palette::of(cx);
+            let body = if self.inline {
+                inline_loading("正在读取表…", &self.layout, &p).into_any_element()
+            } else {
+                loading_state("正在读取表…", &p).size_full().into_any_element()
+            };
+            div().id("state-host").test_support().size_full().child(body)
+        }
+    }
+
+    fn open_loading(cx: &mut TestAppContext, layout: Metrics, inline: bool) -> gpui_kit::AnyWindowHandle {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            apply_theme(false, cx);
+        });
+        let bounds = Bounds { origin: Point::default(), size: gpui_kit::size(px(640.), px(400.)) };
+        cx.update(|cx| {
+            let (window, _) = gpui_kit::open_window(WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() }, cx, |_, cx| {
+                cx.new(|_| LoadingProbe { layout, inline })
+            })
+            .expect("loading window");
+            window
+        })
+    }
+
+    /// 局部加载是一行（行高 = `strip_h`、内容宽、贴左侧），首屏加载才整块；
+    /// 两者不能互相冒充（需求 R4：加载优先骨架/增量，局部不整块换转圈）。
+    #[gpui_kit::test]
+    fn local_loading_stays_one_line_while_first_screen_loading_fills_the_block(cx: &mut TestAppContext) {
+        let layout = Metrics::compact();
+        let window = open_loading(cx, layout, true);
+        let (host, inline) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                (window.find("state-host").bounds(), window.find("inline-loading").bounds())
+            })
+            .unwrap();
+        assert!((f32::from(inline.size.height) - layout.strip_h()).abs() < 0.5, "局部加载只有一行高");
+        assert!((f32::from(inline.origin.x - host.origin.x)).abs() < 0.5, "局部加载贴左侧，不居中");
+        let window = open_loading(cx, layout, false);
+        let (host, block) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                (window.find("state-host").bounds(), window.find("loading-state").bounds())
+            })
+            .unwrap();
+        assert!((f32::from(block.size.width) - f32::from(host.size.width)).abs() < 0.5, "首屏加载整块占满");
+        assert!(f32::from(block.size.height) > layout.strip_h() * 2., "首屏加载是整块，不是一行");
+    }
+
+    struct SkeletonProbe {
+        layout: Metrics,
+    }
+
+    impl Render for SkeletonProbe {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let p = Palette::of(cx);
+            div().id("state-host").test_support().size_full().flex().flex_col().child(skeleton_state(5, &self.layout, &p))
+        }
+    }
+
+    /// 首屏骨架按当前密度排行，行数正好是请求数；它替代整块转圈，不额外叠一层全屏 Spinner。
+    #[gpui_kit::test]
+    fn skeleton_state_is_density_driven_and_replaces_the_full_screen_spinner(cx: &mut TestAppContext) {
+        for (layout, row_h) in [(Metrics::compact(), 26.), (Metrics::standard(), 32.)] {
+            cx.update(|cx| {
+                gpui_kit::init(cx);
+                apply_theme(false, cx);
+            });
+            let bounds = Bounds { origin: Point::default(), size: gpui_kit::size(px(900.), px(600.)) };
+            let window = cx.update(|cx| {
+                let (window, _) = gpui_kit::open_window(WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() }, cx, |_, cx| {
+                    cx.new(|_| SkeletonProbe { layout })
+                })
+                .expect("skeleton window");
+                window
+            });
+            let (rows, spinner) = cx
+                .update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    let rows: Vec<f32> = (0usize..5).map(|index| f32::from(window.find(("skeleton-row", index)).bounds().size.height)).collect();
+                    (rows, window.try_find("loading-state").is_some())
+                })
+                .unwrap();
+            assert_eq!(rows, vec![row_h; 5], "骨架行高随密度（{row_h}）");
+            assert!(!spinner, "骨架不叠一层全屏转圈");
+            let extra = cx
+                .update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    window.try_find(("skeleton-row", 5usize)).is_some()
+                })
+                .unwrap();
+            assert!(!extra, "只画请求的行数");
+        }
+    }
+
+    struct RowProbe;
+
+    impl Render for RowProbe {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let p = Palette::of(cx);
+            div().size_full().child(row_states(div().id("managed-row").child("行"), &p))
+        }
+    }
+
+    /// 反向：容器持有焦点的列表行（`row_states`）不是 Tab 停靠点，Tab 不会跑进行里；
+    /// 焦点仍留在树/面板容器上，快捷键照常生效（规范 S12.3）。
+    #[gpui_kit::test]
+    fn row_states_are_not_tab_stops(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            apply_theme(false, cx);
+        });
+        let (window, _) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |_, cx| cx.new(|_| RowProbe)).expect("row window")
+        });
+        let focused = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.focus_next(cx);
+                window.render_frame(cx);
+                window.focused(cx).is_some()
+            })
+            .unwrap();
+        assert!(!focused, "列表行不抢键盘焦点");
+    }
+}
+
+#[cfg(test)]
+mod metric_tests {
+    use super::*;
+    use gpui_kit::TestAppContext;
+
+    /// 派生高度只由密度决定：紧凑/标准/宽松三档严格递增，且不是写死的常量。
+    #[test]
+    fn derived_heights_follow_density_and_never_coincide() {
+        let (compact, standard, relaxed) = (Metrics::compact(), Metrics::standard(), Metrics::relaxed());
+        assert_eq!(
+            (compact.toolbar_h(), compact.bar_h(), compact.tools_h(), compact.strip_h()),
+            (38., 30., 36., 20.),
+            "紧凑派生高度（规范 S12.2：bar_h 紧凑 30）"
+        );
+        assert_eq!((standard.toolbar_h(), standard.bar_h(), standard.tools_h(), standard.strip_h()), (42., 34., 40., 22.));
+        assert_eq!((relaxed.toolbar_h(), relaxed.bar_h(), relaxed.tools_h(), relaxed.strip_h()), (46., 38., 44., 24.));
+        for (left, right) in [(&compact, &standard), (&standard, &relaxed)] {
+            assert!(left.toolbar_h() < right.toolbar_h());
+            assert!(left.bar_h() < right.bar_h());
+            assert!(left.tools_h() < right.tools_h());
+            assert!(left.strip_h() < right.strip_h());
+        }
+        // 反向：派生高度不是常量，不能三档相同
+        assert_ne!(compact.bar_h(), standard.bar_h());
+        assert_ne!(standard.strip_h(), relaxed.strip_h());
+        assert!(compact.tools_h() > compact.bar_h(), "网格工具条高于结果头");
+    }
+
+    /// 内边距按 density 三档取值，边界互斥：31.9 仍是紧凑、32 起算标准、40 起算宽松。
+    #[test]
+    fn pane_padding_switches_on_exact_density_boundaries() {
+        let mut metrics = Metrics::compact();
+        assert_eq!((metrics.pane_pad(), metrics.section_gap(), metrics.card_pad()), (10., 12., 12.));
+        metrics.row_h = 31.9;
+        assert_eq!(metrics.pane_pad(), 10., "31.9 仍是紧凑档");
+        metrics.row_h = 32.;
+        assert_eq!((metrics.pane_pad(), metrics.section_gap(), metrics.card_pad()), (12., 16., 14.), "32 起算标准档");
+        metrics.row_h = 39.9;
+        assert_eq!(metrics.pane_pad(), 12., "39.9 仍是标准档");
+        metrics.row_h = 40.;
+        assert_eq!((metrics.pane_pad(), metrics.section_gap(), metrics.card_pad()), (16., 20., 18.), "40 起算宽松档");
+    }
+
+    /// 三档宽度只钳水平页边距：1360/900 保留当前密度，640 收到紧凑；垂直边距与行高不动。
+    #[test]
+    fn viewport_clamping_touches_only_horizontal_padding_at_the_three_widths() {
+        for layout in [Metrics::compact(), Metrics::standard(), Metrics::relaxed()] {
+            for width in [1360., 900.] {
+                let scoped = layout.for_viewport(width);
+                assert_eq!(scoped.page_pad, layout.page_pad, "{width}: 宽屏不钳制");
+                assert_eq!(scoped.page_pad_y, layout.page_pad_y);
+                assert_eq!(scoped.row_h, layout.row_h);
+            }
+            let narrow = layout.for_viewport(640.);
+            assert_eq!(narrow.page_pad, Metrics::compact().page_pad, "640 收到紧凑水平边距");
+            assert_eq!(narrow.page_pad_y, layout.page_pad_y, "640 不动垂直边距（反向）");
+            assert_eq!(narrow.row_h, layout.row_h, "640 不改密度（反向）");
+            assert_eq!(narrow.tree_row_h, layout.tree_row_h);
+        }
+        assert_eq!(Metrics::relaxed().page_pad_for(NARROW_PAGE_WIDTH), Metrics::relaxed().page_pad, "760 是边界内");
+        assert_eq!(Metrics::relaxed().page_pad_for(NARROW_PAGE_WIDTH - 1.), Metrics::compact().page_pad, "边界下一像素就钳制");
+        assert_eq!(Metrics::compact().page_pad_for(640.), Metrics::compact().page_pad, "紧凑档钳制后不变");
+    }
+
+    /// 密度全局量：未发布时回落紧凑，发布同值不触发重绘，改档才返回 true。
+    #[gpui_kit::test]
+    fn density_global_defaults_to_compact_and_reports_real_changes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            assert_eq!(Metrics::of(cx), Metrics::compact(), "未发布时回落紧凑（规范 S9）");
+            assert!(Metrics::standard().publish(cx), "第一次发布有变化");
+            assert_eq!(Metrics::of(cx), Metrics::standard());
+            assert!(!Metrics::standard().publish(cx), "同值重复发布不触发重绘");
+            assert!(Metrics::compact().publish(cx), "切回紧凑也是变化");
+            assert_eq!(Metrics::of(cx), Metrics::compact());
+        });
+    }
+
+    /// 主题色板跟随应用主题；深色不是浅色的机械反色。
+    #[gpui_kit::test]
+    fn palette_of_tracks_the_theme_and_dark_is_not_an_inversion(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            apply_theme(false, cx);
+            assert!(!Palette::of(cx).dark, "浅色主题");
+            apply_theme(true, cx);
+            assert!(Palette::of(cx).dark, "深色主题");
+            apply_theme(false, cx);
+            assert!(!Palette::of(cx).dark, "切回浅色");
+        });
+        let (light, dark) = (Palette::light(), Palette::dark());
+        let flip = |color: Hsla| {
+            let mut out = color;
+            out.h = (out.h + 0.5).fract();
+            out.l = 1. - out.l;
+            out
+        };
+        for (name, light_color, dark_color) in [("surface", light.surface, dark.surface), ("text", light.text, dark.text), ("accent", light.accent, dark.accent)] {
+            assert_ne!(light_color, dark_color, "{name}: 两套主题取值不同");
+            assert_ne!(flip(light_color), dark_color, "{name}: 深色是单独调的，不是反色");
+        }
     }
 }
