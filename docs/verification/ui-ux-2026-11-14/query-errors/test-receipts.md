@@ -14,6 +14,9 @@
 | 5 | `cargo test --manifest-path src-tauri/Cargo.toml --locked` | 最终：**901 passed / 0 failed / 7 ignored**（lib 901 + 其余目标全绿）。中途一次运行曾出现 3 个 `app::views::structure::tests` 失败，那是对应文件正被同批次 T9 改写的瞬时状态，本任务未触碰该文件；T9 落地后同一命令转绿 |
 | 6 | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked` | 退出码 0；本任务文件（`query/*`、`app/views/query/*`、`i18n/mod.rs`）无新增 warning（改动前曾出现两条 dead_code，已用 `#[cfg(test)]` 收敛） |
 | 7 | `git diff --exit-code -- src-tauri/Cargo.toml src-tauri/Cargo.lock` | 退出码 0（Cargo 依赖未变） |
+| 8 | `cargo check --manifest-path src-tauri/Cargo.toml --locked --all-targets` | 退出码 0，0 error（在 HEAD `fc513e1` 上复跑） |
+| 9 | `cargo test --manifest-path src-tauri/Cargo.toml --locked --lib -- query::` | ok：153 passed / 0 failed / 1 ignored（在 HEAD `fc513e1` 上复跑） |
+| 10 | `cargo test --manifest-path src-tauri/Cargo.toml --locked --lib` | ok：901 passed / 0 failed / 7 ignored（在 HEAD `fc513e1` 上复跑） |
 
 ## 本任务新增/更新的用例
 
@@ -34,6 +37,13 @@
 - `the_message_page_shows_the_rewrite_once_without_stacking_the_same_error`：消息页一条记录、改写说明与实际语句各一次、长错误只出现一次。
 - `rewritten_error_evidence_holds_at_1360_900_and_640`：三档宽度下的同一场景（见 `widths-1360-900-640.md`）。
 - `a_failed_statement_can_be_jumped_to_and_later_statements_read_as_skipped`（更新）：结果头断言从“包含长错误”改为“只有短状态、原文在语句面板里”。
+
+## 工作区事故与恢复（如实记录）
+
+- 本任务在写 `src-tauri/src/query/tests.rs` 时，有一次整文件写入收到的是非字符串值，导致该文件被写成 `[object Object]`（81476 → 5894 字节），整 crate 测试目标一度编译失败。
+- 恢复方式：`git show HEAD:src-tauri/src/query/tests.rs > src-tauri/src/query/tests.rs` 回到基线，再用精确字符串编辑重新施加本任务的全部用例（新增 6 个执行层/桌面层用例、更新 2 个驱动替身与 1 个结构断言），没有删改任何既有用例。
+- 恢复后字节数：97807（基线 81476 + 本任务新增/更新内容）。此后所有整文件写入只以字符串值进行，改为“先写临时文件再 `cat >>`”或精确 `Edit`。
+- 当前 HEAD 为 `fc513e1`（T2 的连接测试提交）。在该 HEAD 上复跑：`cargo check --all-targets` 退出码 0；`cargo test --lib -- query::` 153 passed / 1 ignored；`cargo test --lib` 901 passed / 0 failed / 7 ignored。
 
 ## ignored 用例
 
