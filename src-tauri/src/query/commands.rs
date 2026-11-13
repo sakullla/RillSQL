@@ -103,6 +103,11 @@ impl QueryState {
     }
 
     #[cfg(test)]
+    pub fn retained_run_count(&self) -> usize {
+        self.runs.lock().expect("runs").len()
+    }
+
+    #[cfg(test)]
     pub fn is_connection_busy(&self, connection_id: &str) -> bool {
         connection_busy(self, connection_id)
     }

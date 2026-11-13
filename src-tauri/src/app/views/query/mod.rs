@@ -242,6 +242,36 @@ fn load_more_plan(results: &[desk::StatementView], page_size: u64) -> Option<(St
     Some((sheet.sql.clone(), (sheet.rows.len() as u64).saturating_add(page_size.max(1))))
 }
 
+/// 最多排队一份快照。视图消失后继续完成已发起的查询，释放服务端副本；
+/// 不重放语句，也不把已经提交的写操作当成取消。终态送达后等接收端处理并关闭。
+async fn forward_run_snapshots(
+    query: &crate::query::QueryState,
+    started: RunDto,
+    snapshots: tokio::sync::mpsc::Sender<Result<RunDto, String>>,
+    polls: &AtomicU32,
+) {
+    let run_id = started.id.clone();
+    let mut pending = desk::run_pending(&started.status);
+    let _ = snapshots.send(Ok(started)).await;
+    while pending {
+        match crate::query::commands::poll_run(query, &run_id, true).await {
+            Ok(snap) => {
+                polls.fetch_add(1, Ordering::Relaxed);
+                pending = desk::run_pending(&snap.status);
+                let _ = snapshots.send(Ok(snap)).await;
+            }
+            Err(error) => {
+                polls.fetch_add(1, Ordering::Relaxed);
+                let _ = snapshots.send(Err(error)).await;
+                break;
+            }
+        }
+    }
+    // 接收端只在处理终态或视图消失后关闭，取消操作因此仍能找到正在交付的运行。
+    snapshots.closed().await;
+    crate::query::commands::release_run(query, &run_id);
+}
+
 /// 加载更多会按"结果来自的目标"重跑同一条 SQL；标签当前目标已经换了（换库、换连接）
 /// 就不能在新目标上续读旧结果，入口隐藏。没有结果来源记录时视为同一目标。
 fn load_more_targets_match(results_target: Option<&desk::Target>, current: Option<&desk::Target>) -> bool {
@@ -1201,7 +1231,7 @@ impl QueryPane {
         let polls = Arc::clone(&self.polls);
         // 一条执行只开一条有序快照通道：中间批次和终态按产生顺序送达界面。
         // 只等终态时，分批读取停在“加载更多”的等待上，界面永远停在“正在执行”且没有行。
-        let (snapshots, mut received) = tokio::sync::mpsc::unbounded_channel::<Result<RunDto, String>>();
+        let (snapshots, mut received) = tokio::sync::mpsc::channel::<Result<RunDto, String>>(1);
         runtime().spawn(async move {
             let started = match crate::query::commands::start_run(
                 &services.connections,
@@ -1220,32 +1250,11 @@ impl QueryPane {
             {
                 Ok(started) => started,
                 Err(error) => {
-                    let _ = snapshots.send(Err(error));
+                    let _ = snapshots.send(Err(error)).await;
                     return;
                 }
             };
-            let run_id = started.id.clone();
-            let mut pending = desk::run_pending(&started.status);
-            if snapshots.send(Ok(started)).is_err() {
-                return;
-            }
-            // 每次带 continue_read 的轮询放行一批行并等到下一批，不忙轮询。
-            while pending {
-                match crate::query::commands::poll_run(&services.query, &run_id, true).await {
-                    Ok(snap) => {
-                        polls.fetch_add(1, Ordering::Relaxed);
-                        pending = desk::run_pending(&snap.status);
-                        if snapshots.send(Ok(snap)).is_err() {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        polls.fetch_add(1, Ordering::Relaxed);
-                        let _ = snapshots.send(Err(error));
-                        return;
-                    }
-                }
-            }
+            forward_run_snapshots(&services.query, started, snapshots, &polls).await;
         });
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
@@ -2715,6 +2724,67 @@ mod tests {
         assert!(load_more_targets_match(None, Some(&target("a", "main"))));
     }
     use gpui_kit::{Point, TestAppContext, WindowBounds, WindowOptions, px, size};
+
+    #[tokio::test]
+    async fn snapshot_stream_is_bounded_and_releases_finished_and_abandoned_runs() {
+        use crate::query::commands::{start_run, StartRequest};
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("rillsql-stream-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("items.sqlite");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&database).create_if_missing(true)).await.unwrap();
+        sqlx::query("CREATE TABLE runs (id INTEGER PRIMARY KEY)").execute(&pool).await.unwrap();
+        let service = Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")));
+        service.open_sqlite_for_test("notes", "Notes", &database).await.unwrap();
+        let query = crate::query::QueryState::from_config_path(&dir.join("connections.sqlite"));
+        for index in 0..6 {
+            let started = start_run(&service, &query, StartRequest {
+                connection_id: "notes".into(), connection_name: "Notes".into(), database: "main".into(), engine: "sqlite".into(),
+                sql: format!("INSERT INTO runs VALUES ({index}); WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<1000) SELECT n FROM seq"),
+                limit: 1000, timeout_ms: None,
+            }).await.unwrap();
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+            let state = query.clone();
+            let polls = Arc::new(AtomicU32::new(0));
+            let count = Arc::clone(&polls);
+            let task = tokio::spawn(async move { forward_run_snapshots(&state, started, sender, &count).await });
+            // 不消费时通道不会积累完整结果集，也不会继续发起下一次读取。
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while receiver.is_empty() { tokio::task::yield_now().await; }
+            }).await.unwrap();
+            assert_eq!(receiver.len(), 1);
+            assert_eq!(receiver.max_capacity(), 1);
+            assert!(polls.load(Ordering::Relaxed) <= 1);
+            if index % 2 == 0 {
+                let mut last_rows = 0;
+                loop {
+                    let run = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await.unwrap().unwrap().unwrap();
+                    let rows = run.statements.last().map(|item| item.rows.len()).unwrap_or(0);
+                    assert!(rows >= last_rows, "快照按产生顺序到达");
+                    last_rows = rows;
+                    if !desk::run_pending(&run.status) {
+                        assert_eq!(run.status, "done");
+                        assert_eq!(last_rows, 1000);
+                        assert_eq!(query.retained_run_count(), 1, "接收端处理终态前仍保留取消定位");
+                        break;
+                    }
+                }
+            }
+            // 奇数轮模拟视图在读取途中消失；已发起的写操作不能重放。
+            drop(receiver);
+            tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+            assert_eq!(query.retained_run_count(), 0, "完成或视图消失后不得保留结果行");
+        }
+        let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs").fetch_one(&pool).await.unwrap();
+        assert_eq!(writes, 6, "每次请求的写语句恰好执行一次");
+        pool.close().await;
+        service.disconnect("notes");
+        drop(query);
+        drop(service);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn open(cx: &mut TestAppContext) -> (gpui_kit::AnyWindowHandle, Entity<QueryPane>) {
         let dir = std::env::temp_dir().join(format!("rillsql-pane-{}", uuid::Uuid::new_v4()));

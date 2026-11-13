@@ -2,7 +2,8 @@
 //! 查找、排序、筛选和提交语句复用 grid 领域；这里只区分已读取窗口、选择和暂存。
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::grid::commands::{ChangeArg, ColumnDto, CommitDto, PageDto, PageRequest, SchemaDto, SortArg, TableRef, ValueArg};
 use crate::grid::{delete_sql, insert_sql, locate_sheet, qualified_name, quote_ident, sql_cell, update_sql, value_family, Cell, Column, Engine, TableSchema, ValueFamily};
@@ -63,13 +64,6 @@ enum FullState {
     Loading,
     Ready(Option<String>),
     Failed(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FullEntry {
-    row_id: String,
-    column_name: String,
-    state: FullState,
 }
 
 /// 一格值能不能直接当原值用。需要完整值时先读一次，读不到就明确拒绝。
@@ -371,8 +365,9 @@ pub struct SharedGrid {
     pub target: GridTarget,
     pub locale: Locale,
     columns: Vec<GridColumn>,
-    source: Vec<GridRow>,
-    rows: Vec<GridRow>,
+    // 来源与排序/筛选视图共享行；只有修改已读原值时才写时复制。
+    source: Vec<Arc<GridRow>>,
+    rows: Vec<Arc<GridRow>>,
     schema: Option<TableSchema>,
     search: String,
     find_scope: FindScope,
@@ -402,12 +397,12 @@ pub struct SharedGrid {
     /// 完整值查看同样记住行 id + 列名，滚动、重排或改变列顺序后仍指向原来那一格。
     viewer: Option<ViewerState>,
     /// 按 (行 id, 列名) 缓存的完整原值：查看、复制、编辑、导出和 WHERE 共用同一次读取。
-    full: Vec<FullEntry>,
+    full: HashMap<String, HashMap<String, FullState>>,
     /// 当前表的真实外键；只有读到结构时才可能有内容。
     keys: Vec<ForeignKeyInfo>,
     overlays: Vec<Overlay>,
     /// 已经离开当前读取窗口、但仍被暂存引用的行；翻页后预览和提交仍用它们。
-    retained: Vec<GridRow>,
+    retained: Vec<Arc<GridRow>>,
     /// 没有对应暂存的失败（例如提交报告给出未知 id）单独记账，不伪造格子。
     failures: Vec<(String, String)>,
     preview_sql: Vec<String>,
@@ -474,7 +469,7 @@ impl SharedGrid {
             focus_id: String::new(),
             selected: false,
             viewer: None,
-            full: Vec::new(),
+            full: HashMap::new(),
             keys: Vec::new(),
             overlays: Vec::new(),
             retained: Vec::new(),
@@ -500,7 +495,7 @@ impl SharedGrid {
     pub fn load_local(&mut self, columns: Vec<GridColumn>, rows: Vec<GridRow>, full_count: Option<i64>, schema: Option<TableSchema>) {
         self.mode = GridMode::Table;
         self.columns = merge_widths(&self.columns, columns);
-        self.source = rows;
+        self.source = rows.into_iter().map(Arc::new).collect();
         self.schema = schema;
         self.full_count = full_count;
         self.truncated = full_count.is_some_and(|count| count > self.source.len() as i64);
@@ -528,7 +523,7 @@ impl SharedGrid {
     pub fn replace_fetched(&mut self, columns: Vec<GridColumn>, rows: Vec<GridRow>, offset: u64, full_count: Option<i64>, truncated: bool, schema: Option<TableSchema>) {
         self.retain_staged_rows();
         self.columns = merge_widths(&self.columns, columns);
-        self.source = rows;
+        self.source = rows.into_iter().map(Arc::new).collect();
         self.schema = schema;
         self.offset = offset;
         self.full_count = full_count;
@@ -571,13 +566,13 @@ impl SharedGrid {
         self.source = rows
             .into_iter()
             .enumerate()
-            .map(|(index, values)| GridRow {
+            .map(|(index, values)| Arc::new(GridRow {
                 id: format!("q{index}"),
                 values,
                 located: false,
                 locator: Vec::new(),
                 inserted: false,
-            })
+            }))
             .collect();
         self.full_count = full_count;
         self.truncated = truncated;
@@ -628,7 +623,9 @@ impl SharedGrid {
         let located = locate_sheet(&schema, &names, &values);
         if !values.is_empty() && located.iter().all(|row| !row.located) {
             self.readonly_reason = "grid.status.unlocated".to_owned();
+            self.rows.clear();
             for (row, item) in self.source.iter_mut().zip(located) {
+                let row = Arc::make_mut(row);
                 row.located = item.located;
                 row.locator = item.locator;
             }
@@ -653,7 +650,9 @@ impl SharedGrid {
             }
             column.editable = editable.iter().any(|item| item == name);
         }
+        self.rows.clear();
         for (row, item) in self.source.iter_mut().zip(located) {
+            let row = Arc::make_mut(row);
             row.located = item.located;
             row.locator = item.locator;
         }
@@ -1568,12 +1567,8 @@ impl SharedGrid {
         shown
     }
 
-    fn full_index(&self, row_id: &str, column_name: &str) -> Option<usize> {
-        self.full.iter().position(|item| item.row_id == row_id && item.column_name == column_name)
-    }
-
     fn full_state(&self, row_id: &str, column_name: &str) -> Option<&FullState> {
-        self.full_index(row_id, column_name).and_then(|index| self.full.get(index)).map(|item| &item.state)
+        self.full.get(row_id)?.get(column_name)
     }
 
     /// 这一格的定位列（唯一键整组）；未定位的行或没有唯一键的表给不出定位。
@@ -1694,10 +1689,7 @@ impl SharedGrid {
             target: self.target.clone(),
             token: self.sheet_serial,
         };
-        match self.full_index(row_id, &column_name) {
-            Some(index) => self.full[index].state = FullState::Loading,
-            None => self.full.push(FullEntry { row_id: row_id.to_owned(), column_name: column_name.clone(), state: FullState::Loading }),
-        }
+        self.full.entry(row_id.to_owned()).or_default().insert(column_name.clone(), FullState::Loading);
         if let Some(state) = self.viewer.as_mut().filter(|state| state.row_id == row_id && state.column_name == column_name) {
             state.phase = CellPhase::Loading;
             state.message.clear();
@@ -1742,10 +1734,7 @@ impl SharedGrid {
     }
 
     fn store_full(&mut self, row_id: &str, column_name: &str, state: FullState, phase: CellPhase, message: String) {
-        match self.full_index(row_id, column_name) {
-            Some(index) => self.full[index].state = state,
-            None => self.full.push(FullEntry { row_id: row_id.to_owned(), column_name: column_name.to_owned(), state }),
-        }
+        self.full.entry(row_id.to_owned()).or_default().insert(column_name.to_owned(), state);
         if let Some(viewer) = self.viewer.as_mut().filter(|viewer| viewer.row_id == row_id && viewer.column_name == column_name) {
             viewer.phase = phase;
             viewer.message = message;
@@ -1891,10 +1880,13 @@ impl SharedGrid {
 
     /// 缓存只保留当前快照里还有的行；翻页和重新读取后不会留下过期原值。
     fn prune_full(&mut self) {
-        let ids: Vec<String> = self.rows.iter().chain(self.source.iter()).chain(self.retained.iter()).map(|row| row.id.clone()).collect();
-        self.full.retain(|item| ids.iter().any(|id| id == &item.row_id));
+        if self.full.is_empty() && self.viewer.is_none() {
+            return;
+        }
+        let ids: HashSet<&str> = self.rows.iter().chain(self.source.iter()).chain(self.retained.iter()).map(|row| row.id.as_str()).collect();
+        self.full.retain(|row_id, _| ids.contains(row_id.as_str()));
         if let Some(viewer) = &self.viewer {
-            if !ids.iter().any(|id| id == &viewer.row_id) {
+            if !ids.contains(viewer.row_id.as_str()) {
                 self.viewer = None;
             }
         }
@@ -2042,21 +2034,21 @@ impl SharedGrid {
         let Some(column_name) = self.columns.get(column).map(|item| item.name.clone()) else {
             return Gate::Readonly;
         };
-        let Some(row) = self.any_row(row_id).cloned() else {
+        let Some(inserted) = self.any_row(row_id).map(|row| row.inserted) else {
             return Gate::Readonly;
         };
         let draw_row = display.unwrap_or(usize::MAX);
-        if row.inserted {
+        if inserted {
             let message = self.validation_message(column, value.as_deref());
             let gate = if message.is_some() { Gate::Validation } else { Gate::Writable };
             self.overlays.retain(|item| !(item.kind == "update" && item.row_id == row_id && item.column_name == column_name));
             if gate == Gate::Writable {
                 if let Some(origin) = self.source.iter_mut().find(|item| item.id == row_id) {
-                    if let Some(slot) = origin.values.get_mut(column) {
+                    if let Some(slot) = Arc::make_mut(origin).values.get_mut(column) {
                         *slot = value.clone();
                     }
                 }
-                if let Some(slot) = display.and_then(|row| self.rows.get_mut(row)).and_then(|item| item.values.get_mut(column)) {
+                if let Some(slot) = display.and_then(|row| self.rows.get_mut(row)).and_then(|item| Arc::make_mut(item).values.get_mut(column)) {
                     *slot = value;
                 }
             } else {
@@ -2126,7 +2118,7 @@ impl SharedGrid {
         let id = format!("i:{}", self.seq + 1);
         self.seq += 1;
         let values = vec![None; self.columns.len()];
-        self.source.push(GridRow { id: id.clone(), values, located: false, locator: Vec::new(), inserted: true });
+        self.source.push(Arc::new(GridRow { id: id.clone(), values, located: false, locator: Vec::new(), inserted: true }));
         self.recompute();
         // 新增行在筛选/查找下可能不在显示快照里，身份必须始终用新行自己的 id，
         // 不能退化成最后一行，否则预览会把别人的行当成新增内容。
@@ -2438,11 +2430,12 @@ impl SharedGrid {
             return 0;
         }
         let mut added = 0;
+        let mut ids: HashSet<String> = self.source.iter().map(|row| row.id.clone()).collect();
         for row in rows {
-            if self.source.iter().any(|item| item.id == row.id) {
+            if !ids.insert(row.id.clone()) {
                 continue;
             }
-            self.source.push(row);
+            self.source.push(Arc::new(row));
             added += 1;
         }
         if full_count.is_some() {
@@ -2666,6 +2659,10 @@ impl SharedGrid {
     }
 
     fn any_row(&self, row_id: &str) -> Option<&GridRow> {
+        self.shared_row(row_id).map(Arc::as_ref)
+    }
+
+    fn shared_row(&self, row_id: &str) -> Option<&Arc<GridRow>> {
         self.rows
             .iter()
             .find(|row| row.id == row_id)
@@ -2684,8 +2681,8 @@ impl SharedGrid {
             if overlay.change_id.is_none() {
                 continue;
             }
-            if let Some(row) = self.any_row(&overlay.row_id) {
-                if !keep.iter().any(|item: &GridRow| item.id == row.id) {
+            if let Some(row) = self.shared_row(&overlay.row_id) {
+                if !keep.iter().any(|item: &Arc<GridRow>| item.id == row.id) {
                     keep.push(row.clone());
                 }
             }
@@ -2703,6 +2700,7 @@ impl SharedGrid {
             return;
         };
         for row in self.source.iter_mut().chain(self.rows.iter_mut()).chain(self.retained.iter_mut()).filter(|row| row.id == row_id) {
+            let row = Arc::make_mut(row);
             if let Some(slot) = row.values.get_mut(column) {
                 *slot = value.clone();
             }
@@ -2737,7 +2735,7 @@ impl SharedGrid {
             let indices: Vec<Option<usize>> = drafts.iter().map(|draft| self.columns.iter().position(|item| item.name == draft.column)).collect();
             rows.retain(|row| {
                 drafts.iter().zip(indices.iter()).all(|(draft, index)| match index {
-                    Some(index) => draft_matches(row.values.get(*index).cloned().unwrap_or(None), self.columns.get(*index), draft),
+                    Some(index) => draft_matches(row.values.get(*index).and_then(|value| value.as_deref()), self.columns.get(*index), draft),
                     None => false,
                 })
             });
@@ -2746,7 +2744,7 @@ impl SharedGrid {
             if let Some(index) = self.columns.iter().position(|item| item.name == *column) {
                 let numeric = self.columns.get(index).is_some_and(|item| matches!(value_family(&item.type_name), ValueFamily::Integer | ValueFamily::Decimal | ValueFamily::Float));
                 rows.sort_by(|left, right| {
-                    let order = compare_cell(left.values.get(index).cloned().unwrap_or(None).as_deref(), right.values.get(index).cloned().unwrap_or(None).as_deref(), numeric);
+                    let order = compare_cell(left.values.get(index).and_then(|value| value.as_deref()), right.values.get(index).and_then(|value| value.as_deref()), numeric);
                     if *descending { order.reverse() } else { order }
                 });
             }
@@ -3317,7 +3315,7 @@ impl SharedGrid {
         }
         self.seq += 1;
         let id = format!("i:{}", self.seq);
-        self.source.push(GridRow { id: id.clone(), values, located: false, locator: Vec::new(), inserted: true });
+        self.source.push(Arc::new(GridRow { id: id.clone(), values, located: false, locator: Vec::new(), inserted: true }));
         self.cloned.push(id.clone());
         self.recompute();
         let row = self.rows.iter().position(|item| item.id == id).unwrap_or(self.rows.len());
@@ -3885,19 +3883,19 @@ fn editable_names(schema: &TableSchema, columns: &[String], proof: &TableProof) 
 }
 
 /// 本地在已读取行上复算同一条条件；NULL 不参与相等、范围和集合的命中，与 SQL 语义一致。
-fn draft_matches(value: Option<String>, column: Option<&GridColumn>, draft: &FilterDraft) -> bool {
+fn draft_matches(value: Option<&str>, column: Option<&GridColumn>, draft: &FilterDraft) -> bool {
     let numeric = column.is_some_and(|item| matches!(value_family(&item.type_name), ValueFamily::Integer | ValueFamily::Decimal | ValueFamily::Float));
     match draft.op.as_str() {
         "null" => value.is_none(),
         "notnull" => value.is_some(),
-        "empty" => value.as_deref() == Some(""),
-        "contains" => value.as_deref().is_some_and(|text| text.to_lowercase().contains(&draft.value.to_lowercase())),
-        "starts" => value.as_deref().is_some_and(|text| text.to_lowercase().starts_with(&draft.value.to_lowercase())),
-        "eq" => value.as_deref() == Some(draft.value.as_str()),
+        "empty" => value == Some(""),
+        "contains" => value.is_some_and(|text| text.to_lowercase().contains(&draft.value.to_lowercase())),
+        "starts" => value.is_some_and(|text| text.to_lowercase().starts_with(&draft.value.to_lowercase())),
+        "eq" => value == Some(draft.value.as_str()),
         // SQL 里 NULL <> 值 不成立，因此 NULL 不算命中"不等于"。
-        "ne" => value.is_some() && value.as_deref() != Some(draft.value.as_str()),
+        "ne" => value.is_some() && value != Some(draft.value.as_str()),
         "gt" | "lt" => {
-            let Some(text) = value.as_deref() else {
+            let Some(text) = value else {
                 return false;
             };
             let order = compare_cell(Some(text), Some(draft.value.as_str()), numeric);
@@ -3908,13 +3906,13 @@ fn draft_matches(value: Option<String>, column: Option<&GridColumn>, draft: &Fil
             }
         }
         "between" => {
-            let Some(text) = value.as_deref() else {
+            let Some(text) = value else {
                 return false;
             };
             compare_cell(Some(text), Some(draft.value.as_str()), numeric).is_ge()
                 && compare_cell(Some(text), Some(draft.second.as_str()), numeric).is_le()
         }
-        "in" => match value.as_deref() {
+        "in" => match value {
             Some(text) => SharedGrid::filter_values(draft).iter().any(|item| item == text),
             None => false,
         },
@@ -4151,6 +4149,80 @@ mod tests {
     }
 
     #[test]
+    fn views_share_rows_across_sort_filter_and_retention_and_writes_are_isolated() {
+        let mut grid = SharedGrid::new();
+        grid.load_local(vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some("alpha")], true), row("2", vec![Some("2"), Some("beta")], true)], Some(2), Some(schema()));
+        assert!(Arc::ptr_eq(&grid.source[0], &grid.rows[0]));
+        let original = Arc::clone(&grid.source[0]);
+        grid.sort = Some(("name".into(), true));
+        grid.recompute();
+        assert_eq!(grid.rows[0].id, "2");
+        assert!(Arc::ptr_eq(&grid.source[1], &grid.rows[0]));
+        grid.set_search("alpha");
+        assert_eq!(grid.rows.len(), 1);
+        assert!(Arc::ptr_eq(&original, &grid.rows[0]));
+        assert_eq!(grid.stage_text_by_id("1", 1, Some("staged".into())), Gate::Writable);
+        grid.retain_staged_rows();
+        assert!(Arc::ptr_eq(&original, &grid.retained[0]));
+        grid.set_row_value("1", "name", Some("committed".into()));
+        assert_eq!(original.values[1].as_deref(), Some("alpha"), "共享的旧快照不被写回修改");
+        assert_eq!(grid.retained[0].values[1].as_deref(), Some("committed"));
+        grid.set_search("");
+        for view in &grid.rows {
+            let source = grid.source.iter().find(|row| row.id == view.id).unwrap();
+            assert!(Arc::ptr_eq(source, view));
+        }
+    }
+
+    #[test]
+    fn indexed_full_cache_keeps_columns_independent_and_prunes_absent_rows() {
+        let mut grid = SharedGrid::new();
+        grid.load_local(vec![text_column("id"), text_column("name")],
+            vec![row("1", vec![Some("1"), Some("alpha")], true), row("2", vec![Some("2"), Some("beta")], true)], Some(2), Some(schema()));
+        grid.store_full("1", "id", FullState::Ready(None), CellPhase::Full, String::new());
+        grid.store_full("1", "name", FullState::Ready(Some("full".into())), CellPhase::Full, String::new());
+        grid.store_full("2", "name", FullState::Failed("retry".into()), CellPhase::Error, "retry".into());
+        grid.set_search("alpha");
+        assert_eq!(grid.full_state("1", "id"), Some(&FullState::Ready(None)));
+        assert_eq!(grid.full_text_of("1", 1), Some(Some("full".into())));
+        assert_eq!(grid.full_state("2", "name"), Some(&FullState::Failed("retry".into())), "隐藏来源行仍保留缓存");
+        grid.source.retain(|row| row.id != "2");
+        grid.recompute();
+        assert!(!grid.full.contains_key("2"));
+        grid.drop_stale_sheet();
+        assert!(grid.full.is_empty());
+    }
+
+    #[test]
+    #[ignore = "manual shared row allocation benchmark"]
+    fn benchmark_grid_shared_rows() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let mut grid = SharedGrid::new();
+        let columns = (0..8).map(|i| text_column(&format!("c{i}"))).collect();
+        let rows = (0..10_000).map(|i| GridRow {
+            id: i.to_string(), values: (0..8).map(|_| Some("x".repeat(128))).collect(),
+            located: false, locator: Vec::new(), inserted: false,
+        }).collect();
+        grid.load_local(columns, rows, Some(10_000), None);
+        let payload: usize = grid.source.iter().flat_map(|r| &r.values).flatten().map(String::len).sum();
+        for trial in 1..=3 {
+            let start = Instant::now();
+            let legacy: Vec<GridRow> = grid.source.iter().map(|r| r.as_ref().clone()).collect();
+            black_box(&legacy);
+            let clone_us = start.elapsed().as_micros();
+            let start = Instant::now();
+            grid.recompute();
+            black_box(&grid.rows);
+            let shared_us = start.elapsed().as_micros();
+            assert!(legacy.iter().zip(&grid.rows).all(|(left, right)| left == right.as_ref()));
+            assert!(grid.rows.iter().zip(&grid.source).all(|(left, right)| Arc::ptr_eq(left, right)));
+            eprintln!("shared-rows trial={trial} rows=10000 columns=8 bytes_per_cell=128 legacy_clone_us={clone_us} shared_recompute_us={shared_us} avoided_view_cell_bytes={payload}");
+        }
+    }
+
+    #[test]
     fn window_selection_and_tsv_do_not_use_the_full_count() {
         let mut grid = SharedGrid::new();
         let rows = (0..100).map(|index| row(&index.to_string(), vec![Some(&index.to_string()), Some("甲")], true)).collect();
@@ -4199,7 +4271,7 @@ mod tests {
         assert_eq!(grid.stage_insert(), Gate::Writable);
         assert!(grid.rows.iter().any(|item| item.inserted), "新增行");
         for item in grid.source.iter_mut().filter(|item| item.inserted) {
-            item.values[1] = Some(envelope.clone());
+            Arc::make_mut(item).values[1] = Some(envelope.clone());
         }
         grid.recompute();
         assert_eq!(grid.unresolved_previews(), 1, "只算真正会被导出的那一格");
