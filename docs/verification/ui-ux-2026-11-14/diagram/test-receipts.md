@@ -27,6 +27,28 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked --lib app::views::diagr
 
 三个宽度用例各自在浅·紧凑、浅·标准、深·紧凑、深·标准 四组主题/密度下重跑同一份断言。
 
+### 运行时间与“挂住”事故（2026-11-14 04:xx 追加）
+
+早前一版把这些断言写成一个用例 `four_states_and_keyboard_hold_at_three_widths_and_both_themes`：在**同一个测试里循环开 3 个窗口**，再用 `Window::resize` 改运行期尺寸。该版本在一个测试进程里跑 28 分钟不退出（CPU 持续 200%），把别人的 crate 级 `cargo test` 一起堵住。
+
+已修复（源码里已经不存在的用例名就是证据：`grep -c four_states_and_keyboard_hold_at_three_widths_and_both_themes` → `0`）：
+
+| 措施 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 窗口数量 | 一个用例里 3 个窗口 | 每个宽度一个用例、**每个用例只开 1 个窗口** |
+| 视口尺寸来源 | `Window::resize`（实测不改视口） | 开窗时给 `WindowBounds::Windowed`，全程不改尺寸；源码里已无 `resize(` 调用 |
+| 键盘驱动等待 | 最多 40 次 Tab+Enter | 最多 12 次（页头 6 个停靠点 + 2 张卡片），并额外加 15 秒墙钟上限，卡住只会失败不会挂起 |
+
+根因说明：能确认的事实是①挂住的进程跑的是旧用例名，而该名字已不在源码里（改动后被替换）；②旧写法在同一个用例内循环开 3 个窗口、并用 `Window::resize` 改运行期尺寸，而 `resize` 实测并不改视口（也就是说它只触发了重新布局却没有得到新视口）；③新写法每个用例只开一个窗口、不调用 `resize`、所有等待都有次数上限 + 墙钟上限，重复跑都正常退出。旧写法里究竟卡在开第 2 个窗口还是卡在 `resize` 的重新布局循环，没有拿到栈，不当作已验证根因——但两条路径现在都已不在用例里。
+
+修复后的实测（本机，同一仓库）：
+
+| 命令 | 耗时 | 结果 |
+| --- | --- | --- |
+| `cargo test --locked --lib app::views::diagram`（并行，连跑 5 次） | 每次 wall 0.96–1.03 s，用例内 0.48–0.53 s | 5/5 全绿，10 passed |
+| 同上 `-- --test-threads=1`（连跑 3 次） | 用例内 1.59–3.25 s | 3/3 全绿 |
+| `cargo test --locked --lib`（全量） | wall 41.65 s / user 104.40 s | 931 passed / 0 failed / 7 ignored，EXIT=0 |
+
 ## 2. 名字里带 diagram 的全部用例（含其它模块）
 
 命令：
@@ -68,6 +90,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked
 
 - 第一次全量（T3 的 `conn_modal`/chrome 改动尚未自洽时）：926 passed / 4 failed，失败全部在 `app::shell::conn_modal::tests::tab_order_stays_inside_the_modal_and_wraps`、`app::shell::tests::density_theme_and_language_reach_the_rendered_chrome`、`app::shell::tests::long_copy_is_truncated_but_fully_available_and_never_holds_neighbours`、`app::shell::tests::sidebar_copy_and_test_remain_usable_while_catalog_is_loading`——均属 T3 范围，与关系图无关。
 - 第二次全量（T3 修好后）：930 passed / 0 failed / 7 ignored（`TEST_EXIT=0`）。
+- 第三次全量（修复窗口用例 + 邻接任务再提交后）：931 passed / 0 failed / 7 ignored，wall 41.65 s，EXIT=0。
 - Clippy（`--all-targets`）：退出码 0。与关系图相关的两条 warning 都是本轮之前就存在的（`src/diagram/mod.rs` 的 `DiagramColumn` re-export、`app/views/diagram/mod.rs` 测试模块里的 `AppContext` 导入），本轮新增代码没有引入 warning。
 
 ## 6. 基线与归属说明

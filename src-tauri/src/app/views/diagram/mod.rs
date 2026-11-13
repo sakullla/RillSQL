@@ -1049,8 +1049,14 @@ mod tests {
             assert!(cx.update(|cx| pane.read(cx).search.is_empty()), "{tag}：清除搜索后恢复现场");
 
             // 纯键盘：Tab 停在卡片上按 Enter，走与双击相同的“打开表数据”请求。
+            // 页头最多 6 个停靠点 + 2 张卡片，12 次足够；循环还有 15 秒墙钟上限，
+            // 任何一次 frame/按键卡住都不会把这个用例拖成“挂住”，只会让它失败。
             let mut opened = false;
-            for _ in 0..40 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            for _ in 0..12 {
+                if std::time::Instant::now() > deadline {
+                    break;
+                }
                 cx.update_window(window, |_, window, cx| {
                     window.focus_next(cx);
                     window.render_frame(cx);
