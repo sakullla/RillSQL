@@ -7,7 +7,8 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, ClipboardItem, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    AnyElement, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px,
 };
 
@@ -24,6 +25,8 @@ const PAGE_LIMIT: u64 = 20;
 const DOC_COL_MIN: f32 = 120.;
 /// 行尾查看/复制/编辑/删除四个图标列的宽度。
 const DOC_ACTIONS_W: f32 = 124.;
+/// 表格视图最多显示的列数；其余字段仍能在整篇文档与 JSON 树里看到。
+const DOC_COL_MAX: usize = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Field {
@@ -34,6 +37,18 @@ enum Field {
 enum EditorMode {
     Insert,
     Replace,
+}
+
+/// 文档区六态：没目标、读取中、读取失败、空集合、筛选无命中、有行。
+/// 空集合（无数据）与筛选无命中（用户操作后无结果）是两种语义，错误也不再伪装成"没有文档"。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocsState {
+    NeedTarget,
+    Loading,
+    Error,
+    EmptyCollection,
+    NoMatch,
+    Rows,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +108,10 @@ pub struct MongoPane {
     viewer_sub: Option<Subscription>,
     viewer_editable: bool,
     viewport_w: f32,
+    /// 文档表格整体只占一个 Tab 停靠点：方向键在格子间移动，Enter 打开当前格。
+    cell_focus: Option<FocusHandle>,
+    /// 键盘光标所在单元格（行、列下标），鼠标点格子也会同步到这里。
+    focused_cell: Option<(usize, usize)>,
 }
 
 impl MongoPane {
@@ -140,6 +159,8 @@ impl MongoPane {
             viewer_sub: None,
             viewer_editable: false,
             viewport_w: 1200.,
+            cell_focus: None,
+            focused_cell: None,
         }
     }
 
@@ -228,6 +249,27 @@ impl MongoPane {
         &self.view_json
     }
 
+    pub fn view_open(&self) -> bool {
+        self.view_open
+    }
+
+    #[cfg(test)]
+    pub fn focused_cell(&self) -> Option<(usize, usize)> {
+        self.focused_cell
+    }
+
+    #[cfg(test)]
+    pub fn docs_state_name(&self) -> &'static str {
+        match self.docs_state() {
+            DocsState::NeedTarget => "need-target",
+            DocsState::Loading => "loading",
+            DocsState::Error => "error",
+            DocsState::EmptyCollection => "empty",
+            DocsState::NoMatch => "no-match",
+            DocsState::Rows => "rows",
+        }
+    }
+
     pub fn confirm_open(&self) -> bool {
         self.confirm_id.is_some() || self.confirm_write.is_some()
     }
@@ -306,10 +348,75 @@ impl MongoPane {
         self.viewer = None;
         self.viewer_sub = None;
         self.viewer_editable = false;
+        self.focused_cell = None;
     }
 
     fn nav_collapsed(&self, width: f32) -> bool {
         self.nav_choice.unwrap_or(width < kit::NARROW_PAGE_WIDTH)
+    }
+
+    /// 文档区六态：先分清"没目标 / 读取中 / 读取失败 / 空集合 / 筛选无命中 / 有行"，
+    /// 再决定画哪一种；错误不再和"这个集合没有文档"共用同一块。
+    fn docs_state(&self) -> DocsState {
+        if self.connection_id.is_empty() || self.database.is_empty() || self.collection.is_empty() {
+            return DocsState::NeedTarget;
+        }
+        if self.busy && self.documents.is_empty() {
+            return DocsState::Loading;
+        }
+        if !self.error.is_empty() && self.documents.is_empty() {
+            return DocsState::Error;
+        }
+        if self.documents.is_empty() {
+            return if self.applied_filter.trim().is_empty() { DocsState::EmptyCollection } else { DocsState::NoMatch };
+        }
+        DocsState::Rows
+    }
+
+    /// 表格视图显示的列：最多 DOC_COL_MAX 列。
+    fn shown_columns(&self) -> Vec<String> {
+        self.columns.iter().take(DOC_COL_MAX).cloned().collect()
+    }
+
+    /// 重试跟随当前目标层级：还没选到集合时重读集合清单，否则重读当前页。
+    fn docs_retry_command(&self) -> &'static str {
+        if self.database.is_empty() || self.collection.is_empty() { "mongo-refresh-db" } else { "mongo-refresh" }
+    }
+
+    /// 文档表格的键盘等价操作：方向键移动光标格，Home/End 到首末列，Enter/空格打开当前格，
+    /// Esc 只收起只读查看（编辑中的草稿不能因为一次 Esc 丢掉）。返回是否吃掉了这次按键。
+    fn cell_key(&mut self, key: &str, _cx: &mut Context<Self>) -> bool {
+        if self.documents.is_empty() {
+            return false;
+        }
+        let rows = self.documents.len();
+        let columns = self.shown_columns().len().max(1);
+        let (row, column) = self.focused_cell.unwrap_or((0, 0));
+        let row = row.min(rows - 1);
+        let column = column.min(columns - 1);
+        match key {
+            "up" => self.focused_cell = Some((row.saturating_sub(1), column)),
+            "down" => self.focused_cell = Some(((row + 1).min(rows - 1), column)),
+            "left" => self.focused_cell = Some((row, column.saturating_sub(1))),
+            "right" => self.focused_cell = Some((row, (column + 1).min(columns - 1))),
+            "home" => self.focused_cell = Some((row, 0)),
+            "end" => self.focused_cell = Some((row, columns - 1)),
+            "enter" | "space" => {
+                let Some(column) = self.shown_columns().get(column).cloned() else { return false };
+                self.open_cell(&row.to_string(), &column);
+            }
+            "escape" => {
+                if !self.view_open && !self.editor_open {
+                    self.focused_cell = None;
+                } else if self.view_open && !self.editor_open {
+                    self.view_open = false;
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        true
     }
 
     pub fn open_spec(&mut self, spec: &str, cx: &mut Context<Self>) {
@@ -911,7 +1018,7 @@ impl Render for MongoPane {
         );
 
         // ---- 左栏：库与集合
-        let mut nav = div().id("mongo-nav").flex().flex_col().gap(px(1.)).flex_1().min_h(px(0.)).overflow_y_scroll().p(px(6.));
+        let mut nav = div().id("mongo-nav-list").flex().flex_col().gap(px(1.)).flex_1().min_h(px(0.)).overflow_y_scroll().p(px(6.));
         nav = nav.child(div().px(px(8.)).pt(px(6.)).pb(px(4.)).child(kit::eyebrow(SharedString::from(self.text("mongo.tab.databases")), &p)));
         for (index, database) in self.databases.iter().take(60).enumerate() {
             let selected = database.name == self.database;
@@ -948,9 +1055,14 @@ impl Render for MongoPane {
             ));
         }
         let nav_w = m.header_h() * 4. + m.pane_pad();
-        let left = div()
+        // 窄窗口里左栏是覆盖内容区的抽屉：展开时不挤压文档表，页面本身也不会被撑出横向滚动。
+        let overlay_nav = !collapsed && self.viewport_w < kit::NARROW_PAGE_WIDTH;
+        let panel_w = if overlay_nav { nav_w.min((self.viewport_w - 32.).max(160.)) } else { nav_w };
+        let nav_column = div()
+            .id("mongo-nav")
+            .test_support()
             .flex_none()
-            .w(px(if collapsed { 0. } else { nav_w }))
+            .w(px(if collapsed { 0. } else { panel_w }))
             .overflow_hidden()
             .h_full()
             .flex()
@@ -958,6 +1070,7 @@ impl Render for MongoPane {
             .bg(p.chrome)
             .border_r_1()
             .border_color(p.line)
+            .when(overlay_nav, |this| this.absolute().top_0().left_0().bottom_0().shadow_lg())
             .child(
                 div()
                     .h(px(m.toolbar_h() + 2.))
@@ -989,20 +1102,42 @@ impl Render for MongoPane {
             .gap(px(6.))
             .border_b_1()
             .border_color(p.line)
-            .child(mongo_icon("mongo-nav-toggle", IconName::PanelLeft, &self.text("mongo.nav.collapse"), &entity))
+            .child(mongo_icon(
+                "mongo-nav-toggle",
+                IconName::PanelLeft,
+                &self.text(if collapsed { "mongo.nav.expand" } else { "mongo.nav.collapse" }),
+                &entity,
+            ))
             .child(mongo_button("mongo-view-table", None, &self.text("mongo.view.table"), Kind::Tool, &entity))
             .child(mongo_button("mongo-view-tree", None, &self.text("mongo.view.tree"), Kind::Tool, &entity))
             .child(
+                // 面包屑自身允许换行与截断：长库名在 640 宽度下也不会把工具条撑出页面。
                 div()
+                    .id("mongo-crumb")
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(4.))
+                    .min_w(px(0.))
+                    .max_w_full()
                     .text_size(px(TypeScale::MD))
                     .child(mongo_button("mongo-crumb-db", None, &self.text("mongo.nav.breadcrumb"), Kind::Tool, &entity))
-                    .child(div().text_color(p.text_muted).child(SharedString::from(if self.database.is_empty() { self.text("mongo.tab.databases") } else { self.database.clone() })))
+                    .child(
+                        div().max_w(px(220.)).truncate().text_color(p.text_muted).child(SharedString::from(if self.database.is_empty() {
+                            self.text("mongo.tab.databases")
+                        } else {
+                            self.database.clone()
+                        })),
+                    )
                     .child(kit::icon(IconName::ChevronRight, 12., p.text_faint))
                     .child(mongo_button("mongo-crumb-coll", None, &self.text("mongo.tab.collections"), Kind::Tool, &entity))
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child(SharedString::from(self.collection.clone()))),
+                    .child(
+                        div()
+                            .max_w(px(220.))
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(SharedString::from(self.collection.clone())),
+                    ),
             )
             .child(div().w(px(8.)))
             .child(div().flex_1().min_w(px(200.)).child(kit::text_input("mongo-filter-field", &filter, self.text("mongo.tab.filterLabel")).small().prefix(kit::icon(IconName::Funnel, 13., p.text_faint))))
@@ -1015,83 +1150,11 @@ impl Render for MongoPane {
             .child(mongo_icon("mongo-next", IconName::ChevronRight, &self.text("mongo.tab.nextPage"), &entity))
             .child(mongo_button("mongo-insert", Some(IconName::Plus), &self.text("mongo.tab.insert"), Kind::Primary, &entity));
 
-        // ---- 文档表
-        let shown: Vec<String> = self.columns.iter().take(7).cloned().collect();
-        // 窄窗口下每列至少 120：不够宽就横向滚动，不把七列压成全是省略号。
-        let row_min_w = shown.len() as f32 * DOC_COL_MIN + DOC_ACTIONS_W + m.pane_pad();
-        let mut table = div().id("mongo-docs").flex().flex_col().flex_1().min_h(px(0.)).overflow_y_scroll().overflow_x_scroll();
-        if !self.filter_error.is_empty() {
-            table = table.child(div().mx(px(10.)).mt(px(10.)).px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.danger_soft).text_color(p.danger).text_size(px(TypeScale::SM)).child(SharedString::from(self.filter_error.clone())));
-        }
-        if self.documents.is_empty() {
-            let empty = if self.applied_filter.is_empty() { self.text("mongo.tab.emptyCollection") } else { self.text("mongo.tab.emptyFiltered") };
-            let detail = if self.collection.is_empty() { self.text("mongo.tab.needCollection") } else { String::new() };
-            table = table.child(div().flex_1().flex().items_center().justify_center().child(kit::empty_state(IconName::Braces, SharedString::from(empty), SharedString::from(detail), &p)));
-        } else {
-            let mut head = div().flex().min_w(px(row_min_w)).h(px(m.bar_h() - 2.)).px(px(10.)).items_center().bg(p.chrome).border_b_1().border_color(p.line).text_size(px(TypeScale::XS)).text_color(p.text_faint);
-            for name in &shown {
-                head = head.child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).truncate().pr(px(8.)).child(SharedString::from(name.clone())));
-            }
-            head = head.child(div().flex_none().w(px(DOC_ACTIONS_W)));
-            table = table.child(head);
-            for (index, doc) in self.documents.iter().take(PAGE_LIMIT as usize).enumerate() {
-                let mut row = div()
-                    .id(SharedString::from(format!("mongo-row-{index}")))
-                    .test_support()
-                    .group("mongo-row")
-                    .flex()
-                    .min_w(px(row_min_w))
-                    .min_h(px(m.row_h + 2.))
-                    .px(px(10.))
-                    .items_center()
-                    .border_b_1()
-                    .border_color(p.line_soft)
-                    .hover(|style| style.bg(p.hover));
-                for (column_index, name) in shown.iter().enumerate() {
-                    let text = cell_text(&doc.json, name);
-                    let badge = cell_badge(&doc.json, name);
-                    let faint = text == "null" || text.is_empty();
-                    let cell_id = format!("mongo-cell:{index}:{column_index}");
-                    let entity = entity.clone();
-                    row = row.child(
-                        div()
-                            .id(SharedString::from(cell_id.clone()))
-                            .flex_1()
-                            .flex_basis(px(0.))
-                            .min_w(px(0.))
-                            .truncate()
-                            .pr(px(8.))
-                            .flex()
-                            .items_center()
-                            .gap(px(4.))
-                            .text_size(px(TypeScale::SM))
-                            .when(name == "_id", |this| this.font_family(mono.clone()).text_color(p.text_muted))
-                            .when(faint && badge.is_none(), |this| this.text_color(p.text_faint))
-                            .when(badge.is_some(), |this| {
-                                this.child(kit::pill(SharedString::from(badge.clone().unwrap_or_default()), p.accent_text, p.accent_soft))
-                            })
-                            .child(SharedString::from(text))
-                            .on_click(move |_, _, cx| {
-                                let cell_id = cell_id.clone();
-                                entity.update(cx, |pane, cx| pane.command(&cell_id, cx));
-                            }),
-                    );
-                }
-                row = row.child(
-                    div()
-                        .flex_none()
-                        .w(px(DOC_ACTIONS_W))
-                        .flex()
-                        .justify_end()
-                        .gap(px(1.))
-                        .child(doc_icon(format!("mongo-view:{index}"), IconName::Eye, format!("{} {index}", self.text("mongo.tab.view")), &entity))
-                        .child(doc_icon(format!("mongo-copy:{index}"), IconName::Copy, format!("{} {index}", self.text("mongo.tab.copy")), &entity))
-                        .child(doc_icon(format!("mongo-edit:{index}"), IconName::Pencil, format!("{} {index}", self.text("mongo.tab.edit")), &entity))
-                        .child(doc_icon(format!("mongo-delete:{index}"), IconName::Trash, format!("{} {index}", self.text("mongo.tab.remove")), &entity)),
-                );
-                table = table.child(row);
-            }
-        }
+        // ---- 文档数据区：状态分派在这里，页面本身不参与横向滚动。
+        let state = self.docs_state();
+        let cell_focus = self.cell_focus.get_or_insert_with(|| cx.focus_handle().tab_stop(true)).clone();
+        let docs_focused = cell_focus.is_focused(window);
+        let documents = self.docs_body(state, docs_focused, &mono, &p, &m, &entity, cx);
 
         let mut right = div().flex_1().min_w(px(0.)).h_full().flex().flex_col().relative().child(toolbar);
         if self.crumb_db || self.crumb_coll {
@@ -1128,7 +1191,6 @@ impl Render for MongoPane {
             }
             right = right.child(menu);
         }
-        let documents = if self.doc_tree { self.document_tree(&p, &m, &entity) } else { table.into_any_element() };
         right = right.child(documents);
 
         // ---- 抽屉：查看 / 编辑
@@ -1199,7 +1261,16 @@ impl Render for MongoPane {
                     )),
             );
         }
-        let status = if self.error.is_empty() { self.note.clone() } else { self.error.clone() };
+        // 状态条：错误优先，其次是操作回执，读取中显示进度文案；读取进度在数据区还有局部/骨架两档。
+        let status = if !self.error.is_empty() {
+            self.error.clone()
+        } else if !self.note.is_empty() {
+            self.note.clone()
+        } else if self.busy {
+            self.text("mongo.tab.loading")
+        } else {
+            String::new()
+        };
         right = right.child(
             div()
                 .id("mongo-status")
@@ -1220,8 +1291,313 @@ impl Render for MongoPane {
                 .child(SharedString::from(status)),
         );
 
-        div().id("mongo-pane").size_full().flex().child(left).child(right)
+        // 页面根只负责分栏：不滚横向、不撑宽，滚动全部交给左栏或文档数据区自己。
+        let mut root = div().id("mongo-pane").test_support().relative().size_full().flex().min_w(px(0.)).overflow_hidden();
+        if overlay_nav {
+            // 窄窗口的抽屉：先画内容，再压一层遮罩与左栏，点遮罩收回导航。
+            let dismiss = entity.clone();
+            root = root.child(right).child(
+                div()
+                    .id("mongo-nav-backdrop")
+                    .test_support()
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .bg(gpui_kit::hsla(0., 0., 0., 0.22))
+                    .on_click(move |_, _, cx| {
+                        dismiss.update(cx, |pane, cx| {
+                            pane.nav_choice = Some(true);
+                            cx.notify();
+                        });
+                    }),
+            ).child(nav_column);
+        } else {
+            root = root.child(nav_column).child(right);
+        }
+        root
     }
+}
+
+impl MongoPane {
+    /// 文档数据区：上面是错误/刷新提示条，下面按六态分派；滚动只发生在这一块内部
+    /// （纵向常驻，横向只在"有行"且列宽不足时出现），页面本身不滚横向。
+    #[allow(clippy::too_many_arguments)]
+    fn docs_body(
+        &mut self,
+        state: DocsState,
+        docs_focused: bool,
+        mono: &SharedString,
+        p: &Palette,
+        m: &kit::Metrics,
+        entity: &Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let cell_focus = self.cell_focus.clone();
+        let mut area = div()
+            .id("mongo-docs")
+            .test_support()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .min_w(px(0.))
+            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
+                let key = match event.keystroke.key.as_str() {
+                    "arrowup" => "up",
+                    "arrowdown" => "down",
+                    "arrowleft" => "left",
+                    "arrowright" => "right",
+                    other => other,
+                };
+                if this.cell_key(key, cx) {
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }));
+        if let Some(handle) = cell_focus {
+            area = area.track_focus(&handle);
+        }
+        area = if matches!(state, DocsState::Rows) { area.overflow_y_scroll().overflow_x_scroll() } else { area.overflow_hidden() };
+        if !self.filter_error.is_empty() {
+            area = area.child(
+                div()
+                    .id("mongo-filter-error")
+                    .test_support()
+                    .flex_none()
+                    .mx(px(10.))
+                    .mt(px(10.))
+                    .px(px(12.))
+                    .py(px(8.))
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(8.))
+                    .rounded(px(Radius::PANEL))
+                    .bg(p.danger_soft)
+                    .text_color(p.danger)
+                    .text_size(px(TypeScale::SM))
+                    .child(kit::icon(IconName::CircleAlert, 14., p.danger))
+                    .child(div().flex_1().min_w(px(120.)).child(SharedString::from(self.filter_error.clone())))
+                    .child(mongo_button_for("mongo-filter-retry", "mongo-refresh", Some(IconName::RefreshCw), &self.text("common.retry"), Kind::Secondary, entity)),
+            );
+        }
+        // 已有内容时的局部刷新：一行局部加载，不把整块换成首屏骨架。
+        if self.busy && matches!(state, DocsState::Rows) {
+            area = area.child(
+                div()
+                    .id("mongo-docs-busy")
+                    .test_support()
+                    .flex_none()
+                    .px(px(12.))
+                    .py(px(6.))
+                    .border_b_1()
+                    .border_color(p.line)
+                    .child(kit::inline_loading(self.text("mongo.tab.loading"), m, p)),
+            );
+        }
+        if matches!(state, DocsState::Rows) {
+            area = area.child(if self.doc_tree { self.document_tree(p, m, entity) } else { self.docs_table(docs_focused, mono, p, m, entity) });
+        } else {
+            area = area.child(
+                div()
+                    .id("mongo-docs-state")
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .min_w(px(0.))
+                    .items_start()
+                    .justify_center()
+                    .px(px(m.pane_pad()))
+                    .py(px(m.pad))
+                    .child(self.docs_state_block(state, p, m, entity)),
+            );
+        }
+        area.into_any_element()
+    }
+
+    /// 六态里除"有行"之外的呈现：说明 + 下一步；主操作进状态块的动作位，不另起一行居中追加。
+    fn docs_state_block(&self, state: DocsState, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>) -> AnyElement {
+        match state {
+            DocsState::NeedTarget if self.connection_id.is_empty() => kit::empty_state_with_action(
+                IconName::Database,
+                self.text("mongo.tab.needConnection"),
+                self.text("mongo.tab.needConnectionHint"),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(kit::kbd(kit::shortcut("Ctrl+B"), p))
+                    .child(div().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(self.text("shell.command.toggleSidebar"))),
+                p,
+            )
+            .into_any_element(),
+            DocsState::NeedTarget => kit::empty_state_with_action(
+                IconName::FolderOpen,
+                self.text("mongo.tab.needCollection"),
+                self.text("mongo.tab.needCollectionHint"),
+                mongo_button_for("mongo-docs-reload", "mongo-refresh-db", Some(IconName::RefreshCw), &self.text("mongo.tab.refreshDatabases"), Kind::Secondary, entity),
+                p,
+            )
+            .into_any_element(),
+            DocsState::Loading => kit::skeleton_state(6, m, p).into_any_element(),
+            DocsState::Error => kit::error_state_with_action(
+                self.text("mongo.tab.loadFailed"),
+                self.error.clone(),
+                mongo_button_for("mongo-docs-retry", self.docs_retry_command(), Some(IconName::RefreshCw), &self.text("common.retry"), Kind::Secondary, entity),
+                p,
+            )
+            .into_any_element(),
+            DocsState::EmptyCollection => kit::empty_state_with_action(
+                IconName::Braces,
+                self.text("mongo.tab.emptyCollection"),
+                self.text("mongo.tab.emptyCollectionHint"),
+                mongo_button_for("mongo-empty-insert", "mongo-insert", Some(IconName::Plus), &self.text("mongo.tab.insert"), Kind::Primary, entity),
+                p,
+            )
+            .into_any_element(),
+            DocsState::NoMatch => {
+                let detail = i18n::fill(&self.text("mongo.tab.emptyFilteredHint"), &[("filter", &self.applied_filter)]);
+                kit::no_match_state_with_action(
+                    IconName::Funnel,
+                    self.text("mongo.tab.emptyFiltered"),
+                    detail,
+                    mongo_button_for("mongo-no-match-clear", "mongo-clear-filter", None, &self.text("mongo.tab.clearFilter"), Kind::Secondary, entity),
+                    p,
+                )
+                .into_any_element()
+            }
+            DocsState::Rows => div().into_any_element(),
+        }
+    }
+
+    /// 表格视图：表头与行共用同一组列宽，行尾四个图标仍是查看/复制/编辑/删除。
+    fn docs_table(&self, docs_focused: bool, mono: &SharedString, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>) -> AnyElement {
+        let shown = self.shown_columns();
+        // 窄窗口下每列至少 120：不够宽就在数据区内部横向滚动，不把列压成全是省略号。
+        let row_min_w = shown.len() as f32 * DOC_COL_MIN + DOC_ACTIONS_W + m.pane_pad();
+        let focus_handle = self.cell_focus.clone();
+        let mut table = div().id("mongo-doc-table").test_support().flex().flex_col().flex_none().min_w(px(row_min_w));
+        let mut head = div()
+            .flex()
+            .flex_none()
+            .min_w(px(row_min_w))
+            .h(px(m.bar_h() - 2.))
+            .px(px(10.))
+            .items_center()
+            .bg(p.chrome)
+            .border_b_1()
+            .border_color(p.line)
+            .text_size(px(TypeScale::XS))
+            .text_color(p.text_faint);
+        for name in &shown {
+            head = head.child(div().flex_1().flex_basis(px(0.)).min_w(px(0.)).truncate().pr(px(8.)).child(SharedString::from(name.clone())));
+        }
+        head = head.child(div().flex_none().w(px(DOC_ACTIONS_W)));
+        table = table.child(head);
+        for (index, doc) in self.documents.iter().take(PAGE_LIMIT as usize).enumerate() {
+            let mut row = div()
+                .id(SharedString::from(format!("mongo-row-{index}")))
+                .test_support()
+                .group("mongo-row")
+                .flex()
+                .flex_none()
+                .min_w(px(row_min_w))
+                .min_h(px(m.row_h + 2.))
+                .px(px(10.))
+                .items_center()
+                .border_b_1()
+                .border_color(p.line_soft)
+                .hover(|style| style.bg(p.hover));
+            for (column_index, name) in shown.iter().enumerate() {
+                let focused = docs_focused && self.focused_cell == Some((index, column_index));
+                row = row.child(doc_cell(
+                    index,
+                    column_index,
+                    name,
+                    cell_text(&doc.json, name),
+                    cell_badge(&doc.json, name),
+                    mono,
+                    focus_handle.clone(),
+                    focused,
+                    p,
+                    entity,
+                ));
+            }
+            row = row.child(
+                div()
+                    .flex_none()
+                    .w(px(DOC_ACTIONS_W))
+                    .flex()
+                    .justify_end()
+                    .gap(px(1.))
+                    .child(doc_icon(format!("mongo-view:{index}"), IconName::Eye, format!("{} {index}", self.text("mongo.tab.view")), entity))
+                    .child(doc_icon(format!("mongo-copy:{index}"), IconName::Copy, format!("{} {index}", self.text("mongo.tab.copy")), entity))
+                    .child(doc_icon(format!("mongo-edit:{index}"), IconName::Pencil, format!("{} {index}", self.text("mongo.tab.edit")), entity))
+                    .child(doc_icon(format!("mongo-delete:{index}"), IconName::Trash, format!("{} {index}", self.text("mongo.tab.remove")), entity)),
+            );
+            table = table.child(row);
+        }
+        table.into_any_element()
+    }
+}
+
+/// 单元格：hover / 按下 / 焦点环 / 光标统一走底座，点击与 Enter 都按字段名打开片段。
+/// 单元格不逐个进 Tab 顺序（文档表整体是一个停靠点），键盘用方向键在格子间移动。
+#[allow(clippy::too_many_arguments)]
+fn doc_cell(
+    row: usize,
+    column_index: usize,
+    column: &str,
+    text: String,
+    badge: Option<String>,
+    mono: &SharedString,
+    focus_handle: Option<FocusHandle>,
+    focused: bool,
+    p: &Palette,
+    entity: &Entity<MongoPane>,
+) -> AnyElement {
+    let id = format!("mongo-cell:{row}:{column}");
+    let faint = text == "null" || text.is_empty();
+    let mut cell = div()
+        .id(SharedString::from(id.clone()))
+        .test_support()
+        .role(gpui_kit::Role::Button)
+        .aria_label(SharedString::from(format!("{column} {text}")))
+        .flex_1()
+        .flex_basis(px(0.))
+        .min_w(px(0.))
+        .pr(px(8.))
+        .h_full()
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .rounded(px(Radius::CONTROL))
+        .text_size(px(TypeScale::SM))
+        .when(column == "_id", |this| this.font_family(mono.clone()).text_color(p.text_muted))
+        .when(faint && badge.is_none(), |this| this.text_color(p.text_faint));
+    if let Some(badge) = badge {
+        cell = cell.child(kit::pill(SharedString::from(badge), p.accent_text, p.accent_soft));
+    }
+    cell = cell.child(div().flex_1().min_w(px(0.)).truncate().child(SharedString::from(text)));
+    let mut cell = kit::interactive(cell, p, false).tab_stop(false);
+    if focused {
+        cell = cell.shadow(vec![kit::focus_ring(p.accent, kit::FOCUS_RING_W)]);
+    }
+    let owner = entity.clone();
+    let command = id;
+    cell.on_click(move |_, window, cx| {
+        if let Some(handle) = focus_handle.clone() {
+            window.focus(&handle, cx);
+        }
+        let command = command.clone();
+        owner.update(cx, |pane, cx| {
+            pane.focused_cell = Some((row, column_index));
+            pane.command(&command, cx);
+        });
+    })
+    .into_any_element()
 }
 
 #[derive(Clone, Copy)]
@@ -1273,11 +1649,8 @@ impl MongoPane {
     }
 
     fn document_tree(&self, p: &Palette, m: &kit::Metrics, entity: &Entity<Self>) -> AnyElement {
-        let mut tree = div().id("mongo-docs").flex().flex_col().flex_1().min_h(px(0.)).overflow_y_scroll();
-        if self.documents.is_empty() {
-            let empty = if self.applied_filter.is_empty() { self.text("mongo.tab.emptyCollection") } else { self.text("mongo.tab.emptyFiltered") };
-            return tree.child(div().flex_1().flex().items_center().justify_center().child(kit::empty_state(IconName::Braces, SharedString::from(empty), SharedString::from(self.text("mongo.view.tree")), &p))).into_any_element();
-        }
+        // 空/加载/错误已在文档数据区的六态里处理，树视图只负责"有行"时的排版。
+        let mut tree = div().id("mongo-doc-tree").test_support().flex().flex_col().flex_1().min_h(px(0.)).min_w(px(0.)).overflow_y_scroll();
         for (index, doc) in self.documents.iter().take(PAGE_LIMIT as usize).enumerate() {
             let parsed = serde_json::from_str::<serde_json::Value>(&doc.json).ok();
             let nodes = parsed.as_ref().map(|value| crate::ui::visible_json_nodes(value, &std::collections::BTreeSet::new(), "")).unwrap_or_default();
@@ -1351,8 +1724,20 @@ fn nav_row(id: String, label: String, icon: IconName, text: String, count: Strin
 }
 
 fn mongo_button(id: &'static str, icon: Option<IconName>, label: &str, kind: Kind, entity: &Entity<MongoPane>) -> gpui_kit::component::button::Button {
+    mongo_button_for(id, id, icon, label, kind, entity)
+}
+
+/// 元素 id 与命令分开：同一个命令在工具条和状态块里各有一个入口，元素 id 不能重复。
+fn mongo_button_for(
+    id: &'static str,
+    command: &'static str,
+    icon: Option<IconName>,
+    label: &str,
+    kind: Kind,
+    entity: &Entity<MongoPane>,
+) -> gpui_kit::component::button::Button {
     let entity = entity.clone();
-    let click = move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| entity.update(cx, |pane, cx| pane.command(id, cx));
+    let click = move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| entity.update(cx, |pane, cx| pane.command(command, cx));
     let label = SharedString::from(label.to_owned());
     match kind {
         Kind::Primary => kit::primary_button(id, icon, label, click),
@@ -1380,6 +1765,7 @@ fn doc_icon(id: String, icon: IconName, label: String, entity: &Entity<MongoPane
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::test::TestWindowExt as _;
 
     #[test]
     fn columns_follow_fields_and_invalid_json_stays_local() {
@@ -1453,6 +1839,19 @@ mod tests {
         let wanted = 7. * DOC_COL_MIN + DOC_ACTIONS_W;
         assert!(row_w > 640., "窄窗口里一行要比窗口宽，交给横向滚动：{row_w}");
         assert!(row_w >= wanted, "每列至少 {DOC_COL_MIN}、动作列 {DOC_ACTIONS_W}：{row_w} < {wanted}");
+        // 横向滚动只发生在文档数据区内部：页面根与数据区都不超过窗口宽。
+        let (page, area, nav_hidden) = cx
+            .update_window(window, |_, window, _| {
+                (
+                    f32::from(window.find("mongo-pane").bounds().size.width),
+                    f32::from(window.find("mongo-docs").bounds().size.width),
+                    f32::from(window.find("mongo-nav").bounds().size.width) <= 1.5,
+                )
+            })
+            .unwrap();
+        assert!(page <= 640.5, "页面本身不能出现横向滚动：{page}");
+        assert!(area <= 640.5, "文档数据区按窗口宽裁切：{area}");
+        assert!(nav_hidden, "窄窗口默认收起左栏");
         let _ = pane;
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1486,6 +1885,413 @@ mod tests {
             });
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn pane_services(tag: &str) -> (std::path::PathBuf, std::sync::Arc<crate::application::AppServices>) {
+        let dir = std::env::temp_dir().join(format!("rillsql-mongo-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(
+            crate::connections::Service::new_for_test(dir.join("connections.sqlite")),
+        )));
+        (dir, services)
+    }
+
+    fn open_pane_at(
+        cx: &mut gpui_kit::TestAppContext,
+        services: std::sync::Arc<crate::application::AppServices>,
+        width: f32,
+    ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<MongoPane>) {
+        use gpui_kit::AppContext as _;
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            let bounds = gpui_kit::Bounds {
+                origin: gpui_kit::Point::default(),
+                size: gpui_kit::size(gpui_kit::px(width), gpui_kit::px(900.)),
+            };
+            gpui_kit::open_window(
+                gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |_window, cx| cx.new(|_| MongoPane::new(services)),
+            )
+            .expect("mongo pane")
+        })
+    }
+
+    fn doc(id: &str, customer: &str, status: &str) -> MongoDoc {
+        MongoDoc {
+            id_json: format!("\"{id}\""),
+            json: format!(r#"{{"_id":"{id}","customer":"{customer}","status":"{status}"}}"#),
+        }
+    }
+
+    fn render(window: gpui_kit::AnyWindowHandle, cx: &mut gpui_kit::TestAppContext) {
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+    }
+
+    /// 单元格的 hover / 按下 / 焦点环 / 禁用取值来自底座，不是页面自造；
+    /// 单元格不进 Tab 顺序，整张文档表是一个停靠点（见 docs_body）。
+    #[test]
+    fn document_cells_take_their_states_from_the_kit() {
+        for p in [Palette::light(), Palette::dark()] {
+            let style = kit::interaction_style(&p, false);
+            assert_eq!(style.hover_bg, Some(p.hover));
+            assert_eq!(style.active_bg, Some(p.active));
+            assert_eq!(style.ring, Some(p.accent), "焦点环用强调色");
+            assert_eq!(style.ring_width, kit::FOCUS_RING_W, "焦点环 2px");
+            assert!(style.focusable);
+            let disabled = kit::interaction_style(&p, true);
+            assert!(disabled.hover_bg.is_none() && disabled.active_bg.is_none() && disabled.ring.is_none() && !disabled.focusable);
+        }
+        assert_eq!(DOC_COL_MAX, 7, "表格最多七列，其余字段在整篇文档里看");
+    }
+
+    #[gpui_kit::test]
+    fn docs_states_separate_empty_no_match_and_error(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let (dir, services) = pane_services("states");
+        let pane = cx.update(|cx| cx.new(|_| MongoPane::new(services)));
+        cx.update(|cx| {
+            pane.update(cx, |pane, _| {
+                assert_eq!(pane.docs_state_name(), "need-target", "没连接时先给出下一步");
+                pane.connection_id = "docs".into();
+                pane.database = "app".into();
+                pane.collection = "users".into();
+                assert_eq!(pane.docs_state_name(), "empty");
+                pane.applied_filter = r#"{"status":"active"}"#.into();
+                assert_eq!(pane.docs_state_name(), "no-match", "筛选无命中与空集合必须分开");
+                pane.busy = true;
+                assert_eq!(pane.docs_state_name(), "loading", "读取中优先于空态");
+                pane.busy = false;
+                pane.show_error("连接已断开".into());
+                assert_eq!(pane.docs_state_name(), "error", "读取失败不能退化成空集合");
+                pane.error.clear();
+                pane.plant_documents("app", "users", vec![doc("1", "c1", "active")]);
+                assert_eq!(pane.docs_state_name(), "rows");
+                assert_eq!(pane.focused_cell(), None, "换目标后键盘光标回到未定位");
+            });
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    fn error_state_replaces_the_body_and_offers_retry(cx: &mut gpui_kit::TestAppContext) {
+        let (dir, services) = pane_services("error-state");
+        let (window, pane) = open_pane_at(cx, services, 900.);
+        cx.update(|cx| {
+            pane.update(cx, |pane, _| {
+                pane.connection_id = "docs".into();
+                pane.connection_name = "文档".into();
+                pane.database = "app".into();
+                pane.collection = "users".into();
+                pane.show_error("连接已断开".into());
+            });
+        });
+        render(window, cx);
+        let (error, empty, retry) = cx
+            .update_window(window, |_, window, _| {
+                (
+                    window.try_find("error-state").is_some(),
+                    window.try_find("empty-state").is_some(),
+                    window.try_find("mongo-docs-retry").is_some(),
+                )
+            })
+            .unwrap();
+        assert!(error, "读取失败要画错误态");
+        assert!(!empty, "错误态不能同时画成空集合");
+        assert!(retry, "错误态的动作位是重试");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    fn filtered_collection_without_match_offers_clearing_the_filter(cx: &mut gpui_kit::TestAppContext) {
+        let (dir, services) = pane_services("no-match");
+        let (window, pane) = open_pane_at(cx, services, 900.);
+        cx.update(|cx| {
+            pane.update(cx, |pane, _| {
+                pane.connection_id = "docs".into();
+                pane.connection_name = "文档".into();
+                pane.database = "app".into();
+                pane.collection = "users".into();
+                pane.applied_filter = r#"{"status":"blocked"}"#.into();
+            });
+        });
+        render(window, cx);
+        let (no_match, clear, empty) = cx
+            .update_window(window, |_, window, _| {
+                (
+                    window.try_find("no-match-state").is_some(),
+                    window.try_find("mongo-no-match-clear").is_some(),
+                    window.try_find("empty-state").is_some(),
+                )
+            })
+            .unwrap();
+        assert!(no_match, "筛选无命中用无命中空态");
+        assert!(clear, "无命中的下一步是清除过滤");
+        assert!(!empty, "无命中不是无数据空态");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    fn clicking_a_cell_opens_that_column_value(cx: &mut gpui_kit::TestAppContext) {
+        let (dir, services) = pane_services("cell-click");
+        let (window, pane) = open_pane_at(cx, services, 900.);
+        cx.update(|cx| {
+            pane.update(cx, |pane, _| {
+                pane.plant_documents("app", "orders", vec![doc("1", "c1", "active")]);
+            });
+        });
+        render(window, cx);
+        cx.update_window(window, |_, window, cx| window.click("mongo-cell:0:customer", cx)).unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert!(pane.view_json().contains("c1"), "点单元格要看到这条字段的值：{}", pane.view_json());
+            assert!(pane.view_open(), "点单元格直接打开值，不是点了没反应");
+            assert_eq!(pane.focused_cell(), Some((0, 1)), "鼠标点格子同步键盘光标");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    fn keyboard_moves_between_cells_and_enter_opens_the_focused_one(cx: &mut gpui_kit::TestAppContext) {
+        let (dir, services) = pane_services("cell-keys");
+        let (window, pane) = open_pane_at(cx, services, 900.);
+        cx.update(|cx| {
+            pane.update(cx, |pane, _| {
+                pane.plant_documents("app", "orders", vec![doc("1", "c1", "active"), doc("2", "c2", "idle")]);
+            });
+        });
+        render(window, cx);
+        let handle = cx.update(|cx| pane.read(cx).cell_focus.clone()).expect("文档区焦点句柄");
+        cx.update_window(window, |_, window, cx| window.focus(&handle, cx)).unwrap();
+        cx.update_window(window, |_, window, cx| window.press("down", cx)).unwrap();
+        cx.update(|cx| assert_eq!(pane.read(cx).focused_cell(), Some((1, 0))));
+        cx.update_window(window, |_, window, cx| window.press("right", cx)).unwrap();
+        cx.update(|cx| assert_eq!(pane.read(cx).focused_cell(), Some((1, 1))));
+        cx.update_window(window, |_, window, cx| window.press("end", cx)).unwrap();
+        cx.update(|cx| assert_eq!(pane.read(cx).focused_cell(), Some((1, 2)), "End 到最后一列"));
+        cx.update_window(window, |_, window, cx| window.press("left", cx)).unwrap();
+        cx.update_window(window, |_, window, cx| window.press("enter", cx)).unwrap();
+        cx.update(|cx| {
+            let pane = pane.read(cx);
+            assert!(pane.view_json().contains("c2"), "Enter 打开当前格：{}", pane.view_json());
+            assert!(pane.view_open());
+        });
+        cx.update_window(window, |_, window, cx| window.press("escape", cx)).unwrap();
+        cx.update(|cx| assert!(!pane.read(cx).view_open(), "Esc 先收起只读查看"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 窄窗口展开左栏不能挤压文档表：左栏覆盖内容区，页面本身仍然没有横向滚动。
+    #[gpui_kit::test]
+    fn narrow_navigation_overlays_instead_of_squeezing_the_table(cx: &mut gpui_kit::TestAppContext) {
+        let (dir, services) = pane_services("nav-overlay");
+        let (window, pane) = open_pane_at(cx, services, 640.);
+        cx.update(|cx| {
+            pane.update(cx, |pane, _| {
+                pane.plant_documents("app", "orders", vec![doc("1", "c1", "active")]);
+            });
+        });
+        render(window, cx);
+        let (page, before) = cx
+            .update_window(window, |_, window, _| {
+                (
+                    f32::from(window.find("mongo-pane").bounds().size.width),
+                    f32::from(window.find("mongo-docs").bounds().size.width),
+                )
+            })
+            .unwrap();
+        assert!((page - 640.).abs() < 1., "页面根不随内容撑宽：{page}");
+        cx.update_window(window, |_, window, cx| window.click("mongo-nav-toggle", cx)).unwrap();
+        render(window, cx);
+        let (overlay, backdrop, after) = cx
+            .update_window(window, |_, window, _| {
+                (
+                    window.try_find("mongo-nav").is_some(),
+                    window.try_find("mongo-nav-backdrop").is_some(),
+                    f32::from(window.find("mongo-docs").bounds().size.width),
+                )
+            })
+            .unwrap();
+        assert!(overlay && backdrop, "窄窗口展开左栏是带遮罩的抽屉");
+        let label = cx.update_window(window, |_, window, _| window.find("mongo-nav-toggle").label().map(|text| text.to_owned())).unwrap();
+        assert_eq!(label.as_deref(), Some("折叠导航"), "左栏展开后按钮说明下一步是折叠");
+        assert!((after - before).abs() < 2., "抽屉覆盖内容区，文档区宽度不变：{before} → {after}");
+        cx.update_window(window, |_, window, cx| window.click("mongo-nav-backdrop", cx)).unwrap();
+        render(window, cx);
+        cx.update_window(window, |_, window, _| assert!(window.try_find("mongo-nav-backdrop").is_none(), "点遮罩收回导航")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一个宽度 × 浅/深色 × 紧凑/标准：六态各自的下一步、单元格四态与键盘等价、页面不横向滚动。
+    fn fill_docs(pane: &gpui_kit::Entity<MongoPane>, state: &str, cx: &mut gpui_kit::App) {
+        pane.update(cx, |pane, _| {
+            pane.documents.clear();
+            pane.columns.clear();
+            pane.total = 0;
+            pane.busy = false;
+            pane.error.clear();
+            pane.filter_error.clear();
+            pane.applied_filter.clear();
+            pane.filter_input.clear();
+            pane.view_open = false;
+            pane.editor_open = false;
+            pane.confirm_id = None;
+            pane.confirm_write = None;
+            pane.confirm_prompt.clear();
+            pane.focused_cell = None;
+            pane.connection_id = "docs".into();
+            pane.connection_name = "文档".into();
+            pane.database = "app".into();
+            pane.collection = "orders".into();
+            match state {
+                "rows" => {
+                    pane.documents = vec![doc("1", "c1", "active"), doc("2", "c2", "idle")];
+                    pane.columns = vec![
+                        "_id".into(),
+                        "customer".into(),
+                        "status".into(),
+                        "total".into(),
+                        "memo".into(),
+                        "created".into(),
+                        "note".into(),
+                    ];
+                    pane.total = 2;
+                }
+                "no-match" => pane.applied_filter = r#"{"status":"blocked"}"#.into(),
+                "error" => pane.show_error("连接已断开".into()),
+                "loading" => pane.busy = true,
+                _ => {}
+            }
+        });
+    }
+
+    fn docs_hold_at(cx: &mut gpui_kit::TestAppContext, width: f32) {
+        let (dir, services) = pane_services("matrix");
+        let (window, pane) = open_pane_at(cx, services, width);
+        let narrow = width < kit::NARROW_PAGE_WIDTH;
+        for (dark, density) in [(false, "compact"), (false, "standard"), (true, "compact"), (true, "standard")] {
+            cx.update(|cx| {
+                kit::apply_theme(dark, cx);
+                let metrics = if density == "compact" { kit::Metrics::compact() } else { kit::Metrics::standard() };
+                metrics.publish(cx);
+            });
+            let tag = format!("{width}/{}/{density}", if dark { "dark" } else { "light" });
+
+            // 有行：表格在数据区里，页面根与数据区都不超过窗口宽。
+            cx.update(|cx| fill_docs(&pane, "rows", cx));
+            render(window, cx);
+            let (page, area, nav, table, cell) = cx
+                .update_window(window, |_, window, _| {
+                    (
+                        f32::from(window.find("mongo-pane").bounds().size.width),
+                        f32::from(window.find("mongo-docs").bounds().size.width),
+                        f32::from(window.find("mongo-nav").bounds().size.width),
+                        window.try_find("mongo-row-0").map(|found| f32::from(found.bounds().size.width)).unwrap_or(0.),
+                        window.try_find("mongo-cell:0:customer").is_some(),
+                    )
+                })
+                .unwrap();
+            assert!((page - width).abs() < 2., "{tag}：页面本身不能被内容撑出横向滚动：{page}");
+            assert!(area <= width + 0.5, "{tag}：数据区按窗口宽裁切：{area}");
+            assert!(cell, "{tag}：有行时文档单元格要在");
+            assert_eq!(nav > 8., !narrow, "{tag}：窄窗口默认收起左栏，宽窗口保持展开");
+            // 列宽下限放不进数据区时，多出来的部分必须是数据区内部的横向滚动，页面本身不超宽。
+            let wanted = 7. * DOC_COL_MIN + DOC_ACTIONS_W;
+            if wanted > area {
+                assert!(table >= wanted, "{tag}：数据区放不下时一行仍保持列宽下限：{table} < {wanted}");
+            } else {
+                assert!(table <= area + 0.5, "{tag}：放得下时一行不超出数据区：{table} > {area}");
+            }
+
+            // 单元格点击 = 打开这一列的值；键盘光标同步。
+            cx.update_window(window, |_, window, cx| window.click("mongo-cell:0:customer", cx)).unwrap();
+            cx.update(|cx| {
+                let pane = pane.read(cx);
+                assert!(pane.view_open() && pane.view_json().contains("c1"), "{tag}：点单元格要看到这一列的值");
+                assert_eq!(pane.focused_cell(), Some((0, 1)), "{tag}：鼠标点格子同步键盘光标");
+            });
+
+            // 键盘等价：Tab 进数据区，方向键移格，Enter 打开当前格，Esc 收起只读查看。
+            let handle = cx.update(|cx| pane.read(cx).cell_focus.clone()).expect("文档区焦点句柄");
+            cx.update_window(window, |_, window, cx| window.focus(&handle, cx)).unwrap();
+            cx.update_window(window, |_, window, cx| window.press("down", cx)).unwrap();
+            cx.update(|cx| assert_eq!(pane.read(cx).focused_cell(), Some((1, 1)), "{tag}：方向键在格子间移动"));
+            cx.update_window(window, |_, window, cx| window.press("enter", cx)).unwrap();
+            cx.update(|cx| assert!(pane.read(cx).view_json().contains("c2"), "{tag}：Enter 打开当前格"));
+            cx.update_window(window, |_, window, cx| window.press("escape", cx)).unwrap();
+            cx.update(|cx| assert!(!pane.read(cx).view_open(), "{tag}：Esc 收起只读查看"));
+
+            // 空集合：无数据空态 + 新增入口，不是错误态。
+            cx.update(|cx| fill_docs(&pane, "empty", cx));
+            render(window, cx);
+            let (empty, insert, error, no_match) = cx
+                .update_window(window, |_, window, _| {
+                    (
+                        window.try_find("empty-state").is_some(),
+                        window.try_find("mongo-empty-insert").is_some(),
+                        window.try_find("error-state").is_some(),
+                        window.try_find("no-match-state").is_some(),
+                    )
+                })
+                .unwrap();
+            assert!(empty && insert, "{tag}：空集合用无数据空态并给出新增入口");
+            assert!(!error && !no_match, "{tag}：空集合不能画成错误或无命中");
+
+            // 筛选无命中：无命中空态 + 清除条件。
+            cx.update(|cx| fill_docs(&pane, "no-match", cx));
+            render(window, cx);
+            let (no_match, clear, empty) = cx
+                .update_window(window, |_, window, _| {
+                    (
+                        window.try_find("no-match-state").is_some(),
+                        window.try_find("mongo-no-match-clear").is_some(),
+                        window.try_find("empty-state").is_some(),
+                    )
+                })
+                .unwrap();
+            assert!(no_match && clear, "{tag}：无命中给清除条件");
+            assert!(!empty, "{tag}：无命中不能和无数据共用一块");
+
+            // 读取失败：错误态 + 重试。
+            cx.update(|cx| fill_docs(&pane, "error", cx));
+            render(window, cx);
+            let (error, retry, empty) = cx
+                .update_window(window, |_, window, _| {
+                    (
+                        window.try_find("error-state").is_some(),
+                        window.try_find("mongo-docs-retry").is_some(),
+                        window.try_find("empty-state").is_some(),
+                    )
+                })
+                .unwrap();
+            assert!(error && retry, "{tag}：读取失败给错误态和重试");
+            assert!(!empty, "{tag}：读取失败不能退化成空集合");
+
+            // 读取中：首屏骨架优先于空态。
+            cx.update(|cx| fill_docs(&pane, "loading", cx));
+            render(window, cx);
+            let (skeleton, empty) = cx
+                .update_window(window, |_, window, _| (window.try_find("skeleton-state").is_some(), window.try_find("empty-state").is_some()))
+                .unwrap();
+            assert!(skeleton, "{tag}：读取中用骨架");
+            assert!(!empty, "{tag}：读取中不能同时画空态");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    fn docs_states_and_cells_hold_at_1360(cx: &mut gpui_kit::TestAppContext) {
+        docs_hold_at(cx, 1360.);
+    }
+
+    #[gpui_kit::test]
+    fn docs_states_and_cells_hold_at_900(cx: &mut gpui_kit::TestAppContext) {
+        docs_hold_at(cx, 900.);
+    }
+
+    #[gpui_kit::test]
+    fn docs_states_and_cells_hold_at_640(cx: &mut gpui_kit::TestAppContext) {
+        docs_hold_at(cx, 640.);
     }
 }
 
