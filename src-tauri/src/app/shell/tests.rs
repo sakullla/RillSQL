@@ -1967,7 +1967,7 @@ fn exchange_commands_prompt_map_cancel_and_fail_from_the_workbench(cx: &mut gpui
     assert!(cx.did_prompt_for_new_path(), "已读取导出应打开保存对话框");
     let loaded_path = dir.join("loaded.csv");
     cx.simulate_new_path_selection(|_| Some(loaded_path.clone()));
-    pump_exchange(cx, window, &view, |_, _| loaded_path.exists());
+    pump_exchange(cx, window, &view, |view, app| loaded_path.exists() && !view.exchange_running_now(app));
     let loaded = String::from_utf8_lossy(&std::fs::read(&loaded_path).unwrap()).into_owned();
     assert!(loaded_path.is_absolute());
     assert!(loaded.contains('甲'), "{loaded}");
@@ -2373,6 +2373,8 @@ fn exchange_source_follows_the_active_item_and_query_source_blocks_full_export(c
 
 #[gpui_kit::test]
 fn exchange_loaded_export_omits_uncommitted_cells(cx: &mut gpui_kit::TestAppContext) {
+    // 已加载导出在真实 Tokio 工作线程写文件，测试需要允许跨线程唤醒。
+    cx.executor().allow_parking();
     let dir = std::env::temp_dir().join(format!("rillsql-exchange-staged-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let services = services_at(&dir);
@@ -2401,7 +2403,7 @@ fn exchange_loaded_export_omits_uncommitted_cells(cx: &mut gpui_kit::TestAppCont
     assert!(cx.did_prompt_for_new_path(), "已读取导出应打开保存对话框");
     let path = dir.join("loaded.csv");
     cx.simulate_new_path_selection(|_| Some(path.clone()));
-    pump_exchange(cx, window, &view, |_, _| path.exists());
+    pump_exchange(cx, window, &view, |view, app| path.exists() && !view.exchange_running_now(app));
     let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
     assert!(text.contains('甲'), "导出应包含已提交值：{text}");
     assert!(!text.contains('乙'), "导出不能包含未提交暂存：{text}");

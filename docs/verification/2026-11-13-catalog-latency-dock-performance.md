@@ -64,3 +64,7 @@ CSV 两版均为 55,655,578 字节，FNV 校验和 `247c011bdc12e508`。定位�
 最终 v0.2.26 debug 二进制已重建并进行上述冷启动及隐藏后再次打开：同一 PID 89736、同一 1280 × 820 主窗口，均 `active=true`、`finishedLaunching=true`、`onscreen=true`。原始证据在 [cold](catalog-dock-2026-11-13/native-cold.json)、[warm](catalog-dock-2026-11-13/native-warm.json)、[性能记录](catalog-dock-2026-11-13/performance.json)。
 
 物理关闭按钮自动化和截图受当前 Accessibility/屏幕权限限制；关闭后重建及动作路由由 GPUI 生命周期测试验证。LaunchServices 冷启动/再次激活不等同于实际点击 Dock 或从下载 DMG 安装。Windows/Linux 原生 GUI 启动未在本机验证，跨平台 CI 和打包结果也不能替代这些证据。
+
+## CI 后续修正（2026-11-14）
+
+首轮 Linux 测试和 Clippy 通过。Windows 为 862 通过、1 失败：`exchange_loaded_export_omits_uncommitted_cells` 的 GPUI scheduler 报告真实 Tokio 线程唤醒未被允许。导出改为后台执行后，该旧测试缺少 `allow_parking()`；已补齐测试配置，并让两处导出测试同时等待文件和 UI 任务终态，避免只见文件就提前退出。修改仅涉及测试，不改变已验证的生产二进制。tag 尚未推送，修正提交继续使用未发布的 0.2.26。
