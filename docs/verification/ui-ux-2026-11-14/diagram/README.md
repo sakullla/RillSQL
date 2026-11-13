@@ -4,7 +4,7 @@
 - 任务：T10「统一 ER 图页面的卡片交互、键盘焦点、三态和窄宽操作，不重做图功能」
 - 覆盖需求：R1（呈现与交互与设计基准一致）、R3（四态、键盘等价、三态各带下一步）、R4（1360/900/640 布局与主操作可达）
 - 覆盖规范：S2 第 6/7 条（全部控件四态、三档宽度无横向滚动）、S5.3（四态与光标）、S5.6（可 Tab 到达、图标按钮有 aria-label）、S7.3（断点）、S8.5（空/错误态说明发生了什么与下一步）、S12.3（`kit::interactive` 四态落地）、S12.4（三态入口）
-- 改动范围：`src-tauri/src/app/views/diagram/mod.rs`（状态判定、卡片四态与键盘等价、窄宽工具条、卡片的下一步）、`src-tauri/src/i18n/mod.rs`（新增 3 条关系图文案）
+- 本次提交：`src-tauri/src/app/views/diagram/mod.rs`（状态判定、卡片四态与键盘等价、窄宽工具条、各状态下一步）+ 本目录文档。界面用的三条 `diagram.emptyDetail` / `diagram.searchNoMatch` / `diagram.searchClear` 文案随提交 `3c21298` 进入 `main`，本任务**不重复认领** `src-tauri/src/i18n/mod.rs`
 - 未改：`src-tauri/src/diagram/`（读取与连线算法）、`src-tauri/src/app/shell/`（外壳与页面切换）、Cargo 依赖
 
 ## 文件
