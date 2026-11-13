@@ -6,7 +6,8 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, relative,
+    AnyElement, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, TestSupportExt as _, Window, div, px, relative,
 };
 
 use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, TypeScale};
@@ -116,6 +117,7 @@ impl Note {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdminInventory {
     pub connected: bool,
+    /// 清单读取已经结束（读到的可能仍是离线结果）；读取途中为 false，页面据此区分骨架与增量指示。
     pub probed: bool,
     /// 读取来源（引擎 · 库）。
     pub source: String,
@@ -341,6 +343,12 @@ impl AdminSession {
         self.preview.as_ref().map(|plan| plan.blocked.iter().map(|text| localize(text, self.locale)).collect()).unwrap_or_default()
     }
 
+    /// 确认层按危险色呈现的条件：预览计划里带 danger 级风险。
+    /// 只影响配色与提示措辞，执行仍要预览后确认。
+    pub fn preview_dangerous(&self) -> bool {
+        self.preview.as_ref().is_some_and(|plan| plan.risks.iter().any(|risk| risk.level == "danger"))
+    }
+
     pub fn cancel(&mut self) {
         self.open = false;
     }
@@ -423,7 +431,7 @@ impl AdminPane {
 
     /// 连接建立或断开后清掉探测闩，下一帧重新读取清单。
     pub fn note_connection(&mut self, connected: bool, cx: &mut Context<Self>) {
-        if self.link_open == Some(connected) && self.session.inventory.probed {
+        if self.link_open == Some(connected) && (self.session.inventory.probed || self.probing) {
             return;
         }
         self.link_open = Some(connected);
@@ -441,7 +449,6 @@ impl AdminPane {
             return;
         }
         self.probing = true;
-        self.session.inventory.probed = true;
         self.probe_gen = self.probe_gen.wrapping_add(1);
         let generation = self.probe_gen;
         self.refresh_inventory(generation, cx);
@@ -708,7 +715,19 @@ impl AdminPane {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn op_card(id: &'static str, kind: &'static str, icon: IconName, title: SharedString, inputs: Vec<AnyElement>, inventory: Vec<String>, entity: &Entity<AdminPane>, locale: Locale, p: &Palette) -> AnyElement {
+fn op_card(
+    id: &'static str,
+    kind: &'static str,
+    icon: IconName,
+    title: SharedString,
+    inputs: Vec<AnyElement>,
+    inventory: Vec<String>,
+    // 读过清单而这节是空的时，块内给出的下一步（图标、标题键、说明键）；读取中或离线时为 None。
+    empty: Option<(IconName, &'static str, &'static str)>,
+    entity: &Entity<AdminPane>,
+    locale: Locale,
+    p: &Palette,
+) -> AnyElement {
     let entity = entity.clone();
     let mut row = div().flex().items_center().gap(px(8.));
     for input in inputs {
@@ -741,6 +760,16 @@ fn op_card(id: &'static str, kind: &'static str, icon: IconName, title: SharedSt
             list = list.child(kit::pill(SharedString::from(item), p.text_muted, p.hover));
         }
         card = card.child(list);
+    } else if let Some((icon, heading, detail)) = empty {
+        // 空的不是整页而是这一节：空态放在本节里，下一句就说清怎么把它填上，表单与预览入口仍在下方。
+        card = card.child(
+            div().id(SharedString::from(format!("{id}-empty"))).test_support().child(kit::empty_state(
+                icon,
+                SharedString::from(i18n::text(locale, heading)),
+                SharedString::from(i18n::text(locale, detail)),
+                p,
+            )),
+        );
     }
     card.child(row).into_any_element()
 }
@@ -751,7 +780,8 @@ fn row_has_children(items: &[String]) -> bool {
 
 impl Render for AdminPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.session.inventory.probed && !self.session.target.connection_id.is_empty() {
+        // 清单是一次异步读取：读取途中不再重复发起，读完（成功或离线）才允许下一次。
+        if !self.probing && !self.session.inventory.probed && !self.session.target.connection_id.is_empty() {
             self.request_inventory(cx);
         }
         let p = Palette::of(cx);
@@ -761,11 +791,17 @@ impl Render for AdminPane {
         let sections = self.session.sections();
         let entity = cx.entity();
         let inventory = self.session.inventory.clone();
+        // 首屏读取给骨架，已读过内容的刷新只在顶部给一行增量指示；两者都优先于空态。
+        let probing = self.probing;
+        let ready = inventory.probed;
+        // 只有读过清单的已连接目标才谈得上"这一节是空的"；离线目标另走连接空态。
+        let listed = ready && inventory.connected;
+        let empty = move |icon: IconName, heading: &'static str, detail: &'static str| listed.then_some((icon, heading, detail));
         let mut cards = div().flex().flex_col().gap(px(12.));
         if sections.maintenance {
-            cards = cards.child(op_card("admin-vacuum", "vacuum", IconName::BrushCleaning, t("admin.action.vacuum"), Vec::new(), Vec::new(), &entity, locale, &p));
+            cards = cards.child(op_card("admin-vacuum", "vacuum", IconName::BrushCleaning, t("admin.action.vacuum"), Vec::new(), Vec::new(), None, &entity, locale, &p));
             let target = self.admin_field("reindex", &i18n::text(locale, "ui.conn.optional"), window, cx);
-            cards = cards.child(op_card("admin-reindex", "reindex", IconName::ListRestart, t("admin.action.reindex"), vec![target], Vec::new(), &entity, locale, &p));
+            cards = cards.child(op_card("admin-reindex", "reindex", IconName::ListRestart, t("admin.action.reindex"), vec![target], Vec::new(), None, &entity, locale, &p));
         }
         if sections.pragma {
             let mut pragma_bits = Vec::new();
@@ -780,7 +816,7 @@ impl Render for AdminPane {
             }
             let value = self.admin_field("pragma_value", "user_version", window, cx);
             cards = cards
-                .child(op_card("admin-pragma", "pragma", IconName::SlidersHorizontal, t("admin.action.pragma"), vec![value], pragma_bits, &entity, locale, &p))
+                .child(op_card("admin-pragma", "pragma", IconName::SlidersHorizontal, t("admin.action.pragma"), vec![value], pragma_bits, None, &entity, locale, &p))
                 .child(op_card(
                     "admin-foreign",
                     "foreign",
@@ -788,6 +824,7 @@ impl Render for AdminPane {
                     SharedString::from(format!("{} · {}", i18n::text(locale, "admin.action.foreignKeys"), if self.session.foreign_keys { "ON" } else { "OFF" })),
                     Vec::new(),
                     Vec::new(),
+                    None,
                     &entity,
                     locale,
                     &p,
@@ -796,7 +833,18 @@ impl Render for AdminPane {
         if sections.attached {
             let path = self.admin_field("attach_path", "/path/to/other.sqlite", window, cx);
             let name = self.admin_field("attach_name", "other", window, cx);
-            cards = cards.child(op_card("admin-attach", "attach", IconName::Paperclip, t("admin.action.attach"), vec![path, name], inventory.attached.clone(), &entity, locale, &p));
+            cards = cards.child(op_card(
+                "admin-attach",
+                "attach",
+                IconName::Paperclip,
+                t("admin.action.attach"),
+                vec![path, name],
+                inventory.attached.clone(),
+                empty(IconName::Paperclip, "admin.empty.attached", "admin.empty.attachedHint"),
+                &entity,
+                locale,
+                &p,
+            ));
         }
         if sections.sequences {
             let name = self.admin_field("sequence", "orders_id_seq", window, cx);
@@ -821,6 +869,7 @@ impl Render for AdminPane {
                 t("admin.action.sequence"),
                 vec![name, start, step, min_value, max_value],
                 inventory.sequences.clone(),
+                empty(IconName::ListOrdered, "admin.empty.sequences", "admin.empty.sequencesHint"),
                 &entity,
                 locale,
                 &p,
@@ -836,45 +885,91 @@ impl Render for AdminPane {
                     toggle_entity.update(cx, |pane, cx| pane.toggle_event(index, cx));
                 }));
             }
-            cards = cards.child(toggles).child(op_card("admin-event", "event", IconName::CalendarClock, t("admin.action.event"), vec![name], inventory.events.clone(), &entity, locale, &p));
+            cards = cards.child(toggles).child(op_card(
+                "admin-event",
+                "event",
+                IconName::CalendarClock,
+                t("admin.action.event"),
+                vec![name],
+                inventory.events.clone(),
+                empty(IconName::CalendarClock, "admin.empty.events", "admin.empty.eventsHint"),
+                &entity,
+                locale,
+                &p,
+            ));
         }
         if sections.enums {
             let name = self.admin_field("enum", "status", window, cx);
             let value = self.admin_field("enum_value", "value", window, cx);
-            cards = cards.child(op_card("admin-enum", "enum", IconName::ListOrdered, t("catalog.kind.enum"), vec![name, value], inventory.enums.clone(), &entity, locale, &p));
+            cards = cards.child(op_card(
+                "admin-enum",
+                "enum",
+                IconName::Braces,
+                t("catalog.kind.enum"),
+                vec![name, value],
+                inventory.enums.clone(),
+                empty(IconName::Braces, "admin.empty.enums", "admin.empty.enumsHint"),
+                &entity,
+                locale,
+                &p,
+            ));
         }
         if sections.domains {
             let name = self.admin_field("domain", "domain", window, cx);
             let value = self.admin_field("domain_default", "DEFAULT", window, cx);
-            cards = cards.child(op_card("admin-domain", "domain", IconName::SlidersHorizontal, t("catalog.kind.domain"), vec![name, value], inventory.domains.clone(), &entity, locale, &p));
+            cards = cards.child(op_card(
+                "admin-domain",
+                "domain",
+                IconName::SlidersHorizontal,
+                t("catalog.kind.domain"),
+                vec![name, value],
+                inventory.domains.clone(),
+                empty(IconName::SlidersHorizontal, "admin.empty.domains", "admin.empty.domainsHint"),
+                &entity,
+                locale,
+                &p,
+            ));
         }
-        if !inventory.faults.is_empty() {
-            for (index, fault) in inventory.faults.iter().enumerate() {
-                let retry_entity = entity.clone();
-                let message = localize(&fault.message, locale);
-                cards = cards.child(
-                    kit::card(&p)
-                        .p(px(metrics.card_pad()))
-                        .flex()
-                        .flex_col()
-                        .gap(px(8.))
-                        .child(div().font_weight(FontWeight::SEMIBOLD).text_color(p.danger).child(t(fault.title_key)))
-                        .child(div().text_size(px(TypeScale::SM)).text_color(p.danger).child(SharedString::from(message)))
-                        .child(kit::secondary_button(SharedString::from(format!("admin-retry-{index}")), Some(IconName::RefreshCw), t("admin.action.retry"), move |_, _, cx| {
-                            retry_entity.update(cx, |pane, cx| pane.refresh(cx));
-                        })),
-                );
-            }
+        // 分区读取失败：与其它页面同一套错误态（原因 + 当场可点的重试），不再自绘一张危险色卡片。
+        for (index, fault) in inventory.faults.iter().enumerate() {
+            let retry_entity = entity.clone();
+            let retry = kit::secondary_button(SharedString::from(format!("admin-retry-{index}")), Some(IconName::RefreshCw), t("admin.action.retry"), move |_, _, cx| {
+                retry_entity.update(cx, |pane, cx| pane.refresh(cx));
+            })
+            .into_any_element();
+            cards = cards.child(
+                div().id(SharedString::from(format!("admin-fault-{index}"))).test_support().child(kit::error_state_with_action(
+                    t(fault.title_key),
+                    SharedString::from(localize(&fault.message, locale)),
+                    retry,
+                    &p,
+                )),
+            );
         }
         if sections.extensions || sections.partitions {
-            let mut list = div().flex().flex_wrap().gap(px(6.));
-            for name in inventory.extensions.iter().chain(inventory.partitions.iter()) {
-                list = list.child(kit::pill(SharedString::from(name.clone()), p.text_muted, p.hover));
+            let mut card = kit::card(&p).p(px(14.)).flex().flex_col().gap(px(10.)).child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(div().flex_none().size(px(30.)).rounded(px(Radius::PANEL)).bg(p.accent_soft).flex().items_center().justify_center().child(kit::icon(IconName::Gauge, 15., p.accent_text)))
+                    .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child(t("admin.section.extras"))),
+            );
+            let items: Vec<String> = inventory.extensions.iter().chain(inventory.partitions.iter()).cloned().collect();
+            if !items.is_empty() {
+                let mut list = div().flex().flex_wrap().gap(px(6.));
+                for name in items {
+                    list = list.child(kit::pill(SharedString::from(name), p.text_muted, p.hover));
+                }
+                card = card.child(list);
+            } else if listed {
+                card = card.child(div().id("admin-extras-empty").test_support().child(kit::empty_state(IconName::Gauge, t("admin.empty.extras"), t("admin.empty.extrasHint"), &p)));
             }
-            cards = cards.child(kit::card(&p).p(px(14.)).flex().flex_col().gap(px(8.)).child(kit::muted(SharedString::from(inventory.source_text(locale)), &p)).child(list));
+            cards = cards.child(card);
         }
         if !sections.pragma && !sections.maintenance && !sections.sequences && !sections.events && !sections.extensions && !sections.partitions && !sections.attached && !sections.enums && !sections.domains {
-            cards = cards.child(kit::empty_state(IconName::Gauge, t("ui.tool.admin"), t("admin.section.none"), &p));
+            // 没有数据库级操作也是一句"下一步"：换成能出现的引擎，而不是一块空白。
+            cards = cards.child(kit::empty_state(IconName::Gauge, t("ui.tool.admin"), t("admin.section.noneHint"), &p));
         }
         let mut column = div()
             .id("admin-pane")
@@ -903,7 +998,13 @@ impl Render for AdminPane {
                             .child(kit::title(t("ui.tool.admin"), TypeScale::LG, &p))
                             .child(div().id("admin-banner").truncate().text_size(px(TypeScale::SM)).text_color(p.text_muted).child(SharedString::from(self.session.banner()))),
                     )
-                    .child(div().id("admin-source").text_size(px(TypeScale::XS)).text_color(p.text_faint).max_w(px(320.)).truncate().child(SharedString::from(inventory.source_text(locale))))
+                    // 同一个位置：读取中换成一行转圈，读完换回来源说明。探测有可见加载态，表头也不会因插入而抖动。
+                    .when(probing, |header| {
+                        header.child(div().id("admin-probing").test_support().max_w(px(320.)).child(kit::inline_loading(t("admin.probe.loading"), &metrics, &p)))
+                    })
+                    .when(!probing, |header| {
+                        header.child(div().id("admin-source").text_size(px(TypeScale::XS)).text_color(p.text_faint).max_w(px(320.)).truncate().child(SharedString::from(inventory.source_text(locale))))
+                    })
                     .child(kit::secondary_button("admin-refresh", Some(IconName::RefreshCw), t("admin.action.refresh"), {
                         let entity = entity.clone();
                         move |_, _, cx| entity.update(cx, |pane, cx| pane.refresh(cx))
@@ -921,13 +1022,43 @@ impl Render for AdminPane {
                     }),
             );
         let note = self.session.note.text(locale);
+        // 首屏读取给骨架、刷新已读内容只给一行增量指示、读完而未连接给带"立即连接"的空态；
+        // 三者都排在卡片之前，卡片本身（表单与预览入口）在任何状态下都保留，管理能力不因状态而消失。
+        let mut states = div().flex().flex_col().gap(px(metrics.section_gap()));
+        if probing && !ready {
+            states = states.child(kit::skeleton_state(3, &metrics, &p));
+        } else if probing {
+            states = states.child(div().id("admin-refreshing").test_support().child(kit::inline_loading(t("admin.probe.refreshing"), &metrics, &p)));
+        }
+        if ready && !probing && !inventory.connected {
+            let connect_entity = entity.clone();
+            let connect = kit::primary_button("admin-body-connect", None, t("admin.action.connect"), move |_, _, cx| {
+                connect_entity.update(cx, |pane, cx| {
+                    if !pane.session.target.connection_id.is_empty() {
+                        pane.connect_request = Some(pane.session.target.connection_id.clone());
+                    }
+                    cx.notify();
+                });
+            })
+            .into_any_element();
+            states = states.child(div().id("admin-offline").test_support().child(kit::empty_state_with_action(
+                IconName::Link,
+                t("admin.offline.heading"),
+                t("admin.offline.detail"),
+                connect,
+                &p,
+            )));
+        }
         column = column
-            .child(div().id("admin-body").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(metrics.page_pad)).child(div().max_w(px(760.)).mx_auto().flex().flex_col().gap(px(metrics.section_gap())).child(cards).when(!note.is_empty(), |this| {
+            .child(div().id("admin-body").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(metrics.page_pad)).child(div().max_w(px(760.)).mx_auto().flex().flex_col().gap(px(metrics.section_gap())).child(states).child(cards).when(!note.is_empty(), |this| {
                 this.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.hover).text_size(px(TypeScale::SM)).child(SharedString::from(note)))
             })))
             .child(div().hidden().child(admin_button("admin-preview", "structure.action.preview", false, entity.clone(), locale)));
         if self.session.open {
             let blocked = self.session.blocked();
+            // 危险操作醒目化：计划里有 danger 级风险时，提示条与确认按钮都换成危险色；
+            // 没有 danger 级风险的管理操作也给一句"确认后立即执行、数据库不提供撤销"。
+            let dangerous = self.session.preview_dangerous();
             column = column.child(
                 div().absolute().inset_0().bg(gpui_kit::hsla(0., 0., 0., 0.25)).flex().items_center().justify_center().child(
                     div()
@@ -973,13 +1104,34 @@ impl Render for AdminPane {
                         })
                         .when(!self.session.preview_rule().is_empty(), |this| this.child(kit::muted(SharedString::from(self.session.preview_rule()), &p)))
                         .when(!blocked.is_empty(), |this| this.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.danger_soft).text_color(p.danger).text_size(px(TypeScale::SM)).child(SharedString::from(blocked.join(" ")))))
+                        // 危险操作说明固定占一行：有 danger 级风险用危险色，其余用提醒色，措辞不同。
+                        .child(
+                            div()
+                                .id(if dangerous { "admin-preview-danger" } else { "admin-preview-irreversible" })
+                                .test_support()
+                                .px(px(12.))
+                                .py(px(8.))
+                                .rounded(px(Radius::PANEL))
+                                .bg(if dangerous { p.danger_soft } else { p.warn_soft })
+                                .text_color(if dangerous { p.danger } else { p.warn })
+                                .text_size(px(TypeScale::SM))
+                                .child(t(if dangerous { "admin.preview.danger" } else { "admin.preview.irreversible" })),
+                        )
                         .child(
                             div()
                                 .flex()
                                 .justify_end()
                                 .gap(px(8.))
                                 .child(admin_button("admin-cancel", "structure.action.cancel", false, entity.clone(), locale))
-                                .child(admin_button("admin-confirm", "structure.action.confirm", true, entity, locale)),
+                                .child(if dangerous {
+                                    let owner = entity.clone();
+                                    kit::danger_button("admin-confirm", Some(IconName::Check), t("structure.action.confirm"), move |_, _, cx| {
+                                        owner.update(cx, |pane, cx| pane.confirm(cx));
+                                    })
+                                    .into_any_element()
+                                } else {
+                                    admin_button("admin-confirm", "structure.action.confirm", true, entity, locale).into_any_element()
+                                }),
                         ),
                 ),
             );
@@ -1385,5 +1537,326 @@ mod tests {
         }
         let offline = AdminInventory::offline(&target("postgres"));
         assert!(!offline.connected);
+    }
+
+    // ---- 三态与危险操作呈现（T15）----
+
+    fn state_services(tag: &str) -> (Arc<crate::application::AppServices>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("rillsql-admin-state-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = Arc::new(crate::application::AppServices::new(Arc::new(crate::connections::Service::new_for_test(dir.join("connections.sqlite")))));
+        (services, dir)
+    }
+
+    fn state_window_options(width: f32) -> gpui_kit::WindowOptions {
+        let bounds = gpui_kit::Bounds { origin: gpui_kit::Point::default(), size: gpui_kit::size(gpui_kit::px(width), gpui_kit::px(900.)) };
+        gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() }
+    }
+
+    /// 探测有可见加载态：首屏给骨架、已读内容的刷新只给一行增量指示；卡片与预览入口在任何状态下都在。
+    /// 读完而未连接时换成带"立即连接"的空态——不是空白，也不是把管理入口藏起来。
+    #[gpui_kit::test]
+    fn probing_is_visible_and_offline_targets_get_a_connect_next_step(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        use gpui_kit::AppContext as _;
+        let (services, dir) = state_services("probing");
+        cx.update(gpui_kit::init);
+        let mut pane = AdminPane::new(services.clone());
+        pane.bind(target("sqlite"));
+        // 首屏：还没有读完清单。
+        pane.probing = true;
+        let (window, pane) = cx
+            .update(|cx| gpui_kit::open_window(state_window_options(900.), cx, |_window, cx| cx.new(|_| pane)))
+            .expect("admin pane");
+        let (skeleton, offline, error, header, cards) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                (
+                    window.try_find("skeleton-state").map(|block| block.visible()),
+                    window.try_find("admin-offline").is_some(),
+                    window.try_find("error-state").is_some(),
+                    window.try_find("admin-probing").is_some(),
+                    window.try_find("admin-vacuum").is_some(),
+                )
+            })
+            .unwrap();
+        assert_eq!(skeleton, Some(true), "首屏读取要给骨架");
+        assert!(!offline, "读取中不能先判成未连接");
+        assert!(!error, "读取中不是错误态");
+        assert!(header, "表头要有可见的读取指示");
+        assert!(cards, "加载中也不能收起管理入口");
+
+        // 已读过内容的刷新：内容留着，只在顶部给一行增量指示。
+        pane.update(cx, |pane, cx| {
+            pane.session.inventory = inventory_from_extras(&target("sqlite"), &crate::catalog::ExtrasBody::default());
+            pane.probing = true;
+            cx.notify();
+        });
+        let (skeleton, offline, error, refreshing) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                (
+                    window.try_find("skeleton-state").is_some(),
+                    window.try_find("admin-offline").is_some(),
+                    window.try_find("error-state").is_some(),
+                    window.try_find("admin-refreshing").is_some(),
+                )
+            })
+            .unwrap();
+        assert!(!skeleton, "已读内容的刷新不该整块变骨架");
+        assert!(!offline, "已连接的目标不该出现连接空态");
+        assert!(!error, "刷新不是错误");
+        assert!(refreshing, "增量刷新要有一行可见指示");
+
+        // 读完而没连接：连接空态带主操作，卡片与预览入口仍在。
+        pane.update(cx, |pane, cx| {
+            pane.session.inventory = AdminInventory::offline(&target("postgres"));
+            pane.session.inventory.probed = true;
+            pane.session.target = target("postgres");
+            pane.probing = false;
+            cx.notify();
+        });
+        let (empty, connect_label, ops) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                (window.try_find("admin-offline").is_some(), window.find("admin-body-connect").label().map(str::to_owned), window.try_find("admin-sequence").is_some())
+            })
+            .unwrap();
+        assert!(empty, "未连接的目标要给空态，不是空白");
+        assert_eq!(connect_label.as_deref(), Some(i18n::text(Locale::ZhCn, "admin.action.connect").as_str()), "空态主操作是当场能做的下一步");
+        assert!(ops, "未连接时操作卡（含预览入口）仍要在");
+        cx.update_window(window, |_, window, cx| window.click("admin-body-connect", cx)).unwrap();
+        let request = pane.update(cx, |pane, _| pane.take_connect_request());
+        assert_eq!(request.as_deref(), Some("notes"), "空态主操作要真的发起连接");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 分区读取失败用统一错误态（原因 + 重试），不再自绘危险色卡片。
+    #[gpui_kit::test]
+    fn inventory_faults_use_the_unified_error_state_with_a_retry_next_step(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        use gpui_kit::AppContext as _;
+        let (services, dir) = state_services("faults");
+        cx.update(gpui_kit::init);
+        let mut extras = crate::catalog::ExtrasBody::default();
+        extras.pragmas.error = Some("读取 PRAGMA 失败：database is locked".into());
+        extras.attached.error = Some("读取附加库失败：permission denied".into());
+        let mut pane = AdminPane::new(services.clone());
+        pane.bind(target("sqlite"));
+        pane.session.inventory = inventory_from_extras(&target("sqlite"), &extras);
+        let (window, _pane) = cx
+            .update(|cx| gpui_kit::open_window(state_window_options(900.), cx, |_window, cx| cx.new(|_| pane)))
+            .expect("admin pane");
+        let (errors, details, first, second, first_visible, retry, second_retry) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                (
+                    window.find_all("error-state").len(),
+                    window.find_all("error-state-detail").len(),
+                    window.within("admin-fault-0").try_find("error-state").is_some(),
+                    window.within("admin-fault-1").try_find("error-state").is_some(),
+                    // 首屏可见的错误态（后面的分区在滚动区里，不必同时可见）。
+                    window.find_all("error-state").into_iter().filter(|block| block.visible()).count(),
+                    window.find("admin-retry-0").label().map(str::to_owned),
+                    window.find("admin-retry-1").label().map(str::to_owned),
+                )
+            })
+            .unwrap();
+        assert_eq!(errors, 2, "两个失败分区各一个统一错误态");
+        assert_eq!(details, 2, "错误态都要写清原因");
+        assert!(first && second, "错误态按分区落在自己的块里");
+        assert!(first_visible > 0, "首屏要看得到错误态");
+        let retry_label = i18n::text(Locale::ZhCn, "admin.action.retry");
+        assert_eq!(retry.as_deref(), Some(retry_label.as_str()), "重试按钮文案要翻译过，不能是键名");
+        assert_eq!(second_retry.as_deref(), Some(retry_label.as_str()), "每个失败分区都带自己的重试");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 空的 section 给上下文下一步，并把表单、预览入口留在原地。
+    #[gpui_kit::test]
+    fn empty_sections_carry_a_next_step_and_keep_their_forms(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        use gpui_kit::AppContext as _;
+        let (services, dir) = state_services("empty");
+        cx.update(gpui_kit::init);
+        // 预览按钮的无障碍名是这一节的标题（op_card 的 accessibility_label），不是按钮上的"预览 SQL"。
+        for (engine, empty_id, field_id, button_id, title_key) in [
+            ("sqlite", "admin-attach-empty", "admin-field-attach_path", "admin-attach", "admin.action.attach"),
+            ("postgres", "admin-sequence-empty", "admin-field-sequence", "admin-sequence", "admin.action.sequence"),
+        ] {
+            let mut pane = AdminPane::new(services.clone());
+            pane.bind(target(engine));
+            pane.session.inventory = inventory_from_extras(&target(engine), &crate::catalog::ExtrasBody::default());
+            let (window, _pane) = cx
+                .update(|cx| gpui_kit::open_window(state_window_options(900.), cx, |_window, cx| cx.new(|_| pane)))
+                .expect("admin pane");
+            let (empty, detail, field, preview) = cx
+                .update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    (
+                        window.try_find(empty_id).is_some(),
+                        window.within(empty_id).find("empty-state-detail").visible(),
+                        window.try_find(field_id).is_some(),
+                        window.find(button_id).label().map(str::to_owned),
+                    )
+                })
+                .unwrap();
+            assert!(empty, "{engine}: 空 section 要有带下一步的空态");
+            assert!(detail, "{engine}: 空态要写出下一步（说明文字可见）");
+            assert!(field, "{engine}: 空态不能把输入框挤掉");
+            assert_eq!(preview.as_deref(), Some(i18n::text(Locale::ZhCn, title_key).as_str()), "{engine}: 预览入口仍在，且无障碍名是这一节的标题");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 危险操作：计划里有 danger 级风险时确认层用危险色与不同措辞；普通管理操作也给一句"不能撤销"。
+    #[gpui_kit::test]
+    fn dangerous_previews_mark_the_confirm_and_explain_that_it_cannot_be_undone(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        use gpui_kit::AppContext as _;
+        let (services, dir) = state_services("danger");
+        cx.update(gpui_kit::init);
+        let mut pane = AdminPane::new(services.clone());
+        pane.bind(target("sqlite"));
+        pane.session.inventory = inventory_from_extras(&target("sqlite"), &crate::catalog::ExtrasBody::default());
+        let snapshot = Snapshot::bare(DdlEngine::Sqlite, "main", "", "main");
+        pane.session.operation = AdminOp::Vacuum;
+        pane.session.arm_fixture(&snapshot);
+        assert!(!pane.session.preview_dangerous(), "VACUUM 不是 danger 级");
+        let (window, pane) = cx
+            .update(|cx| gpui_kit::open_window(state_window_options(900.), cx, |_window, cx| cx.new(|_| pane)))
+            .expect("admin pane");
+        let (notice, danger_notice, confirm) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                (
+                    window.try_find("admin-preview-irreversible").map(|block| block.visible()),
+                    window.try_find("admin-preview-danger").is_some(),
+                    window.find("admin-confirm").label().map(str::to_owned),
+                )
+            })
+            .unwrap();
+        assert_eq!(notice, Some(true), "预览层的确认说明要写清不能撤销");
+        assert!(!danger_notice, "没有 danger 级风险时不用危险措辞");
+        assert_eq!(confirm.as_deref(), Some(i18n::text(Locale::ZhCn, "structure.action.confirm").as_str()), "确认入口不能回退");
+
+        // 危险计划走的是同一套预览：删除表自带 danger 级风险。
+        let mut danger_snapshot = Snapshot::bare(DdlEngine::Sqlite, "main", "", "customers");
+        danger_snapshot.name = "customers".into();
+        let plan = preview_plan(&danger_snapshot, &Action::DropTable { table: "customers".into() });
+        assert!(plan.risks.iter().any(|risk| risk.level == "danger"), "删表计划应当带 danger 级风险");
+        pane.update(cx, |pane, cx| {
+            pane.session.arm_live(plan);
+            cx.notify();
+        });
+        let (dangerous, danger_notice, plain_notice, confirm) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                (
+                    pane.read(cx).session.preview_dangerous(),
+                    window.try_find("admin-preview-danger").map(|block| block.visible()),
+                    window.try_find("admin-preview-irreversible").is_some(),
+                    window.find("admin-confirm").label().map(str::to_owned),
+                )
+            })
+            .unwrap();
+        assert!(dangerous, "danger 级风险要认出来");
+        assert_eq!(danger_notice, Some(true), "danger 级风险换成危险措辞");
+        assert!(!plain_notice, "危险与普通说明互斥");
+        assert_ne!(
+            i18n::text(Locale::ZhCn, "admin.preview.danger"),
+            i18n::text(Locale::ZhCn, "admin.preview.irreversible"),
+            "危险与普通管理操作的说明必须不同"
+        );
+        assert_eq!(confirm.as_deref(), Some(i18n::text(Locale::ZhCn, "structure.action.confirm").as_str()), "危险确认入口仍在");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 三档宽度 × 双主题 × 双密度：空态、说明与操作入口都不越出窗口右边界（R1/R4）。
+    /// 本机没有原生截屏通道，这里给的是 headless 布局几何；像素截图由交付阶段在候选版本上取。
+    #[gpui_kit::test]
+    fn states_and_actions_stay_inside_1360_900_and_640_in_both_themes_and_densities(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        use gpui_kit::AppContext as _;
+        let (services, dir) = state_services("widths");
+        cx.update(gpui_kit::init);
+        let setups = [
+            ("浅色/紧凑", false, kit::Metrics::compact()),
+            ("浅色/标准", false, kit::Metrics::standard()),
+            ("深色/紧凑", true, kit::Metrics::compact()),
+            ("深色/标准", true, kit::Metrics::standard()),
+        ];
+        for (label, dark, density) in setups {
+            for width in [1360., 900., 640.] {
+                cx.update(|cx| {
+                    kit::apply_theme(dark, cx);
+                    density.publish(cx);
+                });
+                let mut pane = AdminPane::new(services.clone());
+                pane.bind(target("sqlite"));
+                pane.session.inventory = inventory_from_extras(&target("sqlite"), &crate::catalog::ExtrasBody::default());
+                let (window, _pane) = cx
+                    .update(|cx| gpui_kit::open_window(state_window_options(width), cx, |_window, cx| cx.new(|_| pane)))
+                    .expect("admin pane");
+                let (empty, detail, preview, refresh) = cx
+                    .update_window(window, |_, window, cx| {
+                        window.render_frame(cx);
+                        (
+                            window.try_find("admin-attach-empty").is_some(),
+                            window.find("empty-state-detail").bounds(),
+                            window.find("admin-attach").bounds(),
+                            window.find("admin-refresh").bounds(),
+                        )
+                    })
+                    .unwrap();
+                assert!(empty, "{label}/{width}: 空 section 要给下一步");
+                println!("{label}/{width}: 空态说明 {detail:?} 预览 {preview:?} 刷新 {refresh:?}");
+                for (name, bounds) in [("空态说明", detail), ("预览入口", preview), ("刷新", refresh)] {
+                    assert!(bounds.size.width > px(0.), "{label}/{width}: {name} 要有宽度");
+                    assert!(
+                        bounds.origin.x + bounds.size.width <= px(width) + px(1.),
+                        "{label}/{width}: {name} 越出右边界 {bounds:?}"
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 新增的状态文案：两种语言都有、英文不含中文，且三类语义措辞互不相同。
+    #[test]
+    fn admin_state_copy_is_translated_and_state_specific() {
+        let cjk = crate::ddl::english::has_cjk;
+        let keys = [
+            "admin.probe.loading",
+            "admin.probe.refreshing",
+            "admin.offline.heading",
+            "admin.offline.detail",
+            "admin.section.extras",
+            "admin.section.noneHint",
+            "admin.empty.attached",
+            "admin.empty.attachedHint",
+            "admin.empty.sequences",
+            "admin.empty.sequencesHint",
+            "admin.empty.events",
+            "admin.empty.eventsHint",
+            "admin.empty.enums",
+            "admin.empty.enumsHint",
+            "admin.empty.domains",
+            "admin.empty.domainsHint",
+            "admin.empty.extras",
+            "admin.empty.extrasHint",
+            "admin.preview.irreversible",
+            "admin.preview.danger",
+        ];
+        for key in keys {
+            let zh = i18n::text(Locale::ZhCn, key);
+            let en = i18n::text(Locale::En, key);
+            assert_ne!(zh, key, "{key}");
+            assert_ne!(en, key, "{key}");
+            assert!(!cjk(&en), "{key}: {en}");
+        }
+        assert_ne!(i18n::text(Locale::ZhCn, "admin.section.none"), i18n::text(Locale::ZhCn, "admin.section.noneHint"));
+        assert_ne!(i18n::text(Locale::ZhCn, "admin.empty.attachedHint"), i18n::text(Locale::ZhCn, "admin.offline.detail"));
     }
 }
