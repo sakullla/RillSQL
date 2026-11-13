@@ -5,16 +5,16 @@ use std::sync::Arc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, InputEvent};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClipboardItem, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, px, relative,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window, div, px, relative,
 };
 
 use crate::ui::{DataFormat, EditMode, FormatViewer, TruncationState, ViewerSpec};
-use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, TypeScale};
+use crate::ui::kit::{self, FieldSpec, Fields, Palette, Radius, Tip as _, TypeScale};
 
 use crate::application::AppServices;
 use crate::app::views::grid::{operation_banner, GridTarget};
@@ -86,6 +86,88 @@ fn definition_text(snapshot: &Snapshot) -> (String, Vec<String>) {
         return (snapshot.table_sql.clone(), Vec::new());
     }
     crate::ddl::rebuilt_definition(snapshot)
+}
+
+/// 字段、索引、外键三张列表共用一份几何（S8.4：复用结果网格的表头、行高与列宽规范）。
+/// 行高与表头高都取 `Metrics::row_h`，随密度变化；左右内边距三张表相同，
+/// 不再各自拼 `row_h + 2` 与不同的 `px(14.)`。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TableSpec {
+    header_h: f32,
+    row_h: f32,
+    pad_x: f32,
+}
+
+impl TableSpec {
+    const PAD_X: f32 = 12.;
+
+    fn of(m: kit::Metrics) -> Self {
+        Self { header_h: m.row_h, row_h: m.row_h, pad_x: Self::PAD_X }
+    }
+}
+
+/// 一列的语义、伸缩权重与最小宽度。最小宽度之和要在 640 宽的窗口里放得下（R6）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ColumnSpec {
+    key: &'static str,
+    weight: f32,
+    min_w: f32,
+}
+
+const FIELDS_TABLE: [ColumnSpec; 4] = [
+    ColumnSpec { key: "structure.field.column", weight: 2., min_w: 96. },
+    ColumnSpec { key: "structure.field.type", weight: 1.4, min_w: 76. },
+    ColumnSpec { key: "ui.structure.nullable", weight: 0.6, min_w: 52. },
+    ColumnSpec { key: "ui.structure.default", weight: 1.4, min_w: 80. },
+];
+
+const INDEXES_TABLE: [ColumnSpec; 3] = [
+    ColumnSpec { key: "structure.field.index", weight: 2., min_w: 96. },
+    ColumnSpec { key: "structure.section.columns", weight: 2., min_w: 96. },
+    ColumnSpec { key: "ui.structure.unique", weight: 0.6, min_w: 52. },
+];
+
+const FOREIGN_TABLE: [ColumnSpec; 3] = [
+    ColumnSpec { key: "structure.section.foreign", weight: 1.4, min_w: 84. },
+    ColumnSpec { key: "structure.section.columns", weight: 1.4, min_w: 84. },
+    ColumnSpec { key: "ui.structure.references", weight: 2., min_w: 108. },
+];
+
+fn table_columns(section: Section) -> &'static [ColumnSpec] {
+    match section {
+        Section::Indexes => &INDEXES_TABLE,
+        Section::ForeignKeys => &FOREIGN_TABLE,
+        _ => &FIELDS_TABLE,
+    }
+}
+
+/// 列表三态与内容态的判定，供渲染与测试共用：加载优先于错误，错误优先于空态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListState {
+    Loading,
+    Error,
+    Empty,
+    Rows,
+}
+
+fn list_state(loading: bool, error: &str, rows: usize) -> ListState {
+    if loading {
+        return ListState::Loading;
+    }
+    if !error.is_empty() {
+        return ListState::Error;
+    }
+    if rows == 0 {
+        return ListState::Empty;
+    }
+    ListState::Rows
+}
+
+/// 空态的列表不保留表头骨架：表头只属于有行的表。
+/// 判定与用例共用；渲染路径里"只有有行才画表头"由 `structure_table` 的调用点保证。
+#[allow(dead_code)]
+fn shows_table_header(state: ListState) -> bool {
+    state == ListState::Rows
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,6 +333,27 @@ impl StructureSession {
     pub fn danger_name_ok(&self) -> bool {
         !self.production() || self.danger_name.trim() == self.target.table
     }
+
+    /// 确认层按危险色呈现的条件：危险操作页签，或计划里本身有 danger 级风险。
+    /// 只影响配色与图标，二次确认仍由 `requires_second_confirm` 决定。
+    pub fn preview_dangerous(&self) -> bool {
+        self.section == Section::Danger
+            || self
+                .preview
+                .as_ref()
+                .is_some_and(|plan| plan.risks.iter().any(|risk| risk.level == "danger"))
+    }
+
+    /// 生产环境危险操作必须先输入对象名；未满足时确认按钮保持禁用。
+    pub fn confirm_blocked(&self) -> bool {
+        self.section == Section::Danger && !self.danger_name_ok()
+    }
+
+    /// 确认层标题里的对象名：已有对象用表名，新建表用输入的表名。
+    pub fn object_label(&self) -> String {
+        if self.mode == StructureMode::Create { self.table_name.clone() } else { self.target.table.clone() }
+    }
+
 
     fn column_drafts_for_action(&self) -> Vec<ColumnDraft> {
         let mut columns = self.kept_columns.clone();
@@ -1076,75 +1179,267 @@ impl StructurePane {
         self.view_editor = Some(editor);
     }
 
-    fn overview(&self, p: &Palette, cx: &App) -> AnyElement {
+    /// “当前结构”卡片：列表走统一的加载/失败/空/有行四态；空列表不再画表头加破折号冒充空态。
+    fn overview(&self, entity: &Entity<StructurePane>, p: &Palette, cx: &App) -> AnyElement {
         let locale = self.session.locale;
+        let metrics = kit::Metrics::of(cx);
         let t = |key: &str| SharedString::from(i18n::text(locale, key));
-        if self.loading {
-            return kit::loading_state(t("ui.structure.loading"), p).justify_start().into_any_element();
+        let section = self.session.section;
+        if matches!(section, Section::Columns | Section::Indexes | Section::ForeignKeys) {
+            match list_state(self.loading, &self.load_error, self.list_len(section)) {
+                ListState::Loading => return kit::skeleton_state(6, &metrics, p).into_any_element(),
+                ListState::Error => {
+                    let owner = entity.clone();
+                    let retry = kit::secondary_button("structure-retry", None, t("structure.error.retry"), move |_, _, cx| {
+                        owner.update(cx, |pane, cx| pane.retry_load(cx));
+                    })
+                    .into_any_element();
+                    return kit::error_state_with_action(t("structure.error.heading"), SharedString::from(self.load_error_text()), retry, p).into_any_element();
+                }
+                ListState::Empty => {
+                    let (icon, heading, detail) = match section {
+                        Section::Indexes => (IconName::Hash, "structure.empty.indexes", "structure.empty.indexesHint"),
+                        Section::ForeignKeys => (IconName::Key, "structure.empty.foreignKeys", "structure.empty.foreignKeysHint"),
+                        _ => (IconName::Table, "structure.empty.columns", "structure.empty.columnsHint"),
+                    };
+                    return kit::empty_state(icon, t(heading), t(detail), p).into_any_element();
+                }
+                ListState::Rows => {}
+            }
+            return self.list_card(entity, section, p, cx);
         }
-        if !self.load_error.is_empty() {
-            return div().p(px(16.)).text_color(p.danger).child(SharedString::from(self.load_error_text())).into_any_element();
+        // 视图 / DDL / 危险操作页签：显示对象的 SQL 定义（重建定义与 DDL 页签一致）。
+        let (sql, _missing) = self.snapshot.as_ref().map(definition_text).unwrap_or((String::new(), Vec::new()));
+        if sql.trim().is_empty() {
+            return kit::empty_state(IconName::Braces, t("ui.structure.none"), t("structure.empty.definition"), p).into_any_element();
+        }
+        div()
+            .id("structure-definition")
+            .max_h(px(260.))
+            .overflow_y_scroll()
+            .p(px(metrics.card_pad()))
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_size(px(TypeScale::SM))
+            .text_color(p.text_muted)
+            .child(SharedString::from(sql))
+            .into_any_element()
+    }
+
+    /// 有行时的列表：表头与行共用 TableSpec；行带右键菜单，菜单项仍只改草稿，要预览确认才执行。
+    fn list_card(&self, entity: &Entity<StructurePane>, section: Section, p: &Palette, cx: &App) -> AnyElement {
+        let locale = self.session.locale;
+        let spec = TableSpec::of(kit::Metrics::of(cx));
+        let mono = cx.theme().mono_font_family.clone();
+        let rows = self.list_rows(section, locale, &mono, p);
+        structure_table(entity, table_columns(section), rows, spec, p, locale)
+    }
+
+    fn list_rows(&self, section: Section, locale: Locale, mono: &SharedString, p: &Palette) -> Vec<RowSpec> {
+        let text = |key: &str| i18n::text(locale, key);
+        let Some(snapshot) = &self.snapshot else {
+            return Vec::new();
+        };
+        match section {
+            Section::Columns => snapshot
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| {
+                    let dropped = self.session.kept_columns.get(index).is_some_and(|draft| draft.dropped);
+                    RowSpec {
+                        id: format!("columns-{index}"),
+                        dim: dropped,
+                        cells: vec![
+                            cell_main(column.name.clone(), column.primary.then_some(IconName::Key), p),
+                            cell_mono(column.type_name.clone(), mono, p),
+                            cell_text(if column.nullable { "✓".into() } else { "—".into() }, p),
+                            cell_mono(column.default_sql.clone().unwrap_or_default(), mono, p),
+                        ],
+                        menu: vec![
+                            MenuEntry {
+                                id: format!("copy-column-{index}"),
+                                label: text("structure.menu.copyName"),
+                                action: RowAction::Copy(column.name.clone()),
+                                disabled: false,
+                                reason: None,
+                            },
+                            MenuEntry {
+                                id: format!("drop-column-{index}"),
+                                label: text(if dropped { "structure.menu.restoreColumn" } else { "structure.menu.dropColumn" }),
+                                action: RowAction::ToggleColumnDrop(index),
+                                disabled: false,
+                                reason: None,
+                            },
+                        ],
+                    }
+                })
+                .collect(),
+            Section::Indexes => snapshot
+                .indexes
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let reason = localize(&row.reason, locale);
+                    RowSpec {
+                        id: format!("indexes-{index}"),
+                        dim: false,
+                        cells: vec![
+                            cell_main(row.name.clone(), row.unique.then_some(IconName::Hash), p),
+                            cell_mono(
+                                row.columns
+                                    .iter()
+                                    .map(|column| if column.descending { format!("{} DESC", column.name) } else { column.name.clone() })
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                mono,
+                                p,
+                            ),
+                            cell_text(if row.unique { "✓".into() } else { "—".into() }, p),
+                        ],
+                        menu: vec![
+                            MenuEntry {
+                                id: format!("copy-index-{index}"),
+                                label: text("structure.menu.copyName"),
+                                action: RowAction::Copy(row.name.clone()),
+                                disabled: false,
+                                reason: None,
+                            },
+                            MenuEntry {
+                                id: format!("drop-index-{index}"),
+                                label: text("structure.index.delete"),
+                                action: RowAction::DropIndex(row.name.clone()),
+                                disabled: row.protected,
+                                reason: (row.protected && !reason.is_empty()).then_some(reason),
+                            },
+                        ],
+                    }
+                })
+                .collect(),
+            Section::ForeignKeys => snapshot
+                .foreign_keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    let reference = if key.ref_schema.is_empty() { key.ref_table.clone() } else { format!("{}.{}", key.ref_schema, key.ref_table) };
+                    let name = if key.name.is_empty() { format!("fk_{index}") } else { key.name.clone() };
+                    RowSpec {
+                        id: format!("foreign-{index}"),
+                        dim: false,
+                        cells: vec![
+                            cell_main(name.clone(), None, p),
+                            cell_mono(key.columns.join(", "), mono, p),
+                            cell_mono(format!("{reference}({})", key.ref_columns.join(", ")), mono, p),
+                        ],
+                        menu: vec![
+                            MenuEntry {
+                                id: format!("copy-fk-{index}"),
+                                label: text("structure.menu.copyName"),
+                                action: RowAction::Copy(name.clone()),
+                                disabled: false,
+                                reason: None,
+                            },
+                            MenuEntry {
+                                id: format!("drop-fk-{index}"),
+                                label: text("structure.fk.delete"),
+                                action: RowAction::DropForeignKey(name),
+                                disabled: key.name.is_empty(),
+                                reason: None,
+                            },
+                        ],
+                    }
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn list_len(&self, section: Section) -> usize {
+        let Some(snapshot) = &self.snapshot else {
+            return 0;
+        };
+        match section {
+            Section::Columns => snapshot.columns.len(),
+            Section::Indexes => snapshot.indexes.len(),
+            Section::ForeignKeys => snapshot.foreign_keys.len(),
+            _ => 0,
+        }
+    }
+
+    /// 读取失败后的重试：清掉失败原因与已读标记，下一帧重新读取（不清用户草稿）。
+    pub fn retry_load(&mut self, cx: &mut Context<Self>) {
+        self.load_error.clear();
+        self.loaded_for.clear();
+        self.loading = false;
+        cx.notify();
+    }
+
+    /// 读取中或读取失败时不显示新增表单与主操作：先让用户看到加载/失败态与重试。
+    fn form_visible(&self) -> bool {
+        self.session.mode == StructureMode::Create || (!self.loading && self.load_error.is_empty())
+    }
+
+    /// 主操作（预览 SQL）固定显示的条件。它与内容滚动分开，长字段列表下也始终可达。
+    fn preview_action_visible(&self) -> bool {
+        let section = self.session.section;
+        let readonly_view = self.session.object_kind == "view" && self.session.mode != StructureMode::Create;
+        self.form_visible() && !matches!(section, Section::Ddl) && !(section == Section::Columns && readonly_view)
+    }
+
+    /// 表名 + 字段/索引数量的摘要行（S8.4）。
+    fn summary_text(&self) -> String {
+        if self.session.mode == StructureMode::Create {
+            return String::new();
         }
         let Some(snapshot) = &self.snapshot else {
-            return div().p(px(16.)).text_color(p.text_faint).child(t("ui.structure.none")).into_any_element();
+            return String::new();
         };
-        let mono = cx.theme().mono_font_family.clone();
-        match self.session.section {
-            Section::Columns => {
-                let rows = snapshot
-                    .columns
-                    .iter()
-                    .map(|column| {
-                        vec![
-                            cell_main(column.name.clone(), column.primary.then_some(IconName::Key), p),
-                            cell_mono(column.type_name.clone(), &mono, p),
-                            cell_text(if column.nullable { "✓".into() } else { "—".into() }, p),
-                            cell_mono(column.default_sql.clone().unwrap_or_default(), &mono, p),
-                        ]
-                    })
-                    .collect();
-                grid_table(vec![t("structure.field.column"), t("structure.field.type"), t("ui.structure.nullable"), t("ui.structure.default")], vec![2., 1.4, 0.6, 1.4], rows, p, kit::Metrics::of(cx))
-            }
-            Section::Indexes => {
-                let rows = snapshot
-                    .indexes
-                    .iter()
-                    .map(|index| {
-                        vec![
-                            cell_main(index.name.clone(), index.unique.then_some(IconName::Hash), p),
-                            cell_mono(index.columns.iter().map(|column| if column.descending { format!("{} DESC", column.name) } else { column.name.clone() }).collect::<Vec<_>>().join(", "), &mono, p),
-                            cell_text(if index.unique { "✓".into() } else { "—".into() }, p),
-                        ]
-                    })
-                    .collect();
-                grid_table(vec![t("structure.field.index"), t("structure.section.columns"), t("ui.structure.unique")], vec![2., 2., 0.6], rows, p, kit::Metrics::of(cx))
-            }
-            Section::ForeignKeys => {
-                let rows = snapshot
-                    .foreign_keys
-                    .iter()
-                    .map(|key| {
-                        let reference = if key.ref_schema.is_empty() { key.ref_table.clone() } else { format!("{}.{}", key.ref_schema, key.ref_table) };
-                        vec![
-                            cell_main(if key.name.is_empty() { "—".into() } else { key.name.clone() }, None, p),
-                            cell_mono(key.columns.join(", "), &mono, p),
-                            cell_mono(format!("{reference}({})", key.ref_columns.join(", ")), &mono, p),
-                        ]
-                    })
-                    .collect();
-                grid_table(vec![t("structure.section.foreign"), t("structure.section.columns"), t("ui.structure.references")], vec![1.4, 1.4, 2.], rows, p, kit::Metrics::of(cx))
-            }
-            Section::View | Section::Ddl | Section::Danger => div()
-                .id("structure-ddl")
-                .max_h(px(260.))
-                .overflow_y_scroll()
-                .p(px(14.))
-                .font_family(mono)
-                .text_size(px(TypeScale::SM))
-                .text_color(p.text_muted)
-                .child(SharedString::from(if snapshot.table_sql.is_empty() { i18n::text(locale, "ui.structure.none") } else { snapshot.table_sql.clone() }))
-                .into_any_element(),
+        let columns = snapshot.columns.len().to_string();
+        let indexes = snapshot.indexes.len().to_string();
+        i18n::fill(&i18n::text(self.session.locale, "structure.summary"), &[("columns", &columns), ("indexes", &indexes)])
+    }
+
+    fn apply_row_action(&mut self, action: RowAction, cx: &mut Context<Self>) {
+        match action {
+            RowAction::Copy(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+            RowAction::ToggleColumnDrop(index) => self.toggle_column(index, "drop"),
+            RowAction::DropIndex(name) => self.preview_drop_index(name, cx),
+            RowAction::DropForeignKey(name) => self.preview_drop_fk(name, cx),
         }
+    }
+
+    /// 主操作按钮：页签内容之外的一条固定动作栏，三档宽度都不被滚动吞掉。
+    fn preview_footer(&self, entity: &Entity<StructurePane>, p: &Palette, locale: Locale, metrics: kit::Metrics) -> Option<AnyElement> {
+        if !self.preview_action_visible() {
+            return None;
+        }
+        let t = |key: &str| SharedString::from(i18n::text(locale, key));
+        let section = self.session.section;
+        let owner = entity.clone();
+        let click = move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
+            owner.update(cx, |pane, cx| pane.preview_current(cx));
+        };
+        let button = if section == Section::Danger {
+            kit::danger_button("structure-preview", Some(IconName::Eye), t("structure.action.preview"), click).into_any_element()
+        } else {
+            kit::primary_button("structure-preview", Some(IconName::Eye), t("structure.action.preview"), click).into_any_element()
+        };
+        Some(
+            div()
+                .id("structure-actions")
+                .test_support()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(metrics.page_pad))
+                .py(px(8.))
+                .border_t_1()
+                .border_color(p.line)
+                .bg(p.surface)
+                .child(div().flex_1().min_w(px(0.)).child(kit::muted(t("structure.action.hint"), p)))
+                .child(button)
+                .into_any_element(),
+        )
     }
 }
 
@@ -1202,24 +1497,131 @@ async fn load_fk_choices(service: &crate::connections::Service, target: &GridTar
     FkChoices { schemas, tables, columns }
 }
 
-fn grid_table(headers: Vec<SharedString>, weights: Vec<f32>, rows: Vec<Vec<AnyElement>>, p: &Palette, m: kit::Metrics) -> AnyElement {
-    let mut head = div().flex().px(px(14.)).h(px(m.bar_h() - 2.)).items_center().bg(p.chrome).border_b_1().border_color(p.line).text_size(px(TypeScale::XS)).text_color(p.text_faint);
-    for (header, weight) in headers.into_iter().zip(weights.iter()) {
-        head = head.child(div().flex_grow(*weight).flex_shrink(1.).flex_basis(px(0.)).min_w(px(0.)).child(header));
+/// 列表一行：单元格、右键菜单与“已标记删除”的淡化状态。
+struct RowSpec {
+    /// 行 id 片段（\`columns-0\` 之类），行的元素 id 是 \`structure-row-{id}\`。
+    id: String,
+    dim: bool,
+    cells: Vec<AnyElement>,
+    menu: Vec<MenuEntry>,
+}
+
+/// 右键菜单项。动作只改草稿或发起预览，不直接执行 SQL。
+struct MenuEntry {
+    id: String,
+    label: String,
+    action: RowAction,
+    disabled: bool,
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RowAction {
+    Copy(String),
+    ToggleColumnDrop(usize),
+    DropIndex(String),
+    DropForeignKey(String),
+}
+
+/// 一张结构列表：表头与行共用一份 TableSpec（行高、表头高、左右内边距）。
+fn structure_table(entity: &Entity<StructurePane>, columns: &[ColumnSpec], rows: Vec<RowSpec>, spec: TableSpec, p: &Palette, locale: Locale) -> AnyElement {
+    let mut head = div()
+        .id("structure-table-head")
+        .test_support()
+        .flex()
+        .flex_none()
+        .px(px(spec.pad_x))
+        .h(px(spec.header_h))
+        .items_center()
+        .bg(p.chrome)
+        .border_b_1()
+        .border_color(p.line)
+        .text_size(px(TypeScale::XS))
+        .text_color(p.text_faint);
+    for column in columns {
+        head = head.child(table_cell(*column, div().truncate().child(SharedString::from(i18n::text(locale, column.key)))));
     }
     let mut body = div().flex().flex_col();
-    let empty = rows.is_empty();
     for row in rows {
-        let mut line = div().flex().px(px(14.)).min_h(px(m.row_h + 2.)).items_center().border_b_1().border_color(p.line_soft).hover(|style| style.bg(p.hover));
-        for (cell, weight) in row.into_iter().zip(weights.iter()) {
-            line = line.child(div().flex_grow(*weight).flex_shrink(1.).flex_basis(px(0.)).min_w(px(0.)).pr(px(8.)).child(cell));
+        let owner = entity.clone();
+        let entries = row.menu;
+        // 每行一个稳定的元素 id：右键菜单的状态按元素 id 保存，共用同一处代码位置会让所有行共享一个菜单。
+        let mut cells = div()
+            .id(SharedString::from(format!("structure-row-cells-{}", row.id)))
+            .flex()
+            .flex_1()
+            .min_w(px(0.))
+            .items_center();
+        for (cell, column) in row.cells.into_iter().zip(columns.iter()) {
+            cells = cells.child(table_cell(*column, cell));
         }
+        let cells = cells.context_menu(move |menu, _, _| row_menu(&owner, &entries, menu));
+        let line = div()
+            .id(SharedString::from(format!("structure-row-{}", row.id)))
+            .test_support()
+            .flex()
+            .px(px(spec.pad_x))
+            .h(px(spec.row_h))
+            .items_center()
+            .border_b_1()
+            .border_color(p.line_soft)
+            .when(row.dim, |this| this.opacity(0.5))
+            .hover(|style| style.bg(p.hover))
+            .child(cells);
         body = body.child(line);
     }
-    if empty {
-        body = body.child(div().px(px(14.)).py(px(12.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child("—"));
-    }
     div().flex().flex_col().child(head).child(body).into_any_element()
+}
+
+fn table_cell(cell: ColumnSpec, child: impl IntoElement) -> gpui_kit::Div {
+    div()
+        .flex_grow(cell.weight)
+        .flex_shrink(1.)
+        .flex_basis(px(0.))
+        .min_w(px(cell.min_w))
+        .pr(px(8.))
+        .child(child)
+}
+
+fn row_menu(entity: &Entity<StructurePane>, entries: &[MenuEntry], mut menu: PopupMenu) -> PopupMenu {
+    for entry in entries {
+        menu = menu.item(menu_entry(entity, entry));
+    }
+    menu
+}
+
+/// 菜单项带稳定 id（\`structure-menu-{id}\`），禁用项留在菜单里并说明原因。
+fn menu_entry(entity: &Entity<StructurePane>, entry: &MenuEntry) -> PopupMenuItem {
+    let owner = entity.downgrade();
+    let element_id = SharedString::from(format!("structure-menu-{}", entry.id));
+    let label = SharedString::from(entry.label.clone());
+    let reason = entry.reason.clone();
+    let disabled = entry.disabled;
+    let item = PopupMenuItem::element(move |_, cx| {
+        let p = Palette::of(cx);
+        div()
+            .id(element_id.clone())
+            .test_support()
+            .w_full()
+            .flex()
+            .items_center()
+            .text_size(px(TypeScale::SM))
+            .when(disabled, |this| this.text_color(p.text_faint))
+            .child(label.clone())
+            .when_some(reason.clone(), |this, reason| this.tooltip_text(SharedString::from(reason)))
+    });
+    if entry.disabled {
+        return item.disabled(true);
+    }
+    let action = entry.action.clone();
+    item.on_click(move |_: &gpui_kit::ClickEvent, _, cx| {
+        if let Some(owner) = owner.upgrade() {
+            owner.update(cx, |pane, cx| {
+                pane.apply_row_action(action.clone(), cx);
+                cx.notify();
+            });
+        }
+    })
 }
 
 fn cell_main(text: String, icon: Option<IconName>, p: &Palette) -> AnyElement {
@@ -1238,9 +1640,8 @@ fn cell_mono(text: String, mono: &SharedString, p: &Palette) -> AnyElement {
 }
 
 fn cell_text(text: String, p: &Palette) -> AnyElement {
-    div().text_color(p.text_muted).child(SharedString::from(text)).into_any_element()
+    div().truncate().text_color(p.text_muted).child(SharedString::from(text)).into_any_element()
 }
-
 
 impl StructurePane {
     fn preview_current(&mut self, cx: &mut Context<Self>) {
@@ -1743,17 +2144,6 @@ impl StructurePane {
                 }
             }
         }
-        if !matches!(section, Section::Ddl) && !(section == Section::Columns && readonly_view) {
-            let preview_entity = entity.clone();
-            let preview_click = move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| {
-                preview_entity.update(cx, |pane, cx| pane.preview_current(cx));
-            };
-            form = form.child(div().flex().justify_end().child(if section == Section::Danger {
-                kit::danger_button("structure-preview", Some(IconName::Eye), t("structure.action.preview"), preview_click).into_any_element()
-            } else {
-                kit::primary_button("structure-preview", Some(IconName::Eye), t("structure.action.preview"), preview_click).into_any_element()
-            }));
-        }
         form.into_any_element()
     }
 }
@@ -1792,7 +2182,8 @@ impl Render for StructurePane {
                 }),
             ));
         }
-        let form = self.section_form(window, cx);
+        let form = if self.form_visible() { Some(self.section_form(window, cx)) } else { None };
+        let summary = self.summary_text();
         let title = if self.session.mode == StructureMode::Create {
             t("structure.action.createTable")
         } else if self.session.target.table.is_empty() {
@@ -1802,6 +2193,7 @@ impl Render for StructurePane {
         };
         let mut column = div()
             .id("structure-pane")
+            .test_support()
             .relative()
             .size_full()
             .flex()
@@ -1826,19 +2218,66 @@ impl Render for StructurePane {
                             .flex()
                             .flex_col()
                             .child(kit::title(title, TypeScale::LG, &p))
-                            .child(div().id("structure-banner").text_size(px(TypeScale::SM)).text_color(p.text_muted).truncate().child(SharedString::from(self.session.banner()))),
+                            .child(div().id("structure-banner").text_size(px(TypeScale::SM)).text_color(p.text_muted).truncate().child(SharedString::from(self.session.banner())))
+                            .when(!summary.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .id("structure-summary")
+                                        .test_support()
+                                        .text_size(px(TypeScale::XS))
+                                        .text_color(p.text_faint)
+                                        .truncate()
+                                        .child(SharedString::from(summary)),
+                                )
+                            }),
                     )
                     .child(kit::segmented_sized(items, &p, metrics.control_h)),
             );
         let mut body = div().id("structure-body").flex_1().min_h(px(0.)).overflow_y_scroll().p(px(metrics.page_pad)).flex().flex_col().gap(px(metrics.section_gap()));
-        body = body
-            .child(div().flex().flex_col().gap(px(8.)).child(kit::eyebrow(t("ui.structure.existing"), &p)).child(kit::card(&p).overflow_hidden().child(self.overview(&p, cx))))
-            .child(div().flex().flex_col().gap(px(8.)).child(kit::eyebrow(t(if section == Section::Danger { "structure.section.danger" } else { "ui.structure.add" }), &p)).child(kit::card(&p).p(px(metrics.card_pad())).child(form)));
+        body = body.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(kit::eyebrow(t("ui.structure.existing"), &p))
+                .child(kit::card(&p).overflow_hidden().child(self.overview(&entity, &p, cx))),
+        );
+        if let Some(form) = form {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(kit::eyebrow(t(if section == Section::Danger { "structure.section.danger" } else { "ui.structure.add" }), &p))
+                    .child(kit::card(&p).p(px(metrics.card_pad())).child(form)),
+            );
+        }
         if !self.session.note.is_empty() {
             body = body.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.hover).text_size(px(TypeScale::SM)).child(SharedString::from(self.session.note())));
         }
-        column = column.child(body);
+        column = column.child(body.test_support());
+        if let Some(actions) = self.preview_footer(&entity, &p, locale, metrics) {
+            column = column.child(actions);
+        }
         if self.session.preview_open() {
+            // 危险操作确认层（S12.5）：标题行带对象名与危险图标，只有正文滚动，
+            // 页脚动作固定可见，640/900/1360 三档都能点到取消与确认。
+            let dangerous = self.session.preview_dangerous();
+            let armed = self.session.armed();
+            let confirm_blocked = self.session.confirm_blocked();
+            let object = SharedString::from(self.session.object_label());
+            let sql = self.session.preview_sql().join("\n");
+            let banner = SharedString::from(self.session.banner());
+            let target = SharedString::from(self.session.preview_target());
+            let rule = self.session.preview_rule();
+            let note_text = self.session.note();
+            let risks = self.session.preview_risks();
+            let blocked_text = self.session.blocked().join(" ");
+            let preview_title = t("structure.preview.title");
+            let confirm_label = if armed { t("structure.action.confirmAgain") } else { t("structure.action.confirm") };
+            let cancel_label = t("structure.action.cancel");
+            let typed_hint =
+                (section == Section::Danger && self.session.production() && confirm_blocked).then(|| t("structure.danger.typeHint"));
             let danger_field = if section == Section::Danger && self.session.production() {
                 Some(kit::form_row(
                     t("structure.danger.typeName"),
@@ -1848,7 +2287,6 @@ impl Render for StructurePane {
             } else {
                 None
             };
-            let blocked = self.session.blocked();
             let confirm = {
                 let entity = entity.clone();
                 move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| entity.update(cx, |pane, cx| pane.confirm(cx))
@@ -1865,63 +2303,116 @@ impl Render for StructurePane {
             column = column.child(
                 div().absolute().inset_0().bg(gpui_kit::hsla(0., 0., 0., 0.25)).flex().items_center().justify_center().child(
                     div()
-                        .id("structure-preview")
+                        .id("structure-preview-dialog")
+                        .test_support()
                         .role(gpui_kit::Role::Dialog)
-                        .aria_label(t("structure.preview.title"))
+                        .aria_label(preview_title.clone())
                         .occlude()
                         .w(px(620.))
                         .max_w(relative(0.92))
-                        .p(px(metrics.card_pad()))
+                        .max_h(relative(0.92))
                         .flex()
                         .flex_col()
-                        .gap(px(12.))
+                        .overflow_hidden()
                         .bg(p.raised)
                         .border_1()
                         .border_color(p.line)
                         .rounded(px(Radius::PANEL))
                         .shadow_lg()
-                        .child(kit::title(t("structure.preview.title"), TypeScale::LG, &p))
-                        .child(kit::muted(SharedString::from(self.session.banner()), &p))
                         .child(
                             div()
-                                .id("structure-preview-sql")
-                                .max_h(px(280.))
-                                .overflow_y_scroll()
-                                .p(px(12.))
-                                .rounded(px(Radius::PANEL))
-                                .bg(p.chrome)
-                                .border_1()
-                                .border_color(p.line)
-                                .font_family(cx.theme().mono_font_family.clone())
-                                .text_size(px(TypeScale::SM))
-                                .child(SharedString::from(self.session.preview_sql().join("\n"))),
-                        )
-                        .child(kit::muted(SharedString::from(self.session.preview_target()), &p))
-                        .when(!self.session.preview_risks().is_empty(), |this| {
-                            let mut risks = div().flex().flex_col().gap(px(4.));
-                            for (level, text) in self.session.preview_risks() {
-                                let (fg, bg) = if level == "danger" { (p.danger, p.danger_soft) } else if level == "warn" { (p.warn, p.warn_soft) } else { (p.text_muted, p.hover) };
-                                risks = risks.child(div().px(px(10.)).py(px(6.)).rounded(px(Radius::PANEL)).bg(bg).text_color(fg).text_size(px(TypeScale::SM)).child(SharedString::from(text)));
-                            }
-                            this.child(risks)
-                        })
-                        .when(!self.session.preview_rule().is_empty(), |this| this.child(kit::muted(SharedString::from(self.session.preview_rule()), &p)))
-                        .when(!blocked.is_empty(), |this| {
-                            this.child(div().px(px(12.)).py(px(8.)).rounded(px(Radius::PANEL)).bg(p.danger_soft).text_color(p.danger).text_size(px(TypeScale::SM)).child(SharedString::from(blocked.join(" "))))
-                        })
-                        .when(!self.session.note.is_empty(), |this| this.child(kit::muted(SharedString::from(self.session.note()), &p)))
-                        .when_some(danger_field, |this, field| this.child(field))
-                        .child(
-                            div()
+                                .flex_none()
                                 .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .px(px(metrics.card_pad()))
+                                .pt(px(metrics.card_pad()))
+                                .pb(px(10.))
+                                .border_b_1()
+                                .border_color(p.line_soft)
+                                .when(dangerous, |this| this.child(kit::icon(IconName::TriangleAlert, 16., p.danger)))
+                                .child(kit::title(preview_title, TypeScale::LG, &p))
+                                .child(div().flex_1().min_w(px(0.)))
+                                .child(
+                                    div()
+                                        .id("structure-preview-object")
+                                        .test_support()
+                                        .min_w(px(0.))
+                                        .text_size(px(TypeScale::SM))
+                                        .text_color(p.text_muted)
+                                        .truncate()
+                                        .child(object),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("structure-preview-body")
+                                .test_support()
+                                .flex_1()
+                                .min_h(px(0.))
+                                .overflow_y_scroll()
+                                .px(px(metrics.card_pad()))
+                                .py(px(10.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(10.))
+                                .child(kit::muted(banner, &p))
+                                .child(
+                                    div()
+                                        .id("structure-preview-sql")
+                                        .max_h(px(240.))
+                                        .overflow_y_scroll()
+                                        .p(px(12.))
+                                        .rounded(px(Radius::PANEL))
+                                        .bg(p.chrome)
+                                        .border_1()
+                                        .border_color(p.line)
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .text_size(px(TypeScale::SM))
+                                        .child(SharedString::from(sql)),
+                                )
+                                .child(kit::muted(target, &p))
+                                .when(!risks.is_empty(), |this| {
+                                    let mut list = div().flex().flex_col().gap(px(4.));
+                                    for (level, text) in risks {
+                                        let (fg, bg) = if level == "danger" { (p.danger, p.danger_soft) } else if level == "warn" { (p.warn, p.warn_soft) } else { (p.text_muted, p.hover) };
+                                        list = list.child(div().px(px(10.)).py(px(6.)).rounded(px(Radius::PANEL)).bg(bg).text_color(fg).text_size(px(TypeScale::SM)).child(SharedString::from(text)));
+                                    }
+                                    this.child(list)
+                                })
+                                .when(!rule.is_empty(), |this| this.child(kit::muted(SharedString::from(rule), &p)))
+                                .when(!blocked_text.is_empty(), |this| {
+                                    this.child(
+                                        div()
+                                            .px(px(12.))
+                                            .py(px(8.))
+                                            .rounded(px(Radius::PANEL))
+                                            .bg(p.danger_soft)
+                                            .text_color(p.danger)
+                                            .text_size(px(TypeScale::SM))
+                                            .child(SharedString::from(blocked_text.clone())),
+                                    )
+                                })
+                                .when(!note_text.is_empty(), |this| this.child(kit::muted(SharedString::from(note_text), &p)))
+                                .when_some(danger_field, |this, field| this.child(field))
+                                .when_some(typed_hint, |this, hint| this.child(div().text_size(px(TypeScale::XS)).text_color(p.warn).child(hint))),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
                                 .justify_end()
                                 .gap(px(8.))
-                                .child(kit::secondary_button("structure-cancel", None, t("structure.action.cancel"), cancel))
-                                .child(if section == Section::Danger || self.session.armed() {
-                                    let label = if self.session.armed() { t("structure.action.confirmAgain") } else { t("structure.action.confirm") };
-                                    kit::danger_button("structure-confirm", Some(IconName::Check), label, confirm).disabled(section == Section::Danger && !self.session.danger_name_ok()).into_any_element()
+                                .px(px(metrics.card_pad()))
+                                .py(px(10.))
+                                .border_t_1()
+                                .border_color(p.line_soft)
+                                .child(kit::secondary_button("structure-cancel", None, cancel_label, cancel))
+                                .child(if dangerous || armed {
+                                    kit::danger_button("structure-confirm", Some(IconName::Check), confirm_label, confirm).disabled(confirm_blocked).into_any_element()
                                 } else {
-                                    kit::primary_button("structure-confirm", Some(IconName::Check), t("structure.action.confirm"), confirm).into_any_element()
+                                    kit::primary_button("structure-confirm", Some(IconName::Check), confirm_label, confirm).into_any_element()
                                 }),
                         ),
                 ),
@@ -2377,6 +2868,324 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn snapshot_with(columns: usize) -> Snapshot {
+        let mut snapshot = Snapshot::bare(DdlEngine::Postgres, "app", "public", "orders");
+        snapshot.kind = "table".into();
+        for index in 0..columns {
+            snapshot.columns.push(column(&format!("col_{index}"), if index == 0 { "bigint" } else { "integer" }, index == 0));
+        }
+        snapshot
+    }
+
+    /// 没有连接 id 的目标：渲染时不会发起读取，快照由用例直接注入。
+    fn offline_target(table: &str) -> GridTarget {
+        GridTarget {
+            connection_id: String::new(),
+            connection_name: String::new(),
+            database: "app".into(),
+            schema: "public".into(),
+            table: table.into(),
+            engine: "postgres".into(),
+            environment: "dev".into(),
+        }
+    }
+
+    fn pane_with_snapshot(services: std::sync::Arc<crate::application::AppServices>, columns: usize) -> StructurePane {
+        let mut pane = StructurePane::new(services);
+        pane.bind(offline_target("orders"));
+        let snapshot = snapshot_with(columns);
+        pane.session.object_kind = snapshot.kind.clone();
+        pane.session.kept_columns = column_drafts(&snapshot);
+        pane.session.index_columns.clear();
+        pane.drafts_ready = true;
+        pane.snapshot = Some(snapshot);
+        pane
+    }
+
+    fn offline_services(name: &str) -> (std::sync::Arc<crate::application::AppServices>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("rillsql-structure-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services = std::sync::Arc::new(crate::application::AppServices::new(std::sync::Arc::new(
+            crate::connections::Service::new_for_test(dir.join("connections.sqlite")),
+        )));
+        (services, dir)
+    }
+
+    /// 字段、索引、外键三张列表共用一份行高、表头高与内边距，最小列宽在 640 宽窗口里放得下（S8.4 / R6）。
+    #[test]
+    fn structure_lists_share_one_row_height_and_fit_the_narrowest_window() {
+        for metrics in [kit::Metrics::compact(), kit::Metrics::standard(), kit::Metrics::relaxed()] {
+            let spec = TableSpec::of(metrics);
+            assert_eq!(spec.header_h, metrics.row_h, "表头高取 row_h");
+            assert_eq!(spec.row_h, metrics.row_h, "行高取 row_h，不再各表 +2");
+            assert_eq!(spec.pad_x, TableSpec::PAD_X, "三张表共用同一左右内边距");
+            for section in [Section::Columns, Section::Indexes, Section::ForeignKeys] {
+                let columns = table_columns(section);
+                assert!(columns.len() >= 3, "{section:?} 至少要能显示标识、内容与状态列");
+                let total: f32 = columns.iter().map(|column| column.min_w).sum();
+                let available = 640. - 2. * metrics.page_pad - 2. * spec.pad_x;
+                assert!(total <= available, "{section:?}: 最小列宽之和 {total} 超过 640 宽可用的 {available}");
+                assert!(columns.iter().all(|column| column.weight > 0.), "{section:?}: 每列都要能伸缩");
+            }
+        }
+        // 反向：行高不能是个与密度无关的常量。
+        assert_ne!(TableSpec::of(kit::Metrics::compact()).row_h, TableSpec::of(kit::Metrics::standard()).row_h);
+    }
+
+    /// 空列表不画表头冒充空态；加载优先于错误，错误优先于空态。
+    #[test]
+    fn empty_lists_have_no_header_and_loading_wins_over_error() {
+        assert_eq!(list_state(false, "", 0), ListState::Empty);
+        assert!(!shows_table_header(ListState::Empty), "空列表不能保留表头加破折号");
+        assert_eq!(list_state(false, "", 3), ListState::Rows);
+        assert!(shows_table_header(ListState::Rows));
+        assert_eq!(list_state(true, "", 0), ListState::Loading);
+        assert_eq!(list_state(true, "找不到表或视图 orders", 3), ListState::Loading, "加载优先于错误");
+        assert_eq!(list_state(false, "找不到表或视图 orders", 0), ListState::Error);
+    }
+
+    /// 生产环境的危险操作在输入对象名之前不能确认；图标/配色按危险呈现。
+    #[test]
+    fn production_warning_name_gates_the_confirm_button() {
+        let mut session = StructureSession::new(target("postgres", "orders"));
+        session.target.environment = "prod".into();
+        session.section = Section::Danger;
+        session.arm_fixture(&snapshot_with(1));
+        assert!(session.confirm_blocked(), "生产环境未输入对象名时确认必须禁用");
+        assert!(session.preview_dangerous());
+        session.danger_name = "orders".into();
+        assert!(!session.confirm_blocked());
+        session.section = Section::Columns;
+        assert!(!session.confirm_blocked(), "非危险页签不受对象名约束");
+        assert_eq!(session.object_label(), "orders");
+
+        session.mode = StructureMode::Create;
+        session.table_name = "notes".into();
+        assert_eq!(session.object_label(), "notes", "新建表确认层标题用输入的表名");
+    }
+
+    /// 主操作固定在滚动内容之外：字段很多、窗口只有 640 宽时也直接可见可点（R6）。
+    #[gpui_kit::test]
+    fn primary_action_stays_outside_the_scrolled_body_at_every_width(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        use gpui_kit::AppContext as _;
+        let (services, dir) = offline_services("actions");
+        cx.update(gpui_kit::init);
+        for width in [1360., 900., 640.] {
+            let (window, _pane) = cx
+                .update(|cx| {
+                    let bounds = gpui_kit::Bounds {
+                        origin: gpui_kit::Point::default(),
+                        size: gpui_kit::size(gpui_kit::px(width), gpui_kit::px(900.)),
+                    };
+                    let (window, pane) = gpui_kit::open_window(
+                        gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+                        cx,
+                        |_window, cx| cx.new(|_| pane_with_snapshot(services.clone(), 26)),
+                    )
+                    .expect("structure pane");
+                    (window, pane)
+                });
+            let (button, body, pane_bounds, row_h) = cx
+                .update_window(window, |_, window, cx| {
+                    window.render_frame(cx);
+                    (
+                        window.find("structure-preview").bounds(),
+                        window.find("structure-body").bounds(),
+                        window.find("structure-pane").bounds(),
+                        window.find("structure-row-columns-0").bounds(),
+                    )
+                })
+                .unwrap();
+            let bottom = f32::from(button.origin.y + button.size.height);
+            assert!(bottom <= f32::from(pane_bounds.size.height) + 0.5, "{width}: 主操作被裁在窗口外（底 {bottom}）");
+            assert!(
+                f32::from(button.origin.y) >= f32::from(body.origin.y + body.size.height) - 0.5,
+                "{width}: 主操作不能落在滚动内容里"
+            );
+            let expected = cx.update(|cx| kit::Metrics::of(cx).row_h);
+            assert!((f32::from(row_h.size.height) - expected).abs() < 0.5, "{width}: 行高应为 Metrics::row_h {expected}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 行右键菜单的语义：复制只写剪贴板，"标记删除"只改草稿，任何菜单动作都不执行 SQL。
+    ///
+    /// 说明：ContextMenu 弹层在 headless 测试窗口里不展开（它用 hitbox.is_hovered 判断按下是否属于自己，
+    /// 没有真实指针时恒为假），所以这里验证菜单项内容与它们触发的动作；行的渲染与行高由
+    /// primary_action_stays_outside_the_scrolled_body_at_every_width 覆盖。
+    #[gpui_kit::test]
+    fn row_menu_actions_only_edit_the_draft_and_never_execute(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let (services, dir) = offline_services("menu");
+        let pane = cx.update(|cx| cx.new(|_| pane_with_snapshot(services, 2)));
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                let mono = SharedString::from("mono");
+                let rows = pane.list_rows(Section::Columns, Locale::ZhCn, &mono, &Palette::light());
+                assert_eq!(rows.len(), 2, "两列就该有两个可右键的行");
+                let ids = rows[1].menu.iter().map(|entry| entry.id.as_str()).collect::<Vec<_>>();
+                assert_eq!(ids, vec!["copy-column-1", "drop-column-1"], "字段行菜单：复制名称 + 标记删除");
+                assert!(rows[1].menu.iter().all(|entry| !entry.disabled));
+
+                pane.apply_row_action(RowAction::Copy("col_1".into()), cx);
+                pane.apply_row_action(RowAction::ToggleColumnDrop(1), cx);
+                assert!(pane.session.kept_columns[1].dropped, "标记删除落在草稿上");
+                assert!(!pane.session.preview_open(), "菜单动作不能绕过预览");
+                assert!(!pane.session.armed(), "也不能把计划推到可执行状态");
+                // 同一个菜单项再点一次是取消标记。
+                pane.apply_row_action(RowAction::ToggleColumnDrop(1), cx);
+                assert!(!pane.session.kept_columns[1].dropped, "再点一次取消删除标记");
+            });
+        });
+        let copied = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        assert_eq!(copied.as_deref(), Some("col_1"), "复制名称进剪贴板");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 浅/深色 × 紧凑/标准：行高与表头高随密度取 \`row_h\`，主题只换配色，主操作与空态位置不变（S9 / S12.2）。
+    #[gpui_kit::test]
+    fn structure_lists_follow_density_in_both_themes(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        use gpui_kit::AppContext as _;
+        let (services, dir) = offline_services("density");
+        for dark in [false, true] {
+            for metrics in [kit::Metrics::compact(), kit::Metrics::standard()] {
+                let expected = metrics.row_h;
+                cx.update(|cx| {
+                    gpui_kit::init(cx);
+                    kit::apply_theme(dark, cx);
+                    metrics.publish(cx);
+                });
+                let (window, _pane) = cx
+                    .update(|cx| {
+                        let bounds = gpui_kit::Bounds {
+                            origin: gpui_kit::Point::default(),
+                            size: gpui_kit::size(gpui_kit::px(900.), gpui_kit::px(900.)),
+                        };
+                        let (window, pane) = gpui_kit::open_window(
+                            gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+                            cx,
+                            |_window, cx| cx.new(|_| pane_with_snapshot(services.clone(), 3)),
+                        )
+                        .expect("structure pane");
+                        (window, pane)
+                    });
+                let (row, head, action) = cx
+                    .update_window(window, |_, window, cx| {
+                        window.render_frame(cx);
+                        (
+                            window.find("structure-row-columns-0").bounds(),
+                            window.find("structure-table-head").bounds(),
+                            window.find("structure-preview").visible(),
+                        )
+                    })
+                    .unwrap();
+                let theme = if dark { "深色" } else { "浅色" };
+                assert!((f32::from(row.size.height) - expected).abs() < 0.5, "{theme}: 行高 {} 应为 {expected}", f32::from(row.size.height));
+                assert!((f32::from(head.size.height) - expected).abs() < 0.5, "{theme}: 表头高应为 {expected}");
+                assert!(action, "{theme}: 主操作在两种密度两种主题下都在位");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 空索引列表整块换成空态：既没有表头，也没有"表头 + 破折号"的占位行。
+    #[gpui_kit::test]
+    fn empty_index_list_replaces_the_table_with_an_empty_state(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        use gpui_kit::AppContext as _;
+        let (services, dir) = offline_services("empty-indexes");
+        cx.update(gpui_kit::init);
+        let (window, _pane) = cx.update(|cx| {
+            let bounds = gpui_kit::Bounds {
+                origin: gpui_kit::Point::default(),
+                size: gpui_kit::size(gpui_kit::px(900.), gpui_kit::px(900.)),
+            };
+            let (window, pane) = gpui_kit::open_window(
+                gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |_window, cx| {
+                    cx.new(|_| {
+                        let mut pane = pane_with_snapshot(services.clone(), 2);
+                        pane.session.section = Section::Indexes;
+                        pane
+                    })
+                },
+            )
+            .expect("structure pane");
+            (window, pane)
+        });
+        let (head, empty, dash_rows) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                (
+                    window.try_find("structure-table-head").map(|head| head.visible()),
+                    window.try_find("empty-state").map(|block| block.visible()),
+                    window.find_all("structure-row-indexes-0").len(),
+                )
+            })
+            .unwrap();
+        assert!(head.is_none(), "空索引列表不能保留表头");
+        assert_eq!(empty, Some(true), "空索引列表要换成空态块");
+        assert_eq!(dash_rows, 0, "空列表不能留占位行");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 危险确认层在 640×640 里也放得下：只有正文滚动，取消与确认始终可见。
+    #[gpui_kit::test]
+    fn danger_dialog_keeps_its_actions_visible_in_a_short_narrow_window(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt;
+        use gpui_kit::AppContext as _;
+        let (services, dir) = offline_services("dialog");
+        cx.update(gpui_kit::init);
+        let (window, _pane) = cx.update(|cx| {
+            let bounds = gpui_kit::Bounds {
+                origin: gpui_kit::Point::default(),
+                size: gpui_kit::size(gpui_kit::px(640.), gpui_kit::px(640.)),
+            };
+            let (window, pane) = gpui_kit::open_window(
+                gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() },
+                cx,
+                |_window, cx| {
+                    cx.new(|_| {
+                        let mut pane = pane_with_snapshot(services.clone(), 8);
+                        pane.session.section = Section::Danger;
+                        let snapshot = snapshot_with(8);
+                        pane.session.arm_fixture(&snapshot);
+                        pane
+                    })
+                },
+            )
+            .expect("structure pane");
+            (window, pane)
+        });
+        let (dialog, body, confirm, cancel, window_size) = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                (
+                    window.find("structure-preview-dialog").bounds(),
+                    window.find("structure-preview-body").bounds(),
+                    window.find("structure-confirm").bounds(),
+                    window.find("structure-cancel").bounds(),
+                    window.find("structure-pane").bounds(),
+                )
+            })
+            .unwrap();
+        let limit = f32::from(window_size.size.height) * 0.92 + 1.;
+        assert!(f32::from(dialog.size.height) <= limit, "确认层高 {} 超出窗口可用高度 {limit}", f32::from(dialog.size.height));
+        assert!(f32::from(confirm.size.height) > 0., "确认按钮要真的画出来");
+        for (name, bounds) in [("确认", confirm), ("取消", cancel)] {
+            let bottom = f32::from(bounds.origin.y + bounds.size.height);
+            assert!(bottom <= f32::from(window_size.size.height) + 0.5, "{name}按钮被裁在窗口外（底 {bottom}）");
+        }
+        assert!(
+            f32::from(body.size.height) < f32::from(dialog.size.height),
+            "正文与页脚分工：正文滚动，页脚固定"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
