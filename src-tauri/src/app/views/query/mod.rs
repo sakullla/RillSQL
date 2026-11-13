@@ -2942,7 +2942,11 @@ mod tests {
         })
         .unwrap();
         let landed = wait_for_tokio(cx, window, std::time::Duration::from_secs(30), |cx| {
-            cx.update(|cx| view.read(cx).query_cell(0, 1, cx) == "真实")
+            cx.update(|cx| {
+                let view = view.read(cx);
+                // 第一批结果可能先于终态到达；已执行记录只在运行结束后写入。
+                view.query_cell(0, 1, cx) == "真实" && view.model.active_tab().is_some_and(|tab| !tab.running)
+            })
         });
         let note = cx.update(|cx| view.read(cx).query_note(cx));
         assert!(landed, "真实 SELECT 没有回到结果表：{note}");
