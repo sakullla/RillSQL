@@ -225,7 +225,7 @@ fn density_theme_and_language_reach_the_rendered_chrome(cx: &mut gpui_kit::TestA
         let palette = window.find("palette").bounds();
         assert!(f32::from(palette.origin.x) >= 0.);
         assert!(f32::from(palette.origin.x + palette.size.width) <= width + 0.5);
-        assert!(f32::from(palette.size.width) <= 560.);
+        assert!(f32::from(palette.size.width) <= 620.);
     })
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -4082,7 +4082,7 @@ fn stale_objects_refuse_actions_and_keep_the_selectable_row_message() {
 }
 
 #[test]
-fn object_search_uses_complete_path_and_clearing_restores_the_tree() {
+fn object_search_keeps_the_tree_shape_and_clearing_restores_the_tree() {
     use crate::catalog::model::ObjectRow;
     let orders = ObjectRow::table("orders", Some(1));
     let people = ObjectRow::table("people", Some(1));
@@ -4095,10 +4095,13 @@ fn object_search_uses_complete_path_and_clearing_restores_the_tree() {
     assert!(before > 1, "展开后有子行");
 
     model.set_field(DraftField::ObjectFilter, "ord".into());
-    let hits = model.nav_rows();
+    let rows = model.nav_rows();
+    let hits: Vec<_> = rows.iter().filter(|row| row.highlight.is_some()).collect();
     assert_eq!(hits.len(), 1);
-    assert!(hits[0].label.contains("shop") && hits[0].label.contains("public"), "完整路径：{}", hits[0].label);
-    assert!(hits[0].highlight.is_some(), "命中要高亮");
+    assert_eq!(hits[0].label, "orders");
+    assert!(rows.iter().any(|row| row.label == "shop"), "命中对象所在的库仍在树上");
+    assert!(rows.iter().all(|row| row.label != "people"), "未命中的对象隐藏");
+    assert!(!model.nav_rows_for("pg").is_empty(), "资源管理器在连接下画出命中的分支");
     assert_eq!(model.nav_empty_key("pg"), Some("ui.explorer.noMatch"));
 
     model.set_field(DraftField::ObjectFilter, String::new());

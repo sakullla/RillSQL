@@ -289,6 +289,10 @@ pub struct NavRow {
     pub loaded: usize,
     /// 高亮区间（字节偏移），只在搜索命中时给出。
     pub highlight: Option<(usize, usize)>,
+    /// 列：类型与约束（如 "INTEGER · pk · not null"）；索引：所含列与唯一性。其余为空。
+    pub detail: String,
+    /// 列是否属于主键。
+    pub primary: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1200,64 +1204,66 @@ impl NavTree {
         }
     }
 
-    fn matches(&self, node: &NavNode) -> bool {
-        if self.query.is_empty() {
-            return false;
-        }
-        let needle = self.query.to_lowercase();
-        node.name.to_lowercase().contains(&needle) || node.path.to_lowercase().contains(&needle)
-    }
-
-    /// 可见行。搜索时是命中列表（完整路径 + 高亮），否则是按展开状态展开的树。
+    /// 可见行。没有搜索词时按展开状态展开整棵树；有搜索词时保留树结构：
+    /// 命中的对象连同它的连接 / 库 / 模式 / 分组一起显示，祖先自动展开，命中处高亮。
     pub fn visible(&self) -> Vec<NavRow> {
         let mut rows = Vec::new();
-        if self.query.is_empty() {
+        if self.query.trim().is_empty() {
             for id in &self.roots {
                 self.walk(id, 0, &mut rows);
             }
             return rows;
         }
-        for node in self.nodes.values() {
-            if node.kind != NavKind::Object && node.kind != NavKind::Keyspace {
-                continue;
-            }
-            if !self.matches(node) {
-                continue;
-            }
-            let label = if node.path.is_empty() { node.label.clone() } else { format!("{} / {}", node.path, node.name) };
-            rows.push(NavRow {
-                id: node.id.clone(),
-                depth: 1,
-                kind: node.kind,
-                highlight: match_span(&label, &self.query),
-                label,
-                name: node.name.clone(),
-                label_key: node.label_key,
-                path: node.path.clone(),
-                expanded: self.expanded.contains(&node.id),
-                focused: self.focus.as_deref() == Some(node.id.as_str()),
-                expandable: node.expandable,
-                object_kind: node.object_kind,
-                stale: node.stale,
-                loading: node.loading,
-                error: node.error.clone(),
-                has_more: node.has_more,
-                total: node.total,
-                loaded: node.loaded,
-            });
+        let needle = self.query.trim().to_lowercase();
+        for id in &self.roots {
+            self.walk_filtered(id, 0, &needle, &mut rows);
         }
         rows
     }
 
-    fn walk(&self, id: &str, depth: usize, rows: &mut Vec<NavRow>) {
+    /// 只有对象、Redis 键空间、库和模式按名字参与筛选；分组与列不单独命中，
+    /// 否则“列”“表”这样的分组名或常见列名会把整棵树都带出来。
+    fn name_hits(node: &NavNode, needle: &str) -> bool {
+        matches!(node.kind, NavKind::Object | NavKind::Keyspace | NavKind::Database | NavKind::Schema)
+            && node.name.to_lowercase().contains(needle)
+    }
+
+    fn subtree_hits(&self, id: &str, needle: &str) -> bool {
+        let Some(node) = self.nodes.get(id) else { return false };
+        Self::name_hits(node, needle) || node.children.iter().any(|child| self.subtree_hits(child, needle))
+    }
+
+    fn walk_filtered(&self, id: &str, depth: usize, needle: &str, rows: &mut Vec<NavRow>) {
         let Some(node) = self.nodes.get(id) else { return };
+        if Self::name_hits(node, needle) && node.kind == NavKind::Object {
+            // 命中的对象本身照常显示：用户展开它就能看到列和索引。
+            let at = rows.len();
+            self.walk(id, depth, rows);
+            if let Some(row) = rows.get_mut(at) {
+                row.highlight = match_span(&row.label, needle);
+            }
+            return;
+        }
+        if !self.subtree_hits(id, needle) {
+            return;
+        }
+        let mut row = self.row_of(node, depth, true);
+        if Self::name_hits(node, needle) {
+            row.highlight = match_span(&row.label, needle);
+        }
+        rows.push(row);
+        for child in &node.children {
+            self.walk_filtered(child, depth + 1, needle, rows);
+        }
+    }
+
+    fn row_of(&self, node: &NavNode, depth: usize, expanded: bool) -> NavRow {
         let label = if node.label_key.is_some() {
             node.label_key.unwrap_or_default().to_owned()
         } else {
             node.label.clone()
         };
-        let expanded = self.expanded.contains(id);
-        rows.push(NavRow {
+        NavRow {
             id: node.id.clone(),
             depth,
             kind: node.kind,
@@ -1267,7 +1273,7 @@ impl NavTree {
             label_key: node.label_key,
             path: node.path.clone(),
             expanded,
-            focused: self.focus.as_deref() == Some(id),
+            focused: self.focus.as_deref() == Some(node.id.as_str()),
             expandable: node.expandable,
             object_kind: node.object_kind,
             stale: node.stale,
@@ -1276,7 +1282,15 @@ impl NavTree {
             has_more: node.has_more,
             total: node.total,
             loaded: node.loaded,
-        });
+            detail: if matches!(node.kind, NavKind::Column | NavKind::Index) { node.cursor.clone().unwrap_or_default() } else { String::new() },
+            primary: node.primary,
+        }
+    }
+
+    fn walk(&self, id: &str, depth: usize, rows: &mut Vec<NavRow>) {
+        let Some(node) = self.nodes.get(id) else { return };
+        let expanded = self.expanded.contains(id);
+        rows.push(self.row_of(node, depth, expanded));
         if !expanded {
             return;
         }
@@ -1813,7 +1827,7 @@ mod tests {
     }
 
     #[test]
-    fn search_shows_complete_path_with_highlight_and_restores_the_tree() {
+    fn search_keeps_the_tree_shape_with_highlight_and_restores_the_tree() {
         let pg = connection(
             Engine::Postgres,
             vec![database("shop", vec![schema("public", vec![table("orders"), table("people")])])],
@@ -1828,13 +1842,23 @@ mod tests {
         let before_focus = tree.focus().unwrap().to_owned();
 
         assert!(tree.search("ord"));
-        let hits = tree.visible();
+        let rows = tree.visible();
+        // 筛选保留树结构：命中的对象连同连接 / 库 / 模式 / 分组一起出现，未命中的同级对象隐藏。
+        let hits: Vec<_> = rows.iter().filter(|row| row.highlight.is_some()).collect();
         assert_eq!(hits.len(), 1);
-        assert!(hits[0].label.contains("orders"));
-        assert!(hits[0].label.contains("shop"), "搜索显示完整路径：{}", hits[0].label);
-        assert!(hits[0].label.contains("public"));
+        assert_eq!(hits[0].label, "orders");
         let (start, end) = hits[0].highlight.expect("命中要高亮");
         assert_eq!(&hits[0].label[start..end].to_lowercase(), "ord");
+        assert!(rows.iter().all(|row| row.label != "people"), "未命中的对象不出现");
+        for kind in [NavKind::Connection, NavKind::Database, NavKind::Schema, NavKind::Group] {
+            assert!(rows.iter().any(|row| row.kind == kind && row.expanded), "祖先 {kind:?} 自动展开");
+        }
+        let at = rows.iter().position(|row| row.label == "orders").unwrap();
+        assert!(rows[at].depth > 0, "命中行保留树缩进");
+
+        assert!(tree.search("nothing-matches"));
+        assert!(tree.visible().is_empty(), "没有命中时不留空壳祖先");
+        assert!(tree.search("ord"));
 
         assert!(tree.clear_search());
         assert!(tree.query().is_empty());

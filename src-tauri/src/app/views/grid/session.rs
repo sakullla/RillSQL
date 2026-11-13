@@ -821,18 +821,19 @@ impl SharedGrid {
         self.scope
     }
 
+    /// 行数摘要：完整行数已知时写“起–止 / 总数 行”（读完时只写总数），未知时只写已读行数。
     pub fn range_text(&self) -> String {
-        let (start, end) = self.visible_bounds();
         let loaded = self.rows.len();
-        let full = match self.full_count {
-            Some(count) => count.to_string(),
-            None => i18n::text(self.locale, "grid.range.unknownFull"),
-        };
-        let scope = match self.scope {
-            RangeScope::Fetched => i18n::text(self.locale, "grid.range.loaded"),
-            RangeScope::LoadedSubset => i18n::text(self.locale, "grid.range.subset"),
-        };
-        format!("{scope} {start}-{end}/{loaded} / {full}")
+        let unit = i18n::text(self.locale, "ui.grid.rows");
+        let first = self.offset + 1;
+        let last = self.offset + loaded as u64;
+        match self.full_count {
+            Some(count) if self.offset == 0 && loaded as i64 >= count => format!("{} {unit}", group_digits(count)),
+            Some(count) if loaded == 0 => format!("0 / {} {unit}", group_digits(count)),
+            Some(count) => format!("{}–{} / {} {unit}", group_digits(first as i64), group_digits(last as i64), group_digits(count)),
+            None if self.offset > 0 && loaded > 0 => format!("{}–{} {unit}", group_digits(first as i64), group_digits(last as i64)),
+            None => format!("{} {unit}", group_digits(loaded as i64)),
+        }
     }
 
     pub fn find_text(&self) -> &str {
@@ -1242,11 +1243,11 @@ impl SharedGrid {
             SheetEmptiness::ResultEmpty => return i18n::text(self.locale, "grid.state.resultEmpty"),
             SheetEmptiness::Rows => {}
         }
+        // 还有更多、已到末尾、不能续读都不是需要用户处理的事：行数摘要和翻页按钮已经说明，
+        // 这里不再常驻一句解释。
         match self.continuation(loading) {
             Continuation::Loading => i18n::text(self.locale, "grid.state.loading"),
-            Continuation::More => i18n::text(self.locale, "grid.state.more"),
-            Continuation::Complete => i18n::text(self.locale, "grid.state.complete"),
-            Continuation::Unavailable => i18n::text(self.locale, "grid.state.noContinuation"),
+            Continuation::More | Continuation::Complete | Continuation::Unavailable => String::new(),
         }
     }
 
@@ -1384,7 +1385,7 @@ impl SharedGrid {
         self.rows.get(row).map(|item| item.id.as_str())
     }
 
-    fn row_index(&self, row_id: &str) -> Option<usize> {
+    pub fn row_index(&self, row_id: &str) -> Option<usize> {
         self.rows.iter().position(|row| row.id == row_id)
     }
 
@@ -4232,8 +4233,11 @@ mod tests {
         assert_eq!(grid.rendered_len(), 8);
         assert_eq!(grid.loaded_len(), 100);
         assert_eq!(grid.full_count(), Some(1000));
-        assert!(grid.range_text().contains("40-48/100"));
-        assert!(grid.range_text().contains("1000"));
+        // 行数摘要写已读取的行区间和完整行数，不随滚动窗口变化，数字带千分位。
+        assert_eq!(grid.range_text(), "1–100 / 1,000 行");
+        assert_eq!(group_digits(1234567), "1,234,567");
+        assert_eq!(group_digits(-1000), "-1,000");
+        assert_eq!(group_digits(999), "999");
         grid.select_all_loaded();
         assert_eq!(grid.selection_count(), 200);
         assert!(grid.selection_within_loaded());
@@ -6382,4 +6386,17 @@ mod batch_tests {
         assert!(header.foreign && header.abbr == "JSON");
         assert!(json_grid.column_header(0).unwrap().primary);
     }
+}
+
+/// 千分位分组：12345 → "12,345"。
+pub fn group_digits(value: i64) -> String {
+    let digits = value.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if value < 0 { format!("-{out}") } else { out }
 }

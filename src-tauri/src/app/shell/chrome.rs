@@ -516,28 +516,20 @@ impl Workbench {
                     )),
             );
         }
-        if self.model.nav_searching() {
-            // 搜索用同一份树索引，行显示完整路径并高亮命中；清除后目录原样回来。
-            let hits = self.model.nav_rows();
-            if hits.is_empty() {
-                if let Some(key) = self.model.nav_empty_key("") {
-                    children += 1;
-                    list = list.child(div().pl(px(30.)).py(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(self.t(key)));
-                }
-            }
-            for row in hits {
-                if self.model.reveal_node.as_deref() == Some(row.id.as_str()) {
-                    reveal_at = Some(children);
-                }
-                children += 1;
-                list = list.child(self.nav_row(&row, true, &p, cx));
-            }
-        } else {
+        let searching = self.model.nav_searching();
+        let mut search_hits = 0usize;
+        {
             for row in rows {
                 let id = row.saved.id.clone();
                 let status = self.model.connections.status.get(&id).copied().unwrap_or(LinkStatus::Disconnected);
                 // 展开状态只有一份：树上的连接节点。鼠标、键盘和渲染都读它。
-                let expanded = self.model.nav_connection_expanded(&id) && status == LinkStatus::Connected;
+                let nav_rows = self.model.nav_rows_for(&id);
+                // 筛选时保留树结构：没有命中的连接整条隐藏，有命中的连接自动展开。
+                if searching && nav_rows.is_empty() {
+                    continue;
+                }
+                search_hits += nav_rows.iter().filter(|row| row.highlight.is_some()).count();
+                let expanded = (searching || self.model.nav_connection_expanded(&id)) && status == LinkStatus::Connected;
                 let selected = self.model.connections.selected.as_deref() == Some(id.as_str());
                 children += 1;
                 list = list.child(self.connection_row(&row, status, expanded, selected, &p, cx));
@@ -549,7 +541,6 @@ impl Workbench {
                     children += 1;
                     list = list.child(self.connection_error_row(&id, &error, &p, cx));
                 }
-                let nav_rows = self.model.nav_rows_for(&id);
                 if nav_rows.is_empty() {
                     if let Some(key) = self.model.nav_empty_key(&id) {
                         if key != "ui.explorer.error" {
@@ -566,6 +557,20 @@ impl Workbench {
                     children += 1;
                     list = list.child(self.nav_row(&nav_row, false, &p, cx));
                 }
+            }
+            if searching && search_hits == 0 {
+                list = list.child(
+                    div()
+                        .id("explorer-search-empty")
+                        .px(px(16.))
+                        .py(px(12.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .text_size(px(TypeScale::SM))
+                        .text_color(p.text_faint)
+                        .child(self.t("ui.explorer.noMatch")),
+                );
             }
         }
         // 跳转定义选中的行：滚进可见区（下一次布局生效），只滚一次。
@@ -810,13 +815,19 @@ impl Workbench {
         };
         let depth = if flat { 0 } else { row.depth };
         let indent = 18. + depth as f32 * 12.;
-        let icon = nav_icon(row.kind, row.object_kind);
-        let chevron = if row.expandable {
-            if row.expanded { IconName::ChevronDown } else { IconName::ChevronRight }
-        } else {
-            IconName::Dot
+        let leaf_column = row.kind == NavKind::Column;
+        let (column_type, column_marks) = split_column_detail(&row.detail);
+        let icon = if leaf_column { column_icon(&column_type, row.primary) } else { nav_icon(row.kind, row.object_kind) };
+        let icon_tint = if leaf_column && row.primary { p.accent } else { nav_tint(row.kind, p) };
+        let chevron = if row.expanded { IconName::ChevronDown } else { IconName::ChevronRight };
+        let detail_text = match row.kind {
+            NavKind::Column => column_type.to_lowercase(),
+            NavKind::Index => row.detail.clone(),
+            _ => String::new(),
         };
-        let tooltip = if row.path.is_empty() {
+        let tooltip = if leaf_column && !row.detail.is_empty() {
+            SharedString::from(format!("{} — {}", row.name, row.detail))
+        } else if row.path.is_empty() {
             label.clone()
         } else {
             SharedString::from(format!("{} / {}", row.path, row.name))
@@ -857,6 +868,8 @@ impl Workbench {
                     .flex()
                     .items_center()
                     .cursor_pointer()
+                    .flex_none()
+                    .w(px(12.))
                     .when(row.expandable, |this| {
                         this.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
@@ -864,13 +877,36 @@ impl Workbench {
                             this.perform(&format!("nav-toggle:{toggle_id}"), cx);
                             cx.notify();
                         }))
-                    })
-                    .child(kit::icon(chevron, 12., p.text_faint)),
+                        .child(kit::icon(chevron, 12., p.text_faint))
+                    }),
             )
-            .child(kit::icon(icon, 13., nav_tint(row.kind, p)))
+            .child(kit::icon(icon, 13., icon_tint))
             .child(body)
+            .when(!detail_text.is_empty(), |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .max_w(px(120.))
+                        .truncate()
+                        .text_size(px(TypeScale::XS))
+                        .text_color(p.text_faint)
+                        .child(SharedString::from(detail_text.clone())),
+                )
+            })
+            .when(leaf_column && column_marks.contains("not null") && !row.primary, |this| {
+                this.child(div().flex_none().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from("*")))
+            })
             .when(is_group && row.total > 0, |this| {
-                this.child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(row.total.to_string())))
+                this.child(
+                    div()
+                        .flex_none()
+                        .px(px(5.))
+                        .rounded(px(Radius::TAG))
+                        .bg(p.hover)
+                        .text_size(px(TypeScale::XS))
+                        .text_color(p.text_muted)
+                        .child(SharedString::from(row.total.to_string())),
+                )
             })
             .when(row.stale, |this| {
                 this.child(div().text_size(px(TypeScale::XS)).text_color(p.warn).child(self.t("catalog.tree.stale")))
@@ -2851,8 +2887,8 @@ impl Workbench {
             .key_context("Palette")
             .occlude()
             .w_full()
-            .max_w(px(560.))
-            .max_h(px(460.))
+            .max_w(px(620.))
+            .max_h(px(480.))
             .flex()
             .flex_col()
             .bg(p.raised)
@@ -2941,24 +2977,39 @@ impl Workbench {
                 ));
                 list = list.child(empty);
             }
+            let mut last_group = "";
             for (index, entry) in entries.into_iter().take(40).enumerate() {
                 let selected = index == self.model.palette_index;
                 let id = entry.id.clone();
                 let chord = crate::app::COMMANDS.iter().find(|command| command.id == entry.id).and_then(|command| command.chord);
                 let icon = palette_icon(&entry.id);
-                let group = match entry.group {
-                    "connection" => self.t("shell.paletteGroup.connection"),
-                    "table" => self.t("shell.paletteGroup.table"),
-                    _ => SharedString::from(""),
-                };
-                let detail = entry.detail.clone();
+                // 分组标题只在组变化时出现一次，行内不再重复组名和附加说明。
+                if entry.group != last_group {
+                    last_group = entry.group;
+                    let heading = match entry.group {
+                        "connection" => self.t("shell.paletteGroup.connection"),
+                        "table" => self.t("shell.paletteGroup.table"),
+                        _ => self.t("shell.paletteGroup.command"),
+                    };
+                    list = list.child(
+                        div()
+                            .px(px(10.))
+                            .pt(px(if index == 0 { 4. } else { 10. }))
+                            .pb(px(4.))
+                            .text_size(px(TypeScale::XS))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.text_faint)
+                            .child(heading),
+                    );
+                }
                 list = list.child(
                     kit::row_states(div().id(SharedString::from(format!("pal-{index}"))), &p)
                         .test_support()
                         .role(gpui_kit::Role::MenuItem)
                         .aria_label(SharedString::from(entry.label.clone()))
                         .aria_selected(selected)
-                        .h(px(m.row_h + 2.))
+                        .flex_none()
+                        .h(px(m.row_h + 4.))
                         .px(px(10.))
                         .flex()
                         .items_center()
@@ -2966,11 +3017,20 @@ impl Workbench {
                         .rounded(px(Radius::CONTROL))
                         .when(selected, |this| this.bg(p.accent_soft).text_color(p.accent_text))
                         .when(!selected, |this| this.hover(|style| style.bg(p.hover)))
-                        .child(kit::icon(icon, 15., if selected { p.accent_text } else { p.text_muted }))
-                        .child(div().flex_1().truncate().child(SharedString::from(entry.label)))
-                        .when(!detail.is_empty(), |this| this.child(div().max_w(px(160.)).truncate().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(SharedString::from(detail))))
-                        .when(!group.is_empty(), |this| this.child(div().text_size(px(TypeScale::XS)).text_color(p.text_faint).child(group)))
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(22.))
+                                .rounded(px(Radius::CONTROL))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(if selected { p.raised } else { p.hover })
+                                .child(kit::icon(icon, 13., if selected { p.accent_text } else { p.text_muted })),
+                        )
+                        .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(TypeScale::MD)).child(SharedString::from(entry.label)))
                         .when_some(chord, |this, chord| this.child(kit::kbd(kit::shortcut(&chord.replace("Mod+", "Ctrl+")), &p)))
+                        .when(selected && chord.is_none(), |this| this.child(kit::icon(IconName::CornerDownLeft, 12., p.accent_text)))
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             this.model.shell.close_overlay();
                             this.perform(&id, cx);
@@ -2980,9 +3040,36 @@ impl Workbench {
                         })),
                 );
             }
+            let hint = |keys: &'static str, label: SharedString| {
+                div().flex().items_center().gap(px(4.)).child(kit::kbd(keys, &p)).child(label)
+            };
+            let footer = div()
+                .id("palette-footer")
+                .flex_none()
+                .h(px(m.row_h + 4.))
+                .px(px(12.))
+                .flex()
+                .items_center()
+                .gap(px(14.))
+                .border_t_1()
+                .border_color(p.line)
+                .bg(p.chrome)
+                .text_size(px(TypeScale::XS))
+                .text_color(p.text_faint)
+                .child(hint("↑↓", self.t("shell.palette.hintMove")))
+                .child(hint("Enter", self.t("shell.palette.hintRun")))
+                .child(hint("Esc", self.t("shell.palette.hintClose")));
             panel = panel
-                .child(div().p(px(10.)).border_b_1().border_color(p.line).child(input.prefix(kit::icon(IconName::Search, 14., p.text_faint))))
-                .child(list);
+                .child(
+                    div()
+                        .px(px(12.))
+                        .py(px(10.))
+                        .border_b_1()
+                        .border_color(p.line)
+                        .child(input.appearance(false).prefix(kit::icon(IconName::Search, 15., p.text_faint))),
+                )
+                .child(list.flex_1().min_h(px(0.)))
+                .child(footer);
         }
         backdrop("palette-backdrop", 0.18, cx)
             .flex()
@@ -3562,6 +3649,40 @@ fn nav_icon(kind: NavKind, object: Option<ObjectKind>) -> IconName {
             ObjectKind::Extension => IconName::Plug,
             ObjectKind::Event => IconName::Clock,
         },
+    }
+}
+
+/// 列节点的 detail 形如 "INTEGER · pk · not null"：拆成类型与约束标记。
+fn split_column_detail(detail: &str) -> (String, String) {
+    let mut parts = detail.split(" · ");
+    let first = parts.next().unwrap_or_default();
+    if first == "pk" || first == "not null" {
+        return (String::new(), detail.to_owned());
+    }
+    (first.to_owned(), parts.collect::<Vec<_>>().join(" · "))
+}
+
+/// 列图标按类型族区分：主键、数字、文本、时间、布尔、二进制、JSON。
+fn column_icon(data_type: &str, primary: bool) -> IconName {
+    if primary {
+        return IconName::KeyRound;
+    }
+    let ty = data_type.to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|word| ty.contains(word));
+    if has(&["json"]) {
+        IconName::Braces
+    } else if has(&["bool", "bit"]) {
+        IconName::ToggleLeft
+    } else if has(&["date", "time", "year", "interval"]) {
+        IconName::CalendarClock
+    } else if has(&["blob", "binary", "bytea", "image"]) {
+        IconName::Binary
+    } else if has(&["int", "num", "dec", "real", "float", "double", "serial", "money"]) {
+        IconName::Hash
+    } else if has(&["char", "text", "clob", "string", "uuid", "enum", "xml"]) {
+        IconName::CaseSensitive
+    } else {
+        IconName::Type
     }
 }
 

@@ -124,6 +124,21 @@ pub struct QueryPane {
     marks_seen: HashMap<String, u64>,
     /// 正在重命名的固定结果页签。
     pin_rename: Option<PinRename>,
+    /// 点击行数后统计的完整行数：(统计的 SQL, 状态)。结果换了 SQL 就不再显示。
+    row_count: Option<(String, RowCount)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum RowCount {
+    Running,
+    Done(i64),
+    Failed(String),
+}
+
+/// 统计完整行数用的语句：把结果语句当子查询包一层 COUNT(*)，去掉结尾分号。
+fn count_sql(sql: &str) -> String {
+    let body = sql.trim().trim_end_matches(';').trim_end();
+    format!("SELECT COUNT(*) FROM (\n{body}\n) rillsql_count")
 }
 
 struct PinRename {
@@ -302,6 +317,7 @@ impl QueryPane {
             targets: Vec::new(),
             variable_values: HashMap::new(),
             side: HashMap::new(),
+            row_count: None,
             density: Density::Compact,
             narrow: false,
             #[cfg(test)]
@@ -1300,6 +1316,78 @@ impl QueryPane {
 
     /// 结果被读取上限截断时，再执行一次同一条只读语句并放大窗口。
     /// 写语句不会因为翻页被自动重放。
+    /// 统计当前结果的完整行数：在结果来自的目标上执行一次 COUNT(*)，不改动已显示的结果。
+    fn count_total(&mut self, cx: &mut Context<Self>) {
+        let source = match self.desk.results() {
+            [sheet] if is_pageable(sheet) => sheet.sql.clone(),
+            _ => return,
+        };
+        if !self.load_more_allowed() {
+            return;
+        }
+        if matches!(&self.row_count, Some((sql, RowCount::Running)) if *sql == source) {
+            return;
+        }
+        let Some(target) = self.desk.results_target().or_else(|| self.desk.target()) else {
+            return;
+        };
+        self.row_count = Some((source.clone(), RowCount::Running));
+        cx.notify();
+        let services = Arc::clone(&self.services);
+        let timeout_ms = self.timeout_ms;
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<i64, String>>();
+        let request = crate::query::commands::StartRequest {
+            connection_id: target.connection_id.clone(),
+            connection_name: target.connection_name.clone(),
+            database: target.database.clone(),
+            engine: target.engine.clone(),
+            sql: count_sql(&source),
+            limit: 1,
+            timeout_ms,
+        };
+        runtime().spawn(async move {
+            let outcome = async {
+                let mut snap = crate::query::commands::start_run(&services.connections, &services.query, request).await?;
+                let run_id = snap.id.clone();
+                while desk::run_pending(&snap.status) {
+                    snap = crate::query::commands::poll_run(&services.query, &run_id, true).await?;
+                }
+                let _ = crate::query::commands::release_run(&services.query, &run_id);
+                let statement = snap.statements.into_iter().next().ok_or_else(|| "no result".to_owned())?;
+                if statement.status != "ok" {
+                    return Err(if statement.message.is_empty() { statement.status } else { statement.message });
+                }
+                statement
+                    .rows
+                    .first()
+                    .and_then(|row| row.first())
+                    .and_then(|cell| cell.as_deref())
+                    .and_then(|text| text.trim().parse::<i64>().ok())
+                    .ok_or_else(|| "COUNT(*) returned no number".to_owned())
+            }
+            .await;
+            let _ = tx.send(outcome);
+        });
+        let view = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let Ok(outcome) = rx.await else { return };
+            cx.update(|cx| {
+                if let Some(view) = view.upgrade() {
+                    view.update(cx, |this, cx| {
+                        if this.row_count.as_ref().is_some_and(|(sql, _)| *sql == source) {
+                            this.row_count = Some((source, match outcome {
+                                Ok(total) => RowCount::Done(total),
+                                Err(message) => RowCount::Failed(message),
+                            }));
+                            cx.notify();
+                        }
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
     fn load_more(&mut self, cx: &mut Context<Self>) {
         if !self.context_active {
             self.desk.set_active_note(NOT_ACTIVE_QUERY);
@@ -2228,12 +2316,69 @@ impl QueryPane {
             );
         }
         if let Some(summary) = summary {
-            items.push(div().px(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(SharedString::from(summary)).into_any_element());
+            items.push(self.render_row_summary(summary, running, p, metrics, entity));
         }
         if let Some(more) = self.render_load_more(running, p, metrics, entity) {
             items.push(more);
         }
         items
+    }
+
+    /// 行数摘要。结果被截断时可以点击，统计完整行数；统计完成后写成“已读 / 总数”。
+    #[inline(never)]
+    fn render_row_summary(&self, summary: String, running: bool, p: &Palette, metrics: Metrics, entity: &Entity<QueryPane>) -> AnyElement {
+        let locale = self.locale;
+        // 执行中每帧都会重绘：这时不取结果快照、不做可统计判断，只画纯文本。
+        if running || self.desk.result_view() != ResultView::Current {
+            return div().id("query-row-summary").px(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(SharedString::from(summary)).into_any_element();
+        }
+        let results = self.desk.results();
+        let countable = results.len() == 1
+            && results[0].truncated
+            && is_pageable(&results[0])
+            && self.load_more_allowed();
+        if !countable {
+            return div().id("query-row-summary").px(px(6.)).text_size(px(TypeScale::SM)).text_color(p.text_faint).child(SharedString::from(summary)).into_any_element();
+        }
+        let loaded = results[0].rows.len() as i64;
+        let unit = i18n::text(locale, "ui.grid.rows");
+        let state = self.row_count.as_ref().filter(|(sql, _)| *sql == results[0].sql).map(|(_, state)| state.clone());
+        let (label, tip, tone) = match &state {
+            Some(RowCount::Done(total)) => (
+                format!("{} / {} {unit}", crate::app::views::grid::group_digits(loaded), crate::app::views::grid::group_digits(*total)),
+                i18n::text(locale, "query.count.recount"),
+                p.text_muted,
+            ),
+            Some(RowCount::Running) => (format!("{loaded}+ {unit}"), i18n::text(locale, "query.count.running"), p.text_faint),
+            Some(RowCount::Failed(message)) => (format!("{loaded}+ {unit}"), format!("{}: {message}", i18n::text(locale, "query.count.failed")), p.danger),
+            None => (format!("{loaded}+ {unit}"), i18n::text(locale, "query.count.hint"), p.text_muted),
+        };
+        let running = matches!(state, Some(RowCount::Running));
+        let click = entity.clone();
+        kit::interactive(div().id("query-row-summary"), p, false)
+            .test_support()
+            .flex_none()
+            .role(gpui_kit::Role::Button)
+            .aria_label(SharedString::from(tip.clone()))
+            .tooltip_text(SharedString::from(tip))
+            .h(px(metrics.control_h))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .rounded(px(Radius::CONTROL))
+            .text_size(px(TypeScale::SM))
+            .text_color(tone)
+            .child(if running {
+                Spinner::new().xsmall().color(p.accent).into_any_element()
+            } else {
+                kit::icon(IconName::Sigma, 12., tone).into_any_element()
+            })
+            .child(SharedString::from(label))
+            .on_click(move |_, _, cx| {
+                click.update(cx, |pane, cx| pane.count_total(cx));
+            })
+            .into_any_element()
     }
 
     #[inline(never)]
@@ -2688,6 +2833,13 @@ mod tests {
             range: None,
             error_mark: None,
         }
+    }
+
+    #[test]
+    fn row_count_wraps_the_result_statement_without_its_trailing_semicolon() {
+        assert_eq!(count_sql("SELECT * FROM item;  "), "SELECT COUNT(*) FROM (\nSELECT * FROM item\n) rillsql_count");
+        // 结尾的行注释不能吞掉右括号：语句另起一行包进子查询。
+        assert!(count_sql("select 1 -- note").ends_with("-- note\n) rillsql_count"));
     }
 
     #[test]

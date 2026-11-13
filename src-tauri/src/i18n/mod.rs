@@ -147,6 +147,10 @@ dict! {
     "shell.palette.title" => "命令面板", "Command palette";
     "shell.paletteGroup.connection" => "连接", "Connections";
     "shell.paletteGroup.table" => "表 / 视图", "Tables & views";
+    "shell.paletteGroup.command" => "命令", "Commands";
+    "shell.palette.hintMove" => "选择", "Navigate";
+    "shell.palette.hintRun" => "执行", "Run";
+    "shell.palette.hintClose" => "关闭", "Close";
     "shell.welcome.title" => "RillSQL", "RillSQL";
     "shell.welcome.factEngines" => "支持 PostgreSQL、MySQL、MariaDB、SQL Server、SQLite、Redis、MongoDB", "Supports PostgreSQL, MySQL, MariaDB, SQL Server, SQLite, Redis and MongoDB";
     "shell.welcome.resumeTitle" => "继续工作", "Continue working";
@@ -325,6 +329,7 @@ dict! {
     "grid.filter.clearAll" => "清除全部条件", "Clear all filters";
     "grid.filter.remove" => "删除这条条件", "Remove this filter";
     "grid.filter.value" => "值", "Value";
+    "grid.filter.and" => "且", "and";
     "grid.filter.upper" => "上界", "Upper bound";
     "grid.filter.valuePlaceholder" => "值或集合（逗号分隔）", "Value or comma-separated set";
     "grid.filter.upperPlaceholder" => "上界", "Upper bound";
@@ -797,6 +802,10 @@ dict! {
     "ui.query.messages" => "消息", "Messages";
     "ui.query.outline" => "大纲", "Outline";
     "ui.grid.rows" => "行", "rows";
+    "query.count.hint" => "点击统计完整行数", "Click to count all rows";
+    "query.count.running" => "正在统计完整行数…", "Counting all rows…";
+    "query.count.failed" => "统计行数失败", "Row count failed";
+    "query.count.recount" => "点击重新统计", "Click to count again";
     "ui.grid.searchPlaceholder" => "在已读取的行里查找", "Filter visible rows…";
     "ui.grid.refresh" => "刷新", "Refresh";
     "ui.grid.empty" => "没有数据", "No rows";
